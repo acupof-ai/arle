@@ -11,8 +11,16 @@ extern "C" {
 // Opaque: the stub never dereferences the args, so mirroring the real
 // struct here only invites drift.
 typedef struct ArleFa3FwdHd256Args ArleFa3FwdHd256Args;
+typedef struct ArleFa3BwdHd256Args ArleFa3BwdHd256Args;
 
 cudaError_t arle_fa3_fwd_hd256_bf16_cuda(const ArleFa3FwdHd256Args* a,
+                                         cudaStream_t stream) {
+    (void)a;
+    (void)stream;
+    return cudaErrorNotSupported;
+}
+
+cudaError_t arle_fa3_bwd_hd256_bf16_cuda(const ArleFa3BwdHd256Args* a,
                                          cudaStream_t stream) {
     (void)a;
     (void)stream;
