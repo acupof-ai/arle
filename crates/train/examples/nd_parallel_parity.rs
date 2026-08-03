@@ -24,9 +24,9 @@
 //! norms 3.744990 vs 1.984009 — a 1.89x break the loss-only gate could not see.
 //!
 //! Full-attention by default; `ARLE_ND_HYBRID=1` makes every layer but the last
-//! linear attention so the seq<->head all-to-all transport is covered too (48 of
-//! the real 27B's 64 layers are GDN, so full-attn-only certifies the minority of
-//! the model). `ARLE_ND_LAYERS=n` sets depth, `ARLE_ND_CP_SIZE=n` the world size
+//! linear attention, and `ARLE_ND_HYBRID=k` (k>=2) interleaves full attention every
+//! k-th layer — `4` is the real 27B's shape (48 of its 64 layers are GDN).
+//! `ARLE_ND_LAYERS=n` sets depth, `ARLE_ND_CP_SIZE=n` the world size
 //! (= the ring step count) — the two axes a bias has to scale on to matter.
 //!
 //! Run on a GPU host (>= 2 GPUs):
@@ -117,11 +117,9 @@ fn nd_seq() -> usize {
         .unwrap_or(16)
 }
 
-// `ARLE_ND_HYBRID=1` makes every layer but the last linear attention, whose CP
-// transport is the seq↔head all-to-all, not the ring — the real 27B is 48/64 GDN,
-// so a full-attn-only gate certifies the minority of the model. `ARLE_ND_LAYERS=n`
-// sets depth (default 2): the GDN CP path shows a systematic grad bias, and depth
-// is how you tell a per-layer constant from one that compounds toward the real 48.
+// `=1` is one full-attn layer atop an all-GDN stack, so no ring gradient crosses a
+// layer below it — blind to a defect that compounds down the backward. `=k` (k>=2)
+// interleaves every k-th layer; 4 is the 27B's shape.
 #[cfg(all(feature = "cuda", feature = "nccl"))]
 fn nd_layer_types() -> Vec<LayerType> {
     let depth = std::env::var("ARLE_ND_LAYERS")
@@ -129,14 +127,23 @@ fn nd_layer_types() -> Vec<LayerType> {
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(2)
         .max(1);
-    let hybrid = std::env::var("ARLE_ND_HYBRID").is_ok_and(|v| v.trim() == "1");
-    let lead = if hybrid {
-        LayerType::LinearAttention
-    } else {
-        LayerType::FullAttention
-    };
-    let mut types = vec![lead; depth - 1];
-    types.push(LayerType::FullAttention);
+    let period = std::env::var("ARLE_ND_HYBRID")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(0);
+    if period == 0 {
+        return vec![LayerType::FullAttention; depth];
+    }
+    let mut types: Vec<LayerType> = (0..depth)
+        .map(|i| {
+            if period >= 2 && (i + 1) % period == 0 {
+                LayerType::FullAttention
+            } else {
+                LayerType::LinearAttention
+            }
+        })
+        .collect();
+    types[depth - 1] = LayerType::FullAttention;
     types
 }
 
