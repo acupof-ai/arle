@@ -149,6 +149,9 @@ mod nccl_backend {
     // the pointer itself is opaque and is only dereferenced through FFI
     // calls that NCCL serializes internally.
     unsafe impl Send for NcclBackend {}
+    // SAFETY: `&self` methods only hand `comm` back to NCCL, which is thread-safe
+    // per its API contract; matching collective *order* across ranks is the
+    // caller's job (unchecked here) but is a hang, not memory unsafety.
     unsafe impl Sync for NcclBackend {}
 
     impl NcclBackend {
@@ -161,6 +164,8 @@ mod nccl_backend {
             rank: usize,
         ) -> Result<Self> {
             let mut comm: nccl::ncclComm_t = std::ptr::null_mut();
+            // SAFETY: `comm` is a live out-param; `unique_id` is an owned 128-byte
+            // POD. Caller guarantees every rank calls with the same id (unchecked).
             let res = unsafe {
                 nccl::ncclCommInitRank(&mut comm, world_size as i32, unique_id, rank as i32)
             };
@@ -196,6 +201,8 @@ mod nccl_backend {
         ) -> Result<Self> {
             let mut newcomm: nccl::ncclComm_t = std::ptr::null_mut();
             // `config = null` ⇒ the sub-comm inherits the parent's config.
+            // SAFETY: `self.comm` is live for `&self`, `newcomm` is a live out-param,
+            // and a null config is the documented "inherit" value.
             let res = unsafe {
                 nccl::ncclCommSplit(self.comm, color, key, &mut newcomm, std::ptr::null_mut())
             };
@@ -223,6 +230,8 @@ mod nccl_backend {
             op: ReduceOp,
             stream: *mut std::ffi::c_void,
         ) -> Result<()> {
+            // SAFETY: per this fn's contract sendbuf/recvbuf are live device
+            // allocations of `count` elements on `self.comm`'s device, as is `stream`.
             let res = unsafe {
                 nccl::ncclAllReduce(
                     sendbuf,
@@ -253,8 +262,11 @@ mod nccl_backend {
             bytes: usize,
         ) -> Result<(*mut std::ffi::c_void, nccl::ncclWindow_t)> {
             let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+            // SAFETY: `ptr` is a live out-param; NCCL owns the allocation it writes there.
             nccl::check(unsafe { nccl::ncclMemAlloc(&mut ptr, bytes) })?;
             let mut win: nccl::ncclWindow_t = std::ptr::null_mut();
+            // SAFETY: `ptr` is the `bytes`-sized allocation just returned above, `win` a
+            // live out-param, `self.comm` live for `&self`.
             let res = unsafe {
                 nccl::ncclCommWindowRegister(
                     self.comm,
@@ -267,6 +279,8 @@ mod nccl_backend {
             if let Err(err) = nccl::check(res) {
                 // Roll back the allocation so a failed registration (e.g. NCCL
                 // < 2.27 at runtime) doesn't leak device memory.
+                // SAFETY: `ptr` came from `ncclMemAlloc` above and registration failed,
+                // so no window still references it.
                 let _ = unsafe { nccl::ncclMemFree(ptr) };
                 return Err(err);
             }
@@ -283,7 +297,11 @@ mod nccl_backend {
             ptr: *mut std::ffi::c_void,
             win: nccl::ncclWindow_t,
         ) -> Result<()> {
+            // SAFETY: caller guarantees `ptr`/`win` came from
+            // `mem_alloc_symmetric_window` on this comm and are unused after this
+            // (unchecked); deregistering before the free is the required order.
             nccl::check(unsafe { nccl::ncclCommWindowDeregister(self.comm, win) })?;
+            // SAFETY: `ptr` is the `ncclMemAlloc` allocation, now deregistered.
             nccl::check(unsafe { nccl::ncclMemFree(ptr) })?;
             Ok(())
         }
@@ -326,6 +344,8 @@ mod nccl_backend {
             {
                 let (src, _src_guard) = send.device_ptr(&ctx.stream);
                 let (dst, _dst_guard) = recv.device_ptr_mut(&ctx.stream);
+                // SAFETY: src/dst are live for the guards held in this scope — send holds
+                // per_rank_words i32s, recv per_rank_words*world_size — and the stream owns both.
                 unsafe {
                     self.all_gather(
                         src as *const std::ffi::c_void,
@@ -386,6 +406,8 @@ mod nccl_backend {
             op: ReduceOp,
             stream: *mut std::ffi::c_void,
         ) -> Result<()> {
+            // SAFETY: trait contract — `buffer` holds `count` `dtype` elements on this
+            // comm's device and `stream` belongs to it; NCCL allows send==recv in-place.
             let res = unsafe {
                 nccl::ncclAllReduce(
                     buffer as *const _,
@@ -408,6 +430,8 @@ mod nccl_backend {
             dtype: DType,
             stream: *mut std::ffi::c_void,
         ) -> Result<()> {
+            // SAFETY: trait contract — `sendbuf` holds `sendcount` elements and `recvbuf`
+            // `sendcount * world_size`, both on this comm's device, `stream` on it too.
             let res = unsafe {
                 nccl::ncclAllGather(
                     sendbuf,
@@ -430,6 +454,8 @@ mod nccl_backend {
             op: ReduceOp,
             stream: *mut std::ffi::c_void,
         ) -> Result<()> {
+            // SAFETY: trait contract — `sendbuf` holds `recvcount * world_size` elements
+            // and `recvbuf` `recvcount`, both on this comm's device, as is `stream`.
             let res = unsafe {
                 nccl::ncclReduceScatter(
                     sendbuf,
@@ -452,6 +478,8 @@ mod nccl_backend {
             root: usize,
             stream: *mut std::ffi::c_void,
         ) -> Result<()> {
+            // SAFETY: trait contract — `buffer` holds `count` `dtype` elements on this
+            // comm's device; `root` is a caller-supplied rank, unchecked against world_size.
             let res = unsafe {
                 nccl::ncclBroadcast(
                     buffer as *const _,
@@ -474,6 +502,8 @@ mod nccl_backend {
             peer: usize,
             stream: *mut std::ffi::c_void,
         ) -> Result<()> {
+            // SAFETY: trait contract — `sendbuf` holds `count` `dtype` elements on this
+            // comm's device; caller pairs this with a matching `recv` on `peer` (unchecked).
             let res = unsafe {
                 nccl::ncclSend(
                     sendbuf,
@@ -495,6 +525,8 @@ mod nccl_backend {
             peer: usize,
             stream: *mut std::ffi::c_void,
         ) -> Result<()> {
+            // SAFETY: trait contract — `recvbuf` is writable for `count` `dtype` elements
+            // on this comm's device; caller pairs this with a `send` on `peer` (unchecked).
             let res = unsafe {
                 nccl::ncclRecv(
                     recvbuf,
@@ -509,10 +541,14 @@ mod nccl_backend {
         }
 
         fn group_start(&self) -> Result<()> {
+            // SAFETY: no arguments; NCCL only flips its thread-local group depth. Pairing
+            // with `group_end` on the same thread is the caller's job.
             nccl::check(unsafe { nccl::ncclGroupStart() })
         }
 
         fn group_end(&self) -> Result<()> {
+            // SAFETY: no arguments; flushes the thread-local group opened by
+            // `group_start`, whose buffers the caller keeps live until this returns.
             nccl::check(unsafe { nccl::ncclGroupEnd() })
         }
 
@@ -523,6 +559,8 @@ mod nccl_backend {
 
     impl Drop for NcclBackend {
         fn drop(&mut self) {
+            // SAFETY: `comm` is owned solely by this backend (`split` returns a distinct
+            // sub-comm), so this is its one and only destroy.
             unsafe {
                 let _ = nccl::ncclCommDestroy(self.comm);
             }
