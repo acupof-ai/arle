@@ -4,21 +4,21 @@
 // grid is launched with (rows, 1, 1) and block_dim 256.
 
 extern "C" __global__ void softmax_last_axis_f32(
-    float* __restrict__ out,
-    const float* __restrict__ x,
+    T* __restrict__ out,
+    const T* __restrict__ x,
     int cols
 ) {
     extern __shared__ float smem[];
     int row = blockIdx.x;
     int tid = threadIdx.x;
     int block = blockDim.x;
-    const float* row_x = x + row * cols;
-    float* row_out = out + row * cols;
+    const T* row_x = x + row * cols;
+    T* row_out = out + row * cols;
 
     // Phase 1: row max.
     float local_max = __int_as_float(0xFF800000);
     for (int i = tid; i < cols; i += block) {
-        float v = row_x[i];
+        float v = static_cast<float>(row_x[i]);
         if (v > local_max) local_max = v;
     }
     smem[tid] = local_max;
@@ -35,7 +35,7 @@ extern "C" __global__ void softmax_last_axis_f32(
     // Phase 2: sum of exp(x - max).
     float local_sum = 0.0f;
     for (int i = tid; i < cols; i += block) {
-        local_sum += __expf(row_x[i] - row_max);
+        local_sum += __expf(static_cast<float>(row_x[i]) - row_max);
     }
     smem[tid] = local_sum;
     __syncthreads();
@@ -48,25 +48,25 @@ extern "C" __global__ void softmax_last_axis_f32(
 
     // Phase 3: normalized output.
     for (int i = tid; i < cols; i += block) {
-        row_out[i] = __expf(row_x[i] - row_max) * inv;
+        row_out[i] = static_cast<T>(__expf(static_cast<float>(row_x[i]) - row_max) * inv);
     }
 }
 
 extern "C" __global__ void log_softmax_last_axis_f32(
-    float* __restrict__ out,
-    const float* __restrict__ x,
+    T* __restrict__ out,
+    const T* __restrict__ x,
     int cols
 ) {
     extern __shared__ float smem[];
     int row = blockIdx.x;
     int tid = threadIdx.x;
     int block = blockDim.x;
-    const float* row_x = x + row * cols;
-    float* row_out = out + row * cols;
+    const T* row_x = x + row * cols;
+    T* row_out = out + row * cols;
 
     float local_max = __int_as_float(0xFF800000);
     for (int i = tid; i < cols; i += block) {
-        float v = row_x[i];
+        float v = static_cast<float>(row_x[i]);
         if (v > local_max) local_max = v;
     }
     smem[tid] = local_max;
@@ -82,7 +82,7 @@ extern "C" __global__ void log_softmax_last_axis_f32(
 
     float local_sum = 0.0f;
     for (int i = tid; i < cols; i += block) {
-        local_sum += __expf(row_x[i] - row_max);
+        local_sum += __expf(static_cast<float>(row_x[i]) - row_max);
     }
     smem[tid] = local_sum;
     __syncthreads();
@@ -93,27 +93,27 @@ extern "C" __global__ void log_softmax_last_axis_f32(
     float log_denom = logf(smem[0]);
 
     for (int i = tid; i < cols; i += block) {
-        row_out[i] = (row_x[i] - row_max) - log_denom;
+        row_out[i] = static_cast<T>((static_cast<float>(row_x[i]) - row_max) - log_denom);
     }
 }
 
 extern "C" __global__ void softmax_last_axis_backward_f32(
-    float* __restrict__ grad_input,
-    const float* __restrict__ upstream,
-    const float* __restrict__ softmax_output,
+    T* __restrict__ grad_input,
+    const T* __restrict__ upstream,
+    const T* __restrict__ softmax_output,
     int cols
 ) {
     extern __shared__ float smem[];
     int row = blockIdx.x;
     int tid = threadIdx.x;
     int block = blockDim.x;
-    const float* row_up = upstream + row * cols;
-    const float* row_out = softmax_output + row * cols;
-    float* row_grad = grad_input + row * cols;
+    const T* row_up = upstream + row * cols;
+    const T* row_out = softmax_output + row * cols;
+    T* row_grad = grad_input + row * cols;
 
     float local_dot = 0.0f;
     for (int i = tid; i < cols; i += block) {
-        local_dot += row_up[i] * row_out[i];
+        local_dot += static_cast<float>(row_up[i]) * static_cast<float>(row_out[i]);
     }
     smem[tid] = local_dot;
     __syncthreads();
@@ -124,6 +124,6 @@ extern "C" __global__ void softmax_last_axis_backward_f32(
     float dot = smem[0];
 
     for (int i = tid; i < cols; i += block) {
-        row_grad[i] = row_out[i] * (row_up[i] - dot);
+        row_grad[i] = static_cast<T>(static_cast<float>(row_out[i]) * (static_cast<float>(row_up[i]) - dot));
     }
 }

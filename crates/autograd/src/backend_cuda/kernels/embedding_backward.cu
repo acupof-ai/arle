@@ -22,7 +22,7 @@
 
 extern "C" __global__ void embedding_backward_f32(
     float* __restrict__ grad_table,
-    const float* __restrict__ upstream,
+    const T* __restrict__ upstream,
     const int* __restrict__ ids,
     int n_ids,
     int hidden_dim,
@@ -32,9 +32,9 @@ extern "C" __global__ void embedding_backward_f32(
     if (row >= n_ids) return;
     int id = ids[row];
     if (id < 0 || id >= vocab_size) return;
-    const float* src = upstream + row * hidden_dim;
+    const T* src = upstream + row * hidden_dim;
     float* dst = grad_table + id * hidden_dim;
     for (int c = 0; c < hidden_dim; ++c) {
-        atomicAdd(&dst[c], src[c]);
+        atomicAdd(&dst[c], static_cast<float>(src[c]));
     }
 }

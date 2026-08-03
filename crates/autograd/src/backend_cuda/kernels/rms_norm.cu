@@ -7,8 +7,8 @@
 // shared memory. Grid: (rows, 1, 1). Block: (256, 1, 1). Shared: block * f32.
 
 extern "C" __global__ void rms_norm_f32(
-    float* __restrict__ out,
-    const float* __restrict__ x,
+    T* __restrict__ out,
+    const T* __restrict__ x,
     const float* __restrict__ weight,
     int cols,
     float eps
@@ -17,13 +17,13 @@ extern "C" __global__ void rms_norm_f32(
     int row = blockIdx.x;
     int tid = threadIdx.x;
     int block = blockDim.x;
-    const float* row_x = x + row * cols;
-    float* row_out = out + row * cols;
+    const T* row_x = x + row * cols;
+    T* row_out = out + row * cols;
 
     // Phase 1: per-thread local sum of squares.
     float local_sq = 0.0f;
     for (int i = tid; i < cols; i += block) {
-        float v = row_x[i];
+        float v = static_cast<float>(row_x[i]);
         local_sq += v * v;
     }
     smem[tid] = local_sq;
@@ -40,6 +40,6 @@ extern "C" __global__ void rms_norm_f32(
 
     // Phase 3: normalize and scale by weight.
     for (int i = tid; i < cols; i += block) {
-        row_out[i] = row_x[i] * inv_rms * weight[i];
+        row_out[i] = static_cast<T>(static_cast<float>(row_x[i]) * inv_rms * weight[i]);
     }
 }
