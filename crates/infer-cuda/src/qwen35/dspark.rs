@@ -143,6 +143,15 @@ impl Qwen35DsparkHead {
             "markov w2 size mismatch: got {}, expected {w2_len}",
             w2.len()
         );
+        // The bias is added in bf16, so under half an ulp of the base logit it is
+        // discarded whole and the head is a no-op no matter how well it trained.
+        let rms = |v: &[f32]| (v.iter().map(|x| x * x).sum::<f32>() / v.len() as f32).sqrt();
+        log::info!(
+            "dspark markov publish: rms|w1|={:.3e} rms|w2|={:.3e} est|bias|={:.3e} (bf16 floor ~3e-2)",
+            rms(w1),
+            rms(w2),
+            (markov.rank as f32).sqrt() * rms(w1) * rms(w2)
+        );
         let w1_bf16: Vec<half::bf16> = w1.iter().map(|&x| half::bf16::from_f32(x)).collect();
         let w2_bf16: Vec<half::bf16> = w2.iter().map(|&x| half::bf16::from_f32(x)).collect();
         markov.w1.data = ctx
@@ -486,6 +495,18 @@ fn load_host_matrix(
         .collect())
 }
 
+/// Cold-start `w1[i]` in `[-0.02, 0.02)`. The former `sin(0.1·(i mod 1000))`
+/// aliased with period `gcd(1000, rank)` — 125 shared rows for the whole vocab,
+/// and since `∂bias/∂w2 = w1[c]` that was the head's ceiling, not the init's.
+/// Mirrors `train::dspark_train::markov_w1_init`.
+fn markov_w1_init(i: usize) -> f32 {
+    let mut h = (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    h ^= h >> 29;
+    h = h.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    h ^= h >> 32;
+    0.04 * ((h >> 40) as f32 / (1u32 << 24) as f32) - 0.02
+}
+
 pub(crate) fn load_dspark_head(
     ctx: &DeviceContext,
     dir: &Path,
@@ -605,7 +626,7 @@ pub(crate) fn load_dspark_head(
         // pay a vocab-wide gemm to add zero.
         ensure!(rank > 0, "dspark train head rank must be positive");
         let w1_bytes: Vec<u8> = (0..trunk_vocab * rank)
-            .flat_map(|i| bf16::from_f32(0.02 * ((i % 1000) as f32 * 0.1).sin()).to_le_bytes())
+            .flat_map(|i| bf16::from_f32(markov_w1_init(i)).to_le_bytes())
             .collect();
         let w2_bytes = vec![0u8; trunk_vocab * rank * 2];
         log::info!(

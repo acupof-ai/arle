@@ -508,3 +508,61 @@ fn prob_match_alpha_one_trains_at_large_vocab() {
         "pure PM must move the head: max |Δw1| = {moved}"
     );
 }
+
+/// `sin(i % 1000)` aliased with period `gcd(1000, rank)`, giving 125 shared rows
+/// for a 248320 vocab — all inside a ~4-dim subspace. Since `∂bias/∂w2 = w1[c]`,
+/// that ceiling is the head's, not just the init's.
+#[test]
+fn markov_w1_init_rows_are_distinct() {
+    const V: usize = 512;
+    const R: usize = 32;
+    let row = |c: usize| -> Vec<f32> {
+        (0..R)
+            .map(|r| train::dspark_train::markov_w1_init(c * R + r))
+            .collect()
+    };
+    let rows: Vec<Vec<f32>> = (0..V).map(row).collect();
+    for c in 0..V {
+        for d in c + 1..V {
+            assert_ne!(rows[c], rows[d], "w1 rows {c} and {d} are identical");
+        }
+    }
+    // Mean |cosine| over distinct pairs: ~sqrt(2/(pi*R)) = 0.14 when the rows
+    // span R dims, near 1 when they collapse into a low-dim subspace.
+    let dot = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| x * y).sum::<f32>();
+    let norm: Vec<f32> = rows.iter().map(|r| dot(r, r).sqrt()).collect();
+    let pairs = V * (V - 1) / 2;
+    let mean_cos: f32 = (0..V)
+        .flat_map(|c| (c + 1..V).map(move |d| (c, d)))
+        .map(|(c, d)| (dot(&rows[c], &rows[d]) / (norm[c] * norm[d])).abs())
+        .sum::<f32>()
+        / pairs as f32;
+    assert!(
+        mean_cos < 0.3,
+        "w1 rows are near-collinear: mean|cos|={mean_cos}"
+    );
+}
+
+/// The serve adds `bias = Σ_r w1[c][r]·w2[v][r]` in bf16, so a head whose bias
+/// never reaches half an ulp of the base logit (~0.03) is a bit-exact no-op no
+/// matter how well it trains. From `w2 = 0` AdamW moves each element by ~lr per
+/// step, so `|bias| ≈ sqrt(rank)·rms|w1|·(lr·steps)` — which pins how many
+/// publishes the shipped default needs before drafting can change at all.
+#[test]
+fn cold_start_default_lr_reaches_the_bf16_floor() {
+    let cfg = DsparkTrainConfig::default();
+    let rank = cfg.markov_rank as f32;
+    let rms_w1 = {
+        let n = 1 << 16;
+        let sq: f32 = (0..n)
+            .map(|i| train::dspark_train::markov_w1_init(i).powi(2))
+            .sum();
+        (sq / n as f32).sqrt()
+    };
+    let steps = 0.03 / (rank.sqrt() * rms_w1 * cfg.learning_rate);
+    assert!(
+        steps < 300.0,
+        "at lr {} a w2=0 cold start needs {steps:.0} steps to clear the bf16 floor",
+        cfg.learning_rate
+    );
+}

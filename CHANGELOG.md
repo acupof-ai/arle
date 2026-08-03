@@ -1417,3 +1417,17 @@ v0.2.1.
 
 
 > Older releases (0.1.x — pre-rewrite): see [CHANGELOG-history.md](CHANGELOG-history.md)
+
+### 2026-08-04 — default flip: DSpark train sidecar `learning_rate` 1e-4 → 1e-3
+
+The online DSpark Markov head trained but could not be observed: the bias reached
+~1e-3 while the serve adds it into bf16 draft logits whose half-ulp is ~0.03, so
+`base + bias` returned `base` bit-for-bit and drafting never changed. Compounding
+it, the cold-start `w1` used `0.02·sin(0.1·(i mod 1000))`, which aliases with
+period `gcd(1000, rank)` — 125 distinct rows for a 248320 vocab, all in a ~4-dim
+subspace, and `∂bias/∂w2 = w1[c]` made that the whole head's ceiling.
+
+`w1` now uses a per-element hash; `update_markov_weights` logs
+`rms|w1| rms|w2| est|bias|` against the bf16 floor on every publish.
+See [errors/2026-08-03-dspark-online-sidecar-degrades-regardless-of-loss.md](docs/experience/errors/2026-08-03-dspark-online-sidecar-degrades-regardless-of-loss.md).
+Serve-side measurement `pending-remote`.

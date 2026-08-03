@@ -61,6 +61,16 @@ pub struct DsparkExperience {
 const MARKOV_W1: &str = "markov_head.markov_w1.weight";
 const MARKOV_W2: &str = "markov_head.markov_w2.weight";
 
+/// Cold-start `w1[i]` in `[-0.02, 0.02)`. Must match the serve-side
+/// materialization in `infer-cuda/src/qwen35/dspark.rs`.
+pub fn markov_w1_init(i: usize) -> f32 {
+    let mut h = (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    h ^= h >> 29;
+    h = h.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    h ^= h >> 32;
+    0.04 * ((h >> 40) as f32 / (1u32 << 24) as f32) - 0.02
+}
+
 /// Read a head written by [`DsparkTrainer::save_weights`] back as host f32
 /// `(w1, w2)`, ready for `LoadedInferenceEngine::update_dspark_markov_weights`.
 pub fn load_markov_head(path: &Path) -> Result<(Vec<f32>, Vec<f32>)> {
@@ -139,7 +149,9 @@ impl Default for DsparkTrainConfig {
     fn default() -> Self {
         Self {
             markov_rank: 256,
-            learning_rate: 1e-4,
+            // AdamW moves |w2| by ~lr/step from a w2=0 cold start; at 1e-4 the
+            // bias needs ~3e3 steps to clear the bf16 floor the serve adds it in.
+            learning_rate: 1e-3,
             batch_size: 8,
             baseline_ema_alpha: 0.01,
             prob_match_alpha: 0.9,
@@ -180,6 +192,8 @@ pub struct DsparkTrainer {
     spectrum_probe: Option<crate::iso_spectrum::SpectrumProbe>,
     /// Position-weighted per-token accept rate, smoothed. Reported, never used.
     accept_ema: f32,
+    /// Trained rows in the last step — the reference sees ~1.8M, this sidecar ~30.
+    last_rows: usize,
     /// Per-parameter relative spectral drift measured at the last cadence — the
     /// paper's premise on this head, emitted on both ISO on/off. Empty until the
     /// first cadence.
@@ -233,6 +247,7 @@ impl DsparkTrainer {
             init_weights,
             optim,
             accept_ema: 0.0,
+            last_rows: 0,
             running,
         })
     }
@@ -268,13 +283,7 @@ impl DsparkTrainer {
                 // unfreezes w1 as it grows. Random-initializing both bolts a
                 // random rank-`markov_rank` bias onto a working drafter.
                 let rank = self.config.markov_rank;
-                let scale = 0.02;
-                let w1: Vec<f32> = (0..vocab_size * rank)
-                    .map(|i| {
-                        let s = (i % 1000) as f32;
-                        scale * (s * 0.1).sin()
-                    })
-                    .collect();
+                let w1: Vec<f32> = (0..vocab_size * rank).map(markov_w1_init).collect();
                 (rank, w1, vec![0.0; vocab_size * rank])
             }
         };
@@ -474,6 +483,7 @@ impl DsparkTrainer {
         if n_rows == 0 {
             return Ok(0.0);
         }
+        self.last_rows = n_rows;
         // #169 case probe: decoded per-row ground truth (drafted token vs base
         // draft argmax vs target argmax). Env-gated, capped, append-only.
         if let Some(path) = std::env::var_os("ARLE_DSPARK_DUMP") {
@@ -708,9 +718,10 @@ impl DsparkTrainer {
                         ),
                     };
                     eprintln!(
-                        "dspark_train: step={steps} loss={loss:.4} accept_ema={:.4} n={}{iso}",
+                        "dspark_train: step={steps} loss={loss:.4} accept_ema={:.4} n={} rows={}{iso}",
                         self.accept_ema,
-                        batch.len()
+                        batch.len(),
+                        self.last_rows
                     );
                     if steps.is_multiple_of(self.config.swap_every) {
                         self.publish(&on_weights, steps);
