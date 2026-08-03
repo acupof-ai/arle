@@ -407,9 +407,12 @@ fn tiny_full_attn_config() -> Qwen35Config {
         // ring fallback only, so its FA3-vs-scalar A/B was hollow. (Toy dim 2 is also
         // out: the single-card ref would fall back to f32, making parity f32-vs-bf16.)
         head_dim: 256,
-        linear_num_key_heads: 2,
+        // 8 GDN heads, not 2: linear-attn CP is head-parallel, so the transport
+        // refuses cp_size > heads — at 2 the gate could never reach the cp=8 that
+        // 256K training targets.
+        linear_num_key_heads: 8,
         linear_key_head_dim: 2,
-        linear_num_value_heads: 2,
+        linear_num_value_heads: 8,
         linear_value_head_dim: 2,
         linear_conv_kernel_dim: 4,
         rope_theta: 10_000.0,
