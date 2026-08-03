@@ -4,6 +4,7 @@
 //! buffers and model implementation details stay below `infer-seam`.
 
 use std::collections::{BTreeMap, VecDeque};
+use std::sync::OnceLock;
 
 mod planner;
 mod prefix;
@@ -707,7 +708,9 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         // Lazily warm the backend before the first step does any real work.
         self.warmup()?;
 
-        let diag = std::env::var_os("ARLE_STEP_DIAG").is_some();
+        // Cached: `step` runs per decode token and an env read takes a global lock.
+        static STEP_DIAG: OnceLock<bool> = OnceLock::new();
+        let diag = *STEP_DIAG.get_or_init(|| std::env::var_os("ARLE_STEP_DIAG").is_some());
         if let Some(inflight) = self.inflight.take() {
             match self.executor.poll(inflight)? {
                 PollResult::Ready(output) => {
@@ -1295,11 +1298,6 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             bail!("infer-core engine has waiting requests but zero slots");
         }
 
-        let mut free_slots = self.free_slots();
-        let running_cap = self.config.running_cap();
-        let mut remaining_prefill_tokens = self.config.prefill_step_budget();
-        let mut active_prefills = self.active_prefill_count();
-        let max_prefills = self.config.max_concurrent_prefill();
         // TP-synced: a rank-local `free_pages()` can differ across ranks (e.g.
         // per-rank KV-tier host-demote residuals), and this value gates the
         // same Admit/Throttle decision as the `cached_prefix_match_len`
@@ -1309,6 +1307,18 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         // docs/experience/errors/2026-07-05-multiproc-lockstep-ack-hang-no-timeout.md).
         let mut remaining_pages = self.executor.tp_sync_min(self.kv.free_pages())?;
         self.evict_prefix_cache_if_below_low_water();
+        // Nothing to admit — both loops below are waiter-driven, so skip the
+        // per-tick free-slot scan. Placed AFTER the collective so every rank
+        // still issues it on every tick.
+        if self.waiting.is_empty() {
+            return Ok(());
+        }
+
+        let mut free_slots = self.free_slots();
+        let running_cap = self.config.running_cap();
+        let mut remaining_prefill_tokens = self.config.prefill_step_budget();
+        let mut active_prefills = self.active_prefill_count();
+        let max_prefills = self.config.max_concurrent_prefill();
 
         while self.active.len() < running_cap {
             let Some(&slot) = free_slots.first() else {

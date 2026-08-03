@@ -300,7 +300,6 @@ fn engine_loop_with_tick_broadcaster<E, K>(
                 pending.len()
             );
         }
-        publish_counters(&engine, &counters);
 
         // 3. If there is engine work, run one tick and deliver any completions.
         //    Looping here (rather than one tick per outer pass) keeps latency low
@@ -347,6 +346,10 @@ fn engine_loop_with_tick_broadcaster<E, K>(
             publish_counters(&engine, &counters);
             continue;
         }
+
+        // Idle pass: the stepping branch above publishes on every tick, so this
+        // is the only other place counters can go stale.
+        publish_counters(&engine, &counters);
 
         // 4. Fully idle. If the frontend is gone and nothing remains, exit.
         if !submit_open {
