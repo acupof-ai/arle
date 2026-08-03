@@ -1,8 +1,9 @@
 use super::*;
 
-/// Whole-step Qwen3.5/3.6 decode graph enabled? `--qwen35-decode-graph true`
-/// opt-in, default OFF until the pod license (≥ +10% tok/s + needle gate +
-/// replay-reuse evidence per the bench spec). The eager path stays the
+/// Whole-step Qwen3.5/3.6 decode graph enabled? Default ON since 2026-08-03
+/// (paged lane license: −7.9% ITL, byte-identical greedy, MMLU 84/100 vs
+/// 80-81 baseline, 4100+ counted replays); `--qwen35-decode-graph false` is
+/// the escape hatch and the same-binary A/B arm. The eager path stays the
 /// correctness floor; `Qwen35CudaExecutor::warmup` additionally gates TP and
 /// host-routed MoE off regardless of this.
 fn qwen35_decode_graph_enabled() -> bool {

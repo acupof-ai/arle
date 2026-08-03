@@ -43,8 +43,9 @@ fn d_deepep_num_sms() -> u32 {
 /// CUDA executor runtime toggles, applied via `infer_cuda::apply_runtime_flags`.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct CudaRuntimeFlags {
-    /// Whole-step Qwen3.5/3.6 decode graph (opt-in until the pod license).
-    #[serde(default)]
+    /// Whole-step Qwen3.5/3.6 decode graph (paged lane licensed 2026-08-03:
+    /// −7.9% ITL, byte-identical greedy, MMLU parity).
+    #[serde(default = "d_true")]
     pub qwen35_decode_graph: bool,
     /// Batched rows>1 Qwen3.5/3.6 decode; off = sequential per-row A/B arm.
     #[serde(default = "d_true")]
@@ -126,7 +127,7 @@ pub struct CudaRuntimeFlags {
 impl Default for CudaRuntimeFlags {
     fn default() -> Self {
         Self {
-            qwen35_decode_graph: false,
+            qwen35_decode_graph: true,
             qwen35_batched_decode: true,
             qwen35_deepgemm: true,
             qwen35_moe_decode_kernel: true,
