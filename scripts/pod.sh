@@ -3,6 +3,15 @@ set -euo pipefail
 
 POD="${POD:-$HOME/bin/pod}"
 TN="${TN:-tn}"
+# One tree seen from two sides: `tn push` writes NODE_TREE, the pod reads POD_TREE.
+# Overriding one alone stages the sync tarball at the default node path and then
+# tells the pod to read the overridden one — "incomplete sync stage", far from the
+# cause (2026-08-04). Checked before the defaults land, or both always look set.
+if { [ -n "${POD_TREE:-}" ] && [ -z "${NODE_TREE:-}" ]; } ||
+   { [ -z "${POD_TREE:-}" ] && [ -n "${NODE_TREE:-}" ]; }; then
+  echo "POD_TREE and NODE_TREE must be set together (same tree, pod side and node side); got POD_TREE='${POD_TREE:-}' NODE_TREE='${NODE_TREE:-}'" >&2
+  exit 2
+fi
 NODE_TREE="${NODE_TREE:-/root/arle-build}"
 TREE="${POD_TREE:-/host/arle-build}"
 STATE="${POD_STATE:-/root/arle-ops}"
