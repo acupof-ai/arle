@@ -834,21 +834,10 @@ allow_sm70 = false
 ffi = true
 
 # ===========================================================================
-# Gated Delta Rule (Qwen3.5 fixed shape). build-only (ffi=false); 6 phases.
-# kernel_family "gdr"; allow_sm70=true (all phases).
+# Gated Delta Rule (Qwen3.5 fixed shape). build-only (ffi=false); 5 phases.
+# kernel_family "gdr"; allow_sm70=true (all phases). prepare + solve are
+# native CUDA C (csrc/recurrent/) — TileLang lowers them pathologically.
 # ===========================================================================
-
-[[kernel]]
-phase = "prepare"
-abi = "gdr_prepare_v1"
-kernel_family = "gdr"
-kernel_key = "gdr_chunk_prepare"
-py_module = "tools/tilelang/gated_delta_rule.py"
-artifact_dir = "gated_delta_rule_chunk_prepare"
-kernel_name = "gated_delta_rule_prefill_chunk_prepare"
-out_name = "tilelang_gated_delta_rule_chunk_prepare"
-allow_sm70 = true
-ffi = false
 
 [[kernel]]
 phase = "cumsum"

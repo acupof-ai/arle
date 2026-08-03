@@ -2,7 +2,11 @@
 
 The canonical chunk-wise GDR pipeline with TileLang AOT stages. The
 strict-lower triangular solve is kept as native CUDA C because TileLang 0.1.9
-cannot lower that stage's mixed-index fragment layout on sm_89.
+cannot lower that stage's mixed-index fragment layout on sm_89. The prepare
+stage is also native CUDA C (csrc/recurrent/gdr_prefill_prepare.cu): the
+TileLang lowering replicated the full q/k row into every thread's registers
+(local-memory spill, 128x redundant loads, 66 ms/layer vs ~0.1 ms roofline).
+Both stay in KERNELS below as lowering references only.
 
 Upstream references this file is adapted from (per user direction
 2026-05-05 "可以直接抄过来用"):
