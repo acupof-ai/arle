@@ -1963,33 +1963,9 @@ impl Qwen35Model {
         );
         let start_pos = rows[0].slot.seq_len();
         self.stage_step_inputs(ws, chains, start_pos)?;
-        self.dspark_verify_captured(rows, ws, start_pos, recall, taps)?;
-        self.finish_verify(rows, ws, seq_len)
-    }
-
-    /// The pure-GPU verify body over ALREADY-staged inputs: trunk forward,
-    /// final norm, lm_head into the persistent `ws.verify_logits`. No H2D, no
-    /// D2H, no sync, no host state advance — this is the CUDA-graph-capturable
-    /// region (the [`Qwen35Model::forward_hidden_staged`] contract, extended
-    /// through the lm_head).
-    pub(crate) fn dspark_verify_captured(
-        &self,
-        rows: &mut [super::LinearRow<'_>],
-        ws: &mut Qwen35Workspace,
-        start_pos: usize,
-        recall: &mut Qwen35RecallForward<'_>,
-        taps: &mut Qwen35DsparkTaps,
-    ) -> Result<()> {
-        let seq_len: usize = rows.iter().map(|r| r.len).sum();
         self.forward_hidden_staged(rows, ws, start_pos, Some(recall), Some(taps))?;
         let hidden_size = self.config.hidden_size;
-        let vocab = self.output_projection().rows;
-        let Qwen35Workspace {
-            hidden,
-            normed,
-            verify_logits,
-            ..
-        } = ws;
+        let Qwen35Workspace { hidden, normed, .. } = ws;
         let hidden = hidden.get(&self.ctx, hidden_size, seq_len)?;
         let normed = normed.get(&self.ctx, hidden_size, seq_len)?;
         super::rms_norm_offset(
@@ -1999,27 +1975,9 @@ impl Qwen35Model {
             self.config.rms_norm_eps,
             normed,
         )?;
-        let logits = verify_logits.get(&self.ctx, vocab, seq_len)?;
-        gemm_batch(&self.ctx, self.output_projection(), normed, logits)
-    }
-
-    /// Outside-capture tail shared by the eager and graphed verify lanes: lift
-    /// the logits out of the persistent slot, then advance the trunk rows.
-    pub(crate) fn finish_verify(
-        &self,
-        rows: &mut [super::LinearRow<'_>],
-        ws: &mut Qwen35Workspace,
-        seq_len: usize,
-    ) -> Result<HiddenStates> {
         let vocab = self.output_projection().rows;
         let mut logits = HiddenStates::zeros(&self.ctx, vocab, seq_len)?;
-        let src = ws.verify_logits.get(&self.ctx, vocab, seq_len)?;
-        // ponytail: one D2D (~2 µs) buys the owned return the accept path
-        // already expects; drop it if that path learns to read the slot.
-        self.ctx
-            .stream
-            .memcpy_dtod(&src.data, &mut logits.data)
-            .map_err(|e| anyhow!("verify logits lift failed: {e}"))?;
+        gemm_batch(&self.ctx, self.output_projection(), normed, &mut logits)?;
         self.ctx.sync()?;
         // Last: the caller rolls the pool back on any error here, and that only
         // restores consistency while the trunk seq_lens have not moved.
