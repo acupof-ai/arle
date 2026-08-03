@@ -261,7 +261,7 @@ impl CudaBackend {
     #[cfg(all(feature = "nccl", not(feature = "no-cuda")))]
     fn comm(&self, axis: CommAxis) -> Option<&Arc<NcclBackend>> {
         match axis {
-            CommAxis::World => self.nccl.as_ref(),
+            CommAxis::World | CommAxis::Expert => self.nccl.as_ref(),
             CommAxis::Seq => self.nccl_seq.as_ref(),
         }
     }
@@ -2403,6 +2403,146 @@ impl Backend for CudaBackend {
                     }
                     nccl.group_end()
                         .map_err(|_| AutogradError::TapeInvariant("ring group_end failed"))?;
+                }
+                return Ok(DeviceHandle::Cuda(CudaStorage::new(out)));
+            }
+            #[cfg(not(all(feature = "nccl", not(feature = "no-cuda"))))]
+            unreachable!("world>1 without nccl feature")
+        }
+    }
+
+    fn comm_world_rank(&self, axis: CommAxis) -> (usize, usize) {
+        #[cfg(all(feature = "nccl", not(feature = "no-cuda")))]
+        {
+            self.comm(axis)
+                .map_or((1, 0), |nccl| (nccl.world_size(), nccl.rank()))
+        }
+        #[cfg(not(all(feature = "nccl", not(feature = "no-cuda"))))]
+        {
+            let _ = axis;
+            (1, 0)
+        }
+    }
+
+    fn ep_exchange_rows_device(
+        &self,
+        x: &DeviceHandle,
+        dim: usize,
+        send_counts: &[usize],
+        recv_counts: &[usize],
+        axis: CommAxis,
+    ) -> Result<DeviceHandle> {
+        #[cfg(feature = "no-cuda")]
+        {
+            let _ = (x, dim, send_counts, recv_counts, axis);
+            todo!("GPU required: cuda ep_exchange_rows_device is unavailable under feature no-cuda")
+        }
+
+        #[cfg(not(feature = "no-cuda"))]
+        {
+            let send_rows: usize = send_counts.iter().sum();
+            let src = self.cuda_slice(x, "ep_exchange_rows")?;
+            if src.len() != send_rows * dim {
+                return Err(AutogradError::DataLengthMismatch {
+                    len: src.len(),
+                    shape: vec![send_rows, dim],
+                    size: send_rows * dim,
+                });
+            }
+
+            #[cfg(all(feature = "nccl", not(feature = "no-cuda")))]
+            let world = self.comm(axis).map_or(1, |nccl| nccl.world_size());
+            #[cfg(not(all(feature = "nccl", not(feature = "no-cuda"))))]
+            let world = 1usize;
+            if world <= 1 {
+                return Ok(x.clone());
+            }
+
+            #[cfg(all(feature = "nccl", not(feature = "no-cuda")))]
+            {
+                if send_counts.len() != world || recv_counts.len() != world {
+                    return Err(AutogradError::TapeInvariant(
+                        "ep_exchange_rows: counts length must equal the group size",
+                    ));
+                }
+                let nccl = self.comm(axis).expect("world>1 implies nccl present");
+                let rank = nccl.rank();
+                let recv_rows: usize = recv_counts.iter().sum();
+                let mut out = self
+                    .stream
+                    .alloc_zeros::<f32>(recv_rows * dim)
+                    .map_err(|_| AutogradError::TapeInvariant("ep_exchange recv alloc failed"))?;
+                let send_offs: Vec<usize> = send_counts
+                    .iter()
+                    .scan(0, |o, &c| {
+                        let s = *o;
+                        *o += c * dim;
+                        Some(s)
+                    })
+                    .collect();
+                let recv_offs: Vec<usize> = recv_counts
+                    .iter()
+                    .scan(0, |o, &c| {
+                        let s = *o;
+                        *o += c * dim;
+                        Some(s)
+                    })
+                    .collect();
+                // Own segment moves by D2D; peers pair inside one NCCL group.
+                if send_counts[rank] != recv_counts[rank] {
+                    return Err(AutogradError::TapeInvariant(
+                        "ep_exchange_rows: self send/recv counts must match",
+                    ));
+                }
+                if send_counts[rank] > 0 {
+                    let seg = send_offs[rank]..send_offs[rank] + send_counts[rank] * dim;
+                    let mut dst =
+                        out.slice_mut(recv_offs[rank]..recv_offs[rank] + recv_counts[rank] * dim);
+                    self.stream
+                        .memcpy_dtod(&src.slice(seg), &mut dst)
+                        .map_err(|_| AutogradError::TapeInvariant("ep_exchange self D2D failed"))?;
+                }
+                {
+                    let stream = self.stream.cu_stream().cast();
+                    let (src_ptr, _sg) = src.device_ptr(&self.stream);
+                    let (dst_ptr, _dg) = out.device_ptr_mut(&self.stream);
+                    nccl.group_start()
+                        .map_err(|_| AutogradError::TapeInvariant("ep_exchange group_start"))?;
+                    for j in 0..world {
+                        if j == rank {
+                            continue;
+                        }
+                        // SAFETY: offsets stay inside src/out (built from the same
+                        // counts the length checks above validated).
+                        unsafe {
+                            if send_counts[j] > 0 {
+                                nccl.send(
+                                    (src_ptr as *const f32).add(send_offs[j]).cast(),
+                                    send_counts[j] * dim,
+                                    DType::F32,
+                                    j,
+                                    stream,
+                                )
+                                .map_err(|_| {
+                                    AutogradError::TapeInvariant("ep_exchange send failed")
+                                })?;
+                            }
+                            if recv_counts[j] > 0 {
+                                nccl.recv(
+                                    (dst_ptr as *mut f32).add(recv_offs[j]).cast(),
+                                    recv_counts[j] * dim,
+                                    DType::F32,
+                                    j,
+                                    stream,
+                                )
+                                .map_err(|_| {
+                                    AutogradError::TapeInvariant("ep_exchange recv failed")
+                                })?;
+                            }
+                        }
+                    }
+                    nccl.group_end()
+                        .map_err(|_| AutogradError::TapeInvariant("ep_exchange group_end"))?;
                 }
                 return Ok(DeviceHandle::Cuda(CudaStorage::new(out)));
             }
