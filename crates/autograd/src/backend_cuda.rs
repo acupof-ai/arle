@@ -311,6 +311,18 @@ impl CudaBackend {
         todo!("GPU required: CudaBackend::mem_get_info is unavailable under feature no-cuda")
     }
 
+    /// Whether an NCCL communicator is attached (multi-rank collectives work).
+    #[cfg(all(feature = "nccl", not(feature = "no-cuda")))]
+    pub fn has_collective(&self) -> bool {
+        self.nccl.is_some()
+    }
+
+    /// Whether an NCCL communicator is attached (multi-rank collectives work).
+    #[cfg(not(all(feature = "nccl", not(feature = "no-cuda"))))]
+    pub fn has_collective(&self) -> bool {
+        false
+    }
+
     #[cfg(not(feature = "no-cuda"))]
     #[track_caller]
     fn upload_slice(&self, host: &[f32], shape: &[usize]) -> Result<CudaSlice<f32>> {
