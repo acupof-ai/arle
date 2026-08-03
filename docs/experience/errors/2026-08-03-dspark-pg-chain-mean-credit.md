@@ -4,17 +4,21 @@ Date: 2026-08-03 · `crates/train/src/dspark_train.rs`
 
 ## Context
 
-The one DSpark head on the pod (`/host/arle-runs/warm-head/`) got *worse* as it
-trained: over 44 steps its `accept_ema` fell 0.414 → 0.324. That is a
-single-run internal metric, so it is not exposed to the co-tenancy confound
-that invalidated the same day's serve-side sweep
-([retraction](2026-08-03-dspark-block-curve-was-cotenant-noise.md)) — and the
-cause below is a property of the update rule, derivable from the source without
-any benchmark.
+Found while reading the trainer after the one DSpark head on the pod
+(`/host/arle-runs/warm-head/`) appeared to get worse as it trained — its
+`accept_ema` fell 0.414 → 0.324 over 44 steps.
 
-The head's serve-side effect is **unmeasured**: the arms I ran to compare it
-against the un-headed drafter shared that sweep's co-tenancy defect. Re-measure
-on an empty box before quoting a number for it.
+**That symptom is withdrawn.** At `baseline_ema_alpha = 0.01` the EMA is seeded
+from the first batch and has a ~100-step time constant, so it declines
+monotonically from an unlucky seed whether or not training does anything; the
+2026-08-03 rerun's trajectory fits a constant-mean EMA to ≤0.7 pp with no trend
+term ([retraction](2026-08-03-dspark-online-sidecar-degrades-regardless-of-loss.md)).
+The head's serve-side effect is likewise unmeasured — the arms compared against
+the un-headed drafter shared a co-tenancy defect
+([retraction](2026-08-03-dspark-block-curve-was-cotenant-noise.md)).
+
+The bug below survives all of that because it is **derived from the update rule,
+not inferred from a metric**. No measurement supports or refutes it yet.
 
 ## Root Cause
 
