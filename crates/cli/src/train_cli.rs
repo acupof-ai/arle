@@ -22,9 +22,9 @@ use crate::args::{ModelArgs, ModelCommand, ModelDownloadArgs, ModelSourceArg};
 use crate::{
     args::{
         KlDirectionArg, LrScheduleArg, ModelFamilyArg, OpdBackendArg, OpdKlMaskArg,
-        OpdSftAnchorArg, OpdTeacherRuntimeArg, PretrainPresetArg, SaveDtypeArg, TrainAgentOpdArgs,
-        TrainArgs, TrainCcConvertArgs, TrainCommand, TrainEnvArgs, TrainEstimateMemoryArgs,
-        TrainOpdArgs, TrainPplArgs, TrainRubricOpdArgs, TrainSelfOpdArgs,
+        OpdSftAnchorArg, OpdTeacherRuntimeArg, PretrainPresetArg, SaveDtypeArg, TapeDtypeArg,
+        TrainAgentOpdArgs, TrainArgs, TrainCcConvertArgs, TrainCommand, TrainEnvArgs,
+        TrainEstimateMemoryArgs, TrainOpdArgs, TrainPplArgs, TrainRubricOpdArgs, TrainSelfOpdArgs,
     },
     hardware, hub_discovery,
 };
@@ -1119,6 +1119,7 @@ fn run_opd_from_dirs(args: TrainOpdArgs) -> Result<()> {
     };
 
     let (mut store, train_backend, backend_label) = build_opd_store(args.backend)?;
+    apply_tape_dtype(&mut store, args.tape_dtype)?;
     let mut tape = Tape::new();
 
     let teacher_model = if corpus_sft_only {
@@ -1510,6 +1511,7 @@ fn run_opd_smoke(args: TrainOpdArgs) -> Result<()> {
     }
 
     let (mut store, _train_backend, backend_label) = build_opd_store(args.backend)?;
+    apply_tape_dtype(&mut store, args.tape_dtype)?;
     let mut tape = Tape::new();
     let teacher = Qwen35Model::new_for_eval(&cfg, &mut store).context("build smoke teacher")?;
     let teacher_forward = train::teacher_infer::InProcessTeacher::new(&teacher);
@@ -1834,6 +1836,7 @@ fn run_rubric_opd_impl(args: TrainRubricOpdArgs) -> Result<()> {
     };
 
     let (mut store, train_backend, _backend_label) = build_opd_store(args.backend)?;
+    apply_tape_dtype(&mut store, args.tape_dtype)?;
 
     // Vocab is read from the checkpoint config (not the autograd student) so the
     // rollout engine can load BEFORE the autograd student when `--share-frozen-base`
@@ -2760,7 +2763,7 @@ fn run_agent_opd_replay(
         Vec::new()
     };
     let (mut store, train_backend, backend_label) = build_opd_store(args.backend)?;
-    store.set_tape_dtype(args.tape_dtype.as_tape_dtype());
+    apply_tape_dtype(&mut store, args.tape_dtype)?;
 
     eprintln!(
         "[arle train agent-opd] replay: {} record(s) from {} on {backend_label} (no rollout engine)",
@@ -3026,7 +3029,7 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
         .context("launch pre-CUDA sandbox-spawner helper")?;
 
     let (mut store, train_backend, _backend_label) = build_opd_store(args.backend)?;
-    store.set_tape_dtype(args.tape_dtype.as_tape_dtype());
+    apply_tape_dtype(&mut store, args.tape_dtype)?;
 
     // Vocab from the checkpoint config (not the autograd student) so the rollout
     // engine can load BEFORE the autograd student when `--share-frozen-base` is
@@ -4114,6 +4117,7 @@ fn run_self_opd_from_dir(args: TrainSelfOpdArgs) -> Result<()> {
     };
 
     let (mut store, train_backend, backend_label) = build_opd_store(args.backend)?;
+    apply_tape_dtype(&mut store, args.tape_dtype)?;
     let mut tape = Tape::new();
 
     eprintln!(
@@ -4386,6 +4390,7 @@ fn run_self_opd_smoke(args: TrainSelfOpdArgs) -> Result<()> {
     }
 
     let (mut store, _train_backend, backend_label) = build_opd_store(args.backend)?;
+    apply_tape_dtype(&mut store, args.tape_dtype)?;
     let mut tape = Tape::new();
     let student = Qwen35Model::new_with_lora_targets(&cfg, lora, target_set, &mut store)
         .context("build smoke LoRA student")?;
@@ -4682,6 +4687,19 @@ fn maybe_preoffload_infer_teacher_before_steps(
         "opd_engine_offload teacher_pre_step_offloaded freed_bytes={freed} freed_mib={:.1}",
         freed as f64 / (1024.0 * 1024.0)
     );
+    Ok(())
+}
+
+/// Bf16 tape is CUDA-only; bail instead of silently training on an f32 tape.
+fn apply_tape_dtype(store: &mut TensorStore, requested: TapeDtypeArg) -> Result<()> {
+    store.set_tape_dtype(requested.as_tape_dtype());
+    if requested == TapeDtypeArg::Bf16 && store.backend().tape_dtype() != autograd::TapeDtype::Bf16
+    {
+        bail!(
+            "--tape-dtype bf16 is a no-op on the {:?} backend; use --backend cuda",
+            store.backend().device()
+        );
+    }
     Ok(())
 }
 
