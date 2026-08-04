@@ -205,7 +205,7 @@ unsafe extern "C" {
 }
 
 // ============================================================================
-// FlashQLA chunked GDR fwd — TileLang AOT, Hopper-only, DK=DV=128/chunk=64,
+// FlashQLA chunked GDR fwd+bwd — TileLang AOT, Hopper-only, DK=DV=128/chunk=64,
 // one symbol triple per (H, Hg) instantiation (kernels.toml): unsuffixed =
 // H=32/Hg=16, `_h48` = H=48/Hg=16. Non-sm90 builds link
 // CUDA_ERROR_NOT_SUPPORTED stubs; `gdr_fq_prep_cuda` is native CUDA C
@@ -220,6 +220,13 @@ unsafe extern "C" {
 //   fwd:    (q,k,v,a_inv,g_cumsum,beta,h0) -> o [S,H,128] bf16, ht
 //           h0/ht may BOTH point at the slot state [H,128,128] f32
 //           (each CTA reads its h0 slice fully before writing ht).
+//
+// Backward (training only; the fwd runs with store_h off):
+//   prepare_h: (k,v,a_inv,g_cumsum,beta,h0) -> h [num_chunks,H,128,128] bf16
+//   bwd:       (dout,dht,q,k,v,a_inv,g_cumsum,beta,h)
+//              -> dq/dk/dv [S,H,128] bf16, dg/dbeta [S,H] f32, dh0
+//              dq/dk carry the VALUE-head axis: with Hg<H the caller sums the
+//              head group. dg is w.r.t. g_cumsum, not the per-token g.
 // ============================================================================
 
 pub type FqCumsumFn = unsafe extern "C" fn(*const f32, *mut f32, i32, CUstream) -> CUresult;
@@ -235,6 +242,38 @@ pub type FqFwdFn = unsafe extern "C" fn(
     *const f32,
     *const f32,
     *mut Half,
+    *mut f32,
+    i32,
+    CUstream,
+) -> CUresult;
+#[allow(clippy::type_complexity)]
+pub type FqPrepareHFn = unsafe extern "C" fn(
+    *const Half,
+    *const Half,
+    *const Half,
+    *const f32,
+    *const f32,
+    *const f32,
+    *mut Half,
+    i32,
+    CUstream,
+) -> CUresult;
+#[allow(clippy::type_complexity)]
+pub type FqBwdFn = unsafe extern "C" fn(
+    *const Half,
+    *const f32,
+    *const Half,
+    *const Half,
+    *const Half,
+    *const Half,
+    *const f32,
+    *const f32,
+    *const Half,
+    *mut Half,
+    *mut Half,
+    *mut Half,
+    *mut f32,
+    *mut f32,
     *mut f32,
     i32,
     CUstream,
@@ -289,6 +328,38 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    pub fn gdr_fq_prepare_h_cuda(
+        k: *const Half,
+        v: *const Half,
+        a_inv: *const Half,
+        g_cumsum: *const f32,
+        beta: *const f32,
+        h0: *const f32,
+        h: *mut Half,
+        seq_len: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn gdr_fq_bwd_cuda(
+        dout: *const Half,
+        dht: *const f32,
+        q: *const Half,
+        k: *const Half,
+        v: *const Half,
+        a_inv: *const Half,
+        g_cumsum: *const f32,
+        beta: *const f32,
+        h: *const Half,
+        dq: *mut Half,
+        dk: *mut Half,
+        dv: *mut Half,
+        dg: *mut f32,
+        dbeta: *mut f32,
+        dh0: *mut f32,
+        seq_len: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn gdr_fq_cumsum_h48_cuda(
         g_in: *const f32,
         g_out: *mut f32,
@@ -314,6 +385,38 @@ unsafe extern "C" {
         h0: *const f32,
         o: *mut Half,
         ht: *mut f32,
+        seq_len: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn gdr_fq_prepare_h_h48_cuda(
+        k: *const Half,
+        v: *const Half,
+        a_inv: *const Half,
+        g_cumsum: *const f32,
+        beta: *const f32,
+        h0: *const f32,
+        h: *mut Half,
+        seq_len: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn gdr_fq_bwd_h48_cuda(
+        dout: *const Half,
+        dht: *const f32,
+        q: *const Half,
+        k: *const Half,
+        v: *const Half,
+        a_inv: *const Half,
+        g_cumsum: *const f32,
+        beta: *const f32,
+        h: *const Half,
+        dq: *mut Half,
+        dk: *mut Half,
+        dv: *mut Half,
+        dg: *mut f32,
+        dbeta: *mut f32,
+        dh0: *mut f32,
         seq_len: i32,
         stream: CUstream,
     ) -> CUresult;

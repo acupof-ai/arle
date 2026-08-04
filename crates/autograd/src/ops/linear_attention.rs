@@ -327,6 +327,8 @@ pub fn linear_attention_core(
             g: None,
             beta: None,
             chunk_state: None,
+            raw_output: None,
+            flashqla: false,
             initial_state: None,
             initial_conv_window: None,
             batch: params.batch,
@@ -989,6 +991,8 @@ pub fn linear_attention_core_with_carry_taped(
             g: None,
             beta: None,
             chunk_state: None,
+            raw_output: None,
+            flashqla: false,
             initial_state,
             initial_conv_window,
             batch: params.batch,
@@ -1130,16 +1134,30 @@ fn try_linear_attention_forward_device(
             .alloc_device_tensor(vec![params.batch, params.seq_len, qkv_dim], result.qkv_conv)?;
         let g_id = store.alloc_device_tensor(head_shape.clone(), result.g)?;
         let beta_id = store.alloc_device_tensor(head_shape, result.beta)?;
+        let flashqla = result.flashqla;
+        // FlashQLA keeps only chunk 0 (the state carry) — it recomputes the rest.
         let chunk_state_id = store.alloc_device_tensor(
             vec![
                 params.batch,
-                num_chunks,
+                if result.flashqla { 1 } else { num_chunks },
                 params.num_value_heads,
                 params.key_dim,
                 params.value_dim,
             ],
             result.chunk_state,
         )?;
+        let raw_output_id = flashqla
+            .then(|| {
+                store.alloc_device_tensor(
+                    vec![
+                        params.batch,
+                        params.seq_len,
+                        params.num_value_heads * params.value_dim,
+                    ],
+                    result.raw_output,
+                )
+            })
+            .transpose()?;
         TapeEntry {
             op: BackwardOp::LinearAttention,
             output_id,
@@ -1167,6 +1185,8 @@ fn try_linear_attention_forward_device(
                 g: Some(g_id),
                 beta: Some(beta_id),
                 chunk_state: Some(chunk_state_id),
+                raw_output: raw_output_id,
+                flashqla,
                 // State carry lives in chunk_state[0] → None (Some would misfire
                 // needs_host_recompute). Conv carry is a real backward input → keep it.
                 initial_state: None,
@@ -1202,6 +1222,8 @@ fn try_linear_attention_backward_device(
     g: Option<TensorId>,
     beta: Option<TensorId>,
     chunk_state: Option<TensorId>,
+    raw_output: Option<TensorId>,
+    flashqla: bool,
     initial_conv_window: Option<TensorId>,
     params: LinearAttentionParams,
     store: &mut TensorStore,
@@ -1224,6 +1246,9 @@ fn try_linear_attention_backward_device(
     let Some(chunk_state) = chunk_state else {
         return Ok(None);
     };
+    if flashqla && raw_output.is_none() {
+        return Ok(None);
+    }
 
     for tensor_id in [
         output_grad_id,
@@ -1240,7 +1265,10 @@ fn try_linear_attention_backward_device(
         g,
         beta,
         chunk_state,
-    ] {
+    ]
+    .into_iter()
+    .chain(raw_output)
+    {
         store.ensure_device(tensor_id)?;
     }
 
@@ -1268,6 +1296,7 @@ fn try_linear_attention_backward_device(
     let g_handle = handle(store, g)?;
     let beta_handle = handle(store, beta)?;
     let chunk_state_handle = handle(store, chunk_state)?;
+    let raw_output_handle = raw_output.map(|id| handle(store, id)).transpose()?;
     let conv_tail_handle = initial_conv_window
         .map(|id| {
             store.ensure_device(id)?;
@@ -1303,6 +1332,8 @@ fn try_linear_attention_backward_device(
                 g: &g_handle,
                 beta: &beta_handle,
                 chunk_state: &chunk_state_handle,
+                raw_output: raw_output_handle.as_ref(),
+                flashqla,
                 initial_conv_window: conv_tail_handle.as_ref(),
             })?
     else {
@@ -1398,6 +1429,8 @@ pub(crate) fn linear_attention_backward(
         g,
         beta,
         chunk_state,
+        raw_output,
+        flashqla,
         initial_state,
         initial_conv_window,
         batch,
@@ -1458,6 +1491,8 @@ pub(crate) fn linear_attention_backward(
             g,
             beta,
             chunk_state,
+            raw_output,
+            flashqla,
             initial_conv_window,
             params,
             store,

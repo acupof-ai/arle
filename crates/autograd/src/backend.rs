@@ -419,6 +419,9 @@ pub struct LinearAttentionDeviceForwardResult {
     pub a_inv: DeviceHandle,
     pub chunk_state: DeviceHandle,
     pub raw_output: DeviceHandle,
+    /// The forward took the FlashQLA chunkwise route, so the backward must too.
+    /// Recorded on the tape: the runtime flag can flip between calls.
+    pub flashqla: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -437,7 +440,11 @@ pub struct LinearAttentionDeviceBackwardArgs<'a> {
     pub qkv_conv: &'a DeviceHandle,
     pub g: &'a DeviceHandle,
     pub beta: &'a DeviceHandle,
+    /// FlashQLA route: only chunk 0 (= the state carry). Otherwise every chunk.
     pub chunk_state: &'a DeviceHandle,
+    /// FlashQLA route: the GDN output the rms-gated backward differentiates.
+    pub raw_output: Option<&'a DeviceHandle>,
+    pub flashqla: bool,
     // OPD conv carry (None = default). Feeds the conv1d backward boundary taps'
     // grad_weight; the recurrent state carry lives in chunk_state[0], not here.
     pub initial_conv_window: Option<&'a DeviceHandle>,

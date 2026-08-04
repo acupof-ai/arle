@@ -572,6 +572,273 @@ extern "C" __global__ void linear_attention_rms_gated_forward_f32_from_bf16(
     }
 }
 
+// Backward of the gated RMS-norm head, split out so the FlashQLA route can
+// hand the GDN core a plain dO. One block per (token, value head) row.
+extern "C" __global__ void linear_attention_rms_gated_backward_f32_to_bf16(
+    unsigned short* __restrict__ d_raw,
+    float* __restrict__ dz,
+    float* __restrict__ dnorm,
+    const unsigned short* __restrict__ raw_output,
+    const float* __restrict__ z,
+    const float* __restrict__ upstream,
+    const float* __restrict__ norm_weight,
+    int rows,
+    int value_dim,
+    float eps
+) {
+    extern __shared__ float smem[];
+    int row = blockIdx.x;
+    if (row >= rows) {
+        return;
+    }
+    int tid = threadIdx.x;
+    int block = blockDim.x;
+    const unsigned short* row_x = raw_output + (long long)row * value_dim;
+    const float* row_z = z + (long long)row * value_dim;
+    const float* row_up = upstream + (long long)row * value_dim;
+    unsigned short* row_d = d_raw + (long long)row * value_dim;
+
+    float local_sq = 0.0f;
+    for (int i = tid; i < value_dim; i += block) {
+        float x = la_bf16_to_float(row_x[i]);
+        local_sq += x * x;
+    }
+    smem[tid] = local_sq;
+    __syncthreads();
+    for (int step = block / 2; step > 0; step >>= 1) {
+        if (tid < step) {
+            smem[tid] += smem[tid + step];
+        }
+        __syncthreads();
+    }
+    float inv_rms = rsqrtf((smem[0] / (float)value_dim) + eps);
+    __syncthreads();
+
+    float local_dot = 0.0f;
+    for (int i = tid; i < value_dim; i += block) {
+        float x = la_bf16_to_float(row_x[i]);
+        float gate = row_z[i];
+        float up = row_up[i];
+        float dcore = up * la_silu(gate);
+        dz[(long long)row * value_dim + i] =
+            up * x * inv_rms * norm_weight[i] * la_silu_grad(gate);
+        atomicAdd(&dnorm[i], dcore * x * inv_rms);
+        local_dot += dcore * x * norm_weight[i];
+    }
+    smem[tid] = local_dot;
+    __syncthreads();
+    for (int step = block / 2; step > 0; step >>= 1) {
+        if (tid < step) {
+            smem[tid] += smem[tid + step];
+        }
+        __syncthreads();
+    }
+    float dot_beta = smem[0];
+    float coeff = inv_rms * inv_rms * inv_rms / (float)value_dim;
+    for (int i = tid; i < value_dim; i += block) {
+        float x = la_bf16_to_float(row_x[i]);
+        float dcore = row_up[i] * la_silu(row_z[i]);
+        row_d[i] = la_float_to_bf16(
+            dcore * norm_weight[i] * inv_rms - x * coeff * dot_beta);
+    }
+}
+
+// Backward of gdr_fq_prep + the chunk-local cumsum: takes the FlashQLA core
+// grads and lands them on qkv_conv / a_proj / b_proj / dt_bias / A_log.
+// grid = num_chunks * batch * value heads, chunk-major.
+// dq/dk arrive on the VALUE-head axis, so the Hg<H group sums via atomicAdd —
+// exact, because the l2-norm Jacobian is linear in the incoming grad.
+extern "C" __global__ void linear_attention_gdr_prepare_backward_f32(
+    float* __restrict__ dqkv_conv,
+    float* __restrict__ db,
+    float* __restrict__ da,
+    float* __restrict__ ddt,
+    float* __restrict__ da_log,
+    const unsigned short* __restrict__ dq,
+    const unsigned short* __restrict__ dk,
+    const unsigned short* __restrict__ dv,
+    const float* __restrict__ dg_cumsum,
+    const float* __restrict__ dbeta,
+    const unsigned short* __restrict__ qkv_conv,
+    const float* __restrict__ a_proj,
+    const float* __restrict__ dt_bias,
+    const float* __restrict__ a_log,
+    const float* __restrict__ beta,
+    int batch,
+    int seq_len,
+    int num_key_heads,
+    int num_value_heads,
+    int key_dim,
+    int value_dim,
+    int qkv_dim
+) {
+    constexpr int BT = 64;
+    __shared__ float dg_tok[BT];
+    __shared__ float reduce[LINEAR_ATTENTION_BLOCK];
+    __shared__ float scalar0;
+    __shared__ float scalar1;
+
+    int rows = batch * num_value_heads;
+    int row = blockIdx.x % rows;
+    int batch_idx = row / num_value_heads;
+    int value_head = row - batch_idx * num_value_heads;
+    if (batch_idx >= batch || key_dim > LINEAR_ATTENTION_MAX_DIM ||
+        value_dim > LINEAR_ATTENTION_MAX_DIM) {
+        return;
+    }
+    int base = (blockIdx.x / rows) * BT;
+    int limit = seq_len - base;
+    if (limit > BT) {
+        limit = BT;
+    }
+    if (limit <= 0) {
+        return;
+    }
+
+    int tid = threadIdx.x;
+    int block = blockDim.x;
+    int q_dim = num_key_heads * key_dim;
+    int v_offset = q_dim + q_dim;
+    int key_head = value_head * num_key_heads / num_value_heads;
+    float exp_a = expf(a_log[value_head]);
+
+    // dg is w.r.t. the chunk-local cumsum: reverse-inclusive-sum it back per token.
+    for (int t = tid; t < BT; t += block) {
+        dg_tok[t] = t < limit
+            ? dg_cumsum[la_idx3(batch_idx, base + t, value_head, seq_len,
+                                num_value_heads)]
+            : 0.0f;
+    }
+    __syncthreads();
+    if (tid == 0) {
+        for (int t = limit - 2; t >= 0; --t) {
+            dg_tok[t] += dg_tok[t + 1];
+        }
+    }
+    __syncthreads();
+
+    for (int local_t = 0; local_t < limit; ++local_t) {
+        int seq_idx = base + local_t;
+        long long v_row =
+            ((long long)seq_idx * num_value_heads + value_head) * value_dim;
+
+        float local_qq = 0.0f;
+        float local_kk = 0.0f;
+        float local_qd = 0.0f;
+        float local_kd = 0.0f;
+        for (int i = tid; i < key_dim; i += block) {
+            float qr = la_bf16_to_float(qkv_conv[la_idx3(
+                batch_idx, seq_idx, key_head * key_dim + i, seq_len, qkv_dim)]);
+            float kr = la_bf16_to_float(qkv_conv[la_idx3(
+                batch_idx, seq_idx, q_dim + key_head * key_dim + i, seq_len,
+                qkv_dim)]);
+            local_qq += qr * qr;
+            local_kk += kr * kr;
+            local_qd += qr * la_bf16_to_float(dq[v_row + i]);
+            local_kd += kr * la_bf16_to_float(dk[v_row + i]);
+        }
+
+        reduce[tid] = local_qq;
+        __syncthreads();
+        for (int step = block / 2; step > 0; step >>= 1) {
+            if (tid < step) {
+                reduce[tid] += reduce[tid + step];
+            }
+            __syncthreads();
+        }
+        if (tid == 0) {
+            scalar0 = sqrtf(reduce[0] + 1.0e-12f);
+        }
+        __syncthreads();
+        float q_norm = scalar0;
+
+        reduce[tid] = local_kk;
+        __syncthreads();
+        for (int step = block / 2; step > 0; step >>= 1) {
+            if (tid < step) {
+                reduce[tid] += reduce[tid + step];
+            }
+            __syncthreads();
+        }
+        if (tid == 0) {
+            scalar1 = sqrtf(reduce[0] + 1.0e-12f);
+        }
+        __syncthreads();
+        float k_norm = scalar1;
+
+        reduce[tid] = local_qd;
+        __syncthreads();
+        for (int step = block / 2; step > 0; step >>= 1) {
+            if (tid < step) {
+                reduce[tid] += reduce[tid + step];
+            }
+            __syncthreads();
+        }
+        if (tid == 0) {
+            scalar0 = reduce[0];
+        }
+        __syncthreads();
+        float q_dot = scalar0;
+
+        reduce[tid] = local_kd;
+        __syncthreads();
+        for (int step = block / 2; step > 0; step >>= 1) {
+            if (tid < step) {
+                reduce[tid] += reduce[tid + step];
+            }
+            __syncthreads();
+        }
+        if (tid == 0) {
+            scalar1 = reduce[0];
+        }
+        __syncthreads();
+        float k_dot = scalar1;
+
+        float q_norm_cubed = q_norm * q_norm * q_norm;
+        float k_norm_cubed = k_norm * k_norm * k_norm;
+        for (int i = tid; i < key_dim; i += block) {
+            float qr = la_bf16_to_float(qkv_conv[la_idx3(
+                batch_idx, seq_idx, key_head * key_dim + i, seq_len, qkv_dim)]);
+            float kr = la_bf16_to_float(qkv_conv[la_idx3(
+                batch_idx, seq_idx, q_dim + key_head * key_dim + i, seq_len,
+                qkv_dim)]);
+            float dqn = la_bf16_to_float(dq[v_row + i]);
+            float dkn = la_bf16_to_float(dk[v_row + i]);
+            atomicAdd(
+                &dqkv_conv[la_idx3(batch_idx, seq_idx, key_head * key_dim + i,
+                                   seq_len, qkv_dim)],
+                dqn / q_norm - qr * q_dot / q_norm_cubed);
+            atomicAdd(
+                &dqkv_conv[la_idx3(batch_idx, seq_idx,
+                                   q_dim + key_head * key_dim + i, seq_len,
+                                   qkv_dim)],
+                dkn / k_norm - kr * k_dot / k_norm_cubed);
+        }
+        for (int i = tid; i < value_dim; i += block) {
+            atomicAdd(
+                &dqkv_conv[la_idx3(batch_idx, seq_idx,
+                                   v_offset + value_head * value_dim + i,
+                                   seq_len, qkv_dim)],
+                la_bf16_to_float(dv[v_row + i]));
+        }
+
+        if (tid == 0) {
+            unsigned long long head_idx = la_idx3(
+                batch_idx, seq_idx, value_head, seq_len, num_value_heads);
+            float softplus_input = a_proj[head_idx] + dt_bias[value_head];
+            float softplus_value = la_softplus(softplus_input);
+            float softplus_grad = la_sigmoid(softplus_input);
+            float common = dg_tok[local_t] * (-exp_a);
+            da[head_idx] = common * softplus_grad;
+            atomicAdd(&ddt[value_head], common * softplus_grad);
+            atomicAdd(&da_log[value_head], common * softplus_value);
+            float beta_value = beta[head_idx];
+            db[head_idx] = dbeta[head_idx] * beta_value * (1.0f - beta_value);
+        }
+        __syncthreads();
+    }
+}
+
 extern "C" __global__ void linear_attention_chunked_scan_backward_f32(
     float* __restrict__ dqkv_conv,
     float* __restrict__ dz,

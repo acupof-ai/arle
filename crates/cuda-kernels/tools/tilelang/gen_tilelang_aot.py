@@ -415,7 +415,7 @@ FLASHQLA_SCALAR_INPUTS = {
     "seq_end_idx": ("int32_t", "seq_len"),
 }
 
-FLASHQLA_KEYS = ("fq_cumsum", "fq_kkt", "fq_fwd")
+FLASHQLA_KEYS = ("fq_cumsum", "fq_kkt", "fq_fwd", "fq_prepare_h", "fq_bwd")
 
 
 def flashqla_specs(num_heads: int) -> dict:
@@ -473,6 +473,75 @@ def flashqla_specs(num_heads: int) -> dict:
         scalar_inputs=FLASHQLA_SCALAR_INPUTS,
         prelude="",
         grid=f"""    int grid_x = {2 * num_heads};  /* ceildiv(DV=128, block_DV=64) * batch(1) * H */
+    int grid_y = 1;
+    int grid_z = 1;""",
+        block="512, 1, 1",
+    ),
+    "fq_prepare_h": WrapperSpec(
+        public_params="""    const uint16_t *k,
+    const uint16_t *v,
+    const uint16_t *a_inv,
+    const float *g_cumsum,
+    const float *beta,
+    const float *h0,
+    uint16_t *h,
+    int32_t seq_len,
+    CUstream stream""",
+        tensor_inputs={
+            "k": "k",
+            "v": "v",
+            "a": "a_inv",
+            "g": "g_cumsum",
+            "b": "beta",
+            "h0": "h0",
+            "h": "h",
+        },
+        scalar_inputs=FLASHQLA_SCALAR_INPUTS,
+        prelude="",
+        grid=f"""    int grid_x = {num_heads};  /* batch(1) * H */
+    int grid_y = 1;
+    int grid_z = 1;""",
+        block="512, 1, 1",
+    ),
+    # `do` is a C keyword — the public param is `dout`.
+    "fq_bwd": WrapperSpec(
+        public_params="""    const uint16_t *dout,
+    const float *dht,
+    const uint16_t *q,
+    const uint16_t *k,
+    const uint16_t *v,
+    const uint16_t *a_inv,
+    const float *g_cumsum,
+    const float *beta,
+    const uint16_t *h,
+    uint16_t *dq,
+    uint16_t *dk,
+    uint16_t *dv,
+    float *dg,
+    float *dbeta,
+    float *dh0,
+    int32_t seq_len,
+    CUstream stream""",
+        tensor_inputs={
+            "do": "dout",
+            "dht": "dht",
+            "q": "q",
+            "k": "k",
+            "v": "v",
+            "a": "a_inv",
+            "g": "g_cumsum",
+            "b": "beta",
+            "h": "h",
+            "dq": "dq",
+            "dk": "dk",
+            "dv": "dv",
+            "dg": "dg",
+            "db": "dbeta",
+            "dh0": "dh0",
+        },
+        scalar_inputs=FLASHQLA_SCALAR_INPUTS,
+        prelude="",
+        grid=f"""    int grid_x = {num_heads};  /* batch(1) * H */
     int grid_y = 1;
     int grid_z = 1;""",
         block="512, 1, 1",
