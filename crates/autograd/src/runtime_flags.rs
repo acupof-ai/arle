@@ -1,7 +1,6 @@
 //! Train-time runtime toggles: `arle train … --flag` →
 //! [`apply_runtime_flags`] once at CLI start. The statics are the single
-//! truth — no env reads, except [`cp_ring_fa3`]: `ARLE_CP_RING_FA3` is read
-//! once so the pod scalar-vs-FA3 A/B runs one binary without CLI re-plumbing.
+//! truth — no env reads.
 
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering::Relaxed};
 
@@ -101,19 +100,6 @@ pub(crate) fn decode_attn_legacy() -> bool {
 #[cfg_attr(any(not(feature = "cuda"), feature = "no-cuda"), allow(dead_code))]
 pub(crate) fn tape_precision() -> TapePrecision {
     TapePrecision::from_u8(TAPE_PRECISION.load(Relaxed))
-}
-/// FA3 route for the CP ring per-block kernels. Default OFF until the hd256
-/// CP grad-parity gate is green — measured 2.17x/step, but its first correctness
-/// A/B ran at hd128 where FA3 never engages. `ARLE_CP_RING_FA3=1` opts in;
-/// hd256 / sm90 / real-kernel-marker gating still applies at the callsite.
-#[cfg_attr(any(not(feature = "cuda"), feature = "no-cuda"), allow(dead_code))]
-pub(crate) fn cp_ring_fa3() -> bool {
-    static CP_RING_FA3: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *CP_RING_FA3.get_or_init(|| {
-        std::env::var("ARLE_CP_RING_FA3")
-            .ok()
-            .is_some_and(|v| matches!(v.trim(), "1" | "true" | "on"))
-    })
 }
 /// `true` when retained activations + emitted grads store bf16 (CUDA-only path).
 #[cfg_attr(any(not(feature = "cuda"), feature = "no-cuda"), allow(dead_code))]
