@@ -136,6 +136,8 @@ const FUNCTION_NAMES: &[&str] = &[
     "linear_attention_conv1d_silu_boundary_f32_to_bf16",
     "linear_attention_copy_f32",
     "linear_attention_rms_gated_forward_f32_from_bf16",
+    "linear_attention_rms_gated_backward_f32_to_bf16",
+    "linear_attention_gdr_prepare_backward_f32",
     "linear_attention_chunked_scan_backward_f32",
     "linear_attention_chunk_transfer_f32",
     "linear_attention_chunk_carry_f32",

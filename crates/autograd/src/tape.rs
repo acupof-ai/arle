@@ -157,7 +157,13 @@ pub enum SavedContext {
         qkv_conv: Option<TensorId>,
         g: Option<TensorId>,
         beta: Option<TensorId>,
+        /// FlashQLA route: chunk 0 only (the state carry). Otherwise every chunk.
         chunk_state: Option<TensorId>,
+        /// FlashQLA route only: the pre-norm GDN output its backward differentiates.
+        raw_output: Option<TensorId>,
+        /// Which forward route ran. The runtime flag can flip between calls, so
+        /// the backward reads this instead of re-checking the flag.
+        flashqla: bool,
         /// OPD frozen-prompt-KV carry: seeds the recurrent state + conv window
         /// from a prior (prompt) segment so the backward recompute reproduces the
         /// forward exactly. `None` for the default full-sequence path.
