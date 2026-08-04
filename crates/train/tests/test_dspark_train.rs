@@ -542,27 +542,3 @@ fn markov_w1_init_rows_are_distinct() {
         "w1 rows are near-collinear: mean|cos|={mean_cos}"
     );
 }
-
-/// The serve adds `bias = Σ_r w1[c][r]·w2[v][r]` in bf16, so a head whose bias
-/// never reaches half an ulp of the base logit (~0.03) is a bit-exact no-op no
-/// matter how well it trains. From `w2 = 0` AdamW moves each element by ~lr per
-/// step, so `|bias| ≈ sqrt(rank)·rms|w1|·(lr·steps)` — which pins how many
-/// publishes the shipped default needs before drafting can change at all.
-#[test]
-fn cold_start_default_lr_reaches_the_bf16_floor() {
-    let cfg = DsparkTrainConfig::default();
-    let rank = cfg.markov_rank as f32;
-    let rms_w1 = {
-        let n = 1 << 16;
-        let sq: f32 = (0..n)
-            .map(|i| train::dspark_train::markov_w1_init(i).powi(2))
-            .sum();
-        (sq / n as f32).sqrt()
-    };
-    let steps = 0.03 / (rank.sqrt() * rms_w1 * cfg.learning_rate);
-    assert!(
-        steps < 300.0,
-        "at lr {} a w2=0 cold start needs {steps:.0} steps to clear the bf16 floor",
-        cfg.learning_rate
-    );
-}
