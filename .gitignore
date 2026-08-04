@@ -53,3 +53,5 @@ logs/
 data/opd-corpora/
 doc-fetch-resources/Qb9mdxvQaoJbN6xP3TGckwSBnFe/
 .arle-runs/
+# understand-anything knowledge graph (local exploration artifact, regenerable)
+.understand-anything/
