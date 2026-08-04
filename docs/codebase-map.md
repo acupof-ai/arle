@@ -45,7 +45,7 @@ Current workspace members (ownership and boundaries are listed in
  `crates/tools`
 - **specs:** `crates/qwen3-spec`, `crates/qwen35-spec`, `crates/deepseek-spec`,
  `crates/gemma-spec`, `crates/deepseek-ocr-spec`
-- **training:** `crates/autograd`, `crates/train`
+- **training:** `crates/autograd`, `crates/train`, `crates/spec-train`
 - **substrate:** `crates/infer-gguf`, `crates/kv-native-sys`,
  `crates/xgrammar-sys`, `crates/agent-bench`
 
