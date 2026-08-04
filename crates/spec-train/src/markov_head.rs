@@ -8,6 +8,28 @@ use std::path::Path;
 const MARKOV_W1: &str = "markov_head.markov_w1.weight";
 const MARKOV_W2: &str = "markov_head.markov_w2.weight";
 
+/// `w1`'s `[vocab, rank]` shape, read from the header alone. The serve needs it
+/// before the engine loads, to size the head slot a DFlash backbone ships
+/// without — guessing a rank would only turn a load into a size mismatch.
+pub fn shape(path: &Path) -> Result<(usize, usize)> {
+    let bytes =
+        std::fs::read(path).with_context(|| format!("read markov head {}", path.display()))?;
+    let st = safetensors::SafeTensors::deserialize(&bytes)
+        .map_err(|e| anyhow::anyhow!("parse markov head {}: {e}", path.display()))?;
+    let shape = st
+        .tensor(MARKOV_W1)
+        .map_err(|e| anyhow::anyhow!("{} missing {MARKOV_W1}: {e}", path.display()))?
+        .shape()
+        .to_vec();
+    match shape[..] {
+        [vocab, rank] => Ok((vocab, rank)),
+        _ => anyhow::bail!(
+            "{} {MARKOV_W1}: expected [vocab, rank], got {shape:?}",
+            path.display()
+        ),
+    }
+}
+
 /// Read a head as host f32 `(w1, w2)`, ready for
 /// `LoadedInferenceEngine::update_dspark_markov_weights`.
 pub fn load(path: &Path) -> Result<(Vec<f32>, Vec<f32>)> {

@@ -194,10 +194,6 @@ pub struct ServeSpecOptions {
     pub dspark_markov_init: Option<std::path::PathBuf>,
 }
 
-/// Rank of the head slot materialized for `--dspark-markov-init`. Matches the
-/// `markov_rank` DeepSpec ships for DSpark (`config/dspark/*.py`).
-pub const DSPARK_MARKOV_RANK: usize = 256;
-
 pub const DEFAULT_MTP_DRAFT_TOKENS: usize = 2;
 pub const DEFAULT_MTP_DRAFT_TOPK: usize = 1;
 
@@ -276,12 +272,13 @@ pub fn serve_http(
             engine_config.dspark_sps_row_ms = opts.spec.dspark_sps_row_ms;
             engine_config.dspark_block_size = opts.spec.dspark_block_size;
             // `--dspark-markov-init` needs a head slot to install over; a DFlash
-            // backbone ships none. Shape only — both halves are overwritten.
-            engine_config.markov_head_rank = opts
-                .spec
-                .dspark_markov_init
-                .is_some()
-                .then_some(DSPARK_MARKOV_RANK);
+            // backbone ships none. Shape only — both halves are overwritten — but
+            // the rank comes from the file, so a mismatched head fails at load
+            // with its own shape rather than against a guessed one.
+            engine_config.markov_head_rank = match &opts.spec.dspark_markov_init {
+                Some(path) => Some(spec_train::markov_head::shape(path)?.1),
+                None => None,
+            };
         }
     }
 

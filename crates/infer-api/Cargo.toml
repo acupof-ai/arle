@@ -12,6 +12,7 @@ publish = false
 # additive: it does not migrate any consumer.
 
 [dependencies]
+spec-train = { path = "../spec-train" }
 anyhow = "1.0"
 axum = "0.8"
 fastrace = { version = "0.7.16", features = ["enable"] }
