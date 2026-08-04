@@ -751,7 +751,6 @@ pub(crate) struct ServeArgs {
     #[arg(long, default_value_t = 0.53, value_name = "MS")]
     pub(crate) dspark_sps_row_ms: f32,
 
-    /// Spawn the DSpark train sidecar alongside `--spec-type dspark` serving.
     /// Cap the DSpark draft block length (checkpoint value if unset). The chain
     /// stops at the first rejection, so every position past the accepted prefix
     /// costs a draft forward and a verify row that can never commit: TC-27B +
