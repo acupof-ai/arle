@@ -106,10 +106,14 @@ fn try_pin(ordinal: usize, world_size: usize) -> anyhow::Result<String> {
     // including rank 0 in the multi-threaded coordinator.
     let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
     for &c in slice {
+        // SAFETY: `set` is a live zeroed cpu_set_t and `c` is a CPU index
+        // from the topology query, below CPU_SETSIZE.
         unsafe { libc::CPU_SET(c, &mut set) };
     }
     // Calling thread first (the inheritance anchor for threads spawned later).
     ensure!(
+        // SAFETY: `set` is fully initialized above and its size is passed
+        // exactly; pid 0 is the calling thread.
         unsafe { libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set) } == 0,
         "sched_setaffinity(self) failed: {}",
         std::io::Error::last_os_error()
