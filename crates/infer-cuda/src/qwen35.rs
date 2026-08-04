@@ -76,6 +76,11 @@ const QWEN35_BATCHED_DECODE_KV_SPLITS: usize = 4;
 /// c=8 TTFT p50 12.07 → 18.23 s with prefill routed here).
 const FA3_MAX_QLEN: usize = 64;
 
+/// Floor for the derived FA3 decode split ceiling — the value shipped as a
+/// constant before the ceiling was derived, and the measured optimum from
+/// batch 4 up (2026-08-04: batch 8 is +0.36% at a ceiling of 20).
+const FA3_DECODE_SPLITS_FLOOR: usize = 8;
+
 #[cfg(test)]
 pub(crate) mod conv_probe {
     use super::*;
@@ -6585,19 +6590,23 @@ impl Qwen35Model {
                             // SMs, serialized.
                             // Split-KV pays only when q is tiny vs kv; a long
                             // prefill chunk saturates SMs on the q axis alone.
-                            // Upper bound only: FA3 picks the live value itself from
-                            // batch, length and SM count (flash_prepare_scheduler.cu
-                            // `num_splits_dynamic`), clamped by what we pass. Its
-                            // appetite peaks at batch 1, where pack_gqa leaves
-                            // kv_heads tiles per split — so one tile per SM there is
-                            // a ceiling that never binds at any larger batch. The
-                            // shipped constant 8 did bind: 4×8 = 32 tiles on 78 SMs.
+                            // Upper bound only: FA3 picks the live value itself
+                            // (flash_prepare_scheduler.cu `num_splits_dynamic`),
+                            // clamped by what we pass. pack_gqa leaves batch ×
+                            // kv_heads tiles before splitting, so one tile per SM
+                            // is where the ceiling stops costing anything — raising
+                            // it further only grows the combine scratch, which
+                            // measured +0.36% at batch 8. The historical 8 is the
+                            // floor: it is the measured optimum from batch 4 up,
+                            // and it bound the scheduler only at batch 1, where
+                            // 4×8 = 32 tiles left 46 of 78 SMs idle.
                             let splits = if meta.seq_len <= FA3_MAX_QLEN {
                                 match qwen35_fa3_decode_splits() {
                                     0 => self
                                         .ctx
                                         .sm_count()
-                                        .div_ceil(self.local_kv_heads.max(1))
+                                        .div_ceil(meta.batch.max(1) * self.local_kv_heads.max(1))
+                                        .max(FA3_DECODE_SPLITS_FLOOR)
                                         .clamp(2, 256),
                                     n => n,
                                 }
