@@ -1141,14 +1141,6 @@ pub(crate) struct OpdRuntimeArgs {
     #[arg(long, default_value_t = false, action = clap::ArgAction::Set, value_name = "BOOL")]
     pub(crate) writeback_frozen_prompt_kv: bool,
 
-    /// Legacy full-matmul LoRA linear backward (A/B arm).
-    #[arg(long, default_value_t = false, action = clap::ArgAction::Set, value_name = "BOOL")]
-    pub(crate) legacy_lora_linear_bwd: bool,
-
-    /// Legacy unchunked SDPA backward (A/B arm).
-    #[arg(long, default_value_t = false, action = clap::ArgAction::Set, value_name = "BOOL")]
-    pub(crate) legacy_sdpa_bwd: bool,
-
     /// FlashQLA chunkwise GDN prefill in the autograd CUDA backend.
     #[arg(long, default_value_t = false, action = clap::ArgAction::Set, value_name = "BOOL")]
     pub(crate) gdr_chunkwise_prefill: bool,
@@ -1240,9 +1232,7 @@ impl OpdRuntimeArgs {
             max_update_seq: self.max_update_seq,
             autograd: autograd::AutogradRuntimeFlags {
                 checkpoint_offload_min_bytes: self.checkpoint_offload_min_bytes,
-                legacy_lora_linear_bwd: self.legacy_lora_linear_bwd,
                 lora_linear_bwd_tile_rows: self.lora_linear_bwd_tile_rows,
-                legacy_sdpa_bwd: self.legacy_sdpa_bwd,
                 moe_lora_bwd_expert_tile: self.moe_lora_bwd_expert_tile,
                 gdr_chunkwise_prefill: self.gdr_chunkwise_prefill,
                 la_backward_mono: self.la_backward_mono,

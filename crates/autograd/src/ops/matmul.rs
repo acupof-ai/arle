@@ -381,10 +381,6 @@ pub(crate) fn matmul_bt_backward(
     Ok(grads)
 }
 
-fn legacy_lora_linear_backward_enabled() -> bool {
-    crate::runtime_flags::legacy_lora_linear_bwd()
-}
-
 fn lora_linear_backward_tile_rows() -> usize {
     crate::runtime_flags::lora_linear_bwd_tile_rows()
 }
@@ -406,7 +402,7 @@ fn matmul_bt_lora_backward_tiled(
     need_grad_b: bool,
     store: &mut TensorStore,
 ) -> Result<Option<GradPairs>> {
-    if legacy_lora_linear_backward_enabled() || !is_lora_matmul_site(site) {
+    if !is_lora_matmul_site(site) {
         return Ok(None);
     }
     let tile_rows = lora_linear_backward_tile_rows();

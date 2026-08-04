@@ -395,7 +395,7 @@ pub(crate) fn causal_sdpa_recompute_backward(
             && upstream.dirty != Dirty::Host
             && upstream.device_handle.is_some()
     };
-    if device_path_ok && !legacy_sdpa_backward_enabled() {
+    if device_path_ok {
         let q_handle = store
             .tensor(q)?
             .device_handle
@@ -444,20 +444,6 @@ pub(crate) fn causal_sdpa_recompute_backward(
         return Ok(grads);
     }
 
-    if device_path_ok {
-        return causal_sdpa_recompute_backward_device_legacy_chunked(
-            q,
-            k,
-            v,
-            output_grad_id,
-            &q_shape,
-            need_grad_q,
-            need_grad_k,
-            need_grad_v,
-            store,
-        );
-    }
-
     let q_tensor = store.tensor_host(q)?;
     let k_tensor = store.tensor_host(k)?;
     let v_tensor = store.tensor_host(v)?;
@@ -495,10 +481,6 @@ pub(crate) fn causal_sdpa_recompute_backward(
     Ok(grads)
 }
 
-fn legacy_sdpa_backward_enabled() -> bool {
-    crate::runtime_flags::legacy_sdpa_bwd()
-}
-
 /// Fit backward score transients in 4 GiB.
 fn sdpa_backward_q_chunk(merged_heads: usize, seq_len: usize) -> usize {
     let per_row = merged_heads
@@ -506,37 +488,6 @@ fn sdpa_backward_q_chunk(merged_heads: usize, seq_len: usize) -> usize {
         .saturating_mul(4)
         .max(1);
     ((4usize << 30) / per_row.saturating_mul(6)).clamp(1, seq_len)
-}
-
-// Query chunks bound memory; key and value gradients accumulate across chunks.
-#[allow(clippy::too_many_arguments)]
-fn causal_sdpa_recompute_backward_device_legacy_chunked(
-    q: TensorId,
-    k: TensorId,
-    v: TensorId,
-    upstream: TensorId,
-    shape: &[usize],
-    need_grad_q: bool,
-    need_grad_k: bool,
-    need_grad_v: bool,
-    store: &mut TensorStore,
-) -> Result<GradPairs> {
-    let merged_heads = shape[0] * shape[1];
-    let q_chunk = sdpa_backward_q_chunk(merged_heads, shape[2]);
-    causal_sdpa_recompute_backward_device_chunked(
-        q,
-        k,
-        v,
-        upstream,
-        shape,
-        shape,
-        0,
-        need_grad_q,
-        need_grad_k,
-        need_grad_v,
-        q_chunk,
-        store,
-    )
 }
 
 #[allow(clippy::too_many_arguments)]
