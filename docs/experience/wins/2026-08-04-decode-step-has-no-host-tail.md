@@ -1,10 +1,11 @@
-# The decode gap vs SGLang is intra-GPU dead time, not host time — 2026-08-04
+# The champion decode step is kernel time end to end — 2026-08-04
 
-> Status: **Measurement, no code change.** Supersedes the same-file
-> 2026-08-03 version, whose headline ("~1.6 ms is host time between steps")
-> the direct in-process timer refutes. **Total host time in a champion decode
-> step is 0.061 ms.** The gap is dead time between kernels inside the graph
-> replay, and the lever is launch count.
+> Status: **Measurement, no code change.** Host time in a decode step is
+> **0.061 ms** of 19.03, and `Σ kernel` is **19.184 ms** against a 18.97 ms
+> wall. There is no host tail and no idle to reclaim; every optimization from
+> here has to make a kernel faster. Two earlier headlines on this file —
+> "~1.6 ms is host time between steps" and "the lever is launch count" — are
+> refuted below by the measurements that replaced them.
 
 ## What the nsys ledger said, and why it misled
 
@@ -75,18 +76,22 @@ dead on the same evidence.
 **4 µs/launch was a quotient, not a rate.** Removing 18% of the launches
 removed none of the idle.
 
-## What is still open
+## The idle it was named after does not exist
 
-The ~4.3 ms/step of intra-GPU idle (GPU wall 18.97 vs Σ kernel ~14.7) is now
-bounded from two sides and explained by neither:
+The ~4.3 ms figure came from GPU wall 18.97 minus `Σ kernel ≈ 14.7`, and that
+14.7 was the T4 trace's 15.886 reduced by the *expected* gains of two later
+tranches, never re-measured. An nsys run on the champion itself puts **Σ kernel
+at 19.184 ms** against a 18.97 ms wall, occupancy 0.95: the step is kernel time
+end to end. Nothing is idle, which is why removing 192 launches returned
+nothing.
 
-- **not host time** — 0.061 ms, measured directly above
-- **not per-launch dispatch** — 192 launches removed, 0.00 ms returned
+Eager launch cost was then measured directly for comparison:
+`--qwen35-decode-graph false` runs the same work outside the graph and costs
+**+1.55 ms** over ~1000 launches, ~1.6 µs each. Inside a captured graph node
+count is free.
 
-The remaining candidates are things a kernel-duration sum already counts as
-"busy" or cannot see: dependency serialization between adjacent kernels, tail
-effects on small grids, memory-system stalls. That needs `ncu` on the replayed
-graph, not another fusion.
+The real lever was one kernel:
+[FA3 decode splits](2026-08-04-fa3-decode-splits-fill-the-sms.md).
 
 ## Rule
 
