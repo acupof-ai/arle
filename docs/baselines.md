@@ -240,3 +240,107 @@ with concurrency (queueing).
 c=16 produced 131204 errors in 60 s with `[coordinator] lockstep stalled`. The
 TP lockstep proposal path deadlocks at world_size=1 — needs a TP=1 fast path
 before this arm is retried.
+
+---
+
+# Training baselines — OPD writeback
+
+> Status: Active. Same screening rules as the inference rows above. Training
+> numbers were previously scattered across wins entries and task descriptions;
+> this section is the single truth. A row not listed here has not been measured.
+
+**Fingerprint** — re-anchor when any of these move: model, LoRA target set,
+`cp_size`/`dp_size`, GPU set, sequence length, commit.
+
+- Model `bottlecapai/ThinkingCap-Qwen3.6-27B-FP8` (64 layers = 16 full-attn +
+  48 gated-delta, kv_heads 4, head_dim 256), or `qwen35-08b-clean`
+  (24 layers, `full_attention_interval: 4`, dense MLP) for the correctness rows.
+- LoRA `attention-qv`. Workload = `--synthetic-writeback-seq N` (one masked-CE
+  writeback on a synthetic trajectory; no rollout).
+- Box 8×H20 (sm_90, 97.9 GB). Two ranks = one CP group unless stated.
+
+**Before trusting any CP row, verify the binary.** `nm -D <bin> | grep
+ncclCommInitRank` and `ldd <bin> | grep libnccl`. A shared build target was
+silently overwritten by a `cuda`-only build on 2026-08-05 and the resulting run
+failed in a way that reads as a code bug. FA3 additionally needs
+`ARLE_CUDA_ENABLE_FA3=1` and the vendored hopper tree at build time — without
+them `ring_fa3_route`'s real-kernel marker returns 0 and the ring silently falls
+back to the scalar kernels.
+
+## CHAMPION — 27B, cp=2, seq=32768 · `15caff0d0` (2026-08-05)
+
+| | |
+|---|---:|
+| forward | 34.2 s |
+| fused CE | 0.92 s |
+| backward | 190.0 s |
+| optimizer | 0.05 s |
+| **step** | **225.2 s** |
+| checkpoint peak | 61,396 MiB/rank |
+| loss | 10.871086 |
+| grad_norm | 2.263385 |
+
+Both ranks print identical loss and grad_norm (post-all-reduce). Reproduces the
+2026-08-04 FA3 reference (10.871086 / 2.264733 / ~212 s) to 6-decimal loss and
+0.06% grad-norm; the +6% on step is shared-box variance.
+
+## CHAMPION — 27B, cp=2, seq=81920 · `e675f031b` (2026-08-05)
+
+| | rank 0 | rank 1 |
+|---|---:|---:|
+| forward | 80.671 s | 81.009 s |
+| fused CE | 1.916 s | 1.913 s |
+| backward | 670.275 s | 670.319 s |
+| **step** | **752.956 s** | **753.294 s** |
+
+Peak 91,547 MiB/rank (93.5% of the card), host RSS 55.5 GB, loss 4.536131,
+grad_norm 7.202155.
+
+### Step budget — where the time goes
+
+`nsys cuda_gpu_kern_sum`, one step, both ranks combined, FA3 engaged.
+
+| share | time | instances | kernel |
+|---|---:|---:|---|
+| 71.0% | 707.345 s | 90 | `linear_attention_chunked_scan_backward_f32` |
+| 6.7% | 66.316 s | 238,080 | `gated_delta_rule_prefill_recurrent` |
+| 3.9% | 38.365 s | 7,436 | nvjet GEMM 128×256 |
+| 3.2% | 32.096 s | 4,194 | nvjet GEMM 320×128 TNT |
+| 1.9% | 19.134 s | 2,886 | nvjet GEMM 320×128 NNT |
+| 1.5% | 15.271 s | 11,664 | `transpose_axes_swap_f32` |
+| 1.5% | 14.635 s | 47 | `FlashAttnBwdSm90` |
+| 1.4% | 13.553 s | 25,196 | `slice_f32` |
+
+The two gated-delta rows are 77.7% of the step. Both ride the route the
+FlashQLA port (`4846f8046`) replaces.
+
+## Correctness rows — 0.8B dense, seq=2048 · `15caff0d0` (2026-08-05)
+
+| arm | loss | grad_norm |
+|---|---:|---:|
+| cp=1 | 8.963640 | 3.464997 |
+| cp=2 | 8.963213 | 3.459866 |
+
+Post-all-reduce (both cp=2 ranks identical). cp=1 reproduces its published
+reference (3.464947) to 5e-5. The cp1–cp2 gap is 1.48e-3, against a published
+8.56e-4 measured before FA3 engaged — same order, opposite sign. **n=1 per arm;
+this config's own noise floor is not established.**
+
+## Known walls
+
+| shape | outcome |
+|---|---|
+| 27B cp=1 seq=81920 | forward completes (3972.216 s), **backward OOMs** on `cuda alloc_zeros failed`. Host RSS 104.5 GB. The failing tensor is not named by the log. |
+| 27B cp=2 seq=131072 | fits — backward peak 94,175 MiB (96.6%), ~3.3 GB headroom (2026-08-02, older commit) |
+| 27B cp=4 seq=131072 | full step ~3100 s, host RSS 170.4 GiB total / ~44.6 GB per rank (2026-08-03, scalar ring, older commit) |
+
+## Not reproducible
+
+The scalar-ring arm is gone. `ARLE_CP_RING_FA3` was deleted in `15caff0d0`, so
+FA3 is unconditional at head_dim 256 on sm_90 and the pre-flip numbers below are
+historical only — they cannot be re-measured on a current binary.
+
+| shape | scalar ring | FA3 | ratio |
+|---|---:|---:|---:|
+| cp=2 seq=32768 (2026-08-04) | 460.1 s | 212.1 s | 2.17× |
+| cp=2 seq=81920 (2026-08-05) | 2670.06 s | 752.96 s | 3.54× |
