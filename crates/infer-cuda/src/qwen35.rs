@@ -6585,10 +6585,13 @@ impl Qwen35Model {
                             // SMs, serialized.
                             // Split-KV pays only when q is tiny vs kv; a long
                             // prefill chunk saturates SMs on the q axis alone.
-                            // pack_gqa folds the q heads into their kv head, so a
-                            // decode layer's only work tiles are kv_heads × splits.
-                            // Below one tile per SM the rest of the machine idles:
-                            // on H20 the shipped 8 gave 4×8=32 tiles on 78 SMs.
+                            // Upper bound only: FA3 picks the live value itself from
+                            // batch, length and SM count (flash_prepare_scheduler.cu
+                            // `num_splits_dynamic`), clamped by what we pass. Its
+                            // appetite peaks at batch 1, where pack_gqa leaves
+                            // kv_heads tiles per split — so one tile per SM there is
+                            // a ceiling that never binds at any larger batch. The
+                            // shipped constant 8 did bind: 4×8 = 32 tiles on 78 SMs.
                             let splits = if meta.seq_len <= FA3_MAX_QLEN {
                                 match qwen35_fa3_decode_splits() {
                                     0 => self
