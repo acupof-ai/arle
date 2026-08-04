@@ -1286,7 +1286,15 @@ fn generate_tilelang_artifacts_per_sm(
         let cuda_arch: u32 = sm_token
             .parse()
             .expect("SmSpec.sm passed whitelist; must parse as u32");
-        let target = format!("cuda -arch=sm_{sm_token}");
+        // FlashQLA's warp-specialized kernels emit `setmaxnreg`, which ptxas takes
+        // only under the sm_90a variant — same constraint that forces sm_90a on the
+        // FlashMLA/FA3 TUs below. Artifact names keep `sm90`; only the target moves.
+        let arch_token = if base_spec.kernel_family == "flashqla" && sm_token == "90" {
+            "90a"
+        } else {
+            sm_token.as_str()
+        };
+        let target = format!("cuda -arch=sm_{arch_token}");
 
         let src_hash = tilelang_kernel_src_hash(base_spec, sm_token);
         let per_sm_artifact_dir = format!("{}_sm{sm_token}", base_spec.artifact_dir);
