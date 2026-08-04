@@ -80,6 +80,7 @@ def convert_gptq_tensors(
     expected_g_idx = (
         torch.arange(k, device=qweight.device, dtype=torch.long) // group_size
     )
+    has_desc_act = False
     if g_idx is not None:
         if (
             g_idx.ndim != 1
@@ -87,18 +88,12 @@ def convert_gptq_tensors(
             or g_idx.dtype not in (torch.int32, torch.int64)
         ):
             raise ValueError(f"{tensor_name}: g_idx must be int32/int64 [{k}]")
-        if not torch.equal(
-            g_idx.to(device=qweight.device, dtype=torch.long), expected_g_idx
-        ):
-            raise ValueError(
-                f"{tensor_name}: non-canonical g_idx requires desc_act support"
-            )
+        g_idx_long = g_idx.to(device=qweight.device, dtype=torch.long)
+        if not torch.equal(g_idx_long, expected_g_idx):
+            has_desc_act = True
 
-    packed = torch.empty(
-        (output_channels, k // W4_VALUES_PER_BYTE),
-        dtype=torch.uint8,
-        device=qweight.device,
-    )
+    # Unpack qweight to signed int4 (stored/permuted column order).
+    signed = torch.empty((output_channels, k), dtype=torch.int8, device=qweight.device)
     for start in range(0, output_channels, channel_chunk_size):
         end = min(start + channel_chunk_size, output_channels)
         channels = torch.arange(start, end, device=qweight.device, dtype=torch.long)
@@ -111,25 +106,48 @@ def convert_gptq_tensors(
                 f"{tensor_name}: symmetric GPTQ requires zero point 8, got {values[:8]}"
             )
 
-        signed = torch.empty((end - start, k), dtype=torch.int8, device=qweight.device)
         qweight_chunk = qweight[:, start:end]
         for nibble in range(GPTQ_VALUES_PER_WORD):
             unsigned = ((qweight_chunk >> (nibble * 4)) & 0xF).to(torch.int8).T
             groups = expected_g_idx[nibble::GPTQ_VALUES_PER_WORD]
-            signed[:, nibble::GPTQ_VALUES_PER_WORD] = unsigned - zeros[:, groups]
+            signed[start:end, nibble::GPTQ_VALUES_PER_WORD] = unsigned - zeros[:, groups]
 
-        minimum = int(signed.min().item())
-        maximum = int(signed.max().item())
-        if minimum < -8 or maximum > 7:
-            raise ValueError(
-                f"{tensor_name}: signed codes out of range [-8, 7]: "
-                f"min={minimum}, max={maximum}"
-            )
+    minimum = int(signed.min().item())
+    maximum = int(signed.max().item())
+    if minimum < -8 or maximum > 7:
+        raise ValueError(
+            f"{tensor_name}: signed codes out of range [-8, 7]: "
+            f"min={minimum}, max={maximum}"
+        )
 
-        unsigned = (signed + 8).to(torch.uint8)
-        packed[start:end] = unsigned[:, 0::2] | (unsigned[:, 1::2] << 4)
+    if has_desc_act:
+        # desc_act: input channels were permuted by activation magnitude before
+        # quantization. g_idx[i] gives the stored group of original channel i.
+        # Dequantize in stored order, then unpermute to original channel order,
+        # then re-quantize with canonical groups so the ARLE W4A16 kernel
+        # (which assumes canonical groups) gets correct per-channel scales.
+        stored_groups = expected_g_idx  # group of each stored column
+        scales_f = scales.to(torch.float32)  # [num_groups, output_channels]
+        dequant = signed.to(torch.float32) * scales_f[stored_groups].T  # [N, K]
+        # Unpermute columns: original channel i lives at stored position
+        # argsort(g_idx)[i]. Stable sort keeps original order within a group,
+        # which is the best reconstruction possible from g_idx alone.
+        inv_perm = torch.argsort(g_idx_long, stable=True)
+        dequant = dequant[:, inv_perm]
+        # Re-quantize with canonical groups (symmetric, zero-point 8).
+        w = dequant.reshape(output_channels, num_groups, group_size)
+        absmax = w.abs().amax(dim=-1, keepdim=True).clamp(min=1e-10)
+        new_scales = (absmax / 7.0).squeeze(-1)  # [N, num_groups]
+        w_q = torch.clamp(torch.round(w / absmax * 7.0), -8, 7).to(torch.int8)
+        signed = w_q.reshape(output_channels, k)
+        scales_out = new_scales.to(torch.bfloat16).contiguous()
+    else:
+        scales_out = scales.T.contiguous().to(torch.bfloat16)
 
-    return packed, scales.T.contiguous().to(torch.bfloat16)
+    unsigned = (signed + 8).to(torch.uint8)
+    packed = unsigned[:, 0::2] | (unsigned[:, 1::2] << 4)
+
+    return packed, scales_out
 
 
 def _read_json(path):
@@ -188,7 +206,6 @@ def _validate_gptq_v1(config):
         and isinstance(config.get("group_size"), int)
         and config["group_size"] > 0
         and config.get("sym") is True
-        and config.get("desc_act") is False
     )
     version = config.get("gptq_version", config.get("version"))
     checkpoint_format = str(
@@ -197,7 +214,7 @@ def _validate_gptq_v1(config):
     explicit_v2 = version in (2, "2", "v2") or checkpoint_format in ("gptq_v2", "v2")
     if not supported or explicit_v2:
         raise ValueError(
-            "Only GPTQ v1 4-bit symmetric quantization without act-order is supported; "
+            "Only GPTQ v1 4-bit symmetric quantization is supported; "
             f"got {config}"
         )
 
