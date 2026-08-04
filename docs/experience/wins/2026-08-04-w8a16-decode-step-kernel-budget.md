@@ -87,11 +87,32 @@ Three separate problems, and they do not rank the way the time column does:
   `rms_norm_batched_offset` takes 3.19 µs for 10 KB in and 10 KB out — 6 ns of
   traffic at the achievable rate. This bucket is entirely per-kernel latency.
 
-That last bucket contradicts
-[2026-08-04-launch-count-is-not-the-decode-lever](../errors/2026-08-04-launch-count-is-not-the-decode-lever.md),
-where fusing 192 residual-add + norm pairs returned 0.00 ms: this ledger prices
-`add_native` alone at 0.176 ms. That experiment ran on a pre-split-fix build
-and must be repeated against this budget before either result is trusted.
+## Inside the replay the kernels are back to back
+
+Node start/end timestamps for one step, taken between two consecutive
+`embedding_batched_native_kernel` calls:
+
+| | |
+|---|---:|
+| kernel nodes | 1060 |
+| first start → last end | 16.683 ms |
+| Σ node duration | 16.631 ms |
+| inter-node gap, total | 88.6 µs (0.084 µs/node) |
+| overlap, total | 36.7 µs |
+
+The step is 99.7% busy. Launch overhead inside a captured graph is 0.084 µs
+per node, so removing nodes can return at most that — which is why fusing 192
+residual-add + norm pairs moved the wall 0.00 ms
+([entry](../errors/2026-08-04-launch-count-is-not-the-decode-lever.md)).
+
+That does not make the 1.53 ms small-kernel bucket unreachable, and it explains
+why that particular fusion missed it. A fused kernel replaces two *durations*
+with one, worth `add_native`'s 0.176 ms — but the one built there re-read the
+sum from global memory in its second pass, so its traffic equalled the unfused
+pair's and its duration did too. It bought one 0.084 µs launch and paid a full
+global read. **The bucket is reclaimable only by fusion that keeps the second
+pass in registers** (the [T6 GDN](2026-08-03-t6-gdn-decode-kernel.md) pattern);
+traffic-preserving fusion is zero by construction.
 
 ## Learnings
 
@@ -107,6 +128,10 @@ that the kernel count matches the step's known launch count.
 **Rule: rank optimization targets by headroom, not by share.** The largest row
 here has the least available time per unit of work required, and the cheapest
 win sits in a bucket worth 9% of the step.
+
+**Rule: a fusion is worth a kernel duration, not a launch.** Inside a graph the
+launch is 0.084 µs and the duration is microseconds. A fusion that leaves the
+byte count unchanged returns the launch and nothing else.
 
 Related: [[feedback_measured_floor_is_not_physical_floor]],
 [[feedback_path_probe_before_perf_claim]].
