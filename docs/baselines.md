@@ -316,15 +316,20 @@ FlashQLA port (`4846f8046`) replaces.
 
 ## Correctness rows — 0.8B dense, seq=2048 · `15caff0d0` (2026-08-05)
 
-| arm | loss | grad_norm |
-|---|---:|---:|
-| cp=1 | 8.963640 | 3.464997 |
-| cp=2 | 8.963213 | 3.459866 |
+Mean of 3 serial reps per cell, post-all-reduce (all ranks identical). Within-cell
+spread is 5.2e-5 to 2.1e-4 relative across every cell.
 
-Post-all-reduce (both cp=2 ranks identical). cp=1 reproduces its published
-reference (3.464947) to 5e-5. The cp1–cp2 gap is 1.48e-3, against a published
-8.56e-4 measured before FA3 engaged — same order, opposite sign. **n=1 per arm;
-this config's own noise floor is not established.**
+| arm | grad_norm | deviation from cp=1 |
+|---|---:|---:|
+| cp=1 | 3.464900 | — |
+| cp=2 | 3.459982 | −1.419e-3 |
+| cp=4 | 3.464276 | −1.80e-4 |
+
+FA3 is inert at cp=1 (no ring exists there): toggling it leaves loss identical at
+8.963640 and grad_norm inside the spread. The deviation does not compound with
+ring-step count — it collapses into the noise floor at cp=4, while the pre-flip
+scalar path's grows (+1.085e-3 at cp=2 to +1.655e-3 at cp=4). See
+[the gate entry](experience/wins/2026-08-05-fa3-cp-gate-compounding-not-sign.md).
 
 ## Known walls
 
