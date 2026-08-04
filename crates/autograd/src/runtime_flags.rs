@@ -25,12 +25,8 @@ impl TapePrecision {
 pub struct AutogradRuntimeFlags {
     /// Min tensor bytes for checkpoint host offload (`--checkpoint-offload-min-bytes`).
     pub checkpoint_offload_min_bytes: usize,
-    /// Legacy full-matmul LoRA linear backward A/B arm (`--legacy-lora-linear-bwd`).
-    pub legacy_lora_linear_bwd: bool,
     /// Row tile for the LoRA linear backward (`--lora-linear-bwd-tile-rows`).
     pub lora_linear_bwd_tile_rows: usize,
-    /// Legacy unchunked SDPA backward A/B arm (`--legacy-sdpa-bwd`).
-    pub legacy_sdpa_bwd: bool,
     /// Expert tile for the MoE LoRA backward (`--moe-lora-bwd-expert-tile`).
     pub moe_lora_bwd_expert_tile: usize,
     /// FlashQLA chunkwise GDN prefill in the CUDA backend (`--gdr-chunkwise-prefill`).
@@ -49,9 +45,7 @@ impl Default for AutogradRuntimeFlags {
     fn default() -> Self {
         Self {
             checkpoint_offload_min_bytes: 2 << 20,
-            legacy_lora_linear_bwd: false,
             lora_linear_bwd_tile_rows: 1024,
-            legacy_sdpa_bwd: false,
             moe_lora_bwd_expert_tile: 16,
             gdr_chunkwise_prefill: false,
             la_backward_mono: false,
@@ -63,9 +57,7 @@ impl Default for AutogradRuntimeFlags {
 }
 
 static CHECKPOINT_OFFLOAD_MIN_BYTES: AtomicUsize = AtomicUsize::new(2 << 20);
-static LEGACY_LORA_LINEAR_BWD: AtomicBool = AtomicBool::new(false);
 static LORA_LINEAR_BWD_TILE_ROWS: AtomicUsize = AtomicUsize::new(1024);
-static LEGACY_SDPA_BWD: AtomicBool = AtomicBool::new(false);
 static MOE_LORA_BWD_EXPERT_TILE: AtomicUsize = AtomicUsize::new(16);
 static GDR_CHUNKWISE_PREFILL: AtomicBool = AtomicBool::new(false);
 static LA_BACKWARD_MONO: AtomicBool = AtomicBool::new(false);
@@ -74,9 +66,7 @@ static TAPE_PRECISION: AtomicU8 = AtomicU8::new(0);
 
 pub fn apply_runtime_flags(f: &AutogradRuntimeFlags) {
     CHECKPOINT_OFFLOAD_MIN_BYTES.store(f.checkpoint_offload_min_bytes, Relaxed);
-    LEGACY_LORA_LINEAR_BWD.store(f.legacy_lora_linear_bwd, Relaxed);
     LORA_LINEAR_BWD_TILE_ROWS.store(f.lora_linear_bwd_tile_rows.max(1), Relaxed);
-    LEGACY_SDPA_BWD.store(f.legacy_sdpa_bwd, Relaxed);
     MOE_LORA_BWD_EXPERT_TILE.store(f.moe_lora_bwd_expert_tile.max(1), Relaxed);
     GDR_CHUNKWISE_PREFILL.store(f.gdr_chunkwise_prefill, Relaxed);
     LA_BACKWARD_MONO.store(f.la_backward_mono, Relaxed);
@@ -89,14 +79,8 @@ pub fn apply_runtime_flags(f: &AutogradRuntimeFlags) {
 pub(crate) fn checkpoint_offload_min_bytes() -> usize {
     CHECKPOINT_OFFLOAD_MIN_BYTES.load(Relaxed)
 }
-pub(crate) fn legacy_lora_linear_bwd() -> bool {
-    LEGACY_LORA_LINEAR_BWD.load(Relaxed)
-}
 pub(crate) fn lora_linear_bwd_tile_rows() -> usize {
     LORA_LINEAR_BWD_TILE_ROWS.load(Relaxed)
-}
-pub(crate) fn legacy_sdpa_bwd() -> bool {
-    LEGACY_SDPA_BWD.load(Relaxed)
 }
 pub(crate) fn moe_lora_bwd_expert_tile() -> usize {
     MOE_LORA_BWD_EXPERT_TILE.load(Relaxed)
