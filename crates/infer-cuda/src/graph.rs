@@ -254,6 +254,9 @@ fn audit_capturing_graph(stream: &CudaStream) -> Result<CaptureAudit> {
     let mut nodes: Vec<cu::CUgraphNode> = vec![std::ptr::null_mut(); n];
     // SAFETY: nodes has capacity n as reported by the count query.
     unsafe { cu::cuGraphGetNodes(graph, nodes.as_mut_ptr(), &mut n).result()? };
+    if std::env::var_os("ARLE_GRAPH_NODE_CENSUS").is_some_and(|v| v != "0") {
+        log_kernel_node_census(graph, &nodes[..n]);
+    }
     let mut audit = CaptureAudit {
         total_nodes: n,
         host_memcpy_nodes: 0,
@@ -291,6 +294,124 @@ fn audit_capturing_graph(stream: &CudaStream) -> Result<CaptureAudit> {
         }
     }
     Ok(audit)
+}
+
+/// Dump every kernel node of the capturing graph in execution order, with its
+/// launch geometry (`ARLE_GRAPH_NODE_CENSUS=1`, capture-time only).
+///
+/// A profiler aggregates by kernel name, so one Marlin row covers every
+/// projection in the step and its efficiency cannot be split by call site.
+/// This census is the join key: `nsys profile --cuda-graph-trace=node` times
+/// each node separately, and the ordered list below names what each one is.
+fn log_kernel_node_census(
+    graph: cudarc::driver::sys::CUgraph,
+    nodes: &[cudarc::driver::sys::CUgraphNode],
+) {
+    use cudarc::driver::sys as cu;
+    let order = topological_order(graph, nodes);
+    log::info!(
+        "[graph-node-census] {} node(s), execution order",
+        order.len()
+    );
+    for (i, &node) in order.iter().enumerate() {
+        let mut p = std::mem::MaybeUninit::<cu::CUDA_KERNEL_NODE_PARAMS>::uninit();
+        // SAFETY: node handles come from cuGraphGetNodes on a live graph; a
+        // non-kernel node fails cleanly and is skipped.
+        if unsafe { cu::cuGraphKernelNodeGetParams_v2(node, p.as_mut_ptr()) }
+            .result()
+            .is_err()
+        {
+            continue;
+        }
+        // SAFETY: success above guarantees initialization.
+        let p = unsafe { p.assume_init() };
+        let mut name: *const std::ffi::c_char = std::ptr::null();
+        // SAFETY: out-param is a valid local; the driver owns the returned
+        // string for the lifetime of the function.
+        let name = if unsafe { cu::cuFuncGetName(&mut name, p.func) }
+            .result()
+            .is_ok()
+            && !name.is_null()
+        {
+            // SAFETY: driver-owned NUL-terminated string, valid while the
+            // module is loaded — copied out immediately.
+            unsafe { std::ffi::CStr::from_ptr(name) }
+                .to_string_lossy()
+                .into_owned()
+        } else {
+            "<unnamed>".to_string()
+        };
+        log::info!(
+            "[graph-node-census] {i:04} grid=({},{},{}) block=({},{},{}) smem={} {name}",
+            p.gridDimX,
+            p.gridDimY,
+            p.gridDimZ,
+            p.blockDimX,
+            p.blockDimY,
+            p.blockDimZ,
+            p.sharedMemBytes,
+        );
+    }
+}
+
+/// Nodes in execution order. Single-stream capture yields a chain, so a
+/// Kahn walk is exact; on any branch the tie is broken by handle order,
+/// which keeps the census total-correct if locally out of order.
+fn topological_order(
+    graph: cudarc::driver::sys::CUgraph,
+    nodes: &[cudarc::driver::sys::CUgraphNode],
+) -> Vec<cudarc::driver::sys::CUgraphNode> {
+    use cudarc::driver::sys as cu;
+    let mut n_edges: usize = 0;
+    // SAFETY: null from/to queries the edge count.
+    if unsafe {
+        cu::cuGraphGetEdges(
+            graph,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut n_edges,
+        )
+    }
+    .result()
+    .is_err()
+    {
+        return nodes.to_vec();
+    }
+    let mut from = vec![std::ptr::null_mut(); n_edges];
+    let mut to = vec![std::ptr::null_mut(); n_edges];
+    // SAFETY: both buffers hold n_edges entries as reported by the count query.
+    if unsafe { cu::cuGraphGetEdges(graph, from.as_mut_ptr(), to.as_mut_ptr(), &mut n_edges) }
+        .result()
+        .is_err()
+    {
+        return nodes.to_vec();
+    }
+    let index: HashMap<_, _> = nodes.iter().enumerate().map(|(i, &n)| (n, i)).collect();
+    let mut succ: Vec<Vec<usize>> = vec![Vec::new(); nodes.len()];
+    let mut indeg = vec![0usize; nodes.len()];
+    for e in 0..n_edges {
+        let (Some(&f), Some(&t)) = (index.get(&from[e]), index.get(&to[e])) else {
+            continue;
+        };
+        succ[f].push(t);
+        indeg[t] += 1;
+    }
+    let mut ready: Vec<usize> = (0..nodes.len()).filter(|&i| indeg[i] == 0).collect();
+    let mut out = Vec::with_capacity(nodes.len());
+    while let Some(i) = ready.pop() {
+        out.push(nodes[i]);
+        for &s in &succ[i] {
+            indeg[s] -= 1;
+            if indeg[s] == 0 {
+                ready.push(s);
+            }
+        }
+    }
+    if out.len() == nodes.len() {
+        out
+    } else {
+        nodes.to_vec()
+    }
 }
 
 /// Per-batch-size pool of captured graphs (one per batch size, reused across
