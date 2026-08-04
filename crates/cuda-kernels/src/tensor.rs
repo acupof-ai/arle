@@ -2334,6 +2334,40 @@ impl DeviceMatrix {
                 m.group_size = a.group_size;
                 m
             }
+            WeightFormat::W4A16 => {
+                ensure!(
+                    a.group_size == b.group_size && a.marlin_packed.is_none(),
+                    "fuse_rows W4A16 needs matching group_size and pre-repack sources"
+                );
+                let qa = a
+                    .qweight
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("a missing qweight"))?;
+                let qb = b
+                    .qweight
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("b missing qweight"))?;
+                let sa = a
+                    .qscales
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("a missing qscales"))?;
+                let sb = b
+                    .qscales
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("b missing qscales"))?;
+                let mut m = Self::from_parts_dense(
+                    ctx.stream
+                        .alloc_zeros::<bf16>(1)
+                        .map_err(|e| anyhow!("fuse_rows dummy alloc failed: {e}"))?,
+                    rows,
+                    a.cols,
+                );
+                m.weight_format = WeightFormat::W4A16;
+                m.qweight = Some(concat(ctx, qa, qb)?);
+                m.qscales = Some(concat(ctx, sa, sb)?);
+                m.group_size = a.group_size;
+                m
+            }
             WeightFormat::Fp8BlockScaled => {
                 ensure!(
                     a.quant_block_m == b.quant_block_m

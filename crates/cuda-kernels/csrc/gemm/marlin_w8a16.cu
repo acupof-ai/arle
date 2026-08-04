@@ -20,6 +20,32 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
+#ifdef ARLE_DISABLE_MARLIN_SM70
+
+extern "C" {
+
+cudaError_t marlin_gptq_repack_w8a16_cuda(
+    const uint32_t* b_q_weight, uint32_t* out, int size_k, int size_n, cudaStream_t stream) {
+  (void)b_q_weight; (void)out; (void)size_k; (void)size_n; (void)stream;
+  return cudaErrorNotSupported;
+}
+
+CUresult marlin_w8a16_gemm_cuda(
+    const __nv_bfloat16* A, const uint32_t* B_packed, const __nv_bfloat16* scales,
+    __nv_bfloat16* C, float* c_tmp, int* workspace,
+    int m, int n, int k, int group_size, cudaStream_t stream) {
+  (void)A; (void)B_packed; (void)scales; (void)C; (void)c_tmp; (void)workspace;
+  (void)m; (void)n; (void)k; (void)group_size; (void)stream;
+  return CUDA_ERROR_NOT_SUPPORTED;
+}
+
+int marlin_w8a16_c_tmp_floats(int m, int sms) { (void)m; (void)sms; return 0; }
+int marlin_w8a16_workspace_ints(int sms) { (void)sms; return 0; }
+
+}  // extern "C"
+
+#else
+
 #include "marlin/gptq_marlin.cuh"
 #include "marlin/gptq_marlin_repack.cuh"
 
@@ -142,3 +168,5 @@ int marlin_w8a16_c_tmp_floats(int m, int sms) {
 int marlin_w8a16_workspace_ints(int sms) { return sms * 4; }
 
 }  // extern "C"
+
+#endif  // ARLE_DISABLE_MARLIN_SM70
