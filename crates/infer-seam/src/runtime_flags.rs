@@ -20,7 +20,7 @@ fn d_true() -> bool {
     true
 }
 fn d_fa3_decode_splits() -> usize {
-    8
+    0
 }
 fn d_deepgemm_min_routes() -> usize {
     1024
@@ -62,7 +62,8 @@ pub struct CudaRuntimeFlags {
     /// FA3 full-attention prefill (silently ignored on stub builds).
     #[serde(default = "d_true")]
     pub qwen35_fa3: bool,
-    /// FA3 decode split count (clamped to \[2, 256\]).
+    /// FA3 decode split count; 0 derives it from the device SM count so the
+    /// kv-head × split tiles fill the machine. Explicit values clamp to \[2, 256\].
     #[serde(default = "d_fa3_decode_splits")]
     pub qwen35_fa3_decode_splits: usize,
     /// Routed-row floor for the DeepGEMM grouped expert path. Default 1024,
