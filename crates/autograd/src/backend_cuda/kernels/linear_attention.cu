@@ -78,6 +78,126 @@ __device__ __forceinline__ long long la_state_time_base(
     return ((((long long)batch * seq_len + seq) * heads + head) * key_dim) * value_dim;
 }
 
+// Block-wide sum. Every thread gets the total and `reduce` is reusable on return.
+__device__ __forceinline__ float la_block_sum(
+    float* reduce,
+    int tid,
+    int block,
+    float value
+) {
+    reduce[tid] = value;
+    __syncthreads();
+    for (int step = block / 2; step > 0; step >>= 1) {
+        if (tid < step) {
+            reduce[tid] += reduce[tid + step];
+        }
+        __syncthreads();
+    }
+    float total = reduce[0];
+    __syncthreads();
+    return total;
+}
+
+// The pre-norm GDN core row and its gradient: bf16 in global memory on the
+// FlashQLA route, f32 in shared memory inside the fused chunk kernel.
+struct LaCoreRowBf16 {
+    const unsigned short* __restrict__ x;
+    unsigned short* __restrict__ d;
+    __device__ __forceinline__ float load(int i) const { return la_bf16_to_float(x[i]); }
+    __device__ __forceinline__ void store(int i, float v) const { d[i] = la_float_to_bf16(v); }
+};
+
+struct LaCoreRowF32 {
+    const float* x;
+    float* d;
+    __device__ __forceinline__ float load(int i) const { return x[i]; }
+    __device__ __forceinline__ void store(int i, float v) const { d[i] = v; }
+};
+
+// Backward of out = silu(z) * weight * x * rsqrt(mean(x^2) + eps) for one
+// (token, value head) row. dz/dnorm land in global memory; dx goes back
+// through `row`. Pointers are already offset to the row.
+template <typename Row>
+__device__ __forceinline__ void la_rms_gated_backward_row(
+    Row row,
+    float* reduce,
+    float* __restrict__ dz,
+    float* __restrict__ dnorm,
+    const float* __restrict__ z,
+    const float* __restrict__ upstream,
+    const float* __restrict__ norm_weight,
+    int tid,
+    int block,
+    int value_dim,
+    float eps
+) {
+    float local_sq = 0.0f;
+    for (int i = tid; i < value_dim; i += block) {
+        float x = row.load(i);
+        local_sq += x * x;
+    }
+    float inv_rms =
+        rsqrtf((la_block_sum(reduce, tid, block, local_sq) / (float)value_dim) + eps);
+
+    float local_dot = 0.0f;
+    for (int i = tid; i < value_dim; i += block) {
+        float x = row.load(i);
+        float gate = z[i];
+        float up = upstream[i];
+        float dcore = up * la_silu(gate);
+        // Association matches the fused kernels' original: they are the verified
+        // path, so the never-run FlashQLA kernel is the one that conforms.
+        dz[i] = up * (x * inv_rms * norm_weight[i]) * la_silu_grad(gate);
+        atomicAdd(&dnorm[i], dcore * x * inv_rms);
+        local_dot += dcore * x * norm_weight[i];
+    }
+    float dot_beta = la_block_sum(reduce, tid, block, local_dot);
+
+    float coeff = inv_rms * inv_rms * inv_rms / (float)value_dim;
+    for (int i = tid; i < value_dim; i += block) {
+        float x = row.load(i);
+        float dcore = upstream[i] * la_silu(z[i]);
+        row.store(i, dcore * norm_weight[i] * inv_rms - x * coeff * dot_beta);
+    }
+}
+
+// d(x / ||x||) pulled back onto x.
+__device__ __forceinline__ float la_l2_norm_grad(
+    float d_normed,
+    float raw,
+    float dot,
+    float norm,
+    float norm_cubed
+) {
+    return d_normed / norm - raw * dot / norm_cubed;
+}
+
+// Gate-parameter tail: the per-token decay/beta grads onto a_proj, dt_bias,
+// A_log and b_proj. Single-thread; `head_idx` indexes the [b, s, head] planes.
+__device__ __forceinline__ void la_gate_param_backward(
+    float* __restrict__ da,
+    float* __restrict__ ddt,
+    float* __restrict__ da_log,
+    float* __restrict__ db,
+    const float* __restrict__ a_proj,
+    const float* __restrict__ dt_bias,
+    unsigned long long head_idx,
+    int value_head,
+    float exp_a,
+    float dg,
+    float dbeta_value,
+    float beta_value
+) {
+    float softplus_input = a_proj[head_idx] + dt_bias[value_head];
+    float softplus_value = la_softplus(softplus_input);
+    float softplus_grad = la_sigmoid(softplus_input);
+    float common = dg * (-exp_a);
+    da[head_idx] = common * softplus_grad;
+    atomicAdd(&ddt[value_head], common * softplus_grad);
+    atomicAdd(&da_log[value_head], common * softplus_value);
+    db[head_idx] = dbeta_value * beta_value * (1.0f - beta_value);
+}
+
 extern "C" __global__ void linear_attention_conv1d_silu_forward_f32_to_bf16(
     float* __restrict__ preact,
     unsigned short* __restrict__ out_bf16,
@@ -438,19 +558,10 @@ extern "C" __global__ void linear_attention_scan_backward_f32(
         float dexp_g = scalar0;
 
         if (tid == 0) {
-            float a_value = a_proj[la_idx3(
-                batch_idx, seq_idx, value_head, seq_len, num_value_heads)];
-            float softplus_input = a_value + dt_bias[value_head];
-            float softplus_value = la_softplus(softplus_input);
-            float softplus_grad = la_sigmoid(softplus_input);
-            float dg = dexp_g * exp_g_value;
-            float common = dg * (-exp_a);
-            da[la_idx3(batch_idx, seq_idx, value_head, seq_len, num_value_heads)] =
-                common * softplus_grad;
-            atomicAdd(&ddt[value_head], common * softplus_grad);
-            atomicAdd(&da_log[value_head], common * softplus_value);
-            db[la_idx3(batch_idx, seq_idx, value_head, seq_len, num_value_heads)] =
-                dbeta_scalar * beta_value * (1.0f - beta_value);
+            la_gate_param_backward(
+                da, ddt, da_log, db, a_proj, dt_bias,
+                la_idx3(batch_idx, seq_idx, value_head, seq_len, num_value_heads),
+                value_head, exp_a, dexp_g * exp_g_value, dbeta_scalar, beta_value);
         }
 
         float local_q_dot = 0.0f;
@@ -491,8 +602,8 @@ extern "C" __global__ void linear_attention_scan_backward_f32(
 
         for (int i = tid; i < key_dim; i += blockDim.x) {
             float dq_raw =
-                q_scale * (dq_vec[i] / q_norm - q_raw[i] * q_dot / q_norm_cubed);
-            float dk_raw = dk_vec[i] / k_norm - k_raw[i] * k_dot / k_norm_cubed;
+                q_scale * la_l2_norm_grad(dq_vec[i], q_raw[i], q_dot, q_norm, q_norm_cubed);
+            float dk_raw = la_l2_norm_grad(dk_vec[i], k_raw[i], k_dot, k_norm, k_norm_cubed);
             atomicAdd(
                 &dqkv[la_idx3(batch_idx, seq_idx, key_head * key_dim + i, seq_len, qkv_dim)],
                 dq_raw);
@@ -555,15 +666,8 @@ extern "C" __global__ void linear_attention_rms_gated_forward_f32_from_bf16(
         float x = la_bf16_to_float(row_x[i]);
         local_sq += x * x;
     }
-    smem[tid] = local_sq;
-    __syncthreads();
-    for (int step = block / 2; step > 0; step >>= 1) {
-        if (tid < step) {
-            smem[tid] += smem[tid + step];
-        }
-        __syncthreads();
-    }
-    float inv_rms = rsqrtf((smem[0] / (float)value_dim) + eps);
+    float inv_rms =
+        rsqrtf((la_block_sum(smem, tid, block, local_sq) / (float)value_dim) + eps);
 
     for (int i = tid; i < value_dim; i += block) {
         float gate = la_silu(row_z[i]);
@@ -591,56 +695,11 @@ extern "C" __global__ void linear_attention_rms_gated_backward_f32_to_bf16(
     if (row >= rows) {
         return;
     }
-    int tid = threadIdx.x;
-    int block = blockDim.x;
-    const unsigned short* row_x = raw_output + (long long)row * value_dim;
-    const float* row_z = z + (long long)row * value_dim;
-    const float* row_up = upstream + (long long)row * value_dim;
-    unsigned short* row_d = d_raw + (long long)row * value_dim;
-
-    float local_sq = 0.0f;
-    for (int i = tid; i < value_dim; i += block) {
-        float x = la_bf16_to_float(row_x[i]);
-        local_sq += x * x;
-    }
-    smem[tid] = local_sq;
-    __syncthreads();
-    for (int step = block / 2; step > 0; step >>= 1) {
-        if (tid < step) {
-            smem[tid] += smem[tid + step];
-        }
-        __syncthreads();
-    }
-    float inv_rms = rsqrtf((smem[0] / (float)value_dim) + eps);
-    __syncthreads();
-
-    float local_dot = 0.0f;
-    for (int i = tid; i < value_dim; i += block) {
-        float x = la_bf16_to_float(row_x[i]);
-        float gate = row_z[i];
-        float up = row_up[i];
-        float dcore = up * la_silu(gate);
-        dz[(long long)row * value_dim + i] =
-            up * x * inv_rms * norm_weight[i] * la_silu_grad(gate);
-        atomicAdd(&dnorm[i], dcore * x * inv_rms);
-        local_dot += dcore * x * norm_weight[i];
-    }
-    smem[tid] = local_dot;
-    __syncthreads();
-    for (int step = block / 2; step > 0; step >>= 1) {
-        if (tid < step) {
-            smem[tid] += smem[tid + step];
-        }
-        __syncthreads();
-    }
-    float dot_beta = smem[0];
-    float coeff = inv_rms * inv_rms * inv_rms / (float)value_dim;
-    for (int i = tid; i < value_dim; i += block) {
-        float x = la_bf16_to_float(row_x[i]);
-        float dcore = row_up[i] * la_silu(row_z[i]);
-        row_d[i] = la_float_to_bf16(
-            dcore * norm_weight[i] * inv_rms - x * coeff * dot_beta);
-    }
+    long long base = (long long)row * value_dim;
+    LaCoreRowBf16 core{raw_output + base, d_raw + base};
+    la_rms_gated_backward_row(
+        core, smem, dz + base, dnorm, z + base, upstream + base, norm_weight,
+        threadIdx.x, blockDim.x, value_dim, eps);
 }
 
 // Backward of gdr_fq_prep + the chunk-local cumsum: takes the FlashQLA core
@@ -675,8 +734,6 @@ extern "C" __global__ void linear_attention_gdr_prepare_backward_f32(
     constexpr int BT = 64;
     __shared__ float dg_tok[BT];
     __shared__ float reduce[LINEAR_ATTENTION_BLOCK];
-    __shared__ float scalar0;
-    __shared__ float scalar1;
 
     int rows = batch * num_value_heads;
     int row = blockIdx.x % rows;
@@ -738,61 +795,10 @@ extern "C" __global__ void linear_attention_gdr_prepare_backward_f32(
             local_kd += kr * la_bf16_to_float(dk[v_row + i]);
         }
 
-        reduce[tid] = local_qq;
-        __syncthreads();
-        for (int step = block / 2; step > 0; step >>= 1) {
-            if (tid < step) {
-                reduce[tid] += reduce[tid + step];
-            }
-            __syncthreads();
-        }
-        if (tid == 0) {
-            scalar0 = sqrtf(reduce[0] + 1.0e-12f);
-        }
-        __syncthreads();
-        float q_norm = scalar0;
-
-        reduce[tid] = local_kk;
-        __syncthreads();
-        for (int step = block / 2; step > 0; step >>= 1) {
-            if (tid < step) {
-                reduce[tid] += reduce[tid + step];
-            }
-            __syncthreads();
-        }
-        if (tid == 0) {
-            scalar1 = sqrtf(reduce[0] + 1.0e-12f);
-        }
-        __syncthreads();
-        float k_norm = scalar1;
-
-        reduce[tid] = local_qd;
-        __syncthreads();
-        for (int step = block / 2; step > 0; step >>= 1) {
-            if (tid < step) {
-                reduce[tid] += reduce[tid + step];
-            }
-            __syncthreads();
-        }
-        if (tid == 0) {
-            scalar0 = reduce[0];
-        }
-        __syncthreads();
-        float q_dot = scalar0;
-
-        reduce[tid] = local_kd;
-        __syncthreads();
-        for (int step = block / 2; step > 0; step >>= 1) {
-            if (tid < step) {
-                reduce[tid] += reduce[tid + step];
-            }
-            __syncthreads();
-        }
-        if (tid == 0) {
-            scalar1 = reduce[0];
-        }
-        __syncthreads();
-        float k_dot = scalar1;
+        float q_norm = sqrtf(la_block_sum(reduce, tid, block, local_qq) + 1.0e-12f);
+        float k_norm = sqrtf(la_block_sum(reduce, tid, block, local_kk) + 1.0e-12f);
+        float q_dot = la_block_sum(reduce, tid, block, local_qd);
+        float k_dot = la_block_sum(reduce, tid, block, local_kd);
 
         float q_norm_cubed = q_norm * q_norm * q_norm;
         float k_norm_cubed = k_norm * k_norm * k_norm;
@@ -807,12 +813,12 @@ extern "C" __global__ void linear_attention_gdr_prepare_backward_f32(
             atomicAdd(
                 &dqkv_conv[la_idx3(batch_idx, seq_idx, key_head * key_dim + i,
                                    seq_len, qkv_dim)],
-                dqn / q_norm - qr * q_dot / q_norm_cubed);
+                la_l2_norm_grad(dqn, qr, q_dot, q_norm, q_norm_cubed));
             atomicAdd(
                 &dqkv_conv[la_idx3(batch_idx, seq_idx,
                                    q_dim + key_head * key_dim + i, seq_len,
                                    qkv_dim)],
-                dkn / k_norm - kr * k_dot / k_norm_cubed);
+                la_l2_norm_grad(dkn, kr, k_dot, k_norm, k_norm_cubed));
         }
         for (int i = tid; i < value_dim; i += block) {
             atomicAdd(
@@ -825,15 +831,9 @@ extern "C" __global__ void linear_attention_gdr_prepare_backward_f32(
         if (tid == 0) {
             unsigned long long head_idx = la_idx3(
                 batch_idx, seq_idx, value_head, seq_len, num_value_heads);
-            float softplus_input = a_proj[head_idx] + dt_bias[value_head];
-            float softplus_value = la_softplus(softplus_input);
-            float softplus_grad = la_sigmoid(softplus_input);
-            float common = dg_tok[local_t] * (-exp_a);
-            da[head_idx] = common * softplus_grad;
-            atomicAdd(&ddt[value_head], common * softplus_grad);
-            atomicAdd(&da_log[value_head], common * softplus_value);
-            float beta_value = beta[head_idx];
-            db[head_idx] = dbeta[head_idx] * beta_value * (1.0f - beta_value);
+            la_gate_param_backward(
+                da, ddt, da_log, db, a_proj, dt_bias, head_idx, value_head, exp_a,
+                dg_tok[local_t], dbeta[head_idx], beta[head_idx]);
         }
         __syncthreads();
     }
@@ -1061,54 +1061,12 @@ extern "C" __global__ void linear_attention_chunked_scan_backward_f32(
             }
             __syncthreads();
 
-            float local_core_sq = 0.0f;
-            for (int v = tid; v < value_dim; v += blockDim.x) {
-                local_core_sq += core_out[v] * core_out[v];
-            }
-            reduce[tid] = local_core_sq;
-            __syncthreads();
-            for (int step = blockDim.x / 2; step > 0; step >>= 1) {
-                if (tid < step) {
-                    reduce[tid] += reduce[tid + step];
-                }
-                __syncthreads();
-            }
-            if (tid == 0) {
-                scalar0 = rsqrtf((reduce[0] / (float)value_dim) + eps);
-            }
-            __syncthreads();
-            float inv_rms = scalar0;
-
-            float local_dot_beta = 0.0f;
-            for (int v = tid; v < value_dim; v += blockDim.x) {
-                unsigned long long out_idx = la_idx4(
-                    batch_idx, seq_idx, value_head, v, seq_len, num_value_heads, value_dim);
-                float normed = core_out[v] * inv_rms * norm_weight[v];
-                float gate = z[out_idx];
-                float gate_silu = la_silu(gate);
-                float dcore_v = upstream[out_idx] * gate_silu;
-                dcore[v] = dcore_v;
-                dz[out_idx] = upstream[out_idx] * normed * la_silu_grad(gate);
-                atomicAdd(&dnorm[v], dcore_v * core_out[v] * inv_rms);
-                local_dot_beta += dcore_v * core_out[v] * norm_weight[v];
-            }
-            reduce[tid] = local_dot_beta;
-            __syncthreads();
-            for (int step = blockDim.x / 2; step > 0; step >>= 1) {
-                if (tid < step) {
-                    reduce[tid] += reduce[tid + step];
-                }
-                __syncthreads();
-            }
-            if (tid == 0) {
-                scalar0 = reduce[0];
-            }
-            __syncthreads();
-            float dot_beta = scalar0;
-            float coeff = inv_rms * inv_rms * inv_rms / (float)value_dim;
-            for (int v = tid; v < value_dim; v += blockDim.x) {
-                dcore[v] = dcore[v] * norm_weight[v] * inv_rms - core_out[v] * coeff * dot_beta;
-            }
+            unsigned long long out_base = la_idx4(
+                batch_idx, seq_idx, value_head, 0, seq_len, num_value_heads, value_dim);
+            LaCoreRowF32 core{core_out, dcore};
+            la_rms_gated_backward_row(
+                core, reduce, dz + out_base, dnorm, z + out_base, upstream + out_base,
+                norm_weight, tid, blockDim.x, value_dim, eps);
             __syncthreads();
 
             for (int k = tid; k < key_dim; k += blockDim.x) {
@@ -1206,19 +1164,10 @@ extern "C" __global__ void linear_attention_chunked_scan_backward_f32(
             float dexp_g = scalar0;
 
             if (tid == 0) {
-                float a_value = a_proj[la_idx3(
-                    batch_idx, seq_idx, value_head, seq_len, num_value_heads)];
-                float softplus_input = a_value + dt_bias[value_head];
-                float softplus_value = la_softplus(softplus_input);
-                float softplus_grad = la_sigmoid(softplus_input);
-                float dg = dexp_g * exp_g_value;
-                float common = dg * (-exp_a);
-                da[la_idx3(batch_idx, seq_idx, value_head, seq_len, num_value_heads)] =
-                    common * softplus_grad;
-                atomicAdd(&ddt[value_head], common * softplus_grad);
-                atomicAdd(&da_log[value_head], common * softplus_value);
-                db[la_idx3(batch_idx, seq_idx, value_head, seq_len, num_value_heads)] =
-                    dbeta_scalar * beta_value * (1.0f - beta_value);
+                la_gate_param_backward(
+                    da, ddt, da_log, db, a_proj, dt_bias,
+                    la_idx3(batch_idx, seq_idx, value_head, seq_len, num_value_heads),
+                    value_head, exp_a, dexp_g * exp_g_value, dbeta_scalar, beta_value);
             }
 
             float local_q_dot = 0.0f;
@@ -1259,8 +1208,8 @@ extern "C" __global__ void linear_attention_chunked_scan_backward_f32(
 
             for (int i = tid; i < key_dim; i += blockDim.x) {
                 float dq_raw =
-                    q_scale * (dq_vec[i] / q_norm - q_raw[i] * q_dot / q_norm_cubed);
-                float dk_raw = dk_vec[i] / k_norm - k_raw[i] * k_dot / k_norm_cubed;
+                    q_scale * la_l2_norm_grad(dq_vec[i], q_raw[i], q_dot, q_norm, q_norm_cubed);
+                float dk_raw = la_l2_norm_grad(dk_vec[i], k_raw[i], k_dot, k_norm, k_norm_cubed);
                 atomicAdd(
                     &dqkv_conv[la_idx3(batch_idx, seq_idx, key_head * key_dim + i, seq_len, qkv_dim)],
                     dq_raw);
@@ -1656,8 +1605,6 @@ extern "C" __global__ void linear_attention_chunk_grad_f32(
     __shared__ float core_out[LINEAR_ATTENTION_MAX_DIM];
     __shared__ float dcore[LINEAR_ATTENTION_MAX_DIM];
     __shared__ float reduce[LINEAR_ATTENTION_BLOCK];
-    __shared__ float scalar0;
-    __shared__ float scalar1;
 
     float exp_a = expf(a_log[value_head]);
     float q_scale = rsqrtf((float)key_dim);
@@ -1696,19 +1643,8 @@ extern "C" __global__ void linear_attention_chunk_grad_f32(
             for (int i = tid; i < key_dim; i += blockDim.x) {
                 local_k_sq += k_raw[i] * k_raw[i];
             }
-            reduce[tid] = local_k_sq;
-            __syncthreads();
-            for (int step = blockDim.x / 2; step > 0; step >>= 1) {
-                if (tid < step) {
-                    reduce[tid] += reduce[tid + step];
-                }
-                __syncthreads();
-            }
-            if (tid == 0) {
-                scalar0 = sqrtf(reduce[0] + 1.0e-12f);
-            }
-            __syncthreads();
-            float k_norm = scalar0;
+            float k_norm =
+                sqrtf(la_block_sum(reduce, tid, blockDim.x, local_k_sq) + 1.0e-12f);
             for (int i = tid; i < key_dim; i += blockDim.x) {
                 k_vec[i] = k_raw[i] / k_norm;
             }
@@ -1764,33 +1700,11 @@ extern "C" __global__ void linear_attention_chunk_grad_f32(
                 local_q_sq += q_raw[i] * q_raw[i];
                 local_k_sq += k_raw[i] * k_raw[i];
             }
-            reduce[tid] = local_q_sq;
-            __syncthreads();
-            for (int step = blockDim.x / 2; step > 0; step >>= 1) {
-                if (tid < step) {
-                    reduce[tid] += reduce[tid + step];
-                }
-                __syncthreads();
-            }
-            if (tid == 0) {
-                scalar0 = sqrtf(reduce[0] + 1.0e-12f);
-            }
-            __syncthreads();
-            float q_norm = scalar0;
+            float q_norm =
+                sqrtf(la_block_sum(reduce, tid, blockDim.x, local_q_sq) + 1.0e-12f);
 
-            reduce[tid] = local_k_sq;
-            __syncthreads();
-            for (int step = blockDim.x / 2; step > 0; step >>= 1) {
-                if (tid < step) {
-                    reduce[tid] += reduce[tid + step];
-                }
-                __syncthreads();
-            }
-            if (tid == 0) {
-                scalar0 = sqrtf(reduce[0] + 1.0e-12f);
-            }
-            __syncthreads();
-            float k_norm = scalar0;
+            float k_norm =
+                sqrtf(la_block_sum(reduce, tid, blockDim.x, local_k_sq) + 1.0e-12f);
 
             for (int i = tid; i < key_dim; i += blockDim.x) {
                 q_vec[i] = q_scale * q_raw[i] / q_norm;
@@ -1811,54 +1725,12 @@ extern "C" __global__ void linear_attention_chunk_grad_f32(
             }
             __syncthreads();
 
-            float local_core_sq = 0.0f;
-            for (int v = tid; v < value_dim; v += blockDim.x) {
-                local_core_sq += core_out[v] * core_out[v];
-            }
-            reduce[tid] = local_core_sq;
-            __syncthreads();
-            for (int step = blockDim.x / 2; step > 0; step >>= 1) {
-                if (tid < step) {
-                    reduce[tid] += reduce[tid + step];
-                }
-                __syncthreads();
-            }
-            if (tid == 0) {
-                scalar0 = rsqrtf((reduce[0] / (float)value_dim) + eps);
-            }
-            __syncthreads();
-            float inv_rms = scalar0;
-
-            float local_dot_beta = 0.0f;
-            for (int v = tid; v < value_dim; v += blockDim.x) {
-                unsigned long long out_idx = la_idx4(
-                    batch_idx, seq_idx, value_head, v, seq_len, num_value_heads, value_dim);
-                float normed = core_out[v] * inv_rms * norm_weight[v];
-                float gate = z[out_idx];
-                float gate_silu = la_silu(gate);
-                float dcore_v = upstream[out_idx] * gate_silu;
-                dcore[v] = dcore_v;
-                dz[out_idx] = upstream[out_idx] * normed * la_silu_grad(gate);
-                atomicAdd(&dnorm[v], dcore_v * core_out[v] * inv_rms);
-                local_dot_beta += dcore_v * core_out[v] * norm_weight[v];
-            }
-            reduce[tid] = local_dot_beta;
-            __syncthreads();
-            for (int step = blockDim.x / 2; step > 0; step >>= 1) {
-                if (tid < step) {
-                    reduce[tid] += reduce[tid + step];
-                }
-                __syncthreads();
-            }
-            if (tid == 0) {
-                scalar0 = reduce[0];
-            }
-            __syncthreads();
-            float dot_beta = scalar0;
-            float coeff = inv_rms * inv_rms * inv_rms / (float)value_dim;
-            for (int v = tid; v < value_dim; v += blockDim.x) {
-                dcore[v] = dcore[v] * norm_weight[v] * inv_rms - core_out[v] * coeff * dot_beta;
-            }
+            unsigned long long out_base = la_idx4(
+                batch_idx, seq_idx, value_head, 0, seq_len, num_value_heads, value_dim);
+            LaCoreRowF32 core{core_out, dcore};
+            la_rms_gated_backward_row(
+                core, reduce, dz + out_base, dnorm, z + out_base, upstream + out_base,
+                norm_weight, tid, blockDim.x, value_dim, eps);
             __syncthreads();
 
             for (int k = tid; k < key_dim; k += blockDim.x) {
@@ -1907,19 +1779,7 @@ extern "C" __global__ void linear_attention_chunk_grad_f32(
                 local_dbeta += d_delta[v] * (v_raw[v] - kv);
                 dkv_mem[v] = -d_delta[v] * beta_value;
             }
-            reduce[tid] = local_dbeta;
-            __syncthreads();
-            for (int step = blockDim.x / 2; step > 0; step >>= 1) {
-                if (tid < step) {
-                    reduce[tid] += reduce[tid + step];
-                }
-                __syncthreads();
-            }
-            if (tid == 0) {
-                scalar0 = reduce[0];
-            }
-            __syncthreads();
-            float dbeta_scalar = scalar0;
+            float dbeta_scalar = la_block_sum(reduce, tid, blockDim.x, local_dbeta);
 
             for (int idx = tid; idx < state_elems; idx += blockDim.x) {
                 int k = idx / value_dim;
@@ -1941,34 +1801,13 @@ extern "C" __global__ void linear_attention_chunk_grad_f32(
             for (int idx = tid; idx < state_elems; idx += blockDim.x) {
                 local_dexp_g += prev_state[idx] * grad_state[idx];
             }
-            reduce[tid] = local_dexp_g;
-            __syncthreads();
-            for (int step = blockDim.x / 2; step > 0; step >>= 1) {
-                if (tid < step) {
-                    reduce[tid] += reduce[tid + step];
-                }
-                __syncthreads();
-            }
-            if (tid == 0) {
-                scalar0 = reduce[0];
-            }
-            __syncthreads();
-            float dexp_g = scalar0;
+            float dexp_g = la_block_sum(reduce, tid, blockDim.x, local_dexp_g);
 
             if (tid == 0) {
-                float a_value = a_proj[la_idx3(
-                    batch_idx, seq_idx, value_head, seq_len, num_value_heads)];
-                float softplus_input = a_value + dt_bias[value_head];
-                float softplus_value = la_softplus(softplus_input);
-                float softplus_grad = la_sigmoid(softplus_input);
-                float dg = dexp_g * exp_g_value;
-                float common = dg * (-exp_a);
-                da[la_idx3(batch_idx, seq_idx, value_head, seq_len, num_value_heads)] =
-                    common * softplus_grad;
-                atomicAdd(&ddt[value_head], common * softplus_grad);
-                atomicAdd(&da_log[value_head], common * softplus_value);
-                db[la_idx3(batch_idx, seq_idx, value_head, seq_len, num_value_heads)] =
-                    dbeta_scalar * beta_value * (1.0f - beta_value);
+                la_gate_param_backward(
+                    da, ddt, da_log, db, a_proj, dt_bias,
+                    la_idx3(batch_idx, seq_idx, value_head, seq_len, num_value_heads),
+                    value_head, exp_a, dexp_g * exp_g_value, dbeta_scalar, beta_value);
             }
 
             float local_q_dot = 0.0f;
@@ -1977,40 +1816,16 @@ extern "C" __global__ void linear_attention_chunk_grad_f32(
                 local_q_dot += q_raw[i] * dq_vec[i];
                 local_k_dot += k_raw[i] * dk_vec[i];
             }
-            reduce[tid] = local_q_dot;
-            __syncthreads();
-            for (int step = blockDim.x / 2; step > 0; step >>= 1) {
-                if (tid < step) {
-                    reduce[tid] += reduce[tid + step];
-                }
-                __syncthreads();
-            }
-            if (tid == 0) {
-                scalar0 = reduce[0];
-            }
-            __syncthreads();
-            float q_dot = scalar0;
+            float q_dot = la_block_sum(reduce, tid, blockDim.x, local_q_dot);
 
-            reduce[tid] = local_k_dot;
-            __syncthreads();
-            for (int step = blockDim.x / 2; step > 0; step >>= 1) {
-                if (tid < step) {
-                    reduce[tid] += reduce[tid + step];
-                }
-                __syncthreads();
-            }
-            if (tid == 0) {
-                scalar1 = reduce[0];
-            }
-            __syncthreads();
-            float k_dot = scalar1;
+            float k_dot = la_block_sum(reduce, tid, blockDim.x, local_k_dot);
             float q_norm_cubed = q_norm * q_norm * q_norm;
             float k_norm_cubed = k_norm * k_norm * k_norm;
 
             for (int i = tid; i < key_dim; i += blockDim.x) {
                 float dq_raw =
-                    q_scale * (dq_vec[i] / q_norm - q_raw[i] * q_dot / q_norm_cubed);
-                float dk_raw = dk_vec[i] / k_norm - k_raw[i] * k_dot / k_norm_cubed;
+                    q_scale * la_l2_norm_grad(dq_vec[i], q_raw[i], q_dot, q_norm, q_norm_cubed);
+                float dk_raw = la_l2_norm_grad(dk_vec[i], k_raw[i], k_dot, k_norm, k_norm_cubed);
                 atomicAdd(
                     &dqkv_conv[la_idx3(batch_idx, seq_idx, key_head * key_dim + i, seq_len, qkv_dim)],
                     dq_raw);

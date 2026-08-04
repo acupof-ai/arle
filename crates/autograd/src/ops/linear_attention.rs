@@ -1130,8 +1130,15 @@ fn try_linear_attention_forward_device(
             .alloc_device_tensor(vec![params.batch, params.seq_len, qkv_dim], result.preact)?;
         let qkv_conv_id = store
             .alloc_device_tensor(vec![params.batch, params.seq_len, qkv_dim], result.qkv_conv)?;
-        let g_id = store.alloc_device_tensor(head_shape.clone(), result.g)?;
-        let beta_id = store.alloc_device_tensor(head_shape, result.beta)?;
+        // FlashQLA re-derives g/beta in the backward, so they never reach the tape.
+        let (g_id, beta_id) = if result.flashqla {
+            (None, None)
+        } else {
+            (
+                Some(store.alloc_device_tensor(head_shape.clone(), result.g)?),
+                Some(store.alloc_device_tensor(head_shape, result.beta)?),
+            )
+        };
         // FlashQLA keeps only chunk 0 (the state carry) — it recomputes the rest.
         let chunk_state_id = store.alloc_device_tensor(
             vec![
@@ -1180,8 +1187,8 @@ fn try_linear_attention_forward_device(
                 norm_weight,
                 preact: Some(preact_id),
                 qkv_conv: Some(qkv_conv_id),
-                g: Some(g_id),
-                beta: Some(beta_id),
+                g: g_id,
+                beta: beta_id,
                 chunk_state: Some(chunk_state_id),
                 raw_output: raw_output_id,
                 // State carry lives in chunk_state[0] → None (Some would misfire
@@ -1233,15 +1240,13 @@ fn try_linear_attention_backward_device(
     let Some(qkv_conv) = qkv_conv else {
         return Ok(None);
     };
-    let Some(g) = g else {
-        return Ok(None);
-    };
-    let Some(beta) = beta else {
-        return Ok(None);
-    };
     let Some(chunk_state) = chunk_state else {
         return Ok(None);
     };
+    // Only FlashQLA re-derives g/beta; every other route needs them off the tape.
+    if raw_output.is_none() && (g.is_none() || beta.is_none()) {
+        return Ok(None);
+    }
 
     for tensor_id in [
         output_grad_id,
@@ -1255,11 +1260,11 @@ fn try_linear_attention_backward_device(
         norm_weight,
         preact,
         qkv_conv,
-        g,
-        beta,
         chunk_state,
     ]
     .into_iter()
+    .chain(g)
+    .chain(beta)
     .chain(raw_output)
     {
         store.ensure_device(tensor_id)?;
@@ -1286,8 +1291,8 @@ fn try_linear_attention_backward_device(
     let norm_handle = handle(store, norm_weight)?;
     let preact_handle = handle(store, preact)?;
     let qkv_conv_handle = handle(store, qkv_conv)?;
-    let g_handle = handle(store, g)?;
-    let beta_handle = handle(store, beta)?;
+    let g_handle = g.map(|id| handle(store, id)).transpose()?;
+    let beta_handle = beta.map(|id| handle(store, id)).transpose()?;
     let chunk_state_handle = handle(store, chunk_state)?;
     let raw_output_handle = raw_output.map(|id| handle(store, id)).transpose()?;
     let conv_tail_handle = initial_conv_window
@@ -1322,8 +1327,8 @@ fn try_linear_attention_backward_device(
                 norm_weight: &norm_handle,
                 preact: &preact_handle,
                 qkv_conv: &qkv_conv_handle,
-                g: &g_handle,
-                beta: &beta_handle,
+                g: g_handle.as_ref(),
+                beta: beta_handle.as_ref(),
                 chunk_state: &chunk_state_handle,
                 raw_output: raw_output_handle.as_ref(),
                 initial_conv_window: conv_tail_handle.as_ref(),

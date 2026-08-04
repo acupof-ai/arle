@@ -438,8 +438,9 @@ pub struct LinearAttentionDeviceBackwardArgs<'a> {
     pub norm_weight: &'a DeviceHandle,
     pub preact: &'a DeviceHandle,
     pub qkv_conv: &'a DeviceHandle,
-    pub g: &'a DeviceHandle,
-    pub beta: &'a DeviceHandle,
+    /// None on the FlashQLA route, which re-derives both from `qkv_conv`.
+    pub g: Option<&'a DeviceHandle>,
+    pub beta: Option<&'a DeviceHandle>,
     /// FlashQLA route: only chunk 0 (= the state carry). Otherwise every chunk.
     pub chunk_state: &'a DeviceHandle,
     /// Some = the FlashQLA route ran; the GDN output the rms-gated backward

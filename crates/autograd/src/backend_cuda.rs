@@ -6415,6 +6415,8 @@ fn cuda_linear_attention_backward_device(
             let slice = |src| cuda_row_slice(backend, src, row, p.batch);
             let initial_conv_window = args.initial_conv_window.map(slice).transpose()?;
             let raw_output = args.raw_output.map(slice).transpose()?;
+            let g = args.g.map(slice).transpose()?;
+            let beta = args.beta.map(slice).transpose()?;
             cuda_linear_attention_backward_device_row(
                 backend,
                 LinearAttentionDeviceBackwardArgs {
@@ -6426,8 +6428,8 @@ fn cuda_linear_attention_backward_device(
                     a_proj: &slice(args.a_proj)?,
                     preact: &slice(args.preact)?,
                     qkv_conv: &slice(args.qkv_conv)?,
-                    g: &slice(args.g)?,
-                    beta: &slice(args.beta)?,
+                    g: g.as_ref(),
+                    beta: beta.as_ref(),
                     chunk_state: &slice(args.chunk_state)?,
                     raw_output: raw_output.as_ref(),
                     conv1d_weight: args.conv1d_weight,
@@ -6460,6 +6462,17 @@ fn cuda_linear_attention_backward_device(
         da_log: sum(|r| &r.da_log, p.num_value_heads)?,
         dnorm: sum(|r| &r.dnorm, p.value_dim)?,
     }))
+}
+
+/// Only FlashQLA re-derives g/beta; the recurrent routes read them off the tape.
+#[cfg(not(feature = "no-cuda"))]
+fn taped_g_beta<'a>(
+    beta: Option<&'a CudaSlice<f32>>,
+    g: Option<&'a CudaSlice<f32>>,
+) -> Result<(&'a CudaSlice<f32>, &'a CudaSlice<f32>)> {
+    beta.zip(g).ok_or(AutogradError::TapeInvariant(
+        "linear_attention backward missing taped g/beta",
+    ))
 }
 
 #[cfg(not(feature = "no-cuda"))]
@@ -6500,27 +6513,35 @@ fn cuda_linear_attention_backward_device_row(
         backend.cuda_slice(args.norm_weight, "linear_attention_backward norm_weight")?;
     let preact = backend.cuda_slice(args.preact, "linear_attention_backward preact")?;
     let qkv_conv = backend.cuda_bf16_slice(args.qkv_conv, "linear_attention_backward qkv_conv")?;
-    let beta = backend.cuda_slice(args.beta, "linear_attention_backward beta")?;
-    let g = backend.cuda_slice(args.g, "linear_attention_backward g")?;
+    let beta = args
+        .beta
+        .map(|h| backend.cuda_slice(h, "linear_attention_backward beta"))
+        .transpose()?;
+    let g = args
+        .g
+        .map(|h| backend.cuda_slice(h, "linear_attention_backward g"))
+        .transpose()?;
     let chunk_state =
         backend.cuda_slice(args.chunk_state, "linear_attention_backward chunk_state")?;
 
     for (label, got, expected) in [
-        ("upstream", upstream.len(), z_len),
-        ("qkv", qkv.len(), qkv_len),
-        ("z", z.len(), z_len),
-        ("a_proj", a_proj.len(), head_len),
-        ("conv1d_weight", conv1d_weight.len(), conv_len),
-        ("dt_bias", dt_bias.len(), p.num_value_heads),
-        ("a_log", a_log.len(), p.num_value_heads),
-        ("norm_weight", norm_weight.len(), p.value_dim),
-        ("preact", preact.len(), qkv_len),
-        ("qkv_conv", qkv_conv.len(), qkv_len),
-        ("beta", beta.len(), head_len),
-        ("g", g.len(), head_len),
-        ("chunk_state", chunk_state.len(), chunk_state_len),
+        ("upstream", Some(upstream.len()), z_len),
+        ("qkv", Some(qkv.len()), qkv_len),
+        ("z", Some(z.len()), z_len),
+        ("a_proj", Some(a_proj.len()), head_len),
+        ("conv1d_weight", Some(conv1d_weight.len()), conv_len),
+        ("dt_bias", Some(dt_bias.len()), p.num_value_heads),
+        ("a_log", Some(a_log.len()), p.num_value_heads),
+        ("norm_weight", Some(norm_weight.len()), p.value_dim),
+        ("preact", Some(preact.len()), qkv_len),
+        ("qkv_conv", Some(qkv_conv.len()), qkv_len),
+        ("beta", beta.map(|s| s.len()), head_len),
+        ("g", g.map(|s| s.len()), head_len),
+        ("chunk_state", Some(chunk_state.len()), chunk_state_len),
     ] {
-        if got != expected {
+        if let Some(got) = got
+            && got != expected
+        {
             return Err(AutogradError::TapeInvariant(Box::leak(
                 format!(
                     "cuda linear_attention_backward_device {label} len mismatch: got={got} expected={expected}"
@@ -6865,6 +6886,7 @@ fn cuda_linear_attention_backward_device_row(
             )?;
         }
     } else if use_mono {
+        let (beta, g) = taped_g_beta(beta, g)?;
         let mut grad_state_scratch = backend
             .stream
             .alloc_zeros::<f32>(state_len)
@@ -6954,6 +6976,7 @@ fn cuda_linear_attention_backward_device_row(
             },
         )?;
     } else {
+        let (beta, g) = taped_g_beta(beta, g)?;
         let rows_i32 = i32::try_from(rows)
             .map_err(|_| AutogradError::TapeInvariant("linear_attention rows exceeds i32"))?;
         let num_chunks_i32 = i32::try_from(num_chunks)
