@@ -1,0 +1,112 @@
+# The W8A16 27B decode step, kernel by kernel — CUDA, 2026-08-04
+
+> Status: Measurement. First per-kernel budget for the W8A16 champion; the
+> 2026-08-01 budget is the FP8 model and its weight layout does not transfer.
+
+## Goal
+
+Split the 16.9 ms decode step at 33K context into kernels, and score each
+against the bytes it has to read.
+
+## A whole-step graph makes the default trace blind
+
+`nsys profile --trace=cuda` on the champion reports **one kernel**:
+
+```
+Time(%)  Total(ns)   Instances  Avg(ns)  Name
+100.0    25,121,062  1176       21,361   argmax_kernel_fast(...)
+```
+
+Every other kernel is inside the captured decode graph, and nsys times a graph
+replay as a single unit by default. `argmax` is the only kernel left outside
+it, in the sampling tail. The window is correctly placed — 1176 argmax calls
+in 20 s is 17 ms/step — and it still shows nothing.
+
+**`--cuda-graph-trace=node` is mandatory once a whole-step graph exists.** It
+times each graph node separately and the step opens up.
+
+## Parameters
+
+```bash
+nsys launch --session-new=... --trace=cuda --cuda-graph-trace=node env ... arle serve ...
+# collection started 45 s in (past the 33K prefill), 20 s window, 3000-token completion
+nsys stats --report cuda_gpu_kern_sum --force-export=true
+```
+
+- H20 GPU 6, Qwen3.6-27B W8A16, 33K prompt, c=1, shipped defaults
+- Steps in window: 1147 (`embedding_batched_native_kernel`, exactly 1/step)
+- In-process `submit` over the same run: 17.272 ms
+
+## Results
+
+Per decode step, total ÷ 1147:
+
+| kernel | launches | ms | % |
+|---|---:|---:|---:|
+| Marlin W8A16 GEMM | 256 | 11.709 | 70.3 |
+| FA3 decode attention | 16 | 2.373 | 14.3 |
+| lm_head (`nvjet_tst_128x8`) | 1 | 0.666 | 4.0 |
+| `rms_norm_batched_offset` | 128 | 0.408 | 2.5 |
+| `gated_delta_rule_decode` | 48 | 0.228 | 1.4 |
+| in_proj GEMV (`nvjet_tst_64x8` splitK) | 48 | 0.224 | 1.3 |
+| `add_native` | 128 | 0.176 | 1.1 |
+| `conv1d_prefill` | 48 | 0.124 | 0.7 |
+| `split2` | 96 | 0.112 | 0.7 |
+| `decode_prep_paged_hd256` | 16 | 0.111 | 0.7 |
+| `silu_mul_fused` | 64 | 0.104 | 0.6 |
+| `rms_norm_gated` | 48 | 0.079 | 0.5 |
+| `conv1d_state_update` | 48 | 0.078 | 0.5 |
+| `splitKreduce` | 48 | 0.071 | 0.4 |
+| FA3 combine | 16 | 0.060 | 0.4 |
+| `prepare_varlen_num_blocks` | 16 | 0.054 | 0.3 |
+| 5 more, each ≤ 0.03 | 51 | 0.074 | 0.4 |
+| **Σ kernel** | **~1150** | **16.651** | |
+
+Σ kernel 16.651 against `submit` 17.272 leaves 0.62 ms (3.6%) of gap, which
+includes the nsys tracing overhead present in this run and absent from the
+17.272.
+
+## Scored against the bytes
+
+H20 achievable read is 3.5 TB/s (measured, `docs/baselines.md`).
+
+| bucket | bytes/step | floor | measured | achieved | of achievable |
+|---|---:|---:|---:|---:|---:|
+| Marlin (int8 weights) | 30 GB | 8.57 ms | 11.71 | 2.56 TB/s | 73% |
+| FA3 (KV at ~34K) | 2.2 GB | 0.63 | 2.37 | 0.93 TB/s | 27% |
+| lm_head (bf16) | 1.5 GB | 0.43 | 0.67 | 2.24 TB/s | 64% |
+| ~750 small kernels | ≈ 0 | ≈ 0 | 1.53 | — | latency |
+
+Three separate problems, and they do not rank the way the time column does:
+
+- **Marlin owns 70% of the step and is already at 73% of achievable.** Only
+  3.1 ms exists there and it costs a kernel rewrite.
+- **FA3 is the worst efficiency at 27%**, but after the split-ceiling fix it is
+  down to 2.37 ms, so the whole prize is 1.7 ms.
+- **~750 small kernels cost 1.53 ms while reading almost nothing.**
+  `rms_norm_batched_offset` takes 3.19 µs for 10 KB in and 10 KB out — 6 ns of
+  traffic at the achievable rate. This bucket is entirely per-kernel latency.
+
+That last bucket contradicts
+[2026-08-04-launch-count-is-not-the-decode-lever](../errors/2026-08-04-launch-count-is-not-the-decode-lever.md),
+where fusing 192 residual-add + norm pairs returned 0.00 ms: this ledger prices
+`add_native` alone at 0.176 ms. That experiment ran on a pre-split-fix build
+and must be repeated against this budget before either result is trusted.
+
+## Learnings
+
+The step is 100% kernel time (host is 0.061 ms,
+[entry](2026-08-04-decode-step-has-no-host-tail.md)), and now it is 100%
+attributed.
+
+**Rule: a whole-step CUDA graph silently empties the default profile.** One
+kernel at 100% is not a fast step, it is a graph the profiler declined to open.
+Any trace of a graphed path needs `--cuda-graph-trace=node`, and the check is
+that the kernel count matches the step's known launch count.
+
+**Rule: rank optimization targets by headroom, not by share.** The largest row
+here has the least available time per unit of work required, and the cheapest
+win sits in a bucket worth 9% of the step.
+
+Related: [[feedback_measured_floor_is_not_physical_floor]],
+[[feedback_path_probe_before_perf_claim]].
