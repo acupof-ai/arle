@@ -11,7 +11,7 @@
 //! The `RealCudaExecutor` Dsv4 branch (`executor.rs`) constructs + runs this
 //! model; the lead wires the multi-process TP=8/EP=8 launcher + bench entry.
 
-use anyhow::{Result, anyhow, bail, ensure};
+use anyhow::{Result, anyhow, ensure};
 use cuda_kernels::ffi;
 use cuda_kernels::prelude::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStates};
 use cuda_kernels::tensor::{CudaPipelineStreamKind, Dsv4Fp8DeepGemmWeightCache};
@@ -1616,7 +1616,7 @@ impl Dsv4Model {
             return Ok(());
         }
         #[cfg(not(all(feature = "cuda", feature = "nccl")))]
-        bail!("ARLE_DSV4_MOE_TRANSPORT=mega_moe requires infer-cuda features cuda,nccl");
+        anyhow::bail!("ARLE_DSV4_MOE_TRANSPORT=mega_moe requires infer-cuda features cuda,nccl");
         #[cfg(all(feature = "cuda", feature = "nccl"))]
         {
             ensure!(
@@ -3810,7 +3810,9 @@ impl Dsv4Model {
                         }
                     }
                     #[cfg(not(feature = "deepep"))]
-                    bail!("ARLE_DSV4_MOE_TRANSPORT=deepep requires infer-cuda feature deepep");
+                    anyhow::bail!(
+                        "ARLE_DSV4_MOE_TRANSPORT=deepep requires infer-cuda feature deepep"
+                    );
                 } else {
                     let tail = kv_adapter.moe_tail_scratch_mut();
                     let needs_moe_allreduce = crate::moe::dsv4_moe_forward(
@@ -5308,7 +5310,9 @@ impl Dsv4Model {
                     }
                     #[cfg(not(feature = "deepep"))]
                     {
-                        bail!("ARLE_DSV4_MOE_TRANSPORT=deepep requires infer-cuda feature deepep");
+                        anyhow::bail!(
+                            "ARLE_DSV4_MOE_TRANSPORT=deepep requires infer-cuda feature deepep"
+                        );
                     }
                 } else {
                     crate::moe::dsv4_moe_forward(
