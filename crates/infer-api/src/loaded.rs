@@ -2139,8 +2139,8 @@ mod backend {
                 config.dspark_draft_model.as_deref(),
                 config.dspark_sps_bias_ms,
                 config.dspark_sps_row_ms,
-                config.config.markov_head_rank,
-                config.config.dspark_block_size,
+                config.markov_head_rank,
+                config.dspark_block_size,
                 config.mtp_draft_tokens,
             )?,
             // DSv4 multi-rank serve. The DSv4 executor resolves its TP
