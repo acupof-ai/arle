@@ -112,9 +112,6 @@ pub use executor::CudaKvCacheDtype;
 /// target_logits, accepted_count) tuples; a separate trainer drains them and
 /// runs acceptance-weighted policy gradient against the acceptance reward.
 #[cfg(feature = "cuda")]
-pub use executor::dspark_train::{
-    DsparkExperience, DsparkExperienceBuffer, buffer as dspark_experience_buffer,
-};
 #[cfg(feature = "cuda")]
 pub use executor::set_decode_graph_default;
 /// Tier budget resolution: machine-derived disk budget when `--kv-disk` has no
@@ -343,7 +340,7 @@ impl CudaExecutor {
         dspark_draft_model: Option<&std::path::Path>,
         dspark_sps_bias_ms: f32,
         dspark_sps_row_ms: f32,
-        dspark_train_head_rank: Option<usize>,
+        markov_head_rank: Option<usize>,
         dspark_block_size: Option<usize>,
         mtp_draft_tokens: Option<usize>,
     ) -> anyhow::Result<Self> {
@@ -359,7 +356,7 @@ impl CudaExecutor {
                     dspark_draft_model,
                     dspark_sps_bias_ms,
                     dspark_sps_row_ms,
-                    dspark_train_head_rank,
+                    markov_head_rank,
                     dspark_block_size,
                     mtp_draft_tokens,
                 )?,
@@ -541,21 +538,6 @@ impl CudaExecutor {
                  the no-GPU placeholder has no resident weights"
             ),
             CudaExecutorInner::Real(real) => real.update_dspark_markov_weights(w1, w2),
-        }
-    }
-
-    /// Read the current DSpark Markov head weights back to host as f32.
-    ///
-    /// Used by the train sidecar to seed the trainer from the loaded checkpoint.
-    /// Returns `(w1 [vocab*rank], w2 [rank*vocab], rank)`.
-    #[cfg(feature = "cuda")]
-    pub fn get_dspark_markov_weights(&self) -> anyhow::Result<(Vec<f32>, Vec<f32>, usize)> {
-        match &self.inner {
-            CudaExecutorInner::Placeholder => anyhow::bail!(
-                "DSpark Markov weight read requires the real CUDA executor; \
-                 the no-GPU placeholder has no resident weights"
-            ),
-            CudaExecutorInner::Real(real) => real.get_dspark_markov_weights(),
         }
     }
 

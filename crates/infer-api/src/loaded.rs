@@ -129,13 +129,13 @@ pub struct EngineLoadConfig {
     pub dspark_sps_bias_ms: f32,
     #[serde(default = "default_dspark_sps_row_ms")]
     pub dspark_sps_row_ms: f32,
-    /// Materialize a trainable Markov head of this rank when the draft
-    /// checkpoint ships without one (DFlash backbones do). `None` = leave the
-    /// drafter head-less, which is what a plain serve wants: an untrained head
-    /// adds zero to every logit at the cost of a vocab-wide gemm. Set only by
-    /// `--dspark-train`, whose sidecar has nothing to write into otherwise.
+    /// Materialize an empty Markov head slot of this rank when the draft
+    /// checkpoint ships without one (DFlash backbones do). Set only by
+    /// `--dspark-markov-init`, which has nothing to install over otherwise; a
+    /// plain serve leaves the drafter head-less rather than pay a vocab-wide
+    /// gemm to add zero.
     #[serde(default)]
-    pub dspark_train_head_rank: Option<usize>,
+    pub markov_head_rank: Option<usize>,
     /// Cap the draft block length. A block longer than the accepted prefix costs a
     /// draft forward and a verify row per position and can never commit them.
     #[serde(default)]
@@ -218,7 +218,7 @@ impl Default for EngineLoadConfig {
             dspark_draft_model: None,
             dspark_sps_bias_ms: default_dspark_sps_bias_ms(),
             dspark_sps_row_ms: default_dspark_sps_row_ms(),
-            dspark_train_head_rank: None,
+            markov_head_rank: None,
             dspark_block_size: None,
             cuda: infer_seam::CudaRuntimeFlags::default(),
             metal: infer_seam::MetalRuntimeFlags::default(),
@@ -743,32 +743,6 @@ mod backend {
             }
         }
 
-        /// Access the DSpark train sidecar experience buffer.
-        ///
-        /// Returns `Some` on CUDA backends where the DSpark drafter is active;
-        /// `None` on other backends. The buffer is populated by the inference
-        /// hot path with (draft_tokens, draft_logits, target_logits,
-        /// accepted_count) tuples for test-time training of the draft model.
-        #[cfg(feature = "cuda")]
-        pub fn dspark_experience_buffer(
-            &self,
-        ) -> Option<&'static infer_cuda::DsparkExperienceBuffer> {
-            match self {
-                Self::Cuda(_) => Some(infer_cuda::dspark_experience_buffer()),
-                #[cfg(feature = "metal")]
-                Self::Metal(_)
-                | Self::MetalDiffusionGemma(_)
-                | Self::MetalGemma4(_)
-                | Self::MetalDeepseekOcr(_) => None,
-                #[cfg(feature = "hip")]
-                Self::Hip(_) => None,
-                #[cfg(feature = "vulkan")]
-                Self::Vulkan(_) => None,
-                #[cfg(all(feature = "cpu", not(feature = "metal")))]
-                Self::Cpu(_) => None,
-            }
-        }
-
         /// Hot-swap the DSpark Markov head weights from a host f32 snapshot.
         /// Called by the train sidecar after each acceptance-weighted step.
         #[cfg(feature = "cuda")]
@@ -788,30 +762,6 @@ mod backend {
                 Self::Vulkan(_) => anyhow::bail!("update_dspark_markov_weights is CUDA-only"),
                 #[cfg(all(feature = "cpu", not(feature = "metal")))]
                 Self::Cpu(_) => anyhow::bail!("update_dspark_markov_weights is CUDA-only"),
-            }
-        }
-
-        /// Read the current DSpark Markov head weights back to host as f32.
-        ///
-        /// Used by the train sidecar to seed the trainer from the loaded checkpoint.
-        /// Returns `(w1 [vocab*rank], w2 [rank*vocab], rank)`.
-        #[cfg(feature = "cuda")]
-        pub fn get_dspark_markov_weights(&self) -> Result<(Vec<f32>, Vec<f32>, usize)> {
-            match self {
-                Self::Cuda(engine) => engine.get_dspark_markov_weights(),
-                #[cfg(feature = "metal")]
-                Self::Metal(_)
-                | Self::MetalDiffusionGemma(_)
-                | Self::MetalGemma4(_)
-                | Self::MetalDeepseekOcr(_) => {
-                    anyhow::bail!("get_dspark_markov_weights is CUDA-only")
-                }
-                #[cfg(feature = "hip")]
-                Self::Hip(_) => anyhow::bail!("get_dspark_markov_weights is CUDA-only"),
-                #[cfg(feature = "vulkan")]
-                Self::Vulkan(_) => anyhow::bail!("get_dspark_markov_weights is CUDA-only"),
-                #[cfg(all(feature = "cpu", not(feature = "metal")))]
-                Self::Cpu(_) => anyhow::bail!("get_dspark_markov_weights is CUDA-only"),
             }
         }
 
@@ -2189,8 +2139,8 @@ mod backend {
                 config.dspark_draft_model.as_deref(),
                 config.dspark_sps_bias_ms,
                 config.dspark_sps_row_ms,
-                config.dspark_train_head_rank,
-                config.dspark_block_size,
+                config.config.markov_head_rank,
+                config.config.dspark_block_size,
                 config.mtp_draft_tokens,
             )?,
             // DSv4 multi-rank serve. The DSv4 executor resolves its TP

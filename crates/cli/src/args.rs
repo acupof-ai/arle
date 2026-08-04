@@ -752,25 +752,6 @@ pub(crate) struct ServeArgs {
     pub(crate) dspark_sps_row_ms: f32,
 
     /// Spawn the DSpark train sidecar alongside `--spec-type dspark` serving.
-    /// Drains the experience buffer the hot path populates and hot-swaps updated
-    /// Markov-head weights back into the running engine. No-op without
-    /// `--spec-type dspark` or on non-CUDA backends.
-    #[arg(long, default_value_t = false)]
-    pub(crate) dspark_train: bool,
-
-    /// Write the trained DSpark Markov head here (bf16 safetensors, the draft
-    /// loader's own tensor names). Without it the head is lost at shutdown.
-    #[arg(long, value_name = "FILE")]
-    pub(crate) dspark_train_out: Option<PathBuf>,
-
-    /// DSpark train sidecar learning rate. The default is sized for a head grown
-    /// from `w2 = 0`: AdamW moves the bias ~lr per step and the serve adds it in
-    /// bf16, so anything below half an ulp of the base logit (~0.03) is discarded
-    /// outright. Aggressive values risk only acceptance — the trunk verifies
-    /// every token, so correctness cannot regress.
-    #[arg(long, value_name = "LR")]
-    pub(crate) dspark_train_lr: Option<f32>,
-
     /// Cap the DSpark draft block length (checkpoint value if unset). The chain
     /// stops at the first rejection, so every position past the accepted prefix
     /// costs a draft forward and a verify row that can never commit: TC-27B +
@@ -780,31 +761,10 @@ pub(crate) struct ServeArgs {
     #[arg(long, value_name = "N")]
     pub(crate) dspark_block_size: Option<usize>,
 
-    /// Experiences per DSpark train step. Step cost is linear in this, so it
-    /// trades gradient noise for optimizer steps at a fixed data rate, not for
-    /// throughput.
-    #[arg(long, value_name = "N")]
-    pub(crate) dspark_train_batch: Option<usize>,
-
-    /// DSpark objective mix: `α` weights the total-variation match against the
-    /// trunk, `1 − α` the cross-entropy on the trunk's token. Default 0.9 / 0.1,
-    /// the paper's (arXiv:2607.05147 eq. 12). α=1 is pure distribution matching.
-    /// The step logs `spectrum_drift` next to `pm_alpha`, so an α-sweep measures
-    /// whether drift scales with the dense fraction.
-    #[arg(long, value_name = "ALPHA")]
-    pub(crate) dspark_prob_match_alpha: Option<f32>,
-    /// Constrain DSpark training to the base checkpoint's singular spectrum,
-    /// optimizing only the singular frames (ISO, arXiv:2607.19331). The step logs
-    /// `spectrum_drift` either way (a non-mutating spectrum probe runs on both
-    /// arms), so a run without this flag measures whether the fixed-spectrum
-    /// premise actually holds for this head.
-    #[arg(long, default_value_t = false)]
-    pub(crate) dspark_train_iso: bool,
-
-    /// Replace the draft checkpoint's Markov head with one saved by
-    /// `--dspark-train-out`. This is how a trained head is put back into a
-    /// serve — copying the file into the draft dir does nothing, since the
-    /// loader reads only the shards `model.safetensors.index.json` lists.
+    /// Install a Markov head from a safetensors file over the draft
+    /// checkpoint's. This is the only way to put a trained head into a serve —
+    /// copying the file into the draft dir does nothing, since the loader reads
+    /// only the shards `model.safetensors.index.json` lists.
     #[arg(long, value_name = "FILE")]
     pub(crate) dspark_markov_init: Option<PathBuf>,
 

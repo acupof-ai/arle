@@ -53,10 +53,6 @@ pub mod tensor_parallel;
 #[path = "runtime_flags.rs"]
 mod runtime_flags;
 pub use runtime_flags::{TrainRuntimeFlags, apply_runtime_flags};
-#[path = "dspark_train.rs"]
-pub mod dspark_train;
-#[path = "iso_spectrum.rs"]
-pub mod iso_spectrum;
 #[path = "rubric.rs"]
 pub mod rubric;
 #[path = "rubric_opd.rs"]

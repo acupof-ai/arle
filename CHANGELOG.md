@@ -1431,3 +1431,20 @@ subspace, and `∂bias/∂w2 = w1[c]` made that the whole head's ceiling.
 `rms|w1| rms|w2| est|bias|` against the bf16 floor on every publish.
 See [errors/2026-08-03-dspark-online-sidecar-degrades-regardless-of-loss.md](docs/experience/errors/2026-08-03-dspark-online-sidecar-degrades-regardless-of-loss.md).
 Serve-side measurement `pending-remote`.
+
+### 2026-08-04 — removed: the DSpark online train sidecar
+
+`--dspark-train`, `--dspark-train-out`, `--dspark-train-lr`,
+`--dspark-train-batch`, `--dspark-train-iso` and `--dspark-prob-match-alpha` are
+gone, with the trainer, the hot-path experience capture and the weight-publish
+channel. `--dspark-markov-init` stays: installing a trained head is now the only
+way a head reaches a serve.
+
+The sidecar saw 120 training rows per optimizer step against DeepSpec's
+1,835,008. That gap is architectural, not a data-rate knob — DSpark's 512x
+amplification comes from a training-time attention mask over sampled anchors,
+which a path that only observes what the serve actually drafted cannot have.
+See [errors/2026-08-04-dspark-bias-floor-model-was-wrong-twice.md](docs/experience/errors/2026-08-04-dspark-bias-floor-model-was-wrong-twice.md).
+
+New `spec-train` crate holds the artifact layer (Markov head I/O, ISO frames).
+Kept out of `train`, which stays OPD-only: the two share only autograd.

@@ -402,6 +402,7 @@ dependencies = [
  "rustyline",
  "serde",
  "serde_json",
+ "spec-train",
  "sysinfo",
  "tempfile",
  "tokio",
@@ -3094,6 +3095,16 @@ dependencies = [
  "byteorder",
  "libc",
  "winapi",
+]
+
+[[package]]
+name = "spec-train"
+version = "0.4.0"
+dependencies = [
+ "anyhow",
+ "autograd",
+ "half",
+ "safetensors",
 ]
 
 [[package]]

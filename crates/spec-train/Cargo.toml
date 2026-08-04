@@ -1,0 +1,19 @@
+[package]
+name = "spec-train"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+autobins = false
+
+[features]
+default = []
+no-cuda = ["autograd/no-cuda"]
+metal = ["autograd/metal"]
+cuda = ["autograd/cuda"]
+
+[dependencies]
+autograd = { path = "../autograd", default-features = false, features = ["safetensors"] }
+anyhow = "1.0"
+half = "2"
+safetensors = { workspace = true }

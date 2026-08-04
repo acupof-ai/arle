@@ -97,9 +97,8 @@ pub use infer_server::{
 // `infer::server_engine::StudentLora*` path the `train` crate couples to).
 #[cfg(feature = "cuda")]
 pub use infer_cuda::{
-    DsparkExperience, DsparkExperienceBuffer, SharedFp8BaseProjection, StudentLoraLayer,
-    StudentLoraMatrices, StudentLoraProjection, StudentLoraProjectionUpdate, StudentLoraUpdate,
-    set_qwen35_moe_experts_bf16_resident,
+    SharedFp8BaseProjection, StudentLoraLayer, StudentLoraMatrices, StudentLoraProjection,
+    StudentLoraProjectionUpdate, StudentLoraUpdate, set_qwen35_moe_experts_bf16_resident,
 };
 /// Rank-0 NCCL `unique_id` mint for the multiproc-serve coordinator.
 #[cfg(feature = "nccl")]

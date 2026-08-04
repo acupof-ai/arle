@@ -1605,27 +1605,6 @@ impl Dsv4CudaExecutor {
         Ok(())
     }
 
-    /// Read the current DSpark Markov head weights back to host as f32.
-    ///
-    /// Used by the train sidecar to seed the trainer from the loaded checkpoint
-    /// instead of random init. Returns `(w1 [vocab*rank], w2 [vocab*rank], rank)`.
-    pub(crate) fn get_dspark_markov_weights(&self) -> Result<(Vec<f32>, Vec<f32>, usize)> {
-        let dspark = self
-            .dspark
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("DSpark head not loaded"))?;
-        let stage = dspark
-            .draft
-            .stages
-            .last()
-            .ok_or_else(|| anyhow::anyhow!("DSpark draft has no stages"))?;
-        let (Some(mw1), Some(mw2)) = (stage.markov_w1.as_ref(), stage.markov_w2.as_ref()) else {
-            anyhow::bail!("DSpark exit stage has no Markov head weights");
-        };
-        let w1 = mw1.to_host(&self.model.ctx)?;
-        let w2 = mw2.to_host(&self.model.ctx)?;
-        Ok((w1, w2, mw1.cols))
-    }
 
     /// Seed a freshly-prefilled prompt chunk into the DSpark draft context: pull
     /// the transient multi-row taps the prefill forward stashed on the slot and
@@ -1839,16 +1818,6 @@ impl Dsv4CudaExecutor {
         // skipped when draft_logits are unavailable (TP lockstep cleared them).
         if let Some(draft_logits) = proposal.draft_logits.as_ref() {
             // DSv4 drafts from every row (row i drafts chain[i+1]) — next-token mode.
-            super::dspark_train::capture_dspark_experience_hidden(
-                &self.model.ctx,
-                &proposal.chain,
-                draft_logits,
-                &verify.logits,
-                0,
-                proposal.chain.len(),
-                accepted,
-                true,
-            );
         }
 
         // Return to the real frontier, restore the aliased ring boundary, then
@@ -2136,16 +2105,6 @@ impl Dsv4CudaExecutor {
             // skipped when draft_logits are unavailable (e.g. sampling path overwrite).
             if let Some(draft_logits) = proposal.draft_logits.as_ref() {
                 // DSv4 drafts from every row (row i drafts chain[i+1]) — next-token mode.
-                super::dspark_train::capture_dspark_experience_hidden(
-                    &self.model.ctx,
-                    &proposal.chain,
-                    draft_logits,
-                    &verify_logits,
-                    logits_offset,
-                    proposal.chain.len(),
-                    accepted,
-                    true,
-                );
             }
             logits_offset += proposal.chain.len();
 

@@ -188,26 +188,15 @@ pub struct ServeSpecOptions {
     pub dspark_sps_row_ms: f32,
     pub mtp_draft_tokens: Option<usize>,
     pub mtp_draft_topk: Option<usize>,
-    /// Spawn the DSpark train sidecar alongside `--spec-type dspark` serving.
-    pub dspark_train: bool,
-    /// Where the sidecar checkpoints the trained Markov head.
-    pub dspark_train_out: Option<std::path::PathBuf>,
-    /// Constrain DSpark training to the base checkpoint's singular spectrum.
-    pub dspark_train_iso: bool,
-    /// Override the train sidecar learning rate.
-    pub dspark_train_lr: Option<f32>,
-    /// Override the train sidecar batch size (experiences per optimizer step).
-    pub dspark_train_batch: Option<usize>,
-    /// Override the DSpark objective mix (TV = α, cross-entropy = 1−α).
-    pub dspark_prob_match_alpha: Option<f32>,
-    /// Rank of the trainable Markov head to materialize when the draft ships
-    /// without one. Set by the CLI from `--dspark-train`.
-    pub dspark_train_head_rank: Option<usize>,
     /// Cap the DSpark draft block length.
     pub dspark_block_size: Option<usize>,
     /// A saved Markov head to install over the draft checkpoint's at startup.
     pub dspark_markov_init: Option<std::path::PathBuf>,
 }
+
+/// Rank of the head slot materialized for `--dspark-markov-init`. Matches the
+/// `markov_rank` DeepSpec ships for DSpark (`config/dspark/*.py`).
+pub const DSPARK_MARKOV_RANK: usize = 256;
 
 pub const DEFAULT_MTP_DRAFT_TOKENS: usize = 2;
 pub const DEFAULT_MTP_DRAFT_TOPK: usize = 1;
@@ -285,8 +274,14 @@ pub fn serve_http(
             engine_config.dspark_draft_model = Some(std::path::PathBuf::from(dir));
             engine_config.dspark_sps_bias_ms = opts.spec.dspark_sps_bias_ms;
             engine_config.dspark_sps_row_ms = opts.spec.dspark_sps_row_ms;
-            engine_config.dspark_train_head_rank = opts.spec.dspark_train_head_rank;
             engine_config.dspark_block_size = opts.spec.dspark_block_size;
+            // `--dspark-markov-init` needs a head slot to install over; a DFlash
+            // backbone ships none. Shape only — both halves are overwritten.
+            engine_config.markov_head_rank = opts
+                .spec
+                .dspark_markov_init
+                .is_some()
+                .then_some(DSPARK_MARKOV_RANK);
         }
     }
 

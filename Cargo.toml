@@ -25,6 +25,7 @@ members = [
     "crates/infer-server",
     "crates/infer-topo",
     "crates/infer-util",
+    "crates/spec-train",
     "crates/infer-vulkan",
     "crates/kv-native-sys",
     "crates/mlx-sys",
