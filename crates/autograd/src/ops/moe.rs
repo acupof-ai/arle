@@ -118,10 +118,6 @@ impl MoeGroupedLinearProfile {
     }
 }
 
-fn legacy_lora_linear_backward_enabled() -> bool {
-    crate::runtime_flags::legacy_lora_linear_bwd()
-}
-
 fn moe_lora_backward_expert_tile() -> usize {
     crate::runtime_flags::moe_lora_bwd_expert_tile()
 }
@@ -962,7 +958,7 @@ pub(crate) fn moe_grouped_linear_backward(
             "moe grouped linear LoRA path missing packed input",
         ))?;
         let expert_tile = moe_lora_backward_expert_tile();
-        if !legacy_lora_linear_backward_enabled() && active_len > expert_tile {
+        if active_len > expert_tile {
             grouped_lora_backward_tiled(
                 store,
                 &profile,

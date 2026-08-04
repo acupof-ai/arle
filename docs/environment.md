@@ -64,7 +64,6 @@ workers see them; train flags apply via `train::apply_runtime_flags`):
 | `ARLE_OPD_ROLLOUT_RETAIN_INTERVAL` / `_ROLLOUT_PROGRESS_INTERVAL` | `arle train <opd> --rollout-retain-interval` / `--rollout-progress-interval` |
 | `ARLE_OPD_MOE_LORA_BWD_EXPERT_TILE` / `_LORA_LINEAR_BWD_TILE_ROWS` | `arle train <opd> --moe-lora-bwd-expert-tile` / `--lora-linear-bwd-tile-rows` |
 | `ARLE_OPD_WRITEBACK_FROZEN_PROMPT_KV` | `arle train <opd> --writeback-frozen-prompt-kv` |
-| `ARLE_OPD_LEGACY_LORA_LINEAR_BWD` / `_LEGACY_SDPA_BWD` | `arle train <opd> --legacy-lora-linear-bwd` / `--legacy-sdpa-bwd` |
 | `ARLE_GDR_CHUNKWISE_PREFILL` / `ARLE_LA_BACKWARD_MONO` / `ARLE_AUTOGRAD_DECODE_ATTN_LEGACY` | `arle train <opd> --gdr-chunkwise-prefill` / `--la-backward-mono` / `--autograd-decode-attn-legacy` |
 
 Deferred (read site inside frozen DSv4 files this pass):
