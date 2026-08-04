@@ -4311,7 +4311,7 @@ impl Qwen35Model {
     /// | 4 | `prefill_attention_hd256_prep_cuda` | position read from staged `start_pos` DEVICE buffer (already a device-pointer arg); writes K/V cache rows + q_prepped in place |
     /// | 5 | `nonpaged_prefill_attention_devpos_cuda` | NEW devpos entry: kv walk bounded by `*start_pos_dev` read on device; grid `(heads, 1)` shape-constant |
     /// | 6 | `attention_gate_batch_hd256_cuda` | stateless gate RMW on ws buffers |
-    /// | 7 | `conv1d_prefill_cuda` (+ its internal `conv1d_state_update_kernel`) | depthwise conv + ring shift are content-based in-place device writes; each replay advances the ring by one token exactly like eager |
+    /// | 7 | `conv1d_prefill_cuda` (one fused `conv1d_decode_kernel` at seq_len 1) | depthwise conv + ring shift are content-based in-place device writes; each replay advances the ring by one token exactly like eager |
     /// | 8 | `gated_delta_rule_decode_cuda` | recurrent-state advance is a content-based in-place device write; no position arg |
     /// | 9 | `rms_norm_gated_cuda` | stateless; fixed ws buffers |
     /// | 10 | `dsv4_route` + `qwen36_renorm_topk_weights` | device router (gate requires `qwen35_decode_moe_graph_capturable`): all-zero bias table is `upload_const` (warm, no H2D node); writes route indices/weights slots unconditionally |

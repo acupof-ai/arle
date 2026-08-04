@@ -76,6 +76,52 @@ __global__ void conv1d_prefill_kernel(
     // chunk's tail instead of the previous chunk's.
 }
 
+// seq_len == 1 gives one thread per (slot, channel), so it reads the whole
+// ring before rewriting it and the race above cannot occur.
+__global__ void conv1d_decode_kernel(
+    const __nv_bfloat16* __restrict__ x_seq,
+    const __nv_bfloat16* const* __restrict__ x_ptrs,
+    const __nv_bfloat16* __restrict__ conv_weight,
+    __nv_bfloat16* __restrict__ conv_state,
+    __nv_bfloat16* const* __restrict__ state_ptrs,
+    __nv_bfloat16* __restrict__ out_seq,
+    int num_channels,
+    int kernel_size
+) {
+    const int s = blockIdx.y;
+    if (x_ptrs) {
+        x_seq = x_ptrs[s];
+        conv_state = state_ptrs[s];
+        out_seq += static_cast<size_t>(s) * num_channels;
+    }
+
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= num_channels) return;
+
+    const int state_width = kernel_size - 1;
+    float ring[4];
+    for (int i = 0; i < state_width; i++) {
+        ring[i] = __bfloat162float(conv_state[c * state_width + i]);
+    }
+    const float x = __bfloat162float(x_seq[c]);
+
+    float sum = 0.0f;
+    for (int k = 0; k < state_width; k++) {
+        sum += ring[k] * __bfloat162float(conv_weight[c * kernel_size + k]);
+    }
+    sum += x * __bfloat162float(conv_weight[c * kernel_size + state_width]);
+
+    const float sum_bf16 = __bfloat162float(__float2bfloat16(sum));
+    out_seq[c] = __float2bfloat16(sum_bf16 / (1.0f + expf(-sum_bf16)));
+
+    for (int i = 0; i + 1 < state_width; i++) {
+        conv_state[c * state_width + i] = __float2bfloat16(ring[i + 1]);
+    }
+    if (state_width > 0) {
+        conv_state[c * state_width + state_width - 1] = __float2bfloat16(x);
+    }
+}
+
 // State-update kernel: rebuild the conv ring from the chunk tail. One thread
 // per channel; reproduces the exact ring semantics of the writer branch that
 // previously lived in conv1d_prefill_kernel (including seq_len < kernel-1,
@@ -131,6 +177,14 @@ cudaError_t conv1d_prefill_cuda(
     int kernel_size,
     cudaStream_t stream
 ) {
+    if (seq_len == 1) {
+        int blocks = (num_channels + CONV1D_BLOCK - 1) / CONV1D_BLOCK;
+        conv1d_decode_kernel<<<blocks, CONV1D_BLOCK, 0, stream>>>(
+            x_seq, nullptr, conv_weight, conv_state, nullptr,
+            out_seq, num_channels, kernel_size
+        );
+        return cudaGetLastError();
+    }
     int total = num_channels * seq_len;
     int blocks = (total + CONV1D_BLOCK - 1) / CONV1D_BLOCK;
     conv1d_prefill_kernel<<<blocks, CONV1D_BLOCK, 0, stream>>>(
@@ -167,6 +221,15 @@ cudaError_t conv1d_prefill_varlen_cuda(
 ) {
     if (batch <= 0 || max_len <= 0) {
         return cudaErrorInvalidValue;
+    }
+    // max_len == 1 forces every row_len to 1: the decode form covers all slots.
+    if (max_len == 1) {
+        dim3 dgrid((num_channels + CONV1D_BLOCK - 1) / CONV1D_BLOCK, batch);
+        conv1d_decode_kernel<<<dgrid, CONV1D_BLOCK, 0, stream>>>(
+            nullptr, x_ptrs, conv_weight, nullptr, state_ptrs,
+            out_seq, num_channels, kernel_size
+        );
+        return cudaGetLastError();
     }
     int total = num_channels * max_len;
     dim3 grid((total + CONV1D_BLOCK - 1) / CONV1D_BLOCK, batch);
