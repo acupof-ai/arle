@@ -888,8 +888,9 @@ pub(crate) struct ServeArgs {
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set, value_name = "BOOL")]
     pub(crate) qwen35_fa3: bool,
 
-    /// FA3 decode split count (clamped to [2, 256]).
-    #[arg(long, default_value_t = 8, value_name = "N")]
+    /// FA3 decode split count; 0 derives it from the device SM count so the
+    /// kv-head × split tiles fill the machine. Explicit values clamp to [2, 256].
+    #[arg(long, default_value_t = 0, value_name = "N")]
     pub(crate) qwen35_fa3_decode_splits: usize,
     /// Routed-row floor for the DeepGEMM grouped expert path (default 1024).
     /// Batched decode is `R = top_k * B`, so 1024 keeps decode off DeepGEMM;
