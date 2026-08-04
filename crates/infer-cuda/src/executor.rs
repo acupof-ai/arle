@@ -946,8 +946,6 @@ impl RealCudaExecutor {
         }
     }
 
-    }
-
     /// Read-only borrow of resident FP8 block-scaled base projection pointers
     /// for train-infer weight sharing (`--share-frozen-base`). Only the
     /// Qwen3.5/3.6 hybrid student carries shareable FP8 base weights.
