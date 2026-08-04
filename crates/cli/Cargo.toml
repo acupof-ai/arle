@@ -43,6 +43,7 @@ infer-plan = { path = "../infer-plan" }
 infer-util = { path = "../infer-util" }
 deepseek-spec = { path = "../deepseek-spec" }
 qwen35-spec = { path = "../qwen35-spec" }
+spec-train = { path = "../spec-train" }
 train = { path = "../train", default-features = false }
 tools = { path = "../tools" }
 log = "0.4"

@@ -808,7 +808,7 @@ impl Qwen35CudaExecutor {
         dspark_draft_model: Option<&Path>,
         dspark_sps_bias_ms: f32,
         dspark_sps_row_ms: f32,
-        dspark_train_head_rank: Option<usize>,
+        markov_head_rank: Option<usize>,
         dspark_block_size: Option<usize>,
         mtp_draft_tokens: Option<usize>,
     ) -> Result<Self> {
@@ -866,7 +866,7 @@ impl Qwen35CudaExecutor {
                         bias_ms: dspark_sps_bias_ms,
                         row_ms: dspark_sps_row_ms,
                     },
-                    dspark_train_head_rank,
+                    markov_head_rank,
                     dspark_block_size,
                 )?;
                 model.set_spec_draft_tokens(head.block_size());
@@ -2152,16 +2152,6 @@ impl Qwen35CudaExecutor {
             // verifying any, so a shared buffer would pair the wrong slot.
             let df = ds.slots[c.slot].as_mut().expect("seeded slot");
             if let Some(draft_logits) = df.logits.as_ref() {
-                super::dspark_train::capture_dspark_experience_hidden(
-                    &model.ctx,
-                    &c.chain,
-                    draft_logits,
-                    &logits,
-                    c.row0,
-                    c.chain.len(),
-                    k,
-                    ds.head.cfg.next_token_heads,
-                );
                 // Where the trunk's token sat in the draft's own ranking at the
                 // position that broke the chain — the width a candidate tree
                 // would need to survive it.
@@ -3660,17 +3650,6 @@ impl Qwen35CudaExecutor {
         dspark.head.update_markov_weights(&self.model.ctx, w1, w2)
     }
 
-    /// Read the current DSpark Markov head weights back to host as f32.
-    ///
-    /// Used by the train sidecar to seed the trainer from the loaded checkpoint.
-    /// Returns `(w1 [vocab*rank], w2 [rank*vocab], rank)`.
-    pub(crate) fn get_dspark_markov_weights(&self) -> Result<(Vec<f32>, Vec<f32>, usize)> {
-        let dspark = self
-            .dspark
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("DSpark head not loaded"))?;
-        dspark.head.get_markov_weights(&self.model.ctx)
-    }
 }
 
 #[cfg(test)]

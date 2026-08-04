@@ -401,16 +401,6 @@ impl ServeInferenceEngine<infer_cuda::CudaExecutor, infer_cuda::CudaKvPool> {
             Ok(())
         })?
     }
-
-    /// Read the current DSpark Markov head weights back to host as f32.
-    ///
-    /// Used by the train sidecar to seed the trainer from the loaded checkpoint
-    /// instead of random init. Runs on the engine thread via the control seam.
-    /// Returns `(w1 [vocab*rank], w2 [rank*vocab], rank)`.
-    pub fn get_dspark_markov_weights(&self) -> Result<(Vec<f32>, Vec<f32>, usize)> {
-        self.serve
-            .run_on_executor(|executor| executor.get_dspark_markov_weights())?
-    }
 }
 
 // `Send` holds via the auto-trait: `ServeInferenceEngine` stores only a
