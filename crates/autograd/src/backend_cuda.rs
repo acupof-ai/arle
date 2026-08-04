@@ -2341,6 +2341,7 @@ impl Backend for CudaBackend {
             #[cfg(all(feature = "nccl", not(feature = "no-cuda")))]
             if let Some(nccl) = self.comm(axis) {
                 let (dst_ptr, _dst_guard) = out.device_ptr_mut(&self.stream);
+                // SAFETY: NCCL collective over a guarded device pointer live for the call.
                 unsafe {
                     nccl.all_reduce(
                         dst_ptr as *mut _,
@@ -2409,6 +2410,7 @@ impl Backend for CudaBackend {
                 {
                     let (src_ptr, _src_guard) = src.device_ptr(&self.stream);
                     let (dst_ptr, _dst_guard) = out.device_ptr_mut(&self.stream);
+                    // SAFETY: NCCL collective over guarded src/dst pointers live for the call.
                     unsafe {
                         nccl.all_gather(
                             src_ptr as *const _,
@@ -2420,7 +2422,7 @@ impl Backend for CudaBackend {
                         .map_err(|_| AutogradError::TapeInvariant("NCCL all_gather_seq failed"))?;
                     }
                 }
-                return Ok(DeviceHandle::Cuda(CudaStorage::new(out)));
+                Ok(DeviceHandle::Cuda(CudaStorage::new(out)))
             }
             #[cfg(not(all(feature = "nccl", not(feature = "no-cuda"))))]
             unreachable!("world>1 without nccl feature")
@@ -2481,6 +2483,7 @@ impl Backend for CudaBackend {
                 {
                     let (src_ptr, _src_guard) = src.device_ptr(&self.stream);
                     let (dst_ptr, _dst_guard) = out.device_ptr_mut(&self.stream);
+                    // SAFETY: NCCL collective over guarded src/dst pointers live for the call.
                     unsafe {
                         nccl.reduce_scatter(
                             src_ptr as *const _,
@@ -2495,7 +2498,7 @@ impl Backend for CudaBackend {
                         })?;
                     }
                 }
-                return Ok(DeviceHandle::Cuda(CudaStorage::new(out)));
+                Ok(DeviceHandle::Cuda(CudaStorage::new(out)))
             }
             #[cfg(not(all(feature = "nccl", not(feature = "no-cuda"))))]
             unreachable!("world>1 without nccl feature")
@@ -2555,6 +2558,7 @@ impl Backend for CudaBackend {
                     let stream = self.stream.cu_stream().cast();
                     nccl.group_start()
                         .map_err(|_| AutogradError::TapeInvariant("ring group_start failed"))?;
+                    // SAFETY: NCCL send/recv inside a group over guarded pointers live for the call.
                     unsafe {
                         nccl.send(src_ptr as *const _, len, DType::F32, next, stream)
                             .map_err(|_| AutogradError::TapeInvariant("ring send failed"))?;
@@ -2564,7 +2568,7 @@ impl Backend for CudaBackend {
                     nccl.group_end()
                         .map_err(|_| AutogradError::TapeInvariant("ring group_end failed"))?;
                 }
-                return Ok(DeviceHandle::Cuda(CudaStorage::new(out)));
+                Ok(DeviceHandle::Cuda(CudaStorage::new(out)))
             }
             #[cfg(not(all(feature = "nccl", not(feature = "no-cuda"))))]
             unreachable!("world>1 without nccl feature")
@@ -2704,7 +2708,7 @@ impl Backend for CudaBackend {
                     nccl.group_end()
                         .map_err(|_| AutogradError::TapeInvariant("ep_exchange group_end"))?;
                 }
-                return Ok(DeviceHandle::Cuda(CudaStorage::new(out)));
+                Ok(DeviceHandle::Cuda(CudaStorage::new(out)))
             }
             #[cfg(not(all(feature = "nccl", not(feature = "no-cuda"))))]
             unreachable!("world>1 without nccl feature")
@@ -2851,7 +2855,7 @@ impl Backend for CudaBackend {
                     .collect();
                 let (out_h, produced) = cuda_concat_axis(self, &parts, scatter_axis)?;
                 debug_assert_eq!(produced, out_shape);
-                return Ok((out_h, out_shape));
+                Ok((out_h, out_shape))
             }
             #[cfg(not(all(feature = "nccl", not(feature = "no-cuda"))))]
             unreachable!("world>1 without nccl feature")
@@ -6605,7 +6609,7 @@ fn cuda_linear_attention_backward_device_row(
             .saturating_mul(p.key_dim),
     );
     let staged_bytes = staged_elems.saturating_mul(std::mem::size_of::<f32>());
-    let use_mono = !args.raw_output.is_some()
+    let use_mono = args.raw_output.is_none()
         && (linear_attention_mono_backward_forced()
             || staged_bytes > backend.mem_get_info().map_or(0, |(free, _)| free) / 2);
 
@@ -6618,9 +6622,9 @@ fn cuda_linear_attention_backward_device_row(
             ))
             .and_then(|h| backend.cuda_bf16_slice(h, "linear_attention_backward raw_output"))?;
         let b_proj = backend.cuda_slice(args.b_proj, "linear_attention_backward b_proj")?;
-        let b_bf16 = backend.local_f32_as_bf16(&b_proj, head_len)?;
-        let a_bf16 = backend.local_f32_as_bf16(&a_proj, head_len)?;
-        let dt_bf16 = backend.local_f32_as_bf16(&dt_bias, p.num_value_heads)?;
+        let b_bf16 = backend.local_f32_as_bf16(b_proj, head_len)?;
+        let a_bf16 = backend.local_f32_as_bf16(a_proj, head_len)?;
+        let dt_bf16 = backend.local_f32_as_bf16(dt_bias, p.num_value_heads)?;
 
         let q_len = p.seq_len * p.num_value_heads * p.key_dim;
         let v_len = p.seq_len * p.num_value_heads * p.value_dim;
