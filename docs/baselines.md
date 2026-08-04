@@ -170,23 +170,30 @@ and need a re-anchor sweep.**
 
 Model `iso-tc-huihui-w8a16` (Huihui-Qwen3.6-27B abliterated, W8A16 gs=128,
 29 GB), GPU 6, `bench-agent-32k-64.jsonl`, c=1, 16 requests × 256 tokens,
-temperature 0, seed 20260416. Decode ITL p50; TTFT not in scope.
-SGLang 0.5.13 row serves the GPTQ v1 twin repacked by
+temperature 0, seed 20260416. TTFT is cold — 16 distinct prompts, no prefix
+hits. SGLang 0.5.13 row serves the GPTQ v1 twin repacked by
 `scripts/w8a16_to_gptq.py` — identical int8 values, identical kernel.
 
-### CHAMPION — `f6820efa9` (2026-08-03)
+### CHAMPION — `e1017b40d` (2026-08-04)
 
-| arm | ITL p50 | ITL p99 |
-|---|---:|---:|
-| ARLE | **18.98** | 19.52 |
-| SGLang, same kernel + same weights | 17.07 | 18.67 |
+Two reps per arm, interleaved; both reps agree to 0.03 ms ITL / 0.03 s TTFT.
 
-Greedy byte-identical to the pre-#196 binary; decode graph verified by
-counted capture/replay events (17 / 4100+ per run). Prior champion 26.88 ms
-(`3ca42b44a`).
+| arm | TTFT p50 | ITL p50 | ITL p99 | e2e p50 | out tok/s |
+|---|---:|---:|---:|---:|---:|
+| ARLE | 31.08 s | **16.66** | 20.17 | 35.49 s | 7.63 |
+| SGLang, same kernel + same weights | **21.03 s** | 17.14 | 19.39 | **25.44 s** | 10.57 |
 
-[method](experience/wins/2026-08-02-w8a16-sglang-matched-ab.md) ·
-[module ledger](experience/wins/2026-08-03-t4-paged-decode-graph.md)
+Prior champions 18.98 ms (`f6820efa9`), 26.88 (`3ca42b44a`).
+
+Decode leads by 2.8%; ARLE's Σ kernel is 0.07 ms higher and its host tail
+0.061 ms against SGLang's ~0.6, which is where the ITL lead comes from. p99 is
+4% behind. **TTFT is 1.48× behind and unchanged since 2026-08-02 (30.5 s)** —
+every accepted optimization since then landed on decode.
+
+[decode budget, both stacks](experience/wins/2026-08-04-w8a16-decode-step-kernel-budget.md) ·
+[FA3 splits](experience/wins/2026-08-04-fa3-decode-splits-fill-the-sms.md) ·
+[conv1d fusion](experience/wins/2026-08-04-conv1d-decode-fusion.md) ·
+[repack method](experience/wins/2026-08-02-w8a16-sglang-matched-ab.md)
 
 ---
 
