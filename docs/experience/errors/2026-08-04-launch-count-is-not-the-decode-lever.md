@@ -34,8 +34,10 @@ in the pod tree.
 
 **The dispatch-gap model.** 4.0 µs/launch was a derived average
 (idle ÷ launches), and I treated it as a marginal cost. It is not: removing
-18% of the launches removed none of the idle. Whatever the GPU is doing
-between kernels during a graph replay, it does not scale with node count.
+18% of the launches removed none of the idle. Node timestamps later priced the
+real gap at **0.084 µs per node** — 88.6 µs across a 1060-node step that is
+99.7% busy ([budget](../wins/2026-08-04-w8a16-decode-step-kernel-budget.md)).
+There was never 4 µs of anything to reclaim.
 
 **The kernel itself was a wash by construction.** The fused kernel's second
 pass re-reads the sum from global memory (`uint2 xv = sum_ro[i]`), so its
