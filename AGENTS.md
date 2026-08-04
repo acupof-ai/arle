@@ -1,6 +1,6 @@
 # ARLE — Agent Contract
 
-Assisting **ckl**. Project gotchas and hard gates only — generic Rust / CUDA /
+Assisting **ckl**. Project caveats and hard gates only — generic Rust / CUDA /
 Metal / git knowledge is intentionally absent, and so is anything you can read
 off the file tree. Match the surrounding code's idiom, naming, and comment
 density rather than a style rulebook.
@@ -31,16 +31,16 @@ Two backends plug into one seam (`infer_seam::{BackendExecutor, KvPool}`, two
 host-only traits): CUDA continuous batching (`cudarc` + vendored FlashMLA /
 DeepGEMM / DeepEP + TileLang AOT + native CUDA C) and Metal (`crates/mlx-sys`
 C++ bridge, packed varlen decode). One `infer_core::Engine<E, K>` drives both —
-**a new backend means implementing the two seam traits, not touching
-scheduler / cache / server.**
+**a new backend means implementing the two seam traits; scheduler / cache /
+server stay untouched.**
 
 Non-obvious ownership:
 - **`infer-*` owns serving/runtime truth.** The monolithic `infer/` crate was
   deleted 2026-06-04 (`e81b98fb`, ~167k LOC) — any doc or command referencing
   `infer/` or `-p infer` is stale.
-- `infer-api` (`LoadedInferenceEngine`) is the single programmatic front door;
-  `arle` is the CLI front door.
-- **`train` is OPD-only**, not a second product line. Scratch pretrain / SFT /
+- `infer-api` (`LoadedInferenceEngine`) is the single programmatic entry point;
+  `arle` is the CLI entry point.
+- **`train` is OPD-only** (no second product line). Scratch pretrain / SFT /
   GRPO / multi-turn RL were deleted in the 2026-05-18 pivot (pretrain unwinnable
   at a 322× gap; the rest duplicate vLLM+verl / TRL / axolotl). OPD is the one
   axis where ARLE's runtime authority differentiates.
@@ -49,8 +49,8 @@ Non-obvious ownership:
 
 **Metal canonical model — globally unified:
 `mlx-community/Qwen3.6-35B-A3B-4bit`** (MoE, ~19 GB, HF-cached) — the default for
-every Metal serve, `scripts/bench_*.sh`, smoke, and Metal wins/errors; catches
-MoE regressions a dense model can't. Unit-test opt-out:
+every Metal serve, `scripts/bench_*.sh`, smoke, and Metal wins/errors; detects
+MoE regressions a dense model cannot. Unit-test opt-out:
 `INFER_TEST_MODEL_PATH=models/Qwen3.5-0.8B-MLX-4bit` (document why). CUDA benches
 keep their own defaults.
 - **Auto-wired-limit** (always-on): the Metal executor pins weights via
@@ -82,20 +82,20 @@ the bench spec.
 **GPU kernel work** ships a measured before/after — `ncu` (CUDA) or Xcode Metal
 capture / MLX instruments (Metal).
 
-**Fast path, not the fallback.** If it only works on the eager/un-captured path,
+**Fast path only.** If it only works on the eager/un-captured path,
 it isn't done — no per-step readback/sync in the hot loop; capture at sync
 points, rebuild transient state on restore.
 
-**Correctness parity = the correct-inference gate**, not byte-identity (MoE
-non-determinism): `scripts/needle_gate.py` + `scripts/lever_gate.sh`, needle
+**Correctness parity = the correct-inference gate** (byte-identity is not
+required, due to MoE non-determinism): `scripts/needle_gate.py` + `scripts/lever_gate.sh`, needle
 ladder ×3 same-config vs the baseline envelope. Default flips additionally need a
 wall-clock perf license.
 
 **No half-states.** Finish a refactor unit or revert it; never leave parallel
 old+new paths in the tree.
 
-**Talk like a human.** Say the finding in plain words first, numbers second.
-No jargon wall, no hedging, no restating the question. If a sentence needs a
+**Use plain language.** Say the finding in plain words first, numbers second.
+No dense jargon, no hedging, no restating the question. If a sentence needs a
 glossary, rewrite it.
 
 **Approach-first for >3 files or architectural decisions** — outline, then
@@ -137,7 +137,7 @@ tranches, each self-contained, simplify pass first. Never `git stash` others'
 work; commit only your own files by explicit path. After `git mv` + edits,
 re-check `git status` — the fmt hook de-stages renames.
 
-**CHANGELOG is the progress spine.** Three event classes land a line the same
+**CHANGELOG is the central progress record.** Three event classes land a line the same
 day, linking the wins/errors entry: **phase exit · default flip ·
 accept-or-reject verdict**. Phase exits also cut a release tag. Weekly (~30 min):
 CHANGELOG catch-up; promote patterns recurring ≥3× into `docs/agent-method.md`;
@@ -157,6 +157,26 @@ specific bug. If the code already reads clearly, leave it bare — no comment.
 `errors/YYYY-MM-DD-slug.md` = Context / Root Cause / Fix / Rule;
 `wins/…` = Context / What Worked / Rule. Bench snapshots use
 [`TEMPLATE-bench.md`](docs/experience/wins/TEMPLATE-bench.md), never overwritten.
+
+---
+
+## Writing (reports & experiment notes)
+
+1. **Standard terms.** Use the established term for a concept; do not coin a
+   new one.
+2. **No metaphors.** Name the referent directly; any phrase that needs the
+   reader to infer what it stands for gets rewritten.
+3. **Neutral headers.** Table headers and category names are neutral nouns
+   (Problem, Phenomenon, Impact, Result). Keep section status labels
+   consistent (e.g. Completed / Confirmed / Below baseline / Pending).
+4. **No "X, not Y" sentences.** State the fact directly without contrastive
+   framing.
+5. **Table cells may be descriptive.** Not every entry needs a number or
+   conclusion — an entry may describe only what happened.
+6. **Unknown cause.** Write "cause unknown"; do not append unverified
+   explanations. Once a mechanism is confirmed, that content may stay.
+7. **No colloquialisms.** Formal, precise wording only.
+8. **No personification.** Systems, processes, and data do not act or feel.
 
 ---
 
