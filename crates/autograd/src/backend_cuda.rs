@@ -4978,13 +4978,24 @@ fn ring_fa3_route(
     q_pos: &[usize],
     k_pos: &[usize],
 ) -> bool {
-    // SAFETY: pure host query exported by both the real shim and the stub.
-    let real = unsafe { ffi::arle_fa3_real_kernel_marker_cuda() } == 1;
-    dims.head_dim == 256
+    let shape_ok = dims.head_dim == 256
         && q_pos.len() == dims.q_rows
         && k_pos.len() == dims.blk_len
-        && real
-        && ring_fa3_is_sm90(backend)
+        && ring_fa3_is_sm90(backend);
+    // SAFETY: pure host query exported by both the real shim and the stub.
+    let real = unsafe { ffi::arle_fa3_real_kernel_marker_cuda() } == 1;
+    if shape_ok && !real {
+        // A stub build falls back silently at ~1/3 the speed, and such a run has
+        // already been mistaken for an FA3 measurement.
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| {
+            eprintln!(
+                "[autograd] FA3 ring shape qualifies but the real kernel is absent — running \
+                 scalar. Rebuild with ARLE_CUDA_ENABLE_FA3=1 and vendor/flash-attention/hopper."
+            );
+        });
+    }
+    shape_ok && real
 }
 
 /// The vendored FA3 units are sm_90a-only — dispatch strictly on 9.0.
@@ -6419,7 +6430,6 @@ fn cuda_linear_attention_backward_device(
                     beta: &slice(args.beta)?,
                     chunk_state: &slice(args.chunk_state)?,
                     raw_output: raw_output.as_ref(),
-                    flashqla: args.flashqla,
                     conv1d_weight: args.conv1d_weight,
                     dt_bias: args.dt_bias,
                     a_log: args.a_log,
@@ -6470,7 +6480,7 @@ fn cuda_linear_attention_backward_device_row(
     let state_len = rows * state_elems;
     let num_chunks = p.seq_len.div_ceil(64);
     // FlashQLA saves only the carry; the per-chunk states are recomputed below.
-    let chunk_state_len = if args.flashqla {
+    let chunk_state_len = if args.raw_output.is_some() {
         state_len
     } else {
         num_chunks * p.num_value_heads * state_elems
@@ -6574,11 +6584,11 @@ fn cuda_linear_attention_backward_device_row(
             .saturating_mul(p.key_dim),
     );
     let staged_bytes = staged_elems.saturating_mul(std::mem::size_of::<f32>());
-    let use_mono = !args.flashqla
+    let use_mono = !args.raw_output.is_some()
         && (linear_attention_mono_backward_forced()
             || staged_bytes > backend.mem_get_info().map_or(0, |(free, _)| free) / 2);
 
-    if args.flashqla {
+    if args.raw_output.is_some() {
         let fq = flashqla_gdr_symbols(p.num_value_heads, p.num_key_heads)?;
         let raw_output = args
             .raw_output
