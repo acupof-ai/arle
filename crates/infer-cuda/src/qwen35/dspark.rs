@@ -165,23 +165,6 @@ impl Qwen35DsparkHead {
         ctx.sync()?;
         Ok(())
     }
-
-    /// Read the current Markov head weights back to host as f32.
-    ///
-    /// Used by the train sidecar to seed the trainer from the loaded checkpoint
-    /// instead of random init. Returns `(w1 [vocab*rank], w2 [vocab*rank], rank)`.
-    pub(crate) fn get_markov_weights(
-        &self,
-        ctx: &DeviceContext,
-    ) -> Result<(Vec<f32>, Vec<f32>, usize)> {
-        let markov = self
-            .markov
-            .as_ref()
-            .ok_or_else(|| anyhow!("dspark head has no Markov head"))?;
-        let w1 = markov.w1.to_host(ctx)?;
-        let w2 = markov.w2.to_host(ctx)?;
-        Ok((w1, w2, markov.rank))
-    }
 }
 
 /// Per-slot draft context K/V cache: for each draft layer, the RoPE'd/normed K

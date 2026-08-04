@@ -642,6 +642,7 @@ pub fn cuda_qwen35_engine_from_model_path(
         0.9,
         None,
         0.0,
+        0.0,
         None,
         None,
         None,
@@ -1702,7 +1703,7 @@ mod tests {
             None,
             None,
             0.5,
-            None,
+            0.0,
         )
         .map_err(|e| anyhow::anyhow!("from_dsv4_fp8_safetensors failed: {e:#}"))?;
 
