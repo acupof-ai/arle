@@ -4969,7 +4969,7 @@ fn cuda_ring_block_bwd(
 // (o, lse) into the running accumulators as block stats (m = lse, l = 1);
 // backward mirrors ring-flash-attention's global-LSE trick (final lse + final
 // o + upstream d_out, per-pair causal flag). Scalar kernels remain the
-// non-sm90 / non-hd256 / ARLE_CP_RING_FA3=0 fallback.
+// non-sm90 / non-hd256 fallback.
 
 #[cfg(not(feature = "no-cuda"))]
 fn ring_fa3_route(
@@ -4983,7 +4983,6 @@ fn ring_fa3_route(
     dims.head_dim == 256
         && q_pos.len() == dims.q_rows
         && k_pos.len() == dims.blk_len
-        && crate::runtime_flags::cp_ring_fa3()
         && real
         && ring_fa3_is_sm90(backend)
 }
