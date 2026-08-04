@@ -20,9 +20,6 @@ use crate::{
     args::{Args, ServeArgs, ServeBackendArg, ServeKvCacheDtypeArg, ServeSpecTypeArg},
     hardware::CompiledBackend,
 };
-#[cfg(feature = "cuda")]
-use train::dspark_train::DsparkTrainConfig;
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ServeBackend {
     Cuda,
@@ -135,12 +132,12 @@ fn run_config(config: ServeConfig) -> ExitCode {
     // on the one config that supports it.
     #[cfg(all(unix, feature = "cuda"))]
     if config.backend == ServeBackend::Cuda
-        && (config.options.spec.dspark_train || config.options.spec.dspark_markov_init.is_some())
+        && config.options.spec.dspark_markov_init.is_some()
         && crate::serve_multiproc::world_size_from_env() > 1
         && infer_api::cuda_model_takes_multiproc_serve(&config.options.model_path)
     {
         eprintln!(
-            "[ARLE serve] --dspark-train / --dspark-markov-init require a single-process \
+            "[ARLE serve] --dspark-markov-init requires a single-process \
              serve, but this model runs multiproc TP; the train sidecar is not wired into \
              the coordinator. Serve a single-GPU model (e.g. Qwen3.6-27B-FP8 TP=1) for \
              DSpark test-time training."
@@ -199,73 +196,34 @@ fn run_config(config: ServeConfig) -> ExitCode {
         config.options.port,
     );
 
-    // DSpark head lifecycle, both halves of it, once the engine is loaded:
-    // `--dspark-markov-init` installs a previously trained head over the draft
-    // checkpoint's, and `--dspark-train` spawns the acceptance-weighted trainer
-    // thread that drains the hot path's experience buffer and hot-swaps updated
-    // weights back in. The guard is held for the serve lifetime so the thread
-    // stops on shutdown. Both need `--spec-type dspark`.
-    #[cfg(feature = "cuda")]
-    let dspark_guard = std::sync::Arc::new(std::sync::Mutex::new(None));
+    // `--dspark-markov-init` installs a saved Markov head over the draft
+    // checkpoint's once the engine is loaded. The head slot itself is
+    // materialized by the executor (`markov_head_rank`).
     #[cfg(feature = "cuda")]
     #[allow(clippy::type_complexity)]
     let on_engine_loaded: Option<
         Box<dyn Fn(&std::sync::Arc<LoadedInferenceEngine>) -> anyhow::Result<()> + Send + Sync>,
     > = {
-        let train = config.options.spec.dspark_train;
         let init = config.options.spec.dspark_markov_init.clone();
         let is_dspark = config.options.spec.spec_type == ServeSpecType::Dspark;
-        if (train || init.is_some()) && !is_dspark {
+        if init.is_some() && !is_dspark {
             eprintln!(
-                "[ARLE serve] warning: --dspark-train / --dspark-markov-init require \
-                 --spec-type dspark; ignoring"
+                "[ARLE serve] warning: --dspark-markov-init requires --spec-type dspark; ignoring"
             );
         }
-        if !is_dspark || (!train && init.is_none()) {
-            None
-        } else {
-            let dspark_guard = std::sync::Arc::clone(&dspark_guard);
-            let save_path = config.options.spec.dspark_train_out.clone();
-            let iso = config.options.spec.dspark_train_iso;
-            let lr = config.options.spec.dspark_train_lr;
-            let batch = config.options.spec.dspark_train_batch;
-            let prob_match_alpha = config.options.spec.dspark_prob_match_alpha;
-            Some(Box::new(
+        match init.filter(|_| is_dspark) {
+            None => None,
+            Some(path) => Some(Box::new(
                 move |engine: &std::sync::Arc<LoadedInferenceEngine>| {
-                    if let Some(path) = &init {
-                        let (w1, w2) = train::dspark_train::load_markov_head(path)?;
-                        engine.update_dspark_markov_weights(&w1, &w2)?;
-                        eprintln!(
-                            "[ARLE serve] DSpark Markov head loaded from {}",
-                            path.display()
-                        );
-                    }
-                    if !train {
-                        return Ok(());
-                    }
-                    let guard = train::dspark_train::spawn_dspark_train_sidecar(
-                        std::sync::Arc::clone(engine),
-                        DsparkTrainConfig {
-                            save_path: save_path.clone(),
-                            iso_fixed_spectrum: iso,
-                            learning_rate: lr.unwrap_or(DsparkTrainConfig::default().learning_rate),
-                            batch_size: batch.unwrap_or(DsparkTrainConfig::default().batch_size),
-                            prob_match_alpha: prob_match_alpha
-                                .unwrap_or(DsparkTrainConfig::default().prob_match_alpha),
-                            ..Default::default()
-                        },
-                    )?;
-                    let Some(guard) = guard else {
-                        anyhow::bail!(
-                            "DSpark train sidecar not started (no experience buffer); \
-                         --spec-type dspark requires a CUDA DSpark-capable engine"
-                        );
-                    };
-                    eprintln!("[ARLE serve] DSpark train sidecar started");
-                    *dspark_guard.lock().unwrap() = Some(guard);
+                    let (w1, w2) = spec_train::markov_head::load(&path)?;
+                    engine.update_dspark_markov_weights(&w1, &w2)?;
+                    eprintln!(
+                        "[ARLE serve] DSpark Markov head loaded from {}",
+                        path.display()
+                    );
                     Ok(())
                 },
-            ))
+            )),
         }
     };
     #[cfg(not(feature = "cuda"))]
@@ -449,19 +407,7 @@ fn resolve_spec_options(backend: ServeBackend, serve_args: &ServeArgs) -> ServeS
         dspark_sps_row_ms: serve_args.dspark_sps_row_ms,
         mtp_draft_tokens: serve_args.mtp_draft_tokens,
         mtp_draft_topk: serve_args.mtp_draft_topk,
-        dspark_train: serve_args.dspark_train,
-        dspark_train_out: serve_args.dspark_train_out.clone(),
-        dspark_train_iso: serve_args.dspark_train_iso,
-        dspark_train_lr: serve_args.dspark_train_lr,
-        dspark_train_batch: serve_args.dspark_train_batch,
-        dspark_prob_match_alpha: serve_args.dspark_prob_match_alpha,
         dspark_block_size: serve_args.dspark_block_size,
-        // The sidecar needs a head to write into, and so does `--dspark-markov-init`
-        // (`update_markov_weights` has nothing to install over) — a DFlash backbone
-        // ships none. Rank comes from the trainer's own default so there is one source.
-        dspark_train_head_rank: (serve_args.dspark_train
-            || serve_args.dspark_markov_init.is_some())
-        .then(|| train::dspark_train::DsparkTrainConfig::default().markov_rank),
         dspark_markov_init: serve_args.dspark_markov_init.clone(),
     }
 }

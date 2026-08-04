@@ -27,8 +27,6 @@ use crate::model::CudaModel;
 use crate::ops::argmax;
 
 #[cfg(feature = "cuda")]
-#[path = "executor/dspark_train.rs"]
-pub mod dspark_train;
 #[path = "executor/dsv4.rs"]
 mod dsv4;
 #[path = "executor/qwen.rs"]
@@ -231,7 +229,7 @@ impl RealCudaExecutor {
         dspark_draft_model: Option<&Path>,
         dspark_sps_bias_ms: f32,
         dspark_sps_row_ms: f32,
-        dspark_train_head_rank: Option<usize>,
+        markov_head_rank: Option<usize>,
         dspark_block_size: Option<usize>,
         mtp_draft_tokens: Option<usize>,
     ) -> Result<Self> {
@@ -246,7 +244,7 @@ impl RealCudaExecutor {
                 dspark_draft_model,
                 dspark_sps_bias_ms,
                 dspark_sps_row_ms,
-                dspark_train_head_rank,
+                markov_head_rank,
                 dspark_block_size,
                 mtp_draft_tokens,
             )?,
@@ -948,19 +946,6 @@ impl RealCudaExecutor {
         }
     }
 
-    /// Read the current DSpark Markov head weights back to host as f32.
-    ///
-    /// Used by the train sidecar to seed the trainer from the loaded checkpoint.
-    /// Returns `(w1 [vocab*rank], w2 [rank*vocab], rank)`.
-    pub(crate) fn get_dspark_markov_weights(&self) -> Result<(Vec<f32>, Vec<f32>, usize)> {
-        match self {
-            Self::Qwen35(q) => q.get_dspark_markov_weights(),
-            Self::Dsv4(d) => d.get_dspark_markov_weights(),
-            Self::Qwen(_) => anyhow::bail!(
-                "DSpark Markov weight read is only wired for the Qwen3.5/3.6 and DSv4-Flash executors; \
-                 the dense Qwen3 executor has no DSpark head"
-            ),
-        }
     }
 
     /// Read-only borrow of resident FP8 block-scaled base projection pointers
