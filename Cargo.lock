@@ -1575,6 +1575,7 @@ dependencies = [
  "safetensors",
  "serde",
  "serde_json",
+ "spec-train",
  "tempfile",
  "tokenizers",
  "tokio",
