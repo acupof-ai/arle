@@ -3649,7 +3649,6 @@ impl Qwen35CudaExecutor {
             .ok_or_else(|| anyhow::anyhow!("DSpark head not loaded"))?;
         dspark.head.update_markov_weights(&self.model.ctx, w1, w2)
     }
-
 }
 
 #[cfg(test)]

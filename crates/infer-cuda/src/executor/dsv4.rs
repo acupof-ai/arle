@@ -1605,7 +1605,6 @@ impl Dsv4CudaExecutor {
         Ok(())
     }
 
-
     /// Seed a freshly-prefilled prompt chunk into the DSpark draft context: pull
     /// the transient multi-row taps the prefill forward stashed on the slot and
     /// append them at absolute trunk positions `start_abs..` (the canonical
