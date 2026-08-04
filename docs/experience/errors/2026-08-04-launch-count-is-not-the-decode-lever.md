@@ -54,12 +54,20 @@ Dead, on this evidence: the conv1d 2-kernel merge (~48 launches) and the
 split2/split_qkv fusion (~64), both of which were ranked purely on the
 4 µs/launch model.
 
-**Still unexplained: ~4.3 ms/step of intra-GPU idle** (GPU wall 18.97 vs
-Σ kernel ~14.7). It is not host time (0.061 ms, measured), and it is not
-per-launch dispatch (this entry). The next probe should ask what the device
-is waiting on — dependency serialization between adjacent kernels, tail
-effects on small grids, or memory-system stalls the kernel-duration sum
-already counts as "busy" — and it needs `ncu`, not another fusion.
+**The ~4.3 ms of "intra-GPU idle" did not exist.** It came from GPU wall 18.97
+minus `Σ kernel ≈ 14.7`, and that 14.7 was the T4 trace's 15.886 minus the
+*expected* gains of two later tranches, never re-measured. An nsys run on the
+champion put Σ kernel at **19.184 ms** with occupancy 0.95 — the step is kernel
+time end to end.
+
+The launch cost itself was then measured directly: `--qwen35-decode-graph
+false` runs the same work eagerly and costs **+1.55 ms** over ~1000 launches,
+i.e. ~1.6 µs per eager launch, consistent with T4's 1.84 ms graph win. Inside a
+captured graph node count is effectively free, which is why removing 192 nodes
+bought nothing.
+
+The real lever was in one kernel:
+[FA3 decode splits](../wins/2026-08-04-fa3-decode-splits-fill-the-sms.md).
 
 ## Rule
 
