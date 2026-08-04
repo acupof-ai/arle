@@ -114,6 +114,35 @@ global read. **The bucket is reclaimable only by fusion that keeps the second
 pass in registers** (the [T6 GDN](2026-08-03-t6-gdn-decode-kernel.md) pattern);
 traffic-preserving fusion is zero by construction.
 
+## Against SGLang, kernel by kernel
+
+Same GPU, same int8 values (mechanical GPTQ v1 repack), same `gptq_marlin`
+kernel, SGLang 0.5.13 traced the same way (957 steps):
+
+| kernel | ARLE ms | SGLang ms | Δ |
+|---|---:|---:|---:|
+| Marlin GEMM (256 each) | 11.709 | 11.611 | +0.098 |
+| FA3 decode (16 each) | 2.373 | 2.507 | −0.134 |
+| lm_head (1 each) | 0.666 | 0.666 | 0.000 |
+| GDN decode (48 each) | 0.228 | 0.277 | −0.049 |
+| in_proj splitK (48 each) | 0.224 | 0.305 | −0.081 |
+| norms | 0.487 | 0.503 | −0.016 |
+| conv1d | 0.202 | 0.125 | +0.077 |
+| remaining tail | 0.586 | 0.533 | +0.053 |
+| **Σ kernel** | **16.651** | **16.527** | **+0.124 (+0.7%)** |
+
+**The decode step is at parity**, from 1.57× behind on
+[2026-08-02](2026-08-02-w8a16-sglang-matched-ab.md). Marlin matches to 0.8%,
+which is what running the same kernel on the same bytes should look like. FA3
+is 5% *faster* here after the split-ceiling fix. The one row behind was conv1d,
+since [closed](2026-08-04-conv1d-decode-fusion.md).
+
+End to end on the same 16×256-token c=1 protocol, SGLang delivers 10.5 tok/s
+against ARLE's 7.6. Subtracting the measured decode time (256 × 16.95 ms) puts
+TTFT at **~29.4 s vs ~20.2 s**, the same 1.45× as 2026-08-02 — **prefill has
+not moved while decode closed.** Those TTFTs are derived from throughput, not
+measured; the direct measurement is the next step.
+
 ## Learnings
 
 The step is 100% kernel time (host is 0.061 ms,
