@@ -855,19 +855,13 @@ impl Dsv4Model {
 
 /// Proposal from one DSpark block draft. `chain[0]` = anchor, `chain[1..]` = the
 /// drafted tokens surviving confidence truncation (`draft_len`). Consumed by the
-/// verify path: `chain` feeds [`Dsv4Model::forward_tokens_verify`] as `tokens`;
-/// `draft_logits` = the RAW base rows (pre-Markov-bias), matching what the
-/// qwen35 lane captures: the trainer re-derives the bias from its own live
-/// `w1`/`w2`, so handing it corrected rows double-biases the objective (#176).
+/// verify path: `chain` feeds [`Dsv4Model::forward_tokens_verify`] as `tokens`.
 #[allow(dead_code)]
 pub(crate) struct Dsv4DsparkProposal {
     /// Verify input ids `[anchor, d0 .. d_{L-1}]` (len == `draft_len + 1`).
     pub chain: Vec<u32>,
     /// Number of drafted tokens `L` surviving confidence truncation.
     pub draft_len: usize,
-    /// Raw base logits `[vocab, draft_len]` for the drafted prefix, pre-bias.
-    /// `None` when the block truncated to zero drafts.
-    pub draft_logits: Option<HiddenStates>,
     /// DIAG: base-only (pre-Markov) greedy argmax per block row `[block]`. Splits
     /// "Markov masks a working forward" from "forward is context-blind" — if
     /// `base_argmax[0]` is constant per anchor while target varies, the forward is
@@ -978,25 +972,12 @@ impl Dsv4Model {
         let draft_len = keep.min(drafts.len());
         drafts.truncate(draft_len);
 
-        let draft_logits = if draft_len == 0 {
-            None
-        } else {
-            // SAFETY: uninit scratch; the leading `draft_len` rows are copied.
-            let mut out = unsafe { HiddenStates::uninit(ctx, vocab, draft_len)? };
-            let src = base_logits.data.slice(0..draft_len * vocab);
-            ctx.stream
-                .memcpy_dtod(&src, &mut out.data)
-                .map_err(|e| anyhow!("DSpark draft logits copy failed: {e}"))?;
-            Some(out)
-        };
-
         let mut chain = Vec::with_capacity(1 + draft_len);
         chain.push(anchor);
         chain.extend(drafts);
         Ok(Dsv4DsparkProposal {
             chain,
             draft_len,
-            draft_logits,
             base_argmax,
         })
     }

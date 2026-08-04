@@ -1652,7 +1652,6 @@ impl Dsv4CudaExecutor {
         if r0_chain != proposal.chain {
             proposal.draft_len = r0[0] as usize;
             proposal.chain = r0_chain;
-            proposal.draft_logits = None;
         }
         Ok(())
     }
@@ -1811,13 +1810,6 @@ impl Dsv4CudaExecutor {
         // rank commits an identical KV tail (next tick's combined attention reads
         // all ranks' shards — an inconsistent commit corrupts it).
         (accepted, bonus) = Self::tp_lockstep_accept(&self.model, accepted, bonus)?;
-
-        // Train sidecar: capture (draft_tokens, draft_logits, target_logits,
-        // accepted) for the asynchronous acceptance-weighted trainer. Best-effort;
-        // skipped when draft_logits are unavailable (TP lockstep cleared them).
-        if let Some(draft_logits) = proposal.draft_logits.as_ref() {
-            // DSv4 drafts from every row (row i drafts chain[i+1]) — next-token mode.
-        }
 
         // Return to the real frontier, restore the aliased ring boundary, then
         // fold anchor + accepted drafts exactly once from persisted verify rows.
@@ -2060,7 +2052,7 @@ impl Dsv4CudaExecutor {
             )?;
         }
 
-        let (verified, verify_logits) = self.model.forward_decode_batch_verify(
+        let (verified, _verify_logits) = self.model.forward_decode_batch_verify(
             &mut self.slots,
             &mut self.kv_adapter,
             &slot_ids,
@@ -2072,7 +2064,6 @@ impl Dsv4CudaExecutor {
         // ── Phase 4: per-slot accept + rollback + commit (proven fold path).
         let mut out: Vec<Vec<u32>> = vec![Vec::new(); n];
         let mut verified_iter = verified.into_iter();
-        let mut logits_offset = 0usize; // column offset into verify_logits (non-fallback only)
         for i in 0..n {
             if let Some(toks) = &fallback_tokens[i] {
                 out[i] = toks.clone();
@@ -2098,14 +2089,6 @@ impl Dsv4CudaExecutor {
             // TP lockstep on accepted/bonus (rank 0 wins — KV tail must be identical
             // across ranks, else next tick's combined attention corrupts).
             (accepted, bonus) = Self::tp_lockstep_accept(&self.model, accepted, bonus)?;
-
-            // Train sidecar: capture (draft_tokens, draft_logits, target_logits,
-            // accepted) for the asynchronous acceptance-weighted trainer. Best-effort;
-            // skipped when draft_logits are unavailable (e.g. sampling path overwrite).
-            if let Some(draft_logits) = proposal.draft_logits.as_ref() {
-                // DSv4 drafts from every row (row i drafts chain[i+1]) — next-token mode.
-            }
-            logits_offset += proposal.chain.len();
 
             self.model.truncate_slot(
                 &mut self.slots[slot_idx],
