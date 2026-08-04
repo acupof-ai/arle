@@ -3059,6 +3059,7 @@ fn synthetic_writeback_fd_probe<O: autograd::Optimizer>(
     Ok(())
 }
 
+#[cfg(feature = "cuda")]
 fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
     use std::sync::{Arc, Mutex};
 
