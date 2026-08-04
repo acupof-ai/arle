@@ -6025,7 +6025,9 @@ fn cuda_linear_attention_forward_device_row(
         .stream
         .alloc_zeros::<f32>(state_len)
         .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (la final_state)"))?;
-    let use_chunkwise = p.seq_len <= 32 && linear_attention_gdr_chunkwise_prefill_enabled();
+    // The `seq_len <= 32` clamp (abb1ed995) worked around a WGMMA deadlock in the
+    // pre-FlashQLA chunk kernel, which 778fef873 replaced — the flag alone gates it now.
+    let use_chunkwise = linear_attention_gdr_chunkwise_prefill_enabled();
     // Seed carry so chunk_state[0] = carry. Only the taken branch's buffer needs it: the
     // recurrent branch runs final_state → chunk_state[0], the chunkwise branch reads initial_state
     // (final_state is output-only there). Seed the one the branch consumes — the other is dead.
