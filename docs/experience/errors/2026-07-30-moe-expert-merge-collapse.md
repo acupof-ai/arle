@@ -55,6 +55,27 @@ preserve256 → also collapsed, so it cannot rescue quality either. Before
 declaring any compressed/quantized/merged model "weak", inspect open-ended
 generation — an MCQ score cannot distinguish broken from weak.
 
+## Measured mechanism (2026-08-03, layer 1, `/host/isowork/probe/`)
+
+Two independent defects; only the second is fatal.
+
+1. **The merge is lossy by construction.** `iso_merge_group.py` builds
+   `W = mean(U_aligned) · diag(mean(S)) · mean(V_aligned)ᵀ` — the average of
+   orthonormal frames is not orthonormal. Measured `svdvals(Vbar)` mean 0.70,
+   min 0.50 ⇒ merged `‖W*‖_F` = 0.71× the members, mid-spectrum 0.65×. The
+   graft recipe (freeze anchor Σ, polar-retract) fixes this exactly (1.0001×).
+2. **There is nothing to merge.** Pairwise weight cosine over all 256 experts:
+   mean 0.003, p99 0.010, **max 0.020** (gate_proj; up/down max 0.004). Every
+   expert is orthogonal to every other — best-pair relative distance 1.400 vs
+   √2 = 1.414 for random. No clustering signal exists, and 4→1 discards ~75% of
+   the information whatever the algorithm. Graft-style merge confirms it: rel
+   err to the 3 non-anchor members 1.53/1.45/1.42 = identical to keeping the
+   anchor alone (1.53/1.45/1.42).
+
+The only shared structure is a rank-16 subspace (best pair's top-16 V-frame
+cos 0.90, full-frame mean 0.48) — a shared-basis factorization, not a merge,
+and 16/512 saves nothing.
+
 ## Status
 
 CLOSED, negative. 4:1 (iso64/cal/coact/preserve256) + low-rank distill + 2:1
