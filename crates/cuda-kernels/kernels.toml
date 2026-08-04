@@ -246,6 +246,23 @@ int32_t seq_len, CUstream stream"""
 call = "q, k, v, a_inv, g_cumsum, beta, h0, o, ht, seq_len, stream"
 rust = []
 
+[abi.fq_prepare_h_v1]
+fn_ty = "FqPrepareHV1Fn"
+c = """const uint16_t* k, const uint16_t* v, const uint16_t* a_inv, const float* g_cumsum, \
+const float* beta, const float* h0, uint16_t* h, int32_t seq_len, CUstream stream"""
+call = "k, v, a_inv, g_cumsum, beta, h0, h, seq_len, stream"
+rust = []
+
+[abi.fq_bwd_v1]
+fn_ty = "FqBwdV1Fn"
+c = """const uint16_t* dout, const float* dht, const uint16_t* q, const uint16_t* k, \
+const uint16_t* v, const uint16_t* a_inv, const float* g_cumsum, const float* beta, \
+const uint16_t* h, uint16_t* dq, uint16_t* dk, uint16_t* dv, float* dg, float* dbeta, \
+float* dh0, int32_t seq_len, CUstream stream"""
+call = """dout, dht, q, k, v, a_inv, g_cumsum, beta, h, dq, dk, dv, dg, dbeta, dh0, \
+seq_len, stream"""
+rust = []
+
 # ===========================================================================
 # BF16 prefill (paged_attn_v1) — kernel_family "attention".
 # allow_sm70: all HD128 + HD256 BF16 configs (Qwen3.5/3.6 dense + MoE,
@@ -952,6 +969,36 @@ allow_sm70 = false
 gate = "flashqla"
 ffi = false
 
+[[kernel]]
+q_heads = 32
+kv_heads = 16
+phase = "fq_prepare_h"
+abi = "fq_prepare_h_v1"
+kernel_family = "flashqla"
+kernel_key = "fq_prepare_h"
+py_module = "tools/tilelang/flashqla_gdr.py"
+artifact_dir = "flashqla_gdr_prepare_h"
+kernel_name = "gdr_fq_prepare_h"
+out_name = "tilelang_flashqla_gdr_prepare_h"
+allow_sm70 = false
+gate = "flashqla"
+ffi = false
+
+[[kernel]]
+q_heads = 32
+kv_heads = 16
+phase = "fq_bwd"
+abi = "fq_bwd_v1"
+kernel_family = "flashqla"
+kernel_key = "fq_bwd"
+py_module = "tools/tilelang/flashqla_gdr.py"
+artifact_dir = "flashqla_gdr_bwd"
+kernel_name = "gdr_fq_bwd"
+out_name = "tilelang_flashqla_gdr_bwd"
+allow_sm70 = false
+gate = "flashqla"
+ffi = false
+
 # H=48/Hg=16 — ThinkingCap-Qwen3.6-27B.
 [[kernel]]
 q_heads = 48
@@ -994,6 +1041,36 @@ py_module = "tools/tilelang/flashqla_gdr.py"
 artifact_dir = "flashqla_gdr_fwd_h48"
 kernel_name = "gdr_fq_fwd_h48"
 out_name = "tilelang_flashqla_gdr_fwd_h48"
+allow_sm70 = false
+gate = "flashqla"
+ffi = false
+
+[[kernel]]
+q_heads = 48
+kv_heads = 16
+phase = "fq_prepare_h"
+abi = "fq_prepare_h_v1"
+kernel_family = "flashqla"
+kernel_key = "fq_prepare_h"
+py_module = "tools/tilelang/flashqla_gdr.py"
+artifact_dir = "flashqla_gdr_prepare_h_h48"
+kernel_name = "gdr_fq_prepare_h_h48"
+out_name = "tilelang_flashqla_gdr_prepare_h_h48"
+allow_sm70 = false
+gate = "flashqla"
+ffi = false
+
+[[kernel]]
+q_heads = 48
+kv_heads = 16
+phase = "fq_bwd"
+abi = "fq_bwd_v1"
+kernel_family = "flashqla"
+kernel_key = "fq_bwd"
+py_module = "tools/tilelang/flashqla_gdr.py"
+artifact_dir = "flashqla_gdr_bwd_h48"
+kernel_name = "gdr_fq_bwd_h48"
+out_name = "tilelang_flashqla_gdr_bwd_h48"
 allow_sm70 = false
 gate = "flashqla"
 ffi = false
