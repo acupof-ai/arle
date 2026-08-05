@@ -46,7 +46,7 @@ impl Default for AutogradRuntimeFlags {
             checkpoint_offload_min_bytes: 2 << 20,
             lora_linear_bwd_tile_rows: 1024,
             moe_lora_bwd_expert_tile: 16,
-            gdr_chunkwise_prefill: false,
+            gdr_chunkwise_prefill: true,
             la_backward_mono: false,
             decode_attn_legacy: false,
             cuda_mempool_retain: true,
