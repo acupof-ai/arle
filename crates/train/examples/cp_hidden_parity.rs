@@ -39,6 +39,14 @@ const REL_TOL: f32 = 2.0e-2;
 
 #[cfg(all(feature = "cuda", feature = "nccl"))]
 fn main() -> Result<()> {
+    // autograd's flags come from apply_runtime_flags, never from the environment,
+    // so without this the FlashQLA arm silently runs the recurrent path and both
+    // arms come back bit-identical.
+    autograd::apply_runtime_flags(&autograd::AutogradRuntimeFlags {
+        gdr_chunkwise_prefill: std::env::var("ARLE_CPH_GDR_CHUNKWISE")
+            .is_ok_and(|v| matches!(v.trim(), "1" | "true" | "on")),
+        ..Default::default()
+    });
     if let Ok(rank) = std::env::var("ARLE_CPH_RANK") {
         return rank_main(rank.parse().context("ARLE_CPH_RANK parse")?);
     }
