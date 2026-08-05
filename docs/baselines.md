@@ -190,9 +190,10 @@ Prior champions: TTFT 31.08 s (`e1017b40d`), ITL 18.98 ms (`f6820efa9`),
 
 Decode leads by 2.8%. TTFT is 1.19× behind, down from 1.48× — FlashQLA chunked
 GDR had never been compiled into the pod binary and prefill ran the serial
-recurrent scan. **The whole remaining prefill gap is 3.8 s of GPU idle** (ARLE
-3.97 s vs SGLang 0.19 s over a cold 33K prefill); GPU-busy time is within
-0.93 s. p99 is 5% behind.
+recurrent scan. **The whole remaining prefill gap is GPU idle**; GPU-busy time is within
+0.93 s. In-span idle (between first and last prefill kernel) is 1.675 s, of
+which 1.605 s sits in 18 stalls of ~90 ms each — the 2048-token recurrent-state
+snapshot, not launch overhead. p99 is 5% behind.
 
 `--chunked-prefill-size` is not a lever on either stack: 2048 vs 4096 (ARLE)
 and 4096 vs 8192 (SGLang) all land inside 0.07 s TTFT.
