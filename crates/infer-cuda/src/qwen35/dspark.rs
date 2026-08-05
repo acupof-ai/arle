@@ -238,12 +238,34 @@ impl Qwen35DsparkSlotState {
 pub(crate) struct Qwen35DsparkTaps {
     targets: Vec<i64>,
     bufs: Vec<HiddenSlot>,
+    captured: Vec<bool>,
     hidden: usize,
     seq: usize,
     armed: bool,
 }
 
 impl Qwen35DsparkTaps {
+    /// Every id must name a layer the forward will actually reach, exactly
+    /// once — a duplicate or out-of-range id would leave `capture` with nothing
+    /// to write and hand the reader a zero buffer it cannot tell from a real
+    /// one.
+    pub(crate) fn validate(targets: &[i64], num_layers: usize) -> Result<()> {
+        let mut seen = targets.to_vec();
+        seen.sort_unstable();
+        seen.dedup();
+        ensure!(
+            seen.len() == targets.len(),
+            "duplicate dspark target_layer_ids: {targets:?}"
+        );
+        for &t in targets {
+            ensure!(
+                t == -1 || (0..num_layers as i64).contains(&t),
+                "dspark target layer {t} outside -1..{num_layers}"
+            );
+        }
+        Ok(())
+    }
+
     pub(crate) fn prepare(&mut self, targets: &[i64], hidden: usize, seq: usize) {
         if self.targets != targets {
             self.targets = targets.to_vec();
@@ -251,6 +273,7 @@ impl Qwen35DsparkTaps {
                 .take(targets.len())
                 .collect();
         }
+        self.captured = vec![false; targets.len()];
         self.hidden = hidden;
         self.seq = seq;
         self.armed = true;
@@ -282,6 +305,7 @@ impl Qwen35DsparkTaps {
         ctx.stream
             .memcpy_dtod(&hidden.data, &mut buf.data)
             .map_err(|e| anyhow!("dspark tap capture failed: {e}"))?;
+        self.captured[i] = true;
         Ok(())
     }
 
@@ -295,6 +319,12 @@ impl Qwen35DsparkTaps {
     pub(crate) fn tap_to_host(&mut self, ctx: &DeviceContext, i: usize) -> Result<Vec<f32>> {
         ensure!(self.armed, "dspark tap readback without an armed capture");
         ensure!(i < self.bufs.len(), "tap {i} of {}", self.bufs.len());
+        ensure!(
+            self.captured[i],
+            "dspark tap {i} (layer {}) was never captured; reading it would \
+             hand the trainer a zero feature",
+            self.targets[i]
+        );
         self.bufs[i].get(ctx, self.hidden, self.seq)?.to_host(ctx)
     }
 

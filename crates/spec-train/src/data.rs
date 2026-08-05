@@ -33,6 +33,16 @@ pub fn read_jsonl(path: &Path) -> Result<Vec<Conversation>> {
         .collect()
 }
 
+/// Read a conversations JSONL and tokenize it with the model's own tokenizer.
+pub fn load_samples(data: &Path, tokenizer: &Path, max_len: usize) -> Result<Vec<Sample>> {
+    let tk = Tokenizer::from_file(tokenizer)
+        .map_err(|e| anyhow::anyhow!("load tokenizer {}: {e}", tokenizer.display()))?;
+    read_jsonl(data)?
+        .iter()
+        .map(|c| to_sample(c, &tk, max_len))
+        .collect()
+}
+
 /// Tokenize one conversation and mark the assistant turns as trainable.
 ///
 /// The mask is derived from token byte offsets against the rendered turn
