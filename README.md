@@ -128,6 +128,17 @@ Measured on H20 (96 GB), `--spec-type mtp --mtp-draft-tokens 2`, greedy verifica
 
 The 35B-A3B hybrid MoE (30 linear-attention + 10 full-attention layers, 256 experts, 8/tok) decodes ~2× faster than the 27B dense model at the same quant level. MTP gains are modest at greedy topk=1; higher draft token counts and topk can increase the speedup.
 
+### Against SGLang
+
+Same weights, same GPU, same quantized kernel — SGLang serves a repack of our own checkpoint. Qwen3.6-27B, one H20, 33K prompt, one request at a time.
+
+| | ARLE | SGLang 0.5.13 |
+|---|---:|---:|
+| Decode, per token | **16.69 ms** | 17.16 ms |
+| Prefill, 33K prompt | 25.0 s | **21.0 s** |
+
+Decode is 2.8% faster. Prefill is 19% slower — that is what we are working on. Numbers and method: [docs/baselines.md](docs/baselines.md).
+
 ### On-Policy Distillation
 
 Teacher = production server. Student trains on its own rollouts:

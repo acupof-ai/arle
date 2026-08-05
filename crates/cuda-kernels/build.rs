@@ -2651,7 +2651,6 @@ fn main() {
     // Hopper only (DSv4 target = H20 / SM90a); SM100 sources are skipped.
     // CUTLASS ships inside vendor/flashmla/csrc/cutlass/ (NVIDIA tag
     // 147f5673 — FlashMLA submodule pin). Refs sgl-kernel/cmake/flashmla.cmake.
-    println!("cargo:rerun-if-env-changed=ARLE_CUDA_ENABLE_FLASHMLA");
     println!("cargo:rerun-if-env-changed=ARLE_CUDA_DISABLE_FLASHMLA");
     println!("cargo:rerun-if-env-changed=ARLE_CUDA_DISABLE_FLASHMLA_DECODE");
     let flashmla_root = Path::new("vendor/flashmla");
