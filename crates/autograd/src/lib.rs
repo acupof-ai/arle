@@ -8,6 +8,8 @@ pub mod backend_cuda;
 #[cfg(feature = "metal")]
 #[path = "backend_metal.rs"]
 pub mod backend_metal;
+#[path = "grad_clip.rs"]
+pub mod grad_clip;
 #[path = "lr_schedule.rs"]
 pub mod lr_schedule;
 #[path = "module.rs"]

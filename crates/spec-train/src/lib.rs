@@ -19,3 +19,5 @@ pub mod loss;
 pub mod markov_head;
 #[path = "mask.rs"]
 pub mod mask;
+#[path = "trainer.rs"]
+pub mod trainer;

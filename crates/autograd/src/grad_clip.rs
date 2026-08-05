@@ -1,7 +1,7 @@
 //! Gradient clipping — free functions (`clip_grad_norm` /
-//! `compute_global_norm_f64`) used by the OPD training loops.
+//! `compute_global_norm_f64`) shared by every training loop.
 
-use autograd::{AutogradError, CommAxis, Device, Optimizer, TensorId, TensorStore, tensor::Dirty};
+use crate::{AutogradError, CommAxis, Device, Optimizer, TensorId, TensorStore, tensor::Dirty};
 
 #[derive(Debug, thiserror::Error)]
 pub enum FiniteStepError {
