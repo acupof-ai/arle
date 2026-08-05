@@ -43,7 +43,8 @@ if [[ -n "$MANIFEST" ]]; then
     cuda_prebuilt_validate_bundle "$MANIFEST_DIR" || die "invalid kernel producer manifest or artifact hashes"
     BUNDLE_ID="$(cuda_prebuilt_manifest_value "$MANIFEST" kernel_build_id)"
     [[ "$BUNDLE_ID" =~ ^bundle:[0-9a-f]{64}$ ]] || die "kernel manifest has invalid kernel_build_id"
-    EMBEDDED_BUNDLE_ID="$("$PROBE_BIN" --kernel-build-id)" || die "probe binary cannot report its kernel build ID"
+    # First line only: `--kernel-build-id` also prints `capabilities:` (06a27527e).
+    EMBEDDED_BUNDLE_ID="$("$PROBE_BIN" --kernel-build-id | head -n1)" || die "probe binary cannot report its kernel build ID"
     [[ "$EMBEDDED_BUNDLE_ID" == "$BUNDLE_ID" ]] || die "kernel manifest ID does not match the probe binary"
     BUNDLE_ID_SOURCE="verified_binary"
     BUNDLE_MANIFEST_SHA256="$(cuda_prebuilt_hash_file "$MANIFEST")"
