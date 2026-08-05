@@ -51,6 +51,7 @@ mod app {
         sparse_logit_probe: bool,
         frozen_prompt_kv: bool,
         prompt_len: usize,
+        gdr_chunkwise: bool,
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,6 +68,12 @@ mod app {
 
     pub fn main() -> Result<()> {
         let args = parse_args()?;
+        // autograd flags come from apply_runtime_flags, never the environment, so
+        // the FlashQLA GDN backward only engages when this is set explicitly.
+        autograd::apply_runtime_flags(&autograd::AutogradRuntimeFlags {
+            gdr_chunkwise_prefill: args.gdr_chunkwise,
+            ..Default::default()
+        });
         if args.target_set != LoraTargetSet::AllLinear {
             bail!(
                 "finite-diff gate requires --target-set all-linear so the default Qwen3.6 adapter exists"
@@ -76,7 +83,7 @@ mod app {
             "qwen36_fp8_lora_fd_gate_start model={} device={} rank={} alpha={:.6} \
              target_set={} target_adapter={} eps={:.1e} tokens={:?} mode={} layer={} \
              profile_backward={} profile_forward_only={} check_route_stability={} \
-             freeze_base_routes={} sparse_logit_probe={}",
+             freeze_base_routes={} sparse_logit_probe={} gdr_chunkwise={}",
             args.model.display(),
             args.device,
             args.lora.rank,
@@ -91,7 +98,8 @@ mod app {
             args.profile_forward_only,
             args.check_route_stability,
             args.freeze_base_routes,
-            args.sparse_logit_probe
+            args.sparse_logit_probe,
+            args.gdr_chunkwise
         );
 
         let backend = Arc::new(
@@ -308,6 +316,7 @@ mod app {
         let mut sparse_logit_probe = false;
         let mut frozen_prompt_kv = false;
         let mut prompt_len = 0usize;
+        let mut gdr_chunkwise = false;
 
         let mut args = env::args().skip(1);
         while let Some(arg) = args.next() {
@@ -350,6 +359,7 @@ mod app {
                 "--freeze-base-routes" => freeze_base_routes = true,
                 "--sparse-logit-probe" => sparse_logit_probe = true,
                 "--frozen-prompt-kv" => frozen_prompt_kv = true,
+                "--gdr-chunkwise" => gdr_chunkwise = true,
                 "--prompt-len" => {
                     prompt_len = next_arg("--prompt-len", &mut args)?
                         .parse()
@@ -364,7 +374,7 @@ mod app {
                          [--mode mlp-layer|full-model|tail] [--layer N] [--profile-backward] \
                          [--profile-forward-only] [--check-route-stability] \
                          [--freeze-base-routes] [--sparse-logit-probe] \
-                         [--frozen-prompt-kv --prompt-len N]"
+                         [--frozen-prompt-kv --prompt-len N] [--gdr-chunkwise]"
                     );
                     std::process::exit(0);
                 }
@@ -420,6 +430,7 @@ mod app {
             sparse_logit_probe,
             frozen_prompt_kv,
             prompt_len,
+            gdr_chunkwise,
         })
     }
 
