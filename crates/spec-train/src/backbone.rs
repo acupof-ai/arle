@@ -449,12 +449,18 @@ pub fn load_frozen(dir: &Path, name: &str, store: &mut TensorStore) -> Result<Te
     Shards::open(dir)?.tensor(name, false, store)
 }
 
-/// Whether a directory carries any of the draft's own weights. A config-only
-/// directory means train from scratch.
+/// Whether a directory carries any of the draft's own weights. Only "no
+/// safetensors here" means train from scratch; a corrupt or unreadable shard
+/// is an error, because silently restarting would overwrite the checkpoint the
+/// caller meant to resume.
 pub fn has_weights(dir: &Path) -> Result<bool> {
-    Ok(Shards::open(dir)
-        .ok()
-        .is_some_and(|s| s.has(&dspark_tensor_names(1).fc)))
+    let any = std::fs::read_dir(dir)?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .any(|p| p.extension().is_some_and(|e| e == "safetensors"));
+    if !any {
+        return Ok(false);
+    }
+    Ok(Shards::open(dir)?.has(&dspark_tensor_names(1).fc))
 }
 
 /// Write the trainable half back in the loader's names. Embeddings and
