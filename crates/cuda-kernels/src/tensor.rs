@@ -4214,8 +4214,14 @@ impl<T> RawDevicePtr<T> {
 /// Extract and cache a raw device pointer from a CudaSlice.
 /// Calls device_ptr() once -- amortized over thousands of decode steps.
 pub fn cache_ptr<T>(slice: &CudaSlice<T>, ctx: &DeviceContext) -> RawDevicePtr<T> {
+    cache_ptr_on(slice, &ctx.stream)
+}
+
+/// `cache_ptr` for callers that hold a bare stream (the autograd backend) rather
+/// than a full `DeviceContext`. Same one-shot device_ptr extraction.
+pub fn cache_ptr_on<T>(slice: &CudaSlice<T>, stream: &CudaStream) -> RawDevicePtr<T> {
     use cudarc::driver::DevicePtr;
-    let (ptr, _sync) = slice.device_ptr(&ctx.stream);
+    let (ptr, _sync) = slice.device_ptr(stream);
     RawDevicePtr {
         ptr,
         _marker: PhantomData,

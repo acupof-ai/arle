@@ -1105,6 +1105,10 @@ pub(crate) struct OpdRuntimeArgs {
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set, value_name = "BOOL")]
     pub(crate) gdr_chunkwise_prefill: bool,
 
+    /// Native FP8 DeepGEMM for frozen-weight forward projections (opt-in; gated on FD parity).
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set, value_name = "BOOL")]
+    pub(crate) fp8_native_gemm: bool,
+
     /// Force the monolithic chunked-scan linear-attention backward (A/B arm).
     #[arg(long, default_value_t = false, action = clap::ArgAction::Set, value_name = "BOOL")]
     pub(crate) la_backward_mono: bool,
@@ -1195,6 +1199,7 @@ impl OpdRuntimeArgs {
                 lora_linear_bwd_tile_rows: self.lora_linear_bwd_tile_rows,
                 moe_lora_bwd_expert_tile: self.moe_lora_bwd_expert_tile,
                 gdr_chunkwise_prefill: self.gdr_chunkwise_prefill,
+                fp8_native_gemm: self.fp8_native_gemm,
                 la_backward_mono: self.la_backward_mono,
                 decode_attn_legacy: self.autograd_decode_attn_legacy,
                 cuda_mempool_retain: self.cuda_mempool_retain,
