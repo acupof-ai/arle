@@ -23,8 +23,7 @@ pub mod checkpoint;
 pub mod context_parallel;
 #[path = "ema_self_teacher.rs"]
 pub mod ema_self_teacher;
-#[path = "grad_clip.rs"]
-pub mod grad_clip;
+pub use autograd::grad_clip;
 #[path = "infer_student.rs"]
 pub mod infer_student;
 #[path = "lora.rs"]
