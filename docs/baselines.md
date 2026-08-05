@@ -325,20 +325,10 @@ Same harness (`/host/fqgate.sh perf_on`), same seq, only variable is the flag.
 | **step** | **378.723 s** | **378.723 s** | 752.956 s | **1.99×** |
 
 Peak host RSS 55.4 GB, loss 4.537510, grad_norm 7.976866, RUN_EXIT=0. The 71%
-`linear_attention_chunked_scan_backward_f32` row is gone. `--la-backward-mono`
-forces the recurrent arm below.
+`linear_attention_chunked_scan_backward_f32` row is gone.
 
-## Recurrent GDN backward (pre-FlashQLA A/B baseline) — 27B, cp=2, seq=81920 · `e675f031b` (2026-08-05)
-
-| | rank 0 | rank 1 |
-|---|---:|---:|
-| forward | 80.671 s | 81.009 s |
-| fused CE | 1.916 s | 1.913 s |
-| backward | 670.275 s | 670.319 s |
-| **step** | **752.956 s** | **753.294 s** |
-
-Peak 91,547 MiB/rank (93.5% of the card), host RSS 55.5 GB, loss 4.536131,
-grad_norm 7.202155.
+The recurrent column is `--la-backward-mono` on `e675f031b`: device peak
+91,547 MiB/rank (93.5% of the card), loss 4.536131, grad_norm 7.202155.
 
 ### Step budget — where the time goes
 
