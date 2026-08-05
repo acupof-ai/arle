@@ -1102,7 +1102,7 @@ pub(crate) struct OpdRuntimeArgs {
     pub(crate) writeback_frozen_prompt_kv: bool,
 
     /// FlashQLA chunkwise GDN prefill in the autograd CUDA backend.
-    #[arg(long, default_value_t = false, action = clap::ArgAction::Set, value_name = "BOOL")]
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set, value_name = "BOOL")]
     pub(crate) gdr_chunkwise_prefill: bool,
 
     /// Force the monolithic chunked-scan linear-attention backward (A/B arm).
