@@ -10,8 +10,8 @@ Vendored upstream kernels (adopt-official-first; see each entry's pin).
   `deep_gemm/include/deep_gemm/{comm/barrier,common/{math,types,utils},impls/sm90_fp8_mega_moe,layout/{mega_moe,sym_buffer},ptx/{ld_st,utils},scheduler/mega_moe}.cuh`.
   No FP8xFP4 files or Python/TVM API surface are included.
 - `flashmla/`: `deepseek-ai/FlashMLA` csrc (cutlass submodule snapshot at
-  NVIDIA tag `147f5673`). Linked via `arle_flashmla_shim.cu` behind
-  `ARLE_CUDA_ENABLE_FLASHMLA`.
+  NVIDIA tag `147f5673`). Linked via `arle_flashmla_shim.cu` whenever the
+  vendored tree is present.
 - `flash-attention/`: `Dao-AILab/flash-attention` at
   `fc8cbad6b6b90220cf6ef8121c29e299a3ba7d9a` — `hopper/` headers + the
   hdim256/bf16/fwd/sm90 instantiation set only (5 units + combine +

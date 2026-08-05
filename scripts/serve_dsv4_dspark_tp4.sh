@@ -6,7 +6,6 @@ source "$TREE/scripts/pod-build-env.sh"
 cd "$TREE"
 CUDA_VISIBLE_DEVICES="0,1,2,3" INFER_TP_SIZE=4 INFER_CUDA_DEVICES=0,1,2,3 \
   ARLE_DSV4_MOE_BACKEND=allreduce \
-  ARLE_CUDA_ENABLE_DEEPGEMM_NATIVE=1 \
   DG_JIT_CACHE_DIR=/host/deepgemm-warm \
   ./target/release/arle serve --backend cuda \
     --model-path /host/DeepSeek-V4-Flash-FP8 \
