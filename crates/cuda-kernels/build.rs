@@ -1688,10 +1688,9 @@ fn compile_tilelang_aot_kernels(
     let mut generated_sources = Vec::new();
 
     // Registry-driven: one TileLangKernelSpec per kernels.toml row. Every SM
-    // target gets every kernel; the flashqla gate (sm90-only +
-    // ARLE_CUDA_ENABLE_FLASHQLA_GDR) is reproduced per-row below.
-    println!("cargo:rerun-if-env-changed=ARLE_CUDA_ENABLE_FLASHQLA_GDR");
-    let enable_flashqla_gdr = env_flag("ARLE_CUDA_ENABLE_FLASHQLA_GDR");
+    // target gets every kernel; the flashqla rows need sm_90, which is the
+    // whole gate — an env opt-in made `--qwen35-gdr-chunked` (default true) a
+    // silent no-op for three days.
     let sm90_targets: Vec<SmSpec> = sm_targets
         .iter()
         .filter(|sm| sm.sm == "90")
@@ -1699,7 +1698,7 @@ fn compile_tilelang_aot_kernels(
         .collect();
     for (spec, k) in registry_to_specs(reg) {
         if k.gate == "flashqla" {
-            if !enable_flashqla_gdr || sm90_targets.is_empty() {
+            if sm90_targets.is_empty() {
                 write_tilelang_unsupported_stub(
                     out_dir,
                     &spec.artifact_dir,
@@ -2181,7 +2180,7 @@ fn configured_capabilities(sm_targets: &[SmSpec]) -> BTreeSet<String> {
     {
         capabilities.insert("flashmla".into());
     }
-    if env_flag("ARLE_CUDA_ENABLE_FA3") && Path::new("vendor/flash-attention/hopper").is_dir() {
+    if Path::new("vendor/flash-attention/hopper").is_dir() {
         capabilities.insert("fa3".into());
     }
     let deepgemm_root = env_nonempty("ARLE_DEEPGEMM_ROOT")
@@ -2226,10 +2225,6 @@ fn producer_contract(
         ("target".into(), std::env::var("TARGET").unwrap_or_default()),
         ("host".into(), std::env::var("HOST").unwrap_or_default()),
         ("resolved_sm".into(), resolved_sms(sm_targets)),
-        (
-            "build.ARLE_CUDA_ENABLE_FLASHQLA_GDR".into(),
-            env_flag("ARLE_CUDA_ENABLE_FLASHQLA_GDR").to_string(),
-        ),
         (
             "capabilities".into(),
             capabilities.iter().cloned().collect::<Vec<_>>().join(","),
@@ -2732,16 +2727,14 @@ fn main() {
 
     // FA3 hopper fwd + bwd (hdim256/bf16/sm90) — vendored at
     // `vendor/flash-attention/` (Dao-AILab/flash-attention @ fc8cbad6, cutlass
-    // pin 71275920). Explicit opt-in (ARLE_CUDA_ENABLE_FA3=1): the
-    // instantiation units are nvcc-heavy and build.rs recompiles every .cu on
-    // any csrc change, so the cost is only paid on FA3-target builds.
-    println!("cargo:rerun-if-env-changed=ARLE_CUDA_ENABLE_FA3");
+    // pin 71275920). The vendored tree plus an sm_90 target is the whole gate:
+    // the instantiation units are nvcc-heavy, but only an sm_90 build compiles
+    // them and that is exactly the build that wants FA3.
     let fa3_root = Path::new("vendor/flash-attention");
     let fa3_stub = Path::new("csrc/attention/arle_fa3_stubs.cu");
     let fa3_shim = Path::new("csrc/attention/arle_fa3_shim.cu");
-    let enable_fa3 = env_flag("ARLE_CUDA_ENABLE_FA3")
-        && fa3_root.join("hopper").is_dir()
-        && sm_targets.iter().any(|target| target.sm == "90");
+    let enable_fa3 =
+        fa3_root.join("hopper").is_dir() && sm_targets.iter().any(|target| target.sm == "90");
     // Exactly one implementation of the FA3 FFI symbols may reach the archive
     // (same single-definition rule as the FlashMLA stub handling above).
     cu_files.retain(|p| p != fa3_stub);

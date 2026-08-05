@@ -30,7 +30,7 @@
 #                   false/omitted: build-only (FFI extern stays hand-written in
 #                   ffi/recurrent.rs for GDR/FlashQLA — see open_questions).
 #   gate         -> default | flashqla (build-time inclusion gate; flashqla rows
-#                   are sm_90-only + ARLE_CUDA_ENABLE_FLASHQLA_GDR; else stubbed)
+#                   are sm_90-only; else stubbed)
 #
 # Head-config derivation for the python SUPPORTED_HEADS lists is deferred to a
 # later tranche (the py modules still validate against their own tuples); tranche
@@ -917,7 +917,7 @@ allow_sm70 = true
 ffi = false
 
 # ===========================================================================
-# FlashQLA chunked GDR fwd — sm_90 only + ARLE_CUDA_ENABLE_FLASHQLA_GDR.
+# FlashQLA chunked GDR fwd — sm_90 only.
 # gate="flashqla": build.rs stubs (NOT_SUPPORTED) unless flag set AND sm_90 in
 # targets. build-only (ffi=false), but every row here also lands in the
 # generated `FLASHQLA_GDR_TABLE` (build.rs -> flashqla_gdr_generated.rs) that
