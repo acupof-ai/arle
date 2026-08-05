@@ -23,6 +23,10 @@ pub mod turboquant_state;
 
 pub use kv_types::{KVCacheDtype, KVFormat};
 
+/// Re-export the crate's bf16 type so downstream crates (autograd) can name the
+/// `RawDevicePtr<bf16>` the DeepGEMM wrappers expect without their own `half` dep.
+pub use half::bf16;
+
 include!(concat!(env!("OUT_DIR"), "/kernel_build_identity.rs"));
 
 #[cfg(feature = "cuda")]

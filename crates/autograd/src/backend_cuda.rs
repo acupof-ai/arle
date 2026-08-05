@@ -1172,8 +1172,127 @@ impl CudaBackend {
         a_shape: &[usize],
         storage: &CudaFp8BlockScaledStorage,
     ) -> Result<(CudaSlice<f32>, Vec<usize>)> {
+        // Native FP8 DeepGEMM for the frozen-weight forward projection `a @ bᵀ`,
+        // copying serve's `try_fp8_deepgemm_dense_batch` (quant_linear.rs:373):
+        // quantize the bf16 activation to fp8 and run the fp8 tensor-core GEMM,
+        // skipping the per-GEMM weight dequant the bf16 fallback pays. The
+        // fallback stays for the flag-off / non-conforming / non-Hopper path.
+        if crate::runtime_flags::fp8_native_gemm() {
+            if let Some(out) = self.matmul_bt_device_fp8_deepgemm(a, a_shape, storage)? {
+                return Ok(out);
+            }
+        }
         let (b_bf16, b_shape) = self.fp8_block_scaled_as_bf16(storage)?;
         self.matmul_bt_device_f32_bf16(a, a_shape, &b_bf16, &b_shape)
+    }
+
+    /// Native FP8 DeepGEMM path for `a @ bᵀ` with a frozen block-scaled weight.
+    /// Returns `None` when the shape/hardware does not meet DeepGEMM's contract
+    /// (128×128 blocks, `rows%8==0`, `cols%128==0`, SM≥9) so the caller falls
+    /// back to the bf16 dequant GEMM.
+    #[cfg(not(feature = "no-cuda"))]
+    fn matmul_bt_device_fp8_deepgemm(
+        &self,
+        a: &CudaSlice<f32>,
+        a_shape: &[usize],
+        storage: &CudaFp8BlockScaledStorage,
+    ) -> Result<Option<(CudaSlice<f32>, Vec<usize>)>> {
+        use cuda_kernels::tensor::cache_ptr_on;
+        let (weight, scales, rows, cols, block_m, block_k) =
+            self.cuda_fp8_block_scaled_storage(storage)?;
+        if a_shape.len() != 2 {
+            return Err(AutogradError::InvalidRank {
+                expected: "fp8 matmul_bt lhs must be rank-2",
+                got: a_shape.len(),
+            });
+        }
+        let m = a_shape[0];
+        let (n, k) = (rows, cols);
+        let shape_ok = block_m == 128
+            && block_k == 128
+            && n.is_multiple_of(8)
+            && k.is_multiple_of(128)
+            && self.fp8_deepgemm_sm_ok();
+        if !shape_ok || m == 0 {
+            return Ok(None);
+        }
+
+        let a_bf16 = self.local_f32_as_bf16(a, a.len())?; // reuses the bf16-GEMM cast
+        let scale_stride_m = m.div_ceil(4) * 4; // TMA 4-row alignment of the activation scales
+        let scale_cols = k.div_ceil(128);
+        let input_fp8 = self
+            .stream
+            .alloc_zeros::<u8>(m * k)
+            .map_err(|_| cuda_alloc_failed("fp8 deepgemm input", vec![m, k]))?;
+        let input_scales = self
+            .stream
+            .alloc_zeros::<f32>(scale_stride_m * scale_cols)
+            .map_err(|_| {
+                cuda_alloc_failed("fp8 deepgemm scales", vec![scale_stride_m, scale_cols])
+            })?;
+        let out_bf16 = self
+            .stream
+            .alloc_zeros::<u16>(m * n)
+            .map_err(|_| cuda_alloc_failed("fp8 deepgemm out", vec![m, n]))?;
+        // Single-group quantize metadata: one dense "expert" covering all m rows.
+        let active_experts = self
+            .stream
+            .memcpy_stod(&[0i32])
+            .map_err(|_| AutogradError::TapeInvariant("fp8 deepgemm active_experts H2D failed"))?;
+        let active_offsets = self
+            .stream
+            .memcpy_stod(&[0i32])
+            .map_err(|_| AutogradError::TapeInvariant("fp8 deepgemm active_offsets H2D failed"))?;
+        let m_i32 = i32::try_from(m)
+            .map_err(|_| AutogradError::TapeInvariant("fp8 deepgemm m exceeds i32"))?;
+        let active_counts = self
+            .stream
+            .memcpy_stod(&[m_i32])
+            .map_err(|_| AutogradError::TapeInvariant("fp8 deepgemm active_counts H2D failed"))?;
+
+        let s = &self.stream;
+        // SAFETY: every ptr is a live device allocation sized to the dims passed.
+        unsafe {
+            cuda_kernels::moe::dsv4_deepgemm_pack_quantize_bf16_to_fp8(
+                cache_ptr_on(&a_bf16, s).cast::<cuda_kernels::bf16>(),
+                cache_ptr_on(&input_fp8, s),
+                cache_ptr_on(&input_scales, s),
+                cache_ptr_on(&active_experts, s),
+                cache_ptr_on(&active_offsets, s),
+                cache_ptr_on(&active_counts, s),
+                1,
+                m,
+                k,
+                scale_stride_m,
+                s.cu_stream(),
+            )
+            .map_err(|_| AutogradError::TapeInvariant("fp8 deepgemm pack_quantize failed"))?;
+            cuda_kernels::moe::dsv4_deepgemm_fp8_gemm_nt(
+                cache_ptr_on(&input_fp8, s),
+                cache_ptr_on(&input_scales, s),
+                cache_ptr_on(weight, s),
+                cache_ptr_on(scales, s),
+                cache_ptr_on(&out_bf16, s).cast::<cuda_kernels::bf16>(),
+                m,
+                n,
+                k,
+                scale_stride_m,
+                s.cu_stream(),
+            )
+            .map_err(|_| AutogradError::TapeInvariant("fp8 deepgemm gemm_nt failed"))?;
+        }
+        let out_f32 = self.import_local_bf16_as_f32(&out_bf16, m * n)?;
+        Ok(Some((out_f32, vec![m, n])))
+    }
+
+    /// DeepGEMM FP8 needs Hopper+ (sm_90 / sm_100). Major ≥ 9.
+    #[cfg(not(feature = "no-cuda"))]
+    fn fp8_deepgemm_sm_ok(&self) -> bool {
+        use cudarc::driver::sys::CUdevice_attribute as Attr;
+        self.stream
+            .context()
+            .attribute(Attr::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)
+            .is_ok_and(|v| v >= 9)
     }
 
     #[cfg(not(feature = "no-cuda"))]
