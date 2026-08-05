@@ -1288,6 +1288,11 @@ pub(crate) struct TrainSpecDraftArgs {
     #[arg(long, default_value_t = 512, value_parser = parse_positive_usize)]
     pub(crate) num_anchors: usize,
 
+    /// Blocks per backward — the VRAM knob. Attention scores and logits both
+    /// scale with it; all 512 anchors at once is ~82 GiB of activation.
+    #[arg(long, default_value_t = 32, value_parser = parse_positive_usize)]
+    pub(crate) blocks_per_backward: usize,
+
     #[arg(long, default_value_t = 6e-4)]
     pub(crate) lr: f32,
 
