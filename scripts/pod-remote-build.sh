@@ -227,7 +227,9 @@ PY
       rc=1
     fi
     if [ "$rc" -eq 0 ]; then
-      embedded_id="$($binary --kernel-build-id)" || rc=1
+      # First line only: `--kernel-build-id` also prints a `capabilities:` line
+      # (06a27527e), and comparing the whole output failed every green build.
+      embedded_id="$($binary --kernel-build-id | head -n1)" || rc=1
       [ "$embedded_id" != unreported ] && [ "$embedded_id" = "$producer_id" ] || rc=1
     fi
     write_receipt "$RECEIPT" "schema=arle-build-v1" "operation=$OP" "label=$LABEL" "tree=$TREE" "source_head=${source_head:-}" "source_digest=${source_digest_value:-}" "argv_file=$DIR/argv.nul" "argv_sha=$(argv_sha256 "$DIR/argv.nul")" "binary=$binary" "binary_sha=$binary_sha" "cargo_out_dir=${cargo_out_dir:-}" "producer_manifest=$manifest" "producer_manifest_sha=$manifest_sha" "producer_id=$producer_id" "embedded_id=$embedded_id" "kernel_id=$producer_id" "exit=$rc" "pid=$$" "pgid=$(ps -o pgid= -p $$ | tr -d ' ')" "start=$(proc_start $$)" "finished_at=$(date -u +%FT%TZ)"
