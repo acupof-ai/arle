@@ -303,7 +303,23 @@ Both ranks print identical loss and grad_norm (post-all-reduce). Reproduces the
 2026-08-04 FA3 reference (10.871086 / 2.264733 / ~212 s) to 6-decimal loss and
 0.06% grad-norm; the +6% on step is shared-box variance.
 
-## CHAMPION — 27B, cp=2, seq=81920 · `e675f031b` (2026-08-05)
+## CHAMPION — 27B, cp=2, seq=81920 · FlashQLA default-on `fa742a038` (2026-08-05)
+
+FlashQLA GDN chunkwise backward is the default (`--gdr-chunkwise-prefill=true`).
+Same harness (`/host/fqgate.sh perf_on`), same seq, only variable is the flag.
+
+| | rank 0 | rank 1 | recurrent (below) | speedup |
+|---|---:|---:|---:|---:|
+| forward | 64.124 s | 64.125 s | 81.0 s | 1.26× |
+| fused CE | 0.83 s | 0.83 s | 1.91 s | — |
+| backward | 312.643 s | 312.648 s | 670.275 s | **2.14×** |
+| **step** | **378.723 s** | **378.723 s** | 752.956 s | **1.99×** |
+
+Peak host RSS 55.4 GB, loss 4.537510, grad_norm 7.976866, RUN_EXIT=0. The 71%
+`linear_attention_chunked_scan_backward_f32` row is gone. `--la-backward-mono`
+forces the recurrent arm below.
+
+## Recurrent GDN backward (pre-FlashQLA A/B baseline) — 27B, cp=2, seq=81920 · `e675f031b` (2026-08-05)
 
 | | rank 0 | rank 1 |
 |---|---:|---:|
