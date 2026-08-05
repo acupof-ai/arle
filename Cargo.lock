@@ -3102,12 +3102,17 @@ dependencies = [
 name = "spec-train"
 version = "0.4.0"
 dependencies = [
+ "ahash",
  "anyhow",
  "autograd",
+ "chat",
  "half",
  "memmap2",
  "qwen35-spec",
  "safetensors",
+ "serde",
+ "serde_json",
+ "tokenizers",
 ]
 
 [[package]]

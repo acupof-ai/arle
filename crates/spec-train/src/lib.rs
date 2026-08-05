@@ -11,6 +11,8 @@
 pub mod backbone;
 #[path = "block.rs"]
 pub mod block;
+#[path = "data.rs"]
+pub mod data;
 #[path = "iso_spectrum.rs"]
 pub mod iso_spectrum;
 #[path = "loss.rs"]
