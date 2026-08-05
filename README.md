@@ -115,18 +115,18 @@ A 35B-A3B MoE decodes as fast as the 4B dense — only ~3B params activate per t
 
 Qwen3.6-27B (OptiQ 4/8-bit): the model's own NextN/MTP head drafts, the base verifies — **output is bit-identical to greedy**, **12.3 → 17.75 tok/s (+44%)**, past the 15.2 tok/s HBM floor no kernel can reach.
 
-### NVIDIA (8×H20, single GPU, FP8)
+### NVIDIA (one H20)
 
-Measured on H20 (96 GB), `--spec-type mtp --mtp-draft-tokens 2`, greedy verification (topk=1).
+The real workload: 32K-token multi-turn agent prompts, not a synthetic short prompt.
 
-| Model | c=1 | c=4 | c=8 |
+| Qwen3.6, 1×H20 | c=1 | c=8 | c=16 |
 |---|---:|---:|---:|
-| Qwen3.6-27B (FP8, no MTP) | 39.8 tok/s | 63.4 tok/s | 86.8 tok/s |
-| Qwen3.6-27B (FP8, MTP×2) | 41.4 tok/s (+4%) | 64.9 tok/s (+2%) | 88.1 tok/s (+1.5%) |
-| Qwen3.6-35B-A3B (FP8 MoE, no MTP) | 78.7 tok/s | 119.0 tok/s | 182.8 tok/s |
-| Qwen3.6-35B-A3B (FP8 MoE, MTP×2) | 79.2 tok/s (+0.6%) | 119.6 tok/s (+0.5%) | 186.0 tok/s (+1.7%) |
+| 35B-A3B MoE — decode tok/s | 61.7 | 22.7 | 13.6 |
+| 35B-A3B MoE — total tok/s | 6,707 | 27,968 | 33,859 |
+| 27B dense — decode tok/s | 34.7 | 12.2 | 8.2 |
+| 27B dense — total tok/s | 5,028 | 24,703 | 30,046 |
 
-The 35B-A3B hybrid MoE (30 linear-attention + 10 full-attention layers, 256 experts, 8/tok) decodes ~2× faster than the 27B dense model at the same quant level. MTP gains are modest at greedy topk=1; higher draft token counts and topk can increase the speedup.
+The 35B-A3B MoE decodes ~1.8× faster than the 27B dense at the same quant — only ~3B params activate per token. `total tok/s` is capacity (prompt + generated over wall clock); `decode tok/s` is single-stream latency. Build `a956f69b1`; the DSpark block drafter lifts c=1 further — rows in [docs/baselines.md](docs/baselines.md).
 
 ### Against SGLang
 

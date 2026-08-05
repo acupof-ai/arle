@@ -89,7 +89,18 @@ print(client.chat.completions.create(
 
 <sub>质量不掉:PPL 7.82(vs uniform-4bit 8.56)· 68.8% 草稿接受率 · 默认开,<code>--no-speculative</code> 可关。</sub>
 
-**NVIDIA —— DeepSeek-V4-Flash,8×H20(TP=8 / EP=8,FP8 MoE)。** B=1 decode **53 tok/s**(prefill 23 ms);并发批量 decode lane 在 c=8 再 **+48%**。
+**NVIDIA —— 单卡 H20,32K 多轮 agent prompt**(不是短 prompt 合成负载):
+
+| Qwen3.6 · 1×H20 | c=1 | c=8 | c=16 |
+|---|---:|---:|---:|
+| 35B-A3B MoE —— decode tok/s | 61.7 | 22.7 | 13.6 |
+| 35B-A3B MoE —— total tok/s | 6,707 | 27,968 | 33,859 |
+| 27B dense —— decode tok/s | 34.7 | 12.2 | 8.2 |
+| 27B dense —— total tok/s | 5,028 | 24,703 | 30,046 |
+
+<sub>build <code>a956f69b1</code> · <code>total tok/s</code> 是吞吐(prompt+生成 / 墙钟),<code>decode tok/s</code> 是单流延迟 · DSpark 块草稿器在 c=1 还能再抬,见 <a href="docs/baselines.md">baselines</a></sub>
+
+**DeepSeek-V4-Flash,8×H20(TP=8 / EP=8,FP8 MoE)。** B=1 decode **53 tok/s**(prefill 23 ms);并发批量 decode lane 在 c=8 再 **+48%**。
 
 **对比 SGLang。** 同一份权重、同一块卡、同一个量化 kernel —— SGLang 跑的是我们 checkpoint 的重打包版。Qwen3.6-27B,单卡 H20,33K prompt,单请求:decode 每 token **16.69 ms vs 17.16**,快 2.8%;33K prefill **25.0 s vs 21.0**,慢 19% —— 这是当前在做的事。数据见 [docs/baselines.md](docs/baselines.md)。
 
