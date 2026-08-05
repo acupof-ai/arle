@@ -26,9 +26,11 @@ def function_body(name):
     raise AssertionError(f"unterminated function: {name}")
 
 contract = function_body("producer_contract")
-assert '"build.ARLE_CUDA_ENABLE_FLASHQLA_GDR"' in contract
-assert 'env_flag("ARLE_CUDA_ENABLE_FLASHQLA_GDR")' in contract
 capabilities = function_body("configured_capabilities")
+# FlashQLA GDR is gated by sm_90 presence, not a build env opt-in — the
+# capability lands in the producer contract's `capabilities` field.
+assert 'capabilities.insert("flashqla"' in capabilities
+assert 'spec.sm == "90"' in capabilities
 assert 'env_nonempty("ARLE_DEEPEP_DIR")' in capabilities
 assert "ARLE_DEEPEP_SIDECAR_PREBUILT" not in capabilities
 required = function_body("required_symbols")

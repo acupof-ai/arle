@@ -51,7 +51,7 @@ pub(crate) fn run_spec_draft(args: TrainSpecDraftArgs) -> Result<()> {
 
     // The draft's parameters live on the same device the trunk forward runs on.
     let backend: std::sync::Arc<dyn autograd::Backend> =
-        std::sync::Arc::new(autograd::CudaBackend::new(0)?);
+        std::sync::Arc::new(autograd::backend_cuda::CudaBackend::new(0)?);
     let mut store = TensorStore::with_backend(backend);
     let embed = backbone::load_frozen(
         &args.model_path,

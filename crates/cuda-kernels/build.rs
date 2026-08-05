@@ -2551,7 +2551,8 @@ fn main() {
     emit_flashqla_gdr_generated(&registry, &early_out_dir);
     std::fs::write(
         early_out_dir.join("kernel_build_identity.rs"),
-        "pub const KERNEL_BUILD_ID: &str = \"not-built\";\n",
+        "pub const KERNEL_BUILD_ID: &str = \"not-built\";\n\
+         pub const KERNEL_CAPABILITIES: &str = \"\";\n",
     )
     .expect("write initial kernel build identity");
     println!("cargo:rerun-if-env-changed=ARLE_TILELANG_TOOLCHAIN_PROBE_SELF_TEST");
