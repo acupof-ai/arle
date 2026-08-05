@@ -3105,6 +3105,8 @@ dependencies = [
  "anyhow",
  "autograd",
  "half",
+ "memmap2",
+ "qwen35-spec",
  "safetensors",
 ]
 
