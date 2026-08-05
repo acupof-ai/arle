@@ -174,22 +174,30 @@ temperature 0, seed 20260416. TTFT is cold — 16 distinct prompts, no prefix
 hits. SGLang 0.5.13 row serves the GPTQ v1 twin repacked by
 `scripts/w8a16_to_gptq.py` — identical int8 values, identical kernel.
 
-### CHAMPION — `e1017b40d` (2026-08-04)
+### CHAMPION — `6e3f68fac` (2026-08-05)
 
-Two reps per arm, interleaved; both reps agree to 0.03 ms ITL / 0.03 s TTFT.
+Two reps per arm; reps agree to 0.08 s TTFT / 0.02 ms ITL. P/D reported
+separately: `prefill tok/s = prompt_tokens / TTFT` (33000 prompt tokens),
+`decode tok/s = 1 / ITL`.
 
-| arm | TTFT p50 | ITL p50 | ITL p99 | e2e p50 | out tok/s |
-|---|---:|---:|---:|---:|---:|
-| ARLE | 31.08 s | **16.66** | 20.17 | 35.49 s | 7.63 |
-| SGLang, same kernel + same weights | **21.03 s** | 17.14 | 19.39 | **25.44 s** | 10.57 |
+| arm | TTFT p50 | prefill tok/s | ITL p50 | decode tok/s | ITL p99 | e2e p50 |
+|---|---:|---:|---:|---:|---:|---:|
+| ARLE | 25.01 s | 1329 | **16.69** | **59.9** | 20.22 | 29.45 s |
+| SGLang, same kernel + same weights | **21.03 s** | **1568** | 17.16 | 58.3 | **19.19** | **25.44 s** |
 
-Prior champions 18.98 ms (`f6820efa9`), 26.88 (`3ca42b44a`).
+Prior champions: TTFT 31.08 s (`e1017b40d`), ITL 18.98 ms (`f6820efa9`),
+26.88 (`3ca42b44a`).
 
-Decode leads by 2.8%; ARLE's Σ kernel is 0.07 ms higher and its host tail
-0.061 ms against SGLang's ~0.6, which is where the ITL lead comes from. p99 is
-4% behind. **TTFT is 1.48× behind and unchanged since 2026-08-02 (30.5 s)** —
-every accepted optimization since then landed on decode.
+Decode leads by 2.8%. TTFT is 1.19× behind, down from 1.48× — FlashQLA chunked
+GDR had never been compiled into the pod binary and prefill ran the serial
+recurrent scan. **The whole remaining prefill gap is 3.8 s of GPU idle** (ARLE
+3.97 s vs SGLang 0.19 s over a cold 33K prefill); GPU-busy time is within
+0.93 s. p99 is 5% behind.
 
+`--chunked-prefill-size` is not a lever on either stack: 2048 vs 4096 (ARLE)
+and 4096 vs 8192 (SGLang) all land inside 0.07 s TTFT.
+
+[FlashQLA stub build + prefill ledger](experience/wins/2026-08-05-flashqla-was-never-compiled-into-the-pod-binary.md) ·
 [decode budget, both stacks](experience/wins/2026-08-04-w8a16-decode-step-kernel-budget.md) ·
 [FA3 splits](experience/wins/2026-08-04-fa3-decode-splits-fill-the-sms.md) ·
 [conv1d fusion](experience/wins/2026-08-04-conv1d-decode-fusion.md) ·
