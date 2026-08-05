@@ -3087,6 +3087,10 @@ fn main() {
     if enable_fa3 {
         capabilities.insert("fa3".into());
     }
+    // Same condition `compile_tilelang_aot_kernels` gates the flashqla rows on.
+    if sm_targets.iter().any(|spec| spec.sm == "90") {
+        capabilities.insert("flashqla".into());
+    }
 
     compile_tilelang_aot_kernels(&registry, &cuda_path, &out_dir, &sm_targets);
 
