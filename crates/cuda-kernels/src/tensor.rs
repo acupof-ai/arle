@@ -4108,6 +4108,16 @@ impl HiddenStates {
         self.data.len() * std::mem::size_of::<bf16>()
     }
 
+    /// Copy to host as f32, token-major `[seq_len, hidden_dim]`.
+    pub fn to_host(&self, ctx: &DeviceContext) -> Result<Vec<f32>> {
+        let host = ctx
+            .stream
+            .clone_dtoh(&self.data)
+            .map_err(|e| anyhow!("D2H copy failed: {}", e))?;
+        ctx.sync()?;
+        Ok(host.iter().map(|x| x.to_f32()).collect())
+    }
+
     /// Borrowed view over the whole buffer (`seq_len` columns).
     pub fn as_view(&self) -> HiddenStatesView<'_> {
         HiddenStatesView {

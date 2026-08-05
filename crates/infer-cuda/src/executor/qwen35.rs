@@ -3598,6 +3598,82 @@ impl Qwen35CudaExecutor {
         result
     }
 
+    /// One-shot trunk forward for offline DSpark draft training: the raw taps
+    /// at `target_layer_ids` as `[seq, taps·hidden]` and the final-normed
+    /// hidden states as `[seq, hidden]`, both host-side.
+    ///
+    /// Same transient-slot discipline as [`Self::forward_token_logits`] — a
+    /// private slot and borrowed KV pages, returned before this returns — so it
+    /// never disturbs the serving slots.
+    pub(crate) fn forward_training_taps(
+        &mut self,
+        input_ids: &[u32],
+        target_layer_ids: &[i64],
+    ) -> Result<(Vec<f32>, Vec<f32>)> {
+        self.ensure_not_collective("forward_training_taps")?;
+        ensure!(
+            !input_ids.is_empty(),
+            "forward_training_taps requires a non-empty token sequence"
+        );
+        let mut taps = crate::qwen35::dspark::Qwen35DsparkTaps::default();
+        let mut slot = self.model.new_slot_state();
+        let (num_linear, gdr_len, conv_len) = self.model.recurrent_dims();
+        let mut scratch_pool = Vec::new();
+        slot.acquire_recurrent(
+            &self.model.ctx,
+            num_linear,
+            gdr_len,
+            conv_len,
+            &mut scratch_pool,
+        )?;
+        if self.full_attn_kv.is_none() {
+            return self.model.forward_training_taps(
+                &mut slot,
+                &mut self.workspace,
+                &mut taps,
+                target_layer_ids,
+                input_ids,
+                None,
+            );
+        }
+        let pool_probe = self.full_attn_kv.as_ref().expect("full_attn_kv present");
+        let kv_slot = (0..self.slots.len())
+            .find(|&s| pool_probe.seq_len(s) == 0 && self.slots[s].seq_len() == 0)
+            .ok_or_else(|| {
+                anyhow::anyhow!("forward_training_taps: no free KV slot for the transient forward")
+            })?;
+        let Self {
+            model,
+            workspace,
+            full_attn_kv,
+            ..
+        } = self;
+        let pool = full_attn_kv.as_mut().expect("full_attn_kv present");
+        let scratch = pool.alloc_detached_pages(input_ids.len().div_ceil(pool.page_size))?;
+        pool.mirror_slot(kv_slot, &scratch, input_ids.len())?;
+        let result =
+            crate::loader::PageMeta::for_slot(&model.ctx, pool, kv_slot, 0, input_ids.len())
+                .and_then(|meta| {
+                    let mut rc = crate::qwen35::Qwen35RecallForward {
+                        pool,
+                        meta: &meta,
+                        layer0_query: None,
+                    };
+                    model.forward_training_taps(
+                        &mut slot,
+                        workspace,
+                        &mut taps,
+                        target_layer_ids,
+                        input_ids,
+                        Some(&mut rc),
+                    )
+                });
+        let pool = self.full_attn_kv.as_mut().expect("full_attn_kv present");
+        pool.mirror_slot(kv_slot, &[], 0)?;
+        pool.release_pages(&scratch);
+        result
+    }
+
     pub(crate) fn device(&self) -> &DeviceContext {
         &self.model.ctx
     }
