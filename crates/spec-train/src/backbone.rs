@@ -132,7 +132,11 @@ impl Draft {
         let (cos, sin) = rope_tables(&positions, hd, c.rope_theta, store)?;
         let (cos_q, sin_q) = rope_tables(&positions[ctx_len..], hd, c.rope_theta, store)?;
 
-        let mask = store.from_slice(&crate::mask::additive(blocks, ctx_len), &[1, rows, kv_len])?;
+        let window = (!c.layer_types.is_empty()).then_some(c.sliding_window);
+        let mask = store.from_slice(
+            &crate::mask::additive(blocks, ctx_len, window),
+            &[1, rows, kv_len],
+        )?;
 
         for l in &self.layers {
             let normed = ops::rmsnorm(h, l.input_layernorm, c.rms_norm_eps, store, tape)?;

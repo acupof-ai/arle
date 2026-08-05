@@ -99,8 +99,19 @@ pub(crate) fn run_spec_draft(args: TrainSpecDraftArgs) -> Result<()> {
     let train_cfg = trainer::Config {
         lr: args.lr,
         num_anchors: args.num_anchors,
+        blocks_per_backward: args.blocks_per_backward,
         ..trainer::Config::default()
     };
+    println!(
+        "peak activation {:.1} GiB/backward",
+        trainer::peak_activation_bytes(
+            &draft.cfg,
+            args.blocks_per_backward,
+            args.max_len,
+            trunk.vocab_size,
+        ) as f64
+            / (1u64 << 30) as f64
+    );
     let mut trainer = trainer::Trainer::new(draft, train_cfg, args.steps);
     let mut tape = Tape::new();
 
