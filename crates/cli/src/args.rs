@@ -1246,12 +1246,60 @@ pub(crate) enum TrainCommand {
     /// Perplexity (PPL) over a text corpus via teacher-forced logits — a quality
     /// calibration for FP8 / quant checkpoints. CUDA-only (forward_token_logits).
     Ppl(TrainPplArgs),
+    /// Offline DSpark speculative-decoding draft training: anchored blocks
+    /// against the trunk's own taps and logits. CUDA-only (the trunk forward is
+    /// `LoadedInferenceEngine::forward_training_taps`).
+    SpecDraft(TrainSpecDraftArgs),
 }
 
 #[derive(Debug, Clone, ClapArgs)]
 #[command(
     after_help = "Examples:\n  arle train ppl --model-path checkpoints/base --corpus wikitext.txt\n  arle train ppl --model-path ckpt-fp8 --corpus corpus.txt --ctx 2048 --max-windows 8 --json"
 )]
+pub(crate) struct TrainSpecDraftArgs {
+    /// Target model directory. Supplies the trunk forward, the tokenizer, and
+    /// the embeddings + lm_head the draft shares with it.
+    #[arg(long, value_name = "PATH")]
+    pub(crate) model_path: PathBuf,
+
+    /// Draft directory: `config.json` always, weights only to warm-start.
+    /// Config alone trains from scratch, which is what the reference does.
+    #[arg(long, value_name = "PATH")]
+    pub(crate) draft: PathBuf,
+
+    /// Conversations JSONL from `scripts/spec_train_data.py regen`.
+    #[arg(long, value_name = "PATH")]
+    pub(crate) data: PathBuf,
+
+    /// Where to write the trained draft.
+    #[arg(long, value_name = "PATH")]
+    pub(crate) out: PathBuf,
+
+    #[arg(long, default_value_t = 1000, value_parser = parse_positive_usize)]
+    pub(crate) steps: usize,
+
+    /// Samples per optimizer step.
+    #[arg(long, default_value_t = 8, value_parser = parse_positive_usize)]
+    pub(crate) batch: usize,
+
+    #[arg(long, default_value_t = 4096, value_parser = parse_positive_usize)]
+    pub(crate) max_len: usize,
+
+    #[arg(long, default_value_t = 512, value_parser = parse_positive_usize)]
+    pub(crate) num_anchors: usize,
+
+    #[arg(long, default_value_t = 6e-4)]
+    pub(crate) lr: f32,
+
+    /// Markov head rank; 0 trains a draft without one.
+    #[arg(long, default_value_t = 256)]
+    pub(crate) markov_rank: usize,
+
+    #[arg(long, default_value_t = 100, value_parser = parse_positive_usize)]
+    pub(crate) save_every: usize,
+}
+
+#[derive(Debug, Clone, ClapArgs)]
 pub(crate) struct TrainPplArgs {
     /// Model directory (local path or HF id) to score.
     #[arg(long, value_name = "PATH")]

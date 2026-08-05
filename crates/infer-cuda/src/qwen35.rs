@@ -42,7 +42,7 @@ use cuda_kernels::tensor::{
     HostMatrixSnapshot, WeightFormat, cache_ptr, offload_raw_slice, reload_raw_slice,
 };
 use cudarc::driver::{
-    CudaSlice, CudaView, CudaViewMut, DevicePtr, DevicePtrMut, sys::CUevent_flags,
+    CudaSlice, CudaView, CudaViewMut, DevicePtr, DevicePtrMut, PinnedHostSlice, sys::CUevent_flags,
 };
 use half::bf16;
 use infer_plan::SamplingParams;
@@ -1127,6 +1127,11 @@ pub(crate) struct Qwen35SlotState {
     gdr_states: Vec<CudaSlice<f32>>,
     /// `[num_linear_layers]` conv1d rings (`qkv_dim*(kernel-1)` bf16).
     conv_states: Vec<DeviceVec>,
+    /// Reusable pinned staging for [`Self::snapshot_recurrent`]. A `Vec`/`[T]`
+    /// destination makes every `memcpy_dtoh` a full stream synchronize
+    /// (cudarc `SyncOnDrop::Sync`); a pinned slice syncs on its own event.
+    gdr_pinned: Vec<PinnedHostSlice<f32>>,
+    conv_pinned: Vec<PinnedHostSlice<bf16>>,
     /// True once `acquire_recurrent` has run for the current occupant (even
     /// when `num_linear == 0` and the state vecs are empty). Guards the
     /// forward's `has_recurrent()` chokepoint against a missed acquire.
@@ -1274,6 +1279,8 @@ impl Qwen35SlotState {
             v_caches: Vec::new(),
             gdr_states: Vec::new(),
             conv_states: Vec::new(),
+            gdr_pinned: Vec::new(),
+            conv_pinned: Vec::new(),
             recurrent_acquired: false,
             seq_len: 0,
         }
@@ -1369,7 +1376,7 @@ impl Qwen35SlotState {
     /// device work) so `restore_recurrent_from_snapshot` (0==0 dims, no-op zips)
     /// stays consistent.
     pub(crate) fn snapshot_recurrent(
-        &self,
+        &mut self,
         ctx: &DeviceContext,
     ) -> Result<Qwen35RecurrentSnapshot> {
         if self.gdr_states.is_empty() {
@@ -1378,28 +1385,68 @@ impl Qwen35SlotState {
                 conv: Vec::new(),
             });
         }
+        self.ensure_snapshot_staging(ctx)?;
+        for (state, dst) in self.gdr_states.iter().zip(self.gdr_pinned.iter_mut()) {
+            ctx.stream
+                .memcpy_dtoh(state, dst)
+                .map_err(|e| anyhow!("gdr D2H failed: {e}"))?;
+        }
+        for (state, dst) in self.conv_states.iter().zip(self.conv_pinned.iter_mut()) {
+            ctx.stream
+                .memcpy_dtoh(&state.data, dst)
+                .map_err(|e| anyhow!("conv D2H failed: {e}"))?;
+        }
+        // No stream synchronize: `as_slice` waits on each pinned buffer's own
+        // event, and stream order already keeps the next chunk off the state.
         let gdr = self
-            .gdr_states
+            .gdr_pinned
             .iter()
-            .map(|s| {
-                ctx.stream
-                    .clone_dtoh(s)
-                    .map_err(|e| anyhow!("gdr D2H failed: {e}"))
+            .map(|p| {
+                p.as_slice()
+                    .map(<[f32]>::to_vec)
+                    .map_err(|e| anyhow!("gdr pinned read failed: {e}"))
             })
             .collect::<Result<Vec<_>>>()?;
         let conv = self
-            .conv_states
+            .conv_pinned
             .iter()
-            .map(|c| {
-                ctx.stream
-                    .clone_dtoh(&c.data)
-                    .map_err(|e| anyhow!("conv D2H failed: {e}"))
+            .map(|p| {
+                p.as_slice()
+                    .map(<[bf16]>::to_vec)
+                    .map_err(|e| anyhow!("conv pinned read failed: {e}"))
             })
             .collect::<Result<Vec<_>>>()?;
-        ctx.stream
-            .synchronize()
-            .map_err(|e| anyhow!("sync after recurrent snapshot: {e}"))?;
         Ok(Qwen35RecurrentSnapshot { gdr, conv })
+    }
+
+    /// Allocate the pinned snapshot staging once per occupant. Sizes follow the
+    /// live state vectors, which `acquire_recurrent` fixes for the request.
+    fn ensure_snapshot_staging(&mut self, ctx: &DeviceContext) -> Result<()> {
+        if self.gdr_pinned.len() == self.gdr_states.len()
+            && self.conv_pinned.len() == self.conv_states.len()
+        {
+            return Ok(());
+        }
+        self.gdr_pinned.clear();
+        self.conv_pinned.clear();
+        for state in &self.gdr_states {
+            // SAFETY: the buffer is written only by the D2H above, after which
+            // `synchronize` has completed it; freed with the slot state.
+            self.gdr_pinned.push(unsafe {
+                ctx.ctx
+                    .alloc_pinned::<f32>(state.len())
+                    .map_err(|e| anyhow!("alloc pinned gdr staging failed: {e}"))?
+            });
+        }
+        for state in &self.conv_states {
+            // SAFETY: as above.
+            self.conv_pinned.push(unsafe {
+                ctx.ctx
+                    .alloc_pinned::<bf16>(state.data.len())
+                    .map_err(|e| anyhow!("alloc pinned conv staging failed: {e}"))?
+            });
+        }
+        Ok(())
     }
 
     /// H2D restore from a sidecar snapshot. The slot MUST have acquired recurrent
@@ -4535,6 +4582,63 @@ impl Qwen35Model {
             label: "qwen35_verify_logits[seq,vocab]",
         };
         Ok((logits_vec, [seq_len, vocab], hiddens))
+    }
+
+    /// Trunk forward for offline DSpark draft training: the raw residual-stream
+    /// taps at `target_layer_ids` as `[seq, taps·hidden]`, and the final-normed
+    /// hidden states as `[seq, hidden]`, both on the host.
+    ///
+    /// Serving fuses the taps on device and never materializes them; training
+    /// needs them raw because `fc`/`hidden_norm` are the parameters being
+    /// learned. No lm-head GEMM here — the draft's distillation target is
+    /// computed from `last_hidden` against the same weights on the train side.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_training_taps(
+        &self,
+        slot: &mut Qwen35SlotState,
+        ws: &mut Qwen35Workspace,
+        taps: &mut dspark::Qwen35DsparkTaps,
+        target_layer_ids: &[i64],
+        tokens: &[u32],
+        recall: Option<&mut Qwen35RecallForward>,
+    ) -> Result<(Vec<f32>, Vec<f32>)> {
+        ensure!(!tokens.is_empty(), "training forward needs tokens");
+        ensure!(
+            !target_layer_ids.is_empty(),
+            "training forward needs target_layer_ids"
+        );
+        let seq_len = tokens.len();
+        let hidden_size = self.config.hidden_size;
+        taps.prepare(target_layer_ids, hidden_size, seq_len);
+        self.forward_hidden_capture(slot, ws, tokens, 0, None, recall, Some(taps))?;
+
+        // Taps come off first: the final norm below reuses `ws.normed`, and a
+        // tap buffer is the draft's only view of the trunk's interior.
+        let ntaps = target_layer_ids.len();
+        let mut features = vec![0.0f32; seq_len * ntaps * hidden_size];
+        for t in 0..ntaps {
+            let tap = taps.tap_to_host(&self.ctx, t)?;
+            for r in 0..seq_len {
+                let dst = r * ntaps * hidden_size + t * hidden_size;
+                features[dst..dst + hidden_size]
+                    .copy_from_slice(&tap[r * hidden_size..][..hidden_size]);
+            }
+        }
+        taps.release();
+
+        let Qwen35Workspace { hidden, normed, .. } = ws;
+        let hidden = hidden.get(&self.ctx, hidden_size, seq_len)?;
+        let normed = normed.get(&self.ctx, hidden_size, seq_len)?;
+        rms_norm_offset(
+            &self.ctx,
+            hidden,
+            &self.norm,
+            self.config.rms_norm_eps,
+            normed,
+        )?;
+        self.ctx.sync()?;
+        let last_hidden = normed.to_host(&self.ctx)?;
+        Ok((features, last_hidden))
     }
 
     /// One NextN-MTP draft level: given the previous chain token `token` and its

@@ -25,6 +25,7 @@ use crate::{
         OpdSftAnchorArg, OpdTeacherRuntimeArg, PretrainPresetArg, SaveDtypeArg, TapeDtypeArg,
         TrainAgentOpdArgs, TrainArgs, TrainCcConvertArgs, TrainCommand, TrainEnvArgs,
         TrainEstimateMemoryArgs, TrainOpdArgs, TrainPplArgs, TrainRubricOpdArgs, TrainSelfOpdArgs,
+        TrainSpecDraftArgs,
     },
     hardware, hub_discovery,
 };
@@ -100,6 +101,7 @@ pub(crate) fn run_train(train: TrainArgs) -> ExitCode {
         }
         TrainCommand::CcConvert(args) => exit_from_result(run_cc_convert_impl(args)),
         TrainCommand::Ppl(args) => exit_from_result(run_ppl(args)),
+        TrainCommand::SpecDraft(args) => exit_from_result(run_spec_draft(args)),
     }
 }
 
@@ -197,6 +199,14 @@ fn run_ppl(args: TrainPplArgs) -> Result<()> {
 #[cfg(not(feature = "cuda"))]
 fn run_ppl(_args: TrainPplArgs) -> Result<()> {
     bail!("arle train ppl requires the CUDA backend (forward_token_logits is CUDA-only)")
+}
+
+#[cfg(feature = "cuda")]
+use crate::spec_train_target::run_spec_draft;
+
+#[cfg(not(feature = "cuda"))]
+fn run_spec_draft(_args: TrainSpecDraftArgs) -> Result<()> {
+    bail!("arle train spec-draft requires the CUDA backend (the trunk forward is CUDA-only)")
 }
 
 /// Numerically stable next-token NLL: `-log_softmax(row)[target]`, subtracting
@@ -5163,7 +5173,7 @@ fn resolve_model_dir_local_only(source: &Path) -> Option<PathBuf> {
     infer_util::hf_hub::resolve_local_model_path(&source_text)
 }
 
-fn resolve_local_tokenizer_path(source: &Path) -> Result<PathBuf> {
+pub(crate) fn resolve_local_tokenizer_path(source: &Path) -> Result<PathBuf> {
     if source.is_file() {
         return Ok(source.to_path_buf());
     }
