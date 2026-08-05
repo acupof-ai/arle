@@ -85,10 +85,17 @@ pub(crate) fn run_spec_draft(args: TrainSpecDraftArgs) -> Result<()> {
     };
     let target_layer_ids = draft.cfg.target_layer_ids.clone();
 
+    // `single_sequence` sets `total_pages` as a FLOOR; the pool is still sized
+    // from free VRAM by `mem_fraction_static`, whose serving default of 0.9
+    // leaves the draft nothing (measured: 87.7 of 95.6 GiB for one 512-token
+    // sequence).
     let engine = LoadedInferenceEngine::load_with_config(
         model_path,
         /*cuda_graph=*/ false,
-        EngineLoadConfig::single_sequence(args.max_len),
+        EngineLoadConfig {
+            mem_fraction_static: args.trunk_mem_fraction,
+            ..EngineLoadConfig::single_sequence(args.max_len)
+        },
     )
     .with_context(|| format!("load engine from {model_path}"))?;
     let mut target = EngineTarget {

@@ -1293,6 +1293,12 @@ pub(crate) struct TrainSpecDraftArgs {
     #[arg(long, default_value_t = 32, value_parser = parse_positive_usize)]
     pub(crate) blocks_per_backward: usize,
 
+    /// Fraction of VRAM the trunk's KV pool may claim. The serving default
+    /// (0.9) leaves nothing for the draft: a training job runs one short
+    /// sequence, so the pool is pure waste here.
+    #[arg(long, default_value_t = 0.45)]
+    pub(crate) trunk_mem_fraction: f64,
+
     #[arg(long, default_value_t = 6e-4)]
     pub(crate) lr: f32,
 
