@@ -192,8 +192,13 @@ Decode leads by 2.8%. TTFT is 1.19× behind, down from 1.48× — FlashQLA chunk
 GDR had never been compiled into the pod binary and prefill ran the serial
 recurrent scan. **The whole remaining prefill gap is GPU idle**; GPU-busy time is within
 0.93 s. In-span idle (between first and last prefill kernel) is 1.675 s, of
-which 1.605 s sits in 18 stalls of ~90 ms each — the 2048-token recurrent-state
-snapshot, not launch overhead. p99 is 5% behind.
+which 1.605 s sits in 18 stalls of ~90 ms each, evenly spaced at the chunk
+cadence and each bounded by `argmax` → `embedding` — host time, not launch
+overhead. **Cause unknown.** The 2048-token recurrent-state snapshot sits
+inside those stalls but does not cause them: making its D2H 9× faster moved
+the stalls by zero
+([entry](experience/wins/2026-08-05-pinned-snapshot-staging-d2h-0577-to-0062s.md)).
+p99 is 5% behind.
 
 `--chunked-prefill-size` is not a lever on either stack: 2048 vs 4096 (ARLE)
 and 4096 vs 8192 (SGLang) all land inside 0.07 s TTFT.
