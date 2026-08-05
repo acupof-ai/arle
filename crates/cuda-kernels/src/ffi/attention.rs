@@ -870,7 +870,7 @@ unsafe extern "C" {
 // ============================================================================
 // FA3 hopper fwd + bwd shim (hdim256/bf16/sm_90a) — vendored Dao-AILab
 // flash-attention @ fc8cbad6, torch-free C ABI in
-// `csrc/attention/arle_fa3_shim.cu`. Build opt-in via ARLE_CUDA_ENABLE_FA3;
+// `csrc/attention/arle_fa3_shim.cu`. Built whenever the target includes sm_90;
 // without it the stub returns `cudaErrorNotSupported` and the marker returns
 // 0 (assert it returns 1 before enabling the runtime path — flashmla stub
 // lesson).
