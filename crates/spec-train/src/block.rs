@@ -135,6 +135,30 @@ pub fn build_block(
     })
 }
 
+/// Draft-row input ids, flattened over blocks. Only the anchor row carries a
+/// real token; the rest of the block is denoised from `mask_token_id`, so the
+/// draft never sees the answer it is predicting. `prev` is the Markov head's
+/// condition and is a different thing.
+#[must_use]
+pub fn noise_token_ids(blocks: &[Block], mask_token_id: u32) -> Vec<u32> {
+    blocks
+        .iter()
+        .flat_map(|b| {
+            std::iter::once(b.prev[0]).chain(std::iter::repeat_n(mask_token_id, b.prev.len() - 1))
+        })
+        .collect()
+}
+
+/// RoPE position of each draft row: `anchor + t`, so row `t` sits where its
+/// condition token sits and predicts the position after it.
+#[must_use]
+pub fn draft_positions(blocks: &[Block]) -> Vec<usize> {
+    blocks
+        .iter()
+        .flat_map(|b| (0..b.targets.len()).map(move |t| b.anchor + t))
+        .collect()
+}
+
 /// Per-row loss weight `exp(-t / gamma)`, zeroed where `eval` is false.
 /// `gamma = None` weights every live row equally. The reference ships 4.0.
 #[must_use]
@@ -218,6 +242,20 @@ mod tests {
         assert!(a.windows(2).all(|w| w[0] < w[1]), "ascending, no repeats");
         let cands = anchor_candidates(&mask);
         assert!(a.iter().all(|p| cands.contains(p)));
+    }
+
+    #[test]
+    fn only_the_anchor_row_carries_a_real_token() {
+        let (ids, mask) = seq(16);
+        let blocks = [
+            build_block(&ids, &mask, 3, 3).unwrap(),
+            build_block(&ids, &mask, 8, 3).unwrap(),
+        ];
+        assert_eq!(
+            noise_token_ids(&blocks, 999),
+            vec![3, 999, 999, 8, 999, 999]
+        );
+        assert_eq!(draft_positions(&blocks), vec![3, 4, 5, 8, 9, 10]);
     }
 
     #[test]

@@ -3,11 +3,12 @@
 //! Separate from `train` (OPD-only) because the two share only the autograd
 //! substrate: data recipe, loss, block-mask construction and eval all differ.
 //!
-//! Built: block construction, the attention plan, the objective, and the
-//! artifact layer. Not built: the draft backbone forward/backward and the
-//! masked-tile attention kernel [`mask::Plan::partial`] calls for — both GPU
-//! work, neither verifiable without CUDA.
+//! Block construction, the attention mask, the draft backbone, and the DSpark
+//! objective. The backbone is the eager autograd op chain, so its backward is
+//! the tape's and it runs on any backend.
 
+#[path = "backbone.rs"]
+pub mod backbone;
 #[path = "block.rs"]
 pub mod block;
 #[path = "iso_spectrum.rs"]
