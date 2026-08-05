@@ -25,7 +25,6 @@ use crate::{
         OpdSftAnchorArg, OpdTeacherRuntimeArg, PretrainPresetArg, SaveDtypeArg, TapeDtypeArg,
         TrainAgentOpdArgs, TrainArgs, TrainCcConvertArgs, TrainCommand, TrainEnvArgs,
         TrainEstimateMemoryArgs, TrainOpdArgs, TrainPplArgs, TrainRubricOpdArgs, TrainSelfOpdArgs,
-        TrainSpecDraftArgs,
     },
     hardware, hub_discovery,
 };
@@ -205,7 +204,7 @@ fn run_ppl(_args: TrainPplArgs) -> Result<()> {
 use crate::spec_train_target::run_spec_draft;
 
 #[cfg(not(feature = "cuda"))]
-fn run_spec_draft(_args: TrainSpecDraftArgs) -> Result<()> {
+fn run_spec_draft(_args: crate::args::TrainSpecDraftArgs) -> Result<()> {
     bail!("arle train spec-draft requires the CUDA backend (the trunk forward is CUDA-only)")
 }
 

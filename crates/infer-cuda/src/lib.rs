@@ -500,6 +500,7 @@ impl CudaExecutor {
     /// Trunk taps at `target_layer_ids` as `[seq, taps·hidden]` plus the
     /// final-normed hidden states as `[seq, hidden]`, both host f32 — the two
     /// trunk inputs `spec_train::trainer::Target` needs per sample.
+    #[cfg(feature = "cuda")]
     pub fn forward_training_taps(
         &mut self,
         input_ids: &[u32],

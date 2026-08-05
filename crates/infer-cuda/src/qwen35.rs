@@ -1340,6 +1340,12 @@ impl Qwen35SlotState {
         let gdr = std::mem::take(&mut self.gdr_states);
         let conv = std::mem::take(&mut self.conv_states);
         pool.push((gdr, conv));
+        // The pinned staging is per-slot and sized to the device buffers just
+        // returned; holding it across the idle window pins ~147 MiB/slot host
+        // RAM for a snapshot that may never come. `ensure_snapshot_staging`
+        // rebuilds it on the next snapshot.
+        self.gdr_pinned.clear();
+        self.conv_pinned.clear();
         self.seq_len = 0;
     }
 
@@ -4609,6 +4615,7 @@ impl Qwen35Model {
         );
         let seq_len = tokens.len();
         let hidden_size = self.config.hidden_size;
+        dspark::Qwen35DsparkTaps::validate(target_layer_ids, self.config.num_hidden_layers)?;
         taps.prepare(target_layer_ids, hidden_size, seq_len);
         self.forward_hidden_capture(slot, ws, tokens, 0, None, recall, Some(taps))?;
 

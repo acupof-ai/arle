@@ -49,17 +49,25 @@ pub(crate) fn run_spec_draft(args: TrainSpecDraftArgs) -> Result<()> {
         cfg.num_hidden_layers
     );
 
-    let mut store = TensorStore::new()?;
+    // The draft's parameters live on the same device the trunk forward runs on.
+    let backend: std::sync::Arc<dyn autograd::Backend> =
+        std::sync::Arc::new(autograd::CudaBackend::new(0)?);
+    let mut store = TensorStore::with_backend(backend);
     let embed = backbone::load_frozen(
         &args.model_path,
         trunk.embed_tokens_tensor_name(),
         &mut store,
     )
     .context("load trunk embeddings")?;
-    // Tied embeddings: the lm_head tensor is simply absent and the trunk reuses
-    // the embedding table. The draft must share whichever it is.
-    let lm_head = backbone::load_frozen(&args.model_path, trunk.lm_head_tensor_name(), &mut store)
-        .unwrap_or(embed);
+    // Tie is a config fact, not something to infer from a failed load — an
+    // untied model whose lm_head is missing or unreadable must stop, not train
+    // a draft against the wrong output distribution.
+    let lm_head = if trunk.tie_word_embeddings {
+        embed
+    } else {
+        backbone::load_frozen(&args.model_path, trunk.lm_head_tensor_name(), &mut store)
+            .context("load trunk lm_head")?
+    };
 
     let draft = if backbone::has_weights(&args.draft)? {
         println!("warm-starting from {}", args.draft.display());
@@ -125,13 +133,6 @@ fn load_samples(
     model_dir: &Path,
     max_len: usize,
 ) -> Result<Vec<spec_train::trainer::Sample>> {
-    use spec_train::data;
-
     let tokenizer_path = crate::train_cli::resolve_local_tokenizer_path(model_dir)?;
-    let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
-        .map_err(|e| anyhow::anyhow!("load tokenizer {}: {e}", tokenizer_path.display()))?;
-    data::read_jsonl(data)?
-        .iter()
-        .map(|c| data::to_sample(c, &tokenizer, max_len))
-        .collect()
+    spec_train::data::load_samples(data, &tokenizer_path, max_len)
 }
