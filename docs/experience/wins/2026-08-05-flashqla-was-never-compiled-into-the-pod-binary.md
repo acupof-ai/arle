@@ -120,6 +120,22 @@ one. FlashQLA's license (chat GSM 95/100 zero disagreements, chat MMLU 80 v 81,
 needle 9/9; raw-completion knife-edge flips the named trade) was adjudicated
 2026-08-02.
 
+## The flag is gone
+
+Setting the env in `pod-build-env.sh` fixed this box and left the defect. Both
+build-time opt-ins were deleted (`0ac780495`) rather than inverted to
+`DISABLE`: the gates already carried the real conditions — vendored tree
+present, sm_90 among the targets — and an opt-out is still a switch someone has
+to know exists. DeepGEMM-native and FlashMLA already auto-detected; its comment
+records the identical bug ("it was opt-in, leaving production on the ~20×
+slower dequant→GEMM fallback"). FA3 and FlashQLA were the last two opt-ins.
+
+Rebuilt with no `ARLE_CUDA_*` set at all: TTFT 24.94 / 24.95 s against the
+env-set build's 24.97 / 25.05, ledger identical (Marlin 18.656, linear
+attention 0.441, GPU idle 3.970), zero fallback lines in the serve log.
+
+Both fallback logs moved `info!` → `warn!`.
+
 ## Learnings
 
 **Rule: a feature flag that defaults true proves nothing about the binary.**
