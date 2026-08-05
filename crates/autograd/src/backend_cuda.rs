@@ -110,7 +110,7 @@ fn linear_attention_debug_stage_done(
 ) -> Result<()> {
     if let Some(started) = started {
         backend.stream.synchronize().map_err(|err| {
-            AutogradError::TapeInvariant(Box::leak(
+            crate::AutogradError::TapeInvariant(Box::leak(
                 format!("cuda synchronize failed (linear_attention {label}): {err:?}")
                     .into_boxed_str(),
             ))
@@ -128,39 +128,25 @@ fn linear_attention_gdr_chunkwise_prefill_enabled() -> bool {
     crate::runtime_flags::gdr_chunkwise_prefill()
 }
 
-/// (H, Hg) is an AOT instantiation parameter, one symbol set per kernels.toml
-/// row group.
+/// (H, Hg) is an AOT instantiation parameter; under context parallelism each
+/// rank owns H/cp value heads and Hg/cp key heads, so the built set is one
+/// geometry per (model, cp_size). The table is generated from kernels.toml.
 #[cfg(not(feature = "no-cuda"))]
-struct FlashqlaGdr {
-    cumsum: ffi::FqCumsumFn,
-    kkt: ffi::FqKktFn,
-    fwd: ffi::FqFwdFn,
-    prepare_h: ffi::FqPrepareHFn,
-    bwd: ffi::FqBwdFn,
-}
-
-#[cfg(not(feature = "no-cuda"))]
-fn flashqla_gdr_symbols(h: usize, hg: usize) -> Result<FlashqlaGdr> {
-    match (h, hg) {
-        (32, 16) => Ok(FlashqlaGdr {
-            cumsum: ffi::gdr_fq_cumsum_cuda,
-            kkt: ffi::gdr_fq_kkt_cuda,
-            fwd: ffi::gdr_fq_fwd_cuda,
-            prepare_h: ffi::gdr_fq_prepare_h_cuda,
-            bwd: ffi::gdr_fq_bwd_cuda,
-        }),
-        (48, 16) => Ok(FlashqlaGdr {
-            cumsum: ffi::gdr_fq_cumsum_h48_cuda,
-            kkt: ffi::gdr_fq_kkt_h48_cuda,
-            fwd: ffi::gdr_fq_fwd_h48_cuda,
-            prepare_h: ffi::gdr_fq_prepare_h_h48_cuda,
-            bwd: ffi::gdr_fq_bwd_h48_cuda,
-        }),
-        _ => Err(AutogradError::TapeInvariant(Box::leak(
-            format!("flashqla GDN head geometry H={h}/Hg={hg} not built (have 32/16, 48/16)")
-                .into_boxed_str(),
-        ))),
-    }
+fn flashqla_gdr_symbols(h: usize, hg: usize) -> Result<&'static ffi::FlashqlaGdrSyms> {
+    ffi::FLASHQLA_GDR_TABLE
+        .iter()
+        .find(|g| g.q_heads as usize == h && g.kv_heads as usize == hg)
+        .ok_or_else(|| {
+            let have = ffi::FLASHQLA_GDR_TABLE
+                .iter()
+                .map(|g| format!("{}/{}", g.q_heads, g.kv_heads))
+                .collect::<Vec<_>>()
+                .join(", ");
+            AutogradError::TapeInvariant(Box::leak(
+                format!("flashqla GDN head geometry H={h}/Hg={hg} not built (have {have})")
+                    .into_boxed_str(),
+            ))
+        })
 }
 
 /// A/B escape hatch: force the legacy monolithic chunked-scan backward (one
