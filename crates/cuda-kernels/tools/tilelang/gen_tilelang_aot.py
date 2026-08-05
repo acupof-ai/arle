@@ -792,7 +792,11 @@ def _build_args_array(parsed_args, spec: WrapperSpec) -> str:
     lines = []
     for kind, name in parsed_args:
         if kind == "tensor":
-            user = spec.tensor_inputs.get(name)
+            # TileLang suffixes params that collide with a C++ keyword (`do` -> `do_1`),
+            # the same renaming the scalar path already strips.
+            user = spec.tensor_inputs.get(name) or spec.tensor_inputs.get(
+                re.sub(r"_\d+$", "", name)
+            )
             if user is None:
                 raise RuntimeError(
                     f"unknown tensor parameter {name!r} in TileLang kernel — "
