@@ -117,6 +117,7 @@ pub fn run() -> ExitCode {
     let mut args = Args::parse();
     if args.kernel_build_id {
         println!("{}", infer_api::kernel_build_id());
+        println!("capabilities:{}", infer_api::kernel_capabilities());
         return ExitCode::SUCCESS;
     }
     let command = args.command.take();

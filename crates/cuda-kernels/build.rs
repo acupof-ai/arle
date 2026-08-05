@@ -2180,8 +2180,12 @@ fn configured_capabilities(sm_targets: &[SmSpec]) -> BTreeSet<String> {
     {
         capabilities.insert("flashmla".into());
     }
-    if Path::new("vendor/flash-attention/hopper").is_dir() {
+    let sm90 = sm_targets.iter().any(|spec| spec.sm == "90");
+    if sm90 && Path::new("vendor/flash-attention/hopper").is_dir() {
         capabilities.insert("fa3".into());
+    }
+    if sm90 {
+        capabilities.insert("flashqla".into());
     }
     let deepgemm_root = env_nonempty("ARLE_DEEPGEMM_ROOT")
         .map(PathBuf::from)
@@ -2442,9 +2446,13 @@ fn emit_kernel_build_identity(out_dir: &Path, manifest: &BTreeMap<String, String
     let id = manifest
         .get("kernel_build_id")
         .expect("CUDA prebuilt manifest lacks kernel_build_id");
+    let capabilities = manifest.get("capabilities").map_or("", String::as_str);
     std::fs::write(
         out_dir.join("kernel_build_identity.rs"),
-        format!("pub const KERNEL_BUILD_ID: &str = {id:?};\n"),
+        format!(
+            "pub const KERNEL_BUILD_ID: &str = {id:?};\n\
+             pub const KERNEL_CAPABILITIES: &str = {capabilities:?};\n"
+        ),
     )
     .expect("write kernel build identity");
 }

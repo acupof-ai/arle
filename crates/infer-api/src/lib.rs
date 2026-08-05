@@ -50,6 +50,21 @@ pub const fn kernel_build_id() -> &'static str {
         "unreported"
     }
 }
+/// Kernel families compiled into this binary, comma-separated. A fast path
+/// missing here is a build defect, not a runtime choice — reading it is the
+/// cheapest way to tell a stub build from a real one.
+#[must_use]
+pub const fn kernel_capabilities() -> &'static str {
+    #[cfg(feature = "cuda")]
+    {
+        cuda_kernels::KERNEL_CAPABILITIES
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        ""
+    }
+}
+
 #[cfg(feature = "cuda")]
 pub use loaded::CudaWorkerEngine;
 #[cfg(any(
