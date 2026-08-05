@@ -119,14 +119,12 @@ Qwen3.6-27B (OptiQ 4/8-bit): the model's own NextN/MTP head drafts, the base ver
 
 The real workload: 32K-token multi-turn agent prompts, not a synthetic short prompt.
 
-| Qwen3.6, 1×H20 | c=1 | c=8 | c=16 |
+| Qwen3.6, 1×H20 · decode / total tok/s | c=1 | c=8 | c=16 |
 |---|---:|---:|---:|
-| 35B-A3B MoE — decode tok/s | 61.7 | 22.7 | 13.6 |
-| 35B-A3B MoE — total tok/s | 6,707 | 27,968 | 33,859 |
-| 27B dense — decode tok/s | 34.7 | 12.2 | 8.2 |
-| 27B dense — total tok/s | 5,028 | 24,703 | 30,046 |
+| 35B-A3B MoE | 61.7 / 6,707 | 22.7 / 27,968 | 13.6 / 33,859 |
+| 27B dense + DSpark drafter | **102.0** / 7,441 | 16.5 / 31,754 | 9.1 / 32,559 |
 
-The 35B-A3B MoE decodes ~1.8× faster than the 27B dense at the same quant — only ~3B params activate per token. `total tok/s` is capacity (prompt + generated over wall clock); `decode tok/s` is single-stream latency. Build `a956f69b1`; the DSpark block drafter lifts c=1 further — rows in [docs/baselines.md](docs/baselines.md).
+`decode tok/s` is single-stream latency; `total tok/s` is capacity (prompt + generated over wall clock). The DSpark block drafter is 2.9× over plain decode at c=1 and washes out by c=16 — verify is free only while the GPU has idle compute. Builds `a956f69b1` / `51985031d`, full rows in [docs/baselines.md](docs/baselines.md).
 
 ### Against SGLang
 

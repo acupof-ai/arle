@@ -1,14 +1,15 @@
 # Rolling performance baselines
 
-> Status: Active — champion row + step budget per fingerprint. Best numbers
-> only; verdicts, rejected arms and analysis live in the linked entries.
+> Status: Active — **one SOTA row per model, plus its config**. A superseded
+> row is deleted, not archived here; verdicts, rejected arms, prior champions
+> and analysis live in the linked `experience/` entries.
 
-Screening compares a new run against the champion row — no second arm.
+Screening compares a new run against the SOTA row — no second arm.
 
-1. **Effect > ~10%** (2× the measured drift band): verdict valid, update the
-   champion, archive the binary.
+1. **Effect > ~10%** (2× the measured drift band): verdict valid, replace the
+   SOTA row, archive the binary.
 2. **Inside the ±3% drift band**: never kill on ambiguity. Escalate to a
-   same-shell A/B against the archived champion (≥3 trials/arm, median + range).
+   same-shell A/B against the archived binary (≥3 trials/arm, median + range).
 3. **Fingerprint change re-anchors**: model, TP/EP, GPU set, serve flags, slot
    line, dataset, driver/CUDA. Re-measure before comparing.
 4. **Anchor audit** every ~5 accepted updates and before any default flip: one
@@ -26,9 +27,9 @@ python3 scripts/gen_bench_prompts.py bench-agent-32k-16x8.jsonl 16 32000 214 8
 
 ---
 
-## Qwen3.6 · 1×H20 · single-GPU · eager — LONG-AGENT ANCHOR
+## Qwen3.6-27B-FP8 · 1×H20 · single-GPU · eager — LONG-AGENT ANCHOR
 
-### CHAMPION (DSpark) — `51985031d` (2026-07-30) · `arle-mk`
+### SOTA — DSpark, `51985031d` (2026-07-30) · `arle-mk`
 
 Features on: batched draft · replay · snapshot · capture · markov+confidence
 head driving the goodput budget. Serve adds `--spec-type dspark
@@ -59,51 +60,12 @@ Two properties of this row are load-bearing when reading it:
   slot decodes rather than waits on prefill. At 0.26–0.47 (c=1/2) `burst` is
   inflated ~1/occ. Never read `burst` as a kernel cost.
 
-### CHAMPION (no-spec) — `a956f69b1` (2026-07-28) · `arle-fa3b2`
-
-Features on: host-authoritative KV mirror · batched FA3 (one launch per layer).
-
-| c | arm | TTFT cold | TTFT warm | TPOT | ITL p50 | decode tok/s | total tok/s |
-|---|---|---:|---:|---:|---:|---:|---:|
-| 1 | MoE | 9.2 s | 0.7 s | 16.22 ms | 16.17 ms | 61.7 | 6707.2 |
-| 8 | MoE | 0.6 s | 0.5 s | 44.10 ms | 38.31 ms | 22.7 | 27967.8 |
-| 16 | MoE | 1.8 s | 0.6 s | 73.74 ms | 60.90 ms | 13.6 | 33858.9 |
-| 1 | dense | 19.0 s | 1.0 s | 28.83 ms | 28.78 ms | 34.7 | 5028.2 |
-| 2 | dense | — | — | 78.40 ms | — | 12.8 | — |
-| 4 | dense | — | — | 64.67 ms | — | 15.5 | — |
-| 8 | dense | 1.2 s | 0.5 s | 81.87 ms | 52.30 ms | 12.2 | 24702.9 |
-| 16 | dense | 4.2 s | 0.7 s | 122.15 ms | 66.55 ms | 8.2 | 30045.6 |
-
-ITL p50 fit: MoE `15.7 + 2.82·B` ms, dense `38.0 + 1.78·B` ms.
-Gate exact=3 DET at 512/4k/16k/32k. 0 errors. MoE 128/128, dense 126/128.
-Anchor audit 2026-07-30 re-ran this binary at −0.03 / +0.40 / +2.26% — accumulated
-drift over five accepted DSpark updates is bounded under 2.3%.
-
-DSpark over no-spec at matched c: 2.9× (c=1), 2.5× (c=2), 2.0× (c=4), 1.4× (c=8),
-1.1× (c=16).
+DSpark over the same binary with spec off: 2.9× (c=1), 2.5× (c=2), 2.0× (c=4),
+1.4× (c=8), 1.1× (c=16).
 
 ### Step budget — where the time goes (2026-08-01, `nsys`, dense FP8)
 
-> Decode half superseded 2026-08-03 (decode graph is default-on; the GDN
-> kernel's grid and state traffic both moved). Prefill half current.
-
-The champion tables say how fast; this says what to fix. Both captures are
-GPU-idle, ThinkingCap-Qwen3.6-27B-FP8, one H20.
-
-**Decode, 25 ms/step** (plain, no spec, 59 steps, 1094 `cudaLaunchKernel`/step):
-
-| kernel | launches/step | ms | share |
-|---|---:|---:|---:|
-| `fp8_gemv_batch_kernel` | 400 | 13.8 | 66% |
-| `gemv_handwritten_kernel` (bf16) | 97 | 4.3 | 21% |
-| `gated_delta_rule_decode` | 48 | 0.80 | 4% |
-| rms_norm / add / silu | ~250 | 0.79 | 4% |
-| flash attn (16 of 64 layers are full-attn) | 16 | 0.20 | 1% |
-| GPU idle between launches | — | ~4 | 16% |
-
-Weights are 31.2 GB and H20's **measured achievable read is 3.5 TB/s** (not the
-4.02 spec sheet), so the per-step floor is 8.9 ms. The GEMVs take 18.1 ms —
-**49% of achievable**, reproducing the 51% attributed on 2026-07-10.
+The SOTA table says how fast; this says what to fix.
 
 **Prefill, 33K in 28.6 s** (single request, 24.0 s GPU-busy, ~37K launches,
 2328 `cuMemcpyDtoH` costing 1.58 s):
@@ -135,7 +97,27 @@ costs what decoding 1 costs. Spec decode is working; the intercept is the wall.
 [prefill profile](experience/wins/2026-08-01-prefill-and-decode-step-budget.md) ·
 [FP8 small-M attribution](experience/wins/2026-07-10-qwen-fp8-smallm-deepgemm-crossover.md)
 
-### Environment
+---
+
+## Qwen3.6-35B-A3B-FP8 (MoE) · 1×H20 · single-GPU · eager
+
+### SOTA — `a956f69b1` (2026-07-28) · `arle-fa3b2`
+
+No spec. Features on: host-authoritative KV mirror · batched FA3 (one launch
+per layer).
+
+| c | TTFT cold | TTFT warm | TPOT | ITL p50 | decode tok/s | total tok/s |
+|---|---:|---:|---:|---:|---:|---:|
+| 1 | 9.2 s | 0.7 s | 16.22 ms | 16.17 ms | 61.7 | 6707.2 |
+| 8 | 0.6 s | 0.5 s | 44.10 ms | 38.31 ms | 22.7 | 27967.8 |
+| 16 | 1.8 s | 0.6 s | 73.74 ms | 60.90 ms | 13.6 | 33858.9 |
+
+ITL p50 fit `15.7 + 2.82·B` ms. Gate exact=3 DET at 512/4k/16k/32k. 0 errors,
+128/128. Anchor audit 2026-07-30 bounds accumulated drift under 2.3%.
+
+---
+
+## Environment — both 1×H20 FP8 rows
 
 - **Box** 1×H20 (sm_90, 78 SM, 96 GB), TP=1, eager, `--max-running-requests 16`.
 - **Models** `bottlecapai/ThinkingCap-Qwen3.6-27B-FP8` (dense, 64 layers, 16
@@ -174,7 +156,7 @@ temperature 0, seed 20260416. TTFT is cold — 16 distinct prompts, no prefix
 hits. SGLang 0.5.13 row serves the GPTQ v1 twin repacked by
 `scripts/w8a16_to_gptq.py` — identical int8 values, identical kernel.
 
-### CHAMPION — `0ac780495` (2026-08-05)
+### SOTA — `0ac780495` (2026-08-05)
 
 Two reps per arm; reps agree to 0.08 s TTFT / 0.02 ms ITL. P/D reported
 separately: `prefill tok/s = prompt_tokens / TTFT` (33000 prompt tokens),
@@ -184,9 +166,6 @@ separately: `prefill tok/s = prompt_tokens / TTFT` (33000 prompt tokens),
 |---|---:|---:|---:|---:|---:|---:|
 | ARLE | 25.01 s | 1329 | **16.69** | **59.9** | 20.22 | 29.45 s |
 | SGLang, same kernel + same weights | **21.03 s** | **1568** | 17.16 | 58.3 | **19.19** | **25.44 s** |
-
-Prior champions: TTFT 31.08 s (`e1017b40d`), ITL 18.98 ms (`f6820efa9`),
-26.88 (`3ca42b44a`).
 
 Decode leads by 2.8%, TTFT is 1.19× behind (was 1.48×), p99 5% behind.
 
@@ -220,7 +199,7 @@ build: TTFT 24.94/24.95 s vs 24.97/25.05, zero fallback lines in the serve log.
 
 ## DSv4-Flash-FP8 · 4×H20 · TP=4/EP=4 · eager
 
-### CHAMPION — Base, `d0525cb06` (re-anchored 2026-07-25, #180)
+### SOTA — Base, `d0525cb06` (re-anchored 2026-07-25, #180)
 
 > Short-prompt fingerprint, retired 2026-07-26 under rule 5 — the dataset is no
 > longer reproducible from the repo. Evidence for what it licensed, not a
@@ -295,7 +274,7 @@ hopper tree and an sm_90 target at build time — without them
 `ring_fa3_route`'s real-kernel marker returns 0 and the ring falls back to the
 scalar kernels.
 
-## CHAMPION — 27B, cp=2, seq=32768 · `15caff0d0` (2026-08-05)
+## SOTA — 27B, cp=2, seq=32768 · `15caff0d0` (2026-08-05)
 
 | | |
 |---|---:|
@@ -312,7 +291,7 @@ Both ranks print identical loss and grad_norm (post-all-reduce). Reproduces the
 2026-08-04 FA3 reference (10.871086 / 2.264733 / ~212 s) to 6-decimal loss and
 0.06% grad-norm; the +6% on step is shared-box variance.
 
-## CHAMPION — 27B, cp=2, seq=81920 · FlashQLA default-on `fa742a038` (2026-08-05)
+## SOTA — 27B, cp=2, seq=81920 · FlashQLA default-on `fa742a038` (2026-08-05)
 
 FlashQLA GDN chunkwise backward is the default (`--gdr-chunkwise-prefill=true`).
 Same harness (`/host/fqgate.sh perf_on`), same seq, only variable is the flag.
@@ -373,13 +352,3 @@ scalar path's grows (+1.085e-3 at cp=2 to +1.655e-3 at cp=4). See
 | 27B cp=2 seq=131072 | fits — backward peak 94,175 MiB (96.6%), ~3.3 GB headroom (2026-08-02, older commit) |
 | 27B cp=4 seq=131072 | full step ~3100 s, host RSS 170.4 GiB total / ~44.6 GB per rank (2026-08-03, scalar ring, older commit) |
 
-## Not reproducible
-
-The scalar-ring arm is gone. `ARLE_CP_RING_FA3` was deleted in `15caff0d0`, so
-FA3 is unconditional at head_dim 256 on sm_90 and the pre-flip numbers below are
-historical only — they cannot be re-measured on a current binary.
-
-| shape | scalar ring | FA3 | ratio |
-|---|---:|---:|---:|
-| cp=2 seq=32768 (2026-08-04) | 460.1 s | 212.1 s | 2.17× |
-| cp=2 seq=81920 (2026-08-05) | 2670.06 s | 752.96 s | 3.54× |
