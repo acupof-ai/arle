@@ -767,9 +767,9 @@ fn qwen35_profile<T>(
 /// kernel (42.1% of prefill GPU time at 3k).
 /// Default ON (licensed 2026-06-11: 3k prefill −36%, multi-shape verified —
 /// see `wins/2026-06-11-qwen35-fa3-prefill-licensed.md`);
-/// `--qwen35-fa3 false` is the same-binary fallback arm. On stub builds
-/// (no `ARLE_CUDA_ENABLE_FA3`) the link marker is 0 and the gate silently
-/// keeps the in-tree kernel, so the default is safe across build flavors.
+/// `--qwen35-fa3 false` is the same-binary fallback arm. A build without an
+/// sm_90 target links the stub, whose marker is 0, and the gate keeps the
+/// in-tree kernel.
 /// The marker is process-wide, but capability is checked on the bound context
 /// so mixed-device workers cannot inherit another device's decision.
 fn qwen35_fa3_enabled(ctx: &DeviceContext) -> bool {
@@ -781,9 +781,9 @@ fn qwen35_fa3_enabled(ctx: &DeviceContext) -> bool {
     if !real {
         static LOGGED: OnceLock<()> = OnceLock::new();
         LOGGED.get_or_init(|| {
-            log::info!(
-                "FA3 stub build (no ARLE_CUDA_ENABLE_FA3) — full-attention \
-                 prefill stays on the in-tree kernel"
+            log::warn!(
+                "FA3 stub build (no sm_90 target) — full-attention prefill \
+                 stays on the in-tree kernel"
             );
         });
         return false;
@@ -799,18 +799,17 @@ fn qwen35_fa3_decode_splits() -> usize {
 /// through the FlashQLA chunked kernels (TileLang AOT, sm_90a) instead of
 /// the serial `gated_delta_rule_prefill_recurrent` kernel (28.0% of prefill
 /// GPU time pre-FA3).
-/// Default OFF (candidate arm). Only valid on the baked Qwen3.6 single-GPU
-/// shard (H=32/Hg=16/128/128 — the call site additionally shape-guards);
-/// builds without an sm_90 target link NOT_SUPPORTED stubs, so keep the gate
-/// off there. Decode (`seq_len == 1`) always stays on the recurrent kernel.
+/// Default ON (licensed 2026-08-02). The call site shape-guards the head
+/// geometry, and builds without an sm_90 target link NOT_SUPPORTED stubs that
+/// the probe below detects. Decode (`seq_len == 1`) stays on the recurrent
+/// kernel.
 fn qwen35_gdr_chunked_enabled() -> bool {
     crate::runtime_flags::qwen35_gdr_chunked()
 }
 
-/// One-shot probe: stub builds (no ARLE_CUDA_ENABLE_FLASHQLA_GDR) and non-sm90
-/// devices return CUDA_ERROR_NOT_SUPPORTED from the dispatch wrapper before
-/// touching any pointer; a real kernel rejects the seq_len=0 launch with a
-/// different code. Unavailable → silently keep the recurrent scan (FA3 pattern).
+/// One-shot probe: stub builds and non-sm90 devices return
+/// CUDA_ERROR_NOT_SUPPORTED from the dispatch wrapper before touching any
+/// pointer; a real kernel rejects the seq_len=0 launch with a different code.
 fn fq_kernels_available(ctx: &DeviceContext, cumsum: ffi::FqCumsumFn) -> bool {
     static AVAILABLE: OnceLock<bool> = OnceLock::new();
     *AVAILABLE.get_or_init(|| {
@@ -823,7 +822,7 @@ fn fq_kernels_available(ctx: &DeviceContext, cumsum: ffi::FqCumsumFn) -> bool {
         let r = unsafe { cumsum(std::ptr::null(), std::ptr::null_mut(), 0, std::ptr::null_mut()) };
         let ok = r != cudarc::driver::sys::CUresult::CUDA_ERROR_NOT_SUPPORTED;
         if !ok {
-            log::info!("FlashQLA chunked GDR unavailable (stub build or non-sm90); using the recurrent scan");
+            log::warn!("FlashQLA chunked GDR unavailable (stub build or non-sm90); using the recurrent scan");
         }
         ok
     })

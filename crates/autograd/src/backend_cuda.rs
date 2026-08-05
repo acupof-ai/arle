@@ -4981,7 +4981,7 @@ fn ring_fa3_route(
         WARNED.call_once(|| {
             eprintln!(
                 "[autograd] FA3 ring shape qualifies but the real kernel is absent — running \
-                 scalar. Rebuild with ARLE_CUDA_ENABLE_FA3=1 and vendor/flash-attention/hopper."
+                 scalar. Rebuild for an sm_90 target with vendor/flash-attention/hopper present."
             );
         });
     }

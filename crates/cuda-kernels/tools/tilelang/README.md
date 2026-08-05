@@ -67,7 +67,7 @@ Build only the kernel producer crate:
 cargo build --release -p cuda-kernels --features cuda
 ```
 
-A T1 candidate is generated and packed once with `ARLE_CUDA_ENABLE_FA3=1`.
+A T1 candidate is generated and packed once on an sm_90 build.
 Cold consumers fetch those exact bytes and build with
 `INFER_TILELANG_PYTHON=/usr/bin/false`; they cannot regenerate the candidate.
 GPU qualification emits fragments bound to the candidate archive SHA-256,

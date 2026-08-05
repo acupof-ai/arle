@@ -325,17 +325,25 @@ fn log_kernel_node_census(
         }
         // SAFETY: success above guarantees initialization.
         let p = unsafe { p.assume_init() };
-        let mut name: *const std::ffi::c_char = std::ptr::null();
-        // SAFETY: out-param is a valid local; the driver owns the returned
-        // string for the lifetime of the function.
-        let name = if unsafe { cu::cuFuncGetName(&mut name, p.func) }
-            .result()
-            .is_ok()
-            && !name.is_null()
-        {
+        let mut raw: *const std::ffi::c_char = std::ptr::null();
+        // A node carries `func` or `kern`, never both.
+        let got = if !p.func.is_null() {
+            // SAFETY: out-param is a valid local; the handle is non-null.
+            unsafe { cu::cuFuncGetName(&mut raw, p.func) }
+                .result()
+                .is_ok()
+        } else if !p.kern.is_null() {
+            // SAFETY: as above.
+            unsafe { cu::cuKernelGetName(&mut raw, p.kern) }
+                .result()
+                .is_ok()
+        } else {
+            false
+        };
+        let name = if got && !raw.is_null() {
             // SAFETY: driver-owned NUL-terminated string, valid while the
             // module is loaded — copied out immediately.
-            unsafe { std::ffi::CStr::from_ptr(name) }
+            unsafe { std::ffi::CStr::from_ptr(raw) }
                 .to_string_lossy()
                 .into_owned()
         } else {

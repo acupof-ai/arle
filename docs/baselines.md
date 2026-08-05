@@ -277,10 +277,10 @@ before this arm is retried.
 **Before trusting any CP row, verify the binary.** `nm -D <bin> | grep
 ncclCommInitRank` and `ldd <bin> | grep libnccl`. A shared build target was
 silently overwritten by a `cuda`-only build on 2026-08-05 and the resulting run
-failed in a way that reads as a code bug. FA3 additionally needs
-`ARLE_CUDA_ENABLE_FA3=1` and the vendored hopper tree at build time — without
-them `ring_fa3_route`'s real-kernel marker returns 0 and the ring silently falls
-back to the scalar kernels.
+failed in a way that reads as a code bug. FA3 additionally needs the vendored
+hopper tree and an sm_90 target at build time — without them
+`ring_fa3_route`'s real-kernel marker returns 0 and the ring falls back to the
+scalar kernels.
 
 ## CHAMPION — 27B, cp=2, seq=32768 · `15caff0d0` (2026-08-05)
 

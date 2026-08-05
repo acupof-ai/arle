@@ -84,7 +84,6 @@ lane=$LANE
 arches=$ARCHS
 tilelang_inputs=$tilelang_inputs
 cuda_contract=$CUDA_CONTRACT
-flashqla_gdr=${ARLE_CUDA_ENABLE_FLASHQLA_GDR:-}
 EOF
 }
 
@@ -102,7 +101,6 @@ kernel_bundle_manifest() {
   "nvcc_sha256": "$(if [[ -n "$nvcc" ]]; then cuda_prebuilt_command_id "$nvcc" --version; else printf missing; fi)",
   "host_compiler_sha256": "$(cuda_prebuilt_command_id "${NVCC_CCBIN:-g++}" --version)",
   "python_sha256": "$(cuda_prebuilt_command_id python3 --version)",
-  "flashqla_gdr": "${ARLE_CUDA_ENABLE_FLASHQLA_GDR:-}",
   "abi_sha256": "$abi_hash",
   "symbol_allowlist": "symbols.txt",
   "symbol_allowlist_sha256": "$symbols_hash",
