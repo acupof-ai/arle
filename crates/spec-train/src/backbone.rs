@@ -443,6 +443,20 @@ pub fn load(
     })
 }
 
+/// One frozen table (`embed_tokens` / `lm_head`) out of a model directory.
+/// The draft shares the trunk's, so they are read here and never stepped.
+pub fn load_frozen(dir: &Path, name: &str, store: &mut TensorStore) -> Result<TensorId> {
+    Shards::open(dir)?.tensor(name, false, store)
+}
+
+/// Whether a directory carries any of the draft's own weights. A config-only
+/// directory means train from scratch.
+pub fn has_weights(dir: &Path) -> Result<bool> {
+    Ok(Shards::open(dir)
+        .ok()
+        .is_some_and(|s| s.has(&dspark_tensor_names(1).fc)))
+}
+
 /// Write the trainable half back in the loader's names. Embeddings and
 /// `lm_head` stay out: the serve reads the trunk's and warns when a draft
 /// checkpoint carries its own.
@@ -548,6 +562,10 @@ impl Shards {
     }
 
     fn param(&self, name: &str, store: &mut TensorStore) -> Result<TensorId> {
+        self.tensor(name, true, store)
+    }
+
+    fn tensor(&self, name: &str, grad: bool, store: &mut TensorStore) -> Result<TensorId> {
         for (mmap, names) in &self.files {
             if !names.iter().any(|x| x == name) {
                 continue;
@@ -575,7 +593,7 @@ impl Shards {
                     .collect(),
                 d => bail!("{name}: unsupported dtype {d:?}"),
             };
-            return Ok(store.alloc(Tensor::new(data, t.shape().to_vec(), true)?));
+            return Ok(store.alloc(Tensor::new(data, t.shape().to_vec(), grad)?));
         }
         bail!("{name} missing from the draft checkpoint")
     }

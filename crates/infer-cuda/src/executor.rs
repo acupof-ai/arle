@@ -836,6 +836,22 @@ impl RealCudaExecutor {
         }
     }
 
+    /// Trunk taps + final hidden states for offline DSpark draft training
+    /// (Qwen3.5/3.6 hybrid only), host-side.
+    pub(crate) fn forward_training_taps(
+        &mut self,
+        input_ids: &[u32],
+        target_layer_ids: &[i64],
+    ) -> Result<(Vec<f32>, Vec<f32>)> {
+        match self {
+            Self::Qwen35(q) => q.forward_training_taps(input_ids, target_layer_ids),
+            Self::Qwen(_) | Self::Dsv4(_) => anyhow::bail!(
+                "forward_training_taps is wired for the Qwen3.5/3.6 hybrid DSpark draft, \
+                 not dense Qwen3 or DSv4"
+            ),
+        }
+    }
+
     /// Device context of the underlying model (for the OPD raw-logits surface to
     /// build a `RawLogits` carrying a sync/consume handle).
     pub(crate) fn device(&self) -> &DeviceContext {

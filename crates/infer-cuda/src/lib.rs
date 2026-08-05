@@ -497,6 +497,24 @@ impl CudaExecutor {
         }
     }
 
+    /// Trunk taps at `target_layer_ids` as `[seq, taps·hidden]` plus the
+    /// final-normed hidden states as `[seq, hidden]`, both host f32 — the two
+    /// trunk inputs `spec_train::trainer::Target` needs per sample.
+    pub fn forward_training_taps(
+        &mut self,
+        input_ids: &[u32],
+        target_layer_ids: &[i64],
+    ) -> anyhow::Result<(Vec<f32>, Vec<f32>)> {
+        match &mut self.inner {
+            CudaExecutorInner::Real(real) => {
+                real.forward_training_taps(input_ids, target_layer_ids)
+            }
+            CudaExecutorInner::Placeholder => anyhow::bail!(
+                "forward_training_taps requires a loaded CUDA model, not the placeholder executor"
+            ),
+        }
+    }
+
     /// Fold a fresh student LoRA update into the resident Qwen3.5/3.6
     /// projection weights (OPD per-step re-merge). Errors on the no-GPU
     /// placeholder and on non-student CUDA models (dense Qwen3 / DSv4).

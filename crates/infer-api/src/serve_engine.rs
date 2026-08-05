@@ -359,6 +359,21 @@ impl ServeInferenceEngine<infer_cuda::CudaExecutor, infer_cuda::CudaKvPool> {
         })?
     }
 
+    /// Trunk taps + final hidden states for offline DSpark draft training.
+    /// Runs on the engine thread like `forward_token_logits`; the results are
+    /// host `Vec<f32>`, so nothing device-bound crosses back.
+    pub fn forward_training_taps(
+        &self,
+        input_ids: &[u32],
+        target_layer_ids: &[i64],
+    ) -> Result<(Vec<f32>, Vec<f32>)> {
+        let input_ids = input_ids.to_vec();
+        let target_layer_ids = target_layer_ids.to_vec();
+        self.serve.run_on_executor(move |executor| {
+            executor.forward_training_taps(&input_ids, &target_layer_ids)
+        })?
+    }
+
     /// Fold a fresh student LoRA update into the resident projection weights
     /// (OPD per-step re-merge), then drop the now-stale prefix cache. Runs both
     /// on the engine-thread-owned [`Engine`] via the [`ServeHandle`] out-of-band

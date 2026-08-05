@@ -29,6 +29,8 @@ mod runtime_report;
 mod serve;
 #[cfg(all(unix, feature = "cuda"))]
 mod serve_multiproc;
+#[cfg(feature = "cuda")]
+mod spec_train_target;
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 mod startup;
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]

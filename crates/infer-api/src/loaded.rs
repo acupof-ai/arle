@@ -743,6 +743,33 @@ mod backend {
             }
         }
 
+        /// Trunk taps at `target_layer_ids` (`[seq, taps·hidden]`) and the
+        /// final-normed hidden states (`[seq, hidden]`), host f32 — what
+        /// `spec_train::trainer::Target` needs per sample. CUDA-only.
+        #[cfg(feature = "cuda")]
+        pub fn forward_training_taps(
+            &self,
+            input_ids: &[u32],
+            target_layer_ids: &[i64],
+        ) -> Result<(Vec<f32>, Vec<f32>)> {
+            match self {
+                Self::Cuda(engine) => engine.forward_training_taps(input_ids, target_layer_ids),
+                #[cfg(feature = "metal")]
+                Self::Metal(_)
+                | Self::MetalDiffusionGemma(_)
+                | Self::MetalGemma4(_)
+                | Self::MetalDeepseekOcr(_) => {
+                    anyhow::bail!("forward_training_taps is CUDA-only")
+                }
+                #[cfg(feature = "hip")]
+                Self::Hip(_) => anyhow::bail!("forward_training_taps is CUDA-only"),
+                #[cfg(feature = "vulkan")]
+                Self::Vulkan(_) => anyhow::bail!("forward_training_taps is CUDA-only"),
+                #[cfg(all(feature = "cpu", not(feature = "metal")))]
+                Self::Cpu(_) => anyhow::bail!("forward_training_taps is CUDA-only"),
+            }
+        }
+
         /// Hot-swap the DSpark Markov head weights from a host f32 snapshot.
         /// Called by the train sidecar after each acceptance-weighted step.
         #[cfg(feature = "cuda")]

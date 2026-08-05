@@ -288,6 +288,19 @@ impl Qwen35DsparkTaps {
     fn disarm(&mut self) {
         self.armed = false;
     }
+
+    /// Captured tap `i` as host f32, token-major `[seq, hidden]`. Offline draft
+    /// training reads the taps raw; serving fuses them on device through
+    /// [`Qwen35Model::dspark_tap_features`] instead.
+    pub(crate) fn tap_to_host(&mut self, ctx: &DeviceContext, i: usize) -> Result<Vec<f32>> {
+        ensure!(self.armed, "dspark tap readback without an armed capture");
+        ensure!(i < self.bufs.len(), "tap {i} of {}", self.bufs.len());
+        self.bufs[i].get(ctx, self.hidden, self.seq)?.to_host(ctx)
+    }
+
+    pub(crate) fn release(&mut self) {
+        self.disarm();
+    }
 }
 
 /// Draft-side persistent scratch, one per executor — every buffer here is
