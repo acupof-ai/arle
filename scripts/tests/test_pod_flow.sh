@@ -55,7 +55,10 @@ out="$POD_TREE/target/test-manifest"
 exe="$POD_TREE/target/release/arle"
 mkdir -p "$(dirname "$exe")" "$out" "$POD_TREE/target/stale"
 id=kernel-123; [ "${CARGO_CASE:-}" != embedded-mismatch ] || id=kernel-wrong
-printf '#!/usr/bin/env bash\nif [ "$1" = --kernel-build-id ]; then echo %s; exit; fi\nexit 0\n' "$id" > "$exe"
+# Two lines, like the real binary: comparing the whole output against the
+# manifest id failed every green build until 06a27527e's `capabilities:` line
+# was accounted for, and a one-line fake could never have caught it.
+printf '#!/usr/bin/env bash\nif [ "$1" = --kernel-build-id ]; then echo %s; echo capabilities:fa3,flashmla; exit; fi\nexit 0\n' "$id" > "$exe"
 chmod +x "$exe"
 printf 'schema=1\nkernel_build_id=kernel-123\n' > "$out/arle-cuda-kernels.manifest"
 printf 'schema=1\nkernel_build_id=stale\n' > "$POD_TREE/target/stale/arle-cuda-kernels.manifest"
@@ -224,6 +227,10 @@ POD_TREE="$TREE" POD_STATE="$STATE" bash "$TREE/scripts/pod-remote-build.sh" bui
 receipt="$STATE/builds/manifest/receipt"
 [ "$(awk -F= '$1=="kernel_id" {print $2}' "$receipt")" = kernel-123 ]
 [ "$(awk -F= '$1=="embedded_id" {print $2}' "$receipt")" = kernel-123 ]
+# The success case asserted every field except the one that says it succeeded,
+# so a green build reporting exit=1 went unnoticed (06a27527e's second
+# `--kernel-build-id` line broke the embedded-id comparison).
+[ "$(awk -F= '$1=="exit" {print $2}' "$receipt")" = 0 ]
 [ "$(awk -F= '$1=="cargo_out_dir" {print $2}' "$receipt")" = "$TREE/target/test-manifest" ]
 grep -Fq "producer_manifest=$TREE/target/test-manifest/arle-cuda-kernels.manifest" "$receipt"
 [ "$(awk -F= '$1=="argv_sha" {print $2}' "$receipt")" = "$(sha256sum "$STATE/builds/manifest/argv.nul" | cut -d' ' -f1)" ]
