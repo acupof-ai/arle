@@ -151,7 +151,6 @@ resolve_deepgemm_env
 resolve_deepep_env
 
 export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-9.0}"
-export ARLE_CUDA_ENABLE_FLASHMLA_DECODE="${ARLE_CUDA_ENABLE_FLASHMLA_DECODE:-1}"
 export ARLE_NVCC_SPLIT_COMPILE="${ARLE_NVCC_SPLIT_COMPILE:-8}"
 
 if prebuilt_ready; then
