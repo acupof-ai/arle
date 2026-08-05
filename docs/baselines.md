@@ -174,7 +174,7 @@ temperature 0, seed 20260416. TTFT is cold — 16 distinct prompts, no prefix
 hits. SGLang 0.5.13 row serves the GPTQ v1 twin repacked by
 `scripts/w8a16_to_gptq.py` — identical int8 values, identical kernel.
 
-### CHAMPION — `6e3f68fac` (2026-08-05)
+### CHAMPION — `0ac780495` (2026-08-05)
 
 Two reps per arm; reps agree to 0.08 s TTFT / 0.02 ms ITL. P/D reported
 separately: `prefill tok/s = prompt_tokens / TTFT` (33000 prompt tokens),
@@ -196,6 +196,10 @@ recurrent scan. **The whole remaining prefill gap is 3.8 s of GPU idle** (ARLE
 
 `--chunked-prefill-size` is not a lever on either stack: 2048 vs 4096 (ARLE)
 and 4096 vs 8192 (SGLang) all land inside 0.07 s TTFT.
+
+The row is from a build with no `ARLE_CUDA_*` set — FA3 and FlashQLA now build
+from vendored-tree + sm_90 detection alone. Confirmed against the env-set
+build: TTFT 24.94/24.95 s vs 24.97/25.05, zero fallback lines in the serve log.
 
 [FlashQLA stub build + prefill ledger](experience/wins/2026-08-05-flashqla-was-never-compiled-into-the-pod-binary.md) ·
 [decode budget, both stacks](experience/wins/2026-08-04-w8a16-decode-step-kernel-budget.md) ·
