@@ -114,27 +114,20 @@ impl Draft {
         p
     }
 
-    pub fn forward(
+    /// `[ctx_len, taps·hidden]` taps to the `[ctx_len, hidden]` context the
+    /// blocks attend. A function of the taps and two parameters only, so it is
+    /// constant across a sample's chunks — see [`Self::forward_projected`].
+    pub fn project_context(
         &self,
-        input: &Input<'_>,
+        taps: TensorId,
         store: &mut TensorStore,
         tape: &mut Tape,
-    ) -> Result<Output> {
-        let c = &self.cfg;
-        let blocks = input.blocks;
-        ensure!(!blocks.is_empty(), "no anchored blocks");
-        let block_size = blocks[0].targets.len();
-        let rows = blocks.len() * block_size;
-        let (ctx_len, kv_len) = (input.ctx_len, input.ctx_len + rows);
-        let hd = c.head_dim;
-        let (nh, nkv) = (c.num_attention_heads, c.num_key_value_heads);
-        let groups = nh / nkv;
-
+    ) -> Result<TensorId> {
         // A non-finite tap reaches every parameter through `fc` and only shows
         // up as a NaN loss much later; probe the host mirror where one exists
         // rather than scanning `[ctx_len, taps·hidden]` every forward.
         if let Some(d) = store
-            .get(input.taps)
+            .get(taps)
             .map(|t| t.data.as_slice())
             .filter(|d| !d.is_empty())
         {
@@ -145,9 +138,45 @@ impl Draft {
                 "trunk taps are not finite"
             );
         }
+        let ctx = ops::matmul_bt(taps, self.fc, store, tape)?;
+        Ok(ops::rmsnorm(
+            ctx,
+            self.hidden_norm,
+            self.cfg.rms_norm_eps,
+            store,
+            tape,
+        )?)
+    }
 
-        let ctx = ops::matmul_bt(input.taps, self.fc, store, tape)?;
-        let ctx = ops::rmsnorm(ctx, self.hidden_norm, c.rms_norm_eps, store, tape)?;
+    pub fn forward(
+        &self,
+        input: &Input<'_>,
+        store: &mut TensorStore,
+        tape: &mut Tape,
+    ) -> Result<Output> {
+        let ctx = self.project_context(input.taps, store, tape)?;
+        self.forward_projected(input.blocks, ctx, input.ctx_len, store, tape)
+    }
+
+    /// The blocks' forward over an already-projected context. Splitting it out
+    /// lets a chunked backward pay `fc` once per sample instead of once per
+    /// chunk — the projection is 1.07 TFLOP at seq 4096.
+    pub fn forward_projected(
+        &self,
+        blocks: &[Block],
+        ctx: TensorId,
+        ctx_len: usize,
+        store: &mut TensorStore,
+        tape: &mut Tape,
+    ) -> Result<Output> {
+        let c = &self.cfg;
+        ensure!(!blocks.is_empty(), "no anchored blocks");
+        let block_size = blocks[0].targets.len();
+        let rows = blocks.len() * block_size;
+        let kv_len = ctx_len + rows;
+        let hd = c.head_dim;
+        let (nh, nkv) = (c.num_attention_heads, c.num_key_value_heads);
+        let groups = nh / nkv;
 
         let noise: Vec<usize> = block::noise_token_ids(blocks, c.mask_token_id)
             .iter()

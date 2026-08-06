@@ -4637,7 +4637,7 @@ impl Qwen35Model {
         let Qwen35Workspace { hidden, normed, .. } = ws;
         let hidden = hidden.get(&self.ctx, hidden_size, seq_len)?;
         let normed = normed.get(&self.ctx, hidden_size, seq_len)?;
-        rms_norm_offset(
+        rms_norm_batch(
             &self.ctx,
             hidden,
             &self.norm,
