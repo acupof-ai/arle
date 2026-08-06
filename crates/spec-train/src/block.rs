@@ -149,10 +149,9 @@ pub fn noise_token_ids(blocks: &[Block], mask_token_id: u32) -> Vec<u32> {
         .collect()
 }
 
-/// RoPE position of each draft row: `anchor + t`. Matches the serve, where the
-/// anchor is `last_token` at absolute position `start = kv_seq_len` and row `t`
-/// sits at `start + t`. Doubles as the trunk hidden index whose logits supervise
-/// row `t` — hidden `p` predicts token `p+1`, and row `t` targets `anchor+1+t`.
+/// RoPE position of each draft row: `anchor + t`, matching the serve. Doubles as
+/// the trunk hidden index that supervises row `t` — hidden `p` predicts `p+1`,
+/// and row `t` targets `anchor+1+t`.
 #[must_use]
 pub fn draft_positions(blocks: &[Block]) -> Vec<usize> {
     blocks
