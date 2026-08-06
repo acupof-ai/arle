@@ -216,6 +216,18 @@ struct PinnedCheckpointPool {
     slots: Vec<PinnedHostSlice<f32>>,
     free: Vec<u32>,
     allocated_bytes: usize,
+    stream: Option<Arc<CudaStream>>,
+}
+
+#[cfg(not(feature = "no-cuda"))]
+impl Drop for PinnedCheckpointPool {
+    // The slots' events are never recorded, so `PinnedHostSlice::drop` would
+    // `cuMemFreeHost` under an in-flight DtoH; drain the stream first.
+    fn drop(&mut self) {
+        if let Some(stream) = &self.stream {
+            let _ = stream.synchronize();
+        }
+    }
 }
 
 #[cfg(not(feature = "no-cuda"))]
@@ -1879,6 +1891,7 @@ impl Backend for CudaBackend {
             let Some(slot) = pool.take(self.stream.context(), len, budget)? else {
                 return Ok(None);
             };
+            pool.stream.get_or_insert_with(|| self.stream.clone());
             // No synchronize: stream order already puts this copy behind the
             // compute that wrote `src` and ahead of `src`'s stream-ordered free.
             let copied = match pool.slots[slot as usize].as_mut_slice() {
