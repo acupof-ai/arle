@@ -269,13 +269,14 @@ pub(crate) struct Qwen35CudaExecutor {
     /// Budget bytes for durable NVMe recall spill (`--kv-disk-limit`).
     /// `None` until `set_kv_tier_disk` wires it.
     disk_budget: Option<usize>,
-    /// `mem_fraction_static` + requested page floor captured at construction so
-    /// `ensure_kv_pool` can RE-PROFILE and rebuild `full_attn_kv` identically
-    /// after `release_kv_pool` dropped it (agent-OPD rollout→writeback→rollout:
-    /// the dead pool is freed for the co-resident autograd writeback, then
-    /// re-acquired before the next round's rollout). Not on the serve path.
-    kv_pool_mem_fraction_static: f64,
-    kv_pool_requested_pages: usize,
+    /// Page count the construction-time profile chose, so `ensure_kv_pool` can
+    /// rebuild `full_attn_kv` at the SAME size after `release_kv_pool` dropped it
+    /// (agent-OPD rollout→writeback→rollout: the dead pool is freed for the
+    /// co-resident autograd writeback, then re-acquired before the next round's
+    /// rollout). Re-profiling instead would read free VRAM with the student
+    /// holding the memory the release just handed it, shrinking the pool every
+    /// round until it hits the token floor. Not on the serve path.
+    kv_pool_sized_pages: usize,
     /// Recurrent prefix sidecars live in `slot_tier` under `NS_SIDECAR` (blob =
     /// recurrent state + full-attn KV, keyed by token-prefix hash), so they share
     /// the ONE budget-managed store instead of a private capped RAM map — the
@@ -914,13 +915,13 @@ impl Qwen35CudaExecutor {
         // Shared paged full-attn KV pool — the DEFAULT substrate (Phase 2 of the
         // shared-paged-KV migration). Built EAGERLY here, profile-sized from
         // MEASURED free VRAM after weights load (SGLang's mem_fraction_static),
-        // NOT `num_slots × max_seq_len` (the per-slot contiguous waste). The same
-        // build is re-run by `ensure_kv_pool` after `release_kv_pool` drops it on
-        // the agent-OPD writeback path — extracted into `build_full_attn_kv_pool`.
+        // NOT `num_slots × max_seq_len` (the per-slot contiguous waste). This is
+        // the ONLY profile; `ensure_kv_pool` re-allocates at `kv_pool_sized_pages`
+        // after `release_kv_pool` drops it on the agent-OPD writeback path.
         let pool_t0 = Instant::now();
         let requested_pages = total_pages.max(1);
         let kv_format = kv_dtype.kv_format();
-        let full_attn_kv = Self::build_full_attn_kv_pool(
+        let (full_attn_kv, kv_pool_sized_pages) = Self::build_full_attn_kv_pool(
             &model,
             num_slots,
             requested_pages,
@@ -973,8 +974,7 @@ impl Qwen35CudaExecutor {
             weights_epoch,
             disk_root: None,
             disk_budget: None,
-            kv_pool_mem_fraction_static: mem_fraction_static,
-            kv_pool_requested_pages: total_pages.max(1),
+            kv_pool_sized_pages,
             sidecar_page_key: std::collections::HashMap::new(),
             prefill_boundary_snapshot: (0..num_slots).map(|_| None).collect(),
             periodic_boundary_snapshots: (0..num_slots).map(|_| Vec::new()).collect(),
@@ -996,9 +996,10 @@ impl Qwen35CudaExecutor {
 
     /// Build the shared paged full-attn KV pool, profile-sized from MEASURED free
     /// VRAM (SGLang's `mem_fraction_static`); `requested_pages` is the fallback
-    /// for a failed probe, not a floor over it (#178). The constructor's eager
-    /// build and `ensure_kv_pool`'s post-release rebuild both go through here so
-    /// the re-acquired pool matches the original sizing recipe.
+    /// for a failed probe, not a floor over it (#178). Returns the pool and the
+    /// page count it chose — `ensure_kv_pool` restores THAT size rather than
+    /// profiling again, since the free VRAM it would read has been handed to the
+    /// co-resident student by the intervening `release_kv_pool`.
     fn build_full_attn_kv_pool(
         model: &crate::qwen35::Qwen35Model,
         num_slots: usize,
@@ -1006,7 +1007,7 @@ impl Qwen35CudaExecutor {
         mem_fraction_static: f64,
         kv_format: KVFormat,
         dspark_slot_bytes: usize,
-    ) -> Result<PagedKVPool> {
+    ) -> Result<(PagedKVPool, usize)> {
         let num_full = model.config.num_full_attention_layers();
         let local_kv_heads = model.local_kv_heads();
         let head_dim = model.config.head_dim;
@@ -1083,6 +1084,24 @@ impl Qwen35CudaExecutor {
                 requested_pages
             }
         };
+        Ok((
+            Self::alloc_full_attn_kv_pool(model, num_slots, total_pool_pages, kv_format)?,
+            total_pool_pages,
+        ))
+    }
+
+    /// Allocate the pool at an EXACT page count, no profiling.
+    /// `build_full_attn_kv_pool` profiles then calls this; `ensure_kv_pool` calls
+    /// it directly with the size the construction-time profile chose.
+    fn alloc_full_attn_kv_pool(
+        model: &crate::qwen35::Qwen35Model,
+        num_slots: usize,
+        total_pool_pages: usize,
+        kv_format: KVFormat,
+    ) -> Result<PagedKVPool> {
+        let num_full = model.config.num_full_attention_layers();
+        let local_kv_heads = model.local_kv_heads();
+        let head_dim = model.config.head_dim;
         let pool_token_budget = total_pool_pages * SUPPORTED_PAGE_SIZE;
         let pool_budget_bytes = PagedKVPool::budget_bytes_for_tokens(
             num_full,
@@ -1151,27 +1170,31 @@ impl Qwen35CudaExecutor {
         Ok(())
     }
 
-    /// Re-acquire the shared paged full-attn KV pool after `release_kv_pool`
-    /// dropped it (agent-OPD next-round rollout). Re-profiles from current free
-    /// VRAM with the construction-time `mem_fraction_static`.
+    /// Re-acquire the shared paged full-attn KV pool at the size the
+    /// construction-time profile chose (agent-OPD next-round rollout).
     /// No-op (idempotent) if the pool is already resident.
+    ///
+    /// Deliberately does NOT re-profile. `release_kv_pool` exists to hand this
+    /// VRAM to the co-resident student, so a profile taken here reads a card with
+    /// the student holding it: the pool shrinks every round and, once
+    /// `total × (1 − mem_fraction_static)` exceeds what is left free, collapses to
+    /// `PROFILE_KV_TOKENS_FLOOR`. A floored device pool then hands the host mirror
+    /// page ids it cannot back (`TokenKVPool::mirror_slot page N out of range N`)
+    /// and the engine thread dies mid-round.
     pub(crate) fn ensure_kv_pool(&mut self) -> Result<()> {
         if self.full_attn_kv.is_some() {
             return Ok(());
         }
-        let pool = Self::build_full_attn_kv_pool(
+        let pool = Self::alloc_full_attn_kv_pool(
             &self.model,
             self.num_slots,
-            self.kv_pool_requested_pages,
-            self.kv_pool_mem_fraction_static,
+            self.kv_pool_sized_pages,
             self.kv_format,
-            self.dspark.as_ref().map_or(0, |ds| {
-                ds.head.slot_state_bytes(self.model.config.vocab_size)
-            }),
         )?;
         log::info!(
-            "Qwen3.6 re-acquired full-attn KV pool: {}MB (agent-OPD next-round rollout)",
-            pool.device_bytes() >> 20
+            "Qwen3.6 re-acquired full-attn KV pool: {}MB / {} pages (agent-OPD next-round rollout)",
+            pool.device_bytes() >> 20,
+            self.kv_pool_sized_pages,
         );
         self.full_attn_kv = Some(pool);
         Ok(())

@@ -3777,6 +3777,20 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
                 .sum();
             prompt_tokens += g_prompt;
             completion_tokens += g_completion;
+            // A group that generated nothing means the engine served nothing —
+            // it died, or admission rejects every prompt. Continuing spends the
+            // remaining task budget on requests that cannot succeed (a dead
+            // engine burned 3 tasks × 183 s before this check existed), and the
+            // metrics it writes are ratios over a zero denominator.
+            if g_completion == 0 {
+                bail!(
+                    "group {group_idx} ({}) generated 0 completion tokens across {} sample(s): \
+                     the rollout engine is not serving. Check the engine log for a closed engine \
+                     thread or a KV pool collapsed to the token floor.",
+                    group.task_id,
+                    group.samples.len(),
+                );
+            }
             // Group rollout wall = first cc start → last cc end.
             let rollout_secs = group
                 .samples
