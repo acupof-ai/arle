@@ -137,7 +137,7 @@ jobs:
               -p infer-core -p infer-server -p infer-plan -p infer-seam
               -p infer-moe -p infer-topo -p infer-util -p deepseek-spec -p agent
           - name: support
-            cmd: cargo test -p chat -p tools -p qwen3-spec -p qwen35-spec -p kv-native-sys --profile release-fast
+            cmd: cargo test -p chat -p tools -p qwen3-spec -p qwen35-spec -p kv-native-sys -p spec-train --profile release-fast
           # autograd: leaf crate, lightweight. Always completes, warms the
           # shared dep cache for the train lane below.
           - name: autograd
