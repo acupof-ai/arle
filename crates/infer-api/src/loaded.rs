@@ -2026,10 +2026,15 @@ mod backend {
         use infer_server::OpenAiTokenizer;
 
         infer_cuda::set_decode_graph_default(enable_cuda_graph);
-        let tokenizer = OpenAiTokenizer::from_model_dir(model_path)?;
-        let model_id = crate::serve_engine::model_id_from_path(model_path);
+        // Resolve HF id → local cache dir, downloading if absent. Mirrors the
+        // Metal path's `infer_metal::resolve_model_path` so `arle serve
+        // --model-path Qwen/Qwen3.5-4B` works on CUDA without a pre-download.
+        let resolved = infer_util::hf_hub::resolve_model_path(model_path)?;
+        let resolved_str = resolved.to_string_lossy().to_string();
+        let tokenizer = OpenAiTokenizer::from_model_dir(&resolved)?;
+        let model_id = crate::serve_engine::model_id_from_path(&resolved_str);
 
-        let model_source = model_path.to_string();
+        let model_source = resolved_str;
         let engine_config = config.clone();
         let serve = ServeHandle::spawn_with_engine_builder_and_shutdown(
             move || build_cuda_engine(&model_source, &engine_config),

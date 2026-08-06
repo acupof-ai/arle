@@ -20,6 +20,7 @@ infer-core = { path = "../infer-core" }
 infer-plan = { path = "../infer-plan", features = ["serde"] }
 infer-seam = { path = "../infer-seam" }
 infer-server = { path = "../infer-server" }
+infer-util = { path = "../infer-util" }
 log = "0.4"
 serde = { workspace = true }
 serde_json = { workspace = true }
