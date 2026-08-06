@@ -156,31 +156,31 @@ temperature 0, seed 20260416. TTFT is cold — 16 distinct prompts, no prefix
 hits. SGLang 0.5.13 row serves the GPTQ v1 twin repacked by
 `scripts/w8a16_to_gptq.py` — identical int8 values, identical kernel.
 
-### SOTA — `0ac780495` (2026-08-05)
+### SOTA — snapshot stride 8192 (2026-08-06)
 
-Two reps per arm; reps agree to 0.08 s TTFT / 0.02 ms ITL. P/D reported
+Two reps per arm; reps agree to 0.10 s TTFT / 0.02 ms ITL. P/D reported
 separately: `prefill tok/s = prompt_tokens / TTFT` (33000 prompt tokens),
 `decode tok/s = 1 / ITL`.
 
 | arm | TTFT p50 | prefill tok/s | ITL p50 | decode tok/s | ITL p99 | e2e p50 |
 |---|---:|---:|---:|---:|---:|---:|
-| ARLE | 25.01 s | 1329 | **16.69** | **59.9** | 20.22 | 29.45 s |
+| ARLE | 23.01 s | 1434 | **16.70** | **59.9** | 20.50 | 27.4 s |
 | SGLang, same kernel + same weights | **21.03 s** | **1568** | 17.16 | 58.3 | **19.19** | **25.44 s** |
 
-Decode leads by 2.8%, TTFT is 1.19× behind (was 1.48×), p99 5% behind.
+Decode leads by 2.8%, TTFT is 1.09× behind (was 1.48× then 1.19×), p99 7% behind.
+Gate: needle 512/4k/16k/32k ×3, all `exact=3 miss=0 DET`.
 
 Prefill idle split, cold 33K, `--cuda-graph-trace=node`:
 
 | | ARLE | SGLang |
 |---|---:|---:|
 | GPU busy | 21.9 s | within 0.93 s of ARLE |
-| in-span idle | 1.675 s | 0.19 s |
-| — of which, 18 stalls > 10 ms | 1.605 s | — |
-| D2H, `0cfd6e0a2` (was `0ac780495`) | 2.771 GB / **0.062 s** (0.577 s) | ~0 |
+| in-span idle, stride 2048 | 1.675 s | 0.19 s |
+| D2H, pinned staging (was pageable) | 2.771 GB / **0.062 s** (0.577 s) | ~0 |
 
-Stalls are evenly spaced at the chunk cadence, each bounded by `argmax` →
-`embedding`. **Cause unknown** — the 2048-token recurrent-state snapshot sits
-inside them and is not the cause.
+Periodic snapshot cost by stride, 33K prefill: 18 snapshots 3.13 s · 4
+snapshots 0.85 s · 0 snapshots 0 s. Each retains ~150 MB until publish, so the
+cost is the count. Remaining gap against SGLang: 1.98 s.
 
 `--chunked-prefill-size` is not a lever on either stack: 2048 vs 4096 (ARLE)
 and 4096 vs 8192 (SGLang) all land inside 0.07 s TTFT.
