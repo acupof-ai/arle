@@ -24,6 +24,10 @@ enum CheckpointResidency {
     None,
     Host,
     L3,
+    /// Backend-owned pinned host buffer (slot index). `data` is empty — the
+    /// pinned buffer is the storage, not a staging hop, so reload is one HtoD
+    /// straight out of it. Host reads go through `Backend::checkpoint_pin_readback`.
+    Pinned(u32),
 }
 
 #[derive(Debug)]
@@ -41,10 +45,12 @@ pub struct Tensor {
 
 impl Clone for Tensor {
     fn clone(&self) -> Self {
-        assert_ne!(
-            self.checkpoint_residency,
-            CheckpointResidency::L3,
-            "restore L3 checkpoint before cloning"
+        assert!(
+            matches!(
+                self.checkpoint_residency,
+                CheckpointResidency::None | CheckpointResidency::Host
+            ),
+            "restore an off-host checkpoint before cloning"
         );
         // P3.1 (post-Wave-1): mirror the `TensorStore::clone_tensor`
         // discipline at the `Tensor` level — when the source is
@@ -325,13 +331,16 @@ impl TensorStore {
                 tensor.data.len() * std::mem::size_of::<f32>(),
             )
         };
+        if let CheckpointResidency::Pinned(slot) = residency {
+            self.backend().checkpoint_pin_release(slot);
+        }
         if let Some(l3) = &mut self.checkpoint_l3 {
             match residency {
                 CheckpointResidency::Host => {
                     l3.host_bytes = l3.host_bytes.saturating_sub(bytes);
                 }
                 CheckpointResidency::L3 => l3.remove(id),
-                CheckpointResidency::None => {}
+                CheckpointResidency::None | CheckpointResidency::Pinned(_) => {}
             }
         }
         self.raw_tensor_mut(id)?.checkpoint_residency = CheckpointResidency::None;
@@ -371,6 +380,7 @@ impl TensorStore {
                     l3.remove(id);
                 }
             }
+            CheckpointResidency::Pinned(slot) => self.backend.checkpoint_pin_release(slot),
             CheckpointResidency::None => {}
         }
         self.free_ids.push(id);
@@ -434,6 +444,9 @@ impl TensorStore {
                             l3.remove(id);
                         }
                     }
+                    CheckpointResidency::Pinned(slot) => {
+                        self.backend.checkpoint_pin_release(slot);
+                    }
                     CheckpointResidency::None => {}
                 }
             }
@@ -452,7 +465,10 @@ impl TensorStore {
             .and_then(Option::as_ref)
             .is_some_and(|tensor| {
                 tensor.dirty == Dirty::Device
-                    || tensor.checkpoint_residency == CheckpointResidency::L3
+                    || matches!(
+                        tensor.checkpoint_residency,
+                        CheckpointResidency::L3 | CheckpointResidency::Pinned(_)
+                    )
             })
         {
             self.ensure_host(id)
@@ -481,6 +497,16 @@ impl TensorStore {
     }
 
     pub fn ensure_host(&mut self, id: TensorId) -> Result<()> {
+        if let CheckpointResidency::Pinned(slot) = self.tensor(id)?.checkpoint_residency {
+            let size = self.tensor(id)?.size;
+            let mut host = self.checkpoint_offload_pool.take(size);
+            self.backend().checkpoint_pin_readback(slot, &mut host)?;
+            let tensor = self.raw_tensor_mut(id)?;
+            tensor.data = host;
+            tensor.dirty = Dirty::Host;
+            tensor.checkpoint_residency = CheckpointResidency::Host;
+            return Ok(());
+        }
         if self.tensor(id)?.checkpoint_residency == CheckpointResidency::L3 {
             let expected_len = self.tensor(id)?.size;
             let host = self
@@ -561,6 +587,17 @@ impl TensorStore {
     }
 
     pub fn ensure_device(&mut self, id: TensorId) -> Result<()> {
+        // Pinned: one async HtoD straight out of the pinned buffer. Stream-ordered,
+        // so the handle is usable by the next enqueued op with no host wait.
+        if let CheckpointResidency::Pinned(slot) = self.tensor(id)?.checkpoint_residency {
+            let shape = self.tensor(id)?.shape.clone();
+            let handle = self.backend().checkpoint_pin_reload(slot, &shape)?;
+            let tensor = self.raw_tensor_mut(id)?;
+            tensor.device_handle = Some(handle);
+            tensor.dirty = Dirty::Device;
+            tensor.checkpoint_residency = CheckpointResidency::None;
+            return Ok(());
+        }
         let was_l3 = self.tensor(id)?.checkpoint_residency == CheckpointResidency::L3;
         if was_l3 {
             self.ensure_host(id)?;
@@ -627,7 +664,7 @@ impl TensorStore {
     /// that host work, and the 80K OPD backward runs at a 5 GB device margin.
     pub(crate) fn ensure_checkpoint_device(&mut self, id: TensorId) -> Result<()> {
         let reload = match self.tensor(id)?.checkpoint_residency {
-            CheckpointResidency::L3 => true,
+            CheckpointResidency::L3 | CheckpointResidency::Pinned(_) => true,
             CheckpointResidency::Host => crate::runtime_flags::checkpoint_reload_device(),
             CheckpointResidency::None => false,
         };
@@ -709,7 +746,10 @@ impl TensorStore {
     /// exists. This keeps model weights device-authoritative on memory-tight
     /// CUDA hosts; callers that later need host data can still use `to_host`.
     pub fn evict_host_mirror(&mut self, id: TensorId) -> Result<usize> {
-        if self.tensor(id)?.checkpoint_residency == CheckpointResidency::L3 {
+        if matches!(
+            self.tensor(id)?.checkpoint_residency,
+            CheckpointResidency::L3 | CheckpointResidency::Pinned(_)
+        ) {
             self.ensure_host(id)?;
         }
         self.discard_checkpoint_copy(id)?;
@@ -821,6 +861,26 @@ impl TensorStore {
                     .clone(),
             )
         };
+
+        // Pinned path: one async DtoH into a backend-owned pinned buffer that KEEPS
+        // the activation, so neither leg touches a pageable host buffer and neither
+        // blocks the host. `ensure_checkpoint_device` reloads a pinned checkpoint
+        // unconditionally — pinned bytes are cheap to move over PCIe and expensive
+        // for the CPU to read, so pinning an activation commits to reloading it.
+        // Stands down when L3 is configured so the two spill mechanisms never mix.
+        if self.checkpoint_l3.is_none()
+            && let Some(slot) = self.backend().checkpoint_pin_offload(&handle, size)?
+        {
+            let old_host = {
+                let tensor = self.raw_tensor_mut(id)?;
+                tensor.device_handle = None;
+                tensor.dirty = Dirty::Host;
+                tensor.checkpoint_residency = CheckpointResidency::Pinned(slot);
+                std::mem::take(&mut tensor.data)
+            };
+            self.checkpoint_offload_pool.recycle(old_host);
+            return Ok(bytes);
+        }
 
         let mut host = self.checkpoint_offload_pool.take(size);
         self.backend().eval(&[&handle])?;
@@ -1124,6 +1184,144 @@ fn shape_size(shape: &[usize]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Host stand-in for the CUDA pinned pool. A slot is `Some` while it holds an
+    /// activation and `None` once released, so the `take().expect(...)` calls fail
+    /// loudly on the two silent-corruption modes: reading a released slot, and
+    /// handing the same slot out twice.
+    #[derive(Debug, Default)]
+    struct PinSpy {
+        slots: std::sync::Mutex<Vec<Option<Vec<f32>>>>,
+    }
+
+    impl PinSpy {
+        fn live(&self, slot: u32) -> bool {
+            self.slots.lock().expect("spy")[slot as usize].is_some()
+        }
+    }
+
+    impl Backend for PinSpy {
+        fn device(&self) -> Device {
+            Device::Cpu
+        }
+
+        // Required trait items, delegated — this spy only overrides the pin methods.
+        fn matmul(
+            &self,
+            a: &DeviceHandle,
+            a_shape: &[usize],
+            b: &DeviceHandle,
+            b_shape: &[usize],
+        ) -> Result<(DeviceHandle, Vec<usize>)> {
+            CpuBackend.matmul(a, a_shape, b, b_shape)
+        }
+
+        fn matmul_forward(
+            &self,
+            a: &[f32],
+            a_shape: &[usize],
+            b: &[f32],
+            b_shape: &[usize],
+        ) -> Result<(Vec<f32>, Vec<usize>)> {
+            CpuBackend.matmul_forward(a, a_shape, b, b_shape)
+        }
+
+        fn add(&self, a: &DeviceHandle, b: &DeviceHandle, shape: &[usize]) -> Result<DeviceHandle> {
+            CpuBackend.add(a, b, shape)
+        }
+
+        fn sum_all(&self, x: &DeviceHandle, shape: &[usize]) -> Result<DeviceHandle> {
+            CpuBackend.sum_all(x, shape)
+        }
+
+        fn checkpoint_pin_offload(&self, handle: &DeviceHandle, len: usize) -> Result<Option<u32>> {
+            let data = self.readback(handle)?;
+            assert_eq!(data.len(), len, "offload length must match the handle");
+            let mut slots = self.slots.lock().expect("spy");
+            slots.push(Some(data));
+            Ok(Some(u32::try_from(slots.len() - 1).expect("slot fits u32")))
+        }
+
+        fn checkpoint_pin_reload(&self, slot: u32, shape: &[usize]) -> Result<DeviceHandle> {
+            let data = self.slots.lock().expect("spy")[slot as usize]
+                .take()
+                .expect("reload of a released slot");
+            assert_eq!(data.len(), shape_size(shape));
+            self.upload(&data, shape)
+        }
+
+        fn checkpoint_pin_readback(&self, slot: u32, dst: &mut [f32]) -> Result<()> {
+            let data = self.slots.lock().expect("spy")[slot as usize]
+                .take()
+                .expect("readback of a released slot");
+            dst.copy_from_slice(&data);
+            Ok(())
+        }
+
+        fn checkpoint_pin_release(&self, slot: u32) {
+            self.slots.lock().expect("spy")[slot as usize] = None;
+        }
+    }
+
+    /// The three ways a pinned checkpoint leaves its slot — reload, host readback,
+    /// and free — must each hand back the exact values and leave no slot live.
+    #[test]
+    fn pinned_checkpoint_reloads_reads_back_and_releases() {
+        let spy = std::sync::Arc::new(PinSpy::default());
+        let mut store = TensorStore::with_backend(spy.clone());
+        let len = crate::runtime_flags::checkpoint_offload_min_bytes()
+            .div_ceil(std::mem::size_of::<f32>());
+        let values = vec![-0.75; len];
+        let bytes = len * std::mem::size_of::<f32>();
+
+        let park = |store: &mut TensorStore| -> TensorId {
+            let id = store.from_slice(&values, &[len]).expect("alloc");
+            store.ensure_device(id).expect("upload");
+            assert_eq!(
+                store.offload_checkpoint_to_host(id).expect("park"),
+                bytes,
+                "the pinned path must report the device bytes it freed"
+            );
+            let tensor = store.tensor(id).expect("parked");
+            assert!(matches!(
+                tensor.checkpoint_residency,
+                CheckpointResidency::Pinned(_)
+            ));
+            assert!(tensor.data.is_empty(), "pinned storage, not a staging copy");
+            assert!(tensor.device_handle.is_none());
+            id
+        };
+        let slot_of = |store: &TensorStore, id: TensorId| match store
+            .tensor(id)
+            .expect("parked")
+            .checkpoint_residency
+        {
+            CheckpointResidency::Pinned(slot) => slot,
+            other => panic!("expected a pinned checkpoint, got {other:?}"),
+        };
+
+        // Reload: the replay path. Residency clears and the value survives.
+        let a = park(&mut store);
+        let slot_a = slot_of(&store, a);
+        store.ensure_checkpoint_device(a).expect("reload");
+        let tensor = store.tensor(a).expect("reloaded");
+        assert_eq!(tensor.checkpoint_residency, CheckpointResidency::None);
+        assert_eq!(tensor.dirty, Dirty::Device);
+        assert_eq!(store.to_host(a).expect("reloaded values"), values);
+        assert!(!spy.live(slot_a), "reload must release the slot");
+
+        // Host readback: `get_mut` / `ensure_host` on a pinned checkpoint.
+        let b = park(&mut store);
+        let slot_b = slot_of(&store, b);
+        assert_eq!(store.to_host(b).expect("read back values"), values);
+        assert!(!spy.live(slot_b), "readback must release the slot");
+
+        // Free without a reload: the slot must not leak.
+        let c = park(&mut store);
+        let slot_c = slot_of(&store, c);
+        store.free(c).expect("free parked");
+        assert!(!spy.live(slot_c), "free must release the slot");
+    }
 
     #[test]
     fn nvrtc_prelude_binds_t_per_dtype() {
