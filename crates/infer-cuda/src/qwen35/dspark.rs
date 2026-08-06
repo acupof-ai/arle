@@ -65,7 +65,9 @@ pub(crate) struct Qwen35DsparkHead {
     cos_cache: DeviceVec,
     sin_cache: DeviceVec,
     /// Per-layer ctx-cache rows (== per-head cache stride): `sliding_window +
-    /// block_size` addressed as an absolute-position ring (`row = pos % cap`).
+    /// block_size`, or the whole per-request ceiling when the draft config
+    /// declares no window. Addressed as an absolute-position ring (`row = pos %
+    /// cap`).
     cap: usize,
     /// RoPE table length = `min(max_seq_len, max_total_tokens) + block_size` —
     /// the per-request token ceiling, NOT the whole KV-pool `max_seq_len`.
@@ -682,25 +684,34 @@ pub(crate) fn load_dspark_head(
         );
     }
 
-    // All draft layers are sliding-window: fixed `window + block` ring cache.
-    // RoPE tables cover the full per-request token ceiling (absolute positions).
+    // Every draft layer runs one ring cache. RoPE tables cover the full
+    // per-request token ceiling (absolute positions).
     let rope_cap = max_seq_len.min(max_total_tokens.max(1)) + cfg.block_size;
-    let cap = cfg.sliding_window + cfg.block_size;
-    let full = cfg
-        .layer_types
-        .iter()
-        .filter(|t| matches!(t, qwen35_spec::DsparkLayerType::Full))
-        .count();
-    if full > 0 {
-        // Honoring them needs a ctx ring the length of the request (671 MB/slot
-        // at 32k vs 42 MB), so they are windowed on purpose — but silently
-        // windowing a full-attention layer moves acceptance, so say it.
-        log::warn!(
-            "dspark draft: {full}/{} layers declare full attention; all run the \
-             {}-token sliding window (ctx ring is {cap} rows)",
-            cfg.layer_types.len(),
-            cfg.sliding_window
-        );
+    let cap = cfg.sliding_window.map_or(rope_cap, |w| w + cfg.block_size);
+    match cfg.sliding_window {
+        // A config with no window buys full attention with a request-length ring
+        // (671 MB/slot at 32k vs 42 MB windowed) — worth one line at load.
+        None => log::info!(
+            "dspark draft: no sliding_window declared; every layer runs full \
+             attention over a {cap}-row ctx ring"
+        ),
+        Some(window) => {
+            let full = cfg
+                .layer_types
+                .iter()
+                .filter(|t| matches!(t, qwen35_spec::DsparkLayerType::Full))
+                .count();
+            if full > 0 {
+                // Honoring them needs a ctx ring the length of the request, so
+                // they are windowed on purpose — but silently windowing a
+                // full-attention layer moves acceptance, so say it.
+                log::warn!(
+                    "dspark draft: {full}/{} layers declare full attention; all run the \
+                     {window}-token sliding window (ctx ring is {cap} rows)",
+                    cfg.layer_types.len(),
+                );
+            }
+        }
     }
     let (cos_cache, sin_cache) =
         crate::ops::precompute_rope(ctx, cfg.head_dim, rope_cap, cfg.rope_theta, None)?;
@@ -726,6 +737,14 @@ pub(crate) struct DsparkRollback<'a> {
     pub(crate) spec: &'a mut Qwen35SpecSlotState,
     pub(crate) start_pos: usize,
     pub(crate) k: usize,
+}
+
+/// Lowest absolute key position a draft row at `pos` may read. HF sliding
+/// window keeps keys with `q_pos - k_pos < window`; no window reaches the
+/// whole prefix.
+fn window_lo(cfg: &DsparkConfig, pos: usize) -> usize {
+    cfg.sliding_window
+        .map_or(0, |w| pos.saturating_sub(w.saturating_sub(1)))
 }
 
 /// Elementwise add over two same-length device buffers.
@@ -904,20 +923,17 @@ impl Qwen35Model {
         let embed_ms = super::mtp_phase_lap(ctx, &mut pt);
 
         let start_abs = scratch.start_pos_abs.upload(&self.ctx, &[start as i32])?;
-        // Per-row attention windows. HF sliding window keeps keys with
-        // q_pos - k_pos < window, never below `ctx_base`; the ctx buffer is an
+        // Per-row attention windows, never below `ctx_base`; the ctx buffer is an
         // absolute ring, so row `row` walks `[lo, start+block)` mapped through
         // `% cap`. `lo` reads only start/row/window/ctx_base — layer-independent,
         // so one table serves all 5 layers and one ragged-window launch replaces
         // `block` single-row ones.
         let mut win = vec![0i32; 2 * block];
         for row in 0..block {
-            let lo = (start + row)
-                .saturating_sub(cfg.sliding_window - 1)
-                .max(df.ctx_base);
+            let lo = window_lo(cfg, start + row).max(df.ctx_base);
             let kv_len = kv_len_total - lo;
-            // kv_len == q_pos+1−lo ≤ window+block == cap, so the ring read never
-            // revisits a physical row (the kernel cannot check this host-side).
+            // kv_len == q_pos+1−lo ≤ cap, so the ring read never revisits a
+            // physical row (the kernel cannot check this host-side).
             ensure!(kv_len <= head.cap, "dspark draft row window {kv_len} > cap");
             win[row] = lo as i32;
             win[block + row] = kv_len as i32;
@@ -1283,9 +1299,7 @@ impl Qwen35Model {
             ids[s * block] = anchors[s] as i32;
             pos[s] = start as i32;
             for row in 0..block {
-                let lo = (start + row)
-                    .saturating_sub(cfg.sliding_window - 1)
-                    .max(df.ctx_base);
+                let lo = window_lo(cfg, start + row).max(df.ctx_base);
                 let kv_len = start + block - lo;
                 ensure!(kv_len <= head.cap, "dspark draft row window {kv_len} > cap");
                 win[s * block + row] = lo as i32;

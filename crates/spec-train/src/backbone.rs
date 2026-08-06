@@ -43,6 +43,18 @@ pub struct Confidence {
     pub with_markov: bool,
 }
 
+/// The heads this run asks for. Authoritative over what a warm-start checkpoint
+/// happens to carry — a DFlash checkpoint carries neither.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Heads {
+    /// 0 trains no markov head.
+    pub markov_rank: usize,
+    /// Comes from the confidence loss weight being > 0. A head that gets no
+    /// gradient still reaches the serve, which obeys it and truncates every
+    /// block by noise.
+    pub confidence: bool,
+}
+
 pub struct Draft {
     pub cfg: DsparkConfig,
     pub fc: TensorId,
@@ -148,7 +160,7 @@ impl Draft {
         let (cos, sin) = rope_tables(&positions, hd, c.rope_theta, store)?;
         let (cos_q, sin_q) = rope_tables(&positions[ctx_len..], hd, c.rope_theta, store)?;
 
-        let window = (!c.layer_types.is_empty()).then_some(c.sliding_window);
+        let window = c.sliding_window.filter(|_| !c.layer_types.is_empty());
         let mask = store.from_slice(
             &crate::mask::additive(blocks, ctx_len, window),
             &[1, rows, kv_len],
@@ -301,61 +313,50 @@ fn rope_tables(
 }
 
 /// Fresh weights: normal(0, 0.02) for projections, ones for norms — HF's
-/// `_init_weights` for Qwen3, which is what the reference trains from.
-/// `vocab` comes from the trunk's `lm_head`, whose rows the draft predicts.
+/// `_init_weights` for Qwen3, which is what the reference trains from. Vocab is
+/// the trunk `lm_head`'s row count, whose distribution the draft predicts.
 pub fn init(
     cfg: DsparkConfig,
-    vocab: usize,
-    markov_rank: usize,
+    heads: Heads,
+    seed: u64,
     embed_tokens: TensorId,
     lm_head: TensorId,
     store: &mut TensorStore,
 ) -> Result<Draft> {
-    let mut seed = 0x5DEE_C0DE_u64;
+    let mut init = Init(seed);
     let (h, hd) = (cfg.hidden_size, cfg.head_dim);
     let (nh, nkv) = (cfg.num_attention_heads, cfg.num_key_value_heads);
-    let mut normal = |rows: usize, cols: usize, store: &mut TensorStore| -> Result<TensorId> {
-        let data: Vec<f32> = (0..rows * cols).map(|_| 0.02 * gauss(&mut seed)).collect();
-        Ok(store.alloc(Tensor::new(data, vec![rows, cols], true)?))
-    };
-    let ones = |n: usize, store: &mut TensorStore| -> Result<TensorId> {
-        Ok(store.alloc(Tensor::new(vec![1.0; n], vec![n], true)?))
-    };
+    let vocab = shape_of(store, lm_head)?[0];
 
     let layers = (0..cfg.num_hidden_layers)
         .map(|_| {
             Ok(Layer {
-                q_proj: normal(nh * hd, h, store)?,
-                k_proj: normal(nkv * hd, h, store)?,
-                v_proj: normal(nkv * hd, h, store)?,
-                o_proj: normal(h, nh * hd, store)?,
+                q_proj: init.normal(nh * hd, h, store)?,
+                k_proj: init.normal(nkv * hd, h, store)?,
+                v_proj: init.normal(nkv * hd, h, store)?,
+                o_proj: init.normal(h, nh * hd, store)?,
                 q_norm: ones(hd, store)?,
                 k_norm: ones(hd, store)?,
                 input_layernorm: ones(h, store)?,
                 post_attention_layernorm: ones(h, store)?,
-                gate_proj: normal(cfg.intermediate_size, h, store)?,
-                up_proj: normal(cfg.intermediate_size, h, store)?,
-                down_proj: normal(h, cfg.intermediate_size, store)?,
+                gate_proj: init.normal(cfg.intermediate_size, h, store)?,
+                up_proj: init.normal(cfg.intermediate_size, h, store)?,
+                down_proj: init.normal(h, cfg.intermediate_size, store)?,
             })
         })
         .collect::<Result<Vec<_>>>()?;
 
-    let markov = match markov_rank {
+    let markov = match heads.markov_rank {
         0 => None,
-        rank => Some(Markov {
-            w1: normal(vocab, rank, store)?,
-            w2: normal(vocab, rank, store)?,
-            rank,
-        }),
+        rank => Some(init.markov(rank, vocab, store)?),
     };
-    let confidence = Some(Confidence {
-        weight: normal(1, h + markov_rank, store)?,
-        bias: store.alloc(Tensor::new(vec![0.0], vec![1], true)?),
-        with_markov: markov.is_some(),
-    });
+    let confidence = heads
+        .confidence
+        .then(|| init.confidence(h, markov.as_ref(), store))
+        .transpose()?;
 
     Ok(Draft {
-        fc: normal(h, cfg.target_layer_ids.len() * h, store)?,
+        fc: init.normal(h, cfg.target_layer_ids.len() * h, store)?,
         hidden_norm: ones(h, store)?,
         norm: ones(h, store)?,
         cfg,
@@ -365,6 +366,44 @@ pub fn init(
         embed_tokens,
         lm_head,
     })
+}
+
+fn ones(n: usize, store: &mut TensorStore) -> Result<TensorId> {
+    Ok(store.alloc(Tensor::new(vec![1.0; n], vec![n], true)?))
+}
+
+/// One splitmix64 stream, so a run reproduces from `--seed` alone. Shared by
+/// [`init`] and the heads [`load`] has to create for a warm start.
+struct Init(u64);
+
+impl Init {
+    fn normal(&mut self, rows: usize, cols: usize, store: &mut TensorStore) -> Result<TensorId> {
+        let data: Vec<f32> = (0..rows * cols)
+            .map(|_| 0.02 * gauss(&mut self.0))
+            .collect();
+        Ok(store.alloc(Tensor::new(data, vec![rows, cols], true)?))
+    }
+
+    fn markov(&mut self, rank: usize, vocab: usize, store: &mut TensorStore) -> Result<Markov> {
+        Ok(Markov {
+            w1: self.normal(vocab, rank, store)?,
+            w2: self.normal(vocab, rank, store)?,
+            rank,
+        })
+    }
+
+    fn confidence(
+        &mut self,
+        hidden: usize,
+        markov: Option<&Markov>,
+        store: &mut TensorStore,
+    ) -> Result<Confidence> {
+        Ok(Confidence {
+            weight: self.normal(1, hidden + markov.map_or(0, |m| m.rank), store)?,
+            bias: store.alloc(Tensor::new(vec![0.0], vec![1], true)?),
+            with_markov: markov.is_some(),
+        })
+    }
 }
 
 /// Box-Muller over splitmix64 — deterministic so a re-init reproduces a run.
@@ -407,8 +446,14 @@ fn host_of(store: &TensorStore, id: TensorId) -> Result<Vec<f32>> {
 }
 
 /// Read a draft checkpoint. `embed_tokens` / `lm_head` are the trunk's.
+///
+/// `heads` decides which heads the returned draft has, not the shard: a warm
+/// start from a DFlash checkpoint carries the backbone alone, and deriving the
+/// heads from tensor presence there yields a draft the serve cannot use.
 pub fn load(
     dir: &Path,
+    heads: Heads,
+    seed: u64,
     embed_tokens: TensorId,
     lm_head: TensorId,
     store: &mut TensorStore,
@@ -443,29 +488,52 @@ pub fn load(
             "{gated}: only the vanilla w1/w2 markov head is wired"
         );
     }
+    let mut init = Init(seed);
     let markov = match shards.has(&names.markov_w1) {
         true => {
             let w1 = shards.param(&names.markov_w1, store)?;
             let rank = shape_of(store, w1)?[1];
+            ensure!(
+                heads.markov_rank == rank,
+                "checkpoint markov rank {rank}, run asks for {}",
+                heads.markov_rank
+            );
             Some(Markov {
                 w1,
                 w2: shards.param(&names.markov_w2, store)?,
                 rank,
             })
         }
-        false => None,
+        false => match heads.markov_rank {
+            0 => None,
+            rank => Some(init.markov(rank, shape_of(store, lm_head)?[0], store)?),
+        },
     };
     let confidence = match shards.has(&names.confidence_weight) {
         true => {
+            ensure!(
+                heads.confidence,
+                "checkpoint carries a confidence head, the run's confidence loss weight is 0"
+            );
             let weight = shards.param(&names.confidence_weight, store)?;
-            let with_markov = shape_of(store, weight)?[1] > cfg.hidden_size;
+            let width = shape_of(store, weight)?[1];
+            let with_markov = width > cfg.hidden_size;
+            let rank = markov.as_ref().map_or(0, |m| m.rank);
+            ensure!(
+                width == cfg.hidden_size + usize::from(with_markov) * rank,
+                "confidence head takes {width} features, this draft supplies {}",
+                cfg.hidden_size + rank
+            );
             Some(Confidence {
                 weight,
                 bias: shards.param(&names.confidence_bias, store)?,
                 with_markov,
             })
         }
-        false => None,
+        false => heads
+            .confidence
+            .then(|| init.confidence(cfg.hidden_size, markov.as_ref(), store))
+            .transpose()?,
     };
 
     Ok(Draft {
@@ -507,8 +575,10 @@ pub fn has_weights(dir: &Path) -> Result<bool> {
 /// `target_layer_ids` is part of the weights, not metadata — `fc` is trained
 /// against that tap order and reading it back in another order is silent
 /// garbage. `speculative_tokens` carries the next-token/same-position bit;
-/// `architectures` is identical for both flavors and never decides it.
-fn config_json(cfg: &DsparkConfig) -> serde_json::Value {
+/// `architectures` is identical for both flavors and never decides it. The head
+/// fields are the reference's `build_draft_config` names.
+fn config_json(draft: &Draft) -> serde_json::Value {
+    let cfg = &draft.cfg;
     let layer_types: Vec<&str> = cfg
         .layer_types
         .iter()
@@ -533,6 +603,11 @@ fn config_json(cfg: &DsparkConfig) -> serde_json::Value {
         "mask_token_id": cfg.mask_token_id,
         "target_layer_ids": cfg.target_layer_ids,
         "speculative_tokens": cfg.max_draft_tokens(),
+        "markov_rank": draft.markov.as_ref().map_or(0, |m| m.rank),
+        "markov_head_type": "vanilla",
+        "enable_confidence_head": draft.confidence.is_some(),
+        "confidence_head_with_markov":
+            draft.confidence.as_ref().is_some_and(|c| c.with_markov),
     })
 }
 
@@ -602,7 +677,7 @@ pub fn save(draft: &Draft, dir: &Path, store: &TensorStore) -> Result<()> {
     std::fs::create_dir_all(dir)?;
     std::fs::write(
         dir.join("config.json"),
-        serde_json::to_string_pretty(&config_json(&draft.cfg))?,
+        serde_json::to_string_pretty(&config_json(draft))?,
     )?;
     let tmp = dir.join("model.safetensors.tmp");
     safetensors::serialize_to_file(views, None, &tmp)
@@ -705,7 +780,7 @@ mod tests {
             head_dim: 4,
             rms_norm_eps: 1e-6,
             rope_theta: 10_000.0,
-            sliding_window: 4096,
+            sliding_window: Some(4096),
             layer_types: vec![DsparkLayerType::Full; 2],
             block_size: 3,
             mask_token_id: 31,
@@ -714,12 +789,25 @@ mod tests {
         }
     }
 
+    const HEADS: Heads = Heads {
+        markov_rank: 4,
+        confidence: true,
+    };
+    /// The draw `taped_gradients_match_finite_differences` is calibrated
+    /// against; other seeds land 0.08-0.17 against its 5e-2 bar.
+    const SEED: u64 = 0x5DEE_C0DE;
+
     fn setup() -> (TensorStore, Tape, Draft) {
+        let (mut store, embed, lm_head) = tables();
+        let draft = init(tiny_cfg(), HEADS, SEED, embed, lm_head, &mut store).unwrap();
+        (store, Tape::new(), draft)
+    }
+
+    fn tables() -> (TensorStore, TensorId, TensorId) {
         let mut store = TensorStore::with_backend(Arc::new(CpuBackend) as Arc<dyn Backend>);
         let embed = init_table(VOCAB, HIDDEN, 1, &mut store);
         let lm_head = init_table(VOCAB, HIDDEN, 2, &mut store);
-        let draft = init(tiny_cfg(), VOCAB, 4, embed, lm_head, &mut store).unwrap();
-        (store, Tape::new(), draft)
+        (store, embed, lm_head)
     }
 
     fn init_table(rows: usize, cols: usize, salt: u64, store: &mut TensorStore) -> TensorId {
@@ -802,6 +890,7 @@ mod tests {
                 weights: &weights,
                 denom: weights.iter().sum(),
                 conf_logits: out.confidence,
+                block_size: blocks[0].targets.len(),
             },
             crate::loss::Weights::default(),
             store,
@@ -954,19 +1043,42 @@ mod tests {
         );
     }
 
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "arle-spec-train-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
     /// `save` -> `load` is the only path by which a trained draft reaches the
     /// serve, and the config it writes is what binds `fc` to its tap order.
     #[test]
     fn a_saved_draft_reloads_as_the_same_model() {
         let (mut store, _tape, draft) = setup();
-        let dir =
-            std::env::temp_dir().join(format!("arle-spec-train-roundtrip-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = scratch("roundtrip");
         save(&draft, &dir, &store).unwrap();
 
-        let back = load(&dir, draft.embed_tokens, draft.lm_head, &mut store).unwrap();
+        let back = load(
+            &dir,
+            HEADS,
+            SEED,
+            draft.embed_tokens,
+            draft.lm_head,
+            &mut store,
+        )
+        .unwrap();
         assert_eq!(back.cfg, draft.cfg);
         assert!(has_weights(&dir).unwrap());
+        // `zip` below would pass on a draft that came back with fewer heads.
+        assert_eq!(back.parameters().len(), draft.parameters().len());
+        assert_eq!(
+            back.markov.as_ref().map(|m| m.rank),
+            Some(HEADS.markov_rank)
+        );
+        assert!(back.confidence.as_ref().is_some_and(|c| c.with_markov));
 
         for (a, b) in draft.parameters().into_iter().zip(back.parameters()) {
             assert_eq!(shape_of(&store, a).unwrap(), shape_of(&store, b).unwrap());
@@ -980,5 +1092,57 @@ mod tests {
             assert!(off <= 0.0039, "parameter {a:?} came back {off} off");
         }
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A confidence head the loss never touched still reaches the serve, which
+    /// obeys it; and a DFlash warm start carries no heads at all, so neither
+    /// end may be read off the shard.
+    #[test]
+    fn heads_follow_the_request_not_the_checkpoint() {
+        let (mut store, embed, lm_head) = tables();
+        let bare = init(
+            tiny_cfg(),
+            Heads::default(),
+            SEED,
+            embed,
+            lm_head,
+            &mut store,
+        )
+        .unwrap();
+        assert!(bare.markov.is_none() && bare.confidence.is_none());
+
+        let dir = scratch("heads");
+        save(&bare, &dir, &store).unwrap();
+        let grown = load(&dir, HEADS, SEED, embed, lm_head, &mut store).unwrap();
+        assert_eq!(grown.markov.as_ref().map(|m| m.rank), Some(4));
+        assert_eq!(
+            shape_of(&store, grown.confidence.as_ref().unwrap().weight).unwrap(),
+            vec![1, HIDDEN + 4]
+        );
+
+        save(&grown, &dir, &store).unwrap();
+        let clash = Heads {
+            markov_rank: 8,
+            ..HEADS
+        };
+        assert!(load(&dir, clash, SEED, embed, lm_head, &mut store).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Two runs at one `--seed` must start from the same weights; the point of
+    /// the flag is that a bench A/B differs only by the arm.
+    #[test]
+    fn init_starts_from_the_seed() {
+        let weights = |seed| {
+            let (mut store, embed, lm_head) = tables();
+            let draft = init(tiny_cfg(), HEADS, seed, embed, lm_head, &mut store).unwrap();
+            draft
+                .parameters()
+                .into_iter()
+                .flat_map(|p| store.to_host(p).unwrap())
+                .collect::<Vec<f32>>()
+        };
+        assert_eq!(weights(42), weights(42));
+        assert_ne!(weights(42), weights(43));
     }
 }

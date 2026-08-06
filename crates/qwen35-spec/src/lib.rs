@@ -1171,7 +1171,8 @@ impl Qwen35Config {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DsparkLayerType {
     Full,
-    /// Sliding-window attention; the window comes from `DsparkConfig::sliding_window`.
+    /// Sliding-window attention; the window comes from
+    /// `DsparkConfig::sliding_window`, which the config must then declare.
     Sliding,
 }
 
@@ -1196,7 +1197,10 @@ pub struct DsparkConfig {
     pub head_dim: usize,
     pub rms_norm_eps: f32,
     pub rope_theta: f32,
-    pub sliding_window: usize,
+    /// `None` = no window. DeepSpec draft configs declare no `sliding_window`
+    /// at all, so substituting one gives a converted checkpoint a reach it was
+    /// never trained with.
+    pub sliding_window: Option<usize>,
     pub layer_types: Vec<DsparkLayerType>,
     pub block_size: usize,
     pub mask_token_id: u32,
@@ -1257,6 +1261,15 @@ impl DsparkConfig {
                 "layer_types length != num_hidden_layers",
             ));
         }
+        let sliding_window = v
+            .get("sliding_window")
+            .and_then(serde_json::Value::as_u64)
+            .map(|n| n as usize);
+        if sliding_window.is_none() && layer_types.contains(&DsparkLayerType::Sliding) {
+            return Err(Qwen35ConfigError::InvalidConfig(
+                "sliding_attention layers without sliding_window",
+            ));
+        }
         let block_size = field("block_size")
             .and_then(serde_json::Value::as_u64)
             .map(|n| n as usize)
@@ -1270,10 +1283,7 @@ impl DsparkConfig {
             head_dim: usize_of("head_dim")?,
             rms_norm_eps: f32_of("rms_norm_eps", 1e-6),
             rope_theta: f32_of("rope_theta", 1e7),
-            sliding_window: v
-                .get("sliding_window")
-                .and_then(serde_json::Value::as_u64)
-                .map_or(2048, |n| n as usize),
+            sliding_window,
             layer_types,
             block_size,
             mask_token_id,
@@ -1297,13 +1307,19 @@ impl DsparkConfig {
     }
 }
 
-/// Additive verify-step cost model `step_ms = bias + row · verify_rows`, the
-/// same shape sglang profiles for its DSpark planner. Defaults are H20
+/// Draft-keep policy for [`dspark_verify_lens`]: the additive verify-step cost
+/// model `step_ms = bias + row · verify_rows` (the same shape sglang profiles
+/// for its DSpark planner) plus the confidence gate. Cost defaults are H20
 /// ThinkingCap-27B c=16 measurements (trunk 116 + draft 95 fixed, 0.53/row).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DsparkSps {
     pub bias_ms: f32,
     pub row_ms: f32,
+    /// `--dspark-confidence-threshold`. `None` = unset, keep the goodput budget.
+    /// `<= 0` turns the gate off and proposes the whole block, which is how
+    /// DeepSpec's `eval.py` measures every published accept_len; `> 0` floors
+    /// the budget's admission cut at that survival.
+    pub confidence_threshold: Option<f32>,
 }
 
 impl Default for DsparkSps {
@@ -1311,6 +1327,7 @@ impl Default for DsparkSps {
         Self {
             bias_ms: 211.0,
             row_ms: 0.53,
+            confidence_threshold: None,
         }
     }
 }
@@ -1322,8 +1339,15 @@ impl Default for DsparkSps {
 /// (cumprod of per-position confidence, monotone decreasing). B=0 is an arm,
 /// so the result never predicts worse than not speculating. Survival is
 /// monotone per request, so the global admission cut yields prefix lengths.
+/// A threshold of 0 short-circuits the whole budget (DeepSpec
+/// `_confident_prefix_length`), which is the only way to measure the drafter
+/// separately from its confidence head.
 pub fn dspark_verify_lens(survivals: &[&[f32]], sps: DsparkSps) -> Vec<usize> {
     const EPS: f32 = 1e-6;
+    if sps.confidence_threshold.is_some_and(|t| t <= 0.0) {
+        return survivals.iter().map(|s| s.len()).collect();
+    }
+    let floor = sps.confidence_threshold.unwrap_or(0.0).max(EPS);
     let r = survivals.len() as f32;
     let mut all: Vec<f32> = survivals
         .iter()
@@ -1343,7 +1367,7 @@ pub fn dspark_verify_lens(survivals: &[&[f32]], sps: DsparkSps) -> Vec<usize> {
     }
     survivals
         .iter()
-        .map(|s| s.iter().take_while(|p| **p >= cut.max(EPS)).count())
+        .map(|s| s.iter().take_while(|p| **p >= cut.max(floor)).count())
         .collect()
 }
 
@@ -1368,8 +1392,36 @@ mod dspark_schedule_tests {
         let dear = DsparkSps {
             bias_ms: 1.0,
             row_ms: 100.0,
+            ..DsparkSps::default()
         };
         assert_eq!(dspark_verify_lens(&[&hi, &hi], dear), vec![0, 0]);
+    }
+
+    /// A drafter cannot be measured while its confidence head decides how much
+    /// of the block ships; DeepSpec's own eval defaults the gate off. Threshold
+    /// 0 must therefore beat every cost argument, and an unset threshold must
+    /// leave the budget exactly as it was.
+    #[test]
+    fn threshold_zero_proposes_the_whole_block() {
+        let lo = [1e-8f32; 4];
+        let dear = DsparkSps {
+            bias_ms: 1.0,
+            row_ms: 100.0,
+            confidence_threshold: Some(0.0),
+        };
+        assert_eq!(dspark_verify_lens(&[&lo, &lo], dear), vec![4, 4]);
+        let unset = DsparkSps {
+            confidence_threshold: None,
+            ..dear
+        };
+        assert_eq!(dspark_verify_lens(&[&lo, &lo], unset), vec![0, 0]);
+        // A positive threshold floors the admission cut at that survival.
+        let hi = [0.9f32, 0.8, 0.7, 0.6];
+        let gated = DsparkSps {
+            confidence_threshold: Some(0.75),
+            ..DsparkSps::default()
+        };
+        assert_eq!(dspark_verify_lens(&[&hi, &hi], gated), vec![2, 2]);
     }
 
     /// The row convention decides where drafts start; reading it wrong is
@@ -1398,6 +1450,32 @@ mod dspark_schedule_tests {
         assert!(!c.next_token_heads);
         let c = write(&format!("{{{body},{ids}}}"));
         assert!(c.next_token_heads);
+    }
+
+    /// DeepSpec draft configs set every layer `full_attention` and carry no
+    /// `sliding_window`; substituting one hands the draft a reach it was never
+    /// trained with, and no correctness gate sees it.
+    #[test]
+    fn absent_sliding_window_means_no_window() {
+        let dir = std::env::temp_dir().join("arle-dspark-window-test");
+        let write = |cfg: &str| {
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("config.json"), cfg).unwrap();
+            DsparkConfig::from_dir(&dir)
+        };
+        let body = r#""architectures":["DSparkDraftModel"],"num_hidden_layers":1,
+            "hidden_size":8,"intermediate_size":8,"num_attention_heads":1,
+            "num_key_value_heads":1,"head_dim":8,"block_size":16,
+            "mask_token_id":1,"target_layer_ids":[0]"#;
+        let c = write(&format!("{{{body}}}")).unwrap();
+        assert_eq!(c.sliding_window, None);
+        let c = write(&format!("{{{body},\"sliding_window\":2048}}")).unwrap();
+        assert_eq!(c.sliding_window, Some(2048));
+        // A windowed layer with no window to apply is a malformed checkpoint.
+        let e = write(&format!(
+            "{{{body},\"layer_types\":[\"sliding_attention\"]}}"
+        ));
+        assert!(e.is_err(), "sliding_attention without sliding_window");
     }
 }
 

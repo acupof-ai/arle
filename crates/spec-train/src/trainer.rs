@@ -7,14 +7,19 @@
 use anyhow::{Result, ensure};
 use autograd::{
     Backend, Optimizer, Tape, TensorId, TensorStore,
+    adamw_state::{AdamWParamState, AdamWState},
     grad_clip::finite_optimizer_step,
     lr_schedule::{CosineWithWarmup, LrSchedule},
     ops,
     optim::AdamW,
 };
-use std::{collections::HashSet, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    path::Path,
+    sync::Arc,
+};
 
-use qwen35_spec::DsparkConfig;
+use qwen35_spec::{DsparkConfig, dspark_tensor_names};
 
 use crate::{
     backbone::{Draft, Input},
@@ -56,7 +61,7 @@ impl Default for Config {
 }
 
 /// One optimizer step, as measured.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct StepStats {
     pub loss: f32,
     pub ce: f32,
@@ -69,6 +74,11 @@ pub struct StepStats {
     pub counted: usize,
     /// Backwards run, summed over those samples.
     pub chunks: usize,
+    pub confidence_bias: f32,
+    pub confidence_abs_error: f32,
+    pub confidence_cumprod_bias: f32,
+    pub tau: f32,
+    pub accept_at: Vec<f32>,
 }
 
 #[derive(Debug)]
@@ -164,7 +174,7 @@ impl Trainer {
                 continue;
             };
             total += out.loss;
-            terms = add_terms(terms, out.terms);
+            terms = add_terms(terms, out.terms, 1.0);
             chunks += out.chunks;
             counted += 1;
             tape.entries.clear();
@@ -200,7 +210,166 @@ impl Trainer {
             lr,
             counted,
             chunks,
+            confidence_bias: terms.confidence_bias / n,
+            confidence_abs_error: terms.confidence_abs_error / n,
+            confidence_cumprod_bias: terms.confidence_cumprod_bias / n,
+            tau: terms.tau / n,
+            accept_at: terms.accept_at.iter().map(|x| x / n).collect(),
         })
+    }
+
+    /// Write `optimizer.safetensors` beside [`crate::backbone::save`]'s
+    /// weights: the AdamW moments and the step both schedules count from.
+    /// Resuming without it restarts the moments at zero and the cosine at step
+    /// 0, so a resumed run takes a different trajectory from an uninterrupted
+    /// one.
+    pub fn state(&self, dir: &Path) -> Result<()> {
+        let names = self.param_names();
+        let state = self.opt.export_state(&names);
+        ensure!(
+            state.skipped_export == 0,
+            "{} AdamW moment entries carry no name — that part of the model \
+             would resume cold",
+            state.skipped_export
+        );
+
+        // f32, unlike the bf16 weights: the second moment runs ~1e-8 and bf16's
+        // 8-bit mantissa would quantize the resumed step size.
+        let buffers: Vec<(String, Vec<usize>, Vec<u8>)> = state
+            .params
+            .iter()
+            .flat_map(|p| {
+                [("exp_avg", &p.m), ("exp_avg_sq", &p.v)].map(|(suffix, moment)| {
+                    (
+                        format!("{}.{suffix}", p.name),
+                        p.shape.clone(),
+                        moment.iter().flat_map(|x| x.to_le_bytes()).collect(),
+                    )
+                })
+            })
+            .collect();
+        let views: Vec<_> = buffers
+            .iter()
+            .map(|(name, shape, bytes)| {
+                let v = safetensors::tensor::TensorView::new(
+                    safetensors::Dtype::F32,
+                    shape.clone(),
+                    bytes,
+                )
+                .expect("f32 view over own buffer");
+                (name.clone(), v)
+            })
+            .collect();
+
+        let meta = HashMap::from([
+            ("trainer_step".to_string(), self.step.to_string()),
+            ("adamw_step".to_string(), state.step.to_string()),
+        ]);
+        std::fs::create_dir_all(dir)?;
+        let tmp = dir.join("optimizer.safetensors.tmp");
+        safetensors::serialize_to_file(views, Some(meta), &tmp)
+            .map_err(|e| anyhow::anyhow!("optimizer save to {} failed: {e}", tmp.display()))?;
+        std::fs::rename(&tmp, dir.join("optimizer.safetensors"))?;
+        Ok(())
+    }
+
+    /// Restore what [`Trainer::state`] wrote. `false` when `dir` holds weights
+    /// but no optimizer state — a checkpoint from before this existed, resumed
+    /// cold on purpose rather than silently.
+    pub fn load_state(&mut self, dir: &Path) -> Result<bool> {
+        let path = dir.join("optimizer.safetensors");
+        if !path.exists() {
+            return Ok(false);
+        }
+        let bytes = std::fs::read(&path)?;
+        let shard = safetensors::SafeTensors::deserialize(&bytes)
+            .map_err(|e| anyhow::anyhow!("parse {}: {e}", path.display()))?;
+        let (_, header) = safetensors::SafeTensors::read_metadata(&bytes)
+            .map_err(|e| anyhow::anyhow!("read metadata of {}: {e}", path.display()))?;
+        let meta = header
+            .metadata()
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("{}: no step metadata", path.display()))?;
+        let step = |key: &str| -> Result<u64> {
+            meta.get(key)
+                .ok_or_else(|| anyhow::anyhow!("{}: {key} missing", path.display()))?
+                .parse()
+                .map_err(|e| anyhow::anyhow!("{}: {key} unparsable: {e}", path.display()))
+        };
+
+        let names = self.param_names();
+        let mut params = Vec::with_capacity(names.len());
+        for (_, name) in &names {
+            let Ok(m) = shard.tensor(&format!("{name}.exp_avg")) else {
+                continue;
+            };
+            let v = shard
+                .tensor(&format!("{name}.exp_avg_sq"))
+                .map_err(|e| anyhow::anyhow!("{name}.exp_avg_sq: {e}"))?;
+            params.push(AdamWParamState {
+                name: name.clone(),
+                shape: m.shape().to_vec(),
+                m: moment_f32(name, &m)?,
+                v: moment_f32(name, &v)?,
+            });
+        }
+        self.opt.import_state(
+            &AdamWState {
+                step: step("adamw_step")?,
+                params,
+                skipped_export: 0,
+            },
+            &names,
+        )?;
+        self.step = step("trainer_step")? as usize;
+        Ok(true)
+    }
+
+    /// Steps taken, so a resumed loop can bound itself and place its sample
+    /// cursor.
+    #[must_use]
+    pub fn step(&self) -> usize {
+        self.step
+    }
+
+    /// [`Draft::parameters`]'s order, tagged with the checkpoint's own tensor
+    /// names — positional keys would silently hand `q_proj`'s moments to
+    /// `o_proj` the moment the parameter list changes shape.
+    fn param_names(&self) -> Vec<(TensorId, String)> {
+        let names = dspark_tensor_names(self.draft.cfg.num_hidden_layers);
+        let mut out = vec![
+            (self.draft.fc, names.fc),
+            (self.draft.hidden_norm, names.hidden_norm),
+            (self.draft.norm, names.norm),
+        ];
+        for (n, l) in names.layers.iter().zip(&self.draft.layers) {
+            out.extend([
+                (l.q_proj, n.q_proj.clone()),
+                (l.k_proj, n.k_proj.clone()),
+                (l.v_proj, n.v_proj.clone()),
+                (l.o_proj, n.o_proj.clone()),
+                (l.q_norm, n.q_norm.clone()),
+                (l.k_norm, n.k_norm.clone()),
+                (l.input_layernorm, n.input_layernorm.clone()),
+                (
+                    l.post_attention_layernorm,
+                    n.post_attention_layernorm.clone(),
+                ),
+                (l.gate_proj, n.gate_proj.clone()),
+                (l.up_proj, n.up_proj.clone()),
+                (l.down_proj, n.down_proj.clone()),
+            ]);
+        }
+        if let Some(m) = &self.draft.markov {
+            out.extend([(m.w1, names.markov_w1), (m.w2, names.markov_w2)]);
+        }
+        if let Some(c) = &self.draft.confidence {
+            out.extend([
+                (c.weight, names.confidence_weight),
+                (c.bias, names.confidence_bias),
+            ]);
+        }
+        out
     }
 
     fn keep_set(&self, store: &TensorStore) -> HashSet<TensorId> {
@@ -282,7 +451,7 @@ impl Trainer {
         {
             let (l, t) = self.chunk_backward(chunk, w, &ctx, scale, store, tape)?;
             out.loss += l;
-            out.terms = add_terms(out.terms, t);
+            out.terms = add_terms(out.terms, t, chunk.len() as f32 / blocks.len() as f32);
             out.chunks += 1;
             tape.entries.clear();
             tape.set_enabled(true);
@@ -372,6 +541,7 @@ impl Trainer {
                 weights,
                 denom: ctx.denom,
                 conf_logits: out.confidence,
+                block_size,
             },
             self.cfg.weights,
             store,
@@ -380,12 +550,39 @@ impl Trainer {
     }
 }
 
-fn add_terms(a: Terms, b: Terms) -> Terms {
+fn moment_f32(name: &str, view: &safetensors::tensor::TensorView<'_>) -> Result<Vec<f32>> {
+    ensure!(
+        view.dtype() == safetensors::Dtype::F32,
+        "{name}: moments must be f32, found {:?}",
+        view.dtype()
+    );
+    Ok(view
+        .data()
+        .chunks_exact(4)
+        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .collect())
+}
+
+/// `share` is `b`'s fraction of the blocks it is folded into. Everything
+/// divided by [`SampleCtx::denom`] is already a share of the sample and adds
+/// straight; `tau` and `accept_at` are means over the chunk's own blocks and
+/// would otherwise count once per chunk.
+fn add_terms(a: Terms, b: Terms, share: f32) -> Terms {
+    let mut accept_at = a.accept_at;
+    accept_at.resize(accept_at.len().max(b.accept_at.len()), 0.0);
+    for (x, y) in accept_at.iter_mut().zip(&b.accept_at) {
+        *x += share * y;
+    }
     Terms {
         ce: a.ce + b.ce,
         tv: a.tv + b.tv,
         conf: a.conf + b.conf,
         mean_accept: a.mean_accept + b.mean_accept,
+        confidence_bias: a.confidence_bias + b.confidence_bias,
+        confidence_abs_error: a.confidence_abs_error + b.confidence_abs_error,
+        confidence_cumprod_bias: a.confidence_cumprod_bias + b.confidence_cumprod_bias,
+        tau: a.tau + share * b.tau,
+        accept_at,
     }
 }
 
@@ -482,7 +679,7 @@ mod tests {
             head_dim: 4,
             rms_norm_eps: 1e-6,
             rope_theta: 10_000.0,
-            sliding_window: 4096,
+            sliding_window: Some(4096),
             layer_types: vec![DsparkLayerType::Full; 2],
             block_size: 3,
             mask_token_id: 23,
@@ -503,8 +700,11 @@ mod tests {
         let mut store = TensorStore::with_backend(backend.clone());
         let embed = table(1, &mut store);
         let lm_head = table(2, &mut store);
-        let draft =
-            crate::backbone::init(cfg(), VOCAB, MARKOV_RANK, embed, lm_head, &mut store).unwrap();
+        let heads = crate::backbone::Heads {
+            markov_rank: MARKOV_RANK,
+            confidence: true,
+        };
+        let draft = crate::backbone::init(cfg(), heads, 7, embed, lm_head, &mut store).unwrap();
         let trainer = Trainer::new(draft, config, 20, backend);
         (store, trainer)
     }
@@ -661,10 +861,10 @@ mod tests {
                     store.to_host(g).unwrap()
                 })
                 .collect::<Vec<_>>();
-            (out.loss, g)
+            (out.loss, g, out.terms)
         };
-        let (whole_loss, whole) = grads(&mut trainer, 9, &mut store);
-        let (split_loss, split) = grads(&mut trainer, 4, &mut store);
+        let (whole_loss, whole, whole_terms) = grads(&mut trainer, 9, &mut store);
+        let (split_loss, split, split_terms) = grads(&mut trainer, 4, &mut store);
 
         assert!(
             whole.iter().flatten().any(|g| g.abs() > 1e-6),
@@ -679,6 +879,21 @@ mod tests {
                 let tol = 1e-4 * (1.0 + x.abs().max(y.abs()));
                 assert!((x - y).abs() <= tol, "grad {x} != {y} across the split");
             }
+        }
+        // `tau` and `accept_at` are means over a chunk's own blocks, so folding
+        // them chunk-by-chunk is where a VRAM knob leaks into a diagnostic.
+        assert!(whole_terms.tau > 1.0, "tau is at its floor — no signal");
+        assert!(
+            (whole_terms.tau - split_terms.tau).abs() <= 1e-5 * whole_terms.tau,
+            "tau moved with the split: {} vs {}",
+            whole_terms.tau,
+            split_terms.tau
+        );
+        for (x, y) in whole_terms.accept_at.iter().zip(&split_terms.accept_at) {
+            assert!(
+                (x - y).abs() <= 1e-5,
+                "accept_at {x} != {y} across the split"
+            );
         }
     }
 
@@ -696,7 +911,7 @@ mod tests {
         let first = trainer
             .train_step(&samples, &mut FakeTarget, &mut store, &mut tape)
             .unwrap();
-        let mut last = first;
+        let mut last = first.clone();
         for _ in 0..9 {
             last = trainer
                 .train_step(&samples, &mut FakeTarget, &mut store, &mut tape)
@@ -721,6 +936,97 @@ mod tests {
             first.mean_accept
         );
         assert!(first.grad_norm > 0.0 && first.counted == 2 && first.chunks == 2);
+    }
+
+    /// A resumed run must take the same step as an uninterrupted one. Zeroed
+    /// AdamW moments and a cosine schedule restarted at step 0 both land here.
+    ///
+    /// The two arms start from the same deterministic init and see the same
+    /// data, so their weights after two steps are identical; only the third
+    /// step can differ, and only through the optimizer.
+    #[test]
+    fn a_resumed_run_matches_an_uninterrupted_one() {
+        let dir = std::env::temp_dir().join("spec-train-resume-state");
+        let _ = std::fs::remove_dir_all(&dir);
+        let samples: Vec<Sample> = (0..2).map(sample).collect();
+        let conf = Config {
+            lr: 5e-2,
+            num_anchors: 8,
+            ..Config::default()
+        };
+
+        let third_step = |rebuild: bool, load: bool| -> (StepStats, Vec<Vec<f32>>) {
+            let (mut store, mut trainer) = setup(conf);
+            let mut tape = Tape::new();
+            for _ in 0..2 {
+                trainer
+                    .train_step(&samples, &mut FakeTarget, &mut store, &mut tape)
+                    .unwrap();
+            }
+            if !rebuild {
+                let stats = trainer
+                    .train_step(&samples, &mut FakeTarget, &mut store, &mut tape)
+                    .unwrap();
+                let w = trainer
+                    .params
+                    .iter()
+                    .map(|&p| store.to_host(p).unwrap())
+                    .collect();
+                return (stats, w);
+            }
+            trainer.state(&dir).unwrap();
+            let backend: Arc<dyn Backend + Send + Sync> = Arc::new(CpuBackend);
+            let mut fresh = Trainer::new(trainer.draft, conf, 20, backend);
+            if load {
+                assert!(
+                    fresh.load_state(&dir).unwrap(),
+                    "no optimizer state was written"
+                );
+            }
+            let stats = fresh
+                .train_step(&samples, &mut FakeTarget, &mut store, &mut tape)
+                .unwrap();
+            let w = fresh
+                .params
+                .iter()
+                .map(|&p| store.to_host(p).unwrap())
+                .collect();
+            (stats, w)
+        };
+
+        let (base, base_w) = third_step(false, false);
+        let (resumed, resumed_w) = third_step(true, true);
+        let (cold, cold_w) = third_step(true, false);
+
+        assert_eq!(resumed.lr, base.lr, "the schedule did not resume at step 2");
+        assert!(
+            (resumed.loss - base.loss).abs() <= 1e-6 * base.loss.abs(),
+            "the two arms diverged before the third step: {} vs {}",
+            base.loss,
+            resumed.loss
+        );
+        for (i, (a, b)) in base_w.iter().zip(&resumed_w).enumerate() {
+            for (x, y) in a.iter().zip(b) {
+                let tol = 1e-5 * (1.0 + x.abs().max(y.abs()));
+                assert!((x - y).abs() <= tol, "parameter {i}: {x} != {y} on resume");
+            }
+        }
+
+        // Without the restored state the same rebuild must move somewhere else,
+        // or the gate is measuring nothing.
+        assert_ne!(
+            cold.lr, base.lr,
+            "the schedule is flat and cannot be a gate"
+        );
+        assert!(
+            base_w
+                .iter()
+                .zip(&cold_w)
+                .flat_map(|(a, b)| a.iter().zip(b))
+                .any(|(x, y)| (x - y).abs() > 1e-5 * (1.0 + x.abs())),
+            "a cold optimizer produced the same step — nothing was restored"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// The control [`the_loop_reduces_the_loss`] needs: a falling loss says
@@ -749,7 +1055,7 @@ mod tests {
         let first = trainer
             .train_step(&samples, &mut FakeTarget, &mut store, &mut tape)
             .unwrap();
-        let mut last = first;
+        let mut last = first.clone();
         for _ in 0..9 {
             last = trainer
                 .train_step(&samples, &mut FakeTarget, &mut store, &mut tape)
