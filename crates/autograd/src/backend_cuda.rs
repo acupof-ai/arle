@@ -199,13 +199,17 @@ impl Bf16Operand<'_> {
     }
 }
 
+/// 64 MiB slot granularity: varying trajectory lengths share size classes instead
+/// of exhausting the budget on exact-fit slots.
+#[cfg(not(feature = "no-cuda"))]
+const PINNED_SLOT_GRANULARITY: usize = 16 << 20;
+
 /// Reusable pinned host buffers holding parked checkpoint activations.
 ///
-/// Slots are permanent once allocated (`cuMemHostAlloc` is expensive and the
-/// pinned pages are unswappable); `free` lists the idle ones. Reuse is
-/// **exact-length** only: `cuMemcpyDtoHAsync` copies the whole destination, so a
-/// longer buffer would read past the source. The OPD checkpoint hiddens are one
-/// or two size classes, so exact-fit costs nothing in practice.
+/// Slots are permanent once allocated; a slot may be larger than the activation, so
+/// every copy names its own length (cudarc's typed memcpy copies the whole dst).
+/// Ordering = the backend's single stream; copies pass plain slices, which record no
+/// host-visible event, so `checkpoint_pin_readback` drains the stream itself.
 #[cfg(not(feature = "no-cuda"))]
 #[derive(Default)]
 struct PinnedCheckpointPool {
@@ -216,7 +220,7 @@ struct PinnedCheckpointPool {
 
 #[cfg(not(feature = "no-cuda"))]
 impl PinnedCheckpointPool {
-    /// An idle slot holding exactly `len` f32, growing the pool while the budget
+    /// An idle slot holding at least `len` f32, growing the pool while the budget
     /// allows. `None` = budget spent, caller falls back to the pageable path.
     fn take(
         &mut self,
@@ -224,15 +228,20 @@ impl PinnedCheckpointPool {
         len: usize,
         budget_bytes: usize,
     ) -> Result<Option<u32>> {
-        let slots = &self.slots;
-        if let Some(index) = self
-            .free
-            .iter()
-            .position(|&slot| slots[slot as usize].len() == len)
-        {
+        let reuse = {
+            let slots = &self.slots;
+            self.free
+                .iter()
+                .enumerate()
+                .filter(|&(_, &slot)| slots[slot as usize].len() >= len)
+                .min_by_key(|&(_, &slot)| slots[slot as usize].len())
+                .map(|(index, _)| index)
+        };
+        if let Some(index) = reuse {
             return Ok(Some(self.free.swap_remove(index)));
         }
-        let bytes = len.saturating_mul(std::mem::size_of::<f32>());
+        let capacity = len.next_multiple_of(PINNED_SLOT_GRANULARITY);
+        let bytes = capacity.saturating_mul(std::mem::size_of::<f32>());
         if self.allocated_bytes.saturating_add(bytes) > budget_bytes {
             return Ok(None);
         }
@@ -241,7 +250,7 @@ impl PinnedCheckpointPool {
         // SAFETY: the buffer is uninitialised here and is written only by the DtoH
         // the caller enqueues next; cudarc frees it (after syncing its event) when
         // the pool drops with the backend.
-        let buf = unsafe { ctx.alloc_pinned::<f32>(len) }.map_err(|_| {
+        let buf = unsafe { ctx.alloc_pinned::<f32>(capacity) }.map_err(|_| {
             AutogradError::TapeInvariant("cuMemHostAlloc for the checkpoint pool failed")
         })?;
         self.slots.push(buf);
@@ -1872,7 +1881,10 @@ impl Backend for CudaBackend {
             };
             // No synchronize: stream order already puts this copy behind the
             // compute that wrote `src` and ahead of `src`'s stream-ordered free.
-            let copied = self.stream.memcpy_dtoh(src, &mut pool.slots[slot as usize]);
+            let copied = match pool.slots[slot as usize].as_mut_slice() {
+                Ok(host) => self.stream.memcpy_dtoh(src, &mut host[..len]),
+                Err(err) => Err(err),
+            };
             if copied.is_err() {
                 pool.release(slot);
                 return Err(AutogradError::TapeInvariant(
@@ -1896,18 +1908,23 @@ impl Backend for CudaBackend {
                 .pinned_checkpoints
                 .lock()
                 .map_err(|_| AutogradError::TapeInvariant("pinned checkpoint pool poisoned"))?;
-            let buf = pool.slot(slot)?;
             let size = shape_size(shape);
-            if buf.len() != size {
-                return Err(AutogradError::DataLengthMismatch {
-                    len: buf.len(),
-                    shape: shape.to_vec(),
-                    size,
-                });
-            }
-            let device = self.stream.clone_htod(buf).map_err(|_| {
-                AutogradError::TapeInvariant("cuda pinned checkpoint htod copy failed")
-            })?;
+            let device = {
+                let buf = pool.slot(slot)?;
+                if buf.len() < size {
+                    return Err(AutogradError::DataLengthMismatch {
+                        len: buf.len(),
+                        shape: shape.to_vec(),
+                        size,
+                    });
+                }
+                let host = buf.as_slice().map_err(|_| {
+                    AutogradError::TapeInvariant("pinned checkpoint host pointer failed")
+                })?;
+                self.stream.clone_htod(&host[..size]).map_err(|_| {
+                    AutogradError::TapeInvariant("cuda pinned checkpoint htod copy failed")
+                })?
+            };
             pool.release(slot);
             Ok(DeviceHandle::Cuda(CudaStorage::new(device)))
         }
@@ -1922,23 +1939,28 @@ impl Backend for CudaBackend {
 
         #[cfg(not(feature = "no-cuda"))]
         {
+            // Copies record no host-visible event; the drain is what proves the DtoH landed.
+            self.stream.synchronize().map_err(|_| {
+                AutogradError::TapeInvariant("cuda synchronize failed (pinned checkpoint readback)")
+            })?;
             let mut pool = self
                 .pinned_checkpoints
                 .lock()
                 .map_err(|_| AutogradError::TapeInvariant("pinned checkpoint pool poisoned"))?;
-            // `as_slice` waits on the buffer's own event, so the DtoH is complete.
-            let src = pool
-                .slot(slot)?
-                .as_slice()
-                .map_err(|_| AutogradError::TapeInvariant("pinned checkpoint host read failed"))?;
-            if src.len() != dst.len() {
-                return Err(AutogradError::DataLengthMismatch {
-                    len: src.len(),
-                    shape: vec![dst.len()],
-                    size: dst.len(),
-                });
+            {
+                let buf = pool.slot(slot)?;
+                if buf.len() < dst.len() {
+                    return Err(AutogradError::DataLengthMismatch {
+                        len: buf.len(),
+                        shape: vec![dst.len()],
+                        size: dst.len(),
+                    });
+                }
+                let src = buf.as_slice().map_err(|_| {
+                    AutogradError::TapeInvariant("pinned checkpoint host read failed")
+                })?;
+                dst.copy_from_slice(&src[..dst.len()]);
             }
-            dst.copy_from_slice(src);
             pool.release(slot);
             Ok(())
         }
