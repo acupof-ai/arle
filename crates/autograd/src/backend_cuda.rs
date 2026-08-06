@@ -53,11 +53,12 @@ use cudarc::cublas::{result as cublas_result, sys as cublas_sys};
 use cudarc::driver::sys::{CUdeviceptr, CUresult, cuMemcpyDtoD_v2};
 #[cfg(not(feature = "no-cuda"))]
 use cudarc::driver::{
-    CudaContext, CudaSlice, CudaStream, DevicePtr, DevicePtrMut, DeviceRepr, PushKernelArg, result,
+    CudaContext, CudaSlice, CudaStream, DevicePtr, DevicePtrMut, DeviceRepr, PinnedHostSlice,
+    PushKernelArg, result,
 };
-#[cfg(not(feature = "no-cuda"))]
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
+#[cfg(not(feature = "no-cuda"))]
+use std::sync::{Arc, Mutex};
 
 use crate::TapeDtype;
 
@@ -198,6 +199,73 @@ impl Bf16Operand<'_> {
     }
 }
 
+/// Reusable pinned host buffers holding parked checkpoint activations.
+///
+/// Slots are permanent once allocated (`cuMemHostAlloc` is expensive and the
+/// pinned pages are unswappable); `free` lists the idle ones. Reuse is
+/// **exact-length** only: `cuMemcpyDtoHAsync` copies the whole destination, so a
+/// longer buffer would read past the source. The OPD checkpoint hiddens are one
+/// or two size classes, so exact-fit costs nothing in practice.
+#[cfg(not(feature = "no-cuda"))]
+#[derive(Default)]
+struct PinnedCheckpointPool {
+    slots: Vec<PinnedHostSlice<f32>>,
+    free: Vec<u32>,
+    allocated_bytes: usize,
+}
+
+#[cfg(not(feature = "no-cuda"))]
+impl PinnedCheckpointPool {
+    /// An idle slot holding exactly `len` f32, growing the pool while the budget
+    /// allows. `None` = budget spent, caller falls back to the pageable path.
+    fn take(
+        &mut self,
+        ctx: &Arc<CudaContext>,
+        len: usize,
+        budget_bytes: usize,
+    ) -> Result<Option<u32>> {
+        let slots = &self.slots;
+        if let Some(index) = self
+            .free
+            .iter()
+            .position(|&slot| slots[slot as usize].len() == len)
+        {
+            return Ok(Some(self.free.swap_remove(index)));
+        }
+        let bytes = len.saturating_mul(std::mem::size_of::<f32>());
+        if self.allocated_bytes.saturating_add(bytes) > budget_bytes {
+            return Ok(None);
+        }
+        let slot = u32::try_from(self.slots.len())
+            .map_err(|_| AutogradError::TapeInvariant("pinned checkpoint pool slot overflow"))?;
+        // SAFETY: the buffer is uninitialised here and is written only by the DtoH
+        // the caller enqueues next; cudarc frees it (after syncing its event) when
+        // the pool drops with the backend.
+        let buf = unsafe { ctx.alloc_pinned::<f32>(len) }.map_err(|_| {
+            AutogradError::TapeInvariant("cuMemHostAlloc for the checkpoint pool failed")
+        })?;
+        self.slots.push(buf);
+        self.allocated_bytes += bytes;
+        Ok(Some(slot))
+    }
+
+    /// Idempotent: a slot already idle is not pushed twice, so a double release
+    /// cannot hand the same buffer to two tensors.
+    fn release(&mut self, slot: u32) {
+        if (slot as usize) < self.slots.len() && !self.free.contains(&slot) {
+            self.free.push(slot);
+        }
+    }
+
+    fn slot(&self, slot: u32) -> Result<&PinnedHostSlice<f32>> {
+        self.slots
+            .get(slot as usize)
+            .ok_or(AutogradError::TapeInvariant(
+                "pinned checkpoint slot out of range",
+            ))
+    }
+}
+
 pub struct CudaBackend {
     tape_dtype: AtomicU8,
     #[cfg(not(feature = "no-cuda"))]
@@ -206,6 +274,8 @@ pub struct CudaBackend {
     blas: Arc<CudaBlas>,
     #[cfg(not(feature = "no-cuda"))]
     kernels: KernelCache,
+    #[cfg(not(feature = "no-cuda"))]
+    pinned_checkpoints: Mutex<PinnedCheckpointPool>,
     #[cfg(all(feature = "nccl", not(feature = "no-cuda")))]
     nccl: Option<Arc<NcclBackend>>,
     /// Seq-collective comm: split subgroup when composed, else same as `nccl`.
@@ -255,6 +325,7 @@ impl CudaBackend {
                 stream,
                 blas: Arc::new(blas),
                 kernels,
+                pinned_checkpoints: Mutex::default(),
                 #[cfg(all(feature = "nccl", not(feature = "no-cuda")))]
                 nccl: None,
                 #[cfg(all(feature = "nccl", not(feature = "no-cuda")))]
@@ -1763,6 +1834,126 @@ impl Backend for CudaBackend {
             self.stream
                 .synchronize()
                 .map_err(|_| AutogradError::TapeInvariant("cuda synchronize failed"))
+        }
+    }
+
+    fn checkpoint_pin_offload(&self, handle: &DeviceHandle, len: usize) -> Result<Option<u32>> {
+        #[cfg(feature = "no-cuda")]
+        {
+            let _ = (handle, len);
+            todo!("GPU required: cuda checkpoint_pin_offload is unavailable under feature no-cuda")
+        }
+
+        #[cfg(not(feature = "no-cuda"))]
+        {
+            let budget = crate::runtime_flags::checkpoint_pinned_offload_bytes();
+            // Only f32 device storage: a bf16/fp8 handle's host image is not the
+            // f32 activation the reload has to hand back.
+            let DeviceHandle::Cuda(storage) = handle else {
+                return Ok(None);
+            };
+            if budget == 0 {
+                return Ok(None);
+            }
+            let src = self.cuda_storage_slice(storage)?;
+            if src.len() != len {
+                return Err(AutogradError::DataLengthMismatch {
+                    len: src.len(),
+                    shape: vec![len],
+                    size: len,
+                });
+            }
+            let mut pool = self
+                .pinned_checkpoints
+                .lock()
+                .map_err(|_| AutogradError::TapeInvariant("pinned checkpoint pool poisoned"))?;
+            let Some(slot) = pool.take(self.stream.context(), len, budget)? else {
+                return Ok(None);
+            };
+            // No synchronize: stream order already puts this copy behind the
+            // compute that wrote `src` and ahead of `src`'s stream-ordered free.
+            let copied = self.stream.memcpy_dtoh(src, &mut pool.slots[slot as usize]);
+            if copied.is_err() {
+                pool.release(slot);
+                return Err(AutogradError::TapeInvariant(
+                    "cuda pinned checkpoint dtoh copy failed",
+                ));
+            }
+            Ok(Some(slot))
+        }
+    }
+
+    fn checkpoint_pin_reload(&self, slot: u32, shape: &[usize]) -> Result<DeviceHandle> {
+        #[cfg(feature = "no-cuda")]
+        {
+            let _ = (slot, shape);
+            todo!("GPU required: cuda checkpoint_pin_reload is unavailable under feature no-cuda")
+        }
+
+        #[cfg(not(feature = "no-cuda"))]
+        {
+            let mut pool = self
+                .pinned_checkpoints
+                .lock()
+                .map_err(|_| AutogradError::TapeInvariant("pinned checkpoint pool poisoned"))?;
+            let buf = pool.slot(slot)?;
+            let size = shape_size(shape);
+            if buf.len() != size {
+                return Err(AutogradError::DataLengthMismatch {
+                    len: buf.len(),
+                    shape: shape.to_vec(),
+                    size,
+                });
+            }
+            let device = self.stream.clone_htod(buf).map_err(|_| {
+                AutogradError::TapeInvariant("cuda pinned checkpoint htod copy failed")
+            })?;
+            pool.release(slot);
+            Ok(DeviceHandle::Cuda(CudaStorage::new(device)))
+        }
+    }
+
+    fn checkpoint_pin_readback(&self, slot: u32, dst: &mut [f32]) -> Result<()> {
+        #[cfg(feature = "no-cuda")]
+        {
+            let _ = (slot, dst);
+            todo!("GPU required: cuda checkpoint_pin_readback is unavailable under feature no-cuda")
+        }
+
+        #[cfg(not(feature = "no-cuda"))]
+        {
+            let mut pool = self
+                .pinned_checkpoints
+                .lock()
+                .map_err(|_| AutogradError::TapeInvariant("pinned checkpoint pool poisoned"))?;
+            // `as_slice` waits on the buffer's own event, so the DtoH is complete.
+            let src = pool
+                .slot(slot)?
+                .as_slice()
+                .map_err(|_| AutogradError::TapeInvariant("pinned checkpoint host read failed"))?;
+            if src.len() != dst.len() {
+                return Err(AutogradError::DataLengthMismatch {
+                    len: src.len(),
+                    shape: vec![dst.len()],
+                    size: dst.len(),
+                });
+            }
+            dst.copy_from_slice(src);
+            pool.release(slot);
+            Ok(())
+        }
+    }
+
+    fn checkpoint_pin_release(&self, slot: u32) {
+        #[cfg(feature = "no-cuda")]
+        {
+            let _ = slot;
+            todo!("GPU required: cuda checkpoint_pin_release is unavailable under feature no-cuda")
+        }
+
+        #[cfg(not(feature = "no-cuda"))]
+        if let Ok(mut pool) = self.pinned_checkpoints.lock() {
+            pool.release(slot);
         }
     }
 
