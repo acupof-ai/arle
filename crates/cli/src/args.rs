@@ -1094,6 +1094,13 @@ pub(crate) struct OpdRuntimeArgs {
     #[arg(long, default_value_t = false, action = clap::ArgAction::Set, value_name = "BOOL")]
     pub(crate) checkpoint_reload_device: bool,
 
+    /// Pinned-host budget for parked checkpoint activations (0 = off, pageable
+    /// path). Pinned buffers make both copy legs async and non-blocking; the
+    /// pages are unswappable, so this is a hard ceiling. An activation it pins is
+    /// always reloaded to device, whatever `--checkpoint-reload-device` says.
+    #[arg(long, default_value_t = 0, value_name = "BYTES")]
+    pub(crate) checkpoint_pinned_offload_bytes: usize,
+
     /// Skip longer update records (0 = unlimited).
     #[arg(long, default_value_t = 23_000, value_name = "TOKENS")]
     pub(crate) max_update_seq: usize,
@@ -1222,6 +1229,7 @@ impl OpdRuntimeArgs {
             autograd: autograd::AutogradRuntimeFlags {
                 checkpoint_offload_min_bytes: self.checkpoint_offload_min_bytes,
                 checkpoint_reload_device: self.checkpoint_reload_device,
+                checkpoint_pinned_offload_bytes: self.checkpoint_pinned_offload_bytes,
                 lora_linear_bwd_tile_rows: self.lora_linear_bwd_tile_rows,
                 moe_lora_bwd_expert_tile: self.moe_lora_bwd_expert_tile,
                 gdr_chunkwise_prefill: self.gdr_chunkwise_prefill,

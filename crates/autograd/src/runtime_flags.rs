@@ -27,6 +27,10 @@ pub struct AutogradRuntimeFlags {
     /// Reload a host-offloaded checkpoint to device before its backward replay
     /// (`--checkpoint-reload-device`).
     pub checkpoint_reload_device: bool,
+    /// Pinned-host budget for parked checkpoint activations, bytes; 0 = off, keep
+    /// the pageable path (`--checkpoint-pinned-offload-bytes`). Pinned pages are
+    /// unswappable, so this is a hard ceiling, not a hint.
+    pub checkpoint_pinned_offload_bytes: usize,
     /// Row tile for the LoRA linear backward (`--lora-linear-bwd-tile-rows`).
     pub lora_linear_bwd_tile_rows: usize,
     /// Expert tile for the MoE LoRA backward (`--moe-lora-bwd-expert-tile`).
@@ -50,6 +54,7 @@ impl Default for AutogradRuntimeFlags {
         Self {
             checkpoint_offload_min_bytes: 2 << 20,
             checkpoint_reload_device: false,
+            checkpoint_pinned_offload_bytes: 0,
             lora_linear_bwd_tile_rows: 1024,
             moe_lora_bwd_expert_tile: 16,
             gdr_chunkwise_prefill: true,
@@ -64,6 +69,7 @@ impl Default for AutogradRuntimeFlags {
 
 static CHECKPOINT_OFFLOAD_MIN_BYTES: AtomicUsize = AtomicUsize::new(2 << 20);
 static CHECKPOINT_RELOAD_DEVICE: AtomicBool = AtomicBool::new(false);
+static CHECKPOINT_PINNED_OFFLOAD_BYTES: AtomicUsize = AtomicUsize::new(0);
 static LORA_LINEAR_BWD_TILE_ROWS: AtomicUsize = AtomicUsize::new(1024);
 static MOE_LORA_BWD_EXPERT_TILE: AtomicUsize = AtomicUsize::new(16);
 static GDR_CHUNKWISE_PREFILL: AtomicBool = AtomicBool::new(false);
@@ -75,6 +81,7 @@ static TAPE_PRECISION: AtomicU8 = AtomicU8::new(0);
 pub fn apply_runtime_flags(f: &AutogradRuntimeFlags) {
     CHECKPOINT_OFFLOAD_MIN_BYTES.store(f.checkpoint_offload_min_bytes, Relaxed);
     CHECKPOINT_RELOAD_DEVICE.store(f.checkpoint_reload_device, Relaxed);
+    CHECKPOINT_PINNED_OFFLOAD_BYTES.store(f.checkpoint_pinned_offload_bytes, Relaxed);
     LORA_LINEAR_BWD_TILE_ROWS.store(f.lora_linear_bwd_tile_rows.max(1), Relaxed);
     MOE_LORA_BWD_EXPERT_TILE.store(f.moe_lora_bwd_expert_tile.max(1), Relaxed);
     GDR_CHUNKWISE_PREFILL.store(f.gdr_chunkwise_prefill, Relaxed);
@@ -91,6 +98,10 @@ pub(crate) fn checkpoint_offload_min_bytes() -> usize {
 }
 pub(crate) fn checkpoint_reload_device() -> bool {
     CHECKPOINT_RELOAD_DEVICE.load(Relaxed)
+}
+#[cfg_attr(any(not(feature = "cuda"), feature = "no-cuda"), allow(dead_code))]
+pub(crate) fn checkpoint_pinned_offload_bytes() -> usize {
+    CHECKPOINT_PINNED_OFFLOAD_BYTES.load(Relaxed)
 }
 /// Test-only A/B lever for the reload arm (the CLI flag is the production path).
 #[cfg(test)]
