@@ -735,11 +735,7 @@ impl Shards {
                 .tensor(name)
                 .map_err(|e| anyhow::anyhow!("read {name}: {e}"))?;
             let data: Vec<f32> = match t.dtype() {
-                safetensors::Dtype::BF16 => t
-                    .data()
-                    .chunks_exact(2)
-                    .map(|b| half::bf16::from_le_bytes([b[0], b[1]]).to_f32())
-                    .collect(),
+                safetensors::Dtype::BF16 => autograd::safetensors_io::bf16_bytes_to_f32(t.data()),
                 safetensors::Dtype::F16 => t
                     .data()
                     .chunks_exact(2)

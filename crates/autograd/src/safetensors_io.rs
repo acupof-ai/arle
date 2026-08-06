@@ -229,6 +229,34 @@ impl safetensors::View for TensorFileBf16View {
     }
 }
 
+/// Widen a little-endian BF16 payload to f32.
+///
+/// The obvious `chunks_exact(2).map(u16::from_le_bytes)` is one scalar
+/// unaligned read per element; `train::qwen35_loader` measured that shape into
+/// a watchdog kill on `embed_tokens`/`lm_head`, which are 1.27 B elements each
+/// on the 27B checkpoints. Bulk-copy first, then widen with a shift.
+#[must_use]
+pub fn bf16_bytes_to_f32(bytes: &[u8]) -> Vec<f32> {
+    let mut bits = vec![0u16; bytes.len() / 2];
+    // SAFETY: `bits` owns `bits.len()` u16 = `bytes.len() & !1` contiguous
+    // bytes, and u16 has no invalid bit patterns.
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            bytes.as_ptr(),
+            bits.as_mut_ptr().cast::<u8>(),
+            bits.len() * 2,
+        );
+    }
+    if cfg!(target_endian = "big") {
+        for b in &mut bits {
+            *b = b.swap_bytes();
+        }
+    }
+    bits.into_iter()
+        .map(|b| f32::from_bits(u32::from(b) << 16))
+        .collect()
+}
+
 fn tensor_view_to_f32(view: &safetensors::tensor::TensorView<'_>) -> Result<Vec<f32>> {
     let data = view.data();
     match view.dtype() {
@@ -236,10 +264,7 @@ fn tensor_view_to_f32(view: &safetensors::tensor::TensorView<'_>) -> Result<Vec<
             .chunks_exact(4)
             .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
             .collect()),
-        Dtype::BF16 => Ok(data
-            .chunks_exact(2)
-            .map(|chunk| f32::from_bits((u16::from_le_bytes([chunk[0], chunk[1]]) as u32) << 16))
-            .collect()),
+        Dtype::BF16 => Ok(bf16_bytes_to_f32(data)),
         Dtype::F16 => Ok(data
             .chunks_exact(2)
             .map(|chunk| half::f16::from_le_bytes([chunk[0], chunk[1]]).to_f32())
