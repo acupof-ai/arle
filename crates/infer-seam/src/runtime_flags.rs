@@ -117,6 +117,11 @@ pub struct CudaRuntimeFlags {
     /// Default 1: only true c=1 speculates.
     #[serde(default = "d_spec_max_batch")]
     pub spec_max_batch: usize,
+    /// DSpark confidence-head early stop. `None` = unset, keep the goodput
+    /// budget; `<= 0` proposes the whole block (how DeepSpec's `eval.py`
+    /// measures a drafter apart from its head); `> 0` floors the admission cut.
+    #[serde(default)]
+    pub dspark_confidence_threshold: Option<f32>,
     /// DeepEP intranode SM budget (positive, even).
     #[serde(default = "d_deepep_num_sms")]
     pub deepep_num_sms: u32,
@@ -150,6 +155,7 @@ impl Default for CudaRuntimeFlags {
             mtp_adaptive: false,
             mtp_min_accept: d_mtp_min_accept(),
             spec_max_batch: d_spec_max_batch(),
+            dspark_confidence_threshold: None,
             deepep_num_sms: d_deepep_num_sms(),
             deepep_max_dispatch_tokens_per_rank: None,
         }
