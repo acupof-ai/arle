@@ -198,3 +198,31 @@ the estimator's dominant terms are per-chunk scores and logits, so hoisting
 
 Still pending-remote: serve-side accept_rate A/B of a trained draft, and the
 full-corpus (57k rows) run on the batch-wide denominator objective.
+
+## Update 2026-08-07 — first serve-side acceptance A/B
+
+Build `b4fix`/`b4fix3` (head `21dec1fa5`/`cfe43a3ce`), H20, same serve flags
+both arms: `--spec-type dspark --dspark-confidence-threshold 0` (goodput gate
+off, raw acceptance), 4 chat prompts x 256 tokens.
+
+| Arm | chains | drafted | accepted | accept_rate |
+|---|---|---|---|---|
+| `/host/Qwen3.6-27B-DFlash` (shipped warm-start) | 264 | 3960 | 760 | 19.2% |
+| `/tmp/spec-smoke/tv400` (from-scratch, 3200 samples) | 963 | 6741 | 57 | 0.85% |
+
+The pipeline round-trips: the trained checkpoint loads through
+`load_dspark_head`, drafts, and lands verified tokens — the serve-alignment
+gates closed the geometry gap this entry opened with. The rate itself measures
+training scale, not the mechanism: 3200 samples vs the reference's ~13.5M.
+The from-scratch arm is not a treatment claim; the decisive run is the 57k
+full corpus (batch-wide denominator objective, `9add3ea1b`) against the
+DFlash warm start.
+
+`b4s100`, 100 steps on the batch-wide denominator: same loss scale
+(2.4-2.6), no NaN, gnorm 0.7-2.2 — the objective change is numerically safe
+at training shape.
+
+Side fix while measuring: one pod-side `kernel_artifacts.sh export` had made
+every later build/run fail `source changed since receipt` — the tarball lands
+in the repo root by design but was not gitignored, and `source_digest` counts
+untracked-unignored files (`cfe43a3ce`).
