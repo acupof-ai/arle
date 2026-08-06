@@ -55,11 +55,40 @@ pub struct Terms {
     /// mean of (cumprod(sigmoid(z)) - cumprod(accept)) over a block — the statistic
     /// the serve actually thresholds.
     pub confidence_cumprod_bias: f32,
-    /// mean over blocks of 1 + sum(cumprod(accept)): expected tokens committed per
-    /// block. Floor 1.0, ceiling 1 + block_size.
-    pub tau: f32,
-    /// accept rate at each within-block position, length block_size.
-    pub accept_at: Vec<f32>,
+    /// Numerator of `tau`: Σ over live blocks of 1 + sum(cumprod(accept)).
+    /// Kept as raw sums so folding across chunks and samples is pooled —
+    /// a per-chunk mean would move with `blocks_per_backward`.
+    pub tau_sum: f32,
+    /// Denominator of `tau`: live block count.
+    pub tau_blocks: f32,
+    /// Numerator of `accept_at`: Σ accept over live rows at each within-block
+    /// position, length block_size.
+    pub accept_at_sum: Vec<f32>,
+    /// Denominator of `accept_at`: live row count at each position.
+    pub accept_at_live: Vec<f32>,
+}
+
+impl Terms {
+    /// Expected tokens committed per block: 1 + Σ cumprod(accept).
+    /// Floor 1.0, ceiling 1 + block_size.
+    #[must_use]
+    pub fn tau(&self) -> f32 {
+        if self.tau_blocks > 0.0 {
+            self.tau_sum / self.tau_blocks
+        } else {
+            0.0
+        }
+    }
+
+    /// Accept rate at each within-block position, length block_size.
+    #[must_use]
+    pub fn accept_at(&self) -> Vec<f32> {
+        self.accept_at_sum
+            .iter()
+            .zip(&self.accept_at_live)
+            .map(|(&sum, &n)| if n > 0.0 { sum / n } else { 0.0 })
+            .collect()
+    }
 }
 
 /// `Σ(x ⊙ w) / denom`. Position decay folds into the constant `w`.
@@ -130,16 +159,10 @@ fn fill_diagnostics(
     terms.confidence_bias = bias / denom;
     terms.confidence_abs_error = abs_error / denom;
     terms.confidence_cumprod_bias = cumprod_bias / denom;
-    terms.tau = if blocks == 0 {
-        0.0
-    } else {
-        tau_sum / blocks as f32
-    };
-    terms.accept_at = pos_accept
-        .iter()
-        .zip(&pos_live)
-        .map(|(&sum, &n)| if n > 0.0 { sum / n } else { 0.0 })
-        .collect();
+    terms.tau_sum = tau_sum;
+    terms.tau_blocks = blocks as f32;
+    terms.accept_at_sum = pos_accept;
+    terms.accept_at_live = pos_live;
 }
 
 pub fn dspark_loss(
@@ -568,7 +591,7 @@ mod tests {
             block_size: 3,
         };
         let (_, terms) = dspark_loss(&b, Weights::default(), &mut s, &mut t).unwrap();
-        assert!((terms.tau - 1.875).abs() < 1e-3, "tau = {}", terms.tau);
+        assert!((terms.tau() - 1.875).abs() < 1e-3, "tau = {}", terms.tau());
         assert_eq!(terms.confidence_bias, 0.0, "no head, no confidence stats");
     }
 
@@ -599,14 +622,14 @@ mod tests {
         let decay = (-0.25f32).exp();
         let live = run(&[1.0, decay, 1.0, decay]);
         assert!(
-            (live.accept_at[0] - 0.75).abs() < 1e-4,
+            (live.accept_at()[0] - 0.75).abs() < 1e-4,
             "{:?}",
-            live.accept_at
+            live.accept_at()
         );
         assert!(
-            (live.accept_at[1] - 0.25).abs() < 1e-4,
+            (live.accept_at()[1] - 0.25).abs() < 1e-4,
             "{:?}",
-            live.accept_at
+            live.accept_at()
         );
         // Raw: the decay that pulls mean_accept off the 0.5 row mean leaves accept_at alone.
         assert!(
@@ -617,10 +640,10 @@ mod tests {
 
         let dead = run(&[1.0, decay, 1.0, 0.0]);
         assert!(
-            (dead.accept_at[1] - 0.5).abs() < 1e-4,
+            (dead.accept_at()[1] - 0.5).abs() < 1e-4,
             "{:?}",
-            dead.accept_at
+            dead.accept_at()
         );
-        assert!((dead.tau - 2.0).abs() < 1e-3, "tau = {}", dead.tau);
+        assert!((dead.tau() - 2.0).abs() < 1e-3, "tau = {}", dead.tau());
     }
 }

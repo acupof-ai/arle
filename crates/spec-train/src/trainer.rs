@@ -181,7 +181,7 @@ impl Trainer {
                 continue;
             };
             total += out.loss;
-            terms = add_terms(terms, out.terms, 1.0);
+            terms = add_terms(terms, out.terms);
             chunks += out.chunks;
             counted += 1;
             tape.entries.clear();
@@ -220,8 +220,8 @@ impl Trainer {
             confidence_bias: terms.confidence_bias / n,
             confidence_abs_error: terms.confidence_abs_error / n,
             confidence_cumprod_bias: terms.confidence_cumprod_bias / n,
-            tau: terms.tau / n,
-            accept_at: terms.accept_at.iter().map(|x| x / n).collect(),
+            tau: terms.tau(),
+            accept_at: terms.accept_at(),
         })
     }
 
@@ -474,7 +474,7 @@ impl Trainer {
         {
             let (l, t) = self.chunk_backward(chunk, w, &ctx, scale, store, tape)?;
             out.loss += l;
-            out.terms = add_terms(out.terms, t, chunk.len() as f32 / blocks.len() as f32);
+            out.terms = add_terms(out.terms, t);
             out.chunks += 1;
             tape.entries.clear();
             tape.set_enabled(true);
@@ -585,15 +585,19 @@ fn moment_f32(name: &str, view: &safetensors::tensor::TensorView<'_>) -> Result<
         .collect())
 }
 
-/// `share` is `b`'s fraction of the blocks it is folded into. Everything
-/// divided by [`SampleCtx::denom`] is already a share of the sample and adds
-/// straight; `tau` and `accept_at` are means over the chunk's own blocks and
-/// would otherwise count once per chunk.
-fn add_terms(a: Terms, b: Terms, share: f32) -> Terms {
-    let mut accept_at = a.accept_at;
-    accept_at.resize(accept_at.len().max(b.accept_at.len()), 0.0);
-    for (x, y) in accept_at.iter_mut().zip(&b.accept_at) {
-        *x += share * y;
+/// Everything divided by [`SampleCtx::denom`] is already a share of the
+/// sample; `tau` and `accept_at` are kept as raw numerator/denominator pairs.
+/// Both add straight, so the fold is invariant to how blocks are chunked.
+fn add_terms(a: Terms, b: Terms) -> Terms {
+    let mut accept_at_sum = a.accept_at_sum;
+    let mut accept_at_live = a.accept_at_live;
+    accept_at_sum.resize(accept_at_sum.len().max(b.accept_at_sum.len()), 0.0);
+    accept_at_live.resize(accept_at_live.len().max(b.accept_at_live.len()), 0.0);
+    for (x, y) in accept_at_sum.iter_mut().zip(&b.accept_at_sum) {
+        *x += y;
+    }
+    for (x, y) in accept_at_live.iter_mut().zip(&b.accept_at_live) {
+        *x += y;
     }
     Terms {
         ce: a.ce + b.ce,
@@ -603,8 +607,10 @@ fn add_terms(a: Terms, b: Terms, share: f32) -> Terms {
         confidence_bias: a.confidence_bias + b.confidence_bias,
         confidence_abs_error: a.confidence_abs_error + b.confidence_abs_error,
         confidence_cumprod_bias: a.confidence_cumprod_bias + b.confidence_cumprod_bias,
-        tau: a.tau + share * b.tau,
-        accept_at,
+        tau_sum: a.tau_sum + b.tau_sum,
+        tau_blocks: a.tau_blocks + b.tau_blocks,
+        accept_at_sum,
+        accept_at_live,
     }
 }
 
@@ -917,16 +923,16 @@ mod tests {
                 assert!((x - y).abs() <= tol, "grad {x} != {y} across the split");
             }
         }
-        // `tau` and `accept_at` are means over a chunk's own blocks, so folding
-        // them chunk-by-chunk is where a VRAM knob leaks into a diagnostic.
-        assert!(whole_terms.tau > 1.0, "tau is at its floor — no signal");
+        // `tau` and `accept_at` fold as raw numerator/denominator sums, so a
+        // VRAM knob cannot leak into a diagnostic.
+        assert!(whole_terms.tau() > 1.0, "tau is at its floor — no signal");
         assert!(
-            (whole_terms.tau - split_terms.tau).abs() <= 1e-5 * whole_terms.tau,
+            (whole_terms.tau() - split_terms.tau()).abs() <= 1e-5 * whole_terms.tau(),
             "tau moved with the split: {} vs {}",
-            whole_terms.tau,
-            split_terms.tau
+            whole_terms.tau(),
+            split_terms.tau()
         );
-        for (x, y) in whole_terms.accept_at.iter().zip(&split_terms.accept_at) {
+        for (x, y) in whole_terms.accept_at().iter().zip(&split_terms.accept_at()) {
             assert!(
                 (x - y).abs() <= 1e-5,
                 "accept_at {x} != {y} across the split"
