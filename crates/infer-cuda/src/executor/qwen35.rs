@@ -1038,6 +1038,16 @@ impl Qwen35CudaExecutor {
                 let profiled_pages = (profiled_tokens / SUPPORTED_PAGE_SIZE as u64) as usize;
                 // #178: flooring the profile at a constant books HBM the card lacks.
                 let sized = profiled_pages.max(1);
+                if profiled_tokens == infer_seam::PROFILE_KV_TOKENS_FLOOR {
+                    // `mem_fraction_static` bounds the engine's share of TOTAL, so any
+                    // value under the weights' own share leaves nothing and admission
+                    // silently caps at 4096 tokens — every longer prompt aborts.
+                    log::warn!(
+                        "KV pool collapsed to the {}-token floor at mem_fraction_static \
+                         {mem_fraction_static}: raise it above the weights' share of total VRAM",
+                        infer_seam::PROFILE_KV_TOKENS_FLOOR,
+                    );
+                }
                 log::info!(
                     "CUDA Qwen3.6 full-attn KV pool profiled from measured VRAM: free {}MB / \
                      total {}MB, recurrent reservation {}MB ({num_slots} slots × {}MB), \

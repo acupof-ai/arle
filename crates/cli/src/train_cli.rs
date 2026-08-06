@@ -3293,11 +3293,11 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
             max_prompt_tokens: cc_total_pages * 16 - 256,
             max_total_tokens: cc_total_pages * 16,
             chunked_prefill_size: Some(CC_SESSION_TOKENS),
-            // The autograd student co-resides with this engine, so the engine
-            // must NOT greedily reserve 0.9 of free VRAM (the SGLang default) —
-            // its KV pool is num_slots-based (small). Cap the static reservation
-            // so the student's weights + writeback activations fit alongside.
-            mem_fraction_static: 0.2,
+            // Share of TOTAL VRAM, not of free: the pool gets
+            // `free − total × (1 − F)`. The hardcoded 0.2 reserved 78 GB of a
+            // 97.5 GB H20 against 68 GB free, collapsing the pool to the
+            // 4096-token floor and aborting every 21K agent prompt.
+            mem_fraction_static: args.runtime.rollout_mem_fraction,
             dspark_draft_model: args.runtime.dspark_draft_model.clone(),
             dspark_sps_bias_ms: args.runtime.dspark_sps_bias_ms,
             dspark_sps_row_ms: args.runtime.dspark_sps_row_ms,
