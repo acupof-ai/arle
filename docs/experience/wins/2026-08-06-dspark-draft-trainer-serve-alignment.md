@@ -17,17 +17,18 @@ training loss must not depend on `--blocks-per-backward`, which is a VRAM knob.
 
 Two confirmed defects made the trained draft mismatch the serve.
 
-1. **Visible context off by one.** At serve
+1. **The context window did not slide per row.** At serve
    (`crates/infer-cuda/src/qwen35/dspark.rs:887,913-921`;
-   `crates/infer-cuda/src/executor/qwen35.rs:1948`) the conditioning token sits
-   at absolute position `start-1` and the context ring runs to `start`
-   exclusive, so the draft reads the conditioning token's own tap. Row `t` has
-   query RoPE position `start + t` and context low bound
-   `(start + t) - (sliding_window - 1)`. Training put row `t` at `anchor + t`
-   and gave it context `[anchor - W, anchor)` — one position low, and missing
-   `taps[anchor]`, the one key the draft always holds at inference. Relative
-   RoPE geometry matched, so no shape or index assertion fired; only the content
-   of the newest key differed.
+   `crates/infer-cuda/src/executor/qwen35.rs:1893-1897,1948,2183`) the anchor is
+   `last_token` at absolute position `start = kv_seq_len`, unforwarded when the
+   draft runs — its tap is appended only after the verify — so the ring holds
+   `[ctx_base, start)`, strictly below the anchor. Row `t` sits at query RoPE
+   `start + t` with low bound `(start + t) - (sliding_window - 1)`: the span
+   narrows by one key per row. Training gave every row the same
+   `[anchor - W, anchor)`, so row `t` saw `1 + t` keys the serve never supplies.
+   The upper bound was already right; a first fix moved it to `anchor + 1` on a
+   misread of `last_token`, which put `taps[anchor]` in reach — the residual row
+   0's own distillation target is projected from — and was reverted.
 2. **`blocks_per_backward` changed the objective.** `loss.rs` recomputed
    `denom` over the current chunk while `trainer.rs` scaled every chunk by
    `1/(batch·chunks)`. A row's effective weight became `w_r/(batch·C·W_c)`

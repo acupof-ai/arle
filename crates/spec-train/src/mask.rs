@@ -12,17 +12,19 @@
 
 use crate::block::Block;
 
-/// Context keys row `t` of the block at `anchor` may reach: `[lo, anchor+1)` with
-/// `lo = (anchor+1+t) - (window-1)`, clamped. That is the serve's per-row sliding
-/// window (`qwen35/dspark.rs`) at `start = anchor + 1`, so the conditioning
-/// token's own tap is in reach — the one key the draft always has at inference.
+/// Context keys row `t` of the block at `anchor` may reach: `[lo, anchor)` with
+/// `lo = (anchor+t) - (window-1)`, clamped. The serve's `start` IS the anchor —
+/// `last_token` has not been forwarded when the draft runs, so its tap is not in
+/// the ring (`executor/qwen35.rs` appends it only after the verify). The span
+/// therefore stops strictly below `anchor`; reaching `taps[anchor]` would hand
+/// the draft the residual its own distillation target is projected from.
 /// The serve runs every draft layer on the sliding ring regardless of
 /// `layer_types`, so training past the window would fit links inference does not
 /// have.
 fn ctx_span(anchor: usize, t: usize, ctx_len: usize, window: Option<usize>) -> (usize, usize) {
-    let hi = (anchor + 1).min(ctx_len);
+    let hi = anchor.min(ctx_len);
     let lo = match window {
-        Some(w) if w > 0 => (anchor + 1 + t).saturating_sub(w - 1),
+        Some(w) if w > 0 => (anchor + t).saturating_sub(w - 1),
         _ => 0,
     };
     (lo.min(hi), hi)
@@ -92,9 +94,9 @@ mod tests {
                 .filter(|&c| m[r * (ctx + q) + c] == 0.0)
                 .collect()
         };
-        assert_eq!(visible(0), vec![0, 1, 2, 3, 16, 17]);
+        assert_eq!(visible(0), vec![0, 1, 2, 16, 17]);
         assert_eq!(visible(1), visible(0), "no causality inside a block");
-        assert_eq!(visible(2), vec![0, 1, 2, 3, 4, 5, 6, 18, 19]);
+        assert_eq!(visible(2), vec![0, 1, 2, 3, 4, 5, 18, 19]);
     }
 
     #[test]
@@ -112,8 +114,9 @@ mod tests {
 
     /// The serve's window, written out from `qwen35/dspark.rs` rather than from
     /// `ctx_span`: `lo = (start + row).saturating_sub(sliding_window - 1)`, keys
-    /// `[lo, start + block)`, with `start = anchor + 1`. It slides per row, so a
-    /// block-wide span silently over-feeds the later rows.
+    /// `[lo, start + block)`. `start` is the anchor's own absolute position —
+    /// `last_token` at `kv_seq_len`, not yet forwarded — so the ring stops below
+    /// it. The span slides per row; a block-wide one over-feeds the later rows.
     #[test]
     fn every_row_reaches_exactly_what_the_serve_gives_it() {
         let (ctx, window, anchor, block_size) = (32usize, 8usize, 20usize, 4usize);
@@ -121,7 +124,7 @@ mod tests {
         let kv = ctx + block_size;
         let m = additive(&blocks, ctx, Some(window));
 
-        let start = anchor + 1;
+        let start = anchor;
         for row in 0..block_size {
             let lo = (start + row).saturating_sub(window - 1);
             let want: Vec<usize> = (lo..start).chain(ctx..kv).collect();
@@ -130,16 +133,17 @@ mod tests {
         }
     }
 
-    /// The conditioning token's own tap is the single key the draft is guaranteed
-    /// at inference; a span ending at `anchor` drops it.
+    /// `taps[anchor]` is the residual `trainer.rs` projects through `lm_head` for
+    /// row 0's target. The serve cannot supply it — the anchor is unforwarded at
+    /// draft time — so reaching it here would fit a shortcut to the answer.
     #[test]
-    fn the_anchor_tap_is_visible() {
+    fn the_anchor_tap_is_out_of_reach() {
         let (ctx, anchor, block_size) = (32usize, 10usize, 4usize);
         let blocks = blocks_at(&[anchor], ctx, block_size);
         for window in [None, Some(0), Some(4), Some(4096)] {
             let m = additive(&blocks, ctx, window);
-            assert_eq!(m[anchor], 0.0, "window {window:?}");
-            assert_eq!(m[anchor + 1], f32::NEG_INFINITY, "and nothing past it");
+            assert_eq!(m[anchor], f32::NEG_INFINITY, "window {window:?}");
+            assert_eq!(m[anchor - 1], 0.0, "but the token before it is in reach");
         }
     }
 
