@@ -72,7 +72,7 @@ pub struct CudaRuntimeFlags {
     #[serde(default = "d_deepgemm_min_routes")]
     pub qwen35_deepgemm_min_routes: usize,
     /// FlashQLA chunked GDN prefill (sm_90a baked Qwen3.6 shard only).
-    #[serde(default)]
+    #[serde(default = "d_true")]
     pub qwen35_gdr_chunked: bool,
     /// Fast page-16 decode-metadata kernel path.
     #[serde(default)]
@@ -136,7 +136,7 @@ impl Default for CudaRuntimeFlags {
             qwen35_fa3: true,
             qwen35_fa3_decode_splits: d_fa3_decode_splits(),
             qwen35_deepgemm_min_routes: d_deepgemm_min_routes(),
-            qwen35_gdr_chunked: false,
+            qwen35_gdr_chunked: true,
             decode_metadata_fast_page16: false,
             marlin_w4_fp8_prefill: false,
             mempool_retain: true,
