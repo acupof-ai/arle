@@ -110,8 +110,8 @@ struct SampleCtx<'a> {
     /// `[seq, hidden]`, the trunk's final hidden state.
     last_hidden: &'a [f32],
     seq: usize,
-    /// `Σ w` over the WHOLE sample. Every chunk divides by this one number, so
-    /// no row's weight depends on which chunk it landed in.
+    /// `Σ w` over the WHOLE batch. Every chunk divides by this one number, so
+    /// no row's weight depends on which chunk or sample it landed in.
     denom: f32,
 }
 
@@ -156,8 +156,10 @@ impl Trainer {
         }
     }
 
-    /// Accumulate over `samples`, clip, and step. Every reported quantity is a
-    /// mean over the samples that produced any supervision.
+    /// Accumulate over `samples`, clip, and step. All rows in the batch share
+    /// one denominator — the batch-wide weight sum — so a sample's influence
+    /// tracks its supervision mass, as in the reference's all-reduced
+    /// denominators, and every reported quantity is a pooled row-weighted mean.
     pub fn train_step(
         &mut self,
         samples: &[Sample],
@@ -168,19 +170,30 @@ impl Trainer {
         ensure!(!samples.is_empty(), "empty batch");
         AdamW::zero_grad(&mut self.opt, &self.params, store);
 
-        let mut total = 0.0;
+        let plans: Vec<Option<(Vec<Block>, Vec<f32>)>> = samples
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                let seed = self
+                    .cfg
+                    .seed
+                    .wrapping_add((self.step * samples.len() + i) as u64);
+                self.plan_sample(s, seed)
+            })
+            .collect::<Result<_>>()?;
+        let denom: f32 = plans.iter().flatten().flat_map(|(_, w)| w).sum();
+        ensure!(denom > 0.0, "no sample in the batch carried supervision");
+
+        let mut loss = 0.0;
         let mut terms = Terms::default();
         let mut counted = 0usize;
         let mut chunks = 0usize;
-        for (i, s) in samples.iter().enumerate() {
-            let seed = self
-                .cfg
-                .seed
-                .wrapping_add((self.step * samples.len() + i) as u64);
-            let Some(out) = self.accumulate(s, seed, samples.len(), target, store, tape)? else {
+        for (s, plan) in samples.iter().zip(&plans) {
+            let Some((blocks, weights)) = plan else {
                 continue;
             };
-            total += out.loss;
+            let out = self.accumulate(s, blocks, weights, denom, target, store, tape)?;
+            loss += out.loss;
             terms = add_terms(terms, out.terms);
             chunks += out.chunks;
             counted += 1;
@@ -188,10 +201,7 @@ impl Trainer {
             tape.set_enabled(true);
             store.retain_ids(&self.keep_set(store, &[]));
         }
-        ensure!(counted > 0, "no sample in the batch carried supervision");
 
-        let n = counted as f32;
-        let loss = total / n;
         let lr = self.schedule.lr(self.step as u64);
         Optimizer::set_lr(&mut self.opt, lr);
         // One finite transaction: a NaN loss or grad norm clears the pending
@@ -209,17 +219,17 @@ impl Trainer {
         store.retain_ids(&self.keep_set(store, &[]));
         Ok(StepStats {
             loss,
-            ce: terms.ce / n,
-            tv: terms.tv / n,
-            conf: terms.conf / n,
-            mean_accept: terms.mean_accept / n,
+            ce: terms.ce,
+            tv: terms.tv,
+            conf: terms.conf,
+            mean_accept: terms.mean_accept,
             grad_norm: grad_norm as f32,
             lr,
             counted,
             chunks,
-            confidence_bias: terms.confidence_bias / n,
-            confidence_abs_error: terms.confidence_abs_error / n,
-            confidence_cumprod_bias: terms.confidence_cumprod_bias / n,
+            confidence_bias: terms.confidence_bias,
+            confidence_abs_error: terms.confidence_abs_error,
+            confidence_cumprod_bias: terms.confidence_cumprod_bias,
             tau: terms.tau(),
             accept_at: terms.accept_at(),
         })
@@ -398,17 +408,11 @@ impl Trainer {
         keep
     }
 
-    /// One sample's backward, accumulated into the params' grads. `None` when
-    /// the sample has no anchorable position.
-    fn accumulate(
-        &self,
-        sample: &Sample,
-        seed: u64,
-        batch: usize,
-        target: &mut dyn Target,
-        store: &mut TensorStore,
-        tape: &mut Tape,
-    ) -> Result<Option<SampleOut>> {
+    /// Anchor sampling, block construction and row weights for one sample —
+    /// the host-only part of [`Self::accumulate`], split out so `train_step`
+    /// can pool every sample's weight sum into the batch denominator before
+    /// any forward runs. `None` when the sample carries no supervision.
+    fn plan_sample(&self, sample: &Sample, seed: u64) -> Result<Option<(Vec<Block>, Vec<f32>)>> {
         ensure!(
             sample.input_ids.len() == sample.loss_mask.len(),
             "input_ids {} != loss_mask {}",
@@ -424,16 +428,30 @@ impl Trainer {
             .iter()
             .map(|&a| block::build_block(&sample.input_ids, &sample.loss_mask, a, block_size))
             .collect::<Result<_>>()?;
-
         let weights: Vec<f32> = blocks
             .iter()
             .flat_map(|b| block::row_weights(b, Some(self.cfg.loss_decay_gamma)))
             .collect();
-        let denom: f32 = weights.iter().sum();
-        if denom <= 0.0 {
+        if weights.iter().sum::<f32>() <= 0.0 {
             return Ok(None);
         }
+        Ok(Some((blocks, weights)))
+    }
 
+    /// One sample's backward, accumulated into the params' grads. `denom` is
+    /// the batch-wide weight sum, so every reported quantity is that sample's
+    /// share of the batch and sums straight across samples — the reference's
+    /// all-reduced denominators (`loss.py:11`).
+    fn accumulate(
+        &self,
+        sample: &Sample,
+        blocks: &[Block],
+        weights: &[f32],
+        denom: f32,
+        target: &mut dyn Target,
+        store: &mut TensorStore,
+        tape: &mut Tape,
+    ) -> Result<SampleOut> {
         let seq = sample.input_ids.len();
         let hidden = self.draft.cfg.hidden_size;
         let (taps, last_hidden) = target.forward(&sample.input_ids)?;
@@ -461,18 +479,17 @@ impl Trainer {
             denom,
         };
 
-        let scale = 1.0 / batch as f32;
         let mut out = SampleOut {
             loss: 0.0,
             terms: Terms::default(),
             chunks: 0,
         };
-        let chunk_rows = self.cfg.blocks_per_backward * block_size;
+        let chunk_rows = self.cfg.blocks_per_backward * self.draft.cfg.block_size;
         for (chunk, w) in blocks
             .chunks(self.cfg.blocks_per_backward)
             .zip(weights.chunks(chunk_rows))
         {
-            let (l, t) = self.chunk_backward(chunk, w, &ctx, scale, store, tape)?;
+            let (l, t) = self.chunk_backward(chunk, w, &ctx, store, tape)?;
             out.loss += l;
             out.terms = add_terms(out.terms, t);
             out.chunks += 1;
@@ -481,16 +498,15 @@ impl Trainer {
             store.retain_ids(&self.keep_set(store, &[ctx.taps, ctx.ctx]));
         }
 
-        // One `fc`/`hidden_norm` backward per sample. `d(Σ ctx⊙g)/dfc =
-        // Σ g·∂ctx/∂fc`, and the chunk backwards already folded `scale` into
-        // `g`, so the surrogate needs no further scaling.
+        // One `fc`/`hidden_norm` backward per sample: `d(Σ ctx⊙g)/dfc =
+        // Σ g·∂ctx/∂fc`.
         if let Some(g) = store.get(ctx.ctx).and_then(|t| t.grad) {
             let live = self.draft.project_context(ctx.taps, store, tape)?;
             let prod = ops::mul(live, g, store, tape)?;
             let surrogate = ops::sum(prod, store, tape)?;
             tape.backward_accumulate_only(surrogate, store)?;
         }
-        Ok(Some(out))
+        Ok(out)
     }
 
     /// Forward + loss + backward for one chunk of blocks. The chunk is the unit
@@ -498,15 +514,14 @@ impl Trainer {
     /// scale with its row count.
     ///
     /// The split is a VRAM knob and nothing else: a block attends only the
-    /// context and its own rows, and every chunk divides by the sample-wide
-    /// `ctx.denom`, so the chunk losses sum to the sample's loss and the chunk
-    /// gradients sum to the sample's gradient however the blocks are cut.
+    /// context and its own rows, and every chunk divides by the batch-wide
+    /// `ctx.denom`, so the chunk losses sum to the batch's loss and the chunk
+    /// gradients sum to the batch's gradient however the blocks are cut.
     fn chunk_backward(
         &self,
         blocks: &[Block],
         weights: &[f32],
         ctx: &SampleCtx<'_>,
-        scale: f32,
         store: &mut TensorStore,
         tape: &mut Tape,
     ) -> Result<(f32, Terms)> {
@@ -515,11 +530,7 @@ impl Trainer {
         }
         let (loss, terms) = self.chunk_loss(blocks, weights, ctx, store, tape)?;
         let value = store.to_host(loss)?[0];
-        // Scale by the fixed sample count, as the reference's fixed
-        // global_batch_size does — not by whatever happened to carry
-        // supervision, which would make the step size data-dependent.
-        let scaled = ops::mul_scalar(loss, scale, store, tape)?;
-        tape.backward_accumulate_only(scaled, store)?;
+        tape.backward_accumulate_only(loss, store)?;
         Ok((value, terms))
     }
 
@@ -891,10 +902,22 @@ mod tests {
         let mut grads = |trainer: &mut Trainer, bpb: usize, store: &mut TensorStore| {
             trainer.cfg.blocks_per_backward = bpb;
             AdamW::zero_grad(&mut trainer.opt, &trainer.params, store);
-            let out = trainer
-                .accumulate(&s, 7, 1, &mut FakeTarget, store, &mut tape)
+            let (blocks, weights) = trainer
+                .plan_sample(&s, 7)
                 .unwrap()
                 .expect("sample carries supervision");
+            let denom: f32 = weights.iter().sum();
+            let out = trainer
+                .accumulate(
+                    &s,
+                    &blocks,
+                    &weights,
+                    denom,
+                    &mut FakeTarget,
+                    store,
+                    &mut tape,
+                )
+                .unwrap();
             assert_eq!(out.chunks, 9usize.div_ceil(bpb));
             let g = trainer
                 .params
@@ -938,6 +961,57 @@ mod tests {
                 "accept_at {x} != {y} across the split"
             );
         }
+    }
+
+    /// The batch denominator is the pooled weight sum, so a sample's influence
+    /// tracks its supervision mass: batch loss = Σ num_i / Σ den_i, not the
+    /// mean of per-sample means.
+    #[test]
+    fn the_batch_pools_one_denominator_across_samples() {
+        let (mut store, trainer) = setup(Config {
+            num_anchors: 9,
+            ..Config::default()
+        });
+        let mut tape = Tape::new();
+        let (a, b) = (sample(0), sample(1));
+
+        let mut run = |s: &Sample, seed: u64, denom_override: Option<f32>| {
+            let (blocks, weights) = trainer
+                .plan_sample(s, seed)
+                .unwrap()
+                .expect("sample carries supervision");
+            let den: f32 = weights.iter().sum();
+            let out = trainer
+                .accumulate(
+                    s,
+                    &blocks,
+                    &weights,
+                    denom_override.unwrap_or(den),
+                    &mut FakeTarget,
+                    &mut store,
+                    &mut tape,
+                )
+                .unwrap();
+            tape.entries.clear();
+            tape.set_enabled(true);
+            store.retain_ids(&trainer.keep_set(&store, &[]));
+            (out.loss, den)
+        };
+
+        let (loss_a, den_a) = run(&a, 7, None);
+        let (loss_b, den_b) = run(&b, 8, None);
+        assert!(
+            (den_a - den_b).abs() > 1e-3,
+            "equal supervision mass ({den_a} vs {den_b}) makes this gate vacuous"
+        );
+
+        let pooled_den = den_a + den_b;
+        let pooled = run(&a, 7, Some(pooled_den)).0 + run(&b, 8, Some(pooled_den)).0;
+        let expected = (loss_a * den_a + loss_b * den_b) / pooled_den;
+        assert!(
+            (pooled - expected).abs() <= 1e-5 * expected.abs(),
+            "pooled loss {pooled} != denom-weighted mean {expected}"
+        );
     }
 
     #[test]
