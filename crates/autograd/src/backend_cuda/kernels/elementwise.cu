@@ -76,6 +76,18 @@ extern "C" __global__ void exp_f32(
     }
 }
 
+extern "C" __global__ void abs_f32(
+    T* out,
+    const T* a,
+    unsigned long long n
+) {
+    unsigned long long i =
+        static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i < n) {
+        out[i] = static_cast<T>(fabsf(static_cast<float>(a[i])));
+    }
+}
+
 extern "C" __global__ void neg_f32(
     T* out,
     const T* a,

@@ -2,7 +2,7 @@
 //!
 //! One sequence yields up to `num_anchors` independent training blocks: at each
 //! anchor `a` the draft predicts positions `a+1 ..= a+block_size` from the prefix
-//! `< a`. That amplification is why offline training sees ~1.8M rows per
+//! `<= a`. That amplification is why offline training sees ~1.8M rows per
 //! optimizer step where an online capture sees one block per decode step — it is
 //! a property of the training-time attention mask, not a data-rate knob.
 //!
@@ -20,7 +20,7 @@ use anyhow::{Result, ensure};
 /// One anchored block's supervision.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Block {
-    /// Trunk position the block hangs off. The draft sees the prefix `< anchor`.
+    /// Trunk position the block hangs off. The draft sees the prefix `<= anchor`.
     pub anchor: usize,
     /// Ground-truth ids at `anchor+1 ..= anchor+block_size`. Indices past the
     /// sequence clamp to the last position, exactly as the reference's
@@ -149,10 +149,22 @@ pub fn noise_token_ids(blocks: &[Block], mask_token_id: u32) -> Vec<u32> {
         .collect()
 }
 
-/// RoPE position of each draft row: `anchor + t`, so row `t` sits where its
-/// condition token sits and predicts the position after it.
+/// RoPE position of each draft row: `anchor + 1 + t` — the position the row
+/// predicts. Matches the serve, where a block starting at `kv_seq_len = anchor+1`
+/// puts row `t` at RoPE position `start + t`.
 #[must_use]
 pub fn draft_positions(blocks: &[Block]) -> Vec<usize> {
+    blocks
+        .iter()
+        .flat_map(|b| (0..b.targets.len()).map(move |t| b.anchor + 1 + t))
+        .collect()
+}
+
+/// Trunk hidden index whose logits are row `t`'s distillation target:
+/// `anchor + t`, since hidden `p` predicts token `p+1` and row `t` predicts
+/// `anchor + 1 + t`.
+#[must_use]
+pub fn target_hidden_positions(blocks: &[Block]) -> Vec<usize> {
     blocks
         .iter()
         .flat_map(|b| (0..b.targets.len()).map(move |t| b.anchor + t))
@@ -255,7 +267,12 @@ mod tests {
             noise_token_ids(&blocks, 999),
             vec![3, 999, 999, 8, 999, 999]
         );
-        assert_eq!(draft_positions(&blocks), vec![3, 4, 5, 8, 9, 10]);
+        assert_eq!(draft_positions(&blocks), vec![4, 5, 6, 9, 10, 11]);
+        assert_eq!(
+            target_hidden_positions(&blocks),
+            vec![3, 4, 5, 8, 9, 10],
+            "the trunk hidden that predicts the row's target sits one below it"
+        );
     }
 
     #[test]

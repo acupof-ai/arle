@@ -3106,7 +3106,6 @@ dependencies = [
  "ahash",
  "anyhow",
  "autograd",
- "chat",
  "half",
  "memmap2",
  "qwen35-spec",

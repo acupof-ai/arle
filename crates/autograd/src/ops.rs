@@ -52,7 +52,7 @@ pub(crate) use collective::{
     all_gather_seq_backward, all_reduce_sum_backward, all_to_all_backward,
     reduce_scatter_sum_backward,
 };
-pub(crate) use elementwise::{add_backward, mul_backward, mul_scalar_backward};
+pub(crate) use elementwise::{abs_backward, add_backward, mul_backward, mul_scalar_backward};
 pub(crate) use embed::embedding_backward;
 pub(crate) use fused_linear_distill::{fused_linear_distill_backward, generalized_jsd_backward};
 pub(crate) use gather::gather_last_dim_backward;
@@ -240,6 +240,11 @@ pub fn add_broadcast(
 
 pub fn add(a: TensorId, b: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<TensorId> {
     elementwise::add(a, b, store, tape)
+}
+
+/// Elementwise `|x|`. Backward is `grad * sign(x)`, with `sign(0) = 0`.
+pub fn abs(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<TensorId> {
+    elementwise::abs(x, store, tape)
 }
 
 pub fn mul(a: TensorId, b: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<TensorId> {
