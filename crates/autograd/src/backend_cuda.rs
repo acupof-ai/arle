@@ -1275,10 +1275,10 @@ impl CudaBackend {
         // quantize the bf16 activation to fp8 and run the fp8 tensor-core GEMM,
         // skipping the per-GEMM weight dequant the bf16 fallback pays. The
         // fallback stays for the flag-off / non-conforming / non-Hopper path.
-        if crate::runtime_flags::fp8_native_gemm() {
-            if let Some(out) = self.matmul_bt_device_fp8_deepgemm(a, a_shape, storage)? {
-                return Ok(out);
-            }
+        if crate::runtime_flags::fp8_native_gemm()
+            && let Some(out) = self.matmul_bt_device_fp8_deepgemm(a, a_shape, storage)?
+        {
+            return Ok(out);
         }
         let (b_bf16, b_shape) = self.fp8_block_scaled_as_bf16(storage)?;
         self.matmul_bt_device_f32_bf16(a, a_shape, &b_bf16, &b_shape)
@@ -1335,17 +1335,17 @@ impl CudaBackend {
         // Single-group quantize metadata: one dense "expert" covering all m rows.
         let active_experts = self
             .stream
-            .memcpy_stod(&[0i32])
+            .clone_htod(&[0i32])
             .map_err(|_| AutogradError::TapeInvariant("fp8 deepgemm active_experts H2D failed"))?;
         let active_offsets = self
             .stream
-            .memcpy_stod(&[0i32])
+            .clone_htod(&[0i32])
             .map_err(|_| AutogradError::TapeInvariant("fp8 deepgemm active_offsets H2D failed"))?;
         let m_i32 = i32::try_from(m)
             .map_err(|_| AutogradError::TapeInvariant("fp8 deepgemm m exceeds i32"))?;
         let active_counts = self
             .stream
-            .memcpy_stod(&[m_i32])
+            .clone_htod(&[m_i32])
             .map_err(|_| AutogradError::TapeInvariant("fp8 deepgemm active_counts H2D failed"))?;
 
         let s = &self.stream;
@@ -2656,6 +2656,8 @@ impl Backend for CudaBackend {
 
         #[cfg(not(feature = "no-cuda"))]
         {
+            #[cfg(not(feature = "nccl"))]
+            let _ = axis;
             let len = shape_size(shape);
             let src = self.cuda_slice(x, "all_reduce_sum")?;
             if src.len() != len {
@@ -2707,6 +2709,8 @@ impl Backend for CudaBackend {
 
         #[cfg(not(feature = "no-cuda"))]
         {
+            #[cfg(not(feature = "nccl"))]
+            let _ = axis;
             let local_len = shape_size(local_shape);
             let src = self.cuda_slice(x, "all_gather_seq")?;
             if src.len() != local_len {
@@ -2780,6 +2784,8 @@ impl Backend for CudaBackend {
 
         #[cfg(not(feature = "no-cuda"))]
         {
+            #[cfg(not(feature = "nccl"))]
+            let _ = axis;
             let local_len = shape_size(local_shape);
             let src = self.cuda_slice(x, "reduce_scatter_sum")?;
 
@@ -2939,6 +2945,8 @@ impl Backend for CudaBackend {
 
         #[cfg(not(feature = "no-cuda"))]
         {
+            #[cfg(not(feature = "nccl"))]
+            let _ = (recv_counts, axis);
             let send_rows: usize = send_counts.iter().sum();
             let src = self.cuda_slice(x, "ep_exchange_rows")?;
             if src.len() != send_rows * dim {
@@ -3066,6 +3074,8 @@ impl Backend for CudaBackend {
 
         #[cfg(not(feature = "no-cuda"))]
         {
+            #[cfg(not(feature = "nccl"))]
+            let _ = axis;
             let rank_n = in_shape.len();
             if scatter_axis == gather_axis || scatter_axis >= rank_n || gather_axis >= rank_n {
                 return Err(AutogradError::TapeInvariant(
