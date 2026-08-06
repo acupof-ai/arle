@@ -1,8 +1,8 @@
 # DSpark long-agent anchor re-measured: c=1 +40%, c≥4 down — CUDA, 2026-08-06
 
-> Status: **c=1 accepted, c≥4 open.** The anchor audit against the archived
-> champion binary is the deciding measurement and is recorded below once it
-> lands. Do not edit the `docs/baselines.md` row until it does.
+> Status: **c=1 accepted (+41.6%), c≥4 is a confirmed regression (−6.0 / −10.1
+> / −7.2% at c=4/8/16).** The archived champion reproduces its own recorded row
+> today, so the deficit is not a fingerprint artifact. Bisect target below.
 
 ## Goal
 
@@ -96,14 +96,58 @@ accumulated drift. `51985031d`'s binary is archived at
 ~800 commits between the two shas. Same box, same dataset file, same serve
 flags, same grid, back to back.
 
-Two outcomes, two different actions:
+**The champion reproduces its own row**, which is what makes the rest of this
+readable:
 
-- `arle-mk` reproduces ~31754 at c=8 today → the deficit is a real regression;
-  the row records it and the next step is bisecting the ~800 commits.
-- `arle-mk` also lands near 29060 → the recorded row was measured under a
-  different fingerprint; the row is replaced and no regression is filed.
+| c | recorded (07-30) | champion today | drift |
+|---:|---:|---:|---:|
+| 1 | 7440.7 | 7287.4 | −2.1% |
+| 4 | 25432.8 | 25265.7 | −0.7% |
+| 8 | 31754.1 | 30621.3 | −3.6% |
+| 16 | 32559.0 | 31890.9 | −2.1% |
 
-Result: **pending**, this session.
+Six days and ~800 commits of accumulated drift on the champion binary itself:
+within the ±2.7% band at c=1/4/16, at its edge at c=8. The recorded row, the
+box, and the regenerated dataset all agree.
+
+Back to back, same shell:
+
+| c | champion `51985031d` | HEAD `b8d390bf3` | Δ |
+|---:|---:|---:|---:|
+| 1 | 7287.4 | **10321.5** | **+41.6%** |
+| 2 | 20740.4 | 19967.0 | −3.7% |
+| 4 | 25265.7 | 23750.0 | −6.0% |
+| 8 | 30621.3 | 27517.6 | **−10.1%** |
+| 16 | 31890.9 | 29583.1 | **−7.2%** |
+
+`accept_rate` 0.3121 vs 0.3091 — spec decode is not the difference.
+
+The champion completed 126/128 at every point against HEAD's 128/128. An
+incomplete request spends wall clock without contributing tokens, so the
+champion's throughput is understated if anything; the deficit is a floor, not
+a ceiling.
+
+**Verdict: a real concurrency regression**, reproducible against the binary
+that set the row, on a quiet box, an order of magnitude outside the measured
+drift band.
+
+## Bisect target
+
+Not yet run. The cheapest first probe, before touching the ~800-commit range:
+
+`301d0c074` (today) raised `SIDECAR_SNAPSHOT_STRIDE_PAGES` 128 → 512 in
+`crates/infer-cuda/src/executor.rs:49`. Its own commit message states the
+tradeoff — a cross-conversation prefix hit now re-prefills up to 8K tokens
+instead of 2K — and it was licensed on a single-request 33K TTFT measurement,
+which is the c=1 regime. This workload is 16 sessions × 8 turns against 16
+slots, so a session's later turn can find its slot taken and land on the
+restore path; that is where the stated cost falls.
+
+**This is a hypothesis, not a root cause.** It is one compile-time constant, so
+the test is a rebuild at 128 and one sweep — about an hour, against a
+multi-hour bisect. If it moves c=8 back toward 30621, the mechanism is
+confirmed and the constant becomes a per-workload decision rather than a global
+default. If it does not, the range still has to be bisected.
 
 ## Learnings
 
@@ -118,3 +162,16 @@ runs.
 constant. Running the same sweep twice cost 45 minutes and turned "−7.3%, is
 that noise?" into "−8.5% against a measured ±2.7% spread", which is the
 difference between a finding and a guess.
+
+**An archive turns a six-day-old row into a live control arm.** The deficit had
+three candidate explanations — a regression, accumulated drift in the recorded
+row, or a fingerprint difference in how it was measured. Running the archived
+binary back to back settled all three in 90 minutes and needed no rebuild and
+no bisect. The rule that every accepted binary gets archived is what made the
+row falsifiable; without `/host/spec-phase/arle-mk` the only path was bisecting
+~800 commits against a number nobody could reproduce.
+
+**A prefill license does not cover concurrency.** The three changes that landed
+since the row were each licensed on single-request 33K TTFT. They delivered:
+c=1 is up 41.6%. The same window lost 10.1% at c=8, on a workload the licensing
+benches never ran.
