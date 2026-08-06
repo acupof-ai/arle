@@ -1957,7 +1957,10 @@ fn run_rubric_opd_impl(args: TrainRubricOpdArgs) -> Result<()> {
             max_prompt_tokens: student_seq,
             max_total_tokens: student_seq,
             chunked_prefill_size: Some(student_seq),
-            mem_fraction_static: args.runtime.rollout_mem_fraction,
+            // Not `--rollout-mem-fraction`: this path loads a third ~35B judge at
+            // 0.9 AFTER this engine, and the envelope above is already the
+            // tightest in the file. Unmeasured at 0.5.
+            mem_fraction_static: 0.2,
             dspark_draft_model: args.runtime.dspark_draft_model.clone(),
             dspark_sps_bias_ms: args.runtime.dspark_sps_bias_ms,
             dspark_sps_row_ms: args.runtime.dspark_sps_row_ms,
@@ -3763,8 +3766,6 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
                 .sum();
             prompt_tokens += g_prompt;
             completion_tokens += g_completion;
-            // Continuing past a non-serving engine spends the remaining task
-            // budget on requests that cannot succeed.
             // Never fatal: `--save-every 0` saves only after the final round, and
             // a failed sandbox spawn also lands here.
             if g_completion == 0 {

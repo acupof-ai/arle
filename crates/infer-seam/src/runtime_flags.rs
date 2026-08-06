@@ -147,7 +147,7 @@ impl Default for CudaRuntimeFlags {
             mempool_retain: d_true(),
             shard_cache_bytes: None,
             numa_pin: d_true(),
-            comm_backend: CommBackend::Auto,
+            comm_backend: CommBackend::default(),
             dsv4_flashmla_decode: None,
             dsv4_dsa_indexer_sms: d_dsa_indexer_sms(),
             dsv4_moe_contig_decode: false,
@@ -198,11 +198,11 @@ fn d_spec_accept_topk() -> i32 {
 impl Default for MetalRuntimeFlags {
     fn default() -> Self {
         Self {
-            pipeline: true,
-            warmup: true,
-            paged_kv_read: true,
+            pipeline: d_true(),
+            warmup: d_true(),
+            paged_kv_read: d_true(),
             host_sampling: false,
-            speculative: true,
+            speculative: d_true(),
             draft_model: None,
             speculative_tokens: None,
             spec_accept_topk: d_spec_accept_topk(),
