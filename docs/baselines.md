@@ -29,15 +29,18 @@ python3 scripts/gen_bench_prompts.py bench-agent-32k-16x8.jsonl 16 32000 214 8
 
 ## Qwen3.6-27B-FP8 · 1×H20 · single-GPU · eager — LONG-AGENT ANCHOR
 
-### SOTA — DSpark, `b8d390bf3` (2026-08-06)
+### SOTA — DSpark, `4933e1bf4` (2026-08-07)
 
-> **c≥4 carries an unresolved decode regression** — TPOT +9.7% at c=8 and
-> +21.5% at c=16 against the binary this row replaces, while c=1 decode is
-> 12.7% faster. Both are recorded below; the audit that separated them, and the
-> bisect target, are in
+> **Part of the c≥4 decode regression is fixed; c=16 still carries about half.**
+> The verify linear core ran a per-row host loop, costing B× the kernel launches
+> per layer; batching it is worth −12.7% TPOT at c=8 and +10.0% total tok/s at
+> c=16 in a counterbalanced A/B
+> ([`wins/2026-08-07-dspark-verify-linear-core-batched.md`](experience/wins/2026-08-07-dspark-verify-linear-core-batched.md)).
+> c=8 is now within 1.4% of the 07-30 champion, c=16 still 5.5% above it. The
+> audit that opened the regression is in
 > [`wins/2026-08-06-dspark-anchor-remeasure-c1-plus-40-percent.md`](experience/wins/2026-08-06-dspark-anchor-remeasure-c1-plus-40-percent.md).
-> Screen a candidate against c=1 freely; a c≥4 comparison is against a known-sick
-> champion until the probe lands.
+> Screen a candidate against c=1 and c=8 freely; c=16 is still against a
+> partly-sick champion.
 
 Features on: batched draft · replay · snapshot · capture · markov+confidence
 head driving the goodput budget. Serve adds `--spec-type dspark
@@ -57,6 +60,11 @@ One serve, ascending, so `pt` is 1st through 5th — every point but c=1 inherit
 a warm cache. `TTFT cold` is the p90 of the 128 requests (16 of them are turn 0);
 `TTFT warm` is the p50.
 
+**Every cell is the mean of two sweeps run in opposite orders.** The arm that
+runs second on a shared box loads cold (1173 s to ready against 15 s) and
+measures 3–6.5% slower — larger than the drift band, so a single sweep confounds
+the binary with its position. Counterbalance any A/B on this row.
+
 `TPOT` is `itl_mean`, and for a spec row that is the only honest per-token
 number: `itl_p50` reads 0.02 ms because it samples the within-chain gap.
 `decode tok/s = 1000 / TPOT` is per request and excludes prefill; `total tok/s`
@@ -64,14 +72,18 @@ is the whole-run figure and does not.
 
 | c | pt | TTFT cold | TTFT warm | TPOT | decode tok/s | total tok/s | req/s |
 |---|---|---:|---:|---:|---:|---:|---:|
-| 1 | 1st | 10.79 s | 0.94 s | 8.41 ms | **118.9** | **10406.8** | 0.298 |
-| 2 | 2nd | 0.70 s | 0.59 s | 18.88 ms | 53.0 | 20752.5 | 0.594 |
-| 4 | 3rd | 1.01 s | 0.62 s | 35.68 ms | 28.0 | 24327.3 | 0.697 |
-| 8 | 4th | 1.52 s | 0.78 s | 67.08 ms | 14.9 | 28669.5 | 0.821 |
-| 16 | 5th | 2.73 s | 1.24 s | 131.32 ms | 7.6 | 30486.2 | 0.873 |
+| 1 | 1st | 10.79 s | 0.80 s | 8.57 ms | **116.7** | **10486.0** | 0.300 |
+| 2 | 2nd | 0.66 s | 0.57 s | 18.66 ms | 53.6 | 21941.2 | 0.629 |
+| 4 | 3rd | 1.03 s | 0.60 s | 35.58 ms | 28.1 | 26853.3 | 0.769 |
+| 8 | 4th | 1.51 s | 0.74 s | **64.61 ms** | 15.5 | 31457.0 | 0.901 |
+| 16 | 5th | 3.46 s | 1.42 s | **117.68 ms** | 8.5 | **32953.9** | 0.944 |
 
-128/128 at every point, 0 errors. `prompt_tokens` 34782/request against a 32000
-target (+8.7%, inside the ±10% bar). Cumulative `accept` 0.3085.
+128/128 at every point, both sweeps, 0 errors. `prompt_tokens` 34782/request
+against a 32000 target (+8.7%, inside the ±10% bar). Cumulative `accept` 0.2996
+— 1.2% below the row this replaces, because the batched recurrent core is not
+bit-identical to per-row FlashQLA and the shifted numerics move which draft
+tokens verify. Correctness is gated by `scripts/needle_concurrent.py` (a
+distinct needle per row at c=2/8/16, ×3) rather than by acceptance.
 
 **Measured drift band, ±2.7%.** The same sweep run twice gave total tok/s
 10444.2 / 20484.9 / 24666.9 / 29450.8 / 31313.7 — the row above is the idle-box
@@ -208,7 +220,9 @@ ITL p50 fit `15.7 + 2.82·B` ms. Gate exact=3 DET at 512/4k/16k/32k. 0 errors,
 - **Dataset** `bench-agent-32k-16x8.jsonl`, sha256 `8867f63eaac2f053…`,
   `prompt_tokens` p50 34828.
 - **Runner** `bench_throughput.py`, 128 req/point, max_tokens 214, greedy,
-  seed 20260416. **Gate** `needle_gate.py 512,4096,16384,32768 3 0.0`.
+  seed 20260416. **Gate** `needle_gate.py 512,4096,16384,32768 3 0.0`; a change
+  that only fires at concurrency needs `needle_concurrent.py` as well, since the
+  ladder is single-request and would run the untouched path.
 - **Metrics** TTFT and decode are separate SLOs, never averaged. Decode =
   token-weighted mean ITL (`Σ itl_s / count`); never `e2e − ttft` (this harness
   carries ~4.7 s teardown, inflating TPOT ~1.85×). Cold = session turn 0,
