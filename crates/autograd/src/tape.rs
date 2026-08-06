@@ -1107,6 +1107,7 @@ impl Tape {
         ))?;
         let param_ids = &entry.input_ids[1..];
 
+        let input_was_parked = store.checkpoint_parked(input_id)?;
         let need_input_grad = store.tensor(input_id)?.requires_grad;
         let mut d_input = need_input_grad
             .then(|| SeqAccum::new(vec![batch, seq, dim], 1, store))
@@ -1171,11 +1172,9 @@ impl Tape {
             self.trim_after_checkpoint_replay(store)?;
             start = end;
         }
-        // Mirror `checkpoint_backward`: under `--checkpoint-reload-device` the
-        // reload above made the full-seq input device-resident for the whole
-        // chunk loop, so park it again to keep the backward high-water at one
-        // hidden. Inert when it never left host (returns 0).
-        if self.offload_checkpoints {
+        // Re-park only an input that arrived parked; a never-parked input
+        // (non-checkpointed forward) would pay a fresh full-seq DtoH + sync here.
+        if self.offload_checkpoints && input_was_parked {
             store.offload_checkpoint_to_host(input_id)?;
         }
 

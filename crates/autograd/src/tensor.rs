@@ -662,6 +662,13 @@ impl TensorStore {
     /// repack it host-side and re-upload the repacked copy instead of doing one
     /// HtoD up front. Off by default: it trades one resident hidden of VRAM for
     /// that host work, and the 80K OPD backward runs at a 5 GB device margin.
+    pub(crate) fn checkpoint_parked(&self, id: TensorId) -> Result<bool> {
+        Ok(!matches!(
+            self.tensor(id)?.checkpoint_residency,
+            CheckpointResidency::None
+        ))
+    }
+
     pub(crate) fn ensure_checkpoint_device(&mut self, id: TensorId) -> Result<()> {
         let reload = match self.tensor(id)?.checkpoint_residency {
             CheckpointResidency::L3 | CheckpointResidency::Pinned(_) => true,
