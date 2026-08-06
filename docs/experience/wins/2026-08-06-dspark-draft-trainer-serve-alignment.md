@@ -155,3 +155,46 @@ breaks, and the probe has not run there. Item 4 is the same regime.
 pending-remote. Local correctness gates pass; no acceptance number exists yet,
 so the tranche is unlicensed for a default flip on the serve side. The next
 wall is the pod run in the Problems list, item 5.
+
+## Update 2026-08-06, evening — norm fix, batch denominator, 400-step run
+
+Commits `cf31adb0c` (final-norm kernel + one-`fc`-backward-per-sample),
+`eefe83719`, `b13aa15d1`, `60f24b113`, `75b04180b` (pooled tau/accept@k),
+`9add3ea1b` (batch-wide denominator). Build `normfix` at `9e4522122`, H20,
+GPU 0/1, ThinkingCap-27B-FP8 trunk, `/tmp/spec-corpus/timing2k.jsonl`
+(1913 samples).
+
+`forward_training_taps` was the one remaining `rms_norm_offset` call on
+`self.norm` after the `e4629d69a` sweep — every distillation target logit was
+computed under the wrong norm kernel (~2.04x per-dim error). The earlier probe
+passed because the oracle used the same wrong path: agreement between a
+co-evolving oracle and the thing it checks is not correctness.
+
+Probe, post-fix (`probe3`, 369-token sample, 16 positions): argmax 0.938,
+top-64 overlap 0.989, mean |delta log p(next)| 0.0155. The earlier
+argmax 1.000 / 0.0120 row above predates the fix and is superseded.
+
+Training (`tv400`): 400 steps, batch 8, 512 anchors, max-len 4096,
+lr 7.5e-5 cosine (sqrt-scaled from the reference's 6e-4 at batch 512),
+per-sample denominator (predates `9add3ea1b`).
+
+| Quantity | step 0 | step 399 |
+|---|---|---|
+| loss | 3.324 | 2.247 |
+| CE | 13.31 | 7.12 |
+| TV | 1.133 | 0.942 |
+| accept | 0.433 | 0.529 |
+| tau | 1.77 | 2.15 |
+| confidence_bias | -0.240 | -0.010 |
+| confidence_abs_error | 0.270 | 0.098 |
+| gnorm | 58.8 | 0.77 |
+
+TV falls monotonically net of batch noise; the confidence head converges to
+unbiased. 3200 samples seen vs the reference's ~13.5M — the run licenses the
+mechanism, not a serve-side acceptance claim. `s/step` 9.5-29.3 tracks the
+per-step chunk count (39-95); ~0.28 s/chunk. Peak activation printed 8.9 GiB:
+the estimator's dominant terms are per-chunk scores and logits, so hoisting
+`fc` out of the chunk loop moves time, not peak.
+
+Still pending-remote: serve-side accept_rate A/B of a trained draft, and the
+full-corpus (57k rows) run on the batch-wide denominator objective.
