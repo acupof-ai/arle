@@ -2233,9 +2233,11 @@ extern "C" CUresult dsv4_deepgemm_fp8_gemm_nt_cuda(
     int k,
     int sfa_aligned_m,
     CUstream stream) {
+  // stream==nullptr is CUDA's legal default stream (handle 0); the training
+  // caller runs on it (autograd holds ctx.default_stream()). pack_quantize
+  // accepts it too — only the launch APIs are consulted, not this guard.
   if (a == nullptr || sfa == nullptr || b == nullptr || sfb == nullptr ||
-      d == nullptr || stream == nullptr || m <= 0 || n <= 0 || k <= 0 ||
-      sfa_aligned_m < m) {
+      d == nullptr || m <= 0 || n <= 0 || k <= 0 || sfa_aligned_m < m) {
     return CUDA_ERROR_INVALID_VALUE;
   }
   if ((k % kScaleGranK) != 0 || (n % 8) != 0 ||
