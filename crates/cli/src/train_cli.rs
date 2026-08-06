@@ -1957,12 +1957,8 @@ fn run_rubric_opd_impl(args: TrainRubricOpdArgs) -> Result<()> {
             max_prompt_tokens: student_seq,
             max_total_tokens: student_seq,
             chunked_prefill_size: Some(student_seq),
-            // The autograd student co-resides with this engine (same as agent-opd),
-            // so it must NOT greedily reserve 0.9 of free VRAM (the SGLang serving
-            // default) — the KV pool is num_slots-based (small). Without this cap the
-            // ~0.9 arena leaves fixed ~10% headroom on ANY card, so the masked-CE
-            // writeback OOMs (`cuda alloc_zeros failed`) GPU-size-independently.
-            mem_fraction_static: 0.2,
+            // Co-resident with the autograd student, so it cannot take serve's 0.9.
+            mem_fraction_static: args.runtime.rollout_mem_fraction,
             dspark_draft_model: args.runtime.dspark_draft_model.clone(),
             dspark_sps_bias_ms: args.runtime.dspark_sps_bias_ms,
             dspark_sps_row_ms: args.runtime.dspark_sps_row_ms,
@@ -3304,12 +3300,7 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
             // MTP GPU gate passed 2026-07-17 (1.21×); default-on waits for the
             // depth sweep + an in-loop A/B.
             mtp_draft_tokens: args.runtime.mtp_draft_tokens,
-            cuda: infer_api::CudaRuntimeFlags {
-                qwen35_decode_graph: args.runtime.qwen35_decode_graph,
-                qwen35_gdr_chunked: args.runtime.qwen35_gdr_chunked,
-                mempool_retain: args.runtime.cuda_mempool_retain,
-                ..Default::default()
-            },
+            cuda: args.runtime.cuda_runtime_flags(),
             ..EngineLoadConfig::default()
         },
     )
@@ -3779,11 +3770,15 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
             completion_tokens += g_completion;
             // Continuing past a non-serving engine spends the remaining task
             // budget on requests that cannot succeed.
+            // Never fatal: `--save-every 0` writes adapters only after the final
+            // round, so an abort here discards every completed round. A sandbox
+            // that failed to spawn or timed out also lands here (cc_output_tokens
+            // is None), so 0 is not proof the engine died.
             if g_completion == 0 {
-                bail!(
-                    "group {group_idx} ({}) generated 0 completion tokens across {} sample(s): \
-                     the rollout engine is not serving. Check the engine log for a closed engine \
-                     thread or a KV pool collapsed to the token floor.",
+                eprintln!(
+                    "[agent-opd] group {group_idx} ({}) generated 0 completion tokens across {} \
+                     sample(s) — check the engine log for a closed engine thread or a KV pool \
+                     collapsed to the token floor",
                     group.task_id,
                     group.samples.len(),
                 );
@@ -4792,11 +4787,7 @@ fn load_opd_infer_student(
             mem_fraction_static: runtime.rollout_mem_fraction,
             // Whole-step decode graph for the rollout: eager per-token decode is
             // host-launch-bound (~156 ms/token), the OPD step's dominant cost.
-            cuda: infer_api::CudaRuntimeFlags {
-                qwen35_decode_graph: runtime.qwen35_decode_graph,
-                qwen35_gdr_chunked: runtime.qwen35_gdr_chunked,
-                ..Default::default()
-            },
+            cuda: runtime.cuda_runtime_flags(),
             ..EngineLoadConfig::single_sequence(max_seq_len)
         },
     )

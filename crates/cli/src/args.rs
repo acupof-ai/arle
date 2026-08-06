@@ -1244,6 +1244,21 @@ impl OpdRuntimeArgs {
             },
         }
     }
+
+    /// CUDA toggles for the rollout engine's `EngineLoadConfig.cuda`, mirroring
+    /// [`ServeArgs::cuda_runtime_flags`]. Both OPD rollout engines build their
+    /// flags here: hand-written literals had already dropped `mempool_retain` on
+    /// one of the two paths, so `--cuda-mempool-retain false` was honored for
+    /// agent-OPD and silently ignored for plain OPD.
+    #[cfg(feature = "cuda")]
+    pub(crate) fn cuda_runtime_flags(&self) -> infer_api::CudaRuntimeFlags {
+        infer_api::CudaRuntimeFlags {
+            qwen35_decode_graph: self.qwen35_decode_graph,
+            qwen35_gdr_chunked: self.qwen35_gdr_chunked,
+            mempool_retain: self.cuda_mempool_retain,
+            ..Default::default()
+        }
+    }
 }
 
 #[derive(Debug, Clone, clap::Args)]
