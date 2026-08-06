@@ -487,7 +487,12 @@ pub fn load(
     lm_head: TensorId,
     store: &mut TensorStore,
 ) -> Result<Draft> {
-    let cfg = DsparkConfig::from_dir(dir)?;
+    let mut cfg = DsparkConfig::from_dir(dir)?;
+    // Training supervision is unconditionally next-token (row `t` targets
+    // `anchor+1+t`), so a draft loaded here — including a same-position DFlash
+    // warm start — is next-token geometry, and the checkpoint saved from it
+    // must say so or the serve reads every row one position off.
+    cfg.next_token_heads = true;
     let names = dspark_tensor_names(cfg.num_hidden_layers);
     let shards = Shards::open(dir)?;
 
