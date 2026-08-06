@@ -1957,7 +1957,6 @@ fn run_rubric_opd_impl(args: TrainRubricOpdArgs) -> Result<()> {
             max_prompt_tokens: student_seq,
             max_total_tokens: student_seq,
             chunked_prefill_size: Some(student_seq),
-            // Co-resident with the autograd student, so it cannot take serve's 0.9.
             mem_fraction_static: args.runtime.rollout_mem_fraction,
             dspark_draft_model: args.runtime.dspark_draft_model.clone(),
             dspark_sps_bias_ms: args.runtime.dspark_sps_bias_ms,
@@ -3289,10 +3288,6 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
             max_prompt_tokens: cc_total_pages * 16 - 256,
             max_total_tokens: cc_total_pages * 16,
             chunked_prefill_size: Some(CC_SESSION_TOKENS),
-            // Share of TOTAL VRAM, not of free: the pool gets
-            // `free − total × (1 − F)`. The hardcoded 0.2 reserved 78 GB of a
-            // 97.5 GB H20 against 68 GB free, collapsing the pool to the
-            // 4096-token floor and aborting every 21K agent prompt.
             mem_fraction_static: args.runtime.rollout_mem_fraction,
             dspark_draft_model: args.runtime.dspark_draft_model.clone(),
             dspark_sps_bias_ms: args.runtime.dspark_sps_bias_ms,
@@ -3770,10 +3765,8 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
             completion_tokens += g_completion;
             // Continuing past a non-serving engine spends the remaining task
             // budget on requests that cannot succeed.
-            // Never fatal: `--save-every 0` writes adapters only after the final
-            // round, so an abort here discards every completed round. A sandbox
-            // that failed to spawn or timed out also lands here (cc_output_tokens
-            // is None), so 0 is not proof the engine died.
+            // Never fatal: `--save-every 0` saves only after the final round, and
+            // a failed sandbox spawn also lands here.
             if g_completion == 0 {
                 eprintln!(
                     "[agent-opd] group {group_idx} ({}) generated 0 completion tokens across {} \

@@ -1182,11 +1182,10 @@ pub(crate) struct OpdRuntimeArgs {
     #[arg(long, value_name = "N")]
     pub(crate) mtp_draft_tokens: Option<usize>,
 
-    /// Share of TOTAL VRAM the in-process rollout engine may hold: its KV pool
-    /// gets `free − total × (1 − F)`, so F below the weights' own share of total
-    /// (0.30 for the 27B on an H20) yields a zero-size pool and every prompt
-    /// longer than the 4096-token floor is aborted. Above the co-resident
-    /// autograd student's headroom it OOMs the writeback instead.
+    /// Share of TOTAL VRAM for the rollout engine (see
+    /// `infer_seam::profile_kv_pool_tokens`). Below the weights' own share of
+    /// total the pool collapses to the token floor; above the co-resident
+    /// student's headroom the writeback OOMs.
     #[arg(long, default_value_t = 0.5, value_name = "F")]
     pub(crate) rollout_mem_fraction: f64,
 }
@@ -1245,11 +1244,7 @@ impl OpdRuntimeArgs {
         }
     }
 
-    /// CUDA toggles for the rollout engine's `EngineLoadConfig.cuda`, mirroring
-    /// [`ServeArgs::cuda_runtime_flags`]. Both OPD rollout engines build their
-    /// flags here: hand-written literals had already dropped `mempool_retain` on
-    /// one of the two paths, so `--cuda-mempool-retain false` was honored for
-    /// agent-OPD and silently ignored for plain OPD.
+    /// CUDA toggles for the rollout engine. Both OPD engines build them here.
     #[cfg(feature = "cuda")]
     pub(crate) fn cuda_runtime_flags(&self) -> infer_api::CudaRuntimeFlags {
         infer_api::CudaRuntimeFlags {
@@ -2534,6 +2529,19 @@ mod tests {
         RunArgs, TrainCommand,
     };
     use clap::{CommandFactory, Parser};
+
+    /// The two divergences are deliberate; a third fails this test.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn serve_defaults_match_the_seam_defaults() {
+        let serve = super::ServeArgs::parse_from(["arle-serve"]).cuda_runtime_flags();
+        let expected = infer_api::CudaRuntimeFlags {
+            dsv4_decode_reuse: serve.dsv4_decode_reuse, // licensed on serve only
+            comm_backend: serve.comm_backend,           // serve forces NCCL
+            ..Default::default()
+        };
+        assert_eq!(serve, expected);
+    }
 
     #[test]
     fn parse_kv_budget_accepts_percent_fraction_bytes_and_off() {
