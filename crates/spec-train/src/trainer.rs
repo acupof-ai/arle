@@ -22,7 +22,7 @@ use std::{
 use qwen35_spec::{DsparkConfig, dspark_tensor_names};
 
 use crate::{
-    backbone::{Draft, Input},
+    backbone::Draft,
     block::{self, Block},
     loss::{self, Batch, Terms},
 };
@@ -103,6 +103,10 @@ struct SampleCtx<'a> {
     /// re-uploading it per chunk costs a host copy and an H2D of 419 MB each at
     /// seq 4096.
     taps: TensorId,
+    /// `[seq, hidden]` = `project_context(taps)`, detached so the chunks
+    /// accumulate `dL/dctx` into it and `fc` is differentiated once per sample
+    /// rather than once per chunk.
+    ctx: TensorId,
     /// `[seq, hidden]`, the trunk's final hidden state.
     last_hidden: &'a [f32],
     seq: usize,
@@ -380,6 +384,11 @@ impl Trainer {
             .into_iter()
             .chain(live.iter().copied())
             .collect();
+        for &id in live {
+            if let Some(g) = store.get(id).and_then(|t| t.grad) {
+                keep.insert(g);
+            }
+        }
         for &p in &self.params {
             keep.insert(p);
             if let Some(g) = store.get(p).and_then(|t| t.grad) {
@@ -439,8 +448,14 @@ impl Trainer {
             &taps,
             &[seq, self.draft.cfg.target_layer_ids.len() * hidden],
         )?;
+        let mut frozen = Tape::new();
+        frozen.set_enabled(false);
+        let projected = self.draft.project_context(taps, store, &mut frozen)?;
+        let projected = store.detach(projected)?;
+        store.set_requires_grad(projected, true)?;
         let ctx = SampleCtx {
             taps,
+            ctx: projected,
             last_hidden: &last_hidden,
             seq,
             denom,
@@ -463,7 +478,17 @@ impl Trainer {
             out.chunks += 1;
             tape.entries.clear();
             tape.set_enabled(true);
-            store.retain_ids(&self.keep_set(store, &[ctx.taps]));
+            store.retain_ids(&self.keep_set(store, &[ctx.taps, ctx.ctx]));
+        }
+
+        // One `fc`/`hidden_norm` backward per sample. `d(Σ ctx⊙g)/dfc =
+        // Σ g·∂ctx/∂fc`, and the chunk backwards already folded `scale` into
+        // `g`, so the surrogate needs no further scaling.
+        if let Some(g) = store.get(ctx.ctx).and_then(|t| t.grad) {
+            let live = self.draft.project_context(ctx.taps, store, tape)?;
+            let prod = ops::mul(live, g, store, tape)?;
+            let surrogate = ops::sum(prod, store, tape)?;
+            tape.backward_accumulate_only(surrogate, store)?;
         }
         Ok(Some(out))
     }
@@ -510,15 +535,9 @@ impl Trainer {
     ) -> Result<(TensorId, Terms)> {
         let hidden = self.draft.cfg.hidden_size;
         let block_size = self.draft.cfg.block_size;
-        let out = self.draft.forward(
-            &Input {
-                blocks,
-                taps: ctx.taps,
-                ctx_len: ctx.seq,
-            },
-            store,
-            tape,
-        )?;
+        let out = self
+            .draft
+            .forward_projected(blocks, ctx.ctx, ctx.seq, store, tape)?;
 
         // Hidden `p` predicts token `p+1`, and row `t` at RoPE `anchor+t` targets
         // `anchor+1+t`, so the supervising hidden is the row's own position.
@@ -807,8 +826,17 @@ mod tests {
                 &[SEQ, cfg().target_layer_ids.len() * cfg().hidden_size],
             )
             .unwrap();
+        let mut frozen = Tape::new();
+        frozen.set_enabled(false);
+        let projected = trainer
+            .draft
+            .project_context(taps, &mut store, &mut frozen)
+            .unwrap();
+        let projected = store.detach(projected).unwrap();
+        store.set_requires_grad(projected, true).unwrap();
         let ctx = SampleCtx {
             taps,
+            ctx: projected,
             last_hidden: &last_hidden,
             seq: SEQ,
             denom: weights.iter().sum(),
