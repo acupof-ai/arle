@@ -1171,6 +1171,13 @@ impl Tape {
             self.trim_after_checkpoint_replay(store)?;
             start = end;
         }
+        // Mirror `checkpoint_backward`: under `--checkpoint-reload-device` the
+        // reload above made the full-seq input device-resident for the whole
+        // chunk loop, so park it again to keep the backward high-water at one
+        // hidden. Inert when it never left host (returns 0).
+        if self.offload_checkpoints {
+            store.offload_checkpoint_to_host(input_id)?;
+        }
 
         let mut pairs = GradPairs::new();
         if let Some(acc) = d_input.take() {
