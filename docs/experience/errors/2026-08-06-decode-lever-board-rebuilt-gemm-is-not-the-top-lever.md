@@ -190,17 +190,50 @@ probe.
 
 ## Ranked
 
-| # | Lever | c=1 | c=16 | Kind |
-|---|---|---|---|---|
-| 1 | Batch the GDN advance + attention prep across verify rows | — | ~32 ms of a ~105 ms verify | Reuse the existing `LinearCore::Tables` path |
-| 2 | FA3 decode KV read, 25% → 70–80% | 1.8 ms of 16.65 (11%) | ~30 ms of a ~43 ms KV term | Probe first, then kernel/config |
-| 3 | Small-M GEMM path (TRT-LLM / TurboMind shape-aware dispatch) | ~2.2–4.8 ms | amortizes away | Kernel port |
-| 4 | Marlin smem over-request → `blocks_per_sm` 2 at small M | unknown, cheap to test | same | ~4-line additive edit, decode-only |
-| 5 | ~750 small kernels, 1.53 ms of pure latency | 1.53 ms (9%) | same | Register-resident fusion only |
+| # | Lever | c=1 | c=16 | Kind | Status |
+|---|---|---|---|---|---|
+| 1 | Batch the GDN advance + attention prep across verify rows | — | ~32 ms of a ~105 ms verify | Reuse the existing `LinearCore::Tables` path | **KILLED**, measured below |
+| 2 | FA3 decode KV read, 25% → 70–80% | 1.8 ms of 16.65 (11%) | ~30 ms of a ~43 ms KV term | Probe first, then kernel/config | now #1 |
+| 3 | Small-M GEMM path (TRT-LLM / TurboMind shape-aware dispatch) | ~2.2–4.8 ms | amortizes away | Kernel port | open |
+| 4 | Marlin smem over-request → `blocks_per_sm` 2 at small M | unknown, cheap to test | same | ~4-line additive edit, decode-only | open |
+| 5 | ~750 small kernels, 1.53 ms of pure latency | 1.53 ms (9%) | same | Register-resident fusion only | open |
 
-#1 and #2 are the concurrency story and neither is the GEMM. #1 is the unusual
-one: the batched code path already exists and is gated off for chain lengths
-above 1, so the work is reuse, not invention.
+## #1 measured, and killed
+
+The per-row term is real. The attribution to the GDN lane was wrong.
+
+Phase split of the DSpark tick — c=16, 33K prompts, ThinkingCap-Qwen3.6-27B-FP8
+on 1× H20 (GPU 6), steady-state samples only:
+
+| rows | chain_rows | draft | snap | verify | commit | tick |
+|---:|---:|---:|---:|---:|---:|---:|
+| 16 | 96 | 47.94 | 1.55 | 109.29 | 3.21 | **162.0 ms** |
+| 1 | 6 | 2.29 | 0.12 | 24.00 | 0.44 | **26.9 ms** |
+
+Slopes across the two points: verify **5.69 ms/row**, draft **3.04 ms/row**.
+85% of the tick scales with rows, which is what the model predicted.
+
+Then the A/B — same binary, only the GDN lane swapped
+(`--qwen35-gdr-chunked false`):
+
+| arm | draft | snap | verify | commit | tick | bench out tok/s |
+|---|---:|---:|---:|---:|---:|---:|
+| chunked (shipped) | 47.94 | 1.55 | 109.29 | 3.21 | 162.0 | **21.1** |
+| recurrent | 48.05 | 1.55 | 110.14 | 3.21 | 162.9 | 14.8 |
+| Δ | +0.2% | 0 | **+0.8%** | 0 | +0.6% | −29.9% |
+
+The swap changes both the algorithm and the per-(row, layer) launch count by
+2–4×, and verify moved 0.8%. The arm is provably engaged — end-to-end
+throughput moved 30% in the same A/B — so this is a real null, not a dead flag.
+**The per-row verify cost is neither the GDN kernel nor its launch overhead.**
+That kills both proposed fixes: the chain-length threshold and the
+batch-across-rows rewrite.
+
+It also settles where the chunked-GDR win lives. The tick is identical across
+arms, so all 30% is prefill and none of it is decode.
+
+With the GDN lane excluded, the ~91 ms per-row verify term is dominated by the
+FA3 KV read: 16 rows × 2.16 GB at 0.93 TB/s ≈ 51 ms. #1 collapses into #2.
 
 ## Unverified
 
@@ -214,12 +247,15 @@ above 1, so the work is reuse, not invention.
   matched nothing because `--kernel-name-base function` strips template
   arguments from `cutlass::device_kernel<...>`, the second stalled after graph
   capture.
-- **The 2.48 ms/row fit predates chunked GDR going default-on** (2026-08-02).
-  The fit measured `gated_delta_rule_prefill_recurrent`; the current binary
-  pads a 7-token chain into a 64-token FlashQLA chunk and issues more launches
-  per (row, layer). The per-row term may have moved in either direction. An
-  nsys kernel-name histogram of one verify step settles it, and it should be
-  re-fit before #1 is sized.
+- **Which kernel owns the ~91 ms per-row verify term.** The GDN lane is
+  excluded by measurement (above); the FA3 KV read accounts for ~51 ms by
+  arithmetic; the remaining ~40 ms is unattributed. An nsys kernel-name
+  histogram of one verify step settles it. Two attempts failed: session mode
+  (`nsys launch --session-new` + `nsys start`) produced a report with no CUDA
+  kernel data and an `nsys stats` that died on
+  `boost::filesystem::current_path`; `--delay 260 --duration 40` missed the
+  window because the bench finished at 231 s. A third attempt should use
+  `--delay 150`.
 - **The Marlin byte denominator** — 24.3 GB by arithmetic vs 30 GB in the
   budget entry. Efficiency is 59% or 73% depending on which is right, and the
   headroom 4.8 ms or 3.1 ms.
