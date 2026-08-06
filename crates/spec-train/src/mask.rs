@@ -2,7 +2,7 @@
 //!
 //! Ported from deepseek-ai/DeepSpec (MIT) `create_dspark_attention_mask`.
 //! Keys are `[context(ctx_len) ; draft(blocks × block_size)]`; queries are the
-//! draft rows alone. Row `(j, t)` sees context keys `<= anchor_j` within its own
+//! draft rows alone. Row `(j, t)` sees context keys `< anchor_j` within its own
 //! sliding window and every draft key of block `j` — the block is bidirectional
 //! inside itself.
 //!
@@ -13,14 +13,9 @@
 use crate::block::Block;
 
 /// Context keys row `t` of the block at `anchor` may reach: `[lo, anchor)` with
-/// `lo = (anchor+t) - (window-1)`, clamped. The serve's `start` IS the anchor —
-/// `last_token` has not been forwarded when the draft runs, so its tap is not in
-/// the ring (`executor/qwen35.rs` appends it only after the verify). The span
-/// therefore stops strictly below `anchor`; reaching `taps[anchor]` would hand
-/// the draft the residual its own distillation target is projected from.
-/// The serve runs every draft layer on the sliding ring regardless of
-/// `layer_types`, so training past the window would fit links inference does not
-/// have.
+/// `lo = (anchor+t) - (window-1)`, clamped. Exclusive because the serve's ring
+/// stops below the anchor, and the window applies to every draft layer there
+/// regardless of `layer_types` — both derived in the tests below.
 fn ctx_span(anchor: usize, t: usize, ctx_len: usize, window: Option<usize>) -> (usize, usize) {
     let hi = anchor.min(ctx_len);
     let lo = match window {
