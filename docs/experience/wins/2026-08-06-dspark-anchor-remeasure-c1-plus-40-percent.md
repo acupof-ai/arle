@@ -3,6 +3,12 @@
 > Status: **c=1 accepted (+41.6%), c≥4 is a confirmed regression (−6.0 / −10.1
 > / −7.2% at c=4/8/16).** The archived champion reproduces its own recorded row
 > today, so the deficit is not a fingerprint artifact. Bisect target below.
+>
+> **Partly resolved 2026-08-07** — the verify linear core ran a per-row host
+> loop, costing B× the kernel launches per layer. Batching it recovered c=8 to
+> within 1.4% of the champion and about half of c=16:
+> [`2026-08-07-dspark-verify-linear-core-batched.md`](2026-08-07-dspark-verify-linear-core-batched.md).
+> The remaining c=16 gap is still unattributed.
 
 ## Goal
 
@@ -157,7 +163,31 @@ The cost model **is** mis-fit — the model predicts 261.9 ms for a tick measure
 at 162.0 — but `--dspark-block-size 6` caps each row's admitted extra at 5, and
 the argmax saturates over that range. A wrong parameter that nothing reads.
 
-Bisect over the 293-commit range is the remaining path.
+## Bisect
+
+TPOT (ms), same box, same dataset, same flags:
+
+| c | `51985031d` 07-30 | `3d80dd473` 07-31 | `b8d390bf3` 08-06 |
+|---:|---:|---:|---:|
+| 1 | 9.690 | 9.669 | **8.462** |
+| 8 | 63.685 | **59.635** | **69.894** |
+| 16 | 111.529 | **113.174** | **135.509** |
+
+The midpoint is clean — faster than the champion at c=8, within 1.5% at c=16 —
+so **the regression is entirely in `3d80dd473..b8d390bf3`**: 145 commits, all
+dated 08-03 through 08-06.
+
+The same three points date the c=1 win independently: total tok/s is 7287 /
+7733 / 10322, so the +40% arrived after 07-31, which is where chunked GDR
+(08-02) and FlashQLA (08-05) landed. Both directions agree.
+
+**Archived binaries make a step free.** `/host/gdr-gates/arle-gdr2-3d80dd4` is
+the midpoint prebuilt, so that step cost one sweep and no build. Building it
+instead failed: a `cp -a` bisect tree carries the newer commit's `target/` and
+generated TileLang artifacts, `git checkout --force` only resets tracked files,
+and the mixed-version binary compiled and then died uploading
+`layers.30.mlp.up_proj.weight`. Sweep an archive when one exists; clean
+`generated/` when building.
 
 ## Learnings
 
