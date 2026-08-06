@@ -98,8 +98,11 @@ pub trait Target {
 
 /// Everything a chunk needs from the sample it belongs to.
 struct SampleCtx<'a> {
-    /// `[seq, taps·hidden]`, the trunk residual stream at the tapped layers.
-    taps: &'a [f32],
+    /// `[seq, taps·hidden]`, the trunk residual stream at the tapped layers,
+    /// uploaded ONCE per sample: it is constant across the sample's chunks, and
+    /// re-uploading it per chunk costs a host copy and an H2D of 419 MB each at
+    /// seq 4096.
+    taps: TensorId,
     /// `[seq, hidden]`, the trunk's final hidden state.
     last_hidden: &'a [f32],
     seq: usize,
@@ -179,7 +182,7 @@ impl Trainer {
             counted += 1;
             tape.entries.clear();
             tape.set_enabled(true);
-            store.retain_ids(&self.keep_set(store));
+            store.retain_ids(&self.keep_set(store, &[]));
         }
         ensure!(counted > 0, "no sample in the batch carried supervision");
 
@@ -199,7 +202,7 @@ impl Trainer {
             store,
         )?;
         self.step += 1;
-        store.retain_ids(&self.keep_set(store));
+        store.retain_ids(&self.keep_set(store, &[]));
         Ok(StepStats {
             loss,
             ce: terms.ce / n,
@@ -372,9 +375,10 @@ impl Trainer {
         out
     }
 
-    fn keep_set(&self, store: &TensorStore) -> HashSet<TensorId> {
+    fn keep_set(&self, store: &TensorStore, live: &[TensorId]) -> HashSet<TensorId> {
         let mut keep: HashSet<TensorId> = [self.draft.embed_tokens, self.draft.lm_head]
             .into_iter()
+            .chain(live.iter().copied())
             .collect();
         for &p in &self.params {
             keep.insert(p);
@@ -431,8 +435,12 @@ impl Trainer {
             taps.len(),
             last_hidden.len()
         );
+        let taps = store.from_slice(
+            &taps,
+            &[seq, self.draft.cfg.target_layer_ids.len() * hidden],
+        )?;
         let ctx = SampleCtx {
-            taps: &taps,
+            taps,
             last_hidden: &last_hidden,
             seq,
             denom,
@@ -455,7 +463,7 @@ impl Trainer {
             out.chunks += 1;
             tape.entries.clear();
             tape.set_enabled(true);
-            store.retain_ids(&self.keep_set(store));
+            store.retain_ids(&self.keep_set(store, &[ctx.taps]));
         }
         Ok(Some(out))
     }
@@ -502,15 +510,10 @@ impl Trainer {
     ) -> Result<(TensorId, Terms)> {
         let hidden = self.draft.cfg.hidden_size;
         let block_size = self.draft.cfg.block_size;
-        let taps = store.from_slice(
-            ctx.taps,
-            &[ctx.seq, self.draft.cfg.target_layer_ids.len() * hidden],
-        )?;
-
         let out = self.draft.forward(
             &Input {
                 blocks,
-                taps,
+                taps: ctx.taps,
                 ctx_len: ctx.seq,
             },
             store,
@@ -519,11 +522,11 @@ impl Trainer {
 
         // Hidden `p` predicts token `p+1`, and row `t` at RoPE `anchor+t` targets
         // `anchor+1+t`, so the supervising hidden is the row's own position.
-        let aligned: Vec<f32> = block::draft_positions(blocks)
-            .into_iter()
-            .flat_map(|p| ctx.last_hidden[p.min(ctx.seq - 1) * hidden..][..hidden].to_vec())
-            .collect();
         let rows = blocks.len() * block_size;
+        let mut aligned = Vec::with_capacity(rows * hidden);
+        for p in block::draft_positions(blocks) {
+            aligned.extend_from_slice(&ctx.last_hidden[p.min(ctx.seq - 1) * hidden..][..hidden]);
+        }
         let aligned = store.from_slice(&aligned, &[rows, hidden])?;
         let mut frozen = Tape::new();
         frozen.set_enabled(false);
@@ -798,8 +801,14 @@ mod tests {
             .flat_map(|b| block::row_weights(b, Some(4.0)))
             .collect();
         let (taps, last_hidden) = FakeTarget.forward(&ids).unwrap();
+        let taps = store
+            .from_slice(
+                &taps,
+                &[SEQ, cfg().target_layer_ids.len() * cfg().hidden_size],
+            )
+            .unwrap();
         let ctx = SampleCtx {
-            taps: &taps,
+            taps,
             last_hidden: &last_hidden,
             seq: SEQ,
             denom: weights.iter().sum(),
