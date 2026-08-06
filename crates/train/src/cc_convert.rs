@@ -265,10 +265,7 @@ fn list_dumps(dir: &Path) -> Result<Vec<(u64, PathBuf)>> {
     let mut dumps = Vec::new();
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
-        // A missing dir is an empty dump set, not a dead run — both callers
-        // already treat "no dumps" as a skipped conversion. The dir defaults to
-        // `./dumps`, so anything that changes CWD or cleans the build tree used
-        // to kill a training run mid-round.
+        // Both callers already treat "no dumps" as a skipped conversion.
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(dumps),
         Err(e) => {
             return Err(e).with_context(|| format!("read dump dir {}", dir.display()));

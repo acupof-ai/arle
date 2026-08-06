@@ -269,13 +269,8 @@ pub(crate) struct Qwen35CudaExecutor {
     /// Budget bytes for durable NVMe recall spill (`--kv-disk-limit`).
     /// `None` until `set_kv_tier_disk` wires it.
     disk_budget: Option<usize>,
-    /// Page count the construction-time profile chose, so `ensure_kv_pool` can
-    /// rebuild `full_attn_kv` at the SAME size after `release_kv_pool` dropped it
-    /// (agent-OPD rollout→writeback→rollout: the dead pool is freed for the
-    /// co-resident autograd writeback, then re-acquired before the next round's
-    /// rollout). Re-profiling instead would read free VRAM with the student
-    /// holding the memory the release just handed it, shrinking the pool every
-    /// round until it hits the token floor. Not on the serve path.
+    /// Page count the construction-time profile chose; `ensure_kv_pool` rebuilds
+    /// at this size. Not on the serve path.
     kv_pool_sized_pages: usize,
     /// Recurrent prefix sidecars live in `slot_tier` under `NS_SIDECAR` (blob =
     /// recurrent state + full-attn KV, keyed by token-prefix hash), so they share
@@ -915,9 +910,8 @@ impl Qwen35CudaExecutor {
         // Shared paged full-attn KV pool — the DEFAULT substrate (Phase 2 of the
         // shared-paged-KV migration). Built EAGERLY here, profile-sized from
         // MEASURED free VRAM after weights load (SGLang's mem_fraction_static),
-        // NOT `num_slots × max_seq_len` (the per-slot contiguous waste). This is
-        // the ONLY profile; `ensure_kv_pool` re-allocates at `kv_pool_sized_pages`
-        // after `release_kv_pool` drops it on the agent-OPD writeback path.
+        // NOT `num_slots × max_seq_len` (the per-slot contiguous waste). The ONLY
+        // profile — see `ensure_kv_pool`.
         let pool_t0 = Instant::now();
         let requested_pages = total_pages.max(1);
         let kv_format = kv_dtype.kv_format();
@@ -997,9 +991,7 @@ impl Qwen35CudaExecutor {
     /// Build the shared paged full-attn KV pool, profile-sized from MEASURED free
     /// VRAM (SGLang's `mem_fraction_static`); `requested_pages` is the fallback
     /// for a failed probe, not a floor over it (#178). Returns the pool and the
-    /// page count it chose — `ensure_kv_pool` restores THAT size rather than
-    /// profiling again, since the free VRAM it would read has been handed to the
-    /// co-resident student by the intervening `release_kv_pool`.
+    /// page count it chose, which `ensure_kv_pool` restores.
     fn build_full_attn_kv_pool(
         model: &crate::qwen35::Qwen35Model,
         num_slots: usize,
@@ -1090,9 +1082,7 @@ impl Qwen35CudaExecutor {
         ))
     }
 
-    /// Allocate the pool at an EXACT page count, no profiling.
-    /// `build_full_attn_kv_pool` profiles then calls this; `ensure_kv_pool` calls
-    /// it directly with the size the construction-time profile chose.
+    /// Allocate the pool at an exact page count, no profiling.
     fn alloc_full_attn_kv_pool(
         model: &crate::qwen35::Qwen35Model,
         num_slots: usize,
@@ -1174,13 +1164,9 @@ impl Qwen35CudaExecutor {
     /// construction-time profile chose (agent-OPD next-round rollout).
     /// No-op (idempotent) if the pool is already resident.
     ///
-    /// Deliberately does NOT re-profile. `release_kv_pool` exists to hand this
-    /// VRAM to the co-resident student, so a profile taken here reads a card with
-    /// the student holding it: the pool shrinks every round and, once
-    /// `total × (1 − mem_fraction_static)` exceeds what is left free, collapses to
-    /// `PROFILE_KV_TOKENS_FLOOR`. A floored device pool then hands the host mirror
-    /// page ids it cannot back (`TokenKVPool::mirror_slot page N out of range N`)
-    /// and the engine thread dies mid-round.
+    /// Deliberately does NOT re-profile: `release_kv_pool` handed this VRAM to
+    /// the co-resident student, so a profile taken here shrinks the pool every
+    /// round until it collapses to `PROFILE_KV_TOKENS_FLOOR`.
     pub(crate) fn ensure_kv_pool(&mut self) -> Result<()> {
         if self.full_attn_kv.is_some() {
             return Ok(());

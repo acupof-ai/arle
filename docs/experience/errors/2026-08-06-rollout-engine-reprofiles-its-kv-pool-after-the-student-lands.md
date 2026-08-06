@@ -47,7 +47,7 @@ Three defects chain from there:
 2. **The floor path builds an inconsistent pool.** The device pool shrinks to
    the floor while the host pool keeps its requested size:
    `TokenKVPool::mirror_slot page 256 out of range 256 (host pool total_pages
-   exceeds device pool budget?)`. That is a panic, not a degraded mode.
+   exceeds device pool budget?)`.
 3. **agent-OPD treats a dead engine as recoverable.** It logs `prefix warm-up
    failed (continuing)` and continues into a state where no request can ever
    succeed. Three of four tasks ran to their full timeout producing zero
@@ -122,12 +122,9 @@ underneath it.** Any sizing formula that mixes a `free` reading with a `total`
 constant will drift as co-tenants grow. Check what else is resident at every
 point the profile runs, not just the first one.
 
-**A gate that only counts absent symptoms passes on code that never ran.** The
-first attempt reported 0 collapses, 0 engine deaths, 0 range errors — every
-symptom of the bug, absent — while `ensure_kv_pool` was called zero times. The
-run died before the round tail, which is the only place the fixed path is
-reachable. Assert the treatment executed and produced the right value (19393
-pages restored against 19393 profiled), never that the failure is missing.
+**A gate that only counts absent symptoms passes on code that never ran.**
+Assert the treatment executed and produced the right value, never that the
+failure is missing.
 
 **A warning that names a knob without printing the measurement cannot be acted
 on.** The `KV pool collapsed to the 4096-token floor at mem_fraction_static
