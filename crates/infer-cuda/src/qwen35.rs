@@ -9084,7 +9084,6 @@ mod tests {
             norm_topk_prob: true,
             mlp_only_layers: vec![],
             full_attn_gated: true,
-            output_gate_type: "sigmoid".to_string(),
         }
     }
 
