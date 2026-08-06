@@ -52,7 +52,7 @@ impl Default for AutogradRuntimeFlags {
     fn default() -> Self {
         Self {
             checkpoint_offload_min_bytes: 2 << 20,
-            checkpoint_reload_device: false,
+            checkpoint_reload_device: true,
             checkpoint_pinned_offload_bytes: 0,
             lora_linear_bwd_tile_rows: 1024,
             moe_lora_bwd_expert_tile: 16,
@@ -67,7 +67,7 @@ impl Default for AutogradRuntimeFlags {
 }
 
 static CHECKPOINT_OFFLOAD_MIN_BYTES: AtomicUsize = AtomicUsize::new(2 << 20);
-static CHECKPOINT_RELOAD_DEVICE: AtomicBool = AtomicBool::new(false);
+static CHECKPOINT_RELOAD_DEVICE: AtomicBool = AtomicBool::new(true);
 static CHECKPOINT_PINNED_OFFLOAD_BYTES: AtomicUsize = AtomicUsize::new(0);
 static LORA_LINEAR_BWD_TILE_ROWS: AtomicUsize = AtomicUsize::new(1024);
 static MOE_LORA_BWD_EXPERT_TILE: AtomicUsize = AtomicUsize::new(16);

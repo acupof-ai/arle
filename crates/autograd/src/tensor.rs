@@ -1537,21 +1537,21 @@ mod tests {
         assert_eq!(tensor.checkpoint_residency, CheckpointResidency::Host);
         assert_eq!(tensor.data, values);
         assert!(tensor.device_handle.is_none());
-        store
-            .ensure_checkpoint_device(second)
-            .expect("host checkpoint stays host");
-        assert_eq!(
+        crate::runtime_flags::set_checkpoint_reload_device(false);
+        let stays_host = store.ensure_checkpoint_device(second).map(|()| {
             store
                 .tensor(second)
                 .expect("second tensor")
-                .checkpoint_residency,
+                .checkpoint_residency
+        });
+        crate::runtime_flags::set_checkpoint_reload_device(true);
+        assert_eq!(
+            stays_host.expect("host checkpoint stays host"),
             CheckpointResidency::Host
         );
-        crate::runtime_flags::set_checkpoint_reload_device(true);
         let reloaded = store
             .ensure_checkpoint_device(second)
             .and_then(|()| store.to_host(second));
-        crate::runtime_flags::set_checkpoint_reload_device(false);
         assert_eq!(reloaded.expect("reloaded host checkpoint"), values);
 
         store

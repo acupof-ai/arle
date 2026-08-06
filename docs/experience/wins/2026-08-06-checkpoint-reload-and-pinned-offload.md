@@ -87,13 +87,27 @@ too — all arms must be measured on the same tree.
 Precedent for DtoH into cudarc write-combined pinned memory:
 `infer-cuda/src/qwen35.rs:1396` (recurrent-state snapshot), in production.
 
-## Results — pending-remote
+## Results — measured 2026-08-06, pod GPUs 4+5, tree `d7ecbbcee`, one rep/arm
 
-| arm | backward | step | loss | grad_norm | peak VRAM |
-|---|---:|---:|---:|---:|---:|
-| baseline (`7da312d0d`, both flags off) | 315.7 s | — | 4.537510 | 7.965–7.985 | 92/97 GB |
-| `--checkpoint-reload-device true` | | | | | |
-| + `--checkpoint-pinned-offload-bytes 8589934592` | | | | | |
+| arm | backward | step | loss | grad_norm | peak VRAM (cp0/cp1) | host RSS |
+|---|---:|---:|---:|---:|---:|---:|
+| A baseline (both flags off) | 304.6 s | 372.1 s | 4.537510 | 7.981584 | 91.5 / 89.9 GB | 52.9 GiB |
+| B `--checkpoint-reload-device true` | **121.8 s (−60.0%)** | 192.1 s | 4.537510 | 7.970384 | 88.7 / 89.1 GB | 49.0 GiB |
+| C = B + `--checkpoint-pinned-offload-bytes 8589934592` | 115.3 s | 180.1 s | 4.537510 | 7.967986 | 87.4 / **97.4** GB | 49.3 GiB |
+
+Verdict:
+- **B accepted, default flipped to on** (this entry's commit). −182.8 s is 19× the
+  9.8 s run-to-run spread; loss bit-identical, grad_norm in the 7.965–7.985
+  envelope. The predicted "one extra resident hidden" VRAM cost never
+  materialized — B's peak is *lower* than A's on both ranks (−2.9 GiB cp0),
+  and host RSS fell 3.9 GiB with the pageable round-trip gone.
+- **C rejected, pinned pool stays 0 (off).** −6.5 s over B is inside the 9.8 s
+  spread, and its cp1 peak reached 97.4 of 97.9 GB — 449 MiB headroom
+  (rank-asymmetric, cause unknown). The pool emits no engagement probe, so
+  there is no positive evidence it fired; adjudicating it needs an engagement
+  counter plus 3 reps, and the upside on the table is a wash.
+- A reproduces the `7da312d0d` baseline (304.6 vs 315.7 / 307.7 prior reps,
+  loss exact), so the `slice_host_eager` borrow did not move the baseline arm.
 
 Three arms, one binary, one flag changed per step. The pinned arm rides on top of
 the reload arm because pinning implies reloading; that ordering is why the reload
