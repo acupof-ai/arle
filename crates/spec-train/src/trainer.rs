@@ -189,10 +189,10 @@ impl Trainer {
         let mut counted = 0usize;
         let mut chunks = 0usize;
         for (s, plan) in samples.iter().zip(&plans) {
-            let Some((blocks, weights)) = plan else {
+            let Some(plan) = plan else {
                 continue;
             };
-            let out = self.accumulate(s, blocks, weights, denom, target, store, tape)?;
+            let out = self.accumulate(s, plan, denom, target, store, tape)?;
             loss += out.loss;
             terms = add_terms(terms, out.terms);
             chunks += out.chunks;
@@ -445,13 +445,13 @@ impl Trainer {
     fn accumulate(
         &self,
         sample: &Sample,
-        blocks: &[Block],
-        weights: &[f32],
+        plan: &(Vec<Block>, Vec<f32>),
         denom: f32,
         target: &mut dyn Target,
         store: &mut TensorStore,
         tape: &mut Tape,
     ) -> Result<SampleOut> {
+        let (blocks, weights) = plan;
         let seq = sample.input_ids.len();
         let hidden = self.draft.cfg.hidden_size;
         let (taps, last_hidden) = target.forward(&sample.input_ids)?;
@@ -902,21 +902,13 @@ mod tests {
         let mut grads = |trainer: &mut Trainer, bpb: usize, store: &mut TensorStore| {
             trainer.cfg.blocks_per_backward = bpb;
             AdamW::zero_grad(&mut trainer.opt, &trainer.params, store);
-            let (blocks, weights) = trainer
+            let plan = trainer
                 .plan_sample(&s, 7)
                 .unwrap()
                 .expect("sample carries supervision");
-            let denom: f32 = weights.iter().sum();
+            let denom: f32 = plan.1.iter().sum();
             let out = trainer
-                .accumulate(
-                    &s,
-                    &blocks,
-                    &weights,
-                    denom,
-                    &mut FakeTarget,
-                    store,
-                    &mut tape,
-                )
+                .accumulate(&s, &plan, denom, &mut FakeTarget, store, &mut tape)
                 .unwrap();
             assert_eq!(out.chunks, 9usize.div_ceil(bpb));
             let g = trainer
@@ -976,16 +968,15 @@ mod tests {
         let (a, b) = (sample(0), sample(1));
 
         let mut run = |s: &Sample, seed: u64, denom_override: Option<f32>| {
-            let (blocks, weights) = trainer
+            let plan = trainer
                 .plan_sample(s, seed)
                 .unwrap()
                 .expect("sample carries supervision");
-            let den: f32 = weights.iter().sum();
+            let den: f32 = plan.1.iter().sum();
             let out = trainer
                 .accumulate(
                     s,
-                    &blocks,
-                    &weights,
+                    &plan,
                     denom_override.unwrap_or(den),
                     &mut FakeTarget,
                     &mut store,
