@@ -301,14 +301,14 @@ __global__ void rms_norm_batched_kernel(const __nv_bfloat16 *__restrict__ x,
       __nv_bfloat162 w1_lo = *reinterpret_cast<__nv_bfloat162 *>(&wv1.x);
       __nv_bfloat162 w1_hi = *reinterpret_cast<__nv_bfloat162 *>(&wv1.y);
 
-      float n0 = __bfloat162float(x0_lo.x) * inv_rms * __bfloat162float(w0_lo.x);
-      float n1 = __bfloat162float(x0_lo.y) * inv_rms * __bfloat162float(w0_lo.y);
-      float n2 = __bfloat162float(x0_hi.x) * inv_rms * __bfloat162float(w0_hi.x);
-      float n3 = __bfloat162float(x0_hi.y) * inv_rms * __bfloat162float(w0_hi.y);
-      float n4 = __bfloat162float(x1_lo.x) * inv_rms * __bfloat162float(w1_lo.x);
-      float n5 = __bfloat162float(x1_lo.y) * inv_rms * __bfloat162float(w1_lo.y);
-      float n6 = __bfloat162float(x1_hi.x) * inv_rms * __bfloat162float(w1_hi.x);
-      float n7 = __bfloat162float(x1_hi.y) * inv_rms * __bfloat162float(w1_hi.y);
+      float n0 = __bfloat162float(x0_lo.x) * inv_rms * (1.0f + __bfloat162float(w0_lo.x));
+      float n1 = __bfloat162float(x0_lo.y) * inv_rms * (1.0f + __bfloat162float(w0_lo.y));
+      float n2 = __bfloat162float(x0_hi.x) * inv_rms * (1.0f + __bfloat162float(w0_hi.x));
+      float n3 = __bfloat162float(x0_hi.y) * inv_rms * (1.0f + __bfloat162float(w0_hi.y));
+      float n4 = __bfloat162float(x1_lo.x) * inv_rms * (1.0f + __bfloat162float(w1_lo.x));
+      float n5 = __bfloat162float(x1_lo.y) * inv_rms * (1.0f + __bfloat162float(w1_lo.y));
+      float n6 = __bfloat162float(x1_hi.x) * inv_rms * (1.0f + __bfloat162float(w1_hi.x));
+      float n7 = __bfloat162float(x1_hi.y) * inv_rms * (1.0f + __bfloat162float(w1_hi.y));
 
       uint4 result;
       __nv_bfloat162 r0_lo, r0_hi, r1_lo, r1_hi;
@@ -327,7 +327,7 @@ __global__ void rms_norm_batched_kernel(const __nv_bfloat16 *__restrict__ x,
       out_vec8[i] = result;
     }
     for (int i = n8 * 8 + tid; i < hidden_dim; i += NORM_BLOCK) {
-      float n = __bfloat162float(x_row[i]) * inv_rms * __bfloat162float(weight[i]);
+      float n = __bfloat162float(x_row[i]) * inv_rms * (1.0f + __bfloat162float(weight[i]));
       out_row[i] = __float2bfloat16(n);
     }
   } else {
@@ -343,16 +343,16 @@ __global__ void rms_norm_batched_kernel(const __nv_bfloat16 *__restrict__ x,
 
       uint2 result;
       __nv_bfloat162 r_lo, r_hi;
-      r_lo.x = __float2bfloat16(__bfloat162float(x_lo.x) * inv_rms * __bfloat162float(w_lo.x));
-      r_lo.y = __float2bfloat16(__bfloat162float(x_lo.y) * inv_rms * __bfloat162float(w_lo.y));
-      r_hi.x = __float2bfloat16(__bfloat162float(x_hi.x) * inv_rms * __bfloat162float(w_hi.x));
-      r_hi.y = __float2bfloat16(__bfloat162float(x_hi.y) * inv_rms * __bfloat162float(w_hi.y));
+      r_lo.x = __float2bfloat16(__bfloat162float(x_lo.x) * inv_rms * (1.0f + __bfloat162float(w_lo.x)));
+      r_lo.y = __float2bfloat16(__bfloat162float(x_lo.y) * inv_rms * (1.0f + __bfloat162float(w_lo.y)));
+      r_hi.x = __float2bfloat16(__bfloat162float(x_hi.x) * inv_rms * (1.0f + __bfloat162float(w_hi.x)));
+      r_hi.y = __float2bfloat16(__bfloat162float(x_hi.y) * inv_rms * (1.0f + __bfloat162float(w_hi.y)));
       result.x = *reinterpret_cast<unsigned int *>(&r_lo);
       result.y = *reinterpret_cast<unsigned int *>(&r_hi);
       out_vec[i] = result;
     }
     for (int i = n4 * 4 + tid; i < hidden_dim; i += NORM_BLOCK) {
-      float n = __bfloat162float(x_row[i]) * inv_rms * __bfloat162float(weight[i]);
+      float n = __bfloat162float(x_row[i]) * inv_rms * (1.0f + __bfloat162float(weight[i]));
       out_row[i] = __float2bfloat16(n);
     }
   }
@@ -1007,7 +1007,8 @@ __global__ void rms_norm_gated_kernel(
   __syncthreads();
 
   float normed = x_val * s_inv_rms;
-  // Weight is F32, per head_dim (broadcast across heads)
+  // Weight is F32, per head_dim (broadcast across heads).
+  // Qwen3.5 stores norm weight as (weight - 1); kernel applies (1 + stored).
   float w = weight[tid];
   normed *= w;
 

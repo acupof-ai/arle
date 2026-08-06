@@ -6,7 +6,7 @@
 
 __device__ __forceinline__ __nv_bfloat16 rms_norm_elem(
     __nv_bfloat16 x, float rms_inv, __nv_bfloat16 weight) {
-    return __float2bfloat16(__bfloat162float(x) * rms_inv * __bfloat162float(weight));
+    return __float2bfloat16(__bfloat162float(x) * rms_inv * (1.0f + __bfloat162float(weight)));
 }
 
 __device__ __forceinline__ void apply_rope_pair(
@@ -151,7 +151,8 @@ __global__ void attention_gate_batch_kernel(
     __nv_bfloat16* __restrict__ attn_out,            // [q_dim, seq_len]
     int num_q_heads,
     int head_dim,
-    int seq_len
+    int seq_len,
+    int use_swish
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int q_dim = num_q_heads * head_dim;
@@ -167,8 +168,9 @@ __global__ void attention_gate_batch_kernel(
 
     float gate = __bfloat162float(q_full_batch[gate_idx]);
     float sig_gate = 1.0f / (1.0f + expf(-gate));
+    float gate_val = use_swish ? (gate * sig_gate) : sig_gate;
     float out = __bfloat162float(attn_out[idx]);
-    attn_out[idx] = __float2bfloat16(out * sig_gate);
+    attn_out[idx] = __float2bfloat16(out * gate_val);
 }
 
 extern "C" {
@@ -309,6 +311,7 @@ cudaError_t attention_gate_batch_hd256_cuda(
     int num_q_heads,
     int head_dim,
     int seq_len,
+    int use_swish,
     cudaStream_t stream
 ) {
     if (num_q_heads <= 0 || (head_dim != 128 && head_dim != 256) || seq_len < 0) {
@@ -325,7 +328,8 @@ cudaError_t attention_gate_batch_hd256_cuda(
         attn_out,
         num_q_heads,
         head_dim,
-        seq_len
+        seq_len,
+        use_swish
     );
     return cudaGetLastError();
 }

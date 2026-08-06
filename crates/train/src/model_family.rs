@@ -86,6 +86,7 @@ pub fn synthetic_qwen35_config(seq: usize, pattern: Qwen35AttentionPattern) -> Q
         norm_topk_prob: true,
         mlp_only_layers: Vec::new(),
         full_attn_gated: true,
+            output_gate_type: "sigmoid".to_string(),
     };
     apply_qwen35_attention_pattern(&mut cfg, pattern)
         .expect("synthetic_qwen35_config must satisfy the qwen3.5 scratch contract");

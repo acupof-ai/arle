@@ -42,7 +42,7 @@ __device__ __forceinline__ float rms_norm_head_hd256(
     }
     __syncthreads();
 
-    return val * scratch[0] * weight;
+    return val * scratch[0] * (1.0f + weight);
 }
 
 // Partial RoPE: pair-wise rotation on first rotary_dim elements.
@@ -171,7 +171,8 @@ __global__ void attention_gate_paged_hd256_kernel(
     const __nv_bfloat16* __restrict__ q_full_batch,  // [B, num_q_heads * HD256 * 2]
     __nv_bfloat16* __restrict__ attn_out,            // [B, num_q_heads * HD256]
     int num_q_heads,
-    int batch_size
+    int batch_size,
+    int use_swish
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int q_dim = num_q_heads * HD256;
@@ -188,8 +189,9 @@ __global__ void attention_gate_paged_hd256_kernel(
 
     float gate = __bfloat162float(q_full_batch[gate_idx]);
     float sig_gate = 1.0f / (1.0f + expf(-gate));
+    float gate_val = use_swish ? (gate * sig_gate) : sig_gate;
     float out = __bfloat162float(attn_out[idx]);
-    attn_out[idx] = __float2bfloat16(out * sig_gate);
+    attn_out[idx] = __float2bfloat16(out * gate_val);
 }
 
 extern "C" {
@@ -253,6 +255,7 @@ cudaError_t attention_gate_paged_hd256_cuda(
     __nv_bfloat16* attn_out,
     int num_q_heads,
     int batch_size,
+    int use_swish,
     cudaStream_t stream
 ) {
     if (q_full_batch == nullptr || attn_out == nullptr || num_q_heads <= 0 || batch_size <= 0) {
@@ -263,7 +266,7 @@ cudaError_t attention_gate_paged_hd256_cuda(
     int threads = 256;
     int blocks = (total + threads - 1) / threads;
     attention_gate_paged_hd256_kernel<<<blocks, threads, 0, stream>>>(
-        q_full_batch, attn_out, num_q_heads, batch_size
+        q_full_batch, attn_out, num_q_heads, batch_size, use_swish
     );
     return cudaGetLastError();
 }

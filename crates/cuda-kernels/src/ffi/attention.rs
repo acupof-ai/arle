@@ -77,6 +77,7 @@ unsafe extern "C" {
         num_q_heads: i32,
         head_dim: i32,
         seq_len: i32,
+        use_swish: i32,
         stream: CUstream,
     ) -> CUresult;
 
@@ -332,6 +333,7 @@ unsafe extern "C" {
         attn_out: *mut Half,
         num_q_heads: i32,
         batch_size: i32,
+        use_swish: i32,
         stream: CUstream,
     ) -> CUresult;
 
