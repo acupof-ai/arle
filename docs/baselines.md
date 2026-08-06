@@ -31,9 +31,10 @@ python3 scripts/gen_bench_prompts.py bench-agent-32k-16x8.jsonl 16 32000 214 8
 
 ### SOTA — DSpark, `b8d390bf3` (2026-08-06)
 
-> **c≥4 carries an unresolved −6 to −10% regression** against the binary this
-> row replaces. Both are recorded below; the audit that separated them, and the
-> first bisect probe, are in
+> **c≥4 carries an unresolved decode regression** — TPOT +9.7% at c=8 and
+> +21.5% at c=16 against the binary this row replaces, while c=1 decode is
+> 12.7% faster. Both are recorded below; the audit that separated them, and the
+> bisect target, are in
 > [`wins/2026-08-06-dspark-anchor-remeasure-c1-plus-40-percent.md`](experience/wins/2026-08-06-dspark-anchor-remeasure-c1-plus-40-percent.md).
 > Screen a candidate against c=1 freely; a c≥4 comparison is against a known-sick
 > champion until the probe lands.
@@ -56,13 +57,18 @@ One serve, ascending, so `pt` is 1st through 5th — every point but c=1 inherit
 a warm cache. `TTFT cold` is the p90 of the 128 requests (16 of them are turn 0);
 `TTFT warm` is the p50.
 
-| c | pt | TTFT cold | TTFT warm | ITL mean | out tok/s | total tok/s | req/s |
+`TPOT` is `itl_mean`, and for a spec row that is the only honest per-token
+number: `itl_p50` reads 0.02 ms because it samples the within-chain gap.
+`decode tok/s = 1000 / TPOT` is per request and excludes prefill; `total tok/s`
+is the whole-run figure and does not.
+
+| c | pt | TTFT cold | TTFT warm | TPOT | decode tok/s | total tok/s | req/s |
 |---|---|---:|---:|---:|---:|---:|---:|
-| 1 | 1st | 10.79 s | 0.94 s | 8.41 ms | 35.1 | **10406.8** | 0.298 |
-| 2 | 2nd | 0.70 s | 0.59 s | 18.88 ms | 80.4 | 20752.5 | 0.594 |
-| 4 | 3rd | 1.01 s | 0.62 s | 35.68 ms | 93.7 | 24327.3 | 0.697 |
-| 8 | 4th | 1.52 s | 0.78 s | 67.08 ms | 103.0 | 28669.5 | 0.821 |
-| 16 | 5th | 2.73 s | 1.24 s | 131.32 ms | 104.8 | 30486.2 | 0.873 |
+| 1 | 1st | 10.79 s | 0.94 s | 8.41 ms | **118.9** | **10406.8** | 0.298 |
+| 2 | 2nd | 0.70 s | 0.59 s | 18.88 ms | 53.0 | 20752.5 | 0.594 |
+| 4 | 3rd | 1.01 s | 0.62 s | 35.68 ms | 28.0 | 24327.3 | 0.697 |
+| 8 | 4th | 1.52 s | 0.78 s | 67.08 ms | 14.9 | 28669.5 | 0.821 |
+| 16 | 5th | 2.73 s | 1.24 s | 131.32 ms | 7.6 | 30486.2 | 0.873 |
 
 128/128 at every point, 0 errors. `prompt_tokens` 34782/request against a 32000
 target (+8.7%, inside the ±10% bar). Cumulative `accept` 0.3085.
@@ -75,6 +81,8 @@ this, not the ±3% constant at the top of the file, for this workload.
 **The superseded row, kept as the regression's other arm** — `51985031d`
 (2026-07-30) · `arle-mk`, re-run on the same box and dataset on 2026-08-06:
 
+total tok/s (prefill + decode):
+
 | c | recorded 07-30 | `arle-mk` re-run | this row | Δ vs `arle-mk` |
 |---|---:|---:|---:|---:|
 | 1 | 7440.7 | 7287.4 | 10321.5 | **+41.6%** |
@@ -83,9 +91,29 @@ this, not the ±3% constant at the top of the file, for this workload.
 | 8 | 31754.1 | 30621.3 | 27517.6 | **−10.1%** |
 | 16 | 32559.0 | 31890.9 | 29583.1 | **−7.2%** |
 
-The champion reproduces its own 07-30 numbers to within 2.1% at c=1/4/16, so
-the deficit is a regression rather than drift or a fingerprint difference. Both
-`this row` columns come from the audit's back-to-back shell; the standalone
+**TPOT, decode only — this is where the regression actually lives:**
+
+| c | recorded TPOT | `arle-mk` re-run | this row | Δ decode tok/s |
+|---|---:|---:|---:|---:|
+| 1 | 9.80 ms | 9.69 ms | **8.46 ms** | **+14.5%** |
+| 2 | 31.26 ms | 19.82 ms | 18.89 ms | +4.8% |
+| 4 | 32.10 ms | 35.69 ms | 36.23 ms | −1.5% |
+| 8 | 60.70 ms | 63.68 ms | **69.89 ms** | **−8.9%** |
+| 16 | 109.43 ms | 111.53 ms | **135.51 ms** | **−17.7%** |
+
+The champion reproduces its own 07-30 row on both metrics — total tok/s within
+2.1% at c=1/4/16, TPOT within 1.1% at c=1 and 1.9% at c=16 — so the deficit is
+a regression rather than drift or a fingerprint difference.
+
+Separating the two metrics changes what has to be bisected. **The regression is
+in decode and scales with concurrency** (−1.5 / −8.9 / −17.7% at c=4/8/16),
+while c=1 decode got 14.5% *faster*. A blended `out tok/s` hid both halves. Any
+candidate mechanism has to explain a per-token cost that grows with batch and
+is absent at batch 1 — which rules out the prefill-side changes that landed in
+the same window, `SIDECAR_SNAPSHOT_STRIDE_PAGES` included, since a
+cross-conversation restore is TTFT work and cannot move steady-state TPOT.
+
+Both `this row` columns come from the audit's back-to-back shell; the standalone
 sweep above is a separate run of the same binary, which is why c=1 reads 10406.8
 there and 10321.5 here.
 
