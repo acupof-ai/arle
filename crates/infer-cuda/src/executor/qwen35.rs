@@ -1158,13 +1158,11 @@ impl Qwen35CudaExecutor {
         Ok(())
     }
 
-    /// Re-acquire the shared paged full-attn KV pool at the size the constructed
-    /// pool reported (agent-OPD next-round rollout).
-    /// No-op (idempotent) if the pool is already resident.
+    /// Re-acquire the pool at `kv_pool_sized_pages`; no-op if resident.
     ///
-    /// Deliberately does NOT re-profile: `release_kv_pool` handed this VRAM to
-    /// the co-resident student, so a profile taken here shrinks the pool every
-    /// round until it collapses to `PROFILE_KV_TOKENS_FLOOR`.
+    /// Deliberately does NOT re-profile: `release_kv_pool` handed this VRAM to the
+    /// co-resident student, so a profile here shrinks the pool every round until
+    /// it collapses to `PROFILE_KV_TOKENS_FLOOR`.
     pub(crate) fn ensure_kv_pool(&mut self) -> Result<()> {
         if self.full_attn_kv.is_some() {
             return Ok(());
@@ -1175,8 +1173,7 @@ impl Qwen35CudaExecutor {
             self.kv_pool_sized_pages,
             self.kv_format,
         )?;
-        // Construction warns once when the profile floors; without this the
-        // replay would silently reuse that floored pool for the rest of the run.
+        // Construction warns once; the replay would otherwise be silent.
         let floor_pages = infer_seam::PROFILE_KV_TOKENS_FLOOR as usize / SUPPORTED_PAGE_SIZE;
         if self.kv_pool_sized_pages <= floor_pages {
             log::warn!(
