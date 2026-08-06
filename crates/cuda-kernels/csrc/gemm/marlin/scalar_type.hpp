@@ -2,6 +2,8 @@
 
 #include <cassert>
 #include <stdexcept>
+#include <tuple>
+#include <utility>
 #ifndef __CUDACC__
 #include <variant>
 #endif
