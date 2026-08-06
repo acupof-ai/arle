@@ -51,8 +51,8 @@ and 5; sweep 2 ran on an idle box.
 | 16 | 31313.7 | 30486.2 | −2.6% |
 
 **The co-tenant hypothesis is dead**: the idle box measured marginally slower.
-Run-to-run spread on this workload is **±2.7%**, which confirms the file's
-stated ±3% drift band on this workload rather than assuming it.
+Run-to-run spread is **±2.7%**, measured rather than inherited from the file's
+stated ±3%.
 
 Against the recorded row, median of the two sweeps:
 
@@ -96,8 +96,8 @@ accumulated drift. `51985031d`'s binary is archived at
 ~800 commits between the two shas. Same box, same dataset file, same serve
 flags, same grid, back to back.
 
-**The champion reproduces its own row**, which is what makes the rest of this
-readable:
+**The champion reproduces its own row** — within the ±2.7% band at c=1/4/16, at
+its edge at c=8:
 
 | c | recorded (07-30) | champion today | drift |
 |---:|---:|---:|---:|
@@ -105,10 +105,6 @@ readable:
 | 4 | 25432.8 | 25265.7 | −0.7% |
 | 8 | 31754.1 | 30621.3 | −3.6% |
 | 16 | 32559.0 | 31890.9 | −2.1% |
-
-Six days and ~800 commits of accumulated drift on the champion binary itself:
-within the ±2.7% band at c=1/4/16, at its edge at c=8. The recorded row, the
-box, and the regenerated dataset all agree.
 
 Back to back, same shell:
 
@@ -143,38 +139,25 @@ incomplete request spends wall clock without contributing tokens, so the
 champion's throughput is understated if anything; the deficit is a floor, not
 a ceiling.
 
-**Verdict: a real concurrency regression**, reproducible against the binary
-that set the row, on a quiet box, an order of magnitude outside the measured
-drift band.
+**Verdict: a real concurrency regression**, reproducible against the binary that
+set the row, on a quiet box, ~4× the measured drift band.
 
-## Bisect target
+## Hypotheses tested
 
-Not yet run. The cheapest first probe, before touching the ~800-commit range:
+The constraint any candidate must satisfy: a per-token cost that grows with
+batch and is absent at batch 1.
 
-`301d0c074` (today) raised `SIDECAR_SNAPSHOT_STRIDE_PAGES` 128 → 512 in
-`crates/infer-cuda/src/executor.rs:49`. Its own commit message states the
-tradeoff — a cross-conversation prefix hit now re-prefills up to 8K tokens
-instead of 2K — and it was licensed on a single-request 33K TTFT measurement,
-which is the c=1 regime. This workload is 16 sessions × 8 turns against 16
-slots, so a session's later turn can find its slot taken and land on the
-restore path; that is where the stated cost falls.
+| candidate | test | result |
+|---|---|---|
+| `SIDECAR_SNAPSHOT_STRIDE_PAGES` 128 → 512 (`301d0c074`) | same-source A/B, that constant alone | **dead** — 128 is worse everywhere: c=1 −7.0%, c=4 −5.2%, c=8 −6.6% |
+| DSpark goodput cost model mis-fit (`c3f38fdd7`) | same-binary flag A/B, 211/0.53 vs a refit 17.9/1.50 | **dead** — drafted 85570 vs 85735, accept 0.3245 vs 0.3246 |
+| `grammar_bitmask` per-step cost (`7c3946a2e`) | read the guard | **dead** — `is_greedy() && grammar_bitmask.is_none()` keeps the argmax fast path, and the bench is `--temperature 0` |
 
-**This is a hypothesis, not a root cause** — and the decode/prefill split above
-argues against it. A cross-conversation restore is TTFT work; it should not move
-steady-state TPOT at all, and the sign is wrong twice over: stride 512 takes
-*fewer* snapshots than 128, so it holds less of the ~150 MB-per-snapshot live
-state, which if anything should help at concurrency.
+The cost model **is** mis-fit — the model predicts 261.9 ms for a tick measured
+at 162.0 — but `--dspark-block-size 6` caps each row's admitted extra at 5, and
+the argmax saturates over that range. A wrong parameter that nothing reads.
 
-The probe ran anyway. It is one compile-time constant against a multi-hour
-bisect, the arms differ by that constant alone, and today already produced one
-case where the obvious mechanism (the GDN lane) was killed by measurement after
-an equally confident argument. A negative result narrows the range; the argument
-alone does not.
-
-**What the constraint now requires of any candidate:** a per-token cost that
-grows with batch size and is absent at batch 1. That excludes every prefill-side
-change in the window and points at the batched decode path — scheduler
-admission, spec-decode batching, or KV paging under slot pressure.
+Bisect over the 293-commit range is the remaining path.
 
 ## Learnings
 
@@ -203,9 +186,13 @@ since the row were each licensed on single-request 33K TTFT. They delivered:
 c=1 is up 41.6%. The same window lost 10.1% at c=8, on a workload the licensing
 benches never ran.
 
-**A blended `out tok/s` hides which half moved.** `output_tokens / wall`
-charges decode for prefill's time. Splitting it turned "c≥4 throughput is down
-6–10%" into "decode TPOT is up 9.7% at c=8 and 21.5% at c=16 while c=1 decode
-is 12.7% faster" — a constraint sharp enough to exclude every prefill-side
-change in the window, including the one this entry had named as its first
-probe. The row now carries TPOT and decode tok/s for that reason.
+**A blended `out tok/s` hides which half moved.** `output_tokens / wall` charges
+decode for prefill's time. Splitting it excluded every prefill-side change in
+the window, including the one this entry had named as its first probe.
+
+**A wrong parameter is not a live parameter.** The goodput cost model
+over-estimates the current tick by 62%, which fit the constraint on sign,
+magnitude, and mechanism. Re-fitting it moved the drafted count 0.2%: the block
+cap makes the argmax saturate, so nothing reads the parameter. Three hypotheses
+died this way — the GDN lane, the snapshot stride, and this one — each after an
+argument that felt sufficient.

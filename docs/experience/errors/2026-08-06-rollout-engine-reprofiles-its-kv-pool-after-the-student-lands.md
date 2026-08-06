@@ -55,7 +55,7 @@ Three defects chain from there:
 
 ## Fix
 
-`5ae88ee44` — **profile once, at construction; re-acquire at the recorded
+`a22237237` — **profile once, at construction; re-acquire at the recorded
 size.** Neither candidate from the first analysis was right. Bounding against
 `free` instead of `total × (1 − F)` changes sizing for every caller of
 `profile_kv_pool_tokens`, serve included, which is a default flip needing its
@@ -67,23 +67,26 @@ was in its known-good state:
 
 - `alloc_full_attn_kv_pool(model, num_slots, pages, kv_format)` extracted — it
   allocates at an exact page count and does no profiling.
-- `build_full_attn_kv_pool` profiles, then calls it, and returns
-  `(pool, sized_pages)`.
 - `kv_pool_sized_pages` replaces `kv_pool_mem_fraction_static` +
-  `kv_pool_requested_pages`, which existed only to re-profile.
+  `kv_pool_requested_pages`, which existed only to re-profile. It reads
+  `full_attn_kv.max_total_pages` — the pool's own post-clamp count, not a
+  parallel copy (`ac6669a12`).
 - `ensure_kv_pool` calls `alloc_full_attn_kv_pool` directly. An allocation that
   genuinely does not fit now errors, where it used to silently floor.
 
 The host/device page mismatch needed no separate patch — it was downstream of
 the shrink.
 
-`b8d390bf3` fixes an unrelated fatality found while gating this: `list_dumps`
+`f5f027840` fixes an unrelated fatality found while gating this: `list_dumps`
 bailed on a missing dump dir while both callers already treat "no dumps" as a
 skipped conversion. The dir defaults to `./dumps` relative to CWD, so anything
 cleaning the build tree killed a run mid-round.
 
-agent-OPD additionally bails when a group generates 0 completion tokens
-(`5ae88ee44`).
+agent-OPD warns when a group generates 0 completion tokens. This was a `bail!`
+until `de7f4bf8d`: the abort sat inside the round loop, before both weight-save
+sites, so under `--save-every 0` (what `scripts/agent_opd_curve.sh` passes) one
+zero-token group discarded every completed round. Zero is also not proof the
+engine died — a sandbox that fails to spawn yields the same sum.
 
 ### Gate
 
