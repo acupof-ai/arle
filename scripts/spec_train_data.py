@@ -88,6 +88,7 @@ def complete(base_url: str, model: str, messages: list,
         "messages": messages,
         "temperature": args.temperature,
         "top_p": args.top_p,
+        "top_k": args.top_k,
         "max_tokens": args.max_tokens,
     }).encode()
     req = urllib.request.Request(
@@ -189,10 +190,15 @@ def main() -> None:
     r.add_argument("--in", dest="input", type=Path, required=True)
     r.add_argument("--out", type=Path, required=True)
     r.add_argument("--concurrency", type=int, default=32)
+    # The sampling parameters are part of the objective: the TV term carries 0.9
+    # of it and is taken against the trunk's distribution on exactly this text.
+    # DeepSpec `scripts/data/prepare_data.sh:19-23` (its min_p=0 is a no-op).
     r.add_argument("--temperature", type=float, default=0.7)
     r.add_argument("--top-p", type=float, default=0.8)
-    # A reasoning turn needs >=10K on its own (2026-06-17: a 256-token cap
-    # taught an OPD student to answer early); 4096 dropped the longest samples.
+    r.add_argument("--top-k", type=int, default=20)
+    # Thinking trunk: one reasoning turn needs >=10K (2026-06-17: a 256-token cap
+    # taught an OPD student to answer early), past DeepSpec's non-thinking 4096 —
+    # its `README.md:64-65` sanctions the re-tune.
     r.add_argument("--max-tokens", type=int, default=16384)
     r.add_argument("--timeout", type=float, default=600.0)
     r.set_defaults(fn=cmd_regen)
