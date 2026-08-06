@@ -35,18 +35,21 @@ pub(crate) fn run_spec_draft(args: TrainSpecDraftArgs) -> Result<()> {
         .model_path
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("model path is not valid UTF-8"))?;
-    let cfg = DsparkConfig::from_dir(&args.draft)
+    let mut cfg = DsparkConfig::from_dir(&args.draft)
         .with_context(|| format!("read draft config from {}", args.draft.display()))?;
     // Block construction is unconditionally next-token: row `t` is supervised
-    // with `anchor+1+t`, which a `next_token_heads: false` serve reads one
-    // position off.
-    ensure!(
-        cfg.next_token_heads,
-        "{} has next_token_heads = false (same-position DFlash); training only \
-         produces next-token drafts, so the serve would read every row one \
-         position off",
-        args.draft.display()
-    );
+    // with `anchor+1+t`. A same-position DFlash checkpoint is still a valid
+    // warm start — the backbone weights carry over and training re-aims the
+    // one-position shift — but the SAVED config must state the geometry the
+    // training produced, or the serve reads every row one position off.
+    if !cfg.next_token_heads {
+        println!(
+            "{} is same-position DFlash; warm-starting its backbone into \
+             next-token geometry",
+            args.draft.display()
+        );
+        cfg.next_token_heads = true;
+    }
     let trunk = Qwen35Config::from_model_dir(&args.model_path)
         .with_context(|| format!("read trunk config from {}", args.model_path.display()))?;
 
