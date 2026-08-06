@@ -2,7 +2,7 @@ use smallvec::smallvec;
 
 use crate::{
     AutogradError, DeviceHandle, Result,
-    backend::{broadcast_offset, validate_broadcast},
+    backend::{Device, broadcast_offset, validate_broadcast},
     tape::{BackwardOp, GradPairs, SavedContext, Tape, TapeEntry},
     tensor::{Dirty, Tensor, TensorId, TensorStore},
 };
@@ -495,6 +495,12 @@ pub(crate) fn reshape_backward(
             "reshape backward missing saved shape",
         ));
     };
+    // Heal a host-resident upstream grad before the gate (mirrors
+    // matmul_backward) so one host grad upstream doesn't demote this reshape —
+    // and everything downstream — to the host contract with a full-buffer clone.
+    if store.backend().device() != Device::Cpu {
+        store.ensure_device(output_grad_id)?;
+    }
     let device_path_ok = {
         let upstream = store.tensor(output_grad_id)?;
         upstream.dirty != Dirty::Host && upstream.device_handle.is_some()

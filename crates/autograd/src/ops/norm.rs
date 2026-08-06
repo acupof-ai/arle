@@ -2,6 +2,7 @@ use smallvec::smallvec;
 
 use crate::{
     AutogradError, Result,
+    backend::Device,
     tape::{BackwardOp, GradPairs, SavedContext, Tape, TapeEntry},
     tensor::{Dirty, Tensor, TensorId, TensorStore},
 };
@@ -186,7 +187,14 @@ pub(crate) fn rmsnorm_backward(
     // Route through `rms_norm_backward_device` whenever
     // upstream, x, and weight are all device-resident. A host path would
     // `ensure_host(x)` + read `tensor_host` for all three operands, demoting
-    // x back to host before any downstream device op could see it.
+    // x back to host before any downstream device op could see it. Heal a
+    // host-resident upstream grad first (mirrors matmul_backward) so one host
+    // grad upstream doesn't demote this norm — and everything downstream.
+    if store.backend().device() != Device::Cpu {
+        store.ensure_device(output_grad_id)?;
+        store.ensure_device(x)?;
+        store.ensure_device(weight)?;
+    }
     let device_path_ok = {
         let upstream = store.tensor(output_grad_id)?;
         let x_t = store.tensor(x)?;
