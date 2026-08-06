@@ -45,7 +45,7 @@ attention-qv, `--task-limit 1` to finish before the re-profile bug fires
 ([`errors/2026-08-06-rollout-engine-reprofiles-its-kv-pool-after-the-student-lands.md`](../errors/2026-08-06-rollout-engine-reprofiles-its-kv-pool-after-the-student-lands.md)).
 
 The agent took the **same turn count in both arms**, which makes the per-sample
-walls a paired comparison rather than a noisy one:
+walls a paired comparison:
 
 | sample | turns | recurrent | chunked | Δ |
 |---|---:|---:|---:|---:|
@@ -113,9 +113,9 @@ at 0.2 it starves itself.
 ## Problems
 
 The first A/B was uninterpretable — both arms produced zero completion tokens,
-so the flag under test could not have shown a difference either way. The zero
-was read as "the A/B is a wash" for one round before the arms were checked for
-having done any work at all.
+so the flag under test could not have shown a difference. The zero was read as
+"the A/B is a wash" for one round before the arms were checked for having done
+any work at all.
 
 ## Rule
 
