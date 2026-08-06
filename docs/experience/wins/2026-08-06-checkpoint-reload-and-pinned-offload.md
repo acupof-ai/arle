@@ -119,13 +119,32 @@ correctness license here is the OPD step's loss/grad_norm against 4.537510 /
 7.965–7.985. Both arms reorder *when* bytes move, never *what* is computed, so
 parity must hold exactly.
 
-Re-profile check: `upload_slice` 35% and `reshape` 16.2% must both fall. If the
-backward drops but those rows do not, the mechanism is not the one claimed.
+Re-profile check (2026-08-07, nsys on the new defaults, 119.0 s backward window,
+loss 4.537510 exact): **mechanism confirmed.** `cuMemcpyHtoDAsync` 110.3 → 33.9 s;
+`reshape` / `rmsnorm` / `Vec`-repack host rows absent from the top 15 (libc leaf
+total now 5.7% ≈ 6.8 s); HtoD copy traffic 327.8 → 88.7 GB, DtoH 101.5 → 51.2 GB.
+Artifacts: `/host/fq-nsys-out/l2probe_newdefaults.{nsys-rep,sqlite}`.
+
+New ranking after the win:
+1. `cuStreamSynchronize` ~50 s (42%, unchanged absolute — the wall shrank around
+   it): 73% of samples under `CudaBackend::eval`, 27% under `trim_memory_pool`.
+2. Pageable `cuMemcpyHtoDAsync` ~34 s (28.5%).
+3. `__clock_gettime` ~14 s (11.7%).
+GPU kernel-busy is now 83.8 s of 119 s = **70%** (was 28% of 305 s) with kernel
+time itself unchanged (84.6 → 83.8 s, 61k launches) — the backward is converging
+on GPU-bound, and the eval/trim sync spin largely overlaps GPU-busy time. Ceiling
+for further pure host-side levers: ~35 s. This also explains arm C's wash: the
+pinned pool targeted a row whose absolute cost the reload arm had already
+absorbed into overlap.
 
 ## Problems
 
-None yet — nothing measured.
+The `--synthetic-writeback-seq` recipe is a single-step probe by construction
+(`train_cli.rs:3464` returns after one step); a multi-update training
+measurement must use the cc-rollout agent-OPD lane.
 
 ## Learnings
 
-pending-remote.
+The profiled 21% "reshape memcpy" row and the 36% HtoD row were two symptoms of
+one cause — recompute-forward on a host-resident activation — and one residency
+flag removed both. Rank levers by the cause under the rows, not the rows.
