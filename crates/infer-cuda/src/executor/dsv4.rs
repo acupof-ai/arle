@@ -796,6 +796,7 @@ impl Dsv4CudaExecutor {
         let sps = qwen35_spec::DsparkSps {
             bias_ms: sps_bias_ms,
             row_ms: sps_row_ms,
+            confidence_threshold: crate::runtime_flags::dspark_confidence_threshold(),
         };
         log::info!(
             "CUDA DSv4 DSpark runtime initialized: stages={num_stages} block={block_size} \
