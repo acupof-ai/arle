@@ -1363,6 +1363,20 @@ pub(crate) struct TrainSpecDraftArgs {
 
     #[arg(long, default_value_t = 100, value_parser = parse_positive_usize)]
     pub(crate) save_every: usize,
+
+    /// Check the trunk supervision signal on the first sample and exit without
+    /// training. One `forward_training_taps` — the trainer's own call — then
+    /// the `last_hidden @ lm_head` reconstruction against the engine's own
+    /// logits at 16 positions spread over the sequence, gated on argmax
+    /// agreement 0.75, top-64 overlap 0.50, and mean |Δ log p(next token)|
+    /// 1.0 nat; plus every tap non-degenerate at pairwise cosine under 0.99.
+    /// The bars are loose because the engine's head is FP8/Marlin against an
+    /// f32 recompute, and still strict because a wrong tap layer or a
+    /// pre/post-norm slip puts all three near zero while the loss curve keeps
+    /// falling. Non-zero exit on FAIL. Materializes `[seq, vocab]` logits, so
+    /// `--max-len` bounds the cost.
+    #[arg(long, default_value_t = false)]
+    pub(crate) probe: bool,
 }
 
 #[derive(Debug, Clone, ClapArgs)]

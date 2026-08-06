@@ -1041,10 +1041,21 @@ impl Qwen35CudaExecutor {
                 if profiled_tokens == infer_seam::PROFILE_KV_TOKENS_FLOOR {
                     // `mem_fraction_static` bounds the engine's share of TOTAL, so any
                     // value under the weights' own share leaves nothing and admission
-                    // silently caps at 4096 tokens — every longer prompt aborts.
+                    // silently caps at 4096 tokens — every longer prompt aborts. The
+                    // operands ride along: the adjacent info! is suppressed at the
+                    // default level, and without them this needs nvidia-smi to diagnose.
+                    let reserve = (total as f64 * (1.0 - mem_fraction_static)) as u64;
                     log::warn!(
-                        "KV pool collapsed to the {}-token floor at mem_fraction_static \
-                         {mem_fraction_static}: raise it above the weights' share of total VRAM",
+                        "KV pool collapsed to the {}-token floor: free_after_recurrent {}MB − \
+                         reserve {}MB (= total {}MB × (1 − mem_fraction_static \
+                         {mem_fraction_static})) leaves nothing for {cell_bytes_per_token}B/tok \
+                         cells. Raise mem_fraction_static above {:.2}, or free VRAM: every \
+                         prompt over {} tokens will abort.",
+                        infer_seam::PROFILE_KV_TOKENS_FLOOR,
+                        free_after_recurrent >> 20,
+                        reserve >> 20,
+                        total >> 20,
+                        1.0 - (free_after_recurrent as f64 / total as f64),
                         infer_seam::PROFILE_KV_TOKENS_FLOOR,
                     );
                 }
