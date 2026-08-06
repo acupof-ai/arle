@@ -904,7 +904,10 @@ fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) {
         .unwrap_or_else(|err| panic!("read identity directory {}: {err}", dir.display()))
     {
         let path = entry.expect("read identity directory entry").path();
-        if path.file_name().is_some_and(|name| name == "__pycache__") {
+        if path
+            .file_name()
+            .is_some_and(|name| name == "__pycache__" || name.to_string_lossy().starts_with('.'))
+        {
             continue;
         }
         if path.is_dir() {
