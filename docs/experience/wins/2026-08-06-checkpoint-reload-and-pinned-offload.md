@@ -62,9 +62,10 @@ all three of the plan's silent-corruption modes disappear by construction:
 
 | Risk | Guard |
 |---|---|
-| pinned buffer reused while its copy is in flight | cudarc brackets every pinned memcpy with `stream.wait(event)` / `event.record(stream)`; `as_slice` syncs on that event |
+| pinned buffer reused while its copy is in flight | reuse re-enqueues on the same stream, ordered behind the previous copy; the one host read (`checkpoint_pin_readback`) drains the stream |
 | device buffer freed under an in-flight DtoH | `CudaSlice::drop` frees via `cuMemFreeAsync` on the same stream, so the free is ordered behind the copy |
 | consumer reads a reloaded handle before the HtoD lands | same stream, so stream order is the ordering |
+| pool dropped under an in-flight DtoH | copies pass plain slices, which record no event on the buffer, so `PinnedCheckpointPool::drop` drains the stream before `cuMemFreeHost` |
 
 **No `pinned → Vec` leg.** cudarc's `alloc_pinned` sets
 `CU_MEMHOSTALLOC_WRITECOMBINED`, where host reads are uncached. The pinned buffer
@@ -73,8 +74,15 @@ the rare `ensure_host` fallback. A pass-through staging design (the plan's shape
 would have added ~100 GB of write-combined host reads and could have come out
 slower than the pageable path it replaced.
 
-Slot reuse is exact-length: `cuMemcpyDtoHAsync` copies the whole destination, so a
-longer buffer would read past the source.
+Slot capacities round to 64 MiB with best-fit reuse and an exact-fit fallback
+(`aa5b1f820`, `d1870526f`): exact-length reuse plus varying OPD trajectory
+lengths exhausted the budget on the first size classes and silently disabled the
+pinned path. Every copy names its own length, since cudarc's typed memcpy copies
+the whole destination.
+
+`d1870526f` also removes a full-source clone in `slice_host_eager` (it cloned
+the whole tensor to read one chunk), which cuts the baseline arm's replay memcpy
+too — all arms must be measured on the same tree.
 
 Precedent for DtoH into cudarc write-combined pinned memory:
 `infer-cuda/src/qwen35.rs:1396` (recurrent-state snapshot), in production.
