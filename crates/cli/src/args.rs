@@ -1312,6 +1312,9 @@ fn spec_draft_cfg() -> spec_train::trainer::Config {
     after_help = "Examples:\n  arle train spec-draft --model-path checkpoints/base --draft drafts/dspark --data conversations.jsonl --out drafts/dspark-trained\n  arle train spec-draft --model-path checkpoints/base --draft drafts/dspark --data conversations.jsonl --out /tmp/ab-tv0 --loss-tv 0.0 --seed 42 --log-every 1"
 )]
 pub(crate) struct TrainSpecDraftArgs {
+    #[command(flatten)]
+    pub(crate) runtime: OpdRuntimeArgs,
+
     /// Target model directory. Supplies the trunk forward, the tokenizer, and
     /// the embeddings + lm_head the draft shares with it.
     #[arg(long, value_name = "PATH")]
