@@ -7,10 +7,12 @@
 //!
 //! One conversation yields ONE sample, rendered exactly as the serve renders it
 //! at the moment it generates the conversation's last assistant turn, and only
-//! that turn is supervised. The checkpoint template strips the reasoning from
-//! every assistant turn before the last user query, so an earlier turn's text
-//! in this rendering is not what the trunk emitted there and training on it
-//! would be off-distribution.
+//! that turn is supervised. DeepSpec supervises every assistant turn
+//! (`deepspec/data/parser.py:114-138`) because its non-thinking render puts each
+//! turn after the same prefix the target sampled it under; our template deletes
+//! every history turn's reasoning, so those answers no longer follow the
+//! reasoning that produced them and supervising them would train a conditional
+//! the trunk never emits.
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use serde::Deserialize;
@@ -27,6 +29,9 @@ const THINK_START: &str = "<think>";
 const THINK_END: &str = "</think>";
 /// What the template emits between the reasoning and the answer.
 const CLOSER: &str = "\n</think>\n\n";
+/// DeepSpec `scripts/data/prepare_target_cache.py --min-loss-tokens`, counted
+/// the same way: supervised tokens left after truncation.
+const MIN_SUPERVISED: usize = 14;
 
 #[derive(Debug, Deserialize)]
 pub struct Message {
@@ -78,6 +83,7 @@ pub fn load_samples(data: &Path, tokenizer: &Path, limits: Limits) -> Result<Vec
 
     let raw = std::fs::read_to_string(data).with_context(|| format!("read {}", data.display()))?;
     let mut samples = Vec::new();
+    let (mut truncated, mut cut, mut short) = (0usize, 0usize, 0usize);
     for (i, line) in raw.lines().enumerate() {
         if line.trim().is_empty() {
             continue;
@@ -85,21 +91,44 @@ pub fn load_samples(data: &Path, tokenizer: &Path, limits: Limits) -> Result<Vec
         let at = format!("{}:{}", data.display(), i + 1);
         let conv: Conversation =
             serde_json::from_str(line).with_context(|| format!("{at}: parse conversation"))?;
-        let sample = to_sample(&conv, &tk, limits).with_context(|| at.clone())?;
-        ensure!(
-            !anchor_candidates(&sample.loss_mask).is_empty(),
-            "{at}: no two consecutive supervised positions survive max_len {} — the sample \
-             can anchor no block",
-            limits.max_len
-        );
-        samples.push(sample);
+        match to_sample(&conv, &tk, limits).with_context(|| at)? {
+            Outcome::Kept {
+                sample,
+                truncated: t,
+            } => {
+                truncated += usize::from(t);
+                samples.push(sample);
+            }
+            Outcome::Cut => cut += 1,
+            Outcome::Short => short += 1,
+        }
     }
+    println!(
+        "{}: {} samples, {truncated} truncated at max_len {}, {cut} dropped (max_len cut the \
+         supervised turn), {short} dropped (under {MIN_SUPERVISED} supervised tokens)",
+        data.display(),
+        samples.len(),
+        limits.max_len,
+    );
     ensure!(
         !samples.is_empty(),
-        "{} holds no conversations",
-        data.display()
+        "{} yields no usable sample: {cut} dropped where max_len {} cut the supervised turn, \
+         {short} dropped under {MIN_SUPERVISED} supervised tokens",
+        data.display(),
+        limits.max_len
     );
     Ok(samples)
+}
+
+/// What became of one conversation.
+pub enum Outcome {
+    /// `truncated` marks a row shortened to `max_len` with its supervision intact.
+    Kept { sample: Sample, truncated: bool },
+    /// `max_len` ate supervised tokens.
+    Cut,
+    /// Under [`MIN_SUPERVISED`] supervised tokens, or no two consecutive ones to
+    /// anchor a block.
+    Short,
 }
 
 /// Tokenize one conversation and mark its last assistant turn as trainable.
@@ -108,7 +137,7 @@ pub fn load_samples(data: &Path, tokenizer: &Path, limits: Limits) -> Result<Vec
 /// it stays correct whatever the tokenizer does to the boundaries — and a token
 /// that crosses a boundary is an error, because supervising it would supervise
 /// prompt bytes and dropping it would lose a generated token.
-pub fn to_sample(conv: &Conversation, tokenizer: &Tokenizer, limits: Limits) -> Result<Sample> {
+pub fn to_sample(conv: &Conversation, tokenizer: &Tokenizer, limits: Limits) -> Result<Outcome> {
     let rendered = render(conv)?;
     let encoding = tokenizer
         .encode(rendered.text.as_str(), false)
@@ -123,15 +152,12 @@ pub fn to_sample(conv: &Conversation, tokenizer: &Tokenizer, limits: Limits) -> 
 
     let generated = &rendered.generated;
     let take = encoding.len().min(limits.max_len);
-    // The supervised turn is last, so max_len cuts the answer, never the prompt.
-    ensure!(
-        take == encoding.len() || offsets[take - 1].1 >= generated.end,
-        "conversation {}: max_len {} cuts the supervised turn — raise --max-len to {} \
-         or the trainer sees a fragment of the answer",
-        conv.id,
-        limits.max_len,
-        encoding.len()
-    );
+    let truncated = take < encoding.len();
+    // The supervised turn is last, so max_len cuts the answer, never the prompt:
+    // a cut leaves a fragment the trunk never decoded, so the row goes.
+    if truncated && offsets[take - 1].1 < generated.end {
+        return Ok(Outcome::Cut);
+    }
     let mut loss_mask = Vec::with_capacity(take);
     for &(start, end) in &offsets[..take] {
         let inside = start >= generated.start && end <= generated.end;
@@ -147,9 +173,17 @@ pub fn to_sample(conv: &Conversation, tokenizer: &Tokenizer, limits: Limits) -> 
         loss_mask.push(inside && start < end);
     }
 
-    Ok(Sample {
-        input_ids: encoding.get_ids()[..take].to_vec(),
-        loss_mask,
+    if loss_mask.iter().filter(|&&m| m).count() < MIN_SUPERVISED
+        || anchor_candidates(&loss_mask).is_empty()
+    {
+        return Ok(Outcome::Short);
+    }
+    Ok(Outcome::Kept {
+        sample: Sample {
+            input_ids: encoding.get_ids()[..take].to_vec(),
+            loss_mask,
+        },
+        truncated,
     })
 }
 
@@ -369,20 +403,31 @@ mod tests {
         let c = conv();
         let text = render(&c).unwrap().text;
         tokenizer(&text).save(&tok_path, false).unwrap();
-        std::fs::write(
-            &data,
+        let line = |id: u64, msgs: &[Message]| {
             serde_json::json!({
-                "id": 1,
-                "conversations": c.conversations.iter()
+                "id": id,
+                "conversations": msgs.iter()
                     .map(|m| serde_json::json!({"role": m.role, "content": m.content}))
                     .collect::<Vec<_>>(),
             })
             .to_string()
-                + "\n",
-        )
-        .unwrap();
+                + "\n"
+        };
+        // 44 supervised bytes, then a row whose 12 fall under MIN_SUPERVISED.
+        let short = [
+            Message {
+                role: "user".into(),
+                content: "ask".into(),
+            },
+            Message {
+                role: "assistant".into(),
+                content: "hi".into(),
+            },
+        ];
+        std::fs::write(&data, line(1, &c.conversations) + &line(2, &short)).unwrap();
 
         let samples = load_samples(&data, &tok_path, limits(4096)).unwrap();
+        assert_eq!(samples.len(), 1, "the under-supervised row must drop");
         let tk = Tokenizer::from_file(&tok_path).unwrap();
         let marked: Vec<u32> = samples[0]
             .input_ids
@@ -397,13 +442,12 @@ mod tests {
             "second thought\n</think>\n\nreply two<|im_end|>"
         );
 
-        // Truncation that leaves the assistant turn out is an error, not a
-        // sample the trainer silently skips.
+        // Truncation that eats the assistant turn drops the row and says so; only
+        // an empty corpus stops the run.
         let err = load_samples(&data, &tok_path, limits(8)).unwrap_err();
-        assert!(err.to_string().contains("train.jsonl:1"), "{err}");
         assert!(
-            format!("{err:#}").contains("cuts the supervised turn"),
-            "{err:#}"
+            err.to_string().contains("2 dropped where max_len 8 cut"),
+            "{err}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

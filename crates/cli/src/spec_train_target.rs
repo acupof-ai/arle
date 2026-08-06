@@ -93,19 +93,21 @@ pub(crate) fn run_spec_draft(args: TrainSpecDraftArgs) -> Result<()> {
             .context("load trunk lm_head")?
     };
 
-    let draft = if backbone::has_weights(&args.draft)? {
+    // A confidence head trained at weight 0 still reaches the serve, which
+    // obeys it and truncates every block by noise.
+    let heads = backbone::Heads {
+        markov_rank: args.markov_rank,
+        confidence: args.loss_confidence > 0.0,
+    };
+    let draft = if let Some(dir) = &args.resume {
+        println!("resuming from {}", dir.display());
+        backbone::load(dir, heads, args.seed, embed, lm_head, &mut store)?
+    } else if backbone::has_weights(&args.draft)? {
         println!("warm-starting from {}", args.draft.display());
-        backbone::load(&args.draft, embed, lm_head, &mut store)?
+        backbone::load(&args.draft, heads, args.seed, embed, lm_head, &mut store)?
     } else {
-        println!("training from scratch");
-        backbone::init(
-            cfg,
-            trunk.vocab_size,
-            args.markov_rank,
-            embed,
-            lm_head,
-            &mut store,
-        )?
+        println!("training from scratch, init seed {}", args.seed);
+        backbone::init(cfg, heads, args.seed, embed, lm_head, &mut store)?
     };
     let target_layer_ids = draft.cfg.target_layer_ids.clone();
 
@@ -159,10 +161,35 @@ pub(crate) fn run_spec_draft(args: TrainSpecDraftArgs) -> Result<()> {
     let mut trainer = trainer::Trainer::new(draft, train_cfg, args.steps, backend);
     let mut tape = Tape::new();
 
-    let mut order = epoch_order(samples.len(), args.seed, 0);
-    let mut cursor = 0usize;
-    let mut epoch = 0u64;
-    for step in 0..args.steps {
+    let start_step = match &args.resume {
+        Some(dir) => {
+            // Weights without moments is a warm start, which `--draft` already
+            // does; letting it through here would silently restart AdamW and
+            // the cosine at zero under a flag that promises otherwise.
+            ensure!(
+                trainer.load_state(dir)?,
+                "{} carries no optimizer.safetensors; use --draft to warm-start from its weights",
+                dir.display()
+            );
+            let step = trainer.step();
+            println!("restored optimizer state at step {step}");
+            step
+        }
+        None => 0,
+    };
+    ensure!(
+        start_step < args.steps,
+        "--resume is already at step {start_step}, --steps {}",
+        args.steps
+    );
+
+    // A step consumes exactly `--batch` samples, so the resumed cursor is the
+    // running total and no sample is replayed or skipped.
+    let consumed = start_step * args.batch;
+    let mut epoch = (consumed / samples.len()) as u64;
+    let mut order = epoch_order(samples.len(), args.seed, epoch);
+    let mut cursor = consumed % samples.len();
+    for step in start_step..args.steps {
         let mut batch = Vec::with_capacity(args.batch);
         for _ in 0..args.batch {
             if cursor == order.len() {
@@ -182,14 +209,20 @@ pub(crate) fn run_spec_draft(args: TrainSpecDraftArgs) -> Result<()> {
             .train_step(&batch, &mut target, &mut store, &mut tape)
             .with_context(|| format!("step {step}"))?;
         if step.is_multiple_of(args.log_every) || step + 1 == args.steps {
+            // `tau` and `confidence_bias` condemn a checkpoint on their own: tau
+            // at the 1.0 floor drafts nothing, and BCE alone cannot tell an
+            // over-confident head from a saturated-low one.
             println!(
                 "step {step} loss {:.6} ce {:.4} tv {:.4} conf {:.4} accept {:.4} \
-                 gnorm {:.4} lr {:.3e} {:.2}s/step counted {}/{} chunks {}",
+                 tau {:.3} confidence_bias {:+.4} gnorm {:.4} lr {:.3e} {:.2}s/step \
+                 counted {}/{} chunks {}",
                 st.loss,
                 st.ce,
                 st.tv,
                 st.conf,
                 st.mean_accept,
+                st.tau,
+                st.confidence_bias,
                 st.grad_norm,
                 st.lr,
                 started.elapsed().as_secs_f64(),
@@ -197,9 +230,18 @@ pub(crate) fn run_spec_draft(args: TrainSpecDraftArgs) -> Result<()> {
                 batch.len(),
                 st.chunks
             );
+            let accept_at: Vec<String> = st.accept_at.iter().map(|a| format!("{a:.3}")).collect();
+            println!(
+                "  accept@0..{} {}  confidence_abs_error {:.4} confidence_cumprod_bias {:+.4}",
+                st.accept_at.len().saturating_sub(1),
+                accept_at.join(" "),
+                st.confidence_abs_error,
+                st.confidence_cumprod_bias,
+            );
         }
         if (step + 1).is_multiple_of(args.save_every) || step + 1 == args.steps {
             backbone::save(&trainer.draft, &args.out, &store)?;
+            trainer.state(&args.out)?;
             println!("saved {}", args.out.display());
         }
     }

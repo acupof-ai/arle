@@ -760,6 +760,17 @@ pub(crate) struct ServeArgs {
     #[arg(long, value_name = "N")]
     pub(crate) dspark_block_size: Option<usize>,
 
+    /// Confidence-head early stop: a DSpark block is cut at the first position
+    /// whose cumulative survival falls under this. 0 turns the gate off and
+    /// drafts the whole block, which is how the reference evaluates (DeepSpec
+    /// `eval.py --confidence-threshold`, default 0.0) — it measures a drafter
+    /// apart from its head, and a saturated-low head truncates every block to
+    /// nothing. Unset keeps the goodput budget, which is what ships today.
+    /// A positive value cuts earlier than DeepSpec's, which thresholds each
+    /// position's own sigmoid rather than the running product.
+    #[arg(long, value_parser = parse_unit_interval, value_name = "P")]
+    pub(crate) dspark_confidence_threshold: Option<f32>,
+
     /// Install a Markov head from a safetensors file over the draft
     /// checkpoint's. This is the only way to put a trained head into a serve —
     /// copying the file into the draft dir does nothing, since the loader reads
@@ -1001,6 +1012,7 @@ impl ServeArgs {
             mtp_adaptive: self.mtp_adaptive,
             mtp_min_accept: self.mtp_min_accept,
             spec_max_batch: self.spec_max_batch,
+            dspark_confidence_threshold: self.dspark_confidence_threshold,
             deepep_num_sms: self.deepep_num_sms,
             deepep_max_dispatch_tokens_per_rank: self.deepep_max_dispatch_tokens_per_rank,
         }
@@ -1301,10 +1313,11 @@ pub(crate) struct TrainSpecDraftArgs {
     #[arg(long, default_value_t = 8, value_parser = parse_positive_usize)]
     pub(crate) batch: usize,
 
-    /// Tokens kept per conversation. Must clear the regen cap
-    /// (`spec_train_data.py --max-tokens`, 16384) plus the prompt, because the
-    /// supervised turn is last and truncation cuts the answer, not the prompt.
-    #[arg(long, default_value_t = 20480, value_parser = parse_positive_usize)]
+    /// Tokens kept per conversation. 4096 is the reference's `data.max_length`
+    /// (DeepSpec `config/dspark/dspark_qwen3_14b.py`). Truncation drops the
+    /// tail, so a conversation over the cap loses the end of the supervised
+    /// turn; raising this also lengthens every trunk forward.
+    #[arg(long, default_value_t = 4096, value_parser = parse_positive_usize)]
     pub(crate) max_len: usize,
 
     #[arg(long, default_value_t = spec_draft_cfg().num_anchors, value_parser = parse_positive_usize)]
@@ -1363,6 +1376,13 @@ pub(crate) struct TrainSpecDraftArgs {
 
     #[arg(long, default_value_t = 100, value_parser = parse_positive_usize)]
     pub(crate) save_every: usize,
+
+    /// Continue a run from a `--save-every` checkpoint directory: draft weights,
+    /// AdamW moments and the step counter, so the LR schedule, the anchor draw
+    /// and the sample order pick up where they stopped. Takes precedence over
+    /// the `--draft` warm start.
+    #[arg(long, value_name = "DIR")]
+    pub(crate) resume: Option<PathBuf>,
 
     /// Check the trunk supervision signal on the first sample and exit without
     /// training. One `forward_training_taps` — the trainer's own call — then
@@ -3140,6 +3160,41 @@ mod tests {
         let args = Args::try_parse_from(["arle"]).expect("default args");
         assert_eq!(args.trace_prompts, super::TracePromptsMode::On);
         assert!(args.trace.is_none());
+    }
+
+    /// Unset and `0` must stay distinguishable all the way into
+    /// `CudaRuntimeFlags`: unset keeps the goodput budget, `0` proposes the
+    /// whole block. Collapsing them flips every serve's default silently.
+    #[test]
+    fn dspark_confidence_threshold_separates_unset_from_zero() {
+        let flags = |extra: &[&str]| {
+            let argv = [&["arle", "serve", "--backend", "cuda"][..], extra].concat();
+            match Args::try_parse_from(argv)
+                .expect("serve should parse")
+                .command
+                .expect("serve command")
+            {
+                CliCommand::Serve(serve) => serve.cuda_runtime_flags().dspark_confidence_threshold,
+                other => panic!("expected serve command, got {other:?}"),
+            }
+        };
+        assert_eq!(flags(&[]), None);
+        assert_eq!(flags(&["--dspark-confidence-threshold", "0"]), Some(0.0));
+        assert_eq!(
+            flags(&["--dspark-confidence-threshold", "0.75"]),
+            Some(0.75)
+        );
+        assert!(
+            Args::try_parse_from([
+                "arle",
+                "serve",
+                "--backend",
+                "cuda",
+                "--dspark-confidence-threshold",
+                "1.5",
+            ])
+            .is_err()
+        );
     }
 
     #[test]
