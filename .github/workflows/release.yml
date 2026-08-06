@@ -162,9 +162,9 @@ jobs:
     needs: qualify-release
     runs-on: ubuntu-22.04
     continue-on-error: true
-    # Off by default: a no-GPU cross-compile runner can't validate sm_70, and the
-    # in-CI patched-tvm-ffi wheel rebuild is fragile. sm_70 is verified on the real
-    # V100 box instead (ssh v100; see wins/2026-07-13-sm70-gated-delta-rule-fp16-gate).
+    # Off by default: a no-GPU cross-compile runner can't validate sm_70. sm_70 is
+    # verified on the real V100 box instead (ssh v100; see
+    # wins/2026-07-13-sm70-gated-delta-rule-fp16-gate).
     # Set repo var ENABLE_EXOTIC_SM_LANES=true to run it.
     if: ${{ vars.ENABLE_EXOTIC_SM_LANES == 'true' }}
 
@@ -206,7 +206,7 @@ jobs:
       # GEMM operands as fp16 in-kernel (gemm_dtype gate in
       # batch_{prefill,decode}_paged_hd*.py) so dispatch hits TileLang's stock
       # GemmMMASm70 mma.sync tensor-core path — validated on real V100 (cosine
-      # 0.999999) with STOCK TileLang 0.1.11. No source patch is needed: the former
+      # 0.999999) with STOCK TileLang. No source patch is needed: the former
       # scripts/sm70_tilelang.patch cuda.fma fallback (PR tile-ai/tilelang#2339) is
       # dead for these kernels and was removed 2026-06-15 (confirmed by a no-patch
       # build on real V100). Build from source (not the pinned wheel) for THIS
@@ -214,16 +214,19 @@ jobs:
       # data layout (src/tl_templates + 3rdparty/cutlass/include) that build.rs's
       # probe (tilelang_include_dirs) requires, and --no-build-isolation lets the C++
       # build see the already-pinned torch / apache-tvm-ffi cu12 stack. CUDA 12.8
-      # (installed above) satisfies stock 0.1.11's c++20 codegen. T1 + Blackwell keep
+      # (installed above) satisfies stock tilelang's c++20 codegen. T1 + Blackwell keep
       # the pinned wheel: separate runners, separate Python envs, zero blast radius.
+      # tilelang >=0.1.13 imports cleanly against vanilla apache-tvm-ffi (the
+      # first-wins TypeAttr fix from tile-ai/tilelang#2367 landed upstream), so no
+      # ARLE tvm-ffi patch is needed.
       - name: Build TileLang from source (sm_70 layout templates)
         run: |
           pip install --no-cache-dir "cython>=3.1.0" scikit-build-core "z3-solver>=4.13.0,<4.15.5" ninja cmake
-          git clone --recursive --shallow-submodules --depth 1 --branch v0.1.11 \
+          git clone --recursive --shallow-submodules --depth 1 --branch v0.1.13 \
             https://github.com/tile-ai/tilelang.git /tmp/tilelang-sm70
           pip install --no-cache-dir --no-build-isolation /tmp/tilelang-sm70
 
-      - name: Patch apache-tvm-ffi so `import tilelang` works (tilelang#2367)
+      - name: Verify TileLang import (no tvm-ffi patch needed)
         run: scripts/ci-patch-tvm-ffi.sh
 
       - name: Cache cargo registry
@@ -271,8 +274,8 @@ jobs:
     runs-on: ubuntu-22.04
     continue-on-error: true
     # Off by default: no Blackwell hardware exists in CI to validate sm_100/sm_120
-    # codegen, and the in-CI patched-tvm-ffi wheel rebuild is fragile. Set repo var
-    # ENABLE_EXOTIC_SM_LANES=true to run it once Blackwell hardware is available.
+    # codegen. Set repo var ENABLE_EXOTIC_SM_LANES=true to run it once Blackwell
+    # hardware is available.
     if: ${{ vars.ENABLE_EXOTIC_SM_LANES == 'true' }}
 
     steps:
@@ -290,7 +293,7 @@ jobs:
       - name: Install Python build dependencies (required for AOT kernel compilation)
         run: pip install --no-cache-dir -r requirements-build.txt
 
-      - name: Patch apache-tvm-ffi so `import tilelang` works (tilelang#2367)
+      - name: Verify TileLang import (no tvm-ffi patch needed)
         run: scripts/ci-patch-tvm-ffi.sh
 
       - name: Cache cargo registry
