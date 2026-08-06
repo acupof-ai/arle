@@ -226,3 +226,44 @@ Side fix while measuring: one pod-side `kernel_artifacts.sh export` had made
 every later build/run fail `source changed since receipt` — the tarball lands
 in the repo root by design but was not gitignored, and `source_digest` counts
 untracked-unignored files (`cfe43a3ce`).
+
+## Update 2026-08-07 — DFlash warm-start closes 8x of the scratch gap
+
+`010af0ede` enables warm-starting the trainer from the shipped same-position
+DFlash checkpoint: `backbone::load` carries the backbone weights and stamps
+`next_token_heads = true` (heads are freshly initialized either way).
+
+Step-0 metrics under warm start are worse than scratch (TV 1.91 vs 1.13,
+accept 0.043 vs 0.433): DFlash's row `t` predicts position `anchor+t`, the
+trainer supervises `anchor+1+t`, so every prediction starts one row off and
+the fresh heads add noise on top. Step 0 is therefore not a load check; the
+trajectory is.
+
+Training (timing2k 1913 samples, 400 steps, batch 8, lr 7.5e-5 cosine, run
+`ws400e`, build `ws2` head `4933e1bf4`, `blocks-per-backward` 16 after a
+step-60 OOM at 32 with peak 15.9 GiB/backward):
+
+| Steps | Scratch (tv400) | Warm start (ws400e) |
+|---|---|---|
+| 50 | TV 1.06, accept 0.44 | TV 0.98, accept 0.51 |
+| 400 | TV 0.94, accept 0.53, tau 2.15 | TV 0.73, accept 0.64, tau 2.94 |
+
+Warm start reaches scratch's 400-step endpoint by step 50 and keeps going.
+
+Serve accept A/B (same flags as the previous update, 4 prompts x 256 tokens,
+confidence gate off):
+
+| Draft | Trunk | accept_rate |
+|---|---|---|
+| DFlash shipped | ThinkingCap | 19.2% (760/3960) |
+| DFlash shipped | Qwen3.6-27B-FP8 | 18.2% (749/4110) |
+| ws400 warm start | ThinkingCap | 6.6% (525/7968) |
+| ws400 warm start | Qwen3.6-27B-FP8 | 6.8% (537/7856) |
+| tv400 scratch | ThinkingCap | 0.85% (57/6741) |
+
+Both drafts score the same on either trunk, so the train-serve trunk
+difference is not a confound. Warm start lifts serve acceptance 8x over
+scratch at identical smoke scale (3200 samples); the remaining gap to the
+shipped DFlash is training scale. Rule: warm-start is the default trainer
+configuration; the decisive 57k-corpus run starts from DFlash, not from
+scratch.
