@@ -43,22 +43,41 @@ loop, mirroring `checkpoint_backward`, so the device high-water stays at one hid
 **Cost:** one resident hidden of VRAM during the replay (`[1, seq/cp, dim]`). Peak
 is 92/97 GB with ~5 GB free, so this is the flag's only real risk.
 
-## Arm 2 — `--checkpoint-pinned-offload` (pinned host storage, async copies)
+## Arm 2 — `--checkpoint-pinned-offload-bytes` (pinned host storage, async copies)
 
-Pending. Design note: the copies do **not** need a second stream. The backward is
-72% GPU-idle, so the constraint is the *host* blocking inside pageable copies, not
-a lack of GPU overlap. Pinned host memory on the existing default stream makes
-`cuMemcpyHtoDAsync`/`DtoHAsync` return to the host immediately and removes the
-`synchronize`; the copy then serializes with compute on a stream that is idle
-150 s. That drops the cross-stream event/fence machinery and its three
-silent-corruption modes entirely.
+`CheckpointResidency::Pinned(slot)` parks the activation in a backend-owned pinned
+buffer: `offload_checkpoint_to_host` issues one async DtoH into it,
+`ensure_device` issues one async HtoD out of it. Both are unconditional in
+`ensure_checkpoint_device` — pinning an activation commits to reloading it. The
+flag is a byte budget (0 = off); above it the pageable path takes over, so the
+pinned footprint is a hard ceiling, which matters because the pages are
+unswappable and one rank already carries ~171 GB host RSS.
 
-Second design note: cudarc's `alloc_pinned` sets `CU_MEMHOSTALLOC_WRITECOMBINED`,
-so host **reads** from a pinned buffer are uncached and slow. The pinned buffer
-therefore *owns* the offloaded activation for its whole host residency — there is
-no `pinned → Vec` copy on either leg. A pass-through staging design would have
-added ~100 GB of write-combined host reads and could have been slower than the
-pageable path it replaced.
+**No second stream.** The plan called for a copy stream with event fences. It is
+not needed and was dropped: the backward is 72% GPU-idle, so what has to stop
+blocking is the *calling thread*, not the copy engine. `cuMemcpyDtoHAsync` blocks
+the host on pageable memory and returns immediately on pinned; that alone recovers
+the 36% + 17% + 9.4% rows. Keeping both legs on the existing default stream makes
+all three of the plan's silent-corruption modes disappear by construction:
+
+| Risk | Guard |
+|---|---|
+| pinned buffer reused while its copy is in flight | cudarc brackets every pinned memcpy with `stream.wait(event)` / `event.record(stream)`; `as_slice` syncs on that event |
+| device buffer freed under an in-flight DtoH | `CudaSlice::drop` frees via `cuMemFreeAsync` on the same stream, so the free is ordered behind the copy |
+| consumer reads a reloaded handle before the HtoD lands | same stream, so stream order is the ordering |
+
+**No `pinned → Vec` leg.** cudarc's `alloc_pinned` sets
+`CU_MEMHOSTALLOC_WRITECOMBINED`, where host reads are uncached. The pinned buffer
+owns the activation for its whole host residency; nothing copies out of it except
+the rare `ensure_host` fallback. A pass-through staging design (the plan's shape)
+would have added ~100 GB of write-combined host reads and could have come out
+slower than the pageable path it replaced.
+
+Slot reuse is exact-length: `cuMemcpyDtoHAsync` copies the whole destination, so a
+longer buffer would read past the source.
+
+Precedent for DtoH into cudarc write-combined pinned memory:
+`infer-cuda/src/qwen35.rs:1396` (recurrent-state snapshot), in production.
 
 ## Results — pending-remote
 
@@ -66,7 +85,11 @@ pageable path it replaced.
 |---|---:|---:|---:|---:|---:|
 | baseline (`7da312d0d`, both flags off) | 315.7 s | — | 4.537510 | 7.965–7.985 | 92/97 GB |
 | `--checkpoint-reload-device true` | | | | | |
-| + `--checkpoint-pinned-offload true` | | | | | |
+| + `--checkpoint-pinned-offload-bytes 8589934592` | | | | | |
+
+Three arms, one binary, one flag changed per step. The pinned arm rides on top of
+the reload arm because pinning implies reloading; that ordering is why the reload
+arm is measured first rather than bundled.
 
 Gate: parity is the license, not the serve gates. `needle_gate.py` / `lever_gate.sh`
 boot `arle serve` (inference forward) and never run the training backward, so the
