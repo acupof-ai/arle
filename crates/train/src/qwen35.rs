@@ -6265,7 +6265,6 @@ mod tests {
             norm_topk_prob: true,
             mlp_only_layers: Vec::new(),
             full_attn_gated: true,
-            output_gate_type: "sigmoid".to_string(),
         }
     }
 
@@ -6302,7 +6301,6 @@ mod tests {
             norm_topk_prob: true,
             mlp_only_layers: Vec::new(),
             full_attn_gated: true,
-            output_gate_type: "sigmoid".to_string(),
         }
     }
 

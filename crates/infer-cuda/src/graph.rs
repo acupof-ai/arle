@@ -322,6 +322,7 @@ fn log_kernel_node_census(
             .result()
             .is_ok();
         #[cfg(not(infer_cuda_cuda_12))]
+        // SAFETY: same as above: node handles from cuGraphGetNodes on a live graph.
         let params_ok = unsafe { cu::cuGraphKernelNodeGetParams(node, p.as_mut_ptr()) }
             .result()
             .is_ok();
@@ -335,14 +336,20 @@ fn log_kernel_node_census(
             let mut raw: *const std::ffi::c_char = std::ptr::null();
             // A node carries `func` or `kern`, never both.
             let got = if !p.func.is_null() {
-                unsafe { cu::cuFuncGetName(&mut raw, p.func) }.result().is_ok()
+                unsafe { cu::cuFuncGetName(&mut raw, p.func) }
+                    .result()
+                    .is_ok()
             } else if !p.kern.is_null() {
-                unsafe { cu::cuKernelGetName(&mut raw, p.kern) }.result().is_ok()
+                unsafe { cu::cuKernelGetName(&mut raw, p.kern) }
+                    .result()
+                    .is_ok()
             } else {
                 false
             };
             if got && !raw.is_null() {
-                unsafe { std::ffi::CStr::from_ptr(raw) }.to_string_lossy().into_owned()
+                unsafe { std::ffi::CStr::from_ptr(raw) }
+                    .to_string_lossy()
+                    .into_owned()
             } else {
                 "<unnamed>".to_string()
             }
