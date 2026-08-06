@@ -98,6 +98,14 @@ curl -s http://127.0.0.1:8000/v1/stats | python3 -m json.tool
 | Lints | `cargo clippy -p spec-train -p autograd --all-targets -- -D warnings` | clean |
 | Mac CUDA typecheck | `cargo check -p infer-api --release --no-default-features --features cuda,no-cuda --lib` | clean |
 
+### Pod, measured
+
+| Gate | Command | Result |
+|---|---|---|
+| CUDA/CPU parity, all autograd device ops | `pod_gpu_tests.sh run parity1 0 -- -p autograd --release --features cuda --test test_cuda_lazy_ops` | 43 passed, 0 failed, 28.6 s |
+
+The three cases the draft forward needed — `cuda_rank3_matmul_and_backward_match_cpu_on_draft_attention`, `cuda_concat_axis0_axis1_and_slice_backward_match_cpu`, `cuda_rank5_broadcast_expand_and_backward_match_cpu` — pass against their CPU references. This is the first CUDA execution of any of them.
+
 Gates that now fail if the defect returns:
 
 | Defect | Gate |
@@ -125,27 +133,22 @@ Raw artifacts: pending-remote.
 
 ## Problems
 
-Nine gates remain open. Seven need the pod:
+Six gates remain open, all needing the pod:
 
 1. Target-logits oracle — `last_hidden @ lm_head` against
    `LoadedInferenceEngine::forward_token_logits` for the same ids.
 2. Tap sanity — per-tap norm and pairwise distinctness of
-   `forward_training_taps`; the in-tree probe checks three elements for
-   finiteness and nothing else.
-3. CUDA-vs-CPU parity for rank-3 batched `matmul` backward, `cat` on axes 0
-   and 1, and the rank-5 `broadcast_expand` inside `repeat_kv`. All three run
-   in the draft forward; none has a CUDA parity test.
-4. Serve-side checkpoint load — the round-trip gate uses `spec_train`'s own
+   `forward_training_taps`.
+3. Serve-side checkpoint load — the round-trip gate uses `spec_train`'s own
    reader, not `load_dspark_head`.
-5. Measured acceptance of a trained draft.
-6. `peak_activation_bytes` against real VRAM at training shape; the local
+4. Measured acceptance of a trained draft.
+5. `peak_activation_bytes` against real VRAM at training shape; the local
    measurement is at hidden 8, vocab 24.
-7. The `ctx_base` clamp. The serve floors the per-row window at the ring base
+6. The `ctx_base` clamp. The serve floors the per-row window at the ring base
    (`dspark.rs:915`); training floors at 0. Once the ring has wrapped, the serve
    sees fewer keys than training fitted on. Not modeled, not measured.
 
-Two are local and unwritten: an `lr=0` noise-floor control, and a gate on the
-`next_token_heads` startup guard in `crates/cli/src/spec_train_target.rs`.
+Items 1 and 2 are built and unrun: `arle train spec-draft --probe`.
 
 ## Learnings
 
