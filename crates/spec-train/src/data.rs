@@ -83,7 +83,7 @@ pub fn load_samples(data: &Path, tokenizer: &Path, limits: Limits) -> Result<Vec
 
     let raw = std::fs::read_to_string(data).with_context(|| format!("read {}", data.display()))?;
     let mut samples = Vec::new();
-    let (mut truncated, mut cut, mut short) = (0usize, 0usize, 0usize);
+    let (mut truncated, mut cut, mut short, mut unsup) = (0usize, 0usize, 0usize, 0usize);
     for (i, line) in raw.lines().enumerate() {
         if line.trim().is_empty() {
             continue;
@@ -101,11 +101,13 @@ pub fn load_samples(data: &Path, tokenizer: &Path, limits: Limits) -> Result<Vec
             }
             Outcome::Cut => cut += 1,
             Outcome::Short => short += 1,
+            Outcome::Unsupervised => unsup += 1,
         }
     }
     println!(
         "{}: {} samples, {truncated} truncated at max_len {}, {cut} dropped (max_len cut the \
-         supervised turn), {short} dropped (under {MIN_SUPERVISED} supervised tokens)",
+         supervised turn), {short} dropped (under {MIN_SUPERVISED} supervised tokens), \
+         {unsup} dropped (no trailing assistant turn)",
         data.display(),
         samples.len(),
         limits.max_len,
@@ -113,7 +115,8 @@ pub fn load_samples(data: &Path, tokenizer: &Path, limits: Limits) -> Result<Vec
     ensure!(
         !samples.is_empty(),
         "{} yields no usable sample: {cut} dropped where max_len {} cut the supervised turn, \
-         {short} dropped under {MIN_SUPERVISED} supervised tokens",
+         {short} dropped under {MIN_SUPERVISED} supervised tokens, {unsup} dropped with no \
+         trailing assistant turn",
         data.display(),
         limits.max_len
     );
@@ -129,6 +132,9 @@ pub enum Outcome {
     /// Under [`MIN_SUPERVISED`] supervised tokens, or no two consecutive ones to
     /// anchor a block.
     Short,
+    /// No trailing assistant turn to supervise. Raw prompt corpora carry these;
+    /// regeneration cannot, since it ends every row on a generated turn.
+    Unsupervised,
 }
 
 /// Tokenize one conversation and mark its last assistant turn as trainable.
@@ -138,6 +144,9 @@ pub enum Outcome {
 /// that crosses a boundary is an error, because supervising it would supervise
 /// prompt bytes and dropping it would lose a generated token.
 pub fn to_sample(conv: &Conversation, tokenizer: &Tokenizer, limits: Limits) -> Result<Outcome> {
+    if !ends_in_a_supervisable_turn(conv) {
+        return Ok(Outcome::Unsupervised);
+    }
     let rendered = render(conv)?;
     let encoding = tokenizer
         .encode(rendered.text.as_str(), false)
@@ -193,6 +202,17 @@ struct Rendered {
     /// the generation prompt, `<|im_end|>` included. Exactly what the draft has
     /// to predict at serve.
     generated: Range<usize>,
+}
+
+/// The shape [`render`] supervises: a final assistant turn after the last user
+/// one. Checked before rendering so a corpus row of any other shape is counted
+/// and skipped rather than killing the load.
+fn ends_in_a_supervisable_turn(conv: &Conversation) -> bool {
+    let msgs = &conv.conversations;
+    let Some(last_query) = msgs.iter().rposition(|m| m.role == "user") else {
+        return false;
+    };
+    msgs.len() - 1 > last_query && msgs[msgs.len() - 1].role == "assistant"
 }
 
 /// The Qwen3.5 / Qwen3.6 chat template for the shapes this corpus has (an
@@ -316,6 +336,29 @@ mod tests {
             mask_token_id: 0,
             max_len,
         }
+    }
+
+    /// A raw prompt corpus carries rows that stop on a user turn. They have
+    /// nothing to supervise, and one of them used to abort the whole load.
+    #[test]
+    fn a_row_with_no_trailing_assistant_turn_is_dropped_not_fatal() {
+        assert!(ends_in_a_supervisable_turn(&conv()));
+        let mut trailing_user = conv();
+        trailing_user.conversations.push(Message {
+            role: "user".into(),
+            content: "ask three".into(),
+        });
+        assert!(!ends_in_a_supervisable_turn(&trailing_user));
+
+        let tk = tokenizer(&render(&conv()).unwrap().text);
+        assert!(matches!(
+            to_sample(&trailing_user, &tk, limits(4096)).unwrap(),
+            Outcome::Unsupervised
+        ));
+        assert!(matches!(
+            to_sample(&conv(), &tk, limits(4096)).unwrap(),
+            Outcome::Kept { .. }
+        ));
     }
 
     /// Every char its own token, decoded by concatenation: offsets tile the
