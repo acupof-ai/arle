@@ -149,22 +149,12 @@ pub fn noise_token_ids(blocks: &[Block], mask_token_id: u32) -> Vec<u32> {
         .collect()
 }
 
-/// RoPE position of each draft row: `anchor + 1 + t` — the position the row
-/// predicts. Matches the serve, where a block starting at `kv_seq_len = anchor+1`
-/// puts row `t` at RoPE position `start + t`.
+/// RoPE position of each draft row: `anchor + t`. Matches the serve, where the
+/// anchor is `last_token` at absolute position `start = kv_seq_len` and row `t`
+/// sits at `start + t`. Doubles as the trunk hidden index whose logits supervise
+/// row `t` — hidden `p` predicts token `p+1`, and row `t` targets `anchor+1+t`.
 #[must_use]
 pub fn draft_positions(blocks: &[Block]) -> Vec<usize> {
-    blocks
-        .iter()
-        .flat_map(|b| (0..b.targets.len()).map(move |t| b.anchor + 1 + t))
-        .collect()
-}
-
-/// Trunk hidden index whose logits are row `t`'s distillation target:
-/// `anchor + t`, since hidden `p` predicts token `p+1` and row `t` predicts
-/// `anchor + 1 + t`.
-#[must_use]
-pub fn target_hidden_positions(blocks: &[Block]) -> Vec<usize> {
     blocks
         .iter()
         .flat_map(|b| (0..b.targets.len()).map(move |t| b.anchor + t))
@@ -267,12 +257,7 @@ mod tests {
             noise_token_ids(&blocks, 999),
             vec![3, 999, 999, 8, 999, 999]
         );
-        assert_eq!(draft_positions(&blocks), vec![4, 5, 6, 9, 10, 11]);
-        assert_eq!(
-            target_hidden_positions(&blocks),
-            vec![3, 4, 5, 8, 9, 10],
-            "the trunk hidden that predicts the row's target sits one below it"
-        );
+        assert_eq!(draft_positions(&blocks), vec![3, 4, 5, 8, 9, 10]);
     }
 
     #[test]
