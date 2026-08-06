@@ -15,7 +15,6 @@ cuda = ["autograd/cuda"]
 [dependencies]
 autograd = { path = "../autograd", default-features = false, features = ["safetensors"] }
 anyhow = "1.0"
-chat = { path = "../chat" }
 half = "2"
 memmap2 = { workspace = true }
 qwen35-spec = { path = "../qwen35-spec" }

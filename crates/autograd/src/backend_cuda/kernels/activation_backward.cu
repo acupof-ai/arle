@@ -45,6 +45,22 @@ extern "C" __global__ void sigmoid_backward_f32(
     }
 }
 
+// sign(0) = 0 — the L1 subgradient, so a zero residual contributes nothing.
+extern "C" __global__ void abs_backward_f32(
+    T* __restrict__ grad_input,
+    const T* __restrict__ upstream,
+    const T* __restrict__ x,
+    unsigned long long n
+) {
+    unsigned long long i =
+        static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i < n) {
+        float xv = static_cast<float>(x[i]);
+        float sign = (xv > 0.0f) ? 1.0f : ((xv < 0.0f) ? -1.0f : 0.0f);
+        grad_input[i] = static_cast<T>(static_cast<float>(upstream[i]) * sign);
+    }
+}
+
 extern "C" __global__ void exp_backward_f32(
     T* __restrict__ grad_input,
     const T* __restrict__ upstream,
