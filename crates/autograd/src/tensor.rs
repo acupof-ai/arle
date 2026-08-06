@@ -24,9 +24,7 @@ enum CheckpointResidency {
     None,
     Host,
     L3,
-    /// Backend-owned pinned host buffer (slot index). `data` is empty — the
-    /// pinned buffer is the storage, not a staging hop, so reload is one HtoD
-    /// straight out of it. Host reads go through `Backend::checkpoint_pin_readback`.
+    /// Backend-owned pinned host slot; `data` is empty — the buffer is the storage.
     Pinned(u32),
 }
 
@@ -587,8 +585,6 @@ impl TensorStore {
     }
 
     pub fn ensure_device(&mut self, id: TensorId) -> Result<()> {
-        // Pinned: one async HtoD straight out of the pinned buffer. Stream-ordered,
-        // so the handle is usable by the next enqueued op with no host wait.
         if let CheckpointResidency::Pinned(slot) = self.tensor(id)?.checkpoint_residency {
             let shape = self.tensor(id)?.shape.clone();
             let handle = self.backend().checkpoint_pin_reload(slot, &shape)?;
@@ -652,16 +648,6 @@ impl TensorStore {
         Ok(())
     }
 
-    /// Restore an offloaded checkpoint ahead of its backward replay.
-    ///
-    /// L3 unconditionally — the payload is not in `data`, so no lazy per-op
-    /// `ensure_device` can reach it. `Host` only under
-    /// `--checkpoint-reload-device`: the replay's forward ops gate on device
-    /// residency (`reshape`, `slice`, `silu`, … each fall to a host `Vec` path
-    /// when `dirty == Host`), so leaving the hidden on host makes the recompute
-    /// repack it host-side and re-upload the repacked copy instead of doing one
-    /// HtoD up front. Off by default: it trades one resident hidden of VRAM for
-    /// that host work, and the 80K OPD backward runs at a 5 GB device margin.
     pub(crate) fn checkpoint_parked(&self, id: TensorId) -> Result<bool> {
         Ok(!matches!(
             self.tensor(id)?.checkpoint_residency,
@@ -669,6 +655,10 @@ impl TensorStore {
         ))
     }
 
+    /// Restore an offloaded checkpoint ahead of its backward replay. L3/Pinned
+    /// unconditionally (the payload is not in `data`); `Host` only under
+    /// `--checkpoint-reload-device`, since the replay ops otherwise fall to host
+    /// `Vec` paths and re-upload a repacked copy instead of one HtoD up front.
     pub(crate) fn ensure_checkpoint_device(&mut self, id: TensorId) -> Result<()> {
         let reload = match self.tensor(id)?.checkpoint_residency {
             CheckpointResidency::L3 | CheckpointResidency::Pinned(_) => true,
@@ -869,12 +859,7 @@ impl TensorStore {
             )
         };
 
-        // Pinned path: one async DtoH into a backend-owned pinned buffer that KEEPS
-        // the activation, so neither leg touches a pageable host buffer and neither
-        // blocks the host. `ensure_checkpoint_device` reloads a pinned checkpoint
-        // unconditionally — pinned bytes are cheap to move over PCIe and expensive
-        // for the CPU to read, so pinning an activation commits to reloading it.
-        // Stands down when L3 is configured so the two spill mechanisms never mix.
+        // Pinned first (unless L3 is configured — the two spill mechanisms never mix).
         if self.checkpoint_l3.is_none()
             && let Some(slot) = self.backend().checkpoint_pin_offload(&handle, size)?
         {
@@ -1192,10 +1177,7 @@ fn shape_size(shape: &[usize]) -> usize {
 mod tests {
     use super::*;
 
-    /// Host stand-in for the CUDA pinned pool. A slot is `Some` while it holds an
-    /// activation and `None` once released, so the `take().expect(...)` calls fail
-    /// loudly on the two silent-corruption modes: reading a released slot, and
-    /// handing the same slot out twice.
+    /// Host stand-in for the CUDA pinned pool; panics on released-slot reads.
     #[derive(Debug, Default)]
     struct PinSpy {
         slots: std::sync::Mutex<Vec<Option<Vec<f32>>>>,
@@ -1212,7 +1194,6 @@ mod tests {
             Device::Cpu
         }
 
-        // Required trait items, delegated — this spy only overrides the pin methods.
         fn matmul(
             &self,
             a: &DeviceHandle,
@@ -1270,8 +1251,6 @@ mod tests {
         }
     }
 
-    /// The three ways a pinned checkpoint leaves its slot — reload, host readback,
-    /// and free — must each hand back the exact values and leave no slot live.
     #[test]
     fn pinned_checkpoint_reloads_reads_back_and_releases() {
         let spy = std::sync::Arc::new(PinSpy::default());
@@ -1568,9 +1547,6 @@ mod tests {
                 .checkpoint_residency,
             CheckpointResidency::Host
         );
-        // Flag arm: the same host-resident checkpoint reloads to device, so the
-        // replay forward sees `Dirty::Device` and takes its device path. Both
-        // arms must yield the same values — the flag moves residency, not data.
         crate::runtime_flags::set_checkpoint_reload_device(true);
         let reloaded = store
             .ensure_checkpoint_device(second)

@@ -232,8 +232,7 @@ impl Drop for PinnedCheckpointPool {
 
 #[cfg(not(feature = "no-cuda"))]
 impl PinnedCheckpointPool {
-    /// An idle slot holding at least `len` f32, growing the pool while the budget
-    /// allows. `None` = budget spent, caller falls back to the pageable path.
+    /// An idle slot holding at least `len` f32; `None` = budget spent.
     fn take(
         &mut self,
         ctx: &Arc<CudaContext>,
@@ -252,16 +251,24 @@ impl PinnedCheckpointPool {
         if let Some(index) = reuse {
             return Ok(Some(self.free.swap_remove(index)));
         }
-        let capacity = len.next_multiple_of(PINNED_SLOT_GRANULARITY);
-        let bytes = capacity.saturating_mul(std::mem::size_of::<f32>());
-        if self.allocated_bytes.saturating_add(bytes) > budget_bytes {
+        let fits = |cap: usize| {
+            self.allocated_bytes
+                .saturating_add(cap.saturating_mul(std::mem::size_of::<f32>()))
+                <= budget_bytes
+        };
+        // Exact-fit fallback keeps a nearly-spent (or sub-granularity) budget usable.
+        let rounded = len.next_multiple_of(PINNED_SLOT_GRANULARITY);
+        let capacity = if fits(rounded) {
+            rounded
+        } else if fits(len) {
+            len
+        } else {
             return Ok(None);
-        }
+        };
+        let bytes = capacity * std::mem::size_of::<f32>();
         let slot = u32::try_from(self.slots.len())
             .map_err(|_| AutogradError::TapeInvariant("pinned checkpoint pool slot overflow"))?;
-        // SAFETY: the buffer is uninitialised here and is written only by the DtoH
-        // the caller enqueues next; cudarc frees it (after syncing its event) when
-        // the pool drops with the backend.
+        // SAFETY: uninitialised until the DtoH the caller enqueues next writes it.
         let buf = unsafe { ctx.alloc_pinned::<f32>(capacity) }.map_err(|_| {
             AutogradError::TapeInvariant("cuMemHostAlloc for the checkpoint pool failed")
         })?;
@@ -270,8 +277,7 @@ impl PinnedCheckpointPool {
         Ok(Some(slot))
     }
 
-    /// Idempotent: a slot already idle is not pushed twice, so a double release
-    /// cannot hand the same buffer to two tensors.
+    /// Idempotent: a double release cannot hand the same slot to two tensors.
     fn release(&mut self, slot: u32) {
         if (slot as usize) < self.slots.len() && !self.free.contains(&slot) {
             self.free.push(slot);
@@ -1868,8 +1874,7 @@ impl Backend for CudaBackend {
         #[cfg(not(feature = "no-cuda"))]
         {
             let budget = crate::runtime_flags::checkpoint_pinned_offload_bytes();
-            // Only f32 device storage: a bf16/fp8 handle's host image is not the
-            // f32 activation the reload has to hand back.
+            // f32 storage only: a bf16/fp8 host image is not what the reload hands back.
             let DeviceHandle::Cuda(storage) = handle else {
                 return Ok(None);
             };
@@ -1892,8 +1897,7 @@ impl Backend for CudaBackend {
                 return Ok(None);
             };
             pool.stream.get_or_insert_with(|| self.stream.clone());
-            // No synchronize: stream order already puts this copy behind the
-            // compute that wrote `src` and ahead of `src`'s stream-ordered free.
+            // No synchronize: stream order covers the write before and the free after.
             let copied = match pool.slots[slot as usize].as_mut_slice() {
                 Ok(host) => self.stream.memcpy_dtoh(src, &mut host[..len]),
                 Err(err) => Err(err),

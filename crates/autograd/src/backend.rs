@@ -677,30 +677,15 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         Ok(())
     }
 
-    /// Park a checkpoint activation in a reusable **pinned** host slot: one async
-    /// DtoH, no host synchronize, and the pinned buffer keeps the bytes until the
-    /// reload copies them straight back out. `Ok(None)` = this backend has no
-    /// pinned pool, or its byte budget is spent, and the caller keeps the pageable
-    /// path. The returned slot index is opaque to the caller.
-    ///
-    /// The copy rides this backend's own stream, so it is ordered behind the
-    /// compute that produced `handle` and ahead of the free that follows this
-    /// call — no second stream and no cross-stream fence. That is the right shape
-    /// here because the OPD backward is host-bound with an idle GPU: what has to
-    /// stop blocking is the calling thread, not the copy engine.
-    ///
-    /// There is deliberately no `pinned → Vec<f32>` leg: `cuMemHostAlloc` pins
-    /// write-combined, where host reads are uncached, so passing the bytes through
-    /// pinned staging on their way to a pageable buffer would be slower than the
-    /// pageable copy it replaces.
+    /// Park a checkpoint activation in a pinned host slot: one async DtoH on the
+    /// backend's stream, no host wait; the slot owns the bytes (write-combined, so
+    /// no `Vec<f32>` staging leg). `Ok(None)` = no pool / budget spent → pageable path.
     fn checkpoint_pin_offload(&self, handle: &DeviceHandle, len: usize) -> Result<Option<u32>> {
         let _ = (handle, len);
         Ok(None)
     }
 
-    /// Async HtoD out of `slot` into a fresh handle for `shape`, releasing the
-    /// slot. Stream-ordered, so the handle is safe for the next enqueued op with
-    /// no host wait.
+    /// Async HtoD out of `slot` into a fresh handle for `shape`, releasing the slot.
     fn checkpoint_pin_reload(&self, slot: u32, shape: &[usize]) -> Result<DeviceHandle> {
         let _ = (slot, shape);
         Err(crate::AutogradError::TapeInvariant(
@@ -708,9 +693,7 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         ))
     }
 
-    /// Blocking read of `slot` into `dst`, releasing the slot. The rare host-read
-    /// fallback (`ensure_host` on a pinned checkpoint); pays the write-combined
-    /// read the offload path exists to avoid.
+    /// Blocking read of `slot` into `dst`, releasing the slot.
     fn checkpoint_pin_readback(&self, slot: u32, dst: &mut [f32]) -> Result<()> {
         let _ = (slot, dst);
         Err(crate::AutogradError::TapeInvariant(

@@ -1172,8 +1172,7 @@ impl Tape {
             self.trim_after_checkpoint_replay(store)?;
             start = end;
         }
-        // Re-park only an input that arrived parked; a never-parked input
-        // (non-checkpointed forward) would pay a fresh full-seq DtoH + sync here.
+        // A never-parked input must not pay a fresh full-seq DtoH + sync here.
         if self.offload_checkpoints && input_was_parked {
             store.offload_checkpoint_to_host(input_id)?;
         }

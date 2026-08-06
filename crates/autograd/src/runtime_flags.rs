@@ -27,9 +27,8 @@ pub struct AutogradRuntimeFlags {
     /// Reload a host-offloaded checkpoint to device before its backward replay
     /// (`--checkpoint-reload-device`).
     pub checkpoint_reload_device: bool,
-    /// Pinned-host budget for parked checkpoint activations, bytes; 0 = off, keep
-    /// the pageable path (`--checkpoint-pinned-offload-bytes`). Pinned pages are
-    /// unswappable, so this is a hard ceiling, not a hint.
+    /// Pinned-host byte budget for parked checkpoints; 0 = pageable path
+    /// (`--checkpoint-pinned-offload-bytes`).
     pub checkpoint_pinned_offload_bytes: usize,
     /// Row tile for the LoRA linear backward (`--lora-linear-bwd-tile-rows`).
     pub lora_linear_bwd_tile_rows: usize,

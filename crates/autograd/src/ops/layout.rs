@@ -286,16 +286,21 @@ fn slice_host_eager(
     store: &mut TensorStore,
     tape: &mut Tape,
 ) -> Result<TensorId> {
-    let input = store.tensor_host(x)?;
+    store.ensure_host(x)?;
+    // Borrow, not `tensor_host`: cloning the full source costs a full-seq memcpy
+    // per chunk in the offloaded replay.
+    let input = store.tensor(x)?;
     let (data, shape) = slice_data(&input.data, &input.shape, starts, ends)?;
-    let output_id = store.alloc(Tensor::new(data, shape, input.requires_grad)?);
+    let input_shape = input.shape.clone();
+    let requires_grad = input.requires_grad;
+    let output_id = store.alloc(Tensor::new(data, shape, requires_grad)?);
 
     TapeEntry {
         op: BackwardOp::Slice,
         output_id,
         input_ids: smallvec![x],
         saved: SavedContext::SliceCtx {
-            input_shape: input.shape,
+            input_shape,
             starts: starts.to_vec(),
             ends: ends.to_vec(),
         },
