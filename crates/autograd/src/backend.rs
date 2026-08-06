@@ -1387,6 +1387,19 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         self.upload(&out, shape)
     }
 
+    /// Elementwise `out = |a|`.
+    fn abs_forward(&self, a: &[f32]) -> Result<Vec<f32>> {
+        cpu_abs_forward(a)
+    }
+
+    /// Device-handle variant of `abs_forward`. The default falls back to
+    /// `readback → host compute → upload`; CUDA overrides with a 1D kernel.
+    fn abs(&self, x: &DeviceHandle, shape: &[usize]) -> Result<DeviceHandle> {
+        let host = self.readback(x)?;
+        let out = self.abs_forward(&host)?;
+        self.upload(&out, shape)
+    }
+
     /// Elementwise `out = a * b` over identically-sized contiguous tensors.
     fn mul_forward(&self, a: &[f32], b: &[f32]) -> Result<Vec<f32>> {
         cpu_mul_forward(a, b)
@@ -2538,6 +2551,35 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
             .iter()
             .zip(upstream_host.iter())
             .map(|(&yv, &up)| up * yv * (1.0 - yv))
+            .collect();
+        self.upload(&grad, shape)
+    }
+
+    /// Device-resident backward for `abs(x)`. Consumes the saved input `x`:
+    /// `grad_x[i] = upstream[i] * sign(x[i])`, with `sign(0) = 0`.
+    ///
+    /// Default fallback: `readback → host loop → upload`. CUDA overrides
+    /// with a 1D NVRTC kernel.
+    fn abs_backward_device(
+        &self,
+        upstream: &DeviceHandle,
+        x: &DeviceHandle,
+        shape: &[usize],
+    ) -> Result<DeviceHandle> {
+        let upstream_host = self.readback(upstream)?;
+        let x_host = self.readback(x)?;
+        let size = shape_size(shape);
+        if upstream_host.len() != size || x_host.len() != size {
+            return Err(crate::AutogradError::DataLengthMismatch {
+                len: upstream_host.len().min(x_host.len()),
+                shape: shape.to_vec(),
+                size,
+            });
+        }
+        let grad: Vec<f32> = x_host
+            .iter()
+            .zip(upstream_host.iter())
+            .map(|(&xv, &up)| up * cpu_sign(xv))
             .collect();
         self.upload(&grad, shape)
     }

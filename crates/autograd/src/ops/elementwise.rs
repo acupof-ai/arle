@@ -225,6 +225,122 @@ fn mul_scalar_host_eager(
     Ok(output_id)
 }
 
+/// Elementwise `|x|`. The L1 subgradient the DSpark TV term needs, so it can
+/// stay device-side instead of folding `sign` into a host-materialized weight.
+pub fn abs(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<TensorId> {
+    let t = store.tensor(x)?;
+    if t.device_handle.is_some() && t.dirty != Dirty::Host {
+        abs_device_lazy(x, store, tape)
+    } else {
+        abs_host_eager(x, store, tape)
+    }
+}
+
+fn abs_device_lazy(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<TensorId> {
+    store.ensure_device(x)?;
+    let input_shape = store.tensor(x)?.shape.clone();
+    let input_handle = store
+        .tensor(x)?
+        .device_handle
+        .as_ref()
+        .ok_or(AutogradError::TapeInvariant(
+            "abs: ensure_device left tensor without a device handle",
+        ))?
+        .clone();
+
+    let out_handle = store.backend().abs(&input_handle, &input_shape)?;
+    let output_id = store.alloc_device_tensor(input_shape, out_handle)?;
+
+    TapeEntry {
+        op: BackwardOp::Abs,
+        output_id,
+        input_ids: smallvec![x],
+        saved: SavedContext::Tensor(x),
+    }
+    .record(store, tape)?;
+
+    Ok(output_id)
+}
+
+fn abs_host_eager(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<TensorId> {
+    let input = store.tensor_host(x)?;
+    let output = store.backend().abs_forward(&input.data)?;
+    let output_id = store.alloc(Tensor::new(output, input.shape.clone(), false)?);
+
+    TapeEntry {
+        op: BackwardOp::Abs,
+        output_id,
+        input_ids: smallvec![x],
+        saved: SavedContext::Tensor(x),
+    }
+    .record(store, tape)?;
+
+    Ok(output_id)
+}
+
+pub(crate) fn abs_backward(
+    entry: &TapeEntry,
+    output_grad_id: TensorId,
+    store: &mut TensorStore,
+) -> Result<GradPairs> {
+    let SavedContext::Tensor(x) = entry.saved.clone() else {
+        return Err(AutogradError::TapeInvariant(
+            "abs backward missing saved input",
+        ));
+    };
+    if !store.tensor(x)?.requires_grad {
+        return Ok(GradPairs::new());
+    }
+
+    let upstream_shape = store.tensor(output_grad_id)?.shape.clone();
+    let x_shape = store.tensor(x)?.shape.clone();
+    if x_shape != upstream_shape {
+        return Err(AutogradError::ShapeMismatch {
+            expected: x_shape,
+            got: upstream_shape,
+        });
+    }
+    let device_path_ok = {
+        let upstream = store.tensor(output_grad_id)?;
+        let saved = store.tensor(x)?;
+        upstream.dirty != Dirty::Host
+            && upstream.device_handle.is_some()
+            && saved.dirty != Dirty::Host
+            && saved.device_handle.is_some()
+    };
+    if device_path_ok {
+        let upstream_handle = store
+            .tensor(output_grad_id)?
+            .device_handle
+            .as_ref()
+            .expect("checked above")
+            .clone();
+        let x_handle = store
+            .tensor(x)?
+            .device_handle
+            .as_ref()
+            .expect("checked above")
+            .clone();
+        let grad_handle =
+            store
+                .backend()
+                .abs_backward_device(&upstream_handle, &x_handle, &x_shape)?;
+        let grad_id = store.alloc_device_tensor(x_shape, grad_handle)?;
+        return Ok(smallvec![(x, grad_id)]);
+    }
+
+    let input = store.tensor_host(x)?;
+    let upstream = store.tensor_host(output_grad_id)?;
+    let grad = input
+        .data
+        .iter()
+        .zip(upstream.data.iter())
+        .map(|(&value, &grad_out)| grad_out * crate::backend::cpu_sign(value))
+        .collect();
+    let grad_id = store.alloc(Tensor::new(grad, input.shape, false)?);
+    Ok(smallvec![(x, grad_id)])
+}
+
 pub(crate) fn add_backward(
     entry: &TapeEntry,
     output_grad_id: TensorId,
@@ -414,4 +530,52 @@ pub(crate) fn mul_scalar_backward(
     let grad = store.backend().mul_scalar_forward(&upstream, k)?;
     let grad_id = store.alloc(Tensor::new(grad, input_shape, false)?);
     Ok(smallvec![(a, grad_id)])
+}
+
+#[cfg(test)]
+mod abs_tests {
+    use super::*;
+    use crate::ops;
+
+    fn sum_abs(values: &[f32]) -> Result<(Vec<f32>, Vec<f32>)> {
+        let mut store = TensorStore::default();
+        let mut tape = Tape::new();
+        let x = store.alloc(Tensor::new(values.to_vec(), vec![values.len()], true)?);
+        let y = abs(x, &mut store, &mut tape)?;
+        // Non-unit upstream, so a backward that dropped the incoming grad still fails.
+        let scaled = ops::mul_scalar(y, 3.0, &mut store, &mut tape)?;
+        let loss = ops::sum(scaled, &mut store, &mut tape)?;
+        let out = store.to_host(y)?;
+        let grads = tape.backward(loss, &mut store)?;
+        Ok((out, store.to_host(grads[&x])?))
+    }
+
+    #[test]
+    fn abs_forward_and_subgradient() -> Result<()> {
+        let values = [-2.5_f32, -0.25, 1.75, 4.0];
+        let (out, grad) = sum_abs(&values)?;
+        assert_eq!(out, vec![2.5, 0.25, 1.75, 4.0]);
+
+        // Central differences on `3·Σ|x|` away from the kink.
+        let eps = 1e-2_f32;
+        for (i, &v) in values.iter().enumerate() {
+            let mut plus = values;
+            plus[i] = v + eps;
+            let mut minus = values;
+            minus[i] = v - eps;
+            let f = |xs: &[f32; 4]| 3.0 * xs.iter().map(|x| x.abs()).sum::<f32>();
+            let numeric = (f(&plus) - f(&minus)) / (2.0 * eps);
+            assert!(
+                (grad[i] - numeric).abs() < 1e-3,
+                "grad[{i}] = {} vs numeric {numeric}",
+                grad[i]
+            );
+        }
+
+        // sign(0) = 0: the kink contributes no gradient in either direction.
+        let (out0, grad0) = sum_abs(&[0.0])?;
+        assert_eq!(out0, vec![0.0]);
+        assert_eq!(grad0, vec![0.0]);
+        Ok(())
+    }
 }

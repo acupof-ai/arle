@@ -2,8 +2,9 @@
 //!
 //! Ported from deepseek-ai/DeepSpec (MIT) `create_dspark_attention_mask`.
 //! Keys are `[context(ctx_len) ; draft(blocks × block_size)]`; queries are the
-//! draft rows alone. Row `(j, t)` sees context keys `< anchor_j` and every
-//! draft key of block `j` — the block is bidirectional inside itself.
+//! draft rows alone. Row `(j, t)` sees context keys `<= anchor_j` within its own
+//! sliding window and every draft key of block `j` — the block is bidirectional
+//! inside itself.
 //!
 //! Dense because that is all it needs to be: the mask adds into scores through
 //! the existing `add_broadcast`, so attention stays the eager matmul/softmax
@@ -11,13 +12,20 @@
 
 use crate::block::Block;
 
-/// Context keys block `j` may reach: `[anchor - window, anchor)`, clamped.
+/// Context keys row `t` of the block at `anchor` may reach: `[lo, anchor+1)` with
+/// `lo = (anchor+1+t) - (window-1)`, clamped. That is the serve's per-row sliding
+/// window (`qwen35/dspark.rs`) at `start = anchor + 1`, so the conditioning
+/// token's own tap is in reach — the one key the draft always has at inference.
 /// The serve runs every draft layer on the sliding ring regardless of
-/// `layer_types`, so training past the window would fit links inference does
-/// not have.
-fn ctx_span(anchor: usize, ctx_len: usize, window: Option<usize>) -> (usize, usize) {
-    let end = anchor.min(ctx_len);
-    (window.map_or(0, |w| end.saturating_sub(w)), end)
+/// `layer_types`, so training past the window would fit links inference does not
+/// have.
+fn ctx_span(anchor: usize, t: usize, ctx_len: usize, window: Option<usize>) -> (usize, usize) {
+    let hi = (anchor + 1).min(ctx_len);
+    let lo = match window {
+        Some(w) if w > 0 => (anchor + 1 + t).saturating_sub(w - 1),
+        _ => 0,
+    };
+    (lo.min(hi), hi)
 }
 
 /// `[q_len, ctx_len + q_len]` row-major, 0 where visible.
@@ -30,8 +38,8 @@ pub fn additive(blocks: &[Block], ctx_len: usize, window: Option<usize>) -> Vec<
     let kv_len = ctx_len + q_len;
     let mut m = vec![f32::NEG_INFINITY; q_len * kv_len];
     for (j, b) in blocks.iter().enumerate() {
-        let (lo, hi) = ctx_span(b.anchor, ctx_len, window);
         for t in 0..block_size {
+            let (lo, hi) = ctx_span(b.anchor, t, ctx_len, window);
             let row = (j * block_size + t) * kv_len;
             m[row + lo..row + hi].fill(0.0);
             let own = row + ctx_len + j * block_size;
@@ -50,9 +58,11 @@ pub fn density(blocks: &[Block], ctx_len: usize, window: Option<usize>) -> f32 {
     let q_len = blocks.len() * block_size;
     let visible: usize = blocks
         .iter()
-        .map(|b| {
-            let (lo, hi) = ctx_span(b.anchor, ctx_len, window);
-            block_size * (hi - lo + block_size)
+        .flat_map(|b| {
+            (0..block_size).map(move |t| {
+                let (lo, hi) = ctx_span(b.anchor, t, ctx_len, window);
+                hi - lo + block_size
+            })
         })
         .sum();
     visible as f32 / (q_len * (ctx_len + q_len)) as f32
@@ -82,9 +92,9 @@ mod tests {
                 .filter(|&c| m[r * (ctx + q) + c] == 0.0)
                 .collect()
         };
-        assert_eq!(visible(0), vec![0, 1, 2, 16, 17]);
+        assert_eq!(visible(0), vec![0, 1, 2, 3, 16, 17]);
         assert_eq!(visible(1), visible(0), "no causality inside a block");
-        assert_eq!(visible(2), vec![0, 1, 2, 3, 4, 5, 18, 19]);
+        assert_eq!(visible(2), vec![0, 1, 2, 3, 4, 5, 6, 18, 19]);
     }
 
     #[test]
@@ -100,14 +110,37 @@ mod tests {
         }
     }
 
+    /// The serve's window, written out from `qwen35/dspark.rs` rather than from
+    /// `ctx_span`: `lo = (start + row).saturating_sub(sliding_window - 1)`, keys
+    /// `[lo, start + block)`, with `start = anchor + 1`. It slides per row, so a
+    /// block-wide span silently over-feeds the later rows.
     #[test]
-    fn the_window_bounds_what_a_block_reaches() {
-        let blocks = blocks_at(&[10], 32, 2);
-        let (ctx, q) = (32, 2);
-        let m = additive(&blocks, ctx, Some(4));
-        let visible: Vec<usize> = (0..ctx).filter(|&c| m[c] == 0.0).collect();
-        assert_eq!(visible, vec![6, 7, 8, 9], "window 4 ending at the anchor");
-        assert_eq!(m[ctx..ctx + q], [0.0, 0.0], "own block still whole");
+    fn every_row_reaches_exactly_what_the_serve_gives_it() {
+        let (ctx, window, anchor, block_size) = (32usize, 8usize, 20usize, 4usize);
+        let blocks = blocks_at(&[anchor], ctx, block_size);
+        let kv = ctx + block_size;
+        let m = additive(&blocks, ctx, Some(window));
+
+        let start = anchor + 1;
+        for row in 0..block_size {
+            let lo = (start + row).saturating_sub(window - 1);
+            let want: Vec<usize> = (lo..start).chain(ctx..kv).collect();
+            let got: Vec<usize> = (0..kv).filter(|&c| m[row * kv + c] == 0.0).collect();
+            assert_eq!(got, want, "row {row}");
+        }
+    }
+
+    /// The conditioning token's own tap is the single key the draft is guaranteed
+    /// at inference; a span ending at `anchor` drops it.
+    #[test]
+    fn the_anchor_tap_is_visible() {
+        let (ctx, anchor, block_size) = (32usize, 10usize, 4usize);
+        let blocks = blocks_at(&[anchor], ctx, block_size);
+        for window in [None, Some(0), Some(4), Some(4096)] {
+            let m = additive(&blocks, ctx, window);
+            assert_eq!(m[anchor], 0.0, "window {window:?}");
+            assert_eq!(m[anchor + 1], f32::NEG_INFINITY, "and nothing past it");
+        }
     }
 
     #[test]

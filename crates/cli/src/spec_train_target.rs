@@ -5,8 +5,9 @@
 //! `infer-api` already depends on that crate for the Markov-head artifact;
 //! this is the one direction left open.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, ensure};
 use std::path::Path;
+use std::time::Instant;
 
 use crate::args::TrainSpecDraftArgs;
 
@@ -28,7 +29,7 @@ pub(crate) fn run_spec_draft(args: TrainSpecDraftArgs) -> Result<()> {
     use autograd::{Tape, TensorStore};
     use infer_api::{EngineLoadConfig, LoadedInferenceEngine};
     use qwen35_spec::{DsparkConfig, Qwen35Config};
-    use spec_train::{backbone, trainer};
+    use spec_train::{backbone, block, trainer};
 
     let model_path = args
         .model_path
@@ -36,23 +37,48 @@ pub(crate) fn run_spec_draft(args: TrainSpecDraftArgs) -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("model path is not valid UTF-8"))?;
     let cfg = DsparkConfig::from_dir(&args.draft)
         .with_context(|| format!("read draft config from {}", args.draft.display()))?;
+    // Block construction is unconditionally next-token: row `t` is supervised
+    // with `anchor+1+t`, which a `next_token_heads: false` serve reads one
+    // position off.
+    ensure!(
+        cfg.next_token_heads,
+        "{} has next_token_heads = false (same-position DFlash); training only \
+         produces next-token drafts, so the serve would read every row one \
+         position off",
+        args.draft.display()
+    );
     let trunk = Qwen35Config::from_model_dir(&args.model_path)
         .with_context(|| format!("read trunk config from {}", args.model_path.display()))?;
 
-    let samples = load_samples(&args.data, &args.model_path, args.max_len)?;
-    if samples.is_empty() {
-        bail!("{} produced no trainable samples", args.data.display());
-    }
+    let samples = load_samples(
+        &args.data,
+        &args.model_path,
+        spec_train::data::Limits {
+            vocab_size: trunk.vocab_size,
+            mask_token_id: cfg.mask_token_id,
+            max_len: args.max_len,
+        },
+    )?;
+    let tokens: usize = samples.iter().map(|s| s.input_ids.len()).sum();
+    let masked: usize = samples
+        .iter()
+        .map(|s| s.loss_mask.iter().filter(|&&m| m).count())
+        .sum();
+    let candidates: Vec<usize> = samples
+        .iter()
+        .map(|s| block::anchor_candidates(&s.loss_mask).len())
+        .collect();
     println!(
-        "{} samples, {} draft layers",
+        "{} samples, {tokens} tokens, {:.1}% loss-masked, {} anchor candidates in sample 0, {} draft layers",
         samples.len(),
+        100.0 * masked as f64 / tokens as f64,
+        candidates[0],
         cfg.num_hidden_layers
     );
 
     // The draft's parameters live on the same device the trunk forward runs on.
-    let backend: std::sync::Arc<dyn autograd::Backend> =
-        std::sync::Arc::new(autograd::backend_cuda::CudaBackend::new(0)?);
-    let mut store = TensorStore::with_backend(backend);
+    let backend = std::sync::Arc::new(autograd::backend_cuda::CudaBackend::new(0)?);
+    let mut store = TensorStore::with_backend(backend.clone());
     let embed = backbone::load_frozen(
         &args.model_path,
         trunk.embed_tokens_tensor_name(),
@@ -105,9 +131,18 @@ pub(crate) fn run_spec_draft(args: TrainSpecDraftArgs) -> Result<()> {
 
     let train_cfg = trainer::Config {
         lr: args.lr,
+        warmup_ratio: args.warmup_ratio,
+        weight_decay: args.weight_decay,
+        max_grad_norm: args.max_grad_norm,
         num_anchors: args.num_anchors,
         blocks_per_backward: args.blocks_per_backward,
-        ..trainer::Config::default()
+        loss_decay_gamma: args.loss_decay_gamma,
+        weights: spec_train::loss::Weights {
+            ce: args.loss_ce,
+            tv: args.loss_tv,
+            confidence: args.loss_confidence,
+        },
+        seed: args.seed,
     };
     println!(
         "peak activation {:.1} GiB/backward",
@@ -119,38 +154,83 @@ pub(crate) fn run_spec_draft(args: TrainSpecDraftArgs) -> Result<()> {
         ) as f64
             / (1u64 << 30) as f64
     );
-    let mut trainer = trainer::Trainer::new(draft, train_cfg, args.steps);
+    let mut trainer = trainer::Trainer::new(draft, train_cfg, args.steps, backend);
     let mut tape = Tape::new();
 
+    let mut order = epoch_order(samples.len(), args.seed, 0);
+    let mut cursor = 0usize;
+    let mut epoch = 0u64;
     for step in 0..args.steps {
-        let batch: Vec<_> = (0..args.batch)
-            .map(|i| {
-                let s = &samples[(step * args.batch + i) % samples.len()];
-                trainer::Sample {
-                    input_ids: s.input_ids.clone(),
-                    loss_mask: s.loss_mask.clone(),
-                }
-            })
-            .collect();
-        let loss = trainer
+        let mut batch = Vec::with_capacity(args.batch);
+        for _ in 0..args.batch {
+            if cursor == order.len() {
+                epoch += 1;
+                order = epoch_order(samples.len(), args.seed, epoch);
+                cursor = 0;
+            }
+            let s = &samples[order[cursor]];
+            cursor += 1;
+            batch.push(trainer::Sample {
+                input_ids: s.input_ids.clone(),
+                loss_mask: s.loss_mask.clone(),
+            });
+        }
+        let started = Instant::now();
+        let st = trainer
             .train_step(&batch, &mut target, &mut store, &mut tape)
             .with_context(|| format!("step {step}"))?;
-        if step.is_multiple_of(10) {
-            println!("step {step} loss {loss:.6}");
+        if step.is_multiple_of(args.log_every) || step + 1 == args.steps {
+            println!(
+                "step {step} loss {:.6} ce {:.4} tv {:.4} conf {:.4} accept {:.4} \
+                 gnorm {:.4} lr {:.3e} {:.2}s/step counted {}/{} chunks {}",
+                st.loss,
+                st.ce,
+                st.tv,
+                st.conf,
+                st.mean_accept,
+                st.grad_norm,
+                st.lr,
+                started.elapsed().as_secs_f64(),
+                st.counted,
+                batch.len(),
+                st.chunks
+            );
         }
         if (step + 1).is_multiple_of(args.save_every) || step + 1 == args.steps {
-            backbone::save(&trainer.draft, &args.out, &mut store)?;
+            backbone::save(&trainer.draft, &args.out, &store)?;
             println!("saved {}", args.out.display());
         }
     }
     Ok(())
 }
 
+/// Sample order for one epoch: the keyed shuffle `block::sample_anchors` uses,
+/// so `--seed` alone reproduces both the anchor draw and the batch composition.
+fn epoch_order(n: usize, seed: u64, epoch: u64) -> Vec<usize> {
+    let mut keyed: Vec<(u64, usize)> = (0..n)
+        .map(|i| {
+            let key = seed
+                ^ epoch.wrapping_mul(0xD1B5_4A32_D192_ED03)
+                ^ (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            (splitmix64(key), i)
+        })
+        .collect();
+    keyed.sort_unstable();
+    keyed.into_iter().map(|(_, i)| i).collect()
+}
+
+fn splitmix64(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    x ^ (x >> 31)
+}
+
 fn load_samples(
     data: &Path,
     model_dir: &Path,
-    max_len: usize,
+    limits: spec_train::data::Limits,
 ) -> Result<Vec<spec_train::trainer::Sample>> {
     let tokenizer_path = crate::train_cli::resolve_local_tokenizer_path(model_dir)?;
-    spec_train::data::load_samples(data, &tokenizer_path, max_len)
+    spec_train::data::load_samples(data, &tokenizer_path, limits)
 }

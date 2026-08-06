@@ -6,20 +6,20 @@
 
 use anyhow::{Result, ensure};
 use autograd::{
-    Optimizer, Tape, TensorId, TensorStore,
+    Backend, Optimizer, Tape, TensorId, TensorStore,
     grad_clip::finite_optimizer_step,
     lr_schedule::{CosineWithWarmup, LrSchedule},
     ops,
     optim::AdamW,
 };
-use std::collections::HashSet;
+use std::{collections::HashSet, sync::Arc};
 
 use qwen35_spec::DsparkConfig;
 
 use crate::{
     backbone::{Draft, Input},
     block::{self, Block},
-    loss::{self, Batch},
+    loss::{self, Batch, Terms},
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -55,6 +55,23 @@ impl Default for Config {
     }
 }
 
+/// One optimizer step, as measured.
+#[derive(Debug, Clone, Copy)]
+pub struct StepStats {
+    pub loss: f32,
+    pub ce: f32,
+    pub tv: f32,
+    pub conf: f32,
+    pub mean_accept: f32,
+    pub grad_norm: f32,
+    pub lr: f32,
+    /// Samples in the batch that carried supervision.
+    pub counted: usize,
+    /// Backwards run, summed over those samples.
+    pub chunks: usize,
+}
+
+#[derive(Debug)]
 pub struct Sample {
     pub input_ids: Vec<u32>,
     /// Positions the draft is trained on — the assistant turns.
@@ -69,6 +86,25 @@ pub trait Target {
     fn forward(&mut self, input_ids: &[u32]) -> Result<(Vec<f32>, Vec<f32>)>;
 }
 
+/// Everything a chunk needs from the sample it belongs to.
+struct SampleCtx<'a> {
+    /// `[seq, taps·hidden]`, the trunk residual stream at the tapped layers.
+    taps: &'a [f32],
+    /// `[seq, hidden]`, the trunk's final hidden state.
+    last_hidden: &'a [f32],
+    seq: usize,
+    /// `Σ w` over the WHOLE sample. Every chunk divides by this one number, so
+    /// no row's weight depends on which chunk it landed in.
+    denom: f32,
+}
+
+/// One sample's contribution to the step.
+struct SampleOut {
+    loss: f32,
+    terms: Terms,
+    chunks: usize,
+}
+
 pub struct Trainer {
     pub draft: Draft,
     pub cfg: Config,
@@ -79,10 +115,17 @@ pub struct Trainer {
 }
 
 impl Trainer {
-    pub fn new(draft: Draft, cfg: Config, total_steps: usize) -> Self {
+    /// `backend` keeps the AdamW moments device-resident; the host constructor
+    /// would round-trip ~127M markov parameters through host memory per step.
+    pub fn new(
+        draft: Draft,
+        cfg: Config,
+        total_steps: usize,
+        backend: Arc<dyn Backend + Send + Sync>,
+    ) -> Self {
         let params = draft.parameters();
         Self {
-            opt: AdamW::new(cfg.lr, (0.9, 0.999), 1e-8, cfg.weight_decay),
+            opt: AdamW::new_with_device(cfg.lr, (0.9, 0.999), 1e-8, cfg.weight_decay, backend),
             schedule: CosineWithWarmup {
                 base_lr: cfg.lr,
                 min_lr: 0.0,
@@ -96,45 +139,49 @@ impl Trainer {
         }
     }
 
-    /// Accumulate over `samples`, clip, and step. Returns the mean loss over
-    /// the samples that produced any supervision.
+    /// Accumulate over `samples`, clip, and step. Every reported quantity is a
+    /// mean over the samples that produced any supervision.
     pub fn train_step(
         &mut self,
         samples: &[Sample],
         target: &mut dyn Target,
         store: &mut TensorStore,
         tape: &mut Tape,
-    ) -> Result<f32> {
+    ) -> Result<StepStats> {
         ensure!(!samples.is_empty(), "empty batch");
         AdamW::zero_grad(&mut self.opt, &self.params, store);
 
         let mut total = 0.0;
+        let mut terms = Terms::default();
         let mut counted = 0usize;
+        let mut chunks = 0usize;
         for (i, s) in samples.iter().enumerate() {
             let seed = self
                 .cfg
                 .seed
                 .wrapping_add((self.step * samples.len() + i) as u64);
-            match self.accumulate(s, seed, samples.len(), target, store, tape)? {
-                Some(l) => {
-                    total += l;
-                    counted += 1;
-                }
-                None => continue,
-            }
+            let Some(out) = self.accumulate(s, seed, samples.len(), target, store, tape)? else {
+                continue;
+            };
+            total += out.loss;
+            terms = add_terms(terms, out.terms);
+            chunks += out.chunks;
+            counted += 1;
             tape.entries.clear();
             tape.set_enabled(true);
             store.retain_ids(&self.keep_set(store));
         }
         ensure!(counted > 0, "no sample in the batch carried supervision");
 
-        let loss = total / counted as f32;
-        Optimizer::set_lr(&mut self.opt, self.schedule.lr(self.step as u64));
+        let n = counted as f32;
+        let loss = total / n;
+        let lr = self.schedule.lr(self.step as u64);
+        Optimizer::set_lr(&mut self.opt, lr);
         // One finite transaction: a NaN loss or grad norm clears the pending
         // grads and advances no parameter, moment or schedule step. Clipping a
         // NaN norm would otherwise scale every gradient by NaN and contaminate
         // the AdamW moments permanently.
-        finite_optimizer_step(
+        let grad_norm = finite_optimizer_step(
             loss,
             &self.params,
             self.cfg.max_grad_norm,
@@ -143,7 +190,17 @@ impl Trainer {
         )?;
         self.step += 1;
         store.retain_ids(&self.keep_set(store));
-        Ok(loss)
+        Ok(StepStats {
+            loss,
+            ce: terms.ce / n,
+            tv: terms.tv / n,
+            conf: terms.conf / n,
+            mean_accept: terms.mean_accept / n,
+            grad_norm: grad_norm as f32,
+            lr,
+            counted,
+            chunks,
+        })
     }
 
     fn keep_set(&self, store: &TensorStore) -> HashSet<TensorId> {
@@ -169,7 +226,7 @@ impl Trainer {
         target: &mut dyn Target,
         store: &mut TensorStore,
         tape: &mut Tape,
-    ) -> Result<Option<f32>> {
+    ) -> Result<Option<SampleOut>> {
         ensure!(
             sample.input_ids.len() == sample.loss_mask.len(),
             "input_ids {} != loss_mask {}",
@@ -190,72 +247,112 @@ impl Trainer {
             .iter()
             .flat_map(|b| block::row_weights(b, Some(self.cfg.loss_decay_gamma)))
             .collect();
-        if weights.iter().sum::<f32>() <= 0.0 {
+        let denom: f32 = weights.iter().sum();
+        if denom <= 0.0 {
             return Ok(None);
         }
 
         let seq = sample.input_ids.len();
         let hidden = self.draft.cfg.hidden_size;
-        let (taps_host, last_hidden) = target.forward(&sample.input_ids)?;
+        let (taps, last_hidden) = target.forward(&sample.input_ids)?;
         ensure!(
-            taps_host.len() == seq * self.draft.cfg.target_layer_ids.len() * hidden
+            taps.len() == seq * self.draft.cfg.target_layer_ids.len() * hidden
                 && last_hidden.len() == seq * hidden,
             "target returned {} tap and {} hidden values for {seq} tokens",
-            taps_host.len(),
+            taps.len(),
             last_hidden.len()
         );
+        let ctx = SampleCtx {
+            taps: &taps,
+            last_hidden: &last_hidden,
+            seq,
+            denom,
+        };
 
-        let chunks = blocks.len().div_ceil(self.cfg.blocks_per_backward);
-        let scale = 1.0 / (batch * chunks) as f32;
-        let mut total = 0.0;
-        for chunk in blocks.chunks(self.cfg.blocks_per_backward) {
-            total +=
-                self.chunk_backward(chunk, &taps_host, &last_hidden, seq, scale, store, tape)?;
+        let scale = 1.0 / batch as f32;
+        let mut out = SampleOut {
+            loss: 0.0,
+            terms: Terms::default(),
+            chunks: 0,
+        };
+        let chunk_rows = self.cfg.blocks_per_backward * block_size;
+        for (chunk, w) in blocks
+            .chunks(self.cfg.blocks_per_backward)
+            .zip(weights.chunks(chunk_rows))
+        {
+            let (l, t) = self.chunk_backward(chunk, w, &ctx, scale, store, tape)?;
+            out.loss += l;
+            out.terms = add_terms(out.terms, t);
+            out.chunks += 1;
             tape.entries.clear();
             tape.set_enabled(true);
             store.retain_ids(&self.keep_set(store));
         }
-        Ok(Some(total / chunks as f32))
+        Ok(Some(out))
     }
 
     /// Forward + loss + backward for one chunk of blocks. The chunk is the unit
     /// because the two widest tensors — attention scores and logits — both
-    /// scale with its row count, and a block only ever attends the context and
-    /// its own rows, so chunking changes no result.
-    #[allow(clippy::too_many_arguments)]
+    /// scale with its row count.
+    ///
+    /// The split is a VRAM knob and nothing else: a block attends only the
+    /// context and its own rows, and every chunk divides by the sample-wide
+    /// `ctx.denom`, so the chunk losses sum to the sample's loss and the chunk
+    /// gradients sum to the sample's gradient however the blocks are cut.
     fn chunk_backward(
         &self,
         blocks: &[Block],
-        taps_host: &[f32],
-        last_hidden: &[f32],
-        seq: usize,
+        weights: &[f32],
+        ctx: &SampleCtx<'_>,
         scale: f32,
         store: &mut TensorStore,
         tape: &mut Tape,
-    ) -> Result<f32> {
+    ) -> Result<(f32, Terms)> {
+        if weights.iter().sum::<f32>() <= 0.0 {
+            return Ok((0.0, Terms::default()));
+        }
+        let (loss, terms) = self.chunk_loss(blocks, weights, ctx, store, tape)?;
+        let value = store.to_host(loss)?[0];
+        // Scale by the fixed sample count, as the reference's fixed
+        // global_batch_size does — not by whatever happened to carry
+        // supervision, which would make the step size data-dependent.
+        let scaled = ops::mul_scalar(loss, scale, store, tape)?;
+        tape.backward_accumulate_only(scaled, store)?;
+        Ok((value, terms))
+    }
+
+    /// The chunk's graph up to the loss scalar — the point
+    /// [`peak_activation_bytes`] models.
+    fn chunk_loss(
+        &self,
+        blocks: &[Block],
+        weights: &[f32],
+        ctx: &SampleCtx<'_>,
+        store: &mut TensorStore,
+        tape: &mut Tape,
+    ) -> Result<(TensorId, Terms)> {
         let hidden = self.draft.cfg.hidden_size;
         let block_size = self.draft.cfg.block_size;
         let taps = store.from_slice(
-            taps_host,
-            &[seq, self.draft.cfg.target_layer_ids.len() * hidden],
+            ctx.taps,
+            &[ctx.seq, self.draft.cfg.target_layer_ids.len() * hidden],
         )?;
 
         let out = self.draft.forward(
             &Input {
                 blocks,
                 taps,
-                ctx_len: seq,
+                ctx_len: ctx.seq,
             },
             store,
             tape,
         )?;
 
-        // The trunk's own prediction for the same positions: row `t` of block
-        // `j` predicts `anchor+1+t`, so the trunk hidden state to read is the
-        // one at `anchor+t` — the draft row's own RoPE position.
-        let aligned: Vec<f32> = block::draft_positions(blocks)
+        // Row `t` predicts `anchor+1+t`, so the trunk hidden whose logits are
+        // that prediction sits one index earlier than the row's RoPE position.
+        let aligned: Vec<f32> = block::target_hidden_positions(blocks)
             .into_iter()
-            .flat_map(|p| last_hidden[p.min(seq - 1) * hidden..][..hidden].to_vec())
+            .flat_map(|p| ctx.last_hidden[p.min(ctx.seq - 1) * hidden..][..hidden].to_vec())
             .collect();
         let rows = blocks.len() * block_size;
         let aligned = store.from_slice(&aligned, &[rows, hidden])?;
@@ -267,41 +364,41 @@ impl Trainer {
             .iter()
             .flat_map(|b| b.targets.iter().map(|&t| t as usize))
             .collect();
-        let weights: Vec<f32> = blocks
-            .iter()
-            .flat_map(|b| block::row_weights(b, Some(self.cfg.loss_decay_gamma)))
-            .collect();
-        if weights.iter().sum::<f32>() <= 0.0 {
-            return Ok(0.0);
-        }
-        let loss = loss::dspark_loss(
+        loss::dspark_loss(
             &Batch {
                 draft_logits: out.logits,
                 target_logits,
                 targets: &targets,
-                weights: &weights,
+                weights,
+                denom: ctx.denom,
                 conf_logits: out.confidence,
             },
             self.cfg.weights,
             store,
             tape,
-        )?;
-        let value = store.to_host(loss)?[0];
-        // Scale by the fixed sample × chunk count, as the reference's fixed
-        // global_batch_size does — not by whatever happened to carry
-        // supervision, which would make the step size data-dependent.
-        let scaled = ops::mul_scalar(loss, scale, store, tape)?;
-        tape.backward_accumulate_only(scaled, store)?;
-        Ok(value)
+        )
     }
 }
 
-/// Bytes of f32 activation the widest tensors hold for one backward.
+fn add_terms(a: Terms, b: Terms) -> Terms {
+    Terms {
+        ce: a.ce + b.ce,
+        tv: a.tv + b.tv,
+        conf: a.conf + b.conf,
+        mean_accept: a.mean_accept + b.mean_accept,
+    }
+}
+
+/// Bytes of f32 activation live when the chunk's loss scalar completes — the
+/// peak, because nothing between the chunk's first upload and its backward is
+/// freed, and the backward frees each intermediate grad at its last consumer.
 ///
-/// The forward keeps four score-shaped tensors per layer (matmul, scale, mask,
-/// softmax) live until backward, and the loss keeps five logit-shaped ones.
-/// Both scale with `blocks_per_backward`, which is the only knob between the
-/// reference recipe and an OOM: all 512 anchors at once is ~70 GiB of scores.
+/// Counted off `backbone::forward` and `loss::dspark_loss` op by op; every
+/// forward op allocates exactly one output. Terms narrower than a row vector
+/// are dropped (the Markov rank, the confidence scalars, the per-row loss
+/// vectors) — under 2% at training shapes. `blocks_per_backward` is the only
+/// knob between the reference recipe and an OOM: all 512 anchors at once is
+/// ~110 GiB.
 #[must_use]
 pub fn peak_activation_bytes(
     draft: &DsparkConfig,
@@ -310,20 +407,50 @@ pub fn peak_activation_bytes(
     vocab: usize,
 ) -> usize {
     let rows = blocks_per_backward * draft.block_size;
-    let scores = draft.num_attention_heads * rows * (ctx_len + rows);
-    4 * (4 * scores * draft.num_hidden_layers + 5 * rows * vocab)
+    let kv = ctx_len + rows;
+    let (h, hd) = (draft.hidden_size, draft.head_dim);
+    let q_dim = draft.num_attention_heads * hd;
+    let kv_dim = draft.num_key_value_heads * hd;
+
+    // Per layer: 4 score-shaped (matmul, scale, mask, softmax); 10 query-shaped
+    // (project, the four head_norm steps, rope, the `q3` reshape, and the three
+    // attention outputs); 7 at full head width (`repeat_kv` expands then
+    // re-reshapes, for keys and values, plus `k3`, `v3` and the key transpose);
+    // 13 at kv width (the context and draft projections and their cat, twice,
+    // then head_norm and rope on the keys, reshape and transpose on the values,
+    // and both `repeat_kv` inputs); 6 residual-shaped and 4 MLP-shaped.
+    let per_layer = 4 * draft.num_attention_heads * rows * kv
+        + 10 * rows * q_dim
+        + 7 * kv * q_dim
+        + 13 * kv * kv_dim
+        + 6 * rows * h
+        + 4 * rows * draft.intermediate_size;
+
+    // The full-context path, re-run once per chunk: the tap upload, the `fc`
+    // GEMM and its norm, the rope tables (cos and sin at half head width, for
+    // the whole kv sequence and again for the queries), the dense mask.
+    let context =
+        ctx_len * draft.target_layer_ids.len() * h + 2 * ctx_len * h + (kv + rows) * hd + rows * kv;
+
+    // 10 logit-shaped: the draft logits, the Markov bias and its add, the
+    // trunk's logits, log_softmax, both softmaxes, the negation, the difference
+    // and its abs. 5 hidden-shaped: the embedding and its reshape, the final
+    // norm, the aligned trunk hidden, the confidence input.
+    let head = 10 * rows * vocab + 5 * rows * h;
+
+    4 * (per_layer * draft.num_hidden_layers + context + head)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use autograd::{Backend, CpuBackend, Tensor};
-    use qwen35_spec::{DsparkConfig, DsparkLayerType};
-    use std::sync::Arc;
+    use autograd::{CpuBackend, Tensor};
+    use qwen35_spec::DsparkLayerType;
 
     const VOCAB: usize = 24;
     const HIDDEN: usize = 8;
     const SEQ: usize = 24;
+    const MARKOV_RANK: usize = 4;
 
     /// A fixed pseudo-trunk. Its taps and hidden states are an arbitrary but
     /// deterministic function of the token, so the draft has something
@@ -364,9 +491,34 @@ mod tests {
         }
     }
 
+    fn table(salt: u64, store: &mut TensorStore) -> TensorId {
+        let data: Vec<f32> = (0..VOCAB * HIDDEN)
+            .map(|i| ((i as f32 + salt as f32) * 0.29).sin() * 0.1)
+            .collect();
+        store.alloc(Tensor::new(data, vec![VOCAB, HIDDEN], false).unwrap())
+    }
+
+    fn setup(config: Config) -> (TensorStore, Trainer) {
+        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(CpuBackend);
+        let mut store = TensorStore::with_backend(backend.clone());
+        let embed = table(1, &mut store);
+        let lm_head = table(2, &mut store);
+        let draft =
+            crate::backbone::init(cfg(), VOCAB, MARKOV_RANK, embed, lm_head, &mut store).unwrap();
+        let trainer = Trainer::new(draft, config, 20, backend);
+        (store, trainer)
+    }
+
+    fn sample(salt: u32) -> Sample {
+        Sample {
+            input_ids: (0..SEQ as u32).map(|i| (i * 5 + salt) % 20).collect(),
+            loss_mask: (0..SEQ).map(|i| i >= 4).collect(),
+        }
+    }
+
     /// The gate the tiny-shape tests cannot be: the reference recipe at its
     /// real dimensions must fit beside a resident 27B trunk. Without chunking
-    /// the same arithmetic gives ~70 GiB of score tensors alone.
+    /// the same arithmetic gives ~110 GiB.
     #[test]
     fn the_reference_recipe_fits_in_vram() {
         let mut c = cfg();
@@ -389,34 +541,124 @@ mod tests {
         );
     }
 
+    /// The formula is the VRAM budget the CLI prints before a run, so it has to
+    /// track what the graph actually allocates. Measured against a real chunk
+    /// forward; the residual is the sub-row-sized tensors it deliberately drops.
+    #[test]
+    fn the_peak_formula_tracks_a_measured_forward() {
+        let bpb = 5;
+        let (mut store, trainer) = setup(Config {
+            num_anchors: bpb,
+            blocks_per_backward: bpb,
+            ..Config::default()
+        });
+
+        let ids: Vec<u32> = (0..SEQ as u32).map(|i| i % 20).collect();
+        let mask = vec![true; SEQ];
+        let anchors = block::sample_anchors(&mask, bpb, 5);
+        assert_eq!(anchors.len(), bpb, "need a full chunk to measure");
+        let blocks: Vec<Block> = anchors
+            .iter()
+            .map(|&a| block::build_block(&ids, &mask, a, cfg().block_size).unwrap())
+            .collect();
+        let weights: Vec<f32> = blocks
+            .iter()
+            .flat_map(|b| block::row_weights(b, Some(4.0)))
+            .collect();
+        let (taps, last_hidden) = FakeTarget.forward(&ids).unwrap();
+        let ctx = SampleCtx {
+            taps: &taps,
+            last_hidden: &last_hidden,
+            seq: SEQ,
+            denom: weights.iter().sum(),
+        };
+
+        // Element counts, not `live_host_bytes`: an op that took the device
+        // path leaves `data` empty even on the CPU backend.
+        let live = |s: &TensorStore| -> usize {
+            s.live_ids()
+                .iter()
+                .filter_map(|&id| s.get(id))
+                .map(|t| t.size * size_of::<f32>())
+                .sum()
+        };
+        let mut tape = Tape::new();
+        let before = live(&store);
+        trainer
+            .chunk_loss(&blocks, &weights, &ctx, &mut store, &mut tape)
+            .unwrap();
+        let measured = live(&store) - before;
+
+        // The residual is the Markov rank, the confidence input's rank columns
+        // and the per-row loss vectors — all of which vanish beside `vocab` and
+        // `ctx_len` at training shapes but are ~1.7% at these.
+        let predicted = peak_activation_bytes(&cfg(), bpb, SEQ, VOCAB);
+        let ratio = predicted as f64 / measured as f64;
+        assert!(
+            (0.96..=1.02).contains(&ratio),
+            "formula {predicted} B vs measured {measured} B (×{ratio:.3})"
+        );
+    }
+
+    /// `blocks_per_backward` is a VRAM knob, so the gradient must not move when
+    /// it does. A ragged tail (9 blocks at 4) is where a per-chunk denominator
+    /// re-weights a row by which chunk it happened to land in.
+    #[test]
+    fn chunking_does_not_change_the_gradient() {
+        let (mut store, mut trainer) = setup(Config {
+            num_anchors: 9,
+            blocks_per_backward: 9,
+            ..Config::default()
+        });
+        let mut tape = Tape::new();
+        let s = sample(0);
+
+        let mut grads = |trainer: &mut Trainer, bpb: usize, store: &mut TensorStore| {
+            trainer.cfg.blocks_per_backward = bpb;
+            AdamW::zero_grad(&mut trainer.opt, &trainer.params, store);
+            let out = trainer
+                .accumulate(&s, 7, 1, &mut FakeTarget, store, &mut tape)
+                .unwrap()
+                .expect("sample carries supervision");
+            assert_eq!(out.chunks, 9usize.div_ceil(bpb));
+            let g = trainer
+                .params
+                .iter()
+                .map(|&p| {
+                    let g = store.get(p).and_then(|t| t.grad).expect("no gradient");
+                    store.to_host(g).unwrap()
+                })
+                .collect::<Vec<_>>();
+            (out.loss, g)
+        };
+        let (whole_loss, whole) = grads(&mut trainer, 9, &mut store);
+        let (split_loss, split) = grads(&mut trainer, 4, &mut store);
+
+        assert!(
+            whole.iter().flatten().any(|g| g.abs() > 1e-6),
+            "no gradient reached the parameters — the gate is vacuous"
+        );
+        assert!(
+            (whole_loss - split_loss).abs() <= 1e-5 * whole_loss.abs(),
+            "the reported loss moved with the split: {whole_loss} vs {split_loss}"
+        );
+        for (a, b) in whole.iter().zip(&split) {
+            for (x, y) in a.iter().zip(b) {
+                let tol = 1e-4 * (1.0 + x.abs().max(y.abs()));
+                assert!((x - y).abs() <= tol, "grad {x} != {y} across the split");
+            }
+        }
+    }
+
     #[test]
     fn the_loop_reduces_the_loss() {
-        let mut store = TensorStore::with_backend(Arc::new(CpuBackend) as Arc<dyn Backend>);
-        let table = |salt: u64, store: &mut TensorStore| {
-            let data: Vec<f32> = (0..VOCAB * HIDDEN)
-                .map(|i| ((i as f32 + salt as f32) * 0.29).sin() * 0.1)
-                .collect();
-            store.alloc(Tensor::new(data, vec![VOCAB, HIDDEN], false).unwrap())
-        };
-        let embed = table(1, &mut store);
-        let lm_head = table(2, &mut store);
-        let draft = crate::backbone::init(cfg(), VOCAB, 4, embed, lm_head, &mut store).unwrap();
-
-        let samples: Vec<Sample> = (0..2)
-            .map(|s| Sample {
-                input_ids: (0..SEQ as u32).map(|i| (i * 5 + s) % 20).collect(),
-                loss_mask: (0..SEQ).map(|i| i >= 4).collect(),
-            })
-            .collect();
-
-        let mut cfg = Config {
+        let (mut store, mut trainer) = setup(Config {
             lr: 5e-2,
             warmup_ratio: 0.0,
             num_anchors: 8,
             ..Config::default()
-        };
-        cfg.weights.confidence = 0.0;
-        let mut trainer = Trainer::new(draft, cfg, 20);
+        });
+        let samples: Vec<Sample> = (0..2).map(sample).collect();
         let mut tape = Tape::new();
 
         let first = trainer
@@ -428,7 +670,24 @@ mod tests {
                 .train_step(&samples, &mut FakeTarget, &mut store, &mut tape)
                 .unwrap();
         }
-        assert!(first.is_finite() && last.is_finite(), "{first} -> {last}");
-        assert!(last < first * 0.95, "loss did not fall: {first} -> {last}");
+        assert!(
+            first.loss.is_finite() && last.loss.is_finite(),
+            "{} -> {}",
+            first.loss,
+            last.loss
+        );
+        assert!(
+            last.loss < first.loss * 0.95,
+            "loss did not fall: {} -> {}",
+            first.loss,
+            last.loss
+        );
+        assert!(first.conf > 0.0, "the confidence term is not in the loop");
+        assert!(
+            (0.0..=1.0).contains(&first.mean_accept),
+            "mean_accept {}",
+            first.mean_accept
+        );
+        assert!(first.grad_norm > 0.0 && first.counted == 2 && first.chunks == 2);
     }
 }

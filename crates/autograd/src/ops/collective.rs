@@ -521,10 +521,10 @@ mod tests {
             .map(|r| slice_axis(&full, full_shape, scatter, r * sc, (r + 1) * sc))
             .collect();
         let got = a2a_ref(&inputs, scatter, gather, n);
-        for j in 0..n {
+        for (j, rank) in got.iter().enumerate() {
             // Independent expected: rank j holds the FULL sequence for head-slice j.
             let expected = slice_axis(&full, full_shape, gather, j * g, (j + 1) * g);
-            assert_eq!(got[j], expected, "a2a forward mismatch at rank {j}");
+            assert_eq!(*rank, expected, "a2a forward mismatch at rank {j}");
         }
         // Self-adjoint: applying the shuffle with axes swapped reconstructs inputs.
         let back = a2a_ref(&got, gather, scatter, n);

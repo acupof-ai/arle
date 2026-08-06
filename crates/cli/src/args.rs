@@ -1264,9 +1264,15 @@ pub(crate) enum TrainCommand {
     SpecDraft(TrainSpecDraftArgs),
 }
 
+/// Every objective/optimizer default is the trainer's, so `--help` and the
+/// recipe cannot drift apart.
+fn spec_draft_cfg() -> spec_train::trainer::Config {
+    spec_train::trainer::Config::default()
+}
+
 #[derive(Debug, Clone, ClapArgs)]
 #[command(
-    after_help = "Examples:\n  arle train ppl --model-path checkpoints/base --corpus wikitext.txt\n  arle train ppl --model-path ckpt-fp8 --corpus corpus.txt --ctx 2048 --max-windows 8 --json"
+    after_help = "Examples:\n  arle train spec-draft --model-path checkpoints/base --draft drafts/dspark --data conversations.jsonl --out drafts/dspark-trained\n  arle train spec-draft --model-path checkpoints/base --draft drafts/dspark --data conversations.jsonl --out /tmp/ab-tv0 --loss-tv 0.0 --seed 42 --log-every 1"
 )]
 pub(crate) struct TrainSpecDraftArgs {
     /// Target model directory. Supplies the trunk forward, the tokenizer, and
@@ -1283,8 +1289,9 @@ pub(crate) struct TrainSpecDraftArgs {
     #[arg(long, value_name = "PATH")]
     pub(crate) data: PathBuf,
 
-    /// Where to write the trained draft.
-    #[arg(long, value_name = "PATH")]
+    /// Directory to write the trained draft into: `config.json` +
+    /// `model.safetensors`, the layout `--draft` and the serve both read.
+    #[arg(long, value_name = "DIR")]
     pub(crate) out: PathBuf,
 
     #[arg(long, default_value_t = 1000, value_parser = parse_positive_usize)]
@@ -1294,15 +1301,18 @@ pub(crate) struct TrainSpecDraftArgs {
     #[arg(long, default_value_t = 8, value_parser = parse_positive_usize)]
     pub(crate) batch: usize,
 
-    #[arg(long, default_value_t = 4096, value_parser = parse_positive_usize)]
+    /// Tokens kept per conversation. Must clear the regen cap
+    /// (`spec_train_data.py --max-tokens`, 16384) plus the prompt, because the
+    /// supervised turn is last and truncation cuts the answer, not the prompt.
+    #[arg(long, default_value_t = 20480, value_parser = parse_positive_usize)]
     pub(crate) max_len: usize,
 
-    #[arg(long, default_value_t = 512, value_parser = parse_positive_usize)]
+    #[arg(long, default_value_t = spec_draft_cfg().num_anchors, value_parser = parse_positive_usize)]
     pub(crate) num_anchors: usize,
 
     /// Blocks per backward — the VRAM knob. Attention scores and logits both
     /// scale with it; all 512 anchors at once is ~82 GiB of activation.
-    #[arg(long, default_value_t = 32, value_parser = parse_positive_usize)]
+    #[arg(long, default_value_t = spec_draft_cfg().blocks_per_backward, value_parser = parse_positive_usize)]
     pub(crate) blocks_per_backward: usize,
 
     /// Fraction of VRAM the trunk's KV pool may claim. The serving default
@@ -1311,12 +1321,45 @@ pub(crate) struct TrainSpecDraftArgs {
     #[arg(long, default_value_t = 0.45)]
     pub(crate) trunk_mem_fraction: f64,
 
-    #[arg(long, default_value_t = 6e-4)]
+    #[arg(long, default_value_t = spec_draft_cfg().lr)]
     pub(crate) lr: f32,
+
+    #[arg(long, default_value_t = spec_draft_cfg().warmup_ratio, value_parser = parse_unit_interval)]
+    pub(crate) warmup_ratio: f32,
+
+    /// Gradient-norm clip. The step log prints the pre-clip norm, so a run that
+    /// clips every step — a silent lr cut — is visible as one.
+    #[arg(long, default_value_t = spec_draft_cfg().max_grad_norm)]
+    pub(crate) max_grad_norm: f32,
+
+    #[arg(long, default_value_t = spec_draft_cfg().weight_decay)]
+    pub(crate) weight_decay: f32,
+
+    /// Row weight `exp(-t / gamma)` across a block; later rows count less.
+    #[arg(long, default_value_t = spec_draft_cfg().loss_decay_gamma)]
+    pub(crate) loss_decay_gamma: f32,
+
+    /// Objective mix `α_ce·ℒ_ce + α_tv·ℒ_tv + α_conf·ℒ_conf`.
+    #[arg(long, default_value_t = spec_draft_cfg().weights.ce)]
+    pub(crate) loss_ce: f32,
+
+    #[arg(long, default_value_t = spec_draft_cfg().weights.tv)]
+    pub(crate) loss_tv: f32,
+
+    #[arg(long, default_value_t = spec_draft_cfg().weights.confidence)]
+    pub(crate) loss_confidence: f32,
+
+    /// Fixes the anchor sample and the epoch shuffle, so two runs are comparable.
+    #[arg(long, default_value_t = spec_draft_cfg().seed)]
+    pub(crate) seed: u64,
 
     /// Markov head rank; 0 trains a draft without one.
     #[arg(long, default_value_t = 256)]
     pub(crate) markov_rank: usize,
+
+    /// Steps between log lines.
+    #[arg(long, default_value_t = 1, value_parser = parse_positive_usize)]
+    pub(crate) log_every: usize,
 
     #[arg(long, default_value_t = 100, value_parser = parse_positive_usize)]
     pub(crate) save_every: usize,

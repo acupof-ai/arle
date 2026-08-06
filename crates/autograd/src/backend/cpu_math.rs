@@ -813,6 +813,23 @@ pub fn cpu_neg_forward(a: &[f32]) -> Result<Vec<f32>> {
     Ok(a.iter().map(|x| -x).collect())
 }
 
+/// CPU reference `out = |a|`.
+pub fn cpu_abs_forward(a: &[f32]) -> Result<Vec<f32>> {
+    Ok(a.iter().map(|x| x.abs()).collect())
+}
+
+/// CPU reference `sign(x)` with `sign(0) = 0` — the L1 subgradient `abs`
+/// picks. `f32::signum` cannot be used: it maps ±0.0 to ±1.0.
+pub fn cpu_sign(x: f32) -> f32 {
+    if x > 0.0 {
+        1.0
+    } else if x < 0.0 {
+        -1.0
+    } else {
+        0.0
+    }
+}
+
 /// CPU reference GELU (tanh approximation). Matches the CUDA `gelu_f32` kernel.
 pub fn cpu_gelu_forward(a: &[f32]) -> Result<Vec<f32>> {
     const K: f32 = 0.797_884_6_f32; // sqrt(2/pi)

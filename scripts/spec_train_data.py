@@ -18,6 +18,9 @@ tens of terabytes against a few GPU-hours to recompute, and the pod's /host is
         --in data/spec-train/train.jsonl --out data/spec-train/train_regen.jsonl
 
 `regen` is resumable: rerun it and it picks up after the ids already written.
+Each assistant turn keeps its reasoning, wrapped back into the `<think>` block
+the chat template renders, because that is the bulk of what the draft has to
+predict at serve. Turns cut off by `--max-tokens` are counted and dropped.
 """
 
 from __future__ import annotations
@@ -27,6 +30,7 @@ import json
 import sys
 import urllib.error
 import urllib.request
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import Lock
@@ -73,7 +77,12 @@ def cmd_split(args: argparse.Namespace) -> None:
         print(f"{name}: {kept} rows -> {path}")
 
 
-def complete(base_url: str, model: str, messages: list, args: argparse.Namespace) -> str:
+class Truncated(Exception):
+    """The turn hit --max-tokens, so neither the reasoning nor the answer ended."""
+
+
+def complete(base_url: str, model: str, messages: list,
+             args: argparse.Namespace) -> tuple[dict, str]:
     body = json.dumps({
         "model": model,
         "messages": messages,
@@ -87,7 +96,8 @@ def complete(base_url: str, model: str, messages: list, args: argparse.Namespace
         headers={"Content-Type": "application/json"},
     )
     with urllib.request.urlopen(req, timeout=args.timeout) as resp:
-        return json.load(resp)["choices"][0]["message"]["content"]
+        choice = json.load(resp)["choices"][0]
+    return choice["message"], choice.get("finish_reason", "")
 
 
 def regen_one(conv: dict, args: argparse.Namespace) -> dict | None:
@@ -99,12 +109,21 @@ def regen_one(conv: dict, args: argparse.Namespace) -> dict | None:
             history.append(msg)
             out.append(msg)
             continue
-        content = complete(args.base_url, args.model, history, args)
+        message, finish = complete(args.base_url, args.model, history, args)
+        if finish == "length":
+            raise Truncated(f"turn {len(out)} hit max_tokens={args.max_tokens}")
+        content = (message.get("content") or "").strip()
         if not content:
             return None
-        reply = {"role": "assistant", "content": content}
-        history.append(reply)
-        out.append(reply)
+        # On a thinking checkpoint the serve has already lifted the reasoning
+        # into `reasoning_content`; put it back inside the delimiters the chat
+        # template re-emits, so the corpus text is what the trunk prefills.
+        reasoning = (message.get("reasoning_content") or "").strip()
+        text = f"<think>\n{reasoning}\n</think>\n\n{content}" if reasoning else content
+        # History goes back content-only: the template drops the reasoning of
+        # every turn before the last user query anyway.
+        history.append({"role": "assistant", "content": content})
+        out.append({"role": "assistant", "content": text})
     return {"id": conv["id"], "conversations": out}
 
 
@@ -123,27 +142,31 @@ def cmd_regen(args: argparse.Namespace) -> None:
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
     lock = Lock()
-    failed = 0
+    counts: Counter[str] = Counter()
     with args.out.open("a", encoding="utf-8") as fh:
-        def work(conv: dict) -> bool:
+        def work(conv: dict) -> str:
             try:
                 row = regen_one(conv, args)
+            except Truncated as exc:
+                print(f"id {conv['id']}: {exc}", file=sys.stderr)
+                return "truncated"
             except (urllib.error.URLError, OSError, KeyError, TimeoutError) as exc:
                 print(f"id {conv['id']}: {exc}", file=sys.stderr)
-                return False
+                return "failed"
             if row is None:
-                return False
+                return "failed"
             with lock:
                 fh.write(json.dumps(row, ensure_ascii=False) + "\n")
                 fh.flush()
-            return True
+            return "completed"
 
         with ThreadPoolExecutor(max_workers=args.concurrency) as pool:
-            for i, ok in enumerate(pool.map(work, todo), start=1):
-                failed += not ok
+            for i, status in enumerate(pool.map(work, todo), start=1):
+                counts[status] += 1
                 if i % 100 == 0:
-                    print(f"{i}/{len(todo)} ({failed} failed)", flush=True)
-    print(f"done: {len(todo) - failed} written, {failed} failed -> {args.out}")
+                    print(f"{i}/{len(todo)} {dict(counts)}", flush=True)
+    print(f"done: {counts['completed']} written, {counts['truncated']} truncated "
+          f"(max_tokens={args.max_tokens}), {counts['failed']} failed -> {args.out}")
 
 
 def main() -> None:
@@ -168,7 +191,9 @@ def main() -> None:
     r.add_argument("--concurrency", type=int, default=32)
     r.add_argument("--temperature", type=float, default=0.7)
     r.add_argument("--top-p", type=float, default=0.8)
-    r.add_argument("--max-tokens", type=int, default=4096)
+    # A reasoning turn needs >=10K on its own (2026-06-17: a 256-token cap
+    # taught an OPD student to answer early); 4096 dropped the longest samples.
+    r.add_argument("--max-tokens", type=int, default=16384)
     r.add_argument("--timeout", type=float, default=600.0)
     r.set_defaults(fn=cmd_regen)
 

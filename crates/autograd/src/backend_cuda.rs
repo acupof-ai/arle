@@ -3161,6 +3161,18 @@ impl Backend for CudaBackend {
         }
     }
 
+    fn abs(&self, x: &DeviceHandle, shape: &[usize]) -> Result<DeviceHandle> {
+        #[cfg(feature = "no-cuda")]
+        {
+            let _ = (x, shape);
+            todo!("GPU required: cuda abs is unavailable under feature no-cuda")
+        }
+        #[cfg(not(feature = "no-cuda"))]
+        {
+            cuda_unary_1d_device(self, x, shape, "abs_f32", "abs")
+        }
+    }
+
     fn mul(&self, a: &DeviceHandle, b: &DeviceHandle, shape: &[usize]) -> Result<DeviceHandle> {
         #[cfg(feature = "no-cuda")]
         {
@@ -4073,6 +4085,25 @@ impl Backend for CudaBackend {
         #[cfg(not(feature = "no-cuda"))]
         {
             cuda_sigmoid_backward_device(self, upstream, y, shape)
+        }
+    }
+
+    /// Device-resident backward for `abs(x)`. Consumes the saved
+    /// input `x`: `dx[i] = upstream[i] * sign(x[i])`, `sign(0) = 0`.
+    fn abs_backward_device(
+        &self,
+        upstream: &DeviceHandle,
+        x: &DeviceHandle,
+        shape: &[usize],
+    ) -> Result<DeviceHandle> {
+        #[cfg(feature = "no-cuda")]
+        {
+            let _ = (upstream, x, shape);
+            todo!("GPU required: cuda abs_backward_device is unavailable under feature no-cuda")
+        }
+        #[cfg(not(feature = "no-cuda"))]
+        {
+            cuda_abs_backward_device(self, upstream, x, shape)
         }
     }
 
@@ -12086,6 +12117,23 @@ fn cuda_sigmoid_backward_device(
         shape,
         "sigmoid_backward_f32",
         "sigmoid_backward_device",
+    )
+}
+
+#[cfg(not(feature = "no-cuda"))]
+fn cuda_abs_backward_device(
+    backend: &CudaBackend,
+    upstream: &DeviceHandle,
+    x: &DeviceHandle,
+    shape: &[usize],
+) -> Result<DeviceHandle> {
+    cuda_elementwise_backward_with_saved(
+        backend,
+        upstream,
+        x,
+        shape,
+        "abs_backward_f32",
+        "abs_backward_device",
     )
 }
 

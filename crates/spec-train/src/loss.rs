@@ -1,6 +1,6 @@
 //! `ℒ = α_ce·ℒ_ce + α_tv·ℒ_tv + α_conf·ℒ_conf`, term for term with
 //! deepseek-ai/DeepSpec (MIT) `deepspec/modeling/dspark/loss.py`. All three
-//! share one denominator, `Σ w`, over [`crate::block::row_weights`].
+//! share one denominator, [`Batch::denom`].
 
 use anyhow::{Result, ensure};
 use autograd::{Tape, TensorId, TensorStore, ops};
@@ -31,12 +31,23 @@ pub struct Batch<'a> {
     pub targets: &'a [usize],
     /// Zero on rows `eval` masked out.
     pub weights: &'a [f32],
+    /// Normalizer. The sample-wide weight sum, so chunking the backward does
+    /// not re-weight rows; callers pass it and the loss never recomputes it.
+    pub denom: f32,
     /// `[rows]` pre-sigmoid. `None` drops `ℒ_conf`.
     pub conf_logits: Option<TensorId>,
 }
 
-/// `Σ(x ⊙ w) / denom`. Sign and position decay fold into the constant `w`, so
-/// this is also how the L1 subgradient is taken without an `abs` op.
+/// Host-side value of each term, for logging.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Terms {
+    pub ce: f32,
+    pub tv: f32,
+    pub conf: f32,
+    pub mean_accept: f32,
+}
+
+/// `Σ(x ⊙ w) / denom`. Position decay folds into the constant `w`.
 fn weighted_mean(
     x: TensorId,
     w: &[f32],
@@ -66,18 +77,18 @@ pub fn dspark_loss(
     weights: Weights,
     store: &mut TensorStore,
     tape: &mut Tape,
-) -> Result<TensorId> {
+) -> Result<(TensorId, Terms)> {
     let &Batch {
         draft_logits,
         target_logits,
         targets,
         weights: w,
+        denom,
         conf_logits,
     } = batch;
     let rows = targets.len();
     ensure!(rows > 0, "empty batch");
     ensure!(w.len() == rows, "weights {} != rows {rows}", w.len());
-    let denom: f32 = w.iter().sum();
     ensure!(denom > 0.0, "every row is masked out");
     let vocab = *store
         .get(draft_logits)
@@ -97,13 +108,21 @@ pub fn dspark_loss(
     let p_target = ops::softmax(target_logits, store, tape)?;
     let neg_target = ops::mul_scalar(p_target, -1.0, store, tape)?;
     let diff = ops::add(p_draft, neg_target, store, tape)?;
-    let diff_host = store.to_host(diff)?;
-    let signed_w: Vec<f32> = diff_host
+    let abs_diff = ops::abs(diff, store, tape)?;
+    // Fold the vocab axis on device with a ones-GEMV: the row weights then
+    // only need `rows` values, and the per-row L1 the confidence target wants
+    // comes back as `rows` floats instead of the whole `[rows, vocab]` diff.
+    let ones = store.from_slice(&vec![1.0; vocab], &[vocab, 1])?;
+    let l1 = ops::matmul(abs_diff, ones, store, tape)?;
+    let tv = weighted_mean(l1, w, &[rows, 1], denom, store, tape)?;
+
+    let accept = accept_targets(&store.to_host(l1)?);
+    let mean_accept = w
         .iter()
-        .enumerate()
-        .map(|(i, &d)| w[i / vocab].copysign(d))
-        .collect();
-    let tv = weighted_mean(diff, &signed_w, &[rows, vocab], denom, store, tape)?;
+        .zip(accept.iter())
+        .map(|(&wr, &a)| wr * a)
+        .sum::<f32>()
+        / denom;
 
     let mut loss = ops::add(
         ops::mul_scalar(ce, weights.ce, store, tape)?,
@@ -112,12 +131,8 @@ pub fn dspark_loss(
         tape,
     )?;
 
+    let mut conf_value = 0.0;
     if let Some(conf) = conf_logits {
-        let l1: Vec<f32> = diff_host
-            .chunks_exact(vocab)
-            .map(|row| row.iter().map(|d| d.abs()).sum())
-            .collect();
-        let accept = accept_targets(&l1);
         // BCE-with-logits without a softplus op: `[z, 0]` through log_softmax
         // gives column 0 = log σ(z), column 1 = log(1 − σ(z)).
         let z = ops::reshape(conf, &[rows, 1], store, tape)?;
@@ -128,6 +143,7 @@ pub fn dspark_loss(
             .flat_map(|r| [-w[r] * accept[r], -w[r] * (1.0 - accept[r])])
             .collect();
         let conf_loss = weighted_mean(log_sig, &bce_w, &[rows, 2], denom, store, tape)?;
+        conf_value = store.to_host(conf_loss)?[0];
         loss = ops::add(
             loss,
             ops::mul_scalar(conf_loss, weights.confidence, store, tape)?,
@@ -136,7 +152,13 @@ pub fn dspark_loss(
         )?;
     }
 
-    Ok(loss)
+    let terms = Terms {
+        ce: store.to_host(ce)?[0],
+        tv: store.to_host(tv)?[0],
+        conf: conf_value,
+        mean_accept,
+    };
+    Ok((loss, terms))
 }
 
 #[cfg(test)]
@@ -183,11 +205,13 @@ mod tests {
             target_logits: g,
             targets: &[1],
             weights: &[1.0],
+            denom: 1.0,
             conf_logits: None,
         };
-        let loss = dspark_loss(&b, only("ce"), &mut s, &mut t).unwrap();
+        let (loss, terms) = dspark_loss(&b, only("ce"), &mut s, &mut t).unwrap();
         let expect = ((2.0f32).exp() + 3.0).ln();
         assert!((s.to_host(loss).unwrap()[0] - expect).abs() < 1e-5);
+        assert!((terms.ce - expect).abs() < 1e-5);
     }
 
     #[test]
@@ -201,13 +225,51 @@ mod tests {
                 target_logits: g,
                 targets: &[0],
                 weights: &[1.0],
+                denom: 1.0,
                 conf_logits: None,
             };
-            let l = dspark_loss(&b, only("tv"), &mut s, &mut t).unwrap();
+            let (l, _) = dspark_loss(&b, only("tv"), &mut s, &mut t).unwrap();
             s.to_host(l).unwrap()[0]
         };
         assert!(run(&[1.0, 0.0, 0.0, 0.0], &[1.0, 0.0, 0.0, 0.0]).abs() < 1e-6);
         assert!(run(&[9.0, 0.0, 0.0, 0.0], &[0.0, 9.0, 0.0, 0.0]) > 1.9);
+    }
+
+    /// TV's gradient only exists when the target genuinely differs — a test
+    /// that passes the draft's own tensor as the target cancels it exactly.
+    #[test]
+    fn tv_gradient_moves_the_draft_toward_the_target() {
+        let target = [0.0f32, 3.0, 0.0, -1.0];
+        let tv_and_grad = |draft: &[f32]| {
+            let (mut s, mut t) = setup();
+            let d = put(&mut s, draft, &[1, VOCAB], true);
+            let g = put(&mut s, &target, &[1, VOCAB], false);
+            let b = Batch {
+                draft_logits: d,
+                target_logits: g,
+                targets: &[0],
+                weights: &[1.0],
+                denom: 1.0,
+                conf_logits: None,
+            };
+            let (l, terms) = dspark_loss(&b, only("tv"), &mut s, &mut t).unwrap();
+            let value = s.to_host(l).unwrap()[0];
+            let grads = t.backward(l, &mut s).unwrap();
+            assert!((terms.tv - value).abs() < 1e-6);
+            (value, s.to_host(grads[&d]).unwrap())
+        };
+
+        let draft = [1.5f32, 0.0, 0.5, 0.0];
+        let (before, grad) = tv_and_grad(&draft);
+        assert!(before > 0.1, "target must actually differ: tv = {before}");
+        assert!(
+            grad.iter().any(|g| g.abs() > 1e-6),
+            "TV gradient vanished: {grad:?}"
+        );
+
+        let stepped: Vec<f32> = draft.iter().zip(&grad).map(|(x, g)| x - 0.1 * g).collect();
+        let (after, _) = tv_and_grad(&stepped);
+        assert!(after < before, "TV did not fall: {before} -> {after}");
     }
 
     #[test]
@@ -231,12 +293,67 @@ mod tests {
                 target_logits: g,
                 targets: &[1, 1],
                 weights: &[1.0, 0.0],
+                denom: 1.0,
                 conf_logits: None,
             };
-            let l = dspark_loss(&b, Weights::default(), &mut s, &mut t).unwrap();
+            let (l, _) = dspark_loss(&b, Weights::default(), &mut s, &mut t).unwrap();
             s.to_host(l).unwrap()[0]
         };
         assert!((mk(0.0) - mk(7.0)).abs() < 1e-6);
+    }
+
+    /// The `blocks_per_backward` gate: with the sample-wide `denom` held fixed,
+    /// splitting the rows across chunks must leave the summed loss unchanged.
+    /// Recomputing the denominator per chunk breaks this.
+    #[test]
+    fn splitting_the_rows_leaves_the_loss_unchanged() {
+        let draft: Vec<f32> = (0..3 * VOCAB)
+            .map(|i| (i as f32 * 0.7).sin() * 2.0)
+            .collect();
+        let target: Vec<f32> = (0..3 * VOCAB)
+            .map(|i| (i as f32 * 0.4).cos() * 2.0)
+            .collect();
+        let conf = [0.3f32, -1.2, 0.8];
+        let tokens = [1usize, 3, 0];
+        let row_w = [1.0f32, 0.5, 0.25];
+        let denom: f32 = row_w.iter().sum();
+
+        let run = |sel: &[usize]| {
+            let (mut s, mut t) = setup();
+            let take = |src: &[f32]| -> Vec<f32> {
+                sel.iter()
+                    .flat_map(|&r| src[r * VOCAB..][..VOCAB].to_vec())
+                    .collect()
+            };
+            let n = sel.len();
+            let d = put(&mut s, &take(&draft), &[n, VOCAB], true);
+            let g = put(&mut s, &take(&target), &[n, VOCAB], false);
+            let c = put(
+                &mut s,
+                &sel.iter().map(|&r| conf[r]).collect::<Vec<_>>(),
+                &[n],
+                true,
+            );
+            let tk: Vec<usize> = sel.iter().map(|&r| tokens[r]).collect();
+            let ws: Vec<f32> = sel.iter().map(|&r| row_w[r]).collect();
+            let b = Batch {
+                draft_logits: d,
+                target_logits: g,
+                targets: &tk,
+                weights: &ws,
+                denom,
+                conf_logits: Some(c),
+            };
+            let (l, _) = dspark_loss(&b, Weights::default(), &mut s, &mut t).unwrap();
+            s.to_host(l).unwrap()[0]
+        };
+
+        let whole = run(&[0, 1, 2]);
+        let split = run(&[0]) + run(&[1, 2]);
+        assert!(
+            (whole - split).abs() < 1e-5,
+            "chunking changed the objective: {whole} vs {split}"
+        );
     }
 
     #[test]
@@ -251,9 +368,11 @@ mod tests {
                 target_logits: g,
                 targets: &[0],
                 weights: &[1.0],
+                denom: 1.0,
                 conf_logits: Some(c),
             };
-            let l = dspark_loss(&b, only("conf"), &mut s, &mut t).unwrap();
+            let (l, terms) = dspark_loss(&b, only("conf"), &mut s, &mut t).unwrap();
+            assert!((terms.mean_accept - 1.0).abs() < 1e-6);
             s.to_host(l).unwrap()[0]
         };
         assert!(at(6.0) < at(0.0), "confident is better when accept == 1");

@@ -12,7 +12,7 @@
 use anyhow::{Context, Result, bail, ensure};
 
 use autograd::{Tape, Tensor, TensorId, TensorStore, ops};
-use qwen35_spec::{DsparkConfig, dspark_tensor_names};
+use qwen35_spec::{DsparkConfig, DsparkLayerType, dspark_tensor_names};
 use std::path::Path;
 
 use crate::block::{self, Block};
@@ -117,6 +117,22 @@ impl Draft {
         let hd = c.head_dim;
         let (nh, nkv) = (c.num_attention_heads, c.num_key_value_heads);
         let groups = nh / nkv;
+
+        // A non-finite tap reaches every parameter through `fc` and only shows
+        // up as a NaN loss much later; probe the host mirror where one exists
+        // rather than scanning `[ctx_len, taps·hidden]` every forward.
+        if let Some(d) = store
+            .get(input.taps)
+            .map(|t| t.data.as_slice())
+            .filter(|d| !d.is_empty())
+        {
+            ensure!(
+                [0, d.len() / 2, d.len() - 1]
+                    .iter()
+                    .all(|&i| d[i].is_finite()),
+                "trunk taps are not finite"
+            );
+        }
 
         let ctx = ops::matmul_bt(input.taps, self.fc, store, tape)?;
         let ctx = ops::rmsnorm(ctx, self.hidden_norm, c.rms_norm_eps, store, tape)?;
@@ -372,6 +388,24 @@ fn shape_of(store: &TensorStore, id: TensorId) -> Result<Vec<usize>> {
         .clone())
 }
 
+/// Host values of one tensor. `TensorStore::to_host` would want the store
+/// mutably, and a checkpoint write has no business borrowing it that way, so a
+/// device-resident parameter is read back through the backend directly.
+fn host_of(store: &TensorStore, id: TensorId) -> Result<Vec<f32>> {
+    let t = store
+        .get(id)
+        .ok_or_else(|| anyhow::anyhow!("tensor {id:?} was freed"))?;
+    if t.dirty != autograd::tensor::Dirty::Device {
+        return Ok(t.data.clone());
+    }
+    let handle = t
+        .device_handle
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("tensor {id:?} is on device with no handle"))?;
+    store.backend().eval(&[handle])?;
+    Ok(store.backend().readback(handle)?)
+}
+
 /// Read a draft checkpoint. `embed_tokens` / `lm_head` are the trunk's.
 pub fn load(
     dir: &Path,
@@ -467,10 +501,49 @@ pub fn has_weights(dir: &Path) -> Result<bool> {
     Ok(Shards::open(dir)?.has(&dspark_tensor_names(1).fc))
 }
 
-/// Write the trainable half back in the loader's names. Embeddings and
-/// `lm_head` stay out: the serve reads the trunk's and warns when a draft
-/// checkpoint carries its own.
-pub fn save(draft: &Draft, path: &Path, store: &mut TensorStore) -> Result<()> {
+/// The `config.json` both readers need beside the shard: [`load`] here and the
+/// serve's `load_dspark_head` go through `DsparkConfig::from_dir`.
+///
+/// `target_layer_ids` is part of the weights, not metadata — `fc` is trained
+/// against that tap order and reading it back in another order is silent
+/// garbage. `speculative_tokens` carries the next-token/same-position bit;
+/// `architectures` is identical for both flavors and never decides it.
+fn config_json(cfg: &DsparkConfig) -> serde_json::Value {
+    let layer_types: Vec<&str> = cfg
+        .layer_types
+        .iter()
+        .map(|t| match t {
+            DsparkLayerType::Full => "full_attention",
+            DsparkLayerType::Sliding => "sliding_attention",
+        })
+        .collect();
+    serde_json::json!({
+        "architectures": ["DSparkDraftModel"],
+        "hidden_size": cfg.hidden_size,
+        "intermediate_size": cfg.intermediate_size,
+        "num_hidden_layers": cfg.num_hidden_layers,
+        "num_attention_heads": cfg.num_attention_heads,
+        "num_key_value_heads": cfg.num_key_value_heads,
+        "head_dim": cfg.head_dim,
+        "rms_norm_eps": cfg.rms_norm_eps,
+        "rope_theta": cfg.rope_theta,
+        "sliding_window": cfg.sliding_window,
+        "layer_types": layer_types,
+        "block_size": cfg.block_size,
+        "mask_token_id": cfg.mask_token_id,
+        "target_layer_ids": cfg.target_layer_ids,
+        "speculative_tokens": cfg.max_draft_tokens(),
+    })
+}
+
+/// Write a checkpoint DIRECTORY the serve can load: `config.json` +
+/// `model.safetensors`. Embeddings and `lm_head` stay out: the serve reads the
+/// trunk's and warns when a draft checkpoint carries its own.
+///
+/// One shard named `model.safetensors` and no index — the serve's
+/// `SafetensorLoader::new` then takes its single-file branch and never scans
+/// for siblings, so a stray file in `dir` cannot change what loads.
+pub fn save(draft: &Draft, dir: &Path, store: &TensorStore) -> Result<()> {
     let names = dspark_tensor_names(draft.cfg.num_hidden_layers);
     let mut named: Vec<(String, TensorId)> = vec![
         (names.fc, draft.fc),
@@ -508,8 +581,7 @@ pub fn save(draft: &Draft, path: &Path, store: &mut TensorStore) -> Result<()> {
     let mut buffers = Vec::with_capacity(named.len());
     for (name, id) in named {
         let shape = shape_of(store, id)?;
-        let bytes: Vec<u8> = store
-            .to_host(id)?
+        let bytes: Vec<u8> = host_of(store, id)?
             .iter()
             .flat_map(|&x| half::bf16::from_f32(x).to_le_bytes())
             .collect();
@@ -527,13 +599,15 @@ pub fn save(draft: &Draft, path: &Path, store: &mut TensorStore) -> Result<()> {
             (name.clone(), v)
         })
         .collect::<Vec<_>>();
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    let tmp = path.with_extension("safetensors.tmp");
+    std::fs::create_dir_all(dir)?;
+    std::fs::write(
+        dir.join("config.json"),
+        serde_json::to_string_pretty(&config_json(&draft.cfg))?,
+    )?;
+    let tmp = dir.join("model.safetensors.tmp");
     safetensors::serialize_to_file(views, None, &tmp)
         .map_err(|e| anyhow::anyhow!("draft save to {} failed: {e}", tmp.display()))?;
-    std::fs::rename(&tmp, path)?;
+    std::fs::rename(&tmp, dir.join("model.safetensors"))?;
     Ok(())
 }
 
@@ -619,6 +693,7 @@ mod tests {
 
     const VOCAB: usize = 32;
     const HIDDEN: usize = 8;
+    const CTX: usize = 8;
 
     fn tiny_cfg() -> DsparkConfig {
         DsparkConfig {
@@ -675,90 +750,121 @@ mod tests {
         store.to_host(out.logits).unwrap()
     }
 
-    /// The mask's whole job: block `j` must not see the trunk past its anchor.
-    /// A wrong mask leaks the answer and this is the only cheap way to see it.
-    #[test]
-    fn a_block_is_blind_to_the_context_after_its_anchor() {
-        let ctx_len = 12;
-        let mut seed = 7;
-        let taps: Vec<f32> = (0..ctx_len * 2 * HIDDEN)
-            .map(|_| gauss(&mut seed))
+    fn noise(n: usize, salt: u64, scale: f32) -> Vec<f32> {
+        let mut seed = salt;
+        (0..n).map(|_| scale * gauss(&mut seed)).collect()
+    }
+
+    fn one_block() -> Vec<Block> {
+        let ids: Vec<u32> = (0..CTX as u32).collect();
+        vec![build_block(&ids, &[true; CTX], 3, 3).unwrap()]
+    }
+
+    /// One chunk's forward + loss, composed as `trainer::chunk_backward` does.
+    /// `target_host` is a tensor of its own: reusing the draft's own logits
+    /// makes `diff` identically zero, which cancels the 0.9-weight TV gradient
+    /// and leaves only the 0.1-weight CE term under test.
+    fn forward_loss(
+        draft: &Draft,
+        blocks: &[Block],
+        taps_host: &[f32],
+        target_host: &[f32],
+        store: &mut TensorStore,
+        tape: &mut Tape,
+    ) -> TensorId {
+        let taps = store.from_slice(taps_host, &[CTX, 2 * HIDDEN]).unwrap();
+        let out = draft
+            .forward(
+                &Input {
+                    blocks,
+                    taps,
+                    ctx_len: CTX,
+                },
+                store,
+                tape,
+            )
+            .unwrap();
+        let rows = blocks.len() * blocks[0].targets.len();
+        let target_logits = store.from_slice(target_host, &[rows, VOCAB]).unwrap();
+        let targets: Vec<usize> = blocks
+            .iter()
+            .flat_map(|b| b.targets.iter().map(|&t| t as usize))
             .collect();
+        let weights: Vec<f32> = blocks
+            .iter()
+            .flat_map(|b| crate::block::row_weights(b, Some(4.0)))
+            .collect();
+        let (loss, _) = crate::loss::dspark_loss(
+            &crate::loss::Batch {
+                draft_logits: out.logits,
+                target_logits,
+                targets: &targets,
+                weights: &weights,
+                denom: weights.iter().sum(),
+                conf_logits: out.confidence,
+            },
+            crate::loss::Weights::default(),
+            store,
+            tape,
+        )
+        .unwrap();
+        loss
+    }
+
+    /// The serve hands the draft the conditioning token's own tap and nothing
+    /// after it (`qwen35/dspark.rs`: the ctx ring runs to `start = anchor+1`
+    /// exclusive). Training either way round is invisible to every shape and
+    /// index assertion — only the content of one key differs.
+    #[test]
+    fn a_block_sees_its_anchor_tap_and_nothing_after_it() {
+        let (ctx_len, row) = (12, 2 * HIDDEN);
+        let taps = noise(ctx_len * row, 7, 1.0);
         let base = run(&taps, ctx_len, &[4, 9]);
+        let block = 3 * VOCAB;
 
-        let mut perturbed = taps.clone();
-        for x in &mut perturbed[9 * 2 * HIDDEN..] {
-            *x += 10.0;
-        }
-        let after = run(&perturbed, ctx_len, &[4, 9]);
-
-        let rows = 3 * VOCAB;
-        let d = |a: &[f32], b: &[f32]| {
+        let bump = |lo: usize, hi: usize| {
+            let mut t = taps.clone();
+            for x in &mut t[lo * row..hi * row] {
+                *x += 10.0;
+            }
+            run(&t, ctx_len, &[4, 9])
+        };
+        let moved = |a: &[f32], b: &[f32]| {
             a.iter()
                 .zip(b)
                 .map(|(x, y)| (x - y).abs())
                 .fold(0.0, f32::max)
         };
-        assert!(
-            d(&base[..rows], &after[..rows]) < 1e-5,
-            "anchor-4 block moved"
-        );
-        assert!(
-            d(&base[rows..], &after[rows..]) < 1e-5,
-            "anchor-9 block moved"
-        );
 
-        let mut early = taps.clone();
-        for x in &mut early[..2 * HIDDEN] {
-            *x += 10.0;
-        }
-        let moved = run(&early, ctx_len, &[4, 9]);
+        let at_anchor = bump(9, 10);
         assert!(
-            d(&base[..rows], &moved[..rows]) > 1e-4,
-            "position 0 is in reach"
+            moved(&base[block..], &at_anchor[block..]) > 1e-4,
+            "anchor-9 block cannot reach taps[9]"
+        );
+        let past_4 = bump(5, ctx_len);
+        assert!(
+            moved(&base[..block], &past_4[..block]) < 1e-5,
+            "anchor-4 block reaches past its anchor"
+        );
+        let past_9 = bump(10, ctx_len);
+        assert!(
+            moved(&base[block..], &past_9[block..]) < 1e-5,
+            "anchor-9 block reaches past its anchor"
         );
     }
 
     #[test]
     fn backward_reaches_every_parameter() {
         let (mut store, mut tape, draft) = setup();
-        let ctx_len = 8;
-        let ids: Vec<u32> = (0..ctx_len as u32).collect();
-        let blocks = vec![build_block(&ids, &vec![true; ctx_len], 3, 3).unwrap()];
-        let mut seed = 3;
-        let taps: Vec<f32> = (0..ctx_len * 2 * HIDDEN)
-            .map(|_| gauss(&mut seed))
-            .collect();
-        let taps = store.from_slice(&taps, &[ctx_len, 2 * HIDDEN]).unwrap();
-        let out = draft
-            .forward(
-                &Input {
-                    blocks: &blocks,
-                    taps,
-                    ctx_len,
-                },
-                &mut store,
-                &mut tape,
-            )
-            .unwrap();
-
-        let loss = crate::loss::dspark_loss(
-            &crate::loss::Batch {
-                draft_logits: out.logits,
-                target_logits: out.logits,
-                targets: &blocks[0]
-                    .targets
-                    .iter()
-                    .map(|&t| t as usize)
-                    .collect::<Vec<_>>(),
-                weights: &crate::block::row_weights(&blocks[0], Some(4.0)),
-                conf_logits: out.confidence,
-            },
-            crate::loss::Weights::default(),
+        let blocks = one_block();
+        let loss = forward_loss(
+            &draft,
+            &blocks,
+            &noise(CTX * 2 * HIDDEN, 3, 1.0),
+            &noise(3 * VOCAB, 5, 0.5),
             &mut store,
             &mut tape,
-        )
-        .unwrap();
+        );
         let grads = tape.backward(loss, &mut store).unwrap();
 
         for p in draft.parameters() {
@@ -766,5 +872,112 @@ mod tests {
             let norm: f32 = store.to_host(g).unwrap().iter().map(|x| x * x).sum();
             assert!(norm > 0.0, "parameter {p:?} got a zero gradient");
         }
+    }
+
+    /// Central differences along one fixed direction per parameter tensor, at
+    /// the default weights so all three loss terms are live. `backward_reaches_
+    /// every_parameter` only proves a gradient is non-zero; a transposed or
+    /// mis-scaled backward survives it and still lets the loss fall.
+    #[test]
+    fn taped_gradients_match_finite_differences() {
+        // Step per ELEMENT, relative to the tensor's own scale: norms sit at
+        // 1.0 and projections at 0.02, and one absolute step cannot serve both.
+        const REL: f32 = 0.04;
+
+        let (mut store, mut tape, draft) = setup();
+        let blocks = one_block();
+        let taps = noise(CTX * 2 * HIDDEN, 3, 1.0);
+        let target = noise(3 * VOCAB, 5, 0.5);
+        let value = |store: &mut TensorStore, tape: &mut Tape| {
+            tape.entries.clear();
+            tape.set_enabled(true);
+            let loss = forward_loss(&draft, &blocks, &taps, &target, store, tape);
+            (store.to_host(loss).unwrap()[0], loss)
+        };
+
+        let (base, loss) = value(&mut store, &mut tape);
+        let grads = tape.backward(loss, &mut store).unwrap();
+
+        let params = draft.parameters();
+        let dirs: Vec<Vec<f32>> = params
+            .iter()
+            .enumerate()
+            .map(|(i, &p)| {
+                let mut d = noise(store.get(p).unwrap().size, 0x51ED + i as u64, 1.0);
+                let scale = d.iter().map(|x| x * x).sum::<f32>().sqrt();
+                d.iter_mut().for_each(|x| *x /= scale);
+                d
+            })
+            .collect();
+        let analytic: Vec<f32> = params
+            .iter()
+            .zip(&dirs)
+            .map(|(&p, d)| {
+                let g = store.to_host(grads[&p]).unwrap();
+                g.iter().zip(d).map(|(a, b)| a * b).sum()
+            })
+            .collect();
+
+        let (mut worst, mut skipped) = (0.0f32, 0usize);
+        for (i, (&p, d)) in params.iter().zip(&dirs).enumerate() {
+            let w = store.to_host(p).unwrap();
+            let rms = (w.iter().map(|x| x * x).sum::<f32>() / w.len() as f32).sqrt();
+            let h = REL * rms.max(1e-3) * (w.len() as f32).sqrt();
+            let shift = |store: &mut TensorStore, s: f32| {
+                let t = store.get_mut(p).unwrap();
+                t.data.iter_mut().zip(d).for_each(|(x, dx)| *x += s * dx);
+            };
+            shift(&mut store, h);
+            let plus = value(&mut store, &mut tape).0;
+            shift(&mut store, -2.0 * h);
+            let minus = value(&mut store, &mut tape).0;
+            shift(&mut store, h);
+
+            let numeric = (plus - minus) / (2.0 * h);
+            // The f32 loss resolves to `|L|·EPSILON`, so `|L|·EPSILON/2h` is
+            // the noise in the difference; below 30× that there is no signal.
+            let floor = 30.0 * base.abs() * f32::EPSILON / (2.0 * h);
+            let scale = analytic[i].abs().max(numeric.abs());
+            if scale < floor {
+                skipped += 1;
+                continue;
+            }
+            worst = worst.max((numeric - analytic[i]).abs() / scale);
+        }
+        assert!(worst < 5e-2, "worst relative gradient error {worst}");
+        assert!(
+            skipped * 2 < params.len(),
+            "{skipped} of {} directional derivatives sat under the f32 noise \
+             floor — the check is passing on too little",
+            params.len()
+        );
+    }
+
+    /// `save` -> `load` is the only path by which a trained draft reaches the
+    /// serve, and the config it writes is what binds `fc` to its tap order.
+    #[test]
+    fn a_saved_draft_reloads_as_the_same_model() {
+        let (mut store, _tape, draft) = setup();
+        let dir =
+            std::env::temp_dir().join(format!("arle-spec-train-roundtrip-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        save(&draft, &dir, &store).unwrap();
+
+        let back = load(&dir, draft.embed_tokens, draft.lm_head, &mut store).unwrap();
+        assert_eq!(back.cfg, draft.cfg);
+        assert!(has_weights(&dir).unwrap());
+
+        for (a, b) in draft.parameters().into_iter().zip(back.parameters()) {
+            assert_eq!(shape_of(&store, a).unwrap(), shape_of(&store, b).unwrap());
+            let (x, y) = (store.to_host(a).unwrap(), store.to_host(b).unwrap());
+            // bf16 storage: half an ulp, 2^-8 relative.
+            let off = x
+                .iter()
+                .zip(&y)
+                .map(|(p, q)| (p - q).abs() / p.abs().max(f32::MIN_POSITIVE))
+                .fold(0.0, f32::max);
+            assert!(off <= 0.0039, "parameter {a:?} came back {off} off");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
