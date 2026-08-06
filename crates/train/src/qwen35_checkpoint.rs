@@ -606,6 +606,7 @@ mod tests {
             norm_topk_prob: true,
             mlp_only_layers: Vec::new(),
             full_attn_gated: true,
+            output_gate_type: "sigmoid".to_string(),
         }
     }
 
@@ -642,6 +643,7 @@ mod tests {
             norm_topk_prob: true,
             mlp_only_layers: Vec::new(),
             full_attn_gated: true,
+            output_gate_type: "sigmoid".to_string(),
         };
         cfg.validate_train_scratch_contract()
             .expect("tiny checkpoint config should satisfy scratch contract");

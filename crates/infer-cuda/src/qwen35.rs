@@ -58,7 +58,7 @@ use crate::moe::{
 };
 use crate::moe_config::ExpertSplit;
 use crate::ops::{
-    add_batch, argmax_into, argmax_row_into, copy_row_to_vec, embedding_batch, gemm_batch, gemv,
+    add_batch, argmax_into, argmax_row_into, copy_row_to_vec, embedding_batch, gemm_batch, gemv, rms_norm_batch, rms_norm_vec,
     silu_mul_fused, split_qkv, split2, upload_i32, warm_fp8_deepgemm_dense,
 };
 use crate::workspace::{HiddenSlot, SliceSlot, VecSlot};
@@ -4273,7 +4273,7 @@ impl Qwen35Model {
         let last_hidden = last_hidden.get(&self.ctx, hidden_size)?;
         copy_row_to_vec(&self.ctx, hidden, seq_len - 1, last_hidden)?;
         let last_normed = last_normed.get(&self.ctx, hidden_size)?;
-        rms_norm_offset_vec(&self.ctx, last_hidden, &self.norm, eps, last_normed)?;
+        rms_norm_vec(&self.ctx, last_hidden, &self.norm, eps, last_normed)?;
         let logits = logits.get(&self.ctx, self.output_projection().rows)?;
         gemv(&self.ctx, self.output_projection(), last_normed, logits)?;
         Ok(())
@@ -4479,7 +4479,7 @@ impl Qwen35Model {
         // rms_norm fully overwrites `normed` before the lm-head GEMM reads it.
         let hidden = hidden.get(&self.ctx, hidden_size, seq_len)?;
         let normed = normed.get(&self.ctx, hidden_size, seq_len)?;
-        rms_norm_offset(&self.ctx, hidden, &self.norm, eps, normed)?;
+        rms_norm_batch(&self.ctx, hidden, &self.norm, eps, normed)?;
         let vocab = self.output_projection().rows;
         // The logits buffer is RETURNED to the OPD caller (ownership leaves the
         // forward), so it stays a per-call allocation — not a workspace slot.
@@ -4529,7 +4529,7 @@ impl Qwen35Model {
         let Qwen35Workspace { hidden, normed, .. } = ws;
         let hidden = hidden.get(&self.ctx, hidden_size, seq_len)?;
         let normed = normed.get(&self.ctx, hidden_size, seq_len)?;
-        rms_norm_offset(&self.ctx, hidden, &self.norm, eps, normed)?;
+        rms_norm_batch(&self.ctx, hidden, &self.norm, eps, normed)?;
         let vocab = self.output_projection().rows;
         let mut logits = HiddenStates::zeros(&self.ctx, vocab, seq_len)?;
         gemm_batch(&self.ctx, self.output_projection(), normed, &mut logits)?;
@@ -4577,7 +4577,7 @@ impl Qwen35Model {
         let Qwen35Workspace { hidden, normed, .. } = ws;
         let hidden = hidden.get(&self.ctx, hidden_size, seq_len)?;
         let normed = normed.get(&self.ctx, hidden_size, seq_len)?;
-        rms_norm_offset(&self.ctx, hidden, &self.norm, eps, normed)?;
+        rms_norm_batch(&self.ctx, hidden, &self.norm, eps, normed)?;
         let vocab = self.output_projection().rows;
         let mut logits = HiddenStates::zeros(&self.ctx, vocab, seq_len)?;
         gemm_batch(&self.ctx, self.output_projection(), normed, &mut logits)?;
@@ -8126,7 +8126,7 @@ impl Qwen35Model {
         }
 
         // ── Final norm over ALL rows + batched lm_head GEMM. ──
-        rms_norm_offset(&self.ctx, hidden, &self.norm, eps, normed)?;
+        rms_norm_batch(&self.ctx, hidden, &self.norm, eps, normed)?;
         let logits_buf = logits_batch.get(&self.ctx, vocab, b)?;
         gemm_batch(&self.ctx, self.output_projection(), normed, logits_buf)?;
 
@@ -8372,7 +8372,7 @@ impl Qwen35Model {
             add_batch(&self.ctx, hidden_mid, mlp_out, hidden)?;
         }
 
-        rms_norm_offset(&self.ctx, hidden, &self.norm, eps, normed)?;
+        rms_norm_batch(&self.ctx, hidden, &self.norm, eps, normed)?;
         let logits_buf = logits_batch.get(&self.ctx, vocab, b)?;
         gemm_batch(&self.ctx, self.output_projection(), normed, logits_buf)?;
 
@@ -9084,6 +9084,7 @@ mod tests {
             norm_topk_prob: true,
             mlp_only_layers: vec![],
             full_attn_gated: true,
+            output_gate_type: "sigmoid".to_string(),
         }
     }
 

@@ -317,38 +317,38 @@ fn log_kernel_node_census(
         let mut p = std::mem::MaybeUninit::<cu::CUDA_KERNEL_NODE_PARAMS>::uninit();
         // SAFETY: node handles come from cuGraphGetNodes on a live graph; a
         // non-kernel node fails cleanly and is skipped.
-        if unsafe { cu::cuGraphKernelNodeGetParams_v2(node, p.as_mut_ptr()) }
+        #[cfg(infer_cuda_cuda_12)]
+        let params_ok = unsafe { cu::cuGraphKernelNodeGetParams_v2(node, p.as_mut_ptr()) }
             .result()
-            .is_err()
-        {
+            .is_ok();
+        #[cfg(not(infer_cuda_cuda_12))]
+        let params_ok = unsafe { cu::cuGraphKernelNodeGetParams(node, p.as_mut_ptr()) }
+            .result()
+            .is_ok();
+        if !params_ok {
             continue;
         }
         // SAFETY: success above guarantees initialization.
         let p = unsafe { p.assume_init() };
-        let mut raw: *const std::ffi::c_char = std::ptr::null();
-        // A node carries `func` or `kern`, never both.
-        let got = if !p.func.is_null() {
-            // SAFETY: out-param is a valid local; the handle is non-null.
-            unsafe { cu::cuFuncGetName(&mut raw, p.func) }
-                .result()
-                .is_ok()
-        } else if !p.kern.is_null() {
-            // SAFETY: as above.
-            unsafe { cu::cuKernelGetName(&mut raw, p.kern) }
-                .result()
-                .is_ok()
-        } else {
-            false
+        #[cfg(infer_cuda_cuda_12)]
+        let name = {
+            let mut raw: *const std::ffi::c_char = std::ptr::null();
+            // A node carries `func` or `kern`, never both.
+            let got = if !p.func.is_null() {
+                unsafe { cu::cuFuncGetName(&mut raw, p.func) }.result().is_ok()
+            } else if !p.kern.is_null() {
+                unsafe { cu::cuKernelGetName(&mut raw, p.kern) }.result().is_ok()
+            } else {
+                false
+            };
+            if got && !raw.is_null() {
+                unsafe { std::ffi::CStr::from_ptr(raw) }.to_string_lossy().into_owned()
+            } else {
+                "<unnamed>".to_string()
+            }
         };
-        let name = if got && !raw.is_null() {
-            // SAFETY: driver-owned NUL-terminated string, valid while the
-            // module is loaded — copied out immediately.
-            unsafe { std::ffi::CStr::from_ptr(raw) }
-                .to_string_lossy()
-                .into_owned()
-        } else {
-            "<unnamed>".to_string()
-        };
+        #[cfg(not(infer_cuda_cuda_12))]
+        let name = "<kernel>".to_string();
         log::info!(
             "[graph-node-census] {i:04} grid=({},{},{}) block=({},{},{}) smem={} {name}",
             p.gridDimX,
