@@ -269,8 +269,8 @@ pub(crate) struct Qwen35CudaExecutor {
     /// Budget bytes for durable NVMe recall spill (`--kv-disk-limit`).
     /// `None` until `set_kv_tier_disk` wires it.
     disk_budget: Option<usize>,
-    /// Page count the construction-time profile chose; `ensure_kv_pool` rebuilds
-    /// at this size. Not on the serve path.
+    /// The constructed pool's own `max_total_pages`; `ensure_kv_pool` rebuilds at
+    /// this size. Not on the serve path.
     kv_pool_sized_pages: usize,
     /// Recurrent prefix sidecars live in `slot_tier` under `NS_SIDECAR` (blob =
     /// recurrent state + full-attn KV, keyed by token-prefix hash), so they share
@@ -916,7 +916,7 @@ impl Qwen35CudaExecutor {
         let pool_t0 = Instant::now();
         let requested_pages = total_pages.max(1);
         let kv_format = kv_dtype.kv_format();
-        let (full_attn_kv, kv_pool_sized_pages) = Self::build_full_attn_kv_pool(
+        let full_attn_kv = Self::build_full_attn_kv_pool(
             &model,
             num_slots,
             requested_pages,
@@ -924,6 +924,7 @@ impl Qwen35CudaExecutor {
             kv_format,
             dspark_slot_bytes,
         )?;
+        let kv_pool_sized_pages = full_attn_kv.max_total_pages;
         cuda_startup_log("qwen35_paged_pool_alloc", pool_t0, format_args!("built"));
 
         // G3 whole-slot spill tier: snapshots stored as 16 MiB chunked blobs
@@ -991,8 +992,7 @@ impl Qwen35CudaExecutor {
 
     /// Build the shared paged full-attn KV pool, profile-sized from MEASURED free
     /// VRAM (SGLang's `mem_fraction_static`); `requested_pages` is the fallback
-    /// for a failed probe, not a floor over it (#178). Returns the pool and the
-    /// page count it chose, which `ensure_kv_pool` restores.
+    /// for a failed probe, not a floor over it (#178).
     fn build_full_attn_kv_pool(
         model: &crate::qwen35::Qwen35Model,
         num_slots: usize,
@@ -1000,7 +1000,7 @@ impl Qwen35CudaExecutor {
         mem_fraction_static: f64,
         kv_format: KVFormat,
         dspark_slot_bytes: usize,
-    ) -> Result<(PagedKVPool, usize)> {
+    ) -> Result<PagedKVPool> {
         let num_full = model.config.num_full_attention_layers();
         let local_kv_heads = model.local_kv_heads();
         let head_dim = model.config.head_dim;
@@ -1077,10 +1077,7 @@ impl Qwen35CudaExecutor {
                 requested_pages
             }
         };
-        Ok((
-            Self::alloc_full_attn_kv_pool(model, num_slots, total_pool_pages, kv_format)?,
-            total_pool_pages,
-        ))
+        Self::alloc_full_attn_kv_pool(model, num_slots, total_pool_pages, kv_format)
     }
 
     /// Allocate the pool at an exact page count, no profiling.
@@ -1178,6 +1175,17 @@ impl Qwen35CudaExecutor {
             self.kv_pool_sized_pages,
             self.kv_format,
         )?;
+        // Construction warns once when the profile floors; without this the
+        // replay would silently reuse that floored pool for the rest of the run.
+        let floor_pages = infer_seam::PROFILE_KV_TOKENS_FLOOR as usize / SUPPORTED_PAGE_SIZE;
+        if self.kv_pool_sized_pages <= floor_pages {
+            log::warn!(
+                "Qwen3.6 re-acquired full-attn KV pool at the {}-token floor ({} pages): \
+                 admission stays capped, every longer prompt aborts",
+                infer_seam::PROFILE_KV_TOKENS_FLOOR,
+                self.kv_pool_sized_pages,
+            );
+        }
         log::info!(
             "Qwen3.6 re-acquired full-attn KV pool: {}MB / {} pages (agent-OPD next-round rollout)",
             pool.device_bytes() >> 20,
