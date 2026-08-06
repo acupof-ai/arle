@@ -1158,8 +1158,8 @@ impl Qwen35CudaExecutor {
         Ok(())
     }
 
-    /// Re-acquire the shared paged full-attn KV pool at the size the
-    /// construction-time profile chose (agent-OPD next-round rollout).
+    /// Re-acquire the shared paged full-attn KV pool at the size the constructed
+    /// pool reported (agent-OPD next-round rollout).
     /// No-op (idempotent) if the pool is already resident.
     ///
     /// Deliberately does NOT re-profile: `release_kv_pool` handed this VRAM to
@@ -1180,10 +1180,14 @@ impl Qwen35CudaExecutor {
         let floor_pages = infer_seam::PROFILE_KV_TOKENS_FLOOR as usize / SUPPORTED_PAGE_SIZE;
         if self.kv_pool_sized_pages <= floor_pages {
             log::warn!(
-                "Qwen3.6 re-acquired full-attn KV pool at the {}-token floor ({} pages): \
-                 admission stays capped, every longer prompt aborts",
+                "Qwen3.6 re-acquired full-attn KV pool at the {}-token floor: {} pages × {} \
+                 tok/page over {} slots, {}MB. Construction profiled this; admission stays \
+                 capped and every longer prompt aborts until mem_fraction_static is raised",
                 infer_seam::PROFILE_KV_TOKENS_FLOOR,
                 self.kv_pool_sized_pages,
+                SUPPORTED_PAGE_SIZE,
+                self.num_slots,
+                pool.device_bytes() >> 20,
             );
         }
         log::info!(
