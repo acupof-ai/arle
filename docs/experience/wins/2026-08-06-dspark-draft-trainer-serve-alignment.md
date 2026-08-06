@@ -103,6 +103,8 @@ curl -s http://127.0.0.1:8000/v1/stats | python3 -m json.tool
 | Gate | Command | Result |
 |---|---|---|
 | CUDA/CPU parity, all autograd device ops | `pod_gpu_tests.sh run parity1 0 -- -p autograd --release --features cuda --test test_cuda_lazy_ops` | 43 passed, 0 failed, 28.6 s |
+| Target-logits oracle, 16 positions of a 44-token sample | `arle train spec-draft … --probe` | argmax 1.000, top-64 overlap 0.993, mean abs delta log p(next) 0.0120 |
+| Tap distinctness, 5 taps at layers 1/16/31/46/61 | same run | L2 1.20e2 -> 1.92e3 monotone in depth; max off-diagonal cosine 0.899 (layers 1-16), min 0.370 (layers 1-61); 0.000% non-finite |
 
 The three cases the draft forward needed — `cuda_rank3_matmul_and_backward_match_cpu_on_draft_attention`, `cuda_concat_axis0_axis1_and_slice_backward_match_cpu`, `cuda_rank5_broadcast_expand_and_backward_match_cpu` — pass against their CPU references. This is the first CUDA execution of any of them.
 
@@ -133,22 +135,20 @@ Raw artifacts: pending-remote.
 
 ## Problems
 
-Six gates remain open, all needing the pod:
+Four gates remain open, all needing the pod:
 
-1. Target-logits oracle — `last_hidden @ lm_head` against
-   `LoadedInferenceEngine::forward_token_logits` for the same ids.
-2. Tap sanity — per-tap norm and pairwise distinctness of
-   `forward_training_taps`.
-3. Serve-side checkpoint load — the round-trip gate uses `spec_train`'s own
+1. Serve-side checkpoint load — the round-trip gate uses `spec_train`'s own
    reader, not `load_dspark_head`.
-4. Measured acceptance of a trained draft.
-5. `peak_activation_bytes` against real VRAM at training shape; the local
+2. Measured acceptance of a trained draft.
+3. `peak_activation_bytes` against real VRAM at training shape; the local
    measurement is at hidden 8, vocab 24.
-6. The `ctx_base` clamp. The serve floors the per-row window at the ring base
+4. The `ctx_base` clamp. The serve floors the per-row window at the ring base
    (`dspark.rs:915`); training floors at 0. Once the ring has wrapped, the serve
    sees fewer keys than training fitted on. Not modeled, not measured.
 
-Items 1 and 2 are built and unrun: `arle train spec-draft --probe`.
+The probe closed the target-logits oracle and tap sanity at 44 tokens. The
+trunk's long-context behaviour — sliding window, ring wrap — is the regime that
+breaks, and the probe has not run there. Item 4 is the same regime.
 
 ## Learnings
 
