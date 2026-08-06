@@ -29,26 +29,65 @@ python3 scripts/gen_bench_prompts.py bench-agent-32k-16x8.jsonl 16 32000 214 8
 
 ## Qwen3.6-27B-FP8 · 1×H20 · single-GPU · eager — LONG-AGENT ANCHOR
 
-### SOTA — DSpark, `51985031d` (2026-07-30) · `arle-mk`
+### SOTA — DSpark, `b8d390bf3` (2026-08-06)
+
+> **c≥4 carries an unresolved −6 to −10% regression** against the binary this
+> row replaces. Both are recorded below; the audit that separated them, and the
+> first bisect probe, are in
+> [`wins/2026-08-06-dspark-anchor-remeasure-c1-plus-40-percent.md`](experience/wins/2026-08-06-dspark-anchor-remeasure-c1-plus-40-percent.md).
+> Screen a candidate against c=1 freely; a c≥4 comparison is against a known-sick
+> champion until the probe lands.
 
 Features on: batched draft · replay · snapshot · capture · markov+confidence
 head driving the goodput budget. Serve adds `--spec-type dspark
 --mtp-draft-model Qwen3.6-27B-DFlash --dspark-block-size 6`; `--spec-max-batch`
 is the shipped default 16.
 
+**Schema changed with this row.** It is driven by `bench_throughput.py`, which
+does not emit `burst`, `occ`, `tok/row`, or per-point `prefix hit`. Those
+columns are dropped rather than carried forward at their 07-30 values. `accept`
+is the run's cumulative rate, not per-point.
+
 A spec row carries `tok/row` (committed tokens per verify row; plain decode
 = 1.0) and `burst`, never ITL p50 — a spec step emits `k+1` tokens back-to-back,
 so most recorded ITLs are the within-chain gap.
 
-| c | pt | TTFT cold | TTFT warm | TPOT | burst | decode tok/s | total tok/s | occ | prefix hit | accept | tok/row |
-|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| 1 | 1st | 19.3 s | 1.1 s | 9.80 ms | 34.8 ms | 102.0 | 7440.7 | 0.26 | 0.883 | 0.509 | 0.591 |
-| 2 | 1st | — | 1.2 s | 31.26 ms | 110.8 ms | 32.0 | 8292.3 | 0.47 | 0.883 | 0.509 | 0.591 |
-| 4 | 2nd | — | 0.5 s | 32.10 ms | 78.2 ms | 31.2 | 25432.8 | 0.85 | 1.000 | 0.287 | 0.406 |
-| 8 | 2nd | — | 0.7 s | 60.70 ms | 145.7 ms | 16.5 | 31754.1 | 0.87 | 1.000 | 0.280 | 0.400 |
-| 16 | 3rd | 6.8 s | 1.2 s | 109.43 ms | 262.7 ms | 9.1 | 32559.0 | 0.87 | 1.000 | 0.280 | 0.400 |
+One serve, ascending, so `pt` is 1st through 5th — every point but c=1 inherits
+a warm cache. `TTFT cold` is the p90 of the 128 requests (16 of them are turn 0);
+`TTFT warm` is the p50.
 
-Gate exact=3 DET at 512/4k/16k/32k. 0 errors. 126/128. `prompt_tokens` p50 34963.
+| c | pt | TTFT cold | TTFT warm | ITL mean | out tok/s | total tok/s | req/s |
+|---|---|---:|---:|---:|---:|---:|---:|
+| 1 | 1st | 10.79 s | 0.94 s | 8.41 ms | 35.1 | **10406.8** | 0.298 |
+| 2 | 2nd | 0.70 s | 0.59 s | 18.88 ms | 80.4 | 20752.5 | 0.594 |
+| 4 | 3rd | 1.01 s | 0.62 s | 35.68 ms | 93.7 | 24327.3 | 0.697 |
+| 8 | 4th | 1.52 s | 0.78 s | 67.08 ms | 103.0 | 28669.5 | 0.821 |
+| 16 | 5th | 2.73 s | 1.24 s | 131.32 ms | 104.8 | 30486.2 | 0.873 |
+
+128/128 at every point, 0 errors. `prompt_tokens` 34782/request against a 32000
+target (+8.7%, inside the ±10% bar). Cumulative `accept` 0.3085.
+
+**Measured drift band, ±2.7%.** The same sweep run twice gave total tok/s
+10444.2 / 20484.9 / 24666.9 / 29450.8 / 31313.7 — the row above is the idle-box
+repeat, and the spread across the pair is what a candidate has to clear. Use
+this, not the ±3% constant at the top of the file, for this workload.
+
+**The superseded row, kept as the regression's other arm** — `51985031d`
+(2026-07-30) · `arle-mk`, re-run on the same box and dataset on 2026-08-06:
+
+| c | recorded 07-30 | `arle-mk` re-run | this row | Δ vs `arle-mk` |
+|---|---:|---:|---:|---:|
+| 1 | 7440.7 | 7287.4 | 10321.5 | **+41.6%** |
+| 2 | 8292.3 | 20740.4 | 19967.0 | −3.7% |
+| 4 | 25432.8 | 25265.7 | 23750.0 | −6.0% |
+| 8 | 31754.1 | 30621.3 | 27517.6 | **−10.1%** |
+| 16 | 32559.0 | 31890.9 | 29583.1 | **−7.2%** |
+
+The champion reproduces its own 07-30 numbers to within 2.1% at c=1/4/16, so
+the deficit is a regression rather than drift or a fingerprint difference. Both
+`this row` columns come from the audit's back-to-back shell; the standalone
+sweep above is a separate run of the same binary, which is why c=1 reads 10406.8
+there and 10321.5 here.
 
 Two properties of this row are load-bearing when reading it:
 
@@ -56,8 +95,9 @@ Two properties of this row are load-bearing when reading it:
   16 turn-0 sessions; later points inherit the cache. At matched c=16: 0.532 as
   a fresh serve's sole point vs 0.313 as a later point — **+70% from cache
   state alone**. "Accept halves at concurrency" is withdrawn.
-- **`occ` = `out tok/s / (c × decode tok/s)`** is the fraction of wall clock a
-  slot decodes rather than waits on prefill. At 0.26–0.47 (c=1/2) `burst` is
+- **`occ` and `burst` are not in this row's schema.** When a driver does emit
+  them: `occ = out tok/s / (c × decode tok/s)` is the fraction of wall clock a
+  slot decodes rather than waits on prefill, and at low `occ` `burst` is
   inflated ~1/occ. Never read `burst` as a kernel cost.
 
 DSpark over the same binary with spec off: 2.9× (c=1), 2.5× (c=2), 2.0× (c=4),
@@ -67,12 +107,26 @@ DSpark over the same binary with spec off: 2.9× (c=1), 2.5× (c=2), 2.0× (c=4)
 
 The SOTA table says how fast; this says what to fix.
 
+> **STALE — do not rank prefill work off this table.** Measured before chunked
+> GDR went default-on (`c2eb5de9e`, 08-02). Its #1 row is a kernel that no
+> longer runs at the shipped defaults: the FlashQLA chunked path replaced
+> `gated_delta_rule_prefill_recurrent` and measured **1.06 s against its 9.37 s**
+> ([`wins/2026-08-02-flashqla-chunked-gdr-h48.md`](experience/wins/2026-08-02-flashqla-chunked-gdr-h48.md)),
+> which moves 33% of the prefill budget and reorders everything below it. Two
+> more prefill changes landed after (`0ac780495`, `301d0c074`). A re-measure
+> needs one `nsys` capture; the two attempts that failed and the delay to use
+> are recorded in
+> [`errors/2026-08-06-decode-lever-board-rebuilt-gemm-is-not-the-top-lever.md`](experience/errors/2026-08-06-decode-lever-board-rebuilt-gemm-is-not-the-top-lever.md).
+> The verify decomposition below is also superseded: measured directly on the
+> current binary as **5.69 ms/row verify + 3.04 ms/row draft**, and the per-row
+> term is not the GDN lane.
+
 **Prefill, 33K in 28.6 s** (single request, 24.0 s GPU-busy, ~37K launches,
 2328 `cuMemcpyDtoH` costing 1.58 s):
 
 | kernel | launches | s | share |
 |---|---:|---:|---:|
-| `gated_delta_rule_prefill_recurrent` | 1152 | 9.37 | 33% |
+| `gated_delta_rule_prefill_recurrent` (no longer on the default path) | 1152 | 9.37 | 33% |
 | DeepGEMM FP8, all shapes | 7936 | 8.33 | 29% |
 | TileLang full attention | 368 | 3.93 | 14% |
 | `pack_quantize` bf16→fp8 | 9600 | 1.50 | 5% |
