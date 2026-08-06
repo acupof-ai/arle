@@ -120,7 +120,23 @@ Back to back, same shell:
 | 8 | 30621.3 | 27517.6 | **−10.1%** |
 | 16 | 31890.9 | 29583.1 | **−7.2%** |
 
-`accept_rate` 0.3121 vs 0.3091 — spec decode is not the difference.
+`accept_rate` 0.3121 vs 0.3091 — spec decode acceptance is not the difference.
+
+**Separating prefill from decode relocates the whole finding.** `out tok/s` is
+`output_tokens / wall`, so it blends the two; `TPOT` (= `itl_mean`, the only
+honest per-token figure on a spec row, since `itl_p50` samples the within-chain
+gap at 0.02 ms) is decode alone:
+
+| c | champion TPOT | HEAD TPOT | Δ TPOT | Δ decode tok/s |
+|---:|---:|---:|---:|---:|
+| 1 | 9.690 ms | **8.462 ms** | −12.7% | **+14.5%** |
+| 2 | 19.817 | 18.892 | −4.7% | +4.8% |
+| 4 | 35.689 | 36.228 | +1.5% | −1.5% |
+| 8 | 63.685 | **69.894** | +9.7% | **−8.9%** |
+| 16 | 111.529 | **135.509** | +21.5% | **−17.7%** |
+
+**The regression is in decode and scales monotonically with concurrency**, and
+c=1 decode is 14.5% *faster*. The blended metric showed neither half.
 
 The champion completed 126/128 at every point against HEAD's 128/128. An
 incomplete request spends wall clock without contributing tokens, so the
@@ -143,11 +159,22 @@ which is the c=1 regime. This workload is 16 sessions × 8 turns against 16
 slots, so a session's later turn can find its slot taken and land on the
 restore path; that is where the stated cost falls.
 
-**This is a hypothesis, not a root cause.** It is one compile-time constant, so
-the test is a rebuild at 128 and one sweep — about an hour, against a
-multi-hour bisect. If it moves c=8 back toward 30621, the mechanism is
-confirmed and the constant becomes a per-workload decision rather than a global
-default. If it does not, the range still has to be bisected.
+**This is a hypothesis, not a root cause** — and the decode/prefill split above
+argues against it. A cross-conversation restore is TTFT work; it should not move
+steady-state TPOT at all, and the sign is wrong twice over: stride 512 takes
+*fewer* snapshots than 128, so it holds less of the ~150 MB-per-snapshot live
+state, which if anything should help at concurrency.
+
+The probe ran anyway. It is one compile-time constant against a multi-hour
+bisect, the arms differ by that constant alone, and today already produced one
+case where the obvious mechanism (the GDN lane) was killed by measurement after
+an equally confident argument. A negative result narrows the range; the argument
+alone does not.
+
+**What the constraint now requires of any candidate:** a per-token cost that
+grows with batch size and is absent at batch 1. That excludes every prefill-side
+change in the window and points at the batched decode path — scheduler
+admission, spec-decode batching, or KV paging under slot pressure.
 
 ## Learnings
 
@@ -175,3 +202,10 @@ row falsifiable; without `/host/spec-phase/arle-mk` the only path was bisecting
 since the row were each licensed on single-request 33K TTFT. They delivered:
 c=1 is up 41.6%. The same window lost 10.1% at c=8, on a workload the licensing
 benches never ran.
+
+**A blended `out tok/s` hides which half moved.** `output_tokens / wall`
+charges decode for prefill's time. Splitting it turned "c≥4 throughput is down
+6–10%" into "decode TPOT is up 9.7% at c=8 and 21.5% at c=16 while c=1 decode
+is 12.7% faster" — a constraint sharp enough to exclude every prefill-side
+change in the window, including the one this entry had named as its first
+probe. The row now carries TPOT and decode tok/s for that reason.
