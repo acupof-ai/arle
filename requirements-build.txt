@@ -1,11 +1,9 @@
 # Build-time Python dependencies for arle.
 # TileLang: AOT attention/GDR kernel codegen for the CUDA feature set.
 #
-# Pinned as a SET; bump together, backed by a pod build. tilelang 0.1.12 +
-# apache-tvm-ffi 0.1.12 import cleanly with the ARLE first-wins TypeAttr patch
-# (tile-ai/tilelang#2367); pod-verified 2026-07-23 (sm_90 AOT regen +
-# `cuda-kernels` build, BUILD_EXIT=0). The patch stays until a tilelang release
-# imports cleanly against vanilla tvm-ffi >=0.1.12.
+# tilelang 0.1.13 imports cleanly against vanilla apache-tvm-ffi (the
+# first-wins TypeAttr fix from tile-ai/tilelang#2367 landed upstream).
+# No ARLE tvm-ffi patch needed.
 #
 # torch ships its own bundled CUDA runtime (nvidia-*-cu12 12.9.x), so the cu129
 # wheel imports cleanly in the CUDA-12.8 build image — no GPU and no matching
@@ -14,14 +12,8 @@
 # triton — don't re-pin it here.
 --extra-index-url https://download.pytorch.org/whl/cu129
 torch==2.13.0+cu129
-# apache-tvm-ffi==0.1.12 — pin carried as a comment, NOT resolver-installed:
-# tilelang 0.1.12's metadata declares apache-tvm-ffi<=0.1.11, so a single-pass
-# `pip install -r` with the pin live is ResolutionImpossible. Installers run
-# `pip install -r` (tilelang pulls vanilla <=0.1.11 transitively), then grep
-# this line for the pin and force-install the patched 0.1.12 wheel
-# (kernels-publish inline / scripts/ci-patch-tvm-ffi.sh / scripts/pod-tilelang-env.sh).
 cuda-python==12.9.0
-tilelang==0.1.12
+tilelang==0.1.13
 # tilelang's tvm dlopens libz3 at import (wheel RUNPATH looks beside libtvm /
 # in ../../z3/lib); pinned inside tilelang's declared <4.15.5 range.
 z3-solver==4.15.4
