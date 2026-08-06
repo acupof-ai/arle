@@ -101,9 +101,9 @@ pub struct CudaRuntimeFlags {
     /// DSv4 contiguous-decode MoE path (KILLED as default; A/B lever).
     #[serde(default)]
     pub dsv4_moe_contig_decode: bool,
-    /// DSv4 decode-region prefix reuse: capture the finished slot's frontier at
-    /// finish, restore a later turn to the exact finish position (opt-in until
-    /// the pod perf+correctness license; OFF = byte-identical).
+    /// DSv4 decode-region prefix reuse: restore a later turn to the exact finish
+    /// position. OFF here, ON in serve — the 2026-07-11 license measured serve
+    /// only. OFF = byte-identical.
     #[serde(default)]
     pub dsv4_decode_reuse: bool,
     /// Adaptive MTP gate at B=1 (skip speculation below the accept break-even).
@@ -133,20 +133,20 @@ pub struct CudaRuntimeFlags {
 impl Default for CudaRuntimeFlags {
     fn default() -> Self {
         Self {
-            qwen35_decode_graph: true,
-            qwen35_batched_decode: true,
-            qwen35_deepgemm: true,
-            qwen35_moe_decode_kernel: true,
-            qwen35_gpu_router: true,
-            qwen35_fa3: true,
+            qwen35_decode_graph: d_true(),
+            qwen35_batched_decode: d_true(),
+            qwen35_deepgemm: d_true(),
+            qwen35_moe_decode_kernel: d_true(),
+            qwen35_gpu_router: d_true(),
+            qwen35_fa3: d_true(),
             qwen35_fa3_decode_splits: d_fa3_decode_splits(),
             qwen35_deepgemm_min_routes: d_deepgemm_min_routes(),
-            qwen35_gdr_chunked: true,
+            qwen35_gdr_chunked: d_true(),
             decode_metadata_fast_page16: false,
             marlin_w4_fp8_prefill: false,
-            mempool_retain: true,
+            mempool_retain: d_true(),
             shard_cache_bytes: None,
-            numa_pin: true,
+            numa_pin: d_true(),
             comm_backend: CommBackend::Auto,
             dsv4_flashmla_decode: None,
             dsv4_dsa_indexer_sms: d_dsa_indexer_sms(),
