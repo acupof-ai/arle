@@ -79,7 +79,7 @@ curl -s http://127.0.0.1:8000/v1/stats | python3 -m json.tool
 
 ## Environment
 
-- Commit: working tree on `4850d0dd7`, uncommitted.
+- Commit: `57eedcd75`.
 - Host / GPU: 8xH20, `pending-remote` (driver, CUDA).
 - Model / dtype: ThinkingCap-27B-FP8 trunk, bf16 draft checkpoint.
 - Draft: 5 layers, hidden 5120, 32 heads, head_dim 128, block_size 7,
@@ -103,7 +103,7 @@ Gates that now fail if the defect returns:
 | Defect | Gate |
 |---|---|
 | Row RoPE position and context span | `spec_train::mask::tests::every_row_reaches_exactly_what_the_serve_gives_it` |
-| Anchor tap dropped from the context | `spec_train::mask::tests::the_anchor_tap_is_visible`, `spec_train::backbone::tests::a_block_sees_its_anchor_tap_and_nothing_after_it` |
+| Anchor tap reachable from the context | `spec_train::mask::tests::the_anchor_tap_is_out_of_reach`, `spec_train::backbone::tests::a_block_is_blind_from_its_anchor_onward` |
 | Distillation target index | `spec_train::block::tests::only_the_anchor_row_carries_a_real_token` |
 | Per-chunk denominator | `spec_train::loss::tests::splitting_the_rows_leaves_the_loss_unchanged`, `spec_train::trainer::tests::chunking_does_not_change_the_gradient` |
 | Composed-loss backward | `spec_train::backbone::tests::taped_gradients_match_finite_differences` |
@@ -125,8 +125,7 @@ Raw artifacts: pending-remote.
 
 ## Problems
 
-Nine gates from the audit remain open because no local runner can close them.
-Seven need the pod:
+Nine gates remain open. Seven need the pod:
 
 1. Target-logits oracle — `last_hidden @ lm_head` against
    `LoadedInferenceEngine::forward_token_logits` for the same ids.
