@@ -1173,23 +1173,21 @@ impl Qwen35CudaExecutor {
             self.kv_pool_sized_pages,
             self.kv_format,
         )?;
+        let mb = pool.device_bytes() >> 20;
         // Construction warns once; the replay would otherwise be silent.
         let floor_pages = infer_seam::PROFILE_KV_TOKENS_FLOOR as usize / SUPPORTED_PAGE_SIZE;
         if self.kv_pool_sized_pages <= floor_pages {
             log::warn!(
-                "Qwen3.6 re-acquired full-attn KV pool at the {}-token floor: {} pages × {} \
-                 tok/page over {} slots, {}MB. Construction profiled this; admission stays \
-                 capped and every longer prompt aborts until mem_fraction_static is raised",
+                "Qwen3.6 re-acquired full-attn KV pool at the {}-token floor over {} slots \
+                 ({mb}MB): admission stays capped and every longer prompt aborts until \
+                 mem_fraction_static is raised",
                 infer_seam::PROFILE_KV_TOKENS_FLOOR,
-                self.kv_pool_sized_pages,
-                SUPPORTED_PAGE_SIZE,
                 self.num_slots,
-                pool.device_bytes() >> 20,
             );
         }
         log::info!(
-            "Qwen3.6 re-acquired full-attn KV pool: {}MB / {} pages (agent-OPD next-round rollout)",
-            pool.device_bytes() >> 20,
+            "Qwen3.6 re-acquired full-attn KV pool: {mb}MB / {} pages (agent-OPD next-round \
+             rollout)",
             self.kv_pool_sized_pages,
         );
         self.full_attn_kv = Some(pool);
