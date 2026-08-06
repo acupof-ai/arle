@@ -1157,10 +1157,12 @@ pub(crate) struct OpdRuntimeArgs {
     #[arg(long, value_name = "N")]
     pub(crate) mtp_draft_tokens: Option<usize>,
 
-    /// KV-pool fraction of post-weights free VRAM for the in-process rollout
-    /// engine. The rollout is single-sequence, so the default 0.9 starves the
-    /// per-step LoRA re-merge scratch (OOM); lower it to leave re-merge room.
-    #[arg(long, default_value_t = 0.9, value_name = "F")]
+    /// Share of TOTAL VRAM the in-process rollout engine may hold: its KV pool
+    /// gets `free − total × (1 − F)`, so F below the weights' own share of total
+    /// (0.30 for the 27B on an H20) yields a zero-size pool and every prompt
+    /// longer than the 4096-token floor is aborted. Above the co-resident
+    /// autograd student's headroom it OOMs the writeback instead.
+    #[arg(long, default_value_t = 0.5, value_name = "F")]
     pub(crate) rollout_mem_fraction: f64,
 }
 
