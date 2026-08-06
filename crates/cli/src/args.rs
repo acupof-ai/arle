@@ -2535,12 +2535,14 @@ mod tests {
     #[test]
     fn serve_defaults_match_the_seam_defaults() {
         let serve = super::ServeArgs::parse_from(["arle-serve"]).cuda_runtime_flags();
-        let expected = infer_api::CudaRuntimeFlags {
-            dsv4_decode_reuse: serve.dsv4_decode_reuse, // licensed on serve only
-            comm_backend: serve.comm_backend,           // serve forces NCCL
-            ..Default::default()
+        assert!(serve.dsv4_decode_reuse, "licensed on serve only");
+        assert_eq!(serve.comm_backend, infer_api::CommBackend::Nccl);
+        let rest = infer_api::CudaRuntimeFlags {
+            dsv4_decode_reuse: false,
+            comm_backend: infer_api::CommBackend::Auto,
+            ..serve
         };
-        assert_eq!(serve, expected);
+        assert_eq!(rest, infer_api::CudaRuntimeFlags::default());
     }
 
     #[test]
