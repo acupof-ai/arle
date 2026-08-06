@@ -2108,7 +2108,17 @@ pub(crate) struct LinearAttnScratch {
     fq_g: SliceSlot<f32>,
     fq_g_cumsum: SliceSlot<f32>,
     fq_beta: SliceSlot<f32>,
+    /// `[5B]` pointer table + `[B]` row lengths for the batched multi-row core.
+    batch_ptrs: SliceSlot<u64>,
+    batch_len: SliceSlot<i32>,
+    batch_host: Vec<u64>,
+    batch_len_host: Vec<i32>,
 }
+
+/// Rows this long or shorter take the batched recurrent core instead of
+/// per-row FlashQLA: one chunk holds them, so there is no chunk parallelism
+/// to win back against B times the launches.
+const LINEAR_BATCH_MAX_LEN: usize = 64;
 
 /// One slot's contiguous column range in a ragged batch. Its `len` token-major
 /// columns advance THIS slot's state; its capture receives them from offset 0.
@@ -7027,6 +7037,10 @@ impl Qwen35Model {
             fq_g,
             fq_g_cumsum,
             fq_beta,
+            batch_ptrs,
+            batch_len,
+            batch_host,
+            batch_len_host,
         } = lw;
         let qkvz = qkvz.get(&self.ctx, qkv_dim + z_dim, rows)?;
         let qkv = qkv.get(&self.ctx, qkv_dim, rows)?;
@@ -7090,29 +7104,55 @@ impl Qwen35Model {
                     }
                     self.batched_copy(capture_copy, &dst, &src, &sz)?;
                 }
-                let mut off = 0usize;
-                for r in rs.iter_mut() {
-                    self.advance_linear_conv_gdr(
+                // Uniform short rows (a DSpark verify tick) pack identically to
+                // the varlen kernels' `s * len` stride, so the whole batch is
+                // one conv + one GDR launch. The per-row loop below is B times
+                // the launches for the same work.
+                let uniform = rs
+                    .first()
+                    .map(|r| r.len)
+                    .filter(|len| *len <= LINEAR_BATCH_MAX_LEN && rs.iter().all(|r| r.len == *len));
+                if let (Some(len), true) = (uniform, rs.len() > 1) {
+                    self.advance_linear_conv_gdr_batched(
                         attn,
-                        &qkv.data.slice(off * qkv_dim..(off + r.len) * qkv_dim),
-                        &b_proj.data.slice(off * b_dim..(off + r.len) * b_dim),
-                        &a_proj.data.slice(off * a_dim..(off + r.len) * a_dim),
-                        r.slot,
+                        rs,
                         linear_idx,
-                        r.len,
-                        &mut qkv_conv
-                            .data
-                            .slice_mut(off * qkv_dim..(off + r.len) * qkv_dim),
-                        &mut gdr_out.data.slice_mut(off * z_dim..(off + r.len) * z_dim),
-                        fq_q,
-                        fq_k,
-                        fq_v,
-                        fq_a,
-                        fq_g,
-                        fq_g_cumsum,
-                        fq_beta,
+                        len,
+                        qkv,
+                        b_proj,
+                        a_proj,
+                        qkv_conv,
+                        gdr_out,
+                        batch_ptrs,
+                        batch_len,
+                        batch_host,
+                        batch_len_host,
                     )?;
-                    off += r.len;
+                } else {
+                    let mut off = 0usize;
+                    for r in rs.iter_mut() {
+                        self.advance_linear_conv_gdr(
+                            attn,
+                            &qkv.data.slice(off * qkv_dim..(off + r.len) * qkv_dim),
+                            &b_proj.data.slice(off * b_dim..(off + r.len) * b_dim),
+                            &a_proj.data.slice(off * a_dim..(off + r.len) * a_dim),
+                            r.slot,
+                            linear_idx,
+                            r.len,
+                            &mut qkv_conv
+                                .data
+                                .slice_mut(off * qkv_dim..(off + r.len) * qkv_dim),
+                            &mut gdr_out.data.slice_mut(off * z_dim..(off + r.len) * z_dim),
+                            fq_q,
+                            fq_k,
+                            fq_v,
+                            fq_a,
+                            fq_g,
+                            fq_g_cumsum,
+                            fq_beta,
+                        )?;
+                        off += r.len;
+                    }
                 }
             }
             LinearCore::Tables { conv, gdr } => {
@@ -7238,6 +7278,134 @@ impl Qwen35Model {
             Some(linear_idx),
             rows,
             || self.tp.all_reduce_sum(&self.ctx, out),
+        )?;
+        Ok(())
+    }
+
+    /// [`Self::advance_linear_conv_gdr`] for B rows of the SAME `len` in one
+    /// conv + one GDR launch, through the varlen kernels
+    /// [`Self::replay_linear_only_batched`] already uses. Uniform `len` makes
+    /// their `s * len` row stride identical to the trunk's ragged packing, so
+    /// the shared scratch needs no repack.
+    ///
+    /// The recurrent lane, not FlashQLA: a verify chain fits in one FlashQLA
+    /// chunk, so chunk parallelism buys nothing against B times the launches.
+    #[allow(clippy::too_many_arguments)]
+    fn advance_linear_conv_gdr_batched(
+        &self,
+        attn: &LinearAttn,
+        rs: &mut [LinearRow<'_>],
+        linear_idx: usize,
+        len: usize,
+        qkv: &HiddenStates,
+        b_proj: &HiddenStates,
+        a_proj: &HiddenStates,
+        qkv_conv: &mut HiddenStates,
+        gdr_out: &mut HiddenStates,
+        batch_ptrs: &mut SliceSlot<u64>,
+        batch_len: &mut SliceSlot<i32>,
+        host: &mut Vec<u64>,
+        len_host: &mut Vec<i32>,
+    ) -> Result<()> {
+        let ctx = &self.ctx;
+        let c = &self.config;
+        let b = rs.len();
+        let qkv_dim = self.local_linear_qkv_dim();
+        let b_dim = attn.in_proj_ba.rows / 2;
+        let (qkv_base, _g0) = qkv.data.device_ptr(&ctx.stream);
+        let (b_base, _g1) = b_proj.data.device_ptr(&ctx.stream);
+        let (a_base, _g2) = a_proj.data.device_ptr(&ctx.stream);
+        let elem = std::mem::size_of::<bf16>() as u64;
+        // Five contiguous B-entry tables in one upload, in the order the
+        // kernels take them: conv x, conv ring, b, a, GDR state.
+        host.clear();
+        host.resize(5 * b, 0);
+        for (i, r) in rs.iter_mut().enumerate() {
+            let row = (i * len) as u64;
+            let conv_state = &mut r.slot.conv_states[linear_idx];
+            ensure!(
+                conv_state.len == qkv_dim * (c.linear_conv_kernel_dim - 1),
+                "Qwen3.5 conv state len {} != qkv_dim*(kernel-1) {}",
+                conv_state.len,
+                qkv_dim * (c.linear_conv_kernel_dim - 1)
+            );
+            host[i] = qkv_base + row * qkv_dim as u64 * elem;
+            host[b + i] = conv_state.data.device_ptr_mut(&ctx.stream).0;
+            host[2 * b + i] = b_base + row * b_dim as u64 * elem;
+            host[3 * b + i] = a_base + row * b_dim as u64 * elem;
+            host[4 * b + i] = r.slot.gdr_states[linear_idx].device_ptr_mut(&ctx.stream).0;
+        }
+        let tbl = batch_ptrs.get(ctx, host.len())?;
+        ctx.stream
+            .memcpy_htod(host, tbl)
+            .map_err(|e| anyhow!("H2D linear batch pointer table: {e}"))?;
+        let (base, _gt) = tbl.device_ptr(&ctx.stream);
+        // Same for every layer of a tick, so upload only when the tick's shape
+        // changes. `get` zero-fills a resize, so both dims must be checked.
+        let d = batch_len.get(ctx, b)?;
+        if len_host.len() != b || len_host[0] != len as i32 {
+            len_host.clear();
+            len_host.resize(b, len as i32);
+            ctx.stream
+                .memcpy_htod(len_host, d)
+                .map_err(|e| anyhow!("H2D linear batch row lengths: {e}"))?;
+        }
+        let (len_ptr, _gl) = d.device_ptr(&ctx.stream);
+        let (w_ptr, _g3) = attn.conv1d_weight.data.device_ptr(&ctx.stream);
+        let (dt_ptr, _g4) = attn.dt_bias.data.device_ptr(&ctx.stream);
+        let (alog_ptr, _g5) = attn.a_log.device_ptr(&ctx.stream);
+        let (cv_ptr, _g6) = qkv_conv.data.device_ptr_mut(&ctx.stream);
+        let (o_ptr, _g7) = gdr_out.data.device_ptr_mut(&ctx.stream);
+        let table = |k: u64| base + k * b as u64 * 8;
+        qwen35_profile(ctx, "qwen/linear/conv1d", Some(linear_idx), b * len, || {
+            // SAFETY: each table holds `b` live pointers staged above; the
+            // shared scratch is `[b * len, dim]`.
+            unsafe {
+                ffi::conv1d_prefill_varlen_cuda(
+                    table(0) as *const *const ffi::Half,
+                    w_ptr as *const ffi::Half,
+                    table(1) as *const *mut ffi::Half,
+                    len_ptr as *const i32,
+                    cv_ptr as *mut ffi::Half,
+                    qkv_dim as i32,
+                    len as i32,
+                    c.linear_conv_kernel_dim as i32,
+                    b as i32,
+                    ctx.stream.cu_stream(),
+                )
+                .result()?;
+            }
+            Ok(())
+        })?;
+        qwen35_profile(
+            ctx,
+            "qwen/linear/gdr_recurrent",
+            Some(linear_idx),
+            b * len,
+            || {
+                // SAFETY: same tables; qkv_conv/gdr_out are `[b * len, dim]`.
+                unsafe {
+                    ffi::gated_delta_rule_prefill_recurrent_varlen_cuda(
+                        cv_ptr as *const ffi::Half,
+                        table(2) as *const *const ffi::Half,
+                        table(3) as *const *const ffi::Half,
+                        dt_ptr as *const ffi::Half,
+                        alog_ptr as *const f32,
+                        table(4) as *const *mut f32,
+                        len_ptr as *const i32,
+                        o_ptr as *mut ffi::Half,
+                        self.local_linear_k_heads as i32,
+                        self.local_linear_v_heads as i32,
+                        c.linear_key_head_dim as i32,
+                        c.linear_value_head_dim as i32,
+                        len as i32,
+                        b as i32,
+                        ctx.stream.cu_stream(),
+                    )
+                    .result()?;
+                }
+                Ok(())
+            },
         )?;
         Ok(())
     }
