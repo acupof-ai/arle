@@ -100,7 +100,10 @@ pub(crate) fn run_train(train: TrainArgs) -> ExitCode {
         }
         TrainCommand::CcConvert(args) => exit_from_result(run_cc_convert_impl(args)),
         TrainCommand::Ppl(args) => exit_from_result(run_ppl(args)),
-        TrainCommand::SpecDraft(args) => exit_from_result(run_spec_draft(args)),
+        TrainCommand::SpecDraft(args) => {
+            train::apply_runtime_flags(&args.runtime.to_flags());
+            exit_from_result(run_spec_draft(args))
+        }
     }
 }
 
