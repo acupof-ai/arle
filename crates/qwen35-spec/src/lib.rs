@@ -470,6 +470,8 @@ struct TextConfig {
     mlp_only_layers: Vec<usize>,
     #[serde(default)]
     moe_config: Option<MoeConfigRaw>,
+    #[serde(default = "default_output_gate_type")]
+    output_gate_type: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -669,10 +671,18 @@ pub struct Qwen35Config {
     /// flat HF Qwen3 config schema.
     #[serde(default = "default_full_attn_gated")]
     pub full_attn_gated: bool,
+    /// Activation for the full-attention output gate.
+    /// Qwen3.5 dense uses sigmoid; Qwen3.6 uses swish.
+    #[serde(default = "default_output_gate_type")]
+    pub output_gate_type: String,
 }
 
 fn default_full_attn_gated() -> bool {
     true
+}
+
+fn default_output_gate_type() -> String {
+    "sigmoid".to_string()
 }
 
 impl Qwen35Config {
@@ -858,6 +868,7 @@ impl Qwen35Config {
             norm_topk_prob: mut moe_norm_topk_prob,
             mlp_only_layers: mut moe_mlp_only_layers,
             moe_config,
+            output_gate_type,
         } = text;
 
         if let Some(nested) = moe_config {
@@ -920,6 +931,7 @@ impl Qwen35Config {
             // `qwen35_loader` train-side path flips this to `false` when it
             // detects vanilla Qwen3 (flat-config schema, no `text_config`).
             full_attn_gated: true,
+            output_gate_type,
         };
         config.validate()?;
         Ok(config)
