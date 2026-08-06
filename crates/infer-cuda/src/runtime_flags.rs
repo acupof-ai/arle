@@ -67,6 +67,8 @@ static DSV4_DECODE_REUSE: AtomicBool = AtomicBool::new(true); // default ON (202
 static MTP_ADAPTIVE: AtomicBool = AtomicBool::new(false);
 static MTP_MIN_ACCEPT_BITS: AtomicU32 = AtomicU32::new(0x3F0C_CCCD); // 0.55f32
 static SPEC_MAX_BATCH: AtomicUsize = AtomicUsize::new(1);
+/// NaN = unset, so an explicit `0` stays distinguishable from no flag at all.
+static DSPARK_CONFIDENCE_THRESHOLD_BITS: AtomicU32 = AtomicU32::new(0x7FC0_0000);
 static DEEPEP_NUM_SMS: AtomicU32 = AtomicU32::new(20);
 
 /// Apply the CLI-resolved flags. Must run before executor construction; the
@@ -98,6 +100,10 @@ pub fn apply_runtime_flags(f: &CudaRuntimeFlags) {
     MTP_ADAPTIVE.store(f.mtp_adaptive, Relaxed);
     MTP_MIN_ACCEPT_BITS.store(f.mtp_min_accept.to_bits(), Relaxed);
     SPEC_MAX_BATCH.store(f.spec_max_batch.max(1), Relaxed);
+    DSPARK_CONFIDENCE_THRESHOLD_BITS.store(
+        f.dspark_confidence_threshold.unwrap_or(f32::NAN).to_bits(),
+        Relaxed,
+    );
     DEEPEP_NUM_SMS.store(f.deepep_num_sms, Relaxed);
     DEEPEP_MAX_DISPATCH_TOKENS_PER_RANK
         .store(f.deepep_max_dispatch_tokens_per_rank.unwrap_or(0), Relaxed);
@@ -204,6 +210,11 @@ pub(crate) fn mtp_min_accept() -> f32 {
 /// when the decode batch is ≤ this, else route to the plain batched path.
 pub(crate) fn spec_max_batch() -> usize {
     SPEC_MAX_BATCH.load(Relaxed)
+}
+/// `--dspark-confidence-threshold`, feeding `DsparkSps::confidence_threshold`.
+pub(crate) fn dspark_confidence_threshold() -> Option<f32> {
+    let t = f32::from_bits(DSPARK_CONFIDENCE_THRESHOLD_BITS.load(Relaxed));
+    (!t.is_nan()).then_some(t)
 }
 #[cfg(feature = "deepep")]
 pub(crate) fn deepep_num_sms() -> u32 {
