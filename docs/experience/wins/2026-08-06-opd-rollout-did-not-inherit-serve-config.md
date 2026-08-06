@@ -38,6 +38,43 @@ The DSpark decode tick is unchanged across the arms — 162.0 vs 162.9 ms at
 rows=16 — so the whole 42% is prefill. Any workload dominated by long prompts
 was paying it; agent-OPD rollouts are 21K-token prompts.
 
+### What it is worth at the OPD level
+
+Same box and model, `arle train agent-opd`, 1 task × 2 samples, LoRA rank 16 on
+attention-qv, `--task-limit 1` to finish before the re-profile bug fires
+([`errors/2026-08-06-rollout-engine-reprofiles-its-kv-pool-after-the-student-lands.md`](../errors/2026-08-06-rollout-engine-reprofiles-its-kv-pool-after-the-student-lands.md)).
+
+The agent took the **same turn count in both arms**, which makes the per-sample
+walls a paired comparison rather than a noisy one:
+
+| sample | turns | recurrent | chunked | Δ |
+|---|---:|---:|---:|---:|
+| #0 | 10 | 108.7 s | **86.1 s** | −20.8% |
+| #1 | 11 | 116.0 s | **104.1 s** | −10.3% |
+
+Group totals:
+
+| arm | gpu_busy | rollout wall | busy_frac | prompt tok | completion tok |
+|---|---:|---:|---:|---:|---:|
+| recurrent | 107.52 s | 116.02 s | 0.927 | 221067 | 3185 |
+| chunked | **92.66 s** | **104.15 s** | 0.890 | **391660** | 3536 |
+| Δ | **−13.8%** | −10.2% | | +77% | +11% |
+
+The chunked arm spends 13.8% less GPU time while processing 77% more prompt
+tokens. The end-to-end gain is smaller than the serve-side 42% for three
+reasons, all expected: prefix caching already removes most repeated prefill
+inside an agent loop, 7–11% of rollout wall is not GPU work at all
+(`busy_frac`), and decode is untouched.
+
+**`busy_per_ktok` is not a valid normalizer here** — it reads −51%, but more
+prompt tokens in an agent loop means more prefix-cache hits, so the denominator
+gets cheaper per token as it grows. Turn-matched wall is the honest comparison.
+
+Same-arm repeat, for the noise floor: a second recurrent-arm run of the same
+task gave gpu_busy 96.995 s / wall 105.261 s / 278892 prompt tokens against
+107.52 / 116.02 / 221067 — **10.8% on time, 26% on prompt tokens**. Group
+totals alone cannot resolve the effect at n=1; the turn-matched pairing can.
+
 ## Bug 2 — `mem_fraction_static: 0.2`, hardcoded
 
 `train_cli.rs` built its `EngineLoadConfig` with a literal `0.2`, which reads
