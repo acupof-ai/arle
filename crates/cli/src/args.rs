@@ -1147,6 +1147,11 @@ pub(crate) struct OpdRuntimeArgs {
     #[arg(long, default_value_t = false, action = clap::ArgAction::Set, value_name = "BOOL")]
     pub(crate) qwen35_decode_graph: bool,
 
+    /// FlashQLA chunked GDN prefill for the in-process rollout engine (mirrors
+    /// serve's flag, same shipped default).
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set, value_name = "BOOL")]
+    pub(crate) qwen35_gdr_chunked: bool,
+
     /// MTP spec-decode draft depth for the in-process rollout engine (mirrors
     /// serve's `--spec-type mtp --mtp-draft-tokens`). None (default) = off.
     #[arg(long, value_name = "N")]

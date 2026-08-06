@@ -3306,6 +3306,7 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
             mtp_draft_tokens: args.runtime.mtp_draft_tokens,
             cuda: infer_api::CudaRuntimeFlags {
                 qwen35_decode_graph: args.runtime.qwen35_decode_graph,
+                qwen35_gdr_chunked: args.runtime.qwen35_gdr_chunked,
                 mempool_retain: args.runtime.cuda_mempool_retain,
                 ..Default::default()
             },
@@ -4782,6 +4783,7 @@ fn load_opd_infer_student(
             // host-launch-bound (~156 ms/token), the OPD step's dominant cost.
             cuda: infer_api::CudaRuntimeFlags {
                 qwen35_decode_graph: runtime.qwen35_decode_graph,
+                qwen35_gdr_chunked: runtime.qwen35_gdr_chunked,
                 ..Default::default()
             },
             ..EngineLoadConfig::single_sequence(max_seq_len)
