@@ -55,18 +55,64 @@ Three defects chain from there:
 
 ## Fix
 
-Not yet written. The shape:
+`5ae88ee44` — **profile once, at construction; re-acquire at the recorded
+size.** Neither candidate from the first analysis was right. Bounding against
+`free` instead of `total × (1 − F)` changes sizing for every caller of
+`profile_kv_pool_tokens`, serve included, which is a default flip needing its
+own perf license. Not re-acquiring at all throws away the release, whose whole
+point is handing that VRAM to the student.
 
-- A co-resident profile should bound against **free**, not against `total × (1
-  − F)` — the reserve exists to leave activation/scratch headroom, and that is
-  a function of the engine's own working set, not of the card.
-- A profile that lands on `PROFILE_KV_TOKENS_FLOOR` must resize the host pool
-  to match, or refuse to resize at all and keep the previous pool.
-- `engine thread closed` is terminal. The rollout loop should abort the round,
-  not spend the remaining task budget on requests that cannot be served.
+The pool size is a decision, not a reading. It belongs to the moment the card
+was in its known-good state:
 
-Interim workaround for measurement: `--task-limit 1`, which finishes the group
-before the second profile is taken.
+- `alloc_full_attn_kv_pool(model, num_slots, pages, kv_format)` extracted — it
+  allocates at an exact page count and does no profiling.
+- `build_full_attn_kv_pool` profiles, then calls it, and returns
+  `(pool, sized_pages)`.
+- `kv_pool_sized_pages` replaces `kv_pool_mem_fraction_static` +
+  `kv_pool_requested_pages`, which existed only to re-profile.
+- `ensure_kv_pool` calls `alloc_full_attn_kv_pool` directly. An allocation that
+  genuinely does not fit now errors, where it used to silently floor.
+
+The host/device page mismatch needed no separate patch — it was downstream of
+the shrink.
+
+`b8d390bf3` fixes an unrelated fatality found while gating this: `list_dumps`
+bailed on a missing dump dir while both callers already treat "no dumps" as a
+skipped conversion. The dir defaults to `./dumps` relative to CWD, so anything
+cleaning the build tree killed a run mid-round.
+
+agent-OPD additionally bails when a group generates 0 completion tokens
+(`5ae88ee44`).
+
+### Gate
+
+The fixed path only runs after `release_kv_pool`, which happens at the LoRA
+sync — so a run that dies mid-round never touches it. The first attempt looked
+clean (0 collapses, 0 engine deaths) and proved nothing: `re-acquired
+full-attn KV pool` appeared **0 times**. The gate below forces the path and
+asserts the size, not the absence of symptoms.
+
+`--task-limit 2 --rounds 2 --samples-per-prompt 2`, `RUST_LOG=info`, own
+`--eval-out-dir`, 1× H20 GPU 6, ThinkingCap-Qwen3.6-27B-FP8:
+
+```
+RUN_EXIT=0
+construction_profile: sizing 19393 pages
+re_acquires: 2
+  re-acquired full-attn KV pool: 19393MB / 19393 pages
+pool_collapsed: 0     engine_closed: 0     mirror_range: 0
+groups=2   ZERO_TOKEN_GROUPS=0
+  round=0 PyCQA__flake8    completion_tok=3150  gpu_busy=72.06  wall=78.31
+  round=0 google__textfsm  completion_tok=2200  gpu_busy=66.84  wall=74.45
+```
+
+Both re-acquires land inside round 0, one per group's sync, so the pool was
+genuinely released and rebuilt rather than short-circuiting on the idempotent
+`full_attn_kv.is_some()` branch. 19393 pages restored against 19393 profiled;
+before the fix the same call site produced the 4096-token floor (256 pages).
+`groups=2` rather than 4 is task selection, not failure: `round 1:
+task-selection ran=0/2 skipped=2` — both tasks were zero-variance in round 0.
 
 ## Rule
 
@@ -75,6 +121,13 @@ long-lived pool re-runs the sizing arithmetic against a card that has changed
 underneath it.** Any sizing formula that mixes a `free` reading with a `total`
 constant will drift as co-tenants grow. Check what else is resident at every
 point the profile runs, not just the first one.
+
+**A gate that only counts absent symptoms passes on code that never ran.** The
+first attempt reported 0 collapses, 0 engine deaths, 0 range errors — every
+symptom of the bug, absent — while `ensure_kv_pool` was called zero times. The
+run died before the round tail, which is the only place the fixed path is
+reachable. Assert the treatment executed and produced the right value (19393
+pages restored against 19393 profiled), never that the failure is missing.
 
 **A warning that names a knob without printing the measurement cannot be acted
 on.** The `KV pool collapsed to the 4096-token floor at mem_fraction_static
