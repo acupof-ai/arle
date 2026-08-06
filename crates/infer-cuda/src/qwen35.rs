@@ -58,8 +58,9 @@ use crate::moe::{
 };
 use crate::moe_config::ExpertSplit;
 use crate::ops::{
-    add_batch, argmax_into, argmax_row_into, copy_row_to_vec, embedding_batch, gemm_batch, gemv, rms_norm_batch, rms_norm_vec,
-    silu_mul_fused, split_qkv, split2, upload_i32, warm_fp8_deepgemm_dense,
+    add_batch, argmax_into, argmax_row_into, copy_row_to_vec, embedding_batch, gemm_batch, gemv,
+    rms_norm_batch, rms_norm_vec, silu_mul_fused, split_qkv, split2, upload_i32,
+    warm_fp8_deepgemm_dense,
 };
 use crate::workspace::{HiddenSlot, SliceSlot, VecSlot};
 
@@ -9084,7 +9085,6 @@ mod tests {
             norm_topk_prob: true,
             mlp_only_layers: vec![],
             full_attn_gated: true,
-            output_gate_type: "sigmoid".to_string(),
         }
     }
 

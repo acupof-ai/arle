@@ -439,7 +439,6 @@ impl Qwen35HfConfig {
             norm_topk_prob: self.norm_topk_prob,
             mlp_only_layers: self.mlp_only_layers.clone(),
             full_attn_gated: true,
-            output_gate_type: "sigmoid".to_string(),
         };
         cfg.validate()?;
         Ok(cfg)
