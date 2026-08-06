@@ -1088,6 +1088,12 @@ pub(crate) struct OpdRuntimeArgs {
     #[arg(long, default_value_t = 2 << 20, value_name = "BYTES")]
     pub(crate) checkpoint_offload_min_bytes: usize,
 
+    /// Reload a host-offloaded checkpoint to device before its backward replay,
+    /// so the recompute forward takes its device path instead of repacking and
+    /// re-uploading host buffers. Costs one resident hidden of VRAM.
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set, value_name = "BOOL")]
+    pub(crate) checkpoint_reload_device: bool,
+
     /// Skip longer update records (0 = unlimited).
     #[arg(long, default_value_t = 23_000, value_name = "TOKENS")]
     pub(crate) max_update_seq: usize,
@@ -1215,6 +1221,7 @@ impl OpdRuntimeArgs {
             max_update_seq: self.max_update_seq,
             autograd: autograd::AutogradRuntimeFlags {
                 checkpoint_offload_min_bytes: self.checkpoint_offload_min_bytes,
+                checkpoint_reload_device: self.checkpoint_reload_device,
                 lora_linear_bwd_tile_rows: self.lora_linear_bwd_tile_rows,
                 moe_lora_bwd_expert_tile: self.moe_lora_bwd_expert_tile,
                 gdr_chunkwise_prefill: self.gdr_chunkwise_prefill,
