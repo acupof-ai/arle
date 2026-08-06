@@ -1090,8 +1090,8 @@ pub(crate) struct OpdRuntimeArgs {
 
     /// Reload a host-offloaded checkpoint to device before its backward replay,
     /// so the recompute forward takes its device path instead of repacking and
-    /// re-uploading host buffers. Costs one resident hidden of VRAM.
-    #[arg(long, default_value_t = false, action = clap::ArgAction::Set, value_name = "BOOL")]
+    /// re-uploading host buffers.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set, value_name = "BOOL")]
     pub(crate) checkpoint_reload_device: bool,
 
     /// Pinned-host budget for parked checkpoint activations (0 = off, pageable
