@@ -617,8 +617,17 @@ mod backend {
     impl LoadedInferenceEngine {
         /// Load the inference engine for the compiled backend.
         /// `enable_cuda_graph` is honored by the CUDA path only.
+        ///
+        /// Single-user load (REPL, OCR): caps slots at 1 so the GDR recurrent
+        /// state doesn't reserve `num_slots`× per-slot bytes (12 GiB for a 9B
+        /// model at the default 256 slots). Multi-request serving uses
+        /// `load_with_config` with the serve-derived slot budget.
         pub fn load(model_path: &str, enable_cuda_graph: bool) -> Result<Self> {
-            Self::load_with_config(model_path, enable_cuda_graph, EngineLoadConfig::default())
+            let config = EngineLoadConfig {
+                max_running_requests: Some(1),
+                ..EngineLoadConfig::default()
+            };
+            Self::load_with_config(model_path, enable_cuda_graph, config)
         }
 
         /// Load with explicit slot / page configuration.
