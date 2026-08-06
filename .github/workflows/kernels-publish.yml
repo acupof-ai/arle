@@ -86,17 +86,9 @@ jobs:
           cuda: '12.8.0'
           method: network
 
-      - name: Install TileLang stack (pinned set + carried tvm-ffi patch)
+      - name: Install TileLang stack (vanilla tvm-ffi, no patch needed)
         run: |
           pip install --no-cache-dir -r requirements-build.txt
-          pin="$(grep -oE 'apache-tvm-ffi==[0-9.]+' requirements-build.txt | cut -d= -f3)"
-          pip download --no-deps --no-binary :all: -d /tmp/ffi "apache-tvm-ffi==$pin"
-          tar -xzf /tmp/ffi/apache*tvm*ffi-*.tar.gz -C /tmp/ffi
-          patch -p1 -d /tmp/ffi/apache*tvm*ffi-*/ \
-            < crates/cuda-kernels/tools/tilelang/patches/tvm-ffi-legacy-tvm-compat.patch
-          pip install --no-cache-dir "cython>=3.1.0" scikit-build-core setuptools-scm ninja cmake
-          pip wheel --no-deps --no-build-isolation -w /tmp/ffi /tmp/ffi/apache*tvm*ffi-*/
-          pip install --force-reinstall --no-deps /tmp/ffi/apache*tvm*ffi-*.whl
           python -c "import tilelang; print('tilelang OK', tilelang.__version__)"
 
       - name: Regenerate T1 kernel set (sm_80/86/89/90)

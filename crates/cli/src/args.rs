@@ -2537,7 +2537,14 @@ mod tests {
     #[cfg(feature = "cuda")]
     #[test]
     fn serve_defaults_match_the_seam_defaults() {
-        let serve = super::ServeArgs::parse_from(["arle-serve"]).cuda_runtime_flags();
+        // `ServeArgs` is a `clap::Args` group, not a `Parser` — build a bare
+        // command around it to get the defaults clap would apply.
+        let cmd = <super::ServeArgs as clap::Args>::augment_args(clap::Command::new("serve"));
+        let serve = <super::ServeArgs as clap::FromArgMatches>::from_arg_matches(
+            &cmd.get_matches_from(["serve"]),
+        )
+        .expect("ServeArgs defaults parse")
+        .cuda_runtime_flags();
         assert!(serve.dsv4_decode_reuse, "licensed on serve only");
         assert_eq!(serve.comm_backend, infer_api::CommBackend::Nccl);
         let rest = infer_api::CudaRuntimeFlags {
