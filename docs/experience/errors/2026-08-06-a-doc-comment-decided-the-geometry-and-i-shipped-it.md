@@ -70,9 +70,7 @@ convention from how they were *used* one layer up.
 **When queries and keys are indexed by the same offset, an off-by-one in the
 base is unobservable by construction.** Nothing but content can distinguish
 it, so the gate must be a content perturbation with a positive control — bump
-`taps[a-1]` and require movement, bump `taps[a..]` and require none. A test
-that reproduces the formula under test cannot discriminate, no matter which
-source it was transcribed from.
+`taps[a-1]` and require movement, bump `taps[a..]` and require none.
 
 **Give a refuter the question, not the claim.** "Is this finding real?"
 inherits the finding's premise. "Where does the anchor sit, and what proves

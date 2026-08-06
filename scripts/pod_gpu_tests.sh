@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
 # Detached launcher for GPU test targets. `pod.sh build` validates its argv down
-# to `cargo build --release --features … --bin <name>`, so nothing in the repo
-# could run `cargo test --features cuda` — which is why the autograd and
-# spec-train suites had never executed a CUDA backward. Mirrors pod_parity.sh:
-# same build env, same re-attachable marker.
+# to `cargo build --release --features … --bin <name>`, so it cannot run
+# `cargo test --features cuda`. Mirrors pod_parity.sh: same build env, same
+# re-attachable marker.
 #   pod_gpu_tests.sh run <label> <devices> -- <cargo test argv...>
 set -uo pipefail
 TREE=/host/arle-build
