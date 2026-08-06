@@ -348,9 +348,9 @@ impl Trainer {
             tape,
         )?;
 
-        // Row `t` predicts `anchor+1+t`, so the trunk hidden whose logits are
-        // that prediction sits one index earlier than the row's RoPE position.
-        let aligned: Vec<f32> = block::target_hidden_positions(blocks)
+        // Hidden `p` predicts token `p+1`, and row `t` at RoPE `anchor+t` targets
+        // `anchor+1+t`, so the supervising hidden is the row's own position.
+        let aligned: Vec<f32> = block::draft_positions(blocks)
             .into_iter()
             .flat_map(|p| ctx.last_hidden[p.min(ctx.seq - 1) * hidden..][..hidden].to_vec())
             .collect();

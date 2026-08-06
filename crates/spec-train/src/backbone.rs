@@ -811,12 +811,13 @@ mod tests {
         loss
     }
 
-    /// The serve hands the draft the conditioning token's own tap and nothing
-    /// after it (`qwen35/dspark.rs`: the ctx ring runs to `start = anchor+1`
-    /// exclusive). Training either way round is invisible to every shape and
-    /// index assertion — only the content of one key differs.
+    /// The serve's ctx ring stops strictly below the anchor: `last_token` has not
+    /// been forwarded when the draft runs, so its tap does not exist yet
+    /// (`executor/qwen35.rs` appends it after the verify). Reaching `taps[anchor]`
+    /// is invisible to every shape and index assertion — only one key's content
+    /// differs — and it is the residual row 0's own target is projected from.
     #[test]
-    fn a_block_sees_its_anchor_tap_and_nothing_after_it() {
+    fn a_block_is_blind_from_its_anchor_onward() {
         let (ctx_len, row) = (12, 2 * HIDDEN);
         let taps = noise(ctx_len * row, 7, 1.0);
         let base = run(&taps, ctx_len, &[4, 9]);
@@ -836,20 +837,20 @@ mod tests {
                 .fold(0.0, f32::max)
         };
 
-        let at_anchor = bump(9, 10);
+        let before_9 = bump(8, 9);
         assert!(
-            moved(&base[block..], &at_anchor[block..]) > 1e-4,
-            "anchor-9 block cannot reach taps[9]"
+            moved(&base[block..], &before_9[block..]) > 1e-4,
+            "positive control: anchor-9 block must reach taps[8]"
         );
-        let past_4 = bump(5, ctx_len);
+        let from_9 = bump(9, ctx_len);
         assert!(
-            moved(&base[..block], &past_4[..block]) < 1e-5,
-            "anchor-4 block reaches past its anchor"
+            moved(&base[block..], &from_9[block..]) < 1e-5,
+            "anchor-9 block reaches taps[9] or beyond"
         );
-        let past_9 = bump(10, ctx_len);
+        let from_4 = bump(4, ctx_len);
         assert!(
-            moved(&base[block..], &past_9[block..]) < 1e-5,
-            "anchor-9 block reaches past its anchor"
+            moved(&base[..block], &from_4[..block]) < 1e-5,
+            "anchor-4 block reaches taps[4] or beyond"
         );
     }
 
