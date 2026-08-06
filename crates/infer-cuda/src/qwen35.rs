@@ -7108,10 +7108,9 @@ impl Qwen35Model {
                 // the varlen kernels' `s * len` stride, so the whole batch is
                 // one conv + one GDR launch. The per-row loop below is B times
                 // the launches for the same work.
-                let uniform = rs
-                    .first()
-                    .map(|r| r.len)
-                    .filter(|len| *len <= LINEAR_BATCH_MAX_LEN && rs.iter().all(|r| r.len == *len));
+                let uniform = rs.first().map(|r| r.len).filter(|len| {
+                    (1..=LINEAR_BATCH_MAX_LEN).contains(len) && rs.iter().all(|r| r.len == *len)
+                });
                 if let (Some(len), true) = (uniform, rs.len() > 1) {
                     self.advance_linear_conv_gdr_batched(
                         attn,
