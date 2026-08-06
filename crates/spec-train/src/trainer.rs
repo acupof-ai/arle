@@ -519,6 +519,10 @@ mod tests {
     /// The gate the tiny-shape tests cannot be: the reference recipe at its
     /// real dimensions must fit beside a resident 27B trunk. Without chunking
     /// the same arithmetic gives ~110 GiB.
+    ///
+    /// The hand count is what makes it a gate. A GiB bound loose enough to be
+    /// stable is far wider than a whole dropped term, so the byte total is
+    /// re-derived here from the op inventory instead.
     #[test]
     fn the_reference_recipe_fits_in_vram() {
         let mut c = cfg();
@@ -529,7 +533,35 @@ mod tests {
         c.block_size = 7;
         let gib = |b: usize| b as f64 / (1 << 30) as f64;
 
+        // Counted off `backbone::forward` and `loss::dspark_loss`, one output
+        // per op, at rows = 32·7 = 224, kv = 4096 + 224 = 4320, head width
+        // 32·128 = 4096 and kv width 1·128 = 128 (`cfg()`'s single kv head).
+        let per_layer = 4 * 32 * 224 * 4320    // scores: matmul, scale, mask, softmax
+            + 10 * 224 * 4096                  // q: proj, 4× head_norm, rope, q3, 3 attn outputs
+            + 7 * 4320 * 4096                  // post-`repeat_kv`: expand + reshape ×2, k3, v3, kᵀ
+            + 13 * 4320 * 128                  // pre-`repeat_kv` k and v, projections through its input
+            + 6 * 224 * 5120                   // residual: 2 norms, 2 projections, 2 adds
+            + 4 * 224 * 16; // MLP at `cfg()`'s intermediate_size
+        let context = 4096 * 2 * 5120          // tap upload, 2 tapped layers
+            + 2 * 4096 * 5120                  // the `fc` GEMM and its norm
+            + (4320 + 224) * 128               // rope cos/sin over the kv sequence, then the queries
+            + 224 * 4320; // dense additive mask
+        let head = 10 * 224 * 248_320          // draft logits, markov bias and add, trunk logits,
+            //   log_softmax, both softmaxes, negate, diff, abs
+            + 5 * 224 * 5120; // embedding, its reshape, final norm, aligned trunk hidden, conf input
+        let derived = 4 * (per_layer * 5 + context + head);
+        assert_eq!(
+            derived, 8_009_330_688,
+            "the term-by-term count changed — re-derive it before trusting the formula"
+        );
+
         let chunked = peak_activation_bytes(&c, 32, 4096, 248_320);
+        assert_eq!(
+            chunked,
+            derived,
+            "the formula and the op inventory disagree by {} B",
+            chunked as i64 - derived as i64
+        );
         assert!(gib(chunked) < 8.0, "chunked peak {:.1} GiB", gib(chunked));
 
         let whole = peak_activation_bytes(&c, 512, 4096, 248_320);
@@ -689,5 +721,59 @@ mod tests {
             first.mean_accept
         );
         assert!(first.grad_norm > 0.0 && first.counted == 2 && first.chunks == 2);
+    }
+
+    /// The control [`the_loop_reduces_the_loss`] needs: a falling loss says
+    /// nothing until the same loop with nothing learned is known to be flat.
+    ///
+    /// Anchors are resampled per step from `seed + step·batch + i`, so
+    /// `num_anchors` is set to the fixture's whole candidate set —
+    /// `sample_anchors` then returns all of it whatever the seed, and a moving
+    /// parameter is the only thing left that could move the loss.
+    #[test]
+    fn the_loss_does_not_move_at_lr_zero() {
+        let samples: Vec<Sample> = (0..2).map(sample).collect();
+        let (mut store, mut trainer) = setup(Config {
+            lr: 0.0,
+            weight_decay: 0.0,
+            warmup_ratio: 0.0,
+            num_anchors: block::anchor_candidates(&samples[0].loss_mask).len(),
+            ..Config::default()
+        });
+        let mut tape = Tape::new();
+        let snapshot = |t: &Trainer, s: &mut TensorStore| -> Vec<Vec<f32>> {
+            t.params.iter().map(|&p| s.to_host(p).unwrap()).collect()
+        };
+
+        let before = snapshot(&trainer, &mut store);
+        let first = trainer
+            .train_step(&samples, &mut FakeTarget, &mut store, &mut tape)
+            .unwrap();
+        let mut last = first;
+        for _ in 0..9 {
+            last = trainer
+                .train_step(&samples, &mut FakeTarget, &mut store, &mut tape)
+                .unwrap();
+        }
+
+        assert_eq!(first.lr, 0.0, "the schedule handed the optimizer an lr");
+        assert!(
+            first.grad_norm > 0.0,
+            "no gradient reached the optimizer — nothing was held back and the \
+             control is vacuous"
+        );
+        assert!(
+            (last.loss - first.loss).abs() <= f32::EPSILON * first.loss.abs(),
+            "the loss moved with nothing learned: {} -> {}",
+            first.loss,
+            last.loss
+        );
+        for (i, (a, b)) in before
+            .iter()
+            .zip(&snapshot(&trainer, &mut store))
+            .enumerate()
+        {
+            assert_eq!(a, b, "parameter {i} moved after 10 steps at lr = 0");
+        }
     }
 }

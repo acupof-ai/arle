@@ -2350,3 +2350,311 @@ fn cuda_ring_block_matches_host_reference_fwd_bwd() {
     check("grad_k", &dev_gk, &host_gk);
     check("grad_v", &dev_gv, &host_gv);
 }
+
+// === DSpark draft-forward parity: the three ops `spec-train` runs that no ===
+// === CUDA gate above reaches. Shapes are the reference recipe in         ===
+// === `spec_train::trainer` (ctx 4096, 32 blocks x block_size 7 = 224     ===
+// === draft rows, 32 query heads over 8 kv heads at head_dim 128) — the   ===
+// === rank arms and the cuBLAS tiling both key off size, so a toy shape   ===
+// === would exercise a different path than the trainer's.                 ===
+
+const DRAFT_CTX: usize = 4096;
+const DRAFT_ROWS: usize = 224;
+const DRAFT_KV: usize = DRAFT_CTX + DRAFT_ROWS;
+const DRAFT_Q_HEADS: usize = 32;
+const DRAFT_KV_HEADS: usize = 8;
+const DRAFT_HEAD_DIM: usize = 128;
+const DRAFT_N_REP: usize = DRAFT_Q_HEADS / DRAFT_KV_HEADS;
+
+/// Rank-3 `matmul` forward and `matmul_backward_device`, on the two batched
+/// products in `spec-train::backbone::forward`: `q3 @ k3^T` (attention scores)
+/// and `softmax(scores) @ v3`. The CUDA backend keeps a separate `(3, 3)` arm
+/// with its own `stride_a` / `stride_b` / `stride_c` arithmetic; only the
+/// `(2, 2)` arm is gated above. The two cases are m/n/k transposes of each
+/// other, so a swapped batch stride cannot survive both.
+#[test]
+fn cuda_rank3_matmul_and_backward_match_cpu_on_draft_attention() {
+    let Ok(backend) = CudaBackend::new(0) else {
+        eprintln!(
+            "skipping cuda_rank3_matmul_and_backward_match_cpu_on_draft_attention: no CUDA device"
+        );
+        return;
+    };
+    let cpu = CpuBackend;
+
+    let cases = [
+        (
+            [DRAFT_Q_HEADS, DRAFT_ROWS, DRAFT_HEAD_DIM],
+            [DRAFT_Q_HEADS, DRAFT_HEAD_DIM, DRAFT_KV],
+        ),
+        (
+            [DRAFT_Q_HEADS, DRAFT_ROWS, DRAFT_KV],
+            [DRAFT_Q_HEADS, DRAFT_KV, DRAFT_HEAD_DIM],
+        ),
+    ];
+
+    for (case, (a_shape, b_shape)) in cases.into_iter().enumerate() {
+        let seed = 0xD5A4_0000 + case as u64 * 0x100;
+        // Bounded at 0.25: the K=4320 reduction random-walks, and this keeps
+        // the cuBLAS-vs-`matmul_a_bt_into` rounding under the 1e-4 floor.
+        let a = rng_vec(seed + 1, a_shape.iter().product(), 0.25);
+        let b = rng_vec(seed + 2, b_shape.iter().product(), 0.25);
+
+        let a_cpu = cpu.upload(&a, &a_shape).expect("cpu upload a");
+        let b_cpu = cpu.upload(&b, &b_shape).expect("cpu upload b");
+        let (host_out_h, out_shape) = cpu
+            .matmul(&a_cpu, &a_shape, &b_cpu, &b_shape)
+            .expect("cpu rank-3 matmul");
+        let host_out = cpu.readback(&host_out_h).expect("cpu rank-3 out readback");
+
+        let a_h: DeviceHandle = backend.upload(&a, &a_shape).expect("upload a");
+        let b_h: DeviceHandle = backend.upload(&b, &b_shape).expect("upload b");
+        let (out_h, dev_shape) = backend
+            .matmul(&a_h, &a_shape, &b_h, &b_shape)
+            .expect("cuda rank-3 matmul");
+        assert_eq!(dev_shape, out_shape, "rank-3 matmul case {case} shape");
+        backend.eval(&[&out_h]).expect("cuda eval");
+        let dev_out = backend.readback(&out_h).expect("rank-3 matmul readback");
+
+        let (excess, abs, idx) = max_err_with_tol(&dev_out, &host_out, 1e-4, 1e-4);
+        assert!(
+            excess <= 1.0,
+            "rank-3 matmul case {case} exceeds atol=1e-4 + rtol=1e-4 at idx {idx} \
+             (|diff|={abs}, dev={}, host={}, excess_ratio={excess})",
+            dev_out[idx],
+            host_out[idx]
+        );
+
+        let g = rng_vec(seed + 3, out_shape.iter().product(), 0.25);
+        let g_cpu = cpu.upload(&g, &out_shape).expect("cpu upload grad_out");
+        let (host_ga_h, host_gb_h) = cpu
+            .matmul_backward_device(
+                &a_cpu, &a_shape, &b_cpu, &b_shape, &g_cpu, &out_shape, true, true,
+            )
+            .expect("cpu rank-3 matmul_backward_device");
+        let host_ga = cpu
+            .readback(&host_ga_h.expect("cpu need_grad_a -> Some"))
+            .expect("cpu grad_a readback");
+        let host_gb = cpu
+            .readback(&host_gb_h.expect("cpu need_grad_b -> Some"))
+            .expect("cpu grad_b readback");
+
+        let g_h: DeviceHandle = backend.upload(&g, &out_shape).expect("upload grad_out");
+        let (ga_h, gb_h) = backend
+            .matmul_backward_device(&a_h, &a_shape, &b_h, &b_shape, &g_h, &out_shape, true, true)
+            .expect("cuda rank-3 matmul_backward_device");
+        let ga_h = ga_h.expect("need_grad_a -> Some");
+        let gb_h = gb_h.expect("need_grad_b -> Some");
+        backend.eval(&[&ga_h, &gb_h]).expect("cuda eval");
+        let dev_ga = backend.readback(&ga_h).expect("grad_a readback");
+        let dev_gb = backend.readback(&gb_h).expect("grad_b readback");
+
+        for (name, dev, host) in [("grad_a", &dev_ga, &host_ga), ("grad_b", &dev_gb, &host_gb)] {
+            assert_eq!(dev.len(), host.len(), "rank-3 {name} case {case} length");
+            let (excess, abs, idx) = max_err_with_tol(dev, host, 1e-4, 1e-4);
+            assert!(
+                excess <= 1.0,
+                "rank-3 matmul_backward_device {name} case {case} exceeds \
+                 atol=1e-4 + rtol=1e-4 at idx {idx} \
+                 (|diff|={abs}, dev={}, host={}, excess_ratio={excess})",
+                dev[idx],
+                host[idx]
+            );
+        }
+    }
+}
+
+/// `Backend::concat` on axis 0 and axis 1, plus the `Backend::slice` that
+/// `ops::layout::cat_backward` is built from. Axis 0 joins the trunk context
+/// K/V with the draft rows (`backbone::cat_ctx_draft`); axis 1 builds the BCE
+/// `[z, 0]` pair (`spec-train::loss`). The concat gate above exercises
+/// `concat_axis2`, a different trait method — a wrong axis-0 offset here mixes
+/// context rows into the draft rows and the loss still falls.
+#[test]
+fn cuda_concat_axis0_axis1_and_slice_backward_match_cpu() {
+    let Ok(backend) = CudaBackend::new(0) else {
+        eprintln!("skipping cuda_concat_axis0_axis1_and_slice_backward_match_cpu: no CUDA device");
+        return;
+    };
+    let cpu = CpuBackend;
+
+    let kv_dim = DRAFT_KV_HEADS * DRAFT_HEAD_DIM;
+    let cases: [(usize, [Vec<usize>; 2]); 2] = [
+        (0, [vec![DRAFT_CTX, kv_dim], vec![DRAFT_ROWS, kv_dim]]),
+        (1, [vec![DRAFT_ROWS, 1], vec![DRAFT_ROWS, 1]]),
+    ];
+
+    for (case, (axis, part_shapes)) in cases.into_iter().enumerate() {
+        let seed = 0xC0A7_0000 + case as u64 * 0x100;
+        // Distinct seeds per part: identical parts would hide a bad offset.
+        let parts: Vec<Vec<f32>> = part_shapes
+            .iter()
+            .enumerate()
+            .map(|(i, s)| rng_vec(seed + 1 + i as u64, s.iter().product(), 1.0))
+            .collect();
+
+        let cpu_handles: Vec<DeviceHandle> = parts
+            .iter()
+            .zip(part_shapes.iter())
+            .map(|(data, s)| cpu.upload(data, s).expect("cpu upload part"))
+            .collect();
+        let cpu_parts: Vec<(&DeviceHandle, &[usize])> = cpu_handles
+            .iter()
+            .zip(part_shapes.iter())
+            .map(|(h, s)| (h, s.as_slice()))
+            .collect();
+        let (host_cat_h, out_shape) = cpu.concat(&cpu_parts, axis).expect("cpu concat");
+        let host_cat = cpu.readback(&host_cat_h).expect("cpu concat readback");
+
+        let dev_handles: Vec<DeviceHandle> = parts
+            .iter()
+            .zip(part_shapes.iter())
+            .map(|(data, s)| backend.upload(data, s).expect("upload part"))
+            .collect();
+        let dev_parts: Vec<(&DeviceHandle, &[usize])> = dev_handles
+            .iter()
+            .zip(part_shapes.iter())
+            .map(|(h, s)| (h, s.as_slice()))
+            .collect();
+        let (cat_h, dev_shape) = backend.concat(&dev_parts, axis).expect("cuda concat");
+        assert_eq!(dev_shape, out_shape, "concat axis {axis} output shape");
+        backend.eval(&[&cat_h]).expect("cuda eval concat");
+        let dev_cat = backend.readback(&cat_h).expect("concat readback");
+
+        let (excess, abs, idx) = max_err(&dev_cat, &host_cat);
+        assert!(
+            excess <= 1.0,
+            "concat axis {axis} exceeds atol=1e-6 + rtol=1e-4 at idx {idx} \
+             (|diff|={abs}, dev={}, host={}, excess_ratio={excess})",
+            dev_cat[idx],
+            host_cat[idx]
+        );
+
+        // Backward: `cat_backward` slices the upstream at each part's axis
+        // range. Use a fresh upstream so the offsets are checked against data
+        // the forward never wrote.
+        let upstream = rng_vec(seed + 0x10, out_shape.iter().product(), 1.0);
+        let up_cpu = cpu
+            .upload(&upstream, &out_shape)
+            .expect("cpu upload upstream");
+        let up_h: DeviceHandle = backend
+            .upload(&upstream, &out_shape)
+            .expect("upload upstream");
+
+        let mut offset = 0_usize;
+        for (part, s) in part_shapes.iter().enumerate() {
+            let mut starts = vec![0_usize; out_shape.len()];
+            let mut ends = out_shape.clone();
+            starts[axis] = offset;
+            ends[axis] = offset + s[axis];
+            offset += s[axis];
+
+            let host_grad_h = cpu
+                .slice(&up_cpu, &out_shape, &starts, &ends)
+                .expect("cpu slice");
+            let host_grad = cpu.readback(&host_grad_h).expect("cpu slice readback");
+            let grad_h = backend
+                .slice(&up_h, &out_shape, &starts, &ends)
+                .expect("cuda slice");
+            backend.eval(&[&grad_h]).expect("cuda eval slice");
+            let dev_grad = backend.readback(&grad_h).expect("slice readback");
+
+            assert_eq!(
+                dev_grad.len(),
+                s.iter().product::<usize>(),
+                "cat backward axis {axis} part {part} grad length"
+            );
+            let (excess, abs, idx) = max_err(&dev_grad, &host_grad);
+            assert!(
+                excess <= 1.0,
+                "cat backward slice axis {axis} part {part} exceeds \
+                 atol=1e-6 + rtol=1e-4 at idx {idx} \
+                 (|diff|={abs}, dev={}, host={}, excess_ratio={excess})",
+                dev_grad[idx],
+                host_grad[idx]
+            );
+        }
+    }
+}
+
+/// Rank-5 `broadcast_expand` — `ops::repeat_kv` at the shipped GQA ratio (32
+/// query heads over 8 kv heads, n_rep=4) — and the sum-reduce its tape entry
+/// records, `add_broadcast_backward_device`. The reduced axis sits in the
+/// middle of a rank-5 shape; the `add_broadcast_backward_device` gate above
+/// reduces a trailing axis of a rank-3 shape, which cannot catch a
+/// mis-ordered stride here.
+#[test]
+fn cuda_rank5_broadcast_expand_and_backward_match_cpu() {
+    let Ok(backend) = CudaBackend::new(0) else {
+        eprintln!("skipping cuda_rank5_broadcast_expand_and_backward_match_cpu: no CUDA device");
+        return;
+    };
+    let cpu = CpuBackend;
+
+    let src_shape = vec![1, DRAFT_KV_HEADS, 1, DRAFT_KV, DRAFT_HEAD_DIM];
+    let target_shape = vec![1, DRAFT_KV_HEADS, DRAFT_N_REP, DRAFT_KV, DRAFT_HEAD_DIM];
+
+    let src = rng_vec(0x9EA7_0001, src_shape.iter().product(), 1.0);
+    let src_cpu = cpu.upload(&src, &src_shape).expect("cpu upload src");
+    let host_out_h = cpu
+        .broadcast_expand(&src_cpu, &src_shape, &target_shape)
+        .expect("cpu broadcast_expand");
+    let host_out = cpu
+        .readback(&host_out_h)
+        .expect("cpu broadcast_expand readback");
+
+    let src_h: DeviceHandle = backend.upload(&src, &src_shape).expect("upload src");
+    let out_h = backend
+        .broadcast_expand(&src_h, &src_shape, &target_shape)
+        .expect("cuda broadcast_expand");
+    backend.eval(&[&out_h]).expect("cuda eval");
+    let dev_out = backend.readback(&out_h).expect("broadcast_expand readback");
+
+    assert_eq!(
+        dev_out.len(),
+        host_out.len(),
+        "rank-5 broadcast_expand length"
+    );
+    let (excess, abs, idx) = max_err(&dev_out, &host_out);
+    assert!(
+        excess <= 1.0,
+        "rank-5 broadcast_expand exceeds atol=1e-6 + rtol=1e-4 at idx {idx} \
+         (|diff|={abs}, dev={}, host={}, excess_ratio={excess})",
+        dev_out[idx],
+        host_out[idx]
+    );
+
+    let upstream = rng_vec(0x9EA7_0002, target_shape.iter().product(), 1.0);
+    let up_cpu = cpu
+        .upload(&upstream, &target_shape)
+        .expect("cpu upload upstream");
+    let host_grad_h = cpu
+        .add_broadcast_backward_device(&up_cpu, &target_shape, &src_shape)
+        .expect("cpu add_broadcast_backward_device");
+    let host_grad = cpu.readback(&host_grad_h).expect("cpu grad readback");
+
+    let up_h: DeviceHandle = backend
+        .upload(&upstream, &target_shape)
+        .expect("upload upstream");
+    let grad_h = backend
+        .add_broadcast_backward_device(&up_h, &target_shape, &src_shape)
+        .expect("cuda add_broadcast_backward_device");
+    backend.eval(&[&grad_h]).expect("cuda eval");
+    let dev_grad = backend
+        .readback(&grad_h)
+        .expect("broadcast_expand grad readback");
+
+    assert_eq!(
+        dev_grad.len(),
+        src.len(),
+        "rank-5 broadcast_expand grad length"
+    );
+    let (excess, abs, idx) = max_err(&dev_grad, &host_grad);
+    assert!(
+        excess <= 1.0,
+        "rank-5 broadcast_expand backward exceeds atol=1e-6 + rtol=1e-4 at idx {idx} \
+         (|diff|={abs}, dev={}, host={}, excess_ratio={excess})",
+        dev_grad[idx],
+        host_grad[idx]
+    );
+}
