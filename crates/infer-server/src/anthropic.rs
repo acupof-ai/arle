@@ -52,6 +52,27 @@ pub(crate) struct MessagesRequest {
     pub top_p: Option<f32>,
     #[serde(default)]
     pub top_k: Option<i32>,
+    /// `{"type":"enabled","budget_tokens":N}` or `{"type":"disabled"}`. Maps to
+    /// the internal `enable_thinking` chat-template kwarg; `budget_tokens` is
+    /// not enforced (the server's `max_thinking_tokens` caps it).
+    #[serde(default)]
+    pub thinking: Option<ThinkingConfig>,
+    /// End-user metadata. Accepted but not echoed (the engine has no storage).
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub metadata: Option<Value>,
+}
+
+/// Anthropic `thinking` request parameter.
+#[derive(Debug, Deserialize)]
+pub(crate) struct ThinkingConfig {
+    #[serde(rename = "type")]
+    pub kind: String,
+    /// Thinking token budget. Accepted but not enforced (the server's
+    /// `max_thinking_tokens` caps it).
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub budget_tokens: Option<usize>,
 }
 
 /// `system` is a plain string or a list of text blocks.
@@ -235,10 +256,26 @@ impl MessagesRequest {
             stream: self.stream,
             stream_options: None,
             stop: (!self.stop_sequences.is_empty()).then(|| self.stop_sequences.clone()),
-            chat_template_kwargs: None,
+            chat_template_kwargs: self.thinking.as_ref().map(|thinking| {
+                let mut kwargs = serde_json::Map::new();
+                kwargs.insert(
+                    "enable_thinking".to_string(),
+                    serde_json::Value::Bool(thinking.kind != "disabled"),
+                );
+                kwargs
+            }),
             tools: self.tools.iter().map(to_openai_tool).collect(),
             response_format: None,
             tool_choice: self.tool_choice.as_ref().map(to_openai_tool_choice),
+            n: None,
+            logprobs: None,
+            top_logprobs: None,
+            logit_bias: None,
+            user: None,
+            parallel_tool_calls: None,
+            service_tier: None,
+            store: None,
+            metadata: None,
         }
     }
 }
@@ -371,6 +408,10 @@ pub(crate) enum ResponseBlock {
         name: String,
         input: Value,
     },
+    /// Anthropic `thinking` block — carries the model's reasoning content.
+    /// Emitted before the `text` block, matching the API spec.
+    #[serde(rename = "thinking")]
+    Thinking { thinking: String },
 }
 
 #[derive(Debug, Serialize)]
@@ -399,6 +440,15 @@ impl MessagesResponse {
     pub(crate) fn from_chat(chat: &ChatCompletionResponse) -> Self {
         let choice = &chat.choices[0];
         let mut content = Vec::new();
+        // Thinking block first (Anthropic convention), when the model produced
+        // reasoning content and the request enabled thinking.
+        if let Some(reasoning) = choice.message.reasoning_content.as_ref()
+            && !reasoning.trim().is_empty()
+        {
+            content.push(ResponseBlock::Thinking {
+                thinking: reasoning.clone(),
+            });
+        }
         // Whitespace-only text never becomes a block (the stream encoder's
         // held-whitespace rule — keep the two paths converged).
         if !choice.message.content.trim().is_empty() {
@@ -490,6 +540,8 @@ pub(crate) struct StreamEncoder {
     next_index: usize,
     /// Index of the currently-open text block, if any.
     text_index: Option<usize>,
+    /// Index of the currently-open thinking block, if any.
+    thinking_index: Option<usize>,
     /// Whitespace held back while NO text block is open: emitted only if
     /// non-whitespace text follows, dropped at block/message boundaries — so a
     /// stray newline around a tool call never opens a whitespace-only text
@@ -504,6 +556,7 @@ impl StreamEncoder {
             model,
             next_index: 0,
             text_index: None,
+            thinking_index: None,
             pending_ws: String::new(),
         }
     }
@@ -579,6 +632,52 @@ impl StreamEncoder {
         out
     }
 
+    /// Emit a thinking delta, opening a thinking content block first if none is
+    /// open. Thinking blocks always precede text blocks (Anthropic convention).
+    pub(crate) fn thinking_delta(&mut self, text: &str) -> String {
+        if text.is_empty() {
+            return String::new();
+        }
+        let mut out = String::new();
+        let index = match self.thinking_index {
+            Some(index) => index,
+            None => {
+                let index = self.next_index;
+                self.next_index += 1;
+                self.thinking_index = Some(index);
+                out.push_str(&frame(
+                    "content_block_start",
+                    &json!({
+                        "type": "content_block_start",
+                        "index": index,
+                        "content_block": {"type": "thinking", "thinking": ""},
+                    }),
+                ));
+                index
+            }
+        };
+        out.push_str(&frame(
+            "content_block_delta",
+            &json!({
+                "type": "content_block_delta",
+                "index": index,
+                "delta": {"type": "thinking_delta", "thinking": text},
+            }),
+        ));
+        out
+    }
+
+    fn close_thinking(&mut self) -> String {
+        self.thinking_index
+            .take()
+            .map_or_else(String::new, |index| {
+                frame(
+                    "content_block_stop",
+                    &json!({"type": "content_block_stop", "index": index}),
+                )
+            })
+    }
+
     fn close_text(&mut self) -> String {
         // Held whitespace never materialized into a block — drop it at the
         // boundary so it can't leak into a later block.
@@ -597,7 +696,8 @@ impl StreamEncoder {
     /// the non-streaming envelope builds.
     pub(crate) fn tool_use(&mut self, name: &str, arguments: &Value) -> String {
         let arguments_json = input_from_value(arguments).to_string();
-        let mut out = self.close_text();
+        let mut out = self.close_thinking();
+        out.push_str(&self.close_text());
         let index = self.next_index;
         self.next_index += 1;
         out.push_str(&frame(
@@ -630,7 +730,8 @@ impl StreamEncoder {
 
     /// Close any open block and terminate: `message_delta` + `message_stop`.
     pub(crate) fn finish(&mut self, stop_reason: &str, output_tokens: usize) -> String {
-        let mut out = self.close_text();
+        let mut out = self.close_thinking();
+        out.push_str(&self.close_text());
         out.push_str(&frame(
             "message_delta",
             &json!({

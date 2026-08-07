@@ -67,11 +67,38 @@ pub(crate) fn stream_usage_chunk(
     })
 }
 
+/// OpenAI streaming error chunk: a `data:` frame carrying `{"error": {...}}`
+/// (no `choices`). The error `type` follows the HTTP-status mapping
+/// (`api_error` for 5xx, `invalid_request_error` for 4xx). Sent once,
+/// immediately before `[DONE]`.
+pub(crate) fn stream_error_chunk(
+    id: &str,
+    created: u64,
+    model: &str,
+    message: &str,
+) -> serde_json::Value {
+    json!({
+        "id": id,
+        "object": "error",
+        "created": created,
+        "model": model,
+        "error": {
+            "message": message,
+            "type": "api_error",
+            "param": null,
+            "code": null
+        },
+        "system_fingerprint": SYSTEM_FINGERPRINT,
+    })
+}
+
 pub(crate) fn finish_reason(reason: Option<&FinishReason>) -> &'static str {
     match reason {
         Some(FinishReason::Stop) => "stop",
         Some(FinishReason::Length) | None => "length",
-        Some(FinishReason::Abort) => "abort",
+        // OpenAI has no `abort` finish reason; map to `stop` (generation was
+        // terminated) so strict OpenAI clients don't choke on an unknown value.
+        Some(FinishReason::Abort) => "stop",
     }
 }
 
@@ -233,6 +260,10 @@ pub(crate) struct StreamPipeline {
     /// disabled), the splitter still strips a leading `<think>` block so it
     /// doesn't leak into content, but the reasoning text is dropped.
     emit_reasoning: bool,
+    /// Whether reasoning is emitted even when tools are active. OpenAI drops
+    /// reasoning in tools mode (no wire lane); Anthropic emits thinking blocks
+    /// alongside tool_use blocks.
+    emit_reasoning_in_tools: bool,
 }
 
 impl StreamPipeline {
@@ -241,6 +272,19 @@ impl StreamPipeline {
             splitter: StreamingReasoningSplitter::new(thinking),
             tool_stream: tools_active.then(chat::StreamingToolCalls::default),
             emit_reasoning: thinking,
+            emit_reasoning_in_tools: false,
+        }
+    }
+
+    /// Construct a pipeline that emits reasoning deltas even in tools mode —
+    /// the Anthropic streaming path, where `thinking` blocks precede
+    /// `tool_use` blocks.
+    pub(crate) fn new_anthropic(thinking: bool, tools_active: bool) -> Self {
+        Self {
+            splitter: StreamingReasoningSplitter::new(thinking),
+            tool_stream: tools_active.then(chat::StreamingToolCalls::default),
+            emit_reasoning: thinking,
+            emit_reasoning_in_tools: true,
         }
     }
 
@@ -251,8 +295,10 @@ impl StreamPipeline {
         calls: &mut Vec<chat::ToolCall>,
     ) {
         match piece {
-            // Tools mode: reasoning has no wire lane (matches non-streaming).
-            ChatDelta::Reasoning(_) if self.tool_stream.is_some() => {}
+            // Tools mode: reasoning has no wire lane for OpenAI (dropped), but
+            // Anthropic emits it as `thinking` blocks.
+            ChatDelta::Reasoning(_)
+                if self.tool_stream.is_some() && !self.emit_reasoning_in_tools => {}
             ChatDelta::Reasoning(text) => {
                 if self.emit_reasoning {
                     deltas.push(ChatDelta::Reasoning(text));
