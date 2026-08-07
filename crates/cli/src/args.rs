@@ -2276,6 +2276,14 @@ pub(crate) struct TrainAgentOpdArgs {
     #[arg(long, default_value_t = 4)]
     pub(crate) samples_per_prompt: usize,
 
+    /// Prompts (task groups) rolled per policy update. All G roll concurrently
+    /// at ONE policy version, then a single update trains their merged batch —
+    /// G × samples_per_prompt sessions in flight instead of one group's worth,
+    /// with the straggler tail amortized across the window. Staleness stays 0
+    /// at any G. Slots/KV are sized from G × samples_per_prompt.
+    #[arg(long, default_value_t = 1)]
+    pub(crate) prompts_per_update: usize,
+
     /// Port the in-process serve binds on 127.0.0.1 for the cc rollout harness.
     #[arg(long, default_value_t = 8000)]
     pub(crate) serve_port: u16,

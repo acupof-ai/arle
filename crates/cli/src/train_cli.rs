@@ -3101,7 +3101,11 @@ fn load_agent_opd_serve_student(
     // traffic: K concurrent cc streams × the measured session ceiling, +25%
     // headroom, page_size 16.
     use train::cc_harness::{CC_MAX_SESSION_TOKENS, CC_SESSION_TOKENS};
-    let width = args.samples_per_prompt.max(1);
+    // Sessions THIS rank serves at once: the update window's samples
+    // (prompts_per_update × samples_per_prompt) spread round-robin over the cp
+    // fleet's endpoints.
+    let width = (args.samples_per_prompt.max(1) * args.prompts_per_update.max(1))
+        .div_ceil(train::context_parallel::CpContext::from_env().size.max(1));
     // Pool = K typical streams, but never smaller than one full long-horizon
     // session (+25% headroom each) so a 200K session stays schedulable.
     let cc_pages = (width * CC_SESSION_TOKENS)
@@ -3583,6 +3587,8 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
     use std::sync::Arc;
 
     use autograd::optim::AdamW;
+    use std::collections::VecDeque;
+
     use train::{
         lora::LoraConfig,
         opd::{WritebackLoss, masked_writeback_ce_step_dispatch, masked_writeback_step},
@@ -4028,210 +4034,259 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
             .collect::<Vec<_>>()
             .into_iter();
         let mut work = round_tasks;
-        let mut next = work.first().map(|i| launch(i, policy_version));
+        // Prompts per update (verl shape): G groups roll concurrently under ONE
+        // policy version, then a single update trains their merged batch. Keeps
+        // G × width sessions in flight so the fleet's slots stay fed and one
+        // group's straggler no longer idles the others; staleness stays 0 at any
+        // G. G=1 is the per-group loop.
+        let g = args.prompts_per_update.max(1);
+        let mut pending: VecDeque<(usize, PendingGroup)> = VecDeque::new();
+        let mut launched = 0usize;
+        let top_up = |pending: &mut VecDeque<(usize, PendingGroup)>,
+                      launched: &mut usize,
+                      work: &[usize],
+                      version: u64| {
+            while pending.len() < g && *launched < work.len() {
+                let i = work[*launched];
+                pending.push_back((i, launch(&i, version)));
+                *launched += 1;
+            }
+        };
+        top_up(&mut pending, &mut launched, &work, policy_version);
         let mut pos = 0;
+        let mut groups_done = 0usize;
         while pos < work.len() {
-            let group_idx = work[pos];
-            let pending = next.take().expect("launched ahead");
-            // Boot-ahead (staleness 0): the next group's sandboxes build during
-            // this group's rollout + train (CPU only — staleness-free).
+            let window: Vec<(usize, PendingGroup)> = pending.drain(..).collect();
+            let n = window.len();
+            // Boot-ahead (staleness 0): the next window's sandboxes build during
+            // this window's rollout + train (CPU only — staleness-free).
             if args.staleness == 0 {
-                next = work.get(pos + 1).map(|i| launch(i, policy_version));
+                top_up(&mut pending, &mut launched, &work, policy_version);
             }
             let gpu_busy_before = infer_api::engine_forward_busy_micros();
-            let (group, behavior_version) = train::aopd_profile::time_try(
+            let rolled = train::aopd_profile::time_try(
                 "cc_rollout",
                 train::aopd_profile::WALL,
-                || -> Result<(train::cc_harness::CcGroup, u64)> {
-                    match pending {
-                        // Rollout runs inline — π_behavior is the CURRENT policy.
-                        PendingGroup::Booted(booted) => {
-                            Ok((harness.run_group(booted)?, policy_version))
-                        }
-                        PendingGroup::Rolling {
-                            behavior_version,
-                            handle,
-                        } => Ok((
-                            handle
+                || -> Result<Vec<(usize, train::cc_harness::CcGroup, u64)>> {
+                    // Booted groups start here so the whole window rolls at once;
+                    // Rolling ones (staleness>0) are already in flight under the
+                    // version they launched with.
+                    let started: Vec<_> = window
+                        .into_iter()
+                        .map(|(idx, pending)| match pending {
+                            PendingGroup::Booted(booted) => {
+                                let harness = Arc::clone(&harness);
+                                (
+                                    idx,
+                                    policy_version,
+                                    std::thread::spawn(move || harness.run_group(booted)),
+                                )
+                            }
+                            PendingGroup::Rolling {
+                                behavior_version,
+                                handle,
+                            } => (idx, behavior_version, handle),
+                        })
+                        .collect();
+                    started
+                        .into_iter()
+                        .map(|(idx, version, handle)| {
+                            let group = handle
                                 .join()
-                                .map_err(|_| anyhow!("stale rollout thread panicked"))??,
-                            behavior_version,
-                        )),
-                    }
+                                .map_err(|_| anyhow!("rollout thread panicked"))??;
+                            Ok((idx, group, version))
+                        })
+                        .collect()
                 },
             )?;
-            // Staleness 1: admit the NEXT group's rollout now, BEFORE this
-            // group's train + merge — cc rolls while the GPU trains; the
+            // Staleness 1: admit the NEXT window's rollout now, BEFORE this
+            // window's train + merge — cc rolls while the GPU trains; the
             // version tag + sidecar IS ratio below correct the one-step drift.
             if args.staleness > 0 {
-                next = work.get(pos + 1).map(|i| launch(i, policy_version));
+                top_up(&mut pending, &mut launched, &work, policy_version);
             }
-            let group_staleness = policy_version - behavior_version;
-
-            let group_passed = group.samples.iter().filter(|s| s.passed()).count();
-            let group_zero_variance = train::cc_harness::zero_variance(&group.samples);
-            rollouts += group.samples.len();
-            passed += group_passed;
-            tasks_passed += usize::from(group_passed > 0);
-            zero_variance_groups += usize::from(group_zero_variance);
-            if let Some(sel) = selection.as_mut() {
-                sel.record(
-                    group_idx,
-                    group_passed as f32 / group.samples.len().max(1) as f32,
-                );
-            }
-            let rewards: Vec<f32> = group.samples.iter().map(|s| s.reward).collect();
-            let reward_mean = rewards.iter().sum::<f32>() / rewards.len().max(1) as f32;
-            let reward_std = (rewards
-                .iter()
-                .map(|r| (r - reward_mean).powi(2))
-                .sum::<f32>()
-                / rewards.len().max(1) as f32)
-                .sqrt();
-            reward_sum += f64::from(rewards.iter().sum::<f32>());
-            let g_prompt: u64 = group.samples.iter().filter_map(|s| s.cc_input_tokens).sum();
-            let g_completion: u64 = group
-                .samples
-                .iter()
-                .filter_map(|s| s.cc_output_tokens)
-                .sum();
-            prompt_tokens += g_prompt;
-            completion_tokens += g_completion;
-            // Never fatal: `--save-every 0` saves only after the final round, and
-            // a failed sandbox spawn also lands here.
-            if g_completion == 0 {
-                eprintln!(
-                    "[agent-opd] group {group_idx} ({}) generated 0 completion tokens across {} \
-                     sample(s) — check the engine log for a closed engine thread or a KV pool \
-                     collapsed to the token floor",
-                    group.task_id,
-                    group.samples.len(),
-                );
-            }
-            // Group rollout wall = first cc start → last cc end.
-            let rollout_secs = group
-                .samples
-                .iter()
-                .map(|s| s.t_end_ms)
-                .max()
-                .unwrap_or(0)
-                .saturating_sub(
-                    group
-                        .samples
-                        .iter()
-                        .map(|s| s.t_start_ms)
-                        .min()
-                        .unwrap_or(0),
-                ) as f64
-                / 1000.0;
-            // GPU-busy fraction of the rollout wall: engine forward wall (submit→ready)
-            // over this group's window; the remainder is agent-latency idle
-            // (tool-exec / pytest / HTTP between turns). Exact at staleness=0;
-            // over-attributes under Rolling (staleness>0) overlap. LEADER-ONLY
-            // under cp>1: the counter is process-local, so follower-endpoint
-            // forward time is not counted — read gpu_busy_frac as a floor.
+            // Window-level: the window's groups roll concurrently, so engine
+            // forward time cannot be split between them.
             let gpu_busy_secs = infer_api::engine_forward_busy_micros()
                 .saturating_sub(gpu_busy_before) as f64
                 / 1e6;
-            metrics.append(&serde_json::json!({
-                "kind": "group",
-                "round": round,
-                "task_id": group.task_id,
-                "rewards": rewards,
-                "reward_mean": reward_mean,
-                "reward_std": reward_std,
-                "zero_variance": group_zero_variance,
-                "behavior_version": behavior_version,
-                "staleness": group_staleness,
-                "passed": group_passed,
-                "edited": group.samples.iter().filter(|s| s.edited).count(),
-                "prompt_tokens": g_prompt,
-                "completion_tokens": g_completion,
-                "rollout_secs": rollout_secs,
-                "rollout_tok_per_sec": g_completion as f64 / rollout_secs.max(1e-9),
-                "gpu_busy_secs": gpu_busy_secs,
-                "gpu_busy_frac": gpu_busy_secs / rollout_secs.max(1e-9),
-            }));
+
+            let mut window_groups: Vec<(usize, train::cc_harness::CcGroup, u64, u64)> =
+                Vec::with_capacity(n);
+            for (group_idx, group, behavior_version) in rolled {
+                let group_staleness = policy_version - behavior_version;
+                let group_passed = group.samples.iter().filter(|s| s.passed()).count();
+                let group_zero_variance = train::cc_harness::zero_variance(&group.samples);
+                rollouts += group.samples.len();
+                passed += group_passed;
+                tasks_passed += usize::from(group_passed > 0);
+                zero_variance_groups += usize::from(group_zero_variance);
+                if let Some(sel) = selection.as_mut() {
+                    sel.record(
+                        group_idx,
+                        group_passed as f32 / group.samples.len().max(1) as f32,
+                    );
+                }
+                let rewards: Vec<f32> = group.samples.iter().map(|s| s.reward).collect();
+                let reward_mean = rewards.iter().sum::<f32>() / rewards.len().max(1) as f32;
+                let reward_std = (rewards
+                    .iter()
+                    .map(|r| (r - reward_mean).powi(2))
+                    .sum::<f32>()
+                    / rewards.len().max(1) as f32)
+                    .sqrt();
+                reward_sum += f64::from(rewards.iter().sum::<f32>());
+                let g_prompt: u64 = group.samples.iter().filter_map(|s| s.cc_input_tokens).sum();
+                let g_completion: u64 = group
+                    .samples
+                    .iter()
+                    .filter_map(|s| s.cc_output_tokens)
+                    .sum();
+                prompt_tokens += g_prompt;
+                completion_tokens += g_completion;
+                // Never fatal: `--save-every 0` saves only after the final round, and
+                // a failed sandbox spawn also lands here.
+                if g_completion == 0 {
+                    eprintln!(
+                        "[agent-opd] group {group_idx} ({}) generated 0 completion tokens across {} \
+                         sample(s) — check the engine log for a closed engine thread or a KV pool \
+                         collapsed to the token floor",
+                        group.task_id,
+                        group.samples.len(),
+                    );
+                }
+                // Group rollout wall = first cc start → last cc end.
+                let rollout_secs = group
+                    .samples
+                    .iter()
+                    .map(|s| s.t_end_ms)
+                    .max()
+                    .unwrap_or(0)
+                    .saturating_sub(
+                        group
+                            .samples
+                            .iter()
+                            .map(|s| s.t_start_ms)
+                            .min()
+                            .unwrap_or(0),
+                    ) as f64
+                    / 1000.0;
+                // GPU-busy fraction of the rollout wall: engine forward wall
+                // (submit→ready) over this group's window; the remainder is
+                // agent-latency idle (tool-exec / pytest / HTTP between turns).
+                // Only separable when the window IS this group. LEADER-ONLY under
+                // cp>1: the counter is process-local, so follower-endpoint forward
+                // time is not counted — read gpu_busy_frac as a floor.
+                let solo_busy = (n == 1).then_some(gpu_busy_secs);
+                metrics.append(&serde_json::json!({
+                    "kind": "group",
+                    "round": round,
+                    "task_id": group.task_id,
+                    "rewards": rewards,
+                    "reward_mean": reward_mean,
+                    "reward_std": reward_std,
+                    "zero_variance": group_zero_variance,
+                    "behavior_version": behavior_version,
+                    "staleness": group_staleness,
+                    "passed": group_passed,
+                    "edited": group.samples.iter().filter(|s| s.edited).count(),
+                    "prompt_tokens": g_prompt,
+                    "completion_tokens": g_completion,
+                    "rollout_secs": rollout_secs,
+                    "rollout_tok_per_sec": g_completion as f64 / rollout_secs.max(1e-9),
+                    "gpu_busy_secs": solo_busy,
+                    "gpu_busy_frac": solo_busy.map(|b| b / rollout_secs.max(1e-9)),
+                }));
+                window_groups.push((group_idx, group, behavior_version, g_completion));
+            }
 
             // Staleness 1 skips quiesce AND the releases ONLY while a next
-            // group is actually Rolling: its requests are legitimately in
+            // window is actually Rolling: its requests are legitimately in
             // flight — cancel_all would kill them, and a dropped KV pool /
             // scratch would be read by live decodes. The re-merge below is
             // atomic engine-side; in-flight requests keep their pinned pages
             // and finish on mixed KV (#92 caveat) — exactly the drift the
-            // version tag + sidecar IS ratio correct. A current-group
+            // version tag + sidecar IS ratio correct. A current-window
             // straggler (its cc child exited) is harmless without the pool
-            // drop and drains on its own. With NOTHING in flight
-            // (`next.is_none()`), release exactly as at staleness 0 — a
-            // resident pool+scratch atop the capture forward OOMed at 97.4 GB.
-            let released_engines = args.staleness == 0 || next.is_none();
+            // drop and drains on its own. With NOTHING in flight, release
+            // exactly as at staleness 0 — a resident pool+scratch atop the
+            // capture forward OOMed at 97.4 GB.
+            let released_engines = args.staleness == 0 || pending.is_empty();
             if released_engines {
                 quiesce_and_release_engines(&infer_student)?;
             }
             log_opd_vram("agent-opd pre-writeback", &train_backend);
 
-            let mut batch: Vec<train::update_strategy::ScoredTrajectory> = group
-                .records
-                .into_iter()
-                .map(|r| train::update_strategy::ScoredTrajectory {
-                    prompt_ids: r.prompt_ids,
-                    response_ids: r.response_ids,
-                    response_mask: r.response_mask,
-                    reward: r.reward,
-                    behavior_logprobs: (!r.gen_logprobs.is_empty()).then_some(r.gen_logprobs),
-                    group_id: group_idx,
-                    // Timeout/harness-error attempts: drop them from the update
-                    // (a budget artifact, not a learnable fail) via DAPO's filter.
-                    truncated: r.truncated,
-                })
-                .collect();
-            // VRAM-wall length guard before writeback. Skipped here == skipped
-            // by update() anyway, while keeping an overlong record out of the
-            // batch-wide sidecar validation and any subsequent model forward.
-            if args.runtime.max_update_seq != 0 {
-                batch.retain(|t| {
-                    let seq = t.prompt_ids.len() + t.response_ids.len();
-                    let keep = seq <= args.runtime.max_update_seq;
-                    if !keep {
-                        eprintln!(
-                            "[agent-opd] SKIP trajectory pre-capture: seq {seq} > max_update_seq {} (VRAM wall)",
-                            args.runtime.max_update_seq
-                        );
-                    }
-                    keep
-                });
-            }
-            // Deadness for DAPO refill = "no learning signal", judged on the
-            // batch BEFORE the writeback-cap truncation — an exhausted cap is a
-            // budget artifact, not a zero-variance group, and must not classify a
-            // live group as dead (which would refill forever once cap_left == 0).
-            // Matches update's own filter, so no double forward.
-            let group_trained = update_preset.planned_training_count(&batch) > 0;
-            if args.writeback_cap.is_some() {
-                if !needs.keep_failing {
-                    // Don't let failures (rejected inside `update`) burn budget.
-                    batch.retain(|t| t.reward >= 1.0);
+            // One batch per group (replay stores them per task), concatenated
+            // into the window's single update.
+            let mut per_group: Vec<(String, Vec<train::update_strategy::ScoredTrajectory>)> =
+                Vec::with_capacity(n);
+            for (group_idx, group, _, g_completion) in window_groups {
+                let mut batch: Vec<train::update_strategy::ScoredTrajectory> = group
+                    .records
+                    .into_iter()
+                    .map(|r| train::update_strategy::ScoredTrajectory {
+                        prompt_ids: r.prompt_ids,
+                        response_ids: r.response_ids,
+                        response_mask: r.response_mask,
+                        reward: r.reward,
+                        behavior_logprobs: (!r.gen_logprobs.is_empty()).then_some(r.gen_logprobs),
+                        group_id: group_idx,
+                        // Timeout/harness-error attempts: drop them from the update
+                        // (a budget artifact, not a learnable fail) via DAPO's filter.
+                        truncated: r.truncated,
+                    })
+                    .collect();
+                // VRAM-wall length guard before writeback. Skipped here == skipped
+                // by update() anyway, while keeping an overlong record out of the
+                // batch-wide sidecar validation and any subsequent model forward.
+                if args.runtime.max_update_seq != 0 {
+                    batch.retain(|t| {
+                        let seq = t.prompt_ids.len() + t.response_ids.len();
+                        let keep = seq <= args.runtime.max_update_seq;
+                        if !keep {
+                            eprintln!(
+                                "[agent-opd] SKIP trajectory pre-capture: seq {seq} > max_update_seq {} (VRAM wall)",
+                                args.runtime.max_update_seq
+                            );
+                        }
+                        keep
+                    });
                 }
-                batch.truncate(cap_left);
-                cap_left -= batch.len();
+                // Deadness for DAPO refill = "no learning signal", judged on the
+                // batch BEFORE the writeback-cap truncation — an exhausted cap is a
+                // budget artifact, not a zero-variance group, and must not classify a
+                // live group as dead (which would refill forever once cap_left == 0).
+                // Matches update's own filter, so no double forward.
+                let group_trained = update_preset.planned_training_count(&batch) > 0;
+                if args.writeback_cap.is_some() {
+                    if !needs.keep_failing {
+                        // Don't let failures (rejected inside `update`) burn budget.
+                        batch.retain(|t| t.reward >= 1.0);
+                    }
+                    batch.truncate(cap_left);
+                    cap_left -= batch.len();
+                }
+                // Append a replacement for a dead group (grow `work` now so the
+                // last-window sync check stays correct; launch is deferred to
+                // end-of-body so a refill thread never races the VRAM release).
+                // Always count the group in `refill`; only skip the append once the
+                // writeback cap is spent — a replacement could not train anyway.
+                let cap_open = args.writeback_cap.is_none() || cap_left > 0;
+                let want_refill = refill.complete(work.len(), group_trained, g_completion);
+                if cap_open
+                    && want_refill
+                    && let Some(idx) = reserve.next()
+                {
+                    work.push(idx);
+                }
+                per_group.push((group.task_id, batch));
             }
-            // Append a replacement for a dead group (grow `work` now so the
-            // last-group sync check stays correct; launch is deferred to
-            // end-of-body so a refill thread never races the VRAM release). Always
-            // count the group in `refill`; only skip the append once the writeback
-            // cap is spent — a replacement could not train anyway.
-            let cap_open = args.writeback_cap.is_none() || cap_left > 0;
-            let want_refill = refill.complete(work.len(), group_trained, g_completion);
-            if cap_open
-                && want_refill
-                && let Some(idx) = reserve.next()
-            {
-                work.push(idx);
-            }
+
             // The update validates the entire ratio-weighted batch before any
             // critic/student forward. Ratio-free CE/GKD ignores absent sidecars.
             // One update + its metrics row; `extra` carries the arm-specific
-            // fields (fresh: group; replay: group/task_id/replayed/age).
+            // fields (fresh: window; replay: group/task_id/replayed/age).
             let mut run_update = |batch: &[train::update_strategy::ScoredTrajectory],
                                   extra: serde_json::Value,
                                   release_engines: bool|
@@ -4285,19 +4340,24 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
                 metrics.append(&row);
                 Ok(())
             };
+            let merged: Vec<train::update_strategy::ScoredTrajectory> = per_group
+                .iter()
+                .flat_map(|(_, batch)| batch.iter().cloned())
+                .collect();
             run_update(
-                &batch,
+                &merged,
                 serde_json::json!({
-                    "group": group_idx,
-                    "behavior_version": behavior_version,
-                    "staleness": group_staleness,
+                    "groups": per_group.len(),
+                    "behavior_version": policy_version,
+                    "staleness": 0,
+                    "window_gpu_busy_secs": gpu_busy_secs,
                 }),
                 released_engines,
             )?;
 
-            // Experience replay (fresh-anchored: only after the fresh group
+            // Experience replay (fresh-anchored: only after the fresh window
             // trained). Stored batches retain the immutable generation-time
-            // behavior sidecars. Push after drawing: first drawable next group.
+            // behavior sidecars. Push after drawing: first drawable next window.
             if let Some((buffer, rng)) = replay.as_mut() {
                 for entry in buffer.draw(round, args.replay_reuse, rng) {
                     run_update(
@@ -4312,7 +4372,9 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
                     )?;
                     replayed_groups += 1;
                 }
-                buffer.push(round, group.task_id.clone(), batch);
+                for (task_id, batch) in per_group {
+                    buffer.push(round, task_id, batch);
+                }
             }
 
             // Writeback transients leave freed blocks hoarded in the autograd
@@ -4323,9 +4385,9 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
             }
             // Sync the trained LoRA into the serve engine (atomic re-merge +
             // prefix-cache drop in one engine-thread closure); every-round
-            // syncs once, at the last group. Then re-acquire the KV pool for
+            // syncs once, at the last window. Then re-acquire the KV pool for
             // the next rollout.
-            let synced = sync_every_group || pos + 1 == work.len();
+            let synced = sync_every_group || pos + n == work.len();
             // Followers re-merge into their own engines and re-acquire their KV
             // pools in parallel with ours.
             if let Some(tx) = mesh_tx.as_mut() {
@@ -4344,7 +4406,7 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
             // Post-merge prefix warm-up: the re-merge flushed the radix cache,
             // so re-prefill the shared cc prompt (newest dump's prompt portion,
             // max_tokens=1) on a background thread — overlapped with the next
-            // group's boot; a queued real request just lands behind it in the
+            // window's boot; a queued real request just lands behind it in the
             // same engine FIFO. Log-and-continue: never kills training.
             if synced {
                 let engine = Arc::clone(infer_student.engine());
@@ -4354,7 +4416,7 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
                     let t0 = Instant::now();
                     let outcome = train::cc_convert::newest_dump_prompt_ids(&dump_dir, &tokenizer)
                         .and_then(|prompt| match prompt {
-                            // No dump yet (round 0 group 0): skip silently.
+                            // No dump yet (round 0 window 0): skip silently.
                             None => Ok(false),
                             Some(ids) => engine
                                 .lock()
@@ -4376,12 +4438,18 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
                 }));
             }
             // Launch a deferred DAPO refill (appended above) only now that the KV
-            // pool is restored — boot-ahead may have left `next` empty when the
-            // dead group looked last. Static path: `work` didn't grow, no-op.
-            pos += 1;
-            if next.is_none() {
-                next = work.get(pos).map(|i| launch(i, policy_version));
-            }
+            // pool is restored. Static path: `work` didn't grow, no-op.
+            pos += n;
+            groups_done += n;
+            top_up(&mut pending, &mut launched, &work, policy_version);
+        }
+        // Windowing must consume every scheduled task exactly once (`work` grows
+        // under DAPO refill, so this is the one place the arithmetic is checked).
+        if groups_done != work.len() {
+            bail!(
+                "round {round}: windowed scheduler ran {groups_done} groups for {} scheduled",
+                work.len()
+            );
         }
 
         let mean_loss = if losses.is_empty() {
