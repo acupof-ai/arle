@@ -19,6 +19,14 @@ gaps n=430584   total 9.86 s   mean 22.9 us
 
 Of that 8.98 s, **7.45 s sat in no CUDA API call at all** — host CPU.
 
+> **Correction (measured after this was written).** The 45%-of-window figure is
+> true of this window and does not generalize: the window was *aimed* at decode,
+> where the cost concentrates. Over a full 512 s bench the same mechanism is
+> **9.4% of wall**. See
+> [`../wins/2026-08-07-prefix-sidecar-serialize-bulk-copy.md`](../wins/2026-08-07-prefix-sidecar-serialize-bulk-copy.md).
+> A window selected for a phenomenon reports that phenomenon's share of the
+> window, not of the run.
+
 ## Error 1 — the graph lever was killed on the wrong 3%
 
 Earlier the same day I had written that CUDA graph capture was "the only lever
