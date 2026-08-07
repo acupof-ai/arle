@@ -1,4 +1,5 @@
 use super::*;
+use crate::qwen35::alloc_recurrent_block;
 
 /// Whole-step Qwen3.5/3.6 decode graph enabled? Default ON;
 /// `--qwen35-decode-graph false` is the escape hatch and the same-binary A/B
@@ -934,25 +935,17 @@ impl Qwen35CudaExecutor {
         // Pre-allocating reserves the VRAM at construction: if it doesn't fit,
         // the engine fails fast here instead of mid-request.
         let (num_linear, gdr_state_len, conv_len) = model.recurrent_dims();
-        let gdr_bytes = num_linear * gdr_state_len * std::mem::size_of::<f32>();
-        let conv_bytes = num_linear * conv_len * std::mem::size_of::<half::bf16>();
+        let (gdr_per_layer, conv_per_layer) = model.linear_state_bytes();
+        let gdr_bytes = num_linear * gdr_per_layer;
+        let conv_bytes = num_linear * conv_per_layer;
         log::info!(
             "Qwen3.5 pre-alloc recurrent pool: {num_slots} slots × \
              ({gdr_bytes} B gdr + {conv_bytes} B conv) = {} MiB",
             num_slots * (gdr_bytes + conv_bytes) / (1 << 20)
         );
-        let mut recurrent_pool = Vec::with_capacity(num_slots);
-        for _ in 0..num_slots {
-            let gdr = (0..num_linear)
-                .map(|_| model.ctx.stream.alloc_zeros::<f32>(gdr_state_len))
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| anyhow::anyhow!("pre-alloc gdr state failed: {e}"))?;
-            let conv = (0..num_linear)
-                .map(|_| DeviceVec::zeros(&model.ctx, conv_len))
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| anyhow::anyhow!("pre-alloc conv state failed: {e}"))?;
-            recurrent_pool.push((gdr, conv));
-        }
+        let recurrent_pool = (0..num_slots)
+            .map(|_| alloc_recurrent_block(&model.ctx, num_linear, gdr_state_len, conv_len))
+            .collect::<Result<Vec<_>>>()?;
 
         // G3 whole-slot spill tier: snapshots stored as 16 MiB chunked blobs
         // (manifest + chunks, the DSv4 pattern) — a whole image never fits one

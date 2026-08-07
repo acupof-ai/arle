@@ -1151,6 +1151,30 @@ pub(crate) struct Qwen35SlotState {
 /// the next one — same dims for every slot, so any block fits any slot.
 pub(crate) type RecurrentBlock = (Vec<CudaSlice<f32>>, Vec<DeviceVec>);
 
+/// Allocate one fresh [`RecurrentBlock`] (`num_linear` GDR slices + `num_linear`
+/// conv buffers). UNINITIALIZED — the caller must zero it before reading
+/// (`acquire_recurrent` always calls `zero_recurrent` after this).
+pub(crate) fn alloc_recurrent_block(
+    ctx: &DeviceContext,
+    num_linear: usize,
+    gdr_state_len: usize,
+    conv_len: usize,
+) -> Result<RecurrentBlock> {
+    let (gdr, conv) = (0..num_linear)
+        .map(|_| {
+            // SAFETY: zero_recurrent runs before any read of this state.
+            let g = unsafe { ctx.stream.alloc::<f32>(gdr_state_len) }
+                .map_err(|e| anyhow!("alloc gated-delta state failed: {e}"))?;
+            // SAFETY: same as above.
+            let c = unsafe { DeviceVec::uninit(ctx, conv_len) }?;
+            Ok((g, c))
+        })
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .unzip::<_, _, Vec<_>, Vec<_>>();
+    Ok((gdr, conv))
+}
+
 /// One committed token + its behavior logprob under the filtered sampling
 /// dist (`None` = uncaptured: greedy / delta policy).
 pub(crate) type CommittedToken = (u32, Option<f32>);
@@ -1323,17 +1347,7 @@ impl Qwen35SlotState {
         }
         let (gdr, conv) = match pool.pop() {
             Some(block) => block,
-            None => (0..num_linear)
-                .map(|_| {
-                    let g = ctx
-                        .stream
-                        .alloc_zeros::<f32>(gdr_state_len)
-                        .map_err(|e| anyhow!("alloc gated-delta state failed: {e}"))?;
-                    Ok((g, DeviceVec::zeros(ctx, conv_len)?))
-                })
-                .collect::<Result<Vec<_>>>()?
-                .into_iter()
-                .unzip::<_, _, Vec<_>, Vec<_>>(),
+            None => alloc_recurrent_block(ctx, num_linear, gdr_state_len, conv_len)?,
         };
         self.gdr_states = gdr;
         self.conv_states = conv;
