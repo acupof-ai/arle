@@ -2,17 +2,22 @@
 //
 // sm_70 has no FA3 (CUTLASS-3.x needs sm_80+) and no BF16 compute — BF16 I/O is
 // cast to FP16 on load, math runs in half2, accumulates in FP32. FA2 tiled
-// online softmax (Br=8 Q tokens, Bc=16 KV tiles) shares K/V reads across the Q
+// online softmax (Br=16 Q tokens, Bc=64 KV tiles) shares K/V reads across the Q
 // tile. Causal chunked-prefill: Q token at absolute position q attends KV 0..q.
 // Interface matches nonpaged_prefill_attention_cuda (drop-in on sm_70).
+//
+// Shared memory layout (dynamic, 68 KB for hdim=256):
+//   k_s [Bc * head_dim] half  = 32 KB
+//   v_s [Bc * head_dim] half  = 32 KB
+//   qk_s [Br * Bc]      float =  4 KB
 
 #include "common.cuh"
 #include <cuda_fp16.h>
 #include <cstdint>
 
-#define FA2_BR 8        // Q tokens per block
-#define FA2_BC 16       // KV tokens per inner tile
-#define FA2_BLOCK 256   // threads = Br * (head_dim / 8) for hdim=256
+#define FA2_BR 16       // Q tokens per block
+#define FA2_BC 64       // KV tokens per inner tile
+#define FA2_BLOCK 512   // threads = Br * (head_dim / 8) for hdim=256
 #define FA2_MAX_HD 256  // max head_dim
 
 __global__ void arle_fa2_sm70_kernel(
@@ -28,9 +33,14 @@ __global__ void arle_fa2_sm70_kernel(
     int max_seq_len,
     float sm_scale) {
 
+  extern __shared__ half smem[];
+  half *k_s = smem;
+  half *v_s = smem + FA2_BC * head_dim;
+  float *qk_s = reinterpret_cast<float *>(v_s + FA2_BC * head_dim);
+
   const int q_head = blockIdx.x;
   const int q_tile = blockIdx.y;
-  const int warp_id = threadIdx.x / WARP_SIZE;   // 0..7 → Q token within tile
+  const int warp_id = threadIdx.x / WARP_SIZE;   // 0..15 → Q token within tile
   const int lane = threadIdx.x % WARP_SIZE;      // 0..31 → dim group
 
   const int q_start = kv_len - seq_len;          // absolute pos of Q token 0
@@ -62,10 +72,6 @@ __global__ void arle_fa2_sm70_kernel(
   float running_max = -INFINITY;
   float running_sum = 0.0f;
 
-  __shared__ half k_s[FA2_BC * FA2_MAX_HD];
-  __shared__ half v_s[FA2_BC * FA2_MAX_HD];
-  __shared__ float qk_s[FA2_BR * FA2_BC];
-
   // Largest absolute KV position any Q token in this tile attends to (causal).
   const int tile_q_max = min(q_start + (q_tile + 1) * FA2_BR, kv_len) - 1;
 
@@ -74,24 +80,39 @@ __global__ void arle_fa2_sm70_kernel(
   const __nv_bfloat16 *v_base = v_cache + kv_head * max_seq_len * head_dim;
 
   for (int k_start = 0; k_start <= tile_q_max; k_start += FA2_BC) {
-    // Cooperative load K/V tile (BF16 -> FP16); 256 threads load FA2_BC*head_dim.
+    // Cooperative load K/V tile (BF16 -> FP16); vectorized via uint4 (8 BF16 = 16B).
     const int elems = FA2_BC * head_dim;
-    #pragma unroll
-    for (int i = threadIdx.x; i < elems; i += FA2_BLOCK) {
-      const int row = i / head_dim;
-      const int col = i % head_dim;
+    const int vec_elems = elems / 8;  // 8 BF16 per uint4
+    for (int i = threadIdx.x; i < vec_elems; i += FA2_BLOCK) {
+      const int base = i * 8;
+      const int row = base / head_dim;
+      const int col = base % head_dim;
       const int k_abs = k_start + row;
-      const float v =
-          k_abs < kv_len ? __bfloat162float(k_base[k_abs * kv_row_bytes + col]) : 0.0f;
-      k_s[i] = __float2half(v);
-      v_s[i] = __float2half(
-          k_abs < kv_len ? __bfloat162float(v_base[k_abs * kv_row_bytes + col]) : 0.0f);
+      const bool valid = k_abs < kv_len;
+
+      // Load 8 BF16 values (16 bytes) as uint4.
+      uint4 kv = valid
+          ? *reinterpret_cast<const uint4 *>(k_base + k_abs * kv_row_bytes + col)
+          : make_uint4(0, 0, 0, 0);
+      uint4 vv = valid
+          ? *reinterpret_cast<const uint4 *>(v_base + k_abs * kv_row_bytes + col)
+          : make_uint4(0, 0, 0, 0);
+
+      // Convert 8 BF16 -> 8 FP16 and store to shared memory.
+      __nv_bfloat16 kbf[8], vbf[8];
+      *reinterpret_cast<uint4 *>(kbf) = kv;
+      *reinterpret_cast<uint4 *>(vbf) = vv;
+      half *k_dst = k_s + base;
+      half *v_dst = v_s + base;
+      #pragma unroll
+      for (int j = 0; j < 8; j++) {
+        k_dst[j] = __float2half(__bfloat162float(kbf[j]));
+        v_dst[j] = __float2half(__bfloat162float(vbf[j]));
+      }
     }
     __syncthreads();
 
-    // QK^T: each warp computes its Q token vs the Bc KV positions. All 32 lanes
-    // must call warp_reduce_sum (full-warp __shfl_down_sync); inactive lanes
-    // keep partial=0 so the reduce stays correct.
+    // QK^T: each warp computes its Q token vs the Bc KV positions.
     #pragma unroll
     for (int k_local = 0; k_local < FA2_BC; k_local++) {
       const int k_abs = k_start + k_local;
@@ -185,10 +206,19 @@ extern "C" cudaError_t arle_fa2_sm70_attention_cuda(
   if (seq_len == 0) {
     return cudaSuccess;
   }
+
+  // Dynamic shared memory: K (Bc*hd*2) + V (Bc*hd*2) + QK (Br*Bc*4).
+  const size_t shm_bytes =
+      (size_t)FA2_BC * head_dim * 2 * 2 + (size_t)FA2_BR * FA2_BC * 4;
+
+  // V100 supports up to 96 KB shared memory per SM; allow the kernel to use it.
+  cudaFuncSetAttribute(arle_fa2_sm70_kernel,
+                       cudaFuncAttributeMaxDynamicSharedMemorySize, shm_bytes);
+
   const int num_q_tiles = (seq_len + FA2_BR - 1) / FA2_BR;
   dim3 grid(num_q_heads, num_q_tiles);
   dim3 block(FA2_BLOCK);
-  arle_fa2_sm70_kernel<<<grid, block, 0, stream>>>(
+  arle_fa2_sm70_kernel<<<grid, block, shm_bytes, stream>>>(
       reinterpret_cast<const __nv_bfloat16 *>(q),
       reinterpret_cast<const __nv_bfloat16 *>(k_cache),
       reinterpret_cast<const __nv_bfloat16 *>(v_cache),
