@@ -13,13 +13,38 @@ describes the DSv4 execution paths; this document describes the Qwen3.6-27B
   and 0.525 s warm through the prefix cache (2026-08-01) — a prefill figure
   without that label means nothing.
 - Decode and prefill are opposite regimes and never share a conclusion. Prefill
-  is compute-bound at ≥76% GPU-busy; plain decode is ≤50% GPU-busy at ~1094
-  launches per step. A measurement that does not name its phase supports no
-  claim about the other
+  is compute-bound at 83.9% GPU-busy (§1.1); a plain decode **step** is 16.7%
+  idle (§2.1), while the 50.5% figure in §4.1 is a bench **window** whose idle
+  is inter-request stalls — the two are not interchangeable. A measurement that
+  does not name its phase supports no claim about the other
   ([error](experience/errors/2026-08-07-measured-prefill-concluded-about-decode.md)).
 - Shares are **of the window that was measured**. A window aimed at one phase
   reports that phase's share of the window, not of the run
   ([correction](experience/errors/2026-08-07-named-a-call-site-whose-gate-was-off.md)).
+
+**Provenance of every measurement table.** The recurring failure in this
+document has been a table measured at one configuration and read as current.
+Each row below carries the date, the batch, and whether a later default flip
+invalidated it. **Check this table before ranking anything off a number.**
+
+| § | table | date | batch | context | status |
+|---|---|---|---|---|---|
+| §1.1 | FP8 prefill budget | 08-01 | 1 | 33K cold | **stale** — pre chunked-GDR default flip; use §1.2 |
+| §1.2 | W8A16 prefill vs SGLang | 08-05 | 1 | 33K cold | current |
+| §2.1 | plain decode step budget | 08-01 | 1 | short | **stale** — its #2 kernel was deleted 08-03; only the 8.9 ms weight-read floor survives |
+| §2.2 | W8A16 decode ledger vs SGLang | 08-03 | 1 | short | **before-state only** — the program it motivated shipped the same day, 26.88 → 21.37 ms |
+| §2.3 | decode throughput vs batch | 08-07 `70760bc09` | 1–16 | 32K | current; the column is `B / TPOT`, decode-only, not end-to-end `out tok/s` |
+| §2.4 | sampling penalty | 08-07 `7b8a66603` | 1, 8, 16 | 32K | current |
+| §3 | DSpark tick phase split | 08-07 `7b8a66603` | 11.0 rows at nominal 16 | short | split current; the `22 ms + 2.48/row` fit is superseded by a per-row fit |
+| §4.1 | launch-gap histogram | 08-07 | c=16 window | short | current, and it is a **window** not a step |
+| §4.2 | prefix sidecar | 08-07 | 1–16 | short | current |
+| §4.4 | memory ledger | 08-07 | 16 slots | — | current |
+| §5.0 | anchor row | 08-07 `70760bc09` | 1, 8, 16 | 32K | current |
+| §5.2 | vs SGLang, W8A16 | 08-06 | — | 33K | current |
+
+**Nine of the twelve are batch 1 or batch-1-derived** while production decodes
+at c=16. That is the single largest structural gap in this document; see
+*Where the ceiling is*.
 
 **Model and device constants** used throughout:
 
@@ -227,7 +252,7 @@ flowchart TB
 
     A3 --> P{"ForwardMode"}
 
-    subgraph PREFILL["Prefill — compute-bound, GPU ≥76% busy"]
+    subgraph PREFILL["Prefill — compute-bound, GPU 83.9% busy"]
         direction TB
         B1["chunk ≤4096 tok"] --> B2["quantized GEMM<br/>FP8 29% · W8A16 58-88%"]
         B2 --> B3["full attention ×16<br/>FA3 / TileLang"]
@@ -235,7 +260,7 @@ flowchart TB
         B4 --> B5["prefix sidecar snapshot<br/>146.8 MiB per stride boundary"]
     end
 
-    subgraph DECODE["Decode — launch-bound, GPU ≤50% busy"]
+    subgraph DECODE["Decode — per-row bound at c=16, 85% of tick scales with rows"]
         direction TB
         C1["draft — DFlash backbone, block 6<br/>19.9% of tick<br/>batched only if ALL rows greedy"] --> C2["snapshot recurrent<br/>2.1%"]
         C2 --> C3["verify — trunk forward<br/>66.6% of tick<br/>5.69 ms/row at c=16, 33K"]
@@ -298,7 +323,22 @@ verify term leads despite the prefill idle being the larger raw number — see
 
 ### 1.1 FP8 weights — 33K cold, single request
 
-`nsys`, 2026-08-01, 28.6 s wall / 24.0 s GPU-busy.
+`nsys`, 2026-08-01, 28.6 s wall / 24.0 s GPU-busy (**83.9%**).
+
+> **STALE — do not rank prefill work off this table.** Measured before chunked
+> GDR went default-on (`c2eb5de9e`, 08-02). Its #1 row is a kernel that no
+> longer runs at the shipped defaults: FlashQLA chunked replaced
+> `gated_delta_rule_prefill_recurrent` and measured **1.06 s against its
+> 9.37 s**, which moves 33% of the budget and reorders everything below it.
+> Two more prefill changes landed after (`0ac780495`, `301d0c074`), and
+> `b0368426a` routed batch==1 prefill to FA3, which also moves the TileLang
+> row. Same flag as [`baselines.md`](baselines.md) carries. A re-measure needs
+> one `nsys` capture. **§1.2 is the current prefill decomposition** — it is
+> dated 08-05 and has the FlashQLA column.
+>
+> One consequence is already readable: removing ~8.3 s of GPU-busy while the
+> 4.60 s idle row stays put takes idle from 16.3% to **~21% of prefill**. The
+> idle item got relatively larger, not smaller.
 
 These kernels interleave across the prefill, so this is a **budget**, not a
 timeline — every bar starts at the same origin and only its length is meaningful.
@@ -368,7 +408,18 @@ Roofline: ~1.68 PFLOP for a 33K prefill (22.3 B GEMM params × 2 × 33e3, plus
 
 ### 2.1 Plain decode step, FP8
 
-`nsys` over 59 plain-decode steps, 2026-08-01, per step:
+`nsys` over 59 plain-decode steps, 2026-08-01, per step.
+
+> **STALE — do not rank decode work off this table, and note it is batch 1.**
+> Two defects. First, its #2 row is a kernel that was deleted from the default
+> path on 08-03: every bf16 N≤4 GEMM rides cuBLASLt now
+> ([`wins/2026-08-03-t5b-lmhead-cublas.md`](experience/wins/2026-08-03-t5b-lmhead-cublas.md)),
+> and the decode program that followed took the step **26.88 → 21.37 ms
+> (−20.5%)** (§2.2). The 23.89 ms sum and the composition under it both predate
+> that. Second, a plain single-row decode step is not the shape served —
+> production runs DSpark verify at c=16, where 85% of the tick scales with rows
+> (§ *Where the ceiling is*). Kept here because the **weight-read floor** it
+> establishes is a device constant and does not go stale.
 
 Budget, not a timeline — 1094 launches per step interleave.
 
@@ -388,9 +439,11 @@ Shares are of the 23.89 ms sum. The originally published shares (66 / 21 / 16 /
 a third base; the ms column is the measurement and the sum is the denominator
 used here.
 
-Weight-read floor at 31.2 GB / 3.5 TB/s = **8.9 ms**. GEMV measured 18.1 ms ⇒
-**~49% of achievable bandwidth**, independently reproducing the 51% found in
-July.
+Weight-read floor at 31.2 GB / 3.5 TB/s = **8.9 ms** — the one durable number
+in this table. GEMV measured 18.1 ms against it, **~49% of achievable
+bandwidth**, reproducing the 51% found in July; but 4.30 ms of that 18.1 is the
+since-deleted `gemv_handwritten_kernel`, so treat 49% as a batch-1 figure from a
+superseded configuration, not as the current roofline gap.
 
 ### 2.2 Module ledger versus SGLang, W8A16
 
