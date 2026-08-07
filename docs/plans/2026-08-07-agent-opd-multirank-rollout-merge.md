@@ -55,6 +55,29 @@ New surface (why this is deferred, not free): per-rank engine lifecycle around
 each writeback (quiesce + KV-pool release on every rank, not just rank 0),
 reverse-channel backpressure, and GRESO state fed from remote groups.
 
+## Prioritization rationale
+
+Build-ahead is justified only when both hold: the final requirement is known,
+and the interim structure creates path dependence. Here neither holds.
+
+- **The final requirement is not yet specified.** Multi-node or multi-rank
+  rollout scale has no scheduled workload; when it arrives, its numbers (rank
+  count, message volume, fault-tolerance semantics) decide the transport. A
+  design built now would target an unmeasured workload and likely be rebuilt.
+- **Path dependence is near zero.** The one-time structural cost was paid in
+  `9da8ff777`: the transport is confined to `MeshUpdateChannel` with two call
+  sites (leader publish in `run_update`, follower recv loop). Replacing files
+  with an NCCL host broadcast or a distributed queue is a localized swap; the
+  training loop does not change. The same seam is where the reverse group
+  channel (step 3) plugs in.
+
+The rule: pay for the narrow seam now; defer the implementation until the
+workload that selects it exists. This also rejected the alternative of a
+general shared object store (Ray-style): the need is ordered broadcast of
+small batches on one host — single producer, lockstep consumers — and a store
+adds a service process, a failure domain, and a dependency that this access
+pattern never uses.
+
 ## Trigger
 
 Build this when **cp>1 is the production training config** — i.e. when 256K-seq
