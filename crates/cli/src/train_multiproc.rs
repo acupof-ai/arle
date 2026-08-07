@@ -79,7 +79,14 @@ pub(crate) fn maybe_spawn_mesh_and_wait(
     {
         let exe = std::env::current_exe().context("current_exe")?;
         // Shared dir for the rank-0 → follower update stream (MeshUpdateChannel).
+        struct MeshDirGuard(std::path::PathBuf);
+        impl Drop for MeshDirGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
         let mesh_dir = std::env::temp_dir().join(format!("arle-mesh-{}", std::process::id()));
+        let _mesh_guard = MeshDirGuard(mesh_dir.clone());
         std::fs::create_dir_all(&mesh_dir)
             .with_context(|| format!("create mesh dir {}", mesh_dir.display()))?;
         let mut children: Vec<(usize, std::process::Child)> = Vec::with_capacity(size);
@@ -153,19 +160,17 @@ pub(crate) fn maybe_spawn_mesh_and_wait(
             .map(Duration::from_secs);
         // Followers exit cleanly at the leader's end-of-stream marker while rank 0
         // still runs eval/save, so only a rank-0 exit (any code) or a nonzero exit
-        // tears the group down.
-        let mut exited = vec![false; size];
+        // tears the group down; cleanly-exited followers leave the poll set.
         let (exit_rank, code) = loop {
-            let hit = children.iter_mut().find_map(|(r, c)| {
-                (!exited[*r])
-                    .then(|| c.try_wait().ok().flatten().map(|s| (*r, s.code())))
-                    .flatten()
+            let hit = (0..children.len()).find_map(|i| {
+                let (r, c) = &mut children[i];
+                c.try_wait().ok().flatten().map(|s| (i, *r, s.code()))
             });
-            if let Some((rank, code)) = hit {
+            if let Some((i, rank, code)) = hit {
                 if rank == 0 || code != Some(0) {
                     break (rank, code);
                 }
-                exited[rank] = true;
+                children.swap_remove(i);
                 log::info!("{axis} rank {rank} exited cleanly; waiting for rank 0");
                 continue;
             }
@@ -182,7 +187,6 @@ pub(crate) fn maybe_spawn_mesh_and_wait(
                         let _ = child.wait();
                         log::info!("killed hung {axis} rank {rank}");
                     }
-                    let _ = std::fs::remove_dir_all(&mesh_dir);
                     anyhow::bail!("{axis} group hung: no rank progressed for {idle:?}");
                 }
             }
@@ -200,7 +204,6 @@ pub(crate) fn maybe_spawn_mesh_and_wait(
         for f in forwarders {
             let _ = f.join();
         }
-        let _ = std::fs::remove_dir_all(&mesh_dir);
         match code {
             Some(0) => Ok(true),
             other => anyhow::bail!("{axis} rank {exit_rank} exited with {other:?}"),
