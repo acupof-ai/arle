@@ -3069,12 +3069,278 @@ fn synthetic_writeback_fd_probe<O: autograd::Optimizer>(
     Ok(())
 }
 
-/// Rank-0 → follower update stream for cp>1 agent-opd. Stochastic cc rollouts
-/// diverge across mesh ranks, so rank 0 owns rollout + filtering and publishes
-/// every update's batch; followers mirror the update calls, keeping the
-/// writeback's cp collectives on identical call sequences. Files live under the
+/// Rollout engine + cc serve + autograd student for one agent-opd rank. Every
+/// mesh rank loads this (the cp fleet serves one group's samples in parallel);
+/// rank 0 additionally owns the harness, filtering, and saves.
+#[cfg(feature = "cuda")]
+struct AgentOpdServeStudent {
+    infer_student: train::infer_student::InferStudent,
+    student: train::qwen35::Qwen35Model,
+    serve_thread: infer_api::ServeThread,
+    dump_dir: PathBuf,
+    cc_model_id: String,
+    all_params: Vec<TensorId>,
+    trainable: Vec<TensorId>,
+}
+
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+fn load_agent_opd_serve_student(
+    args: &TrainAgentOpdArgs,
+    lora: train::lora::LoraConfig,
+    target_set: train::lora::LoraTargetSet,
+    serve_port: u16,
+    eval_out_dir: &Path,
+    vocab: usize,
+    store: &mut autograd::TensorStore,
+    train_backend: &std::sync::Arc<dyn autograd::Backend>,
+) -> Result<AgentOpdServeStudent> {
+    use std::sync::{Arc, Mutex};
+
+    use infer_api::{EngineLoadConfig, LoadedInferenceEngine};
+    use train::{
+        infer_student::InferStudent,
+        qwen35_checkpoint::load_qwen35_lora_adapters,
+        qwen35_loader::{SharedFrozenBaseEntry, load_qwen35_lora_from_hf_dir_with_shared_base},
+    };
+
+    let student_dir = args.student_model.as_path();
+    // Rollout engine (student) doubles as the cc serve. KV budget for cc
+    // traffic: K concurrent cc streams × the measured session ceiling, +25%
+    // headroom, page_size 16.
+    use train::cc_harness::{CC_MAX_SESSION_TOKENS, CC_SESSION_TOKENS};
+    let width = args.samples_per_prompt.max(1);
+    // Pool = K typical streams, but never smaller than one full long-horizon
+    // session (+25% headroom each) so a 200K session stays schedulable.
+    let cc_pages = (width * CC_SESSION_TOKENS)
+        .max(CC_MAX_SESSION_TOKENS)
+        .div_ceil(16);
+    let cc_total_pages = cc_pages + cc_pages / 4;
+
+    // Load order: default loads the autograd student FIRST (engine then sees
+    // post-student free VRAM — byte-identical). --share-frozen-base loads the
+    // engine FIRST so the student can import (zero-copy) its resident FP8 base.
+    let prebuilt_student = if !args.no_share_frozen_base {
+        None
+    } else {
+        eprintln!(
+            "[arle train agent-opd] loading student from {}",
+            student_dir.display()
+        );
+        Some(
+            load_qwen35_lora_from_hf_dir_with_shared_base(
+                student_dir,
+                lora,
+                target_set,
+                args.lora_layer_start,
+                args.lora_skip_experts,
+                None,
+                store,
+            )
+            .with_context(|| format!("load LoRA student from {}", student_dir.display()))?,
+        )
+    };
+
+    eprintln!(
+        "[arle train agent-opd] loading rollout engine from {} (slots={width} pages={cc_total_pages})",
+        student_dir.display()
+    );
+    let student_engine = LoadedInferenceEngine::load_with_config(
+        student_dir
+            .to_str()
+            .ok_or_else(|| anyhow!("student path is not valid UTF-8"))?,
+        // agent-OPD: decode CUDA-graph default-OFF. Its captured workspace (~30 GB
+        // on the 27B MoE, captured during the rollout's decode) would co-reside
+        // with the masked-CE writeback and OOM it (post-rollout engine ~87 GB vs
+        // ~55 GB no-graph). A measured ~26 GB headroom made it worth exposing as
+        // --qwen35-decode-graph; the default flip waits for the co-residency license.
+        args.runtime.qwen35_decode_graph,
+        EngineLoadConfig {
+            num_slots: width,
+            page_size: 16,
+            total_pages: cc_total_pages,
+            // Request caps are POOL-derived, not per-session: capping at
+            // CC_SESSION_TOKENS silently aborted cc mid-conversation (a
+            // tripwire — sidecars showed prompt>22K → gen 0). The pool bounds
+            // memory and the engine preempts under KV pressure (#162).
+            max_prompt_tokens: cc_total_pages * 16 - 256,
+            max_total_tokens: cc_total_pages * 16,
+            chunked_prefill_size: Some(CC_SESSION_TOKENS),
+            mem_fraction_static: args.runtime.rollout_mem_fraction,
+            dspark_draft_model: args.runtime.dspark_draft_model.clone(),
+            dspark_sps_bias_ms: args.runtime.dspark_sps_bias_ms,
+            dspark_sps_row_ms: args.runtime.dspark_sps_row_ms,
+            // MTP GPU gate passed 2026-07-17 (1.21×); default-on waits for the
+            // depth sweep + an in-loop A/B.
+            mtp_draft_tokens: args.runtime.mtp_draft_tokens,
+            cuda: args.runtime.cuda_runtime_flags(),
+            ..EngineLoadConfig::default()
+        },
+    )
+    .with_context(|| format!("load rollout engine from {}", student_dir.display()))?;
+    log_opd_vram("after rollout engine load (KV pool alloc'd)", train_backend);
+
+    // cc serve over THIS engine (same engine thread, same KV pool): install the
+    // dump sink BEFORE any traffic, then serve the router on a background
+    // thread. Token-only shutdown (`serve_thread.shutdown()` at run end).
+    // Every fleet rank shares ONE dump dir (filenames are pid-tagged).
+    let dump_dir = eval_out_dir.join("dumps");
+    infer_api::set_messages_dump_dir(&dump_dir)
+        .with_context(|| format!("create cc dump dir {}", dump_dir.display()))?;
+    let cc_model_id = infer_api::InferenceEngine::model_id(&student_engine).to_owned();
+    // Rollout = flag temperature (>0 keeps behavior logprobs non-empty) +
+    // model nucleus from generation_config (truncates the tail — no salad).
+    let mut sampling_defaults = infer_api::SamplingDefaults::from_generation_config(student_dir);
+    sampling_defaults.temperature = args.rollout_temperature;
+    infer_api::set_sampling_defaults(sampling_defaults);
+    let serve_thread = infer_api::serve_router_on_thread(
+        student_engine.local_router(0)?, // thinking unbounded — the serve default
+        "127.0.0.1",
+        serve_port,
+    )?;
+    eprintln!(
+        "[arle train agent-opd] cc serve on http://127.0.0.1:{} (model={cc_model_id}, dumps={})",
+        serve_port,
+        dump_dir.display()
+    );
+
+    // Train-infer FP8 weight sharing (`--share-frozen-base`): borrow the rollout
+    // engine's resident FP8 base pointers and pass them into the autograd student
+    // load so its frozen FP8 base projections import a NON-OWNING view.
+    let shared_base_entries: Vec<SharedFrozenBaseEntry> = if !args.no_share_frozen_base {
+        let table = student_engine
+            .frozen_base_fp8_pointers()
+            .context("borrow rollout-engine FP8 base pointers for --share-frozen-base")?;
+        eprintln!(
+            "[arle train agent-opd] --share-frozen-base: borrowing {} resident FP8 base projections from the rollout engine (zero-copy)",
+            table.len()
+        );
+        table
+            .into_iter()
+            .map(|p| SharedFrozenBaseEntry {
+                layer_idx: p.layer_idx,
+                proj_suffix: p.proj_suffix,
+                weight_ptr: p.weight_ptr,
+                scale_ptr: p.scale_ptr,
+                rows: p.rows,
+                cols: p.cols,
+                block_m: p.block_m,
+                block_k: p.block_k,
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let shared_base = if !args.no_share_frozen_base {
+        Some(shared_base_entries.as_slice())
+    } else {
+        None
+    };
+
+    let student = match prebuilt_student {
+        Some(s) => s,
+        None => {
+            eprintln!(
+                "[arle train agent-opd] loading student from {}",
+                student_dir.display()
+            );
+            load_qwen35_lora_from_hf_dir_with_shared_base(
+                student_dir,
+                lora,
+                target_set,
+                args.lora_layer_start,
+                args.lora_skip_experts,
+                shared_base,
+                store,
+            )
+            .with_context(|| format!("load LoRA student from {}", student_dir.display()))?
+        }
+    };
+
+    // Resume: overlay a saved adapter onto the fresh student (both load branches
+    // merge here) BEFORE the handoff fence, so its A/B uploads drain with the base.
+    if let Some(dir) = args.lora_adapters.as_deref() {
+        load_qwen35_lora_adapters(&student, store, dir)
+            .with_context(|| format!("resume LoRA adapter from {}", dir.display()))?;
+        eprintln!("[agent-opd] resumed adapter from {}", dir.display());
+    }
+
+    // Shared-base bytes alias the engine's resident FP8 — drain the autograd
+    // backend's OWN in-flight uploads before the first autograd forward
+    // (cross-stream handoff fence). MUST be a stream-scoped sync, NOT a
+    // context-wide `cuCtxSynchronize`: the co-resident rollout engine shares this
+    // device primary context but runs its streams with cudarc event-tracking
+    // DISABLED and idle-parked between scheduler steps, so a `cuCtxSynchronize`
+    // here blocks forever in poll() draining the engine's never-host-progressed
+    // streams (measured deadlock — main thread poll(nfds=2,-1), GPU flat, all
+    // 851 student tensors already materialized). The engine's resident FP8 base
+    // weights are fully written by its own load+warmup before this point, so the
+    // borrow only needs the student's own upload stream drained.
+    if !args.no_share_frozen_base {
+        let opd_load_trace = std::env::var("ARLE_OPD_LOAD_TRACE").is_ok();
+        if opd_load_trace {
+            eprintln!("[opd-load-trace] pre stream-sync (share-frozen-base handoff fence)");
+        }
+        train_backend
+            .stream_synchronize()
+            .context("stream sync before first shared-base autograd forward")?;
+        if opd_load_trace {
+            eprintln!("[opd-load-trace] post stream-sync OK; building InferStudent");
+        }
+    }
+
+    let all_params: Vec<TensorId> = student.all_parameter_ids();
+    let trainable: Vec<TensorId> = all_params
+        .iter()
+        .copied()
+        .filter(|id| store.get(*id).is_some_and(|tensor| tensor.requires_grad))
+        .collect();
+    if trainable.is_empty() {
+        bail!("agent-opd student has no trainable (LoRA) parameters; check --lora-target-set");
+    }
+
+    let infer_student = InferStudent::new(
+        Arc::new(Mutex::new(student_engine)),
+        train_backend.clone(),
+        vocab,
+    );
+    log_opd_vram(
+        "after autograd student load (resident floor)",
+        train_backend,
+    );
+
+    Ok(AgentOpdServeStudent {
+        infer_student,
+        student,
+        serve_thread,
+        dump_dir,
+        cc_model_id,
+        all_params,
+        trainable,
+    })
+}
+
+/// Rank-0 → follower stream for cp>1 agent-opd. Stochastic cc rollouts diverge
+/// across mesh ranks, so rank 0 owns the harness + filtering and publishes
+/// every update's batch plus the engine-lifecycle decisions around it;
+/// followers serve rollouts and mirror the calls, keeping the writeback's cp
+/// collectives on identical call sequences. Files live under the
 /// coordinator-minted `ARLE_TRAIN_MESH_DIR`; publish is write-then-rename so a
 /// reader never sees a partial file.
+#[cfg(feature = "cuda")]
+#[derive(serde::Serialize, serde::Deserialize)]
+enum MeshMsg {
+    Update {
+        batch: Vec<train::update_strategy::ScoredTrajectory>,
+        /// Mirror of the leader's quiesce + scratch/KV release before this
+        /// update (skipped under staleness>0 with a group in flight).
+        release_engines: bool,
+    },
+    /// End of one group's updates: re-merge LoRA when the leader did, then
+    /// re-acquire the KV pool for the next rollout.
+    GroupEnd { synced: bool },
+}
+
 #[cfg(feature = "cuda")]
 struct MeshUpdateChannel {
     dir: PathBuf,
@@ -3097,9 +3363,9 @@ impl MeshUpdateChannel {
         self.dir.join(format!("upd-{seq:08}.json"))
     }
 
-    fn publish(&mut self, batch: &[train::update_strategy::ScoredTrajectory]) -> Result<()> {
+    fn publish(&mut self, msg: &MeshMsg) -> Result<()> {
         let tmp = self.dir.join(format!("upd-{:08}.tmp", self.seq));
-        std::fs::write(&tmp, serde_json::to_vec(batch)?)?;
+        std::fs::write(&tmp, serde_json::to_vec(msg)?)?;
         std::fs::rename(&tmp, self.upd_path(self.seq))?;
         self.seq += 1;
         Ok(())
@@ -3109,13 +3375,10 @@ impl MeshUpdateChannel {
         std::fs::write(self.dir.join("end"), b"").map_err(Into::into)
     }
 
-    /// Blocks until the next batch (`Some`) or the end marker (`None`).
+    /// Blocks until the next message (`Some`) or the end marker (`None`).
     /// `delete_prev`: the last cp rank removes consumed files — by the time its
     /// update k completed, NCCL lockstep guarantees every rank has read file k.
-    fn recv(
-        &mut self,
-        delete_prev: bool,
-    ) -> Result<Option<Vec<train::update_strategy::ScoredTrajectory>>> {
+    fn recv(&mut self, delete_prev: bool) -> Result<Option<MeshMsg>> {
         if delete_prev && self.seq > 0 {
             let _ = std::fs::remove_file(self.upd_path(self.seq - 1));
         }
@@ -3136,59 +3399,55 @@ impl MeshUpdateChannel {
     }
 }
 
-/// cp rank > 0 of the cc-rollout lane: no serve, no rollouts — load the autograd
-/// student + optimizer and mirror rank 0's update stream until end-of-stream.
+/// Eval dumps land in --eval-out-dir, else next to the LoRA adapters / full
+/// checkpoint, else the current dir. Pure function of args so every fleet rank
+/// derives the same shared dump dir.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+fn agent_opd_eval_out_dir(args: &TrainAgentOpdArgs) -> PathBuf {
+    args.eval_out_dir
+        .clone()
+        .or_else(|| args.save_lora_adapters.clone())
+        .or_else(|| args.save_checkpoint.clone())
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// cp rank > 0 of the cc-rollout lane: serve rollouts for rank 0's harness
+/// (fleet endpoint) and mirror rank 0's update stream — including its engine
+/// quiesce/release and LoRA re-merge decisions — until end-of-stream.
 #[cfg(feature = "cuda")]
 fn run_agent_opd_cp_follower(
     args: &TrainAgentOpdArgs,
     lora: train::lora::LoraConfig,
     target_set: train::lora::LoraTargetSet,
+    serve_port: u16,
 ) -> Result<()> {
     use autograd::optim::AdamW;
-    use train::{
-        qwen35_checkpoint::load_qwen35_lora_adapters,
-        qwen35_loader::load_qwen35_lora_from_hf_dir_with_shared_base,
-    };
 
     let cp = train::context_parallel::CpContext::from_env();
     let update_preset = args.update_preset();
     let student_dir = args.student_model.as_path();
-    let (mut store, _train_backend, _label) = build_opd_store(args.backend)?;
+    let (mut store, train_backend, _label) = build_opd_store(args.backend)?;
     apply_tape_dtype(&mut store, args.tape_dtype)?;
     let hf_config = Qwen35Config::from_json_file(student_dir.join("config.json"))
         .with_context(|| format!("read config.json from {}", student_dir.display()))?;
     let vocab = hf_config.vocab_size;
+    let eval_out_dir = agent_opd_eval_out_dir(args);
 
-    eprintln!(
-        "[agent-opd] cp follower rank {}: loading student from {}",
-        cp.rank,
-        student_dir.display()
-    );
-    let student = load_qwen35_lora_from_hf_dir_with_shared_base(
-        student_dir,
+    let fleet = load_agent_opd_serve_student(
+        args,
         lora,
         target_set,
-        args.lora_layer_start,
-        args.lora_skip_experts,
-        None,
+        serve_port,
+        &eval_out_dir,
+        vocab,
         &mut store,
-    )
-    .with_context(|| format!("load LoRA student from {}", student_dir.display()))?;
-    if let Some(dir) = args.lora_adapters.as_deref() {
-        load_qwen35_lora_adapters(&student, &mut store, dir)
-            .with_context(|| format!("resume LoRA adapter from {}", dir.display()))?;
-    }
-    let all_params: Vec<TensorId> = student.all_parameter_ids();
-    let trainable: Vec<TensorId> = all_params
-        .iter()
-        .copied()
-        .filter(|id| store.get(*id).is_some_and(|tensor| tensor.requires_grad))
-        .collect();
+        &train_backend,
+    )?;
     let mut optimizer = AdamW::new(args.lr, (0.9, 0.999), 1.0e-8, 0.0);
     let mut value_critic = match update_preset.advantage {
         train::update_strategy::Advantage::ValueGae { gamma, lam } => Some(
             train::opd::ValueCritic::new(
-                student.config().hidden_size,
+                fleet.student.config().hidden_size,
                 args.value_lr,
                 gamma,
                 lam,
@@ -3198,49 +3457,77 @@ fn run_agent_opd_cp_follower(
         ),
         _ => None,
     };
+    let adapter_map = fleet.student.adapter_name_map();
 
     let mut rx = MeshUpdateChannel::from_env()?;
+    // Rank 0 waits for this before its first session can hit our endpoint.
+    std::fs::write(rx.dir.join(format!("serve-r{}.ready", cp.rank)), b"")?;
     let delete_prev = cp.rank + 1 == cp.size;
-    while let Some(batch) = rx.recv(delete_prev)? {
-        let report = update_preset
-            .update(
-                &batch,
-                &student,
-                all_params.as_slice(),
-                trainable.as_slice(),
-                &mut optimizer,
-                value_critic.as_mut(),
-                vocab,
-                args.writeback_window,
-                &mut store,
-            )
-            .map_err(anyhow::Error::from)?;
-        eprintln!(
-            "[agent-opd] follower update {}: trained={} loss={:.6}",
-            rx.seq - 1,
-            report.trained,
-            report.loss
-        );
-        if let Err(err) = store.backend().trim_memory_pool() {
-            eprintln!("[agent-opd] follower device-pool trim failed: {err}");
+    while let Some(msg) = rx.recv(delete_prev)? {
+        match msg {
+            MeshMsg::Update {
+                batch,
+                release_engines,
+            } => {
+                if release_engines {
+                    quiesce_serve(fleet.infer_student.engine())?;
+                    if let Err(err) = fleet.infer_student.release_inference_scratch() {
+                        eprintln!("[agent-opd] follower release inference scratch failed: {err}");
+                    }
+                    if let Err(err) = fleet.infer_student.release_kv_pool() {
+                        eprintln!("[agent-opd] follower release KV pool failed: {err}");
+                    }
+                }
+                let report = update_preset
+                    .update(
+                        &batch,
+                        &fleet.student,
+                        fleet.all_params.as_slice(),
+                        fleet.trainable.as_slice(),
+                        &mut optimizer,
+                        value_critic.as_mut(),
+                        vocab,
+                        args.writeback_window,
+                        &mut store,
+                    )
+                    .map_err(anyhow::Error::from)?;
+                eprintln!(
+                    "[agent-opd] follower update {}: trained={} loss={:.6}",
+                    rx.seq - 1,
+                    report.trained,
+                    report.loss
+                );
+                if let Err(err) = store.backend().trim_memory_pool() {
+                    eprintln!("[agent-opd] follower device-pool trim failed: {err}");
+                }
+            }
+            MeshMsg::GroupEnd { synced } => {
+                if synced {
+                    fleet
+                        .infer_student
+                        .sync_lora_from_store(&mut store, &adapter_map, lora)
+                        .context("follower: sync trained LoRA into rollout engine")?;
+                }
+                fleet
+                    .infer_student
+                    .ensure_kv_pool_and_resume_admissions()
+                    .context("follower: restore rollout engine after group")?;
+            }
         }
     }
     eprintln!("[agent-opd] cp follower rank {}: end of stream", cp.rank);
+    fleet.serve_thread.shutdown()?;
     Ok(())
 }
 
 #[cfg(feature = "cuda")]
 fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
 
     use autograd::optim::AdamW;
-    use infer_api::{EngineLoadConfig, LoadedInferenceEngine};
     use train::{
-        infer_student::InferStudent,
         lora::LoraConfig,
         opd::{WritebackLoss, masked_writeback_ce_step_dispatch, masked_writeback_step},
-        qwen35_checkpoint::load_qwen35_lora_adapters,
-        qwen35_loader::{SharedFrozenBaseEntry, load_qwen35_lora_from_hf_dir_with_shared_base},
         swe_dataset::SweTask,
     };
 
@@ -3304,7 +3591,7 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
 
     if args.synthetic_writeback_seq == 0 && train::context_parallel::CpContext::from_env().rank > 0
     {
-        return run_agent_opd_cp_follower(&args, lora, target_set);
+        return run_agent_opd_cp_follower(&args, lora, target_set, serve_port);
     }
 
     // Pre-CUDA sandbox-spawner: fork ONE non-CUDA helper to own all rollout
@@ -3394,14 +3681,7 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
         }
         None => Vec::new(),
     };
-    // Eval dumps land in --eval-out-dir, else next to the LoRA adapters / full
-    // checkpoint, else the current dir.
-    let eval_out_dir: PathBuf = args
-        .eval_out_dir
-        .clone()
-        .or_else(|| args.save_lora_adapters.clone())
-        .or_else(|| args.save_checkpoint.clone())
-        .unwrap_or_else(|| PathBuf::from("."));
+    let eval_out_dir: PathBuf = agent_opd_eval_out_dir(&args);
     // Structured per-round metrics sink (one JSON line/round). Machine-readable
     // replacement for stderr regex-scraping; defaults beside the eval dumps.
     let metrics_path: PathBuf = args
@@ -3409,211 +3689,25 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
         .clone()
         .unwrap_or_else(|| eval_out_dir.join("metrics.jsonl"));
 
-    // Rollout engine (student) doubles as the cc serve. KV budget for cc
-    // traffic: K concurrent cc streams × the measured session ceiling, +25%
-    // headroom, page_size 16.
-    use train::cc_harness::{CC_MAX_SESSION_TOKENS, CC_SESSION_TOKENS};
     let width = args.samples_per_prompt.max(1);
-    // Pool = K typical streams, but never smaller than one full long-horizon
-    // session (+25% headroom each) so a 200K session stays schedulable.
-    let cc_pages = (width * CC_SESSION_TOKENS)
-        .max(CC_MAX_SESSION_TOKENS)
-        .div_ceil(16);
-    let cc_total_pages = cc_pages + cc_pages / 4;
-
-    // Load order: default loads the autograd student FIRST (engine then sees
-    // post-student free VRAM — byte-identical). --share-frozen-base loads the
-    // engine FIRST so the student can import (zero-copy) its resident FP8 base.
-    let prebuilt_student = if !args.no_share_frozen_base {
-        None
-    } else {
-        eprintln!(
-            "[arle train agent-opd] loading student from {}",
-            student_dir.display()
-        );
-        Some(
-            load_qwen35_lora_from_hf_dir_with_shared_base(
-                student_dir,
-                lora,
-                target_set,
-                args.lora_layer_start,
-                args.lora_skip_experts,
-                None,
-                &mut store,
-            )
-            .with_context(|| format!("load LoRA student from {}", student_dir.display()))?,
-        )
-    };
-
-    eprintln!(
-        "[arle train agent-opd] loading rollout engine from {} (slots={width} pages={cc_total_pages})",
-        student_dir.display()
-    );
-    let student_engine = LoadedInferenceEngine::load_with_config(
-        student_dir
-            .to_str()
-            .ok_or_else(|| anyhow!("student path is not valid UTF-8"))?,
-        // agent-OPD: decode CUDA-graph default-OFF. Its captured workspace (~30 GB
-        // on the 27B MoE, captured during the rollout's decode) would co-reside
-        // with the masked-CE writeback and OOM it (post-rollout engine ~87 GB vs
-        // ~55 GB no-graph). A measured ~26 GB headroom made it worth exposing as
-        // --qwen35-decode-graph; the default flip waits for the co-residency license.
-        args.runtime.qwen35_decode_graph,
-        EngineLoadConfig {
-            num_slots: width,
-            page_size: 16,
-            total_pages: cc_total_pages,
-            // Request caps are POOL-derived, not per-session: capping at
-            // CC_SESSION_TOKENS silently aborted cc mid-conversation (a
-            // tripwire — sidecars showed prompt>22K → gen 0). The pool bounds
-            // memory and the engine preempts under KV pressure (#162).
-            max_prompt_tokens: cc_total_pages * 16 - 256,
-            max_total_tokens: cc_total_pages * 16,
-            chunked_prefill_size: Some(CC_SESSION_TOKENS),
-            mem_fraction_static: args.runtime.rollout_mem_fraction,
-            dspark_draft_model: args.runtime.dspark_draft_model.clone(),
-            dspark_sps_bias_ms: args.runtime.dspark_sps_bias_ms,
-            dspark_sps_row_ms: args.runtime.dspark_sps_row_ms,
-            // MTP GPU gate passed 2026-07-17 (1.21×); default-on waits for the
-            // depth sweep + an in-loop A/B.
-            mtp_draft_tokens: args.runtime.mtp_draft_tokens,
-            cuda: args.runtime.cuda_runtime_flags(),
-            ..EngineLoadConfig::default()
-        },
-    )
-    .with_context(|| format!("load rollout engine from {}", student_dir.display()))?;
-    log_opd_vram(
-        "after rollout engine load (KV pool alloc'd)",
-        &train_backend,
-    );
-
-    // cc serve over THIS engine (same engine thread, same KV pool): install the
-    // dump sink BEFORE any traffic, then serve the router on a background
-    // thread. Token-only shutdown (`serve_thread.shutdown()` at run end).
-    let dump_dir = eval_out_dir.join("dumps");
-    infer_api::set_messages_dump_dir(&dump_dir)
-        .with_context(|| format!("create cc dump dir {}", dump_dir.display()))?;
-    let cc_model_id = infer_api::InferenceEngine::model_id(&student_engine).to_owned();
-    // Rollout = flag temperature (>0 keeps behavior logprobs non-empty) +
-    // model nucleus from generation_config (truncates the tail — no salad).
-    let mut sampling_defaults = infer_api::SamplingDefaults::from_generation_config(student_dir);
-    sampling_defaults.temperature = args.rollout_temperature;
-    infer_api::set_sampling_defaults(sampling_defaults);
-    let serve_thread = infer_api::serve_router_on_thread(
-        student_engine.local_router(0)?, // thinking unbounded — the serve default
-        "127.0.0.1",
+    let AgentOpdServeStudent {
+        infer_student,
+        student,
+        serve_thread,
+        dump_dir,
+        cc_model_id,
+        all_params,
+        trainable,
+    } = load_agent_opd_serve_student(
+        &args,
+        lora,
+        target_set,
         serve_port,
-    )?;
-    eprintln!(
-        "[arle train agent-opd] cc serve on http://127.0.0.1:{} (model={cc_model_id}, dumps={})",
-        serve_port,
-        dump_dir.display()
-    );
-
-    // Train-infer FP8 weight sharing (`--share-frozen-base`): borrow the rollout
-    // engine's resident FP8 base pointers and pass them into the autograd student
-    // load so its frozen FP8 base projections import a NON-OWNING view.
-    let shared_base_entries: Vec<SharedFrozenBaseEntry> = if !args.no_share_frozen_base {
-        let table = student_engine
-            .frozen_base_fp8_pointers()
-            .context("borrow rollout-engine FP8 base pointers for --share-frozen-base")?;
-        eprintln!(
-            "[arle train agent-opd] --share-frozen-base: borrowing {} resident FP8 base projections from the rollout engine (zero-copy)",
-            table.len()
-        );
-        table
-            .into_iter()
-            .map(|p| SharedFrozenBaseEntry {
-                layer_idx: p.layer_idx,
-                proj_suffix: p.proj_suffix,
-                weight_ptr: p.weight_ptr,
-                scale_ptr: p.scale_ptr,
-                rows: p.rows,
-                cols: p.cols,
-                block_m: p.block_m,
-                block_k: p.block_k,
-            })
-            .collect()
-    } else {
-        Vec::new()
-    };
-    let shared_base = if !args.no_share_frozen_base {
-        Some(shared_base_entries.as_slice())
-    } else {
-        None
-    };
-
-    let student = match prebuilt_student {
-        Some(s) => s,
-        None => {
-            eprintln!(
-                "[arle train agent-opd] loading student from {}",
-                student_dir.display()
-            );
-            load_qwen35_lora_from_hf_dir_with_shared_base(
-                student_dir,
-                lora,
-                target_set,
-                args.lora_layer_start,
-                args.lora_skip_experts,
-                shared_base,
-                &mut store,
-            )
-            .with_context(|| format!("load LoRA student from {}", student_dir.display()))?
-        }
-    };
-
-    // Resume: overlay a saved adapter onto the fresh student (both load branches
-    // merge here) BEFORE the handoff fence, so its A/B uploads drain with the base.
-    if let Some(dir) = args.lora_adapters.as_deref() {
-        load_qwen35_lora_adapters(&student, &mut store, dir)
-            .with_context(|| format!("resume LoRA adapter from {}", dir.display()))?;
-        eprintln!("[agent-opd] resumed adapter from {}", dir.display());
-    }
-
-    // Shared-base bytes alias the engine's resident FP8 — drain the autograd
-    // backend's OWN in-flight uploads before the first autograd forward
-    // (cross-stream handoff fence). MUST be a stream-scoped sync, NOT a
-    // context-wide `cuCtxSynchronize`: the co-resident rollout engine shares this
-    // device primary context but runs its streams with cudarc event-tracking
-    // DISABLED and idle-parked between scheduler steps, so a `cuCtxSynchronize`
-    // here blocks forever in poll() draining the engine's never-host-progressed
-    // streams (measured deadlock — main thread poll(nfds=2,-1), GPU flat, all
-    // 851 student tensors already materialized). The engine's resident FP8 base
-    // weights are fully written by its own load+warmup before this point, so the
-    // borrow only needs the student's own upload stream drained.
-    if !args.no_share_frozen_base {
-        let opd_load_trace = std::env::var("ARLE_OPD_LOAD_TRACE").is_ok();
-        if opd_load_trace {
-            eprintln!("[opd-load-trace] pre stream-sync (share-frozen-base handoff fence)");
-        }
-        train_backend
-            .stream_synchronize()
-            .context("stream sync before first shared-base autograd forward")?;
-        if opd_load_trace {
-            eprintln!("[opd-load-trace] post stream-sync OK; building InferStudent");
-        }
-    }
-
-    let all_params: Vec<TensorId> = student.all_parameter_ids();
-    let trainable: Vec<TensorId> = all_params
-        .iter()
-        .copied()
-        .filter(|id| store.get(*id).is_some_and(|tensor| tensor.requires_grad))
-        .collect();
-    if trainable.is_empty() {
-        bail!("agent-opd student has no trainable (LoRA) parameters; check --lora-target-set");
-    }
-
-    let infer_student = InferStudent::new(
-        Arc::new(Mutex::new(student_engine)),
-        train_backend.clone(),
+        &eval_out_dir,
         vocab,
-    );
-    log_opd_vram(
-        "after autograd student load (resident floor)",
+        &mut store,
         &train_backend,
-    );
+    )?;
 
     let mut optimizer = AdamW::new(args.lr, (0.9, 0.999), 1.0e-8, 0.0);
     // Value critic (ValueGae presets): its weight is created AFTER the
@@ -3731,7 +3825,14 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
     let harness = Arc::new(train::cc_harness::CcHarness {
         work_root: args.work_root.clone(),
         dump_dir,
-        base_url: format!("http://127.0.0.1:{}", serve_port),
+        // Fleet endpoints: rank r serves on base port + r (cp>1); samples
+        // spread round-robin across them.
+        base_urls: {
+            let cp = train::context_parallel::CpContext::from_env();
+            (0..cp.size.max(1))
+                .map(|r| format!("http://127.0.0.1:{}", args.serve_port + r as u16))
+                .collect()
+        },
         model_id: cc_model_id,
         cc_timeout_secs: args.cc_timeout,
         test_timeout_secs: args.test_timeout_secs,
@@ -3739,6 +3840,27 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
         reward_shape: args.reward_shape.into(),
         tokenizer: train::cc_harness::load_tokenizer(&student_dir.join("tokenizer.json"))?,
     });
+
+    // cp>1: this process is rank 0 (followers branched off above). Stream every
+    // update's batch + engine-lifecycle decisions so follower ranks mirror the
+    // collective sequence; wait for every follower serve before any cc traffic.
+    let mut mesh_tx = train::context_parallel::CpContext::from_env()
+        .is_enabled()
+        .then(MeshUpdateChannel::from_env)
+        .transpose()?;
+    if let Some(tx) = mesh_tx.as_ref() {
+        let cp = train::context_parallel::CpContext::from_env();
+        for r in 1..cp.size {
+            let marker = tx.dir.join(format!("serve-r{r}.ready"));
+            while !marker.exists() {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+        }
+        eprintln!(
+            "[agent-opd] rollout fleet ready: {} serve endpoints",
+            cp.size
+        );
+    }
 
     // One deep tokenizer clone for the post-merge warm-up threads.
     let warmup_tokenizer = Arc::new(harness.tokenizer.clone());
@@ -3796,12 +3918,6 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
     // train reward climbs but held-out doesn't, the two diverge — a sign the model
     // is gaming the reward. We warn only when the gap is large AND still widening.
     let mut prev_eval_gap: Option<f64> = None;
-    // cp>1: this process is rank 0 (followers branched off above) — stream every
-    // update's batch so follower ranks mirror the collective sequence.
-    let mut mesh_tx = train::context_parallel::CpContext::from_env()
-        .is_enabled()
-        .then(MeshUpdateChannel::from_env)
-        .transpose()?;
     for round in 0..args.rounds {
         // Anchor the per-stage profiler (human table opt-in via ARLE_AOPD_PROFILE).
         train::aopd_profile::begin_round();
@@ -4016,7 +4132,8 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
             // drop and drains on its own. With NOTHING in flight
             // (`next.is_none()`), release exactly as at staleness 0 — a
             // resident pool+scratch atop the capture forward OOMed at 97.4 GB.
-            if args.staleness == 0 || next.is_none() {
+            let released_engines = args.staleness == 0 || next.is_none();
+            if released_engines {
                 // Quiesce before touching weights / dropping the KV pool: the
                 // group's cc children exited with run_group, so this only drains
                 // a straggler engine request — a live one would hit the dropped
@@ -4101,10 +4218,14 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
             // One update + its metrics row; `extra` carries the arm-specific
             // fields (fresh: group; replay: group/task_id/replayed/age).
             let mut run_update = |batch: &[train::update_strategy::ScoredTrajectory],
-                                  extra: serde_json::Value|
+                                  extra: serde_json::Value,
+                                  release_engines: bool|
              -> Result<()> {
                 if let Some(tx) = mesh_tx.as_mut() {
-                    tx.publish(batch)?;
+                    tx.publish(&MeshMsg::Update {
+                        batch: batch.to_vec(),
+                        release_engines,
+                    })?;
                 }
                 let update_started = Instant::now();
                 let report =
@@ -4156,6 +4277,7 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
                     "behavior_version": behavior_version,
                     "staleness": group_staleness,
                 }),
+                released_engines,
             )?;
 
             // Experience replay (fresh-anchored: only after the fresh group
@@ -4171,6 +4293,7 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
                             "replayed": true,
                             "age": round - entry.round,
                         }),
+                        false,
                     )?;
                     replayed_groups += 1;
                 }
@@ -4188,6 +4311,11 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
             // syncs once, at the last group. Then re-acquire the KV pool for
             // the next rollout.
             let synced = sync_every_group || pos + 1 == work.len();
+            // Followers re-merge into their own engines and re-acquire their KV
+            // pools in parallel with ours.
+            if let Some(tx) = mesh_tx.as_mut() {
+                tx.publish(&MeshMsg::GroupEnd { synced })?;
+            }
             if synced {
                 let sync_started = Instant::now();
                 infer_student

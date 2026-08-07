@@ -38,8 +38,9 @@ pub struct CcHarness {
     pub work_root: PathBuf,
     /// Serve `--dump-messages-dir` the attempt time-windows attribute against.
     pub dump_dir: PathBuf,
-    /// In-process serve origin, e.g. `http://127.0.0.1:8000`.
-    pub base_url: String,
+    /// Serve origins, e.g. `http://127.0.0.1:8000`. One per rollout engine;
+    /// samples spread round-robin, so a cp fleet serves one group in parallel.
+    pub base_urls: Vec<String>,
     /// Served model id (`claude --model` + `ANTHROPIC_MODEL`).
     pub model_id: String,
     pub cc_timeout_secs: u64,
@@ -345,7 +346,10 @@ impl CcHarness {
             .args(["--output-format", "json", "--dangerously-skip-permissions"])
             .arg(cc_prompt(&task.problem_statement))
             .current_dir(workdir)
-            .env("ANTHROPIC_BASE_URL", &self.base_url)
+            .env(
+                "ANTHROPIC_BASE_URL",
+                &self.base_urls[sample % self.base_urls.len()],
+            )
             .env("ANTHROPIC_API_KEY", "dummy-local")
             // Mandatory on a root container: --dangerously-skip-permissions
             // refuses under uid 0 without it.
