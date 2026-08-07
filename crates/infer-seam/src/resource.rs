@@ -220,8 +220,12 @@ impl Default for NvmeTierPolicy {
         Self {
             fraction: 0.5,
             floor_bytes: 8 * GIB,
-            reserve_floor_bytes: 50 * GIB,
-            reserve_fraction: 0.1,
+            // L3 is a write-through spill layer, not a budgeted cache: no
+            // reserve (neither absolute nor fractional). The budget caps how
+            // much disk the spill may consume; disk is consumed only on actual
+            // spill, so a reserve would just silently shrink the usable tier.
+            reserve_floor_bytes: 0,
+            reserve_fraction: 0.0,
         }
     }
 }
@@ -242,7 +246,12 @@ fn tier_budget_with_reserve(
     reserve_floor_bytes: usize,
     reserve_fraction: f64,
 ) -> usize {
-    let reserve = reserve_floor_bytes.max((total_bytes as f64 * reserve_fraction) as usize);
+    // Cap the reserve at 50% of total resource so a small box (total < 2×
+    // reserve_floor) still gets a non-zero budget instead of collapsing to 0.
+    let reserve_cap = (total_bytes as f64 * 0.5) as usize;
+    let reserve = reserve_floor_bytes
+        .max((total_bytes as f64 * reserve_fraction) as usize)
+        .min(reserve_cap);
     let ceiling = resource_bytes.saturating_sub(reserve);
     let scaled = (resource_bytes as f64 * fraction) as usize;
     // Lower-bound by the floor, then upper-bound by the reserve ceiling (the
@@ -530,9 +539,9 @@ mod tests {
     #[test]
     fn nvme_l3_budget_floor_and_probe_miss() {
         let p = NvmeTierPolicy::default();
-        // 12 GiB free, 64 GiB total → reserve = max(50, 6.4) = 50; ceiling = 12 − 50
-        // saturates to 0 → budget 0 (floor 8 can't claim into the reserve).
-        assert_eq!(nvme_l3_budget(Some(12 * GIB), Some(64 * GIB), p), 0);
+        // 12 GiB free, 64 GiB total → reserve = max(0, 0.05×64=3.2) = 3.2 GiB.
+        // ceiling = 12 − 3.2 = 8.8 GiB; 0.5×12 = 6 < floor 8 → budget = 8 GiB.
+        assert_eq!(nvme_l3_budget(Some(12 * GIB), Some(64 * GIB), p), 8 * GIB);
         // Probe miss → floor.
         assert_eq!(nvme_l3_budget(None, Some(DISK_TOTAL), p), p.floor_bytes);
         assert_eq!(nvme_l3_budget(Some(DISK_FREE), None, p), 8 * GIB);
