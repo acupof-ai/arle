@@ -29,18 +29,25 @@ python3 scripts/gen_bench_prompts.py bench-agent-32k-16x8.jsonl 16 32000 214 8
 
 ## Qwen3.6-27B-FP8 · 1×H20 · single-GPU · eager — LONG-AGENT ANCHOR
 
-### SOTA — DSpark, `4933e1bf4` (2026-08-07)
+### SOTA — DSpark, `70760bc09` (2026-08-07)
 
-> **Part of the c≥4 decode regression is fixed; c=16 still carries about half.**
-> The verify linear core ran a per-row host loop, costing B× the kernel launches
-> per layer; batching it is worth −12.7% TPOT at c=8 and +10.0% total tok/s at
-> c=16 in a counterbalanced A/B
-> ([`wins/2026-08-07-dspark-verify-linear-core-batched.md`](experience/wins/2026-08-07-dspark-verify-linear-core-batched.md)).
-> c=8 is now within 1.4% of the 07-30 champion, c=16 still 5.5% above it. The
+> **The c≥4 decode regression is closed.** Two per-row host loops were costing
+> B× the kernel launches per layer: the verify linear core
+> ([`wins/2026-08-07-dspark-verify-linear-core-batched.md`](experience/wins/2026-08-07-dspark-verify-linear-core-batched.md))
+> and the partial-accept rollback replay
+> ([`wins/2026-08-07-dspark-rollback-replay-batched.md`](experience/wins/2026-08-07-dspark-rollback-replay-batched.md)).
+> Both were reachable only because a flag defaulting on turned a minority branch
+> into the only path. Together they take c=16 TPOT 124.99 → 110.52 ms (−11.6%),
+> putting it 0.9% AHEAD of the 07-30 champion it had been 21.5% behind. The
 > audit that opened the regression is in
 > [`wins/2026-08-06-dspark-anchor-remeasure-c1-plus-40-percent.md`](experience/wins/2026-08-06-dspark-anchor-remeasure-c1-plus-40-percent.md).
-> Screen a candidate against c=1 and c=8 freely; c=16 is still against a
-> partly-sick champion.
+>
+> **Decode is launch-bound, prefill is not.** A pure-decode nsys window is 71.5%
+> GPU idle at 19157 launches/s; a prefill window is ≥76% busy with the dominant
+> GEMM at 92.7% SM throughput. Cost a decode-side lever against the first
+> number and a prefill-side one against the second — a measurement that does not
+> name its phase says nothing about the other
+> ([`errors/2026-08-07-measured-prefill-concluded-about-decode.md`](experience/errors/2026-08-07-measured-prefill-concluded-about-decode.md)).
 
 Features on: batched draft · replay · snapshot · capture · markov+confidence
 head driving the goodput budget. Serve adds `--spec-type dspark
@@ -72,62 +79,53 @@ is the whole-run figure and does not.
 
 | c | pt | TTFT cold | TTFT warm | TPOT | decode tok/s | total tok/s | req/s |
 |---|---|---:|---:|---:|---:|---:|---:|
-| 1 | 1st | 10.79 s | 0.80 s | 8.57 ms | **116.7** | **10486.0** | 0.300 |
-| 2 | 2nd | 0.66 s | 0.57 s | 18.66 ms | 53.6 | 21941.2 | 0.629 |
-| 4 | 3rd | 1.03 s | 0.60 s | 35.58 ms | 28.1 | 26853.3 | 0.769 |
-| 8 | 4th | 1.51 s | 0.74 s | **64.61 ms** | 15.5 | 31457.0 | 0.901 |
-| 16 | 5th | 3.46 s | 1.42 s | **117.68 ms** | 8.5 | **32953.9** | 0.944 |
+| 1 | 1st | 10.82 s | 0.84 s | 8.46 ms | **118.1** | **10453.0** | 0.300 |
+| 2 | 2nd | 0.84 s | 0.60 s | 18.70 ms | 53.5 | 22878.9 | 0.656 |
+| 4 | 3rd | 1.08 s | 0.63 s | 33.77 ms | 29.6 | 27160.7 | 0.778 |
+| 8 | 4th | 1.60 s | 0.79 s | **62.49 ms** | 16.0 | 31334.5 | 0.898 |
+| 16 | 5th | 2.90 s | 1.22 s | **110.52 ms** | 9.0 | **33780.3** | 0.968 |
 
 128/128 at every point, both sweeps, 0 errors. `prompt_tokens` 34782/request
-against a 32000 target (+8.7%, inside the ±10% bar). Cumulative `accept` 0.2996
-— 1.2% below the row this replaces, because the batched recurrent core is not
-bit-identical to per-row FlashQLA and the shifted numerics move which draft
-tokens verify. Correctness is gated by `scripts/needle_concurrent.py` (a
-distinct needle per row at c=2/8/16, ×3) rather than by acceptance.
+against a 32000 target (+8.7%, inside the ±10% bar). Cumulative `accept`
+0.3039 / 0.2977 across the two sweeps. Acceptance is not the correctness gate —
+the batched recurrent core is not bit-identical to per-row FlashQLA, so the
+numerics shift which draft tokens verify; correctness is gated by
+`scripts/needle_concurrent.py` (a distinct needle per row at c=2/8/16, ×3).
+
+`itl_p99` at c=16 is 758.8 ms against a 110.52 ms mean. The tail is a decode row
+waiting behind a prefill step: at the shipped 16384-token per-tick budget a
+prefill step carries ~890 ms of compute. `--max-num-batched-tokens` (added
+`ed92c6d8c`) exposes that budget; the roofline ridge for this box and model is
+~65 tokens, so the shipped value is ~250× past the point where more tokens buy
+throughput. Unmeasured — the knob exists to measure the curve.
 
 **Measured drift band, ±2.7%.** The same sweep run twice gave total tok/s
 10444.2 / 20484.9 / 24666.9 / 29450.8 / 31313.7 — the row above is the idle-box
 repeat, and the spread across the pair is what a candidate has to clear. Use
 this, not the ±3% constant at the top of the file, for this workload.
 
-**The superseded row, kept as the regression's other arm** — `51985031d`
-(2026-07-30) · `arle-mk`, re-run on the same box and dataset on 2026-08-06:
+**The 07-30 champion, kept as the closed regression's other arm** —
+`51985031d` · `arle-mk`, re-run on the same box and dataset on 2026-08-06.
+TPOT (ms), decode only:
 
-total tok/s (prefill + decode):
+| c | `arle-mk` (07-30 champion) | `b8d390bf3` (08-06, the regression) | this row |
+|---|---:|---:|---:|
+| 1 | 9.69 | 8.46 | **8.46** |
+| 2 | 19.82 | 18.89 | **18.70** |
+| 4 | 35.69 | 36.23 | **33.77** |
+| 8 | 63.68 | 69.89 | **62.49** |
+| 16 | 111.53 | 135.51 | **110.52** |
 
-| c | recorded 07-30 | `arle-mk` re-run | this row | Δ vs `arle-mk` |
-|---|---:|---:|---:|---:|
-| 1 | 7440.7 | 7287.4 | 10321.5 | **+41.6%** |
-| 2 | 8292.3 | 20740.4 | 19967.0 | −3.7% |
-| 4 | 25432.8 | 25265.7 | 23750.0 | −6.0% |
-| 8 | 31754.1 | 30621.3 | 27517.6 | **−10.1%** |
-| 16 | 32559.0 | 31890.9 | 29583.1 | **−7.2%** |
+The champion reproduced its own recorded row to within 1.1% at c=1 and 1.9% at
+c=16 when re-run, so the 08-06 deficit was a regression and not drift. Both
+per-row host loops behind it are fixed; this row is ahead of the champion at
+every point.
 
-**TPOT, decode only — this is where the regression actually lives:**
-
-| c | recorded TPOT | `arle-mk` re-run | this row | Δ decode tok/s |
-|---|---:|---:|---:|---:|
-| 1 | 9.80 ms | 9.69 ms | **8.46 ms** | **+14.5%** |
-| 2 | 31.26 ms | 19.82 ms | 18.89 ms | +4.8% |
-| 4 | 32.10 ms | 35.69 ms | 36.23 ms | −1.5% |
-| 8 | 60.70 ms | 63.68 ms | **69.89 ms** | **−8.9%** |
-| 16 | 109.43 ms | 111.53 ms | **135.51 ms** | **−17.7%** |
-
-The champion reproduces its own 07-30 row on both metrics — total tok/s within
-2.1% at c=1/4/16, TPOT within 1.1% at c=1 and 1.9% at c=16 — so the deficit is
-a regression rather than drift or a fingerprint difference.
-
-Separating the two metrics changes what has to be bisected. **The regression is
-in decode and scales with concurrency** (−1.5 / −8.9 / −17.7% at c=4/8/16),
-while c=1 decode got 14.5% *faster*. A blended `out tok/s` hid both halves. Any
-candidate mechanism has to explain a per-token cost that grows with batch and
-is absent at batch 1 — which rules out the prefill-side changes that landed in
-the same window, `SIDECAR_SNAPSHOT_STRIDE_PAGES` included, since a
-cross-conversation restore is TTFT work and cannot move steady-state TPOT.
-
-Both `this row` columns come from the audit's back-to-back shell; the standalone
-sweep above is a separate run of the same binary, which is why c=1 reads 10406.8
-there and 10321.5 here.
+The champion's binary no longer exists on the pod — `/host/spec-phase` and
+`/host/gdr-gates` were deleted between 08-06 and 08-07 — so the middle column is
+the last measurement anyone will get from it. An archived binary is a control
+only while it exists; the 08-07 A/Bs had to build their own control arm from
+the parent commit.
 
 Two properties of this row are load-bearing when reading it:
 
