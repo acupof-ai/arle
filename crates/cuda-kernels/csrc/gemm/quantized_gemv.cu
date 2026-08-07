@@ -185,6 +185,125 @@ extern "C" cudaError_t dequantize_w8a16_to_bf16_cuda(
     return cudaGetLastError();
 }
 
+// W4A16 dequant: 4-bit weight [N, K/2] (2 int4 per byte, low nibble first) ×
+// per-row per-group BF16 scale [N, K/group_size] → BF16 [N, K].
+// Same purpose as the W8A16 dequant above: dequant once, then one cuBLAS BF16
+// GEMM over all M rows (tensor cores on sm_80+, FP16-cast on sm_70).
+__global__ void dequantize_w4a16_to_bf16_kernel(
+    const uint8_t* __restrict__ weight,
+    const __nv_bfloat16* __restrict__ scales,
+    __nv_bfloat16* __restrict__ output,
+    int N,
+    int K,
+    int group_size)
+{
+    const long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    const long total = (long)N * K;
+    if (idx >= total) return;
+    const int row = (int)(idx / K);
+    const int col = (int)(idx % K);
+    const int num_groups = K / group_size;
+    const float scale = __bfloat162float(scales[row * num_groups + col / group_size]);
+    // 2 int4 per byte: low nibble = even col, high nibble = odd col.
+    const uint8_t byte = weight[row * (K / 2) + col / 2];
+    const int int4 = (col & 1) ? (byte >> 4) : (byte & 0x0F);
+    output[idx] = __float2bfloat16((float)(int4 - 8) * scale);
+}
+
+extern "C" cudaError_t dequantize_w4a16_to_bf16_cuda(
+    const uint8_t* weight,
+    const __nv_bfloat16* scales,
+    __nv_bfloat16* output,
+    int N,
+    int K,
+    int group_size,
+    cudaStream_t stream)
+{
+    if (N <= 0 || K <= 0 || group_size <= 0 || K % group_size != 0 || (K & 1) != 0) {
+        return cudaErrorInvalidValue;
+    }
+    const long total = (long)N * K;
+    const int threads = 256;
+    const long blocks = (total + threads - 1) / threads;
+    dequantize_w4a16_to_bf16_kernel<<<(unsigned int)blocks, threads, 0, stream>>>(
+        weight, scales, output, N, K, group_size);
+    return cudaGetLastError();
+}
+
+// W4A16 dequant directly to FP16 (skip BF16 intermediate). On sm_70 this
+// avoids the BF16→FP16 cast that `gemm_cuda` would otherwise do, halving the
+// dequant+cast memory traffic. Output is FP16; caller feeds it to a FP16
+// cublasGemmEx directly.
+//
+// Each thread processes 8 consecutive int4 values (4 bytes) to amortize the
+// scale load and reduce thread count.
+__global__ void dequantize_w4a16_to_fp16_kernel(
+    const uint8_t* __restrict__ weight,
+    const __nv_bfloat16* __restrict__ scales,
+    __half* __restrict__ output,
+    int N,
+    int K,
+    int group_size)
+{
+    // Each thread handles 8 consecutive columns.
+    const int cols_per_thread = 8;
+    const long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    const long total = (long)N * (K / cols_per_thread);
+    if (idx >= total) return;
+    const int row = (int)(idx / (K / cols_per_thread));
+    const int col_base = (int)(idx % (K / cols_per_thread)) * cols_per_thread;
+    const int num_groups = K / group_size;
+
+    // Load 4 bytes = 8 int4 values.
+    const uint32_t packed = *reinterpret_cast<const uint32_t*>(
+        &weight[row * (K / 2) + col_base / 2]);
+
+    // Extract 8 nibbles.
+    uint8_t b0 = packed & 0xFF;
+    uint8_t b1 = (packed >> 8) & 0xFF;
+    uint8_t b2 = (packed >> 16) & 0xFF;
+    uint8_t b3 = (packed >> 24) & 0xFF;
+
+    float vals[8];
+    vals[0] = (float)((int)(b0 & 0x0F) - 8);
+    vals[1] = (float)((int)(b0 >> 4) - 8);
+    vals[2] = (float)((int)(b1 & 0x0F) - 8);
+    vals[3] = (float)((int)(b1 >> 4) - 8);
+    vals[4] = (float)((int)(b2 & 0x0F) - 8);
+    vals[5] = (float)((int)(b2 >> 4) - 8);
+    vals[6] = (float)((int)(b3 & 0x0F) - 8);
+    vals[7] = (float)((int)(b3 >> 4) - 8);
+
+    // Apply scales (one scale per group_size columns).
+    #pragma unroll
+    for (int i = 0; i < cols_per_thread; i++) {
+        int group = (col_base + i) / group_size;
+        float scale = __bfloat162float(scales[row * num_groups + group]);
+        output[row * K + col_base + i] = __float2half(vals[i] * scale);
+    }
+}
+
+extern "C" cudaError_t dequantize_w4a16_to_fp16_cuda(
+    const uint8_t* weight,
+    const __nv_bfloat16* scales,
+    __half* output,
+    int N,
+    int K,
+    int group_size,
+    cudaStream_t stream)
+{
+    if (N <= 0 || K <= 0 || group_size <= 0 || K % group_size != 0 || (K & 1) != 0) {
+        return cudaErrorInvalidValue;
+    }
+    const int cols_per_thread = 8;
+    const long total = (long)N * (K / cols_per_thread);
+    const int threads = 256;
+    const long blocks = (total + threads - 1) / threads;
+    dequantize_w4a16_to_fp16_kernel<<<(unsigned int)blocks, threads, 0, stream>>>(
+        weight, scales, output, N, K, group_size);
+    return cudaGetLastError();
+}
+
 __device__ __forceinline__ float fp8_f32_dot16(
     const uint8_t* __restrict__ weight,
     const __nv_bfloat16* __restrict__ x)

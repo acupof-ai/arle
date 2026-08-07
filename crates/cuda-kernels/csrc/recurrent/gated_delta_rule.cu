@@ -234,8 +234,8 @@ __global__ void gated_delta_rule_prefill_recurrent_kernel(
         seq_len = row_len[slot];
     }
     int v_head = blockIdx.x;
-    int val_idx = threadIdx.x & 0x7F;
-    int j_slice = threadIdx.x >> 7;
+    // One thread per val_idx; state column lives in registers (128 floats).
+    int val_idx = threadIdx.x;
     int warp_id = threadIdx.x >> 5;
     int lane_id = threadIdx.x & 0x1F;
 
@@ -244,7 +244,6 @@ __global__ void gated_delta_rule_prefill_recurrent_kernel(
     int k_dim_total = q_dim_total;
     int qkv_stride = q_dim_total + k_dim_total + val_dim * num_value_heads;
     int out_stride = num_value_heads * val_dim;
-    // b/a already point at this slot's capture, whose rows start at 0.
     qkv += static_cast<size_t>(row_base) * qkv_stride;
     output += static_cast<size_t>(row_base) * out_stride;
 
@@ -252,111 +251,114 @@ __global__ void gated_delta_rule_prefill_recurrent_kernel(
     __shared__ float smem_k[GDR_KEY_DIM];
     __shared__ float smem_v[GDR_VAL_DIM];
     __shared__ float smem_norm[2];
-    __shared__ float warp_norms[GDR_BLOCK_DIM / WARP_SIZE];
+    __shared__ float warp_norms[GDR_VAL_DIM / WARP_SIZE * 2];
     __shared__ float s_exp_g;
     __shared__ float s_beta;
-    __shared__ float smem_kv_partial[GDR_J_SLICES][GDR_VAL_DIM];
-    __shared__ float smem_out_partial[GDR_J_SLICES][GDR_VAL_DIM];
 
     float* my_state = state + v_head * key_dim * val_dim;
-    int j_start = j_slice * GDR_J_PER_SLICE;
-    int j_end = j_start + GDR_J_PER_SLICE;
+
+    // Process state in chunks of CHUNK_J to keep register usage low (32 regs/thread)
+    // and allow more blocks per SM for better latency hiding.
+    #define CHUNK_J 32
+    #define NUM_CHUNKS (GDR_KEY_DIM / CHUNK_J)
 
     for (int token_idx = 0; token_idx < seq_len; ++token_idx) {
         const __nv_bfloat16* token_qkv = qkv + static_cast<size_t>(token_idx) * qkv_stride;
 
-        float q_val = 0.0f;
-        float k_val = 0.0f;
-        if (j_slice == 0) {
-            q_val = __bfloat162float(token_qkv[k_head * key_dim + val_idx]);
-            k_val = __bfloat162float(token_qkv[q_dim_total + k_head * key_dim + val_idx]);
-            smem_v[val_idx] = __bfloat162float(
-                token_qkv[q_dim_total + k_dim_total + v_head * val_dim + val_idx]);
-        }
+        // Load q, k for this head and v for this value head.
+        float q_val = __bfloat162float(token_qkv[k_head * key_dim + val_idx]);
+        float k_val = __bfloat162float(token_qkv[q_dim_total + k_head * key_dim + val_idx]);
+        smem_v[val_idx] = __bfloat162float(
+            token_qkv[q_dim_total + k_dim_total + v_head * val_dim + val_idx]);
 
-        float q_sq = (j_slice == 0) ? q_val * q_val : 0.0f;
-        q_sq = warp_reduce_sum(q_sq);
-        if (lane_id == 0) warp_norms[warp_id] = q_sq;
-        __syncthreads();
-
-        if (threadIdx.x == 0) {
-            float total = warp_norms[0] + warp_norms[1] + warp_norms[2] + warp_norms[3];
-            smem_norm[0] = rsqrtf(total + 1e-12f);
-        }
-        // Same q-vs-k warp_norms ordering hazard as the decode kernel: the
-        // q-partial read by thread 0 must complete before warps 1-3 overwrite
-        // warp_norms with k partials.
-        __syncthreads();
-
-        float k_sq = (j_slice == 0) ? k_val * k_val : 0.0f;
-        k_sq = warp_reduce_sum(k_sq);
-        if (lane_id == 0) warp_norms[warp_id] = k_sq;
-        __syncthreads();
-
-        if (threadIdx.x == 0) {
-            float total = warp_norms[0] + warp_norms[1] + warp_norms[2] + warp_norms[3];
-            smem_norm[1] = rsqrtf(total + 1e-12f);
-        }
-        __syncthreads();
-
-        q_val *= smem_norm[0];
-        k_val *= smem_norm[1];
-        q_val *= rsqrtf((float)key_dim);
-
-        if (j_slice == 0) {
-            smem_q[val_idx] = q_val;
-            smem_k[val_idx] = k_val;
-        }
-
+        // Compute a/b/exp_g/beta on thread 0 while other threads do norm work.
         if (threadIdx.x == 0) {
             float a_val = __bfloat162float(a_proj[token_idx * num_value_heads + v_head]);
             float b_val = __bfloat162float(b_proj[token_idx * num_value_heads + v_head]);
             float bias = __bfloat162float(dt_bias[v_head]);
             float a_log = A_log[v_head];
-
             float x = a_val + bias;
             float softplus_x = (x > 20.0f) ? x : logf(1.0f + expf(x));
             float g = -expf(a_log) * softplus_x;
             s_exp_g = expf(g);
             s_beta = 1.0f / (1.0f + expf(-b_val));
         }
+
+        // L2 normalize q and k together.
+        float q_sq = q_val * q_val;
+        float k_sq = k_val * k_val;
+        q_sq = warp_reduce_sum(q_sq);
+        k_sq = warp_reduce_sum(k_sq);
+        if (lane_id == 0) {
+            warp_norms[warp_id] = q_sq;
+            warp_norms[warp_id + 4] = k_sq;
+        }
         __syncthreads();
+
+        if (threadIdx.x == 0) {
+            float q_total = warp_norms[0] + warp_norms[1] + warp_norms[2] + warp_norms[3];
+            float k_total = warp_norms[4] + warp_norms[5] + warp_norms[6] + warp_norms[7];
+            smem_norm[0] = rsqrtf(q_total + 1e-12f);
+            smem_norm[1] = rsqrtf(k_total + 1e-12f);
+        }
+        __syncthreads();
+
+        q_val *= smem_norm[0] * rsqrtf((float)key_dim);
+        k_val *= smem_norm[1];
+
+        smem_q[val_idx] = q_val;
+        smem_k[val_idx] = k_val;
 
         float exp_g = s_exp_g;
         float beta = s_beta;
 
-        float partial_kv = 0.0f;
-        for (int j = j_start; j < j_end; j++) {
-            float s = my_state[j * val_dim + val_idx];
-            s *= exp_g;
-            my_state[j * val_dim + val_idx] = s;
-            partial_kv += s * smem_k[j];
+        // Decay + kv_mem in chunks. Each chunk loads CHUNK_J state values into registers.
+        float kv_mem = 0.0f;
+        #pragma unroll
+        for (int chunk = 0; chunk < NUM_CHUNKS; chunk++) {
+            float state_chunk[CHUNK_J];
+            const int j_base = chunk * CHUNK_J;
+            #pragma unroll
+            for (int jj = 0; jj < CHUNK_J; jj++) {
+                state_chunk[jj] = my_state[(j_base + jj) * val_dim + val_idx];
+            }
+            #pragma unroll
+            for (int jj = 0; jj < CHUNK_J; jj++) {
+                state_chunk[jj] *= exp_g;
+                kv_mem += state_chunk[jj] * smem_k[j_base + jj];
+            }
+            // Store decayed state back.
+            #pragma unroll
+            for (int jj = 0; jj < CHUNK_J; jj++) {
+                my_state[(j_base + jj) * val_dim + val_idx] = state_chunk[jj];
+            }
         }
 
-        smem_kv_partial[j_slice][val_idx] = partial_kv;
-        __syncthreads();
-
-        float kv_mem = smem_kv_partial[0][val_idx] + smem_kv_partial[1][val_idx]
-                     + smem_kv_partial[2][val_idx] + smem_kv_partial[3][val_idx];
         float my_delta = (smem_v[val_idx] - kv_mem) * beta;
 
-        float partial_out = 0.0f;
-        for (int j = j_start; j < j_end; j++) {
-            float s = my_state[j * val_dim + val_idx];
-            s += my_delta * smem_k[j];
-            my_state[j * val_dim + val_idx] = s;
-            partial_out += s * smem_q[j];
+        // Update + output in chunks.
+        float out = 0.0f;
+        #pragma unroll
+        for (int chunk = 0; chunk < NUM_CHUNKS; chunk++) {
+            float state_chunk[CHUNK_J];
+            const int j_base = chunk * CHUNK_J;
+            #pragma unroll
+            for (int jj = 0; jj < CHUNK_J; jj++) {
+                state_chunk[jj] = my_state[(j_base + jj) * val_dim + val_idx];
+            }
+            #pragma unroll
+            for (int jj = 0; jj < CHUNK_J; jj++) {
+                state_chunk[jj] += my_delta * smem_k[j_base + jj];
+                out += state_chunk[jj] * smem_q[j_base + jj];
+            }
+            #pragma unroll
+            for (int jj = 0; jj < CHUNK_J; jj++) {
+                my_state[(j_base + jj) * val_dim + val_idx] = state_chunk[jj];
+            }
         }
 
-        smem_out_partial[j_slice][val_idx] = partial_out;
-        __syncthreads();
-
-        if (j_slice == 0) {
-            float out = smem_out_partial[0][val_idx] + smem_out_partial[1][val_idx]
-                      + smem_out_partial[2][val_idx] + smem_out_partial[3][val_idx];
-            output[static_cast<size_t>(token_idx) * out_stride + v_head * val_dim + val_idx] =
-                __float2bfloat16(out);
-        }
+        output[static_cast<size_t>(token_idx) * out_stride + v_head * val_dim + val_idx] =
+            __float2bfloat16(out);
         __syncthreads();
     }
 }
@@ -379,7 +381,7 @@ cudaError_t gated_delta_rule_prefill_recurrent_cuda(
     if (key_dim != GDR_KEY_DIM || val_dim != GDR_VAL_DIM || seq_len < 0) {
         return cudaErrorInvalidValue;
     }
-    gated_delta_rule_prefill_recurrent_kernel<<<num_value_heads, GDR_BLOCK_DIM, 0, stream>>>(
+    gated_delta_rule_prefill_recurrent_kernel<<<num_value_heads, GDR_VAL_DIM, 0, stream>>>(
         qkv, b_proj, a_proj, nullptr, nullptr, dt_bias, A_log, state, nullptr, nullptr, output,
         num_key_heads, num_value_heads, key_dim, val_dim, seq_len
     );
@@ -408,7 +410,7 @@ cudaError_t gated_delta_rule_prefill_recurrent_varlen_cuda(
         return cudaErrorInvalidValue;
     }
     dim3 grid(num_value_heads, batch);
-    gated_delta_rule_prefill_recurrent_kernel<<<grid, GDR_BLOCK_DIM, 0, stream>>>(
+    gated_delta_rule_prefill_recurrent_kernel<<<grid, GDR_VAL_DIM, 0, stream>>>(
         qkv, nullptr, nullptr, b_ptrs, a_ptrs, dt_bias, A_log, nullptr, state_ptrs, row_len,
         output, num_key_heads, num_value_heads, key_dim, val_dim, max_len
     );

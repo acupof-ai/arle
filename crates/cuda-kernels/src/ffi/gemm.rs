@@ -371,6 +371,36 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    pub fn dequantize_w4a16_to_bf16_cuda(
+        weight: *const u8,
+        scales: *const Half,
+        output: *mut Half,
+        n: i32,
+        k: i32,
+        group_size: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn dequantize_w4a16_to_fp16_cuda(
+        weight: *const u8,
+        scales: *const Half,
+        output: *mut Half,
+        n: i32,
+        k: i32,
+        group_size: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn gemm_fp16_weight_cuda(
+        w_f16: *const Half,
+        x: *const Half,
+        y: *mut Half,
+        m: i32,
+        n: i32,
+        k: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn gemv_fp4_e2m1_group_cuda(
         weight: *const u8,
         scales: *const u8,
