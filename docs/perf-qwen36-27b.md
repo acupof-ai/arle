@@ -41,13 +41,15 @@ invalidated it. **Check this table before ranking anything off a number.**
 | §4.4 | memory ledger | 08-07 | 16 slots | — | current |
 | §5.0 | anchor row | 08-07 `70760bc09` | 1, 8, 16 | 32K | current |
 | §5.2 | vs SGLang, W8A16 | 08-06 | — | 33K | current |
-| ceiling | c=16 decode+prefill window | 08-08 `70760bc09` | 9 rows/tick at nominal 16 | 32.5K | current — the only capture above batch 1 |
+| ceiling | c=16 window, anchor workload | 08-08 `70760bc09` | 9 rows/tick at nominal 16 | 32.5K | current, but the window undersamples decode 2–6× — see the note there |
+| §2.0 | c=16 window, **decode-shaped** workload | 08-08 `70760bc09` | **16.0 rows/tick**, four counts | 2.5K | **current — the decode baseline**, window reconciled to +6.8% |
 
-Eleven of the thirteen are batch 1 or batch-1-derived while production decodes
-at c=16. **And all thirteen run the anchor workload, which is 279:1
-prompt:output** — so every decode number here is ranked off a benchmark in
-which all decode together is ~1% of GPU time. Both gaps are covered in *Where
-the ceiling is*.
+Eleven of the fourteen are batch 1 or batch-1-derived. Thirteen of the fourteen
+run the **anchor** workload, which is 279:1 prompt:output and in which all
+decode together is 2–6% of GPU time — so read decode numbers off **§2.0**, the
+one decode-shaped capture, and prefill numbers off the anchor. The two
+workloads disagree by 17× on full-attention's share of a decode tick, so a
+decode lever must be priced at the context it will run at.
 
 **Model and device constants** used throughout:
 
@@ -454,6 +456,64 @@ Roofline: ~1.68 PFLOP for a 33K prefill (22.3 B GEMM params × 2 × 33e3, plus
 
 ## 2. Decode
 
+### 2.0 Decode-shaped workload, c=16 — the current decode baseline
+
+`nsys`, 2026-08-08, `70760bc09`, GPU 6, 16 sessions × 1 turn, ~1.1K prompt /
+1.8K generated (**1 : 1.62** prompt:output), 32 requests, 60 s window at bench
+elapsed 40–100 s. **Window reconciled against run totals: 484 ticks in the
+window at 8.07/s against a run-level 7.56/s, +6.8%** — representative, unlike
+the anchor capture (§ *Where the ceiling is*). Rows per tick measured **16.0**
+by four independent counts.
+
+Full entry:
+[`wins/2026-08-08-decode-shaped-reanchor-draft-attention-is-30pct.md`](experience/wins/2026-08-08-decode-shaped-reanchor-draft-attention-is-30pct.md).
+Budget, not a timeline.
+
+```
+tick span 112.33 ms | GPU-busy 96.88 ms (86.2%) | period 123.9 ms
+draft attention        29.57 ms  30.5%  ███████████████
+FP8 GEMM               27.87 ms  28.8%  ██████████████
+GDN / gated-delta      20.30 ms  21.0%  ██████████
+dense GEMM (cuBLAS nvjet + splitK)
+                       11.68 ms  12.1%  ██████
+norms + elementwise     5.67 ms   5.9%  ███
+full-attn paged         1.75 ms   1.8%  █
+sampling                0.06 ms   0.1%
+                                        total 96.88 ms
+```
+
+Row: 407.97 out tok/s, 659.55 total tok/s, ITL mean 31.08 ms, TTFT p50 1.42 s.
+`accept_rate` 0.475, empirical chain length 3.37 tokens.
+
+**A decode lever's share is workload-dependent, and the two captures disagree
+by 17×.** Full-attention is 1.8% of a tick here at ~2.5K context and 42.5% at
+32.5K on the anchor. Neither is "the" decode budget; a decode lever must be
+priced at the context it will run at, and both numbers belong in this document.
+
+**Draft attention is the largest line, and §6 had it priced out.** The register
+carried `DSpark draft attention — 1.5 ms of 35 ms (4.3%) — priced out, 3
+rewrites failed to transfer`. That verdict came from a shape where it was 4.3%;
+here it is **30.5%**. The kernel is `nonpaged_prefill_attention_kernel`, 39,690
+launches in the window — the DFlash draft has no paged KV pool, so the draft
+lane takes the nonpaged branch while the trunk takes
+`prefill_attention_paged_hd256_kernel`.
+
+**Idle inside a tick is 13.8%**, and 61.4% of that gap time sits in **53 gaps
+over 1 ms**. On the anchor capture decode ticks were gap-free below 20 µs; this
+shape is not. Cause unknown. Host round-trips are visible next to it: HtoD
+moves 0.08 GB per tick in **0.486 ms** — latency, not bandwidth.
+
+Achieved KV bandwidth on the paged full-attn kernel:
+
+```
+16 rows x 2484.3 tok x 65536 B = 2.605 GB / 1.590 ms = 1.638 TB/s = 47% of 3.5
+```
+
+Against 1.02 TB/s (29.2%) at 32.5K context and 9 rows on the anchor. Longer
+context measured *lower* achieved bandwidth, but row count moved too (16 vs 9)
+and the two effects are not separable from these two points.
+
+
 ### 2.1 Plain decode step, FP8
 
 `nsys` over 59 plain-decode steps, 2026-08-01, per step.
@@ -782,7 +842,11 @@ Ceilings belong to levers, not to categories.
 
 | lever | phase | measured at | size | status |
 |---|---|---|---|---|
-| **FA3 decode KV bandwidth** | decode | **c=16, 33K** | **~51–91 ms/tick, 9.2× off roofline** | **open, #1** — GDN lane excluded by a same-binary A/B |
+| **DSpark draft attention** | decode | **c=16, 2.5K ctx** | **30.5% of a decode tick** | **open, #1** — was "priced out" at 4.3% from a shape where it was small |
+| FP8 GEMM on the verify shape | decode | c=16, 2.5K ctx | 28.8% of a decode tick | open — never decomposed at this shape |
+| GDN / gated-delta at c=16 | decode | c=16, 2.5K ctx | 21.0% of a decode tick | open — a same-binary A/B nulled it at 33K, untested here |
+| >1 ms gaps inside decode ticks | decode | c=16, 2.5K ctx | 13.8% of tick span, 53 gaps | open, cause unknown |
+| full-attn KV bandwidth | decode | c=16 | **47% of achievable at 2.5K, 29.2% at 32.5K** | open, but only 1.8% of a tick at short context |
 | batched-draft gate under sampling | decode | c=1…16, 32K | −30 to −40% decode tok/s at c ≥ 8 | **open, #2** — `executor/qwen35.rs:1984` tests all rows greedy; one-line narrowing to `idx` |
 | prefill GPU idle | prefill | c=1, 33K | 3.97 vs SGLang 0.19 s | **open, #3** — largest single gap, own SLO (TTFT) |
 | sidecar write policy | prefill | c=1…16 | 83 GB / 9.4% of wall | open — hit rate unmeasured |
@@ -809,7 +873,6 @@ Ceilings belong to levers, not to categories.
 | quantized GEMM kernel | prefill | c=1, 33K | identical to SGLang ±15 ms |
 | DeepGEMM FP8 | prefill | c=1, 33K | 64–67% of peak |
 | CUDA graph on the spec path | decode | c=16 window | all sub-ms gaps 0.87 s, 4.4% of window |
-| DSpark draft attention | decode | batch 1 | 1.5 ms of 35 ms; 3 rewrites failed to transfer |
 | prefill–prefill fusion | prefill | c=1 | ~3% (15 redundant weight reads) |
 | `--chunked-prefill-size` | prefill | c=1, 33K | ±0.07 s TTFT |
 | `--max-num-batched-tokens` | prefill | c=1…16 | budget never binds; 16384 stays |
@@ -840,36 +903,43 @@ chain:
 
 ## Open items, ranked by measured share on a workload that exercises them
 
-The 2026-08-08 c=16 capture reordered this list. Its lesson is in the ranking
-rule: **price a lever on a workload where the phase it touches is a large share
-of GPU time.** FA3 decode-verify is 29.2% of roofline and 0.39% of GPU time on
-the anchor; both are true, and only the second one ranks it.
+Two rules the 08-08 captures produced. **Price a lever on a workload where the
+phase it touches is a large share of GPU time** — full-attention decode is 47%
+of roofline and 1.8% of a decode tick at short context; both are true and only
+the second ranks it. And **reconcile a capture window against run totals before
+quoting a share** — the anchor capture undersampled decode 2–6× by landing in a
+queueing ramp.
 
-1. **Re-anchor decode on a decode-shaped workload.** The anchor is 38.6:1
-   prefill:output after cache and decode is 2–6% of its GPU time, so every
-   decode number in §2 and every decode lever in §6 is ranked off a benchmark
-   that barely decodes. Nothing below this is trustworthy until it is fixed.
-   Short prompts with long generations, one sweep, and the c=16 capture
-   repeated on it — with the window placed after the queueing ramp, or spread
-   over several windows, which this first capture failed to do.
-2. **Prefill is where this workload's time is** — 59.4% FP8 GEMM plus 16.3%
-   FA3 prefill in the measured window, at 96.7% GPU-busy. The FP8 GEMM is
-   already priced out at 64–67% of peak (§1.1), so the open question is whether
-   prefill FA3 and the 12.3% in `pack_quantize` + norms have headroom. Neither
-   has been decomposed.
-3. **FA3 decode-verify KV bandwidth, 29.2% of achievable.** Confirmed
-   mechanism, and the largest line inside a decode tick at 42.5%. Worth ~0.4%
-   on the anchor and materially more on a decode-shaped workload — which is why
-   item 1 gates it.
-4. **Sampling costs 30–40% of decode throughput at c ≥ 8** (§2.4). Same gating
-   problem: measured on the anchor. The gate at `executor/qwen35.rs:1984` tests
-   *all* rows greedy, so one sampled request drops every row to per-row
-   drafting. Do **not** re-open "acceptance collapses with concurrency" — it was
-   withdrawn (`baselines.md:137`), and the 08-08 capture measured `accept_rate`
-   0.478.
-5. **Sidecar write policy** — 1,123 D2H of 3 MiB in a 30 s window, restore hit
-   rate still unmeasured. The only chain item whose cost is known and whose
-   benefit is entirely unknown.
+**Decode** — priced on §2.0, the decode-shaped c=16 capture.
+
+1. **DSpark draft attention, 30.5% of a decode tick.** The largest single line,
+   and §6 had it **priced out at 4.3%** from a shape where it was small. Three
+   earlier kernel rewrites failed to transfer; they were sized against that
+   4.3%. `nonpaged_prefill_attention_kernel`, 39,690 launches in a 60 s window.
+   Re-open with a capture of the kernel itself at this shape.
+2. **FP8 GEMM on the verify shape, 28.8%.** Priced out at 64–67% of peak on
+   *prefill* shapes (§1.1). The verify shape is different and has never been
+   decomposed.
+3. **GDN / gated-delta, 21.0%.** A same-binary A/B nulled this lane at 33K
+   context; that A/B has not been repeated at short context, where its share is
+   larger.
+4. **Gaps over 1 ms inside decode ticks** — 13.8% of tick span, 61.4% of it in
+   53 gaps. Decode ticks on the anchor capture had nothing above 20 µs. Cause
+   unknown. Next to it, HtoD moves 0.08 GB per tick in 0.486 ms, which is
+   latency.
+
+**Prefill** — priced on the anchor, which is what it models.
+
+5. **Prefill is where the anchor's time is** — 59.4% FP8 GEMM plus 16.3% FA3
+   prefill at 96.7% GPU-busy. The FP8 GEMM is priced out at 64–67% of peak, so
+   the open question is prefill FA3 and the 12.3% in `pack_quantize` + norms.
+   Neither has been decomposed.
+6. **Sampling costs 30–40% of decode throughput at c ≥ 8** (§2.4) — measured on
+   the anchor, so its size needs re-measuring on §2.0's shape. The gate at
+   `executor/qwen35.rs:1984` tests *all* rows greedy. Do **not** re-open
+   "acceptance collapses with concurrency": withdrawn (`baselines.md:137`), and
+   both 08-08 captures measured `accept_rate` ≈ 0.475.
+7. **Sidecar write policy** — restore hit rate still unmeasured.
 
 ## Measurement debt
 
