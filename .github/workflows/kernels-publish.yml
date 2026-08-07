@@ -104,6 +104,14 @@ jobs:
           ARLE_KERNEL_CORRECTNESS_STATUS: not-run
         run: scripts/kernel_artifacts.sh pack
 
+      # Publish candidate so validate_release.sh resolves the exact bundle id.
+      # Candidate-only (no GPU evidence) is accepted; qualify job attaches the sidecar later.
+      - name: Publish candidate bundle
+        env:
+          ARLE_KERNEL_CORRECTNESS_STATUS: not-run
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: scripts/kernel_artifacts.sh publish
+
       - name: Upload exact candidate
         uses: actions/upload-artifact@v7
         with:
