@@ -4,6 +4,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use infer_plan::FinishReason;
 use serde_json::json;
 
+/// OpenAI `system_fingerprint` — must match `schema::SYSTEM_FINGERPRINT`.
+const SYSTEM_FINGERPRINT: &str = "arle_fp_1";
+
 pub(crate) fn completion_stream_chunk(
     id: &str,
     created: u64,
@@ -19,6 +22,7 @@ pub(crate) fn completion_stream_chunk(
         "model": model,
         "choices": [{"text": text, "index": 0, "logprobs": null, "finish_reason": finish}],
         "usage": usage,
+        "system_fingerprint": SYSTEM_FINGERPRINT,
     })
 }
 
@@ -36,6 +40,7 @@ pub(crate) fn chat_stream_chunk(
         "model": model,
         "choices": [{"index": 0, "delta": delta, "logprobs": null, "finish_reason": finish}],
         "usage": null,
+        "system_fingerprint": SYSTEM_FINGERPRINT,
     })
 }
 
@@ -58,6 +63,7 @@ pub(crate) fn stream_usage_chunk(
         "model": model,
         "choices": [],
         "usage": usage,
+        "system_fingerprint": SYSTEM_FINGERPRINT,
     })
 }
 
@@ -123,6 +129,20 @@ impl StreamingReasoningSplitter {
     /// Route one decoded delta batch; emits zero, one, or two deltas.
     pub(crate) fn push(&mut self, text: &str) -> Vec<ChatDelta> {
         if !self.enabled {
+            // Thinking is off, but a reasoning-trained model (e.g. Qwen3.6) may
+            // still emit a leading <think> block. Detect it on the first push
+            // and strip it; reasoning is dropped (the caller gates emission).
+            if self.at_start {
+                let trimmed = text.trim_start();
+                if trimmed.starts_with("<think>") {
+                    self.enabled = true;
+                    self.in_reasoning = true;
+                    self.at_start = false;
+                    let rest = trimmed.strip_prefix("<think>").unwrap_or(trimmed);
+                    return self.push(rest);
+                }
+                self.at_start = false;
+            }
             return (!text.is_empty())
                 .then(|| ChatDelta::Content(text.to_string()))
                 .into_iter()
@@ -209,6 +229,10 @@ fn trimmed_once<'a>(started: &mut bool, text: &'a str) -> Option<&'a str> {
 pub(crate) struct StreamPipeline {
     splitter: StreamingReasoningSplitter,
     tool_stream: Option<chat::StreamingToolCalls>,
+    /// Whether reasoning deltas are emitted on the wire. When false (thinking
+    /// disabled), the splitter still strips a leading `<think>` block so it
+    /// doesn't leak into content, but the reasoning text is dropped.
+    emit_reasoning: bool,
 }
 
 impl StreamPipeline {
@@ -216,6 +240,7 @@ impl StreamPipeline {
         Self {
             splitter: StreamingReasoningSplitter::new(thinking),
             tool_stream: tools_active.then(chat::StreamingToolCalls::default),
+            emit_reasoning: thinking,
         }
     }
 
@@ -228,7 +253,11 @@ impl StreamPipeline {
         match piece {
             // Tools mode: reasoning has no wire lane (matches non-streaming).
             ChatDelta::Reasoning(_) if self.tool_stream.is_some() => {}
-            ChatDelta::Reasoning(text) => deltas.push(ChatDelta::Reasoning(text)),
+            ChatDelta::Reasoning(text) => {
+                if self.emit_reasoning {
+                    deltas.push(ChatDelta::Reasoning(text));
+                }
+            }
             ChatDelta::Content(text) => match self.tool_stream.as_mut() {
                 Some(stream) => {
                     let (visible, new_calls) = stream.push(&text);
