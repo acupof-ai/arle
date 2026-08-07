@@ -110,8 +110,10 @@ fn dump_messages_body(body: &serde_json::Value) -> Option<PathBuf> {
     let epoch_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_millis());
+    // pid-tagged: multiple serve processes (cp rollout fleet) share one dir.
     let path = dir.join(format!(
-        "{epoch_ms}_{}.json",
+        "{epoch_ms}_{}_{}.json",
+        std::process::id(),
         seq.fetch_add(1, Ordering::Relaxed)
     ));
     spawn_json_dump(path.clone(), body, "/v1/messages body");
