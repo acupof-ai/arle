@@ -701,6 +701,13 @@ pub(crate) struct ServeArgs {
     #[arg(long, value_parser = parse_positive_usize)]
     pub(crate) chunked_prefill_size: Option<usize>,
 
+    /// Token budget for one scheduler tick (all prefill chunks in that tick
+    /// combined). Sets the M dimension of the step's GEMMs, so it trades step
+    /// latency against GEMM efficiency; a decode row sharing the tick waits a
+    /// whole step. Unset = the shipped constant.
+    #[arg(long, value_parser = parse_positive_usize)]
+    pub(crate) max_num_batched_tokens: Option<usize>,
+
     /// Rotate waiters past the running cap by parking whole decode slots into
     /// the KV tier (whole-slot-tier models only; others fail closed at start).
     #[arg(long, default_value_t = false)]

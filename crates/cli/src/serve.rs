@@ -533,6 +533,9 @@ fn resolve_engine_config(
     if let Some(value) = serve_args.chunked_prefill_size {
         config.chunked_prefill_size = Some(value);
     }
+    if let Some(value) = serve_args.max_num_batched_tokens {
+        config.max_num_batched_tokens = Some(value);
+    }
     config.slot_oversubscription = serve_args.kv_oversubscription;
     config.memory_budget_bytes = serve_args.memory_budget_bytes;
     config.system_reserve_bytes = serve_args.system_reserve_bytes;
