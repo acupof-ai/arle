@@ -19,6 +19,12 @@ Related governance docs:
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-08-07
+
+- **FIX — agent-opd cp>1: rank 0 owns rollout, followers mirror the update stream** (`9da8ff777`). With context-parallelism > 1 the rollout phase could deadlock the writeback collective because follower ranks issued the update stream out of order with rank 0. Rank 0 now owns the rollout and followers mirror its update stream.
+
+## [0.5.0] - 2026-08-07
+
 Progress spine. Entry classes recorded here the day they land: phase exits,
 default flips, and accept-or-reject verdicts (AGENTS.md §Docs lifecycle &
 progress spine).
