@@ -322,12 +322,8 @@ struct Data {
     bool require_tma_alignment;
     void* base;
 
-    // ARLE: not `constexpr` — the DG_UNIFIED_ASSERT below is a statement, and a
-    // c++17 constexpr constructor body may not contain one. Upstream builds this
-    // tree at c++20; our nvcc line stays c++17 because the CUTLASS fallback is
-    // FlashMLA's older vendored copy, which is not c++20-clean.
     CUTLASS_HOST_DEVICE
-    explicit Data(
+    constexpr explicit Data(
         const uint32_t& num_bytes,
         const bool& require_tma_alignment = true,
         void* base = nullptr) :
