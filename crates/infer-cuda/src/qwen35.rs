@@ -1004,7 +1004,10 @@ impl Qwen35SlotImage {
     /// `slot_image_byte_inverse` unit test. No serde: a small fixed header
     /// (`seq_len`, `full_attn_page_count`, `full_attn_pages` byte length, the two
     /// linear counts) followed by the full-attn bytes, then each gdr vec's
-    /// `[len:u64][f32 LE...]` and each conv vec's `[len:u64][bf16 LE...]`.
+    /// `[len:u64][f32...]` and each conv vec's `[len:u64][bf16...]`. The payload
+    /// regions are bulk byte copies in host order — the buffer never leaves this
+    /// box (host DRAM / local NVMe), and per-element `to_le_bytes` cost 37M
+    /// 4-byte appends per park (~150 ms), the dominant swap stall.
     pub(crate) fn to_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(self.dram_bytes() + 64);
         buf.extend_from_slice(&(self.seq_len as u64).to_le_bytes());
@@ -1015,15 +1018,17 @@ impl Qwen35SlotImage {
         buf.extend_from_slice(&self.full_attn_pages);
         for gdr in &self.gdr_host {
             buf.extend_from_slice(&(gdr.len() as u64).to_le_bytes());
-            for &x in gdr {
-                buf.extend_from_slice(&x.to_le_bytes());
-            }
+            // SAFETY: f32 has no padding; the byte view aliases exactly len*4.
+            buf.extend_from_slice(unsafe {
+                std::slice::from_raw_parts(gdr.as_ptr() as *const u8, gdr.len() * 4)
+            });
         }
         for conv in &self.conv_host {
             buf.extend_from_slice(&(conv.len() as u64).to_le_bytes());
-            for &x in conv {
-                buf.extend_from_slice(&x.to_le_bytes());
-            }
+            // SAFETY: bf16 is #[repr(transparent)] over u16; byte view is valid.
+            buf.extend_from_slice(unsafe {
+                std::slice::from_raw_parts(conv.as_ptr() as *const u8, conv.len() * 2)
+            });
         }
         buf
     }
@@ -1066,11 +1071,11 @@ impl Qwen35SlotImage {
             let raw = bytes
                 .get(pos..end)
                 .ok_or_else(|| anyhow!("slot image truncated reading gdr state"))?;
-            gdr_host.push(
-                raw.chunks_exact(4)
-                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                    .collect(),
-            );
+            let mut v = vec![0f32; len];
+            // SAFETY: f32 has no padding; the byte view aliases exactly len*4.
+            unsafe { std::slice::from_raw_parts_mut(v.as_mut_ptr() as *mut u8, len * 4) }
+                .copy_from_slice(raw);
+            gdr_host.push(v);
             pos = end;
         }
         let mut conv_host = Vec::with_capacity(num_conv);
@@ -1082,11 +1087,11 @@ impl Qwen35SlotImage {
             let raw = bytes
                 .get(pos..end)
                 .ok_or_else(|| anyhow!("slot image truncated reading conv state"))?;
-            conv_host.push(
-                raw.chunks_exact(2)
-                    .map(|c| bf16::from_le_bytes([c[0], c[1]]))
-                    .collect(),
-            );
+            let mut v = vec![bf16::ZERO; len];
+            // SAFETY: bf16 is #[repr(transparent)] over u16; byte view is valid.
+            unsafe { std::slice::from_raw_parts_mut(v.as_mut_ptr() as *mut u8, len * 2) }
+                .copy_from_slice(raw);
+            conv_host.push(v);
             pos = end;
         }
         ensure!(
