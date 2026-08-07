@@ -1179,21 +1179,31 @@ impl Qwen35RecurrentSnapshot {
     /// `[len:u64][elems...]`. No full-attention KV: restore mirrors the radix
     /// prefix's own device pages.
     pub(crate) fn to_bytes(&self) -> Vec<u8> {
+        // Every stride boundary of every prefill serializes the WHOLE recurrent
+        // state, so this runs inside the tick, not behind it — surface the cost.
+        let started = std::time::Instant::now();
         let mut buf = Vec::with_capacity(self.host_bytes() + 64);
         buf.extend_from_slice(&(self.gdr.len() as u64).to_le_bytes());
         buf.extend_from_slice(&(self.conv.len() as u64).to_le_bytes());
         for gdr in &self.gdr {
             buf.extend_from_slice(&(gdr.len() as u64).to_le_bytes());
-            for &x in gdr {
-                buf.extend_from_slice(&x.to_le_bytes());
-            }
+            // SAFETY: f32 has no padding; the byte view aliases exactly len*4.
+            buf.extend_from_slice(unsafe {
+                std::slice::from_raw_parts(gdr.as_ptr() as *const u8, gdr.len() * 4)
+            });
         }
         for conv in &self.conv {
             buf.extend_from_slice(&(conv.len() as u64).to_le_bytes());
-            for &x in conv {
-                buf.extend_from_slice(&x.to_le_bytes());
-            }
+            // SAFETY: bf16 is #[repr(transparent)] over u16; byte view is valid.
+            buf.extend_from_slice(unsafe {
+                std::slice::from_raw_parts(conv.as_ptr() as *const u8, conv.len() * 2)
+            });
         }
+        log::info!(
+            "recurrent sidecar serialize: {:.1} MiB in {:.1} ms",
+            buf.len() as f64 / (1024.0 * 1024.0),
+            started.elapsed().as_secs_f64() * 1e3
+        );
         buf
     }
 
@@ -1223,11 +1233,11 @@ impl Qwen35RecurrentSnapshot {
             let raw = bytes
                 .get(pos..end)
                 .ok_or_else(|| anyhow!("recurrent snapshot truncated reading gdr state"))?;
-            gdr.push(
-                raw.chunks_exact(4)
-                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                    .collect(),
-            );
+            let mut v = vec![0f32; len];
+            // SAFETY: f32 has no padding; the byte view aliases exactly len*4.
+            unsafe { std::slice::from_raw_parts_mut(v.as_mut_ptr() as *mut u8, len * 4) }
+                .copy_from_slice(raw);
+            gdr.push(v);
             pos = end;
         }
         let mut conv = Vec::with_capacity(num_conv);
@@ -1239,11 +1249,11 @@ impl Qwen35RecurrentSnapshot {
             let raw = bytes
                 .get(pos..end)
                 .ok_or_else(|| anyhow!("recurrent snapshot truncated reading conv state"))?;
-            conv.push(
-                raw.chunks_exact(2)
-                    .map(|c| bf16::from_le_bytes([c[0], c[1]]))
-                    .collect(),
-            );
+            let mut v = vec![bf16::ZERO; len];
+            // SAFETY: bf16 is #[repr(transparent)] over u16; byte view is valid.
+            unsafe { std::slice::from_raw_parts_mut(v.as_mut_ptr() as *mut u8, len * 2) }
+                .copy_from_slice(raw);
+            conv.push(v);
             pos = end;
         }
         ensure!(
