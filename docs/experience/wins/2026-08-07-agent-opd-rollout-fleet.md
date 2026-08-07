@@ -142,11 +142,39 @@ keeps climbing to 8 sessions/engine (+88%), while per-sample walls degrade
 (each session ~79% slower at G=4 than G=1). Optimizing tok/s past ~4 sessions
 per engine buys wall at the expense of the thing being trained on.
 
-Next arm (`fulltrain10`): **cp=4 × G=2** — 8 concurrent sessions spread as 2 per
-engine. The sweep only ever raised per-engine pressure; adding engines instead
-raises concurrency at the per-engine pressure that produced the healthiest
-per-sample walls. No code change (the fleet and mesh are rank-agnostic, and
-per-rank sizing is `G × ceil(K/cp)`).
+## Accepted config — cp=4 × G=2 (`fulltrain10`)
+
+8 concurrent sessions spread as **2 per engine over 4 engines**. The sweep above
+only ever raised per-engine pressure; adding engines instead buys concurrency at
+the pressure that keeps sessions healthy. No code change — the fleet and mesh are
+rank-agnostic and per-rank sizing is `G × ceil(K/cp)` (`slots=2` confirmed on all
+four ranks).
+
+| round 0 | best of the cp=2 sweep | cp=4 × G=2 |
+|---|---:|---:|
+| sum(sample walls) | 10621 s (G=1, uncontended) | **9350 s** |
+| samples at the 600 s cap | 3/64 (G=4/1200) | **1/64** |
+| aggregate throughput | 72.4 tok/s (G=4) | **88.7 tok/s** |
+| total round wall | 2659 s (G=4) | 3468 s |
+| VRAM peak per card | 78.6–79.1 GB | **76.2–76.9 GB** |
+| passing samples | 10 (G=2) | 10 |
+
+The decisive figure is sum-of-sample-walls: 9350 s is lower than the
+*uncontended* G=1 baseline, i.e. sessions are healthier than in any cp=2 arm
+while running 8 at once. Per-sample walls collapse (tenacity 45–58 s against
+G=4's 157–175 s) and straggler pressure nearly vanishes. Correctness at 4 ranks:
+212 writeback DONE lines in 53 four-way identical groups, all three followers at
+`end of stream`, `staleness: 0`, every group carrying exactly 4 records, VRAM
+2 GB *lower* per card than cp=2 (smaller shard).
+
+Cost to watch at scale: host RSS peaked 230.6 GiB (4 ranks × engine+student),
+second-highest of the campaign; VRAM is not the binding resource.
+
+**New bottleneck, measured:** realized concurrency is only 3.63× of 8 slots — the
+rollout phase is no longer engine-bound. The residual wall is host-side (sandbox
+boot, tool exec, pytest), so further GPU concurrency has little left to buy. The
+untested wall lever is cp=4 × G=4 (16 sessions, still 4 per engine); the host
+floor may absorb it.
 
 ## Production config for the 449-task run
 
