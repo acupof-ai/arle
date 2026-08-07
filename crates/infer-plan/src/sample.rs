@@ -89,6 +89,19 @@ pub fn sample_token_logprob(
         p.grammar_bitmask = None;
         return sample_token_logprob(&masked, &p, position);
     }
+    // Apply logit_bias before any temperature/filtering.
+    let biased = if params.logit_bias.is_empty() {
+        None
+    } else {
+        let mut v = logits.to_vec();
+        for (&tok, &bias) in &params.logit_bias {
+            if (tok as usize) < v.len() {
+                v[tok as usize] += bias;
+            }
+        }
+        Some(v)
+    };
+    let logits = biased.as_deref().unwrap_or(logits);
     if params.is_greedy() || logits.is_empty() {
         return (argmax_logit(logits), None);
     }
