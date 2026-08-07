@@ -25,6 +25,7 @@ The doc tree is reference docs + `plans/` + `research/` + experience wins/errors
 | Workspace topology | [codebase-map.md](codebase-map.md) |
 | Package boundaries | [architecture.md](architecture.md) |
 | DSv4/GLM path map | [architecture-dsv4.md](architecture-dsv4.md) |
+| Qwen3.6-27B performance chain | [perf-qwen36-27b.md](perf-qwen36-27b.md) |
 | Bench + trace process | [bench-and-trace-spec.md](bench-and-trace-spec.md) |
 | Rolling baselines | [baselines.md](baselines.md) |
 | Env / flags | [environment.md](environment.md) |
