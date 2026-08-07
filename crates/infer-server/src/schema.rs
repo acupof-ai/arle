@@ -170,6 +170,21 @@ pub struct CompletionRequest {
     /// schema; `json_object` to any valid JSON.
     #[serde(default)]
     pub response_format: Option<crate::grammar::ResponseFormat>,
+    /// Number of completions to generate. Engine supports only one; accepted
+    /// for client compatibility (values > 1 are ignored).
+    #[serde(default)]
+    pub n: Option<usize>,
+    /// Per-token logprobs depth (0–20). Engine does not surface logprobs yet;
+    /// accepted for client compatibility.
+    #[serde(default)]
+    pub logprobs: Option<u32>,
+    /// Token-id → bias map applied to logits before sampling. Engine does not
+    /// support it yet; accepted for client compatibility.
+    #[serde(default)]
+    pub logit_bias: Option<std::collections::HashMap<u32, f32>>,
+    /// End-user identifier for abuse monitoring. Accepted but unused.
+    #[serde(default)]
+    pub user: Option<String>,
 }
 
 impl CompletionRequest {
@@ -241,6 +256,38 @@ pub struct ChatCompletionRequest {
     /// schema; `json_object` to any valid JSON.
     #[serde(default)]
     pub response_format: Option<crate::grammar::ResponseFormat>,
+    /// Number of chat completion choices to generate. Engine supports only one;
+    /// accepted for client compatibility (values > 1 are ignored).
+    #[serde(default)]
+    pub n: Option<usize>,
+    /// Whether to return per-token logprobs. Engine does not surface logprobs
+    /// yet; accepted for client compatibility.
+    #[serde(default)]
+    pub logprobs: Option<bool>,
+    /// Number of top-k logprobs to return per token (0–20). Engine does not
+    /// surface logprobs yet; accepted for client compatibility.
+    #[serde(default)]
+    pub top_logprobs: Option<u32>,
+    /// Token-id → bias map applied to logits before sampling. Engine does not
+    /// support it yet; accepted for client compatibility.
+    #[serde(default)]
+    pub logit_bias: Option<std::collections::HashMap<u32, f32>>,
+    /// End-user identifier for abuse monitoring. Accepted but unused.
+    #[serde(default)]
+    pub user: Option<String>,
+    /// Whether to allow parallel tool calls. Defaults to true in OpenAI; the
+    /// engine emits one tool call at a time, so this is accepted but ignored.
+    #[serde(default)]
+    pub parallel_tool_calls: Option<bool>,
+    /// OpenAI service tier. Accepted but unused.
+    #[serde(default)]
+    pub service_tier: Option<String>,
+    /// Whether to store the completion for later retrieval. Accepted but unused.
+    #[serde(default)]
+    pub store: Option<bool>,
+    /// Arbitrary metadata attached to the request. Accepted but unused.
+    #[serde(default)]
+    pub metadata: Option<serde_json::Value>,
 }
 
 impl ChatCompletionRequest {
@@ -849,6 +896,14 @@ impl ChatCompletionResponse {
         } else {
             "tool_calls".to_string()
         };
+        // The engine does not yet report a reasoning-vs-content token split, so
+        // `reasoning_tokens` is 0 when thinking is on (field present) and the
+        // whole block is omitted otherwise — matching OpenAI's wire shape.
+        let usage = if enable_thinking {
+            Usage::with_reasoning(prompt_tokens, completion_tokens, 0)
+        } else {
+            Usage::new(prompt_tokens, completion_tokens)
+        };
         Self {
             id: format!("chatcmpl-{}", uuid::Uuid::new_v4().simple()),
             object: "chat.completion",
@@ -865,7 +920,7 @@ impl ChatCompletionResponse {
                 logprobs: None,
                 finish_reason,
             }],
-            usage: Usage::new(prompt_tokens, completion_tokens),
+            usage,
             system_fingerprint: SYSTEM_FINGERPRINT,
         }
     }
@@ -1008,6 +1063,24 @@ pub struct Usage {
     pub prompt_tokens: usize,
     pub completion_tokens: usize,
     pub total_tokens: usize,
+    /// Breakdown of prompt tokens. `cached_tokens` counts tokens served from
+    /// the prefix cache (always 0 until the engine reports cache hits).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_tokens_details: Option<PromptTokensDetails>,
+    /// Breakdown of completion tokens. `reasoning_tokens` counts tokens spent
+    /// in the thinking block (always 0 until the engine splits them).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completion_tokens_details: Option<CompletionTokensDetails>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PromptTokensDetails {
+    pub cached_tokens: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CompletionTokensDetails {
+    pub reasoning_tokens: usize,
 }
 
 impl Usage {
@@ -1016,6 +1089,28 @@ impl Usage {
             prompt_tokens,
             completion_tokens,
             total_tokens: prompt_tokens + completion_tokens,
+            // The engine does not yet report prefix-cache hits to the API layer,
+            // so `cached_tokens` is always 0. The field is present to match
+            // OpenAI's wire shape.
+            prompt_tokens_details: Some(PromptTokensDetails { cached_tokens: 0 }),
+            completion_tokens_details: None,
+        }
+    }
+
+    /// Build a usage block with the reasoning-token breakdown populated. Used
+    /// by the chat path when thinking is enabled so `reasoning_tokens` reflects
+    /// the split-out thinking length.
+    pub(crate) fn with_reasoning(
+        prompt_tokens: usize,
+        completion_tokens: usize,
+        reasoning_tokens: usize,
+    ) -> Self {
+        Self {
+            prompt_tokens,
+            completion_tokens,
+            total_tokens: prompt_tokens + completion_tokens,
+            prompt_tokens_details: Some(PromptTokensDetails { cached_tokens: 0 }),
+            completion_tokens_details: Some(CompletionTokensDetails { reasoning_tokens }),
         }
     }
 }
@@ -1024,7 +1119,10 @@ fn finish_reason(reason: Option<&FinishReason>) -> &'static str {
     match reason {
         Some(FinishReason::Stop) => "stop",
         Some(FinishReason::Length) | None => "length",
-        Some(FinishReason::Abort) => "abort",
+        // OpenAI has no `abort` finish reason. A client disconnect yields no
+        // response at all; an internal abort maps to `stop` (generation was
+        // terminated) so strict OpenAI clients don't choke on an unknown value.
+        Some(FinishReason::Abort) => "stop",
     }
 }
 
@@ -1062,12 +1160,28 @@ impl ApiError {
         }
     }
 
+    pub(crate) fn not_implemented(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::NOT_IMPLEMENTED,
+            message: message.into(),
+        }
+    }
+
     pub(crate) fn status(&self) -> StatusCode {
         self.status
     }
 
     pub(crate) fn into_message(self) -> String {
         self.message
+    }
+
+    /// OpenAI error `type` for the response's HTTP status.
+    fn error_type(&self) -> &'static str {
+        match self.status {
+            StatusCode::TOO_MANY_REQUESTS => "rate_limit_error",
+            s if s.is_server_error() => "api_error",
+            _ => "invalid_request_error",
+        }
     }
 }
 
@@ -1077,8 +1191,10 @@ impl From<anyhow::Error> for ApiError {
         if message.starts_with("server is busy:") {
             return Self::too_many_requests(message);
         }
+        // Internal failures (tokenizer decode, chat-template render, multimodal
+        // extraction) are server errors, not client bad-request.
         Self {
-            status: StatusCode::BAD_REQUEST,
+            status: StatusCode::INTERNAL_SERVER_ERROR,
             message,
         }
     }
@@ -1086,12 +1202,13 @@ impl From<anyhow::Error> for ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        let error_type = self.error_type();
         (
             self.status,
             Json(json!({
                 "error": {
                     "message": self.message,
-                    "type": "invalid_request_error",
+                    "type": error_type,
                     "param": null,
                     "code": null
                 }

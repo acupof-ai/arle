@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use axum::extract::{DefaultBodyLimit, State};
-use axum::http::header;
+use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -31,7 +31,7 @@ use crate::schema::{
 };
 use crate::sse_util::{
     ChatDelta, StreamPipeline, chat_stream_chunk, completion_stream_chunk, finish_reason,
-    stream_usage_chunk, unix_time_secs,
+    stream_error_chunk, stream_usage_chunk, unix_time_secs,
 };
 use crate::tokenizer::OpenAiTokenizer;
 
@@ -316,8 +316,10 @@ pub fn coordinator_router(
         .route("/v1/messages", post(anthropic_messages))
         .route("/v1/messages/count_tokens", post(anthropic_count_tokens))
         .route("/v1/models", get(list_models))
+        .route("/v1/embeddings", post(embeddings_not_implemented))
         .route("/v1/stats", get(stats))
         .route("/metrics", get(metrics))
+        .fallback(fallback_404)
         .layer(DefaultBodyLimit::max(256 * 1024 * 1024))
         .with_state(state)
 }
@@ -680,8 +682,11 @@ fn prompt_prefills_think(prompt: &str) -> bool {
 
 async fn completions(
     State(state): State<Arc<CoordinatorHandle>>,
-    Json(request): Json<CompletionRequest>,
+    request: Result<Json<CompletionRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Response, ApiError> {
+    let Json(request) = request.map_err(|rejection| {
+        ApiError::bad_request(format!("Failed to parse request body as JSON: {rejection}"))
+    })?;
     request.validate()?;
     let sampling = request.sampling_params();
     let max_tokens = sampling.max_new_tokens.unwrap_or(16);
@@ -720,15 +725,9 @@ async fn completions(
             let mut keepalive = keepalive_ticker().await;
             while let Some(delta) = recv_or_keepalive(&mut rx, &mut keepalive, &chunk_tx).await {
                 if let Some(err) = delta.error {
-                    let chunk = serde_json::to_string(&completion_stream_chunk(
-                        &id,
-                        created,
-                        &model,
-                        err,
-                        Some("error"),
-                        None,
-                    ))
-                    .unwrap_or_default();
+                    let chunk =
+                        serde_json::to_string(&stream_error_chunk(&id, created, &model, &err))
+                            .unwrap_or_default();
                     let _ = chunk_tx
                         .send(Ok(format!("data: {chunk}\n\ndata: [DONE]\n\n").into_bytes()))
                         .await;
@@ -815,8 +814,11 @@ async fn completions(
 
 async fn chat_completions(
     State(state): State<Arc<CoordinatorHandle>>,
-    Json(request): Json<ChatCompletionRequest>,
+    request: Result<Json<ChatCompletionRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Response, ApiError> {
+    let Json(request) = request.map_err(|rejection| {
+        ApiError::bad_request(format!("Failed to parse request body as JSON: {rejection}"))
+    })?;
     request.validate()?;
     let sampling = request.sampling_params();
     let stream = request.stream.unwrap_or(false);
@@ -969,14 +971,9 @@ async fn chat_completions(
                 recv_or_keepalive(&mut rx, &mut keepalive, &chunk_tx).await
             {
                 if let Some(err) = delta.error {
-                    let chunk = serde_json::to_string(&chat_stream_chunk(
-                        &id,
-                        created,
-                        &model,
-                        with_role(serde_json::json!({"content": err})),
-                        Some("error"),
-                    ))
-                    .unwrap_or_default();
+                    let chunk =
+                        serde_json::to_string(&stream_error_chunk(&id, created, &model, &err))
+                            .unwrap_or_default();
                     let _ = chunk_tx
                         .send(Ok(format!("data: {chunk}\n\ndata: [DONE]\n\n").into_bytes()))
                         .await;
@@ -1071,8 +1068,12 @@ async fn chat_completions(
                         Some(fr),
                     );
                     let usage_chunk = include_usage.then(|| {
-                        let usage = serde_json::to_value(Usage::new(prompt_len, completion_count))
-                            .unwrap_or_default();
+                        let usage = if thinking {
+                            Usage::with_reasoning(prompt_len, completion_count, 0)
+                        } else {
+                            Usage::new(prompt_len, completion_count)
+                        };
+                        let usage = serde_json::to_value(usage).unwrap_or_default();
                         stream_usage_chunk(&id, created, &model, "chat.completion.chunk", usage)
                     });
                     let _ = chunk_tx
@@ -1159,8 +1160,9 @@ fn push_anthropic_events(
     calls: &[chat::ToolCall],
 ) -> bool {
     for piece in pieces {
-        if let ChatDelta::Content(text) = piece {
-            events.push_str(&encoder.text_delta(&text));
+        match piece {
+            ChatDelta::Reasoning(text) => events.push_str(&encoder.thinking_delta(&text)),
+            ChatDelta::Content(text) => events.push_str(&encoder.text_delta(&text)),
         }
     }
     for call in calls {
@@ -1208,8 +1210,9 @@ async fn anthropic_messages(
             {
                 return;
             }
-            // Converged reasoning-then-tools pipeline (shared with the OpenAI SSE path).
-            let mut pipeline = StreamPipeline::new(thinking, tools_active);
+            // Anthropic pipeline: reasoning is emitted as `thinking` blocks even
+            // in tools mode (unlike OpenAI which drops it).
+            let mut pipeline = StreamPipeline::new_anthropic(thinking, tools_active);
             let mut saw_tool_use = false;
             let mut output_tokens = 0usize;
             let mut gen_ids: Vec<u32> = Vec::new();
@@ -1308,17 +1311,27 @@ async fn anthropic_messages(
         );
     }
     let decoded = decode(&state, &outcome.generated_tokens)?;
-    let (content, tool_calls, split_thinking) =
-        finalize_chat_content(decoded, tools_active, thinking);
-    // Build the OpenAI-shaped completion (reasoning split included), then map
-    // its parts onto the Anthropic envelope.
+    // Anthropic keeps reasoning even when tools are active (thinking blocks
+    // precede text/tool_use blocks). Parse tool calls only when tools are
+    // active (the prompt advertised them), then hand the result to
+    // `from_parts` so it splits reasoning into `reasoning_content`.
+    let (content, calls) = if tools_active {
+        chat::openai_parse_tool_calls(&decoded)
+    } else {
+        (decoded.clone(), Vec::new())
+    };
+    let tool_calls: Vec<ResponseToolCall> = calls
+        .iter()
+        .enumerate()
+        .map(|(index, call)| ResponseToolCall::from_parsed(call, index))
+        .collect();
     let chat = ChatCompletionResponse::from_parts(
         model,
         content,
         outcome.prompt_tokens,
         outcome.generated_tokens.len(),
         outcome.finish.as_ref(),
-        split_thinking,
+        thinking,
         tool_calls,
     );
     Ok(Json(anthropic::MessagesResponse::from_chat(&chat)).into_response())
@@ -1343,6 +1356,31 @@ async fn health() -> Json<serde_json::Value> {
 
 async fn list_models(State(state): State<Arc<CoordinatorHandle>>) -> Json<ModelsResponse> {
     Json(ModelsResponse::single(state.model.clone()))
+}
+
+/// `/v1/embeddings` is not implemented — the runtime has no embedding model.
+/// Returns a 501 in the OpenAI error envelope so clients see a structured
+/// error instead of a plain 404.
+async fn embeddings_not_implemented() -> ApiError {
+    ApiError::not_implemented("embeddings are not supported by this model")
+}
+
+/// Fallback for unmatched routes: return an OpenAI-shaped 404 (or 405 for a
+/// wrong method on a known path) instead of axum's plain-text default.
+async fn fallback_404(req: axum::extract::Request) -> (StatusCode, Json<serde_json::Value>) {
+    use axum::http::StatusCode;
+    let message = format!("No such route: {} {}", req.method(), req.uri().path());
+    (
+        StatusCode::NOT_FOUND,
+        Json(serde_json::json!({
+            "error": {
+                "message": message,
+                "type": "invalid_request_error",
+                "param": null,
+                "code": null
+            }
+        })),
+    )
 }
 
 async fn metrics(
