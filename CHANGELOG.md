@@ -19,6 +19,10 @@ Related governance docs:
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-08-21
+
+- **PERF — V100 (sm_70) prefill: W4A16 dequant→FP16 GEMM + GDR/FA2 tuning** (`df77f7668`). On Volta the W4A16 prefill path ran an on-the-fly dequant FP32 batched GEMM (no tensor cores, 15 TFLOPS). Prefill now dequantizes 4-bit weights to FP16 once per projection and runs a cuBLAS FP16 GEMM on tensor cores (125 TFLOPS); small K/V projections are cached. GDR prefill kernel drops from 5 to 3 `__syncthreads` per token (fused q/k norms) and overlaps exp_g/beta with the norm pass. FA2 sm70 uses Br=16/Bc=64. Qwen3.6-27B-W4A16 on V100: 1K-token prefill 30s→3s (10×), 21K-token 130s→43s (3×).
+
 ## [0.5.1] - 2026-08-07
 
 - **FIX — agent-opd cp>1: rank 0 owns rollout, followers mirror the update stream** (`9da8ff777`). With context-parallelism > 1 the rollout phase could deadlock the writeback collective because follower ranks issued the update stream out of order with rank 0. Rank 0 now owns the rollout and followers mirror its update stream.
