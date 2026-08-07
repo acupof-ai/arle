@@ -77,8 +77,40 @@ windows the verl way: G groups roll concurrently under one policy version, then
 a single update trains their merged batch. Staleness stays 0 (the window shares
 its launch version), and `rejection-ce` steps per trajectory inside `update_ce`,
 so the merged batch does not raise writeback VRAM — only the engine's extra
-slots do (8 vs 4 per rank ≈ +0.6 GB against 19 GB of headroom). A/B
-pending-remote (`fulltrain7`, G=4).
+slots do.
+
+Measured 2026-08-08, `fulltrain7` at `5b1cd473d`, G=4 vs `fulltrain6` G=1
+(same subset16, cp=2, GPUs 4+5):
+
+| round 0 | G=1 | G=4 | Δ |
+|---|---:|---:|---:|
+| `cc_rollout` wall | 4348.5 s | **2101.5 s** | **−51.7%** |
+| realized concurrency | 2.44× | **9.05×** | 3.7× |
+| aggregate throughput | 38.4 tok/s | **72.4 tok/s** | +88% |
+| samples at the 600 s cap | 6 / 64 | 9 / 64 | +50% |
+| passing samples | 9 | 5 | **−44%** |
+
+Correctness clean: 28 writeback DONE lines in 14 identical rank pairs, follower
+losses matching rank 0 to six decimals, `end of stream`, `RUN_EXIT=0`, the
+windowing invariant silent, every group carrying exactly 4 records, and 16
+distinct `#g{nonce}s{sample}` tags inside one window (the P1 fix engaged).
+VRAM peak 79.0 / 78.8 GB — only +0.2 GB over G=1, and host RSS *fell* to
+153 GiB from 270 GiB.
+
+**The wall win is real but the signal cost is the headline.** Per-sample walls
+rose 10621 → 19014 s (each session ~79% slower under 8-way contention), and
+because `--cc-timeout` is a wall-clock cap, contention pushes borderline
+sessions past it: `9b5ribm7`'s samples ran 162–223 s at G=1 and all four pinned
+at 600 s at G=4, taking that task from 3 passes to 1. Measured on the metric
+that matters for RFT — passing samples per wall-hour — G=4 is 8.6/h against
+G=1's 7.5/h, **+15%, not the +88% throughput suggests**.
+
+Conclusion: a wall-clock rollout cap is the wrong control under variable
+contention — it makes the training signal a function of scheduling load. Next
+arm (`fulltrain8`): G=4 with `--cc-timeout 1200`, to test whether the pass loss
+is entirely cap-induced. Also unresolved: aggregate throughput scaled +88% for
+4× the concurrency, so 8 sessions/engine is past the knee; G=2 is the missing
+third point.
 
 ## Production config for the 449-task run
 
