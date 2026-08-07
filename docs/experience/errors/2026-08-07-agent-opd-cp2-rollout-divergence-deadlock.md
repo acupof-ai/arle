@@ -29,11 +29,16 @@ single-card — the cp>1 path of this lane had never been exercised.
 
 ## Fix
 
-Not yet landed. Two viable shapes: rank-0-only rollout+filter with a
-deterministic trajectory broadcast before the cp group joins, or per-rank
-rollout with a rank-0 arbitration barrier. Validation meanwhile: run the lane
-single-GPU — real trajectories cap at `max_update_seq 23000`, which fits one
-card.
+Rank-0-only rollout with a file-based update stream (`MeshUpdateChannel`,
+train_cli.rs): cp rank 0 keeps the whole lane (serve, rollouts, filtering,
+saves) and publishes every update's batch under the coordinator-minted
+`ARLE_TRAIN_MESH_DIR` (write-then-rename); follower ranks skip the rollout
+engine entirely, load only the autograd student + optimizer, and mirror the
+update calls until an end marker — the cp collectives inside the writeback see
+identical call sequences by construction. The coordinator no longer tears the
+group down on a clean follower exit (only rank 0's exit, or any nonzero exit,
+ends the run). dp>1 in this lane now fails fast with an explicit error.
+Pod cp=2 validation: pending-remote (single-GPU subset run first).
 
 Evidence: `/host/lever2-out/fulltrain3-wedged-round0.log`,
 `fulltrain3-rounds.jsonl`, `fulltrain3-metrics.csv` (and `fulltrain2.log`, the

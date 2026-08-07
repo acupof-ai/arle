@@ -78,6 +78,10 @@ pub(crate) fn maybe_spawn_mesh_and_wait(
     #[cfg(feature = "nccl")]
     {
         let exe = std::env::current_exe().context("current_exe")?;
+        // Shared dir for the rank-0 → follower update stream (MeshUpdateChannel).
+        let mesh_dir = std::env::temp_dir().join(format!("arle-mesh-{}", std::process::id()));
+        std::fs::create_dir_all(&mesh_dir)
+            .with_context(|| format!("create mesh dir {}", mesh_dir.display()))?;
         let mut children: Vec<(usize, std::process::Child)> = Vec::with_capacity(size);
         // Monotonic "last time any rank emitted a log line", in ms since `start`.
         // A wedged collective goes silent on every rank (all block on the hung one),
@@ -97,6 +101,7 @@ pub(crate) fn maybe_spawn_mesh_and_wait(
             cmd.env("ARLE_TRAIN_DP_SIZE", dp_size.to_string());
             cmd.env("INFER_CUDA_DEVICE", device.to_string());
             cmd.env("INFER_NCCL_UNIQUE_ID", &uid_hex);
+            cmd.env("ARLE_TRAIN_MESH_DIR", &mesh_dir);
             // Pipe stderr so a forwarder thread can watch for liveness; the worker's
             // own `[cpN]` prefix (install_cp_worker_logger) is preserved on re-print.
             cmd.stderr(std::process::Stdio::piped());
@@ -146,12 +151,23 @@ pub(crate) fn maybe_spawn_mesh_and_wait(
             .and_then(|v| v.parse().ok())
             .filter(|&s| s > 0)
             .map(Duration::from_secs);
+        // Followers exit cleanly at the leader's end-of-stream marker while rank 0
+        // still runs eval/save, so only a rank-0 exit (any code) or a nonzero exit
+        // tears the group down.
+        let mut exited = vec![false; size];
         let (exit_rank, code) = loop {
-            if let Some(hit) = children
-                .iter_mut()
-                .find_map(|(r, c)| c.try_wait().ok().flatten().map(|s| (*r, s.code())))
-            {
-                break hit;
+            let hit = children.iter_mut().find_map(|(r, c)| {
+                (!exited[*r])
+                    .then(|| c.try_wait().ok().flatten().map(|s| (*r, s.code())))
+                    .flatten()
+            });
+            if let Some((rank, code)) = hit {
+                if rank == 0 || code != Some(0) {
+                    break (rank, code);
+                }
+                exited[rank] = true;
+                log::info!("{axis} rank {rank} exited cleanly; waiting for rank 0");
+                continue;
             }
             if let Some(limit) = hang_timeout {
                 let idle = start.elapsed().saturating_sub(Duration::from_millis(
@@ -166,6 +182,7 @@ pub(crate) fn maybe_spawn_mesh_and_wait(
                         let _ = child.wait();
                         log::info!("killed hung {axis} rank {rank}");
                     }
+                    let _ = std::fs::remove_dir_all(&mesh_dir);
                     anyhow::bail!("{axis} group hung: no rank progressed for {idle:?}");
                 }
             }
@@ -183,6 +200,7 @@ pub(crate) fn maybe_spawn_mesh_and_wait(
         for f in forwarders {
             let _ = f.join();
         }
+        let _ = std::fs::remove_dir_all(&mesh_dir);
         match code {
             Some(0) => Ok(true),
             other => anyhow::bail!("{axis} rank {exit_rank} exited with {other:?}"),

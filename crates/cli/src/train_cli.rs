@@ -3069,6 +3069,166 @@ fn synthetic_writeback_fd_probe<O: autograd::Optimizer>(
     Ok(())
 }
 
+/// Rank-0 → follower update stream for cp>1 agent-opd. Stochastic cc rollouts
+/// diverge across mesh ranks, so rank 0 owns rollout + filtering and publishes
+/// every update's batch; followers mirror the update calls, keeping the
+/// writeback's cp collectives on identical call sequences. Files live under the
+/// coordinator-minted `ARLE_TRAIN_MESH_DIR`; publish is write-then-rename so a
+/// reader never sees a partial file.
+#[cfg(feature = "cuda")]
+struct MeshUpdateChannel {
+    dir: PathBuf,
+    seq: u64,
+}
+
+#[cfg(feature = "cuda")]
+impl MeshUpdateChannel {
+    fn from_env() -> Result<Self> {
+        let dir = std::env::var_os("ARLE_TRAIN_MESH_DIR").ok_or_else(|| {
+            anyhow!("cp>1 agent-opd needs the mesh coordinator (ARLE_TRAIN_MESH_DIR unset)")
+        })?;
+        Ok(Self {
+            dir: dir.into(),
+            seq: 0,
+        })
+    }
+
+    fn upd_path(&self, seq: u64) -> PathBuf {
+        self.dir.join(format!("upd-{seq:08}.json"))
+    }
+
+    fn publish(&mut self, batch: &[train::update_strategy::ScoredTrajectory]) -> Result<()> {
+        let tmp = self.dir.join(format!("upd-{:08}.tmp", self.seq));
+        std::fs::write(&tmp, serde_json::to_vec(batch)?)?;
+        std::fs::rename(&tmp, self.upd_path(self.seq))?;
+        self.seq += 1;
+        Ok(())
+    }
+
+    fn finish(&self) -> Result<()> {
+        std::fs::write(self.dir.join("end"), b"").map_err(Into::into)
+    }
+
+    /// Blocks until the next batch (`Some`) or the end marker (`None`).
+    /// `delete_prev`: the last cp rank removes consumed files — by the time its
+    /// update k completed, NCCL lockstep guarantees every rank has read file k.
+    fn recv(
+        &mut self,
+        delete_prev: bool,
+    ) -> Result<Option<Vec<train::update_strategy::ScoredTrajectory>>> {
+        if delete_prev && self.seq > 0 {
+            let _ = std::fs::remove_file(self.upd_path(self.seq - 1));
+        }
+        loop {
+            match std::fs::read(self.upd_path(self.seq)) {
+                Ok(bytes) => {
+                    self.seq += 1;
+                    return Ok(Some(serde_json::from_slice(&bytes)?));
+                }
+                Err(_) => {
+                    if self.dir.join("end").exists() {
+                        return Ok(None);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+            }
+        }
+    }
+}
+
+/// cp rank > 0 of the cc-rollout lane: no serve, no rollouts — load the autograd
+/// student + optimizer and mirror rank 0's update stream until end-of-stream.
+#[cfg(feature = "cuda")]
+fn run_agent_opd_cp_follower(
+    args: &TrainAgentOpdArgs,
+    lora: train::lora::LoraConfig,
+    target_set: train::lora::LoraTargetSet,
+) -> Result<()> {
+    use autograd::optim::AdamW;
+    use train::{
+        qwen35_checkpoint::load_qwen35_lora_adapters,
+        qwen35_loader::load_qwen35_lora_from_hf_dir_with_shared_base,
+    };
+
+    let cp = train::context_parallel::CpContext::from_env();
+    let update_preset = args.update_preset();
+    let student_dir = args.student_model.as_path();
+    let (mut store, _train_backend, _label) = build_opd_store(args.backend)?;
+    apply_tape_dtype(&mut store, args.tape_dtype)?;
+    let hf_config = Qwen35Config::from_json_file(student_dir.join("config.json"))
+        .with_context(|| format!("read config.json from {}", student_dir.display()))?;
+    let vocab = hf_config.vocab_size;
+
+    eprintln!(
+        "[agent-opd] cp follower rank {}: loading student from {}",
+        cp.rank,
+        student_dir.display()
+    );
+    let student = load_qwen35_lora_from_hf_dir_with_shared_base(
+        student_dir,
+        lora,
+        target_set,
+        args.lora_layer_start,
+        args.lora_skip_experts,
+        None,
+        &mut store,
+    )
+    .with_context(|| format!("load LoRA student from {}", student_dir.display()))?;
+    if let Some(dir) = args.lora_adapters.as_deref() {
+        load_qwen35_lora_adapters(&student, &mut store, dir)
+            .with_context(|| format!("resume LoRA adapter from {}", dir.display()))?;
+    }
+    let all_params: Vec<TensorId> = student.all_parameter_ids();
+    let trainable: Vec<TensorId> = all_params
+        .iter()
+        .copied()
+        .filter(|id| store.get(*id).is_some_and(|tensor| tensor.requires_grad))
+        .collect();
+    let mut optimizer = AdamW::new(args.lr, (0.9, 0.999), 1.0e-8, 0.0);
+    let mut value_critic = match update_preset.advantage {
+        train::update_strategy::Advantage::ValueGae { gamma, lam } => Some(
+            train::opd::ValueCritic::new(
+                student.config().hidden_size,
+                args.value_lr,
+                gamma,
+                lam,
+                &mut store,
+            )
+            .map_err(anyhow::Error::from)?,
+        ),
+        _ => None,
+    };
+
+    let mut rx = MeshUpdateChannel::from_env()?;
+    let delete_prev = cp.rank + 1 == cp.size;
+    while let Some(batch) = rx.recv(delete_prev)? {
+        let report = update_preset
+            .update(
+                &batch,
+                &student,
+                all_params.as_slice(),
+                trainable.as_slice(),
+                &mut optimizer,
+                value_critic.as_mut(),
+                vocab,
+                args.writeback_window,
+                &mut store,
+            )
+            .map_err(anyhow::Error::from)?;
+        eprintln!(
+            "[agent-opd] follower update {}: trained={} loss={:.6}",
+            rx.seq - 1,
+            report.trained,
+            report.loss
+        );
+        if let Err(err) = store.backend().trim_memory_pool() {
+            eprintln!("[agent-opd] follower device-pool trim failed: {err}");
+        }
+    }
+    eprintln!("[agent-opd] cp follower rank {}: end of stream", cp.rank);
+    Ok(())
+}
+
 #[cfg(feature = "cuda")]
 fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
     use std::sync::{Arc, Mutex};
@@ -3120,6 +3280,17 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
         .as_deref()
         .ok_or_else(|| anyhow!("--staged-root is required without --replay-records"))?;
 
+    // Stochastic cc rollouts diverge across mesh ranks (different accepted sets
+    // → mismatched collectives → deadlock), so dp>1 is unsupported and cp
+    // followers branch off below to mirror rank 0's update stream. The
+    // synthetic probe is deterministic and exempt.
+    if args.synthetic_writeback_seq == 0 && args.dp_size.max(1) > 1 {
+        bail!(
+            "agent-opd cc rollout does not support --dp-size > 1: per-replica rollouts \
+             diverge at the gradient all-reduce; shard the sequence with --cp-size instead"
+        );
+    }
+
     // MUST run before the sandbox-spawner fork and the first CUDA context —
     // the coordinator owns neither.
     #[cfg(all(unix, feature = "cuda"))]
@@ -3129,6 +3300,11 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
         &args.mesh_devices(),
     )? {
         return Ok(());
+    }
+
+    if args.synthetic_writeback_seq == 0 && train::context_parallel::CpContext::from_env().rank > 0
+    {
+        return run_agent_opd_cp_follower(&args, lora, target_set);
     }
 
     // Pre-CUDA sandbox-spawner: fork ONE non-CUDA helper to own all rollout
@@ -3620,6 +3796,12 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
     // train reward climbs but held-out doesn't, the two diverge — a sign the model
     // is gaming the reward. We warn only when the gap is large AND still widening.
     let mut prev_eval_gap: Option<f64> = None;
+    // cp>1: this process is rank 0 (followers branched off above) — stream every
+    // update's batch so follower ranks mirror the collective sequence.
+    let mut mesh_tx = train::context_parallel::CpContext::from_env()
+        .is_enabled()
+        .then(MeshUpdateChannel::from_env)
+        .transpose()?;
     for round in 0..args.rounds {
         // Anchor the per-stage profiler (human table opt-in via ARLE_AOPD_PROFILE).
         train::aopd_profile::begin_round();
@@ -3921,6 +4103,9 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
             let mut run_update = |batch: &[train::update_strategy::ScoredTrajectory],
                                   extra: serde_json::Value|
              -> Result<()> {
+                if let Some(tx) = mesh_tx.as_mut() {
+                    tx.publish(batch)?;
+                }
                 let update_started = Instant::now();
                 let report =
                     train::aopd_profile::time_try("update", train::aopd_profile::GPU, || {
@@ -4196,6 +4381,12 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
 
         // Per-stage ms + %-of-round breakdown (opt-in ARLE_AOPD_PROFILE; no-op off).
         train::aopd_profile::print_round(round);
+    }
+
+    // Release the followers now; the coordinator keeps the group alive until
+    // rank 0 (this process) finishes eval/save below.
+    if let Some(tx) = mesh_tx.as_ref() {
+        tx.finish()?;
     }
 
     if let Some(join) = warmup_join.take() {
