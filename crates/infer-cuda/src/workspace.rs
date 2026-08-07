@@ -224,3 +224,38 @@ impl SliceSlot<i32> {
         Ok(buf)
     }
 }
+
+/// One cached PINNED host buffer, exact-length reuse.
+///
+/// A `Vec` destination makes the driver page-lock and free a staging buffer on
+/// every `memcpy_dtoh`. In a 30.75 s pure-decode window that was 1.64 s of
+/// `cuMemHostAlloc` + `cuMemFreeHost` across 3552 calls — 15% of the window,
+/// paired 1:1 with the readbacks, to move a handful of i32 tokens.
+pub(crate) struct PinnedSlot<T>(Option<cudarc::driver::PinnedHostSlice<T>>);
+
+impl<T> Default for PinnedSlot<T> {
+    fn default() -> Self {
+        Self(None)
+    }
+}
+
+impl<T: DeviceRepr> PinnedSlot<T> {
+    pub(crate) fn get(
+        &mut self,
+        ctx: &DeviceContext,
+        len: usize,
+    ) -> Result<&mut cudarc::driver::PinnedHostSlice<T>> {
+        if !matches!(&self.0, Some(buf) if buf.len() == len) {
+            // SAFETY: written only by the D2H whose completion the caller waits
+            // on before reading; freed with the slot.
+            self.0 = Some(unsafe {
+                ctx.ctx
+                    .alloc_pinned::<T>(len)
+                    .map_err(|e| anyhow!("alloc pinned staging failed: {e}"))?
+            });
+        }
+        self.0
+            .as_mut()
+            .ok_or_else(|| anyhow!("pinned slot empty after fill"))
+    }
+}
