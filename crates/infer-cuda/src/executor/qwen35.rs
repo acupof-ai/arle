@@ -927,6 +927,33 @@ impl Qwen35CudaExecutor {
         let kv_pool_sized_pages = full_attn_kv.max_total_pages;
         cuda_startup_log("qwen35_paged_pool_alloc", pool_t0, format_args!("built"));
 
+        // Pre-allocate the recurrent (GDR + conv) pool for ALL slots upfront.
+        // Without this, each slot's ~144 MiB GDR state is allocated on its first
+        // request; a burst of concurrent requests can then OOM even though the
+        // budget (`num_slots × per_slot`) was profiled into the KV-pool sizing.
+        // Pre-allocating reserves the VRAM at construction: if it doesn't fit,
+        // the engine fails fast here instead of mid-request.
+        let (num_linear, gdr_state_len, conv_len) = model.recurrent_dims();
+        let gdr_bytes = num_linear * gdr_state_len * std::mem::size_of::<f32>();
+        let conv_bytes = num_linear * conv_len * std::mem::size_of::<half::bf16>();
+        log::info!(
+            "Qwen3.5 pre-alloc recurrent pool: {num_slots} slots × \
+             ({gdr_bytes} B gdr + {conv_bytes} B conv) = {} MiB",
+            num_slots * (gdr_bytes + conv_bytes) / (1 << 20)
+        );
+        let mut recurrent_pool = Vec::with_capacity(num_slots);
+        for _ in 0..num_slots {
+            let gdr = (0..num_linear)
+                .map(|_| model.ctx.stream.alloc_zeros::<f32>(gdr_state_len))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| anyhow::anyhow!("pre-alloc gdr state failed: {e}"))?;
+            let conv = (0..num_linear)
+                .map(|_| DeviceVec::zeros(&model.ctx, conv_len))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| anyhow::anyhow!("pre-alloc conv state failed: {e}"))?;
+            recurrent_pool.push((gdr, conv));
+        }
+
         // G3 whole-slot spill tier: snapshots stored as 16 MiB chunked blobs
         // (manifest + chunks, the DSv4 pattern) — a whole image never fits one
         // fixed page, and the store's size contract is per-page. Same
@@ -948,7 +975,7 @@ impl Qwen35CudaExecutor {
             model,
             slots,
             slot_tier,
-            recurrent_pool: Vec::new(),
+            recurrent_pool,
             workspace: crate::qwen35::Qwen35Workspace::new(),
             num_slots,
             decode_graph_armed,
