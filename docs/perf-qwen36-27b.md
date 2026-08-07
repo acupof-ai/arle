@@ -37,11 +37,23 @@ describes the DSv4 execution paths; this document describes the Qwen3.6-27B
 
 ## 0. The chain
 
-**How to read the figures.** The flowchart carries containment and order only —
-box size means nothing and the percentages inside nodes are labels, not
-lengths. Magnitude lives in the tables, sorted largest first. One table (§1.2)
-carries proportional bars because its point is a visual comparison between two
-stacks; the rest do not, because sorting already answers "what is biggest".
+**How to read the figures.** Three things have to be visible at once — what a
+stage contains, how long it takes, and how it sits inside the end-to-end time —
+and they are carried by two different figure types, which must not be confused:
+
+| type | when | encoding |
+|---|---|---|
+| **timeline** | the stages really are sequential (§0.1 request, §3 tick) | bar **start** is start time, bar **length** is duration; the row is the whole |
+| **budget** | the parts interleave (§1.1 prefill, §2.1 decode step) | every bar starts at the same origin; only **length** means anything |
+
+Drawing an interleaved budget as a timeline would assert an execution order
+that does not exist, so those figures are labelled at the point of use. The
+flowchart carries containment and routing only — box size means nothing there,
+and percentages inside nodes are labels.
+
+**Every share in this document is taken against the sum of the rows shown**, and
+the sum is printed. Where that differs from a previously published share, the
+difference and its cause are stated on the spot.
 
 **What is in this document.** A number earns a place here if it can change a
 decision — what to work on next, or what not to. Everything else stays in the
@@ -85,6 +97,29 @@ Prefill and decode rows share a tick (`ForwardMode::Mixed`), but the executor
 still decomposes the mixed plan into per-row prefill submissions followed by a
 batched decode dispatch (`infer-cuda/src/executor/qwen35.rs:2932`).
 
+### 0.1 Where a request's own latency goes
+
+Anchor workload, 214 output tokens, warm prefix. Bar position is start time and
+bar length is duration, both to scale — these two stages really are sequential.
+
+```
+c=1                       s   share
+prefill (TTFT warm)    0.84   31.7%  ███████████████████
+decode 214 x 8.46 ms   1.81   68.3%                     █████████████████████████████████████████
+                                     total 2.65 s
+
+c=16                      s   share
+prefill (TTFT warm)    1.22    4.9%  ███
+decode 214 x 110.52 ms 23.65  95.1%     █████████████████████████████████████████████████████████
+                                     total 24.87 s
+```
+
+Concurrency moves a request's latency almost entirely into decode. Aggregate
+*throughput* on the same workload runs the other way — prefill tokens dominate
+the token count, which is why total tok/s scales 10453 → 33780 while decode
+tok/s scales 118 → 145 (§2.3). The two views answer different questions and
+neither substitutes for the other.
+
 **The four largest costs are measured and none of them is attributed.** Each is
 sized precisely and its cause is unknown; none is a kernel. Quantized GEMM,
 DeepGEMM FP8, and launch gaps have all been measured and priced out (§6).
@@ -104,14 +139,19 @@ DeepGEMM FP8, and launch gaps have all been measured and priced out (§6).
 
 `nsys`, 2026-08-01, 28.6 s wall / 24.0 s GPU-busy.
 
-| kernel | launches | s | share |
-|---|---:|---:|---:|
-| `gated_delta_rule_prefill_recurrent` | 1152 | **9.37** | **33%** |
-| DeepGEMM FP8, all shapes | 7936 | 8.33 | 29% |
-| GPU idle (includes host tokenization) | — | ≤4.6 | ≤16% |
-| TileLang full attention | 368 | 3.93 | 14% |
-| `pack_quantize` bf16→fp8 | 9600 | 1.50 | 5% |
-| conv1d / norm / silu | 3840 | 0.55 | 2% |
+These kernels interleave across the prefill, so this is a **budget**, not a
+timeline — every bar starts at the same origin and only its length is meaningful.
+
+```
+                                     s   share   launches
+gated_delta_rule_prefill_recurrent 9.37  33.1%   1152  ████████████████████
+DeepGEMM FP8, all shapes           8.33  29.5%   7936  ██████████████████
+GPU idle (incl. host tokenization) 4.60  16.3%      —  ██████████
+TileLang full attention            3.93  13.9%    368  ████████
+pack_quantize bf16 -> fp8          1.50   5.3%   9600  ███
+conv1d / norm / silu               0.55   1.9%   3840  █
+                                                       total 28.28 s
+```
 
 Plus **2328 `cuMemcpyDtoH` costing 1.58 s** — host round-trips inside the
 prefill loop.
@@ -169,14 +209,23 @@ Roofline: ~1.68 PFLOP for a 33K prefill (22.3 B GEMM params × 2 × 33e3, plus
 
 `nsys` over 59 plain-decode steps, 2026-08-01, per step:
 
-| | ms | share |
-|---|---:|---:|
-| `fp8_gemv_batch_kernel` × 400 launches | 13.8 | 66% |
-| `gemv_handwritten_kernel` (bf16) × 97 | 4.3 | 21% |
-| GPU idle between launches (**1094 launches/step**) | ~4 | 16% |
-| `gated_delta_rule_decode` × 48 | 0.80 | 4% |
-| rms_norm / add / silu × ~250 | 0.79 | 4% |
-| flash attention × 16 | 0.20 | 1% |
+Budget, not a timeline — 1094 launches per step interleave.
+
+```
+                                     ms   share   launches
+fp8_gemv_batch_kernel             13.80   57.8%    400  ███████████████████████████████████
+gemv_handwritten_kernel (bf16)     4.30   18.0%     97  ███████████
+GPU idle between launches          4.00   16.7%      —  ██████████
+gated_delta_rule_decode            0.80    3.3%     48  ██
+rms_norm / add / silu              0.79    3.3%   ~250  ██
+flash attention                    0.20    0.8%     16  █
+                                                        total 23.89 ms
+```
+
+Shares are of the 23.89 ms sum. The originally published shares (66 / 21 / 16 /
+4 / 4 / 1) were taken against the ~21 ms measured step, and the idle row against
+a third base; the ms column is the measurement and the sum is the denominator
+used here.
 
 Weight-read floor at 31.2 GB / 3.5 TB/s = **8.9 ms**. GEMV measured 18.1 ms ⇒
 **~49% of achievable bandwidth**, independently reproducing the 51% found in
@@ -274,13 +323,22 @@ temp 0.
 `ARLE_DSPARK_PHASE=1`, 2026-08-07, `7b8a66603`, c=16, short prompts, 293 ticks,
 mean 11.0 rows/tick.
 
-| phase | ms/tick | share |
-|---|---:|---:|
-| **verify** | **42.64** | **72.3%** |
-| draft | 12.75 | 21.6% |
-| rollback (own log line) | 5.03 | — |
-| commit | 2.40 | 4.1% |
-| snapshot | 1.21 | 2.1% |
+The tick is sequential, so position and length are both to scale:
+
+```
+                 ms   share
+draft         12.75   19.9%  ████████████
+snapshot       1.21    1.9%              █
+verify        42.64   66.6%               ████████████████████████████████████████
+commit         2.40    3.7%                                                       ██
+rollback       5.03    7.9%                                                         █████
+                                          total 64.03 ms
+```
+
+Shares are of the 64.03 ms sum. The phase table published earlier used 59.00 ms
+(the four `[dspark-phase]` fields, excluding the separately-logged rollback) as
+its base, which is why `draft` reads 21.6% there and 19.9% here. Rollback is
+real tick time, so the sum is the honest denominator.
 
 
 `commit` splits into tap 0.42, accept 0.02, cap 0.01, trunc 0.01, ext 1.94.
@@ -292,8 +350,8 @@ the split is meaningful.** The same run measured 149.1 out tok/s against
 
 Two structural facts:
 
-- **draft + verify = 94% of the tick.** Orchestration — snapshot, commit,
-  rollback — is 6–14%. Per-row host bookkeeping inside commit is negligible
+- **draft + verify = 86.5% of the tick.** Orchestration — snapshot, commit,
+  rollback — is 13.5%. Per-row host bookkeeping inside commit is negligible
   (accept 0.02 ms, cap and trunc 0.01 ms each).
 - **The verify intercept is the wall.** Decomposed against batch and context,
   verify = **22 ms intercept + 2.48 ms/row** at short context, the slope rising
