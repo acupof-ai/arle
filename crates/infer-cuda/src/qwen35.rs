@@ -62,7 +62,7 @@ use crate::ops::{
     rms_norm_batch, rms_norm_vec, silu_mul_fused, split_qkv, split2, upload_i32,
     warm_fp8_deepgemm_dense,
 };
-use crate::workspace::{HiddenSlot, SliceSlot, VecSlot};
+use crate::workspace::{HiddenSlot, PinnedSlot, SliceSlot, VecSlot};
 
 #[path = "qwen35/dspark.rs"]
 pub(crate) mod dspark;

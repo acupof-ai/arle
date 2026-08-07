@@ -391,6 +391,11 @@ pub(crate) struct DsparkScratch {
     chain_draft: SliceSlot<i32>,
     u_accept: SliceSlot<f32>,
     u_residual: SliceSlot<f32>,
+    /// Pinned staging for the draft loop's token readbacks. `clone_dtoh` into a
+    /// `Vec` makes the driver page-lock and free a buffer per call.
+    tok_host: PinnedSlot<i32>,
+    /// Device argmax ids; verify runs one per tick, so it must not allocate.
+    argmax_ids: SliceSlot<i32>,
 }
 
 #[derive(Default)]
@@ -400,6 +405,8 @@ struct MarkovScratch {
     bias: HiddenSlot,
     sum: HiddenSlot,
     ids: SliceSlot<i32>,
+    /// Pinned staging for this loop's argmax readbacks (see `PinnedSlot`).
+    host: PinnedSlot<i32>,
 }
 
 /// Own `prevs`/`emb`: the settle's are `block`-shaped, these `block - first_row`.
@@ -1132,10 +1139,12 @@ impl Qwen35Model {
                 }
             }
             ctx.sync()?;
-            let drawn: Vec<i32> = ctx
-                .stream
-                .clone_dtoh(scratch.sample_tok.get(ctx, n)?)
+            let src = scratch.sample_tok.get(ctx, n)?.clone();
+            let host = scratch.tok_host.get(ctx, n)?;
+            ctx.stream
+                .memcpy_dtoh(&src, host)
                 .map_err(|e| anyhow!("D2H dspark draws failed: {e}"))?;
+            let drawn: Vec<i32> = host.as_slice()?.to_vec();
             for tok in drawn {
                 ensure!(
                     (0..vocab as i32).contains(&tok),
@@ -1210,11 +1219,12 @@ impl Qwen35Model {
                     }
                 }
                 ctx.sync()?;
-                let tok = ctx
-                    .stream
-                    .clone_dtoh(tok_out)
-                    .map_err(|e| anyhow!("D2H dspark draft token failed: {e}"))?[0]
-                    as u32;
+                let src = tok_out.clone();
+                let host = scratch.tok_host.get(ctx, 1)?;
+                ctx.stream
+                    .memcpy_dtoh(&src, host)
+                    .map_err(|e| anyhow!("D2H dspark draft token failed: {e}"))?;
+                let tok = host.as_slice()?[0] as u32;
                 df.q_rows += 1;
                 tok
             };
@@ -1528,8 +1538,11 @@ impl Qwen35Model {
             rows == b * block,
             "dspark settle: {rows} rows != {b} slots x {block}"
         );
-        let ids = mk.ids.get(ctx, rows)?;
-        let mut toks = self.argmax_rows_into(base, ids)?;
+        let mut host = std::mem::take(&mut mk.host);
+        let mut toks = {
+            let ids = mk.ids.get(ctx, rows)?;
+            self.argmax_rows_into(base, ids, &mut host)
+        }?;
         let Some(m) = m else {
             return Ok(toks);
         };
@@ -1552,8 +1565,12 @@ impl Qwen35Model {
             gemm_batch(ctx, &m.w2, mk.emb.get(ctx, m.rank, rows)?, bias)?;
             let sum = mk.sum.get(ctx, vocab, rows)?;
             add_batch(ctx, base, mk.bias.get(ctx, vocab, rows)?, sum)?;
-            let ids = mk.ids.get(ctx, rows)?;
-            let next = self.argmax_rows_into(mk.sum.get(ctx, vocab, rows)?, ids)?;
+            let next = {
+                let MarkovScratch { ids, sum, .. } = &mut *mk;
+                let logits = sum.get(ctx, vocab, rows)?;
+                let ids = ids.get(ctx, rows)?;
+                self.argmax_rows_into(logits, ids, &mut host)
+            }?;
             // "the correction moved no row another row's bias depends on".
             let settled = (0..b).all(|s| {
                 (first_row..block.saturating_sub(1))
@@ -1701,13 +1718,20 @@ impl Qwen35Model {
     /// Per-row argmax over a whole verify output in one launch + one D2H. The
     /// accept scan is host arithmetic once this lands, so a batched tick costs
     /// one sync instead of one per chain row per slot.
-    pub(crate) fn argmax_rows(&self, logits: &HiddenStates) -> Result<Vec<u32>> {
-        let mut ids_dev = self
-            .ctx
-            .stream
-            .alloc_zeros::<i32>(logits.seq_len)
-            .map_err(|e| anyhow!("dspark argmax ids alloc failed: {e}"))?;
-        self.argmax_rows_into(logits, &mut ids_dev)
+    pub(crate) fn argmax_rows(
+        &self,
+        logits: &HiddenStates,
+        scratch: &mut DsparkScratch,
+    ) -> Result<Vec<u32>> {
+        // Verify runs this every tick, so it goes through the same
+        // no-allocation contract as the draft path's `argmax_rows_into`.
+        let mut ids_dev = std::mem::take(&mut scratch.argmax_ids);
+        let out = {
+            let dev = ids_dev.get(&self.ctx, logits.seq_len)?;
+            self.argmax_rows_into(logits, dev, &mut scratch.tok_host)
+        };
+        scratch.argmax_ids = ids_dev;
+        out
     }
 
     /// [`Self::argmax_rows`] into caller-held scratch — the draft path calls it
@@ -1716,6 +1740,7 @@ impl Qwen35Model {
         &self,
         logits: &HiddenStates,
         ids_dev: &mut CudaSlice<i32>,
+        host: &mut PinnedSlot<i32>,
     ) -> Result<Vec<u32>> {
         let ctx = &self.ctx;
         let (rows, vocab) = (logits.seq_len, logits.hidden_dim);
@@ -1739,10 +1764,11 @@ impl Qwen35Model {
                 .result()?;
             }
         }
-        let ids: Vec<i32> = ctx
-            .stream
-            .clone_dtoh(ids_dev)
+        let hbuf = host.get(ctx, rows)?;
+        ctx.stream
+            .memcpy_dtoh(&*ids_dev, hbuf)
             .map_err(|e| anyhow!("D2H dspark argmax failed: {e}"))?;
+        let ids: Vec<i32> = hbuf.as_slice()?.to_vec();
         ids.into_iter()
             .map(|id| {
                 ensure!((0..vocab as i32).contains(&id), "dspark argmax id {id} oob");

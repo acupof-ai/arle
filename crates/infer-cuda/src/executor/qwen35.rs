@@ -2143,7 +2143,7 @@ impl Qwen35CudaExecutor {
         // One argmax over every chain's rows: the greedy accept scan is host
         // arithmetic from here, so the loop below adds no device syncs.
         let argmax = match decode_rows.iter().any(|r| r.params.is_greedy()) {
-            true => model.argmax_rows(&logits)?,
+            true => model.argmax_rows(&logits, &mut ds.scratch)?,
             false => Vec::new(),
         };
 
