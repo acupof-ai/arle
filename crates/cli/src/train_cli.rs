@@ -2638,23 +2638,8 @@ fn replay_pg(
     epochs: usize,
     store: &mut autograd::TensorStore,
 ) -> Result<()> {
-    use train::update_strategy::Advantage;
-
-    // Value critic (ValueGae only), built after the `trainable` filter so it
-    // rides `all_params` (kept, never stepped) — mirrors the online path.
-    let mut value_critic = match preset.advantage {
-        Advantage::ValueGae { gamma, lam } => Some(
-            train::opd::ValueCritic::new(
-                student.config().hidden_size,
-                args.value_lr,
-                gamma,
-                lam,
-                store,
-            )
-            .map_err(anyhow::Error::from)?,
-        ),
-        _ => None,
-    };
+    let mut value_critic =
+        build_value_critic(&preset, student.config().hidden_size, args.value_lr, store)?;
 
     eprintln!(
         "[agent-opd] replay PG: preset={preset:?} groups={}",
@@ -3345,6 +3330,8 @@ enum MeshMsg {
 struct MeshUpdateChannel {
     dir: PathBuf,
     seq: u64,
+    /// Next consumed file the GC may delete (last cp rank only).
+    gc_next: u64,
 }
 
 #[cfg(feature = "cuda")]
@@ -3356,6 +3343,7 @@ impl MeshUpdateChannel {
         Ok(Self {
             dir: dir.into(),
             seq: 0,
+            gc_next: 0,
         })
     }
 
@@ -3371,17 +3359,23 @@ impl MeshUpdateChannel {
         Ok(())
     }
 
+    /// Delete every consumed file. Call ONLY right after an `Update` completed:
+    /// its collective proves every rank has consumed all files below `seq`.
+    /// (`GroupEnd` carries no collective, so it proves nothing — an eager
+    /// delete there deadlocks a slower rank at cp>=3.)
+    fn gc_consumed(&mut self) {
+        while self.gc_next < self.seq {
+            let _ = std::fs::remove_file(self.upd_path(self.gc_next));
+            self.gc_next += 1;
+        }
+    }
+
     fn finish(&self) -> Result<()> {
         std::fs::write(self.dir.join("end"), b"").map_err(Into::into)
     }
 
     /// Blocks until the next message (`Some`) or the end marker (`None`).
-    /// `delete_prev`: the last cp rank removes consumed files — by the time its
-    /// update k completed, NCCL lockstep guarantees every rank has read file k.
-    fn recv(&mut self, delete_prev: bool) -> Result<Option<MeshMsg>> {
-        if delete_prev && self.seq > 0 {
-            let _ = std::fs::remove_file(self.upd_path(self.seq - 1));
-        }
+    fn recv(&mut self) -> Result<Option<MeshMsg>> {
         loop {
             match std::fs::read(self.upd_path(self.seq)) {
                 Ok(bytes) => {
@@ -3402,13 +3396,78 @@ impl MeshUpdateChannel {
 /// Eval dumps land in --eval-out-dir, else next to the LoRA adapters / full
 /// checkpoint, else the current dir. Pure function of args so every fleet rank
 /// derives the same shared dump dir.
-#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+#[cfg(feature = "cuda")]
 fn agent_opd_eval_out_dir(args: &TrainAgentOpdArgs) -> PathBuf {
     args.eval_out_dir
         .clone()
         .or_else(|| args.save_lora_adapters.clone())
         .or_else(|| args.save_checkpoint.clone())
         .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// Value critic (ValueGae presets): built after the `trainable` filter and not
+/// a student param, so the policy optimizer / LoRA sync / adapter save never
+/// touch it — fully isolated, own AdamW.
+#[cfg(feature = "cuda")]
+fn build_value_critic(
+    preset: &train::update_strategy::UpdatePreset,
+    hidden_size: usize,
+    value_lr: f32,
+    store: &mut autograd::TensorStore,
+) -> Result<Option<train::opd::ValueCritic>> {
+    match preset.advantage {
+        train::update_strategy::Advantage::ValueGae { gamma, lam } => Ok(Some(
+            train::opd::ValueCritic::new(hidden_size, value_lr, gamma, lam, store)
+                .map_err(anyhow::Error::from)?,
+        )),
+        _ => Ok(None),
+    }
+}
+
+/// Every mesh rank runs this exact sequence before a mirrored update — the cp
+/// collectives stay aligned by construction, not by mirrored edits. Quiesce
+/// first (the group's cc children exited with run_group, so this only drains a
+/// straggler request); then drop the scratch + DEAD rollout KV pool — the two
+/// headroom levers (scratch otherwise OOMs the logits alloc; the writeback's
+/// fresh autograd forward never reads the engine KV).
+#[cfg(feature = "cuda")]
+fn quiesce_and_release_engines(infer_student: &train::infer_student::InferStudent) -> Result<()> {
+    train::aopd_profile::time_try("quiesce", train::aopd_profile::WALL, || {
+        quiesce_serve(infer_student.engine())
+    })?;
+    if let Err(err) = infer_student.release_inference_scratch() {
+        eprintln!("[agent-opd] release inference scratch failed: {err}");
+    }
+    if let Err(err) = infer_student.release_kv_pool() {
+        eprintln!("[agent-opd] release KV pool failed: {err}");
+    }
+    Ok(())
+}
+
+/// Group-end twin of [`quiesce_and_release_engines`]: re-merge the trained
+/// LoRA into this rank's engine when the leader synced, then re-acquire the KV
+/// pool. Returns the sync wall (0.0 when not synced).
+#[cfg(feature = "cuda")]
+fn sync_and_restore_engines(
+    infer_student: &train::infer_student::InferStudent,
+    store: &mut autograd::TensorStore,
+    adapter_map: &std::collections::HashMap<&'static str, TensorId>,
+    lora: train::lora::LoraConfig,
+    synced: bool,
+) -> Result<f64> {
+    let mut sync_secs = 0.0;
+    if synced {
+        let started = Instant::now();
+        infer_student
+            .sync_lora_from_store(store, adapter_map, lora)
+            .context("sync trained LoRA into rollout engine")?;
+        sync_secs = started.elapsed().as_secs_f64();
+        train::aopd_profile::record("sync_lora", train::aopd_profile::GPU, sync_secs);
+    }
+    infer_student
+        .ensure_kv_pool_and_resume_admissions()
+        .context("restore rollout engine after group")?;
+    Ok(sync_secs)
 }
 
 /// cp rank > 0 of the cc-rollout lane: serve rollouts for rank 0's harness
@@ -3444,39 +3503,26 @@ fn run_agent_opd_cp_follower(
         &train_backend,
     )?;
     let mut optimizer = AdamW::new(args.lr, (0.9, 0.999), 1.0e-8, 0.0);
-    let mut value_critic = match update_preset.advantage {
-        train::update_strategy::Advantage::ValueGae { gamma, lam } => Some(
-            train::opd::ValueCritic::new(
-                fleet.student.config().hidden_size,
-                args.value_lr,
-                gamma,
-                lam,
-                &mut store,
-            )
-            .map_err(anyhow::Error::from)?,
-        ),
-        _ => None,
-    };
+    let mut value_critic = build_value_critic(
+        &update_preset,
+        fleet.student.config().hidden_size,
+        args.value_lr,
+        &mut store,
+    )?;
     let adapter_map = fleet.student.adapter_name_map();
 
     let mut rx = MeshUpdateChannel::from_env()?;
     // Rank 0 waits for this before its first session can hit our endpoint.
     std::fs::write(rx.dir.join(format!("serve-r{}.ready", cp.rank)), b"")?;
-    let delete_prev = cp.rank + 1 == cp.size;
-    while let Some(msg) = rx.recv(delete_prev)? {
+    let gc_owner = cp.rank + 1 == cp.size;
+    while let Some(msg) = rx.recv()? {
         match msg {
             MeshMsg::Update {
                 batch,
                 release_engines,
             } => {
                 if release_engines {
-                    quiesce_serve(fleet.infer_student.engine())?;
-                    if let Err(err) = fleet.infer_student.release_inference_scratch() {
-                        eprintln!("[agent-opd] follower release inference scratch failed: {err}");
-                    }
-                    if let Err(err) = fleet.infer_student.release_kv_pool() {
-                        eprintln!("[agent-opd] follower release KV pool failed: {err}");
-                    }
+                    quiesce_and_release_engines(&fleet.infer_student)?;
                 }
                 let report = update_preset
                     .update(
@@ -3500,18 +3546,18 @@ fn run_agent_opd_cp_follower(
                 if let Err(err) = store.backend().trim_memory_pool() {
                     eprintln!("[agent-opd] follower device-pool trim failed: {err}");
                 }
+                if gc_owner {
+                    rx.gc_consumed();
+                }
             }
             MeshMsg::GroupEnd { synced } => {
-                if synced {
-                    fleet
-                        .infer_student
-                        .sync_lora_from_store(&mut store, &adapter_map, lora)
-                        .context("follower: sync trained LoRA into rollout engine")?;
-                }
-                fleet
-                    .infer_student
-                    .ensure_kv_pool_and_resume_admissions()
-                    .context("follower: restore rollout engine after group")?;
+                sync_and_restore_engines(
+                    &fleet.infer_student,
+                    &mut store,
+                    &adapter_map,
+                    lora,
+                    synced,
+                )?;
             }
         }
     }
@@ -3710,22 +3756,12 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
     )?;
 
     let mut optimizer = AdamW::new(args.lr, (0.9, 0.999), 1.0e-8, 0.0);
-    // Value critic (ValueGae presets): its weight is created AFTER the
-    // `trainable` filter and is not a student param, so the policy optimizer /
-    // LoRA sync / adapter save never touch it — fully isolated, own AdamW.
-    let mut value_critic = match update_preset.advantage {
-        train::update_strategy::Advantage::ValueGae { gamma, lam } => Some(
-            train::opd::ValueCritic::new(
-                student.config().hidden_size,
-                args.value_lr,
-                gamma,
-                lam,
-                &mut store,
-            )
-            .map_err(anyhow::Error::from)?,
-        ),
-        _ => None,
-    };
+    let mut value_critic = build_value_critic(
+        &update_preset,
+        student.config().hidden_size,
+        args.value_lr,
+        &mut store,
+    )?;
 
     // Diagnostic: skip the (slow, stochastic) agent rollout and drive ONE masked-CE
     // writeback on a synthetic trajectory of length N, so the writeback's OOM
@@ -3822,17 +3858,16 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
     // run sequentially — in-flight concurrency = the K samples of one group.
     // --staleness 1: the next group rolls on a background thread while this
     // group trains+merges (Arc'd for that thread's 'static bound).
+    let cp = train::context_parallel::CpContext::from_env();
     let harness = Arc::new(train::cc_harness::CcHarness {
         work_root: args.work_root.clone(),
         dump_dir,
-        // Fleet endpoints: rank r serves on base port + r (cp>1); samples
-        // spread round-robin across them.
-        base_urls: {
-            let cp = train::context_parallel::CpContext::from_env();
-            (0..cp.size.max(1))
-                .map(|r| format!("http://127.0.0.1:{}", args.serve_port + r as u16))
-                .collect()
-        },
+        // Fleet endpoints: rank r serves on base port + world rank r (== cp
+        // rank — dp>1 is rejected above), the same offset the follower's own
+        // serve_port derives; samples spread round-robin across them.
+        base_urls: (0..cp.size.max(1))
+            .map(|r| format!("http://127.0.0.1:{}", args.serve_port + r as u16))
+            .collect(),
         model_id: cc_model_id,
         cc_timeout_secs: args.cc_timeout,
         test_timeout_secs: args.test_timeout_secs,
@@ -3844,12 +3879,11 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
     // cp>1: this process is rank 0 (followers branched off above). Stream every
     // update's batch + engine-lifecycle decisions so follower ranks mirror the
     // collective sequence; wait for every follower serve before any cc traffic.
-    let mut mesh_tx = train::context_parallel::CpContext::from_env()
+    let mut mesh_tx = cp
         .is_enabled()
         .then(MeshUpdateChannel::from_env)
         .transpose()?;
     if let Some(tx) = mesh_tx.as_ref() {
-        let cp = train::context_parallel::CpContext::from_env();
         for r in 1..cp.size {
             let marker = tx.dir.join(format!("serve-r{r}.ready"));
             while !marker.exists() {
@@ -4097,7 +4131,9 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
             // GPU-busy fraction of the rollout wall: engine forward wall (submit→ready)
             // over this group's window; the remainder is agent-latency idle
             // (tool-exec / pytest / HTTP between turns). Exact at staleness=0;
-            // over-attributes under Rolling (staleness>0) overlap.
+            // over-attributes under Rolling (staleness>0) overlap. LEADER-ONLY
+            // under cp>1: the counter is process-local, so follower-endpoint
+            // forward time is not counted — read gpu_busy_frac as a floor.
             let gpu_busy_secs = infer_api::engine_forward_busy_micros()
                 .saturating_sub(gpu_busy_before) as f64
                 / 1e6;
@@ -4134,24 +4170,7 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
             // resident pool+scratch atop the capture forward OOMed at 97.4 GB.
             let released_engines = args.staleness == 0 || next.is_none();
             if released_engines {
-                // Quiesce before touching weights / dropping the KV pool: the
-                // group's cc children exited with run_group, so this only drains
-                // a straggler engine request — a live one would hit the dropped
-                // pool.
-                train::aopd_profile::time_try("quiesce", train::aopd_profile::WALL, || {
-                    quiesce_serve(infer_student.engine())
-                })?;
-                // Release the inference forward scratch + the DEAD rollout KV
-                // pool BEFORE the writeback — the same two headroom levers as
-                // before (scratch otherwise OOMs the logits alloc; the
-                // writeback's fresh autograd forward never reads the engine KV,
-                // see release_kv_pool).
-                if let Err(err) = infer_student.release_inference_scratch() {
-                    eprintln!("[agent-opd] release inference scratch failed: {err}");
-                }
-                if let Err(err) = infer_student.release_kv_pool() {
-                    eprintln!("[agent-opd] release KV pool failed: {err}");
-                }
+                quiesce_and_release_engines(&infer_student)?;
             }
             log_opd_vram("agent-opd pre-writeback", &train_backend);
 
@@ -4316,19 +4335,16 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
             if let Some(tx) = mesh_tx.as_mut() {
                 tx.publish(&MeshMsg::GroupEnd { synced })?;
             }
+            sync_lora_secs += sync_and_restore_engines(
+                &infer_student,
+                &mut store,
+                &student.adapter_name_map(),
+                lora,
+                synced,
+            )?;
             if synced {
-                let sync_started = Instant::now();
-                infer_student
-                    .sync_lora_from_store(&mut store, &student.adapter_name_map(), lora)
-                    .context("sync trained LoRA into rollout engine")?;
-                let secs = sync_started.elapsed().as_secs_f64();
-                train::aopd_profile::record("sync_lora", train::aopd_profile::GPU, secs);
-                sync_lora_secs += secs;
                 policy_version += 1;
             }
-            infer_student
-                .ensure_kv_pool_and_resume_admissions()
-                .with_context(|| format!("restore rollout engine after group {group_idx}"))?;
             // Post-merge prefix warm-up: the re-merge flushed the radix cache,
             // so re-prefill the shared cc prompt (newest dump's prompt portion,
             // max_tokens=1) on a background thread — overlapped with the next
