@@ -35,6 +35,61 @@ describes the DSv4 execution paths; this document describes the Qwen3.6-27B
 
 ---
 
+## Machine conversion — the frame this document is organized by
+
+"Where does the time go" is the wrong first question on a GPU. The question is
+**what fraction of the machine becomes tokens**, and that is a product of three
+factors, not a list of costs:
+
+| | factor | question | measured |
+|---|---|---|---|
+| **①** | time occupancy | is the GPU running at all | decode **50.5%** busy (§4.1), prefill **83.7%** (§1.1) |
+| **②** | efficiency while running | is the running kernel near roofline | GEMV at **49%** of achievable bandwidth (§2.1) |
+| **③** | arithmetic intensity | how many tokens per weight read | 16× batch buys **1.23×** (§2.3) |
+
+①② are optimization. **③ is not** — it is the regime the decoder runs in, and
+it is the only factor whose ceiling is more than 2×.
+
+**Why ③ dominates.** One token costs 2 × 27e9 = **54 GFLOP** and requires
+reading **31.2 GB** of weights. On this device that read floors at 8.9 ms, so a
+batch-of-1 decode running at *100% of achievable bandwidth* still delivers
+6.1 TFLOPS — **2% of the FP8 peak**. The same 8.9 ms read serving 16 rows
+delivers 97 TFLOPS, **33%**. A memory-bound decoder at full bandwidth is an
+almost entirely idle machine; only sharing the weight read across more tokens
+changes that.
+
+Measured against the anchor row, decode converts `tok/s × 54 GFLOP / 296 TFLOPS`:
+
+```
+                            % of FP8 peak
+c=1    118.2 tok/s   2.2%  █
+c=16   144.8 tok/s   2.6%  █
+ideal, 16 rows on one weight read
+                    32.8%  ███████████████
+```
+
+**Speculation is already the ③ lever, and it is the largest win in this file.**
+A plain decode step is 23.89 ms/token (§2.1); the anchor with DSpark is
+8.46 ms at c=1 — **2.8×**. The consistency check: 118.2 tok/s × 31.2 GB would
+demand 3.69 TB/s against 3.5 TB/s achievable, so the weight read is
+demonstrably being shared. Nothing in ①② has ever produced a factor like that.
+
+**Ceilings, for ranking.** Driving ① to 100% and ② to roofline takes the plain
+step 23.89 → ~11 ms: **2.2×, and that is everything in ①② combined.** Making
+batch scale even 6× instead of 1.23× is **5×**. ③ is both the larger factor and
+the one currently measured broken.
+
+**Consequence for what to work on.** §3 measures verify as
+**22 ms intercept + 2.48 ms/row**. A batch-independent intercept is, by
+definition, the part that adding rows does not amortize — it *is* the ③ failure
+expressed in host terms, and at c=16 it is 36% of verify. Its module
+composition has never been measured. That, not any kernel, is the first item.
+
+Every lever in §6 is tagged ①②③ so this ranking is visible at the point of
+choice rather than reconstructed from the numbers.
+
+---
+
 ## 0. The chain
 
 **How to read the figures.** Three things have to be visible at once — what a
@@ -124,12 +179,15 @@ neither substitutes for the other.
 sized precisely and its cause is unknown; none is a kernel. Quantized GEMM,
 DeepGEMM FP8, and launch gaps have all been measured and priced out (§6).
 
-| cost | size | what is known | what is not | § |
-|---|---|---|---|---|
-| verify intercept | 22 ms, batch- and context-independent | equals a plain decode step, so speculation is working | its module composition on the FP8 + DSpark path — never decomposed | §3 |
-| sampling penalty | −30 to −40% decode tok/s at c ≥ 8 | the concurrency shape is a per-row loop, not acceptance | the split between the batched-draft gate and acceptance rate | §2.4 |
-| prefill GPU idle | 3.97 s vs SGLang 0.19 s | GPU-busy is within 0.93 s on identical kernels | what the idle is waiting on | §1.2 |
-| sidecar writes | 9.4% of wall, 83 GB per bench | the cost, exactly | the restore hit rate, so whether it is earned | §4.2 |
+| cost | factor | size | what is known | what is not | § |
+|---|---|---|---|---|---|
+| verify intercept | ③ | 22 ms, batch- and context-independent | equals a plain decode step, so speculation is working | its module composition on the FP8 + DSpark path — never decomposed | §3 |
+| sampling penalty | ③ | −30 to −40% decode tok/s at c ≥ 8 | the concurrency shape is a per-row loop, not acceptance | the split between the batched-draft gate and acceptance rate | §2.4 |
+| prefill GPU idle | ① | 3.97 s vs SGLang 0.19 s | GPU-busy is within 0.93 s on identical kernels | what the idle is waiting on | §1.2 |
+| sidecar writes | ① | 9.4% of wall, 83 GB per bench | the cost, exactly | the restore hit rate, so whether it is earned | §4.2 |
+
+The two ③ costs rank above the two ① costs even though the prefill idle is the
+larger raw number — see *Machine conversion* above.
 
 ---
 
@@ -495,31 +553,53 @@ W8A16 against SGLang on identical weights and kernel, 2026-08-06:
 
 ## 6. Lever register
 
-Every lever that has been priced, with the measurement that settled it.
+Every lever that has been priced, with the measurement that settled it. The
+**factor** column is which of ①②③ the lever moves; a lever's ceiling is its
+factor's ceiling, so this column ranks before the size column does.
+
+**③ — tokens per weight read.** Ceiling ~12×; every >2× win in this file is here.
+
+| lever | phase | measured share | status |
+|---|---|---|---|
+| DSpark speculation | decode | 23.89 → 8.46 ms/token | **shipped**, **2.8×**, the largest win in this file |
+| batched DSpark verify core | decode | rows × 48 × 5 launches | **shipped**, c=8 TPOT −12.7% |
+| batched rollback replay | decode | 4608 vs 144 launches/tick | **shipped**, c=16 TPOT −11.4% |
+| **22 ms verify intercept** | decode | 36% of verify at c=16 | **open, first item**; composition never measured |
+| batched-draft gate under sampling | decode | **−30 to −40% at c ≥ 8** | **open**; drops every row to per-row drafting, mechanism not isolated from acceptance |
+| prefill–prefill fusion | prefill | ~3% (15 redundant weight reads) | **priced out** |
+| `--max-num-batched-tokens` | prefill | budget never binds | **priced out**, 16384 stays |
+
+**① — time occupancy.** Ceiling: decode 50.5% → 100%, i.e. ~2×.
 
 | lever | phase | measured share | status |
 |---|---|---|---|
 | whole-step CUDA graph | decode | 5.66 vs 2.08 ms idle | **shipped**, −1.84 ms, default-on |
+| sidecar bulk serialize | prefill | 9.4% of wall | **shipped**, −9.5% on the op, end-to-end null |
+| prefill GPU idle | prefill | 3.97 vs 0.19 s | **open, largest single gap** |
+| sidecar write policy | prefill | 83 GB / 9.4% of wall | open, hit rate unmeasured |
+| host tail (refresh H2D, sampling sync) | decode | part of ~4.3 ms residual | open |
+| CUDA graph on the spec path | decode | **0.59 s / 3% of window** | **priced out** |
+| `--chunked-prefill-size` | prefill | ±0.07 s TTFT | **priced out** |
+| pinned readback staging | decode | wash on both phases | **null**, kept |
+
+**② — efficiency while running.** Ceiling: 49% → ~100% of roofline, i.e. ~2×,
+and most of it is already priced out against a measured SGLang reference.
+
+| lever | phase | measured share | status |
+|---|---|---|---|
 | `gemv_handwritten` → cuBLASLt | decode | 3.17 vs 1.11 ms | **shipped**, −1.28 ms |
 | qkv/qkvz fusion | decode | 0.9 ms of marlin busy | **shipped**, −0.59 ms |
 | FlashQLA chunked GDR | prefill | 33% of GPU-busy | **shipped**, 33K cold −26% |
-| batched DSpark verify core | decode | rows × 48 × 5 launches | **shipped**, c=8 TPOT −12.7% |
-| batched rollback replay | decode | 4608 vs 144 launches/tick | **shipped**, c=16 TPOT −11.4% |
-| sidecar bulk serialize | prefill | 9.4% of wall | **shipped**, −9.5% on the op, end-to-end null |
-| batched-draft gate under sampling | decode | **−30 to −40% at c ≥ 8** | **open, largest decode item**; mechanism not isolated from acceptance |
 | GDN decode kernel | decode | 1.21 vs 0.53 ms | open, ~0.7 ms |
 | FA3 decode config | decode | 0.93 vs 0.45 ms | open, ~0.5 ms |
-| host tail (refresh H2D, sampling sync) | decode | part of ~4.3 ms residual | open |
-| prefill GPU idle | prefill | 3.97 vs 0.19 s | **open, largest single gap** |
-| sidecar write policy | prefill | 83 GB / 9.4% of wall | open, hit rate unmeasured |
-| CUDA graph on the spec path | decode | **0.59 s / 3% of window** | **priced out** |
 | quantized GEMM kernel | prefill | identical to SGLang ±15 ms | **priced out** |
 | DeepGEMM FP8 | prefill | 64–67% of peak | **priced out** |
-| `--chunked-prefill-size` | prefill | ±0.07 s TTFT | **priced out** |
-| `--max-num-batched-tokens` | prefill | budget never binds | **priced out**, 16384 stays |
-| prefill–prefill fusion | prefill | ~3% (15 redundant weight reads) | **priced out** |
-| pinned readback staging | decode | wash on both phases | **null**, kept |
 | DSpark draft attention | decode | 1.5 ms of 35 ms (4.3%) | **priced out**, 3 rewrites failed to transfer |
+
+The shape the split exposes: **② is nearly exhausted** — five of its eight
+entries are shipped or priced out against a measured reference, and the two
+open ones are worth 1.2 ms together. **③ has two open items and no measured
+ceiling.**
 
 ---
 
@@ -538,22 +618,39 @@ chain:
 
 ---
 
-## Open items, ranked by unpriced size
+## Open items, ranked by factor then by unpriced size
 
-1. **Sampling costs 30–40% of decode throughput at c ≥ 8** (§2.4). Every
+Ranked by factor first: a ③ item's ceiling is ~12×, an ①② item's is ~2×
+(§ *Machine conversion*). Raw size does not rank across factors.
+
+**③ — tokens per weight read**
+
+1. **Decompose the 22 ms verify intercept** (§3). Batch-independent by
+   measurement, so it is exactly the part adding rows does not amortize — 36%
+   of verify at c=16, and the reason 16× batch buys 1.23×. Its module
+   composition has never been measured, so every DSpark lever is currently
+   chosen without knowing what it displaces.
+2. **Sampling costs 30–40% of decode throughput at c ≥ 8** (§2.4). Same factor:
+   the batched-draft gate at `executor/qwen35.rs:1984` tests *all* rows greedy,
+   so one sampled request drops every row to per-row drafting. Every
    optimization on this row was measured at temp 0 while production serving is
-   predominantly sampled. The concurrency shape implicates the batched-draft
-   gate; separating it from acceptance rate needs one sweep with an acceptance
-   counter.
-2. **Prefill GPU idle, 3.8 s** against SGLang's 0.19 s on identical kernels.
+   predominantly sampled. Separating the gate from acceptance rate needs one
+   sweep with an acceptance counter.
+
+**① — time occupancy**
+
+3. **Prefill GPU idle, 3.8 s** against SGLang's 0.19 s on identical kernels.
    Largest measured single gap and not yet attributed.
-3. **Sidecar write policy** — 83 GB and 9.4% of wall per bench, restore hit
+4. **Sidecar write policy** — 83 GB and 9.4% of wall per bench, restore hit
    rate unmeasured. The only chain item whose cost is known and whose benefit is
    entirely unknown.
-4. **Decode host tail, ~4.3 ms/step** — refresh H2Ds, sampling D2H and sync,
+5. **Decode host tail, ~4.3 ms/step** — refresh H2Ds, sampling D2H and sync,
    scheduler.
-5. **GDN decode kernel 0.7 ms and FA3 decode config 0.5 ms**, both against a
-   measured SGLang reference.
+
+**② — efficiency while running**
+
+6. **GDN decode kernel 0.7 ms and FA3 decode config 0.5 ms**, both against a
+   measured SGLang reference. 1.2 ms together, and the last two open ② items.
 
 ## Measurement debt
 
