@@ -23,7 +23,7 @@ pub struct RolloutNeeds {
 
 /// One scored rollout: the verl-style `(prompt, response, mask)` record plus its
 /// scalar reward, group key, and generation-time behavior-policy logprobs.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ScoredTrajectory {
     pub prompt_ids: Vec<u32>,
     pub response_ids: Vec<u32>,
