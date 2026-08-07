@@ -37,6 +37,18 @@ describes the DSv4 execution paths; this document describes the Qwen3.6-27B
 
 ## 0. The chain
 
+**How to read the figures.** The flowchart carries containment and order only —
+box size means nothing and the percentages inside nodes are labels, not
+lengths. Magnitude lives in the tables, sorted largest first. One table (§1.2)
+carries proportional bars because its point is a visual comparison between two
+stacks; the rest do not, because sorting already answers "what is biggest".
+
+**What is in this document.** A number earns a place here if it can change a
+decision — what to work on next, or what not to. Everything else stays in the
+wins/errors entry it came from and is linked. The four largest numbers in the
+chain are all unattributed, and are marked as such rather than filled with a
+hypothesis; see *Measurement debt*.
+
 ```mermaid
 flowchart TB
     subgraph ADMIT["Admission — infer-core/src/planner.rs"]
@@ -73,16 +85,16 @@ Prefill and decode rows share a tick (`ForwardMode::Mixed`), but the executor
 still decomposes the mixed plan into per-row prefill submissions followed by a
 batched decode dispatch (`infer-cuda/src/executor/qwen35.rs:2932`).
 
-**The three costs that dominate, in order of unpriced size:**
+**The four largest costs are measured and none of them is attributed.** Each is
+sized precisely and its cause is unknown; none is a kernel. Quantized GEMM,
+DeepGEMM FP8, and launch gaps have all been measured and priced out (§6).
 
-| | share | measured in |
-|---|---|---|
-| sampling turns off the batched draft | −30 to −40% decode tok/s at c ≥ 8 | §2.4 |
-| prefill GPU idle | 3.97 s vs SGLang 0.19 s | §1.2 |
-| prefix sidecar writes | 9.4% of wall, 83 GB per bench | §4.2 |
-
-None of the three is a kernel. Quantized GEMM, DeepGEMM FP8, and launch gaps
-have all been measured and priced out (§6).
+| cost | size | what is known | what is not | § |
+|---|---|---|---|---|
+| verify intercept | 22 ms, batch- and context-independent | equals a plain decode step, so speculation is working | its module composition on the FP8 + DSpark path — never decomposed | §3 |
+| sampling penalty | −30 to −40% decode tok/s at c ≥ 8 | the concurrency shape is a per-row loop, not acceptance | the split between the batched-draft gate and acceptance rate | §2.4 |
+| prefill GPU idle | 3.97 s vs SGLang 0.19 s | GPU-busy is within 0.93 s on identical kernels | what the idle is waiting on | §1.2 |
+| sidecar writes | 9.4% of wall, 83 GB per bench | the cost, exactly | the restore hit rate, so whether it is earned | §4.2 |
 
 ---
 
@@ -96,10 +108,10 @@ have all been measured and priced out (§6).
 |---|---:|---:|---:|
 | `gated_delta_rule_prefill_recurrent` | 1152 | **9.37** | **33%** |
 | DeepGEMM FP8, all shapes | 7936 | 8.33 | 29% |
+| GPU idle (includes host tokenization) | — | ≤4.6 | ≤16% |
 | TileLang full attention | 368 | 3.93 | 14% |
 | `pack_quantize` bf16→fp8 | 9600 | 1.50 | 5% |
 | conv1d / norm / silu | 3840 | 0.55 | 2% |
-| GPU idle (includes host tokenization) | — | ≤4.6 | ≤16% |
 
 Plus **2328 `cuMemcpyDtoH` costing 1.58 s** — host round-trips inside the
 prefill loop.
@@ -123,14 +135,17 @@ then routed batch==1 prefill to FA3 for a further −4%.
 mechanically repacked GPTQ twin: **same int8 values, same `gptq_marlin`
 kernel**. Prefill is not captured into a graph on either stack.
 
-| bucket | ARLE (stub build) | ARLE (FlashQLA) | SGLang |
-|---|---:|---:|---:|
-| Marlin GEMM (8448 launches) | 18.660 s | 18.660 | 18.675 |
-| full attention (FA3) | 1.632 | 1.633 | 1.529 |
-| linear attention + conv1d | **7.231** | **0.441** | 0.314 |
-| other | 0.361 | 1.108 | 0.422 |
-| GPU idle | **3.877** | **3.967** | 0.190 |
-| wall | 31.76 | 25.84 | 21.13 |
+| bucket | ARLE (stub) | ARLE (FlashQLA) | | SGLang | |
+|---|---:|---:|---|---:|---|
+| Marlin GEMM (8448 launches) | 18.660 s | 18.660 | `████████████████████████████` | 18.675 | `████████████████████████████` |
+| GPU idle | **3.877** | **3.967** | `██████` | **0.190** | `▏` |
+| full attention (FA3) | 1.632 | 1.633 | `██` | 1.529 | `██` |
+| other | 0.361 | 1.108 | `██` | 0.422 | `▊` |
+| linear attention + conv1d | **7.231** | **0.441** | `▊` | 0.314 | `▌` |
+| **wall** | 31.76 | **25.84** | | **21.13** | |
+
+The two bar columns are on the same scale, so the only visible difference
+between the stacks is the idle row.
 
 Three conclusions that hold for both weight paths:
 
@@ -158,10 +173,10 @@ Roofline: ~1.68 PFLOP for a 33K prefill (22.3 B GEMM params × 2 × 33e3, plus
 |---|---:|---:|
 | `fp8_gemv_batch_kernel` × 400 launches | 13.8 | 66% |
 | `gemv_handwritten_kernel` (bf16) × 97 | 4.3 | 21% |
+| GPU idle between launches (**1094 launches/step**) | ~4 | 16% |
 | `gated_delta_rule_decode` × 48 | 0.80 | 4% |
 | rms_norm / add / silu × ~250 | 0.79 | 4% |
 | flash attention × 16 | 0.20 | 1% |
-| GPU idle between launches (**1094 launches/step**) | ~4 | 16% |
 
 Weight-read floor at 31.2 GB / 3.5 TB/s = **8.9 ms**. GEMV measured 18.1 ms ⇒
 **~49% of achievable bandwidth**, independently reproducing the 51% found in
@@ -172,14 +187,15 @@ July.
 2026-08-03, both stacks `nsys`-decomposed, columns summing to measured ITL.
 ARLE 25.08 ms/step versus SGLang 17.07 ms/step:
 
-| module | ARLE | SGLang | attributed to |
-|---|---:|---:|---|
-| marlin | 13.20 (357 launches) | 12.31 (270) | qkv fusion, fixed-grid prologue × launches |
-| bf16 gemv | 3.17 (52) | 1.11 (nvjet) | `gemv_handwritten_kernel` on fused `[96,5120]` in_proj_ba: ~52 µs at ~19 GB/s, one-block-per-row grid cannot fill 78 SMs; cuBLAS splitK does the shape in ~8 µs |
-| GDN chain | 1.21 | 0.53 | kernel quality (fla-style) |
-| FA3 chain | 0.93 | 0.45 | decode config |
-| norms | ~parity | ~parity | — |
-| idle | 5.66 | 2.08 | whole-step CUDA graph |
+| module | ARLE | | SGLang | | Δ | attributed to |
+|---|---:|---|---:|---|---:|---|
+| marlin | 13.20 (357) | `██████████████████████████` | 12.31 (270) | `████████████████████████` | 0.89 | qkv fusion, fixed-grid prologue × launches |
+| idle | 5.66 | `███████████` | 2.08 | `████` | **3.58** | whole-step CUDA graph |
+| bf16 gemv | 3.17 (52) | `██████` | 1.11 (nvjet) | `██` | 2.06 | `gemv_handwritten_kernel` on fused `[96,5120]` in_proj_ba: ~52 µs at ~19 GB/s, one-block-per-row grid cannot fill 78 SMs; cuBLAS splitK does the shape in ~8 µs |
+| GDN chain | 1.21 | `██` | 0.53 | `█` | 0.68 | kernel quality (fla-style) |
+| FA3 chain | 0.93 | `██` | 0.45 | `█` | 0.48 | decode config |
+| norms | ~parity | | ~parity | | ~0 | — |
+| **total** | **25.08** | | **17.07** | | **8.01** | |
 
 The kernel was exonerated by construction: SGLang decodes bs=1 inside a
 whole-step captured CUDA graph while ARLE launched ~1094 kernels eagerly.
@@ -260,11 +276,12 @@ mean 11.0 rows/tick.
 
 | phase | ms/tick | share |
 |---|---:|---:|
-| draft | 12.75 | 21.6% |
-| snapshot | 1.21 | 2.1% |
 | **verify** | **42.64** | **72.3%** |
-| commit | 2.40 | 4.1% |
+| draft | 12.75 | 21.6% |
 | rollback (own log line) | 5.03 | — |
+| commit | 2.40 | 4.1% |
+| snapshot | 1.21 | 2.1% |
+
 
 `commit` splits into tap 0.42, accept 0.02, cap 0.01, trunc 0.01, ext 1.94.
 `rollback` splits into restore 0.85, replay 4.18.
@@ -486,6 +503,7 @@ Facts this chain rests on that have not been measured:
 
 | item | why it matters |
 |---|---|
+| **module composition of the 22 ms verify intercept** | the largest single number on the decode path; §2.1 decomposes a plain FP8 decode step and §2.2 a W8A16 one, but the FP8 + DSpark verify has never been decomposed, so every DSpark lever is currently chosen without knowing what it displaces |
 | prefix sidecar restore hit rate | decides whether 9.4% of wall is earned |
 | acceptance rate under temperature | separates §2.4's two candidate mechanisms |
 | whole-slot park cost | `a546ba80a` shipped unmeasured; both routes default-off |
