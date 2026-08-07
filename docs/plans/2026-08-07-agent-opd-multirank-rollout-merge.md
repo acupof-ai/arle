@@ -1,6 +1,23 @@
 # Agent-OPD multi-rank rollout merge
 
-**Status: deferred — trigger below.** 2026-08-07.
+**Status: shipped as the serve-fleet variant** (`7aef20557`, 2026-08-07); pod
+cp=2 A/B pending-remote. The trigger fired the same day it was written: the
+cp=2 fix validation showed cp=2 is the preferred operating point (update wall
+7.1× vs single-GPU), which makes follower idle during the rollout phase (75%
+of the round wall) the dominant waste.
+
+**Shipped shape — smaller than the phase-split below.** Because every cc child
+runs on rank 0's host side, followers do not need their own harness or a
+reverse group channel: each follower loads the same rollout engine + serve
+(shared `load_agent_opd_serve_student`) and rank 0's harness spreads one
+group's samples round-robin across the fleet endpoints (`CcHarness.base_urls`).
+The validated per-group cadence, GRESO, DAPO, replay, and staleness machinery
+are untouched; the update stream gained engine-lifecycle flags
+(`MeshMsg::Update.release_engines`, `MeshMsg::GroupEnd.synced`) so followers
+mirror rank 0's quiesce/release and LoRA re-merge around the collectives. Dump
+filenames are pid-tagged so the fleet shares one dump dir. The phase-split
+design below remains the reference for a future multi-node fleet, where
+sessions can no longer all originate on rank 0's host.
 
 ## Current state (shipped)
 
