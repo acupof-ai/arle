@@ -70,12 +70,28 @@ slots (4 per engine × 2 ranks). Two independent causes, both structural:
   never used;
 - the group barrier idles the fast samples' slots until the straggler ends.
 
-## Follow-up
+## Follow-up — `--prompts-per-update` (`f996e6826`)
 
-The next lever is rollout concurrency, not per-sample throughput: batch G
-prompts per update (the verl shape — roll the whole batch at one policy
-version, then a single update), which fills the slots and amortizes the
-straggler tail while staying strictly on-policy. `ScoredTrajectory.group_id`
-already carries the per-prompt key the group baselines need. Filed as the
-production blocker for the 449-task run: at this config round 0 alone
-extrapolates to ~36 h, most of it idle slots.
+The lever is rollout concurrency, not per-sample throughput. The round loop now
+windows the verl way: G groups roll concurrently under one policy version, then
+a single update trains their merged batch. Staleness stays 0 (the window shares
+its launch version), and `rejection-ce` steps per trajectory inside `update_ce`,
+so the merged batch does not raise writeback VRAM — only the engine's extra
+slots do (8 vs 4 per rank ≈ +0.6 GB against 19 GB of headroom). A/B
+pending-remote (`fulltrain7`, G=4).
+
+## Production config for the 449-task run
+
+Two numbers decide it, both from this run:
+- **Windowing is the wall lever.** At G=1 round 0 extrapolates to ~36 h for 449
+  groups. At G=4 the window wall is bounded below by `max(sum of the window's
+  sample walls / 8 slots, longest sample)`, which on this corpus is the cap:
+  ≈ 600 s × 113 windows ≈ 19 h.
+- **After windowing the `--cc-timeout` cap binds.** With 16 samples per window
+  and ~9% of samples capped, almost every window contains a capped sample, so
+  the window wall sits at the cap. Evidence for lowering it: of the run's 8
+  passing samples, 7 finished within 386 s and only 1 passed at the 600 s cap;
+  of the 9 capped samples, 8 failed. A 400 s cap keeps 7 of 8 passes and takes
+  the window wall to ≈ 400 s (≈ 12.5 h for round 0). The cost is coverage of
+  genuinely long trajectories, which are also the hard tasks that carry the
+  most signal — so this is a config call, not a default flip.

@@ -6,6 +6,15 @@ cp=2 fix validation showed cp=2 is the preferred operating point (update wall
 7.1× vs single-GPU), which makes follower idle during the rollout phase (75%
 of the round wall) the dominant waste.
 
+**Measured outcome + second tranche.** The fleet alone moved the round wall only
+−5%: it cut per-sample latency (−23% on throughput-bound groups, +43% tok/s) but
+left rollout *concurrency* unchanged, so the fleet's 8 slots ran at 29%
+utilization ([wins](../experience/wins/2026-08-07-agent-opd-rollout-fleet.md)).
+`f996e6826` adds `--prompts-per-update G`: G groups roll concurrently under one
+policy version, then a single update trains their merged batch — strictly
+on-policy, and the straggler tail is amortized across the window instead of
+idling its siblings' slots.
+
 **Shipped shape — smaller than the phase-split below.** Because every cc child
 runs on rank 0's host side, followers do not need their own harness or a
 reverse group channel: each follower loads the same rollout engine + serve
