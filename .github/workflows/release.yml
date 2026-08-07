@@ -385,7 +385,7 @@ jobs:
     name: Bump Homebrew formula
     needs: create-release
     runs-on: ubuntu-latest
-    if: ${{ !contains(github.ref_name, '-') }}  # skip pre-releases (e.g. v0.1.0-rc1)
+    if: ${{ !contains(github.ref_name, '-') && needs.create-release.result == 'success' }}  # skip pre-releases; run only when create-release succeeded
     steps:
       - name: Update Formula/arle.rb in cklxx/homebrew-tap
         uses: mislav/bump-homebrew-formula-action@v4
