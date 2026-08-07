@@ -41,10 +41,13 @@ invalidated it. **Check this table before ranking anything off a number.**
 | §4.4 | memory ledger | 08-07 | 16 slots | — | current |
 | §5.0 | anchor row | 08-07 `70760bc09` | 1, 8, 16 | 32K | current |
 | §5.2 | vs SGLang, W8A16 | 08-06 | — | 33K | current |
+| ceiling | c=16 decode+prefill window | 08-08 `70760bc09` | 9 rows/tick at nominal 16 | 32.5K | current — the only capture above batch 1 |
 
-**Nine of the twelve are batch 1 or batch-1-derived** while production decodes
-at c=16. That is the single largest structural gap in this document; see
-*Where the ceiling is*.
+Eleven of the thirteen are batch 1 or batch-1-derived while production decodes
+at c=16. **And all thirteen run the anchor workload, which is 279:1
+prompt:output** — so every decode number here is ranked off a benchmark in
+which all decode together is ~1% of GPU time. Both gaps are covered in *Where
+the ceiling is*.
 
 **Model and device constants** used throughout:
 
@@ -127,66 +130,82 @@ The gap grows with batch. That is the opposite of what a batch-independent cost
 produces, and it is invisible in every capture this document contains, all of
 which are batch 1.
 
-### The matched measurement agrees, and it was already in the repo
+### Measured: the mechanism is confirmed and the size is not
 
-`baselines.md:144`, same binary, speculation on against off:
+`nsys`, 2026-08-08, `70760bc09`, GPU 6, c=16 on the 32K anchor dataset, a 30 s
+window at bench elapsed 118–148 s. **This is the document's first decode
+capture above batch 1.** Full entry:
+[`errors/2026-08-08-anchor-is-a-prefill-benchmark-decode-levers-ranked-off-it.md`](experience/errors/2026-08-08-anchor-is-a-prefill-benchmark-decode-levers-ranked-off-it.md).
 
-```
-DSpark gain over spec-off
-c=1   2.9x  ██████████████████
-c=2   2.5x  ███████████████
-c=4   2.0x  ████████████
-c=8   1.4x  ████████         <- crossover region, ~7 rows
-c=16  1.1x  ██████
-```
-
-**Speculation's benefit decays to nothing exactly across the crossover**, which
-is what the derivation predicts: speculation manufactures arithmetic intensity
-when the batch cannot supply it, and past ~7 rows the batch already does. This
-is a matched same-binary A/B and it is the cleanest statement of the batching
-ceiling in the repo.
-
-### The per-row term, measured on the right shape
-
-`errors/2026-08-06-decode-lever-board-rebuilt-gemm-is-not-the-top-lever.md`
-phase-split the tick at c=16, 33K, on the current binary:
-
-| rows | draft | snap | verify | commit | tick |
-|---:|---:|---:|---:|---:|---:|
-| 16 | 47.94 | 1.55 | 109.29 | 3.21 | **162.0 ms** |
-| 1 | 2.29 | 0.12 | 24.00 | 0.44 | **26.9 ms** |
-
-Slopes: verify **5.69 ms/row**, draft **3.04 ms/row** — and **85% of the tick
-scales with rows.** There is no meaningful intercept at this shape. `baselines.md:162`
-records this as superseding the `22 ms + 2.48 ms/row` fit that §3 still carries.
-
-The per-row verify term was then attributed by a same-binary A/B that swapped
-the GDN lane (`--qwen35-gdr-chunked false`): verify moved **0.8%** while
-end-to-end throughput moved 30%, so the arm was engaged and the null is real.
-**The per-row cost is neither the GDN kernel nor its launch overhead.** What
-remains is the FA3 KV read, and the traffic is the term derived above:
+**FA3 decode-verify runs at 29.2% of achievable bandwidth.**
 
 ```
-per-row verify at c=16, 33K        91 ms   (16 x 5.69)
-KV traffic                       34.6 GB   (16 rows x 2.16 GB)
-floor at 3.5 TB/s achievable      9.9 ms
-                                  ------
-                                    9.2x off roofline
+KV traffic / tick   9 rows x 32550 tok x 65536 B  =  19.20 GB
+FA3 time / tick                                      18.79 ms
+achieved                                             1.02 TB/s   = 29.2% of 3.5
+per-layer cross-check  9 x 32550 x 4096 B / 1.174 ms = 1.02 TB/s  (agrees)
 ```
 
-The same entry independently estimates FA3's achieved KV bandwidth at ~25% of
-achievable and lists it as unverified. Its own line — "16 rows × 2.16 GB at
-0.93 TB/s ≈ 51 ms" — does not reproduce (34.6/0.93 = 37.2 ms), so the achieved
-bandwidth is somewhere between 0.38 and 0.68 TB/s depending on how much of the
-91 ms is KV. Either value is 11–19% of achievable. **Measuring it is one probe.**
+The off-roofline half of the claim holds, and the earlier derived range of
+0.38–0.68 TB/s was too pessimistic.
 
-### What this makes the top lever, and what it corrects
+**The size does not hold.** In the same window:
 
-§6 prices "FA3 decode config" at **0.93 vs 0.45 ms, open, ~0.5 ms** — a
-batch-1 number from §2.2. At the shape production runs, the same lane is
-**~51–91 ms and 9.2× off its roofline.** The document under-prices its own top
-lever by two orders of magnitude, for exactly one reason: every capture in it
-was taken at batch 1.
+```
+GPU busy 28676 ms of 29642 ms wall (96.7%), idle 3.26%
+  FP8 GEMM, prefill shapes        59.4%  ███████████████████████████████
+  FA3 prefill                     16.3%  ████████
+  norms + pack_quantize           12.3%  ██████
+  GDN / gated-delta               10.6%  █████
+  FA3 decode-verify                0.39% ▏
+  all decode ticks together        0.98% ▏
+```
+
+Six decode ticks against ~55 chunked-prefill passes. **Removing FA3
+decode-verify entirely would move this row by ~0.4%.**
+
+### The anchor workload is prefill-bound, and this document ranks decode off it
+
+The cause is in the dataset, not the runtime. Over the full 128-request run:
+
+| | |
+|---|---|
+| prompt tokens | 4,452,150 (mean 34,782/req) |
+| output tokens | 15,965 |
+| ratio | **279 : 1** |
+
+Long-agent 32K × 8 turns is, by GPU work, a **prefill benchmark**. §2 and the
+ceiling analysis above are both ranked against a workload where all decode
+together is ~1% of GPU time.
+
+§0.1's "decode is 95.1% of a c=16 request's latency" measures wall clock after
+first token with 128 requests queued on 16 slots — `itl_p50` is **0.0197 ms**
+against `itl_mean` **176.99 ms**, and `e2e_p99` is 199 s. That is queueing, not
+decode compute. The two views must not be added to one conclusion.
+
+**What follows.** Decode levers must be priced on a decode-shaped workload
+(short prompts, long generations) and prefill levers on this one. Ranking both
+off the anchor is how a 29%-of-roofline kernel became a ~0.4% lever.
+
+### What the capture also corrected
+
+| finding | measurement |
+|---|---|
+| **rows per tick is 9, not the nominal 16** | three independent counts: `rms_norm_batched_offset` gridX 54 ÷ block 6; `prefill_attention_paged_hd256` 144/tick = 9 × 16 layers; `add_native` gridX 270 = 54 × 5. Most slots are in prefill, not decode. Repeats the earlier 11.0-at-nominal-16. |
+| **`gated_delta_rule_prefill_recurrent_kernel` is alive on the decode path** | 7.75 ms/tick, 16.6% of tick busy, 48 launches. The §1.1 stale note is right about prefill and wrong if read as "this kernel no longer runs". |
+| `accept_rate` **0.478** | against 0.31 recorded 2026-08-06; acceptance is not the constraint here |
+| decode ticks have no launch-gap problem | 11,422 gaps all in 0–5 µs; every bin ≥20 µs is empty inside a tick |
+| the sidecar still fires | 1,123 D2H, max payload 3,145,728 B, 1.69 GB in the window |
+
+Inside one decode tick, 6 ticks agreeing to ±0.1%:
+
+```
+tick span 50.12 ms | busy 46.62 ms | 1489 kernels
+FA3 full-attn        19.81 ms  42.5%   n=192  ██████████████████████
+FP8 GEMM             14.64 ms  31.4%   n=352  ████████████████
+GDN / gated-delta     8.80 ms  18.9%   n=144  ██████████
+norms + elementwise   3.37 ms   7.2%   n=689  ████
+```
 
 ### Corrections to the previous version of this section
 
@@ -327,9 +346,11 @@ verify term leads despite the prefill idle being the larger raw number — see
 
 > **STALE — do not rank prefill work off this table.** Measured before chunked
 > GDR went default-on (`c2eb5de9e`, 08-02). Its #1 row is a kernel that no
-> longer runs at the shipped defaults: FlashQLA chunked replaced
-> `gated_delta_rule_prefill_recurrent` and measured **1.06 s against its
-> 9.37 s**, which moves 33% of the budget and reorders everything below it.
+> longer runs **on the prefill path** at the shipped defaults: FlashQLA chunked
+> replaced `gated_delta_rule_prefill_recurrent` there and measured **1.06 s
+> against its 9.37 s**, which moves 33% of the budget and reorders everything
+> below it. The kernel itself is still live — the 08-08 capture measures it at
+> **7.75 ms per decode tick, 16.6%**, 48 launches, despite the name.
 > Two more prefill changes landed after (`0ac780495`, `301d0c074`), and
 > `b0368426a` routed batch==1 prefill to FA3, which also moves the TileLang
 > row. Same flag as [`baselines.md`](baselines.md) carries. A re-measure needs
@@ -790,32 +811,37 @@ chain:
 
 ---
 
-## Open items, ranked by size at the batch that is served
+## Open items, ranked by measured share on a workload that exercises them
 
-1. **FA3 decode KV bandwidth at c=16** (§ *Where the ceiling is*). The per-row
-   verify term is 5.69 ms/row on the current binary, 85% of the tick, and a
-   same-binary A/B has already excluded the GDN lane as its cause. The KV
-   traffic is 34.6 GB, whose floor is 9.9 ms against ~51–91 ms measured —
-   **9.2× off roofline** and the largest gap in the document. One `nsys`
-   capture at c=16 / 33K settles the achieved bandwidth, and no such capture
-   exists: every kernel measurement here is batch 1.
-2. **Sampling costs 30–40% of decode throughput at c ≥ 8** (§2.4). The
-   batched-draft gate at `executor/qwen35.rs:1984` tests *all* rows greedy, so
-   one sampled request drops every row to per-row drafting. Production serving
-   is sampled while every optimization on this row was measured at temp 0. The
-   fix is narrowing `all()` to `idx`; measuring it needs one counterbalanced
-   sweep. Do **not** re-open "acceptance collapses with concurrency" — that was
-   withdrawn (`baselines.md:137`), `accept` tracks cache state, not `c`.
-3. **Prefill GPU idle, 3.8 s** against SGLang's 0.19 s on identical kernels.
-   Largest measured single gap, not attributed, and it carries its own SLO:
-   §5.2 has ARLE TTFT p50 23.01 s against SGLang's 21.03 s.
-4. **Sidecar write policy** — 83 GB and 9.4% of wall per bench, restore hit
-   rate unmeasured. The only chain item whose cost is known and whose benefit is
-   entirely unknown.
-5. **Re-price every batch-1 lever at c=16** — decode host tail ~4.3 ms/step and
-   the GDN decode kernel 0.7 ms are both batch-1 figures, and the GDN lane is
-   already a measured null at c=16. Their listed sizes do not apply to the
-   shape that is served.
+The 2026-08-08 c=16 capture reordered this list. Its lesson is in the ranking
+rule: **price a lever on a workload where the phase it touches is a large share
+of GPU time.** FA3 decode-verify is 29.2% of roofline and 0.39% of GPU time on
+the anchor; both are true, and only the second one ranks it.
+
+1. **Re-anchor decode on a decode-shaped workload.** The anchor is 279:1
+   prompt:output and all decode is ~1% of its GPU time, so every decode number
+   in §2 and every decode lever in §6 is ranked off a benchmark that barely
+   decodes. Nothing below this is trustworthy until it is fixed. Short prompts
+   with long generations, one sweep, and the existing c=16 capture repeated on
+   it.
+2. **Prefill is where this workload's time is** — 59.4% FP8 GEMM plus 16.3%
+   FA3 prefill in the measured window, at 96.7% GPU-busy. The FP8 GEMM is
+   already priced out at 64–67% of peak (§1.1), so the open question is whether
+   prefill FA3 and the 12.3% in `pack_quantize` + norms have headroom. Neither
+   has been decomposed.
+3. **FA3 decode-verify KV bandwidth, 29.2% of achievable.** Confirmed
+   mechanism, and the largest line inside a decode tick at 42.5%. Worth ~0.4%
+   on the anchor and materially more on a decode-shaped workload — which is why
+   item 1 gates it.
+4. **Sampling costs 30–40% of decode throughput at c ≥ 8** (§2.4). Same gating
+   problem: measured on the anchor. The gate at `executor/qwen35.rs:1984` tests
+   *all* rows greedy, so one sampled request drops every row to per-row
+   drafting. Do **not** re-open "acceptance collapses with concurrency" — it was
+   withdrawn (`baselines.md:137`), and the 08-08 capture measured `accept_rate`
+   0.478.
+5. **Sidecar write policy** — 1,123 D2H of 3 MiB in a 30 s window, restore hit
+   rate still unmeasured. The only chain item whose cost is known and whose
+   benefit is entirely unknown.
 
 ## Measurement debt
 
@@ -823,8 +849,8 @@ Facts this chain rests on that have not been measured:
 
 | item | why it matters |
 |---|---|
-| **FA3's achieved KV-read bandwidth at c=16, 33K** | the per-row verify term is the largest cost in the chain and the KV read is what is left after the GDN A/B; between 0.38 and 0.68 TB/s against 3.5 achievable, and the two published estimates do not reproduce each other |
-| **any kernel capture above batch 1** | §2.1, §2.2 and §4.1 are all batch 1 or batch-1-derived, while production decodes at c=16; every open kernel size in §6 inherits this |
+| **a decode-shaped workload** | the anchor is 279:1 prompt:output and all decode is ~1% of its GPU time; every decode number in this document is ranked off it |
+| prefill FA3 and `pack_quantize` + norms | 16.3% and 12.3% of GPU time in the 08-08 c=16 window, neither decomposed |
 | prefix sidecar restore hit rate | decides whether 9.4% of wall is earned |
 | acceptance rate under temperature | `accept_rate` is 0.31 at temp 0 on the anchor (2026-08-06); the sampled arm has no matching figure |
 | whole-slot park cost | `a546ba80a` shipped unmeasured; both routes default-off |
