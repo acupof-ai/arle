@@ -161,8 +161,27 @@ GPU busy 28676 ms of 29642 ms wall (96.7%), idle 3.26%
   all decode ticks together        0.98% ▏
 ```
 
-Six decode ticks against ~55 chunked-prefill passes. **Removing FA3
-decode-verify entirely would move this row by ~0.4%.**
+> **The window undersamples decode 2–6×; use the run-level bound, not these
+> two rows.** The bench has a queueing ramp — TTFT p50 4.2 s against p99
+> 164 s — and this window sits at bench elapsed 118–148 s, where many requests
+> are still in their first prefill. Reconciling against run totals (15,981
+> generated tokens, 414 steps, so decode ticks are bounded by
+> `15981 / max-tokens-per-tick ≤ D ≤ 414`, i.e. **143 ≤ D ≤ 414**):
+>
+> | | this window | run-level bound |
+> |---|---:|---:|
+> | all decode ticks | 0.98% | **2.1 – 6.1%** |
+> | FA3 decode-verify | 0.39% | **0.86 – 2.5%** |
+>
+> The conclusion survives — decode is a single-digit share of GPU time on this
+> workload — but the window figures are 2–6× low and must not be quoted. The
+> 29.2% bandwidth measurement is unaffected: it is internal to a tick and does
+> not depend on how many ticks the window caught. This is the same error the
+> reading rules at the top of this document warn about, made again.
+
+Six decode ticks against ~55 chunked-prefill passes, a ratio the run-level
+bound says is inverted relative to the whole run. **Removing FA3 decode-verify
+entirely would move this row by 1–3%.**
 
 ### The anchor workload is prefill-bound, and this document ranks decode off it
 
@@ -176,7 +195,15 @@ The cause is in the dataset, not the runtime. Over the full 128-request run:
 
 Long-agent 32K × 8 turns is, by GPU work, a **prefill benchmark**. §2 and the
 ceiling analysis above are both ranked against a workload where all decode
-together is ~1% of GPU time.
+together is a **2–6%** share of GPU time.
+
+The dataset is not a mistake: `gen_bench_prompts.py` states it models measured
+coding-agent traces (TraceLab, 4,265 Claude Code / Codex sessions — 119K prefix,
+875 append, 214 output, 8.8 steps per request). Prefix caching recovers most of
+it — measured hit rate **0.876**, so 4.45 M prompt tokens become **616 K** of
+real prefill work, still **38.6 : 1** against output. **For the workload ARLE
+targets, prefill genuinely dominates.** The error was not the benchmark; it was
+pricing decode levers on it.
 
 §0.1's "decode is 95.1% of a c=16 request's latency" measures wall clock after
 first token with 128 requests queued on 16 slots — `itl_p50` is **0.0197 ms**
@@ -818,12 +845,13 @@ rule: **price a lever on a workload where the phase it touches is a large share
 of GPU time.** FA3 decode-verify is 29.2% of roofline and 0.39% of GPU time on
 the anchor; both are true, and only the second one ranks it.
 
-1. **Re-anchor decode on a decode-shaped workload.** The anchor is 279:1
-   prompt:output and all decode is ~1% of its GPU time, so every decode number
-   in §2 and every decode lever in §6 is ranked off a benchmark that barely
-   decodes. Nothing below this is trustworthy until it is fixed. Short prompts
-   with long generations, one sweep, and the existing c=16 capture repeated on
-   it.
+1. **Re-anchor decode on a decode-shaped workload.** The anchor is 38.6:1
+   prefill:output after cache and decode is 2–6% of its GPU time, so every
+   decode number in §2 and every decode lever in §6 is ranked off a benchmark
+   that barely decodes. Nothing below this is trustworthy until it is fixed.
+   Short prompts with long generations, one sweep, and the c=16 capture
+   repeated on it — with the window placed after the queueing ramp, or spread
+   over several windows, which this first capture failed to do.
 2. **Prefill is where this workload's time is** — 59.4% FP8 GEMM plus 16.3%
    FA3 prefill in the measured window, at 96.7% GPU-busy. The FP8 GEMM is
    already priced out at 64–67% of peak (§1.1), so the open question is whether
