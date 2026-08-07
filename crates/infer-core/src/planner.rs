@@ -217,6 +217,9 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         }
         let key = self.next_tier_key;
         self.next_tier_key = self.next_tier_key.wrapping_add(1);
+        // The park stalls the whole engine (whole-slot D2H + sync), so its cost
+        // is a scheduling input, not a detail: surface it per event.
+        let started = std::time::Instant::now();
         match self.executor.demote_slot(slot, key) {
             Ok(true) => {}
             Ok(false) => return false,
@@ -226,6 +229,11 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             }
         }
         self.kv_tier_stats.demoted_slots = self.kv_tier_stats.demoted_slots.saturating_add(1);
+        log::info!(
+            "oversubscription park: slot {slot} seq_len {demoted_seq_len} in {:.1} ms (park #{})",
+            started.elapsed().as_secs_f64() * 1e3,
+            self.kv_tier_stats.demoted_slots
+        );
         let mut request = self.active.remove(&slot).expect("checked above");
         // free_slot before release_reused_prefix — same ordering as finish_slot.
         self.free_slot_pages(slot);
@@ -349,6 +357,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         // NOT prompt+generated, which runs one ahead of the device image
         // (the newest token's KV is the next decode step's write).
         let seq_len = std::mem::take(&mut request.swap_seq_len);
+        let started = std::time::Instant::now();
         let restored = self
             .alloc_with_prefix_reclaim(slot, seq_len)
             .and_then(|()| {
@@ -362,6 +371,12 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
                 request.prefill_start_pos = request.prompt_len();
                 self.kv_tier_stats.promoted_slots =
                     self.kv_tier_stats.promoted_slots.saturating_add(1);
+                log::info!(
+                    "oversubscription promote: slot {slot} seq_len {seq_len} in {:.1} ms \
+                     (promote #{})",
+                    started.elapsed().as_secs_f64() * 1e3,
+                    self.kv_tier_stats.promoted_slots
+                );
                 Ok(())
             }
             Err(err) => {
