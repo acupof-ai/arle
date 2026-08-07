@@ -2,8 +2,9 @@
 
 **Date:** 2026-08-07 · **Pod:** 8×H20 GPUs 4+5, ThinkingCap-Qwen3.6-27B-FP8, cp=2
 
-> Status: pending-remote. Pod A/B in flight (subset16 × 4 samples × 3 rounds,
-> fleet binary vs the fulltrain5 baseline).
+> Status: accepted (correct + per-sample faster), but the round wall barely
+> moved — the bottleneck is rollout concurrency, not per-sample throughput.
+> See Results.
 
 ## Context
 
@@ -37,7 +38,44 @@ Same binary, same subset16 manifest, cp=2 GPUs 4/5, one config change per arm:
   (paired writeback losses identical across ranks, follower end-of-stream,
   `RUN_EXIT=0`, loss values in family with fulltrain4/5 round trajectories).
 
-## Results
+## Results — measured 2026-08-07/08, pod GPUs 4+5, tree `af9e48246`, `fulltrain6`
 
-Pending-remote: pod run dispatched 2026-08-07 (fulltrain6 series); numbers land
-here when the report returns.
+Correctness: 3 rounds, `RUN_EXIT=0`, both serve pids present in the shared dump
+dir, rank-0 and follower writeback losses identical to all printed decimals
+(e.g. 0.013347/0.013347), 24 mirrored updates, follower `end of stream`, mesh
+dir removed. Peak VRAM symmetric 78.4 / 78.5 GB (both ranks now hold
+engine + student).
+
+Round 0 (same 16 tasks as the `fulltrain5` baseline), matched per task:
+
+| Scope | baseline | fleet | Δ |
+|---|---:|---:|---:|
+| round-0 `cc_rollout` wall | 4576 s | 4348 s | −5% |
+| 11 matched groups, cumulative | 3283 s | 3451 s | +5% |
+| the 7 of those under the cap in both arms | 1367 s | 1051 s | **−23%** |
+| aggregate throughput on those 7 | 47.2 tok/s | 67.6 tok/s | **+43%** |
+
+The per-sample mechanism works; the round wall does not follow it because the
+wall is straggler-bound. A group's wall is `max` over its samples, and 9 of the
+run's 96 samples sat at the 600 s `--cc-timeout` cap (1 of them still passed —
+`rejection-ce` keeps a truncated pass, `SampleFilter::PassOnly` does not filter
+on `truncated`). In round 0 six capped samples set 4 of 11 group walls = 70% of
+the wall. The two tasks that flipped from finished to capped had already run
+489–571 s in prior runs — inside their own spread, not a fleet regression.
+
+**Rollout capacity utilization ≈ 29%**: run-wide sample wall 17078 s against a
+7289 s `cc_rollout` wall = 2.34 samples in flight on average, against 8 fleet
+slots (4 per engine × 2 ranks). Two independent causes, both structural:
+- only one group (4 samples) is ever in flight, so half the fleet's slots are
+  never used;
+- the group barrier idles the fast samples' slots until the straggler ends.
+
+## Follow-up
+
+The next lever is rollout concurrency, not per-sample throughput: batch G
+prompts per update (the verl shape — roll the whole batch at one policy
+version, then a single update), which fills the slots and amortizes the
+straggler tail while staying strictly on-policy. `ScoredTrajectory.group_id`
+already carries the per-prompt key the group baselines need. Filed as the
+production blocker for the 449-task run: at this config round 0 alone
+extrapolates to ~36 h, most of it idle slots.
