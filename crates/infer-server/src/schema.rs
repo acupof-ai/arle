@@ -509,6 +509,9 @@ pub struct CompletionResponse {
     pub model: String,
     pub choices: Vec<CompletionChoice>,
     pub usage: Usage,
+    /// OpenAI `system_fingerprint` — a stable identifier for the model/backend
+    /// configuration. Static for a given build.
+    pub system_fingerprint: &'static str,
 }
 
 impl CompletionResponse {
@@ -537,6 +540,7 @@ impl CompletionResponse {
                 prompt_token_ids,
             }],
             usage: Usage::new(prompt_tokens, completion_tokens),
+            system_fingerprint: SYSTEM_FINGERPRINT,
         }
     }
 }
@@ -823,6 +827,9 @@ pub struct ChatCompletionResponse {
     pub model: String,
     pub choices: Vec<ChatChoice>,
     pub usage: Usage,
+    /// OpenAI `system_fingerprint` — a stable identifier for the model/backend
+    /// configuration. Static for a given build.
+    pub system_fingerprint: &'static str,
 }
 
 impl ChatCompletionResponse {
@@ -855,9 +862,11 @@ impl ChatCompletionResponse {
                     reasoning_content,
                     tool_calls,
                 },
+                logprobs: None,
                 finish_reason,
             }],
             usage: Usage::new(prompt_tokens, completion_tokens),
+            system_fingerprint: SYSTEM_FINGERPRINT,
         }
     }
 }
@@ -866,6 +875,8 @@ impl ChatCompletionResponse {
 pub struct ChatChoice {
     pub index: usize,
     pub message: AssistantMessage,
+    /// Per-token logprobs (always `null` — not yet surfaced by the engine).
+    pub logprobs: Option<serde_json::Value>,
     pub finish_reason: String,
 }
 
@@ -918,18 +929,26 @@ impl ResponseToolCall {
 
 const THINK_END: &str = "</think>";
 
+/// OpenAI `system_fingerprint` — a stable identifier for the model/backend
+/// configuration. Baked into the binary; changes only with the build.
+const SYSTEM_FINGERPRINT: &str = "arle_fp_1";
+
 /// Split a thinking-model's generated text into `(reasoning_content, content)`.
 ///
-/// The chat template pre-fills `<think>\n` into the *prompt*, so the model emits
-/// `reasoning</think>answer` (closer + answer). We split on the closer to give
-/// API consumers a clean `content` (the actual answer/commands).
-/// - Thinking OFF: byte-identical passthrough `(None, text)` — no scan, so an
-///   answer that legitimately contains a literal `</think>` is never truncated
-///   (matches SGLang/vLLM: parse reasoning only when the lane is active).
-/// - Thinking ON, has `</think>`: reasoning = text before it (leading `<think>`
-///   stripped, trimmed); content = text after it (leading whitespace trimmed).
-/// - Thinking ON, no `</think>`: truncated thinking → all reasoning, empty
-///   content (the answer never arrived; a max_tokens concern, not ours).
+/// Two output shapes arrive here:
+/// - **Thinking ON**: the chat template pre-fills `<think>\n` into the *prompt*,
+///   so the model emits `reasoning</think>answer` (no opening tag).
+/// - **Thinking OFF but model emits `<think>` anyway** (e.g. Qwen3.6, which is
+///   reasoning-trained and re-opens the block even when the template closed it):
+///   output is `<think>reasoning</think>answer`.
+///
+/// In both cases the leading thinking block must be stripped from `content`.
+/// `reasoning_content` is only returned when `enable_thinking` is true; when
+/// false the reasoning is silently dropped (the client asked for no thinking).
+///
+/// Non-thinking outputs (no leading `<think>`, no `</think>` when thinking is
+/// off) pass through byte-identically — a literal `</think>` in a plain answer
+/// is never truncated.
 ///
 /// Empty reasoning collapses to `None` so the field is omitted.
 ///
@@ -939,24 +958,49 @@ const THINK_END: &str = "</think>";
 // (`coordinator::finalize_chat_content`) — the tool parser's paired-tag strip
 // misses the prompt-prefilled `reasoning</think>` form.
 pub(crate) fn split_reasoning(text: &str, enable_thinking: bool) -> (Option<String>, String) {
-    if !enable_thinking {
-        return (None, text.to_string());
+    let trimmed = text.trim_start();
+    // Model emitted a leading <think> — strip the whole thinking block.
+    if trimmed.starts_with("<think>") {
+        return match trimmed.find(THINK_END) {
+            Some(idx) => {
+                let reasoning = trimmed[..idx]
+                    .trim_start()
+                    .trim_start_matches("<think>")
+                    .trim();
+                let content = trimmed[idx + THINK_END.len()..].trim_start();
+                let reasoning_content =
+                    (enable_thinking && !reasoning.is_empty()).then(|| reasoning.to_string());
+                (reasoning_content, content.to_string())
+            }
+            // No closer: if thinking is on, it's truncated reasoning; if off,
+            // pass through (don't drop the user's text).
+            None => {
+                if enable_thinking {
+                    (Some(trimmed.trim().to_string()), String::new())
+                } else {
+                    (None, text.to_string())
+                }
+            }
+        };
     }
-    let (reasoning, content) = match text.find(THINK_END) {
-        Some(idx) => (
-            text[..idx]
-                .trim_start()
-                .trim_start_matches("<think>")
-                .trim(),
-            text[idx + THINK_END.len()..].trim_start(),
-        ),
-        // Truncated thinking: the closer never arrived, so neither did the answer.
-        None => (text.trim(), ""),
-    };
-    (
-        (!reasoning.is_empty()).then(|| reasoning.to_string()),
-        content.to_string(),
-    )
+    // No leading <think>.
+    if enable_thinking {
+        // Prompt prefilled <think>, so output is reasoning</think>answer.
+        let (reasoning, content) = match trimmed.find(THINK_END) {
+            Some(idx) => (
+                trimmed[..idx].trim(),
+                trimmed[idx + THINK_END.len()..].trim_start(),
+            ),
+            None => (trimmed.trim(), ""),
+        };
+        (
+            (!reasoning.is_empty()).then(|| reasoning.to_string()),
+            content.to_string(),
+        )
+    } else {
+        // Non-thinking output — byte-identical passthrough.
+        (None, text.to_string())
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
