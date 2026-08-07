@@ -32,6 +32,20 @@ in the phase the fix acts on):
 Within-arm spread at c=16 was C 58.15/57.52 and D 57.12/58.86 — the arms
 overlap, so the −13.9% the c=16 p99 shows is inside the noise.
 
+Repeated on the long-agent anchor (the other phase, the other dataset), also
+counterbalanced:
+
+| c | C TPOT | D TPOT | Δ | Δ total tok/s |
+|---:|---:|---:|---:|---:|
+| 1 | 8.609 | 8.521 | −1.0% | +0.5% |
+| 2 | 18.618 | 18.444 | −0.9% | −0.1% |
+| 4 | 34.126 | 33.036 | −3.2% | −1.6% |
+| 8 | 60.782 | 61.769 | **+1.6%** | +1.1% |
+| 16 | 115.444 | 112.579 | −2.5% | −0.0% |
+
+The sign flips at c=8 and the within-arm spread at c=16 is 3.2% (C
+117.31/113.58), so this is a null on both workloads, not a small win on one.
+
 **Root cause of the wrong prediction: a profiler-measured host-side cost
 fraction does not extrapolate to an unprofiled run.** nsys slows the host far
 more than the GPU — the profiled run did 13687 total tok/s against 32954
