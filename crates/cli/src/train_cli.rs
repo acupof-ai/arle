@@ -3059,6 +3059,9 @@ fn synthetic_writeback_fd_probe<O: autograd::Optimizer>(
 /// rank 0 additionally owns the harness, filtering, and saves.
 #[cfg(feature = "cuda")]
 struct AgentOpdServeStudent {
+    store: autograd::TensorStore,
+    train_backend: std::sync::Arc<dyn autograd::Backend>,
+    vocab: usize,
     infer_student: train::infer_student::InferStudent,
     student: train::qwen35::Qwen35Model,
     serve_thread: infer_api::ServeThread,
@@ -3069,16 +3072,11 @@ struct AgentOpdServeStudent {
 }
 
 #[cfg(feature = "cuda")]
-#[allow(clippy::too_many_arguments)]
 fn load_agent_opd_serve_student(
     args: &TrainAgentOpdArgs,
     lora: train::lora::LoraConfig,
     target_set: train::lora::LoraTargetSet,
     serve_port: u16,
-    eval_out_dir: &Path,
-    vocab: usize,
-    store: &mut autograd::TensorStore,
-    train_backend: &std::sync::Arc<dyn autograd::Backend>,
 ) -> Result<AgentOpdServeStudent> {
     use std::sync::{Arc, Mutex};
 
@@ -3090,6 +3088,15 @@ fn load_agent_opd_serve_student(
     };
 
     let student_dir = args.student_model.as_path();
+    let (mut store, train_backend, _backend_label) = build_opd_store(args.backend)?;
+    apply_tape_dtype(&mut store, args.tape_dtype)?;
+    // Vocab from the checkpoint config (not the autograd student) so the rollout
+    // engine can load BEFORE the autograd student when `--share-frozen-base` is
+    // set. Same value `Qwen35Model::config()` exposes.
+    let hf_config = Qwen35Config::from_json_file(student_dir.join("config.json"))
+        .with_context(|| format!("read config.json from {}", student_dir.display()))?;
+    let vocab = hf_config.vocab_size;
+    let eval_out_dir = agent_opd_eval_out_dir(args);
     // Rollout engine (student) doubles as the cc serve. KV budget for cc
     // traffic: K concurrent cc streams × the measured session ceiling, +25%
     // headroom, page_size 16.
@@ -3120,7 +3127,7 @@ fn load_agent_opd_serve_student(
                 args.lora_layer_start,
                 args.lora_skip_experts,
                 None,
-                store,
+                &mut store,
             )
             .with_context(|| format!("load LoRA student from {}", student_dir.display()))?,
         )
@@ -3163,7 +3170,10 @@ fn load_agent_opd_serve_student(
         },
     )
     .with_context(|| format!("load rollout engine from {}", student_dir.display()))?;
-    log_opd_vram("after rollout engine load (KV pool alloc'd)", train_backend);
+    log_opd_vram(
+        "after rollout engine load (KV pool alloc'd)",
+        &train_backend,
+    );
 
     // cc serve over THIS engine (same engine thread, same KV pool): install the
     // dump sink BEFORE any traffic, then serve the router on a background
@@ -3236,7 +3246,7 @@ fn load_agent_opd_serve_student(
                 args.lora_layer_start,
                 args.lora_skip_experts,
                 shared_base,
-                store,
+                &mut store,
             )
             .with_context(|| format!("load LoRA student from {}", student_dir.display()))?
         }
@@ -3245,7 +3255,7 @@ fn load_agent_opd_serve_student(
     // Resume: overlay a saved adapter onto the fresh student (both load branches
     // merge here) BEFORE the handoff fence, so its A/B uploads drain with the base.
     if let Some(dir) = args.lora_adapters.as_deref() {
-        load_qwen35_lora_adapters(&student, store, dir)
+        load_qwen35_lora_adapters(&student, &mut store, dir)
             .with_context(|| format!("resume LoRA adapter from {}", dir.display()))?;
         eprintln!("[agent-opd] resumed adapter from {}", dir.display());
     }
@@ -3291,10 +3301,13 @@ fn load_agent_opd_serve_student(
     );
     log_opd_vram(
         "after autograd student load (resident floor)",
-        train_backend,
+        &train_backend,
     );
 
     Ok(AgentOpdServeStudent {
+        store,
+        train_backend,
+        vocab,
         infer_student,
         student,
         serve_thread,
@@ -3326,6 +3339,20 @@ enum MeshMsg {
     GroupEnd { synced: bool },
 }
 
+/// Borrow twin of [`MeshMsg`] for the publish side — same serde shape, no
+/// batch clone.
+#[cfg(feature = "cuda")]
+#[derive(serde::Serialize)]
+enum MeshMsgRef<'a> {
+    Update {
+        batch: &'a [train::update_strategy::ScoredTrajectory],
+        release_engines: bool,
+    },
+    GroupEnd {
+        synced: bool,
+    },
+}
+
 #[cfg(feature = "cuda")]
 struct MeshUpdateChannel {
     dir: PathBuf,
@@ -3351,7 +3378,7 @@ impl MeshUpdateChannel {
         self.dir.join(format!("upd-{seq:08}.json"))
     }
 
-    fn publish(&mut self, msg: &MeshMsg) -> Result<()> {
+    fn publish<M: serde::Serialize>(&mut self, msg: &M) -> Result<()> {
         let tmp = self.dir.join(format!("upd-{:08}.tmp", self.seq));
         std::fs::write(&tmp, serde_json::to_vec(msg)?)?;
         std::fs::rename(&tmp, self.upd_path(self.seq))?;
@@ -3484,30 +3511,15 @@ fn run_agent_opd_cp_follower(
 
     let cp = train::context_parallel::CpContext::from_env();
     let update_preset = args.update_preset();
-    let student_dir = args.student_model.as_path();
-    let (mut store, train_backend, _label) = build_opd_store(args.backend)?;
-    apply_tape_dtype(&mut store, args.tape_dtype)?;
-    let hf_config = Qwen35Config::from_json_file(student_dir.join("config.json"))
-        .with_context(|| format!("read config.json from {}", student_dir.display()))?;
-    let vocab = hf_config.vocab_size;
-    let eval_out_dir = agent_opd_eval_out_dir(args);
 
-    let fleet = load_agent_opd_serve_student(
-        args,
-        lora,
-        target_set,
-        serve_port,
-        &eval_out_dir,
-        vocab,
-        &mut store,
-        &train_backend,
-    )?;
+    let mut fleet = load_agent_opd_serve_student(args, lora, target_set, serve_port)?;
+    let vocab = fleet.vocab;
     let mut optimizer = AdamW::new(args.lr, (0.9, 0.999), 1.0e-8, 0.0);
     let mut value_critic = build_value_critic(
         &update_preset,
         fleet.student.config().hidden_size,
         args.value_lr,
-        &mut store,
+        &mut fleet.store,
     )?;
     let adapter_map = fleet.student.adapter_name_map();
 
@@ -3534,7 +3546,7 @@ fn run_agent_opd_cp_follower(
                         value_critic.as_mut(),
                         vocab,
                         args.writeback_window,
-                        &mut store,
+                        &mut fleet.store,
                     )
                     .map_err(anyhow::Error::from)?;
                 eprintln!(
@@ -3543,7 +3555,7 @@ fn run_agent_opd_cp_follower(
                     report.trained,
                     report.loss
                 );
-                if let Err(err) = store.backend().trim_memory_pool() {
+                if let Err(err) = fleet.store.backend().trim_memory_pool() {
                     eprintln!("[agent-opd] follower device-pool trim failed: {err}");
                 }
                 if gc_owner {
@@ -3553,7 +3565,7 @@ fn run_agent_opd_cp_follower(
             MeshMsg::GroupEnd { synced } => {
                 sync_and_restore_engines(
                     &fleet.infer_student,
-                    &mut store,
+                    &mut fleet.store,
                     &adapter_map,
                     lora,
                     synced,
@@ -3650,16 +3662,6 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
     let _spawner = train::spawner::SpawnerHandle::launch()
         .context("launch pre-CUDA sandbox-spawner helper")?;
 
-    let (mut store, train_backend, _backend_label) = build_opd_store(args.backend)?;
-    apply_tape_dtype(&mut store, args.tape_dtype)?;
-
-    // Vocab from the checkpoint config (not the autograd student) so the rollout
-    // engine can load BEFORE the autograd student when `--share-frozen-base` is
-    // set. Same value `Qwen35Model::config()` exposes — default path unchanged.
-    let hf_config = Qwen35Config::from_json_file(student_dir.join("config.json"))
-        .with_context(|| format!("read config.json from {}", student_dir.display()))?;
-    let vocab = hf_config.vocab_size;
-
     // SWE-bench-Pro tasks; each task's staged tree is `<staged_root>/<instance_id>/`.
     let mut tasks_raw = train::swe_dataset::load_swe_tasks(dataset)?;
     if let Some(n) = args.task_limit {
@@ -3737,6 +3739,9 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
 
     let width = args.samples_per_prompt.max(1);
     let AgentOpdServeStudent {
+        mut store,
+        train_backend,
+        vocab,
         infer_student,
         student,
         serve_thread,
@@ -3744,16 +3749,7 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
         cc_model_id,
         all_params,
         trainable,
-    } = load_agent_opd_serve_student(
-        &args,
-        lora,
-        target_set,
-        serve_port,
-        &eval_out_dir,
-        vocab,
-        &mut store,
-        &train_backend,
-    )?;
+    } = load_agent_opd_serve_student(&args, lora, target_set, serve_port)?;
 
     let mut optimizer = AdamW::new(args.lr, (0.9, 0.999), 1.0e-8, 0.0);
     let mut value_critic = build_value_critic(
@@ -4241,8 +4237,8 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
                                   release_engines: bool|
              -> Result<()> {
                 if let Some(tx) = mesh_tx.as_mut() {
-                    tx.publish(&MeshMsg::Update {
-                        batch: batch.to_vec(),
+                    tx.publish(&MeshMsgRef::Update {
+                        batch,
                         release_engines,
                     })?;
                 }
@@ -4333,7 +4329,7 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
             // Followers re-merge into their own engines and re-acquire their KV
             // pools in parallel with ours.
             if let Some(tx) = mesh_tx.as_mut() {
-                tx.publish(&MeshMsg::GroupEnd { synced })?;
+                tx.publish(&MeshMsgRef::GroupEnd { synced })?;
             }
             sync_lora_secs += sync_and_restore_engines(
                 &infer_student,
