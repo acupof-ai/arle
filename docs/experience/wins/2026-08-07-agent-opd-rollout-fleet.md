@@ -105,12 +105,48 @@ at 600 s at G=4, taking that task from 3 passes to 1. Measured on the metric
 that matters for RFT — passing samples per wall-hour — G=4 is 8.6/h against
 G=1's 7.5/h, **+15%, not the +88% throughput suggests**.
 
-Conclusion: a wall-clock rollout cap is the wrong control under variable
-contention — it makes the training signal a function of scheduling load. Next
-arm (`fulltrain8`): G=4 with `--cc-timeout 1200`, to test whether the pass loss
-is entirely cap-induced. Also unresolved: aggregate throughput scaled +88% for
-4× the concurrency, so 8 sessions/engine is past the knee; G=2 is the missing
-third point.
+## Concurrency sweep — round 0, one rep per arm
+
+| | G=1/600 | G=4/600 | G=4/1200 | G=2/600 |
+|---|---:|---:|---:|---:|
+| `cc_rollout` wall | 4348.5 s | **2101.5 s** | 3502.4 s | 3538.2 s |
+| update wall | 894.4 s | 452.5 s | 526.0 s | 1421.3 s |
+| **total round wall** | 5242 s | **2554 s** | 4028 s | 4959 s |
+| sum(sample walls) | 10621 s | 19014 s | 21410 s | 14103 s |
+| realized concurrency | 2.44× | **9.05×** | 6.11× | 3.99× |
+| aggregate throughput | 38.4 tok/s | **72.4 tok/s** | 59.9 tok/s | 49.7 tok/s |
+| samples at cap | 6/64 | 9/64 | **3/64** | 7/64 |
+| passing samples | 9 | 5 | 5 | 10 |
+| passes / total-wall hour | 6.18 | 7.05 | 4.47 | 7.26 |
+
+VRAM peak sat at 78.6–79.1 GB in every arm (13 GB under the abort line) and is
+effectively invariant to G, so slot state is not the binding cost at these
+widths. Correctness signature clean in all arms.
+
+**What is established, and what is not.** The wall, concurrency and throughput
+figures are mechanistic and large. The pass counts are not resolved at one rep:
+64 samples at a ~11% pass rate carry a binomial SD of ≈2.5, so 9 vs 5 is 1.6 SD
+and 10 vs 9 is noise. Read the passes-per-hour column as indistinguishable
+between G=2 and G=4, and both marginally above G=1.
+
+**The 1200 s cap is strictly worse** — the one clean refutation in the sweep.
+It did what it was supposed to mechanically (capped samples 9 → 3, and two
+sessions at 604 s and 623 s converted to passes the 600 s cap would have cut)
+but total passes stayed at 5 and realized concurrency *fell* 9.05× → 6.11×:
+long stragglers hold slots while the rest of the window drains. So the G=4 pass
+count is not primarily cap-induced. A longer leash buys wandering (one sample
+burned 82 turns), not solutions.
+
+**Throughput and pass yield knee at different points.** Aggregate throughput
+keeps climbing to 8 sessions/engine (+88%), while per-sample walls degrade
+(each session ~79% slower at G=4 than G=1). Optimizing tok/s past ~4 sessions
+per engine buys wall at the expense of the thing being trained on.
+
+Next arm (`fulltrain10`): **cp=4 × G=2** — 8 concurrent sessions spread as 2 per
+engine. The sweep only ever raised per-engine pressure; adding engines instead
+raises concurrency at the per-engine pressure that produced the healthiest
+per-sample walls. No code change (the fleet and mesh are rank-agnostic, and
+per-rank sizing is `G × ceil(K/cp)`).
 
 ## Production config for the 449-task run
 
