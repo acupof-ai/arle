@@ -38,7 +38,21 @@ update calls until an end marker — the cp collectives inside the writeback see
 identical call sequences by construction. The coordinator no longer tears the
 group down on a clean follower exit (only rank 0's exit, or any nonzero exit,
 ends the run). dp>1 in this lane now fails fast with an explicit error.
-Pod cp=2 validation: pending-remote (single-GPU subset run first).
+Pod cp=2 validation (2026-08-07, subset16 × 4 samples × 3 rounds, GPUs 4+5,
+tree `9da8ff777`): **confirmed.** The former wedge point — first passing-group
+writeback — completed in ~30 s; 46 writebacks, 22 mirrored updates, rank-0 and
+follower losses identical to all printed decimals (e.g. 0.085379/0.085379,
+0.118810/0.118810); follower reached `end of stream`, run exited 0, mesh dir
+consumed and removed. VRAM leader 78.4 GB peak vs follower 43.0 GB.
+
+Side effect: cp=2 is the better operating point for this lane, not only a
+parity mode — round-0 update wall 1119 s vs 7892 s single-GPU (7.1×; backward
+28–30 s vs 213–252 s at the same ~21 K seq). The ~10.5 K/rank shard stays out
+of the checkpoint-offload regime; host RSS peak 206.9 vs 270.5 GB.
+
+Untested surfaces (recorded, not blocking): follower `--lora-adapters` resume;
+ValueGae critic under cp (zero-init is deterministic in theory; the shipped
+lane is rejection-ce).
 
 Evidence: `/host/lever2-out/fulltrain3-wedged-round0.log`,
 `fulltrain3-rounds.jsonl`, `fulltrain3-metrics.csv` (and `fulltrain2.log`, the
