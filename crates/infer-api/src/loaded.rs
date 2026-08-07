@@ -40,6 +40,13 @@ pub struct EngineLoadConfig {
     /// Per-request prefill chunk size; `None` = backend/model-kind default.
     #[serde(default)]
     pub chunked_prefill_size: Option<usize>,
+    /// Token budget for one scheduler tick — the M dimension of every GEMM in
+    /// the step, so it is the throughput/latency dial: above the roofline ridge
+    /// more tokens buy no throughput and cost step latency linearly, and any
+    /// decode row sharing the tick waits that long. `None` = the shipped
+    /// constant.
+    #[serde(default)]
+    pub max_num_batched_tokens: Option<usize>,
     /// `Some(n)` = MTP spec decode on with draft depth `n`; `None` = off.
     pub mtp_draft_tokens: Option<usize>,
     /// `Some(k)` = D2 MTP root-branch top-k width; verifier rows are root + candidates.
@@ -199,6 +206,7 @@ impl Default for EngineLoadConfig {
             max_prompt_tokens: usize::MAX,
             max_total_tokens: 65_536,
             chunked_prefill_size: None,
+            max_num_batched_tokens: None,
             mtp_draft_tokens: None,
             mtp_draft_topk: None,
             kv_cache_dtype: KvCacheDtype::Auto,
@@ -557,6 +565,9 @@ mod backend {
             // single-threaded MLX encode loop responsive between decode steps).
             // The CUDA load path re-resolves per model kind before use.
             config.chunked_prefill_size = self.chunked_prefill_size.unwrap_or(64);
+            if let Some(v) = self.max_num_batched_tokens {
+                config.max_num_batched_tokens = v.max(1);
+            }
             config.max_running_requests = self.max_running_requests;
             config.slot_oversubscription = self.slot_oversubscription;
             // Diagnostic-only escape hatch (not a shipped feature) for the
