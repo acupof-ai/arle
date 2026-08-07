@@ -213,12 +213,16 @@ impl GroupAssembler {
 pub struct BootedGroup {
     task: Arc<SweTask>,
     k: usize,
+    /// Per-boot nonce. Dump attribution keys on the request's model tag, so
+    /// concurrent groups (`--prompts-per-update` > 1) must not share one.
+    nonce: u64,
     rx: Receiver<Result<(usize, PathBuf)>>,
 }
 
 impl CcHarness {
     /// Start booting `k` sandboxes for `task` on 2 background threads.
     pub fn boot_group(&self, task: &Arc<SweTask>, staged_tree: &Path, k: usize) -> BootedGroup {
+        static GROUP_NONCE: AtomicUsize = AtomicUsize::new(0);
         let k = k.max(1);
         let (tx, rx) = sync_channel(k);
         let next = Arc::new(AtomicUsize::new(0));
@@ -251,6 +255,7 @@ impl CcHarness {
         BootedGroup {
             task: Arc::clone(task),
             k,
+            nonce: GROUP_NONCE.fetch_add(1, Ordering::Relaxed) as u64,
             rx,
         }
     }
@@ -264,7 +269,7 @@ impl CcHarness {
                 let (sample, workdir) = booted.rx.recv().context("cc boot thread died")??;
                 let (tx, task) = (tx.clone(), &booted.task);
                 scope.spawn(move || {
-                    let _ = tx.send(self.run_sample(task, sample, &workdir));
+                    let _ = tx.send(self.run_sample(task, booted.nonce, sample, &workdir));
                 });
             }
             drop(tx);
@@ -296,7 +301,7 @@ impl CcHarness {
                 t_end_ms: s.t_end_ms,
                 reward: s.reward,
                 errored: s.errored,
-                model: Some(sample_model(&self.model_id, s.sample)),
+                model: Some(sample_model(&self.model_id, booted.nonce, s.sample)),
             })
             .collect();
         let records = convert_cc_dumps(&self.dump_dir, &self.tokenizer, &windows)?;
@@ -333,10 +338,18 @@ impl CcHarness {
     /// routed under `ARLE_SPAWNER_SOCKET`; env per-child via `Command::env`),
     /// then the single Rust reward definition (`git diff` gate →
     /// `score_workdir`; errors fold into reward 0).
-    fn run_sample(&self, task: &SweTask, sample: usize, workdir: &Path) -> ScoredSample {
+    fn run_sample(
+        &self,
+        task: &SweTask,
+        nonce: u64,
+        sample: usize,
+        workdir: &Path,
+    ) -> ScoredSample {
         // Per-sample model tag: the serve echoes `model` back without
-        // interpreting it, so concurrent samples' dumps stay attributable.
-        let model = sample_model(&self.model_id, sample);
+        // interpreting it, so concurrent samples' dumps stay attributable. The
+        // group nonce is what keeps concurrent GROUPS apart
+        // (`--prompts-per-update` > 1) — the sample index alone repeats.
+        let model = sample_model(&self.model_id, nonce, sample);
         let mut cmd = Command::new("claude");
         cmd.arg("-p")
             .args(["--model", &model])
@@ -459,8 +472,8 @@ fn cc_prompt(problem_statement: &str) -> String {
 
 /// The model id a sample requests with: `<model>#s<k>`. Distinct per sample so
 /// dump attribution never relies on wall-clock alone under concurrency.
-fn sample_model(model_id: &str, sample: usize) -> String {
-    format!("{model_id}#s{sample}")
+fn sample_model(model_id: &str, nonce: u64, sample: usize) -> String {
+    format!("{model_id}#g{nonce}s{sample}")
 }
 
 fn epoch_ms() -> u64 {

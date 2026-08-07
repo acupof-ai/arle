@@ -3101,11 +3101,14 @@ fn load_agent_opd_serve_student(
     // traffic: K concurrent cc streams × the measured session ceiling, +25%
     // headroom, page_size 16.
     use train::cc_harness::{CC_MAX_SESSION_TOKENS, CC_SESSION_TOKENS};
-    // Sessions THIS rank serves at once: the update window's samples
-    // (prompts_per_update × samples_per_prompt) spread round-robin over the cp
-    // fleet's endpoints.
-    let width = (args.samples_per_prompt.max(1) * args.prompts_per_update.max(1))
-        .div_ceil(train::context_parallel::CpContext::from_env().size.max(1));
+    // Sessions THIS rank serves at once. Round-robin restarts per group
+    // (`sample % base_urls.len()`), so every concurrent group hands this rank
+    // its own ceil(K/cp) — G × ceil(K/cp), not ceil(G×K/cp).
+    let width = args.prompts_per_update.max(1)
+        * args
+            .samples_per_prompt
+            .max(1)
+            .div_ceil(train::context_parallel::CpContext::from_env().size.max(1));
     // Pool = K typical streams, but never smaller than one full long-horizon
     // session (+25% headroom each) so a 200K session stays schedulable.
     let cc_pages = (width * CC_SESSION_TOKENS)
@@ -4111,6 +4114,10 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
                 .saturating_sub(gpu_busy_before) as f64
                 / 1e6;
 
+            // The window shares one launch version, so its staleness is a single
+            // number (0 at --staleness 0; 1 for a window admitted before the
+            // previous update).
+            let window_behavior = rolled.first().map_or(policy_version, |(_, _, v)| *v);
             let mut window_groups: Vec<(usize, train::cc_harness::CcGroup, u64, u64)> =
                 Vec::with_capacity(n);
             for (group_idx, group, behavior_version) in rolled {
@@ -4348,8 +4355,8 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
                 &merged,
                 serde_json::json!({
                     "groups": per_group.len(),
-                    "behavior_version": policy_version,
-                    "staleness": 0,
+                    "behavior_version": window_behavior,
+                    "staleness": policy_version - window_behavior,
                     "window_gpu_busy_secs": gpu_busy_secs,
                 }),
                 released_engines,
@@ -4359,7 +4366,12 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
             // trained). Stored batches retain the immutable generation-time
             // behavior sidecars. Push after drawing: first drawable next window.
             if let Some((buffer, rng)) = replay.as_mut() {
-                for entry in buffer.draw(round, args.replay_reuse, rng) {
+                // Per FRESH group, as at G=1 — one draw per window would thin
+                // replay by G.
+                for entry in (0..per_group.len())
+                    .flat_map(|_| buffer.draw(round, args.replay_reuse, rng))
+                    .collect::<Vec<_>>()
+                {
                     run_update(
                         &entry.batch,
                         serde_json::json!({
