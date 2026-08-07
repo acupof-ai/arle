@@ -564,12 +564,11 @@ case "${1:-help}" in
         ;;
     publish)
         cd "$ROOT"
-        [[ "$CORRECTNESS_STATUS" == passed ]] || {
-            echo "publish requires ARLE_KERNEL_CORRECTNESS_STATUS=passed" >&2
-            exit 1
-        }
-        id="$(kernel_bundle_id)"
-        validate_correctness_evidence "$id"
+        case "$CORRECTNESS_STATUS" in
+            passed) id="$(kernel_bundle_id)"; validate_correctness_evidence "$id" ;;
+            not-run) id="$(kernel_bundle_id)" ;;  # candidate: no GPU evidence yet
+            *) echo "publish requires ARLE_KERNEL_CORRECTNESS_STATUS=passed or not-run" >&2; exit 1 ;;
+        esac
         tar --version 2>/dev/null | grep -q 'GNU tar' || {
             echo "publishing requires GNU tar for canonical metadata" >&2
             exit 1
@@ -592,7 +591,10 @@ case "${1:-help}" in
             }
             tmp="$(mktemp -d)"
             gh release download "$REL" -R "$REPO" -p "$file" -p "$checksum" -D "$tmp"
-            verify_archive "$tmp/$file" "$tmp/$checksum" "$id" 1
+            # require_passed matches publish mode: candidate accepts not-run; qualified requires passed.
+            require_passed=0
+            [[ "$CORRECTNESS_STATUS" == passed ]] && require_passed=1
+            verify_archive "$tmp/$file" "$tmp/$checksum" "$id" "$require_passed"
             cmp "$checksum" "$tmp/$checksum" >/dev/null || {
                 echo "immutable bundle identity collision: $file" >&2
                 rm -rf "$tmp"
