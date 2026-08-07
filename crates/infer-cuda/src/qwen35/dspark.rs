@@ -1818,15 +1818,13 @@ impl Qwen35Model {
         self.batched_copy(copy, &gdr.1, &gdr.0, &[gdr_bytes])?;
         self.batched_copy(copy, &conv.1, &conv.0, &[conv_bytes])?;
         let restore_ms = super::mtp_phase_lap(&self.ctx, &mut pt);
-        // The varlen replay is the recurrent kernel; leave the opt-in chunked
-        // path on its own route.
-        if super::qwen35_gdr_chunked_enabled() {
-            for r in rolls.iter_mut() {
-                self.replay_linear_only(r.slot, ws, &r.spec.capture, r.k)?;
-                r.slot.set_seq_len(r.start_pos + r.k + 1);
-            }
-            return Ok(());
-        }
+        // Always the batched varlen replay. It gated on `--qwen35-gdr-chunked`
+        // while that flag was opt-in; the flag defaulted on in c2eb5de9e and the
+        // per-slot loop silently became the only route, at rows x 48 x ~6
+        // launches a tick against 48 x 3 here. The replay recomputes from the
+        // restored snapshot, so it never had to match the trunk's kernel — and
+        // since the trunk's uniform short rows now take this same recurrent
+        // varlen kernel, matching it is the more consistent choice anyway.
         let ks: Vec<usize> = rolls.iter().map(|r| r.k).collect();
         let mut slots: Vec<&mut Qwen35SlotState> = Vec::with_capacity(rolls.len());
         let mut captures: Vec<&Qwen35LinearCapture> = Vec::with_capacity(rolls.len());
