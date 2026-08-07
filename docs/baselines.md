@@ -92,12 +92,15 @@ the batched recurrent core is not bit-identical to per-row FlashQLA, so the
 numerics shift which draft tokens verify; correctness is gated by
 `scripts/needle_concurrent.py` (a distinct needle per row at c=2/8/16, ×3).
 
-`itl_p99` at c=16 is 758.8 ms against a 110.52 ms mean. The tail is a decode row
-waiting behind a prefill step: at the shipped 16384-token per-tick budget a
-prefill step carries ~890 ms of compute. `--max-num-batched-tokens` (added
-`ed92c6d8c`) exposes that budget; the roofline ridge for this box and model is
-~65 tokens, so the shipped value is ~250× past the point where more tokens buy
-throughput. Unmeasured — the knob exists to measure the curve.
+`itl_p99` at c=16 is 758.8 ms against a 110.52 ms mean, and the cause is NOT the
+per-tick prefill budget. Swept on one binary with the default run twice as its
+own control, `--max-num-batched-tokens` 16384 → 2048 is 0.0% and → 512 is 13.3%
+*worse*; the budget almost never binds, because prefix caching leaves each agent
+turn only ~864 new tokens. **16384 stays.** Do not read the ~65-token roofline
+ridge as an argument for lowering it — the ridge is a lower bound, and splitting
+the same work across more forwards just re-pays the weight read
+([`errors/2026-08-07-two-nulls-pinned-staging-and-the-token-budget.md`](experience/errors/2026-08-07-two-nulls-pinned-staging-and-the-token-budget.md)).
+Same-config repeat spread on that sweep was 5.7%.
 
 **Measured drift band, ±2.7%.** The same sweep run twice gave total tok/s
 10444.2 / 20484.9 / 24666.9 / 29450.8 / 31313.7 — the row above is the idle-box
