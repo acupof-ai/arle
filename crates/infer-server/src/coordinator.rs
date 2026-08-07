@@ -688,7 +688,19 @@ async fn completions(
         ApiError::bad_request(format!("Failed to parse request body as JSON: {rejection}"))
     })?;
     request.validate()?;
-    let sampling = request.sampling_params();
+    let mut sampling = request.sampling_params();
+    // Convert string `stop` sequences to token ids and merge with
+    // `stop_token_ids`. The engine only supports token-id stops, so string
+    // stops are materialized here at the API boundary.
+    if let Some(stop_strings) = &request.stop {
+        for s in stop_strings {
+            if s.is_empty() {
+                continue;
+            }
+            let ids = encode(&state, s)?;
+            sampling.stop_token_ids.extend(ids);
+        }
+    }
     let max_tokens = sampling.max_new_tokens.unwrap_or(16);
     // Token-id prompt → feed verbatim (exact-token multi-turn); text → tokenize.
     let prompt_tokens = match &request.prompt {
@@ -820,7 +832,18 @@ async fn chat_completions(
         ApiError::bad_request(format!("Failed to parse request body as JSON: {rejection}"))
     })?;
     request.validate()?;
-    let sampling = request.sampling_params();
+    let mut sampling = request.sampling_params();
+    // Convert string `stop` sequences to token ids (engine only supports
+    // token-id stops).
+    if let Some(stop_strings) = &request.stop {
+        for s in stop_strings {
+            if s.is_empty() {
+                continue;
+            }
+            let ids = encode(&state, s)?;
+            sampling.stop_token_ids.extend(ids);
+        }
+    }
     let stream = request.stream.unwrap_or(false);
     let include_usage = request
         .stream_options
@@ -1181,7 +1204,18 @@ async fn anthropic_messages(
         .map_err(|err| MessagesError::invalid_request(err.to_string()))?;
     request.validate()?;
     let (chat_request, thinking, tools_active, prompt_tokens) = anthropic_prompt(&state, &request)?;
-    let sampling = chat_request.sampling_params();
+    let mut sampling = chat_request.sampling_params();
+    // Convert string `stop` sequences to token ids (engine only supports
+    // token-id stops).
+    if let Some(stop_strings) = &chat_request.stop {
+        for s in stop_strings {
+            if s.is_empty() {
+                continue;
+            }
+            let ids = encode(&state, s)?;
+            sampling.stop_token_ids.extend(ids);
+        }
+    }
     // max_tokens is validated present; mirror the chat path's thinking clamp.
     let mut max_tokens = sampling.max_new_tokens.unwrap_or(16);
     if state.max_thinking_tokens > 0 && thinking {
