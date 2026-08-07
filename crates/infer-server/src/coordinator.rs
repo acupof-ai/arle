@@ -26,8 +26,9 @@ use crate::multiproc_relay::{
     CompletionSinks, RelayCompletionDelta, RelayCoordinator, RelayEnvelope, WireRequest,
 };
 use crate::schema::{
-    ApiError, ChatCompletionRequest, ChatCompletionResponse, CompletionRequest, CompletionResponse,
-    ModelsResponse, ResponseToolCall, StatsResponse, Usage,
+    ApiError, AssistantMessage, ChatChoice, ChatCompletionRequest, ChatCompletionResponse,
+    CompletionChoice, CompletionRequest, CompletionResponse, ModelsResponse, ResponseToolCall,
+    SYSTEM_FINGERPRINT, StatsResponse, Usage, split_reasoning,
 };
 use crate::sse_util::{
     ChatDelta, StreamPipeline, chat_stream_chunk, completion_stream_chunk, finish_reason,
@@ -221,7 +222,7 @@ fn wait_for_ack_window(relay: &Arc<Mutex<RelayCoordinator>>, seq: u64) -> Option
 }
 
 enum CoordSubmission {
-    Submit(WireRequest),
+    Submit(Box<WireRequest>),
     /// A request's HTTP client disconnected/timed out (`InFlightGuard::drop`).
     /// Sent unconditionally on every drop, including normal completions —
     /// `RelayEnvelope::CancelRequest` is a no-op on a rank where the request
@@ -390,7 +391,7 @@ fn lockstep_loop(
         let mut cancellations: Vec<u64> = Vec::new();
         loop {
             match submit_rx.try_recv() {
-                Ok(CoordSubmission::Submit(request)) => drained.push(request),
+                Ok(CoordSubmission::Submit(request)) => drained.push(*request),
                 Ok(CoordSubmission::Cancel(request_id)) => cancellations.push(request_id),
                 Err(std::sync::mpsc::TryRecvError::Empty) => break,
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
@@ -442,7 +443,7 @@ fn lockstep_loop(
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
                     coord.broadcast(&RelayEnvelope::TickAdmissions {
                         seq,
-                        requests: vec![request],
+                        requests: vec![*request],
                     })
                 };
                 if let Err(err) = send {
@@ -576,13 +577,13 @@ fn streaming_submit(
     };
     state
         .submit_tx
-        .send(CoordSubmission::Submit(WireRequest {
+        .send(CoordSubmission::Submit(Box::new(WireRequest {
             request_id,
             prompt_tokens,
             max_tokens,
             sampling,
             response_format,
-        }))
+        })))
         .map_err(|_| ApiError::internal("coordinator lockstep loop closed; cannot submit"))?;
     Ok((rx, guard))
 }
@@ -803,6 +804,64 @@ async fn completions(
 
     let return_token_ids = request.return_token_ids.unwrap_or(false);
     let prompt_token_ids = return_token_ids.then(|| prompt_tokens.clone());
+    let n = sampling.n.max(1);
+    if request.stream.unwrap_or(false) && n > 1 {
+        return Err(ApiError::bad_request(
+            "stream=true with n>1 is not supported",
+        ));
+    }
+
+    if n > 1 {
+        let mut choices = Vec::with_capacity(n);
+        for i in 0..n {
+            let mut params = sampling.clone();
+            params.seed = Some(sampling.seed.unwrap_or(0).wrapping_add(i as u64));
+            let outcome = submit_and_collect(
+                &state,
+                prompt_tokens.clone(),
+                max_tokens,
+                params,
+                request.response_format.clone(),
+            )
+            .await?;
+            let text = decode(&state, &outcome.generated_tokens)?;
+            let lps = request
+                .logprobs
+                .is_some()
+                .then_some(outcome.gen_logprobs.clone());
+            let logprobs_value = lps.and_then(|lps_vec| {
+                if lps_vec.len() != outcome.generated_tokens.len() {
+                    return None;
+                }
+                Some(serde_json::json!({
+                    "tokens": outcome.generated_tokens.iter().map(|&t| t.to_string()).collect::<Vec<_>>(),
+                    "token_logprobs": lps_vec,
+                    "top_logprobs": vec![serde_json::Value::Null; lps_vec.len()],
+                    "text_offset": (0..outcome.generated_tokens.len()).collect::<Vec<_>>(),
+                }))
+            });
+            choices.push(CompletionChoice {
+                text,
+                index: i,
+                logprobs: logprobs_value,
+                finish_reason: finish_reason(outcome.finish.as_ref()).to_string(),
+                token_ids: return_token_ids.then_some(outcome.generated_tokens.clone()),
+                prompt_token_ids: prompt_token_ids.clone(),
+            });
+        }
+        let total_completion: usize = choices.iter().map(|c| c.text.len()).sum();
+        return Ok(Json(CompletionResponse {
+            id: format!("cmpl-{}", uuid::Uuid::new_v4().simple()),
+            object: "text_completion",
+            created: unix_time_secs(),
+            model: state.model.clone(),
+            choices,
+            usage: Usage::new(prompt_tokens.len(), total_completion),
+            system_fingerprint: SYSTEM_FINGERPRINT,
+        })
+        .into_response());
+    }
+
     let outcome = submit_and_collect(
         &state,
         prompt_tokens,
@@ -812,6 +871,10 @@ async fn completions(
     )
     .await?;
     let text = decode(&state, &outcome.generated_tokens)?;
+    let return_lps = request
+        .logprobs
+        .is_some()
+        .then_some(outcome.gen_logprobs.clone());
     Ok(Json(CompletionResponse::from_parts(
         state.model.clone(),
         text,
@@ -820,6 +883,7 @@ async fn completions(
         outcome.finish.as_ref(),
         return_token_ids.then_some(outcome.generated_tokens),
         prompt_token_ids,
+        return_lps,
     ))
     .into_response())
 }
@@ -864,6 +928,17 @@ async fn chat_completions(
         .as_ref()
         .and_then(|kwargs| kwargs.get("reasoning_effort"))
         .and_then(serde_json::Value::as_str);
+    // Pass tool_choice to the template so it can instruct the model (required /
+    // forced function). Templates that ignore it stay byte-identical.
+    let mut template_kwargs = request.chat_template_kwargs.clone().unwrap_or_default();
+    if let Some(tc) = &request.tool_choice {
+        template_kwargs.insert("tool_choice".to_string(), tc.clone());
+    }
+    let template_kwargs = if template_kwargs.is_empty() {
+        None
+    } else {
+        Some(template_kwargs)
+    };
     let mut max_tokens = sampling.max_new_tokens.unwrap_or_else(|| {
         if thinking && state.max_thinking_tokens > 0 {
             state.max_thinking_tokens
@@ -894,7 +969,7 @@ async fn chat_completions(
                     .map_err(|_| ApiError::internal("tokenizer lock poisoned"))?;
                 tokenizer.render_chat_full(
                     &request.messages,
-                    request.chat_template_kwargs.as_ref(),
+                    template_kwargs.as_ref(),
                     tools,
                     thinking,
                     reasoning_effort,
@@ -935,6 +1010,7 @@ async fn chat_completions(
                 delta.finish_reason.as_ref(),
                 split_thinking,
                 tool_calls,
+                None,
             ))
             .into_response());
         }
@@ -1119,6 +1195,78 @@ async fn chat_completions(
             .into_response());
     }
 
+    let n = sampling.n.max(1);
+    // Streaming with n>1 is not supported (OpenAI streams multiple choices
+    // with different indices — complex; fall back to a single stream).
+    if stream && n > 1 {
+        return Err(ApiError::bad_request(
+            "stream=true with n>1 is not supported",
+        ));
+    }
+
+    if n > 1 {
+        let mut choices = Vec::with_capacity(n);
+        let want_lps = request.logprobs.unwrap_or(false);
+        for i in 0..n {
+            let mut params = sampling.clone();
+            params.seed = Some(sampling.seed.unwrap_or(0).wrapping_add(i as u64));
+            let outcome = submit_and_collect(
+                &state,
+                prompt_tokens.clone(),
+                max_tokens,
+                params,
+                request.response_format.clone(),
+            )
+            .await?;
+            let decoded = decode(&state, &outcome.generated_tokens)?;
+            let (content, tool_calls, split_thinking) =
+                finalize_chat_content(decoded, tools_active, thinking);
+            let (reasoning_content, content) = split_reasoning(&content, split_thinking);
+            let finish_reason = if tool_calls.is_empty() {
+                finish_reason(outcome.finish.as_ref()).to_string()
+            } else {
+                "tool_calls".to_string()
+            };
+            let logprobs_value = want_lps.then(|| {
+                let toks = &outcome.generated_tokens;
+                let lps = &outcome.gen_logprobs;
+                if lps.len() != toks.len() {
+                    return serde_json::Value::Null;
+                }
+                let cl: Vec<serde_json::Value> = toks
+                    .iter()
+                    .zip(lps.iter())
+                    .map(|(&t, &lp)| {
+                        serde_json::json!({"token": t.to_string(), "logprob": lp, "top_logprobs": []})
+                    })
+                    .collect();
+                serde_json::json!({"content": cl})
+            });
+            choices.push(ChatChoice {
+                index: i,
+                message: AssistantMessage {
+                    role: "assistant",
+                    content,
+                    reasoning_content,
+                    tool_calls,
+                },
+                logprobs: logprobs_value,
+                finish_reason,
+            });
+        }
+        let total_completion = choices.iter().map(|c| c.message.content.len()).sum();
+        return Ok(Json(ChatCompletionResponse {
+            id: format!("chatcmpl-{}", uuid::Uuid::new_v4().simple()),
+            object: "chat.completion",
+            created: unix_time_secs(),
+            model: state.model.clone(),
+            choices,
+            usage: Usage::new(prompt_tokens.len(), total_completion),
+            system_fingerprint: SYSTEM_FINGERPRINT,
+        })
+        .into_response());
+    }
+
     let outcome = submit_and_collect(
         &state,
         prompt_tokens,
@@ -1130,6 +1278,10 @@ async fn chat_completions(
     let decoded = decode(&state, &outcome.generated_tokens)?;
     let (content, tool_calls, split_thinking) =
         finalize_chat_content(decoded, tools_active, thinking);
+    let return_lps = request.logprobs.unwrap_or(false).then_some((
+        outcome.generated_tokens.clone(),
+        outcome.gen_logprobs.clone(),
+    ));
     Ok(Json(ChatCompletionResponse::from_parts(
         state.model.clone(),
         content,
@@ -1138,6 +1290,7 @@ async fn chat_completions(
         outcome.finish.as_ref(),
         split_thinking,
         tool_calls,
+        return_lps,
     ))
     .into_response())
 }
@@ -1159,12 +1312,30 @@ fn anthropic_prompt(
     } else {
         &[]
     };
+    let mut anthropic_kwargs = chat_request
+        .chat_template_kwargs
+        .clone()
+        .unwrap_or_default();
+    if let Some(tc) = &chat_request.tool_choice {
+        anthropic_kwargs.insert("tool_choice".to_string(), tc.clone());
+    }
+    let anthropic_kwargs = if anthropic_kwargs.is_empty() {
+        None
+    } else {
+        Some(anthropic_kwargs)
+    };
     let prompt = {
         let tokenizer = state
             .tokenizer
             .lock()
             .map_err(|_| ApiError::internal("tokenizer lock poisoned"))?;
-        tokenizer.render_chat_full(&chat_request.messages, None, tools, thinking, None)?
+        tokenizer.render_chat_full(
+            &chat_request.messages,
+            anthropic_kwargs.as_ref(),
+            tools,
+            thinking,
+            None,
+        )?
     };
     let prompt_tokens = encode(state, &prompt)?;
     // /v1/messages carries no chat_template_kwargs, so the rendered-prompt gate
@@ -1367,6 +1538,7 @@ async fn anthropic_messages(
         outcome.finish.as_ref(),
         thinking,
         tool_calls,
+        None,
     );
     Ok(Json(anthropic::MessagesResponse::from_chat(&chat)).into_response())
 }
@@ -1554,6 +1726,7 @@ mod tests {
             Some(&FinishReason::Stop),
             split_thinking,
             tool_calls,
+            None,
         );
         let value = serde_json::to_value(crate::anthropic::MessagesResponse::from_chat(&chat))
             .expect("serialize");

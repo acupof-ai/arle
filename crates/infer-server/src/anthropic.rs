@@ -1035,6 +1035,7 @@ mod tests {
             Some(&FinishReason::Stop),
             false,
             calls,
+            None,
         );
         let response = MessagesResponse::from_chat(&chat_response);
         let v = serde_json::to_value(&response).expect("serialize");
@@ -1064,6 +1065,7 @@ mod tests {
             Some(&FinishReason::Stop),
             false,
             Vec::new(),
+            None,
         ));
         assert_eq!(plain.stop_reason, "end_turn");
         let truncated = MessagesResponse::from_chat(&ChatCompletionResponse::from_parts(
@@ -1074,6 +1076,7 @@ mod tests {
             Some(&FinishReason::Length),
             false,
             Vec::new(),
+            None,
         ));
         assert_eq!(truncated.stop_reason, "max_tokens");
     }
@@ -1107,6 +1110,7 @@ mod tests {
             Some(&FinishReason::Stop),
             false,
             Vec::new(),
+            None,
         );
         let response = MessagesResponse::from_chat(&chat);
         assert!(response.content.is_empty());

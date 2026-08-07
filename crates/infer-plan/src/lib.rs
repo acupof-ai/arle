@@ -179,6 +179,11 @@ pub struct SamplingParams {
     /// allowed). Host-side and backend-neutral; the engine refreshes it after
     /// every accepted token.
     pub grammar_bitmask: Option<std::sync::Arc<[u32]>>,
+    /// Token-id → logit bias added before sampling.
+    pub logit_bias: std::collections::HashMap<u32, f32>,
+    /// Number of completions to generate. Engine supports one; values > 1 are
+    /// handled by the API layer (re-run with offset seeds).
+    pub n: usize,
 }
 
 impl Default for SamplingParams {
@@ -196,6 +201,8 @@ impl Default for SamplingParams {
             seed: None,
             max_new_tokens: None,
             grammar_bitmask: None,
+            logit_bias: std::collections::HashMap::new(),
+            n: 1,
         }
     }
 }

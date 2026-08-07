@@ -210,6 +210,8 @@ impl CompletionRequest {
             self.ignore_eos,
             self.stop_token_ids.clone(),
             self.seed,
+            self.logit_bias.clone(),
+            self.n,
         )
     }
 }
@@ -315,6 +317,8 @@ impl ChatCompletionRequest {
             self.ignore_eos,
             self.stop_token_ids.clone(),
             self.seed,
+            self.logit_bias.clone(),
+            self.n,
         )
     }
 
@@ -529,6 +533,8 @@ fn sampling_params(
     ignore_eos: Option<bool>,
     stop_token_ids: Option<Vec<u32>>,
     seed: Option<u64>,
+    logit_bias: Option<std::collections::HashMap<u32, f32>>,
+    n: Option<usize>,
 ) -> SamplingParams {
     let default = SamplingParams::default();
     let serve = sampling_defaults();
@@ -545,6 +551,8 @@ fn sampling_params(
         seed,
         max_new_tokens: max_tokens,
         grammar_bitmask: None,
+        logit_bias: logit_bias.unwrap_or_default(),
+        n: n.unwrap_or(1).max(1),
     }
 }
 
@@ -572,7 +580,20 @@ impl CompletionResponse {
         finish: Option<&FinishReason>,
         token_ids: Option<Vec<u32>>,
         prompt_token_ids: Option<Vec<u32>>,
+        logprobs: Option<Vec<f32>>,
     ) -> Self {
+        let logprobs_value = logprobs.and_then(|lps| {
+            let toks = token_ids.as_ref()?;
+            if lps.len() != toks.len() {
+                return None;
+            }
+            Some(serde_json::json!({
+                "tokens": toks.iter().map(|&t| t.to_string()).collect::<Vec<_>>(),
+                "token_logprobs": lps,
+                "top_logprobs": vec![serde_json::Value::Null; lps.len()],
+                "text_offset": (0..toks.len()).collect::<Vec<_>>(),
+            }))
+        });
         Self {
             id: format!("cmpl-{}", uuid::Uuid::new_v4().simple()),
             object: "text_completion",
@@ -581,7 +602,7 @@ impl CompletionResponse {
             choices: vec![CompletionChoice {
                 text,
                 index: 0,
-                logprobs: None,
+                logprobs: logprobs_value,
                 finish_reason: finish_reason(finish).to_string(),
                 token_ids,
                 prompt_token_ids,
@@ -888,6 +909,7 @@ impl ChatCompletionResponse {
         finish: Option<&FinishReason>,
         enable_thinking: bool,
         tool_calls: Vec<ResponseToolCall>,
+        logprobs: Option<(Vec<u32>, Vec<f32>)>,
     ) -> Self {
         let (reasoning_content, content) = split_reasoning(&content, enable_thinking);
         // OpenAI semantics: any emitted tool call overrides the finish reason.
@@ -896,14 +918,28 @@ impl ChatCompletionResponse {
         } else {
             "tool_calls".to_string()
         };
-        // The engine does not yet report a reasoning-vs-content token split, so
-        // `reasoning_tokens` is 0 when thinking is on (field present) and the
-        // whole block is omitted otherwise — matching OpenAI's wire shape.
         let usage = if enable_thinking {
             Usage::with_reasoning(prompt_tokens, completion_tokens, 0)
         } else {
             Usage::new(prompt_tokens, completion_tokens)
         };
+        let logprobs_value = logprobs.and_then(|(toks, lps)| {
+            if lps.len() != toks.len() {
+                return None;
+            }
+            let content_logprobs: Vec<serde_json::Value> = toks
+                .iter()
+                .zip(lps.iter())
+                .map(|(&t, &lp)| {
+                    serde_json::json!({
+                        "token": t.to_string(),
+                        "logprob": lp,
+                        "top_logprobs": [],
+                    })
+                })
+                .collect();
+            Some(serde_json::json!({ "content": content_logprobs }))
+        });
         Self {
             id: format!("chatcmpl-{}", uuid::Uuid::new_v4().simple()),
             object: "chat.completion",
@@ -917,7 +953,7 @@ impl ChatCompletionResponse {
                     reasoning_content,
                     tool_calls,
                 },
-                logprobs: None,
+                logprobs: logprobs_value,
                 finish_reason,
             }],
             usage,
@@ -986,7 +1022,7 @@ const THINK_END: &str = "</think>";
 
 /// OpenAI `system_fingerprint` — a stable identifier for the model/backend
 /// configuration. Baked into the binary; changes only with the build.
-const SYSTEM_FINGERPRINT: &str = "arle_fp_1";
+pub(crate) const SYSTEM_FINGERPRINT: &str = "arle_fp_1";
 
 /// Split a thinking-model's generated text into `(reasoning_content, content)`.
 ///
@@ -1317,6 +1353,7 @@ mod tests {
             Some(&FinishReason::Length),
             None,
             None,
+            None,
         );
         let hidden_json = serde_json::to_value(&hidden).expect("serialize hidden");
         assert!(hidden_json["choices"][0].get("token_ids").is_none());
@@ -1330,6 +1367,7 @@ mod tests {
             Some(&FinishReason::Length),
             Some(vec![1, 2]),
             Some(vec![7, 8, 9]),
+            None,
         );
         let visible_json = serde_json::to_value(&visible).expect("serialize visible");
         assert_eq!(visible_json["choices"][0]["token_ids"], json!([1, 2]));
@@ -1496,6 +1534,7 @@ mod tests {
             Some(&FinishReason::Stop),
             false,
             Vec::new(),
+            None,
         );
         let v = serde_json::to_value(&resp).expect("serialize");
         let message = &v["choices"][0]["message"];
@@ -1557,6 +1596,7 @@ mod tests {
             Some(&FinishReason::Stop),
             false,
             tool_calls,
+            None,
         );
         let v = serde_json::to_value(&resp).expect("serialize");
         assert_eq!(v["choices"][0]["finish_reason"], "tool_calls");
