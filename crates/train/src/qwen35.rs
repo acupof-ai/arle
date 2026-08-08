@@ -12,13 +12,14 @@ use autograd::{
     AutogradError, Device, Tape, Tensor, TensorId, TensorStore,
     ops::{
         LinearAttentionParams, MoeGroupedLinearExpert, MoeGroupedLinearInput, MoeGroupedRoute,
-        MoeTopK, add, add_broadcast, causal_sdpa_recompute, causal_sdpa_recompute_with_q_start,
-        causal_sdpa_with_q_start, checkpoint_sequential, embedding, linear_attention_boundary,
-        linear_attention_core, linear_attention_core_with_carry,
-        linear_attention_core_with_carry_taped, linear_attention_ctx_bytes,
-        linear_attention_row_transient_bytes, matmul_bt_with_site, moe_grouped_linear,
-        moe_grouped_weighted_scatter, moe_topk_softmax, moe_topk_softmax_with_indices, mul,
-        repeat_kv, reshape, rmsnorm, rope, sigmoid, silu, slice, transpose,
+        MoeTopK, add, add_broadcast, cat_seq, causal_sdpa_recompute,
+        causal_sdpa_recompute_with_q_start, causal_sdpa_with_q_start, checkpoint_sequential,
+        embedding, linear_attention_boundary, linear_attention_core,
+        linear_attention_core_with_carry, linear_attention_core_with_carry_taped,
+        linear_attention_ctx_bytes, linear_attention_row_transient_bytes, matmul_bt_with_site,
+        moe_grouped_linear, moe_grouped_weighted_scatter, moe_topk_softmax,
+        moe_topk_softmax_with_indices, mul, repeat_kv, reshape, rmsnorm, rope, sigmoid, silu,
+        slice, transpose,
     },
     tape::checkpoint_replay_mem_stage,
 };
@@ -646,52 +647,68 @@ impl Qwen35Layer {
         Ok(out)
     }
 
-    /// OPD frozen-prompt-KV phase 1 (per layer, OFF-TAPE): capture this layer's
-    /// prompt-prefix attention state (K/V for full attention, recurrent
-    /// state+conv window for linear attention) AND propagate the prompt hidden
-    /// through the full residual block so the next layer's capture sees the
-    /// correct input. `x` is `[batch, gen_start, hidden]`. Returns
-    /// `(next_prompt_hidden, LayerPrefix)`. The caller passes a DISABLED tape.
+    /// OPD frozen-prompt-KV phase 1 (off-tape): capture this layer's prompt
+    /// prefix K/V (full attention) or boundary state (linear attention) AND
+    /// produce the layer's attention+MLP output so the next layer's capture
+    /// sees the correct residual stream.
+    ///
+    /// `prefix_kv` = accumulated K/V from earlier prompt chunks (None for the
+    /// first chunk). `chunk_start` = absolute row index of this chunk's first
+    /// token (0 for the first chunk). The returned `LayerPrefix` holds the FULL
+    /// K/V (prefix + this chunk) for the gen-segment pass. The caller passes a
+    /// DISABLED tape.
     #[allow(clippy::too_many_arguments)]
     fn forward_capture_prefix(
         &self,
         x: TensorId,
         cfg: &Qwen35Config,
         tp: TpContext,
-        cos_prefix: TensorId,
-        sin_prefix: TensorId,
+        cos: TensorId,
+        sin: TensorId,
         batch: usize,
-        gen_start: usize,
+        seq_len: usize,
+        chunk_start: usize,
+        prefix_kv: Option<&PrefixKv>,
         store: &mut TensorStore,
         tape: &mut Tape,
     ) -> Result<(TensorId, LayerPrefix)> {
         let h = qwen35_rmsnorm(x, self.input_layernorm, cfg.rms_norm_eps, store, tape)?;
         let (attn_out, prefix) = match &self.self_attn {
             Qwen35Attention::Full(attn) => {
-                let prefix = self.forward_full_attention_capture_prefix_kv(
-                    h, attn, cfg, tp, cos_prefix, sin_prefix, batch, gen_start, store, tape,
+                // K/V for this chunk (RMSNorm + RoPE + repeat_kv, requires_grad=false).
+                let chunk_kv = self.forward_full_attention_capture_prefix_kv(
+                    h, attn, cfg, tp, cos, sin, batch, seq_len, store, tape,
                 )?;
-                // The prompt residual stream needs the layer's attention output;
-                // recompute it via the standard full-sequence path (off-tape).
-                let attn_out = self.forward_full_attention(
+                // Full K/V = accumulated prefix + this chunk.
+                let full_kv = if let Some(prefix) = prefix_kv {
+                    PrefixKv {
+                        k: cat_seq(prefix.k, chunk_kv.k, store, tape)?,
+                        v: cat_seq(prefix.v, chunk_kv.v, store, tape)?,
+                    }
+                } else {
+                    chunk_kv
+                };
+                // Attention: Q from this chunk, K/V = full (prefix + chunk).
+                // q_start = chunk_start so causal masking is by absolute position.
+                let attn_out = self.forward_full_attention_with_kv(
                     h,
                     attn,
                     cfg,
                     tp,
-                    crate::context_parallel::CpContext::single(),
-                    cos_prefix,
-                    sin_prefix,
+                    cos,
+                    sin,
+                    &full_kv,
                     batch,
-                    gen_start,
-                    None,
+                    seq_len,
+                    chunk_start,
                     store,
                     tape,
                 )?;
-                (attn_out, LayerPrefix::Full(prefix))
+                (attn_out, LayerPrefix::Full(full_kv))
             }
             Qwen35Attention::Linear(attn) => {
                 let prefix = self.forward_linear_attention_capture_prefix_state(
-                    h, attn, cfg, batch, gen_start, store, tape,
+                    h, attn, cfg, batch, seq_len, store, tape,
                 )?;
                 let attn_out = self.forward_linear_attention(
                     h,
@@ -699,7 +716,7 @@ impl Qwen35Layer {
                     cfg,
                     crate::context_parallel::CpContext::single(),
                     batch,
-                    gen_start,
+                    seq_len,
                     store,
                     tape,
                 )?;
@@ -714,9 +731,88 @@ impl Qwen35Layer {
             store,
             tape,
         )?;
-        let mlp_out = self.forward_mlp(h, cfg, tp, batch, gen_start, store, tape)?;
+        let mlp_out = self.forward_mlp(h, cfg, tp, batch, seq_len, store, tape)?;
         let next = add(x, mlp_out, store, tape)?;
         Ok((next, prefix))
+    }
+
+    /// Full-attention forward with pre-computed K/V (used by the chunked
+    /// prefix pass: K/V spans prefix + chunk, Q spans the chunk only).
+    /// `q_start` = absolute row of the chunk's first token, so the causal
+    /// mask lets Q[i] attend to K/V[0 .. q_start+i+1].
+    #[allow(clippy::too_many_arguments)]
+    fn forward_full_attention_with_kv(
+        &self,
+        h: TensorId,
+        attn: &Qwen35FullAttention,
+        cfg: &Qwen35Config,
+        tp: TpContext,
+        cos: TensorId,
+        sin: TensorId,
+        kv: &PrefixKv,
+        batch: usize,
+        seq_len: usize,
+        q_start: usize,
+        store: &mut TensorStore,
+        tape: &mut Tape,
+    ) -> Result<TensorId> {
+        let local_attention_heads = tp.local_attention_heads(cfg)?;
+        let q_full = attn.q_proj.forward(h, store, tape)?;
+        let (q, gate) = if cfg.full_attn_gated {
+            let q_full = reshape(
+                q_full,
+                &[batch, seq_len, local_attention_heads, cfg.head_dim * 2],
+                store,
+                tape,
+            )?;
+            let q = slice(
+                q_full,
+                &[0, 0, 0, 0],
+                &[batch, seq_len, local_attention_heads, cfg.head_dim],
+                store,
+                tape,
+            )?;
+            let gate = slice(
+                q_full,
+                &[0, 0, 0, cfg.head_dim],
+                &[batch, seq_len, local_attention_heads, cfg.head_dim * 2],
+                store,
+                tape,
+            )?;
+            (
+                transpose(q, 1, 2, store, tape)?,
+                Some(transpose(gate, 1, 2, store, tape)?),
+            )
+        } else {
+            let q = reshape(
+                q_full,
+                &[batch, seq_len, local_attention_heads, cfg.head_dim],
+                store,
+                tape,
+            )?;
+            (transpose(q, 1, 2, store, tape)?, None)
+        };
+        let q = qwen35_rmsnorm(q, attn.q_norm, cfg.rms_norm_eps, store, tape)?;
+        let q = rope(q, cos, sin, store, tape)?;
+        // kv.k / kv.v are already RMSNorm'd, RoPE'd, and repeat_kv'd (full heads).
+        let attn_hidden = causal_sdpa_recompute_with_q_start(q, kv.k, kv.v, q_start, store, tape)?;
+        let attn_hidden = if let Some(gate) = gate {
+            let gate = sigmoid(gate, store, tape)?;
+            mul(attn_hidden, gate, store, tape)?
+        } else {
+            attn_hidden
+        };
+        let attn_hidden = merge_heads(
+            attn_hidden,
+            batch,
+            seq_len,
+            local_attention_heads,
+            cfg.head_dim,
+            store,
+            tape,
+        )?;
+        let out = attn.o_proj.forward(attn_hidden, store, tape)?;
+        Ok(maybe_all_reduce(out, tp, store, tape)?)
     }
 
     /// OPD frozen-prompt-KV phase 2 (per layer, TAPED): residual block over the
@@ -4669,45 +4765,70 @@ impl Qwen35Model {
         let batch = 1usize;
 
         // ---- PHASE 1: off-tape prompt prefix capture ----
+        // Chunked: the prompt is processed in OPD_SEQ_CHUNK-row pieces so the
+        // per-layer hidden/MLP transients stay O(chunk × hidden) instead of
+        // O(prompt × hidden). Each layer's K/V is accumulated across chunks
+        // (prefix + chunk) and used as the attention K/V for the next chunk.
         let prefix_cache = if gen_start > 0 {
             let prompt_token_indices = prompt_ids.iter().map(|&id| id as usize).collect::<Vec<_>>();
             let prompt_pos = prompt_positions
                 .iter()
                 .map(|&id| id as usize)
                 .collect::<Vec<_>>();
-            let cos_prefix = select_cache_rows(self.cos_cache, &prompt_pos, store)?;
-            let sin_prefix = select_cache_rows(self.sin_cache, &prompt_pos, store)?;
 
             let mut prefix_tape = Tape::new();
             prefix_tape.set_enabled(false);
-            let mut prompt_hidden = embedding(
-                self.embed_tokens,
-                &prompt_token_indices,
-                store,
-                &mut prefix_tape,
-            )?;
-            prompt_hidden = reshape(
-                prompt_hidden,
-                &[batch, gen_start, self.config.hidden_size],
-                store,
-                &mut prefix_tape,
-            )?;
-            let mut layers = Vec::with_capacity(self.layers.len());
-            for layer in &self.layers {
-                let (next, prefix) = layer.forward_capture_prefix(
-                    prompt_hidden,
-                    &self.config,
-                    self.tp,
-                    cos_prefix,
-                    sin_prefix,
-                    batch,
-                    gen_start,
+
+            let chunk = crate::runtime_flags::OPD_SEQ_CHUNK;
+            let num_chunks = gen_start.div_ceil(chunk);
+            // Accumulated K/V per layer (None before the first chunk touches it).
+            let mut layer_prefix: Vec<Option<PrefixKv>> = vec![None; self.layers.len()];
+
+            for c in 0..num_chunks {
+                let start = c * chunk;
+                let end = (start + chunk).min(gen_start);
+                let chunk_len = end - start;
+                let chunk_ids = &prompt_token_indices[start..end];
+                let chunk_pos = &prompt_pos[start..end];
+                let cos_chunk = select_cache_rows(self.cos_cache, chunk_pos, store)?;
+                let sin_chunk = select_cache_rows(self.sin_cache, chunk_pos, store)?;
+
+                let mut h = embedding(self.embed_tokens, chunk_ids, store, &mut prefix_tape)?;
+                h = reshape(
+                    h,
+                    &[batch, chunk_len, self.config.hidden_size],
                     store,
                     &mut prefix_tape,
                 )?;
-                prompt_hidden = next;
-                layers.push(prefix);
+
+                for (li, layer) in self.layers.iter().enumerate() {
+                    let (next, prefix) = layer.forward_capture_prefix(
+                        h,
+                        &self.config,
+                        self.tp,
+                        cos_chunk,
+                        sin_chunk,
+                        batch,
+                        chunk_len,
+                        start,
+                        layer_prefix[li].as_ref(),
+                        store,
+                        &mut prefix_tape,
+                    )?;
+                    h = next;
+                    if let LayerPrefix::Full(kv) = prefix {
+                        layer_prefix[li] = Some(kv);
+                    }
+                }
             }
+
+            let layers = layer_prefix
+                .into_iter()
+                .map(|opt| {
+                    opt.map(LayerPrefix::Full)
+                        .expect("every full-attn layer must have captured prefix K/V")
+                })
+                .collect();
             WritebackPrefixCache { layers }
         } else {
             // gen_start == 0: no prefix; an empty cache forces the gen pass to seed
