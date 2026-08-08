@@ -4211,7 +4211,7 @@ impl Qwen35Model {
                     "qwen/dense_ffn",
                     Some(layer_idx),
                     seq_len,
-                    || self.dense_mlp(mlp, mlp_in, dense, mlp_out),
+                    || self.dense_mlp(mlp, mlp_in, dense, mlp_out, Some((layer_idx, start_pos))),
                 )?;
             }
             // ONE all-reduce covers the whole FFN partial: the MoE buffer already
@@ -4859,7 +4859,7 @@ impl Qwen35Model {
                 .mlp
                 .as_ref()
                 .ok_or_else(|| anyhow!("MTP head layer missing MLP"))?;
-            self.dense_mlp(mlp, &normed, &mut ws.dense, &mut mlp_out)?;
+            self.dense_mlp(mlp, &normed, &mut ws.dense, &mut mlp_out, None)?;
         }
         let mut h_layer = HiddenStates::zeros(&self.ctx, hidden, 1)?;
         add_batch(&self.ctx, &hidden_mid, &mlp_out, &mut h_layer)?;
@@ -6125,21 +6125,51 @@ impl Qwen35Model {
     /// Dense SwiGLU MLP into `out` (`[hidden, seq]`). One GEMM over the
     /// row-fused `[gate; up]` weight, then the fused SwiGLU reads each row's
     /// halves in place. Every stage fully overwrites its scratch buffer.
+    /// `probe` is `(layer_idx, start_pos)` on the trunk forward and `None` on the
+    /// MTP/spec paths: it splits the MLP's three ops for the component parity
+    /// bisect (gate_up GEMM, silu_mul, down GEMM), which one `mlp_out` tap cannot.
     fn dense_mlp(
         &self,
         mlp: &DenseMlp,
         normed: &HiddenStates,
         dw: &mut DenseMlpScratch,
         out: &mut HiddenStates,
+        probe: Option<(usize, usize)>,
     ) -> Result<()> {
         let inter = mlp.inter_dim();
         let seq_len = normed.seq_len;
         let gate_up = dw.gate_up.get(&self.ctx, 2 * inter, seq_len)?;
         gemm_batch(&self.ctx, &mlp.gate_up_proj, normed, gate_up)?;
+        #[cfg(feature = "cuda")]
+        self.stage_mlp_step(probe, "gate_up", gate_up);
         let act = dw.act.get(&self.ctx, inter, seq_len)?;
         silu_mul_fused(&self.ctx, gate_up, act)?;
+        #[cfg(feature = "cuda")]
+        self.stage_mlp_step(probe, "silu_act", act);
         gemm_batch(&self.ctx, &mlp.down_proj, act, out)?;
         Ok(())
+    }
+
+    /// Emit one MLP intermediate row under `ARLE_PROBE_STAGES`.
+    #[cfg(feature = "cuda")]
+    fn stage_mlp_step(&self, probe: Option<(usize, usize)>, stage: &str, buf: &HiddenStates) {
+        let Some((layer_idx, start_pos)) = probe else {
+            return;
+        };
+        let width = buf.hidden_dim;
+        for r in 0..buf.seq_len {
+            let pos = (start_pos + r) as u64;
+            if crate::probe::stage_want(pos) {
+                crate::probe::stage_bf16(
+                    &self.ctx,
+                    stage,
+                    layer_idx,
+                    r,
+                    pos,
+                    buf.data.slice(r * width..(r + 1) * width),
+                );
+            }
+        }
     }
 
     /// Thin trunk wrapper: full attention writing this rank's per-slot K/V cache
@@ -8354,7 +8384,7 @@ impl Qwen35Model {
                     .mlp
                     .as_ref()
                     .ok_or_else(|| anyhow!("dense layer missing both mlp and moe weights"))?;
-                self.dense_mlp(mlp, mlp_in, dense, mlp_out)?;
+                self.dense_mlp(mlp, mlp_in, dense, mlp_out, None)?;
             }
             // ONE all-reduce covers the whole FFN partial (see the per-layer
             // enumeration in the method docs); exact `[hidden, B]` message.
@@ -8606,7 +8636,7 @@ impl Qwen35Model {
                     .mlp
                     .as_ref()
                     .ok_or_else(|| anyhow!("dense layer missing both mlp and moe weights"))?;
-                self.dense_mlp(mlp, mlp_in, dense, mlp_out)?;
+                self.dense_mlp(mlp, mlp_in, dense, mlp_out, None)?;
             }
             self.tp.all_reduce_sum(&self.ctx, mlp_out)?;
             add_batch(&self.ctx, hidden_mid, mlp_out, hidden)?;
