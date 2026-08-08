@@ -1,8 +1,8 @@
 # DSpark draft attention was launched per slot at 192 blocks — CUDA, 2026-08-08
 
-> Status: **mechanism measured, serve A/B and correctness gate pending-remote.**
-> Do not quote an end-to-end number from this entry until the Results section
-> below is filled in.
+> Status: **licensed.** Serve A/B survives a device swap, needle gate clean on
+> both arms. **ITL mean 31.05 → 27.81 ms, −10.4%**, which is 57% of what the
+> tick decomposition projected — the residual is unexplained, see below.
 
 ## Problem
 
@@ -64,25 +64,77 @@ serve duration histogram is bimodal — 47% of launches in the 550–600 µs bin
 
 ## Results — serve A/B
 
-Pending-remote. Matched A/B, two binaries from the same HEAD (`3a8f99b1f` and
-its parent), decode-shaped c=16, arms swapped across GPU 0 and GPU 1.
+Matched A/B, two binaries built serially from the same tree — NEW `3a8f99b1f`
+(sha `9906b136…`) and BASE `d42c7afc2` = its parent (sha `44a4b874…`). Decode-
+shaped c=16, 32 requests, `max_tokens` 4096, temp 0, arms swapped across GPU 0
+and GPU 1. Artifacts `/host/draftattn/ab/`.
 
-| | BASE | NEW | Δ |
-|---|---|---|---|
-| output tok/s | | | |
-| ITL mean | | | |
-| accept_rate | | | |
+| arm | GPU | out tok/s | total tok/s | ITL mean | TTFT p50 | accept_rate | gen tokens |
+|---|---|---:|---:|---:|---:|---:|---:|
+| BASE | 0 | 394.8 | 616.2 | 31.53 ms | 1403.7 ms | 0.4602 | 63181 |
+| NEW | 0 | 413.0 | 702.8 | **27.47** | 1436.9 | 0.4430 | 50470 |
+| BASE | 1 | 390.2 | 651.4 | 30.57 | 1142.7 | 0.4404 | 52942 |
+| NEW | 1 | 457.8 | 743.0 | **28.15** | 1226.7 | 0.4541 | 56874 |
+
+| | GPU 0 | GPU 1 |
+|---|---:|---:|
+| ITL mean | −12.9% | −7.9% |
+| total tok/s | +14.1% | +14.1% |
+| out tok/s | +4.6% | +17.3% |
+| TTFT p50 | +2.4% | +7.3% |
+
+**NEW wins on both devices on both ITL mean and total tok/s**, so the swap rule
+is satisfied. Quote **ITL mean, 31.05 → 27.81 ms, −10.4%**: it is
+work-normalized, whereas `out tok/s` spans +4.6% to +17.3% because the arms
+generated 50.5k–63.2k tokens (temp-0 generations diverge under MoE
+non-determinism). TTFT is a wash-to-slightly-worse, as expected for a
+decode-side change.
+
+BASE reproduces the documented decode baseline — ITL mean 31.53 / 30.57 against
+31.08 ms recorded on 08-08, and 394.8 / 390.2 out tok/s against 407.97.
+
+`accept_rate` symptom check: BASE {0.4602, 0.4404}, NEW {0.4430, 0.4541}. The
+cross-arm gap (≤0.017) is smaller than BASE's own device-to-device spread
+(0.0198), so the arms agree.
+
+`BENCH_EXIT=1` in all four arms — the script's `complete != requests` rule
+firing on the 4 requests that hit the 4096 cap, plus its repetition detector
+(8/6 on BASE, 4/7 on NEW). It fires identically on BASE, so it is a property of
+the prompt set at 4096 tokens.
+
+## Only 57% of the projected win transferred
+
+The tick decomposition projects more than was measured, and the gap is not
+explained.
+
+```
+draft attention   29.57 ms of 96.88 ms GPU-busy, in a 112.33 ms tick span
+-69.3%         ->  9.07 ms, saving 20.5 ms
+new busy           76.4 ms; idle held at 15.45 ms -> span 91.9 ms  = -18.2%
+measured ITL                                                        -10.4%
+```
+
+Candidates are that the 13.8% intra-tick idle does not shrink with the work, and
+that ITL mean carries time outside the decode tick. Neither is measured. **Cause
+unknown** — settle it with an `nsys` capture on NEW at the same shape,
+confirming the draft-attention line actually fell to ~9 ms and locating the
+residual. Recorded as the follow-up rather than guessed at.
 
 ## Correctness gate
 
-Pending-remote. `scripts/needle_gate.py` ladder ×3 same-config repeats per arm,
-at depth 0.0 and 0.5.
+`scripts/needle_gate.py`, ladder ×3 same-config repeats, per arm, at depth 0.0
+and 0.5. Routing `RAW=1 TEMPLATE=qwen3_nonthink NEEDLE_MAX_TOKENS=64` —
+ThinkingCap-Qwen3.6 is a thinking model and the default chat route spends the
+token budget inside the reasoning block, which false-fails every length.
 
-The harness bit-identity covers the kernel math only. The failure mode this
-change can actually produce lives in the caller — a wrong slot index, a wrong
-window-table offset, or the k/v pointer-array halves swapped — any of which
-makes one draft slot attend another slot's ring. That is a correctness bug the
-math check cannot see, which is why the gate is required here and not optional.
+All four arms, every length, both depths: **3/0/0 exact, deterministic.**
+Decoded output was the needle in all 72 runs. NEW is exactly on BASE's envelope.
+
+This is the check that mattered. The harness bit-identity covers the kernel math
+only; the failure mode this change can produce lives in the caller — a wrong
+slot index, a wrong window-table offset, or the k/v pointer-array halves swapped
+— any of which makes one draft slot attend another slot's ring. Well-formed
+arithmetic on the wrong data, invisible to a math check.
 
 ## Learnings
 
@@ -90,6 +142,11 @@ math check cannot see, which is why the gate is required here and not optional.
 model config.** The config gave 3072 blocks and a 2048-token window; the serve
 runs 192 blocks and behaves like a 1376-token window. Three rewrites were sized
 against the config.
+
+**A microbench's bit-identity is not the correctness gate.** I treated it as
+one, because in the harness I filled the per-slot pointer array myself, in the
+right order. The gate had to be added to the pod brief after the fact; a
+perf-only brief produces a perf-only answer.
 
 **"Only X stays per-slot" in a doc comment is an unpriced cost.** It was written
 when the batched draft landed and stayed true for seven weeks, through a
