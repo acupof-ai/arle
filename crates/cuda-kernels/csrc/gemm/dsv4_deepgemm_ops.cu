@@ -72,7 +72,10 @@ __global__ void dsv4_deepgemm_pack_quantize_bf16_to_fp8_kernel(
     int cols,
     int scale_stride_m,
     int scale_k_blocks) {
-  int64_t linear = blockIdx.x;
+  // One warp per 128-element quantization block: 4 bf16 per lane held in
+  // registers, so amax and the scaled write share a single read and the
+  // reduction stays in shuffles. Caller guarantees cols % GRAN_K == 0.
+  int64_t linear = (int64_t)blockIdx.x * (DSV4_DEEPGEMM_BLOCK / 32) + (threadIdx.x >> 5);
   const int k_block = static_cast<int>(linear % scale_k_blocks);
   linear /= scale_k_blocks;
   const int row = static_cast<int>(linear % max_m);
@@ -82,39 +85,28 @@ __global__ void dsv4_deepgemm_pack_quantize_bf16_to_fp8_kernel(
   if (row >= count) return;
   const int expert = active_experts[active];
   const int src_row = active_offsets[active] + row;
-  const int col_start = k_block * DSV4_DEEPGEMM_GRAN_K;
-  const int col_end = min(col_start + DSV4_DEEPGEMM_GRAN_K, cols);
-
-  float local_max = 0.0f;
-  for (int col = col_start + threadIdx.x; col < col_end; col += blockDim.x) {
-    local_max = fmaxf(local_max, fabsf(dg_bf16_to_f32(input[src_row * cols + col])));
-  }
-  local_max = dg_warp_reduce_max(local_max);
-  __shared__ float warp_max[DSV4_DEEPGEMM_BLOCK / 32];
   const int lane = threadIdx.x & 31;
-  const int warp = threadIdx.x >> 5;
-  if (lane == 0) warp_max[warp] = local_max;
-  __syncthreads();
+  const int64_t col_base = (int64_t)k_block * DSV4_DEEPGEMM_GRAN_K;
 
-  float block_max = 0.0f;
-  if (warp == 0) {
-    block_max = lane < (blockDim.x + 31) / 32 ? warp_max[lane] : 0.0f;
-    block_max = dg_warp_reduce_max(block_max);
-  }
-  __shared__ float scale_shared;
-  if (threadIdx.x == 0) {
-    scale_shared = block_max > 0.0f ? block_max / DSV4_FP8_E4M3_MAX : 1.0f;
-    scales[dg_scale_offset(expert, row, k_block, scale_stride_m, scale_k_blocks)] =
-        scale_shared;
-  }
-  __syncthreads();
+  const ushort4 v = reinterpret_cast<const ushort4*>(
+      input + (int64_t)src_row * cols + col_base)[lane];
+  const float f0 = dg_bf16_to_f32(v.x), f1 = dg_bf16_to_f32(v.y);
+  const float f2 = dg_bf16_to_f32(v.z), f3 = dg_bf16_to_f32(v.w);
+  float local_max = fmaxf(fmaxf(fabsf(f0), fabsf(f1)), fmaxf(fabsf(f2), fabsf(f3)));
+  local_max = dg_warp_reduce_max(local_max);
 
-  const float scale = scale_shared;
-  uint8_t* dst_row = output + (expert * max_m + row) * cols;
-  for (int col = col_start + threadIdx.x; col < col_end; col += blockDim.x) {
-    float value = dg_bf16_to_f32(input[src_row * cols + col]);
-    dst_row[col] = dg_f32_to_fp8(scale > 0.0f ? value / scale : 0.0f);
+  const float scale = local_max > 0.0f ? local_max / DSV4_FP8_E4M3_MAX : 1.0f;
+  if (lane == 0) {
+    scales[dg_scale_offset(expert, row, k_block, scale_stride_m, scale_k_blocks)] = scale;
   }
+
+  uchar4 out;
+  out.x = dg_f32_to_fp8(f0 / scale);
+  out.y = dg_f32_to_fp8(f1 / scale);
+  out.z = dg_f32_to_fp8(f2 / scale);
+  out.w = dg_f32_to_fp8(f3 / scale);
+  reinterpret_cast<uchar4*>(
+      output + ((int64_t)expert * max_m + row) * cols + col_base)[lane] = out;
 }
 
 __global__ void dsv4_deepgemm_swiglu_quantize_w13_kernel(
@@ -305,8 +297,9 @@ extern "C" CUresult dsv4_deepgemm_pack_quantize_bf16_to_fp8_cuda(
     return CUDA_ERROR_INVALID_VALUE;
   }
   int scale_k_blocks = (cols + DSV4_DEEPGEMM_GRAN_K - 1) / DSV4_DEEPGEMM_GRAN_K;
-  int64_t grid = static_cast<int64_t>(scale_k_blocks) * max_m * active_count;
-  if (grid > INT_MAX) return CUDA_ERROR_INVALID_VALUE;
+  int64_t warps = static_cast<int64_t>(scale_k_blocks) * max_m * active_count;
+  int64_t grid = (warps + (DSV4_DEEPGEMM_BLOCK / 32) - 1) / (DSV4_DEEPGEMM_BLOCK / 32);
+  if (warps > INT_MAX) return CUDA_ERROR_INVALID_VALUE;
   dsv4_deepgemm_pack_quantize_bf16_to_fp8_kernel<<<static_cast<int>(grid), DSV4_DEEPGEMM_BLOCK, 0, (cudaStream_t)stream>>>(
       input, output, scales, active_experts, active_offsets, active_counts,
       active_count, max_m, cols, scale_stride_m, scale_k_blocks);
