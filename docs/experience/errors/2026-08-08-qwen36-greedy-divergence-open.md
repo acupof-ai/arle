@@ -69,6 +69,8 @@ excluded below, and the route used cannot go further.
 | FP8 GEMM kernels | Prefill (M=130, DeepGEMM dense) and decode (M=1, scalar GEMV lane) are **different kernels** and agree to 0.06 logits while both sit 1.7 logits from the reference. |
 | FP8 load-time dequant / block-scale metadata | Independent numpy dequant against our `n_block*k_blocks + k_block` indexing: **max_rel = 0.000e+00, bit-identical**, across 8 tensors and every projection shape ([12288,5120], [1024,5120], [5120,6144], [17408,5120], [5120,17408]). Scale grids are all non-square, so a transposed index cannot be silent. `weight_scale_inv` → `Multiply` confirmed (`quant_format.rs:118-128`); dequant range [−0.2478, 0.4067]. |
 | Embedding | relL2 **9.28e-09**, norm ratio **1.00000000**, cosine 1.0, max element diff 5e-09. The input is exact; layer 0's error is generated inside layer 0. |
+| Dense MLP, all three ops | Component parity with an exactly injected `mlp_in`, against an **FP8-emulated** reference (our own scale rule applied to `bf16(x)`, then a bf16-dequantized weight in f32): `gate_up` gate half relL2 **2.053e-03**, up half **2.069e-03**, both **1.1× floor**, cosine 0.9999979. Against HF bf16 the same halves read 7.1× / 7.4× floor — and **HF-bf16 against the FP8-emulated reference is itself 7.1× / 7.3×**, so the whole gap is what FP8 costs, not ours. Control: with the activation left un-quantized, HF-bf16 and the reference agree at the floor (gate 1.654e-03), so the gap comes from activation quantization specifically rather than from the weight-dequant path. |
+| A quantization-recipe difference against sglang | sglang 0.5.13 takes `Fp8Config` → `Fp8LinearMethod.apply` → `w8a8_block_fp8_linear` (`fp8.py:165-183`, `:732`, `:791-799`), dispatching to **DeepGEMM** on H20 with no bf16 fallback for these shapes. It quantizes activations **per-token-group, group 128**, scale `amax / 448` with a clamped amax floor (`fp8_utils.py`, `fp8_kernel.py:498`, `:127-132`). **The same granularity and the same rule as ours** (`dsv4_deepgemm_ops.cu:88-117`). Not checked: the `DEEPGEMM_SCALE_UE8M0` default, which would make sglang's scales coarser, not finer. |
 
 ## What the residual-stream comparison does say
 
@@ -101,6 +103,20 @@ Per-layer at position 129, ours against HF (dequantized bf16), full 5120-wide ro
    1.8× more than the MLP at L0 (0.01152 against 0.00640), 1.7× at L1, 2.3× at L3.
    **No component is named.** The same small-denominator trap appeared three times
    in one investigation.
+3. **"The dense MLP is 6.4×–11.6× its floor, so it is the defect"** — the floor
+   was `‖a‖ × 2⁻⁹`, a **bf16** floor, applied to a GEMM whose activations are
+   **e4m3**. Three mantissa bits give a per-element RTN relative error around
+   3.6% RMS, and the measured 1.4e-2 is *below* that crude prediction. Against an
+   FP8-emulated reference every `gate_up` half sits at 1.1× floor. **The
+   reference class was wrong, not the metric** — the same structural failure as
+   the accumulated-state route.
+4. **"If sglang paid 1.4e-2 per GEMM it could not land within 0.5% of HF at the
+   output, so its recipe must differ"** — the premise assumed per-GEMM error
+   compounds across layers. The depth profile refutes it: relL2 goes 8.7e-03
+   (L0–7) → 4.7e-02 (L32–39) → **2.9e-02 (L56–63)**, saturating and then
+   decreasing. The error acts on each block's contribution, not on the residual
+   stream itself, so 64 layers do not give 64 × 1.4e-2. sglang paying the same
+   per-GEMM cost **is** compatible with 0.004 agreement at the output.
 
 ## Limits of this route
 
@@ -132,20 +148,59 @@ Per-layer at position 129, ours against HF (dequantized bf16), full 5120-wide ro
   pytest-verified passes, so a degenerate rollout fails its tests and is filtered.
   The defect costs pass yield and rollout budget, not training-data correctness.
 
-## Next step (not started)
+## What the component parity harness settled, and what it left
 
-**A component parity harness with a shared exact input.** Feed HF's layer-0
-`post_attention_layernorm` output into our `dense_mlp` and compare outputs; same
-for the GDN block with HF's `input_layernorm` output. Input error is zero by
-construction, so the output difference is that component's own and there is no
-accumulation to confound it. The pattern exists at
-`crates/infer-cuda/examples/marlin_w8a16_parity.rs` and `dsv4_parity.rs`.
+The harness worked: `ARLE_PARITY_INJECT` / `_POINT` / `_LAYER` overwrite a tapped
+buffer with a reference tensor (`probe.rs:549`, chunk-aware — prefill splits 130
+into 128+2 and the injection must slice per chunk), so the component under test
+gets a zero-error input and there is no accumulation to confound the output. With
+it, **every component that has been tested sits at its floor against the correct
+reference.** The dense MLP was the last candidate the residual-stream route had
+pointed at, and it is exonerated.
+
+That leaves the divergence unexplained but the surface much smaller. Two live
+questions, cheapest first:
+
+1. **Is this position simply ill-conditioned?** Perturb HF's layer-63 hidden by
+   the relative magnitude actually measured there (relL2 2.9e-2, random
+   direction, many draws), then run HF's own final norm + `lm_head`. If the
+   argmax flips to `5289` and the entropy climbs toward 7 nats under generic
+   noise, there is **no defect** — FP8's ordinary error is sufficient to flip
+   this token and sglang landed on `328` by luck. If it stays `328` at 0.7 nats
+   across every draw, generic error is not sufficient and something specific is
+   wrong. Pure numpy; no GPU.
+2. **The one segment never checked: final norm + `lm_head`.** The last tap is
+   L63 `resid` and the next observable is the logits. Everything between is
+   shared by prefill and decode, has never been compared, and `lm_head` is a
+   248320×5120 GEMM that may take different tiling from the trunk. Test by
+   injecting HF's post-L63 hidden and comparing our logits.
+
+**Weakened to not worth a run:** a position off-by-one in the logits row. It
+would explain the entropy gap (7.147 nats against 0.7085 — a perturbed
+distribution does not gain 6.4 nats, a different position's distribution does),
+but prefill-130 and decode-at-130 agree to **0.06 logits**, far too tight for two
+paths to be independently off by a row and coincide, and L0 `attn_out` at 0.01153
+against a 0.01958 floor with an exact injected input rules out attention dropping
+a key.
 
 ## Rule
 
+- **The floor must match the arithmetic under test.** A bf16 floor on an FP8
+  GEMM manufactured a 7× "defect" that was entirely FP8's own cost. The check
+  that catches it is the **third comparison**: reference-A against reference-B.
+  If the two references differ from each other by the same amount our output
+  differs from either, nothing has been measured.
 - **Convert to absolute before comparing tensors of different norms.** Per-tensor
   `relL2` made a 0.36-norm buffer look worse than a 10.0-norm one, and would also
   have shown a fake 10× GDN amplification.
+- **Do not assume per-layer error compounds.** Block-local error acts on the
+  block's contribution, not on the residual stream, and the observed profile
+  saturates and then decreases. An argument of the form "N layers × per-layer
+  error" is wrong by default and needs the depth profile to license it.
+- **Grep the callers before changing a signature.** `dense_mlp` has six; two live
+  in `qwen35/dspark.rs`, which is entirely behind the `cuda` feature and
+  therefore invisible to the Mac `--no-default-features` typecheck. This is the
+  fourth diagnostic in this investigation whose call sites were incomplete.
 - **A reference is only a reference on the path under test.** Two separate
   endpoint confounds (raw against chat-templated prompt; completions against chat
   harness) each produced a confident wrong conclusion.
