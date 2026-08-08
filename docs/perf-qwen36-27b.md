@@ -51,6 +51,7 @@ invalidated it. **Check this table before ranking anything off a number.**
 | ceiling | c=16 window, anchor workload | 08-08 `70760bc09` | 9 rows/tick at nominal 16 | 32.5K | current, but the window undersamples decode 2–6× — see the note there |
 | §2.0 | c=16 window, **decode-shaped** workload | 08-08 `70760bc09` | **16.0 rows/tick**, four counts | 2.5K | **current — the decode baseline**, window reconciled to +6.8% |
 | §1.3 | FP8 GEMM decomposed, per layer | 08-08 `70760bc09` | c=16 | 32.5K anchor | **current — the prefill baseline.** Read off the anchor trace, no new GPU time |
+| model | exact prefill/decode ledger, floors, tail bandwidth | 08-09 `70760bc09` | c=16 | 32.5K anchor | **current — supersedes the 251.9 µs/token estimate.** A partition of the window, not a fit; same trace, no new GPU time |
 
 Eleven of the fifteen are batch 1 or batch-1-derived. Fourteen of the fifteen
 run the **anchor** workload, which is 279:1 prompt:output and in which all
@@ -90,80 +91,137 @@ c        concurrent rows
 ```
 
 Prefill and decode are separate terms because they are separate regimes; the
-workload picks which one dominates, and on the anchor it is P by 258:1.
+workload picks which one dominates, and on the anchor it is `P` by 258:1.
 
-### `c_prefill` — per token, measured at chunk 2048, anchor c=16, `70760bc09`
+### The anchor window, resolved exactly — 2026-08-09, `70760bc09`
 
-Every coefficient is one kernel's duration divided by 2048, times the number of
-layers that run it. 64 layers = 16 full-attention + 48 linear.
+Every kernel in the `nsys` c=16 capture is assigned to prefill or decode by
+whether its start falls inside one of the seven decode windows, so the ledger
+below is a **partition of the window, not a fit**. Nothing is unattributed.
 
-| term | layers | µs/token | share of model |
-|---|---:|---:|---:|
-| `gate_up` | 64 | 82.7 | **32.8%** |
-| `down_proj` | 64 | 44.0 | 17.5% |
-| FA3 | 16 | 39.3 | 15.6% |
-| linear-attn `in_proj` | 48 | 29.4 | 11.7% |
-| `fq_fwd` (FlashQLA) | 48 | 18.1 | 7.2% |
-| attention `out_proj` | 64 | 15.7 | 6.2% |
-| `qkv` | 16 | 8.7 | 3.5% |
-| `silu_mul` | 64 | 6.5 | 2.6% |
-| `conv1d` | 48 | 6.5 | 2.6% |
-| `paged_hd256` | 16 | 0.9 | 0.3% |
-| | | **251.9** | 100% |
+| | |
+|---|---|
+| wall | 29,642 ms |
+| GPU busy | 28,676 ms (idle 966 ms, 3.3%) |
+| kernel time | 28,601 ms = **28,168 prefill + 433 decode** |
+| prefill tokens | **90,208** in 44 chunks of 2048, launched as 55 segments |
+| decode tokens | **349** in 6 passes |
+| `c_prefill` | **312.3 µs/token** |
 
-FA3 is entered at its p50, 5031 µs; it is the one term that varies strongly with
-`L` (1.18–10.92 ms observed), so this row is a point estimate, not a coefficient.
+The chunk structure is read off `silu_mul`, whose grid is `(68, tokens)` with
+`68 x 256 = 17408 = intermediate_size`, cross-checked against `split_qkv` and
+`paged_hd256`, whose `gridY` sums are identical to within 0.01%. A chunk of 2048
+tokens spanning two sequences is issued as two segments, which is why 44 chunks
+produce 55 prefill segments and `977 = 16 x (55 + 6)` full-attention launches.
 
-### Closure — the model's acceptance test
+**This replaces two earlier counts, both wrong.** §1.3 said 176 chunks, inferred
+from duration clusters; a later note said 33, which was a GEMM launch count read
+as a `silu_mul` count. The three-way cross-check above settles it at 44.
 
-```
-predicted   90,208 tokens x 251.9 us  =  22.72 s
-measured    kernel time in the window  =  28.60 s
-closure                                   79%
-```
+### `c_prefill` — the exact per-token ledger
 
-**The model accounts for 79% of the window and the missing 5.9 s is not
-attributed.** Known candidates, none yet measured into the ledger:
-`pack_quantize` (5.8% of kernel time, and it appears four times per layer in the
-sequence), norms, `split2`, the prefix sidecar's D2H, and FA3 launches beyond the
-528 the full-chunk count predicts against 977 observed.
+Prefill kernel time divided by 90,208 tokens. `n` is launches; a GEMM's `K` is
+read from the `pack_quantize` that feeds it and its `N` from the consumer's grid.
 
-Closure is the test every future measurement must improve. A change that raises
-a coefficient's accuracy but lowers closure has found a second effect, not a
-better number.
+| term | n | ms | µs/token | share |
+|---|---:|---:|---:|---:|
+| `gate_up` (K 5120 → N 34816) | 3523 | 7562.6 | 83.8 | **26.9%** |
+| FA3 | 881 | 4646.4 | 51.5 | **16.5%** |
+| `down_proj` (K 17408 → N 5120) | 2819 | 3807.0 | 42.2 | 13.5% |
+| linear-attn `in_proj` (K 5120 → N 16384) | 2115 | 2583.5 | 28.6 | 9.2% |
+| **`pack_quantize`** | 14095 | 2205.2 | 24.4 | **7.8%** |
+| `fq_fwd` (FlashQLA) | 2643 | 1617.6 | 17.9 | 5.7% |
+| `out_proj` (K 6144 → N 5120) | 2820 | 1361.9 | 15.1 | 4.8% |
+| `qkv` (K 5120 → N 14336) | 881 | 800.5 | 8.9 | 2.8% |
+| `conv1d` | 2931 | 587.5 | 6.5 | 2.1% |
+| `silu_mul` | 3523 | 586.1 | 6.5 | 2.1% |
+| `split2` | 5286 | 357.7 | 4.0 | 1.3% |
+| `fq_kkt` | 2643 | 279.7 | 3.1 | 1.0% |
+| `rms_norm_gated` | 2643 | 257.3 | 2.9 | 0.9% |
+| `gdr_fq_prep` | 2643 | 207.3 | 2.3 | 0.7% |
+| remainder (small GEMM variants, `nvjet`, norms, adds, paged gate) | — | 1308.1 | 14.5 | 4.6% |
+| | | **28,168.4** | **312.3** | 100% |
+
+The earlier version of this table was a 251.9 µs/token point estimate that closed
+only 79% of the window. It is superseded: the residual was not one missing effect
+but the small-`M` GEMM variants, the elementwise tail, and a `pack_quantize`
+count that was low by 40%.
 
 ### The floor layer — what the cost *must* be
 
-A share tells you how big a term is. It does not tell you whether the term can
-be made smaller, and ranking by share alone is how this document repeatedly
-picked work with no headroom in it. Each coefficient therefore needs a floor:
-the same work against whichever hardware limit binds it.
+A share says how big a term is. It does not say whether the term can be made
+smaller, and ranking by share alone is how this document repeatedly picked work
+with no headroom in it. Each term therefore carries a floor: the same work
+against whichever hardware limit binds it.
 
-| term | floor µs/token | measured | at peak | headroom |
+**Arithmetic.** GEMM floors are `2·K·N·layers / 296 TFLOPS` per token — config
+dimensions and the FP8 peak, no fitting.
+
+| term | floor µs/tok | measured | of FP8 peak | headroom |
 |---|---:|---:|---:|---:|
-| `gate_up` | 77.1 | 82.7 | **93.2%** | 5.6 µs |
-| `down_proj` | 38.5 | 44.0 | 87.6% | 5.5 µs |
-| attention `out_proj` | 13.6 | 15.7 | 86.6% | 2.1 µs |
-| FA3 | see below | 39.3 | not resolved | unknown |
-| `in_proj`, `qkv` | N not resolved from the trace | 38.1 | — | unknown |
+| `in_proj` | 27.2 | 28.6 | **95.1%** | 1.4 |
+| `gate_up` | 77.1 | 83.8 | **92.0%** | 6.7 |
+| `qkv` | 7.9 | 8.9 | 88.8% | 1.0 |
+| `down_proj` | 38.5 | 44.6 | 86.3% | 6.1 |
+| `out_proj` | 13.6 | 15.8 | 86.1% | 2.2 |
+| | **164.3** | **181.7** | | **17.4 = 1570 ms** |
 
-GEMM floors are `2·K·N / 296 TFLOPS` per token, times the layers that run it —
-no fitting, only the config's dimensions and the FP8 peak from the constants
-table.
+**Attention.** FA3's cost is dead linear in KV depth, which resolves the
+denominator the persistent grid hides. Sorting the 977 launches by their segment
+length gives a clean ladder: at `Q = 2048` each additional 2048 tokens of KV
+depth costs **732 µs**, over nine consecutive rungs, ±0.8%.
 
-**`gate_up` + `down_proj` are 50.3% of the model with 11.1 µs/token of total
-headroom — 4.4% of `c_prefill`.** That is the whole prize for making the largest
-half of prefill faster, and it is why §1.3 closes the lever.
+```
+FLOP per rung  =  4 x 2048 x 2048 x 24 heads x 256 head_dim  =  1.031e11
+                  / 732 us  =  140.8 TFLOPS  =  95.1% of the 148 bf16 peak
+```
 
-**FA3's floor inverts into a question about the workload, not the kernel.** At
-`4·L·24·256` FLOP per token per layer against the 148 TFLOPS bf16 peak, the
-measured 2.456 µs/token/layer *is* the floor exactly when the mean KV depth is
-**14.8K**. So either FA3 is already at bf16 peak, or the mean depth is lower and
-there is headroom proportional to the shortfall. The trace cannot say which,
-because the persistent grid hides the sequence lengths — the same missing
-denominator as §1.3's open item. **This single unknown decides whether prefill
-has any kernel headroom left at all**, and it is the highest-value measurement
-in the document.
+Mean effective KV depth over the prefill segments is **18.0K**, and per-launch
+depths run 5.9K–30.5K, consistent with a 32K anchor. **FA3 has 227 ms of
+headroom and the open item is closed** — the previous version of this section
+called this "the highest-value measurement in the document" and offered 14.8K as
+the break-even depth; the measured depth is above it, so the kernel is at peak.
+
+**Consequence: prefill arithmetic is finished.** Every GEMM is at 86–95% of FP8
+peak and attention is at 95% of bf16 peak. Together they are 74.6% of prefill
+time with **1797 ms of headroom, 6.1% of wall**. Nothing in this document should
+propose a faster matrix kernel again.
+
+### The tail — the same trace, scored against bandwidth
+
+The kernels that are not GEMM and not attention are 23.3% of prefill time. None
+of them is model work; they quantize, split, normalize, convolve, and add. All
+are bandwidth-bound, so the floor is `bytes / 3.5 TB/s`.
+
+| kernel | ms | GB moved | TB/s | of HBM | floor ms |
+|---|---:|---:|---:|---:|---:|
+| **`pack_quantize`** | **2216** | 593 | 0.27 | **7.6%** | 170 |
+| `silu_mul` | 589 | 605 | 1.03 | 29.4% | 173 |
+| `conv1d` | 590 | 222 | 0.38 | 10.7% | 63 |
+| `split2` | 360 | 289 | 0.80 | 23.0% | 83 |
+| `rms_norm_gated` | 259 | 160 | 0.62 | 17.7% | 46 |
+| `gdr_fq_prep` | 207 | 107 | 0.51 | 14.7% | 30 |
+| `add_native` | 117 | 46 | 0.39 | 11.3% | 13 |
+| `split_qkv` | 101 | 83 | 0.83 | 23.6% | 24 |
+| `rms_norm_batched` | 105 | 6 | 0.06 | 1.6% | 2 |
+| | **4544** | 2111 | | | **603** |
+
+**3940 ms of headroom — 13.3% of wall, and 2.2× the entire arithmetic
+headroom.** Byte counts are derived from grid dimensions and the obvious
+read/write pattern; `conv1d` and `split2` carry the largest modelling error, and
+even doubling every estimate leaves ~3.3 s.
+
+**One mechanism explains the whole column.** `pack_quantize` at
+`dsv4_deepgemm_ops.cu:89` is representative: one 128-thread block per 128-element
+quantization block, **one `uint16_t` per thread**, a shared-memory block reduction
+for `amax`, then a second pass that re-reads the same input to scale it. That is
+2-byte accesses where H20 needs ≥8, a `__syncthreads` per 128 elements, and
+double the necessary traffic. The whole tail was written the same way.
+
+The fix is mechanical and identical everywhere: one warp per quantization block,
+`float4`-width loads, values kept in registers so the second read disappears, and
+`__shfl_xor` in place of shared memory. The upper bound on the tail is fusion
+into the producing kernel's epilogue, which removes it entirely.
 
 ### The gap layer — four buckets, four distinct remedies
 
@@ -195,41 +253,40 @@ anyone learning which bucket paid — which is indistinguishable from guessing.
 
 ### The buckets, measured on the anchor window
 
-Window 29.64 s wall, 28.60 s kernel.
-
 | bucket | measured | share of wall | how it was obtained |
 |---|---:|---:|---|
-| **inflation — `pack_quantize`** | **1653 ms** | **5.6%** | 8463 launches; 439 GB of HBM traffic at **7.6% of 3.5 TB/s** |
-| floor gap — MLP GEMM | 1001 ms | 3.4% | 11.1 µs/token of headroom × 90,208 tokens |
-| idle | 966 ms | 3.3% | GPU busy 28676 ms of 29642 ms |
-| stall | not measured | — | needs `ncu` warp-stall reasons; sits inside the 21% closure residual |
+| **tail — inflation + stall, not yet split** | **3940 ms** | **13.3%** | 2111 GB at 0.06–1.03 TB/s against 3.5 |
+| floor gap — all GEMM | 1570 ms | 5.3% | 17.4 µs/token × 90,208 |
+| idle | 966 ms | 3.3% | GPU busy 28,676 of 29,642 ms |
+| floor gap — FA3 | 227 ms | 0.8% | 4.9% short of the 148 TFLOPS bf16 peak |
+| `fq_fwd` (FlashQLA) | 1618 ms | 5.5% | **unscored** — no floor derived yet |
+| | **6703 ms** | **22.6%** | excluding `fq_fwd` |
 
-**The largest identified bucket is data preparation, not arithmetic.**
-`pack_quantize` converts bf16 activations to FP8 blocks to feed the GEMM — no
-part of it is model work. It costs 5.6% of wall, and its 439 GB round trip runs
-at 7.6% of achievable bandwidth, so **1528 ms of it is headroom even before
-asking whether the kernel should exist**. Fused into the producing kernel's
-epilogue, the whole 1653 ms goes.
+**The tail's gap is not cleanly one bucket.** Scalar access both adds traffic
+(inflation: the input is read twice) and starves the memory pipeline (stall: 2
+bytes per thread cannot keep enough in flight). Splitting it needs `ncu` warp
+stall reasons. The remedy is the same either way, which is why the work is
+actionable before the split — but the split is what tells us how much of the
+3940 ms actually returns.
 
-Compare: making the largest half of prefill arithmetic faster is worth 1001 ms,
-and it is 93% of the way to the FP8 peak already.
-
-**Total identified headroom is ~3.6 s of 29.6 s — 12%.** Winning every bucket
-leaves the workload where reducing `P` and `L` is the only remaining lever. That
-number is the honest ceiling on kernel work for this workload, and it is the
-model's most useful output.
+**Total identified headroom is 6.7 s of 29.6 s — 22.6%**, and 59% of it is in
+kernels that do no model arithmetic at all. After that, only reducing `P` and `L`
+remains.
 
 ### What this model is for, and what it forbids
 
-It ranks work by `share x achievable improvement`, both of which it makes
-explicit. Two consequences already follow:
+It ranks work by `share x achievable improvement`, both of which it now makes
+explicit. Three consequences follow:
 
-- **`gate_up` + `down_proj` are 50.3% of the model and run at 93% / 88% of FP8
-  peak (§1.3).** Half the prefill cost is at the hardware floor. On this workload
-  the dominant term cannot be made faster — only `P` can be made smaller.
-- **A decode-side lever is multiplied by `N_tick`, which the anchor makes tiny.**
-  This is why the slot-batched draft attention is −10.4% on a decode-shaped
-  workload and a null here; the model predicted it before the A/B ran.
+- **Prefill arithmetic is at the hardware floor.** GEMM 86–95% of FP8 peak, FA3
+  95% of bf16 peak, 74.6% of prefill time, 6.1% of wall in headroom. Only `P` can
+  make it smaller.
+- **The largest single lever is `pack_quantize`**, which is pure data
+  preparation, runs at 7.6% of HBM bandwidth, and is 7.8% of prefill time.
+- **A decode-side lever is multiplied by `N_tick`, which the anchor makes tiny** —
+  433 ms of 28,601. This is why the slot-batched draft attention is −10.4% on a
+  decode-shaped workload and a null here; the model predicted it before the A/B
+  ran.
 
 It also forbids the error this document made three times in two days: a
 coefficient measured at one `(c, L, chunk)` cannot be read at another. Every row
@@ -677,7 +734,7 @@ kernel grids rather than the bench CSV.
 | `gate_up` | **33.9%** | 275.9 | **93.2%** |
 | `down_proj` | 24.2% | 259.1 | 87.5% |
 | attention `out_proj` | 8.7% | 255.8 | 86.4% |
-| linear-attn `in_proj` | 21.6% | — | N not resolved from the trace |
+| linear-attn `in_proj` | 21.6% | 273.5 | 92.4% (N 16384, from `split2`'s grid) |
 
 MLP alone (`gate_up` + `down_proj`) is **69.7% of the FP8 GEMM time and ~40% of
 all GPU kernel time** on the anchor.
@@ -696,14 +753,20 @@ full-attn layer (×16) qkv 1117.0 -> paged_hd256 109.5 -> FA3 7231.7
 per full-attention layer per chunk. 977 launches, p50 **5.03 ms**, spanning
 1.18 → 10.92 ms as the chunk's context depth grows.
 
-**Its efficiency is not scorable from this trace, and it is not claimed here.**
-The grid is (78, 1, 1) — persistent, one block per SM — so the sequence lengths
-are not in the trace, and attention FLOPs depend entirely on them. Two
-independent counts of the same window also disagree on how many chunks it
-contains: `silu_mul` gives 2115 / 64 layers = **33.0**, FA3 gives 977 / 16
-full-attn layers = **61.1**. Until that is reconciled, any TFLOPS figure for
-FA3 would be built on a denominator I cannot defend. Next measurement: NVTX
-ranges or `ncu` on the prefill FA3 launches.
+**Scored 2026-08-09: 140.8 TFLOPS, 95.1% of the bf16 peak.** The grid is
+(78, 1, 1) — persistent, one block per SM — so sequence lengths are absent from
+the trace and the denominator had to come from elsewhere. Joining each launch to
+the `split_qkv` that precedes it gives its `Q`; sorting the `Q = 2048` launches
+by duration gives a ladder whose step is **732 µs per 2048 tokens of KV depth**,
+constant to ±0.8% over nine rungs. That step is one clean rectangle of attention
+work, `4 × 2048 × 2048 × 24 × 256 = 1.031e11` FLOP, so the rate follows without
+knowing any absolute depth. Mean effective depth is **18.0K**, per-launch range
+5.9K–30.5K.
+
+The apparent chunk-count disagreement — `silu_mul` 2115/64 = **33**, FA3 977/16 =
+**61** — was two different quantities. 33 is full 2048-token chunks; 61 is
+*segments*, because a chunk spanning two requests is issued as two launches:
+33 + 8 + 8 + 3 + 3 prefill + 6 decode = 61, and 44 chunks in total.
 
 **This kills the largest open item.** §1.1 records `gate_up` / `down` at 199 /
 189 TFLOPS, "64–67% — leave alone", and that number was measured at **33K cold,
@@ -1251,20 +1314,31 @@ queueing ramp.
    cannot be made faster, only smaller.** Levers are prefix-cache hit rate,
    sparsity, and effective context length — not kernels.
 
-6. **Prefill FA3 — 16.6%, the second-largest line, identified but unscored.**
-   `device_kernel` is `cutlass::device_kernel<flash::FlashAttnFwdSm90<…>>`, one
-   launch per full-attention layer per chunk, 977 launches, p50 5.03 ms over a
-   1.18–10.92 ms range (§1.3). **Efficiency is not derivable from the trace** —
-   the persistent (78, 1, 1) grid hides the sequence lengths, and two counts of
-   the same window disagree on chunk count (33.0 from `silu_mul`, 61.1 from
-   FA3). Reconcile that first, then score it with NVTX or `ncu`. This is the
-   next prefill measurement, and the largest one still open.
-6. **Sampling costs 30–40% of decode throughput at c ≥ 8** (§2.4) — measured on
+6. **Prefill FA3 is CLOSED — 140.8 TFLOPS, 95.1% of the bf16 peak (2026-08-09).**
+   The persistent (78, 1, 1) grid hides sequence lengths, so the rate came from
+   the *slope* instead: 732 µs per 2048×2048 block of attention work, constant to
+   ±0.8% over nine rungs (§1.3). Mean effective KV depth 18.0K. 227 ms of
+   headroom in 4646 ms. **With this and item 5, prefill arithmetic has 1797 ms of
+   headroom total — 6.1% of wall — and no kernel lever remains in it.**
+
+7. **The elementwise tail is the largest open lever — 4544 ms at 0.06–1.03 TB/s
+   against 3.5, headroom 3940 ms = 13.3% of wall.** `pack_quantize` alone is 2216
+   ms at **7.6% of HBM bandwidth**. One mechanism explains the column: scalar
+   2-byte accesses, one element per thread, a `__syncthreads` block reduction per
+   128 elements, and the input read twice
+   (`csrc/gemm/dsv4_deepgemm_ops.cu:89`). Fix is vectorized loads + warp-level
+   reduction; upper bound is fusion into the producer's epilogue. This is now the
+   #1 item in the document.
+
+8. **`fq_fwd` (FlashQLA) — 1618 ms, 5.7% of prefill, no floor derived.** The only
+   large prefill term with no roofline attached to it.
+
+9. **Sampling costs 30–40% of decode throughput at c ≥ 8** (§2.4) — measured on
    the anchor, so its size needs re-measuring on §2.0's shape. The gate at
    `executor/qwen35.rs:1984` tests *all* rows greedy. Do **not** re-open
    "acceptance collapses with concurrency": withdrawn (`baselines.md:137`), and
    both 08-08 captures measured `accept_rate` ≈ 0.475.
-7. **Sidecar write policy** — restore hit rate still unmeasured.
+10. **Sidecar write policy** — restore hit rate still unmeasured.
 
 ## Measurement debt
 
@@ -1273,7 +1347,8 @@ Facts this chain rests on that have not been measured:
 | item | why it matters |
 |---|---|
 | **a decode-shaped workload** | the anchor is 279:1 prompt:output and all decode is ~1% of its GPU time; every decode number in this document is ranked off it |
-| prefill FA3 and `pack_quantize` + norms | 16.3% and 12.3% of GPU time in the 08-08 c=16 window, neither decomposed |
+| **warp stall reasons** | the tail's 3940 ms gap is inflation and stall jointly; `ncu` is what splits them, and the split says how much of it returns |
+| `fq_fwd` (FlashQLA) floor | 1618 ms, 5.7% of prefill, the only large term with no roofline |
 | prefix sidecar restore hit rate | decides whether 9.4% of wall is earned |
 | acceptance rate under temperature | `accept_rate` is 0.31 at temp 0 on the anchor (2026-08-06); the sampled arm has no matching figure |
 | whole-slot park cost | `a546ba80a` shipped unmeasured; both routes default-off |
