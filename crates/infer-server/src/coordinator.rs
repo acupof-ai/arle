@@ -34,7 +34,7 @@ use crate::sse_util::{
     ChatDelta, StreamPipeline, chat_stream_chunk, completion_stream_chunk, finish_reason,
     stream_error_chunk, stream_usage_chunk, unix_time_secs,
 };
-use crate::tokenizer::OpenAiTokenizer;
+use crate::tokenizer::{IncrementalDetokenizer, OpenAiTokenizer};
 
 /// Idle park on the submit channel; matches the in-process engine loop.
 const IDLE_PARK: Duration = Duration::from_millis(2);
@@ -751,6 +751,7 @@ async fn completions(
             // `guard` dropped when this task exits, decrementing in_flight + unregistering sink.
             let _guard = guard;
             let mut completion_count = 0usize;
+            let mut detok = IncrementalDetokenizer::default();
             // Keep-alive pings while generation runs (long prefills emit no tokens),
             // which also surfaces a client disconnect before the first token.
             let mut keepalive = keepalive_ticker().await;
@@ -771,7 +772,7 @@ async fn completions(
                             .tokenizer
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        tok.decode(&delta.token_ids).unwrap_or_default()
+                        detok.push(&tok, &delta.token_ids)
                     };
                     let chunk = serde_json::to_string(&completion_stream_chunk(
                         &id, created, &model, text, None, None,
@@ -787,14 +788,17 @@ async fn completions(
                 }
                 if delta.finish {
                     let fr = finish_reason(delta.finish_reason.as_ref());
-                    let final_chunk = completion_stream_chunk(
-                        &id,
-                        created,
-                        &model,
-                        String::new(),
-                        Some(fr),
-                        None,
-                    );
+                    // Bytes still held for an unfinished codepoint: the stream is
+                    // over, so they will never complete.
+                    let tail = {
+                        let tok = state_clone
+                            .tokenizer
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        detok.flush(&tok)
+                    };
+                    let final_chunk =
+                        completion_stream_chunk(&id, created, &model, tail, Some(fr), None);
                     let usage_chunk = include_usage.then(|| {
                         let usage = serde_json::to_value(Usage::new(prompt_len, completion_count))
                             .unwrap_or_default();
@@ -1094,6 +1098,7 @@ async fn chat_completions(
             // Keep-alive pings while generation runs (long prefills emit no tokens),
             // which also surfaces a client disconnect before the first token.
             let mut keepalive = keepalive_ticker().await;
+            let mut detok = IncrementalDetokenizer::default();
             'stream: while let Some(delta) =
                 recv_or_keepalive(&mut rx, &mut keepalive, &chunk_tx).await
             {
@@ -1113,7 +1118,7 @@ async fn chat_completions(
                             .tokenizer
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        tok.decode(&delta.token_ids).unwrap_or_default()
+                        detok.push(&tok, &delta.token_ids)
                     };
                     let (pieces, calls) = pipeline.push(&text);
                     completed_calls.extend(calls);
@@ -1136,8 +1141,24 @@ async fn chat_completions(
                     }
                 }
                 if delta.finish {
+                    // Bytes held for an unfinished codepoint go through the pipeline
+                    // before it closes — the stream is over, they never complete.
+                    let tail = {
+                        let tok = state_clone
+                            .tokenizer
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        detok.flush(&tok)
+                    };
+                    let mut pieces = Vec::new();
+                    if !tail.is_empty() {
+                        let (tail_pieces, calls) = pipeline.push(&tail);
+                        pieces.extend(tail_pieces);
+                        completed_calls.extend(calls);
+                    }
                     // Flush the pipeline: truncated thinking + buffered tool tail.
-                    let (pieces, calls) = pipeline.finish();
+                    let (finish_pieces, calls) = pipeline.finish();
+                    pieces.extend(finish_pieces);
                     completed_calls.extend(calls);
                     for piece in pieces {
                         let chunk = serde_json::to_string(&chat_stream_chunk(
@@ -1460,6 +1481,7 @@ async fn anthropic_messages(
             let mut output_tokens = 0usize;
             let mut gen_ids: Vec<u32> = Vec::new();
             let mut gen_lps: Vec<f32> = Vec::new();
+            let mut detok = IncrementalDetokenizer::default();
             // Keep-alive pings while generation runs (long prefills).
             let mut ping = tokio::time::interval(Duration::from_secs(5));
             ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1490,13 +1512,27 @@ async fn anthropic_messages(
                                     .tokenizer
                                     .lock()
                                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                                tok.decode(&delta.token_ids).unwrap_or_default()
+                                detok.push(&tok, &delta.token_ids)
                             };
                             let (pieces, calls) = pipeline.push(&text);
                             saw_tool_use |=
                                 push_anthropic_events(&mut events, &mut encoder, pieces, &calls);
                         }
                         if delta.finish {
+                            // Bytes held for an unfinished codepoint: the stream is
+                            // over, so they never complete.
+                            let tail = {
+                                let tok = state_clone
+                                    .tokenizer
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                detok.flush(&tok)
+                            };
+                            if !tail.is_empty() {
+                                let (pieces, calls) = pipeline.push(&tail);
+                                saw_tool_use |=
+                                    push_anthropic_events(&mut events, &mut encoder, pieces, &calls);
+                            }
                             if let Some((path, prompt)) = sidecar.take() {
                                 write_tokens_sidecar(
                                     &path,
