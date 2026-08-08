@@ -4208,6 +4208,28 @@ impl Qwen35Model {
             if let Some(t) = taps.as_deref_mut() {
                 t.capture(&self.ctx, layer_idx as i64, hidden)?;
             }
+            // Residual-stream fingerprint per layer (`ARLE_PROBE_STAGES`), so a
+            // cross-runtime disagreement can be bisected to the first layer that
+            // diverges. The `pos` label is `start_pos + row`, which is the true
+            // position only for a single-row launch — enough for the one-request
+            // diagnostic this exists for, wrong for a batched paged step.
+            #[cfg(feature = "cuda")]
+            {
+                let width = hidden.hidden_dim;
+                for r in 0..hidden.seq_len {
+                    let pos = (start_pos + r) as u64;
+                    if crate::probe::stage_want(pos) {
+                        crate::probe::stage_bf16(
+                            &self.ctx,
+                            "resid",
+                            layer_idx,
+                            r,
+                            pos,
+                            hidden.data.slice(r * width..(r + 1) * width),
+                        );
+                    }
+                }
+            }
         }
 
         Ok(())
