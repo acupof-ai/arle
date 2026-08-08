@@ -60,20 +60,44 @@ still emitted, so a stream cannot stall holding them.
 
 **Bench gate:** correctness fix in `crates/infer-server/src/`, throughput-neutral
 by construction (one extra decode of ≤4 tokens only while a codepoint is
-incomplete). Pod verification of the repro is `pending-remote`.
+incomplete).
 
-## Open — the 96-run is not this bug
+Verified on the pod at `ee6339fd7` (isolated build tree, serve on an idle GPU so
+production's binary and endpoints were untouched): the assembled streamed text
+carries **zero U+FFFD and is byte-identical to the non-streaming decode of the
+same greedy generation**. The old binary on the same class of prompt put the
+first replacement at character 236, immediately after a 4-byte emoji, with 97
+occurrences in the body.
 
-The GSM8K case is a whole-sequence decode: `split_reasoning` splits the *string*
-after one decode of all tokens, so a token-boundary split cannot produce it. In
-that response the thinking block is clean for 1666 characters and the answer
-block is 96 of 121 characters replaced, `finish_reason=stop`,
-`completion_tokens=573`. The model produced a long run of bytes that never form
-valid UTF-8. **Cause unknown** — the next step is to read the generated token ids
-for that span and check whether they are byte-fallback tokens, which would make
-it a generation defect rather than a decode one. Also noted while there:
-`completion_tokens_details.reasoning_tokens` reports 0 while 1666 characters of
-thinking were returned.
+## The 96-run is a separate defect, on the generation side
+
+Resolved at token level, and it is not a decode problem. The corrupted span is
+**48 repetitions of one ordinary token, id 151353, piece `ª½`** — bytes `aa bd`,
+both UTF-8 continuation bytes, valid only as the tail of a 4-byte codepoint
+(`f0 9f` + `aa bd` = U+1FABD). The generation contains **zero byte-fallback
+tokens** (0 of 546) and **zero tokens carrying a 4-byte lead byte**, so the
+emoji's tail was emitted 48 times and its head never was. 48 tokens × 2 orphaned
+bytes = the 96 replacements: the detokenizer is reporting faithfully, and no
+amount of incremental buffering can repair bytes whose lead never arrives.
+
+The token sequence entering the run:
+
+```
+'Ċ' '</think>' 'ĊĊ' 'Step' '-by' '-step' ' solution' ':'  then 48× 'ª½'
+```
+
+So greedy decode closes `</think>`, writes a heading, and then locks into a
+repetition loop on a partial-codepoint fragment token until it stops
+(`finish_reason=stop`, 546 tokens). Deterministic and reproducible on the same
+item; a neighbouring item re-ran clean, so it is content-specific.
+
+**Cause unknown.** This is an inference-correctness question, tracked separately
+from this entry. The decisive next probe is a reference comparison: serve the
+same checkpoint under sglang, same prompt, greedy — clean output there makes it
+ours.
+
+Also noted while in the same response: `completion_tokens_details.reasoning_tokens`
+reports 0 while 1666 characters of thinking were returned.
 
 ## Rule
 
