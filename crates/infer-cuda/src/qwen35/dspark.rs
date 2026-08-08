@@ -13,7 +13,6 @@
 
 use super::*;
 
-use crate::ops::rms_norm_batch;
 use qwen35_spec::{DsparkConfig, DsparkSps, dspark_tensor_names, dspark_verify_lens};
 
 struct DsparkLayer {
@@ -790,7 +789,7 @@ impl Qwen35Model {
         }
         let acc = scratch.feat_a.get(ctx, hidden, seq)?;
         let normed = scratch.feat_b.get(ctx, hidden, seq)?;
-        rms_norm_batch(ctx, acc, &head.hidden_norm, eps, normed)?;
+        rms_norm_offset(ctx, acc, &head.hidden_norm, eps, normed)?;
         scratch.feat_seq = seq;
         taps.disarm();
         Ok(())
@@ -953,7 +952,7 @@ impl Qwen35Model {
             let cap_li = head.cap;
             let h = scratch.hidden.get(ctx, hidden, block)?;
             let normed = scratch.normed.get(ctx, hidden, block)?;
-            rms_norm_batch(ctx, h, &layer.input_layernorm, eps, normed)?;
+            rms_norm_offset(ctx, h, &layer.input_layernorm, eps, normed)?;
 
             let q_full = scratch.q_full.get(ctx, 2 * q_dim, block)?;
             gemm_batch(ctx, &layer.q_proj, normed, q_full)?;
@@ -1056,7 +1055,7 @@ impl Qwen35Model {
                 hidden_mid,
             )?;
             let normed = scratch.normed.get(ctx, hidden, block)?;
-            rms_norm_batch(
+            rms_norm_offset(
                 ctx,
                 hidden_mid,
                 &layer.post_attention_layernorm,
@@ -1075,7 +1074,7 @@ impl Qwen35Model {
         }
 
         let final_normed = scratch.final_normed.get(ctx, hidden, block)?;
-        rms_norm_batch(
+        rms_norm_offset(
             ctx,
             scratch.hidden.get(ctx, hidden, block)?,
             &head.norm,
@@ -1334,7 +1333,7 @@ impl Qwen35Model {
             let cap_li = head.cap;
             let h = scratch.hidden.get(ctx, hidden, rows)?;
             let normed = scratch.normed.get(ctx, hidden, rows)?;
-            rms_norm_batch(ctx, h, &layer.input_layernorm, eps, normed)?;
+            rms_norm_offset(ctx, h, &layer.input_layernorm, eps, normed)?;
 
             let q_full = scratch.q_full.get(ctx, 2 * q_dim, rows)?;
             gemm_batch(ctx, &layer.q_proj, normed, q_full)?;
@@ -1439,7 +1438,7 @@ impl Qwen35Model {
                 hidden_mid,
             )?;
             let normed = scratch.normed.get(ctx, hidden, rows)?;
-            rms_norm_batch(
+            rms_norm_offset(
                 ctx,
                 hidden_mid,
                 &layer.post_attention_layernorm,
@@ -1459,7 +1458,7 @@ impl Qwen35Model {
         let layers_ms = qkv_ms + attn_ms + mlp_ms;
 
         let final_normed = scratch.final_normed.get(ctx, hidden, rows)?;
-        rms_norm_batch(
+        rms_norm_offset(
             ctx,
             scratch.hidden.get(ctx, hidden, rows)?,
             &head.norm,
