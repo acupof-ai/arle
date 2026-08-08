@@ -3112,6 +3112,25 @@ pub fn masked_writeback_step<O: Optimizer>(
     let frozen = crate::runtime_flags::writeback_frozen_prompt_kv() && prompt_len > 1;
     let gen_start = if frozen { prompt_len - 1 } else { 0 };
 
+    // Under frozen+CP the gen segment (rows gen_start..seq_len) is what gets
+    // CP-sharded, not the full sequence. Pad the gen segment to 2*cp_size and
+    // build its shard; the prompt prefix stays full-rank (off-tape, every rank
+    // runs it). Loss positions map global p -> gen-local (p - gen_start) ->
+    // gen_shard local row.
+    let gen_shard = if frozen && cp.is_enabled() {
+        let gen_len = seq_len - gen_start;
+        let gen_padded = cp.padded_seq_len(gen_len);
+        // Pad full/positions so the gen segment's tail is a multiple of 2*cp_size.
+        if gen_padded != gen_len {
+            full.resize(gen_start + gen_padded, 0);
+            positions.extend(seq_len as u32..(gen_start + gen_padded) as u32);
+            seq_len = gen_start + gen_padded;
+        }
+        Some(cp.shard(gen_padded))
+    } else {
+        None
+    };
+
     // Split the (predicting-position p, target token) pairs into the parallel
     // i32 index/target arrays the fused chunked CE consumes. `p` indexes the
     // hidden tensor's sequence rows; the targets are the hard next tokens.
@@ -3127,17 +3146,26 @@ pub fn masked_writeback_step<O: Optimizer>(
             )));
         }
     }
-    // Map each masked target to its local hidden row. `shard.local_of` handles both
-    // paths: under CP the shard is zigzag so it maps position→local row via the chunk
-    // map (and gen_start==0, frozen disabled); off-CP the shard is the whole sequence
-    // so local_of(p)==Some(p) and the `- gen_start` rebases into the frozen-prompt gen
-    // segment. Every frozen target p >= gen_start, so the subtraction can't underflow.
+    // Map each masked target to its local hidden row.
+    // - Non-frozen: full-sequence shard (or whole sequence off-CP).
+    // - Frozen off-CP: gen segment is the whole sequence rows 0..gen_len, so
+    //   local row = p - gen_start.
+    // - Frozen+CP: gen segment is CP-sharded; map (p - gen_start) through the
+    //   gen shard's local_of.
     let (position_indices, target_tokens): (Vec<i32>, Vec<i32>) = loss_targets
         .iter()
         .filter_map(|&(p, target)| {
-            shard
-                .local_of(p)
-                .map(|local| ((local - gen_start) as i32, target as i32))
+            if frozen {
+                let gen_local = p - gen_start;
+                if let Some(gs) = &gen_shard {
+                    gs.local_of(gen_local)
+                        .map(|local| (local as i32, target as i32))
+                } else {
+                    Some((gen_local as i32, target as i32))
+                }
+            } else {
+                shard.local_of(p).map(|local| (local as i32, target as i32))
+            }
         })
         .unzip();
 
@@ -3145,11 +3173,14 @@ pub fn masked_writeback_step<O: Optimizer>(
     // Offload per-layer grad-checkpoints to host RAM only past a length that needs
     // it: the H2D re-upload serializes on the host thread and starves the GPU on
     // short trajectories, but resident checkpoints OOM the allocator on long ones.
-    // Seq-adaptive gate + rationale + anchors: `writeback_offload_for_seq`.
-    let offload_checkpoints = crate::runtime_flags::writeback_offload_for_seq(seq_len);
+    // Frozen path forwards only the gen segment, so gate on gen_len, not seq_len.
+    let fwd_len = if frozen { seq_len - gen_start } else { seq_len };
+    let offload_checkpoints = crate::runtime_flags::writeback_offload_for_seq(fwd_len);
     tape.set_offload_checkpoints(offload_checkpoints);
     tape.set_enabled(true);
-    eprintln!("[masked-writeback] offload_checkpoints={offload_checkpoints} seq_len={seq_len}");
+    eprintln!(
+        "[masked-writeback] offload_checkpoints={offload_checkpoints} fwd_len={fwd_len} seq_len={seq_len}"
+    );
     let keep_extra: HashSet<TensorId> = HashSet::new();
     eprintln!(
         "[masked-writeback] seq_len={seq_len} total_targets={total_targets} \
@@ -3163,18 +3194,48 @@ pub fn masked_writeback_step<O: Optimizer>(
     let t_fwd = Instant::now();
     let hidden = if frozen {
         let seg = GenSegment::split(&full, prompt_len);
-        student
-            .forward_hidden_states_gen_segment(
-                store,
-                &mut tape,
-                &seg.prompt_prefix,
-                &seg.gen_ids,
-                &seg.prompt_positions,
-                &seg.gen_positions,
-            )
-            .map_err(|err| {
-                map_qwen35_forward_error("masked writeback frozen-prompt-KV student hidden", err)
-            })?
+        if cp.is_enabled() {
+            // Frozen+CP: shard the gen segment's ids/positions; prompt prefix is
+            // full-rank (off-tape). gen_shard.local_rows() gives the gen-local
+            // rows this rank owns.
+            let gs = gen_shard.as_ref().unwrap();
+            let gen_rows = gs.local_rows();
+            let shard_gen_ids: Vec<u32> = gen_rows.iter().map(|&r| seg.gen_ids[r]).collect();
+            let shard_gen_pos: Vec<u32> = gen_rows.iter().map(|&r| seg.gen_positions[r]).collect();
+            student
+                .forward_hidden_states_gen_segment(
+                    store,
+                    &mut tape,
+                    &seg.prompt_prefix,
+                    &shard_gen_ids,
+                    &seg.prompt_positions,
+                    &shard_gen_pos,
+                    cp,
+                )
+                .map_err(|err| {
+                    map_qwen35_forward_error(
+                        "masked writeback frozen-prompt-KV CP student hidden",
+                        err,
+                    )
+                })?
+        } else {
+            student
+                .forward_hidden_states_gen_segment(
+                    store,
+                    &mut tape,
+                    &seg.prompt_prefix,
+                    &seg.gen_ids,
+                    &seg.prompt_positions,
+                    &seg.gen_positions,
+                    cp,
+                )
+                .map_err(|err| {
+                    map_qwen35_forward_error(
+                        "masked writeback frozen-prompt-KV student hidden",
+                        err,
+                    )
+                })?
+        }
     } else if cp.is_enabled() {
         // CP: embed only this rank's zigzag shard rows; attention gathers the full
         // KV. positions carry ABSOLUTE ids so RoPE cos/sin match the gathered prefix.
@@ -3408,7 +3469,8 @@ pub fn capture_rollout_logprobs(
     // the forward retains no device activations across layers (resident
     // checkpoints spiked 50.7→97.4 GB and OOMed at seq≈15K; offload is
     // numerically transparent, see `checkpoint_offload_is_transparent`).
-    tape.set_offload_checkpoints(crate::runtime_flags::writeback_offload_for_seq(seq_len));
+    let fwd_len = if frozen { seq_len - gen_start } else { seq_len };
+    tape.set_offload_checkpoints(crate::runtime_flags::writeback_offload_for_seq(fwd_len));
     let hidden = if frozen {
         let seg = GenSegment::split(&full, prompt_len);
         student
@@ -3419,6 +3481,7 @@ pub fn capture_rollout_logprobs(
                 &seg.gen_ids,
                 &seg.prompt_positions,
                 &seg.gen_positions,
+                crate::context_parallel::CpContext::single(),
             )
             .map_err(|err| {
                 map_qwen35_forward_error("rollout-logprob frozen-prompt-KV student hidden", err)
@@ -3603,6 +3666,7 @@ impl ValueCritic {
                     &seg.gen_ids,
                     &seg.prompt_positions,
                     &seg.gen_positions,
+                    crate::context_parallel::CpContext::single(),
                 )
                 .map_err(|err| {
                     map_qwen35_forward_error("value-critic frozen-prompt-KV student hidden", err)
