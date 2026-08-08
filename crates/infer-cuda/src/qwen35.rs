@@ -4097,6 +4097,11 @@ impl Qwen35Model {
                 seq_len,
                 || rms_norm_offset(&self.ctx, hidden, &layer.input_layernorm, eps, normed),
             )?;
+            #[cfg(feature = "cuda")]
+            {
+                stage_row("attn_in", layer_idx, normed);
+                crate::probe::parity_inject(&self.ctx, "attn_in", layer_idx, normed);
+            }
 
             match &layer.attn {
                 Qwen35Attn::Full(full_attn) => {
@@ -4176,6 +4181,8 @@ impl Qwen35Model {
             {
                 stage_row("attn_out", layer_idx, attn_out);
                 stage_row("resid_mid", layer_idx, hidden_mid);
+                stage_row("mlp_in", layer_idx, normed);
+                crate::probe::parity_inject(&self.ctx, "mlp_in", layer_idx, normed);
             }
             let mlp_in: &HiddenStates = normed;
             if let Some(moe_weights) = &layer.moe {

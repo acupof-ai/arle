@@ -476,3 +476,93 @@ mod tests {
         assert!(lens_stats(&logits, 99).is_none());
     }
 }
+
+// ── Component parity injection (`ARLE_PARITY_*`, diagnostic-only) ────────────
+// Overwrite one forward buffer with a reference tensor so a single component can
+// be compared on an EXACTLY shared input. Comparing accumulated states cannot
+// localize a cross-runtime divergence below bf16 granularity (the residual
+// stream is bf16 on device, so every layer's own rounding is the floor); an
+// injected input removes the accumulation instead of trying to measure past it.
+//
+// `ARLE_PARITY_INJECT` = path to raw little-endian f32, row-major
+// `[seq_len, hidden_dim]`, exactly matching the target buffer.
+// `ARLE_PARITY_POINT`  = `attn_in` (post input_layernorm) or `mlp_in`
+//                        (post post_attention_layernorm).
+// `ARLE_PARITY_LAYER`  = layer index.
+
+#[cfg(feature = "cuda")]
+struct ParityInject {
+    layer: usize,
+    point: String,
+    values: Vec<half::bf16>,
+}
+
+#[cfg(feature = "cuda")]
+fn parity_config() -> Option<&'static ParityInject> {
+    static CONFIG: OnceLock<Option<ParityInject>> = OnceLock::new();
+    CONFIG
+        .get_or_init(|| {
+            let path = std::env::var("ARLE_PARITY_INJECT").ok()?;
+            let point = std::env::var("ARLE_PARITY_POINT").unwrap_or_else(|_| "mlp_in".to_string());
+            let layer = std::env::var("ARLE_PARITY_LAYER")
+                .ok()
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+            let bytes = match std::fs::read(&path) {
+                Ok(bytes) => bytes,
+                Err(err) => {
+                    eprintln!("[parity] read {path} failed: {err}; injection disabled");
+                    return None;
+                }
+            };
+            if bytes.len() % 4 != 0 {
+                eprintln!("[parity] {path} is {} bytes, not f32-aligned", bytes.len());
+                return None;
+            }
+            let values: Vec<half::bf16> = bytes
+                .chunks_exact(4)
+                .map(|b| {
+                    half::bf16::from_f32(f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                })
+                .collect();
+            eprintln!(
+                "[parity] injecting {} values at {point} layer {layer} from {path}",
+                values.len()
+            );
+            Some(ParityInject {
+                layer,
+                point,
+                values,
+            })
+        })
+        .as_ref()
+}
+
+/// Replace `buf` with the injected reference tensor when this is the configured
+/// point and layer. Loud on every fire and on every mismatch — a silent
+/// injection would make a parity run look like a clean forward.
+#[cfg(feature = "cuda")]
+pub(crate) fn parity_inject(ctx: &DeviceContext, point: &str, layer: usize, buf: &mut HiddenStates) {
+    let Some(cfg) = parity_config() else { return };
+    if cfg.layer != layer || cfg.point != point {
+        return;
+    }
+    let want = buf.hidden_dim * buf.seq_len;
+    if cfg.values.len() != want {
+        eprintln!(
+            "[parity] {point} layer {layer}: have {} values, buffer wants {want} \
+             ({} x {}) — NOT injecting",
+            cfg.values.len(),
+            buf.seq_len,
+            buf.hidden_dim
+        );
+        return;
+    }
+    match ctx.stream.clone_htod(&cfg.values) {
+        Ok(data) => {
+            buf.data = data;
+            eprintln!("[parity] injected {point} layer {layer} ({want} values)");
+        }
+        Err(err) => eprintln!("[parity] {point} layer {layer} H2D failed: {err}"),
+    }
+}
