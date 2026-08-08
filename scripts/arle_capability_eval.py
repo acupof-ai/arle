@@ -551,6 +551,13 @@ def _gsm8k_gold_answer(answer: str) -> str:
     return m.group(1).replace(",", "")
 
 
+def _gsm8k_difficulty(answer: str) -> int:
+    """Arithmetic steps in the gold solution — GSM8K's own `<<expr=val>>`
+    calculator annotations. Deterministic, needs no external labels, and is the
+    difficulty axis the sampler stratifies on."""
+    return answer.count("<<")
+
+
 def _gsm8k_extract_answer(text: str) -> str | None:
     # Thinking models emit the whole chain-of-thought in a <think>...</think>
     # block, then the final answer after it. The block is full of arithmetic
@@ -597,10 +604,34 @@ def run_gsm8k(
     few_shot = "\n".join(_gsm8k_format_shot(ex) for ex in shot_examples)
     if few_shot:
         few_shot += "\n"
-    indices = list(range(len(ds_test)))
+    # Stratify on difficulty (gold-solution step count) instead of sampling the
+    # test set uniformly: same estimand as the full 1319 but a tighter one at the
+    # same n, and it makes the per-difficulty breakdown below free. Proportional,
+    # NOT equal-per-bucket — equal quotas would over-weight the rare deep items
+    # and the aggregate would stop being comparable to earlier runs.
+    want = min(max(n_samples, 0), len(ds_test))
+    by_steps: dict[int, list[int]] = {}
+    for i, ex in enumerate(ds_test):
+        by_steps.setdefault(_gsm8k_difficulty(ex["answer"]), []).append(i)
+    indices: list[int] = []
+    # Largest-remainder allocation, so the pool lands exactly on `want`.
+    quotas = {
+        steps: want * len(bucket) // len(ds_test) for steps, bucket in by_steps.items()
+    }
+    remainders = sorted(
+        by_steps,
+        key=lambda s: (-((want * len(by_steps[s])) % len(ds_test)), s),
+    )
+    for steps in remainders[: want - sum(quotas.values())]:
+        quotas[steps] += 1
+    for steps in sorted(by_steps):
+        bucket = list(by_steps[steps])
+        if seed is not None:
+            random.Random(f"gsm8k-{seed}-{steps}").shuffle(bucket)
+        indices.extend(bucket[: quotas[steps]])
     if seed is not None:
         random.Random(f"gsm8k-{seed}").shuffle(indices)
-    pool = [ds_test[i] for i in indices[: min(n_samples, len(ds_test))]]
+    pool = [ds_test[i] for i in indices]
     sample_fingerprint = _fingerprint_records([
         {
             "question": ex["question"],
@@ -650,6 +681,7 @@ def run_gsm8k(
             correct += 1
         per_question.append({
             "i": i,
+            "steps": _gsm8k_difficulty(ex["answer"]),
             "gold": gold,
             "predicted": pred,
             "correct": pred == gold if pred is not None else False,
@@ -674,6 +706,21 @@ def run_gsm8k(
     scored = len(pool) - invalid
     accuracy = correct / scored if scored else 0.0
     ci95 = _wilson_ci(correct, scored)
+    # Per-difficulty accuracy: an OPD delta shows up in the deep-step buckets
+    # first, and the aggregate hides that.
+    by_difficulty: dict[str, dict] = {}
+    for rec in per_question:
+        bucket = by_difficulty.setdefault(
+            str(rec.get("steps", -1)), {"n": 0, "scored": 0, "correct": 0}
+        )
+        bucket["n"] += 1
+        if rec["status"] == "scored":
+            bucket["scored"] += 1
+            bucket["correct"] += int(rec["correct"])
+    for bucket in by_difficulty.values():
+        bucket["accuracy"] = (
+            bucket["correct"] / bucket["scored"] if bucket["scored"] else 0.0
+        )
     report = {
         "task": "gsm8k",
         "status": "ok",
@@ -697,6 +744,8 @@ def run_gsm8k(
         "n_shots": len(shot_examples),
         "accuracy": accuracy,
         "ci95": list(ci95),
+        "sampling": "difficulty-stratified (proportional, gold-solution step count)",
+        "by_difficulty": by_difficulty,
         "elapsed_seconds": elapsed,
         "seed": seed,
     }
