@@ -64,6 +64,12 @@ python scripts/analyze_multi_seed.py \
   --task mmlu
 ```
 
+`--concurrency N` issues N requests in flight (default 1). The serve batches
+continuously, so the default leaves every slot but one idle — a 500-problem
+GSM8K seed took 80 minutes at 1-way on a 2-slot engine. **A paired comparison
+must use the same `--concurrency` on both arms**: batch composition perturbs MoE
+numerics, so a concurrency change is a config change, not a free speedup.
+
 Small MMLU deltas are noisy. The 2026-05-28 retraction stands: a capability
 claim under 5 percentage points at small `n` needs multi-seed evidence and a
 paired/McNemar or Wilson confidence interval before it can be written as a win.
