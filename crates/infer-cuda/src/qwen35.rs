@@ -4100,7 +4100,7 @@ impl Qwen35Model {
             #[cfg(feature = "cuda")]
             {
                 stage_row("attn_in", layer_idx, normed);
-                crate::probe::parity_inject(&self.ctx, "attn_in", layer_idx, normed);
+                crate::probe::parity_inject(&self.ctx, "attn_in", layer_idx, start_pos, normed);
             }
 
             match &layer.attn {
@@ -4182,7 +4182,7 @@ impl Qwen35Model {
                 stage_row("attn_out", layer_idx, attn_out);
                 stage_row("resid_mid", layer_idx, hidden_mid);
                 stage_row("mlp_in", layer_idx, normed);
-                crate::probe::parity_inject(&self.ctx, "mlp_in", layer_idx, normed);
+                crate::probe::parity_inject(&self.ctx, "mlp_in", layer_idx, start_pos, normed);
             }
             let mlp_in: &HiddenStates = normed;
             if let Some(moe_weights) = &layer.moe {
