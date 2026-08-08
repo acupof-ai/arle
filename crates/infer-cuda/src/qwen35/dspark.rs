@@ -1064,7 +1064,7 @@ impl Qwen35Model {
                 normed,
             )?;
             let mlp_out = scratch.attn_out_h.get(ctx, hidden, block)?;
-            self.dense_mlp(&layer.mlp, normed, &mut scratch.dense, mlp_out)?;
+            self.dense_mlp(&layer.mlp, normed, &mut scratch.dense, mlp_out, None)?;
             add_batch(
                 ctx,
                 scratch.hidden_mid.get(ctx, hidden, block)?,
@@ -1447,7 +1447,7 @@ impl Qwen35Model {
                 normed,
             )?;
             let mlp_out = scratch.attn_out_h.get(ctx, hidden, rows)?;
-            self.dense_mlp(&layer.mlp, normed, &mut scratch.dense, mlp_out)?;
+            self.dense_mlp(&layer.mlp, normed, &mut scratch.dense, mlp_out, None)?;
             add_batch(
                 ctx,
                 scratch.hidden_mid.get(ctx, hidden, rows)?,
