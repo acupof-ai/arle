@@ -618,3 +618,153 @@ class TestIntegrationConcurrency:
         for i, (status, resp) in results.items():
             assert status == 200, f"Request {i} failed: {resp}"
             assert len(resp["choices"][0]["text"]) > 0
+
+
+@skip_without_server
+class TestIntegrationNewFeatures:
+    """Tests for newly added API features."""
+
+    @pytest.fixture(autouse=True)
+    def server_url(self):
+        self.base_url = INFER_URL.rstrip("/")
+
+    def test_system_fingerprint_present(self):
+        _, resp = post_json(
+            f"{self.base_url}{COMPLETIONS_PATH}",
+            make_completions_request(max_tokens=5, temperature=0.0),
+        )
+        assert "system_fingerprint" in resp
+        assert isinstance(resp["system_fingerprint"], str)
+
+    def test_chat_system_fingerprint_present(self):
+        _, resp = post_json(
+            f"{self.base_url}{CHAT_PATH}",
+            make_chat_request(max_tokens=5, temperature=0.0),
+        )
+        assert "system_fingerprint" in resp
+
+    def test_choice_logprobs_is_null(self):
+        _, resp = post_json(
+            f"{self.base_url}{CHAT_PATH}",
+            make_chat_request(max_tokens=5, temperature=0.0),
+        )
+        choice = resp["choices"][0]
+        assert "logprobs" in choice
+        assert choice["logprobs"] is None
+
+    def test_completion_choice_logprobs_is_null(self):
+        _, resp = post_json(
+            f"{self.base_url}{COMPLETIONS_PATH}",
+            make_completions_request(max_tokens=5, temperature=0.0),
+        )
+        assert resp["choices"][0]["logprobs"] is None
+
+    def test_usage_has_prompt_tokens_details(self):
+        _, resp = post_json(
+            f"{self.base_url}{CHAT_PATH}",
+            make_chat_request(max_tokens=5, temperature=0.0),
+        )
+        usage = resp["usage"]
+        assert "prompt_tokens_details" in usage
+        assert "cached_tokens" in usage["prompt_tokens_details"]
+
+    def test_finish_reason_is_standard(self):
+        _, resp = post_json(
+            f"{self.base_url}{CHAT_PATH}",
+            make_chat_request(max_tokens=5, temperature=0.0),
+        )
+        fr = resp["choices"][0]["finish_reason"]
+        assert fr in ("stop", "length", "tool_calls", "content_filter")
+
+    def test_embeddings_returns_501(self):
+        status, resp = post_json(
+            f"{self.base_url}/v1/embeddings",
+            {"model": DEFAULT_MODEL, "input": "test"},
+        )
+        assert status == 501
+        assert "error" in resp
+
+    def test_unknown_route_returns_404_json(self):
+        status, resp = post_json(
+            f"{self.base_url}/v1/nonexistent",
+            {"prompt": "test"},
+        )
+        assert status == 404
+        assert "error" in resp
+
+    def test_n_returns_multiple_choices(self):
+        req = make_completions_request(
+            prompt="The number is",
+            max_tokens=5,
+            temperature=1.0,
+            seed=42,
+            n=3,
+        )
+        status, resp = post_json(f"{self.base_url}{COMPLETIONS_PATH}", req)
+        assert status == 200
+        assert len(resp["choices"]) == 3
+        for i, choice in enumerate(resp["choices"]):
+            assert choice["index"] == i
+
+    def test_logprobs_request_returns_token_logprobs(self):
+        req = make_completions_request(
+            prompt="Hello",
+            max_tokens=5,
+            temperature=0.0,
+            logprobs=1,
+        )
+        status, resp = post_json(f"{self.base_url}{COMPLETIONS_PATH}", req)
+        assert status == 200
+        logprobs = resp["choices"][0]["logprobs"]
+        if logprobs is not None:
+            assert "tokens" in logprobs
+            assert "token_logprobs" in logprobs
+
+    def test_logit_bias_accepted(self):
+        req = make_completions_request(
+            prompt="The",
+            max_tokens=3,
+            temperature=0.0,
+            logit_bias={"0": -100.0},
+        )
+        status, resp = post_json(f"{self.base_url}{COMPLETIONS_PATH}", req)
+        assert status == 200
+
+    def test_streaming_has_system_fingerprint(self):
+        req = make_completions_request(
+            prompt="Hi",
+            max_tokens=5,
+            temperature=0.0,
+            stream=True,
+        )
+        events = stream_sse(f"{self.base_url}{COMPLETIONS_PATH}", req)
+        assert len(events) > 0
+        assert "system_fingerprint" in events[0]
+
+    def test_streaming_chat_has_system_fingerprint(self):
+        req = make_chat_request(
+            max_tokens=5,
+            temperature=0.0,
+            stream=True,
+        )
+        events = stream_sse(f"{self.base_url}{CHAT_PATH}", req)
+        assert len(events) > 0
+        assert "system_fingerprint" in events[0]
+
+    def test_user_field_accepted(self):
+        req = make_chat_request(
+            max_tokens=3,
+            temperature=0.0,
+            user="test-user",
+        )
+        status, _ = post_json(f"{self.base_url}{CHAT_PATH}", req)
+        assert status == 200
+
+    def test_parallel_tool_calls_field_accepted(self):
+        req = make_chat_request(
+            max_tokens=3,
+            temperature=0.0,
+            parallel_tool_calls=True,
+        )
+        status, _ = post_json(f"{self.base_url}{CHAT_PATH}", req)
+        assert status == 200

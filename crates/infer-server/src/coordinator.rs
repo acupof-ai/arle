@@ -690,16 +690,18 @@ async fn completions(
     })?;
     request.validate()?;
     let mut sampling = request.sampling_params();
-    // Convert string `stop` sequences to token ids and merge with
-    // `stop_token_ids`. The engine only supports token-id stops, so string
-    // stops are materialized here at the API boundary.
+    // Convert string `stop` sequences to token ids. The engine only supports
+    // token-id stops, so try the string as-is and with a leading space/newline
+    // (models often emit a leading space before a word).
     if let Some(stop_strings) = &request.stop {
         for s in stop_strings {
             if s.is_empty() {
                 continue;
             }
-            let ids = encode(&state, s)?;
-            sampling.stop_token_ids.extend(ids);
+            for variant in [s.clone(), format!(" {s}"), format!("\n{s}")] {
+                let ids = encode(&state, &variant)?;
+                sampling.stop_token_ids.extend(ids);
+            }
         }
     }
     let max_tokens = sampling.max_new_tokens.unwrap_or(16);
@@ -898,14 +900,16 @@ async fn chat_completions(
     request.validate()?;
     let mut sampling = request.sampling_params();
     // Convert string `stop` sequences to token ids (engine only supports
-    // token-id stops).
+    // token-id stops). Try as-is and with leading space/newline.
     if let Some(stop_strings) = &request.stop {
         for s in stop_strings {
             if s.is_empty() {
                 continue;
             }
-            let ids = encode(&state, s)?;
-            sampling.stop_token_ids.extend(ids);
+            for variant in [s.clone(), format!(" {s}"), format!("\n{s}")] {
+                let ids = encode(&state, &variant)?;
+                sampling.stop_token_ids.extend(ids);
+            }
         }
     }
     let stream = request.stream.unwrap_or(false);
@@ -1377,14 +1381,16 @@ async fn anthropic_messages(
     let (chat_request, thinking, tools_active, prompt_tokens) = anthropic_prompt(&state, &request)?;
     let mut sampling = chat_request.sampling_params();
     // Convert string `stop` sequences to token ids (engine only supports
-    // token-id stops).
+    // token-id stops). Try as-is and with leading space/newline.
     if let Some(stop_strings) = &chat_request.stop {
         for s in stop_strings {
             if s.is_empty() {
                 continue;
             }
-            let ids = encode(&state, s)?;
-            sampling.stop_token_ids.extend(ids);
+            for variant in [s.clone(), format!(" {s}"), format!("\n{s}")] {
+                let ids = encode(&state, &variant)?;
+                sampling.stop_token_ids.extend(ids);
+            }
         }
     }
     // max_tokens is validated present; mirror the chat path's thinking clamp.
