@@ -131,6 +131,8 @@ pub(crate) fn lens_stats(logits: &[f32], target: u32) -> Option<LensStats> {
 // ── JSONL writer (rank-0 only, lazy, flush per line) ─────────────────────────
 
 static DISABLED: AtomicBool = AtomicBool::new(false);
+/// Set by the first `lens_begin`; stays false on a forward that never captures.
+static LENS_EVER_ARMED: AtomicBool = AtomicBool::new(false);
 
 fn fail(err: &dyn fmt::Display) {
     if !DISABLED.swap(true, Ordering::Relaxed) {
@@ -180,6 +182,23 @@ fn emit(line: fmt::Arguments) {
     }
 }
 
+/// Warn once when the lens is configured on a model whose forward never arms it
+/// (only the DSv4 executor calls `lens_begin`). Without this the `meta` line
+/// reports `lens_layers: N` and no lens record ever follows, which reads as
+/// "the lens found nothing".
+fn warn_lens_unwired() {
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    if lens_layers() > 0
+        && !LENS_EVER_ARMED.load(Ordering::Relaxed)
+        && !WARNED.swap(true, Ordering::Relaxed)
+    {
+        eprintln!(
+            "[probe] ARLE_PROBE_LENS_LAYERS is set but this model's forward does not \
+             capture lens layers; no lens records will be emitted"
+        );
+    }
+}
+
 /// `prefill`/`decode` record. `token`/`nll` are `None` only for the last
 /// prefill row of a chunk (the target crosses the chunk boundary).
 pub(crate) fn emit_token(
@@ -189,6 +208,7 @@ pub(crate) fn emit_token(
     nll: Option<f32>,
     entropy: f32,
 ) {
+    warn_lens_unwired();
     match (token, nll) {
         (Some(token), Some(nll)) => emit(format_args!(
             "{{\"phase\":\"{phase}\",\"pos\":{pos},\"token\":{token},\"nll\":{nll:.6},\"entropy\":{entropy:.6}}}"
@@ -230,6 +250,7 @@ thread_local! {
 pub(crate) fn lens_begin() {
     LENS_STASH.with(|stash| stash.borrow_mut().clear());
     LENS_ARMED.set(true);
+    LENS_EVER_ARMED.store(true, Ordering::Relaxed);
 }
 
 /// Stash one layer's `[vocab, rows]` device logits. NO sync, NO D2H.
