@@ -954,6 +954,12 @@ queueing ramp.
    53 gaps. Decode ticks on the anchor capture had nothing above 20 µs. Cause
    unknown. Next to it, HtoD moves 0.08 GB per tick in 0.486 ms, which is
    latency.
+5. **The trunk verify attention is per-slot too, and it is small.**
+   `prefill_attention_paged_hd256_kernel` runs grid **(4, 6, 1) = 24 blocks**,
+   126,948 launches — the same one-launch-per-slot shape as #1. It costs 1.6%
+   of the decode window here and 5.4 ms of the anchor window, so it does not
+   earn the same fix today. Recorded because the mechanism is identical and its
+   share grows with context.
 
 **Prefill** — priced on the anchor, which is what it models.
 
