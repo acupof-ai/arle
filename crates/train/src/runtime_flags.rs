@@ -55,7 +55,15 @@ pub fn apply_runtime_flags(f: &TrainRuntimeFlags) {
     WRITEBACK_OFFLOAD.store(f.writeback_offload, Relaxed);
     ENGINE_OFFLOAD.store(f.engine_offload as u8, Relaxed);
     GRADIENT_CHECKPOINTING.store(f.gradient_checkpointing, Relaxed);
-    WRITEBACK_FROZEN_PROMPT_KV.store(f.writeback_frozen_prompt_kv, Relaxed);
+    // The gen-segment forward is single-rank; CP shards the full sequence
+    // instead. Normalized here rather than at each call site — two of the three
+    // sites have no `cp` in scope, and one guarded site plus two unguarded ones
+    // is how a latent flag becomes an active bug the day it is switched on.
+    WRITEBACK_FROZEN_PROMPT_KV.store(
+        f.writeback_frozen_prompt_kv
+            && !crate::context_parallel::CpContext::from_env().is_enabled(),
+        Relaxed,
+    );
     ROLLOUT_RETAIN_INTERVAL.store(f.rollout_retain_interval.max(1), Relaxed);
     ROLLOUT_PROGRESS_INTERVAL.store(f.rollout_progress_interval.max(1), Relaxed);
     MAX_UPDATE_SEQ.store(f.max_update_seq, Relaxed);
