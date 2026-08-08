@@ -4,12 +4,26 @@
 
 ## Context
 
-The 449-task agent-OPD production run (`fulltrain11`) reported host RSS
-plateauing at ~208 GiB over its first 30 groups, then resuming a climb:
-233 → 264 → 286 → 306 GiB by group 58, ≈0.86 GiB per group per rank. Linear
-extrapolation crossed the box's memory before round 0 would finish. Every prior
-run of this lane was 16–24 groups and ended inside the apparent plateau, so the
-growth had never been visible.
+The 449-task agent-OPD production run (`fulltrain11`) looked to plateau at
+~208 GiB of summed host RSS over its first 30 groups, then resumed growing:
+233 → 259 → 287 → 306 GiB by group 58. Every prior run of this lane was 16–24
+groups and ended inside the apparent plateau, so the growth had never been
+visible.
+
+State the shape, not a rate: **hour-long flats, discrete jumps of +19 to +26 GiB
+summed across four ranks, and at least one −19 GiB drop.** That is a step
+function with reclaim, consistent with new size classes entering the pool rather
+than a per-group leak — and the reason the earlier "plateaued, risk retired"
+call and its mirror-image "will fire at group 394" projection were both wrong:
+constant-rate arithmetic on a step curve supports either conclusion.
+
+The growth is genuinely anonymous memory, not a page-cache artifact:
+`RssAnon` ≈ `VmRSS` to within 0.6 GiB on every rank (`RssFile` is 0.55 GiB,
+0.9% of the total), even though the box's page cache holds 1241 GiB of model
+file. Per-rank `RssAnon` also spans 60.7–86.5 GiB, monotonically ordered by
+pid, while the rank doing the *most* work (rank 0: harness + cc_convert +
+metrics + serve) holds the *least* — **cause unknown**; the CP zigzag gives every
+rank equal shard bytes, so shard size does not explain it.
 
 ## Root Cause
 
