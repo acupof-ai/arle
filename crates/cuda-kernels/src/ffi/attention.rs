@@ -173,6 +173,28 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    /// Slot-batched [`nonpaged_prefill_attention_ring_varlen_cuda`]: one launch
+    /// for every draft slot. `k_slots` / `v_slots` are device arrays of `slots`
+    /// ring-cache base pointers (one per slot, separately allocated), and the
+    /// window table is slot-major — `ring_base_dev` / `kv_len_dev` are each
+    /// `slots * seq_len` i32, row `s * seq_len + t`.
+    pub fn nonpaged_prefill_attention_ring_varlen_batched_cuda(
+        q: *const Half,
+        k_slots: *const *const std::ffi::c_void,
+        v_slots: *const *const std::ffi::c_void,
+        out: *mut Half,
+        num_q_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        seq_len: i32,
+        slots: i32,
+        ring_base_dev: *const i32,
+        kv_len_dev: *const i32,
+        ring_modulus: i32,
+        sm_scale: f32,
+        stream: CUstream,
+    ) -> CUresult;
+
     /// Device-position variant of [`nonpaged_prefill_attention_cuda`]:
     /// `start_pos_dev` is one device-resident i32 (kv_len = *start_pos_dev +
     /// token + 1 inside the kernel), making the launch CUDA-graph

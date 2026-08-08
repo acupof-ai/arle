@@ -20,7 +20,12 @@ __global__ void nonpaged_prefill_attention_kernel(
     int ring_modulus,     // >0: physical row = (ring_base + abs_pos) % ring_modulus
     const int *__restrict__ ring_base_dev,  // per-token ring_base (ragged windows)
     const int *__restrict__ kv_len_dev,     // per-token key count; null = causal
-    float sm_scale) {
+    float sm_scale,
+    // Slot batching: non-null promotes blockIdx.z to a slot axis, each slot
+    // keeping the separate ring cache its `Qwen35DsparkSlotState` owns. Null
+    // leaves the grid 2-D and the single `k_cache`/`v_cache` in force.
+    const __nv_bfloat16 *const *__restrict__ k_slots = nullptr,
+    const __nv_bfloat16 *const *__restrict__ v_slots = nullptr) {
   int q_head = blockIdx.x;
   int token = blockIdx.y;
   int dim = threadIdx.x;
@@ -43,6 +48,15 @@ __global__ void nonpaged_prefill_attention_kernel(
   int gqa_ratio = num_q_heads / num_kv_heads;
   int kv_head = q_head / gqa_ratio;
   int q_dim = num_q_heads * head_dim;
+  if (k_slots != nullptr) {
+    int slot = blockIdx.z;
+    k_cache = k_slots[slot];
+    v_cache = v_slots[slot];
+    q += (int64_t)slot * seq_len * q_dim;
+    out += (int64_t)slot * seq_len * q_dim;
+    ring_base_dev += slot * seq_len;
+    kv_len_dev += slot * seq_len;
+  }
   // Ragged windows: each query row carries its own [ring_base, ring_base+kv_len)
   // key range (DSpark's per-row sliding lower bound). Absent → causal.
   int kv_len = start_pos + token + 1;
@@ -281,6 +295,58 @@ extern "C" cudaError_t nonpaged_prefill_attention_ring_varlen_cuda(
       ring_base_dev,
       kv_len_dev,
       sm_scale);
+  return cudaGetLastError();
+}
+
+// Slot-batched ring-varlen: one launch over every draft slot, gridZ = slots.
+// Each slot keeps its own ring cache, so the bases arrive as a device array of
+// `slots` pointers. The window table is `[all bases][all lengths]`, each
+// `slots * seq_len` long and slot-major. Same math as the per-slot entry — the
+// per-slot loop it replaces ran 192-block grids that left the GPU 85% idle.
+extern "C" cudaError_t nonpaged_prefill_attention_ring_varlen_batched_cuda(
+    const uint16_t *q,
+    const void *const *k_slots,
+    const void *const *v_slots,
+    uint16_t *out,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    int seq_len,
+    int slots,
+    const int *ring_base_dev,
+    const int *kv_len_dev,
+    int ring_modulus,
+    float sm_scale,
+    cudaStream_t stream) {
+  if (num_q_heads <= 0 || num_kv_heads <= 0 || seq_len < 0 || slots < 0 ||
+      ring_modulus <= 0 || k_slots == nullptr || v_slots == nullptr ||
+      ring_base_dev == nullptr || kv_len_dev == nullptr ||
+      (head_dim != 128 && head_dim != 256) || num_q_heads % num_kv_heads != 0) {
+    return cudaErrorInvalidValue;
+  }
+  if (seq_len == 0 || slots == 0) {
+    return cudaSuccess;
+  }
+  dim3 grid(num_q_heads, seq_len, slots);
+  nonpaged_prefill_attention_kernel<<<grid, head_dim, 0, stream>>>(
+      reinterpret_cast<const __nv_bfloat16 *>(q),
+      /*k_cache=*/nullptr,
+      /*v_cache=*/nullptr,
+      reinterpret_cast<__nv_bfloat16 *>(out),
+      num_q_heads,
+      num_kv_heads,
+      head_dim,
+      seq_len,
+      /*start_pos=*/0,
+      /*start_pos_dev=*/nullptr,
+      /*max_seq_len=*/ring_modulus,
+      /*ring_base=*/0,
+      ring_modulus,
+      ring_base_dev,
+      kv_len_dev,
+      sm_scale,
+      reinterpret_cast<const __nv_bfloat16 *const *>(k_slots),
+      reinterpret_cast<const __nv_bfloat16 *const *>(v_slots));
   return cudaGetLastError();
 }
 

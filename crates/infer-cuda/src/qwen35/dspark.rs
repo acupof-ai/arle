@@ -346,6 +346,9 @@ pub(crate) struct DsparkScratch {
     /// Per-row draft attention windows, `[ring_base; block] ++ [kv_len; block]`
     /// — identical for every layer, so one upload serves the whole forward.
     attn_win: SliceSlot<i32>,
+    /// `[k_ctx base; slots] ++ [v_ctx base; slots]` for the current draft
+    /// layer — the slot-batched attention launch reads the rings through it.
+    attn_kv_slots: SliceSlot<u64>,
     hidden: HiddenSlot,
     normed: HiddenSlot,
     hidden_mid: HiddenSlot,
@@ -1359,10 +1362,17 @@ impl Qwen35Model {
                 let nkv = cfg.num_key_value_heads as i32;
                 let hd = cfg.head_dim as i32;
                 let sm_scale = 1.0 / (cfg.head_dim as f32).sqrt();
+                // `[k bases][v bases]`, one entry per slot: staged here so the
+                // attention below runs once at gridZ = slots instead of once
+                // per slot on a 192-block grid.
+                let mut kv_bases = vec![0u64; 2 * b];
+                let mut ring_guards = Vec::with_capacity(2 * b);
                 for (s, df) in dfs.iter_mut().enumerate() {
                     let off = (s * block) as u64;
-                    let (kc_ptr, _gk) = df.k_ctx[li].data.device_ptr_mut(&ctx.stream);
-                    let (vc_ptr, _gv) = df.v_ctx[li].data.device_ptr_mut(&ctx.stream);
+                    let (kc_ptr, gk) = df.k_ctx[li].data.device_ptr_mut(&ctx.stream);
+                    let (vc_ptr, gv) = df.v_ctx[li].data.device_ptr_mut(&ctx.stream);
+                    kv_bases[s] = kc_ptr;
+                    kv_bases[b + s] = vc_ptr;
                     // SAFETY: offset by this slot's `block` rows inside a
                     // `rows`-row buffer; ring bounds guarded above.
                     unsafe {
@@ -1389,26 +1399,32 @@ impl Qwen35Model {
                         )
                         .result()?;
                     }
-                    // SAFETY: q/out offset as above; the window table is
-                    // `rows` bases then `rows` lengths.
-                    unsafe {
-                        ffi::nonpaged_prefill_attention_ring_varlen_cuda(
-                            (qp_ptr + off * q_dim as u64 * elem) as *const ffi::Half,
-                            kc_ptr as *const ffi::Half,
-                            vc_ptr as *const ffi::Half,
-                            (ao_ptr + off * q_dim as u64 * elem) as *mut ffi::Half,
-                            nq,
-                            nkv,
-                            hd,
-                            block as i32,
-                            (w_ptr as *const i32).add(s * block),
-                            (w_ptr as *const i32).add(rows + s * block),
-                            cap_li as i32,
-                            sm_scale,
-                            ctx.stream.cu_stream(),
-                        )
-                        .result()?;
-                    }
+                    ring_guards.push(gk);
+                    ring_guards.push(gv);
+                }
+                let slots_dev = scratch.attn_kv_slots.upload(ctx, &kv_bases)?;
+                let (sl_ptr, _gs) = slots_dev.device_ptr(&ctx.stream);
+                // SAFETY: `kv_bases` holds this layer's `b` k rings then `b` v
+                // rings, each staged above; the window table is `rows` bases
+                // then `rows` lengths, slot-major as the kernel indexes it.
+                unsafe {
+                    ffi::nonpaged_prefill_attention_ring_varlen_batched_cuda(
+                        qp_ptr as *const ffi::Half,
+                        sl_ptr as *const *const std::ffi::c_void,
+                        (sl_ptr as *const *const std::ffi::c_void).add(b),
+                        ao_ptr as *mut ffi::Half,
+                        nq,
+                        nkv,
+                        hd,
+                        block as i32,
+                        b as i32,
+                        w_ptr as *const i32,
+                        (w_ptr as *const i32).add(rows),
+                        cap_li as i32,
+                        sm_scale,
+                        ctx.stream.cu_stream(),
+                    )
+                    .result()?;
                 }
             }
 
