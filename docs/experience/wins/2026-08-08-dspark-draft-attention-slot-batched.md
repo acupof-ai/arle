@@ -1,8 +1,16 @@
 # DSpark draft attention was launched per slot at 192 blocks — CUDA, 2026-08-08
 
-> Status: **licensed.** Serve A/B survives a device swap, needle gate clean on
-> both arms. **ITL mean 31.05 → 27.81 ms, −10.4%**, which is 57% of what the
-> tick decomposition projected — the residual is unexplained, see below.
+> Status: **licensed on the decode-shaped workload.** Serve A/B survives a
+> device swap, needle gate clean on both arms. **ITL mean 31.05 → 27.81 ms,
+> −10.4%**, which is 57% of what the tick decomposition projected — the
+> residual is unexplained, see below.
+>
+> **This does not update the `baselines.md` champion row.** That row tracks one
+> workload, the multi-turn long-agent 32K anchor, and a dataset change is a
+> fingerprint change under its rule 3. All decode together is 2.1–6.1% of GPU
+> time on the anchor, so the win there is expected to be much smaller or
+> absent. Anchor A/B pending; a null result on it would not retract this entry,
+> it would bound the claim.
 
 ## Problem
 
@@ -129,6 +137,14 @@ token budget inside the reasoning block, which false-fails every length.
 
 All four arms, every length, both depths: **3/0/0 exact, deterministic.**
 Decoded output was the needle in all 72 runs. NEW is exactly on BASE's envelope.
+
+**Scope of what that gate covered.** The ladder run was `1000,2000,4000,8000`,
+which I specified — `lever_gate.sh` defaults to `115,300,446,2000,8000` and
+`needle_gate.py` spans a 241-token boundary. **The rungs below 1000 were not
+covered**, and they are the ones that matter most here: at short context the
+draft ring runs a small `kv_len` and `ctx_base` clamping engages, which is
+where a slot-indexing defect would show. Pending. Capability was not checked
+either; an MMLU smoke on both arms is pending.
 
 This is the check that mattered. The harness bit-identity covers the kernel math
 only; the failure mode this change can produce lives in the caller — a wrong
