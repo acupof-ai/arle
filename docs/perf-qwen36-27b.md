@@ -165,6 +165,60 @@ denominator as §1.3's open item. **This single unknown decides whether prefill
 has any kernel headroom left at all**, and it is the highest-value measurement
 in the document.
 
+### The gap layer — four buckets, four distinct remedies
+
+A floor says what the work must cost. It does not say where the difference went,
+and "where it went" is what picks the next task. The machine is, at every
+instant, either doing required work, doing work the implementation added, or not
+issuing at all:
+
+```
+T_actual  =  T_floor  +  T_inflation  +  T_stall  +  T_idle
+
+T_floor       max over resources of required_work / capacity — irreducible
+T_inflation   work the implementation added: quantization round trips,
+              materialized intermediates, re-reads, recompute
+T_stall       warps resident but not issuable — the data they need is in
+              flight from HBM and there is not enough concurrency to cover it
+T_idle        nothing resident: launch gaps, syncs, host waits
+```
+
+The buckets matter because their remedies do not overlap. **Inflation** is paid
+down by fusion, dtype choice, and caching. **Stall** by async copy / TMA, warp
+specialization, deeper software pipelining, more occupancy. **Idle** by CUDA
+graphs, persistent kernels, stream overlap, larger batches. **Floor** only by
+doing less work.
+
+This is also why almost any change appears to help. Fusion attacks inflation and
+idle at once, and most kernels have slack in both, so a win arrives without
+anyone learning which bucket paid — which is indistinguishable from guessing.
+
+### The buckets, measured on the anchor window
+
+Window 29.64 s wall, 28.60 s kernel.
+
+| bucket | measured | share of wall | how it was obtained |
+|---|---:|---:|---|
+| **inflation — `pack_quantize`** | **1653 ms** | **5.6%** | 8463 launches; 439 GB of HBM traffic at **7.6% of 3.5 TB/s** |
+| floor gap — MLP GEMM | 1001 ms | 3.4% | 11.1 µs/token of headroom × 90,208 tokens |
+| idle | 966 ms | 3.3% | GPU busy 28676 ms of 29642 ms |
+| stall | not measured | — | needs `ncu` warp-stall reasons; sits inside the 21% closure residual |
+
+**The largest identified bucket is data preparation, not arithmetic.**
+`pack_quantize` converts bf16 activations to FP8 blocks to feed the GEMM — no
+part of it is model work. It costs 5.6% of wall, and its 439 GB round trip runs
+at 7.6% of achievable bandwidth, so **1528 ms of it is headroom even before
+asking whether the kernel should exist**. Fused into the producing kernel's
+epilogue, the whole 1653 ms goes.
+
+Compare: making the largest half of prefill arithmetic faster is worth 1001 ms,
+and it is 93% of the way to the FP8 peak already.
+
+**Total identified headroom is ~3.6 s of 29.6 s — 12%.** Winning every bucket
+leaves the workload where reducing `P` and `L` is the only remaining lever. That
+number is the honest ceiling on kernel work for this workload, and it is the
+model's most useful output.
+
 ### What this model is for, and what it forbids
 
 It ranks work by `share x achievable improvement`, both of which it makes
