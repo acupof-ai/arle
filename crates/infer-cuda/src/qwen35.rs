@@ -4057,6 +4057,27 @@ impl Qwen35Model {
         qwen35_profile(&self.ctx, "qwen/embedding", None, seq_len, || {
             embedding_batch(&self.ctx, &self.embed_tokens, token_ids, hidden)
         })?;
+        // Probe tap: `layer = usize::MAX` marks the embedding output, so a
+        // cross-runtime bisect can rule the input in or out before layer 0.
+        #[cfg(feature = "cuda")]
+        let stage_row = |stage: &str, layer: usize, buf: &HiddenStates| {
+            let width = buf.hidden_dim;
+            for r in 0..buf.seq_len {
+                let pos = (start_pos + r) as u64;
+                if crate::probe::stage_want(pos) {
+                    crate::probe::stage_bf16(
+                        &self.ctx,
+                        stage,
+                        layer,
+                        r,
+                        pos,
+                        buf.data.slice(r * width..(r + 1) * width),
+                    );
+                }
+            }
+        };
+        #[cfg(feature = "cuda")]
+        stage_row("embed", usize::MAX, hidden);
         // DSpark tap: `-1` = the embedding output (residual stream pre-layer-0).
         if let Some(t) = taps.as_deref_mut() {
             t.capture(&self.ctx, -1, hidden)?;
@@ -4151,6 +4172,11 @@ impl Qwen35Model {
                     )
                 },
             )?;
+            #[cfg(feature = "cuda")]
+            {
+                stage_row("attn_out", layer_idx, attn_out);
+                stage_row("resid_mid", layer_idx, hidden_mid);
+            }
             let mlp_in: &HiddenStates = normed;
             if let Some(moe_weights) = &layer.moe {
                 let cfg = self
@@ -4208,27 +4234,15 @@ impl Qwen35Model {
             if let Some(t) = taps.as_deref_mut() {
                 t.capture(&self.ctx, layer_idx as i64, hidden)?;
             }
-            // Residual-stream fingerprint per layer (`ARLE_PROBE_STAGES`), so a
-            // cross-runtime disagreement can be bisected to the first layer that
-            // diverges. The `pos` label is `start_pos + row`, which is the true
-            // position only for a single-row launch — enough for the one-request
+            // Per-layer fingerprints (`ARLE_PROBE_STAGES`) so a cross-runtime
+            // disagreement can be bisected to a layer AND to a point inside it.
+            // The `pos` label is `start_pos + row`, which is the true position
+            // only for a single-row launch — enough for the one-request
             // diagnostic this exists for, wrong for a batched paged step.
             #[cfg(feature = "cuda")]
             {
-                let width = hidden.hidden_dim;
-                for r in 0..hidden.seq_len {
-                    let pos = (start_pos + r) as u64;
-                    if crate::probe::stage_want(pos) {
-                        crate::probe::stage_bf16(
-                            &self.ctx,
-                            "resid",
-                            layer_idx,
-                            r,
-                            pos,
-                            hidden.data.slice(r * width..(r + 1) * width),
-                        );
-                    }
-                }
+                stage_row("mlp_out", layer_idx, mlp_out);
+                stage_row("resid", layer_idx, hidden);
             }
         }
 
