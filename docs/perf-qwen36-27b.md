@@ -498,6 +498,10 @@ launches in the window — the DFlash draft has no paged KV pool, so the draft
 lane takes the nonpaged branch while the trunk takes
 `prefill_attention_paged_hd256_kernel`.
 
+Every one of those launches carries grid **(32, 6, 1) = 192 blocks**, on one
+stream, 7.5 µs apart: 16 slots × 5 draft layers, one launch per slot. The cost
+was the launch structure, not the arithmetic — see open item #1.
+
 **Idle inside a tick is 13.8%**, and 61.4% of that gap time sits in **53 gaps
 over 1 ms**. On the anchor capture decode ticks were gap-free below 20 µs; this
 shape is not. Cause unknown. Host round-trips are visible next to it: HtoD
@@ -691,9 +695,11 @@ Two structural facts:
   — the term batching **does** amortize; the slope is what it cannot.
 
 Consequence for kernel work: price a kernel against the per-row term at the
-batch you serve, not against a batch-1 step. DSpark draft attention is 1.5 ms of a 35 ms step (4.3%), so a
-−33% microbench win there is capped at −1.4% end to end — which is why three
-kernel rewrites failed to transfer.
+batch you serve, not against a batch-1 step. DSpark draft attention was priced
+at 1.5 ms of a 35 ms step (4.3%), which caps a −33% microbench win at −1.4% end
+to end. On a decode-shaped c=16 workload the same kernel is 30.5% of a tick
+(§2.0), and the cost there is the per-slot launch, not the inner loop — the
+same shape error that made the three rewrites miss.
 
 ---
 
@@ -842,7 +848,7 @@ Ceilings belong to levers, not to categories.
 
 | lever | phase | measured at | size | status |
 |---|---|---|---|---|
-| **DSpark draft attention** | decode | **c=16, 2.5K ctx** | **30.5% of a decode tick** | **open, #1** — was "priced out" at 4.3% from a shape where it was small |
+| **DSpark draft attention** | decode | **c=16, 2.5K ctx** | **30.5% of a decode tick** | **root-caused: the launch was per-slot, 192 blocks.** Slot-batched at `3a8f99b1f`, −69% pinned-shape; serve A/B pending-remote |
 | FP8 GEMM on the verify shape | decode | c=16, 2.5K ctx | 28.8% of a decode tick | open — never decomposed at this shape |
 | GDN / gated-delta at c=16 | decode | c=16, 2.5K ctx | 21.0% of a decode tick | open — a same-binary A/B nulled it at 33K, untested here |
 | >1 ms gaps inside decode ticks | decode | c=16, 2.5K ctx | 13.8% of tick span, 53 gaps | open, cause unknown |
@@ -912,11 +918,32 @@ queueing ramp.
 
 **Decode** — priced on §2.0, the decode-shaped c=16 capture.
 
-1. **DSpark draft attention, 30.5% of a decode tick.** The largest single line,
-   and §6 had it **priced out at 4.3%** from a shape where it was small. Three
-   earlier kernel rewrites failed to transfer; they were sized against that
-   4.3%. `nonpaged_prefill_attention_kernel`, 39,690 launches in a 60 s window.
-   Re-open with a capture of the kernel itself at this shape.
+1. **DSpark draft attention, 30.5% of a decode tick — root-caused, fix landed
+   at `3a8f99b1f`, serve A/B pending-remote.** The largest single line, and §6
+   had it **priced out at 4.3%** from a shape where it was small.
+
+   The cost was never in the kernel's arithmetic. All 39,690 launches in the
+   window carry grid **(32, 6, 1) = 192 blocks**, serialized on one stream 7.5
+   µs apart — 16 slots × 5 draft layers per tick, one launch each. The batched
+   draft (`dspark_draft_blocks`) batched the GEMMs and left the ring kernels
+   per-slot, which its own doc comment said. 192 blocks is ~2.5 per SM on an
+   H20; the two 08-01 rewrites were tuned by `ncu` at **3072** blocks, where
+   the kernel really is ALU-bound, and that is why neither transferred.
+
+   Folding the slot axis into `blockIdx.z` gives grid (32, 6, 16) = 3072
+   blocks. Pinned-shape A/B, output bit-identical in every arm:
+
+   | kv_len | per-slot | batched | Δ |
+   |---:|---:|---:|---:|
+   | 512 | 3.545 ms | 1.023 | −71.1% |
+   | 1024 | 7.203 | 2.057 | −71.4% |
+   | 1376 | 9.013 | 2.766 | **−69.3%** |
+   | 2048 | 13.283 | 4.197 | −68.4% |
+
+   The win is flat across the window, so it is structural. The harness at
+   `kv_len` 1376 costs 563 µs per 192-block launch against the serve's 558 µs
+   mode, so it sits on the measured operating point. End-to-end effect is not
+   claimed until the serve A/B lands.
 2. **FP8 GEMM on the verify shape, 28.8%.** Priced out at 64–67% of peak on
    *prefill* shapes (§1.1). The verify shape is different and has never been
    decomposed.
