@@ -132,6 +132,39 @@ Closure is the test every future measurement must improve. A change that raises
 a coefficient's accuracy but lowers closure has found a second effect, not a
 better number.
 
+### The floor layer — what the cost *must* be
+
+A share tells you how big a term is. It does not tell you whether the term can
+be made smaller, and ranking by share alone is how this document repeatedly
+picked work with no headroom in it. Each coefficient therefore needs a floor:
+the same work against whichever hardware limit binds it.
+
+| term | floor µs/token | measured | at peak | headroom |
+|---|---:|---:|---:|---:|
+| `gate_up` | 77.1 | 82.7 | **93.2%** | 5.6 µs |
+| `down_proj` | 38.5 | 44.0 | 87.6% | 5.5 µs |
+| attention `out_proj` | 13.6 | 15.7 | 86.6% | 2.1 µs |
+| FA3 | see below | 39.3 | not resolved | unknown |
+| `in_proj`, `qkv` | N not resolved from the trace | 38.1 | — | unknown |
+
+GEMM floors are `2·K·N / 296 TFLOPS` per token, times the layers that run it —
+no fitting, only the config's dimensions and the FP8 peak from the constants
+table.
+
+**`gate_up` + `down_proj` are 50.3% of the model with 11.1 µs/token of total
+headroom — 4.4% of `c_prefill`.** That is the whole prize for making the largest
+half of prefill faster, and it is why §1.3 closes the lever.
+
+**FA3's floor inverts into a question about the workload, not the kernel.** At
+`4·L·24·256` FLOP per token per layer against the 148 TFLOPS bf16 peak, the
+measured 2.456 µs/token/layer *is* the floor exactly when the mean KV depth is
+**14.8K**. So either FA3 is already at bf16 peak, or the mean depth is lower and
+there is headroom proportional to the shortfall. The trace cannot say which,
+because the persistent grid hides the sequence lengths — the same missing
+denominator as §1.3's open item. **This single unknown decides whether prefill
+has any kernel headroom left at all**, and it is the highest-value measurement
+in the document.
+
 ### What this model is for, and what it forbids
 
 It ranks work by `share x achievable improvement`, both of which it makes
