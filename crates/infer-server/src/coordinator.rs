@@ -639,6 +639,22 @@ fn decode(state: &Arc<CoordinatorHandle>, tokens: &[u32]) -> Result<String, ApiE
     Ok(tokenizer.decode(tokens)?)
 }
 
+/// Strip trailing stop sequences from the generated text. The engine stops on
+/// the stop token but includes it in the output; OpenAI omits the stop
+/// sequence from the response.
+fn strip_stop_strings(text: &str, stop: &[String]) -> String {
+    let mut result = text.to_string();
+    for s in stop {
+        if s.is_empty() {
+            continue;
+        }
+        if let Some(idx) = result.rfind(s) {
+            result.truncate(idx);
+        }
+    }
+    result
+}
+
 /// Split a decoded chat completion into visible content + response tool calls
 /// (the non-streaming twin of [`crate::sse_util::StreamPipeline`]).
 ///
@@ -827,6 +843,10 @@ async fn completions(
             )
             .await?;
             let text = decode(&state, &outcome.generated_tokens)?;
+            let text = request
+                .stop
+                .as_deref()
+                .map_or_else(|| text.clone(), |stop| strip_stop_strings(&text, stop));
             let lps = request
                 .logprobs
                 .is_some()
@@ -873,6 +893,10 @@ async fn completions(
     )
     .await?;
     let text = decode(&state, &outcome.generated_tokens)?;
+    let text = request
+        .stop
+        .as_deref()
+        .map_or_else(|| text.clone(), |stop| strip_stop_strings(&text, stop));
     let return_lps = request
         .logprobs
         .is_some()
@@ -1223,6 +1247,10 @@ async fn chat_completions(
             )
             .await?;
             let decoded = decode(&state, &outcome.generated_tokens)?;
+            let decoded = request.stop.as_deref().map_or_else(
+                || decoded.clone(),
+                |stop| strip_stop_strings(&decoded, stop),
+            );
             let (content, tool_calls, split_thinking) =
                 finalize_chat_content(decoded, tools_active, thinking);
             let (reasoning_content, content) = split_reasoning(&content, split_thinking);
@@ -1280,6 +1308,10 @@ async fn chat_completions(
     )
     .await?;
     let decoded = decode(&state, &outcome.generated_tokens)?;
+    let decoded = request.stop.as_deref().map_or_else(
+        || decoded.clone(),
+        |stop| strip_stop_strings(&decoded, stop),
+    );
     let (content, tool_calls, split_thinking) =
         finalize_chat_content(decoded, tools_active, thinking);
     let return_lps = request.logprobs.unwrap_or(false).then_some((
@@ -1522,6 +1554,10 @@ async fn anthropic_messages(
         );
     }
     let decoded = decode(&state, &outcome.generated_tokens)?;
+    let decoded = chat_request.stop.as_deref().map_or_else(
+        || decoded.clone(),
+        |stop| strip_stop_strings(&decoded, stop),
+    );
     // Anthropic keeps reasoning even when tools are active (thinking blocks
     // precede text/tool_use blocks). Parse tool calls only when tools are
     // active (the prompt advertised them), then hand the result to
