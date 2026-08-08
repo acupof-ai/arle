@@ -4252,9 +4252,13 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
                         let seq = t.prompt_ids.len() + t.response_ids.len();
                         let keep = seq <= args.runtime.max_update_seq;
                         if !keep {
+                            // reward: a dropped pass is lost signal, a dropped fail is not.
                             eprintln!(
-                                "[agent-opd] SKIP trajectory pre-capture: seq {seq} > max_update_seq {} (VRAM wall)",
-                                args.runtime.max_update_seq
+                                "[agent-opd] SKIP trajectory pre-capture: seq {seq} > max_update_seq {} (VRAM wall), prompt {} reward {:.2} supervised {}",
+                                args.runtime.max_update_seq,
+                                t.prompt_ids.len(),
+                                t.reward,
+                                t.response_mask.iter().filter(|&&m| m == 1).count()
                             );
                         }
                         keep
