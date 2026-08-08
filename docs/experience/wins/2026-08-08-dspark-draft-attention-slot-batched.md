@@ -5,12 +5,11 @@
 > −10.4%**, which is 57% of what the tick decomposition projected — the
 > residual is unexplained, see below.
 >
-> **This does not update the `baselines.md` champion row.** That row tracks one
-> workload, the multi-turn long-agent 32K anchor, and a dataset change is a
-> fingerprint change under its rule 3. All decode together is 2.1–6.1% of GPU
-> time on the anchor, so the win there is expected to be much smaller or
-> absent. Anchor A/B pending; a null result on it would not retract this entry,
-> it would bound the claim.
+> **On the 32K long-agent anchor it is worth nothing measurable** — 3 trials
+> per arm, counterbalanced: TPOT +0.8% (NEW slower), out tok/s −0.7%, total
+> tok/s +3.3%, every delta inside the arm's own trial spread. The champion row
+> does not move, and the honest summary is that this optimises a regime the
+> anchor does not exercise.
 
 ## Problem
 
@@ -128,6 +127,39 @@ unknown** — settle it with an `nsys` capture on NEW at the same shape,
 confirming the draft-attention line actually fell to ~9 ms and locating the
 residual. Recorded as the follow-up rather than guessed at.
 
+## The anchor workload — null
+
+The workload `docs/baselines.md` is defined over. Dataset regenerated
+in-container, sha256 `8867f63e…`, an exact match to the sha pinned in that
+file; parameters from its Runner line (128 req/point, `--max-tokens 214`,
+greedy, seed 20260416, c=16). Because a single trial would have landed on the
+±2.7% drift band edge, 3 trials per arm, counterbalanced BASE/NEW/NEW/BASE/
+BASE/NEW, fresh serve each, all on GPU 0.
+
+| arm | out tok/s | total tok/s | TPOT | TTFT p50 | accept_rate |
+|---|---:|---:|---:|---:|---:|
+| BASE median | 47.21 | 13482.2 | 183.20 ms | 3548.4 ms | 0.4853 |
+| NEW median | 46.87 | 13925.8 | 184.73 ms | 3666.3 ms | 0.4772 |
+| Δ | −0.7% | +3.3% | **+0.8% (slower)** | +3.3% (slower) | — |
+
+**Null.** The deltas point in opposite directions depending on the metric, and
+each is smaller than the arm's own trial-to-trial spread — BASE spans 3.5% on
+total tok/s and 3.8% on TPOT, NEW spans 3.1% and 5.1%, and BASE's best total
+tok/s (13945.9) exceeds NEW's median. On TPOT, the metric a decode-side lever
+must move, NEW is 0.8% *worse*, i.e. flat. **The +14.1% total tok/s on the
+decode-shaped workload does not transfer to the anchor at all.**
+
+This is what the tick decomposition predicted: all decode together is 2.1–6.1%
+of GPU time on the anchor, which is 279:1 prompt:output (38.6:1 after the
+measured prefix-cache hit). Predicted before the run and confirmed by it.
+
+These absolute numbers are **not** comparable to the `baselines.md` c=16 row
+(total 33780.3, TPOT 110.52 ms): that row is the 5th point of an ascending
+single-serve sweep and inherits a warm prefix cache, while these are fresh
+serves with c=16 as the only point, so every request pays full 32K prefill. The
+gap is cache state, which the file documents. **The champion row cannot be
+updated from this data either way** — that needs the full ascending sweep.
+
 ## Correctness gate
 
 `scripts/needle_gate.py`, ladder ×3 same-config repeats, per arm, at depth 0.0
@@ -138,13 +170,25 @@ token budget inside the reasoning block, which false-fails every length.
 All four arms, every length, both depths: **3/0/0 exact, deterministic.**
 Decoded output was the needle in all 72 runs. NEW is exactly on BASE's envelope.
 
-**Scope of what that gate covered.** The ladder run was `1000,2000,4000,8000`,
-which I specified — `lever_gate.sh` defaults to `115,300,446,2000,8000` and
-`needle_gate.py` spans a 241-token boundary. **The rungs below 1000 were not
-covered**, and they are the ones that matter most here: at short context the
-draft ring runs a small `kv_len` and `ctx_base` clamping engages, which is
-where a slot-indexing defect would show. Pending. Capability was not checked
-either; an MMLU smoke on both arms is pending.
+The first ladder I specified was `1000,2000,4000,8000`, which dropped the short
+rungs `lever_gate.sh` defaults to — and those are the ones that matter here,
+since at short context the draft ring runs a small `kv_len` and `ctx_base`
+clamping engages. Run separately afterwards, both arms:
+
+| len | 115 | 180 | 241 | 300 | 446 |
+|---|---|---|---|---|---|
+| BASE | 3/0/0 DET | 3/0/0 DET | 3/0/0 DET | 3/0/0 DET | 3/0/0 DET |
+| NEW | 3/0/0 DET | 3/0/0 DET | 3/0/0 DET | 3/0/0 DET | 3/0/0 DET |
+
+**11/11 rungs matched across both ladders**, including the 241 boundary, no
+partial and no miss anywhere. No slot-indexing or `ctx_base`-clamp signal.
+
+**MMLU smoke**, n=50 seed 0, paired: BASE 0.812 (39/48, 2 invalid), NEW 0.812,
+and **0 per-question disagreements across all 50 items** — same predicted
+letter everywhere, including both invalid extractions. At n=50 a score
+*difference* would not be interpretable (CI ±0.11), but zero paired
+disagreement is a real signal that does not depend on n. A smoke, not a
+capability claim.
 
 This is the check that mattered. The harness bit-identity covers the kernel math
 only; the failure mode this change can produce lives in the caller — a wrong
@@ -158,6 +202,13 @@ arithmetic on the wrong data, invisible to a math check.
 model config.** The config gave 3072 blocks and a 2048-token window; the serve
 runs 192 blocks and behaves like a 1376-token window. Three rewrites were sized
 against the config.
+
+**A structural defect can be real, large, correctly fixed, and still worth
+nothing on the workload you are judged by.** 192-block launches were a genuine
+defect and batching them is a genuine −69% on the kernel. It buys −10.4% ITL
+where decode is 60% of the tick and 0% where decode is 2–6% of it. The kernel
+share, not the kernel's inefficiency, was always the governing number; that is
+the same Amdahl error this document has now made twice, once in each direction.
 
 **A microbench's bit-identity is not the correctness gate.** I treated it as
 one, because in the harness I filled the per-slot pointer array myself, in the

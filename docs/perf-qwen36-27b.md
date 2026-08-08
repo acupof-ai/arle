@@ -918,10 +918,13 @@ queueing ramp.
 
 **Decode** — priced on §2.0, the decode-shaped c=16 capture.
 
-1. **DSpark draft attention, 30.5% of a decode tick — fixed and licensed at
-   `3a8f99b1f`. ITL mean 31.05 → 27.81 ms, −10.4%**, surviving a GPU swap, with
-   the needle ladder clean on both arms. It was the largest single line, and §6
-   had it **priced out at 4.3%** from a shape where it was small.
+1. **DSpark draft attention, 30.5% of a decode tick — fixed at `3a8f99b1f`.
+   ITL mean 31.05 → 27.81 ms, −10.4% on the decode-shaped workload, and a null
+   on the anchor** (TPOT +0.8%, inside the trial spread, 3 trials per arm).
+   Correctness clean: 11/11 needle rungs, MMLU 0/50 disagreements. It was the
+   largest single line, and §6 had it **priced out at 4.3%** from a shape where
+   it was small — but the anchor result is the reminder that a 30.5% share on
+   one workload is 2–6% on another, and the fix is worth what the share is.
 
    The cost was never in the kernel's arithmetic. All 39,690 launches in the
    window carry grid **(32, 6, 1) = 192 blocks**, serialized on one stream 7.5
@@ -945,12 +948,13 @@ queueing ramp.
    `kv_len` 1376 costs 563 µs per 192-block launch against the serve's 558 µs
    mode, so it sits on the measured operating point.
 
-   **Only 57% of it transferred, and that is the open part.** The decomposition
-   projects −18.2% on tick span (29.57 → 9.07 ms saves 20.5 ms of a 112.33 ms
-   span); the serve measured −10.4% on ITL mean. Cause unknown. Settle it with
-   an `nsys` capture on the new binary at the same shape — confirm the draft
-   line actually fell to ~9 ms, and locate the residual. Item #4 below, the 53
-   gaps over 1 ms, is the first place to look.
+   **Only 57% of it transferred even on the decode-shaped workload, and that is
+   the open part.** The decomposition projects −18.2% on tick span (29.57 →
+   9.07 ms saves 20.5 ms of a 112.33 ms span); the serve measured −10.4% on ITL
+   mean. Cause unknown. Settle it with an `nsys` capture on the new binary at
+   the same shape — confirm the draft line actually fell to ~9 ms, and locate
+   the residual. Item #4 below, the 53 gaps over 1 ms, is the first place to
+   look.
 2. **FP8 GEMM on the verify shape, 28.8%.** Priced out at 64–67% of peak on
    *prefill* shapes (§1.1). The verify shape is different and has never been
    decomposed.
