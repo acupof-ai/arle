@@ -31,6 +31,7 @@ Tasks deferred:
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import hashlib
 import json
 import math
@@ -42,6 +43,27 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
+
+
+def _issue_many(call, items, concurrency):
+    """Run `call(item)` over `items`, `concurrency` at a time, in input order.
+
+    The serve is a continuous-batching engine, so one-request-at-a-time leaves
+    every slot but one idle: a 500-problem GSM8K seed took 80 min at 1-way.
+    Exceptions are returned in place so each caller keeps its own per-item
+    error handling. Paired comparisons must use the SAME concurrency on both
+    arms — batch composition perturbs MoE numerics.
+    """
+    def guarded(item):
+        try:
+            return call(item)
+        except (urllib.error.URLError, urllib.error.HTTPError, OSError) as exc:
+            return exc
+
+    if concurrency <= 1:
+        return [guarded(item) for item in items]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as pool:
+        return list(pool.map(guarded, items))
 
 
 SCRIPT_SCHEMA_VERSION = "arle-capability-eval-v2"
@@ -313,6 +335,7 @@ def run_mmlu(
     seed: int | None = None,
     dataset_revision: str = DEFAULT_DATASET_REVISION,
     max_tokens: int = 32,
+    concurrency: int = 1,
 ) -> dict:
     """Run MMLU 5-shot eval. Saves the first `debug_samples` raw responses
     to <output_dir>/mmlu_debug.json so future extractor fixes can target
@@ -398,28 +421,34 @@ def run_mmlu(
     # much tighter SE when comparing two models on the same seed).
     per_question: list[dict] = []
     t0 = time.time()
-    for i, ex in enumerate(pool):
-        subj = ex["subject"]
-        shots = "\n".join(_mmlu_format_shot(s) for s in dev_by_subject.get(subj, [])[:5])
-        prompt = MMLU_FEW_SHOT_TEMPLATE.format(
-            subject=subj.replace("_", " "),
-            shots=shots,
+    prompts = [
+        MMLU_FEW_SHOT_TEMPLATE.format(
+            subject=ex["subject"].replace("_", " "),
+            shots="\n".join(
+                _mmlu_format_shot(s) for s in dev_by_subject.get(ex["subject"], [])[:5]
+            ),
             question=ex["question"],
             a=ex["choices"][0],
             b=ex["choices"][1],
             c=ex["choices"][2],
             d=ex["choices"][3],
         )
-        # Base models often need a few tokens to commit to a letter when
-        # leading whitespace / paren / "The answer is" pattern lands.
-        # 32 tokens covers all those shapes and is still fast (MMLU is a
-        # single-letter task; per-task budget, see --mmlu-max-tokens).
-        try:
-            resp = client.completion(prompt, max_tokens=max_tokens, temperature=0.0)
-        except (urllib.error.URLError, urllib.error.HTTPError, OSError) as exc:
-            print(f"[mmlu] sample {i} request error: {exc}", flush=True)
+        for ex in pool
+    ]
+    # Base models often need a few tokens to commit to a letter when leading
+    # whitespace / paren / "The answer is" pattern lands. 32 tokens covers all
+    # those shapes and is still fast (per-task budget, see --mmlu-max-tokens).
+    responses = _issue_many(
+        lambda prompt: client.completion(prompt, max_tokens=max_tokens, temperature=0.0),
+        prompts,
+        concurrency,
+    )
+    for i, (ex, resp) in enumerate(zip(pool, responses)):
+        subj = ex["subject"]
+        if isinstance(resp, Exception):
+            print(f"[mmlu] sample {i} request error: {resp}", flush=True)
             invalid += 1
-            invalid_records.append({"i": i, "subject": subj, "kind": "request_error", "reason": str(exc)})
+            invalid_records.append({"i": i, "subject": subj, "kind": "request_error", "reason": str(resp)})
             per_question.append({"i": i, "subject": subj, "gold": None, "predicted": None,
                                  "status": "request_error"})
             continue
@@ -550,6 +579,7 @@ def run_gsm8k(
     seed: int | None = None,
     dataset_revision: str = DEFAULT_DATASET_REVISION,
     max_tokens: int = 2048,
+    concurrency: int = 1,
 ) -> dict:
     try:
         from datasets import load_dataset
@@ -586,23 +616,27 @@ def run_gsm8k(
     debug_records: list[dict] = []
     per_question: list[dict] = []
     t0 = time.time()
-    for i, ex in enumerate(pool):
-        # Thinking models collapse on completion-endpoint few-shot (they emit
-        # 1 token and stop when they see prior `#### N` exemplars). The chat
-        # endpoint drives their trained reason-then-answer mode; a zero-shot
-        # instruction to end with `#### <number>` gives a clean extractable tail.
-        instruction = (
-            f"{ex['question']}\n\n"
-            "Solve step by step. End your response with the final numeric "
-            "answer on its own, preceded by ####."
-        )
-        try:
-            resp = client.chat(
-                [{"role": "user", "content": instruction}],
-                max_tokens=max_tokens, temperature=0.0,
-            )
-        except (urllib.error.URLError, urllib.error.HTTPError, OSError) as exc:
-            print(f"[gsm8k] sample {i} request error: {exc}", flush=True)
+    # Thinking models collapse on completion-endpoint few-shot (they emit 1
+    # token and stop when they see prior `#### N` exemplars). The chat endpoint
+    # drives their trained reason-then-answer mode; a zero-shot instruction to
+    # end with `#### <number>` gives a clean extractable tail.
+    instructions = [
+        f"{ex['question']}\n\n"
+        "Solve step by step. End your response with the final numeric "
+        "answer on its own, preceded by ####."
+        for ex in pool
+    ]
+    responses = _issue_many(
+        lambda instruction: client.chat(
+            [{"role": "user", "content": instruction}],
+            max_tokens=max_tokens, temperature=0.0,
+        ),
+        instructions,
+        concurrency,
+    )
+    for i, (ex, resp) in enumerate(zip(pool, responses)):
+        if isinstance(resp, Exception):
+            print(f"[gsm8k] sample {i} request error: {resp}", flush=True)
             invalid += 1
             per_question.append({"i": i, "gold": None, "predicted": None, "status": "request_error"})
             continue
@@ -931,6 +965,7 @@ def _run_suite_once(args: argparse.Namespace, client, requested: list[str], outp
                 seed=seed,
                 dataset_revision=args.gsm8k_revision,
                 max_tokens=args.gsm8k_max_tokens,
+                concurrency=args.concurrency,
             )
         elif task == "mmlu":
             report = run_mmlu(
@@ -940,6 +975,7 @@ def _run_suite_once(args: argparse.Namespace, client, requested: list[str], outp
                 seed=seed,
                 dataset_revision=args.mmlu_revision,
                 max_tokens=args.mmlu_max_tokens,
+                concurrency=args.concurrency,
             )
         elif task == "math500":
             report = run_math500(
@@ -988,6 +1024,11 @@ def main(argv: list[str]) -> int:
                         help="HTTP request timeout in seconds for --backend arle")
     parser.add_argument("--tasks", default="mmlu,gsm8k", help="comma-separated subset of: " + ", ".join(TASK_RUNNERS))
     parser.add_argument("--n-samples", type=int, default=200, help="samples per task")
+    parser.add_argument("--concurrency", type=int, default=1,
+                        help="in-flight requests against the serve (default 1 = serial). "
+                             "The serve batches continuously, so 1 leaves every slot but one "
+                             "idle; 8 turns an 80-min GSM8K seed into ~10 min. Paired "
+                             "comparisons must use the SAME value on both arms.")
     parser.add_argument("--gsm8k-shots", type=int, default=8, help="few-shot examples for GSM8K")
     parser.add_argument("--gsm8k-max-tokens", type=int, default=2048,
                         help="generation budget for GSM8K (reasoning). 2048 covers base-model CoT; "
