@@ -73,6 +73,83 @@ decode lever must be priced at the context it will run at.
 
 ---
 
+## The model
+
+One predictive structure for the whole document. Everything below this section is
+either a coefficient in it, a measurement that corrects a coefficient, or a
+residual it does not yet explain. **A number that cannot be placed in this model
+does not belong in this document.**
+
+```
+T_kernel  =  P x c_prefill(L)  +  N_tick x c_tick(c, L)
+
+P        prefill tokens actually computed (after the prefix cache)
+N_tick   decode ticks = generated tokens / (rows x tokens accepted per chain)
+L        context depth, which only the attention terms depend on
+c        concurrent rows
+```
+
+Prefill and decode are separate terms because they are separate regimes; the
+workload picks which one dominates, and on the anchor it is P by 258:1.
+
+### `c_prefill` — per token, measured at chunk 2048, anchor c=16, `70760bc09`
+
+Every coefficient is one kernel's duration divided by 2048, times the number of
+layers that run it. 64 layers = 16 full-attention + 48 linear.
+
+| term | layers | µs/token | share of model |
+|---|---:|---:|---:|
+| `gate_up` | 64 | 82.7 | **32.8%** |
+| `down_proj` | 64 | 44.0 | 17.5% |
+| FA3 | 16 | 39.3 | 15.6% |
+| linear-attn `in_proj` | 48 | 29.4 | 11.7% |
+| `fq_fwd` (FlashQLA) | 48 | 18.1 | 7.2% |
+| attention `out_proj` | 64 | 15.7 | 6.2% |
+| `qkv` | 16 | 8.7 | 3.5% |
+| `silu_mul` | 64 | 6.5 | 2.6% |
+| `conv1d` | 48 | 6.5 | 2.6% |
+| `paged_hd256` | 16 | 0.9 | 0.3% |
+| | | **251.9** | 100% |
+
+FA3 is entered at its p50, 5031 µs; it is the one term that varies strongly with
+`L` (1.18–10.92 ms observed), so this row is a point estimate, not a coefficient.
+
+### Closure — the model's acceptance test
+
+```
+predicted   90,208 tokens x 251.9 us  =  22.72 s
+measured    kernel time in the window  =  28.60 s
+closure                                   79%
+```
+
+**The model accounts for 79% of the window and the missing 5.9 s is not
+attributed.** Known candidates, none yet measured into the ledger:
+`pack_quantize` (5.8% of kernel time, and it appears four times per layer in the
+sequence), norms, `split2`, the prefix sidecar's D2H, and FA3 launches beyond the
+528 the full-chunk count predicts against 977 observed.
+
+Closure is the test every future measurement must improve. A change that raises
+a coefficient's accuracy but lowers closure has found a second effect, not a
+better number.
+
+### What this model is for, and what it forbids
+
+It ranks work by `share x achievable improvement`, both of which it makes
+explicit. Two consequences already follow:
+
+- **`gate_up` + `down_proj` are 50.3% of the model and run at 93% / 88% of FP8
+  peak (§1.3).** Half the prefill cost is at the hardware floor. On this workload
+  the dominant term cannot be made faster — only `P` can be made smaller.
+- **A decode-side lever is multiplied by `N_tick`, which the anchor makes tiny.**
+  This is why the slot-batched draft attention is −10.4% on a decode-shaped
+  workload and a null here; the model predicted it before the A/B ran.
+
+It also forbids the error this document made three times in two days: a
+coefficient measured at one `(c, L, chunk)` cannot be read at another. Every row
+above carries its shape.
+
+---
+
 ## Where the ceiling is — the roofline of the shape production actually runs
 
 **This section is a derivation, written when every kernel measurement in the
@@ -478,7 +555,7 @@ the `pack_quantize` that feeds it.
 `sm90_fp8_gemm_1d2d_impl` is **57.7% of all kernel time** (16.51 s of 28.60 s),
 in one launch shape — grid (78, 1, 1), i.e. one persistent block per SM, which
 is DeepGEMM's design and not a starved grid. 14,094 launches resolve into
-**four GEMMs per layer over 176 prefill chunks of 2048 tokens**:
+**four GEMMs per layer**, the periodic unit being a 2048-token prefill chunk:
 
 ```
 pack K=5120   -> GEMM  503.7 us   attention out_proj   (K 6144 -> N 5120)
@@ -492,6 +569,21 @@ pack K=5120   -> GEMM 1256.7 us   linear-attn in_proj
 `silu_mul` grid (68, 2048) pins the shape: 68 × 256 = 17408 = `intermediate_size`
 per token over a 2048-token chunk, so `gate_up` is the fused 2×17408 projection.
 `hidden_size` 5120, `intermediate_size` 17408, 64 layers.
+
+**`silu_mul`'s `gridY` is the token counter, and it closes the window's ledger.**
+An earlier version of this section said "176 prefill chunks", inferred from
+duration-cluster counts; that was wrong. The grids give it directly:
+
+| `silu_mul` grid | launches | tokens each | what |
+|---|---:|---:|---|
+| (68, 2048) | 2115 | 2048 | full prefill chunks |
+| (68, 1712) + (68, 336) | 512 + 512 | 2048 together | chunk split across two requests |
+| (68, 1696) + (68, 352) | 192 + 192 | 2048 together | same |
+| (68, 54) | 414 | 54 | **decode** — 9 rows × block 6 |
+
+Σ (`gridY` × launches) ÷ 64 layers = **90,208 prefill tokens and 349 decode
+tokens — 258:1**, an independent confirmation of the anchor's 279:1 derived from
+kernel grids rather than the bench CSV.
 
 | GEMM | share of FP8 GEMM | TFLOPS | of ~296 FP8 peak |
 |---|---:|---:|---:|
