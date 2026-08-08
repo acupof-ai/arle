@@ -140,10 +140,29 @@ impl Tensor {
     }
 }
 
-#[derive(Debug, Default)]
+/// Idle host buffers kept for reuse across checkpoint offloads. Bounded: OPD
+/// trajectory lengths span ~5K–30K tokens, so first-fit reuse with unbounded
+/// retention accumulated one buffer per size class ever seen — 0.86 GiB per
+/// group per rank of host growth on the 449-task run. The pool only has to
+/// absorb churn between a release and the next take.
+#[derive(Debug)]
 struct CheckpointOffloadPool {
     free: Vec<Vec<f32>>,
+    pooled_bytes: usize,
+    cap_bytes: usize,
 }
+
+impl Default for CheckpointOffloadPool {
+    fn default() -> Self {
+        Self {
+            free: Vec::new(),
+            pooled_bytes: 0,
+            cap_bytes: CHECKPOINT_OFFLOAD_POOL_CAP_BYTES,
+        }
+    }
+}
+
+const CHECKPOINT_OFFLOAD_POOL_CAP_BYTES: usize = 4 << 30;
 
 struct CheckpointL3 {
     store: kv_native_sys::KvTierStore,
@@ -240,21 +259,53 @@ fn parse_env_bytes(name: &str) -> Option<usize> {
 
 impl CheckpointOffloadPool {
     fn take(&mut self, len: usize) -> Vec<f32> {
-        if let Some(index) = self.free.iter().position(|buf| buf.capacity() >= len) {
-            let mut buf = self.free.swap_remove(index);
-            buf.resize(len, 0.0);
-            buf
-        } else {
-            vec![0.0; len]
+        // Best fit, not first fit: a short trajectory must not claim the
+        // largest buffer and force the next long one to allocate.
+        let pick = self
+            .free
+            .iter()
+            .enumerate()
+            .filter(|(_, buf)| buf.capacity() >= len)
+            .min_by_key(|(_, buf)| buf.capacity())
+            .map(|(index, _)| index);
+        match pick {
+            Some(index) => {
+                let mut buf = self.free.swap_remove(index);
+                self.pooled_bytes = self
+                    .pooled_bytes
+                    .saturating_sub(buf.capacity() * std::mem::size_of::<f32>());
+                buf.resize(len, 0.0);
+                buf
+            }
+            None => vec![0.0; len],
         }
     }
 
     fn recycle(&mut self, mut buf: Vec<f32>) {
-        if buf.capacity() == 0 {
+        let bytes = buf.capacity() * std::mem::size_of::<f32>();
+        if bytes == 0 {
             return;
         }
         buf.clear();
         self.free.push(buf);
+        self.pooled_bytes += bytes;
+        // Smallest-first eviction: a large buffer serves any smaller take, so
+        // capacity coverage is what the cap should buy.
+        while self.pooled_bytes > self.cap_bytes && self.free.len() > 1 {
+            let Some(index) = self
+                .free
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, buf)| buf.capacity())
+                .map(|(index, _)| index)
+            else {
+                break;
+            };
+            let dropped = self.free.swap_remove(index);
+            self.pooled_bytes = self
+                .pooled_bytes
+                .saturating_sub(dropped.capacity() * std::mem::size_of::<f32>());
+        }
     }
 }
 
@@ -1170,6 +1221,42 @@ fn shape_size(shape: &[usize]) -> usize {
         1
     } else {
         shape.iter().product()
+    }
+}
+
+#[cfg(test)]
+mod pool_tests {
+    use super::{CHECKPOINT_OFFLOAD_POOL_CAP_BYTES, CheckpointOffloadPool};
+
+    /// The pool must stay bounded across growing size classes (the 449-task run
+    /// grew host RSS 0.86 GiB per group before the cap) and must hand back the
+    /// SMALLEST fitting buffer, or a short trajectory strands the largest one.
+    #[test]
+    fn pool_is_bounded_and_best_fit() {
+        let mut pool = CheckpointOffloadPool {
+            cap_bytes: 4096 * std::mem::size_of::<f32>(),
+            ..Default::default()
+        };
+        for len in (1..=64).map(|i| i * 256) {
+            pool.recycle(vec![0.0; len]);
+            assert!(
+                pool.pooled_bytes <= pool.cap_bytes || pool.free.len() == 1,
+                "pool grew past its cap: {} > {}",
+                pool.pooled_bytes,
+                pool.cap_bytes
+            );
+        }
+        // Best fit, isolated from eviction (cap lifted) — 512 must not consume a
+        // buffer far larger than it needs.
+        pool.free.clear();
+        pool.pooled_bytes = 0;
+        pool.cap_bytes = usize::MAX;
+        pool.recycle(vec![0.0; 4096]);
+        pool.recycle(vec![0.0; 512]);
+        assert_eq!(pool.take(512).capacity(), 512);
+        assert_eq!(pool.take(512).capacity(), 4096);
+        assert_eq!(pool.pooled_bytes, 0, "take must debit pooled bytes");
+        assert!(CHECKPOINT_OFFLOAD_POOL_CAP_BYTES > 0);
     }
 }
 
