@@ -18,9 +18,16 @@ describes the DSv4 execution paths; this document describes the Qwen3.6-27B
   is inter-request stalls — the two are not interchangeable. A measurement that
   does not name its phase supports no claim about the other
   ([error](experience/errors/2026-08-07-measured-prefill-concluded-about-decode.md)).
-- Shares are **of the window that was measured**. A window aimed at one phase
-  reports that phase's share of the window, not of the run
-  ([correction](experience/errors/2026-08-07-named-a-call-site-whose-gate-was-off.md)).
+- Shares are **of the window that was measured**, and a window is not quotable
+  until it is reconciled against the run totals — the 08-08 anchor capture
+  undersampled decode 2–6× by landing in a queueing ramp
+  ([correction](experience/errors/2026-08-07-named-a-call-site-whose-gate-was-off.md),
+  [entry](experience/errors/2026-08-08-anchor-is-a-prefill-benchmark-decode-levers-ranked-off-it.md)).
+- **A kernel's distance from roofline and its share of GPU time are different
+  numbers, and only the second ranks it.** Both failure directions are now on
+  record: draft attention was priced out at a 4.3% share where it is 30.5%
+  (§2.0), and the FP8 GEMM was held open at 64–67% of peak where it runs 93%
+  (§1.3). Before pricing any lever, name the workload and the batch.
 
 **Provenance of every measurement table.** The recurring failure in this
 document has been a table measured at one configuration and read as current.
@@ -68,11 +75,16 @@ decode lever must be priced at the context it will run at.
 
 ## Where the ceiling is — the roofline of the shape production actually runs
 
-Every kernel measurement in this document was taken at **batch 1**: §2.1 is an
-`nsys` capture of plain single-row decode steps, §2.2 compares against SGLang
-decoding `bs=1` inside a graph. Production serves DSpark verify at c=16 and 32K
-context, and **that shape has never been captured**. This section derives what
-it should cost, because the derivation changes which levers are worth pulling.
+**This section is a derivation, written when every kernel measurement in the
+document was batch 1** (§2.1 plain single-row decode steps, §2.2 against SGLang
+at `bs=1` in a graph) and the served c=16 / 32K shape had never been captured.
+It is kept because the derivation is what motivated the captures, and because
+comparing it against them is the point.
+
+**Three c=16 captures now exist and they settle it**: the anchor window below,
+§2.0 (decode-shaped), and §1.3 (the FP8 GEMM decomposed). Where this section's
+derivation disagrees with them, they win — read the "Measured" subsection
+before using any number above it.
 
 **Scope of the metric.** FLOPs below are GEMM only — `2 × 22.3e9` per token,
 using the same 22.3 B GEMM-parameter count §1.2 uses for the prefill roofline.
@@ -130,8 +142,8 @@ c=16  32K        104.9 ms 18.7 ms      5.6x
 ```
 
 The gap grows with batch. That is the opposite of what a batch-independent cost
-produces, and it is invisible in every capture this document contains, all of
-which are batch 1.
+produces, and it was invisible in every capture this document contained when
+this was written — all of which were batch 1.
 
 ### Measured: the mechanism is confirmed and the size is not
 
@@ -353,11 +365,12 @@ neither substitutes for the other.
 
 **The four largest costs are measured and none of them is attributed.** Each is
 sized precisely and its cause is unknown. Quantized GEMM, DeepGEMM FP8, and
-launch gaps have all been measured and priced out (§6).
+launch gaps have all been measured and priced out (§6) — the FP8 GEMM
+decisively so, at 87–93% of peak (§1.3).
 
 | cost | size | what is known | what is not | § |
 |---|---|---|---|---|
-| per-row verify term at c=16 | **5.69 ms/row, 85% of the tick, 9.2× off roofline** | the GDN lane is excluded by a same-binary A/B, so what remains is the FA3 KV read | FA3's achieved bandwidth on this shape — no capture above batch 1 exists | ceiling |
+| per-row verify term at c=16 | **5.69 ms/row, 85% of the tick, 9.2× off roofline** | measured 2026-08-08: FA3 decode-verify achieves **1.02 TB/s = 29.2%** at 32.5K/9 rows and 47% at 2.5K/16 rows | why the achieved bandwidth falls with context when row count moved too — two points cannot separate them | ceiling, §2.0 |
 | sampling penalty | −30 to −40% decode tok/s at c ≥ 8 | the concurrency shape is a per-row loop; acceptance-vs-concurrency is withdrawn | the size of the batched-draft gate's share | §2.4 |
 | prefill GPU idle | 3.97 s vs SGLang 0.19 s | GPU-busy is within 0.93 s on identical kernels | what the idle is waiting on | §1.2 |
 | sidecar writes | 9.4% of wall, 83 GB per bench | the cost, exactly | the restore hit rate, so whether it is earned | §4.2 |
