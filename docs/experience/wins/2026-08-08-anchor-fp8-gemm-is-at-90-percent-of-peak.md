@@ -66,9 +66,27 @@ sparsity, effective context length — not to do it faster.
 §1.1's verdict ("leave alone") was right; its number was not. 64–67% was the
 single-request 33K-cold shape; the served c=16 shape runs 20–29 points higher.
 
-Remaining prefill kernel candidates are FA3 prefill (16.3%) and
-`pack_quantize` + norms (12.3%), neither decomposed, and together half the size
-of the line that is already at the floor.
+## The rest of the layer, same trace
+
+```
+linear layer (x48)    out_proj 503.6 -> gate_up 2645 -> silu -> down 1409
+                      -> in_proj 1255.7 -> conv1d 277 -> fq_fwd 773 us
+full-attn layer (x16) qkv 1117.0 -> paged_hd256 109.5 -> FA3 7231.7
+                      -> out_proj 503.6 -> gate_up 2645 -> silu -> down 1409
+```
+
+`device_kernel`, the second-largest line at **16.6%**, demangles to
+`cutlass::device_kernel<flash::FlashAttnFwdSm90<...>>` — FA3, one launch per
+full-attention layer per chunk. 977 launches, p50 **5.03 ms**, range 1.18-10.92
+ms as context depth grows.
+
+**Its efficiency is not scored here and no number is offered.** The grid is
+(78, 1, 1) — persistent, one block per SM — so sequence lengths are absent from
+the trace, and attention FLOPs depend entirely on them. Worse, two independent
+counts of the same window disagree on how many chunks it holds: `silu_mul`
+gives 2115 / 64 layers = **33.0**, FA3 gives 977 / 16 full-attn layers =
+**61.1**. A TFLOPS figure now would rest on a denominator that is provably
+inconsistent. Reconcile the chunk count first, then score with NVTX or `ncu`.
 
 ## Learnings
 

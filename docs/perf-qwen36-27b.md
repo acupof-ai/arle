@@ -490,6 +490,29 @@ per token over a 2048-token chunk, so `gate_up` is the fused 2×17408 projection
 MLP alone (`gate_up` + `down_proj`) is **69.7% of the FP8 GEMM time and ~40% of
 all GPU kernel time** on the anchor.
 
+**The two layer types, read off the same periodic sequence:**
+
+```
+linear layer (×48)   out_proj 503.6 -> gate_up 2645 -> silu -> down 1409
+                     -> in_proj 1255.7 -> conv1d 277 -> fq_fwd 773 us
+full-attn layer (×16) qkv 1117.0 -> paged_hd256 109.5 -> FA3 7231.7
+                     -> out_proj 503.6 -> gate_up 2645 -> silu -> down 1409
+```
+
+`device_kernel` — 16.6% of kernel time, the second-largest line — demangles to
+`cutlass::device_kernel<flash::FlashAttnFwdSm90<…>>`, i.e. **FA3**, one launch
+per full-attention layer per chunk. 977 launches, p50 **5.03 ms**, spanning
+1.18 → 10.92 ms as the chunk's context depth grows.
+
+**Its efficiency is not scorable from this trace, and it is not claimed here.**
+The grid is (78, 1, 1) — persistent, one block per SM — so the sequence lengths
+are not in the trace, and attention FLOPs depend entirely on them. Two
+independent counts of the same window also disagree on how many chunks it
+contains: `silu_mul` gives 2115 / 64 layers = **33.0**, FA3 gives 977 / 16
+full-attn layers = **61.1**. Until that is reconciled, any TFLOPS figure for
+FA3 would be built on a denominator I cannot defend. Next measurement: NVTX
+ranges or `ncu` on the prefill FA3 launches.
+
 **This kills the largest open item.** §1.1 records `gate_up` / `down` at 199 /
 189 TFLOPS, "64–67% — leave alone", and that number was measured at **33K cold,
 single request**. At the served c=16 shape the same kernels run at **87–93% of
@@ -1034,10 +1057,16 @@ queueing ramp.
 
    **The consequence re-ranks the project: on the anchor, the dominant cost
    cannot be made faster, only smaller.** Levers are prefix-cache hit rate,
-   sparsity, and effective context length — not kernels. Remaining prefill
-   kernel work is FA3 prefill (16.3%) and `pack_quantize` + norms (12.3%),
-   neither decomposed, and together they are half the size of a line that is
-   already at the floor.
+   sparsity, and effective context length — not kernels.
+
+6. **Prefill FA3 — 16.6%, the second-largest line, identified but unscored.**
+   `device_kernel` is `cutlass::device_kernel<flash::FlashAttnFwdSm90<…>>`, one
+   launch per full-attention layer per chunk, 977 launches, p50 5.03 ms over a
+   1.18–10.92 ms range (§1.3). **Efficiency is not derivable from the trace** —
+   the persistent (78, 1, 1) grid hides the sequence lengths, and two counts of
+   the same window disagree on chunk count (33.0 from `silu_mul`, 61.1 from
+   FA3). Reconcile that first, then score it with NVTX or `ncu`. This is the
+   next prefill measurement, and the largest one still open.
 6. **Sampling costs 30–40% of decode throughput at c ≥ 8** (§2.4) — measured on
    the anchor, so its size needs re-measuring on §2.0's shape. The gate at
    `executor/qwen35.rs:1984` tests *all* rows greedy. Do **not** re-open
