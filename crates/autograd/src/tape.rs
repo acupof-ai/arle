@@ -220,6 +220,11 @@ pub enum SavedContext {
         /// `(k, v, k_pos)` per ring block; `k_pos[c]` = absolute position of the
         /// block's col c (a Vec, not a scalar base, so zigzag shards mask right).
         blocks: SmallVec<[(TensorId, TensorId, Vec<usize>); 4]>,
+        /// Frozen-prompt-KV prefix block `(k, v, k_pos)`, or `None` for plain CP.
+        /// Replayed first in backward (grad_q kept, grad_k/v dropped — prefix is
+        /// a constant leaf). Kept out of `blocks` so it never ring-backs to an
+        /// owner (every rank holds the full prefix).
+        prefix: Option<(TensorId, TensorId, Vec<usize>)>,
         lse: TensorId,
         out: TensorId,
         rows: usize,

@@ -307,6 +307,25 @@ pub fn cp_causal_sdpa(
     store: &mut TensorStore,
     tape: &mut Tape,
 ) -> Result<TensorId> {
+    cp_causal_sdpa_with_prefix(q, k, v, cp_size, cp_rank, positions, None, 0, store, tape)
+}
+
+/// CP causal SDPA with an optional frozen-prompt-KV prefix. When `prefix_k`/`prefix_v`
+/// are given, every q row attends to the full prefix (positions `0..gen_start`) plus
+/// the ringed gen K/V. The prefix is a constant leaf — its grad is dropped in backward.
+#[allow(clippy::too_many_arguments)]
+pub fn cp_causal_sdpa_with_prefix(
+    q: TensorId,
+    k: TensorId,
+    v: TensorId,
+    cp_size: usize,
+    cp_rank: usize,
+    positions: Option<&[usize]>,
+    prefix: Option<(TensorId, TensorId)>,
+    gen_start: usize,
+    store: &mut TensorStore,
+    tape: &mut Tape,
+) -> Result<TensorId> {
     let shape = store.tensor(q)?.shape.clone();
     if shape.len() != 4 {
         return Err(AutogradError::InvalidRank {
@@ -318,13 +337,26 @@ pub fn cp_causal_sdpa(
 
     if store.backend().device() == Device::Cuda && cp_size > 1 {
         return cp_causal_sdpa_device_ring(
-            q, k, v, cp_size, cp_rank, positions, &shape, store, tape,
+            q, k, v, cp_size, cp_rank, positions, prefix, gen_start, &shape, store, tape,
         );
     }
 
-    // CPU / world==1: the whole local sequence is one KV block. Absolute positions
-    // are `positions` if given, else the contiguous default `cp_rank*s + row` (for
-    // world==1 cp_rank is 0, so 0..s — the plain-causal case gated on CPU).
+    // CPU / world==1: the whole local sequence is one KV block. With a prefix,
+    // concatenate prefix+gen k/v and run plain causal SDPA with q_start=gen_start
+    // (identical to the non-CP frozen path). Gen k/v arrive at kv_heads width;
+    // repeat to full heads to match the prefix (which is repeat_kv'd at capture).
+    if let Some((prefix_k, prefix_v)) = prefix {
+        let kv_heads = store.tensor(k)?.shape[1];
+        let kv_repeat = h / kv_heads;
+        let k_rep = crate::ops::repeat_kv(k, kv_repeat, store, tape)?;
+        let v_rep = crate::ops::repeat_kv(v, kv_repeat, store, tape)?;
+        let k_full = crate::ops::cat_seq(prefix_k, k_rep, store, tape)?;
+        let v_full = crate::ops::cat_seq(prefix_v, v_rep, store, tape)?;
+        return crate::ops::attention::causal_sdpa_recompute_with_q_start(
+            q, k_full, v_full, gen_start, store, tape,
+        );
+    }
+
     let tiles = b * h;
     let scale = 1.0 / (d as f32).sqrt();
     let q_pos: Vec<usize> = match positions {
@@ -354,6 +386,7 @@ pub fn cp_causal_sdpa(
         saved: SavedContext::RingAttentionCtx {
             q,
             blocks: smallvec![(k, v, q_pos.clone())],
+            prefix: None,
             lse: lse_id,
             out: out_id,
             rows: s,
@@ -385,6 +418,8 @@ fn cp_causal_sdpa_device_ring(
     cp_size: usize,
     cp_rank: usize,
     positions: Option<&[usize]>,
+    prefix: Option<(TensorId, TensorId)>,
+    gen_start: usize,
     shape: &[usize],
     store: &mut TensorStore,
     tape: &mut Tape,
@@ -422,7 +457,12 @@ fn cp_causal_sdpa_device_ring(
     let q_h = device_handle(store, q, "ring q")?;
     let q_pos_h = store.backend().upload(&q_pos_f32, &[s])?;
     let rows = num_q_tiles * s;
-    // Accumulator init: M=-inf, L=0, O=0 (device-resident, f32).
+
+    // Accumulator init: M=-inf, L=0, O=0 (device-resident, f32). With a frozen
+    // prompt prefix, run one extra merge step against the full prefix K/V first —
+    // every q row (abs position >= gen_start) can attend to every prefix row
+    // (0..gen_start), so the causal mask passes all prefix keys. The prefix is
+    // full-heads width (repeat_kv'd at capture), so num_kv_heads = num_q_heads.
     let mut acc_m = store
         .backend()
         .upload(&vec![f32::NEG_INFINITY; rows], &[rows])?;
@@ -430,6 +470,44 @@ fn cp_causal_sdpa_device_ring(
     let mut acc_o = store
         .backend()
         .upload(&vec![0.0f32; rows * d], &[rows * d])?;
+
+    let prefix_ctx = if let Some((prefix_k, prefix_v)) = prefix {
+        store.ensure_device(prefix_k)?;
+        store.ensure_device(prefix_v)?;
+        let pk_h = device_handle(store, prefix_k, "ring prefix k")?;
+        let pv_h = device_handle(store, prefix_v, "ring prefix v")?;
+        let prefix_pos: Vec<usize> = (0..gen_start).collect();
+        let prefix_pos_f32: Vec<f32> = prefix_pos.iter().map(|&p| p as f32).collect();
+        let prefix_pos_h = store.backend().upload(&prefix_pos_f32, &[gen_start])?;
+        let prefix_dims = RingBlockDims {
+            num_q_tiles,
+            num_q_heads: h,
+            num_kv_heads: h, // prefix k/v is repeat_kv'd to full heads
+            head_dim: d,
+            q_rows: s,
+            blk_len: gen_start,
+            sm_scale: scale,
+        };
+        let (m2, l2, o2) = store.backend().ring_block_fwd_merge(
+            &q_h,
+            &pk_h,
+            &pv_h,
+            &acc_m,
+            &acc_l,
+            &acc_o,
+            &q_pos_h,
+            &prefix_pos_h,
+            &q_pos,
+            &prefix_pos,
+            prefix_dims,
+        )?;
+        acc_m = m2;
+        acc_l = l2;
+        acc_o = o2;
+        Some((prefix_k, prefix_v, prefix_pos))
+    } else {
+        None
+    };
 
     // Rotate fresh k/v handles + their positions so the tape inputs stay immutable;
     // save each step's block handles + k_pos Vec for the backward replay. k_pos
@@ -476,6 +554,7 @@ fn cp_causal_sdpa_device_ring(
         saved: SavedContext::RingAttentionCtx {
             q,
             blocks: step_blocks,
+            prefix: prefix_ctx,
             lse: lse_id,
             out: out_id,
             rows: s,
@@ -524,6 +603,7 @@ pub(crate) fn cp_ring_attention_backward(
     let SavedContext::RingAttentionCtx {
         q,
         blocks,
+        prefix,
         lse,
         out,
         rows,
@@ -546,6 +626,7 @@ pub(crate) fn cp_ring_attention_backward(
         return cp_ring_attention_backward_device(
             &entry.input_ids,
             blocks,
+            prefix.as_ref(),
             q,
             lse,
             out,
@@ -625,6 +706,7 @@ pub(crate) fn cp_ring_attention_backward(
 fn cp_ring_attention_backward_device(
     input_ids: &[TensorId],
     blocks: &smallvec::SmallVec<[(TensorId, TensorId, Vec<usize>); 4]>,
+    prefix: Option<&(TensorId, TensorId, Vec<usize>)>,
     q: TensorId,
     lse: TensorId,
     out: TensorId,
@@ -667,6 +749,45 @@ fn cp_ring_attention_backward_device(
         &vec![0.0f32; num_q_tiles * rows * d],
         &[num_q_tiles * rows * d],
     )?;
+
+    // Frozen-prompt-KV prefix replay: run the backward block against the full
+    // prefix K/V. The prefix is a constant leaf (requires_grad=false), so its
+    // grad_k/grad_v are dropped — only grad_q is kept. Prefix is full-heads width
+    // (repeat_kv'd at capture), so num_kv_heads = num_q_heads. Prefix is NOT
+    // ring-backed: every rank holds the full prefix, so there's no owner to return
+    // its grad to.
+    if let Some((prefix_k, prefix_v, prefix_pos)) = prefix {
+        let prefix_len = prefix_pos.len();
+        let pk_h = device_handle(store, *prefix_k, "ring prefix k")?;
+        let pv_h = device_handle(store, *prefix_v, "ring prefix v")?;
+        let prefix_pos_f32: Vec<f32> = prefix_pos.iter().map(|&p| p as f32).collect();
+        let prefix_pos_h = store.backend().upload(&prefix_pos_f32, &[prefix_len])?;
+        let prefix_dims = RingBlockDims {
+            num_q_tiles,
+            num_q_heads: h,
+            num_kv_heads: h,
+            head_dim: d,
+            q_rows: rows,
+            blk_len: prefix_len,
+            sm_scale: scale,
+        };
+        let (gq2, _gk_prefix, _gv_prefix) = store.backend().ring_block_bwd(
+            &q_h,
+            &pk_h,
+            &pv_h,
+            &out_h,
+            &lse_h,
+            &dout_h,
+            &grad_q,
+            &q_pos_h,
+            &prefix_pos_h,
+            q_pos,
+            prefix_pos,
+            prefix_dims,
+        )?;
+        grad_q = gq2;
+    }
+
     // Per-step grad_k/grad_v handles, produced in forward-ring order.
     let mut step_gk: smallvec::SmallVec<[DeviceHandle; 4]> = smallvec![];
     let mut step_gv: smallvec::SmallVec<[DeviceHandle; 4]> = smallvec![];

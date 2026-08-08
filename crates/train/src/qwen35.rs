@@ -736,6 +736,8 @@ impl Qwen35Layer {
         batch: usize,
         gen_start: usize,
         gen_len: usize,
+        cp: crate::context_parallel::CpContext,
+        cp_positions: Option<&[usize]>,
         store: &mut TensorStore,
         tape: &mut Tape,
     ) -> Result<TensorId> {
@@ -743,11 +745,28 @@ impl Qwen35Layer {
         let attn_out = match (&self.self_attn, layer_prefix) {
             (Qwen35Attention::Full(attn), LayerPrefix::Full(prefix_kv)) => self
                 .forward_full_attention_gen_segment(
-                    h, attn, cfg, tp, cos_gen, sin_gen, prefix_kv, batch, gen_start, gen_len,
-                    store, tape,
+                    h,
+                    attn,
+                    cfg,
+                    tp,
+                    cos_gen,
+                    sin_gen,
+                    prefix_kv,
+                    batch,
+                    gen_start,
+                    gen_len,
+                    cp,
+                    cp_positions,
+                    store,
+                    tape,
                 )?,
-            (Qwen35Attention::Linear(attn), LayerPrefix::Linear(prefix_state)) => self
-                .forward_linear_attention_gen_segment(
+            (Qwen35Attention::Linear(attn), LayerPrefix::Linear(prefix_state)) => {
+                if cp.is_enabled() {
+                    return Err(Qwen35Error::InvalidConfig(
+                        "frozen-prompt-KV + CP is not yet implemented for linear attention layers",
+                    ));
+                }
+                self.forward_linear_attention_gen_segment(
                     h,
                     attn,
                     cfg,
@@ -756,7 +775,8 @@ impl Qwen35Layer {
                     gen_len,
                     store,
                     tape,
-                )?,
+                )?
+            }
             _ => {
                 return Err(Qwen35Error::InvalidConfig(
                     "frozen-prompt-KV layer prefix kind does not match the layer attention kind",
@@ -1974,6 +1994,8 @@ impl Qwen35Layer {
         batch: usize,
         gen_start: usize,
         gen_len: usize,
+        cp: crate::context_parallel::CpContext,
+        cp_positions: Option<&[usize]>,
         store: &mut TensorStore,
         tape: &mut Tape,
     ) -> Result<TensorId> {
@@ -2042,17 +2064,34 @@ impl Qwen35Layer {
         let k = rope(k, cos_gen, sin_gen, store, tape)?;
 
         let kv_repeat = local_attention_heads / local_key_value_heads;
-        let k_gen = repeat_kv(k, kv_repeat, store, tape)?;
-        let v_gen = repeat_kv(v, kv_repeat, store, tape)?;
 
-        // Concatenate the frozen prefix K/V (positions 0..gen_start) with the gen
-        // K/V (positions gen_start..seq_len) along the seq axis. The prefix is a
-        // constant leaf so grad flows only into k_gen/v_gen.
-        let k_full = cat_seq(prefix_kv.k, k_gen, store, tape)?;
-        let v_full = cat_seq(prefix_kv.v, v_gen, store, tape)?;
+        let attn_hidden = if cp.is_enabled() {
+            // CP: gen k/v stay at kv_heads width (GQA resolved inside the ring
+            // kernel). The prefix k/v is full-heads width (repeat_kv'd at capture),
+            // so the prefix merge step sets num_kv_heads = num_q_heads.
+            autograd::ops::ring_attention::cp_causal_sdpa_with_prefix(
+                q,
+                k,
+                v,
+                cp.size,
+                cp.rank,
+                cp_positions,
+                Some((prefix_kv.k, prefix_kv.v)),
+                gen_start,
+                store,
+                tape,
+            )?
+        } else {
+            let k_gen = repeat_kv(k, kv_repeat, store, tape)?;
+            let v_gen = repeat_kv(v, kv_repeat, store, tape)?;
+            // Concatenate the frozen prefix K/V (positions 0..gen_start) with the gen
+            // K/V (positions gen_start..seq_len) along the seq axis. The prefix is a
+            // constant leaf so grad flows only into k_gen/v_gen.
+            let k_full = cat_seq(prefix_kv.k, k_gen, store, tape)?;
+            let v_full = cat_seq(prefix_kv.v, v_gen, store, tape)?;
+            causal_sdpa_recompute_with_q_start(q, k_full, v_full, gen_start, store, tape)?
+        };
 
-        let attn_hidden =
-            causal_sdpa_recompute_with_q_start(q, k_full, v_full, gen_start, store, tape)?;
         let attn_hidden = if let Some(gate) = gate {
             let gate = sigmoid(gate, store, tape)?;
             mul(attn_hidden, gate, store, tape)?
@@ -4618,6 +4657,7 @@ impl Qwen35Model {
         gen_ids: &[u32],
         prompt_positions: &[u32],
         gen_positions: &[u32],
+        cp: crate::context_parallel::CpContext,
     ) -> Result<TensorId> {
         if prompt_ids.len() != prompt_positions.len() {
             return Err(Qwen35Error::InputLenMismatch {
@@ -4697,6 +4737,9 @@ impl Qwen35Model {
             .collect::<Vec<_>>();
         let cos_gen = select_cache_rows(self.cos_cache, &gen_pos, store)?;
         let sin_gen = select_cache_rows(self.sin_cache, &gen_pos, store)?;
+        // CP: gen_positions are the absolute rows of this rank's gen shard; pass them
+        // through so the ring kernel masks causally by true position. Off-CP: None.
+        let cp_positions: Option<Vec<usize>> = cp.is_enabled().then_some(gen_pos.clone());
 
         let mut hidden = embedding(self.embed_tokens, &gen_token_indices, store, tape)?;
         hidden = reshape(
@@ -4712,6 +4755,7 @@ impl Qwen35Model {
             let cfg = self.config.clone();
             let tp = self.tp;
             let (cos_id, sin_id) = (cos_gen, sin_gen);
+            let cp_positions = cp_positions.clone();
             let layer_fn = {
                 let layers = Arc::clone(&layers);
                 let cache = Arc::clone(&cache);
@@ -4727,6 +4771,8 @@ impl Qwen35Model {
                             batch,
                             gen_start,
                             gen_len,
+                            cp,
+                            cp_positions.as_deref(),
                             s,
                             t,
                         )
@@ -4760,6 +4806,8 @@ impl Qwen35Model {
                     batch,
                     gen_start,
                     gen_len,
+                    cp,
+                    cp_positions.as_deref(),
                     store,
                     tape,
                 )?;
