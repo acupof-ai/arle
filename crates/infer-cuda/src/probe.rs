@@ -23,6 +23,10 @@ pub(crate) struct ProbeConfig {
     lens_layers: usize,
     token_entropy: bool,
     stages: bool,
+    /// `ARLE_PROBE_STAGE_FULL`: append the whole row to each stage record.
+    /// A summary cannot answer "how far apart are two runtimes' vectors" —
+    /// that needs `||a-b|| / ||a||`, so the full row has to cross the wire.
+    stage_full: bool,
     path: PathBuf,
 }
 
@@ -53,10 +57,14 @@ fn init_config() -> Option<ProbeConfig> {
     let stages = std::env::var("ARLE_PROBE_STAGES")
         .ok()
         .is_some_and(|value| value.trim() != "0" && !value.trim().is_empty());
+    let stage_full = std::env::var("ARLE_PROBE_STAGE_FULL")
+        .ok()
+        .is_some_and(|value| value.trim() != "0" && !value.trim().is_empty());
     Some(ProbeConfig {
         lens_layers,
         token_entropy,
         stages,
+        stage_full,
         path: PathBuf::from(path),
     })
 }
@@ -357,8 +365,19 @@ fn emit_stage(stage: &str, layer: usize, row: usize, pos: u64, values: &[f32]) {
                 if v > values[mx] { i } else { mx },
             )
         });
+    // L2 in f64: the scale a cross-runtime delta must be judged against.
+    let l2 = values
+        .iter()
+        .map(|&v| f64::from(v) * f64::from(v))
+        .sum::<f64>()
+        .sqrt();
+    let full = if config().is_some_and(|cfg| cfg.stage_full) {
+        format!(",\"values\":{values:?}")
+    } else {
+        String::new()
+    };
     emit(format_args!(
-        "{{\"phase\":\"stage\",\"stage\":\"{stage}\",\"layer\":{layer},\"row\":{row},\"pos\":{pos},\"n\":{},\"sum\":{sum:.6},\"head\":{head:?},\"tail\":{tail:?},\"min\":{:.6},\"argmin\":{argmin},\"max\":{:.6},\"argmax\":{argmax}}}",
+        "{{\"phase\":\"stage\",\"stage\":\"{stage}\",\"layer\":{layer},\"row\":{row},\"pos\":{pos},\"n\":{},\"sum\":{sum:.6},\"l2\":{l2:.6},\"head\":{head:?},\"tail\":{tail:?},\"min\":{:.6},\"argmin\":{argmin},\"max\":{:.6},\"argmax\":{argmax}{full}}}",
         values.len(),
         values.get(argmin).copied().unwrap_or(f32::NAN),
         values.get(argmax).copied().unwrap_or(f32::NAN),
