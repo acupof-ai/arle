@@ -3109,10 +3109,7 @@ pub fn masked_writeback_step<O: Optimizer>(
     // Frozen-prompt-KV: forward only the gen segment, rebasing masked positions
     // into it. gen_start=0 keeps positions absolute for the byte-identical full
     // path. Every masked target p >= prompt_len-1 = gen_start, so p-gen_start>=0.
-    // Disabled under CP (the gen-segment path is single-rank; CP shards the full
-    // sequence instead).
-    let frozen =
-        crate::runtime_flags::writeback_frozen_prompt_kv() && prompt_len > 1 && !cp.is_enabled();
+    let frozen = crate::runtime_flags::writeback_frozen_prompt_kv() && prompt_len > 1;
     let gen_start = if frozen { prompt_len - 1 } else { 0 };
 
     // Split the (predicting-position p, target token) pairs into the parallel
