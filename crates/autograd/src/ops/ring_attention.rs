@@ -476,8 +476,9 @@ fn cp_causal_sdpa_device_ring(
         store.ensure_device(prefix_v)?;
         let pk_h = device_handle(store, prefix_k, "ring prefix k")?;
         let pv_h = device_handle(store, prefix_v, "ring prefix v")?;
+        // Prefix positions are always 0..gen_start (contiguous from 0).
         let prefix_pos: Vec<usize> = (0..gen_start).collect();
-        let prefix_pos_f32: Vec<f32> = prefix_pos.iter().map(|&p| p as f32).collect();
+        let prefix_pos_f32: Vec<f32> = (0..gen_start).map(|p| p as f32).collect();
         let prefix_pos_h = store.backend().upload(&prefix_pos_f32, &[gen_start])?;
         let prefix_dims = RingBlockDims {
             num_q_tiles,
@@ -504,7 +505,7 @@ fn cp_causal_sdpa_device_ring(
         acc_m = m2;
         acc_l = l2;
         acc_o = o2;
-        Some((prefix_k, prefix_v, prefix_pos))
+        Some((prefix_k, prefix_v, gen_start))
     } else {
         None
     };
@@ -706,7 +707,7 @@ pub(crate) fn cp_ring_attention_backward(
 fn cp_ring_attention_backward_device(
     input_ids: &[TensorId],
     blocks: &smallvec::SmallVec<[(TensorId, TensorId, Vec<usize>); 4]>,
-    prefix: Option<&(TensorId, TensorId, Vec<usize>)>,
+    prefix: Option<&(TensorId, TensorId, usize)>,
     q: TensorId,
     lse: TensorId,
     out: TensorId,
@@ -756,11 +757,12 @@ fn cp_ring_attention_backward_device(
     // (repeat_kv'd at capture), so num_kv_heads = num_q_heads. Prefix is NOT
     // ring-backed: every rank holds the full prefix, so there's no owner to return
     // its grad to.
-    if let Some((prefix_k, prefix_v, prefix_pos)) = prefix {
-        let prefix_len = prefix_pos.len();
+    if let Some((prefix_k, prefix_v, gen_start)) = prefix {
+        let prefix_len = *gen_start;
         let pk_h = device_handle(store, *prefix_k, "ring prefix k")?;
         let pv_h = device_handle(store, *prefix_v, "ring prefix v")?;
-        let prefix_pos_f32: Vec<f32> = prefix_pos.iter().map(|&p| p as f32).collect();
+        let prefix_pos: Vec<usize> = (0..prefix_len).collect();
+        let prefix_pos_f32: Vec<f32> = (0..prefix_len).map(|p| p as f32).collect();
         let prefix_pos_h = store.backend().upload(&prefix_pos_f32, &[prefix_len])?;
         let prefix_dims = RingBlockDims {
             num_q_tiles,
@@ -782,7 +784,7 @@ fn cp_ring_attention_backward_device(
             &q_pos_h,
             &prefix_pos_h,
             q_pos,
-            prefix_pos,
+            &prefix_pos,
             prefix_dims,
         )?;
         grad_q = gq2;

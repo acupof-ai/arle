@@ -12,14 +12,13 @@ use autograd::{
     AutogradError, Device, Tape, Tensor, TensorId, TensorStore,
     ops::{
         LinearAttentionParams, MoeGroupedLinearExpert, MoeGroupedLinearInput, MoeGroupedRoute,
-        MoeTopK, add, add_broadcast, cat_seq, causal_sdpa_recompute,
-        causal_sdpa_recompute_with_q_start, causal_sdpa_with_q_start, checkpoint_sequential,
-        embedding, linear_attention_boundary, linear_attention_core,
-        linear_attention_core_with_carry, linear_attention_core_with_carry_taped,
-        linear_attention_ctx_bytes, linear_attention_row_transient_bytes, matmul_bt_with_site,
-        moe_grouped_linear, moe_grouped_weighted_scatter, moe_topk_softmax,
-        moe_topk_softmax_with_indices, mul, repeat_kv, reshape, rmsnorm, rope, sigmoid, silu,
-        slice, transpose,
+        MoeTopK, add, add_broadcast, causal_sdpa_recompute, causal_sdpa_recompute_with_q_start,
+        causal_sdpa_with_q_start, checkpoint_sequential, embedding, linear_attention_boundary,
+        linear_attention_core, linear_attention_core_with_carry,
+        linear_attention_core_with_carry_taped, linear_attention_ctx_bytes,
+        linear_attention_row_transient_bytes, matmul_bt_with_site, moe_grouped_linear,
+        moe_grouped_weighted_scatter, moe_topk_softmax, moe_topk_softmax_with_indices, mul,
+        repeat_kv, reshape, rmsnorm, rope, sigmoid, silu, slice, transpose,
     },
     tape::checkpoint_replay_mem_stage,
 };
@@ -2063,34 +2062,23 @@ impl Qwen35Layer {
         let q = rope(q, cos_gen, sin_gen, store, tape)?;
         let k = rope(k, cos_gen, sin_gen, store, tape)?;
 
-        let kv_repeat = local_attention_heads / local_key_value_heads;
-
-        let attn_hidden = if cp.is_enabled() {
-            // CP: gen k/v stay at kv_heads width (GQA resolved inside the ring
-            // kernel). The prefix k/v is full-heads width (repeat_kv'd at capture),
-            // so the prefix merge step sets num_kv_heads = num_q_heads.
-            autograd::ops::ring_attention::cp_causal_sdpa_with_prefix(
-                q,
-                k,
-                v,
-                cp.size,
-                cp.rank,
-                cp_positions,
-                Some((prefix_kv.k, prefix_kv.v)),
-                gen_start,
-                store,
-                tape,
-            )?
-        } else {
-            let k_gen = repeat_kv(k, kv_repeat, store, tape)?;
-            let v_gen = repeat_kv(v, kv_repeat, store, tape)?;
-            // Concatenate the frozen prefix K/V (positions 0..gen_start) with the gen
-            // K/V (positions gen_start..seq_len) along the seq axis. The prefix is a
-            // constant leaf so grad flows only into k_gen/v_gen.
-            let k_full = cat_seq(prefix_kv.k, k_gen, store, tape)?;
-            let v_full = cat_seq(prefix_kv.v, v_gen, store, tape)?;
-            causal_sdpa_recompute_with_q_start(q, k_full, v_full, gen_start, store, tape)?
-        };
+        // CP + off-CP share one path: cp_causal_sdpa_with_prefix handles cp_size==1
+        // by falling through to its prefix CPU block (repeat_kv + cat + q_start
+        // causal SDPA), identical to the old inline else branch. Gen k/v stay at
+        // kv_heads width under CP (GQA resolved in the ring kernel); off-CP the
+        // prefix block repeat_kv's them to match the full-heads prefix.
+        let attn_hidden = autograd::ops::ring_attention::cp_causal_sdpa_with_prefix(
+            q,
+            k,
+            v,
+            cp.size,
+            cp.rank,
+            cp_positions,
+            Some((prefix_kv.k, prefix_kv.v)),
+            gen_start,
+            store,
+            tape,
+        )?;
 
         let attn_hidden = if let Some(gate) = gate {
             let gate = sigmoid(gate, store, tape)?;
@@ -4739,7 +4727,9 @@ impl Qwen35Model {
         let sin_gen = select_cache_rows(self.sin_cache, &gen_pos, store)?;
         // CP: gen_positions are the absolute rows of this rank's gen shard; pass them
         // through so the ring kernel masks causally by true position. Off-CP: None.
-        let cp_positions: Option<Vec<usize>> = cp.is_enabled().then_some(gen_pos.clone());
+        // Arc so checkpoint_sequential's per-group layer_fn.clone() is a refcount
+        // bump, not a deep copy of the position vector.
+        let cp_positions: Option<Arc<[usize]>> = cp.is_enabled().then(|| Arc::from(gen_pos));
 
         let mut hidden = embedding(self.embed_tokens, &gen_token_indices, store, tape)?;
         hidden = reshape(
