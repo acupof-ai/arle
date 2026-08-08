@@ -43,6 +43,52 @@ enum ChatTemplate {
     UnsupportedChat { reason: String },
 }
 
+/// Streaming detokenizer. A codepoint's bytes can span a token boundary, so
+/// decoding each delta on its own replaces the split character with U+FFFD —
+/// one per orphaned byte, so a 4-byte emoji arrives as two of them. Holds the
+/// tokens carrying an incomplete tail until the bytes that finish it arrive.
+#[derive(Default)]
+pub struct IncrementalDetokenizer {
+    pending: Vec<u32>,
+}
+
+/// A codepoint is at most 4 bytes and a token at least 1, so a partial tail
+/// spans at most 4 tokens; a longer replacement run is genuinely invalid output
+/// and must be emitted rather than buffered forever.
+const MAX_PENDING_TOKENS: usize = 4;
+
+impl IncrementalDetokenizer {
+    /// Text that is safe to emit now. Empty while a codepoint is in progress.
+    pub fn push(&mut self, tok: &OpenAiTokenizer, ids: &[u32]) -> String {
+        self.pending.extend_from_slice(ids);
+        let text = tok.decode(&self.pending).unwrap_or_default();
+        if !text.ends_with(char::REPLACEMENT_CHARACTER) || self.pending.len() > MAX_PENDING_TOKENS {
+            self.pending.clear();
+            return text;
+        }
+        let n = self.pending.len();
+        for k in 1..=n {
+            let head = tok.decode(&self.pending[..n - k]).unwrap_or_default();
+            if !head.ends_with(char::REPLACEMENT_CHARACTER) {
+                self.pending.drain(..n - k);
+                return head;
+            }
+        }
+        String::new()
+    }
+
+    /// Emit whatever is still held. The stream is over, so an unfinished
+    /// codepoint will never complete.
+    pub fn flush(&mut self, tok: &OpenAiTokenizer) -> String {
+        if self.pending.is_empty() {
+            return String::new();
+        }
+        let text = tok.decode(&self.pending).unwrap_or_default();
+        self.pending.clear();
+        text
+    }
+}
+
 /// Tokenizer and chat-template adapter for the OpenAI v1 facade.
 #[derive(Clone)]
 pub struct OpenAiTokenizer {
@@ -531,6 +577,70 @@ mod tests {
             msg("user", "hi"),
             msg("assistant", "yo")
         ]));
+    }
+
+    /// A 4-byte emoji streamed one token at a time must arrive intact, not as
+    /// two U+FFFD. Needs a real byte-level vocab, so it runs against
+    /// `INFER_TEST_MODEL_PATH` (or the repo-local Qwen3.5-0.8B).
+    #[test]
+    fn streaming_detokenizer_rejoins_split_codepoints() {
+        let dir = std::env::var("INFER_TEST_MODEL_PATH")
+            .unwrap_or_else(|_| "models/Qwen3.5-0.8B".to_string());
+        let path = std::path::Path::new(&dir);
+        if !path.join("tokenizer.json").exists() {
+            eprintln!("no tokenizer.json under {dir}; skipping split-codepoint test");
+            return;
+        }
+        let tok = OpenAiTokenizer::from_model_dir_without_chat(path, "test").expect("load");
+        let text = "1. ✅ ok\n2. 🚀 go";
+        let ids = tok.encode(text).expect("encode");
+        // Whole-sequence decode is the reference; per-token streaming must match.
+        assert_eq!(tok.decode(&ids).expect("decode"), text);
+
+        // The defect being fixed: decoding each token alone splits the emoji.
+        let naive: String = ids
+            .iter()
+            .map(|&id| tok.decode(&[id]).unwrap_or_default())
+            .collect();
+        assert!(
+            naive.contains(char::REPLACEMENT_CHARACTER),
+            "vocab does not split this codepoint, so the test proves nothing"
+        );
+
+        let mut detok = IncrementalDetokenizer::default();
+        let streamed: String = ids.iter().map(|&id| detok.push(&tok, &[id])).collect();
+        let streamed = streamed + &detok.flush(&tok);
+        assert_eq!(
+            streamed, text,
+            "streaming decode dropped or replaced a split codepoint"
+        );
+        assert!(!streamed.contains(char::REPLACEMENT_CHARACTER));
+    }
+
+    /// Bytes that never form a valid codepoint must still be emitted, or a
+    /// stream would stall forever holding them.
+    #[test]
+    fn streaming_detokenizer_does_not_buffer_forever() {
+        let dir = std::env::var("INFER_TEST_MODEL_PATH")
+            .unwrap_or_else(|_| "models/Qwen3.5-0.8B".to_string());
+        let path = std::path::Path::new(&dir);
+        if !path.join("tokenizer.json").exists() {
+            eprintln!("no tokenizer.json under {dir}; skipping invalid-run test");
+            return;
+        }
+        let tok = OpenAiTokenizer::from_model_dir_without_chat(path, "test").expect("load");
+        // A run of continuation bytes: the emoji's tail tokens without its lead.
+        let ids = tok.encode("🚀🚀🚀").expect("encode");
+        let mut detok = IncrementalDetokenizer::default();
+        let mut out = String::new();
+        for &id in &ids[1..] {
+            out.push_str(&detok.push(&tok, &[id]));
+        }
+        out.push_str(&detok.flush(&tok));
+        assert!(
+            !out.is_empty(),
+            "invalid bytes were buffered instead of emitted"
+        );
     }
 
     // A trimmed Qwen-style ChatML jinja template exercising the standard HF
