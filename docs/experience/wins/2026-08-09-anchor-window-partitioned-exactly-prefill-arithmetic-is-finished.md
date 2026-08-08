@@ -95,6 +95,40 @@ double the necessary traffic. The rest of the tail is written the same way.
 Total identified headroom rises from 12% to **22.6% of wall**, and 59% of it is
 in the tail.
 
+## The tail's gap is inflation, not stall — `ncu`, same day
+
+A microbench of `pack_quantize` at the traced shapes (rows 2048, cols 5120 /
+17408 / 6144), current form against one warp per quantization block with
+`ushort4` loads and values held in registers:
+
+```
+cols= 5120   cur  88.5 us (0.36 TB/s)   vec  25.1 us (1.27 TB/s)   3.53x   mismatches=0
+cols=17408   cur 319.3 us (0.34 TB/s)   vec  86.3 us (1.25 TB/s)   3.70x   mismatches=0
+cols= 6144   cur 107.3 us (0.36 TB/s)   vec  29.6 us (1.29 TB/s)   3.62x   mismatches=0
+```
+
+| `ncu` metric | current | vectorized |
+|---|---:|---:|
+| duration | 101.4 µs | 27.6 µs (3.67×) |
+| executed instructions | 46.79 M | **11.81 M (3.96× fewer)** |
+| SM (compute) throughput | 81.3% | 74.9% |
+| **DRAM throughput** | **5.2%** | 19.2% |
+| achieved occupancy | 89.8% | 83.7% |
+| executed IPC | 3.30 | 3.21 |
+
+**The speedup equals the instruction reduction, and the memory system was never
+the constraint.** Both versions issue at ~80% of SM throughput with IPC above
+3.2 and occupancy near 90%; DRAM sits at 5.2% while the current kernel runs. The
+gap the tail carries is `T_inflation` — instructions the implementation added —
+and `T_stall` is empty.
+
+This contradicted my own framing, which had called the tail "inflation and stall
+jointly" on the reasoning that 2-byte accesses cannot keep enough bytes in
+flight. They can; the kernel simply never asks for enough of them, because it
+spends its cycles on address arithmetic, a block reduction, and two
+`__syncthreads` per 128 elements. **The stall-class remedies — TMA, async copy,
+warp specialization, deeper pipelining — would return nothing here.**
+
 ## Rule
 
 **When the denominator is hidden, measure the slope.** FA3's grid is persistent,
@@ -107,6 +141,14 @@ recovered from a derivative when it cannot be recovered from a ratio.
 as a contradiction that blocked a measurement for a day. It was chunks vs
 segments. Before treating a mismatch as an error, check that both sides name the
 same unit.
+
+**A kernel at 7.6% of bandwidth is not necessarily bandwidth-bound.** The
+inference "slow, and it moves a lot of bytes, so it is starved on memory" was
+wrong by an order of magnitude: DRAM was at 5.2% and the SM at 81%. A low
+achieved bandwidth is equally consistent with a kernel that is too busy to ask
+for memory. Check SM throughput and IPC before assigning a bandwidth-class
+remedy — the four gap buckets have disjoint remedies precisely so that a
+misassignment is expensive.
 
 **Partition beats fit.** The old model was a sum of point estimates and closed
 79%; the missing 21% read as one unexplained effect. Assigning every kernel to a
