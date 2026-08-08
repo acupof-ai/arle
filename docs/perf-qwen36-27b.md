@@ -43,8 +43,9 @@ invalidated it. **Check this table before ranking anything off a number.**
 | §5.2 | vs SGLang, W8A16 | 08-06 | — | 33K | current |
 | ceiling | c=16 window, anchor workload | 08-08 `70760bc09` | 9 rows/tick at nominal 16 | 32.5K | current, but the window undersamples decode 2–6× — see the note there |
 | §2.0 | c=16 window, **decode-shaped** workload | 08-08 `70760bc09` | **16.0 rows/tick**, four counts | 2.5K | **current — the decode baseline**, window reconciled to +6.8% |
+| §1.3 | FP8 GEMM decomposed, per layer | 08-08 `70760bc09` | c=16 | 32.5K anchor | **current — the prefill baseline.** Read off the anchor trace, no new GPU time |
 
-Eleven of the fourteen are batch 1 or batch-1-derived. Thirteen of the fourteen
+Eleven of the fifteen are batch 1 or batch-1-derived. Fourteen of the fifteen
 run the **anchor** workload, which is 279:1 prompt:output and in which all
 decode together is 2–6% of GPU time — so read decode numbers off **§2.0**, the
 one decode-shaped capture, and prefill numbers off the anchor. The two
@@ -300,19 +301,19 @@ flowchart TB
 
     A3 --> P{"ForwardMode"}
 
-    subgraph PREFILL["Prefill — compute-bound, GPU 83.9% busy"]
+    subgraph PREFILL["Prefill — 94% of GPU time on the anchor (279:1 prompt:output)"]
         direction TB
-        B1["chunk ≤4096 tok"] --> B2["quantized GEMM<br/>FP8 29% · W8A16 58-88%"]
-        B2 --> B3["full attention ×16<br/>FA3 / TileLang"]
-        B3 --> B4["linear attention ×48<br/>FlashQLA chunked GDR"]
-        B4 --> B5["prefix sidecar snapshot<br/>146.8 MiB per stride boundary"]
+        B1["chunk 2048 tok"] --> B2["FP8 GEMM — 57.7% of all kernel time<br/>gate_up 33.9% at 93% of peak<br/>down 24.2% at 88% — AT THE FLOOR"]
+        B2 --> B3["full attention ×16<br/>FA3 / TileLang — 16.3%"]
+        B3 --> B4["linear attention ×48<br/>FlashQLA chunked GDR — 10.6%"]
+        B4 --> B5["pack_quantize + norms — 12.3%<br/>prefix sidecar 146.8 MiB per stride"]
     end
 
-    subgraph DECODE["Decode — per-row bound at c=16, 85% of tick scales with rows"]
+    subgraph DECODE["Decode — 2.1-6.1% of GPU time on the anchor, 100% of a decode-shaped one"]
         direction TB
-        C1["draft — DFlash backbone, block 6<br/>19.9% of tick<br/>batched only if ALL rows greedy"] --> C2["snapshot recurrent<br/>2.1%"]
-        C2 --> C3["verify — trunk forward<br/>66.6% of tick<br/>5.69 ms/row at c=16, 33K"]
-        C3 --> C4["accept + commit<br/>4.1%"]
+        C1["draft — DFlash backbone, block 6<br/>attention 30.5% of a decode-shaped tick<br/>slot-batched 3a8f99b1f"] --> C2["snapshot recurrent"]
+        C2 --> C3["verify — trunk forward<br/>FP8 GEMM 28.8% · GDN 21.0%<br/>full-attn 1.8% at 2.5K ctx, 42.5% at 32.5K"]
+        C3 --> C4["accept + commit"]
         C4 --> C5["rollback replay<br/>batched varlen"]
     end
 
@@ -411,7 +412,7 @@ Per-part ceilings decide where work is worth doing:
 
 | part | achieved | ceiling | verdict |
 |---|---|---|---|
-| DeepGEMM `gate_up` / `down` | 199 / 189 TFLOPS | ~296 FP8 | **64–67% — leave alone** |
+| DeepGEMM `gate_up` / `down` | 199 / 189 TFLOPS | ~296 FP8 | 64–67% at THIS shape; **93 / 88% at the served c=16 shape — see §1.3** |
 | full attention | 54 TFLOPS | ~148 BF16 | 36%, and on TileLang rather than the FA3 decode already uses |
 | `gated_delta_rule_prefill_recurrent` | — | — | not compute-bound: `<<<48, …>>>` on **78 SMs**, scanning the sequence serially inside each block |
 
@@ -451,6 +452,55 @@ Three conclusions that hold for both weight paths:
 Roofline: ~1.68 PFLOP for a 33K prefill (22.3 B GEMM params × 2 × 33e3, plus
 0.21 PFLOP causal full attention over 16 layers) against 148 TFLOPS BF16 →
 **11.4 s floor**. SGLang 54% MFU, ARLE 46% after the FlashQLA fix.
+
+---
+
+### 1.3 The anchor's biggest line, decomposed — it is at ~90% of FP8 peak
+
+The `nsys` c=16 anchor capture, `70760bc09`, same window as §"Measured". Read
+off the trace with no new GPU time; the launch sequence is exactly periodic, so
+each GEMM is identified by the kernel it sits between and by the dimension of
+the `pack_quantize` that feeds it.
+
+`sm90_fp8_gemm_1d2d_impl` is **57.7% of all kernel time** (16.51 s of 28.60 s),
+in one launch shape — grid (78, 1, 1), i.e. one persistent block per SM, which
+is DeepGEMM's design and not a starved grid. 14,094 launches resolve into
+**four GEMMs per layer over 176 prefill chunks of 2048 tokens**:
+
+```
+pack K=5120   -> GEMM  503.7 us   attention out_proj   (K 6144 -> N 5120)
+pack K=5120   -> GEMM 2646.8 us   gate_up              (K 5120 -> N 34816)
+                 silu_mul (68, 2048)
+pack K=17408  -> GEMM 1409.0 us   down_proj            (K 17408 -> N 5120)
+pack K=5120   -> GEMM 1256.7 us   linear-attn in_proj
+                 split2 -> conv1d -> fq_fwd
+```
+
+`silu_mul` grid (68, 2048) pins the shape: 68 × 256 = 17408 = `intermediate_size`
+per token over a 2048-token chunk, so `gate_up` is the fused 2×17408 projection.
+`hidden_size` 5120, `intermediate_size` 17408, 64 layers.
+
+| GEMM | share of FP8 GEMM | TFLOPS | of ~296 FP8 peak |
+|---|---:|---:|---:|
+| `gate_up` | **33.9%** | 275.9 | **93.2%** |
+| `down_proj` | 24.2% | 259.1 | 87.5% |
+| attention `out_proj` | 8.7% | 255.8 | 86.4% |
+| linear-attn `in_proj` | 21.6% | — | N not resolved from the trace |
+
+MLP alone (`gate_up` + `down_proj`) is **69.7% of the FP8 GEMM time and ~40% of
+all GPU kernel time** on the anchor.
+
+**This kills the largest open item.** §1.1 records `gate_up` / `down` at 199 /
+189 TFLOPS, "64–67% — leave alone", and that number was measured at **33K cold,
+single request**. At the served c=16 shape the same kernels run at **87–93% of
+FP8 peak**. The anchor's dominant cost is not inefficient; it is the hardware
+floor. There is no GEMM lever here — the only way to reduce it is to do less
+matrix work (prefix cache hit rate, sparsity, shorter effective context), not
+faster matrix work.
+
+Same shape error as the draft attention, in the opposite direction: a number
+measured at one shape was governing a decision at another. There it understated
+a lever by 7×; here it overstated one.
 
 ---
 
@@ -848,8 +898,9 @@ Ceilings belong to levers, not to categories.
 
 | lever | phase | measured at | size | status |
 |---|---|---|---|---|
-| **DSpark draft attention** | decode | **c=16, 2.5K ctx** | **30.5% of a decode tick** | **root-caused: the launch was per-slot, 192 blocks.** Slot-batched at `3a8f99b1f`, −69% pinned-shape; serve A/B pending-remote |
-| FP8 GEMM on the verify shape | decode | c=16, 2.5K ctx | 28.8% of a decode tick | open — never decomposed at this shape |
+| **FP8 GEMM, prefill shapes** | prefill | **c=16 anchor** | **57.7% of ALL kernel time** | **CLOSED (§1.3)** — `gate_up` 93.2% of FP8 peak, `down` 87.5%. At the floor; only less math helps |
+| **DSpark draft attention** | decode | **c=16, 2.5K ctx** | **30.5% of a decode tick** | **FIXED** `3a8f99b1f` — per-slot 192-block launch; −69% pinned, ITL −10.4% decode-shaped, **null on the anchor** |
+| FP8 GEMM on the verify shape | decode | c=16, 2.5K ctx | 28.8% of a decode tick | open — but the prefill shapes are at 90% of peak (§1.3), so expect little |
 | GDN / gated-delta at c=16 | decode | c=16, 2.5K ctx | 21.0% of a decode tick | open — a same-binary A/B nulled it at 33K, untested here |
 | >1 ms gaps inside decode ticks | decode | c=16, 2.5K ctx | 13.8% of tick span, 53 gaps | open, cause unknown |
 | full-attn KV bandwidth | decode | c=16 | **47% of achievable at 2.5K, 29.2% at 32.5K** | open, but only 1.8% of a tick at short context |
@@ -974,10 +1025,19 @@ queueing ramp.
 
 **Prefill** — priced on the anchor, which is what it models.
 
-5. **Prefill is where the anchor's time is** — 59.4% FP8 GEMM plus 16.3% FA3
-   prefill at 96.7% GPU-busy. The FP8 GEMM is priced out at 64–67% of peak, so
-   the open question is prefill FA3 and the 12.3% in `pack_quantize` + norms.
-   Neither has been decomposed.
+5. **The anchor's FP8 GEMM is decomposed and it is CLOSED — ~90% of FP8 peak
+   (§1.3).** It is 57.7% of all kernel time, and `gate_up` runs at **93.2%** of
+   the 296 TFLOPS peak, `down_proj` at 87.5%, attention `out_proj` at 86.4%.
+   MLP alone is ~40% of all GPU kernel time and sits on the hardware floor. The
+   "64–67% — leave alone" in §1.1 was right about the verdict and wrong about
+   the number, having been measured at 33K cold single-request.
+
+   **The consequence re-ranks the project: on the anchor, the dominant cost
+   cannot be made faster, only smaller.** Levers are prefix-cache hit rate,
+   sparsity, and effective context length — not kernels. Remaining prefill
+   kernel work is FA3 prefill (16.3%) and `pack_quantize` + norms (12.3%),
+   neither decomposed, and together they are half the size of a line that is
+   already at the floor.
 6. **Sampling costs 30–40% of decode throughput at c ≥ 8** (§2.4) — measured on
    the anchor, so its size needs re-measuring on §2.0's shape. The gate at
    `executor/qwen35.rs:1984` tests *all* rows greedy. Do **not** re-open
