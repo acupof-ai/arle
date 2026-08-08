@@ -220,8 +220,10 @@ double the necessary traffic. The whole tail was written the same way.
 
 The fix is mechanical and identical everywhere: one warp per quantization block,
 `float4`-width loads, values kept in registers so the second read disappears, and
-`__shfl_xor` in place of shared memory. The upper bound on the tail is fusion
-into the producing kernel's epilogue, which removes it entirely.
+`__shfl_xor` in place of shared memory. Measured on the traced shapes:
+**3.4–3.7× faster, output bit-identical**, and `ncu` attributes the whole gain to
+executing 3.96× fewer instructions (see the gap layer). The upper bound on the
+tail is fusion into the producing kernel's epilogue, which removes it entirely.
 
 ### The gap layer — four buckets, four distinct remedies
 
@@ -255,19 +257,44 @@ anyone learning which bucket paid — which is indistinguishable from guessing.
 
 | bucket | measured | share of wall | how it was obtained |
 |---|---:|---:|---|
-| **tail — inflation + stall, not yet split** | **3940 ms** | **13.3%** | 2111 GB at 0.06–1.03 TB/s against 3.5 |
+| **tail — inflation, `ncu`-confirmed** | **3940 ms** | **13.3%** | 2111 GB at 0.06–1.03 TB/s against 3.5 |
 | floor gap — all GEMM | 1570 ms | 5.3% | 17.4 µs/token × 90,208 |
 | idle | 966 ms | 3.3% | GPU busy 28,676 of 29,642 ms |
 | floor gap — FA3 | 227 ms | 0.8% | 4.9% short of the 148 TFLOPS bf16 peak |
 | `fq_fwd` (FlashQLA) | 1618 ms | 5.5% | **unscored** — no floor derived yet |
 | | **6703 ms** | **22.6%** | excluding `fq_fwd` |
 
-**The tail's gap is not cleanly one bucket.** Scalar access both adds traffic
-(inflation: the input is read twice) and starves the memory pipeline (stall: 2
-bytes per thread cannot keep enough in flight). Splitting it needs `ncu` warp
-stall reasons. The remedy is the same either way, which is why the work is
-actionable before the split — but the split is what tells us how much of the
-3940 ms actually returns.
+**The tail's gap is `T_inflation`, and `T_stall` is empty.** This was open until
+2026-08-09, when `ncu` on `pack_quantize` at the traced shapes settled it against
+my own expectation:
+
+| metric | current | vectorized |
+|---|---:|---:|
+| duration | 101.4 µs | **27.6 µs (3.67×)** |
+| executed instructions | 46.79 M | **11.81 M (3.96× fewer)** |
+| SM (compute) throughput | 81.3% | 74.9% |
+| **DRAM throughput** | **5.2%** | 19.2% |
+| achieved occupancy | 89.8% | 83.7% |
+| executed IPC | 3.30 | 3.21 |
+
+**The speedup equals the instruction reduction.** Both versions run the SM at
+~80% of issue throughput with IPC above 3.2 and occupancy near 90% — the kernel
+is not waiting on memory, it is issuing address arithmetic, reduction, and
+synchronization instructions at nearly the hardware rate. DRAM at 5.2% means the
+memory system is close to idle while this runs.
+
+Two consequences. **The remedies that address stall — TMA, async copy, warp
+specialization, deeper pipelining — would do nothing here**, and the megakernel
+line addresses `T_idle`, a different 966 ms. **And the tail's binding floor is
+not bandwidth but instruction issue**: `instructions / issue_rate`. The
+bandwidth floor in the table above is a lower bound that the tail cannot reach
+by moving bytes faster, only by executing fewer instructions per byte —
+vectorization does that, and fusion into the producer's epilogue removes them
+entirely.
+
+The vectorized form is **bit-identical across all three traced shapes** (0
+mismatches over 2048 × {5120, 17408, 6144}) and 3.4–3.7× faster, so the ~1600 ms
+this predicts on the served `pack_quantize` is measured, not modelled.
 
 **Total identified headroom is 6.7 s of 29.6 s — 22.6%**, and 59% of it is in
 kernels that do no model arithmetic at all. After that, only reducing `P` and `L`
@@ -1347,7 +1374,6 @@ Facts this chain rests on that have not been measured:
 | item | why it matters |
 |---|---|
 | **a decode-shaped workload** | the anchor is 279:1 prompt:output and all decode is ~1% of its GPU time; every decode number in this document is ranked off it |
-| **warp stall reasons** | the tail's 3940 ms gap is inflation and stall jointly; `ncu` is what splits them, and the split says how much of it returns |
 | `fq_fwd` (FlashQLA) floor | 1618 ms, 5.7% of prefill, the only large term with no roofline |
 | prefix sidecar restore hit rate | decides whether 9.4% of wall is earned |
 | acceptance rate under temperature | `accept_rate` is 0.31 at temp 0 on the anchor (2026-08-06); the sampled arm has no matching figure |
