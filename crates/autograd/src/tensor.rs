@@ -142,9 +142,9 @@ impl Tensor {
 
 /// Idle host buffers kept for reuse across checkpoint offloads. Bounded: OPD
 /// trajectory lengths span ~5K–30K tokens, so first-fit reuse with unbounded
-/// retention accumulated one buffer per size class ever seen — 0.86 GiB per
-/// group per rank of host growth on the 449-task run. The pool only has to
-/// absorb churn between a release and the next take.
+/// retention accumulated one buffer per size class ever seen (449-task run:
+/// summed host RssAnon stepped 208 → 306 GiB). The pool only has to absorb
+/// churn between a release and the next take.
 #[derive(Debug)]
 struct CheckpointOffloadPool {
     free: Vec<Vec<f32>>,
@@ -1228,9 +1228,8 @@ fn shape_size(shape: &[usize]) -> usize {
 mod pool_tests {
     use super::{CHECKPOINT_OFFLOAD_POOL_CAP_BYTES, CheckpointOffloadPool};
 
-    /// The pool must stay bounded across growing size classes (the 449-task run
-    /// grew host RSS 0.86 GiB per group before the cap) and must hand back the
-    /// SMALLEST fitting buffer, or a short trajectory strands the largest one.
+    /// The pool must stay bounded across growing size classes and must hand back
+    /// the SMALLEST fitting buffer, or a short trajectory strands the largest one.
     #[test]
     fn pool_is_bounded_and_best_fit() {
         let mut pool = CheckpointOffloadPool {
