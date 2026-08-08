@@ -1,4 +1,4 @@
-# Greedy divergence from two external runtimes on Qwen3.6-27B-FP8 — root cause OPEN
+# The final norm applied `w` instead of `(1+w)` on Qwen3.6-27B
 
 **Date:** 2026-08-08 · **Pod:** 8×H20 · **Model:** ThinkingCap-Qwen3.6-27B-FP8
 (dense, 64 layers = 48 GDN + 16 full-attention, `full_attention_interval: 4`,
@@ -51,8 +51,53 @@ generation. The loop is a symptom of the divergence, not the defect.
 
 ## Root cause
 
-**OPEN.** Localized to the model forward; every component that could be tested is
-excluded below, and the route used cannot go further.
+**The trunk's final RMSNorm before `lm_head` applied `w` where the model's
+convention is `(1 + w)`.** Qwen3.5/3.6 uses the offset convention, `norm.cu:666`
+carries the kernel family for it (`// RMSNorm with (1+weight) offset — Qwen3.5 /
+Gemma style`), and the 64 in-layer trunk norms already called it. So this was a
+call-site selection error, not a missing implementation — which is exactly why
+in-layer norms were bit-exact (`attn_in` relL2 1.7e-09) while the final one was
+2.1× off.
+
+| norm convention | ‖norm_out‖ | argmax | p1 | logit[328] | logit[5289] | rel vs HF logits |
+|---|---|---|---|---|---|---|
+| `x·rsqrt(…)·w` | 56.2240 | **5289** | 0.3282 | 11.0752 | 12.6197 | 9.987e-01 |
+| **`x·rsqrt(…)·(1+w)`** | **118.1459** | **328** | 0.7659 | 28.0149 | 25.9583 | **2.168e-03** |
+| HF actual | 118.1514 | 328 | 0.7639 | 28.0 | 26.0 | — |
+
+The scale is the giveaway: 118.1514 / 56.2240 = **2.101**, and the norm weight's
+RMS is 0.9715, so `(1+w)` has RMS ≈ 1.99. `norm_in` is bit-identical to HF's L63
+residual (`‖d‖ = 0.000e+00`), so the divergence is created inside the norm.
+
+Found in numpy from tensors already on disk, before any source was read —
+reproducing the wrong answer by omitting the `+1` is what named the defect.
+
+## Fix
+
+`694245eec` — 14 call sites swapped to `rms_norm_offset` / `rms_norm_offset_vec`
+(`qwen35.rs:9219`, `:9246`; byte-identical signatures, and the latter's doc
+comment already read "the final norm before lm_head").
+
+**Two instances, not one.** The trunk's final norm (`qwen35.rs:4359` plus six
+batched/OPD/spec sites on `&self.norm`), and separately **every norm in
+`qwen35/dspark.rs`** — `input_layernorm`, `post_attention_layernorm`,
+`head.norm`, `head.hidden_norm`, the same weights the trunk applies `(1+w)` to.
+The MTP head's final norm (`:4868`) was already correct, so the plain-`w` variant
+had no remaining legitimate caller on this model. The DSpark instance bears on
+spec-decode rather than on this repro and a trunk-only investigation would never
+have surfaced it.
+
+**Verified, gate 1** (`694245eec`, same 130 ids, `IDENTICAL=True`, single prefill,
+greedy): top-1 **328**, top-3 **328 > 348 > 5289** — the exact ordering both
+external runtimes give, with `5289` moved from our rank 1 to rank 3. Logits
+27.875 / 26.25 against HF's 28.0 / 26.0, bf16 granularity at that magnitude.
+`nan=0 pos_inf=0 neg_inf=0`.
+
+**Gates still pending:** the GSM8K item end to end (does it answer instead of the
+48× `ª½` run), needle ×3 same-config against the baseline envelope, then the
+capability re-measure on the identical grid. This changes the logits of **every**
+request, so the needle gate and the capability delta are what license it — not
+this one position.
 
 ## Exclusions, each with the evidence that closed it
 
@@ -158,22 +203,17 @@ it, **every component that has been tested sits at its floor against the correct
 reference.** The dense MLP was the last candidate the residual-stream route had
 pointed at, and it is exonerated.
 
-That leaves the divergence unexplained but the surface much smaller. Two live
-questions, cheapest first:
+**That result was the finding, not a dead end.** "Every component is at its floor"
+closed the whole class "the defect is inside some kernel", and what remained was
+the one segment with no tap on either side of it: between L63 `resid` and the
+logits. The two tests that followed settled it:
 
-1. **Is this position simply ill-conditioned?** Perturb HF's layer-63 hidden by
-   the relative magnitude actually measured there (relL2 2.9e-2, random
-   direction, many draws), then run HF's own final norm + `lm_head`. If the
-   argmax flips to `5289` and the entropy climbs toward 7 nats under generic
-   noise, there is **no defect** — FP8's ordinary error is sufficient to flip
-   this token and sglang landed on `328` by luck. If it stays `328` at 0.7 nats
-   across every draw, generic error is not sufficient and something specific is
-   wrong. Pure numpy; no GPU.
-2. **The one segment never checked: final norm + `lm_head`.** The last tap is
-   L63 `resid` and the next observable is the logits. Everything between is
-   shared by prefill and decode, has never been compared, and `lm_head` is a
-   248320×5120 GEMM that may take different tiling from the trunk. Test by
-   injecting HF's post-L63 hidden and comparing our logits.
+1. **Is the position ill-conditioned?** No. Perturbing HF's layer-63 hidden at
+   relL2 0.029 / 0.05 / 0.1 / 0.2 / 0.4 / 0.8, 12 draws each, then running HF's
+   own final norm + `lm_head`: the argmax **never** moved and entropy stayed
+   7.50–11.4. Generic error of any magnitude does not produce this flip. A
+   specific systematic transform does.
+2. **Final norm + `lm_head`.** The `(1+w)` result above.
 
 **Weakened to not worth a run:** a position off-by-one in the logits row. It
 would explain the entropy gap (7.147 nats against 0.7085 — a perturbed
@@ -185,6 +225,16 @@ a key.
 
 ## Rule
 
+- **Tap both ends of every segment, or the untapped one is where the bug lives.**
+  Eleven exclusions and a component parity harness all landed inside the trunk
+  because that is where the taps were. The final norm had a tap before it (L63
+  `resid`) and nothing after it until the logits, so it was the only transform in
+  the model no comparison could see — and it was the defect. Before the next
+  round of probes, list the segments with no observable on one side.
+- **A parity harness that puts everything at its floor has told you something.**
+  It closes the class "some kernel is wrong", which is what makes the untapped
+  segment the answer by elimination. Reading that result as failure cost a
+  round trip.
 - **The floor must match the arithmetic under test.** A bf16 floor on an FP8
   GEMM manufactured a 7× "defect" that was entirely FP8's own cost. The check
   that catches it is the **third comparison**: reference-A against reference-B.
