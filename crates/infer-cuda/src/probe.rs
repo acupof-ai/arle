@@ -521,9 +521,7 @@ fn parity_config() -> Option<&'static ParityInject> {
             }
             let values: Vec<half::bf16> = bytes
                 .chunks_exact(4)
-                .map(|b| {
-                    half::bf16::from_f32(f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-                })
+                .map(|b| half::bf16::from_f32(f32::from_le_bytes([b[0], b[1], b[2], b[3]])))
                 .collect();
             eprintln!(
                 "[parity] injecting {} values at {point} layer {layer} from {path}",
@@ -539,29 +537,46 @@ fn parity_config() -> Option<&'static ParityInject> {
 }
 
 /// Replace `buf` with the injected reference tensor when this is the configured
-/// point and layer. Loud on every fire and on every mismatch — a silent
-/// injection would make a parity run look like a clean forward.
+/// point and layer. Loud on every fire, on a bounds mismatch, and on a read
+/// failure — a silent injection would make a parity run look like a clean forward.
+///
+/// Prefill is chunked and the split is not predictable from prompt length (130
+/// tokens arrive as 128+2, 64 tokens as 48+16), so the file holds the WHOLE
+/// prompt and each chunk takes the slice at its own `start_row`. `start_row` is
+/// the absolute position, which is the file offset only for a fresh request —
+/// the one-request diagnostic this exists for.
 #[cfg(feature = "cuda")]
-pub(crate) fn parity_inject(ctx: &DeviceContext, point: &str, layer: usize, buf: &mut HiddenStates) {
+pub(crate) fn parity_inject(
+    ctx: &DeviceContext,
+    point: &str,
+    layer: usize,
+    start_row: usize,
+    buf: &mut HiddenStates,
+) {
     let Some(cfg) = parity_config() else { return };
     if cfg.layer != layer || cfg.point != point {
         return;
     }
-    let want = buf.hidden_dim * buf.seq_len;
-    if cfg.values.len() != want {
+    let width = buf.hidden_dim;
+    let lo = start_row * width;
+    let hi = lo + buf.seq_len * width;
+    if hi > cfg.values.len() {
         eprintln!(
-            "[parity] {point} layer {layer}: have {} values, buffer wants {want} \
-             ({} x {}) — NOT injecting",
-            cfg.values.len(),
-            buf.seq_len,
-            buf.hidden_dim
+            "[parity] {point} layer {layer}: rows {start_row}..{} need {hi} values, file has {} \
+             — NOT injecting",
+            start_row + buf.seq_len,
+            cfg.values.len()
         );
         return;
     }
-    match ctx.stream.clone_htod(&cfg.values) {
+    match ctx.stream.clone_htod(&cfg.values[lo..hi]) {
         Ok(data) => {
             buf.data = data;
-            eprintln!("[parity] injected {point} layer {layer} ({want} values)");
+            eprintln!(
+                "[parity] injected {point} layer {layer} rows {start_row}..{} ({} values)",
+                start_row + buf.seq_len,
+                hi - lo
+            );
         }
         Err(err) => eprintln!("[parity] {point} layer {layer} H2D failed: {err}"),
     }
