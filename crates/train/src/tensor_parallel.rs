@@ -13,9 +13,6 @@
 
 use autograd::{Result, Tape, TensorId, TensorStore, ops::all_reduce_sum};
 
-/// A rank's position on the tensor-parallel axis (`attn_tp` of the mesh). Pure
-/// coordinates + size; the model applies `divide` to its own head/intermediate
-/// dimensions. `single()` (world_size 1) is the byte-identical single-card path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TpContext {
     pub rank: usize,
@@ -34,9 +31,6 @@ impl TpContext {
         Self { rank, world_size }
     }
 
-    /// TP placement from the one device mesh: the attention-TP sub-axis of
-    /// `infer_topo` (`attn_tp_rank` / `attn_tp_size`), so train and serve derive
-    /// TP coordinates from a single `MultiAxisConfig` instead of two private configs.
     pub fn from_coord(cfg: infer_topo::MultiAxisConfig, coord: infer_topo::RankCoord) -> Self {
         Self {
             rank: coord.attn_tp_rank,
@@ -48,18 +42,12 @@ impl TpContext {
         self.world_size > 1
     }
 
-    /// A sharded dimension divided by the TP world size, or `None` if it doesn't
-    /// divide evenly. Every column/row-parallel weight dimension obeys this; the
-    /// caller maps `None` to its own config error (the model owns the message).
     pub fn divide(self, value: usize) -> Option<usize> {
         (self.world_size != 0 && value.is_multiple_of(self.world_size))
             .then_some(value / self.world_size)
     }
 }
 
-/// All-reduce-sum a row/column-parallel partial output across the TP group, or
-/// pass it through unchanged off-TP (byte-identical single-card). The collective's
-/// adjoint lives in `autograd`; this is only the enable gate.
 pub fn maybe_all_reduce(
     x: TensorId,
     tp: TpContext,
@@ -92,8 +80,6 @@ mod tests {
         assert_eq!(tp.divide(30), None);
     }
 
-    // Mesh convergence: attn_tp coordinates come from the one MultiAxisConfig,
-    // not a private derivation — the TP view of a pure-TP mesh reproduces {rank, size}.
     #[test]
     fn from_coord_pure_tp_matches_rank_size() {
         use infer_topo::{MultiAxisConfig, RankCoord};
