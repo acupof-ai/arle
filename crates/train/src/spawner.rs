@@ -42,48 +42,35 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-/// Env var carrying the socket path the helper listens on (set on the re-exec'd
-/// child by [`SpawnerHandle::launch`]). Presence selects the spawner-server role.
+/// Env var carrying the socket path the helper listens on.
 pub const LISTEN_ENV: &str = "ARLE_SPAWNER_LISTEN";
 
-/// Env var carrying the socket path clients connect to (set in the parent's own
-/// environment by [`SpawnerHandle::launch`]). Presence routes [`crate::sandbox`]
-/// through the spawner instead of spawning directly.
+/// Env var carrying the socket path clients connect to.
 pub const SOCKET_ENV: &str = "ARLE_SPAWNER_SOCKET";
 
-/// How often the server polls a timed child for completion. Matches the
-/// pre-spawner `sandbox::POLL_INTERVAL`.
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
-/// Serializes tests that mutate the process-global spawner env vars
-/// (`LISTEN_ENV`/`SOCKET_ENV`). Cargo runs tests in parallel threads, so without
-/// one shared lock across BOTH this module and `crate::sandbox`, two
-/// server-standup tests race on the same global env and bind the wrong socket.
+/// Serializes tests that mutate the spawner env vars (parallel tests race).
 #[cfg(test)]
 pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// Mirrors the fields the sandbox sets on a `Command`.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SpawnRequest {
     pub program: String,
     pub args: Vec<String>,
-    /// Working dir, or `None` to inherit the helper's cwd.
     pub cwd: Option<PathBuf>,
-    /// Env overrides: `(key, Some(val))` sets, `(key, None)` removes. Applied on
-    /// top of the helper's inherited environment.
+    /// `(key, Some(val))` sets, `(key, None)` removes.
     pub env: Vec<(String, Option<String>)>,
-    /// `true` → combine stdout+stderr into `stdout` and run under a process-group
-    /// timeout (the `run_captured` path). `false` → keep them separate, no
-    /// timeout (the `.output()` path).
+    /// `true` → combined stdout+stderr + process-group timeout (run_captured).
+    /// `false` → separate streams, no timeout (output()).
     pub combined_timeout: bool,
-    /// Wall-clock timeout in seconds; only honored when `combined_timeout`.
     pub timeout_s: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SpawnResponse {
     pub stdout: Vec<u8>,
-    /// Empty when `combined_timeout` (output is folded into `stdout`).
+    /// Empty when `combined_timeout` (output folded into `stdout`).
     pub stderr: Vec<u8>,
     pub exit_code: Option<i32>,
     pub timed_out: bool,
@@ -105,16 +92,13 @@ fn read_frame<R: Read>(r: &mut R) -> std::io::Result<Vec<u8>> {
     Ok(buf)
 }
 
-/// Called from the `arle` entry point when `ARLE_SPAWNER_LISTEN` is set; never
-/// returns under normal operation (loops until the listener errors or the
-/// parent exits and the socket is removed). Returns the process exit code.
+/// Entry point when `ARLE_SPAWNER_LISTEN` is set; loops until listener errors.
 pub fn serve_loop() -> i32 {
     let sock = match std::env::var(LISTEN_ENV) {
         Ok(s) => s,
         Err(_) => return 0,
     };
-    // Stale socket from a crashed prior run blocks bind; the path is per-pid so a
-    // leftover is ours to clear.
+    // Stale socket from a crashed prior run blocks bind; per-pid path is ours.
     let _ = std::fs::remove_file(&sock);
     let listener = match UnixListener::bind(&sock) {
         Ok(l) => l,
@@ -126,9 +110,7 @@ pub fn serve_loop() -> i32 {
     eprintln!("[arle sandbox-spawner] listening on {sock}");
     for conn in listener.incoming() {
         match conn {
-            // Thread per connection: the cc harness runs K cc children + boot +
-            // score spawns concurrently; a serial accept loop would serialize
-            // every rollout behind one 600s `claude` run.
+            // Thread per connection: cc harness runs K children concurrently.
             Ok(stream) => {
                 std::thread::spawn(move || handle_conn(stream));
             }
@@ -160,9 +142,6 @@ fn handle_conn(mut stream: UnixStream) {
     }
 }
 
-/// The `combined_timeout` path replicates `sandbox::run_captured` —
-/// `setsid`-wrapped, combined output to a temp file, process-group kill on
-/// timeout. The plain path replicates `Command::output()`.
 fn run_request(req: &SpawnRequest) -> SpawnResponse {
     if req.combined_timeout {
         match run_captured(req) {
@@ -217,15 +196,9 @@ fn build_command(req: &SpawnRequest) -> Command {
     cmd
 }
 
-/// Spawns the program in a new process group (`process_group(0)` → `setpgid`,
-/// NOT `setsid`) so the whole group can be torn down on timeout. Output
-/// captured to a temp file (no pipe → no hang on backgrounded grandchildren).
-/// Uses `libc::kill` to signal the group without forking an external `kill`
-/// binary.
-///
-/// Previously this called `Command::new("setsid").arg(program)` which triggered
-/// ELKEID's `setsid()` ancestry hook and killed arle. The replacement avoids
-/// both `setsid()` and any extra fork.
+/// Spawn in a new process group (`setpgid`, NOT `setsid` — ELKEID hooks
+/// `setsid` ancestry and kills arle). Output to a temp file (no pipe hang).
+/// `libc::kill` for group teardown (no extra `kill` fork).
 fn run_captured(req: &SpawnRequest) -> std::io::Result<(Vec<u8>, Option<i32>, bool)> {
     let tmp = tempfile::NamedTempFile::new()?;
     let stdout_handle = tmp.reopen()?;
@@ -236,12 +209,10 @@ fn run_captured(req: &SpawnRequest) -> std::io::Result<(Vec<u8>, Option<i32>, bo
         .stdin(Stdio::null())
         .stdout(stdout_handle)
         .stderr(stderr_handle)
-        // New process group (setpgid, not setsid) so kill_group can target the
-        // whole group without touching the spawner's own group.
+        // setpgid, not setsid — ELKEID hooks setsid ancestry.
         .process_group(0);
 
     let mut child = command.spawn()?;
-    // The child's PGID == its PID because we used process_group(0).
     let pgid = child.id() as i32;
 
     let deadline = Instant::now() + Duration::from_secs(req.timeout_s);
@@ -266,25 +237,21 @@ fn run_captured(req: &SpawnRequest) -> std::io::Result<(Vec<u8>, Option<i32>, bo
     Ok((output, code, killed))
 }
 
-/// Uses `libc::kill` directly to avoid forking an external `kill` binary
-/// (extra forks can trigger ELKEID).
+/// `libc::kill` directly — no external `kill` fork (extra forks can trigger ELKEID).
 fn kill_group(pgid: i32) {
     // SAFETY: kill(-pgid, SIGKILL) is well-defined; an empty or already-reaped
     // group returns ESRCH which we ignore.
     unsafe { libc::kill(-pgid, libc::SIGKILL) };
 }
 
-/// Connects to the spawner socket and runs spawns there instead of forking.
-/// Cloneable + cheap (just the socket path); a fresh connection is opened per
-/// request so it is `Send`-safe across the sandbox executor.
+/// Connects to the spawner socket; a fresh connection per request (Send-safe).
 #[derive(Clone, Debug)]
 pub struct SpawnClient {
     socket: PathBuf,
 }
 
 impl SpawnClient {
-    /// Read the socket path from `ARLE_SPAWNER_SOCKET`; `None` when unset (the
-    /// normal direct-spawn path).
+    /// `None` when `ARLE_SPAWNER_SOCKET` unset (direct-spawn path).
     pub fn from_env() -> Option<Self> {
         std::env::var(SOCKET_ENV)
             .ok()
@@ -305,18 +272,16 @@ impl SpawnClient {
     }
 }
 
-/// Owns the helper child; killing it on drop tears the helper down with the run.
+/// Owns the helper child; killing it on drop tears the helper down.
 pub struct SpawnerHandle {
     child: std::process::Child,
     socket: PathBuf,
 }
 
 impl SpawnerHandle {
-    /// Re-exec the current `arle` binary as the spawner helper BEFORE any CUDA
-    /// init, wait for its socket, and set `ARLE_SPAWNER_SOCKET` in THIS process so
-    /// [`crate::sandbox`] routes through it. MUST be called before the first
-    /// CUDA-context creation (`build_opd_store` → `CudaBackend::new`), while the
-    /// parent is still non-CUDA-resident, so this one fork is ELKEID-safe.
+    /// Re-exec `arle` as the spawner helper BEFORE any CUDA init (ELKEID kills
+    /// CUDA-resident processes that fork `setsid`). Sets `ARLE_SPAWNER_SOCKET`
+    /// so `crate::sandbox` routes through it.
     pub fn launch() -> anyhow::Result<Self> {
         let exe = std::env::current_exe()
             .map_err(|e| anyhow::anyhow!("locate current exe for sandbox-spawner: {e}"))?;
@@ -325,16 +290,13 @@ impl SpawnerHandle {
 
         let child = Command::new(&exe)
             .env(LISTEN_ENV, &socket)
-            // The helper is a plain spawner; never let it inherit a worker/spawner
-            // role from the parent env, and don't recurse.
+            // Don't inherit the parent's socket env — the helper must not recurse.
             .env_remove(SOCKET_ENV)
             .stdin(Stdio::null())
             .spawn()
             .map_err(|e| anyhow::anyhow!("spawn sandbox-spawner helper: {e}"))?;
 
-        // Wait for the helper to bind its socket (poll up to ~10s). The helper
-        // does no CUDA / model load, so bind is sub-second; the budget only covers
-        // process startup + dynamic linking.
+        // Wait for the helper to bind its socket (sub-second; budget for startup).
         let deadline = Instant::now() + Duration::from_secs(10);
         while !socket.exists() {
             if Instant::now() >= deadline {
@@ -346,8 +308,7 @@ impl SpawnerHandle {
             std::thread::sleep(Duration::from_millis(20));
         }
         // Route this process's sandbox spawns through the helper.
-        // SAFETY: single-threaded at this point — we are before CUDA init and
-        // before any rollout threads exist.
+        // SAFETY: single-threaded before CUDA init and rollout threads.
         unsafe {
             std::env::set_var(SOCKET_ENV, &socket);
         }
@@ -362,9 +323,7 @@ impl SpawnerHandle {
 
 impl Drop for SpawnerHandle {
     fn drop(&mut self) {
-        // Stop routing through a helper we're about to kill.
-        // SAFETY: drop happens at end of the agent-OPD run; rollout threads are
-        // joined by then.
+        // SAFETY: drop happens at end of run; rollout threads are joined.
         unsafe {
             std::env::remove_var(SOCKET_ENV);
         }
