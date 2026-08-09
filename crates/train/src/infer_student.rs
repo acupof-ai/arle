@@ -62,8 +62,6 @@ impl InferStudent {
         self.vocab_size
     }
 
-    /// Offload the rollout engine's device weights to host RAM (OPD
-    /// time-share), freeing VRAM for the student backward. Returns bytes freed.
     pub fn offload_engine_weights(&self) -> Result<usize> {
         let engine = self
             .engine
@@ -72,7 +70,6 @@ impl InferStudent {
         engine.offload_engine_weights()
     }
 
-    /// Reload the rollout engine's device weights before the next rollout.
     pub fn reload_engine_weights(&self) -> Result<()> {
         let engine = self
             .engine
@@ -81,10 +78,8 @@ impl InferStudent {
         engine.reload_engine_weights()
     }
 
-    /// Release the rollout engine's inference forward scratch WITHOUT offloading
-    /// weights or evicting KV, freeing VRAM for the co-resident OPD writeback
-    /// (the agent-OPD rollout->writeback path never offloads, so the 24K-shaped
-    /// scratch otherwise OOMs the masked-CE writeback).
+    /// Release the inference forward scratch (no weight offload, no KV eviction)
+    /// to free VRAM for the co-resident OPD writeback.
     pub fn release_inference_scratch(&self) -> Result<()> {
         let engine = self
             .engine
@@ -93,13 +88,9 @@ impl InferStudent {
         engine.release_inference_scratch()
     }
 
-    /// Drop the rollout engine's KV pool before the co-resident masked-CE
-    /// writeback. The writeback's `forward_hidden_states` is a FRESH autograd
-    /// forward that does NOT read this engine's KV cache, so the pool is DEAD
-    /// during the writeback — freeing it (~KV-pool GB) is the agent-OPD writeback
-    /// headroom lever. The rollout has finished + synced before this is called, so
-    /// the pool holds no resident pages. Re-acquired by [`Self::ensure_kv_pool`]
-    /// before the next round's rollout.
+    /// Drop the KV pool before the masked-CE writeback. The writeback's forward
+    /// is a fresh autograd pass that doesn't read this engine's KV, so the pool
+    /// is dead during writeback — freeing it is the agent-OPD headroom lever.
     pub fn release_kv_pool(&self) -> Result<()> {
         let engine = self
             .engine
@@ -108,8 +99,6 @@ impl InferStudent {
         engine.release_kv_pool()
     }
 
-    /// Re-acquire the rollout engine's KV pool dropped by
-    /// [`Self::release_kv_pool`] before the next round's rollout. Idempotent.
     pub fn ensure_kv_pool(&self) -> Result<()> {
         let engine = self
             .engine
@@ -118,7 +107,6 @@ impl InferStudent {
         engine.ensure_kv_pool()
     }
 
-    /// Re-acquire the KV pool, then resume admission only after success.
     pub fn ensure_kv_pool_and_resume_admissions(&self) -> Result<()> {
         let engine = self
             .engine
@@ -127,13 +115,8 @@ impl InferStudent {
         engine.ensure_kv_pool_and_resume_admissions()
     }
 
-    /// Generate `rollout_len` tokens from `prompt_ids` through the infer
-    /// scheduler/KV path and return the full prompt+generated rollout.
-    ///
-    /// OPD rollout requires an exact-length token sequence. The old raw-logits
-    /// loop sampled unconditionally and ignored EOS/stop ids, so the serve-path
-    /// request does the same by forcing `ignore_eos=true` and clearing
-    /// `stop_token_ids` on the per-rollout sampling copy.
+    /// Generate `rollout_len` tokens from `prompt_ids` and return prompt+generated.
+    /// Forces `ignore_eos=true` and clears `stop_token_ids` for exact-length rollout.
     pub fn generate_rollout(
         &self,
         prompt_ids: &[u32],
@@ -173,16 +156,8 @@ impl InferStudent {
         Ok(rollout)
     }
 
-    /// Generate `n` **natural, EOS-respecting** completions of up to
-    /// `max_new_tokens` tokens each, for rubric-OPD rejection sampling. Returns the
-    /// GENERATED tokens per sample (prompt excluded), variable length.
-    ///
-    /// This is the rubric-OPD counterpart of [`Self::generate_rollout`]: that path
-    /// forces exact-length `ignore_eos` decoding for token-KL alignment, whereas the
-    /// rubric judge needs *complete* solutions (stop at EOS) and the writeback CE
-    /// trains the natural completion. Per-sample seeds (`base + i` when a seed is
-    /// set) give reproducible diversity at temperature > 0; with no seed the engine
-    /// RNG advances across calls. Samples are independent requests.
+    /// Generate `n` EOS-respecting completions of up to `max_new_tokens` each,
+    /// for rubric-OPD rejection sampling. Returns generated tokens per sample.
     pub fn generate_samples(
         &self,
         prompt_ids: &[u32],
@@ -198,11 +173,6 @@ impl InferStudent {
             return Ok(Vec::new());
         }
 
-        // Natural generation: do NOT force ignore_eos (that is the token-KL
-        // exact-length path); the rubric judge needs complete answers. The N
-        // per-seed samples are submitted together so the continuous-batching
-        // rollout engine (num_slots=2) decodes them concurrently instead of one
-        // at a time. `generate_batch` validates each result.
         let base = sampling.cloned().unwrap_or_default();
         let requests: Vec<(Vec<u32>, SamplingParams)> = (0..n)
             .map(|i| {
@@ -216,11 +186,9 @@ impl InferStudent {
         self.generate_batch(&requests, max_new_tokens)
     }
 
-    /// Batched generation: each `(prompt, sampling)` is an independent request
-    /// submitted together to the continuous-batching engine, then collected in
-    /// order. Used by rubric-OPD eval to decode all N prompts concurrently —
-    /// per-request B=1 decode is memory-bandwidth-bound, so batching amortizes
-    /// the weight reads. Engine is locked once for the whole batch.
+    /// Submit all `(prompt, sampling)` requests to the continuous-batching engine
+    /// and collect results in order. Batching amortizes weight reads (B=1 decode
+    /// is memory-bandwidth-bound).
     pub fn generate_batch(
         &self,
         requests: &[(Vec<u32>, SamplingParams)],
@@ -249,12 +217,7 @@ impl InferStudent {
     }
 
     /// Run a single forward over `input_ids` (with absolute `positions`) and
-    /// return the next token over the **last** position's logits.
-    ///
-    /// The infer engine's `forward_token_logits` is stateless from the caller's
-    /// POV: it accepts the full token sequence + contiguous positions each call
-    /// (matching how `InferTeacher` drives it). The rollout loop therefore
-    /// passes the growing full sequence with `positions = 0..len` each step.
+    /// return the next token from the last position's logits.
     pub fn decode_next_token(
         &self,
         input_ids: &[u32],
@@ -296,9 +259,6 @@ impl InferStudent {
             );
         }
 
-        // Host argmax over the last position. `to_host_f32` materializes the
-        // full [seq_len, vocab_size] block (mirrors teacher BF16->F32 handling
-        // via the engine's own conversion); we only scan the last row.
         let host = raw_logits.to_host_f32()?;
         let vocab = raw_logits.vocab_size();
         let seq_len = raw_logits.seq_len();
@@ -310,17 +270,8 @@ impl InferStudent {
         Ok(token)
     }
 
-    /// Per-step student LoRA sync (OPD P2).
-    ///
-    /// D2H the LoRA A/B adapter tensors from the train `TensorStore` and push
-    /// them into the infer student engine, which restores cached base weights
-    /// and folds each fresh adapter in-memory (`remerge_student_lora`).
-    /// Idempotent across steps: the infer side always re-merges from the same
-    /// pristine base, so deltas never accumulate.
-    ///
-    /// `adapter_map` is the train model's `adapter_name_map()`. Matrices are
-    /// exported raw (un-scaled); the infer merge applies `scale = alpha / r`
-    /// once. Every recognized projection must provide both A and B.
+    /// D2H LoRA A/B from the train store and push into the infer engine, which
+    /// re-merges from the pristine base (idempotent — no delta accumulation).
     pub fn sync_lora_from_store(
         &self,
         store: &mut TensorStore,
@@ -332,8 +283,6 @@ impl InferStudent {
             bail!("InferStudent LoRA sync: lora_config.rank must be > 0");
         }
 
-        // Collect per-layer A/B from the train store, keyed by absolute layer
-        // index and projection. BTreeMap gives deterministic update ordering.
         let mut layers: HashMap<usize, PartialLayer> = HashMap::new();
         let mut unsupported = Vec::new();
         for (&name, &tensor_id) in adapter_map {
@@ -357,9 +306,7 @@ impl InferStudent {
             let entry = layers.entry(layer_idx).or_default();
             let slot = entry.projections.entry(projection).or_default();
             match which {
-                // lora_A shape = [rank, in_features]
                 LoraHalf::A => slot.a = Some((values, shape[0], shape[1])),
-                // lora_B shape = [out_features, rank]
                 LoraHalf::B => slot.b = Some((values, shape[0], shape[1])),
             }
         }
@@ -423,17 +370,13 @@ impl InferStudent {
             .map_err(|err| anyhow!("LoadedInferenceEngine lock poisoned: {err}"))?;
         engine.remerge_student_lora(update)?;
 
-        // Refresh the train student's frozen base: the merged weights now live
-        // in the rollout engine's dense-BF16 `data` buffers. Re-point the
-        // student's frozen-base tensors at those BF16 bytes (non-owning view),
-        // then free the retired FP8 qweight/scales. This both keeps the
-        // student's base in sync with the merged weights AND frees ~27 GB of
-        // FP8 keepalive that would otherwise OOM the next round's forward.
+        // Re-point the student's frozen-base tensors at the engine's merged BF16
+        // bytes, then free the retired FP8 buffers (~27 GB) that would OOM the
+        // next round's forward.
         let bf16_ptrs = engine.frozen_base_bf16_pointers()?;
         drop(engine);
 
         for entry in &bf16_ptrs {
-            // Match the train-side parameter name: `*.layers.{layer_idx}.{proj_suffix}.weight`.
             let suffix = format!(".layers.{}.{}.weight", entry.layer_idx, entry.proj_suffix);
             let Some((&name, &id)) = param_name_map
                 .iter()
@@ -458,8 +401,6 @@ impl InferStudent {
             })?;
         }
 
-        // Now that the student re-aliases the BF16 bytes, free the retired FP8
-        // buffers. Re-lock the engine (the borrow above was released).
         let mut engine = self
             .engine
             .lock()
@@ -469,12 +410,8 @@ impl InferStudent {
     }
 }
 
-/// Fast adapter-only (LoRA) checkpoint save. D2H-reads each adapter A/B
-/// `TensorId` from the store and writes them to a single safetensors file, keyed
-/// by adapter name. This is the cheap alternative to the full-materialize save,
-/// which host-loops the merged base+LoRA weights and hangs at 27B; the adapter
-/// matrices are tiny, so this is fast. The saved file can be re-merged onto the
-/// base model for eval. bf16 so a downstream infer loader can consume it.
+/// Save LoRA A/B adapters to a single safetensors file (bf16). The cheap
+/// alternative to full-materialize save (which hangs at 27B); adapters are tiny.
 #[cfg(feature = "cuda")]
 pub fn save_lora_adapters(
     store: &mut TensorStore,
@@ -494,15 +431,12 @@ pub fn save_lora_adapters(
         .map_err(|err| anyhow!("save_lora_adapters to {}: {err}", out_path.display()))
 }
 
-/// Adapter accumulator for one layer during the store scan.
 #[cfg(feature = "cuda")]
 #[derive(Default)]
 struct PartialLayer {
     projections: BTreeMap<StudentLoraProjection, PartialProj>,
 }
 
-/// A single projection's optional A/B host matrices, each as
-/// `(values, rows, cols)`.
 #[cfg(feature = "cuda")]
 #[derive(Default)]
 struct PartialProj {
@@ -512,8 +446,6 @@ struct PartialProj {
 
 #[cfg(feature = "cuda")]
 impl PartialProj {
-    /// Convert to `StudentLoraMatrices`. A dangling half (A without B or vice
-    /// versa) is an error.
     fn into_matrices(
         self,
         rank: usize,
