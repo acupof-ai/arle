@@ -176,6 +176,51 @@ run the model-specific correctness gate. Token identity against another kernel
 is not required when MoE non-determinism applies; coherent autoregressive output
 and the model-specific gate are required.
 
+### 4.1 Numerical acceptance for kernel optimizations
+
+Measure numerical error before timing. Use the same inputs for the accepted
+kernel and the candidate, and preserve the raw outputs or a reproducible seed.
+The reference is FP64 or FP32 as required to make its error negligible relative
+to the output dtype. A comparison against the old kernel alone cannot establish
+accuracy.
+
+Classify the operation before choosing the gate:
+
+| operation | required gate |
+|---|---|
+| copy, split, index, reshape, mask, or address-only change | output bits match exactly; any mismatch is a correctness failure |
+| pointwise math stored as BF16/FP16 | zero finite/non-finite or sign-class mismatches and at most 1 output-dtype ULP from the reference |
+| GEMM, reduction, attention, recurrent update, or changed accumulation order | report `max_abs`, `p99_abs`, RMSE, max relative error with a stated near-zero floor, and cosine; the candidate may not worsen the accepted kernel's reference-error metrics by more than 5% |
+| quantization or format conversion | report saturation count, zero/non-finite handling, round-trip error, and the format-specific bound; cosine alone is insufficient |
+
+The 5% value is a regression budget relative to the accepted implementation.
+It does not define absolute model accuracy. If the accepted error is zero, the
+default budget is zero. A different bound must be derived and written into the
+hypothesis before the run; observing the candidate first and then choosing a
+bound invalidates the comparison.
+
+Exercise every production shape touched by the change plus boundary cases:
+unaligned tails, smallest and largest supported dimensions, zeros, signed small
+values, and the finite extrema expected at that call site. Use at least three
+seeds for generated inputs. A production trace supplies the shapes; the
+numerical comparison remains required.
+
+Then run the model gate on the exact candidate binary:
+
+1. `scripts/lever_gate.sh` against a same-config baseline envelope, with the
+   needle ladder repeated three times;
+2. `python3 scripts/needle_gate.py temp` for math, quantization, reduction, or
+   kernel-route changes that can preserve greedy argmax while corrupting the
+   distribution;
+3. require zero request errors, zero empty outputs, zero new miss classes, and
+   zero looping outputs.
+
+MoE non-determinism relaxes cross-binary token identity only at the model layer.
+The bit-exact operator contract and operator reference-error bound remain. A
+rollback passes when the restored source, rebuilt binary identity, and
+model gate all match the named pre-change baseline; source equality alone is
+insufficient.
+
 ## 5. Server and cache hygiene
 
 - Run one benchmark process at a time.
