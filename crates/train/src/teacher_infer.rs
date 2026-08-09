@@ -82,17 +82,10 @@ pub trait TeacherForward {
         &[]
     }
 
-    /// Offload the teacher's device weights to host RAM (OPD engine
-    /// time-share). Called after the teacher has produced logits and the
-    /// student-side KL slice is materialized, so the teacher is idle during the
-    /// student backward. Returns the device VRAM bytes freed. Default no-op
-    /// (in-process / API teachers do not own a separate infer engine to free).
     fn offload_engine_weights(&self) -> Result<usize> {
         Ok(0)
     }
 
-    /// Reload the teacher's device weights before the next scoring forward.
-    /// Default no-op.
     fn reload_engine_weights(&self) -> Result<()> {
         Ok(())
     }
@@ -137,12 +130,6 @@ struct ResolvedTeacherRoute {
     token_prefix: Vec<u32>,
 }
 
-/// Deterministic prompt router for using multiple specialist teachers in OPD.
-///
-/// The router keeps the `TeacherForward` contract unchanged: prompt ownership is
-/// selected from the token prefix, and the chosen teacher returns logits in the
-/// caller's `TensorStore`. Longest-prefix match wins; unmatched prompts use the
-/// configured default teacher.
 pub struct MultiTeacher<'a> {
     entries: Vec<TeacherEntry<'a>>,
     routes: Vec<ResolvedTeacherRoute>,
@@ -381,10 +368,8 @@ impl ApiTeacher {
             .unwrap_or_default()
     }
 
-    /// POST the token/position sequence, return the raw bf16-LE logits bytes and
-    /// `[rows, cols]` shape (from headers). The body is the raw `[seq, vocab]`
-    /// block (~1 GB) — base64+JSON of it dominated the step, so the wire is now
-    /// `application/octet-stream` with no string encode/parse.
+    /// POST tokens/positions, return raw bf16-LE logits bytes + `[rows, cols]`.
+    /// Body is `application/octet-stream` (~1 GB) — base64+JSON dominated the step.
     fn post_logits(&self, input_ids: &[u32], positions: &[u32]) -> Result<(Vec<u8>, [usize; 2])> {
         let body = ApiTeacherRequest {
             input_ids,
@@ -531,18 +516,12 @@ impl<'a> InProcessTeacher<'a> {
         }
     }
 
-    /// Build a teacher exposing an EXPLICIT parameter-id list instead of the
-    /// model's full `all_parameter_ids()`.
-    ///
-    /// SOPD's EMA self-teacher needs this: its base-shared model is built via
-    /// `Qwen35Model::new_lora_from_base(student, ...)`, and
-    /// `share_base_parameters_from` rebuilds `param_ids` by copying the base
-    /// model's `param_ids` wholesale — so when the base is a LoRA *student*, the
-    /// EMA model's `all_parameter_ids()` also lists the student's *trainable*
-    /// adapter ids. The OPD step rejects any teacher param with
-    /// `requires_grad=true` (and treats teacher params as off-limits for the
-    /// student), so the EMA teacher must expose only its own frozen params
-    /// (base + EMA adapter), excluding the student adapter.
+    /// Build a teacher exposing an explicit parameter-id list (not the model's
+    /// full `all_parameter_ids()`). SOPD's EMA self-teacher shares the LoRA
+    /// student's base, so `all_parameter_ids()` includes the student's trainable
+    /// adapter ids. The OPD step rejects teacher params with `requires_grad=true`,
+    /// so the EMA teacher must expose only its own frozen params (base + EMA
+    /// adapter), excluding the student adapter.
     pub fn with_parameter_ids(model: &'a Qwen35Model, parameter_ids: Vec<TensorId>) -> Self {
         Self {
             model,
@@ -923,7 +902,6 @@ mod tests {
             .collect();
         let decoded = decode_bf16_le_logits(&bytes, 4)?;
         assert_eq!(decoded, [1.25, -2.5, 3.75, 4.0]);
-        // length mismatch is rejected
         assert!(decode_bf16_le_logits(&bytes, 3).is_err());
         Ok(())
     }
