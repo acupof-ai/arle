@@ -260,7 +260,6 @@ mod tests {
     #[test]
     fn physical_token_rows_identity_is_contiguous() {
         let page_size = 16;
-        // 3 identity pages → logical rows 0..48 map to physical 0..48.
         let table: Vec<u32> = (0..3).collect();
         let rows = physical_token_rows(&table, page_size, 5, 20).expect("rows");
         let expected: Vec<i32> = (5..25).collect();
@@ -273,25 +272,15 @@ mod tests {
     #[test]
     fn physical_token_rows_fragmented_follows_table() {
         let page_size = 16;
-        // Logical pages 0,1,2 → physical pages 7,3,9.
         let table = vec![7u32, 3, 9];
-        // Tokens at logical pos 14,15 (page 0 → phys 7) and 16,17 (page 1 → phys 3).
         let rows = physical_token_rows(&table, page_size, 14, 4).expect("rows");
-        assert_eq!(
-            rows,
-            vec![
-                7 * 16 + 14,
-                7 * 16 + 15,
-                3 * 16, // pos 16 → logical page 1 → phys 3, in-page 0
-                3 * 16 + 1,
-            ]
-        );
+        assert_eq!(rows, vec![7 * 16 + 14, 7 * 16 + 15, 3 * 16, 3 * 16 + 1,]);
     }
 
     #[test]
     fn physical_token_rows_rejects_position_past_table() {
         let page_size = 16;
-        let table = vec![0u32, 1]; // logical pages 0,1 only (positions 0..32)
+        let table = vec![0u32, 1];
         let err = physical_token_rows(&table, page_size, 30, 5)
             .unwrap_err()
             .to_string();
@@ -349,9 +338,7 @@ mod tests {
     /// whole point of the lookup; band addressing could not serve this.
     #[test]
     fn dsv4_pack_fragmented_table_follows_physical_pages() {
-        // Logical pages 0,1,2 → physical pages 7,3,9 (non-contiguous).
         let table = vec![7u32, 3, 9];
-        // Token 0 (logical page 0 → phys 7, row 0).
         assert_eq!(
             dsv4_pack_token_byte_base(
                 &table,
@@ -363,7 +350,6 @@ mod tests {
             .unwrap(),
             7 * PACK_BLOCK * PACK_TOKEN_BYTES
         );
-        // Token 65 (logical page 1 → phys 3, row 1).
         assert_eq!(
             dsv4_pack_token_byte_base(
                 &table,
@@ -375,7 +361,6 @@ mod tests {
             .unwrap(),
             3 * PACK_BLOCK * PACK_TOKEN_BYTES + PACK_TOKEN_DATA_BYTES
         );
-        // Token 130 (logical page 2 → phys 9, row 2).
         assert_eq!(
             dsv4_pack_token_byte_base(
                 &table,
@@ -391,7 +376,7 @@ mod tests {
 
     #[test]
     fn dsv4_pack_rejects_token_past_table() {
-        let table = vec![0u32, 1]; // 2 logical pages → 128 tokens.
+        let table = vec![0u32, 1];
         let err = dsv4_pack_token_byte_base(
             &table,
             200,
@@ -446,19 +431,15 @@ mod tests {
     /// whole point of the lookup; band addressing could not serve this.
     #[test]
     fn dsv4_decode_fragmented_table_follows_physical_pages() {
-        // Logical pages 0,1,2 → physical pages 7,3,9 (non-contiguous).
         let table = vec![7u32, 3, 9];
-        // out=0 (logical page 0 → phys 7, row 0).
         assert_eq!(
             dsv4_decode_route_index(&table, 0, DEC_PBS, 0).unwrap(),
             (7 * DEC_PBS) as i32
         );
-        // out=65 (logical page 1 → phys 3, row 1).
         assert_eq!(
             dsv4_decode_route_index(&table, DEC_PBS as i32 + 1, DEC_PBS, 0).unwrap(),
             (3 * DEC_PBS + 1) as i32
         );
-        // out=130 (logical page 2 → phys 9, row 2).
         assert_eq!(
             dsv4_decode_route_index(&table, 2 * DEC_PBS as i32 + 2, DEC_PBS, 0).unwrap(),
             (9 * DEC_PBS + 2) as i32
@@ -470,20 +451,16 @@ mod tests {
     /// out-of-bounds read of the FP8 pool. A physical page in range is unaffected.
     #[test]
     fn dsv4_decode_masks_physical_page_past_pool() {
-        // Logical pages 0,1,2 → physical 7,3,9; pool has only 8 blocks.
         let table = vec![7u32, 3, 9];
         let total_blocks = 8;
-        // logical 0 → phys 7 (< 8): kept.
         assert_eq!(
             dsv4_decode_route_index(&table, 0, DEC_PBS, total_blocks).unwrap(),
             (7 * DEC_PBS) as i32
         );
-        // logical 1 → phys 3 (< 8): kept.
         assert_eq!(
             dsv4_decode_route_index(&table, DEC_PBS as i32 + 1, DEC_PBS, total_blocks).unwrap(),
             (3 * DEC_PBS + 1) as i32
         );
-        // logical 2 → phys 9 (>= 8): MASKED.
         assert_eq!(
             dsv4_decode_route_index(&table, 2 * DEC_PBS as i32 + 2, DEC_PBS, total_blocks).unwrap(),
             -1
@@ -492,7 +469,7 @@ mod tests {
 
     #[test]
     fn dsv4_decode_rejects_index_past_table() {
-        let table = vec![0u32, 1]; // 2 logical pages → indices 0..128.
+        let table = vec![0u32, 1];
         let err = dsv4_decode_route_index(&table, 200, DEC_PBS, 0)
             .unwrap_err()
             .to_string();
@@ -510,8 +487,6 @@ mod tests {
     fn dsv4_batched_page_table_row_stride_is_fixed_width() {
         const MAX_BATCH: usize = 4;
         const ROW_WIDTH: usize = DEC_PAGES; // per-slot total_blocks
-        // Flat [max_batch, row_width] buffer; row r is the identity table for a
-        // slot whose first physical page is r * ROW_WIDTH.
         let mut buf = [0u32; MAX_BATCH * ROW_WIDTH];
         for r in 0..MAX_BATCH {
             for lp in 0..ROW_WIDTH {
@@ -529,7 +504,6 @@ mod tests {
             row_width,
             "buggy stride must differ for n<max"
         );
-        // Each row routed at the fixed stride lands in its own slot's pages.
         for r in 0..MAX_BATCH {
             let row = &buf[r * row_width..(r + 1) * row_width];
             assert_eq!(

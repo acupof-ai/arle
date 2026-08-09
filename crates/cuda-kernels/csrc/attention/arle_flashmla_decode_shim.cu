@@ -71,9 +71,9 @@ int32_t arle_flashmla_sm90_sparse_decode_real_kernel_marker_cuda() {
     return 1;
 }
 
-// Reports the FP8 KV bytes/token packed layout for a (d_qk, model_type_int)
-// pair so ARLE-side allocation code can size buffers consistently with the
-// kernel's stride_kv_row hard-assert. Returns -1 for unsupported pairs.
+// FP8 KV bytes/token so ARLE-side allocation can size buffers consistently
+// with the kernel's stride_kv_row hard-assert. Returns -1 for unsupported
+// pairs.
 //
 // model_type_int: 0 = V32 (d_qk=576), 1 = MODEL1 (d_qk=512).
 int32_t arle_flashmla_sm90_sparse_decode_bytes_per_token(
@@ -85,17 +85,13 @@ int32_t arle_flashmla_sm90_sparse_decode_bytes_per_token(
     return -1;
 }
 
-// Compute the decode scheduler tuning meta (`num_sm_parts`,
-// `fixed_overhead_num_blocks`, `block_size_topk`) for a (h_q, s_q,
-// model_type_int) tuple by invoking
-// `sm90::decode::sparse_fp8::Decode_Sm90_Impl::get_meta(h_q, s_q)` on the
-// host. The values are CUDA-device-property dependent; arch detection is
-// done by `kerutils::Arch` (which reads `cudaGetDeviceProperties` from the
-// current device).
+// Decode scheduler tuning meta, computed on the host from
+// `sm90::decode::sparse_fp8::Decode_Sm90_Impl::get_meta(h_q, s_q)`. Values
+// are CUDA-device-property dependent; arch detection reads
+// `cudaGetDeviceProperties` from the current device.
 //
-// Caller writes the three meta ints into out_meta in this order so they
-// can be used to size the GPU-side `tile_scheduler_metadata` / `num_splits`
-// tensors before the sched_meta kernel launch.
+// Output order matches the GPU-side `tile_scheduler_metadata` / `num_splits`
+// sizing needed before the sched_meta kernel launch.
 cudaError_t arle_flashmla_sm90_sparse_decode_get_meta(
     int32_t h_q,
     int32_t s_q,
@@ -369,8 +365,7 @@ cudaError_t arle_flashmla_sm90_sparse_decode_fwd(
             return cudaErrorInvalidValue;
         }
 
-        // Combine step: merges split-KV partial outputs into the final
-        // output. Reads lse_accum / o_accum, writes lse + out. Skipped
+        // Combine: reads lse_accum / o_accum, writes lse + out. Skipped
         // implicitly when num_splits[b] = 1 (CTA early-returns in
         // combine.cu line 39-41).
         CombineParams cp{};

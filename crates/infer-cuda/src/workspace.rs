@@ -92,7 +92,6 @@ impl HiddenSlot {
         self.0 = None;
     }
 
-    /// Borrow the cached buffer, if any.
     pub(crate) fn as_ref(&self) -> Option<&HiddenStates> {
         self.0.as_ref()
     }
@@ -120,7 +119,6 @@ impl VecSlot {
     }
 }
 
-/// One cached typed device buffer (`CudaSlice<T>`).
 #[derive(Default)]
 pub(crate) struct SliceSlot<T>(Option<CudaSlice<T>>);
 

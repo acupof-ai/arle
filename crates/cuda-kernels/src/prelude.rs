@@ -1,7 +1,7 @@
 //! Proto-API contract for the CUDA kernel crate.
 //!
-//! This module is the single import point for the seven CUDA tensor / pool /
-//! metadata types that 25+ files in `model/` and `ops/` share. It exists for
+//! This module is the single import point for the nine CUDA tensor / pool /
+//! metadata symbols that 25+ files in `model/` and `ops/` share. It exists for
 //! two reasons:
 //!
 //! 1. **Stable consumer surface.** Model code says

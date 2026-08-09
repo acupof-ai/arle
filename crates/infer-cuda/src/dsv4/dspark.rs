@@ -233,7 +233,6 @@ impl Dsv4Model {
 
         let mut keepalive = Dsv4ForwardKeepalive::new(false);
 
-        // ── Noise block. HC pre-norm the stream to the attention input.
         let attn_mhc = crate::hc::gen_mhc_params(ctx, config, &layer.hc_attn, stream_in)?;
         // SAFETY: uninit device scratch; fully written before first read.
         let mut attn_normed = unsafe { HiddenStates::uninit(ctx, hidden_size, block)? };
@@ -249,7 +248,7 @@ impl Dsv4Model {
         )?;
         keepalive.keep_hidden(&attn_normed);
 
-        // q: wq_a → q_norm → wq_b (pre-absorbed, w_kc None → local_heads*head_dim).
+        // pre-absorbed: w_kc None → local_heads*head_dim.
         // SAFETY: dsv4_linear writes the full buffer.
         let mut c_q = unsafe { HiddenStates::uninit(ctx, attention.wq_a.rows, block)? };
         crate::attention::dsv4_linear(ctx, &attention.wq_a, &attn_normed, &mut c_q)?;
@@ -261,7 +260,7 @@ impl Dsv4Model {
         crate::attention::dsv4_linear(ctx, &attention.wq_b, &c_q_normed, &mut q_raw)?;
         keepalive.keep_hidden(&q_raw);
 
-        // latent: wkv → kv_norm (the single compressed K==V latent).
+        // the single compressed K==V latent.
         // SAFETY: dsv4_linear writes the full buffer.
         let mut kv_raw = unsafe { HiddenStates::uninit(ctx, head_dim, block)? };
         crate::attention::dsv4_linear(ctx, &attention.wkv, &attn_normed, &mut kv_raw)?;
@@ -310,7 +309,7 @@ impl Dsv4Model {
             }
         }
 
-        // ── Dense non-causal MLA-latent attention over [context ++ block]: every
+        // Dense non-causal MLA-latent attention over [context ++ block]: every
         // block row attends the whole kv_len range; K==V head-shared latent.
         let kv_len = (block_start + block) - df.ctx_base;
         let attn_heads = scratch.attn_heads.get(ctx, local_heads * head_dim, block)?;
@@ -348,7 +347,6 @@ impl Dsv4Model {
             }
         }
 
-        // ── O-projection (wo_a → wo_b) back to hidden, then TP all-reduce.
         // SAFETY: uninit device scratch; fully written by mla_oproj.
         let mut attn_out = unsafe { HiddenStates::uninit(ctx, hidden_size, block)? };
         {
@@ -380,7 +378,7 @@ impl Dsv4Model {
         keepalive.keep_hidden(&attn_out);
         keepalive.keep_hidden(&attn_stream);
 
-        // ── FFN (MoE + shared expert) HC, identical to mtp_forward_level.
+        // identical to mtp_forward_level.
         let ffn_mhc = crate::hc::gen_mhc_params(ctx, config, &layer.hc_ffn, &attn_stream)?;
         // SAFETY: uninit device scratch; fully written before first read.
         let mut ffn_normed = unsafe { HiddenStates::uninit(ctx, hidden_size, block)? };
@@ -496,8 +494,8 @@ impl Dsv4Model {
             attn_states.len()
         );
 
-        // ── Noise embedding: pos0 = anchor, pos1.. = mask token; embed via the
-        // base table (draft has no own embed), then HC-expand hidden → stream.
+        // pos0 = anchor, pos1.. = mask token; embed via the base table (draft has
+        // no own embed), then HC-expand hidden → stream.
         let mut ids = vec![config.dspark_noise_token_id as i32; block];
         ids[0] = anchor as i32;
         let ids_dev = crate::ops::upload_i32(ctx, &ids)?;
@@ -513,9 +511,9 @@ impl Dsv4Model {
         // stage forward's shape gate requires `block_tokens.len() == block`.
         let block_tokens: Vec<u32> = ids.iter().map(|&i| i as u32).collect();
 
-        // ── Chain the stages over the accumulated context latent. Each stage
-        // appends ONLY the noise block to its own `latent_kv` at `df.ctx_end` and
-        // does NOT advance the cursor — the committed context is already resident.
+        // Chain the stages over the accumulated context latent. Each stage appends
+        // ONLY the noise block to its own `latent_kv` at `df.ctx_end` and does NOT
+        // advance the cursor — the committed context is already resident.
         for (stage_idx, attn_state) in attn_states.iter_mut().enumerate() {
             hidden_stream = self.dspark_stage_forward(
                 draft,
@@ -530,7 +528,7 @@ impl Dsv4Model {
             self.dspark_dbg_stats(&format!("stage{stage_idx}"), &hidden_stream);
         }
 
-        // ── Exit: block_hidden = mtp.{n-1}.norm(mtp.{n-1}.hc_head(stream)). DSv4
+        // Exit: block_hidden = mtp.{n-1}.norm(mtp.{n-1}.hc_head(stream)). DSv4
         // folds the wide stream through the stage's head HC (vs qwen3's bare norm)
         // then RMSNorm — mirrors `head_normed_rows`, stage-scoped.
         let exit = &draft.stages[num_stages - 1];
@@ -841,8 +839,6 @@ impl Dsv4Model {
     }
 }
 
-// ── Markov semi-AR sampling + confidence truncation ──────────────────────────
-//
 // TODO(P2): dedup with qwen35::dspark into a shared target-independent
 // dspark_heads module. Kept separate to protect the shipped Qwen3.6 B track —
 // DO NOT touch `qwen35/dspark.rs` for this.
@@ -920,7 +916,6 @@ impl Dsv4Model {
         let mut base_row = HiddenStates::zeros(ctx, vocab, 1)?;
         let mut sum_row = HiddenStates::zeros(ctx, vocab, 1)?;
         let mut step_vec = DeviceVec::zeros(ctx, vocab)?;
-        // Markov bias buffers (allocated once when the head is present).
         let mut markov_bufs = markov
             .map(|(w1, _)| -> Result<_> {
                 Ok((
@@ -933,18 +928,16 @@ impl Dsv4Model {
         let mut drafts = Vec::with_capacity(block);
         let mut prev = anchor;
         for i in 0..block {
-            // base_row = base_logits[:, i].
             let src = base_logits.data.slice(i * vocab..(i + 1) * vocab);
             ctx.stream
                 .memcpy_dtod(&src, &mut base_row.data)
                 .map_err(|e| anyhow!("DSpark base row copy failed: {e}"))?;
 
-            // corrected_row = base_row (+ Markov bias when the head is present).
             let corrected_row =
                 if let (Some((w1, w2)), Some((emb, bias))) = (markov, markov_bufs.as_mut()) {
                     let tok = crate::ops::upload_i32(ctx, &[prev as i32])?;
-                    crate::ops::embedding_batch(ctx, w1, &tok, emb)?; // markov_w1[prev]
-                    crate::ops::gemm_batch(ctx, w2, emb, bias)?; // markov_w2 · emb
+                    crate::ops::embedding_batch(ctx, w1, &tok, emb)?;
+                    crate::ops::gemm_batch(ctx, w2, emb, bias)?;
                     crate::ops::add_batch(ctx, &base_row, bias, &mut sum_row)?;
                     &sum_row
                 } else {
@@ -1026,7 +1019,6 @@ impl Dsv4Model {
         let mut survival = Vec::with_capacity(prev_tokens.len().min(block));
         let mut acc = 1.0f32;
         for (i, &prev) in prev_tokens.iter().enumerate().take(block) {
-            // feat[..hidden] = block_hidden[:, i].
             let src = block_hidden.data.slice(i * hidden..(i + 1) * hidden);
             ctx.stream
                 .memcpy_dtod(&src, &mut feat.data.slice_mut(0..hidden))

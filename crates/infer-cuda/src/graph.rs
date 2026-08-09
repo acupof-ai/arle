@@ -46,7 +46,6 @@ pub struct CudaGraphState {
 unsafe impl Send for CudaGraphState {}
 
 impl CudaGraphState {
-    /// Create empty graph state bound to `stream`.
     #[must_use]
     pub fn new(stream: Arc<CudaStream>) -> Self {
         Self {
@@ -71,7 +70,6 @@ impl CudaGraphState {
         self.warm_remaining = self.warm_remaining.max(n);
     }
 
-    /// Whether the graph for this shape has been captured yet.
     #[must_use]
     pub fn is_captured(&self) -> bool {
         self.graph.is_some()
@@ -195,7 +193,6 @@ impl CudaGraphState {
 pub struct CapturedDecodeGraph {
     /// Decode batch size (number of rows) this graph was captured for.
     pub batch_size: usize,
-    /// The capture/replay state for this batch size.
     pub state: CudaGraphState,
 }
 
@@ -440,7 +437,6 @@ pub struct GraphBucket {
 }
 
 impl GraphBucket {
-    /// Create an empty bucket pool bound to the decode compute `stream`.
     #[must_use]
     pub fn new(stream: Arc<CudaStream>) -> Self {
         Self {
@@ -449,19 +445,16 @@ impl GraphBucket {
         }
     }
 
-    /// Number of distinct decode batch sizes that have a graph slot.
     #[must_use]
     pub fn len(&self) -> usize {
         self.graphs.len()
     }
 
-    /// Whether any decode batch size has a graph slot yet.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.graphs.is_empty()
     }
 
-    /// Whether `batch_size` already has a captured graph.
     #[must_use]
     pub fn contains(&self, batch_size: usize) -> bool {
         self.graphs

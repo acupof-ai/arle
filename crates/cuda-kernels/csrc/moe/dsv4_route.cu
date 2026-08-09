@@ -44,7 +44,7 @@ __device__ __forceinline__ uint16_t dsv4_swiglu_clamped_one(
   float up = dsv4_route_bf16_to_f32(up_bits);
   gate = fminf(gate, limit);
   up = fminf(fmaxf(up, -limit), limit);
-  float silu = gate / (1.0f + expf(-gate));
+  float silu = gate / (1.0f + __expf(-gate));
   return dsv4_route_f32_to_bf16_bits(silu * up);
 }
 
@@ -137,14 +137,14 @@ extern "C" CUresult dsv4_scale_route_outputs_by_meta_cuda(
 
 __device__ __forceinline__ float dsv4_route_sigmoid(float value) {
   if (value >= 0.0f) {
-    return 1.0f / (1.0f + expf(-value));
+    return 1.0f / (1.0f + __expf(-value));
   }
-  float expv = expf(value);
+  float expv = __expf(value);
   return expv / (1.0f + expv);
 }
 
 __device__ __forceinline__ float dsv4_route_softplus(float value) {
-  return value > 20.0f ? value : log1pf(expf(value));
+  return value > 20.0f ? value : __logf(1.0f + __expf(value));
 }
 
 __device__ __forceinline__ float dsv4_route_score(float logit, int scoring_kind) {

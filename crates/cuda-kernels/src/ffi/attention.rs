@@ -626,7 +626,6 @@ unsafe extern "C" {
 // `CUresult`, `CUstream`, `Half` are in scope from the `use super::{...}` above.
 include!(concat!(env!("OUT_DIR"), "/ffi_tilelang_generated.rs"));
 
-// ============================================================================
 // DSv4-Flash (MODEL1) FP8 KV pack.
 //
 // Packs ARLE's bf16 DSv4 KV (NoPE 448 + RoPE 64) into the MODEL1 FP8
@@ -640,7 +639,6 @@ include!(concat!(env!("OUT_DIR"), "/ffi_tilelang_generated.rs"));
 // for the kernel-side decode dispatch lives in `ffi/misc.rs` next to
 // `arle_flashmla_sm90_sparse_decode_fwd`; runtime wire-up is a separate
 // downstream item.
-// ============================================================================
 unsafe extern "C" {
     /// Pack `n_tokens` worth of (NoPE bf16, RoPE bf16) into the MODEL1 FP8
     /// block-paged layout. `page_block_size` is the upstream
@@ -789,7 +787,6 @@ unsafe extern "C" {
     ) -> CUresult;
 }
 
-// ============================================================================
 // DSv4 FlashMLA sparse-decode indices builder (block-paged coords).
 //
 // Builds the unified per-decode-token indices buffer (s_q=1) in the
@@ -801,7 +798,6 @@ unsafe extern "C" {
 // row-segment layout (SW slots | compressed selections | -1 padding).
 //
 // Phase D-4 step 1 of the FlashMLA decode integration.
-// ============================================================================
 unsafe extern "C" {
     /// Build the unified decode indices row (`s_q=1`).
     ///
@@ -889,14 +885,12 @@ unsafe extern "C" {
     ) -> CUresult;
 }
 
-// ============================================================================
 // FA3 hopper fwd + bwd shim (hdim256/bf16/sm_90a) — vendored Dao-AILab
 // flash-attention @ fc8cbad6, torch-free C ABI in
 // `csrc/attention/arle_fa3_shim.cu`. Built whenever the target includes sm_90;
 // without it the stub returns `cudaErrorNotSupported` and the marker returns
 // 0 (assert it returns 1 before enabling the runtime path — flashmla stub
 // lesson).
-// ============================================================================
 
 /// Mirror of `ArleFa3FwdHd256Args` in `csrc/attention/arle_fa3_shim.cu`.
 /// All strides in elements; the last dim (head_dim) must be contiguous. The

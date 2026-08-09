@@ -37,7 +37,6 @@ pub trait CollectiveBackend: Send + Sync {
     fn rank(&self) -> usize;
 
     /// In-place all-reduce.
-    /// In-place all-reduce.
     ///
     /// # Safety
     /// `buffer` must be a valid GPU pointer holding `count` elements of

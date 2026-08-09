@@ -1082,7 +1082,7 @@ impl Dsv4FlashMlaDecodeBatchScratch {
         let d_qk = head_dim as i32;
         let d_v = meta.d_v;
         let stride_kv_block_bytes = 64_i32 * bytes_per_token;
-        let stride_q = (global_heads * head_dim) as i32; // per-row Q stride (s_q=1)
+        let stride_q = (global_heads * head_dim) as i32; // s_q=1
         let stride_o = (global_heads as i32) * d_v;
         // Reader pitch MUST equal the writer pitch: the batched indices builder
         // (dsv4_flashmla_decode_build_indices.cu:210) writes row r at
@@ -1092,7 +1092,7 @@ impl Dsv4FlashMlaDecodeBatchScratch {
         // `r*topk_unified` → garbled every row but row 0 (Phase-B correctness KILL,
         // numdiff FIRST-EXCEEDANCE L0 row1). SGLang's invariant: builder pitch ==
         // reader pitch by construction.
-        let stride_indices = shape.topk_unified as i32; // row stride of self.indices (writer pitch)
+        let stride_indices = shape.topk_unified as i32; // writer pitch
         let stride_lse = global_heads as i32;
         let (indices_ptr, indices_guard) = self.indices.device_ptr(&ctx.stream);
         let (topk_ptr, topk_guard) = self.topk_length.device_ptr(&ctx.stream);

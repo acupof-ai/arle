@@ -74,7 +74,7 @@ static __device__ __forceinline__ float fp8d_swiglu_clamped(float gate, float up
                                                             float limit) {
     gate = fminf(gate, limit);
     up = fminf(fmaxf(up, -limit), limit);
-    return (gate / (1.0f + expf(-gate))) * up;
+    return (gate / (1.0f + __expf(-gate))) * up;
 }
 
 // Accumulate 16 FP8 weights (one block scale) against 16 BF16 activations in

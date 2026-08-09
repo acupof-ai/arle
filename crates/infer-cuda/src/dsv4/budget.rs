@@ -222,7 +222,6 @@ impl Dsv4Model {
                 &self.kv_arena,
             )?;
             total = total.saturating_add(n.saturating_mul(ring));
-            // spec_normed: per layer HiddenStates[hidden, rows].
             total = total.saturating_add(n.saturating_mul(hidden * rows * bf16));
             // spec_verify: embeddings + initial_stream, then per layer 7 row-major
             // temporaries (5 hidden-wide + 2 stream-wide), all `rows` columns. This
@@ -582,8 +581,7 @@ impl Dsv4Model {
                 .unwrap_or(usize::MAX)
             };
             let affordable = affordable.min(pool_affordable_slots);
-            // Neutral clamp (infer-seam): planned = min(requested, affordable);
-            // clamped == requested > affordable. NCCL min-reduce stays CUDA-side.
+            // Neutral clamp (infer-seam). NCCL min-reduce stays CUDA-side.
             let (planned, clamped) = infer_seam::clamp_to_affordable(requested, affordable);
             if clamped {
                 log::warn!(

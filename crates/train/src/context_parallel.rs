@@ -360,7 +360,6 @@ mod tests {
     #[test]
     fn from_mesh_dp_times_cp_derives_cp_axis() {
         let (dp, cp) = (2usize, 2usize);
-        // (world_rank, expected cp_rank)
         for (world, cp_rank) in [(0, 0), (1, 1), (2, 0), (3, 1)] {
             let ctx = CpContext::from_mesh(dp, cp, world);
             assert_eq!(ctx.size, cp, "CP view size is the CP axis");
@@ -380,7 +379,6 @@ mod tests {
     #[test]
     fn dp_from_mesh_derives_dp_axis() {
         let (dp, cp) = (2usize, 2usize);
-        // (world_rank, expected dp_rank)
         for (world, dp_rank) in [(0, 0), (1, 0), (2, 1), (3, 1)] {
             let ctx = DpContext::from_mesh(dp, cp, world);
             assert_eq!(ctx.size, dp, "DP view size is the DP axis");
