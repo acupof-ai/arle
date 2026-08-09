@@ -11,12 +11,9 @@ use autograd::{
 
 pub const DEFAULT_KL_CHUNK_SIZE: usize = 32;
 
-/// `batchmean` correction for the KL reductions: `mean` reduces over
-/// positions×vocab, so `×vocab` recovers `sum_v / positions`. Load-bearing —
-/// dropping it collapses the AdamW effective LR by ~vocab×
-/// (`errors/2026-06-16-opd-kl-vocab-reduction-lr-collapse.md`); a blended CE
-/// anchor must use this same scale, never re-divide by vocab. All three KL
-/// reductions route through here so it can't drift.
+/// `batchmean` correction: `mean` reduces over positions×vocab, so `×vocab`
+/// recovers `sum_v / positions`. Load-bearing — dropping it collapses the AdamW
+/// effective LR by ~vocab× (`errors/2026-06-16-opd-kl-vocab-reduction-lr-collapse.md`).
 #[inline]
 fn kl_batchmean_scale(vocab: usize) -> f32 {
     debug_assert!(vocab > 0, "kl_batchmean_scale: vocab must be > 0");
@@ -42,12 +39,8 @@ pub fn cross_entropy_loss(
     mul_scalar(mean_log_prob, -1.0, store, tape)
 }
 
-/// Forward KL divergence `KL(teacher || student)`, the OPD distill objective.
-/// Student logits require grad, teacher logits do not; the loss backprops only
-/// through the student. Drops the constant `-H(t)` and minimises the soft
-/// cross-entropy `-Σ_v t·log s`. `num_positions` is checked against
-/// `numel()/vocab` to catch a stale rollout length. Reduction is `batchmean`
-/// (see [`kl_batchmean_scale`]).
+/// Forward KL `KL(teacher || student)`. Drops the constant `-H(t)`, minimises
+/// soft cross-entropy `-Σ_v t·log s`. Reduction: `batchmean` (see `kl_batchmean_scale`).
 pub fn kl_distill_loss(
     student_logits: TensorId,
     teacher_logits: TensorId,
@@ -86,14 +79,8 @@ pub fn kl_distill_loss(
     }
 }
 
-/// Chunked sibling of [`kl_distill_loss`] that preserves the baseline
-/// mean-over-positions-and-vocab scale while limiting KL intermediates to
-/// `[prefix..., chunk, vocab]`.
-///
-/// The input logits may still be full-sequence tensors. This entrypoint
-/// chunks the loss graph only; OPD/eval callers must stop materializing full
-/// forward logits separately before this becomes an end-to-end peak-memory
-/// fix.
+/// Chunked sibling of `kl_distill_loss` that limits KL intermediates to
+/// `[prefix..., chunk, vocab]` while preserving the `batchmean` scale.
 pub fn kl_distill_loss_chunked(
     student_logits: TensorId,
     teacher_logits: TensorId,
@@ -888,10 +875,6 @@ mod tests {
         let teacher = store.alloc(
             Tensor::new(teacher_logits.to_vec(), shape.to_vec(), false).expect("teacher logits"),
         );
-        // Mirror `kl_distill_loss`'s `batchmean` scale: `mean` over (positions ×
-        // vocab) then `* vocab` to recover `sum_v / positions`. `-vocab` and
-        // `vocab` match the real path's `-temperature_sq * vocab_scale` /
-        // `temperature_sq * vocab_scale` at temperature == 1.0 byte-for-byte.
         let vocab = shape.last().copied().expect("vocab dim") as f32;
         let loss = match direction {
             KlDirection::Forward => {
@@ -952,7 +935,6 @@ mod tests {
         for (i, (&a, &b)) in lhs.iter().zip(rhs.iter()).enumerate() {
             let abs = (a - b).abs();
             let tol = eps + REL_TOL * b.abs();
-            // track the largest abs-over-tol violation, not the largest abs
             let slack = abs - tol;
             if slack > worst.4 {
                 worst = (i, a, b, abs, slack);
@@ -1018,18 +1000,10 @@ mod tests {
                     .collect::<Vec<_>>()
             })
             .sum::<f64>()
-            // `batchmean`: sum over vocab, mean over positions (= len / vocab),
-            // matching `kl_distill_loss`'s `vocab`-rescaled normalization.
             / (student_logits.len() / vocab) as f64
     }
 
-    /// Independent f64 reference for the FORWARD path. The production forward
-    /// loss minimizes the soft cross-entropy `-sum_v t_p * log s_p` (the `-H(t)`
-    /// term is dropped, see `kl_distill_loss` doc), reduced `batchmean` (sum over
-    /// vocab, mean over positions). Recomputed from scratch (softmax the teacher,
-    /// log_softmax the student) so it does NOT reuse the production
-    /// `-1.0 * vocab` construction — this is the independent forward check the
-    /// suite previously lacked (only `reference_reverse_kl_mean` existed).
+    /// Independent f64 reference for the forward path (softmax teacher, log_softmax student).
     fn reference_forward_kl_mean(
         student_logits: &[f32],
         teacher_logits: &[f32],
@@ -2020,10 +1994,6 @@ mod tests {
 
     #[test]
     fn forward_kl_matches_hand_computed_reference() {
-        // Independent absolute-value check for the FORWARD batchmean path,
-        // closing the audit-found test gap (forward previously rested only on
-        // chunked-equivalence + byte-identity to a helper that reused the same
-        // `-1.0 * vocab` construction = self-consistency, not independence).
         let shape = [2, 4];
         let student_logits = vec![0.3, -0.7, 1.2, 0.0, -0.2, 0.9, 0.1, -1.1];
         let teacher_logits = vec![-0.4, 0.6, 0.2, -0.1, 1.3, -0.8, 0.4, 0.0];
