@@ -158,7 +158,6 @@ impl CudaKvCacheDtype {
         }
     }
 
-    /// The cuda-kernels pool format this dtype selects.
     #[must_use]
     pub fn kv_format(self) -> KVFormat {
         match self {
@@ -1322,7 +1321,6 @@ mod tests {
 
     #[test]
     fn resolve_cuda_support_matrix() {
-        // Auto + explicit Bf16 resolve to the default CUDA dtype.
         assert_eq!(
             CudaKvCacheDtype::resolve(KvCacheDtype::Auto).unwrap(),
             CudaKvCacheDtype::Bf16
