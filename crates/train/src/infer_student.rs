@@ -216,8 +216,6 @@ impl InferStudent {
         Ok(generated)
     }
 
-    /// Run a single forward over `input_ids` (with absolute `positions`) and
-    /// return the next token from the last position's logits.
     pub fn decode_next_token(
         &self,
         input_ids: &[u32],

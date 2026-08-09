@@ -128,7 +128,6 @@ impl EmaSelfTeacher {
         Ok(())
     }
 
-    /// Pair the student's adapters in the same order as `self.adapter_ids`.
     pub fn student_adapter_pairs(student: &Qwen35Model) -> Vec<(TensorId, TensorId)> {
         pair_adapters(&student.adapter_name_map())
             .expect("student adapter map must pair into (lora_a, lora_b) tuples")
@@ -322,7 +321,7 @@ fn ema_blend(
             e.len()
         ));
     }
-    let mut out = e; // reuse the EMA host buffer
+    let mut out = e;
     for (o, &sv) in out.iter_mut().zip(s.iter()) {
         *o = alpha * *o + (1.0 - alpha) * sv;
     }

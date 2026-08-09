@@ -42,10 +42,8 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-/// Env var carrying the socket path the helper listens on.
 pub const LISTEN_ENV: &str = "ARLE_SPAWNER_LISTEN";
 
-/// Env var carrying the socket path clients connect to.
 pub const SOCKET_ENV: &str = "ARLE_SPAWNER_SOCKET";
 
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -92,7 +90,6 @@ fn read_frame<R: Read>(r: &mut R) -> std::io::Result<Vec<u8>> {
     Ok(buf)
 }
 
-/// Entry point when `ARLE_SPAWNER_LISTEN` is set; loops until listener errors.
 pub fn serve_loop() -> i32 {
     let sock = match std::env::var(LISTEN_ENV) {
         Ok(s) => s,
@@ -244,7 +241,6 @@ fn kill_group(pgid: i32) {
     unsafe { libc::kill(-pgid, libc::SIGKILL) };
 }
 
-/// Connects to the spawner socket; a fresh connection per request (Send-safe).
 #[derive(Clone, Debug)]
 pub struct SpawnClient {
     socket: PathBuf,
@@ -272,7 +268,6 @@ impl SpawnClient {
     }
 }
 
-/// Owns the helper child; killing it on drop tears the helper down.
 pub struct SpawnerHandle {
     child: std::process::Child,
     socket: PathBuf,

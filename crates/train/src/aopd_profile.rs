@@ -70,7 +70,6 @@ pub fn phase_secs() -> Vec<(&'static str, f64)> {
     )
 }
 
-/// `kind` is one of GPU/WALL/DISK. Use `time`/`time_try` for closures.
 pub fn record(label: &'static str, kind: &'static str, secs: f64) {
     if let Ok(mut t) = table().lock() {
         match t.rows.iter_mut().find(|(l, _, _)| *l == label) {
