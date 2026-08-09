@@ -972,6 +972,33 @@ impl RealCudaExecutor {
             ),
         }
     }
+
+    /// Non-owning views of every resident dense-BF16 base projection's device
+    /// pointer, for refreshing the train student's frozen base AFTER a LoRA
+    /// re-merge.
+    pub(crate) fn frozen_base_bf16_pointers(
+        &self,
+    ) -> Result<Vec<crate::qwen35::SharedBf16BaseProjection>> {
+        match self {
+            Self::Qwen35(q) => q.frozen_base_bf16_pointers(),
+            Self::Qwen(_) => anyhow::bail!(
+                "frozen-base BF16 sharing is only wired for the Qwen3.5/3.6 hybrid OPD student"
+            ),
+            Self::Dsv4(_) => anyhow::bail!(
+                "frozen-base BF16 sharing is only wired for the Qwen3.5/3.6 hybrid OPD student"
+            ),
+        }
+    }
+
+    /// Free the retired FP8 qweight/scales buffers for every projection that
+    /// has been promoted to dense BF16. Call ONLY after the train student has
+    /// re-aliased its frozen base to the BF16 `data` pointer.
+    pub(crate) fn free_retired_fp8_buffers(&mut self) {
+        match self {
+            Self::Qwen35(q) => q.free_retired_fp8_buffers(),
+            _ => {}
+        }
+    }
 }
 
 use kv_native_sys::{BLOB_CHUNK_BYTES, KvTierStore, default_t1_budget_bytes};
