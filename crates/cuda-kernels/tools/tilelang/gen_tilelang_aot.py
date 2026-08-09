@@ -395,8 +395,8 @@ GDR_SPECS = {
 }
 
 
-# FlashQLA chunked GDR fwd (tools/tilelang/flashqla_gdr.py — Hopper-only,
-# DK=DV=128/chunk=64/block_DV=64; H/Hg per instantiation via
+# FlashQLA chunked GDR fwd (tools/tilelang/flashqla_gdr.py — Hopper-only;
+# H/Hg per instantiation via
 # --num-q-heads/--num-kv-heads). All dynamic shape vars resolve from the
 # single `seq_len` public scalar; batch is always 1.
 FLASHQLA_SCALAR_INPUTS = {
@@ -418,7 +418,10 @@ FLASHQLA_SCALAR_INPUTS = {
 FLASHQLA_KEYS = ("fq_cumsum", "fq_kkt", "fq_fwd", "fq_prepare_h", "fq_bwd")
 
 
-def flashqla_specs(num_heads: int) -> dict:
+def flashqla_specs(num_heads: int, value_dim: int, block_value_dim: int) -> dict:
+    if value_dim <= 0 or block_value_dim <= 0:
+        raise ValueError("FlashQLA value dimensions must be positive")
+    value_tiles = (value_dim + block_value_dim - 1) // block_value_dim
     return {
     "fq_cumsum": WrapperSpec(
         public_params="""    const float *g_in,
@@ -472,7 +475,7 @@ def flashqla_specs(num_heads: int) -> dict:
         },
         scalar_inputs=FLASHQLA_SCALAR_INPUTS,
         prelude="",
-        grid=f"""    int grid_x = {2 * num_heads};  /* ceildiv(DV=128, block_DV=64) * batch(1) * H */
+        grid=f"""    int grid_x = {value_tiles * num_heads};  /* ceildiv(DV, block_DV) * batch(1) * H */
     int grid_y = 1;
     int grid_z = 1;""",
         block="512, 1, 1",
@@ -1007,7 +1010,9 @@ def main() -> int:
         prim_func = module.get_kernel(
             args.kernel_key, args.num_q_heads, args.num_kv_heads
         )
-        wrapper_spec = flashqla_specs(args.num_q_heads)[args.kernel_key]
+        wrapper_spec = flashqla_specs(
+            args.num_q_heads, module.FQ_DV, module.FQ_BLOCK_DV
+        )[args.kernel_key]
     else:
         if not args.kernel_key:
             raise RuntimeError("gdr kernels require --kernel-key")
