@@ -1,5 +1,6 @@
 use super::*;
 
+#[cfg(test)]
 pub(crate) mod conv_probe {
     use super::*;
     use std::cell::RefCell;
@@ -57,8 +58,8 @@ pub(crate) mod conv_probe {
         weight: &DeviceVec,
         state: &DeviceVec,
     ) -> Result<Option<Pending>> {
-        // 只捕获第一个 linear-attention 层的 conv：同一层的 conv 算术在所有层相同，
-        // 一层足以验证正确性，避免下载每一层的 state。
+        // Conv arithmetic is identical across all layers; one layer suffices and
+        // avoids downloading every layer's state.
         let needed = linear_idx == 0 && CAPTURES.with(|captures| captures.borrow().is_some());
         if !needed {
             return Ok(None);

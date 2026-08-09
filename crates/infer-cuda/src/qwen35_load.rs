@@ -478,7 +478,6 @@ impl Qwen35Model {
                             &m,
                             &tp_cfg,
                         )?,
-                        // Per-v-head vectors `[Vh]`.
                         dt_bias: load_v_head_vec_sharded(
                             &loader,
                             &ctx,
@@ -660,6 +659,7 @@ impl Qwen35Model {
         })
     }
 
+    #[allow(dead_code)] // WIP: durable KV-recall manifest weight-version stamp, not yet wired
     pub(crate) fn weights_epoch(&self) -> &str {
         &self.weights_epoch
     }
