@@ -136,7 +136,6 @@ impl Qwen35Model {
         let sm_scale = 1.0f32 / (c.head_dim as f32).sqrt();
         let kv_len = start_pos + seq_len;
 
-        // Prep: q/k RMSNorm + RoPE + write K/V into the contiguous cache.
         {
             let (qf_ptr, _g0) = q_full.data.device_ptr(&self.ctx.stream);
             let (k_ptr, _g1) = k_batch.data.device_ptr(&self.ctx.stream);
@@ -446,7 +445,6 @@ impl Qwen35Model {
         let k_pool_ptr = pool.k_ptr(full_idx, &self.ctx.stream);
         let v_pool_ptr = pool.v_ptr(full_idx, &self.ctx.stream);
 
-        // Prep: q/k RMSNorm + RoPE; write each row's K/V into its tail page(s).
         {
             #[cfg(test)]
             let prep_capture = if !decode && meta.batch == 1 {
@@ -607,7 +605,6 @@ impl Qwen35Model {
             }
         }
 
-        // Paged attention over the recall page table (RoPE pre-baked).
         {
             #[cfg(test)]
             let attn_capture = if !decode && meta.batch == 1 {
@@ -1186,7 +1183,6 @@ impl Qwen35Model {
             }
         }
 
-        // ── gated output RMSNorm (per value head; gate = z). ──
         let normed_out = normed_out.get(&self.ctx, z_dim, rows)?;
         {
             let (x_ptr, _g0) = gdr_out.data.device_ptr(&self.ctx.stream);
@@ -1414,7 +1410,6 @@ impl Qwen35Model {
         let qkv_dim = self.local_linear_qkv_dim();
         let z_dim = self.local_linear_z_dim();
 
-        // ── conv1d (advances the per-slot conv ring). ──
         let conv_state = &mut slot.conv_states[linear_idx];
         ensure!(
             conv_state.len == qkv_dim * (c.linear_conv_kernel_dim - 1),
@@ -1469,13 +1464,13 @@ impl Qwen35Model {
             conv_probe::finish(&self.ctx, conv_capture, qkv_conv, conv_state)?;
         }
 
-        // ── gated-delta rule. Decode (seq_len==1) is always the recurrent
-        //    kernel. Prefill chunks default to the recurrent kernel; the
-        //    FlashQLA chunked path (--qwen35-gdr-chunked) replaces the
-        //    serial token scan with chunk-parallel TileLang kernels, one AOT
-        //    instantiation per (Hg, H) geometry — unknown geometry falls back
-        //    to recurrent. The legacy in-tree chunkwise TileLang path stays
-        //    dead (sm_90 hang was in ITS kernels). ──
+        // Gated-delta rule. Decode (seq_len==1) is always the recurrent
+        // kernel. Prefill chunks default to the recurrent kernel; the
+        // FlashQLA chunked path (--qwen35-gdr-chunked) replaces the
+        // serial token scan with chunk-parallel TileLang kernels, one AOT
+        // instantiation per (Hg, H) geometry — unknown geometry falls back
+        // to recurrent. The legacy in-tree chunkwise TileLang path stays
+        // dead (sm_90 hang was in ITS kernels).
         let fq_fns: Option<(ffi::FqCumsumFn, ffi::FqKktFn, ffi::FqFwdFn)> =
             match (self.local_linear_k_heads, self.local_linear_v_heads) {
                 (16, 32) => Some((

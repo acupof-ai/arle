@@ -81,8 +81,10 @@ const FA3_MAX_QLEN: usize = 64;
 /// batch 4 up (2026-08-04: batch 8 is +0.36% at a ceiling of 20).
 const FA3_DECODE_SPLITS_FLOOR: usize = 8;
 
+#[cfg(test)]
 #[path = "qwen35_probe.rs"]
 mod probe;
+#[cfg(test)]
 pub(crate) use probe::*;
 fn qwen35_profile_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
@@ -439,6 +441,7 @@ mod decode;
 mod spec;
 pub(crate) use spec::*;
 
+#[cfg(test)]
 mod tests {
     use super::*;
     use qwen35_spec::LayerType;
@@ -592,7 +595,6 @@ mod tests {
         let model = Qwen35Model::from_safetensors(Path::new(&path), max_seq, Some(depth))
             .expect("load Qwen3.6-27B-FP8 with MTP head");
 
-        // Greedy no-spec: prefill the prompt, then decode `n_decode` tokens.
         let (num_linear, gdr_len, conv_len) = model.recurrent_dims();
         let run_nospec = || -> (Vec<u32>, f64) {
             let mut slot = model.new_slot_state();
@@ -620,7 +622,6 @@ mod tests {
             (out, t0.elapsed().as_secs_f64())
         };
 
-        // Spec: prefill seeds (pending, hidden), then loop spec_step(depth).
         let run_spec = || -> (Vec<u32>, f64, usize, usize) {
             let mut slot = model.new_slot_state();
             let mut acq_pool = Vec::new();
@@ -810,7 +811,6 @@ mod tests {
         ctx.sync().unwrap();
         assert_eq!(device_merged.len(), reference.len());
 
-        // Cosine similarity + max-abs-err vs the host reference.
         let mut dot = 0.0f64;
         let mut nr = 0.0f64;
         let mut nd = 0.0f64;

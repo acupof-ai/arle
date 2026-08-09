@@ -45,27 +45,6 @@ pub(crate) struct Qwen35SpecSlotState {
     pub(crate) u_residual: SliceSlot<f32>,
 }
 
-/// Per-linear-layer capture of the gated-delta-rule inputs from the spec verify
-/// forward, sized for the full `depth+1`-row chain — the substrate for the
-/// cheap partial-accept replay.
-///
-/// On a partial accept (`k < depth`) the trunk linear state must be left at the
-/// post-`[pending, d1..dk]` position. The old path re-ran a FULL `depth+1`-wide
-/// trunk forward (`forward_hidden`) over the accepted prefix purely for that
-/// recurrent side-effect (21-47 ms per macro-step on H20 real-fp8). The state
-/// the GDR + conv1d kernels advance is a pure function of their per-layer inputs
-/// (the post-in_proj `qkv` PRE-conv1d, plus the `b`/`a` gate projections); those
-/// inputs already encode the full-stack residual because the verify produced
-/// them with the real trunk. So instead of recomputing them we **cache them
-/// during verify** and re-run ONLY conv1d + the recurrent GDR over rows
-/// `[0..=k]` on a partial accept — bit-identical to the verify's first `k+1`
-/// recurrent steps (same kernels, same inputs, same in-place math), skipping
-/// every full-attn block, every MLP/MoE, the final norm, and the lm_head.
-///
-/// All three caches are token-major `[(depth+1), width]` bf16 (token `t` at
-/// offset `t*width`), so rows `[0..=k]` slice contiguously as `[0..(k+1)*width]`.
-/// Allocated only with the spec state, so the baseline decode path never pays.
-#[allow(dead_code)] // populated by linear_attention under capture; read by replay_linear_only
 /// Pointer/length staging for [`Qwen35Model::batched_copy`].
 #[derive(Default)]
 pub(crate) struct Qwen35CopyScratch {
@@ -158,6 +137,27 @@ impl Qwen35ReplayTables {
     }
 }
 
+/// Per-linear-layer capture of the gated-delta-rule inputs from the spec verify
+/// forward, sized for the full `depth+1`-row chain — the substrate for the
+/// cheap partial-accept replay.
+///
+/// On a partial accept (`k < depth`) the trunk linear state must be left at the
+/// post-`[pending, d1..dk]` position. The old path re-ran a FULL `depth+1`-wide
+/// trunk forward (`forward_hidden`) over the accepted prefix purely for that
+/// recurrent side-effect (21-47 ms per macro-step on H20 real-fp8). The state
+/// the GDR + conv1d kernels advance is a pure function of their per-layer inputs
+/// (the post-in_proj `qkv` PRE-conv1d, plus the `b`/`a` gate projections); those
+/// inputs already encode the full-stack residual because the verify produced
+/// them with the real trunk. So instead of recomputing them we **cache them
+/// during verify** and re-run ONLY conv1d + the recurrent GDR over rows
+/// `[0..=k]` on a partial accept — bit-identical to the verify's first `k+1`
+/// recurrent steps (same kernels, same inputs, same in-place math), skipping
+/// every full-attn block, every MLP/MoE, the final norm, and the lm_head.
+///
+/// All three caches are token-major `[(depth+1), width]` bf16 (token `t` at
+/// offset `t*width`), so rows `[0..=k]` slice contiguously as `[0..(k+1)*width]`.
+/// Allocated only with the spec state, so the baseline decode path never pays.
+#[allow(dead_code)] // populated by linear_attention under capture; read by replay_linear_only
 pub(crate) struct Qwen35LinearCapture {
     /// Number of layers (== `num_linear`); the per-row stride is each buffer's
     /// `len / (depth+1)`.

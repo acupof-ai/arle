@@ -24,14 +24,11 @@ impl Qwen35Model {
             h_prev.len
         );
 
-        // Candidate token embedding.
         let token_ids = upload_i32(&self.ctx, &[token as i32])?;
         let mut emb = HiddenStates::zeros(&self.ctx, hidden, 1)?;
         embedding_batch(&self.ctx, &self.embed_tokens, &token_ids, &mut emb)?;
 
-        // Pre-fc RMSNorms over [embedding ; previous hidden], concat.
-        // fc is [hidden, 2*hidden]; the concat input is [norm(emb) ; norm(h_prev)]
-        // (embedding first — matches the Metal `qwen3_5_mtp` loader order).
+        // embedding first — matches the Metal `qwen3_5_mtp` loader order.
         let mut concat = HiddenStates::zeros(&self.ctx, 2 * hidden, 1)?;
         let mut emb_n = HiddenStates::zeros(&self.ctx, hidden, 1)?;
         rms_norm_offset(&self.ctx, &emb, &mtp.pre_fc_norm_embedding, eps, &mut emb_n)?;
@@ -54,8 +51,7 @@ impl Qwen35Model {
         let mut h_fc = HiddenStates::zeros(&self.ctx, hidden, 1)?;
         gemm_batch(&self.ctx, &mtp.fc, &concat, &mut h_fc)?;
 
-        // One transformer block (Full attn over the head's own per-block
-        //       KV + dense MLP), mirroring the trunk layer body.
+        // mirrors the trunk layer body.
         let layer = &mtp.layer;
         let Qwen35Attn::Full(full_attn) = &layer.attn else {
             unreachable!("MTP head layer is always full attention");
@@ -113,7 +109,7 @@ impl Qwen35Model {
         let mut h_layer = HiddenStates::zeros(&self.ctx, hidden, 1)?;
         add_batch(&self.ctx, &hidden_mid, &mlp_out, &mut h_layer)?;
 
-        // Final head RMSNorm + SHARED lm_head + token selection.
+        // SHARED lm_head (same weights as trunk).
         rms_norm_offset(&self.ctx, &h_layer, &mtp.norm, eps, &mut normed)?;
         let vocab = self.output_projection().rows;
         let mut logits = HiddenStates::zeros(&self.ctx, vocab, 1)?;
@@ -312,7 +308,6 @@ impl Qwen35Model {
         };
         let accept_ms = mtp_phase_lap(&self.ctx, &mut pt);
 
-        // next_hidden = the verify hidden of accepted row k (produced `bonus`).
         let mut next_hidden = DeviceVec::zeros(&self.ctx, hidden_size)?;
         {
             let src = hiddens.data.slice(k * hidden_size..(k + 1) * hidden_size);
@@ -457,7 +452,6 @@ impl Qwen35Model {
     }
 }
 
-/// Offset RMSNorm (1+weight) over a batch — Qwen3.5 norms store `weight - 1`.
 /// Spec-decode phase attribution: returns `Some(Instant)` only when
 /// `ARLE_MTP_PHASE` is set (the per-phase sync needed for accurate GPU timing is
 /// opt-in, so the default spec-decode path pays nothing).
