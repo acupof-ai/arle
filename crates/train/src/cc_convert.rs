@@ -31,7 +31,6 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow, ensure};
 use serde::{Deserialize, Serialize};
 
-/// One capture window grouping dumps into a single attempt.
 #[derive(Debug, Clone, Deserialize)]
 pub struct CcWindow {
     pub label: String,
@@ -286,7 +285,6 @@ fn read_json(path: &Path) -> Result<serde_json::Value> {
     serde_json::from_str(&raw).with_context(|| format!("parse {}", path.display()))
 }
 
-/// Dump body → serve-identical chat request → span-carrying ChatML render.
 fn render_dump(body: serde_json::Value) -> Result<chat::RenderedChatMl> {
     let chat_request = infer_server::messages_body_to_chat_request(body)
         .context("map /v1/messages body onto the chat request")?;
@@ -311,7 +309,6 @@ fn messages_len(body: &serde_json::Value) -> usize {
         .map_or(0, Vec::len)
 }
 
-/// Parse `<dump>.tokens.json`; non-empty prompt+gen required, else fallback.
 fn read_tokens_sidecar(dump_path: &Path) -> Option<infer_server::TokensSidecar> {
     let path = infer_server::tokens_sidecar_path(dump_path);
     let raw = fs::read_to_string(&path).ok()?;
@@ -413,7 +410,6 @@ fn to_chat_message(message: &infer_server::ChatMessage) -> chat::ChatMessage {
     }
 }
 
-/// Token is supervised (1) iff its byte range overlaps any supervised span.
 fn mask_from_offsets(offsets: &[(usize, usize)], supervised: &[Range<usize>]) -> Vec<u8> {
     offsets
         .iter()

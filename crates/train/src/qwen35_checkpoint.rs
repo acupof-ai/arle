@@ -68,8 +68,6 @@ pub enum Qwen35StudentWeights<'a> {
     /// Save a full model checkpoint. For LoRA students this materializes
     /// base+adapter weights under the base HF tensor names.
     FullMaterialized { bf16: bool },
-    /// Save only LoRA adapter tensors as a PEFT adapter directory:
-    /// `adapter_config.json` plus `adapter_model.safetensors`.
     AdapterOnly {
         bf16: bool,
         adapter_config: &'a LoraAdapterConfig,

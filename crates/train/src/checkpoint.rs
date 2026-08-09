@@ -57,8 +57,6 @@ pub struct TrainerStateDoc {
     pub codec_version: u32,
 }
 
-/// Save trainer state + AdamW moments to `<dir>/trainer_state.json` and
-/// `<dir>/optimizer.safetensors`.
 pub fn save_trainer_state_v2(
     dir: &Path,
     state: &TrainerStateDoc,
