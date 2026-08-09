@@ -200,8 +200,13 @@ def _source_quantization_config(input_dir, config):
 
 
 def _validate_gptq_v1(config):
+    quant_method = config.get("quant_method", "gptq").lower()
+    packing_format = str(config.get("packing_format", "")).lower()
+    # AutoRound with `auto_gptq` packing uses the same int4 layout as GPTQ v1.
+    is_gptq = quant_method == "gptq"
+    is_autoround_gptq = quant_method == "auto-round" and "auto_gptq" in packing_format
     supported = (
-        config.get("quant_method", "gptq").lower() == "gptq"
+        (is_gptq or is_autoround_gptq)
         and config.get("bits") == 4
         and isinstance(config.get("group_size"), int)
         and config["group_size"] > 0
@@ -214,8 +219,8 @@ def _validate_gptq_v1(config):
     explicit_v2 = version in (2, "2", "v2") or checkpoint_format in ("gptq_v2", "v2")
     if not supported or explicit_v2:
         raise ValueError(
-            "Only GPTQ v1 4-bit symmetric quantization is supported; "
-            f"got {config}"
+            "Only GPTQ v1 / AutoRound(auto_gptq) 4-bit symmetric quantization is "
+            f"supported; got {config}"
         )
 
 
@@ -252,21 +257,26 @@ def _inspect_index(input_dir, index):
 
     declared_shards = set(weight_map.values())
     actual_shards = {source.name for source in source_shards}
-    if declared_shards != actual_shards:
-        raise ValueError(
-            "index shard set mismatch: "
-            f"missing={sorted(declared_shards - actual_shards)}, "
-            f"unindexed={sorted(actual_shards - declared_shards)}"
-        )
+    unindexed = actual_shards - declared_shards
+    if unindexed:
+        # Shards not listed in the index (e.g. MTP head sidecars). Add their
+        # tensors to the weight_map so they are converted and re-emitted.
+        for source in source_shards:
+            if source.name not in unindexed:
+                continue
+            with safe_open(source, framework="pt", device="cpu") as handle:
+                for key in handle.keys():
+                    weight_map[key] = source.name
+        declared_shards = set(weight_map.values())
 
     actual_map = {}
     for source in source_shards:
         with safe_open(source, framework="pt", device="cpu") as handle:
             for key in handle.keys():
                 if key in actual_map:
-                    raise ValueError(
-                        f"tensor {key} appears in both {actual_map[key]} and {source.name}"
-                    )
+                    # Duplicate tensor across shards (e.g. MTP head emitted in
+                    # both model_extra_tensors and model_mtp_bf16). Keep the first.
+                    continue
                 actual_map[key] = source.name
 
     declared_keys = set(weight_map)
