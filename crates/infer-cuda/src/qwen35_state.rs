@@ -171,6 +171,7 @@ pub(crate) fn alloc_recurrent_block(
             // SAFETY: zero_recurrent runs before any read of this state.
             let g = unsafe { ctx.stream.alloc::<f32>(gdr_state_len) }
                 .map_err(|e| anyhow!("alloc gated-delta state failed: {e}"))?;
+            // SAFETY: zero_recurrent runs before any read of this state.
             let c = unsafe { DeviceVec::uninit(ctx, conv_len) }?;
             Ok((g, c))
         })
@@ -441,6 +442,8 @@ impl Qwen35SlotState {
             });
         }
         for state in &self.conv_states {
+            // SAFETY: written only by the D2H above, after which synchronize
+            // has completed it; freed with the slot state.
             self.conv_pinned.push(unsafe {
                 ctx.ctx
                     .alloc_pinned::<bf16>(state.data.len())
