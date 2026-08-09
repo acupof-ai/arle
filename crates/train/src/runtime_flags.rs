@@ -6,7 +6,6 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering::Relaxed};
 
 use crate::opd::EngineOffloadMode;
 
-/// Train-side knobs the OPD CLI flags control.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TrainRuntimeFlags {
     pub writeback_offload: bool,

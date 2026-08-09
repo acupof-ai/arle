@@ -31,7 +31,6 @@ pub const CC_SESSION_TOKENS: usize = 22_000;
 /// and the serve request caps derive from the pool, never from the typical size.
 pub const CC_MAX_SESSION_TOKENS: usize = 200_000;
 
-/// Run-wide knobs; construct literally.
 pub struct CcHarness {
     pub work_root: PathBuf,
     pub dump_dir: PathBuf,
@@ -45,7 +44,6 @@ pub struct CcHarness {
     pub tokenizer: tokenizers::Tokenizer,
 }
 
-/// How the raw pytest pass-fraction becomes the training reward.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub enum RewardShape {
     #[default]
@@ -80,7 +78,6 @@ pub fn load_tokenizer(path: &Path) -> Result<tokenizers::Tokenizer> {
         .map_err(|err| anyhow!("load tokenizer {}: {err}", path.display()))
 }
 
-/// One scored rollout sample: cc attempt stats + pytest verdict + dump window.
 #[derive(Clone, Debug)]
 pub struct ScoredSample {
     pub task_id: String,
@@ -140,7 +137,6 @@ impl RefillBudget {
         }
     }
 
-    /// Record a completed group; return whether to boot a replacement.
     pub fn complete(&mut self, committed: usize, trained: bool, tokens: u64) -> bool {
         self.tokens = self.tokens.saturating_add(tokens);
         if trained {
@@ -181,7 +177,6 @@ impl GroupAssembler {
     }
 }
 
-/// Boot-ahead handle: `k` sandboxes building in the background.
 pub struct BootedGroup {
     task: Arc<SweTask>,
     k: usize,

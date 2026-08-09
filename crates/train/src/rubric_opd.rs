@@ -177,7 +177,6 @@ pub struct RubricOpdConfig {
     /// engine's resident base bytes, so the Phase-B rollout offload is skipped
     /// (freeing those bytes would crash the CE forward reading the alias).
     pub share_frozen_base: bool,
-    /// When `true`, distill only the shortest accepted rollout per prompt.
     pub distill_shortest: bool,
 }
 

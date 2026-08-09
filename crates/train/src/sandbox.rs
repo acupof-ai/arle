@@ -43,7 +43,6 @@ fn request_from_command(
     }
 }
 
-/// Run a `Command` via the pre-CUDA spawner helper.
 fn spawn_via_helper(
     client: &SpawnClient,
     command: &Command,
@@ -60,8 +59,6 @@ struct PlainOutput {
     status: String,
 }
 
-/// Routed through the spawner helper when its env is set; direct otherwise.
-/// `combined_timeout=false`: separate stdout/stderr, no timeout.
 fn plain_output(command: &mut Command, label: &str) -> Result<PlainOutput> {
     if let Some(client) = SpawnClient::from_env() {
         let resp = spawn_via_helper(&client, command, false, Duration::ZERO)
@@ -92,9 +89,6 @@ const BASH_OUTPUT_CLIP: usize = 8000;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
-/// Isolate `command` in its own process group, capture combined stdout+stderr
-/// to a temp file (no pipe → no hang on backgrounded grandchildren).
-/// Returns `(combined_output, exit_code, killed_by_timeout)`.
 pub(crate) fn run_captured(
     command: Command,
     timeout: Duration,
@@ -177,7 +171,6 @@ pub(crate) fn run_captured(
     Ok((output, code, killed))
 }
 
-/// Signal the whole process group. Uses the `kill` binary (no libc dep).
 fn kill_group(pgid: i32) {
     // Never signal our own group: a mis-derived pgid must not SIGKILL the
     // caller's session (observed under `cargo test -p train --features cuda`).
@@ -234,8 +227,6 @@ fn format_bash_output(stdout: &[u8], stderr: &[u8], code: Option<i32>, killed: b
     clip_middle(&combined, BASH_OUTPUT_CLIP)
 }
 
-/// Copy `staged_tree` into `work_root/instance_id`, run `setup_cmd`, then
-/// `git init` + commit "base". Returns the workdir path.
 pub fn boot_workdir(
     work_root: &Path,
     instance_id: &str,
@@ -330,9 +321,6 @@ pub fn diff_workdir(workdir: &Path) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-/// Apply `test_patch`, run `fail_to_pass` tests. Returns `(reward, log_tail)`
-/// where reward = passed/total in [0,1]. Falls back to binary (exit-0 → 1.0)
-/// when killed or summary unparseable.
 pub fn score_workdir(
     workdir: &Path,
     test_patch: &str,
@@ -426,7 +414,6 @@ pub fn score_workdir(
     Ok((reward, log_tail))
 }
 
-/// Parse pytest summary line: `"3 passed, 2 failed"` → `(3, 2)`.
 fn parse_pytest_counts(text: &str) -> Option<(usize, usize)> {
     let count_of = |line: &str, kind: &str| -> Option<usize> {
         line.split(", ").find_map(|seg| {

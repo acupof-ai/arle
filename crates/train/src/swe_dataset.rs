@@ -30,8 +30,6 @@ pub struct SweTask {
     pub before_repo_set_cmd: Option<String>,
 }
 
-/// Normalize a value that may be a JSON array, a JSON-string of an array,
-/// or a bare string into `Vec<String>`.
 fn normalize_string_list(value: &serde_json::Value) -> Vec<String> {
     match value {
         serde_json::Value::Array(items) => items
