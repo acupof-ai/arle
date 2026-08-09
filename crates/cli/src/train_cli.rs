@@ -453,11 +453,13 @@ fn run_opd(args: TrainOpdArgs) -> ExitCode {
 /// checkpoints), and runs the w2s step: ΔT → proxy teacher → reverse KL +
 /// local/global KL regularization.
 fn run_w2s(args: TrainW2sArgs) -> Result<()> {
+    use crate::args::W2sAuxBackendArg;
     use autograd::{Tape, TensorId, optim::AdamW};
     use train::{
         lora::LoraConfig,
-        qwen35_loader::{load_qwen35_from_hf_dir, load_qwen35_lora_from_hf_dir},
-        w2s::{W2sAuxModel, W2sConfig, w2s_step},
+        qwen35::Qwen35Model,
+        qwen35_loader::load_qwen35_from_hf_dir,
+        w2s::{W2sAuxModel, W2sConfig, sync_lora_adapters, w2s_step},
     };
 
     let target_set = parse_lora_target_set(&args.lora_target_set)?;
@@ -466,56 +468,170 @@ fn run_w2s(args: TrainW2sArgs) -> Result<()> {
         alpha: args.lora_alpha,
     };
 
-    let (mut store, _train_backend, backend_label) = build_opd_store(args.backend)?;
+    let (mut store, train_backend, backend_label) = build_opd_store(args.backend)?;
+    #[cfg(not(feature = "cuda"))]
+    let _ = train_backend;
     let mut tape = Tape::new();
 
     eprintln!("[arle train w2s] backend={backend_label}");
 
-    // Load student (LoRA) — the model being trained.
-    eprintln!(
-        "[arle train w2s] loading student (LoRA) from {}",
-        args.student_model.display()
-    );
-    let student = load_qwen35_lora_from_hf_dir(&args.student_model, lora, target_set, &mut store)
-        .with_context(|| format!("load student from {}", args.student_model.display()))?;
-
-    // Load base model (no LoRA) — used for both π_old (local KL) and π_base
-    // (global KL) in Phase 1. The shadow-adapter split lands in Phase 2.
+    // Load base model (no LoRA) — π_base for the global KL regularizer.
     eprintln!(
         "[arle train w2s] loading base model from {}",
         args.student_model.display()
     );
-    let student_base = load_qwen35_from_hf_dir(&args.student_model, &mut store)
+    let base = load_qwen35_from_hf_dir(&args.student_model, &mut store)
         .with_context(|| format!("load base from {}", args.student_model.display()))?;
+    #[cfg(feature = "cuda")]
+    let vocab_size = base.config().vocab_size;
+
+    // Student (shadow adapter) — the model being trained.
+    eprintln!("[arle train w2s] creating student (shadow adapter)");
+    let student = Qwen35Model::new_lora_from_base(&base, lora, target_set, &mut store)
+        .context("create student shadow adapter")?;
+
+    // Serving adapter — π_old for the local KL regularizer. Created from the
+    // student (not the base) so `new_lora_from_base`'s retain_ids keeps the
+    // student's adapter params alive alongside the serving adapter's.
+    eprintln!("[arle train w2s] creating serving adapter");
+    let serving = Qwen35Model::new_lora_from_base(&student, lora, target_set, &mut store)
+        .context("create serving adapter")?;
+
+    // Initialize serving = shadow (both start from the same LoRA init).
+    sync_lora_adapters(&student, &serving, &mut store)?;
 
     // Load auxiliary models.
-    eprintln!(
-        "[arle train w2s] loading aux1 pre-RL from {}",
-        args.aux1_pre.display()
-    );
-    let aux1_pre = load_qwen35_from_hf_dir(&args.aux1_pre, &mut store)
-        .with_context(|| format!("load aux1 pre-RL from {}", args.aux1_pre.display()))?;
-    eprintln!(
-        "[arle train w2s] loading aux1 post-RL from {}",
-        args.aux1_post.display()
-    );
-    let aux1_post = load_qwen35_from_hf_dir(&args.aux1_post, &mut store)
-        .with_context(|| format!("load aux1 post-RL from {}", args.aux1_post.display()))?;
-    let aux1 = W2sAuxModel::new(aux1_pre, aux1_post);
+    let aux1 = match args.aux_backend {
+        W2sAuxBackendArg::InProcess => {
+            eprintln!(
+                "[arle train w2s] loading aux1 pre-RL from {}",
+                args.aux1_pre.display()
+            );
+            let aux1_pre = load_qwen35_from_hf_dir(&args.aux1_pre, &mut store)
+                .with_context(|| format!("load aux1 pre-RL from {}", args.aux1_pre.display()))?;
+            eprintln!(
+                "[arle train w2s] loading aux1 post-RL from {}",
+                args.aux1_post.display()
+            );
+            let aux1_post = load_qwen35_from_hf_dir(&args.aux1_post, &mut store)
+                .with_context(|| format!("load aux1 post-RL from {}", args.aux1_post.display()))?;
+            W2sAuxModel::new_in_process(aux1_pre, aux1_post)
+        }
+        #[cfg(feature = "cuda")]
+        W2sAuxBackendArg::Infer => {
+            use infer_api::{EngineLoadConfig, LoadedInferenceEngine};
+            use std::sync::{Arc, Mutex};
+            use train::teacher_infer::InferTeacher;
 
-    eprintln!(
-        "[arle train w2s] loading aux2 pre-RL from {}",
-        args.aux2_pre.display()
-    );
-    let aux2_pre = load_qwen35_from_hf_dir(&args.aux2_pre, &mut store)
-        .with_context(|| format!("load aux2 pre-RL from {}", args.aux2_pre.display()))?;
-    eprintln!(
-        "[arle train w2s] loading aux2 post-RL from {}",
-        args.aux2_post.display()
-    );
-    let aux2_post = load_qwen35_from_hf_dir(&args.aux2_post, &mut store)
-        .with_context(|| format!("load aux2 post-RL from {}", args.aux2_post.display()))?;
-    let aux2 = W2sAuxModel::new(aux2_pre, aux2_post);
+            eprintln!(
+                "[arle train w2s] loading aux1 pre-RL (infer) from {}",
+                args.aux1_pre.display()
+            );
+            let pre_engine = LoadedInferenceEngine::load_with_config(
+                args.aux1_pre
+                    .to_str()
+                    .ok_or_else(|| anyhow!("aux1 pre path not UTF-8"))?,
+                true,
+                EngineLoadConfig::single_sequence(128),
+            )
+            .with_context(|| format!("load aux1 pre-RL infer from {}", args.aux1_pre.display()))?;
+            eprintln!(
+                "[arle train w2s] loading aux1 post-RL (infer) from {}",
+                args.aux1_post.display()
+            );
+            let post_engine = LoadedInferenceEngine::load_with_config(
+                args.aux1_post
+                    .to_str()
+                    .ok_or_else(|| anyhow!("aux1 post path not UTF-8"))?,
+                true,
+                EngineLoadConfig::single_sequence(128),
+            )
+            .with_context(|| {
+                format!("load aux1 post-RL infer from {}", args.aux1_post.display())
+            })?;
+            let pre_teacher = InferTeacher::new(
+                Arc::new(Mutex::new(pre_engine)),
+                train_backend.clone(),
+                vocab_size,
+            );
+            let post_teacher = InferTeacher::new(
+                Arc::new(Mutex::new(post_engine)),
+                train_backend.clone(),
+                vocab_size,
+            );
+            W2sAuxModel::new_infer(pre_teacher, post_teacher)
+        }
+        #[cfg(not(feature = "cuda"))]
+        W2sAuxBackendArg::Infer => {
+            bail!("--aux-backend infer requires the cuda feature");
+        }
+    };
+
+    let aux2 = match args.aux_backend {
+        W2sAuxBackendArg::InProcess => {
+            eprintln!(
+                "[arle train w2s] loading aux2 pre-RL from {}",
+                args.aux2_pre.display()
+            );
+            let aux2_pre = load_qwen35_from_hf_dir(&args.aux2_pre, &mut store)
+                .with_context(|| format!("load aux2 pre-RL from {}", args.aux2_pre.display()))?;
+            eprintln!(
+                "[arle train w2s] loading aux2 post-RL from {}",
+                args.aux2_post.display()
+            );
+            let aux2_post = load_qwen35_from_hf_dir(&args.aux2_post, &mut store)
+                .with_context(|| format!("load aux2 post-RL from {}", args.aux2_post.display()))?;
+            W2sAuxModel::new_in_process(aux2_pre, aux2_post)
+        }
+        #[cfg(feature = "cuda")]
+        W2sAuxBackendArg::Infer => {
+            use infer_api::{EngineLoadConfig, LoadedInferenceEngine};
+            use std::sync::{Arc, Mutex};
+            use train::teacher_infer::InferTeacher;
+
+            eprintln!(
+                "[arle train w2s] loading aux2 pre-RL (infer) from {}",
+                args.aux2_pre.display()
+            );
+            let pre_engine = LoadedInferenceEngine::load_with_config(
+                args.aux2_pre
+                    .to_str()
+                    .ok_or_else(|| anyhow!("aux2 pre path not UTF-8"))?,
+                true,
+                EngineLoadConfig::single_sequence(128),
+            )
+            .with_context(|| format!("load aux2 pre-RL infer from {}", args.aux2_pre.display()))?;
+            eprintln!(
+                "[arle train w2s] loading aux2 post-RL (infer) from {}",
+                args.aux2_post.display()
+            );
+            let post_engine = LoadedInferenceEngine::load_with_config(
+                args.aux2_post
+                    .to_str()
+                    .ok_or_else(|| anyhow!("aux2 post path not UTF-8"))?,
+                true,
+                EngineLoadConfig::single_sequence(128),
+            )
+            .with_context(|| {
+                format!("load aux2 post-RL infer from {}", args.aux2_post.display())
+            })?;
+            let pre_teacher = InferTeacher::new(
+                Arc::new(Mutex::new(pre_engine)),
+                train_backend.clone(),
+                vocab_size,
+            );
+            let post_teacher = InferTeacher::new(
+                Arc::new(Mutex::new(post_engine)),
+                train_backend.clone(),
+                vocab_size,
+            );
+            W2sAuxModel::new_infer(pre_teacher, post_teacher)
+        }
+        #[cfg(not(feature = "cuda"))]
+        W2sAuxBackendArg::Infer => {
+            bail!("--aux-backend infer requires the cuda feature");
+        }
+    };
 
     let trainable_params: Vec<TensorId> = student
         .all_parameter_ids()
@@ -550,8 +666,8 @@ fn run_w2s(args: TrainW2sArgs) -> Result<()> {
     for step in 0..args.steps {
         let outcome = w2s_step(
             &student,
-            &student_base,
-            &student_base,
+            &serving,
+            &base,
             &aux1,
             &aux2,
             &prompt_ids,
@@ -572,6 +688,11 @@ fn run_w2s(args: TrainW2sArgs) -> Result<()> {
                 "[arle train w2s] step={step} loss={:.6} max_prob={:.4} consistency={:.4}",
                 outcome.loss, outcome.max_prob, outcome.consistency
             );
+            // Shadow → serving: the local KL regularizer now anchors against
+            // the just-updated adapter. In the full online flow this only
+            // happens after a validation-set eval passes; here we sync every
+            // step so the local KL tracks the latest shadow state.
+            sync_lora_adapters(&student, &serving, &mut store)?;
         }
     }
 
