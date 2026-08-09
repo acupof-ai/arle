@@ -4284,10 +4284,13 @@ mod tier_io_tests {
     }
 
     #[test]
-    #[ignore = "GPU + Qwen3.6-27B-W4A16 checkpoint; set INFER_QWEN35_GDR_PROBE_OUT"]
-    fn qwen35_paged_prefill_gdr_parity() {
+    #[ignore = "GPU + Qwen3.6 checkpoint; set INFER_QWEN35_GDR_PROBE_OUT"]
+    fn qwen35_recurrent_prefill_gdr_parity() {
         let out_path = std::env::var("INFER_QWEN35_GDR_PROBE_OUT")
             .expect("INFER_QWEN35_GDR_PROBE_OUT must name the report path");
+        let mut runtime_flags = infer_seam::CudaRuntimeFlags::default();
+        runtime_flags.qwen35_gdr_chunked = false;
+        crate::runtime_flags::apply_runtime_flags(&runtime_flags);
         let model_path = std::env::var("INFER_QWEN35_GDR_MODEL_PATH")
             .unwrap_or_else(|_| "/tmp/Qwen3.6-27B-W4A16-fixed-d68879e".to_string());
         let total_pages = 16;
@@ -4312,7 +4315,7 @@ mod tier_io_tests {
         assert!(executor.mtp.is_none());
         assert_eq!(executor.kv_format, KVFormat::BF16);
         let mut report = format!(
-            "model={model_path}\nscope=first_linear_gdr_per_paged_prefill_segment\noutput_gate=bf16_ulp<=8\nstate_gate=abs_err<1e-3\n"
+            "model={model_path}\npath=recurrent\nscope=first_linear_gdr_per_paged_prefill_segment\noutput_gate=bf16_ulp<=8\nstate_gate=abs_err<1e-3\n"
         );
         let mut all_passed = true;
 
