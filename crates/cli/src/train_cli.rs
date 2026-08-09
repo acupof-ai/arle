@@ -25,6 +25,7 @@ use crate::{
         OpdSftAnchorArg, OpdTeacherRuntimeArg, PretrainPresetArg, SaveDtypeArg, TapeDtypeArg,
         TrainAgentOpdArgs, TrainArgs, TrainCcConvertArgs, TrainCommand, TrainEnvArgs,
         TrainEstimateMemoryArgs, TrainOpdArgs, TrainPplArgs, TrainRubricOpdArgs, TrainSelfOpdArgs,
+        TrainW2sArgs,
     },
     hardware, hub_discovery,
 };
@@ -103,6 +104,10 @@ pub(crate) fn run_train(train: TrainArgs) -> ExitCode {
         TrainCommand::SpecDraft(args) => {
             train::apply_runtime_flags(&args.runtime.to_flags());
             exit_from_result(run_spec_draft(args))
+        }
+        TrainCommand::W2s(args) => {
+            train::apply_runtime_flags(&args.runtime.to_flags());
+            exit_from_result(run_w2s(args))
         }
     }
 }
@@ -440,6 +445,137 @@ fn run_opd(args: TrainOpdArgs) -> ExitCode {
          See `arle train opd --help` for the full surface."
     );
     ExitCode::FAILURE
+}
+
+/// `arle train w2s` — weak-to-strong online distillation.
+///
+/// Loads the student (LoRA), two auxiliary models (each with pre-RL + post-RL
+/// checkpoints), and runs the w2s step: ΔT → proxy teacher → reverse KL +
+/// local/global KL regularization.
+fn run_w2s(args: TrainW2sArgs) -> Result<()> {
+    use autograd::{Tape, TensorId, optim::AdamW};
+    use train::{
+        lora::LoraConfig,
+        qwen35_loader::{load_qwen35_from_hf_dir, load_qwen35_lora_from_hf_dir},
+        w2s::{W2sAuxModel, W2sConfig, w2s_step},
+    };
+
+    let target_set = parse_lora_target_set(&args.lora_target_set)?;
+    let lora = LoraConfig {
+        rank: args.lora_rank,
+        alpha: args.lora_alpha,
+    };
+
+    let (mut store, _train_backend, backend_label) = build_opd_store(args.backend)?;
+    let mut tape = Tape::new();
+
+    eprintln!("[arle train w2s] backend={backend_label}");
+
+    // Load student (LoRA) — the model being trained.
+    eprintln!(
+        "[arle train w2s] loading student (LoRA) from {}",
+        args.student_model.display()
+    );
+    let student = load_qwen35_lora_from_hf_dir(&args.student_model, lora, target_set, &mut store)
+        .with_context(|| format!("load student from {}", args.student_model.display()))?;
+
+    // Load base model (no LoRA) — used for both π_old (local KL) and π_base
+    // (global KL) in Phase 1. The shadow-adapter split lands in Phase 2.
+    eprintln!(
+        "[arle train w2s] loading base model from {}",
+        args.student_model.display()
+    );
+    let student_base = load_qwen35_from_hf_dir(&args.student_model, &mut store)
+        .with_context(|| format!("load base from {}", args.student_model.display()))?;
+
+    // Load auxiliary models.
+    eprintln!(
+        "[arle train w2s] loading aux1 pre-RL from {}",
+        args.aux1_pre.display()
+    );
+    let aux1_pre = load_qwen35_from_hf_dir(&args.aux1_pre, &mut store)
+        .with_context(|| format!("load aux1 pre-RL from {}", args.aux1_pre.display()))?;
+    eprintln!(
+        "[arle train w2s] loading aux1 post-RL from {}",
+        args.aux1_post.display()
+    );
+    let aux1_post = load_qwen35_from_hf_dir(&args.aux1_post, &mut store)
+        .with_context(|| format!("load aux1 post-RL from {}", args.aux1_post.display()))?;
+    let aux1 = W2sAuxModel::new(aux1_pre, aux1_post);
+
+    eprintln!(
+        "[arle train w2s] loading aux2 pre-RL from {}",
+        args.aux2_pre.display()
+    );
+    let aux2_pre = load_qwen35_from_hf_dir(&args.aux2_pre, &mut store)
+        .with_context(|| format!("load aux2 pre-RL from {}", args.aux2_pre.display()))?;
+    eprintln!(
+        "[arle train w2s] loading aux2 post-RL from {}",
+        args.aux2_post.display()
+    );
+    let aux2_post = load_qwen35_from_hf_dir(&args.aux2_post, &mut store)
+        .with_context(|| format!("load aux2 post-RL from {}", args.aux2_post.display()))?;
+    let aux2 = W2sAuxModel::new(aux2_pre, aux2_post);
+
+    let trainable_params: Vec<TensorId> = student
+        .all_parameter_ids()
+        .into_iter()
+        .filter(|id| store.get(*id).is_some_and(|t| t.requires_grad))
+        .collect();
+    eprintln!(
+        "[arle train w2s] trainable params: {}",
+        trainable_params.len()
+    );
+
+    let cfg = W2sConfig {
+        alpha: args.alpha,
+        temperature: args.temperature,
+        confidence_threshold: args.confidence_threshold,
+        consistency_threshold: args.consistency_threshold,
+        beta_local: args.beta_local,
+        beta_global: args.beta_global,
+        grad_clip: args.grad_clip,
+    };
+
+    let prompt_ids: Vec<u32> = match &args.prompt_ids {
+        Some(s) => s
+            .split(',')
+            .map(|t| t.trim().parse::<u32>().context("parse prompt token id"))
+            .collect::<Result<Vec<_>>>()?,
+        None => vec![1, 3, 8],
+    };
+
+    let mut optimizer = AdamW::new(args.lr, (0.9, 0.999), 1e-8, 0.0);
+
+    for step in 0..args.steps {
+        let outcome = w2s_step(
+            &student,
+            &student_base,
+            &student_base,
+            &aux1,
+            &aux2,
+            &prompt_ids,
+            &cfg,
+            &trainable_params,
+            &mut optimizer,
+            &mut store,
+            &mut tape,
+        )?;
+
+        if outcome.skipped {
+            eprintln!(
+                "[arle train w2s] step={step} skipped reason={:?} max_prob={:.4} consistency={:.4}",
+                outcome.skip_reason, outcome.max_prob, outcome.consistency
+            );
+        } else {
+            eprintln!(
+                "[arle train w2s] step={step} loss={:.6} max_prob={:.4} consistency={:.4}",
+                outcome.loss, outcome.max_prob, outcome.consistency
+            );
+        }
+    }
+
+    Ok(())
 }
 
 /// Reject advertised-but-unimplemented distillation objectives before any

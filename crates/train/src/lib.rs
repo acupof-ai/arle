@@ -72,6 +72,8 @@ pub mod trainer;
 pub mod trajectory_scorer;
 #[path = "update_strategy.rs"]
 pub mod update_strategy;
+#[path = "w2s.rs"]
+pub mod w2s;
 
 pub use lora::{LinearWithLora, LoraAdapterConfig, LoraConfig, LoraTargetSet};
 pub use trainer::cleanup_after_backward;

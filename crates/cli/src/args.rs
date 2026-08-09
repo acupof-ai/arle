@@ -1306,6 +1306,10 @@ pub(crate) enum TrainCommand {
     /// against the trunk's own taps and logits. CUDA-only (the trunk forward is
     /// `LoadedInferenceEngine::forward_training_taps`).
     SpecDraft(TrainSpecDraftArgs),
+    /// Weak-to-strong (w2s) online distillation: distill the policy shift
+    /// (post-RL − pre-RL log-prob difference) from two weak auxiliary models
+    /// into a strong student via a proxy teacher and reverse KL.
+    W2s(TrainW2sArgs),
 }
 
 /// Every objective/optimizer default is the trainer's, so `--help` and the
@@ -1432,6 +1436,95 @@ pub(crate) struct TrainSpecDraftArgs {
     /// `--max-len` bounds the cost.
     #[arg(long, default_value_t = false)]
     pub(crate) probe: bool,
+}
+
+#[derive(Debug, Clone, ClapArgs)]
+#[command(
+    after_help = "Weak-to-strong (w2s) online distillation.\n\nDistill the policy shift ΔT = log π_post-RL − log π_pre-RL from two weak auxiliary models into a strong student. The proxy teacher is z_student.detach() + α·T·(ΔT₁+ΔT₂)/2, trained with reverse KL.\n\nExamples:\n  arle train w2s --student-model <dir> --aux1-pre <dir> --aux1-post <dir> --aux2-pre <dir> --aux2-post <dir> --steps 100"
+)]
+pub(crate) struct TrainW2sArgs {
+    #[command(flatten)]
+    pub(crate) runtime: OpdRuntimeArgs,
+
+    /// Student (strong) model directory. Loaded with LoRA adapters.
+    #[arg(long, value_name = "PATH")]
+    pub(crate) student_model: PathBuf,
+
+    /// Auxiliary model 1 pre-RL (base) checkpoint.
+    #[arg(long, value_name = "PATH")]
+    pub(crate) aux1_pre: PathBuf,
+
+    /// Auxiliary model 1 post-RL (instruct) checkpoint.
+    #[arg(long, value_name = "PATH")]
+    pub(crate) aux1_post: PathBuf,
+
+    /// Auxiliary model 2 pre-RL (base) checkpoint.
+    #[arg(long, value_name = "PATH")]
+    pub(crate) aux2_pre: PathBuf,
+
+    /// Auxiliary model 2 post-RL (instruct) checkpoint.
+    #[arg(long, value_name = "PATH")]
+    pub(crate) aux2_post: PathBuf,
+
+    /// Prompt token ids (comma-separated). Defaults to a short BOS sequence.
+    #[arg(long, value_name = "IDS")]
+    pub(crate) prompt_ids: Option<String>,
+
+    /// Distillation strength α. α·T·‖ΔT‖ should be comparable to ‖z_student‖.
+    #[arg(long, default_value_t = 0.5)]
+    pub(crate) alpha: f32,
+
+    /// Softmax temperature T (2–4).
+    #[arg(long, default_value_t = 2.0, value_parser = parse_positive_temperature)]
+    pub(crate) temperature: f32,
+
+    /// Confidence filter: skip samples where student max prob exceeds this.
+    #[arg(long, default_value_t = 0.9, value_parser = parse_unit_interval)]
+    pub(crate) confidence_threshold: f32,
+
+    /// Consistency gate: skip samples where cos(ΔT₁, ΔT₂) is below this.
+    #[arg(long, default_value_t = 0.0)]
+    pub(crate) consistency_threshold: f32,
+
+    /// Local KL regularizer weight β₁ (vs previous adapter).
+    #[arg(long, default_value_t = 0.01)]
+    pub(crate) beta_local: f32,
+
+    /// Global KL regularizer weight β₂ (vs base model).
+    #[arg(long, default_value_t = 0.001)]
+    pub(crate) beta_global: f32,
+
+    /// Total training steps.
+    #[arg(long, default_value_t = 10)]
+    pub(crate) steps: usize,
+
+    /// AdamW learning rate.
+    #[arg(long, default_value_t = 1.0e-5)]
+    pub(crate) lr: f32,
+
+    /// Gradient L2 norm clip threshold.
+    #[arg(long, default_value_t = 1.0)]
+    pub(crate) grad_clip: f32,
+
+    /// LoRA rank.
+    #[arg(long, default_value_t = 16)]
+    pub(crate) lora_rank: usize,
+
+    /// LoRA alpha.
+    #[arg(long, default_value_t = 32.0)]
+    pub(crate) lora_alpha: f32,
+
+    /// LoRA target set.
+    #[arg(long, default_value = "attention-qv")]
+    pub(crate) lora_target_set: String,
+
+    /// Compute backend.
+    #[arg(long, value_enum, default_value_t = OpdBackendArg::Auto)]
+    pub(crate) backend: OpdBackendArg,
+
+    /// Render output as JSON.
+    #[arg(long, default_value_t = false)]
+    pub(crate) json: bool,
 }
 
 #[derive(Debug, Clone, ClapArgs)]
