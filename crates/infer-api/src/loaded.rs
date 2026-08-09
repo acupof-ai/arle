@@ -555,7 +555,16 @@ mod backend {
             // Prompt cap = min(requested, KV capacity − gen reserve). Capacity is
             // a hard ceiling, not a floor: over-length writes past the fixed DSv4
             // bands (#145). usize::MAX sentinel = unset → capacity-bound.
-            let per_req_cap = self.total_pages.saturating_mul(self.page_size);
+            // Prompt cap = min(requested, KV capacity − gen reserve). For shared
+            // KV pools (dense Qwen3/Qwen3.6/DSv4) the device pool is profiled
+            // from free VRAM after load, so `total_pages` here is just the
+            // advisory default (8192) — using it would cap prompts at 114k even
+            // though the profiled pool holds 770k+. Bind to `max_total_tokens`
+            // instead; the post-load profiled-capacity clamp (M2) binds it down
+            // to the real device pool if needed.
+            let per_req_cap = self
+                .max_total_tokens
+                .max(self.total_pages.saturating_mul(self.page_size));
             let gen_reserve = per_req_cap / 8;
             config.max_prompt_tokens = self
                 .max_prompt_tokens

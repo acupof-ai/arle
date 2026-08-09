@@ -4779,8 +4779,8 @@ impl Qwen35Model {
 
             let chunk = crate::runtime_flags::OPD_SEQ_CHUNK;
             let num_chunks = gen_start.div_ceil(chunk);
-            // Accumulated K/V per layer (None before the first chunk touches it).
-            let mut layer_prefix: Vec<Option<PrefixKv>> = vec![None; self.layers.len()];
+            // Accumulated prefix per layer (None before the first chunk touches it).
+            let mut layer_prefix: Vec<Option<LayerPrefix>> = vec![None; self.layers.len()];
 
             for c in 0..num_chunks {
                 let start = c * chunk;
@@ -4800,6 +4800,10 @@ impl Qwen35Model {
                 )?;
 
                 for (li, layer) in self.layers.iter().enumerate() {
+                    let prefix_kv = match &layer_prefix[li] {
+                        Some(LayerPrefix::Full(kv)) => Some(kv),
+                        _ => None,
+                    };
                     let (next, prefix) = layer.forward_capture_prefix(
                         h,
                         &self.config,
@@ -4809,23 +4813,18 @@ impl Qwen35Model {
                         batch,
                         chunk_len,
                         start,
-                        layer_prefix[li].as_ref(),
+                        prefix_kv,
                         store,
                         &mut prefix_tape,
                     )?;
                     h = next;
-                    if let LayerPrefix::Full(kv) = prefix {
-                        layer_prefix[li] = Some(kv);
-                    }
+                    layer_prefix[li] = Some(prefix);
                 }
             }
 
             let layers = layer_prefix
                 .into_iter()
-                .map(|opt| {
-                    opt.map(LayerPrefix::Full)
-                        .expect("every full-attn layer must have captured prefix K/V")
-                })
+                .map(|opt| opt.expect("every layer must have captured prefix"))
                 .collect();
             WritebackPrefixCache { layers }
         } else {

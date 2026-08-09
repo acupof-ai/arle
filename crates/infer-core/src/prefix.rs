@@ -265,7 +265,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
     /// previous turn's generated tokens instead of re-prefilling them.
     /// Returns the newly cached pages (already cache-retained), in order.
     pub(crate) fn publish_prefix_blocks(&mut self, slot: usize, tokens: &[u32]) -> Vec<BlockId> {
-        if !self.kv.is_active() {
+        if !self.kv.is_active() || !self.config.enable_prefix_cache {
             return Vec::new();
         }
 
