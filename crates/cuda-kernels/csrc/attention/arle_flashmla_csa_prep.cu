@@ -101,7 +101,6 @@ __global__ void arle_csa_build_indices_kernel(
         }
     }
 
-    // [sw_count + index_topk, topk_unified): -1 padding.
     int pad_start = sw_count + index_topk;
     for (int k = pad_start + threadIdx.x; k < topk_unified; k += blockDim.x) {
         row[k] = -1;
@@ -194,7 +193,6 @@ __global__ void arle_hca_build_indices_kernel(
         row[sw_count + k] = comp_base_in_pool + k;
     }
 
-    // [sw_count + comp_keys, topk_unified): -1 padding.
     int pad_start = sw_count + comp_keys;
     for (int k = pad_start + threadIdx.x; k < topk_unified; k += blockDim.x) {
         row[k] = -1;
@@ -307,8 +305,6 @@ __global__ void arle_chain_verify_build_indices_kernel(
 
 extern "C" {
 
-// Build kv_unified = concat(window_cache_rebased, k_prepared, compressed).
-// All pointers are device pointers. Stream-ordered.
 cudaError_t arle_flashmla_csa_pack_kv(
         __nv_bfloat16* kv_unified,                // [s_kv_total, d_qk]
         const __nv_bfloat16* window_cache,        // [sw_window, d_qk] rolling
@@ -337,7 +333,6 @@ cudaError_t arle_flashmla_csa_pack_kv(
         if (err != cudaSuccess) return err;
     }
 
-    // [sw_window, sw_window + n_tokens): linear k_prepared.
     if (n_tokens > 0) {
         auto err = cudaMemcpyAsync(
             kv_unified + (size_t)sw_window * d_qk,
@@ -347,7 +342,6 @@ cudaError_t arle_flashmla_csa_pack_kv(
         if (err != cudaSuccess) return err;
     }
 
-    // [sw_window + n_tokens, s_kv_total): compressed.
     if (compressed_count > 0 && compressed != nullptr) {
         auto err = cudaMemcpyAsync(
             kv_unified + (size_t)(sw_window + n_tokens) * d_qk,
@@ -359,7 +353,6 @@ cudaError_t arle_flashmla_csa_pack_kv(
     return cudaSuccess;
 }
 
-// Build the matching indices + topk_length for the unified pool.
 cudaError_t arle_flashmla_csa_build_indices(
         int32_t* indices,
         int32_t* topk_length,
