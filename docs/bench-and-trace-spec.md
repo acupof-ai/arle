@@ -64,6 +64,10 @@ license cache-sensitive changes.
 
 The JSON artifact is the source of truth. CSV is a view. Preserve both.
 
+The runner always sends `ignore_eos=true`: this is a fixed-output performance
+workload, so every request must generate exactly `max_tokens`. Empty or invalid
+decoded output still fails the correctness gate.
+
 ### 3.3 Workload — long agent sequences, one shape for everything
 
 **Every performance claim runs on `gen_bench_prompts.py`'s 32k-token agent
