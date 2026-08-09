@@ -696,6 +696,25 @@ impl StatsResponse {
                 prefill_tokens: counters.throughput.prefill_tokens,
                 generated_tokens: counters.throughput.generated_tokens,
                 requests_completed: counters.throughput.requests_completed,
+                forward_busy_micros: counters.throughput.forward_busy_micros,
+                prefill_forward_steps: counters.throughput.prefill_forward_steps,
+                prefill_forward_busy_micros: counters.throughput.prefill_forward_busy_micros,
+                decode_forward_steps: counters.throughput.decode_forward_steps,
+                decode_forward_busy_micros: counters.throughput.decode_forward_busy_micros,
+                mixed_forward_steps: counters.throughput.mixed_forward_steps,
+                mixed_forward_busy_micros: counters.throughput.mixed_forward_busy_micros,
+                decode_step_phase: StepPhaseStatsResponse {
+                    steps: counters.throughput.decode_step_phase.steps,
+                    poll_micros: counters.throughput.decode_step_phase.poll_micros,
+                    apply_output_micros: counters.throughput.decode_step_phase.apply_output_micros,
+                    poll_background_micros: counters
+                        .throughput
+                        .decode_step_phase
+                        .poll_background_micros,
+                    admit_micros: counters.throughput.decode_step_phase.admit_micros,
+                    plan_micros: counters.throughput.decode_step_phase.plan_micros,
+                    submit_micros: counters.throughput.decode_step_phase.submit_micros,
+                },
             },
             prefix_cache: PrefixCacheStatsResponse {
                 lookups: prefix.lookups,
@@ -783,6 +802,25 @@ pub struct ThroughputStatsResponse {
     pub prefill_tokens: u64,
     pub generated_tokens: u64,
     pub requests_completed: u64,
+    pub forward_busy_micros: u64,
+    pub prefill_forward_steps: u64,
+    pub prefill_forward_busy_micros: u64,
+    pub decode_forward_steps: u64,
+    pub decode_forward_busy_micros: u64,
+    pub mixed_forward_steps: u64,
+    pub mixed_forward_busy_micros: u64,
+    pub decode_step_phase: StepPhaseStatsResponse,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StepPhaseStatsResponse {
+    pub steps: u64,
+    pub poll_micros: u64,
+    pub apply_output_micros: u64,
+    pub poll_background_micros: u64,
+    pub admit_micros: u64,
+    pub plan_micros: u64,
+    pub submit_micros: u64,
 }
 
 /// KV host-demoted counters. All zero until a backend with a tier
@@ -1407,6 +1445,16 @@ mod tests {
         counters.kv_tier.demoted_slots = 2;
         counters.kv_system.reuse_hit_host_demoted = 3;
         counters.kv_system.disk_pages = 4;
+        counters.throughput.forward_busy_micros = 70;
+        counters.throughput.prefill_forward_steps = 1;
+        counters.throughput.prefill_forward_busy_micros = 20;
+        counters.throughput.decode_forward_steps = 2;
+        counters.throughput.decode_forward_busy_micros = 50;
+        counters.throughput.decode_step_phase = infer_core::StepPhaseStats {
+            steps: 2,
+            submit_micros: 40,
+            ..infer_core::StepPhaseStats::default()
+        };
         let operator_dispatch = infer_seam::OperatorDispatchStats {
             policy_hash: "policy-1".to_string(),
             implementation_hits: vec![infer_seam::OperatorImplementationHits {
@@ -1428,6 +1476,11 @@ mod tests {
         assert!(stats.kv_tier.available);
         assert_eq!(stats.kv_tier.demoted_slots, 2);
         assert_eq!(stats.kv_system.reuse_hit_host_demoted, 3);
+        assert_eq!(stats.throughput.forward_busy_micros, 70);
+        assert_eq!(stats.throughput.prefill_forward_busy_micros, 20);
+        assert_eq!(stats.throughput.decode_forward_busy_micros, 50);
+        assert_eq!(stats.throughput.decode_step_phase.steps, 2);
+        assert_eq!(stats.throughput.decode_step_phase.submit_micros, 40);
         assert!(stats.ssd_recall.available);
         assert_eq!(stats.build_identity.kernel_bundle_id, "bundle-1");
         assert_eq!(stats.operator_dispatch.policy_hash, "policy-1");

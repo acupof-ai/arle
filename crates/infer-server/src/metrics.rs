@@ -368,6 +368,7 @@ mod tests {
                 prefill_tokens: 1200,
                 generated_tokens: 256,
                 requests_completed: 5,
+                ..ThroughputStats::default()
             },
             kv_tier: KvTierStats {
                 demoted_pages: 6,
