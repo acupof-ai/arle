@@ -107,9 +107,9 @@ cudaError_t marlin_gptq_repack_w8a16_cuda(
 // workspace >= sms ints, zero-initialized once (Marlin leaves locks at 0).
 CUresult marlin_w8a16_gemm_cuda(
     const __nv_bfloat16* A,       // [m, k] row-major (lda = k)
-    const uint32_t* B_packed,     // Marlin-repacked kU8B128 weight
+    const uint32_t* B_packed,     // Marlin-repacked kU8B128
     const __nv_bfloat16* scales,  // [k/group_size, n] permuted
-    __nv_bfloat16* C,             // [m, n] output
+    __nv_bfloat16* C,             // [m, n]
     float* c_tmp,                 // caller-owned fp32-reduce scratch
     int* workspace,               // caller-owned zeroed int lock buffer
     int m, int n, int k, int group_size, cudaStream_t stream) {

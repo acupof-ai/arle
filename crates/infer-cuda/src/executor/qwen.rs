@@ -503,7 +503,6 @@ impl QwenCudaExecutor {
             if let Some(token) = self.try_recall_decode(row, position, host_kv)? {
                 token
             } else {
-                // Try the captured graph; on any miss fall back to the eager path.
                 match self.try_captured_decode(row.slot, row.last_token, row.kv_seq_len)? {
                     Some(()) => self.sample_decode_logits(&row.params, position)?,
                     None => self.model.forward_tokens(
@@ -569,8 +568,6 @@ impl QwenCudaExecutor {
 
         let n_prefill = plan.prefill_rows.len();
         let mut tokens = Vec::with_capacity(rows);
-        // Decode first: active decode requests get their next token before any
-        // prefill sub-step runs. Slots are disjoint so KV order is irrelevant.
         if !plan.decode_rows.is_empty() {
             let sub_batch = kv_batch.subset(n_prefill..kv_batch.rows.len())?;
             tokens.extend(self.submit_decode_batch(&plan.decode_rows, host_kv, &sub_batch)?);
@@ -699,8 +696,7 @@ impl QwenCudaExecutor {
             let mut tokens = Vec::with_capacity(batch);
             for row in decode_rows {
                 let position = row.kv_seq_len.saturating_add(1) as u64;
-                // KV already mirrored above; run the per-row forward. Recall reuses
-                // its restricted-table path when active.
+                // Recall reuses its restricted-table path when active.
                 let token = if let Some(token) = self.try_recall_decode(row, position, host_kv)? {
                     token
                 } else {
@@ -723,8 +719,6 @@ impl QwenCudaExecutor {
             return Ok(tokens);
         }
 
-        // True batched decode. Build the M-row page table from the freshly mirrored
-        // slots, run one forward, sample M tokens (one per row's params/position).
         let last_tokens: Vec<u32> = decode_rows.iter().map(|r| r.last_token).collect();
         let params: Vec<SamplingParams> = decode_rows.iter().map(|r| r.params.clone()).collect();
         let positions: Vec<u64> = decode_rows

@@ -79,7 +79,6 @@ fn pair_adapters(map: &HashMap<&'static str, TensorId>) -> Result<Vec<(TensorId,
 /// EMA self-teacher: a base-shared second [`Qwen35Model`] holding the EMA
 /// adapter, plus the layer-ordered EMA adapter `(lora_a, lora_b)` TensorIds.
 pub struct EmaSelfTeacher {
-    /// Base-shared second model holding the EMA adapter.
     model: Qwen35Model,
     /// EMA adapter pairs, layer-ordered (sorted by base name) so index `i`
     /// lines up with [`Self::student_adapter_pairs`] index `i`.
@@ -179,7 +178,6 @@ impl EmaSelfTeacher {
             .expect("student adapter map must pair into (lora_a, lora_b) tuples")
     }
 
-    /// Copy the student adapter values verbatim into the EMA adapter (EMA = student).
     pub fn copy_from_student(
         &mut self,
         student: &Qwen35Model,
@@ -246,11 +244,8 @@ impl EmaSelfTeacher {
 
 /// Snapshot of everything that must roll back together on a gate-fail (R2).
 pub struct EmaTrainSnapshot {
-    /// Student adapter `(lora_a data, lora_b data)`, layer-ordered.
     student_adapter: Vec<(Vec<f32>, Vec<f32>)>,
-    /// EMA adapter `(lora_a data, lora_b data)`, layer-ordered.
     ema_adapter: Vec<(Vec<f32>, Vec<f32>)>,
-    /// AdamW moments for the trainable student params.
     adamw: AdamWState,
 }
 
@@ -460,10 +455,8 @@ mod tests {
         let lora = lora_config();
         let target_set = LoraTargetSet::AttentionQv;
 
-        // 1. Student via the normal lora constructor, on the CPU backend store.
         let student = Qwen35Model::new_with_lora_targets(&cfg, lora, target_set, &mut store)?;
 
-        // 2. EMA self-teacher; assert EMA adapter == student adapter at construction.
         let mut ema = EmaSelfTeacher::from_student(&student, lora, target_set, &mut store)?;
 
         let student_pairs = EmaSelfTeacher::student_adapter_pairs(&student);
@@ -512,13 +505,11 @@ mod tests {
             );
         }
 
-        // Snapshot the pre-mutation EMA lora_b (zeros at init) of pair 0 for the
-        // halfway-move assertion.
+        // Snapshot the pre-mutation EMA lora_b for the halfway-move assertion.
         let (s_a0, s_b0) = student_pairs[0];
         let (e_a0, e_b0) = ema.adapter_ids[0];
         let ema_b_before = store.to_host(e_b0)?;
 
-        // 3. Mutate the student adapter: write non-zero values into student lora_b.
         let student_b_len = store.to_host(s_b0)?.len();
         let mutated: Vec<f32> = (0..student_b_len)
             .map(|i| (i as f32) * 0.25 + 1.0)
@@ -554,7 +545,6 @@ mod tests {
             "EMA halfway must differ from student"
         );
 
-        // 4. Snapshot adapters → mutate student + ema → restore → byte-identity.
         let optimizer = AdamW::new(1.0e-3, (0.9, 0.999), 1.0e-8, 0.0);
         let snap = ema.snapshot(&student, &optimizer, &mut store)?;
 
@@ -563,7 +553,6 @@ mod tests {
         let ema_a_snapshot = store.to_host(e_a0)?;
         let ema_b_snapshot = store.to_host(e_b0)?;
 
-        // Scribble over student + ema adapters.
         {
             let t = store.get_mut(s_b0).expect("student lora_b present");
             for x in t.data.iter_mut() {

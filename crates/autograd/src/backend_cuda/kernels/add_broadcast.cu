@@ -1,12 +1,8 @@
-// Right-aligned broadcast-add: out[i] = a[i] + b[broadcast_offset(i)].
+// Right-aligned broadcast-add.
 //
-// `out_shape` describes the output (== a_shape) with rank `out_rank`. The
-// host pre-computes `b_strides` of length `out_rank` using right-alignment:
-// entries with a broadcast axis (b-dim == 1 or axis missing from b_shape)
-// get stride 0; matching axes get the contiguous row-major stride.
-// With that, the per-element b offset is just sum(coord[d] * b_strides[d]).
-//
-// Grid/block: 1-D, one thread per output element.
+// `b_strides` is precomputed with right-alignment: broadcast axes (b-dim == 1
+// or missing) get stride 0; matching axes get the contiguous row-major stride.
+// The per-element b offset is sum(coord[d] * b_strides[d]).
 extern "C" __global__ void add_broadcast_f32(
     const T* __restrict__ a,
     const T* __restrict__ b,
@@ -29,9 +25,9 @@ extern "C" __global__ void add_broadcast_f32(
     out[idx] = static_cast<T>(static_cast<float>(a[idx]) + static_cast<float>(b[b_off]));
 }
 
-// Right-aligned broadcast-copy: out[i] = src[broadcast_offset(i)]. Same stride
-// convention as add_broadcast_f32's `b`, minus the zero `a` operand — a pure
-// expand for GQA repeat_kv (no zeroed carrier, output written in full).
+// Right-aligned broadcast-copy. Same stride convention as add_broadcast_f32.
+//
+// Pure expand for GQA repeat_kv: no zeroed `a` carrier, output written in full.
 extern "C" __global__ void broadcast_copy_f32(
     const T* __restrict__ src,
     T* __restrict__ out,
