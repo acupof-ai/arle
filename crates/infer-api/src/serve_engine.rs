@@ -403,6 +403,24 @@ impl ServeInferenceEngine<infer_cuda::CudaExecutor, infer_cuda::CudaKvPool> {
             .run_on_executor(|executor| executor.frozen_base_fp8_pointers())?
     }
 
+    /// Non-owning views of every resident dense-BF16 base projection's device
+    /// pointer, for refreshing the train student's frozen base AFTER a LoRA
+    /// re-merge.
+    pub fn frozen_base_bf16_pointers(&self) -> Result<Vec<infer_cuda::SharedBf16BaseProjection>> {
+        self.serve
+            .run_on_executor(|executor| executor.frozen_base_bf16_pointers())?
+    }
+
+    /// Free the retired FP8 qweight/scales buffers for every projection that
+    /// has been promoted to dense BF16. Call ONLY after the train student has
+    /// re-aliased its frozen base to the BF16 `data` pointer.
+    pub fn free_retired_fp8_buffers(&self) {
+        let _ = self.serve.run_on_executor(|executor| -> Result<()> {
+            executor.free_retired_fp8_buffers();
+            Ok(())
+        });
+    }
+
     /// Hot-swap the DSpark Markov head weights from a host f32 snapshot, then
     /// drop the now-stale prefix cache. Runs on the engine thread via the
     /// control seam so the resident weight mutation never races an in-flight

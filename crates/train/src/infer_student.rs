@@ -325,6 +325,7 @@ impl InferStudent {
         &self,
         store: &mut TensorStore,
         adapter_map: &HashMap<&'static str, TensorId>,
+        param_name_map: &HashMap<&'static str, TensorId>,
         lora_config: LoraConfig,
     ) -> Result<()> {
         if lora_config.rank == 0 {
@@ -420,7 +421,51 @@ impl InferStudent {
             .engine
             .lock()
             .map_err(|err| anyhow!("LoadedInferenceEngine lock poisoned: {err}"))?;
-        engine.remerge_student_lora(update)
+        engine.remerge_student_lora(update)?;
+
+        // Refresh the train student's frozen base: the merged weights now live
+        // in the rollout engine's dense-BF16 `data` buffers. Re-point the
+        // student's frozen-base tensors at those BF16 bytes (non-owning view),
+        // then free the retired FP8 qweight/scales. This both keeps the
+        // student's base in sync with the merged weights AND frees ~27 GB of
+        // FP8 keepalive that would otherwise OOM the next round's forward.
+        let bf16_ptrs = engine.frozen_base_bf16_pointers()?;
+        drop(engine);
+
+        for entry in &bf16_ptrs {
+            // Match the train-side parameter name: `*.layers.{layer_idx}.{proj_suffix}.weight`.
+            let suffix = format!(".layers.{}.{}.weight", entry.layer_idx, entry.proj_suffix);
+            let Some((&name, &id)) = param_name_map
+                .iter()
+                .find(|(name, _)| name.ends_with(&suffix))
+            else {
+                continue;
+            };
+            let shape = vec![entry.rows, entry.cols];
+            let handle = {
+                let backend = store.backend();
+                backend
+                    .import_bf16_device_ptr(entry.data_ptr, &shape)
+                    .map_err(|err| {
+                        anyhow!("LoRA sync: import BF16 base for {name} failed: {err}")
+                    })?
+            };
+            store
+                .replace_device_handle(id, handle)
+                .map_err(|err| anyhow!("LoRA sync: replace BF16 base for {name} failed: {err}"))?;
+            store.set_requires_grad(id, false).map_err(|err| {
+                anyhow!("LoRA sync: set requires_grad=false for {name} failed: {err}")
+            })?;
+        }
+
+        // Now that the student re-aliases the BF16 bytes, free the retired FP8
+        // buffers. Re-lock the engine (the borrow above was released).
+        let mut engine = self
+            .engine
+            .lock()
+            .map_err(|err| anyhow!("LoadedInferenceEngine lock poisoned: {err}"))?;
+        engine.free_retired_fp8_buffers();
+        Ok(())
     }
 }
 

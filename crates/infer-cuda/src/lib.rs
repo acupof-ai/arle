@@ -96,8 +96,8 @@ mod workspace;
 // the train crate pushes into the student engine; re-exported from `infer-api`.
 #[cfg(feature = "cuda")]
 pub use qwen35::{
-    SharedFp8BaseProjection, StudentLoraLayer, StudentLoraMatrices, StudentLoraProjection,
-    StudentLoraProjectionUpdate, StudentLoraUpdate,
+    SharedBf16BaseProjection, SharedFp8BaseProjection, StudentLoraLayer, StudentLoraMatrices,
+    StudentLoraProjection, StudentLoraProjectionUpdate, StudentLoraUpdate,
 };
 
 // Load-time decode-graph default setter (CLI `--cuda-graph` → engine). Lets the
@@ -544,6 +544,33 @@ impl CudaExecutor {
                  the no-GPU placeholder has no resident weights"
             ),
             CudaExecutorInner::Real(real) => real.frozen_base_fp8_pointers(),
+        }
+    }
+
+    /// Non-owning views of every resident dense-BF16 base projection's device
+    /// pointer, for refreshing the train student's frozen base AFTER a LoRA
+    /// re-merge.
+    #[cfg(feature = "cuda")]
+    pub fn frozen_base_bf16_pointers(
+        &self,
+    ) -> anyhow::Result<Vec<qwen35::SharedBf16BaseProjection>> {
+        match &self.inner {
+            CudaExecutorInner::Placeholder => anyhow::bail!(
+                "frozen-base BF16 sharing requires the real CUDA executor; \
+                 the no-GPU placeholder has no resident weights"
+            ),
+            CudaExecutorInner::Real(real) => real.frozen_base_bf16_pointers(),
+        }
+    }
+
+    /// Free the retired FP8 qweight/scales buffers for every projection that
+    /// has been promoted to dense BF16. Call ONLY after the train student has
+    /// re-aliased its frozen base to the BF16 `data` pointer.
+    #[cfg(feature = "cuda")]
+    pub fn free_retired_fp8_buffers(&mut self) {
+        match &mut self.inner {
+            CudaExecutorInner::Placeholder => {}
+            CudaExecutorInner::Real(real) => real.free_retired_fp8_buffers(),
         }
     }
 
