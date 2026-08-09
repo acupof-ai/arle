@@ -21,25 +21,97 @@ use autograd::{
 
 use crate::loss::{KlDirection, kl_distill_loss};
 use crate::qwen35::Qwen35Model;
+#[cfg(feature = "cuda")]
+use crate::teacher_infer::{InferTeacher, TeacherForward};
+
+/// Copy host data into a tensor and mark it dirty for device upload.
+fn write_tensor_data(store: &mut TensorStore, id: TensorId, data: &[f32]) -> Result<()> {
+    {
+        let tensor = store
+            .get_mut(id)
+            .ok_or_else(|| anyhow!("write_tensor_data: tensor {id} not found"))?;
+        if tensor.data.len() != data.len() {
+            return Err(anyhow!(
+                "write_tensor_data: length mismatch for {id}: tensor has {}, data has {}",
+                tensor.data.len(),
+                data.len()
+            ));
+        }
+        tensor.data.copy_from_slice(data);
+        tensor.dirty = autograd::tensor::Dirty::Host;
+    }
+    store.ensure_device(id)?;
+    Ok(())
+}
+
+/// Copy all LoRA adapter weights from `src` to `dst` (shadow → serving or
+/// serving → shadow). Both models must share the same adapter layout (created
+/// from the same base).
+pub fn sync_lora_adapters(
+    src: &Qwen35Model,
+    dst: &Qwen35Model,
+    store: &mut TensorStore,
+) -> Result<()> {
+    let src_map = src.adapter_name_map();
+    let dst_map = dst.adapter_name_map();
+    for (name, src_id) in &src_map {
+        let dst_id = dst_map
+            .get(name)
+            .ok_or_else(|| anyhow!("sync_lora_adapters: dst missing adapter {name:?}"))?;
+        let data = store.to_host(*src_id)?;
+        write_tensor_data(store, *dst_id, &data)?;
+    }
+    Ok(())
+}
 
 /// A single auxiliary model: holds the pre-RL (base) and post-RL (instruct)
 /// checkpoints. Both are frozen — only the student trains.
-pub struct W2sAuxModel {
-    pre_rl: Qwen35Model,
-    post_rl: Qwen35Model,
+///
+/// Two backends:
+/// - `InProcess`: autograd-loaded `Qwen35Model`, for small models that fit in
+///   the training process's GPU memory alongside the student.
+/// - `Infer`: `LoadedInferenceEngine`-backed, for large models that need TP or
+///   would otherwise OOM the training process. The logits are imported into
+///   the train store as constants (no gradient flows into the aux models).
+pub enum W2sAuxModel {
+    InProcess {
+        pre_rl: Qwen35Model,
+        post_rl: Qwen35Model,
+    },
+    #[cfg(feature = "cuda")]
+    Infer {
+        pre_rl: InferTeacher,
+        post_rl: InferTeacher,
+    },
 }
 
 impl W2sAuxModel {
-    pub fn new(pre_rl: Qwen35Model, post_rl: Qwen35Model) -> Self {
-        Self { pre_rl, post_rl }
+    pub fn new_in_process(pre_rl: Qwen35Model, post_rl: Qwen35Model) -> Self {
+        Self::InProcess { pre_rl, post_rl }
     }
 
-    pub fn pre_rl(&self) -> &Qwen35Model {
-        &self.pre_rl
+    #[cfg(feature = "cuda")]
+    pub fn new_infer(pre_rl: InferTeacher, post_rl: InferTeacher) -> Self {
+        Self::Infer { pre_rl, post_rl }
     }
 
-    pub fn post_rl(&self) -> &Qwen35Model {
-        &self.post_rl
+    /// Pre-RL model parameter IDs (in-process only; infer teachers have no
+    /// train-store params).
+    pub fn pre_rl_param_ids(&self) -> Vec<TensorId> {
+        match self {
+            Self::InProcess { pre_rl, .. } => pre_rl.all_parameter_ids(),
+            #[cfg(feature = "cuda")]
+            Self::Infer { .. } => vec![],
+        }
+    }
+
+    /// Post-RL model parameter IDs.
+    pub fn post_rl_param_ids(&self) -> Vec<TensorId> {
+        match self {
+            Self::InProcess { post_rl, .. } => post_rl.all_parameter_ids(),
+            #[cfg(feature = "cuda")]
+            Self::Infer { .. } => vec![],
+        }
     }
 
     /// Policy shift ΔT = log_softmax(post_rl) − log_softmax(pre_rl).
@@ -53,22 +125,40 @@ impl W2sAuxModel {
         store: &mut TensorStore,
         tape: &mut Tape,
     ) -> Result<TensorId> {
-        let was_enabled = tape.enabled;
-        tape.set_enabled(false);
-        let post_logits = self
-            .post_rl
-            .forward(store, tape, input_ids, positions)
-            .map_err(|e| anyhow!("aux post-RL forward: {e}"))?;
-        let pre_logits = self
-            .pre_rl
-            .forward(store, tape, input_ids, positions)
-            .map_err(|e| anyhow!("aux pre-RL forward: {e}"))?;
-        let lp_post = log_softmax(post_logits, store, tape)?;
-        let lp_pre = log_softmax(pre_logits, store, tape)?;
-        let neg_pre = mul_scalar(lp_pre, -1.0, store, tape)?;
-        let delta = add(lp_post, neg_pre, store, tape)?;
-        tape.set_enabled(was_enabled);
-        Ok(delta)
+        match self {
+            Self::InProcess { pre_rl, post_rl } => {
+                let was_enabled = tape.enabled;
+                tape.set_enabled(false);
+                let post_logits = post_rl
+                    .forward(store, tape, input_ids, positions)
+                    .map_err(|e| anyhow!("aux post-RL forward: {e}"))?;
+                let pre_logits = pre_rl
+                    .forward(store, tape, input_ids, positions)
+                    .map_err(|e| anyhow!("aux pre-RL forward: {e}"))?;
+                let lp_post = log_softmax(post_logits, store, tape)?;
+                let lp_pre = log_softmax(pre_logits, store, tape)?;
+                let neg_pre = mul_scalar(lp_pre, -1.0, store, tape)?;
+                let delta = add(lp_post, neg_pre, store, tape)?;
+                tape.set_enabled(was_enabled);
+                Ok(delta)
+            }
+            #[cfg(feature = "cuda")]
+            Self::Infer { pre_rl, post_rl } => {
+                // InferTeacher imports logits as device constants into the store;
+                // the tape is not involved (no grad flows into aux models).
+                let post_logits = post_rl
+                    .forward_logits_device(input_ids, positions, store, tape)
+                    .map_err(|e| anyhow!("aux post-RL infer forward: {e}"))?;
+                let pre_logits = pre_rl
+                    .forward_logits_device(input_ids, positions, store, tape)
+                    .map_err(|e| anyhow!("aux pre-RL infer forward: {e}"))?;
+                let lp_post = log_softmax(post_logits.tensor_id, store, tape)?;
+                let lp_pre = log_softmax(pre_logits.tensor_id, store, tape)?;
+                let neg_pre = mul_scalar(lp_pre, -1.0, store, tape)?;
+                let delta = add(lp_post, neg_pre, store, tape)?;
+                Ok(delta)
+            }
+        }
     }
 }
 
@@ -150,6 +240,26 @@ pub fn w2s_step<O: Optimizer>(
     let positions: Vec<u32> = (0..input_ids.len() as u32).collect();
     let num_positions = input_ids.len();
 
+    // Cleanup: keep all model params, free everything else. Grads are freed by
+    // `zero_grad` after the optimizer step — keeping them here would silently
+    // accumulate across steps (backward adds to existing grads).
+    let cleanup = |store: &mut TensorStore, tape: &mut Tape| {
+        let mut keep = HashSet::new();
+        for model in [
+            student.all_parameter_ids(),
+            student_old.all_parameter_ids(),
+            student_base.all_parameter_ids(),
+            aux1.pre_rl_param_ids(),
+            aux1.post_rl_param_ids(),
+            aux2.pre_rl_param_ids(),
+            aux2.post_rl_param_ids(),
+        ] {
+            keep.extend(model);
+        }
+        store.retain_ids(&keep);
+        tape.entries.clear();
+    };
+
     // 1. Student forward → z_s
     let z_s = student
         .forward(store, tape, input_ids, &positions)
@@ -160,6 +270,7 @@ pub fn w2s_step<O: Optimizer>(
     let probs_host = store.to_host(student_probs)?;
     let max_prob = probs_host.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     if max_prob > cfg.confidence_threshold {
+        cleanup(store, tape);
         return Ok(W2sStepOutcome {
             loss: 0.0,
             skipped: true,
@@ -178,6 +289,7 @@ pub fn w2s_step<O: Optimizer>(
     let d2_host = store.to_host(delta2)?;
     let consistency = cosine_similarity(&d1_host, &d2_host);
     if consistency < cfg.consistency_threshold {
+        cleanup(store, tape);
         return Ok(W2sStepOutcome {
             loss: 0.0,
             skipped: true,
@@ -246,17 +358,9 @@ pub fn w2s_step<O: Optimizer>(
         crate::grad_clip::clip_grad_norm(trainable_params, cfg.grad_clip, store);
     }
     optimizer.step(store, trainable_params)?;
+    optimizer.zero_grad(store, trainable_params);
 
-    // Cleanup: keep only student trainable params + their grads.
-    let mut keep = HashSet::new();
-    for &p in trainable_params {
-        keep.insert(p);
-        if let Some(g) = store.get(p).and_then(|t| t.grad) {
-            keep.insert(g);
-        }
-    }
-    store.retain_ids(&keep);
-    tape.entries.clear();
+    cleanup(store, tape);
 
     Ok(W2sStepOutcome {
         loss: loss_value,
