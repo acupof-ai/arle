@@ -18,14 +18,12 @@
 
 use crate::lora_shard::shard_range;
 
-/// A stage's position in the pipeline (`pp` axis of the mesh).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PpContext {
     pub rank: usize,
     pub size: usize,
 }
 
-/// The contiguous layer range `[start, end)` a stage owns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LayerRange {
     pub start: usize,
@@ -37,8 +35,6 @@ impl PpContext {
         Self { rank: 0, size: 1 }
     }
 
-    /// The PP view of the mesh for explicit sizes + world rank (pure, no env).
-    /// Falls back to `single()` on a misconfigured mesh.
     pub fn from_mesh(pp_size: usize, tp_size: usize, world_rank: usize) -> Self {
         let cfg = infer_topo::MultiAxisConfig {
             tp_size: tp_size.max(1),
@@ -69,9 +65,6 @@ impl PpContext {
         self.rank + 1 == self.size
     }
 
-    /// The layer range this stage owns — the same even-split-remainder-to-last
-    /// formula CP/DP use, so stages tile the layer stack contiguously and the last
-    /// absorbs the remainder.
     pub fn layers(self, num_layers: usize) -> LayerRange {
         if self.size <= 1 {
             return LayerRange {
