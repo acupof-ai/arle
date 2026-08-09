@@ -52,7 +52,7 @@ unsafe extern "C" {
 
     pub fn arle_car_destroy(handle: *mut std::os::raw::c_void);
 
-    // ── Production ABI (serve path): handle exchange rides the already-up
+    // Production ABI (serve path): handle exchange rides the already-up
     // NCCL comm, not rendezvous files. `arle_car_create` takes OWNERSHIP of
     // every pointer; `arle_car_destroy_prod` frees own regions and IPC-closes
     // peer mappings.

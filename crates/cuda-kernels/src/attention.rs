@@ -1,9 +1,9 @@
 //! DSv4-Flash attention-side packing/dispatch wrappers.
 //!
-//! Today this module holds a single op — `dsv4_fp8_kv_pack` — the MODEL1
-//! FP8 KV pack kernel that feeds FlashMLA's sparse-FP8 decode path
+//! This module holds the DSv4-Flash MODEL1 (and V32) FP8 KV pack kernels plus
+//! FlashMLA sparse-decode index builders that feed FlashMLA's sparse-FP8
+//! decode path
 //! (`sm90::decode::sparse_fp8::run_flash_splitkv_mla_fp8_sparse_kernel`).
-//! Phase D-3'.
 //!
 //! Runtime wire-up (D-4) is a separate dispatch; this wrapper exposes the
 //! FFI through the established `DeviceContext`-driven idiom that the rest
@@ -678,7 +678,6 @@ mod fa2_sm70_tests {
                 let q_base = q_pos * num_q_heads * head_dim + qh * head_dim;
                 let k_base = kh * max_seq_len * head_dim;
 
-                // Causal logits over KV 0..=q_pos.
                 let mut logits = vec![0.0f32; q_pos + 1];
                 for k_pos in 0..=q_pos {
                     let mut dot = 0.0f32;

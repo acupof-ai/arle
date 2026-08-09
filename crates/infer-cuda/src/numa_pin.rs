@@ -42,7 +42,7 @@ fn try_pin(ordinal: usize, world_size: usize) -> anyhow::Result<String> {
         .context("nvidia-smi spawn failed")?;
     ensure!(out.status.success(), "nvidia-smi exited non-zero");
     let text = String::from_utf8_lossy(&out.stdout);
-    let mut nodes: Vec<(usize, i32)> = Vec::new(); // (gpu index, numa node)
+    let mut nodes: Vec<(usize, i32)> = Vec::new();
     for line in text.lines() {
         let mut parts = line.split(',').map(str::trim);
         let (Some(idx), Some(bus)) = (parts.next(), parts.next()) else {

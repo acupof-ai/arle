@@ -682,9 +682,8 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
 
     /// Allocate a zero-filled device handle for `shape`.
     ///
-    /// Default implementation uploads a host zero vector so existing
-    /// backends inherit correct behavior. CUDA overrides to allocate and
-    /// memset on device, which avoids first-step AdamW moment HtoD traffic.
+    /// CUDA overrides to allocate and memset on device, which avoids
+    /// first-step AdamW moment HtoD traffic.
     fn zeros(&self, shape: &[usize]) -> Result<DeviceHandle> {
         let size = shape_size(shape);
         self.upload(&vec![0.0; size], shape)
@@ -934,7 +933,6 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
     /// Compute `C = A @ B^T` for rank-2 row-major tensors where
     /// `A:[M,K]`, `B:[N,K]`, and `C:[M,N]`.
     ///
-    /// Default fallback reads host buffers and calls `cpu_matmul_bt_forward`.
     /// Backends can override to avoid materialising `B^T`.
     fn matmul_bt(
         &self,
@@ -957,9 +955,7 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
     /// - rank-2: `A:[M,K]`, `B:[K,N]`, `dC:[M,N]`.
     /// - rank-3 (batched): `A:[B,M,K]`, `B:[B,K,N]`, `dC:[B,M,N]`.
     ///
-    /// Semantics: `grad_a = dC @ B^T` and `grad_b = A^T @ dC`. The default
-    /// implementation forwards to `cpu_matmul_backward`; Metal/CUDA override
-    /// to run on-device.
+    /// Semantics: `grad_a = dC @ B^T` and `grad_b = A^T @ dC`.
     fn matmul_backward(
         &self,
         a: &[f32],
@@ -983,8 +979,7 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         )
     }
 
-    /// Device-handle variant of `matmul_backward`. Foundation for the
-    /// device-resident gradient tape.
+    /// Foundation for the device-resident gradient tape.
     ///
     /// Computes `grad_a = grad_out @ B^T` and `grad_b = A^T @ grad_out` and
     /// returns each as an *unevaluated* `DeviceHandle` so the caller can
@@ -993,10 +988,7 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
     /// `log_softmax_last_axis_backward`). `need_grad_a` / `need_grad_b`
     /// short-circuit to `None` so the unused SGEMM is never launched.
     ///
-    /// The default implementation does
-    /// `readback → cpu_matmul_backward → upload` so non-CUDA backends silently
-    /// inherit correct (but slow) behaviour; CUDA overrides to keep both
-    /// SGEMMs on-device with no host roundtrip.
+    /// CUDA overrides to keep both SGEMMs on-device with no host roundtrip.
     ///
     /// The existing host-buffer `matmul_backward` stays in place — both
     /// methods coexist while the dispatch wiring lands in a follow-up
@@ -1041,8 +1033,7 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         Ok((grad_a_handle, grad_b_handle))
     }
 
-    /// Device-handle backward for `C = A @ B^T`. Default fallback uses host
-    /// buffers and uploads the requested gradients.
+    /// Backward for `C = A @ B^T`.
     fn matmul_bt_backward_device(
         &self,
         a: &DeviceHandle,
@@ -1083,11 +1074,9 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         Ok((grad_a_handle, grad_b_handle))
     }
 
-    /// Device-handle input-gradient for `C = A @ B^T`.
-    ///
-    /// This is the narrow `grad_a = grad_out @ B` case used by frozen base
-    /// weights. It avoids requiring the original `A` handle when no
-    /// `grad_b` is needed.
+    /// The narrow `grad_a = grad_out @ B` case used by frozen base weights.
+    /// It avoids requiring the original `A` handle when no `grad_b` is
+    /// needed.
     fn matmul_bt_input_grad_device(
         &self,
         b: &DeviceHandle,
@@ -1155,8 +1144,8 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         self.add_into_device(dest, src, shape)
     }
 
-    /// Device-handle all-reduce sum over the `axis` communicator.
-    /// Single-rank and CPU semantics are identity.
+    /// All-reduce sum over the `axis` communicator. Single-rank and CPU
+    /// semantics are identity.
     ///
     /// The operation is functional: it returns a fresh handle and never
     /// mutates `x`, so tape consumers can keep sharing the input handle.
@@ -1312,8 +1301,8 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
     }
 
     /// Sum of squares for a device handle, returned on host as `f64`.
-    /// The default fallback reads the full tensor; CUDA overrides with a
-    /// partial-reduction kernel so gradient clipping can stay device-resident.
+    /// CUDA overrides with a partial-reduction kernel so gradient clipping
+    /// can stay device-resident.
     fn sum_squares(&self, x: &DeviceHandle, shape: &[usize]) -> Result<f64> {
         let host = self.readback(x)?;
         let size = shape_size(shape);
@@ -1333,7 +1322,7 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
             .sum())
     }
 
-    /// Device-resident global-norm gradient clip across many tensors.
+    /// Global-norm gradient clip across many tensors.
     ///
     /// Default returns `None` so higher-level train code can fall back to the
     /// portable per-tensor path. CUDA overrides with a batched pointer-array
@@ -1369,28 +1358,23 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         cpu_log_softmax_forward_last_axis(x, shape)
     }
 
-    /// Device-handle variant of `softmax_forward_last_axis`. Lazy on backends
-    /// that can compose softmax into their graph (Metal: `mlx_softmax_axis`);
-    /// the default implementation falls back to `readback → host compute →
-    /// upload` so CPU/CUDA need no special-case.
+    /// Lazy on backends that can compose softmax into their graph (Metal:
+    /// `mlx_softmax_axis`).
     fn softmax_last_axis(&self, x: &DeviceHandle, shape: &[usize]) -> Result<DeviceHandle> {
         let host = self.readback(x)?;
         let out = self.softmax_forward_last_axis(&host, shape)?;
         self.upload(&out, shape)
     }
 
-    /// Device-handle variant of `log_softmax_forward_last_axis`. Lazy on
-    /// backends that can compose into their graph (Metal uses
-    /// `mlx_logsumexp_axis` + `mlx_subtract`); the default implementation
-    /// falls back to `readback → host compute → upload`.
+    /// Lazy on backends that can compose into their graph (Metal uses
+    /// `mlx_logsumexp_axis` + `mlx_subtract`).
     fn log_softmax_last_axis(&self, x: &DeviceHandle, shape: &[usize]) -> Result<DeviceHandle> {
         let host = self.readback(x)?;
         let out = self.log_softmax_forward_last_axis(&host, shape)?;
         self.upload(&out, shape)
     }
 
-    /// Device-handle variant of softmax backward. Computes
-    /// `grad_input = y * (upstream - sum(upstream * y, axis=-1, keepdim=true))`
+    /// Computes `grad_input = y * (upstream - sum(upstream * y, axis=-1, keepdim=true))`
     /// row-wise over the last axis, where `y` is the saved forward softmax
     /// output.
     fn softmax_last_axis_backward(
@@ -1405,8 +1389,7 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         self.upload(&grad, shape)
     }
 
-    /// Device-handle variant of `cpu_log_softmax_backward`. Computes
-    /// `grad_input = upstream - exp(log_softmax_output) * sum(upstream, axis=-1, keepdim=true)`
+    /// Computes `grad_input = upstream - exp(log_softmax_output) * sum(upstream, axis=-1, keepdim=true)`
     /// row-wise over the last axis.
     ///
     /// `log_softmax_output` is the saved forward output (NOT the input —
@@ -1414,13 +1397,10 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
     /// softmax probability, which is just `exp(saved_output)`). `upstream`
     /// has the same shape as `log_softmax_output`.
     ///
-    /// The default fallback runs
-    /// the host formula via `cpu_log_softmax_backward`, so non-CUDA
-    /// backends inherit correct behaviour. CUDA overrides this with a
-    /// single per-row NVRTC kernel that consumes the saved forward output
-    /// without a host roundtrip — kills the `[B, S, V]` × 4 B ≈ 1 GB DtoH
-    /// copy that nsys identified as the single largest readback per
-    /// training step.
+    /// CUDA overrides this with a single per-row NVRTC kernel that consumes
+    /// the saved forward output without a host roundtrip — kills the
+    /// `[B, S, V]` × 4 B ≈ 1 GB DtoH copy that nsys identified as the
+    /// single largest readback per training step.
     fn log_softmax_last_axis_backward(
         &self,
         upstream: &DeviceHandle,
@@ -1433,20 +1413,15 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         self.upload(&grad, shape)
     }
 
-    /// Device-handle variant of `silu_forward`. Lazy on backends that can
-    /// compose `x * sigmoid(x)` into their graph (Metal: `mlx_multiply` +
-    /// `mlx_sigmoid`); the default implementation falls back to
-    /// `readback → host compute → upload` so CPU/CUDA need no special-case.
+    /// Lazy on backends that can compose `x * sigmoid(x)` into their graph
+    /// (Metal: `mlx_multiply` + `mlx_sigmoid`).
     fn silu(&self, x: &DeviceHandle, shape: &[usize]) -> Result<DeviceHandle> {
         let host = self.readback(x)?;
         let out = self.silu_forward(&host)?;
         self.upload(&out, shape)
     }
 
-    /// Device-handle variant of `exp_forward`. Lazy on backends with a
-    /// native `exp` graph node (Metal: `mlx_exp`); the default
-    /// implementation falls back to `readback → host compute → upload`
-    /// so CPU/CUDA need no special-case.
+    /// Lazy on backends with a native `exp` graph node (Metal: `mlx_exp`).
     fn exp(&self, x: &DeviceHandle, shape: &[usize]) -> Result<DeviceHandle> {
         let host = self.readback(x)?;
         let out = self.exp_forward(&host)?;
@@ -1458,10 +1433,7 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         cpu_sigmoid_forward(a)
     }
 
-    /// Device-handle variant of `sigmoid_forward`. Lazy on backends with a
-    /// native `sigmoid` graph node (Metal: `mlx_sigmoid`); the default
-    /// implementation falls back to `readback → host compute → upload`
-    /// so CPU/CUDA need no special-case.
+    /// Lazy on backends with a native `sigmoid` graph node (Metal: `mlx_sigmoid`).
     fn sigmoid(&self, x: &DeviceHandle, shape: &[usize]) -> Result<DeviceHandle> {
         let host = self.readback(x)?;
         let out = self.sigmoid_forward(&host)?;
@@ -1473,8 +1445,7 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         cpu_abs_forward(a)
     }
 
-    /// Device-handle variant of `abs_forward`. The default falls back to
-    /// `readback → host compute → upload`; CUDA overrides with a 1D kernel.
+    /// CUDA overrides with a 1D kernel.
     fn abs(&self, x: &DeviceHandle, shape: &[usize]) -> Result<DeviceHandle> {
         let host = self.readback(x)?;
         let out = self.abs_forward(&host)?;
@@ -1486,12 +1457,10 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         cpu_mul_forward(a, b)
     }
 
-    /// Device-handle variant of `mul_forward`. Lazy on backends that can
-    /// compose `a * b` into their graph (Metal: `mlx_multiply`); default
-    /// falls back to `readback(a) → readback(b) → host compute → upload`
-    /// so CPU/CUDA need no special-case. Shapes must match on both sides
-    /// (elementwise, not broadcasted — use `add_broadcast`'s `mul` twin if
-    /// broadcast multiplication is ever needed).
+    /// Lazy on backends that can compose `a * b` into their graph (Metal:
+    /// `mlx_multiply`). Shapes must match on both sides (elementwise, not
+    /// broadcasted — use `add_broadcast`'s `mul` twin if broadcast
+    /// multiplication is ever needed).
     fn mul(&self, a: &DeviceHandle, b: &DeviceHandle, shape: &[usize]) -> Result<DeviceHandle> {
         let a_host = self.readback(a)?;
         let b_host = self.readback(b)?;
@@ -1504,23 +1473,18 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         cpu_mul_scalar_forward(a, s)
     }
 
-    /// Device-handle variant of `mul_scalar_forward`. Lazy on backends
-    /// that can compose `x * s` into their graph (Metal: broadcast
-    /// `mlx_multiply` against a rank-0 scalar `mlx_array`); the default
-    /// implementation falls back to `readback → host compute → upload`
-    /// so CPU/CUDA need no special-case.
+    /// Lazy on backends that can compose `x * s` into their graph (Metal:
+    /// broadcast `mlx_multiply` against a rank-0 scalar `mlx_array`).
     fn mul_scalar(&self, x: &DeviceHandle, s: f32, shape: &[usize]) -> Result<DeviceHandle> {
         let host = self.readback(x)?;
         let out = self.mul_scalar_forward(&host, s)?;
         self.upload(&out, shape)
     }
 
-    /// Device-resident backward for `mul_scalar(x, k)`. Computes
-    /// `grad_x[i] = upstream[i] * k` and returns an unevaluated handle.
+    /// Computes `grad_x[i] = upstream[i] * k` and returns an unevaluated
+    /// handle.
     ///
-    /// The default fallback runs `readback → host multiply → upload` so
-    /// CPU/Metal inherit correct behaviour. CUDA overrides with a 1D
-    /// NVRTC kernel.
+    /// CUDA overrides with a 1D NVRTC kernel.
     ///
     /// Wires the CE-loss backward chain the surrounding device overrides
     /// already cover: `mul_scalar_backward` was the *first* host op in
@@ -1539,19 +1503,18 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         self.upload(&grad, shape)
     }
 
-    /// Device-resident backward for `mean(x)`. The forward reduces
-    /// `elem_count = product(output_shape)` elements to a rank-0 scalar;
-    /// the backward broadcasts `upstream_grad / elem_count` across
-    /// `elem_count` slots of the returned `d_input` handle.
+    /// The forward reduces `elem_count = product(output_shape)` elements to
+    /// a rank-0 scalar; the backward broadcasts
+    /// `upstream_grad / elem_count` across `elem_count` slots of the
+    /// returned `d_input` handle.
     ///
     /// `upstream_grad` must be a rank-0 scalar (shape `[]` or `[1]`).
     /// `output_shape` is the shape of the input to the original `mean`
     /// op (i.e. the shape of the returned `d_input`).
     ///
-    /// The default fallback runs `readback scalar → host broadcast-scale
-    /// → upload` so CPU/Metal inherit correct behaviour. CUDA overrides
-    /// with a 1D NVRTC kernel that fetches the upstream scalar from
-    /// device memory (free L1 broadcast) and writes one slot per thread.
+    /// CUDA overrides with a 1D NVRTC kernel that fetches the upstream
+    /// scalar from device memory (free L1 broadcast) and writes one slot
+    /// per thread.
     ///
     /// Pairs with `mul_scalar_backward_device` to keep the CE-loss
     /// backward chain device-resident.
@@ -1578,8 +1541,8 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         self.upload(&grad, output_shape)
     }
 
-    /// Device-resident backward for `sum(x)`: broadcast the rank-0
-    /// upstream scalar across the original input shape.
+    /// Broadcast the rank-0 upstream scalar across the original input
+    /// shape.
     fn sum_backward_device(
         &self,
         upstream_grad: &DeviceHandle,
@@ -1612,12 +1575,9 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         cpu_add_broadcast_forward(a, a_shape, b, b_shape)
     }
 
-    /// Device-handle variant of `add_broadcast_forward`. Lazy on backends
-    /// whose native add already broadcasts (Metal: `mlx_add` — NumPy-style
-    /// right-aligned broadcasting, no explicit `broadcast_to` needed); the
-    /// default implementation falls back to `readback → host compute →
-    /// upload` so CPU/CUDA need no special-case. Output shape equals
-    /// `a_shape` (the same contract as `add_broadcast_forward`).
+    /// Lazy on backends whose native add already broadcasts (Metal:
+    /// `mlx_add` — NumPy-style right-aligned broadcasting, no explicit
+    /// `broadcast_to` needed). Output shape equals `a_shape`.
     fn add_broadcast(
         &self,
         a: &DeviceHandle,
@@ -1648,9 +1608,8 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         Ok(out)
     }
 
-    /// Device-handle variant of `broadcast_expand_forward`. Default falls back
-    /// to `readback → host → upload`; CUDA/Metal override with an in-place
-    /// device expand (no zero carrier, no round-trip).
+    /// CUDA/Metal override with an in-place device expand (no zero carrier,
+    /// no round-trip).
     fn broadcast_expand(
         &self,
         src: &DeviceHandle,
@@ -1694,12 +1653,10 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         cpu_rms_norm_forward(x, weight, shape, eps)
     }
 
-    /// Device-handle variant of `rms_norm_forward`. Lazy on backends with
-    /// a native fused rms-norm op (Metal: `mlx_fast_rms_norm` over a
-    /// borrowed `x` handle + per-call `weight` upload); the default
-    /// implementation falls back to `readback → host compute → upload`.
-    /// Backward path recomputes `inv_rms` host-side — see `ops::norm`
-    /// for the saved-context encoding.
+    /// Lazy on backends with a native fused rms-norm op (Metal:
+    /// `mlx_fast_rms_norm` over a borrowed `x` handle + per-call `weight`
+    /// upload). Backward path recomputes `inv_rms` host-side — see
+    /// `ops::norm` for the saved-context encoding.
     fn rms_norm(
         &self,
         x: &DeviceHandle,
@@ -1725,13 +1682,11 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         cpu_embedding_forward(weight, vocab, dim, ids)
     }
 
-    /// Device-handle variant of `embedding_forward`. Lazy on backends that
-    /// can compose the row-gather into their eval stream (Metal: upload
-    /// `ids` as a tiny int32 array + `mlx_take_axis` + reshape, no eval).
-    /// Output shape is `[1, ids.len(), dim]` — matching
-    /// `ops::embedding`'s convention of treating raw ids as a single batch
-    /// row. Default implementation falls back to `readback → host compute →
-    /// upload`.
+    /// Lazy on backends that can compose the row-gather into their eval
+    /// stream (Metal: upload `ids` as a tiny int32 array + `mlx_take_axis`
+    /// + reshape, no eval). Output shape is `[1, ids.len(), dim]` —
+    /// matching `ops::embedding`'s convention of treating raw ids as a
+    /// single batch row.
     fn embedding(
         &self,
         table: &DeviceHandle,
@@ -1753,7 +1708,6 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
 
     /// Device-token embedding variant for greedy decode loops. `ids` is a
     /// device-resident f32 vector whose values are exact integer token ids.
-    /// Default fallback reads those tiny ids to host and reuses `embedding`.
     fn embedding_from_f32_ids(
         &self,
         table: &DeviceHandle,
@@ -1826,13 +1780,12 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         self.upload(&host, &[len])
     }
 
-    /// Device-handle lazy GELU (erf form), matching `ops::activation::gelu`'s
-    /// CPU body: `0.5 * x * (1 + erf(x / sqrt(2)))`. NOT the tanh-approx
-    /// variant exposed by `gelu_forward` — those two formulas differ at the
-    /// ~1e-3 level, and `gelu_backward` hard-codes the erf-derivative via
-    /// the saved input, so forward must stay on the erf form for the
-    /// saved-input derivative to be consistent. Default implementation
-    /// falls back to `readback → host erf compute → upload`.
+    /// Lazy GELU (erf form), matching `ops::activation::gelu`'s CPU body:
+    /// `0.5 * x * (1 + erf(x / sqrt(2)))`. NOT the tanh-approx variant
+    /// exposed by `gelu_forward` — those two formulas differ at the ~1e-3
+    /// level, and `gelu_backward` hard-codes the erf-derivative via the
+    /// saved input, so forward must stay on the erf form for the
+    /// saved-input derivative to be consistent.
     fn gelu(&self, x: &DeviceHandle, shape: &[usize]) -> Result<DeviceHandle> {
         let host = self.readback(x)?;
         let out: Vec<f32> = host
@@ -1868,14 +1821,12 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         cpu_rope_forward(x, x_shape, cos, sin)
     }
 
-    /// Device-handle variant of `rope_forward`. Lazy on backends that can
-    /// compose the half-split rotation graph into their eval stream (Metal:
-    /// `mlx_slice` → `mlx_multiply` → `mlx_subtract`/`mlx_add` → `mlx_concatenate_axis`,
-    /// no eval). `cos`/`sin` stay as host slices — the caches are precomputed
-    /// per seq length and seldom benefit from being device-resident, and
-    /// keeping them host-side means no merge of device handles is required.
-    /// Default implementation falls back to `readback → host compute →
-    /// upload`.
+    /// Lazy on backends that can compose the half-split rotation graph into
+    /// their eval stream (Metal: `mlx_slice` → `mlx_multiply` →
+    /// `mlx_subtract`/`mlx_add` → `mlx_concatenate_axis`, no eval).
+    /// `cos`/`sin` stay as host slices — the caches are precomputed per seq
+    /// length and seldom benefit from being device-resident, and keeping
+    /// them host-side means no merge of device handles is required.
     fn rope(
         &self,
         x: &DeviceHandle,
@@ -1900,12 +1851,10 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         cpu_gather_last_dim_forward(src, src_shape, ids)
     }
 
-    /// Device-handle variant of `gather_last_dim_forward`. Lazy on backends
-    /// that can compose `flatten → take_axis → reshape` into their eval
-    /// stream (Metal: `mlx_reshape` to `[prefix*vocab]`, `mlx_take_axis`
-    /// with remapped `i * vocab + ids[i]` flat ids, `mlx_reshape` back to
-    /// `src_shape[..-1]`). Default implementation falls back to
-    /// `readback → host compute → upload`. Output shape is
+    /// Lazy on backends that can compose `flatten → take_axis → reshape`
+    /// into their eval stream (Metal: `mlx_reshape` to `[prefix*vocab]`,
+    /// `mlx_take_axis` with remapped `i * vocab + ids[i]` flat ids,
+    /// `mlx_reshape` back to `src_shape[..-1]`). Output shape is
     /// `src_shape[..-1]` (empty for rank-1 input).
     fn gather_last_dim(
         &self,
@@ -1923,13 +1872,13 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         self.upload(&out, &out_shape)
     }
 
-    /// Device-handle backward for `gather_last_dim`. Zero-fills a
-    /// `[prefix_rows, vocab] = src_shape` output and scatters the per-prefix
-    /// `upstream` values into the `(row, ids[row])` slots. Equivalent to the
-    /// flat `scatter_add_rows_forward(upstream, prefix_rows, 1,
-    /// remapped_ids, prefix_rows * vocab)` path the host backward takes, but
-    /// the trait-level signature exposes the natural `[B, S, V]` output
-    /// shape so backends can pick block tiling (one block per prefix row of
+    /// Zero-fills a `[prefix_rows, vocab] = src_shape` output and scatters
+    /// the per-prefix `upstream` values into the `(row, ids[row])` slots.
+    /// Equivalent to the flat
+    /// `scatter_add_rows_forward(upstream, prefix_rows, 1, remapped_ids,
+    /// prefix_rows * vocab)` path the host backward takes, but the
+    /// trait-level signature exposes the natural `[B, S, V]` output shape
+    /// so backends can pick block tiling (one block per prefix row of
     /// `vocab` cols) without un-flattening.
     ///
     /// `upstream` has length `product(src_shape[..-1])` (one scalar per
@@ -1937,8 +1886,8 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
     /// Negative or out-of-range indices are silently skipped, matching
     /// `cpu_gather_last_dim_backward` / `cpu_scatter_add_rows_forward`.
     ///
-    /// CUDA overrides this with a single per-row NVRTC kernel so
-    /// the `[B, S, V]` grad stays device-resident — keeps the `1 GB`
+    /// CUDA overrides this with a single per-row NVRTC kernel so the
+    /// `[B, S, V]` grad stays device-resident — keeps the `1 GB`
     /// scatter-add output off the host-roundtrip path the host
     /// `gather_last_dim_backward` forces.
     fn gather_last_dim_backward(
@@ -1953,11 +1902,9 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
     }
 
     /// Pure-layout reshape: returns a handle whose view is `new_shape` over
-    /// the same logical elements. Numel must match (`product(new_shape) ==
-    /// product(old_shape)`); the caller is expected to have checked that.
-    /// Default: readback → host (no-op reshape, contiguous) → upload.
-    /// Metal overrides to `mlx_reshape` so the whole graph stays lazy —
-    /// reshape is a free metadata op on MLX side.
+    /// the same logical elements. Numel must match; the caller is expected
+    /// to have checked that. Metal overrides to `mlx_reshape` so the whole
+    /// graph stays lazy — reshape is a free metadata op on MLX side.
     fn reshape(&self, x: &DeviceHandle, new_shape: &[usize]) -> Result<DeviceHandle> {
         let host = self.readback(x)?;
         self.upload(&host, new_shape)
@@ -1965,10 +1912,9 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
 
     /// Swap two axes of `x`. `old_shape` is the pre-swap shape; the caller is
     /// responsible for computing the post-swap shape (just swap the two
-    /// entries). `axis1`/`axis2` must be valid axes into `old_shape`. Default:
-    /// readback → host transpose loop → upload. Metal overrides to
-    /// `mlx_transpose_axes` with a permutation that is identity except for
-    /// the two swapped positions, composing into the lazy graph.
+    /// entries). `axis1`/`axis2` must be valid axes into `old_shape`. Metal
+    /// overrides to `mlx_transpose_axes` with a permutation that is identity
+    /// except for the two swapped positions, composing into the lazy graph.
     fn transpose_axes_swap(
         &self,
         x: &DeviceHandle,
@@ -1984,11 +1930,10 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
 
     /// Contiguous-stride slice of `x` over `old_shape` from per-axis `starts`
     /// (inclusive) to `ends` (exclusive). Returns a new device handle whose
-    /// logical shape is `ends - starts` (caller computes). Default: readback →
-    /// host slice loop → upload. Metal overrides to `mlx_slice` with
-    /// strides=1, wrapping the non-contiguous view in `mlx_contiguous` so
-    /// readback respects the sliced window (same rationale as the
-    /// `transpose_axes_swap` override).
+    /// logical shape is `ends - starts` (caller computes). Metal overrides to
+    /// `mlx_slice` with strides=1, wrapping the non-contiguous view in
+    /// `mlx_contiguous` so readback respects the sliced window (same
+    /// rationale as the `transpose_axes_swap` override).
     fn slice(
         &self,
         x: &DeviceHandle,
@@ -2002,9 +1947,8 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
     }
 
     /// Concatenate two rank-4 `[batch, heads, seq, dim]` tensors along the
-    /// sequence axis. Default: readback → host reference → upload. CUDA
-    /// overrides this for OPD rollout KV-cache appends so cached K/V stay
-    /// device-resident during greedy decode.
+    /// sequence axis. CUDA overrides this for OPD rollout KV-cache appends
+    /// so cached K/V stay device-resident during greedy decode.
     fn concat_axis2(
         &self,
         a: &DeviceHandle,
@@ -2020,8 +1964,8 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
     }
 
     /// Concatenate N same-rank tensors along `axis` (shapes equal off `axis`).
-    /// Default readback→host→upload; CUDA overrides D2D (the CP reorder concats a
-    /// full-seq tensor per layer — a host round-trip there costs hours at 256K).
+    /// CUDA overrides D2D (the CP reorder concats a full-seq tensor per layer
+    /// — a host round-trip there costs hours at 256K).
     fn concat(
         &self,
         parts: &[(&DeviceHandle, &[usize])],
@@ -2242,9 +2186,8 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         Ok((k_handle, v_handle, out_shape))
     }
 
-    /// Device-handle backward for a contiguous slice. Returns a full
-    /// `old_shape` gradient with upstream values scattered into the sliced
-    /// window and zeros elsewhere.
+    /// Returns a full `old_shape` gradient with upstream values scattered
+    /// into the sliced window and zeros elsewhere.
     fn slice_backward_device(
         &self,
         upstream: &DeviceHandle,
@@ -2326,7 +2269,6 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
     ///   `1 - beta1^step` / `1 - beta2^step`, passed in so this op never sees
     ///   the step counter (matches how CUDA AdamW kernels are usually driven).
     ///
-    /// Default implementation: `readback(param, m, v) → host formula → upload`.
     /// This is CPU-correct by construction and gives non-Metal backends a
     /// working fallback. Metal overrides to compose the update into its lazy
     /// MLX graph so `m` / `v` / `param` stay device-resident across steps —
@@ -2398,19 +2340,17 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         Ok((new_param, new_m, new_v))
     }
 
-    /// Device-grad variant of `adamw_step`. Accepts the gradient as
-    /// a `DeviceHandle` so device-resident backward ops
-    /// (`embedding_backward_device`, `add_broadcast_backward_device`,
-    /// `matmul_backward_device`, ...) skip the per-param `to_host(grad_id)` DtoH
-    /// that otherwise makes the device-resident embedding/add_broadcast grads a
-    /// +1.8% wash (and adds 41.5 GB DtoH / step).
+    /// Accepts the gradient as a `DeviceHandle` so device-resident backward
+    /// ops (`embedding_backward_device`, `add_broadcast_backward_device`,
+    /// `matmul_backward_device`, ...) skip the per-param `to_host(grad_id)`
+    /// DtoH that otherwise makes the device-resident embedding/add_broadcast
+    /// grads a +1.8% wash (and adds 41.5 GB DtoH / step).
     ///
     /// Same semantics + eval contract as `adamw_step`: returns the updated
     /// `(param, m, v)` *unevaluated* so the caller batches a single terminal
-    /// `backend.eval(...)` per optimizer step. Default impl: `readback(grad) →
-    /// self.adamw_step(...)` so CPU/Metal silently inherit correctness through
-    /// the host fallback. CUDA overrides to keep the gradient on-device and
-    /// reuse the existing fused `adamw_step_f32` NVRTC kernel.
+    /// `backend.eval(...)` per optimizer step. CUDA overrides to keep the
+    /// gradient on-device and reuse the existing fused `adamw_step_f32`
+    /// NVRTC kernel.
     #[allow(clippy::too_many_arguments)]
     fn adamw_step_device(
         &self,
@@ -2455,18 +2395,16 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         cpu_scatter_add_rows_forward(upstream, prefix_rows, feature_dim, indices, vocab)
     }
 
-    /// Device-resident backward for `embedding`. Scatter-adds
-    /// the per-token-position upstream gradient `[1, n_ids, hidden]` (or any
-    /// rank that flattens to `n_ids * hidden`) into the `[vocab, hidden]`
-    /// embedding table gradient. `atomicAdd` is mandatory — duplicate token
-    /// ids within a single batch are normal (e.g. `the` appears N times in a
-    /// 1024-token sequence) and must accumulate correctly.
+    /// Scatter-adds the per-token-position upstream gradient
+    /// `[1, n_ids, hidden]` (or any rank that flattens to `n_ids * hidden`)
+    /// into the `[vocab, hidden]` embedding table gradient. `atomicAdd` is
+    /// mandatory — duplicate token ids within a single batch are normal
+    /// (e.g. `the` appears N times in a 1024-token sequence) and must
+    /// accumulate correctly.
     ///
-    /// Default fallback runs `readback → cpu_scatter_add_rows_forward →
-    /// upload` so CPU/Metal inherit correct behaviour. CUDA overrides with
-    /// an NVRTC kernel that initializes the `[vocab, hidden]` output to zero
-    /// and accumulates each `(b*S + s)`-row of upstream into
-    /// `out[ids[b*S+s], :]` via `atomicAdd`.
+    /// CUDA overrides with an NVRTC kernel that initializes the
+    /// `[vocab, hidden]` output to zero and accumulates each `(b*S + s)`-row
+    /// of upstream into `out[ids[b*S+s], :]` via `atomicAdd`.
     ///
     /// Keeps the embedding backward off the host so the `[B, S, H]` upstream
     /// tensor — second largest per-step DtoH in the P3.1 residue — never
@@ -2486,7 +2424,6 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         self.upload(&grad, &[vocab_size, hidden_dim])
     }
 
-    /// Device-resident backward for `add_broadcast`.
     /// Given the forward `out = a + broadcast(b, a_shape)`, this returns
     /// `grad_b = sum_over_broadcast_axes(upstream)` with output shape
     /// `b_shape`. Axes whose `b_shape` dim is 1 (or are absent from `b_shape`
@@ -2496,9 +2433,7 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
     /// reduction is implemented as one block per output element — each block
     /// strides through the broadcast-source slots and shared-memory-reduces.
     ///
-    /// Default fallback runs `readback → host loop (mirrors
-    /// `add_broadcast_backward` host path) → upload`. CUDA overrides with an
-    /// NVRTC kernel.
+    /// CUDA overrides with an NVRTC kernel.
     fn add_broadcast_backward_device(
         &self,
         upstream: &DeviceHandle,
@@ -2532,14 +2467,12 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         self.upload(&grad_b, b_shape)
     }
 
-    /// Device-resident backward for `silu(x)`. Elementwise
-    /// `grad_x[i] = upstream[i] * silu'(x[i])` where
+    /// Elementwise `grad_x[i] = upstream[i] * silu'(x[i])` where
     /// `silu'(x) = sigmoid(x) * (1 + x * (1 - sigmoid(x)))`. The saved
     /// context is the original input `x` (not the output), matching the
     /// host `silu_backward`.
     ///
-    /// Default fallback: `readback(upstream) → readback(x) → host loop →
-    /// upload`. CUDA overrides with a 1D NVRTC kernel. Returned handle is
+    /// CUDA overrides with a 1D NVRTC kernel. Returned handle is
     /// unevaluated per the batched-eval contract.
     fn silu_backward_device(
         &self,
@@ -2569,13 +2502,11 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         self.upload(&grad, shape)
     }
 
-    /// Device-resident backward for `gelu(x)` (erf form, matches
-    /// the autograd `gelu_host_eager` forward). Elementwise
-    /// `grad_x[i] = upstream[i] * gelu'(x[i])` where
+    /// Elementwise `grad_x[i] = upstream[i] * gelu'(x[i])` where
     /// `gelu'(x) = 0.5*(1 + erf(x/√2)) + x * (1/√(2π)) * exp(-x²/2)`.
+    /// (erf form, matches the autograd `gelu_host_eager` forward.)
     ///
-    /// Default fallback: `readback → host loop → upload`. CUDA overrides
-    /// with a 1D NVRTC kernel. Returned handle is unevaluated.
+    /// CUDA overrides with a 1D NVRTC kernel. Returned handle is unevaluated.
     fn gelu_backward_device(
         &self,
         upstream: &DeviceHandle,
@@ -2607,11 +2538,10 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         self.upload(&grad, shape)
     }
 
-    /// Device-resident backward for `sigmoid(x)`. Consumes the
-    /// saved output `y`: `grad_x[i] = upstream[i] * y[i] * (1 - y[i])`.
+    /// Consumes the saved output `y`:
+    /// `grad_x[i] = upstream[i] * y[i] * (1 - y[i])`.
     ///
-    /// Default fallback: `readback → host loop → upload`. CUDA overrides
-    /// with a 1D NVRTC kernel.
+    /// CUDA overrides with a 1D NVRTC kernel.
     fn sigmoid_backward_device(
         &self,
         upstream: &DeviceHandle,
@@ -2636,11 +2566,10 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         self.upload(&grad, shape)
     }
 
-    /// Device-resident backward for `abs(x)`. Consumes the saved input `x`:
+    /// Consumes the saved input `x`:
     /// `grad_x[i] = upstream[i] * sign(x[i])`, with `sign(0) = 0`.
     ///
-    /// Default fallback: `readback → host loop → upload`. CUDA overrides
-    /// with a 1D NVRTC kernel.
+    /// CUDA overrides with a 1D NVRTC kernel.
     fn abs_backward_device(
         &self,
         upstream: &DeviceHandle,
@@ -2665,11 +2594,10 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         self.upload(&grad, shape)
     }
 
-    /// Device-resident backward for `exp(x)`. Consumes the saved
-    /// output `y = exp(x)`: `grad_x[i] = upstream[i] * y[i]`.
+    /// Consumes the saved output `y = exp(x)`:
+    /// `grad_x[i] = upstream[i] * y[i]`.
     ///
-    /// Default fallback: `readback → host multiply → upload`. CUDA
-    /// overrides with a 1D NVRTC kernel.
+    /// CUDA overrides with a 1D NVRTC kernel.
     fn exp_backward_device(
         &self,
         upstream: &DeviceHandle,
@@ -2694,13 +2622,11 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         self.upload(&grad, shape)
     }
 
-    /// Device-resident backward for `mul(a, b)`. Returns
-    /// `(grad_a, grad_b)` where `grad_a[i] = upstream[i] * b[i]` and
-    /// `grad_b[i] = upstream[i] * a[i]`. `need_grad_a` / `need_grad_b`
+    /// Returns `(grad_a, grad_b)` where `grad_a[i] = upstream[i] * b[i]`
+    /// and `grad_b[i] = upstream[i] * a[i]`. `need_grad_a` / `need_grad_b`
     /// short-circuit each side to `None` (mirrors `matmul_backward_device`).
     ///
-    /// Default fallback: `readback → host multiply → upload` for each
-    /// requested side. CUDA overrides with two 1D NVRTC kernels.
+    /// CUDA overrides with two 1D NVRTC kernels.
     fn mul_backward_device(
         &self,
         upstream: &DeviceHandle,
@@ -2757,7 +2683,6 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         Ok((grad_a, grad_b))
     }
 
-    /// Device-resident backward for `rms_norm(x, weight, eps)`.
     /// Returns `(grad_x, grad_w)` where each side is gated by the
     /// corresponding `need_grad_*` flag (default impl skips the host
     /// allocation for skipped sides).
@@ -2768,9 +2693,9 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
     ///   grad_x[r,j] = inv*upstream[r,j]*weight[j] - x[r,j]*inv*inv*dot/H
     ///   grad_w[j]   = sum_r(upstream[r,j] * x[r,j] * inv_rms[r])
     ///
-    /// Default fallback: `readback → host loop → upload`. CUDA overrides
-    /// with three NVRTC kernels (per-row inv_rms scratch, then per-row
-    /// grad_x with shared-mem `dot` reduce, then per-col grad_w reduce).
+    /// CUDA overrides with three NVRTC kernels (per-row inv_rms scratch,
+    /// then per-row grad_x with shared-mem `dot` reduce, then per-col
+    /// grad_w reduce).
     fn rms_norm_backward_device(
         &self,
         upstream: &DeviceHandle,
@@ -2801,7 +2726,6 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
             });
         }
 
-        // Per-row inv_rms.
         let mut inv_rms = vec![0.0_f32; rows];
         for (row, inv_slot) in inv_rms.iter_mut().enumerate() {
             let base = row * hidden;
@@ -2846,16 +2770,14 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         Ok((grad_x, grad_w))
     }
 
-    /// Device-resident backward for `rope(x, cos, sin)`. The
-    /// backward is identical to the forward with `sin` negated:
+    /// The backward is identical to the forward with `sin` negated:
     ///   grad_x = rope_forward(upstream, cos, -sin)
     ///
     /// `cos`/`sin` stay host-side (mirrors `rope` forward — caches are
     /// per-seq and seldom benefit from being device-resident).
     ///
-    /// Default fallback: `readback(upstream) → host neg(sin) →
-    /// cpu_rope_forward → upload`. CUDA overrides with a dedicated NVRTC
-    /// kernel that inlines the sign flip.
+    /// CUDA overrides with a dedicated NVRTC kernel that inlines the sign
+    /// flip.
     fn rope_backward_device(
         &self,
         upstream: &DeviceHandle,
