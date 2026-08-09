@@ -5,21 +5,16 @@ impl Qwen35Model {
         self.lm_head.as_ref().unwrap_or(&self.embed_tokens)
     }
 
-    /// This rank's full-attention query width (`local_q_heads * head_dim`).
-
     pub(crate) fn local_full_attn_q_dim(&self) -> usize {
         self.local_q_heads * self.config.head_dim
     }
 
     /// This rank's GATED q_proj output width: the projection interleaves
     /// `[query; gate]` per head, so each local head contributes `2*head_dim` rows.
-
     pub(crate) fn local_full_attn_q_proj_dim(&self) -> usize {
         self.local_q_heads * self.config.head_dim * 2
     }
 
-    /// This rank's full-attention K/V width (`local_kv_heads * head_dim`).
-    ///
     /// Single source for every full-attn K/V cache / pool size on this rank.
     /// CACHE-IDENTITY INVARIANT (KV replication, kv_heads < world_size): each
     /// rank holds `local_kv_heads == 1` KV head, and ranks in the same replica
@@ -27,19 +22,14 @@ impl Qwen35Model {
     /// AND see the same `normed` hidden states, so their per-rank-local cache rows
     /// are bit-identical. GQA then runs independently per rank against its own
     /// copy — no cross-replica KV exchange is needed or done.
-
     pub(crate) fn local_full_attn_kv_dim(&self) -> usize {
         self.local_kv_heads * self.config.head_dim
     }
-
-    /// This rank's fused gated-delta `[q | k | v]` width.
 
     pub(crate) fn local_linear_qkv_dim(&self) -> usize {
         let qk = 2 * self.local_linear_k_heads * self.config.linear_key_head_dim;
         qk + self.local_linear_v_heads * self.config.linear_value_head_dim
     }
-
-    /// This rank's gated-delta output / z-gate width.
 
     pub(crate) fn local_linear_z_dim(&self) -> usize {
         self.local_linear_v_heads * self.config.linear_value_head_dim
@@ -72,8 +62,6 @@ impl Qwen35Model {
     /// requested draft depth. Snapshot scratch matches [`Self::new_slot_state`]'s
     /// linear-state dims exactly so a snapshot/restore is a straight D2D copy.
     #[allow(dead_code)] // called by the executor spec-slot init in a later increment
-    /// Per-layer bytes of the two linear states, in `linear_state_addrs` order.
-
     pub(crate) fn linear_state_bytes(&self) -> (usize, usize) {
         let c = &self.config;
         (
@@ -141,15 +129,6 @@ impl Qwen35Model {
             u_residual: SliceSlot::default(),
         })
     }
-
-    /// Warm the Qwen FP8 dense DeepGEMM JIT for the CUDA default prefill chunk.
-    ///
-    /// The routed-expert port already uses DSv4's grouped path. The SLO 4096/256
-    /// regression was the divergent dense-projection lane: first request paid
-    /// one DeepGEMM JIT compile per `(M,N,K)` dense FP8 projection shape. Warming
-    /// unique `(rows, cols)` at `M=2048` mirrors the scheduler's CUDA Qwen chunk
-    /// floor and keeps the compile cost out of request TTFT without mutating KV
-    /// or recurrent state.
 
     pub(crate) fn per_slot_kv_bytes(&self) -> (usize, usize, usize, usize) {
         let c = &self.config;
@@ -234,11 +213,6 @@ impl Qwen35Model {
         }
         Ok(planned)
     }
-
-    /// Load a BF16 Qwen3.5/3.6 hybrid dense-or-MoE checkpoint, resolving the TP
-    /// runtime from the environment (single-GPU when no TP env is set).
-    ///
-    /// `max_seq_len` sizes the per-slot full-attn contiguous K/V cache.
 
     pub(crate) fn forward_hidden(
         &self,
@@ -578,11 +552,6 @@ impl Qwen35Model {
         Ok(())
     }
 
-    /// Run prefill or decode for one row. `start_pos` is the absolute position of
-    /// the first token; `tokens` are the new tokens (whole prompt on prefill, one
-    /// token on decode). Advances `slot.seq_len` and the recurrent state. Returns
-    /// the next sampled token + its behavior logprob (`None` for greedy). `ws` is
-    /// the executor's persistent forward workspace (serial forwards share one).
     pub(crate) fn forward_tokens(
         &self,
         slot: &mut Qwen35SlotState,
@@ -710,7 +679,6 @@ impl Qwen35Model {
         Ok(ptr)
     }
 
-    /// Per-slot KV-cache capacity (tokens).
     pub(crate) fn max_seq_len(&self) -> usize {
         self.max_seq_len
     }
@@ -721,14 +689,10 @@ impl Qwen35Model {
         self.spec_draft_tokens
     }
 
-    /// This rank's local full-attention KV head count (= global config on a
-    /// single GPU). Used by the opt-in KV-recall pool sizing + paged kernels.
     pub(crate) fn local_kv_heads(&self) -> usize {
         self.local_kv_heads
     }
 
-    /// This rank's local full-attention query head count (= global config on a
-    /// single GPU). Used by the opt-in KV-recall scoring + paged kernels.
     pub(crate) fn local_q_heads(&self) -> usize {
         self.local_q_heads
     }

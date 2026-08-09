@@ -35,29 +35,17 @@ pub(crate) struct Qwen35Workspace {
 
 #[derive(Default)]
 pub(crate) struct FullAttnScratch {
-    /// Fused `[q; k; v]` GEMM output, split into `q_full`/`k_batch`/`v_batch`.
     pub(crate) qkv_fused: HiddenSlot,
     pub(crate) q_full: HiddenSlot,
     pub(crate) k_batch: HiddenSlot,
     pub(crate) v_batch: HiddenSlot,
     pub(crate) q_prepped: HiddenSlot,
     pub(crate) attn_heads: HiddenSlot,
-    /// FA3 prefill scratch (`--qwen35-fa3`): fp32 softmax LSE
-    /// `[local_q_heads * seq_len]` (write-only output of the fwd kernel) and
-    /// the persistent-scheduler semaphore (1 i32, zeroed by the shim per
-    /// launch).
     pub(crate) fa3_lse: SliceSlot<f32>,
-    /// FA3 split scratch: fp32 partial
-    /// outputs `[splits, b=1, local_q_heads, seq_len, head_dim]`.
     pub(crate) fa3_oaccum: SliceSlot<f32>,
-    /// FA3 split-decode scratch: fp32 partial LSE
-    /// `[splits, b=1, local_q_heads, seq_len]`.
     pub(crate) fa3_lseaccum: SliceSlot<f32>,
     pub(crate) fa3_semaphore: SliceSlot<i32>,
-    /// Batched split-KV decode scratch for full attention:
-    /// `[B, local_q_heads, QWEN35_BATCHED_DECODE_KV_SPLITS, head_dim]`.
     pub(crate) batch_partial_out: SliceSlot<f32>,
-    /// `[B, local_q_heads, QWEN35_BATCHED_DECODE_KV_SPLITS]`.
     pub(crate) batch_partial_m: SliceSlot<f32>,
     pub(crate) batch_partial_l: SliceSlot<f32>,
 }
@@ -79,22 +67,16 @@ pub(crate) struct Qwen35RecallForward<'a> {
 
 #[derive(Default)]
 pub(crate) struct LinearAttnScratch {
-    /// Staging for the batched spec-capture copies.
     pub(crate) capture_copy: Qwen35CopyScratch,
-    /// Fused `[qkv; z]` GEMM output, split into `qkv`/`z`.
     pub(crate) qkvz: HiddenSlot,
     pub(crate) qkv: HiddenSlot,
     pub(crate) z: HiddenSlot,
-    /// Fused `[b; a]` GEMM output (`[2*Vh, S]`), split into `b_proj`/`a_proj`.
     pub(crate) ba: HiddenSlot,
     pub(crate) b_proj: HiddenSlot,
     pub(crate) a_proj: HiddenSlot,
     pub(crate) qkv_conv: HiddenSlot,
     pub(crate) gdr_out: HiddenSlot,
     pub(crate) normed_out: HiddenSlot,
-    /// FlashQLA chunked-prefill scratch (`--qwen35-gdr-chunked`), all
-    /// token-major dense: q/k `[S, Hg, 128]` bf16 l2norm'd, v `[S, H, 128]`
-    /// bf16, a_inv `[S, H, 64]` bf16, g/g_cumsum/beta `[S, H]` f32.
     pub(crate) fq_q: HiddenSlot,
     pub(crate) fq_k: HiddenSlot,
     pub(crate) fq_v: HiddenSlot,
@@ -102,7 +84,6 @@ pub(crate) struct LinearAttnScratch {
     pub(crate) fq_g: SliceSlot<f32>,
     pub(crate) fq_g_cumsum: SliceSlot<f32>,
     pub(crate) fq_beta: SliceSlot<f32>,
-    /// `[5B]` pointer table + `[B]` row lengths for the batched multi-row core.
     pub(crate) batch_ptrs: SliceSlot<u64>,
     pub(crate) batch_len: SliceSlot<i32>,
     pub(crate) batch_host: Vec<u64>,
@@ -147,7 +128,6 @@ impl Qwen35Workspace {
         Self::default()
     }
 
-    /// Buffer-address generation (see the `epoch` field).
     pub(crate) fn epoch(&self) -> u64 {
         self.epoch
     }
@@ -242,24 +222,12 @@ impl Qwen35Workspace {
 /// when the row→slot mapping changes (monolith `TileLangDecodeMetadata.update`
 /// pattern).
 pub(crate) struct Qwen35BatchDecodeState {
-    /// Dedicated `[*, B]`-shaped forward workspace (see struct docs).
     pub(crate) ws: Qwen35Workspace,
-    /// Per-row absolute start positions (`[B]` i32), staged once per step;
-    /// batched full-attention kernels read the device array directly.
     pub(crate) positions: SliceSlot<i32>,
-    /// Per-row KV lengths after appending the decode token (`positions + 1`).
     pub(crate) seq_lens: SliceSlot<i32>,
-    /// Per-FULL-layer `[num_slots]` u64 device tables of K/V cache pointers
-    /// (`Half** [B] -> [local_kv_heads, max_seq_len, head_dim]`). The batched
-    /// full-attn kernel writes the current row and reads the prefix through
-    /// these pointers.
     pub(crate) full_k_cache_ptrs: Vec<CudaSlice<u64>>,
     pub(crate) full_v_cache_ptrs: Vec<CudaSlice<u64>>,
-    /// Per-LINEAR-layer `[num_slots]` u64 device tables of conv-ring pointers
-    /// (`Half** [B] -> [C, K-1]` as `conv1d_decode_batch_cuda` consumes them).
     pub(crate) conv_state_ptrs: Vec<CudaSlice<u64>>,
-    /// Per-LINEAR-layer `[num_slots]` u64 device tables of GDR-state pointers
-    /// (`float** [B] -> [Vh, Kd, Vd]` as `gdr_decode_batch_cuda` consumes them).
     pub(crate) gdr_state_ptrs: Vec<CudaSlice<u64>>,
     /// Host staging vecs for the table uploads (monolith pattern: one
     /// `memcpy_htod` per layer per table, no per-row H2D).
@@ -267,11 +235,8 @@ pub(crate) struct Qwen35BatchDecodeState {
     pub(crate) gdr_host: Vec<u64>,
     pub(crate) full_k_host: Vec<u64>,
     pub(crate) full_v_host: Vec<u64>,
-    /// Row→slot mapping the tables were last staged for (empty = never).
     pub(crate) staged_slot_indices: Vec<usize>,
-    /// Batched logits `[vocab, B]` (final norm + lm_head GEMM over all rows).
     pub(crate) logits_batch: HiddenSlot,
-    /// Batched greedy argmax outputs `[B]` i32.
     pub(crate) argmax: SliceSlot<i32>,
 }
 

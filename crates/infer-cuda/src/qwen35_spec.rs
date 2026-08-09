@@ -28,7 +28,7 @@ impl Qwen35Model {
         let mut emb = HiddenStates::zeros(&self.ctx, hidden, 1)?;
         embedding_batch(&self.ctx, &self.embed_tokens, &token_ids, &mut emb)?;
 
-        // embedding first — matches the Metal `qwen3_5_mtp` loader order.
+        // Matches the Metal `qwen3_5_mtp` loader order.
         let mut concat = HiddenStates::zeros(&self.ctx, 2 * hidden, 1)?;
         let mut emb_n = HiddenStates::zeros(&self.ctx, hidden, 1)?;
         rms_norm_offset(&self.ctx, &emb, &mtp.pre_fc_norm_embedding, eps, &mut emb_n)?;
@@ -51,7 +51,7 @@ impl Qwen35Model {
         let mut h_fc = HiddenStates::zeros(&self.ctx, hidden, 1)?;
         gemm_batch(&self.ctx, &mtp.fc, &concat, &mut h_fc)?;
 
-        // mirrors the trunk layer body.
+        // Mirrors the trunk layer body.
         let layer = &mtp.layer;
         let Qwen35Attn::Full(full_attn) = &layer.attn else {
             unreachable!("MTP head layer is always full attention");
@@ -60,7 +60,7 @@ impl Qwen35Model {
         let mut normed = HiddenStates::zeros(&self.ctx, hidden, 1)?;
         rms_norm_offset(&self.ctx, &h_fc, &layer.input_layernorm, eps, &mut normed)?;
 
-        // Local position within the fresh draft block (== head-KV row + RoPE pos).
+        // level == head-KV row == RoPE position within the draft block.
         let start_pos_dev = upload_i32(&self.ctx, &[level as i32])?;
         let mut attn_out = HiddenStates::zeros(&self.ctx, hidden, 1)?;
         self.full_attention_into(
@@ -109,7 +109,7 @@ impl Qwen35Model {
         let mut h_layer = HiddenStates::zeros(&self.ctx, hidden, 1)?;
         add_batch(&self.ctx, &hidden_mid, &mlp_out, &mut h_layer)?;
 
-        // SHARED lm_head (same weights as trunk).
+        // Same weights as the trunk lm_head.
         rms_norm_offset(&self.ctx, &h_layer, &mtp.norm, eps, &mut normed)?;
         let vocab = self.output_projection().rows;
         let mut logits = HiddenStates::zeros(&self.ctx, vocab, 1)?;
@@ -166,38 +166,22 @@ impl Qwen35Model {
         Ok((next, h_out))
     }
 
-    /// One depth-`depth` NextN-MTP speculative decode step (single CHAIN).
+    /// NextN-MTP speculative decode step (single chain).
     ///
-    /// Drafts a `depth`-token chain with the MTP head (each level autoregressive
-    /// on the previous level's head hidden), verifies `[pending, d1..dD]` in a
-    /// SINGLE trunk forward, accepts, and commits the accepted drafts + the
-    /// trunk's bonus. Greedy rows (`params.is_greedy()`) accept the longest
-    /// prefix whose draft token equals the trunk's argmax at that row (STRICT,
-    /// k=1 top-1 match) — **token-exact to greedy no-spec decode** (every
-    /// committed token is a trunk argmax); the correctness gate is spec greedy
-    /// ≡ no-spec greedy (MoE non-determinism caveat applies to the 35B/27B MoE
-    /// shapes). Sampled rows draft by device multinomial from the filtered head
-    /// dist (q retained per level) and accept by chain rejection sampling
-    /// ([`Self::mtp_accept_commit_sampled`]) — committed tokens are distributed
-    /// exactly as filtered target sampling. A single chain (no sibling
-    /// branching) keeps the 48 gated-delta linear layers' sequential recurrence
-    /// correct; tree/top-k acceptance is a later, lossy increment.
+    /// Correctness: greedy rows accept the longest prefix whose draft equals the
+    /// trunk's argmax — token-exact to no-spec greedy. Sampled rows accept by
+    /// chain rejection sampling; committed tokens distribute exactly as filtered
+    /// target sampling.
     ///
-    /// State contract (caller threads `pending`/`hidden` across steps):
-    /// - `pending`: the last already-emitted token, (re)written into the KV at
-    ///   `start_pos` by the verify (its KV is not yet materialized).
-    /// - `hidden`: the trunk hidden that PRODUCED `pending` — the head's level-0
-    ///   seed (matches Metal `prepare_draft_block_mtp` + DSv4 `spec.hidden`).
+    /// State contract:
+    /// - `pending`: last emitted token, written into KV at `start_pos` by verify.
+    /// - `hidden`: trunk hidden that produced `pending` — the head's level-0 seed.
     /// - entry invariant: `slot.seq_len() == start_pos`.
     ///
-    /// Returns `(emitted_tokens, next_pending, next_hidden)` with `k` = accepted
-    /// draft count: emitted `[d1..dk, bonus]` (k+1 tokens); next_pending = bonus;
-    /// next_hidden = the verify hidden of accepted row `k`. seq_len → `start_pos+k+1`.
-    /// On full accept (`k==depth`) the verify already left the trunk state correct;
-    /// on partial accept the trunk linear state is rolled back to post-`[pending,
-    /// d1..dk]` via the pre-verify snapshot + a `(k+1)`-token replay (the full-attn
-    /// KV self-heals via the seq_len rewind).
-
+    /// Returns `(emitted, bonus, next_hidden)`: emitted = `[d1..dk, bonus]`,
+    /// `k` = accepted draft count. On partial accept the trunk linear state
+    /// rolls back via the pre-verify snapshot + a `(k+1)`-token linear replay;
+    /// the full-attn KV self-heals under the seq_len rewind.
     pub(crate) fn spec_step(
         &self,
         slot: &mut Qwen35SlotState,
@@ -228,8 +212,6 @@ impl Qwen35Model {
         let hidden_size = self.config.hidden_size;
         let mut pt = mtp_phase_start(&self.ctx);
 
-        // 1. Draft a depth-token chain: each level feeds the prior level's head
-        //    hidden (autoregressive), starting from (pending, seed hidden).
         let mut h_prev = DeviceVec::zeros(&self.ctx, hidden_size)?;
         self.ctx
             .stream
@@ -246,14 +228,11 @@ impl Qwen35Model {
         }
         let draft_ms = mtp_phase_lap(&self.ctx, &mut pt);
 
-        // 2. Snapshot the trunk linear state BEFORE the verify (partial-accept base).
         spec.snapshot_trunk(&self.ctx, slot)?;
         let snap_ms = mtp_phase_lap(&self.ctx, &mut pt);
 
-        // 3. Verify the whole chain in ONE trunk forward → per-row logits + hiddens.
-        //    Advances the full-attn KV + 48 linear states by depth+1 tokens, and
-        //    captures each linear layer's gated-delta inputs for ALL depth+1 rows
-        //    (the cheap partial-accept replay reads them; see step 5).
+        // Captures each linear layer's gated-delta inputs for all depth+1 rows
+        // so the partial-accept replay can re-advance only the linear state.
         let (logits, dims, hiddens) = self.forward_tokens_verify(
             slot,
             ws,
@@ -269,10 +248,6 @@ impl Qwen35Model {
         );
         let verify_ms = mtp_phase_lap(&self.ctx, &mut pt);
 
-        // 4+5. Accept + commit, rolling the trunk back on partial accept (the
-        //    verify over-advanced by depth+1 > k+1). Greedy: longest prefix
-        //    where the draft == the trunk's argmax at that row. Sampled: chain
-        //    rejection sampling over the shared-filter p/q dists.
         let (emitted, bonus, k) = if params.is_greedy() {
             let mut k = 0usize;
             let bonus;
@@ -285,7 +260,7 @@ impl Qwen35Model {
                     break;
                 }
             }
-            // Greedy: delta policy, no behavior logprob (P6 sidecar skips greedy).
+            // Greedy: delta policy, no behavior logprob.
             let mut emitted: Vec<CommittedToken> =
                 chain[1..=k].iter().map(|&t| (t, None)).collect();
             emitted.push((bonus, None));
@@ -301,7 +276,6 @@ impl Qwen35Model {
                 self.replay_linear_only(slot, ws, &spec.capture, k)?;
                 slot.set_seq_len(start_pos + k + 1);
             }
-            // else k==depth: verify already left seq_len=start_pos+depth+1, state correct.
             (emitted, bonus, k)
         } else {
             self.mtp_accept_commit_sampled(slot, spec, ws, &chain, &logits, start_pos, params)?
@@ -325,18 +299,10 @@ impl Qwen35Model {
         Ok((emitted, bonus, next_hidden))
     }
 
-    /// Rejection-sampling twin of the greedy accept scan in [`Self::spec_step`]
-    /// — the port of [`Self::dspark_accept_commit_sampled`] onto the NextN-MTP
-    /// lane (mirrors flashinfer/SGLang `chain_speculative_sampling`): accept
-    /// `chain[j+1]` with prob min(1, p_j(tok)/q_j(tok)); the first reject
-    /// commits a residual `max(0, p−q)` renormalized draw, full accept a bonus
-    /// draw from the last row. Exactness invariant: p and q pass the SAME
-    /// engine-sampler filter (temp/top_k/top_p/min_p), so committed tokens are
-    /// distributed exactly as filtered target sampling. Identical rollback set
-    /// to the greedy path: `restore_trunk` + `replay_linear_only` +
-    /// `set_seq_len` (the full-attn KV self-heals under the caller's seq
-    /// rewind / pool truncate). Returns `(emitted-with-logprobs, bonus, k)`.
-
+    /// Chain rejection sampling for the sampled spec path.
+    ///
+    /// Exactness invariant: p and q pass the same engine-sampler filter, so
+    /// committed tokens distribute exactly as filtered target sampling.
     pub(crate) fn mtp_accept_commit_sampled(
         &self,
         slot: &mut Qwen35SlotState,
@@ -355,8 +321,7 @@ impl Qwen35Model {
             "mtp sampled verify: depth {depth} > head cap {cap}"
         );
         let vocab = self.output_projection().rows;
-        // Uniform streams at pos = start_pos + j + 1 (identical to the host
-        // path's per-step draws — position-salted, so batching changes nothing).
+        // Position-salted: identical to the host path's per-step draws.
         let pos = |j: usize| (start_pos + j + 1) as u64;
         let u_acc: Vec<f32> = (0..depth)
             .map(|j| dspark::unit_uniform(params.seed, dspark::SALT_ACCEPT, pos(j)))
@@ -434,9 +399,8 @@ impl Qwen35Model {
         );
         let mut tokens: Vec<u32> = chain[1..=k].to_vec();
         tokens.push(bonus);
-        // Behavior logprobs: committed token j is marginally distributed as the
-        // filtered target dist p_j (chain rejection-sampling exactness), and the
-        // p rows are still materialized + final (verdict D2H synced above).
+        // Committed token j distributes as the filtered target dist p_j;
+        // p rows are final (verdict D2H synced above).
         let logprobs = chain_commit_logprobs(ctx, p_all, vocab, &tokens)?;
         let emitted = tokens
             .into_iter()
@@ -452,14 +416,12 @@ impl Qwen35Model {
     }
 }
 
-/// Spec-decode phase attribution: returns `Some(Instant)` only when
-/// `ARLE_MTP_PHASE` is set (the per-phase sync needed for accurate GPU timing is
-/// opt-in, so the default spec-decode path pays nothing).
+/// Opt-in phase timing (set `ARLE_MTP_PHASE`); the per-phase sync needed for
+/// accurate GPU timing is off by default so the hot path pays nothing.
 pub(crate) fn mtp_phase_start(ctx: &DeviceContext) -> Option<std::time::Instant> {
     phase_start(ctx, "ARLE_MTP_PHASE")
 }
 
-/// Same opt-in phase timer keyed on `ARLE_DSPARK_PHASE` (DSpark block step).
 pub(crate) fn dspark_phase_start(ctx: &DeviceContext) -> Option<std::time::Instant> {
     phase_start(ctx, "ARLE_DSPARK_PHASE")
 }
@@ -473,7 +435,6 @@ pub(crate) fn phase_start(ctx: &DeviceContext, var: &str) -> Option<std::time::I
     }
 }
 
-/// Sync + return ms since the last lap (or 0.0 when phase timing is off).
 pub(crate) fn mtp_phase_lap(ctx: &DeviceContext, t: &mut Option<std::time::Instant>) -> f64 {
     match t {
         Some(prev) => {
@@ -487,12 +448,9 @@ pub(crate) fn mtp_phase_lap(ctx: &DeviceContext, t: &mut Option<std::time::Insta
     }
 }
 
-/// log p_filtered of each committed chain token, read from the materialized
-/// filtered `p` rows (`dspark_filter_probs_cuda` output; row j produced
-/// `tokens[j]`). Caller contract: the accept verdict's D2H + sync already ran,
-/// so the rows are final and these 4-byte reads add no new sync. Committed
-/// tokens always carry filtered mass > 0; the floor clamp only guards f32
-/// underflow at `ln`.
+/// log p_filtered of each committed chain token from the materialized `p` rows.
+/// Caller must have synced the accept verdict D2H so the rows are final.
+/// The floor clamp guards f32 underflow at `ln`.
 pub(crate) fn chain_commit_logprobs(
     ctx: &DeviceContext,
     p_all: &CudaSlice<f32>,
@@ -513,7 +471,7 @@ pub(crate) fn chain_commit_logprobs(
         .collect()
 }
 
-/// Offset RMSNorm (1+weight) over a batch — Qwen3.5 norms store `weight - 1`.
+/// Offset RMSNorm: Qwen3.5 norms store `weight - 1`, so apply `1 + weight`.
 pub(crate) fn rms_norm_offset(
     ctx: &DeviceContext,
     x: &HiddenStates,
@@ -540,7 +498,7 @@ pub(crate) fn rms_norm_offset(
     Ok(())
 }
 
-/// Offset RMSNorm (1+weight) over a single vector (the final norm before lm_head).
+/// Offset RMSNorm over a single vector (final norm before lm_head).
 pub(crate) fn rms_norm_offset_vec(
     ctx: &DeviceContext,
     x: &DeviceVec,

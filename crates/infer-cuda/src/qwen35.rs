@@ -240,9 +240,7 @@ pub(crate) struct Qwen35Layer {
 }
 
 pub(crate) struct Qwen35MtpHead {
-    /// RMSNorm over the candidate token embedding, pre-`fc`.
     pre_fc_norm_embedding: DeviceVec,
-    /// RMSNorm over the previous-step trunk hidden, pre-`fc`.
     pre_fc_norm_hidden: DeviceVec,
     /// Concat projection `[hidden, 2*hidden]` mapping the two normed inputs to
     /// the transformer-block input.
@@ -274,9 +272,7 @@ pub(crate) struct Qwen35Model {
     local_kv_heads: usize,
     local_linear_k_heads: usize,
     local_linear_v_heads: usize,
-    /// This rank's EP expert ownership (every expert local on a single GPU).
     expert_split: ExpertSplit,
-    /// Per-slot cache capacity (full-attn contiguous cache rows).
     max_seq_len: usize,
     /// NextN-MTP draft head for speculative decode. `Some` (and
     /// `spec_draft_tokens > 0`) only when the constructor was asked to load it;
@@ -284,7 +280,6 @@ pub(crate) struct Qwen35Model {
     /// byte-identical when spec-decode is off.
     #[allow(dead_code)] // read by the spec-decode draft/verify path (next increment)
     mtp: Option<Qwen35MtpHead>,
-    /// Requested MTP draft depth (`0` = spec-decode off).
     #[allow(dead_code)] // read by the spec-decode orchestrator (next increment)
     spec_draft_tokens: usize,
     /// Host-resident weight snapshot while the engine is offloaded for the OPD
@@ -339,7 +334,6 @@ struct OffloadedDenseMlp {
     down_proj: HostMatrixSnapshot,
 }
 
-/// Host snapshot of a full-attention block (mirrors [`FullAttn`]).
 struct OffloadedFullAttn {
     qkv_proj: HostMatrixSnapshot,
     o_proj: HostMatrixSnapshot,
@@ -347,7 +341,6 @@ struct OffloadedFullAttn {
     k_norm: Vec<bf16>,
 }
 
-/// Host snapshot of a gated-delta linear-attention block (mirrors [`LinearAttn`]).
 struct OffloadedLinearAttn {
     in_proj_qkvz: HostMatrixSnapshot,
     in_proj_ba: HostMatrixSnapshot,
@@ -537,7 +530,6 @@ mod tests {
         validate_qwen35_cuda_config(&cfg).unwrap();
     }
 
-    /// First index where two token streams differ (or the shorter length).
     fn first_divergence(a: &[u32], b: &[u32]) -> usize {
         a.iter()
             .zip(b.iter())
@@ -629,7 +621,6 @@ mod tests {
                 .unwrap();
             let mut spec = model.new_spec_slot_state().unwrap();
             let mut ws = Qwen35Workspace::new();
-            // Prefill returns the next token's logits + the producing hidden.
             let (logits, dims, mut hidden) = model
                 .forward_tokens_with_hidden(&mut slot, &mut ws, &prompt, 0, None)
                 .unwrap();
@@ -770,7 +761,6 @@ mod tests {
 
         let reference = host_merge_reference(&base, &a, &b, rows, cols, rank, scale);
 
-        // --- device path (replicates merge_lora_proj_device) ---
         // A transposed to [cols, rank] row-major: a_t[c*rank+k] = a[k*cols+c].
         let mut a_t = vec![bf16::ZERO; cols * rank];
         for k in 0..rank {
@@ -905,7 +895,6 @@ mod tests {
         let max_n = proj_shapes.iter().map(|(r, c)| r * c).max().unwrap();
         let mut delta = DeviceVec::zeros(&ctx, max_n).unwrap();
 
-        // --- HOST triple-loop path (the old merge) ---
         let t0 = std::time::Instant::now();
         for p in &projs {
             let mut merged = vec![bf16::ZERO; p.rows * p.cols];
@@ -924,7 +913,6 @@ mod tests {
         }
         let host_ms = t0.elapsed().as_secs_f64() * 1e3;
 
-        // --- DEVICE path (the new merge) ---
         ctx.sync().unwrap();
         let t1 = std::time::Instant::now();
         for p in &mut projs {

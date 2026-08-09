@@ -344,7 +344,6 @@ impl Qwen35Model {
             let names = m.layer_tensor_names(layer_idx);
             let attn_t0 = Instant::now();
             let attn = match &names.attention {
-                // Single GPU: full tensors, byte-identical to the pre-TP path.
                 Qwen35AttentionTensorNames::Full(full) if tp_cfg.is_single() => {
                     Qwen35Attn::Full(Box::new(FullAttn {
                         qkv_proj: loader.load_matrices_row_fused(
@@ -393,8 +392,6 @@ impl Qwen35Model {
                             ],
                         )?
                     },
-                    // Row-parallel: each rank holds the o_proj input columns of
-                    // its own heads; the forward all-reduces the partial sums.
                     o_proj: loader.load_matrix_sharded_quant_aware(
                         &ctx,
                         &full.o_proj,
@@ -470,7 +467,6 @@ impl Qwen35Model {
                             )?;
                             DeviceMatrix::fuse_rows(&ctx, &b, &a)?
                         },
-                        // Depthwise conv: channel rows mirror the qkv block shard.
                         conv1d_weight: load_conv1d_sharded(
                             &loader,
                             &ctx,
@@ -496,8 +492,6 @@ impl Qwen35Model {
                         // rms_norm_gated (norm.cu `weight[tid]`) — replicated,
                         // matching the qwen35-spec Shard contract.
                         norm_weight: loader.load_f32_vec(&ctx, &lin.norm)?,
-                        // Row-parallel: input columns follow this rank's v heads;
-                        // the forward all-reduces the partial sums.
                         out_proj: loader.load_matrix_sharded_quant_aware(
                             &ctx,
                             &lin.out_proj,
@@ -692,7 +686,6 @@ impl Qwen35Model {
 
         let mut blocks = Vec::with_capacity(self.layers.len());
         for layer in &mut self.layers {
-            // (MoE guard hoisted to the preflight above — no mid-loop bail.)
             let (input_layernorm, in_ln_n) = layer.input_layernorm.offload_to_host(&ctx)?;
             let (post_attention_layernorm, post_ln_n) =
                 layer.post_attention_layernorm.offload_to_host(&ctx)?;
