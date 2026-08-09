@@ -1,6 +1,6 @@
 # DFlash draft norms used the target model convention
 
-> Status: pending-remote
+> Status: Fixed
 
 ## Context
 
@@ -25,8 +25,11 @@ Restore plain `rms_norm_batch` for the draft feature norm, two layer norms, and
 final norm in both single-slot and batched draft paths. This is seven call
 sites and one existing import; no new path or configuration is added.
 
-Pending remote: CUDA release build, concurrent needle c=2/8/16 x3, acceptance
-recovery, and the canonical baseline sweep.
+Remote CUDA release build passed. Concurrent needle c=2/8/16 x3 passed 78/78
+exact with zero misses. The canonical sweep completed 128/128 at every point;
+acceptance was 26.90-27.81% at c=2-16, recovering from 0.334%. The accepted
+baseline is recorded in
+[`2026-08-10-qwen36-27b-corrected-baseline.md`](../wins/2026-08-10-qwen36-27b-corrected-baseline.md).
 
 ## Rule
 
