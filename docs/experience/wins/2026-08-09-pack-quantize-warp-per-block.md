@@ -82,14 +82,17 @@ a sentinel first and checks that rows past an expert's count are untouched.
 TEMPLATE=qwen3_nonthink NEEDLE_MAX_TOKENS=64`, ThinkingCap-27B-FP8, 3 runs/rung,
 both arms:
 
-| rung | 115 | 300 | 446 | 2000 | 8000 |
+| rung (prompt tok) | 115 (149) | 300 (314) | 446 (453) | 2000 (1989) | 8000 (8129) |
 |---|---|---|---|---|---|
-| BASE | 3/0/0 DET | 3/0/0 DET | 3/0/0 DET | 3/0/0 DET | 3/0/0 DET |
-| NEW | 3/0/0 DET | 3/0/0 DET | 3/0/0 DET | 3/0/0 DET | 3/0/0 DET |
+| BASE `a37d9cca5` | 3/0/0 DET | 3/0/0 DET | 3/0/0 DET | 3/0/0 DET | 3/0/0 DET |
+| 4/lane `554173b36` | 3/0/0 DET | 3/0/0 DET | 3/0/0 DET | 3/0/0 DET | 3/0/0 DET |
+| **8/lane `5cfe8494f`** | 3/0/0 DET | 3/0/0 DET | 3/0/0 DET | 3/0/0 DET | 3/0/0 DET |
 
-`GATE_EXIT=0` on both, every run emitting the identical needle. The short rungs
-that straddle the 241-token boundary are included, and they are the ones this
-change could plausibly break through the ragged `max_m`.
+`GATE_EXIT=0` on all three, every run emitting the identical `738291`. The short
+rungs that straddle the 241-token boundary are included, and they are the ones
+this change could plausibly break through the ragged `max_m`. The 8/lane serve
+log confirms the changed kernel was exercised rather than a fallback: `Qwen3.5
+FP8 dense DeepGEMM warmed 5 projection shape(s) at M=2048`.
 
 ## Result — anchor A/B, 32K long-agent, c=16
 
