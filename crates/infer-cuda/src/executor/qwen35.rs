@@ -4157,6 +4157,49 @@ mod tier_io_tests {
         (output, state)
     }
 
+    fn error_metrics(reference: &[f32], actual: &[f32], rel_floor: f64) -> String {
+        assert_eq!(reference.len(), actual.len());
+        let mut abs_errors = Vec::with_capacity(reference.len());
+        let mut squared_error = 0.0;
+        let mut max_rel = 0.0f64;
+        let mut dot = 0.0;
+        let mut reference_norm = 0.0;
+        let mut actual_norm = 0.0;
+        let mut non_finite_mismatch = 0;
+        for (&reference, &actual) in reference.iter().zip(actual) {
+            if !reference.is_finite() || !actual.is_finite() {
+                non_finite_mismatch += usize::from(reference.to_bits() != actual.to_bits());
+                continue;
+            }
+            let reference = f64::from(reference);
+            let actual = f64::from(actual);
+            let abs = (reference - actual).abs();
+            abs_errors.push(abs);
+            squared_error += abs * abs;
+            max_rel = max_rel.max(abs / reference.abs().max(rel_floor));
+            dot += reference * actual;
+            reference_norm += reference * reference;
+            actual_norm += actual * actual;
+        }
+        abs_errors.sort_unstable_by(f64::total_cmp);
+        let max_abs = abs_errors.last().copied().unwrap_or(0.0);
+        let p99_index = (99 * abs_errors.len()).div_ceil(100).saturating_sub(1);
+        let p99_abs = abs_errors.get(p99_index).copied().unwrap_or(0.0);
+        let rmse = (squared_error / abs_errors.len().max(1) as f64).sqrt();
+        let cosine = if reference_norm == 0.0 && actual_norm == 0.0 {
+            1.0
+        } else if reference_norm == 0.0 || actual_norm == 0.0 {
+            0.0
+        } else {
+            dot / (reference_norm * actual_norm).sqrt()
+        };
+        format!(
+            "max_abs={max_abs:.9e} p99_abs={p99_abs:.9e} rmse={rmse:.9e} \
+             max_rel={max_rel:.9e} rel_floor={rel_floor:.1e} cosine={cosine:.9} \
+             non_finite_mismatch={non_finite_mismatch}"
+        )
+    }
+
     fn format_gdr_case(
         name: &str,
         captures: &[crate::qwen35::gdr_probe::Capture],
@@ -4170,6 +4213,20 @@ mod tier_io_tests {
             let (reference_output, reference_state) = replay_gdr(capture);
             assert_eq!(capture.output.len(), reference_output.len());
             assert_eq!(capture.post_state.len(), reference_state.len());
+
+            let output_metrics = error_metrics(
+                &reference_output
+                    .iter()
+                    .map(|value| value.to_f32())
+                    .collect::<Vec<_>>(),
+                &capture
+                    .output
+                    .iter()
+                    .map(|value| value.to_f32())
+                    .collect::<Vec<_>>(),
+                1e-6,
+            );
+            let state_metrics = error_metrics(&reference_state, &capture.post_state, 1e-9);
 
             let output_mismatch = reference_output
                 .iter()
@@ -4209,7 +4266,7 @@ mod tier_io_tests {
             passed &= segment_passed;
             writeln!(
                 report,
-                "case={name} segment={segment} cursor={}..{} rows={} vheads={} kd={} vd={} output_ulp<=8={} state_abs<1e-3={} first_mismatch={}",
+                "case={name} segment={segment} cursor={}..{} rows={} vheads={} kd={} vd={} output_ulp<=8={} state_abs<1e-3={} output_{output_metrics} state_{state_metrics} first_mismatch={}",
                 cursor,
                 cursor + capture.seq_len,
                 capture.seq_len,
@@ -4231,10 +4288,11 @@ mod tier_io_tests {
     fn qwen35_paged_prefill_gdr_parity() {
         let out_path = std::env::var("INFER_QWEN35_GDR_PROBE_OUT")
             .expect("INFER_QWEN35_GDR_PROBE_OUT must name the report path");
-        let model_path = "/tmp/Qwen3.6-27B-W4A16-fixed-d68879e";
+        let model_path = std::env::var("INFER_QWEN35_GDR_MODEL_PATH")
+            .unwrap_or_else(|_| "/tmp/Qwen3.6-27B-W4A16-fixed-d68879e".to_string());
         let total_pages = 16;
         let mut executor = Qwen35CudaExecutor::from_qwen35_safetensors(
-            model_path,
+            &model_path,
             2,
             total_pages,
             total_pages * SUPPORTED_PAGE_SIZE,
