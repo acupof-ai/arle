@@ -102,7 +102,7 @@ __global__ void silu_mul_fused_kernel(
     __nv_bfloat162 u67 = *reinterpret_cast<__nv_bfloat162*>(&u.w);
 
     auto silu_mul = [](float gate, float up) -> __nv_bfloat16 {
-        float s = gate / (1.0f + __expf(-gate));
+        float s = gate / (1.0f + expf(-gate));
         return __float2bfloat16(s * up);
     };
 

@@ -19,7 +19,7 @@ __device__ __forceinline__ __nv_bfloat16 silu_mul_one(__nv_bfloat16 gate,
                                                        __nv_bfloat16 up) {
   float g = __bfloat162float(gate);
   float u = __bfloat162float(up);
-  float silu = g / (1.0f + __expf(-g));
+  float silu = g / (1.0f + expf(-g));
   return __float2bfloat16(silu * u);
 }
 
@@ -27,7 +27,7 @@ __device__ __forceinline__ __nv_bfloat16 dsv4_swiglu_one(
     __nv_bfloat16 gate, __nv_bfloat16 up, float limit) {
   float g = fminf(__bfloat162float(gate), limit);
   float u = fminf(fmaxf(__bfloat162float(up), -limit), limit);
-  float silu = g / (1.0f + __expf(-g));
+  float silu = g / (1.0f + expf(-g));
   return __float2bfloat16(silu * u);
 }
 
