@@ -36,13 +36,10 @@ mod tests {
 
     #[test]
     fn key_batch_is_one_and_pages_round_up() {
-        // page_size=16: 0 prior tokens → total 1 token → 1 page.
         let k0 = decode_graph_key_for(16, 0);
         assert_eq!(k0.batch_size, DECODE_GRAPH_BATCH);
         assert_eq!(k0.num_pages, 1);
-        // 14 prior → total 15 → still 1 page.
         assert_eq!(decode_graph_key_for(16, 14).num_pages, 1);
-        // 15 prior → total 16 → exactly 1 page (no spillover yet).
         assert_eq!(decode_graph_key_for(16, 15).num_pages, 1);
     }
 
@@ -51,8 +48,8 @@ mod tests {
         // The recapture trigger: when total length crosses a page_size boundary the
         // num_pages key increments, so the bucket misses the old graph and captures
         // a new one for the longer page-table walk.
-        let before = decode_graph_key_for(16, 15); // total 16 → 1 page
-        let after = decode_graph_key_for(16, 16); // total 17 → 2 pages
+        let before = decode_graph_key_for(16, 15);
+        let after = decode_graph_key_for(16, 16);
         assert_eq!(before.num_pages, 1);
         assert_eq!(after.num_pages, 2);
         assert_ne!(
@@ -83,10 +80,8 @@ mod tests {
             let key = decode_graph_key_for(16, kv_seq_len);
             *seen.entry(key.num_pages).or_insert(0) += 1;
         }
-        // kv_seq_len 0..=63 → total length 1..=64 → page counts 1..=4 (64/16 = 4).
         assert_eq!(seen.keys().min().copied(), Some(1));
         assert_eq!(seen.keys().max().copied(), Some(4));
-        // Each of the 4 page counts covers exactly 16 of the 64 steps.
         assert!(seen.values().all(|&c| c == 16), "even split: {seen:?}");
     }
 }

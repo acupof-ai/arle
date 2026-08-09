@@ -54,10 +54,7 @@ safetensors = { workspace = true, optional = true }
 half = { version = "2", optional = true }
 
 [features]
-# No backend defaulted, mirroring the legacy `infer` crate: callers pick one.
-#   --features cuda            Linux + NVIDIA
-#   --features metal,no-cuda   Apple Silicon
-#   --features cpu,no-cuda     portable smoke / CI
+# No backend defaulted, mirroring the legacy `infer` crate.
 default = []
 # CUDA backend (structurally wired; the real forward is Phase-0 / lead-owned).
 # Pulls `cuda-kernels` + `cudarc` for the OPD-teacher `RawLogits` device surface.
@@ -72,13 +69,11 @@ cuda = [
 ]
 # Marker feature for builds without a CUDA toolchain (macOS, dev CI).
 no-cuda = ["infer-cuda?/no-cuda", "cuda-kernels?/no-cuda"]
-# Metal backend via infer-metal (Apple Silicon).
 metal = ["dep:infer-metal", "infer-metal/metal"]
-# HIP backend via infer-hip (AMD ROCm, DSv4 GGUF). infer-server has no
-# hip-specific code, so no infer-server feature is forwarded (unlike metal).
+# infer-server has no hip-specific code, so no infer-server feature is forwarded
+# (unlike metal).
 hip = ["dep:infer-hip", "infer-hip/hip"]
-# Vulkan backend via infer-vulkan (cross-vendor, Windows lane). infer-server
-# stays backend-neutral; device code is gated below infer-vulkan.
+# infer-server stays backend-neutral; device code is gated below infer-vulkan.
 vulkan = ["dep:infer-vulkan", "infer-vulkan/vulkan"]
 # Portable CPU backend: drives the engine over infer-metal's feature-free
 # host KV pool + the placeholder MetalExecutor (no MLX, no CUDA). Used for
