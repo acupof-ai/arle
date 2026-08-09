@@ -394,6 +394,17 @@ where
             }
         );
         let freed_rollout = if cfg.share_frozen_base {
+            // Weights stay resident (student aliases them), but the inference
+            // scratch (workspace + batched-decode buffers + decode graph) and
+            // the (dead) KV pool are pure headroom — the writeback's fresh
+            // autograd forward never reads them. Release both so the 27B
+            // forward+backward fits.
+            if let Err(err) = student.release_inference_scratch() {
+                eprintln!("[rubric] release inference scratch failed: {err}");
+            }
+            if let Err(err) = student.release_kv_pool() {
+                eprintln!("[rubric] release KV pool failed: {err}");
+            }
             0
         } else {
             student.offload_engine_weights().unwrap_or(0)
@@ -431,6 +442,12 @@ where
         eprintln!("[rubric] round {round} phase-D: reloading engines");
         if !cfg.share_frozen_base {
             student.reload_engine_weights()?;
+        } else {
+            // Weights stayed resident; only the KV pool (released in Phase B)
+            // needs re-acquiring before the next round's rollout.
+            if let Err(err) = student.ensure_kv_pool() {
+                eprintln!("[rubric] ensure KV pool failed: {err}");
+            }
         }
         if let Some(j) = judge {
             j.reload_engine_weights()?;
