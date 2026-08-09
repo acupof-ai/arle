@@ -240,7 +240,6 @@ fn default_norm_topk_prob() -> bool {
     true
 }
 
-/// Controls name remapping and contract checks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HfSchema {
     /// `model.layers.N.*`, plain `q_proj`. Qwen3-0.6B/1.7B/4B.

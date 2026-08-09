@@ -78,7 +78,6 @@ pub fn infer_rollout_flag_enabled() -> bool {
     INFER_ROLLOUT_OVERRIDE.get().copied().unwrap_or(true)
 }
 
-/// `--rollout-engine` selection; unset defaults to `infer`.
 #[cfg(feature = "cuda")]
 static INFER_ROLLOUT_OVERRIDE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 
@@ -121,7 +120,6 @@ impl EngineOffloadMode {
     }
 }
 
-/// OPD engine offload mode (`--engine-offload off|all|student|teacher`).
 #[cfg(feature = "cuda")]
 pub fn engine_offload_mode() -> EngineOffloadMode {
     crate::runtime_flags::engine_offload()
@@ -373,7 +371,6 @@ fn print_backward_profile(
     }
 }
 
-/// Greedy-argmax the last-position row of a `[1, seq_len, vocab]` logits tensor.
 fn greedy_next_token(
     logits_id: TensorId,
     seq_len: usize,
@@ -2921,7 +2918,6 @@ pub enum WritebackLoss<'a> {
     },
 }
 
-/// CE compatibility wrapper.
 pub fn masked_writeback_ce_step<O: Optimizer>(
     student: &Qwen35Model,
     all_model_params: &[TensorId],
