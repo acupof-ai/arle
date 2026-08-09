@@ -177,7 +177,6 @@ impl Qwen35Model {
         // ── Stage pointer tables (no-op when the row→slot mapping is unchanged). ──
         bd.stage_pointer_tables(&self.ctx, slots, slot_indices)?;
 
-        // ── Stage per-step inputs: token ids + per-row absolute positions. ──
         let token_ids_host: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
         let positions_host: Vec<i32> = kv_seq_lens.iter().map(|&len| len as i32).collect();
         let seq_lens_host: Vec<i32> = positions_host.iter().map(|&p| p + 1).collect();
@@ -264,8 +263,6 @@ impl Qwen35Model {
                 }
             }
 
-            // Post-attn residual add + post_attention_layernorm via the
-            // `add_batch` + `rms_norm_offset` pair (`hidden_mid`/`normed`).
             add_batch(&self.ctx, hidden, attn_out, hidden_mid)?;
             rms_norm_offset(
                 &self.ctx,
@@ -300,12 +297,9 @@ impl Qwen35Model {
             // enumeration in the method docs); exact `[hidden, B]` message.
             self.tp.all_reduce_sum(&self.ctx, mlp_out)?;
 
-            // MLP residual add: the post-attn sum lives in `hidden_mid`;
-            // add_batch reads hidden_mid/mlp_out and writes `hidden`.
             add_batch(&self.ctx, hidden_mid, mlp_out, hidden)?;
         }
 
-        // ── Final norm over ALL rows + batched lm_head GEMM. ──
         rms_norm_offset(&self.ctx, hidden, &self.norm, eps, normed)?;
         let logits_buf = logits_batch.get(&self.ctx, vocab, b)?;
         gemm_batch(&self.ctx, self.output_projection(), normed, logits_buf)?;

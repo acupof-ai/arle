@@ -159,10 +159,8 @@ impl Qwen35Model {
         let f32sz = std::mem::size_of::<f32>();
         // Full-attn K/V is paged (shared pool), not per-slot → 0 here.
         let kv_bytes = 0usize;
-        // Gated-delta recurrent state: num_linear × (Vh × Kd × Vd) f32.
         let gdr_len = self.local_linear_v_heads * c.linear_key_head_dim * c.linear_value_head_dim;
         let gdr_bytes = num_linear.saturating_mul(gdr_len).saturating_mul(f32sz);
-        // Conv1d rings: num_linear × (qkv_dim × (kernel-1)) bf16.
         let conv_len = self.local_linear_qkv_dim() * (c.linear_conv_kernel_dim - 1);
         let conv_bytes = num_linear.saturating_mul(conv_len).saturating_mul(bf16);
         let per_slot = kv_bytes
@@ -486,8 +484,6 @@ impl Qwen35Model {
                 }
             }
 
-            // Post-attn residual add + post_attention_layernorm via the
-            // `add_batch` + `rms_norm_offset` pair (`hidden_mid`/`normed`).
             qwen35_profile(
                 &self.ctx,
                 "qwen/post_attn_norm",
@@ -564,7 +560,6 @@ impl Qwen35Model {
                 seq_len,
                 || add_batch(&self.ctx, hidden_mid, mlp_out, hidden),
             )?;
-            // DSpark tap: the residual-stream OUTPUT of this layer.
             if let Some(t) = taps.as_deref_mut() {
                 t.capture(&self.ctx, layer_idx as i64, hidden)?;
             }
