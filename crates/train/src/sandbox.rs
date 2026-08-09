@@ -17,7 +17,6 @@ use anyhow::{Context, Result, anyhow, bail};
 
 use crate::spawner::{SpawnClient, SpawnRequest, SpawnResponse};
 
-/// Build a [`SpawnRequest`] from a `Command` (program/args/cwd/env) for the helper.
 fn request_from_command(
     command: &Command,
     combined_timeout: bool,
@@ -56,20 +55,18 @@ fn spawn_via_helper(
     client.run(&request_from_command(command, combined_timeout, timeout))
 }
 
-/// Captured result of a plain (no-timeout, separate streams) spawn — the subset
-/// of `std::process::Output` the cp/git call sites use.
+/// Subset of `std::process::Output` the cp/git call sites use.
 struct PlainOutput {
     stdout: Vec<u8>,
     stderr: Vec<u8>,
     success: bool,
-    /// Human-readable exit status for error messages.
     status: String,
 }
 
-/// `Command::output()` equivalent, routed through the spawner helper when its env
-/// is set (agent-OPD rollout) and run directly otherwise (byte-identical default).
-/// This is the `combined_timeout=false` path: stdout/stderr stay separate, no
-/// timeout. Covers cp/git (`run_checked`), `git diff`, and `git apply`.
+/// Routed through the spawner helper when its env is set (agent-OPD rollout)
+/// and run directly otherwise (byte-identical default). This is the
+/// `combined_timeout=false` path: stdout/stderr stay separate, no timeout.
+/// Covers cp/git (`run_checked`), `git diff`, and `git apply`.
 fn plain_output(command: &mut Command, label: &str) -> Result<PlainOutput> {
     if let Some(client) = SpawnClient::from_env() {
         let resp = spawn_via_helper(&client, command, false, Duration::ZERO)
@@ -105,8 +102,8 @@ const BASH_OUTPUT_CLIP: usize = 8000;
 /// stays tight, large enough not to spin.
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
-/// Run `command` under a wall-clock `timeout`, isolating it in its own process
-/// group and capturing combined stdout+stderr to a temp file instead of a pipe.
+/// Isolates `command` in its own process group and captures combined
+/// stdout+stderr to a temp file instead of a pipe.
 ///
 /// This fixes a real hang: a tool command that backgrounds a process (`foo &`)
 /// or spawns a child that inherits and holds the stdout pipe makes
@@ -213,9 +210,9 @@ pub(crate) fn run_captured(
     Ok((output, code, killed))
 }
 
-/// `kill -KILL -<pgid>` — signal the whole process group (negative pid). Uses the
-/// `kill` binary to avoid a libc dependency; failure is ignored (the group may be
-/// empty already, which is the common case).
+/// Signal the whole process group (negative pid). Uses the `kill` binary to
+/// avoid a libc dependency; failure is ignored (the group may be empty
+/// already, which is the common case).
 fn kill_group(pgid: i32) {
     // Never signal our own group: a mis-derived pgid must not SIGKILL the
     // caller's session (observed 3× deterministic under `cargo test -p train
@@ -234,9 +231,8 @@ fn kill_group(pgid: i32) {
         .status();
 }
 
-/// Clip a string to `max_chars` keeping HEAD + TAIL. Tests / tracebacks live at
-/// the tail, so both ends are preserved. (Local copy — `tools::clip_middle` is
-/// private.)
+/// Tests / tracebacks live at the tail, so both ends are preserved.
+/// (Local copy — `tools::clip_middle` is private.)
 fn clip_middle(s: &str, max_chars: usize) -> String {
     let total = s.chars().count();
     if total <= max_chars {
@@ -281,9 +277,6 @@ fn format_bash_output(stdout: &[u8], stderr: &[u8], code: Option<i32>, killed: b
     clip_middle(&combined, BASH_OUTPUT_CLIP)
 }
 
-/// Stage a repo tree into a fresh per-task workdir and git-init it so edits can
-/// be diffed.
-///
 /// `staged_tree` is a dir holding the repo already checked out at `base_commit`
 /// (cloning/checkout is the caller's job, out of scope). Copies it into
 /// `work_root/instance_id`, optionally runs `setup_cmd` (e.g. `pip install`) in
@@ -373,8 +366,6 @@ pub fn boot_workdir(
     Ok(workdir)
 }
 
-/// `git -C workdir diff` — the agent's candidate patch (unstaged edits vs the
-/// committed base).
 pub fn diff_workdir(workdir: &Path) -> Result<String> {
     let mut command = Command::new("git");
     command.arg("-C").arg(workdir).arg("diff");
@@ -497,11 +488,10 @@ pub fn score_workdir(
     Ok((reward, log_tail))
 }
 
-/// Parse the LAST pytest `-q` summary line (pytest prints it last) into
-/// `(passed, failed + errored)`. Robust to any subset of
-/// {passed, failed, error(s), skipped, xfailed}: e.g. `"3 passed, 2 failed in
-/// 0.4s"` → `(3, 2)`, `"2 passed, 1 error in 0.3s"` → `(2, 1)`. Returns `None`
-/// when no summary line is present (collection crash / empty output).
+/// Robust to any subset of {passed, failed, error(s), skipped, xfailed}:
+/// e.g. `"3 passed, 2 failed in 0.4s"` → `(3, 2)`,
+/// `"2 passed, 1 error in 0.3s"` → `(2, 1)`. Returns `None` when no summary
+/// line is present (collection crash / empty output).
 fn parse_pytest_counts(text: &str) -> Option<(usize, usize)> {
     let count_of = |line: &str, kind: &str| -> Option<usize> {
         line.split(", ").find_map(|seg| {
@@ -526,7 +516,6 @@ fn parse_pytest_counts(text: &str) -> Option<(usize, usize)> {
     None
 }
 
-/// Run a `Command` and return an error including stderr if it does not exit 0.
 /// Routes through the sandbox-spawner when its env is set (agent-OPD rollout).
 fn run_checked(command: &mut Command, label: &str) -> Result<()> {
     let output = plain_output(command, label)?;
