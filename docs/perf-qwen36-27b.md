@@ -238,23 +238,24 @@ at 48 × 128 = 6144. Six GEMMs per 64-token chunk per CTA:
   / 148 TFLOPS bf16 = 230 ms floor      measured 1708 ms = 13.5% of peak
 ```
 
-**But most of that 1478 ms is not waste.** Two structural limits, both derived,
-neither measured:
+**Most of that 1478 ms remains structurally constrained.** Two limits are now
+measured:
 
-- **Wave quantization.** 96 CTAs on 78 SMs: 18 SMs take two CTAs and set the
-  critical path, so the ceiling is `96 / (2 × 78) = 62%`, lifting the floor to
-  371 ms. This one is checkable and changeable — `block_DV = 32` gives
-  `4 × H = 192` CTAs, 82% ceiling, at the cost of computing the DV-independent
-  `p = q @ kᵀ` four times instead of twice (+10% work for +32% wave efficiency).
+- **Wave quantization.** The 96-CTA grid on 78 SMs measures 1.23 waves/SM. A
+  corrected `block_DV = 32` build launches 192 CTAs, but fails numerical parity:
+  790 in-forward metrics exceed the 5% regression budget, including layer-0
+  output max error 0.21875 → 2.75. This tile-size lever is closed.
 - **Dependency chain.** A 2048-token segment is **32 serial chunks**, each six
   dependent GEMMs at 64×128×64 — Hopper `wgmma`'s minimum M. The recurrence
   `h → u → o` carries almost no ILP. Per chunk step: 3.4 µs ideal against 19.1 µs
-  measured, **18% efficient**.
+  measured. `ncu` confirms the wait: 92.67% of cycles have no eligible warp and
+  long scoreboard accounts for 87.2% of the issued-instruction interval, while
+  DRAM is 2.80% and SM throughput 12.87%.
 
-**`fq_fwd` is `T_stall`'s only large candidate and the bucket has never been
-measured.** Its 1478 ms nominal gap is larger than any remaining individual tail
-row. Its dependency structure provides a concrete hypothesis; the reclaimable
-fraction remains unknown until `ncu` splits the warp stall reasons.
+**`fq_fwd` is a measured `T_stall` case with no licensed implementation.** The
+1478 ms nominal gap remains larger than any individual tail row, but the tested
+wave-count remedy is numerically invalid. A different implementation must
+preserve the 64-wide numerical contract before it is timed.
 
 **Consequence: prefill arithmetic is finished.** Every GEMM is at 86–95% of FP8
 peak and attention is at 95% of bf16 peak. Together they are 74.6% of prefill
@@ -342,7 +343,7 @@ busy 96.5% / 96.4%, kernel 28,601 / 28,611 ms — like for like.
 | bucket | selected-window amount | of kernel time | run-level status | how it was obtained |
 |---|---:|---:|---|---|
 | tail, 8 kernels | **2248 ms observed** | 7.9% | unmeasured | trace sum; binding resources unclassified |
-| `fq_fwd` nominal gap | **1478 ms derived** | 5.2% | unmeasured | 13.5% of bf16 roofline; reclaimable fraction unknown |
+| `fq_fwd` nominal gap | **1478 ms derived** | 5.2% | diagnosed; tile lever rejected | dependency stalls measured; `block_DV=32` fails parity |
 | floor gap — all GEMM | 1570 ms derived | 5.5% | unmeasured | 17.4 µs/token × 90,208 |
 | idle | 966 ms observed | 3.4% | selected window only | GPU busy 28,676 of 29,642 ms |
 | floor gap — FA3 | 227 ms derived | 0.8% | unmeasured | 4.9% short of the 148 TFLOPS bf16 peak |
@@ -373,9 +374,9 @@ The traffic lower bound above remains useful as a sanity check. The other eight
 rows have no bucket assignment yet.
 
 **`fq_fwd` is the opposite case and the reason the buckets are kept separate.**
-Same nominal size, no demonstrated remedy, and a dependency structure that
-`T_stall` is exactly the name for. Measuring it is the next thing this document
-needs.
+Its nominal gap is the same size, but `ncu` assigns it to dependency stalls and
+the tested wave-count remedy fails numerical parity. The bucket is measured;
+the implementation lever is closed.
 
 ### What this model is for, and what it forbids
 
@@ -1360,7 +1361,7 @@ Execute one tranche at a time. A tranche advances only after its stated gate.
 | **0. Re-anchor** | current HEAD, 1×H20 GPU 1, shipped DSpark defaults, canonical 32K × 8-turn dataset | runner JSON/CSV, serve log, start/end `/v1/stats`, build identity, concurrent needle output | 128/128 complete at every `c=1,2,4,8,16`, zero errors/empty outputs, prompt p50 within ±10%, c=2/8/16 concurrent needle ×3 clean |
 | **1. Close the run model** | run the same sweep with `ARLE_STEP_PHASE=1`; reconcile wall, forward-busy time, prefill tokens, generated tokens, steps, rows, accepted tokens, prefix hits, and queue depth | one full-run ledger whose terms and overlap rules are explicit | ≥95% of measured GPU-busy time assigned; request and token counts equal the runner artifact |
 | **2. Price the prefix sidecar** | derive writes/read bytes from tier I/O counters and restores from prefix hits; add a temporary same-binary write-policy toggle only if current counters cannot isolate the sidecar | restore hits, restored tokens, useful read/write bytes, serialization time, matched on/off wall A/B | retain only when saved prefill wall exceeds write + restore wall; otherwise reduce periodic writes or delete them |
-| **3. Measure `fq_fwd`** | `ncu` at the traced `Q=2048`, 48-head, 96-CTA shape; inspect wave occupancy, long-scoreboard/dependency stalls, and instruction issue | raw `ncu` report plus a pinned `block_DV=64/32` kernel A/B if the stall split supports it | kernel win, correct output, then positive canonical wall A/B; otherwise close the lever |
+| **3. Close `fq_fwd` tile size — completed** | `ncu` at `Q=2048`, H=48; correct the wrapper grid; validate 64/32 with in-forward recurrent reference | raw 96/192-CTA `ncu` reports and numerical comparison | **closed:** dependency stall confirmed; `block_DV=32` fails correctness |
 | **4. Close decode residuals** | post-slot-batching decode-shaped c=16 `nsys`; then sampled-row A/B with seeded-row counts and `accept_rate` | tick partition, >1 ms gap owners, draft/verify lines, sampled gate reachability | explain the missing 43% of the draft-attention prediction before another decode edit |
 | **5. Profile the tail individually** | `conv1d`, `silu_mul`, `split2`, then norms/prep at their traced shapes | one `ncu` report per kernel, ordered by observed full-run contribution | implement only a named instruction, traffic, or launch reduction; the `pack_quantize` repair is not a template |
 
@@ -1469,15 +1470,13 @@ TTFT ratios are hypotheses pending a complete matched run.
    `conv1d` is a causal compute loop, and norms/prep contain reductions. Their
    run-level shares, binding resources, and reclaimable fractions are open.
 
-8. **`fq_fwd` (FlashQLA) is now the largest non-GEMM term — 1708 ms, 5.97%, at
+8. **`fq_fwd` (FlashQLA) is the largest non-GEMM term — 1708 ms, 5.97%, at
    13.5% of the bf16 roofline.** Floor derived 2026-08-09 (§ the floor layer):
    230 ms ideal, 371 ms after wave quantization, **1478 ms nominal headroom**.
-   **`T_stall`'s only large candidate, and that bucket has never been measured.**
-   Two derived limits, neither confirmed: 96 CTAs on 78 SMs caps utilization at
-   62% (`block_DV = 32` would give 192 CTAs and 82% — a concrete, falsifiable
-   A/B), and a 32-chunk serial recurrence of six dependent 64×128×64 GEMMs runs
-   at 18% per chunk step. **`ncu` warp-stall reasons decide how much of the 1478
-   ms is reachable; until then it is not comparable to item 7's 2248 ms.**
+   `ncu` measures **92.67% no-eligible-warp cycles, 87.2% long-scoreboard share,
+   2.80% DRAM, and 12.87% SM throughput**. The 96-CTA wave tail is real, but the
+   corrected 192-CTA `block_DV=32` candidate fails in-forward numerical parity.
+   **The stall is confirmed and the tile-size lever is closed.**
 
 9. **Sampling costs 30–40% of decode throughput at c ≥ 8** (§2.4) — measured on
    the anchor, so its size needs re-measuring on §2.0's shape. The gate at
@@ -1492,7 +1491,6 @@ Facts this chain rests on that have not been measured:
 
 | item | why it matters |
 |---|---|
-| **`fq_fwd` warp-stall split** | 1478 ms nominal headroom at 13.5% of roofline; `ncu` decides how much is reachable, and it is the only large `T_stall` candidate in the document |
 | **full-run phase accounting** | the selected window over-represents `pack_quantize` by 2.02x; the run-level shares of every other term and the critical-path split remain unknown |
 | prefix sidecar restore hit rate | decides whether 9.4% of wall is earned |
 | acceptance rate under temperature | the sampled arm has no matching `accept_rate`; its 30–40% throughput penalty is still unattributed |
