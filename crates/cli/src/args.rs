@@ -1522,6 +1522,12 @@ pub(crate) struct TrainW2sArgs {
     #[arg(long, value_enum, default_value_t = OpdBackendArg::Auto)]
     pub(crate) backend: OpdBackendArg,
 
+    /// Auxiliary model backend: `in-process` loads the aux models in the train
+    /// process (small models only); `infer` runs them via LoadedInferenceEngine
+    /// (supports TP / large models that would OOM the train process).
+    #[arg(long, value_enum, default_value_t = W2sAuxBackendArg::InProcess)]
+    pub(crate) aux_backend: W2sAuxBackendArg,
+
     /// Render output as JSON.
     #[arg(long, default_value_t = false)]
     pub(crate) json: bool,
@@ -1867,6 +1873,14 @@ pub(crate) enum OpdBackendArg {
     Auto,
     Cpu,
     Cuda,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub(crate) enum W2sAuxBackendArg {
+    /// Load aux models in the train process (small models only).
+    InProcess,
+    /// Run aux models via LoadedInferenceEngine (supports TP / large models).
+    Infer,
 }
 
 #[derive(Debug, Clone, ClapArgs)]
