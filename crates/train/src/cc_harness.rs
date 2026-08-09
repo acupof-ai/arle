@@ -31,23 +31,16 @@ pub const CC_SESSION_TOKENS: usize = 22_000;
 /// and the serve request caps derive from the pool, never from the typical size.
 pub const CC_MAX_SESSION_TOKENS: usize = 200_000;
 
-/// Run-wide knobs; construct literally. Stateless — boot-ahead state lives in
-/// the [`BootedGroup`] values the caller threads between calls.
+/// Run-wide knobs; construct literally.
 pub struct CcHarness {
-    /// Per-sample sandboxes land at `<work_root>/<instance_id>#<sample>`.
     pub work_root: PathBuf,
-    /// Serve `--dump-messages-dir` the attempt time-windows attribute against.
     pub dump_dir: PathBuf,
-    /// Serve origins, e.g. `http://127.0.0.1:8000`. One per rollout engine;
-    /// samples spread round-robin, so a cp fleet serves one group in parallel.
+    /// One per rollout engine; samples spread round-robin.
     pub base_urls: Vec<String>,
-    /// Served model id (`claude --model` + `ANTHROPIC_MODEL`).
     pub model_id: String,
     pub cc_timeout_secs: u64,
     pub test_timeout_secs: u64,
-    /// Scoring `PYTHONPATH` prefix (e.g. `lib` for ansible).
     pub pythonpath: Option<String>,
-    /// Transform from raw pass-fraction to training reward. Default = as-is.
     pub reward_shape: RewardShape,
     pub tokenizer: tokenizers::Tokenizer,
 }
@@ -55,13 +48,11 @@ pub struct CcHarness {
 /// How the raw pytest pass-fraction becomes the training reward.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub enum RewardShape {
-    /// Reward = the pass-fraction as-is. Original behavior.
     #[default]
     Dense,
-    /// Reward = 1.0 only when every test passes, else 0.0.
     Binary,
-    /// 1.0 on a full pass, 0.0 on a timeout/harness error, otherwise a small
-    /// fraction that only orders attempts inside an all-failing group.
+    /// 1.0 on full pass, 0.0 on timeout/error, else a small fraction that only
+    /// orders attempts inside an all-failing group.
     Anchored,
 }
 
@@ -94,15 +85,12 @@ pub fn load_tokenizer(path: &Path) -> Result<tokenizers::Tokenizer> {
 pub struct ScoredSample {
     pub task_id: String,
     pub sample: usize,
-    /// Shaped reward; pass ⇔ `reward >= 1.0` (all shapes agree on the pass point).
+    /// Pass ⇔ `reward >= 1.0` (all shapes agree on the pass point).
     pub reward: f32,
     pub edited: bool,
-    /// cc timed out or scoring failed — a budget/infra artifact, not a real
-    /// fail. Marks the trajectory truncated so the update drops it.
+    /// Timeout or scoring failure — budget artifact, marks trajectory truncated.
     pub errored: bool,
-    /// Score log tail, prefixed with the cc error when the attempt failed.
     pub note: String,
-    /// cc attempt wall (epoch ms) — the dump-attribution window.
     pub t_start_ms: u64,
     pub t_end_ms: u64,
     pub cc_turns: Option<u64>,
@@ -117,32 +105,22 @@ impl ScoredSample {
     }
 }
 
-/// One completed group: K scored samples + their converted token records —
-/// one per sidecar-covered request, so usually MORE than K (re-render
-/// fallback: one per sample; zero when an attempt produced no serve request).
 pub struct CcGroup {
     pub task_id: String,
     pub samples: Vec<ScoredSample>,
     pub records: Vec<CcRecord>,
 }
 
-/// All rewards equal → the group carries zero advantage signal.
 #[must_use]
 pub fn zero_variance(samples: &[ScoredSample]) -> bool {
     samples.windows(2).all(|w| w[0].reward == w[1].reward)
 }
 
-/// DAPO dynamic sampling: boot replacement groups until `target` of them train
-/// a nonzero batch, so a round holds variance-bearing groups instead of padding
-/// with dead (zero-advantage / all-truncated) ones. Terminates deterministically
-/// on an impossible corpus via the launch cap (and caller-side reserve
-/// exhaustion). Pure accounting — the caller owns launch and the reserve pool.
+/// DAPO dynamic sampling: boot replacement groups until `target` train a
+/// nonzero batch. Terminates on the launch cap or token budget.
 pub struct RefillBudget {
-    /// Effective (nonzero-batch) groups wanted this round.
     pub target: usize,
-    /// Hard cap on total group launches; ≥ `target`.
     pub max_launches: usize,
-    /// Cumulative rollout-token cap across refills (0 = unbounded).
     pub token_budget: u64,
     pub effective: usize,
     pub discarded: usize,
@@ -163,8 +141,6 @@ impl RefillBudget {
     }
 
     /// Record a completed group; return whether to boot a replacement.
-    /// `committed` = groups launched/scheduled so far. Refill only replaces a
-    /// dead group, and only while under the launch and token budgets.
     pub fn complete(&mut self, committed: usize, trained: bool, tokens: u64) -> bool {
         self.tokens = self.tokens.saturating_add(tokens);
         if trained {
@@ -179,8 +155,6 @@ impl RefillBudget {
     }
 }
 
-/// Sample-level group assembly: a group completes at its `k`-th scored sample,
-/// regardless of completion order across interleaved tasks.
 pub struct GroupAssembler {
     k: usize,
     pending: HashMap<String, Vec<ScoredSample>>,
@@ -195,7 +169,6 @@ impl GroupAssembler {
         }
     }
 
-    /// The completed group (sorted by sample index) once its k-th sample lands.
     pub fn add(&mut self, sample: ScoredSample) -> Option<Vec<ScoredSample>> {
         let task_id = sample.task_id.clone();
         let slot = self.pending.entry(task_id.clone()).or_default();
@@ -208,19 +181,17 @@ impl GroupAssembler {
     }
 }
 
-/// Boot-ahead handle: `k` sandboxes building in the background; consumed by
-/// [`CcHarness::run_group`]. Dropping it unwinds the boot threads.
+/// Boot-ahead handle: `k` sandboxes building in the background.
 pub struct BootedGroup {
     task: Arc<SweTask>,
     k: usize,
-    /// Per-boot nonce. Dump attribution keys on the request's model tag, so
-    /// concurrent groups (`--prompts-per-update` > 1) must not share one.
+    /// Dump attribution keys on the request's model tag, so concurrent groups
+    /// (`--prompts-per-update` > 1) must not share one.
     nonce: u64,
     rx: Receiver<Result<(usize, PathBuf)>>,
 }
 
 impl CcHarness {
-    /// Start booting `k` sandboxes for `task` on 2 background threads.
     pub fn boot_group(&self, task: &Arc<SweTask>, staged_tree: &Path, k: usize) -> BootedGroup {
         static GROUP_NONCE: AtomicUsize = AtomicUsize::new(0);
         let k = k.max(1);
@@ -260,8 +231,6 @@ impl CcHarness {
         }
     }
 
-    /// Release each sample to its own cc→score thread as its boot lands (no
-    /// group barrier), collect all `k`, convert the group's dumps in-memory.
     pub fn run_group(&self, booted: BootedGroup) -> Result<CcGroup> {
         let mut samples = std::thread::scope(|scope| -> Result<Vec<ScoredSample>> {
             let (tx, rx) = sync_channel(booted.k);
@@ -305,14 +274,9 @@ impl CcHarness {
             })
             .collect();
         let records = convert_cc_dumps(&self.dump_dir, &self.tokenizer, &windows)?;
-        // Backfill tokens for timed-out samples: `cc_input/output_tokens` come from
-        // the `claude` CLI stdout usage (run_sample), which is None on the 600s wall
-        // → group metrics zeroed those trajectories (2026-07-24 band=1 root cause).
-        // The serve-written sidecars survive the CLI timeout; convert_cc_dumps just
-        // read them into `records`. Per sample, the final turn = the record with the
-        // largest prompt (resent-prefix growth); use its prompt/gen lens (summing
-        // turns double-counts the prefix). Only fill the None (CLI usage stays
-        // authoritative when present).
+        // Backfill tokens for timed-out samples: CLI usage is None on the 600s
+        // wall, but serve sidecars survive. Use the final turn's (largest prompt)
+        // prompt/gen lens; only fill None (CLI usage stays authoritative).
         for s in &mut samples {
             if s.cc_input_tokens.is_some() {
                 continue;
@@ -334,10 +298,6 @@ impl CcHarness {
         })
     }
 
-    /// One sample end-to-end: `claude -p` (fork-safe `run_captured`, spawner-
-    /// routed under `ARLE_SPAWNER_SOCKET`; env per-child via `Command::env`),
-    /// then the single Rust reward definition (`git diff` gate →
-    /// `score_workdir`; errors fold into reward 0).
     fn run_sample(
         &self,
         task: &SweTask,
@@ -345,16 +305,12 @@ impl CcHarness {
         sample: usize,
         workdir: &Path,
     ) -> ScoredSample {
-        // Per-sample model tag: the serve echoes `model` back without
-        // interpreting it, so concurrent samples' dumps stay attributable. The
-        // group nonce is what keeps concurrent GROUPS apart
-        // (`--prompts-per-update` > 1) — the sample index alone repeats.
+        // Per-sample model tag keeps concurrent samples' dumps attributable.
         let model = sample_model(&self.model_id, nonce, sample);
         let mut cmd = Command::new("claude");
         cmd.arg("-p")
             .args(["--model", &model])
-            // Allowlist keeps CC off WebFetch/WebSearch/Task — the sandbox is
-            // offline and one web call stalls on CC's ~38s retry-backoff.
+            // Sandbox is offline; web calls stall on CC's retry-backoff.
             .args(["--allowedTools", "Bash Read Write Edit Grep Glob"])
             .args(["--output-format", "json", "--dangerously-skip-permissions"])
             .arg(cc_prompt(&task.problem_statement))
@@ -364,8 +320,7 @@ impl CcHarness {
                 &self.base_urls[sample % self.base_urls.len()],
             )
             .env("ANTHROPIC_API_KEY", "dummy-local")
-            // Mandatory on a root container: --dangerously-skip-permissions
-            // refuses under uid 0 without it.
+            // Required under uid 0 for --dangerously-skip-permissions.
             .env("IS_SANDBOX", "1")
             .env("ANTHROPIC_MODEL", &model)
             .env("ANTHROPIC_SMALL_FAST_MODEL", &model)
@@ -385,8 +340,8 @@ impl CcHarness {
             }
         };
 
-        // `score_err` = the diff/score step itself failed (vs a clean fail with a
-        // real pass-fraction). Errored attempts don't carry a learnable reward.
+        // `score_err` = diff/score step failed (not a clean fail). Errored
+        // attempts don't carry a learnable reward.
         let (raw_reward, edited, score_err, score_note) = match diff_workdir(workdir) {
             Err(err) => (0.0, false, true, format!("diff error: {err}")),
             Ok(diff) if diff.trim().is_empty() => (0.0, false, false, "no edits".to_owned()),
@@ -430,8 +385,7 @@ impl CcHarness {
     }
 }
 
-/// `--output-format json` prints one JSON object on stdout; `run_captured`
-/// folds stderr in, so fall back to the outermost `{…}` slice.
+/// `--output-format json`; stderr is folded in, so fall back to the outermost `{…}`.
 fn parse_cc_json(output: &[u8], code: Option<i32>) -> (Option<serde_json::Value>, Option<String>) {
     let text = String::from_utf8_lossy(output);
     let parsed: Option<serde_json::Value> = serde_json::from_str(text.trim())
@@ -452,8 +406,7 @@ fn parse_cc_json(output: &[u8], code: Option<i32>) -> (Option<serde_json::Value>
     (Some(v), error)
 }
 
-/// CC task prompt — verbatim from `cc_swe_baseline.py::cc_attempt`, problem
-/// statement clipped to 3000 chars like the py slice.
+/// CC task prompt — verbatim from `cc_swe_baseline.py::cc_attempt`.
 fn cc_prompt(problem_statement: &str) -> String {
     let clipped: String = problem_statement.chars().take(3000).collect();
     format!(
@@ -470,8 +423,7 @@ fn cc_prompt(problem_statement: &str) -> String {
     )
 }
 
-/// The model id a sample requests with: `<model>#s<k>`. Distinct per sample so
-/// dump attribution never relies on wall-clock alone under concurrency.
+/// `<model>#g<nonce>s<sample>` — distinct per sample for dump attribution.
 fn sample_model(model_id: &str, nonce: u64, sample: usize) -> String {
     format!("{model_id}#g{nonce}s{sample}")
 }
