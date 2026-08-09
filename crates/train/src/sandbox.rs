@@ -43,9 +43,7 @@ fn request_from_command(
     }
 }
 
-/// Run a `Command` via the pre-CUDA spawner helper. `combined_timeout=true`
-/// mirrors `run_captured` (setsid + process-group timeout, combined output);
-/// `false` mirrors `Command::output()` (separate stdout/stderr, no timeout).
+/// Run a `Command` via the pre-CUDA spawner helper.
 fn spawn_via_helper(
     client: &SpawnClient,
     command: &Command,
@@ -55,7 +53,6 @@ fn spawn_via_helper(
     client.run(&request_from_command(command, combined_timeout, timeout))
 }
 
-/// Subset of `std::process::Output` the cp/git call sites use.
 struct PlainOutput {
     stdout: Vec<u8>,
     stderr: Vec<u8>,
@@ -63,10 +60,8 @@ struct PlainOutput {
     status: String,
 }
 
-/// Routed through the spawner helper when its env is set (agent-OPD rollout)
-/// and run directly otherwise (byte-identical default). This is the
-/// `combined_timeout=false` path: stdout/stderr stay separate, no timeout.
-/// Covers cp/git (`run_checked`), `git diff`, and `git apply`.
+/// Routed through the spawner helper when its env is set; direct otherwise.
+/// `combined_timeout=false`: separate stdout/stderr, no timeout.
 fn plain_output(command: &mut Command, label: &str) -> Result<PlainOutput> {
     if let Some(client) = SpawnClient::from_env() {
         let resp = spawn_via_helper(&client, command, false, Duration::ZERO)
@@ -93,35 +88,19 @@ fn plain_output(command: &mut Command, label: &str) -> Result<PlainOutput> {
     })
 }
 
-/// Maximum characters of combined stdout/stderr surfaced from a bash tool
-/// result before head+tail clipping kicks in.
 const BASH_OUTPUT_CLIP: usize = 8000;
 
-/// How often `run_bash` / `score_workdir` poll the child for completion while
-/// enforcing the Rust-side timeout. Small enough that the wall-clock timeout
-/// stays tight, large enough not to spin.
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
-/// Isolates `command` in its own process group and captures combined
-/// stdout+stderr to a temp file instead of a pipe.
-///
-/// This fixes a real hang: a tool command that backgrounds a process (`foo &`)
-/// or spawns a child that inherits and holds the stdout pipe makes
-/// `wait_with_output()` block reading that pipe until the grandchild closes it —
-/// i.e. forever for a daemon, leaving the parent stuck in `wait4()`. Capturing
-/// to a file removes the pipe entirely; running in a fresh process group and
-/// killing the whole group on exit/timeout reaps any lingering grandchildren so
-/// they can't linger or hold the parent.
-///
-/// Returns `(combined_output, exit_code, killed_by_timeout)`. Also the cc
-/// harness's `claude -p` spawn path (`crate::cc_harness`).
+/// Isolate `command` in its own process group, capture combined stdout+stderr
+/// to a temp file (no pipe → no hang on backgrounded grandchildren).
+/// Returns `(combined_output, exit_code, killed_by_timeout)`.
 pub(crate) fn run_captured(
     command: Command,
     timeout: Duration,
 ) -> std::io::Result<(Vec<u8>, Option<i32>, bool)> {
-    // Route through the pre-CUDA spawner helper when agent-OPD set its socket env;
-    // the helper does the setsid fork on a non-CUDA process (dodges ELKEID). When
-    // unset (normal serve/CLI) we spawn directly below — byte-identical default.
+    // Route through the pre-CUDA spawner helper when set (dodges ELKEID);
+    // otherwise spawn directly (byte-identical default).
     if let Some(client) = SpawnClient::from_env() {
         let resp = spawn_via_helper(&client, &command, true, timeout)?;
         return Ok((resp.stdout, resp.exit_code, resp.timed_out));
@@ -131,24 +110,12 @@ pub(crate) fn run_captured(
     let stdout_handle = tmp.reopen()?;
     let stderr_handle = stdout_handle.try_clone()?; // dup'd fd shares the offset → interleaved
 
-    // Re-parent the tool command under the standalone `setsid` binary so it runs
-    // in its OWN session+group (leader pid == the spawned child's pid). On a
-    // timeout we `kill -KILL -<pgid>` the whole subtree and reap any backgrounded
-    // grandchildren.
-    //
-    // We DO NOT use `Command::process_group(0)`. That routes the group change
-    // through an in-child `pre_exec` hook between `fork()` and `exec()`; in the
-    // agent-OPD rollout the parent is a MULTI-THREADED, CUDA-resident process, so
-    // `fork()` snapshots a libc/CUDA lock held by another (now-absent) thread and
-    // the child's `setpgid` deadlocks before `exec` — the round-0 repo-overview
-    // `bash -lc` never runs, the rollout hangs the full `bash_timeout_secs`, and
-    // the group-kill then SIGKILLs the whole student tree (the load deadlock is
-    // fixed by stream_synchronize, this is the NEXT blocker on the same loop). The
-    // standalone `setsid` binary creates the new session AFTER `exec`, so there is
-    // no in-child hook and the spawn stays fork-safe.
-    // macOS has no standalone `setsid` binary: spawn directly there (the timeout
-    // still kills the direct child; only backgrounded grandchildren can outlive
-    // it). Linux — the production lane — keeps the full session re-parent + kill.
+    // Use the standalone `setsid` binary, NOT `Command::process_group(0)`.
+    // The latter runs `setpgid` in a pre_exec hook between fork() and exec();
+    // in a multi-threaded CUDA-resident parent, fork() snapshots a libc/CUDA
+    // lock held by another thread and the child's setpgid deadlocks before
+    // exec. `setsid` creates the new session AFTER exec, so no in-child hook.
+    // macOS has no `setsid` binary: spawn directly there.
     let mut command = if cfg!(target_os = "linux") {
         let prog = command.get_program().to_owned();
         let args: Vec<_> = command.get_args().map(|a| a.to_owned()).collect();
@@ -210,14 +177,10 @@ pub(crate) fn run_captured(
     Ok((output, code, killed))
 }
 
-/// Signal the whole process group (negative pid). Uses the `kill` binary to
-/// avoid a libc dependency; failure is ignored (the group may be empty
-/// already, which is the common case).
+/// Signal the whole process group. Uses the `kill` binary (no libc dep).
 fn kill_group(pgid: i32) {
     // Never signal our own group: a mis-derived pgid must not SIGKILL the
-    // caller's session (observed 3× deterministic under `cargo test -p train
-    // --features cuda` on the pod, 2026-07-24; exact mis-derivation hop
-    // unpinned — this guard closes the class).
+    // caller's session (observed under `cargo test -p train --features cuda`).
     // SAFETY: getpgrp takes no arguments and cannot fail.
     if pgid <= 1 || pgid == unsafe { libc::getpgrp() } {
         return;
@@ -231,8 +194,6 @@ fn kill_group(pgid: i32) {
         .status();
 }
 
-/// Tests / tracebacks live at the tail, so both ends are preserved.
-/// (Local copy — `tools::clip_middle` is private.)
 fn clip_middle(s: &str, max_chars: usize) -> String {
     let total = s.chars().count();
     if total <= max_chars {
@@ -245,10 +206,6 @@ fn clip_middle(s: &str, max_chars: usize) -> String {
     format!("{head}\n... (output truncated) ...\n{tail}")
 }
 
-/// Combine stdout then stderr into a single bash tool result. stderr is
-/// prefixed with `[stderr] ` only when non-empty; `(no output)` when both are
-/// empty. Appends `[exit {code}]` when the process exited, or
-/// `[killed: timeout]` when the Rust timeout fired. Clipped to ~8000 chars.
 fn format_bash_output(stdout: &[u8], stderr: &[u8], code: Option<i32>, killed: bool) -> String {
     let stdout = String::from_utf8_lossy(stdout);
     let stderr = String::from_utf8_lossy(stderr);
@@ -277,20 +234,15 @@ fn format_bash_output(stdout: &[u8], stderr: &[u8], code: Option<i32>, killed: b
     clip_middle(&combined, BASH_OUTPUT_CLIP)
 }
 
-/// `staged_tree` is a dir holding the repo already checked out at `base_commit`
-/// (cloning/checkout is the caller's job, out of scope). Copies it into
-/// `work_root/instance_id`, optionally runs `setup_cmd` (e.g. `pip install`) in
-/// the workdir, then `git init` + `add` + commit `"base"` under a deterministic
-/// identity. Returns the path to the workdir.
+/// Copy `staged_tree` into `work_root/instance_id`, run `setup_cmd`, then
+/// `git init` + commit "base". Returns the workdir path.
 pub fn boot_workdir(
     work_root: &Path,
     instance_id: &str,
     staged_tree: &Path,
     setup_cmd: Option<&str>,
 ) -> Result<PathBuf> {
-    // An ancestor CLAUDE.md cost ~31K tokens/request of CC preamble
-    // (wins/2026-07-24-agent-opd-gpu-busy-frac-measured-go.md). Per-run
-    // invariant of work_root, so warn once, not per boot.
+    // An ancestor CLAUDE.md costs ~31K tokens/request of CC preamble.
     static ANCESTOR_CLAUDE_MD_WARN: std::sync::Once = std::sync::Once::new();
     if let Some(dir) = work_root.ancestors().find(|a| a.join("CLAUDE.md").exists()) {
         ANCESTOR_CLAUDE_MD_WARN.call_once(|| {
@@ -311,8 +263,7 @@ pub fn boot_workdir(
     fs::create_dir_all(&workdir)
         .with_context(|| format!("failed to create workdir {}", workdir.display()))?;
 
-    // Copy the staged tree's CONTENTS into the workdir. `<src>/.` copies the
-    // directory contents (incl. dotfiles) rather than nesting the dir itself.
+    // `<src>/.` copies contents (incl. dotfiles) rather than nesting the dir.
     let src_contents = format!("{}/.", staged_tree.display());
     run_checked(
         Command::new("cp")
@@ -379,12 +330,9 @@ pub fn diff_workdir(workdir: &Path) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-/// Apply the hidden `test_patch` (skip if empty), then run the `fail_to_pass`
-/// tests. Returns `(reward, log_tail)` where `reward` is the partial-credit
-/// fraction of `fail_to_pass` tests that passed, in `[0.0, 1.0]`; `1.0` iff all
-/// `fail_to_pass` pass (⇔ pytest exit-0). Falls back to binary (exit-0 → 1.0)
-/// when the run is killed or the pytest summary can't be parsed.
-/// The test command runs under a Rust-enforced timeout (like `run_bash`).
+/// Apply `test_patch`, run `fail_to_pass` tests. Returns `(reward, log_tail)`
+/// where reward = passed/total in [0,1]. Falls back to binary (exit-0 → 1.0)
+/// when killed or summary unparseable.
 pub fn score_workdir(
     workdir: &Path,
     test_patch: &str,
@@ -393,16 +341,10 @@ pub fn score_workdir(
     timeout_secs: u64,
 ) -> Result<(f32, String)> {
     if !test_patch.trim().is_empty() {
-        // The hidden test_patch is ground truth; the student must not be able to
-        // block or skew scoring by editing the (hidden) test files it touches.
-        // Reset just those paths to the committed base before applying, so
-        // `git apply` lands cleanly even if the rollout dirtied a test file — the
-        // student's SOURCE fix in other files is preserved. (Without this, a
-        // plain `git apply` against a student-dirtied test file fails "patch does
-        // not apply" and a real fix is mis-scored as failing.)
-        // A `+++ b/<path>` is a real file header only when it directly follows a
-        // `--- ` line — gating on that avoids mistaking a patch CONTENT line that
-        // happens to start with `+++ b/` for a path to reset.
+        // Reset the patch's test paths to base before applying, so `git apply`
+        // lands cleanly even if the rollout dirtied a test file. The student's
+        // source fix in other files is preserved.
+        // A `+++ b/<path>` is a real header only when it follows a `--- ` line.
         let mut after_minus_header = false;
         for line in test_patch.lines() {
             if after_minus_header && let Some(path) = line.strip_prefix("+++ b/") {
@@ -420,10 +362,8 @@ pub fn score_workdir(
             after_minus_header = line.starts_with("--- ");
         }
 
-        // Write via the full (possibly-relative) path from the process cwd, but
-        // hand `git apply` the bare filename: `git -C workdir` resolves a
-        // file-arg relative to workdir, so a workdir-relative path would double
-        // the prefix ("can't open patch") whenever work_root is relative.
+        // Hand `git apply` the bare filename: `git -C workdir` resolves it
+        // relative to workdir, so a workdir-relative path would double the prefix.
         let patch_name = ".arle_test_patch.diff";
         let patch_file = workdir.join(patch_name);
         fs::write(&patch_file, test_patch)
@@ -455,8 +395,7 @@ pub fn score_workdir(
 
     let mut command = Command::new("bash");
     command.arg("-lc").arg(&cmd).current_dir(workdir);
-    // Mirror run_bash: no bytecode, and ignore any stale pyc a rollout left
-    // behind (scoring must execute the edited source, not cached bytecode).
+    // No bytecode: scoring must execute edited source, not cached pyc.
     command.env("PYTHONDONTWRITEBYTECODE", "1");
     if let Some(pythonpath) = pythonpath {
         let combined = match std::env::var("PYTHONPATH") {
@@ -470,9 +409,8 @@ pub fn score_workdir(
         .with_context(|| "failed to run pytest".to_string())?;
     let log_tail = format_bash_output(&output, &[], code, killed);
 
-    // Partial-credit reward = passed / requested. Fall back to binary (exit-0 →
-    // 1.0) when killed or the summary is unparseable (collection crash / no tail
-    // line), so a timed-out or crashed run never mints spurious credit.
+    // Fall back to binary (exit-0 → 1.0) when killed or summary unparseable,
+    // so a timed-out/crashed run never mints spurious credit.
     let reward = match parse_pytest_counts(&String::from_utf8_lossy(&output)) {
         Some((passed, _)) if !killed => {
             (passed as f32 / fail_to_pass.len().max(1) as f32).clamp(0.0, 1.0)
@@ -488,10 +426,7 @@ pub fn score_workdir(
     Ok((reward, log_tail))
 }
 
-/// Robust to any subset of {passed, failed, error(s), skipped, xfailed}:
-/// e.g. `"3 passed, 2 failed in 0.4s"` → `(3, 2)`,
-/// `"2 passed, 1 error in 0.3s"` → `(2, 1)`. Returns `None` when no summary
-/// line is present (collection crash / empty output).
+/// Parse pytest summary line: `"3 passed, 2 failed"` → `(3, 2)`.
 fn parse_pytest_counts(text: &str) -> Option<(usize, usize)> {
     let count_of = |line: &str, kind: &str| -> Option<usize> {
         line.split(", ").find_map(|seg| {
@@ -516,7 +451,6 @@ fn parse_pytest_counts(text: &str) -> Option<(usize, usize)> {
     None
 }
 
-/// Routes through the sandbox-spawner when its env is set (agent-OPD rollout).
 fn run_checked(command: &mut Command, label: &str) -> Result<()> {
     let output = plain_output(command, label)?;
     if !output.success {
