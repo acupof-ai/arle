@@ -140,8 +140,7 @@ impl Qwen35Model {
             params.len(),
             sample_positions.len()
         );
-        // Pre-mutation validation: every row in bounds and in budget BEFORE
-        // any device state is touched.
+        // Validate before any device state is touched.
         for (r, &si) in slot_indices.iter().enumerate() {
             ensure!(
                 si < slots.len(),
@@ -174,7 +173,7 @@ impl Qwen35Model {
         let hidden_size = c.hidden_size;
         let vocab = self.output_projection().rows;
 
-        // ── Stage pointer tables (no-op when the row→slot mapping is unchanged). ──
+        // no-op when the row→slot mapping is unchanged.
         bd.stage_pointer_tables(&self.ctx, slots, slot_indices)?;
 
         let token_ids_host: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
@@ -211,8 +210,6 @@ impl Qwen35Model {
         let positions_dev = positions.upload(&self.ctx, &positions_host)?;
         let seq_lens_dev = seq_lens.upload(&self.ctx, &seq_lens_host)?;
 
-        // ── Forward body: identical layer stack to `forward_hidden_staged`
-        //    at seq_len == B, with the two per-slot dispatch differences. ──
         let hidden = hidden.get(&self.ctx, hidden_size, b)?;
         embedding_batch(&self.ctx, &self.embed_tokens, token_ids, hidden)?;
         let normed = normed.get(&self.ctx, hidden_size, b)?;
@@ -312,8 +309,6 @@ impl Qwen35Model {
             slots[si].advance_seq_len(1);
         }
 
-        // ── Sampling: ONE batched argmax over `[B, vocab]` (greedy fast
-        //    path); any non-greedy row falls back to per-row host sampling. ──
         let argmax_buf = argmax.get(&self.ctx, b)?;
         {
             let (l_ptr, _gl) = logits_buf.data.device_ptr(&self.ctx.stream);
@@ -393,9 +388,7 @@ impl Qwen35Model {
             meta.total_q,
             b
         );
-        // Pre-mutation validation: every row in bounds, recurrent resident, and
-        // the pool already holds this row's POST-append length (the engine
-        // appended one token per row before building `meta`).
+        // Pool already holds POST-append length (engine appended one token per row before building `meta`).
         for (r, &si) in slot_indices.iter().enumerate() {
             ensure!(
                 si < slots.len(),
@@ -425,8 +418,7 @@ impl Qwen35Model {
         let hidden_size = c.hidden_size;
         let vocab = self.output_projection().rows;
 
-        // Stage the recurrent pointer tables ONLY (paged full-attn needs no
-        // contiguous K/V tables); no-op when the row→slot mapping is unchanged.
+        // Paged full-attn needs no contiguous K/V tables; no-op when row→slot mapping unchanged.
         bd.stage_recurrent_pointer_tables(&self.ctx, slots, slot_indices)?;
 
         let token_ids_host: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();

@@ -1,71 +1,56 @@
 use super::*;
 
-/// Host image of one whole slot for G3 capacity spill (mirror of
-/// [`crate::dsv4::Dsv4SlotImage`]): the slot's full-attn KV pages plus the
-/// per-linear-layer recurrent + conv state and the materialized length. Every
-/// device buffer the slot owns is captured here byte-for-byte — a missed buffer
-/// is a silently-wrong restore. `k_caches`/`v_caches` are NOT captured: the
-/// paged default leaves them empty (full-attn KV is paged), asserted at capture.
+/// Host image of one whole slot for G3 capacity spill. Every device buffer the
+/// slot owns is captured here byte-for-byte — a missed buffer is a
+/// silently-wrong restore. `k_caches`/`v_caches` are NOT captured: the paged
+/// default leaves them empty, asserted at capture.
 pub(crate) struct Qwen35SlotImage {
-    /// Full-attn KV bytes in slot-logical page order (from `copy_pages_to_host`).
     pub(crate) full_attn_pages: Vec<u8>,
-    /// Logical page count the bytes cover (drives swap-in page allocation).
     pub(crate) full_attn_page_count: usize,
-    /// `[num_linear]` gated-delta recurrent states (f32), D2H verbatim.
     pub(crate) gdr_host: Vec<Vec<f32>>,
-    /// `[num_linear]` conv1d rings (bf16), D2H verbatim.
     pub(crate) conv_host: Vec<Vec<bf16>>,
-    /// Materialized full-attn length the image was captured at.
     pub(crate) seq_len: usize,
 }
 
 pub(crate) struct Qwen35SlotState {
-    /// `[num_full_layers]` contiguous K caches, each `max_seq_len*kv_dim` bf16.
     /// EMPTY by default (full-attn KV is paged); populated only by the legacy
     /// contiguous lane when explicitly requested.
     pub(crate) k_caches: Vec<DeviceVec>,
     pub(crate) v_caches: Vec<DeviceVec>,
-    /// `[num_linear_layers]` gated-delta recurrent states (`Vh*Kd*Vd` f32).
     pub(crate) gdr_states: Vec<CudaSlice<f32>>,
-    /// `[num_linear_layers]` conv1d rings (`qkv_dim*(kernel-1)` bf16).
     pub(crate) conv_states: Vec<DeviceVec>,
-    /// Reusable pinned staging for [`Self::snapshot_recurrent`]. A `Vec`/`[T]`
-    /// destination makes every `memcpy_dtoh` a full stream synchronize
-    /// (cudarc `SyncOnDrop::Sync`); a pinned slice syncs on its own event.
+    /// A `Vec`/`[T]` destination makes every `memcpy_dtoh` a full stream
+    /// synchronize (cudarc `SyncOnDrop::Sync`); a pinned slice syncs on its own
+    /// event.
     pub(crate) gdr_pinned: Vec<PinnedHostSlice<f32>>,
     pub(crate) conv_pinned: Vec<PinnedHostSlice<bf16>>,
     /// True once `acquire_recurrent` has run for the current occupant (even
     /// when `num_linear == 0` and the state vecs are empty). Guards the
     /// forward's `has_recurrent()` chokepoint against a missed acquire.
     pub(crate) recurrent_acquired: bool,
-    /// Tokens materialized into the caches so far (full-attn kv_len).
     pub(crate) seq_len: usize,
 }
 
-/// A detached, reusable recurrent state block (`(gdr_states, conv_states)`) on
-/// the executor's free-list. Released back by a finished request and popped by
-/// the next one — same dims for every slot, so any block fits any slot.
+/// A detached, reusable recurrent state block on the executor's free-list.
+/// Released back by a finished request and popped by the next one — same dims
+/// for every slot, so any block fits any slot.
 pub(crate) type RecurrentBlock = (Vec<CudaSlice<f32>>, Vec<DeviceVec>);
 
-/// One committed token + its behavior logprob under the filtered sampling
-/// dist (`None` = uncaptured: greedy / delta policy).
+/// `None` = uncaptured (greedy / delta policy).
 pub(crate) type CommittedToken = (u32, Option<f32>);
 
-/// D2H snapshot of the recurrent state at a prefix boundary.
-/// Used by the sidecar prefix-cache to restore the recurrent layers
-/// when reusing a Qwen3.5/3.6 hybrid prefix via the page-radix path.
+/// D2H snapshot of the recurrent state at a prefix boundary, used by the
+/// sidecar prefix-cache to restore the recurrent layers when reusing a
+/// Qwen3.5/3.6 hybrid prefix via the page-radix path.
 #[derive(Clone)]
 pub(crate) struct Qwen35RecurrentSnapshot {
-    /// `[num_linear]` gated-delta states (f32), copied verbatim from device.
     pub(crate) gdr: Vec<Vec<f32>>,
-    /// `[num_linear]` conv1d rings (bf16), copied verbatim from device.
     pub(crate) conv: Vec<Vec<bf16>>,
 }
 
 impl Qwen35SlotImage {
-    /// Approximate device-state byte size of a whole-slot image (the unit the G3
-    /// `KvTierStore` budgets one entry against). Used only to size the tier's
-    /// count cap — exactness isn't required, but it must scale with the image.
+    /// Approximate byte size — used only to size the tier's count cap, so
+    /// exactness isn't required, but it must scale with the image.
     pub(crate) fn dram_bytes(&self) -> usize {
         self.full_attn_pages.len()
             + self.gdr_host.iter().map(|v| v.len() * 4).sum::<usize>()
@@ -73,16 +58,9 @@ impl Qwen35SlotImage {
             + 8
     }
 
-    /// Flatten the whole-slot image into ONE length-prefixed byte buffer for the
-    /// G3 [`kv_native_sys::KvTierStore`] (opaque-`u64`-keyed transport). The
-    /// exact byte-inverse of [`Self::from_bytes`] — proven field-for-field in the
-    /// `slot_image_byte_inverse` unit test. No serde: a small fixed header
-    /// (`seq_len`, `full_attn_page_count`, `full_attn_pages` byte length, the two
-    /// linear counts) followed by the full-attn bytes, then each gdr vec's
-    /// `[len:u64][f32...]` and each conv vec's `[len:u64][bf16...]`. The payload
-    /// regions are bulk byte copies in host order — the buffer never leaves this
-    /// box (host DRAM / local NVMe), and per-element `to_le_bytes` cost 37M
-    /// 4-byte appends per park (~150 ms), the dominant swap stall.
+    /// No serde: per-element `to_le_bytes` cost 37M 4-byte appends per park
+    /// (~150 ms), the dominant swap stall. Payload regions are bulk byte copies
+    /// in host order — the buffer never leaves this box.
     pub(crate) fn to_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(self.dram_bytes() + 64);
         buf.extend_from_slice(&(self.seq_len as u64).to_le_bytes());
@@ -108,9 +86,7 @@ impl Qwen35SlotImage {
         buf
     }
 
-    /// Reconstruct a whole-slot image from [`Self::to_bytes`] — the exact
-    /// byte-inverse. A cursor walks the fixed header then the four sized regions;
-    /// any short/over-long buffer (a corrupt or foreign payload) errors rather
+    /// Any short/over-long buffer (corrupt or foreign payload) errors rather
     /// than restore garbage.
     pub(crate) fn from_bytes(bytes: &[u8]) -> Result<Self> {
         let mut pos = 0usize;
@@ -195,7 +171,6 @@ pub(crate) fn alloc_recurrent_block(
             // SAFETY: zero_recurrent runs before any read of this state.
             let g = unsafe { ctx.stream.alloc::<f32>(gdr_state_len) }
                 .map_err(|e| anyhow!("alloc gated-delta state failed: {e}"))?;
-            // SAFETY: same as above.
             let c = unsafe { DeviceVec::uninit(ctx, conv_len) }?;
             Ok((g, c))
         })
@@ -206,20 +181,17 @@ pub(crate) fn alloc_recurrent_block(
 }
 
 impl Qwen35RecurrentSnapshot {
-    /// Approximate host byte size (for cap accounting).
     #[allow(dead_code)]
     pub(crate) fn host_bytes(&self) -> usize {
         self.gdr.iter().map(|v| v.len() * 4).sum::<usize>()
             + self.conv.iter().map(|v| v.len() * 2).sum::<usize>()
     }
 
-    /// Flatten for the sidecar tier store — exact byte-inverse of
-    /// [`Self::from_bytes`]. Header `[num_gdr][num_conv]` (u64 LE), then each vec
-    /// `[len:u64][elems...]`. No full-attention KV: restore mirrors the radix
-    /// prefix's own device pages.
+    /// No full-attention KV: restore mirrors the radix prefix's own device
+    /// pages.
     pub(crate) fn to_bytes(&self) -> Vec<u8> {
         // Every stride boundary of every prefill serializes the WHOLE recurrent
-        // state, so this runs inside the tick, not behind it — surface the cost.
+        // state, so this runs inside the tick — surface the cost.
         let started = std::time::Instant::now();
         let mut buf = Vec::with_capacity(self.host_bytes() + 64);
         buf.extend_from_slice(&(self.gdr.len() as u64).to_le_bytes());
@@ -246,9 +218,8 @@ impl Qwen35RecurrentSnapshot {
         buf
     }
 
-    /// Reconstruct a snapshot from [`Self::to_bytes`] — the exact byte-inverse.
-    /// Any short/over-long buffer (corrupt or foreign payload) errors rather than
-    /// restore garbage, so the caller falls through to clean recompute.
+    /// Any short/over-long buffer errors rather than restore garbage, so the
+    /// caller falls through to clean recompute.
     pub(crate) fn from_bytes(bytes: &[u8]) -> Result<Self> {
         let mut pos = 0usize;
         let take_u64 = |pos: &mut usize| -> Result<u64> {
@@ -320,14 +291,10 @@ pub(crate) fn hash_prefix_tokens(tokens: &[u32]) -> u64 {
 }
 
 impl Qwen35SlotState {
-    /// A fresh idle slot: allocate NOTHING. The recurrent state (~147 MiB) is a
-    /// fixed-size per-request state — not token-addressable like the paged
-    /// full-attn KV — so it draws from a request-grained free-list pool
-    /// ([`RecurrentBlock`]) lazily on activation ([`Self::acquire_recurrent`]),
-    /// not upfront per `num_slots`. Idle slots cost zero recurrent HBM; the win
-    /// is partial-load footprint + the foundation for future L2 spill. At full
-    /// concurrency the pool grows to `num_slots`, identical to the old upfront
-    /// reservation. `k_caches`/`v_caches` stay empty (full-attn KV is paged).
+    /// The recurrent state (~147 MiB) is fixed-size per-request, not
+    /// token-addressable like paged full-attn KV, so it draws from a
+    /// request-grained free-list pool lazily on activation, not upfront per
+    /// `num_slots`. Idle slots cost zero recurrent HBM.
     pub(crate) fn new_linear_only() -> Self {
         Self {
             k_caches: Vec::new(),
@@ -341,13 +308,9 @@ impl Qwen35SlotState {
         }
     }
 
-    /// Activate this slot's recurrent state for a fresh request (the
-    /// `start_pos == 0` prefill): pop a reusable block from `pool` (free-list
-    /// reuse, no alloc churn) or allocate fresh, then ZERO it. Idempotent —
-    /// no-op if already allocated, so a chunked-prefill's later chunks
-    /// (`start_pos > 0`) never re-zero and wipe the prefix's recurrent state;
-    /// the zero happens ONLY on fresh acquisition. MUST run before any forward
-    /// reads `gdr_states`.
+    /// Idempotent — no-op if already allocated, so a chunked-prefill's later
+    /// chunks (`start_pos > 0`) never re-zero and wipe the prefix's recurrent
+    /// state.
     pub(crate) fn acquire_recurrent(
         &mut self,
         ctx: &DeviceContext,
@@ -358,7 +321,7 @@ impl Qwen35SlotState {
     ) -> Result<()> {
         if !self.gdr_states.is_empty() {
             self.recurrent_acquired = true;
-            return Ok(()); // already active (a chunked-prefill continuation)
+            return Ok(()); // chunked-prefill continuation
         }
         let (gdr, conv) = match pool.pop() {
             Some(block) => block,
@@ -368,15 +331,12 @@ impl Qwen35SlotState {
         self.conv_states = conv;
         self.recurrent_acquired = true;
         self.seq_len = 0;
-        // Zero on acquisition (a pooled block carries the prior occupant's
-        // state; a fresh alloc is already zero but re-zeroing is cheap/uniform).
+        // A pooled block carries the prior occupant's state.
         self.zero_recurrent(ctx)
     }
 
-    /// Return this slot's recurrent block to the free-list, leaving the slot's
-    /// fields empty. Called ONLY at request finish (the slot's prior occupant is
-    /// fully done — no in-flight forward references it), so the block is safe to
-    /// hand to the next request.
+    /// Called only at request finish, so the block is safe to hand to the next
+    /// request.
     pub(crate) fn release_recurrent(&mut self, pool: &mut Vec<RecurrentBlock>) {
         self.recurrent_acquired = false;
         if self.gdr_states.is_empty() {
@@ -385,17 +345,13 @@ impl Qwen35SlotState {
         let gdr = std::mem::take(&mut self.gdr_states);
         let conv = std::mem::take(&mut self.conv_states);
         pool.push((gdr, conv));
-        // The pinned staging is per-slot and sized to the device buffers just
-        // returned; holding it across the idle window pins ~147 MiB/slot host
-        // RAM for a snapshot that may never come. `ensure_snapshot_staging`
-        // rebuilds it on the next snapshot.
+        // Holding pinned staging across the idle window pins ~147 MiB/slot host
+        // RAM for a snapshot that may never come.
         self.gdr_pinned.clear();
         self.conv_pinned.clear();
         self.seq_len = 0;
     }
 
-    /// Zero the recurrent + conv-ring state in place (the per-request fresh
-    /// start). Does not touch the full-attn cursor. No-op when unallocated.
     pub(crate) fn zero_recurrent(&mut self, ctx: &DeviceContext) -> Result<()> {
         for s in &mut self.gdr_states {
             ctx.stream
@@ -414,18 +370,15 @@ impl Qwen35SlotState {
         self.seq_len
     }
 
-    /// Whether this slot's recurrent state is resident (acquired). A forward
-    /// that reads `gdr_states` MUST see this true — a false here means an
-    /// `acquire_recurrent` hook was missed at the request's `start_pos == 0`.
+    /// A forward that reads `gdr_states` MUST see this true — a false here
+    /// means an `acquire_recurrent` hook was missed.
     pub(crate) fn has_recurrent(&self) -> bool {
         self.recurrent_acquired
     }
 
-    /// D2H snapshot of the current recurrent state. A full-attn-only model
-    /// (`num_linear == 0`) has empty `gdr_states`/`conv_states` but still reaches
-    /// the prefix-cache sidecar snapshot path — return an empty snapshot (no
-    /// device work) so `restore_recurrent_from_snapshot` (0==0 dims, no-op zips)
-    /// stays consistent.
+    /// A full-attn-only model (`num_linear == 0`) still reaches this path —
+    /// return an empty snapshot so `restore_recurrent_from_snapshot` (0==0
+    /// dims, no-op zips) stays consistent.
     pub(crate) fn snapshot_recurrent(
         &mut self,
         ctx: &DeviceContext,
@@ -447,8 +400,8 @@ impl Qwen35SlotState {
                 .memcpy_dtoh(&state.data, dst)
                 .map_err(|e| anyhow!("conv D2H failed: {e}"))?;
         }
-        // No stream synchronize: `as_slice` waits on each pinned buffer's own
-        // event, and stream order already keeps the next chunk off the state.
+        // `as_slice` waits on each pinned buffer's own event; stream order keeps
+        // the next chunk off the state.
         let gdr = self
             .gdr_pinned
             .iter()
@@ -470,8 +423,6 @@ impl Qwen35SlotState {
         Ok(Qwen35RecurrentSnapshot { gdr, conv })
     }
 
-    /// Allocate the pinned snapshot staging once per occupant. Sizes follow the
-    /// live state vectors, which `acquire_recurrent` fixes for the request.
     pub(crate) fn ensure_snapshot_staging(&mut self, ctx: &DeviceContext) -> Result<()> {
         if self.gdr_pinned.len() == self.gdr_states.len()
             && self.conv_pinned.len() == self.conv_states.len()
@@ -481,8 +432,8 @@ impl Qwen35SlotState {
         self.gdr_pinned.clear();
         self.conv_pinned.clear();
         for state in &self.gdr_states {
-            // SAFETY: the buffer is written only by the D2H above, after which
-            // `synchronize` has completed it; freed with the slot state.
+            // SAFETY: written only by the D2H above, after which synchronize
+            // has completed it; freed with the slot state.
             self.gdr_pinned.push(unsafe {
                 ctx.ctx
                     .alloc_pinned::<f32>(state.len())
@@ -490,7 +441,6 @@ impl Qwen35SlotState {
             });
         }
         for state in &self.conv_states {
-            // SAFETY: as above.
             self.conv_pinned.push(unsafe {
                 ctx.ctx
                     .alloc_pinned::<bf16>(state.data.len())
@@ -500,9 +450,7 @@ impl Qwen35SlotState {
         Ok(())
     }
 
-    /// H2D restore from a sidecar snapshot. The slot MUST have acquired recurrent
-    /// buffers before calling (call `acquire_recurrent` first). Errors if
-    /// dims mismatch (stale snapshot from a different checkpoint).
+    /// Errors if dims mismatch (stale snapshot from a different checkpoint).
     pub(crate) fn restore_recurrent_from_snapshot(
         &mut self,
         ctx: &DeviceContext,
@@ -532,23 +480,17 @@ impl Qwen35SlotState {
         Ok(())
     }
 
-    /// Advance the materialized length by `n` tokens. The captured decode
-    /// graph's caller uses this: the graph body
-    /// ([`Qwen35Model::forward_decode_step_captured`]) is host-state-free —
-    /// replay re-launches only GPU work — so the host-side length advance
-    /// happens exactly once per step at the call site, never inside the
-    /// captured closure.
+    /// The captured decode graph body is host-state-free (replay re-launches
+    /// only GPU work), so the host-side length advance happens at the call
+    /// site, never inside the captured closure.
     pub(crate) fn advance_seq_len(&mut self, n: usize) {
         self.seq_len += n;
     }
 
-    /// Snapshot the linear-attention recurrent + conv-ring state into caller
-    /// scratch, before a speculative verify pass. The 48 gated-delta layers
-    /// advance their state **in place, content-based, no position index**
-    /// (`gated_delta_rule_decode_cuda` / `_prefill_recurrent_cuda`), so they do
-    /// NOT self-heal under a seq_len rewind — they must be restored on reject.
-    /// The full-attn K/V caches are position-indexed and self-heal via the
-    /// rewind, so they are intentionally not copied here.
+    /// The gated-delta layers advance their state in place, content-based, no
+    /// position index, so they do NOT self-heal under a seq_len rewind — they
+    /// must be restored on reject. Full-attn K/V is position-indexed and
+    /// self-heals, so it's intentionally not copied here.
     pub(crate) fn snapshot_linear_into(
         &self,
         ctx: &DeviceContext,
@@ -576,8 +518,6 @@ impl Qwen35SlotState {
         Ok(())
     }
 
-    /// Restore the linear-attention recurrent + conv-ring state from a snapshot
-    /// taken by [`Self::snapshot_linear_into`] (speculative verify rejected).
     pub(crate) fn restore_linear_from(
         &mut self,
         ctx: &DeviceContext,
@@ -605,38 +545,24 @@ impl Qwen35SlotState {
         Ok(())
     }
 
-    /// Rewind the full-attn cache cursor (speculative verify accepted `len`
-    /// tokens). Stale rows `[len, prev_seq_len)` are position-indexed and get
-    /// overwritten by the next real token at that position — no copy needed.
+    /// Stale rows are position-indexed and get overwritten by the next real
+    /// token at that position — no copy needed.
     pub(crate) fn set_seq_len(&mut self, len: usize) {
         self.seq_len = len;
     }
 
-    /// Free the per-slot full-attn contiguous K/V caches. Since the shared-paged
-    /// migration the DEFAULT build never allocates them (`new_linear_only` leaves
-    /// `k_caches`/`v_caches` empty), so this is a no-op there. The linear-attn
-    /// recurrent + conv-ring state (`gdr_states`/`conv_states`) is untouched.
-    #[allow(dead_code)] // legacy contiguous-lane helper; the paged default never allocates these.
+    /// No-op by default: the paged migration never allocates `k_caches`/
+    /// `v_caches`.
+    #[allow(dead_code)] // legacy contiguous-lane helper
     pub(crate) fn free_full_attn_caches(&mut self) {
         self.k_caches = Vec::new();
         self.v_caches = Vec::new();
     }
 
-    /// Serialize this slot's COMPLETE device state into a host image for G3
-    /// whole-slot spill, then FREE the device buffers (pages back to
-    /// `full_attn_kv`, recurrent block back to `pool`). The engine frees the slot
-    /// right after `demote_slot`, so the trailing `ctx.sync()` (inside
-    /// `copy_pages_to_host` for pages, explicit here for the recurrent D2H) makes
-    /// the host image complete before any device buffer is reused.
-    ///
-    /// Captured buffers (every device buffer the slot owns, proven complete):
-    ///   (a) full-attn KV pages — `copy_pages_to_host`, then drop the mirror
-    ///       (the host pool frees them right after `demote_slot`).
-    ///   (b) `gdr_states[0..num_linear]` (f32) — `clone_dtoh` each.
-    ///   (c) `conv_states[0..num_linear]` (bf16) — `clone_dtoh` each.
-    ///   (d) `seq_len`.
-    /// Then `release_recurrent` returns the recurrent block to the free-list.
-    /// `k_caches`/`v_caches` are asserted empty (paged default) — not captured.
+    /// The engine frees the slot right after `demote_slot`, so the trailing
+    /// sync (inside `copy_pages_to_host` for pages, explicit here for the
+    /// recurrent D2H) makes the host image complete before any device buffer
+    /// is reused.
     pub(crate) fn swap_out_image(
         &mut self,
         ctx: &DeviceContext,
@@ -655,12 +581,11 @@ impl Qwen35SlotState {
             self.seq_len,
             full_attn_kv.seq_len(slot)
         );
-        // (a) Full-attn KV pages (slot-logical order). `copy_pages_to_host` ends
-        // in `ctx.sync()`, so the host bytes are complete here.
+        // `copy_pages_to_host` ends in `ctx.sync()`, so the host bytes are
+        // complete here.
         let pages = full_attn_kv.page_indices(slot).to_vec();
         let full_attn_pages = full_attn_kv.copy_pages_to_host(ctx, &pages)?;
         let full_attn_page_count = pages.len();
-        // (b) + (c) recurrent + conv D2H (stream-ordered; sync below covers them).
         let gdr_host = self
             .gdr_states
             .iter()
@@ -679,8 +604,7 @@ impl Qwen35SlotState {
                     .map_err(|e| anyhow!("Qwen3.6 swap conv-state D2H failed: {e}"))
             })
             .collect::<Result<Vec<_>>>()?;
-        // The clone_dtoh copies above are stream-ordered; drain before the host
-        // image is stored/read.
+        // clone_dtoh is stream-ordered; drain before the host image is read.
         ctx.sync()?;
         let image = Qwen35SlotImage {
             full_attn_pages,
@@ -689,19 +613,15 @@ impl Qwen35SlotState {
             conv_host,
             seq_len: self.seq_len,
         };
-        // Free every device buffer now that the image owns the state.
         full_attn_kv.mirror_slot(slot, &[], 0)?;
         self.release_recurrent(recurrent_pool);
         self.seq_len = 0;
         Ok(image)
     }
 
-    /// Restore a whole-slot image — the exact byte-inverse of
-    /// [`Self::swap_out_image`]. Mirror the host pages the engine re-allocated,
-    /// acquire a recurrent block, H2D the captured bytes verbatim (the SAME
-    /// session restores its OWN state), set `seq_len`. The engine resumes
-    /// decode immediately after `promote_slot`, so the trailing `ctx.sync()`
-    /// makes the device restore complete before the host image can be dropped.
+    /// The engine resumes decode immediately after `promote_slot`, so the
+    /// trailing `ctx.sync()` makes the device restore complete before the host
+    /// image can be dropped.
     pub(crate) fn swap_in_image(
         &mut self,
         ctx: &DeviceContext,
@@ -714,11 +634,10 @@ impl Qwen35SlotState {
         image: &Qwen35SlotImage,
         slot_pages: &[u32],
     ) -> Result<()> {
-        // A scheduler-free slot may still hold its FINISHED previous occupant's
-        // device state: this arm vacates lazily at the next position-0 prefill,
-        // and a swap re-admission is exactly such a fresh occupancy. Release the
-        // stale state the same way `submit_prefill_row` does (#134 — the old
-        // empty-slot ensure here cost one graceful recompute per rotation pair).
+        // A scheduler-free slot may still hold its finished previous occupant's
+        // device state; a swap re-admission is a fresh occupancy. (#134 — the
+        // old empty-slot ensure here cost one graceful recompute per rotation
+        // pair.)
         if self.has_recurrent() {
             self.release_recurrent(recurrent_pool);
         }
@@ -751,18 +670,16 @@ impl Qwen35SlotState {
                 .memcpy_htod(src, &mut dst.data)
                 .map_err(|e| anyhow!("Qwen3.6 swap conv-state H2D failed: {e}"))?;
         }
-        // (d) materialized length (both the slot and the pool's allocator agree).
         self.seq_len = image.seq_len;
-        // H2D complete before the host image can be dropped (matches DSv4).
         ctx.sync()?;
         Ok(())
     }
 }
 
-#[allow(dead_code)] // consumed by mtp_forward_level + spec_step (next increments)
+#[allow(dead_code)] // consumed by mtp_forward_level + spec_step
 
 impl DenseMlp {
-    /// SwiGLU intermediate width (half the fused projection's output rows).
+    /// Half the fused projection's output rows (SwiGLU gate+up).
     pub(crate) fn inter_dim(&self) -> usize {
         self.gate_up_proj.rows / 2
     }

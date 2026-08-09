@@ -58,8 +58,7 @@ pub(crate) mod conv_probe {
         weight: &DeviceVec,
         state: &DeviceVec,
     ) -> Result<Option<Pending>> {
-        // Conv arithmetic is identical across all layers; one layer suffices and
-        // avoids downloading every layer's state.
+        // Conv arithmetic is identical across all layers; one layer suffices and avoids downloading every layer's state.
         let needed = linear_idx == 0 && CAPTURES.with(|captures| captures.borrow().is_some());
         if !needed {
             return Ok(None);

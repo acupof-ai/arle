@@ -26,13 +26,11 @@ pub(crate) struct LinearAttn {
     /// Row-fused `[b; a]` (`[2*Vh, hidden]`): one GEMM per step, split into
     /// the per-head b/a scalars downstream. b = rows `0..Vh`, a = `Vh..2*Vh`.
     pub(crate) in_proj_ba: DeviceMatrix,
-    /// Depthwise conv1d weight `[qkv_dim*kernel]` bf16.
     pub(crate) conv1d_weight: DeviceVec,
     pub(crate) dt_bias: DeviceVec,
-    /// `A_log` `[num_value_heads]` f32 (this rank's v-head shard under TP).
+    /// This rank's v-head shard under TP.
     pub(crate) a_log: CudaSlice<f32>,
-    /// Gated output RMSNorm scale `[value_head_dim]` f32, broadcast across
-    /// heads by rms_norm_gated (norm.cu `weight[tid]`) — replicated under TP.
+    /// Gated output RMSNorm scale, broadcast across heads; replicated under TP.
     pub(crate) norm_weight: CudaSlice<f32>,
     pub(crate) out_proj: DeviceMatrix,
 }
@@ -334,7 +332,6 @@ impl Qwen35Model {
             )?;
         }
 
-        // Per-head sigmoid gate from q_full's gate half.
         {
             let (qf_ptr, _g0) = q_full.data.device_ptr(&self.ctx.stream);
             let (o_ptr, _g1) = attn_out.data.device_ptr_mut(&self.ctx.stream);
@@ -875,7 +872,6 @@ impl Qwen35Model {
             attn_probe::finish(&self.ctx, attn_capture, attn_out)?;
         }
 
-        // Per-head sigmoid gate from q_full's gate half.
         {
             let (qf_ptr, _g0) = q_full.data.device_ptr(&self.ctx.stream);
             let (o_ptr, _g1) = attn_out.data.device_ptr_mut(&self.ctx.stream);
