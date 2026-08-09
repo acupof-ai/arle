@@ -29,121 +29,58 @@ python3 scripts/gen_bench_prompts.py bench-agent-32k-16x8.jsonl 16 32000 214 8
 
 ## Qwen3.6-27B-FP8 · 1×H20 · single-GPU · eager — LONG-AGENT ANCHOR
 
-### SOTA — DSpark, `70760bc09` (2026-08-07)
+### SOTA — DSpark, runtime `9b38ba6c0`, runner `c98c4e0b2` (2026-08-10)
 
-> **The c≥4 decode regression is closed.** Two per-row host loops were costing
-> B× the kernel launches per layer: the verify linear core
-> ([`wins/2026-08-07-dspark-verify-linear-core-batched.md`](experience/wins/2026-08-07-dspark-verify-linear-core-batched.md))
-> and the partial-accept rollback replay
-> ([`wins/2026-08-07-dspark-rollback-replay-batched.md`](experience/wins/2026-08-07-dspark-rollback-replay-batched.md)).
-> Both were reachable only because a flag defaulting on turned a minority branch
-> into the only path. Together they take c=16 TPOT 124.99 → 110.52 ms (−11.6%),
-> putting it 0.9% AHEAD of the 07-30 champion it had been 21.5% behind. The
-> audit that opened the regression is in
-> [`wins/2026-08-06-dspark-anchor-remeasure-c1-plus-40-percent.md`](experience/wins/2026-08-06-dspark-anchor-remeasure-c1-plus-40-percent.md).
->
-> **Decode is launch-bound, prefill is not.** A pure-decode nsys window is 71.5%
-> GPU idle at 19157 launches/s; a prefill window is ≥76% busy with the dominant
-> GEMM at 92.7% SM throughput. Cost a decode-side lever against the first
-> number and a prefill-side one against the second — a measurement that does not
-> name its phase says nothing about the other
-> ([`errors/2026-08-07-measured-prefill-concluded-about-decode.md`](experience/errors/2026-08-07-measured-prefill-concluded-about-decode.md)).
+This row re-anchors the corrected model and benchmark semantics. The Qwen3Next
+target final norm uses `(1+w)`; the Qwen3 DFlash draft uses plain-weight
+RMSNorm. The fixed-output runner sends `ignore_eos=true`, and its
+production-length warmup has a disjoint prefix-cache key.
 
 Features on: batched draft · replay · snapshot · capture · markov+confidence
 head driving the goodput budget. Serve adds `--spec-type dspark
---mtp-draft-model Qwen3.6-27B-DFlash --dspark-block-size 6`; `--spec-max-batch`
-is the shipped default 16.
+--mtp-draft-model /host/Qwen3.6-27B-DFlash --dspark-block-size 6`; 16 slots,
+195 MiB per slot.
 
-**Schema changed with this row.** It is driven by `bench_throughput.py`, which
-does not emit `burst`, `occ`, `tok/row`, or per-point `prefix hit`. Those
-columns are dropped rather than carried forward at their 07-30 values. `accept`
-is the run's cumulative rate, not per-point.
+Identity:
 
-A spec row carries `tok/row` (committed tokens per verify row; plain decode
-= 1.0) and `burst`, never ITL p50 — a spec step emits `k+1` tokens back-to-back,
-so most recorded ITLs are the within-chain gap.
+- Runtime commit `9b38ba6c01def7b44c8dc6ee90c38249aee2bf8d`
+- Runner commit `c98c4e0b2`
+- Binary SHA-256 `5df97e8711ecda7787106a503b7dea432adbab5e865587c9f8a85725d0f078ca`
+- Kernel bundle `e9454f1fc2320f4a62cabe87407442759f956cb4941cb632db953e19ca882cec`
+- GPU `GPU-77551814-ffe0-d267-728e-a3a20a0612de` (H20)
+- Dataset SHA-256 `8867f63eaac2f0537bb2b17847a7d0d3c1bb8d504c1ad191e97d673e9ecc4f34`
 
-One serve, ascending, so `pt` is 1st through 5th — every point but c=1 inherits
-a warm cache. `TTFT cold` is the p90 of the 128 requests (16 of them are turn 0);
-`TTFT warm` is the p50.
+One fresh serve, ascending concurrency. ITL mean is the per-output-token latency
+for speculative decode; event-level ITL percentiles include burst emission and
+must not be converted into per-token throughput.
 
-**Every cell is the mean of two sweeps run in opposite orders.** The arm that
-runs second on a shared box loads cold (1173 s to ready against 15 s) and
-measures 3–6.5% slower — larger than the drift band, so a single sweep confounds
-the binary with its position. Counterbalance any A/B on this row.
+| c | prefix hits | accept | TTFT p50/p99 | ITL mean/p99 | output tok/s | total tok/s | req/s |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 112/128 | 41.57% | 951.9 / 10276.7 ms | 10.56 / 49.46 ms | 47.47 | 7762.61 | 0.222 |
+| 2 | 128/128 | 27.45% | 564.4 / 976.2 ms | 17.08 / 94.75 ms | 98.85 | 16165.85 | 0.462 |
+| 4 | 128/128 | 27.81% | 625.2 / 1470.3 ms | 29.57 / 513.63 ms | 123.07 | 20125.66 | 0.575 |
+| 8 | 128/128 | 26.90% | 613.0 / 3668.8 ms | 49.85 / 542.96 ms | 151.59 | 24790.76 | 0.708 |
+| 16 | 128/128 | 27.32% | 939.0 / 8141.3 ms | 92.27 / 760.58 ms | 162.60 | 26590.69 | 0.760 |
 
-`TPOT` is `itl_mean`, and for a spec row that is the only honest per-token
-number: `itl_p50` reads 0.02 ms because it samples the within-chain gap.
-`decode tok/s = 1000 / TPOT` is per request and excludes prefill; `total tok/s`
-is the whole-run figure and does not.
+Every point completed 128/128 with zero incomplete, error, empty, or
+correctness-failed responses. Prompt tokens are 32425 / 34827.5 / 37248
+min/p50/max; p50 is +8.84% from the 32K target and passes the ±10% gate.
+Completion tokens are exactly 214 / 214 / 214.
 
-| c | pt | TTFT cold | TTFT warm | TPOT | decode tok/s | total tok/s | req/s |
-|---|---|---:|---:|---:|---:|---:|---:|
-| 1 | 1st | 10.82 s | 0.84 s | 8.46 ms | **118.1** | **10453.0** | 0.300 |
-| 2 | 2nd | 0.84 s | 0.60 s | 18.70 ms | 53.5 | 22878.9 | 0.656 |
-| 4 | 3rd | 1.08 s | 0.63 s | 33.77 ms | 29.6 | 27160.7 | 0.778 |
-| 8 | 4th | 1.60 s | 0.79 s | **62.49 ms** | 16.0 | 31334.5 | 0.898 |
-| 16 | 5th | 2.90 s | 1.22 s | **110.52 ms** | 9.0 | **33780.3** | 0.968 |
+The c=1 point has the expected 112 warm hits: 16 cold turn-0 requests followed
+by seven reusable turns per session. The old runner reported 113 because its
+warmup used dataset prompt zero. Later points are fully warm because the grid is
+ascending, so this row is the canonical workload baseline and not a pure
+concurrency-scaling experiment.
 
-128/128 at every point, both sweeps, 0 errors. `prompt_tokens` 34782/request
-against a 32000 target (+8.7%, inside the ±10% bar). Cumulative `accept`
-0.3039 / 0.2977 across the two sweeps. Acceptance is not the correctness gate —
-the batched recurrent core is not bit-identical to per-row FlashQLA, so the
-numerics shift which draft tokens verify; correctness is gated by
-`scripts/needle_concurrent.py` (a distinct needle per row at c=2/8/16, ×3).
+Correctness: concurrent needle c=2/8/16 ×3 passed 78/78 exact with zero misses.
+The same repaired runtime produced 26.90-27.81% acceptance at c=2-16, recovering
+from the pre-fix 0.334% and matching the historical ~27.6% range.
 
-`itl_p99` at c=16 is 758.8 ms against a 110.52 ms mean, and the cause is NOT the
-per-tick prefill budget. Swept on one binary with the default run twice as its
-own control, `--max-num-batched-tokens` 16384 → 2048 is 0.0% and → 512 is 13.3%
-*worse*; the budget almost never binds, because prefix caching leaves each agent
-turn only ~864 new tokens. **16384 stays.** Do not read the ~65-token roofline
-ridge as an argument for lowering it — the ridge is a lower bound, and splitting
-the same work across more forwards just re-pays the weight read
-([`errors/2026-08-07-two-nulls-pinned-staging-and-the-token-budget.md`](experience/errors/2026-08-07-two-nulls-pinned-staging-and-the-token-budget.md)).
-Same-config repeat spread on that sweep was 5.7%.
-
-**Measured drift band, ±2.7%.** The same sweep run twice gave total tok/s
-10444.2 / 20484.9 / 24666.9 / 29450.8 / 31313.7 — the row above is the idle-box
-repeat, and the spread across the pair is what a candidate has to clear. Use
-this, not the ±3% constant at the top of the file, for this workload.
-
-**The 07-30 champion, kept as the closed regression's other arm** —
-`51985031d` · `arle-mk`, re-run on the same box and dataset on 2026-08-06.
-TPOT (ms), decode only:
-
-| c | `arle-mk` (07-30 champion) | `b8d390bf3` (08-06, the regression) | this row |
-|---|---:|---:|---:|
-| 1 | 9.69 | 8.46 | **8.46** |
-| 2 | 19.82 | 18.89 | **18.70** |
-| 4 | 35.69 | 36.23 | **33.77** |
-| 8 | 63.68 | 69.89 | **62.49** |
-| 16 | 111.53 | 135.51 | **110.52** |
-
-The champion reproduced its own recorded row to within 1.1% at c=1 and 1.9% at
-c=16 when re-run, so the 08-06 deficit was a regression and not drift. Both
-per-row host loops behind it are fixed; this row is ahead of the champion at
-every point.
-
-The champion's binary no longer exists on the pod — `/host/spec-phase` and
-`/host/gdr-gates` were deleted between 08-06 and 08-07 — so the middle column is
-the last measurement anyone will get from it. An archived binary is a control
-only while it exists; the 08-07 A/Bs had to build their own control arm from
-the parent commit.
-
-Two properties of this row are load-bearing when reading it:
-
-- **`accept` tracks `pt`, not `c`.** A serve's first point misses the dataset's
-  16 turn-0 sessions; later points inherit the cache. At matched c=16: 0.532 as
-  a fresh serve's sole point vs 0.313 as a later point — **+70% from cache
-  state alone**. "Accept halves at concurrency" is withdrawn.
-- **`occ` and `burst` are not in this row's schema.** When a driver does emit
-  them: `occ = out tok/s / (c × decode tok/s)` is the fraction of wall clock a
-  slot decodes rather than waits on prefill, and at low `occ` `burst` is
-  inflated ~1/occ. Never read `burst` as a kernel cost.
-
-DSpark over the same binary with spec off: 2.9× (c=1), 2.5× (c=2), 2.0× (c=4),
-1.4× (c=8), 1.1× (c=16).
-
+Raw artifacts:
+`/host/agent-infer-9b38-g2/artifacts/c98-baseline/`. This fingerprint has one
+valid sweep; use a matched A/B for candidate deltas until a repeat establishes
+its drift band.
 ### Step budget — where the time goes (2026-08-01, `nsys`, dense FP8)
 
 The SOTA table says how fast; this says what to fix.
@@ -448,4 +385,3 @@ scalar path's grows (+1.085e-3 at cp=2 to +1.655e-3 at cp=4). See
 | 27B cp=1 seq=81920 | forward completes (3972.216 s), **backward OOMs** on `cuda alloc_zeros failed`. Host RSS 104.5 GB. The failing tensor is not named by the log. |
 | 27B cp=2 seq=131072 | fits — backward peak 94,175 MiB (96.6%), ~3.3 GB headroom (2026-08-02, older commit) |
 | 27B cp=4 seq=131072 | full step ~3100 s, host RSS 170.4 GiB total / ~44.6 GB per rank (2026-08-03, scalar ring, older commit) |
-
