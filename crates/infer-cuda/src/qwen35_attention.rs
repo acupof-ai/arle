@@ -35,6 +35,57 @@ pub(crate) struct LinearAttn {
     pub(crate) out_proj: DeviceMatrix,
 }
 
+fn format_fq_parity_metrics(reference: &[f64], actual: &[f64], rel_floor: f64) -> String {
+    assert_eq!(reference.len(), actual.len());
+    let mut abs_errors = Vec::with_capacity(reference.len());
+    let mut squared_error = 0.0;
+    let mut max_rel = 0.0f64;
+    let mut dot = 0.0;
+    let mut reference_norm = 0.0;
+    let mut actual_norm = 0.0;
+    let mut non_finite_mismatch = 0;
+    for (&reference, &actual) in reference.iter().zip(actual) {
+        if !reference.is_finite() || !actual.is_finite() {
+            non_finite_mismatch += usize::from(reference.to_bits() != actual.to_bits());
+            continue;
+        }
+        let abs = (reference - actual).abs();
+        abs_errors.push(abs);
+        squared_error += abs * abs;
+        max_rel = max_rel.max(abs / reference.abs().max(rel_floor));
+        dot += reference * actual;
+        reference_norm += reference * reference;
+        actual_norm += actual * actual;
+    }
+    abs_errors.sort_unstable_by(f64::total_cmp);
+    let max_abs = abs_errors.last().copied().unwrap_or(0.0);
+    let p99_index = (99 * abs_errors.len()).div_ceil(100).saturating_sub(1);
+    let p99_abs = abs_errors.get(p99_index).copied().unwrap_or(0.0);
+    let rmse = (squared_error / abs_errors.len().max(1) as f64).sqrt();
+    let rel_l2 = (squared_error / reference_norm.max(1e-30)).sqrt();
+    let cosine = if reference_norm == 0.0 && actual_norm == 0.0 {
+        1.0
+    } else if reference_norm == 0.0 || actual_norm == 0.0 {
+        0.0
+    } else {
+        dot / (reference_norm * actual_norm).sqrt()
+    };
+    format!(
+        "max_abs={max_abs:.9e} p99_abs={p99_abs:.9e} rmse={rmse:.9e} \
+         max_rel={max_rel:.9e} rel_floor={rel_floor:.1e} rel_l2={rel_l2:.9e} \
+         cosine={cosine:.9} non_finite_mismatch={non_finite_mismatch}"
+    )
+}
+
+#[cfg(test)]
+#[test]
+fn fq_parity_metrics_reports_distribution_and_non_finite_mismatch() {
+    let report = format_fq_parity_metrics(&[0.0, 1.0, f64::INFINITY], &[0.0, 1.5, 0.0], 1e-6);
+    assert!(report.contains("max_abs=5.000000000e-1"));
+    assert!(report.contains("rmse=3.535533906e-1"));
+    assert!(report.contains("non_finite_mismatch=1"));
+}
+
 impl Qwen35Model {
     pub(crate) fn full_attention(
         &self,
@@ -1628,31 +1679,22 @@ impl Qwen35Model {
                 }
                 let a = self.ctx.stream.clone_dtoh(&*gdr_state)?;
                 let b = self.ctx.stream.clone_dtoh(&snap)?;
-                let (mut n2, mut d2) = (0f64, 0f64);
-                for (x, y) in a.iter().zip(b.iter()) {
-                    let d = (*x - *y) as f64;
-                    n2 += d * d;
-                    d2 += (*y as f64) * (*y as f64);
-                }
                 let oc = self.ctx.stream.clone_dtoh(&*gdr_out)?;
                 let orf = self.ctx.stream.clone_dtoh(&o_ref.data)?;
-                let (mut on2, mut od2) = (0f64, 0f64);
-                let (mut worst, mut worst_i) = (0f64, 0usize);
-                for (i, (x, y)) in oc.iter().zip(orf.iter()).enumerate() {
-                    let d = (x.to_f32() - y.to_f32()) as f64;
-                    on2 += d * d;
-                    od2 += (y.to_f32() as f64) * (y.to_f32() as f64);
-                    if d.abs() > worst {
-                        worst = d.abs();
-                        worst_i = i;
-                    }
-                }
+                let state_actual = a.iter().map(|value| f64::from(*value)).collect::<Vec<_>>();
+                let state_reference = b.iter().map(|value| f64::from(*value)).collect::<Vec<_>>();
+                let output_actual = oc
+                    .iter()
+                    .map(|value| f64::from(value.to_f32()))
+                    .collect::<Vec<_>>();
+                let output_reference = orf
+                    .iter()
+                    .map(|value| f64::from(value.to_f32()))
+                    .collect::<Vec<_>>();
                 eprintln!(
-                    "[fq-parity] layer={linear_idx} seq={seq_len} state_rel={:.3e} o_rel={:.3e} o_worst={:.3}@tok{}",
-                    (n2 / (d2 + 1e-30)).sqrt(),
-                    (on2 / (od2 + 1e-30)).sqrt(),
-                    worst,
-                    worst_i / z_dim
+                    "[fq-parity] layer={linear_idx} seq={seq_len} state_{} output_{}",
+                    format_fq_parity_metrics(&state_reference, &state_actual, 1e-9),
+                    format_fq_parity_metrics(&output_reference, &output_actual, 1e-6),
                 );
             }
         }
