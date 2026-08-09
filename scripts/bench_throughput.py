@@ -170,6 +170,7 @@ async def send_streaming(
                 "prompt": prompt,
                 "max_tokens": max_tokens,
                 "temperature": temperature,
+                "ignore_eos": True,
                 "stream": True,
                 "stream_options": {"include_usage": True},
             },
@@ -455,6 +456,7 @@ async def async_main(args: argparse.Namespace) -> int:
             "seconds_per_concurrency": args.seconds_per_concurrency,
             "max_tokens": args.max_tokens,
             "temperature": args.temperature,
+            "ignore_eos": True,
         },
         "points": [],
     }
