@@ -1683,9 +1683,9 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
     }
 
     /// Lazy on backends that can compose the row-gather into their eval
-    /// stream (Metal: upload `ids` as a tiny int32 array + `mlx_take_axis`
-    /// + reshape, no eval). Output shape is `[1, ids.len(), dim]` —
-    /// matching `ops::embedding`'s convention of treating raw ids as a
+    /// stream (Metal: upload `ids` as a tiny int32 array, `mlx_take_axis`,
+    /// reshape, no eval). Output shape is `[1, ids.len(), dim]`. This
+    /// matches the `ops::embedding` convention of treating raw ids as a
     /// single batch row.
     fn embedding(
         &self,
