@@ -463,7 +463,15 @@ async def async_main(args: argparse.Namespace) -> int:
     limits = httpx.Limits(max_connections=max(args.concurrency_grid))
     timeout = httpx.Timeout(args.timeout_seconds)
     async with httpx.AsyncClient(timeout=timeout, limits=limits) as client:
-        warmup = await send_streaming(client, args.url, args.model, prompts[0], min(16, args.max_tokens), 0.0, -1)
+        warmup = await send_streaming(
+            client,
+            args.url,
+            args.model,
+            f"[ARLE benchmark warmup]\n{prompts[0]}",
+            min(16, args.max_tokens),
+            0.0,
+            -1,
+        )
         if not warmup.gate_pass:
             print(f"warmup failed: {warmup.error or warmup.correctness_error}", file=sys.stderr)
             return 2

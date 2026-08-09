@@ -70,6 +70,13 @@ class BenchThroughputTest(unittest.TestCase):
                 self.assertEqual(report["schema"], "arle.bench_throughput.v1")
                 self.assertTrue(report["config"]["ignore_eos"])
                 self.assertTrue(all(request["ignore_eos"] for request in Handler.requests))
+                self.assertTrue(
+                    Handler.requests[0]["prompt"].startswith("[ARLE benchmark warmup]")
+                )
+                self.assertTrue(all(
+                    not request["prompt"].startswith("[ARLE benchmark warmup]")
+                    for request in Handler.requests[1:]
+                ))
                 self.assertEqual((summary["complete"], summary["error"]), (2, 0))
                 self.assertEqual((summary["prompt_tokens"], summary["output_tokens"]), (2, 4))
                 self.assertTrue(all(result["output_events"] == 2 for result in report["points"][0]["results"]))
