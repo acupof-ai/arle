@@ -1,18 +1,8 @@
-// Fused AdamW per-element update. Matches `cpu_adamw_step_in_place`
-// in `crates/autograd/src/backend.rs` to within float-rounding:
+// Fused AdamW update. Matches `cpu_adamw_step_in_place` in
+// `crates/autograd/src/backend.rs` to within float-rounding.
 //
-//   param *= (1 - lr*wd)                  // decoupled weight decay (skip if wd == 0)
-//   m      = beta1*m + (1-beta1)*g
-//   v      = beta2*v + (1-beta2)*g*g
-//   m_hat  = m / bc1
-//   v_hat  = v / bc2
-//   param -= lr * m_hat / (sqrt(v_hat) + eps)
-//
-// Each thread owns one element of `param`, `m`, `v`. All three are
-// mutated in place; `grad` is read-only. One launch fuses upload of
-// `grad` (done by the host caller via `clone_htod`) + the entire AdamW
-// formula, replacing the 3× readback + 3× upload + host loop the
-// default `Backend::adamw_step` would do.
+// One launch fuses the grad upload (host caller does `clone_htod`) with
+// the full AdamW formula, replacing 3x readback + 3x upload + host loop.
 extern "C" __global__ void adamw_step_f32(
     float* __restrict__ param,
     float* __restrict__ m,

@@ -1,28 +1,17 @@
-// PF8.2 — INT4 weight preprocessing for W4+FP8 marlin GEMM (without_zp variant only)
+// INT4 weight preprocessing for W4+FP8 marlin GEMM (without_zp variant).
 //
-// Verbatim port of vLLM's `csrc/quantization/marlin/marlin_int4_fp8_preprocess.cu`
-// `_without_zp` kernel under Apache 2.0 license. Adapts torch FFI →
-// extern "C" cudarc convention per ARLE's
-// crates/cuda-kernels/src/ffi/gemm.rs pattern.
+// Port of vLLM's marlin_int4_fp8_preprocess.cu `_without_zp` (Apache 2.0).
+// Merges zero-point=8 into INT4 weights at prep time so the runtime GEMM
+// skips the per-element zero-point subtract.
 //
-// Purpose: subtraction-merging zero-point=8 into INT4 weight tensor
-// at offline weight-prep time, so the runtime W4+FP8 marlin GEMM
-// kernel doesn't need per-element zero-point subtract. Saves ~1
-// instruction per dequantized element.
+// AWQ variant omitted: ARLE has no AWQ checkpoint loader.
 //
-// AWQ variant SKIPPED for PF8.2 (ARLE has no AWQ checkpoint loader);
-// add later if AWQ format support lands.
-//
-// Used by NEW prefill-only FP8 directive (Substep PF8.2, ~120 LOC).
-//
-// License: Apache 2.0 (per vLLM upstream `marlin.cu` attribution)
-// Adapted from: https://github.com/vllm-project/vllm/blob/main/csrc/quantization/marlin/marlin_int4_fp8_preprocess.cu
+// Source: https://github.com/vllm-project/vllm/blob/main/csrc/quantization/marlin/marlin_int4_fp8_preprocess.cu
 
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <stdint.h>
 
-// for only non-zp format (like gptq)
 __global__ void marlin_int4_fp8_preprocess_kernel_without_zp(
     // qweight: (size_k * size_n / 8,) packed INT4 in INT32
     const int32_t* __restrict__ qweight,
@@ -34,11 +23,8 @@ __global__ void marlin_int4_fp8_preprocess_kernel_without_zp(
 #pragma unroll
   for (int32_t i = 0; i < 8; i++) {
     int32_t single_val = val & 0xF;
-    // Bake zero-point subtract: single_val ∈ [0,15], target offset = 8.
-    // For values ≥ 8: shift down by 8 (keep numeric distance to 0).
-    // For values < 8: invert as 15 - single_val (mirror around boundary).
-    // Net effect: matches what the upstream W4+FP8 marlin GEMM expects
-    // for sign-extended INT4 with zero-point=8.
+    // Merge zero-point=8: values >= 8 shift down, < 8 mirror (15 - v).
+    // Matches upstream W4+FP8 sign-extended INT4 expectation.
     single_val = single_val >= 8 ? single_val - 8 : 15 - single_val;
     new_val |= single_val << (i * 4);
     val >>= 4;
@@ -50,15 +36,15 @@ __global__ void marlin_int4_fp8_preprocess_kernel_without_zp(
 extern "C" cudaError_t marlin_int4_fp8_preprocess_without_zp_cuda(
     const int32_t* qweight,
     int32_t* output,
-    int32_t numel,    // qweight.numel() (INT32 element count, packs 8 INT4 each)
+    int32_t numel,    // INT32 element count (8 INT4 per INT32)
     cudaStream_t stream) {
   if (numel <= 0) {
     return cudaSuccess;
   }
   // Grid: each block processes 32 INT32 elements (256 INT4 weights).
-  // Per upstream check: numel * 8 % 256 == 0  ⇔  numel % 32 == 0.
+  // Upstream requires numel * 8 % 256 == 0  <=>  numel % 32 == 0.
   if (numel % 32 != 0) {
-    // Caller should ensure alignment; bail to surface error.
+    // Caller must ensure alignment; bail to surface the error.
     return cudaErrorInvalidValue;
   }
   int32_t blocks = numel / 32;

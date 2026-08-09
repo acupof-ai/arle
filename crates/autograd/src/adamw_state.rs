@@ -12,8 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{TensorId, optim::AdamW};
 
-/// Per-parameter AdamW moment state (first + second moment), tagged with the
-/// caller-supplied `name` and the shape at export time.
+/// `m`/`v` are the first and second moments; `shape` is captured at export time.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct AdamWParamState {
     pub name: String,
@@ -22,30 +21,21 @@ pub struct AdamWParamState {
     pub shape: Vec<usize>,
 }
 
-/// Full AdamW optimizer state: the step counter plus every known param's
-/// moments. `skipped_export` records how many internal AdamW entries were
-/// omitted during the most recent export (because the caller's `names` slice
-/// did not cover them). Defaults to 0 for freshly deserialized states.
+/// `skipped_export` counts internal AdamW entries omitted from the last export
+/// (caller's `names` slice did not cover them); `0` for freshly deserialized states.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct AdamWState {
     pub step: u64,
     pub params: Vec<AdamWParamState>,
-    /// Count of internal AdamW state entries not covered by the caller's
-    /// `names` slice during export. Populated by [`AdamW::export_state`];
-    /// `0` for any state that was freshly deserialized (the field round-trips
-    /// through serde so callers can propagate it across a save/load cycle).
+    /// Populated by [`AdamW::export_state`]; round-trips through serde so callers
+    /// can propagate it across a save/load cycle.
     #[serde(default)]
     pub skipped_export: usize,
 }
 
 impl AdamW {
-    /// Serialize moments for every `TensorId` listed in `names`.
-    ///
-    /// Any `TensorId` currently tracked in AdamW's internal state but missing
-    /// from `names` is skipped; the count of those skips is recorded in
-    /// [`AdamWState::skipped_export`]. Names whose `TensorId` has no state
-    /// yet (e.g. param never received a gradient) are silently omitted — they
-    /// have nothing to save.
+    /// Any tracked `TensorId` missing from `names` is skipped; the count lands in
+    /// [`AdamWState::skipped_export`]. Names with no state yet are omitted.
     pub fn export_state(&self, names: &[(TensorId, String)]) -> AdamWState {
         let params: Vec<AdamWParamState> = names
             .iter()
@@ -71,13 +61,8 @@ impl AdamW {
         }
     }
 
-    /// Restore moments for entries whose `name` matches one in `names`.
-    ///
-    /// Returns the count of params successfully restored. Entries in `state`
-    /// whose `name` has no corresponding `TensorId` in `names` (caller-side
-    /// mapping is authoritative — it's the up-to-date one) are silently
-    /// skipped. A shape mismatch between `state` and the current parameter
-    /// shape tracked by AdamW is a hard error.
+    /// Returns the count of params restored. Entries whose `name` isn't in `names`
+    /// are skipped (caller-side mapping is authoritative). Shape mismatch is a hard error.
     pub fn import_state(
         &mut self,
         state: &AdamWState,
@@ -93,7 +78,6 @@ impl AdamW {
         let mut restored = 0usize;
         for param in &state.params {
             let Some(&id) = lookup.get(param.name.as_str()) else {
-                // Caller's mapping doesn't cover this name. Skip silently.
                 continue;
             };
 
