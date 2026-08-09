@@ -189,7 +189,7 @@ __global__ void attention_gate_paged_hd256_kernel(
     int gate_idx = b * q_full_dim + q_head * 2 * HD256 + HD256 + dim;
 
     float gate = __bfloat162float(q_full_batch[gate_idx]);
-    float sig_gate = 1.0f / (1.0f + expf(-gate));
+    float sig_gate = 1.0f / (1.0f + __expf(-gate));
     float out = __bfloat162float(attn_out[idx]);
     attn_out[idx] = __float2bfloat16(out * sig_gate);
 }

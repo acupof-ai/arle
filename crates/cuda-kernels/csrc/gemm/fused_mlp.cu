@@ -116,7 +116,7 @@ __global__ void fused_mlp_intermediate_kernel(
           // Match HF: GEMV outputs are bf16, silu output is bf16, then bf16 × bf16
           __nv_bfloat16 gate_bf16 = __float2bfloat16(g);
           float gf = __bfloat162float(gate_bf16);
-          float silu_g = gf / (1.0f + expf(-gf));
+          float silu_g = gf / (1.0f + __expf(-gf));
           __nv_bfloat16 silu_bf16 = __float2bfloat16(silu_g);
           __nv_bfloat16 up_bf16 = __float2bfloat16(u);
           float result = __bfloat162float(silu_bf16) * __bfloat162float(up_bf16);

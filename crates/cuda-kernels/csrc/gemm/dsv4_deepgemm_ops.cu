@@ -59,7 +59,7 @@ __device__ __forceinline__ float dg_swiglu(uint16_t gate_bits, uint16_t up_bits,
   float up = dg_bf16_to_f32(up_bits);
   gate = fminf(gate, limit);
   up = fminf(fmaxf(up, -limit), limit);
-  return (gate / (1.0f + expf(-gate))) * up;
+  return (gate / (1.0f + __expf(-gate))) * up;
 }
 
 __global__ void dsv4_deepgemm_pack_quantize_bf16_to_fp8_kernel(

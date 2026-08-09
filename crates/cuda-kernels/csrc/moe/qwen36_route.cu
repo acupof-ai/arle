@@ -70,8 +70,8 @@ extern "C" cudaError_t qwen36_renorm_topk_weights_cuda(
 // `shared_y = sigmoid(x @ shared_expert_gate) * shared_y; return y + shared_y`.
 
 __device__ __forceinline__ float qwen36_sigmoid(float v) {
-  if (v >= 0.0f) return 1.0f / (1.0f + expf(-v));
-  float e = expf(v);
+  if (v >= 0.0f) return 1.0f / (1.0f + __expf(-v));
+  float e = __expf(v);
   return e / (1.0f + e);
 }
 

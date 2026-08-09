@@ -359,7 +359,7 @@ static __device__ __forceinline__ float moe_decode_dot8(float acc,
 
 // Matches silu_mul_one (csrc/misc/elementwise_basic.cu): fp32 sigmoid form.
 static __device__ __forceinline__ float moe_decode_silu(float g) {
-    return g / (1.0f + expf(-g));
+    return g / (1.0f + __expf(-g));
 }
 
 // Single-output decode grouped GEMM (down projection).

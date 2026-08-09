@@ -62,7 +62,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(50);
 #[cfg(test)]
 pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// One subprocess to run. Mirrors the fields the sandbox sets on a `Command`.
+/// Mirrors the fields the sandbox sets on a `Command`.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SpawnRequest {
     pub program: String,
@@ -80,7 +80,6 @@ pub struct SpawnRequest {
     pub timeout_s: u64,
 }
 
-/// Result of one spawn.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SpawnResponse {
     pub stdout: Vec<u8>,
@@ -105,8 +104,6 @@ fn read_frame<R: Read>(r: &mut R) -> std::io::Result<Vec<u8>> {
     r.read_exact(&mut buf)?;
     Ok(buf)
 }
-
-// ───────────────────────── server (helper process) ─────────────────────────
 
 /// Run the spawner server loop on the socket named by `ARLE_SPAWNER_LISTEN`.
 /// Called from the `arle` entry point when that env is set; never returns under
@@ -151,7 +148,7 @@ pub fn serve_loop() -> i32 {
 fn handle_conn(mut stream: UnixStream) {
     let req_bytes = match read_frame(&mut stream) {
         Ok(b) => b,
-        Err(_) => return, // client hung up
+        Err(_) => return,
     };
     let req: SpawnRequest = match serde_json::from_slice(&req_bytes) {
         Ok(r) => r,
@@ -282,8 +279,6 @@ fn kill_group(pgid: i32) {
     unsafe { libc::kill(-pgid, libc::SIGKILL) };
 }
 
-// ───────────────────────── client (CUDA-resident parent) ─────────────────────────
-
 /// Connects to the spawner socket and runs spawns there instead of forking.
 /// Cloneable + cheap (just the socket path); a fresh connection is opened per
 /// request so it is `Send`-safe across the sandbox executor.
@@ -304,7 +299,6 @@ impl SpawnClient {
             })
     }
 
-    /// Send one request, block for the response.
     pub fn run(&self, req: &SpawnRequest) -> std::io::Result<SpawnResponse> {
         let mut stream = UnixStream::connect(&self.socket)?;
         let bytes = serde_json::to_vec(req)
@@ -315,8 +309,6 @@ impl SpawnClient {
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
     }
 }
-
-// ───────────────────────── parent-side launch ─────────────────────────
 
 /// Owns the helper child; killing it on drop tears the helper down with the run.
 pub struct SpawnerHandle {
@@ -443,7 +435,6 @@ mod tests {
             std::env::set_var(LISTEN_ENV, &sock);
         }
         let server = std::thread::spawn(serve_loop);
-        // Wait for bind.
         let deadline = Instant::now() + Duration::from_secs(5);
         while !sock.exists() {
             assert!(Instant::now() < deadline, "server never bound");

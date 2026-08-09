@@ -90,15 +90,13 @@ __device__ __forceinline__ int32_t arle_dsv4_flashmla_decode_index_at(
         int num_logical_pages,
         int total_blocks) {                      // whole-pool page count for the route OOB guard
     if (start_pos < 0) return -1;
-    // SW slot count for this decode token. Decode is single-token (s_q=1)
-    // so the SW window covers positions [max(0, start_pos - sw + 1), start_pos].
+    // Decode is single-token (s_q=1): SW window covers
+    // positions [max(0, start_pos - sw + 1), start_pos].
     int sw_start = start_pos - sliding_window + 1;
     if (sw_start < 0) sw_start = 0;
     const int sw_count = start_pos - sw_start + 1;  // ∈ [1, sliding_window]
 
-    // Segment dispatch.
     if (tid < sw_count) {
-        // SW slot region.
         const int p = sw_start + tid;
         const int ring_idx = p % sliding_window;
         const int block_id = ring_idx / page_block_size;
@@ -153,7 +151,6 @@ __device__ __forceinline__ int32_t arle_dsv4_flashmla_decode_index_at(
             }
         }
     }
-    // Padding tail.
     return -1;
 }
 
@@ -267,11 +264,9 @@ extern "C" {
 //                            sub-pool's sliding_window * 1 = sw_blocks*64 capacity)
 //   start_pos              — absolute position of the (single) decode token
 //   max_compressed_keys    — index_topk (CSA) or padded compressed_count (HCA)
-//   compress_ratio         — ratio for compressor causality gate
 //   mode_int               — 1 = CSA, 2 = HCA
 //   page_block_size        — 64 for DSv4-Flash MODEL1 (matches upstream
 //                            `vendor/flashmla/csrc/sm90/decode/sparse_fp8/config.h`)
-//   stream                 — CUDA stream
 //
 // `topk_unified = sliding_window + max_compressed_keys` is derived inside
 // (must be a multiple of 128 per FlashMLA's hard-assert).

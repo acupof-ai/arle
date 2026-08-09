@@ -16,9 +16,9 @@ __device__ __forceinline__ uint16_t f32_to_bf16_bits(const float value) {
 
 __device__ __forceinline__ float dsv4_sigmoid(float value) {
   if (value >= 0.0f) {
-    return 1.0f / (1.0f + expf(-value));
+    return 1.0f / (1.0f + __expf(-value));
   }
-  float expv = expf(value);
+  float expv = __expf(value);
   return expv / (1.0f + expv);
 }
 
