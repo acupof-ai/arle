@@ -1300,7 +1300,20 @@ mod backend {
         pub fn free_retired_fp8_buffers(&mut self) {
             match self {
                 Self::Cuda(engine) => engine.free_retired_fp8_buffers(),
-                _ => {}
+                #[cfg(feature = "metal")]
+                Self::Metal(_) => {}
+                #[cfg(feature = "metal")]
+                Self::MetalDiffusionGemma(_) => {}
+                #[cfg(feature = "metal")]
+                Self::MetalGemma4(_) => {}
+                #[cfg(feature = "metal")]
+                Self::MetalDeepseekOcr(_) => {}
+                #[cfg(feature = "hip")]
+                Self::Hip(_) => {}
+                #[cfg(feature = "vulkan")]
+                Self::Vulkan(_) => {}
+                #[cfg(feature = "cpu")]
+                Self::Cpu(_) => {}
             }
         }
 

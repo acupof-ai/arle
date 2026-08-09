@@ -478,6 +478,7 @@ where
 /// Used for the device LoRA merge `W = base + scale·(B·A)`. `delta` is generic
 /// over the buffer view so a reused (over-sized) scratch slice works; only its
 /// first `n` elements are read.
+#[cfg(test)]
 pub(crate) fn lora_scaled_add_into<B, D, O>(
     ctx: &DeviceContext,
     base: &B,

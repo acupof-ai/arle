@@ -336,10 +336,12 @@ fn log_kernel_node_census(
             let mut raw: *const std::ffi::c_char = std::ptr::null();
             // A node carries `func` or `kern`, never both.
             let got = if !p.func.is_null() {
+                // SAFETY: `p.func` is a valid CUfunction from the captured graph node.
                 unsafe { cu::cuFuncGetName(&mut raw, p.func) }
                     .result()
                     .is_ok()
             } else if !p.kern.is_null() {
+                // SAFETY: `p.kern` is a valid CUkernel from the captured graph node.
                 unsafe { cu::cuKernelGetName(&mut raw, p.kern) }
                     .result()
                     .is_ok()
@@ -347,6 +349,7 @@ fn log_kernel_node_census(
                 false
             };
             if got && !raw.is_null() {
+                // SAFETY: `raw` was written by cuFuncGetName/cuKernelGetName and is a valid C string.
                 unsafe { std::ffi::CStr::from_ptr(raw) }
                     .to_string_lossy()
                     .into_owned()
