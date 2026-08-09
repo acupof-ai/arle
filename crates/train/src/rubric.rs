@@ -15,19 +15,14 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Whether a criterion gates acceptance (Factual) or is advisory/logged (Process).
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum CriterionKind {
-    /// Correctness of an intermediate or final result. **All Factual criteria must
-    /// pass for the rollout to be accepted.**
+    /// Correctness of an intermediate or final result. All Factual criteria must pass.
     Factual,
-    /// Quality of the reasoning process. Logged and reportable, but does not by
-    /// itself gate acceptance (avoids penalizing correct answers with terse steps).
+    /// Quality of the reasoning process. Logged but does not gate acceptance.
     Process,
 }
 
-/// One rubric criterion. `key` is the machine key the judge must emit in its JSON
-/// verdict; `description` is the human-readable instruction shown to the judge.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Criterion {
     pub key: String,
@@ -52,29 +47,21 @@ impl Criterion {
     }
 }
 
-/// A task rubric: a short task name plus its criteria.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Rubric {
     pub task: String,
     pub criteria: Vec<Criterion>,
 }
 
-/// Parsed judge verdict. `parse_error` is set when the judge output could not be
-/// mapped to every criterion key; such a rollout is never accepted.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Verdict {
-    /// Per-criterion (key, passed). Empty when `parse_error`.
     pub passed: Vec<(String, bool)>,
-    /// All Factual criteria passed and the verdict parsed cleanly.
     pub accepted: bool,
-    /// The judge output could not be parsed into every criterion key.
     pub parse_error: bool,
 }
 
 impl Verdict {
-    /// A verdict for a judge call that errored or produced unparseable output.
-    /// Never accepted, surfaced as a parse error (CLAUDE.md §0 case-as-fact: a
-    /// judge timeout/garbage is neither a pass nor a fail-class).
+    /// Never accepted — a judge timeout/garbage is neither a pass nor a fail-class.
     pub fn parse_error() -> Self {
         Self {
             passed: Vec::new(),
@@ -85,8 +72,6 @@ impl Verdict {
 }
 
 impl Rubric {
-    /// Render the prompt sent to the judge model. Asks for a single JSON object
-    /// keyed by each criterion `key` with boolean values, emitted as the final line.
     pub fn judge_prompt(&self, problem: &str, rollout: &str) -> String {
         let criteria = self
             .criteria
@@ -114,10 +99,6 @@ impl Rubric {
         )
     }
 
-    /// Render a prompt asking a strong solver to PRODUCE a correct solution
-    /// (Mode B corrector for rejected prompts). Lists the Factual requirements so
-    /// the solution carries the answer format the rubric checks. Vocab-agnostic:
-    /// the solver's text is re-tokenized into the student vocab as a CE target.
     pub fn solve_prompt(&self, problem: &str) -> String {
         let requirements = self
             .criteria
@@ -133,9 +114,6 @@ impl Rubric {
         )
     }
 
-    /// Parse a judge output into a [`Verdict`]. Extracts the last balanced `{...}`
-    /// JSON object, requires a boolean for every criterion key; any missing key or
-    /// unparseable JSON yields `parse_error = true` (never accepted).
     pub fn parse_verdict(&self, judge_output: &str) -> Verdict {
         let reject = Verdict {
             passed: Vec::new(),
@@ -177,8 +155,6 @@ impl Rubric {
     }
 }
 
-/// Extract the last balanced top-level `{...}` substring (the judge may emit prose
-/// before its JSON verdict). Returns `None` if no balanced object is found.
 fn last_json_object(text: &str) -> Option<String> {
     let bytes = text.as_bytes();
     let end = text.rfind('}')?;
@@ -200,22 +176,13 @@ fn last_json_object(text: &str) -> Option<String> {
     None
 }
 
-/// Result of applying a rubric to one prompt's N rollouts (RFT selection step).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Selection {
-    /// Indices into the rollout slice the judge accepted.
     pub accepted: Vec<usize>,
-    /// Count of *distinct* accepted rollout texts — the RFT log-linear x-axis: the
-    /// gain scales with distinct accepted CoTs per prompt, not the raw accept count.
     pub distinct_accepted: usize,
-    /// Rollouts whose verdict failed to parse (judge timeout/garbage), surfaced for
-    /// monitoring; excluded from acceptance, never bucketed as a fail.
     pub parse_errors: usize,
 }
 
-/// Select accepted rollouts for one prompt. `rollouts` and `verdicts` are
-/// index-aligned; acceptance = `verdict.accepted`; `distinct_accepted` dedups
-/// identical accepted texts.
 pub fn select(rollouts: &[String], verdicts: &[Verdict]) -> Selection {
     assert_eq!(
         rollouts.len(),
@@ -244,11 +211,6 @@ pub fn select(rollouts: &[String], verdicts: &[Verdict]) -> Selection {
     }
 }
 
-/// Content of the last balanced `{...}` following the last occurrence of `marker`
-/// (e.g. `"\\boxed{"`). Returns `None` if absent/empty. Ports
-/// `_extract_last_braced` from `scripts/arle_capability_eval.py`: it scans every
-/// `marker` occurrence and keeps the LAST one whose balanced body is non-empty
-/// (after trimming).
 pub fn extract_last_braced(text: &str, marker: &str) -> Option<String> {
     if marker.is_empty() {
         return None;
@@ -284,22 +246,15 @@ pub fn extract_last_braced(text: &str, marker: &str) -> Option<String> {
                 _ => out.push(ch),
             }
         }
-        // Mirror the Python `start = pos + len(marker)`: advance past this marker.
         start = body_start;
     }
 }
 
-/// Normalize a math answer for exact-match. Ports `_math_normalize_answer` from
-/// `scripts/arle_capability_eval.py`: extract `\boxed{}` first if present, then
-/// strip `$`, drop spacing macros, fold `\dfrac`/`\tfrac` -> `\frac`, unwrap
-/// non-nested `\text{X}` -> `X`, remove commas, remove all whitespace, rstrip `.`,
-/// lowercase.
 pub fn normalize_math_answer(answer: &str) -> String {
     let mut s = answer.trim().to_string();
     if let Some(boxed) = extract_last_braced(&s, "\\boxed{") {
         s = boxed;
     }
-    // s.replace("\\$", "").strip("$")
     s = s.replace("\\$", "");
     s = s.trim_matches('$').to_string();
     for (old, new) in [
@@ -314,30 +269,22 @@ pub fn normalize_math_answer(answer: &str) -> String {
     ] {
         s = s.replace(old, new);
     }
-    // re.sub(r"\\text\{([^{}]*)\}", r"\1", s): unwrap non-nested \text{...}.
     s = unwrap_text_macro(&s);
     s = s.replace(',', "");
-    // re.sub(r"\s+", "", s): remove ALL whitespace.
     s = s.chars().filter(|c| !c.is_whitespace()).collect();
     s = s.trim_end_matches('.').to_string();
     s.to_lowercase()
 }
 
-/// Replace every non-nested `\text{X}` with its inner `X` (the regex
-/// `\\text\{([^{}]*)\}` only matches bodies free of braces, so nested cases are
-/// left untouched, matching the Python port).
 fn unwrap_text_macro(s: &str) -> String {
     let pat = "\\text{";
     let mut out = String::with_capacity(s.len());
     let mut rest = s;
     while let Some(pos) = rest.find(pat) {
         let body_start = pos + pat.len();
-        // Find the closing `}`; bail (leave literal) if the body contains a brace.
         if let Some(close_rel) = rest[body_start..].find('}') {
             let body = &rest[body_start..body_start + close_rel];
             if body.contains('{') {
-                // Nested -> regex would not match; copy the marker literally and
-                // continue scanning after it.
                 out.push_str(&rest[..body_start]);
                 rest = &rest[body_start..];
                 continue;
@@ -346,7 +293,6 @@ fn unwrap_text_macro(s: &str) -> String {
             out.push_str(body);
             rest = &rest[body_start + close_rel + 1..];
         } else {
-            // No closing brace -> no match; copy the rest verbatim.
             break;
         }
     }
@@ -354,16 +300,7 @@ fn unwrap_text_macro(s: &str) -> String {
     out
 }
 
-/// Self-consistency selection: extract+normalize each rollout's `\boxed` answer,
-/// take the majority (most common non-empty normalized answer), and accept every
-/// rollout whose answer == the majority. No external judge.
-///
-/// `parse_errors` = rollouts with no extractable answer. `distinct_accepted` =
-/// count of distinct rollout TEXTS among accepted. Empty / all-unparseable input
-/// yields an empty `Selection` with `parse_errors == rollouts.len()`.
 pub fn select_by_self_consistency(rollouts: &[String]) -> Selection {
-    // Normalize each rollout; an empty normalized string = unparseable (no
-    // extractable answer), surfaced as a parse error and never voted/accepted.
     let answers: Vec<Option<String>> = rollouts
         .iter()
         .map(|r| {
@@ -374,7 +311,6 @@ pub fn select_by_self_consistency(rollouts: &[String]) -> Selection {
 
     let parse_errors = answers.iter().filter(|a| a.is_none()).count();
 
-    // Majority vote over non-empty answers; ties -> first-seen (deterministic).
     let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
     let mut order: Vec<&str> = Vec::new();
     for a in answers.iter().flatten() {
@@ -384,8 +320,6 @@ pub fn select_by_self_consistency(rollouts: &[String]) -> Selection {
         }
         *counts.entry(key).or_insert(0) += 1;
     }
-    // Pick the most-supported answer; on a tie of counts keep the first-seen
-    // (iterate insertion order, only replace on a STRICTLY greater count).
     let mut majority: Option<&str> = None;
     let mut best = 0usize;
     for &k in &order {
@@ -396,7 +330,6 @@ pub fn select_by_self_consistency(rollouts: &[String]) -> Selection {
         }
     }
     let Some(majority) = majority.map(str::to_string) else {
-        // No rollout had an answer.
         return Selection {
             accepted: Vec::new(),
             distinct_accepted: 0,
@@ -422,8 +355,6 @@ pub fn select_by_self_consistency(rollouts: &[String]) -> Selection {
     }
 }
 
-/// Built-in rubric for math reasoning (MATH-500 style): factual answer correctness
-/// gates acceptance; reasoning validity is logged.
 pub fn math_rubric() -> Rubric {
     Rubric {
         task: "math reasoning".to_string(),
@@ -440,9 +371,6 @@ pub fn math_rubric() -> Rubric {
     }
 }
 
-/// Built-in rubric for agentic tool-use (BFCL live): the call decision gates
-/// acceptance (right tool+args, or correctly abstain on irrelevant queries);
-/// reason-before-act is logged.
 pub fn bfcl_agentic_rubric() -> Rubric {
     Rubric {
         task: "agentic tool-use".to_string(),
@@ -578,7 +506,6 @@ mod tests {
                 "{} should gate on exactly one factual criterion",
                 r.task
             );
-            // a clean all-true verdict is accepted; a factual-false verdict is not
             let keys: Vec<_> = r
                 .criteria
                 .iter()
@@ -595,16 +522,12 @@ mod tests {
             extract_last_braced("x \\boxed{42} y", "\\boxed{"),
             Some("42".to_string())
         );
-        // No marker -> None.
         assert_eq!(extract_last_braced("no answer here", "\\boxed{"), None);
-        // Empty body -> None (matches the Python non-empty candidate filter).
         assert_eq!(extract_last_braced("\\boxed{}", "\\boxed{"), None);
-        // Last non-empty wins across multiple markers.
         assert_eq!(
             extract_last_braced("\\boxed{1} then \\boxed{2}", "\\boxed{"),
             Some("2".to_string())
         );
-        // Nested braces are balanced correctly.
         assert_eq!(
             extract_last_braced("\\boxed{\\frac{1}{2}}", "\\boxed{"),
             Some("\\frac{1}{2}".to_string())
@@ -622,12 +545,10 @@ mod tests {
 
     #[test]
     fn normalize_math_answer_folds_macros_and_text() {
-        // \dfrac -> \frac, \text{X} unwrap, whitespace strip, trailing dot, lower.
         assert_eq!(
             normalize_math_answer("\\boxed{\\dfrac{1}{2} \\text{cm}.}"),
             "\\frac{1}{2}cm"
         );
-        // Two rollouts with the SAME boxed answer normalize equal.
         let a = normalize_math_answer("So the result is \\boxed{42}.");
         let b = normalize_math_answer("Therefore \\boxed{42}");
         assert_eq!(a, b);
@@ -649,9 +570,6 @@ mod tests {
 
     #[test]
     fn self_consistency_all_unparseable_is_empty() {
-        // A rollout is unparseable iff its normalized answer is empty. With no
-        // \boxed, the normalizer folds the WHOLE text, so only empty /
-        // whitespace-only rollouts have no extractable answer.
         let rollouts = vec![String::new(), "   ".to_string(), "\n\t  \n".to_string()];
         let s = select_by_self_consistency(&rollouts);
         assert!(s.accepted.is_empty());
