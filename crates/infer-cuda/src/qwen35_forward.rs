@@ -1,0 +1,994 @@
+use super::*;
+
+impl Qwen35Model {
+    pub(crate) fn output_projection(&self) -> &DeviceMatrix {
+        self.lm_head.as_ref().unwrap_or(&self.embed_tokens)
+    }
+
+    /// This rank's full-attention query width (`local_q_heads * head_dim`).
+
+    pub(crate) fn local_full_attn_q_dim(&self) -> usize {
+        self.local_q_heads * self.config.head_dim
+    }
+
+    /// This rank's GATED q_proj output width: the projection interleaves
+    /// `[query; gate]` per head, so each local head contributes `2*head_dim` rows.
+
+    pub(crate) fn local_full_attn_q_proj_dim(&self) -> usize {
+        self.local_q_heads * self.config.head_dim * 2
+    }
+
+    /// This rank's full-attention K/V width (`local_kv_heads * head_dim`).
+    ///
+    /// Single source for every full-attn K/V cache / pool size on this rank.
+    /// CACHE-IDENTITY INVARIANT (KV replication, kv_heads < world_size): each
+    /// rank holds `local_kv_heads == 1` KV head, and ranks in the same replica
+    /// group loaded IDENTICAL k/v projection weights ([`infer_topo::kv_load_block_index`])
+    /// AND see the same `normed` hidden states, so their per-rank-local cache rows
+    /// are bit-identical. GQA then runs independently per rank against its own
+    /// copy — no cross-replica KV exchange is needed or done.
+
+    pub(crate) fn local_full_attn_kv_dim(&self) -> usize {
+        self.local_kv_heads * self.config.head_dim
+    }
+
+    /// This rank's fused gated-delta `[q | k | v]` width.
+
+    pub(crate) fn local_linear_qkv_dim(&self) -> usize {
+        let qk = 2 * self.local_linear_k_heads * self.config.linear_key_head_dim;
+        qk + self.local_linear_v_heads * self.config.linear_value_head_dim
+    }
+
+    /// This rank's gated-delta output / z-gate width.
+
+    pub(crate) fn local_linear_z_dim(&self) -> usize {
+        self.local_linear_v_heads * self.config.linear_value_head_dim
+    }
+
+    /// `(num_linear, gdr_state_len, conv_len)` for this rank's recurrent state,
+    /// sized from LOCAL shard widths (each rank carries only its own v-head
+    /// recurrent slabs / qkv conv channels). Single source for both
+    /// [`Qwen35SlotState::acquire_recurrent`] and the spec snapshot scratch.
+
+    pub(crate) fn recurrent_dims(&self) -> (usize, usize, usize) {
+        let c = &self.config;
+        let num_linear = c.num_hidden_layers - c.num_full_attention_layers();
+        let gdr_state_len =
+            self.local_linear_v_heads * c.linear_key_head_dim * c.linear_value_head_dim;
+        let conv_len = self.local_linear_qkv_dim() * (c.linear_conv_kernel_dim - 1);
+        (num_linear, gdr_state_len, conv_len)
+    }
+
+    /// A fresh idle slot — allocates nothing. The recurrent state is drawn from
+    /// the executor's free-list on activation ([`Qwen35SlotState::acquire_recurrent`]);
+    /// the full-attn K/V lives in the shared `PagedKVPool`.
+
+    pub(crate) fn new_slot_state(&self) -> Qwen35SlotState {
+        Qwen35SlotState::new_linear_only()
+    }
+
+    /// Allocate per-slot speculative-decode state (draft head KV + trunk linear
+    /// snapshot scratch), sized from this rank's local shard widths and the
+    /// requested draft depth. Snapshot scratch matches [`Self::new_slot_state`]'s
+    /// linear-state dims exactly so a snapshot/restore is a straight D2D copy.
+    #[allow(dead_code)] // called by the executor spec-slot init in a later increment
+    /// Per-layer bytes of the two linear states, in `linear_state_addrs` order.
+
+    pub(crate) fn linear_state_bytes(&self) -> (usize, usize) {
+        let c = &self.config;
+        (
+            self.local_linear_v_heads * c.linear_key_head_dim * c.linear_value_head_dim * 4,
+            self.local_linear_qkv_dim() * (c.linear_conv_kernel_dim - 1) * 2,
+        )
+    }
+
+    pub(crate) fn new_spec_slot_state(&self) -> Result<Qwen35SpecSlotState> {
+        let c = &self.config;
+        let num_full = c.num_full_attention_layers();
+        let num_linear = c.num_hidden_layers - num_full;
+        // depth >= 1: the head cache holds the draft chain (level positions
+        // 0..depth); +1 leaves room for the seed row at position 0.
+        let depth = self.spec_draft_tokens.max(1);
+        let kv_dim = self.local_full_attn_kv_dim();
+        let gdr_state_len =
+            self.local_linear_v_heads * c.linear_key_head_dim * c.linear_value_head_dim;
+        let conv_len = self.local_linear_qkv_dim() * (c.linear_conv_kernel_dim - 1);
+        let qkv_dim = self.local_linear_qkv_dim();
+        // b/a are one scalar per LOCAL value head, sharded identically on every
+        // linear layer (`in_proj_b`/`in_proj_a` rows == local_linear_v_heads),
+        // so the capture stride is uniform across layers.
+        let ba_dim = self.local_linear_v_heads;
+        let cap_rows = depth + 1;
+        let mut gdr_snap = Vec::with_capacity(num_linear);
+        let mut conv_snap = Vec::with_capacity(num_linear);
+        let mut cap_qkv = Vec::with_capacity(num_linear);
+        let mut cap_b = Vec::with_capacity(num_linear);
+        let mut cap_a = Vec::with_capacity(num_linear);
+        for _ in 0..num_linear {
+            gdr_snap.push(
+                self.ctx
+                    .stream
+                    .alloc_zeros::<f32>(gdr_state_len)
+                    .map_err(|e| anyhow!("alloc spec gated-delta snapshot failed: {e}"))?,
+            );
+            conv_snap.push(DeviceVec::zeros(&self.ctx, conv_len)?);
+            cap_qkv.push(DeviceVec::zeros(&self.ctx, cap_rows * qkv_dim)?);
+            cap_b.push(DeviceVec::zeros(&self.ctx, cap_rows * ba_dim)?);
+            cap_a.push(DeviceVec::zeros(&self.ctx, cap_rows * ba_dim)?);
+        }
+        Ok(Qwen35SpecSlotState {
+            head_k: DeviceVec::zeros(&self.ctx, (depth + 1) * kv_dim)?,
+            head_v: DeviceVec::zeros(&self.ctx, (depth + 1) * kv_dim)?,
+            gdr_snap,
+            conv_snap,
+            capture: Qwen35LinearCapture {
+                rows: cap_rows,
+                qkv: cap_qkv,
+                b_proj: cap_b,
+                a_proj: cap_a,
+            },
+            argmax_scratch: self
+                .ctx
+                .stream
+                .alloc_zeros::<i32>(1)
+                .map_err(|e| anyhow!("alloc spec argmax scratch failed: {e}"))?,
+            q_probs: SliceSlot::default(),
+            p_probs: SliceSlot::default(),
+            sample_tok: SliceSlot::default(),
+            accept_out: SliceSlot::default(),
+            chain_draft: SliceSlot::default(),
+            u_accept: SliceSlot::default(),
+            u_residual: SliceSlot::default(),
+        })
+    }
+
+    /// Warm the Qwen FP8 dense DeepGEMM JIT for the CUDA default prefill chunk.
+    ///
+    /// The routed-expert port already uses DSv4's grouped path. The SLO 4096/256
+    /// regression was the divergent dense-projection lane: first request paid
+    /// one DeepGEMM JIT compile per `(M,N,K)` dense FP8 projection shape. Warming
+    /// unique `(rows, cols)` at `M=2048` mirrors the scheduler's CUDA Qwen chunk
+    /// floor and keeps the compile cost out of request TTFT without mutating KV
+    /// or recurrent state.
+
+    pub(crate) fn per_slot_kv_bytes(&self) -> (usize, usize, usize, usize) {
+        let c = &self.config;
+        let num_full = c.num_full_attention_layers();
+        let num_linear = c.num_hidden_layers - num_full;
+        let bf16 = std::mem::size_of::<half::bf16>();
+        let f32sz = std::mem::size_of::<f32>();
+        // Full-attn K/V is paged (shared pool), not per-slot → 0 here.
+        let kv_bytes = 0usize;
+        // Gated-delta recurrent state: num_linear × (Vh × Kd × Vd) f32.
+        let gdr_len = self.local_linear_v_heads * c.linear_key_head_dim * c.linear_value_head_dim;
+        let gdr_bytes = num_linear.saturating_mul(gdr_len).saturating_mul(f32sz);
+        // Conv1d rings: num_linear × (qkv_dim × (kernel-1)) bf16.
+        let conv_len = self.local_linear_qkv_dim() * (c.linear_conv_kernel_dim - 1);
+        let conv_bytes = num_linear.saturating_mul(conv_len).saturating_mul(bf16);
+        let per_slot = kv_bytes
+            .saturating_add(gdr_bytes)
+            .saturating_add(conv_bytes);
+        (per_slot, kv_bytes, gdr_bytes, conv_bytes)
+    }
+
+    /// Clamp `requested` slots to what post-weights free VRAM affords — the
+    /// dynamic KV-memory budget Qwen3.5/3.6 previously lacked (requested slots
+    /// were admitted as-is → OOM at large max_seq_len, the #60 failure class).
+    /// Unified with DSv4 through the infer-seam budget kernel; the affordable
+    /// count is NCCL min-reduced for TP-consistent slot counts. Call AFTER
+    /// weights load so `mem_get_info().free` already excludes them.
+
+    pub(crate) fn kv_budget_num_slots(
+        &self,
+        requested: usize,
+        extra_per_slot_bytes: usize,
+    ) -> Result<usize> {
+        const MEM_FRACTION: f64 = 0.9;
+        let (per_slot, kv_bytes, gdr_bytes, conv_bytes) = self.per_slot_kv_bytes();
+        let per_slot = per_slot.saturating_add(extra_per_slot_bytes);
+        let affordable_local: i32 = match cudarc::driver::result::mem_get_info() {
+            Ok((free, _total)) => {
+                // Same neutral kernel as DSv4: floor(free × fraction) / per_slot.
+                let budget = infer_seam::SlotBudget::from_free(free, MEM_FRACTION, 0, per_slot);
+                log::info!(
+                    "Qwen3.5 KV budget: free {}MB, per_slot {}MB (K+V {}MB + gdr {}MB + conv {}MB + draft {}MB)",
+                    free >> 20,
+                    per_slot >> 20,
+                    kv_bytes >> 20,
+                    gdr_bytes >> 20,
+                    conv_bytes >> 20,
+                    extra_per_slot_bytes >> 20,
+                );
+                budget
+                    .affordable()
+                    .map_or(i32::MAX, |n| i32::try_from(n).unwrap_or(i32::MAX))
+            }
+            // Can't query (no active context / driver error) → don't bind the
+            // min; the other ranks' budgets still apply.
+            Err(_) => i32::MAX,
+        };
+        let affordable =
+            self.tp
+                .all_reduce_min_scalar_i32(&self.ctx, affordable_local)? as usize;
+        // Reject-below-fixed guard (parity with Metal's fits_fixed + DSv4): a
+        // cross-rank-min affordable of 0 means post-weights free VRAM cannot
+        // hold even one slot at this max_seq_len. Fail closed uniformly
+        // (lockstep-safe — same reduced scalar on every rank) instead of the
+        // former `max(1)` admitting one slot and OOMing at slot allocation.
+        anyhow::ensure!(
+            affordable > 0,
+            "Qwen3.5 KV budget rejected startup: post-weights free VRAM affords 0 slots at \
+             max_seq_len {} (per_slot ~{}MB exceeds {MEM_FRACTION} of free). Free VRAM or \
+             lower --max-total-tokens.",
+            self.max_seq_len,
+            per_slot >> 20,
+        );
+        let (planned, clamped) = infer_seam::clamp_to_affordable(requested, affordable);
+        if clamped {
+            log::warn!(
+                "Qwen3.5 KV budget: requested {requested} slots × ~{}MB/slot exceeds the \
+                 cross-rank-min affordable {affordable} (local affordable {affordable_local}, \
+                 {MEM_FRACTION} of post-weights free); clamping num_slots to {affordable}. \
+                 Lower --max-total-tokens (max_seq_len {}) to raise concurrency.",
+                per_slot >> 20,
+                self.max_seq_len,
+            );
+        }
+        Ok(planned)
+    }
+
+    /// Load a BF16 Qwen3.5/3.6 hybrid dense-or-MoE checkpoint, resolving the TP
+    /// runtime from the environment (single-GPU when no TP env is set).
+    ///
+    /// `max_seq_len` sizes the per-slot full-attn contiguous K/V cache.
+
+    pub(crate) fn forward_hidden(
+        &self,
+        slot: &mut Qwen35SlotState,
+        ws: &mut Qwen35Workspace,
+        tokens: &[u32],
+        start_pos: usize,
+    ) -> Result<()> {
+        self.forward_hidden_capture(slot, ws, tokens, start_pos, None, None, None)
+    }
+
+    /// [`Self::forward_hidden`] with an optional per-linear-layer gated-delta
+    /// input capture (spec verify only). When `capture` is `Some`, each linear
+    /// layer copies its post-in_proj `qkv` (PRE-conv1d) + `b`/`a` projections
+    /// for all rows into the capture so a partial-accept replay can re-run only
+    /// conv1d + GDR (see [`Qwen35LinearCapture`]). `None` is byte-for-byte the
+    /// old `forward_hidden` (the capture branch is fully elided).
+    pub(crate) fn forward_hidden_capture(
+        &self,
+        slot: &mut Qwen35SlotState,
+        ws: &mut Qwen35Workspace,
+        tokens: &[u32],
+        start_pos: usize,
+        capture: Option<&mut Qwen35LinearCapture>,
+        recall: Option<&mut Qwen35RecallForward>,
+        taps: Option<&mut dspark::Qwen35DsparkTaps>,
+    ) -> Result<()> {
+        ensure!(
+            !tokens.is_empty(),
+            "Qwen3.5 hybrid forward requires at least one token"
+        );
+        ensure!(
+            slot.seq_len == start_pos,
+            "Qwen3.5 hybrid slot seq_len {} != start_pos {start_pos} (uncached full-prefix \
+             path requires contiguous appends)",
+            slot.seq_len
+        );
+        let seq_len = tokens.len();
+        ensure!(
+            start_pos + seq_len <= self.max_seq_len,
+            "Qwen3.5 hybrid sequence {} exceeds KV cache budget {}",
+            start_pos + seq_len,
+            self.max_seq_len
+        );
+        self.stage_step_inputs(ws, tokens, start_pos)?;
+        let mut rows = [LinearRow {
+            slot,
+            len: seq_len,
+            capture,
+        }];
+        self.forward_hidden_staged(&mut rows, ws, start_pos, recall, taps)?;
+        rows[0].slot.seq_len += seq_len;
+        Ok(())
+    }
+
+    /// Stage the per-step HOST inputs (token ids, start_pos) into their
+    /// persistent device slots. This is the ONLY H2D traffic of a decode step;
+    /// the captured decode graph runs it OUTSIDE the capture/replay (the dense
+    /// `stage1_write` pattern), so the graph body below is a pure GPU kernel
+    /// sequence. Returns the `(token_ids, start_pos)` device addresses for the
+    /// graph-bake fingerprint (length-matched slot reuse keeps them stable; a
+    /// change means the captured graph reads stale memory and must recapture).
+    pub(crate) fn stage_step_inputs(
+        &self,
+        ws: &mut Qwen35Workspace,
+        tokens: &[u32],
+        start_pos: usize,
+    ) -> Result<(u64, u64)> {
+        let token_ids_host: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
+        let token_ids = ws.token_ids.upload(&self.ctx, &token_ids_host)?;
+        let (token_ids_ptr, _g0) = token_ids.device_ptr(&self.ctx.stream);
+        let start_pos_dev = ws.start_pos.upload(&self.ctx, &[start_pos as i32])?;
+        let (start_pos_ptr, _g1) = start_pos_dev.device_ptr(&self.ctx.stream);
+        Ok((token_ids_ptr, start_pos_ptr))
+    }
+
+    /// The pure-GPU layer stack over already-staged inputs: embeds the staged
+    /// token ids, runs every layer over the workspace buffers, and advances
+    /// each row's recurrent/conv/KV device state in place. Does NOT advance
+    /// `slot.seq_len` and performs NO H2D/D2H/sync — at one row of one token
+    /// this is the CUDA-graph-capturable decode body (every per-step scalar is
+    /// read from the staged device buffers; see
+    /// [`Self::forward_decode_step_captured`] for the capture-safety table).
+    ///
+    /// `rows` are the ragged per-slot token spans, token-major and in the same
+    /// order as the staged ids; the full-attn layers get their identity from
+    /// `recall`'s page table instead. `start_pos` (host) is consumed only by
+    /// the multi-token NON-paged attention launch, which is single-row.
+    pub(crate) fn forward_hidden_staged(
+        &self,
+        rows: &mut [LinearRow<'_>],
+        ws: &mut Qwen35Workspace,
+        start_pos: usize,
+        mut recall: Option<&mut Qwen35RecallForward>,
+        mut taps: Option<&mut dspark::Qwen35DsparkTaps>,
+    ) -> Result<()> {
+        // Single chokepoint for every recurrent-reading forward (prefill /
+        // decode / spec-capture / OPD): each row's recurrent block MUST be
+        // resident — a missed `acquire_recurrent` hook would otherwise read an
+        // empty `gdr_states` as a silent no-op.
+        ensure!(
+            rows.iter().all(|r| r.slot.has_recurrent()),
+            "Qwen3.6 forward: slot recurrent state not acquired (missing \
+             acquire_recurrent at the start_pos==0 prefill)"
+        );
+        let seq_len: usize = rows.iter().map(|r| r.len).sum();
+        ensure!(
+            recall.is_some() || rows.len() == 1,
+            "Qwen3.6 forward: the contiguous full-attn cache is single-row, got {} rows",
+            rows.len()
+        );
+        let c = &self.config;
+        let eps = c.rms_norm_eps;
+        let hidden_size = c.hidden_size;
+
+        // Destructure once: each binding borrows its own workspace field, so
+        // the residual-stream buffers, the per-block scratch, and the MoE
+        // scratch stay simultaneously borrowable across the layer loop.
+        let Qwen35Workspace {
+            token_ids,
+            start_pos: start_pos_slot,
+            hidden,
+            normed,
+            hidden_mid,
+            attn_out,
+            mlp_out,
+            full,
+            linear,
+            dense,
+            moe,
+            ..
+        } = ws;
+
+        // Shape-matched re-gets return the SAME buffers `stage_step_inputs`
+        // just wrote (no H2D here — a mismatch would mean staging was skipped,
+        // which the two call paths above make impossible).
+        let token_ids = &*token_ids.get(&self.ctx, seq_len)?;
+        let start_pos_dev = &*start_pos_slot.get(&self.ctx, 1)?;
+
+        let hidden = hidden.get(&self.ctx, hidden_size, seq_len)?;
+        qwen35_profile(&self.ctx, "qwen/embedding", None, seq_len, || {
+            embedding_batch(&self.ctx, &self.embed_tokens, token_ids, hidden)
+        })?;
+        // Probe tap: `layer = usize::MAX` marks the embedding output, so a
+        // cross-runtime bisect can rule the input in or out before layer 0.
+        #[cfg(feature = "cuda")]
+        let stage_row = |stage: &str, layer: usize, buf: &HiddenStates| {
+            let width = buf.hidden_dim;
+            for r in 0..buf.seq_len {
+                let pos = (start_pos + r) as u64;
+                if crate::probe::stage_want(pos) {
+                    crate::probe::stage_bf16(
+                        &self.ctx,
+                        stage,
+                        layer,
+                        r,
+                        pos,
+                        buf.data.slice(r * width..(r + 1) * width),
+                    );
+                }
+            }
+        };
+        #[cfg(feature = "cuda")]
+        stage_row("embed", usize::MAX, hidden);
+        // DSpark tap: `-1` = the embedding output (residual stream pre-layer-0).
+        if let Some(t) = taps.as_deref_mut() {
+            t.capture(&self.ctx, -1, hidden)?;
+        }
+        let normed = normed.get(&self.ctx, hidden_size, seq_len)?;
+        let hidden_mid = hidden_mid.get(&self.ctx, hidden_size, seq_len)?;
+        let attn_out = attn_out.get(&self.ctx, hidden_size, seq_len)?;
+        let mlp_out = mlp_out.get(&self.ctx, hidden_size, seq_len)?;
+
+        let mut full_idx = 0usize;
+        let mut linear_idx = 0usize;
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            qwen35_profile(
+                &self.ctx,
+                "qwen/input_norm",
+                Some(layer_idx),
+                seq_len,
+                || rms_norm_offset(&self.ctx, hidden, &layer.input_layernorm, eps, normed),
+            )?;
+            #[cfg(feature = "cuda")]
+            {
+                stage_row("attn_in", layer_idx, normed);
+                crate::probe::parity_inject(&self.ctx, "attn_in", layer_idx, start_pos, normed);
+            }
+
+            match &layer.attn {
+                Qwen35Attn::Full(full_attn) => {
+                    qwen35_profile(
+                        &self.ctx,
+                        "qwen/full_attention",
+                        Some(layer_idx),
+                        seq_len,
+                        || {
+                            if let Some(rc) = recall.as_deref_mut() {
+                                self.full_attention_paged(
+                                    full_attn,
+                                    normed,
+                                    full_idx,
+                                    rc.pool,
+                                    rc.meta,
+                                    full,
+                                    attn_out,
+                                    rc.layer0_query.as_mut(),
+                                )
+                            } else {
+                                self.full_attention(
+                                    full_attn,
+                                    normed,
+                                    &mut *rows[0].slot,
+                                    full_idx,
+                                    start_pos,
+                                    start_pos_dev,
+                                    full,
+                                    attn_out,
+                                )
+                            }
+                        },
+                    )?;
+                    full_idx += 1;
+                }
+                Qwen35Attn::Linear(lin) => {
+                    qwen35_profile(
+                        &self.ctx,
+                        "qwen/linear_attention",
+                        Some(layer_idx),
+                        seq_len,
+                        || {
+                            self.linear_attention(
+                                lin,
+                                normed,
+                                LinearCore::Rows(&mut *rows),
+                                linear_idx,
+                                linear,
+                                attn_out,
+                            )
+                        },
+                    )?;
+                    linear_idx += 1;
+                }
+            }
+
+            // Post-attn residual add + post_attention_layernorm via the
+            // `add_batch` + `rms_norm_offset` pair (`hidden_mid`/`normed`).
+            qwen35_profile(
+                &self.ctx,
+                "qwen/post_attn_norm",
+                Some(layer_idx),
+                seq_len,
+                || {
+                    add_batch(&self.ctx, hidden, attn_out, hidden_mid)?;
+                    rms_norm_offset(
+                        &self.ctx,
+                        hidden_mid,
+                        &layer.post_attention_layernorm,
+                        eps,
+                        normed,
+                    )
+                },
+            )?;
+            #[cfg(feature = "cuda")]
+            {
+                stage_row("attn_out", layer_idx, attn_out);
+                stage_row("resid_mid", layer_idx, hidden_mid);
+                stage_row("mlp_in", layer_idx, normed);
+                crate::probe::parity_inject(&self.ctx, "mlp_in", layer_idx, start_pos, normed);
+            }
+            let mlp_in: &HiddenStates = normed;
+            if let Some(moe_weights) = &layer.moe {
+                let cfg = self
+                    .moe_config
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("MoE layer present but model has no moe_config"))?;
+                qwen35_profile(&self.ctx, "qwen/moe_ffn", Some(layer_idx), seq_len, || {
+                    moe_forward_into(
+                        &self.ctx,
+                        moe_weights,
+                        mlp_in,
+                        cfg,
+                        &self.expert_split,
+                        moe,
+                        mlp_out,
+                    )
+                })?;
+            } else {
+                let mlp = layer
+                    .mlp
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("dense layer missing both mlp and moe weights"))?;
+                qwen35_profile(
+                    &self.ctx,
+                    "qwen/dense_ffn",
+                    Some(layer_idx),
+                    seq_len,
+                    || self.dense_mlp(mlp, mlp_in, dense, mlp_out, Some((layer_idx, start_pos))),
+                )?;
+            }
+            // ONE all-reduce covers the whole FFN partial: the MoE buffer already
+            // sums this rank's routed experts (non-local routes contribute zero)
+            // + the column/row-sharded shared expert; the dense branch is a
+            // row-parallel down_proj partial. No-op on a single GPU.
+            qwen35_profile(
+                &self.ctx,
+                "qwen/ffn_allreduce",
+                Some(layer_idx),
+                seq_len,
+                || self.tp.all_reduce_sum(&self.ctx, mlp_out),
+            )?;
+
+            // MLP residual add producing the next layer's residual stream.
+            // The post-attn sum lives in `hidden_mid`; add_batch reads
+            // hidden_mid/mlp_out and writes `hidden` (whose previous value is
+            // dead).
+            qwen35_profile(
+                &self.ctx,
+                "qwen/ffn_residual",
+                Some(layer_idx),
+                seq_len,
+                || add_batch(&self.ctx, hidden_mid, mlp_out, hidden),
+            )?;
+            // DSpark tap: the residual-stream OUTPUT of this layer.
+            if let Some(t) = taps.as_deref_mut() {
+                t.capture(&self.ctx, layer_idx as i64, hidden)?;
+            }
+            // Per-layer fingerprints (`ARLE_PROBE_STAGES`) so a cross-runtime
+            // disagreement can be bisected to a layer AND to a point inside it.
+            // The `pos` label is `start_pos + row`, which is the true position
+            // only for a single-row launch — enough for the one-request
+            // diagnostic this exists for, wrong for a batched paged step.
+            #[cfg(feature = "cuda")]
+            {
+                stage_row("mlp_out", layer_idx, mlp_out);
+                stage_row("resid", layer_idx, hidden);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Run prefill or decode for one row. `start_pos` is the absolute position of
+    /// the first token; `tokens` are the new tokens (whole prompt on prefill, one
+    /// token on decode). Advances `slot.seq_len` and the recurrent state. Returns
+    /// the next sampled token + its behavior logprob (`None` for greedy). `ws` is
+    /// the executor's persistent forward workspace (serial forwards share one).
+    pub(crate) fn forward_tokens(
+        &self,
+        slot: &mut Qwen35SlotState,
+        ws: &mut Qwen35Workspace,
+        tokens: &[u32],
+        start_pos: usize,
+        params: &SamplingParams,
+        position: u64,
+    ) -> Result<(u32, Option<f32>)> {
+        qwen35_profile(&self.ctx, "qwen/forward_hidden", None, tokens.len(), || {
+            self.forward_hidden(slot, ws, tokens, start_pos)
+        })?;
+        qwen35_profile(&self.ctx, "qwen/lm_head", None, tokens.len(), || {
+            self.lm_head_logits(ws, tokens.len())
+        })?;
+        qwen35_profile(&self.ctx, "qwen/sample", None, tokens.len(), || {
+            self.sample_workspace_logits(ws, params, position)
+        })
+    }
+
+    /// [`Self::forward_tokens`] over the opt-in paged recall KV pool
+    /// (`--kv-recall`): the full-attn layers read/write `recall.pool` over
+    /// `recall.meta` instead of the contiguous slot cache. `slot.seq_len` is
+    /// still advanced in lockstep (the executor's decode invariant reads it);
+    /// the pool's own `seq_len` is advanced separately via `alloc_tokens`.
+    pub(crate) fn forward_tokens_recall(
+        &self,
+        slot: &mut Qwen35SlotState,
+        ws: &mut Qwen35Workspace,
+        tokens: &[u32],
+        start_pos: usize,
+        params: &SamplingParams,
+        position: u64,
+        recall: &mut Qwen35RecallForward,
+    ) -> Result<(u32, Option<f32>)> {
+        self.forward_tokens_recall_tapped(
+            slot, ws, tokens, start_pos, params, position, recall, None,
+        )
+    }
+
+    /// [`Self::forward_tokens_recall`] with an optional DSpark trunk-tap
+    /// capture (`--spec-type dspark` prefill/warm steps). `None` is
+    /// byte-identical to the untapped path.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_tokens_recall_tapped(
+        &self,
+        slot: &mut Qwen35SlotState,
+        ws: &mut Qwen35Workspace,
+        tokens: &[u32],
+        start_pos: usize,
+        params: &SamplingParams,
+        position: u64,
+        recall: &mut Qwen35RecallForward,
+        taps: Option<&mut dspark::Qwen35DsparkTaps>,
+    ) -> Result<(u32, Option<f32>)> {
+        ensure!(
+            !tokens.is_empty(),
+            "Qwen3.5 recall forward requires at least one token"
+        );
+        let seq_len = tokens.len();
+        self.stage_step_inputs(ws, tokens, start_pos)?;
+        let mut rows = [LinearRow {
+            slot,
+            len: seq_len,
+            capture: None,
+        }];
+        self.forward_hidden_staged(&mut rows, ws, start_pos, Some(recall), taps)?;
+        rows[0].slot.seq_len += seq_len;
+        self.lm_head_logits(ws, seq_len)?;
+        self.sample_workspace_logits(ws, params, position)
+    }
+
+    /// Final norm (offset) + LM head on the last token only, into `ws.logits`.
+    /// Last stage of the captured decode graph (the capture ends at the logits
+    /// buffer, dense-style); sampling stays outside.
+    ///
+    /// TP invariant: embed/lm_head are replicated and `hidden` is
+    /// post-all-reduce (every row-parallel output above was summed), so the
+    /// logits — and therefore the sampled token — are identical on every
+    /// rank. No rank ever needs to broadcast its sample.
+    pub(crate) fn lm_head_logits(&self, ws: &mut Qwen35Workspace, seq_len: usize) -> Result<()> {
+        let eps = self.config.rms_norm_eps;
+        let hidden_size = self.config.hidden_size;
+        let Qwen35Workspace {
+            hidden,
+            last_hidden,
+            last_normed,
+            logits,
+            ..
+        } = ws;
+        // Shape-matched re-get returns the SAME buffer forward_hidden filled.
+        let hidden = hidden.get(&self.ctx, hidden_size, seq_len)?;
+        let last_hidden = last_hidden.get(&self.ctx, hidden_size)?;
+        copy_row_to_vec(&self.ctx, hidden, seq_len - 1, last_hidden)?;
+        let last_normed = last_normed.get(&self.ctx, hidden_size)?;
+        rms_norm_offset_vec(&self.ctx, last_hidden, &self.norm, eps, last_normed)?;
+        let logits = logits.get(&self.ctx, self.output_projection().rows)?;
+        gemv(&self.ctx, self.output_projection(), last_normed, logits)?;
+        Ok(())
+    }
+
+    /// Sample the next token from `ws.logits` (written by
+    /// [`Self::lm_head_logits`] — eagerly or by a decode-graph replay). Greedy
+    /// uses the persistent `argmax_out` slot (zero per-token allocations);
+    /// non-greedy reads the logits to host. Always OUTSIDE any capture (syncs).
+    pub(crate) fn sample_workspace_logits(
+        &self,
+        ws: &mut Qwen35Workspace,
+        params: &SamplingParams,
+        position: u64,
+    ) -> Result<(u32, Option<f32>)> {
+        let Qwen35Workspace {
+            logits, argmax_out, ..
+        } = ws;
+        let logits = logits.get(&self.ctx, self.output_projection().rows)?;
+        let argmax_out = argmax_out.get(&self.ctx, 1)?;
+        sample_cuda_token_scratched(&self.ctx, logits, params, position, argmax_out)
+    }
+
+    /// Device address of the workspace logits buffer (allocating it at vocab
+    /// size if absent) — the decode-graph bake fingerprint's output anchor.
+    pub(crate) fn workspace_logits_ptr(&self, ws: &mut Qwen35Workspace) -> Result<u64> {
+        let logits = ws.logits.get(&self.ctx, self.output_projection().rows)?;
+        let (ptr, _g) = logits.data.device_ptr(&self.ctx.stream);
+        Ok(ptr)
+    }
+
+    /// Per-slot KV-cache capacity (tokens).
+    pub(crate) fn max_seq_len(&self) -> usize {
+        self.max_seq_len
+    }
+
+    /// MTP spec-decode draft depth this model was built for (`0` = spec off).
+    /// The executor's `mtp_decode_row` uses this to size `spec_step`'s depth.
+    pub(crate) fn spec_draft_tokens(&self) -> usize {
+        self.spec_draft_tokens
+    }
+
+    /// This rank's local full-attention KV head count (= global config on a
+    /// single GPU). Used by the opt-in KV-recall pool sizing + paged kernels.
+    pub(crate) fn local_kv_heads(&self) -> usize {
+        self.local_kv_heads
+    }
+
+    /// This rank's local full-attention query head count (= global config on a
+    /// single GPU). Used by the opt-in KV-recall scoring + paged kernels.
+    pub(crate) fn local_q_heads(&self) -> usize {
+        self.local_q_heads
+    }
+
+    /// Run the full forward over `tokens` and return the FULL `[seq_len, vocab]`
+    /// logits (every row, not just the last) WITHOUT sampling. Mirrors
+    /// [`Self::forward_tokens`]'s layer stack but, instead of slicing the last
+    /// row + a single `gemv`, applies the final offset-RMSNorm over the whole
+    /// batch and a batched lm-head GEMM, returning the device logits buffer plus
+    /// its `[seq_len, vocab]` shape.
+    ///
+    /// This is the OPD teacher raw-logits path: the distillation loss needs the
+    /// teacher's per-position logit distribution over the prompt, so it cannot
+    /// use the sampling tail. `slot` carries the per-slot KV + recurrent state
+    /// exactly like [`Self::forward_tokens`].
+    pub(crate) fn forward_token_logits_full(
+        &self,
+        slot: &mut Qwen35SlotState,
+        ws: &mut Qwen35Workspace,
+        tokens: &[u32],
+        start_pos: usize,
+        recall: Option<&mut Qwen35RecallForward>,
+    ) -> Result<(DeviceVec, [usize; 2])> {
+        self.forward_hidden_capture(slot, ws, tokens, start_pos, None, recall, None)?;
+        let seq_len = tokens.len();
+        let eps = self.config.rms_norm_eps;
+        let hidden_size = self.config.hidden_size;
+
+        // Final norm (offset) over the WHOLE batch, then the batched lm-head GEMM
+        // produces every row's logits — no last-row slice, no sampling.
+        // (TP invariant as in `forward_tokens`: replicated lm_head over
+        // post-all-reduce hidden ⇒ identical logits on every rank.)
+        let Qwen35Workspace { hidden, normed, .. } = ws;
+        // Shape-matched re-gets return the SAME buffers forward_hidden used;
+        // rms_norm fully overwrites `normed` before the lm-head GEMM reads it.
+        let hidden = hidden.get(&self.ctx, hidden_size, seq_len)?;
+        let normed = normed.get(&self.ctx, hidden_size, seq_len)?;
+        rms_norm_offset(&self.ctx, hidden, &self.norm, eps, normed)?;
+        let vocab = self.output_projection().rows;
+        // The logits buffer is RETURNED to the OPD caller (ownership leaves the
+        // forward), so it stays a per-call allocation — not a workspace slot.
+        let mut logits = HiddenStates::zeros(&self.ctx, vocab, seq_len)?;
+        gemm_batch(&self.ctx, self.output_projection(), normed, &mut logits)?;
+        self.ctx.sync()?;
+
+        // `HiddenStates` is a `[vocab, seq_len]` column-batch over a flat device
+        // buffer; reinterpret it as a `[seq_len, vocab]` row-major `DeviceVec`
+        // (the train OPD bridge reads it as `[1, seq_len, vocab]`).
+        let logits_vec = DeviceVec {
+            data: logits.data,
+            len: seq_len * vocab,
+            label: "qwen35_token_logits[seq,vocab]",
+        };
+        Ok((logits_vec, [seq_len, vocab]))
+    }
+
+    /// Like [`Self::forward_token_logits_full`] but ALSO returns the LAST token's
+    /// RAW trunk hidden (pre-final-norm) in a freshly-owned `DeviceVec`. The
+    /// NextN-MTP draft head consumes that hidden as its level-0 input
+    /// (`fc(concat[embed(tok), h])`), so spec-decode needs both the verify logits
+    /// and the trunk hidden from a single forward. Byte-identical to
+    /// `forward_token_logits_full` for the logits; the extra `copy_row_to_vec`
+    /// captures the hidden BEFORE the lm-head norm reuses the workspace.
+    /// (Spec-decode port increment 3a; gated path, no default-decode change.)
+    #[allow(dead_code)] // consumed by mtp_forward_level / spec_step (next increment)
+    pub(crate) fn forward_tokens_with_hidden(
+        &self,
+        slot: &mut Qwen35SlotState,
+        ws: &mut Qwen35Workspace,
+        tokens: &[u32],
+        start_pos: usize,
+        recall: Option<&mut Qwen35RecallForward>,
+    ) -> Result<(DeviceVec, [usize; 2], DeviceVec)> {
+        self.forward_hidden_capture(slot, ws, tokens, start_pos, None, recall, None)?;
+        let seq_len = tokens.len();
+        let eps = self.config.rms_norm_eps;
+        let hidden_size = self.config.hidden_size;
+        // Capture the last row's raw trunk hidden into an OWNED buffer first —
+        // the lm-head norm below overwrites `ws.normed` from `ws.hidden`.
+        let mut last_hidden = DeviceVec::zeros(&self.ctx, hidden_size)?;
+        {
+            let hidden = ws.hidden.get(&self.ctx, hidden_size, seq_len)?;
+            copy_row_to_vec(&self.ctx, hidden, seq_len - 1, &mut last_hidden)?;
+        }
+        let Qwen35Workspace { hidden, normed, .. } = ws;
+        let hidden = hidden.get(&self.ctx, hidden_size, seq_len)?;
+        let normed = normed.get(&self.ctx, hidden_size, seq_len)?;
+        rms_norm_offset(&self.ctx, hidden, &self.norm, eps, normed)?;
+        let vocab = self.output_projection().rows;
+        let mut logits = HiddenStates::zeros(&self.ctx, vocab, seq_len)?;
+        gemm_batch(&self.ctx, self.output_projection(), normed, &mut logits)?;
+        self.ctx.sync()?;
+        let logits_vec = DeviceVec {
+            data: logits.data,
+            len: seq_len * vocab,
+            label: "qwen35_token_logits[seq,vocab]",
+        };
+        Ok((logits_vec, [seq_len, vocab], last_hidden))
+    }
+
+    /// Like [`Self::forward_token_logits_full`] but ALSO returns EVERY row's raw
+    /// trunk hidden (pre-final-norm) as one owned `[seq_len, hidden]` (token-major)
+    /// `DeviceVec`. The depth>1 spec-decode verify needs the ACCEPTED row's hidden
+    /// (not just the last) to seed the next block's level-0 draft — the accepted
+    /// prefix length is only known after host-argmax, so all rows are captured.
+    /// Byte-identical logits to `forward_token_logits_full`; the extra D2D copy of
+    /// `ws.hidden` happens BEFORE the lm-head norm reuses the workspace.
+    #[allow(dead_code)] // consumed by spec_step (next increment)
+    pub(crate) fn forward_tokens_verify(
+        &self,
+        slot: &mut Qwen35SlotState,
+        ws: &mut Qwen35Workspace,
+        tokens: &[u32],
+        start_pos: usize,
+        capture: Option<&mut Qwen35LinearCapture>,
+        recall: Option<&mut Qwen35RecallForward>,
+    ) -> Result<(DeviceVec, [usize; 2], DeviceVec)> {
+        self.forward_hidden_capture(slot, ws, tokens, start_pos, capture, recall, None)?;
+        let seq_len = tokens.len();
+        let eps = self.config.rms_norm_eps;
+        let hidden_size = self.config.hidden_size;
+        // Capture ALL rows' raw (pre-final-norm) trunk hidden into an owned
+        // [seq_len, hidden] (token-major) buffer — the spec step seeds the next
+        // block's level-0 draft from the accepted row's hidden.
+        let mut hiddens = DeviceVec::zeros(&self.ctx, seq_len * hidden_size)?;
+        {
+            let hidden = ws.hidden.get(&self.ctx, hidden_size, seq_len)?;
+            self.ctx
+                .stream
+                .memcpy_dtod(&hidden.data, &mut hiddens.data)
+                .map_err(|e| anyhow!("verify hidden batch capture failed: {e}"))?;
+        }
+        let Qwen35Workspace { hidden, normed, .. } = ws;
+        let hidden = hidden.get(&self.ctx, hidden_size, seq_len)?;
+        let normed = normed.get(&self.ctx, hidden_size, seq_len)?;
+        rms_norm_offset(&self.ctx, hidden, &self.norm, eps, normed)?;
+        let vocab = self.output_projection().rows;
+        let mut logits = HiddenStates::zeros(&self.ctx, vocab, seq_len)?;
+        gemm_batch(&self.ctx, self.output_projection(), normed, &mut logits)?;
+        self.ctx.sync()?;
+        let logits_vec = DeviceVec {
+            data: logits.data,
+            len: seq_len * vocab,
+            label: "qwen35_verify_logits[seq,vocab]",
+        };
+        Ok((logits_vec, [seq_len, vocab], hiddens))
+    }
+
+    /// Trunk forward for offline DSpark draft training: the raw residual-stream
+    /// taps at `target_layer_ids` as `[seq, taps·hidden]`, and the final-normed
+    /// hidden states as `[seq, hidden]`, both on the host.
+    ///
+    /// Serving fuses the taps on device and never materializes them; training
+    /// needs them raw because `fc`/`hidden_norm` are the parameters being
+    /// learned. No lm-head GEMM here — the draft's distillation target is
+    /// computed from `last_hidden` against the same weights on the train side.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_training_taps(
+        &self,
+        slot: &mut Qwen35SlotState,
+        ws: &mut Qwen35Workspace,
+        taps: &mut dspark::Qwen35DsparkTaps,
+        target_layer_ids: &[i64],
+        tokens: &[u32],
+        recall: Option<&mut Qwen35RecallForward>,
+    ) -> Result<(Vec<f32>, Vec<f32>)> {
+        ensure!(!tokens.is_empty(), "training forward needs tokens");
+        ensure!(
+            !target_layer_ids.is_empty(),
+            "training forward needs target_layer_ids"
+        );
+        let seq_len = tokens.len();
+        let hidden_size = self.config.hidden_size;
+        dspark::Qwen35DsparkTaps::validate(target_layer_ids, self.config.num_hidden_layers)?;
+        taps.prepare(target_layer_ids, hidden_size, seq_len);
+        self.forward_hidden_capture(slot, ws, tokens, 0, None, recall, Some(taps))?;
+
+        // Taps come off first: the final norm below reuses `ws.normed`, and a
+        // tap buffer is the draft's only view of the trunk's interior.
+        let ntaps = target_layer_ids.len();
+        let mut features = vec![0.0f32; seq_len * ntaps * hidden_size];
+        for t in 0..ntaps {
+            let tap = taps.tap_to_host(&self.ctx, t)?;
+            for r in 0..seq_len {
+                let dst = r * ntaps * hidden_size + t * hidden_size;
+                features[dst..dst + hidden_size]
+                    .copy_from_slice(&tap[r * hidden_size..][..hidden_size]);
+            }
+        }
+        taps.release();
+
+        let Qwen35Workspace { hidden, normed, .. } = ws;
+        let hidden = hidden.get(&self.ctx, hidden_size, seq_len)?;
+        let normed = normed.get(&self.ctx, hidden_size, seq_len)?;
+        rms_norm_offset(
+            &self.ctx,
+            hidden,
+            &self.norm,
+            self.config.rms_norm_eps,
+            normed,
+        )?;
+        self.ctx.sync()?;
+        let last_hidden = normed.to_host(&self.ctx)?;
+        Ok((features, last_hidden))
+    }
+}
+
+fn rms_norm_offset(
+    ctx: &DeviceContext,
+    x: &HiddenStates,
+    weight: &DeviceVec,
+    eps: f32,
+    out: &mut HiddenStates,
+) -> Result<()> {
+    let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
+    let (w_ptr, _gw) = weight.data.device_ptr(&ctx.stream);
+    let (out_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
+    // SAFETY: x/weight/out valid on ctx.stream; out matches x shape.
+    unsafe {
+        ffi::rms_norm_batched_offset_cuda(
+            x_ptr as *const ffi::Half,
+            w_ptr as *const ffi::Half,
+            out_ptr as *mut ffi::Half,
+            x.hidden_dim as i32,
+            x.seq_len as i32,
+            eps,
+            ctx.stream.cu_stream(),
+        )
+        .result()?;
+    }
+    Ok(())
+}
+
+/// Offset RMSNorm (1+weight) over a single vector (the final norm before lm_head).
+fn rms_norm_offset_vec(
+    ctx: &DeviceContext,
+    x: &DeviceVec,
+    weight: &DeviceVec,
+    eps: f32,
+    out: &mut DeviceVec,
+) -> Result<()> {
+    let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
+    let (w_ptr, _gw) = weight.data.device_ptr(&ctx.stream);
+    let (out_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
+    // SAFETY: x/weight/out valid on ctx.stream; out matches x len.
+    unsafe {
+        ffi::rms_norm_offset_cuda(
+            x_ptr as *const ffi::Half,
+            w_ptr as *const ffi::Half,
+            out_ptr as *mut ffi::Half,
+            x.len as i32,
+            eps,
+            ctx.stream.cu_stream(),
+        )
+        .result()?;
+    }
+    Ok(())
+}
