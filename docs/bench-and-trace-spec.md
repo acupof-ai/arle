@@ -68,6 +68,10 @@ The runner always sends `ignore_eos=true`: this is a fixed-output performance
 workload, so every request must generate exactly `max_tokens`. Empty or invalid
 decoded output still fails the correctness gate.
 
+The warmup prepends a dedicated marker to the first workload prompt. This keeps
+the production-length warmup while preventing it from priming a measured
+session's prefix cache.
+
 ### 3.3 Workload — long agent sequences, one shape for everything
 
 **Every performance claim runs on `gen_bench_prompts.py`'s 32k-token agent
