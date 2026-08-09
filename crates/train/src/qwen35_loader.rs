@@ -1,48 +1,24 @@
 //! HuggingFace-format safetensors loader for [`Qwen35Model`].
 //!
-//! Reads a HF-style model directory (a `config.json` plus one or more
-//! `model*.safetensors` shards, optionally with a `model.safetensors.index.json`
-//! manifest) and materializes a live `Qwen35Model` whose `TensorStore` slots
-//! are populated from the on-disk weights.
-//!
 //! ## Schema coverage
 //!
-//! - **Qwen3.5 / Qwen3.6 layout** (nested `text_config`, tensor names rooted at
-//!   `model.language_model.*`, `q_proj` includes the output gate so its
-//!   `out_features == num_attention_heads * head_dim * 2`): natively supported.
-//!   The HF config is consumed via [`Qwen35Config::from_json_str`] which handles
-//!   both nested and flat layouts.
+//! - **Qwen3.5 / Qwen3.6** (`model.language_model.*`, gated `q_proj`): natively
+//!   supported.
+//! - **Vanilla Qwen3** (`model.*`, plain `q_proj`): partially supported — the
+//!   loader remaps `model.*` → `model.language_model.*` and synthesizes
+//!   `linear_*` fields. A plain `q_proj` checkpoint fails the gated-attention
+//!   shape check; see [`load_qwen35_from_hf_dir`].
 //!
-//! - **Vanilla Qwen3 layout** (flat HF config, tensor names rooted at
-//!   `model.*`, plain `q_proj` of shape `[num_heads * head_dim, hidden]` and
-//!   no `linear_attention` layers): partially supported. The loader maps the
-//!   `model.*` prefix to the `model.language_model.*` namespace the train
-//!   model uses internally, synthesizes the missing `linear_*` config fields
-//!   from the standard full-attention sizes, and reports a clear error if
-//!   `q_proj`'s on-disk shape does not match the gated-attention shape the
-//!   train-side `Qwen35Model` was built for. See [`load_qwen35_from_hf_dir`]
-//!   for the exact failure mode and the follow-up tranche needed to land a
-//!   non-gated full-attention variant of `Qwen35Model`.
-//!
-//! ## What the loader does not do
-//!
-//! - It does not download anything. It expects an already-materialized
-//!   directory on disk (the canonical entry point is
-//!   `~/.cache/modelscope/hub/models/Qwen/Qwen3-0.6B/` for the OPD-only pivot
-//!   smoke path).
-//! - It does not touch the tokenizer or generation config. Those live in
-//!   the same directory but are read elsewhere (e.g. `train::tokenizer`).
-//! - Quantized checkpoint support is deliberately narrow: CUDA LoRA-student
-//!   loads accept frozen FP8 E4M3 block-scaled base linear weights when the
-//!   checkpoint provides the matching `*.weight_scale_inv` side tensor. Teacher,
-//!   trainable-base, and CPU loads still reject quantized weights.
+//! Quantized checkpoint support is deliberately narrow: CUDA LoRA-student loads
+//! accept frozen FP8 E4M3 block-scaled base weights with a matching
+//! `*.weight_scale_inv` side tensor. Teacher, trainable-base, and CPU loads
+//! reject quantized weights.
 //!
 //! ## Independence from the `infer` crate
 //!
-//! Train must not depend on `infer` at runtime per the OPD-only pivot
-//! contract. This file therefore re-implements the small amount of shard
-//! discovery + BF16/F16 widening needed; the heavy lifting (safetensors
-//! parsing) goes through the workspace `safetensors` crate directly.
+//! Train must not depend on `infer` at runtime (OPD-only pivot contract), so
+//! this file re-implements shard discovery + BF16/F16 widening; safetensors
+//! parsing goes through the workspace `safetensors` crate.
 
 use std::{
     collections::HashMap,
@@ -64,14 +40,10 @@ use crate::{
 };
 
 /// One frozen base projection's resident FP8 block-scaled device pointers,
-/// borrowed read-only from a co-resident infer-cuda engine for train-infer
-/// weight sharing (`--share-frozen-base`).
+/// borrowed from a co-resident infer-cuda engine (`--share-frozen-base`).
 ///
-/// Backend-agnostic by design: the loader must not depend on `infer` (OPD-only
-/// pivot contract), so `train_cli` maps the infer-api `SharedFp8BaseProjection`
-/// into this plain struct. `layer_idx` + `proj_suffix` (e.g.
-/// `"self_attn.q_proj"`) form the key the loader matches against a planned
-/// tensor's `train_name` (`*.layers.{layer_idx}.{proj_suffix}.weight`).
+/// Backend-agnostic: train must not depend on `infer` (OPD-only pivot), so
+/// `train_cli` maps infer-api's `SharedFp8BaseProjection` into this struct.
 #[derive(Debug, Clone)]
 pub struct SharedFrozenBaseEntry {
     pub layer_idx: usize,
@@ -85,10 +57,6 @@ pub struct SharedFrozenBaseEntry {
 }
 
 impl SharedFrozenBaseEntry {
-    /// True iff this entry is the shared base for the given autograd
-    /// `train_name`. Matches `*.layers.{layer_idx}.{proj_suffix}.weight`, robust
-    /// to both the `model.language_model.*` (Qwen3.5/3.6) and `model.*`
-    /// (vanilla Qwen3) name prefixes.
     fn matches(&self, train_name: &str) -> bool {
         train_name.ends_with(&format!(
             ".layers.{}.{}.weight",
@@ -97,9 +65,7 @@ impl SharedFrozenBaseEntry {
     }
 }
 
-/// Lookup table of shared frozen base projections, keyed by `train_name` match.
-/// `None`/empty = the default (no sharing) path — every frozen FP8 base tensor
-/// uploads its own copy, byte-identical to today.
+/// `None`/empty = no sharing — every frozen FP8 base uploads its own copy.
 pub type SharedFrozenBaseTable<'a> = &'a [SharedFrozenBaseEntry];
 
 #[derive(Debug, Error)]
@@ -179,17 +145,8 @@ pub enum LoaderError {
 
 pub type Result<T> = std::result::Result<T, LoaderError>;
 
-// ─────────────────────────── HF config schema ────────────────────────────────
-
-/// Field set is the union of vanilla Qwen3 (0.6B / 1.7B / 4B) and the
-/// Qwen3.5 / Qwen3.6 nested `text_config` layout. We accept either by
-/// reading both shapes via [`serde_json::Value`] inside
-/// [`Qwen35HfConfig::from_value`] before binding fields, rather than relying
-/// on a tagged enum that complicates downstream consumers.
-///
-/// All `linear_*` fields are optional because vanilla Qwen3 omits them
-/// entirely. `layer_types` is also optional — when missing we treat every
-/// layer as `FullAttention`.
+/// Union of vanilla Qwen3 and Qwen3.5/3.6 nested `text_config` fields.
+/// `linear_*` and `layer_types` optional (vanilla Qwen3 omits them).
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct Qwen35HfConfig {
     pub hidden_size: usize,
@@ -215,7 +172,6 @@ pub struct Qwen35HfConfig {
     #[serde(default = "default_tie_word_embeddings")]
     pub tie_word_embeddings: bool,
 
-    // Optional Qwen3.5-style fields (absent on vanilla Qwen3 0.6B/1.7B/4B).
     #[serde(default)]
     pub layer_types: Option<Vec<LayerType>>,
     #[serde(default)]
@@ -284,22 +240,16 @@ fn default_norm_topk_prob() -> bool {
     true
 }
 
-/// What kind of HF schema this directory exposes — controls name remapping
-/// and downstream contract checks.
+/// Controls name remapping and contract checks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HfSchema {
-    /// `model.layers.N.*` prefix, plain (un-gated) `q_proj`. Examples:
-    /// `Qwen/Qwen3-0.6B`, `Qwen/Qwen3-1.7B`, `Qwen/Qwen3-4B`.
+    /// `model.layers.N.*`, plain `q_proj`. Qwen3-0.6B/1.7B/4B.
     Qwen3,
-    /// `model.language_model.layers.N.*` prefix, gated `q_proj` (out_features
-    /// includes the per-head output gate). Examples: `Qwen/Qwen3.5-*`,
-    /// `Qwen/Qwen3.6-*`.
+    /// `model.language_model.layers.N.*`, gated `q_proj`. Qwen3.5/3.6.
     Qwen35,
 }
 
 impl Qwen35HfConfig {
-    /// Accepts both the flat (Qwen3) and nested-`text_config` (Qwen3.5 /
-    /// Qwen3.6) layouts; the nested form is unwrapped before field binding.
     pub fn from_json_str(content: &str) -> Result<(Self, HfSchema)> {
         let value: serde_json::Value = serde_json::from_str(content)?;
         Self::from_value(&value)
@@ -310,9 +260,6 @@ impl Qwen35HfConfig {
             Some(text) => (text.clone(), HfSchema::Qwen35),
             None => (value.clone(), HfSchema::Qwen3),
         };
-        // Fold the model-level `eos_token_id` / `bos_token_id` from the outer
-        // object onto the text block when the nested block doesn't carry them
-        // (Qwen3.5 typical layout).
         let text = if schema == HfSchema::Qwen35 {
             merge_token_ids(text, value)
         } else {
@@ -322,7 +269,6 @@ impl Qwen35HfConfig {
         let mut config: Qwen35HfConfig = serde_json::from_value(text.clone())?;
         config.merge_nested_moe_config();
 
-        // Qwen3.5 / Qwen3.6 stash rope under a `rope_parameters` block.
         if let Some(rope) = text.get("rope_parameters") {
             if let Some(theta) = rope.get("rope_theta").and_then(serde_json::Value::as_f64) {
                 config.rope_theta = theta as f32;
@@ -374,10 +320,8 @@ impl Qwen35HfConfig {
         Self::from_json_str(&content)
     }
 
-    /// Missing `linear_*` fields are filled with defaults derived from the
-    /// dense attention shape — the train model only consults them when a
-    /// layer has `LayerType::LinearAttention`, so for vanilla full-attention
-    /// Qwen3 the synthesized values are inert.
+    /// Missing `linear_*` fields default to the dense attention shape — only
+    /// consulted when a layer has `LayerType::LinearAttention`.
     pub fn to_qwen35_config(&self) -> Result<Qwen35Config> {
         let eos = self.eos_token_id.unwrap_or(0);
         let num_layers = self.num_hidden_layers;
@@ -410,8 +354,6 @@ impl Qwen35HfConfig {
             num_attention_heads: self.num_attention_heads,
             num_key_value_heads: self.num_key_value_heads,
             head_dim,
-            // Defaults derived from the dense attention shape — only consulted
-            // if a layer is `LinearAttention`.
             linear_num_key_heads: self
                 .linear_num_key_heads
                 .unwrap_or(self.num_attention_heads),
@@ -454,9 +396,6 @@ fn merge_token_ids(mut text: serde_json::Value, parent: &serde_json::Value) -> s
     text
 }
 
-// ─────────────────────────── shard discovery ─────────────────────────────────
-
-/// One memory-mapped safetensors shard plus its (lazy) deserialized index.
 struct ShardFile {
     mmap: Mmap,
 }
@@ -481,9 +420,6 @@ impl ShardFile {
     }
 }
 
-/// Returns either a single `model.safetensors` shard (when the index
-/// manifest is absent) or one shard per file referenced in
-/// `model.safetensors.index.json`.
 fn discover_shards(dir: &Path) -> Result<Vec<PathBuf>> {
     let single = dir.join("model.safetensors");
     let index = dir.join("model.safetensors.index.json");
@@ -523,13 +459,9 @@ fn discover_shards(dir: &Path) -> Result<Vec<PathBuf>> {
     )))
 }
 
-// ─────────────────────────── name remapping ──────────────────────────────────
-
-/// For `HfSchema::Qwen35` this is a no-op (the train side uses the Qwen3.5
-/// canonical naming). For `HfSchema::Qwen3` we strip the `language_model.`
-/// segment so e.g. `model.language_model.layers.0.self_attn.q_proj.weight`
-/// becomes `model.layers.0.self_attn.q_proj.weight`. The lm_head case is
-/// handled by [`hf_lm_head_candidates`].
+/// For `HfSchema::Qwen35` this is identity. For `HfSchema::Qwen3` we strip
+/// the `language_model.` segment. The lm_head case is handled by
+/// [`hf_lm_head_candidates`].
 fn train_name_to_hf(train_name: &str, schema: HfSchema) -> String {
     match schema {
         HfSchema::Qwen35 => train_name.to_owned(),
@@ -546,9 +478,7 @@ fn train_name_to_hf(train_name: &str, schema: HfSchema) -> String {
 
 /// LM head fallback list. Vanilla Qwen3 ships `lm_head.weight` (not under
 /// `model.`). When `tie_word_embeddings` is true the embedding row is reused
-/// and the LM head tensor may be absent; the train-side tied case maps to
-/// `embed_tokens.weight`, so only explicit untied `*.lm_head.weight` names
-/// should route through these fallback candidates.
+/// and the LM head tensor may be absent.
 fn hf_lm_head_candidates(schema: HfSchema) -> &'static [&'static str] {
     match schema {
         HfSchema::Qwen35 => &["lm_head.weight", "model.language_model.lm_head.weight"],
@@ -566,8 +496,6 @@ fn hf_candidates_for_train_name(train_name: &str, schema: HfSchema) -> Vec<Strin
         vec![train_name_to_hf(train_name, schema)]
     }
 }
-
-// ─────────────────────────── dtype widening ──────────────────────────────────
 
 fn dtype_to_f32(view: &TensorView<'_>, name: &str) -> Result<Vec<f32>> {
     let bytes = view.data();
@@ -599,21 +527,16 @@ fn dtype_to_bf16_bits(view: &TensorView<'_>, name: &str) -> Result<Vec<u16>> {
             bytes.len()
         )));
     }
-    // The safetensors BF16 payload is little-endian u16. The old
-    // `chunks_exact(2).map(u16::from_le_bytes).collect()` ran one scalar
-    // `core::ptr::write::<u16>` per element — single-threaded over the giant
-    // frozen-base tensors (`embed_tokens` + `lm_head` are each [248320, 5120] =
-    // 1.27 B u16), so the 27B student load spun ~minutes on one core (GPU idle,
-    // RSS flat) and the over-long load got reaped by the box watchdog before it
-    // finished. Bulk-copy the bytes into the `Vec<u16>` instead (one memcpy),
-    // then byte-swap only on a big-endian host. x86-64/aarch64 are LE, so this
-    // is a straight memcpy there — the per-element loop is fully eliminated.
+    // The old `chunks_exact(2).map(u16::from_le_bytes).collect()` ran one scalar
+    // write per element — single-threaded over the giant frozen-base tensors
+    // (embed_tokens + lm_head each ~1.27 B u16 on 27B), so the student load
+    // spun minutes on one core. Bulk-copy the bytes into the `Vec<u16>` (one
+    // memcpy), then byte-swap only on big-endian hosts.
     let mut out = vec![0u16; bytes.len() / 2];
     {
-        // SAFETY: `out` owns `out.len()` u16 = `bytes.len()` contiguous bytes; a
-        // `[u8]` view over its buffer is valid for that exact length, properly
-        // sized/aligned (u16 alignment ⊇ u8), and non-overlapping with `bytes`
-        // (fresh alloc). `copy_from_slice` asserts equal length.
+        // SAFETY: `out` owns `out.len()` u16 = `bytes.len()` contiguous bytes;
+        // a `[u8]` view over its buffer is valid for that exact length,
+        // properly aligned (u16 ⊇ u8), and non-overlapping with `bytes`.
         let out_bytes =
             unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr().cast::<u8>(), bytes.len()) };
         out_bytes.copy_from_slice(bytes);
@@ -626,15 +549,8 @@ fn dtype_to_bf16_bits(view: &TensorView<'_>, name: &str) -> Result<Vec<u16>> {
     Ok(out)
 }
 
-// ─────────────────────────── public entry point ──────────────────────────────
-
-/// The model is initialized via [`Qwen35Model::new_for_eval`] (frozen, no
-/// LoRA, no `requires_grad`) and every parameter slot is overwritten with
-/// the data read from the safetensors shards in `dir`.
-///
-/// On any error the function rolls `store` back to its entry state, so
-/// callers do not need to discard the store after a failed OPD checkpoint
-/// load.
+/// Loads a frozen eval model (no LoRA, no `requires_grad`). On error, rolls
+/// `store` back to its entry state.
 pub fn load_qwen35_from_hf_dir(dir: &Path, store: &mut TensorStore) -> Result<Qwen35Model> {
     let rollback = TensorStoreRollback::capture(store);
     match load_qwen35_from_hf_dir_inner(dir, store, LoadMode::FrozenEval, None) {
@@ -646,10 +562,8 @@ pub fn load_qwen35_from_hf_dir(dir: &Path, store: &mut TensorStore) -> Result<Qw
     }
 }
 
-/// Same shard discovery, shape validation, dtype widening, and rollback
-/// semantics as [`load_qwen35_from_hf_dir`], but initializes the model with
-/// [`Qwen35Model::new`] so loaded trainable parameter slots keep
-/// `requires_grad = true`. Use the frozen loader for teachers.
+/// Like [`load_qwen35_from_hf_dir`] but keeps `requires_grad = true` on
+/// trainable slots. Use the frozen loader for teachers.
 pub fn load_qwen35_trainable_from_hf_dir(
     dir: &Path,
     store: &mut TensorStore,
@@ -664,9 +578,8 @@ pub fn load_qwen35_trainable_from_hf_dir(
     }
 }
 
-/// Cross-size OPD student path: teacher and student checkpoints can differ,
-/// while the student base stays frozen and only adapter weights receive
-/// gradients.
+/// Cross-size OPD student: teacher and student checkpoints can differ, the
+/// student base stays frozen, only adapter weights receive gradients.
 pub fn load_qwen35_lora_from_hf_dir(
     dir: &Path,
     lora: LoraConfig,
@@ -700,10 +613,8 @@ pub fn load_qwen35_lora_from_hf_dir_with_layer_start(
 /// When `shared_base` is `Some(table)`, every frozen FP8 block-scaled base
 /// projection whose `train_name` matches a table entry imports a NON-OWNING
 /// device view over the co-resident infer engine's resident base weight
-/// (zero-copy) instead of uploading its own ~27 GB copy. Unmatched frozen FP8
-/// tensors, and all tensors when `shared_base` is `None`, take the existing
-/// `upload_fp8_block_scaled` path — so the default (`None`) is byte-identical
-/// to [`load_qwen35_lora_from_hf_dir_with_layer_start`].
+/// (zero-copy) instead of uploading its own ~27 GB copy. Unmatched tensors
+/// and the `None` default take the existing upload path.
 pub fn load_qwen35_lora_from_hf_dir_with_shared_base(
     dir: &Path,
     lora: LoraConfig,
@@ -763,19 +674,13 @@ fn load_qwen35_from_hf_dir_inner(
         )));
     }
 
-    // 1) HF config → Qwen35Config.
     let (hf_cfg, schema) = Qwen35HfConfig::from_json_file(dir.join("config.json"))?;
     let mut cfg = hf_cfg.to_qwen35_config()?;
-    // Vanilla Qwen3 (flat-schema HF config) ships un-gated q_proj. Qwen3.5 /
-    // Qwen3.6 (nested `text_config`) ships gated q_proj — the default that
-    // `to_qwen35_config` writes.
+    // Vanilla Qwen3 ships un-gated q_proj; Qwen3.5/3.6 ships gated q_proj.
     if matches!(schema, HfSchema::Qwen3) {
         cfg.full_attn_gated = false;
     }
 
-    // 2) Open every shard once and build a `hf_name -> shard_idx` lookup before
-    //    allocating model tensors in the caller's store. Missing checkpoint
-    //    files should fail without leaving a half-constructed eval model behind.
     let shard_paths = discover_shards(dir)?;
     let shards: Vec<ShardFile> = shard_paths
         .iter()
@@ -792,8 +697,6 @@ fn load_qwen35_from_hf_dir_inner(
         }
     }
 
-    // 3) Qwen35Config → fresh model. The load mode controls whether loaded
-    //    slots remain frozen for teachers/eval or trainable for OPD students.
     let load_trace = std::env::var("ARLE_OPD_LOAD_TRACE").is_ok();
     if load_trace {
         eprintln!(
@@ -838,9 +741,6 @@ fn load_qwen35_from_hf_dir_inner(
     }
     let param_map = model.param_name_map();
 
-    // 4) Preflight every tensor before writing any checkpoint data into the
-    //    store. This keeps missing/mismatched later tensors from leaving
-    //    partially materialized checkpoint weights behind.
     let load_plan = plan_tensor_loads(
         &param_map,
         &cfg,
@@ -851,7 +751,6 @@ fn load_qwen35_from_hf_dir_inner(
         store,
     )?;
 
-    // 5) Materialize each train parameter from the safetensors.
     for (i, planned) in load_plan.iter().enumerate() {
         if load_trace {
             eprintln!(
@@ -923,18 +822,13 @@ fn plan_tensor_loads(
     safetensors_views: &[SafeTensors<'_>],
     store: &TensorStore,
 ) -> Result<Vec<PlannedTensorLoad>> {
-    //
-    // The `param_name_map()` contract returns the same `TensorId` for the
-    // embedding row twice (once under the embed_tokens name, once under
-    // `lm_head` when `tie_word_embeddings == true`). Deduplicating here keeps
-    // us from writing the same slot twice and lets us report a clean
-    // "missing lm_head" error only when the model genuinely needs a separate
-    // head tensor.
+    // `param_name_map()` returns the same `TensorId` for the embedding row
+    // twice (embed_tokens + lm_head when `tie_word_embeddings`). Dedupe here
+    // to avoid writing the same slot twice.
     let mut planned_ids: std::collections::HashSet<TensorId> = std::collections::HashSet::new();
     let mut plan = Vec::new();
     for (&train_name, &id) in param_map {
         if planned_ids.contains(&id) {
-            // Already filled (tied lm_head case).
             continue;
         }
         let candidates = hf_candidates_for_train_name(train_name, schema);
@@ -966,10 +860,6 @@ fn plan_tensor_loads(
             plan.push(tensor_load);
             continue;
         } else {
-            // Tied-embedding fallback: if this slot is the lm_head and the
-            // tied embedding slot was already planned, we're done. If this
-            // lm_head name appears before embed_tokens in the HashMap order,
-            // leave the id unplanned so the embedding name can still load it.
             if train_name.ends_with("lm_head.weight") && cfg.tie_word_embeddings {
                 continue;
             }
@@ -1210,9 +1100,7 @@ fn is_fp8_cuda_frozen_base_tensor(train_name: &str, expected_shape: &[usize]) ->
             || train_name.ends_with(".linear_attn.in_proj_b.weight")
             || train_name.ends_with(".linear_attn.in_proj_a.weight")
             || train_name.ends_with(".linear_attn.out_proj.weight")
-            // Dense MLP (non-MoE students, e.g. Qwen3.x-27B dense). The whitelist
-            // predates dense FP8 students (only MoE/DSv4 were loaded), so the plain
-            // mlp.{gate,up,down}_proj had no FP8 path and fell to "unsupported dtype".
+            // Dense MLP (non-MoE students, e.g. Qwen3.x-27B dense).
             || train_name.ends_with(".mlp.gate_proj.weight")
             || train_name.ends_with(".mlp.up_proj.weight")
             || train_name.ends_with(".mlp.down_proj.weight")
@@ -1247,10 +1135,9 @@ fn load_planned_tensor_into_slot(
         .map_err(|err| LoaderError::Safetensors(format!("{}: {err}", planned.hf_name)))?;
     if let Some(fp8) = &planned.fp8_cuda_frozen_base {
         // Train-infer weight sharing (`--share-frozen-base`): if a co-resident
-        // infer engine exposes the resident FP8 base for THIS frozen projection
-        // and the dims match, import a NON-OWNING device view (zero-copy)
-        // instead of uploading a private ~27 GB copy. Default (`None`) and any
-        // unmatched tensor fall through to the byte-identical upload below.
+        // infer engine exposes the resident FP8 base for this projection and
+        // the dims match, import a NON-OWNING device view (zero-copy) instead
+        // of uploading a private ~27 GB copy.
         if let Some(entry) = shared_base.and_then(|table| {
             table.iter().find(|e| {
                 e.matches(&planned.train_name)
@@ -1345,8 +1232,8 @@ fn shape_mismatch_hint(
     )
 }
 
-/// The train side is Qwen3.5-shaped (`q_proj` includes the per-head output
-/// gate); vanilla Qwen3 ships `q_proj` without that gate.
+/// Train side is Qwen3.5-shaped (`q_proj` includes the per-head output gate);
+/// vanilla Qwen3 ships `q_proj` without that gate.
 fn q_proj_gate_hint(train_name: &str, expected: &[usize], got: &[usize]) -> String {
     if !train_name.ends_with(".self_attn.q_proj.weight") {
         return String::new();
@@ -1368,8 +1255,6 @@ fn q_proj_gate_hint(train_name: &str, expected: &[usize], got: &[usize]) -> Stri
         .to_owned()
 }
 
-// ─────────────────────────── unit tests ──────────────────────────────────────
-
 #[cfg(test)]
 mod tests {
     use std::borrow::Cow;
@@ -1378,9 +1263,7 @@ mod tests {
 
     use super::*;
 
-    /// Canonical Qwen3-0.6B `config.json` (HF flat layout). Used to verify
-    /// the HF-config → `Qwen35Config` conversion without needing the
-    /// safetensors file on disk.
+    /// Canonical Qwen3-0.6B `config.json` (HF flat layout).
     const QWEN3_0_6B_CONFIG_JSON: &str = r#"{
         "architectures": ["Qwen3ForCausalLM"],
         "attention_bias": false,
@@ -1454,12 +1337,6 @@ mod tests {
 
     #[test]
     fn dtype_to_bf16_bits_bulk_matches_scalar_reference() {
-        // Mirror the load-time conversion of the giant frozen-base tables: build
-        // a BF16 safetensors view over a known little-endian payload and assert
-        // the bulk-copy path produces EXACTLY the old per-element
-        // `chunks_exact(2).map(u16::from_le_bytes)` result (the fix must be
-        // byte-identical, only faster). Covers odd values, 0x0000, 0xFFFF, and a
-        // non-zero low/high byte so any endian/stride bug surfaces.
         let words: Vec<u16> = (0u16..4096).chain([0, 0xFFFF, 0x1234, 0xABCD]).collect();
         let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let shape = vec![words.len()];
@@ -1546,14 +1423,12 @@ mod tests {
                 .iter()
                 .all(|lt| *lt == LayerType::FullAttention)
         );
-        // Synthesized linear_* fields are inert (no LinearAttention layers).
         assert_eq!(cfg.linear_num_key_heads, 16);
         assert_eq!(cfg.linear_key_head_dim, 128);
         assert_eq!(cfg.linear_conv_kernel_dim, 4);
     }
 
-    /// Nested-layout Qwen3.5/Qwen3.6 style config — verifies the schema
-    /// detection picks `Qwen35` and the rope_parameters block parses.
+    /// Nested-layout Qwen3.5/Qwen3.6 style config.
     const QWEN35_NESTED_CONFIG_JSON: &str = r#"{
         "architectures": ["Qwen3_5_NextForCausalLM"],
         "eos_token_id": 248044,
@@ -1736,10 +1611,8 @@ mod tests {
     fn parses_qwen35_nested_text_config() {
         let (cfg, schema) = Qwen35HfConfig::from_json_str(QWEN35_NESTED_CONFIG_JSON).unwrap();
         assert_eq!(schema, HfSchema::Qwen35);
-        // rope_parameters: rope_theta is taken from the nested block, not the root.
         assert_eq!(cfg.rope_theta, 1_000_000.0);
         assert_eq!(cfg.partial_rotary_factor, 0.5);
-        // eos_token_id is on the root, not the text_config block.
         assert_eq!(cfg.eos_token_id, Some(248_044));
         assert_eq!(cfg.hidden_size, 2560);
         let layer_types = cfg.layer_types.as_ref().expect("layer_types present");
@@ -1849,14 +1722,12 @@ mod tests {
             hint.contains("vanilla Qwen3 ships an un-gated q_proj"),
             "hint missing diagnostic: {hint}"
         );
-        // unrelated tensor → no hint
         let unrelated = q_proj_gate_hint(
             "model.language_model.layers.0.input_layernorm.weight",
             &[1024],
             &[2048],
         );
         assert!(unrelated.is_empty());
-        // matching shapes → no hint
         let matching = q_proj_gate_hint(
             "model.language_model.layers.0.self_attn.q_proj.weight",
             &[2048, 1024],

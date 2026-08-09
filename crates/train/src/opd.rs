@@ -63,20 +63,16 @@ use autograd::ops::{
 };
 
 /// Routes the OPD rollout through the in-process infer engine (`InferStudent`)
-/// instead of the train-crate decode. Built only when the infer arm is selected
-/// and an `InferStudent` loaded; `None` → train-crate rollout (A/B baseline).
+/// instead of the train-crate decode. `None` → train-crate rollout (A/B baseline).
 #[cfg(feature = "cuda")]
 pub struct InferRolloutCtx<'a> {
-    /// In-process infer student engine (LoRA-synced from the train store).
     pub student: &'a InferStudent,
-    /// Train LoRA config (rank / alpha) used to export the adapter for sync.
     pub lora_config: LoraConfig,
 }
 
-/// True when the infer-engine rollout path is selected (the default). The
-/// in-process infer student (CUDA graph + paged KV) is 4.99× faster than the
-/// train-crate O(n²) decode (`wins/2026-05-29-opd-infer-rollout-default-p4.md`).
-/// Set by `--rollout-engine {infer,train}`; unset → `infer`.
+/// True when the infer-engine rollout path is selected (default). The in-process
+/// infer student (CUDA graph + paged KV) is 4.99× faster than train-crate O(n²)
+/// decode (`wins/2026-05-29-opd-infer-rollout-default-p4.md`).
 #[cfg(feature = "cuda")]
 pub fn infer_rollout_flag_enabled() -> bool {
     INFER_ROLLOUT_OVERRIDE.get().copied().unwrap_or(true)
@@ -92,58 +88,40 @@ pub fn set_infer_rollout_override(use_infer: bool) {
     let _ = INFER_ROLLOUT_OVERRIDE.set(use_infer);
 }
 
-/// OPD engine weight time-share mode (`--engine-offload`). When on, the
-/// idle infer engines offload their device weights to host RAM during the
-/// student backward, freeing VRAM so long rollouts (≥256) fit on a 16 GB card.
-///
-/// The vLLM-sleep-mode / verl HybridFlow equivalent ARLE previously lacked.
+/// OPD engine weight time-share mode (`--engine-offload`). Offloads idle infer
+/// engines to host RAM during student backward, freeing VRAM for long rollouts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EngineOffloadMode {
-    /// Default — resident-weights path is unchanged.
     Off,
-    /// Offload BOTH idle engines (rollout student + scoring teacher) together
-    /// after the teacher scores. Frees the most VRAM (~4.4 GB at rollout-256)
+    /// Offload BOTH engines after teacher scores. Frees ~4.4 GB at rollout-256
     /// but reloads the teacher every step, which races the shared async pool
-    /// across the three co-resident CUDA contexts (step-2 illegal address —
-    /// see `errors/2026-05-30-...`).
+    /// across three co-resident CUDA contexts (step-2 illegal address — see
+    /// `errors/2026-05-30-...`).
     All,
-    /// Offload ONLY the rollout infer-student; keep the teacher resident. The
-    /// teacher is never reloaded, so the step-2 teacher-reload path is avoided.
-    /// Frees ~1.4 GB — enough for moderate rollout-256 backwards but can OOM on
-    /// the longest CoTs (the teacher's 3 GB stays put).
+    /// Offload ONLY the rollout infer-student; keep teacher resident. Avoids
+    /// the step-2 teacher-reload path. Frees ~1.4 GB.
     Student,
-    /// Offload ONLY the scoring teacher; keep the rollout infer-student
-    /// resident. Frees the teacher's ~3.0 GB (more headroom than `Student`) and
-    /// — because only ONE engine offloads/reloads — keeps the shared async pool
-    /// free of the student↔teacher offload interleaving that corrupts the W4A8
-    /// Marlin reload under `All`. Matches the single-engine offload/reload
-    /// parity conditions, so the teacher's Marlin side buffers round-trip.
+    /// Offload ONLY the scoring teacher; keep student resident. Frees ~3.0 GB
+    /// and avoids the student↔teacher offload interleaving that corrupts the
+    /// W4A8 Marlin reload under `All`.
     Teacher,
 }
 
 impl EngineOffloadMode {
-    /// True when any engine offload is active (student and/or teacher).
     pub fn is_enabled(self) -> bool {
         !matches!(self, EngineOffloadMode::Off)
     }
 
-    /// True when the scoring teacher participates in the offload/reload
-    /// time-share. `Student` keeps the teacher resident.
     pub fn offloads_teacher(self) -> bool {
         matches!(self, EngineOffloadMode::All | EngineOffloadMode::Teacher)
     }
 
-    /// True when the rollout infer-student participates in the offload/reload
-    /// time-share. `Teacher` keeps the student resident.
     pub fn offloads_student(self) -> bool {
         matches!(self, EngineOffloadMode::All | EngineOffloadMode::Student)
     }
 }
 
-/// The OPD engine offload mode (`--engine-offload off|all|student|teacher`;
-/// `teacher` keeps the student resident — frees ~3 GB and avoids the
-/// multi-engine pool interleaving that corrupts the W4A8 Marlin reload under
-/// `all`).
+/// OPD engine offload mode (`--engine-offload off|all|student|teacher`).
 #[cfg(feature = "cuda")]
 pub fn engine_offload_mode() -> EngineOffloadMode {
     crate::runtime_flags::engine_offload()
@@ -203,8 +181,8 @@ pub enum OpdKlMask {
     CompletionOnly,
 }
 
-/// Default Route-B logits window. Keep it aligned with the KL chunk size so
-/// each backward materializes at most one `[window, vocab]` logits tile.
+/// Default Route-B logits window. Aligned with the KL chunk size so each
+/// backward materializes at most one `[window, vocab]` logits tile.
 pub const DEFAULT_LOGITS_WINDOW_SIZE: usize = DEFAULT_KL_CHUNK_SIZE;
 
 #[derive(Debug, Clone, Copy)]
@@ -233,10 +211,10 @@ impl Default for GkdLossConfig<'_> {
             kl_temperature: 1.0,
             kl_beta: None,
             teacher_topk: None,
-            // Dense logits+KL by default: the fused lm_head+loss path ran the
-            // lm_head on the HOST (~205 s/step for the 27B, GPU idle) vs ~3.9 s
-            // GPU-bound dense. Opt into fused only for windows too large to
-            // materialize [window, vocab]. errors/2026-06-23-opd-fused-distill-default-host-bound.
+            // Dense logits+KL by default: fused lm_head+loss ran lm_head on
+            // HOST (~205 s/step for 27B, GPU idle) vs ~3.9 s GPU-bound dense.
+            // Opt into fused only for windows too large to materialize
+            // [window, vocab]. errors/2026-06-23-opd-fused-distill-default-host-bound.
             fused_distill: false,
             logits_window_size: None,
             kl_mask: OpdKlMask::CompletionOnly,
@@ -395,9 +373,7 @@ fn print_backward_profile(
     }
 }
 
-/// Greedy-argmax the last-position row of a `[1, seq_len, vocab]` logits
-/// tensor. The student's lm-head returns dense logits per position; OPD
-/// only needs the next-token row.
+/// Greedy-argmax the last-position row of a `[1, seq_len, vocab]` logits tensor.
 fn greedy_next_token(
     logits_id: TensorId,
     seq_len: usize,
@@ -4107,7 +4083,6 @@ fn run_opd_rollout_phase(
     profile: &mut Option<&mut OpdStepProfile>,
     #[cfg(feature = "cuda")] infer_rollout: Option<&InferRolloutCtx<'_>>,
 ) -> Result<Vec<u32>> {
-    // 1. Student rollout — tape disabled, no backward graph for sample tokens.
     let phase_started = Instant::now();
     store.retain_ids(rollout_keep_base);
     let rollout = if let Some(forced_rollout) = forced_rollout {
@@ -4119,12 +4094,9 @@ fn run_opd_rollout_phase(
         forced_rollout.to_vec()
     } else {
         let rollout_sampling = cfg.rollout_sampling.as_ref();
-        // Infer-engine rollout: mirror the train LoRA into the
-        // infer student once per step, then decode `rollout_len` tokens via
-        // the infer engine. Produces the same `rollout: Vec<u32>` the
-        // train-crate helper would, so downstream KL/backward is unchanged.
-        // When the ctx is absent, the public train-crate helper runs as
-        // the A/B baseline.
+        // Infer-engine rollout: mirror the train LoRA into the infer student
+        // once per step, then decode via the infer engine. Same `rollout`
+        // output as the train-crate helper.
         #[cfg(feature = "cuda")]
         if let Some(ctx) = infer_rollout {
             log_opd_step_trace(total_started, "infer_rollout_reload_start", "");
@@ -4553,9 +4525,9 @@ pub fn opd_step_with_teacher_forward_profiled_gkd_anchor<
             return run_chunked_kl_route(&rt, chunk_size, optimizer, store, tape, &mut profile);
         }
 
-        // 3. Teacher forward — still tape-disabled. Teacher params carry
-        //    `requires_grad = false` so no entries record even if tape was on,
-        //    but disabling cheap-defends against any rogue grad-bearing weight.
+        // Teacher forward — tape-disabled. Teacher params have
+        // `requires_grad = false`, but disabling cheap-defends against rogue
+        // grad-bearing weights.
         let phase_started = Instant::now();
         let teacher_logits = teacher
             .forward_logits_device(&rollout, &positions, store, tape)
@@ -4577,7 +4549,7 @@ pub fn opd_step_with_teacher_forward_profiled_gkd_anchor<
         keep_teacher_logits.insert(teacher_logits.tensor_id);
         store.retain_ids(&keep_teacher_logits);
 
-        // 3. Student forward — tape enabled now so backward can flow.
+        // Student forward — tape enabled so backward can flow.
         tape.set_enabled(true);
         let phase_started = Instant::now();
         let student_logits = student
@@ -4587,9 +4559,7 @@ pub fn opd_step_with_teacher_forward_profiled_gkd_anchor<
             profile.student_forward_seconds += phase_started.elapsed().as_secs_f64();
         });
 
-        // 4. KL distill loss, optionally blended with a GKD hard-token
-        //    SFT anchor. The legacy anchor uses the on-policy rollout;
-        //    corpus-truth mode re-forwards the student over prompt+target.
+        // KL distill loss, optionally blended with a GKD hard-token SFT anchor.
         let phase_started = Instant::now();
         let kl_range = kl_logit_range(gkd_config.kl_mask, prompt_ids.len(), rollout.len())?;
         let (student_kl_logits, teacher_kl_logits) =
@@ -4633,7 +4603,7 @@ pub fn opd_step_with_teacher_forward_profiled_gkd_anchor<
             profile.kl_loss_seconds += phase_started.elapsed().as_secs_f64();
         });
 
-        // 5. Backward + grad clip + optimizer step.
+        // Backward + grad clip + optimizer step.
         let phase_started = Instant::now();
         optimizer.zero_grad(store, student_params);
         record_profile(&mut profile, |profile| {
@@ -4656,11 +4626,9 @@ pub fn opd_step_with_teacher_forward_profiled_gkd_anchor<
         })
     })();
 
-    // 6. Prune rollout/teacher/student forward temporaries on both success
-    //    and failure. Teacher params live in `keep_extra`. Retain the full
-    //    student model, not just the optimizer target slice, because LoRA-only
-    //    OPD optimizes adapter ids while still needing frozen base weights for
-    //    the next forward pass.
+    // Prune rollout/teacher/student forward temporaries on both success and
+    // failure. Retain the full student model (not just optimizer targets)
+    // because LoRA-only OPD needs frozen base weights for the next forward.
     let phase_started = Instant::now();
     cleanup_after_backward(store, tape, &student_model_params, &keep_extra);
     record_profile(&mut profile, |profile| {
