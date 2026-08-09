@@ -961,7 +961,7 @@ __global__ void rms_norm_gated_kernel(
   normed *= w;
 
   float g = __bfloat162float(gate[offset]);
-  float silu_g = g / (1.0f + expf(-g));
+  float silu_g = g / (1.0f + __expf(-g));
 
   out[offset] = __float2bfloat16(normed * silu_g);
 }

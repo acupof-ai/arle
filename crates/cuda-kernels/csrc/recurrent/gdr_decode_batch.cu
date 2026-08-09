@@ -113,10 +113,10 @@ __global__ void gdr_decode_batch_kernel(
         float a_log = A_log[v_head];
 
         float x = a_val + bias;
-        float softplus_x = (x > 20.0f) ? x : logf(1.0f + expf(x));
-        float g = -expf(a_log) * softplus_x;
-        s_exp_g = expf(g);
-        s_beta = 1.0f / (1.0f + expf(-b_val));
+        float softplus_x = (x > 20.0f) ? x : __logf(1.0f + __expf(x));
+        float g = -__expf(a_log) * softplus_x;
+        s_exp_g = __expf(g);
+        s_beta = 1.0f / (1.0f + __expf(-b_val));
     }
     __syncthreads();
 
