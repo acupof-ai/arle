@@ -1253,6 +1253,57 @@ mod backend {
             }
         }
 
+        /// Non-owning views of every resident dense-BF16 base projection's
+        /// device pointer, for refreshing the train student's frozen base AFTER
+        /// a LoRA re-merge.
+        #[cfg(feature = "cuda")]
+        pub fn frozen_base_bf16_pointers(
+            &self,
+        ) -> Result<Vec<infer_cuda::SharedBf16BaseProjection>> {
+            match self {
+                Self::Cuda(engine) => engine.frozen_base_bf16_pointers(),
+                #[cfg(feature = "metal")]
+                Self::Metal(_) => {
+                    anyhow::bail!("frozen-base BF16 sharing is CUDA-only; active backend is Metal")
+                }
+                #[cfg(feature = "metal")]
+                Self::MetalDiffusionGemma(_) => anyhow::bail!(
+                    "frozen-base BF16 sharing is CUDA-only; active backend is Metal DiffusionGemma"
+                ),
+                #[cfg(feature = "metal")]
+                Self::MetalGemma4(_) => anyhow::bail!(
+                    "frozen-base BF16 sharing is CUDA-only; active backend is Metal Gemma4"
+                ),
+                #[cfg(feature = "metal")]
+                Self::MetalDeepseekOcr(_) => anyhow::bail!(
+                    "frozen-base BF16 sharing is CUDA-only; active backend is Metal DeepSeek-OCR"
+                ),
+                #[cfg(feature = "hip")]
+                Self::Hip(_) => {
+                    anyhow::bail!("frozen-base BF16 sharing is CUDA-only; active backend is HIP")
+                }
+                #[cfg(feature = "vulkan")]
+                Self::Vulkan(_) => {
+                    anyhow::bail!("frozen-base BF16 sharing is CUDA-only; active backend is Vulkan")
+                }
+                #[cfg(all(feature = "cpu", not(feature = "metal")))]
+                Self::Cpu(_) => {
+                    anyhow::bail!("frozen-base BF16 sharing is CUDA-only; active backend is CPU")
+                }
+            }
+        }
+
+        /// Free the retired FP8 qweight/scales buffers for every projection
+        /// that has been promoted to dense BF16. Call ONLY after the train
+        /// student has re-aliased its frozen base to the BF16 `data` pointer.
+        #[cfg(feature = "cuda")]
+        pub fn free_retired_fp8_buffers(&mut self) {
+            match self {
+                Self::Cuda(engine) => engine.free_retired_fp8_buffers(),
+                _ => {}
+            }
+        }
+
         /// OpenAI-compat HTTP router over this ALREADY-loaded engine's
         /// `ServeHandle` (same engine thread, same KV pool) — unlike
         /// `router_for_backend`, which spawns a second engine. Serve it with

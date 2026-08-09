@@ -2254,7 +2254,12 @@ fn run_rubric_opd_impl(args: TrainRubricOpdArgs) -> Result<()> {
             eprintln!("[rubric-opd] release KV pool before LoRA sync failed: {err}");
         }
         infer_student
-            .sync_lora_from_store(&mut store, &student.adapter_name_map(), lora)
+            .sync_lora_from_store(
+                &mut store,
+                &student.adapter_name_map(),
+                &student.param_name_map(),
+                lora,
+            )
             .context("sync trained LoRA into rollout engine")?;
         if let Err(err) = infer_student.ensure_kv_pool() {
             eprintln!("[rubric-opd] re-acquire KV pool after LoRA sync failed: {err}");
@@ -3546,6 +3551,7 @@ fn sync_and_restore_engines(
     infer_student: &train::infer_student::InferStudent,
     store: &mut autograd::TensorStore,
     adapter_map: &std::collections::HashMap<&'static str, TensorId>,
+    param_name_map: &std::collections::HashMap<&'static str, TensorId>,
     lora: train::lora::LoraConfig,
     synced: bool,
 ) -> Result<f64> {
@@ -3553,7 +3559,7 @@ fn sync_and_restore_engines(
     if synced {
         let started = Instant::now();
         infer_student
-            .sync_lora_from_store(store, adapter_map, lora)
+            .sync_lora_from_store(store, adapter_map, param_name_map, lora)
             .context("sync trained LoRA into rollout engine")?;
         sync_secs = started.elapsed().as_secs_f64();
         train::aopd_profile::record("sync_lora", train::aopd_profile::GPU, sync_secs);
@@ -3634,6 +3640,7 @@ fn run_agent_opd_cp_follower(
                     &fleet.infer_student,
                     &mut fleet.store,
                     &adapter_map,
+                    &fleet.student.param_name_map(),
                     lora,
                     synced,
                 )?;
@@ -4473,6 +4480,7 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
                 &infer_student,
                 &mut store,
                 &student.adapter_name_map(),
+                &student.param_name_map(),
                 lora,
                 synced,
             )?;

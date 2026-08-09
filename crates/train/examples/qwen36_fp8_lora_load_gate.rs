@@ -113,7 +113,12 @@ mod app {
             let infer_load_seconds = infer_started.elapsed().as_secs_f64();
             let sync_started = Instant::now();
             infer_student
-                .sync_lora_from_store(&mut store, &student.adapter_name_map(), args.lora)
+                .sync_lora_from_store(
+                    &mut store,
+                    &student.adapter_name_map(),
+                    &student.param_name_map(),
+                    args.lora,
+                )
                 .context("sync LoRA into infer student")?;
             backend
                 .device_synchronize()

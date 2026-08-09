@@ -1704,6 +1704,46 @@ impl Backend for CudaBackend {
         }
     }
 
+    fn import_bf16_device_ptr(&self, device_ptr: u64, shape: &[usize]) -> Result<DeviceHandle> {
+        #[cfg(feature = "no-cuda")]
+        {
+            let _ = (device_ptr, shape);
+            todo!("GPU required: cuda bf16 device import is unavailable under feature no-cuda")
+        }
+
+        #[cfg(not(feature = "no-cuda"))]
+        {
+            if shape.len() != 2 {
+                return Err(AutogradError::InvalidRank {
+                    expected: "2",
+                    got: shape.len(),
+                });
+            }
+            let rows = shape[0];
+            let cols = shape[1];
+            let len = rows
+                .checked_mul(cols)
+                .ok_or(AutogradError::TapeInvariant("bf16 import len overflow"))?;
+
+            // NON-OWNING view over the foreign engine's resident BF16 base bytes.
+            // `upgrade_device_ptr` wraps the raw `CUdeviceptr` in a `CudaSlice`
+            // bound to THIS backend's stream/primary context. The
+            // `CudaBf16Storage::new_borrowed` handle leaks the slice on drop
+            // instead of freeing — the infer engine owns the bytes.
+            //
+            // Safety: the caller (post-LoRA-merge frozen-base refresh) guarantees
+            // `device_ptr` is a valid resident allocation on this ordinal of at
+            // least `len` u16 elements, kept resident for the handle's lifetime.
+            let slice: CudaSlice<u16> = unsafe {
+                self.stream
+                    .upgrade_device_ptr::<u16>(device_ptr as CUdeviceptr, len)
+            };
+            Ok(DeviceHandle::CudaBf16(
+                crate::backend::CudaBf16Storage::new_borrowed(slice),
+            ))
+        }
+    }
+
     fn zeros(&self, shape: &[usize]) -> Result<DeviceHandle> {
         #[cfg(feature = "no-cuda")]
         {

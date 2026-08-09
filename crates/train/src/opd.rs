@@ -4179,7 +4179,12 @@ fn run_opd_rollout_phase(
             }
             log_opd_step_trace(total_started, "infer_rollout_sync_lora_start", "");
             ctx.student
-                .sync_lora_from_store(store, &student.adapter_name_map(), ctx.lora_config)
+                .sync_lora_from_store(
+                    store,
+                    &student.adapter_name_map(),
+                    &student.param_name_map(),
+                    ctx.lora_config,
+                )
                 .map_err(|err| {
                     OpdError::InvalidInput(format!("infer student LoRA sync failed: {err}"))
                 })?;

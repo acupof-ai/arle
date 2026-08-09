@@ -156,6 +156,26 @@ impl CudaStorage {
 #[cfg_attr(feature = "no-cuda", allow(dead_code))]
 pub struct CudaBf16Storage {
     inner: Arc<cudarc::driver::CudaSlice<u16>>,
+    /// `true` when `inner` is a NON-OWNING view over device memory owned by a
+    /// foreign allocator (the infer-cuda rollout engine's resident BF16 base
+    /// `DeviceMatrix`, shared after a LoRA re-merge). The backing bytes belong
+    /// to the other engine; this handle must NEVER free them. The custom `Drop`
+    /// below leaks the inner `Arc` so the foreign allocation survives this
+    /// handle. Default `false` (owned) keeps the existing path byte-identical.
+    borrowed: bool,
+}
+
+#[cfg(feature = "cuda")]
+impl Drop for CudaBf16Storage {
+    fn drop(&mut self) {
+        if !self.borrowed {
+            return;
+        }
+        // Foreign-borrowed view: leak the inner `Arc` so the foreign allocation
+        // survives this handle (the infer engine frees the bytes at its own
+        // teardown). See `CudaFp8BlockScaledStorage::drop` for the full rationale.
+        std::mem::forget(self.inner.clone());
+    }
 }
 
 #[cfg(feature = "cuda")]
@@ -164,6 +184,20 @@ impl CudaBf16Storage {
     pub(crate) fn new(inner: cudarc::driver::CudaSlice<u16>) -> Self {
         Self {
             inner: Arc::new(inner),
+            borrowed: false,
+        }
+    }
+
+    /// Construct a NON-OWNING BF16 view over a device buffer owned by a foreign
+    /// allocator. The caller guarantees `inner` was built from a foreign device
+    /// pointer (e.g. via `CudaStream::upgrade_device_ptr`) in the same primary
+    /// context, and that the foreign owner keeps it resident for the lifetime
+    /// of this handle. On drop the inner `Arc` is leaked (never freed). Used by
+    /// the post-LoRA-merge frozen-base refresh path.
+    pub(crate) fn new_borrowed(inner: cudarc::driver::CudaSlice<u16>) -> Self {
+        Self {
+            inner: Arc::new(inner),
+            borrowed: true,
         }
     }
 
@@ -625,6 +659,24 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         let _ = (weight_device_ptr, scale_device_ptr, shape, block_m, block_k);
         Err(crate::AutogradError::TapeInvariant(
             "backend does not support importing fp8 block-scaled device pointers",
+        ))
+    }
+
+    /// Import a NON-OWNING view of a foreign BF16 device buffer (e.g. the
+    /// infer-cuda rollout engine's resident BF16 base `DeviceMatrix` after a
+    /// LoRA re-merge), for refreshing the train student's frozen base without
+    /// copying ~54 GB.
+    ///
+    /// `device_ptr` is a raw CUDA device pointer (`CUdeviceptr` as `u64`) into
+    /// the foreign engine's resident BF16 weight (`rows*cols` u16 elements).
+    /// The returned handle borrows those bytes **without copying** — the caller
+    /// must keep the foreign owner resident for the handle's lifetime. The
+    /// handle is created with `requires_grad = false` semantics by the caller
+    /// (frozen base). The default trait impl errors; CUDA overrides.
+    fn import_bf16_device_ptr(&self, device_ptr: u64, shape: &[usize]) -> Result<DeviceHandle> {
+        let _ = (device_ptr, shape);
+        Err(crate::AutogradError::TapeInvariant(
+            "backend does not support importing bf16 device pointers",
         ))
     }
 
