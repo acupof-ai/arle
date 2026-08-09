@@ -27,9 +27,6 @@ use crate::{
     teacher_infer::InProcessTeacher,
 };
 
-/// Pair an `adapter_name_map()` into deterministic, layer-ordered
-/// `(lora_a, lora_b)` tuples.
-///
 /// Adapter names are `{base_name}.lora_a` / `{base_name}.lora_b` where
 /// `{base_name}` ends in `.weight` (see `lora.rs:123`). We strip the
 /// `.lora_a` / `.lora_b` suffix to recover the shared base prefix, match the
@@ -76,8 +73,6 @@ fn pair_adapters(map: &HashMap<&'static str, TensorId>) -> Result<Vec<(TensorId,
     Ok(pairs)
 }
 
-/// EMA self-teacher: a base-shared second [`Qwen35Model`] holding the EMA
-/// adapter, plus the layer-ordered EMA adapter `(lora_a, lora_b)` TensorIds.
 pub struct EmaSelfTeacher {
     model: Qwen35Model,
     /// EMA adapter pairs, layer-ordered (sorted by base name) so index `i`
@@ -99,8 +94,6 @@ pub struct EmaSelfTeacher {
 }
 
 impl EmaSelfTeacher {
-    /// Build the EMA self-teacher from a freshly constructed student model.
-    ///
     /// CONSTRUCTION ORDER (REQUIRED): call this immediately after building the
     /// student model and BEFORE allocating any other train-store scratch
     /// tensors. [`Qwen35Model::new_lora_from_base`] calls
@@ -147,8 +140,6 @@ impl EmaSelfTeacher {
         Ok(teacher)
     }
 
-    /// Freeze the EMA adapter (`requires_grad = false`) for every pair.
-    ///
     /// The EMA adapter is a frozen TEACHER parameter: it is never optimized
     /// through autograd — [`Self::update`] blends it host-side — so it must not
     /// carry `requires_grad = true`. `Qwen35Model::new_lora_from_base` builds
@@ -201,8 +192,6 @@ impl EmaSelfTeacher {
         Ok(())
     }
 
-    /// EMA step `θ_ema ← α·θ_ema + (1−α)·θ_student`, elementwise, host-side,
-    /// for every aligned `(a, a)` and `(b, b)` adapter pair.
     pub fn update(
         &mut self,
         student: &Qwen35Model,
@@ -250,8 +239,7 @@ pub struct EmaTrainSnapshot {
 }
 
 impl EmaSelfTeacher {
-    /// Snapshot the student adapter, the EMA adapter, and the AdamW moments as
-    /// one unit. `names` for the optimizer export is the student adapter
+    /// `names` for the optimizer export is the student adapter
     /// `(TensorId, leaked-name.to_string())` list — the optimizer only holds
     /// moments for the trainable student params.
     pub fn snapshot(
@@ -282,11 +270,9 @@ impl EmaSelfTeacher {
         })
     }
 
-    /// Restore the student adapter, the EMA adapter, AND the AdamW moments
-    /// together (R2). Restoring ONLY the student adapter would leave the EMA
-    /// trained against rejected student state and the AdamW moments stale —
-    /// the DSv4-EAGLE partial-rollback failure mode. All three roll back as
-    /// one unit.
+    /// Restoring ONLY the student adapter would leave the EMA trained against
+    /// rejected student state and the AdamW moments stale — the DSv4-EAGLE
+    /// partial-rollback failure mode. All three roll back as one unit.
     pub fn restore(
         &mut self,
         snapshot: &EmaTrainSnapshot,
@@ -344,14 +330,11 @@ fn student_adapter_names(student: &Qwen35Model) -> Vec<(TensorId, String)> {
         .collect()
 }
 
-/// `dst.data ← src.data`. Asserts equal length (error, not panic).
 fn copy_tensor(store: &mut TensorStore, src: TensorId, dst: TensorId) -> Result<()> {
     let data = store.to_host(src)?;
     write_tensor(store, dst, &data)
 }
 
-/// `dst.data ← data`. Asserts equal length, including the tensor shape in the
-/// error on mismatch.
 fn write_tensor(store: &mut TensorStore, dst: TensorId, data: &[f32]) -> Result<()> {
     let tensor = store
         .get_mut(dst)
@@ -368,7 +351,6 @@ fn write_tensor(store: &mut TensorStore, dst: TensorId, data: &[f32]) -> Result<
     Ok(())
 }
 
-/// `ema.data ← α·ema.data + (1−α)·student.data`, elementwise, host-side.
 fn ema_blend(
     store: &mut TensorStore,
     student_id: TensorId,
