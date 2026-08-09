@@ -121,4 +121,4 @@ struct LaunchKernel {
   }
 };
 
-}  // namespace host
+}

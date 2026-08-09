@@ -99,7 +99,6 @@ mod tests {
         assert_eq!(pp.layers(64), LayerRange { start: 0, end: 64 });
     }
 
-    // Stages tile the layer stack contiguously and disjointly, remainder to last.
     #[test]
     fn stages_partition_layers_contiguously() {
         let (size, layers) = (4usize, 64usize);
@@ -115,7 +114,6 @@ mod tests {
         assert_eq!(next, layers, "last stage must reach num_layers");
     }
 
-    // Uneven split: 10 layers over 3 stages -> 3,3,4 (remainder to last).
     #[test]
     fn remainder_layers_go_to_last_stage() {
         assert_eq!(

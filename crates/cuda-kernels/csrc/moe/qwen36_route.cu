@@ -61,8 +61,6 @@ extern "C" cudaError_t qwen36_renorm_topk_weights_cuda(
 
 // Shared-expert scalar sigmoid gate + accumulate into the routed output.
 //
-//   out[t, :] = routed[t, :] + sigmoid(gate_logit[t]) * shared_y[t, :]
-//
 // `gate_logit` is the [num_tokens, 1] output of `x @ shared_gate_router`
 // (one logit per token); `shared_y` is the [num_tokens, hidden] dense
 // shared-expert SwiGLU output; `routed` is the [num_tokens, hidden] routed

@@ -89,7 +89,7 @@ mod tests {
         let tp = TpContext::new(1, 4);
         assert!(tp.is_enabled());
         assert_eq!(tp.divide(128), Some(32));
-        assert_eq!(tp.divide(30), None); // 30 % 4 != 0
+        assert_eq!(tp.divide(30), None);
     }
 
     // Mesh convergence: attn_tp coordinates come from the one MultiAxisConfig,

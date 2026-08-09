@@ -453,7 +453,6 @@ pub fn score_workdir(
         }
     }
 
-    // `python3 -m pytest <tests... each quoted> -q -p no:cacheprovider`.
     let quoted: Vec<String> = fail_to_pass
         .iter()
         .map(|t| format!("'{}'", t.replace('\'', r"'\''")))
@@ -679,10 +678,8 @@ mod tests {
         .unwrap();
         let workdir = boot_workdir(work_root.path(), "inst_dirty", staged.path(), None).unwrap();
 
-        // Student DIRTIES the test file — base-context `git apply` would now fail.
         fs::write(workdir.join("test_x.py"), "STUDENT GARBAGE\n").unwrap();
 
-        // test_patch (a git diff vs base) flips the assertion True -> False.
         let test_patch = concat!(
             "diff --git a/test_x.py b/test_x.py\n",
             "--- a/test_x.py\n",
@@ -729,7 +726,6 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
 
-        // Stand up the helper on a temp socket in a background thread.
         let sock_dir = tempfile::tempdir().unwrap();
         let sock = sock_dir.path().join("spawn.sock");
         // SAFETY: serialized by ENV_LOCK; no rollout threads in the test.

@@ -399,7 +399,6 @@ impl RealCudaExecutor {
         }
     }
 
-    /// Materialize cumulative operator dispatch counters for a stats request.
     /// Reads host atomics and performs no device synchronization.
     pub(crate) fn operator_dispatch_stats(&self) -> infer_seam::OperatorDispatchStats {
         crate::ops::qwen_fp8_dense_operator_stats()
@@ -519,7 +518,6 @@ impl RealCudaExecutor {
         }
     }
 
-    /// Generic engine-level prefix match hook (`BackendExecutor` trait).
     /// No arm implements a position-0 prefix store; always no match.
     pub(crate) fn cached_prefix_match_len(&self, _tokens: &[u32]) -> Result<usize> {
         Ok(0)
@@ -905,7 +903,6 @@ impl RealCudaExecutor {
         }
     }
 
-    /// Reload the model's device weights from the host snapshot.
     pub(crate) fn reload_engine_weights(&mut self) -> Result<()> {
         match self {
             Self::Qwen35(q) => q.reload_engine_weights(),
@@ -942,7 +939,7 @@ impl RealCudaExecutor {
         }
     }
 
-    /// Hot-swap the DSpark Markov head weights from a host f32 snapshot.
+    /// Hot-swap the DSpark Markov head weights.
     pub(crate) fn update_dspark_markov_weights(&mut self, w1: &[f32], w2: &[f32]) -> Result<()> {
         match self {
             Self::Qwen35(q) => q.update_dspark_markov_weights(w1, w2),

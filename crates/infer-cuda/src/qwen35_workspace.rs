@@ -3,11 +3,10 @@ use super::*;
 #[derive(Default)]
 pub(crate) struct Qwen35Workspace {
     pub(crate) token_ids: SliceSlot<i32>,
-    /// GPU-resident `start_pos` for the full-attn prep kernel — uploaded once per
-    /// forward (the value is identical for every full-attn layer in the call;
-    /// the old path uploaded one identical buffer per layer). The decode graph
-    /// also reads it from the devpos attention kernel, so it is the single
-    /// per-step position scalar staged pre-replay.
+    /// For the full-attn prep kernel — uploaded once per forward (identical
+    /// for every full-attn layer; the old path uploaded one identical buffer
+    /// per layer). The decode graph also reads it from the devpos attention
+    /// kernel, so it is the single per-step position scalar staged pre-replay.
     pub(crate) start_pos: SliceSlot<i32>,
     pub(crate) hidden: HiddenSlot,
     pub(crate) normed: HiddenSlot,
@@ -21,9 +20,9 @@ pub(crate) struct Qwen35Workspace {
     pub(crate) last_hidden: VecSlot,
     pub(crate) last_normed: VecSlot,
     pub(crate) logits: VecSlot,
-    /// Persistent argmax output (one i32) for the greedy sampling tail —
-    /// removes the last steady-state per-token device allocation
-    /// (`ops::argmax`'s `alloc_zeros(1)`).
+    /// Persistent buffer for the greedy sampling tail — removes the last
+    /// steady-state per-token device allocation (`ops::argmax`'s
+    /// `alloc_zeros(1)`).
     pub(crate) argmax_out: SliceSlot<i32>,
     /// Buffer-address generation. Bumped whenever cached buffers are dropped
     /// wholesale ([`Self::release`]) — i.e. whenever previously-cached device
@@ -132,12 +131,11 @@ impl Qwen35Workspace {
         self.epoch
     }
 
-    /// Drop every cached buffer (frees the VRAM). Called by the executor after
-    /// the OPD weight offload so the workspace does not hold prefill-shaped
-    /// scratch while the student backward needs the headroom. The caller must
-    /// have quiesced the device first (`offload_engine_weights` syncs).
-    /// Bumps the address epoch: any captured decode graph over these buffers
-    /// is stale after this.
+    /// Called by the executor after the OPD weight offload so the workspace
+    /// does not hold prefill-shaped scratch while the student backward needs
+    /// the headroom. The caller must have quiesced the device first
+    /// (`offload_engine_weights` syncs). Bumps the address epoch: any
+    /// captured decode graph over these buffers is stale after this.
     pub(crate) fn release(&mut self) {
         self.epoch += 1;
         let Self {
@@ -434,10 +432,10 @@ impl Qwen35BatchDecodeState {
         self.staged_slot_indices.clear();
     }
 
-    /// Drop the workspace VRAM (OPD weight time-share hook). The pointer
-    /// TABLES and the staged mapping stay: the per-slot state addresses they
-    /// hold are executor-owned and untouched by the weight offload, so they
-    /// remain valid across an offload/reload cycle (and they are ~KB-scale).
+    /// OPD weight time-share hook. The pointer tables and the staged mapping
+    /// stay: the per-slot state addresses they hold are executor-owned and
+    /// untouched by the weight offload, so they remain valid across an
+    /// offload/reload cycle (and they are ~KB-scale).
     pub(crate) fn release(&mut self) {
         self.ws.release();
         self.positions.release();
