@@ -70,7 +70,7 @@ __global__ void conv1d_decode_batch_kernel(
 
     // SiLU activation (bf16 truncation for numerical parity with prefill kernel)
     float sum_bf16 = __bfloat162float(__float2bfloat16(sum));
-    float silu_out = sum_bf16 / (1.0f + __expf(-sum_bf16));
+    float silu_out = sum_bf16 / (1.0f + expf(-sum_bf16));
     out_batch[b * num_channels + c] = __float2bfloat16(silu_out);
 
     // Update state: shift left by 1, insert x at tail.
