@@ -129,12 +129,10 @@ inherits a warm prefix cache. The two report different quantities — TPOT 257 m
 here against the row's 110.52 ms — so the delta is valid and it is not the row's
 cell. Re-measuring the champion needs the ascending sweep on both arms.
 
-**The return is ~55% of prediction and the shortfall is not explained.**
-Predicted ~1600 ms from the kernel's 2205 ms share × 3.67×; measured −12.2 s of
-409 s. The likely reading is dilution — the anchor's wall includes decode and
-queueing where `pack_quantize` is a smaller share than in the pure prefill window
-the prediction was priced on — but that is a hypothesis, not a measurement. An
-`nsys` capture on the new binary settles whether the 3.67× lands in situ.
+**The return is ~48% of prediction, and the capture below explains it.**
+Predicted ~1600 ms from the kernel's 2205 ms window share; measured −12.2 s of
+409 s. Not partial engagement — the kernel delivers 5.12× in situ. The window
+over-states prefill shares by ~2×.
 
 ## Learnings
 
@@ -159,9 +157,53 @@ against the prediction.** The prediction was made first (~5.4% of wall) and the
 measurement came in at 55% of it. Recording the miss is what makes the next
 prediction better; a win reported without its prediction teaches nothing.
 
+## Resolved 2026-08-09 — `nsys` on the new binary
+
+**The kernel is fully engaged and the microbench transfers exactly.** Same 30 s
+steady-state window, same analyzer, `70760bc09` against `5cfe8494f`; wall
+29,642 / 29,693 ms, GPU busy 96.5% / 96.4%, kernel 28,601 / 28,611 ms.
+
+| | before | after |
+|---|---:|---:|
+| launches | 15,631 | 15,931 |
+| total ms | 2216.19 | **441.24** |
+| share of kernel time | 7.75% | **1.54%** |
+| **µs per launch** | **141.78** | **27.70 (5.12×)** |
+
+Every one of the 15,931 launches carries the new `/8` grid — the `gridX`
+distribution maps 1:1 onto the baseline's at exactly one eighth, with no launch
+anywhere at an undivided grid. **So the shortfall was never partial engagement.**
+
+**It was window placement, and the factor is now quantified.** A term of
+run-level share `s` sped up `f` times returns `s(1 - 1/f)` of wall:
+
+```
+1 - 1/5.12 = 0.805        2.98% / 0.805  =  s = 3.70% run-level
+window share of wall = 7.75% x 96.4% busy = 7.47%
+7.47 / 3.70  =  2.02x
+```
+
+**The anchor's `nsys` window over-states prefill kernel shares by ~2×**, with the
+A/B's own 0.5% BASE spread putting the factor in a 1.7-2.4× band. The mechanism
+is inferred, not measured: the capture sits 31-38% into the run with all 16 slots
+saturated on prefill, while the ramp and drain are decode-heavy at low batch.
+
+**The corollary is bigger than the calibration.** Roughly half this workload's
+wall clock is not set by kernel time at all — 128 requests over 16 slots with
+TTFT p90 73-184 s is a scheduling regime. Every remaining kernel lever combined
+is worth ~11% of wall; scheduling is worth more and is unmodelled.
+
+Two numbers from that capture that must **not** be used: the "where did the
+1775 ms go" per-kernel comparison is cross-tree, not cross-kernel — the baseline
+predates the draft-attention change, whose `nonpaged_prefill_attention_kernel`
+went 16 args to 18 and 270 launches to 30 — and the two profiled runs' 11,587
+against 13,760 tok/s is a cross-day, cross-GPU, profiler-loaded comparison, not
+a regression. Only the `pack_quantize` row is comparable across the two captures.
+
 ## Open
 
-- `nsys` on the new binary to confirm the in-situ share and explain the 45% shortfall.
+- The other eight tail kernels are the same code pattern: 2248 ms remaining,
+  ~3.9% of wall calibrated.
 - The shipped form is still instruction-bound: SM 69.2% against DRAM 25.7%. The
   remaining path is fusion into the producing kernel's epilogue, not more tuning.
 - The rest of the tail is the same pathology: `conv1d` 590 ms at 0.38 TB/s,

@@ -118,6 +118,33 @@ produce 55 prefill segments and `977 = 16 x (55 + 6)` full-attention launches.
 from duration clusters; a later note said 33, which was a GEMM launch count read
 as a `silu_mul` count. The three-way cross-check above settles it at 44.
 
+### Calibration — this window over-states prefill shares by ~2x
+
+**Every share below is a share of a 30 s steady-state window, and the window is
+not the run.** The factor is now measured rather than assumed.
+
+`pack_quantize` was 7.75% of the window's kernel time. It was then made **5.12x
+faster in situ** (confirmed by capture, below), and a matched counterbalanced A/B
+on the full 409 s run measured **wall -2.98%**. A term of run-level share `s`
+sped up `f` times returns `s(1 - 1/f)` of wall:
+
+```
+1 - 1/5.12 = 0.805        2.98% / 0.805  =  s = 3.70% run-level
+window share of wall = 7.75% x 96.4% busy = 7.47%
+7.47 / 3.70  =  2.02x
+```
+
+**So multiply any `c_prefill` share by ~0.5 before predicting end-to-end value.**
+The A/B's own 0.5% BASE spread puts the factor in a 1.7-2.4x band.
+
+The mechanism is window placement, and it is inferred rather than measured: the
+capture sits 31-38% into the run with all 16 slots saturated on prefill, while
+the run's ramp and drain are decode-heavy at low batch, where `pack_quantize` and
+every other prefill term is a much smaller share. **The corollary is the larger
+finding — roughly half this workload's wall clock is not set by kernel time at
+all.** 128 requests over 16 slots with TTFT p90 73-184 s is a scheduling regime,
+and it is now the biggest thing this document does not model.
+
 ### `c_prefill` — the exact per-token ledger
 
 Prefill kernel time divided by 90,208 tokens. `n` is launches; a GEMM's `K` is
@@ -129,8 +156,8 @@ read from the `pack_quantize` that feeds it and its `N` from the consumer's grid
 | FA3 | 881 | 4646.4 | 51.5 | **16.5%** |
 | `down_proj` (K 17408 → N 5120) | 2819 | 3807.0 | 42.2 | 13.5% |
 | linear-attn `in_proj` (K 5120 → N 16384) | 2115 | 2583.5 | 28.6 | 9.2% |
-| **`pack_quantize`** | 14095 | 2205.2 | 24.4 | **7.8%** |
-| `fq_fwd` (FlashQLA) | 2643 | 1617.6 | 17.9 | 5.7% |
+| ~~`pack_quantize`~~ | 14095 | 2205.2 | 24.4 | ~~7.8%~~ → **1.54%** (fixed, see below) |
+| **`fq_fwd` (FlashQLA)** | 2643 | 1617.6 | 17.9 | **5.7%** |
 | `out_proj` (K 6144 → N 5120) | 2820 | 1361.9 | 15.1 | 4.8% |
 | `qkv` (K 5120 → N 14336) | 881 | 800.5 | 8.9 | 2.8% |
 | `conv1d` | 2931 | 587.5 | 6.5 | 2.1% |
@@ -182,6 +209,46 @@ headroom and the open item is closed** — the previous version of this section
 called this "the highest-value measurement in the document" and offered 14.8K as
 the break-even depth; the measured depth is above it, so the kernel is at peak.
 
+**FlashQLA `fq_fwd` — 13.5% of the bf16 roofline, and the gap is structural.**
+Derived 2026-08-09 from `tools/tilelang/flashqla_gdr.py` plus the trace grid. The
+grid `(96, 1, 512)` is `ceildiv(DV 128, block_DV 64) × H`, so **H = 48 heads** —
+cross-checked against `rms_norm_gated`'s grid, which puts the gated-delta output
+at 48 × 128 = 6144. Six GEMMs per 64-token chunk per CTA:
+
+| GEMM | M×K×N | MACs |
+|---|---|---:|
+| `h += kᵀ @ vd` | 128×64×64 | 524,288 |
+| `u = k @ h` | 64×128×64 | 524,288 |
+| `a @ u` | 64×64×64 | 262,144 |
+| `p = q @ kᵀ` | 64×128×64 | 524,288 |
+| `o = q @ h` | 64×128×64 | 524,288 |
+| `o += p @ vd` | 64×64×64 | 262,144 |
+
+```
+7.864e6 FLOP/token/layer x 48 layers x 90,208 tokens = 3.405e13 FLOP
+  / 148 TFLOPS bf16 = 230 ms floor      measured 1708 ms = 13.5% of peak
+```
+
+**But most of that 1478 ms is not waste.** Two structural limits, both derived,
+neither measured:
+
+- **Wave quantization.** 96 CTAs on 78 SMs: 18 SMs take two CTAs and set the
+  critical path, so the ceiling is `96 / (2 × 78) = 62%`, lifting the floor to
+  371 ms. This one is checkable and changeable — `block_DV = 32` gives
+  `4 × H = 192` CTAs, 82% ceiling, at the cost of computing the DV-independent
+  `p = q @ kᵀ` four times instead of twice (+10% work for +32% wave efficiency).
+- **Dependency chain.** A 2048-token segment is **32 serial chunks**, each six
+  dependent GEMMs at 64×128×64 — Hopper `wgmma`'s minimum M. The recurrence
+  `h → u → o` carries almost no ILP. Per chunk step: 3.4 µs ideal against 19.1 µs
+  measured, **18% efficient**.
+
+**`fq_fwd` is `T_stall`'s only large candidate and the bucket has never been
+measured.** Its 1478 ms is nominally the same size as the tail's remaining
+2248 ms, and it is a completely different proposition: the tail's gap is
+inflation, mechanically removable, and already demonstrated at 5.12×; this one is
+a latency structure whose reclaimable fraction is unknown until `ncu` splits the
+warp stall reasons.
+
 **Consequence: prefill arithmetic is finished.** Every GEMM is at 86–95% of FP8
 peak and attention is at 95% of bf16 peak. Together they are 74.6% of prefill
 time with **1797 ms of headroom, 6.1% of wall**. Nothing in this document should
@@ -195,7 +262,7 @@ are bandwidth-bound, so the floor is `bytes / 3.5 TB/s`.
 
 | kernel | ms | GB moved | TB/s | of HBM | floor ms |
 |---|---:|---:|---:|---:|---:|
-| **`pack_quantize`** | **2216** | 593 | 0.27 | **7.6%** | 170 |
+| ~~`pack_quantize`~~ **fixed `5cfe8494f`** | 2216 → **441** | 593 | 0.27 → **1.35** | 7.6% → **38.5%** | 170 |
 | `silu_mul` | 589 | 605 | 1.03 | 29.4% | 173 |
 | `conv1d` | 590 | 222 | 0.38 | 10.7% | 63 |
 | `split2` | 360 | 289 | 0.80 | 23.0% | 83 |
@@ -204,10 +271,10 @@ are bandwidth-bound, so the floor is `bytes / 3.5 TB/s`.
 | `add_native` | 117 | 46 | 0.39 | 11.3% | 13 |
 | `split_qkv` | 101 | 83 | 0.83 | 23.6% | 24 |
 | `rms_norm_batched` | 105 | 6 | 0.06 | 1.6% | 2 |
-| | **4544** | 2111 | | | **603** |
+| | **4544** → **2851** | 2111 | | | **603** |
 
-**3940 ms of headroom — 13.3% of wall, and 2.2× the entire arithmetic
-headroom.** Byte counts are derived from grid dimensions and the obvious
+**3940 ms of headroom when this was written; 1775 ms of it has been taken and
+2248 ms remain — 7.9% of kernel time, ~3.9% of wall after the 2x calibration.** Byte counts are derived from grid dimensions and the obvious
 read/write pattern; `conv1d` and `split2` carry the largest modelling error, and
 even doubling every estimate leaves ~3.3 s.
 
@@ -218,12 +285,14 @@ for `amax`, then a second pass that re-reads the same input to scale it. That is
 2-byte accesses where H20 needs ≥8, a `__syncthreads` per 128 elements, and
 double the necessary traffic. The whole tail was written the same way.
 
-The fix is mechanical and identical everywhere: one warp per quantization block,
-`float4`-width loads, values kept in registers so the second read disappears, and
-`__shfl_xor` in place of shared memory. Measured on the traced shapes:
-**3.4–3.7× faster, output bit-identical**, and `ncu` attributes the whole gain to
-executing 3.96× fewer instructions (see the gap layer). The upper bound on the
-tail is fusion into the producing kernel's epilogue, which removes it entirely.
+The fix is mechanical and identical everywhere: 16 lanes per quantization block,
+16 B loads, values kept in registers so the second read disappears, `__shfl_xor`
+in place of shared memory, and a packed two-at-a-time FP8 conversion. Shipped for
+`pack_quantize` at `5cfe8494f`: **5.13× on the microbench, 5.12× in situ, output
+bit-identical**, and `ncu` attributes the whole gain to executing 5.87× fewer
+instructions (see the gap layer). **The other eight kernels are the same code
+pattern and have not been touched.** The upper bound on the tail is fusion into
+the producing kernel's epilogue, which removes it entirely.
 
 ### The gap layer — four buckets, four distinct remedies
 
@@ -255,50 +324,55 @@ anyone learning which bucket paid — which is indistinguishable from guessing.
 
 ### The buckets, measured on the anchor window
 
-| bucket | measured | share of wall | how it was obtained |
-|---|---:|---:|---|
-| **tail — inflation, `ncu`-confirmed** | **3940 ms** | **13.3%** | 2111 GB at 0.06–1.03 TB/s against 3.5 |
-| floor gap — all GEMM | 1570 ms | 5.3% | 17.4 µs/token × 90,208 |
-| idle | 966 ms | 3.3% | GPU busy 28,676 of 29,642 ms |
-| floor gap — FA3 | 227 ms | 0.8% | 4.9% short of the 148 TFLOPS bf16 peak |
-| `fq_fwd` (FlashQLA) | 1618 ms | 5.5% | **unscored** — no floor derived yet |
-| | **6703 ms** | **22.6%** | excluding `fq_fwd` |
+Two captures, same 30 s steady-state window, same analyzer: `70760bc09` (before)
+and `5cfe8494f` (after the `pack_quantize` fix). Wall 29,642 / 29,693 ms, GPU
+busy 96.5% / 96.4%, kernel 28,601 / 28,611 ms — like for like.
 
-**The tail's gap is `T_inflation`, and `T_stall` is empty.** This was open until
-2026-08-09, when `ncu` on `pack_quantize` at the traced shapes settled it against
-my own expectation:
+| bucket | remaining | of kernel time | of wall, calibrated | how it was obtained |
+|---|---:|---:|---:|---|
+| **tail — inflation, 8 kernels untouched** | **2248 ms** | 7.9% | **~3.9%** | 2111 GB at 0.06–1.03 TB/s against 3.5 |
+| **`fq_fwd` — stall, unmeasured** | **1478 ms** | 5.2% | **~2.6%** | 13.5% of the bf16 roofline; reclaimable fraction unknown |
+| floor gap — all GEMM | 1570 ms | 5.5% | ~2.7% | 17.4 µs/token × 90,208 |
+| idle | 966 ms | 3.4% | ~1.7% | GPU busy 28,676 of 29,642 ms |
+| floor gap — FA3 | 227 ms | 0.8% | ~0.4% | 4.9% short of the 148 TFLOPS bf16 peak |
+| | **6489 ms** | **22.7%** | **~11%** | |
 
-| metric | current | vectorized |
+**Taken so far: `pack_quantize`, 1775 ms of kernel time, and it converted to
+−2.98% of wall.** That single data point is what calibrated the last column, and
+it is why the remaining program is worth about 11% of wall rather than the 22.7%
+the kernel-time column suggests.
+
+**The tail's gap is `T_inflation` and `T_stall` is empty — for the tail.** `ncu`
+on `pack_quantize` settled that against my own expectation:
+
+| metric | before | after |
 |---|---:|---:|
-| duration | 101.4 µs | **27.6 µs (3.67×)** |
-| executed instructions | 46.79 M | **11.81 M (3.96× fewer)** |
-| SM (compute) throughput | 81.3% | 74.9% |
-| **DRAM throughput** | **5.2%** | 19.2% |
-| achieved occupancy | 89.8% | 83.7% |
-| executed IPC | 3.30 | 3.21 |
+| duration | 100.7 µs | **20.6 µs (4.89×)** |
+| executed instructions | 46.61 M | **7.95 M (5.87× fewer)** |
+| SM (compute) throughput | 81.5% | 69.2% |
+| **DRAM throughput** | **5.3%** | 25.7% |
+| achieved occupancy | 90.3% | 84.6% |
+| executed IPC | 3.32 | 3.07 |
 
-**The speedup equals the instruction reduction.** Both versions run the SM at
-~80% of issue throughput with IPC above 3.2 and occupancy near 90% — the kernel
-is not waiting on memory, it is issuing address arithmetic, reduction, and
-synchronization instructions at nearly the hardware rate. DRAM at 5.2% means the
-memory system is close to idle while this runs.
+**The speedup equals the instruction reduction at every step.** Both versions run
+the SM at 69–81% of issue throughput with IPC above 3.0 and occupancy near 90% —
+the kernel is not waiting on memory, it is issuing address arithmetic, reduction,
+and synchronization instructions at nearly the hardware rate. DRAM at 5.3% means
+the memory system is close to idle while the old version runs.
 
 Two consequences. **The remedies that address stall — TMA, async copy, warp
-specialization, deeper pipelining — would do nothing here**, and the megakernel
-line addresses `T_idle`, a different 966 ms. **And the tail's binding floor is
-not bandwidth but instruction issue**: `instructions / issue_rate`. The
-bandwidth floor in the table above is a lower bound that the tail cannot reach
-by moving bytes faster, only by executing fewer instructions per byte —
+specialization, deeper pipelining — return nothing on the tail**, and the
+megakernel line addresses `T_idle`, a different 966 ms. **And the tail's binding
+floor is not bandwidth but instruction issue**: `instructions / issue_rate`. The
+bandwidth floor in the table above is a lower bound the tail cannot reach by
+moving bytes faster, only by executing fewer instructions per byte —
 vectorization does that, and fusion into the producer's epilogue removes them
 entirely.
 
-The vectorized form is **bit-identical across all three traced shapes** (0
-mismatches over 2048 × {5120, 17408, 6144}) and 3.4–3.7× faster, so the ~1600 ms
-this predicts on the served `pack_quantize` is measured, not modelled.
-
-**Total identified headroom is 6.7 s of 29.6 s — 22.6%**, and 59% of it is in
-kernels that do no model arithmetic at all. After that, only reducing `P` and `L`
-remains.
+**`fq_fwd` is the opposite case and the reason the buckets are kept separate.**
+Same nominal size, no demonstrated remedy, and a dependency structure that
+`T_stall` is exactly the name for. Measuring it is the next thing this document
+needs.
 
 ### What this model is for, and what it forbids
 
@@ -308,8 +382,12 @@ explicit. Three consequences follow:
 - **Prefill arithmetic is at the hardware floor.** GEMM 86–95% of FP8 peak, FA3
   95% of bf16 peak, 74.6% of prefill time, 6.1% of wall in headroom. Only `P` can
   make it smaller.
-- **The largest single lever is `pack_quantize`**, which is pure data
-  preparation, runs at 7.6% of HBM bandwidth, and is 7.8% of prefill time.
+- **The data-prep tail, not arithmetic, is where kernel headroom lives.**
+  `pack_quantize` was 7.8% of prefill time at 7.6% of HBM bandwidth; fixed, it is
+  1.54%. Eight kernels of the same shape remain.
+- **A window share is not a run share.** Multiply by ~0.5 before predicting
+  end-to-end, and expect ~11% of wall from every remaining kernel lever combined.
+  Beyond that the levers are `P`, `L`, and scheduling — not kernels.
 - **A decode-side lever is multiplied by `N_tick`, which the anchor makes tiny** —
   433 ms of 28,601. This is why the slot-batched draft attention is −10.4% on a
   decode-shaped workload and a null here; the model predicted it before the A/B
@@ -1348,17 +1426,24 @@ queueing ramp.
    headroom in 4646 ms. **With this and item 5, prefill arithmetic has 1797 ms of
    headroom total — 6.1% of wall — and no kernel lever remains in it.**
 
-7. **The elementwise tail is the largest open lever — 4544 ms at 0.06–1.03 TB/s
-   against 3.5, headroom 3940 ms = 13.3% of wall.** `pack_quantize` alone is 2216
-   ms at **7.6% of HBM bandwidth**. One mechanism explains the column: scalar
-   2-byte accesses, one element per thread, a `__syncthreads` block reduction per
-   128 elements, and the input read twice
-   (`csrc/gemm/dsv4_deepgemm_ops.cu:89`). Fix is vectorized loads + warp-level
-   reduction; upper bound is fusion into the producer's epilogue. This is now the
-   #1 item in the document.
+7. **The elementwise tail — `pack_quantize` DONE, eight kernels remain.**
+   `pack_quantize` shipped at `5cfe8494f`: 2216 → 441 ms, **5.12× in situ**,
+   bit-identical, wall −2.98%. The remaining eight are the same code pattern —
+   scalar 2-byte accesses, one element per thread, a `__syncthreads` block
+   reduction per 128 elements, the input read twice — for **2248 ms, ~3.9% of
+   wall calibrated**. Largest are `silu_mul` 610, `conv1d` 610 at 0.38 TB/s,
+   `split2` 372. Fix is the shipped one; upper bound is fusion into the
+   producer's epilogue.
 
-8. **`fq_fwd` (FlashQLA) — 1618 ms, 5.7% of prefill, no floor derived.** The only
-   large prefill term with no roofline attached to it.
+8. **`fq_fwd` (FlashQLA) is now the largest non-GEMM term — 1708 ms, 5.97%, at
+   13.5% of the bf16 roofline.** Floor derived 2026-08-09 (§ the floor layer):
+   230 ms ideal, 371 ms after wave quantization, **1478 ms nominal headroom**.
+   **`T_stall`'s only large candidate, and that bucket has never been measured.**
+   Two derived limits, neither confirmed: 96 CTAs on 78 SMs caps utilization at
+   62% (`block_DV = 32` would give 192 CTAs and 82% — a concrete, falsifiable
+   A/B), and a 32-chunk serial recurrence of six dependent 64×128×64 GEMMs runs
+   at 18% per chunk step. **`ncu` warp-stall reasons decide how much of the 1478
+   ms is reachable; until then it is not comparable to item 7's 2248 ms.**
 
 9. **Sampling costs 30–40% of decode throughput at c ≥ 8** (§2.4) — measured on
    the anchor, so its size needs re-measuring on §2.0's shape. The gate at
@@ -1374,7 +1459,8 @@ Facts this chain rests on that have not been measured:
 | item | why it matters |
 |---|---|
 | **a decode-shaped workload** | the anchor is 279:1 prompt:output and all decode is ~1% of its GPU time; every decode number in this document is ranked off it |
-| `fq_fwd` (FlashQLA) floor | 1618 ms, 5.7% of prefill, the only large term with no roofline |
+| **`fq_fwd` warp-stall split** | 1478 ms nominal headroom at 13.5% of roofline; `ncu` decides how much is reachable, and it is the only large `T_stall` candidate in the document |
+| **the scheduling regime** | ~half the anchor's wall is not kernel time — 128 requests over 16 slots, TTFT p90 73–184 s — and nothing in this document models it |
 | prefix sidecar restore hit rate | decides whether 9.4% of wall is earned |
 | acceptance rate under temperature | `accept_rate` is 0.31 at temp 0 on the anchor (2026-08-06); the sampled arm has no matching figure |
 | whole-slot park cost | `a546ba80a` shipped unmeasured; both routes default-off |
