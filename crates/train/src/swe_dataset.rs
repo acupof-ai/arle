@@ -13,45 +13,31 @@ use std::{
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
-/// One SWE-bench-Pro task record. Only the fields the OPD rollout needs are
-/// decoded; any extra columns in the JSONL are ignored.
 #[derive(Debug, Clone, Deserialize)]
 pub struct SweTask {
-    /// Unique task id, e.g. `"ansible__ansible-12345"`.
     pub instance_id: String,
-    /// The issue text the agent must fix.
     pub problem_statement: String,
-    /// Repository slug, e.g. `"ansible/ansible"`.
     pub repo: String,
-    /// Git sha the repo is checked out at.
     pub base_commit: String,
-    /// Git diff adding/modifying the hidden tests — applied at scoring time,
-    /// NOT given to the agent.
+    /// Hidden tests — applied at scoring, not given to the agent.
     pub test_patch: String,
 
-    /// Tests that must flip from fail to pass. In SWE-bench-Pro this is often a
-    /// JSON-string containing a JSON array, sometimes already a JSON array.
-    /// Use [`SweTask::fail_to_pass`] to normalize.
+    /// May be a JSON array or a JSON-string of a JSON array. Use `fail_to_pass`.
     #[serde(default)]
     pub fail_to_pass: serde_json::Value,
 
-    /// Setup commands run in the sandbox before tests; may be absent.
     #[serde(default)]
     pub before_repo_set_cmd: Option<String>,
 }
 
-/// Normalize a `serde_json::Value` that may be a JSON array of strings, a
-/// JSON-string containing a JSON array, or a single bare string into a
-/// `Vec<String>`. Anything else (null, unparseable) yields an empty vec.
+/// Normalize a value that may be a JSON array, a JSON-string of an array,
+/// or a bare string into `Vec<String>`.
 fn normalize_string_list(value: &serde_json::Value) -> Vec<String> {
     match value {
-        // Already a JSON array: collect the string elements.
         serde_json::Value::Array(items) => items
             .iter()
             .filter_map(|v| v.as_str().map(str::to_owned))
             .collect(),
-        // A string: it may itself be a JSON array literal (the common
-        // SWE-bench-Pro shape), otherwise treat it as a single entry.
         serde_json::Value::String(s) => {
             let trimmed = s.trim();
             if trimmed.starts_with('[')
@@ -74,14 +60,11 @@ fn normalize_string_list(value: &serde_json::Value) -> Vec<String> {
 }
 
 impl SweTask {
-    /// `fail_to_pass` normalized to a `Vec<String>` regardless of JSON shape.
     pub fn fail_to_pass(&self) -> Vec<String> {
         normalize_string_list(&self.fail_to_pass)
     }
 }
 
-/// Load all tasks from a JSONL file (one JSON object per line; blank lines are
-/// skipped). Each non-blank line must parse as a [`SweTask`].
 pub fn load_swe_tasks(path: &Path) -> Result<Vec<SweTask>> {
     let file = File::open(path)
         .with_context(|| format!("failed to open SWE task file {}", path.display()))?;
