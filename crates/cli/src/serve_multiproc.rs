@@ -404,6 +404,26 @@ fn run_lockstep_driver(
                     throughput_prefill_tokens: throughput.prefill_tokens,
                     throughput_generated_tokens: throughput.generated_tokens,
                     throughput_requests_completed: throughput.requests_completed,
+                    throughput_forward_busy_micros: throughput.forward_busy_micros,
+                    throughput_prefill_forward_steps: throughput.prefill_forward_steps,
+                    throughput_prefill_forward_busy_micros: throughput.prefill_forward_busy_micros,
+                    throughput_decode_forward_steps: throughput.decode_forward_steps,
+                    throughput_decode_forward_busy_micros: throughput.decode_forward_busy_micros,
+                    throughput_mixed_forward_steps: throughput.mixed_forward_steps,
+                    throughput_mixed_forward_busy_micros: throughput.mixed_forward_busy_micros,
+                    throughput_decode_phase_steps: throughput.decode_step_phase.steps,
+                    throughput_decode_phase_poll_micros: throughput.decode_step_phase.poll_micros,
+                    throughput_decode_phase_apply_output_micros: throughput
+                        .decode_step_phase
+                        .apply_output_micros,
+                    throughput_decode_phase_poll_background_micros: throughput
+                        .decode_step_phase
+                        .poll_background_micros,
+                    throughput_decode_phase_admit_micros: throughput.decode_step_phase.admit_micros,
+                    throughput_decode_phase_plan_micros: throughput.decode_step_phase.plan_micros,
+                    throughput_decode_phase_submit_micros: throughput
+                        .decode_step_phase
+                        .submit_micros,
                     prefix_lookups: prefix.lookups,
                     prefix_hits: prefix.hits,
                     prefix_hit_tokens: prefix.hit_tokens,
