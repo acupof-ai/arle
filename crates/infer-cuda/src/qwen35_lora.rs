@@ -11,8 +11,6 @@
 
 use super::*;
 
-// --- LoRA types -----------------------------------------------------------
-
 #[derive(Debug, Clone)]
 pub struct StudentLoraMatrices {
     pub a: Vec<f32>,
@@ -85,7 +83,6 @@ pub struct StudentLoraProjectionUpdate {
     pub matrices: StudentLoraMatrices,
 }
 
-/// One model layer's LoRA adapters for the in-memory re-merge sync.
 /// `layer_idx` is the absolute model-layer index.
 #[derive(Debug, Clone)]
 pub struct StudentLoraLayer {
@@ -93,9 +90,8 @@ pub struct StudentLoraLayer {
     pub projections: Vec<StudentLoraProjectionUpdate>,
 }
 
-/// A full LoRA update pushed from the train crate into the infer student
-/// engine. Carries raw A/B per full-attention layer plus `rank`/`alpha`; the
-/// merge path applies `scale = alpha / rank` once.
+/// Carries raw A/B per full-attention layer plus `rank`/`alpha`; the merge
+/// path applies `scale = alpha / rank` once.
 #[derive(Debug, Clone)]
 pub struct StudentLoraUpdate {
     pub layers: Vec<StudentLoraLayer>,
@@ -103,11 +99,10 @@ pub struct StudentLoraUpdate {
     pub alpha: f32,
 }
 
-/// One frozen base projection's resident FP8 block-scaled device pointers,
-/// exposed read-only for the train-infer weight-sharing path
-/// (`--share-frozen-base`). The autograd student's frozen base layers import
-/// these pointers as a NON-OWNING view instead of allocating their own ~27 GB
-/// copy.
+/// Resident FP8 block-scaled device pointers, exposed read-only for the
+/// train-infer weight-sharing path (`--share-frozen-base`). The autograd
+/// student's frozen base layers import these pointers as a NON-OWNING view
+/// instead of allocating their own ~27 GB copy.
 #[derive(Debug, Clone)]
 pub struct SharedFp8BaseProjection {
     pub layer_idx: usize,
@@ -140,37 +135,24 @@ pub(crate) struct LoraBaseKey {
 }
 
 impl Qwen35Model {
-    /// Per-step student LoRA re-merge (OPD P2).
-    ///
-    /// Folds a fresh [`StudentLoraUpdate`] into the resident student projection
-    /// weights in place. On the first call the pristine base weight of every
-    /// touched projection is cached host-side; each call then recomputes
-    /// `W = base + (alpha/rank)·(B·A)` from that pristine base — so re-merging
-    /// never compounds onto an already-merged weight.
-    ///
     /// Read-only borrow of every resident FP8 block-scaled base projection's
     /// device pointers, for train-infer weight sharing (`--share-frozen-base`).
     ///
-    /// Walks each layer's full-attention (q/k/v/o), linear-attention
-    /// (in_proj_qkv/z + out_proj — in_proj_a/b are tiny BF16 and skipped by the
-    /// FP8 filter), dense-MLP (gate/up/down), and MoE projections, emitting a
-    /// [`SharedFp8BaseProjection`] for every one stored as resident block-scaled
-    /// FP8. MoE routed experts come from either
-    /// the per-expert `DeviceMatrix` vecs (DeepGEMM disabled) or sliced out of
-    /// the fused `w13`/`down` grouped FP8 buffers (default), and the shared
-    /// expert from its individual FP8 matrices. The train side picks the subset
-    /// it actually shares (frozen, non-LoRA-target tensors) by matching
-    /// `(layer_idx, proj_suffix)`. Read-only: returns raw pointers, never
-    /// exposes mutation. Single-GPU only — TP/EP shards would split the base, so
-    /// group index equals global expert index.
+    /// in_proj_a/b are tiny per-head BF16 (fp8_block_scaled_ptrs skips them via
+    /// the format filter). MoE routed experts come from either the per-expert
+    /// `DeviceMatrix` vecs (DeepGEMM disabled) or sliced out of the fused
+    /// `w13`/`down` grouped FP8 buffers (default). The train side picks the
+    /// subset it actually shares by matching `(layer_idx, proj_suffix)`.
+    /// Single-GPU only — TP/EP shards would split the base, so group index
+    /// equals global expert index.
     pub(crate) fn frozen_base_fp8_pointers(&self) -> Result<Vec<SharedFp8BaseProjection>> {
         ensure!(
             self.tp.is_single(),
             "frozen-base FP8 sharing is single-GPU only; got TP world_size={}",
             self.tp.config().world_size
         );
-        // From here on a LoRA FP8→BF16 promotion must retire (not free) the FP8
-        // buffers: the importer holds non-owning views of these pointers.
+        // FP8→BF16 promotion must retire (not free) the FP8 buffers: the
+        // importer holds non-owning views of these pointers.
         self.frozen_base_ptrs_exported
             .store(true, Ordering::Relaxed);
         let ctx = &self.ctx;
@@ -217,11 +199,10 @@ impl Qwen35Model {
                 );
             }
             if let Qwen35Attn::Linear(lin) = &layer.attn {
-                // Gated-delta linear attention. in_proj_qkv/z + out_proj ship as
-                // resident FP8 in the Qwen3.5/3.6 hybrid checkpoint; in_proj_a/b
-                // are tiny per-head BF16 (fp8_block_scaled_ptrs skips them via the
-                // format filter). The train student names these
-                // `linear_attn.{in_proj_qkv,in_proj_z,out_proj}` (HF spec).
+                // in_proj_qkv/z + out_proj ship as resident FP8 in the
+                // Qwen3.5/3.6 hybrid checkpoint; in_proj_a/b are tiny per-head
+                // BF16 (skipped by the format filter). The train student names
+                // these `linear_attn.{in_proj_qkv,in_proj_z,out_proj}`.
                 push(
                     &mut out,
                     ctx,
@@ -284,11 +265,10 @@ impl Qwen35Model {
                     &moe.shared_down,
                 );
 
-                // Routed experts. Two storage layouts:
-                //  (A) per-expert Vec<DeviceMatrix> populated (DeepGEMM disabled) -> borrow each directly.
+                // Two storage layouts:
+                //  (A) per-expert Vec<DeviceMatrix> (DeepGEMM disabled) -> borrow each directly.
                 //  (B) fused FP8 grouped buffers (default) -> slice per-expert ptrs into the group.
                 if !moe.gate.is_empty() {
-                    // Layout A: per-expert DeviceMatrix retained.
                     for (e, m) in moe.gate.iter().enumerate() {
                         push(
                             &mut out,
@@ -317,7 +297,6 @@ impl Qwen35Model {
                         );
                     }
                 } else {
-                    // Layout B: slice into the fused grouped FP8 buffers.
                     // Single-GPU: group index == global expert index.
                     if let Some(w13) = &moe.w13_fp8_grouped {
                         // rows = 2*moe_intermediate; gate = rows[0..mi], up = rows[mi..2*mi].
@@ -409,9 +388,7 @@ impl Qwen35Model {
     /// Non-owning views of every resident dense-BF16 base projection's device
     /// pointer, for refreshing the train student's frozen base AFTER a LoRA
     /// re-merge. Projections still stored as FP8 block-scaled are skipped (the
-    /// student keeps its existing FP8 alias for those). The caller uses these
-    /// pointers to re-point the student's frozen-base tensors at the merged
-    /// BF16 bytes, then frees the retired FP8 buffers.
+    /// student keeps its existing FP8 alias for those).
     pub(crate) fn frozen_base_bf16_pointers(&self) -> Result<Vec<SharedBf16BaseProjection>> {
         ensure!(
             self.tp.is_single(),
@@ -550,8 +527,7 @@ impl Qwen35Model {
     }
 
     /// `A` is `[rank, in]`, `B` is `[out, rank]`, matching the train-side
-    /// `LinearWithLora` contract. The next `forward_tokens` picks up the merged
-    /// resident matrices automatically.
+    /// `LinearWithLora` contract.
     pub(crate) fn remerge_student_lora(&mut self, update: StudentLoraUpdate) -> Result<()> {
         ensure!(update.rank > 0, "student LoRA update has rank=0");
         ensure!(
@@ -634,25 +610,21 @@ impl Qwen35Model {
         // The frozen base now IS the merged BF16 `data` (the student re-aliases
         // it). Reset the per-merge dirty set and the one-shot BF16 base cache:
         // the next round's first merge treats the current `data` as the pristine
-        // base (it caches the row window on first touch), and a zero-adapter
-        // round is a no-op rather than a restore-from-FP8.
+        // base, and a zero-adapter round is a no-op rather than a
+        // restore-from-FP8.
         self.lora_dirty.clear();
         self.lora_base_dev.clear();
     }
 
-    /// Promote an FP8-block-scaled LoRA target to dense BF16 on first touch:
-    /// dequantize on-device into a fresh dense buffer and swap the matrix's
-    /// resident storage in place (same rows/cols). Replaces the former host
-    /// remerge lane (O(rows·cols·rank) triple loop + re-quant + full-W upload,
-    /// 60-83s/round) with a one-time kernel; every later re-merge rides the
-    /// on-device dense lane. Dense targets are a no-op; grouped targets error
-    /// in [`Qwen35Model::lora_matrix_mut`].
+    /// Promote FP8-block-scaled LoRA targets to dense BF16 on first touch.
+    /// Replaces the former host remerge lane (O(rows·cols·rank) triple loop +
+    /// re-quant + full-W upload, 60-83s/round) with a one-time kernel; every
+    /// later re-merge rides the on-device dense lane.
     ///
-    /// VRAM: trades FP8→BF16 storage (2×) for the touched projections only;
-    /// their rollout GEMMs ride the dense-BF16 path thereafter (both formats
-    /// are first-class in serving). If `--share-frozen-base` exported the FP8
-    /// pointers, the retired buffers are kept alive (aliased non-owningly by
-    /// the autograd student); otherwise they are freed.
+    /// VRAM: trades FP8→BF16 storage (2×) for touched projections only. If
+    /// `--share-frozen-base` exported the FP8 pointers, the retired buffers are
+    /// kept alive (aliased non-owningly by the autograd student); otherwise
+    /// they are freed.
     fn promote_lora_target_to_bf16(
         &mut self,
         layer_idx: usize,
@@ -717,24 +689,22 @@ impl Qwen35Model {
                 anyhow!("layer {layer_idx} {label}: FP8→BF16 promotion dequant failed: {e}")
             })?;
         }
-        // Success — swap the resident storage to dense BF16 (infallible).
-        // Keep the retired FP8 qweight/scales (and block-scale metadata) in the
-        // matrix: the share-frozen-base student aliases these device pointers,
-        // and the per-step LoRA merge dequantizes them on the fly to recover the
-        // pristine BF16 base — avoiding a separate ~2×base BF16 base cache that
-        // would OOM the 27B sync (FP8 keepalive + BF16 matrix + BF16 base cache
-        // ≈ 3× base bytes). The FP8 buffers are never freed here (the student
-        // owns the alias lifetime); the matrix's `weight_format = DenseBf16`
+        // Keep the retired FP8 qweight/scales in the matrix: the
+        // share-frozen-base student aliases these device pointers, and the
+        // per-step LoRA merge dequantizes them on the fly to recover the
+        // pristine BF16 base — avoiding a separate ~2×base BF16 base cache
+        // that would OOM the 27B sync (FP8 keepalive + BF16 matrix + BF16
+        // base cache ≈ 3× base bytes). The FP8 buffers are never freed here
+        // (the student owns the alias lifetime); `weight_format = DenseBf16`
         // keeps the forward path on `data`.
         matrix.data = dense;
         matrix.weight_format = WeightFormat::DenseBf16;
         Ok(())
     }
 
-    /// Base-cache key for a projection. Projections that live inside a
-    /// row-fused matrix (MlpUp shares `gate_up_proj` with MlpGate) map to one
-    /// canonical key so the pristine device base is cached once per underlying
-    /// buffer — captured before either half's first merge.
+    /// Projections that live inside a row-fused matrix (MlpUp shares
+    /// `gate_up_proj` with MlpGate) map to one canonical key so the pristine
+    /// device base is cached once per underlying buffer.
     fn lora_base_cache_key(layer_idx: usize, projection: StudentLoraProjection) -> LoraBaseKey {
         let projection = match projection {
             StudentLoraProjection::MlpUp => StudentLoraProjection::MlpGate,
@@ -753,8 +723,7 @@ impl Qwen35Model {
 
     /// `(row_offset, rows)` of a projection inside its (possibly row-fused)
     /// resident matrix: e.g. MlpUp occupies `[inter_dim, inter_dim)` of
-    /// `gate_up_proj`, FullK the `[q_gated, kv)` window of `qkv_proj`. A
-    /// projection that owns its whole matrix spans `[0, matrix_rows)`.
+    /// `gate_up_proj`, FullK the `[q_gated, kv)` window of `qkv_proj`.
     fn lora_row_window(
         &self,
         layer_idx: usize,
@@ -786,8 +755,7 @@ impl Qwen35Model {
 
     /// Merge `W = base + scale·(B·A)` for one projection, entirely on device.
     /// FP8-stored targets are promoted to dense BF16 on first touch, so every
-    /// projection rides one lane: pristine device base cache → rank-`rank`
-    /// GEMM + row-window scaled-add into the resident matrix.
+    /// projection rides one lane.
     fn merge_lora_proj(
         &mut self,
         layer_idx: usize,
@@ -806,7 +774,6 @@ impl Qwen35Model {
             return Ok(());
         }
 
-        // Shape checks against the adapter's declared features (cheap; no copy).
         let rows = adapter.out_features;
         let cols = adapter.in_features;
         ensure!(
@@ -835,12 +802,10 @@ impl Qwen35Model {
         self.merge_lora_proj_device(layer_idx, projection, adapter, scale, &key)
     }
 
-    /// On-device dense-BF16 LoRA merge. The pristine base is recovered on the
-    /// fly by dequantizing the FP8 qweight/scales kept in the matrix (kept alive
-    /// for the share-frozen-base student alias), so no separate BF16 base cache
-    /// is needed — saves ~2×base bytes during the 27B sync. Per step: upload
-    /// A/B, run `B·A` on the GPU, dequant FP8→resident `data`, then fold
-    /// `W += scale·(B·A)` into the resident matrix's row window.
+    /// The pristine base is recovered on the fly by dequantizing the FP8
+    /// qweight/scales kept in the matrix (kept alive for the share-frozen-base
+    /// student alias), so no separate BF16 base cache is needed — saves
+    /// ~2×base bytes during the 27B sync.
     fn merge_lora_proj_device(
         &mut self,
         layer_idx: usize,
@@ -856,8 +821,8 @@ impl Qwen35Model {
 
         let (row_offset, _) = self.lora_row_window(layer_idx, projection, rows);
 
-        // Tiny host→device uploads. `a_t` is A transposed to [cols, rank]
-        // row-major (== W[c,k]=A[k,c] for `lora_device_gemm`); `b` uploads as-is
+        // `a_t` is A transposed to [cols, rank] row-major
+        // (== W[c,k]=A[k,c] for `lora_device_gemm`); `b` uploads as-is
         // ([rows, rank] row-major == col-major X[k,r]=B[r,k]).
         let mut a_t = vec![bf16::ZERO; cols * rank];
         for k in 0..rank {
@@ -882,7 +847,6 @@ impl Qwen35Model {
         }
         let ctx = self.ctx.clone();
 
-        // GEMM `B·A` into the scratch buffer.
         {
             let scratch = self
                 .lora_delta_scratch
@@ -899,7 +863,6 @@ impl Qwen35Model {
             )?;
         }
 
-        // Recover the pristine base into the resident matrix's row window.
         // FP8-stored targets dequantize their kept-alive qweight/scales on the
         // fly (no BF16 base cache). Native-BF16 targets (e.g. linear-attn
         // `in_proj_ba`) already hold their base in `data`; we cache that row
@@ -919,8 +882,6 @@ impl Qwen35Model {
             );
             let cache_key = Self::lora_base_cache_key(layer_idx, projection);
             if matrix.qweight_u8.is_some() {
-                // FP8 base: dequant the full matrix into scratch, then copy the
-                // row window into `data`.
                 let qweight = matrix.qweight_u8.as_ref().ok_or_else(|| {
                     anyhow!("layer {layer_idx} {label}: FP8 base missing qweight for merge")
                 })?;
@@ -962,8 +923,7 @@ impl Qwen35Model {
                 })?;
             } else if !self.lora_base_dev.contains_key(&cache_key) {
                 // Native-BF16 base: cache the row window once (before the first
-                // merge) so restore can put it back. `data` already holds the
-                // pristine base at this point.
+                // merge) so restore can put it back.
                 let mut cache = DeviceVec::zeros(&ctx, needed)?;
                 {
                     let matrix = self.lora_matrix(layer_idx, projection)?;
@@ -977,7 +937,6 @@ impl Qwen35Model {
             }
         }
 
-        // Fold `W[row_window] += scale·(B·A)` in place.
         let delta_data = self
             .lora_delta_scratch
             .as_ref()
@@ -1009,7 +968,6 @@ impl Qwen35Model {
         Ok(())
     }
 
-    /// Restore a dense projection's resident matrix from its pristine base.
     /// FP8 targets dequantize their kept-alive qweight/scales; native-BF16
     /// targets copy from the one-shot row-window cache captured at first merge.
     /// Only the projection's own row window is restored, so the other half of a
@@ -1033,8 +991,6 @@ impl Qwen35Model {
         let cols = matrix.cols;
         let window = row_offset * cols..(row_offset + rows) * cols;
         if matrix.qweight_u8.is_some() {
-            // FP8 base: dequant the full matrix into scratch, then copy the row
-            // window back into `data`.
             let qweight = matrix.qweight_u8.as_ref().ok_or_else(|| {
                 anyhow!("layer {layer_idx} {label}: FP8 base missing qweight for restore")
             })?;
@@ -1075,7 +1031,6 @@ impl Qwen35Model {
                 anyhow!("layer {layer_idx} {label}: device base restore D2D failed: {e}")
             })?;
         } else {
-            // Native-BF16 base: copy the cached row window back into `data`.
             let cache_data = self
                 .lora_base_dev
                 .get(key)
@@ -1168,7 +1123,7 @@ impl Qwen35Model {
                 })?;
                 Ok(match projection {
                     // Gate/up live in the row-fused `gate_up_proj`; callers
-                    // address their half via `lora_row_offset`.
+                    // address their half via `lora_row_window`.
                     StudentLoraProjection::MlpGate | StudentLoraProjection::MlpUp => {
                         &dense.gate_up_proj
                     }
