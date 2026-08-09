@@ -174,7 +174,6 @@ impl FlashJudge {
             .offload_engine_weights()
     }
 
-    /// Reload the judge engine's device weights before the next judging phase.
     pub fn reload_engine_weights(&self) -> Result<()> {
         self.engine
             .lock()
