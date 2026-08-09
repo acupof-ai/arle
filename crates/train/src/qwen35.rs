@@ -2725,7 +2725,6 @@ impl Qwen35Layer {
         Ok(attn.out_proj.forward(linear, store, tape)?)
     }
 
-    /// Capture only the frozen prompt carry.
     #[allow(clippy::too_many_arguments)]
     fn forward_linear_attention_capture_prefix_state(
         &self,
@@ -2783,7 +2782,6 @@ impl Qwen35Layer {
         Ok(PrefixState { state, conv_window })
     }
 
-    /// Train generated rows from the frozen prompt carry.
     #[allow(clippy::too_many_arguments)]
     fn forward_linear_attention_gen_segment(
         &self,
