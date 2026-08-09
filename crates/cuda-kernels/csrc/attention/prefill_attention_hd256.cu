@@ -167,7 +167,7 @@ __global__ void attention_gate_batch_kernel(
     int gate_idx = token * q_full_dim + q_head * 2 * head_dim + head_dim + dim;
 
     float gate = __bfloat162float(q_full_batch[gate_idx]);
-    float sig_gate = 1.0f / (1.0f + expf(-gate));
+    float sig_gate = 1.0f / (1.0f + __expf(-gate));
     float out = __bfloat162float(attn_out[idx]);
     attn_out[idx] = __float2bfloat16(out * sig_gate);
 }

@@ -77,9 +77,9 @@ __global__ void gdr_prefill_chunk_prepare_kernel(
     float b_val = __bfloat162float(b_proj[head_idx]);
     float dt = __bfloat162float(dt_bias[v_head]);
     float x = a_val + dt;
-    float softplus_x = x > 20.0f ? x : logf(1.0f + expf(x));
-    g_out[head_idx] = -expf(a_log[v_head]) * softplus_x;
-    beta_out[head_idx] = 1.0f / (1.0f + expf(-b_val));
+    float softplus_x = x > 20.0f ? x : __logf(1.0f + __expf(x));
+    g_out[head_idx] = -__expf(a_log[v_head]) * softplus_x;
+    beta_out[head_idx] = 1.0f / (1.0f + __expf(-b_val));
   }
 }
 
