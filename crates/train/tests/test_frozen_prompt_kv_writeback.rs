@@ -152,6 +152,7 @@ fn forward_backward_inline(
                 &gen_ids,
                 &prompt_positions,
                 &gen_positions,
+                train::context_parallel::CpContext::single(),
             )
             .expect("frozen gen-segment forward")
     } else {
