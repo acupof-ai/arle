@@ -27,11 +27,8 @@ use crate::{
     teacher_infer::InProcessTeacher,
 };
 
-/// Adapter names are `{base_name}.lora_a` / `{base_name}.lora_b` where
-/// `{base_name}` ends in `.weight` (see `lora.rs:123`). We strip the
-/// `.lora_a` / `.lora_b` suffix to recover the shared base prefix, match the
-/// `a`/`b` siblings by that prefix, and sort by base name so the same logical
-/// adapter lands at the same index across the student and the EMA models.
+/// Strip `.lora_a`/`.lora_b` suffixes, match siblings by base prefix, sort by
+/// base name so the same adapter lands at the same index across student and EMA.
 fn pair_adapters(map: &HashMap<&'static str, TensorId>) -> Result<Vec<(TensorId, TensorId)>> {
     let mut a_by_base: HashMap<&str, TensorId> = HashMap::new();
     let mut b_by_base: HashMap<&str, TensorId> = HashMap::new();
@@ -75,40 +72,24 @@ fn pair_adapters(map: &HashMap<&'static str, TensorId>) -> Result<Vec<(TensorId,
 
 pub struct EmaSelfTeacher {
     model: Qwen35Model,
-    /// EMA adapter pairs, layer-ordered (sorted by base name) so index `i`
-    /// lines up with [`Self::student_adapter_pairs`] index `i`.
+    /// Layer-ordered (sorted by base name) so index `i` aligns with student.
     adapter_ids: Vec<(TensorId, TensorId)>,
-    /// The teacher parameter ids exposed via [`Self::as_teacher`] — the EMA
-    /// model's frozen params (shared base + frozen EMA adapter), EXCLUDING the
-    /// student's trainable adapter ids.
-    ///
-    /// Why a stored, filtered list instead of `model.all_parameter_ids()`:
-    /// `new_lora_from_base`'s `share_base_parameters_from` rebuilds the EMA
-    /// model's `param_ids` from the base model's `param_ids` wholesale, and the
-    /// base IS the LoRA student — so `model.all_parameter_ids()` also lists the
-    /// student's trainable adapter ids. Exposing those as teacher params makes
-    /// the OPD step reject them (`requires_grad=true` teacher param / student
-    /// param owned by teacher). The student adapter is kept alive for the step
-    /// via the student's own `all_parameter_ids()`, so dropping it here is safe.
+    /// EMA model params MINUS the student's trainable adapter ids.
+    /// `share_base_parameters_from` folds the student adapter ids into the EMA
+    /// model's `param_ids`, so `all_parameter_ids()` would expose them as
+    /// teacher params — which the OPD step rejects (`requires_grad=true`).
     teacher_param_ids: Vec<TensorId>,
 }
 
 impl EmaSelfTeacher {
-    /// CONSTRUCTION ORDER (REQUIRED): call this immediately after building the
-    /// student model and BEFORE allocating any other train-store scratch
-    /// tensors. [`Qwen35Model::new_lora_from_base`] calls
-    /// `store.retain_ids(student ∪ ema)`, which FREES every other store tensor;
-    /// any scratch allocated before this call is silently dropped.
+    /// Call immediately after building the student, before any other store
+    /// scratch: `new_lora_from_base` calls `store.retain_ids(student ∪ ema)`,
+    /// freeing every other store tensor.
     ///
-    /// The EMA adapter is initialized to an EXACT COPY of the student adapter
-    /// (via [`Self::copy_from_student`]), NOT relied on to coincide via
-    /// name-seeded init. WHY: ① resume-from-checkpoint — a resumed student has
-    /// a non-zero adapter, and the EMA must start from it, not from fresh seed;
-    /// ② bilinearity — the EMA update is elementwise on `A` and `B` separately,
-    /// which only tracks the student's effective `B·A` delta when EMA and
-    /// student share the same basis. The exact copy establishes that shared
-    /// basis at step 0, and the slow EMA (α≈0.999) keeps the two bases close
-    /// enough thereafter for the elementwise update to remain meaningful.
+    /// EMA adapter is initialized to an EXACT COPY of the student adapter:
+    /// ① resume — a resumed student has a non-zero adapter; ② bilinearity —
+    /// the elementwise EMA update on A/B only tracks the student's B·A delta
+    /// when EMA and student share the same basis.
     pub fn from_student(
         student: &Qwen35Model,
         lora: LoraConfig,
@@ -118,10 +99,7 @@ impl EmaSelfTeacher {
         let model = Qwen35Model::new_lora_from_base(student, lora, target_set, store)?;
         let adapter_ids = pair_adapters(&model.adapter_name_map())?;
 
-        // Teacher params = EMA model params MINUS the student's trainable adapter
-        // ids (which `share_base_parameters_from` folds into the EMA model's
-        // param_ids — see the field doc). TensorIds are allocation-stable, so a
-        // snapshot taken here stays valid for the EMA teacher's lifetime.
+        // TensorIds are allocation-stable, so this snapshot stays valid.
         let student_adapter_ids: HashSet<TensorId> =
             student.adapter_name_map().values().copied().collect();
         let teacher_param_ids: Vec<TensorId> = model
@@ -140,15 +118,8 @@ impl EmaSelfTeacher {
         Ok(teacher)
     }
 
-    /// The EMA adapter is a frozen TEACHER parameter: it is never optimized
-    /// through autograd — [`Self::update`] blends it host-side — so it must not
-    /// carry `requires_grad = true`. `Qwen35Model::new_lora_from_base` builds
-    /// the adapter trainable (LoRA adapters init `requires_grad = true`,
-    /// `lora.rs`), so without this freeze the OPD step's
-    /// `validate_teacher_params` rejects the EMA model (every teacher param must
-    /// be frozen) before SOPD can run. The base parameters are already frozen
-    /// (shared from the student via `new_lora_from_base`), so the whole EMA
-    /// model reads as a valid frozen teacher once the adapter is frozen.
+    /// EMA adapter is host-side blended, never autograd-optimized — must be
+    /// frozen so `validate_teacher_params` accepts the EMA model.
     fn freeze_adapter(&self, store: &mut TensorStore) -> Result<()> {
         for &(a, b) in &self.adapter_ids {
             store.set_requires_grad(a, false)?;
@@ -157,14 +128,8 @@ impl EmaSelfTeacher {
         Ok(())
     }
 
-    /// Pair the STUDENT's adapter `(lora_a, lora_b)` TensorIds in the same
-    /// deterministic order as [`Self::adapter_ids`], so student index `i`
-    /// aligns with EMA index `i`.
+    /// Pair the student's adapters in the same order as `self.adapter_ids`.
     pub fn student_adapter_pairs(student: &Qwen35Model) -> Vec<(TensorId, TensorId)> {
-        // `from_student` already proved the student's adapter map pairs cleanly
-        // (the EMA model is built from the same target_set), so any pairing
-        // error here is a logic bug; surface it loudly rather than silently
-        // returning a short Vec.
         pair_adapters(&student.adapter_name_map())
             .expect("student adapter map must pair into (lora_a, lora_b) tuples")
     }
@@ -222,16 +187,15 @@ impl EmaSelfTeacher {
         Ok(())
     }
 
-    /// The [`TeacherForward`](crate::teacher_infer::TeacherForward) the OPD step
-    /// consumes: base + EMA-adapter, tape off, in the train store. Exposes only
-    /// the EMA model's frozen params (NOT the student's trainable adapter — see
-    /// [`Self::teacher_param_ids`]).
+    /// Base + EMA-adapter, tape off. Exposes only frozen params (not the
+    /// student's trainable adapter — see `teacher_param_ids`).
     pub fn as_teacher(&self) -> InProcessTeacher<'_> {
         InProcessTeacher::with_parameter_ids(&self.model, self.teacher_param_ids.clone())
     }
 }
 
-/// Snapshot of everything that must roll back together on a gate-fail (R2).
+/// Student adapter + EMA adapter + AdamW moments — roll back as one unit on
+/// gate-fail (partial rollback = stale EMA/moments, the DSv4-EAGLE failure).
 pub struct EmaTrainSnapshot {
     student_adapter: Vec<(Vec<f32>, Vec<f32>)>,
     ema_adapter: Vec<(Vec<f32>, Vec<f32>)>,
@@ -239,9 +203,6 @@ pub struct EmaTrainSnapshot {
 }
 
 impl EmaSelfTeacher {
-    /// `names` for the optimizer export is the student adapter
-    /// `(TensorId, leaked-name.to_string())` list — the optimizer only holds
-    /// moments for the trainable student params.
     pub fn snapshot(
         &self,
         student: &Qwen35Model,
@@ -270,9 +231,8 @@ impl EmaSelfTeacher {
         })
     }
 
-    /// Restoring ONLY the student adapter would leave the EMA trained against
-    /// rejected student state and the AdamW moments stale — the DSv4-EAGLE
-    /// partial-rollback failure mode. All three roll back as one unit.
+    /// All three (student adapter, EMA adapter, AdamW moments) roll back as
+    /// one unit — partial rollback leaves stale EMA/moments.
     pub fn restore(
         &mut self,
         snapshot: &EmaTrainSnapshot,
@@ -308,11 +268,9 @@ impl EmaSelfTeacher {
         }
 
         let names = student_adapter_names(student);
-        // R2: clear the student adapter's optimizer moments BEFORE overlaying the
-        // snapshot. `import_state` only re-installs entries serialized in the
-        // snapshot; a rejected step that created moments absent from the snapshot
-        // (e.g. the first gated step, snapshotted before any moments existed)
-        // would otherwise leave stale m/v behind for the next accepted step.
+        // Clear adapter moments before overlaying the snapshot — `import_state`
+        // only re-installs snapshotted entries; a rejected step's moments would
+        // otherwise persist for the next accepted step.
         let student_ids: Vec<TensorId> = names.iter().map(|(id, _)| *id).collect();
         optimizer.clear_param_state(&student_ids);
         optimizer.import_state(&snapshot.adamw, &names)?;
@@ -320,8 +278,6 @@ impl EmaSelfTeacher {
     }
 }
 
-/// The student's trainable-adapter `(TensorId, leaked-name.to_string())` list,
-/// for AdamW export/import.
 fn student_adapter_names(student: &Qwen35Model) -> Vec<(TensorId, String)> {
     student
         .adapter_name_map()
