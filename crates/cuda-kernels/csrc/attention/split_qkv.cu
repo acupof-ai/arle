@@ -53,12 +53,12 @@ __global__ void split2_kernel(
         // Entirely in the first section — vectorized copy.
         *reinterpret_cast<uint4*>(first + row * first_dim + col8) =
             *reinterpret_cast<const uint4*>(src);
-    } else if (col8 >= first_dim) {
+    } else if (col8 >= first_dim && col8 + 8 <= fused_dim) {
         // Entirely in the second section — vectorized copy.
         *reinterpret_cast<uint4*>(second + row * second_dim + (col8 - first_dim)) =
             *reinterpret_cast<const uint4*>(src);
     } else {
-        // Straddles the first/second boundary — scalar per element.
+        // Straddles the first/second boundary, or the row tail — scalar per element.
         for (int i = 0; i < 8 && col8 + i < fused_dim; i++) {
             __nv_bfloat16 v = src[i];
             if (col8 + i < first_dim) {
