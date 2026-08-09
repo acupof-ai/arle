@@ -31,24 +31,19 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow, ensure};
 use serde::{Deserialize, Serialize};
 
-/// One capture window grouping dumps into a single attempt. Dumps whose
-/// filename epoch falls in `[t_start_ms, t_end_ms)` belong to the window.
+/// One capture window grouping dumps into a single attempt.
 #[derive(Debug, Clone, Deserialize)]
 pub struct CcWindow {
     pub label: String,
     pub t_start_ms: u64,
     pub t_end_ms: u64,
-    /// Attempt reward (1.0 pass / 0.0 fail). Old windows.jsonl (passing-only)
-    /// lack the field → default 1.0 preserves today's passing = reward-1.0 flow.
+    /// Old windows.jsonl (passing-only) lack this field → default 1.0.
     #[serde(default = "default_reward")]
     pub reward: f32,
-    /// Attempt hit a timeout or harness error — its records are marked
-    /// truncated so the DAPO update filter drops them (not a real fail).
+    /// Timeout/harness error — records marked truncated so the DAPO filter drops them.
     #[serde(default)]
     pub errored: bool,
-    /// Require the dump body's `model` to equal this (the cc harness tags each
-    /// sample's model id) — concurrent samples overlap in time, so wall-clock
-    /// alone would cross-attribute conversations. `None` = time-only (serial).
+    /// Match dump body's `model` — concurrent samples overlap in time.
     #[serde(default)]
     pub model: Option<String>,
 }
@@ -57,33 +52,21 @@ fn default_reward() -> f32 {
     1.0
 }
 
-/// One converted request (or, on the re-render fallback, one attempt): a
-/// verl-style token record plus mask accounting.
 #[derive(Debug, Serialize)]
 pub struct CcRecord {
-    /// `<window label>#r<request seq>` on the per-request path; the window
-    /// label on the fallback. SAO's task key is the prefix before the first
-    /// `#`, so grouping stays at the task level.
+    /// SAO's task key is the prefix before the first `#`.
     pub label: String,
     pub prompt_ids: Vec<u32>,
     pub response_ids: Vec<u32>,
     pub response_mask: Vec<u8>,
-    /// Generation-time behavior logprobs, one per MASKED response token in
-    /// mask order (= `capture_rollout_logprobs` target order) — from the
-    /// serve sidecar's `gen_logprobs`. Empty when the request lacked capture
-    /// (greedy, Metal, pre-P6 serve, re-render fallback).
+    /// One per masked response token, in mask order (= capture_rollout_logprobs target).
     pub gen_logprobs: Vec<f32>,
-    /// Attempt reward carried from the window (SAO advantage input).
     pub reward: f32,
-    /// Attempt timed out or errored — the update filter drops it (budget artifact).
     pub truncated: bool,
     pub masked_tokens: usize,
     pub total_tokens: usize,
 }
 
-/// Convert the dumps under `dump_dir` into JSONL records at `out_path` — one
-/// per sidecar-covered request, grouped by window (no windows = the whole
-/// dir). Returns the records for the caller to log.
 pub fn run_cc_convert(
     dump_dir: &Path,
     tokenizer_path: &Path,
@@ -108,11 +91,6 @@ pub fn run_cc_convert(
     Ok(records)
 }
 
-/// In-memory core: dumps under `dump_dir` → one token record per
-/// sidecar-covered request of each matched window (re-render fallback: one per
-/// window). Unmatched or un-convertible windows are skipped with a note, so
-/// the result may be empty (the cc harness treats an all-failed group as
-/// trainable-empty, not fatal — the CLI wrapper above enforces non-empty).
 pub fn convert_cc_dumps(
     dump_dir: &Path,
     tokenizer: &tokenizers::Tokenizer,
@@ -148,12 +126,9 @@ pub fn convert_cc_dumps(
             );
             continue;
         }
-        // Primary path — one token-exact record per sidecar-covered request.
-        // Earlier turns' gen tokens also recur inside later requests' prompts
-        // (masked 0 there), so each turn is supervised exactly once — its own
-        // record. The shared conversation prefix IS forwarded once per record
-        // at train time (accepted compute cost for correctness; provable
-        // prefix merging is the future optimization, cf. Polar).
+        // One record per sidecar-covered request. Earlier turns' gen tokens
+        // recur inside later requests' prompts (masked 0), so each turn is
+        // supervised exactly once — its own record.
         let before = records.len();
         for (seq, (_, path)) in matched.iter().enumerate() {
             if let Some(sidecar) = read_tokens_sidecar(path) {
@@ -177,11 +152,8 @@ pub fn convert_cc_dumps(
             }
             continue;
         }
-        // Fallback (NO sidecars): re-render the session-final request = the
-        // dump with the LARGEST `messages` array (each CC turn resends the
-        // whole conversation). A single un-convertible window (e.g. a failed
-        // rollout with no assistant turn — SAO keeps failing attempts) must
-        // not abort the whole round's records; skip it and keep the rest.
+        // No sidecars: re-render the session-final request = the dump with the
+        // largest `messages` array (each CC turn resends the whole conversation).
         let final_idx = (0..matched.len())
             .max_by_key(|&i| messages_len(&matched[i].0))
             .expect("matched is non-empty");
@@ -200,8 +172,6 @@ pub fn convert_cc_dumps(
     Ok(records)
 }
 
-/// One request's sidecar → one record: prompt = engine prompt tokens (mask 0),
-/// response = engine gen tokens (mask 1) — token-exact by construction.
 fn request_record(
     label: &str,
     reward: f32,
@@ -226,10 +196,9 @@ fn request_record(
     }
 }
 
-/// Newest dump's prompt-portion tokens (everything before the first assistant
-/// supervised byte; the whole render when no assistant turn yet). Feeds the
-/// post-merge prefix warm-up: one max_tokens=1 prefill re-populates the shared
-/// cc prefix the LoRA re-merge's cache flush dropped. `None` = no dump yet.
+/// Newest dump's prompt tokens (before the first assistant supervised byte).
+/// Feeds the post-merge prefix warm-up: re-populate the shared cc prefix the
+/// LoRA re-merge's cache flush dropped. `None` = no dump yet.
 pub fn newest_dump_prompt_ids(
     dump_dir: &Path,
     tokenizer: &tokenizers::Tokenizer,
@@ -237,8 +206,7 @@ pub fn newest_dump_prompt_ids(
     let Some((_, path)) = list_dumps(dump_dir)?.into_iter().next_back() else {
         return Ok(None);
     };
-    // Serve-written sidecar first: the exact prompt tokens the serve rendered
-    // (token-exact for any chat template); ChatML re-render as fallback.
+    // Serve-written sidecar first (token-exact); ChatML re-render as fallback.
     if let Some(sidecar) = read_tokens_sidecar(&path) {
         return Ok(Some(sidecar.prompt_token_ids));
     }
@@ -260,12 +228,11 @@ pub fn newest_dump_prompt_ids(
     Ok((prompt_len > 0).then(|| ids[..prompt_len].to_vec()))
 }
 
-/// `<epoch_ms>_<seq>.json` files under `dir`, keyed by their epoch prefix.
 fn list_dumps(dir: &Path) -> Result<Vec<(u64, PathBuf)>> {
     let mut dumps = Vec::new();
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
-        // Both callers already treat "no dumps" as a skipped conversion.
+        // Callers treat "no dumps" as a skipped conversion.
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(dumps),
         Err(e) => {
             return Err(e).with_context(|| format!("read dump dir {}", dir.display()));
@@ -296,7 +263,6 @@ fn list_dumps(dir: &Path) -> Result<Vec<(u64, PathBuf)>> {
     Ok(dumps)
 }
 
-/// A window's model-matching dumps in epoch order: `(body, path)`.
 fn dumps_in_window(
     dumps: &[(u64, PathBuf)],
     window: &CcWindow,
@@ -321,8 +287,6 @@ fn read_json(path: &Path) -> Result<serde_json::Value> {
 }
 
 /// Dump body → serve-identical chat request → span-carrying ChatML render.
-/// No generation prompt: this is a supervision record, not an inference
-/// prompt, and the last turn of the fullest request is user/tool anyway.
 fn render_dump(body: serde_json::Value) -> Result<chat::RenderedChatMl> {
     let chat_request = infer_server::messages_body_to_chat_request(body)
         .context("map /v1/messages body onto the chat request")?;
@@ -332,7 +296,6 @@ fn render_dump(body: serde_json::Value) -> Result<chat::RenderedChatMl> {
     Ok(chat::render_structured_chatml_with_spans(&messages, false))
 }
 
-/// Non-empty supervised byte ranges (the assistant turns) of a render.
 fn supervised_spans(rendered: &chat::RenderedChatMl) -> Vec<Range<usize>> {
     rendered
         .spans
@@ -348,8 +311,7 @@ fn messages_len(body: &serde_json::Value) -> usize {
         .map_or(0, Vec::len)
 }
 
-/// Parse `<dump>.tokens.json` when present and usable (non-empty prompt+gen);
-/// anything else falls back to the re-render path.
+/// Parse `<dump>.tokens.json`; non-empty prompt+gen required, else fallback.
 fn read_tokens_sidecar(dump_path: &Path) -> Option<infer_server::TokensSidecar> {
     let path = infer_server::tokens_sidecar_path(dump_path);
     let raw = fs::read_to_string(&path).ok()?;
@@ -366,8 +328,6 @@ fn read_tokens_sidecar(dump_path: &Path) -> Option<infer_server::TokensSidecar> 
     }
 }
 
-/// Split at the first supervised token: everything before is prompt, the rest
-/// is the (masked) response.
 fn split_record(
     label: &str,
     reward: f32,
@@ -389,8 +349,6 @@ fn split_record(
     }
 }
 
-/// One dump body → one token record: serve-identical request mapping, ChatML
-/// render with spans, tokenize with byte offsets, assistant-span mask.
 fn convert_body(
     label: &str,
     reward: f32,
@@ -411,7 +369,6 @@ fn convert_body(
     let ids = encoding.get_ids();
     let offsets = encoding.get_offsets();
     ensure!(!ids.is_empty(), "rendered prompt tokenized to zero tokens");
-    // Sanity: offsets must cover the rendered prompt (byte offsets contract).
     let last_end = offsets.last().map_or(0, |&(_, end)| end);
     ensure!(
         last_end <= rendered.prompt.len(),
@@ -439,8 +396,6 @@ fn convert_body(
     ))
 }
 
-/// Map the serve's OpenAI-shaped message onto the `chat` crate's structured
-/// message (the shape the span renderer supervises).
 fn to_chat_message(message: &infer_server::ChatMessage) -> chat::ChatMessage {
     chat::ChatMessage {
         role: chat::ChatRole::from(message.role.as_str()),
@@ -449,7 +404,7 @@ fn to_chat_message(message: &infer_server::ChatMessage) -> chat::ChatMessage {
             .tool_calls
             .iter()
             .map(|call| {
-                // HF-convention arguments mapping; unparseable falls back raw.
+                // HF-convention arguments; unparseable falls back raw.
                 let arguments = serde_json::from_str(&call.function.arguments)
                     .unwrap_or_else(|_| serde_json::Value::String(call.function.arguments.clone()));
                 chat::ToolCall::new(&call.function.name, arguments)
@@ -458,8 +413,7 @@ fn to_chat_message(message: &infer_server::ChatMessage) -> chat::ChatMessage {
     }
 }
 
-/// Byte spans → per-token mask: a token is supervised (1) iff its byte range
-/// overlaps any supervised span.
+/// Token is supervised (1) iff its byte range overlaps any supervised span.
 fn mask_from_offsets(offsets: &[(usize, usize)], supervised: &[Range<usize>]) -> Vec<u8> {
     offsets
         .iter()
