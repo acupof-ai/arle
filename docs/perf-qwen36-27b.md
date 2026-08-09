@@ -1353,18 +1353,36 @@ the second ranks it. And **reconcile a capture window against run totals before
 quoting a share** — the anchor capture undersampled decode 2–6× by landing in a
 queueing ramp.
 
-Execute in this order:
+Execute one tranche at a time. A tranche advances only after its stated gate.
 
-| priority | measurement | decision it unlocks |
-|---:|---|---|
-| 1 | full-run anchor phase counters or timeline: issued prefill segments, decode ticks, rows, accepted tokens, GPU busy, and queue depth | run-level shares and a closed prediction for the next treatment |
-| 2 | prefix-sidecar write count and restore-hit count on the same run | retain, reduce, or delete the 83 GB write path |
-| 3 | `ncu` on `fq_fwd` at the traced 2048-token shape | test `block_DV=32` only if wave occupancy or dependency stalls bind |
-| 4 | post-fix decode-shaped `nsys`, then sampled-row A/B with `accept_rate` and seeded-row counts | locate the missing 43% of the draft-attention prediction; isolate the sampling gate |
-| 5 | one `ncu` profile per tail row, descending by observed time: `conv1d`, `silu_mul`, `split2`, then norms/prep | choose a row-specific vectorization or fusion; no batch port of `pack_quantize` |
+| tranche | exact work | required artifact | advance gate |
+|---:|---|---|---|
+| **0. Re-anchor** | current HEAD, 1×H20 GPU 1, shipped DSpark defaults, canonical 32K × 8-turn dataset | runner JSON/CSV, serve log, start/end `/v1/stats`, build identity, concurrent needle output | 128/128 complete at every `c=1,2,4,8,16`, zero errors/empty outputs, prompt p50 within ±10%, c=2/8/16 concurrent needle ×3 clean |
+| **1. Close the run model** | run the same sweep with `ARLE_STEP_PHASE=1`; reconcile wall, forward-busy time, prefill tokens, generated tokens, steps, rows, accepted tokens, prefix hits, and queue depth | one full-run ledger whose terms and overlap rules are explicit | ≥95% of measured GPU-busy time assigned; request and token counts equal the runner artifact |
+| **2. Price the prefix sidecar** | derive writes/read bytes from tier I/O counters and restores from prefix hits; add a temporary same-binary write-policy toggle only if current counters cannot isolate the sidecar | restore hits, restored tokens, useful read/write bytes, serialization time, matched on/off wall A/B | retain only when saved prefill wall exceeds write + restore wall; otherwise reduce periodic writes or delete them |
+| **3. Measure `fq_fwd`** | `ncu` at the traced `Q=2048`, 48-head, 96-CTA shape; inspect wave occupancy, long-scoreboard/dependency stalls, and instruction issue | raw `ncu` report plus a pinned `block_DV=64/32` kernel A/B if the stall split supports it | kernel win, correct output, then positive canonical wall A/B; otherwise close the lever |
+| **4. Close decode residuals** | post-slot-batching decode-shaped c=16 `nsys`; then sampled-row A/B with seeded-row counts and `accept_rate` | tick partition, >1 ms gap owners, draft/verify lines, sampled gate reachability | explain the missing 43% of the draft-attention prediction before another decode edit |
+| **5. Profile the tail individually** | `conv1d`, `silu_mul`, `split2`, then norms/prep at their traced shapes | one `ncu` report per kernel, ordered by observed full-run contribution | implement only a named instruction, traffic, or launch reduction; the `pack_quantize` repair is not a template |
 
-The first two items rank wall-clock work. Items 3–5 rank kernel work after the
-run-level denominator is known.
+Tranche 0 uses the existing commands:
+
+```bash
+python3 scripts/gen_bench_prompts.py bench-agent-32k-16x8.jsonl 16 32000 214 8
+python3 scripts/needle_concurrent.py 8000 2 8000 3
+python3 scripts/needle_concurrent.py 8000 8 8000 3
+python3 scripts/needle_concurrent.py 8000 16 8000 3
+python3 scripts/bench_throughput.py --url http://127.0.0.1:8000 \
+  --model ThinkingCap-Qwen3.6-27B-FP8 \
+  --prompts-jsonl bench-agent-32k-16x8.jsonl \
+  --concurrency-grid 1,2,4,8,16 --requests-per-concurrency 128 \
+  --max-tokens 214 --temperature 0 --seed 20260416 \
+  --timeout-seconds 900 --output bench-output/<label>/bench
+```
+
+The 119K experiment in `2026-08-09-27b-dspark-vs-baseline.md` cannot re-anchor
+this row: it disabled prefix caching, completed 5 baseline requests and 1 DSpark
+request, recorded 15 DSpark errors, and exhausted KV at c≥8. Its throughput and
+TTFT ratios are hypotheses pending a complete matched run.
 
 **Decode** — priced on §2.0, the decode-shaped c=16 capture.
 
