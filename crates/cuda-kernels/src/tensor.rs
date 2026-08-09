@@ -3477,12 +3477,11 @@ impl DeviceMatrix {
                 || self.marlin_packed.is_some())
     }
 
-    /// Whether this matrix is plain BF16 with no packed side buffers.
+    /// Whether this matrix's active weight format is dense BF16 (the forward
+    /// path reads from `data`). Retired FP8/qweight buffers may still be present
+    /// (kept alive for the share-frozen-base student alias); they are not used.
     pub fn is_dense_bf16(&self) -> bool {
         self.weight_format == WeightFormat::DenseBf16
-            && self.qweight.is_none()
-            && self.qweight_u8.is_none()
-            && self.tq_packed.is_none()
     }
 
     #[must_use]

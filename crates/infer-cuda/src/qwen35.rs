@@ -2638,20 +2638,11 @@ pub(crate) struct Qwen35Model {
     /// weight buffers are 1-element placeholders in that state and must NOT be
     /// forwarded through until reloaded.
     offloaded: Option<Box<OffloadedWeights>>,
-    /// Pristine *device* copy of each dense-BF16 base weight, captured on the
-    /// first touch (device→device clone of the resident matrix, after any
-    /// FP8→BF16 promotion). The per-step re-merge then runs entirely on-device:
-    /// upload the tiny A/B, GEMM `B·A`, scaled-add `W = base + scale·(B·A)`
-    /// straight into the resident matrix — no host triple-loop, no full-W
-    /// host→device upload.
-    lora_base_dev: HashMap<LoraBaseKey, DeviceVec>,
-    /// FP8 side buffers retired by [`Qwen35Model::promote_lora_target_to_bf16`]
-    /// whose device pointers may still be aliased by a co-resident autograd
-    /// student (`--share-frozen-base` imports NON-OWNING views of the pointers
-    /// exported by [`Qwen35Model::frozen_base_fp8_pointers`]). Kept alive so the
-    /// student keeps reading the pristine FP8 base; never exported → freed on
-    /// promotion instead.
-    lora_promoted_fp8_keepalive: Vec<(CudaSlice<u8>, CudaSlice<f32>)>,
+    /// FP8 qweight/scales are kept in each `DeviceMatrix` after FP8→BF16
+    /// promotion (see `promote_lora_target_to_bf16`): the share-frozen-base
+    /// student aliases these device pointers, and the per-step LoRA merge
+    /// dequantizes them on the fly to recover the pristine BF16 base — no
+    /// separate BF16 base cache, saving ~2×base bytes during the 27B sync.
     /// Latched by [`Qwen35Model::frozen_base_fp8_pointers`]: resident FP8 base
     /// pointers have been exported for train-infer weight sharing.
     frozen_base_ptrs_exported: AtomicBool,
@@ -2662,6 +2653,11 @@ pub(crate) struct Qwen35Model {
     /// LoRA delta. Lets all-zero adapter steps skip weight uploads unless they
     /// need to restore a previously merged projection back to base.
     lora_dirty: HashSet<LoraBaseKey>,
+    /// Pristine BF16 base for projections whose resident matrix is NOT FP8
+    /// (e.g. linear-attn `in_proj_ba`). FP8 projections recover their base by
+    /// dequantizing the kept-alive FP8 qweight/scales, so they are not cached
+    /// here. Only small BF16 projections use this cache — no OOM risk.
+    lora_base_dev: HashMap<LoraBaseKey, DeviceVec>,
     /// Cheap model/weights-version tag (hash of the checkpoint's safetensors
     /// file names + lengths + mtimes). Stamps the durable KV-recall manifest so
     /// a restart after an OPD weight update (which rewrites the checkpoint, so
@@ -3665,11 +3661,10 @@ impl Qwen35Model {
             mtp,
             spec_draft_tokens,
             offloaded: None,
-            lora_base_dev: HashMap::new(),
-            lora_promoted_fp8_keepalive: Vec::new(),
             frozen_base_ptrs_exported: AtomicBool::new(false),
             lora_delta_scratch: None,
             lora_dirty: HashSet::new(),
+            lora_base_dev: HashMap::new(),
             weights_epoch: kv_native_sys::weights_epoch_tag(model_path),
         })
     }
@@ -5586,18 +5581,16 @@ impl Qwen35Model {
             })?;
         }
         // Success — swap the resident storage to dense BF16 (infallible).
-        let retired = (matrix.qweight_u8.take(), matrix.scale_f32.take());
+        // Keep the retired FP8 qweight/scales (and block-scale metadata) in the
+        // matrix: the share-frozen-base student aliases these device pointers,
+        // and the per-step LoRA merge dequantizes them on the fly to recover the
+        // pristine BF16 base — avoiding a separate ~2×base BF16 base cache that
+        // would OOM the 27B sync (FP8 keepalive + BF16 matrix + BF16 base cache
+        // ≈ 3× base bytes). The FP8 buffers are never freed here (the student
+        // owns the alias lifetime); the matrix's `weight_format = DenseBf16`
+        // keeps the forward path on `data`.
         matrix.data = dense;
         matrix.weight_format = WeightFormat::DenseBf16;
-        matrix.quant_scale_rows = 0;
-        matrix.quant_scale_cols = 0;
-        matrix.quant_block_m = 0;
-        matrix.quant_block_k = 0;
-        if self.frozen_base_ptrs_exported.load(Ordering::Relaxed)
-            && let (Some(qweight), Some(scales)) = retired
-        {
-            self.lora_promoted_fp8_keepalive.push((qweight, scales));
-        }
         Ok(())
     }
 
@@ -5705,9 +5698,12 @@ impl Qwen35Model {
         self.merge_lora_proj_device(layer_idx, projection, adapter, scale, &key)
     }
 
-    /// On-device dense-BF16 LoRA merge. Caches the pristine base on-device on
-    /// first touch, then per step uploads the tiny A/B, runs `B·A` on the GPU,
-    /// and folds `W = base + scale·(B·A)` straight into the resident matrix.
+    /// On-device dense-BF16 LoRA merge. The pristine base is recovered on the
+    /// fly by dequantizing the FP8 qweight/scales kept in the matrix (kept alive
+    /// for the share-frozen-base student alias), so no separate BF16 base cache
+    /// is needed — saves ~2×base bytes during the 27B sync. Per step: upload
+    /// A/B, run `B·A` on the GPU, dequant FP8→resident `data`, then fold
+    /// `W += scale·(B·A)` into the resident matrix's row window.
     fn merge_lora_proj_device(
         &mut self,
         layer_idx: usize,
@@ -5721,11 +5717,6 @@ impl Qwen35Model {
         let cols = adapter.in_features;
         let rank = adapter.rank;
 
-        // Pristine device base (device→device clone of the resident matrix on
-        // first touch — runs before any merge mutates the weight). Row-fused
-        // targets share one base under the canonical cache key.
-        let cache_key = Self::lora_base_cache_key(layer_idx, projection);
-        self.ensure_lora_base_dev_cached(layer_idx, projection, &cache_key)?;
         let (row_offset, _) = self.lora_row_window(layer_idx, projection, rows);
 
         // Tiny host→device uploads. `a_t` is A transposed to [cols, rank]
@@ -5771,15 +5762,85 @@ impl Qwen35Model {
             )?;
         }
 
-        // Clone the (cheap, Arc-backed) device handles for the pristine base and
-        // the delta scratch before taking the mutable target borrow — sidesteps
-        // the whole-`self` borrow `lora_weight_target_mut` requires.
-        let base_data = self
-            .lora_base_dev
-            .get(&cache_key)
-            .ok_or_else(|| anyhow!("layer {layer_idx} {label}: device base not cached"))?
-            .data
-            .clone();
+        // Recover the pristine base into the resident matrix's row window.
+        // FP8-stored targets dequantize their kept-alive qweight/scales on the
+        // fly (no BF16 base cache). Native-BF16 targets (e.g. linear-attn
+        // `in_proj_ba`) already hold their base in `data`; we cache that row
+        // window once (before the first merge) so the all-zero-adapter restore
+        // path can put it back.
+        let window = row_offset * cols..row_offset * cols + needed;
+        {
+            let matrix = self.lora_matrix(layer_idx, projection)?;
+            ensure!(
+                matrix.is_dense_bf16() && row_offset + rows <= matrix.rows && matrix.cols == cols,
+                "layer {layer_idx} {label}: dense device merge shape/format mismatch \
+                 ({}x{} {:?} vs window [{row_offset}..{}]x{cols})",
+                matrix.rows,
+                matrix.cols,
+                matrix.weight_format(),
+                row_offset + rows
+            );
+            let cache_key = Self::lora_base_cache_key(layer_idx, projection);
+            if matrix.qweight_u8.is_some() {
+                // FP8 base: dequant the full matrix into scratch, then copy the
+                // row window into `data`.
+                let qweight = matrix.qweight_u8.as_ref().ok_or_else(|| {
+                    anyhow!("layer {layer_idx} {label}: FP8 base missing qweight for merge")
+                })?;
+                let scales = matrix.scale_f32.as_ref().ok_or_else(|| {
+                    anyhow!("layer {layer_idx} {label}: FP8 base missing f32 scales for merge")
+                })?;
+                let mut base_scratch = DeviceVec::zeros(&ctx, matrix.rows * matrix.cols)?;
+                {
+                    let (qw_ptr, _gq) = qweight.device_ptr(&ctx.stream);
+                    let (scale_ptr, _gs) = scales.device_ptr(&ctx.stream);
+                    let (dst_ptr, _gd) = base_scratch.data.device_ptr_mut(&ctx.stream);
+                    // SAFETY: ptrs from live device allocations sized to the dims passed.
+                    unsafe {
+                        ffi::dequantize_fp8_block_scaled_to_bf16_cuda(
+                            qw_ptr as *const u8,
+                            scale_ptr as *const f32,
+                            dst_ptr as *mut ffi::Half,
+                            matrix.rows as i32,
+                            matrix.cols as i32,
+                            matrix.quant_scale_rows as i32,
+                            matrix.quant_scale_cols as i32,
+                            matrix.quant_block_m as i32,
+                            matrix.quant_block_k as i32,
+                            ctx.stream.cu_stream(),
+                        )
+                    }
+                    .result()
+                    .map_err(|e| {
+                        anyhow!(
+                            "layer {layer_idx} {label}: FP8→BF16 base dequant for merge failed: {e}"
+                        )
+                    })?;
+                }
+                let src = base_scratch.data.slice(window.clone());
+                let matrix = self.lora_matrix_mut(layer_idx, projection)?;
+                let mut dst = matrix.data.slice_mut(window.clone());
+                ctx.stream.memcpy_dtod(&src, &mut dst).map_err(|e| {
+                    anyhow!("layer {layer_idx} {label}: base window D2D copy failed: {e}")
+                })?;
+            } else if !self.lora_base_dev.contains_key(&cache_key) {
+                // Native-BF16 base: cache the row window once (before the first
+                // merge) so restore can put it back. `data` already holds the
+                // pristine base at this point.
+                let mut cache = DeviceVec::zeros(&ctx, needed)?;
+                {
+                    let matrix = self.lora_matrix(layer_idx, projection)?;
+                    let src = matrix.data.slice(window.clone());
+                    let mut dst = cache.data.slice_mut(0..needed);
+                    ctx.stream.memcpy_dtod(&src, &mut dst).map_err(|e| {
+                        anyhow!("layer {layer_idx} {label}: BF16 base cache D2D copy failed: {e}")
+                    })?;
+                }
+                self.lora_base_dev.insert(cache_key, cache);
+            }
+        }
+
+        // Fold `W[row_window] += scale·(B·A)` in place.
         let delta_data = self
             .lora_delta_scratch
             .as_ref()
@@ -5787,64 +5848,35 @@ impl Qwen35Model {
             .data
             .clone();
         let delta_view = delta_data.slice(0..needed);
-
-        let matrix = self.lora_matrix_mut(layer_idx, projection)?;
-        ensure!(
-            matrix.is_dense_bf16() && row_offset + rows <= matrix.rows && matrix.cols == cols,
-            "layer {layer_idx} {label}: dense device merge shape/format mismatch \
-             ({}x{} {:?} vs window [{row_offset}..{}]x{cols})",
-            matrix.rows,
-            matrix.cols,
-            matrix.weight_format(),
-            row_offset + rows
-        );
-        let window = row_offset * cols..row_offset * cols + needed;
-        let base_view = base_data.slice(window.clone());
-        let mut out_view = matrix.data.slice_mut(window);
-        crate::ops::lora_scaled_add_into(
-            &ctx,
-            &base_view,
-            &delta_view,
-            &mut out_view,
-            needed,
-            scale,
-        )?;
+        {
+            let matrix = self.lora_matrix_mut(layer_idx, projection)?;
+            let mut out_view = matrix.data.slice_mut(window);
+            let (delta_ptr, _gd) = delta_view.device_ptr(&ctx.stream);
+            let (out_ptr, _go) = out_view.device_ptr_mut(&ctx.stream);
+            // SAFETY: ptrs from live device allocations sized to `needed`.
+            unsafe {
+                ffi::add_scaled_row_cuda(
+                    delta_ptr as *const ffi::Half,
+                    out_ptr as *mut ffi::Half,
+                    needed as i32,
+                    0,
+                    scale,
+                    ctx.stream.cu_stream(),
+                )
+            }
+            .result()
+            .map_err(|e| anyhow!("layer {layer_idx} {label}: LoRA scaled add failed: {e}"))?;
+        }
 
         self.lora_dirty.insert(*key);
         Ok(())
     }
 
-    /// Capture a pristine *device* copy of one dense-BF16 base weight on first
-    /// touch (device→device clone of the resident matrix).
-    fn ensure_lora_base_dev_cached(
-        &mut self,
-        layer_idx: usize,
-        projection: StudentLoraProjection,
-        key: &LoraBaseKey,
-    ) -> Result<()> {
-        if self.lora_base_dev.contains_key(key) {
-            return Ok(());
-        }
-        let label = projection.label();
-        let matrix = self.lora_matrix(layer_idx, projection)?;
-        ensure!(
-            matrix.is_dense_bf16(),
-            "layer {layer_idx} {label}: device base cache requires dense BF16; got {:?}",
-            matrix.weight_format()
-        );
-        let mut base = DeviceVec::zeros(&self.ctx, matrix.rows * matrix.cols)?;
-        self.ctx
-            .stream
-            .memcpy_dtod(&matrix.data, &mut base.data)
-            .map_err(|e| anyhow!("layer {layer_idx} {label}: device base D2D clone failed: {e}"))?;
-        self.lora_base_dev.insert(*key, base);
-        Ok(())
-    }
-
-    /// Restore a dense projection's resident matrix from its pristine device
-    /// base (device→device copy; no host round-trip). Only the projection's
-    /// own row window is restored, so the other half of a row-fused matrix
-    /// keeps its (possibly merged) state.
+    /// Restore a dense projection's resident matrix from its pristine base.
+    /// FP8 targets dequantize their kept-alive qweight/scales; native-BF16
+    /// targets copy from the one-shot row-window cache captured at first merge.
+    /// Only the projection's own row window is restored, so the other half of a
+    /// row-fused matrix keeps its (possibly merged) state.
     fn restore_lora_base_dev(
         &mut self,
         layer_idx: usize,
@@ -5853,25 +5885,78 @@ impl Qwen35Model {
     ) -> Result<()> {
         let label = projection.label();
         let ctx = self.ctx.clone();
-        let base_dev = self
-            .lora_base_dev
-            .get(key)
-            .ok_or_else(|| {
-                anyhow!("layer {layer_idx} {label}: device base not cached for restore")
-            })?
-            .data
-            .clone();
         let matrix_rows = self.lora_matrix(layer_idx, projection)?.rows;
-        // The base always spans the full (possibly fused) matrix; the window is
-        // the whole buffer whenever this projection is the sole occupant.
         let (row_offset, rows) = self.lora_row_window(layer_idx, projection, matrix_rows);
-        let matrix = self.lora_matrix_mut(layer_idx, projection)?;
-        let window = row_offset * matrix.cols..(row_offset + rows) * matrix.cols;
-        let src = base_dev.slice(window.clone());
-        let mut dst = matrix.data.slice_mut(window);
-        ctx.stream.memcpy_dtod(&src, &mut dst).map_err(|e| {
-            anyhow!("layer {layer_idx} {label}: device base restore D2D failed: {e}")
-        })?;
+        let matrix = self.lora_matrix(layer_idx, projection)?;
+        ensure!(
+            matrix.is_dense_bf16(),
+            "layer {layer_idx} {label}: restore requires dense BF16; got {:?}",
+            matrix.weight_format()
+        );
+        let cols = matrix.cols;
+        let window = row_offset * cols..(row_offset + rows) * cols;
+        if matrix.qweight_u8.is_some() {
+            // FP8 base: dequant the full matrix into scratch, then copy the row
+            // window back into `data`.
+            let qweight = matrix.qweight_u8.as_ref().ok_or_else(|| {
+                anyhow!("layer {layer_idx} {label}: FP8 base missing qweight for restore")
+            })?;
+            let scales = matrix.scale_f32.as_ref().ok_or_else(|| {
+                anyhow!("layer {layer_idx} {label}: FP8 base missing f32 scales for restore")
+            })?;
+            let mut scratch = DeviceVec::zeros(&ctx, matrix.rows * matrix.cols)?;
+            {
+                let (qw_ptr, _gq) = qweight.device_ptr(&ctx.stream);
+                let (scale_ptr, _gs) = scales.device_ptr(&ctx.stream);
+                let (dst_ptr, _gd) = scratch.data.device_ptr_mut(&ctx.stream);
+                // SAFETY: ptrs from live device allocations sized to the dims passed.
+                unsafe {
+                    ffi::dequantize_fp8_block_scaled_to_bf16_cuda(
+                        qw_ptr as *const u8,
+                        scale_ptr as *const f32,
+                        dst_ptr as *mut ffi::Half,
+                        matrix.rows as i32,
+                        matrix.cols as i32,
+                        matrix.quant_scale_rows as i32,
+                        matrix.quant_scale_cols as i32,
+                        matrix.quant_block_m as i32,
+                        matrix.quant_block_k as i32,
+                        ctx.stream.cu_stream(),
+                    )
+                }
+                .result()
+                .map_err(|e| {
+                    anyhow!(
+                        "layer {layer_idx} {label}: FP8→BF16 base dequant for restore failed: {e}"
+                    )
+                })?;
+            }
+            let src = scratch.data.slice(window.clone());
+            let matrix = self.lora_matrix_mut(layer_idx, projection)?;
+            let mut dst = matrix.data.slice_mut(window);
+            ctx.stream.memcpy_dtod(&src, &mut dst).map_err(|e| {
+                anyhow!("layer {layer_idx} {label}: device base restore D2D failed: {e}")
+            })?;
+        } else {
+            // Native-BF16 base: copy the cached row window back into `data`.
+            let cache_data = self
+                .lora_base_dev
+                .get(key)
+                .ok_or_else(|| {
+                    anyhow!(
+                        "layer {layer_idx} {label}: BF16 base cache missing for restore \
+                         (merge never cached it?)"
+                    )
+                })?
+                .data
+                .clone();
+            let src = cache_data.slice(0..rows * cols);
+            let matrix = self.lora_matrix_mut(layer_idx, projection)?;
+            let mut dst = matrix.data.slice_mut(window);
+            ctx.stream.memcpy_dtod(&src, &mut dst).map_err(|e| {
+                anyhow!("layer {layer_idx} {label}: BF16 base restore D2D failed: {e}")
+            })?;
+        }
         Ok(())
     }
 

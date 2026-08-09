@@ -2196,9 +2196,69 @@ fn run_rubric_opd_impl(args: TrainRubricOpdArgs) -> Result<()> {
         // Sync the trained LoRA into the rollout engine (always): the eval below
         // and the next round both need this round's improved student. Round 0
         // sampled from base, as intended.
+        // The writeback's autograd forward+backward leaves activation/gradient
+        // tensors resident in the store; drop everything except the model
+        // parameters (and let the optimizer re-create its states next step) so
+        // the engine-thread LoRA re-merge has headroom.
+        let keep: std::collections::HashSet<_> = all_params.iter().copied().collect();
+        eprintln!("[rubric-opd] before retain_ids: keep={} params", keep.len());
+        store.retain_ids(&keep);
+        // DEBUG: account for device memory held by the store's live parameters.
+        {
+            let mut fp8_bytes = 0usize;
+            let mut bf16_bytes = 0usize;
+            let mut f32_bytes = 0usize;
+            let mut other_bytes = 0usize;
+            for &id in all_params.iter() {
+                if let Some(t) = store.get(id) {
+                    match &t.device_handle {
+                        Some(autograd::DeviceHandle::CudaFp8BlockScaled(_)) => {
+                            fp8_bytes += t.size;
+                        }
+                        Some(autograd::DeviceHandle::CudaBf16(_)) => {
+                            bf16_bytes += t.size * 2;
+                        }
+                        Some(autograd::DeviceHandle::Cuda(_)) => {
+                            f32_bytes += t.size * 4;
+                        }
+                        Some(_) => other_bytes += t.size * 4,
+                        None => {}
+                    }
+                }
+            }
+            eprintln!(
+                "[rubric-opd] store params device bytes: fp8={}MiB bf16={}MiB f32={}MiB other={}MiB",
+                fp8_bytes >> 20,
+                bf16_bytes >> 20,
+                f32_bytes >> 20,
+                other_bytes >> 20
+            );
+        }
+        // The optimizer's AdamW moments (m, v) live as DeviceHandles outside the
+        // store, so retain_ids does not free them. Drop them here — the next
+        // writeback step re-creates them from zero — or the engine-thread LoRA
+        // re-merge OOMs on the ~2×param bytes they hold.
+        optimizer.clear_param_state(&all_params);
+        log_opd_vram("rubric post-retain_ids", &train_backend);
+        if let Err(err) = store.backend().trim_memory_pool() {
+            eprintln!("[rubric-opd] device-pool trim before LoRA sync failed: {err}");
+        }
+        log_opd_vram("rubric post-trim", &train_backend);
+        // The rollout KV pool was re-acquired in run_rubric_rounds' Phase D, but
+        // the LoRA re-merge needs headroom for the per-layer BF16 promotion
+        // (FP8 base stays resident as keepalive for the share-frozen-base
+        // student alias, so peak = FP8 + BF16 ≈ 3× base bytes). The KV pool is
+        // dead during the merge — release it and re-acquire after, symmetric
+        // with the agent-OPD sync_and_restore_engines pattern.
+        if let Err(err) = infer_student.release_kv_pool() {
+            eprintln!("[rubric-opd] release KV pool before LoRA sync failed: {err}");
+        }
         infer_student
             .sync_lora_from_store(&mut store, &student.adapter_name_map(), lora)
             .context("sync trained LoRA into rollout engine")?;
+        if let Err(err) = infer_student.ensure_kv_pool() {
+            eprintln!("[rubric-opd] re-acquire KV pool after LoRA sync failed: {err}");
+        }
 
         // Eval this round's student in-process (rollout engine now holds round-N LoRA).
         if let Some(dir) = eval_dir.as_deref()
