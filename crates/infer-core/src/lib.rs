@@ -161,6 +161,27 @@ pub struct ThroughputStats {
     pub generated_tokens: u64,
     /// Requests that finished after holding a slot.
     pub requests_completed: u64,
+    /// Submit-to-ready wall, split by the submitted plan shape.
+    pub forward_busy_micros: u64,
+    pub prefill_forward_steps: u64,
+    pub prefill_forward_busy_micros: u64,
+    pub decode_forward_steps: u64,
+    pub decode_forward_busy_micros: u64,
+    pub mixed_forward_steps: u64,
+    pub mixed_forward_busy_micros: u64,
+    /// Decode-only host phases. These overlap `forward_busy_micros` at submit.
+    pub decode_step_phase: StepPhaseStats,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StepPhaseStats {
+    pub steps: u64,
+    pub poll_micros: u64,
+    pub apply_output_micros: u64,
+    pub poll_background_micros: u64,
+    pub admit_micros: u64,
+    pub plan_micros: u64,
+    pub submit_micros: u64,
 }
 
 /// Process-global GPU-busy micros: cumulative forward wall (`submit`→`poll` Ready)
@@ -194,6 +215,19 @@ static STEP_PHASE_MICROS: [std::sync::atomic::AtomicU64; 6] = [
 ];
 static STEP_PHASE_STEPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 const STEP_PHASE_NAMES: [&str; 6] = ["poll", "apply_out", "poll_bg", "admit", "plan", "submit"];
+
+fn step_phase_stats() -> StepPhaseStats {
+    let load = |index: usize| STEP_PHASE_MICROS[index].load(std::sync::atomic::Ordering::Relaxed);
+    StepPhaseStats {
+        steps: STEP_PHASE_STEPS.load(std::sync::atomic::Ordering::Relaxed),
+        poll_micros: load(0),
+        apply_output_micros: load(1),
+        poll_background_micros: load(2),
+        admit_micros: load(3),
+        plan_micros: load(4),
+        submit_micros: load(5),
+    }
+}
 
 /// KV host-demoted counters. All zero unless the executor reports nonzero tier capacity.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -751,13 +785,42 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         if let Some(inflight) = self.inflight.take() {
             match self.executor.poll(inflight)? {
                 PollResult::Ready(output) => {
-                    if let Some(submitted_at) = self.inflight_submit_at.take() {
-                        ENGINE_FORWARD_BUSY_MICROS.fetch_add(
-                            submitted_at.elapsed().as_micros() as u64,
-                            std::sync::atomic::Ordering::Relaxed,
-                        );
-                    }
                     let plan = self.pending_plan.take().unwrap_or_else(ForwardPlan::idle);
+                    if let Some(submitted_at) = self.inflight_submit_at.take() {
+                        let busy = submitted_at.elapsed().as_micros() as u64;
+                        ENGINE_FORWARD_BUSY_MICROS
+                            .fetch_add(busy, std::sync::atomic::Ordering::Relaxed);
+                        self.throughput_stats.forward_busy_micros = self
+                            .throughput_stats
+                            .forward_busy_micros
+                            .saturating_add(busy);
+                        let (steps, micros) =
+                            match (plan.prefill_rows.is_empty(), plan.decode_rows.is_empty()) {
+                                (false, true) => {
+                                    let stats = &mut self.throughput_stats;
+                                    (
+                                        &mut stats.prefill_forward_steps,
+                                        &mut stats.prefill_forward_busy_micros,
+                                    )
+                                }
+                                (true, false) => {
+                                    let stats = &mut self.throughput_stats;
+                                    (
+                                        &mut stats.decode_forward_steps,
+                                        &mut stats.decode_forward_busy_micros,
+                                    )
+                                }
+                                _ => {
+                                    let stats = &mut self.throughput_stats;
+                                    (
+                                        &mut stats.mixed_forward_steps,
+                                        &mut stats.mixed_forward_busy_micros,
+                                    )
+                                }
+                            };
+                        *steps = steps.saturating_add(1);
+                        *micros = micros.saturating_add(busy);
+                    }
                     applied_decode_only = plan.prefill_rows.is_empty();
                     phase!(0);
                     self.apply_output(&plan, output)?;
@@ -937,7 +1000,10 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
     /// Return engine throughput counters (steps, tokens, completions).
     #[must_use]
     pub fn throughput_stats(&self) -> ThroughputStats {
-        self.throughput_stats
+        ThroughputStats {
+            decode_step_phase: step_phase_stats(),
+            ..self.throughput_stats
+        }
     }
 
     /// Return KV host-tier counters plus the current tier-resident size.
@@ -5304,6 +5370,18 @@ mod tests {
             stats.steps >= 2,
             "at least one prefill and one decode step, got {}",
             stats.steps
+        );
+        assert!(stats.prefill_forward_steps >= 1);
+        assert!(stats.decode_forward_steps >= 1);
+        assert_eq!(
+            stats.prefill_forward_steps + stats.decode_forward_steps + stats.mixed_forward_steps,
+            stats.steps
+        );
+        assert_eq!(
+            stats.prefill_forward_busy_micros
+                + stats.decode_forward_busy_micros
+                + stats.mixed_forward_busy_micros,
+            stats.forward_busy_micros
         );
         Ok(())
     }

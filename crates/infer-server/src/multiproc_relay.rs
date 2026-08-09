@@ -260,6 +260,34 @@ pub struct WireStats {
     pub throughput_prefill_tokens: u64,
     pub throughput_generated_tokens: u64,
     pub throughput_requests_completed: u64,
+    #[serde(default)]
+    pub throughput_forward_busy_micros: u64,
+    #[serde(default)]
+    pub throughput_prefill_forward_steps: u64,
+    #[serde(default)]
+    pub throughput_prefill_forward_busy_micros: u64,
+    #[serde(default)]
+    pub throughput_decode_forward_steps: u64,
+    #[serde(default)]
+    pub throughput_decode_forward_busy_micros: u64,
+    #[serde(default)]
+    pub throughput_mixed_forward_steps: u64,
+    #[serde(default)]
+    pub throughput_mixed_forward_busy_micros: u64,
+    #[serde(default)]
+    pub throughput_decode_phase_steps: u64,
+    #[serde(default)]
+    pub throughput_decode_phase_poll_micros: u64,
+    #[serde(default)]
+    pub throughput_decode_phase_apply_output_micros: u64,
+    #[serde(default)]
+    pub throughput_decode_phase_poll_background_micros: u64,
+    #[serde(default)]
+    pub throughput_decode_phase_admit_micros: u64,
+    #[serde(default)]
+    pub throughput_decode_phase_plan_micros: u64,
+    #[serde(default)]
+    pub throughput_decode_phase_submit_micros: u64,
     pub prefix_lookups: u64,
     pub prefix_hits: u64,
     pub prefix_hit_tokens: u64,
@@ -335,6 +363,22 @@ impl WireStats {
                 prefill_tokens: self.throughput_prefill_tokens,
                 generated_tokens: self.throughput_generated_tokens,
                 requests_completed: self.throughput_requests_completed,
+                forward_busy_micros: self.throughput_forward_busy_micros,
+                prefill_forward_steps: self.throughput_prefill_forward_steps,
+                prefill_forward_busy_micros: self.throughput_prefill_forward_busy_micros,
+                decode_forward_steps: self.throughput_decode_forward_steps,
+                decode_forward_busy_micros: self.throughput_decode_forward_busy_micros,
+                mixed_forward_steps: self.throughput_mixed_forward_steps,
+                mixed_forward_busy_micros: self.throughput_mixed_forward_busy_micros,
+                decode_step_phase: infer_core::StepPhaseStats {
+                    steps: self.throughput_decode_phase_steps,
+                    poll_micros: self.throughput_decode_phase_poll_micros,
+                    apply_output_micros: self.throughput_decode_phase_apply_output_micros,
+                    poll_background_micros: self.throughput_decode_phase_poll_background_micros,
+                    admit_micros: self.throughput_decode_phase_admit_micros,
+                    plan_micros: self.throughput_decode_phase_plan_micros,
+                    submit_micros: self.throughput_decode_phase_submit_micros,
+                },
             },
             prefix_cache: infer_core::PrefixCacheStats {
                 lookups: self.prefix_lookups,
@@ -407,6 +451,26 @@ impl WireStats {
             throughput_prefill_tokens: c.throughput.prefill_tokens,
             throughput_generated_tokens: c.throughput.generated_tokens,
             throughput_requests_completed: c.throughput.requests_completed,
+            throughput_forward_busy_micros: c.throughput.forward_busy_micros,
+            throughput_prefill_forward_steps: c.throughput.prefill_forward_steps,
+            throughput_prefill_forward_busy_micros: c.throughput.prefill_forward_busy_micros,
+            throughput_decode_forward_steps: c.throughput.decode_forward_steps,
+            throughput_decode_forward_busy_micros: c.throughput.decode_forward_busy_micros,
+            throughput_mixed_forward_steps: c.throughput.mixed_forward_steps,
+            throughput_mixed_forward_busy_micros: c.throughput.mixed_forward_busy_micros,
+            throughput_decode_phase_steps: c.throughput.decode_step_phase.steps,
+            throughput_decode_phase_poll_micros: c.throughput.decode_step_phase.poll_micros,
+            throughput_decode_phase_apply_output_micros: c
+                .throughput
+                .decode_step_phase
+                .apply_output_micros,
+            throughput_decode_phase_poll_background_micros: c
+                .throughput
+                .decode_step_phase
+                .poll_background_micros,
+            throughput_decode_phase_admit_micros: c.throughput.decode_step_phase.admit_micros,
+            throughput_decode_phase_plan_micros: c.throughput.decode_step_phase.plan_micros,
+            throughput_decode_phase_submit_micros: c.throughput.decode_step_phase.submit_micros,
             prefix_lookups: c.prefix_cache.lookups,
             prefix_hits: c.prefix_cache.hits,
             prefix_hit_tokens: c.prefix_cache.hit_tokens,
