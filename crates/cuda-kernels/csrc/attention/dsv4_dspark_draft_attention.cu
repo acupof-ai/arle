@@ -58,7 +58,6 @@ __global__ void dsv4_dspark_draft_attention_kernel(
 
   int q_base = token * local_width + head * head_dim;
 
-  // score[j] = sm_scale * dot(q[row], latent_kv[j]) over the full head_dim.
   for (int key_idx = threadIdx.x; key_idx < kv_len; key_idx += blockDim.x) {
     const uint16_t *k = latent_kv + (size_t)key_idx * head_dim;
     float acc = 0.0f;
@@ -69,7 +68,6 @@ __global__ void dsv4_dspark_draft_attention_kernel(
   }
   __syncthreads();
 
-  // Online softmax over all kv_len keys — non-causal, no sink.
   float local_max = -INFINITY;
   for (int key_idx = threadIdx.x; key_idx < kv_len; key_idx += blockDim.x) {
     local_max = fmaxf(local_max, logits[key_idx]);
@@ -88,7 +86,6 @@ __global__ void dsv4_dspark_draft_attention_kernel(
   if (threadIdx.x == 0) denom_shared = denom;
   __syncthreads();
 
-  // v[col] = sum_j w[j] * latent_kv[j, col] over the full head_dim (Flag #1).
   for (int col = threadIdx.x; col < head_dim; col += blockDim.x) {
     float acc = 0.0f;
     for (int key_idx = 0; key_idx < kv_len; ++key_idx) {

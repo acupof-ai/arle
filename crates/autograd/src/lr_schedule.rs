@@ -66,7 +66,6 @@ impl LrSchedule for LinearWarmup {
         if step >= self.warmup_steps {
             return self.base_lr;
         }
-        // step in [0, warmup_steps): linear 0 -> base_lr.
         let frac = step as f32 / self.warmup_steps as f32;
         self.base_lr * frac
     }
@@ -92,13 +91,12 @@ pub struct CosineWithWarmup {
 
 impl LrSchedule for CosineWithWarmup {
     fn lr(&self, step: u64) -> f32 {
-        // Warmup branch (matches LinearWarmup semantics for warmup_steps > 0).
+        // Matches LinearWarmup semantics.
         if self.warmup_steps > 0 && step < self.warmup_steps {
             let frac = step as f32 / self.warmup_steps as f32;
             return self.base_lr * frac;
         }
 
-        // Post-total clamp.
         if step >= self.total_steps {
             return self.min_lr;
         }

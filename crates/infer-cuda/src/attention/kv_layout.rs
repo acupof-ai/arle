@@ -146,9 +146,6 @@ impl Dsv4CompressorState {
         (pkv, psc, prkv, prsc, comp)
     }
 
-    /// Exact requested device bytes owned by this compressor/indexer state:
-    /// Σ over the four bf16 partial-row buffers + the `compressed` HiddenStates
-    /// + the four fp32 probe carry buffers.
     #[allow(dead_code)]
     pub(crate) fn device_bytes(&self) -> usize {
         let bf16 = std::mem::size_of::<half::bf16>();
@@ -182,11 +179,7 @@ impl Dsv4CompressorState {
         } else {
             compressed_capacity
         };
-        // pending_kv + pending_score (ratio*width each) + prev_overlap_kv +
-        // prev_overlap_score (ratio*head_dim each) + compressed[head_dim, ring_rows].
         let bf16_bytes = (2 * ratio * width + 2 * ratio * head_dim + head_dim * ring_rows) * bf16;
-        // FP32 probe carry: pending_kv + pending_score (ratio*width each) +
-        // prev_kv + prev_score (ratio*head_dim each).
         let f32 = std::mem::size_of::<f32>();
         let fp32_bytes = (2 * ratio * width + 2 * ratio * head_dim) * f32;
         bf16_bytes + fp32_bytes
@@ -227,7 +220,6 @@ impl Dsv4CompressorFp32Scratch {
         2 * max_width * max_seq_len * std::mem::size_of::<f32>()
     }
 
-    /// Exact requested device bytes owned by this ONE model-wide scratch.
     pub(crate) fn device_bytes(&self) -> usize {
         (self.kv_raw.len() + self.score_raw.len()) * std::mem::size_of::<f32>()
     }
@@ -355,7 +347,6 @@ impl Dsv4BlockMap {
         }
     }
 
-    /// Compressed row `r` → `(slot-logical page, in-page row)`.
     pub(crate) fn comp_row(&self, r: usize) -> (usize, usize) {
         (self.sw_blocks + r / self.page_size, r % self.page_size)
     }
@@ -387,7 +378,6 @@ pub(crate) struct Dsv4LayerKvLayout {
     /// Slot-logical FlashMLA blocks per slot (`sw_blocks + comp_blocks` for
     /// this layer's shape) — every slot's MAX block-table length.
     pub(super) flashmla_slot_pages: usize,
-    /// Bytes of one pool page (`page_block_size × packed record bytes`).
     pub(super) flashmla_page_bytes: usize,
     /// Demand-paged band (#154 Phase 3b, `dsv4_flashmla_demand_paged`): comp
     /// pages come from the pool free list as the sequence grows; false = the
@@ -601,7 +591,6 @@ pub(crate) struct Dsv4KvBatchRowView {
     pub(crate) slot_page_range: std::ops::Range<usize>,
 }
 
-/// Split borrow: one layer's KV layout + shared DSA / FlashMLA / per-layer MLA decode scratch.
 pub(crate) type LayerFlashMlaAndMlaDecode<'a> = (
     &'a mut Dsv4LayerKvLayout,
     Option<&'a mut Dsv4DsaSharedScratch>,
@@ -992,7 +981,6 @@ impl Dsv4KvAdapter {
         ))
     }
 
-    /// Whether the model-wide batched FlashMLA decode scratch is allocated.
     pub(crate) fn has_flashmla_batch_scratch(&self) -> bool {
         self.flashmla_batch.is_some()
     }
@@ -1230,7 +1218,6 @@ impl Dsv4KvAdapter {
         std::mem::take(&mut self.device_table_dirty[slot])
     }
 
-    /// Free a slot's FlashMLA band across all layers.
     pub(crate) fn flashmla_free_slot(&mut self, slot: usize) -> Result<()> {
         for layer in &mut self.layers {
             layer.flashmla_free_slot(slot)?;

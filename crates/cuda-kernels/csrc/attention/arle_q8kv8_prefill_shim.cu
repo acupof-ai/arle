@@ -97,4 +97,4 @@ cudaError_t arle_q8kv8_sparse_prefill_fwd(
   return cudaSuccess;
 }
 
-}  // extern "C"
+}

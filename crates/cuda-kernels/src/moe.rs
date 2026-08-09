@@ -1369,7 +1369,6 @@ pub unsafe fn qwen36_renorm_topk_weights(
     Ok(())
 }
 
-// ── DSv4 FP8 DeepGEMM MoE pipeline (f8f8bf16, 128-block scale) ─────────────
 // The 5-call native DeepGEMM expert path: pack/quantize the packed grouped
 // hidden to FP8 → masked grouped GEMM (w13 fused gate+up) → SwiGLU+requant →
 // masked grouped GEMM (w2 down) → unpad the padded grouped output back to
@@ -2198,9 +2197,9 @@ mod w4a16_tests {
                 let nibble = NIBBLES[(row + k) % NIBBLES.len()];
                 let byte = &mut packed[row * (K / 2) + k / 2];
                 if k % 2 == 0 {
-                    *byte = nibble; // lo nibble
+                    *byte = nibble;
                 } else {
-                    *byte |= nibble << 4; // hi nibble
+                    *byte |= nibble << 4;
                 }
             }
             for g in 0..num_groups {
