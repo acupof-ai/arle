@@ -105,10 +105,9 @@ fn read_frame<R: Read>(r: &mut R) -> std::io::Result<Vec<u8>> {
     Ok(buf)
 }
 
-/// Run the spawner server loop on the socket named by `ARLE_SPAWNER_LISTEN`.
-/// Called from the `arle` entry point when that env is set; never returns under
-/// normal operation (loops until the listener errors or the parent exits and the
-/// socket is removed). Returns the process exit code.
+/// Called from the `arle` entry point when `ARLE_SPAWNER_LISTEN` is set; never
+/// returns under normal operation (loops until the listener errors or the
+/// parent exits and the socket is removed). Returns the process exit code.
 pub fn serve_loop() -> i32 {
     let sock = match std::env::var(LISTEN_ENV) {
         Ok(s) => s,
@@ -143,8 +142,6 @@ pub fn serve_loop() -> i32 {
     0
 }
 
-/// Serve one connection: one request → one response. (The client opens a fresh
-/// connection per spawn, so a single request per conn keeps the loop trivial.)
 fn handle_conn(mut stream: UnixStream) {
     let req_bytes = match read_frame(&mut stream) {
         Ok(b) => b,
@@ -163,10 +160,9 @@ fn handle_conn(mut stream: UnixStream) {
     }
 }
 
-/// Execute a [`SpawnRequest`] in the (non-CUDA) helper. The `combined_timeout`
-/// path replicates `sandbox::run_captured` — `setsid`-wrapped, combined output to
-/// a temp file, process-group kill on timeout. The plain path replicates
-/// `Command::output()`.
+/// The `combined_timeout` path replicates `sandbox::run_captured` —
+/// `setsid`-wrapped, combined output to a temp file, process-group kill on
+/// timeout. The plain path replicates `Command::output()`.
 fn run_request(req: &SpawnRequest) -> SpawnResponse {
     if req.combined_timeout {
         match run_captured(req) {
@@ -202,7 +198,6 @@ fn run_request(req: &SpawnRequest) -> SpawnResponse {
     }
 }
 
-/// Build the bare `Command` (program/args/cwd/env) WITHOUT the setsid wrap.
 fn build_command(req: &SpawnRequest) -> Command {
     let mut cmd = Command::new(&req.program);
     cmd.args(&req.args);
@@ -222,11 +217,11 @@ fn build_command(req: &SpawnRequest) -> Command {
     cmd
 }
 
-/// `run_captured` equivalent, run inside the helper. Spawns the program in a
-/// new process group (`process_group(0)` → `setpgid`, NOT `setsid`) so the
-/// whole group can be torn down on timeout. Output captured to a temp file
-/// (no pipe → no hang on backgrounded grandchildren). Uses `libc::kill` to
-/// signal the group without forking an external `kill` binary.
+/// Spawns the program in a new process group (`process_group(0)` → `setpgid`,
+/// NOT `setsid`) so the whole group can be torn down on timeout. Output
+/// captured to a temp file (no pipe → no hang on backgrounded grandchildren).
+/// Uses `libc::kill` to signal the group without forking an external `kill`
+/// binary.
 ///
 /// Previously this called `Command::new("setsid").arg(program)` which triggered
 /// ELKEID's `setsid()` ancestry hook and killed arle. The replacement avoids
@@ -271,8 +266,8 @@ fn run_captured(req: &SpawnRequest) -> std::io::Result<(Vec<u8>, Option<i32>, bo
     Ok((output, code, killed))
 }
 
-/// Send SIGKILL to the entire process group `pgid`. Uses `libc::kill` directly
-/// to avoid forking an external `kill` binary (extra forks can trigger ELKEID).
+/// Uses `libc::kill` directly to avoid forking an external `kill` binary
+/// (extra forks can trigger ELKEID).
 fn kill_group(pgid: i32) {
     // SAFETY: kill(-pgid, SIGKILL) is well-defined; an empty or already-reaped
     // group returns ESRCH which we ignore.
