@@ -165,11 +165,9 @@ pub type Result<T> = std::result::Result<T, OpdError>;
 
 #[derive(Debug, Clone)]
 pub struct OpdStepConfig {
-    /// Tokens to roll out greedily from the student starting from the prompt.
     pub rollout_len: usize,
-    /// Optional rollout sampling. `None` keeps the existing greedy argmax path.
+    /// `None` keeps the existing greedy argmax path.
     pub rollout_sampling: Option<SamplingParams>,
-    /// Gradient L2 norm clip threshold.
     pub grad_clip: f32,
 }
 
@@ -2674,14 +2672,6 @@ fn backward_windowed_gkd_loss<T: TeacherForward + ?Sized>(
     Ok(total_loss)
 }
 
-/// Run one OPD step:
-/// 1. Roll out `cfg.rollout_len` tokens from `student` starting from `prompt_ids`,
-///    or use a whole `forced_rollout` trajectory selected by an external scorer.
-/// 2. Forward `teacher` on the full rollout (tape disabled).
-/// 3. Forward `student` on the full rollout (tape enabled).
-/// 4. `kl_distill_loss(student_logits, teacher_logits, rollout.len(), 1.0, …)`.
-/// 5. Backward + grad-clip + optimizer step.
-/// 6. Clear ephemeral tensors so the next step starts from a clean store.
 pub fn opd_step<O: Optimizer>(
     student: &Qwen35Model,
     teacher: &Qwen35Model,
@@ -2707,10 +2697,9 @@ pub fn opd_step<O: Optimizer>(
     )
 }
 
-/// Batched rubric-OPD writeback: one forward+backward over B accepted `(prompt,
-/// completion)` pairs (padded to a common length), completion-masked CE. The 27B
-/// CE is overhead-bound (host op-dispatch, GPU ~0% util), so batching amortizes
-/// the ~64-layer per-op host dispatch over B examples — near-B× throughput.
+/// The 27B CE is overhead-bound (host op-dispatch, GPU ~0% util), so batching
+/// amortizes the ~64-layer per-op host dispatch over B examples — near-B×
+/// throughput.
 ///
 /// The forward yields post-final-norm hidden (not logits); a per-row fused chunked
 /// CE projects only the masked completion positions through `lm_head`, so the dense
@@ -2821,9 +2810,6 @@ pub fn rubric_writeback_ce_step_batched<O: Optimizer>(
     Ok(loss_value)
 }
 
-/// Build the `(predicting-position p, target token id)` list for masked
-/// next-token CE over `prompt_ids ++ response_ids`.
-///
 /// Logits at sequence position `p` predict token `p + 1` (the
 /// `next_token_sft_loss_from_logits` convention). A target counts iff:
 /// - it lies inside the response span: `p + 1 >= prompt_len`, AND
@@ -2949,7 +2935,6 @@ fn log_writeback_vram_ledger(
     );
 }
 
-/// Loss applied by the shared writeback step.
 pub enum WritebackLoss<'a> {
     Ce,
     Pg {
@@ -2992,7 +2977,6 @@ pub fn masked_writeback_ce_step<O: Optimizer>(
     .map(|(loss, _, _)| loss)
 }
 
-/// Frozen prompt and trainable generated segment.
 struct GenSegment {
     prompt_prefix: Vec<u32>,
     gen_ids: Vec<u32>,
@@ -3013,8 +2997,6 @@ impl GenSegment {
     }
 }
 
-/// One checkpointed forward, chunked loss, backward, and optional optimizer step.
-///
 /// The third return is the pre-step global grad L2 norm (post CP/DP all-reduce,
 /// pre-clip) — `None` when `step_optimizer` is false, since accumulated grads are
 /// not yet reduced. Free: `finite_optimizer_step` already computes it.
@@ -3110,10 +3092,6 @@ pub fn masked_writeback_step<O: Optimizer>(
     }
     let fwd_shard = cp.shard(fwd_padded);
 
-    // Split the (predicting-position p, target token) pairs into the parallel
-    // i32 index/target arrays the fused chunked CE consumes. `p` indexes the
-    // hidden tensor's sequence rows; the targets are the hard next tokens.
-    //
     // Vocab bound-check runs over the FULL global set on every rank (not per
     // shard): a bad token must fail all ranks together, or one rank errors while
     // the others wedge in the next collective. Clear OPD error before the autograd
@@ -3381,7 +3359,7 @@ pub fn masked_writeback_step<O: Optimizer>(
 /// `window_size` knob of its own.
 const CAPTURE_LOGPROB_CHUNK_ROWS: usize = 256;
 
-/// Capture π_rollout: `log_softmax(logits)[target]` at each masked
+/// `log_softmax(logits)[target]` at each masked
 /// (LLM-generated) response position, in the SAME order the fused writeback ops
 /// consume (`build_masked_loss_targets`). Tape-OFF forward over `prompt ++
 /// response` — call BEFORE any optimizer step so θ is still the rollout policy
@@ -3486,10 +3464,9 @@ pub fn capture_rollout_logprobs(
     for chunk in loss_targets.chunks(CAPTURE_LOGPROB_CHUNK_ROWS) {
         let rows: Vec<usize> = chunk.iter().map(|&(p, _)| p - gen_start).collect();
         let targets: Vec<usize> = chunk.iter().map(|&(_, t)| t).collect();
-        // Gather this chunk's hidden rows, project through lm_head, log-softmax,
-        // then pick each row's target logprob. Never materializes [seq, vocab].
-        // `embedding` row-gathers but emits [1, chunk, hidden]; reshape to rank-2
-        // so the bf16 matmul_bt forward (which rejects rank-3) accepts it.
+        // Never materializes [seq, vocab]. `embedding` row-gathers but emits
+        // [1, chunk, hidden]; reshape to rank-2 so the bf16 matmul_bt forward
+        // (which rejects rank-3) accepts it.
         let rows_hidden_3d =
             embedding(hidden_2d, &rows, store, &mut tape).map_err(OpdError::from)?;
         let rows_hidden = reshape(rows_hidden_3d, &[rows.len(), hidden_dim], store, &mut tape)
@@ -3511,13 +3488,13 @@ pub fn capture_rollout_logprobs(
     Ok(logprobs)
 }
 
-/// Skip-Observation Generalized Advantage Estimation (SAO Phase 2). `values`
-/// holds V(s_t) at the masked (LLM-generated) positions ONLY, in trajectory
-/// order — so the recursion's "next value" is the next LLM token's, and
-/// environment/tool observation tokens are skipped for free. `terminal_reward`
-/// lands on the final generated token (agentic reward is trajectory-terminal).
-/// Returns `(advantages, returns)`, `returns = advantages + values` (the MSE
-/// target for the critic). γ=discount, λ=GAE trace.
+/// `values` holds V(s_t) at the masked (LLM-generated) positions ONLY, in
+/// trajectory order — so the recursion's "next value" is the next LLM token's,
+/// and environment/tool observation tokens are skipped for free.
+/// `terminal_reward` lands on the final generated token (agentic reward is
+/// trajectory-terminal). Returns `(advantages, returns)`,
+/// `returns = advantages + values` (the MSE target for the critic).
+/// γ=discount, λ=GAE trace.
 pub fn skip_obs_gae(
     values: &[f32],
     terminal_reward: f32,
@@ -3538,12 +3515,11 @@ pub fn skip_obs_gae(
     (advantages, returns)
 }
 
-/// SAO Phase 2 value critic: a single linear head `V(s) = hidden · wᵀ` on the
-/// (frozen) student trunk, its own AdamW + LR. **Frozen-Attention**: both the
-/// GAE value read and the MSE update project a DETACHED copy of the masked
-/// hidden rows (host round-trip), so gradient reaches `weight` only — never the
-/// base. Zero-init → V₀(s)=0 → round-0 GAE = discounted reward-to-go (MC), a
-/// stable cold start (no separate value-pretraining phase).
+/// **Frozen-Attention**: both the GAE value read and the MSE update project a
+/// DETACHED copy of the masked hidden rows (host round-trip), so gradient
+/// reaches `weight` only — never the base. Zero-init → V₀(s)=0 → round-0 GAE =
+/// discounted reward-to-go (MC), a stable cold start (no separate
+/// value-pretraining phase).
 ///
 /// ponytail: one 27B forward per trajectory (`masked_hidden`) feeds BOTH the GAE
 /// values and the MSE update; K=1 update/policy-step. Upgrade to K=2 / a fused
@@ -3591,8 +3567,7 @@ impl ValueCritic {
 
     /// The masked (LLM-generated) hidden rows as a DETACHED host copy, in
     /// `build_masked_loss_targets` order. One checkpointed forward (tape-on but
-    /// never backwarded, like `capture_rollout_logprobs`); returns
-    /// `(rows_flat[n*hidden], n)`, empty when the trajectory has no LLM tokens.
+    /// never backwarded, like `capture_rollout_logprobs`).
     fn masked_hidden(
         &self,
         student: &Qwen35Model,
@@ -3698,9 +3673,8 @@ impl ValueCritic {
         Ok(skip_obs_gae(&values, terminal_reward, self.gamma, self.lam))
     }
 
-    /// One MSE(V(s), returns) update. Frozen-attention: the masked hidden rows
-    /// are a detached constant, so backward accumulates grad on `weight` only.
-    /// Returns the MSE loss (0.0 when nothing to fit).
+    /// Frozen-attention: the masked hidden rows are a detached constant,
+    /// so backward accumulates grad on `weight` only.
     pub fn update(
         &mut self,
         student: &Qwen35Model,
@@ -3749,7 +3723,6 @@ impl ValueCritic {
     }
 }
 
-/// Frozen-prompt compatibility wrapper.
 #[allow(clippy::too_many_arguments)]
 pub fn masked_writeback_ce_step_frozen_prompt_kv<O: Optimizer>(
     student: &Qwen35Model,
@@ -3782,7 +3755,6 @@ pub fn masked_writeback_ce_step_frozen_prompt_kv<O: Optimizer>(
     .map(|(loss, _, _)| loss)
 }
 
-/// Dispatch CE writeback with optional context parallelism.
 #[allow(clippy::too_many_arguments)]
 pub fn masked_writeback_ce_step_dispatch<O: Optimizer>(
     student: &Qwen35Model,
@@ -3817,9 +3789,6 @@ pub fn masked_writeback_ce_step_dispatch<O: Optimizer>(
     .map(|(loss, _, _)| loss)
 }
 
-/// Group the masked (LLM-generated) predicting positions into maximal
-/// contiguous `[start, end)` runs, then sub-window each run by `window_size`.
-///
 /// `masked_positions` are the predicting positions `p` (sorted ascending) whose
 /// next token is LLM-generated — the ones that receive KL loss. Tool/environment
 /// tokens leave gaps, so consecutive `p`s form runs; scoring one run's logit tile
@@ -4122,8 +4091,6 @@ pub fn opd_step_with_teacher_forward_profiled_gkd<O: Optimizer, T: TeacherForwar
     )
 }
 
-/// Student rollout phase: infer-student decode (cuda) or train-crate decode,
-/// producing the `rollout` that downstream KL/backward consumes.
 #[allow(clippy::too_many_arguments)]
 #[cfg_attr(not(feature = "cuda"), allow(unused_variables))]
 fn run_opd_rollout_phase(
@@ -4244,8 +4211,8 @@ fn run_opd_rollout_phase(
     Ok(rollout)
 }
 
-/// Shared borrowed context for the two GKD backward routes. Holds the `&`/Copy
-/// fields common to both; `&mut` store/tape/optimizer/profile stay explicit.
+/// Holds the `&`/Copy fields common to both GKD backward routes;
+/// `&mut` store/tape/optimizer/profile stay explicit.
 struct GkdRouteCtx<'a, T: TeacherForward + ?Sized> {
     student: &'a Qwen35Model,
     teacher: &'a T,
@@ -4364,9 +4331,6 @@ fn run_windowed_gkd_route<O: Optimizer, T: TeacherForward + ?Sized>(
     })
 }
 
-/// Route — pure chunked-KL (lambda == 0.0): full-prefix teacher + student
-/// forward, chunked softmax in the backward, cuda-only offload/reload hooks
-/// around teacher scoring.
 fn run_chunked_kl_route<O: Optimizer, T: TeacherForward + ?Sized>(
     rt: &GkdRouteCtx<'_, T>,
     chunk_size: usize,
