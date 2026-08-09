@@ -2,30 +2,6 @@
 // exactly so the parity gate stays bit-identical modulo `__expf` /
 // reduction-order ULP.
 //
-// Forward identity (matches `rms_norm_f32`):
-//   sum_sq    = sum_j(x[r,j]^2)
-//   inv_rms   = 1 / sqrt(sum_sq / hidden + eps)
-//   y[r,j]    = x[r,j] * inv_rms * w[j]
-//
-// Backward (matches `cpu_rmsnorm_backward`):
-//   inv       = inv_rms[r]
-//   dot       = sum_j(upstream[r,j] * w[j] * x[r,j])
-//   correction= inv * inv * dot / hidden
-//   grad_x[r,j] = (inv * upstream[r,j] * w[j]) - (x[r,j] * inv * correction)
-//   grad_w[j]   = sum_r(upstream[r,j] * x[r,j] * inv[r])
-//
-// Three kernels (driver chains them via lazy `launch_*` — terminal `eval`
-// is the caller's):
-//
-// 1. `rms_norm_inv_rms_f32` — one block per row, reduces sum_sq and emits
-//    the per-row inv_rms into a `[rows]` scratch buffer.
-// 2. `rms_norm_backward_x_f32` — one block per row, consumes the saved
-//    `inv_rms[r]` and reduces `dot` (one shared-mem reduction). Writes
-//    grad_x[r,:].
-// 3. `rms_norm_backward_w_f32` — one block per column, accumulates
-//    `upstream[r,col] * x[r,col] * inv_rms[r]` across rows and reduces.
-//    Writes grad_w[col].
-//
 // `__syncthreads()` discipline: full block-wide barriers around every
 // shared-mem read; tree reduction is the canonical block / 2 form. `eps`
 // is consumed only by the first kernel so the forward and backward agree
@@ -77,7 +53,6 @@ extern "C" __global__ void rms_norm_backward_x_f32(
     const T* row_up = upstream + row * cols;
     T* row_grad = grad_x + row * cols;
 
-    // Phase 1: reduce dot = sum_j(upstream * weight * x).
     float local_dot = 0.0f;
     for (int i = tid; i < cols; i += block) {
         local_dot += static_cast<float>(row_up[i]) * weight[i] * static_cast<float>(row_x[i]);
@@ -93,7 +68,6 @@ extern "C" __global__ void rms_norm_backward_x_f32(
     float inv = inv_rms[row];
     float correction = inv * inv * smem[0] / (float)cols;
 
-    // Phase 2: write grad_x elementwise.
     for (int i = tid; i < cols; i += block) {
         row_grad[i] = static_cast<T>((inv * static_cast<float>(row_up[i]) * weight[i]) - (static_cast<float>(row_x[i]) * inv * correction));
     }

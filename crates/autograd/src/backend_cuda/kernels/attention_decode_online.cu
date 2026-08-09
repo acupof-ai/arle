@@ -36,7 +36,7 @@
 
 namespace {
 
-// Warp-wide sum reduction. `WARP_SIZE` must be 32.
+// `WARP_SIZE` must be 32.
 __device__ __forceinline__ float warp_sum(float v) {
     #pragma unroll
     for (int s = 16; s > 0; s >>= 1) {
@@ -45,8 +45,7 @@ __device__ __forceinline__ float warp_sum(float v) {
     return v;
 }
 
-// Cross-warp sum reduction via shared memory. `warp_id` = tid / 32,
-// `lane_id` = tid % 32. Caller must `__syncthreads()` before reusing scratch.
+// Caller must `__syncthreads()` before reusing scratch.
 __device__ __forceinline__ float block_sum(float v, float* scratch, int tid, int n_warps) {
     int warp_id = tid >> 5;
     int lane_id = tid & 31;
@@ -55,7 +54,6 @@ __device__ __forceinline__ float block_sum(float v, float* scratch, int tid, int
         scratch[warp_id] = w;
     }
     __syncthreads();
-    // Final reduce in the first warp.
     if (warp_id == 0) {
         float partial = (tid < n_warps) ? scratch[tid] : 0.0f;
         partial = warp_sum(partial);
@@ -102,7 +100,6 @@ __global__ void __launch_bounds__(HEAD_DIM, 2) causal_sdpa_decode_gqa_cache_onli
     int kvh = qh / kv_repeat;
     int visible = min(q_start + 1, kv_len);
     if (visible <= 0) {
-        // Zero-fill output (degenerate / mask-empty case) and bail.
         if (tid < HEAD_DIM) {
             out[(b * query_heads + qh) * HEAD_DIM + tid] = 0.0f;
         }
@@ -112,7 +109,6 @@ __global__ void __launch_bounds__(HEAD_DIM, 2) causal_sdpa_decode_gqa_cache_onli
     int q_base = (b * query_heads + qh) * HEAD_DIM;
     int kv_base = (b * kv_heads + kvh) * max_seq * HEAD_DIM;
 
-    // Each thread owns one Q element + one output accumulator slot.
     float q_elem = (tid < HEAD_DIM) ? q[q_base + tid] : 0.0f;
     float o_acc = 0.0f;
     float m_run = neg_inf_f32();
@@ -121,18 +117,16 @@ __global__ void __launch_bounds__(HEAD_DIM, 2) causal_sdpa_decode_gqa_cache_onli
     extern __shared__ float scratch[];
 
     for (int pos = 0; pos < visible; ++pos) {
-        // QK dot: each thread does one multiply, warp-reduce, cross-warp-reduce.
         const float* k_row = k + kv_base + pos * HEAD_DIM;
         float k_elem = (tid < HEAD_DIM) ? k_row[tid] : 0.0f;
         float partial = q_elem * k_elem;
         float s_pos = block_sum(partial, scratch, tid, N_WARPS) * scale;
 
-        // Online softmax update: all threads have s_pos identically.
+        // All threads hold the same `s_pos`.
         float m_new = fmaxf(m_run, s_pos);
         float alpha = __expf(m_run - m_new);
         float beta = __expf(s_pos - m_new);
 
-        // Re-weight + add new V contribution into this thread's slot.
         const float* v_row = v + kv_base + pos * HEAD_DIM;
         float v_elem = (tid < HEAD_DIM) ? v_row[tid] : 0.0f;
         o_acc = o_acc * alpha + beta * v_elem;

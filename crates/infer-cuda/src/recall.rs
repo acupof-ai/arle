@@ -70,43 +70,33 @@ mod cuda_impl {
     /// unless recall is enabled and the session has exceeded the budget.
     #[derive(Default)]
     pub(crate) struct CudaRecallState {
-        /// Resident per-middle-block mean-key reps (#2). Each entry is the
-        /// layer-0 K mean-pooled over its `l_bs` tokens, GQA-shaped to
-        /// `[num_kv_heads, head_dim]` flattened to `nkv * hd` f32 — the resident
-        /// representative that keeps a (future-)offloaded block scorable
-        /// (`q · rep`). Index = middle block index (token base
-        /// `n_init + i * l_bs`). Grown incrementally as whole blocks complete.
+        /// Resident per-middle-block mean-key reps. Layer-0 K mean-pooled over
+        /// `l_bs` tokens, GQA-shaped to `[num_kv_heads, head_dim]` (flattened
+        /// `nkv * hd` f32) — keeps offloaded blocks scorable (`q · rep`).
+        /// Index = middle block index (token base `n_init + i * l_bs`).
         block_reps: Vec<Vec<f32>>,
-        /// Selected page IDs for the NEXT decode step (sink ∪ recalled ∪ local),
-        /// in ascending temporal page order, ending with the current local page.
-        /// `None` = the session still fits the budget → today's full contiguous
-        /// page table (byte-identical default).
+        /// Selected page IDs for the next decode step (sink ∪ recalled ∪ local),
+        /// ascending temporal order. `None` = session fits budget → full
+        /// contiguous page table (byte-identical default).
         recall_pages: Option<Vec<u32>>,
-        /// The working-set token ranges of the NEXT decode step's plan (the
-        /// `plan_recall` output). Kept alongside `recall_pages` so the executor
-        /// can RE-RESOLVE the page list after it prefetches an L3-resident block
-        /// back into HBM (the sentinels in the working set get patched to fresh
-        /// page ids, then [`Self::resolve_recall_pages`] rebuilds `recall_pages`).
-        /// Empty when the plan is the full contiguous range (default path).
+        /// Working-set token ranges of the next step's plan. Kept so the
+        /// executor can re-resolve `recall_pages` after prefetching L3-resident
+        /// blocks back (sentinels patched to fresh page ids). Empty when the
+        /// plan is the full contiguous range.
         recall_ranges: Vec<(usize, usize)>,
-        /// Logical page indices the executor should evict-drop (free out of HBM)
-        /// after this step — the cold middle pages outside the recall working set.
-        /// Drained each step via [`Self::take_evict_pages`]; the actual page free
-        /// happens in the executor against both the host and device pools.
+        /// Logical page indices to evict-drop (cold middle pages outside the
+        /// working set). Drained via [`Self::take_evict_pages`]; the executor
+        /// frees them from both host and device pools.
         evict_pages: Vec<usize>,
-        /// Logical page indices the executor should PREFETCH back into HBM before
-        /// the next step (the re-recall coverage win): pages inside the new
-        /// working set whose physical HBM page was previously evict-dropped (now an
-        /// `EVICTED_PAGE` sentinel) but whose KV lives in the L3 tier. Drained each
-        /// step via [`Self::take_prefetch_pages`]; the executor allocs a fresh page,
-        /// H2D-copies the tier payload, patches the sentinel, then re-resolves
-        /// `recall_pages`. Empty unless re-recall is enabled (`allow_prefetch`).
+        /// Logical page indices to prefetch back from the L3 tier: working-set
+        /// pages currently `EVICTED_PAGE` sentinels. Drained via
+        /// [`Self::take_prefetch_pages`]; the executor allocs a fresh page,
+        /// H2D-copies the tier payload, patches the sentinel, re-resolves.
         prefetch_pages: Vec<usize>,
     }
 
     impl CudaRecallState {
-        /// The selected page list for this step, if recall is active. `None`
-        /// keeps the default full-cache page table.
+        /// Selected page list for this step; `None` keeps the default full-cache page table.
         pub(crate) fn recall_pages(&self) -> Option<&[u32]> {
             self.recall_pages.as_deref()
         }
@@ -121,15 +111,11 @@ mod cuda_impl {
             self.prefetch_pages.clear();
         }
 
-        /// Grow the resident mean-key reps for any newly-frozen middle blocks (#2).
+        /// Grow resident mean-key reps for newly-frozen middle blocks.
         ///
         /// A block is "frozen" once it has left the local window
         /// (`base + l_bs <= cache_len - n_local`), so its K is final and the rep
-        /// is computed exactly once. Mean-pools layer-0 K over each frozen block's
-        /// `l_bs` tokens into a `[num_kv_heads, head_dim]` rep (flattened). Cheap:
-        /// only newly-completed blocks are read back. Reads layer-0 K from the
-        /// paged pool by page (the BF16 K plane is laid out
-        /// `[max_pages, num_kv_heads, page_size, head_dim]`).
+        /// is computed exactly once. Only newly-completed blocks are read back.
         fn update_block_reps(
             &mut self,
             ctx: &DeviceContext,
@@ -152,7 +138,7 @@ mod cuda_impl {
             let pages = pool.page_indices(slot);
             // Layer-0 BF16 K plane: [max_pages, num_kv_heads, page_size, head_dim].
             let k0 = pool.k_data_slice(0);
-            let page_elems = num_kv_heads * page_size * head_dim; // bf16 elems / page
+            let page_elems = num_kv_heads * page_size * head_dim;
             let page_bytes = page_elems * 2;
             let l_bs_f = cfg.l_bs as f32;
 
@@ -170,8 +156,6 @@ mod cuda_impl {
                     break;
                 }
                 let mut rep = vec![0.0_f32; num_kv_heads * head_dim];
-                // Walk this block's `l_bs` tokens; each token lives at page
-                // `pages[pos / page_size]`, intra-page row `pos % page_size`.
                 for pos in base..base + cfg.l_bs {
                     let page = pages[pos / page_size] as usize;
                     let row = pos % page_size;
@@ -202,32 +186,22 @@ mod cuda_impl {
             Ok(())
         }
 
-        /// Recompute the recall page plan for the NEXT decode step (#3/#5).
+        /// Recompute the recall page plan for the next decode step.
         ///
-        /// Scores the resident block reps against this step's GQA-mean layer-0
-        /// query (`q · rep`, one step stale — licensed), runs
-        /// [`infer_core::plan_recall`], converts the chosen token ranges to a
-        /// page subset, and stashes it. `recall_pages` is left `None` when the
-        /// plan is the single contiguous range (session fits the budget) so the
-        /// default page table stays byte-identical.
+        /// Scores block reps against this step's GQA-mean layer-0 query
+        /// (`q · rep`, one step stale — licensed). `recall_pages` is left `None`
+        /// when the plan is the single contiguous range (session fits budget) so
+        /// the default page table stays byte-identical.
         ///
-        /// `query_layer0` is the post-RoPE layer-0 decode query read back from
-        /// `q_batch` as `[num_q_heads, head_dim]` row-major f32. It is GQA-mean
-        /// pooled here (query-heads-per-KV-group → `[num_kv_heads, head_dim]`) to
-        /// match the rep shape — the validated `--shared` per-slot scoring.
+        /// `query_layer0`: post-RoPE layer-0 decode query, `[num_q_heads, head_dim]`
+        /// row-major f32, GQA-mean pooled here to `[num_kv_heads, head_dim]`.
         ///
         /// `allow_prefetch` selects the tier policy:
-        /// - `false` (the dense-Qwen3 arm, no Qwen3.6-style L3 recall tier): a
-        ///   block whose HBM pages were already evict-dropped is masked to `-inf`
-        ///   so `plan_recall` never re-selects it (it cannot be re-attended). The
-        ///   page list is resolved eagerly here — byte-identical to the prior
-        ///   behavior, so the dense path is untouched.
-        /// - `true` (the Qwen3.6 recall tier): ALL blocks compete on their
-        ///   resident reps; an evicted block that ranks top-k is recorded in
-        ///   `prefetch_pages` for the executor to pull back H2D, and page-list
-        ///   resolution is DEFERRED ([`Self::recall_pages`] stays at its previous
-        ///   value until [`Self::resolve_recall_pages`] runs after the prefetch
-        ///   patches the sentinels). The ranges are stashed in `recall_ranges`.
+        /// - `false` (dense-Qwen3 arm, no L3 tier): evicted blocks masked to `-inf`
+        ///   (cannot be re-attended); page list resolved eagerly.
+        /// - `true` (Qwen3.6 recall tier): all blocks compete; top-k evicted blocks
+        ///   go to `prefetch_pages`; page-list resolution deferred until
+        ///   [`Self::resolve_recall_pages`] runs after the prefetch patches sentinels.
         #[allow(clippy::too_many_arguments)]
         pub(crate) fn recompute_recall_plan(
             &mut self,
@@ -330,16 +304,12 @@ mod cuda_impl {
             Ok(())
         }
 
-        /// Logical page indices the executor should evict-drop after this step
-        /// (the complement of the recall plan's working set within the resident
-        /// middle). Drained by the executor; empty when nothing new to free.
+        /// Logical page indices to evict-drop (complement of the working set). Drained by the executor.
         pub(crate) fn take_evict_pages(&mut self) -> Vec<usize> {
             std::mem::take(&mut self.evict_pages)
         }
 
-        /// Logical page indices the executor should PREFETCH back into HBM from the
-        /// L3 tier before the next step (re-recall). Drained by the executor; empty
-        /// unless `allow_prefetch` and an evicted block re-entered the working set.
+        /// Logical page indices to prefetch back from the L3 tier. Drained by the executor.
         pub(crate) fn take_prefetch_pages(&mut self) -> Vec<usize> {
             std::mem::take(&mut self.prefetch_pages)
         }
@@ -365,9 +335,8 @@ mod cuda_impl {
         }
     }
 
-    /// Compute the *logical* page indices to PREFETCH back into HBM: pages covered
-    /// by a working-set range that are currently `EVICTED_PAGE` sentinels (their KV
-    /// lives only in the L3 tier). These are exactly the re-recalled-block pages
+    /// Pages covered by a working-set range that are currently `EVICTED_PAGE`
+    /// sentinels (KV lives only in the L3 tier) — the re-recalled-block pages
     /// the executor must reinstate before the next step attends them.
     fn prefetch_logical_pages(
         ranges: &[(usize, usize)],
@@ -393,11 +362,10 @@ mod cuda_impl {
         out
     }
 
-    /// Compute the *logical* page indices to evict-drop: pages NOT covered by any
-    /// working-set range, excluding the pinned sink (first `n_init` tokens) and
-    /// local (last `n_local` tokens) regions, and skipping pages already evicted
-    /// (sentinel). These are the cold middle pages whose KV is tier-resident and
-    /// whose HBM page can be returned to the pool.
+    /// Pages NOT covered by any working-set range, excluding the pinned sink
+    /// (first `n_init` tokens) and local (last `n_local` tokens) regions, and
+    /// skipping already-evicted sentinels — the cold middle pages whose HBM
+    /// page can be returned to the pool.
     fn evict_logical_pages(
         ranges: &[(usize, usize)],
         pages: &[u32],
@@ -407,7 +375,6 @@ mod cuda_impl {
         if page_size == 0 || pages.is_empty() {
             return Vec::new();
         }
-        // Pages covered by the working set (these stay resident).
         let mut keep = vec![false; pages.len()];
         for &(s, e) in ranges {
             if s >= e {
@@ -435,12 +402,10 @@ mod cuda_impl {
             .collect()
     }
 
-    /// Convert ascending, merged token ranges (from `plan_recall`) to the
-    /// deduplicated, ascending physical page subset. Page granularity (16) is
-    /// finer than the recall block (`l_bs`=32) and the sink/local windows are
-    /// multi-page, so each range covers whole pages; the final range ends at
-    /// `cache_len`, so the last page is the current (partially filled) local
-    /// page — exactly what `kv_last_page_len` must describe.
+    /// Page granularity (16) is finer than the recall block (`l_bs`=32) and the
+    /// sink/local windows are multi-page, so each range covers whole pages; the
+    /// final range ends at `cache_len`, so the last page is the current
+    /// (partially filled) local page — exactly what `kv_last_page_len` describes.
     fn token_ranges_to_pages(
         ranges: &[(usize, usize)],
         pages: &[u32],

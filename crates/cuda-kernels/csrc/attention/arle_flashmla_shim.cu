@@ -22,15 +22,14 @@
 #include <exception>
 #include <stdexcept>
 
-// FlashMLA internals (vendored): SparseAttnFwdParams + the SM90 entry.
-// FlashMLA's `params.h` only pulls in `cutlass/bfloat16.h` — no torch.
+// FlashMLA internals (vendored); params.h pulls in only cutlass/bfloat16.h — no torch.
 #include "../../vendor/flashmla/csrc/params.h"
 #include "../../vendor/flashmla/csrc/sm90/prefill/sparse/fwd.h"
 
 extern "C" {
 
-// Run FlashMLA SM90 sparse prefill attention. All pointer args are CUDA
-// device pointers. Strides are in element count (not bytes).
+// All pointer args are CUDA device pointers. Strides are in element count
+// (not bytes).
 //
 // Returns cudaSuccess on completion (or the first failing cudaError_t if
 // the underlying launch fails — FlashMLA's launcher throws on the
@@ -118,4 +117,4 @@ cudaError_t arle_flashmla_sm90_sparse_prefill_fwd(
     return cudaGetLastError();
 }
 
-}  // extern "C"
+}

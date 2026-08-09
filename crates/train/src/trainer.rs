@@ -11,19 +11,17 @@ use std::collections::HashSet;
 
 use autograd::{Tape, TensorId, TensorStore};
 
-/// Post-backward cleanup: clear the tape, re-enable it for the next
-/// micro-batch, then prune the store down to `keep_extra ∪ params ∪ grads`.
+/// Post-backward cleanup: prune the store down to `keep_extra ∪ params ∪ grads`.
 ///
 /// Matches the `tape.entries.clear(); tape.set_enabled(true);
 /// store.retain_ids(...)` idiom used across the historic hand-written
 /// training loops before the shared trainer/runtime factoring landed.
 ///
 /// Exposed `pub` so OPD eval closures that produce multi-forward activations
-/// can prune the store
-/// between windows. Note: this unconditionally re-enables the tape, which
-/// is correct for the post-backward path but NOT for an eval loop that
-/// wants the tape disabled across windows — the caller must re-disable
-/// with `tape.set_enabled(false)` after each invocation in that case.
+/// can prune the store between windows. Note: this unconditionally re-enables
+/// the tape, which is correct for the post-backward path but NOT for an eval
+/// loop that wants the tape disabled across windows — the caller must
+/// re-disable with `tape.set_enabled(false)` after each invocation in that case.
 pub fn cleanup_after_backward(
     store: &mut TensorStore,
     tape: &mut Tape,
