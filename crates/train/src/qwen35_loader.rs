@@ -181,8 +181,6 @@ pub type Result<T> = std::result::Result<T, LoaderError>;
 
 // ─────────────────────────── HF config schema ────────────────────────────────
 
-/// Minimal serde mirror of a HuggingFace Qwen3 / Qwen3.5 `config.json`.
-///
 /// Field set is the union of vanilla Qwen3 (0.6B / 1.7B / 4B) and the
 /// Qwen3.5 / Qwen3.6 nested `text_config` layout. We accept either by
 /// reading both shapes via [`serde_json::Value`] inside
@@ -300,9 +298,8 @@ pub enum HfSchema {
 }
 
 impl Qwen35HfConfig {
-    /// Parse a HuggingFace `config.json`. Accepts both the flat (Qwen3) and
-    /// nested-`text_config` (Qwen3.5 / Qwen3.6) layouts; the nested form is
-    /// unwrapped before field binding.
+    /// Accepts both the flat (Qwen3) and nested-`text_config` (Qwen3.5 /
+    /// Qwen3.6) layouts; the nested form is unwrapped before field binding.
     pub fn from_json_str(content: &str) -> Result<(Self, HfSchema)> {
         let value: serde_json::Value = serde_json::from_str(content)?;
         Self::from_value(&value)
@@ -377,11 +374,10 @@ impl Qwen35HfConfig {
         Self::from_json_str(&content)
     }
 
-    /// Convert into the train-side [`Qwen35Config`]. Missing `linear_*`
-    /// fields are filled with defaults derived from the dense attention
-    /// shape — the train model only consults them when a layer has
-    /// `LayerType::LinearAttention`, so for vanilla full-attention Qwen3
-    /// the synthesized values are inert.
+    /// Missing `linear_*` fields are filled with defaults derived from the
+    /// dense attention shape — the train model only consults them when a
+    /// layer has `LayerType::LinearAttention`, so for vanilla full-attention
+    /// Qwen3 the synthesized values are inert.
     pub fn to_qwen35_config(&self) -> Result<Qwen35Config> {
         let eos = self.eos_token_id.unwrap_or(0);
         let num_layers = self.num_hidden_layers;
@@ -485,9 +481,9 @@ impl ShardFile {
     }
 }
 
-/// Discover shards. Returns either a single `model.safetensors` shard
-/// (when the index manifest is absent) or one shard per file referenced
-/// in `model.safetensors.index.json`.
+/// Returns either a single `model.safetensors` shard (when the index
+/// manifest is absent) or one shard per file referenced in
+/// `model.safetensors.index.json`.
 fn discover_shards(dir: &Path) -> Result<Vec<PathBuf>> {
     let single = dir.join("model.safetensors");
     let index = dir.join("model.safetensors.index.json");
@@ -529,9 +525,6 @@ fn discover_shards(dir: &Path) -> Result<Vec<PathBuf>> {
 
 // ─────────────────────────── name remapping ──────────────────────────────────
 
-/// Map a train-side tensor name (rooted under `model.language_model.*`) to
-/// the HF tensor name for the supplied schema.
-///
 /// For `HfSchema::Qwen35` this is a no-op (the train side uses the Qwen3.5
 /// canonical naming). For `HfSchema::Qwen3` we strip the `language_model.`
 /// segment so e.g. `model.language_model.layers.0.self_attn.q_proj.weight`
@@ -635,16 +628,13 @@ fn dtype_to_bf16_bits(view: &TensorView<'_>, name: &str) -> Result<Vec<u16>> {
 
 // ─────────────────────────── public entry point ──────────────────────────────
 
-/// Load a HF-format Qwen3 / Qwen3.5 checkpoint into a fresh frozen
-/// [`Qwen35Model`].
-///
 /// The model is initialized via [`Qwen35Model::new_for_eval`] (frozen, no
 /// LoRA, no `requires_grad`) and every parameter slot is overwritten with
 /// the data read from the safetensors shards in `dir`.
 ///
-/// Returns the constructed model. On any error the function rolls `store`
-/// back to its entry state, so callers do not need to discard the store after
-/// a failed OPD checkpoint load.
+/// On any error the function rolls `store` back to its entry state, so
+/// callers do not need to discard the store after a failed OPD checkpoint
+/// load.
 pub fn load_qwen35_from_hf_dir(dir: &Path, store: &mut TensorStore) -> Result<Qwen35Model> {
     let rollback = TensorStoreRollback::capture(store);
     match load_qwen35_from_hf_dir_inner(dir, store, LoadMode::FrozenEval, None) {
@@ -656,12 +646,9 @@ pub fn load_qwen35_from_hf_dir(dir: &Path, store: &mut TensorStore) -> Result<Qw
     }
 }
 
-/// Load a HF-format Qwen3 / Qwen3.5 checkpoint into a fresh trainable
-/// [`Qwen35Model`] suitable for OPD student optimization.
-///
-/// This keeps the same shard discovery, shape validation, dtype widening, and
-/// rollback semantics as [`load_qwen35_from_hf_dir`], but initializes the model
-/// with [`Qwen35Model::new`] so loaded trainable parameter slots keep
+/// Same shard discovery, shape validation, dtype widening, and rollback
+/// semantics as [`load_qwen35_from_hf_dir`], but initializes the model with
+/// [`Qwen35Model::new`] so loaded trainable parameter slots keep
 /// `requires_grad = true`. Use the frozen loader for teachers.
 pub fn load_qwen35_trainable_from_hf_dir(
     dir: &Path,
@@ -677,10 +664,9 @@ pub fn load_qwen35_trainable_from_hf_dir(
     }
 }
 
-/// Load a HF-format Qwen3 / Qwen3.5 checkpoint as a frozen base plus
-/// trainable LoRA adapters. This is the cross-size OPD student path: teacher
-/// and student checkpoints can differ, while the student base stays frozen and
-/// only adapter weights receive gradients.
+/// Cross-size OPD student path: teacher and student checkpoints can differ,
+/// while the student base stays frozen and only adapter weights receive
+/// gradients.
 pub fn load_qwen35_lora_from_hf_dir(
     dir: &Path,
     lora: LoraConfig,
@@ -1359,9 +1345,7 @@ fn shape_mismatch_hint(
     )
 }
 
-/// Detect the specific "vanilla Qwen3 q_proj has half the rows the train
-/// model expects" mismatch and surface a precise, actionable hint. The
-/// train side is Qwen3.5-shaped (`q_proj` includes the per-head output
+/// The train side is Qwen3.5-shaped (`q_proj` includes the per-head output
 /// gate); vanilla Qwen3 ships `q_proj` without that gate.
 fn q_proj_gate_hint(train_name: &str, expected: &[usize], got: &[usize]) -> String {
     if !train_name.ends_with(".self_attn.q_proj.weight") {
