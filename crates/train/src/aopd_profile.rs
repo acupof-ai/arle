@@ -18,7 +18,6 @@
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
-/// Stage resource tag, printed verbatim in the `kind` column.
 pub const GPU: &str = "GPU";
 pub const WALL: &str = "WALL";
 pub const DISK: &str = "DISK";
@@ -51,7 +50,6 @@ fn table() -> &'static Mutex<Table> {
     })
 }
 
-/// Anchor a fresh round: reset the stage table and start the round wall clock.
 pub fn begin_round() {
     if let Ok(mut t) = table().lock() {
         t.rows.clear();
@@ -59,7 +57,6 @@ pub fn begin_round() {
     }
 }
 
-/// Snapshot the round's accumulated `(stage, secs)` pairs for the metrics sink.
 #[must_use]
 pub fn phase_secs() -> Vec<(&'static str, f64)> {
     table().lock().map_or_else(
@@ -73,10 +70,7 @@ pub fn phase_secs() -> Vec<(&'static str, f64)> {
     )
 }
 
-/// Accumulate one stage observation. `kind` is one of [`GPU`] / [`WALL`] /
-/// [`DISK`]. Prefer [`time`] / [`time_try`] for closure-shaped call sites; use
-/// this directly when the elapsed time is derived (e.g. decode wall split out of
-/// a returned record).
+/// `kind` is one of GPU/WALL/DISK. Use `time`/`time_try` for closures.
 pub fn record(label: &'static str, kind: &'static str, secs: f64) {
     if let Ok(mut t) = table().lock() {
         match t.rows.iter_mut().find(|(l, _, _)| *l == label) {
@@ -89,8 +83,6 @@ pub fn record(label: &'static str, kind: &'static str, secs: f64) {
     }
 }
 
-/// Time a closure and accumulate its wall under `label`. Returns the closure's
-/// value unchanged.
 pub fn time<T>(label: &'static str, kind: &'static str, f: impl FnOnce() -> T) -> T {
     let t0 = Instant::now();
     let out = f();
@@ -98,7 +90,6 @@ pub fn time<T>(label: &'static str, kind: &'static str, f: impl FnOnce() -> T) -
     out
 }
 
-/// [`time`] specialized for `Result`-returning stages, so `?` chains stay flat.
 pub fn time_try<T, E>(
     label: &'static str,
     kind: &'static str,
@@ -107,10 +98,6 @@ pub fn time_try<T, E>(
     time(label, kind, f)
 }
 
-/// Print the per-round stage breakdown table and reset the round clock. Columns:
-/// `stage | kind | calls | total_ms | ms/call | %round`, with an
-/// `(untimed/overhead)` residual row and a `TOTAL` row so the table sums to the
-/// round wall.
 pub fn print_round(round: usize) {
     if !enabled() {
         return;
