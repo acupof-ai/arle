@@ -65,7 +65,7 @@ __global__ void conv1d_prefill_kernel(
 
     // Match HF/PyTorch: conv1d writes bf16, then SiLU consumes bf16 input.
     float sum_bf16 = __bfloat162float(__float2bfloat16(sum));
-    float silu_out = sum_bf16 / (1.0f + expf(-sum_bf16));
+    float silu_out = sum_bf16 / (1.0f + __expf(-sum_bf16));
     out_seq[t * num_channels + c] = __float2bfloat16(silu_out);
 
     // NOTE: the conv ring update lives in conv1d_state_update_kernel, launched
@@ -112,7 +112,7 @@ __global__ void conv1d_decode_kernel(
     sum += x * __bfloat162float(conv_weight[c * kernel_size + state_width]);
 
     const float sum_bf16 = __bfloat162float(__float2bfloat16(sum));
-    out_seq[c] = __float2bfloat16(sum_bf16 / (1.0f + expf(-sum_bf16)));
+    out_seq[c] = __float2bfloat16(sum_bf16 / (1.0f + __expf(-sum_bf16)));
 
     for (int i = 0; i + 1 < state_width; i++) {
         conv_state[c * state_width + i] = __float2bfloat16(ring[i + 1]);
