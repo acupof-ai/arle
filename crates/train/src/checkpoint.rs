@@ -14,13 +14,8 @@ use autograd::adamw_state::{AdamWParamState, AdamWState};
 use safetensors::{Dtype, SafeTensors, serialize_to_file};
 use serde::{Deserialize, Serialize};
 
-/// Codec version for the v2 directory checkpoint layout.
 pub const TRAINER_STATE_CODEC_VERSION: u32 = 2;
-
-/// Filename for the trainer scalar/schedule JSON under a v2 checkpoint dir.
 pub const TRAINER_STATE_FILENAME: &str = "trainer_state.json";
-
-/// Filename for the AdamW moments safetensors file under a v2 checkpoint dir.
 pub const OPTIMIZER_STATE_FILENAME: &str = "optimizer.safetensors";
 
 #[derive(Debug, thiserror::Error)]
@@ -51,37 +46,19 @@ pub enum CheckpointError {
 
 pub type Result<T> = std::result::Result<T, CheckpointError>;
 
-// ---------------------------------------------------------------------------
-// Checkpoint Codec v2 — directory layout (trainer_state.json + optimizer.safetensors)
-// ---------------------------------------------------------------------------
-
-/// Trainer-side scalar/schedule state persisted alongside optimizer moments.
-///
-/// Serialized pretty to `<dir>/trainer_state.json`. Kept open-schema via
-/// `schedule_params: serde_json::Value` so schedule implementations can own
-/// their own parameter shape without a matching enum in this crate.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrainerStateDoc {
     pub step: u64,
-    /// Schema tag for the optimizer state. Today: `"adamw-v1"`.
     pub optim_schema: String,
-    /// `"constant"` | `"linear-warmup"` | `"cosine-with-warmup"`.
     pub schedule_name: String,
     pub schedule_params: serde_json::Value,
     pub grad_accum_current: u64,
     pub rng_seed: u64,
-    /// On-disk codec version. Must equal [`TRAINER_STATE_CODEC_VERSION`].
     pub codec_version: u32,
 }
 
-/// Save a v2 directory checkpoint (scalar trainer state + AdamW moments).
-///
-/// Writes:
-/// - `<dir>/trainer_state.json` (pretty-printed JSON)
-/// - `<dir>/optimizer.safetensors` (each param → two tensors `"{name}.m"`,
-///   `"{name}.v"`, f32; top-level metadata carries `step` + `skipped_export`)
-///
-/// Creates `dir` (and any missing parents) on demand.
+/// Save trainer state + AdamW moments to `<dir>/trainer_state.json` and
+/// `<dir>/optimizer.safetensors`.
 pub fn save_trainer_state_v2(
     dir: &Path,
     state: &TrainerStateDoc,
@@ -132,7 +109,6 @@ pub fn save_trainer_state_v2(
     Ok(())
 }
 
-/// Load a v2 directory checkpoint written by [`save_trainer_state_v2`].
 pub fn load_trainer_state_v2(
     dir: &Path,
 ) -> std::result::Result<(TrainerStateDoc, AdamWState), CheckpointError> {
@@ -145,15 +121,11 @@ pub fn load_trainer_state_v2(
 
     let optim_path = dir.join(OPTIMIZER_STATE_FILENAME);
     let optim_bytes = std::fs::read(&optim_path)?;
-    // `SafeTensors::deserialize` gives us tensor views; the top-level
-    // metadata lives on `Metadata` and has to be fetched via `read_metadata`.
     let (_, header_metadata) = SafeTensors::read_metadata(&optim_bytes)
         .map_err(|err| CheckpointError::Safetensors(err.to_string()))?;
     let st = SafeTensors::deserialize(&optim_bytes)
         .map_err(|err| CheckpointError::Safetensors(err.to_string()))?;
 
-    // Group by base name (strip .m/.v suffix), preserving first-seen order so
-    // saved-order round-trips deterministically.
     let mut order: Vec<String> = Vec::new();
     let mut groups: BTreeMap<String, MomentPair> = BTreeMap::new();
     for (key, view) in st.tensors() {
@@ -255,8 +227,6 @@ fn optim_tensor_view_to_f32(
     }
 }
 
-/// Thin `safetensors::View` impl that borrows moment data as little-endian f32
-/// bytes without a heap-allocated detour.
 struct OptimTensorView {
     shape: Vec<usize>,
     bytes: Vec<u8>,
@@ -287,28 +257,10 @@ impl safetensors::View for OptimTensorView {
     }
 }
 
-/// Atomically refresh a `latest` symlink inside `parent` pointing at a
-/// sibling directory named `target_basename`. Used by every training
-/// binary's save-checkpoint path so downstream tooling (e.g.
-/// `infer --model-path <out>/latest`) can reference "the most recent
-/// checkpoint" without knowing the step number. Phase DX-1.
-///
-/// `target_basename` must be a basename (e.g. `"step_000100"`), not a
-/// full path — the symlink is relative so the whole `<parent>/` tree
-/// remains copyable / rsync-safe.
-///
-/// Refuses to overwrite a regular file or directory at `<parent>/latest`
-/// (only an existing symlink is replaced). This guards against a user
-/// accidentally stashing their final checkpoint under that exact name.
-///
-/// The update is atomic from a reader's perspective: we create the new
-/// symlink under `.latest.tmp` first, then `rename()` it onto `latest`.
-/// POSIX `rename` on the same directory is atomic, so readers either see
-/// the old target or the new one — never a missing/half-applied pointer.
-/// Codex review 2026-04-20 on 0da212f (Medium): the previous
-/// remove-then-create sequence exposed a brief window where `latest`
-/// did not exist. An `infer --model-path <out>/latest` call that landed
-/// in that window would fail even though a checkpoint was ready.
+/// Atomically refresh a `latest` symlink inside `parent` pointing at
+/// `target_basename`. The symlink is relative (basename only) so the tree
+/// stays rsync-safe. Refuses to overwrite a non-symlink at `latest`.
+/// Atomic via `.latest.tmp` + `rename` (no missing-`latest` window).
 #[cfg(unix)]
 pub fn write_latest_symlink(parent: &Path, target_basename: &str) -> io::Result<()> {
     use std::os::unix::fs::symlink;
@@ -321,10 +273,8 @@ pub fn write_latest_symlink(parent: &Path, target_basename: &str) -> io::Result<
     }
 
     let link = parent.join("latest");
-    // Refuse to overwrite a non-symlink (file or directory) at `<parent>/latest`.
-    // We only want to atomically swap an existing symlink or fill an empty slot.
     match std::fs::symlink_metadata(&link) {
-        Ok(meta) if meta.file_type().is_symlink() => { /* swap via rename below */ }
+        Ok(meta) if meta.file_type().is_symlink() => {}
         Ok(_) => {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
@@ -334,11 +284,10 @@ pub fn write_latest_symlink(parent: &Path, target_basename: &str) -> io::Result<
                 ),
             ));
         }
-        Err(e) if e.kind() == io::ErrorKind::NotFound => { /* fresh install */ }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
         Err(e) => return Err(e),
     }
 
-    // Clean up any leftover tmp from a prior crashed call.
     let tmp = parent.join(".latest.tmp");
     match std::fs::symlink_metadata(&tmp) {
         Ok(_) => std::fs::remove_file(&tmp)?,
@@ -347,10 +296,7 @@ pub fn write_latest_symlink(parent: &Path, target_basename: &str) -> io::Result<
     }
 
     symlink(target_basename, &tmp)?;
-    // POSIX rename is atomic on the same filesystem and will replace an
-    // existing symlink at `link` without an intermediate "missing" state.
     if let Err(err) = std::fs::rename(&tmp, &link) {
-        // Best-effort cleanup so we don't leave `.latest.tmp` behind.
         let _ = std::fs::remove_file(&tmp);
         return Err(err);
     }
@@ -359,10 +305,6 @@ pub fn write_latest_symlink(parent: &Path, target_basename: &str) -> io::Result<
 
 #[cfg(not(unix))]
 pub fn write_latest_symlink(_parent: &Path, _target_basename: &str) -> io::Result<()> {
-    // Non-unix targets (currently unsupported by this workspace per
-    // CLAUDE.md support matrix) — no-op rather than erroring. Callers
-    // who need a portable marker should fall back to reading the
-    // lexicographically-largest `step_*` entry.
     Ok(())
 }
 
@@ -388,8 +330,6 @@ mod latest_symlink_tests {
         let resolved = fs::canonicalize(&link).expect("resolve latest");
         let expected = fs::canonicalize(&step_dir).expect("resolve step");
         assert_eq!(resolved, expected, "latest must point at step_000001");
-        // Downstream tooling treats `<out>/latest` as a model dir; the
-        // symlink must transparently expose the step dir's files.
         assert!(
             link.join("config.json").exists(),
             "config.json must resolve through the symlink"
@@ -425,7 +365,6 @@ mod latest_symlink_tests {
             .expect_err("must refuse to clobber regular file");
         assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
 
-        // User data must survive.
         let surviving = fs::read_to_string(dir.path().join("latest")).unwrap();
         assert_eq!(surviving, "user-data");
     }
