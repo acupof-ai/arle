@@ -334,6 +334,75 @@ impl Dsv4FlashMlaDecodeState {
         // topk_length[1] + sched_meta[num_sm_parts_max * 8] + num_splits[2].
         (1 + num_sm_parts_max * 8 + 2) * i32_sz
     }
+
+    pub(crate) fn swap_out(
+        &self,
+        ctx: &DeviceContext,
+        pool: &Dsv4LayerKvLayout,
+    ) -> Result<crate::attention::Dsv4FlashMlaImage> {
+        let topk_length = ctx
+            .stream
+            .clone_dtoh(&self.topk_length)
+            .map_err(|e| anyhow!("DSv4 flashmla swap topk_length D2H failed: {e}"))?;
+        let sched_meta = ctx
+            .stream
+            .clone_dtoh(&self.sched_meta)
+            .map_err(|e| anyhow!("DSv4 flashmla swap sched_meta D2H failed: {e}"))?;
+        let num_splits = ctx
+            .stream
+            .clone_dtoh(&self.num_splits)
+            .map_err(|e| anyhow!("DSv4 flashmla swap num_splits D2H failed: {e}"))?;
+        let device_page_table = ctx
+            .stream
+            .clone_dtoh(&self.device_page_table)
+            .map_err(|e| anyhow!("DSv4 flashmla swap device_page_table D2H failed: {e}"))?;
+        Ok(crate::attention::Dsv4FlashMlaImage {
+            fp8_kv_pool_len: self.fp8_kv_pool_len,
+            sw_blocks: self.sw_blocks,
+            comp_blocks: self.comp_blocks,
+            max_compressed_keys: self.max_compressed_keys,
+            topk_unified: self.topk_unified,
+            page_block_size: self.page_block_size,
+            fp8_kv_sw_bootstrapped: self.fp8_kv_sw_bootstrapped,
+            fp8_kv_comp_packed_rows: self.fp8_kv_comp_packed_rows,
+            topk_length,
+            sched_meta,
+            num_splits,
+            num_sm_parts: self.num_sm_parts,
+            fixed_overhead_num_blocks: self.fixed_overhead_num_blocks,
+            block_size_topk: self.block_size_topk,
+            device_page_table,
+        })
+    }
+
+    pub(crate) fn swap_in(
+        &mut self,
+        ctx: &DeviceContext,
+        pool: &mut Dsv4LayerKvLayout,
+        image: &crate::attention::Dsv4FlashMlaImage,
+    ) -> Result<()> {
+        ctx.stream
+            .memcpy_htod(&image.topk_length, &mut self.topk_length)
+            .map_err(|e| anyhow!("DSv4 flashmla swap topk_length H2D failed: {e}"))?;
+        ctx.stream
+            .memcpy_htod(&image.sched_meta, &mut self.sched_meta)
+            .map_err(|e| anyhow!("DSv4 flashmla swap sched_meta H2D failed: {e}"))?;
+        ctx.stream
+            .memcpy_htod(&image.num_splits, &mut self.num_splits)
+            .map_err(|e| anyhow!("DSv4 flashmla swap num_splits H2D failed: {e}"))?;
+        self.fp8_kv_pool_len = image.fp8_kv_pool_len;
+        self.sw_blocks = image.sw_blocks;
+        self.comp_blocks = image.comp_blocks;
+        self.max_compressed_keys = image.max_compressed_keys;
+        self.topk_unified = image.topk_unified;
+        self.page_block_size = image.page_block_size;
+        self.fp8_kv_sw_bootstrapped = image.fp8_kv_sw_bootstrapped;
+        self.fp8_kv_comp_packed_rows = image.fp8_kv_comp_packed_rows;
+        self.num_sm_parts = image.num_sm_parts;
+        self.fixed_overhead_num_blocks = image.fixed_overhead_num_blocks;
+        self.block_size_topk = image.block_size_topk;
+        Ok(())
+    }
 }
 
 /// Model-wide (one instance, NOT per-slot/per-layer) per-forward SCRATCH for the

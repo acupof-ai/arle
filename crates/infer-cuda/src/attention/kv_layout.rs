@@ -184,6 +184,100 @@ impl Dsv4CompressorState {
         let fp32_bytes = (2 * ratio * width + 2 * ratio * head_dim) * f32;
         bf16_bytes + fp32_bytes
     }
+
+    pub(crate) fn swap_out(
+        &self,
+        ctx: &DeviceContext,
+    ) -> Result<crate::attention::Dsv4CompressorImage> {
+        let pending_kv = ctx
+            .stream
+            .clone_dtoh(&self.pending_kv)
+            .map_err(|e| anyhow!("DSv4 compressor swap pending_kv D2H failed: {e}"))?;
+        let pending_score = ctx
+            .stream
+            .clone_dtoh(&self.pending_score)
+            .map_err(|e| anyhow!("DSv4 compressor swap pending_score D2H failed: {e}"))?;
+        let prev_overlap_kv = ctx
+            .stream
+            .clone_dtoh(&self.prev_overlap_kv)
+            .map_err(|e| anyhow!("DSv4 compressor swap prev_overlap_kv D2H failed: {e}"))?;
+        let prev_overlap_score = ctx
+            .stream
+            .clone_dtoh(&self.prev_overlap_score)
+            .map_err(|e| anyhow!("DSv4 compressor swap prev_overlap_score D2H failed: {e}"))?;
+        let compressed = ctx
+            .stream
+            .clone_dtoh(&self.compressed.data)
+            .map_err(|e| anyhow!("DSv4 compressor swap compressed D2H failed: {e}"))?;
+        let fp32_pending_kv = ctx
+            .stream
+            .clone_dtoh(&self.fp32_pending_kv)
+            .map_err(|e| anyhow!("DSv4 compressor swap fp32_pending_kv D2H failed: {e}"))?;
+        let fp32_pending_score = ctx
+            .stream
+            .clone_dtoh(&self.fp32_pending_score)
+            .map_err(|e| anyhow!("DSv4 compressor swap fp32_pending_score D2H failed: {e}"))?;
+        let fp32_prev_kv = ctx
+            .stream
+            .clone_dtoh(&self.fp32_prev_kv)
+            .map_err(|e| anyhow!("DSv4 compressor swap fp32_prev_kv D2H failed: {e}"))?;
+        let fp32_prev_score = ctx
+            .stream
+            .clone_dtoh(&self.fp32_prev_score)
+            .map_err(|e| anyhow!("DSv4 compressor swap fp32_prev_score D2H failed: {e}"))?;
+        Ok(crate::attention::Dsv4CompressorImage {
+            pending_kv,
+            pending_score,
+            prev_overlap_kv,
+            prev_overlap_score,
+            compressed,
+            compressed_seq_len: self.compressed.seq_len,
+            compressed_capacity: self.compressed_capacity,
+            ring_rows: self.ring_rows,
+            fp32_pending_kv,
+            fp32_pending_score,
+            fp32_prev_kv,
+            fp32_prev_score,
+            fp32_carry_stale: self.fp32_carry_stale,
+        })
+    }
+
+    pub(crate) fn swap_in(
+        &mut self,
+        ctx: &DeviceContext,
+        image: &crate::attention::Dsv4CompressorImage,
+    ) -> Result<()> {
+        ctx.stream
+            .memcpy_htod(&image.pending_kv, &mut self.pending_kv)
+            .map_err(|e| anyhow!("DSv4 compressor swap pending_kv H2D failed: {e}"))?;
+        ctx.stream
+            .memcpy_htod(&image.pending_score, &mut self.pending_score)
+            .map_err(|e| anyhow!("DSv4 compressor swap pending_score H2D failed: {e}"))?;
+        ctx.stream
+            .memcpy_htod(&image.prev_overlap_kv, &mut self.prev_overlap_kv)
+            .map_err(|e| anyhow!("DSv4 compressor swap prev_overlap_kv H2D failed: {e}"))?;
+        ctx.stream
+            .memcpy_htod(&image.prev_overlap_score, &mut self.prev_overlap_score)
+            .map_err(|e| anyhow!("DSv4 compressor swap prev_overlap_score H2D failed: {e}"))?;
+        ctx.stream
+            .memcpy_htod(&image.compressed, &mut self.compressed.data)
+            .map_err(|e| anyhow!("DSv4 compressor swap compressed H2D failed: {e}"))?;
+        self.compressed.seq_len = image.compressed_seq_len;
+        ctx.stream
+            .memcpy_htod(&image.fp32_pending_kv, &mut self.fp32_pending_kv)
+            .map_err(|e| anyhow!("DSv4 compressor swap fp32_pending_kv H2D failed: {e}"))?;
+        ctx.stream
+            .memcpy_htod(&image.fp32_pending_score, &mut self.fp32_pending_score)
+            .map_err(|e| anyhow!("DSv4 compressor swap fp32_pending_score H2D failed: {e}"))?;
+        ctx.stream
+            .memcpy_htod(&image.fp32_prev_kv, &mut self.fp32_prev_kv)
+            .map_err(|e| anyhow!("DSv4 compressor swap fp32_prev_kv H2D failed: {e}"))?;
+        ctx.stream
+            .memcpy_htod(&image.fp32_prev_score, &mut self.fp32_prev_score)
+            .map_err(|e| anyhow!("DSv4 compressor swap fp32_prev_score H2D failed: {e}"))?;
+        self.fp32_carry_stale = image.fp32_carry_stale;
+        Ok(())
+    }
 }
 
 /// Model-wide (one instance, NOT per-slot/per-layer) FP32 compressor-probe GEMM
