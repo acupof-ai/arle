@@ -236,7 +236,7 @@ pub struct W2sStepOutcome {
 /// 3. Aux ΔT: ΔT₁, ΔT₂
 /// 4. Consistency gate: cos(ΔT₁, ΔT₂) < threshold → skip
 /// 5. z_proxy = z_s.detach() + α·T·(ΔT₁ + ΔT₂)/2
-/// 6. L = T²·KL(softmax(z_proxy/T) ‖ softmax(z_s/T))
+/// 6. L = T²·KL(softmax(z_s/T) ‖ softmax(z_proxy/T))
 ///      + β₁·KL(π_new ‖ π_old) + β₂·KL(π_new ‖ π_base)
 /// 7. Backward → shadow adapter
 #[allow(clippy::too_many_arguments)]
