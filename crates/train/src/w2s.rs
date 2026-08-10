@@ -287,7 +287,10 @@ pub fn w2s_step<O: Optimizer>(
     // max-prob over the whole sequence would skip every sample.
     let student_probs = softmax(z_s, store, tape)?;
     let probs_host = store.to_host(student_probs)?;
-    let vocab = store.tensor(z_s)?.shape.last().copied().unwrap_or(0);
+    let vocab = store
+        .get(z_s)
+        .and_then(|t| t.shape.last().copied())
+        .unwrap_or(0);
     let last_pos_start = probs_host.len().saturating_sub(vocab);
     let max_prob = probs_host[last_pos_start..]
         .iter()
