@@ -131,6 +131,13 @@ pub(crate) struct Dsv4CudaExecutor {
     /// draft→verify→accept loop instead of MTP; `None` = MTP or no spec. The
     /// per-slot draft caches ride here (serial spec state, like `spec_slots`).
     pub(crate) dspark: Option<Dsv4DsparkExec>,
+    /// Whole-slot capacity spill store: a demoted slot's complete device image
+    /// (FP8 KV band + per-layer compressor/indexer/DSA/SW-ring carry) is
+    /// serialized here and restored on promote. Without this, KV overflow falls
+    /// back to recompute (expensive for long contexts). Uses the same
+    /// `KvTierStore` transport as the prefix-state pool; NVMe spill is opt-in
+    /// via `set_kv_tier_disk`.
+    slot_tier: KvTierStore,
 }
 
 /// Loaded DSpark drafter + its per-slot runtime caches. Present only under
@@ -696,6 +703,13 @@ impl Dsv4CudaExecutor {
             })
             .transpose()?;
         model.boot_mega_moe(num_slots.max(256))?;
+        // Whole-slot spill tier: same `KvTierStore` transport as the prefix
+        // pool, 16 MiB chunked blobs (a DSv4 slot image is far larger than one
+        // fixed page). NVMe spill is opt-in via `set_kv_tier_disk`.
+        let slot_tier = KvTierStore::with_budget(
+            default_t1_budget_bytes(DEFAULT_DRAM_FRACTION),
+            BLOB_CHUNK_BYTES,
+        );
         let exec = Self {
             model,
             slots,
@@ -715,6 +729,7 @@ impl Dsv4CudaExecutor {
             ),
             pending_prefix_captures: VecDeque::new(),
             dspark,
+            slot_tier,
         };
         log::info!(
             "DSv4 prefill chunk capability: {} tokens (ARLE_DSV4_PREFILL_CHUNK {:?}, deepep \
@@ -1158,20 +1173,28 @@ impl Dsv4CudaExecutor {
         root: std::path::PathBuf,
         budget_bytes: usize,
     ) -> bool {
-        self.prefix_state.set_disk(root, budget_bytes)
+        let prefix_ok = self.prefix_state.set_disk(root.clone(), budget_bytes);
+        let slot_ok = self
+            .slot_tier
+            .set_disk(root, budget_bytes, BLOB_CHUNK_BYTES);
+        prefix_ok && slot_ok
     }
 
-    /// Pre-serve re-budget: the whole `--kv-dram` share funds the prefix pool.
     pub(crate) fn set_kv_tier_budget_bytes(&mut self, bytes: usize) {
         self.prefix_state.set_budget_bytes(bytes);
+        self.slot_tier = KvTierStore::with_budget(bytes, BLOB_CHUNK_BYTES);
+    }
+
+    pub(crate) fn kv_slot_tier_enabled(&self) -> bool {
+        true
     }
 
     pub(crate) fn kv_tier_host_demoted_pages(&self) -> usize {
-        self.prefix_state.host_pages()
+        self.prefix_state.host_pages() + self.slot_tier.host_demoted_pages()
     }
 
     pub(crate) fn kv_tier_disk_pages(&self) -> usize {
-        self.prefix_state.disk_pages()
+        self.prefix_state.disk_pages() + self.slot_tier.disk_pages()
     }
 
     pub(crate) fn kv_tier_read_hits(&self) -> infer_seam::KvTierReadHits {
@@ -1193,6 +1216,87 @@ impl Dsv4CudaExecutor {
             metadata_write_bytes: stats.metadata_write_bytes,
             failures: stats.failures,
             completion_wait_ns: stats.completion_wait_ns,
+        }
+    }
+
+    pub(crate) fn demote_slot(&mut self, slot: usize, key: u64) -> Result<bool> {
+        ensure!(
+            slot < self.num_slots,
+            "DSv4 demote slot {slot} outside executor slots {}",
+            self.num_slots
+        );
+        let image = {
+            let Self {
+                model,
+                slots,
+                kv_adapter,
+                ..
+            } = &mut *self;
+            slots[slot].swap_out_image(&model.ctx, kv_adapter, slot)
+        };
+        let capture_ok = usize::from(image.is_ok());
+        if self.tp_min_usize(capture_ok, "dsv4 slot demote capture")? == 0 {
+            return Err(image
+                .err()
+                .unwrap_or_else(|| anyhow::anyhow!("peer rank failed DSv4 slot demote capture")));
+        }
+        let bytes = image?.to_bytes();
+        let inserted = self
+            .slot_tier
+            .insert_chunked(NS_SLOT, NS_SLOT_CHUNK, key, &bytes);
+        if self.tp_min_usize(usize::from(inserted), "dsv4 slot demote insert")? == 0 {
+            if inserted {
+                self.slot_tier.remove_chunked(NS_SLOT, NS_SLOT_CHUNK, key);
+            }
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    pub(crate) fn promote_slot(
+        &mut self,
+        key: u64,
+        slot: usize,
+        _slot_pages: &[u32],
+    ) -> Result<()> {
+        ensure!(
+            slot < self.num_slots,
+            "DSv4 promote slot {slot} outside executor slots {}",
+            self.num_slots
+        );
+        let image = self
+            .slot_tier
+            .read_chunked(NS_SLOT, NS_SLOT_CHUNK, key)
+            .map_err(|e| anyhow::anyhow!("DSv4 whole-slot tier read key {key}: {e}"))
+            .and_then(|bytes| crate::dsv4::Dsv4SlotImage::from_bytes(&bytes));
+        let image_ok = usize::from(image.is_ok());
+        if self.tp_min_usize(image_ok, "dsv4 slot promote read")? == 0 {
+            return Err(image
+                .err()
+                .unwrap_or_else(|| anyhow::anyhow!("peer rank failed DSv4 slot promote read")));
+        }
+        let image = image?;
+        let restored = {
+            let Self {
+                model,
+                slots,
+                kv_adapter,
+                ..
+            } = &mut *self;
+            slots[slot].swap_in_image(&model.ctx, kv_adapter, slot, &image)
+        };
+        let restore_ok = usize::from(restored.is_ok());
+        if self.tp_min_usize(restore_ok, "dsv4 slot promote restore")? == 0 {
+            return Err(restored
+                .err()
+                .unwrap_or_else(|| anyhow::anyhow!("peer rank failed DSv4 slot promote restore")));
+        }
+        restored
+    }
+
+    pub(crate) fn drop_kv_slot_entries(&mut self, keys: &[u64]) {
+        for &key in keys {
+            self.slot_tier.remove_chunked(NS_SLOT, NS_SLOT_CHUNK, key);
         }
     }
 

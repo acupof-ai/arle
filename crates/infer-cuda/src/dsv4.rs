@@ -576,6 +576,376 @@ pub(crate) struct Dsv4SlotState {
     max_seq_len: usize,
 }
 
+/// Host image of one whole DSv4 slot for capacity spill. Captures the per-layer
+/// attention carry (SW ring, compressor/indexer, FlashMLA metadata, DSA) plus
+/// the slot's FP8 KV band pages from each layer's shared pool.
+pub(crate) struct Dsv4SlotImage {
+    pub(crate) seq_len: usize,
+    pub(crate) layers: Vec<crate::attention::Dsv4LayerAttentionImage>,
+    pub(crate) kv_pages: Vec<Vec<u8>>,
+}
+
+impl Dsv4SlotImage {
+    pub(crate) fn dram_bytes(&self) -> usize {
+        let mut bytes = 8 + 8;
+        for layer in &self.layers {
+            bytes += layer.sw_window_cache.len() * 2;
+            if let Some(c) = &layer.compressor {
+                bytes += c.pending_kv.len() * 2
+                    + c.pending_score.len() * 2
+                    + c.prev_overlap_kv.len() * 2
+                    + c.prev_overlap_score.len() * 2
+                    + c.compressed.len() * 2
+                    + c.fp32_pending_kv.len() * 4
+                    + c.fp32_pending_score.len() * 4
+                    + c.fp32_prev_kv.len() * 4
+                    + c.fp32_prev_score.len() * 4
+                    + 8 * 4;
+            }
+            if let Some(c) = &layer.indexer {
+                bytes += c.pending_kv.len() * 2
+                    + c.pending_score.len() * 2
+                    + c.prev_overlap_kv.len() * 2
+                    + c.prev_overlap_score.len() * 2
+                    + c.compressed.len() * 2
+                    + c.fp32_pending_kv.len() * 4
+                    + c.fp32_pending_score.len() * 4
+                    + c.fp32_prev_kv.len() * 4
+                    + c.fp32_prev_score.len() * 4
+                    + 8 * 4;
+            }
+            if let Some(f) = &layer.flashmla {
+                bytes += f.topk_length.len() * 4
+                    + f.sched_meta.len() * 4
+                    + f.num_splits.len() * 4
+                    + f.device_page_table.len() * 4
+                    + 8 * 8;
+            }
+            if let Some(d) = &layer.dsa_official {
+                bytes += d.rotated_keys.len() * 2 + 8 * 2;
+            }
+        }
+        for pages in &self.kv_pages {
+            bytes += pages.len();
+        }
+        bytes
+    }
+
+    pub(crate) fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(self.dram_bytes() + 256);
+        buf.extend_from_slice(&(self.seq_len as u64).to_le_bytes());
+        buf.extend_from_slice(&(self.layers.len() as u64).to_le_bytes());
+        for layer in &self.layers {
+            write_bf16_vec(&mut buf, &layer.sw_window_cache);
+            write_compressor(&mut buf, layer.compressor.as_ref());
+            write_compressor(&mut buf, layer.indexer.as_ref());
+            write_flashmla(&mut buf, layer.flashmla.as_ref());
+            write_dsa(&mut buf, layer.dsa_official.as_ref());
+        }
+        buf.extend_from_slice(&(self.kv_pages.len() as u64).to_le_bytes());
+        for pages in &self.kv_pages {
+            buf.extend_from_slice(&(pages.len() as u64).to_le_bytes());
+            buf.extend_from_slice(pages);
+        }
+        buf
+    }
+
+    pub(crate) fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        let mut pos = 0usize;
+        let read_u64 = |pos: &mut usize| -> Result<u64> {
+            let end = pos
+                .checked_add(8)
+                .ok_or_else(|| anyhow!("dsv4 slot image u64 overflow"))?;
+            let slice = bytes
+                .get(*pos..end)
+                .ok_or_else(|| anyhow!("dsv4 slot image truncated u64 at {pos}"))?;
+            *pos = end;
+            Ok(u64::from_le_bytes(slice.try_into().unwrap()))
+        };
+        let read_u8 = |pos: &mut usize| -> Result<u8> {
+            let end = pos
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("dsv4 slot image u8 overflow"))?;
+            let slice = bytes
+                .get(*pos..end)
+                .ok_or_else(|| anyhow!("dsv4 slot image truncated u8 at {pos}"))?;
+            *pos = end;
+            Ok(slice[0])
+        };
+        let read_bytes = |pos: &mut usize| -> Result<Vec<u8>> {
+            let len = read_u64(pos)? as usize;
+            let end = pos
+                .checked_add(len)
+                .ok_or_else(|| anyhow!("dsv4 slot image bytes overflow"))?;
+            let slice = bytes
+                .get(*pos..end)
+                .ok_or_else(|| anyhow!("dsv4 slot image truncated bytes at {pos}"))?;
+            *pos = end;
+            Ok(slice.to_vec())
+        };
+        let read_bf16_vec = |pos: &mut usize| -> Result<Vec<half::bf16>> {
+            let raw = read_bytes(pos)?;
+            ensure!(
+                raw.len() % 2 == 0,
+                "dsv4 slot image bf16 vec odd length {}",
+                raw.len()
+            );
+            Ok(raw
+                .chunks_exact(2)
+                .map(|c| half::bf16::from_le_bytes([c[0], c[1]]))
+                .collect())
+        };
+        let read_f32_vec = |pos: &mut usize| -> Result<Vec<f32>> {
+            let raw = read_bytes(pos)?;
+            ensure!(
+                raw.len() % 4 == 0,
+                "dsv4 slot image f32 vec odd length {}",
+                raw.len()
+            );
+            Ok(raw
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+                .collect())
+        };
+        let read_i32_vec = |pos: &mut usize| -> Result<Vec<i32>> {
+            let raw = read_bytes(pos)?;
+            ensure!(
+                raw.len() % 4 == 0,
+                "dsv4 slot image i32 vec odd length {}",
+                raw.len()
+            );
+            Ok(raw
+                .chunks_exact(4)
+                .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
+                .collect())
+        };
+
+        let seq_len = read_u64(&mut pos)? as usize;
+        let num_layers = read_u64(&mut pos)? as usize;
+        let mut layers = Vec::with_capacity(num_layers);
+        for _ in 0..num_layers {
+            let sw_window_cache = read_bf16_vec(&mut pos)?;
+            let compressor = read_compressor(&mut pos, &read_u8, &read_bf16_vec, &read_f32_vec)?;
+            let indexer = read_compressor(&mut pos, &read_u8, &read_bf16_vec, &read_f32_vec)?;
+            let flashmla = read_flashmla(&mut pos, &read_u8, &read_i32_vec)?;
+            let dsa_official = read_dsa(&mut pos, &read_u8, &read_bf16_vec)?;
+            layers.push(crate::attention::Dsv4LayerAttentionImage {
+                sw_window_cache,
+                compressor,
+                indexer,
+                flashmla,
+                dsa_official,
+            });
+        }
+        let num_kv = read_u64(&mut pos)? as usize;
+        let mut kv_pages = Vec::with_capacity(num_kv);
+        for _ in 0..num_kv {
+            kv_pages.push(read_bytes(&mut pos)?);
+        }
+        Ok(Dsv4SlotImage {
+            seq_len,
+            layers,
+            kv_pages,
+        })
+    }
+}
+
+fn write_bytes(buf: &mut Vec<u8>, data: &[u8]) {
+    buf.extend_from_slice(&(data.len() as u64).to_le_bytes());
+    buf.extend_from_slice(data);
+}
+
+fn write_bf16_vec(buf: &mut Vec<u8>, v: &[half::bf16]) {
+    let bytes: Vec<u8> = v.iter().flat_map(|b| b.to_le_bytes()).collect();
+    write_bytes(buf, &bytes);
+}
+
+fn write_f32_vec(buf: &mut Vec<u8>, v: &[f32]) {
+    let bytes: Vec<u8> = v.iter().flat_map(|f| f.to_le_bytes()).collect();
+    write_bytes(buf, &bytes);
+}
+
+fn write_i32_vec(buf: &mut Vec<u8>, v: &[i32]) {
+    let bytes: Vec<u8> = v.iter().flat_map(|i| i.to_le_bytes()).collect();
+    write_bytes(buf, &bytes);
+}
+
+fn write_compressor(buf: &mut Vec<u8>, c: Option<&crate::attention::Dsv4CompressorImage>) {
+    match c {
+        None => buf.push(0),
+        Some(c) => {
+            buf.push(1);
+            write_bf16_vec(buf, &c.pending_kv);
+            write_bf16_vec(buf, &c.pending_score);
+            write_bf16_vec(buf, &c.prev_overlap_kv);
+            write_bf16_vec(buf, &c.prev_overlap_score);
+            write_bf16_vec(buf, &c.compressed);
+            buf.extend_from_slice(&(c.compressed_seq_len as u64).to_le_bytes());
+            buf.extend_from_slice(&(c.compressed_capacity as u64).to_le_bytes());
+            buf.extend_from_slice(&(c.ring_rows as u64).to_le_bytes());
+            write_f32_vec(buf, &c.fp32_pending_kv);
+            write_f32_vec(buf, &c.fp32_pending_score);
+            write_f32_vec(buf, &c.fp32_prev_kv);
+            write_f32_vec(buf, &c.fp32_prev_score);
+            buf.push(c.fp32_carry_stale as u8);
+        }
+    }
+}
+
+fn write_flashmla(buf: &mut Vec<u8>, f: Option<&crate::attention::Dsv4FlashMlaImage>) {
+    match f {
+        None => buf.push(0),
+        Some(f) => {
+            buf.push(1);
+            buf.extend_from_slice(&(f.fp8_kv_pool_len as u64).to_le_bytes());
+            buf.extend_from_slice(&(f.sw_blocks as u64).to_le_bytes());
+            buf.extend_from_slice(&(f.comp_blocks as u64).to_le_bytes());
+            buf.extend_from_slice(&(f.max_compressed_keys as u64).to_le_bytes());
+            buf.extend_from_slice(&(f.topk_unified as u64).to_le_bytes());
+            buf.extend_from_slice(&(f.page_block_size as u64).to_le_bytes());
+            buf.push(f.fp8_kv_sw_bootstrapped as u8);
+            buf.extend_from_slice(&(f.fp8_kv_comp_packed_rows as u64).to_le_bytes());
+            write_i32_vec(buf, &f.topk_length);
+            write_i32_vec(buf, &f.sched_meta);
+            write_i32_vec(buf, &f.num_splits);
+            buf.extend_from_slice(&f.num_sm_parts.to_le_bytes());
+            buf.extend_from_slice(&f.fixed_overhead_num_blocks.to_le_bytes());
+            buf.extend_from_slice(&f.block_size_topk.to_le_bytes());
+            write_i32_vec(buf, &f.device_page_table);
+        }
+    }
+}
+
+fn write_dsa(buf: &mut Vec<u8>, d: Option<&crate::attention::Dsv4DsaImage>) {
+    match d {
+        None => buf.push(0),
+        Some(d) => {
+            buf.push(1);
+            buf.extend_from_slice(&(d.key_cache_len as u64).to_le_bytes());
+            write_bf16_vec(buf, &d.rotated_keys);
+            buf.extend_from_slice(&(d.packed_rows as u64).to_le_bytes());
+        }
+    }
+}
+
+fn read_compressor(
+    pos: &mut usize,
+    read_u8: &impl Fn(&mut usize) -> Result<u8>,
+    read_bf16_vec: &impl Fn(&mut usize) -> Result<Vec<half::bf16>>,
+    read_f32_vec: &impl Fn(&mut usize) -> Result<Vec<f32>>,
+) -> Result<Option<crate::attention::Dsv4CompressorImage>> {
+    let flag = read_u8(pos)?;
+    if flag == 0 {
+        return Ok(None);
+    }
+    let pending_kv = read_bf16_vec(pos)?;
+    let pending_score = read_bf16_vec(pos)?;
+    let prev_overlap_kv = read_bf16_vec(pos)?;
+    let prev_overlap_score = read_bf16_vec(pos)?;
+    let compressed = read_bf16_vec(pos)?;
+    let compressed_seq_len = read_u64_helper(pos, read_u8)? as usize;
+    let compressed_capacity = read_u64_helper(pos, read_u8)? as usize;
+    let ring_rows = read_u64_helper(pos, read_u8)? as usize;
+    let fp32_pending_kv = read_f32_vec(pos)?;
+    let fp32_pending_score = read_f32_vec(pos)?;
+    let fp32_prev_kv = read_f32_vec(pos)?;
+    let fp32_prev_score = read_f32_vec(pos)?;
+    let fp32_carry_stale = read_u8(pos)? != 0;
+    Ok(Some(crate::attention::Dsv4CompressorImage {
+        pending_kv,
+        pending_score,
+        prev_overlap_kv,
+        prev_overlap_score,
+        compressed,
+        compressed_seq_len,
+        compressed_capacity,
+        ring_rows,
+        fp32_pending_kv,
+        fp32_pending_score,
+        fp32_prev_kv,
+        fp32_prev_score,
+        fp32_carry_stale,
+    }))
+}
+
+fn read_u64_helper(pos: &mut usize, read_u8: &impl Fn(&mut usize) -> Result<u8>) -> Result<u64> {
+    let mut bytes = [0u8; 8];
+    for b in bytes.iter_mut() {
+        *b = read_u8(pos)?;
+    }
+    Ok(u64::from_le_bytes(bytes))
+}
+
+fn read_flashmla(
+    pos: &mut usize,
+    read_u8: &impl Fn(&mut usize) -> Result<u8>,
+    read_i32_vec: &impl Fn(&mut usize) -> Result<Vec<i32>>,
+) -> Result<Option<crate::attention::Dsv4FlashMlaImage>> {
+    let flag = read_u8(pos)?;
+    if flag == 0 {
+        return Ok(None);
+    }
+    let fp8_kv_pool_len = read_u64_helper(pos, read_u8)? as usize;
+    let sw_blocks = read_u64_helper(pos, read_u8)? as usize;
+    let comp_blocks = read_u64_helper(pos, read_u8)? as usize;
+    let max_compressed_keys = read_u64_helper(pos, read_u8)? as usize;
+    let topk_unified = read_u64_helper(pos, read_u8)? as usize;
+    let page_block_size = read_u64_helper(pos, read_u8)? as usize;
+    let fp8_kv_sw_bootstrapped = read_u8(pos)? != 0;
+    let fp8_kv_comp_packed_rows = read_u64_helper(pos, read_u8)? as usize;
+    let topk_length = read_i32_vec(pos)?;
+    let sched_meta = read_i32_vec(pos)?;
+    let num_splits = read_i32_vec(pos)?;
+    let num_sm_parts = read_i32_helper(pos, read_u8)?;
+    let fixed_overhead_num_blocks = read_i32_helper(pos, read_u8)?;
+    let block_size_topk = read_i32_helper(pos, read_u8)?;
+    let device_page_table = read_i32_vec(pos)?;
+    Ok(Some(crate::attention::Dsv4FlashMlaImage {
+        fp8_kv_pool_len,
+        sw_blocks,
+        comp_blocks,
+        max_compressed_keys,
+        topk_unified,
+        page_block_size,
+        fp8_kv_sw_bootstrapped,
+        fp8_kv_comp_packed_rows,
+        topk_length,
+        sched_meta,
+        num_splits,
+        num_sm_parts,
+        fixed_overhead_num_blocks,
+        block_size_topk,
+        device_page_table,
+    }))
+}
+
+fn read_i32_helper(pos: &mut usize, read_u8: &impl Fn(&mut usize) -> Result<u8>) -> Result<i32> {
+    let mut bytes = [0u8; 4];
+    for b in bytes.iter_mut() {
+        *b = read_u8(pos)?;
+    }
+    Ok(i32::from_le_bytes(bytes))
+}
+
+fn read_dsa(
+    pos: &mut usize,
+    read_u8: &impl Fn(&mut usize) -> Result<u8>,
+    read_bf16_vec: &impl Fn(&mut usize) -> Result<Vec<half::bf16>>,
+) -> Result<Option<crate::attention::Dsv4DsaImage>> {
+    let flag = read_u8(pos)?;
+    if flag == 0 {
+        return Ok(None);
+    }
+    let key_cache_len = read_u64_helper(pos, read_u8)? as usize;
+    let rotated_keys = read_bf16_vec(pos)?;
+    let packed_rows = read_u64_helper(pos, read_u8)? as usize;
+    Ok(Some(crate::attention::Dsv4DsaImage {
+        key_cache_len,
+        rotated_keys,
+        packed_rows,
+    }))
+}
+
 /// Full-prompt-chunk tap capture for the DSpark prefix seed. Each buffer holds
 /// one target layer's wide HC stream `[stream_dim * rows]` token-major (column
 /// `j*hc_mult + r` at `(j*hc_mult + r) * hidden`), index-aligned with
@@ -1516,6 +1886,97 @@ impl Dsv4SlotState {
                     .flashmla_truncate_slot(slot_idx, new_len)?;
             }
         }
+        Ok(())
+    }
+
+    pub(crate) fn swap_out_image(
+        &mut self,
+        ctx: &DeviceContext,
+        kv_adapter: &mut crate::attention::Dsv4KvAdapter,
+        slot_idx: usize,
+    ) -> Result<Dsv4SlotImage> {
+        let num_layers = self.attention.len();
+        let mut layers = Vec::with_capacity(num_layers);
+        let mut kv_pages = Vec::with_capacity(num_layers);
+        for layer_idx in 0..num_layers {
+            let pool = kv_adapter.layer(layer_idx)?;
+            let layer_image = self.attention[layer_idx].swap_out(ctx, pool)?;
+            let pages = if let Some(flash) = &self.attention[layer_idx].flashmla {
+                let table = pool.flashmla_page_table(flash.slot_idx)?;
+                if table.is_empty() {
+                    Vec::new()
+                } else {
+                    pool.flashmla_pool()?.copy_pages_to_host(ctx, table)?
+                }
+            } else {
+                Vec::new()
+            };
+            layers.push(layer_image);
+            kv_pages.push(pages);
+        }
+        ctx.sync()?;
+        for layer_idx in 0..num_layers {
+            if let Some(slot_idx_in_layer) = self.attention[layer_idx].flashmla_slot_idx() {
+                kv_adapter
+                    .layer_mut(layer_idx)?
+                    .flashmla_free_slot(slot_idx_in_layer)?;
+            }
+        }
+        let seq_len = self.seq_len;
+        self.seq_len = 0;
+        Ok(Dsv4SlotImage {
+            seq_len,
+            layers,
+            kv_pages,
+        })
+    }
+
+    pub(crate) fn swap_in_image(
+        &mut self,
+        ctx: &DeviceContext,
+        kv_adapter: &mut crate::attention::Dsv4KvAdapter,
+        slot_idx: usize,
+        image: &Dsv4SlotImage,
+    ) -> Result<()> {
+        ensure!(
+            image.layers.len() == self.attention.len(),
+            "DSv4 swap-in layer count {} != attention states {}",
+            image.layers.len(),
+            self.attention.len()
+        );
+        kv_adapter.mirror_full_band(ctx, slot_idx, image.seq_len)?;
+        for layer_idx in 0..self.attention.len() {
+            if let Some(flash) = &self.attention[layer_idx].flashmla {
+                let slot_idx_in_layer = flash.slot_idx;
+                if !image.kv_pages[layer_idx].is_empty() {
+                    let table: Vec<u32> = kv_adapter
+                        .layer(layer_idx)?
+                        .flashmla_page_table(slot_idx_in_layer)?
+                        .to_vec();
+                    let expected = image.layers[layer_idx]
+                        .flashmla
+                        .as_ref()
+                        .map(|f| f.device_page_table.len())
+                        .unwrap_or(0);
+                    ensure!(
+                        table.len() == expected,
+                        "DSv4 swap-in layer {layer_idx} page count {} != image {}",
+                        table.len(),
+                        expected
+                    );
+                    kv_adapter
+                        .layer_mut(layer_idx)?
+                        .flashmla_pool_mut()?
+                        .copy_pages_from_host(ctx, &table, &image.kv_pages[layer_idx])?;
+                }
+            }
+            let pool = kv_adapter.layer_mut(layer_idx)?;
+            self.attention[layer_idx].swap_in(ctx, pool, &image.layers[layer_idx])?;
+            self.attention[layer_idx]
+                .refresh_flashmla_device_page_table(ctx, kv_adapter.layer(layer_idx)?)?;
+        }
+        self.seq_len = image.seq_len;
+        ctx.sync()?;
         Ok(())
     }
 }
