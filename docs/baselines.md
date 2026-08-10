@@ -231,6 +231,32 @@ build: TTFT 24.94/24.95 s vs 24.97/25.05, zero fallback lines in the serve log.
 
 ---
 
+## DSv4-Flash-FP8 · 8×H20 · TP=8/EP=8 · eager
+
+### SOTA — DSpark, runtime `868043f5f` (2026-08-10)
+
+Serve `--spec-type dspark --mtp-draft-model
+/host/nvme0/DeepSeek-V4-Flash-DSpark-draft-fp8`. DSpark runtime: stages=3
+block=5 target_layers=[40,41,42], +2592 MB weights/GPU. Base model + draft on
+NVMe (HDD load timed out the engine-ready barrier at 924 s).
+
+Synthetic prompts (64), 30 s/point, max_tokens 128, greedy, seed 42. Not the
+32K agent fingerprint — a first DSv4 DSpark measurement; re-anchor on the
+agent workload before ranking.
+
+| c | complete | out tok/s | total tok/s | accept |
+|---|---:|---:|---:|---:|
+| 1 | 18/18 | 72.4 | 76.9 | 58.7% |
+| 8 | 48/48 | 176.2 | 187.6 | — |
+| 16 | 64/64 | 242.2 | 257.9 | — |
+
+Acceptance 58.7% (1390 accepted / 2367 drafted, 574 chains), 2.42 tokens/chain
+(block size 5). c=1 is +37% over the plain-decode 53 tok/s. The speedup is
+smaller than Qwen3.6-27B's 2.9× because DSv4's verify cost (larger model, FP8
+MoE) eats more of the draft gain.
+
+---
+
 ## DSv4-Flash-FP8 · 4×H20 · TP=4/EP=4 · eager
 
 ### SOTA — Base, `d0525cb06` (re-anchored 2026-07-25, #180)
