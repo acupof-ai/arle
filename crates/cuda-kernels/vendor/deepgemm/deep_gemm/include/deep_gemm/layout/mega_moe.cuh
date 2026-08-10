@@ -323,12 +323,12 @@ struct Data {
     void* base;
 
     CUTLASS_HOST_DEVICE
-    constexpr explicit Data(
+    explicit Data(
         const uint32_t& num_bytes,
         const bool& require_tma_alignment = true,
         void* base = nullptr) :
         num_bytes(num_bytes), require_tma_alignment(require_tma_alignment), base(base) {
-        DG_UNIFIED_ASSERT(num_bytes % 16 == 0 or not require_tma_alignment);
+        assert(num_bytes % 16 == 0 || !require_tma_alignment);
     }
 
     template <typename dtype_t = uint32_t>

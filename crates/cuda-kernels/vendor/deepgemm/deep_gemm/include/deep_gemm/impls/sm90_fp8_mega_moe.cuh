@@ -221,16 +221,16 @@ sm90_fp8_mega_moe_impl(void* y,
     const auto workspace = layout::SM90Workspace(
         sym_buffer.get_base_ptr(), kNumRanks, kNumExperts, kNumMaxTokensPerRank, kNumTopk);
 
-    constexpr auto fp8_token_layout              = layout::Data(kHidden);
-    constexpr auto bf16_token_layout             = layout::Data(kHidden * sizeof(nv_bfloat16));
-    constexpr auto fp8_intermediate_token_layout = layout::Data(kIntermediateHidden);
+    const auto fp8_token_layout              = layout::Data(kHidden);
+    const auto bf16_token_layout             = layout::Data(kHidden * sizeof(nv_bfloat16));
+    const auto fp8_intermediate_token_layout = layout::Data(kIntermediateHidden);
     // Per-128 K float SF: 4 bytes per per-128 group => `kHidden / 32` bytes/token (same as SM100 packing)
-    constexpr auto fp8_sf_layout                 = layout::Data(kHidden / 32);
+    const auto fp8_sf_layout                 = layout::Data(kHidden / 32);
     // Per-64 K float SF (SM90 only): 4 bytes per per-64 group => `kIntermediateHidden / 16` bytes/token
-    constexpr auto fp8_intermediate_sf_layout    = layout::Data(kIntermediateHidden / 16);
-    constexpr auto input_topk_idx_layout         = layout::Data(kNumTopk * sizeof(int64_t), false);
-    constexpr auto input_topk_weights_layout     = layout::Data(kNumTopk * sizeof(float), false);
-    constexpr auto l1_topk_weights_layout        = layout::Data(sizeof(float), false);
+    const auto fp8_intermediate_sf_layout    = layout::Data(kIntermediateHidden / 16);
+    const auto input_topk_idx_layout         = layout::Data(kNumTopk * sizeof(int64_t), false);
+    const auto input_topk_weights_layout     = layout::Data(kNumTopk * sizeof(float), false);
+    const auto l1_topk_weights_layout        = layout::Data(sizeof(float), false);
 
     // Registered input area
     const auto input_token_buffer        = layout::Buffer(fp8_token_layout, 1, kNumMaxTokensPerRank, workspace.get_end_ptr());
