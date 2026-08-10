@@ -2979,11 +2979,12 @@ impl SafetensorLoader {
             std::slice::from_raw_parts(qw_bytes.as_ptr().cast::<i32>(), qw_bytes.len() / 4)
         };
 
-        // Read scales (BF16 [num_groups, n])
+        // Read scales (BF16 or F16 [num_groups, n])
         let scales = self.borrow_raw_tensor(&view.scale_names[0])?;
         ensure!(
-            scales.dtype == Dtype::BF16 && scales.shape == [num_groups, n],
-            "{}: expected GPTQ scales BF16 [{}, {}], got {:?} {:?}",
+            (scales.dtype == Dtype::BF16 || scales.dtype == Dtype::F16)
+                && scales.shape == [num_groups, n],
+            "{}: expected GPTQ scales BF16/F16 [{}, {}], got {:?} {:?}",
             view.scale_names[0],
             num_groups,
             n,
@@ -2991,6 +2992,21 @@ impl SafetensorLoader {
             scales.shape
         );
         let scales_bytes = scales.bytes();
+        // Convert F16 scales to BF16 if needed.
+        let scales_bf16: Cow<[u8]> = if scales.dtype == Dtype::F16 {
+            Cow::Owned(
+                scales_bytes
+                    .chunks_exact(2)
+                    .flat_map(|c| {
+                        let f16 = half::f16::from_le_bytes([c[0], c[1]]);
+                        half::bf16::from_f32(f16.to_f32()).to_le_bytes()
+                    })
+                    .collect(),
+            )
+        } else {
+            Cow::Borrowed(scales_bytes)
+        };
+        let scales_bytes = scales_bf16.as_ref();
 
         // Read qzeros (I32 [num_groups, n//8])
         let qzeros = self.borrow_raw_tensor(&view.scale_names[1])?;
