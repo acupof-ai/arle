@@ -663,24 +663,72 @@ fn run_w2s(args: TrainW2sArgs) -> Result<()> {
         grad_clip: args.grad_clip,
     };
 
-    let prompt_ids: Vec<u32> = match &args.prompt_ids {
-        Some(s) => s
-            .split(',')
-            .map(|t| t.trim().parse::<u32>().context("parse prompt token id"))
-            .collect::<Result<Vec<_>>>()?,
-        None => vec![1, 3, 8],
+    // Build the list of training prompts. If `--train-data` is set, load the
+    // JSONL and tokenize each row; otherwise fall back to the single
+    // `--prompt-ids` sequence (or the default BOS smoke-test prompt).
+    let prompts: Vec<Vec<u32>> = match &args.train_data {
+        Some(path) => {
+            use std::io::{BufRead, BufReader};
+            let file = std::fs::File::open(path)
+                .with_context(|| format!("open train data {}", path.display()))?;
+            let reader = BufReader::new(file);
+            let mut out = Vec::new();
+            for (i, line) in reader.lines().enumerate() {
+                let line = line.with_context(|| format!("read train data line {i}"))?;
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let row: serde_json::Value = serde_json::from_str(&line)
+                    .with_context(|| format!("parse train data line {i}"))?;
+                if let Some(ids) = row.get("prompt_ids").and_then(|v| v.as_array()) {
+                    let ids: Vec<u32> = ids
+                        .iter()
+                        .filter_map(|v| v.as_u64().map(|n| n as u32))
+                        .collect();
+                    if !ids.is_empty() {
+                        out.push(ids);
+                    }
+                } else if let Some(text) = row.get("text").and_then(|v| v.as_str()) {
+                    // Tokenize with the student's tokenizer.
+                    let ids = tokenize_text(text, &args.student_model)?;
+                    if !ids.is_empty() {
+                        out.push(ids);
+                    }
+                }
+            }
+            if out.is_empty() {
+                bail!("no valid prompts found in {}", path.display());
+            }
+            eprintln!(
+                "[arle train w2s] loaded {} training prompts from {}",
+                out.len(),
+                path.display()
+            );
+            out
+        }
+        None => {
+            let ids = match &args.prompt_ids {
+                Some(s) => s
+                    .split(',')
+                    .map(|t| t.trim().parse::<u32>().context("parse prompt token id"))
+                    .collect::<Result<Vec<_>>>()?,
+                None => vec![1, 3, 8],
+            };
+            vec![ids]
+        }
     };
 
     let mut optimizer = AdamW::new(args.lr, (0.9, 0.999), 1e-8, 0.0);
 
     for step in 0..args.steps {
+        let prompt_ids = &prompts[step % prompts.len()];
         let outcome = w2s_step(
             &student,
             &serving,
             &base,
             &aux1,
             &aux2,
-            &prompt_ids,
+            prompt_ids,
             &cfg,
             &trainable_params,
             &mut optimizer,
@@ -706,6 +754,95 @@ fn run_w2s(args: TrainW2sArgs) -> Result<()> {
         }
     }
 
+    // Save the trained LoRA adapter if requested.
+    if let Some(adapter_dir) = &args.save_adapter {
+        save_w2s_adapter(
+            &student,
+            &mut store,
+            adapter_dir,
+            &args.student_model,
+            &lora,
+            target_set,
+        )?;
+        eprintln!(
+            "[arle train w2s] adapter saved to {}",
+            adapter_dir.display()
+        );
+    }
+
+    Ok(())
+}
+
+/// Tokenize a text string using the model's tokenizer.json.
+fn tokenize_text(text: &str, model_dir: &std::path::Path) -> Result<Vec<u32>> {
+    use tokenizers::Tokenizer;
+    let tok_path = model_dir.join("tokenizer.json");
+    let tok = Tokenizer::from_file(&tok_path)
+        .with_context(|| format!("load tokenizer from {}", tok_path.display()))?;
+    let ids = tok
+        .encode(text, false)
+        .map_err(|e| anyhow!("tokenize: {e}"))?;
+    Ok(ids.get_ids().to_vec())
+}
+
+/// Save the student's LoRA adapter as a PEFT-style directory (adapter_model.safetensors
+/// + adapter_config.json + tokenizer/config copies), loadable by `arle serve --lora`.
+fn save_w2s_adapter(
+    student: &Qwen35Model,
+    store: &mut TensorStore,
+    adapter_dir: &std::path::Path,
+    student_model: &std::path::Path,
+    lora: &train::lora::LoraConfig,
+    target_set: train::lora::LoraTargetSet,
+) -> Result<()> {
+    use train::lora::{LoraAdapterConfig, LoraTargetSet};
+    use train::qwen35_checkpoint::{
+        ConfigJsonSource, GenerationConfigSource, Qwen35NamedCheckpoint, Qwen35StudentWeights,
+        save_named_qwen35_student_checkpoint,
+    };
+
+    fs::create_dir_all(adapter_dir)
+        .with_context(|| format!("create adapter dir {}", adapter_dir.display()))?;
+    let sources = checkpoint_sources(student_model)?;
+    let mut adapter_config =
+        LoraAdapterConfig::new(student_model.display().to_string(), "qwen35", *lora);
+    adapter_config.target_modules = match target_set {
+        LoraTargetSet::AttentionQv => vec!["q_proj".to_owned(), "v_proj".to_owned()],
+        LoraTargetSet::AttentionFull => vec![
+            "q_proj".to_owned(),
+            "k_proj".to_owned(),
+            "v_proj".to_owned(),
+            "o_proj".to_owned(),
+            "in_proj_qkv".to_owned(),
+            "out_proj".to_owned(),
+        ],
+        LoraTargetSet::AllLinear => vec!["all-linear".to_owned()],
+    };
+    let mut adapter_tape = Tape::new();
+    save_named_qwen35_student_checkpoint(
+        Qwen35NamedCheckpoint {
+            out_dir: adapter_dir.parent().unwrap_or(std::path::Path::new(".")),
+            dirname: adapter_dir
+                .file_name()
+                .unwrap_or_default()
+                .to_str()
+                .unwrap_or("adapter"),
+            tokenizer_path: Some(&sources.tokenizer_path),
+            config_json: ConfigJsonSource::CopyFrom(&sources.config_path),
+            generation_config: GenerationConfigSource::CopyOrSynthesize {
+                source_path: &sources.generation_config_path,
+                fallback_config_path: &sources.config_path,
+            },
+        },
+        student,
+        store,
+        &mut adapter_tape,
+        Qwen35StudentWeights::AdapterOnly {
+            bf16: true,
+            adapter_config,
+        },
+    )
+    .with_context(|| format!("save w2s adapter to {}", adapter_dir.display()))?;
     Ok(())
 }
 

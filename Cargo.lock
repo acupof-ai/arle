@@ -405,6 +405,7 @@ dependencies = [
  "spec-train",
  "sysinfo",
  "tempfile",
+ "tokenizers",
  "tokio",
  "tools",
  "train",
