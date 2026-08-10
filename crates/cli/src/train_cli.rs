@@ -778,7 +778,7 @@ fn tokenize_text(text: &str, model_dir: &std::path::Path) -> Result<Vec<u32>> {
     use tokenizers::Tokenizer;
     let tok_path = model_dir.join("tokenizer.json");
     let tok = Tokenizer::from_file(&tok_path)
-        .with_context(|| format!("load tokenizer from {}", tok_path.display()))?;
+        .map_err(|e| anyhow!("load tokenizer from {}: {e}", tok_path.display()))?;
     let ids = tok
         .encode(text, false)
         .map_err(|e| anyhow!("tokenize: {e}"))?;
@@ -788,7 +788,7 @@ fn tokenize_text(text: &str, model_dir: &std::path::Path) -> Result<Vec<u32>> {
 /// Save the student's LoRA adapter as a PEFT-style directory (adapter_model.safetensors
 /// + adapter_config.json + tokenizer/config copies), loadable by `arle serve --lora`.
 fn save_w2s_adapter(
-    student: &Qwen35Model,
+    student: &train::qwen35::Qwen35Model,
     store: &mut TensorStore,
     adapter_dir: &std::path::Path,
     student_model: &std::path::Path,
@@ -839,7 +839,7 @@ fn save_w2s_adapter(
         &mut adapter_tape,
         Qwen35StudentWeights::AdapterOnly {
             bf16: true,
-            adapter_config,
+            adapter_config: &adapter_config,
         },
     )
     .with_context(|| format!("save w2s adapter to {}", adapter_dir.display()))?;
