@@ -2384,7 +2384,7 @@ impl SafetensorLoader {
             .unwrap_or(false)
     }
 
-    fn quant_view_for(&self, name: &str) -> Result<Option<QuantTensorView>> {
+    pub(crate) fn quant_view_for(&self, name: &str) -> Result<Option<QuantTensorView>> {
         if self.quant_manifest.is_none() {
             return Ok(None);
         }
