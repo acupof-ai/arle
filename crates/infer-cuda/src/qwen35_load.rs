@@ -908,6 +908,20 @@ fn load_linear_qkv_sharded(
     if let Some(matrix) = loader.load_linear_qkv_fp8_head_sharded(ctx, name, &head_blocks, tp)? {
         return Ok(matrix);
     }
+    // GPTQ/W4A16 and other packed-quant formats: the fused qkv weight lives at
+    // `{name}.qweight` (no `.weight`). For TP=1 the whole matrix loads as one
+    // quant view; head-block sharding for TP>1 is not yet implemented for
+    // packed quant (falls through to the BF16 path, which errors clearly).
+    if tp.world_size == 1 {
+        let view = loader.quant_view_for(name)?;
+        eprintln!(
+            "[DEBUG] load_linear_qkv_sharded {name}: quant_view={}",
+            view.is_some()
+        );
+        if view.is_some() {
+            return loader.load_matrix_quant_aware(ctx, name);
+        }
+    }
     let tensor = loader.load_raw_tensor(name)?;
     ensure!(
         tensor.dtype == Dtype::BF16,

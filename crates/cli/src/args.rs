@@ -1467,8 +1467,21 @@ pub(crate) struct TrainW2sArgs {
     pub(crate) aux2_post: PathBuf,
 
     /// Prompt token ids (comma-separated). Defaults to a short BOS sequence.
+    /// Ignored when `--train-data` is set.
     #[arg(long, value_name = "IDS")]
     pub(crate) prompt_ids: Option<String>,
+
+    /// Training data JSONL. Each row must have `prompt_ids` (list of token
+    /// ids) or `text` (raw string, tokenized with the student's tokenizer).
+    /// When set, the w2s loop iterates over the dataset instead of a single
+    /// fixed prompt.
+    #[arg(long, value_name = "PATH")]
+    pub(crate) train_data: Option<PathBuf>,
+
+    /// Directory to save the trained LoRA adapter after the run. When omitted,
+    /// the adapter is discarded (smoke-test mode).
+    #[arg(long, value_name = "PATH")]
+    pub(crate) save_adapter: Option<PathBuf>,
 
     /// Distillation strength α. α·T·‖ΔT‖ should be comparable to ‖z_student‖.
     #[arg(long, default_value_t = 0.5)]
