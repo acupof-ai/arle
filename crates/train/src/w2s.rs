@@ -146,12 +146,28 @@ impl W2sAuxModel {
             Self::Infer { pre_rl, post_rl } => {
                 // InferTeacher imports logits as device constants into the store;
                 // the tape is not involved (no grad flows into aux models).
+                // Reload each teacher's weights onto GPU just-in-time and offload
+                // immediately after, so only one aux engine is resident at a time.
+                post_rl
+                    .reload_engine_weights()
+                    .map_err(|e| anyhow!("reload aux post-RL engine: {e}"))?;
                 let post_logits = post_rl
                     .forward_logits_device(input_ids, positions, store, tape)
                     .map_err(|e| anyhow!("aux post-RL infer forward: {e}"))?;
+                post_rl
+                    .offload_engine_weights()
+                    .map_err(|e| anyhow!("offload aux post-RL engine: {e}"))?;
+
+                pre_rl
+                    .reload_engine_weights()
+                    .map_err(|e| anyhow!("reload aux pre-RL engine: {e}"))?;
                 let pre_logits = pre_rl
                     .forward_logits_device(input_ids, positions, store, tape)
                     .map_err(|e| anyhow!("aux pre-RL infer forward: {e}"))?;
+                pre_rl
+                    .offload_engine_weights()
+                    .map_err(|e| anyhow!("offload aux pre-RL engine: {e}"))?;
+
                 let lp_post = log_softmax(post_logits.tensor_id, store, tape)?;
                 let lp_pre = log_softmax(pre_logits.tensor_id, store, tape)?;
                 let neg_pre = mul_scalar(lp_pre, -1.0, store, tape)?;

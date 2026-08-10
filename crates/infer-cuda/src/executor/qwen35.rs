@@ -2873,6 +2873,15 @@ impl Qwen35CudaExecutor {
         // addresses — drop them wholesale. Re-built + re-captured lazily after
         // reload (the gate flag stays armed).
         self.decode_graph = None;
+        // Release the KV pool too: the w2s aux engines only run short forward
+        // passes, and leaving N KV pools resident OOMs the student forward.
+        // `reload_engine_weights` re-acquires it via `ensure_kv_pool`.
+        self.release_kv_pool()?;
+        // Trim the async pool AFTER releasing workspace + batch-decode scratch
+        // so the co-resident autograd store (cudaMalloc) sees the freed VRAM.
+        self.model.ctx.trim_memory_pool()?;
+        let (free, total) = self.model.ctx.mem_info_bytes()?;
+        eprintln!("[executor-offload] free={free} total={total}");
         Ok(freed)
     }
 
@@ -2895,7 +2904,10 @@ impl Qwen35CudaExecutor {
     /// Reload the model's device weights from the host snapshot.
     pub(crate) fn reload_engine_weights(&mut self) -> Result<()> {
         self.ensure_not_collective("reload_engine_weights")?;
-        self.model.reload_engine_weights()
+        self.model.reload_engine_weights()?;
+        // Re-acquire the KV pool released by `offload_engine_weights`.
+        self.ensure_kv_pool()?;
+        Ok(())
     }
 
     /// OPD surfaces are rank-0 control-seam calls: under multi-rank TP they
