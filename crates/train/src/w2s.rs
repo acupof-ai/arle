@@ -114,10 +114,13 @@ impl W2sAuxModel {
         }
     }
 
-    /// Policy shift ΔT = log_softmax(post_rl) − log_softmax(pre_rl).
+    /// Policy shift ΔT = post_rl_logits − pre_rl_logits (logit space).
     ///
-    /// Both forwards run with the tape disabled — the aux models supply a
-    /// constant distillation signal; no gradient flows into them.
+    /// Using the logit-space shift (not log-prob) keeps the proxy teacher
+    /// `z_proxy = z_s + α·T·ΔT` in a single space — adding a log-prob
+    /// difference to logits mixes coordinate systems and distorts the
+    /// softmax. Both forwards run with the tape disabled — the aux models
+    /// supply a constant distillation signal; no gradient flows into them.
     pub fn forward_delta(
         &self,
         input_ids: &[u32],
@@ -135,10 +138,8 @@ impl W2sAuxModel {
                 let pre_logits = pre_rl
                     .forward(store, tape, input_ids, positions)
                     .map_err(|e| anyhow!("aux pre-RL forward: {e}"))?;
-                let lp_post = log_softmax(post_logits, store, tape)?;
-                let lp_pre = log_softmax(pre_logits, store, tape)?;
-                let neg_pre = mul_scalar(lp_pre, -1.0, store, tape)?;
-                let delta = add(lp_post, neg_pre, store, tape)?;
+                let neg_pre = mul_scalar(pre_logits, -1.0, store, tape)?;
+                let delta = add(post_logits, neg_pre, store, tape)?;
                 tape.set_enabled(was_enabled);
                 Ok(delta)
             }
@@ -168,10 +169,8 @@ impl W2sAuxModel {
                     .offload_engine_weights()
                     .map_err(|e| anyhow!("offload aux pre-RL engine: {e}"))?;
 
-                let lp_post = log_softmax(post_logits.tensor_id, store, tape)?;
-                let lp_pre = log_softmax(pre_logits.tensor_id, store, tape)?;
-                let neg_pre = mul_scalar(lp_pre, -1.0, store, tape)?;
-                let delta = add(lp_post, neg_pre, store, tape)?;
+                let neg_pre = mul_scalar(pre_logits.tensor_id, -1.0, store, tape)?;
+                let delta = add(post_logits.tensor_id, neg_pre, store, tape)?;
                 Ok(delta)
             }
         }
@@ -283,9 +282,17 @@ pub fn w2s_step<O: Optimizer>(
         .map_err(|e| anyhow!("student forward: {e}"))?;
 
     // 2. Confidence filter (host-side for Phase 1).
+    // Only the last position matters for generation — prompt positions are
+    // always high-confidence (the next token is the fixed prompt text), so
+    // max-prob over the whole sequence would skip every sample.
     let student_probs = softmax(z_s, store, tape)?;
     let probs_host = store.to_host(student_probs)?;
-    let max_prob = probs_host.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let vocab = store.tensor(z_s)?.shape.last().copied().unwrap_or(0);
+    let last_pos_start = probs_host.len().saturating_sub(vocab);
+    let max_prob = probs_host[last_pos_start..]
+        .iter()
+        .copied()
+        .fold(f32::NEG_INFINITY, f32::max);
     if max_prob > cfg.confidence_threshold {
         cleanup(store, tape);
         return Ok(W2sStepOutcome {
