@@ -95,14 +95,14 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         sym_buffer.get_base_ptr(), kNumRanks, kNumExperts, kNumMaxTokensPerRank, kNumTopk);
 
     // Token and buffer layouts
-    constexpr auto fp8_token_layout = layout::Data(kHidden);
-    constexpr auto bf16_token_layout = layout::Data(kHidden * sizeof(nv_bfloat16));
-    constexpr auto fp8_intermediate_token_layout = layout::Data(kIntermediateHidden);
-    constexpr auto fp8_sf_layout = layout::Data(kHidden / 32);
-    constexpr auto fp8_intermediate_sf_layout = layout::Data(kIntermediateHidden / 32);
-    constexpr auto input_topk_idx_layout = layout::Data(kNumTopk * sizeof(int64_t), false);
-    constexpr auto input_topk_weights_layout = layout::Data(kNumTopk * sizeof(float), false);
-    constexpr auto l1_topk_weights_layout = layout::Data(sizeof(float), false);
+    const auto fp8_token_layout = layout::Data(kHidden);
+    const auto bf16_token_layout = layout::Data(kHidden * sizeof(nv_bfloat16));
+    const auto fp8_intermediate_token_layout = layout::Data(kIntermediateHidden);
+    const auto fp8_sf_layout = layout::Data(kHidden / 32);
+    const auto fp8_intermediate_sf_layout = layout::Data(kIntermediateHidden / 32);
+    const auto input_topk_idx_layout = layout::Data(kNumTopk * sizeof(int64_t), false);
+    const auto input_topk_weights_layout = layout::Data(kNumTopk * sizeof(float), false);
+    const auto l1_topk_weights_layout = layout::Data(sizeof(float), false);
 
     // Registered inputs
     const auto input_token_buffer = layout::Buffer(
