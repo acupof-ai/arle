@@ -609,7 +609,7 @@ fn run_w2s(args: TrainW2sArgs) -> Result<()> {
             );
             let aux2_post = load_qwen35_from_hf_dir(&args.aux2_post, &mut store)
                 .with_context(|| format!("load aux2 post-RL from {}", args.aux2_post.display()))?;
-            W2sAuxModel::new_in_process(aux2_pre, aux2_post)
+            (W2sAuxModel::new_in_process(aux2_pre, aux2_post), false)
         }
         #[cfg(feature = "cuda")]
         W2sAuxBackendArg::Infer => {
@@ -619,9 +619,10 @@ fn run_w2s(args: TrainW2sArgs) -> Result<()> {
             // aux2 (ΔT₁ == ΔT₂). Real runs load independent aux2 checkpoints.
             eprintln!("[arle train w2s] reusing aux1 engines for aux2 (smoke-test sharing)");
             match &aux1 {
-                W2sAuxModel::Infer { pre_rl, post_rl } => {
-                    W2sAuxModel::new_infer(pre_rl.clone(), post_rl.clone())
-                }
+                W2sAuxModel::Infer { pre_rl, post_rl } => (
+                    W2sAuxModel::new_infer(pre_rl.clone(), post_rl.clone()),
+                    true,
+                ),
                 _ => unreachable!("aux_backend=infer but aux1 is not Infer"),
             }
         }
@@ -630,6 +631,7 @@ fn run_w2s(args: TrainW2sArgs) -> Result<()> {
             bail!("--aux-backend infer requires the cuda feature");
         }
     };
+    let (aux2, share_aux) = aux2;
 
     let trainable_params: Vec<TensorId> = student
         .all_parameter_ids()
@@ -734,6 +736,7 @@ fn run_w2s(args: TrainW2sArgs) -> Result<()> {
             &mut optimizer,
             &mut store,
             &mut tape,
+            share_aux,
         )?;
 
         if outcome.skipped {
