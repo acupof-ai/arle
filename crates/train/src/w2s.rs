@@ -252,6 +252,7 @@ pub fn w2s_step<O: Optimizer>(
     optimizer: &mut O,
     store: &mut TensorStore,
     tape: &mut Tape,
+    share_aux: bool,
 ) -> Result<W2sStepOutcome> {
     let positions: Vec<u32> = (0..input_ids.len() as u32).collect();
     let num_positions = input_ids.len();
@@ -298,7 +299,13 @@ pub fn w2s_step<O: Optimizer>(
 
     // 3. Aux policy shifts ΔT₁, ΔT₂.
     let delta1 = aux1.forward_delta(input_ids, &positions, store, tape)?;
-    let delta2 = aux2.forward_delta(input_ids, &positions, store, tape)?;
+    let delta2 = if share_aux {
+        // Both aux models are identical — reuse ΔT₁ instead of running the
+        // same forward pass twice (saves one pre-RL + one post-RL reload).
+        delta1
+    } else {
+        aux2.forward_delta(input_ids, &positions, store, tape)?
+    };
 
     // 4. Consistency gate (host-side for Phase 1).
     let d1_host = store.to_host(delta1)?;
