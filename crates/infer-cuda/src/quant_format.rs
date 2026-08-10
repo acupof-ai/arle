@@ -430,11 +430,11 @@ pub(crate) fn validate_scale_shapes(
                 k
             );
             let num_groups = k / group_size;
-            // scales: BF16 [num_groups, n]
+            // scales: BF16 or F16 [num_groups, n]
             let scales = tensor_by_name(tensors, &view.scale_names[0])?;
             ensure!(
-                scales.dtype == Dtype::BF16,
-                "{}: GPTQ scales must be BF16, got {:?}",
+                scales.dtype == Dtype::BF16 || scales.dtype == Dtype::F16,
+                "{}: GPTQ scales must be BF16 or F16, got {:?}",
                 view.scale_names[0],
                 scales.dtype
             );
