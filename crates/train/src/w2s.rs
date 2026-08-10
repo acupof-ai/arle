@@ -16,7 +16,7 @@ use std::collections::HashSet;
 use anyhow::{Result, anyhow};
 use autograd::{
     Optimizer, Tape, TensorId, TensorStore,
-    ops::{add, log_softmax, mul_scalar, softmax},
+    ops::{add, mul_scalar, softmax},
 };
 
 use crate::loss::{KlDirection, kl_distill_loss};
