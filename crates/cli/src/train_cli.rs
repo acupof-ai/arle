@@ -538,12 +538,20 @@ fn run_w2s(args: TrainW2sArgs) -> Result<()> {
                 "[arle train w2s] loading aux1 pre-RL (infer) from {}",
                 args.aux1_pre.display()
             );
+            // Aux engines only run a single short forward pass; keep the KV
+            // pool tiny so the student's activations + aux weights fit on one
+            // GPU. `single_sequence` sets total_pages but the CUDA pool sizer
+            // ignores it and budgets from `mem_fraction_static` of free VRAM.
+            let aux_cfg = EngineLoadConfig {
+                mem_fraction_static: 0.01,
+                ..EngineLoadConfig::single_sequence(128)
+            };
             let pre_engine = LoadedInferenceEngine::load_with_config(
                 args.aux1_pre
                     .to_str()
                     .ok_or_else(|| anyhow!("aux1 pre path not UTF-8"))?,
                 true,
-                EngineLoadConfig::single_sequence(128),
+                aux_cfg.clone(),
             )
             .with_context(|| format!("load aux1 pre-RL infer from {}", args.aux1_pre.display()))?;
             eprintln!(
@@ -565,7 +573,7 @@ fn run_w2s(args: TrainW2sArgs) -> Result<()> {
                     .to_str()
                     .ok_or_else(|| anyhow!("aux1 post path not UTF-8"))?,
                 true,
-                EngineLoadConfig::single_sequence(128),
+                aux_cfg,
             )
             .with_context(|| {
                 format!("load aux1 post-RL infer from {}", args.aux1_post.display())
