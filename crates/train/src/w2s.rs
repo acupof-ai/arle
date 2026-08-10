@@ -321,7 +321,10 @@ pub fn w2s_step<O: Optimizer>(
     let d1_host = store.to_host(delta1)?;
     let d2_host = store.to_host(delta2)?;
     let consistency = cosine_similarity(&d1_host, &d2_host);
-    if consistency < cfg.consistency_threshold {
+    // NaN consistency means the aux forward produced NaN logits (e.g. INT8
+    // quantization overflow on some inputs). Skip rather than poisoning the
+    // student's adapter weights with a NaN gradient.
+    if consistency.is_nan() || consistency < cfg.consistency_threshold {
         cleanup(store, tape);
         return Ok(W2sStepOutcome {
             loss: 0.0,
