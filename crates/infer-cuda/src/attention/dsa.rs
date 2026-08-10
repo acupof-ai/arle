@@ -80,6 +80,30 @@ impl Dsv4DsaOfficialState {
     pub(crate) fn device_bytes(&self) -> usize {
         self.rotated_keys.len() * std::mem::size_of::<half::bf16>()
     }
+
+    pub(crate) fn swap_out(&self, ctx: &DeviceContext) -> Result<crate::attention::Dsv4DsaImage> {
+        let rotated_keys = ctx
+            .stream
+            .clone_dtoh(&self.rotated_keys)
+            .map_err(|e| anyhow!("DSv4 DSA swap rotated_keys D2H failed: {e}"))?;
+        Ok(crate::attention::Dsv4DsaImage {
+            key_cache_len: self.key_cache_len,
+            rotated_keys,
+            packed_rows: self.packed_rows,
+        })
+    }
+
+    pub(crate) fn swap_in(
+        &mut self,
+        ctx: &DeviceContext,
+        image: &crate::attention::Dsv4DsaImage,
+    ) -> Result<()> {
+        ctx.stream
+            .memcpy_htod(&image.rotated_keys, &mut self.rotated_keys)
+            .map_err(|e| anyhow!("DSv4 DSA swap rotated_keys H2D failed: {e}"))?;
+        self.packed_rows = image.packed_rows;
+        Ok(())
+    }
 }
 
 /// Per-MODEL shared half of the official DSA selector — ONE instance per
@@ -593,6 +617,58 @@ impl Dsv4SpecRingSnapshot {
     }
 }
 
+/// Host image of one layer's attention state for whole-slot spill. Every
+/// device buffer that carries cross-call state is captured byte-for-byte.
+/// Scratch-only fields (`fused_wqkv`) are NOT captured — they're overwritten
+/// before read each forward.
+pub(crate) struct Dsv4LayerAttentionImage {
+    pub(crate) sw_window_cache: Vec<half::bf16>,
+    pub(crate) compressor: Option<Dsv4CompressorImage>,
+    pub(crate) indexer: Option<Dsv4CompressorImage>,
+    pub(crate) flashmla: Option<Dsv4FlashMlaImage>,
+    pub(crate) dsa_official: Option<Dsv4DsaImage>,
+}
+
+pub(crate) struct Dsv4CompressorImage {
+    pub(crate) pending_kv: Vec<half::bf16>,
+    pub(crate) pending_score: Vec<half::bf16>,
+    pub(crate) prev_overlap_kv: Vec<half::bf16>,
+    pub(crate) prev_overlap_score: Vec<half::bf16>,
+    pub(crate) compressed: Vec<half::bf16>,
+    pub(crate) compressed_seq_len: usize,
+    pub(crate) compressed_capacity: usize,
+    pub(crate) ring_rows: usize,
+    pub(crate) fp32_pending_kv: Vec<f32>,
+    pub(crate) fp32_pending_score: Vec<f32>,
+    pub(crate) fp32_prev_kv: Vec<f32>,
+    pub(crate) fp32_prev_score: Vec<f32>,
+    pub(crate) fp32_carry_stale: bool,
+}
+
+pub(crate) struct Dsv4FlashMlaImage {
+    pub(crate) fp8_kv_pool_len: usize,
+    pub(crate) sw_blocks: usize,
+    pub(crate) comp_blocks: usize,
+    pub(crate) max_compressed_keys: usize,
+    pub(crate) topk_unified: usize,
+    pub(crate) page_block_size: usize,
+    pub(crate) fp8_kv_sw_bootstrapped: bool,
+    pub(crate) fp8_kv_comp_packed_rows: usize,
+    pub(crate) topk_length: Vec<i32>,
+    pub(crate) sched_meta: Vec<i32>,
+    pub(crate) num_splits: Vec<i32>,
+    pub(crate) num_sm_parts: i32,
+    pub(crate) fixed_overhead_num_blocks: i32,
+    pub(crate) block_size_topk: i32,
+    pub(crate) device_page_table: Vec<i32>,
+}
+
+pub(crate) struct Dsv4DsaImage {
+    pub(crate) key_cache_len: usize,
+    pub(crate) rotated_keys: Vec<half::bf16>,
+    pub(crate) packed_rows: usize,
+}
+
 impl Dsv4LayerAttentionState {
     /// This layer-state's indexer compressed-key row count (`compressed.seq_len`),
     /// or `None` if the layer has no indexer. Used by the batched P1b cache-write
@@ -1070,6 +1146,64 @@ impl Dsv4LayerAttentionState {
             if let Some(bootstrapped) = snap.fp8_bootstrapped_before {
                 flash.fp8_kv_sw_bootstrapped = bootstrapped;
             }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn swap_out(
+        &mut self,
+        ctx: &DeviceContext,
+        pool: &Dsv4LayerKvLayout,
+    ) -> Result<Dsv4LayerAttentionImage> {
+        let sw_window_cache = ctx
+            .stream
+            .clone_dtoh(&self.sw_window_cache)
+            .map_err(|e| anyhow!("DSv4 swap sw_window_cache D2H failed: {e}"))?;
+        let compressor = self
+            .compressor
+            .as_ref()
+            .map(|c| c.swap_out(ctx))
+            .transpose()?;
+        let indexer = self.indexer.as_ref().map(|c| c.swap_out(ctx)).transpose()?;
+        let flashmla = self
+            .flashmla
+            .as_ref()
+            .map(|f| f.swap_out(ctx, pool))
+            .transpose()?;
+        let dsa_official = self
+            .dsa_official
+            .as_ref()
+            .map(|d| d.swap_out(ctx))
+            .transpose()?;
+        Ok(Dsv4LayerAttentionImage {
+            sw_window_cache,
+            compressor,
+            indexer,
+            flashmla,
+            dsa_official,
+        })
+    }
+
+    pub(crate) fn swap_in(
+        &mut self,
+        ctx: &DeviceContext,
+        pool: &mut Dsv4LayerKvLayout,
+        image: &Dsv4LayerAttentionImage,
+    ) -> Result<()> {
+        ctx.stream
+            .memcpy_htod(&image.sw_window_cache, &mut self.sw_window_cache)
+            .map_err(|e| anyhow!("DSv4 swap sw_window_cache H2D failed: {e}"))?;
+        if let (Some(dst), Some(src)) = (&mut self.compressor, &image.compressor) {
+            dst.swap_in(ctx, src)?;
+        }
+        if let (Some(dst), Some(src)) = (&mut self.indexer, &image.indexer) {
+            dst.swap_in(ctx, src)?;
+        }
+        if let (Some(dst), Some(src)) = (&mut self.flashmla, &image.flashmla) {
+            dst.swap_in(ctx, pool, src)?;
+        }
+        if let (Some(dst), Some(src)) = (&mut self.dsa_official, &image.dsa_official) {
+            dst.swap_in(ctx, src)?;
         }
         Ok(())
     }
