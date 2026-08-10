@@ -491,29 +491,34 @@ impl RealCudaExecutor {
     pub(crate) fn kv_slot_tier_enabled(&self) -> bool {
         match self {
             Self::Qwen35(q) => q.kv_slot_tier_enabled(),
-            Self::Dsv4(_) | Self::Qwen(_) => false,
+            Self::Dsv4(d) => d.kv_slot_tier_enabled(),
+            Self::Qwen(_) => false,
         }
     }
 
     pub(crate) fn demote_slot(&mut self, slot: usize, key: u64) -> Result<bool> {
         match self {
             Self::Qwen35(q) => q.demote_slot(slot, key),
-            Self::Dsv4(_) | Self::Qwen(_) => Ok(false),
+            Self::Dsv4(d) => d.demote_slot(slot, key),
+            Self::Qwen(_) => Ok(false),
         }
     }
 
     pub(crate) fn promote_slot(&mut self, key: u64, slot: usize, slot_pages: &[u32]) -> Result<()> {
         match self {
             Self::Qwen35(q) => q.promote_slot(key, slot, slot_pages),
-            Self::Dsv4(_) | Self::Qwen(_) => {
-                anyhow::bail!("whole-slot KV tier store is only implemented for Qwen3.6 CUDA")
+            Self::Dsv4(d) => d.promote_slot(key, slot, slot_pages),
+            Self::Qwen(_) => {
+                anyhow::bail!("whole-slot KV tier store is only implemented for Qwen3.6/DSv4 CUDA")
             }
         }
     }
 
     pub(crate) fn drop_kv_slot_entries(&mut self, keys: &[u64]) {
-        if let Self::Qwen35(q) = self {
-            q.drop_kv_slot_entries(keys);
+        match self {
+            Self::Qwen35(q) => q.drop_kv_slot_entries(keys),
+            Self::Dsv4(d) => d.drop_kv_slot_entries(keys),
+            Self::Qwen(_) => {}
         }
     }
 
