@@ -539,7 +539,7 @@ pub(crate) struct Dsv4LayerAttentionState {
     pub(super) sw_window_cache: CudaSlice<half::bf16>,
     pub(super) compressor: Option<Dsv4CompressorState>,
     pub(super) indexer: Option<Dsv4CompressorState>,
-    pub(super) flashmla: Option<Dsv4FlashMlaDecodeState>,
+    pub(crate) flashmla: Option<Dsv4FlashMlaDecodeState>,
     pub(super) fused_wqkv: Option<Dsv4FusedWqkvDecodeScratch>,
     pub(super) dsa_official: Option<Dsv4DsaOfficialState>,
 }

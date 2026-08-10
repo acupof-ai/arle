@@ -105,7 +105,7 @@ impl Dsv4FlashMlaDecodeShape {
 }
 
 pub(crate) struct Dsv4FlashMlaDecodeState {
-    pub(super) slot_idx: usize,
+    pub(crate) slot_idx: usize,
     pub(super) fp8_kv_pool_len: usize,
     pub(super) sw_blocks: usize,
     pub(super) comp_blocks: usize,
@@ -338,7 +338,7 @@ impl Dsv4FlashMlaDecodeState {
     pub(crate) fn swap_out(
         &self,
         ctx: &DeviceContext,
-        pool: &Dsv4LayerKvLayout,
+        _pool: &Dsv4LayerKvLayout,
     ) -> Result<crate::attention::Dsv4FlashMlaImage> {
         let topk_length = ctx
             .stream
@@ -378,7 +378,7 @@ impl Dsv4FlashMlaDecodeState {
     pub(crate) fn swap_in(
         &mut self,
         ctx: &DeviceContext,
-        pool: &mut Dsv4LayerKvLayout,
+        _pool: &mut Dsv4LayerKvLayout,
         image: &crate::attention::Dsv4FlashMlaImage,
     ) -> Result<()> {
         ctx.stream

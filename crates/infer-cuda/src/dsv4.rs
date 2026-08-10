@@ -1902,7 +1902,8 @@ impl Dsv4SlotState {
             let pool = kv_adapter.layer(layer_idx)?;
             let layer_image = self.attention[layer_idx].swap_out(ctx, pool)?;
             let pages = if let Some(flash) = &self.attention[layer_idx].flashmla {
-                let table = pool.flashmla_page_table(flash.slot_idx)?;
+                debug_assert_eq!(flash.slot_idx, slot_idx);
+                let table = pool.flashmla_page_table(slot_idx)?;
                 if table.is_empty() {
                     Vec::new()
                 } else {
@@ -1947,11 +1948,11 @@ impl Dsv4SlotState {
         kv_adapter.mirror_full_band(ctx, slot_idx, image.seq_len)?;
         for layer_idx in 0..self.attention.len() {
             if let Some(flash) = &self.attention[layer_idx].flashmla {
-                let slot_idx_in_layer = flash.slot_idx;
+                debug_assert_eq!(flash.slot_idx, slot_idx);
                 if !image.kv_pages[layer_idx].is_empty() {
                     let table: Vec<u32> = kv_adapter
                         .layer(layer_idx)?
-                        .flashmla_page_table(slot_idx_in_layer)?
+                        .flashmla_page_table(slot_idx)?
                         .to_vec();
                     let expected = image.layers[layer_idx]
                         .flashmla

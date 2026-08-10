@@ -1621,13 +1621,13 @@ impl Dsv4LayerKvLayout {
 
     /// The layer's shared FlashMLA latent pool (present iff the decode-alloc
     /// gate is on and this layer has a non-empty FlashMLA shape).
-    pub(super) fn flashmla_pool(&self) -> Result<&TokenKVPool> {
+    pub(crate) fn flashmla_pool(&self) -> Result<&TokenKVPool> {
         self.flashmla_kv_pool
             .as_ref()
             .ok_or_else(|| anyhow!("DSv4 FlashMLA shared pool missing"))
     }
 
-    pub(super) fn flashmla_pool_mut(&mut self) -> Result<&mut TokenKVPool> {
+    pub(crate) fn flashmla_pool_mut(&mut self) -> Result<&mut TokenKVPool> {
         self.flashmla_kv_pool
             .as_mut()
             .ok_or_else(|| anyhow!("DSv4 FlashMLA shared pool missing"))
@@ -1655,7 +1655,7 @@ impl Dsv4LayerKvLayout {
     /// (FlashMLA's FFI calls our 64-token page a "block"). The ONLY source of band addresses (#85 P2) — token counts and
     /// block counts come from the pool's table, never re-derived from
     /// `slot_idx` arithmetic.
-    pub(super) fn flashmla_page_table(&self, slot_idx: usize) -> Result<&[u32]> {
+    pub(crate) fn flashmla_page_table(&self, slot_idx: usize) -> Result<&[u32]> {
         ensure!(
             slot_idx < self.num_slots,
             "DSv4 attention pool slot {slot_idx} outside num_slots {}",
