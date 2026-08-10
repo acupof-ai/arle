@@ -205,26 +205,42 @@ impl Dsv4CompressorState {
             .stream
             .clone_dtoh(&self.prev_overlap_score)
             .map_err(|e| anyhow!("DSv4 compressor swap prev_overlap_score D2H failed: {e}"))?;
-        let compressed = ctx
-            .stream
-            .clone_dtoh(&self.compressed.data)
-            .map_err(|e| anyhow!("DSv4 compressor swap compressed D2H failed: {e}"))?;
-        let fp32_pending_kv = ctx
-            .stream
-            .clone_dtoh(&self.fp32_pending_kv)
-            .map_err(|e| anyhow!("DSv4 compressor swap fp32_pending_kv D2H failed: {e}"))?;
-        let fp32_pending_score = ctx
-            .stream
-            .clone_dtoh(&self.fp32_pending_score)
-            .map_err(|e| anyhow!("DSv4 compressor swap fp32_pending_score D2H failed: {e}"))?;
-        let fp32_prev_kv = ctx
-            .stream
-            .clone_dtoh(&self.fp32_prev_kv)
-            .map_err(|e| anyhow!("DSv4 compressor swap fp32_prev_kv D2H failed: {e}"))?;
-        let fp32_prev_score = ctx
-            .stream
-            .clone_dtoh(&self.fp32_prev_score)
-            .map_err(|e| anyhow!("DSv4 compressor swap fp32_prev_score D2H failed: {e}"))?;
+        let valid = self.compressed.seq_len * self.compressed.hidden_dim;
+        let compressed = if valid > 0 {
+            ctx.stream
+                .clone_dtoh(&self.compressed.data.slice(..valid))
+                .map_err(|e| anyhow!("DSv4 compressor swap compressed D2H failed: {e}"))?
+        } else {
+            Vec::new()
+        };
+        let (fp32_pending_kv, fp32_pending_score, fp32_prev_kv, fp32_prev_score) = if self
+            .fp32_carry_stale
+        {
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new())
+        } else {
+            let fp32_pending_kv = ctx
+                .stream
+                .clone_dtoh(&self.fp32_pending_kv)
+                .map_err(|e| anyhow!("DSv4 compressor swap fp32_pending_kv D2H failed: {e}"))?;
+            let fp32_pending_score = ctx
+                .stream
+                .clone_dtoh(&self.fp32_pending_score)
+                .map_err(|e| anyhow!("DSv4 compressor swap fp32_pending_score D2H failed: {e}"))?;
+            let fp32_prev_kv = ctx
+                .stream
+                .clone_dtoh(&self.fp32_prev_kv)
+                .map_err(|e| anyhow!("DSv4 compressor swap fp32_prev_kv D2H failed: {e}"))?;
+            let fp32_prev_score = ctx
+                .stream
+                .clone_dtoh(&self.fp32_prev_score)
+                .map_err(|e| anyhow!("DSv4 compressor swap fp32_prev_score D2H failed: {e}"))?;
+            (
+                fp32_pending_kv,
+                fp32_pending_score,
+                fp32_prev_kv,
+                fp32_prev_score,
+            )
+        };
         Ok(crate::attention::Dsv4CompressorImage {
             pending_kv,
             pending_score,
@@ -232,8 +248,6 @@ impl Dsv4CompressorState {
             prev_overlap_score,
             compressed,
             compressed_seq_len: self.compressed.seq_len,
-            compressed_capacity: self.compressed_capacity,
-            ring_rows: self.ring_rows,
             fp32_pending_kv,
             fp32_pending_score,
             fp32_prev_kv,
@@ -259,23 +273,32 @@ impl Dsv4CompressorState {
         ctx.stream
             .memcpy_htod(&image.prev_overlap_score, &mut self.prev_overlap_score)
             .map_err(|e| anyhow!("DSv4 compressor swap prev_overlap_score H2D failed: {e}"))?;
-        ctx.stream
-            .memcpy_htod(&image.compressed, &mut self.compressed.data)
-            .map_err(|e| anyhow!("DSv4 compressor swap compressed H2D failed: {e}"))?;
+        if !image.compressed.is_empty() {
+            ctx.stream
+                .memcpy_htod(
+                    &image.compressed,
+                    &mut self.compressed.data.slice_mut(..image.compressed.len()),
+                )
+                .map_err(|e| anyhow!("DSv4 compressor swap compressed H2D failed: {e}"))?;
+        }
         self.compressed.seq_len = image.compressed_seq_len;
-        ctx.stream
-            .memcpy_htod(&image.fp32_pending_kv, &mut self.fp32_pending_kv)
-            .map_err(|e| anyhow!("DSv4 compressor swap fp32_pending_kv H2D failed: {e}"))?;
-        ctx.stream
-            .memcpy_htod(&image.fp32_pending_score, &mut self.fp32_pending_score)
-            .map_err(|e| anyhow!("DSv4 compressor swap fp32_pending_score H2D failed: {e}"))?;
-        ctx.stream
-            .memcpy_htod(&image.fp32_prev_kv, &mut self.fp32_prev_kv)
-            .map_err(|e| anyhow!("DSv4 compressor swap fp32_prev_kv H2D failed: {e}"))?;
-        ctx.stream
-            .memcpy_htod(&image.fp32_prev_score, &mut self.fp32_prev_score)
-            .map_err(|e| anyhow!("DSv4 compressor swap fp32_prev_score H2D failed: {e}"))?;
-        self.fp32_carry_stale = image.fp32_carry_stale;
+        if image.fp32_carry_stale {
+            self.fp32_carry_stale = true;
+        } else {
+            ctx.stream
+                .memcpy_htod(&image.fp32_pending_kv, &mut self.fp32_pending_kv)
+                .map_err(|e| anyhow!("DSv4 compressor swap fp32_pending_kv H2D failed: {e}"))?;
+            ctx.stream
+                .memcpy_htod(&image.fp32_pending_score, &mut self.fp32_pending_score)
+                .map_err(|e| anyhow!("DSv4 compressor swap fp32_pending_score H2D failed: {e}"))?;
+            ctx.stream
+                .memcpy_htod(&image.fp32_prev_kv, &mut self.fp32_prev_kv)
+                .map_err(|e| anyhow!("DSv4 compressor swap fp32_prev_kv H2D failed: {e}"))?;
+            ctx.stream
+                .memcpy_htod(&image.fp32_prev_score, &mut self.fp32_prev_score)
+                .map_err(|e| anyhow!("DSv4 compressor swap fp32_prev_score H2D failed: {e}"))?;
+            self.fp32_carry_stale = false;
+        }
         Ok(())
     }
 }
@@ -571,6 +594,7 @@ impl Dsv4LayerKvLayout {
         ctx: &DeviceContext,
         slot_idx: usize,
         tokens: usize,
+        zero: bool,
     ) -> Result<bool> {
         if !self.flashmla_demand_paged {
             return Ok(false);
@@ -588,9 +612,11 @@ impl Dsv4LayerKvLayout {
                  unreachable: {e}"
             )
         })?;
-        self.flashmla_pool_mut()?
-            .zero_pages(ctx, &new_pages)
-            .map_err(|e| anyhow!("DSv4 FlashMLA demand-page zero failed: {e}"))?;
+        if zero {
+            self.flashmla_pool_mut()?
+                .zero_pages(ctx, &new_pages)
+                .map_err(|e| anyhow!("DSv4 FlashMLA demand-page zero failed: {e}"))?;
+        }
         Ok(true)
     }
 
@@ -1238,7 +1264,7 @@ impl Dsv4KvAdapter {
                 continue;
             }
             if layer.flashmla_demand_paged {
-                changed |= layer.flashmla_ensure_band(ctx, slot, seq_len)?;
+                changed |= layer.flashmla_ensure_band(ctx, slot, seq_len, false)?;
                 layer.flashmla_pool_mut()?.set_band_cursor(slot, seq_len)?;
                 continue;
             }
@@ -1279,7 +1305,7 @@ impl Dsv4KvAdapter {
                 continue;
             }
             if layer.flashmla_demand_paged {
-                changed |= layer.flashmla_ensure_band(ctx, slot, tokens)?;
+                changed |= layer.flashmla_ensure_band(ctx, slot, tokens, true)?;
                 continue;
             }
             let Some(pool) = layer.flashmla_kv_pool.as_mut() else {
@@ -1388,7 +1414,8 @@ impl ModelKvAdapter for Dsv4KvAdapter {
                     continue;
                 }
                 if layer.flashmla_demand_paged {
-                    band_changed |= layer.flashmla_ensure_band(&ctx, row.slot, ensure_tokens)?;
+                    band_changed |=
+                        layer.flashmla_ensure_band(&ctx, row.slot, ensure_tokens, true)?;
                 } else {
                     // Identity band (#154): band page = slot*lsp + i. Engine
                     // logical ids never enter physical tables — V32 pack
