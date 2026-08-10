@@ -763,10 +763,16 @@ impl Qwen35Model {
         }
 
         // Quiesce again after the block frees so reload (or a co-resident
-        // backward) sees a settled pool. We deliberately do NOT trim the pool to
-        // the OS: the freed blocks must stay in the shared async pool for the
-        // student backward to reuse.
+        // backward) sees a settled pool. Trim the pool to the OS so the
+        // co-resident autograd store (which uses cudaMalloc, not the async
+        // pool) can reuse the freed VRAM for the student forward.
         ctx.sync()?;
+        let (free_before, _) = ctx.mem_info_bytes()?;
+        ctx.trim_memory_pool()?;
+        let (free_after, _) = ctx.mem_info_bytes()?;
+        eprintln!(
+            "[offload] freed={freed} bytes, free_before={free_before}, free_after={free_after}"
+        );
 
         self.offloaded = Some(Box::new(OffloadedWeights {
             embed_tokens,

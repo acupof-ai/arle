@@ -500,6 +500,17 @@ fn run_w2s(args: TrainW2sArgs) -> Result<()> {
     // Initialize serving = shadow (both start from the same LoRA init).
     sync_lora_adapters(&student, &serving, &mut store)?;
 
+    // Upload all model weights to GPU upfront. The forward pass would
+    // otherwise upload them on-demand, which OOMs when aux engines are
+    // resident (54 GB student + 29 GB aux = 83 GB < 97 GB H20).
+    eprintln!("[arle train w2s] uploading student/base weights to GPU");
+    for id in student.all_parameter_ids() {
+        store.ensure_device(id)?;
+    }
+    for id in serving.all_parameter_ids() {
+        store.ensure_device(id)?;
+    }
+
     // Load auxiliary models.
     let aux1 = match args.aux_backend {
         W2sAuxBackendArg::InProcess => {
@@ -521,7 +532,7 @@ fn run_w2s(args: TrainW2sArgs) -> Result<()> {
         W2sAuxBackendArg::Infer => {
             use infer_api::{EngineLoadConfig, LoadedInferenceEngine};
             use std::sync::{Arc, Mutex};
-            use train::teacher_infer::InferTeacher;
+            use train::teacher_infer::{InferTeacher, TeacherForward};
 
             eprintln!(
                 "[arle train w2s] loading aux1 pre-RL (infer) from {}",
@@ -539,6 +550,16 @@ fn run_w2s(args: TrainW2sArgs) -> Result<()> {
                 "[arle train w2s] loading aux1 post-RL (infer) from {}",
                 args.aux1_post.display()
             );
+            let pre_teacher = InferTeacher::new(
+                Arc::new(Mutex::new(pre_engine)),
+                train_backend.clone(),
+                vocab_size,
+            );
+            // Offload pre-RL weights to CPU so the post-RL engine fits on GPU.
+            let pre_freed = pre_teacher
+                .offload_engine_weights()
+                .context("offload aux1 pre-RL engine weights")?;
+            eprintln!("[arle train w2s] aux1 pre-RL offload freed {pre_freed} bytes");
             let post_engine = LoadedInferenceEngine::load_with_config(
                 args.aux1_post
                     .to_str()
@@ -549,16 +570,15 @@ fn run_w2s(args: TrainW2sArgs) -> Result<()> {
             .with_context(|| {
                 format!("load aux1 post-RL infer from {}", args.aux1_post.display())
             })?;
-            let pre_teacher = InferTeacher::new(
-                Arc::new(Mutex::new(pre_engine)),
-                train_backend.clone(),
-                vocab_size,
-            );
             let post_teacher = InferTeacher::new(
                 Arc::new(Mutex::new(post_engine)),
                 train_backend.clone(),
                 vocab_size,
             );
+            let post_freed = post_teacher
+                .offload_engine_weights()
+                .context("offload aux1 post-RL engine weights")?;
+            eprintln!("[arle train w2s] aux1 post-RL offload freed {post_freed} bytes");
             W2sAuxModel::new_infer(pre_teacher, post_teacher)
         }
         #[cfg(not(feature = "cuda"))]
@@ -585,47 +605,17 @@ fn run_w2s(args: TrainW2sArgs) -> Result<()> {
         }
         #[cfg(feature = "cuda")]
         W2sAuxBackendArg::Infer => {
-            use infer_api::{EngineLoadConfig, LoadedInferenceEngine};
-            use std::sync::{Arc, Mutex};
-            use train::teacher_infer::InferTeacher;
+            use train::w2s::W2sAuxModel;
 
-            eprintln!(
-                "[arle train w2s] loading aux2 pre-RL (infer) from {}",
-                args.aux2_pre.display()
-            );
-            let pre_engine = LoadedInferenceEngine::load_with_config(
-                args.aux2_pre
-                    .to_str()
-                    .ok_or_else(|| anyhow!("aux2 pre path not UTF-8"))?,
-                true,
-                EngineLoadConfig::single_sequence(128),
-            )
-            .with_context(|| format!("load aux2 pre-RL infer from {}", args.aux2_pre.display()))?;
-            eprintln!(
-                "[arle train w2s] loading aux2 post-RL (infer) from {}",
-                args.aux2_post.display()
-            );
-            let post_engine = LoadedInferenceEngine::load_with_config(
-                args.aux2_post
-                    .to_str()
-                    .ok_or_else(|| anyhow!("aux2 post path not UTF-8"))?,
-                true,
-                EngineLoadConfig::single_sequence(128),
-            )
-            .with_context(|| {
-                format!("load aux2 post-RL infer from {}", args.aux2_post.display())
-            })?;
-            let pre_teacher = InferTeacher::new(
-                Arc::new(Mutex::new(pre_engine)),
-                train_backend.clone(),
-                vocab_size,
-            );
-            let post_teacher = InferTeacher::new(
-                Arc::new(Mutex::new(post_engine)),
-                train_backend.clone(),
-                vocab_size,
-            );
-            W2sAuxModel::new_infer(pre_teacher, post_teacher)
+            // Smoke-test memory optimization: share aux1's infer engines for
+            // aux2 (ΔT₁ == ΔT₂). Real runs load independent aux2 checkpoints.
+            eprintln!("[arle train w2s] reusing aux1 engines for aux2 (smoke-test sharing)");
+            match &aux1 {
+                W2sAuxModel::Infer { pre_rl, post_rl } => {
+                    W2sAuxModel::new_infer(pre_rl.clone(), post_rl.clone())
+                }
+                _ => unreachable!("aux_backend=infer but aux1 is not Infer"),
+            }
         }
         #[cfg(not(feature = "cuda"))]
         W2sAuxBackendArg::Infer => {
