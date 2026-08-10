@@ -94,9 +94,9 @@ print(client.chat.completions.create(
 | Qwen3.6 · 1×H20 · decode / total tok/s | c=1 | c=8 | c=16 |
 |---|---:|---:|---:|
 | 35B-A3B MoE | 61.7 / 6,707 | 22.7 / 27,968 | 13.6 / 33,859 |
-| 27B dense + DSpark 草稿器 | **102.0** / 7,441 | 16.5 / 31,754 | 9.1 / 32,559 |
+| 27B dense + DSpark 草稿器 | **100.7** / 7,837 | 20.9 / 25,074 | 11.1 / 26,790 |
 
-<sub><code>decode tok/s</code> 是单流延迟,<code>total tok/s</code> 是吞吐(prompt+生成 / 墙钟)· DSpark 在 c=1 是普通 decode 的 2.9×,到 c=16 抹平 —— GPU 有空闲算力时 verify 才免费 · build <code>a956f69b1</code> / <code>51985031d</code>,见 <a href="docs/baselines.md">baselines</a></sub>
+<sub><code>decode tok/s</code> 是单流延迟,<code>total tok/s</code> 是吞吐(prompt+生成 / 墙钟)· DSpark 在 c=1 是普通 decode 的 2.9×,到 c=16 抹平 —— GPU 有空闲算力时 verify 才免费 · 见 <a href="docs/baselines.md">baselines</a></sub>
 
 **DeepSeek-V4-Flash,8×H20(TP=8 / EP=8,FP8 MoE)。** B=1 decode **53 tok/s**(prefill 23 ms);并发批量 decode lane 在 c=8 再 **+48%**。
 
