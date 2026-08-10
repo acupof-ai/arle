@@ -9,6 +9,12 @@ else
   export PATH=/root/.cargo/bin:/usr/local/cuda/bin:$PATH
 fi
 export CUDA_HOME=/usr/local/cuda
+# ELKEID (host security agent) SIGKILLs any process that forks while a CUDA
+# device is visible — nvcc/ptxas/cicc fork heavily during cuda-kernels build.
+# The build does not need a GPU (it cross-compiles for sm_90), so hide devices
+# from the build process. The runtime (pod-remote-run.sh) sets its own
+# CUDA_VISIBLE_DEVICES from the claimed GPU.
+export CUDA_VISIBLE_DEVICES=""
 export TORCH_CUDA_ARCH_LIST=9.0          # H20 == sm_90
 export CMAKE_CUDA_ARCHITECTURES=90
 # TileLang AOT regen — REQUIRED for full arle / cuda-kernels builds now that the

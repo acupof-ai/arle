@@ -804,8 +804,13 @@ fn save_w2s_adapter(
         save_named_qwen35_student_checkpoint,
     };
 
-    fs::create_dir_all(adapter_dir)
-        .with_context(|| format!("create adapter dir {}", adapter_dir.display()))?;
+    // The adapter dir may have been created (empty) by an earlier setup step;
+    // the checkpoint writer refuses to merge into an existing directory.
+    if adapter_dir.exists() {
+        fs::remove_dir_all(adapter_dir)
+            .with_context(|| format!("remove existing adapter dir {}", adapter_dir.display()))?;
+    }
+
     let sources = checkpoint_sources(student_model)?;
     let mut adapter_config =
         LoraAdapterConfig::new(student_model.display().to_string(), "qwen35", *lora);
