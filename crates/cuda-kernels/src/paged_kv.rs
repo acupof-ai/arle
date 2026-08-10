@@ -1026,6 +1026,23 @@ impl TokenKVPool {
     }
 
     pub fn copy_pages_to_host(&self, ctx: &DeviceContext, pages: &[u32]) -> Result<Vec<u8>> {
+        let out = self.copy_pages_to_host_impl(ctx, pages)?;
+        ctx.sync()?;
+        Ok(out)
+    }
+
+    /// Like [`copy_pages_to_host`] but omits the trailing `ctx.sync()`. Use when
+    /// the caller batches many per-layer copies and issues a single sync after
+    /// the loop (avoids N-1 unnecessary stream fences).
+    pub fn copy_pages_to_host_no_sync(
+        &self,
+        ctx: &DeviceContext,
+        pages: &[u32],
+    ) -> Result<Vec<u8>> {
+        self.copy_pages_to_host_impl(ctx, pages)
+    }
+
+    fn copy_pages_to_host_impl(&self, ctx: &DeviceContext, pages: &[u32]) -> Result<Vec<u8>> {
         #[cfg(feature = "cuda")]
         {
             // Tier/swap transports hand this caller-built page lists; validate
@@ -1096,7 +1113,6 @@ impl TokenKVPool {
                 }
             }
 
-            ctx.sync()?;
             Ok(out)
         }
         #[cfg(not(feature = "cuda"))]
