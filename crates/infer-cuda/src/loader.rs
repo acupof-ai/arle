@@ -2955,7 +2955,7 @@ impl SafetensorLoader {
         &self,
         ctx: &DeviceContext,
         view: &QuantTensorView,
-        _shard: &QuantMatrixShard,
+        shard: &QuantMatrixShard,
         group_size: usize,
     ) -> Result<DeviceMatrix> {
         let qweight = self.borrow_raw_tensor(&view.name)?;
@@ -2975,6 +2975,7 @@ impl SafetensorLoader {
 
         // Read qweight as i32 words
         let qw_bytes = qweight.bytes();
+        // SAFETY: qweight is I32 [packed_k, n], so its bytes are a valid i32 slice.
         let qw: &[i32] = unsafe {
             std::slice::from_raw_parts(qw_bytes.as_ptr().cast::<i32>(), qw_bytes.len() / 4)
         };
@@ -3021,6 +3022,7 @@ impl SafetensorLoader {
             qzeros.shape
         );
         let qz_bytes = qzeros.bytes();
+        // SAFETY: qzeros is I32 [num_groups, packed_n], so its bytes are a valid i32 slice.
         let qz: &[i32] = unsafe {
             std::slice::from_raw_parts(qz_bytes.as_ptr().cast::<i32>(), qz_bytes.len() / 4)
         };
@@ -3073,16 +3075,32 @@ impl SafetensorLoader {
             }
         }
 
+        // Apply the TP shard to the converted ARLE-layout tensors. GPTQ packs
+        // both K (into i32 words) and N (into qzeros words), so sharding the
+        // raw tensors directly is error-prone; convert first, then shard the
+        // canonical [n, k//2] weight and [n, groups] scales with the shared
+        // W4A16 shard helpers.
+        let weight_shard =
+            self.shard_fp4_packed_weight_cow(&arle_weight, n, k, group_size, shard)?;
+        let scale_shard = self.shard_w4a16_scales_cow(&arle_scales, n, k, group_size, shard)?;
+
         // SAFETY: BF16 bytes are valid &[half::bf16]
         let scales_data: &[half::bf16] = unsafe {
             std::slice::from_raw_parts(
-                arle_scales.as_ptr().cast::<half::bf16>(),
-                arle_scales.len() / 2,
+                scale_shard.bytes.as_ptr().cast::<half::bf16>(),
+                scale_shard.bytes.len() / 2,
             )
         };
 
-        DeviceMatrix::from_quantized_int4(ctx, &arle_weight, scales_data, n, k, group_size)
-            .with_context(|| format!("upload GPTQ W4A16 tensor {}", view.name))
+        DeviceMatrix::from_quantized_int4(
+            ctx,
+            weight_shard.bytes.as_ref(),
+            scales_data,
+            weight_shard.rows,
+            weight_shard.cols * 2,
+            group_size,
+        )
+        .with_context(|| format!("upload GPTQ W4A16 tensor {}", view.name))
     }
 
     /// Load a W8A16 view: signed INT8 weights (non-packed, [rows, cols]) with
