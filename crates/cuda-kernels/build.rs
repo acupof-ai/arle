@@ -2534,6 +2534,13 @@ fn run_nvcc_jobs(nvcc: &str, wrapper: Option<&str>, jobs: &[NvccJob]) {
 }
 
 fn main() {
+    // build.rs uses relative paths (tools/tilelang/..., kernels.toml) that are
+    // relative to this crate's directory. Cargo runs build scripts from the
+    // workspace root, so chdir to CARGO_MANIFEST_DIR first.
+    if let Ok(manifest_dir) = std::env::var("CARGO_MANIFEST_DIR") {
+        let _ = std::env::set_current_dir(manifest_dir);
+    }
+
     // Compile-capability cfgs, consumed cross-crate via the `cuda_kernels::HAS_*`
     // consts in lib.rs (a `cfg!` set here is not visible in `infer-cuda`).
     // Declared unconditionally — before the no-cuda early-return — so the lib.rs

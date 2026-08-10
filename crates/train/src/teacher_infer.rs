@@ -578,11 +578,12 @@ impl TeacherForward for InProcessTeacher<'_> {
 }
 
 #[cfg(feature = "cuda")]
+#[derive(Clone)]
 pub struct InferTeacher {
     engine: Arc<Mutex<LoadedInferenceEngine>>,
     train_backend: Arc<dyn Backend>,
     vocab_size: usize,
-    last_profile: Mutex<InferTeacherProfile>,
+    last_profile: Arc<Mutex<InferTeacherProfile>>,
 }
 
 #[cfg(feature = "cuda")]
@@ -607,7 +608,7 @@ impl InferTeacher {
             engine,
             train_backend,
             vocab_size,
-            last_profile: Mutex::new(InferTeacherProfile::default()),
+            last_profile: Arc::new(Mutex::new(InferTeacherProfile::default())),
         }
     }
 
