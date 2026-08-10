@@ -3334,12 +3334,19 @@ impl Qwen35Model {
         lora_layer_start: Option<usize>,
         store: &mut TensorStore,
     ) -> Result<Self> {
-        let mut model = Self::new_with_lora_targets_and_tp_layer_start(
+        // The base weights are shared from `base`, so do NOT materialize a
+        // second frozen-base copy (for a 27B model that is ~108 GB of f32
+        // random data immediately discarded by share_base_parameters_from).
+        let mut model = Self::new_internal(
             &base.config,
-            lora,
+            Some(lora),
             target_set,
             lora_layer_start,
+            false,
             base.tp,
+            Qwen35InitMode::LoraOrFrozen {
+                materialize_frozen_base: false,
+            },
             store,
         )?;
         model.gradient_checkpointing = base.gradient_checkpointing;

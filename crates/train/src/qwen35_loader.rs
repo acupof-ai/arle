@@ -963,7 +963,7 @@ fn should_load_bf16_cuda_frozen_base(
     dtype: Dtype,
     store: &TensorStore,
 ) -> bool {
-    matches!(mode, LoadMode::LoraStudent { .. })
+    matches!(mode, LoadMode::LoraStudent { .. } | LoadMode::FrozenEval)
         && !requires_grad
         && dtype == Dtype::BF16
         && store.backend().device() == Device::Cuda
@@ -1010,7 +1010,7 @@ fn plan_fp8_cuda_frozen_base(
     const QWEN36_FP8_BLOCK_M: usize = 128;
     const QWEN36_FP8_BLOCK_K: usize = 128;
 
-    if !(matches!(mode, LoadMode::LoraStudent { .. })
+    if !(matches!(mode, LoadMode::LoraStudent { .. } | LoadMode::FrozenEval)
         && !requires_grad
         && dtype == Dtype::F8_E4M3
         && store.backend().device() == Device::Cuda

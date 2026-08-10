@@ -633,6 +633,18 @@ fn run_w2s(args: TrainW2sArgs) -> Result<()> {
         trainable_params.len()
     );
 
+    // Re-upload student/serving weights to GPU. The aux-engine load/offload
+    // cycle may have evicted them from the device (the autograd store spills
+    // to host under memory pressure), so the student forward would otherwise
+    // htod-copy them one-by-one and OOM.
+    eprintln!("[arle train w2s] re-uploading student/serving weights to GPU");
+    for id in student.all_parameter_ids() {
+        store.ensure_device(id)?;
+    }
+    for id in serving.all_parameter_ids() {
+        store.ensure_device(id)?;
+    }
+
     let cfg = W2sConfig {
         alpha: args.alpha,
         temperature: args.temperature,
