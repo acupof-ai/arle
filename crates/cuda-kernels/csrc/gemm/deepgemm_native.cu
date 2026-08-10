@@ -1347,21 +1347,15 @@ void compile_with_nvcc(
           << " -cubin"
           << " -o " << shell_quote(cubin_path)
           << " -O3"
-          // -std=c++20 (NOT c++17 + -fconcepts). The old combo passed
-          // `-fconcepts` to host gcc, which defines `__cpp_concepts` and makes
-          // gcc-13's libstdc++ <type_traits> expose its C++20 `requires`-clause
-          // detection idiom (type_traits:2651) — but NVCC's *device* C++17
-          // frontend (cicc/EDG) can't parse `requires`, so the JIT compile of
-          // every generated kernel died with "identifier \"requires\" is
-          // undefined" and the GEMM surfaced as CUDA_ERROR_UNKNOWN /
-          // _LAUNCH_FAILED (b335). CUDA 12.9 nvcc fully supports c++20 on the
-          // device side, so concepts parse natively and `-fconcepts` is
-          // redundant. Validated on the pod by recompiling the exact failing
-          // generated kernel.cu: c++17+fconcepts EXIT=1 (type_traits:2651),
-          // c++20-no-fconcepts EXIT=0. The deepgemm JIT is SM90-gated
-          // (major==9) and the only Hopper target runs CUDA 12.9, so c++20 is
-          // safe across every arch this path compiles for.
-          << " -std=c++20"
+          // -std=c++17 (NOT c++20). c++20 makes nvcc's cicc frontend choke on
+          // the flashmla CUTLASS `is_any_of` fold expression
+          // (`... || std::is_same_v<T, Us>` → "pack expansion does not make
+          // use of any argument packs"). c++17 parses the same headers fine
+          // (the build itself uses -std=c++17). The earlier c++17+-fconcepts
+          // combo failed because -fconcepts pulled gcc's C++20 <type_traits>
+          // `requires` clauses into device code; without -fconcepts, c++17
+          // libstdc++ stays requires-free. SM90-only path, CUDA 12.9.
+          << " -std=c++17"
           << " --expt-relaxed-constexpr"
           << " --expt-extended-lambda"
           << " --diag-suppress=39,161,174,177,186,940"
