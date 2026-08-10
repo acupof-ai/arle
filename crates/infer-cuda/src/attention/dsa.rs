@@ -87,7 +87,6 @@ impl Dsv4DsaOfficialState {
             .clone_dtoh(&self.rotated_keys)
             .map_err(|e| anyhow!("DSv4 DSA swap rotated_keys D2H failed: {e}"))?;
         Ok(crate::attention::Dsv4DsaImage {
-            key_cache_len: self.key_cache_len,
             rotated_keys,
             packed_rows: self.packed_rows,
         })
@@ -636,8 +635,6 @@ pub(crate) struct Dsv4CompressorImage {
     pub(crate) prev_overlap_score: Vec<half::bf16>,
     pub(crate) compressed: Vec<half::bf16>,
     pub(crate) compressed_seq_len: usize,
-    pub(crate) compressed_capacity: usize,
-    pub(crate) ring_rows: usize,
     pub(crate) fp32_pending_kv: Vec<f32>,
     pub(crate) fp32_pending_score: Vec<f32>,
     pub(crate) fp32_prev_kv: Vec<f32>,
@@ -646,25 +643,11 @@ pub(crate) struct Dsv4CompressorImage {
 }
 
 pub(crate) struct Dsv4FlashMlaImage {
-    pub(crate) fp8_kv_pool_len: usize,
-    pub(crate) sw_blocks: usize,
-    pub(crate) comp_blocks: usize,
-    pub(crate) max_compressed_keys: usize,
-    pub(crate) topk_unified: usize,
-    pub(crate) page_block_size: usize,
     pub(crate) fp8_kv_sw_bootstrapped: bool,
     pub(crate) fp8_kv_comp_packed_rows: usize,
-    pub(crate) topk_length: Vec<i32>,
-    pub(crate) sched_meta: Vec<i32>,
-    pub(crate) num_splits: Vec<i32>,
-    pub(crate) num_sm_parts: i32,
-    pub(crate) fixed_overhead_num_blocks: i32,
-    pub(crate) block_size_topk: i32,
-    pub(crate) device_page_table: Vec<i32>,
 }
 
 pub(crate) struct Dsv4DsaImage {
-    pub(crate) key_cache_len: usize,
     pub(crate) rotated_keys: Vec<half::bf16>,
     pub(crate) packed_rows: usize,
 }
