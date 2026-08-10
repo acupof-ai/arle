@@ -2955,7 +2955,7 @@ impl SafetensorLoader {
         &self,
         ctx: &DeviceContext,
         view: &QuantTensorView,
-        shard: &QuantMatrixShard,
+        _shard: &QuantMatrixShard,
         group_size: usize,
     ) -> Result<DeviceMatrix> {
         let qweight = self.borrow_raw_tensor(&view.name)?;
