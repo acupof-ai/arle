@@ -30,7 +30,7 @@ clap = { version = "4", features = ["derive"] }
 console = "0.16"
 ctrlc = "3"
 dialoguer = "0.11"
-hf-hub = { version = "0.5", features = ["tokio"] }
+hf-hub = { version = "0.5", default-features = false, features = ["tokio", "rustls-tls", "ureq"] }
 indicatif = "0.18"
 # DSv4 multiproc-serve: coordinator -> worker death-detect pipe (Unix `pipe(2)`).
 # Used only by `serve_multiproc` (cfg(all(unix, feature = "cuda"))).
@@ -48,7 +48,7 @@ train = { path = "../train", default-features = false }
 tools = { path = "../tools" }
 log = "0.4"
 nucleo-matcher = "0.3"
-reqwest = { version = "0.12", features = ["blocking", "json"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 rustyline = "15"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
