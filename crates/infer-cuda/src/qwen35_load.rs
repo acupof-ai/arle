@@ -913,12 +913,7 @@ fn load_linear_qkv_sharded(
     // quant view; head-block sharding for TP>1 is not yet implemented for
     // packed quant (falls through to the BF16 path, which errors clearly).
     if tp.world_size == 1 {
-        let view = loader.quant_view_for(name)?;
-        eprintln!(
-            "[DEBUG] load_linear_qkv_sharded {name}: quant_view={}",
-            view.is_some()
-        );
-        if view.is_some() {
+        if loader.quant_view_for(name)?.is_some() {
             return loader.load_matrix_quant_aware(ctx, name);
         }
     }
