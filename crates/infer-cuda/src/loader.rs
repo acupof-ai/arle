@@ -2392,6 +2392,7 @@ impl SafetensorLoader {
         let mut candidates = vec![name.to_owned()];
         if let Some(base) = name.strip_suffix(".weight") {
             candidates.push(format!("{base}.weight_packed"));
+            candidates.push(format!("{base}.qweight"));
         }
         for candidate in candidates {
             if !headers.contains_key(&candidate) {
@@ -2563,6 +2564,9 @@ impl SafetensorLoader {
             } => self.load_fp4_group_view(ctx, view, &shard, group_size, global_scale_apply),
             QuantFormat::W4A16 { group_size } => {
                 self.load_w4a16_view(ctx, view, &shard, group_size)
+            }
+            QuantFormat::GptqW4A16 { group_size } => {
+                self.load_gptq_w4a16_view(ctx, view, &shard, group_size)
             }
             QuantFormat::W8A16 { group_size } => {
                 self.load_w8a16_view(ctx, view, &shard, group_size)
@@ -2941,6 +2945,128 @@ impl SafetensorLoader {
             group_size,
         )
         .with_context(|| format!("upload W4A16 tensor {}", view.name))
+    }
+
+    /// Load a GPTQ/AutoRound W4A16 view and convert to ARLE's internal W4A16
+    /// layout. GPTQ stores qweight as I32 [k//8, n] (8 int4 per word), scales as
+    /// BF16 [groups, n], and qzeros as I32 [groups, n//8]. ARLE expects U8
+    /// [n, k//2] (2 int4 per byte, low nibble first) and BF16 [n, groups].
+    fn load_gptq_w4a16_view(
+        &self,
+        ctx: &DeviceContext,
+        view: &QuantTensorView,
+        shard: &QuantMatrixShard,
+        group_size: usize,
+    ) -> Result<DeviceMatrix> {
+        let qweight = self.borrow_raw_tensor(&view.name)?;
+        let n = view.logical_shape[0];
+        let k = view.logical_shape[1];
+        let packed_k = k / 8;
+        ensure!(
+            qweight.dtype == Dtype::I32 && qweight.shape == [packed_k, n],
+            "{}: expected GPTQ qweight I32 [{}, {}], got {:?} {:?}",
+            view.name,
+            packed_k,
+            n,
+            qweight.dtype,
+            qweight.shape
+        );
+        let num_groups = k / group_size;
+
+        // Read qweight as i32 words
+        let qw_bytes = qweight.bytes();
+        let qw: &[i32] = unsafe {
+            std::slice::from_raw_parts(qw_bytes.as_ptr().cast::<i32>(), qw_bytes.len() / 4)
+        };
+
+        // Read scales (BF16 [num_groups, n])
+        let scales = self.borrow_raw_tensor(&view.scale_names[0])?;
+        ensure!(
+            scales.dtype == Dtype::BF16 && scales.shape == [num_groups, n],
+            "{}: expected GPTQ scales BF16 [{}, {}], got {:?} {:?}",
+            view.scale_names[0],
+            num_groups,
+            n,
+            scales.dtype,
+            scales.shape
+        );
+        let scales_bytes = scales.bytes();
+
+        // Read qzeros (I32 [num_groups, n//8])
+        let qzeros = self.borrow_raw_tensor(&view.scale_names[1])?;
+        let packed_n = n / 8;
+        ensure!(
+            qzeros.dtype == Dtype::I32 && qzeros.shape == [num_groups, packed_n],
+            "{}: expected GPTQ qzeros I32 [{}, {}], got {:?} {:?}",
+            view.scale_names[1],
+            num_groups,
+            packed_n,
+            qzeros.dtype,
+            qzeros.shape
+        );
+        let qz_bytes = qzeros.bytes();
+        let qz: &[i32] = unsafe {
+            std::slice::from_raw_parts(qz_bytes.as_ptr().cast::<i32>(), qz_bytes.len() / 4)
+        };
+
+        // Convert GPTQ qweight [packed_k, n] -> ARLE weight [n, packed_k*4] (U8).
+        // GPTQ: each i32 holds 8 uint4; ARLE: each u8 holds 2 uint4 (lo=even, hi=odd).
+        // Logical layout after conversion: [n, k] signed int4, packed to [n, k/2].
+        let arle_packed_cols = k / 2;
+        let mut arle_weight = vec![0u8; n * arle_packed_cols];
+        let mut arle_scales = vec![0u8; n * num_groups * 2]; // BF16
+
+        for g in 0..num_groups {
+            let k_start = g * group_size;
+            let k_end = k_start + group_size;
+            // Unpack qzeros for this group: qzeros[g, :] is I32 [n//8]
+            let mut zeros = vec![0u8; n];
+            for j in 0..n {
+                let word_idx = j / 8;
+                let shift = (j % 8) * 4;
+                let raw = ((qz[g * packed_n + word_idx] >> shift) & 0xF) as u8;
+                zeros[j] = raw + 1; // GPTQ stores actual_zero - 1
+            }
+            // Copy scales for this group: scales[g, :] is BF16 [n]
+            let scale_offset = g * n * 2;
+            for j in 0..n {
+                arle_scales[j * num_groups * 2 + g * 2] = scales_bytes[scale_offset + j * 2];
+                arle_scales[j * num_groups * 2 + g * 2 + 1] =
+                    scales_bytes[scale_offset + j * 2 + 1];
+            }
+            // Convert qweight rows for this group
+            for k_idx in k_start..k_end {
+                let packed_row = k_idx / 8;
+                let nibble = k_idx % 8;
+                let shift = nibble * 4;
+                let arle_byte_idx_base = k_idx / 2;
+                let is_high = k_idx % 2 == 1;
+                for j in 0..n {
+                    let raw = ((qw[packed_row * n + j] >> shift) & 0xF) as u8;
+                    // GPTQ dequant: (raw - zero) * scale.
+                    // ARLE dequant: (arle_uint4 - 8) * scale.
+                    // => arle_uint4 = raw - zero + 8.
+                    let arle_val = raw.wrapping_sub(zeros[j]).wrapping_add(8);
+                    let arle_idx = j * arle_packed_cols + arle_byte_idx_base;
+                    if is_high {
+                        arle_weight[arle_idx] |= (arle_val & 0x0F) << 4;
+                    } else {
+                        arle_weight[arle_idx] = arle_val & 0x0F;
+                    }
+                }
+            }
+        }
+
+        // SAFETY: BF16 bytes are valid &[half::bf16]
+        let scales_data: &[half::bf16] = unsafe {
+            std::slice::from_raw_parts(
+                arle_scales.as_ptr().cast::<half::bf16>(),
+                arle_scales.len() / 2,
+            )
+        };
+
+        DeviceMatrix::from_quantized_int4(ctx, &arle_weight, scales_data, n, k, group_size)
+            .with_context(|| format!("upload GPTQ W4A16 tensor {}", view.name))
     }
 
     /// Load a W8A16 view: signed INT8 weights (non-packed, [rows, cols]) with
