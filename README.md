@@ -126,6 +126,10 @@ The real workload: 32K-token multi-turn agent prompts, not a synthetic short pro
 
 `decode tok/s` is single-stream latency; `total tok/s` is capacity (prompt + generated over wall clock). The DSpark block drafter is 2.9× over plain decode at c=1 and washes out by c=16 — verify is free only while the GPU has idle compute. Full rows in [docs/baselines.md](docs/baselines.md).
 
+### DeepSeek-V4-Flash (8×H20, TP=8/EP=8, FP8 MoE)
+
+B=1 decode **53 tok/s** (prefill 23 ms). With the DSpark block drafter: B=1 **72.4 tok/s** (+37%, 58.7% acceptance rate); the batched decode lane gains a further **+48%** at c=8.
+
 ### Against SGLang
 
 Same weights, same GPU, same quantized kernel — SGLang serves a repack of our own checkpoint. Qwen3.6-27B, one H20, 33K prompt, one request at a time.

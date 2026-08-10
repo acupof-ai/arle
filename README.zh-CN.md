@@ -98,7 +98,7 @@ print(client.chat.completions.create(
 
 <sub><code>decode tok/s</code> 是单流延迟,<code>total tok/s</code> 是吞吐(prompt+生成 / 墙钟)· DSpark 在 c=1 是普通 decode 的 2.9×,到 c=16 抹平 —— GPU 有空闲算力时 verify 才免费 · 见 <a href="docs/baselines.md">baselines</a></sub>
 
-**DeepSeek-V4-Flash,8×H20(TP=8 / EP=8,FP8 MoE)。** B=1 decode **53 tok/s**(prefill 23 ms);并发批量 decode lane 在 c=8 再 **+48%**。
+**DeepSeek-V4-Flash,8×H20(TP=8 / EP=8,FP8 MoE)。** B=1 decode **53 tok/s**(prefill 23 ms);开 DSpark 块草稿器后 B=1 **72.4 tok/s**(+37%,接受率 58.7%);并发批量 decode lane 在 c=8 再 **+48%**。
 
 **对比 SGLang。** 同一份权重、同一块卡、同一个量化 kernel —— SGLang 跑的是我们 checkpoint 的重打包版。Qwen3.6-27B,单卡 H20,33K prompt,单请求:decode 每 token **16.69 ms vs 17.16**,快 2.8%;33K prefill **25.0 s vs 21.0**,慢 19% —— 这是当前在做的事。数据见 [docs/baselines.md](docs/baselines.md)。
 
