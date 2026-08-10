@@ -29,6 +29,11 @@ pub(crate) enum QuantFormat {
     W4A16 {
         group_size: usize,
     },
+    /// GPTQ/AutoRound W4A16: qweight (U32 [k//8, n]), scales (BF16 [groups, n]),
+    /// qzeros (U32 [groups, n//8]). Converted to ARLE W4A16 layout at load time.
+    GptqW4A16 {
+        group_size: usize,
+    },
     W8A16 {
         group_size: usize,
     },
@@ -95,7 +100,10 @@ pub(crate) fn detect_quant_format(
     let Some(tensor) = tensors.get(name) else {
         return Ok(None);
     };
-    if !name.ends_with(".weight") && !name.ends_with(".weight_packed") {
+    if !name.ends_with(".weight")
+        && !name.ends_with(".weight_packed")
+        && !name.ends_with(".qweight")
+    {
         return Ok(None);
     }
 
@@ -115,6 +123,35 @@ pub(crate) fn detect_quant_format(
             format: QuantFormat::DenseF32,
             scale_names: Vec::new(),
         },
+        // GPTQ/AutoRound W4A16: qweight (I32 [k//8, n]), scales (BF16 [groups, n]),
+        // qzeros (I32 [groups, n//8]). Converted to ARLE W4A16 layout at load time.
+        Dtype::I32
+            if tensors.contains_key(&format!("{base}.scales"))
+                && tensors.contains_key(&format!("{base}.qzeros")) =>
+        {
+            let scales = tensor_by_name(tensors, &format!("{base}.scales"))?;
+            ensure!(
+                scales.shape.len() == 2,
+                "{name}: GPTQ scales must be rank-2, got {:?}",
+                scales.shape
+            );
+            let packed_k = tensor.shape[0];
+            let n = tensor.shape[1];
+            let k = packed_k * 8;
+            let num_groups = scales.shape[0];
+            ensure!(
+                k % num_groups == 0,
+                "{name}: GPTQ k={k} not divisible by num_groups={num_groups}"
+            );
+            let group_size = k / num_groups;
+            QuantTensorView {
+                name: name.to_owned(),
+                logical_shape: vec![n, k],
+                storage_dtype: tensor.dtype,
+                format: QuantFormat::GptqW4A16 { group_size },
+                scale_names: vec![format!("{base}.scales"), format!("{base}.qzeros")],
+            }
+        }
         Dtype::F8_E4M3 if tensors.contains_key(&format!("{base}.weight_scale_inv")) => {
             QuantTensorView {
                 name: name.to_owned(),
@@ -378,6 +415,55 @@ pub(crate) fn validate_scale_shapes(
             );
             Ok(())
         }
+        QuantFormat::GptqW4A16 { group_size } => {
+            ensure!(
+                view.logical_shape.len() == 2,
+                "{}: GPTQ W4A16 weights must be rank-2",
+                view.name
+            );
+            let n = view.logical_shape[0];
+            let k = view.logical_shape[1];
+            ensure!(
+                k.is_multiple_of(group_size),
+                "{}: GPTQ W4A16 logical K {} must be group-aligned to {group_size}",
+                view.name,
+                k
+            );
+            let num_groups = k / group_size;
+            // scales: BF16 [num_groups, n]
+            let scales = tensor_by_name(tensors, &view.scale_names[0])?;
+            ensure!(
+                scales.dtype == Dtype::BF16,
+                "{}: GPTQ scales must be BF16, got {:?}",
+                view.scale_names[0],
+                scales.dtype
+            );
+            ensure!(
+                scales.shape == [num_groups, n],
+                "{}: GPTQ scales shape {:?} != [{}, {}]",
+                view.scale_names[0],
+                scales.shape,
+                num_groups,
+                n
+            );
+            // qzeros: I32 [num_groups, n//8]
+            let qzeros = tensor_by_name(tensors, &view.scale_names[1])?;
+            ensure!(
+                qzeros.dtype == Dtype::I32,
+                "{}: GPTQ qzeros must be I32, got {:?}",
+                view.scale_names[1],
+                qzeros.dtype
+            );
+            ensure!(
+                qzeros.shape == [num_groups, n / 8],
+                "{}: GPTQ qzeros shape {:?} != [{}, {}]",
+                view.scale_names[1],
+                qzeros.shape,
+                num_groups,
+                n / 8
+            );
+            Ok(())
+        }
         QuantFormat::W8A16 { group_size } => {
             ensure!(
                 view.logical_shape.len() == 2,
@@ -450,6 +536,7 @@ fn tensor_by_name<'a>(
 
 fn weight_base(name: &str) -> &str {
     name.strip_suffix(".weight_packed")
+        .or_else(|| name.strip_suffix(".qweight"))
         .or_else(|| name.strip_suffix(".weight"))
         .unwrap_or(name)
 }
