@@ -2847,13 +2847,9 @@ cudaError_t w4a16_gemv_batch_cuda(
     const __nv_bfloat16* input, __nv_bfloat16* output,
     int B, int N, int K, int group_size, cudaStream_t stream)
 {
-    // B=1 decode: marlin GEMV (uint4 loads, FP16 FMA).
-    // B>=2 (DSpark verify): WMMA tensor-core GEMM. Weight is dequantized to
-    // fp16 in shared memory (no global write), mma.sync.m16n16k16 does the
-    // matmul at 8× the CUDA-core throughput.
-    if (B >= 2) {
-        return w4a16_gemm_wmma_cuda(weight, scales, input, output, B, N, K, group_size, stream);
-    }
+    // Marlin GEMV for all batch sizes. The WMMA tensor-core path is under
+    // development (correctness issues); fall back to the known-good marlin
+    // GEMV which uses uint4 loads and FP16 FMA.
     return w4a16_gemv_batch_cuda_marlin(weight, scales, input, output, B, N, K, group_size, stream);
 }
 
