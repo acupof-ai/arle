@@ -86,8 +86,8 @@ __global__ void w4a16_gemm_wmma_kernel(
 
         // --- Load input tile [m0..m0+16, k0..k0+16], transpose to [K, M] ---
         // Zero the whole tile first so padding rows (m >= M) are 0.
-        if (tid < WMMA_TILE_M * WMMA_TILE_K) {
-            x_smem[tid] = __float2half(0.0f);
+        for (int i = tid; i < WMMA_TILE_M * WMMA_TILE_K; i += blockDim.x) {
+            x_smem[i] = __float2half(0.0f);
         }
         __syncthreads();
         if (tid < WMMA_TILE_M) {
