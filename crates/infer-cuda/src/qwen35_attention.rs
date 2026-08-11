@@ -632,33 +632,9 @@ impl Qwen35Model {
                         rows,
                     )?;
                 }
-                KVFormat::INT8 => {
-                    kv_quant::quantize_paged_kv_single(
-                        &self.ctx,
-                        pool.k_ptr(full_idx, &self.ctx.stream),
-                        pool.k_data_ptr(full_idx, &self.ctx.stream),
-                        pool.k_scales_ptr(full_idx, &self.ctx.stream),
-                        new_rows,
-                        self.local_kv_heads,
-                        c.head_dim,
-                        kv_dim,
-                        rows,
-                    )?;
-                    kv_quant::quantize_paged_kv_single(
-                        &self.ctx,
-                        pool.v_ptr(full_idx, &self.ctx.stream),
-                        pool.v_data_ptr(full_idx, &self.ctx.stream),
-                        pool.v_scales_ptr(full_idx, &self.ctx.stream),
-                        new_rows,
-                        self.local_kv_heads,
-                        c.head_dim,
-                        kv_dim,
-                        rows,
-                    )?;
-                }
                 other => anyhow::bail!(
                     "Qwen35 full-attn paged: unsupported pool format {other:?} \
-                     (only BF16, FP8E4M3 and INT8 are wired)"
+                     (only BF16 and FP8E4M3 are wired)"
                 ),
             }
         }
@@ -698,6 +674,8 @@ impl Qwen35Model {
                 ffi::AttnPhase::Prefill
             };
             {
+                let (qp_ptr, _g0) = q_prepped.data.device_ptr_mut(&self.ctx.stream);
+                let (ao_ptr, _g5) = attn_out.data.device_ptr_mut(&self.ctx.stream);
                 crate::profile::profile_op(
                     &self.ctx,
                     "full_paged/attention",
@@ -718,8 +696,6 @@ impl Qwen35Model {
                             && c.head_dim == 256
                             && qwen35_fa3_enabled(&self.ctx)
                         {
-                            let (qp_ptr, _g0) = q_prepped.data.device_ptr_mut(&self.ctx.stream);
-                            let (ao_ptr, _g5) = attn_out.data.device_ptr_mut(&self.ctx.stream);
                             // ONE launch for the whole batch: q/o are packed
                             // [total_q, h, d] behind `q_indptr`, and each row's KV
                             // extent comes from `kv_lens_dev` against the
@@ -833,8 +809,6 @@ impl Qwen35Model {
                         );
                         match pool.format {
                             KVFormat::BF16 => {
-                                let (qp_ptr, _g0) = q_prepped.data.device_ptr_mut(&self.ctx.stream);
-                                let (ao_ptr, _g5) = attn_out.data.device_ptr_mut(&self.ctx.stream);
                                 // SAFETY: kernel signature from paged_attn_v1 ABI (18-arg BF16).
                                 let kernel = ffi::resolve_paged_attn_v1(
                                     c.head_dim as u32,
@@ -876,8 +850,6 @@ impl Qwen35Model {
                                 }
                             }
                             KVFormat::FP8E4M3 => {
-                                let (qp_ptr, _g0) = q_prepped.data.device_ptr_mut(&self.ctx.stream);
-                                let (ao_ptr, _g5) = attn_out.data.device_ptr_mut(&self.ctx.stream);
                                 // SAFETY: kernel signature from paged_attn_fp8_v1 ABI (20-arg).
                                 // k/v data buffers are FP8; scales are per-token per-kv-head f32.
                                 let kernel = ffi::resolve_paged_attn_fp8_v1(
@@ -924,45 +896,6 @@ impl Qwen35Model {
                                     )
                                     .result()?;
                                 }
-                            }
-                            KVFormat::INT8 => {
-                                // Per-(token, kv_head) symmetric INT8 KV: same
-                                // split-KV varlen kernel as FP8, `int8_kv` flips
-                                // the load to int8 + scale.
-                                let ws = pool.int8_attn_workspace.as_ref().ok_or_else(|| {
-                                    anyhow!("INT8 paged attn missing int8_attn_workspace")
-                                })?;
-                                let max_kv_len = meta
-                                    .kv_lens
-                                    .iter()
-                                    .copied()
-                                    .max()
-                                    .unwrap_or(0);
-                                kv_quant::decode_attention_varlen_fp8(
-                                    &self.ctx,
-                                    &q_prepped,
-                                    &meta.q_indptr,
-                                    pool.k_data_ptr(full_idx, &self.ctx.stream),
-                                    pool.v_data_ptr(full_idx, &self.ctx.stream),
-                                    Some(pool.k_scales_ptr(full_idx, &self.ctx.stream)),
-                                    Some(pool.v_scales_ptr(full_idx, &self.ctx.stream)),
-                                    &meta.kv_indptr,
-                                    &meta.kv_indices,
-                                    &meta.kv_last_page_len,
-                                    attn_out,
-                                    self.local_q_heads,
-                                    self.local_kv_heads,
-                                    c.head_dim,
-                                    pool.page_size,
-                                    meta.batch,
-                                    meta.total_q,
-                                    max_kv_len,
-                                    true, // int8_kv
-                                    true, // causal
-                                    sm_scale,
-                                    ws,
-                                    pool.int8_attn_workspace_bytes,
-                                )?;
                             }
                             other => anyhow::bail!(
                                 "Qwen35 full-attn paged attention: unsupported pool format {other:?}"
