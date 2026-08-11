@@ -39,7 +39,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.5.2"
+version = "0.5.3"
 edition = "2024"
 license = "MIT"
 publish = false
@@ -79,7 +79,7 @@ uuid = { version = "1", features = ["v4"] }
 
 [package]
 name = "arle"
-version = "0.5.2"
+version = "0.5.3"
 edition = "2024"
 license = "MIT"
 publish = false
