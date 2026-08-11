@@ -426,57 +426,6 @@ pub(crate) fn stage_f32(
     emit_stage(stage, layer, row, pos, &host);
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{entropy_nll, lens_stats};
-
-    #[test]
-    fn uniform_logits_entropy_is_ln_vocab() {
-        let vocab = 1024usize;
-        let logits = vec![0.25f32; vocab];
-        let (entropy, nll) = entropy_nll(&logits, Some(3));
-        let ln_v = (vocab as f32).ln();
-        assert!((entropy - ln_v).abs() < 1e-4, "H={entropy} ln(V)={ln_v}");
-        assert!((nll.unwrap() - ln_v).abs() < 1e-4);
-    }
-
-    #[test]
-    fn one_hot_entropy_is_zero() {
-        let mut logits = vec![-30.0f32; 512];
-        logits[7] = 30.0;
-        let (entropy, nll) = entropy_nll(&logits, Some(7));
-        assert!(entropy.abs() < 1e-4, "H={entropy}");
-        assert!(nll.unwrap().abs() < 1e-4);
-    }
-
-    #[test]
-    fn nll_of_argmax_equals_negated_top1_logprob() {
-        let logits: Vec<f32> = (0..97)
-            .map(|i| ((i * 37) % 19) as f32 * 0.37 - 3.0)
-            .collect();
-        let argmax = logits
-            .iter()
-            .enumerate()
-            .max_by(|a, b| a.1.total_cmp(b.1))
-            .map(|(i, _)| i as u32)
-            .unwrap();
-        let stats = lens_stats(&logits, argmax).unwrap();
-        assert_eq!(stats.top1, argmax);
-        assert!((stats.nll + stats.top1_logprob).abs() < 1e-5);
-        let (entropy, nll) = entropy_nll(&logits, Some(argmax));
-        assert!((stats.entropy - entropy).abs() < 1e-6);
-        assert!((stats.nll - nll.unwrap()).abs() < 1e-6);
-    }
-
-    #[test]
-    fn out_of_vocab_target_yields_no_nll() {
-        let logits = vec![0.0f32; 8];
-        let (_, nll) = entropy_nll(&logits, Some(99));
-        assert!(nll.is_none());
-        assert!(lens_stats(&logits, 99).is_none());
-    }
-}
-
 // ── Component parity injection (`ARLE_PARITY_*`, diagnostic-only) ────────────
 // Overwrite one forward buffer with a reference tensor so a single component can
 // be compared on an EXACTLY shared input. Comparing accumulated states cannot

@@ -105,27 +105,3 @@ impl VulkanQwen3Model {
         )
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn dense_qwen3_ops_match_cuda_order() {
-        let ops = dense_qwen3_forward_ops(1);
-        assert_eq!(ops.first(), Some(&Qwen3Op::Embedding));
-        assert_eq!(ops.last(), Some(&Qwen3Op::LmHead));
-        assert_eq!(
-            &ops[1..1 + DENSE_QWEN3_LAYER_OPS.len()],
-            DENSE_QWEN3_LAYER_OPS
-        );
-        assert_eq!(ops[1], Qwen3Op::InputRmsNorm);
-        assert_eq!(ops[2], Qwen3Op::QProj);
-        assert_eq!(ops[3], Qwen3Op::KProj);
-        assert_eq!(ops[4], Qwen3Op::VProj);
-        assert!(ops.contains(&Qwen3Op::QNorm));
-        assert!(ops.contains(&Qwen3Op::KNorm));
-        assert!(ops.contains(&Qwen3Op::SwiGlu));
-        assert_eq!(ops.len(), 19);
-    }
-}

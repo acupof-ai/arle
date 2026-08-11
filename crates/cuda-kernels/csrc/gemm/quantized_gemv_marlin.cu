@@ -26,7 +26,7 @@
 #define WARP_SIZE 32
 #define GEMV_THREADS 256
 #define GEMV_ROWS 8
-#define W4A16_MARLIN_BTILE 8
+#define W4A16_MARLIN_BTILE 4
 
 __device__ __forceinline__ float warp_reduce_sum(float val) {
     #pragma unroll

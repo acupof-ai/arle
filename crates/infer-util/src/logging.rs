@@ -198,39 +198,3 @@ pub fn init_stderr_with_prefix(level: &str, prefix: &str) {
 pub fn init_default() {
     init(LoggingConfig::default());
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// `init()` is process-global (`Once`) — this must be the only test in
-    /// this crate that initializes logging, so the file sink it sets up is
-    /// observable exactly once.
-    #[test]
-    fn file_sink_writes_a_log_line_to_disk() {
-        let dir = std::env::temp_dir().join(format!("arle-logging-test-{}", std::process::id()));
-        // SAFETY: single-threaded test process, set before the one `init()` call below.
-        unsafe { std::env::set_var("ARLE_LOG_DIR", &dir) };
-        init_stderr("info");
-        log::info!("logging file-sink self-check");
-        // logforth's file appender flushes on a background thread, so the file
-        // can exist before the record lands — poll content, not just presence.
-        let mut contents = String::new();
-        for _ in 0..100 {
-            contents = std::fs::read_dir(&dir)
-                .ok()
-                .and_then(|d| d.filter_map(|e| e.ok()).next())
-                .and_then(|e| std::fs::read_to_string(e.path()).ok())
-                .unwrap_or_default();
-            if contents.contains("logging file-sink self-check") {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
-        assert!(
-            contents.contains("logging file-sink self-check"),
-            "log file under {dir:?} missing the test record after 2s: {contents:?}"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-}

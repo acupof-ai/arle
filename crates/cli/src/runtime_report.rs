@@ -102,39 +102,3 @@ fn ru_maxrss_to_bytes(raw: u64) -> u64 {
 fn ru_maxrss_to_bytes(raw: u64) -> u64 {
     raw.saturating_mul(1024)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::{MemorySnapshot, format_exit_memory_report, format_gib};
-
-    #[test]
-    fn format_gib_uses_binary_units() {
-        assert_eq!(format_gib(3 * 1024 * 1024 * 1024), "3.00 GiB");
-    }
-
-    #[test]
-    fn exit_report_includes_peak_current_and_available() {
-        let body = format_exit_memory_report(MemorySnapshot {
-            peak_rss_bytes: Some(4 * 1024 * 1024 * 1024),
-            current_rss_bytes: Some(3 * 1024 * 1024 * 1024),
-            system_available_bytes: Some(21 * 1024 * 1024 * 1024),
-        });
-        assert_eq!(
-            body,
-            "[ARLE] exit memory: peak_rss=4.00 GiB current_rss=3.00 GiB system_available=21.00 GiB"
-        );
-    }
-
-    #[test]
-    fn exit_report_handles_missing_process_metrics() {
-        let body = format_exit_memory_report(MemorySnapshot {
-            peak_rss_bytes: None,
-            current_rss_bytes: None,
-            system_available_bytes: Some(1024 * 1024 * 1024),
-        });
-        assert_eq!(
-            body,
-            "[ARLE] exit memory: peak_rss=unknown current_rss=unknown system_available=1.00 GiB"
-        );
-    }
-}

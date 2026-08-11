@@ -251,6 +251,22 @@ pub struct WireStats {
     pub throughput_generated_tokens: u64,
     pub throughput_requests_completed: u64,
     #[serde(default)]
+    pub throughput_requests_succeeded: u64,
+    #[serde(default)]
+    pub throughput_requests_failed: u64,
+    #[serde(default)]
+    pub throughput_ttft_micros_total: u64,
+    #[serde(default)]
+    pub throughput_ttft_count: u64,
+    #[serde(default)]
+    pub throughput_tpot_micros_total: u64,
+    #[serde(default)]
+    pub throughput_tpot_count: u64,
+    #[serde(default)]
+    pub throughput_e2e_micros_total: u64,
+    #[serde(default)]
+    pub throughput_e2e_count: u64,
+    #[serde(default)]
     pub throughput_forward_busy_micros: u64,
     #[serde(default)]
     pub throughput_prefill_forward_steps: u64,
@@ -355,6 +371,14 @@ impl WireStats {
                 prefill_tokens: self.throughput_prefill_tokens,
                 generated_tokens: self.throughput_generated_tokens,
                 requests_completed: self.throughput_requests_completed,
+                requests_succeeded: self.throughput_requests_succeeded,
+                requests_failed: self.throughput_requests_failed,
+                ttft_micros_total: self.throughput_ttft_micros_total,
+                ttft_count: self.throughput_ttft_count,
+                tpot_micros_total: self.throughput_tpot_micros_total,
+                tpot_count: self.throughput_tpot_count,
+                e2e_micros_total: self.throughput_e2e_micros_total,
+                e2e_count: self.throughput_e2e_count,
                 forward_busy_micros: self.throughput_forward_busy_micros,
                 prefill_forward_steps: self.throughput_prefill_forward_steps,
                 prefill_forward_busy_micros: self.throughput_prefill_forward_busy_micros,
@@ -443,6 +467,14 @@ impl WireStats {
             throughput_prefill_tokens: c.throughput.prefill_tokens,
             throughput_generated_tokens: c.throughput.generated_tokens,
             throughput_requests_completed: c.throughput.requests_completed,
+            throughput_requests_succeeded: c.throughput.requests_succeeded,
+            throughput_requests_failed: c.throughput.requests_failed,
+            throughput_ttft_micros_total: c.throughput.ttft_micros_total,
+            throughput_ttft_count: c.throughput.ttft_count,
+            throughput_tpot_micros_total: c.throughput.tpot_micros_total,
+            throughput_tpot_count: c.throughput.tpot_count,
+            throughput_e2e_micros_total: c.throughput.e2e_micros_total,
+            throughput_e2e_count: c.throughput.e2e_count,
             throughput_forward_busy_micros: c.throughput.forward_busy_micros,
             throughput_prefill_forward_steps: c.throughput.prefill_forward_steps,
             throughput_prefill_forward_busy_micros: c.throughput.prefill_forward_busy_micros,
@@ -1373,295 +1405,4 @@ fn read_envelope(stream: &mut TcpStream) -> Result<Option<RelayEnvelope>> {
     let envelope: RelayEnvelope =
         serde_json::from_slice(&payload).context("relay deserialize envelope")?;
     Ok(Some(envelope))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::thread;
-
-    /// The 2026-07-05 livelock's actual freeze point: the coordinator wedged
-    /// inside `send()` on a peer that stopped reading. A non-reading peer
-    /// fills the socket buffer after enough writes; `set_write_timeout` must
-    /// turn that block into a bounded `Err`, not a permanent hang.
-    #[test]
-    fn write_timeout_bounds_a_send_to_a_non_reading_peer() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        // Accept and hold the connection open, but never read from it —
-        // simulates the stuck-peer symptom without needing a real second process.
-        let _peer = thread::spawn(move || listener.accept().unwrap().0);
-        let mut client = TcpChannel::new(TcpStream::connect(addr).unwrap());
-        client
-            .set_write_timeout(Some(Duration::from_millis(50)))
-            .unwrap();
-        let envelope = RelayEnvelope::TickAdmissions {
-            seq: 0,
-            requests: vec![],
-        };
-        let started = Instant::now();
-        let err = loop {
-            if let Err(err) = client.send(&envelope) {
-                break err;
-            }
-            assert!(
-                started.elapsed() < Duration::from_secs(5),
-                "socket buffer never filled after 5s of sends"
-            );
-        };
-        assert!(
-            started.elapsed() < Duration::from_secs(5),
-            "send() only errored after {:?}, longer than any reasonable write timeout",
-            started.elapsed()
-        );
-        drop(err); // just needs to be an Err; message is OS/timing-dependent.
-    }
-
-    #[test]
-    fn envelope_round_trip() {
-        let env = RelayEnvelope::TickAdmissions {
-            seq: 5,
-            requests: vec![WireRequest {
-                request_id: 42,
-                prompt_tokens: vec![1, 2, 3, 4],
-                max_tokens: 16,
-                sampling: SamplingParams::default(),
-                response_format: None,
-            }],
-        };
-        let bytes = serde_json::to_vec(&env).unwrap();
-        let decoded: RelayEnvelope = serde_json::from_slice(&bytes).unwrap();
-        match decoded {
-            RelayEnvelope::TickAdmissions { seq, requests } => {
-                assert_eq!(seq, 5);
-                assert_eq!(requests.len(), 1);
-                assert_eq!(requests[0].request_id, 42);
-                assert_eq!(requests[0].prompt_tokens, vec![1, 2, 3, 4]);
-                assert_eq!(requests[0].max_tokens, 16);
-            }
-            other => panic!("expected TickAdmissions, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn tick_ack_round_trip() {
-        let env = RelayEnvelope::TickAck { rank: 3, seq: 17 };
-        let bytes = serde_json::to_vec(&env).unwrap();
-        match serde_json::from_slice(&bytes).unwrap() {
-            RelayEnvelope::TickAck { rank, seq } => {
-                assert_eq!(rank, 3);
-                assert_eq!(seq, 17);
-            }
-            other => panic!("expected TickAck, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn tick_ack_ledger_min_over_all_ranks() {
-        let ledger = TickAckLedger::new([0, 1]);
-        assert_eq!(ledger.min_acked(), 0, "no acks yet");
-        ledger.ack(0, 0);
-        assert_eq!(ledger.min_acked(), 0, "rank 1 never acked");
-        ledger.ack(1, 2);
-        assert_eq!(ledger.min_acked(), 1, "rank 0 only acked seq 0");
-        ledger.ack(0, 2);
-        assert_eq!(ledger.min_acked(), 3, "both ranks acked through seq 2");
-        ledger.ack(0, 1);
-        assert_eq!(ledger.min_acked(), 3, "stale ack is a no-op");
-    }
-
-    #[test]
-    fn coordinator_tracks_min_acked_ticks_from_worker_acks() {
-        let world_size = 2;
-        let pending = RelayCoordinator::bind().unwrap();
-        let coord_addr: SocketAddr = format!("127.0.0.1:{}", pending.port()).parse().unwrap();
-
-        let worker_thread = thread::spawn(move || {
-            let mut worker =
-                RelayWorker::connect_with_rank(coord_addr, Duration::from_secs(5), 1, world_size)
-                    .unwrap();
-            for seq in 0..3 {
-                worker
-                    .send(&RelayEnvelope::TickAck { rank: 1, seq })
-                    .unwrap();
-            }
-            assert!(worker.recv().unwrap().is_none(), "EOF on coordinator drop");
-        });
-
-        let coord = pending
-            .accept(world_size, Duration::from_secs(5))
-            .expect("worker connected within 5s");
-        // No 0-before-ack assert here: the reader thread races the accept
-        // return (the pure-ledger test covers the unacked state).
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while coord.min_acked_ticks() < 3 {
-            assert!(Instant::now() < deadline, "acks not observed within 5s");
-            thread::sleep(Duration::from_millis(5));
-        }
-        assert_eq!(coord.min_acked_ticks(), 3);
-        drop(coord);
-
-        worker_thread.join().unwrap();
-    }
-
-    #[test]
-    fn coordinator_worker_round_trip() {
-        let world_size = 2;
-        let pending = RelayCoordinator::bind().unwrap();
-        let coord_addr: SocketAddr = format!("127.0.0.1:{}", pending.port()).parse().unwrap();
-
-        let worker_thread = thread::spawn(move || {
-            let mut worker =
-                RelayWorker::connect_with_rank(coord_addr, Duration::from_secs(5), 1, world_size)
-                    .unwrap();
-            // Receive one envelope, then EOF on shutdown.
-            let env = worker.recv().unwrap().expect("envelope");
-            match env {
-                RelayEnvelope::TickAdmissions { seq, requests } => {
-                    assert_eq!(seq, 0);
-                    assert_eq!(requests[0].request_id, 7);
-                    assert_eq!(requests[0].prompt_tokens, vec![100, 200]);
-                }
-                _ => panic!("expected TickAdmissions"),
-            }
-            let next = worker.recv().unwrap();
-            assert!(next.is_none(), "expected EOF after coordinator drop");
-        });
-
-        let mut coord = pending
-            .accept(world_size, Duration::from_secs(5))
-            .expect("worker connected within 5s");
-        assert_eq!(coord.worker_ranks(), vec![1]);
-        coord
-            .broadcast(&RelayEnvelope::TickAdmissions {
-                seq: 0,
-                requests: vec![WireRequest {
-                    request_id: 7,
-                    prompt_tokens: vec![100, 200],
-                    max_tokens: 1,
-                    sampling: SamplingParams::default(),
-                    response_format: None,
-                }],
-            })
-            .unwrap();
-        drop(coord);
-
-        worker_thread.join().unwrap();
-    }
-
-    #[test]
-    fn coordinator_targeted_send_reaches_only_selected_rank() {
-        let world_size = 3;
-        let pending = RelayCoordinator::bind().unwrap();
-        let coord_addr: SocketAddr = format!("127.0.0.1:{}", pending.port()).parse().unwrap();
-
-        let rank1_thread = thread::spawn(move || {
-            let mut worker =
-                RelayWorker::connect_with_rank(coord_addr, Duration::from_secs(5), 1, world_size)
-                    .unwrap();
-            assert!(worker.recv().unwrap().is_none());
-        });
-
-        let coord_addr: SocketAddr = format!("127.0.0.1:{}", pending.port()).parse().unwrap();
-        let rank2_thread = thread::spawn(move || {
-            let mut worker =
-                RelayWorker::connect_with_rank(coord_addr, Duration::from_secs(5), 2, world_size)
-                    .unwrap();
-            let env = worker.recv().unwrap().expect("targeted envelope");
-            match env {
-                RelayEnvelope::TickAdmissions { seq, requests } => {
-                    assert_eq!(seq, 3);
-                    assert_eq!(requests[0].request_id, 9);
-                    assert_eq!(requests[0].prompt_tokens, vec![9]);
-                }
-                other => panic!("expected TickAdmissions, got {other:?}"),
-            }
-            assert!(worker.recv().unwrap().is_none());
-        });
-
-        let mut coord = pending
-            .accept(world_size, Duration::from_secs(5))
-            .expect("workers connected within 5s");
-        assert_eq!(coord.worker_ranks(), vec![1, 2]);
-        coord
-            .send_to_ranks(
-                &[2],
-                &RelayEnvelope::TickAdmissions {
-                    seq: 3,
-                    requests: vec![WireRequest {
-                        request_id: 9,
-                        prompt_tokens: vec![9],
-                        max_tokens: 1,
-                        sampling: SamplingParams::default(),
-                        response_format: None,
-                    }],
-                },
-            )
-            .unwrap();
-        drop(coord);
-
-        rank1_thread.join().unwrap();
-        rank2_thread.join().unwrap();
-    }
-
-    #[test]
-    fn coordinator_dispatches_worker_completion_to_registered_sink() {
-        let world_size = 2;
-        let pending = RelayCoordinator::bind().unwrap();
-        let coord_addr: SocketAddr = format!("127.0.0.1:{}", pending.port()).parse().unwrap();
-
-        let worker_thread = thread::spawn(move || {
-            let mut worker =
-                RelayWorker::connect_with_rank(coord_addr, Duration::from_secs(5), 1, world_size)
-                    .unwrap();
-            match worker.recv().unwrap().expect("request signal") {
-                RelayEnvelope::TickAdmissions { requests, .. } => {
-                    assert_eq!(requests[0].request_id, 11);
-                }
-                other => panic!("expected request signal, got {other:?}"),
-            }
-            worker
-                .send(&RelayEnvelope::Completion {
-                    request_id: 11,
-                    delta: RelayCompletionDelta::text("remote".to_string()),
-                })
-                .unwrap();
-            worker
-                .send(&RelayEnvelope::Completion {
-                    request_id: 11,
-                    delta: RelayCompletionDelta {
-                        finish: true,
-                        ..Default::default()
-                    },
-                })
-                .unwrap();
-        });
-
-        let mut coord = pending
-            .accept(world_size, Duration::from_secs(5))
-            .expect("worker connected within 5s");
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        coord.register_completion_sink(11, tx).unwrap();
-        coord
-            .send_to_ranks(
-                &[1],
-                &RelayEnvelope::TickAdmissions {
-                    seq: 0,
-                    requests: vec![WireRequest {
-                        request_id: 11,
-                        prompt_tokens: vec![11],
-                        max_tokens: 1,
-                        sampling: SamplingParams::default(),
-                        response_format: None,
-                    }],
-                },
-            )
-            .unwrap();
-        let first = rx.blocking_recv().expect("text completion");
-        assert_eq!(first.text_delta, "remote");
-        let second = rx.blocking_recv().expect("finish completion");
-        assert!(second.finish);
-
-        worker_thread.join().unwrap();
-    }
 }

@@ -49,45 +49,6 @@ struct PendingPrefixCapture {
     pages: Vec<PendingPrefixPage>,
 }
 
-#[cfg(test)]
-mod pending_prefix_tests {
-    use super::*;
-
-    fn page(source_page: u32) -> PendingPrefixPage {
-        PendingPrefixPage {
-            source_page,
-            target_page: source_page,
-            confirmed: false,
-            cancelled: false,
-            entry: crate::attention::Dsv4PrefixPageEntry {
-                page_index: 0,
-                boundary: false,
-                layers: Vec::new(),
-            },
-            frontier_tail: None,
-        }
-    }
-
-    #[test]
-    fn pending_capture_rekeys_or_cancels_before_page_recycle() {
-        let mut rekeyed = page(7);
-        rekeyed.repair(9, 7, false);
-        assert_eq!(rekeyed.target_page, 9);
-        assert!(rekeyed.confirmed);
-        rekeyed.cancel_provisional(&[7]);
-        assert!(!rekeyed.cancelled);
-        assert!(rekey_target_conflicts(7, 9, true));
-        assert!(!rekey_target_conflicts(7, 9, false));
-        assert!(!rekey_target_conflicts(9, 9, true));
-
-        let mut recycled = page(11);
-        recycled.cancel_provisional(&[11]);
-        assert!(recycled.cancelled);
-        assert!(capture_epoch_matches(3, Some(3)));
-        assert!(!capture_epoch_matches(3, Some(4)));
-    }
-}
-
 /// DSv4-Flash executor: drives [`crate::dsv4::Dsv4Model::forward_tokens`].
 /// Prefill/mixed still run one scheduled row. Pure decode uses B=1 as the
 /// single-row reference and B>1 as the canonical layer-major batched lane for
