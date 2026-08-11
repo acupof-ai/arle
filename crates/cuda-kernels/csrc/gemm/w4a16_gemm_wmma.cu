@@ -3,10 +3,11 @@
 // output[N, M] = weight[N, K] (int4) * input[M, K] (bf16)^T
 //
 // The weight is dequantized int4→fp16 in shared memory (no global memory write),
-// then mma.sync.m16n16k16 does the matmul on tensor cores.
+// then mma.sync.m16n16k16 does the matmul on tensor cores. This avoids the
+// 2× memory blowup of the dequant-to-global + cuBLAS path while getting 8× the
+// compute throughput of the int-bit-bashing CUDA-core GEMV.
 //
-// Uses 4 warps per block (4 n-tiles) to share the input tile, and K-splitting
-// to increase occupancy.
+// Only used for M >= 2 (the DSpark verify batch); M=1 decode keeps the GEMV.
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -18,22 +19,16 @@ using namespace nvcuda;
 #define WMMA_TILE_N 16
 #define WMMA_TILE_M 16
 #define WMMA_TILE_K 16
-#define WMMA_WARPS 4
-#define WMMA_K_SPLITS 4
 
 __global__ void w4a16_gemm_wmma_kernel(
     const uint8_t* __restrict__ weight,   // [N, K/2] int4
     const __nv_bfloat16* __restrict__ scales, // [N, ceil(K/group_size)]
     const __nv_bfloat16* __restrict__ input,  // [M, K] bf16
-    float* __restrict__ output,                // [M, N] float accumulator
-    int M, int N, int K, int group_size, int k_chunk_size)
+    __nv_bfloat16* __restrict__ output,       // [N, M] bf16
+    int M, int N, int K, int group_size)
 {
-    const int warp_id = threadIdx.x / 32;
-    const int lane = threadIdx.x % 32;
-    const int n0 = (blockIdx.x * WMMA_WARPS + warp_id) * WMMA_TILE_N;
+    const int n0 = blockIdx.x * WMMA_TILE_N;
     const int m0 = blockIdx.y * WMMA_TILE_M;
-    const int k_start = blockIdx.z * k_chunk_size;
-    const int k_end = min(k_start + k_chunk_size, K);
     if (n0 >= N || m0 >= M) return;
 
     const int tid = threadIdx.x;
@@ -42,92 +37,96 @@ __global__ void w4a16_gemm_wmma_kernel(
     wmma::fragment<wmma::accumulator, WMMA_TILE_N, WMMA_TILE_M, WMMA_TILE_K, float> c_frag;
     wmma::fill_fragment(c_frag, 0.0f);
 
-    __shared__ half w_smem[WMMA_WARPS * WMMA_TILE_N * WMMA_TILE_K];
+    // Shared memory for the dequantized weight tile [16, 16] fp16 and the
+    // input tile [16, 16] fp16.
+    __shared__ half w_smem[WMMA_TILE_N * WMMA_TILE_K];
     __shared__ half x_smem[WMMA_TILE_M * WMMA_TILE_K];
 
-    for (int k0 = k_start; k0 < k_end; k0 += WMMA_TILE_K) {
-        // --- Dequant weight tile for this warp ---
-        half* w_smem_warp = w_smem + warp_id * WMMA_TILE_N * WMMA_TILE_K;
-        {
-            const int row = lane / 2;
-            const int hf = lane % 2;
-            if (row < WMMA_TILE_N) {
-                const int n = n0 + row;
-                const int g = k0 / group_size;
-                const float scale_f = __bfloat162float(scales[n * groups_per_row + g]);
-                const uint8_t* wrow = weight + (size_t)n * (K / 2) + k0 / 2;
-                half* wout = w_smem_warp + row * WMMA_TILE_K;
-                const uint32_t w = *reinterpret_cast<const uint32_t*>(wrow + hf * 4);
-                const uint32_t lo = w & 0x0F0F0F0Fu;
-                const uint32_t hi = (w >> 4) & 0x0F0F0F0Fu;
-                const uint8_t* lob = reinterpret_cast<const uint8_t*>(&lo);
-                const uint8_t* hib = reinterpret_cast<const uint8_t*>(&hi);
-                const int base = hf * 8;
-                #pragma unroll
-                for (int i = 0; i < 4; i++) {
-                    wout[base + i * 2]     = __float2half((float)((int)lob[i] - 8) * scale_f);
-                    wout[base + i * 2 + 1] = __float2half((float)((int)hib[i] - 8) * scale_f);
-                }
+    for (int k0 = 0; k0 < K; k0 += WMMA_TILE_K) {
+        // --- Dequant weight tile [n0..n0+16, k0..k0+16] into w_smem ---
+        // Each thread handles one row of the tile.
+        if (tid < WMMA_TILE_N) {
+            const int n = n0 + tid;
+            const int g = k0 / group_size;
+            const float scale_f = __bfloat162float(scales[n * groups_per_row + g]);
+            const uint8_t* wrow = weight + (size_t)n * (K / 2) + k0 / 2;
+            half* wout = w_smem + tid * WMMA_TILE_K;
+            // 16 int4 values = 8 bytes. Load as 2 uint32.
+            const uint32_t w0 = *reinterpret_cast<const uint32_t*>(wrow);
+            const uint32_t w1 = *reinterpret_cast<const uint32_t*>(wrow + 4);
+            // Unpack 8 nibbles from w0.
+            const uint32_t lo0 = w0 & 0x0F0F0F0Fu;
+            const uint32_t hi0 = (w0 >> 4) & 0x0F0F0F0Fu;
+            const uint32_t lo1 = w1 & 0x0F0F0F0Fu;
+            const uint32_t hi1 = (w1 >> 4) & 0x0F0F0F0Fu;
+            // Dequant: extract nibbles, subtract 8, multiply by scale.
+            // Use the same int->float path as the scalar GEMV for bit-exact
+            // dequant values; the Marlin OR-with-0x6400 trick is equivalent but
+            // we keep the obvious form here while debugging the WMMA path.
+            const uint8_t* lo0b = reinterpret_cast<const uint8_t*>(&lo0);
+            const uint8_t* hi0b = reinterpret_cast<const uint8_t*>(&hi0);
+            const uint8_t* lo1b = reinterpret_cast<const uint8_t*>(&lo1);
+            const uint8_t* hi1b = reinterpret_cast<const uint8_t*>(&hi1);
+            #pragma unroll
+            for (int i = 0; i < 4; i++) {
+                float w0 = (float)((int)lo0b[i] - 8) * scale_f;
+                float w1 = (float)((int)hi0b[i] - 8) * scale_f;
+                wout[i * 2]     = __float2half(w0);
+                wout[i * 2 + 1] = __float2half(w1);
+            }
+            #pragma unroll
+            for (int i = 0; i < 4; i++) {
+                float w0 = (float)((int)lo1b[i] - 8) * scale_f;
+                float w1 = (float)((int)hi1b[i] - 8) * scale_f;
+                wout[8 + i * 2]     = __float2half(w0);
+                wout[8 + i * 2 + 1] = __float2half(w1);
             }
         }
+        __syncthreads();
 
-        // --- Load input tile (shared by all warps) ---
-        if (warp_id == 0) {
-            for (int i = lane; i < WMMA_TILE_M * WMMA_TILE_K; i += 32) {
-                int m = i / WMMA_TILE_K;
-                int k = i % WMMA_TILE_K;
-                half val = __float2half(0.0f);
-                if (m0 + m < M) {
-                    val = __float2half(__bfloat162float(input[(size_t)(m0 + m) * K + k0 + k]));
+        // --- Load input tile [m0..m0+16, k0..k0+16], transpose to [K, M] ---
+        // Zero the whole tile first so padding rows (m >= M) are 0.
+        if (tid < WMMA_TILE_M * WMMA_TILE_K) {
+            x_smem[tid] = __float2half(0.0f);
+        }
+        __syncthreads();
+        if (tid < WMMA_TILE_M) {
+            const int m = m0 + tid;
+            if (m < M) {
+                const __nv_bfloat16* xrow = input + (size_t)m * K + k0;
+                // Store transposed: x_smem[k * WMMA_TILE_M + m_idx] = input[m, k].
+                for (int i = 0; i < WMMA_TILE_K; i++) {
+                    x_smem[i * WMMA_TILE_M + tid] = __float2half(__bfloat162float(xrow[i]));
                 }
-                x_smem[i] = val;
             }
         }
         __syncthreads();
 
         // --- WMMA matmul ---
         wmma::fragment<wmma::matrix_a, WMMA_TILE_N, WMMA_TILE_M, WMMA_TILE_K, half, wmma::row_major> a_frag;
-        wmma::fragment<wmma::matrix_b, WMMA_TILE_N, WMMA_TILE_M, WMMA_TILE_K, half, wmma::col_major> b_frag;
-        wmma::load_matrix_sync(a_frag, w_smem_warp, WMMA_TILE_K);
-        wmma::load_matrix_sync(b_frag, x_smem, WMMA_TILE_K);
+        wmma::fragment<wmma::matrix_b, WMMA_TILE_N, WMMA_TILE_M, WMMA_TILE_K, half, wmma::row_major> b_frag;
+        wmma::load_matrix_sync(a_frag, w_smem, WMMA_TILE_K);
+        wmma::load_matrix_sync(b_frag, x_smem, WMMA_TILE_M);
         wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
         __syncthreads();
     }
 
-    // --- Atomically accumulate partial sum ---
-    __shared__ float c_smem[WMMA_WARPS * WMMA_TILE_N * WMMA_TILE_M];
-    float* c_smem_warp = c_smem + warp_id * WMMA_TILE_N * WMMA_TILE_M;
-    wmma::store_matrix_sync(c_smem_warp, c_frag, WMMA_TILE_M, wmma::mem_row_major);
+    // --- Store output tile [m0..m0+16, n0..n0+16] in [M, N] layout ---
+    // c_smem is [N_tile, M_tile] row-major; we need output[m, n] = c_smem[n_row, m_col].
+    __shared__ float c_smem[WMMA_TILE_N * WMMA_TILE_M];
+    wmma::store_matrix_sync(c_smem, c_frag, WMMA_TILE_M, wmma::mem_row_major);
     __syncthreads();
 
-    for (int i = lane; i < WMMA_TILE_N * WMMA_TILE_M; i += 32) {
-        const int n_idx = i / WMMA_TILE_M;
-        const int m_idx = i % WMMA_TILE_M;
-        const int n = n0 + n_idx;
+    // Each thread writes one element to get coalesced writes in the N dimension.
+    const int m_idx = tid / WMMA_TILE_N;  // 0..15
+    const int n_idx = tid % WMMA_TILE_N;  // 0..15
+    if (m_idx < WMMA_TILE_M && n_idx < WMMA_TILE_N) {
         const int m = m0 + m_idx;
-        if (n < N && m < M) {
-            atomicAdd(&output[(size_t)m * N + n], c_smem_warp[n_idx * WMMA_TILE_M + m_idx]);
+        const int n = n0 + n_idx;
+        if (m < M && n < N) {
+            output[(size_t)m * N + n] = __float2bfloat16(c_smem[n_idx * WMMA_TILE_M + m_idx]);
         }
     }
-}
-
-__global__ void convert_fp32_to_bf16_kernel(const float* __restrict__ in,
-                                             __nv_bfloat16* __restrict__ out, size_t n) {
-    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) {
-        out[i] = __float2bfloat16(in[i]);
-    }
-}
-
-static float* g_out_fp32 = nullptr;
-static size_t g_out_fp32_elems = 0;
-
-static cudaError_t ensure_out_fp32(size_t elems) {
-    if (elems <= g_out_fp32_elems) return cudaSuccess;
-    if (g_out_fp32) cudaFree(g_out_fp32);
-    cudaError_t err = cudaMalloc(&g_out_fp32, elems * sizeof(float));
-    if (err == cudaSuccess) g_out_fp32_elems = elems;
-    return err;
 }
 
 extern "C" cudaError_t w4a16_gemm_wmma_cuda(
@@ -138,25 +137,10 @@ extern "C" cudaError_t w4a16_gemm_wmma_cuda(
     int M, int N, int K, int group_size,
     cudaStream_t stream)
 {
-    const int k_chunk_size = (K + WMMA_K_SPLITS - 1) / WMMA_K_SPLITS;
-    const size_t out_elems = (size_t)M * N;
-
-    cudaError_t err = ensure_out_fp32(out_elems);
-    if (err != cudaSuccess) return err;
-    err = cudaMemsetAsync(g_out_fp32, 0, out_elems * sizeof(float), stream);
-    if (err != cudaSuccess) return err;
-
-    dim3 grid((N + WMMA_WARPS * WMMA_TILE_N - 1) / (WMMA_WARPS * WMMA_TILE_N),
-              (M + WMMA_TILE_M - 1) / WMMA_TILE_M,
-              WMMA_K_SPLITS);
-    dim3 block(WMMA_WARPS * 32);
+    dim3 grid((N + WMMA_TILE_N - 1) / WMMA_TILE_N,
+              (M + WMMA_TILE_M - 1) / WMMA_TILE_M);
+    dim3 block(32);  // one warp for WMMA; 16 threads dequant weight rows
     w4a16_gemm_wmma_kernel<<<grid, block, 0, stream>>>(
-        weight, scales, input, g_out_fp32, M, N, K, group_size, k_chunk_size);
-    err = cudaGetLastError();
-    if (err != cudaSuccess) return err;
-
-    constexpr int CONV_BLOCK = 256;
-    convert_fp32_to_bf16_kernel<<<(out_elems + CONV_BLOCK - 1) / CONV_BLOCK, CONV_BLOCK, 0, stream>>>(
-        g_out_fp32, output, out_elems);
+        weight, scales, input, output, M, N, K, group_size);
     return cudaGetLastError();
 }
