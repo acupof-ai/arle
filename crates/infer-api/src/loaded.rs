@@ -2552,6 +2552,10 @@ mod backend {
             self.engine.operator_dispatch_stats()
         }
 
+        pub fn op_timing_stats(&self) -> infer_seam::OpTimingStats {
+            self.engine.op_timing_stats()
+        }
+
         pub fn artifact_identity(&self) -> infer_seam::BackendArtifactIdentity {
             self.engine.artifact_identity()
         }

@@ -3040,12 +3040,14 @@ mod dsv4_gpu {
         // Router gemm → logits[T, E] → route on device.
         let (route_indices, route_weights) =
             crate::stage_profile::profile(ctx, "dsv4/stage/moe_route", || -> Result<_> {
-                let _nvtx = crate::nvtx::range("dsv4/moe_route");
-                // SAFETY: router gemm writes the full logits buffer.
-                let mut logits = unsafe { HiddenStates::uninit(ctx, cfg.num_experts, num_tokens)? };
-                gemm_batch(ctx, &layer.gate, hidden, &mut logits)?;
-                let routing = dsv4_route_device(model, layer, tokens, &logits, keepalive)?;
-                Ok((routing.indices, routing.weights))
+                crate::profile::profile_op(ctx, "moe_route", None, num_tokens, || {
+                    // SAFETY: router gemm writes the full logits buffer.
+                    let mut logits =
+                        unsafe { HiddenStates::uninit(ctx, cfg.num_experts, num_tokens)? };
+                    gemm_batch(ctx, &layer.gate, hidden, &mut logits)?;
+                    let routing = dsv4_route_device(model, layer, tokens, &logits, keepalive)?;
+                    Ok((routing.indices, routing.weights))
+                })
             })?;
 
         #[cfg(all(feature = "cuda", feature = "nccl"))]
@@ -3578,46 +3580,47 @@ mod dsv4_gpu {
             intermediate
         );
 
-        let expert_out = {
-            let _nvtx = crate::nvtx::range("dsv4/deepgemm_grouped");
-            deepgemm_grouped_experts(
-                ctx,
-                layer,
-                &packed_hidden,
-                &counts,
-                &offsets,
-                contig_align,
-                swiglu_limit,
-                keepalive,
-            )?
-        };
+        let expert_out =
+            crate::profile::profile_op(ctx, "deepgemm_grouped", None, num_tokens, || {
+                deepgemm_grouped_experts(
+                    ctx,
+                    layer,
+                    &packed_hidden,
+                    &counts,
+                    &offsets,
+                    contig_align,
+                    swiglu_limit,
+                    keepalive,
+                )
+            })?;
         keepalive.keep_hidden(&expert_out);
 
         // Scatter weighted expert outputs to route slots, combine topk.
-        let nvtx_combine = crate::nvtx::range("dsv4/combine_scatter");
-        let route_out = HiddenStates::zeros(ctx, hidden_dim, total_routes.max(1))?;
-        keepalive.keep_hidden(&route_out);
-        // SAFETY: all buffers valid on ctx.stream for the given shapes.
-        unsafe {
-            moe::dsv4_scatter_all_route_slots(
-                cache_ptr(&expert_out.data, ctx),
-                cache_ptr(&route_out.data, ctx),
-                cache_ptr(&packed_route_slot, ctx),
-                cache_ptr(&packed_weight, ctx),
-                expert_out.seq_len,
-                hidden_dim,
-                ctx.stream.cu_stream(),
-            )?;
-            moe::dsv4_combine_route_slot_outputs(
-                cache_ptr(&route_out.data, ctx),
-                cache_ptr(&out.data, ctx),
-                num_tokens,
-                topk,
-                hidden_dim,
-                ctx.stream.cu_stream(),
-            )?;
-        }
-        drop(nvtx_combine);
+        crate::profile::profile_op(ctx, "combine_scatter", None, num_tokens, || {
+            let route_out = HiddenStates::zeros(ctx, hidden_dim, total_routes.max(1))?;
+            keepalive.keep_hidden(&route_out);
+            // SAFETY: all buffers valid on ctx.stream for the given shapes.
+            unsafe {
+                moe::dsv4_scatter_all_route_slots(
+                    cache_ptr(&expert_out.data, ctx),
+                    cache_ptr(&route_out.data, ctx),
+                    cache_ptr(&packed_route_slot, ctx),
+                    cache_ptr(&packed_weight, ctx),
+                    expert_out.seq_len,
+                    hidden_dim,
+                    ctx.stream.cu_stream(),
+                )?;
+                moe::dsv4_combine_route_slot_outputs(
+                    cache_ptr(&route_out.data, ctx),
+                    cache_ptr(&out.data, ctx),
+                    num_tokens,
+                    topk,
+                    hidden_dim,
+                    ctx.stream.cu_stream(),
+                )?;
+            }
+            Ok(())
+        })?;
 
         // The shared expert is replicated on every rank. Callers must all-reduce
         // the routed local expert contribution first, then add the shared expert
@@ -3708,8 +3711,7 @@ mod dsv4_gpu {
             Ok(())
         })?;
 
-        {
-            let _nvtx = crate::nvtx::range("dsv4/deepgemm_grouped");
+        crate::profile::profile_op(ctx, "deepgemm_grouped", None, num_tokens, || {
             crate::stage_profile::profile(
                 ctx,
                 "dsv4/stage/moe_deepgemm_grouped",
@@ -3734,46 +3736,50 @@ mod dsv4_gpu {
                     }
                     Ok(())
                 },
-            )?
-        };
-
-        let nvtx_combine = crate::nvtx::range("dsv4/combine_scatter");
-        crate::stage_profile::profile(ctx, "dsv4/stage/moe_combine_scatter", || -> Result<()> {
-            // SAFETY: ptrs from live device allocations sized to the dims passed.
-            unsafe {
-                if use_contiguous {
-                    moe::dsv4_scatter_all_route_slots(
-                        cache_ptr(&scratch.grouped_contig.out.data, ctx),
-                        cache_ptr(&scratch.route_out.data, ctx),
-                        cache_ptr(&scratch.grouped_contig.packed_route_slot, ctx),
-                        cache_ptr(&scratch.grouped_contig.packed_weight, ctx),
-                        scratch.grouped_contig.packed_hidden.seq_len,
-                        hidden_dim,
-                        ctx.stream.cu_stream(),
-                    )?;
-                } else {
-                    moe::dsv4_scatter_all_route_slots(
-                        cache_ptr(&scratch.grouped.out_compact.data, ctx),
-                        cache_ptr(&scratch.route_out.data, ctx),
-                        cache_ptr(&scratch.packed_route_slot, ctx),
-                        cache_ptr(&scratch.packed_weight, ctx),
-                        total_routes,
-                        hidden_dim,
-                        ctx.stream.cu_stream(),
-                    )?;
-                }
-                moe::dsv4_combine_route_slot_outputs(
-                    cache_ptr(&scratch.route_out.data, ctx),
-                    cache_ptr(&out.data, ctx),
-                    num_tokens,
-                    topk,
-                    hidden_dim,
-                    ctx.stream.cu_stream(),
-                )?;
-            }
-            Ok(())
+            )
         })?;
-        drop(nvtx_combine);
+
+        crate::profile::profile_op(ctx, "combine_scatter", None, num_tokens, || {
+            crate::stage_profile::profile(
+                ctx,
+                "dsv4/stage/moe_combine_scatter",
+                || -> Result<()> {
+                    // SAFETY: ptrs from live device allocations sized to the dims passed.
+                    unsafe {
+                        if use_contiguous {
+                            moe::dsv4_scatter_all_route_slots(
+                                cache_ptr(&scratch.grouped_contig.out.data, ctx),
+                                cache_ptr(&scratch.route_out.data, ctx),
+                                cache_ptr(&scratch.grouped_contig.packed_route_slot, ctx),
+                                cache_ptr(&scratch.grouped_contig.packed_weight, ctx),
+                                scratch.grouped_contig.packed_hidden.seq_len,
+                                hidden_dim,
+                                ctx.stream.cu_stream(),
+                            )?;
+                        } else {
+                            moe::dsv4_scatter_all_route_slots(
+                                cache_ptr(&scratch.grouped.out_compact.data, ctx),
+                                cache_ptr(&scratch.route_out.data, ctx),
+                                cache_ptr(&scratch.packed_route_slot, ctx),
+                                cache_ptr(&scratch.packed_weight, ctx),
+                                total_routes,
+                                hidden_dim,
+                                ctx.stream.cu_stream(),
+                            )?;
+                        }
+                        moe::dsv4_combine_route_slot_outputs(
+                            cache_ptr(&scratch.route_out.data, ctx),
+                            cache_ptr(&out.data, ctx),
+                            num_tokens,
+                            topk,
+                            hidden_dim,
+                            ctx.stream.cu_stream(),
+                        )?;
+                    }
+                    Ok(())
+                },
+            )
+        })?;
         Ok(())
     }
 

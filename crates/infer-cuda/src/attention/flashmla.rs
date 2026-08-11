@@ -1229,18 +1229,20 @@ impl Dsv4FlashMlaDecodeBatchScratch {
         if tp_world > 1 {
             let (gather_ptr, gather_guard) = self.tp_gathered_q.device_ptr_mut(&ctx.stream);
             {
-                let _nvtx = crate::nvtx::range("dsv4/flashmla_q_allgather_batched");
-                // SAFETY: per-rank Q is local_heads*head_dim bf16; the gather
-                // landing buffer holds tp_world*local_heads*head_dim. Same
-                // contract as the single-row path.
-                unsafe {
-                    tp.all_gather_bf16_raw(
-                        ctx,
-                        q_ptr as *const std::ffi::c_void,
-                        local_heads * config.head_dim,
-                        gather_ptr as *mut std::ffi::c_void,
-                    )?;
-                }
+                crate::profile::profile_op(ctx, "flashmla_q_allgather_batched", None, 1, || {
+                    // SAFETY: per-rank Q is local_heads*head_dim bf16; the gather
+                    // landing buffer holds tp_world*local_heads*head_dim. Same
+                    // contract as the single-row path.
+                    unsafe {
+                        tp.all_gather_bf16_raw(
+                            ctx,
+                            q_ptr as *const std::ffi::c_void,
+                            local_heads * config.head_dim,
+                            gather_ptr as *mut std::ffi::c_void,
+                        )?;
+                    }
+                    Ok(())
+                })?;
             }
             drop(gather_guard);
             let (gather_ptr, gather_guard) = self.tp_gathered_q.device_ptr(&ctx.stream);
@@ -1250,22 +1252,24 @@ impl Dsv4FlashMlaDecodeBatchScratch {
             let (dst_ptr, dst_guard) = dst_view.device_ptr_mut(&ctx.stream);
             drop(dst_guard);
             {
-                let _nvtx = crate::nvtx::range("dsv4/flashmla_q_repack_batched");
-                // SAFETY: repack tp_world×[local_heads,head_dim] gathered Q into
-                // one global-head row (s_q=1); both buffers valid on ctx.stream.
-                unsafe {
-                    ffi::dsv4_tp_q_repack_cuda(
-                        gather_ptr as *const ffi::Half,
-                        dst_ptr as *mut ffi::Half,
-                        tp_world as i32,
-                        1,
-                        local_heads as i32,
-                        config.head_dim as i32,
-                        ctx.stream.cu_stream(),
-                    )
-                    .result()
-                    .map_err(|e| anyhow!("DSv4 batched FlashMLA TP Q repack failed: {e}"))?;
-                }
+                crate::profile::profile_op(ctx, "flashmla_q_repack_batched", None, 1, || {
+                    // SAFETY: repack tp_world×[local_heads,head_dim] gathered Q into
+                    // one global-head row (s_q=1); both buffers valid on ctx.stream.
+                    unsafe {
+                        ffi::dsv4_tp_q_repack_cuda(
+                            gather_ptr as *const ffi::Half,
+                            dst_ptr as *mut ffi::Half,
+                            tp_world as i32,
+                            1,
+                            local_heads as i32,
+                            config.head_dim as i32,
+                            ctx.stream.cu_stream(),
+                        )
+                        .result()
+                        .map_err(|e| anyhow!("DSv4 batched FlashMLA TP Q repack failed: {e}"))?;
+                    }
+                    Ok(())
+                })?;
             }
             drop(gather_guard);
             // dst_view drops at the end of this branch, ending the q_batched borrow.
@@ -1319,22 +1323,24 @@ impl Dsv4FlashMlaDecodeBatchScratch {
             let (src_ptr, src_guard) = src_view.device_ptr(&ctx.stream);
             let (dst_ptr, dst_guard) = local_attn.data.device_ptr_mut(&ctx.stream);
             {
-                let _nvtx = crate::nvtx::range("dsv4/flashmla_out_slice_batched");
-                // SAFETY: src is one global-head output row (h_q*d_v); dst this
-                // rank's local block. Same args as the single-row out-slice.
-                unsafe {
-                    ffi::dsv4_tp_out_slice_cuda(
-                        src_ptr as *const ffi::Half,
-                        dst_ptr as *mut ffi::Half,
-                        1,
-                        self.h_q_d_v() as i32,
-                        local_width as i32,
-                        (tp_rank * local_width) as i32,
-                        ctx.stream.cu_stream(),
-                    )
-                    .result()
-                    .map_err(|e| anyhow!("DSv4 batched FlashMLA TP out slice failed: {e}"))?;
-                }
+                crate::profile::profile_op(ctx, "flashmla_out_slice_batched", None, 1, || {
+                    // SAFETY: src is one global-head output row (h_q*d_v); dst this
+                    // rank's local block. Same args as the single-row out-slice.
+                    unsafe {
+                        ffi::dsv4_tp_out_slice_cuda(
+                            src_ptr as *const ffi::Half,
+                            dst_ptr as *mut ffi::Half,
+                            1,
+                            self.h_q_d_v() as i32,
+                            local_width as i32,
+                            (tp_rank * local_width) as i32,
+                            ctx.stream.cu_stream(),
+                        )
+                        .result()
+                        .map_err(|e| anyhow!("DSv4 batched FlashMLA TP out slice failed: {e}"))?;
+                    }
+                    Ok(())
+                })?;
             }
             drop(src_guard);
             drop(dst_guard);
@@ -1382,23 +1388,25 @@ impl Dsv4FlashMlaDecodeBatchScratch {
             let (src_ptr, src_guard) = src_view.device_ptr(&ctx.stream);
             let (dst_ptr, dst_guard) = local_attn_batched.data.device_ptr_mut(&ctx.stream);
             {
-                let _nvtx = crate::nvtx::range("dsv4/flashmla_out_slice_batched");
-                // SAFETY: src is `n` global-head output rows (stride h_q*d_v), dst is
-                // n local rows (stride local_width); same per-row args as
-                // `slice_out_row`, with s_q=n so the kernel loops rows internally.
-                unsafe {
-                    ffi::dsv4_tp_out_slice_cuda(
-                        src_ptr as *const ffi::Half,
-                        dst_ptr as *mut ffi::Half,
-                        n as i32,
-                        self.h_q_d_v() as i32,
-                        local_width as i32,
-                        (tp_rank * local_width) as i32,
-                        ctx.stream.cu_stream(),
-                    )
-                    .result()
-                    .map_err(|e| anyhow!("DSv4 batched FlashMLA TP out slice failed: {e}"))?;
-                }
+                crate::profile::profile_op(ctx, "flashmla_out_slice_batched", None, n, || {
+                    // SAFETY: src is `n` global-head output rows (stride h_q*d_v), dst is
+                    // n local rows (stride local_width); same per-row args as
+                    // `slice_out_row`, with s_q=n so the kernel loops rows internally.
+                    unsafe {
+                        ffi::dsv4_tp_out_slice_cuda(
+                            src_ptr as *const ffi::Half,
+                            dst_ptr as *mut ffi::Half,
+                            n as i32,
+                            self.h_q_d_v() as i32,
+                            local_width as i32,
+                            (tp_rank * local_width) as i32,
+                            ctx.stream.cu_stream(),
+                        )
+                        .result()
+                        .map_err(|e| anyhow!("DSv4 batched FlashMLA TP out slice failed: {e}"))?;
+                    }
+                    Ok(())
+                })?;
             }
             drop(src_guard);
             drop(dst_guard);
