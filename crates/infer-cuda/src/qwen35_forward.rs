@@ -353,7 +353,7 @@ impl Qwen35Model {
         let start_pos_dev = &*start_pos_slot.get(&self.ctx, 1)?;
 
         let hidden = hidden.get(&self.ctx, hidden_size, seq_len)?;
-        qwen35_profile(&self.ctx, "qwen/embedding", None, seq_len, || {
+        crate::profile::profile_op(&self.ctx, "embedding", None, seq_len, || {
             embedding_batch(&self.ctx, &self.embed_tokens, token_ids, hidden)
         })?;
         // Probe tap: `layer = usize::MAX` marks the embedding output, so a
@@ -389,13 +389,9 @@ impl Qwen35Model {
         let mut full_idx = 0usize;
         let mut linear_idx = 0usize;
         for (layer_idx, layer) in self.layers.iter().enumerate() {
-            qwen35_profile(
-                &self.ctx,
-                "qwen/input_norm",
-                Some(layer_idx),
-                seq_len,
-                || rms_norm_offset(&self.ctx, hidden, &layer.input_layernorm, eps, normed),
-            )?;
+            crate::profile::profile_op(&self.ctx, "input_norm", Some(layer_idx), seq_len, || {
+                rms_norm_offset(&self.ctx, hidden, &layer.input_layernorm, eps, normed)
+            })?;
             #[cfg(feature = "cuda")]
             {
                 stage_row("attn_in", layer_idx, normed);
@@ -404,9 +400,9 @@ impl Qwen35Model {
 
             match &layer.attn {
                 Qwen35Attn::Full(full_attn) => {
-                    qwen35_profile(
+                    crate::profile::profile_op(
                         &self.ctx,
-                        "qwen/full_attention",
+                        "full_attention",
                         Some(layer_idx),
                         seq_len,
                         || {
@@ -438,9 +434,9 @@ impl Qwen35Model {
                     full_idx += 1;
                 }
                 Qwen35Attn::Linear(lin) => {
-                    qwen35_profile(
+                    crate::profile::profile_op(
                         &self.ctx,
-                        "qwen/linear_attention",
+                        "linear_attention",
                         Some(layer_idx),
                         seq_len,
                         || {
@@ -458,9 +454,9 @@ impl Qwen35Model {
                 }
             }
 
-            qwen35_profile(
+            crate::profile::profile_op(
                 &self.ctx,
-                "qwen/post_attn_norm",
+                "post_attn_norm",
                 Some(layer_idx),
                 seq_len,
                 || {
