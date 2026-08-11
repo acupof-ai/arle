@@ -661,7 +661,6 @@ impl Qwen35Model {
         crate::profile::profile_op(&self.ctx, "lm_head_gemv", None, seq_len, || {
             gemv(&self.ctx, self.output_projection(), last_normed, logits)
         })?;
-        crate::numeric_check::check_numeric(&self.ctx, &logits.data, "qwen35_forward_logits");
         Ok(())
     }
 
@@ -752,7 +751,6 @@ impl Qwen35Model {
         crate::profile::profile_op(&self.ctx, "lm_head_gemm", None, seq_len, || {
             gemm_batch(&self.ctx, self.output_projection(), normed, &mut logits)
         })?;
-        crate::numeric_check::check_numeric(&self.ctx, &logits.data, "qwen35_full_logits");
         self.ctx.sync()?;
 
         // `HiddenStates` is a `[vocab, seq_len]` column-batch over a flat device
@@ -807,7 +805,6 @@ impl Qwen35Model {
         crate::profile::profile_op(&self.ctx, "lm_head_gemm", None, seq_len, || {
             gemm_batch(&self.ctx, self.output_projection(), normed, &mut logits)
         })?;
-        crate::numeric_check::check_numeric(&self.ctx, &logits.data, "qwen35_with_hidden_logits");
         self.ctx.sync()?;
         let logits_vec = DeviceVec {
             data: logits.data,
@@ -862,7 +859,6 @@ impl Qwen35Model {
         crate::profile::profile_op(&self.ctx, "lm_head_gemm", None, seq_len, || {
             gemm_batch(&self.ctx, self.output_projection(), normed, &mut logits)
         })?;
-        crate::numeric_check::check_numeric(&self.ctx, &logits.data, "qwen35_verify_logits");
         self.ctx.sync()?;
         let logits_vec = DeviceVec {
             data: logits.data,

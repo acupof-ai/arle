@@ -831,6 +831,16 @@ cudaError_t gemm_cuda(const __nv_bfloat16 *W, const __nv_bfloat16 *X, __nv_bfloa
   return gemm_cublaslt_impl(W, X, Y, M, N, K, stream, /*graphsafe=*/false);
 }
 
+// Convert a BF16 buffer to FP16. Used to cache dequantized FP16 weights so the
+// W4A16 prefill path can skip the per-call BF16→FP16 cast inside gemm_cuda.
+cudaError_t convert_bf16_to_fp16_cuda(const __nv_bfloat16 *in, __half *out, size_t n,
+                                      cudaStream_t stream) {
+  constexpr int CONV_BLOCK = 256;
+  convert_bf16_to_fp16_kernel<<<(n + CONV_BLOCK - 1) / CONV_BLOCK, CONV_BLOCK, 0,
+                                stream>>>(in, out, n);
+  return cudaGetLastError();
+}
+
 // GEMM with FP16 weights (already dequantized) and BF16 activations/output.
 // On sm_70 this skips the BF16→FP16 weight cast that `gemm_cuda` does, since
 // the W4A16 dequant already produced FP16 weights.
