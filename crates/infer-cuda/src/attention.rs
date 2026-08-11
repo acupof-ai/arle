@@ -2104,47 +2104,49 @@ fn flashmla_pack_compressed_delta(
     // Bulk rebuild observability (codex R3): volume scales with the restored/
     // prefilled length (~584 B/row/layer, e.g. matched=8064 → ~1.2 MB/layer,
     // ~25 MB across the 21 CSA layers) — NVTX for traces, debug for counters.
-    let _nvtx = crate::nvtx::range("dsv4/flashmla_bulk_comp_rebuild");
-    log::debug!(
-        "DSv4 FlashMLA bulk comp rebuild: rows {start_row}..{end_row} ({n} rows, {} bytes)",
-        n * config.head_dim * 2
-    );
-    let (block_ids, rows): (Vec<i32>, Vec<i32>) = (start_row..end_row)
-        .map(|row| {
-            let (page, in_page) = bmap.comp_row(row);
-            (page as i32, in_page as i32)
-        })
-        .unzip();
-    ctx.stream
-        .memcpy_htod(&block_ids, &mut scratch.comp_block_ids)
-        .map_err(|e| anyhow!("DSv4 FlashMLA compressed block_ids H2D failed: {e}"))?;
-    ctx.stream
-        .memcpy_htod(&rows, &mut scratch.comp_rows)
-        .map_err(|e| anyhow!("DSv4 FlashMLA compressed rows H2D failed: {e}"))?;
+    crate::profile::profile_op(ctx, "flashmla_bulk_comp_rebuild", None, n, || {
+        log::debug!(
+            "DSv4 FlashMLA bulk comp rebuild: rows {start_row}..{end_row} ({n} rows, {} bytes)",
+            n * config.head_dim * 2
+        );
+        let (block_ids, rows): (Vec<i32>, Vec<i32>) = (start_row..end_row)
+            .map(|row| {
+                let (page, in_page) = bmap.comp_row(row);
+                (page as i32, in_page as i32)
+            })
+            .unzip();
+        ctx.stream
+            .memcpy_htod(&block_ids, &mut scratch.comp_block_ids)
+            .map_err(|e| anyhow!("DSv4 FlashMLA compressed block_ids H2D failed: {e}"))?;
+        ctx.stream
+            .memcpy_htod(&rows, &mut scratch.comp_rows)
+            .map_err(|e| anyhow!("DSv4 FlashMLA compressed rows H2D failed: {e}"))?;
 
-    // Stage-B: `block_ids` carries slot-LOGICAL pages (`sw_blocks + row/64`);
-    // hand the POOL base + device page table so the kernel routes each to its
-    // dynamic physical block (`block_id = table[logical]`).
-    let (compressed_ptr, _cg) = compressed.data.device_ptr(&ctx.stream);
-    let pool_buf = pool.flashmla_pool_data_mut()?;
-    let (pool_ptr, _pg) = pool_buf.device_ptr_mut(&ctx.stream);
-    let row_offset_bytes = start_row as u64 * config.head_dim as u64 * 2;
-    let nope_ptr = compressed_ptr + row_offset_bytes;
-    let rope_ptr = nope_ptr + (config.head_dim - config.qk_rope_head_dim) as u64 * 2;
-    flash_kv::dsv4_fp8_kv_pack_strided_raw(
-        ctx,
-        nope_ptr,
-        rope_ptr,
-        pool_ptr,
-        &scratch.comp_block_ids,
-        &scratch.comp_rows,
-        n,
-        bmap.page_size(),
-        config.head_dim,
-        config.head_dim,
-        Some(&flash.device_page_table),
-    )?;
-    flash.fp8_kv_comp_packed_rows = end_row;
+        // Stage-B: `block_ids` carries slot-LOGICAL pages (`sw_blocks + row/64`);
+        // hand the POOL base + device page table so the kernel routes each to its
+        // dynamic physical block (`block_id = table[logical]`).
+        let (compressed_ptr, _cg) = compressed.data.device_ptr(&ctx.stream);
+        let pool_buf = pool.flashmla_pool_data_mut()?;
+        let (pool_ptr, _pg) = pool_buf.device_ptr_mut(&ctx.stream);
+        let row_offset_bytes = start_row as u64 * config.head_dim as u64 * 2;
+        let nope_ptr = compressed_ptr + row_offset_bytes;
+        let rope_ptr = nope_ptr + (config.head_dim - config.qk_rope_head_dim) as u64 * 2;
+        flash_kv::dsv4_fp8_kv_pack_strided_raw(
+            ctx,
+            nope_ptr,
+            rope_ptr,
+            pool_ptr,
+            &scratch.comp_block_ids,
+            &scratch.comp_rows,
+            n,
+            bmap.page_size(),
+            config.head_dim,
+            config.head_dim,
+            Some(&flash.device_page_table),
+        )?;
+        flash.fp8_kv_comp_packed_rows = end_row;
+        Ok(())
+    })?;
     Ok(())
 }
 
@@ -2367,34 +2369,36 @@ fn try_flashmla_prefill_attention(
     // SAFETY: uninit device scratch; fully written before first read.
     let mut kv_unified = unsafe { HiddenStates::uninit(ctx, config.head_dim, kv_rows)? };
     {
-        let _nvtx = crate::nvtx::range("dsv4/flashmla_prefill_pack_kv");
-        let (kv_ptr, _kvg) = kv_unified.data.device_ptr_mut(&ctx.stream);
-        let (window_ptr, _wg) = sw_window_cache.device_ptr(&ctx.stream);
-        let (k_ptr, _kg) = k_prepared.data.device_ptr(&ctx.stream);
-        let (comp_ptr, _cg) = match compressed.filter(|_| compressed_count > 0) {
-            Some(c) => {
-                let (p, g) = c.data.device_ptr(&ctx.stream);
-                (p as *const ffi::Half, Some(g))
+        crate::profile::profile_op(ctx, "flashmla_prefill_pack_kv", None, token_count, || {
+            let (kv_ptr, _kvg) = kv_unified.data.device_ptr_mut(&ctx.stream);
+            let (window_ptr, _wg) = sw_window_cache.device_ptr(&ctx.stream);
+            let (k_ptr, _kg) = k_prepared.data.device_ptr(&ctx.stream);
+            let (comp_ptr, _cg) = match compressed.filter(|_| compressed_count > 0) {
+                Some(c) => {
+                    let (p, g) = c.data.device_ptr(&ctx.stream);
+                    (p as *const ffi::Half, Some(g))
+                }
+                None => (std::ptr::null(), None),
+            };
+            // SAFETY: ptrs from live device allocations sized to the dims passed.
+            unsafe {
+                ffi::arle_flashmla_csa_pack_kv(
+                    kv_ptr as *mut ffi::Half,
+                    window_ptr as *const ffi::Half,
+                    k_ptr as *const ffi::Half,
+                    comp_ptr,
+                    start_pos as i32,
+                    config.sliding_window as i32,
+                    token_count as i32,
+                    compressed_count as i32,
+                    config.head_dim as i32,
+                    ctx.stream.cu_stream(),
+                )
+                .result()
+                .map_err(|e| anyhow!("DSv4 FlashMLA prefill KV pack failed: {e}"))?;
             }
-            None => (std::ptr::null(), None),
-        };
-        // SAFETY: ptrs from live device allocations sized to the dims passed.
-        unsafe {
-            ffi::arle_flashmla_csa_pack_kv(
-                kv_ptr as *mut ffi::Half,
-                window_ptr as *const ffi::Half,
-                k_ptr as *const ffi::Half,
-                comp_ptr,
-                start_pos as i32,
-                config.sliding_window as i32,
-                token_count as i32,
-                compressed_count as i32,
-                config.head_dim as i32,
-                ctx.stream.cu_stream(),
-            )
-            .result()
-            .map_err(|e| anyhow!("DSv4 FlashMLA prefill KV pack failed: {e}"))?;
-        }
+            Ok(())
+        })?;
     }
 
     let mut indices = ctx
@@ -2406,122 +2410,138 @@ fn try_flashmla_prefill_attention(
         .alloc_zeros::<i32>(token_count)
         .map_err(|e| anyhow!("DSv4 FlashMLA prefill topk_length alloc failed: {e}"))?;
     {
-        let _nvtx = crate::nvtx::range("dsv4/flashmla_prefill_build_indices");
-        let (indices_ptr, _ig) = indices.device_ptr_mut(&ctx.stream);
-        let (topk_ptr, _tg) = topk_length.device_ptr_mut(&ctx.stream);
-        if let Some(meta) = chain_verify {
-            let (pos_ptr, _pg) = meta.positions.device_ptr(&ctx.stream);
-            let (anc_ptr, _ag) = meta.ancestors.device_ptr(&ctx.stream);
-            let (sel_ptr, _sg) = match (mode, selected) {
-                (DeepSeekV4AttentionMode::CompressedSparse, Some(sel)) => {
-                    let (p, g) = sel.device_ptr(&ctx.stream);
-                    (p as *const i32, Some(g))
-                }
-                (DeepSeekV4AttentionMode::CompressedSparse, None) => {
-                    bail!("DSv4 FlashMLA CSA chain verify missing selected topk")
-                }
-                _ => (std::ptr::null(), None),
-            };
-            let max_compressed_arg = if mode == DeepSeekV4AttentionMode::HybridCompressed {
-                max_compressed_keys
-            } else {
-                0
-            };
-            // SAFETY: ptrs from live device allocations sized to the dims passed.
-            unsafe {
-                ffi::arle_flashmla_chain_verify_build_indices(
-                    indices_ptr as *mut i32,
-                    topk_ptr as *mut i32,
-                    pos_ptr as *const i32,
-                    anc_ptr as *const i32,
-                    meta.max_anc as i32,
-                    sel_ptr,
-                    token_count as i32,
-                    start_pos as i32,
-                    config.sliding_window as i32,
-                    if sel_ptr.is_null() {
-                        0
+        crate::profile::profile_op(
+            ctx,
+            "flashmla_prefill_build_indices",
+            None,
+            token_count,
+            || {
+                let (indices_ptr, _ig) = indices.device_ptr_mut(&ctx.stream);
+                let (topk_ptr, _tg) = topk_length.device_ptr_mut(&ctx.stream);
+                if let Some(meta) = chain_verify {
+                    let (pos_ptr, _pg) = meta.positions.device_ptr(&ctx.stream);
+                    let (anc_ptr, _ag) = meta.ancestors.device_ptr(&ctx.stream);
+                    let (sel_ptr, _sg) = match (mode, selected) {
+                        (DeepSeekV4AttentionMode::CompressedSparse, Some(sel)) => {
+                            let (p, g) = sel.device_ptr(&ctx.stream);
+                            (p as *const i32, Some(g))
+                        }
+                        (DeepSeekV4AttentionMode::CompressedSparse, None) => {
+                            bail!("DSv4 FlashMLA CSA chain verify missing selected topk")
+                        }
+                        _ => (std::ptr::null(), None),
+                    };
+                    let max_compressed_arg = if mode == DeepSeekV4AttentionMode::HybridCompressed {
+                        max_compressed_keys
                     } else {
-                        config.index_topk as i32
-                    },
-                    max_compressed_arg as i32,
-                    topk_unified as i32,
-                    compressed_count as i32,
-                    compress_ratio as i32,
-                    ctx.stream.cu_stream(),
-                )
-                .result()
-                .map_err(|e| anyhow!("DSv4 FlashMLA chain verify indices failed: {e}"))?;
-            }
-        } else {
-            // SAFETY: ptrs from live device allocations sized to the dims passed.
-            unsafe {
-                match mode {
-                    DeepSeekV4AttentionMode::CompressedSparse => {
-                        let selected = selected.ok_or_else(|| {
-                            anyhow!("DSv4 FlashMLA CSA prefill missing selected topk")
-                        })?;
-                        let (selected_ptr, _sg) = selected.device_ptr(&ctx.stream);
-                        ffi::arle_flashmla_csa_build_indices(
+                        0
+                    };
+                    // SAFETY: ptrs from live device allocations sized to the dims passed.
+                    unsafe {
+                        ffi::arle_flashmla_chain_verify_build_indices(
                             indices_ptr as *mut i32,
                             topk_ptr as *mut i32,
-                            selected_ptr as *const i32,
+                            pos_ptr as *const i32,
+                            anc_ptr as *const i32,
+                            meta.max_anc as i32,
+                            sel_ptr,
                             token_count as i32,
                             start_pos as i32,
                             config.sliding_window as i32,
-                            config.index_topk as i32,
+                            if sel_ptr.is_null() {
+                                0
+                            } else {
+                                config.index_topk as i32
+                            },
+                            max_compressed_arg as i32,
+                            topk_unified as i32,
                             compressed_count as i32,
                             compress_ratio as i32,
                             ctx.stream.cu_stream(),
                         )
                         .result()
-                        .map_err(|e| anyhow!("DSv4 FlashMLA CSA prefill indices failed: {e}"))?;
+                        .map_err(|e| anyhow!("DSv4 FlashMLA chain verify indices failed: {e}"))?;
                     }
-                    DeepSeekV4AttentionMode::HybridCompressed => {
-                        ffi::arle_flashmla_hca_build_indices(
-                            indices_ptr as *mut i32,
-                            topk_ptr as *mut i32,
-                            token_count as i32,
-                            start_pos as i32,
-                            config.sliding_window as i32,
-                            max_compressed_keys as i32,
-                            compressed_count as i32,
-                            compress_ratio as i32,
-                            ctx.stream.cu_stream(),
-                        )
-                        .result()
-                        .map_err(|e| anyhow!("DSv4 FlashMLA HCA prefill indices failed: {e}"))?;
-                    }
-                    DeepSeekV4AttentionMode::SlidingWindow => unreachable!(),
-                    DeepSeekV4AttentionMode::SparseIndexed => {
-                        // GLM SparseIndexed mirrors the CSA index build (top-k over
-                        // `selected`), but over the FULL per-token latent (no
-                        // compressor): pass compress_ratio=1.
-                        let selected = selected.ok_or_else(|| {
-                            anyhow!("DSv4 FlashMLA SparseIndexed prefill missing selected topk")
-                        })?;
-                        let (selected_ptr, _sg) = selected.device_ptr(&ctx.stream);
-                        // ponytail: pod-verify SparseIndexed prefill index build uses ratio=1 (full latent)
-                        ffi::arle_flashmla_csa_build_indices(
-                            indices_ptr as *mut i32,
-                            topk_ptr as *mut i32,
-                            selected_ptr as *const i32,
-                            token_count as i32,
-                            start_pos as i32,
-                            config.sliding_window as i32,
-                            config.index_topk as i32,
-                            compressed_count as i32,
-                            1,
-                            ctx.stream.cu_stream(),
-                        )
-                        .result()
-                        .map_err(|e| {
-                            anyhow!("DSv4 FlashMLA SparseIndexed prefill indices failed: {e}")
-                        })?;
+                } else {
+                    // SAFETY: ptrs from live device allocations sized to the dims passed.
+                    unsafe {
+                        match mode {
+                            DeepSeekV4AttentionMode::CompressedSparse => {
+                                let selected = selected.ok_or_else(|| {
+                                    anyhow!("DSv4 FlashMLA CSA prefill missing selected topk")
+                                })?;
+                                let (selected_ptr, _sg) = selected.device_ptr(&ctx.stream);
+                                ffi::arle_flashmla_csa_build_indices(
+                                    indices_ptr as *mut i32,
+                                    topk_ptr as *mut i32,
+                                    selected_ptr as *const i32,
+                                    token_count as i32,
+                                    start_pos as i32,
+                                    config.sliding_window as i32,
+                                    config.index_topk as i32,
+                                    compressed_count as i32,
+                                    compress_ratio as i32,
+                                    ctx.stream.cu_stream(),
+                                )
+                                .result()
+                                .map_err(|e| {
+                                    anyhow!("DSv4 FlashMLA CSA prefill indices failed: {e}")
+                                })?;
+                            }
+                            DeepSeekV4AttentionMode::HybridCompressed => {
+                                ffi::arle_flashmla_hca_build_indices(
+                                    indices_ptr as *mut i32,
+                                    topk_ptr as *mut i32,
+                                    token_count as i32,
+                                    start_pos as i32,
+                                    config.sliding_window as i32,
+                                    max_compressed_keys as i32,
+                                    compressed_count as i32,
+                                    compress_ratio as i32,
+                                    ctx.stream.cu_stream(),
+                                )
+                                .result()
+                                .map_err(|e| {
+                                    anyhow!("DSv4 FlashMLA HCA prefill indices failed: {e}")
+                                })?;
+                            }
+                            DeepSeekV4AttentionMode::SlidingWindow => unreachable!(),
+                            DeepSeekV4AttentionMode::SparseIndexed => {
+                                // GLM SparseIndexed mirrors the CSA index build (top-k over
+                                // `selected`), but over the FULL per-token latent (no
+                                // compressor): pass compress_ratio=1.
+                                let selected = selected.ok_or_else(|| {
+                                    anyhow!(
+                                        "DSv4 FlashMLA SparseIndexed prefill missing selected topk"
+                                    )
+                                })?;
+                                let (selected_ptr, _sg) = selected.device_ptr(&ctx.stream);
+                                // ponytail: pod-verify SparseIndexed prefill index build uses ratio=1 (full latent)
+                                ffi::arle_flashmla_csa_build_indices(
+                                    indices_ptr as *mut i32,
+                                    topk_ptr as *mut i32,
+                                    selected_ptr as *const i32,
+                                    token_count as i32,
+                                    start_pos as i32,
+                                    config.sliding_window as i32,
+                                    config.index_topk as i32,
+                                    compressed_count as i32,
+                                    1,
+                                    ctx.stream.cu_stream(),
+                                )
+                                .result()
+                                .map_err(|e| {
+                                    anyhow!(
+                                        "DSv4 FlashMLA SparseIndexed prefill indices failed: {e}"
+                                    )
+                                })?;
+                            }
+                        }
                     }
                 }
-            }
-        }
+                Ok(())
+            },
+        )?;
     }
 
     let mut max_logits = ctx
@@ -2559,35 +2579,53 @@ fn try_flashmla_prefill_attention(
                 .map_err(|e| anyhow!("DSv4 FlashMLA prefill TP output alloc failed: {e}"))?;
             let (gather_ptr, gather_guard) = gathered.device_ptr_mut(&ctx.stream);
             {
-                let _nvtx = crate::nvtx::range("dsv4/flashmla_prefill_q_allgather");
-                // SAFETY: q spans token_count*local_width; gathered holds tp_world x that, on ctx.stream.
-                unsafe {
-                    tp.all_gather_bf16_raw(
-                        ctx,
-                        q_ptr as *const std::ffi::c_void,
-                        token_count * local_width,
-                        gather_ptr as *mut std::ffi::c_void,
-                    )?;
-                }
+                crate::profile::profile_op(
+                    ctx,
+                    "flashmla_prefill_q_allgather",
+                    None,
+                    token_count,
+                    || {
+                        // SAFETY: q spans token_count*local_width; gathered holds tp_world x that, on ctx.stream.
+                        unsafe {
+                            tp.all_gather_bf16_raw(
+                                ctx,
+                                q_ptr as *const std::ffi::c_void,
+                                token_count * local_width,
+                                gather_ptr as *mut std::ffi::c_void,
+                            )?;
+                        }
+                        Ok(())
+                    },
+                )?;
             }
             drop(gather_guard);
             let (packed_ptr, packed_guard) = packed.device_ptr_mut(&ctx.stream);
             {
-                let _nvtx = crate::nvtx::range("dsv4/flashmla_prefill_q_repack");
-                // SAFETY: ptrs from live device allocations sized to the dims passed.
-                unsafe {
-                    ffi::dsv4_tp_q_repack_cuda(
-                        gather_ptr as *const ffi::Half,
-                        packed_ptr as *mut ffi::Half,
-                        tp_world as i32,
-                        token_count as i32,
-                        local_heads as i32,
-                        config.head_dim as i32,
-                        ctx.stream.cu_stream(),
-                    )
-                    .result()
-                    .map_err(|e| anyhow!("DSv4 FlashMLA prefill TP Q repack failed: {e}"))?;
-                }
+                crate::profile::profile_op(
+                    ctx,
+                    "flashmla_prefill_q_repack",
+                    None,
+                    token_count,
+                    || {
+                        // SAFETY: ptrs from live device allocations sized to the dims passed.
+                        unsafe {
+                            ffi::dsv4_tp_q_repack_cuda(
+                                gather_ptr as *const ffi::Half,
+                                packed_ptr as *mut ffi::Half,
+                                tp_world as i32,
+                                token_count as i32,
+                                local_heads as i32,
+                                config.head_dim as i32,
+                                ctx.stream.cu_stream(),
+                            )
+                            .result()
+                            .map_err(|e| {
+                                anyhow!("DSv4 FlashMLA prefill TP Q repack failed: {e}")
+                            })?;
+                        }
+                        Ok(())
+                    },
+                )?;
             }
             drop(packed_guard);
             let (full_out_ptr, full_out_guard) = full_out.device_ptr(&ctx.stream);
@@ -2645,100 +2683,104 @@ fn try_flashmla_prefill_attention(
     };
 
     {
-        let _nvtx = crate::nvtx::range("dsv4/flashmla_prefill_fwd");
-        // q8kv8 fp8 sparse prefill is FlashMLA prefill's fp8 twin: it occupies
-        // the SAME execution point (post-gather global-head Q, global out) so it
-        // runs on the production TP path. Gate on global_heads%64 (the kernel's
-        // GMMA head-tile), not local_heads — a TP=4 shard has local_heads=16 but
-        // the gathered Q here is all `global_heads`.
-        if dsv4_q8kv8_prefill_enabled()? && global_heads % 64 == 0 {
-            let _q8 = crate::nvtx::range("dsv4/q8kv8_prefill");
-            let head_dim = config.head_dim;
-            let q_elems = token_count * global_width;
-            let kv_elems = kv_rows * head_dim;
-            let mut q_fp8 = ctx.stream.alloc_zeros::<u8>(q_elems)?;
-            let mut kv_fp8 = ctx.stream.alloc_zeros::<u8>(kv_elems)?;
-            let mut scale = ctx.stream.alloc_zeros::<f32>(2)?;
-            ctx.stream.memcpy_htod(&[1.0f32, 1.0f32], &mut scale)?;
-            // Cast the gathered global-head Q and the shared latent KV to fp8.
-            let cast_fp8 =
-                |src: *const ffi::Half, dst: &mut CudaSlice<u8>, n: usize| -> Result<()> {
-                    let (dst_ptr, _dg) = dst.device_ptr_mut(&ctx.stream);
-                    // SAFETY: src spans n elements; dst holds n bytes, fully written.
+        crate::profile::profile_op(ctx, "flashmla_prefill_fwd", None, token_count, || {
+            // q8kv8 fp8 sparse prefill is FlashMLA prefill's fp8 twin: it occupies
+            // the SAME execution point (post-gather global-head Q, global out) so it
+            // runs on the production TP path. Gate on global_heads%64 (the kernel's
+            // GMMA head-tile), not local_heads — a TP=4 shard has local_heads=16 but
+            // the gathered Q here is all `global_heads`.
+            if dsv4_q8kv8_prefill_enabled()? && global_heads % 64 == 0 {
+                crate::profile::profile_op(ctx, "q8kv8_prefill", None, token_count, || {
+                    let head_dim = config.head_dim;
+                    let q_elems = token_count * global_width;
+                    let kv_elems = kv_rows * head_dim;
+                    let mut q_fp8 = ctx.stream.alloc_zeros::<u8>(q_elems)?;
+                    let mut kv_fp8 = ctx.stream.alloc_zeros::<u8>(kv_elems)?;
+                    let mut scale = ctx.stream.alloc_zeros::<f32>(2)?;
+                    ctx.stream.memcpy_htod(&[1.0f32, 1.0f32], &mut scale)?;
+                    // Cast the gathered global-head Q and the shared latent KV to fp8.
+                    let cast_fp8 =
+                        |src: *const ffi::Half, dst: &mut CudaSlice<u8>, n: usize| -> Result<()> {
+                            let (dst_ptr, _dg) = dst.device_ptr_mut(&ctx.stream);
+                            // SAFETY: src spans n elements; dst holds n bytes, fully written.
+                            unsafe {
+                                ffi::arle_bf16_to_fp8_e4m3_cuda(
+                                    src,
+                                    dst_ptr as *mut u8,
+                                    n as i64,
+                                    ctx.stream.cu_stream(),
+                                )
+                                .result()?;
+                            }
+                            Ok(())
+                        };
+                    cast_fp8(q_for_flashmla as *const ffi::Half, &mut q_fp8, q_elems)?;
+                    cast_fp8(kv_ptr as *const ffi::Half, &mut kv_fp8, kv_elems)?;
+                    let (q_fp8_ptr, _qfg) = q_fp8.device_ptr(&ctx.stream);
+                    let (kv_fp8_ptr, _kfg) = kv_fp8.device_ptr(&ctx.stream);
+                    let (scale_ptr, _sg) = scale.device_ptr(&ctx.stream);
+                    // indices/topk reuse FlashMLA's; topk_length=null → fixed-topk path.
+                    // SAFETY: fp8 buffers filled above; out is global-width, sliced below.
                     unsafe {
-                        ffi::arle_bf16_to_fp8_e4m3_cuda(
-                            src,
-                            dst_ptr as *mut u8,
-                            n as i64,
+                        ffi::arle_q8kv8_sparse_prefill_fwd(
+                            q_fp8_ptr as *const u8,
+                            kv_fp8_ptr as *const u8,
+                            indices_ptr as *const i32,
+                            scale_ptr as *const f32,
+                            scale_ptr as *const f32,
+                            sink_ptr,
+                            std::ptr::null(),
+                            flash_out_ptr as *mut ffi::Half,
+                            max_ptr as *mut f32,
+                            lse_ptr as *mut f32,
+                            token_count as i32,
+                            kv_rows as i32,
+                            global_heads as i32,
+                            head_dim as i32,
+                            topk_unified as i32,
+                            sm_scale,
                             ctx.stream.cu_stream(),
                         )
-                        .result()?;
+                        .result()
+                        .map_err(|e| anyhow!("DSv4 q8kv8 prefill failed: {e}"))?;
                     }
                     Ok(())
-                };
-            cast_fp8(q_for_flashmla as *const ffi::Half, &mut q_fp8, q_elems)?;
-            cast_fp8(kv_ptr as *const ffi::Half, &mut kv_fp8, kv_elems)?;
-            let (q_fp8_ptr, _qfg) = q_fp8.device_ptr(&ctx.stream);
-            let (kv_fp8_ptr, _kfg) = kv_fp8.device_ptr(&ctx.stream);
-            let (scale_ptr, _sg) = scale.device_ptr(&ctx.stream);
-            // indices/topk reuse FlashMLA's; topk_length=null → fixed-topk path.
-            // SAFETY: fp8 buffers filled above; out is global-width, sliced below.
-            unsafe {
-                ffi::arle_q8kv8_sparse_prefill_fwd(
-                    q_fp8_ptr as *const u8,
-                    kv_fp8_ptr as *const u8,
-                    indices_ptr as *const i32,
-                    scale_ptr as *const f32,
-                    scale_ptr as *const f32,
-                    sink_ptr,
-                    std::ptr::null(),
-                    flash_out_ptr as *mut ffi::Half,
-                    max_ptr as *mut f32,
-                    lse_ptr as *mut f32,
-                    token_count as i32,
-                    kv_rows as i32,
-                    global_heads as i32,
-                    head_dim as i32,
-                    topk_unified as i32,
-                    sm_scale,
-                    ctx.stream.cu_stream(),
-                )
-                .result()
-                .map_err(|e| anyhow!("DSv4 q8kv8 prefill failed: {e}"))?;
+                })?;
+            } else {
+                // SAFETY: ptrs from live device allocations sized to the dims passed.
+                unsafe {
+                    ffi::arle_flashmla_sm90_sparse_prefill_fwd(
+                        q_for_flashmla,
+                        kv_ptr as *const ffi::Half,
+                        indices_ptr as *const i32,
+                        sink_ptr,
+                        topk_ptr as *const i32,
+                        flash_out_ptr,
+                        max_ptr as *mut f32,
+                        lse_ptr as *mut f32,
+                        token_count as i32,
+                        kv_rows as i32,
+                        global_heads as i32,
+                        1,
+                        config.head_dim as i32,
+                        config.head_dim as i32,
+                        topk_unified as i32,
+                        sm_scale,
+                        global_width as i32,
+                        config.head_dim as i32,
+                        config.head_dim as i32,
+                        0,
+                        topk_unified as i32,
+                        0,
+                        0,
+                        ctx.stream.cu_stream(),
+                    )
+                    .result()
+                    .map_err(|e| anyhow!("DSv4 FlashMLA sparse prefill failed: {e}"))?;
+                }
             }
-        } else {
-            // SAFETY: ptrs from live device allocations sized to the dims passed.
-            unsafe {
-                ffi::arle_flashmla_sm90_sparse_prefill_fwd(
-                    q_for_flashmla,
-                    kv_ptr as *const ffi::Half,
-                    indices_ptr as *const i32,
-                    sink_ptr,
-                    topk_ptr as *const i32,
-                    flash_out_ptr,
-                    max_ptr as *mut f32,
-                    lse_ptr as *mut f32,
-                    token_count as i32,
-                    kv_rows as i32,
-                    global_heads as i32,
-                    1,
-                    config.head_dim as i32,
-                    config.head_dim as i32,
-                    topk_unified as i32,
-                    sm_scale,
-                    global_width as i32,
-                    config.head_dim as i32,
-                    config.head_dim as i32,
-                    0,
-                    topk_unified as i32,
-                    0,
-                    0,
-                    ctx.stream.cu_stream(),
-                )
-                .result()
-                .map_err(|e| anyhow!("DSv4 FlashMLA sparse prefill failed: {e}"))?;
-            }
-        }
+            Ok(())
+        })?;
     }
 
     if tp_world > 1 {
@@ -2747,68 +2789,86 @@ fn try_flashmla_prefill_attention(
             .ok_or_else(|| anyhow!("DSv4 FlashMLA prefill missing TP full output"))?;
         let (full_out_ptr, full_out_guard) = full_out.device_ptr(&ctx.stream);
         {
-            let _nvtx = crate::nvtx::range("dsv4/flashmla_prefill_out_slice");
-            // SAFETY: ptrs from live device allocations sized to the dims passed.
-            unsafe {
-                ffi::dsv4_tp_out_slice_cuda(
-                    full_out_ptr as *const ffi::Half,
-                    out_ptr as *mut ffi::Half,
-                    token_count as i32,
-                    global_width as i32,
-                    local_width as i32,
-                    (tp_rank * local_width) as i32,
-                    ctx.stream.cu_stream(),
-                )
-                .result()
-                .map_err(|e| anyhow!("DSv4 FlashMLA prefill TP out slice failed: {e}"))?;
-            }
+            crate::profile::profile_op(
+                ctx,
+                "flashmla_prefill_out_slice",
+                None,
+                token_count,
+                || {
+                    // SAFETY: ptrs from live device allocations sized to the dims passed.
+                    unsafe {
+                        ffi::dsv4_tp_out_slice_cuda(
+                            full_out_ptr as *const ffi::Half,
+                            out_ptr as *mut ffi::Half,
+                            token_count as i32,
+                            global_width as i32,
+                            local_width as i32,
+                            (tp_rank * local_width) as i32,
+                            ctx.stream.cu_stream(),
+                        )
+                        .result()
+                        .map_err(|e| anyhow!("DSv4 FlashMLA prefill TP out slice failed: {e}"))?;
+                    }
+                    Ok(())
+                },
+            )?;
         }
         drop(full_out_guard);
     }
 
     {
-        let _nvtx = crate::nvtx::range("dsv4/flashmla_prefill_inverse_rope");
-        // SAFETY: ptrs from live device allocations sized to the dims passed.
-        unsafe {
-            if let Some(meta) = chain_verify {
-                let (pos_ptr, _pg) = meta.positions.device_ptr(&ctx.stream);
-                ffi::arle_dsv4_output_inverse_rope_batch_start_pos_cuda(
-                    out_ptr as *mut ffi::Half,
-                    token_count as i32,
-                    local_heads as i32,
-                    config.head_dim as i32,
-                    config.qk_rope_head_dim as i32,
-                    pos_ptr as *const i32,
-                    rope_base,
-                    original_seq_len,
-                    rope_factor,
-                    rope_beta_fast,
-                    rope_beta_slow,
-                    ctx.stream.cu_stream(),
-                )
-                .result()
-                .map_err(|e| {
-                    anyhow!("DSv4 FlashMLA chain verify output inverse-rope failed: {e}")
-                })?;
-            } else {
-                ffi::arle_dsv4_output_inverse_rope_cuda(
-                    out_ptr as *mut ffi::Half,
-                    token_count as i32,
-                    local_heads as i32,
-                    config.head_dim as i32,
-                    config.qk_rope_head_dim as i32,
-                    start_pos as i32,
-                    rope_base,
-                    original_seq_len,
-                    rope_factor,
-                    rope_beta_fast,
-                    rope_beta_slow,
-                    ctx.stream.cu_stream(),
-                )
-                .result()
-                .map_err(|e| anyhow!("DSv4 FlashMLA prefill output inverse-rope failed: {e}"))?;
-            }
-        }
+        crate::profile::profile_op(
+            ctx,
+            "flashmla_prefill_inverse_rope",
+            None,
+            token_count,
+            || {
+                // SAFETY: ptrs from live device allocations sized to the dims passed.
+                unsafe {
+                    if let Some(meta) = chain_verify {
+                        let (pos_ptr, _pg) = meta.positions.device_ptr(&ctx.stream);
+                        ffi::arle_dsv4_output_inverse_rope_batch_start_pos_cuda(
+                            out_ptr as *mut ffi::Half,
+                            token_count as i32,
+                            local_heads as i32,
+                            config.head_dim as i32,
+                            config.qk_rope_head_dim as i32,
+                            pos_ptr as *const i32,
+                            rope_base,
+                            original_seq_len,
+                            rope_factor,
+                            rope_beta_fast,
+                            rope_beta_slow,
+                            ctx.stream.cu_stream(),
+                        )
+                        .result()
+                        .map_err(|e| {
+                            anyhow!("DSv4 FlashMLA chain verify output inverse-rope failed: {e}")
+                        })?;
+                    } else {
+                        ffi::arle_dsv4_output_inverse_rope_cuda(
+                            out_ptr as *mut ffi::Half,
+                            token_count as i32,
+                            local_heads as i32,
+                            config.head_dim as i32,
+                            config.qk_rope_head_dim as i32,
+                            start_pos as i32,
+                            rope_base,
+                            original_seq_len,
+                            rope_factor,
+                            rope_beta_fast,
+                            rope_beta_slow,
+                            ctx.stream.cu_stream(),
+                        )
+                        .result()
+                        .map_err(|e| {
+                            anyhow!("DSv4 FlashMLA prefill output inverse-rope failed: {e}")
+                        })?;
+                    }
+                }
+                Ok(())
+            },
+        )?;
     }
 
     if chain_verify.is_none() {
@@ -2896,34 +2956,37 @@ fn try_flashmla_decode_attention(
     // from. The SW-ring bootstrap is the only SW-specific step here.
     // ponytail: pod-verify GLM pure-SparseIndexed (sliding_window=0) skips SW-ring entirely; attention is indexer-selected full-latent only
     if config.sliding_window > 0 {
-        let _nvtx = crate::nvtx::range("dsv4/flashmla_pack_sw_ring");
-        flashmla_pack_sw_ring(ctx, flash, scratch, pool, sw_window_cache, config)?;
+        crate::profile::profile_op(ctx, "flashmla_pack_sw_ring", None, 1, || {
+            flashmla_pack_sw_ring(ctx, flash, scratch, pool, sw_window_cache, config)
+        })?;
     }
 
     {
-        let _nvtx = crate::nvtx::range("dsv4/flashmla_pack_one");
-        flashmla_pack_one_sw_token(
-            ctx,
-            flash,
-            scratch,
-            pool,
-            k_prepared,
-            start_pos_device,
-            config,
-        )?;
+        crate::profile::profile_op(ctx, "flashmla_pack_one", None, 1, || {
+            flashmla_pack_one_sw_token(
+                ctx,
+                flash,
+                scratch,
+                pool,
+                k_prepared,
+                start_pos_device,
+                config,
+            )
+        })?;
     }
     {
-        let _nvtx = crate::nvtx::range("dsv4/flashmla_pack_compressed");
-        flashmla_pack_compressed_delta(
-            ctx,
-            flash,
-            scratch,
-            pool,
-            compressed,
-            start_pos_device,
-            compress_ratio,
-            config,
-        )?;
+        crate::profile::profile_op(ctx, "flashmla_pack_compressed", None, 1, || {
+            flashmla_pack_compressed_delta(
+                ctx,
+                flash,
+                scratch,
+                pool,
+                compressed,
+                start_pos_device,
+                compress_ratio,
+                config,
+            )
+        })?;
     }
 
     let mode_int = flashmla_mode_int(mode);
@@ -2954,30 +3017,31 @@ fn try_flashmla_decode_attention(
     let (indices_ptr, indices_guard) = scratch.indices.device_ptr_mut(&ctx.stream);
     let (start_ptr, start_guard) = start_pos_device.device_ptr(&ctx.stream);
     {
-        let _nvtx = crate::nvtx::range("dsv4/flashmla_build_indices");
-        flash_kv::dsv4_flashmla_decode_build_indices_start_pos_ptr_raw(
-            ctx,
-            indices_ptr,
-            selected_ptr_u64,
-            bmap.sw_blocks(),
-            config.sliding_window,
-            start_ptr,
-            flash.max_compressed_keys,
-            // GLM SparseIndexed: every token a key (ratio=1); SW also 1; CSA/HCA
-            // keep compress_ratio.
-            if mode == DeepSeekV4AttentionMode::SlidingWindow
-                || mode == DeepSeekV4AttentionMode::SparseIndexed
-            {
-                1
-            } else {
-                compress_ratio
-            },
-            mode_int,
-            bmap.page_size(),
-            build_page_table,
-            // M1: whole-pool page count — mask any routed physical page >= this.
-            pool.flashmla_total_pages(),
-        )?;
+        crate::profile::profile_op(ctx, "flashmla_build_indices", None, 1, || {
+            flash_kv::dsv4_flashmla_decode_build_indices_start_pos_ptr_raw(
+                ctx,
+                indices_ptr,
+                selected_ptr_u64,
+                bmap.sw_blocks(),
+                config.sliding_window,
+                start_ptr,
+                flash.max_compressed_keys,
+                // GLM SparseIndexed: every token a key (ratio=1); SW also 1; CSA/HCA
+                // keep compress_ratio.
+                if mode == DeepSeekV4AttentionMode::SlidingWindow
+                    || mode == DeepSeekV4AttentionMode::SparseIndexed
+                {
+                    1
+                } else {
+                    compress_ratio
+                },
+                mode_int,
+                bmap.page_size(),
+                build_page_table,
+                // M1: whole-pool page count — mask any routed physical page >= this.
+                pool.flashmla_total_pages(),
+            )
+        })?;
     }
     drop(indices_guard);
     drop(start_guard);
@@ -3005,35 +3069,39 @@ fn try_flashmla_decode_attention(
     let q_for_flashmla = if tp_world > 1 {
         let (gather_ptr, gather_guard) = scratch.tp_gathered_q.device_ptr_mut(&ctx.stream);
         {
-            let _nvtx = crate::nvtx::range("dsv4/flashmla_q_allgather");
-            // SAFETY: q spans token_count*local_width; gathered holds tp_world x that, on ctx.stream.
-            unsafe {
-                tp.all_gather_bf16_raw(
-                    ctx,
-                    q_ptr as *const std::ffi::c_void,
-                    local_heads * config.head_dim,
-                    gather_ptr as *mut std::ffi::c_void,
-                )?;
-            }
+            crate::profile::profile_op(ctx, "flashmla_q_allgather", None, 1, || {
+                // SAFETY: q spans token_count*local_width; gathered holds tp_world x that, on ctx.stream.
+                unsafe {
+                    tp.all_gather_bf16_raw(
+                        ctx,
+                        q_ptr as *const std::ffi::c_void,
+                        local_heads * config.head_dim,
+                        gather_ptr as *mut std::ffi::c_void,
+                    )?;
+                }
+                Ok(())
+            })?;
         }
         drop(gather_guard);
         let (packed_ptr, packed_guard) = scratch.tp_packed_q.device_ptr_mut(&ctx.stream);
         {
-            let _nvtx = crate::nvtx::range("dsv4/flashmla_q_repack");
-            // SAFETY: ptrs from live device allocations sized to the dims passed.
-            unsafe {
-                ffi::dsv4_tp_q_repack_cuda(
-                    gather_ptr as *const ffi::Half,
-                    packed_ptr as *mut ffi::Half,
-                    tp_world as i32,
-                    1,
-                    local_heads as i32,
-                    config.head_dim as i32,
-                    ctx.stream.cu_stream(),
-                )
-                .result()
-                .map_err(|e| anyhow!("DSv4 FlashMLA TP Q repack failed: {e}"))?;
-            }
+            crate::profile::profile_op(ctx, "flashmla_q_repack", None, 1, || {
+                // SAFETY: ptrs from live device allocations sized to the dims passed.
+                unsafe {
+                    ffi::dsv4_tp_q_repack_cuda(
+                        gather_ptr as *const ffi::Half,
+                        packed_ptr as *mut ffi::Half,
+                        tp_world as i32,
+                        1,
+                        local_heads as i32,
+                        config.head_dim as i32,
+                        ctx.stream.cu_stream(),
+                    )
+                    .result()
+                    .map_err(|e| anyhow!("DSv4 FlashMLA TP Q repack failed: {e}"))?;
+                }
+                Ok(())
+            })?;
         }
         drop(packed_guard);
         packed_ptr as *const ffi::Half
@@ -3097,55 +3165,57 @@ fn try_flashmla_decode_attention(
     let stride_indices = flash.topk_unified as i32;
     let stride_lse = global_heads as i32;
     {
-        let _nvtx = crate::nvtx::range("dsv4/flashmla_fwd");
-        // SAFETY: ptrs from live device allocations sized to the dims passed.
-        unsafe {
-            ffi::arle_flashmla_sm90_sparse_decode_fwd(
-                q_for_flashmla,
-                pool_ptr as *const ffi::Half,
-                indices_ptr as *const i32,
-                topk_ptr as *const i32,
-                sink_ptr,
-                flash_out_ptr,
-                lse_out_ptr as *mut f32,
-                lse_accum_ptr as *mut f32,
-                o_accum_ptr as *mut f32,
-                sched_ptr as *const i32,
-                splits_ptr as *const i32,
-                1,
-                1,
-                global_heads as i32,
-                1,
-                d_qk,
-                d_v,
-                (flash.sw_blocks + flash.comp_blocks) as i32,
-                64,
-                stride_indices,
-                flash.num_sm_parts,
-                model_type_int,
-                sm_scale,
-                stride_q,
-                stride_q,
-                d_qk,
-                stride_kv_block_bytes,
-                bytes_per_token,
-                stride_indices,
-                stride_indices,
-                stride_lse,
-                1,
-                stride_o,
-                stride_o,
-                d_v,
-                global_heads as i32,
-                global_heads as i32,
-                stride_o,
-                stride_o,
-                d_v,
-                ctx.stream.cu_stream(),
-            )
-            .result()
-            .map_err(|e| anyhow!("DSv4 FlashMLA sparse decode failed: {e}"))?;
-        }
+        crate::profile::profile_op(ctx, "flashmla_fwd", None, 1, || {
+            // SAFETY: ptrs from live device allocations sized to the dims passed.
+            unsafe {
+                ffi::arle_flashmla_sm90_sparse_decode_fwd(
+                    q_for_flashmla,
+                    pool_ptr as *const ffi::Half,
+                    indices_ptr as *const i32,
+                    topk_ptr as *const i32,
+                    sink_ptr,
+                    flash_out_ptr,
+                    lse_out_ptr as *mut f32,
+                    lse_accum_ptr as *mut f32,
+                    o_accum_ptr as *mut f32,
+                    sched_ptr as *const i32,
+                    splits_ptr as *const i32,
+                    1,
+                    1,
+                    global_heads as i32,
+                    1,
+                    d_qk,
+                    d_v,
+                    (flash.sw_blocks + flash.comp_blocks) as i32,
+                    64,
+                    stride_indices,
+                    flash.num_sm_parts,
+                    model_type_int,
+                    sm_scale,
+                    stride_q,
+                    stride_q,
+                    d_qk,
+                    stride_kv_block_bytes,
+                    bytes_per_token,
+                    stride_indices,
+                    stride_indices,
+                    stride_lse,
+                    1,
+                    stride_o,
+                    stride_o,
+                    d_v,
+                    global_heads as i32,
+                    global_heads as i32,
+                    stride_o,
+                    stride_o,
+                    d_v,
+                    ctx.stream.cu_stream(),
+                )
+                .result()
+                .map_err(|e| anyhow!("DSv4 FlashMLA sparse decode failed: {e}"))?;
+            }
+            Ok(())
+        })?;
     }
 
     // The FlashMLA output is [heads, d_v]: d_v == head_dim for MODEL1, but the
@@ -3154,21 +3224,23 @@ fn try_flashmla_decode_attention(
     if tp_world > 1 {
         let (full_out_ptr, full_out_guard) = scratch.tp_full_out.device_ptr(&ctx.stream);
         {
-            let _nvtx = crate::nvtx::range("dsv4/flashmla_out_slice");
-            // SAFETY: ptrs from live device allocations sized to the dims passed.
-            unsafe {
-                ffi::dsv4_tp_out_slice_cuda(
-                    full_out_ptr as *const ffi::Half,
-                    out_ptr as *mut ffi::Half,
-                    1,
-                    (global_heads * out_head_dim) as i32,
-                    (local_heads * out_head_dim) as i32,
-                    (tp_rank * local_heads * out_head_dim) as i32,
-                    ctx.stream.cu_stream(),
-                )
-                .result()
-                .map_err(|e| anyhow!("DSv4 FlashMLA TP out slice failed: {e}"))?;
-            }
+            crate::profile::profile_op(ctx, "flashmla_out_slice", None, 1, || {
+                // SAFETY: ptrs from live device allocations sized to the dims passed.
+                unsafe {
+                    ffi::dsv4_tp_out_slice_cuda(
+                        full_out_ptr as *const ffi::Half,
+                        out_ptr as *mut ffi::Half,
+                        1,
+                        (global_heads * out_head_dim) as i32,
+                        (local_heads * out_head_dim) as i32,
+                        (tp_rank * local_heads * out_head_dim) as i32,
+                        ctx.stream.cu_stream(),
+                    )
+                    .result()
+                    .map_err(|e| anyhow!("DSv4 FlashMLA TP out slice failed: {e}"))?;
+                }
+                Ok(())
+            })?;
         }
         drop(full_out_guard);
     }
@@ -3180,26 +3252,28 @@ fn try_flashmla_decode_attention(
     // V32's value side is reconstructed by the w_vc absorption (D3d) downstream.
     // ponytail: pod-verify V32 skips output inverse-RoPE (512 latent is pure NoPE)
     if !is_v32 {
-        let _nvtx = crate::nvtx::range("dsv4/flashmla_inverse_rope");
-        // SAFETY: ptrs from live device allocations sized to the dims passed.
-        unsafe {
-            ffi::arle_dsv4_output_inverse_rope_start_pos_ptr_cuda(
-                out_ptr as *mut ffi::Half,
-                1,
-                local_heads as i32,
-                config.head_dim as i32,
-                config.qk_rope_head_dim as i32,
-                start_ptr as *const i32,
-                rope_base,
-                original_seq_len,
-                rope_factor,
-                rope_beta_fast,
-                rope_beta_slow,
-                ctx.stream.cu_stream(),
-            )
-            .result()
-            .map_err(|e| anyhow!("DSv4 FlashMLA output inverse-rope failed: {e}"))?;
-        }
+        crate::profile::profile_op(ctx, "flashmla_inverse_rope", None, 1, || {
+            // SAFETY: ptrs from live device allocations sized to the dims passed.
+            unsafe {
+                ffi::arle_dsv4_output_inverse_rope_start_pos_ptr_cuda(
+                    out_ptr as *mut ffi::Half,
+                    1,
+                    local_heads as i32,
+                    config.head_dim as i32,
+                    config.qk_rope_head_dim as i32,
+                    start_ptr as *const i32,
+                    rope_base,
+                    original_seq_len,
+                    rope_factor,
+                    rope_beta_fast,
+                    rope_beta_slow,
+                    ctx.stream.cu_stream(),
+                )
+                .result()
+                .map_err(|e| anyhow!("DSv4 FlashMLA output inverse-rope failed: {e}"))?;
+            }
+            Ok(())
+        })?;
     }
 
     drop(q_guard);
@@ -3260,40 +3334,42 @@ pub(crate) fn flashmla_decode_pack_batched(
         return Ok(());
     }
     {
-        let _nvtx = crate::nvtx::range("dsv4/flashmla_pack_one_batched");
-        flash_kv::dsv4_fp8_kv_pack_strided_batched_raw(
-            ctx,
-            nope_arr,
-            rope_arr,
-            pool_ptr,
-            start_pos,
-            n,
-            64,
-            config.sliding_window,
-            config.head_dim,
-            config.head_dim,
-            page_table_arr,
-            num_logical_pages,
-        )?;
+        crate::profile::profile_op(ctx, "flashmla_pack_one_batched", None, n, || {
+            flash_kv::dsv4_fp8_kv_pack_strided_batched_raw(
+                ctx,
+                nope_arr,
+                rope_arr,
+                pool_ptr,
+                start_pos,
+                n,
+                64,
+                config.sliding_window,
+                config.head_dim,
+                config.head_dim,
+                page_table_arr,
+                num_logical_pages,
+            )
+        })?;
     }
     // compress_ratio==0 layers (DSv4-Flash 0/1/last) have NO compressor — skip the
     // completed-compressor pack. The batched FFI rejects ratio<=0 with INVALID_VALUE;
     // the single-row path skips it too (passes compressed=None for these layers).
     if compress_ratio > 0 {
-        let _nvtx = crate::nvtx::range("dsv4/flashmla_pack_compressed_batched");
-        flash_kv::dsv4_fp8_kv_pack_completed_compressor_row_batched_raw(
-            ctx,
-            compressed_arr,
-            pool_ptr,
-            start_pos,
-            n,
-            compress_ratio,
-            sw_blocks,
-            64,
-            config.head_dim,
-            page_table_arr,
-            num_logical_pages,
-        )?;
+        crate::profile::profile_op(ctx, "flashmla_pack_compressed_batched", None, n, || {
+            flash_kv::dsv4_fp8_kv_pack_completed_compressor_row_batched_raw(
+                ctx,
+                compressed_arr,
+                pool_ptr,
+                start_pos,
+                n,
+                compress_ratio,
+                sw_blocks,
+                64,
+                config.head_dim,
+                page_table_arr,
+                num_logical_pages,
+            )
+        })?;
     }
     Ok(())
 }
@@ -3325,33 +3401,36 @@ pub(crate) fn flashmla_decode_pack_row(
     start_pos_device: &CudaSlice<i32>,
 ) -> Result<()> {
     {
-        let _nvtx = crate::nvtx::range("dsv4/flashmla_pack_sw_ring_batched");
-        flashmla_pack_sw_ring(ctx, flash, scratch, pool, sw_window_cache, config)?;
+        crate::profile::profile_op(ctx, "flashmla_pack_sw_ring_batched", None, 1, || {
+            flashmla_pack_sw_ring(ctx, flash, scratch, pool, sw_window_cache, config)
+        })?;
     }
     {
-        let _nvtx = crate::nvtx::range("dsv4/flashmla_pack_one_batched");
-        flashmla_pack_one_sw_token(
-            ctx,
-            flash,
-            scratch,
-            pool,
-            k_prepared,
-            start_pos_device,
-            config,
-        )?;
+        crate::profile::profile_op(ctx, "flashmla_pack_one_batched", None, 1, || {
+            flashmla_pack_one_sw_token(
+                ctx,
+                flash,
+                scratch,
+                pool,
+                k_prepared,
+                start_pos_device,
+                config,
+            )
+        })?;
     }
     {
-        let _nvtx = crate::nvtx::range("dsv4/flashmla_pack_compressed_batched");
-        flashmla_pack_compressed_delta(
-            ctx,
-            flash,
-            scratch,
-            pool,
-            compressed,
-            start_pos_device,
-            compress_ratio,
-            config,
-        )?;
+        crate::profile::profile_op(ctx, "flashmla_pack_compressed_batched", None, 1, || {
+            flashmla_pack_compressed_delta(
+                ctx,
+                flash,
+                scratch,
+                pool,
+                compressed,
+                start_pos_device,
+                compress_ratio,
+                config,
+            )
+        })?;
     }
     Ok(())
 }
@@ -3381,27 +3460,29 @@ pub(crate) fn flashmla_decode_finish_row(
     let (out_ptr, out_guard) = local_attn.data.device_ptr_mut(&ctx.stream);
     let (start_ptr, start_guard) = start_pos_device.device_ptr(&ctx.stream);
     {
-        let _nvtx = crate::nvtx::range("dsv4/flashmla_inverse_rope_batched");
-        // SAFETY: identical args to the single-row inverse-rope; out is one
-        // local-head row (token_count=1), start_pos_device is this row's pos.
-        unsafe {
-            ffi::arle_dsv4_output_inverse_rope_start_pos_ptr_cuda(
-                out_ptr as *mut ffi::Half,
-                1,
-                local_heads as i32,
-                config.head_dim as i32,
-                config.qk_rope_head_dim as i32,
-                start_ptr as *const i32,
-                rope_base,
-                original_seq_len,
-                rope_factor,
-                rope_beta_fast,
-                rope_beta_slow,
-                ctx.stream.cu_stream(),
-            )
-            .result()
-            .map_err(|e| anyhow!("DSv4 batched FlashMLA output inverse-rope failed: {e}"))?;
-        }
+        crate::profile::profile_op(ctx, "flashmla_inverse_rope_batched", None, 1, || {
+            // SAFETY: identical args to the single-row inverse-rope; out is one
+            // local-head row (token_count=1), start_pos_device is this row's pos.
+            unsafe {
+                ffi::arle_dsv4_output_inverse_rope_start_pos_ptr_cuda(
+                    out_ptr as *mut ffi::Half,
+                    1,
+                    local_heads as i32,
+                    config.head_dim as i32,
+                    config.qk_rope_head_dim as i32,
+                    start_ptr as *const i32,
+                    rope_base,
+                    original_seq_len,
+                    rope_factor,
+                    rope_beta_fast,
+                    rope_beta_slow,
+                    ctx.stream.cu_stream(),
+                )
+                .result()
+                .map_err(|e| anyhow!("DSv4 batched FlashMLA output inverse-rope failed: {e}"))?;
+            }
+            Ok(())
+        })?;
     }
     drop(out_guard);
     drop(start_guard);
@@ -3440,31 +3521,33 @@ pub(crate) fn flashmla_decode_inverse_rope_batched(
     rope_beta_fast: f32,
     rope_beta_slow: f32,
 ) -> Result<()> {
-    let _nvtx = crate::nvtx::range("dsv4/flashmla_inverse_rope_batched_ptr");
-    let (out_ptr, og) = out_ptrs.device_ptr(&ctx.stream);
-    let (start_ptr, sg) = start_pos.device_ptr(&ctx.stream);
-    // SAFETY: out_ptrs holds N valid `[local_width,1]` device pointers; start_pos
-    // is `[N]`; the kernel grids N*local_heads blocks and indexes both per row.
-    unsafe {
-        ffi::arle_dsv4_output_inverse_rope_batched_ptr_cuda(
-            out_ptr as *const *mut ffi::Half,
-            n as i32,
-            local_heads as i32,
-            config.head_dim as i32,
-            config.qk_rope_head_dim as i32,
-            start_ptr as *const i32,
-            rope_base,
-            original_seq_len,
-            rope_factor,
-            rope_beta_fast,
-            rope_beta_slow,
-            ctx.stream.cu_stream(),
-        )
-        .result()
-        .map_err(|e| anyhow!("DSv4 batched FlashMLA output inverse-rope (ptr) failed: {e}"))?;
-    }
-    drop(og);
-    drop(sg);
+    crate::profile::profile_op(ctx, "flashmla_inverse_rope_batched_ptr", None, n, || {
+        let (out_ptr, og) = out_ptrs.device_ptr(&ctx.stream);
+        let (start_ptr, sg) = start_pos.device_ptr(&ctx.stream);
+        // SAFETY: out_ptrs holds N valid `[local_width,1]` device pointers; start_pos
+        // is `[N]`; the kernel grids N*local_heads blocks and indexes both per row.
+        unsafe {
+            ffi::arle_dsv4_output_inverse_rope_batched_ptr_cuda(
+                out_ptr as *const *mut ffi::Half,
+                n as i32,
+                local_heads as i32,
+                config.head_dim as i32,
+                config.qk_rope_head_dim as i32,
+                start_ptr as *const i32,
+                rope_base,
+                original_seq_len,
+                rope_factor,
+                rope_beta_fast,
+                rope_beta_slow,
+                ctx.stream.cu_stream(),
+            )
+            .result()
+            .map_err(|e| anyhow!("DSv4 batched FlashMLA output inverse-rope (ptr) failed: {e}"))?;
+        }
+        drop(og);
+        drop(sg);
+        Ok(())
+    })?;
     Ok(())
 }
 
@@ -3484,28 +3567,30 @@ pub(crate) fn flashmla_decode_sw_window_batched(
     start_pos: &CudaSlice<i32>,
     n: usize,
 ) -> Result<()> {
-    let _nvtx = crate::nvtx::range("dsv4/flashmla_sw_window_batched_ptr");
-    let (k_ptr, kg) = k_ptrs.device_ptr(&ctx.stream);
-    let (cache_ptr, cg) = cache_ptrs.device_ptr(&ctx.stream);
-    let (start_ptr, sg) = start_pos.device_ptr(&ctx.stream);
-    // SAFETY: k_ptrs/cache_ptrs hold N valid device pointers; start_pos is `[N]`;
-    // the kernel grids N*head_dim threads and indexes per row.
-    unsafe {
-        ffi::dsv4_update_window_cache_batched_ptr_cuda(
-            k_ptr as *const *const ffi::Half,
-            cache_ptr as *const *mut ffi::Half,
-            n as i32,
-            start_ptr as *const i32,
-            config.sliding_window as i32,
-            config.head_dim as i32,
-            ctx.stream.cu_stream(),
-        )
-        .result()
-        .map_err(|e| anyhow!("DSv4 batched FlashMLA SW window write (ptr) failed: {e}"))?;
-    }
-    drop(kg);
-    drop(cg);
-    drop(sg);
+    crate::profile::profile_op(ctx, "flashmla_sw_window_batched_ptr", None, n, || {
+        let (k_ptr, kg) = k_ptrs.device_ptr(&ctx.stream);
+        let (cache_ptr, cg) = cache_ptrs.device_ptr(&ctx.stream);
+        let (start_ptr, sg) = start_pos.device_ptr(&ctx.stream);
+        // SAFETY: k_ptrs/cache_ptrs hold N valid device pointers; start_pos is `[N]`;
+        // the kernel grids N*head_dim threads and indexes per row.
+        unsafe {
+            ffi::dsv4_update_window_cache_batched_ptr_cuda(
+                k_ptr as *const *const ffi::Half,
+                cache_ptr as *const *mut ffi::Half,
+                n as i32,
+                start_ptr as *const i32,
+                config.sliding_window as i32,
+                config.head_dim as i32,
+                ctx.stream.cu_stream(),
+            )
+            .result()
+            .map_err(|e| anyhow!("DSv4 batched FlashMLA SW window write (ptr) failed: {e}"))?;
+        }
+        drop(kg);
+        drop(cg);
+        drop(sg);
+        Ok(())
+    })?;
     Ok(())
 }
 
@@ -3757,69 +3842,70 @@ fn run_fused_wqkv_decode_into(
         kv_normed,
     )?;
 
-    let nvtx_wq_b = crate::nvtx::range("dsv4/linear/wq_b");
-    match (
-        dsv4_decode_proj_deepgemm_enabled(),
-        attention.wq_b_deepgemm.as_ref(),
-    ) {
-        (true, Some(cache)) => {
-            // Lever #1: wq_b (M=1) through tensor-core DeepGEMM instead of the
-            // scalar GEMV. Quantize c_q_normed (K=q_lora_rank) into the fused
-            // scratch FP8 buffer (already consumed by the wq_a|wkv GEMM above, so
-            // safe to reuse on this stream), then DeepGEMM dense GEMM.
-            let k = scratch.q_lora_rank;
-            ensure!(
-                cache.cols == k && cache.rows == attention.wq_b.rows,
-                "DSv4 wq_b DeepGEMM cache shape {}x{} != expected {}x{}",
-                cache.rows,
-                cache.cols,
-                attention.wq_b.rows,
-                k
-            );
-            crate::linear_profile::profile(ctx, "dsv4/linear/wq_b", || -> Result<()> {
-                let stream = ctx.stream.cu_stream();
-                // SAFETY: all buffers live on ctx.stream; K=q_lora_rank ≤ hidden_dim
-                // so the fused scratch (sized for hidden_dim) covers the FP8 +
-                // scale extents.
-                unsafe {
-                    cuda_moe::dsv4_deepgemm_pack_quantize_bf16_to_fp8(
-                        cache_ptr(&c_q_normed.data, ctx),
-                        cache_ptr(&scratch.input_fp8, ctx),
-                        cache_ptr(&scratch.input_scales, ctx),
-                        cache_ptr(&scratch.active_experts, ctx),
-                        cache_ptr(&scratch.active_offsets, ctx),
-                        cache_ptr(&scratch.active_counts, ctx),
-                        1,
-                        scratch.max_m,
-                        k,
-                        scratch.scale_stride_m,
-                        stream,
-                    )
-                    .map_err(|e| anyhow!("DSv4 wq_b activation quantize failed: {e}"))?;
-                    cuda_moe::dsv4_deepgemm_fp8_gemm_nt(
-                        cache_ptr(&scratch.input_fp8, ctx),
-                        cache_ptr(&scratch.input_scales, ctx),
-                        cache_ptr(&cache.weight, ctx),
-                        cache_ptr(&cache.scales, ctx),
-                        cache_ptr(&q_raw.data, ctx),
-                        1,
-                        cache.rows,
-                        cache.cols,
-                        scratch.scale_stride_m,
-                        stream,
-                    )
-                    .map_err(|e| anyhow!("DSv4 wq_b DeepGEMM dense failed: {e}"))?;
-                }
-                Ok(())
-            })?;
+    crate::profile::profile_op(ctx, "linear/wq_b", None, 1, || {
+        match (
+            dsv4_decode_proj_deepgemm_enabled(),
+            attention.wq_b_deepgemm.as_ref(),
+        ) {
+            (true, Some(cache)) => {
+                // Lever #1: wq_b (M=1) through tensor-core DeepGEMM instead of the
+                // scalar GEMV. Quantize c_q_normed (K=q_lora_rank) into the fused
+                // scratch FP8 buffer (already consumed by the wq_a|wkv GEMM above, so
+                // safe to reuse on this stream), then DeepGEMM dense GEMM.
+                let k = scratch.q_lora_rank;
+                ensure!(
+                    cache.cols == k && cache.rows == attention.wq_b.rows,
+                    "DSv4 wq_b DeepGEMM cache shape {}x{} != expected {}x{}",
+                    cache.rows,
+                    cache.cols,
+                    attention.wq_b.rows,
+                    k
+                );
+                crate::linear_profile::profile(ctx, "dsv4/linear/wq_b", || -> Result<()> {
+                    let stream = ctx.stream.cu_stream();
+                    // SAFETY: all buffers live on ctx.stream; K=q_lora_rank ≤ hidden_dim
+                    // so the fused scratch (sized for hidden_dim) covers the FP8 +
+                    // scale extents.
+                    unsafe {
+                        cuda_moe::dsv4_deepgemm_pack_quantize_bf16_to_fp8(
+                            cache_ptr(&c_q_normed.data, ctx),
+                            cache_ptr(&scratch.input_fp8, ctx),
+                            cache_ptr(&scratch.input_scales, ctx),
+                            cache_ptr(&scratch.active_experts, ctx),
+                            cache_ptr(&scratch.active_offsets, ctx),
+                            cache_ptr(&scratch.active_counts, ctx),
+                            1,
+                            scratch.max_m,
+                            k,
+                            scratch.scale_stride_m,
+                            stream,
+                        )
+                        .map_err(|e| anyhow!("DSv4 wq_b activation quantize failed: {e}"))?;
+                        cuda_moe::dsv4_deepgemm_fp8_gemm_nt(
+                            cache_ptr(&scratch.input_fp8, ctx),
+                            cache_ptr(&scratch.input_scales, ctx),
+                            cache_ptr(&cache.weight, ctx),
+                            cache_ptr(&cache.scales, ctx),
+                            cache_ptr(&q_raw.data, ctx),
+                            1,
+                            cache.rows,
+                            cache.cols,
+                            scratch.scale_stride_m,
+                            stream,
+                        )
+                        .map_err(|e| anyhow!("DSv4 wq_b DeepGEMM dense failed: {e}"))?;
+                    }
+                    Ok(())
+                })?;
+            }
+            _ => {
+                crate::linear_profile::profile(ctx, "dsv4/linear/wq_b", || {
+                    dsv4_linear(ctx, &attention.wq_b, c_q_normed, &mut *q_raw)
+                })?;
+            }
         }
-        _ => {
-            crate::linear_profile::profile(ctx, "dsv4/linear/wq_b", || {
-                dsv4_linear(ctx, &attention.wq_b, c_q_normed, &mut *q_raw)
-            })?;
-        }
-    }
-    drop(nvtx_wq_b);
+        Ok(())
+    })?;
     Ok(())
 }
 
@@ -4215,16 +4301,16 @@ fn compressor_forward_decode_graph(
         score_scratch.hidden_dim,
         score_scratch.seq_len
     );
-    let nvtx_compressor_wkv = crate::nvtx::range("dsv4/linear/compressor_wkv");
-    crate::linear_profile::profile(ctx, "dsv4/linear/compressor_wkv", || {
-        dsv4_linear(ctx, &compressor.wkv, hidden, kv_scratch)
+    crate::profile::profile_op(ctx, "linear/compressor_wkv", None, 1, || {
+        crate::linear_profile::profile(ctx, "dsv4/linear/compressor_wkv", || {
+            dsv4_linear(ctx, &compressor.wkv, hidden, kv_scratch)
+        })
     })?;
-    drop(nvtx_compressor_wkv);
-    let nvtx_compressor_wgate = crate::nvtx::range("dsv4/linear/compressor_wgate");
-    crate::linear_profile::profile(ctx, "dsv4/linear/compressor_wgate", || {
-        dsv4_linear(ctx, &compressor.wgate, hidden, score_scratch)
+    crate::profile::profile_op(ctx, "linear/compressor_wgate", None, 1, || {
+        crate::linear_profile::profile(ctx, "dsv4/linear/compressor_wgate", || {
+            dsv4_linear(ctx, &compressor.wgate, hidden, score_scratch)
+        })
     })?;
-    drop(nvtx_compressor_wgate);
     compressor_forward(
         ctx,
         config,
@@ -4335,27 +4421,27 @@ pub(crate) fn mla_attention_decode_graph(
         let fused = state.fused_wqkv.as_mut().ok_or_else(|| {
             anyhow!("DSv4 fused wqkv decode requested but decode scratch was not allocated")
         })?;
-        let nvtx_wqkv = crate::nvtx::range("dsv4/linear/wqkv_a_fused");
-        crate::linear_profile::profile(ctx, "dsv4/linear/wqkv_a_fused", || {
-            run_fused_wqkv_decode_into(
-                ctx,
-                config,
-                attention,
-                hidden,
-                fused,
-                &mut scratch.c_q_normed,
-                &mut scratch.q_raw,
-                &mut scratch.kv_normed,
-            )
+        crate::profile::profile_op(ctx, "linear/wqkv_a_fused", None, 1, || {
+            crate::linear_profile::profile(ctx, "dsv4/linear/wqkv_a_fused", || {
+                run_fused_wqkv_decode_into(
+                    ctx,
+                    config,
+                    attention,
+                    hidden,
+                    fused,
+                    &mut scratch.c_q_normed,
+                    &mut scratch.q_raw,
+                    &mut scratch.kv_normed,
+                )
+            })
         })?;
-        drop(nvtx_wqkv);
     } else {
         let (wq_a, wq_b, wkv) = attention.decode_proj_weights();
-        let nvtx_wq_a = crate::nvtx::range("dsv4/linear/wq_a");
-        crate::linear_profile::profile(ctx, "dsv4/linear/wq_a", || {
-            dsv4_linear(ctx, wq_a, hidden, &mut scratch.c_q)
+        crate::profile::profile_op(ctx, "linear/wq_a", None, 1, || {
+            crate::linear_profile::profile(ctx, "dsv4/linear/wq_a", || {
+                dsv4_linear(ctx, wq_a, hidden, &mut scratch.c_q)
+            })
         })?;
-        drop(nvtx_wq_a);
         mla_rms_norm_into(
             ctx,
             &scratch.c_q,
@@ -4363,16 +4449,16 @@ pub(crate) fn mla_attention_decode_graph(
             config.rms_norm_eps,
             &mut scratch.c_q_normed,
         )?;
-        let nvtx_wq_b = crate::nvtx::range("dsv4/linear/wq_b");
-        crate::linear_profile::profile(ctx, "dsv4/linear/wq_b", || {
-            dsv4_linear(ctx, wq_b, &scratch.c_q_normed, &mut scratch.q_raw)
+        crate::profile::profile_op(ctx, "linear/wq_b", None, 1, || {
+            crate::linear_profile::profile(ctx, "dsv4/linear/wq_b", || {
+                dsv4_linear(ctx, wq_b, &scratch.c_q_normed, &mut scratch.q_raw)
+            })
         })?;
-        drop(nvtx_wq_b);
-        let nvtx_wkv = crate::nvtx::range("dsv4/linear/wkv");
-        crate::linear_profile::profile(ctx, "dsv4/linear/wkv", || {
-            dsv4_linear(ctx, wkv, hidden, &mut scratch.kv_raw)
+        crate::profile::profile_op(ctx, "linear/wkv", None, 1, || {
+            crate::linear_profile::profile(ctx, "dsv4/linear/wkv", || {
+                dsv4_linear(ctx, wkv, hidden, &mut scratch.kv_raw)
+            })
         })?;
-        drop(nvtx_wkv);
         mla_rms_norm_into(
             ctx,
             &scratch.kv_raw,
@@ -5197,11 +5283,12 @@ pub(crate) fn mla_attention_prepare(
         let scratch = state.fused_wqkv.as_mut().ok_or_else(|| {
             anyhow!("DSv4 fused wqkv decode requested but decode scratch was not allocated")
         })?;
-        let nvtx_wqkv = crate::nvtx::range("dsv4/linear/wqkv_a_fused");
-        let out = crate::linear_profile::profile(ctx, "dsv4/linear/wqkv_a_fused", || {
-            run_fused_wqkv_decode(ctx, config, attention, hidden, scratch)
-        })?;
-        drop(nvtx_wqkv);
+        let out =
+            crate::profile::profile_op(ctx, "linear/wqkv_a_fused", None, token_count, || {
+                crate::linear_profile::profile(ctx, "dsv4/linear/wqkv_a_fused", || {
+                    run_fused_wqkv_decode(ctx, config, attention, hidden, scratch)
+                })
+            })?;
         out
     } else if token_count > 1 && dsv4_fp8_linear_deepgemm_enabled()? {
         // SAFETY: uninit device scratch; fully written before first read.
@@ -5211,37 +5298,45 @@ pub(crate) fn mla_attention_prepare(
         let scratch = prefill_shared.as_deref_mut().ok_or_else(|| {
             anyhow!("DSv4 fused wqkv prefill requested but prefill scratch was not allocated")
         })?;
-        let nvtx_wqkv = crate::nvtx::range("dsv4/linear/wqkv_a_fused_prefill");
-        crate::linear_profile::profile(ctx, "dsv4/linear/wqkv_a_fused_prefill", || {
-            run_fused_wqkv_prefill(ctx, attention, hidden, scratch, &mut c_q, &mut kv_raw)
-        })?;
-        drop(nvtx_wqkv);
+        crate::profile::profile_op(
+            ctx,
+            "linear/wqkv_a_fused_prefill",
+            None,
+            token_count,
+            || {
+                crate::linear_profile::profile(ctx, "dsv4/linear/wqkv_a_fused_prefill", || {
+                    run_fused_wqkv_prefill(ctx, attention, hidden, scratch, &mut c_q, &mut kv_raw)
+                })
+            },
+        )?;
         keepalive.keep_hidden(&c_q);
         let c_q_normed = mla_rms_norm(ctx, &c_q, &attention.q_norm, config.rms_norm_eps)?;
         keepalive.keep_hidden(&c_q_normed);
         // SAFETY: uninit device scratch; fully written before first read.
         let mut q_raw = unsafe { HiddenStates::uninit(ctx, local_width, token_count)? };
-        let nvtx_wq_b = crate::nvtx::range("dsv4/linear/wq_b");
-        // Prefill wq_b → DeepGEMM (off the scalar dsv4_fp8_gemv_batch, the 62% of
-        // mla_attn prefill). Reuses the prefill fused-wqkv FP8 scratch since
-        // K=q_lora_rank ≤ hidden_dim. Opt-in until the prefill A/B licenses it.
-        if let Some(cache) = attention
-            .wq_b_deepgemm
-            .as_ref()
-            .filter(|_| dsv4_prefill_proj_deepgemm_enabled())
-        {
-            let scratch = prefill_shared.as_deref_mut().ok_or_else(|| {
-                anyhow!("DSv4 prefill wq_b DeepGEMM requested but prefill scratch not allocated")
-            })?;
-            crate::linear_profile::profile(ctx, "dsv4/linear/wq_b", || {
-                prefill_proj_deepgemm(ctx, scratch, cache, &c_q_normed, &mut q_raw)
-            })?;
-        } else {
-            crate::linear_profile::profile(ctx, "dsv4/linear/wq_b", || {
-                dsv4_linear(ctx, &attention.wq_b, &c_q_normed, &mut q_raw)
-            })?;
-        }
-        drop(nvtx_wq_b);
+        crate::profile::profile_op(ctx, "linear/wq_b", None, token_count, || {
+            // Prefill wq_b → DeepGEMM (off the scalar dsv4_fp8_gemv_batch, the 62% of
+            // mla_attn prefill). Reuses the prefill fused-wqkv FP8 scratch since
+            // K=q_lora_rank ≤ hidden_dim. Opt-in until the prefill A/B licenses it.
+            if let Some(cache) = attention
+                .wq_b_deepgemm
+                .as_ref()
+                .filter(|_| dsv4_prefill_proj_deepgemm_enabled())
+            {
+                let scratch = prefill_shared.as_deref_mut().ok_or_else(|| {
+                    anyhow!(
+                        "DSv4 prefill wq_b DeepGEMM requested but prefill scratch not allocated"
+                    )
+                })?;
+                crate::linear_profile::profile(ctx, "dsv4/linear/wq_b", || {
+                    prefill_proj_deepgemm(ctx, scratch, cache, &c_q_normed, &mut q_raw)
+                })
+            } else {
+                crate::linear_profile::profile(ctx, "dsv4/linear/wq_b", || {
+                    dsv4_linear(ctx, &attention.wq_b, &c_q_normed, &mut q_raw)
+                })
+            }
+        })?;
         keepalive.keep_hidden(&q_raw);
 
         // KV latent: wkv (down to the single compressed latent) → kv_norm.
@@ -5260,31 +5355,31 @@ pub(crate) fn mla_attention_prepare(
         };
         // SAFETY: dsv4_linear writes the full c_q buffer.
         let mut c_q = unsafe { HiddenStates::uninit(ctx, wq_a.rows, token_count)? };
-        let nvtx_wq_a = crate::nvtx::range("dsv4/linear/wq_a");
-        crate::linear_profile::profile(ctx, "dsv4/linear/wq_a", || {
-            dsv4_linear(ctx, wq_a, hidden, &mut c_q)
+        crate::profile::profile_op(ctx, "linear/wq_a", None, token_count, || {
+            crate::linear_profile::profile(ctx, "dsv4/linear/wq_a", || {
+                dsv4_linear(ctx, wq_a, hidden, &mut c_q)
+            })
         })?;
-        drop(nvtx_wq_a);
         keepalive.keep_hidden(&c_q);
         let c_q_normed = mla_rms_norm(ctx, &c_q, &attention.q_norm, config.rms_norm_eps)?;
         keepalive.keep_hidden(&c_q_normed);
         // SAFETY: dsv4_linear writes the full q_raw buffer.
         let mut q_raw = unsafe { HiddenStates::uninit(ctx, local_width, token_count)? };
-        let nvtx_wq_b = crate::nvtx::range("dsv4/linear/wq_b");
-        crate::linear_profile::profile(ctx, "dsv4/linear/wq_b", || {
-            dsv4_linear(ctx, wq_b, &c_q_normed, &mut q_raw)
+        crate::profile::profile_op(ctx, "linear/wq_b", None, token_count, || {
+            crate::linear_profile::profile(ctx, "dsv4/linear/wq_b", || {
+                dsv4_linear(ctx, wq_b, &c_q_normed, &mut q_raw)
+            })
         })?;
-        drop(nvtx_wq_b);
         keepalive.keep_hidden(&q_raw);
 
         // KV latent: wkv (down to the single compressed latent) → kv_norm.
         // SAFETY: dsv4_linear writes the full kv_raw buffer.
         let mut kv_raw = unsafe { HiddenStates::uninit(ctx, head_dim, token_count)? };
-        let nvtx_wkv = crate::nvtx::range("dsv4/linear/wkv");
-        crate::linear_profile::profile(ctx, "dsv4/linear/wkv", || {
-            dsv4_linear(ctx, wkv, hidden, &mut kv_raw)
+        crate::profile::profile_op(ctx, "linear/wkv", None, token_count, || {
+            crate::linear_profile::profile(ctx, "dsv4/linear/wkv", || {
+                dsv4_linear(ctx, wkv, hidden, &mut kv_raw)
+            })
         })?;
-        drop(nvtx_wkv);
         keepalive.keep_hidden(&kv_raw);
         let kv_normed = mla_rms_norm(ctx, &kv_raw, &attention.kv_norm, config.rms_norm_eps)?;
         keepalive.keep_hidden(&kv_normed);
@@ -5781,11 +5876,11 @@ pub(crate) fn mla_attention_prepare_proj_batch(
         let mut c_q = unsafe { HiddenStates::uninit(ctx, attention.wq_a.rows, n)? };
         // SAFETY: uninit device scratch; fully written before first read.
         let mut kv_raw = unsafe { HiddenStates::uninit(ctx, head_dim, n)? };
-        let nvtx_wqkv = crate::nvtx::range("dsv4/linear/wqkv_a_fused_batched");
-        crate::linear_profile::profile(ctx, "dsv4/linear/wqkv_a_fused_batched", || {
-            run_fused_wqkv_prefill(ctx, attention, normed, &mut *scratch, &mut c_q, &mut kv_raw)
+        crate::profile::profile_op(ctx, "linear/wqkv_a_fused_batched", None, n, || {
+            crate::linear_profile::profile(ctx, "dsv4/linear/wqkv_a_fused_batched", || {
+                run_fused_wqkv_prefill(ctx, attention, normed, &mut *scratch, &mut c_q, &mut kv_raw)
+            })
         })?;
-        drop(nvtx_wqkv);
         keepalive.keep_hidden(&c_q);
         let c_q_normed = mla_rms_norm(ctx, &c_q, &attention.q_norm, config.rms_norm_eps)?;
         keepalive.keep_hidden(&c_q_normed);
@@ -5797,11 +5892,11 @@ pub(crate) fn mla_attention_prepare_proj_batch(
             .wq_b_deepgemm
             .as_ref()
             .ok_or_else(|| anyhow!("DSv4 MLA proj-batch DeepGEMM path requires wq_b_deepgemm"))?;
-        let nvtx_wq_b = crate::nvtx::range("dsv4/linear/wq_b_batched");
-        crate::linear_profile::profile(ctx, "dsv4/linear/wq_b_batched", || {
-            prefill_proj_deepgemm(ctx, &mut *scratch, cache, &c_q_normed, &mut q_raw)
+        crate::profile::profile_op(ctx, "linear/wq_b_batched", None, n, || {
+            crate::linear_profile::profile(ctx, "dsv4/linear/wq_b_batched", || {
+                prefill_proj_deepgemm(ctx, &mut *scratch, cache, &c_q_normed, &mut q_raw)
+            })
         })?;
-        drop(nvtx_wq_b);
         keepalive.keep_hidden(&q_raw);
         keepalive.keep_hidden(&kv_raw);
         let kv_normed = mla_rms_norm(ctx, &kv_raw, &attention.kv_norm, config.rms_norm_eps)?;
@@ -5816,29 +5911,29 @@ pub(crate) fn mla_attention_prepare_proj_batch(
         let (wq_a, wq_b, wkv) = attention.decode_proj_weights();
         // SAFETY: dsv4_linear writes the full c_q buffer.
         let mut c_q = unsafe { HiddenStates::uninit(ctx, wq_a.rows, n)? };
-        let nvtx_wq_a = crate::nvtx::range("dsv4/linear/wq_a_batched");
-        crate::linear_profile::profile(ctx, "dsv4/linear/wq_a_batched", || {
-            dsv4_linear(ctx, wq_a, normed, &mut c_q)
+        crate::profile::profile_op(ctx, "linear/wq_a_batched", None, n, || {
+            crate::linear_profile::profile(ctx, "dsv4/linear/wq_a_batched", || {
+                dsv4_linear(ctx, wq_a, normed, &mut c_q)
+            })
         })?;
-        drop(nvtx_wq_a);
         keepalive.keep_hidden(&c_q);
         let c_q_normed = mla_rms_norm(ctx, &c_q, &attention.q_norm, config.rms_norm_eps)?;
         keepalive.keep_hidden(&c_q_normed);
         // SAFETY: dsv4_linear writes the full q_raw buffer.
         let mut q_raw = unsafe { HiddenStates::uninit(ctx, local_width, n)? };
-        let nvtx_wq_b = crate::nvtx::range("dsv4/linear/wq_b_batched");
-        crate::linear_profile::profile(ctx, "dsv4/linear/wq_b_batched", || {
-            dsv4_linear(ctx, wq_b, &c_q_normed, &mut q_raw)
+        crate::profile::profile_op(ctx, "linear/wq_b_batched", None, n, || {
+            crate::linear_profile::profile(ctx, "dsv4/linear/wq_b_batched", || {
+                dsv4_linear(ctx, wq_b, &c_q_normed, &mut q_raw)
+            })
         })?;
-        drop(nvtx_wq_b);
         keepalive.keep_hidden(&q_raw);
         // SAFETY: dsv4_linear writes the full kv_raw buffer.
         let mut kv_raw = unsafe { HiddenStates::uninit(ctx, head_dim, n)? };
-        let nvtx_wkv = crate::nvtx::range("dsv4/linear/wkv_batched");
-        crate::linear_profile::profile(ctx, "dsv4/linear/wkv_batched", || {
-            dsv4_linear(ctx, wkv, normed, &mut kv_raw)
+        crate::profile::profile_op(ctx, "linear/wkv_batched", None, n, || {
+            crate::linear_profile::profile(ctx, "dsv4/linear/wkv_batched", || {
+                dsv4_linear(ctx, wkv, normed, &mut kv_raw)
+            })
         })?;
-        drop(nvtx_wkv);
         keepalive.keep_hidden(&kv_raw);
         let kv_normed = mla_rms_norm(ctx, &kv_raw, &attention.kv_norm, config.rms_norm_eps)?;
         keepalive.keep_hidden(&kv_normed);
@@ -7246,11 +7341,11 @@ pub(crate) fn mla_oproj(
     if let Some(o_proj) = attention.o_proj.as_ref() {
         let _ = &mut prefill_shared;
         let _ = keepalive;
-        let nvtx = crate::nvtx::range("dsv4/linear/o_proj");
-        crate::linear_profile::profile(ctx, "dsv4/linear/o_proj", || {
-            dsv4_linear(ctx, o_proj, local_attn, out)
+        crate::profile::profile_op(ctx, "linear/o_proj", None, token_count, || {
+            crate::linear_profile::profile(ctx, "dsv4/linear/o_proj", || {
+                dsv4_linear(ctx, o_proj, local_attn, out)
+            })
         })?;
-        drop(nvtx);
         return Ok(());
     }
     let shape = dsv4_oproj_group_shape(
@@ -7322,11 +7417,11 @@ pub(crate) fn mla_oproj(
             .as_ref()
             .expect("wo_dg gate checked");
         let wo_a_cols = attention.wo_a.as_ref().expect("DSv4 wo_a").cols;
-        let nvtx_wo_a = crate::nvtx::range("dsv4/linear/wo_a");
-        crate::linear_profile::profile(ctx, "dsv4/linear/wo_a", || {
-            decode_proj_deepgemm(ctx, scratch, wo_a_cache, local_attn, &mut latent, wo_a_cols)
+        crate::profile::profile_op(ctx, "linear/wo_a", None, token_count, || {
+            crate::linear_profile::profile(ctx, "dsv4/linear/wo_a", || {
+                decode_proj_deepgemm(ctx, scratch, wo_a_cache, local_attn, &mut latent, wo_a_cols)
+            })
         })?;
-        drop(nvtx_wo_a);
     } else if wo_a_group_decode_dg {
         let scratch = state
             .fused_wqkv
@@ -7336,41 +7431,38 @@ pub(crate) fn mla_oproj(
             .wo_a_group_deepgemm
             .as_ref()
             .expect("wo grouped dg gate checked");
-        let nvtx_wo_a = crate::nvtx::range("dsv4/linear/wo_a");
-        crate::linear_profile::profile(ctx, "dsv4/linear/wo_a", || {
-            dsv4_wo_a_grouped_deepgemm_decode(
-                ctx,
-                scratch,
-                wo_a_caches,
-                local_attn,
-                shape,
-                &mut latent,
-            )
+        crate::profile::profile_op(ctx, "linear/wo_a", None, token_count, || {
+            crate::linear_profile::profile(ctx, "dsv4/linear/wo_a", || {
+                dsv4_wo_a_grouped_deepgemm_decode(
+                    ctx,
+                    scratch,
+                    wo_a_caches,
+                    local_attn,
+                    shape,
+                    &mut latent,
+                )
+            })
         })?;
-        drop(nvtx_wo_a);
     } else if wo_a_prefill_dg {
         // Prefill wo_a (M=token_count) → DeepGEMM for the single-output-group case.
         let wo_a_cache = attention
             .wo_a_deepgemm
             .as_ref()
             .expect("wo prefill gate checked");
-        let nvtx_wo_a = crate::nvtx::range("dsv4/linear/wo_a");
-        {
+        crate::profile::profile_op(ctx, "linear/wo_a", None, token_count, || {
             let scratch = prefill_shared
                 .as_deref_mut()
                 .expect("wo prefill gate checked");
             crate::linear_profile::profile(ctx, "dsv4/linear/wo_a", || {
                 prefill_proj_deepgemm(ctx, scratch, wo_a_cache, local_attn, &mut latent)
-            })?;
-        }
-        drop(nvtx_wo_a);
+            })
+        })?;
     } else if wo_a_group_prefill_dg {
         let wo_a_caches = attention
             .wo_a_group_deepgemm
             .as_ref()
             .expect("wo grouped prefill gate checked");
-        let nvtx_wo_a = crate::nvtx::range("dsv4/linear/wo_a");
-        {
+        crate::profile::profile_op(ctx, "linear/wo_a", None, token_count, || {
             let scratch = prefill_shared
                 .as_deref_mut()
                 .expect("wo grouped prefill gate checked");
@@ -7383,26 +7475,25 @@ pub(crate) fn mla_oproj(
                     shape,
                     &mut latent,
                 )
-            })?;
-        }
-        drop(nvtx_wo_a);
+            })
+        })?;
     } else if shape.groups == 1 {
-        let nvtx_wo_a = crate::nvtx::range("dsv4/linear/wo_a");
-        crate::linear_profile::profile(ctx, "dsv4/linear/wo_a", || {
-            dsv4_linear(
-                ctx,
-                attention.wo_a.as_ref().expect("DSv4 wo_a"),
-                local_attn,
-                &mut latent,
-            )
+        crate::profile::profile_op(ctx, "linear/wo_a", None, token_count, || {
+            crate::linear_profile::profile(ctx, "dsv4/linear/wo_a", || {
+                dsv4_linear(
+                    ctx,
+                    attention.wo_a.as_ref().expect("DSv4 wo_a"),
+                    local_attn,
+                    &mut latent,
+                )
+            })
         })?;
-        drop(nvtx_wo_a);
     } else {
-        let nvtx_wo_a = crate::nvtx::range("dsv4/linear/wo_a");
-        crate::linear_profile::profile(ctx, "dsv4/linear/wo_a", || {
-            dsv4_wo_a_grouped_linear(ctx, attention, local_attn, shape, &mut latent)
+        crate::profile::profile_op(ctx, "linear/wo_a", None, token_count, || {
+            crate::linear_profile::profile(ctx, "dsv4/linear/wo_a", || {
+                dsv4_wo_a_grouped_linear(ctx, attention, local_attn, shape, &mut latent)
+            })
         })?;
-        drop(nvtx_wo_a);
     }
     keepalive.keep_hidden(&latent);
 
@@ -7423,35 +7514,33 @@ pub(crate) fn mla_oproj(
             .as_ref()
             .expect("wo_b dg gate checked");
         let wo_b_cols = attention.wo_b.as_ref().expect("DSv4 wo_b").cols;
-        let nvtx_wo_b = crate::nvtx::range("dsv4/linear/wo_b");
-        crate::linear_profile::profile(ctx, "dsv4/linear/wo_b", || {
-            decode_proj_deepgemm(ctx, scratch, wo_b_cache, &latent, out, wo_b_cols)
+        crate::profile::profile_op(ctx, "linear/wo_b", None, token_count, || {
+            crate::linear_profile::profile(ctx, "dsv4/linear/wo_b", || {
+                decode_proj_deepgemm(ctx, scratch, wo_b_cache, &latent, out, wo_b_cols)
+            })
         })?;
-        drop(nvtx_wo_b);
     } else if wo_b_prefill_dg {
         let wo_b_cache = attention
             .wo_b_deepgemm
             .as_ref()
             .expect("wo_b prefill gate checked");
-        let nvtx_wo_b = crate::nvtx::range("dsv4/linear/wo_b");
-        {
+        crate::profile::profile_op(ctx, "linear/wo_b", None, token_count, || {
             let scratch = prefill_shared.expect("wo_b prefill gate checked");
             crate::linear_profile::profile(ctx, "dsv4/linear/wo_b", || {
                 prefill_proj_deepgemm(ctx, scratch, wo_b_cache, &latent, out)
-            })?;
-        }
-        drop(nvtx_wo_b);
-    } else {
-        let nvtx_wo_b = crate::nvtx::range("dsv4/linear/wo_b");
-        crate::linear_profile::profile(ctx, "dsv4/linear/wo_b", || {
-            dsv4_linear(
-                ctx,
-                attention.wo_b.as_ref().expect("DSv4 wo_b"),
-                &latent,
-                out,
-            )
+            })
         })?;
-        drop(nvtx_wo_b);
+    } else {
+        crate::profile::profile_op(ctx, "linear/wo_b", None, token_count, || {
+            crate::linear_profile::profile(ctx, "dsv4/linear/wo_b", || {
+                dsv4_linear(
+                    ctx,
+                    attention.wo_b.as_ref().expect("DSv4 wo_b"),
+                    &latent,
+                    out,
+                )
+            })
+        })?;
     }
     // Restore the shared fused-wqkv scratch active_counts to [1] after a batched
     // (M=n) decode-DeepGEMM O-LoRA. The single-group wo_a/wo_b decode lanes write
@@ -7526,11 +7615,11 @@ fn mla_oproj_decode_graph(
             .expect("wo_dg gate checked");
         let wo_a_cols = attention.wo_a.as_ref().expect("DSv4 wo_a").cols;
         let scratch = state.fused_wqkv.as_mut().expect("wo_dg gate checked");
-        let nvtx_wo_a = crate::nvtx::range("dsv4/linear/wo_a");
-        crate::linear_profile::profile(ctx, "dsv4/linear/wo_a", || {
-            decode_proj_deepgemm(ctx, scratch, wo_a_cache, local_attn, latent, wo_a_cols)
+        crate::profile::profile_op(ctx, "linear/wo_a", None, 1, || {
+            crate::linear_profile::profile(ctx, "dsv4/linear/wo_a", || {
+                decode_proj_deepgemm(ctx, scratch, wo_a_cache, local_attn, latent, wo_a_cols)
+            })
         })?;
-        drop(nvtx_wo_a);
     } else if wo_a_group_decode_dg {
         let wo_a_caches = attention
             .wo_a_group_deepgemm
@@ -7540,28 +7629,35 @@ fn mla_oproj_decode_graph(
             .fused_wqkv
             .as_mut()
             .expect("wo grouped dg gate checked");
-        let nvtx_wo_a = crate::nvtx::range("dsv4/linear/wo_a");
-        crate::linear_profile::profile(ctx, "dsv4/linear/wo_a", || {
-            dsv4_wo_a_grouped_deepgemm_decode(ctx, scratch, wo_a_caches, local_attn, shape, latent)
+        crate::profile::profile_op(ctx, "linear/wo_a", None, 1, || {
+            crate::linear_profile::profile(ctx, "dsv4/linear/wo_a", || {
+                dsv4_wo_a_grouped_deepgemm_decode(
+                    ctx,
+                    scratch,
+                    wo_a_caches,
+                    local_attn,
+                    shape,
+                    latent,
+                )
+            })
         })?;
-        drop(nvtx_wo_a);
     } else if shape.groups == 1 {
-        let nvtx_wo_a = crate::nvtx::range("dsv4/linear/wo_a");
-        crate::linear_profile::profile(ctx, "dsv4/linear/wo_a", || {
-            dsv4_linear(
-                ctx,
-                attention.wo_a.as_ref().expect("DSv4 wo_a"),
-                local_attn,
-                latent,
-            )
+        crate::profile::profile_op(ctx, "linear/wo_a", None, 1, || {
+            crate::linear_profile::profile(ctx, "dsv4/linear/wo_a", || {
+                dsv4_linear(
+                    ctx,
+                    attention.wo_a.as_ref().expect("DSv4 wo_a"),
+                    local_attn,
+                    latent,
+                )
+            })
         })?;
-        drop(nvtx_wo_a);
     } else {
-        let nvtx_wo_a = crate::nvtx::range("dsv4/linear/wo_a");
-        crate::linear_profile::profile(ctx, "dsv4/linear/wo_a", || {
-            dsv4_wo_a_grouped_linear(ctx, attention, local_attn, shape, latent)
+        crate::profile::profile_op(ctx, "linear/wo_a", None, 1, || {
+            crate::linear_profile::profile(ctx, "dsv4/linear/wo_a", || {
+                dsv4_wo_a_grouped_linear(ctx, attention, local_attn, shape, latent)
+            })
         })?;
-        drop(nvtx_wo_a);
     }
 
     let wo_b_decode_dg = dsv4_decode_proj_deepgemm_enabled()
@@ -7574,22 +7670,22 @@ fn mla_oproj_decode_graph(
             .expect("wo_b dg gate checked");
         let wo_b_cols = attention.wo_b.as_ref().expect("DSv4 wo_b").cols;
         let scratch = state.fused_wqkv.as_mut().expect("wo_b dg gate checked");
-        let nvtx_wo_b = crate::nvtx::range("dsv4/linear/wo_b");
-        crate::linear_profile::profile(ctx, "dsv4/linear/wo_b", || {
-            decode_proj_deepgemm(ctx, scratch, wo_b_cache, latent, out, wo_b_cols)
+        crate::profile::profile_op(ctx, "linear/wo_b", None, 1, || {
+            crate::linear_profile::profile(ctx, "dsv4/linear/wo_b", || {
+                decode_proj_deepgemm(ctx, scratch, wo_b_cache, latent, out, wo_b_cols)
+            })
         })?;
-        drop(nvtx_wo_b);
     } else {
-        let nvtx_wo_b = crate::nvtx::range("dsv4/linear/wo_b");
-        crate::linear_profile::profile(ctx, "dsv4/linear/wo_b", || {
-            dsv4_linear(
-                ctx,
-                attention.wo_b.as_ref().expect("DSv4 wo_b"),
-                latent,
-                out,
-            )
+        crate::profile::profile_op(ctx, "linear/wo_b", None, 1, || {
+            crate::linear_profile::profile(ctx, "dsv4/linear/wo_b", || {
+                dsv4_linear(
+                    ctx,
+                    attention.wo_b.as_ref().expect("DSv4 wo_b"),
+                    latent,
+                    out,
+                )
+            })
         })?;
-        drop(nvtx_wo_b);
     }
     Ok(())
 }
@@ -7737,166 +7833,169 @@ fn compressor_fp32_probe(
     apply_rope: bool,
     rope_original_seq_len: i32,
 ) -> Result<()> {
-    let _nvtx = crate::nvtx::range("dsv4/compressor_fp32_probe");
-    let probe = &compressor.fp32_probe;
-    ensure!(
-        probe.wkv.cols == hidden.hidden_dim && probe.wgate.cols == hidden.hidden_dim,
-        "DSv4 compressor FP32 projection K mismatch"
-    );
-    ensure!(
-        probe.ape.len() == ratio * width,
-        "DSv4 compressor FP32 APE len {} != ratio*width {}",
-        probe.ape.len(),
-        ratio * width
-    );
-    // Model-wide shared FP32 GEMM scratch (hoisted off the per-slot state);
-    // written and consumed within this call, no cross-call state.
-    ensure!(
-        token_count * width <= scratch.kv_raw.len(),
-        "DSv4 compressor FP32 scratch too small: token_count {token_count} × width {width} \
-         exceeds {}",
-        scratch.kv_raw.len()
-    );
-    if state.fp32_carry_stale {
-        let pending_elems = i32::try_from(state.fp32_pending_kv.len())
-            .map_err(|_| anyhow!("DSv4 FP32 carry pending elems exceed i32"))?;
-        let prev_elems = i32::try_from(state.fp32_prev_kv.len())
-            .map_err(|_| anyhow!("DSv4 FP32 carry prev elems exceed i32"))?;
-        let (pkv_b, _b0) = state.pending_kv.device_ptr(&ctx.stream);
-        let (psc_b, _b1) = state.pending_score.device_ptr(&ctx.stream);
-        let (prkv_b, _b2) = state.prev_overlap_kv.device_ptr(&ctx.stream);
-        let (prsc_b, _b3) = state.prev_overlap_score.device_ptr(&ctx.stream);
-        let (pkv, _f0) = state.fp32_pending_kv.device_ptr_mut(&ctx.stream);
-        let (psc, _f1) = state.fp32_pending_score.device_ptr_mut(&ctx.stream);
-        let (prkv, _f2) = state.fp32_prev_kv.device_ptr_mut(&ctx.stream);
-        let (prsc, _f3) = state.fp32_prev_score.device_ptr_mut(&ctx.stream);
-        // SAFETY: bf16/f32 carry buffers are allocated with identical element
-        // counts (`Dsv4CompressorState::new`).
-        unsafe {
-            ffi::dsv4_compressor_fp32_carry_reseed_cuda(
-                pkv_b as *const ffi::Half,
-                psc_b as *const ffi::Half,
-                prkv_b as *const ffi::Half,
-                prsc_b as *const ffi::Half,
-                pkv as *mut f32,
-                psc as *mut f32,
-                prkv as *mut f32,
-                prsc as *mut f32,
-                pending_elems,
-                prev_elems,
-                ctx.stream.cu_stream(),
-            )
-            .result()?;
+    crate::profile::profile_op(ctx, "compressor_fp32_probe", None, token_count, || {
+        let probe = &compressor.fp32_probe;
+        ensure!(
+            probe.wkv.cols == hidden.hidden_dim && probe.wgate.cols == hidden.hidden_dim,
+            "DSv4 compressor FP32 projection K mismatch"
+        );
+        ensure!(
+            probe.ape.len() == ratio * width,
+            "DSv4 compressor FP32 APE len {} != ratio*width {}",
+            probe.ape.len(),
+            ratio * width
+        );
+        // Model-wide shared FP32 GEMM scratch (hoisted off the per-slot state);
+        // written and consumed within this call, no cross-call state.
+        ensure!(
+            token_count * width <= scratch.kv_raw.len(),
+            "DSv4 compressor FP32 scratch too small: token_count {token_count} × width {width} \
+             exceeds {}",
+            scratch.kv_raw.len()
+        );
+        if state.fp32_carry_stale {
+            let pending_elems = i32::try_from(state.fp32_pending_kv.len())
+                .map_err(|_| anyhow!("DSv4 FP32 carry pending elems exceed i32"))?;
+            let prev_elems = i32::try_from(state.fp32_prev_kv.len())
+                .map_err(|_| anyhow!("DSv4 FP32 carry prev elems exceed i32"))?;
+            let (pkv_b, _b0) = state.pending_kv.device_ptr(&ctx.stream);
+            let (psc_b, _b1) = state.pending_score.device_ptr(&ctx.stream);
+            let (prkv_b, _b2) = state.prev_overlap_kv.device_ptr(&ctx.stream);
+            let (prsc_b, _b3) = state.prev_overlap_score.device_ptr(&ctx.stream);
+            let (pkv, _f0) = state.fp32_pending_kv.device_ptr_mut(&ctx.stream);
+            let (psc, _f1) = state.fp32_pending_score.device_ptr_mut(&ctx.stream);
+            let (prkv, _f2) = state.fp32_prev_kv.device_ptr_mut(&ctx.stream);
+            let (prsc, _f3) = state.fp32_prev_score.device_ptr_mut(&ctx.stream);
+            // SAFETY: bf16/f32 carry buffers are allocated with identical element
+            // counts (`Dsv4CompressorState::new`).
+            unsafe {
+                ffi::dsv4_compressor_fp32_carry_reseed_cuda(
+                    pkv_b as *const ffi::Half,
+                    psc_b as *const ffi::Half,
+                    prkv_b as *const ffi::Half,
+                    prsc_b as *const ffi::Half,
+                    pkv as *mut f32,
+                    psc as *mut f32,
+                    prkv as *mut f32,
+                    prsc as *mut f32,
+                    pending_elems,
+                    prev_elems,
+                    ctx.stream.cu_stream(),
+                )
+                .result()?;
+            }
+            state.fp32_carry_stale = false;
         }
-        state.fp32_carry_stale = false;
-    }
-    let kv_raw = &mut scratch.kv_raw;
-    let score_raw = &mut scratch.score_raw;
-    let pending_kv = &mut state.fp32_pending_kv;
-    let pending_score = &mut state.fp32_pending_score;
-    let prev_kv = &mut state.fp32_prev_kv;
-    let prev_score = &mut state.fp32_prev_score;
-    {
-        let (wkv, _wg0) = probe.wkv.data.device_ptr(&ctx.stream);
-        let (wgate, _wg1) = probe.wgate.data.device_ptr(&ctx.stream);
-        let (x, _xg) = hidden.data.device_ptr(&ctx.stream);
-        let (kv, _kg) = kv_raw.device_ptr_mut(&ctx.stream);
-        let (score, _sg) = score_raw.device_ptr_mut(&ctx.stream);
-        // SAFETY: dense BF16 matrices and outputs match the checked M/N/K shapes.
-        unsafe {
-            ffi::gemm_bf16_f32_cuda(
-                wkv as *const ffi::Half,
-                x as *const ffi::Half,
-                kv as *mut f32,
-                width as i32,
-                token_count as i32,
-                hidden.hidden_dim as i32,
-                ctx.stream.cu_stream(),
-            )
-            .result()?;
-            ffi::gemm_bf16_f32_cuda(
-                wgate as *const ffi::Half,
-                x as *const ffi::Half,
-                score as *mut f32,
-                width as i32,
-                token_count as i32,
-                hidden.hidden_dim as i32,
-                ctx.stream.cu_stream(),
-            )
-            .result()?;
+        let kv_raw = &mut scratch.kv_raw;
+        let score_raw = &mut scratch.score_raw;
+        let pending_kv = &mut state.fp32_pending_kv;
+        let pending_score = &mut state.fp32_pending_score;
+        let prev_kv = &mut state.fp32_prev_kv;
+        let prev_score = &mut state.fp32_prev_score;
+        {
+            let (wkv, _wg0) = probe.wkv.data.device_ptr(&ctx.stream);
+            let (wgate, _wg1) = probe.wgate.data.device_ptr(&ctx.stream);
+            let (x, _xg) = hidden.data.device_ptr(&ctx.stream);
+            let (kv, _kg) = kv_raw.device_ptr_mut(&ctx.stream);
+            let (score, _sg) = score_raw.device_ptr_mut(&ctx.stream);
+            // SAFETY: dense BF16 matrices and outputs match the checked M/N/K shapes.
+            unsafe {
+                ffi::gemm_bf16_f32_cuda(
+                    wkv as *const ffi::Half,
+                    x as *const ffi::Half,
+                    kv as *mut f32,
+                    width as i32,
+                    token_count as i32,
+                    hidden.hidden_dim as i32,
+                    ctx.stream.cu_stream(),
+                )
+                .result()?;
+                ffi::gemm_bf16_f32_cuda(
+                    wgate as *const ffi::Half,
+                    x as *const ffi::Half,
+                    score as *mut f32,
+                    width as i32,
+                    token_count as i32,
+                    hidden.hidden_dim as i32,
+                    ctx.stream.cu_stream(),
+                )
+                .result()?;
+            }
         }
-    }
-    let rope = &config.rope_parameters;
-    let (rope_dim, rope_base) = if apply_rope {
-        (config.qk_rope_head_dim, config.compress_rope_theta)
-    } else {
-        (0, config.compress_rope_theta)
-    };
-    let start_pos_i32 = i32::try_from(start_pos)
-        .map_err(|_| anyhow::anyhow!("DSv4 FP32 compressor start_pos {start_pos} exceeds i32"))?;
-    let pending_len = start_pos % ratio;
-    let pending_len_i32 = i32::try_from(pending_len).map_err(|_| {
-        anyhow::anyhow!("DSv4 FP32 compressor pending_len {pending_len} exceeds i32")
+        let rope = &config.rope_parameters;
+        let (rope_dim, rope_base) = if apply_rope {
+            (config.qk_rope_head_dim, config.compress_rope_theta)
+        } else {
+            (0, config.compress_rope_theta)
+        };
+        let start_pos_i32 = i32::try_from(start_pos).map_err(|_| {
+            anyhow::anyhow!("DSv4 FP32 compressor start_pos {start_pos} exceeds i32")
+        })?;
+        let pending_len = start_pos % ratio;
+        let pending_len_i32 = i32::try_from(pending_len).map_err(|_| {
+            anyhow::anyhow!("DSv4 FP32 compressor pending_len {pending_len} exceeds i32")
+        })?;
+        let compressed_base = start_pos / ratio;
+        let compressed_base_i32 = i32::try_from(compressed_base).map_err(|_| {
+            anyhow::anyhow!("DSv4 FP32 compressor compressed_base {compressed_base} exceeds i32")
+        })?;
+        let has_prev_overlap = i32::from(compressed_base > 0);
+        let overlap_page_stride = 0i32;
+        {
+            let (kv, _kg) = kv_raw.device_ptr(&ctx.stream);
+            let (score, _sg) = score_raw.device_ptr(&ctx.stream);
+            let (ape, _ag) = probe.ape.device_ptr(&ctx.stream);
+            let (norm, _ng) = compressor.norm.data.device_ptr(&ctx.stream);
+            let (pkv, _p0) = pending_kv.device_ptr_mut(&ctx.stream);
+            let (psc, _p1) = pending_score.device_ptr_mut(&ctx.stream);
+            let (prkv, _p2) = prev_kv.device_ptr_mut(&ctx.stream);
+            let (prsc, _p3) = prev_score.device_ptr_mut(&ctx.stream);
+            let (prkv_bf16, _p4) = state.prev_overlap_kv.device_ptr_mut(&ctx.stream);
+            let (prsc_bf16, _p5) = state.prev_overlap_score.device_ptr_mut(&ctx.stream);
+            let (pkv_bf16, _p6) = state.pending_kv.device_ptr_mut(&ctx.stream);
+            let (psc_bf16, _p7) = state.pending_score.device_ptr_mut(&ctx.stream);
+            let (compressed, _cg) = state.compressed.data.device_ptr_mut(&ctx.stream);
+            // SAFETY: all buffers match the checked ratio, width, and token count.
+            unsafe {
+                ffi::dsv4_compressor_fp32_prefill_probe_cuda(
+                    kv as *const f32,
+                    score as *const f32,
+                    ape as *const f32,
+                    norm as *const ffi::Half,
+                    pkv as *mut f32,
+                    psc as *mut f32,
+                    prkv as *mut f32,
+                    prsc as *mut f32,
+                    prkv_bf16 as *mut ffi::Half,
+                    prsc_bf16 as *mut ffi::Half,
+                    pkv_bf16 as *mut ffi::Half,
+                    psc_bf16 as *mut ffi::Half,
+                    compressed as *mut ffi::Half,
+                    token_count as i32,
+                    start_pos_i32,
+                    pending_len_i32,
+                    compressed_base_i32,
+                    head_dim as i32,
+                    ratio as i32,
+                    width as i32,
+                    i32::from(overlap),
+                    has_prev_overlap,
+                    overlap_page_stride,
+                    config.rms_norm_eps,
+                    rope_dim as i32,
+                    rope_base,
+                    rope_original_seq_len,
+                    rope.factor,
+                    rope.beta_fast,
+                    rope.beta_slow,
+                    ctx.stream.cu_stream(),
+                )
+                .result()?;
+            }
+        }
+        state.compressed.seq_len = compressed_rows;
+        Ok(())
     })?;
-    let compressed_base = start_pos / ratio;
-    let compressed_base_i32 = i32::try_from(compressed_base).map_err(|_| {
-        anyhow::anyhow!("DSv4 FP32 compressor compressed_base {compressed_base} exceeds i32")
-    })?;
-    let has_prev_overlap = i32::from(compressed_base > 0);
-    let overlap_page_stride = 0i32;
-    {
-        let (kv, _kg) = kv_raw.device_ptr(&ctx.stream);
-        let (score, _sg) = score_raw.device_ptr(&ctx.stream);
-        let (ape, _ag) = probe.ape.device_ptr(&ctx.stream);
-        let (norm, _ng) = compressor.norm.data.device_ptr(&ctx.stream);
-        let (pkv, _p0) = pending_kv.device_ptr_mut(&ctx.stream);
-        let (psc, _p1) = pending_score.device_ptr_mut(&ctx.stream);
-        let (prkv, _p2) = prev_kv.device_ptr_mut(&ctx.stream);
-        let (prsc, _p3) = prev_score.device_ptr_mut(&ctx.stream);
-        let (prkv_bf16, _p4) = state.prev_overlap_kv.device_ptr_mut(&ctx.stream);
-        let (prsc_bf16, _p5) = state.prev_overlap_score.device_ptr_mut(&ctx.stream);
-        let (pkv_bf16, _p6) = state.pending_kv.device_ptr_mut(&ctx.stream);
-        let (psc_bf16, _p7) = state.pending_score.device_ptr_mut(&ctx.stream);
-        let (compressed, _cg) = state.compressed.data.device_ptr_mut(&ctx.stream);
-        // SAFETY: all buffers match the checked ratio, width, and token count.
-        unsafe {
-            ffi::dsv4_compressor_fp32_prefill_probe_cuda(
-                kv as *const f32,
-                score as *const f32,
-                ape as *const f32,
-                norm as *const ffi::Half,
-                pkv as *mut f32,
-                psc as *mut f32,
-                prkv as *mut f32,
-                prsc as *mut f32,
-                prkv_bf16 as *mut ffi::Half,
-                prsc_bf16 as *mut ffi::Half,
-                pkv_bf16 as *mut ffi::Half,
-                psc_bf16 as *mut ffi::Half,
-                compressed as *mut ffi::Half,
-                token_count as i32,
-                start_pos_i32,
-                pending_len_i32,
-                compressed_base_i32,
-                head_dim as i32,
-                ratio as i32,
-                width as i32,
-                i32::from(overlap),
-                has_prev_overlap,
-                overlap_page_stride,
-                config.rms_norm_eps,
-                rope_dim as i32,
-                rope_base,
-                rope_original_seq_len,
-                rope.factor,
-                rope.beta_fast,
-                rope.beta_slow,
-                ctx.stream.cu_stream(),
-            )
-            .result()?;
-        }
-    }
-    state.compressed.seq_len = compressed_rows;
     Ok(())
 }
 
@@ -8058,19 +8157,19 @@ fn compressor_forward(
         None => {
             // SAFETY: dsv4_linear writes the full compressor kv buffer.
             let mut kv = unsafe { HiddenStates::uninit(ctx, width, token_count)? };
-            let nvtx_compressor_wkv = crate::nvtx::range("dsv4/linear/compressor_wkv");
-            crate::linear_profile::profile(ctx, "dsv4/linear/compressor_wkv", || {
-                dsv4_linear(ctx, &compressor.wkv, hidden, &mut kv)
+            crate::profile::profile_op(ctx, "linear/compressor_wkv", None, token_count, || {
+                crate::linear_profile::profile(ctx, "dsv4/linear/compressor_wkv", || {
+                    dsv4_linear(ctx, &compressor.wkv, hidden, &mut kv)
+                })
             })?;
-            drop(nvtx_compressor_wkv);
             keepalive.keep_hidden(&kv);
             // SAFETY: dsv4_linear writes the full compressor score buffer.
             let mut score = unsafe { HiddenStates::uninit(ctx, width, token_count)? };
-            let nvtx_compressor_wgate = crate::nvtx::range("dsv4/linear/compressor_wgate");
-            crate::linear_profile::profile(ctx, "dsv4/linear/compressor_wgate", || {
-                dsv4_linear(ctx, &compressor.wgate, hidden, &mut score)
+            crate::profile::profile_op(ctx, "linear/compressor_wgate", None, token_count, || {
+                crate::linear_profile::profile(ctx, "dsv4/linear/compressor_wgate", || {
+                    dsv4_linear(ctx, &compressor.wgate, hidden, &mut score)
+                })
             })?;
-            drop(nvtx_compressor_wgate);
             keepalive.keep_hidden(&score);
             (
                 owned_kv.insert(kv) as &HiddenStates,
@@ -8256,33 +8355,33 @@ pub(crate) fn compressor_batch_prepass(
     );
     // SAFETY: dsv4_linear writes the full output buffer.
     let mut kv_raw_batch = unsafe { HiddenStates::uninit(ctx, width, n)? };
-    let nvtx_wkv = crate::nvtx::range("dsv4/linear/compressor_wkv_batched");
-    crate::linear_profile::profile(ctx, "dsv4/linear/compressor_wkv_batched", || {
-        proj_batched(
-            ctx,
-            &compressor.wkv,
-            compressor.wkv_deepgemm.as_ref(),
-            scratch.as_deref_mut(),
-            normed_batch,
-            &mut kv_raw_batch,
-        )
+    crate::profile::profile_op(ctx, "linear/compressor_wkv_batched", None, n, || {
+        crate::linear_profile::profile(ctx, "dsv4/linear/compressor_wkv_batched", || {
+            proj_batched(
+                ctx,
+                &compressor.wkv,
+                compressor.wkv_deepgemm.as_ref(),
+                scratch.as_deref_mut(),
+                normed_batch,
+                &mut kv_raw_batch,
+            )
+        })
     })?;
-    drop(nvtx_wkv);
     keepalive.keep_hidden(&kv_raw_batch);
     // SAFETY: dsv4_linear writes the full output buffer.
     let mut score_raw_batch = unsafe { HiddenStates::uninit(ctx, width, n)? };
-    let nvtx_wgate = crate::nvtx::range("dsv4/linear/compressor_wgate_batched");
-    crate::linear_profile::profile(ctx, "dsv4/linear/compressor_wgate_batched", || {
-        proj_batched(
-            ctx,
-            &compressor.wgate,
-            compressor.wgate_deepgemm.as_ref(),
-            scratch,
-            normed_batch,
-            &mut score_raw_batch,
-        )
+    crate::profile::profile_op(ctx, "linear/compressor_wgate_batched", None, n, || {
+        crate::linear_profile::profile(ctx, "dsv4/linear/compressor_wgate_batched", || {
+            proj_batched(
+                ctx,
+                &compressor.wgate,
+                compressor.wgate_deepgemm.as_ref(),
+                scratch,
+                normed_batch,
+                &mut score_raw_batch,
+            )
+        })
     })?;
-    drop(nvtx_wgate);
     keepalive.keep_hidden(&score_raw_batch);
     Ok(Some((kv_raw_batch, score_raw_batch)))
 }
@@ -8332,33 +8431,33 @@ pub(crate) fn indexer_query_batch_prepass(
     );
     // SAFETY: dsv4_linear writes the full output buffer.
     let mut q_i_batch = unsafe { HiddenStates::uninit(ctx, indexer.wq_b.rows, n)? };
-    let nvtx_wq_b = crate::nvtx::range("dsv4/linear/indexer_wq_b_batched");
-    crate::linear_profile::profile(ctx, "dsv4/linear/indexer_wq_b_batched", || {
-        proj_batched(
-            ctx,
-            &indexer.wq_b,
-            indexer.wq_b_deepgemm.as_ref(),
-            scratch.as_deref_mut(),
-            c_q_normed_batch,
-            &mut q_i_batch,
-        )
+    crate::profile::profile_op(ctx, "linear/indexer_wq_b_batched", None, n, || {
+        crate::linear_profile::profile(ctx, "dsv4/linear/indexer_wq_b_batched", || {
+            proj_batched(
+                ctx,
+                &indexer.wq_b,
+                indexer.wq_b_deepgemm.as_ref(),
+                scratch.as_deref_mut(),
+                c_q_normed_batch,
+                &mut q_i_batch,
+            )
+        })
     })?;
-    drop(nvtx_wq_b);
     keepalive.keep_hidden(&q_i_batch);
     // SAFETY: dsv4_linear writes the full output buffer.
     let mut weights_batch = unsafe { HiddenStates::uninit(ctx, indexer.weights_proj.rows, n)? };
-    let nvtx_weights = crate::nvtx::range("dsv4/linear/indexer_weights_batched");
-    crate::linear_profile::profile(ctx, "dsv4/linear/indexer_weights_batched", || {
-        proj_batched(
-            ctx,
-            &indexer.weights_proj,
-            indexer.weights_proj_deepgemm.as_ref(),
-            scratch,
-            normed_batch,
-            &mut weights_batch,
-        )
+    crate::profile::profile_op(ctx, "linear/indexer_weights_batched", None, n, || {
+        crate::linear_profile::profile(ctx, "dsv4/linear/indexer_weights_batched", || {
+            proj_batched(
+                ctx,
+                &indexer.weights_proj,
+                indexer.weights_proj_deepgemm.as_ref(),
+                scratch,
+                normed_batch,
+                &mut weights_batch,
+            )
+        })
     })?;
-    drop(nvtx_weights);
     keepalive.keep_hidden(&weights_batch);
     Ok((q_i_batch, weights_batch))
 }
@@ -9142,37 +9241,37 @@ fn csa_select(
     } else {
         // SAFETY: dsv4_linear writes the full index-query buffer.
         let mut q_i = unsafe { HiddenStates::uninit(ctx, indexer.wq_b.rows, c_q_normed.seq_len)? };
-        let nvtx_indexer_wq_b = crate::nvtx::range("dsv4/linear/indexer_wq_b");
-        // Prefill index-query (M=token_count) → DeepGEMM, off the scalar fp8_gemv (the #1
-        // remaining projection at M=1024). Decode (seq_len==1) / no-cache stays scalar.
-        let indexer_wq_b_dg = c_q_normed.seq_len > 1
-            && dsv4_prefill_indexer_deepgemm_enabled()
-            && indexer.wq_b_deepgemm.is_some()
-            && prefill_scratch.is_some();
-        if indexer_wq_b_dg {
-            let cache = indexer
-                .wq_b_deepgemm
-                .as_ref()
-                .expect("indexer wq_b dg gate checked");
-            let scratch = prefill_scratch.expect("indexer wq_b dg gate checked");
-            crate::linear_profile::profile(ctx, "dsv4/linear/indexer_wq_b", || {
-                prefill_proj_deepgemm(ctx, scratch, cache, c_q_normed, &mut q_i)
-            })?;
-        } else {
-            crate::linear_profile::profile(ctx, "dsv4/linear/indexer_wq_b", || {
-                dsv4_linear(ctx, &indexer.wq_b, c_q_normed, &mut q_i)
-            })?;
-        }
-        drop(nvtx_indexer_wq_b);
+        crate::profile::profile_op(ctx, "linear/indexer_wq_b", None, c_q_normed.seq_len, || {
+            // Prefill index-query (M=token_count) → DeepGEMM, off the scalar fp8_gemv (the #1
+            // remaining projection at M=1024). Decode (seq_len==1) / no-cache stays scalar.
+            let indexer_wq_b_dg = c_q_normed.seq_len > 1
+                && dsv4_prefill_indexer_deepgemm_enabled()
+                && indexer.wq_b_deepgemm.is_some()
+                && prefill_scratch.is_some();
+            if indexer_wq_b_dg {
+                let cache = indexer
+                    .wq_b_deepgemm
+                    .as_ref()
+                    .expect("indexer wq_b dg gate checked");
+                let scratch = prefill_scratch.expect("indexer wq_b dg gate checked");
+                crate::linear_profile::profile(ctx, "dsv4/linear/indexer_wq_b", || {
+                    prefill_proj_deepgemm(ctx, scratch, cache, c_q_normed, &mut q_i)
+                })
+            } else {
+                crate::linear_profile::profile(ctx, "dsv4/linear/indexer_wq_b", || {
+                    dsv4_linear(ctx, &indexer.wq_b, c_q_normed, &mut q_i)
+                })
+            }
+        })?;
         keepalive.keep_hidden(&q_i);
         // SAFETY: dsv4_linear writes the full index-weight buffer.
         let mut weights =
             unsafe { HiddenStates::uninit(ctx, indexer.weights_proj.rows, hidden.seq_len)? };
-        let nvtx_indexer_weights = crate::nvtx::range("dsv4/linear/indexer_weights");
-        crate::linear_profile::profile(ctx, "dsv4/linear/indexer_weights", || {
-            dsv4_linear(ctx, &indexer.weights_proj, hidden, &mut weights)
+        crate::profile::profile_op(ctx, "linear/indexer_weights", None, hidden.seq_len, || {
+            crate::linear_profile::profile(ctx, "dsv4/linear/indexer_weights", || {
+                dsv4_linear(ctx, &indexer.weights_proj, hidden, &mut weights)
+            })
         })?;
-        drop(nvtx_indexer_weights);
         keepalive.keep_hidden(&weights);
         (Some(q_i), Some(weights))
     };

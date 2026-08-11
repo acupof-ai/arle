@@ -394,6 +394,7 @@ fn run_lockstep_driver(
                 let system = engine.kv_system_metrics();
                 let spec = engine.spec_decode_stats();
                 let operator_dispatch = engine.operator_dispatch_stats();
+                let op_timing = engine.op_timing_stats();
                 let artifact = engine.artifact_identity();
                 let data = WireStats {
                     build_identity: infer_api::build_identity(artifact),
@@ -470,6 +471,7 @@ fn run_lockstep_driver(
                     spec_rejected: spec.rejected,
                     spec_partial_ctx_chains: spec.partial_ctx_chains,
                     operator_dispatch,
+                    op_timing,
                 };
                 if let Err(e) = relay.send(&RelayEnvelope::StatsResponse {
                     request_id,
