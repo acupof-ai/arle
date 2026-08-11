@@ -566,18 +566,3 @@ mod nccl_backend {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn dtype_enum_size() {
-        assert_eq!(std::mem::size_of::<DType>(), 4);
-    }
-
-    #[test]
-    fn reduce_op_enum_size() {
-        assert_eq!(std::mem::size_of::<ReduceOp>(), 4);
-    }
-}

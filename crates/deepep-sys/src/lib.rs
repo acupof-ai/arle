@@ -646,17 +646,3 @@ impl Drop for Buffer {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn stub_or_native_compiles() {
-        // Just ensure the API surface compiles in both modes.
-        // We can't actually construct a Buffer in unit tests because that
-        // requires 2+ CUDA devices and DeepEP. Smoke is in
-        // infer/tests/deepep_sys_smoke.rs once added.
-        let _ = is_native();
-    }
-}

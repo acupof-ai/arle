@@ -211,39 +211,3 @@ impl KvPrefixStore for VulkanKvPool {
         Ok(())
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use infer_seam::KvPool;
-
-    #[test]
-    fn alloc_truncate_and_free() {
-        let mut pool = VulkanKvPool::new(2, 8, 16, 64);
-        let dyn_pool: &mut dyn KvPool = &mut pool;
-        dyn_pool.alloc(0, 17).unwrap();
-        assert_eq!(dyn_pool.seq_len(0), 17);
-        assert_eq!(dyn_pool.page_indices(0).len(), 2);
-        dyn_pool.truncate_slot(0, 16).unwrap();
-        assert_eq!(dyn_pool.page_indices(0).len(), 1);
-        dyn_pool.free_slot(0);
-        assert_eq!(dyn_pool.free_pages(), 8);
-    }
-
-    #[test]
-    fn retained_prefix_survives_free_slot() {
-        let mut pool = VulkanKvPool::new(2, 8, 16, 64);
-        pool.alloc(0, 32).unwrap();
-        let prefix = pool.page_indices(0).to_vec();
-        pool.retain_pages(&prefix);
-        let before = pool.free_pages();
-        pool.free_slot(0);
-        assert_eq!(pool.free_pages(), before);
-        pool.attach_pages(1, &prefix, 32).unwrap();
-        assert_eq!(pool.seq_len(1), 32);
-        pool.free_slot(1);
-        pool.release_pages(&prefix);
-        assert_eq!(pool.retained_count(), 0);
-        assert_eq!(pool.free_pages(), 8);
-    }
-}

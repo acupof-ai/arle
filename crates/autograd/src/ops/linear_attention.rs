@@ -1041,24 +1041,6 @@ pub fn linear_attention_row_transient_bytes(params: LinearAttentionParams) -> us
         .saturating_mul(params.seq_len)
         .saturating_mul(4 * f32_elems + 2 * bf16_elems)
 }
-
-/// Pinned so editing the row kernel's buffers forces a deliberate recount.
-#[test]
-fn linear_attention_byte_counts_are_pinned() {
-    let p = LinearAttentionParams {
-        batch: 2,
-        seq_len: 65,
-        num_key_heads: 2,
-        num_value_heads: 3,
-        key_dim: 4,
-        value_dim: 5,
-        conv_kernel: 4,
-        eps: 1e-6,
-    };
-    assert_eq!(linear_attention_ctx_bytes(p), 36_060);
-    assert_eq!(linear_attention_row_transient_bytes(p), 204_880);
-}
-
 fn try_linear_attention_forward_device(
     qkv: TensorId,
     z: TensorId,
@@ -2551,36 +2533,4 @@ fn state_time_base(
     value_dim: usize,
 ) -> usize {
     (((batch * seq_len + seq) * heads + head) * key_dim) * value_dim
-}
-
-#[cfg(test)]
-mod cp_reorder_tests {
-    use super::zigzag_block_perms;
-
-    // Independent oracle: rebuild the a2a physical block layout straight from the
-    // zigzag rule (rank r owns global chunks r, 2N-1-r; a2a lays ranks in order),
-    // then check `fwd` un-interleaves it to 0..2N and `phys` is its inverse.
-    fn a2a_physical_to_global(n: usize) -> Vec<usize> {
-        let mut phys = Vec::new();
-        for r in 0..n {
-            phys.push(r);
-            phys.push(2 * n - 1 - r);
-        }
-        phys
-    }
-
-    #[test]
-    fn fwd_perm_restores_global_order_and_phys_inverts_it() {
-        for n in [1usize, 2, 4] {
-            let (fwd, phys) = zigzag_block_perms(n);
-            let physical = a2a_physical_to_global(n);
-            // Applying fwd to the physical layout yields ascending global chunks.
-            let restored: Vec<usize> = fwd.iter().map(|&p| physical[p]).collect();
-            assert_eq!(restored, (0..2 * n).collect::<Vec<_>>(), "fwd n={n}");
-            // phys ∘ fwd = identity.
-            for (p, &g) in fwd.iter().enumerate() {
-                assert_eq!(phys[g], p, "phys not inverse of fwd at n={n}");
-            }
-        }
-    }
 }

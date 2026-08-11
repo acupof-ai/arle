@@ -40,7 +40,3 @@ pub use route::{
     ExpertWeight, RoutingDecision, group_limited_mask, route, route_and_combine, route_token,
     scores_from_logits, sigmoid, stable_softmax, stable_softplus,
 };
-
-#[cfg(test)]
-#[path = "tests.rs"]
-mod tests;

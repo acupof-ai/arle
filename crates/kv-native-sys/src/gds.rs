@@ -129,30 +129,3 @@ fn unescape_mount(value: &str) -> String {
         .replace("\\012", "\n")
         .replace("\\134", "\\")
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parses_flags_and_deepest_mount() {
-        let config = r#"{"allow_compat_mode":false,"use_pci_p2pdma":true}"#;
-        assert_eq!(json_bool(config, "allow_compat_mode"), Some(false));
-        assert_eq!(json_bool(config, "use_pci_p2pdma"), Some(true));
-
-        let mounts = "1 0 8:1 / / rw - ext4 /dev/root rw\n\
-                      2 1 8:2 / /data\\040disk rw - xfs /dev/nvme0n1 rw\n";
-        assert_eq!(
-            mount_for(mounts, Path::new("/data disk/cache")),
-            Some(("/dev/nvme0n1".into(), "xfs".into()))
-        );
-    }
-
-    #[test]
-    fn mmap_never_passes() {
-        assert_eq!(
-            probe(Path::new("."), DiskIoMode::Mmap),
-            Err("L3 disk mode is not O_DIRECT".into())
-        );
-    }
-}

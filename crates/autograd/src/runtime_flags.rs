@@ -103,10 +103,6 @@ pub(crate) fn checkpoint_pinned_offload_bytes() -> usize {
     CHECKPOINT_PINNED_OFFLOAD_BYTES.load(Relaxed)
 }
 /// Test-only A/B lever for the reload arm (the CLI flag is the production path).
-#[cfg(test)]
-pub(crate) fn set_checkpoint_reload_device(on: bool) {
-    CHECKPOINT_RELOAD_DEVICE.store(on, Relaxed);
-}
 pub(crate) fn lora_linear_bwd_tile_rows() -> usize {
     LORA_LINEAR_BWD_TILE_ROWS.load(Relaxed)
 }

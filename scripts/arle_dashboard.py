@@ -68,6 +68,15 @@ def _poll_loop():
             dec_us = tp.get("decode_forward_busy_micros", 0)
             decode_rate = dec_tokens / (dec_us / 1e6) if dec_us else 0
             spec = stats.get("spec_decode", {})
+            succ = tp.get("requests_succeeded", 0)
+            fail = tp.get("requests_failed", 0)
+            success_rate = (succ / (succ + fail) * 100) if (succ + fail) else 0
+            ttft_total = tp.get("ttft_micros_total", 0)
+            ttft_cnt = tp.get("ttft_count", 0)
+            tpot_total = tp.get("tpot_micros_total", 0)
+            tpot_cnt = tp.get("tpot_count", 0)
+            e2e_total = tp.get("e2e_micros_total", 0)
+            e2e_cnt = tp.get("e2e_count", 0)
             with _lock:
                 _cache["stats"] = stats
                 _cache["gpu"] = gpu
@@ -81,6 +90,10 @@ def _poll_loop():
                     "gpu_util": gpu.get("gpu_util", 0),
                     "mem_used": gpu.get("mem_used", 0),
                     "power": gpu.get("power", 0),
+                    "ttft_ms": (ttft_total / ttft_cnt / 1000) if ttft_cnt else 0,
+                    "tpot_ms": (tpot_total / tpot_cnt / 1000) if tpot_cnt else 0,
+                    "e2e_ms": (e2e_total / e2e_cnt / 1000) if e2e_cnt else 0,
+                    "success_rate": success_rate,
                 })
         except Exception:
             pass
@@ -133,6 +146,10 @@ td:first-child { color: #888; }
   <div class="card"><div class="label">GPU Memory</div><div class="value yellow" id="gpumem">—</div></div>
   <div class="card"><div class="label">Power</div><div class="value" id="power">—</div><div style="font-size:11px;color:#888">W</div></div>
   <div class="card"><div class="label">DSpark</div><div class="value" id="dspark">—</div></div>
+  <div class="card"><div class="label">TTFT (avg)</div><div class="value blue" id="ttft">—</div><div style="font-size:11px;color:#888">ms</div></div>
+  <div class="card"><div class="label">TPOT (avg)</div><div class="value green" id="tpot">—</div><div style="font-size:11px;color:#888">ms</div></div>
+  <div class="card"><div class="label">E2E Latency</div><div class="value purple" id="e2e">—</div><div style="font-size:11px;color:#888">ms</div></div>
+  <div class="card"><div class="label">Success Rate</div><div class="value" id="success">—</div><div style="font-size:11px;color:#888">%</div></div>
 </div>
 <div class="charts">
   <div class="chart-box"><h3>Decode Rate (tok/s)</h3><div class="chart-wrap"><canvas id="cRate"></canvas></div></div>
@@ -144,6 +161,7 @@ td:first-child { color: #888; }
   <div class="chart-box"><h3>GPU Power (W)</h3><div class="chart-wrap"><canvas id="cPower"></canvas></div></div>
   <div class="chart-box"><h3>Per-Op CUDA Time (ms)</h3><div class="chart-wrap" style="height:240px"><canvas id="cOpTiming"></canvas></div></div>
   <div class="chart-box"><h3>Per-Op Time Share</h3><div class="chart-wrap" style="height:240px"><canvas id="cOpShare"></canvas></div></div>
+  <div class="chart-box"><h3>Latency (ms)</h3><div class="chart-wrap"><canvas id="cLatency"></canvas></div></div>
 </div>
 <table id="kv"></table>
 <script>
@@ -176,6 +194,17 @@ const charts = {
     data: { labels: [], datasets: [{ data: [], backgroundColor: ['#82aaff','#c792ea','#7ec699','#ffcb6b','#f07178','#89ddff','#ff9cac','#c3e88d','#546e7a'], borderWidth: 1, borderColor: '#1a1a1a' }] },
     options: { responsive: true, maintainAspectRatio: false, animation: false, cutout: '60%',
       plugins: { legend: { position: 'right', labels: { color: '#ccc', font: { size: 11 }, boxWidth: 12 } } } }
+  }),
+  latency: new Chart(document.getElementById('cLatency'), {
+    type: 'line',
+    data: { labels: [], datasets: [
+      { label: 'TTFT', data: [], borderColor: '#82aaff', backgroundColor: '#82aaff20', borderWidth: 2, tension: 0.3, pointRadius: 0, fill: false },
+      { label: 'TPOT', data: [], borderColor: '#7ec699', backgroundColor: '#7ec69920', borderWidth: 2, tension: 0.3, pointRadius: 0, fill: false },
+      { label: 'E2E', data: [], borderColor: '#c792ea', backgroundColor: '#c792ea20', borderWidth: 2, tension: 0.3, pointRadius: 0, fill: false },
+    ] },
+    options: { responsive: true, maintainAspectRatio: false, animation: false,
+      plugins: { legend: { labels: { color: '#ccc', font: { size: 11 } } } },
+      scales: { x: { display: false }, y: { grid: { color: '#222' }, ticks: { color: '#888' }, suggestedMin: 0 } } }
   }),
 };
 async function tick() {
@@ -213,6 +242,21 @@ async function tick() {
   dsEl.className = 'value ' + (spec.available ? 'green' : 'red');
   if (spec.available && spec.accept_rate != null)
     dsEl.textContent += ' (' + (spec.accept_rate*100).toFixed(0) + '%)';
+  const ttftTotal = tp.ttft_micros_total ?? 0;
+  const ttftCnt = tp.ttft_count ?? 0;
+  const tpotTotal = tp.tpot_micros_total ?? 0;
+  const tpotCnt = tp.tpot_count ?? 0;
+  const e2eTotal = tp.e2e_micros_total ?? 0;
+  const e2eCnt = tp.e2e_count ?? 0;
+  const succ = tp.requests_succeeded ?? 0;
+  const fail = tp.requests_failed ?? 0;
+  document.getElementById('ttft').textContent = ttftCnt ? (ttftTotal / ttftCnt / 1000).toFixed(1) : '—';
+  document.getElementById('tpot').textContent = tpotCnt ? (tpotTotal / tpotCnt / 1000).toFixed(2) : '—';
+  document.getElementById('e2e').textContent = e2eCnt ? (e2eTotal / e2eCnt / 1000).toFixed(1) : '—';
+  const succRate = (succ + fail) ? (succ / (succ + fail) * 100) : null;
+  const succEl = document.getElementById('success');
+  succEl.textContent = succRate != null ? succRate.toFixed(1) + '%' : '—';
+  succEl.className = 'value ' + (succRate != null && succRate >= 99 ? 'green' : succRate != null ? 'yellow' : '');
   if (h.length) {
     const setData = (c, mapper) => {
       c.data.labels = h.map(() => '');
@@ -240,6 +284,11 @@ async function tick() {
     charts.opShare.data.labels = shareLabels;
     charts.opShare.data.datasets[0].data = shareData;
     charts.opShare.update('none');
+    charts.latency.data.labels = h.map(() => '');
+    charts.latency.data.datasets[0].data = h.map(p => p.ttft_ms || 0);
+    charts.latency.data.datasets[1].data = h.map(p => p.tpot_ms || 0);
+    charts.latency.data.datasets[2].data = h.map(p => p.e2e_ms || 0);
+    charts.latency.update('none');
   }
   const rows = [
     ['KV resident (GPU)', kv.resident_pages ?? 0],
