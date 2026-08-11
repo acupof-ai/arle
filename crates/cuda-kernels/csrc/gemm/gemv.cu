@@ -69,6 +69,14 @@ __global__ void gemv_handwritten_kernel(
   int K_tail = K - K4 * 4;  // remainder for scalar fallback
   bool use_bf16x8 = (K % 8) == 0;
 
+  // x_shared is laid out as chunks of GEMV_BLOCK vector elements, each padded
+  // by 1 element so the inter-chunk stride (GEMV_BLOCK+1) is coprime with 32.
+  // Without this, elements GEMV_BLOCK apart alias the same SM banks, and the
+  // 4-way unrolled accumulators all contend for the same banks.
+  int chunks_4 = (K4 + GEMV_BLOCK - 1) / GEMV_BLOCK;
+  // Tail (scalar remainder) sits after the padded uint2 array.
+  int tail_bf16_offset = chunks_4 * (GEMV_BLOCK + 1) * 4; // uint2 -> 4 bf16
+
   float sums[GEMV_ROWS_PER_BLOCK];
   #pragma unroll
   for (int r = 0; r < GEMV_ROWS_PER_BLOCK; r++) sums[r] = 0.0f;
@@ -77,18 +85,21 @@ __global__ void gemv_handwritten_kernel(
     const uint4 *x_vec8 = reinterpret_cast<const uint4 *>(x);
     uint4 *x_shared_vec8 = reinterpret_cast<uint4 *>(x_shared);
     for (int k8 = tid; k8 < K8; k8 += GEMV_BLOCK) {
-      x_shared_vec8[k8] = x_vec8[k8];
+      int p = k8 + (k8 >> 8); // padded index: 1 padding uint4 per 256-elem chunk
+      x_shared_vec8[p] = x_vec8[k8];
     }
   } else {
     const uint2 *x_vec4 = reinterpret_cast<const uint2 *>(x);
     uint2 *x_shared_vec4 = reinterpret_cast<uint2 *>(x_shared);
     for (int k4 = tid; k4 < K4; k4 += GEMV_BLOCK) {
-      x_shared_vec4[k4] = x_vec4[k4];
+      int p = k4 + (k4 >> 8); // padded index: 1 padding uint2 per 256-elem chunk
+      x_shared_vec4[p] = x_vec4[k4];
     }
     if (K_tail > 0) {
+      __nv_bfloat16 *x_tail = x_shared + tail_bf16_offset;
       int k_start = K4 * 4;
       for (int k = k_start + tid; k < K; k += GEMV_BLOCK) {
-        x_shared[k] = x[k];
+        x_tail[k - k_start] = x[k];
       }
     }
   }
@@ -98,27 +109,56 @@ __global__ void gemv_handwritten_kernel(
   for (int r = 0; r < GEMV_ROWS_PER_BLOCK; r++) {
     int row = row_base + r;
     if (row < M) {
-      float sum = 0.0f;
+      // 4 independent accumulators to expose ILP; the FMA chain latency is
+      // hidden by issuing 4 independent loads+FMAs per iteration.
+      float sum0 = 0.0f, sum1 = 0.0f, sum2 = 0.0f, sum3 = 0.0f;
 
       if (use_bf16x8) {
         const uint4 *A_row_vec8 = reinterpret_cast<const uint4 *>(A + row * K);
         const uint4 *x_shared_vec8 = reinterpret_cast<const uint4 *>(x_shared);
-        for (int k8 = tid; k8 < K8; k8 += GEMV_BLOCK) {
-          sum += bf16x8_dot(A_row_vec8[k8], x_shared_vec8[k8]);
+        int k8 = tid;
+        for (; k8 + 3 * GEMV_BLOCK < K8; k8 += 4 * GEMV_BLOCK) {
+          int p = k8 + (k8 >> 8);
+          sum0 += bf16x8_dot(A_row_vec8[k8], x_shared_vec8[p]);
+          sum1 += bf16x8_dot(A_row_vec8[k8 + GEMV_BLOCK],
+                             x_shared_vec8[p + GEMV_BLOCK + 1]);
+          sum2 += bf16x8_dot(A_row_vec8[k8 + 2 * GEMV_BLOCK],
+                             x_shared_vec8[p + 2 * (GEMV_BLOCK + 1)]);
+          sum3 += bf16x8_dot(A_row_vec8[k8 + 3 * GEMV_BLOCK],
+                             x_shared_vec8[p + 3 * (GEMV_BLOCK + 1)]);
+        }
+        for (; k8 < K8; k8 += GEMV_BLOCK) {
+          int p = k8 + (k8 >> 8);
+          sum0 += bf16x8_dot(A_row_vec8[k8], x_shared_vec8[p]);
         }
       } else {
         const uint2 *A_row_vec4 = reinterpret_cast<const uint2 *>(A + row * K);
         const uint2 *x_shared_vec4 = reinterpret_cast<const uint2 *>(x_shared);
-        for (int k4 = tid; k4 < K4; k4 += GEMV_BLOCK) {
-          sum += bf16x4_dot(A_row_vec4[k4], x_shared_vec4[k4]);
+        int k4 = tid;
+        for (; k4 + 3 * GEMV_BLOCK < K4; k4 += 4 * GEMV_BLOCK) {
+          int p = k4 + (k4 >> 8);
+          sum0 += bf16x4_dot(A_row_vec4[k4], x_shared_vec4[p]);
+          sum1 += bf16x4_dot(A_row_vec4[k4 + GEMV_BLOCK],
+                             x_shared_vec4[p + GEMV_BLOCK + 1]);
+          sum2 += bf16x4_dot(A_row_vec4[k4 + 2 * GEMV_BLOCK],
+                             x_shared_vec4[p + 2 * (GEMV_BLOCK + 1)]);
+          sum3 += bf16x4_dot(A_row_vec4[k4 + 3 * GEMV_BLOCK],
+                             x_shared_vec4[p + 3 * (GEMV_BLOCK + 1)]);
+        }
+        for (; k4 < K4; k4 += GEMV_BLOCK) {
+          int p = k4 + (k4 >> 8);
+          sum0 += bf16x4_dot(A_row_vec4[k4], x_shared_vec4[p]);
         }
       }
 
+      float sum = sum0 + sum1 + sum2 + sum3;
+
       if (K_tail > 0) {
         const __nv_bfloat16 *A_row = A + row * K;
+        __nv_bfloat16 *x_tail = x_shared + tail_bf16_offset;
         int k_start = K4 * 4;
         for (int k = k_start + tid; k < K; k += GEMV_BLOCK) {
-          sum += __bfloat162float(A_row[k]) * __bfloat162float(x_shared[k]);
+          sum += __bfloat162float(A_row[k]) * __bfloat162float(x_tail[k - k_start]);
         }
       }
 
@@ -767,7 +807,18 @@ void cublas_destroy() {
 cudaError_t gemv_cuda(const __nv_bfloat16 *A, const __nv_bfloat16 *x, __nv_bfloat16 *y, int M, int K,
                cudaStream_t stream) {
   int num_blocks = (M + GEMV_ROWS_PER_BLOCK - 1) / GEMV_ROWS_PER_BLOCK;
-  size_t smem_bytes = static_cast<size_t>(K) * sizeof(__nv_bfloat16);
+  // x_shared is chunk-padded: each GEMV_BLOCK vector elements get +1 padding
+  // element so the inter-chunk stride is coprime with 32 (kills SM bank
+  // aliasing for the 4-way unrolled accumulators).
+  bool use_bf16x8 = (K % 8) == 0;
+  int vec_elems = use_bf16x8 ? (K / 8) : (K / 4);
+  int chunks = (vec_elems + GEMV_BLOCK - 1) / GEMV_BLOCK;
+  size_t vec_size = use_bf16x8 ? sizeof(uint4) : sizeof(uint2);
+  size_t smem_bytes = static_cast<size_t>(chunks) * (GEMV_BLOCK + 1) * vec_size;
+  if (!use_bf16x8) {
+    int K_tail = K - (K / 4) * 4;
+    smem_bytes += static_cast<size_t>(K_tail) * sizeof(__nv_bfloat16);
+  }
   gemv_handwritten_kernel<<<num_blocks, GEMV_BLOCK, smem_bytes, stream>>>(A, x, y, M, K);
     return cudaGetLastError();
 }
