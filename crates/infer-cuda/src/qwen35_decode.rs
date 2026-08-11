@@ -334,6 +334,7 @@ impl Qwen35Model {
         crate::profile::profile_op(&self.ctx, "lm_head_gemm", None, b, || {
             gemm_batch(&self.ctx, self.output_projection(), normed, logits_buf)
         })?;
+        crate::numeric_check::check_numeric(&self.ctx, &logits_buf.data, "qwen35_decode_logits");
 
         // Host seq_len advance: the device state (KV rows, conv rings, GDR
         // states) advanced in-stream above, so the host counters advance here
@@ -593,6 +594,7 @@ impl Qwen35Model {
         crate::profile::profile_op(&self.ctx, "lm_head_gemm", None, b, || {
             gemm_batch(&self.ctx, self.output_projection(), normed, logits_buf)
         })?;
+        crate::numeric_check::check_numeric(&self.ctx, &logits_buf.data, "qwen35_paged_decode_logits");
 
         // Host seq_len advance (device KV/conv/GDR advanced in-stream above).
         for &si in slot_indices {
