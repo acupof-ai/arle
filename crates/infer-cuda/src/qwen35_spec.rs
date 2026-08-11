@@ -26,12 +26,16 @@ impl Qwen35Model {
 
         let token_ids = upload_i32(&self.ctx, &[token as i32])?;
         let mut emb = HiddenStates::zeros(&self.ctx, hidden, 1)?;
-        embedding_batch(&self.ctx, &self.embed_tokens, &token_ids, &mut emb)?;
+        crate::profile::profile_op(&self.ctx, "embedding", None, 1, || {
+            embedding_batch(&self.ctx, &self.embed_tokens, &token_ids, &mut emb)
+        })?;
 
         // Matches the Metal `qwen3_5_mtp` loader order.
         let mut concat = HiddenStates::zeros(&self.ctx, 2 * hidden, 1)?;
         let mut emb_n = HiddenStates::zeros(&self.ctx, hidden, 1)?;
-        rms_norm_offset(&self.ctx, &emb, &mtp.pre_fc_norm_embedding, eps, &mut emb_n)?;
+        crate::profile::profile_op(&self.ctx, "mtp_emb_norm", None, 1, || {
+            rms_norm_offset(&self.ctx, &emb, &mtp.pre_fc_norm_embedding, eps, &mut emb_n)
+        })?;
         {
             let mut dst = concat.data.slice_mut(0..hidden);
             self.ctx
@@ -40,7 +44,9 @@ impl Qwen35Model {
                 .map_err(|e| anyhow!("mtp concat emb half failed: {e}"))?;
         }
         let mut h_n = DeviceVec::zeros(&self.ctx, hidden)?;
-        rms_norm_offset_vec(&self.ctx, h_prev, &mtp.pre_fc_norm_hidden, eps, &mut h_n)?;
+        crate::profile::profile_op(&self.ctx, "mtp_hidden_norm", None, 1, || {
+            rms_norm_offset_vec(&self.ctx, h_prev, &mtp.pre_fc_norm_hidden, eps, &mut h_n)
+        })?;
         {
             let mut dst = concat.data.slice_mut(hidden..2 * hidden);
             self.ctx
@@ -49,7 +55,9 @@ impl Qwen35Model {
                 .map_err(|e| anyhow!("mtp concat hidden half failed: {e}"))?;
         }
         let mut h_fc = HiddenStates::zeros(&self.ctx, hidden, 1)?;
-        gemm_batch(&self.ctx, &mtp.fc, &concat, &mut h_fc)?;
+        crate::profile::profile_op(&self.ctx, "mtp_fc", None, 1, || {
+            gemm_batch(&self.ctx, &mtp.fc, &concat, &mut h_fc)
+        })?;
 
         // Mirrors the trunk layer body.
         let layer = &mtp.layer;
@@ -58,105 +66,130 @@ impl Qwen35Model {
         };
 
         let mut normed = HiddenStates::zeros(&self.ctx, hidden, 1)?;
-        rms_norm_offset(&self.ctx, &h_fc, &layer.input_layernorm, eps, &mut normed)?;
+        crate::profile::profile_op(&self.ctx, "input_norm", None, 1, || {
+            rms_norm_offset(&self.ctx, &h_fc, &layer.input_layernorm, eps, &mut normed)
+        })?;
 
         // level == head-KV row == RoPE position within the draft block.
         let start_pos_dev = upload_i32(&self.ctx, &[level as i32])?;
         let mut attn_out = HiddenStates::zeros(&self.ctx, hidden, 1)?;
-        self.full_attention_into(
-            full_attn,
-            &normed,
-            &mut spec.head_k,
-            &mut spec.head_v,
-            0, // profiling label
-            level,
-            &start_pos_dev,
-            &mut ws.full,
-            &mut attn_out,
-        )?;
+        crate::profile::profile_op(&self.ctx, "full_attention", None, 1, || {
+            self.full_attention_into(
+                full_attn,
+                &normed,
+                &mut spec.head_k,
+                &mut spec.head_v,
+                0, // profiling label
+                level,
+                &start_pos_dev,
+                &mut ws.full,
+                &mut attn_out,
+            )
+        })?;
 
         let mut hidden_mid = HiddenStates::zeros(&self.ctx, hidden, 1)?;
-        add_batch(&self.ctx, &h_fc, &attn_out, &mut hidden_mid)?;
-        rms_norm_offset(
-            &self.ctx,
-            &hidden_mid,
-            &layer.post_attention_layernorm,
-            eps,
-            &mut normed,
-        )?;
+        crate::profile::profile_op(&self.ctx, "post_attn_norm", None, 1, || {
+            add_batch(&self.ctx, &h_fc, &attn_out, &mut hidden_mid)?;
+            rms_norm_offset(
+                &self.ctx,
+                &hidden_mid,
+                &layer.post_attention_layernorm,
+                eps,
+                &mut normed,
+            )
+        })?;
         let mut mlp_out = HiddenStates::zeros(&self.ctx, hidden, 1)?;
         if let Some(moe) = &layer.moe {
             let moe_cfg = self
                 .moe_config
                 .as_ref()
                 .ok_or_else(|| anyhow!("MTP MoE layer but no moe_config"))?;
-            crate::moe::moe_forward_into(
-                &self.ctx,
-                moe,
-                &normed,
-                moe_cfg,
-                &self.expert_split,
-                &mut ws.moe,
-                &mut mlp_out,
-            )?;
+            crate::profile::profile_op(&self.ctx, "moe_ffn", None, 1, || {
+                crate::moe::moe_forward_into(
+                    &self.ctx,
+                    moe,
+                    &normed,
+                    moe_cfg,
+                    &self.expert_split,
+                    &mut ws.moe,
+                    &mut mlp_out,
+                )
+            })?;
         } else {
             let mlp = layer
                 .mlp
                 .as_ref()
                 .ok_or_else(|| anyhow!("MTP head layer missing MLP"))?;
-            self.dense_mlp(mlp, &normed, &mut ws.dense, &mut mlp_out, None)?;
+            crate::profile::profile_op(&self.ctx, "dense_ffn", None, 1, || {
+                self.dense_mlp(mlp, &normed, &mut ws.dense, &mut mlp_out, None)
+            })?;
         }
         let mut h_layer = HiddenStates::zeros(&self.ctx, hidden, 1)?;
-        add_batch(&self.ctx, &hidden_mid, &mlp_out, &mut h_layer)?;
+        crate::profile::profile_op(&self.ctx, "ffn_residual", None, 1, || {
+            add_batch(&self.ctx, &hidden_mid, &mlp_out, &mut h_layer)
+        })?;
 
         // Same weights as the trunk lm_head.
-        rms_norm_offset(&self.ctx, &h_layer, &mtp.norm, eps, &mut normed)?;
+        crate::profile::profile_op(&self.ctx, "final_norm", None, 1, || {
+            rms_norm_offset(&self.ctx, &h_layer, &mtp.norm, eps, &mut normed)
+        })?;
         let vocab = self.output_projection().rows;
         let mut logits = HiddenStates::zeros(&self.ctx, vocab, 1)?;
-        gemm_batch(&self.ctx, self.output_projection(), &normed, &mut logits)?;
+        crate::profile::profile_op(&self.ctx, "lm_head_gemm", None, 1, || {
+            gemm_batch(&self.ctx, self.output_projection(), &normed, &mut logits)
+        })?;
         let logits_vec = DeviceVec {
             data: logits.data,
             len: vocab,
             label: "qwen35_mtp_draft_logits",
         };
         let next = if params.is_greedy() {
-            argmax_into(&self.ctx, &logits_vec, &mut spec.argmax_scratch)?
+            crate::profile::profile_op(&self.ctx, "sample", None, 1, || {
+                argmax_into(&self.ctx, &logits_vec, &mut spec.argmax_scratch)
+            })?
         } else {
-            // Filter + q-row retain + multinomial draw in one device call; the
-            // uniform is the salted (seed, position) stream plain decode would
-            // consume at this position (mirrors the DSpark draft draw).
-            let u =
-                dspark::unit_uniform(params.seed, dspark::SALT_DRAW, (start_pos + level) as u64);
-            let cap = self.spec_draft_tokens.max(1);
-            let q_all = spec.q_probs.get(&self.ctx, cap * vocab)?;
-            let tok_out = spec.sample_tok.get(&self.ctx, 1)?;
-            {
-                let (l_ptr, _gl) = logits_vec.data.device_ptr(&self.ctx.stream);
-                let (q_ptr, _gq) = q_all.device_ptr_mut(&self.ctx.stream);
-                let (t_ptr, _gt) = tok_out.device_ptr_mut(&self.ctx.stream);
-                // SAFETY: logits_vec holds `vocab` bf16; q row `level` < cap
-                // (spec_step's depth guard bounds every level).
-                unsafe {
-                    ffi::dspark_draft_sample_cuda(
-                        l_ptr as *const ffi::Half,
-                        (q_ptr + (level * vocab * 4) as u64) as *mut f32,
-                        t_ptr as *mut i32,
-                        vocab as i32,
-                        1.0 / params.temperature,
-                        params.top_k,
-                        params.top_p,
-                        params.min_p,
-                        u,
-                        self.ctx.stream.cu_stream(),
-                    )
-                    .result()?;
+            crate::profile::profile_op(&self.ctx, "sample", None, 1, || {
+                // Filter + q-row retain + multinomial draw in one device call; the
+                // uniform is the salted (seed, position) stream plain decode would
+                // consume at this position (mirrors the DSpark draft draw).
+                let u = dspark::unit_uniform(
+                    params.seed,
+                    dspark::SALT_DRAW,
+                    (start_pos + level) as u64,
+                );
+                let cap = self.spec_draft_tokens.max(1);
+                let q_all = spec.q_probs.get(&self.ctx, cap * vocab)?;
+                let tok_out = spec.sample_tok.get(&self.ctx, 1)?;
+                {
+                    let (l_ptr, _gl) = logits_vec.data.device_ptr(&self.ctx.stream);
+                    let (q_ptr, _gq) = q_all.device_ptr_mut(&self.ctx.stream);
+                    let (t_ptr, _gt) = tok_out.device_ptr_mut(&self.ctx.stream);
+                    // SAFETY: logits_vec holds `vocab` bf16; q row `level` < cap
+                    // (spec_step's depth guard bounds every level).
+                    unsafe {
+                        ffi::dspark_draft_sample_cuda(
+                            l_ptr as *const ffi::Half,
+                            (q_ptr + (level * vocab * 4) as u64) as *mut f32,
+                            t_ptr as *mut i32,
+                            vocab as i32,
+                            1.0 / params.temperature,
+                            params.top_k,
+                            params.top_p,
+                            params.min_p,
+                            u,
+                            self.ctx.stream.cu_stream(),
+                        )
+                        .result()?;
+                    }
                 }
-            }
-            self.ctx.sync()?;
-            self.ctx
-                .stream
-                .clone_dtoh(tok_out)
-                .map_err(|e| anyhow!("D2H mtp draft token failed: {e}"))?[0] as u32
+                self.ctx.sync()?;
+                Ok(self
+                    .ctx
+                    .stream
+                    .clone_dtoh(tok_out)
+                    .map_err(|e| anyhow!("D2H mtp draft token failed: {e}"))?[0]
+                    as u32)
+            })?
         };
 
         // The head's own output hidden seeds the next level (autoregressive chain,

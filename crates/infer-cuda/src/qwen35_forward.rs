@@ -281,12 +281,15 @@ impl Qwen35Model {
         tokens: &[u32],
         start_pos: usize,
     ) -> Result<(u64, u64)> {
-        let token_ids_host: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
-        let token_ids = ws.token_ids.upload(&self.ctx, &token_ids_host)?;
-        let (token_ids_ptr, _g0) = token_ids.device_ptr(&self.ctx.stream);
-        let start_pos_dev = ws.start_pos.upload(&self.ctx, &[start_pos as i32])?;
-        let (start_pos_ptr, _g1) = start_pos_dev.device_ptr(&self.ctx.stream);
-        Ok((token_ids_ptr, start_pos_ptr))
+        let seq_len = tokens.len();
+        crate::profile::profile_op(&self.ctx, "stage_inputs", None, seq_len, || {
+            let token_ids_host: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
+            let token_ids = ws.token_ids.upload(&self.ctx, &token_ids_host)?;
+            let (token_ids_ptr, _g0) = token_ids.device_ptr(&self.ctx.stream);
+            let start_pos_dev = ws.start_pos.upload(&self.ctx, &[start_pos as i32])?;
+            let (start_pos_ptr, _g1) = start_pos_dev.device_ptr(&self.ctx.stream);
+            Ok((token_ids_ptr, start_pos_ptr))
+        })
     }
 
     /// The pure-GPU layer stack over already-staged inputs: embeds the staged
