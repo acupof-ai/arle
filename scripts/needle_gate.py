@@ -11,7 +11,9 @@ Routing (the gate is model-neutral via the checkpoint Jinja chat template, #66):
   RAW=1        raw /v1/completions (+ TEMPLATE=dsv4 for the legacy DSv4 shim,
                TEMPLATE=qwen3_nonthink for Qwen3.x non-thinking ChatML)
 
-Env: PORT (default 18189), MODEL (default "x").
+Env: PORT (default 18189), MODEL (default "x"), KV_DTYPE (label only, e.g.
+bf16/int8/fp8 — printed on every line so a precision-matrix run can be
+grep-split; the caller restarts serve with the matching --kv-cache-dtype).
 
 Prints one line per run with the raw decoded completion, then a per-length
 summary line: exact/partial/miss counts + deterministic? (all runs identical).
@@ -95,6 +97,8 @@ def one_chat(prompt):
 
 one = one_completion if os.environ.get("RAW") == "1" else one_chat
 
+KV_DTYPE = os.environ.get("KV_DTYPE", "")
+
 
 def glued_repeat(out):
     # Flattened-logits salad glues fragments back-to-back ("memoizatmemoizat");
@@ -158,12 +162,12 @@ for target in lengths:
             outs.append(None)
             continue
         outs.append(out)
-        print("len=%d depth=%.2f run=%d pt=%s cls=%s wall=%.1fs out=%r"
-              % (target, depth, r, pt, classify(out), dt, out))
+        print("len=%d depth=%.2f run=%d pt=%s cls=%s wall=%.1fs kv=%s out=%r"
+              % (target, depth, r, pt, classify(out), dt, KV_DTYPE, out))
     ok = [o for o in outs if o is not None]
     cls = [classify(o) for o in ok]
     det = "DET" if len(set(ok)) <= 1 and len(ok) == runs else "NONDET"
-    print("SUMMARY len=%d depth=%.2f exact=%d partial=%d miss=%d %s"
+    print("SUMMARY len=%d depth=%.2f exact=%d partial=%d miss=%d %s kv=%s"
           % (target, depth, cls.count("exact"), cls.count("partial"),
-             cls.count("miss"), det))
+             cls.count("miss"), det, KV_DTYPE))
     sys.stdout.flush()

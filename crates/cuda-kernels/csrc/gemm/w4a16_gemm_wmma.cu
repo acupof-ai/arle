@@ -111,20 +111,19 @@ __global__ void w4a16_gemm_wmma_kernel(
         __syncthreads();
     }
 
-    // --- Store output tile [m0..m0+16, n0..n0+16] in [M, N] layout ---
-    // c_smem is [N_tile, M_tile] row-major; we need output[m, n] = c_smem[n_row, m_col].
+    // --- Store output tile ---
+    // Test: store as [N, M] to check if WMMA computation is correct.
     __shared__ float c_smem[WMMA_TILE_N * WMMA_TILE_M];
     wmma::store_matrix_sync(c_smem, c_frag, WMMA_TILE_M, wmma::mem_row_major);
     __syncthreads();
 
-    // Each thread writes one element to get coalesced writes in the N dimension.
-    const int m_idx = tid / WMMA_TILE_N;  // 0..15
-    const int n_idx = tid % WMMA_TILE_N;  // 0..15
-    if (m_idx < WMMA_TILE_M && n_idx < WMMA_TILE_N) {
-        const int m = m0 + m_idx;
+    const int n_idx = tid / WMMA_TILE_M;  // 0..15
+    const int m_idx = tid % WMMA_TILE_M;  // 0..15
+    if (n_idx < WMMA_TILE_N && m_idx < WMMA_TILE_M) {
         const int n = n0 + n_idx;
-        if (m < M && n < N) {
-            output[(size_t)m * N + n] = __float2bfloat16(c_smem[n_idx * WMMA_TILE_M + m_idx]);
+        const int m = m0 + m_idx;
+        if (n < N && m < M) {
+            output[(size_t)n * M + m] = __float2bfloat16(c_smem[n_idx * WMMA_TILE_M + m_idx]);
         }
     }
 }

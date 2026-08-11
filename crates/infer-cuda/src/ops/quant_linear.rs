@@ -18,7 +18,7 @@ mod qwen_fp8_dense_policy {
 /// Pre-Hopper dequant→BF16-cuBLAS floor. Stays at the old 16: that path pays a
 /// full weight dequant (1 read + 2 bf16 writes) per call, so tiny M belongs on
 /// the GEMV there even though Hopper's DeepGEMM lane wins from M=2.
-const QWEN_FP8_DEQUANT_GEMM_MIN_M: usize = 16;
+const QWEN_FP8_DEQUANT_GEMM_MIN_M: usize = 2;
 
 #[derive(Default)]
 struct QwenFp8DenseScratch {
@@ -75,19 +75,28 @@ thread_local! {
         RefCell::new(MarlinW8a16Scratch::default());
 }
 
-// Qwen FP8 dense dispatch counters. Per-family split if/when more operator
-// families migrate to generated policy. fallback_count is derived (gemv +
-// dequant), not an independent atomic.
+// Qwen quant dispatch counters. Per-impl split so the stats surface can tell
+// which quant format took which path (deepgemm / marlin / dequant+gemm / gemv).
+// fallback_count is derived (all dequant+gemm + all gemv), not an independent
+// atomic.
 static DEEPGEMM_HITS: AtomicU64 = AtomicU64::new(0);
-static GEMV_HITS: AtomicU64 = AtomicU64::new(0);
-static DEQUANT_GEMM_HITS: AtomicU64 = AtomicU64::new(0);
+static FP8_DEQUANT_GEMM_HITS: AtomicU64 = AtomicU64::new(0);
+static W8A16_DEQUANT_GEMM_HITS: AtomicU64 = AtomicU64::new(0);
+static W4A16_DEQUANT_GEMM_HITS: AtomicU64 = AtomicU64::new(0);
 static MARLIN_W8A16_HITS: AtomicU64 = AtomicU64::new(0);
+static FP8_GEMV_HITS: AtomicU64 = AtomicU64::new(0);
+static W8A16_GEMV_HITS: AtomicU64 = AtomicU64::new(0);
+static W4A16_GEMV_HITS: AtomicU64 = AtomicU64::new(0);
 
 static FP8_IMPLEMENTATION_IDS: &[(&AtomicU64, &str)] = &[
     (&DEEPGEMM_HITS, "cuda.qwen.fp8_pack_deepgemm"),
-    (&GEMV_HITS, "cuda.qwen.fp8_gemv"),
-    (&DEQUANT_GEMM_HITS, "cuda.qwen.fp8_dequant_bf16_gemm"),
+    (&FP8_DEQUANT_GEMM_HITS, "cuda.qwen.fp8_dequant_bf16_gemm"),
+    (&W8A16_DEQUANT_GEMM_HITS, "cuda.w8a16.dequant_bf16_gemm"),
+    (&W4A16_DEQUANT_GEMM_HITS, "cuda.w4a16.dequant_bf16_gemm"),
     (&MARLIN_W8A16_HITS, "cuda.w8a16.marlin_tensorcore"),
+    (&FP8_GEMV_HITS, "cuda.qwen.fp8_gemv"),
+    (&W8A16_GEMV_HITS, "cuda.w8a16.gemv"),
+    (&W4A16_GEMV_HITS, "cuda.w4a16.gemv"),
 ];
 
 /// Cumulative operator dispatch stats for Qwen FP8 dense projection.
@@ -107,8 +116,12 @@ pub(crate) fn qwen_fp8_dense_operator_stats() -> infer_seam::OperatorDispatchSta
             })
         })
         .collect();
-    let fallback_count =
-        GEMV_HITS.load(Ordering::Relaxed) + DEQUANT_GEMM_HITS.load(Ordering::Relaxed);
+    let fallback_count = FP8_DEQUANT_GEMM_HITS.load(Ordering::Relaxed)
+        + W8A16_DEQUANT_GEMM_HITS.load(Ordering::Relaxed)
+        + W4A16_DEQUANT_GEMM_HITS.load(Ordering::Relaxed)
+        + FP8_GEMV_HITS.load(Ordering::Relaxed)
+        + W8A16_GEMV_HITS.load(Ordering::Relaxed)
+        + W4A16_GEMV_HITS.load(Ordering::Relaxed);
 
     infer_seam::OperatorDispatchStats {
         policy_hash: qwen_fp8_dense_policy::POLICY_ID.into(),
@@ -807,7 +820,7 @@ fn try_w4a16_dequant_bf16_gemm_batch(
                 let (wfp16_ptr, _gw) = cached.device_ptr(&ctx.stream);
                 // SAFETY: all pointers are valid device buffers from the context, sizes match the GEMM dims.
                 unsafe {
-                    ffi::gemm_fp16_weight_cuda(
+                    ffi::fp16_gemm_wmma_cuda(
                         wfp16_ptr as *const ffi::Half,
                         x_ptr as *const ffi::Half,
                         out_ptr as *mut ffi::Half,
@@ -883,7 +896,7 @@ fn try_w4a16_dequant_bf16_gemm_batch(
         let (wfp16_ptr, _gw) = weight_fp16.device_ptr(&ctx.stream);
         // SAFETY: all pointers are valid device buffers, sizes match the GEMM dims.
         unsafe {
-            ffi::gemm_fp16_weight_cuda(
+            ffi::fp16_gemm_wmma_cuda(
                 wfp16_ptr as *const ffi::Half,
                 x_ptr as *const ffi::Half,
                 out_ptr as *mut ffi::Half,
@@ -919,7 +932,7 @@ pub(super) fn gemm_batch(
     // above, so dequant → BF16 cuBLAS GEMM here (small-M decode keeps the scalar
     // GEMV below). No-op on Hopper (returns false).
     if try_fp8_dequant_bf16_gemm_batch(ctx, weight, x, out)? {
-        DEQUANT_GEMM_HITS.fetch_add(1, Ordering::Relaxed);
+        FP8_DEQUANT_GEMM_HITS.fetch_add(1, Ordering::Relaxed);
         return Ok(());
     }
 
@@ -934,7 +947,7 @@ pub(super) fn gemm_batch(
     // of the per-token weight re-read of the batched GEMV below. Small-M decode
     // returns false and keeps the GEMV/batched-GEMM path.
     if try_w8a16_dequant_bf16_gemm_batch(ctx, weight, x, out)? {
-        DEQUANT_GEMM_HITS.fetch_add(1, Ordering::Relaxed);
+        W8A16_DEQUANT_GEMM_HITS.fetch_add(1, Ordering::Relaxed);
         return Ok(());
     }
 
@@ -943,7 +956,7 @@ pub(super) fn gemm_batch(
     // (no tensor cores on V100), so dequant + BF16 GEMM (FP16 tensor cores
     // on sm_80+, FP16-cast on sm_70) is much faster for prefill.
     if try_w4a16_dequant_bf16_gemm_batch(ctx, weight, x, out)? {
-        DEQUANT_GEMM_HITS.fetch_add(1, Ordering::Relaxed);
+        W4A16_DEQUANT_GEMM_HITS.fetch_add(1, Ordering::Relaxed);
         return Ok(());
     }
 
@@ -1035,7 +1048,7 @@ pub(super) fn gemm_batch(
                         .result()?)
                     },
                 )?;
-                GEMV_HITS.fetch_add(1, Ordering::Relaxed);
+                FP8_GEMV_HITS.fetch_add(1, Ordering::Relaxed);
             }
             WeightFormat::Fp4E2M1Group => {
                 ensure!(
@@ -1116,7 +1129,7 @@ pub(super) fn gemm_batch(
                     stream,
                 )
                 .result()?;
-                GEMV_HITS.fetch_add(1, Ordering::Relaxed);
+                W4A16_GEMV_HITS.fetch_add(1, Ordering::Relaxed);
             }
             WeightFormat::W8A16 => {
                 let qw = weight
@@ -1147,7 +1160,7 @@ pub(super) fn gemm_batch(
                     stream,
                 )
                 .result()?;
-                GEMV_HITS.fetch_add(1, Ordering::Relaxed);
+                W8A16_GEMV_HITS.fetch_add(1, Ordering::Relaxed);
             }
             other => bail!("gemm_batch unsupported resident quant weight format {other}"),
         }
@@ -1194,7 +1207,7 @@ pub(super) fn gemv(
                     stream,
                 )
                 .result()?;
-                GEMV_HITS.fetch_add(1, Ordering::Relaxed);
+                FP8_GEMV_HITS.fetch_add(1, Ordering::Relaxed);
             }
             WeightFormat::Fp4E2M1Group => {
                 ensure!(
@@ -1318,7 +1331,7 @@ pub(super) fn gemv(
                     stream,
                 )
                 .result()?;
-                GEMV_HITS.fetch_add(1, Ordering::Relaxed);
+                W4A16_GEMV_HITS.fetch_add(1, Ordering::Relaxed);
             }
             WeightFormat::W8A16 => {
                 let qw = weight
@@ -1348,7 +1361,7 @@ pub(super) fn gemv(
                     stream,
                 )
                 .result()?;
-                GEMV_HITS.fetch_add(1, Ordering::Relaxed);
+                W8A16_GEMV_HITS.fetch_add(1, Ordering::Relaxed);
             }
             other => bail!("gemv unsupported resident quant weight format {other}"),
         }

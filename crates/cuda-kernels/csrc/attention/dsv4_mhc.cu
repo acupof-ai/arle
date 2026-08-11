@@ -14,6 +14,14 @@ __device__ __forceinline__ uint16_t f32_to_bf16_bits(const float value) {
   return *reinterpret_cast<uint16_t *>(&out);
 }
 
+// uint16 shared-memory bank swizzle. Bank of x_row[i] = (i / 2) % 32, so
+// consecutive uint16 share a bank (2-way conflict). Flipping bit 5 for odd
+// columns maps even/odd threads to banks 0..15 / 16..31 — all 32 distinct.
+// Adds 32 elements to the required shared-memory footprint.
+__device__ __forceinline__ int dsv4_mhc_swizzle_col(int col) {
+  return col ^ ((col & 1) << 5);
+}
+
 __device__ __forceinline__ float dsv4_sigmoid(float value) {
   if (value >= 0.0f) {
     return 1.0f / (1.0f + __expf(-value));
@@ -269,7 +277,7 @@ __global__ void dsv4_mhc_pre_rms_norm_kernel(
                bf16_to_f32(residual[residual_base + lane * hidden_size + col]);
     }
     const uint16_t bits = f32_to_bf16_bits(value);
-    x_row[col] = bits;
+    x_row[dsv4_mhc_swizzle_col(col)] = bits;
     const float rounded = bf16_to_f32(bits);
     local_sum += rounded * rounded;
   }
@@ -284,7 +292,7 @@ __global__ void dsv4_mhc_pre_rms_norm_kernel(
 
   uint16_t *out_row = out + token * hidden_size;
   for (int col = threadIdx.x; col < hidden_size; col += blockDim.x) {
-    const float value = bf16_to_f32(x_row[col]) * inv_rms *
+    const float value = bf16_to_f32(x_row[dsv4_mhc_swizzle_col(col)]) * inv_rms *
                         bf16_to_f32(weight[col]);
     out_row[col] = f32_to_bf16_bits(value);
   }
@@ -305,7 +313,7 @@ extern "C" CUresult dsv4_mhc_pre_rms_norm_cuda(
     return CUDA_ERROR_INVALID_VALUE;
   }
   if (num_tokens == 0) return CUDA_SUCCESS;
-  const size_t shmem = (size_t)hidden_size * sizeof(uint16_t);
+  const size_t shmem = ((size_t)hidden_size + 32) * sizeof(uint16_t);
   if (shmem > 192 * 1024) return CUDA_ERROR_INVALID_VALUE;
   if (shmem > 48 * 1024) {
     cudaError_t attr = cudaFuncSetAttribute(
@@ -396,7 +404,7 @@ __global__ void dsv4_mhc_params_pre_rms_norm_kernel(
                bf16_to_f32(residual[row_start + lane * hidden_size + col]);
     }
     const uint16_t bits = f32_to_bf16_bits(value);
-    x_row[col] = bits;
+    x_row[dsv4_mhc_swizzle_col(col)] = bits;
     const float rounded = bf16_to_f32(bits);
     local_sum += rounded * rounded;
   }
@@ -412,7 +420,7 @@ __global__ void dsv4_mhc_params_pre_rms_norm_kernel(
   uint16_t *out_row = out + token * hidden_size;
   for (int col = threadIdx.x; col < hidden_size; col += blockDim.x) {
     const float value =
-        bf16_to_f32(x_row[col]) * inv_rms * bf16_to_f32(weight[col]);
+        bf16_to_f32(x_row[dsv4_mhc_swizzle_col(col)]) * inv_rms * bf16_to_f32(weight[col]);
     out_row[col] = f32_to_bf16_bits(value);
   }
 }
@@ -441,7 +449,7 @@ extern "C" CUresult dsv4_mhc_params_pre_rms_norm_cuda(
     return CUDA_ERROR_INVALID_VALUE;
   }
   if (num_tokens == 0) return CUDA_SUCCESS;
-  const size_t shmem = (size_t)hidden_size * sizeof(uint16_t);
+  const size_t shmem = ((size_t)hidden_size + 32) * sizeof(uint16_t);
   if (shmem > 192 * 1024) return CUDA_ERROR_INVALID_VALUE;
   if (shmem > 48 * 1024) {
     cudaError_t attr = cudaFuncSetAttribute(
@@ -504,7 +512,7 @@ extern "C" CUresult dsv4_mhc_pre_rms_norm_bench_cuda(
       (block_dim & 31) != 0) {
     return CUDA_ERROR_INVALID_VALUE;
   }
-  const size_t shmem = (size_t)hidden_size * sizeof(uint16_t);
+  const size_t shmem = ((size_t)hidden_size + 32) * sizeof(uint16_t);
   dsv4_mhc_pre_rms_norm_kernel<<<num_tokens, block_dim, shmem,
                                  (cudaStream_t)stream>>>(
       residual, pre, weight, out, num_tokens, hidden_size, hc_mult, eps);

@@ -4,7 +4,7 @@
 #![allow(clippy::undocumented_unsafe_blocks)]
 
 use super::*;
-use crate::tensor::DeviceContext;
+use crate::tensor::{DeviceContext, DeviceVec};
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 use half::bf16;
 
@@ -662,4 +662,478 @@ fn fp8_dequant_bf16_gemm_matches_scalar() {
         max_abs <= 1.0,
         "dequant→bf16 GEMM vs scalar max_abs_err {max_abs:.4} above 1.0 — fallback parity broken"
     );
+}
+
+// ---- W8A16 / W4A16 group-quantized GEMV + dequant correctness ----
+//
+// Weight layout: row-major [N, K] (W8A16 int8) or [N, K/2] (W4A16 packed
+// uint8, low nibble = even col, high nibble = odd col). Per-group BF16 scales
+// [N, K/group_size]: scale[row, col/group_size] multiplies every weight in
+// that group. W4A16 stores unsigned nibbles 0..15; the dequant value is
+// nibble - 8 (signed range -8..7).
+
+fn quantize_w8a16_group(
+    weight_f32: &[f32],
+    n: usize,
+    k: usize,
+    group_size: usize,
+) -> (Vec<i8>, Vec<bf16>) {
+    let num_groups = k / group_size;
+    let mut weight_i8 = vec![0i8; n * k];
+    let mut scales = vec![bf16::ZERO; n * num_groups];
+    for row in 0..n {
+        for g in 0..num_groups {
+            let start = g * group_size;
+            let end = start + group_size;
+            let mut max_abs = 0.0f32;
+            for col in start..end {
+                max_abs = max_abs.max(weight_f32[row * k + col].abs());
+            }
+            let scale = if max_abs > 0.0 { max_abs / 127.0 } else { 1.0 };
+            scales[row * num_groups + g] = bf16::from_f32(scale);
+            for col in start..end {
+                let q = (weight_f32[row * k + col] / scale)
+                    .round()
+                    .clamp(-127.0, 127.0);
+                weight_i8[row * k + col] = q as i8;
+            }
+        }
+    }
+    (weight_i8, scales)
+}
+
+fn quantize_w4a16_group(
+    weight_f32: &[f32],
+    n: usize,
+    k: usize,
+    group_size: usize,
+) -> (Vec<u8>, Vec<bf16>) {
+    let num_groups = k / group_size;
+    let mut weight_packed = vec![0u8; n * (k / 2)];
+    let mut scales = vec![bf16::ZERO; n * num_groups];
+    for row in 0..n {
+        for g in 0..num_groups {
+            let start = g * group_size;
+            let end = start + group_size;
+            let mut max_abs = 0.0f32;
+            for col in start..end {
+                max_abs = max_abs.max(weight_f32[row * k + col].abs());
+            }
+            let scale = if max_abs > 0.0 { max_abs / 7.0 } else { 1.0 };
+            scales[row * num_groups + g] = bf16::from_f32(scale);
+            for col in start..end {
+                let q = (weight_f32[row * k + col] / scale).round().clamp(-8.0, 7.0);
+                let nibble = (q as i8 + 8) as u8; // 0..15
+                let byte_idx = row * (k / 2) + col / 2;
+                if col & 1 == 0 {
+                    weight_packed[byte_idx] = nibble;
+                } else {
+                    weight_packed[byte_idx] |= nibble << 4;
+                }
+            }
+        }
+    }
+    (weight_packed, scales)
+}
+
+#[test]
+fn w8a16_gemv_matches_reference() {
+    let ctx = DeviceContext::new().expect("failed to create CUDA context");
+    let n = 4usize;
+    let k = 256usize;
+    let group_size = 128usize;
+    let num_groups = k / group_size;
+
+    let mut weight_f32 = vec![0.0f32; n * k];
+    for row in 0..n {
+        for col in 0..k {
+            let raw = ((row * 31 + col * 17 + 5) % 23) as f32 - 11.0;
+            weight_f32[row * k + col] = raw * 0.03125;
+        }
+    }
+    let (weight_i8, scales) = quantize_w8a16_group(&weight_f32, n, k, group_size);
+
+    let mut input_host = vec![bf16::ZERO; k];
+    for (col, val) in input_host.iter_mut().enumerate() {
+        let raw = ((col * 7 + 3) % 19) as f32 - 9.0;
+        *val = bf16::from_f32(raw * 0.0625);
+    }
+
+    let mut expected = vec![0.0f32; n];
+    for row in 0..n {
+        let mut sum = 0.0f32;
+        for col in 0..k {
+            let scale = scales[row * num_groups + col / group_size].to_f32();
+            sum += weight_i8[row * k + col] as f32 * scale * input_host[col].to_f32();
+        }
+        expected[row] = sum;
+    }
+
+    let weight_dev = ctx.stream.clone_htod(&weight_i8).expect("weight H2D");
+    let scales_dev = ctx.stream.clone_htod(&scales).expect("scales H2D");
+    let input_dev = ctx.stream.clone_htod(&input_host).expect("input H2D");
+    let mut output_dev = ctx.stream.alloc_zeros::<bf16>(n).expect("output alloc");
+    {
+        let (weight_ptr, _wg) = weight_dev.device_ptr(&ctx.stream);
+        let (scales_ptr, _sg) = scales_dev.device_ptr(&ctx.stream);
+        let (input_ptr, _ig) = input_dev.device_ptr(&ctx.stream);
+        let (output_ptr, _og) = output_dev.device_ptr_mut(&ctx.stream);
+        unsafe {
+            w8a16_gemv_cuda(
+                weight_ptr as *const i8,
+                scales_ptr as *const Half,
+                input_ptr as *const Half,
+                output_ptr as *mut Half,
+                n as i32,
+                k as i32,
+                group_size as i32,
+                ctx.stream.cu_stream(),
+            )
+            .result()
+            .expect("w8a16 GEMV");
+        }
+    }
+    ctx.sync().expect("sync w8a16 GEMV");
+
+    let got = ctx.stream.clone_dtoh(&output_dev).expect("output D2H");
+    assert_bf16_close(&got, &expected, 0.05);
+}
+
+#[test]
+fn w4a16_gemv_matches_reference() {
+    let ctx = DeviceContext::new().expect("failed to create CUDA context");
+    let n = 4usize;
+    let k = 256usize;
+    let group_size = 128usize;
+    let num_groups = k / group_size;
+
+    let mut weight_f32 = vec![0.0f32; n * k];
+    for row in 0..n {
+        for col in 0..k {
+            let raw = ((row * 31 + col * 17 + 5) % 23) as f32 - 11.0;
+            weight_f32[row * k + col] = raw * 0.03125;
+        }
+    }
+    let (weight_packed, scales) = quantize_w4a16_group(&weight_f32, n, k, group_size);
+
+    let mut input_host = vec![bf16::ZERO; k];
+    for (col, val) in input_host.iter_mut().enumerate() {
+        let raw = ((col * 7 + 3) % 19) as f32 - 9.0;
+        *val = bf16::from_f32(raw * 0.0625);
+    }
+
+    let mut expected = vec![0.0f32; n];
+    for row in 0..n {
+        let mut sum = 0.0f32;
+        for col in 0..k {
+            let byte = weight_packed[row * (k / 2) + col / 2];
+            let nibble = if col & 1 == 0 { byte & 0x0f } else { byte >> 4 };
+            let q = nibble as i8 - 8;
+            let scale = scales[row * num_groups + col / group_size].to_f32();
+            sum += q as f32 * scale * input_host[col].to_f32();
+        }
+        expected[row] = sum;
+    }
+
+    let weight_dev = ctx.stream.clone_htod(&weight_packed).expect("weight H2D");
+    let scales_dev = ctx.stream.clone_htod(&scales).expect("scales H2D");
+    let input_dev = ctx.stream.clone_htod(&input_host).expect("input H2D");
+    let mut output_dev = ctx.stream.alloc_zeros::<bf16>(n).expect("output alloc");
+    {
+        let (weight_ptr, _wg) = weight_dev.device_ptr(&ctx.stream);
+        let (scales_ptr, _sg) = scales_dev.device_ptr(&ctx.stream);
+        let (input_ptr, _ig) = input_dev.device_ptr(&ctx.stream);
+        let (output_ptr, _og) = output_dev.device_ptr_mut(&ctx.stream);
+        unsafe {
+            w4a16_gemv_cuda(
+                weight_ptr as *const u8,
+                scales_ptr as *const Half,
+                input_ptr as *const Half,
+                output_ptr as *mut Half,
+                n as i32,
+                k as i32,
+                group_size as i32,
+                ctx.stream.cu_stream(),
+            )
+            .result()
+            .expect("w4a16 GEMV");
+        }
+    }
+    ctx.sync().expect("sync w4a16 GEMV");
+
+    let got = ctx.stream.clone_dtoh(&output_dev).expect("output D2H");
+    assert_bf16_close(&got, &expected, 0.2);
+}
+
+#[test]
+fn dequantize_w8a16_to_bf16_matches_reference() {
+    let ctx = DeviceContext::new().expect("failed to create CUDA context");
+    let n = 4usize;
+    let k = 256usize;
+    let group_size = 128usize;
+    let num_groups = k / group_size;
+
+    let mut weight_f32 = vec![0.0f32; n * k];
+    for row in 0..n {
+        for col in 0..k {
+            let raw = ((row * 31 + col * 17 + 5) % 23) as f32 - 11.0;
+            weight_f32[row * k + col] = raw * 0.03125;
+        }
+    }
+    let (weight_i8, scales) = quantize_w8a16_group(&weight_f32, n, k, group_size);
+
+    let mut expected = vec![0.0f32; n * k];
+    for row in 0..n {
+        for col in 0..k {
+            let scale = scales[row * num_groups + col / group_size].to_f32();
+            expected[row * k + col] = weight_i8[row * k + col] as f32 * scale;
+        }
+    }
+
+    let weight_dev = ctx.stream.clone_htod(&weight_i8).expect("weight H2D");
+    let scales_dev = ctx.stream.clone_htod(&scales).expect("scales H2D");
+    let mut output_dev = ctx.stream.alloc_zeros::<bf16>(n * k).expect("output alloc");
+    {
+        let (weight_ptr, _wg) = weight_dev.device_ptr(&ctx.stream);
+        let (scales_ptr, _sg) = scales_dev.device_ptr(&ctx.stream);
+        let (output_ptr, _og) = output_dev.device_ptr_mut(&ctx.stream);
+        unsafe {
+            dequantize_w8a16_to_bf16_cuda(
+                weight_ptr as *const i8,
+                scales_ptr as *const Half,
+                output_ptr as *mut Half,
+                n as i32,
+                k as i32,
+                group_size as i32,
+                ctx.stream.cu_stream(),
+            )
+            .result()
+            .expect("dequant w8a16");
+        }
+    }
+    ctx.sync().expect("sync dequant w8a16");
+
+    let got = ctx.stream.clone_dtoh(&output_dev).expect("output D2H");
+    assert_bf16_close(&got, &expected, 0.02);
+}
+
+#[test]
+fn dequantize_w4a16_to_bf16_matches_reference() {
+    let ctx = DeviceContext::new().expect("failed to create CUDA context");
+    let n = 4usize;
+    let k = 256usize;
+    let group_size = 128usize;
+    let num_groups = k / group_size;
+
+    let mut weight_f32 = vec![0.0f32; n * k];
+    for row in 0..n {
+        for col in 0..k {
+            let raw = ((row * 31 + col * 17 + 5) % 23) as f32 - 11.0;
+            weight_f32[row * k + col] = raw * 0.03125;
+        }
+    }
+    let (weight_packed, scales) = quantize_w4a16_group(&weight_f32, n, k, group_size);
+
+    let mut expected = vec![0.0f32; n * k];
+    for row in 0..n {
+        for col in 0..k {
+            let byte = weight_packed[row * (k / 2) + col / 2];
+            let nibble = if col & 1 == 0 { byte & 0x0f } else { byte >> 4 };
+            let q = nibble as i8 - 8;
+            let scale = scales[row * num_groups + col / group_size].to_f32();
+            expected[row * k + col] = q as f32 * scale;
+        }
+    }
+
+    let weight_dev = ctx.stream.clone_htod(&weight_packed).expect("weight H2D");
+    let scales_dev = ctx.stream.clone_htod(&scales).expect("scales H2D");
+    let mut output_dev = ctx.stream.alloc_zeros::<bf16>(n * k).expect("output alloc");
+    {
+        let (weight_ptr, _wg) = weight_dev.device_ptr(&ctx.stream);
+        let (scales_ptr, _sg) = scales_dev.device_ptr(&ctx.stream);
+        let (output_ptr, _og) = output_dev.device_ptr_mut(&ctx.stream);
+        unsafe {
+            dequantize_w4a16_to_bf16_cuda(
+                weight_ptr as *const u8,
+                scales_ptr as *const Half,
+                output_ptr as *mut Half,
+                n as i32,
+                k as i32,
+                group_size as i32,
+                ctx.stream.cu_stream(),
+            )
+            .result()
+            .expect("dequant w4a16");
+        }
+    }
+    ctx.sync().expect("sync dequant w4a16");
+
+    let got = ctx.stream.clone_dtoh(&output_dev).expect("output D2H");
+    assert_bf16_close(&got, &expected, 0.05);
+}
+
+// ─── KV cache quantization round-trip tests ───
+
+/// INT8 KV round-trip: bf16 → INT8 (per-token per-head absmax/127) → bf16.
+///
+/// Layout: HND `[num_kv_heads, max_seq_len, head_dim]`.
+/// Symmetric quantization: `scale = absmax / 127`, `int8 = round(x / scale)`.
+/// Max abs error ≈ scale / 2 = absmax / 254, so relative to the value range
+/// the error is bounded by ~1/127 of the per-row absmax.
+#[test]
+fn int8_kv_quantize_dequantize_roundtrip() {
+    let ctx = DeviceContext::new().expect("failed to create CUDA context");
+    let num_kv_heads = 2usize;
+    let head_dim = 64usize;
+    let max_seq_len = 32usize;
+    let token_count = max_seq_len;
+
+    let total = num_kv_heads * max_seq_len * head_dim;
+    let mut input_host = vec![bf16::ZERO; total];
+    for (i, val) in input_host.iter_mut().enumerate() {
+        // Values in [-1, 1), deterministic pseudo-random pattern.
+        let v = ((i * 37 + 13) % 256) as f32 / 256.0 * 2.0 - 1.0;
+        *val = bf16::from_f32(v);
+    }
+
+    let kv_bf16 = DeviceVec::from_host(&ctx, &input_host).expect("input H2D");
+    let mut kv_int8 = ctx.stream.alloc_zeros::<i8>(total).expect("int8 alloc");
+    let mut scales = ctx
+        .stream
+        .alloc_zeros::<f32>(num_kv_heads * max_seq_len)
+        .expect("scales alloc");
+
+    crate::kv_quant::quantize_kv(
+        &ctx,
+        &kv_bf16,
+        &mut kv_int8,
+        &mut scales,
+        num_kv_heads,
+        head_dim,
+        max_seq_len,
+        0, // start_pos
+        token_count,
+    )
+    .expect("quantize kv int8");
+    ctx.sync().expect("sync quantize kv int8");
+
+    let mut out_bf16 = DeviceVec::zeros(&ctx, total).expect("out bf16 alloc");
+    crate::kv_quant::dequantize_kv(
+        &ctx,
+        &kv_int8,
+        &scales,
+        &mut out_bf16,
+        num_kv_heads,
+        head_dim,
+        max_seq_len,
+        token_count,
+    )
+    .expect("dequantize kv int8");
+    ctx.sync().expect("sync dequantize kv int8");
+
+    let got = ctx.stream.clone_dtoh(&out_bf16.data).expect("out D2H");
+    let expected: Vec<f32> = input_host.iter().map(|x| x.to_f32()).collect();
+    // INT8 symmetric: step = scale, max error ≈ scale/2. With absmax ≤ 1 the
+    // scale ≤ 1/127 ≈ 7.9e-3, so error ≤ ~4e-3. 2e-2 leaves headroom for
+    // bf16 rounding of the input and the absmax edge case.
+    assert_bf16_close(&got, &expected, 2e-2);
+}
+
+/// FP8 E4M3 KV round-trip: bf16 → FP8 (per-token per-head absmax/448) → bf16.
+///
+/// Input bf16 lives in the paged HND work buffer
+/// `[num_pages, num_kv_heads, 16, head_dim]`; the FP8 durable pool is NHD
+/// `[max_total_tokens, kv_dim]` where `kv_dim = num_kv_heads * head_dim`.
+/// `new_token_indices` maps each batch token to its pool row.
+///
+/// Symmetric quantization: `scale = absmax / 448`, `fp8 = x / scale`.
+/// E4M3 mantissa has 3 bits (8 levels), so the relative step is ~1/8 of the
+/// bin; max abs error ≈ scale * (1/16) for values near absmax, i.e.
+/// absmax / 7168. With absmax ≤ 1 the error is well below 5e-2.
+#[test]
+fn fp8_kv_quantize_dequantize_roundtrip() {
+    let ctx = DeviceContext::new().expect("failed to create CUDA context");
+    let num_kv_heads = 2usize;
+    let head_dim = 64usize;
+    let kv_dim = num_kv_heads * head_dim;
+    let max_total_tokens = 32usize;
+    const PAGE_SIZE: usize = 16;
+    let num_pages = max_total_tokens.div_ceil(PAGE_SIZE);
+    let batch_size = max_total_tokens;
+
+    // Paged HND layout: [num_pages, num_kv_heads, PAGE_SIZE, head_dim].
+    let total = num_pages * num_kv_heads * PAGE_SIZE * head_dim;
+    let mut input_host = vec![bf16::ZERO; total];
+    for (i, val) in input_host.iter_mut().enumerate() {
+        let v = ((i * 37 + 13) % 256) as f32 / 256.0 * 2.0 - 1.0;
+        *val = bf16::from_f32(v);
+    }
+
+    let kv_bf16 = ctx.stream.clone_htod(&input_host).expect("input H2D");
+    let mut kv_fp8 = ctx
+        .stream
+        .alloc_zeros::<u8>(max_total_tokens * kv_dim)
+        .expect("fp8 alloc");
+    let mut scales = ctx
+        .stream
+        .alloc_zeros::<f32>(max_total_tokens * num_kv_heads)
+        .expect("scales alloc");
+    let token_indices: Vec<i32> = (0..batch_size as i32).collect();
+    let token_indices_dev = ctx
+        .stream
+        .clone_htod(&token_indices)
+        .expect("token indices H2D");
+
+    {
+        let (bf16_ptr, _g1) = kv_bf16.device_ptr(&ctx.stream);
+        let (fp8_ptr, _g2) = kv_fp8.device_ptr_mut(&ctx.stream);
+        let (scales_ptr, _g3) = scales.device_ptr_mut(&ctx.stream);
+
+        crate::kv_quant::quantize_paged_kv_fp8(
+            &ctx,
+            bf16_ptr,
+            fp8_ptr,
+            scales_ptr,
+            &token_indices_dev,
+            num_kv_heads,
+            head_dim,
+            kv_dim,
+            batch_size,
+        )
+        .expect("quantize kv fp8");
+    }
+    ctx.sync().expect("sync quantize kv fp8");
+
+    let mut out_bf16 = ctx
+        .stream
+        .alloc_zeros::<bf16>(total)
+        .expect("out bf16 alloc");
+    {
+        let (out_ptr, _g4) = out_bf16.device_ptr_mut(&ctx.stream);
+        let (fp8_ptr, _g5) = kv_fp8.device_ptr(&ctx.stream);
+        let (scales_ptr, _g6) = scales.device_ptr(&ctx.stream);
+
+        crate::kv_quant::dequantize_paged_kv_fp8_to_hnd(
+            &ctx,
+            fp8_ptr,
+            scales_ptr,
+            out_ptr,
+            &token_indices_dev,
+            num_kv_heads,
+            head_dim,
+            kv_dim,
+            batch_size,
+        )
+        .expect("dequantize kv fp8");
+    }
+    ctx.sync().expect("sync dequantize kv fp8");
+
+    let got = ctx.stream.clone_dtoh(&out_bf16).expect("out D2H");
+    let expected: Vec<f32> = input_host.iter().map(|x| x.to_f32()).collect();
+    // FP8 E4M3 has 3 mantissa bits → ~12.5% relative resolution per bin.
+    // Per-row scale = absmax/448, so the worst-case absolute error for a
+    // value near absmax is ~absmax * (1/448) * (1/2) ≈ absmax/896. With
+    // absmax ≤ 1 this is ~1e-3; 5e-2 covers bf16 input rounding and the
+    // E4M3 subnormal/edge bins.
+    assert_bf16_close(&got, &expected, 5e-2);
 }
