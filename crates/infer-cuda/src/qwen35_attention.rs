@@ -166,17 +166,11 @@ impl Qwen35Model {
         let q_full = q_full.get(&self.ctx, q_proj_dim, seq_len)?;
         let k_batch = k_batch.get(&self.ctx, kv_dim, seq_len)?;
         let v_batch = v_batch.get(&self.ctx, kv_dim, seq_len)?;
-        qwen35_profile(
-            &self.ctx,
-            "qwen/full/qkv_gemm",
-            Some(full_idx),
-            seq_len,
-            || {
-                gemm_batch(&self.ctx, &attn.qkv_proj, normed, qkv_fused)?;
-                split_qkv(&self.ctx, qkv_fused, q_full, k_batch, v_batch)?;
-                Ok(())
-            },
-        )?;
+        crate::profile::profile_op(&self.ctx, "full/qkv_gemm", Some(full_idx), seq_len, || {
+            gemm_batch(&self.ctx, &attn.qkv_proj, normed, qkv_fused)?;
+            split_qkv(&self.ctx, qkv_fused, q_full, k_batch, v_batch)?;
+            Ok(())
+        })?;
 
         let q_prepped = q_prepped.get(&self.ctx, q_dim, seq_len)?;
         let attn_out = attn_heads.get(&self.ctx, q_dim, seq_len)?;
@@ -197,7 +191,7 @@ impl Qwen35Model {
             let (kc_ptr, _g8) = k_cache.data.device_ptr_mut(&self.ctx.stream);
             let (vc_ptr, _g9) = v_cache.data.device_ptr_mut(&self.ctx.stream);
             let (sp_ptr, _g10) = start_pos_dev.device_ptr(&self.ctx.stream);
-            qwen35_profile(&self.ctx, "qwen/full/prep", Some(full_idx), seq_len, || {
+            crate::profile::profile_op(&self.ctx, "full/prep", Some(full_idx), seq_len, || {
                 // SAFETY: all buffers valid on ctx.stream; cache sized max_seq_len*kv_dim.
                 unsafe {
                     ffi::prefill_attention_hd256_prep_cuda(
@@ -243,9 +237,9 @@ impl Qwen35Model {
             // SAFETY: q_prepped/caches/out valid on ctx.stream for the shapes
             // above; `start_pos_dev` is the forward-level staged position (one
             // i32, value == start_pos).
-            qwen35_profile(
+            crate::profile::profile_op(
                 &self.ctx,
-                "qwen/full/attention",
+                "full/attention",
                 Some(full_idx),
                 seq_len,
                 || {
@@ -386,7 +380,7 @@ impl Qwen35Model {
         {
             let (qf_ptr, _g0) = q_full.data.device_ptr(&self.ctx.stream);
             let (o_ptr, _g1) = attn_out.data.device_ptr_mut(&self.ctx.stream);
-            qwen35_profile(&self.ctx, "qwen/full/gate", Some(full_idx), seq_len, || {
+            crate::profile::profile_op(&self.ctx, "full/gate", Some(full_idx), seq_len, || {
                 // SAFETY: q_full/attn_out valid on ctx.stream; gate layout per full-attn prep.
                 unsafe {
                     ffi::attention_gate_batch_hd256_cuda(
@@ -403,21 +397,13 @@ impl Qwen35Model {
             })?;
         }
 
-        qwen35_profile(
-            &self.ctx,
-            "qwen/full/o_proj",
-            Some(full_idx),
-            seq_len,
-            || gemm_batch(&self.ctx, &attn.o_proj, attn_out, out),
-        )?;
+        crate::profile::profile_op(&self.ctx, "full/o_proj", Some(full_idx), seq_len, || {
+            gemm_batch(&self.ctx, &attn.o_proj, attn_out, out)
+        })?;
         // Row-parallel o_proj: sum the per-rank partials (no-op single-GPU).
-        qwen35_profile(
-            &self.ctx,
-            "qwen/full/allreduce",
-            Some(full_idx),
-            seq_len,
-            || self.tp.all_reduce_sum(&self.ctx, out),
-        )?;
+        crate::profile::profile_op(&self.ctx, "full/allreduce", Some(full_idx), seq_len, || {
+            self.tp.all_reduce_sum(&self.ctx, out)
+        })?;
         Ok(())
     }
 
@@ -475,9 +461,9 @@ impl Qwen35Model {
         let q_full = q_full.get(&self.ctx, q_proj_dim, rows)?;
         let k_batch = k_batch.get(&self.ctx, kv_dim, rows)?;
         let v_batch = v_batch.get(&self.ctx, kv_dim, rows)?;
-        qwen35_profile(
+        crate::profile::profile_op(
             &self.ctx,
-            "qwen/full_paged/qkv_gemm",
+            "full_paged/qkv_gemm",
             Some(full_idx),
             rows,
             || {
@@ -530,9 +516,9 @@ impl Qwen35Model {
             let (start_pos_ptr, _gs) = meta.start_positions.device_ptr(&self.ctx.stream);
             {
                 let (qp_ptr, _g7) = q_prepped.data.device_ptr_mut(&self.ctx.stream);
-                qwen35_profile(
+                crate::profile::profile_op(
                     &self.ctx,
-                    "qwen/full_paged/prep",
+                    "full_paged/prep",
                     Some(full_idx),
                     rows,
                     || {
@@ -690,9 +676,9 @@ impl Qwen35Model {
             {
                 let (qp_ptr, _g0) = q_prepped.data.device_ptr_mut(&self.ctx.stream);
                 let (ao_ptr, _g5) = attn_out.data.device_ptr_mut(&self.ctx.stream);
-                qwen35_profile(
+                crate::profile::profile_op(
                     &self.ctx,
-                    "qwen/full_paged/attention",
+                    "full_paged/attention",
                     Some(full_idx),
                     rows,
                     || {
@@ -928,26 +914,20 @@ impl Qwen35Model {
             let (o_ptr, _g1) = attn_out.data.device_ptr_mut(&self.ctx.stream);
             // SAFETY: q_full/attn_out valid on ctx.stream; gate iterates
             // rows * num_q_heads.
-            qwen35_profile(
-                &self.ctx,
-                "qwen/full_paged/gate",
-                Some(full_idx),
-                rows,
-                || {
-                    // SAFETY: ptrs from live device allocations sized to the dims passed.
-                    unsafe {
-                        ffi::attention_gate_paged_hd256_cuda(
-                            qf_ptr as *const ffi::Half,
-                            o_ptr as *mut ffi::Half,
-                            self.local_q_heads as i32,
-                            rows as i32,
-                            self.ctx.stream.cu_stream(),
-                        )
-                        .result()?;
-                    }
-                    Ok(())
-                },
-            )?;
+            crate::profile::profile_op(&self.ctx, "full_paged/gate", Some(full_idx), rows, || {
+                // SAFETY: ptrs from live device allocations sized to the dims passed.
+                unsafe {
+                    ffi::attention_gate_paged_hd256_cuda(
+                        qf_ptr as *const ffi::Half,
+                        o_ptr as *mut ffi::Half,
+                        self.local_q_heads as i32,
+                        rows as i32,
+                        self.ctx.stream.cu_stream(),
+                    )
+                    .result()?;
+                }
+                Ok(())
+            })?;
         }
 
         // Layer-0 PREFILL: read back the post-RoPE prepped Q for the recall score
@@ -982,17 +962,13 @@ impl Qwen35Model {
             *dst = q;
         }
 
-        qwen35_profile(
-            &self.ctx,
-            "qwen/full_paged/o_proj",
-            Some(full_idx),
-            rows,
-            || gemm_batch(&self.ctx, &attn.o_proj, attn_out, out),
-        )?;
+        crate::profile::profile_op(&self.ctx, "full_paged/o_proj", Some(full_idx), rows, || {
+            gemm_batch(&self.ctx, &attn.o_proj, attn_out, out)
+        })?;
         // Row-parallel o_proj: sum the per-rank partials (no-op single-GPU).
-        qwen35_profile(
+        crate::profile::profile_op(
             &self.ctx,
-            "qwen/full_paged/allreduce",
+            "full_paged/allreduce",
             Some(full_idx),
             rows,
             || self.tp.all_reduce_sum(&self.ctx, out),
@@ -1056,19 +1032,13 @@ impl Qwen35Model {
         let ba = ba.get(&self.ctx, b_dim + a_dim, rows)?;
         let b_proj = b_proj.get(&self.ctx, b_dim, rows)?;
         let a_proj = a_proj.get(&self.ctx, a_dim, rows)?;
-        qwen35_profile(
-            &self.ctx,
-            "qwen/linear/in_proj",
-            Some(linear_idx),
-            rows,
-            || {
-                gemm_batch(&self.ctx, &attn.in_proj_qkvz, normed, qkvz)?;
-                split2(&self.ctx, qkvz, qkv, z)?;
-                gemm_batch(&self.ctx, &attn.in_proj_ba, normed, ba)?;
-                split2(&self.ctx, ba, b_proj, a_proj)?;
-                Ok(())
-            },
-        )?;
+        crate::profile::profile_op(&self.ctx, "linear/in_proj", Some(linear_idx), rows, || {
+            gemm_batch(&self.ctx, &attn.in_proj_qkvz, normed, qkvz)?;
+            split2(&self.ctx, qkvz, qkv, z)?;
+            gemm_batch(&self.ctx, &attn.in_proj_ba, normed, ba)?;
+            split2(&self.ctx, ba, b_proj, a_proj)?;
+            Ok(())
+        })?;
 
         let qkv_conv = qkv_conv.get(&self.ctx, qkv_dim, rows)?;
         let gdr_out = gdr_out.get(&self.ctx, z_dim, rows)?;
@@ -1173,9 +1143,9 @@ impl Qwen35Model {
                 let (gdr_tbl, _g7) = gdr.device_ptr(&self.ctx.stream);
                 let (cv_ptr, _g8) = qkv_conv.data.device_ptr_mut(&self.ctx.stream);
                 let (o_ptr, _g9) = gdr_out.data.device_ptr_mut(&self.ctx.stream);
-                qwen35_profile(
+                crate::profile::profile_op(
                     &self.ctx,
-                    "qwen/linear/conv1d",
+                    "linear/conv1d",
                     Some(linear_idx),
                     rows,
                     || {
@@ -1198,9 +1168,9 @@ impl Qwen35Model {
                         Ok(())
                     },
                 )?;
-                qwen35_profile(
+                crate::profile::profile_op(
                     &self.ctx,
-                    "qwen/linear/gdr_recurrent",
+                    "linear/gdr_recurrent",
                     Some(linear_idx),
                     rows,
                     || {
@@ -1244,43 +1214,33 @@ impl Qwen35Model {
             // is a per-[Vd] broadcast (no blockIdx dependence), so the
             // extension is exact (the monolith's `rms_norm_gated_batch_into`
             // passed `seq_len * num_heads` identically).
-            qwen35_profile(
-                &self.ctx,
-                "qwen/linear/norm",
-                Some(linear_idx),
-                rows,
-                || {
-                    // SAFETY: ptrs from live device allocations sized to the dims passed.
-                    unsafe {
-                        ffi::rms_norm_gated_cuda(
-                            x_ptr as *const ffi::Half,
-                            w_ptr as *const f32,
-                            gate_ptr as *const ffi::Half,
-                            o_ptr as *mut ffi::Half,
-                            (self.local_linear_v_heads * rows) as i32,
-                            c.linear_value_head_dim as i32,
-                            c.rms_norm_eps,
-                            self.ctx.stream.cu_stream(),
-                        )
-                        .result()?;
-                    }
-                    Ok(())
-                },
-            )?;
+            crate::profile::profile_op(&self.ctx, "linear/norm", Some(linear_idx), rows, || {
+                // SAFETY: ptrs from live device allocations sized to the dims passed.
+                unsafe {
+                    ffi::rms_norm_gated_cuda(
+                        x_ptr as *const ffi::Half,
+                        w_ptr as *const f32,
+                        gate_ptr as *const ffi::Half,
+                        o_ptr as *mut ffi::Half,
+                        (self.local_linear_v_heads * rows) as i32,
+                        c.linear_value_head_dim as i32,
+                        c.rms_norm_eps,
+                        self.ctx.stream.cu_stream(),
+                    )
+                    .result()?;
+                }
+                Ok(())
+            })?;
         }
 
-        qwen35_profile(
-            &self.ctx,
-            "qwen/linear/out_proj",
-            Some(linear_idx),
-            rows,
-            || gemm_batch(&self.ctx, &attn.out_proj, normed_out, out),
-        )?;
+        crate::profile::profile_op(&self.ctx, "linear/out_proj", Some(linear_idx), rows, || {
+            gemm_batch(&self.ctx, &attn.out_proj, normed_out, out)
+        })?;
         // Row-parallel out_proj: ONE all-reduce over the exact `[hidden, rows]`
         // buffer (no-op single-GPU).
-        qwen35_profile(
+        crate::profile::profile_op(
             &self.ctx,
-            "qwen/linear/allreduce",
+            "linear/allreduce",
             Some(linear_idx),
             rows,
             || self.tp.all_reduce_sum(&self.ctx, out),
@@ -1363,7 +1323,7 @@ impl Qwen35Model {
         let (cv_ptr, _g6) = qkv_conv.data.device_ptr_mut(&ctx.stream);
         let (o_ptr, _g7) = gdr_out.data.device_ptr_mut(&ctx.stream);
         let table = |k: u64| base + k * b as u64 * 8;
-        qwen35_profile(ctx, "qwen/linear/conv1d", Some(linear_idx), b * len, || {
+        crate::profile::profile_op(ctx, "linear/conv1d", Some(linear_idx), b * len, || {
             // SAFETY: each table holds `b` live pointers staged above; the
             // shared scratch is `[b * len, dim]`.
             unsafe {
@@ -1383,9 +1343,9 @@ impl Qwen35Model {
             }
             Ok(())
         })?;
-        qwen35_profile(
+        crate::profile::profile_op(
             ctx,
-            "qwen/linear/gdr_recurrent",
+            "linear/gdr_recurrent",
             Some(linear_idx),
             b * len,
             || {
@@ -1483,9 +1443,9 @@ impl Qwen35Model {
                 let (o_ptr, _g3) = qkv_conv.device_ptr_mut(&self.ctx.stream);
                 // SAFETY: qkv/weight/state/out valid on ctx.stream; weight len checked
                 // by the kernel against num_channels*kernel.
-                qwen35_profile(
+                crate::profile::profile_op(
                     &self.ctx,
-                    "qwen/linear/conv1d",
+                    "linear/conv1d",
                     Some(linear_idx),
                     seq_len,
                     || {
@@ -1585,9 +1545,9 @@ impl Qwen35Model {
             // `.get` calls above. The slot state pointer is passed as BOTH
             // h0 and ht (in-place chunk chaining): each fwd CTA reads its h0
             // slice fully before writing the same ht slice.
-            qwen35_profile(
+            crate::profile::profile_op(
                 &self.ctx,
-                "qwen/linear/gdr_fq",
+                "linear/gdr_fq",
                 Some(linear_idx),
                 seq_len,
                 || {
@@ -1724,9 +1684,9 @@ impl Qwen35Model {
                 let (alog_ptr, _g4) = attn.a_log.device_ptr(&self.ctx.stream);
                 let (s_ptr, _g5) = gdr_state.device_ptr_mut(&self.ctx.stream);
                 let (o_ptr, _g6) = gdr_out.device_ptr_mut(&self.ctx.stream);
-                qwen35_profile(
+                crate::profile::profile_op(
                     &self.ctx,
-                    "qwen/linear/gdr_recurrent",
+                    "linear/gdr_recurrent",
                     Some(linear_idx),
                     seq_len,
                     || {

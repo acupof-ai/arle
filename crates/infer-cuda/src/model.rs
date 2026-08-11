@@ -655,75 +655,89 @@ impl CudaModel {
             ..
         } = *decode_ctx;
 
-        embedding_batch(&self.ctx, &self.embed_tokens, token_ids, hidden)?;
+        let seq_len = meta.seq_len;
+
+        crate::profile::profile_op(&self.ctx, "embedding", None, seq_len, || {
+            embedding_batch(&self.ctx, &self.embed_tokens, token_ids, hidden)
+        })?;
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
-            rms_norm_batch(
-                &self.ctx,
-                hidden,
-                &layer.input_layernorm,
-                self.config.rms_norm_eps,
-                normed,
-            )?;
-            gemm_batch(&self.ctx, &layer.attention.q_proj, normed, q_batch)?;
-            gemm_batch(&self.ctx, &layer.attention.k_proj, normed, k_batch)?;
-            gemm_batch(&self.ctx, &layer.attention.v_proj, normed, v_batch)?;
-            paged_attention(
-                &self.ctx,
-                layer_idx,
-                pool,
-                q_batch,
-                k_batch,
-                v_batch,
-                &layer.attention.q_norm,
-                &layer.attention.k_norm,
-                &self.cos_cache,
-                &self.sin_cache,
-                self.config.rms_norm_eps,
-                meta,
-                self.local_q_heads,
-                self.local_kv_heads,
-                self.config.head_dim,
-                attn_output,
-            )?;
-            gemm_batch(&self.ctx, &layer.attention.o_proj, attn_output, o_buf)?;
-            // Always the no-op here (capture only runs single-GPU); kept for
-            // parity with the eager forward.
-            self.tp.all_reduce_sum(&self.ctx, o_buf)?;
-            add_batch(&self.ctx, hidden, o_buf, hidden_out)?;
+            crate::profile::profile_op(&self.ctx, "input_norm", Some(layer_idx), seq_len, || {
+                rms_norm_batch(
+                    &self.ctx,
+                    hidden,
+                    &layer.input_layernorm,
+                    self.config.rms_norm_eps,
+                    normed,
+                )
+            })?;
+            crate::profile::profile_op(&self.ctx, "attention", Some(layer_idx), seq_len, || {
+                gemm_batch(&self.ctx, &layer.attention.q_proj, normed, q_batch)?;
+                gemm_batch(&self.ctx, &layer.attention.k_proj, normed, k_batch)?;
+                gemm_batch(&self.ctx, &layer.attention.v_proj, normed, v_batch)?;
+                paged_attention(
+                    &self.ctx,
+                    layer_idx,
+                    pool,
+                    q_batch,
+                    k_batch,
+                    v_batch,
+                    &layer.attention.q_norm,
+                    &layer.attention.k_norm,
+                    &self.cos_cache,
+                    &self.sin_cache,
+                    self.config.rms_norm_eps,
+                    meta,
+                    self.local_q_heads,
+                    self.local_kv_heads,
+                    self.config.head_dim,
+                    attn_output,
+                )?;
+                gemm_batch(&self.ctx, &layer.attention.o_proj, attn_output, o_buf)?;
+                // Always the no-op here (capture only runs single-GPU); kept for
+                // parity with the eager forward.
+                self.tp.all_reduce_sum(&self.ctx, o_buf)?;
+                add_batch(&self.ctx, hidden, o_buf, hidden_out)
+            })?;
             std::mem::swap(hidden, hidden_out);
 
-            rms_norm_batch(
-                &self.ctx,
-                hidden,
-                &layer.post_attention_layernorm,
-                self.config.rms_norm_eps,
-                normed,
-            )?;
-            // Dense fast path only: MoE's host-routed `moe_forward` is not
-            // graph-capturable, so a MoE layer here is a wiring bug.
-            let mlp = layer.mlp.as_ref().ok_or_else(|| {
-                anyhow::anyhow!("captured decode path does not support MoE layers")
+            crate::profile::profile_op(&self.ctx, "post_norm", Some(layer_idx), seq_len, || {
+                rms_norm_batch(
+                    &self.ctx,
+                    hidden,
+                    &layer.post_attention_layernorm,
+                    self.config.rms_norm_eps,
+                    normed,
+                )
             })?;
-            gemm_batch(&self.ctx, &mlp.gate_proj, normed, gate_out)?;
-            gemm_batch(&self.ctx, &mlp.up_proj, normed, up_out)?;
-            silu_mul(&self.ctx, gate_out, up_out, act_out)?;
-            gemm_batch(&self.ctx, &mlp.down_proj, act_out, o_buf)?;
-            self.tp.all_reduce_sum(&self.ctx, o_buf)?;
-            add_batch(&self.ctx, hidden, o_buf, hidden_out)?;
+            crate::profile::profile_op(&self.ctx, "mlp", Some(layer_idx), seq_len, || {
+                // Dense fast path only: MoE's host-routed `moe_forward` is not
+                // graph-capturable, so a MoE layer here is a wiring bug.
+                let mlp = layer.mlp.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("captured decode path does not support MoE layers")
+                })?;
+                gemm_batch(&self.ctx, &mlp.gate_proj, normed, gate_out)?;
+                gemm_batch(&self.ctx, &mlp.up_proj, normed, up_out)?;
+                silu_mul(&self.ctx, gate_out, up_out, act_out)?;
+                gemm_batch(&self.ctx, &mlp.down_proj, act_out, o_buf)?;
+                self.tp.all_reduce_sum(&self.ctx, o_buf)?;
+                add_batch(&self.ctx, hidden, o_buf, hidden_out)
+            })?;
             std::mem::swap(hidden, hidden_out);
         }
 
         // B=1 decode: the single token row is row 0.
-        copy_row_to_vec(&self.ctx, hidden, 0, last_hidden)?;
-        rms_norm_vec(
-            &self.ctx,
-            last_hidden,
-            &self.norm,
-            self.config.rms_norm_eps,
-            last_normed,
-        )?;
-        gemv(&self.ctx, self.output_projection(), last_normed, logits)?;
+        crate::profile::profile_op(&self.ctx, "lm_head", None, seq_len, || {
+            copy_row_to_vec(&self.ctx, hidden, 0, last_hidden)?;
+            rms_norm_vec(
+                &self.ctx,
+                last_hidden,
+                &self.norm,
+                self.config.rms_norm_eps,
+                last_normed,
+            )?;
+            gemv(&self.ctx, self.output_projection(), last_normed, logits)
+        })?;
         Ok(())
     }
 }

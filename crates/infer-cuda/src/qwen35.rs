@@ -41,9 +41,7 @@ use cuda_kernels::prelude::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStates
 use cuda_kernels::tensor::{
     HostMatrixSnapshot, WeightFormat, cache_ptr, offload_raw_slice, reload_raw_slice,
 };
-use cudarc::driver::{
-    CudaSlice, CudaView, CudaViewMut, DevicePtr, DevicePtrMut, PinnedHostSlice, sys::CUevent_flags,
-};
+use cudarc::driver::{CudaSlice, CudaView, CudaViewMut, DevicePtr, DevicePtrMut, PinnedHostSlice};
 use half::bf16;
 use infer_plan::SamplingParams;
 use infer_topo::TpConfig;
@@ -86,13 +84,6 @@ const FA3_DECODE_SPLITS_FLOOR: usize = 8;
 mod probe;
 #[cfg(test)]
 pub(crate) use probe::*;
-fn qwen35_profile_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var_os("ARLE_QWEN35_PROFILE").is_some()
-            || std::env::var_os("ARLE_QWEN35_MOE_PROFILE").is_some()
-    })
-}
 
 fn qwen35_startup_profile_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
@@ -107,41 +98,6 @@ fn qwen35_startup_log(phase: &str, start: Instant, extra: std::fmt::Arguments<'_
             start.elapsed().as_secs_f64() * 1000.0
         );
     }
-}
-
-fn qwen35_profile<T>(
-    ctx: &DeviceContext,
-    label: &'static str,
-    layer_idx: Option<usize>,
-    seq_len: usize,
-    f: impl FnOnce() -> Result<T>,
-) -> Result<T> {
-    if !qwen35_profile_enabled() {
-        return f();
-    }
-    let start = ctx.ctx.new_event(Some(CUevent_flags::CU_EVENT_DEFAULT))?;
-    let stop = ctx.ctx.new_event(Some(CUevent_flags::CU_EVENT_DEFAULT))?;
-    start.record(&ctx.stream)?;
-    let host_t0 = Instant::now();
-    let result = f();
-    let host_ms = host_t0.elapsed().as_secs_f64() * 1000.0;
-    stop.record(&ctx.stream)?;
-    stop.synchronize()?;
-    let cuda_ms = start.elapsed_ms(&stop)? as f64;
-    if std::env::var("INFER_TP_RANK")
-        .map(|rank| rank == "0")
-        .unwrap_or(true)
-    {
-        match layer_idx {
-            Some(layer_idx) => eprintln!(
-                "[qwen-layer-profile] {label} layer={layer_idx} seq={seq_len} cuda_ms={cuda_ms:.3} host_ms={host_ms:.3}"
-            ),
-            None => eprintln!(
-                "[qwen-layer-profile] {label} layer=na seq={seq_len} cuda_ms={cuda_ms:.3} host_ms={host_ms:.3}"
-            ),
-        }
-    }
-    result
 }
 
 /// Route full-attention prefill chunks (`seq_len > 1`) through the vendored

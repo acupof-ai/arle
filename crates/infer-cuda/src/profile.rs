@@ -47,11 +47,15 @@ pub fn profile_op<T>(
     seq_len: usize,
     f: impl FnOnce() -> Result<T>,
 ) -> Result<T> {
-    let nvtx_label = match layer_idx {
-        Some(idx) => format!("{name}_layer{idx} seq={seq_len}"),
-        None => format!("{name} seq={seq_len}"),
+    let _nvtx = if crate::nvtx::is_enabled() {
+        let label = match layer_idx {
+            Some(idx) => format!("{name}_layer{idx} seq={seq_len}"),
+            None => format!("{name} seq={seq_len}"),
+        };
+        Some(crate::nvtx::range(&label))
+    } else {
+        None
     };
-    let _nvtx = crate::nvtx::range(&nvtx_label);
 
     if !enabled() {
         return f();

@@ -32,6 +32,10 @@ fn enabled() -> bool {
     })
 }
 
+pub(crate) fn is_enabled() -> bool {
+    enabled()
+}
+
 fn load() -> NvtxFns {
     // SAFETY: dlopen/dlsym on NUL-terminated static names; every returned
     // pointer is null-checked before use, and the transmuted signatures match

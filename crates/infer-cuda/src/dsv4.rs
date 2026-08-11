@@ -2488,19 +2488,18 @@ impl Dsv4Model {
             sched.ancestors.len(),
             tokens.len()
         );
-        let _nvtx = crate::nvtx::range("dsv4/lm_head_verify");
-
         // ONE scheduled sparse verify forward. `hiddens[j]` = row j's MTP
         // stream; `argmax[j]` = the target's argmax AFTER `tokens[j]` (so
         // `argmax[i]` is exactly what an accepted child of node i must equal).
         // Attention uses the frozen sparse verify lane and does not commit slot
         // KV state.
         let stream_dim = self.config.hidden_size * self.config.hc_mult;
+        let seq_len = tokens.len();
         let was_frozen = crate::attention::dsv4_verify_frozen();
         if !was_frozen {
             crate::attention::set_dsv4_verify_frozen(true);
         }
-        let result = (|| -> Result<SpecVerifyResult> {
+        let result = crate::profile::profile_op(&self.ctx, "lm_head", None, seq_len, || {
             let (stream, mut keepalive) = self.forward_tokens_stream_impl(
                 slot,
                 kv_adapter,
@@ -2525,7 +2524,7 @@ impl Dsv4Model {
                 argmax,
                 hiddens,
             })
-        })();
+        });
         if !was_frozen {
             crate::attention::set_dsv4_verify_frozen(false);
         }
@@ -2574,30 +2573,31 @@ impl Dsv4Model {
             start_positions,
             capture_taps,
         )?;
-        let _nvtx = crate::nvtx::range("dsv4/lm_head_sample_batched");
         let fast_head = self.lm_head_shard.is_none()
             && params.iter().all(SamplingParams::is_greedy)
             && !crate::probe::token_entropy()
             && crate::probe::lens_layers() == 0
             && std::env::var_os("INFER_DSV4_DUMP_TOPK_POSITIONS").is_none();
-        let out_tokens = if fast_head {
-            let logits = self.verify_logits_from_stream(&stream, n, &mut keepalive)?;
-            self.mtp_argmax_batch(&logits)?
-        } else {
-            // `forward_stream_last_token` folds row `seq_len - 1`.
-            (0..n)
-                .map(|r| {
-                    self.forward_stream_last_token(
-                        &stream,
-                        r + 1,
-                        &params[r],
-                        positions[r],
-                        None,
-                        &mut keepalive,
-                    )
-                })
-                .collect::<Result<Vec<_>>>()?
-        };
+        let out_tokens = crate::profile::profile_op(&self.ctx, "lm_head", None, n, || {
+            if fast_head {
+                let logits = self.verify_logits_from_stream(&stream, n, &mut keepalive)?;
+                self.mtp_argmax_batch(&logits)
+            } else {
+                // `forward_stream_last_token` folds row `seq_len - 1`.
+                (0..n)
+                    .map(|r| {
+                        self.forward_stream_last_token(
+                            &stream,
+                            r + 1,
+                            &params[r],
+                            positions[r],
+                            None,
+                            &mut keepalive,
+                        )
+                    })
+                    .collect::<Result<Vec<_>>>()
+            }
+        })?;
         // Post-sampling sync point: all rows' emitted tokens are known.
         crate::probe::lens_flush(&self.ctx, positions, &out_tokens);
         dsv4_decode_trace(
@@ -2691,24 +2691,25 @@ impl Dsv4Model {
         }
 
         let token_ids_host: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
-        let nvtx_embed = crate::nvtx::range("dsv4/embed");
         let token_ids = crate::ops::upload_i32(&self.ctx, &token_ids_host)?;
         keepalive.keep_i32(&token_ids);
         // SAFETY: embedding_batch writes the full [seq_len, hidden_size] buffer.
         let mut embeddings = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
-        crate::ops::embedding_batch(&self.ctx, &self.embed_tokens, &token_ids, &mut embeddings)?;
-        keepalive.keep_hidden(&embeddings);
         // SAFETY: initial_stream_from_embeddings writes the full stream buffer.
         let mut stream = unsafe { HiddenStates::uninit(&self.ctx, stream_dim, seq_len)? };
-        crate::hc::initial_stream_from_embeddings(
-            &self.ctx,
-            &embeddings,
-            hidden_size,
-            hc_mult,
-            &mut stream,
-        )?;
+        crate::profile::profile_op(&self.ctx, "embedding", None, seq_len, || {
+            crate::ops::embedding_batch(&self.ctx, &self.embed_tokens, &token_ids, &mut embeddings)
+                .map_err(|e| anyhow!("DSv4 embed lookup failed: {e}"))?;
+            crate::hc::initial_stream_from_embeddings(
+                &self.ctx,
+                &embeddings,
+                hidden_size,
+                hc_mult,
+                &mut stream,
+            )
+        })?;
+        keepalive.keep_hidden(&embeddings);
         keepalive.keep_hidden(&stream);
-        drop(nvtx_embed);
 
         // Reusable [hidden,1] scratch for the per-row attention copy-in/out.
         // Declared once (lives to function return → stream-ordered free, like the
@@ -2829,7 +2830,6 @@ impl Dsv4Model {
             crate::probe::lens_begin();
         }
         for (layer_idx, layer) in self.layers.iter().enumerate() {
-            let _layer_nvtx = crate::nvtx::range(&format!("dsv4/layer_{layer_idx:02}"));
             let full_flatten = layer.mode != DeepSeekV4AttentionMode::SparseIndexed;
 
             // Diagnostic-only substage fingerprint (`ARLE_PROBE_STAGES`, see
@@ -2862,24 +2862,51 @@ impl Dsv4Model {
             // SAFETY: uninit device scratch; fully written before first read.
             let mut normed = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
             let attn_mhc = if self.config.is_glm() {
-                crate::ops::rms_norm_batch(&self.ctx, &stream, &layer.attn_norm, eps, &mut normed)?;
+                crate::profile::profile_op(
+                    ctx,
+                    "attn_hc_pre_norm",
+                    Some(layer_idx),
+                    seq_len,
+                    || {
+                        crate::ops::rms_norm_batch(
+                            &self.ctx,
+                            &stream,
+                            &layer.attn_norm,
+                            eps,
+                            &mut normed,
+                        )
+                    },
+                )?;
                 None
             } else {
-                let mhc =
-                    crate::hc::gen_mhc_params(&self.ctx, &self.config, &layer.hc_attn, &stream)?;
+                let mhc = crate::profile::profile_op(
+                    ctx,
+                    "attn_hc_params",
+                    Some(layer_idx),
+                    seq_len,
+                    || crate::hc::gen_mhc_params(&self.ctx, &self.config, &layer.hc_attn, &stream),
+                )?;
                 keepalive.keep_f32(&mhc.pre);
                 keepalive.keep_f32(&mhc.post);
                 keepalive.keep_f32(&mhc.comb);
                 // SAFETY: fused hc_pre+rms_norm writes the full [seq_len, hidden_size] buffer.
-                crate::hc::mhc_pre_rms_norm(
-                    &self.ctx,
-                    &stream,
-                    &mhc.pre,
-                    &layer.attn_norm,
-                    eps,
-                    hidden_size,
-                    hc_mult,
-                    &mut normed,
+                crate::profile::profile_op(
+                    ctx,
+                    "attn_hc_pre_norm",
+                    Some(layer_idx),
+                    seq_len,
+                    || {
+                        crate::hc::mhc_pre_rms_norm(
+                            &self.ctx,
+                            &stream,
+                            &mhc.pre,
+                            &layer.attn_norm,
+                            eps,
+                            hidden_size,
+                            hc_mult,
+                            &mut normed,
+                        )
+                    },
                 )?;
                 Some(mhc)
             };
@@ -2942,7 +2969,6 @@ impl Dsv4Model {
                         .layer_dsa_and_flashmla_batch_mut(layer_idx)?
                         .1
                         .is_some();
-                let _nvtx = crate::nvtx::range("dsv4/mla_attn_batched");
                 // N-row staging for the batched CSA select. CompressedSparse uses the
                 // batched indexer-query prepass output directly; lanes without that
                 // prepass (SparseIndexed) stage per-row q_i/weights here.
@@ -3231,382 +3257,415 @@ impl Dsv4Model {
                 } else {
                     None
                 };
-                {
-                    let _nvtx = crate::nvtx::range("dsv4/mla_attn_batched_prepare");
-                    // Op "c" batched KV pack (MODEL1 only): when `pack_batched` is on,
-                    // the per-row pack's SW one-token + compressed-delta launches are
-                    // HOISTED out of this loop into ONE batched launch each after it
-                    // (the SW-ring BOOTSTRAP stays per-row — once per slot). Gather
-                    // each row's k_prepared NoPE/RoPE base, compressor `compressed`
-                    // base (0 = no-op for no-compressor rows), and per-slot device
-                    // page-table pointer here; the persistent device page tables live
-                    // in `flash.device_page_table` (not per-call temporaries — #8).
-                    // V32 (head_dim==576) and SparseIndexed (!full_flatten) keep the
-                    // per-row pack byte-for-byte.
-                    // Post-restore/bulk gap (codex R3): the batched pack only
-                    // packs THIS step's delta; a restored slot re-enters decode
-                    // with fp8_kv_comp_packed_rows=0 and needs the single-row
-                    // path's [packed_rows, seq_len) bulk rebuild — run the whole
-                    // layer per-row this tick. Batched gap-fill is future work.
-                    let comp_bulk_gap = (0..n)
-                        .any(|r| slots[slot_ids[r]].attention[layer_idx].flashmla_comp_bulk_gap());
-                    let pack_batched =
-                        full_flatten && self.config.head_dim != 576 && !comp_bulk_gap;
-                    let mut pack_nope_ptrs: Vec<u64> = Vec::new();
-                    let mut pack_rope_ptrs: Vec<u64> = Vec::new();
-                    let mut pack_compressed_ptrs: Vec<u64> = Vec::new();
-                    let mut pack_pt_ptrs: Vec<u64> = Vec::new();
-                    let mut pack_sw_blocks: usize = 0;
-                    let mut pack_num_logical_pages: usize = 0;
-                    if pack_batched {
-                        pack_nope_ptrs.reserve(n);
-                        pack_rope_ptrs.reserve(n);
-                        pack_compressed_ptrs.reserve(n);
-                        pack_pt_ptrs.reserve(n);
-                    }
-                    for r in 0..n {
-                        if !full_flatten {
-                            let src = normed.data.slice(r * hidden_size..(r + 1) * hidden_size);
-                            ctx.stream
-                                .memcpy_dtod(&src, &mut normed_row.data)
-                                .map_err(|e| anyhow!("DSv4 batched attn copy-in failed: {e}"))?;
-                            let cq_src = proj
-                                .c_q_normed
-                                .data
-                                .slice(r * q_lora_rank..(r + 1) * q_lora_rank);
-                            ctx.stream
-                                .memcpy_dtod(&cq_src, &mut c_q_normed_row.data)
-                                .map_err(|e| anyhow!("DSv4 batched c_q copy-in failed: {e}"))?;
+                crate::profile::profile_op(
+                    ctx,
+                    "attention_prepare",
+                    Some(layer_idx),
+                    seq_len,
+                    || {
+                        // Op "c" batched KV pack (MODEL1 only): when `pack_batched` is on,
+                        // the per-row pack's SW one-token + compressed-delta launches are
+                        // HOISTED out of this loop into ONE batched launch each after it
+                        // (the SW-ring BOOTSTRAP stays per-row — once per slot). Gather
+                        // each row's k_prepared NoPE/RoPE base, compressor `compressed`
+                        // base (0 = no-op for no-compressor rows), and per-slot device
+                        // page-table pointer here; the persistent device page tables live
+                        // in `flash.device_page_table` (not per-call temporaries — #8).
+                        // V32 (head_dim==576) and SparseIndexed (!full_flatten) keep the
+                        // per-row pack byte-for-byte.
+                        // Post-restore/bulk gap (codex R3): the batched pack only
+                        // packs THIS step's delta; a restored slot re-enters decode
+                        // with fp8_kv_comp_packed_rows=0 and needs the single-row
+                        // path's [packed_rows, seq_len) bulk rebuild — run the whole
+                        // layer per-row this tick. Batched gap-fill is future work.
+                        let comp_bulk_gap = (0..n).any(|r| {
+                            slots[slot_ids[r]].attention[layer_idx].flashmla_comp_bulk_gap()
+                        });
+                        let pack_batched =
+                            full_flatten && self.config.head_dim != 576 && !comp_bulk_gap;
+                        let mut pack_nope_ptrs: Vec<u64> = Vec::new();
+                        let mut pack_rope_ptrs: Vec<u64> = Vec::new();
+                        let mut pack_compressed_ptrs: Vec<u64> = Vec::new();
+                        let mut pack_pt_ptrs: Vec<u64> = Vec::new();
+                        let mut pack_sw_blocks: usize = 0;
+                        let mut pack_num_logical_pages: usize = 0;
+                        if pack_batched {
+                            pack_nope_ptrs.reserve(n);
+                            pack_rope_ptrs.reserve(n);
+                            pack_compressed_ptrs.reserve(n);
+                            pack_pt_ptrs.reserve(n);
                         }
-                        // This row's q_prepared / k_prepared slices → fresh OWNED
-                        // [*, 1] HiddenStates the compressed-only finish takes by
-                        // value into the returned Dsv4MlaPrepared (the batched fwd
-                        // reads the gathered Q; the finish loop reads
-                        // k_prepared/local_attn — both must outlive the reused row
-                        // scratch). Cheap [*, 1] bf16 alloc per row.
-                        // SAFETY: each dtod copy fills the full buffer before read.
-                        let mut q_prepared_owned =
-                            unsafe { HiddenStates::uninit(&self.ctx, local_width, 1)? };
-                        {
-                            let qp_src = proj
-                                .q_prepared
-                                .data
-                                .slice(r * local_width..(r + 1) * local_width);
-                            ctx.stream
-                                .memcpy_dtod(&qp_src, &mut q_prepared_owned.data)
-                                .map_err(|e| {
-                                    anyhow!("DSv4 batched q_prepared owned copy failed: {e}")
-                                })?;
-                        }
-                        let mut k_prepared_owned =
+                        for r in 0..n {
+                            if !full_flatten {
+                                let src = normed.data.slice(r * hidden_size..(r + 1) * hidden_size);
+                                ctx.stream.memcpy_dtod(&src, &mut normed_row.data).map_err(
+                                    |e| anyhow!("DSv4 batched attn copy-in failed: {e}"),
+                                )?;
+                                let cq_src = proj
+                                    .c_q_normed
+                                    .data
+                                    .slice(r * q_lora_rank..(r + 1) * q_lora_rank);
+                                ctx.stream
+                                    .memcpy_dtod(&cq_src, &mut c_q_normed_row.data)
+                                    .map_err(|e| anyhow!("DSv4 batched c_q copy-in failed: {e}"))?;
+                            }
+                            // This row's q_prepared / k_prepared slices → fresh OWNED
+                            // [*, 1] HiddenStates the compressed-only finish takes by
+                            // value into the returned Dsv4MlaPrepared (the batched fwd
+                            // reads the gathered Q; the finish loop reads
+                            // k_prepared/local_attn — both must outlive the reused row
+                            // scratch). Cheap [*, 1] bf16 alloc per row.
+                            // SAFETY: each dtod copy fills the full buffer before read.
+                            let mut q_prepared_owned =
+                                unsafe { HiddenStates::uninit(&self.ctx, local_width, 1)? };
+                            {
+                                let qp_src = proj
+                                    .q_prepared
+                                    .data
+                                    .slice(r * local_width..(r + 1) * local_width);
+                                ctx.stream
+                                    .memcpy_dtod(&qp_src, &mut q_prepared_owned.data)
+                                    .map_err(|e| {
+                                        anyhow!("DSv4 batched q_prepared owned copy failed: {e}")
+                                    })?;
+                            }
+                            let mut k_prepared_owned =
                             // SAFETY: uninit device scratch; fully written before first read.
                             unsafe { HiddenStates::uninit(&self.ctx, mla_head_dim, 1)? };
-                        {
-                            let kp_src = proj
-                                .k_prepared
-                                .data
-                                .slice(r * mla_head_dim..(r + 1) * mla_head_dim);
-                            ctx.stream
-                                .memcpy_dtod(&kp_src, &mut k_prepared_owned.data)
-                                .map_err(|e| {
-                                    anyhow!("DSv4 batched k_prepared owned copy failed: {e}")
-                                })?;
-                        }
-                        let (
-                            layer_pool,
-                            dsa_shared,
-                            flash_batch,
-                            flashmla_scratch,
-                            _prefill_shared,
-                        ) = kv_adapter.layer_dsa_and_flashmla_batch_mut(layer_idx)?;
-                        let flash_batch = flash_batch.ok_or_else(|| {
-                            anyhow!("DSv4 batched decode lane: batch scratch missing")
-                        })?;
-                        let flashmla_scratch = flashmla_scratch.ok_or_else(|| {
-                            anyhow!("DSv4 batched decode lane: single-row decode scratch missing")
-                        })?;
-                        let slot = &mut slots[slot_ids[r]];
-                        slot_block_offsets
-                            .push(layer_pool.flashmla_slot_first_block_or_zero(slot_ids[r])?);
-                        page_tables.push(layer_pool.flashmla_page_table_padded_i32(slot_ids[r])?);
-                        // Batched CSA select: thread this row's gather sink (q_i /
-                        // weights staging + key_count capture). `csa_select` then
-                        // runs cache writes only and returns `selected: None`; the
-                        // ONE `csa_select_official_batched` after the loop fills
-                        // `selected_batched`. When not batching DSA, `None` →
-                        // byte-identical per-row select.
-                        let need_dsa_stage =
-                            use_batched_dsa_select && indexer_query_kv_score.is_none();
-                        if need_dsa_stage && dsa_stage_q_i.is_none() {
-                            let index_heads = self.config.index_n_heads;
-                            let q_width = index_heads * self.config.index_head_dim;
-                            // SAFETY: each row's slice is fully written by the per-row
-                            // gather before the batched select reads it.
-                            let q_b = unsafe { HiddenStates::uninit(&self.ctx, q_width, n)? };
-                            // SAFETY: uninit device scratch; fully written before first read.
-                            let w_b = unsafe { HiddenStates::uninit(&self.ctx, index_heads, n)? };
-                            keepalive.keep_hidden(&q_b);
-                            keepalive.keep_hidden(&w_b);
-                            dsa_stage_q_i = Some(q_b);
-                            dsa_stage_weights = Some(w_b);
-                        }
-                        let batched_gather = if use_batched_dsa_select {
-                            Some(crate::attention::Dsv4DsaBatchedGather {
-                                q_i_batch: dsa_stage_q_i.as_mut(),
-                                weights_batch: dsa_stage_weights.as_mut(),
-                                row: r,
-                                key_counts: dsa_key_counts
-                                    .as_mut()
-                                    .expect("batched DSA key_counts present"),
-                                // CompressedSparse full-flatten: P1b already wrote
-                                // the cache; csa_select skips the per-row write.
-                                // SparseIndexed (no P1b): false → per-row write.
-                                cache_writes_in_prepass,
-                            })
-                        } else {
-                            None
-                        };
-                        // Slice this row's `[width,1]` column out of the batched
-                        // compressor/indexer pre-pass outputs (gate ON). Mirrors the
-                        // q_prepared_owned slice convention above: a fresh owned
-                        // [width,1] bf16 buffer per row, filled by a single dtod copy,
-                        // referenced (not consumed) by the precomputed struct so it
-                        // outlives the prepare call. `None` means no batched
-                        // projection exists for this layer.
-                        let slice_row = |src: &HiddenStates| -> Result<HiddenStates> {
-                            let width = src.hidden_dim;
-                            // SAFETY: the dtod copy fills the full buffer before read.
-                            let mut row_buf = unsafe { HiddenStates::uninit(&self.ctx, width, 1)? };
-                            let col = src.data.slice(r * width..(r + 1) * width);
-                            self.ctx
-                                .stream
-                                .memcpy_dtod(&col, &mut row_buf.data)
-                                .map_err(|e| {
-                                    anyhow!("DSv4 batched compressor slice copy failed: {e}")
-                                })?;
-                            Ok(row_buf)
-                        };
-                        // Full-flatten: the compressor STATE update already ran
-                        // batched in P1a, so the per-row `[width,1]` slice copies (the
-                        // ∝n per-row work this campaign removes) are SKIPPED — pass
-                        // `skip_compressor=true` + the P1a-captured `indexer_rows_before`
-                        // and NO precomputed slices. Without full-flatten, build the
-                        // per-row slices and run the per-row compressor as before.
-                        //
-                        // The owned slice buffers are bound at iteration scope so they
-                        // outlive the prepare call that borrows them through
-                        // `compressor_precomputed` (dropping at iteration end). Empty
-                        // (`None`) under full-flatten — no per-row slice work.
-                        let (comp_main_row, comp_indexer_row) = if full_flatten {
-                            (None, None)
-                        } else {
-                            let main_row = match compressor_kv_score.as_ref() {
-                                Some((kv, score)) => Some((slice_row(kv)?, slice_row(score)?)),
-                                None => None,
-                            };
-                            let indexer_row = match indexer_kv_score.as_ref() {
-                                Some((kv, score)) => Some((slice_row(kv)?, slice_row(score)?)),
-                                None => None,
-                            };
-                            (main_row, indexer_row)
-                        };
-                        let compressor_precomputed = comp_main_row.as_ref().map(|(kv, score)| {
-                            crate::attention::Dsv4CompressorPrecomputed {
-                                main: (kv, score),
-                                indexer: comp_indexer_row
-                                    .as_ref()
-                                    .map(|(ikv, iscore)| (ikv as &_, iscore as &_)),
+                            {
+                                let kp_src = proj
+                                    .k_prepared
+                                    .data
+                                    .slice(r * mla_head_dim..(r + 1) * mla_head_dim);
+                                ctx.stream
+                                    .memcpy_dtod(&kp_src, &mut k_prepared_owned.data)
+                                    .map_err(|e| {
+                                        anyhow!("DSv4 batched k_prepared owned copy failed: {e}")
+                                    })?;
                             }
-                        });
-                        // CSA indexer-query batched pre-pass: borrow this row's
-                        // `[width,1]` column VIEW of `q_i`/`weights` so `csa_select`
-                        // skips the per-row m=1 GEMVs AND the per-row D2D re-copy —
-                        // the view feeds the prepass column's device pointer straight
-                        // into the gather (zero copy; same address the old per-row
-                        // copy produced → byte-identical). `None` when the pre-pass
-                        // didn't run (SparseIndexed / no indexer) → byte-identical
-                        // per-row GEMVs.
-                        let indexer_query_precomputed =
-                            indexer_query_kv_score.as_ref().map(|(q_i, weights)| {
-                                crate::attention::Dsv4IndexerQueryPrecomputed {
-                                    q_i: q_i.col(r),
-                                    weights: weights.col(r),
-                                }
-                            });
-                        let skip_compressor = full_flatten;
-                        let idx_before_override = if full_flatten {
-                            indexer_rows_before.get(r).copied()
-                        } else {
-                            None
-                        };
-                        let row_prepared = crate::attention::mla_attention_prepare_compressed_only(
-                            &self.ctx,
-                            &self.config,
-                            &layer.attention,
-                            layer.mode,
-                            layer.compress_ratio,
-                            layer_idx,
-                            &normed_row,
-                            &c_q_normed_row,
-                            q_prepared_owned,
-                            k_prepared_owned,
-                            &proj,
-                            &mut slot.attention[layer_idx],
-                            layer_pool,
-                            dsa_shared,
-                            start_positions[r],
-                            Some(&slot.start_pos_device),
-                            batched_gather,
-                            compressor_precomputed,
-                            indexer_query_precomputed,
-                            skip_compressor,
-                            idx_before_override,
-                            &mut keepalive,
-                        )?;
-                        // Pack this row's KV into the shared pool, then gather its
-                        // global-head Q into q_batched[r]. flash arena + pool +
-                        // batch scratch are disjoint (slots vs kv_adapter fields).
-                        let (flash, sw_window, compressed) =
-                            slot.attention[layer_idx].flashmla_pack_borrow(want_compressed)?;
-                        if pack_batched {
-                            // Op "c": run the once-per-slot SW-ring BOOTSTRAP here
-                            // (no-op after the first decode); gather this row's pack
-                            // pointers + per-slot device page table for the ONE
-                            // batched SW+compressed pack issued after the loop.
-                            crate::attention::flashmla_pack_sw_ring(
-                                &self.ctx,
-                                flash,
-                                flashmla_scratch,
+                            let (
                                 layer_pool,
-                                sw_window,
-                                &self.config,
-                            )?;
-                            pack_sw_blocks = flash.sw_blocks();
-                            let (nope_ptr, ng) =
-                                row_prepared.k_prepared.data.device_ptr(&self.ctx.stream);
-                            pack_nope_ptrs.push(nope_ptr);
-                            pack_rope_ptrs.push(
-                                nope_ptr
-                                    + crate::attention::flashmla_pack_rope_offset_bytes(
-                                        &self.config,
-                                    ),
-                            );
-                            drop(ng);
-                            match compressed {
-                                Some(c) => {
-                                    let (cp, cg) = c.data.device_ptr(&self.ctx.stream);
-                                    pack_compressed_ptrs.push(cp);
-                                    drop(cg);
-                                }
-                                None => pack_compressed_ptrs.push(0),
+                                dsa_shared,
+                                flash_batch,
+                                flashmla_scratch,
+                                _prefill_shared,
+                            ) = kv_adapter.layer_dsa_and_flashmla_batch_mut(layer_idx)?;
+                            let flash_batch = flash_batch.ok_or_else(|| {
+                                anyhow!("DSv4 batched decode lane: batch scratch missing")
+                            })?;
+                            let flashmla_scratch = flashmla_scratch.ok_or_else(|| {
+                                anyhow!(
+                                    "DSv4 batched decode lane: single-row decode scratch missing"
+                                )
+                            })?;
+                            let slot = &mut slots[slot_ids[r]];
+                            slot_block_offsets
+                                .push(layer_pool.flashmla_slot_first_block_or_zero(slot_ids[r])?);
+                            page_tables
+                                .push(layer_pool.flashmla_page_table_padded_i32(slot_ids[r])?);
+                            // Batched CSA select: thread this row's gather sink (q_i /
+                            // weights staging + key_count capture). `csa_select` then
+                            // runs cache writes only and returns `selected: None`; the
+                            // ONE `csa_select_official_batched` after the loop fills
+                            // `selected_batched`. When not batching DSA, `None` →
+                            // byte-identical per-row select.
+                            let need_dsa_stage =
+                                use_batched_dsa_select && indexer_query_kv_score.is_none();
+                            if need_dsa_stage && dsa_stage_q_i.is_none() {
+                                let index_heads = self.config.index_n_heads;
+                                let q_width = index_heads * self.config.index_head_dim;
+                                // SAFETY: each row's slice is fully written by the per-row
+                                // gather before the batched select reads it.
+                                let q_b = unsafe { HiddenStates::uninit(&self.ctx, q_width, n)? };
+                                // SAFETY: uninit device scratch; fully written before first read.
+                                let w_b =
+                                    unsafe { HiddenStates::uninit(&self.ctx, index_heads, n)? };
+                                keepalive.keep_hidden(&q_b);
+                                keepalive.keep_hidden(&w_b);
+                                dsa_stage_q_i = Some(q_b);
+                                dsa_stage_weights = Some(w_b);
                             }
-                            // Use the persistent device page table from flash
-                            // state (not a per-call temporary that would be freed
-                            // before the batched kernel runs — #8 graph UAF).
-                            pack_num_logical_pages =
-                                pack_num_logical_pages.max(flash.device_page_table.len());
-                            let (pt, pg) = flash.device_page_table.device_ptr(&self.ctx.stream);
-                            pack_pt_ptrs.push(pt);
-                            drop(pg);
-                        } else {
-                            crate::attention::flashmla_decode_pack_row(
+                            let batched_gather = if use_batched_dsa_select {
+                                Some(crate::attention::Dsv4DsaBatchedGather {
+                                    q_i_batch: dsa_stage_q_i.as_mut(),
+                                    weights_batch: dsa_stage_weights.as_mut(),
+                                    row: r,
+                                    key_counts: dsa_key_counts
+                                        .as_mut()
+                                        .expect("batched DSA key_counts present"),
+                                    // CompressedSparse full-flatten: P1b already wrote
+                                    // the cache; csa_select skips the per-row write.
+                                    // SparseIndexed (no P1b): false → per-row write.
+                                    cache_writes_in_prepass,
+                                })
+                            } else {
+                                None
+                            };
+                            // Slice this row's `[width,1]` column out of the batched
+                            // compressor/indexer pre-pass outputs (gate ON). Mirrors the
+                            // q_prepared_owned slice convention above: a fresh owned
+                            // [width,1] bf16 buffer per row, filled by a single dtod copy,
+                            // referenced (not consumed) by the precomputed struct so it
+                            // outlives the prepare call. `None` means no batched
+                            // projection exists for this layer.
+                            let slice_row = |src: &HiddenStates| -> Result<HiddenStates> {
+                                let width = src.hidden_dim;
+                                // SAFETY: the dtod copy fills the full buffer before read.
+                                let mut row_buf =
+                                    unsafe { HiddenStates::uninit(&self.ctx, width, 1)? };
+                                let col = src.data.slice(r * width..(r + 1) * width);
+                                self.ctx
+                                    .stream
+                                    .memcpy_dtod(&col, &mut row_buf.data)
+                                    .map_err(|e| {
+                                        anyhow!("DSv4 batched compressor slice copy failed: {e}")
+                                    })?;
+                                Ok(row_buf)
+                            };
+                            // Full-flatten: the compressor STATE update already ran
+                            // batched in P1a, so the per-row `[width,1]` slice copies (the
+                            // ∝n per-row work this campaign removes) are SKIPPED — pass
+                            // `skip_compressor=true` + the P1a-captured `indexer_rows_before`
+                            // and NO precomputed slices. Without full-flatten, build the
+                            // per-row slices and run the per-row compressor as before.
+                            //
+                            // The owned slice buffers are bound at iteration scope so they
+                            // outlive the prepare call that borrows them through
+                            // `compressor_precomputed` (dropping at iteration end). Empty
+                            // (`None`) under full-flatten — no per-row slice work.
+                            let (comp_main_row, comp_indexer_row) = if full_flatten {
+                                (None, None)
+                            } else {
+                                let main_row = match compressor_kv_score.as_ref() {
+                                    Some((kv, score)) => Some((slice_row(kv)?, slice_row(score)?)),
+                                    None => None,
+                                };
+                                let indexer_row = match indexer_kv_score.as_ref() {
+                                    Some((kv, score)) => Some((slice_row(kv)?, slice_row(score)?)),
+                                    None => None,
+                                };
+                                (main_row, indexer_row)
+                            };
+                            let compressor_precomputed =
+                                comp_main_row.as_ref().map(|(kv, score)| {
+                                    crate::attention::Dsv4CompressorPrecomputed {
+                                        main: (kv, score),
+                                        indexer: comp_indexer_row
+                                            .as_ref()
+                                            .map(|(ikv, iscore)| (ikv as &_, iscore as &_)),
+                                    }
+                                });
+                            // CSA indexer-query batched pre-pass: borrow this row's
+                            // `[width,1]` column VIEW of `q_i`/`weights` so `csa_select`
+                            // skips the per-row m=1 GEMVs AND the per-row D2D re-copy —
+                            // the view feeds the prepass column's device pointer straight
+                            // into the gather (zero copy; same address the old per-row
+                            // copy produced → byte-identical). `None` when the pre-pass
+                            // didn't run (SparseIndexed / no indexer) → byte-identical
+                            // per-row GEMVs.
+                            let indexer_query_precomputed =
+                                indexer_query_kv_score.as_ref().map(|(q_i, weights)| {
+                                    crate::attention::Dsv4IndexerQueryPrecomputed {
+                                        q_i: q_i.col(r),
+                                        weights: weights.col(r),
+                                    }
+                                });
+                            let skip_compressor = full_flatten;
+                            let idx_before_override = if full_flatten {
+                                indexer_rows_before.get(r).copied()
+                            } else {
+                                None
+                            };
+                            let row_prepared =
+                                crate::attention::mla_attention_prepare_compressed_only(
+                                    &self.ctx,
+                                    &self.config,
+                                    &layer.attention,
+                                    layer.mode,
+                                    layer.compress_ratio,
+                                    layer_idx,
+                                    &normed_row,
+                                    &c_q_normed_row,
+                                    q_prepared_owned,
+                                    k_prepared_owned,
+                                    &proj,
+                                    &mut slot.attention[layer_idx],
+                                    layer_pool,
+                                    dsa_shared,
+                                    start_positions[r],
+                                    Some(&slot.start_pos_device),
+                                    batched_gather,
+                                    compressor_precomputed,
+                                    indexer_query_precomputed,
+                                    skip_compressor,
+                                    idx_before_override,
+                                    &mut keepalive,
+                                )?;
+                            // Pack this row's KV into the shared pool, then gather its
+                            // global-head Q into q_batched[r]. flash arena + pool +
+                            // batch scratch are disjoint (slots vs kv_adapter fields).
+                            let (flash, sw_window, compressed) =
+                                slot.attention[layer_idx].flashmla_pack_borrow(want_compressed)?;
+                            if pack_batched {
+                                // Op "c": run the once-per-slot SW-ring BOOTSTRAP here
+                                // (no-op after the first decode); gather this row's pack
+                                // pointers + per-slot device page table for the ONE
+                                // batched SW+compressed pack issued after the loop.
+                                crate::attention::flashmla_pack_sw_ring(
+                                    &self.ctx,
+                                    flash,
+                                    flashmla_scratch,
+                                    layer_pool,
+                                    sw_window,
+                                    &self.config,
+                                )?;
+                                pack_sw_blocks = flash.sw_blocks();
+                                let (nope_ptr, ng) =
+                                    row_prepared.k_prepared.data.device_ptr(&self.ctx.stream);
+                                pack_nope_ptrs.push(nope_ptr);
+                                pack_rope_ptrs.push(
+                                    nope_ptr
+                                        + crate::attention::flashmla_pack_rope_offset_bytes(
+                                            &self.config,
+                                        ),
+                                );
+                                drop(ng);
+                                match compressed {
+                                    Some(c) => {
+                                        let (cp, cg) = c.data.device_ptr(&self.ctx.stream);
+                                        pack_compressed_ptrs.push(cp);
+                                        drop(cg);
+                                    }
+                                    None => pack_compressed_ptrs.push(0),
+                                }
+                                // Use the persistent device page table from flash
+                                // state (not a per-call temporary that would be freed
+                                // before the batched kernel runs — #8 graph UAF).
+                                pack_num_logical_pages =
+                                    pack_num_logical_pages.max(flash.device_page_table.len());
+                                let (pt, pg) = flash.device_page_table.device_ptr(&self.ctx.stream);
+                                pack_pt_ptrs.push(pt);
+                                drop(pg);
+                            } else {
+                                crate::attention::flashmla_decode_pack_row(
+                                    &self.ctx,
+                                    &self.config,
+                                    layer.compress_ratio,
+                                    flash,
+                                    flashmla_scratch,
+                                    layer_pool,
+                                    sw_window,
+                                    &row_prepared.k_prepared,
+                                    compressed,
+                                    &slot.start_pos_device,
+                                )?;
+                            }
+                            flash_batch.gather_q_row(
                                 &self.ctx,
                                 &self.config,
-                                layer.compress_ratio,
-                                flash,
-                                flashmla_scratch,
-                                layer_pool,
-                                sw_window,
-                                &row_prepared.k_prepared,
-                                compressed,
-                                &slot.start_pos_device,
+                                &row_prepared.q_prepared,
+                                &self.tp,
+                                r,
+                                row_prepared.local_heads,
                             )?;
-                        }
-                        flash_batch.gather_q_row(
-                            &self.ctx,
-                            &self.config,
-                            &row_prepared.q_prepared,
-                            &self.tp,
-                            r,
-                            row_prepared.local_heads,
-                        )?;
-                        // CSA only: gather this row's indexer top-k `selected`
-                        // (`[index_topk]` i32, == this layer's max_compressed_keys)
-                        // into the contiguous `selected_batched[r * index_topk..]`,
-                        // so the ONE batched index build can read it per row
-                        // (`selected + row * max_compressed_keys`). SW/HCA skip this
-                        // (selected is None) and the batched build sees selected_ptr=0
-                        // — byte-identical to the prior SW/HCA-only lane.
-                        //
-                        // When the batched DSA select is engaged, `selected` is
-                        // None (the per-row read was deferred); `selected_batched`
-                        // is filled by the ONE `csa_select_official_batched` after
-                        // this loop, so skip the per-row gather here.
-                        // CSA + GLM SparseIndexed (has_indexer) both produce a per-row
-                        // `selected`; gather it when the batched select lane is off.
-                        if runs_indexer && !use_batched_dsa_select {
-                            let sel = row_prepared.selected.as_ref().ok_or_else(|| {
+                            // CSA only: gather this row's indexer top-k `selected`
+                            // (`[index_topk]` i32, == this layer's max_compressed_keys)
+                            // into the contiguous `selected_batched[r * index_topk..]`,
+                            // so the ONE batched index build can read it per row
+                            // (`selected + row * max_compressed_keys`). SW/HCA skip this
+                            // (selected is None) and the batched build sees selected_ptr=0
+                            // — byte-identical to the prior SW/HCA-only lane.
+                            //
+                            // When the batched DSA select is engaged, `selected` is
+                            // None (the per-row read was deferred); `selected_batched`
+                            // is filled by the ONE `csa_select_official_batched` after
+                            // this loop, so skip the per-row gather here.
+                            // CSA + GLM SparseIndexed (has_indexer) both produce a per-row
+                            // `selected`; gather it when the batched select lane is off.
+                            if runs_indexer && !use_batched_dsa_select {
+                                let sel = row_prepared.selected.as_ref().ok_or_else(|| {
                                 anyhow!(
                                     "DSv4 batched indexer decode: row {r} missing indexer selected"
                                 )
                             })?;
-                            flash_batch.gather_selected_row(&self.ctx, sel, r)?;
+                                flash_batch.gather_selected_row(&self.ctx, sel, r)?;
+                            }
+                            // Keep the prepared buffers alive to function return — the
+                            // batched fwd (after this loop) reads the gathered Q, and
+                            // the finish loop reads k_prepared/local_attn. Mirrors the
+                            // keepalive discipline of the per-row intermediates
+                            // (guards the disabled-event-tracking premature free).
+                            keepalive.keep_hidden(&row_prepared.q_prepared);
+                            keepalive.keep_hidden(&row_prepared.k_prepared);
+                            keepalive.keep_hidden(&row_prepared.local_attn);
+                            if let Some(sel) = row_prepared.selected.as_ref() {
+                                keepalive.keep_i32(sel);
+                            }
+                            prepared.push(row_prepared);
                         }
-                        // Keep the prepared buffers alive to function return — the
-                        // batched fwd (after this loop) reads the gathered Q, and
-                        // the finish loop reads k_prepared/local_attn. Mirrors the
-                        // keepalive discipline of the per-row intermediates
-                        // (guards the disabled-event-tracking premature free).
-                        keepalive.keep_hidden(&row_prepared.q_prepared);
-                        keepalive.keep_hidden(&row_prepared.k_prepared);
-                        keepalive.keep_hidden(&row_prepared.local_attn);
-                        if let Some(sel) = row_prepared.selected.as_ref() {
-                            keepalive.keep_i32(sel);
+                        // Op "c": ONE batched SW one-token + compressed-delta pack over
+                        // all N rows, replacing the 2×N per-row launches above. Issued
+                        // here (after the prepare loop's per-row gathers, before
+                        // build_layer_batch_meta / the batched fwd read the pool).
+                        // Per-slot device page tables are persistent in
+                        // `flash.device_page_table` (#8 fix); uploaded ptr arrays are
+                        // kept alive past the launch via `ptr_keepalive` / `keepalive`.
+                        if pack_batched && n > 0 {
+                            crate::profile::profile_op(
+                                ctx,
+                                "attention_pack",
+                                Some(layer_idx),
+                                seq_len,
+                                || {
+                                    let pool_ptr = {
+                                        let (
+                                            layer_pool,
+                                            _dsa,
+                                            _flash_batch,
+                                            _flashmla_scratch,
+                                            _prefill,
+                                        ) = kv_adapter
+                                            .layer_dsa_and_flashmla_batch_mut(layer_idx)?;
+                                        layer_pool.flashmla_pool_base_ptr(&self.ctx)?
+                                    };
+                                    let positions =
+                                        batched_positions.as_ref().ok_or_else(|| {
+                                            anyhow!(
+                                                "DSv4 op-c batched pack: batched positions missing"
+                                            )
+                                        })?;
+                                    let nope_arr =
+                                        crate::ops::upload_u64(&self.ctx, &pack_nope_ptrs)?;
+                                    let rope_arr =
+                                        crate::ops::upload_u64(&self.ctx, &pack_rope_ptrs)?;
+                                    let compressed_arr =
+                                        crate::ops::upload_u64(&self.ctx, &pack_compressed_ptrs)?;
+                                    let pt_arr = crate::ops::upload_u64(&self.ctx, &pack_pt_ptrs)?;
+                                    crate::attention::flashmla_decode_pack_batched(
+                                        &self.ctx,
+                                        &self.config,
+                                        layer.compress_ratio,
+                                        pack_sw_blocks,
+                                        n,
+                                        pool_ptr,
+                                        &nope_arr,
+                                        &rope_arr,
+                                        &compressed_arr,
+                                        positions,
+                                        &pt_arr,
+                                        pack_num_logical_pages,
+                                    )?;
+                                    ptr_keepalive.push(nope_arr);
+                                    ptr_keepalive.push(rope_arr);
+                                    ptr_keepalive.push(compressed_arr);
+                                    ptr_keepalive.push(pt_arr);
+                                    Ok(())
+                                },
+                            )?;
                         }
-                        prepared.push(row_prepared);
-                    }
-                    // Op "c": ONE batched SW one-token + compressed-delta pack over
-                    // all N rows, replacing the 2×N per-row launches above. Issued
-                    // here (after the prepare loop's per-row gathers, before
-                    // build_layer_batch_meta / the batched fwd read the pool).
-                    // Per-slot device page tables are persistent in
-                    // `flash.device_page_table` (#8 fix); uploaded ptr arrays are
-                    // kept alive past the launch via `ptr_keepalive` / `keepalive`.
-                    if pack_batched && n > 0 {
-                        let _nvtx = crate::nvtx::range("dsv4/flashmla_pack_batched");
-                        let pool_ptr = {
-                            let (layer_pool, _dsa, _flash_batch, _flashmla_scratch, _prefill) =
-                                kv_adapter.layer_dsa_and_flashmla_batch_mut(layer_idx)?;
-                            layer_pool.flashmla_pool_base_ptr(&self.ctx)?
-                        };
-                        let positions = batched_positions.as_ref().ok_or_else(|| {
-                            anyhow!("DSv4 op-c batched pack: batched positions missing")
-                        })?;
-                        let nope_arr = crate::ops::upload_u64(&self.ctx, &pack_nope_ptrs)?;
-                        let rope_arr = crate::ops::upload_u64(&self.ctx, &pack_rope_ptrs)?;
-                        let compressed_arr =
-                            crate::ops::upload_u64(&self.ctx, &pack_compressed_ptrs)?;
-                        let pt_arr = crate::ops::upload_u64(&self.ctx, &pack_pt_ptrs)?;
-                        crate::attention::flashmla_decode_pack_batched(
-                            &self.ctx,
-                            &self.config,
-                            layer.compress_ratio,
-                            pack_sw_blocks,
-                            n,
-                            pool_ptr,
-                            &nope_arr,
-                            &rope_arr,
-                            &compressed_arr,
-                            positions,
-                            &pt_arr,
-                            pack_num_logical_pages,
-                        )?;
-                        ptr_keepalive.push(nope_arr);
-                        ptr_keepalive.push(rope_arr);
-                        ptr_keepalive.push(compressed_arr);
-                        ptr_keepalive.push(pt_arr);
-                    }
-                }
+                        Ok(())
+                    },
+                )?;
                 if let Some(t) = _compidx_t {
                     ctx.stream.synchronize().ok();
                     // `_compidx_t` brackets exactly the per-row prepare loop above
@@ -3744,8 +3803,7 @@ impl Dsv4Model {
                 } else {
                     None
                 };
-                {
-                    let _nvtx = crate::nvtx::range("dsv4/mla_attn_batched_fwd");
+                crate::profile::profile_op(ctx, "attention_fwd", Some(layer_idx), seq_len, || {
                     let (layer_pool, _dsa, flash_batch, _flashmla_scratch, _prefill) =
                         kv_adapter.layer_dsa_and_flashmla_batch_mut(layer_idx)?;
                     let flash_batch = flash_batch.ok_or_else(|| {
@@ -3773,8 +3831,8 @@ impl Dsv4Model {
                         layer_idx,
                         n,
                         sm_scale,
-                    )?;
-                }
+                    )
+                })?;
                 if let Some(t) = _fwd_t {
                     ctx.stream.synchronize().ok();
                     fwd_ms += t.elapsed().as_secs_f64() * 1000.0;
@@ -3786,201 +3844,214 @@ impl Dsv4Model {
                 } else {
                     None
                 };
-                {
-                    let _nvtx = crate::nvtx::range("dsv4/mla_attn_batched_finish");
-                    // FINISH order is identical between the two gate states; only
-                    // the inverse-RoPE + SW-window WRITE switch from N per-row
-                    // launches to ONE batched launch each when `full_flatten` is on
-                    // (the heavy ∝n FINISH tail). Both must run BEFORE the per-row
-                    // O-LoRA (which consumes the inverse-roped `local_attn`).
-                    //
-                    // Pass F1: slice each row's global-head output into its
-                    // `local_attn` (per-row, cheap memcpy/TP-slice). When
-                    // full_flatten, also gather this row's local_attn / k_prepared /
-                    // sw_window device pointers for the batched FINISH kernels.
-                    let mut out_ptrs: Vec<u64> = if full_flatten {
-                        Vec::with_capacity(n)
-                    } else {
-                        Vec::new()
-                    };
-                    let mut kprep_ptrs: Vec<u64> = if full_flatten {
-                        Vec::with_capacity(n)
-                    } else {
-                        Vec::new()
-                    };
-                    let mut swcache_ptrs: Vec<u64> = if full_flatten {
-                        Vec::with_capacity(n)
-                    } else {
-                        Vec::new()
-                    };
-                    // F1 batched: when full_flatten, slice ALL n rows' global-head
-                    // output into the contiguous `local_attn_batched` in ONE launch,
-                    // replacing the N per-row `slice_out_row` memcpy/TP-slices.
-                    if full_flatten {
-                        let local_heads = prepared[0].local_heads;
-                        let (_layer_pool, _dsa, flash_batch, _flashmla_scratch, _prefill) =
-                            kv_adapter.layer_dsa_and_flashmla_batch_mut(layer_idx)?;
-                        let flash_batch = flash_batch.ok_or_else(|| {
-                            anyhow!("DSv4 batched decode lane: batch scratch missing")
-                        })?;
-                        flash_batch.slice_out_batched(
-                            &self.ctx,
-                            &self.config,
-                            &self.tp,
-                            n,
-                            local_heads,
-                            &mut local_attn_batched,
-                        )?;
-                    }
-                    let local_width_row = local_attn_batched.hidden_dim;
-                    for r in 0..n {
-                        // One mutable borrow of row r's prepared state; field
-                        // accesses below are disjoint (k_prepared/scalars `&`,
-                        // local_attn `&mut`) so the borrow checker splits them.
-                        let p = &mut prepared[r];
-                        if full_flatten {
-                            // Gather this row's device pointers for the batched
-                            // FINISH kernels. The output pointer is row r's slice of
-                            // the contiguous `local_attn_batched` (the F2 O-LoRA then
-                            // reads the same buffer). Single-stream: ptrs stay valid.
-                            let row_view = local_attn_batched
-                                .data
-                                .slice(r * local_width_row..(r + 1) * local_width_row);
-                            let (op, og) = row_view.device_ptr(&ctx.stream);
-                            out_ptrs.push(op);
-                            drop(og);
-                            let (kp, kg) = p.k_prepared.data.device_ptr(&ctx.stream);
-                            kprep_ptrs.push(kp);
-                            drop(kg);
-                            let slot = &mut slots[slot_ids[r]];
-                            let sw_window = slot.attention[layer_idx].sw_window_cache_mut();
-                            let (cp, cg) = sw_window.device_ptr_mut(&ctx.stream);
-                            swcache_ptrs.push(cp);
-                            drop(cg);
+                crate::profile::profile_op(
+                    ctx,
+                    "attention_finish",
+                    Some(layer_idx),
+                    seq_len,
+                    || {
+                        // FINISH order is identical between the two gate states; only
+                        // the inverse-RoPE + SW-window WRITE switch from N per-row
+                        // launches to ONE batched launch each when `full_flatten` is on
+                        // (the heavy ∝n FINISH tail). Both must run BEFORE the per-row
+                        // O-LoRA (which consumes the inverse-roped `local_attn`).
+                        //
+                        // Pass F1: slice each row's global-head output into its
+                        // `local_attn` (per-row, cheap memcpy/TP-slice). When
+                        // full_flatten, also gather this row's local_attn / k_prepared /
+                        // sw_window device pointers for the batched FINISH kernels.
+                        let mut out_ptrs: Vec<u64> = if full_flatten {
+                            Vec::with_capacity(n)
                         } else {
-                            // Per-row lane (unchanged): slice this row out, then
-                            // per-row inverse-RoPE + SW-window write, one launch each.
-                            {
-                                let (_layer_pool, _dsa, flash_batch, _flashmla_scratch, _prefill) =
-                                    kv_adapter.layer_dsa_and_flashmla_batch_mut(layer_idx)?;
-                                let flash_batch = flash_batch.ok_or_else(|| {
-                                    anyhow!("DSv4 batched decode lane: batch scratch missing")
-                                })?;
-                                flash_batch.slice_out_row(
-                                    &self.ctx,
-                                    &self.config,
-                                    &self.tp,
-                                    r,
-                                    p.local_heads,
-                                    &mut p.local_attn,
-                                )?;
-                            }
-                            let slot = &mut slots[slot_ids[r]];
-                            let sw_window = slot.attention[layer_idx].sw_window_cache_mut();
-                            crate::attention::flashmla_decode_finish_row(
+                            Vec::new()
+                        };
+                        let mut kprep_ptrs: Vec<u64> = if full_flatten {
+                            Vec::with_capacity(n)
+                        } else {
+                            Vec::new()
+                        };
+                        let mut swcache_ptrs: Vec<u64> = if full_flatten {
+                            Vec::with_capacity(n)
+                        } else {
+                            Vec::new()
+                        };
+                        // F1 batched: when full_flatten, slice ALL n rows' global-head
+                        // output into the contiguous `local_attn_batched` in ONE launch,
+                        // replacing the N per-row `slice_out_row` memcpy/TP-slices.
+                        if full_flatten {
+                            let local_heads = prepared[0].local_heads;
+                            let (_layer_pool, _dsa, flash_batch, _flashmla_scratch, _prefill) =
+                                kv_adapter.layer_dsa_and_flashmla_batch_mut(layer_idx)?;
+                            let flash_batch = flash_batch.ok_or_else(|| {
+                                anyhow!("DSv4 batched decode lane: batch scratch missing")
+                            })?;
+                            flash_batch.slice_out_batched(
                                 &self.ctx,
                                 &self.config,
-                                sw_window,
-                                &p.k_prepared,
-                                &mut p.local_attn,
-                                start_positions[r],
-                                &slot.start_pos_device,
-                                p.local_heads,
-                                p.rope_base,
-                                p.original_seq_len,
+                                &self.tp,
+                                n,
+                                local_heads,
+                                &mut local_attn_batched,
+                            )?;
+                        }
+                        let local_width_row = local_attn_batched.hidden_dim;
+                        for r in 0..n {
+                            // One mutable borrow of row r's prepared state; field
+                            // accesses below are disjoint (k_prepared/scalars `&`,
+                            // local_attn `&mut`) so the borrow checker splits them.
+                            let p = &mut prepared[r];
+                            if full_flatten {
+                                // Gather this row's device pointers for the batched
+                                // FINISH kernels. The output pointer is row r's slice of
+                                // the contiguous `local_attn_batched` (the F2 O-LoRA then
+                                // reads the same buffer). Single-stream: ptrs stay valid.
+                                let row_view = local_attn_batched
+                                    .data
+                                    .slice(r * local_width_row..(r + 1) * local_width_row);
+                                let (op, og) = row_view.device_ptr(&ctx.stream);
+                                out_ptrs.push(op);
+                                drop(og);
+                                let (kp, kg) = p.k_prepared.data.device_ptr(&ctx.stream);
+                                kprep_ptrs.push(kp);
+                                drop(kg);
+                                let slot = &mut slots[slot_ids[r]];
+                                let sw_window = slot.attention[layer_idx].sw_window_cache_mut();
+                                let (cp, cg) = sw_window.device_ptr_mut(&ctx.stream);
+                                swcache_ptrs.push(cp);
+                                drop(cg);
+                            } else {
+                                // Per-row lane (unchanged): slice this row out, then
+                                // per-row inverse-RoPE + SW-window write, one launch each.
+                                {
+                                    let (
+                                        _layer_pool,
+                                        _dsa,
+                                        flash_batch,
+                                        _flashmla_scratch,
+                                        _prefill,
+                                    ) = kv_adapter.layer_dsa_and_flashmla_batch_mut(layer_idx)?;
+                                    let flash_batch = flash_batch.ok_or_else(|| {
+                                        anyhow!("DSv4 batched decode lane: batch scratch missing")
+                                    })?;
+                                    flash_batch.slice_out_row(
+                                        &self.ctx,
+                                        &self.config,
+                                        &self.tp,
+                                        r,
+                                        p.local_heads,
+                                        &mut p.local_attn,
+                                    )?;
+                                }
+                                let slot = &mut slots[slot_ids[r]];
+                                let sw_window = slot.attention[layer_idx].sw_window_cache_mut();
+                                crate::attention::flashmla_decode_finish_row(
+                                    &self.ctx,
+                                    &self.config,
+                                    sw_window,
+                                    &p.k_prepared,
+                                    &mut p.local_attn,
+                                    start_positions[r],
+                                    &slot.start_pos_device,
+                                    p.local_heads,
+                                    p.rope_base,
+                                    p.original_seq_len,
+                                    self.config.rope_parameters.factor,
+                                    self.config.rope_parameters.beta_fast,
+                                    self.config.rope_parameters.beta_slow,
+                                )?;
+                            }
+                        }
+                        // Batched FINISH tail (gate ON): ONE inverse-RoPE + ONE SW-window
+                        // write over all N rows, replacing the per-row launches above.
+                        // local_heads / rope params are uniform across the layer's rows.
+                        if full_flatten {
+                            let positions = batched_positions.as_ref().ok_or_else(|| {
+                                anyhow!("DSv4 full-flatten finish: batched positions missing")
+                            })?;
+                            let local_heads = prepared[0].local_heads;
+                            let rope_base = prepared[0].rope_base;
+                            let original_seq_len = prepared[0].original_seq_len;
+                            let out_arr = crate::ops::upload_u64(&self.ctx, &out_ptrs)?;
+                            let kprep_arr = crate::ops::upload_u64(&self.ctx, &kprep_ptrs)?;
+                            let swcache_arr = crate::ops::upload_u64(&self.ctx, &swcache_ptrs)?;
+                            crate::attention::flashmla_decode_inverse_rope_batched(
+                                &self.ctx,
+                                &self.config,
+                                &out_arr,
+                                positions,
+                                n,
+                                local_heads,
+                                rope_base,
+                                original_seq_len,
                                 self.config.rope_parameters.factor,
                                 self.config.rope_parameters.beta_fast,
                                 self.config.rope_parameters.beta_slow,
                             )?;
+                            crate::attention::flashmla_decode_sw_window_batched(
+                                &self.ctx,
+                                &self.config,
+                                &kprep_arr,
+                                &swcache_arr,
+                                positions,
+                                n,
+                            )?;
+                            ptr_keepalive.push(out_arr);
+                            ptr_keepalive.push(kprep_arr);
+                            ptr_keepalive.push(swcache_arr);
                         }
-                    }
-                    // Batched FINISH tail (gate ON): ONE inverse-RoPE + ONE SW-window
-                    // write over all N rows, replacing the per-row launches above.
-                    // local_heads / rope params are uniform across the layer's rows.
-                    if full_flatten {
-                        let positions = batched_positions.as_ref().ok_or_else(|| {
-                            anyhow!("DSv4 full-flatten finish: batched positions missing")
-                        })?;
-                        let local_heads = prepared[0].local_heads;
-                        let rope_base = prepared[0].rope_base;
-                        let original_seq_len = prepared[0].original_seq_len;
-                        let out_arr = crate::ops::upload_u64(&self.ctx, &out_ptrs)?;
-                        let kprep_arr = crate::ops::upload_u64(&self.ctx, &kprep_ptrs)?;
-                        let swcache_arr = crate::ops::upload_u64(&self.ctx, &swcache_ptrs)?;
-                        crate::attention::flashmla_decode_inverse_rope_batched(
-                            &self.ctx,
-                            &self.config,
-                            &out_arr,
-                            positions,
-                            n,
-                            local_heads,
-                            rope_base,
-                            original_seq_len,
-                            self.config.rope_parameters.factor,
-                            self.config.rope_parameters.beta_fast,
-                            self.config.rope_parameters.beta_slow,
-                        )?;
-                        crate::attention::flashmla_decode_sw_window_batched(
-                            &self.ctx,
-                            &self.config,
-                            &kprep_arr,
-                            &swcache_arr,
-                            positions,
-                            n,
-                        )?;
-                        ptr_keepalive.push(out_arr);
-                        ptr_keepalive.push(kprep_arr);
-                        ptr_keepalive.push(swcache_arr);
-                    }
-                    // Pass F2: O-LoRA → attn_out (consumes the inverse-roped output).
-                    // full_flatten batches over N in ONE mla_oproj(token_count=n):
-                    // plain-o (GLM, seq-parametric dsv4_linear), single-output-group
-                    // (Qwen3.6 MODEL1 at TP>1, decode-DeepGEMM M=n), AND grouped
-                    // (groups>1, gather/GEMM/scatter M=n per group) all converge here
-                    // reading the contiguous `local_attn_batched` and writing directly
-                    // into `attn_out` ([hidden, n]) — no per-row alloc, no copy-out.
-                    // The !full_flatten lane (SparseIndexed) stays per-row over
-                    // `prepared[r].local_attn`.
-                    if full_flatten {
-                        // Batched O-LoRA over all N rows in one call. local_attn_batched
-                        // is [local_width, n]; the decode lane reads it token-major.
-                        let slot = &mut slots[slot_ids[0]];
-                        crate::attention::mla_oproj(
-                            &self.ctx,
-                            &layer.attention,
-                            &mut slot.attention[layer_idx],
-                            // Decode: prefill DeepGEMM lane never taken. The decode
-                            // lane reuses slot 0's shared transient fused_wqkv scratch
-                            // at M=n (active_counts=[n], restored to [1] internally).
-                            None,
-                            &local_attn_batched,
-                            n,
-                            &mut keepalive,
-                            &mut attn_out,
-                        )?;
-                    } else {
-                        for r in 0..n {
-                            let row_src = &prepared[r].local_attn;
-                            let slot = &mut slots[slot_ids[r]];
+                        // Pass F2: O-LoRA → attn_out (consumes the inverse-roped output).
+                        // full_flatten batches over N in ONE mla_oproj(token_count=n):
+                        // plain-o (GLM, seq-parametric dsv4_linear), single-output-group
+                        // (Qwen3.6 MODEL1 at TP>1, decode-DeepGEMM M=n), AND grouped
+                        // (groups>1, gather/GEMM/scatter M=n per group) all converge here
+                        // reading the contiguous `local_attn_batched` and writing directly
+                        // into `attn_out` ([hidden, n]) — no per-row alloc, no copy-out.
+                        // The !full_flatten lane (SparseIndexed) stays per-row over
+                        // `prepared[r].local_attn`.
+                        if full_flatten {
+                            // Batched O-LoRA over all N rows in one call. local_attn_batched
+                            // is [local_width, n]; the decode lane reads it token-major.
+                            let slot = &mut slots[slot_ids[0]];
                             crate::attention::mla_oproj(
                                 &self.ctx,
                                 &layer.attention,
                                 &mut slot.attention[layer_idx],
+                                // Decode: prefill DeepGEMM lane never taken. The decode
+                                // lane reuses slot 0's shared transient fused_wqkv scratch
+                                // at M=n (active_counts=[n], restored to [1] internally).
                                 None,
-                                row_src,
-                                1,
+                                &local_attn_batched,
+                                n,
                                 &mut keepalive,
-                                &mut attn_out_row,
+                                &mut attn_out,
                             )?;
-                            let mut dst = attn_out
-                                .data
-                                .slice_mut(r * hidden_size..(r + 1) * hidden_size);
-                            ctx.stream
-                                .memcpy_dtod(&attn_out_row.data, &mut dst)
-                                .map_err(|e| anyhow!("DSv4 batched attn copy-out failed: {e}"))?;
+                        } else {
+                            for r in 0..n {
+                                let row_src = &prepared[r].local_attn;
+                                let slot = &mut slots[slot_ids[r]];
+                                crate::attention::mla_oproj(
+                                    &self.ctx,
+                                    &layer.attention,
+                                    &mut slot.attention[layer_idx],
+                                    None,
+                                    row_src,
+                                    1,
+                                    &mut keepalive,
+                                    &mut attn_out_row,
+                                )?;
+                                let mut dst = attn_out
+                                    .data
+                                    .slice_mut(r * hidden_size..(r + 1) * hidden_size);
+                                ctx.stream
+                                    .memcpy_dtod(&attn_out_row.data, &mut dst)
+                                    .map_err(|e| {
+                                        anyhow!("DSv4 batched attn copy-out failed: {e}")
+                                    })?;
+                            }
                         }
-                    }
-                }
+                        Ok(())
+                    },
+                )?;
                 if let Some(t) = _finish_t {
                     ctx.stream.synchronize().ok();
                     finish_ms += t.elapsed().as_secs_f64() * 1000.0;
@@ -3996,49 +4067,51 @@ impl Dsv4Model {
                 } else {
                     None
                 };
-                let _nvtx = crate::nvtx::range("dsv4/mla_attn_per_row");
-                for r in 0..n {
-                    let src = normed.data.slice(r * hidden_size..(r + 1) * hidden_size);
-                    ctx.stream
-                        .memcpy_dtod(&src, &mut normed_row.data)
-                        .map_err(|e| anyhow!("DSv4 batched attn copy-in failed: {e}"))?;
-                    let (layer_pool, dsa_shared, flashmla_scratch, prefill_shared, _fp32) =
-                        kv_adapter.layer_and_dsa_shared_mut(layer_idx)?;
-                    let slot = &mut slots[slot_ids[r]];
-                    crate::attention::mla_attention(
-                        &self.ctx,
-                        &self.config,
-                        &layer.attention,
-                        layer.mode,
-                        layer.compress_ratio,
-                        layer_idx,
-                        &normed_row,
-                        &mut slot.attention[layer_idx],
-                        layer_pool,
-                        dsa_shared,
-                        flashmla_scratch,
-                        prefill_shared,
-                        // Decode lane (start_pos_device Some): probe unreachable.
-                        None,
-                        start_positions[r],
-                        Some(&slot.start_pos_device),
-                        None,
-                        &self.tp,
-                        &mut attn_out_row,
-                        &mut keepalive,
-                    )?;
-                    let mut dst = attn_out
-                        .data
-                        .slice_mut(r * hidden_size..(r + 1) * hidden_size);
-                    ctx.stream
-                        .memcpy_dtod(&attn_out_row.data, &mut dst)
-                        .map_err(|e| anyhow!("DSv4 batched attn copy-out failed: {e}"))?;
-                    // No per-row host sync: every op (memcpy, mla_attention's
-                    // FlashMLA/compressor/indexer FFI, copy-out) runs on ctx.stream,
-                    // so stream ordering already serializes row r's reads of the
-                    // shared {normed,attn_out}_row scratch before row r+1's writes
-                    // (WAR resolved by stream order). The sync was debug isolation.
-                }
+                crate::profile::profile_op(ctx, "attention", Some(layer_idx), seq_len, || {
+                    for r in 0..n {
+                        let src = normed.data.slice(r * hidden_size..(r + 1) * hidden_size);
+                        ctx.stream
+                            .memcpy_dtod(&src, &mut normed_row.data)
+                            .map_err(|e| anyhow!("DSv4 batched attn copy-in failed: {e}"))?;
+                        let (layer_pool, dsa_shared, flashmla_scratch, prefill_shared, _fp32) =
+                            kv_adapter.layer_and_dsa_shared_mut(layer_idx)?;
+                        let slot = &mut slots[slot_ids[r]];
+                        crate::attention::mla_attention(
+                            &self.ctx,
+                            &self.config,
+                            &layer.attention,
+                            layer.mode,
+                            layer.compress_ratio,
+                            layer_idx,
+                            &normed_row,
+                            &mut slot.attention[layer_idx],
+                            layer_pool,
+                            dsa_shared,
+                            flashmla_scratch,
+                            prefill_shared,
+                            // Decode lane (start_pos_device Some): probe unreachable.
+                            None,
+                            start_positions[r],
+                            Some(&slot.start_pos_device),
+                            None,
+                            &self.tp,
+                            &mut attn_out_row,
+                            &mut keepalive,
+                        )?;
+                        let mut dst = attn_out
+                            .data
+                            .slice_mut(r * hidden_size..(r + 1) * hidden_size);
+                        ctx.stream
+                            .memcpy_dtod(&attn_out_row.data, &mut dst)
+                            .map_err(|e| anyhow!("DSv4 batched attn copy-out failed: {e}"))?;
+                        // No per-row host sync: every op (memcpy, mla_attention's
+                        // FlashMLA/compressor/indexer FFI, copy-out) runs on ctx.stream,
+                        // so stream ordering already serializes row r's reads of the
+                        // shared {normed,attn_out}_row scratch before row r+1's writes
+                        // (WAR resolved by stream order). The sync was debug isolation.
+                    }
+                    Ok(())
+                })?;
                 if let Some(t) = _csa_t {
                     ctx.stream.synchronize().ok();
                     csa_ms += t.elapsed().as_secs_f64() * 1000.0;
@@ -4049,27 +4122,30 @@ impl Dsv4Model {
             // to N per-row all-reduces: NCCL tiles a [hidden,N] message differently
             // than N×[hidden,1], so identical-input rows pick up ~1 bf16 ULP of
             // per-row drift here. This is the legitimate batched-numerics seed.
-            {
-                let _nvtx = crate::nvtx::range("dsv4/attn_allreduce");
-                self.tp.all_reduce_sum(&self.ctx, &mut attn_out)?;
-            }
+            crate::profile::profile_op(ctx, "attn_allreduce", Some(layer_idx), seq_len, || {
+                self.tp.all_reduce_sum(&self.ctx, &mut attn_out)
+            })?;
             stage_all("attn_out", &attn_out);
             // SAFETY: hc_post / add_batch writes the full stream buffer.
             let mut attn_stream = unsafe { HiddenStates::uninit(&self.ctx, stream_dim, seq_len)? };
             if let Some(mhc) = attn_mhc.as_ref() {
-                crate::hc::hc_post(
-                    &self.ctx,
-                    &attn_out,
-                    &stream,
-                    &mhc.post,
-                    &mhc.comb,
-                    hidden_size,
-                    hc_mult,
-                    &mut attn_stream,
-                )?;
+                crate::profile::profile_op(ctx, "attn_hc_post", Some(layer_idx), seq_len, || {
+                    crate::hc::hc_post(
+                        &self.ctx,
+                        &attn_out,
+                        &stream,
+                        &mhc.post,
+                        &mhc.comb,
+                        hidden_size,
+                        hc_mult,
+                        &mut attn_stream,
+                    )
+                })?;
             } else {
                 // GLM plain residual: stream = attn_out + stream (stream_dim==hidden).
-                crate::ops::add_batch(&self.ctx, &attn_out, &stream, &mut attn_stream)?;
+                crate::profile::profile_op(ctx, "attn_hc_post", Some(layer_idx), seq_len, || {
+                    crate::ops::add_batch(&self.ctx, &attn_out, &stream, &mut attn_stream)
+                })?;
             }
             keepalive.keep_hidden(&attn_stream);
             stream = attn_stream;
@@ -4086,24 +4162,51 @@ impl Dsv4Model {
             // SAFETY: uninit device scratch; fully written before first read.
             let mut normed = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
             let ffn_mhc = if self.config.is_glm() {
-                crate::ops::rms_norm_batch(&self.ctx, &stream, &layer.ffn_norm, eps, &mut normed)?;
+                crate::profile::profile_op(
+                    ctx,
+                    "ffn_hc_pre_norm",
+                    Some(layer_idx),
+                    seq_len,
+                    || {
+                        crate::ops::rms_norm_batch(
+                            &self.ctx,
+                            &stream,
+                            &layer.ffn_norm,
+                            eps,
+                            &mut normed,
+                        )
+                    },
+                )?;
                 None
             } else {
-                let mhc =
-                    crate::hc::gen_mhc_params(&self.ctx, &self.config, &layer.hc_ffn, &stream)?;
+                let mhc = crate::profile::profile_op(
+                    ctx,
+                    "ffn_hc_params",
+                    Some(layer_idx),
+                    seq_len,
+                    || crate::hc::gen_mhc_params(&self.ctx, &self.config, &layer.hc_ffn, &stream),
+                )?;
                 keepalive.keep_f32(&mhc.pre);
                 keepalive.keep_f32(&mhc.post);
                 keepalive.keep_f32(&mhc.comb);
                 // SAFETY: fused hc_pre+rms_norm writes the full [seq_len, hidden_size] buffer.
-                crate::hc::mhc_pre_rms_norm(
-                    &self.ctx,
-                    &stream,
-                    &mhc.pre,
-                    &layer.ffn_norm,
-                    eps,
-                    hidden_size,
-                    hc_mult,
-                    &mut normed,
+                crate::profile::profile_op(
+                    ctx,
+                    "ffn_hc_pre_norm",
+                    Some(layer_idx),
+                    seq_len,
+                    || {
+                        crate::hc::mhc_pre_rms_norm(
+                            &self.ctx,
+                            &stream,
+                            &mhc.pre,
+                            &layer.ffn_norm,
+                            eps,
+                            hidden_size,
+                            hc_mult,
+                            &mut normed,
+                        )
+                    },
                 )?;
                 Some(mhc)
             };
@@ -4124,14 +4227,16 @@ impl Dsv4Model {
                 // SAFETY: uninit device scratch; fully written before first read.
                 unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
             if let Some(dense) = layer.dense_mlp.as_ref() {
-                dsv4_dense_mlp_forward(
-                    &self.ctx,
-                    dense,
-                    &normed,
-                    &mut moe_with_shared,
-                    self.config.swiglu_limit,
-                    &mut keepalive,
-                )?;
+                crate::profile::profile_op(ctx, "mlp", Some(layer_idx), seq_len, || {
+                    dsv4_dense_mlp_forward(
+                        &self.ctx,
+                        dense,
+                        &normed,
+                        &mut moe_with_shared,
+                        self.config.swiglu_limit,
+                        &mut keepalive,
+                    )
+                })?;
                 keepalive.keep_hidden(&moe_with_shared);
             } else {
                 // SAFETY: uninit device scratch; fully written before first read.
@@ -4199,22 +4304,35 @@ impl Dsv4Model {
                     );
                 } else {
                     let tail = kv_adapter.moe_tail_scratch_mut();
-                    let needs_moe_allreduce = crate::moe::dsv4_moe_forward(
-                        self,
-                        layer.moe.as_ref().expect("DSv4 layer.moe"),
-                        tokens,
-                        &normed,
-                        &mut moe_out,
-                        &mut keepalive,
-                        tail,
-                        mega_epoch,
+                    let needs_moe_allreduce = crate::profile::profile_op(
+                        ctx,
+                        "moe_route",
+                        Some(layer_idx),
+                        seq_len,
+                        || {
+                            crate::moe::dsv4_moe_forward(
+                                self,
+                                layer.moe.as_ref().expect("DSv4 layer.moe"),
+                                tokens,
+                                &normed,
+                                &mut moe_out,
+                                &mut keepalive,
+                                tail,
+                                mega_epoch,
+                            )
+                        },
                     )?;
                     keepalive.keep_hidden(&moe_out);
                     // Routed experts are EP-sharded → sum, then add the replicated
                     // shared expert once per rank. One all-reduce over [N, hidden].
                     if needs_moe_allreduce {
-                        let _nvtx = crate::nvtx::range("dsv4/moe_allreduce");
-                        self.tp.all_reduce_sum(&self.ctx, &mut moe_out)?;
+                        crate::profile::profile_op(
+                            ctx,
+                            "moe_allreduce",
+                            Some(layer_idx),
+                            seq_len,
+                            || self.tp.all_reduce_sum(&self.ctx, &mut moe_out),
+                        )?;
                     }
                 }
                 keepalive.keep_hidden(&moe_out);
@@ -4247,36 +4365,44 @@ impl Dsv4Model {
                     shared.hidden_dim,
                     hidden_size
                 );
-                crate::moe::dsv4_shared_expert_forward_decode_scratch(
-                    &self.ctx,
-                    &self.ctx.stream,
-                    layer.moe.as_ref().expect("DSv4 layer.moe"),
-                    &normed,
-                    shared,
-                    self.config.swiglu_limit,
-                    scratch,
-                )?;
+                crate::profile::profile_op(ctx, "shared_expert", Some(layer_idx), seq_len, || {
+                    crate::moe::dsv4_shared_expert_forward_decode_scratch(
+                        &self.ctx,
+                        &self.ctx.stream,
+                        layer.moe.as_ref().expect("DSv4 layer.moe"),
+                        &normed,
+                        shared,
+                        self.config.swiglu_limit,
+                        scratch,
+                    )
+                })?;
                 // SAFETY: add_batch writes the full [seq_len, hidden_size] buffer.
-                crate::ops::add_batch(&self.ctx, &moe_out, shared, &mut moe_with_shared)?;
+                crate::profile::profile_op(ctx, "shared_add", Some(layer_idx), seq_len, || {
+                    crate::ops::add_batch(&self.ctx, &moe_out, shared, &mut moe_with_shared)
+                })?;
                 keepalive.keep_hidden(&moe_with_shared);
             }
             stage_all("moe_out", &moe_with_shared);
             // SAFETY: hc_post / add_batch writes the full stream buffer.
             let mut ffn_stream = unsafe { HiddenStates::uninit(&self.ctx, stream_dim, seq_len)? };
             if let Some(mhc) = ffn_mhc.as_ref() {
-                crate::hc::hc_post(
-                    &self.ctx,
-                    &moe_with_shared,
-                    &stream,
-                    &mhc.post,
-                    &mhc.comb,
-                    hidden_size,
-                    hc_mult,
-                    &mut ffn_stream,
-                )?;
+                crate::profile::profile_op(ctx, "ffn_hc_post", Some(layer_idx), seq_len, || {
+                    crate::hc::hc_post(
+                        &self.ctx,
+                        &moe_with_shared,
+                        &stream,
+                        &mhc.post,
+                        &mhc.comb,
+                        hidden_size,
+                        hc_mult,
+                        &mut ffn_stream,
+                    )
+                })?;
             } else {
                 // GLM plain residual: stream = ffn_out + stream (stream_dim==hidden).
-                crate::ops::add_batch(&self.ctx, &moe_with_shared, &stream, &mut ffn_stream)?;
+                crate::profile::profile_op(ctx, "ffn_hc_post", Some(layer_idx), seq_len, || {
+                    crate::ops::add_batch(&self.ctx, &moe_with_shared, &stream, &mut ffn_stream)
+                })?;
             }
             keepalive.keep_hidden(&ffn_stream);
             stream = ffn_stream;
@@ -4444,24 +4570,29 @@ impl Dsv4Model {
         let tokens: Vec<u32> = row_tokens.iter().flat_map(|c| c.iter().copied()).collect();
         let token_ids_host: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
 
-        let nvtx_embed = crate::nvtx::range("dsv4/embed");
         let token_ids = crate::ops::upload_i32(&self.ctx, &token_ids_host)?;
         keepalive.keep_i32(&token_ids);
         // SAFETY: embedding_batch writes the full [m, hidden_size] buffer.
         let mut embeddings = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
-        crate::ops::embedding_batch(&self.ctx, &self.embed_tokens, &token_ids, &mut embeddings)?;
-        keepalive.keep_hidden(&embeddings);
         // SAFETY: initial_stream_from_embeddings writes the full stream buffer.
         let mut stream = unsafe { HiddenStates::uninit(&self.ctx, stream_dim, seq_len)? };
-        crate::hc::initial_stream_from_embeddings(
-            &self.ctx,
-            &embeddings,
-            hidden_size,
-            hc_mult,
-            &mut stream,
-        )?;
+        crate::profile::profile_op(&self.ctx, "embedding", None, seq_len, || {
+            crate::ops::embedding_batch(
+                &self.ctx,
+                &self.embed_tokens,
+                &token_ids,
+                &mut embeddings,
+            )?;
+            crate::hc::initial_stream_from_embeddings(
+                &self.ctx,
+                &embeddings,
+                hidden_size,
+                hc_mult,
+                &mut stream,
+            )
+        })?;
+        keepalive.keep_hidden(&embeddings);
         keepalive.keep_hidden(&stream);
-        drop(nvtx_embed);
 
         // Per-slot chain verify: one FlashMLA sparse forward over each slot
         // chunk per layer. The prefix metadata expresses row r -> ancestors
@@ -4487,41 +4618,64 @@ impl Dsv4Model {
         crate::attention::set_dsv4_verify_frozen(true);
         let result = (|| -> Result<()> {
             for (layer_idx, layer) in self.layers.iter().enumerate() {
-                let _layer_nvtx = crate::nvtx::range(&format!("dsv4/layer_{layer_idx:02}"));
                 // ── Attention half: HC params + pre-norm over the whole [M] batch.
                 // ponytail: pod-verify GLM hc_mult==1 plain residual + identity stream (no hyper-connection)
                 // SAFETY: uninit device scratch; fully written before first read.
                 let mut normed = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
                 let attn_mhc = if self.config.is_glm() {
                     // GLM: plain RMSNorm of the stream (stream IS the hidden).
-                    crate::ops::rms_norm_batch(
+                    crate::profile::profile_op(
                         &self.ctx,
-                        &stream,
-                        &layer.attn_norm,
-                        eps,
-                        &mut normed,
+                        "attn_hc_pre_norm",
+                        Some(layer_idx),
+                        seq_len,
+                        || {
+                            crate::ops::rms_norm_batch(
+                                &self.ctx,
+                                &stream,
+                                &layer.attn_norm,
+                                eps,
+                                &mut normed,
+                            )
+                        },
                     )?;
                     None
                 } else {
-                    let mhc = crate::hc::gen_mhc_params(
+                    let mhc = crate::profile::profile_op(
                         &self.ctx,
-                        &self.config,
-                        &layer.hc_attn,
-                        &stream,
+                        "attn_hc_params",
+                        Some(layer_idx),
+                        seq_len,
+                        || {
+                            crate::hc::gen_mhc_params(
+                                &self.ctx,
+                                &self.config,
+                                &layer.hc_attn,
+                                &stream,
+                            )
+                        },
                     )?;
                     keepalive.keep_f32(&mhc.pre);
                     keepalive.keep_f32(&mhc.post);
                     keepalive.keep_f32(&mhc.comb);
                     // SAFETY: fused hc_pre+rms_norm writes the full [m, hidden_size] buffer.
-                    crate::hc::mhc_pre_rms_norm(
+                    crate::profile::profile_op(
                         &self.ctx,
-                        &stream,
-                        &mhc.pre,
-                        &layer.attn_norm,
-                        eps,
-                        hidden_size,
-                        hc_mult,
-                        &mut normed,
+                        "attn_hc_pre_norm",
+                        Some(layer_idx),
+                        seq_len,
+                        || {
+                            crate::hc::mhc_pre_rms_norm(
+                                &self.ctx,
+                                &stream,
+                                &mhc.pre,
+                                &layer.attn_norm,
+                                eps,
+                                hidden_size,
+                                hc_mult,
+                                &mut normed,
+                            )
+                        },
                     )?;
                     Some(mhc)
                 };
@@ -4535,102 +4689,137 @@ impl Dsv4Model {
                 let mut attn_out =
                     unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
                 {
-                    let _nvtx = crate::nvtx::range("dsv4/mla_attn_chain_verify");
-                    for s in 0..n {
-                        let off = offsets[s];
-                        let len = lens[s];
-                        normed_chunk.seq_len = len;
-                        attn_chunk.seq_len = len;
-                        let src = normed
-                            .data
-                            .slice(off * hidden_size..(off + len) * hidden_size);
-                        self.ctx
-                            .stream
-                            .memcpy_dtod(
-                                &src,
-                                &mut normed_chunk.data.slice_mut(0..len * hidden_size),
-                            )
-                            .map_err(|e| {
-                                anyhow!("DSv4 batched verify chunk copy-in failed: {e}")
-                            })?;
-                        // Commit-fold scatter: persist THIS slot's per-layer
-                        // attn-normed chain rows into the OWNING slot's
-                        // `spec_normed[layer_idx]`. The combined `normed` is
-                        // sliced per slot, so there is no cross-slot aliasing.
-                        let slot = &mut slots[slot_ids[s]];
-                        let cache = slot.spec_normed.as_mut().ok_or_else(|| {
-                            anyhow!("DSv4 batched verify without spec_normed cache")
-                        })?;
-                        let mut dst = cache[layer_idx].data.slice_mut(0..len * hidden_size);
-                        self.ctx
-                            .stream
-                            .memcpy_dtod(
-                                &normed
+                    crate::profile::profile_op(
+                        &self.ctx,
+                        "attention",
+                        Some(layer_idx),
+                        seq_len,
+                        || {
+                            for s in 0..n {
+                                let off = offsets[s];
+                                let len = lens[s];
+                                normed_chunk.seq_len = len;
+                                attn_chunk.seq_len = len;
+                                let src = normed
                                     .data
-                                    .slice(off * hidden_size..(off + len) * hidden_size),
-                                &mut dst,
-                            )
-                            .map_err(|e| {
-                                anyhow!("DSv4 batched verify spec_normed persist failed: {e}")
-                            })?;
-                        let (layer_pool, dsa_shared, flashmla_scratch, prefill_shared, fp32) =
-                            kv_adapter.layer_and_dsa_shared_mut(layer_idx)?;
-                        let slot = &mut slots[slot_ids[s]];
-                        crate::attention::mla_attention(
-                            &self.ctx,
-                            &self.config,
-                            &layer.attention,
-                            layer.mode,
-                            layer.compress_ratio,
-                            layer_idx,
-                            &normed_chunk,
-                            &mut slot.attention[layer_idx],
-                            layer_pool,
-                            dsa_shared,
-                            flashmla_scratch,
-                            prefill_shared,
-                            fp32,
-                            start_positions[s],
-                            None,
-                            Some(&sparse_metas[s]),
-                            &self.tp,
-                            &mut attn_chunk,
-                            &mut keepalive,
-                        )?;
-                        let mut dst = attn_out
-                            .data
-                            .slice_mut(off * hidden_size..(off + len) * hidden_size);
-                        self.ctx
-                            .stream
-                            .memcpy_dtod(&attn_chunk.data.slice(0..len * hidden_size), &mut dst)
-                            .map_err(|e| {
-                                anyhow!("DSv4 batched verify chunk copy-out failed: {e}")
-                            })?;
-                    }
+                                    .slice(off * hidden_size..(off + len) * hidden_size);
+                                self.ctx
+                                    .stream
+                                    .memcpy_dtod(
+                                        &src,
+                                        &mut normed_chunk.data.slice_mut(0..len * hidden_size),
+                                    )
+                                    .map_err(|e| {
+                                        anyhow!("DSv4 batched verify chunk copy-in failed: {e}")
+                                    })?;
+                                // Commit-fold scatter: persist THIS slot's per-layer
+                                // attn-normed chain rows into the OWNING slot's
+                                // `spec_normed[layer_idx]`. The combined `normed` is
+                                // sliced per slot, so there is no cross-slot aliasing.
+                                let slot = &mut slots[slot_ids[s]];
+                                let cache = slot.spec_normed.as_mut().ok_or_else(|| {
+                                    anyhow!("DSv4 batched verify without spec_normed cache")
+                                })?;
+                                let mut dst = cache[layer_idx].data.slice_mut(0..len * hidden_size);
+                                self.ctx
+                                    .stream
+                                    .memcpy_dtod(
+                                        &normed
+                                            .data
+                                            .slice(off * hidden_size..(off + len) * hidden_size),
+                                        &mut dst,
+                                    )
+                                    .map_err(|e| {
+                                        anyhow!(
+                                            "DSv4 batched verify spec_normed persist failed: {e}"
+                                        )
+                                    })?;
+                                let (
+                                    layer_pool,
+                                    dsa_shared,
+                                    flashmla_scratch,
+                                    prefill_shared,
+                                    fp32,
+                                ) = kv_adapter.layer_and_dsa_shared_mut(layer_idx)?;
+                                let slot = &mut slots[slot_ids[s]];
+                                crate::attention::mla_attention(
+                                    &self.ctx,
+                                    &self.config,
+                                    &layer.attention,
+                                    layer.mode,
+                                    layer.compress_ratio,
+                                    layer_idx,
+                                    &normed_chunk,
+                                    &mut slot.attention[layer_idx],
+                                    layer_pool,
+                                    dsa_shared,
+                                    flashmla_scratch,
+                                    prefill_shared,
+                                    fp32,
+                                    start_positions[s],
+                                    None,
+                                    Some(&sparse_metas[s]),
+                                    &self.tp,
+                                    &mut attn_chunk,
+                                    &mut keepalive,
+                                )?;
+                                let mut dst = attn_out
+                                    .data
+                                    .slice_mut(off * hidden_size..(off + len) * hidden_size);
+                                self.ctx
+                                    .stream
+                                    .memcpy_dtod(
+                                        &attn_chunk.data.slice(0..len * hidden_size),
+                                        &mut dst,
+                                    )
+                                    .map_err(|e| {
+                                        anyhow!("DSv4 batched verify chunk copy-out failed: {e}")
+                                    })?;
+                            }
+                            Ok(())
+                        },
+                    )?;
                 }
                 keepalive.keep_hidden(&attn_out);
                 // Row-parallel O-LoRA: one all-reduce over [M, hidden].
-                {
-                    let _nvtx = crate::nvtx::range("dsv4/attn_allreduce");
-                    self.tp.all_reduce_sum(&self.ctx, &mut attn_out)?;
-                }
+                crate::profile::profile_op(
+                    &self.ctx,
+                    "attn_allreduce",
+                    Some(layer_idx),
+                    seq_len,
+                    || self.tp.all_reduce_sum(&self.ctx, &mut attn_out),
+                )?;
                 // SAFETY: hc_post / add_batch writes the full stream buffer.
                 let mut attn_stream =
                     unsafe { HiddenStates::uninit(&self.ctx, stream_dim, seq_len)? };
                 if let Some(mhc) = attn_mhc.as_ref() {
-                    crate::hc::hc_post(
+                    crate::profile::profile_op(
                         &self.ctx,
-                        &attn_out,
-                        &stream,
-                        &mhc.post,
-                        &mhc.comb,
-                        hidden_size,
-                        hc_mult,
-                        &mut attn_stream,
+                        "attn_hc_post",
+                        Some(layer_idx),
+                        seq_len,
+                        || {
+                            crate::hc::hc_post(
+                                &self.ctx,
+                                &attn_out,
+                                &stream,
+                                &mhc.post,
+                                &mhc.comb,
+                                hidden_size,
+                                hc_mult,
+                                &mut attn_stream,
+                            )
+                        },
                     )?;
                 } else {
                     // GLM plain residual: stream = attn_out + stream (stream_dim==hidden).
-                    crate::ops::add_batch(&self.ctx, &attn_out, &stream, &mut attn_stream)?;
+                    crate::profile::profile_op(
+                        &self.ctx,
+                        "attn_hc_post",
+                        Some(layer_idx),
+                        seq_len,
+                        || crate::ops::add_batch(&self.ctx, &attn_out, &stream, &mut attn_stream),
+                    )?;
                 }
                 keepalive.keep_hidden(&attn_stream);
                 stream = attn_stream;
@@ -4643,30 +4832,58 @@ impl Dsv4Model {
                 // SAFETY: uninit device scratch; fully written before first read.
                 let mut normed = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
                 let ffn_mhc = if self.config.is_glm() {
-                    crate::ops::rms_norm_batch(
+                    crate::profile::profile_op(
                         &self.ctx,
-                        &stream,
-                        &layer.ffn_norm,
-                        eps,
-                        &mut normed,
+                        "ffn_hc_pre_norm",
+                        Some(layer_idx),
+                        seq_len,
+                        || {
+                            crate::ops::rms_norm_batch(
+                                &self.ctx,
+                                &stream,
+                                &layer.ffn_norm,
+                                eps,
+                                &mut normed,
+                            )
+                        },
                     )?;
                     None
                 } else {
-                    let mhc =
-                        crate::hc::gen_mhc_params(&self.ctx, &self.config, &layer.hc_ffn, &stream)?;
+                    let mhc = crate::profile::profile_op(
+                        &self.ctx,
+                        "ffn_hc_params",
+                        Some(layer_idx),
+                        seq_len,
+                        || {
+                            crate::hc::gen_mhc_params(
+                                &self.ctx,
+                                &self.config,
+                                &layer.hc_ffn,
+                                &stream,
+                            )
+                        },
+                    )?;
                     keepalive.keep_f32(&mhc.pre);
                     keepalive.keep_f32(&mhc.post);
                     keepalive.keep_f32(&mhc.comb);
                     // SAFETY: fused hc_pre+rms_norm writes the full [m, hidden_size] buffer.
-                    crate::hc::mhc_pre_rms_norm(
+                    crate::profile::profile_op(
                         &self.ctx,
-                        &stream,
-                        &mhc.pre,
-                        &layer.ffn_norm,
-                        eps,
-                        hidden_size,
-                        hc_mult,
-                        &mut normed,
+                        "ffn_hc_pre_norm",
+                        Some(layer_idx),
+                        seq_len,
+                        || {
+                            crate::hc::mhc_pre_rms_norm(
+                                &self.ctx,
+                                &stream,
+                                &mhc.pre,
+                                &layer.ffn_norm,
+                                eps,
+                                hidden_size,
+                                hc_mult,
+                                &mut normed,
+                            )
+                        },
                     )?;
                     Some(mhc)
                 };
@@ -4677,69 +4894,126 @@ impl Dsv4Model {
                     // SAFETY: uninit device scratch; fully written before first read.
                     unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
                 if let Some(dense) = layer.dense_mlp.as_ref() {
-                    dsv4_dense_mlp_forward(
-                        &self.ctx,
-                        dense,
-                        &normed,
-                        &mut moe_with_shared,
-                        self.config.swiglu_limit,
-                        &mut keepalive,
-                    )?;
+                    crate::profile::profile_op(&self.ctx, "mlp", Some(layer_idx), seq_len, || {
+                        dsv4_dense_mlp_forward(
+                            &self.ctx,
+                            dense,
+                            &normed,
+                            &mut moe_with_shared,
+                            self.config.swiglu_limit,
+                            &mut keepalive,
+                        )
+                    })?;
                     keepalive.keep_hidden(&moe_with_shared);
                 } else {
                     // SAFETY: the MoE forward writes the full routed output buffer.
                     let mut moe_out =
                         unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
-                    let needs_moe_allreduce = crate::moe::dsv4_moe_forward(
-                        self,
-                        layer.moe.as_ref().expect("DSv4 layer.moe"),
-                        &tokens,
-                        &normed,
-                        &mut moe_out,
-                        &mut keepalive,
-                        None,
-                        mega_epoch,
+                    let needs_moe_allreduce = crate::profile::profile_op(
+                        &self.ctx,
+                        "moe_route",
+                        Some(layer_idx),
+                        seq_len,
+                        || {
+                            crate::moe::dsv4_moe_forward(
+                                self,
+                                layer.moe.as_ref().expect("DSv4 layer.moe"),
+                                &tokens,
+                                &normed,
+                                &mut moe_out,
+                                &mut keepalive,
+                                None,
+                                mega_epoch,
+                            )
+                        },
                     )?;
                     keepalive.keep_hidden(&moe_out);
                     if needs_moe_allreduce {
-                        let _nvtx = crate::nvtx::range("dsv4/moe_allreduce");
-                        self.tp.all_reduce_sum(&self.ctx, &mut moe_out)?;
+                        crate::profile::profile_op(
+                            &self.ctx,
+                            "moe_allreduce",
+                            Some(layer_idx),
+                            seq_len,
+                            || self.tp.all_reduce_sum(&self.ctx, &mut moe_out),
+                        )?;
                     }
                     // Grouped shared expert over [M] (dense FFN, prefill path).
                     let mut shared =
                         // SAFETY: uninit device scratch; fully written before first read.
                         unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
-                    crate::moe::dsv4_shared_expert_forward(
+                    crate::profile::profile_op(
                         &self.ctx,
-                        &self.ctx.stream,
-                        layer.moe.as_ref().expect("DSv4 layer.moe"),
-                        &normed,
-                        &mut shared,
-                        self.config.swiglu_limit,
-                        &mut keepalive,
+                        "shared_expert",
+                        Some(layer_idx),
+                        seq_len,
+                        || {
+                            crate::moe::dsv4_shared_expert_forward(
+                                &self.ctx,
+                                &self.ctx.stream,
+                                layer.moe.as_ref().expect("DSv4 layer.moe"),
+                                &normed,
+                                &mut shared,
+                                self.config.swiglu_limit,
+                                &mut keepalive,
+                            )
+                        },
                     )?;
                     keepalive.keep_hidden(&shared);
                     // SAFETY: add_batch writes the full [m, hidden_size] buffer.
-                    crate::ops::add_batch(&self.ctx, &moe_out, &shared, &mut moe_with_shared)?;
+                    crate::profile::profile_op(
+                        &self.ctx,
+                        "shared_add",
+                        Some(layer_idx),
+                        seq_len,
+                        || {
+                            crate::ops::add_batch(
+                                &self.ctx,
+                                &moe_out,
+                                &shared,
+                                &mut moe_with_shared,
+                            )
+                        },
+                    )?;
                     keepalive.keep_hidden(&moe_with_shared);
                 }
                 // SAFETY: hc_post / add_batch writes the full stream buffer.
                 let mut ffn_stream =
                     unsafe { HiddenStates::uninit(&self.ctx, stream_dim, seq_len)? };
                 if let Some(mhc) = ffn_mhc.as_ref() {
-                    crate::hc::hc_post(
+                    crate::profile::profile_op(
                         &self.ctx,
-                        &moe_with_shared,
-                        &stream,
-                        &mhc.post,
-                        &mhc.comb,
-                        hidden_size,
-                        hc_mult,
-                        &mut ffn_stream,
+                        "ffn_hc_post",
+                        Some(layer_idx),
+                        seq_len,
+                        || {
+                            crate::hc::hc_post(
+                                &self.ctx,
+                                &moe_with_shared,
+                                &stream,
+                                &mhc.post,
+                                &mhc.comb,
+                                hidden_size,
+                                hc_mult,
+                                &mut ffn_stream,
+                            )
+                        },
                     )?;
                 } else {
                     // GLM plain residual: stream = ffn_out + stream (stream_dim==hidden).
-                    crate::ops::add_batch(&self.ctx, &moe_with_shared, &stream, &mut ffn_stream)?;
+                    crate::profile::profile_op(
+                        &self.ctx,
+                        "ffn_hc_post",
+                        Some(layer_idx),
+                        seq_len,
+                        || {
+                            crate::ops::add_batch(
+                                &self.ctx,
+                                &moe_with_shared,
+                                &stream,
+                                &mut ffn_stream,
+                            )
+                        },
+                    )?;
                 }
                 keepalive.keep_hidden(&ffn_stream);
                 stream = ffn_stream;
@@ -4780,9 +5054,12 @@ impl Dsv4Model {
         }
 
         // ── Target logits matrix over all M rows, then its greedy top-1 view.
-        let _nvtx = crate::nvtx::range("dsv4/lm_head_verify_batched");
-        let logits = self.verify_logits_from_stream(&stream, m, &mut keepalive)?;
-        let argmax_all = self.mtp_argmax_batch(&logits)?;
+        let (logits, argmax_all) =
+            crate::profile::profile_op(&self.ctx, "lm_head", None, m, || {
+                let logits = self.verify_logits_from_stream(&stream, m, &mut keepalive)?;
+                let argmax_all = self.mtp_argmax_batch(&logits)?;
+                Ok((logits, argmax_all))
+            })?;
         std::hint::black_box(keepalive.len());
         drop(keepalive);
 
@@ -4855,17 +5132,16 @@ impl Dsv4Model {
         let eps = self.config.rms_norm_eps;
         let ctx = &self.ctx;
 
-        let _nvtx = crate::nvtx::range("dsv4/lm_head_sample");
         // ── Head HC: fold the last token's wide stream row → one hidden vector.
         let mut last_hidden = DeviceVec::zeros(ctx, hidden_size)?;
         if self.config.is_glm() {
             // GLM: head hidden = stream row (stream_dim==hidden, no head HC mixer).
             // ponytail: pod-verify GLM hc_mult==1 head hidden = stream row (identity)
-            crate::stage_profile::profile(ctx, "dsv4/stage/head_hc", || {
+            crate::profile::profile_op(ctx, "head_hc", None, seq_len, || {
                 crate::ops::copy_row_to_vec(ctx, stream, seq_len - 1, &mut last_hidden)
             })?;
         } else {
-            crate::stage_profile::profile(ctx, "dsv4/stage/head_hc", || {
+            crate::profile::profile_op(ctx, "head_hc", None, seq_len, || {
                 crate::hc::head_hidden_from_stream(
                     ctx,
                     &self.config,
@@ -4892,16 +5168,16 @@ impl Dsv4Model {
 
         // ── Final norm + lm_head projection + sample (last token row).
         let mut last_normed = DeviceVec::zeros(ctx, hidden_size)?;
-        crate::stage_profile::profile(ctx, "dsv4/stage/head_norm", || {
+        crate::profile::profile_op(ctx, "head_norm", None, seq_len, || {
             crate::ops::rms_norm_vec(ctx, &last_hidden, &self.norm, eps, &mut last_normed)
         })?;
         keepalive.keep_vec(&last_normed);
         let mut logits = DeviceVec::zeros(ctx, self.lm_head.rows)?;
-        crate::stage_profile::profile(ctx, "dsv4/stage/lm_head_project", || {
+        crate::profile::profile_op(ctx, "lm_head_project", None, seq_len, || {
             self.lm_head_project(&last_normed, &mut logits)
         })?;
         keepalive.keep_vec(&logits);
-        let token = crate::stage_profile::profile(ctx, "dsv4/stage/sample", || {
+        let token = crate::profile::profile_op(ctx, "sample", None, seq_len, || {
             self.sample_logits(&logits, params, position)
         })?;
         Ok(token)
@@ -4978,17 +5254,14 @@ impl Dsv4Model {
         scratch.set_rows(seq_len)?;
 
         let token_ids_host: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
-        let nvtx_embed = crate::nvtx::range("dsv4/embed");
-        let token_ids = crate::ops::upload_i32(ctx, &token_ids_host)?;
-        crate::stage_profile::profile(ctx, "dsv4/stage/embed", || {
+        crate::profile::profile_op(ctx, "embedding", None, seq_len, || {
+            let token_ids = crate::ops::upload_i32(ctx, &token_ids_host)?;
             crate::ops::embedding_batch(
                 ctx,
                 &self.embed_tokens,
                 &token_ids,
                 &mut scratch.embeddings,
-            )
-        })?;
-        crate::stage_profile::profile(ctx, "dsv4/stage/embed_hc_expand", || {
+            )?;
             crate::hc::initial_stream_from_embeddings(
                 ctx,
                 &scratch.embeddings,
@@ -4997,7 +5270,6 @@ impl Dsv4Model {
                 &mut scratch.initial_stream,
             )
         })?;
-        drop(nvtx_embed);
 
         let sparse_verify_meta = crate::attention::Dsv4ChainVerifyAttnMeta::new(
             ctx,
@@ -5005,7 +5277,6 @@ impl Dsv4Model {
             &sched.ancestors,
         )?;
         for (layer_idx, layer) in self.layers.iter().enumerate() {
-            let _layer_nvtx = crate::nvtx::range(&format!("dsv4/layer_{layer_idx:02}"));
             let (prev_layers, current_and_rest) = scratch.layers.split_at_mut(layer_idx);
             let current = current_and_rest
                 .first_mut()
@@ -5019,27 +5290,40 @@ impl Dsv4Model {
                 };
                 let normed = &mut current.attn_normed;
                 let attn_mhc = if self.config.is_glm() {
-                    crate::stage_profile::profile(ctx, "dsv4/stage/attn_hc_pre_norm", || {
-                        crate::ops::rms_norm_batch(ctx, stream, &layer.attn_norm, eps, normed)
-                    })?;
+                    crate::profile::profile_op(
+                        ctx,
+                        "attn_hc_pre_norm",
+                        Some(layer_idx),
+                        seq_len,
+                        || crate::ops::rms_norm_batch(ctx, stream, &layer.attn_norm, eps, normed),
+                    )?;
                     None
                 } else {
-                    let mhc =
-                        crate::stage_profile::profile(ctx, "dsv4/stage/attn_hc_params", || {
-                            crate::hc::gen_mhc_params(ctx, &self.config, &layer.hc_attn, stream)
-                        })?;
-                    crate::stage_profile::profile(ctx, "dsv4/stage/attn_hc_pre_norm", || {
-                        crate::hc::mhc_pre_rms_norm(
-                            ctx,
-                            stream,
-                            &mhc.pre,
-                            &layer.attn_norm,
-                            eps,
-                            hidden_size,
-                            hc_mult,
-                            normed,
-                        )
-                    })?;
+                    let mhc = crate::profile::profile_op(
+                        ctx,
+                        "attn_hc_params",
+                        Some(layer_idx),
+                        seq_len,
+                        || crate::hc::gen_mhc_params(ctx, &self.config, &layer.hc_attn, stream),
+                    )?;
+                    crate::profile::profile_op(
+                        ctx,
+                        "attn_hc_pre_norm",
+                        Some(layer_idx),
+                        seq_len,
+                        || {
+                            crate::hc::mhc_pre_rms_norm(
+                                ctx,
+                                stream,
+                                &mhc.pre,
+                                &layer.attn_norm,
+                                eps,
+                                hidden_size,
+                                hc_mult,
+                                normed,
+                            )
+                        },
+                    )?;
                     Some(mhc)
                 };
 
@@ -5052,58 +5336,74 @@ impl Dsv4Model {
                         .map_err(|e| anyhow!("DSv4 commit-fold normed persist failed: {e}"))?;
                 }
 
-                let _nvtx = crate::nvtx::range("dsv4/mla_attn_sparse_verify");
-                let (layer_pool, dsa_shared, flashmla_scratch, prefill_shared, fp32) =
-                    kv_adapter.layer_and_dsa_shared_mut(layer_idx)?;
-                crate::attention::mla_attention(
-                    ctx,
-                    &self.config,
-                    &layer.attention,
-                    layer.mode,
-                    layer.compress_ratio,
-                    layer_idx,
-                    normed,
-                    &mut slot.attention[layer_idx],
-                    layer_pool,
-                    dsa_shared,
-                    flashmla_scratch,
-                    prefill_shared,
-                    fp32,
-                    start_pos,
-                    None,
-                    Some(&sparse_verify_meta),
-                    &self.tp,
-                    &mut current.attn_out,
-                    &mut keepalive,
-                )?;
-
-                let _nvtx = crate::nvtx::range("dsv4/attn_allreduce");
-                crate::stage_profile::profile(ctx, "dsv4/stage/attn_allreduce", || {
-                    self.tp.all_reduce_sum(ctx, &mut current.attn_out)
+                crate::profile::profile_op(ctx, "attention", Some(layer_idx), seq_len, || {
+                    let (layer_pool, dsa_shared, flashmla_scratch, prefill_shared, fp32) =
+                        kv_adapter.layer_and_dsa_shared_mut(layer_idx)?;
+                    crate::attention::mla_attention(
+                        ctx,
+                        &self.config,
+                        &layer.attention,
+                        layer.mode,
+                        layer.compress_ratio,
+                        layer_idx,
+                        normed,
+                        &mut slot.attention[layer_idx],
+                        layer_pool,
+                        dsa_shared,
+                        flashmla_scratch,
+                        prefill_shared,
+                        fp32,
+                        start_pos,
+                        None,
+                        Some(&sparse_verify_meta),
+                        &self.tp,
+                        &mut current.attn_out,
+                        &mut keepalive,
+                    )
                 })?;
 
+                crate::profile::profile_op(
+                    ctx,
+                    "attn_allreduce",
+                    Some(layer_idx),
+                    seq_len,
+                    || self.tp.all_reduce_sum(ctx, &mut current.attn_out),
+                )?;
+
                 if let Some(mhc) = attn_mhc.as_ref() {
-                    crate::stage_profile::profile(ctx, "dsv4/stage/attn_hc_post", || {
-                        crate::hc::hc_post(
-                            ctx,
-                            &current.attn_out,
-                            stream,
-                            &mhc.post,
-                            &mhc.comb,
-                            hidden_size,
-                            hc_mult,
-                            &mut current.attn_stream,
-                        )
-                    })?;
+                    crate::profile::profile_op(
+                        ctx,
+                        "attn_hc_post",
+                        Some(layer_idx),
+                        seq_len,
+                        || {
+                            crate::hc::hc_post(
+                                ctx,
+                                &current.attn_out,
+                                stream,
+                                &mhc.post,
+                                &mhc.comb,
+                                hidden_size,
+                                hc_mult,
+                                &mut current.attn_stream,
+                            )
+                        },
+                    )?;
                 } else {
-                    crate::stage_profile::profile(ctx, "dsv4/stage/attn_hc_post", || {
-                        crate::ops::add_batch(
-                            ctx,
-                            &current.attn_out,
-                            stream,
-                            &mut current.attn_stream,
-                        )
-                    })?;
+                    crate::profile::profile_op(
+                        ctx,
+                        "attn_hc_post",
+                        Some(layer_idx),
+                        seq_len,
+                        || {
+                            crate::ops::add_batch(
+                                ctx,
+                                &current.attn_out,
+                                stream,
+                                &mut current.attn_stream,
+                            )
+                        },
+                    )?;
                 }
             }
 
@@ -5111,73 +5411,98 @@ impl Dsv4Model {
                 let stream = &current.attn_stream;
                 let normed = &mut current.ffn_normed;
                 let ffn_mhc = if self.config.is_glm() {
-                    crate::stage_profile::profile(ctx, "dsv4/stage/ffn_hc_pre_norm", || {
-                        crate::ops::rms_norm_batch(ctx, stream, &layer.ffn_norm, eps, normed)
-                    })?;
+                    crate::profile::profile_op(
+                        ctx,
+                        "ffn_hc_pre_norm",
+                        Some(layer_idx),
+                        seq_len,
+                        || crate::ops::rms_norm_batch(ctx, stream, &layer.ffn_norm, eps, normed),
+                    )?;
                     None
                 } else {
-                    let mhc =
-                        crate::stage_profile::profile(ctx, "dsv4/stage/ffn_hc_params", || {
-                            crate::hc::gen_mhc_params(ctx, &self.config, &layer.hc_ffn, stream)
-                        })?;
-                    crate::stage_profile::profile(ctx, "dsv4/stage/ffn_hc_pre_norm", || {
-                        crate::hc::mhc_pre_rms_norm(
-                            ctx,
-                            stream,
-                            &mhc.pre,
-                            &layer.ffn_norm,
-                            eps,
-                            hidden_size,
-                            hc_mult,
-                            normed,
-                        )
-                    })?;
+                    let mhc = crate::profile::profile_op(
+                        ctx,
+                        "ffn_hc_params",
+                        Some(layer_idx),
+                        seq_len,
+                        || crate::hc::gen_mhc_params(ctx, &self.config, &layer.hc_ffn, stream),
+                    )?;
+                    crate::profile::profile_op(
+                        ctx,
+                        "ffn_hc_pre_norm",
+                        Some(layer_idx),
+                        seq_len,
+                        || {
+                            crate::hc::mhc_pre_rms_norm(
+                                ctx,
+                                stream,
+                                &mhc.pre,
+                                &layer.ffn_norm,
+                                eps,
+                                hidden_size,
+                                hc_mult,
+                                normed,
+                            )
+                        },
+                    )?;
                     Some(mhc)
                 };
 
                 if let Some(dense) = layer.dense_mlp.as_ref() {
-                    dsv4_dense_mlp_forward(
-                        ctx,
-                        dense,
-                        normed,
-                        &mut current.moe_with_shared,
-                        self.config.swiglu_limit,
-                        &mut keepalive,
-                    )?;
+                    crate::profile::profile_op(ctx, "mlp", Some(layer_idx), seq_len, || {
+                        dsv4_dense_mlp_forward(
+                            ctx,
+                            dense,
+                            normed,
+                            &mut current.moe_with_shared,
+                            self.config.swiglu_limit,
+                            &mut keepalive,
+                        )
+                    })?;
                 } else {
-                    let needs_moe_allreduce = crate::moe::dsv4_moe_forward(
-                        self,
-                        layer.moe.as_ref().expect("DSv4 layer.moe"),
-                        tokens,
-                        normed,
-                        &mut current.moe_out,
-                        &mut keepalive,
-                        None,
-                        mega_epoch,
+                    let needs_moe_allreduce = crate::profile::profile_op(
+                        ctx,
+                        "moe_route",
+                        Some(layer_idx),
+                        seq_len,
+                        || {
+                            crate::moe::dsv4_moe_forward(
+                                self,
+                                layer.moe.as_ref().expect("DSv4 layer.moe"),
+                                tokens,
+                                normed,
+                                &mut current.moe_out,
+                                &mut keepalive,
+                                None,
+                                mega_epoch,
+                            )
+                        },
                     )?;
 
                     if needs_moe_allreduce {
-                        let _nvtx = crate::nvtx::range("dsv4/moe_allreduce");
-                        crate::stage_profile::profile(ctx, "dsv4/stage/moe_allreduce", || {
-                            self.tp.all_reduce_sum(ctx, &mut current.moe_out)
-                        })?;
+                        crate::profile::profile_op(
+                            ctx,
+                            "moe_allreduce",
+                            Some(layer_idx),
+                            seq_len,
+                            || self.tp.all_reduce_sum(ctx, &mut current.moe_out),
+                        )?;
                     }
 
-                    let _nvtx_shared_hc = crate::nvtx::range("dsv4/shared_hc");
-                    let (shared_out, shared_scratch) = kv_adapter.shared_expert_decode_mut();
-                    let shared = shared_out.ok_or_else(|| {
-                        anyhow!("DSv4 verify requires shared-expert output buffer")
-                    })?;
-                    shared.seq_len = seq_len;
-                    ensure!(
-                        shared.hidden_dim == hidden_size,
-                        "DSv4 shared verify scratch hidden {} != {}",
-                        shared.hidden_dim,
-                        hidden_size
-                    );
-                    let shared_scratch = shared_scratch
-                        .ok_or_else(|| anyhow!("DSv4 verify requires shared-expert scratch"))?;
-                    crate::stage_profile::profile(ctx, "dsv4/stage/shared_expert", || {
+                    crate::profile::profile_op(ctx, "shared_hc", Some(layer_idx), seq_len, || {
+                        let (shared_out, shared_scratch) = kv_adapter.shared_expert_decode_mut();
+                        let shared = shared_out.ok_or_else(|| {
+                            anyhow!("DSv4 verify requires shared-expert output buffer")
+                        })?;
+                        shared.seq_len = seq_len;
+                        ensure!(
+                            shared.hidden_dim == hidden_size,
+                            "DSv4 shared verify scratch hidden {} != {}",
+                            shared.hidden_dim,
+                            hidden_size
+                        );
+                        let shared_scratch = shared_scratch
+                            .ok_or_else(|| anyhow!("DSv4 verify requires shared-expert scratch"))?;
                         crate::moe::dsv4_shared_expert_forward_decode_scratch(
                             ctx,
                             &ctx.stream,
@@ -5186,9 +5511,7 @@ impl Dsv4Model {
                             shared,
                             self.config.swiglu_limit,
                             shared_scratch,
-                        )
-                    })?;
-                    crate::stage_profile::profile(ctx, "dsv4/stage/shared_add", || {
+                        )?;
                         crate::ops::add_batch(
                             ctx,
                             &current.moe_out,
@@ -5199,27 +5522,39 @@ impl Dsv4Model {
                 }
 
                 if let Some(mhc) = ffn_mhc.as_ref() {
-                    crate::stage_profile::profile(ctx, "dsv4/stage/ffn_hc_post", || {
-                        crate::hc::hc_post(
-                            ctx,
-                            &current.moe_with_shared,
-                            stream,
-                            &mhc.post,
-                            &mhc.comb,
-                            hidden_size,
-                            hc_mult,
-                            &mut current.ffn_stream,
-                        )
-                    })?;
+                    crate::profile::profile_op(
+                        ctx,
+                        "ffn_hc_post",
+                        Some(layer_idx),
+                        seq_len,
+                        || {
+                            crate::hc::hc_post(
+                                ctx,
+                                &current.moe_with_shared,
+                                stream,
+                                &mhc.post,
+                                &mhc.comb,
+                                hidden_size,
+                                hc_mult,
+                                &mut current.ffn_stream,
+                            )
+                        },
+                    )?;
                 } else {
-                    crate::stage_profile::profile(ctx, "dsv4/stage/ffn_hc_post", || {
-                        crate::ops::add_batch(
-                            ctx,
-                            &current.moe_with_shared,
-                            stream,
-                            &mut current.ffn_stream,
-                        )
-                    })?;
+                    crate::profile::profile_op(
+                        ctx,
+                        "ffn_hc_post",
+                        Some(layer_idx),
+                        seq_len,
+                        || {
+                            crate::ops::add_batch(
+                                ctx,
+                                &current.moe_with_shared,
+                                stream,
+                                &mut current.ffn_stream,
+                            )
+                        },
+                    )?;
                 }
 
                 if self.config.is_dspark()
@@ -5337,21 +5672,16 @@ impl Dsv4Model {
         };
 
         let token_ids_host: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
-        let nvtx_embed = crate::nvtx::range("dsv4/embed");
         let token_ids = crate::ops::upload_i32(&self.ctx, &token_ids_host)?;
         keepalive.keep_i32(&token_ids);
         // SAFETY: embedding_batch writes the full [seq_len, hidden_size] buffer.
         let mut embeddings = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
-        crate::stage_profile::profile(ctx, "dsv4/stage/embed", || {
-            crate::ops::embedding_batch(&self.ctx, &self.embed_tokens, &token_ids, &mut embeddings)
-                .map_err(|e| anyhow!("DSv4 embed lookup failed: {e}"))
-        })?;
-        keepalive.keep_hidden(&embeddings);
-
         // Wide HC residual stream from the token embeddings.
         // SAFETY: initial_stream_from_embeddings writes the full stream buffer.
         let mut stream = unsafe { HiddenStates::uninit(&self.ctx, stream_dim, seq_len)? };
-        crate::stage_profile::profile(ctx, "dsv4/stage/embed_hc_expand", || {
+        crate::profile::profile_op(&self.ctx, "embedding", None, seq_len, || {
+            crate::ops::embedding_batch(&self.ctx, &self.embed_tokens, &token_ids, &mut embeddings)
+                .map_err(|e| anyhow!("DSv4 embed lookup failed: {e}"))?;
             crate::hc::initial_stream_from_embeddings(
                 &self.ctx,
                 &embeddings,
@@ -5360,8 +5690,8 @@ impl Dsv4Model {
                 &mut stream,
             )
         })?;
+        keepalive.keep_hidden(&embeddings);
         keepalive.keep_hidden(&stream);
-        drop(nvtx_embed);
         let sparse_verify_meta = match verify {
             Some(sched) => {
                 ensure!(
@@ -5392,7 +5722,6 @@ impl Dsv4Model {
             crate::probe::lens_begin();
         }
         for (layer_idx, layer) in self.layers.iter().enumerate() {
-            let _layer_nvtx = crate::nvtx::range(&format!("dsv4/layer_{layer_idx:02}"));
             // ── Attention half: HC-wrap MLA attention.
             // ponytail: pod-verify GLM hc_mult==1 plain residual + identity stream (no hyper-connection)
             // SAFETY: fused hc_pre+rms_norm / plain rms_norm writes the full
@@ -5400,35 +5729,51 @@ impl Dsv4Model {
             let mut normed = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
             let attn_mhc = if self.config.is_glm() {
                 // GLM: plain RMSNorm of the stream (stream IS the hidden).
-                crate::stage_profile::profile(ctx, "dsv4/stage/attn_hc_pre_norm", || {
-                    crate::ops::rms_norm_batch(
-                        &self.ctx,
-                        &stream,
-                        &layer.attn_norm,
-                        eps,
-                        &mut normed,
-                    )
-                })?;
+                crate::profile::profile_op(
+                    ctx,
+                    "attn_hc_pre_norm",
+                    Some(layer_idx),
+                    seq_len,
+                    || {
+                        crate::ops::rms_norm_batch(
+                            &self.ctx,
+                            &stream,
+                            &layer.attn_norm,
+                            eps,
+                            &mut normed,
+                        )
+                    },
+                )?;
                 None
             } else {
-                let mhc = crate::stage_profile::profile(ctx, "dsv4/stage/attn_hc_params", || {
-                    crate::hc::gen_mhc_params(&self.ctx, &self.config, &layer.hc_attn, &stream)
-                })?;
+                let mhc = crate::profile::profile_op(
+                    ctx,
+                    "attn_hc_params",
+                    Some(layer_idx),
+                    seq_len,
+                    || crate::hc::gen_mhc_params(&self.ctx, &self.config, &layer.hc_attn, &stream),
+                )?;
                 keepalive.keep_f32(&mhc.pre);
                 keepalive.keep_f32(&mhc.post);
                 keepalive.keep_f32(&mhc.comb);
-                crate::stage_profile::profile(ctx, "dsv4/stage/attn_hc_pre_norm", || {
-                    crate::hc::mhc_pre_rms_norm(
-                        &self.ctx,
-                        &stream,
-                        &mhc.pre,
-                        &layer.attn_norm,
-                        eps,
-                        hidden_size,
-                        hc_mult,
-                        &mut normed,
-                    )
-                })?;
+                crate::profile::profile_op(
+                    ctx,
+                    "attn_hc_pre_norm",
+                    Some(layer_idx),
+                    seq_len,
+                    || {
+                        crate::hc::mhc_pre_rms_norm(
+                            &self.ctx,
+                            &stream,
+                            &mhc.pre,
+                            &layer.attn_norm,
+                            eps,
+                            hidden_size,
+                            hc_mult,
+                            &mut normed,
+                        )
+                    },
+                )?;
                 Some(mhc)
             };
             keepalive.keep_hidden(&normed);
@@ -5452,64 +5797,12 @@ impl Dsv4Model {
                 // whole row chunk. Ancestors carry row `r`'s chain dependency,
                 // so no row replay or slot-ring mutation is needed; commit
                 // writes accepted rows later.
-                let _nvtx = crate::nvtx::range("dsv4/mla_attn_sparse_verify");
-                let (layer_pool, dsa_shared, flashmla_scratch, prefill_shared, fp32) =
-                    kv_adapter.layer_and_dsa_shared_mut(layer_idx)?;
-                crate::attention::mla_attention(
+                crate::profile::profile_op(
                     &self.ctx,
-                    &self.config,
-                    &layer.attention,
-                    layer.mode,
-                    layer.compress_ratio,
-                    layer_idx,
-                    &normed,
-                    &mut slot.attention[layer_idx],
-                    layer_pool,
-                    dsa_shared,
-                    flashmla_scratch,
-                    prefill_shared,
-                    fp32,
-                    start_pos,
-                    None,
-                    Some(meta),
-                    &self.tp,
-                    &mut attn_out,
-                    &mut keepalive,
-                )?;
-            } else {
-                let _nvtx = crate::nvtx::range("dsv4/mla_attn");
-                crate::stage_profile::profile(ctx, "dsv4/stage/mla_attn", || {
-                    let model1_decode = seq_len == 1
-                        && start_pos_device.is_some()
-                        && layer.attention.w_kc.is_none()
-                        && layer.attention.w_vc.is_none()
-                        && layer.attention.o_proj.is_none();
-                    if model1_decode {
-                        let (layer_pool, dsa_shared, flashmla_scratch, mla_scratch) =
-                            kv_adapter.layer_flashmla_and_mla_decode_mut(layer_idx)?;
-                        let mla_scratch = mla_scratch.ok_or_else(|| {
-                            anyhow!("DSv4 MODEL1 layer {layer_idx} missing MLA decode scratch")
-                        })?;
-                        crate::attention::mla_attention_decode_graph(
-                            &self.ctx,
-                            &self.config,
-                            &layer.attention,
-                            layer.mode,
-                            layer.compress_ratio,
-                            layer_idx,
-                            &normed,
-                            &mut slot.attention[layer_idx],
-                            layer_pool,
-                            dsa_shared,
-                            flashmla_scratch,
-                            start_pos,
-                            start_pos_device,
-                            &self.tp,
-                            mla_scratch,
-                            &mut attn_out,
-                            &mut keepalive,
-                        )
-                    } else {
+                    "attention",
+                    Some(layer_idx),
+                    seq_len,
+                    || {
                         let (layer_pool, dsa_shared, flashmla_scratch, prefill_shared, fp32) =
                             kv_adapter.layer_and_dsa_shared_mut(layer_idx)?;
                         crate::attention::mla_attention(
@@ -5527,27 +5820,92 @@ impl Dsv4Model {
                             prefill_shared,
                             fp32,
                             start_pos,
-                            start_pos_device,
                             None,
+                            Some(meta),
                             &self.tp,
                             &mut attn_out,
                             &mut keepalive,
                         )
-                    }
-                })?;
+                    },
+                )?;
+            } else {
+                crate::profile::profile_op(
+                    &self.ctx,
+                    "attention",
+                    Some(layer_idx),
+                    seq_len,
+                    || {
+                        let model1_decode = seq_len == 1
+                            && start_pos_device.is_some()
+                            && layer.attention.w_kc.is_none()
+                            && layer.attention.w_vc.is_none()
+                            && layer.attention.o_proj.is_none();
+                        if model1_decode {
+                            let (layer_pool, dsa_shared, flashmla_scratch, mla_scratch) =
+                                kv_adapter.layer_flashmla_and_mla_decode_mut(layer_idx)?;
+                            let mla_scratch = mla_scratch.ok_or_else(|| {
+                                anyhow!("DSv4 MODEL1 layer {layer_idx} missing MLA decode scratch")
+                            })?;
+                            crate::attention::mla_attention_decode_graph(
+                                &self.ctx,
+                                &self.config,
+                                &layer.attention,
+                                layer.mode,
+                                layer.compress_ratio,
+                                layer_idx,
+                                &normed,
+                                &mut slot.attention[layer_idx],
+                                layer_pool,
+                                dsa_shared,
+                                flashmla_scratch,
+                                start_pos,
+                                start_pos_device,
+                                &self.tp,
+                                mla_scratch,
+                                &mut attn_out,
+                                &mut keepalive,
+                            )
+                        } else {
+                            let (layer_pool, dsa_shared, flashmla_scratch, prefill_shared, fp32) =
+                                kv_adapter.layer_and_dsa_shared_mut(layer_idx)?;
+                            crate::attention::mla_attention(
+                                &self.ctx,
+                                &self.config,
+                                &layer.attention,
+                                layer.mode,
+                                layer.compress_ratio,
+                                layer_idx,
+                                &normed,
+                                &mut slot.attention[layer_idx],
+                                layer_pool,
+                                dsa_shared,
+                                flashmla_scratch,
+                                prefill_shared,
+                                fp32,
+                                start_pos,
+                                start_pos_device,
+                                None,
+                                &self.tp,
+                                &mut attn_out,
+                                &mut keepalive,
+                            )
+                        }
+                    },
+                )?;
             }
             keepalive.keep_hidden(&attn_out);
             // Row-parallel O-LoRA: sum the per-rank partials (no-op single-GPU).
-            {
-                let _nvtx = crate::nvtx::range("dsv4/attn_allreduce");
-                crate::stage_profile::profile(ctx, "dsv4/stage/attn_allreduce", || {
-                    self.tp.all_reduce_sum(&self.ctx, &mut attn_out)
-                })?;
-            }
+            crate::profile::profile_op(
+                &self.ctx,
+                "attn_allreduce",
+                Some(layer_idx),
+                seq_len,
+                || self.tp.all_reduce_sum(&self.ctx, &mut attn_out),
+            )?;
             // SAFETY: hc_post / add_batch writes the full stream buffer.
             let mut attn_stream = unsafe { HiddenStates::uninit(&self.ctx, stream_dim, seq_len)? };
             if let Some(mhc) = attn_mhc.as_ref() {
-                crate::stage_profile::profile(ctx, "dsv4/stage/attn_hc_post", || {
+                crate::profile::profile_op(ctx, "attn_hc_post", Some(layer_idx), seq_len, || {
                     crate::hc::hc_post(
                         &self.ctx,
                         &attn_out,
@@ -5561,7 +5919,7 @@ impl Dsv4Model {
                 })?;
             } else {
                 // GLM plain residual: stream = attn_out + stream (stream_dim==hidden).
-                crate::stage_profile::profile(ctx, "dsv4/stage/attn_hc_post", || {
+                crate::profile::profile_op(ctx, "attn_hc_post", Some(layer_idx), seq_len, || {
                     crate::ops::add_batch(&self.ctx, &attn_out, &stream, &mut attn_stream)
                 })?;
             }
@@ -5574,35 +5932,51 @@ impl Dsv4Model {
             // [seq_len, hidden_size] buffer.
             let mut normed = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
             let ffn_mhc = if self.config.is_glm() {
-                crate::stage_profile::profile(ctx, "dsv4/stage/ffn_hc_pre_norm", || {
-                    crate::ops::rms_norm_batch(
-                        &self.ctx,
-                        &stream,
-                        &layer.ffn_norm,
-                        eps,
-                        &mut normed,
-                    )
-                })?;
+                crate::profile::profile_op(
+                    ctx,
+                    "ffn_hc_pre_norm",
+                    Some(layer_idx),
+                    seq_len,
+                    || {
+                        crate::ops::rms_norm_batch(
+                            &self.ctx,
+                            &stream,
+                            &layer.ffn_norm,
+                            eps,
+                            &mut normed,
+                        )
+                    },
+                )?;
                 None
             } else {
-                let mhc = crate::stage_profile::profile(ctx, "dsv4/stage/ffn_hc_params", || {
-                    crate::hc::gen_mhc_params(&self.ctx, &self.config, &layer.hc_ffn, &stream)
-                })?;
+                let mhc = crate::profile::profile_op(
+                    ctx,
+                    "ffn_hc_params",
+                    Some(layer_idx),
+                    seq_len,
+                    || crate::hc::gen_mhc_params(&self.ctx, &self.config, &layer.hc_ffn, &stream),
+                )?;
                 keepalive.keep_f32(&mhc.pre);
                 keepalive.keep_f32(&mhc.post);
                 keepalive.keep_f32(&mhc.comb);
-                crate::stage_profile::profile(ctx, "dsv4/stage/ffn_hc_pre_norm", || {
-                    crate::hc::mhc_pre_rms_norm(
-                        &self.ctx,
-                        &stream,
-                        &mhc.pre,
-                        &layer.ffn_norm,
-                        eps,
-                        hidden_size,
-                        hc_mult,
-                        &mut normed,
-                    )
-                })?;
+                crate::profile::profile_op(
+                    ctx,
+                    "ffn_hc_pre_norm",
+                    Some(layer_idx),
+                    seq_len,
+                    || {
+                        crate::hc::mhc_pre_rms_norm(
+                            &self.ctx,
+                            &stream,
+                            &mhc.pre,
+                            &layer.ffn_norm,
+                            eps,
+                            hidden_size,
+                            hc_mult,
+                            &mut normed,
+                        )
+                    },
+                )?;
                 Some(mhc)
             };
             keepalive.keep_hidden(&normed);
@@ -5612,14 +5986,16 @@ impl Dsv4Model {
                 // SAFETY: uninit device scratch; fully written before first read.
                 unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
             if let Some(dense) = layer.dense_mlp.as_ref() {
-                dsv4_dense_mlp_forward(
-                    &self.ctx,
-                    dense,
-                    &normed,
-                    &mut moe_with_shared,
-                    self.config.swiglu_limit,
-                    &mut keepalive,
-                )?;
+                crate::profile::profile_op(ctx, "mlp", Some(layer_idx), seq_len, || {
+                    dsv4_dense_mlp_forward(
+                        &self.ctx,
+                        dense,
+                        &normed,
+                        &mut moe_with_shared,
+                        self.config.swiglu_limit,
+                        &mut keepalive,
+                    )
+                })?;
                 keepalive.keep_hidden(&moe_with_shared);
             } else {
                 let use_comm_overlap = seq_len == 1 && !use_deepep_transport;
@@ -5699,168 +6075,172 @@ impl Dsv4Model {
                         );
                     }
                 } else {
-                    crate::moe::dsv4_moe_forward(
-                        self,
-                        layer.moe.as_ref().expect("DSv4 layer.moe"),
-                        tokens,
-                        &normed,
-                        &mut moe_out,
-                        &mut keepalive,
-                        None,
-                        mega_epoch,
-                    )?
+                    crate::profile::profile_op(ctx, "moe_route", Some(layer_idx), seq_len, || {
+                        crate::moe::dsv4_moe_forward(
+                            self,
+                            layer.moe.as_ref().expect("DSv4 layer.moe"),
+                            tokens,
+                            &normed,
+                            &mut moe_out,
+                            &mut keepalive,
+                            None,
+                            mega_epoch,
+                        )
+                    })?
                 };
                 keepalive.keep_hidden(&moe_out);
-                let _nvtx_shared_hc = crate::nvtx::range("dsv4/shared_hc");
-                let mut shared_owned = None;
-                let shared_ready = if use_comm_overlap {
-                    let shared = shared_out.as_deref_mut().ok_or_else(|| {
-                        anyhow!("DSv4 decode requires shared-expert output buffer")
-                    })?;
-                    shared.seq_len = seq_len;
-                    ensure!(
-                        shared.hidden_dim == hidden_size && shared.seq_len == seq_len,
-                        "DSv4 shared decode scratch shape {}x{} != {}x{}",
-                        shared.hidden_dim,
-                        shared.seq_len,
-                        hidden_size,
-                        seq_len
-                    );
-                    let _normed_ready = normed_ready
-                        .as_ref()
-                        .expect("comm-overlap path records normed fence");
-                    let scratch = shared_scratch
-                        .as_deref_mut()
-                        .ok_or_else(|| anyhow!("DSv4 decode requires shared-expert scratch"))?;
-                    crate::stage_profile::profile(ctx, "dsv4/stage/shared_expert", || {
-                        crate::moe::dsv4_shared_expert_forward_decode_scratch(
-                            &self.ctx,
-                            &self.ctx.comm_stream,
-                            layer.moe.as_ref().expect("DSv4 layer.moe"),
-                            &normed,
-                            shared,
-                            self.config.swiglu_limit,
-                            scratch,
-                        )
-                    })?;
-                    Some(ctx.record_pipeline_fence(CudaPipelineStreamKind::Comm)?)
-                } else {
-                    None
-                };
-                // Routed experts are EP-sharded; sum them first, then add the replicated
-                // shared expert exactly once per rank. In the comm-overlap path, shared
-                // expert depends on `normed`, while this compute-stream collective depends
-                // on the routed `moe_out`; the two can run concurrently.
-                if needs_moe_allreduce {
-                    let _nvtx = crate::nvtx::range("dsv4/moe_allreduce");
-                    crate::stage_profile::profile(ctx, "dsv4/stage/moe_allreduce", || {
-                        self.tp.all_reduce_sum(&self.ctx, &mut moe_out)
-                    })?;
-                }
-                if use_comm_overlap {
-                    // Already launched on the comm stream above.
-                } else if seq_len == 1 {
-                    let shared = shared_out.as_deref_mut().ok_or_else(|| {
-                        anyhow!("DSv4 decode requires shared-expert output buffer")
-                    })?;
-                    shared.seq_len = seq_len;
-                    ensure!(
-                        shared.hidden_dim == hidden_size && shared.seq_len == seq_len,
-                        "DSv4 shared decode scratch shape {}x{} != {}x{}",
-                        shared.hidden_dim,
-                        shared.seq_len,
-                        hidden_size,
-                        seq_len
-                    );
-                    let scratch = shared_scratch
-                        .as_deref_mut()
-                        .ok_or_else(|| anyhow!("DSv4 decode requires shared-expert scratch"))?;
-                    crate::stage_profile::profile(ctx, "dsv4/stage/shared_expert", || {
-                        crate::moe::dsv4_shared_expert_forward_decode_scratch(
-                            &self.ctx,
-                            &self.ctx.stream,
-                            layer.moe.as_ref().expect("DSv4 layer.moe"),
-                            &normed,
-                            shared,
-                            self.config.swiglu_limit,
-                            scratch,
-                        )
-                    })?;
-                } else if !use_deepep_transport
-                    && sparse_verify_meta.is_some()
-                    && seq_len <= MAX_SPEC_VERIFY_ROWS
-                {
-                    let shared = shared_out.as_deref_mut().ok_or_else(|| {
-                        anyhow!("DSv4 verify requires shared-expert output buffer")
-                    })?;
-                    shared.seq_len = seq_len;
-                    ensure!(
-                        shared.hidden_dim == hidden_size,
-                        "DSv4 shared verify scratch hidden {} != {}",
-                        shared.hidden_dim,
-                        hidden_size
-                    );
-                    let scratch = shared_scratch
-                        .ok_or_else(|| anyhow!("DSv4 verify requires shared-expert scratch"))?;
-                    crate::stage_profile::profile(ctx, "dsv4/stage/shared_expert", || {
-                        crate::moe::dsv4_shared_expert_forward_decode_scratch(
-                            &self.ctx,
-                            &self.ctx.stream,
-                            layer.moe.as_ref().expect("DSv4 layer.moe"),
-                            &normed,
-                            shared,
-                            self.config.swiglu_limit,
-                            scratch,
-                        )
-                    })?;
-                } else {
-                    // Keep the default masked path order byte-for-byte with main:
-                    // routed MoE → all-reduce → allocate/run shared expert. Moving
-                    // shared scratch allocation before all-reduce can reuse in-flight
-                    // helper buffers under disabled cudarc event tracking.
-                    // SAFETY: dsv4_shared_expert_forward writes the full shared output.
-                    let mut shared =
-                        unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
-                    crate::stage_profile::profile(ctx, "dsv4/stage/shared_expert", || {
-                        crate::moe::dsv4_shared_expert_forward(
-                            &self.ctx,
-                            &self.ctx.stream,
-                            layer.moe.as_ref().expect("DSv4 layer.moe"),
-                            &normed,
-                            &mut shared,
-                            self.config.swiglu_limit,
-                            &mut keepalive,
-                        )
-                    })?;
-                    shared_owned = Some(shared);
-                };
-                let shared = if seq_len == 1
-                    || (!use_deepep_transport
-                        && sparse_verify_meta.is_some()
-                        && seq_len <= MAX_SPEC_VERIFY_ROWS)
-                {
-                    shared_out.as_deref().ok_or_else(|| {
-                        anyhow!("DSv4 decode requires shared-expert output buffer")
-                    })?
-                } else {
-                    shared_owned
-                        .as_ref()
-                        .expect("multi-token shared expert allocates owned output")
-                };
-                keepalive.keep_hidden(shared);
-                if let Some(fence) = shared_ready.as_ref() {
-                    ctx.wait_on_pipeline_fence(fence, CudaPipelineStreamKind::Compute)?;
-                }
-                // SAFETY: add_batch writes the full [seq_len, hidden_size] buffer.
-                crate::stage_profile::profile(ctx, "dsv4/stage/shared_add", || {
-                    crate::ops::add_batch(&self.ctx, &moe_out, shared, &mut moe_with_shared)
-                })?;
-                keepalive.keep_hidden(&moe_with_shared);
+                crate::profile::profile_op(
+                    &self.ctx,
+                    "shared_hc",
+                    Some(layer_idx),
+                    seq_len,
+                    || {
+                        let mut shared_owned = None;
+                        let shared_ready = if use_comm_overlap {
+                            let shared = shared_out.as_deref_mut().ok_or_else(|| {
+                                anyhow!("DSv4 decode requires shared-expert output buffer")
+                            })?;
+                            shared.seq_len = seq_len;
+                            ensure!(
+                                shared.hidden_dim == hidden_size && shared.seq_len == seq_len,
+                                "DSv4 shared decode scratch shape {}x{} != {}x{}",
+                                shared.hidden_dim,
+                                shared.seq_len,
+                                hidden_size,
+                                seq_len
+                            );
+                            let _normed_ready = normed_ready
+                                .as_ref()
+                                .expect("comm-overlap path records normed fence");
+                            let scratch = shared_scratch.as_deref_mut().ok_or_else(|| {
+                                anyhow!("DSv4 decode requires shared-expert scratch")
+                            })?;
+                            crate::moe::dsv4_shared_expert_forward_decode_scratch(
+                                &self.ctx,
+                                &self.ctx.comm_stream,
+                                layer.moe.as_ref().expect("DSv4 layer.moe"),
+                                &normed,
+                                shared,
+                                self.config.swiglu_limit,
+                                scratch,
+                            )?;
+                            Some(ctx.record_pipeline_fence(CudaPipelineStreamKind::Comm)?)
+                        } else {
+                            None
+                        };
+                        // Routed experts are EP-sharded; sum them first, then add the replicated
+                        // shared expert exactly once per rank. In the comm-overlap path, shared
+                        // expert depends on `normed`, while this compute-stream collective depends
+                        // on the routed `moe_out`; the two can run concurrently.
+                        if needs_moe_allreduce {
+                            crate::profile::profile_op(
+                                &self.ctx,
+                                "moe_allreduce",
+                                Some(layer_idx),
+                                seq_len,
+                                || self.tp.all_reduce_sum(&self.ctx, &mut moe_out),
+                            )?;
+                        }
+                        if use_comm_overlap {
+                            // Already launched on the comm stream above.
+                        } else if seq_len == 1 {
+                            let shared = shared_out.as_deref_mut().ok_or_else(|| {
+                                anyhow!("DSv4 decode requires shared-expert output buffer")
+                            })?;
+                            shared.seq_len = seq_len;
+                            ensure!(
+                                shared.hidden_dim == hidden_size && shared.seq_len == seq_len,
+                                "DSv4 shared decode scratch shape {}x{} != {}x{}",
+                                shared.hidden_dim,
+                                shared.seq_len,
+                                hidden_size,
+                                seq_len
+                            );
+                            let scratch = shared_scratch.as_deref_mut().ok_or_else(|| {
+                                anyhow!("DSv4 decode requires shared-expert scratch")
+                            })?;
+                            crate::moe::dsv4_shared_expert_forward_decode_scratch(
+                                &self.ctx,
+                                &self.ctx.stream,
+                                layer.moe.as_ref().expect("DSv4 layer.moe"),
+                                &normed,
+                                shared,
+                                self.config.swiglu_limit,
+                                scratch,
+                            )?;
+                        } else if !use_deepep_transport
+                            && sparse_verify_meta.is_some()
+                            && seq_len <= MAX_SPEC_VERIFY_ROWS
+                        {
+                            let shared = shared_out.as_deref_mut().ok_or_else(|| {
+                                anyhow!("DSv4 verify requires shared-expert output buffer")
+                            })?;
+                            shared.seq_len = seq_len;
+                            ensure!(
+                                shared.hidden_dim == hidden_size,
+                                "DSv4 shared verify scratch hidden {} != {}",
+                                shared.hidden_dim,
+                                hidden_size
+                            );
+                            let scratch = shared_scratch.ok_or_else(|| {
+                                anyhow!("DSv4 verify requires shared-expert scratch")
+                            })?;
+                            crate::moe::dsv4_shared_expert_forward_decode_scratch(
+                                &self.ctx,
+                                &self.ctx.stream,
+                                layer.moe.as_ref().expect("DSv4 layer.moe"),
+                                &normed,
+                                shared,
+                                self.config.swiglu_limit,
+                                scratch,
+                            )?;
+                        } else {
+                            // Keep the default masked path order byte-for-byte with main:
+                            // routed MoE → all-reduce → allocate/run shared expert. Moving
+                            // shared scratch allocation before all-reduce can reuse in-flight
+                            // helper buffers under disabled cudarc event tracking.
+                            // SAFETY: dsv4_shared_expert_forward writes the full shared output.
+                            let mut shared =
+                                unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
+                            crate::moe::dsv4_shared_expert_forward(
+                                &self.ctx,
+                                &self.ctx.stream,
+                                layer.moe.as_ref().expect("DSv4 layer.moe"),
+                                &normed,
+                                &mut shared,
+                                self.config.swiglu_limit,
+                                &mut keepalive,
+                            )?;
+                            shared_owned = Some(shared);
+                        };
+                        let shared = if seq_len == 1
+                            || (!use_deepep_transport
+                                && sparse_verify_meta.is_some()
+                                && seq_len <= MAX_SPEC_VERIFY_ROWS)
+                        {
+                            shared_out.as_deref().ok_or_else(|| {
+                                anyhow!("DSv4 decode requires shared-expert output buffer")
+                            })?
+                        } else {
+                            shared_owned
+                                .as_ref()
+                                .expect("multi-token shared expert allocates owned output")
+                        };
+                        keepalive.keep_hidden(shared);
+                        if let Some(fence) = shared_ready.as_ref() {
+                            ctx.wait_on_pipeline_fence(fence, CudaPipelineStreamKind::Compute)?;
+                        }
+                        // SAFETY: add_batch writes the full [seq_len, hidden_size] buffer.
+                        crate::ops::add_batch(&self.ctx, &moe_out, shared, &mut moe_with_shared)?;
+                        keepalive.keep_hidden(&moe_with_shared);
+                        Ok(())
+                    },
+                )?;
             }
             // SAFETY: hc_post / add_batch writes the full stream buffer.
             let mut ffn_stream = unsafe { HiddenStates::uninit(&self.ctx, stream_dim, seq_len)? };
             if let Some(mhc) = ffn_mhc.as_ref() {
-                crate::stage_profile::profile(ctx, "dsv4/stage/ffn_hc_post", || {
+                crate::profile::profile_op(ctx, "ffn_hc_post", Some(layer_idx), seq_len, || {
                     crate::hc::hc_post(
                         &self.ctx,
                         &moe_with_shared,
@@ -5874,7 +6254,7 @@ impl Dsv4Model {
                 })?;
             } else {
                 // GLM plain residual: stream = ffn_out + stream (stream_dim==hidden).
-                crate::stage_profile::profile(ctx, "dsv4/stage/ffn_hc_post", || {
+                crate::profile::profile_op(ctx, "ffn_hc_post", Some(layer_idx), seq_len, || {
                     crate::ops::add_batch(&self.ctx, &moe_with_shared, &stream, &mut ffn_stream)
                 })?;
             }
@@ -5991,13 +6371,19 @@ impl Dsv4Model {
         let token_ids = crate::ops::upload_i32(ctx, &token_ids_host)?;
         // SAFETY: embedding_batch writes the full [m, hidden_size] buffer.
         let mut emb = unsafe { HiddenStates::uninit(ctx, hidden_size, m)? };
-        crate::ops::embedding_batch(ctx, &self.embed_tokens, &token_ids, &mut emb)?;
+        crate::profile::profile_op(ctx, "embedding", None, m, || {
+            crate::ops::embedding_batch(ctx, &self.embed_tokens, &token_ids, &mut emb)
+        })?;
         // SAFETY: uninit device scratch; fully written before first read.
         let mut emb_normed = unsafe { HiddenStates::uninit(ctx, hidden_size, m)? };
-        crate::ops::rms_norm_batch(ctx, &emb, &mtp.enorm, eps, &mut emb_normed)?;
+        crate::profile::profile_op(ctx, "mtp_enorm", None, m, || {
+            crate::ops::rms_norm_batch(ctx, &emb, &mtp.enorm, eps, &mut emb_normed)
+        })?;
         // SAFETY: uninit device scratch; fully written before first read.
         let mut e_proj = unsafe { HiddenStates::uninit(ctx, hidden_size, m)? };
-        crate::attention::dsv4_linear(ctx, &mtp.e_proj, &emb_normed, &mut e_proj)?;
+        crate::profile::profile_op(ctx, "mtp_e_proj", None, m, || {
+            crate::attention::dsv4_linear(ctx, &mtp.e_proj, &emb_normed, &mut e_proj)
+        })?;
 
         // Gather h_prev streams into [m * hc_mult, hidden] (a stream is
         // hc_mult consecutive hidden rows, token-major).
@@ -6013,10 +6399,14 @@ impl Dsv4Model {
         }
         // SAFETY: uninit device scratch; fully written before first read.
         let mut h_normed = unsafe { HiddenStates::uninit(ctx, hidden_size, m * hc_mult)? };
-        crate::ops::rms_norm_batch(ctx, &h_prev_batch, &mtp.hnorm, eps, &mut h_normed)?;
+        crate::profile::profile_op(ctx, "mtp_hnorm", None, m, || {
+            crate::ops::rms_norm_batch(ctx, &h_prev_batch, &mtp.hnorm, eps, &mut h_normed)
+        })?;
         // SAFETY: uninit device scratch; fully written before first read.
         let mut h_proj = unsafe { HiddenStates::uninit(ctx, hidden_size, m * hc_mult)? };
-        crate::attention::dsv4_linear(ctx, &mtp.h_proj, &h_normed, &mut h_proj)?;
+        crate::profile::profile_op(ctx, "mtp_h_proj", None, m, || {
+            crate::attention::dsv4_linear(ctx, &mtp.h_proj, &h_normed, &mut h_proj)
+        })?;
 
         // SAFETY: uninit device scratch; fully written before first read.
         let mut stream = unsafe { HiddenStates::uninit(ctx, stream_dim, m)? };
@@ -6064,23 +6454,28 @@ impl Dsv4Model {
             self.config.head_dim
         );
 
-        let attn_mhc = crate::hc::gen_mhc_params(ctx, &self.config, &layer.hc_attn, &stream)?;
+        let attn_mhc =
+            crate::profile::profile_op(ctx, "attn_hc_params", Some(target_layer_idx), m, || {
+                crate::hc::gen_mhc_params(ctx, &self.config, &layer.hc_attn, &stream)
+            })?;
         // SAFETY: scratch fully written before read.
         let mut attn_normed = unsafe { HiddenStates::uninit(ctx, hidden_size, m)? };
-        crate::hc::mhc_pre_rms_norm(
-            ctx,
-            &stream,
-            &attn_mhc.pre,
-            &layer.attn_norm,
-            eps,
-            hidden_size,
-            hc_mult,
-            &mut attn_normed,
-        )?;
+        crate::profile::profile_op(ctx, "attn_hc_pre_norm", Some(target_layer_idx), m, || {
+            crate::hc::mhc_pre_rms_norm(
+                ctx,
+                &stream,
+                &attn_mhc.pre,
+                &layer.attn_norm,
+                eps,
+                hidden_size,
+                hc_mult,
+                &mut attn_normed,
+            )
+        })?;
         keepalive.keep_hidden(&attn_normed);
         // SAFETY: scratch fully written before read.
         let mut attn_out = unsafe { HiddenStates::uninit(ctx, hidden_size, m)? };
-        {
+        crate::profile::profile_op(ctx, "attention", Some(target_layer_idx), m, || {
             // SAFETY: scratch fully written before read.
             let mut normed_row = unsafe { HiddenStates::uninit(ctx, hidden_size, 1)? };
             // SAFETY: scratch fully written before read.
@@ -6128,79 +6523,100 @@ impl Dsv4Model {
                     .memcpy_dtod(&attn_row.data, &mut dst)
                     .map_err(|e| anyhow!("DSv4 MTP attn copy-out failed: {e}"))?;
             }
-        }
-        self.tp.all_reduce_sum(ctx, &mut attn_out)?;
+            Ok(())
+        })?;
+        crate::profile::profile_op(ctx, "attn_allreduce", Some(target_layer_idx), m, || {
+            self.tp.all_reduce_sum(ctx, &mut attn_out)
+        })?;
         // SAFETY: uninit device scratch; fully written before first read.
         let mut attn_stream = unsafe { HiddenStates::uninit(ctx, stream_dim, m)? };
-        crate::hc::hc_post(
-            ctx,
-            &attn_out,
-            &stream,
-            &attn_mhc.post,
-            &attn_mhc.comb,
-            hidden_size,
-            hc_mult,
-            &mut attn_stream,
-        )?;
+        crate::profile::profile_op(ctx, "attn_hc_post", Some(target_layer_idx), m, || {
+            crate::hc::hc_post(
+                ctx,
+                &attn_out,
+                &stream,
+                &attn_mhc.post,
+                &attn_mhc.comb,
+                hidden_size,
+                hc_mult,
+                &mut attn_stream,
+            )
+        })?;
         keepalive.keep_hidden(&attn_out);
         keepalive.keep_hidden(&attn_stream);
 
-        let ffn_mhc = crate::hc::gen_mhc_params(ctx, &self.config, &layer.hc_ffn, &attn_stream)?;
+        let ffn_mhc =
+            crate::profile::profile_op(ctx, "ffn_hc_params", Some(target_layer_idx), m, || {
+                crate::hc::gen_mhc_params(ctx, &self.config, &layer.hc_ffn, &attn_stream)
+            })?;
         // SAFETY: uninit device scratch; fully written before first read.
         let mut ffn_normed = unsafe { HiddenStates::uninit(ctx, hidden_size, m)? };
-        crate::hc::mhc_pre_rms_norm(
-            ctx,
-            &attn_stream,
-            &ffn_mhc.pre,
-            &layer.ffn_norm,
-            eps,
-            hidden_size,
-            hc_mult,
-            &mut ffn_normed,
-        )?;
+        crate::profile::profile_op(ctx, "ffn_hc_pre_norm", Some(target_layer_idx), m, || {
+            crate::hc::mhc_pre_rms_norm(
+                ctx,
+                &attn_stream,
+                &ffn_mhc.pre,
+                &layer.ffn_norm,
+                eps,
+                hidden_size,
+                hc_mult,
+                &mut ffn_normed,
+            )
+        })?;
         keepalive.keep_hidden(&ffn_normed);
         let level_tokens: Vec<u32> = rows.iter().map(|r| r.token).collect();
         // SAFETY: uninit device scratch; fully written before first read.
         let mut moe_out = unsafe { HiddenStates::uninit(ctx, hidden_size, m)? };
-        let needs_moe_allreduce = crate::moe::dsv4_moe_forward(
-            self,
-            layer.moe.as_ref().expect("DSv4 layer.moe"),
-            &level_tokens,
-            &ffn_normed,
-            &mut moe_out,
-            &mut keepalive,
-            None,
-            mega_epoch,
-        )?;
+        let needs_moe_allreduce =
+            crate::profile::profile_op(ctx, "moe_route", Some(target_layer_idx), m, || {
+                crate::moe::dsv4_moe_forward(
+                    self,
+                    layer.moe.as_ref().expect("DSv4 layer.moe"),
+                    &level_tokens,
+                    &ffn_normed,
+                    &mut moe_out,
+                    &mut keepalive,
+                    None,
+                    mega_epoch,
+                )
+            })?;
         if needs_moe_allreduce {
-            self.tp.all_reduce_sum(ctx, &mut moe_out)?;
+            crate::profile::profile_op(ctx, "moe_allreduce", Some(target_layer_idx), m, || {
+                self.tp.all_reduce_sum(ctx, &mut moe_out)
+            })?;
         }
         // SAFETY: uninit device scratch; fully written before first read.
         let mut shared = unsafe { HiddenStates::uninit(ctx, hidden_size, m)? };
-        crate::moe::dsv4_shared_expert_forward(
-            ctx,
-            &ctx.stream,
-            layer.moe.as_ref().expect("DSv4 layer.moe"),
-            &ffn_normed,
-            &mut shared,
-            self.config.swiglu_limit,
-            &mut keepalive,
-        )?;
+        crate::profile::profile_op(ctx, "shared_expert", Some(target_layer_idx), m, || {
+            crate::moe::dsv4_shared_expert_forward(
+                ctx,
+                &ctx.stream,
+                layer.moe.as_ref().expect("DSv4 layer.moe"),
+                &ffn_normed,
+                &mut shared,
+                self.config.swiglu_limit,
+                &mut keepalive,
+            )
+        })?;
         // SAFETY: uninit device scratch; fully written before first read.
         let mut moe_with_shared = unsafe { HiddenStates::uninit(ctx, hidden_size, m)? };
-        crate::ops::add_batch(ctx, &moe_out, &shared, &mut moe_with_shared)?;
+        crate::profile::profile_op(ctx, "shared_add", Some(target_layer_idx), m, || {
+            crate::ops::add_batch(ctx, &moe_out, &shared, &mut moe_with_shared)
+        })?;
         // SAFETY: uninit device scratch; fully written before first read.
         let mut ffn_stream = unsafe { HiddenStates::uninit(ctx, stream_dim, m)? };
-        crate::hc::hc_post(
-            ctx,
-            &moe_with_shared,
-            &attn_stream,
-            &ffn_mhc.post,
-            &ffn_mhc.comb,
-            hidden_size,
-            hc_mult,
-            &mut ffn_stream,
-        )?;
+        crate::profile::profile_op(ctx, "ffn_hc_post", Some(target_layer_idx), m, || {
+            crate::hc::hc_post(
+                ctx,
+                &moe_with_shared,
+                &attn_stream,
+                &ffn_mhc.post,
+                &ffn_mhc.comb,
+                hidden_size,
+                hc_mult,
+                &mut ffn_stream,
+            )
+        })?;
         keepalive.keep_hidden(&moe_out);
         keepalive.keep_hidden(&shared);
         keepalive.keep_hidden(&moe_with_shared);
@@ -6209,7 +6625,7 @@ impl Dsv4Model {
         // ── Head: per-row HC fold + norm, batched lm_head, device top-k.
         // SAFETY: uninit device scratch; fully written before first read.
         let mut head_normed = unsafe { HiddenStates::uninit(ctx, hidden_size, m)? };
-        {
+        crate::profile::profile_op(ctx, "head_hc", Some(target_layer_idx), m, || {
             let mut last_hidden = DeviceVec::zeros(ctx, hidden_size)?;
             let mut last_normed = DeviceVec::zeros(ctx, hidden_size)?;
             for r in 0..m {
@@ -6229,11 +6645,14 @@ impl Dsv4Model {
                     .memcpy_dtod(&last_normed.data, &mut dst)
                     .map_err(|e| anyhow!("DSv4 MTP head row copy failed: {e}"))?;
             }
-        }
+            Ok(())
+        })?;
         keepalive.keep_hidden(&head_normed);
         // SAFETY: uninit device scratch; fully written before first read.
         let mut logits = unsafe { HiddenStates::uninit(ctx, self.lm_head.rows, m)? };
-        self.lm_head_project_batch(&head_normed, &mut logits)?;
+        crate::profile::profile_op(ctx, "lm_head_project", Some(target_layer_idx), m, || {
+            self.lm_head_project_batch(&head_normed, &mut logits)
+        })?;
         keepalive.keep_hidden(&logits);
         let candidates = self.mtp_topk_device(&mut logits, top_k.max(1))?;
         std::hint::black_box(keepalive.len());

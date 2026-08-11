@@ -211,7 +211,9 @@ impl Qwen35Model {
         let seq_lens_dev = seq_lens.upload(&self.ctx, &seq_lens_host)?;
 
         let hidden = hidden.get(&self.ctx, hidden_size, b)?;
-        embedding_batch(&self.ctx, &self.embed_tokens, token_ids, hidden)?;
+        crate::profile::profile_op(&self.ctx, "embedding", None, b, || {
+            embedding_batch(&self.ctx, &self.embed_tokens, token_ids, hidden)
+        })?;
         let normed = normed.get(&self.ctx, hidden_size, b)?;
         let hidden_mid = hidden_mid.get(&self.ctx, hidden_size, b)?;
         let attn_out = attn_out.get(&self.ctx, hidden_size, b)?;
@@ -219,23 +221,33 @@ impl Qwen35Model {
 
         let mut full_idx = 0usize;
         let mut linear_idx = 0usize;
-        for layer in self.layers.iter() {
-            rms_norm_offset(&self.ctx, hidden, &layer.input_layernorm, eps, normed)?;
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            crate::profile::profile_op(&self.ctx, "input_norm", Some(layer_idx), b, || {
+                rms_norm_offset(&self.ctx, hidden, &layer.input_layernorm, eps, normed)
+            })?;
 
             match &layer.attn {
                 Qwen35Attn::Full(full_attn) => {
-                    self.full_attention_batch_rows(
-                        full_attn,
-                        normed,
-                        slots,
-                        slot_indices,
-                        full_idx,
-                        positions_dev,
-                        seq_lens_dev,
-                        &full_k_cache_ptrs[full_idx],
-                        &full_v_cache_ptrs[full_idx],
-                        full,
-                        attn_out,
+                    crate::profile::profile_op(
+                        &self.ctx,
+                        "full_attention",
+                        Some(layer_idx),
+                        b,
+                        || {
+                            self.full_attention_batch_rows(
+                                full_attn,
+                                normed,
+                                slots,
+                                slot_indices,
+                                full_idx,
+                                positions_dev,
+                                seq_lens_dev,
+                                &full_k_cache_ptrs[full_idx],
+                                &full_v_cache_ptrs[full_idx],
+                                full,
+                                attn_out,
+                            )
+                        },
                     )?;
                     full_idx += 1;
                 }
@@ -245,61 +257,83 @@ impl Qwen35Model {
                         "Qwen3.5 batched decode linear layer {linear_idx} outside pointer tables {}",
                         conv_state_ptrs.len()
                     );
-                    self.linear_attention(
-                        lin,
-                        normed,
-                        LinearCore::Tables {
-                            conv: &conv_state_ptrs[linear_idx],
-                            gdr: &gdr_state_ptrs[linear_idx],
+                    crate::profile::profile_op(
+                        &self.ctx,
+                        "linear_attention",
+                        Some(layer_idx),
+                        b,
+                        || {
+                            self.linear_attention(
+                                lin,
+                                normed,
+                                LinearCore::Tables {
+                                    conv: &conv_state_ptrs[linear_idx],
+                                    gdr: &gdr_state_ptrs[linear_idx],
+                                },
+                                linear_idx,
+                                linear,
+                                attn_out,
+                            )
                         },
-                        linear_idx,
-                        linear,
-                        attn_out,
                     )?;
                     linear_idx += 1;
                 }
             }
 
-            add_batch(&self.ctx, hidden, attn_out, hidden_mid)?;
-            rms_norm_offset(
-                &self.ctx,
-                hidden_mid,
-                &layer.post_attention_layernorm,
-                eps,
-                normed,
-            )?;
+            crate::profile::profile_op(&self.ctx, "post_attn_norm", Some(layer_idx), b, || {
+                add_batch(&self.ctx, hidden, attn_out, hidden_mid)?;
+                rms_norm_offset(
+                    &self.ctx,
+                    hidden_mid,
+                    &layer.post_attention_layernorm,
+                    eps,
+                    normed,
+                )
+            })?;
             let mlp_in: &HiddenStates = normed;
             if let Some(moe_weights) = &layer.moe {
                 let cfg = self
                     .moe_config
                     .as_ref()
                     .ok_or_else(|| anyhow!("MoE layer present but model has no moe_config"))?;
-                moe_forward_into(
-                    &self.ctx,
-                    moe_weights,
-                    mlp_in,
-                    cfg,
-                    &self.expert_split,
-                    moe,
-                    mlp_out,
-                )?;
+                crate::profile::profile_op(&self.ctx, "moe_ffn", Some(layer_idx), b, || {
+                    moe_forward_into(
+                        &self.ctx,
+                        moe_weights,
+                        mlp_in,
+                        cfg,
+                        &self.expert_split,
+                        moe,
+                        mlp_out,
+                    )
+                })?;
             } else {
                 let mlp = layer
                     .mlp
                     .as_ref()
                     .ok_or_else(|| anyhow!("dense layer missing both mlp and moe weights"))?;
-                self.dense_mlp(mlp, mlp_in, dense, mlp_out, None)?;
+                crate::profile::profile_op(&self.ctx, "dense_ffn", Some(layer_idx), b, || {
+                    self.dense_mlp(mlp, mlp_in, dense, mlp_out, None)
+                })?;
             }
             // ONE all-reduce covers the whole FFN partial (see the per-layer
             // enumeration in the method docs); exact `[hidden, B]` message.
-            self.tp.all_reduce_sum(&self.ctx, mlp_out)?;
+            crate::profile::profile_op(&self.ctx, "ffn_allreduce", Some(layer_idx), b, || {
+                self.tp.all_reduce_sum(&self.ctx, mlp_out)
+            })?;
 
-            add_batch(&self.ctx, hidden_mid, mlp_out, hidden)?;
+            crate::profile::profile_op(&self.ctx, "ffn_residual", Some(layer_idx), b, || {
+                add_batch(&self.ctx, hidden_mid, mlp_out, hidden)
+            })?;
         }
 
-        rms_norm_offset(&self.ctx, hidden, &self.norm, eps, normed)?;
+        crate::profile::profile_op(&self.ctx, "final_norm", None, b, || {
+            rms_norm_offset(&self.ctx, hidden, &self.norm, eps, normed)
+        })?;
         let logits_buf = logits_batch.get(&self.ctx, vocab, b)?;
-        gemm_batch(&self.ctx, self.output_projection(), normed, logits_buf)?;
+        crate::profile::profile_op(&self.ctx, "lm_head_gemm", None, b, || {
+            gemm_batch(&self.ctx, self.output_projection(), normed, logits_buf)
+        })?;
 
         // Host seq_len advance: the device state (KV rows, conv rings, GDR
         // states) advanced in-stream above, so the host counters advance here
@@ -310,7 +344,7 @@ impl Qwen35Model {
         }
 
         let argmax_buf = argmax.get(&self.ctx, b)?;
-        {
+        crate::profile::profile_op(&self.ctx, "sample", None, b, || {
             let (l_ptr, _gl) = logits_buf.data.device_ptr(&self.ctx.stream);
             let (a_ptr, _ga) = argmax_buf.device_ptr_mut(&self.ctx.stream);
             // SAFETY: logits is a live `[B, vocab]` bf16 buffer and argmax a
@@ -325,7 +359,8 @@ impl Qwen35Model {
                 )
                 .result()?;
             }
-        }
+            Ok(())
+        })?;
         self.ctx.sync()?;
         let greedy_ids = self
             .ctx
@@ -448,7 +483,9 @@ impl Qwen35Model {
         let token_ids = token_ids.upload(&self.ctx, &token_ids_host)?;
 
         let hidden = hidden.get(&self.ctx, hidden_size, b)?;
-        embedding_batch(&self.ctx, &self.embed_tokens, token_ids, hidden)?;
+        crate::profile::profile_op(&self.ctx, "embedding", None, b, || {
+            embedding_batch(&self.ctx, &self.embed_tokens, token_ids, hidden)
+        })?;
         let normed = normed.get(&self.ctx, hidden_size, b)?;
         let hidden_mid = hidden_mid.get(&self.ctx, hidden_size, b)?;
         let attn_out = attn_out.get(&self.ctx, hidden_size, b)?;
@@ -456,13 +493,23 @@ impl Qwen35Model {
 
         let mut full_idx = 0usize;
         let mut linear_idx = 0usize;
-        for layer in &self.layers {
-            rms_norm_offset(&self.ctx, hidden, &layer.input_layernorm, eps, normed)?;
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            crate::profile::profile_op(&self.ctx, "input_norm", Some(layer_idx), b, || {
+                rms_norm_offset(&self.ctx, hidden, &layer.input_layernorm, eps, normed)
+            })?;
 
             match &layer.attn {
                 Qwen35Attn::Full(full_attn) => {
-                    self.full_attention_paged(
-                        full_attn, normed, full_idx, pool, meta, full, attn_out, None,
+                    crate::profile::profile_op(
+                        &self.ctx,
+                        "full_attention",
+                        Some(layer_idx),
+                        b,
+                        || {
+                            self.full_attention_paged(
+                                full_attn, normed, full_idx, pool, meta, full, attn_out, None,
+                            )
+                        },
                     )?;
                     full_idx += 1;
                 }
@@ -472,58 +519,80 @@ impl Qwen35Model {
                         "Qwen3.6 paged batched decode linear layer {linear_idx} outside pointer tables {}",
                         conv_state_ptrs.len()
                     );
-                    self.linear_attention(
-                        lin,
-                        normed,
-                        LinearCore::Tables {
-                            conv: &conv_state_ptrs[linear_idx],
-                            gdr: &gdr_state_ptrs[linear_idx],
+                    crate::profile::profile_op(
+                        &self.ctx,
+                        "linear_attention",
+                        Some(layer_idx),
+                        b,
+                        || {
+                            self.linear_attention(
+                                lin,
+                                normed,
+                                LinearCore::Tables {
+                                    conv: &conv_state_ptrs[linear_idx],
+                                    gdr: &gdr_state_ptrs[linear_idx],
+                                },
+                                linear_idx,
+                                linear,
+                                attn_out,
+                            )
                         },
-                        linear_idx,
-                        linear,
-                        attn_out,
                     )?;
                     linear_idx += 1;
                 }
             }
 
-            add_batch(&self.ctx, hidden, attn_out, hidden_mid)?;
-            rms_norm_offset(
-                &self.ctx,
-                hidden_mid,
-                &layer.post_attention_layernorm,
-                eps,
-                normed,
-            )?;
+            crate::profile::profile_op(&self.ctx, "post_attn_norm", Some(layer_idx), b, || {
+                add_batch(&self.ctx, hidden, attn_out, hidden_mid)?;
+                rms_norm_offset(
+                    &self.ctx,
+                    hidden_mid,
+                    &layer.post_attention_layernorm,
+                    eps,
+                    normed,
+                )
+            })?;
             let mlp_in: &HiddenStates = normed;
             if let Some(moe_weights) = &layer.moe {
                 let cfg = self
                     .moe_config
                     .as_ref()
                     .ok_or_else(|| anyhow!("MoE layer present but model has no moe_config"))?;
-                moe_forward_into(
-                    &self.ctx,
-                    moe_weights,
-                    mlp_in,
-                    cfg,
-                    &self.expert_split,
-                    moe,
-                    mlp_out,
-                )?;
+                crate::profile::profile_op(&self.ctx, "moe_ffn", Some(layer_idx), b, || {
+                    moe_forward_into(
+                        &self.ctx,
+                        moe_weights,
+                        mlp_in,
+                        cfg,
+                        &self.expert_split,
+                        moe,
+                        mlp_out,
+                    )
+                })?;
             } else {
                 let mlp = layer
                     .mlp
                     .as_ref()
                     .ok_or_else(|| anyhow!("dense layer missing both mlp and moe weights"))?;
-                self.dense_mlp(mlp, mlp_in, dense, mlp_out, None)?;
+                crate::profile::profile_op(&self.ctx, "dense_ffn", Some(layer_idx), b, || {
+                    self.dense_mlp(mlp, mlp_in, dense, mlp_out, None)
+                })?;
             }
-            self.tp.all_reduce_sum(&self.ctx, mlp_out)?;
-            add_batch(&self.ctx, hidden_mid, mlp_out, hidden)?;
+            crate::profile::profile_op(&self.ctx, "ffn_allreduce", Some(layer_idx), b, || {
+                self.tp.all_reduce_sum(&self.ctx, mlp_out)
+            })?;
+            crate::profile::profile_op(&self.ctx, "ffn_residual", Some(layer_idx), b, || {
+                add_batch(&self.ctx, hidden_mid, mlp_out, hidden)
+            })?;
         }
 
-        rms_norm_offset(&self.ctx, hidden, &self.norm, eps, normed)?;
+        crate::profile::profile_op(&self.ctx, "final_norm", None, b, || {
+            rms_norm_offset(&self.ctx, hidden, &self.norm, eps, normed)
+        })?;
         let logits_buf = logits_batch.get(&self.ctx, vocab, b)?;
-        gemm_batch(&self.ctx, self.output_projection(), normed, logits_buf)?;
+        crate::profile::profile_op(&self.ctx, "lm_head_gemm", None, b, || {
+            gemm_batch(&self.ctx, self.output_projection(), normed, logits_buf)
+        })?;
 
         // Host seq_len advance (device KV/conv/GDR advanced in-stream above).
         for &si in slot_indices {
@@ -531,7 +600,7 @@ impl Qwen35Model {
         }
 
         let argmax_buf = argmax.get(&self.ctx, b)?;
-        {
+        crate::profile::profile_op(&self.ctx, "sample", None, b, || {
             let (l_ptr, _gl) = logits_buf.data.device_ptr(&self.ctx.stream);
             let (a_ptr, _ga) = argmax_buf.device_ptr_mut(&self.ctx.stream);
             // SAFETY: logits `[B, vocab]` bf16, argmax `[B]` i32, both on ctx.stream.
@@ -545,7 +614,8 @@ impl Qwen35Model {
                 )
                 .result()?;
             }
-        }
+            Ok(())
+        })?;
         self.ctx.sync()?;
         let greedy_ids = self
             .ctx

@@ -778,19 +778,24 @@ impl Qwen35Model {
         let hidden = head.cfg.hidden_size;
         let seq = taps.seq;
         let eps = head.cfg.rms_norm_eps;
-        let acc = scratch.feat_a.get(ctx, hidden, seq)?;
-        gemm_batch(ctx, &head.fc[0], taps.bufs[0].get(ctx, hidden, seq)?, acc)?;
-        for (t, fc_t) in head.fc.iter().enumerate().skip(1) {
-            let tmp = scratch.feat_b.get(ctx, hidden, seq)?;
-            gemm_batch(ctx, fc_t, taps.bufs[t].get(ctx, hidden, seq)?, tmp)?;
-            let sum = add_vec_into(ctx, scratch.feat_a.get(ctx, hidden, seq)?, tmp)?;
-            ctx.stream
-                .memcpy_dtod(&sum.data, &mut scratch.feat_a.get(ctx, hidden, seq)?.data)
-                .map_err(|e| anyhow!("dspark fc accumulate failed: {e}"))?;
-        }
+        crate::profile::profile_op(ctx, "mtp_fc", None, seq, || {
+            let acc = scratch.feat_a.get(ctx, hidden, seq)?;
+            gemm_batch(ctx, &head.fc[0], taps.bufs[0].get(ctx, hidden, seq)?, acc)?;
+            for (t, fc_t) in head.fc.iter().enumerate().skip(1) {
+                let tmp = scratch.feat_b.get(ctx, hidden, seq)?;
+                gemm_batch(ctx, fc_t, taps.bufs[t].get(ctx, hidden, seq)?, tmp)?;
+                let sum = add_vec_into(ctx, scratch.feat_a.get(ctx, hidden, seq)?, tmp)?;
+                ctx.stream
+                    .memcpy_dtod(&sum.data, &mut scratch.feat_a.get(ctx, hidden, seq)?.data)
+                    .map_err(|e| anyhow!("dspark fc accumulate failed: {e}"))?;
+            }
+            Ok(())
+        })?;
         let acc = scratch.feat_a.get(ctx, hidden, seq)?;
         let normed = scratch.feat_b.get(ctx, hidden, seq)?;
-        rms_norm_batch(ctx, acc, &head.hidden_norm, eps, normed)?;
+        crate::profile::profile_op(ctx, "mtp_hidden_norm", None, seq, || {
+            rms_norm_batch(ctx, acc, &head.hidden_norm, eps, normed)
+        })?;
         scratch.feat_seq = seq;
         taps.disarm();
         Ok(())
@@ -838,57 +843,62 @@ impl Qwen35Model {
         for (li, layer) in head.layers.iter().enumerate() {
             let cap_li = head.cap;
             let k_new = scratch.ctx_k.get(ctx, kv_dim, rows)?;
-            gemm_batch(ctx, &layer.k_proj, feat_rows, k_new)?;
             let v_new = scratch.ctx_v.get(ctx, kv_dim, rows)?;
-            gemm_batch(ctx, &layer.v_proj, feat_rows, v_new)?;
+            crate::profile::profile_op(ctx, "ctx_kv_proj", Some(li), rows, || {
+                gemm_batch(ctx, &layer.k_proj, feat_rows, k_new)?;
+                gemm_batch(ctx, &layer.v_proj, feat_rows, v_new)
+            })?;
             // K-norm + RoPE + cache write via the fused prep kernel. The
             // wrapper requires q heads, so drive `num_kv_heads` dummy q heads
             // over a zeroed gated-layout buffer (0/rms(0+eps)=0, discarded).
             let q_dummy = scratch.ctx_q_dummy.get_zeroed(ctx, 2 * kv_dim, rows)?;
             let q_out = scratch.ctx_q_out.get(ctx, kv_dim, rows)?;
-            let (qd_ptr, _g0) = q_dummy.data.device_ptr(&ctx.stream);
-            let (k_ptr, _g1) = k_new.data.device_ptr(&ctx.stream);
-            let (v_ptr, _g2) = v_new.data.device_ptr(&ctx.stream);
-            let (kn_ptr, _g3) = layer.k_norm.data.device_ptr(&ctx.stream);
-            let (cos_ptr, _g4) = head.cos_cache.data.device_ptr(&ctx.stream);
-            let (sin_ptr, _g5) = head.sin_cache.data.device_ptr(&ctx.stream);
-            let (qo_ptr, _g6) = q_out.data.device_ptr_mut(&ctx.stream);
-            let (kc_ptr, _g7) = df.k_ctx[li].data.device_ptr_mut(&ctx.stream);
-            let (vc_ptr, _g8) = df.v_ctx[li].data.device_ptr_mut(&ctx.stream);
-            let nkv = head.cfg.num_key_value_heads as i32;
-            let hd = head.cfg.head_dim as i32;
-            // One launch must not wrap the ring (else two tokens alias one
-            // row); chunk sizes (≤32) sit far below cap here.
-            ensure!(
-                rows <= cap_li,
-                "dspark sliding append rows {rows} > ring cap {cap_li}; lower chunked_prefill_size"
-            );
-            // SAFETY: ring cache sized cap_li*kv_dim; rows <= cap_li (no
-            // aliasing); abs positions < rope_cap index the cos/sin tables.
-            unsafe {
-                ffi::prefill_attention_hd256_prep_ring_cuda(
-                    qd_ptr as *const ffi::Half,
-                    k_ptr as *const ffi::Half,
-                    v_ptr as *const ffi::Half,
-                    kn_ptr as *const ffi::Half,
-                    kn_ptr as *const ffi::Half,
-                    cos_ptr as *const ffi::Half,
-                    sin_ptr as *const ffi::Half,
-                    qo_ptr as *mut ffi::Half,
-                    kc_ptr as *mut ffi::Half,
-                    vc_ptr as *mut ffi::Half,
-                    nkv,
-                    nkv,
-                    hd,
-                    rows as i32,
-                    sp_abs as *const i32,
-                    hd,
-                    head.cfg.rms_norm_eps,
-                    cap_li as i32,
-                    ctx.stream.cu_stream(),
-                )
-                .result()?;
-            }
+            crate::profile::profile_op(ctx, "ctx_prep", Some(li), rows, || {
+                let (qd_ptr, _g0) = q_dummy.data.device_ptr(&ctx.stream);
+                let (k_ptr, _g1) = k_new.data.device_ptr(&ctx.stream);
+                let (v_ptr, _g2) = v_new.data.device_ptr(&ctx.stream);
+                let (kn_ptr, _g3) = layer.k_norm.data.device_ptr(&ctx.stream);
+                let (cos_ptr, _g4) = head.cos_cache.data.device_ptr(&ctx.stream);
+                let (sin_ptr, _g5) = head.sin_cache.data.device_ptr(&ctx.stream);
+                let (qo_ptr, _g6) = q_out.data.device_ptr_mut(&ctx.stream);
+                let (kc_ptr, _g7) = df.k_ctx[li].data.device_ptr_mut(&ctx.stream);
+                let (vc_ptr, _g8) = df.v_ctx[li].data.device_ptr_mut(&ctx.stream);
+                let nkv = head.cfg.num_key_value_heads as i32;
+                let hd = head.cfg.head_dim as i32;
+                // One launch must not wrap the ring (else two tokens alias one
+                // row); chunk sizes (≤32) sit far below cap here.
+                ensure!(
+                    rows <= cap_li,
+                    "dspark sliding append rows {rows} > ring cap {cap_li}; lower chunked_prefill_size"
+                );
+                // SAFETY: ring cache sized cap_li*kv_dim; rows <= cap_li (no
+                // aliasing); abs positions < rope_cap index the cos/sin tables.
+                unsafe {
+                    ffi::prefill_attention_hd256_prep_ring_cuda(
+                        qd_ptr as *const ffi::Half,
+                        k_ptr as *const ffi::Half,
+                        v_ptr as *const ffi::Half,
+                        kn_ptr as *const ffi::Half,
+                        kn_ptr as *const ffi::Half,
+                        cos_ptr as *const ffi::Half,
+                        sin_ptr as *const ffi::Half,
+                        qo_ptr as *mut ffi::Half,
+                        kc_ptr as *mut ffi::Half,
+                        vc_ptr as *mut ffi::Half,
+                        nkv,
+                        nkv,
+                        hd,
+                        rows as i32,
+                        sp_abs as *const i32,
+                        hd,
+                        head.cfg.rms_norm_eps,
+                        cap_li as i32,
+                        ctx.stream.cu_stream(),
+                    )
+                    .result()?;
+                }
+                Ok(())
+            })?;
         }
         df.ctx_end = start + rows;
         Ok(())
@@ -929,7 +939,9 @@ impl Qwen35Model {
         ids[0] = anchor as i32;
         let ids_dev = scratch.ids.upload(ctx, &ids)?;
         let h = scratch.hidden.get(ctx, hidden, block)?;
-        embedding_batch(ctx, &self.embed_tokens, ids_dev, h)?;
+        crate::profile::profile_op(ctx, "embedding", None, block, || {
+            embedding_batch(ctx, &self.embed_tokens, ids_dev, h)
+        })?;
         let embed_ms = super::mtp_phase_lap(ctx, &mut pt);
 
         let start_abs = scratch.start_pos_abs.upload(&self.ctx, &[start as i32])?;
@@ -953,138 +965,160 @@ impl Qwen35Model {
             let cap_li = head.cap;
             let h = scratch.hidden.get(ctx, hidden, block)?;
             let normed = scratch.normed.get(ctx, hidden, block)?;
-            rms_norm_batch(ctx, h, &layer.input_layernorm, eps, normed)?;
+            crate::profile::profile_op(ctx, "input_norm", Some(li), block, || {
+                rms_norm_batch(ctx, h, &layer.input_layernorm, eps, normed)
+            })?;
 
-            let q_full = scratch.q_full.get(ctx, 2 * q_dim, block)?;
-            gemm_batch(ctx, &layer.q_proj, normed, q_full)?;
-            let k_new = scratch.k_new.get(ctx, kv_dim, block)?;
-            gemm_batch(ctx, &layer.k_proj, normed, k_new)?;
-            let v_new = scratch.v_new.get(ctx, kv_dim, block)?;
-            gemm_batch(ctx, &layer.v_proj, normed, v_new)?;
+            crate::profile::profile_op(ctx, "full_attention", Some(li), block, || {
+                let q_full = scratch.q_full.get(ctx, 2 * q_dim, block)?;
+                gemm_batch(ctx, &layer.q_proj, normed, q_full)?;
+                let k_new = scratch.k_new.get(ctx, kv_dim, block)?;
+                gemm_batch(ctx, &layer.k_proj, normed, k_new)?;
+                let v_new = scratch.v_new.get(ctx, kv_dim, block)?;
+                gemm_batch(ctx, &layer.v_proj, normed, v_new)?;
 
-            // q/k head-RMSNorm + RoPE at absolute positions start..start+block;
-            // noise K/V land at their positions in the ctx cache (self-healing
-            // speculative rows — see the slot-state doc).
-            let q_prepped = scratch.q_prepped.get(ctx, q_dim, block)?;
-            {
-                let (qf_ptr, _g0) = q_full.data.device_ptr(&ctx.stream);
-                let (k_ptr, _g1) = k_new.data.device_ptr(&ctx.stream);
-                let (v_ptr, _g2) = v_new.data.device_ptr(&ctx.stream);
-                let (qn_ptr, _g3) = layer.q_norm.data.device_ptr(&ctx.stream);
-                let (kn_ptr, _g4) = layer.k_norm.data.device_ptr(&ctx.stream);
-                let (cos_ptr, _g5) = head.cos_cache.data.device_ptr(&ctx.stream);
-                let (sin_ptr, _g6) = head.sin_cache.data.device_ptr(&ctx.stream);
-                let (qp_ptr, _g7) = q_prepped.data.device_ptr_mut(&ctx.stream);
-                let (kc_ptr, _g8) = df.k_ctx[li].data.device_ptr_mut(&ctx.stream);
-                let (vc_ptr, _g9) = df.v_ctx[li].data.device_ptr_mut(&ctx.stream);
-                let nq = cfg.num_attention_heads as i32;
-                let nkv = cfg.num_key_value_heads as i32;
-                let hd = cfg.head_dim as i32;
-                let (sp_ptr, _g10) = start_abs.device_ptr(&ctx.stream);
-                // block (≤ cap_li) noise rows write distinct ring rows.
-                // SAFETY: ring cache cap_li*kv_dim; abs pos < rope_cap.
-                unsafe {
-                    ffi::prefill_attention_hd256_prep_ring_cuda(
-                        qf_ptr as *const ffi::Half,
-                        k_ptr as *const ffi::Half,
-                        v_ptr as *const ffi::Half,
-                        qn_ptr as *const ffi::Half,
-                        kn_ptr as *const ffi::Half,
-                        cos_ptr as *const ffi::Half,
-                        sin_ptr as *const ffi::Half,
-                        qp_ptr as *mut ffi::Half,
-                        kc_ptr as *mut ffi::Half,
-                        vc_ptr as *mut ffi::Half,
-                        nq,
-                        nkv,
-                        hd,
-                        block as i32,
-                        sp_ptr as *const i32,
-                        hd,
-                        eps,
-                        cap_li as i32,
-                        ctx.stream.cu_stream(),
-                    )
-                    .result()?;
+                // q/k head-RMSNorm + RoPE at absolute positions start..start+block;
+                // noise K/V land at their positions in the ctx cache (self-healing
+                // speculative rows — see the slot-state doc).
+                let q_prepped = scratch.q_prepped.get(ctx, q_dim, block)?;
+                {
+                    let (qf_ptr, _g0) = q_full.data.device_ptr(&ctx.stream);
+                    let (k_ptr, _g1) = k_new.data.device_ptr(&ctx.stream);
+                    let (v_ptr, _g2) = v_new.data.device_ptr(&ctx.stream);
+                    let (qn_ptr, _g3) = layer.q_norm.data.device_ptr(&ctx.stream);
+                    let (kn_ptr, _g4) = layer.k_norm.data.device_ptr(&ctx.stream);
+                    let (cos_ptr, _g5) = head.cos_cache.data.device_ptr(&ctx.stream);
+                    let (sin_ptr, _g6) = head.sin_cache.data.device_ptr(&ctx.stream);
+                    let (qp_ptr, _g7) = q_prepped.data.device_ptr_mut(&ctx.stream);
+                    let (kc_ptr, _g8) = df.k_ctx[li].data.device_ptr_mut(&ctx.stream);
+                    let (vc_ptr, _g9) = df.v_ctx[li].data.device_ptr_mut(&ctx.stream);
+                    let nq = cfg.num_attention_heads as i32;
+                    let nkv = cfg.num_key_value_heads as i32;
+                    let hd = cfg.head_dim as i32;
+                    let (sp_ptr, _g10) = start_abs.device_ptr(&ctx.stream);
+                    // block (≤ cap_li) noise rows write distinct ring rows.
+                    // SAFETY: ring cache cap_li*kv_dim; abs pos < rope_cap.
+                    unsafe {
+                        ffi::prefill_attention_hd256_prep_ring_cuda(
+                            qf_ptr as *const ffi::Half,
+                            k_ptr as *const ffi::Half,
+                            v_ptr as *const ffi::Half,
+                            qn_ptr as *const ffi::Half,
+                            kn_ptr as *const ffi::Half,
+                            cos_ptr as *const ffi::Half,
+                            sin_ptr as *const ffi::Half,
+                            qp_ptr as *mut ffi::Half,
+                            kc_ptr as *mut ffi::Half,
+                            vc_ptr as *mut ffi::Half,
+                            nq,
+                            nkv,
+                            hd,
+                            block as i32,
+                            sp_ptr as *const i32,
+                            hd,
+                            eps,
+                            cap_li as i32,
+                            ctx.stream.cu_stream(),
+                        )
+                        .result()?;
+                    }
                 }
-            }
+
+                // Non-causal attention: every noise row attends its whole window of
+                // the `[ctx ++ block]` key range, in one ragged-window launch.
+                let attn_heads = scratch.attn_heads.get(ctx, q_dim, block)?;
+                {
+                    let sm_scale = 1.0 / (cfg.head_dim as f32).sqrt();
+                    let (q_ptr, _g0) = q_prepped.data.device_ptr(&ctx.stream);
+                    let (kc_ptr, _g1) = df.k_ctx[li].data.device_ptr(&ctx.stream);
+                    let (vc_ptr, _g2) = df.v_ctx[li].data.device_ptr(&ctx.stream);
+                    let (o_ptr, _g3) = attn_heads.data.device_ptr_mut(&ctx.stream);
+                    let (w_ptr, _g4) = win_dev.device_ptr(&ctx.stream);
+                    let nq = cfg.num_attention_heads as i32;
+                    let nkv = cfg.num_key_value_heads as i32;
+                    let hd = cfg.head_dim as i32;
+                    // SAFETY: `win` holds 2*block i32 (bases then lengths, each
+                    // length ≤ cap_li as asserted above).
+                    unsafe {
+                        ffi::nonpaged_prefill_attention_ring_varlen_cuda(
+                            q_ptr as *const ffi::Half,
+                            kc_ptr as *const ffi::Half,
+                            vc_ptr as *const ffi::Half,
+                            o_ptr as *mut ffi::Half,
+                            nq,
+                            nkv,
+                            hd,
+                            block as i32,
+                            w_ptr as *const i32,
+                            (w_ptr as *const i32).add(block),
+                            cap_li as i32,
+                            sm_scale,
+                            ctx.stream.cu_stream(),
+                        )
+                        .result()?;
+                    }
+                }
+
+                let attn_out_h = scratch.attn_out_h.get(ctx, hidden, block)?;
+                gemm_batch(ctx, &layer.o_proj, attn_heads, attn_out_h)?;
+                Ok(())
+            })?;
 
             prep_ms += super::mtp_phase_lap(ctx, &mut pt);
-            // Non-causal attention: every noise row attends its whole window of
-            // the `[ctx ++ block]` key range, in one ragged-window launch.
-            let attn_heads = scratch.attn_heads.get(ctx, q_dim, block)?;
-            {
-                let sm_scale = 1.0 / (cfg.head_dim as f32).sqrt();
-                let (q_ptr, _g0) = q_prepped.data.device_ptr(&ctx.stream);
-                let (kc_ptr, _g1) = df.k_ctx[li].data.device_ptr(&ctx.stream);
-                let (vc_ptr, _g2) = df.v_ctx[li].data.device_ptr(&ctx.stream);
-                let (o_ptr, _g3) = attn_heads.data.device_ptr_mut(&ctx.stream);
-                let (w_ptr, _g4) = win_dev.device_ptr(&ctx.stream);
-                let nq = cfg.num_attention_heads as i32;
-                let nkv = cfg.num_key_value_heads as i32;
-                let hd = cfg.head_dim as i32;
-                // SAFETY: `win` holds 2*block i32 (bases then lengths, each
-                // length ≤ cap_li as asserted above).
-                unsafe {
-                    ffi::nonpaged_prefill_attention_ring_varlen_cuda(
-                        q_ptr as *const ffi::Half,
-                        kc_ptr as *const ffi::Half,
-                        vc_ptr as *const ffi::Half,
-                        o_ptr as *mut ffi::Half,
-                        nq,
-                        nkv,
-                        hd,
-                        block as i32,
-                        w_ptr as *const i32,
-                        (w_ptr as *const i32).add(block),
-                        cap_li as i32,
-                        sm_scale,
-                        ctx.stream.cu_stream(),
-                    )
-                    .result()?;
-                }
-            }
-
-            attn_ms += super::mtp_phase_lap(ctx, &mut pt);
-            let attn_out_h = scratch.attn_out_h.get(ctx, hidden, block)?;
-            gemm_batch(ctx, &layer.o_proj, attn_heads, attn_out_h)?;
+            attn_ms += 0.0;
             let hidden_mid = scratch.hidden_mid.get(ctx, hidden, block)?;
-            add_batch(
-                ctx,
-                scratch.hidden.get(ctx, hidden, block)?,
-                attn_out_h,
-                hidden_mid,
-            )?;
-            let normed = scratch.normed.get(ctx, hidden, block)?;
-            rms_norm_batch(
-                ctx,
-                hidden_mid,
-                &layer.post_attention_layernorm,
-                eps,
-                normed,
-            )?;
+            crate::profile::profile_op(ctx, "post_attn_norm", Some(li), block, || {
+                add_batch(
+                    ctx,
+                    scratch.hidden.get(ctx, hidden, block)?,
+                    scratch.attn_out_h.get(ctx, hidden, block)?,
+                    hidden_mid,
+                )?;
+                let normed = scratch.normed.get(ctx, hidden, block)?;
+                rms_norm_batch(
+                    ctx,
+                    hidden_mid,
+                    &layer.post_attention_layernorm,
+                    eps,
+                    normed,
+                )
+            })?;
             let mlp_out = scratch.attn_out_h.get(ctx, hidden, block)?;
-            self.dense_mlp(&layer.mlp, normed, &mut scratch.dense, mlp_out, None)?;
-            add_batch(
-                ctx,
-                scratch.hidden_mid.get(ctx, hidden, block)?,
-                mlp_out,
-                scratch.hidden.get(ctx, hidden, block)?,
-            )?;
+            crate::profile::profile_op(ctx, "dense_ffn", Some(li), block, || {
+                self.dense_mlp(
+                    &layer.mlp,
+                    scratch.normed.get(ctx, hidden, block)?,
+                    &mut scratch.dense,
+                    mlp_out,
+                    None,
+                )
+            })?;
+            crate::profile::profile_op(ctx, "ffn_residual", Some(li), block, || {
+                add_batch(
+                    ctx,
+                    scratch.hidden_mid.get(ctx, hidden, block)?,
+                    mlp_out,
+                    scratch.hidden.get(ctx, hidden, block)?,
+                )
+            })?;
             mlp_ms += super::mtp_phase_lap(ctx, &mut pt);
         }
 
         let final_normed = scratch.final_normed.get(ctx, hidden, block)?;
-        rms_norm_batch(
-            ctx,
-            scratch.hidden.get(ctx, hidden, block)?,
-            &head.norm,
-            eps,
-            final_normed,
-        )?;
+        crate::profile::profile_op(ctx, "final_norm", None, block, || {
+            rms_norm_batch(
+                ctx,
+                scratch.hidden.get(ctx, hidden, block)?,
+                &head.norm,
+                eps,
+                final_normed,
+            )
+        })?;
         let vocab = self.output_projection().rows;
         let logits = df.logits.get(ctx, vocab, block)?;
-        gemm_batch(ctx, self.output_projection(), final_normed, logits)?;
+        crate::profile::profile_op(ctx, "lm_head_gemm", None, block, || {
+            gemm_batch(ctx, self.output_projection(), final_normed, logits)
+        })?;
         let head_ms = super::mtp_phase_lap(ctx, &mut pt);
 
         // Left-to-right token selection: argmax (greedy) or a rejection-ready
@@ -1099,21 +1133,23 @@ impl Qwen35Model {
         // Greedy resolves the whole block in one batched pass; sampling walks
         // the chain because a markov bias makes row r depend on row r-1's draw.
         if !sampling {
-            let am = self.dspark_settle_rows(
-                head.markov.as_ref(),
-                df.logits.get(ctx, vocab, block)?,
-                &mut scratch.mk,
-                &[anchor],
-                block,
-                first_row,
-            )?;
-            drafts.extend_from_slice(&am[first_row..block]);
+            crate::profile::profile_op(ctx, "sample", None, block, || {
+                self.dspark_settle_rows(
+                    head.markov.as_ref(),
+                    df.logits.get(ctx, vocab, block)?,
+                    &mut scratch.mk,
+                    &[anchor],
+                    block,
+                    first_row,
+                )
+            })
+            .map(|am| drafts.extend_from_slice(&am[first_row..block]))?;
         }
         // No markov head: every row reads a precomputed logits row, so the
         // draws do not depend on each other — issue them all, then sync once.
         if sampling && head.markov.is_none() {
             let n = block - first_row;
-            {
+            crate::profile::profile_op(ctx, "sample", None, n, || {
                 let elem = std::mem::size_of::<bf16>() as u64;
                 let logits = df.logits.get(ctx, vocab, block)?;
                 let (l_ptr, _gl) = logits.data.device_ptr(&ctx.stream);
@@ -1140,8 +1176,9 @@ impl Qwen35Model {
                         .result()?;
                     }
                 }
-            }
-            ctx.sync()?;
+                ctx.sync()?;
+                Ok(())
+            })?;
             let src = scratch.sample_tok.get(ctx, n)?.clone();
             let host = scratch.tok_host.get(ctx, n)?;
             ctx.stream
@@ -1167,31 +1204,34 @@ impl Qwen35Model {
             // Corrected logits row: base + markov bias when the head is present
             // (`step_logits = base_row + markov_w2 · markov_w1[prev]`).
             let (src, src_row) = if let Some(m) = &head.markov {
-                let tok_dev = scratch.markov_tok.upload(ctx, &[prev as i32])?;
-                let emb = scratch.markov_emb.get(ctx, m.rank, 1)?;
-                embedding_batch(ctx, &m.w1, tok_dev, emb)?;
-                let bias = scratch.markov_bias.get(ctx, vocab, 1)?;
-                gemm_batch(ctx, &m.w2, emb, bias)?;
-                let step = scratch.step_logits.get(ctx, vocab, 1)?;
-                {
-                    let logits = df.logits.get(ctx, vocab, block)?;
-                    let src = logits.data.slice(row * vocab..(row + 1) * vocab);
-                    ctx.stream
-                        .memcpy_dtod(&src, &mut step.data)
-                        .map_err(|e| anyhow!("dspark markov row copy failed: {e}"))?;
-                }
-                let sum = scratch.step_sum.get(ctx, vocab, 1)?;
-                add_batch(
-                    ctx,
-                    scratch.step_logits.get(ctx, vocab, 1)?,
-                    scratch.markov_bias.get(ctx, vocab, 1)?,
-                    sum,
-                )?;
+                crate::profile::profile_op(ctx, "mtp_fc", None, 1, || {
+                    let tok_dev = scratch.markov_tok.upload(ctx, &[prev as i32])?;
+                    let emb = scratch.markov_emb.get(ctx, m.rank, 1)?;
+                    embedding_batch(ctx, &m.w1, tok_dev, emb)?;
+                    let bias = scratch.markov_bias.get(ctx, vocab, 1)?;
+                    gemm_batch(ctx, &m.w2, emb, bias)?;
+                    let step = scratch.step_logits.get(ctx, vocab, 1)?;
+                    {
+                        let logits = df.logits.get(ctx, vocab, block)?;
+                        let src = logits.data.slice(row * vocab..(row + 1) * vocab);
+                        ctx.stream
+                            .memcpy_dtod(&src, &mut step.data)
+                            .map_err(|e| anyhow!("dspark markov row copy failed: {e}"))?;
+                    }
+                    let sum = scratch.step_sum.get(ctx, vocab, 1)?;
+                    add_batch(
+                        ctx,
+                        scratch.step_logits.get(ctx, vocab, 1)?,
+                        scratch.markov_bias.get(ctx, vocab, 1)?,
+                        sum,
+                    )?;
+                    Ok(())
+                })?;
                 (scratch.step_sum.get(ctx, vocab, 1)?, 0)
             } else {
                 (df.logits.get(ctx, vocab, block)?, row)
             };
-            let tok = {
+            let tok = crate::profile::profile_op(ctx, "sample", None, 1, || {
                 // Filter + q-row store + multinomial draw in one device call;
                 // uniform from the host (seed, position) stream plain decode
                 // would consume at this position (SALT_DRAW = 0).
@@ -1229,8 +1269,8 @@ impl Qwen35Model {
                     .map_err(|e| anyhow!("D2H dspark draft token failed: {e}"))?;
                 let tok = host.as_slice()?[0] as u32;
                 df.q_rows += 1;
-                tok
-            };
+                Ok(tok)
+            })?;
             drafts.push(tok);
             prev = tok;
         }
@@ -1323,7 +1363,9 @@ impl Qwen35Model {
         let mut pt = super::dspark_phase_start(ctx);
         let ids_dev = scratch.ids.upload(ctx, &ids)?;
         let h = scratch.hidden.get(ctx, hidden, rows)?;
-        embedding_batch(ctx, &self.embed_tokens, ids_dev, h)?;
+        crate::profile::profile_op(ctx, "embedding", None, rows, || {
+            embedding_batch(ctx, &self.embed_tokens, ids_dev, h)
+        })?;
         let pos_dev = scratch.start_pos_abs.upload(ctx, &pos)?;
         let win_dev = scratch.attn_win.upload(ctx, &win)?;
         let embed_ms = super::mtp_phase_lap(ctx, &mut pt);
@@ -1334,153 +1376,177 @@ impl Qwen35Model {
             let cap_li = head.cap;
             let h = scratch.hidden.get(ctx, hidden, rows)?;
             let normed = scratch.normed.get(ctx, hidden, rows)?;
-            rms_norm_batch(ctx, h, &layer.input_layernorm, eps, normed)?;
+            crate::profile::profile_op(ctx, "input_norm", Some(li), rows, || {
+                rms_norm_batch(ctx, h, &layer.input_layernorm, eps, normed)
+            })?;
 
-            let q_full = scratch.q_full.get(ctx, 2 * q_dim, rows)?;
-            gemm_batch(ctx, &layer.q_proj, normed, q_full)?;
-            let k_new = scratch.k_new.get(ctx, kv_dim, rows)?;
-            gemm_batch(ctx, &layer.k_proj, normed, k_new)?;
-            let v_new = scratch.v_new.get(ctx, kv_dim, rows)?;
-            gemm_batch(ctx, &layer.v_proj, normed, v_new)?;
-            qkv_ms += super::mtp_phase_lap(ctx, &mut pt);
+            crate::profile::profile_op(ctx, "full_attention", Some(li), rows, || {
+                let q_full = scratch.q_full.get(ctx, 2 * q_dim, rows)?;
+                gemm_batch(ctx, &layer.q_proj, normed, q_full)?;
+                let k_new = scratch.k_new.get(ctx, kv_dim, rows)?;
+                gemm_batch(ctx, &layer.k_proj, normed, k_new)?;
+                let v_new = scratch.v_new.get(ctx, kv_dim, rows)?;
+                gemm_batch(ctx, &layer.v_proj, normed, v_new)?;
 
-            let q_prepped = scratch.q_prepped.get(ctx, q_dim, rows)?;
-            let attn_heads = scratch.attn_heads.get(ctx, q_dim, rows)?;
-            {
-                let (qf_ptr, _g0) = q_full.data.device_ptr(&ctx.stream);
-                let (k_ptr, _g1) = k_new.data.device_ptr(&ctx.stream);
-                let (v_ptr, _g2) = v_new.data.device_ptr(&ctx.stream);
-                let (qn_ptr, _g3) = layer.q_norm.data.device_ptr(&ctx.stream);
-                let (kn_ptr, _g4) = layer.k_norm.data.device_ptr(&ctx.stream);
-                let (cos_ptr, _g5) = head.cos_cache.data.device_ptr(&ctx.stream);
-                let (sin_ptr, _g6) = head.sin_cache.data.device_ptr(&ctx.stream);
-                let (qp_ptr, _g7) = q_prepped.data.device_ptr_mut(&ctx.stream);
-                let (ao_ptr, _g8) = attn_heads.data.device_ptr_mut(&ctx.stream);
-                let (w_ptr, _g9) = win_dev.device_ptr(&ctx.stream);
-                let (sp_ptr, _g10) = pos_dev.device_ptr(&ctx.stream);
-                let nq = cfg.num_attention_heads as i32;
-                let nkv = cfg.num_key_value_heads as i32;
-                let hd = cfg.head_dim as i32;
-                let sm_scale = 1.0 / (cfg.head_dim as f32).sqrt();
-                // `[k bases][v bases]`, one entry per slot: staged here so the
-                // attention below runs once at gridZ = slots instead of once
-                // per slot on a 192-block grid.
-                let mut kv_bases = vec![0u64; 2 * b];
-                let mut ring_guards = Vec::with_capacity(2 * b);
-                for (s, df) in dfs.iter_mut().enumerate() {
-                    let off = (s * block) as u64;
-                    let (kc_ptr, gk) = df.k_ctx[li].data.device_ptr_mut(&ctx.stream);
-                    let (vc_ptr, gv) = df.v_ctx[li].data.device_ptr_mut(&ctx.stream);
-                    kv_bases[s] = kc_ptr;
-                    kv_bases[b + s] = vc_ptr;
-                    // SAFETY: offset by this slot's `block` rows inside a
-                    // `rows`-row buffer; ring bounds guarded above.
+                let q_prepped = scratch.q_prepped.get(ctx, q_dim, rows)?;
+                let attn_heads = scratch.attn_heads.get(ctx, q_dim, rows)?;
+                {
+                    let (qf_ptr, _g0) = q_full.data.device_ptr(&ctx.stream);
+                    let (k_ptr, _g1) = k_new.data.device_ptr(&ctx.stream);
+                    let (v_ptr, _g2) = v_new.data.device_ptr(&ctx.stream);
+                    let (qn_ptr, _g3) = layer.q_norm.data.device_ptr(&ctx.stream);
+                    let (kn_ptr, _g4) = layer.k_norm.data.device_ptr(&ctx.stream);
+                    let (cos_ptr, _g5) = head.cos_cache.data.device_ptr(&ctx.stream);
+                    let (sin_ptr, _g6) = head.sin_cache.data.device_ptr(&ctx.stream);
+                    let (qp_ptr, _g7) = q_prepped.data.device_ptr_mut(&ctx.stream);
+                    let (ao_ptr, _g8) = attn_heads.data.device_ptr_mut(&ctx.stream);
+                    let (w_ptr, _g9) = win_dev.device_ptr(&ctx.stream);
+                    let (sp_ptr, _g10) = pos_dev.device_ptr(&ctx.stream);
+                    let nq = cfg.num_attention_heads as i32;
+                    let nkv = cfg.num_key_value_heads as i32;
+                    let hd = cfg.head_dim as i32;
+                    let sm_scale = 1.0 / (cfg.head_dim as f32).sqrt();
+                    // `[k bases][v bases]`, one entry per slot: staged here so the
+                    // attention below runs once at gridZ = slots instead of once
+                    // per slot on a 192-block grid.
+                    let mut kv_bases = vec![0u64; 2 * b];
+                    let mut ring_guards = Vec::with_capacity(2 * b);
+                    for (s, df) in dfs.iter_mut().enumerate() {
+                        let off = (s * block) as u64;
+                        let (kc_ptr, gk) = df.k_ctx[li].data.device_ptr_mut(&ctx.stream);
+                        let (vc_ptr, gv) = df.v_ctx[li].data.device_ptr_mut(&ctx.stream);
+                        kv_bases[s] = kc_ptr;
+                        kv_bases[b + s] = vc_ptr;
+                        // SAFETY: offset by this slot's `block` rows inside a
+                        // `rows`-row buffer; ring bounds guarded above.
+                        unsafe {
+                            ffi::prefill_attention_hd256_prep_ring_cuda(
+                                (qf_ptr + off * 2 * q_dim as u64 * elem) as *const ffi::Half,
+                                (k_ptr + off * kv_dim as u64 * elem) as *const ffi::Half,
+                                (v_ptr + off * kv_dim as u64 * elem) as *const ffi::Half,
+                                qn_ptr as *const ffi::Half,
+                                kn_ptr as *const ffi::Half,
+                                cos_ptr as *const ffi::Half,
+                                sin_ptr as *const ffi::Half,
+                                (qp_ptr + off * q_dim as u64 * elem) as *mut ffi::Half,
+                                kc_ptr as *mut ffi::Half,
+                                vc_ptr as *mut ffi::Half,
+                                nq,
+                                nkv,
+                                hd,
+                                block as i32,
+                                (sp_ptr + s as u64 * 4) as *const i32,
+                                hd,
+                                eps,
+                                cap_li as i32,
+                                ctx.stream.cu_stream(),
+                            )
+                            .result()?;
+                        }
+                        ring_guards.push(gk);
+                        ring_guards.push(gv);
+                    }
+                    let slots_dev = scratch.attn_kv_slots.upload(ctx, &kv_bases)?;
+                    let (sl_ptr, _gs) = slots_dev.device_ptr(&ctx.stream);
+                    // SAFETY: `kv_bases` holds this layer's `b` k rings then `b` v
+                    // rings, each staged above; the window table is `rows` bases
+                    // then `rows` lengths, slot-major as the kernel indexes it.
                     unsafe {
-                        ffi::prefill_attention_hd256_prep_ring_cuda(
-                            (qf_ptr + off * 2 * q_dim as u64 * elem) as *const ffi::Half,
-                            (k_ptr + off * kv_dim as u64 * elem) as *const ffi::Half,
-                            (v_ptr + off * kv_dim as u64 * elem) as *const ffi::Half,
-                            qn_ptr as *const ffi::Half,
-                            kn_ptr as *const ffi::Half,
-                            cos_ptr as *const ffi::Half,
-                            sin_ptr as *const ffi::Half,
-                            (qp_ptr + off * q_dim as u64 * elem) as *mut ffi::Half,
-                            kc_ptr as *mut ffi::Half,
-                            vc_ptr as *mut ffi::Half,
+                        ffi::nonpaged_prefill_attention_ring_varlen_batched_cuda(
+                            qp_ptr as *const ffi::Half,
+                            sl_ptr as *const *const std::ffi::c_void,
+                            (sl_ptr as *const *const std::ffi::c_void).add(b),
+                            ao_ptr as *mut ffi::Half,
                             nq,
                             nkv,
                             hd,
                             block as i32,
-                            (sp_ptr + s as u64 * 4) as *const i32,
-                            hd,
-                            eps,
+                            b as i32,
+                            w_ptr as *const i32,
+                            (w_ptr as *const i32).add(rows),
                             cap_li as i32,
+                            sm_scale,
                             ctx.stream.cu_stream(),
                         )
                         .result()?;
                     }
-                    ring_guards.push(gk);
-                    ring_guards.push(gv);
                 }
-                let slots_dev = scratch.attn_kv_slots.upload(ctx, &kv_bases)?;
-                let (sl_ptr, _gs) = slots_dev.device_ptr(&ctx.stream);
-                // SAFETY: `kv_bases` holds this layer's `b` k rings then `b` v
-                // rings, each staged above; the window table is `rows` bases
-                // then `rows` lengths, slot-major as the kernel indexes it.
-                unsafe {
-                    ffi::nonpaged_prefill_attention_ring_varlen_batched_cuda(
-                        qp_ptr as *const ffi::Half,
-                        sl_ptr as *const *const std::ffi::c_void,
-                        (sl_ptr as *const *const std::ffi::c_void).add(b),
-                        ao_ptr as *mut ffi::Half,
-                        nq,
-                        nkv,
-                        hd,
-                        block as i32,
-                        b as i32,
-                        w_ptr as *const i32,
-                        (w_ptr as *const i32).add(rows),
-                        cap_li as i32,
-                        sm_scale,
-                        ctx.stream.cu_stream(),
-                    )
-                    .result()?;
-                }
-            }
 
-            attn_ms += super::mtp_phase_lap(ctx, &mut pt);
-            let attn_out_h = scratch.attn_out_h.get(ctx, hidden, rows)?;
-            gemm_batch(ctx, &layer.o_proj, attn_heads, attn_out_h)?;
+                let attn_out_h = scratch.attn_out_h.get(ctx, hidden, rows)?;
+                gemm_batch(ctx, &layer.o_proj, attn_heads, attn_out_h)?;
+                Ok(())
+            })?;
+
+            qkv_ms += 0.0;
+            attn_ms += 0.0;
             let hidden_mid = scratch.hidden_mid.get(ctx, hidden, rows)?;
-            add_batch(
-                ctx,
-                scratch.hidden.get(ctx, hidden, rows)?,
-                attn_out_h,
-                hidden_mid,
-            )?;
-            let normed = scratch.normed.get(ctx, hidden, rows)?;
-            rms_norm_batch(
-                ctx,
-                hidden_mid,
-                &layer.post_attention_layernorm,
-                eps,
-                normed,
-            )?;
+            crate::profile::profile_op(ctx, "post_attn_norm", Some(li), rows, || {
+                add_batch(
+                    ctx,
+                    scratch.hidden.get(ctx, hidden, rows)?,
+                    scratch.attn_out_h.get(ctx, hidden, rows)?,
+                    hidden_mid,
+                )?;
+                let normed = scratch.normed.get(ctx, hidden, rows)?;
+                rms_norm_batch(
+                    ctx,
+                    hidden_mid,
+                    &layer.post_attention_layernorm,
+                    eps,
+                    normed,
+                )
+            })?;
             let mlp_out = scratch.attn_out_h.get(ctx, hidden, rows)?;
-            self.dense_mlp(&layer.mlp, normed, &mut scratch.dense, mlp_out, None)?;
-            add_batch(
-                ctx,
-                scratch.hidden_mid.get(ctx, hidden, rows)?,
-                mlp_out,
-                scratch.hidden.get(ctx, hidden, rows)?,
-            )?;
+            crate::profile::profile_op(ctx, "dense_ffn", Some(li), rows, || {
+                self.dense_mlp(
+                    &layer.mlp,
+                    scratch.normed.get(ctx, hidden, rows)?,
+                    &mut scratch.dense,
+                    mlp_out,
+                    None,
+                )
+            })?;
+            crate::profile::profile_op(ctx, "ffn_residual", Some(li), rows, || {
+                add_batch(
+                    ctx,
+                    scratch.hidden_mid.get(ctx, hidden, rows)?,
+                    mlp_out,
+                    scratch.hidden.get(ctx, hidden, rows)?,
+                )
+            })?;
             mlp_ms += super::mtp_phase_lap(ctx, &mut pt);
         }
         let layers_ms = qkv_ms + attn_ms + mlp_ms;
 
         let final_normed = scratch.final_normed.get(ctx, hidden, rows)?;
-        rms_norm_batch(
-            ctx,
-            scratch.hidden.get(ctx, hidden, rows)?,
-            &head.norm,
-            eps,
-            final_normed,
-        )?;
+        crate::profile::profile_op(ctx, "final_norm", None, rows, || {
+            rms_norm_batch(
+                ctx,
+                scratch.hidden.get(ctx, hidden, rows)?,
+                &head.norm,
+                eps,
+                final_normed,
+            )
+        })?;
         let vocab = self.output_projection().rows;
         let logits = scratch.logits_b.get(ctx, vocab, rows)?;
-        gemm_batch(ctx, self.output_projection(), final_normed, logits)?;
+        crate::profile::profile_op(ctx, "lm_head_gemm", None, rows, || {
+            gemm_batch(ctx, self.output_projection(), final_normed, logits)
+        })?;
         let head_ms = super::mtp_phase_lap(ctx, &mut pt);
 
         // One D2H for the whole tick, and one markov settle over every slot.
         let first_row = usize::from(!cfg.next_token_heads);
-        let am = self.dspark_settle_rows(
-            head.markov.as_ref(),
-            scratch.logits_b.get(ctx, vocab, rows)?,
-            &mut scratch.mk,
-            anchors,
-            block,
-            first_row,
-        )?;
+        let am = crate::profile::profile_op(ctx, "sample", None, rows, || {
+            self.dspark_settle_rows(
+                head.markov.as_ref(),
+                scratch.logits_b.get(ctx, vocab, rows)?,
+                &mut scratch.mk,
+                anchors,
+                block,
+                first_row,
+            )
+        })?;
         let settle_ms = super::mtp_phase_lap(ctx, &mut pt);
 
         let n = block - first_row;
@@ -2045,16 +2111,20 @@ impl Qwen35Model {
         let Qwen35Workspace { hidden, normed, .. } = ws;
         let hidden = hidden.get(&self.ctx, hidden_size, seq_len)?;
         let normed = normed.get(&self.ctx, hidden_size, seq_len)?;
-        super::rms_norm_offset(
-            &self.ctx,
-            hidden,
-            &self.norm,
-            self.config.rms_norm_eps,
-            normed,
-        )?;
+        crate::profile::profile_op(&self.ctx, "final_norm", None, seq_len, || {
+            super::rms_norm_offset(
+                &self.ctx,
+                hidden,
+                &self.norm,
+                self.config.rms_norm_eps,
+                normed,
+            )
+        })?;
         let vocab = self.output_projection().rows;
         let mut logits = HiddenStates::zeros(&self.ctx, vocab, seq_len)?;
-        gemm_batch(&self.ctx, self.output_projection(), normed, &mut logits)?;
+        crate::profile::profile_op(&self.ctx, "lm_head_gemm", None, seq_len, || {
+            gemm_batch(&self.ctx, self.output_projection(), normed, &mut logits)
+        })?;
         self.ctx.sync()?;
         // Last: the caller rolls the pool back on any error here, and that only
         // restores consistency while the trunk seq_lens have not moved.
