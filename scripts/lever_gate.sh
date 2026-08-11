@@ -51,7 +51,7 @@ import re, sys
 path, runs, lengths, baseline, require_exact = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4], sys.argv[5] == "1"
 expected_lengths = [int(x) for x in lengths.split(",") if x]
 summary = re.compile(
-    r"^SUMMARY len=(\d+) .* exact=(\d+) partial=(\d+) miss=(\d+) (?:DET|NONDET)$"
+    r"^SUMMARY len=(\d+) .* exact=(\d+) partial=(\d+) miss=(\d+) (?:DET|NONDET)(?: kv=.*)?$"
 )
 
 def load(path):
