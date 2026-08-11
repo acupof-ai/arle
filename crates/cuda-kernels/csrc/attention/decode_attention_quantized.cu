@@ -234,13 +234,21 @@ __global__ void decode_attention_fp8_per_channel_k_partial_kernel(
     float m_local = -FLT_MAX;
     float l_local = 0.0f;
 
-    __shared__ __nv_fp8_e4m3 smem_k[2][TILE_TOKENS][HEAD_DIM];
-    __shared__ __nv_fp8_e4m3 smem_v[2][TILE_TOKENS][HEAD_DIM];
+    // Pad the head dimension by 4 so consecutive tokens' rows start on
+    // different banks (HEAD_DIM is a multiple of 32 → every token row
+    // begins at bank 0, stacking bank conflicts across the token loop).
+    // 4 keeps the packed uint4 FP8 reads 4-byte aligned.
+    __shared__ __nv_fp8_e4m3 smem_k[2][TILE_TOKENS][HEAD_DIM + 4];
+    __shared__ __nv_fp8_e4m3 smem_v[2][TILE_TOKENS][HEAD_DIM + 4];
     __shared__ float smem_v_scales[2][TILE_TOKENS];
 
     __shared__ float smem_m[NUM_WARPS];
     __shared__ float smem_l[NUM_WARPS];
-    __shared__ float smem_o[NUM_WARPS * HEAD_DIM];
+    // Pad per-warp stride by 1 so different warps' rows start on different
+    // banks (HEAD_DIM is a multiple of 32, so without padding every warp's
+    // row begins at bank 0 and cross-warp bank conflicts stack on top of
+    // the within-warp EPT-stride conflicts).
+    __shared__ float smem_o[NUM_WARPS][HEAD_DIM + 1];
 
     const int d_base = lane_id * EPT;
     auto preload_page = [&](int stage, int page_local_idx) {
@@ -328,14 +336,14 @@ __global__ void decode_attention_fp8_per_channel_k_partial_kernel(
     }
     #pragma unroll
     for (int i = 0; i < EPT; i++)
-        smem_o[warp_id * HEAD_DIM + lane_id * EPT + i] = o_reg[i];
+        smem_o[warp_id][lane_id * EPT + i] = o_reg[i];
     __syncthreads();
 
     if (warp_id == 0) {
         float final_m = smem_m[0], final_l = smem_l[0];
         float final_o[EPT];
         #pragma unroll
-        for (int i = 0; i < EPT; i++) final_o[i] = smem_o[lane_id * EPT + i];
+        for (int i = 0; i < EPT; i++) final_o[i] = smem_o[0][lane_id * EPT + i];
 
         for (int w = 1; w < NUM_WARPS; w++) {
             float m_w = smem_m[w];
@@ -345,7 +353,7 @@ __global__ void decode_attention_fp8_per_channel_k_partial_kernel(
             float b = __expf(m_w - new_m);
             #pragma unroll
             for (int i = 0; i < EPT; i++)
-                final_o[i] = final_o[i] * a + smem_o[w * HEAD_DIM + lane_id * EPT + i] * b;
+                final_o[i] = final_o[i] * a + smem_o[w][lane_id * EPT + i] * b;
             final_l = final_l * a + l_w * b;
             final_m = new_m;
         }
@@ -527,13 +535,15 @@ __global__ void decode_attention_int8_per_channel_k_partial_kernel(
     float m_local = -FLT_MAX;
     float l_local = 0.0f;
 
-    __shared__ int8_t smem_k[2][TILE_TOKENS][HEAD_DIM];
-    __shared__ int8_t smem_v[2][TILE_TOKENS][HEAD_DIM];
+    // Pad head dim by 1: INT8 reads are byte-granular (no alignment
+    // requirement), so +1 is enough to shift each token row off bank 0.
+    __shared__ int8_t smem_k[2][TILE_TOKENS][HEAD_DIM + 1];
+    __shared__ int8_t smem_v[2][TILE_TOKENS][HEAD_DIM + 1];
     __shared__ float smem_v_scales[2][TILE_TOKENS];
 
     __shared__ float smem_m[NUM_WARPS];
     __shared__ float smem_l[NUM_WARPS];
-    __shared__ float smem_o[NUM_WARPS * HEAD_DIM];
+    __shared__ float smem_o[NUM_WARPS][HEAD_DIM + 1];
 
     const int d_base = lane_id * EPT;
     auto preload_page = [&](int stage, int page_local_idx) {
@@ -613,7 +623,7 @@ __global__ void decode_attention_int8_per_channel_k_partial_kernel(
     }
     #pragma unroll
     for (int i = 0; i < EPT; i++) {
-        smem_o[warp_id * HEAD_DIM + lane_id * EPT + i] = o_reg[i];
+        smem_o[warp_id][lane_id * EPT + i] = o_reg[i];
     }
     __syncthreads();
 
@@ -623,7 +633,7 @@ __global__ void decode_attention_int8_per_channel_k_partial_kernel(
         float final_o[EPT];
         #pragma unroll
         for (int i = 0; i < EPT; i++) {
-            final_o[i] = smem_o[lane_id * EPT + i];
+            final_o[i] = smem_o[0][lane_id * EPT + i];
         }
 
         #pragma unroll
@@ -638,7 +648,7 @@ __global__ void decode_attention_int8_per_channel_k_partial_kernel(
 
             #pragma unroll
             for (int i = 0; i < EPT; i++) {
-                float o_w = smem_o[w * HEAD_DIM + lane_id * EPT + i];
+                float o_w = smem_o[w][lane_id * EPT + i];
                 final_o[i] = final_o[i] * scale_prev + o_w * scale_w;
             }
             final_l = final_l * scale_prev + l_w * scale_w;
@@ -813,25 +823,76 @@ __global__ void decode_attention_int4_per_channel_k_partial_kernel(
     const int kv_dim_packed = kv_dim / 2;
     const int head_bytes = HEAD_DIM / 2;
 
-    for (int page_local_idx = 0; page_local_idx < my_page_end - my_page_start; page_local_idx++) {
+    // Pad head-byte dimension by 1: INT4 reads are byte-granular, so +1
+    // shifts each token row off bank 0 (head_bytes is a multiple of 16 →
+    // every row begins at bank 0 without padding).
+    __shared__ uint8_t smem_k[2][TILE_TOKENS][HEAD_DIM / 2 + 1];
+    __shared__ uint8_t smem_v[2][TILE_TOKENS][HEAD_DIM / 2 + 1];
+    __shared__ float smem_v_scales[2][TILE_TOKENS];
+    __shared__ float smem_k_dynamic_scales[2][TILE_TOKENS];
+
+    __shared__ float smem_m[NUM_WARPS];
+    __shared__ float smem_l[NUM_WARPS];
+    __shared__ float smem_o[NUM_WARPS][HEAD_DIM + 1];
+
+    auto preload_page = [&](int stage, int page_local_idx) {
         int global_page = my_page_start + page_local_idx;
         int page_idx = kv_indices[page_start_global + global_page];
         int row_base = page_idx * kQuantPageSize;
         int page_tokens = (global_page == total_pages - 1) ? last_page_len[req_idx] : kQuantPageSize;
-
         for (int t = warp_id; t < page_tokens; t += NUM_WARPS) {
             int row_idx = row_base + t;
             int kv_token_byte_base = row_idx * kv_dim_packed + kv_head * head_bytes;
             int scale_off = row_idx * num_kv_heads + kv_head;
-            float v_scale = V_scales[scale_off];
+
+            // cp.async on sm_80 only supports 4/8/16 B copies. For HEAD_DIM=128
+            // each lane owns EPT/2=2 packed bytes, so we round the load offset
+            // down to a 4 B boundary and copy 4 B. Adjacent lanes share the
+            // same 4 B chunk (same global data), so the redundant write to
+            // smem is harmless. The compute phase reads back its own 2 B from
+            // the staged smem.
+            int load_off = byte_base & ~3;
+            __pipeline_memcpy_async(
+                &smem_k[stage][t][load_off],
+                &K_data_packed[kv_token_byte_base + load_off],
+                sizeof(uint32_t));
+            __pipeline_memcpy_async(
+                &smem_v[stage][t][load_off],
+                &V_data_packed[kv_token_byte_base + load_off],
+                sizeof(uint32_t));
+            if (lane_id == 0) {
+                __pipeline_memcpy_async(&smem_v_scales[stage][t], &V_scales[scale_off], sizeof(float));
+                __pipeline_memcpy_async(&smem_k_dynamic_scales[stage][t], &K_dynamic_scales[scale_off], sizeof(float));
+            }
+        }
+        __pipeline_commit();
+    };
+
+    preload_page(0, 0);
+
+    for (int page_local_idx = 0; page_local_idx < my_page_end - my_page_start; page_local_idx++) {
+        int stage = page_local_idx & 1;
+        int global_page = my_page_start + page_local_idx;
+        int page_tokens = (global_page == total_pages - 1) ? last_page_len[req_idx] : kQuantPageSize;
+
+        __pipeline_wait_prior(0);
+        __syncthreads();
+
+        int next_page_local_idx = page_local_idx + 1;
+        if (next_page_local_idx < my_page_end - my_page_start) {
+            preload_page(next_page_local_idx & 1, next_page_local_idx);
+        }
+
+        for (int t = warp_id; t < page_tokens; t += NUM_WARPS) {
+            float v_scale = smem_v_scales[stage][t];
             // Two-level K: per-channel STATIC × per-(token, head) DYNAMIC.
-            float k_dynamic = K_dynamic_scales[scale_off];
+            float k_dynamic = smem_k_dynamic_scales[stage][t];
 
             float qk = 0.0f;
             #pragma unroll
             for (int i = 0; i < EPT; i += 2) {
                 int b = byte_base + i / 2;
-                uint8_t byte = K_data_packed[kv_token_byte_base + b];
+                uint8_t byte = smem_k[stage][t][b];
                 int8_t k0 = (int8_t)(byte << 4) >> 4;          // sign-extend low nibble
                 int8_t k1 = (int8_t)(byte & 0xF0) >> 4;         // arith-shift high nibble
                 qk += q_reg[i + 0] * (float)k0 * k_scale_reg[i + 0] * k_dynamic;
@@ -847,7 +908,7 @@ __global__ void decode_attention_int4_per_channel_k_partial_kernel(
             #pragma unroll
             for (int i = 0; i < EPT; i += 2) {
                 int b = byte_base + i / 2;
-                uint8_t byte = V_data_packed[kv_token_byte_base + b];
+                uint8_t byte = smem_v[stage][t][b];
                 int8_t v0 = (int8_t)(byte << 4) >> 4;
                 int8_t v1 = (int8_t)(byte & 0xF0) >> 4;
                 o_reg[i + 0] = o_reg[i + 0] * exp_diff + exp_qk * (float)v0 * v_scale;
@@ -857,11 +918,9 @@ __global__ void decode_attention_int4_per_channel_k_partial_kernel(
             m_local = m_new;
             l_local = l_new;
         }
-    }
 
-    __shared__ float smem_m[NUM_WARPS];
-    __shared__ float smem_l[NUM_WARPS];
-    __shared__ float smem_o[NUM_WARPS * HEAD_DIM];
+        __syncthreads();
+    }
 
     if (lane_id == 0) {
         smem_m[warp_id] = m_local;
@@ -869,7 +928,7 @@ __global__ void decode_attention_int4_per_channel_k_partial_kernel(
     }
     #pragma unroll
     for (int i = 0; i < EPT; i++) {
-        smem_o[warp_id * HEAD_DIM + lane_id * EPT + i] = o_reg[i];
+        smem_o[warp_id][lane_id * EPT + i] = o_reg[i];
     }
     __syncthreads();
 
@@ -878,7 +937,7 @@ __global__ void decode_attention_int4_per_channel_k_partial_kernel(
         float final_l = smem_l[0];
         float final_o[EPT];
         #pragma unroll
-        for (int i = 0; i < EPT; i++) final_o[i] = smem_o[lane_id * EPT + i];
+        for (int i = 0; i < EPT; i++) final_o[i] = smem_o[0][lane_id * EPT + i];
 
         #pragma unroll
         for (int w = 1; w < NUM_WARPS; w++) {
@@ -890,7 +949,7 @@ __global__ void decode_attention_int4_per_channel_k_partial_kernel(
             float scale_w    = __expf(m_w - m_new);
             #pragma unroll
             for (int i = 0; i < EPT; i++) {
-                float o_w = smem_o[w * HEAD_DIM + lane_id * EPT + i];
+                float o_w = smem_o[w][lane_id * EPT + i];
                 final_o[i] = final_o[i] * scale_prev + o_w * scale_w;
             }
             final_l = final_l * scale_prev + l_w * scale_w;
