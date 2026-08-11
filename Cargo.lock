@@ -24,7 +24,7 @@ dependencies = [
 
 [[package]]
 name = "agent-bench"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "anyhow",
  "infer-core",
@@ -131,7 +131,7 @@ dependencies = [
 
 [[package]]
 name = "arle"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "cli",
  "infer-util",
@@ -695,7 +695,7 @@ dependencies = [
 
 [[package]]
 name = "deepep-sys"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "anyhow",
  "libc",
@@ -704,7 +704,7 @@ dependencies = [
 
 [[package]]
 name = "deepseek-ocr-spec"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "serde",
  "serde_json",
@@ -713,7 +713,7 @@ dependencies = [
 
 [[package]]
 name = "deepseek-spec"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "serde",
  "serde_json",
@@ -1116,7 +1116,7 @@ dependencies = [
 
 [[package]]
 name = "gemma-spec"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "serde",
  "serde_json",
@@ -1582,7 +1582,7 @@ dependencies = [
 
 [[package]]
 name = "infer-api"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "anyhow",
  "axum",
@@ -1611,7 +1611,7 @@ dependencies = [
 
 [[package]]
 name = "infer-core"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "anyhow",
  "infer-plan",
@@ -1621,7 +1621,7 @@ dependencies = [
 
 [[package]]
 name = "infer-cuda"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "anyhow",
  "cuda-kernels",
@@ -1646,7 +1646,7 @@ dependencies = [
 
 [[package]]
 name = "infer-gguf"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "anyhow",
  "deepseek-spec",
@@ -1656,7 +1656,7 @@ dependencies = [
 
 [[package]]
 name = "infer-hip"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "anyhow",
  "deepseek-spec",
@@ -1669,7 +1669,7 @@ dependencies = [
 
 [[package]]
 name = "infer-metal"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "anyhow",
  "deepseek-ocr-spec",
@@ -1687,11 +1687,11 @@ dependencies = [
 
 [[package]]
 name = "infer-moe"
-version = "0.5.2"
+version = "0.5.3"
 
 [[package]]
 name = "infer-plan"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "serde",
  "thiserror 2.0.18",
@@ -1699,7 +1699,7 @@ dependencies = [
 
 [[package]]
 name = "infer-seam"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "anyhow",
  "infer-plan",
@@ -1708,7 +1708,7 @@ dependencies = [
 
 [[package]]
 name = "infer-server"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "anyhow",
  "axum",
@@ -1733,11 +1733,11 @@ dependencies = [
 
 [[package]]
 name = "infer-topo"
-version = "0.5.2"
+version = "0.5.3"
 
 [[package]]
 name = "infer-util"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "anyhow",
  "colored",
@@ -1749,7 +1749,7 @@ dependencies = [
 
 [[package]]
 name = "infer-vulkan"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "anyhow",
  "deepseek-spec",
@@ -2663,7 +2663,7 @@ dependencies = [
 
 [[package]]
 name = "qwen3-spec"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "serde",
  "serde_json",
@@ -2672,7 +2672,7 @@ dependencies = [
 
 [[package]]
 name = "qwen35-spec"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "serde",
  "serde_json",
@@ -3227,7 +3227,7 @@ dependencies = [
 
 [[package]]
 name = "spec-train"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "ahash",
  "anyhow",
@@ -3754,7 +3754,7 @@ dependencies = [
 
 [[package]]
 name = "train"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "anyhow",
  "autograd",
@@ -3986,7 +3986,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vulkan-kernels"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "ash",
  "infer-gguf",
@@ -3995,7 +3995,7 @@ dependencies = [
 
 [[package]]
 name = "vulkan-sys"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "ash",
 ]
