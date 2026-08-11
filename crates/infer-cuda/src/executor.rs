@@ -403,6 +403,19 @@ impl RealCudaExecutor {
         crate::ops::qwen_fp8_dense_operator_stats()
     }
 
+    pub(crate) fn op_timing_stats(&self) -> infer_seam::OpTimingStats {
+        infer_seam::OpTimingStats {
+            ops: crate::profile::get_op_stats()
+                .into_iter()
+                .map(|(name, total_micros, count)| infer_seam::OpTimingEntry {
+                    name,
+                    total_micros,
+                    count,
+                })
+                .collect(),
+        }
+    }
+
     pub(crate) fn kv_tier_disk_pages(&self) -> usize {
         match self {
             Self::Qwen(q) => q.kv_tier_disk_pages(),

@@ -139,6 +139,7 @@ td:first-child { color: #888; }
   <div class="chart-box"><h3>GPU Utilization (%)</h3><div class="chart-wrap"><canvas id="cGpu"></canvas></div></div>
   <div class="chart-box"><h3>GPU Memory (MiB)</h3><div class="chart-wrap"><canvas id="cMem"></canvas></div></div>
   <div class="chart-box"><h3>GPU Power (W)</h3><div class="chart-wrap"><canvas id="cPower"></canvas></div></div>
+  <div class="chart-box"><h3>Per-Op CUDA Time (ms)</h3><div class="chart-wrap" style="height:240px"><canvas id="cOpTiming"></canvas></div></div>
 </div>
 <table id="kv"></table>
 <script>
@@ -159,6 +160,13 @@ const charts = {
   gpu: mk('cGpu', '#c792ea', 100),
   mem: mk('cMem', '#ffcb6b'),
   power: mk('cPower', '#f07178'),
+  opTiming: new Chart(document.getElementById('cOpTiming'), {
+    type: 'bar',
+    data: { labels: [], datasets: [{ data: [], backgroundColor: '#82aaff', borderWidth: 0 }] },
+    options: { indexAxis: 'y', responsive: true, maintainAspectRatio: false, animation: false,
+      plugins: { legend: { display: false } },
+      scales: { x: { grid: { color: '#222' }, ticks: { color: '#888' }, suggestedMin: 0 }, y: { grid: { display: false }, ticks: { color: '#ccc', font: { size: 11 } } } } }
+  }),
 };
 async function tick() {
   const r = await fetch('/api/data');
@@ -200,6 +208,11 @@ async function tick() {
     setData(charts.gpu, p => p.gpu_util || 0);
     setData(charts.mem, p => p.mem_used || 0);
     setData(charts.power, p => p.power || 0);
+    const opTiming = (s.op_timing && s.op_timing.ops) || [];
+    const topOps = opTiming.slice(0, 15);
+    charts.opTiming.data.labels = topOps.map(o => o.name);
+    charts.opTiming.data.datasets[0].data = topOps.map(o => +(o.total_micros / 1000).toFixed(1));
+    charts.opTiming.update('none');
   }
   const rows = [
     ['KV resident (GPU)', kv.resident_pages ?? 0],

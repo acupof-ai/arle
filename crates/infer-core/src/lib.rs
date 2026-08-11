@@ -1019,6 +1019,11 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         self.executor.operator_dispatch_stats()
     }
 
+    #[must_use]
+    pub fn op_timing_stats(&self) -> infer_seam::OpTimingStats {
+        self.executor.op_timing_stats()
+    }
+
     /// Exact backend artifact identity, if the build verified one.
     #[must_use]
     pub fn artifact_identity(&self) -> infer_seam::BackendArtifactIdentity {

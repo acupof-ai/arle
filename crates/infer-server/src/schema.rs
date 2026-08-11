@@ -652,6 +652,7 @@ pub struct StatsResponse {
     pub ssd_recall: SsdRecallStats,
     pub spec_decode: SpecDecodeStatsResponse,
     pub operator_dispatch: infer_seam::OperatorDispatchStats,
+    pub op_timing: infer_seam::OpTimingStats,
 }
 
 impl StatsResponse {
@@ -781,6 +782,7 @@ impl StatsResponse {
                 accept_rate: ratio(counters.spec_decode.accepted, counters.spec_decode.drafted),
             },
             operator_dispatch,
+            op_timing: counters.op_timing,
         }
     }
 }

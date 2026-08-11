@@ -48,7 +48,7 @@ type PendingCompletions = HashMap<RequestHandle, Sender<CompletedRequest>>;
 /// Live scheduler counters the engine loop publishes each tick for the frontend
 /// (`ServeHandle::counters`). Only counters the engine already tracks — no
 /// fabricated latency metrics.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct CounterSnapshot {
     pub active_requests: usize,
     pub queue_depth: usize,
@@ -58,6 +58,7 @@ pub struct CounterSnapshot {
     pub kv_tier: KvTierStats,
     pub kv_system: KvSystemMetrics,
     pub spec_decode: infer_seam::SpecDecodeStats,
+    pub op_timing: infer_seam::OpTimingStats,
 }
 
 /// Cross-thread handle to the latest [`CounterSnapshot`]: the engine loop writes
@@ -77,6 +78,7 @@ fn publish_counters<E: BackendExecutor, K: KvPool>(
         snap.kv_tier = engine.kv_tier_stats();
         snap.kv_system = engine.kv_system_metrics();
         snap.spec_decode = engine.spec_decode_stats();
+        snap.op_timing = engine.op_timing_stats();
     }
 }
 

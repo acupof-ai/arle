@@ -153,6 +153,24 @@ pub struct OperatorDispatchStats {
     pub fallback_count: u64,
 }
 
+/// One operation's cumulative CUDA timing. Names are stable operation keys
+/// (e.g. "attention", "mlp", "embedding"); per-layer entries use
+/// "{name}_layer{idx}".
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct OpTimingEntry {
+    pub name: String,
+    pub total_micros: u64,
+    pub count: u64,
+}
+
+/// Backend-accumulated per-operation CUDA timing, sorted by total_micros desc.
+/// Empty when the backend does not implement per-op profiling or the profiling
+/// env var is unset.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct OpTimingStats {
+    pub ops: Vec<OpTimingEntry>,
+}
+
 /// Backend-owned build artifacts reported only at a stats request boundary.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BackendArtifactIdentity {
@@ -212,6 +230,12 @@ pub trait BackendExecutor {
 
     fn operator_dispatch_stats(&self) -> OperatorDispatchStats {
         OperatorDispatchStats::default()
+    }
+
+    /// Per-operation CUDA timing accumulated since process start. Backends that
+    /// implement per-op profiling return their stats; the default is empty.
+    fn op_timing_stats(&self) -> OpTimingStats {
+        OpTimingStats::default()
     }
 
     fn artifact_identity(&self) -> BackendArtifactIdentity {
