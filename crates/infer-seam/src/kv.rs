@@ -10,9 +10,8 @@ use crate::{KvAllocator, KvPrefixStore, KvQuery};
 
 /// Host-indexed KV pool surface visible to engine-core.
 ///
-/// Implementations may own GPU, Metal, CPU, or remote buffers internally, but
-/// every method in this trait is expressed in host slot ids, page ids, token
-/// counts, and logical positions. The trait is dyn-safe so engine-core can hold
+/// Every method is expressed in host slot ids, page ids, token counts, and
+/// logical positions. The trait is dyn-safe so engine-core can hold
 /// `&mut dyn KvPool` without knowing the backend.
 pub trait KvPool: KvQuery + KvAllocator + KvPrefixStore {}
 

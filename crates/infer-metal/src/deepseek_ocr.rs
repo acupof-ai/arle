@@ -348,7 +348,7 @@ impl CppDeepseekOcrBuilder {
         }
         mlx::check_mlx_error()?;
 
-        // Embeddings + tied? (lm_head is its own weight here, not tied).
+        // lm_head is its own weight here, not tied to the embedding.
         let prefix = "language_model.model";
         let embed_id = self.add_mxfp8(tensors, &format!("{prefix}.embed_tokens"))?;
         let lm_head_id = self.add_mxfp8(tensors, "language_model.lm_head")?;
@@ -500,7 +500,6 @@ impl CppDeepseekOcrBuilder {
             )
         })?;
 
-        // SAM stem.
         let patch_embed_w = self.add_dense_name(tensors, "sam_model.patch_embed.proj.weight")?;
         let patch_embed_b = self.add_dense_name(tensors, "sam_model.patch_embed.proj.bias")?;
         let pos_embed = self.add_dense_name(tensors, "sam_model.pos_embed")?;
@@ -538,7 +537,6 @@ impl CppDeepseekOcrBuilder {
             self.push_sam_block(tensors, i, window_size)?;
         }
 
-        // CLIP stem.
         let class_embed =
             self.add_dense_name(tensors, "vision_model.embeddings.class_embedding")?;
         let pos =
@@ -553,7 +551,6 @@ impl CppDeepseekOcrBuilder {
             self.push_clip_layer(tensors, i)?;
         }
 
-        // Projector + tiling specials.
         let projector_w = self.add_mxfp8(tensors, "projector.layers")?;
         let projector_bias = self.add_dense_name(tensors, "projector.layers.bias")?;
         let image_newline = self.add_dense_name(tensors, "image_newline")?;
@@ -632,7 +629,6 @@ impl CppDeepseekOcrBuilder {
         })
     }
 
-    /// Register a dense tensor; returns its id.
     fn add_dense_name(&mut self, tensors: &TensorMap, name: &str) -> Result<i32> {
         let array = tensor_get(tensors, name)?;
         // SAFETY: mlx_sys FFI over valid owned handles and live caller buffers; failures are reported via rc/mlx_last_error checked after.
@@ -673,7 +669,6 @@ impl CppDeepseekOcrBuilder {
     }
 }
 
-// Convenience accessor so the builder reads `parsed.text()`.
 impl MetalDeepseekOcrConfig {
     pub(crate) fn text(&self) -> &deepseek_ocr_spec::DeepseekOcrTextConfig {
         &self.spec.text

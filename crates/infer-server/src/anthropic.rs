@@ -111,17 +111,14 @@ pub(crate) enum MessageContent {
 pub(crate) struct ContentBlock {
     #[serde(default, rename = "type")]
     pub kind: String,
-    /// `text` blocks.
     #[serde(default)]
     pub text: Option<String>,
-    /// `tool_use` blocks (assistant history).
     #[serde(default)]
     pub id: Option<String>,
     #[serde(default)]
     pub name: Option<String>,
     #[serde(default)]
     pub input: Option<Value>,
-    /// `tool_result` blocks (user messages).
     #[serde(default)]
     pub tool_use_id: Option<String>,
     #[serde(default)]
@@ -130,7 +127,6 @@ pub(crate) struct ContentBlock {
     pub is_error: Option<bool>,
 }
 
-/// `tool_result.content` is a plain string or a list of (text) blocks.
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 pub(crate) enum ToolResultContent {
@@ -175,7 +171,6 @@ pub(crate) struct ToolChoice {
 }
 
 impl MessagesRequest {
-    /// Full validation for `/v1/messages` (`max_tokens` is required there).
     pub(crate) fn validate(&self) -> Result<(), MessagesError> {
         self.validate_for_count()?;
         match self.max_tokens {
@@ -187,7 +182,6 @@ impl MessagesRequest {
         }
     }
 
-    /// `count_tokens` validation: prompt shape only, no `max_tokens`.
     pub(crate) fn validate_for_count(&self) -> Result<(), MessagesError> {
         if self.messages.is_empty() {
             return Err(MessagesError::invalid_request(
@@ -420,7 +414,6 @@ pub(crate) struct UsageTokens {
     pub output_tokens: usize,
 }
 
-/// Non-streaming `POST /v1/messages` response envelope.
 #[derive(Debug, Serialize)]
 pub(crate) struct MessagesResponse {
     pub id: String,
@@ -538,9 +531,7 @@ pub(crate) struct StreamEncoder {
     id: String,
     model: String,
     next_index: usize,
-    /// Index of the currently-open text block, if any.
     text_index: Option<usize>,
-    /// Index of the currently-open thinking block, if any.
     thinking_index: Option<usize>,
     /// Whitespace held back while NO text block is open: emitted only if
     /// non-whitespace text follows, dropped at block/message boundaries — so a
@@ -728,7 +719,6 @@ impl StreamEncoder {
         out
     }
 
-    /// Close any open block and terminate: `message_delta` + `message_stop`.
     pub(crate) fn finish(&mut self, stop_reason: &str, output_tokens: usize) -> String {
         let mut out = self.close_thinking();
         out.push_str(&self.close_text());

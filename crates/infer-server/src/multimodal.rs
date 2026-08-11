@@ -200,19 +200,6 @@ pub fn expand_deepseek_ocr_image_markers(
     Ok(output)
 }
 
-/// Build a DeepSeek-OCR prompt from chat messages in the reference processor's
-/// `<image>\n<text>` layout: BOS, then per message the image marker(s) first and
-/// the text after (newline-separated). The model's chat template is too trivial
-/// to render image parts, and crucially never emits BOS — so we prepend
-/// [`DEEPSEEK_OCR_BOS_MARKER`] explicitly (it encodes to id 0 even with
-/// `add_special_tokens=false`).
-///
-/// This is the single source of truth for the OCR prompt shared by the HTTP
-/// server and the in-process (`complete_multimodal_chat`) path. Two failure
-/// modes it guards against: (1) no BOS → the decoder runs without a position-0
-/// token and degenerates into a non-stopping `{"text":"image"}…` loop that burns
-/// the whole token budget; (2) text-before-image ordering → garbled output, since
-/// the model was trained with the image soft tokens ahead of the instruction.
 pub(crate) fn extract_images(
     messages: &[crate::schema::ChatMessage],
     kind: Option<infer_plan::MultimodalKind>,
@@ -305,6 +292,17 @@ fn decode_image_data_url(url: &str) -> Result<Vec<u8>, crate::schema::ApiError> 
         })
 }
 
+/// Build a DeepSeek-OCR prompt from chat messages in the reference processor's
+/// `<image>\n<text>` layout: BOS, then per message the image marker(s) first and
+/// the text after (newline-separated). The model's chat template is too trivial
+/// to render image parts, and crucially never emits BOS — so we prepend
+/// [`DEEPSEEK_OCR_BOS_MARKER`] explicitly (it encodes to id 0 even with
+/// `add_special_tokens=false`).
+///
+/// Two failure modes it guards against: (1) no BOS → the decoder runs without a
+/// position-0 token and degenerates into a non-stopping loop that burns the
+/// whole token budget; (2) text-before-image ordering → garbled output, since
+/// the model was trained with the image soft tokens ahead of the instruction.
 pub fn build_deepseek_ocr_prompt(messages: &[ChatMessage]) -> String {
     let mut prompt = String::from(DEEPSEEK_OCR_BOS_MARKER);
     for message in messages {

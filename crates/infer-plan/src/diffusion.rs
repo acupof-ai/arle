@@ -12,61 +12,43 @@ use thiserror::Error;
 
 use crate::FinishReason;
 
-/// Default DiffusionGemma canvas length.
 pub const DEFAULT_DIFFUSION_CANVAS_LENGTH: usize = 256;
-/// Default DiffusionGemma maximum denoising steps.
 pub const DEFAULT_DIFFUSION_MAX_DENOISING_STEPS: usize = 48;
-/// Default DiffusionGemma entropy-bound sampler budget.
 pub const DEFAULT_DIFFUSION_ENTROPY_BOUND: f32 = 0.1;
-/// Default DiffusionGemma confidence threshold for adaptive stopping.
 pub const DEFAULT_DIFFUSION_CONFIDENCE_THRESHOLD: f32 = 0.005;
-/// Default DiffusionGemma temperature schedule start.
 pub const DEFAULT_DIFFUSION_T_MAX: f32 = 0.8;
-/// Default DiffusionGemma temperature schedule end.
 pub const DEFAULT_DIFFUSION_T_MIN: f32 = 0.4;
-/// Default DiffusionGemma stability threshold in consecutive argmax canvases.
 pub const DEFAULT_DIFFUSION_STABILITY_THRESHOLD: usize = 1;
 
-/// Backend-neutral parameters for a block-diffusion generation.
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 #[derive(Debug, Clone, PartialEq)]
 pub struct DiffusionGenerationConfig {
-    /// Fixed denoising canvas length.
     pub canvas_length: usize,
-    /// Maximum denoise passes per canvas before forced commit.
     pub max_denoising_steps: usize,
-    /// Maximum output tokens requested by the caller.
     pub max_new_tokens: usize,
-    /// Vocabulary size used for renoising unaccepted positions.
     pub vocab_size: u32,
-    /// Token ids that terminate generation when first committed.
     pub stop_token_ids: Vec<u32>,
-    /// Padding token id; only used to fill the unused tail of a short final canvas.
+    /// Fills the unused tail of a short final canvas.
     pub pad_token_id: u32,
-    /// Entropy-bound sampler budget.
     pub entropy_bound: f32,
     /// Average entropy threshold for adaptive stopping.
     pub confidence_threshold: f32,
-    /// Minimum temperature in the linear denoise schedule.
     pub t_min: f32,
-    /// Maximum temperature in the linear denoise schedule.
     pub t_max: f32,
     /// Required number of stable argmax canvases before adaptive commit.
     pub stability_threshold: usize,
-    /// Deterministic renoise / Gumbel seed.
     pub seed: u64,
 }
 
-/// Host-side image payload for backends that expose a backend-owned VLM path.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MultimodalImage {
-    /// RGB pixels in channel-first `[3, height, width]` order, already converted
-    /// to `0..1` float values and resized to the model processor's patch grid.
+    /// RGB pixels in channel-first `[3, height, width]` order, `0..1` float,
+    /// resized to the model processor's patch grid.
     pub pixels: Vec<f32>,
     pub channels: usize,
     pub height: usize,
     pub width: usize,
-    /// Number of soft-token embeddings the vision tower emits after pooling.
+    /// Soft-token embeddings the vision tower emits after pooling.
     pub soft_token_count: usize,
 }
 
@@ -90,9 +72,8 @@ impl DiffusionGenerationConfig {
             max_denoising_steps: DEFAULT_DIFFUSION_MAX_DENOISING_STEPS,
             max_new_tokens,
             vocab_size,
-            // Diffusion-Gemma default stop/EOS token-id set: 1 = `<eos>`,
-            // 106 = `<end_of_turn>`, 50 = the model's extra stop id (same
-            // fallback as `infer-metal`'s config loader).
+            // 1 = `<eos>`, 106 = `<end_of_turn>`, 50 = the model's extra stop id
+            // (same fallback as `infer-metal`'s config loader).
             stop_token_ids: vec![1, 106, 50],
             pad_token_id: 0,
             entropy_bound: DEFAULT_DIFFUSION_ENTROPY_BOUND,
@@ -139,17 +120,14 @@ impl DiffusionGenerationConfig {
     }
 }
 
-/// Small host-visible sampler output for one denoise pass.
+/// Compact per-position facts for one denoise pass.
 ///
-/// Backends should keep logits and probabilities on device when possible and
-/// only return these compact per-position facts to the outer loop.
+/// Backends should keep logits and probabilities on device and only return
+/// these to the outer loop.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DiffusionCanvasPrediction {
-    /// Temperature-sampled candidate token for each canvas position.
     pub sampled_tokens: Vec<u32>,
-    /// Greedy candidate token for each canvas position.
     pub argmax_tokens: Vec<u32>,
-    /// Entropy of the model distribution for each canvas position.
     pub entropies: Vec<f32>,
 }
 
@@ -200,7 +178,6 @@ pub trait DiffusionBlockModel {
         Ok(None)
     }
 
-    /// Optional backend-owned fast path with a cooperative cancellation flag.
     fn generate_with_cancel(
         &mut self,
         prompt_tokens: &[u32],
@@ -210,7 +187,6 @@ pub trait DiffusionBlockModel {
         self.generate(prompt_tokens, config)
     }
 
-    /// Optional backend-owned multimodal fast path.
     fn generate_multimodal_with_cancel(
         &mut self,
         _prompt_tokens: &[u32],
@@ -227,7 +203,6 @@ pub trait DiffusionBlockModel {
         None
     }
 
-    /// Start a request with the exact generation config selected by the engine.
     fn begin_request(
         &mut self,
         _config: &DiffusionGenerationConfig,
@@ -235,10 +210,8 @@ pub trait DiffusionBlockModel {
         Ok(())
     }
 
-    /// Prefill prompt context before denoising the first canvas.
     fn prefill(&mut self, prompt_tokens: &[u32]) -> Result<(), DiffusionModelError>;
 
-    /// Run one bidirectional denoise pass for the current canvas.
     fn predict_canvas(
         &mut self,
         canvas: &[u32],
@@ -268,7 +241,6 @@ impl DiffusionModelError {
     }
 }
 
-/// Failure from the backend-neutral diffusion loop.
 #[derive(Debug, Error, PartialEq)]
 pub enum DiffusionGenerateError {
     #[error("invalid diffusion config: {0}")]
@@ -298,7 +270,6 @@ pub struct DiffusionStepTrace {
     pub committed: bool,
 }
 
-/// Aggregate diffusion-loop stats.
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct DiffusionGenerateStats {
@@ -308,7 +279,6 @@ pub struct DiffusionGenerateStats {
     pub adaptive_commits: usize,
 }
 
-/// Completed block-diffusion generation.
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 #[derive(Debug, Clone, PartialEq)]
 pub struct DiffusionGenerateOutput {
@@ -318,7 +288,6 @@ pub struct DiffusionGenerateOutput {
     pub trace: Vec<DiffusionStepTrace>,
 }
 
-/// Run the backend-neutral block-diffusion loop.
 pub fn generate_diffusion<M: DiffusionBlockModel>(
     model: &mut M,
     prompt_tokens: &[u32],
@@ -327,8 +296,6 @@ pub fn generate_diffusion<M: DiffusionBlockModel>(
     generate_diffusion_with_cancel(model, prompt_tokens, config, None)
 }
 
-/// Run the backend-neutral block-diffusion loop with optional cooperative
-/// cancellation.
 pub fn generate_diffusion_with_cancel<M: DiffusionBlockModel>(
     model: &mut M,
     prompt_tokens: &[u32],
@@ -461,8 +428,8 @@ fn cancelled(cancel: Option<&AtomicBool>) -> bool {
 
 /// Convert row-major logits into compact canvas predictions.
 ///
-/// This host utility is intended for tests and first bring-up. Production MLX /
-/// CUDA paths should do this on device and return [`DiffusionCanvasPrediction`].
+/// Intended for tests and first bring-up. Production MLX / CUDA paths should do
+/// this on device and return [`DiffusionCanvasPrediction`].
 pub fn diffusion_prediction_from_logits(
     logits: &[f32],
     canvas_len: usize,
@@ -505,8 +472,8 @@ pub fn diffusion_prediction_from_logits(
 
 /// DiffusionGemma entropy-bound acceptance mask.
 ///
-/// Mirrors the upstream rule: sort positions by entropy, accept positions whose
-/// cumulative entropy excluding the current maximum remains within the bound.
+/// Sort positions by entropy, accept positions whose cumulative entropy
+/// excluding the current maximum remains within the bound.
 #[must_use]
 pub fn entropy_bound_acceptance_mask(entropies: &[f32], entropy_bound: f32) -> Vec<bool> {
     let mut sorted: Vec<(usize, f32)> = entropies.iter().copied().enumerate().collect();
@@ -565,9 +532,7 @@ fn history_is_stable(history: &[Vec<u32>], threshold: usize) -> bool {
     if history.len() < threshold {
         return false;
     }
-    let Some(first) = history.first() else {
-        return false;
-    };
+    let first = &history[0];
     history.iter().all(|row| row == first)
 }
 
@@ -598,10 +563,6 @@ fn predict_row(
             argmax = idx;
             argmax_v = logit;
         }
-    }
-
-    if logits.is_empty() {
-        return (0, 0, 0.0);
     }
 
     let temp = temperature.max(0.0);

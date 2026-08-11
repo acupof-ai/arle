@@ -14,7 +14,6 @@ use crate::KvPool;
 /// Host-only batch view over the rows scheduled in one forward step.
 #[derive(Debug, Clone)]
 pub struct KvBatchDescriptor {
-    /// Execution mode requested by the scheduler.
     pub mode: ForwardMode,
     /// Per-row metadata in commit order: prefill rows first, then decode rows.
     pub rows: Vec<KvBatchRow>,
@@ -33,28 +32,19 @@ pub struct KvBatchDescriptor {
 /// One row in a [`KvBatchDescriptor`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KvBatchRow {
-    /// Engine slot id.
     pub slot: usize,
-    /// Decode or prefill row kind.
     pub kind: KvBatchRowKind,
-    /// Logical KV length before this row appends new tokens.
     pub seq_len: usize,
-    /// Logical write start for this row.
     pub append_pos: usize,
-    /// Number of logical tokens this row will append.
     pub append_len: usize,
     /// The request's KNOWN final logical length for this phase (prefill: the
     /// full prompt; decode: `append_pos + append_len`). Demand-paged backends
     /// reserve device pages for the whole known span at the first chunk
     /// instead of growing per chunk (#154 Phase 3b).
     pub total_tokens: usize,
-    /// Occupant epoch for stale device-view invalidation.
     pub slot_epoch: u64,
-    /// Range in [`KvBatchDescriptor::flat_token_ids`].
     pub token_range: Range<usize>,
-    /// Range in [`KvBatchDescriptor::flat_page_ids`].
     pub page_range: Range<usize>,
-    /// Range in [`KvBatchDescriptor::flat_slot_page_ids`].
     pub slot_page_range: Range<usize>,
 }
 

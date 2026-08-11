@@ -5,9 +5,8 @@ use std::sync::{
 };
 
 use infer_plan::{
-    DiffusionBlockModel, DiffusionGenerateError, DiffusionGenerationConfig, FinishReason,
-    ForwardPlan, MultimodalImage, SamplingParams, SlotToken, StepOutput,
-    generate_diffusion_with_cancel,
+    DiffusionBlockModel, DiffusionGenerationConfig, FinishReason, ForwardPlan, MultimodalImage,
+    SamplingParams, SlotToken, StepOutput, generate_diffusion_with_cancel,
 };
 
 use crate::{BackendExecutor, KvPool, PollResult, PrefixBlock};
@@ -158,7 +157,7 @@ impl<M> BufferedDiffusionExecutor<M> {
             &config,
             self.cancel.as_deref(),
         )
-        .map_err(map_diffusion_error)?;
+        .map_err(|err| anyhow::anyhow!("{err}"))?;
         if std::env::var_os("ARLE_DIFFUSION_TRACE").is_some() {
             eprintln!(
                 "diffusion generate complete: prompt_tokens={} generated_tokens={} blocks={} denoise_steps={} forced_commits={} adaptive_commits={} finish={:?}",
@@ -195,10 +194,6 @@ impl<M> BufferedDiffusionExecutor<M> {
         state.generated = buffered;
         self.next_buffered_token(row.slot, epoch)
     }
-}
-
-fn map_diffusion_error(err: DiffusionGenerateError) -> anyhow::Error {
-    anyhow::anyhow!("{err}")
 }
 
 impl<M> BackendExecutor for BufferedDiffusionExecutor<M>

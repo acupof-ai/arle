@@ -14,37 +14,31 @@ use crate::{KvAllocator, KvPrefixStore, KvQuery};
 /// Logical-page slot marker for a page that has been **evict-dropped** out of
 /// HBM under the write-through tiered KV model (`KvAllocator::evict_slot_page`).
 ///
-/// A recall slot keeps its `slot_pages` vector at full *logical* length (one
-/// entry per `ceil(seq_len / page_size)` page) so that token positions still map
-/// to the right logical page index; an evicted middle page leaves this sentinel
-/// in its logical slot while its physical page id is returned to the free pool.
-/// The sentinel never names a real page (`total_pages` is far below `u32::MAX`),
-/// and it only ever appears on the opt-in recall path — the default decode path
-/// has byte-identical contiguous `slot_pages` with no sentinels.
+/// A recall slot keeps its `slot_pages` vector at full *logical* length so that
+/// token positions still map to the right logical page index; an evicted middle
+/// page leaves this sentinel in its logical slot while its physical page id is
+/// returned to the free pool. The sentinel never names a real page
+/// (`total_pages` is far below `u32::MAX`), and it only ever appears on the
+/// opt-in recall path.
 pub const EVICTED_PAGE: u32 = u32::MAX;
 
 /// Host-side paged KV bookkeeping for a backend executor.
 ///
-/// Pages are logical `u32` ids. The executor decides how those ids map to
+/// Pages are logical `u32` ids; the executor decides how those ids map to
 /// device buffers.
 #[derive(Debug)]
 pub struct HostPagedKvPool {
     page_size: usize,
     total_pages: usize,
-    /// Free page ids, used as a LIFO stack.
     free: Vec<u32>,
-    /// Per-slot page ids in logical order.
     slot_pages: Vec<Vec<u32>>,
-    /// Per-slot logical token length.
     slot_len: Vec<usize>,
-    /// Per-slot occupant epoch (bumped on free/attach).
     slot_epoch: Vec<u64>,
     /// Ref counts for pages retained by an external owner such as prefix cache.
     page_refs: HashMap<u32, u32>,
-    /// Per-page live-slot attachment counts (a shared prefix page can be
-    /// attached to several slots at once). A page returns to `free` only when
-    /// BOTH its retain count and attach count are zero: recycling a page a
-    /// live slot still writes aliases two slots onto one physical page, then
+    /// Per-page live-slot attachment counts. A page returns to `free` only when
+    /// BOTH its retain count and attach count are zero: recycling a page a live
+    /// slot still writes aliases two slots onto one physical page, then
     /// double-frees on slot free and drifts `page_refs` until eviction frees
     /// nothing while the evictable count stays positive (#164 residual).
     slot_attach: HashMap<u32, u32>,
@@ -56,7 +50,6 @@ pub struct HostPagedKvPool {
 }
 
 impl HostPagedKvPool {
-    /// Build a pool with `num_slots` logical slots and `total_pages` physical pages.
     #[must_use]
     pub fn new(num_slots: usize, total_pages: usize, page_size: usize) -> Self {
         let page_size = page_size.max(1);
@@ -75,8 +68,8 @@ impl HostPagedKvPool {
         }
     }
 
-    /// Configure fixed-band allocation for slots whose backend needs a full page
-    /// table independent of the current logical token cursor (DSv4 FlashMLA).
+    /// Fixed-band allocation for slots whose backend needs a full page table
+    /// independent of the current logical token cursor (DSv4 FlashMLA).
     pub fn set_fixed_pages_per_slot(&mut self, pages: usize) {
         self.fixed_pages_per_slot = (pages > 0).then_some(pages);
     }

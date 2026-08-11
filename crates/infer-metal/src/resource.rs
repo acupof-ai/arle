@@ -606,13 +606,10 @@ fn kv_bytes_per_token_per_slot(
     let nkv = config.num_key_value_heads;
     let hd = config.head_dim;
     let bytes_per_layer = match kv_cache_dtype {
-        MetalKvCacheDtype::Bf16 => {
-            // K + V, both BF16.
-            2usize
-                .checked_mul(nkv)
-                .and_then(|v| v.checked_mul(hd))
-                .and_then(|v| v.checked_mul(2))
-        }
+        MetalKvCacheDtype::Bf16 => 2usize
+            .checked_mul(nkv)
+            .and_then(|v| v.checked_mul(hd))
+            .and_then(|v| v.checked_mul(2)),
         MetalKvCacheDtype::Int8 => {
             let group = crate::executor::int8_kv_group_size(config.head_dim)?;
             // Per K/V: packed uint32 data uses head_dim bytes; scale+bias use

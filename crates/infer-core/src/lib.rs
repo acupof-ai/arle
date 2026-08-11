@@ -14,9 +14,7 @@ mod writethrough;
 
 pub use radix::{BlockId, PrefixMatch, RadixCache};
 pub use recall::{RecallConfig, RecallPlan, plan_recall};
-pub use writethrough::{
-    cap_rep_pool, evict_drop_pages, plan_working_set, prefetch_blocks, prefetch_query,
-};
+pub use writethrough::{cap_rep_pool, evict_drop_pages, prefetch_blocks, prefetch_query};
 
 use anyhow::{Result, bail};
 use infer_plan::{FinishReason, ForwardPlan, SamplingParams, SlotToken, StepOutput};
@@ -965,25 +963,21 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         self.waiting.is_empty() && self.active.is_empty() && self.inflight.is_none()
     }
 
-    /// Return whether an executor step is currently in flight.
     #[must_use]
     pub fn has_inflight(&self) -> bool {
         self.inflight.is_some()
     }
 
-    /// Return the number of active slots.
     #[must_use]
     pub fn active_count(&self) -> usize {
         self.active.len()
     }
 
-    /// Return the number of waiting requests.
     #[must_use]
     pub fn waiting_count(&self) -> usize {
         self.waiting.len()
     }
 
-    /// Return currently free host-indexed KV pages.
     #[must_use]
     pub fn kv_free_pages(&self) -> usize {
         self.kv.free_pages()
@@ -997,7 +991,6 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         stats
     }
 
-    /// Return engine throughput counters (steps, tokens, completions).
     #[must_use]
     pub fn throughput_stats(&self) -> ThroughputStats {
         ThroughputStats {
@@ -1057,7 +1050,6 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         metrics
     }
 
-    /// Return a completed request by handle.
     #[must_use]
     pub fn completed(&self, handle: RequestHandle) -> Option<&CompletedRequest> {
         self.completed.get(&handle)

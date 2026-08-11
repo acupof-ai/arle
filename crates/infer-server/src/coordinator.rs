@@ -386,7 +386,6 @@ fn lockstep_loop(
             }
         }
 
-        // Drain queued submissions without blocking.
         let mut drained: Vec<WireRequest> = Vec::new();
         let mut cancellations: Vec<u64> = Vec::new();
         loop {
@@ -431,7 +430,6 @@ fn lockstep_loop(
             continue;
         }
 
-        // Fully idle: exit if the frontend is gone, else park for the next submit.
         if !submit_open {
             return;
         }
@@ -827,11 +825,6 @@ async fn completions(
     let return_token_ids = request.return_token_ids.unwrap_or(false);
     let prompt_token_ids = return_token_ids.then(|| prompt_tokens.clone());
     let n = sampling.n.max(1);
-    if request.stream.unwrap_or(false) && n > 1 {
-        return Err(ApiError::bad_request(
-            "stream=true with n>1 is not supported",
-        ));
-    }
 
     if n > 1 {
         let mut choices = Vec::with_capacity(n);
@@ -1245,13 +1238,6 @@ async fn chat_completions(
     }
 
     let n = sampling.n.max(1);
-    // Streaming with n>1 is not supported (OpenAI streams multiple choices
-    // with different indices — complex; fall back to a single stream).
-    if stream && n > 1 {
-        return Err(ApiError::bad_request(
-            "stream=true with n>1 is not supported",
-        ));
-    }
 
     if n > 1 {
         let mut choices = Vec::with_capacity(n);

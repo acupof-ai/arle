@@ -45,15 +45,11 @@ use crate::loaded::LoadedInferenceEngine;
 /// `serve_http` rejects any that the active backend cannot satisfy.
 #[derive(Debug, Clone)]
 pub struct ServeHttpOptions {
-    /// Model directory or HuggingFace model id.
     pub model_path: String,
-    /// Host or IP address to bind.
     pub bind: String,
-    /// Port to listen on.
     pub port: u16,
     /// Honored by the CUDA decode-graph default only.
     pub enable_cuda_graph: bool,
-    /// Engine slot / page / token-budget configuration.
     pub engine_config: EngineLoadConfig,
     /// Speculative-decode request surface. The rewrite server keeps this
     /// fail-closed until a backend actually consumes it.
@@ -61,7 +57,6 @@ pub struct ServeHttpOptions {
 }
 
 impl ServeHttpOptions {
-    /// Construct serve options with the default [`EngineLoadConfig`].
     #[must_use]
     pub fn new(model_path: impl Into<String>, bind: impl Into<String>, port: u16) -> Self {
         Self {
@@ -155,12 +150,9 @@ fn default_cache_root() -> PathBuf {
 /// Speculative decode mode requested at the serve boundary.
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
 pub enum ServeSpecType {
-    /// Standard target-only decode.
     #[default]
     None,
-    /// Backend chooses the available speculative route.
     Auto,
-    /// Multi-token prediction / MTP route.
     Mtp,
     /// DSpark/DFlash block drafter (external draft checkpoint dir via
     /// `--mtp-draft-model`; CUDA Qwen3.5/3.6 only).
@@ -179,7 +171,6 @@ impl ServeSpecType {
     }
 }
 
-/// Speculative decode options carried by [`ServeHttpOptions`].
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ServeSpecOptions {
     pub spec_type: ServeSpecType,
@@ -188,7 +179,6 @@ pub struct ServeSpecOptions {
     pub dspark_sps_row_ms: f32,
     pub mtp_draft_tokens: Option<usize>,
     pub mtp_draft_topk: Option<usize>,
-    /// Cap the DSpark draft block length.
     pub dspark_block_size: Option<usize>,
     /// A saved Markov head to install over the draft checkpoint's at startup.
     pub dspark_markov_init: Option<std::path::PathBuf>,
@@ -386,7 +376,6 @@ fn serve_listener(
     })
 }
 
-/// HTTP server running on a background thread ([`serve_router_on_thread`]).
 #[cfg(any(
     feature = "metal",
     feature = "cuda",
@@ -407,8 +396,6 @@ pub struct ServeThread {
     feature = "cpu"
 ))]
 impl ServeThread {
-    /// Request graceful shutdown and join, returning the serve loop's result
-    /// (e.g. a bind failure surfaces here).
     pub fn shutdown(self) -> Result<()> {
         self.shutdown.request();
         self.join

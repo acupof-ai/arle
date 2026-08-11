@@ -111,7 +111,6 @@ pub(crate) fn unix_time_secs() -> u64 {
 const THINK_START: &str = "<think>";
 const THINK_END: &str = "</think>";
 
-/// One decoded chat-SSE text delta, routed to its wire field.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ChatDelta {
     Reasoning(String),
@@ -153,7 +152,6 @@ impl StreamingReasoningSplitter {
         }
     }
 
-    /// Route one decoded delta batch; emits zero, one, or two deltas.
     pub(crate) fn push(&mut self, text: &str) -> Vec<ChatDelta> {
         if !self.enabled {
             // Thinking is off, but a reasoning-trained model (e.g. Qwen3.6) may
@@ -317,7 +315,6 @@ impl StreamPipeline {
         }
     }
 
-    /// Feed one decoded delta; returns routed deltas + newly completed calls.
     pub(crate) fn push(&mut self, text: &str) -> (Vec<ChatDelta>, Vec<chat::ToolCall>) {
         let mut deltas = Vec::new();
         let mut calls = Vec::new();

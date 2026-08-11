@@ -223,9 +223,6 @@ pub(crate) struct Qwen35CudaExecutor {
     recall_cfg: infer_core::RecallConfig,
     /// Per-slot recall state (reps + next-step page plan + evict list).
     recall: Vec<crate::recall::CudaRecallState>,
-    /// One-shot warn latch when --kv-recall is requested with a non-BF16 pool.
-    #[allow(dead_code)]
-    recall_quant_warned: bool,
     /// Shared paged full-attn KV pool (HD256, `num_full` layers), the DEFAULT
     /// full-attn KV substrate since the shared-paged migration — built eagerly
     /// in the constructor, profile-sized from measured free VRAM (not
@@ -256,10 +253,6 @@ pub(crate) struct Qwen35CudaExecutor {
     /// when `set_kv_recall(true)` lazily builds `recall_tier`.
     recall_budget_bytes: usize,
 
-    /// Model checkpoint path for deriving the weights epoch tag at durable
-    /// NVMe spill time (`set_kv_recall` / `set_kv_tier_disk`).
-    #[allow(dead_code)]
-    model_path: std::path::PathBuf,
     /// Weights-version tag from the checkpoint (`weights_epoch_tag`). Stamped
     /// into the durable recall manifest so a restart drops stale KV after an
     /// OPD weight update.
@@ -980,7 +973,6 @@ impl Qwen35CudaExecutor {
             recall: (0..num_slots)
                 .map(|_| crate::recall::CudaRecallState::default())
                 .collect(),
-            recall_quant_warned: false,
             full_attn_kv: Some(full_attn_kv),
             kv_format,
             recall_tier: None,

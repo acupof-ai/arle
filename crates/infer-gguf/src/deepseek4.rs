@@ -1,13 +1,13 @@
 //! GGUF (`deepseek4` arch) → [`DeepSeekV4Config`] + tensor-name → role map.
 //!
-//! Key strings and tensor names extracted from the nisparks DSv4 branch at
-//! `/tmp/arle-hip-scan/llama.cpp-dsv4` (`pr/01-deepseek-v4-arch` @ 9cb6ae64):
-//! arch name "deepseek4" (llama-arch.cpp:78), KV key table
-//! llama-arch.cpp:142-263, tensor-name table llama-arch.cpp:345-571,
-//! deepseek4 hparam loads llama-model.cpp:2038-2060, tensor creation
-//! llama-model.cpp:5441-5567. Per-layer compress ratio is NOT a metadata
-//! key — it is `blk.%d.attn_compress_ape` ne[1], 0 when the tensor is
-//! absent (llama-memory-deepseek4.cpp:61-63). Hash routing is per-layer
+//! Key strings and tensor names extracted from the nisparks DSv4 branch
+//! (`pr/01-deepseek-v4-arch` @ 9cb6ae64): arch name "deepseek4"
+//! (llama-arch.cpp:78), KV key table llama-arch.cpp:142-263, tensor-name
+//! table llama-arch.cpp:345-571, deepseek4 hparam loads
+//! llama-model.cpp:2038-2060, tensor creation llama-model.cpp:5441-5567.
+//! Per-layer compress ratio is NOT a metadata key — it is
+//! `blk.%d.attn_compress_ape` ne[1], 0 when the tensor is absent
+//! (llama-memory-deepseek4.cpp:61-63). Hash routing is per-layer
 //! `blk.%d.ffn_gate_tid2eid` presence; scoring is hardcoded
 //! sqrt(softplus) (models/deepseek4.cpp:486-487).
 

@@ -538,6 +538,67 @@ unsafe extern "C" {
         seq_len: i32,
         stream: CUstream,
     ) -> CUresult;
+
+    pub fn gdr_fq_cumsum_h16g16_cuda(
+        g_in: *const f32,
+        g_out: *mut f32,
+        seq_len: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn gdr_fq_kkt_h16g16_cuda(
+        k: *const Half,
+        beta: *const f32,
+        a_inv: *mut Half,
+        seq_len: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn gdr_fq_fwd_h16g16_cuda(
+        q: *const Half,
+        k: *const Half,
+        v: *const Half,
+        a_inv: *const Half,
+        g_cumsum: *const f32,
+        beta: *const f32,
+        h0: *const f32,
+        o: *mut Half,
+        ht: *mut f32,
+        seq_len: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn gdr_fq_prepare_h_h16g16_cuda(
+        k: *const Half,
+        v: *const Half,
+        a_inv: *const Half,
+        g_cumsum: *const f32,
+        beta: *const f32,
+        h0: *const f32,
+        h: *mut Half,
+        seq_len: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn gdr_fq_bwd_h16g16_cuda(
+        dout: *const Half,
+        dht: *const f32,
+        q: *const Half,
+        k: *const Half,
+        v: *const Half,
+        a_inv: *const Half,
+        g_cumsum: *const f32,
+        beta: *const f32,
+        h: *const Half,
+        dq: *mut Half,
+        dk: *mut Half,
+        dv: *mut Half,
+        dg: *mut f32,
+        dbeta: *mut f32,
+        dh0: *mut f32,
+        seq_len: i32,
+        stream: CUstream,
+    ) -> CUresult;
 }
 
 // Geometry -> symbol table, generated from the kernels.toml flashqla rows.

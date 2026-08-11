@@ -74,28 +74,22 @@ pub struct CudaRuntimeFlags {
     /// FlashQLA chunked GDN prefill (sm_90a baked Qwen3.6 shard only).
     #[serde(default = "d_true")]
     pub qwen35_gdr_chunked: bool,
-    /// Fast page-16 decode-metadata kernel path.
     #[serde(default)]
     pub decode_metadata_fast_page16: bool,
-    /// Marlin W4 FP8 prefill weights at load.
     #[serde(default)]
     pub marlin_w4_fp8_prefill: bool,
     /// Retain the cuMemAllocAsync pool across syncs (caching allocator).
     #[serde(default = "d_true")]
     pub mempool_retain: bool,
-    /// Safetensor shard read-ahead cache budget in bytes (None = built-in default).
     #[serde(default)]
     pub shard_cache_bytes: Option<usize>,
-    /// Pin multi-rank workers to their GPU's NUMA node.
     #[serde(default = "d_true")]
     pub numa_pin: bool,
-    /// TP collective transport (`--comm-backend`).
     #[serde(default)]
     pub comm_backend: CommBackend,
     /// DSv4 FlashMLA sparse decode: None = default (on when compiled in).
     #[serde(default)]
     pub dsv4_flashmla_decode: Option<bool>,
-    /// DSv4 DSA indexer SM budget.
     #[serde(default = "d_dsa_indexer_sms")]
     pub dsv4_dsa_indexer_sms: usize,
     /// DSv4 contiguous-decode MoE path (KILLED as default; A/B lever).
@@ -109,7 +103,6 @@ pub struct CudaRuntimeFlags {
     /// Adaptive MTP gate at B=1 (skip speculation below the accept break-even).
     #[serde(default)]
     pub mtp_adaptive: bool,
-    /// Minimum accept-rate EMA to keep speculating under --mtp-adaptive.
     #[serde(default = "d_mtp_min_accept")]
     pub mtp_min_accept: f32,
     /// Speculate (MTP/DSpark) only when the decode batch is ≤ this. Above it,
@@ -165,13 +158,10 @@ impl Default for CudaRuntimeFlags {
 /// Metal executor runtime toggles, applied via `infer_metal::apply_runtime_flags`.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MetalRuntimeFlags {
-    /// Overlapped c=1 greedy decode pipeline.
     #[serde(default = "d_true")]
     pub pipeline: bool,
-    /// Load-time JIT warmup forward.
     #[serde(default = "d_true")]
     pub warmup: bool,
-    /// Paged-prefix SDPA read path for single-token decode.
     #[serde(default = "d_true")]
     pub paged_kv_read: bool,
     /// Host (blocking D2H) non-greedy sampler; off = device greedy argmax.

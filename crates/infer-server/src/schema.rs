@@ -143,7 +143,6 @@ where
     )
 }
 
-/// Minimal `/v1/completions` request body.
 #[derive(Debug, Clone, Deserialize)]
 pub struct CompletionRequest {
     pub model: Option<String>,
@@ -216,7 +215,6 @@ impl CompletionRequest {
     }
 }
 
-/// Minimal `/v1/chat/completions` request body.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ChatCompletionRequest {
     pub model: Option<String>,

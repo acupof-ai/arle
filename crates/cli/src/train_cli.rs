@@ -538,13 +538,13 @@ fn run_w2s(args: TrainW2sArgs) -> Result<()> {
                 "[arle train w2s] loading aux1 pre-RL (infer) from {}",
                 args.aux1_pre.display()
             );
-            // Aux engines only run a single short forward pass; keep the KV
-            // pool tiny so the student's activations + aux weights fit on one
-            // GPU. `single_sequence` sets total_pages but the CUDA pool sizer
-            // ignores it and budgets from `mem_fraction_static` of free VRAM.
+            // Aux engines run forward passes over the full prompt+completion
+            // (chain-of-thought KL), so the sequence budget must cover GSM8K
+            // solutions (~500 tokens). `mem_fraction_static` keeps the KV pool
+            // small so the student's activations + aux weights fit on one GPU.
             let aux_cfg = EngineLoadConfig {
-                mem_fraction_static: 0.01,
-                ..EngineLoadConfig::single_sequence(128)
+                mem_fraction_static: 0.1,
+                ..EngineLoadConfig::single_sequence(2048)
             };
             let pre_engine = LoadedInferenceEngine::load_with_config(
                 args.aux1_pre
@@ -691,8 +691,14 @@ fn run_w2s(args: TrainW2sArgs) -> Result<()> {
                         out.push(ids);
                     }
                 } else if let Some(text) = row.get("text").and_then(|v| v.as_str()) {
-                    // Tokenize with the student's tokenizer.
-                    let ids = tokenize_text(text, &args.student_model)?;
+                    // Tokenize with the student's tokenizer. If a `completion`
+                    // field is present, append it so the KL covers the full
+                    // chain-of-thought, not just the first answer token.
+                    let mut full_text = text.to_string();
+                    if let Some(completion) = row.get("completion").and_then(|v| v.as_str()) {
+                        full_text.push_str(completion);
+                    }
+                    let ids = tokenize_text(&full_text, &args.student_model)?;
                     if !ids.is_empty() {
                         out.push(ids);
                     }

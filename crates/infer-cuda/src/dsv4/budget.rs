@@ -216,7 +216,6 @@ impl Dsv4Model {
                 )?);
         }
         if self.spec_decode_on {
-            // spec_rings: one uniform snapshot per layer.
             let ring = crate::attention::Dsv4SpecRingSnapshot::device_bytes_for(
                 &self.config,
                 &self.kv_arena,
@@ -238,7 +237,6 @@ impl Dsv4Model {
             let head_dim = self.config.head_dim;
             let num_stages = self.config.dspark_num_stages();
             let block = self.config.dspark_block_size;
-            // Sliding-window draft latent: fixed `window + block`, no prompt growth.
             let draft_span = self.config.sliding_window + block;
             let latent_cap = draft_span;
             total = total.saturating_add(
@@ -581,7 +579,7 @@ impl Dsv4Model {
                 .unwrap_or(usize::MAX)
             };
             let affordable = affordable.min(pool_affordable_slots);
-            // Neutral clamp (infer-seam). NCCL min-reduce stays CUDA-side.
+            // NCCL min-reduce stays CUDA-side.
             let (planned, clamped) = infer_seam::clamp_to_affordable(requested, affordable);
             if clamped {
                 log::warn!(

@@ -50,7 +50,6 @@ impl Dsv4CompressorState {
         } else {
             compressed_capacity
         };
-        let compressed_rows = ring_rows;
         let fp32_pending_kv = ctx
             .stream
             .alloc_zeros::<f32>(ratio * width)
@@ -84,7 +83,7 @@ impl Dsv4CompressorState {
                 .stream
                 .alloc_zeros::<half::bf16>(ratio * head_dim)
                 .map_err(|e| anyhow::anyhow!("DSv4 compressor prev score alloc failed: {e}"))?,
-            compressed: HiddenStates::zeros(ctx, head_dim, compressed_rows)?,
+            compressed: HiddenStates::zeros(ctx, head_dim, ring_rows)?,
             compressed_capacity,
             ring_rows,
             fp32_pending_kv,

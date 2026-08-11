@@ -20,14 +20,12 @@ pub(crate) struct QuantConfig {
     pub(crate) per_weight: std::sync::Arc<std::collections::HashMap<String, (i32, i32)>>,
 }
 
-/// Qwen3.5 layer type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MetalQwen35LayerType {
     FullAttention,
     LinearAttention,
 }
 
-/// Configuration for Qwen3.5 linear-attention/GDR layers.
 #[derive(Debug, Clone)]
 pub(crate) struct MetalGdrConfig {
     pub(crate) num_key_heads: usize,
@@ -40,14 +38,12 @@ pub(crate) struct MetalGdrConfig {
 
 impl MetalGdrConfig {
     pub(crate) fn qkv_dim(&self) -> usize {
-        let q_dim = self.num_key_heads * self.key_dim;
-        let k_dim = q_dim;
+        let qk_dim = self.num_key_heads * self.key_dim;
         let v_dim = self.num_value_heads * self.value_dim;
-        q_dim + k_dim + v_dim
+        qk_dim * 2 + v_dim
     }
 }
 
-/// Mixture-of-Experts architectural parameters for Qwen3.5/3.6.
 #[derive(Debug, Clone)]
 pub(crate) struct MetalQwen35MoeConfig {
     pub(crate) num_experts: usize,
@@ -383,7 +379,6 @@ fn try_read_config_json(model_dir: &Path) -> Option<serde_json::Value> {
     serde_json::from_str(&raw).ok()
 }
 
-/// Load a safetensors Qwen3.5/Qwen3.6 config for the clean Metal executor.
 pub(crate) fn load_metal_config(model_dir: &Path) -> Result<MetalModelConfig> {
     let path = model_dir.join("config.json");
     let raw = std::fs::read_to_string(&path)

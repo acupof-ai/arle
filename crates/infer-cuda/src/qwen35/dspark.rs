@@ -154,8 +154,8 @@ impl Qwen35DsparkHead {
             rms(w2),
             (markov.rank as f32).sqrt() * rms(w1) * rms(w2)
         );
-        let w1_bf16: Vec<half::bf16> = w1.iter().map(|&x| half::bf16::from_f32(x)).collect();
-        let w2_bf16: Vec<half::bf16> = w2.iter().map(|&x| half::bf16::from_f32(x)).collect();
+        let w1_bf16: Vec<bf16> = w1.iter().map(|&x| bf16::from_f32(x)).collect();
+        let w2_bf16: Vec<bf16> = w2.iter().map(|&x| bf16::from_f32(x)).collect();
         markov.w1.data = ctx
             .stream
             .clone_htod(&w1_bf16)
@@ -1328,7 +1328,7 @@ impl Qwen35Model {
         let win_dev = scratch.attn_win.upload(ctx, &win)?;
         let embed_ms = super::mtp_phase_lap(ctx, &mut pt);
 
-        let elem = std::mem::size_of::<half::f16>() as u64;
+        let elem = std::mem::size_of::<bf16>() as u64;
         let (mut qkv_ms, mut attn_ms, mut mlp_ms) = (0.0f64, 0.0f64, 0.0f64);
         for (li, layer) in head.layers.iter().enumerate() {
             let cap_li = head.cap;

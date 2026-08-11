@@ -21,9 +21,7 @@ pub struct MetalSlotState {
     /// recent step issued on this slot — the input the next prequeue feeds into
     /// `step_session`. `None` outside pipeline mode.
     pub(super) last_sampled: Option<mlx::MlxArray>,
-    /// DFlash target hidden feature store for the last committed target span.
     pub(super) dflash_target_hidden: Option<mlx::MlxArray>,
-    /// Per-slot draft-model KV cache. Separate from target K/V.
     pub(super) dflash_draft_state: Option<dflash::DFlashDraftState>,
     /// Session KV-recall plan for the next decode: when `Some`, the step attends
     /// only these token ranges (sink ∪ recalled blocks ∪ local) via the page-gather

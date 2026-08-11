@@ -29,7 +29,6 @@ where
     E: BackendExecutor + 'static,
     K: KvPool + 'static,
 {
-    /// Adopt a spawned [`ServeHandle`] plus the matching tokenizer.
     #[must_use]
     pub fn new(model_id: String, tokenizer: OpenAiTokenizer, serve: ServeHandle<E, K>) -> Self {
         Self {
@@ -79,12 +78,10 @@ where
         self.serve.release_kv_pool()
     }
 
-    /// Re-acquire the KV pool dropped by [`Self::release_kv_pool`].
     pub fn ensure_kv_pool(&self) -> Result<()> {
         self.serve.ensure_kv_pool()
     }
 
-    /// Re-acquire the KV pool, then resume admission only after success.
     pub fn ensure_kv_pool_and_resume_admissions(&self) -> Result<()> {
         self.serve.ensure_kv_pool_and_resume_admissions()
     }

@@ -1,6 +1,6 @@
-//! Unified logging configuration for Rust LLM.
+//! Unified logging configuration for ARLE.
 //!
-//! Provides consistent log initialization across server and tests.
+//! Consistent log initialization across server and tests.
 
 use colored::Color::{Green, Red, Yellow};
 use logforth::diagnostic::ThreadLocalDiagnostic;
@@ -12,13 +12,13 @@ static INIT: Once = Once::new();
 
 #[derive(Debug, Clone)]
 struct LoggingConfig {
-    /// Log level filter (e.g., "info", "debug", "info,infer=debug").
-    /// Falls back to RUST_LOG environment variable if set.
+    /// Log level filter (e.g. `"info"`, `"info,infer=debug"`).
+    /// Falls back to `RUST_LOG` if set.
     level: String,
     /// Enable colored output (info=green, warn=yellow, error=red).
     colored: bool,
-    /// Fixed prefix prepended to every formatted record (e.g. `"[rank0] "`),
-    /// so interleaved multi-process stderr stays attributable.
+    /// Fixed prefix prepended to every record (e.g. `"[rank0] "`), so
+    /// interleaved multi-process stderr stays attributable.
     prefix: Option<String>,
 }
 
@@ -32,8 +32,7 @@ impl Default for LoggingConfig {
     }
 }
 
-/// Layout decorator: prepends [`LoggingConfig::prefix`] to whatever the
-/// wrapped layout formats.
+/// Prepends a fixed prefix to whatever the wrapped layout formats.
 #[derive(Debug)]
 struct PrefixedLayout {
     prefix: String,
@@ -62,12 +61,10 @@ const DEFAULT_NOISY_MODULE_LEVELS: [(&str, &str); 5] = [
 ];
 
 /// Default-on rolling file sink, so a hung/killed process still leaves a log
-/// on disk instead of only the tmux/terminal scrollback (pod round-7: a hang
-/// investigation had no server log to inspect post-mortem because stderr was
-/// never redirected). `ARLE_LOG_DIR` overrides the directory (default
-/// `"logs"`); set it to `off`/`none`/`""` to disable. One file per process —
-/// `prefix` (multiproc rank tag, e.g. `"[rank2] "`) becomes part of the
-/// filename so ranks don't clobber each other's file.
+/// on disk instead of only the terminal scrollback. `ARLE_LOG_DIR` overrides
+/// the directory (default `"logs"`); set to `off`/`none`/`""` to disable.
+/// One file per process — `prefix` (multiproc rank tag) becomes part of the
+/// filename so ranks don't clobber each other.
 fn build_file_append(prefix: &Option<String>) -> Option<Box<dyn logforth::Append>> {
     let dir = std::env::var("ARLE_LOG_DIR").unwrap_or_else(|_| "logs".to_string());
     if matches!(dir.as_str(), "" | "off" | "none") {
@@ -116,12 +113,11 @@ fn apply_default_module_levels(mut filter: String) -> String {
     filter
 }
 
-/// Initialize logging with the given configuration.
+/// Initialize logging. Idempotent — subsequent calls are no-ops.
 ///
-/// This function is idempotent - subsequent calls after the first are no-ops.
-/// The RUST_LOG environment variable takes precedence over the configured level.
-/// When RUST_LOG is not set, noisy dependency modules default to warn to
-/// keep debug output focused on application components.
+/// `RUST_LOG` takes precedence over `config.level`. When `RUST_LOG` is unset,
+/// noisy dependency modules default to `warn` to keep debug output focused on
+/// application components.
 fn init(config: LoggingConfig) {
     INIT.call_once(|| {
         let LoggingConfig {
@@ -133,7 +129,6 @@ fn init(config: LoggingConfig) {
         let filter_str =
             std::env::var("RUST_LOG").unwrap_or_else(|_| apply_default_module_levels(level));
 
-        // Parse filter from string using EnvFilterBuilder
         let filter =
             logforth::filter::env_filter::EnvFilterBuilder::from_env_or("RUST_LOG", filter_str)
                 .build();
@@ -157,10 +152,10 @@ fn init(config: LoggingConfig) {
             }) as Box<dyn logforth::Layout>,
             None => layout,
         };
-        // Both sinks run on one dedicated background thread (bounded queue,
-        // drop-on-overflow) so a caller thread — inference included — never
-        // blocks on a stderr/disk write. Formatting still happens on the
-        // caller (cheap); only the actual I/O is offloaded.
+        // Both sinks share one background thread (bounded queue,
+        // drop-on-overflow) so the caller thread — inference included — never
+        // blocks on stderr/disk I/O. Formatting stays on the caller (cheap);
+        // only the actual write is offloaded.
         let mut async_append = logforth::append::asynchronous::AsyncBuilder::new("arle-log")
             .buffered_lines_limit(Some(8192))
             .overflow_drop_incoming()
@@ -179,9 +174,7 @@ fn init(config: LoggingConfig) {
     });
 }
 
-/// Initialize logging to stderr without colors.
-///
-/// Convenience function for tests use case.
+/// Initialize stderr logging without colors. For tests.
 pub fn init_stderr(level: &str) {
     init(LoggingConfig {
         level: level.to_string(),
@@ -201,7 +194,7 @@ pub fn init_stderr_with_prefix(level: &str, prefix: &str) {
     });
 }
 
-/// Initialize logging with default settings (stderr, colored, "info" level).
+/// Initialize logging with defaults (stderr, colored, `"info"`).
 pub fn init_default() {
     init(LoggingConfig::default());
 }
@@ -220,9 +213,8 @@ mod tests {
         unsafe { std::env::set_var("ARLE_LOG_DIR", &dir) };
         init_stderr("info");
         log::info!("logging file-sink self-check");
-        // logforth's file appender flushes on a background thread, so the
-        // file can exist before the record lands in it — poll the content,
-        // not just the file's presence.
+        // logforth's file appender flushes on a background thread, so the file
+        // can exist before the record lands — poll content, not just presence.
         let mut contents = String::new();
         for _ in 0..100 {
             contents = std::fs::read_dir(&dir)

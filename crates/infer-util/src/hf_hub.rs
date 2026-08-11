@@ -33,17 +33,12 @@ const DEFAULT_DISCOVERY_CANDIDATES: &[&str] = &[
 
 /// Resolve a model source string to a local directory containing model files.
 ///
-/// # Arguments
-/// * `model_id_or_path` — Either an existing local path or a HuggingFace model
-///   ID (e.g. `"Qwen/Qwen2.5-0.5B-Instruct"`, `"mlx-community/Qwen2.5-0.5B-4bit"`).
-///
 /// Returns the path to the directory that contains `config.json` and weight files.
 ///
-/// Short-circuit: if the input *looks like* a filesystem path (see the
-/// private `looks_like_local_path` helper below) but that path does not
-/// exist locally, the call fails immediately with a clear error rather than
+/// If the input *looks like* a filesystem path (see [`looks_like_local_path`])
+/// but that path does not exist locally, the call fails immediately rather than
 /// falling through to a HuggingFace Hub download. Repo-id inputs (e.g.
-/// `Qwen/Qwen3-0.6B`) still fall through to the hub as before.
+/// `Qwen/Qwen3-0.6B`) still fall through to the hub.
 pub fn resolve_model_path(model_id_or_path: &str) -> Result<PathBuf> {
     if let Some(local) = resolve_local_model_path(model_id_or_path) {
         log::info!("Using local model path: {}", local.display());
@@ -62,11 +57,8 @@ pub fn resolve_model_path(model_id_or_path: &str) -> Result<PathBuf> {
 }
 
 /// Resolve a checkpoint source for callers that need config + weights but not a
-/// tokenizer.
-///
-/// This is used for auxiliary checkpoints such as Metal DFlash draft models,
-/// which are often stored in the local HuggingFace cache without tokenizer
-/// files.
+/// tokenizer (e.g. Metal DFlash draft models stored in the local HF cache
+/// without tokenizer files).
 pub fn resolve_weighted_model_path(model_id_or_path: &str) -> Result<PathBuf> {
     if let Some(local) = resolve_local_weighted_model_path(model_id_or_path) {
         log::info!("Using local weighted model path: {}", local.display());
@@ -79,9 +71,6 @@ pub fn resolve_weighted_model_path(model_id_or_path: &str) -> Result<PathBuf> {
     download_from_hub(model_id_or_path)
 }
 
-/// Resolve a model source using local paths and local HuggingFace cache only.
-///
-/// Returns `None` when no local candidate exists.
 pub fn resolve_local_model_path(model_id_or_path: &str) -> Option<PathBuf> {
     let local = Path::new(model_id_or_path);
     if local.exists() {
@@ -93,9 +82,7 @@ pub fn resolve_local_model_path(model_id_or_path: &str) -> Option<PathBuf> {
         .find(|candidate| is_model_dir(candidate))
 }
 
-/// Resolve a model source using local paths and local HuggingFace cache only.
-///
-/// Unlike [`resolve_local_model_path`], this only requires `config.json` plus at
+/// Like [`resolve_local_model_path`], but only requires `config.json` plus at
 /// least one local weight shard; tokenizer files are optional.
 pub fn resolve_local_weighted_model_path(model_id_or_path: &str) -> Option<PathBuf> {
     let local = Path::new(model_id_or_path);
@@ -108,15 +95,12 @@ pub fn resolve_local_weighted_model_path(model_id_or_path: &str) -> Option<PathB
         .find(|candidate| is_weighted_model_dir(candidate))
 }
 
-/// Discover the best local model from a curated candidate list.
-///
-/// Prefers the explicit candidate order. Returns the candidate label that matched
-/// plus the resolved local path.
+/// Discover the best local model from a curated candidate list, in priority
+/// order. Returns the matched candidate label and its local path.
 pub fn discover_local_model() -> Option<(String, PathBuf)> {
     discover_local_model_from(DEFAULT_DISCOVERY_CANDIDATES)
 }
 
-/// Same as [`discover_local_model`] but with a caller-provided priority list.
 pub fn discover_local_model_from(candidates: &[&str]) -> Option<(String, PathBuf)> {
     candidates.iter().find_map(|candidate| {
         resolve_local_model_path(candidate).map(|path| ((*candidate).to_string(), path))
@@ -125,9 +109,8 @@ pub fn discover_local_model_from(candidates: &[&str]) -> Option<(String, PathBuf
 
 /// Resolve a model source for CLI-style callers.
 ///
-/// Prefers an explicit flag value, then `ARLE_MODEL` (primary) /
-/// `AGENT_INFER_MODEL` (legacy fallback), then local model
-/// auto-discovery using [`discover_local_model`].
+/// Priority: explicit flag value, then `ARLE_MODEL` (primary) /
+/// `AGENT_INFER_MODEL` (legacy fallback), then local model auto-discovery.
 pub fn resolve_model_source(explicit_model_path: Option<&str>) -> Result<String> {
     if let Some(model_path) = explicit_model_path
         && !model_path.trim().is_empty()
@@ -164,7 +147,7 @@ pub fn resolve_model_source(explicit_model_path: Option<&str>) -> Result<String>
 /// Download a model from HuggingFace Hub and return the local cache directory.
 ///
 /// Files are stored under `~/.cache/huggingface/hub/models--<org>--<repo>/snapshots/<sha>/`.
-/// Subsequent calls with the same model ID are served from cache (no re-download).
+/// Subsequent calls with the same model ID are served from cache.
 pub fn download_from_hub(model_id: &str) -> Result<PathBuf> {
     download_repo_assets_from_hub(model_id, true)
 }
@@ -181,7 +164,6 @@ fn download_repo_assets_from_hub(model_id: &str, include_weights: bool) -> Resul
     let api = build_api().context("failed to initialise HuggingFace API")?;
     let repo = api.repo(Repo::new(model_id.to_string(), RepoType::Model));
 
-    // Fetch repo metadata to discover which files exist.
     let info = repo
         .info()
         .with_context(|| format!("failed to fetch repo info for '{model_id}'"))?;
@@ -243,14 +225,13 @@ fn download_repo_assets_from_hub(model_id: &str, include_weights: bool) -> Resul
         }
     }
 
-    // ── derive local cache dir from the first downloaded file ─────────────
     let first = mandatory
         .iter()
         .find(|name| filenames.iter().any(|f| f == *name))
         .unwrap_or(&"config.json");
 
-    // `repo.get()` returns the full path to the cached file; its parent is
-    // the snapshot directory that contains all downloaded files.
+    // `repo.get()` returns the full cached-file path; its parent is the
+    // snapshot directory containing all downloaded files.
     let file_path = repo
         .get(first)
         .with_context(|| format!("failed to resolve cache path for '{first}'"))?;
@@ -262,8 +243,6 @@ fn download_repo_assets_from_hub(model_id: &str, include_weights: bool) -> Resul
     log::info!("Model '{}' ready at: {}", model_id, cache_dir.display());
     Ok(cache_dir)
 }
-
-// ── helpers ───────────────────────────────────────────────────────────────────
 
 pub fn build_api() -> Result<Api> {
     let mut builder = ApiBuilder::new();
@@ -344,17 +323,11 @@ fn parse_hf_model_id(model_id_or_path: &str) -> Option<(String, String)> {
 /// Heuristic: does the input *look like* a filesystem path rather than a
 /// HuggingFace repo id?
 ///
-/// Treated as path-like:
-/// - starts with `/`, `./`, `../`, or `~`
-/// - contains a backslash (Windows-style separator)
-/// - contains more than one forward slash (`a/b/c`)
+/// Path-like: starts with `/`, `./`, `../`, or `~`; contains `\`; or has more
+/// than one `/`. Repo-id (not path-like): bare name or single-slash `org/repo`.
 ///
-/// Treated as a repo id (not path-like):
-/// - bare name (`foo`)
-/// - single-slash `org/repo` form (`Qwen/Qwen3-0.6B`, `databricks/databricks-dolly-15k`)
-///
-/// Note: HuggingFace repo names can legitimately contain dots
-/// (`Qwen/Qwen3.5-4B`), so a dot alone does **not** mark the input as path-like.
+/// HuggingFace repo names can contain dots (`Qwen/Qwen3.5-4B`), so a dot alone
+/// does not mark the input as path-like.
 pub(crate) fn looks_like_local_path(input: &str) -> bool {
     let s = input.trim();
     if s.is_empty() {
@@ -397,8 +370,8 @@ fn is_weighted_model_dir(path: &Path) -> bool {
     };
 
     entries.filter_map(std::result::Result::ok).any(|entry| {
-        // HuggingFace snapshot directories commonly expose files as symlinks to
-        // the blob store, so use `Path::is_file()` instead of `DirEntry::file_type()`.
+        // HF snapshot dirs expose files as symlinks to the blob store, so use
+        // `Path::is_file()` (follows symlinks) instead of `DirEntry::file_type()`.
         if !entry.path().is_file() {
             return false;
         }
@@ -415,8 +388,8 @@ fn fetch_file(repo: &ApiRepo, filename: &str, model_id: &str) -> Result<PathBuf>
         .with_context(|| format!("failed to download '{filename}' from '{model_id}'"))
 }
 
-/// Returns true when there is a `.safetensors` counterpart for a `.bin` file.
-/// e.g. `model.bin` → looks for `model.safetensors` in the file list.
+/// Returns true when a `.safetensors` counterpart exists for a `.bin` file,
+/// e.g. `model.bin` → looks for `model.safetensors`.
 fn has_safetensors_twin(all: &[String], bin_file: &str) -> bool {
     let stem = bin_file.strip_suffix(".bin").unwrap_or(bin_file);
     let twin = format!("{stem}.safetensors");
@@ -499,7 +472,6 @@ mod tests {
 
     #[test]
     fn looks_like_local_path_classifies_paths() {
-        // Path-like: absolute, relative with ./ or ../, home, multiple slashes.
         assert!(looks_like_local_path("/does/not/exist"));
         assert!(looks_like_local_path("/tmp/models"));
         assert!(looks_like_local_path("./models"));
@@ -511,22 +483,16 @@ mod tests {
 
     #[test]
     fn looks_like_local_path_classifies_repo_ids() {
-        // HF repo ids (single slash, no leading special char) are NOT paths.
         assert!(!looks_like_local_path("Qwen/Qwen3-0.6B"));
         assert!(!looks_like_local_path("databricks/databricks-dolly-15k"));
         assert!(!looks_like_local_path("mlx-community/Qwen3-0.6B-4bit"));
-        // Dots are legal in HF repo names (e.g. Qwen3.5).
         assert!(!looks_like_local_path("Qwen/Qwen3.5-4B"));
-        // Bare name.
         assert!(!looks_like_local_path("Qwen3-0.6B"));
-        // Empty.
         assert!(!looks_like_local_path(""));
     }
 
     #[test]
     fn resolve_model_path_fails_fast_for_missing_local_path() {
-        // /definitely/does/not/exist/<pid> looks like an absolute path, so it
-        // must short-circuit without touching the network.
         let bogus = format!(
             "/definitely/does/not/exist-{}-{}",
             std::process::id(),

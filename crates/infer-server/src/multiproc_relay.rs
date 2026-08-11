@@ -108,11 +108,9 @@ const BROADCAST_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 /// and worker ranks. Only impl today is [`TcpChannel`]; the trait exists so a
 /// shm ring can plug in later without touching the loops.
 pub trait RelayChannel: Send {
-    /// Write one envelope to the peer.
     fn send(&mut self, envelope: &RelayEnvelope) -> Result<()>;
     /// Read one envelope; `Ok(None)` on clean peer EOF.
     fn recv(&mut self) -> Result<Option<RelayEnvelope>>;
-    /// Clone an independent handle over the same underlying connection.
     fn try_clone_channel(&self) -> Result<Box<dyn RelayChannel>>;
     /// Set a read timeout (used by the completion reader to poll for shutdown);
     /// `None` blocks indefinitely. Default is a no-op for transports without one.
@@ -196,15 +194,7 @@ impl RelayChannel for LocalChannelSend {
     }
 
     fn try_clone_channel(&self) -> Result<Box<dyn RelayChannel>> {
-        anyhow::bail!("LocalChannelSend is send-only; use clone_tx() instead")
-    }
-}
-
-impl LocalChannelSend {
-    /// Clone the underlying sender for use in spawned threads.
-    #[allow(dead_code)]
-    pub(crate) fn clone_tx(&self) -> std::sync::mpsc::SyncSender<RelayEnvelope> {
-        self.0.clone()
+        anyhow::bail!("LocalChannelSend is send-only and not cloneable")
     }
 }
 
@@ -436,7 +426,6 @@ impl WireStats {
         }
     }
 
-    /// Own the per-tick counters plus request-boundary operator stats for relay.
     pub fn from_counters(
         c: &crate::CounterSnapshot,
         build_identity: crate::BuildIdentity,
@@ -530,21 +519,17 @@ impl WireStats {
 /// at the boundary once the lockstep forward emits real tokens.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct RelayCompletionDelta {
-    /// Newly decoded text for this delta.
     pub text_delta: String,
-    /// Token ids newly emitted in this delta.
     pub token_ids: Vec<u32>,
     /// Generation-time behavior logprobs, one per `token_ids` entry — or empty
     /// when the executor did not capture them (greedy, non-CUDA arms). Serde
     /// default so pre-P6 workers interoperate.
     #[serde(default)]
     pub logprobs: Vec<f32>,
-    /// Whether this is the terminal delta for the request.
     pub finish: bool,
     /// Finish reason on the terminal delta, so the coordinator reports the real
     /// OpenAI `finish_reason` rather than always "stop".
     pub finish_reason: Option<infer_plan::FinishReason>,
-    /// Terminal failure message, if the request failed before a normal finish.
     pub error: Option<String>,
 }
 
@@ -640,9 +625,7 @@ pub struct WireRequest {
     pub request_id: u64,
     /// Prompt token ids (rank 0 tokenizes; workers receive the ids).
     pub prompt_tokens: Vec<u32>,
-    /// Newly generated token budget.
     pub max_tokens: usize,
-    /// Sampling parameters (rewrite [`SamplingParams`]).
     pub sampling: SamplingParams,
     /// Structured-output constraint, resolved into a matcher engine-side.
     #[serde(default)]
@@ -696,19 +679,16 @@ impl TickAckLedger {
         }
     }
 
-    /// A reader thread lost its rank (EOF / hard error).
     pub fn mark_dead(&self) {
         self.dead_ranks.fetch_add(1, Ordering::AcqRel);
     }
 
-    /// Whether any rank's reader has died since boot.
     #[must_use]
     pub fn any_dead(&self) -> bool {
         self.dead_ranks.load(Ordering::Acquire) > 0
     }
 
-    /// Record that `rank` consumed the tick with `seq`. Acks are monotonic per
-    /// rank; a stale/duplicate ack is a no-op (`fetch_max`).
+    /// Acks are monotonic per rank; a stale/duplicate ack is a no-op (`fetch_max`).
     pub fn ack(&self, rank: usize, seq: u64) {
         match self.per_rank.iter().find(|(r, _)| *r == rank) {
             Some((_, count)) => {

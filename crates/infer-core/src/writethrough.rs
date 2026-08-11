@@ -15,7 +15,7 @@
 //! The reps are computed at write-through time (R6) and kept resident in a capped
 //! pool (R1); the rep pool cap lives here as [`cap_rep_pool`].
 
-use crate::{RecallConfig, plan_recall};
+use crate::RecallConfig;
 
 /// Build the **prefetch query** (R3): the mean of the last `m` prompt tokens'
 /// query vectors — the "what am I about to generate" signal — instead of the
@@ -79,20 +79,6 @@ pub fn prefetch_blocks(reps: &[Vec<f32>], query: &[f32], top_k: usize) -> Vec<us
     idx
 }
 
-/// Convenience: turn a session's resident length + block scores into the recalled
-/// token ranges via [`plan_recall`]. This is the bridge the executor uses to write
-/// the prefill/decode page table (working set = sink u prefetched u local). Kept
-/// here so the write-through path has one entry point that already encodes the
-/// budget-bounded selection and the byte-identical full-range fallback.
-#[must_use]
-pub fn plan_working_set(
-    cache_len: usize,
-    block_scores: &[f32],
-    cfg: &RecallConfig,
-) -> crate::RecallPlan {
-    plan_recall(cache_len, block_scores, cfg)
-}
-
 /// Choose which resident device pages to **evict-drop** to fit the HBM page
 /// budget, honoring the sink/local pins.
 ///
@@ -124,18 +110,13 @@ pub fn evict_drop_pages(
     }
     let to_drop = n - budget_pages;
 
-    // Sink pins: the leading pages covering the first `n_init` tokens.
     let sink_pages = cfg.n_init.div_ceil(page_size);
-    // Local pins: the trailing pages covering the last `n_local` tokens (plus the
-    // current partial page). `local_start_token` is the first local token.
     let local_start_token = cache_len.saturating_sub(cfg.n_local);
     let first_local_page = local_start_token / page_size;
 
-    // Candidate (unpinned) page indices.
     let mut candidates: Vec<usize> = (0..n)
         .filter(|&i| i >= sink_pages && i < first_local_page)
         .collect();
-    // Coldest first: lowest last_access, ties break to the lower (older) page idx.
     candidates.sort_by(|&a, &b| {
         let sa = last_access.get(a).copied().unwrap_or(0);
         let sb = last_access.get(b).copied().unwrap_or(0);
@@ -162,7 +143,6 @@ pub fn cap_rep_pool(block_last_access: &[(usize, u64)], cap: usize) -> Vec<usize
     }
     let evict = block_last_access.len() - cap;
     let mut by_recency: Vec<(usize, u64)> = block_last_access.to_vec();
-    // Coldest first (lowest access), ties to lower block index.
     by_recency.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
     by_recency.truncate(evict);
     let mut dropped: Vec<usize> = by_recency.into_iter().map(|(b, _)| b).collect();
@@ -352,8 +332,8 @@ mod tests {
         // grow with cache_len — that is the invariant that matters.
         let c = cfg(16, 256, 32, 8);
         let scores = vec![0.0_f32; 200_000];
-        let a = plan_working_set(64_000, &scores, &c).token_count();
-        let b = plan_working_set(1_000_000, &scores, &c).token_count();
+        let a = crate::plan_recall(64_000, &scores, &c).token_count();
+        let b = crate::plan_recall(1_000_000, &scores, &c).token_count();
         assert_eq!(a, b, "working set is constant regardless of history length");
         assert!(
             b <= c.working_set_tokens() + c.l_bs,

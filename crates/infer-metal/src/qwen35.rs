@@ -548,7 +548,6 @@ fn register_qwen35_moe_layer(model: *mut std::ffi::c_void, moe: &MetalQwen35MoeW
     true
 }
 
-/// Owned C++ Qwen35 compiled model handle.
 pub(crate) struct CppQwen35Model {
     raw: *mut std::ffi::c_void,
 }

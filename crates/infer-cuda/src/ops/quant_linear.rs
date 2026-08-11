@@ -234,7 +234,6 @@ fn qwen_fp8_dense_route(
     n: usize,
     k: usize,
 ) -> qwen_fp8_dense_policy::Route {
-    let _ = qwen_fp8_dense_policy::POLICY_ID;
     if !qwen_fp8_dense_policy::HAS_EXACT_CELLS {
         return qwen_fp8_dense_policy::fallback(m);
     }

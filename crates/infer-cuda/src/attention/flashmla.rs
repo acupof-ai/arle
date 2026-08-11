@@ -337,10 +337,9 @@ impl Dsv4FlashMlaDecodeState {
 
     pub(crate) fn swap_out(
         &self,
-        ctx: &DeviceContext,
+        _ctx: &DeviceContext,
         _pool: &Dsv4LayerKvLayout,
     ) -> Result<crate::attention::Dsv4FlashMlaImage> {
-        let _ = ctx;
         Ok(crate::attention::Dsv4FlashMlaImage {
             fp8_kv_sw_bootstrapped: self.fp8_kv_sw_bootstrapped,
             fp8_kv_comp_packed_rows: self.fp8_kv_comp_packed_rows,
@@ -349,11 +348,10 @@ impl Dsv4FlashMlaDecodeState {
 
     pub(crate) fn swap_in(
         &mut self,
-        ctx: &DeviceContext,
+        _ctx: &DeviceContext,
         _pool: &mut Dsv4LayerKvLayout,
         image: &crate::attention::Dsv4FlashMlaImage,
     ) -> Result<()> {
-        let _ = ctx;
         self.fp8_kv_sw_bootstrapped = image.fp8_kv_sw_bootstrapped;
         self.fp8_kv_comp_packed_rows = image.fp8_kv_comp_packed_rows;
         Ok(())
@@ -579,7 +577,7 @@ pub(crate) struct Dsv4FlashMlaDecodeBatchScratch {
     pub(super) out_batched: CudaSlice<half::bf16>,
     /// `[max_batch, tp_world * local_heads * head_dim]` bf16 — TP all-gather
     /// landing buffer (TP path only). PHASE B: the gather loop uses the `[0,
-    /// tp_gather_cols)` slice per row (one row's allgather at a time), then
+    /// h_q_d)` slice per row (one row's allgather at a time), then
     /// repacks the global Q into `q_batched[r]`.
     pub(super) tp_gathered_q: CudaSlice<half::bf16>,
     /// `[max_batch, csa_topk]` i32 — CSA ONLY: the prepare loop gathers each
@@ -683,7 +681,6 @@ impl Dsv4FlashMlaDecodeBatchScratch {
         let h_q_d_v = h_q
             .checked_mul(d_v)
             .ok_or_else(|| anyhow!("DSv4 batched FlashMLA h_q*d_v overflow"))?;
-        let tp_gather_cols = h_q_d; // tp_world * local_heads * head_dim == global h_q * head_dim
         // Size the per-row page table for the WIDEST layer's band (CSA total_blocks);
         // narrower SW-only layers use a row_width prefix of this shared buffer.
         let max_total_blocks = layer_shapes
@@ -708,9 +705,7 @@ impl Dsv4FlashMlaDecodeBatchScratch {
             num_splits: ctx.stream.alloc_zeros::<i32>(max_batch + 1)?,
             q_batched: ctx.stream.alloc_zeros::<half::bf16>(max_batch * h_q_d)?,
             out_batched: ctx.stream.alloc_zeros::<half::bf16>(max_batch * h_q_d_v)?,
-            tp_gathered_q: ctx
-                .stream
-                .alloc_zeros::<half::bf16>(max_batch * tp_gather_cols)?,
+            tp_gathered_q: ctx.stream.alloc_zeros::<half::bf16>(max_batch * h_q_d)?,
             // CSA per-row top-k gather buffer. `config.index_topk` is the single
             // config-level top-k width every CSA layer uses (== a CSA layer's
             // `max_compressed_keys`), so one fixed row stride serves all CSA
