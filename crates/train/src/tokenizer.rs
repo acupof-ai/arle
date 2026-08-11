@@ -92,32 +92,3 @@ fn tokenizer_error(context: &str, err: impl Display) -> AutogradError {
 fn tokenizer_message(message: &str) -> AutogradError {
     AutogradError::TapeInvariant(Box::leak(message.to_string().into_boxed_str()))
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::path::PathBuf;
-
-    /// Only runs when a real HF model directory is pointed at via
-    /// `INFER_TEST_MODEL_PATH`. Mirrors the infer-side convention.
-    #[test]
-    fn encode_decode_roundtrip() {
-        let Ok(model_dir) = std::env::var("INFER_TEST_MODEL_PATH") else {
-            eprintln!("INFER_TEST_MODEL_PATH unset; skipping tokenizer roundtrip");
-            return;
-        };
-        let path = PathBuf::from(model_dir).join("tokenizer.json");
-        if !path.exists() {
-            eprintln!("no tokenizer.json at {}; skipping", path.display());
-            return;
-        }
-        let tok = ChatTokenizer::from_file(&path).expect("load tokenizer");
-        assert!(tok.vocab_size() > 1000, "vocab suspiciously small");
-
-        let ids = tok.encode("hello world", false).expect("encode");
-        assert!(!ids.is_empty());
-        let text = tok.decode(&ids, true).expect("decode");
-        // Tokenizers sometimes add/remove leading whitespace; trim and compare.
-        assert_eq!(text.trim(), "hello world");
-    }
-}

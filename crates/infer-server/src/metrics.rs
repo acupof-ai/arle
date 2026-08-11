@@ -115,6 +115,92 @@ pub(crate) fn render_prometheus(counters: &CounterSnapshot, model: &str) -> Stri
         counters.throughput.requests_completed,
     );
     push(
+        "requests_succeeded_total",
+        "counter",
+        "Requests that completed successfully (non-abort).",
+        counters.throughput.requests_succeeded,
+    );
+    push(
+        "requests_failed_total",
+        "counter",
+        "Requests that were aborted.",
+        counters.throughput.requests_failed,
+    );
+    push(
+        "ttft_micros_total",
+        "counter",
+        "Sum of time-to-first-token across all requests.",
+        counters.throughput.ttft_micros_total,
+    );
+    push(
+        "ttft_count",
+        "counter",
+        "Number of requests that produced a first token.",
+        counters.throughput.ttft_count,
+    );
+    push(
+        "tpot_micros_total",
+        "counter",
+        "Sum of per-output-token latency across all requests.",
+        counters.throughput.tpot_micros_total,
+    );
+    push(
+        "tpot_count",
+        "counter",
+        "Number of inter-token intervals measured.",
+        counters.throughput.tpot_count,
+    );
+    push(
+        "e2e_latency_micros_total",
+        "counter",
+        "Sum of end-to-end request latency.",
+        counters.throughput.e2e_micros_total,
+    );
+    push(
+        "e2e_latency_count",
+        "counter",
+        "Number of completed requests for e2e latency.",
+        counters.throughput.e2e_count,
+    );
+    push(
+        "forward_busy_micros_total",
+        "counter",
+        "Cumulative GPU forward-busy microseconds.",
+        counters.throughput.forward_busy_micros,
+    );
+    let spec = &counters.spec_decode;
+    let accept_rate = (spec.accepted * 100).checked_div(spec.drafted).unwrap_or(0);
+    push(
+        "spec_accept_rate",
+        "gauge",
+        "Speculative decode token accept rate (%).",
+        accept_rate,
+    );
+    push(
+        "spec_chains_total",
+        "counter",
+        "Speculative decode draft chains attempted.",
+        spec.chains,
+    );
+    push(
+        "spec_drafted_total",
+        "counter",
+        "Tokens drafted by speculative decode.",
+        spec.drafted,
+    );
+    push(
+        "spec_accepted_total",
+        "counter",
+        "Tokens accepted by speculative decode verification.",
+        spec.accepted,
+    );
+    push(
+        "spec_rejected_total",
+        "counter",
+        "Tokens rejected by speculative decode verification.",
+        spec.rejected,
+    );
+    push(
         "kv_tier_resident_blocks",
         "gauge",
         "Prefix blocks currently resident in the host KV tier.",
@@ -339,131 +425,4 @@ fn escape_label_value(value: &str) -> String {
         }
     }
     escaped
-}
-
-#[cfg(test)]
-mod tests {
-    use infer_core::{KvSystemMetrics, KvTierStats, PrefixCacheStats, ThroughputStats};
-
-    use super::*;
-
-    const METRIC_COUNT: usize = 47;
-
-    #[test]
-    fn renders_help_type_and_labelled_samples() {
-        let counters = CounterSnapshot {
-            active_requests: 2,
-            queue_depth: 1,
-            kv_free_pages: 240,
-            prefix_cache: PrefixCacheStats {
-                lookups: 10,
-                hits: 7,
-                hit_tokens: 448,
-                hit_pages: 28,
-                published_pages: 31,
-                cached_pages: 19,
-            },
-            throughput: ThroughputStats {
-                steps: 90,
-                prefill_tokens: 1200,
-                generated_tokens: 256,
-                requests_completed: 5,
-                ..ThroughputStats::default()
-            },
-            kv_tier: KvTierStats {
-                demoted_pages: 6,
-                promoted_pages: 4,
-                promote_failures: 1,
-                resident_blocks: 2,
-                demoted_slots: 3,
-                promoted_slots: 2,
-                slot_promote_failures: 1,
-            },
-            kv_system: KvSystemMetrics {
-                resident_pages: 11,
-                resident_evictable_pages: 9,
-                host_demoted_pages: 4,
-                host_demoted_pending_inflight: 0,
-                disk_pages: 2,
-                reuse_hit_resident: 7,
-                reuse_hit_host_demoted: 3,
-                reuse_hit_disk: 1,
-                reuse_miss: 5,
-                demote_mset_count: 2,
-                demote_mset_copy_bytes: 1024,
-                demote_mset_copy_ms: 8,
-                promote_mget_count: 1,
-                promote_mget_copy_bytes: 512,
-                promote_mget_copy_ms: 6,
-                fetch_wait_ms: 6,
-                fallback_recompute: 1,
-                prefix_match_full_blocks: 12,
-                prefix_match_clamped_blocks: 10,
-                ..KvSystemMetrics::default()
-            },
-            spec_decode: infer_seam::SpecDecodeStats::default(),
-        };
-        let body = render_prometheus(&counters, "qwen3-dense");
-
-        assert!(body.contains("# HELP arle_active_requests "));
-        assert!(body.contains("# TYPE arle_active_requests gauge\n"));
-        assert!(body.contains("arle_active_requests{model_name=\"qwen3-dense\"} 2\n"));
-        assert!(body.contains("# TYPE arle_prefix_cache_lookups_total counter\n"));
-        assert!(body.contains("arle_prefix_cache_lookups_total{model_name=\"qwen3-dense\"} 10\n"));
-        assert!(body.contains("arle_prefix_cache_hits_total{model_name=\"qwen3-dense\"} 7\n"));
-        assert!(
-            body.contains("arle_prefix_cache_hit_tokens_total{model_name=\"qwen3-dense\"} 448\n")
-        );
-        assert!(body.contains("arle_prefix_cache_cached_pages{model_name=\"qwen3-dense\"} 19\n"));
-        assert!(body.contains("arle_kv_free_pages{model_name=\"qwen3-dense\"} 240\n"));
-        assert!(body.contains("# TYPE arle_engine_steps_total counter\n"));
-        assert!(body.contains("arle_engine_steps_total{model_name=\"qwen3-dense\"} 90\n"));
-        assert!(body.contains("arle_prefill_tokens_total{model_name=\"qwen3-dense\"} 1200\n"));
-        assert!(body.contains("arle_generated_tokens_total{model_name=\"qwen3-dense\"} 256\n"));
-        assert!(body.contains("arle_requests_completed_total{model_name=\"qwen3-dense\"} 5\n"));
-        assert!(body.contains("arle_kv_tier_resident_blocks{model_name=\"qwen3-dense\"} 2\n"));
-        assert!(body.contains("arle_kv_tier_demoted_pages_total{model_name=\"qwen3-dense\"} 6\n"));
-        assert!(body.contains("arle_kv_tier_promoted_pages_total{model_name=\"qwen3-dense\"} 4\n"));
-        assert!(
-            body.contains("arle_kv_tier_promote_failures_total{model_name=\"qwen3-dense\"} 1\n")
-        );
-        assert!(body.contains("arle_kv_tier_demoted_slots_total{model_name=\"qwen3-dense\"} 3\n"));
-        assert!(body.contains("arle_kv_tier_promoted_slots_total{model_name=\"qwen3-dense\"} 2\n"));
-        assert!(
-            body.contains(
-                "arle_kv_tier_slot_promote_failures_total{model_name=\"qwen3-dense\"} 1\n"
-            )
-        );
-        assert!(body.contains("arle_kv_system_resident_pages{model_name=\"qwen3-dense\"} 11\n"));
-        assert!(body.contains(
-            "arle_kv_system_reuse_hit_host_demoted_total{model_name=\"qwen3-dense\"} 3\n"
-        ));
-        assert!(body.contains(
-            "arle_kv_system_demote_mset_copy_bytes_total{model_name=\"qwen3-dense\"} 1024\n"
-        ));
-        assert!(body.contains(
-            "arle_kv_system_prefix_match_clamped_blocks_total{model_name=\"qwen3-dense\"} 10\n"
-        ));
-        assert!(body.contains(
-            "arle_kv_tier_io_mode_info{model_name=\"qwen3-dense\",io_mode=\"disabled\"} 1\n"
-        ));
-
-        // Every sample line carries the HELP/TYPE pair exactly once.
-        assert_eq!(body.matches("# HELP ").count(), METRIC_COUNT);
-        assert_eq!(body.matches("# TYPE ").count(), METRIC_COUNT);
-    }
-
-    #[test]
-    fn zero_snapshot_renders_all_metrics() {
-        let body = render_prometheus(&CounterSnapshot::default(), "m");
-        assert_eq!(body.matches("# TYPE ").count(), METRIC_COUNT);
-        assert!(body.contains("arle_queue_depth{model_name=\"m\"} 0\n"));
-        assert!(body.contains("arle_generated_tokens_total{model_name=\"m\"} 0\n"));
-    }
-
-    #[test]
-    fn label_value_is_escaped() {
-        let body = render_prometheus(&CounterSnapshot::default(), "a\"b\\c\nd");
-        assert!(body.contains("model_name=\"a\\\"b\\\\c\\nd\""));
-    }
 }

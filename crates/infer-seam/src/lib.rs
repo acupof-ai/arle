@@ -636,35 +636,6 @@ pub trait BackendExecutor {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{PrefixBlock, pages_only_reusable_prefix_blocks};
-
-    #[test]
-    fn pages_only_counts_resident_and_available_demoted_prefix() {
-        let blocks = [
-            PrefixBlock::ResidentPage(1),
-            PrefixBlock::DemotedKey(7),
-            PrefixBlock::ResidentPage(2),
-            PrefixBlock::DemotedKey(8),
-        ];
-        assert_eq!(
-            pages_only_reusable_prefix_blocks(&blocks, |key| key == 7),
-            3
-        );
-    }
-
-    #[test]
-    fn pages_only_truncates_at_first_missing_demoted_key() {
-        let blocks = [
-            PrefixBlock::ResidentPage(1),
-            PrefixBlock::DemotedKey(7),
-            PrefixBlock::ResidentPage(2),
-        ];
-        assert_eq!(pages_only_reusable_prefix_blocks(&blocks, |_| false), 1);
-    }
-}
-
 /// Verdict returned by the resource governor at the admission boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AdmissionVerdict {

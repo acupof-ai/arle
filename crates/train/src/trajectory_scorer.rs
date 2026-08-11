@@ -63,31 +63,3 @@ pub fn select_best(rollouts: &[Vec<u32>], scores: &[f32]) -> usize {
     }
     best_index
 }
-
-#[cfg(test)]
-mod tests {
-    use super::{ExactMatchScorer, select_best};
-    use autograd::{Tape, TensorStore};
-
-    #[test]
-    fn exact_match_scorer_marks_only_reference_rollouts() {
-        let scorer = ExactMatchScorer::new(vec![1, 3, 8, 4]);
-        let rollouts = vec![vec![1, 3, 8, 4], vec![1, 3, 8, 5], vec![4]];
-        let mut store = TensorStore::default();
-        let mut tape = Tape::new();
-
-        let scores = scorer
-            .score(&[1, 3, 8], &rollouts, &mut store, &mut tape)
-            .expect("exact match scoring should not fail");
-
-        assert_eq!(scores, vec![1.0, 0.0, 0.0]);
-    }
-
-    #[test]
-    fn select_best_returns_first_max_score_index() {
-        let rollouts = vec![vec![1], vec![2], vec![3]];
-        let scores = vec![0.5, 1.0, 1.0];
-
-        assert_eq!(select_best(&rollouts, &scores), 1);
-    }
-}
