@@ -18,7 +18,7 @@ mod qwen_fp8_dense_policy {
 /// Pre-Hopper dequant→BF16-cuBLAS floor. Stays at the old 16: that path pays a
 /// full weight dequant (1 read + 2 bf16 writes) per call, so tiny M belongs on
 /// the GEMV there even though Hopper's DeepGEMM lane wins from M=2.
-const QWEN_FP8_DEQUANT_GEMM_MIN_M: usize = 2;
+const QWEN_FP8_DEQUANT_GEMM_MIN_M: usize = 100000;
 
 #[derive(Default)]
 struct QwenFp8DenseScratch {
