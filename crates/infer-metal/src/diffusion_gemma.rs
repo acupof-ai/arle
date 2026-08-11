@@ -159,9 +159,8 @@ impl QuantRegistry {
             };
         };
 
-        let read_qc = |value: &serde_json::Value| -> Option<QuantConfig> {
-            let object = value.as_object()?;
-            Some(QuantConfig {
+        let read_qc = |object: &serde_json::Map<String, serde_json::Value>| -> QuantConfig {
+            QuantConfig {
                 group_size: object
                     .get("group_size")
                     .and_then(serde_json::Value::as_i64)
@@ -171,23 +170,13 @@ impl QuantRegistry {
                     .and_then(serde_json::Value::as_i64)
                     .map_or(4, |n| n as i32),
                 per_weight: std::sync::Arc::new(HashMap::new()),
-            })
+            }
         };
 
-        let default = Some(QuantConfig {
-            group_size: obj
-                .get("group_size")
-                .and_then(serde_json::Value::as_i64)
-                .map_or(64, |n| n as i32),
-            bits: obj
-                .get("bits")
-                .and_then(serde_json::Value::as_i64)
-                .map_or(4, |n| n as i32),
-            per_weight: std::sync::Arc::new(HashMap::new()),
-        });
+        let default = Some(read_qc(obj));
         let overrides = obj
             .iter()
-            .filter_map(|(key, value)| read_qc(value).map(|qc| (key.clone(), qc)))
+            .filter_map(|(key, value)| value.as_object().map(|o| (key.clone(), read_qc(o))))
             .collect();
         Self { default, overrides }
     }

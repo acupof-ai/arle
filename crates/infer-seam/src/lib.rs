@@ -53,9 +53,7 @@ pub use runtime_flags::{CommBackend, CudaRuntimeFlags, MetalRuntimeFlags};
 /// Result of polling a submitted executor step.
 #[derive(Debug, Clone)]
 pub enum PollResult<I> {
-    /// The executor step finished and produced host-visible tokens.
     Ready(StepOutput),
-    /// The executor step is still in flight and should be polled again.
     NotReady(I),
 }
 
@@ -130,13 +128,9 @@ pub fn pages_only_reusable_prefix_blocks(
 /// accept-commit path — no device sync involved.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SpecDecodeStats {
-    /// Verified draft chains (one per spec step that reached verify).
     pub chains: u64,
-    /// Draft tokens proposed across all chains (excludes the anchor/bonus).
     pub drafted: u64,
-    /// Draft tokens accepted by verify.
     pub accepted: u64,
-    /// Draft tokens rejected by verify (`drafted = accepted + rejected`).
     pub rejected: u64,
     /// Chains drafted from a partial (base > 0) draft context — the
     /// partial-ctx share after a rebase/prefix-restore gap.
@@ -188,11 +182,9 @@ pub trait BackendExecutor {
     /// Opaque backend-owned in-flight handle.
     type Inflight;
 
-    /// Submit a forward plan for asynchronous or synchronous execution.
     fn submit(&mut self, plan: &ForwardPlan, kv: &mut dyn KvPool)
     -> anyhow::Result<Self::Inflight>;
 
-    /// Poll an in-flight forward step for completion.
     fn poll(&mut self, inflight: Self::Inflight) -> anyhow::Result<PollResult<Self::Inflight>>;
 
     /// Advance completed backend work that is independent of the active
@@ -201,7 +193,6 @@ pub trait BackendExecutor {
         Ok(())
     }
 
-    /// Perform optional backend warmup before serving.
     fn warmup(&mut self) -> anyhow::Result<()> {
         Ok(())
     }
@@ -215,19 +206,14 @@ pub trait BackendExecutor {
         Vec::new()
     }
 
-    /// Cumulative speculative-decode counters. Default all-zero for backends
-    /// (or configs) without spec decode.
     fn spec_decode_stats(&self) -> SpecDecodeStats {
         SpecDecodeStats::default()
     }
 
-    /// Cumulative operator dispatch counters and the identities that selected
-    /// them. Default empty until a backend family adopts generated policy.
     fn operator_dispatch_stats(&self) -> OperatorDispatchStats {
         OperatorDispatchStats::default()
     }
 
-    /// Exact backend artifact identity, if the build verified one.
     fn artifact_identity(&self) -> BackendArtifactIdentity {
         BackendArtifactIdentity::default()
     }
@@ -658,20 +644,16 @@ mod tests {
 /// Verdict returned by the resource governor at the admission boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AdmissionVerdict {
-    /// Admit waiting work normally.
     Admit,
     /// Admit nothing this tick (memory pressure, foreground contention, …).
     Hold,
-    /// Shed running work down to at most `n` concurrent requests.
     ShedTo(usize),
 }
 
 /// Per-tick GPU work budget the engine must respect to stay an OS good citizen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StepBudget {
-    /// Upper bound on tokens to process this tick.
     pub max_tokens: usize,
-    /// Soft wall-clock budget for this tick, in microseconds.
     pub max_micros: u64,
 }
 
@@ -693,13 +675,10 @@ impl StepBudget {
 /// headroom + foreground/battery; CUDA: nvml free VRAM; AMD APU: unified-memory
 /// pressure).
 pub trait ResourceGovernor {
-    /// May the engine admit more waiting work right now?
     fn admission_gate(&self) -> AdmissionVerdict;
 
-    /// How much GPU work may this tick do without harming foreground UX?
     fn step_budget(&self) -> StepBudget;
 
-    /// Should the engine back off this tick to keep the OS responsive?
     fn should_yield(&self) -> bool;
 }
 
@@ -739,8 +718,6 @@ pub struct CooperativeGovernor {
 }
 
 impl CooperativeGovernor {
-    /// Build a governor that admits normally, enforces `budget`, and never
-    /// voluntarily yields unless [`Self::with_yield_every_ticks`] is used.
     #[must_use]
     pub fn new(budget: StepBudget) -> Self {
         Self {
@@ -751,7 +728,6 @@ impl CooperativeGovernor {
         }
     }
 
-    /// Override the admission verdict returned at scheduler admission.
     #[must_use]
     pub fn with_admission(mut self, admission: AdmissionVerdict) -> Self {
         self.admission = admission;

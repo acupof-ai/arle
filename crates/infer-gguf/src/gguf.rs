@@ -1,13 +1,13 @@
 //! GGUF v2/v3 reader over memmap.
 //!
-//! Format pinned against `/tmp/arle-hip-scan/llama.cpp/ggml/include/gguf.h`
-//! lines 1-46: magic "GGUF" (4 bytes), version u32, tensor count i64,
-//! kv count i64; strings = u64 length + bytes; enums i32; bool i8; arrays =
-//! elem type i32 + count u64 + payload; tensor info = name + n_dims u32 +
-//! dims i64 each + ggml type i32 + data offset u64; data blob aligned to
-//! `general.alignment` (default 32, gguf.h:44-46). v2 and v3 share this
-//! layout (v3 only adds big-endian variants, which we reject by magic);
-//! only the pre-v2 v1 used u32 lengths and is unsupported here.
+//! Format pinned against llama.cpp's `gguf.h` (lines 1-46). The header is
+//! magic "GGUF" (4 bytes), version u32, tensor count i64, kv count i64.
+//! Strings are u64 length + bytes; enums i32; bool i8. Arrays are elem
+//! type i32 + count u64 + payload. Tensor info is name + n_dims u32 +
+//! dims i64 each + ggml type i32 + data offset u64. The data blob is
+//! aligned to `general.alignment` (default 32, gguf.h:44-46). v2 and v3
+//! share this layout (v3 only adds big-endian variants, which we reject
+//! by magic); only the pre-v2 v1 used u32 lengths and is unsupported.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -17,7 +17,7 @@ use anyhow::{Context, Result, anyhow, bail, ensure};
 pub const GGUF_DEFAULT_ALIGNMENT: u64 = 32;
 
 /// GGML tensor dtypes, ids pinned against `enum ggml_type`
-/// `/tmp/arle-hip-scan/llama.cpp/ggml/include/ggml.h:389-433`.
+/// (llama.cpp ggml.h:389-433).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum GgmlType {
     F32,
@@ -287,7 +287,7 @@ impl<'a> Reader<'a> {
                     count <= self.buf.len() as u64,
                     "GGUF array count {count} exceeds file"
                 );
-                let out: Vec<_> = (0..count)
+                let out = (0..count)
                     .map(|_| self.value(elem_type, depth + 1))
                     .collect::<Result<Vec<_>>>()?;
                 GgufValue::Array(out)
@@ -352,7 +352,7 @@ impl GgufFile {
             let name = r.string()?;
             let n_dims = r.u32()?;
             ensure!(n_dims <= 4, "tensor {name}: {n_dims} dims > GGML_MAX_DIMS");
-            let dims: Vec<u64> = (0..n_dims).map(|_| r.u64()).collect::<Result<Vec<_>>>()?;
+            let dims = (0..n_dims).map(|_| r.u64()).collect::<Result<Vec<_>>>()?;
             let ggml_type = GgmlType::from_id(r.u32()?)?;
             let offset = r.u64()?;
             index.insert(name.clone(), i as usize);
@@ -553,7 +553,7 @@ mod tests {
 
     #[test]
     fn synthetic_roundtrip_metadata_and_tensors() {
-        let f32_data: Vec<u8> = (0..8).flat_map(|i| (i as f32).to_le_bytes()).collect();
+        let f32_data = (0..8).flat_map(|i| (i as f32).to_le_bytes()).collect();
         let q8_block = vec![0u8; 34];
         let path = write_to_temp(
             &[

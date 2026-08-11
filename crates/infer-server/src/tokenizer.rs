@@ -20,7 +20,6 @@ use tokenizers::pre_tokenizers::byte_level::ByteLevel;
 use crate::schema::ChatContent;
 use crate::schema::ChatMessage;
 
-/// How `render_chat` produces the prompt, resolved once at load time.
 #[derive(Clone, Debug)]
 enum ChatTemplate {
     /// The checkpoint's own Jinja `chat_template`, rendered with the standard
@@ -58,7 +57,6 @@ pub struct IncrementalDetokenizer {
 const MAX_PENDING_TOKENS: usize = 4;
 
 impl IncrementalDetokenizer {
-    /// Text that is safe to emit now. Empty while a codepoint is in progress.
     pub fn push(&mut self, tok: &OpenAiTokenizer, ids: &[u32]) -> String {
         self.pending.extend_from_slice(ids);
         let text = tok.decode(&self.pending).unwrap_or_default();
@@ -89,7 +87,6 @@ impl IncrementalDetokenizer {
     }
 }
 
-/// Tokenizer and chat-template adapter for the OpenAI v1 facade.
 #[derive(Clone)]
 pub struct OpenAiTokenizer {
     inner: Tokenizer,
@@ -163,7 +160,6 @@ impl OpenAiTokenizer {
         Ok(encoding.get_ids().to_vec())
     }
 
-    /// Decode token ids into text, skipping special tokens.
     /// Vocabulary indexed by token id, for grammar-compiler construction.
     /// Holes (ids the vocab map skips) come back empty.
     pub fn vocab_by_id(&self) -> Vec<String> {
@@ -176,6 +172,7 @@ impl OpenAiTokenizer {
         out
     }
 
+    /// Decode token ids into text, skipping special tokens.
     pub fn decode(&self, token_ids: &[u32]) -> Result<String> {
         self.inner
             .decode(token_ids, true)
@@ -203,7 +200,6 @@ impl OpenAiTokenizer {
         matches!(self.template, ChatTemplate::BuiltinDeepseekV4)
     }
 
-    /// Render OpenAI chat messages into the model's prompt form.
     pub fn render_chat(&self, messages: &[ChatMessage]) -> Result<String> {
         self.render_chat_with_kwargs(messages, None)
     }
@@ -287,7 +283,6 @@ fn needs_system_hoist(messages: &[ChatMessage]) -> bool {
         .any(|m| m.role == "system")
 }
 
-/// All system messages first (original order), then the rest (original order).
 fn hoist_system_first(messages: &[ChatMessage]) -> Vec<ChatMessage> {
     messages
         .iter()
@@ -532,7 +527,6 @@ fn extract_chat_template(cfg: &serde_json::Value) -> Option<String> {
     }
 }
 
-/// `bos_token`/`eos_token` is a bare string or an AddedToken `{content: …}`.
 fn extract_token(cfg: &serde_json::Value, key: &str) -> Option<String> {
     match cfg.get(key)? {
         serde_json::Value::String(s) => Some(s.clone()),

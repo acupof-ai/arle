@@ -6,20 +6,16 @@
 
 use crate::error::{Result, bail};
 
-/// How per-expert router logits become selection scores. [`Self::scoring_kind`]
-/// matches the CUDA `dsv4_route` `scoring_kind` arg (0/1/2).
+/// [`Self::scoring_kind`] matches the CUDA `dsv4_route` `scoring_kind` arg (0/1/2).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ScoringFunc {
-    /// `scores = stable_softmax(logits)` over all experts.
     Softmax,
-    /// `scores[e] = sigmoid(logits[e])` (independent per expert).
     Sigmoid,
     /// `scores[e] = sqrt(softplus(logits[e]))` (DeepSeek-V4 `sqrtsoftplus`).
     SqrtSoftplus,
 }
 
 impl ScoringFunc {
-    /// Parse the legacy `scoring_func` config string.
     pub fn from_config_str(s: &str) -> Result<Self> {
         match s {
             "softmax" => Ok(Self::Softmax),
@@ -40,23 +36,18 @@ impl ScoringFunc {
     }
 }
 
-/// How the top-k experts are selected from the per-expert scores.
-///
 /// - [`TopkMethod::Greedy`]: plain top-k over the scores (Qwen3.6).
 /// - [`TopkMethod::NoAuxTc`]: DSv4 no-aux-loss top-k — selection uses the
 ///   bias-corrected key `scores[e] + bias[e]`, the weight reads un-biased
 ///   `scores[e]`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum TopkMethod {
-    /// Top-k directly over the scores (Qwen3.6).
     Greedy,
-    /// No-aux-loss top-k with score-correction bias (DSv4 `noaux_tc`).
     NoAuxTc,
 }
 
 impl TopkMethod {
-    /// Parse the legacy `topk_method` config string. DSv4 ships `"noaux_tc"`;
-    /// any plain greedy method maps to [`TopkMethod::Greedy`].
+    /// DSv4 ships `"noaux_tc"`; any plain greedy method maps to [`TopkMethod::Greedy`].
     pub fn from_config_str(s: &str) -> Result<Self> {
         match s {
             "noaux_tc" => Ok(Self::NoAuxTc),
@@ -66,10 +57,9 @@ impl TopkMethod {
     }
 }
 
-/// Device-independent description of one MoE block's router.
 #[derive(Clone, Debug, PartialEq)]
 pub struct MoeConfig {
-    /// Number of routed experts (one router logit each).
+    /// Routed experts (one router logit each).
     pub num_experts: usize,
     /// Always-on shared experts run for every token (Qwen3.6 = 1). They do not
     /// route; see [`MoeConfig::has_shared_expert`].
@@ -78,7 +68,6 @@ pub struct MoeConfig {
     pub top_k: usize,
     /// Scoring function; the selection bias presence comes from `topk_method`.
     pub scoring_func: ScoringFunc,
-    /// Top-k selection rule (`noaux_tc` vs greedy).
     pub topk_method: TopkMethod,
     /// Renormalize the selected top-k weights to sum to 1.
     ///
@@ -100,8 +89,8 @@ pub struct MoeConfig {
 }
 
 impl MoeConfig {
-    /// Qwen3.6 router config: softmax, greedy top-k, no bias, scaling 1.0, one
-    /// sigmoid-gated shared expert, optional `norm_topk_prob`.
+    /// Qwen3.6 router: softmax, greedy top-k, no bias, scaling 1.0, one
+    /// sigmoid-gated shared expert.
     #[must_use]
     pub fn qwen36(
         num_experts: usize,
@@ -123,10 +112,9 @@ impl MoeConfig {
         }
     }
 
-    /// DeepSeek-V4 router config: `sqrtsoftplus` scoring, `noaux_tc` top-k
-    /// (selection bias is a runtime gate tensor, not a config field), config
-    /// `routed_scaling_factor`, `n_shared_experts` always-on. DSv4-Flash ships
-    /// no group-limited routing, so `n_group`/`topk_group` stay `None`.
+    /// DSv4 router: `sqrtsoftplus` scoring, `noaux_tc` top-k (selection bias is
+    /// a runtime gate tensor, not a config field), config `routed_scaling_factor`,
+    /// `n_shared_experts` always-on. DSv4-Flash ships no group-limited routing.
     #[must_use]
     pub fn dsv4(
         num_experts: usize,
@@ -151,13 +139,11 @@ impl MoeConfig {
         }
     }
 
-    /// Whether at least one always-on shared expert runs for every token.
     #[must_use]
     pub fn has_shared_expert(&self) -> bool {
         self.num_shared_experts > 0
     }
 
-    /// Validate the config (experts > 0, valid top_k, consistent group fields).
     pub fn validate(&self) -> Result<()> {
         if self.num_experts == 0 {
             bail!("MoE config requires num_experts > 0");

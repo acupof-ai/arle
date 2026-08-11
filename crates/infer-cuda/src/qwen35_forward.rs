@@ -160,7 +160,7 @@ impl Qwen35Model {
         requested: usize,
         extra_per_slot_bytes: usize,
     ) -> Result<usize> {
-        const MEM_FRACTION: f64 = 0.9;
+        const MEM_FRACTION: f64 = 0.7;
         let (per_slot, kv_bytes, gdr_bytes, conv_bytes) = self.per_slot_kv_bytes();
         let per_slot = per_slot.saturating_add(extra_per_slot_bytes);
         let affordable_local: i32 = match cudarc::driver::result::mem_get_info() {

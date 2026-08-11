@@ -20,7 +20,6 @@ pub enum KvCacheDtype {
     /// other backends keep their established default (CUDA: BF16).
     #[default]
     Auto,
-    /// Native BF16 / model-dtype KV cache.
     Bf16,
     /// INT8 KV cache. Metal uses MLX affine 8-bit groups; CUDA support is a
     /// separate backend implementation detail and must not be silently assumed.
@@ -32,7 +31,6 @@ pub enum KvCacheDtype {
 }
 
 impl KvCacheDtype {
-    /// Stable lowercase label for logs and gate report lines.
     #[must_use]
     pub fn label(self) -> &'static str {
         match self {

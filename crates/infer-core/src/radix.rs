@@ -21,7 +21,6 @@ pub struct PrefixMatch {
 }
 
 impl PrefixMatch {
-    /// Return an empty prefix match.
     #[must_use]
     pub fn empty() -> Self {
         Self {
@@ -30,7 +29,6 @@ impl PrefixMatch {
         }
     }
 
-    /// Return whether this match contains at least one cached block.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.block_ids.is_empty()
@@ -56,7 +54,6 @@ pub struct RadixCache {
     /// before appending, bounding `nodes` growth to the live-node high-water.
     free: Vec<usize>,
     page_to_node: BTreeMap<BlockId, usize>,
-    /// Demoted blocks: backend tier key -> node index.
     tier_to_node: BTreeMap<u64, usize>,
     /// Tier keys invalidated by sever/revive since the last drain. The engine
     /// drains these after every cache mutation batch and forwards them to
@@ -126,19 +123,16 @@ impl RadixCache {
         }
     }
 
-    /// Return the number of tokens in one cached block.
     #[must_use]
     pub fn block_size(&self) -> usize {
         self.block_size
     }
 
-    /// Return the number of cached full blocks.
     #[must_use]
     pub fn cached_page_count(&self) -> usize {
         self.page_to_node.len()
     }
 
-    /// Return the number of blocks currently demoted to the host tier.
     #[must_use]
     pub fn demoted_block_count(&self) -> usize {
         self.tier_to_node.len()
@@ -330,7 +324,6 @@ impl RadixCache {
         true
     }
 
-    /// Whether any node in `idx`'s subtree (inclusive) holds a device page.
     fn subtree_has_resident(&self, idx: usize) -> bool {
         if self.nodes[idx].page_id.is_some() {
             return true;
@@ -429,7 +422,6 @@ impl RadixCache {
         newly_cached
     }
 
-    /// Mark cached blocks as attached to an active slot.
     pub fn retain_blocks(&mut self, pages: &[BlockId]) {
         for page_id in pages {
             if let Some(&node_idx) = self.page_to_node.get(page_id) {
@@ -440,7 +432,6 @@ impl RadixCache {
         }
     }
 
-    /// Release active-slot refs for cached blocks.
     pub fn release_blocks(&mut self, pages: &[BlockId]) {
         for page_id in pages {
             if let Some(&node_idx) = self.page_to_node.get(page_id) {

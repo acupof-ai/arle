@@ -3,10 +3,8 @@
 
 use std::fmt;
 
-/// Crate-local result alias.
 pub type Result<T> = std::result::Result<T, TopoError>;
 
-/// A topology/sharding configuration error (an owned message string).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TopoError(pub(crate) String);
 
@@ -15,8 +13,6 @@ impl TopoError {
         Self(msg.into())
     }
 
-    /// The error message.
-    #[must_use]
     pub fn message(&self) -> &str {
         &self.0
     }

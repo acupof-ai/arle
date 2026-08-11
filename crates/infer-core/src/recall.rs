@@ -25,7 +25,6 @@ pub struct RecallConfig {
 }
 
 impl RecallConfig {
-    /// Tokens the working set occupies when recall is active.
     #[must_use]
     pub fn working_set_tokens(&self) -> usize {
         self.n_init + self.n_local + self.top_k * self.l_bs
@@ -45,7 +44,6 @@ pub struct RecallPlan {
 }
 
 impl RecallPlan {
-    /// Total tokens the plan attends (sum of range widths).
     #[must_use]
     pub fn token_count(&self) -> usize {
         self.ranges.iter().map(|&(s, e)| e - s).sum()
@@ -73,7 +71,6 @@ impl RecallPlan {
 /// has no evictable middle (so the default path is byte-identical to today).
 #[must_use]
 pub fn plan_recall(cache_len: usize, block_scores: &[f32], cfg: &RecallConfig) -> RecallPlan {
-    // Too short to evict anything, or recall disabled → keep everything resident.
     if cfg.l_bs == 0 || cache_len <= cfg.n_init + cfg.n_local + cfg.l_bs {
         return RecallPlan::all_resident(cache_len);
     }
@@ -81,7 +78,6 @@ pub fn plan_recall(cache_len: usize, block_scores: &[f32], cfg: &RecallConfig) -
     let mid_span = cache_len - cfg.n_init - cfg.n_local;
     let nb = mid_span / cfg.l_bs; // whole middle blocks
     if nb == 0 || cfg.top_k >= nb {
-        // Nothing to evict (or recall budget covers every middle block) → resident.
         return RecallPlan::all_resident(cache_len);
     }
     let local_start = mid_lo + nb * cfg.l_bs; // tail (n_local + partial block) is local

@@ -34,7 +34,6 @@ const RESERVE_CAP_FRACTION: f64 = 0.5;
 /// and the per-unit cost — the shared top-of-stack of every backend's budget.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SlotBudget {
-    /// Bytes available for slots/pages after the fixed reservation.
     pub budget_bytes: usize,
     /// Bytes consumed per slot (or per KV token, for page-framed backends).
     pub per_unit_bytes: usize,

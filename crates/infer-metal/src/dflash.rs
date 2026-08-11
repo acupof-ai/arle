@@ -1212,7 +1212,6 @@ fn prepare_draft_block_mtp(
     input_tokens[0] = current_token;
     let mut prev_token = current_token;
 
-    // Produce block_size - 1 draft tokens, chaining hidden across steps.
     for slot in input_tokens.iter_mut().skip(1) {
         let noise_embedding = embed_token_rows(embed_table, &[prev_token]);
         let draft_hidden = runtime.forward_draft(&noise_embedding, &step_hidden, draft_state)?;

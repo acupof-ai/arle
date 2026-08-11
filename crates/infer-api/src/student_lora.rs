@@ -16,7 +16,6 @@ use infer_cuda::{
     StudentLoraUpdate,
 };
 
-/// Which half of a LoRA pair an adapter tensor is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LoraHalf {
     A,

@@ -5,17 +5,13 @@
 
 use crate::error::{Result, bail};
 
-/// Tensor parallel configuration: one rank's placement in the TP group.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TpConfig {
-    /// Total number of TP ranks (GPUs in the tensor-parallel group).
     pub world_size: usize,
-    /// This rank's index within the TP group (`0 <= rank < world_size`).
     pub rank: usize,
 }
 
 impl TpConfig {
-    /// Single-GPU configuration (no parallelism).
     #[must_use]
     pub fn single() -> Self {
         Self {
@@ -24,8 +20,6 @@ impl TpConfig {
         }
     }
 
-    /// Multi-GPU configuration.
-    ///
     /// # Errors
     /// Errors if `world_size == 0` or `rank >= world_size`.
     pub fn new(world_size: usize, rank: usize) -> Result<Self> {
@@ -38,14 +32,11 @@ impl TpConfig {
         Ok(Self { world_size, rank })
     }
 
-    /// True when running on a single GPU (no all-reduce needed).
     #[must_use]
     pub fn is_single(&self) -> bool {
         self.world_size == 1
     }
 
-    /// Validate the configuration.
-    ///
     /// # Errors
     /// Errors if `world_size == 0` or `rank >= world_size`.
     pub fn validate(&self) -> Result<()> {
@@ -58,8 +49,6 @@ impl TpConfig {
         Ok(())
     }
 
-    /// Parse tensor-parallel rank placement from environment.
-    ///
     /// Primary names match the serving binary; `ARLE_*` aliases keep the
     /// lower-level runtime scripts usable while DSv4 bring-up is still moving.
     ///
@@ -82,41 +71,32 @@ impl Default for TpConfig {
     }
 }
 
-/// Describes a rank's slice of a dimension of size `total`.
-///
 /// The rank owns `self.size` elements starting at `self.offset`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ShardingSpec {
-    /// Starting index of this rank's shard.
     pub offset: usize,
-    /// Number of elements owned by this rank.
     pub size: usize,
-    /// Total size of the dimension (sum of all ranks' sizes).
     pub total: usize,
 }
 
 impl ShardingSpec {
-    /// Exclusive end index: `offset + size`.
     #[must_use]
     pub fn end(&self) -> usize {
         self.offset + self.size
     }
 
-    /// Return the range as a [`std::ops::Range`].
     #[must_use]
     pub fn range(&self) -> std::ops::Range<usize> {
         self.offset..self.end()
     }
 
-    /// True if this rank owns the entire dimension (single-GPU case).
     #[must_use]
     pub fn is_full(&self) -> bool {
         self.offset == 0 && self.size == self.total
     }
 }
 
-/// Compute the shard for a **column-parallel** dimension (output features split
-/// across TP ranks).
+/// Column-parallel shard (output features split across TP ranks).
 ///
 /// The last rank absorbs any remainder so that `sum(all sizes) == total`.
 ///
@@ -131,7 +111,6 @@ pub fn column_shard(total: usize, tp: &TpConfig) -> ShardingSpec {
     );
     let base = total / tp.world_size;
     let remainder = total % tp.world_size;
-    // Distribute remainder to the last rank.
     let offset = tp.rank * base;
     let size = if tp.rank == tp.world_size - 1 {
         base + remainder
@@ -145,8 +124,7 @@ pub fn column_shard(total: usize, tp: &TpConfig) -> ShardingSpec {
     }
 }
 
-/// Compute the shard for a **row-parallel** dimension (input features split
-/// across TP ranks).
+/// Row-parallel shard (input features split across TP ranks).
 ///
 /// Identical formula to [`column_shard`] — differs only in semantic interpretation.
 ///
@@ -207,11 +185,9 @@ pub fn head_shard(
     }
     let local_q = num_q_heads / world;
     if num_kv_heads.is_multiple_of(world) {
-        // Shard regime (covers the equal case): byte-identical to the legacy path.
         return Ok((local_q, num_kv_heads / world));
     }
     if num_kv_heads != 0 && world.is_multiple_of(num_kv_heads) {
-        // Replicate regime: one KV head per rank, replicated `world/kv` ways.
         return Ok((local_q, 1));
     }
     bail!(
@@ -247,7 +223,6 @@ pub fn kv_load_block_index(num_kv_heads: usize, tp: &TpConfig) -> Result<usize> 
     )
 }
 
-/// Type of parallel linear layer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ParallelLinearKind {
     /// Split output dimension across TP ranks; all-reduce result.
@@ -256,19 +231,16 @@ pub enum ParallelLinearKind {
     Row,
 }
 
-/// Configuration for a tensor-parallel linear layer.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TpLinearConfig {
     pub kind: ParallelLinearKind,
     pub shard: ShardingSpec,
-    /// Whether an all-reduce is needed after this layer (always true for both
-    /// kinds, unless this is an intermediate result combined in the next layer).
+    /// Always true for both kinds, unless this is an intermediate result
+    /// combined in the next layer.
     pub needs_all_reduce: bool,
 }
 
 impl TpLinearConfig {
-    /// Build config for a column-parallel linear layer.
-    ///
     /// # Panics
     /// Panics if `out_features < tp.world_size` (via [`column_shard`]).
     #[must_use]
@@ -280,8 +252,6 @@ impl TpLinearConfig {
         }
     }
 
-    /// Build config for a row-parallel linear layer.
-    ///
     /// # Panics
     /// Panics if `in_features < tp.world_size` (via [`row_shard`]).
     #[must_use]
@@ -377,8 +347,7 @@ mod tests {
         let s0 = column_shard(10, &tp0);
         let s3 = column_shard(10, &tp3);
         assert_eq!(s0.size, 2);
-        assert_eq!(s3.size, 4); // absorbs remainder
-        // All shards together cover the full dimension
+        assert_eq!(s3.size, 4);
         let total_covered: usize = (0..4)
             .map(|r| column_shard(10, &TpConfig::new(4, r).unwrap()).size)
             .sum();
@@ -395,11 +364,8 @@ mod tests {
     }
 
     // TP=8 target shape: [4096, 1024] column-parallel -> each rank [512, 1024].
-    // (The `in` dim 1024 is unchanged for column-parallel; we shard `out`=4096.)
     #[test]
     fn column_shard_4096_across_tp8_target_shape() {
-        // Each rank owns 512 of the 4096 output rows; offsets are contiguous and
-        // reassembling all 8 shards reproduces the original dimension exactly.
         let mut covered = 0usize;
         let mut expected_offset = 0usize;
         for rank in 0..8 {
@@ -411,7 +377,6 @@ mod tests {
             expected_offset += s.size;
             covered += s.size;
         }
-        // Round-trip: contiguous, non-overlapping, exact cover of [0, 4096).
         assert_eq!(covered, 4096);
         assert_eq!(expected_offset, 4096);
     }
@@ -424,8 +389,7 @@ mod tests {
         assert_eq!(row_shard(128, &tp), column_shard(128, &tp));
     }
 
-    // TP=8 target shape: [4096, 1024] row-parallel -> shard the `in` dim 1024 ->
-    // each rank owns [4096, 128] (here we model the sharded `in` dim = 1024).
+    // TP=8 target shape: [4096, 1024] row-parallel -> shard the `in` dim 1024.
     #[test]
     fn row_shard_1024_across_tp8_target_shape() {
         let mut covered = 0usize;
@@ -461,10 +425,7 @@ mod tests {
             let tp = TpConfig::new(8, rank).unwrap();
             let (q, kv) = head_shard(32, 8, &tp).unwrap();
             assert_eq!(q, 4, "rank {rank} local Q heads");
-            assert_eq!(
-                kv, 1,
-                "rank {rank} local KV heads (>=1, exactly replicated-uniform)"
-            );
+            assert_eq!(kv, 1, "rank {rank} local KV heads");
         }
     }
 
@@ -496,19 +457,16 @@ mod tests {
 
     // Qwen3.5-122B-A10B: 32 Q heads, 2 KV heads, TP=4. 2 KV heads < 4 ranks ->
     // replicate each KV head 4/2 = 2 ways. Every rank: 8 Q heads, 1 KV head.
-    // Ranks {0,1} replicate KV head 0; ranks {2,3} replicate KV head 1.
     #[test]
     fn head_shard_122b_q32_kv2_tp4_replicates() {
         for rank in 0..4 {
             let tp = TpConfig::new(4, rank).unwrap();
             let (q, kv) = head_shard(32, 2, &tp).unwrap();
-            assert_eq!(q, 8, "rank {rank} local Q heads (partitioned)");
-            assert_eq!(kv, 1, "rank {rank} local KV heads (one replicated head)");
-            // Block index: ranks 0,1 -> head 0; ranks 2,3 -> head 1.
+            assert_eq!(q, 8, "rank {rank} local Q heads");
+            assert_eq!(kv, 1, "rank {rank} local KV heads");
             let block = kv_load_block_index(2, &tp).unwrap();
             assert_eq!(block, rank / 2, "rank {rank} replicated KV-head block");
         }
-        // Replica pairs load the SAME KV head -> identical K/V weights.
         assert_eq!(
             kv_load_block_index(2, &TpConfig::new(4, 0).unwrap()).unwrap(),
             kv_load_block_index(2, &TpConfig::new(4, 1).unwrap()).unwrap(),
@@ -517,25 +475,20 @@ mod tests {
             kv_load_block_index(2, &TpConfig::new(4, 2).unwrap()).unwrap(),
             kv_load_block_index(2, &TpConfig::new(4, 3).unwrap()).unwrap(),
         );
-        // Distinct heads across replica groups.
         assert_ne!(
             kv_load_block_index(2, &TpConfig::new(4, 0).unwrap()).unwrap(),
             kv_load_block_index(2, &TpConfig::new(4, 2).unwrap()).unwrap(),
         );
     }
 
-    // Divisible case stays byte-identical: 64Q/8KV @ TP8 unchanged, and the
-    // KV-load block index equals the rank (the legacy `rank * local_rows` offset).
+    // Divisible case stays byte-identical: 64Q/8KV @ TP8 unchanged.
     #[test]
     fn head_shard_64q_8kv_tp8_shard_regime_unchanged() {
         for rank in 0..8 {
             let tp = TpConfig::new(8, rank).unwrap();
             let (q, kv) = head_shard(64, 8, &tp).unwrap();
             assert_eq!(q, 8, "rank {rank} local Q heads");
-            assert_eq!(
-                kv, 1,
-                "rank {rank} local KV heads (distinct, not replicated)"
-            );
+            assert_eq!(kv, 1, "rank {rank} local KV heads");
             assert_eq!(
                 kv_load_block_index(8, &tp).unwrap(),
                 rank,
@@ -544,8 +497,7 @@ mod tests {
         }
     }
 
-    // 1 KV head (full MQA) across TP=4 -> replicate the single head onto all 4
-    // ranks; every rank's block index is 0.
+    // 1 KV head (full MQA) across TP=4 -> replicate the single head onto all 4 ranks.
     #[test]
     fn head_shard_mqa_q32_kv1_tp4_replicates_all() {
         for rank in 0..4 {
@@ -561,8 +513,7 @@ mod tests {
         }
     }
 
-    // Replication requires CLEAN replication: world_size % num_kv_heads == 0.
-    // 3 KV heads @ TP4: 3 doesn't divide 4 and 4 % 3 != 0 -> reject loudly.
+    // Replication requires world_size % num_kv_heads == 0.
     #[test]
     fn head_shard_kv3_tp4_rejects_unclean_replication() {
         let tp = TpConfig::new(4, 0).unwrap();
@@ -621,7 +572,6 @@ mod tests {
     #[test]
     #[should_panic(expected = "cannot shard")]
     fn column_shard_panics_when_total_below_world_size() {
-        // Legacy behavior: `assert!` panics, it does NOT pad. We mirror it.
         let tp = TpConfig::new(8, 0).unwrap();
         let _ = column_shard(4, &tp);
     }

@@ -1257,9 +1257,9 @@ __global__ void dsv4_fp4_route_gemv_batch_kernel(
 
 // Batched W8A16 GEMM: B_TILE inputs share one weight read (vs B separate GEMVs
 // re-reading weight B times). Each thread holds B_TILE accumulators; weight is
-// loaded once per K-step and multiplied against B_TILE input vectors. Mirrors
-// w4a16_gemm_batch_kernel but reads INT8 directly (4 weights per uint32, no
-// nibble unpack) — this is the multi-request decode path (B>=2).
+// loaded once per K-step and multiplied against B_TILE input vectors. Reads
+// INT8 directly (4 weights per uint32, no nibble unpack) — this is the
+// multi-request decode path (B>=2).
 #define W8A16_GEMM_BTILE 4
 __global__ void w8a16_gemm_batch_kernel(
     const uint8_t* __restrict__ weight,
@@ -1420,7 +1420,9 @@ __global__ void q8_embedding_decode_kernel(
 
 // Batched W4A16 GEMM: B_TILE inputs share one weight read (vs B separate GEMVs
 // re-reading weight B times). Each thread holds B_TILE accumulators; weight is
-// loaded once per K-step and multiplied against B_TILE input vectors.
+// loaded once per K-step and multiplied against B_TILE input vectors. Reads
+// INT8 directly (4 weights per uint32, no nibble unpack) — this is the
+// multi-request decode path (B>=2).
 #define W4A16_GEMM_BTILE 4
 __global__ void w4a16_gemm_batch_kernel(
     const uint8_t* __restrict__ weight,
@@ -2829,24 +2831,21 @@ cudaError_t w8a16_gemv_batch_cuda(
     return cudaGetLastError();
 }
 
+// Marlin-style W4A16 GEMV (uint4 loads, 1 warp/row) — V100-optimized.
+extern "C" cudaError_t w4a16_gemv_marlin_cuda(
+    const uint8_t* weight, const __nv_bfloat16* scales,
+    const __nv_bfloat16* input, __nv_bfloat16* output,
+    int B, int N, int K, int group_size, cudaStream_t stream);
+
 cudaError_t w4a16_gemv_batch_cuda(
     const uint8_t* weight, const __nv_bfloat16* scales,
     const __nv_bfloat16* input, __nv_bfloat16* output,
     int B, int N, int K, int group_size, cudaStream_t stream)
 {
-    dim3 block(GEMV_THREADS);
-    // B>=2 uses the batched GEMM (4 inputs share one weight read).
-    if (B >= 2) {
-        dim3 grid((N + GEMV_ROWS - 1) / GEMV_ROWS, (B + W4A16_GEMM_BTILE - 1) / W4A16_GEMM_BTILE);
-        w4a16_gemm_batch_kernel<<<grid, block, 0, stream>>>(
-            weight, scales, input, output, B, N, K, group_size);
-        return cudaGetLastError();
-    }
-    dim3 grid((N + GEMV_ROWS - 1) / GEMV_ROWS, B);
-    size_t smem = (size_t)K * sizeof(__nv_bfloat16);
-    w4a16_gemv_batch_kernel<<<grid, block, smem, stream>>>(
-        weight, scales, input, output, B, N, K, group_size);
-    return cudaGetLastError();
+    // V100 decode path: marlin GEMV for all batch sizes. uint4 loads maximize
+    // HBM bandwidth utilization; the GEMM weight-sharing path is slower on
+    // V100 because its uint32 loads underutilize the memory controller.
+    return w4a16_gemv_marlin_cuda(weight, scales, input, output, B, N, K, group_size, stream);
 }
 
 cudaError_t moe_w4a16_grouped_gemv_batch_cuda(
