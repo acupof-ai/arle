@@ -71,6 +71,8 @@ pub use runtime_flags::apply_runtime_flags;
 mod nvtx;
 #[cfg(feature = "cuda")]
 mod ops;
+#[cfg(feature = "cuda")]
+mod profile;
 // Inference-analysis probe (per-token entropy + decode logit lens), env-gated
 // JSONL. Off = one OnceLock load per hook. Config/math/writer are host-only
 // (CPU-testable); the device lens stash is cuda-gated inside.
@@ -695,6 +697,14 @@ impl BackendExecutor for CudaExecutor {
             CudaExecutorInner::Placeholder => infer_seam::OperatorDispatchStats::default(),
             #[cfg(feature = "cuda")]
             CudaExecutorInner::Real(real) => real.operator_dispatch_stats(),
+        }
+    }
+
+    fn op_timing_stats(&self) -> infer_seam::OpTimingStats {
+        match &self.inner {
+            CudaExecutorInner::Placeholder => infer_seam::OpTimingStats::default(),
+            #[cfg(feature = "cuda")]
+            CudaExecutorInner::Real(real) => real.op_timing_stats(),
         }
     }
 

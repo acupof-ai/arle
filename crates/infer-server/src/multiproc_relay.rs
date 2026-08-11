@@ -338,6 +338,8 @@ pub struct WireStats {
     pub spec_partial_ctx_chains: u64,
     #[serde(default)]
     pub operator_dispatch: infer_seam::OperatorDispatchStats,
+    #[serde(default)]
+    pub op_timing: infer_seam::OpTimingStats,
 }
 
 impl WireStats {
@@ -423,6 +425,7 @@ impl WireStats {
                 rejected: self.spec_rejected,
                 partial_ctx_chains: self.spec_partial_ctx_chains,
             },
+            op_timing: self.op_timing,
         }
     }
 
@@ -506,6 +509,7 @@ impl WireStats {
             spec_rejected: c.spec_decode.rejected,
             spec_partial_ctx_chains: c.spec_decode.partial_ctx_chains,
             operator_dispatch,
+            op_timing: c.op_timing.clone(),
         }
     }
 }

@@ -484,7 +484,7 @@ where
     /// to zero before the first tick (or if the engine thread has gone).
     #[must_use]
     pub fn counters(&self) -> CounterSnapshot {
-        self.counters.lock().map(|c| *c).unwrap_or_default()
+        self.counters.lock().map(|c| c.clone()).unwrap_or_default()
     }
 
     /// Materialize operator dispatch counters + backend artifact identity in one

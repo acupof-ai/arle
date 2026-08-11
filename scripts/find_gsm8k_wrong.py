@@ -53,7 +53,7 @@ def main():
         instruction = (
             f"{question}\n\n"
             "Solve step by step. End your response with the final numeric "
-            "answer on its own, preceded by ####."
+            "answer on its own, preceded by ####.\n<think>"
         )
         try:
             resp = client.chat([{"role": "user", "content": instruction}], args.max_tokens)

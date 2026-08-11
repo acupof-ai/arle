@@ -2832,7 +2832,7 @@ cudaError_t w8a16_gemv_batch_cuda(
 }
 
 // Marlin-style W4A16 GEMV (uint4 loads, 1 warp/row) — V100-optimized.
-extern "C" cudaError_t w4a16_gemv_marlin_cuda(
+extern "C" cudaError_t w4a16_gemv_batch_cuda_marlin(
     const uint8_t* weight, const __nv_bfloat16* scales,
     const __nv_bfloat16* input, __nv_bfloat16* output,
     int B, int N, int K, int group_size, cudaStream_t stream);
@@ -2845,7 +2845,7 @@ cudaError_t w4a16_gemv_batch_cuda(
     // V100 decode path: marlin GEMV for all batch sizes. uint4 loads maximize
     // HBM bandwidth utilization; the GEMM weight-sharing path is slower on
     // V100 because its uint32 loads underutilize the memory controller.
-    return w4a16_gemv_marlin_cuda(weight, scales, input, output, B, N, K, group_size, stream);
+    return w4a16_gemv_batch_cuda_marlin(weight, scales, input, output, B, N, K, group_size, stream);
 }
 
 cudaError_t moe_w4a16_grouped_gemv_batch_cuda(

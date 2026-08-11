@@ -978,7 +978,6 @@ impl Qwen35CudaExecutor {
             recall_tier: None,
             recall_keepalive: (0..num_slots).map(|_| Vec::new()).collect(),
             recall_budget_bytes: tier_budget_bytes,
-            model_path: model_path_buf,
             weights_epoch,
             disk_root: None,
             disk_budget: None,
@@ -1024,7 +1023,7 @@ impl Qwen35CudaExecutor {
         // reservation from free BEFORE profiling the full-attn pool, so
         // weights + recurrent×slots + pool ≤ mem_fraction×free (mirrors DSv4
         // dsv4.rs:1687-1691). Per-rank free, num_slots already min-reduced.
-        let (_per_slot, _kv_bytes, gdr_bytes, conv_bytes) = model.per_slot_kv_bytes();
+        let (_, _, gdr_bytes, conv_bytes) = model.per_slot_kv_bytes();
         // DSpark draft ctx caches are per-slot lazily-allocated device buffers —
         // reserve them here too, or the pool eats the VRAM the first dspark
         // prefill needs.
@@ -1861,9 +1860,9 @@ impl Qwen35CudaExecutor {
             .collect())
     }
 
-    /// with tap capture, extending the ctx cache + pending anchor when the
-    /// cache is contiguous. Non-paged rows run plain and clear the draft state
-    /// (speculation re-seeds at the next paged step).
+    /// Warm-decode one DSpark row with tap capture, extending the ctx cache +
+    /// pending anchor when the cache is contiguous. Non-paged rows run plain
+    /// and clear the draft state (speculation re-seeds at the next paged step).
     fn dspark_warm_decode_row(
         &mut self,
         row: &DecodeRow,
