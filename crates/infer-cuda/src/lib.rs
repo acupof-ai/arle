@@ -67,9 +67,6 @@ mod numa_pin;
 mod runtime_flags;
 #[cfg(feature = "cuda")]
 pub use runtime_flags::apply_runtime_flags;
-// NaN/Inf detection on forward outputs, env-gated by `ARLE_NUMERIC_CHECK`.
-#[cfg(feature = "cuda")]
-mod numeric_check;
 #[cfg(feature = "cuda")]
 mod nvtx;
 #[cfg(feature = "cuda")]
