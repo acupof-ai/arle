@@ -2414,7 +2414,6 @@ impl Dsv4Model {
         // SAFETY: uninit device scratch; fully written before first read.
         let mut logits = unsafe { HiddenStates::uninit(&self.ctx, self.lm_head.rows, rows)? };
         self.lm_head_project_batch(&head_normed, &mut logits)?;
-        crate::numeric_check::check_numeric(&self.ctx, &logits.data, "dsv4_verify_logits");
         Ok(logits)
     }
 
@@ -5177,7 +5176,6 @@ impl Dsv4Model {
         crate::profile::profile_op(ctx, "lm_head_project", None, seq_len, || {
             self.lm_head_project(&last_normed, &mut logits)
         })?;
-        crate::numeric_check::check_numeric(ctx, &logits.data, "dsv4_decode_logits");
         keepalive.keep_vec(&logits);
         let token = crate::profile::profile_op(ctx, "sample", None, seq_len, || {
             self.sample_logits(&logits, params, position)
@@ -6655,7 +6653,6 @@ impl Dsv4Model {
         crate::profile::profile_op(ctx, "lm_head_project", Some(target_layer_idx), m, || {
             self.lm_head_project_batch(&head_normed, &mut logits)
         })?;
-        crate::numeric_check::check_numeric(ctx, &logits.data, "dsv4_mtp_draft_logits");
         keepalive.keep_hidden(&logits);
         let candidates = self.mtp_topk_device(&mut logits, top_k.max(1))?;
         std::hint::black_box(keepalive.len());
@@ -7214,7 +7211,6 @@ impl Dsv4Model {
         }
 
         slot.seq_len += 1;
-        crate::numeric_check::check_numeric(&self.ctx, &graph.logits.data, "dsv4_decode_graph_logits");
         self.sample_logits(&graph.logits, params, position)
     }
 
