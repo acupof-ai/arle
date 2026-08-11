@@ -359,6 +359,7 @@ extern "C" cudaError_t decode_attention_varlen_fp8_cuda(
     __nv_bfloat16* output,
     int num_q_heads,
     int num_kv_heads,
+    int head_dim,
     int page_size,
     int batch_size,
     int total_q_tokens,
@@ -372,7 +373,6 @@ extern "C" cudaError_t decode_attention_varlen_fp8_cuda(
 {
     if (batch_size <= 0 || total_q_tokens <= 0) return cudaSuccess;
 
-    constexpr int HEAD_DIM = 128;
     if (page_size != kPageSize || num_q_heads <= 0 || num_kv_heads <= 0) {
         return cudaErrorInvalidValue;
     }
@@ -382,7 +382,7 @@ extern "C" cudaError_t decode_attention_varlen_fp8_cuda(
 
     int num_splits = choose_varlen_num_splits(max_kv_len);
     size_t needed = decode_attention_varlen_fp8_workspace_bytes(
-        total_q_tokens, num_q_heads, HEAD_DIM, num_splits);
+        total_q_tokens, num_q_heads, head_dim, num_splits);
     if (workspace == nullptr || workspace_bytes < needed) {
         return cudaErrorInvalidValue;
     }
@@ -390,42 +390,54 @@ extern "C" cudaError_t decode_attention_varlen_fp8_cuda(
     float* ws_float = reinterpret_cast<float*>(workspace);
     size_t total_q_heads = (size_t)total_q_tokens * (size_t)num_q_heads;
     float* partial_out = ws_float;
-    float* partial_m = partial_out + (size_t)num_splits * total_q_heads * HEAD_DIM;
+    float* partial_m = partial_out + (size_t)num_splits * total_q_heads * (size_t)head_dim;
     float* partial_l = partial_m + (size_t)num_splits * total_q_heads;
 
     dim3 partial_grid(total_q_tokens, num_q_heads, num_splits);
     dim3 partial_block(VLF8_BLOCK_SIZE);
 
-#define LAUNCH_PARTIAL(INT8_FLAG, CAUSAL_FLAG) \
-    decode_attention_varlen_quantized_partial_kernel<HEAD_DIM, CAUSAL_FLAG, INT8_FLAG> \
+#define LAUNCH_PARTIAL(HD, INT8_FLAG, CAUSAL_FLAG) \
+    decode_attention_varlen_quantized_partial_kernel<HD, CAUSAL_FLAG, INT8_FLAG> \
         <<<partial_grid, partial_block, 0, stream>>>( \
             q_packed, qo_indptr, k_pool, v_pool, k_scales, v_scales, \
             kv_indptr, kv_indices, last_page_len, partial_out, partial_m, partial_l, \
             num_q_heads, num_kv_heads, batch_size, sm_scale, num_splits)
 
-    if (int8_kv) {
-        if (causal) {
-            LAUNCH_PARTIAL(true, true);
+#define LAUNCH_MERGE(HD) \
+    decode_attention_varlen_quantized_merge_kernel<HD><<<merge_grid, merge_block, 0, stream>>>( \
+        partial_out, partial_m, partial_l, output, total_q_tokens, num_q_heads, num_splits)
+
+    cudaError_t err = cudaSuccess;
+    dim3 merge_grid(total_q_tokens, num_q_heads);
+    dim3 merge_block(head_dim);
+
+    if (head_dim == 128) {
+        if (int8_kv) {
+            if (causal) LAUNCH_PARTIAL(128, true, true);
+            else LAUNCH_PARTIAL(128, true, false);
         } else {
-            LAUNCH_PARTIAL(true, false);
+            if (causal) LAUNCH_PARTIAL(128, false, true);
+            else LAUNCH_PARTIAL(128, false, false);
         }
+        err = cudaGetLastError();
+        if (err == cudaSuccess) LAUNCH_MERGE(128);
+    } else if (head_dim == 256) {
+        if (int8_kv) {
+            if (causal) LAUNCH_PARTIAL(256, true, true);
+            else LAUNCH_PARTIAL(256, true, false);
+        } else {
+            if (causal) LAUNCH_PARTIAL(256, false, true);
+            else LAUNCH_PARTIAL(256, false, false);
+        }
+        err = cudaGetLastError();
+        if (err == cudaSuccess) LAUNCH_MERGE(256);
     } else {
-        if (causal) {
-            LAUNCH_PARTIAL(false, true);
-        } else {
-            LAUNCH_PARTIAL(false, false);
-        }
+        return cudaErrorInvalidValue;
     }
 
 #undef LAUNCH_PARTIAL
+#undef LAUNCH_MERGE
 
-    cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) return err;
-
-    dim3 merge_grid(total_q_tokens, num_q_heads);
-    dim3 merge_block(HEAD_DIM);
-    decode_attention_varlen_quantized_merge_kernel<HEAD_DIM><<<merge_grid, merge_block, 0, stream>>>(
-        partial_out, partial_m, partial_l, output, total_q_tokens, num_q_heads, num_splits);
-
     return cudaGetLastError();
 }

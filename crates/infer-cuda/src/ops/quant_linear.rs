@@ -15,10 +15,10 @@ mod qwen_fp8_dense_policy {
     include!("generated/qwen_fp8_dense_projection.rs");
 }
 
-/// Pre-Hopper dequant→BF16-cuBLAS floor. Stays at the old 16: that path pays a
-/// full weight dequant (1 read + 2 bf16 writes) per call, so tiny M belongs on
-/// the GEMV there even though Hopper's DeepGEMM lane wins from M=2.
-const QWEN_FP8_DEQUANT_GEMM_MIN_M: usize = 100000;
+/// Dequant→BF16→WMMA GEMM floor. M=1 (decode) stays on the batched GEMV;
+/// M>=2 uses the WMMA GEMM which avoids the 2× memory blowup of cuBLAS for
+/// small batches (DSpark verify, MoE expert routing).
+const QWEN_FP8_DEQUANT_GEMM_MIN_M: usize = 2;
 
 #[derive(Default)]
 struct QwenFp8DenseScratch {
@@ -40,7 +40,7 @@ struct QwenFp8DenseScratch {
 struct QwenFp8DequantScratch {
     weight_bf16: Option<CudaSlice<bf16>>,
     capacity: usize,
-    // Cache of dequantized FP16 weights, keyed by the original quantized weight
+    // Cache of dequantized BF16 weights, keyed by the original quantized weight
     // pointer. Only used for W4A16 prefill on sm<9: dequant is the dominant
     // cost, so caching the smaller projections (attention qkv/o) avoids
     // re-dequantizing them on every prefill. Larger MLP weights are not cached
@@ -800,7 +800,7 @@ fn try_w4a16_dequant_bf16_gemm_batch(
     let n = weight.rows;
     let k = weight.cols;
     let weight_elems = n * k;
-    // Cache dequantized FP16 weights for small projections only. Larger QKV/MLP
+    // Cache dequantized BF16 weights for small projections only. Larger QKV/MLP
     // weights are dequantized per-call (caching them would OOM on V100's 32GB).
     const W4A16_CACHE_MAX_ELEMS: usize = 10_000_000;
 
@@ -815,12 +815,12 @@ fn try_w4a16_dequant_bf16_gemm_batch(
         let mut scratch = cell.borrow_mut();
 
         // Try the cache first (small weights only).
-        if weight_elems <= W4A16_CACHE_MAX_ELEMS {
+        if false && weight_elems <= W4A16_CACHE_MAX_ELEMS {
             if let Some(cached) = scratch.w4a16_fp16_cache.get(&qw_ptr_u64) {
                 let (wfp16_ptr, _gw) = cached.device_ptr(&ctx.stream);
                 // SAFETY: all pointers are valid device buffers from the context, sizes match the GEMM dims.
                 unsafe {
-                    ffi::fp16_gemm_wmma_cuda(
+                    ffi::gemm_cuda(
                         wfp16_ptr as *const ffi::Half,
                         x_ptr as *const ffi::Half,
                         out_ptr as *mut ffi::Half,
@@ -830,7 +830,7 @@ fn try_w4a16_dequant_bf16_gemm_batch(
                         stream,
                     )
                     .result()
-                    .map_err(|e| anyhow!("W4A16 cached FP16 GEMM failed: {e}"))?;
+                    .map_err(|e| anyhow!("W4A16 cached BF16 GEMM failed: {e}"))?;
                 }
                 return Ok(());
             }
@@ -841,12 +841,12 @@ fn try_w4a16_dequant_bf16_gemm_batch(
             let buf = ctx
                 .stream
                 .alloc_zeros::<bf16>(weight_elems)
-                .map_err(|e| anyhow!("W4A16 dense dequant FP16 cache alloc failed: {e}"))?;
+                .map_err(|e| anyhow!("W4A16 dense dequant BF16 cache alloc failed: {e}"))?;
             {
                 let (wfp16_ptr, _gw) = buf.device_ptr(&ctx.stream);
                 // SAFETY: all pointers are valid device buffers, sizes match the dequant kernel dims.
                 unsafe {
-                    ffi::dequantize_w4a16_to_fp16_cuda(
+                    ffi::dequantize_w4a16_to_bf16_cuda(
                         qw_ptr as *const u8,
                         scales_ptr as *const ffi::Half,
                         wfp16_ptr as *mut ffi::Half,
@@ -856,7 +856,7 @@ fn try_w4a16_dequant_bf16_gemm_batch(
                         stream,
                     )
                     .result()
-                    .map_err(|e| anyhow!("W4A16 dense dequant FP16 kernel failed: {e}"))?;
+                    .map_err(|e| anyhow!("W4A16 dense dequant BF16 kernel failed: {e}"))?;
                 }
             }
             scratch.w4a16_fp16_cache.insert(qw_ptr_u64, buf);
@@ -865,19 +865,19 @@ fn try_w4a16_dequant_bf16_gemm_batch(
             if scratch.capacity < weight_elems {
                 scratch.weight_bf16 =
                     Some(ctx.stream.alloc_zeros::<bf16>(weight_elems).map_err(|e| {
-                        anyhow!("W4A16 dense dequant FP16 scratch alloc failed: {e}")
+                        anyhow!("W4A16 dense dequant BF16 scratch alloc failed: {e}")
                     })?);
                 scratch.capacity = weight_elems;
             }
             let buf = scratch
                 .weight_bf16
                 .as_ref()
-                .ok_or_else(|| anyhow!("W4A16 dense dequant FP16 scratch missing"))?;
+                .ok_or_else(|| anyhow!("W4A16 dense dequant BF16 scratch missing"))?;
             {
                 let (wfp16_ptr, _gw) = buf.device_ptr(&ctx.stream);
                 // SAFETY: all pointers are valid device buffers, sizes match the dequant kernel dims.
                 unsafe {
-                    ffi::dequantize_w4a16_to_fp16_cuda(
+                    ffi::dequantize_w4a16_to_bf16_cuda(
                         qw_ptr as *const u8,
                         scales_ptr as *const ffi::Half,
                         wfp16_ptr as *mut ffi::Half,
@@ -887,7 +887,7 @@ fn try_w4a16_dequant_bf16_gemm_batch(
                         stream,
                     )
                     .result()
-                    .map_err(|e| anyhow!("W4A16 dense dequant FP16 kernel failed: {e}"))?;
+                    .map_err(|e| anyhow!("W4A16 dense dequant BF16 kernel failed: {e}"))?;
                 }
             }
             buf
@@ -906,7 +906,7 @@ fn try_w4a16_dequant_bf16_gemm_batch(
                 stream,
             )
             .result()
-            .map_err(|e| anyhow!("W4A16 dense dequant FP16 GEMM failed: {e}"))?;
+            .map_err(|e| anyhow!("W4A16 dense dequant BF16 GEMM failed: {e}"))?;
         }
         Ok(())
     })?;
