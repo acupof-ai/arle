@@ -44,47 +44,24 @@ __global__ void w4a16_gemm_wmma_kernel(
 
     for (int k0 = 0; k0 < K; k0 += WMMA_TILE_K) {
         // --- Dequant weight tile [n0..n0+16, k0..k0+16] into w_smem ---
-        // Each thread handles one row of the tile.
         if (tid < WMMA_TILE_N) {
             const int n = n0 + tid;
             const int g = k0 / group_size;
             const float scale_f = __bfloat162float(scales[n * groups_per_row + g]);
             const uint8_t* wrow = weight + (size_t)n * (K / 2) + k0 / 2;
             half* wout = w_smem + tid * WMMA_TILE_K;
-            // 16 int4 values = 8 bytes. Load as 2 uint32.
-            const uint32_t w0 = *reinterpret_cast<const uint32_t*>(wrow);
-            const uint32_t w1 = *reinterpret_cast<const uint32_t*>(wrow + 4);
-            // Unpack 8 nibbles from w0.
-            const uint32_t lo0 = w0 & 0x0F0F0F0Fu;
-            const uint32_t hi0 = (w0 >> 4) & 0x0F0F0F0Fu;
-            const uint32_t lo1 = w1 & 0x0F0F0F0Fu;
-            const uint32_t hi1 = (w1 >> 4) & 0x0F0F0F0Fu;
-            // Dequant: extract nibbles, subtract 8, multiply by scale.
-            // Use the same int->float path as the scalar GEMV for bit-exact
-            // dequant values; the Marlin OR-with-0x6400 trick is equivalent but
-            // we keep the obvious form here while debugging the WMMA path.
-            const uint8_t* lo0b = reinterpret_cast<const uint8_t*>(&lo0);
-            const uint8_t* hi0b = reinterpret_cast<const uint8_t*>(&hi0);
-            const uint8_t* lo1b = reinterpret_cast<const uint8_t*>(&lo1);
-            const uint8_t* hi1b = reinterpret_cast<const uint8_t*>(&hi1);
             #pragma unroll
-            for (int i = 0; i < 4; i++) {
-                float w0 = (float)((int)lo0b[i] - 8) * scale_f;
-                float w1 = (float)((int)hi0b[i] - 8) * scale_f;
-                wout[i * 2]     = __float2half(w0);
-                wout[i * 2 + 1] = __float2half(w1);
-            }
-            #pragma unroll
-            for (int i = 0; i < 4; i++) {
-                float w0 = (float)((int)lo1b[i] - 8) * scale_f;
-                float w1 = (float)((int)hi1b[i] - 8) * scale_f;
-                wout[8 + i * 2]     = __float2half(w0);
-                wout[8 + i * 2 + 1] = __float2half(w1);
+            for (int i = 0; i < WMMA_TILE_K; i += 2) {
+                const uint8_t byte = wrow[i / 2];
+                const int lo = byte & 0x0F;
+                const int hi = byte >> 4;
+                wout[i]     = __float2half((float)(lo - 8) * scale_f);
+                wout[i + 1] = __float2half((float)(hi - 8) * scale_f);
             }
         }
         __syncthreads();
 
-        // --- Load input tile [m0..m0+16, k0..k0+16], transpose to [K, M] ---
+        // --- Load input tile [m0..m0+16, k0..k0+16] ---
         // Zero the whole tile first so padding rows (m >= M) are 0.
         for (int i = tid; i < WMMA_TILE_M * WMMA_TILE_K; i += blockDim.x) {
             x_smem[i] = __float2half(0.0f);
@@ -94,9 +71,8 @@ __global__ void w4a16_gemm_wmma_kernel(
             const int m = m0 + tid;
             if (m < M) {
                 const __nv_bfloat16* xrow = input + (size_t)m * K + k0;
-                // Store transposed: x_smem[k * WMMA_TILE_M + m_idx] = input[m, k].
                 for (int i = 0; i < WMMA_TILE_K; i++) {
-                    x_smem[i * WMMA_TILE_M + tid] = __float2half(__bfloat162float(xrow[i]));
+                    x_smem[tid * WMMA_TILE_K + i] = __float2half(__bfloat162float(xrow[i]));
                 }
             }
         }
@@ -104,26 +80,26 @@ __global__ void w4a16_gemm_wmma_kernel(
 
         // --- WMMA matmul ---
         wmma::fragment<wmma::matrix_a, WMMA_TILE_N, WMMA_TILE_M, WMMA_TILE_K, half, wmma::row_major> a_frag;
-        wmma::fragment<wmma::matrix_b, WMMA_TILE_N, WMMA_TILE_M, WMMA_TILE_K, half, wmma::row_major> b_frag;
+        wmma::fragment<wmma::matrix_b, WMMA_TILE_N, WMMA_TILE_M, WMMA_TILE_K, half, wmma::col_major> b_frag;
         wmma::load_matrix_sync(a_frag, w_smem, WMMA_TILE_K);
-        wmma::load_matrix_sync(b_frag, x_smem, WMMA_TILE_M);
+        wmma::load_matrix_sync(b_frag, x_smem, WMMA_TILE_K);
         wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
         __syncthreads();
     }
 
     // --- Store output tile ---
-    // Test: store as [N, M] to check if WMMA computation is correct.
+    // output[batch, output_dim] = C[output_dim, batch]
     __shared__ float c_smem[WMMA_TILE_N * WMMA_TILE_M];
     wmma::store_matrix_sync(c_smem, c_frag, WMMA_TILE_M, wmma::mem_row_major);
     __syncthreads();
 
-    const int n_idx = tid / WMMA_TILE_M;  // 0..15
-    const int m_idx = tid % WMMA_TILE_M;  // 0..15
+    const int n_idx = tid / WMMA_TILE_M;  // 0..15 (output_dim)
+    const int m_idx = tid % WMMA_TILE_M;  // 0..15 (batch)
     if (n_idx < WMMA_TILE_N && m_idx < WMMA_TILE_M) {
-        const int n = n0 + n_idx;
-        const int m = m0 + m_idx;
+        const int n = n0 + n_idx;  // output_dim
+        const int m = m0 + m_idx;  // batch
         if (n < N && m < M) {
-            output[(size_t)n * M + m] = __float2bfloat16(c_smem[n_idx * WMMA_TILE_M + m_idx]);
+            output[(size_t)m * N + n] = __float2bfloat16(c_smem[n_idx * WMMA_TILE_M + m_idx]);
         }
     }
 }
