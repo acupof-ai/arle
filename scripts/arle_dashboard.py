@@ -72,8 +72,10 @@ def _poll_loop():
                 _cache["stats"] = stats
                 _cache["gpu"] = gpu
                 _history.append({
+                    "ts": time.time(),
+                    "forward_busy_micros": tp.get("forward_busy_micros", 0),
                     "decode_rate": decode_rate,
-                    "active": sc.get("active_requests", 0),
+                    "active_requests": sc.get("active_requests", 0),
                     "kv_used": kv_used,
                     "accept_rate": spec.get("accept_rate", 0) or 0,
                     "gpu_util": gpu.get("gpu_util", 0),
@@ -127,6 +129,7 @@ td:first-child { color: #888; }
   <div class="card"><div class="label">KV Used</div><div class="value" id="kvused">—</div></div>
   <div class="card"><div class="label">Decode Rate</div><div class="value blue" id="rate">—</div><div style="font-size:11px;color:#888">tok/s</div></div>
   <div class="card"><div class="label">GPU Util</div><div class="value purple" id="gpuutil">—</div><div style="font-size:11px;color:#888">%</div></div>
+  <div class="card"><div class="label">GPU Busy</div><div class="value green" id="gpubusy">—</div><div style="font-size:11px;color:#888">forward/wall</div></div>
   <div class="card"><div class="label">GPU Memory</div><div class="value yellow" id="gpumem">—</div></div>
   <div class="card"><div class="label">Power</div><div class="value" id="power">—</div><div style="font-size:11px;color:#888">W</div></div>
   <div class="card"><div class="label">DSpark</div><div class="value" id="dspark">—</div></div>
@@ -140,6 +143,7 @@ td:first-child { color: #888; }
   <div class="chart-box"><h3>GPU Memory (MiB)</h3><div class="chart-wrap"><canvas id="cMem"></canvas></div></div>
   <div class="chart-box"><h3>GPU Power (W)</h3><div class="chart-wrap"><canvas id="cPower"></canvas></div></div>
   <div class="chart-box"><h3>Per-Op CUDA Time (ms)</h3><div class="chart-wrap" style="height:240px"><canvas id="cOpTiming"></canvas></div></div>
+  <div class="chart-box"><h3>Per-Op Time Share</h3><div class="chart-wrap" style="height:240px"><canvas id="cOpShare"></canvas></div></div>
 </div>
 <table id="kv"></table>
 <script>
@@ -167,6 +171,12 @@ const charts = {
       plugins: { legend: { display: false } },
       scales: { x: { grid: { color: '#222' }, ticks: { color: '#888' }, suggestedMin: 0 }, y: { grid: { display: false }, ticks: { color: '#ccc', font: { size: 11 } } } } }
   }),
+  opShare: new Chart(document.getElementById('cOpShare'), {
+    type: 'doughnut',
+    data: { labels: [], datasets: [{ data: [], backgroundColor: ['#82aaff','#c792ea','#7ec699','#ffcb6b','#f07178','#89ddff','#ff9cac','#c3e88d','#546e7a'], borderWidth: 1, borderColor: '#1a1a1a' }] },
+    options: { responsive: true, maintainAspectRatio: false, animation: false, cutout: '60%',
+      plugins: { legend: { position: 'right', labels: { color: '#ccc', font: { size: 11 }, boxWidth: 12 } } } }
+  }),
 };
 async function tick() {
   const r = await fetch('/api/data');
@@ -186,6 +196,15 @@ async function tick() {
   const gen = tp.generated_tokens ?? 0;
   document.getElementById('rate').textContent = dec_us ? (gen/(dec_us/1e6)).toFixed(1) : '—';
   document.getElementById('gpuutil').textContent = g.gpu_util != null ? g.gpu_util.toFixed(0) : '—';
+  const h = d.history || [];
+  let gpuBusyPct = null;
+  if (h.length >= 2) {
+    const a = h[h.length - 2], b = h[h.length - 1];
+    const dt = (b.ts - a.ts) * 1e6;
+    const df = (b.forward_busy_micros || 0) - (a.forward_busy_micros || 0);
+    if (dt > 0 && df >= 0) gpuBusyPct = (df / dt) * 100;
+  }
+  document.getElementById('gpubusy').textContent = gpuBusyPct != null ? gpuBusyPct.toFixed(1) + '%' : '—';
   document.getElementById('gpumem').textContent = g.mem_used != null ? (g.mem_used/1024).toFixed(1)+'GB' : '—';
   document.getElementById('power').textContent = g.power != null ? g.power.toFixed(0) : '—';
   const ds = spec.available ? 'ON' : 'off';
@@ -194,7 +213,6 @@ async function tick() {
   dsEl.className = 'value ' + (spec.available ? 'green' : 'red');
   if (spec.available && spec.accept_rate != null)
     dsEl.textContent += ' (' + (spec.accept_rate*100).toFixed(0) + '%)';
-  const h = d.history || [];
   if (h.length) {
     const setData = (c, mapper) => {
       c.data.labels = h.map(() => '');
@@ -202,7 +220,7 @@ async function tick() {
       c.update('none');
     };
     setData(charts.rate, p => p.decode_rate || 0);
-    setData(charts.active, p => p.active || 0);
+    setData(charts.active, p => p.active_requests || 0);
     setData(charts.kv, p => p.kv_used || 0);
     setData(charts.accept, p => (p.accept_rate || 0) * 100);
     setData(charts.gpu, p => p.gpu_util || 0);
@@ -213,6 +231,15 @@ async function tick() {
     charts.opTiming.data.labels = topOps.map(o => o.name);
     charts.opTiming.data.datasets[0].data = topOps.map(o => +(o.total_micros / 1000).toFixed(1));
     charts.opTiming.update('none');
+    const sortedOps = [...opTiming].sort((a, b) => b.total_micros - a.total_micros);
+    const top8 = sortedOps.slice(0, 8);
+    const restMicros = sortedOps.slice(8).reduce((s, o) => s + o.total_micros, 0);
+    const shareLabels = top8.map(o => o.name);
+    const shareData = top8.map(o => o.total_micros);
+    if (restMicros > 0) { shareLabels.push('other'); shareData.push(restMicros); }
+    charts.opShare.data.labels = shareLabels;
+    charts.opShare.data.datasets[0].data = shareData;
+    charts.opShare.update('none');
   }
   const rows = [
     ['KV resident (GPU)', kv.resident_pages ?? 0],

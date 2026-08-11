@@ -1074,7 +1074,9 @@ impl QwenCudaExecutor {
             .decode_ctx
             .as_ref()
             .expect("decode_ctx present when sampling captured logits");
-        sample_cuda_token(&self.model.ctx, &decode_ctx.logits, params, position)
+        crate::profile::profile_op(&self.model.ctx, "sample", None, 1, || {
+            sample_cuda_token(&self.model.ctx, &decode_ctx.logits, params, position)
+        })
     }
 
     /// Loud-error continuity guard replacing the old device-allocator
