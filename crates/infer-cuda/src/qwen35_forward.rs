@@ -483,7 +483,7 @@ impl Qwen35Model {
                     .moe_config
                     .as_ref()
                     .ok_or_else(|| anyhow!("MoE layer present but model has no moe_config"))?;
-                qwen35_profile(&self.ctx, "qwen/moe_ffn", Some(layer_idx), seq_len, || {
+                crate::profile::profile_op(&self.ctx, "moe_ffn", Some(layer_idx), seq_len, || {
                     moe_forward_into(
                         &self.ctx,
                         moe_weights,
@@ -499,9 +499,9 @@ impl Qwen35Model {
                     .mlp
                     .as_ref()
                     .ok_or_else(|| anyhow!("dense layer missing both mlp and moe weights"))?;
-                qwen35_profile(
+                crate::profile::profile_op(
                     &self.ctx,
-                    "qwen/dense_ffn",
+                    "dense_ffn",
                     Some(layer_idx),
                     seq_len,
                     || self.dense_mlp(mlp, mlp_in, dense, mlp_out, Some((layer_idx, start_pos))),
@@ -511,9 +511,9 @@ impl Qwen35Model {
             // sums this rank's routed experts (non-local routes contribute zero)
             // + the column/row-sharded shared expert; the dense branch is a
             // row-parallel down_proj partial. No-op on a single GPU.
-            qwen35_profile(
+            crate::profile::profile_op(
                 &self.ctx,
-                "qwen/ffn_allreduce",
+                "ffn_allreduce",
                 Some(layer_idx),
                 seq_len,
                 || self.tp.all_reduce_sum(&self.ctx, mlp_out),
@@ -523,9 +523,9 @@ impl Qwen35Model {
             // The post-attn sum lives in `hidden_mid`; add_batch reads
             // hidden_mid/mlp_out and writes `hidden` (whose previous value is
             // dead).
-            qwen35_profile(
+            crate::profile::profile_op(
                 &self.ctx,
-                "qwen/ffn_residual",
+                "ffn_residual",
                 Some(layer_idx),
                 seq_len,
                 || add_batch(&self.ctx, hidden_mid, mlp_out, hidden),
@@ -557,13 +557,13 @@ impl Qwen35Model {
         params: &SamplingParams,
         position: u64,
     ) -> Result<(u32, Option<f32>)> {
-        qwen35_profile(&self.ctx, "qwen/forward_hidden", None, tokens.len(), || {
+        crate::profile::profile_op(&self.ctx, "forward_hidden", None, tokens.len(), || {
             self.forward_hidden(slot, ws, tokens, start_pos)
         })?;
-        qwen35_profile(&self.ctx, "qwen/lm_head", None, tokens.len(), || {
+        crate::profile::profile_op(&self.ctx, "lm_head", None, tokens.len(), || {
             self.lm_head_logits(ws, tokens.len())
         })?;
-        qwen35_profile(&self.ctx, "qwen/sample", None, tokens.len(), || {
+        crate::profile::profile_op(&self.ctx, "sample", None, tokens.len(), || {
             self.sample_workspace_logits(ws, params, position)
         })
     }
@@ -614,10 +614,16 @@ impl Qwen35Model {
             len: seq_len,
             capture: None,
         }];
-        self.forward_hidden_staged(&mut rows, ws, start_pos, Some(recall), taps)?;
+        crate::profile::profile_op(&self.ctx, "forward_hidden", None, seq_len, || {
+            self.forward_hidden_staged(&mut rows, ws, start_pos, Some(recall), taps)
+        })?;
         rows[0].slot.seq_len += seq_len;
-        self.lm_head_logits(ws, seq_len)?;
-        self.sample_workspace_logits(ws, params, position)
+        crate::profile::profile_op(&self.ctx, "lm_head", None, seq_len, || {
+            self.lm_head_logits(ws, seq_len)
+        })?;
+        crate::profile::profile_op(&self.ctx, "sample", None, seq_len, || {
+            self.sample_workspace_logits(ws, params, position)
+        })
     }
 
     /// Final norm (offset) + LM head on the last token only, into `ws.logits`.
@@ -641,11 +647,17 @@ impl Qwen35Model {
         // Shape-matched re-get returns the SAME buffer forward_hidden filled.
         let hidden = hidden.get(&self.ctx, hidden_size, seq_len)?;
         let last_hidden = last_hidden.get(&self.ctx, hidden_size)?;
-        copy_row_to_vec(&self.ctx, hidden, seq_len - 1, last_hidden)?;
+        crate::profile::profile_op(&self.ctx, "lm_head_slice", None, seq_len, || {
+            copy_row_to_vec(&self.ctx, hidden, seq_len - 1, last_hidden)
+        })?;
         let last_normed = last_normed.get(&self.ctx, hidden_size)?;
-        rms_norm_offset_vec(&self.ctx, last_hidden, &self.norm, eps, last_normed)?;
+        crate::profile::profile_op(&self.ctx, "final_norm", None, seq_len, || {
+            rms_norm_offset_vec(&self.ctx, last_hidden, &self.norm, eps, last_normed)
+        })?;
         let logits = logits.get(&self.ctx, self.output_projection().rows)?;
-        gemv(&self.ctx, self.output_projection(), last_normed, logits)?;
+        crate::profile::profile_op(&self.ctx, "lm_head_gemv", None, seq_len, || {
+            gemv(&self.ctx, self.output_projection(), last_normed, logits)
+        })?;
         Ok(())
     }
 
@@ -726,12 +738,16 @@ impl Qwen35Model {
         // rms_norm fully overwrites `normed` before the lm-head GEMM reads it.
         let hidden = hidden.get(&self.ctx, hidden_size, seq_len)?;
         let normed = normed.get(&self.ctx, hidden_size, seq_len)?;
-        rms_norm_offset(&self.ctx, hidden, &self.norm, eps, normed)?;
+        crate::profile::profile_op(&self.ctx, "final_norm", None, seq_len, || {
+            rms_norm_offset(&self.ctx, hidden, &self.norm, eps, normed)
+        })?;
         let vocab = self.output_projection().rows;
         // The logits buffer is RETURNED to the OPD caller (ownership leaves the
         // forward), so it stays a per-call allocation — not a workspace slot.
         let mut logits = HiddenStates::zeros(&self.ctx, vocab, seq_len)?;
-        gemm_batch(&self.ctx, self.output_projection(), normed, &mut logits)?;
+        crate::profile::profile_op(&self.ctx, "lm_head_gemm", None, seq_len, || {
+            gemm_batch(&self.ctx, self.output_projection(), normed, &mut logits)
+        })?;
         self.ctx.sync()?;
 
         // `HiddenStates` is a `[vocab, seq_len]` column-batch over a flat device
@@ -771,15 +787,21 @@ impl Qwen35Model {
         let mut last_hidden = DeviceVec::zeros(&self.ctx, hidden_size)?;
         {
             let hidden = ws.hidden.get(&self.ctx, hidden_size, seq_len)?;
-            copy_row_to_vec(&self.ctx, hidden, seq_len - 1, &mut last_hidden)?;
+            crate::profile::profile_op(&self.ctx, "lm_head_slice", None, seq_len, || {
+                copy_row_to_vec(&self.ctx, hidden, seq_len - 1, &mut last_hidden)
+            })?;
         }
         let Qwen35Workspace { hidden, normed, .. } = ws;
         let hidden = hidden.get(&self.ctx, hidden_size, seq_len)?;
         let normed = normed.get(&self.ctx, hidden_size, seq_len)?;
-        rms_norm_offset(&self.ctx, hidden, &self.norm, eps, normed)?;
+        crate::profile::profile_op(&self.ctx, "final_norm", None, seq_len, || {
+            rms_norm_offset(&self.ctx, hidden, &self.norm, eps, normed)
+        })?;
         let vocab = self.output_projection().rows;
         let mut logits = HiddenStates::zeros(&self.ctx, vocab, seq_len)?;
-        gemm_batch(&self.ctx, self.output_projection(), normed, &mut logits)?;
+        crate::profile::profile_op(&self.ctx, "lm_head_gemm", None, seq_len, || {
+            gemm_batch(&self.ctx, self.output_projection(), normed, &mut logits)
+        })?;
         self.ctx.sync()?;
         let logits_vec = DeviceVec {
             data: logits.data,
@@ -816,18 +838,24 @@ impl Qwen35Model {
         let mut hiddens = DeviceVec::zeros(&self.ctx, seq_len * hidden_size)?;
         {
             let hidden = ws.hidden.get(&self.ctx, hidden_size, seq_len)?;
-            self.ctx
-                .stream
-                .memcpy_dtod(&hidden.data, &mut hiddens.data)
-                .map_err(|e| anyhow!("verify hidden batch capture failed: {e}"))?;
+            crate::profile::profile_op(&self.ctx, "verify_hidden_capture", None, seq_len, || {
+                self.ctx
+                    .stream
+                    .memcpy_dtod(&hidden.data, &mut hiddens.data)
+                    .map_err(|e| anyhow!("verify hidden batch capture failed: {e}"))
+            })?;
         }
         let Qwen35Workspace { hidden, normed, .. } = ws;
         let hidden = hidden.get(&self.ctx, hidden_size, seq_len)?;
         let normed = normed.get(&self.ctx, hidden_size, seq_len)?;
-        rms_norm_offset(&self.ctx, hidden, &self.norm, eps, normed)?;
+        crate::profile::profile_op(&self.ctx, "final_norm", None, seq_len, || {
+            rms_norm_offset(&self.ctx, hidden, &self.norm, eps, normed)
+        })?;
         let vocab = self.output_projection().rows;
         let mut logits = HiddenStates::zeros(&self.ctx, vocab, seq_len)?;
-        gemm_batch(&self.ctx, self.output_projection(), normed, &mut logits)?;
+        crate::profile::profile_op(&self.ctx, "lm_head_gemm", None, seq_len, || {
+            gemm_batch(&self.ctx, self.output_projection(), normed, &mut logits)
+        })?;
         self.ctx.sync()?;
         let logits_vec = DeviceVec {
             data: logits.data,
@@ -883,13 +911,15 @@ impl Qwen35Model {
         let Qwen35Workspace { hidden, normed, .. } = ws;
         let hidden = hidden.get(&self.ctx, hidden_size, seq_len)?;
         let normed = normed.get(&self.ctx, hidden_size, seq_len)?;
-        rms_norm_offset(
-            &self.ctx,
-            hidden,
-            &self.norm,
-            self.config.rms_norm_eps,
-            normed,
-        )?;
+        crate::profile::profile_op(&self.ctx, "final_norm", None, seq_len, || {
+            rms_norm_offset(
+                &self.ctx,
+                hidden,
+                &self.norm,
+                self.config.rms_norm_eps,
+                normed,
+            )
+        })?;
         self.ctx.sync()?;
         let last_hidden = normed.to_host(&self.ctx)?;
         Ok((features, last_hidden))

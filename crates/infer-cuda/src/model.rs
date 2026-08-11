@@ -135,7 +135,9 @@ impl CudaModel {
         let token_ids: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
         let token_ids = upload_i32(&self.ctx, &token_ids)?;
         let mut hidden = HiddenStates::zeros(&self.ctx, hidden_size, seq_len)?;
-        embedding_batch(&self.ctx, &self.embed_tokens, &token_ids, &mut hidden)?;
+        crate::profile::profile_op(&self.ctx, "embedding", None, seq_len, || {
+            embedding_batch(&self.ctx, &self.embed_tokens, &token_ids, &mut hidden)
+        })?;
 
         let mut normed = HiddenStates::zeros(&self.ctx, hidden_size, seq_len)?;
         let mut q_batch = HiddenStates::zeros(&self.ctx, q_dim, seq_len)?;
@@ -150,91 +152,106 @@ impl CudaModel {
 
         let meta = PageMeta::for_slot(&self.ctx, pool, slot, start_pos, seq_len)?;
         for (layer_idx, layer) in self.layers.iter().enumerate() {
-            rms_norm_batch(
-                &self.ctx,
-                &hidden,
-                &layer.input_layernorm,
-                self.config.rms_norm_eps,
-                &mut normed,
-            )?;
-            gemm_batch(&self.ctx, &layer.attention.q_proj, &normed, &mut q_batch)?;
-            gemm_batch(&self.ctx, &layer.attention.k_proj, &normed, &mut k_batch)?;
-            gemm_batch(&self.ctx, &layer.attention.v_proj, &normed, &mut v_batch)?;
-            paged_attention(
-                &self.ctx,
-                layer_idx,
-                pool,
-                &mut q_batch,
-                &mut k_batch,
-                &v_batch,
-                &layer.attention.q_norm,
-                &layer.attention.k_norm,
-                &self.cos_cache,
-                &self.sin_cache,
-                self.config.rms_norm_eps,
-                &meta,
-                self.local_q_heads,
-                self.local_kv_heads,
-                self.config.head_dim,
-                &mut attn_output,
-            )?;
-            gemm_batch(&self.ctx, &layer.attention.o_proj, &attn_output, &mut o_buf)?;
-            // Row-parallel o_proj: sum the per-rank partials (no-op single-GPU).
-            self.tp.all_reduce_sum(&self.ctx, &mut o_buf)?;
-            add_batch(&self.ctx, &hidden, &o_buf, &mut hidden_out)?;
+            crate::profile::profile_op(&self.ctx, "input_norm", Some(layer_idx), seq_len, || {
+                rms_norm_batch(
+                    &self.ctx,
+                    &hidden,
+                    &layer.input_layernorm,
+                    self.config.rms_norm_eps,
+                    &mut normed,
+                )
+            })?;
+            crate::profile::profile_op(&self.ctx, "attention", Some(layer_idx), seq_len, || {
+                gemm_batch(&self.ctx, &layer.attention.q_proj, &normed, &mut q_batch)?;
+                gemm_batch(&self.ctx, &layer.attention.k_proj, &normed, &mut k_batch)?;
+                gemm_batch(&self.ctx, &layer.attention.v_proj, &normed, &mut v_batch)?;
+                paged_attention(
+                    &self.ctx,
+                    layer_idx,
+                    pool,
+                    &mut q_batch,
+                    &mut k_batch,
+                    &v_batch,
+                    &layer.attention.q_norm,
+                    &layer.attention.k_norm,
+                    &self.cos_cache,
+                    &self.sin_cache,
+                    self.config.rms_norm_eps,
+                    &meta,
+                    self.local_q_heads,
+                    self.local_kv_heads,
+                    self.config.head_dim,
+                    &mut attn_output,
+                )?;
+                gemm_batch(&self.ctx, &layer.attention.o_proj, &attn_output, &mut o_buf)?;
+                // Row-parallel o_proj: sum the per-rank partials (no-op single-GPU).
+                self.tp.all_reduce_sum(&self.ctx, &mut o_buf)?;
+                add_batch(&self.ctx, &hidden, &o_buf, &mut hidden_out)
+            })?;
             std::mem::swap(&mut hidden, &mut hidden_out);
 
-            rms_norm_batch(
-                &self.ctx,
-                &hidden,
-                &layer.post_attention_layernorm,
-                self.config.rms_norm_eps,
-                &mut normed,
-            )?;
-            if let Some(moe) = &layer.moe {
-                let cfg = self.moe_config.as_ref().ok_or_else(|| {
-                    anyhow::anyhow!("MoE layer present but model has no moe_config")
-                })?;
-                // Dense-path MoE has no EP split (single-rank expert ownership).
-                let split = crate::moe_config::ExpertSplit::single(cfg.num_experts);
-                let moe_out = moe_forward(&self.ctx, moe, &normed, cfg, &split)?;
-                self.ctx
-                    .stream
-                    .memcpy_dtod(&moe_out.data, &mut o_buf.data)
-                    .map_err(|e| anyhow::anyhow!("MoE output D2D into o_buf failed: {e}"))?;
-            } else {
-                let mlp = layer.mlp.as_ref().ok_or_else(|| {
-                    anyhow::anyhow!("dense layer missing both mlp and moe weights")
-                })?;
-                gemm_batch(&self.ctx, &mlp.gate_proj, &normed, &mut gate_out)?;
-                gemm_batch(&self.ctx, &mlp.up_proj, &normed, &mut up_out)?;
-                silu_mul(&self.ctx, &gate_out, &up_out, &mut act_out)?;
-                gemm_batch(&self.ctx, &mlp.down_proj, &act_out, &mut o_buf)?;
-            }
-            // Row-parallel down_proj / MoE-combine: sum the partials (no-op single-GPU).
-            self.tp.all_reduce_sum(&self.ctx, &mut o_buf)?;
-            add_batch(&self.ctx, &hidden, &o_buf, &mut hidden_out)?;
+            crate::profile::profile_op(&self.ctx, "post_norm", Some(layer_idx), seq_len, || {
+                rms_norm_batch(
+                    &self.ctx,
+                    &hidden,
+                    &layer.post_attention_layernorm,
+                    self.config.rms_norm_eps,
+                    &mut normed,
+                )
+            })?;
+            crate::profile::profile_op(&self.ctx, "mlp", Some(layer_idx), seq_len, || {
+                if let Some(moe) = &layer.moe {
+                    let cfg = self.moe_config.as_ref().ok_or_else(|| {
+                        anyhow::anyhow!("MoE layer present but model has no moe_config")
+                    })?;
+                    // Dense-path MoE has no EP split (single-rank expert ownership).
+                    let split = crate::moe_config::ExpertSplit::single(cfg.num_experts);
+                    let moe_out = moe_forward(&self.ctx, moe, &normed, cfg, &split)?;
+                    self.ctx
+                        .stream
+                        .memcpy_dtod(&moe_out.data, &mut o_buf.data)
+                        .map_err(|e| anyhow::anyhow!("MoE output D2D into o_buf failed: {e}"))?;
+                } else {
+                    let mlp = layer.mlp.as_ref().ok_or_else(|| {
+                        anyhow::anyhow!("dense layer missing both mlp and moe weights")
+                    })?;
+                    gemm_batch(&self.ctx, &mlp.gate_proj, &normed, &mut gate_out)?;
+                    gemm_batch(&self.ctx, &mlp.up_proj, &normed, &mut up_out)?;
+                    silu_mul(&self.ctx, &gate_out, &up_out, &mut act_out)?;
+                    gemm_batch(&self.ctx, &mlp.down_proj, &act_out, &mut o_buf)?;
+                }
+                // Row-parallel down_proj / MoE-combine: sum the partials (no-op single-GPU).
+                self.tp.all_reduce_sum(&self.ctx, &mut o_buf)?;
+                add_batch(&self.ctx, &hidden, &o_buf, &mut hidden_out)
+            })?;
             std::mem::swap(&mut hidden, &mut hidden_out);
         }
 
         let mut last_hidden = DeviceVec::zeros(&self.ctx, hidden_size)?;
-        copy_row_to_vec(&self.ctx, &hidden, seq_len - 1, &mut last_hidden)?;
         let mut last_normed = DeviceVec::zeros(&self.ctx, hidden_size)?;
-        rms_norm_vec(
-            &self.ctx,
-            &last_hidden,
-            &self.norm,
-            self.config.rms_norm_eps,
-            &mut last_normed,
-        )?;
-        let mut logits = DeviceVec::zeros(&self.ctx, self.output_projection().rows)?;
-        gemv(
-            &self.ctx,
-            self.output_projection(),
-            &last_normed,
-            &mut logits,
-        )?;
-        sample_cuda_token(&self.ctx, &logits, params, position)
+        crate::profile::profile_op(&self.ctx, "lm_head", None, seq_len, || {
+            copy_row_to_vec(&self.ctx, &hidden, seq_len - 1, &mut last_hidden)?;
+            rms_norm_vec(
+                &self.ctx,
+                &last_hidden,
+                &self.norm,
+                self.config.rms_norm_eps,
+                &mut last_normed,
+            )?;
+            let mut logits = DeviceVec::zeros(&self.ctx, self.output_projection().rows)?;
+            gemv(
+                &self.ctx,
+                self.output_projection(),
+                &last_normed,
+                &mut logits,
+            )?;
+            Ok(logits)
+        })
+        .and_then(|logits| {
+            crate::profile::profile_op(&self.ctx, "sample", None, seq_len, || {
+                sample_cuda_token(&self.ctx, &logits, params, position)
+            })
+        })
     }
 
     /// Batched decode forward (BF16, single-GPU): run `tokens.len() == B`
@@ -292,7 +309,9 @@ impl CudaModel {
         let token_ids: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
         let token_ids = upload_i32(&self.ctx, &token_ids)?;
         let mut hidden = HiddenStates::zeros(&self.ctx, hidden_size, seq_len)?;
-        embedding_batch(&self.ctx, &self.embed_tokens, &token_ids, &mut hidden)?;
+        crate::profile::profile_op(&self.ctx, "embedding", None, seq_len, || {
+            embedding_batch(&self.ctx, &self.embed_tokens, &token_ids, &mut hidden)
+        })?;
 
         let mut normed = HiddenStates::zeros(&self.ctx, hidden_size, seq_len)?;
         let mut q_batch = HiddenStates::zeros(&self.ctx, q_dim, seq_len)?;
@@ -306,69 +325,77 @@ impl CudaModel {
         let mut act_out = HiddenStates::zeros(&self.ctx, inter, seq_len)?;
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
-            rms_norm_batch(
-                &self.ctx,
-                &hidden,
-                &layer.input_layernorm,
-                self.config.rms_norm_eps,
-                &mut normed,
-            )?;
-            gemm_batch(&self.ctx, &layer.attention.q_proj, &normed, &mut q_batch)?;
-            gemm_batch(&self.ctx, &layer.attention.k_proj, &normed, &mut k_batch)?;
-            gemm_batch(&self.ctx, &layer.attention.v_proj, &normed, &mut v_batch)?;
-            // Batched paged decode: meta.seq_len == 1 routes to decode_attention,
-            // meta.batch == B launches prep + attention over (B, B, 1).
-            paged_attention(
-                &self.ctx,
-                layer_idx,
-                pool,
-                &mut q_batch,
-                &mut k_batch,
-                &v_batch,
-                &layer.attention.q_norm,
-                &layer.attention.k_norm,
-                &self.cos_cache,
-                &self.sin_cache,
-                self.config.rms_norm_eps,
-                meta,
-                self.local_q_heads,
-                self.local_kv_heads,
-                self.config.head_dim,
-                &mut attn_output,
-            )?;
-            gemm_batch(&self.ctx, &layer.attention.o_proj, &attn_output, &mut o_buf)?;
-            self.tp.all_reduce_sum(&self.ctx, &mut o_buf)?;
-            add_batch(&self.ctx, &hidden, &o_buf, &mut hidden_out)?;
+            crate::profile::profile_op(&self.ctx, "input_norm", Some(layer_idx), seq_len, || {
+                rms_norm_batch(
+                    &self.ctx,
+                    &hidden,
+                    &layer.input_layernorm,
+                    self.config.rms_norm_eps,
+                    &mut normed,
+                )
+            })?;
+            crate::profile::profile_op(&self.ctx, "attention", Some(layer_idx), seq_len, || {
+                gemm_batch(&self.ctx, &layer.attention.q_proj, &normed, &mut q_batch)?;
+                gemm_batch(&self.ctx, &layer.attention.k_proj, &normed, &mut k_batch)?;
+                gemm_batch(&self.ctx, &layer.attention.v_proj, &normed, &mut v_batch)?;
+                // Batched paged decode: meta.seq_len == 1 routes to decode_attention,
+                // meta.batch == B launches prep + attention over (B, B, 1).
+                paged_attention(
+                    &self.ctx,
+                    layer_idx,
+                    pool,
+                    &mut q_batch,
+                    &mut k_batch,
+                    &v_batch,
+                    &layer.attention.q_norm,
+                    &layer.attention.k_norm,
+                    &self.cos_cache,
+                    &self.sin_cache,
+                    self.config.rms_norm_eps,
+                    meta,
+                    self.local_q_heads,
+                    self.local_kv_heads,
+                    self.config.head_dim,
+                    &mut attn_output,
+                )?;
+                gemm_batch(&self.ctx, &layer.attention.o_proj, &attn_output, &mut o_buf)?;
+                self.tp.all_reduce_sum(&self.ctx, &mut o_buf)?;
+                add_batch(&self.ctx, &hidden, &o_buf, &mut hidden_out)
+            })?;
             std::mem::swap(&mut hidden, &mut hidden_out);
 
-            rms_norm_batch(
-                &self.ctx,
-                &hidden,
-                &layer.post_attention_layernorm,
-                self.config.rms_norm_eps,
-                &mut normed,
-            )?;
-            if let Some(moe) = &layer.moe {
-                let cfg = self.moe_config.as_ref().ok_or_else(|| {
-                    anyhow::anyhow!("MoE layer present but model has no moe_config")
-                })?;
-                let split = crate::moe_config::ExpertSplit::single(cfg.num_experts);
-                let moe_out = moe_forward(&self.ctx, moe, &normed, cfg, &split)?;
-                self.ctx
-                    .stream
-                    .memcpy_dtod(&moe_out.data, &mut o_buf.data)
-                    .map_err(|e| anyhow::anyhow!("MoE output D2D into o_buf failed: {e}"))?;
-            } else {
-                let mlp = layer.mlp.as_ref().ok_or_else(|| {
-                    anyhow::anyhow!("dense layer missing both mlp and moe weights")
-                })?;
-                gemm_batch(&self.ctx, &mlp.gate_proj, &normed, &mut gate_out)?;
-                gemm_batch(&self.ctx, &mlp.up_proj, &normed, &mut up_out)?;
-                silu_mul(&self.ctx, &gate_out, &up_out, &mut act_out)?;
-                gemm_batch(&self.ctx, &mlp.down_proj, &act_out, &mut o_buf)?;
-            }
-            self.tp.all_reduce_sum(&self.ctx, &mut o_buf)?;
-            add_batch(&self.ctx, &hidden, &o_buf, &mut hidden_out)?;
+            crate::profile::profile_op(&self.ctx, "post_norm", Some(layer_idx), seq_len, || {
+                rms_norm_batch(
+                    &self.ctx,
+                    &hidden,
+                    &layer.post_attention_layernorm,
+                    self.config.rms_norm_eps,
+                    &mut normed,
+                )
+            })?;
+            crate::profile::profile_op(&self.ctx, "mlp", Some(layer_idx), seq_len, || {
+                if let Some(moe) = &layer.moe {
+                    let cfg = self.moe_config.as_ref().ok_or_else(|| {
+                        anyhow::anyhow!("MoE layer present but model has no moe_config")
+                    })?;
+                    let split = crate::moe_config::ExpertSplit::single(cfg.num_experts);
+                    let moe_out = moe_forward(&self.ctx, moe, &normed, cfg, &split)?;
+                    self.ctx
+                        .stream
+                        .memcpy_dtod(&moe_out.data, &mut o_buf.data)
+                        .map_err(|e| anyhow::anyhow!("MoE output D2D into o_buf failed: {e}"))?;
+                } else {
+                    let mlp = layer.mlp.as_ref().ok_or_else(|| {
+                        anyhow::anyhow!("dense layer missing both mlp and moe weights")
+                    })?;
+                    gemm_batch(&self.ctx, &mlp.gate_proj, &normed, &mut gate_out)?;
+                    gemm_batch(&self.ctx, &mlp.up_proj, &normed, &mut up_out)?;
+                    silu_mul(&self.ctx, &gate_out, &up_out, &mut act_out)?;
+                    gemm_batch(&self.ctx, &mlp.down_proj, &act_out, &mut o_buf)?;
+                }
+                self.tp.all_reduce_sum(&self.ctx, &mut o_buf)?;
+                add_batch(&self.ctx, &hidden, &o_buf, &mut hidden_out)
+            })?;
             std::mem::swap(&mut hidden, &mut hidden_out);
         }
 
@@ -377,28 +404,32 @@ impl CudaModel {
         // byte-identical to the equivalent B=1 step.
         let mut last_hidden = DeviceVec::zeros(&self.ctx, hidden_size)?;
         let mut last_normed = DeviceVec::zeros(&self.ctx, hidden_size)?;
-        let mut logits = DeviceVec::zeros(&self.ctx, self.output_projection().rows)?;
         let mut out = Vec::with_capacity(batch);
         for row in 0..batch {
-            copy_row_to_vec(&self.ctx, &hidden, row, &mut last_hidden)?;
-            rms_norm_vec(
+            let logits = crate::profile::profile_op(&self.ctx, "lm_head", None, seq_len, || {
+                copy_row_to_vec(&self.ctx, &hidden, row, &mut last_hidden)?;
+                rms_norm_vec(
+                    &self.ctx,
+                    &last_hidden,
+                    &self.norm,
+                    self.config.rms_norm_eps,
+                    &mut last_normed,
+                )?;
+                let mut logits = DeviceVec::zeros(&self.ctx, self.output_projection().rows)?;
+                gemv(
+                    &self.ctx,
+                    self.output_projection(),
+                    &last_normed,
+                    &mut logits,
+                )?;
+                Ok(logits)
+            })?;
+            out.push(crate::profile::profile_op(
                 &self.ctx,
-                &last_hidden,
-                &self.norm,
-                self.config.rms_norm_eps,
-                &mut last_normed,
-            )?;
-            gemv(
-                &self.ctx,
-                self.output_projection(),
-                &last_normed,
-                &mut logits,
-            )?;
-            out.push(sample_cuda_token(
-                &self.ctx,
-                &logits,
-                &params[row],
-                positions[row],
+                "sample",
+                None,
+                seq_len,
+                || sample_cuda_token(&self.ctx, &logits, &params[row], positions[row]),
             )?);
         }
         Ok(out)
@@ -445,7 +476,9 @@ impl CudaModel {
 
         let token_ids = upload_i32(&self.ctx, &[last_token as i32])?;
         let mut hidden = HiddenStates::zeros(&self.ctx, hidden_size, seq_len)?;
-        embedding_batch(&self.ctx, &self.embed_tokens, &token_ids, &mut hidden)?;
+        crate::profile::profile_op(&self.ctx, "embedding", None, seq_len, || {
+            embedding_batch(&self.ctx, &self.embed_tokens, &token_ids, &mut hidden)
+        })?;
 
         let mut normed = HiddenStates::zeros(&self.ctx, hidden_size, seq_len)?;
         let mut q_batch = HiddenStates::zeros(&self.ctx, q_dim, seq_len)?;
@@ -460,98 +493,110 @@ impl CudaModel {
 
         let mut layer0_query: Vec<f32> = Vec::new();
         for (layer_idx, layer) in self.layers.iter().enumerate() {
-            rms_norm_batch(
-                &self.ctx,
-                &hidden,
-                &layer.input_layernorm,
-                self.config.rms_norm_eps,
-                &mut normed,
-            )?;
-            gemm_batch(&self.ctx, &layer.attention.q_proj, &normed, &mut q_batch)?;
-            gemm_batch(&self.ctx, &layer.attention.k_proj, &normed, &mut k_batch)?;
-            gemm_batch(&self.ctx, &layer.attention.v_proj, &normed, &mut v_batch)?;
-            paged_attention(
-                &self.ctx,
-                layer_idx,
-                pool,
-                &mut q_batch,
-                &mut k_batch,
-                &v_batch,
-                &layer.attention.q_norm,
-                &layer.attention.k_norm,
-                &self.cos_cache,
-                &self.sin_cache,
-                self.config.rms_norm_eps,
-                recall_meta,
-                self.local_q_heads,
-                self.local_kv_heads,
-                self.config.head_dim,
-                &mut attn_output,
-            )?;
-            if layer_idx == 0 {
-                // Capture the post-RoPE layer-0 query (q_batch is RoPE'd in place
-                // by `paged_attention`'s prep) for the next-step `q · rep` score.
-                let host: Vec<half::bf16> = self
-                    .ctx
-                    .stream
-                    .clone_dtoh(&q_batch.data)
-                    .map_err(|e| anyhow::anyhow!("recall layer-0 query dtoh failed: {e}"))?;
-                layer0_query = host.iter().map(|v| v.to_f32()).collect();
-            }
-            gemm_batch(&self.ctx, &layer.attention.o_proj, &attn_output, &mut o_buf)?;
-            self.tp.all_reduce_sum(&self.ctx, &mut o_buf)?;
-            add_batch(&self.ctx, &hidden, &o_buf, &mut hidden_out)?;
+            crate::profile::profile_op(&self.ctx, "input_norm", Some(layer_idx), seq_len, || {
+                rms_norm_batch(
+                    &self.ctx,
+                    &hidden,
+                    &layer.input_layernorm,
+                    self.config.rms_norm_eps,
+                    &mut normed,
+                )
+            })?;
+            crate::profile::profile_op(&self.ctx, "attention", Some(layer_idx), seq_len, || {
+                gemm_batch(&self.ctx, &layer.attention.q_proj, &normed, &mut q_batch)?;
+                gemm_batch(&self.ctx, &layer.attention.k_proj, &normed, &mut k_batch)?;
+                gemm_batch(&self.ctx, &layer.attention.v_proj, &normed, &mut v_batch)?;
+                paged_attention(
+                    &self.ctx,
+                    layer_idx,
+                    pool,
+                    &mut q_batch,
+                    &mut k_batch,
+                    &v_batch,
+                    &layer.attention.q_norm,
+                    &layer.attention.k_norm,
+                    &self.cos_cache,
+                    &self.sin_cache,
+                    self.config.rms_norm_eps,
+                    recall_meta,
+                    self.local_q_heads,
+                    self.local_kv_heads,
+                    self.config.head_dim,
+                    &mut attn_output,
+                )?;
+                if layer_idx == 0 {
+                    // Capture the post-RoPE layer-0 query (q_batch is RoPE'd in place
+                    // by `paged_attention`'s prep) for the next-step `q · rep` score.
+                    let host: Vec<half::bf16> =
+                        self.ctx.stream.clone_dtoh(&q_batch.data).map_err(|e| {
+                            anyhow::anyhow!("recall layer-0 query dtoh failed: {e}")
+                        })?;
+                    layer0_query = host.iter().map(|v| v.to_f32()).collect();
+                }
+                gemm_batch(&self.ctx, &layer.attention.o_proj, &attn_output, &mut o_buf)?;
+                self.tp.all_reduce_sum(&self.ctx, &mut o_buf)?;
+                add_batch(&self.ctx, &hidden, &o_buf, &mut hidden_out)
+            })?;
             std::mem::swap(&mut hidden, &mut hidden_out);
 
-            rms_norm_batch(
-                &self.ctx,
-                &hidden,
-                &layer.post_attention_layernorm,
-                self.config.rms_norm_eps,
-                &mut normed,
-            )?;
-            if let Some(moe) = &layer.moe {
-                let cfg = self.moe_config.as_ref().ok_or_else(|| {
-                    anyhow::anyhow!("MoE layer present but model has no moe_config")
-                })?;
-                let split = crate::moe_config::ExpertSplit::single(cfg.num_experts);
-                let moe_out = moe_forward(&self.ctx, moe, &normed, cfg, &split)?;
-                self.ctx
-                    .stream
-                    .memcpy_dtod(&moe_out.data, &mut o_buf.data)
-                    .map_err(|e| anyhow::anyhow!("MoE output D2D into o_buf failed: {e}"))?;
-            } else {
-                let mlp = layer.mlp.as_ref().ok_or_else(|| {
-                    anyhow::anyhow!("dense layer missing both mlp and moe weights")
-                })?;
-                gemm_batch(&self.ctx, &mlp.gate_proj, &normed, &mut gate_out)?;
-                gemm_batch(&self.ctx, &mlp.up_proj, &normed, &mut up_out)?;
-                silu_mul(&self.ctx, &gate_out, &up_out, &mut act_out)?;
-                gemm_batch(&self.ctx, &mlp.down_proj, &act_out, &mut o_buf)?;
-            }
-            self.tp.all_reduce_sum(&self.ctx, &mut o_buf)?;
-            add_batch(&self.ctx, &hidden, &o_buf, &mut hidden_out)?;
+            crate::profile::profile_op(&self.ctx, "post_norm", Some(layer_idx), seq_len, || {
+                rms_norm_batch(
+                    &self.ctx,
+                    &hidden,
+                    &layer.post_attention_layernorm,
+                    self.config.rms_norm_eps,
+                    &mut normed,
+                )
+            })?;
+            crate::profile::profile_op(&self.ctx, "mlp", Some(layer_idx), seq_len, || {
+                if let Some(moe) = &layer.moe {
+                    let cfg = self.moe_config.as_ref().ok_or_else(|| {
+                        anyhow::anyhow!("MoE layer present but model has no moe_config")
+                    })?;
+                    let split = crate::moe_config::ExpertSplit::single(cfg.num_experts);
+                    let moe_out = moe_forward(&self.ctx, moe, &normed, cfg, &split)?;
+                    self.ctx
+                        .stream
+                        .memcpy_dtod(&moe_out.data, &mut o_buf.data)
+                        .map_err(|e| anyhow::anyhow!("MoE output D2D into o_buf failed: {e}"))?;
+                } else {
+                    let mlp = layer.mlp.as_ref().ok_or_else(|| {
+                        anyhow::anyhow!("dense layer missing both mlp and moe weights")
+                    })?;
+                    gemm_batch(&self.ctx, &mlp.gate_proj, &normed, &mut gate_out)?;
+                    gemm_batch(&self.ctx, &mlp.up_proj, &normed, &mut up_out)?;
+                    silu_mul(&self.ctx, &gate_out, &up_out, &mut act_out)?;
+                    gemm_batch(&self.ctx, &mlp.down_proj, &act_out, &mut o_buf)?;
+                }
+                self.tp.all_reduce_sum(&self.ctx, &mut o_buf)?;
+                add_batch(&self.ctx, &hidden, &o_buf, &mut hidden_out)
+            })?;
             std::mem::swap(&mut hidden, &mut hidden_out);
         }
 
         let mut last_hidden = DeviceVec::zeros(&self.ctx, hidden_size)?;
-        copy_row_to_vec(&self.ctx, &hidden, seq_len - 1, &mut last_hidden)?;
         let mut last_normed = DeviceVec::zeros(&self.ctx, hidden_size)?;
-        rms_norm_vec(
-            &self.ctx,
-            &last_hidden,
-            &self.norm,
-            self.config.rms_norm_eps,
-            &mut last_normed,
-        )?;
-        let mut logits = DeviceVec::zeros(&self.ctx, self.output_projection().rows)?;
-        gemv(
-            &self.ctx,
-            self.output_projection(),
-            &last_normed,
-            &mut logits,
-        )?;
-        let token = sample_cuda_token(&self.ctx, &logits, params, position)?;
+        let logits = crate::profile::profile_op(&self.ctx, "lm_head", None, seq_len, || {
+            copy_row_to_vec(&self.ctx, &hidden, seq_len - 1, &mut last_hidden)?;
+            rms_norm_vec(
+                &self.ctx,
+                &last_hidden,
+                &self.norm,
+                self.config.rms_norm_eps,
+                &mut last_normed,
+            )?;
+            let mut logits = DeviceVec::zeros(&self.ctx, self.output_projection().rows)?;
+            gemv(
+                &self.ctx,
+                self.output_projection(),
+                &last_normed,
+                &mut logits,
+            )?;
+            Ok(logits)
+        })?;
+        let token = crate::profile::profile_op(&self.ctx, "sample", None, seq_len, || {
+            sample_cuda_token(&self.ctx, &logits, params, position)
+        })?;
         Ok((token, layer0_query))
     }
 
