@@ -120,7 +120,6 @@ fn dsv4_noaux_tc_bias_drives_selection_not_weight() {
     let bias = [0.0, 0.0, 10.0, 0.0]; // but a huge selection bias
     let scores = scores_from_logits(&logits, ScoringFunc::Sigmoid).unwrap();
     let dec = route_token(&logits, &bias, &cfg).unwrap();
-    // Expert 2 must be selected first thanks to the bias.
     assert_eq!(dec.experts[0].expert, 2, "bias pulls expert 2 to the top");
     // Its weight uses the *un-biased* low score, not the corrected key.
     let sel_sum: f32 = dec.expert_ids().iter().map(|&e| scores[e]).sum();

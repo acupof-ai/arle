@@ -2,7 +2,6 @@
 
 use std::path::{Path, PathBuf};
 
-/// Compute the legacy default wired limit: model weight bytes + 1 GiB.
 pub(crate) fn auto_wired_limit_bytes(model_dir: &Path) -> Option<usize> {
     const HEADROOM: u64 = 1 << 30;
     let estimate = model_weight_size_for_path(model_dir)?;

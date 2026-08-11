@@ -5,12 +5,10 @@ use anyhow::{Context, Result};
 use crate::loader::TensorMap;
 use crate::mlx::{MlxArray, concatenate_axis, dequantize, eval, transpose_all};
 
-/// A projection weight registered with the Qwen35 compiled model.
 #[derive(Clone)]
 pub(crate) enum WeightTensor {
     /// Pre-transposed dense weight: shape `[in, out]`.
     Dense(MlxArray),
-    /// MLX affine quantized weight.
     Quantized {
         w: MlxArray,
         scales: MlxArray,
@@ -74,7 +72,6 @@ pub(crate) struct StackedQuantized {
     pub(crate) biases: MlxArray,
 }
 
-/// Load a 2-D affine-quantized projection with explicit bits/group size.
 pub(crate) fn load_quantized_with_bits(
     tensors: &TensorMap,
     base: &str,
@@ -102,7 +99,6 @@ pub(crate) fn load_quantized_with_bits(
     })
 }
 
-/// Load a 3-D affine-quantized expert stack from safetensors.
 pub(crate) fn load_stacked_quantized(tensors: &TensorMap, base: &str) -> Result<StackedQuantized> {
     let weight = tensors
         .get(&format!("{base}.weight"))
@@ -146,7 +142,6 @@ pub(crate) enum MlpInputProjection {
     },
 }
 
-/// Merge affine-quantized projections by output rows when their layouts match.
 pub(crate) fn merge_quantized_projection_rows(
     weights: &[&WeightTensor],
 ) -> Result<Option<WeightTensor>> {

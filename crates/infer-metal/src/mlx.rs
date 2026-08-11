@@ -7,7 +7,6 @@
 use std::ffi::CStr;
 use std::os::raw::c_void;
 
-/// Check the MLX C++ bridge for a pending error.
 pub fn check_mlx_error() -> anyhow::Result<()> {
     // SAFETY: mlx_last_error returned a non-null NUL-terminated bridge-owned string, read here before any further FFI.
     unsafe {
@@ -45,7 +44,6 @@ fn mlx_array_from_raw_or_panic(raw: *mut mlx_sys::mlx_array, op: &str) -> MlxArr
     MlxArray(raw)
 }
 
-/// MLX dtype values used by the Metal executor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Dtype {
     Bool,
@@ -105,7 +103,6 @@ impl Dtype {
     }
 }
 
-/// Owned MLX array handle.
 pub struct MlxArray(*mut mlx_sys::mlx_array);
 
 impl Drop for MlxArray {

@@ -106,7 +106,6 @@ fn probe_pipeline_fast_path() {
 pub(crate) static PIPELINE_FAST_PATH_HITS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-/// Read the pipeline fast-path firing count (test/bench observability).
 #[cfg(feature = "metal")]
 #[must_use]
 pub fn pipeline_fast_path_hits() -> u64 {
@@ -160,13 +159,13 @@ pub fn paged_kv_read_fallbacks() -> u64 {
     PAGED_KV_READ_FALLBACKS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// In-flight handle for a submitted Metal step.
 pub enum MetalInflight {
-    /// CPU placeholder output.
     Ready(StepOutput),
-    /// Real MLX greedy sample. `poll` materializes this scalar token.
     #[cfg(feature = "metal")]
-    Sampled { slot: usize, sampled: mlx::MlxArray },
+    Sampled {
+        slot: usize,
+        sampled: mlx::MlxArray,
+    },
 }
 
 impl std::fmt::Debug for MetalInflight {
@@ -254,7 +253,6 @@ fn warn_host_sampling_downgrade() {
     }
 }
 
-/// Metal backend executor.
 #[derive(Default)]
 pub struct MetalExecutor {
     #[cfg(feature = "metal")]
@@ -271,7 +269,6 @@ impl std::fmt::Debug for MetalExecutor {
 }
 
 impl MetalExecutor {
-    /// Build a Metal executor.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -280,14 +277,11 @@ impl MetalExecutor {
         }
     }
 
-    /// Build a real single-row greedy MLX Qwen3.5 executor from a local model
-    /// path or HuggingFace id.
     #[cfg(feature = "metal")]
     pub fn from_model_path(model_path: impl AsRef<Path>) -> anyhow::Result<Self> {
         Self::from_model_path_with_kv_cache_dtype(model_path, MetalKvCacheDtype::default())
     }
 
-    /// Build a real MLX Qwen3.5/Qwen3.6 executor with an explicit Metal KV dtype.
     #[cfg(feature = "metal")]
     pub fn from_model_path_with_kv_cache_dtype(
         model_path: impl AsRef<Path>,
@@ -603,7 +597,6 @@ struct RealMetalExecutor {
     slots: HashMap<usize, MetalSlotState>,
     page_store: MetalPageStore,
     active_session_slot: Option<usize>,
-    /// Cross-step decode prequeue (see `pipeline_decode_enabled`).
     pending: Option<PendingStep>,
     /// Opt-in single-request DFlash side path. When present, decode must route
     /// through DFlash or fail; it must never silently fall back to target-only.
@@ -616,7 +609,6 @@ struct RealMetalExecutor {
     /// Recall budget regions (validated defaults). Carved into sink + recalled
     /// top-k + local; the working set is bounded regardless of history length.
     recall_cfg: infer_core::RecallConfig,
-    /// One-time int8-KV-with-recall fallback log latch.
     recall_int8_warned: bool,
 }
 
@@ -652,12 +644,10 @@ impl RealMetalExecutor {
         // vocab index; the output is discarded — only the graph JIT matters.
         let mut state = MetalSlotState::new(usize::MAX, 0, &self.config, self.kv_cache_dtype, 8);
         state.ensure_session_active(model)?;
-        // Tiny prefill → JIT the prefill graph + first MoE encode.
         let prefill = mlx::MlxArray::from_slice_i32(&[0, 0], &[2]);
         let logits = model.prefill_session(&prefill, 2, 0)?;
         mlx::async_eval(&[&logits]);
         state.cache_len = 2;
-        // One decode step → JIT the decode-step graph.
         let step = mlx::MlxArray::from_slice_i32(&[0], &[1]);
         let logits = model.step_session(&step, state.cache_len as i32)?;
         mlx::async_eval(&[&logits]);
@@ -1354,7 +1344,6 @@ impl RealMetalExecutor {
             if self.active_session_slot == Some(slot) {
                 self.active_session_slot = None;
             }
-            // The discarded slot's prequeued step is gone.
             if self.pending.as_ref().is_some_and(|p| p.slot == slot) {
                 self.pending = None;
             }

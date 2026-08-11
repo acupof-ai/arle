@@ -64,7 +64,6 @@ pub struct CounterSnapshot {
 /// it each tick, the frontend reads it.
 type CounterHandle = Arc<Mutex<CounterSnapshot>>;
 
-/// Publish the engine's current counters to the shared snapshot.
 fn publish_counters<E: BackendExecutor, K: KvPool>(
     engine: &Engine<E, K>,
     counters: &CounterHandle,
@@ -109,7 +108,6 @@ pub(crate) struct Submission {
     pub(crate) grammar: Option<infer_core::GrammarHook>,
 }
 
-/// The engine thread body: own the engine, drain submits, step, deliver.
 pub(crate) fn engine_loop<E, K>(
     engine: Engine<E, K>,
     submit_rx: Receiver<Submission>,
@@ -351,7 +349,6 @@ fn engine_loop_with_tick_broadcaster<E, K>(
         // is the only other place counters can go stale.
         publish_counters(&engine, &counters);
 
-        // 4. Fully idle. If the frontend is gone and nothing remains, exit.
         if !submit_open {
             // Flush any straggler completions before leaving.
             deliver_completions(&engine, &mut pending, &streamers);
@@ -394,7 +391,6 @@ fn abort_pending(pending: &mut PendingCompletions, streamers: &Streamers) {
     streamers.borrow_mut().clear();
 }
 
-/// Submit one request to the engine and register its back-channels.
 fn admit_submission<E, K>(
     engine: &mut Engine<E, K>,
     pending: &mut PendingCompletions,
@@ -431,7 +427,6 @@ fn admit_submission<E, K>(
     }
 }
 
-/// Deliver any newly-completed requests to their waiting collectors.
 fn deliver_completions<E, K>(
     engine: &Engine<E, K>,
     pending: &mut PendingCompletions,

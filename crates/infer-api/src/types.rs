@@ -41,7 +41,6 @@ impl RawLogits {
         self.shape[1]
     }
 
-    /// Copy the logits to host as f32 (`seq_len * vocab` elements, row-major).
     pub fn to_host_f32(&self) -> Result<Vec<f32>> {
         self.logits.to_host(&self.device)
     }
@@ -69,7 +68,6 @@ unsafe impl Send for RawLogits {}
 pub struct SessionId(std::sync::Arc<str>);
 
 impl SessionId {
-    /// Borrow the underlying string.
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
@@ -209,7 +207,6 @@ pub enum FinishReason {
 }
 
 impl FinishReason {
-    /// Render to the OpenAI wire string.
     #[must_use]
     pub fn as_openai_str(self) -> &'static str {
         match self {
@@ -236,9 +233,7 @@ pub struct CompletionOutput {
     pub usage: TokenUsage,
     /// Per-token log-probabilities (greedy only); always empty (not yet surfaced).
     pub token_logprobs: Vec<f32>,
-    /// Tokenized prompt the engine actually saw.
     pub prompt_token_ids: Vec<u32>,
-    /// Generated token ids.
     pub response_token_ids: Vec<u32>,
 }
 
@@ -321,7 +316,6 @@ pub struct CompletionStreamDelta {
     pub usage: Option<TokenUsage>,
     /// Log-probability of the generated token (greedy only).
     pub logprob: Option<f32>,
-    /// Token ids newly emitted in this delta.
     pub token_ids: Vec<u32>,
     /// Terminal failure, if the request failed before a normal finish delta.
     pub error: Option<CompletionStreamError>,
@@ -341,7 +335,6 @@ impl CompletionStreamDelta {
         }
     }
 
-    /// Create a terminal error delta.
     #[must_use]
     pub fn error(kind: impl Into<String>, chain: Vec<String>) -> Self {
         Self {
@@ -378,7 +371,6 @@ impl CompletionStreamError {
         }
     }
 
-    /// Flatten into an `anyhow::Error`.
     #[must_use]
     pub fn into_anyhow(self) -> anyhow::Error {
         let chain = if self.chain.is_empty() {
@@ -421,10 +413,8 @@ pub trait InferenceEngine: Send {
     /// The model identifier (e.g. `"Qwen3-8B"`).
     fn model_id(&self) -> &str;
 
-    /// Run a complete generation synchronously and return the full output.
     fn complete(&mut self, req: CompletionRequest) -> Result<CompletionOutput>;
 
-    /// Run a backend-native multimodal chat completion.
     fn complete_multimodal_chat(
         &mut self,
         _req: MultimodalChatRequest,
@@ -434,7 +424,6 @@ pub trait InferenceEngine: Send {
         ))
     }
 
-    /// Run a generation, streaming token deltas through `tx` as produced.
     fn complete_stream(
         &mut self,
         req: CompletionRequest,
@@ -472,7 +461,6 @@ pub trait InferenceEngine: Send {
         Ok(out)
     }
 
-    /// Backend-agnostic engine-level telemetry snapshot.
     fn telemetry(&self) -> EngineTelemetry {
         EngineTelemetry::default()
     }

@@ -29,13 +29,9 @@ pub struct EngineLoadConfig {
     /// the scheduler enforces it after backend budget clamps.
     #[serde(default)]
     pub max_running_requests: Option<usize>,
-    /// Physical KV pages.
     pub total_pages: usize,
-    /// Tokens per KV page.
     pub page_size: usize,
-    /// Max prompt tokens accepted at ingress.
     pub max_prompt_tokens: usize,
-    /// Max prompt+generated tokens for one request.
     pub max_total_tokens: usize,
     /// Per-request prefill chunk size; `None` = backend/model-kind default.
     #[serde(default)]
@@ -327,13 +323,10 @@ impl EngineLoadConfig {
     }
 }
 
-/// Which CUDA forward a checkpoint needs, classified from its `config.json`.
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CudaModelKind {
-    /// Dense Qwen3 (BF16).
     Qwen3Dense,
-    /// Qwen3.5 / 3.6 hybrid dense-or-MoE (BF16).
     Qwen35,
     /// DeepSeek-V4-Flash (multi-GPU only).
     Dsv4,
@@ -552,9 +545,6 @@ mod backend {
     impl EngineLoadConfig {
         pub(super) fn scheduler_config(&self) -> SchedulerConfig {
             let mut config = SchedulerConfig::for_slots(self.hot_workspace_slots());
-            // Prompt cap = min(requested, KV capacity − gen reserve). Capacity is
-            // a hard ceiling, not a floor: over-length writes past the fixed DSv4
-            // bands (#145). usize::MAX sentinel = unset → capacity-bound.
             // Prompt cap = min(requested, KV capacity − gen reserve). For shared
             // KV pools (dense Qwen3/Qwen3.6/DSv4) the device pool is profiled
             // from free VRAM after load, so `total_pages` here is just the
@@ -589,7 +579,6 @@ mod backend {
         }
     }
 
-    /// Backend-dispatching public engine; one variant per compiled backend.
     pub enum LoadedInferenceEngine {
         /// Metal backend (Apple Silicon, MLX). Fully wired and runnable.
         #[cfg(feature = "metal")]
@@ -635,7 +624,6 @@ mod backend {
     }
 
     impl LoadedInferenceEngine {
-        /// Load the inference engine for the compiled backend.
         /// `enable_cuda_graph` is honored by the CUDA path only.
         ///
         /// Single-user load (REPL, OCR): caps slots at 1 so the GDR recurrent
@@ -650,7 +638,6 @@ mod backend {
             Self::load_with_config(model_path, enable_cuda_graph, config)
         }
 
-        /// Load with explicit slot / page configuration.
         // Each arm is a feature-gated `return` (the tail arm varies by feature
         // set), so a bare expression would not compile in single-backend builds.
         #[allow(clippy::needless_return)]
@@ -706,7 +693,6 @@ mod backend {
             }
         }
 
-        /// Name of the active backend variant.
         #[must_use]
         pub fn backend_name(&self) -> &'static str {
             match self {
@@ -1495,8 +1481,6 @@ mod backend {
         }
     }
 
-    /// Build the OpenAI v1 axum router for the compiled backend.
-    ///
     /// Mirrors [`LoadedInferenceEngine::load_with_config`] but returns the bare
     /// [`axum::Router`] the in-process [`crate::serve_http`] loop binds, rather
     /// than the [`InferenceEngine`] adapter the agent/OPD callers use. Each arm
@@ -1976,7 +1960,6 @@ mod backend {
         Ok((serve, tokenizer, model_id))
     }
 
-    /// Read a CUDA checkpoint's `config.json` and classify it for `load_cuda`.
     #[cfg(feature = "cuda")]
     fn detect_cuda_model_kind(model_path: &str) -> Result<super::CudaModelKind> {
         use anyhow::Context;
@@ -2078,14 +2061,8 @@ mod backend {
         ) {
             return paged_pool_pages.max(1);
         }
-        let capacity_tokens = match kind {
-            CudaModelKind::Qwen3Dense | CudaModelKind::Qwen35 | CudaModelKind::Dsv4 => {
-                unreachable!("handled above")
-            }
-            CudaModelKind::DiffusionGemma | CudaModelKind::Qwen3MoeUnsupported => {
-                config.total_pages.saturating_mul(ps)
-            }
-        };
+        // DiffusionGemma | Qwen3MoeUnsupported
+        let capacity_tokens = config.total_pages.saturating_mul(ps);
         capacity_tokens.div_ceil(ps).max(config.total_pages)
     }
 
@@ -2442,7 +2419,6 @@ mod backend {
         Ok(infer_core::Engine::with_config(executor, kv, scheduler))
     }
 
-    /// New tokens (+ optional behavior logprob) since the last drain, per handle.
     #[cfg(feature = "cuda")]
     type PendingTokens = std::rc::Rc<
         std::cell::RefCell<
@@ -2543,65 +2519,51 @@ mod backend {
                 .retain(|&handle, _| self.engine.completed(handle).is_none() && !engine_idle);
         }
 
-        /// Whether the engine has no queued/active/in-flight work — same state
-        /// every rank evaluates, so all sides step or skip symmetrically per tick.
         #[must_use]
         pub fn is_idle(&self) -> bool {
             self.engine.is_idle()
         }
 
-        /// Run exactly one scheduler tick (apply previous output → admit
-        /// waiting → build plan → submit forward).
         pub fn step(&mut self) -> Result<()> {
             self.engine.step()
         }
 
-        /// Snapshot prefix-cache stats for the coordinator `/v1/stats` relay.
         pub fn prefix_cache_stats(&self) -> infer_core::PrefixCacheStats {
             self.engine.prefix_cache_stats()
         }
 
-        /// Snapshot throughput counters for the coordinator `/v1/stats` relay.
         pub fn throughput_stats(&self) -> infer_core::ThroughputStats {
             self.engine.throughput_stats()
         }
 
-        /// Snapshot KV tier counters for the coordinator `/v1/stats` relay.
         pub fn kv_tier_stats(&self) -> infer_core::KvTierStats {
             self.engine.kv_tier_stats()
         }
 
-        /// Snapshot KV system counters for the coordinator `/v1/stats` relay.
         pub fn kv_system_metrics(&self) -> infer_core::KvSystemMetrics {
             self.engine.kv_system_metrics()
         }
 
-        /// Snapshot spec-decode counters for the coordinator `/v1/stats` relay.
         pub fn spec_decode_stats(&self) -> infer_seam::SpecDecodeStats {
             self.engine.spec_decode_stats()
         }
 
-        /// Snapshot operator-dispatch counters for the coordinator `/v1/stats` relay.
         pub fn operator_dispatch_stats(&self) -> infer_seam::OperatorDispatchStats {
             self.engine.operator_dispatch_stats()
         }
 
-        /// Backend artifact identity for the coordinator `/v1/stats` relay.
         pub fn artifact_identity(&self) -> infer_seam::BackendArtifactIdentity {
             self.engine.artifact_identity()
         }
 
-        /// Active (running) request count.
         pub fn active_count(&self) -> usize {
             self.engine.active_count()
         }
 
-        /// Waiting (queued) request count.
         pub fn waiting_count(&self) -> usize {
             self.engine.waiting_count()
         }
 
-        /// Free KV pages remaining.
         pub fn kv_free_pages(&self) -> usize {
             self.engine.kv_free_pages()
         }

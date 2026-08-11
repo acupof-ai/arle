@@ -7,7 +7,7 @@
 
 use crate::SamplingParams;
 
-/// Index of the maximum logit (greedy / argmax). Ties resolve to the lowest index.
+/// Index of the maximum logit. Ties resolve to the lowest index.
 #[must_use]
 pub fn argmax_logit(logits: &[f32]) -> u32 {
     logits
@@ -19,13 +19,14 @@ pub fn argmax_logit(logits: &[f32]) -> u32 {
 }
 
 /// Merge per-rank `(max_logit, global_argmax)` pairs from a vocab-sharded
-/// lm_head (`ARLE_DSV4_LM_HEAD_SHARD=1`, #99) into the global greedy token.
-/// Exactly reproduces the CUDA device argmax it replaces (`sampling.cu`
-/// `warp_reduce_argmax`): max value wins, ties resolve to the LOWEST index.
-/// (NB: [`argmax_logit`]'s `max_by` resolves ties to the highest index — the
-/// device kernel, not the host helper, is this merge's parity reference.)
-/// Pure host math, so every TP rank derives the same winner from the same
-/// gathered pairs. `None` iff `pairs` is empty.
+/// lm_head into the global greedy token.
+///
+/// Reproduces the CUDA device argmax (`sampling.cu` `warp_reduce_argmax`):
+/// max value wins, ties resolve to the LOWEST index. (`argmax_logit`'s
+/// `max_by` resolves ties to the highest index — the device kernel, not the
+/// host helper, is this merge's parity reference.) Pure host math, so every
+/// TP rank derives the same winner from the same gathered pairs. `None` iff
+/// `pairs` is empty.
 #[must_use]
 pub fn merge_vocab_shard_argmax(pairs: impl IntoIterator<Item = (f32, u32)>) -> Option<u32> {
     pairs
@@ -34,7 +35,7 @@ pub fn merge_vocab_shard_argmax(pairs: impl IntoIterator<Item = (f32, u32)>) -> 
         .map(|(_, idx)| idx)
 }
 
-/// SplitMix64 — a tiny dependency-free mixer turning a seed into a u64 stream.
+/// SplitMix64 — a tiny dependency-free mixer.
 fn splitmix64(mut x: u64) -> u64 {
     x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
     let mut z = x;
@@ -43,9 +44,9 @@ fn splitmix64(mut x: u64) -> u64 {
     z ^ (z >> 31)
 }
 
-/// xgrammar bitmask semantics: bit `t` set = token `t` allowed. An all-zero
-/// mask would leave nothing to draw, so it is treated as "no constraint"
-/// rather than returning a token the grammar rejects.
+/// xgrammar bitmask: bit `t` set = token `t` allowed. An all-zero mask leaves
+/// nothing to draw, so it is treated as "no constraint" rather than returning
+/// a token the grammar rejects.
 #[must_use]
 pub fn apply_grammar_bitmask(logits: &[f32], mask: &[u32]) -> Vec<f32> {
     let allowed = |t: usize| mask.get(t / 32).is_some_and(|w| w >> (t % 32) & 1 == 1);
@@ -62,21 +63,20 @@ pub fn apply_grammar_bitmask(logits: &[f32], mask: &[u32]) -> Vec<f32> {
 /// Sample one token id from a logits row under `params`.
 ///
 /// Greedy (`temperature <= 0`) returns `argmax_logit` — bit-identical to the
-/// backends' device argmax, so it preserves greedy parity. For `temperature > 0`
-/// it applies temperature scaling, then optional top-k / top-p (nucleus) / min-p
-/// filtering, then a multinomial draw. Randomness is derived deterministically
-/// from `(params.seed, position)` so a run is reproducible and a discrete poll
-/// needs no per-slot RNG state. Pure and host-side: one logits copy at c=1 is
-/// sub-millisecond, so no new GPU sampling kernel is required.
+/// backends' device argmax. For `temperature > 0` it applies temperature
+/// scaling, then optional top-k / top-p / min-p filtering, then a multinomial
+/// draw. Randomness is derived deterministically from `(params.seed, position)`
+/// so a run is reproducible. Pure host-side: one logits copy at c=1 is
+/// sub-millisecond, so no GPU sampling kernel is required.
 #[must_use]
 pub fn sample_token(logits: &[f32], params: &SamplingParams, position: u64) -> u32 {
     sample_token_logprob(logits, params, position).0
 }
 
 /// [`sample_token`] plus the behavior log-probability of the drawn token under
-/// the SAME filtered, renormalized distribution the draw came from — the IS
-/// ratio denominator for on-policy RL. `None` for greedy (a delta policy) and
-/// for the degenerate-distribution argmax fallback.
+/// the same filtered, renormalized distribution — the IS ratio denominator for
+/// on-policy RL. `None` for greedy (a delta policy) and for the
+/// degenerate-distribution argmax fallback.
 #[must_use]
 pub fn sample_token_logprob(
     logits: &[f32],
@@ -106,7 +106,7 @@ pub fn sample_token_logprob(
         return (argmax_logit(logits), None);
     }
 
-    // Temperature-scaled, numerically stable softmax over all candidates.
+    // Temperature-scaled, numerically stable softmax.
     let inv_t = 1.0 / params.temperature;
     let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     if params.top_k <= 0 && params.top_p >= 1.0 && params.min_p <= 0.0 {
@@ -125,7 +125,6 @@ pub fn sample_token_logprob(
         }
     }
 
-    // Descending by probability for top-k / top-p truncation.
     cand.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
 
     if params.top_k > 0 && (params.top_k as usize) < cand.len() {
@@ -149,14 +148,13 @@ pub fn sample_token_logprob(
         cand.retain(|(_, p)| *p >= thresh);
     }
 
-    // Degenerate distribution (all logits -inf/NaN, or filters emptied the set):
-    // fall back to greedy rather than silently returning token 0.
+    // Degenerate distribution (all logits -inf/NaN, or filters emptied the
+    // set): fall back to greedy rather than silently returning token 0.
     let total: f32 = cand.iter().map(|(_, p)| *p).sum();
     if cand.is_empty() || !total.is_finite() || total <= 0.0 {
         return (argmax_logit(logits), None);
     }
 
-    // Multinomial draw over the surviving candidates.
     let bits = splitmix64(
         params
             .seed
@@ -226,16 +224,14 @@ mod sampler_tests {
         let logits = ramp(64);
         let mut p = SamplingParams::default();
         assert_eq!(sample_token_logprob(&logits, &p, 0).0, 63);
-        // Allow only token 7: both decode modes must land on it, not on the
-        // unconstrained argmax.
+        // Allow only token 7: both decode modes must land on it.
         let mut mask = vec![0u32; 2];
         mask[0] = 1 << 7;
         p.grammar_bitmask = Some(mask.clone().into());
         assert_eq!(sample_token_logprob(&logits, &p, 0).0, 7);
         p.temperature = 1.0;
         assert_eq!(sample_token_logprob(&logits, &p, 0).0, 7);
-        // An empty mask has no legal draw; fall through rather than emit a
-        // token the grammar rejects.
+        // An empty mask has no legal draw; fall through.
         p.temperature = 0.0;
         p.grammar_bitmask = Some(vec![0u32; 2].into());
         assert_eq!(sample_token_logprob(&logits, &p, 0).0, 63);
@@ -252,8 +248,7 @@ mod sampler_tests {
 
     #[test]
     fn degenerate_logits_fall_back_to_greedy() {
-        // All -inf (e.g. a fully-masked row): must NOT silently return token 0
-        // via a NaN-emptied candidate set — fall back to argmax cleanly.
+        // All -inf: must NOT silently return token 0 via a NaN-emptied set.
         let all_neg = vec![f32::NEG_INFINITY; 8];
         let p = SamplingParams {
             temperature: 1.0,
@@ -261,8 +256,7 @@ mod sampler_tests {
             ..SamplingParams::default()
         };
         assert_eq!(sample_token(&all_neg, &p, 3), argmax_logit(&all_neg));
-        // One finite logit among -inf with aggressive min_p: pick the finite one,
-        // never an empty-set token 0.
+        // One finite logit among -inf with aggressive min_p: pick the finite one.
         let mut one = vec![f32::NEG_INFINITY; 8];
         one[5] = 4.0;
         assert_eq!(sample_token(&one, &p, 0), 5);
@@ -276,7 +270,6 @@ mod sampler_tests {
             top_k: 1,
             ..SamplingParams::default()
         };
-        // Only the max survives, so every position samples it.
         for pos in 0..16 {
             assert_eq!(sample_token(&logits, &p, pos), 49);
         }
@@ -290,9 +283,7 @@ mod sampler_tests {
             seed: Some(42),
             ..SamplingParams::default()
         };
-        // Reproducible for a fixed (seed, position).
         assert_eq!(sample_token(&logits, &p, 3), sample_token(&logits, &p, 3));
-        // Advancing position changes the stream (not stuck on one token).
         let draws: Vec<u32> = (0..32).map(|pos| sample_token(&logits, &p, pos)).collect();
         assert!(draws.iter().any(|&t| t != draws[0]));
     }
@@ -342,8 +333,6 @@ mod sampler_tests {
 
     #[test]
     fn vocab_shard_merge_matches_full_device_argmax() {
-        // 4 "ranks" of 4 logits each: the merge over per-slice (max, argmax)
-        // must equal the device argmax over the concatenated vector.
         let slices: Vec<Vec<f32>> = vec![
             vec![0.1, -2.0, 0.9, 0.3],
             vec![4.0, 0.0, 0.0, 0.0],
@@ -371,7 +360,6 @@ mod sampler_tests {
 
     #[test]
     fn top_p_keeps_only_the_nucleus() {
-        // One dominant logit: nucleus collapses to it regardless of temperature.
         let mut logits = vec![0.0; 100];
         logits[7] = 50.0;
         let p = SamplingParams {

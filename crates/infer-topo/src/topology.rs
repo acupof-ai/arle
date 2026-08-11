@@ -49,8 +49,6 @@ impl MultiAxisConfig {
         Ok(cfg)
     }
 
-    /// Parse SGLang-style multi-axis layout from environment.
-    ///
     /// This does not by itself enable DP/CP/MoE-DP execution. It is the runtime
     /// contract input used by DSv4 startup diagnostics and fail-closed guards so
     /// a run cannot silently claim a SGLang-equivalent layout while only wiring
@@ -509,7 +507,7 @@ mod tests {
         );
     }
 
-    // tp=8, pp=1, ep=1, dp=1 over 8 ranks: rank r -> tp_rank=r, tp_group=[0..8].
+    // tp=8, pp=1, ep=1, dp=1 over 8 ranks.
     #[test]
     fn tp8_pp1_ep1_dp1_topology() {
         let cfg = MultiAxisConfig {
@@ -522,8 +520,6 @@ mod tests {
         };
         cfg.validate().unwrap();
         assert_eq!(cfg.world_size(), 8);
-        // Every rank's tp_rank equals its world_rank, and the (only) TP group is
-        // the full [0, 8).
         for r in 0..8 {
             let coord = RankCoord::from_world_rank(cfg, r).unwrap();
             assert_eq!(coord.tp_rank, r);
@@ -568,7 +564,7 @@ mod tests {
         );
     }
 
-    // tp=2, pp=2 over 4 ranks: coords + groups.
+    // tp=2, pp=2 over 4 ranks.
     #[test]
     fn tp2_pp2_four_ranks_coords_and_groups() {
         let cfg = MultiAxisConfig {
@@ -581,7 +577,6 @@ mod tests {
         };
         cfg.validate().unwrap();
         assert_eq!(cfg.world_size(), 4);
-        // world_rank -> (tp_rank, pp_rank): r%2, r/2.
         let expect = [(0usize, 0usize), (1, 0), (0, 1), (1, 1)];
         for (r, (tp, pp)) in expect.iter().enumerate() {
             let coord = RankCoord::from_world_rank(cfg, r).unwrap();
@@ -589,7 +584,6 @@ mod tests {
             assert_eq!(coord.pp_rank, *pp, "rank {r} pp_rank");
             assert_eq!(coord.pp_rank * cfg.tp_size + coord.tp_rank, r);
         }
-        // TP groups: [0,1] and [2,3]. PP groups: [0,2] and [1,3].
         assert_eq!(build_tp_groups(cfg), vec![vec![0, 1], vec![2, 3]]);
         assert_eq!(build_pp_groups(cfg), vec![vec![0, 2], vec![1, 3]]);
     }
@@ -597,8 +591,6 @@ mod tests {
     // SGLang parallel_state.py:1758-1769
     #[test]
     fn attn_cp2_attn_tp4_moe_dp2_moe_ep4_groups_sglang_docstring_1758_1769() {
-        // Per docstring: tp=8, pp=1, attn_cp=2, attn_tp=4 (=> attn_dp=1),
-        // moe_ep=4, moe_dp=2 (=> moe_tp=1).
         let cfg = MultiAxisConfig {
             tp_size: 8,
             pp_size: 1,
@@ -672,7 +664,6 @@ mod tests {
         for world_rank in 0..cfg.world_size() {
             let coord = RankCoord::from_world_rank(cfg, world_rank).unwrap();
             assert_eq!(coord.world_rank, world_rank);
-            // Reassembly from sub-ranks must give back tp_rank.
             let attn_tp = cfg.attn_tp_size();
             let reassembled_tp = (coord.attn_dp_rank * cfg.attn_cp_size + coord.attn_cp_rank)
                 * attn_tp
@@ -682,7 +673,6 @@ mod tests {
             let reassembled_tp_moe =
                 (coord.moe_dp_rank * cfg.ep_size + coord.moe_ep_rank) * moe_tp + coord.moe_tp_rank;
             assert_eq!(reassembled_tp_moe, coord.tp_rank);
-            // pp_rank * tp_size + tp_rank == world_rank
             assert_eq!(coord.pp_rank * cfg.tp_size + coord.tp_rank, world_rank);
         }
     }
@@ -691,7 +681,6 @@ mod tests {
     #[test]
     fn dp_attention_math_matches_sglang() {
         // tp=8, dp=2, attn_cp=2 => attn_tp=2.
-        // tp_rank = (attn_dp_rank * attn_cp_size + attn_cp_rank) * attn_tp_size + attn_tp_rank
         let cfg = MultiAxisConfig {
             tp_size: 8,
             pp_size: 1,
@@ -850,7 +839,6 @@ mod tests {
 
     #[test]
     fn build_pp_groups_single_tp() {
-        // pp_size == world_size: each PP group is a single rank.
         let cfg = MultiAxisConfig {
             tp_size: 1,
             pp_size: 4,
@@ -867,7 +855,6 @@ mod tests {
         );
     }
 
-    // moe_tp_groups + moe_dp_groups coverage at the TP=8/EP=4/MoE-DP=2 shape.
     #[test]
     fn moe_tp_groups_tp8_ep4_moedp2() {
         let cfg = MultiAxisConfig {
@@ -880,8 +867,6 @@ mod tests {
         };
         cfg.validate().unwrap();
         assert_eq!(cfg.moe_tp_size(), 1);
-        // moe_tp == 1 here: each moe_tp group is a singleton; with ep*moe_dp=8
-        // combined indices there are 8 singleton groups.
         assert_eq!(
             build_moe_tp_groups(cfg),
             vec![

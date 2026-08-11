@@ -200,7 +200,6 @@ pub struct RequestTicket {
 }
 
 impl RequestTicket {
-    /// Return the engine-assigned handle for this request.
     #[must_use]
     pub fn handle(&self) -> RequestHandle {
         self.handle
@@ -407,7 +406,6 @@ where
         Ok((ticket, stream_rx))
     }
 
-    /// `submit_streaming` with a per-request next-token constraint.
     pub fn submit_streaming_constrained(
         &self,
         prompt: Vec<u32>,
@@ -597,7 +595,6 @@ where
         self.run_on_executor(|executor| executor.release_kv_pool())?
     }
 
-    /// Re-acquire the engine's KV pool before the next rollout.
     pub fn ensure_kv_pool(&self) -> Result<()> {
         self.run_on_executor(|executor| executor.ensure_kv_pool())?
     }
