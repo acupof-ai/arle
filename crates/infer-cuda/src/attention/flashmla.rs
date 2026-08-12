@@ -341,21 +341,9 @@ impl Dsv4FlashMlaDecodeState {
         _pool: &Dsv4LayerKvLayout,
     ) -> Result<crate::attention::Dsv4FlashMlaImage> {
         Ok(crate::attention::Dsv4FlashMlaImage {
-            fp8_kv_pool_len: 0,
-            sw_blocks: 0,
-            comp_blocks: 0,
-            max_compressed_keys: 0,
-            topk_unified: 0,
-            page_block_size: 0,
             fp8_kv_sw_bootstrapped: self.fp8_kv_sw_bootstrapped,
             fp8_kv_comp_packed_rows: self.fp8_kv_comp_packed_rows,
-            topk_length: Vec::new(),
-            sched_meta: Vec::new(),
-            num_splits: Vec::new(),
-            num_sm_parts: 0,
-            fixed_overhead_num_blocks: 0,
-            block_size_topk: 0,
-            device_page_table: Vec::new(),
+            ..Default::default()
         })
     }
 

@@ -411,13 +411,6 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    pub fn convert_bf16_to_fp16_cuda(
-        input: *const Half,
-        output: *mut Half,
-        n: usize,
-        stream: CUstream,
-    ) -> CUresult;
-
     pub fn w4a16_gemm_wmma_cuda(
         weight: *const u8,
         scales: *const Half,
