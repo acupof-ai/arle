@@ -2,6 +2,13 @@
 //
 // For B=1: standard GEMV (1 row × 1 input).
 // For B>=2: batched GEMM where BTILE inputs share one weight read.
+//
+// Key optimizations:
+//   - Shared-memory accumulators: sum_h2[16] (32 regs) moved to smem,
+//     freeing registers for 2 in-flight uint4 weight loads + higher occupancy.
+//   - 2-way weight pipelining: packed0/packed1 alternate, hiding HBM latency.
+//   - Marlin FP16 dequant: nibble → 0x6400 mantissa trick.
+//   - half2 FMA chain with BTILE input sharing.
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -38,10 +45,13 @@ __global__ void w4a16_gemv_batch_kernel_marlin(
 
     int valid_b = min(W4A16_MARLIN_BTILE, B - batch_base);
 
-    half2 sum_h2[W4A16_MARLIN_BTILE];
+    // Shared-memory accumulators: 512 threads × 16 half2 = 32 KB.
+    // Frees 32 regs/thread vs. register-resident sum_h2[16].
+    __shared__ half2 sum_smem[GEMV_THREADS][W4A16_MARLIN_BTILE];
+    half2* my_sum = &sum_smem[threadIdx.x][0];
     #pragma unroll
     for (int b = 0; b < W4A16_MARLIN_BTILE; b++)
-        sum_h2[b] = __float2half2_rn(0.0f);
+        my_sum[b] = __float2half2_rn(0.0f);
 
     int num_groups = K / group_size;
     int bytes_per_row = K / 2;
@@ -52,82 +62,152 @@ __global__ void w4a16_gemv_batch_kernel_marlin(
 
     const uint8_t* weight_row = weight + (int64_t)row * bytes_per_row;
 
-    // Software pipeline: prefetch first weight.
+    // 2-way weight pipeline: prefetch first two packed weights.
     int k = tid_in_row * 32;
-    uint4 packed = (k < K) ? __ldg(reinterpret_cast<const uint4*>(weight_row + k / 2)) : make_uint4(0,0,0,0);
+    uint4 packed0 = (k < K) ? __ldg(reinterpret_cast<const uint4*>(weight_row + k / 2)) : make_uint4(0,0,0,0);
+    int k1 = k + threads_per_row * 32;
+    uint4 packed1 = (k1 < K) ? __ldg(reinterpret_cast<const uint4*>(weight_row + k1 / 2)) : make_uint4(0,0,0,0);
 
-    for (; k < K; k += threads_per_row * 32) {
-        float scale_f = __bfloat162float(scales[row * num_groups + k / group_size]);
-        half2 scale_h2 = __half2half2(__float2half(scale_f));
+    for (; k < K; k += threads_per_row * 32 * 2) {
+        // Process packed0.
+        {
+            float scale_f = __bfloat162float(scales[row * num_groups + k / group_size]);
+            half2 scale_h2 = __half2half2(__float2half(scale_f));
 
-        // Prefetch next weight while processing current.
-        int next_k = k + threads_per_row * 32;
-        uint4 next_packed = (next_k < K) ? __ldg(reinterpret_cast<const uint4*>(weight_row + next_k / 2)) : make_uint4(0,0,0,0);
-
-        uint32_t words[4] = {packed.x, packed.y, packed.z, packed.w};
-
-        #pragma unroll
-        for (int w = 0; w < 4; w++) {
-            uint32_t p = words[w];
-            int kk = k + w * 8;
-
-            uint32_t lo_all = p & MASK4;
-            uint32_t hi_all = (p >> 4) & MASK4;
-
-            uint32_t lo01 = (0x6400u | (lo_all & 0xffu)) |
-                            ((0x6400u | ((lo_all >> 8) & 0xffu)) << 16);
-            uint32_t lo23 = (0x6400u | ((lo_all >> 16) & 0xffu)) |
-                            ((0x6400u | ((lo_all >> 24) & 0xffu)) << 16);
-            uint32_t hi01 = (0x6400u | (hi_all & 0xffu)) |
-                            ((0x6400u | ((hi_all >> 8) & 0xffu)) << 16);
-            uint32_t hi23 = (0x6400u | ((hi_all >> 16) & 0xffu)) |
-                            ((0x6400u | ((hi_all >> 24) & 0xffu)) << 16);
-
-            half2 w0 = __hsub2(*reinterpret_cast<half2*>(&lo01), SUB_H2);
-            half2 w1 = __hsub2(*reinterpret_cast<half2*>(&hi01), SUB_H2);
-            half2 w2 = __hsub2(*reinterpret_cast<half2*>(&lo23), SUB_H2);
-            half2 w3 = __hsub2(*reinterpret_cast<half2*>(&hi23), SUB_H2);
-
-            half2 wx  = __halves2half2(w0.x, w1.x);
-            half2 wy  = __halves2half2(w0.y, w1.y);
-            half2 wx2 = __halves2half2(w2.x, w3.x);
-            half2 wy2 = __halves2half2(w2.y, w3.y);
-
-            half2 wsx  = __hmul2(wx, scale_h2);
-            half2 wsy  = __hmul2(wy, scale_h2);
-            half2 wsx2 = __hmul2(wx2, scale_h2);
-            half2 wsy2 = __hmul2(wy2, scale_h2);
-
+            uint32_t words[4] = {packed0.x, packed0.y, packed0.z, packed0.w};
             #pragma unroll
-            for (int b = 0; b < W4A16_MARLIN_BTILE; b++) {
-                if (b >= valid_b) break;
-                const __nv_bfloat16* xb = input + (batch_base + b) * K;
+            for (int w = 0; w < 4; w++) {
+                uint32_t p = words[w];
+                int kk = k + w * 8;
 
-                uint4 xpacked = __ldg(reinterpret_cast<const uint4*>(&xb[kk]));
-                const __nv_bfloat16* xbv = reinterpret_cast<const __nv_bfloat16*>(&xpacked);
-                half2 x01 = __halves2half2(__float2half(__bfloat162float(xbv[0])),
-                                           __float2half(__bfloat162float(xbv[1])));
-                half2 x23 = __halves2half2(__float2half(__bfloat162float(xbv[2])),
-                                           __float2half(__bfloat162float(xbv[3])));
-                half2 x45 = __halves2half2(__float2half(__bfloat162float(xbv[4])),
-                                           __float2half(__bfloat162float(xbv[5])));
-                half2 x67 = __halves2half2(__float2half(__bfloat162float(xbv[6])),
-                                           __float2half(__bfloat162float(xbv[7])));
+                uint32_t lo_all = p & MASK4;
+                uint32_t hi_all = (p >> 4) & MASK4;
 
-                sum_h2[b] = __hfma2(wsx,  x01, sum_h2[b]);
-                sum_h2[b] = __hfma2(wsy,  x23, sum_h2[b]);
-                sum_h2[b] = __hfma2(wsx2, x45, sum_h2[b]);
-                sum_h2[b] = __hfma2(wsy2, x67, sum_h2[b]);
+                uint32_t lo01 = (0x6400u | (lo_all & 0xffu)) |
+                                ((0x6400u | ((lo_all >> 8) & 0xffu)) << 16);
+                uint32_t lo23 = (0x6400u | ((lo_all >> 16) & 0xffu)) |
+                                ((0x6400u | ((lo_all >> 24) & 0xffu)) << 16);
+                uint32_t hi01 = (0x6400u | (hi_all & 0xffu)) |
+                                ((0x6400u | ((hi_all >> 8) & 0xffu)) << 16);
+                uint32_t hi23 = (0x6400u | ((hi_all >> 16) & 0xffu)) |
+                                ((0x6400u | ((hi_all >> 24) & 0xffu)) << 16);
+
+                half2 w0 = __hsub2(*reinterpret_cast<half2*>(&lo01), SUB_H2);
+                half2 w1 = __hsub2(*reinterpret_cast<half2*>(&hi01), SUB_H2);
+                half2 w2 = __hsub2(*reinterpret_cast<half2*>(&lo23), SUB_H2);
+                half2 w3 = __hsub2(*reinterpret_cast<half2*>(&hi23), SUB_H2);
+
+                half2 wx  = __halves2half2(w0.x, w1.x);
+                half2 wy  = __halves2half2(w0.y, w1.y);
+                half2 wx2 = __halves2half2(w2.x, w3.x);
+                half2 wy2 = __halves2half2(w2.y, w3.y);
+
+                half2 wsx  = __hmul2(wx, scale_h2);
+                half2 wsy  = __hmul2(wy, scale_h2);
+                half2 wsx2 = __hmul2(wx2, scale_h2);
+                half2 wsy2 = __hmul2(wy2, scale_h2);
+
+                #pragma unroll
+                for (int b = 0; b < W4A16_MARLIN_BTILE; b++) {
+                    if (b >= valid_b) break;
+                    const __nv_bfloat16* xb = input + (batch_base + b) * K;
+
+                    uint4 xpacked = __ldg(reinterpret_cast<const uint4*>(&xb[kk]));
+                    const __nv_bfloat16* xbv = reinterpret_cast<const __nv_bfloat16*>(&xpacked);
+                    half2 x01 = __halves2half2(__float2half(__bfloat162float(xbv[0])),
+                                               __float2half(__bfloat162float(xbv[1])));
+                    half2 x23 = __halves2half2(__float2half(__bfloat162float(xbv[2])),
+                                               __float2half(__bfloat162float(xbv[3])));
+                    half2 x45 = __halves2half2(__float2half(__bfloat162float(xbv[4])),
+                                               __float2half(__bfloat162float(xbv[5])));
+                    half2 x67 = __halves2half2(__float2half(__bfloat162float(xbv[6])),
+                                               __float2half(__bfloat162float(xbv[7])));
+
+                    my_sum[b] = __hfma2(wsx,  x01, my_sum[b]);
+                    my_sum[b] = __hfma2(wsy,  x23, my_sum[b]);
+                    my_sum[b] = __hfma2(wsx2, x45, my_sum[b]);
+                    my_sum[b] = __hfma2(wsy2, x67, my_sum[b]);
+                }
             }
         }
 
-        packed = next_packed;
+        // Prefetch next weight for packed0 slot.
+        int next_k0 = k + threads_per_row * 32 * 2;
+        packed0 = (next_k0 < K) ? __ldg(reinterpret_cast<const uint4*>(weight_row + next_k0 / 2)) : make_uint4(0,0,0,0);
+
+        // Process packed1.
+        {
+            float scale_f = __bfloat162float(scales[row * num_groups + k1 / group_size]);
+            half2 scale_h2 = __half2half2(__float2half(scale_f));
+
+            uint32_t words[4] = {packed1.x, packed1.y, packed1.z, packed1.w};
+            #pragma unroll
+            for (int w = 0; w < 4; w++) {
+                uint32_t p = words[w];
+                int kk = k1 + w * 8;
+
+                uint32_t lo_all = p & MASK4;
+                uint32_t hi_all = (p >> 4) & MASK4;
+
+                uint32_t lo01 = (0x6400u | (lo_all & 0xffu)) |
+                                ((0x6400u | ((lo_all >> 8) & 0xffu)) << 16);
+                uint32_t lo23 = (0x6400u | ((lo_all >> 16) & 0xffu)) |
+                                ((0x6400u | ((lo_all >> 24) & 0xffu)) << 16);
+                uint32_t hi01 = (0x6400u | (hi_all & 0xffu)) |
+                                ((0x6400u | ((hi_all >> 8) & 0xffu)) << 16);
+                uint32_t hi23 = (0x6400u | ((hi_all >> 16) & 0xffu)) |
+                                ((0x6400u | ((hi_all >> 24) & 0xffu)) << 16);
+
+                half2 w0 = __hsub2(*reinterpret_cast<half2*>(&lo01), SUB_H2);
+                half2 w1 = __hsub2(*reinterpret_cast<half2*>(&hi01), SUB_H2);
+                half2 w2 = __hsub2(*reinterpret_cast<half2*>(&lo23), SUB_H2);
+                half2 w3 = __hsub2(*reinterpret_cast<half2*>(&hi23), SUB_H2);
+
+                half2 wx  = __halves2half2(w0.x, w1.x);
+                half2 wy  = __halves2half2(w0.y, w1.y);
+                half2 wx2 = __halves2half2(w2.x, w3.x);
+                half2 wy2 = __halves2half2(w2.y, w3.y);
+
+                half2 wsx  = __hmul2(wx, scale_h2);
+                half2 wsy  = __hmul2(wy, scale_h2);
+                half2 wsx2 = __hmul2(wx2, scale_h2);
+                half2 wsy2 = __hmul2(wy2, scale_h2);
+
+                #pragma unroll
+                for (int b = 0; b < W4A16_MARLIN_BTILE; b++) {
+                    if (b >= valid_b) break;
+                    const __nv_bfloat16* xb = input + (batch_base + b) * K;
+
+                    uint4 xpacked = __ldg(reinterpret_cast<const uint4*>(&xb[kk]));
+                    const __nv_bfloat16* xbv = reinterpret_cast<const __nv_bfloat16*>(&xpacked);
+                    half2 x01 = __halves2half2(__float2half(__bfloat162float(xbv[0])),
+                                               __float2half(__bfloat162float(xbv[1])));
+                    half2 x23 = __halves2half2(__float2half(__bfloat162float(xbv[2])),
+                                               __float2half(__bfloat162float(xbv[3])));
+                    half2 x45 = __halves2half2(__float2half(__bfloat162float(xbv[4])),
+                                               __float2half(__bfloat162float(xbv[5])));
+                    half2 x67 = __halves2half2(__float2half(__bfloat162float(xbv[6])),
+                                               __float2half(__bfloat162float(xbv[7])));
+
+                    my_sum[b] = __hfma2(wsx,  x01, my_sum[b]);
+                    my_sum[b] = __hfma2(wsy,  x23, my_sum[b]);
+                    my_sum[b] = __hfma2(wsx2, x45, my_sum[b]);
+                    my_sum[b] = __hfma2(wsy2, x67, my_sum[b]);
+                }
+            }
+        }
+
+        // Prefetch next weight for packed1 slot.
+        int next_k1 = k1 + threads_per_row * 32 * 2;
+        packed1 = (next_k1 < K) ? __ldg(reinterpret_cast<const uint4*>(weight_row + next_k1 / 2)) : make_uint4(0,0,0,0);
+
+        k1 = next_k1;
     }
 
     #pragma unroll
     for (int b = 0; b < W4A16_MARLIN_BTILE; b++) {
         if (b >= valid_b) break;
-        half sum_h = __hadd(sum_h2[b].x, sum_h2[b].y);
+        half sum_h = __hadd(my_sum[b].x, my_sum[b].y);
         float sum = __half2float(sum_h);
         sum = warp_reduce_sum(sum);
         if (lane_id == 0)
