@@ -7,12 +7,11 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <cstdint>
-#include <cstdio>
 
 #define WARP_SIZE 32
 #define GEMV_THREADS 512
 #define GEMV_ROWS 16
-#define W4A16_MARLIN_BTILE 16
+#define W4A16_MARLIN_BTILE 4
 
 __device__ __forceinline__ float warp_reduce_sum(float val) {
     #pragma unroll
@@ -143,12 +142,6 @@ extern "C" cudaError_t w4a16_gemv_batch_cuda_marlin(
     dim3 grid((N + GEMV_ROWS - 1) / GEMV_ROWS,
               (B + W4A16_MARLIN_BTILE - 1) / W4A16_MARLIN_BTILE);
     dim3 block(GEMV_THREADS);
-    static int printed = 0;
-    if (!printed) {
-        fprintf(stderr, "MARLIN_GEMV: grid=(%d,%d) block=%d GEMV_ROWS=%d GEMV_THREADS=%d BTILE=%d B=%d N=%d K=%d tpr=%d\n",
-                grid.x, grid.y, block.x, GEMV_ROWS, GEMV_THREADS, W4A16_MARLIN_BTILE, B, N, K, GEMV_THREADS/GEMV_ROWS);
-        printed = 1;
-    }
     w4a16_gemv_batch_kernel_marlin<<<grid, block, 0, stream>>>(
         weight, scales, input, output, B, N, K, group_size);
     return cudaGetLastError();
