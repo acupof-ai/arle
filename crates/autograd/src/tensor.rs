@@ -775,22 +775,10 @@ impl TensorStore {
             self.ensure_device(id)?;
             return Ok(());
         }
-        let (data, shape, dirty, has_handle, residency) = {
+        let (data, shape) = {
             let tensor = self.tensor(id)?;
-            (
-                tensor.data.clone(),
-                tensor.shape.clone(),
-                tensor.dirty.clone(),
-                tensor.device_handle.is_some(),
-                tensor.checkpoint_residency,
-            )
+            (tensor.data.clone(), tensor.shape.clone())
         };
-        if data.is_empty() {
-            eprintln!(
-                "[upload_frozen_bf16_from_host] id={id} shape={shape:?} data_len=0 \
-                 dirty={dirty:?} has_handle={has_handle} residency={residency:?}"
-            );
-        }
         let bf16_bits: Vec<u16> = data
             .iter()
             .map(|&f| crate::backend::f32_to_bf16_bits(f))
