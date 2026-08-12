@@ -963,6 +963,12 @@ fn should_load_bf16_cuda_frozen_base(
     dtype: Dtype,
     store: &TensorStore,
 ) -> bool {
+    // ARLE_NO_BF16_CUDA_FROZEN_BASE forces CPU residency for frozen bf16 base
+    // weights. Used by w2s when the student base + aux post-RL would otherwise
+    // OOM the GPU during loading (e.g. 27B pair: 54 GB + 55 GB > 97 GB H20).
+    if std::env::var("ARLE_NO_BF16_CUDA_FROZEN_BASE").is_ok() {
+        return false;
+    }
     matches!(mode, LoadMode::LoraStudent { .. } | LoadMode::FrozenEval)
         && !requires_grad
         && dtype == Dtype::BF16

@@ -73,6 +73,7 @@ pub fn sync_lora_adapters(
 /// - `Infer`: `LoadedInferenceEngine`-backed, for large models that need TP or
 ///   would otherwise OOM the training process. The logits are imported into
 ///   the train store as constants (no gradient flows into the aux models).
+#[derive(Clone)]
 pub enum W2sAuxModel {
     InProcess {
         pre_rl: Qwen35Model,
@@ -132,9 +133,22 @@ impl W2sAuxModel {
             Self::InProcess { pre_rl, post_rl } => {
                 let was_enabled = tape.enabled;
                 tape.set_enabled(false);
+                // Upload post-RL as bf16 (54 GB for 27B), run its forward, then
+                // offload it before the pre-RL (base) forward — the two 27B
+                // models cannot share a 97 GB H20.
+                for id in post_rl.all_parameter_ids() {
+                    store.upload_frozen_bf16_from_host(id)?;
+                }
                 let post_logits = post_rl
                     .forward(store, tape, input_ids, positions)
                     .map_err(|e| anyhow!("aux post-RL forward: {e}"))?;
+                for id in post_rl.all_parameter_ids() {
+                    store.offload_to_host(id)?;
+                }
+                // pre-RL is the student's base model; upload as bf16.
+                for id in pre_rl.all_parameter_ids() {
+                    store.upload_frozen_bf16_from_host(id)?;
+                }
                 let pre_logits = pre_rl
                     .forward(store, tape, input_ids, positions)
                     .map_err(|e| anyhow!("aux pre-RL forward: {e}"))?;
@@ -308,6 +322,17 @@ pub fn w2s_step<O: Optimizer>(
     }
 
     // 3. Aux policy shifts ΔT₁, ΔT₂.
+    // Offload the student's base (non-LoRA) weights to CPU so the aux
+    // post-RL engine fits on GPU. The base weights are shared between
+    // student / student_old / student_base, so offloading once covers all
+    // three. They are reloaded before the KL-regularizer forwards below.
+    let base_param_ids: HashSet<TensorId> = student_base.all_parameter_ids().into_iter().collect();
+    let adapter_ids: HashSet<TensorId> = student.adapter_name_map().values().copied().collect();
+    let base_only_ids: Vec<TensorId> = base_param_ids.difference(&adapter_ids).copied().collect();
+    for id in &base_only_ids {
+        store.offload_to_host(*id)?;
+    }
+
     let delta1 = aux1.forward_delta(input_ids, &positions, store, tape)?;
     let delta2 = if share_aux {
         // Both aux models are identical — reuse ΔT₁ instead of running the
@@ -316,6 +341,14 @@ pub fn w2s_step<O: Optimizer>(
     } else {
         aux2.forward_delta(input_ids, &positions, store, tape)?
     };
+
+    // Reload student base weights for the KL-regularizer forwards. Upload as
+    // bf16 — the 27B base is 54 GB in bf16 but 108 GB in f32, which would OOM
+    // a 97 GB H20. The host f32 mirror was produced by widening the original
+    // bf16 weights, so the truncation back to bf16 is exact.
+    for id in &base_only_ids {
+        store.upload_frozen_bf16_from_host(*id)?;
+    }
 
     // 4. Consistency gate (host-side for Phase 1).
     let d1_host = store.to_host(delta1)?;

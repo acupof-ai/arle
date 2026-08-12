@@ -28,6 +28,12 @@ pub fn bf16_bits_to_f32(bits: u16) -> f32 {
     f32::from_bits((bits as u32) << 16)
 }
 
+/// Truncate f32 to bf16 by keeping the upper 16 bits. Exact for values that
+/// were originally bf16 (lower 16 bits are zero).
+pub fn f32_to_bf16_bits(f: f32) -> u16 {
+    (f.to_bits() >> 16) as u16
+}
+
 pub fn fp8_e4m3_to_f32(bits: u8) -> f32 {
     let sign = if bits & 0x80 == 0 { 1.0 } else { -1.0 };
     let exp = i32::from((bits >> 3) & 0x0f);

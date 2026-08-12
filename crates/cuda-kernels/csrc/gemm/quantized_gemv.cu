@@ -11,6 +11,7 @@
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
 #include <cstdint>
+#include <cstdio>
 
 #define WARP_SIZE 32
 #define GEMV_THREADS 256

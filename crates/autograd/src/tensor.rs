@@ -766,6 +766,27 @@ impl TensorStore {
         Ok(())
     }
 
+    /// Re-store a frozen leaf as bf16 device-resident, converting the host f32
+    /// data to bf16 bits on the CPU before upload. Used by w2s to reload the
+    /// 27B base weights (54 GB in bf16) without materializing the 108 GB f32
+    /// copy on GPU.
+    pub fn upload_frozen_bf16_from_host(&mut self, id: TensorId) -> Result<()> {
+        if self.backend().device() != Device::Cuda {
+            self.ensure_device(id)?;
+            return Ok(());
+        }
+        let (data, shape) = {
+            let tensor = self.tensor(id)?;
+            (tensor.data.clone(), tensor.shape.clone())
+        };
+        let bf16_bits: Vec<u16> = data
+            .iter()
+            .map(|&f| crate::backend::f32_to_bf16_bits(f))
+            .collect();
+        let handle = self.backend().upload_bf16_bits(&bf16_bits, &shape)?;
+        self.replace_device_handle(id, handle)
+    }
+
     /// Re-store a frozen leaf as bf16 device-resident (`--tape-precision bf16`).
     /// No-op unless the flag is set and the backend is CUDA. Frozen leaves only:
     /// the bf16 handle drops the f32 host mirror, so a later backward needing the
