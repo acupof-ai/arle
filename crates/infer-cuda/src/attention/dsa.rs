@@ -629,6 +629,7 @@ pub(crate) struct Dsv4LayerAttentionImage {
     pub(crate) dsa_official: Option<Dsv4DsaImage>,
 }
 
+#[derive(Default)]
 pub(crate) struct Dsv4CompressorImage {
     pub(crate) pending_kv: Vec<half::bf16>,
     pub(crate) pending_score: Vec<half::bf16>,
@@ -645,6 +646,7 @@ pub(crate) struct Dsv4CompressorImage {
     pub(crate) fp32_carry_stale: bool,
 }
 
+#[derive(Default)]
 pub(crate) struct Dsv4FlashMlaImage {
     pub(crate) fp8_kv_pool_len: usize,
     pub(crate) sw_blocks: usize,
@@ -663,6 +665,7 @@ pub(crate) struct Dsv4FlashMlaImage {
     pub(crate) device_page_table: Vec<i32>,
 }
 
+#[derive(Default)]
 pub(crate) struct Dsv4DsaImage {
     pub(crate) key_cache_len: usize,
     pub(crate) rotated_keys: Vec<half::bf16>,
