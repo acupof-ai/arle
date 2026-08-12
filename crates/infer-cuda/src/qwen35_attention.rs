@@ -607,14 +607,6 @@ impl Qwen35Model {
                 )
             })?;
             let kv_dim = self.local_full_attn_kv_dim();
-            let quantize = match pool.format {
-                KVFormat::FP8E4M3 => kv_quant::quantize_paged_kv_fp8,
-                KVFormat::INT8 => kv_quant::quantize_paged_kv_single,
-                other => anyhow::bail!(
-                    "Qwen35 full-attn paged: unsupported pool format {other:?} \
-                     (only BF16, FP8E4M3 and INT8 are wired)"
-                ),
-            };
             for &(src, data, scales) in &[
                 (
                     pool.k_ptr(full_idx, &self.ctx.stream),
@@ -627,7 +619,7 @@ impl Qwen35Model {
                     pool.v_scales_ptr(full_idx, &self.ctx.stream),
                 ),
             ] {
-                quantize(
+                kv_quant::quantize_paged_kv_per_token(
                     &self.ctx,
                     src,
                     data,
@@ -637,6 +629,7 @@ impl Qwen35Model {
                     c.head_dim,
                     kv_dim,
                     rows,
+                    pool.format,
                 )?;
             }
         }
@@ -905,9 +898,9 @@ impl Qwen35Model {
                                 // Per-(token, kv_head) symmetric INT8 KV: same
                                 // split-KV varlen kernel as FP8, `int8_kv` flips
                                 // the load to int8 + scale.
-                                let ws = pool.int8_attn_workspace()?;
+                                let ws = pool.quantized_attn_workspace()?;
                                 let max_kv_len = meta.max_kv_len();
-                                kv_quant::decode_attention_varlen_fp8(
+                                kv_quant::decode_attention_varlen_int8(
                                     &self.ctx,
                                     &q_prepped,
                                     q_indptr_ptr,
@@ -926,11 +919,10 @@ impl Qwen35Model {
                                     meta.batch,
                                     meta.total_q,
                                     max_kv_len,
-                                    true, // int8_kv
                                     true, // causal
                                     sm_scale,
                                     ws,
-                                    pool.int8_attn_workspace_bytes,
+                                    pool.quantized_attn_workspace_bytes,
                                 )?;
                             }
                             other => anyhow::bail!(

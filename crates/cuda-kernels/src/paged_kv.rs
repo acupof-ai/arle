@@ -87,8 +87,8 @@ pub struct TokenKVPool {
     k_work: Option<CudaSlice<u8>>,
     v_work: Option<CudaSlice<u8>>,
     /// Workspace for split-KV fused-dequant attention (INT8 only).
-    pub int8_attn_workspace: Option<CudaSlice<u8>>,
-    pub int8_attn_workspace_bytes: usize,
+    pub quantized_attn_workspace: Option<CudaSlice<u8>>,
+    pub quantized_attn_workspace_bytes: usize,
     /// Per-head per-token f16 norms (TurboQuant only). `[max_total_tokens, num_kv_heads]`
     pub k_norms: Vec<CudaSlice<u16>>,
     pub v_norms: Vec<CudaSlice<u16>>,
@@ -311,7 +311,7 @@ impl TokenKVPool {
         if let Some(s) = &self.v_work {
             total += s.len(); // u8
         }
-        if let Some(s) = &self.int8_attn_workspace {
+        if let Some(s) = &self.quantized_attn_workspace {
             total += s.len(); // u8
         }
         total
@@ -591,7 +591,7 @@ impl TokenKVPool {
         // Quantized split-KV attention workspace.
         // FP8 reuses the same two-phase reduction scratch layout as INT8.
         let num_splits = 32;
-        let (int8_attn_workspace, int8_attn_workspace_bytes) =
+        let (quantized_attn_workspace, quantized_attn_workspace_bytes) =
             if matches!(format, KVFormat::INT8 | KVFormat::FP8E4M3 | KVFormat::INT4)
                 && pool_bytes_per_layer > 0
             {
@@ -670,8 +670,8 @@ impl TokenKVPool {
             v_scales,
             k_work,
             v_work,
-            int8_attn_workspace,
-            int8_attn_workspace_bytes,
+            quantized_attn_workspace,
+            quantized_attn_workspace_bytes,
             k_static_scales,
             k_kivi_calibrated,
             k_norms,
@@ -1922,10 +1922,10 @@ impl TokenKVPool {
 
     /// Split-KV attention workspace (FP8/INT8/INT4). Allocated at pool
     /// construction for quantized formats.
-    pub fn int8_attn_workspace(&self) -> anyhow::Result<&CudaSlice<u8>> {
-        self.int8_attn_workspace
+    pub fn quantized_attn_workspace(&self) -> anyhow::Result<&CudaSlice<u8>> {
+        self.quantized_attn_workspace
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("quantized KV pool missing int8_attn_workspace"))
+            .ok_or_else(|| anyhow::anyhow!("quantized KV pool missing quantized_attn_workspace"))
     }
 
     /// K norms device pointer for a layer (TurboQuant only).

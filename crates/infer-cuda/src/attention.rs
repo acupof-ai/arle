@@ -580,7 +580,7 @@ fn calibrate_and_quantize_new_rows(
                 pool.kv_dim,
                 batch,
             )?;
-            kv_quant::quantize_paged_kv_fp8(
+            kv_quant::quantize_paged_kv_per_token(
                 ctx,
                 pool.v_work_ptr(stream),
                 pool.v_data_ptr(layer_idx, stream),
@@ -590,6 +590,7 @@ fn calibrate_and_quantize_new_rows(
                 head_dim,
                 pool.kv_dim,
                 batch,
+                KVFormat::FP8E4M3,
             )?;
         }
         KVFormat::INT8 => {
@@ -604,7 +605,7 @@ fn calibrate_and_quantize_new_rows(
                 pool.kv_dim,
                 batch,
             )?;
-            kv_quant::quantize_paged_kv_single(
+            kv_quant::quantize_paged_kv_per_token(
                 ctx,
                 pool.v_work_ptr(stream),
                 pool.v_data_ptr(layer_idx, stream),
@@ -614,6 +615,7 @@ fn calibrate_and_quantize_new_rows(
                 head_dim,
                 pool.kv_dim,
                 batch,
+                KVFormat::INT8,
             )?;
         }
         other => bail!("quant KV new-row quantize does not support format {other:?}"),
@@ -623,7 +625,7 @@ fn calibrate_and_quantize_new_rows(
 
 /// Fused-dequant decode attention over the quantized pool planes (replaces
 /// the TileLang bf16 kernel for INT8/FP8 pools). NOT
-/// `decode_attention_varlen_fp8` — that kernel consumes per-token K scales
+/// `decode_attention_varlen_int8` — that kernel consumes per-token K scales
 /// and is incompatible with per-channel K.
 #[allow(clippy::too_many_arguments)]
 fn run_quant_decode(
@@ -645,7 +647,7 @@ fn run_quant_decode(
     let k_static_scales_ptr = pool
         .k_static_scales_ptr(layer_idx, stream)
         .ok_or_else(|| anyhow!("quant KV pool missing KIVI k_static_scales (layer {layer_idx})"))?;
-    let ws = pool.int8_attn_workspace()?;
+    let ws = pool.quantized_attn_workspace()?;
     // The kernel adapts its split count to the workspace it is given
     // (`choose_decode_num_splits` clamps by workspace_bytes, ≥1 split), so the
     // only unfittable case is a single split not fitting. The pool sizes the
@@ -654,9 +656,9 @@ fn run_quant_decode(
     // num_slots — gating on 32 splits here would falsely reject those.
     let needed = kv_quant::decode_attention_int8_workspace_bytes(1, num_q_heads, head_dim, 1);
     ensure!(
-        needed <= pool.int8_attn_workspace_bytes,
+        needed <= pool.quantized_attn_workspace_bytes,
         "quant decode workspace cannot fit a single split: needs {needed} bytes, pool allocated {}",
-        pool.int8_attn_workspace_bytes
+        pool.quantized_attn_workspace_bytes
     );
     let sm_scale = 1.0 / (head_dim as f32).sqrt();
     match pool.format {
@@ -677,7 +679,7 @@ fn run_quant_decode(
             pool.kv_dim,
             sm_scale,
             ws,
-            pool.int8_attn_workspace_bytes,
+            pool.quantized_attn_workspace_bytes,
         ),
         KVFormat::INT8 => kv_quant::decode_attention_int8_per_channel_k(
             ctx,
@@ -696,7 +698,7 @@ fn run_quant_decode(
             pool.kv_dim,
             sm_scale,
             ws,
-            pool.int8_attn_workspace_bytes,
+            pool.quantized_attn_workspace_bytes,
         ),
         other => bail!("quant KV decode does not support format {other:?}"),
     }
