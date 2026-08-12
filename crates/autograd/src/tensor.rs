@@ -757,10 +757,6 @@ impl TensorStore {
     /// then mark the tensor `Dirty::Host`, forcing a full re-upload on the
     /// next forward pass. That is the exact churn this path exists to kill.
     pub fn replace_device_handle(&mut self, id: TensorId, handle: DeviceHandle) -> Result<()> {
-        if id == 0 {
-            let bt = std::backtrace::Backtrace::force_capture();
-            eprintln!("[replace_device_handle] id=0 backtrace:\n{bt}");
-        }
         self.discard_checkpoint_copy(id)?;
         let tensor = self.raw_tensor_mut(id)?;
         tensor.device_handle = Some(handle);
