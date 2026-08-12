@@ -507,7 +507,12 @@ fn run_w2s(args: TrainW2sArgs) -> Result<()> {
     // to GPU after the aux engines are loaded/offloaded, and the w2s step
     // offloads them again during the aux forward pass.
     {
-        let base_ids: HashSet<TensorId> = base.all_parameter_ids().into_iter().collect();
+        let rope_ids: HashSet<TensorId> = base.rope_cache_ids().into_iter().collect();
+        let base_ids: HashSet<TensorId> = base
+            .all_parameter_ids()
+            .into_iter()
+            .filter(|id| !rope_ids.contains(id))
+            .collect();
         let adapter_ids: HashSet<TensorId> = student.adapter_name_map().values().copied().collect();
         let base_only: Vec<TensorId> = base_ids.difference(&adapter_ids).copied().collect();
         eprintln!(
@@ -517,20 +522,6 @@ fn run_w2s(args: TrainW2sArgs) -> Result<()> {
         for id in &base_only {
             store.offload_to_host(*id)?;
         }
-        // Debug: check that the first base weight has host data after offload.
-        if let Some(&id) = base_only.first() {
-            let data_len = store.get(id).map(|t| t.data.len()).unwrap_or(0);
-            eprintln!("[arle train w2s] first base weight id={id} data_len={data_len}");
-        }
-        // Debug: count base weights with empty data after offload.
-        let empty_count = base_only
-            .iter()
-            .filter(|&&id| store.get(id).map(|t| t.data.is_empty()).unwrap_or(true))
-            .count();
-        eprintln!(
-            "[arle train w2s] base weights with empty data after offload: {empty_count}/{}",
-            base_only.len()
-        );
     }
 
     // Load auxiliary models.
@@ -727,7 +718,14 @@ fn run_w2s(args: TrainW2sArgs) -> Result<()> {
     // rather than f32 (108 GB) to fit the 97 GB H20.
     eprintln!("[arle train w2s] re-uploading student/serving weights to GPU");
     {
-        let base_ids: HashSet<TensorId> = base.all_parameter_ids().into_iter().collect();
+        // RoPE cos/sin caches stay f32 with their host mirror (read by
+        // `select_cache_rows`); exclude them from the bf16 base set.
+        let rope_ids: HashSet<TensorId> = base.rope_cache_ids().into_iter().collect();
+        let base_ids: HashSet<TensorId> = base
+            .all_parameter_ids()
+            .into_iter()
+            .filter(|id| !rope_ids.contains(id))
+            .collect();
         let adapter_ids: HashSet<TensorId> = student.adapter_name_map().values().copied().collect();
         for id in student.all_parameter_ids() {
             if base_ids.contains(&id) && !adapter_ids.contains(&id) {
@@ -737,9 +735,11 @@ fn run_w2s(args: TrainW2sArgs) -> Result<()> {
             }
         }
         for id in serving.all_parameter_ids() {
-            if base_ids.contains(&id) && !adapter_ids.contains(&id) {
-                store.upload_frozen_bf16_from_host(id)?;
-            } else {
+            // Base weights were already uploaded (and their host mirror cleared)
+            // by the student loop above. Re-running `upload_frozen_bf16_from_host`
+            // on them would fail with "data length 0". Only the serving adapter's
+            // own LoRA params need to be brought on-device.
+            if !base_ids.contains(&id) {
                 store.ensure_device(id)?;
             }
         }

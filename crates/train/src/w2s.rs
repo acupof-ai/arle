@@ -64,6 +64,20 @@ pub fn sync_lora_adapters(
     Ok(())
 }
 
+/// Upload all model params as bf16. RoPE cos/sin caches stay f32 with their
+/// host mirror — `select_cache_rows` reads them from host memory.
+fn upload_model_bf16(model: &Qwen35Model, store: &mut TensorStore) -> Result<()> {
+    let rope_ids: HashSet<TensorId> = model.rope_cache_ids().into_iter().collect();
+    for id in model.all_parameter_ids() {
+        if rope_ids.contains(&id) {
+            store.ensure_device(id)?;
+        } else {
+            store.upload_frozen_bf16_from_host(id)?;
+        }
+    }
+    Ok(())
+}
+
 /// A single auxiliary model: holds the pre-RL (base) and post-RL (instruct)
 /// checkpoints. Both are frozen — only the student trains.
 ///
@@ -136,9 +150,7 @@ impl W2sAuxModel {
                 // Upload post-RL as bf16 (54 GB for 27B), run its forward, then
                 // offload it before the pre-RL (base) forward — the two 27B
                 // models cannot share a 97 GB H20.
-                for id in post_rl.all_parameter_ids() {
-                    store.upload_frozen_bf16_from_host(id)?;
-                }
+                upload_model_bf16(post_rl, store)?;
                 let post_logits = post_rl
                     .forward(store, tape, input_ids, positions)
                     .map_err(|e| anyhow!("aux post-RL forward: {e}"))?;
@@ -146,9 +158,7 @@ impl W2sAuxModel {
                     store.offload_to_host(id)?;
                 }
                 // pre-RL is the student's base model; upload as bf16.
-                for id in pre_rl.all_parameter_ids() {
-                    store.upload_frozen_bf16_from_host(id)?;
-                }
+                upload_model_bf16(pre_rl, store)?;
                 let pre_logits = pre_rl
                     .forward(store, tape, input_ids, positions)
                     .map_err(|e| anyhow!("aux pre-RL forward: {e}"))?;
@@ -326,7 +336,15 @@ pub fn w2s_step<O: Optimizer>(
     // post-RL engine fits on GPU. The base weights are shared between
     // student / student_old / student_base, so offloading once covers all
     // three. They are reloaded before the KL-regularizer forwards below.
-    let base_param_ids: HashSet<TensorId> = student_base.all_parameter_ids().into_iter().collect();
+    // RoPE cos/sin caches stay host-resident (read by `select_cache_rows`);
+    // exclude them from the base set so they are never offloaded or
+    // re-uploaded through the bf16 path (which clears the host mirror).
+    let rope_ids: HashSet<TensorId> = student_base.rope_cache_ids().into_iter().collect();
+    let base_param_ids: HashSet<TensorId> = student_base
+        .all_parameter_ids()
+        .into_iter()
+        .filter(|id| !rope_ids.contains(id))
+        .collect();
     let adapter_ids: HashSet<TensorId> = student.adapter_name_map().values().copied().collect();
     let base_only_ids: Vec<TensorId> = base_param_ids.difference(&adapter_ids).copied().collect();
     for id in &base_only_ids {
