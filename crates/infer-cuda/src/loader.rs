@@ -359,6 +359,13 @@ pub(crate) struct PageMeta {
 }
 
 impl PageMeta {
+    /// Max KV length across all rows (prefix + new tokens). Under CUDA graph
+    /// capture the host `kv_lens` can be stale, so `seqlen_k_capture` wins.
+    pub(crate) fn max_kv_len(&self) -> usize {
+        self.seqlen_k_capture
+            .unwrap_or_else(|| self.kv_lens.iter().copied().max().unwrap_or(0))
+    }
+
     /// Ragged page table over `rows` of `(slot, start_pos, len)`. The prefix-sum
     /// indptrs cover 1×T (prefill/verify), B×1 (decode) and the B×T middle;
     /// the kernel triple is `(batch, total_q, seq_len)`.

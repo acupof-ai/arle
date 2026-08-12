@@ -1920,6 +1920,14 @@ impl TokenKVPool {
         ptr
     }
 
+    /// Split-KV attention workspace (FP8/INT8/INT4). Allocated at pool
+    /// construction for quantized formats.
+    pub fn int8_attn_workspace(&self) -> anyhow::Result<&CudaSlice<u8>> {
+        self.int8_attn_workspace
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("quantized KV pool missing int8_attn_workspace"))
+    }
+
     /// K norms device pointer for a layer (TurboQuant only).
     pub fn k_norms_ptr(&self, layer: usize, stream: &cudarc::driver::CudaStream) -> u64 {
         let (ptr, _guard) = self.k_norms[layer].device_ptr(stream);

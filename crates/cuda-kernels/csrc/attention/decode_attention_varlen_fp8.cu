@@ -407,36 +407,34 @@ extern "C" cudaError_t decode_attention_varlen_fp8_cuda(
     decode_attention_varlen_quantized_merge_kernel<HD><<<merge_grid, merge_block, 0, stream>>>( \
         partial_out, partial_m, partial_l, output, total_q_tokens, num_q_heads, num_splits)
 
+#define LAUNCH_AT_HD(HD) \
+    do { \
+        if (int8_kv) { \
+            if (causal) LAUNCH_PARTIAL(HD, true, true); \
+            else LAUNCH_PARTIAL(HD, true, false); \
+        } else { \
+            if (causal) LAUNCH_PARTIAL(HD, false, true); \
+            else LAUNCH_PARTIAL(HD, false, false); \
+        } \
+        err = cudaGetLastError(); \
+        if (err == cudaSuccess) LAUNCH_MERGE(HD); \
+    } while (0)
+
     cudaError_t err = cudaSuccess;
     dim3 merge_grid(total_q_tokens, num_q_heads);
     dim3 merge_block(head_dim);
 
     if (head_dim == 128) {
-        if (int8_kv) {
-            if (causal) LAUNCH_PARTIAL(128, true, true);
-            else LAUNCH_PARTIAL(128, true, false);
-        } else {
-            if (causal) LAUNCH_PARTIAL(128, false, true);
-            else LAUNCH_PARTIAL(128, false, false);
-        }
-        err = cudaGetLastError();
-        if (err == cudaSuccess) LAUNCH_MERGE(128);
+        LAUNCH_AT_HD(128);
     } else if (head_dim == 256) {
-        if (int8_kv) {
-            if (causal) LAUNCH_PARTIAL(256, true, true);
-            else LAUNCH_PARTIAL(256, true, false);
-        } else {
-            if (causal) LAUNCH_PARTIAL(256, false, true);
-            else LAUNCH_PARTIAL(256, false, false);
-        }
-        err = cudaGetLastError();
-        if (err == cudaSuccess) LAUNCH_MERGE(256);
+        LAUNCH_AT_HD(256);
     } else {
         return cudaErrorInvalidValue;
     }
 
 #undef LAUNCH_PARTIAL
 #undef LAUNCH_MERGE
+#undef LAUNCH_AT_HD
 
     if (err != cudaSuccess) return err;
     return cudaGetLastError();

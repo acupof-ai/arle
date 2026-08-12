@@ -645,10 +645,7 @@ fn run_quant_decode(
     let k_static_scales_ptr = pool
         .k_static_scales_ptr(layer_idx, stream)
         .ok_or_else(|| anyhow!("quant KV pool missing KIVI k_static_scales (layer {layer_idx})"))?;
-    let ws = pool
-        .int8_attn_workspace
-        .as_ref()
-        .ok_or_else(|| anyhow!("quant KV pool missing split-KV attention workspace"))?;
+    let ws = pool.int8_attn_workspace()?;
     // The kernel adapts its split count to the workspace it is given
     // (`choose_decode_num_splits` clamps by workspace_bytes, ≥1 split), so the
     // only unfittable case is a single split not fitting. The pool sizes the
