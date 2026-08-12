@@ -2274,7 +2274,8 @@ impl Backend for CudaBackend {
         {
             let a_op = self.f32_operand(a, "matmul")?;
             let a = a_op.get();
-            let b = self.cuda_slice(b, "matmul")?;
+            let b_op = self.f32_operand(b, "matmul")?;
+            let b = b_op.get();
             let (out, out_shape) = self.matmul_device(a, a_shape, b, b_shape)?;
             Ok((DeviceHandle::Cuda(CudaStorage::new(out)), out_shape))
         }
@@ -9173,8 +9174,10 @@ fn cuda_binary_1d_device(
         })?;
         return Ok(DeviceHandle::CudaBf16(CudaBf16Storage::new(d_out)));
     }
-    let d_a = backend.cuda_slice(a, op_label)?;
-    let d_b = backend.cuda_slice(b, op_label)?;
+    let d_a_op = backend.f32_operand(a, op_label)?;
+    let d_b_op = backend.f32_operand(b, op_label)?;
+    let d_a = d_a_op.get();
+    let d_b = d_b_op.get();
     if d_a.len() != size || d_b.len() != size {
         return Err(AutogradError::DataLengthMismatch {
             len: d_a.len().min(d_b.len()),
