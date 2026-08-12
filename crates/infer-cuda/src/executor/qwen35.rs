@@ -1400,7 +1400,8 @@ impl Qwen35CudaExecutor {
         self.full_attn_kv.is_some()
     }
 
-    /// Multi-row page tables and the batched HD256 kernels are BF16-only.
+    /// Whether the pool is BF16. Still gates the whole-step decode graph
+    /// (persistent page table is BF16-only) and DSpark batched draft.
     fn paged_kv_bf16(&self) -> bool {
         self.full_attn_kv
             .as_ref()
@@ -2991,8 +2992,8 @@ impl Qwen35CudaExecutor {
         let kind = self.spec_kind();
         // Only a batched greedy DSpark draft pays above c=1. MTP still drafts
         // per row; sampling loses −15.5% at c=8 and −26.4% at c=16 because the
-        // rejection test commits far less per verify row; a quant-KV pool cannot
-        // build a multi-row page table. Each holds the gate at 1.
+        // rejection test commits far less per verify row; the batched DSpark
+        // path is unvalidated with quant-KV pools. Each holds the gate at 1.
         let batched = kind == SpecKind::Dspark
             && self.paged_kv_bf16()
             && decode_rows.iter().all(|r| r.params.is_greedy());
@@ -3361,19 +3362,18 @@ impl Qwen35CudaExecutor {
         // Under the shared-paged default (always-on), B>1 decode batches over the
         // shared `full_attn_kv` pool via the PAGED batched kernels (the contiguous
         // `k_caches`/`v_caches` the legacy batched path reads are never allocated).
-        // BF16 single-GPU only: the batched-paged HD256 kernels are BF16, and a TP
-        // collective per-rank lockstep is handled by `forward_decode_batch_paged`'s
-        // all-reduces — but the correctness floor keeps quant-KV and `--kv-recall`
-        // (per-row restricted page table) on the serial per-row path.
+        // BF16 and INT8/FP8 pools both run here: the quant arm quantizes each
+        // row's new token into the pool planes, then runs the varlen quantized
+        // decode kernel. A TP collective per-rank lockstep is handled by
+        // `forward_decode_batch_paged`'s all-reduces — the correctness floor
+        // keeps `--kv-recall` (per-row restricted page table) on the serial
+        // per-row path.
         if self.full_attn_paged() {
-            if qwen35_batched_decode_enabled()
-                && self.paged_kv_bf16()
-                && !self.recall_active()
-                && self.model.tp.is_single()
+            if qwen35_batched_decode_enabled() && !self.recall_active() && self.model.tp.is_single()
             {
                 return self.submit_decode_batch_paged(rows, host_kv);
             }
-            // Correctness floor: recall / quant-KV / TP → serial per-row paged.
+            // Correctness floor: recall / TP → serial per-row paged.
             let mut tokens = Vec::with_capacity(rows.len());
             for row in rows {
                 let (token, logprob) =
@@ -3463,8 +3463,8 @@ impl Qwen35CudaExecutor {
     /// the per-row append + page-table build mirrors the single-row
     /// [`Self::decode_row_paged_default`], so a B-row batch is byte-equivalent to
     /// B sequential single-row paged decodes (each row attends only its own
-    /// slot's pages via its `kv_indptr` slice). BF16 single-GPU, no recall (gated
-    /// by the caller in `submit_decode_batch`).
+    /// slot's pages via its `kv_indptr` slice). BF16 and INT8/FP8 pools both
+    /// run; single-GPU, no recall (gated by the caller in `submit_decode_batch`).
     fn submit_decode_batch_paged(
         &mut self,
         rows: &[DecodeRow],
