@@ -9,6 +9,9 @@ else
   export PATH=/root/.cargo/bin:/usr/local/cuda/bin:$PATH
 fi
 export CUDA_HOME=/usr/local/cuda
+# Shared 180-core box: unbounded cargo parallelism spawns that many nvcc at
+# once (~4 GB each) and OOM-kills the build. 32 keeps peak under ~130 GB.
+export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-32}"
 # ELKEID (host security agent) SIGKILLs any process that forks while a CUDA
 # device is visible — nvcc/ptxas/cicc fork heavily during cuda-kernels build.
 # The build does not need a GPU (it cross-compiles for sm_90), so hide devices

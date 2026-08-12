@@ -14,7 +14,7 @@
 #   family       -> grouping + drives generated_dir/symbol prefixes
 #   head_dim     -> documentation/resolve key (baked into the cubin, not a py arg)
 #   q_heads/kv_heads -> --num-q-heads/--num-kv-heads (omit for non-attn rows)
-#   kv_dtype     -> bf16 | fp8 (selects the abi; resolve() key)
+#   kv_dtype     -> bf16 (selects the abi; resolve() key)
 #   phase        -> prefill | decode | split_partial | split_merge | <gdr phase> | <fq phase>
 #   abi          -> names a [abi.*] shared C signature block (below)
 #   py_module    -> --kernel-path
@@ -23,7 +23,7 @@
 #   artifact_dir -> generated/<dir> base (per-SM gets _sm{N}, dispatch gets _dispatch)
 #   kernel_family-> generator --kernel-family (NOT the registry `family`; the py
 #                   codegen tag: attention | attention_bf16_split_partial |
-#                   attention_bf16_split_merge | attention_fp8 | gdr | flashqla)
+#                   attention_bf16_split_merge | gdr | flashqla)
 #   kernel_key   -> generator --kernel-key (optional; split_partial/merge/gdr/fq)
 #   allow_sm70   -> include sm_70 in the per-SM loop (Qwen3.5 dense subset + GDR)
 #   ffi          -> true: emit a Rust extern in ffi_tilelang_generated.rs.
@@ -140,41 +140,6 @@ rust = [
   ["stream", "CUstream"],
 ]
 
-[abi.paged_attn_fp8_v1]
-fn_ty = "PagedAttnFp8V1Fn"
-# 20-arg: k/v pools as const u8 (FP8 E4M3) + k_scales/v_scales.
-c = """uint16_t *q, const int32_t *q_indptr, const uint8_t *k_pool, const uint8_t *v_pool, \
-const float *k_scales, const float *v_scales, const int32_t *kv_indptr, \
-const int32_t *kv_indices, const int32_t *kv_last_page_len, uint16_t *o, \
-int32_t batch_size, int32_t total_q_tokens, int32_t max_qlen, int32_t num_pages, \
-int32_t total_pages, int32_t num_q_heads, int32_t num_kv_heads, int32_t page_size, \
-float sm_scale, CUstream stream"""
-call = """q, q_indptr, k_pool, v_pool, k_scales, v_scales, kv_indptr, kv_indices, \
-kv_last_page_len, o, batch_size, total_q_tokens, max_qlen, num_pages, total_pages, \
-num_q_heads, num_kv_heads, page_size, sm_scale, stream"""
-rust = [
-  ["q", "*mut Half"],
-  ["q_indptr", "*const i32"],
-  ["k_pool", "*const u8"],
-  ["v_pool", "*const u8"],
-  ["k_scales", "*const f32"],
-  ["v_scales", "*const f32"],
-  ["kv_indptr", "*const i32"],
-  ["kv_indices", "*const i32"],
-  ["kv_last_page_len", "*const i32"],
-  ["o", "*mut Half"],
-  ["batch_size", "i32"],
-  ["total_q_tokens", "i32"],
-  ["max_qlen", "i32"],
-  ["num_pages", "i32"],
-  ["total_pages", "i32"],
-  ["num_q_heads", "i32"],
-  ["num_kv_heads", "i32"],
-  ["page_size", "i32"],
-  ["sm_scale", "f32"],
-  ["stream", "CUstream"],
-]
-
 # GDR + FlashQLA ABIs: build-only in tranche 1 (ffi = false). Their Rust externs
 # stay hand-written in ffi/recurrent.rs (they are individual pub fn decls, not
 # macro lockstep — outside the FFI-collapse scope). C signature is still required
@@ -266,8 +231,7 @@ rust = []
 # ===========================================================================
 # BF16 prefill (paged_attn_v1) — kernel_family "attention".
 # allow_sm70: all HD128 + HD256 BF16 configs (Qwen3.5/3.6 dense + MoE,
-#   incl. 0.8B/1.7B/27B/35B-A3B). FP8 kernels stay sm_80+ (Volta has no FP8
-#   compute). HD64 stays sm_80+ (no Qwen3 model uses it).
+#   incl. 0.8B/1.7B/27B/35B-A3B). HD64 stays sm_80+ (no Qwen3 model uses it).
 # ===========================================================================
 
 [[kernel]]
@@ -684,170 +648,6 @@ artifact_dir = "batch_decode_paged_hd128_split_merge_q64_kv8"
 kernel_name = "tilelang_batch_decode_paged_hd128_split_merge_q64_kv8_run"
 out_name = "tilelang_batch_decode_paged_hd128_split_merge_q64_kv8"
 allow_sm70 = true
-ffi = true
-
-# ===========================================================================
-# FP8 KV decode (M_b.2 A0) — single config (32,8). kernel_family attention_fp8.
-# ===========================================================================
-
-[[kernel]]
-head_dim = 128
-q_heads = 32
-kv_heads = 8
-phase = "decode"
-abi = "paged_attn_fp8_v1"
-kernel_family = "attention_fp8"
-py_module = "tools/tilelang/batch_decode_paged_hd128_fp8.py"
-artifact_dir = "batch_decode_paged_hd128_fp8_q32_kv8"
-kernel_name = "tilelang_batch_decode_paged_hd128_fp8_q32_kv8_run"
-out_name = "tilelang_batch_decode_paged_hd128_fp8_q32_kv8"
-allow_sm70 = false
-ffi = true
-
-# ===========================================================================
-# FP8 KV HD256 (Qwen3.5 full-attn layers). paged_attn_fp8_v1 ABI.
-# 5 head configs × 2 phases (decode + prefill) = 10 entries.
-# allow_sm70 = false (FP8 requires Ampere+).
-# ===========================================================================
-
-[[kernel]]
-head_dim = 256
-q_heads = 8
-kv_heads = 1
-phase = "decode"
-abi = "paged_attn_fp8_v1"
-kernel_family = "attention_fp8"
-py_module = "tools/tilelang/batch_decode_paged_hd256_fp8.py"
-artifact_dir = "batch_decode_paged_hd256_fp8_q8_kv1"
-kernel_name = "tilelang_batch_decode_paged_hd256_fp8_q8_kv1_run"
-out_name = "tilelang_batch_decode_paged_hd256_fp8_q8_kv1"
-allow_sm70 = false
-ffi = true
-
-[[kernel]]
-head_dim = 256
-q_heads = 8
-kv_heads = 2
-phase = "decode"
-abi = "paged_attn_fp8_v1"
-kernel_family = "attention_fp8"
-py_module = "tools/tilelang/batch_decode_paged_hd256_fp8.py"
-artifact_dir = "batch_decode_paged_hd256_fp8_q8_kv2"
-kernel_name = "tilelang_batch_decode_paged_hd256_fp8_q8_kv2_run"
-out_name = "tilelang_batch_decode_paged_hd256_fp8_q8_kv2"
-allow_sm70 = false
-ffi = true
-
-[[kernel]]
-head_dim = 256
-q_heads = 16
-kv_heads = 2
-phase = "decode"
-abi = "paged_attn_fp8_v1"
-kernel_family = "attention_fp8"
-py_module = "tools/tilelang/batch_decode_paged_hd256_fp8.py"
-artifact_dir = "batch_decode_paged_hd256_fp8_q16_kv2"
-kernel_name = "tilelang_batch_decode_paged_hd256_fp8_q16_kv2_run"
-out_name = "tilelang_batch_decode_paged_hd256_fp8_q16_kv2"
-allow_sm70 = false
-ffi = true
-
-[[kernel]]
-head_dim = 256
-q_heads = 16
-kv_heads = 4
-phase = "decode"
-abi = "paged_attn_fp8_v1"
-kernel_family = "attention_fp8"
-py_module = "tools/tilelang/batch_decode_paged_hd256_fp8.py"
-artifact_dir = "batch_decode_paged_hd256_fp8_q16_kv4"
-kernel_name = "tilelang_batch_decode_paged_hd256_fp8_q16_kv4_run"
-out_name = "tilelang_batch_decode_paged_hd256_fp8_q16_kv4"
-allow_sm70 = false
-ffi = true
-
-[[kernel]]
-head_dim = 256
-q_heads = 24
-kv_heads = 4
-phase = "decode"
-abi = "paged_attn_fp8_v1"
-kernel_family = "attention_fp8"
-py_module = "tools/tilelang/batch_decode_paged_hd256_fp8.py"
-artifact_dir = "batch_decode_paged_hd256_fp8_q24_kv4"
-kernel_name = "tilelang_batch_decode_paged_hd256_fp8_q24_kv4_run"
-out_name = "tilelang_batch_decode_paged_hd256_fp8_q24_kv4"
-allow_sm70 = false
-ffi = true
-
-[[kernel]]
-head_dim = 256
-q_heads = 8
-kv_heads = 1
-phase = "prefill"
-abi = "paged_attn_fp8_v1"
-kernel_family = "attention_fp8"
-py_module = "tools/tilelang/batch_prefill_paged_hd256_fp8.py"
-artifact_dir = "batch_prefill_paged_hd256_fp8_q8_kv1"
-kernel_name = "tilelang_batch_prefill_paged_hd256_fp8_q8_kv1_run"
-out_name = "tilelang_batch_prefill_paged_hd256_fp8_q8_kv1"
-allow_sm70 = false
-ffi = true
-
-[[kernel]]
-head_dim = 256
-q_heads = 8
-kv_heads = 2
-phase = "prefill"
-abi = "paged_attn_fp8_v1"
-kernel_family = "attention_fp8"
-py_module = "tools/tilelang/batch_prefill_paged_hd256_fp8.py"
-artifact_dir = "batch_prefill_paged_hd256_fp8_q8_kv2"
-kernel_name = "tilelang_batch_prefill_paged_hd256_fp8_q8_kv2_run"
-out_name = "tilelang_batch_prefill_paged_hd256_fp8_q8_kv2"
-allow_sm70 = false
-ffi = true
-
-[[kernel]]
-head_dim = 256
-q_heads = 16
-kv_heads = 2
-phase = "prefill"
-abi = "paged_attn_fp8_v1"
-kernel_family = "attention_fp8"
-py_module = "tools/tilelang/batch_prefill_paged_hd256_fp8.py"
-artifact_dir = "batch_prefill_paged_hd256_fp8_q16_kv2"
-kernel_name = "tilelang_batch_prefill_paged_hd256_fp8_q16_kv2_run"
-out_name = "tilelang_batch_prefill_paged_hd256_fp8_q16_kv2"
-allow_sm70 = false
-ffi = true
-
-[[kernel]]
-head_dim = 256
-q_heads = 16
-kv_heads = 4
-phase = "prefill"
-abi = "paged_attn_fp8_v1"
-kernel_family = "attention_fp8"
-py_module = "tools/tilelang/batch_prefill_paged_hd256_fp8.py"
-artifact_dir = "batch_prefill_paged_hd256_fp8_q16_kv4"
-kernel_name = "tilelang_batch_prefill_paged_hd256_fp8_q16_kv4_run"
-out_name = "tilelang_batch_prefill_paged_hd256_fp8_q16_kv4"
-allow_sm70 = false
-ffi = true
-
-[[kernel]]
-head_dim = 256
-q_heads = 24
-kv_heads = 4
-phase = "prefill"
-abi = "paged_attn_fp8_v1"
-kernel_family = "attention_fp8"
-py_module = "tools/tilelang/batch_prefill_paged_hd256_fp8.py"
-artifact_dir = "batch_prefill_paged_hd256_fp8_q24_kv4"
-kernel_name = "tilelang_batch_prefill_paged_hd256_fp8_q24_kv4_run"
-out_name = "tilelang_batch_prefill_paged_hd256_fp8_q24_kv4"
-allow_sm70 = false
 ffi = true
 
 # ===========================================================================

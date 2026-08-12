@@ -844,63 +844,13 @@ impl Qwen35Model {
                                     .result()?;
                                 }
                             }
-                            KVFormat::FP8E4M3 => {
-                                let (qp_ptr, _g0) = q_prepped.data.device_ptr_mut(&self.ctx.stream);
-                                let (ao_ptr, _g5) = attn_out.data.device_ptr_mut(&self.ctx.stream);
-                                // SAFETY: kernel signature from paged_attn_fp8_v1 ABI (20-arg).
-                                // k/v data buffers are FP8; scales are per-token per-kv-head f32.
-                                let kernel = ffi::resolve_paged_attn_fp8_v1(
-                                    c.head_dim as u32,
-                                    self.local_q_heads as u32,
-                                    self.local_kv_heads as u32,
-                                    phase,
-                                )
-                                .ok_or_else(|| {
-                                    anyhow!(
-                                        "no HD256 FP8 paged {} kernel for q{}_kv{}",
-                                        if decode { "decode" } else { "prefill" },
-                                        self.local_q_heads,
-                                        self.local_kv_heads
-                                    )
-                                })?;
-                                let k_data = pool.k_data_ptr(full_idx, &self.ctx.stream);
-                                let v_data = pool.v_data_ptr(full_idx, &self.ctx.stream);
-                                let k_scales = pool.k_scales_ptr(full_idx, &self.ctx.stream);
-                                let v_scales = pool.v_scales_ptr(full_idx, &self.ctx.stream);
-                                // SAFETY: ptrs from live device allocations sized to the dims passed.
-                                unsafe {
-                                    kernel(
-                                        qp_ptr as *mut ffi::Half,
-                                        q_indptr_ptr as *const i32,
-                                        k_data as *const u8,
-                                        v_data as *const u8,
-                                        k_scales as *const f32,
-                                        v_scales as *const f32,
-                                        kv_indptr_ptr as *const i32,
-                                        kv_indices_ptr as *const i32,
-                                        last_page_len_ptr as *const i32,
-                                        ao_ptr as *mut ffi::Half,
-                                        bsz,
-                                        total_q,
-                                        max_q,
-                                        pool.max_total_pages as i32,
-                                        meta.num_pages as i32,
-                                        self.local_q_heads as i32,
-                                        self.local_kv_heads as i32,
-                                        pool.page_size as i32,
-                                        sm_scale,
-                                        self.ctx.stream.cu_stream(),
-                                    )
-                                    .result()?;
-                                }
-                            }
-                            KVFormat::INT8 => {
-                                // Per-(token, kv_head) symmetric INT8 KV: same
-                                // split-KV varlen kernel as FP8, `int8_kv` flips
-                                // the load to int8 + scale.
+                            KVFormat::FP8E4M3 | KVFormat::INT8 => {
+                                // Per-(token, kv_head) symmetric quantized KV
+                                // (FP8 E4M3 or INT8). Both share the split-KV
+                                // varlen kernel; `kv_format` selects the load.
                                 let ws = pool.quantized_attn_workspace()?;
                                 let max_kv_len = meta.max_kv_len();
-                                kv_quant::decode_attention_varlen_int8(
+                                kv_quant::decode_attention_varlen_quantized(
                                     &self.ctx,
                                     &q_prepped,
                                     q_indptr_ptr,
@@ -920,6 +870,7 @@ impl Qwen35Model {
                                     meta.total_q,
                                     max_kv_len,
                                     true, // causal
+                                    pool.format,
                                     sm_scale,
                                     ws,
                                     pool.quantized_attn_workspace_bytes,
