@@ -841,13 +841,12 @@ fn read_compressor(
         prev_overlap_score,
         compressed,
         compressed_seq_len,
-        compressed_capacity: 0,
-        ring_rows: 0,
         fp32_pending_kv,
         fp32_pending_score,
         fp32_prev_kv,
         fp32_prev_score,
         fp32_carry_stale,
+        ..Default::default()
     }))
 }
 
@@ -862,21 +861,9 @@ fn read_flashmla(
     let fp8_kv_sw_bootstrapped = read_u8(bytes, pos)? != 0;
     let fp8_kv_comp_packed_rows = read_u64(bytes, pos)? as usize;
     Ok(Some(crate::attention::Dsv4FlashMlaImage {
-        fp8_kv_pool_len: 0,
-        sw_blocks: 0,
-        comp_blocks: 0,
-        max_compressed_keys: 0,
-        topk_unified: 0,
-        page_block_size: 0,
         fp8_kv_sw_bootstrapped,
         fp8_kv_comp_packed_rows,
-        topk_length: Vec::new(),
-        sched_meta: Vec::new(),
-        num_splits: Vec::new(),
-        num_sm_parts: 0,
-        fixed_overhead_num_blocks: 0,
-        block_size_topk: 0,
-        device_page_table: Vec::new(),
+        ..Default::default()
     }))
 }
 
@@ -888,9 +875,9 @@ fn read_dsa(bytes: &[u8], pos: &mut usize) -> Result<Option<crate::attention::Ds
     let rotated_keys = read_bf16_vec(bytes, pos)?;
     let packed_rows = read_u64(bytes, pos)? as usize;
     Ok(Some(crate::attention::Dsv4DsaImage {
-        key_cache_len: 0,
         rotated_keys,
         packed_rows,
+        ..Default::default()
     }))
 }
 

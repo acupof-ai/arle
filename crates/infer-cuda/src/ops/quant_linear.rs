@@ -776,14 +776,12 @@ fn try_w8a16_dequant_bf16_gemm_batch(
 
 fn try_w4a16_dequant_bf16_gemm_batch(
     _ctx: &DeviceContext,
-    weight: &DeviceMatrix,
+    _weight: &DeviceMatrix,
     _x: &HiddenStates,
     _out: &mut HiddenStates,
 ) -> Result<bool> {
-    if weight.weight_format != WeightFormat::W4A16 {
-        return Ok(false);
-    }
-    // Use Marlin batched GEMV for all batch sizes.
+    // W4A16 dense dequant+GEMM path is intentionally disabled: Marlin batched
+    // GEMV (w4a16_gemv_batch_cuda) handles all batch sizes.
     Ok(false)
 }
 
