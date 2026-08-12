@@ -594,8 +594,8 @@ unsafe extern "C" {
     pub fn decode_attention_varlen_fp8_cuda(
         q_packed: *const Half,
         qo_indptr: *const i32,
-        k_pool: *const u8, // FP8 E4M3
-        v_pool: *const u8, // FP8 E4M3
+        k_pool: *const u8, // FP8 E4M3 or INT8
+        v_pool: *const u8, // FP8 E4M3 or INT8
         k_scales: *const f32,
         v_scales: *const f32,
         kv_indptr: *const i32,
@@ -604,6 +604,7 @@ unsafe extern "C" {
         output: *mut Half,
         num_q_heads: i32,
         num_kv_heads: i32,
+        head_dim: i32,
         page_size: i32,
         batch_size: i32,
         total_q_tokens: i32,

@@ -509,10 +509,28 @@ fn run_w2s(args: TrainW2sArgs) -> Result<()> {
     {
         let base_ids: HashSet<TensorId> = base.all_parameter_ids().into_iter().collect();
         let adapter_ids: HashSet<TensorId> = student.adapter_name_map().values().copied().collect();
-        eprintln!("[arle train w2s] offloading base weights to CPU");
-        for id in base_ids.difference(&adapter_ids) {
+        let base_only: Vec<TensorId> = base_ids.difference(&adapter_ids).copied().collect();
+        eprintln!(
+            "[arle train w2s] offloading {} base weights to CPU",
+            base_only.len()
+        );
+        for id in &base_only {
             store.offload_to_host(*id)?;
         }
+        // Debug: check that the first base weight has host data after offload.
+        if let Some(&id) = base_only.first() {
+            let data_len = store.get(id).map(|t| t.data.len()).unwrap_or(0);
+            eprintln!("[arle train w2s] first base weight id={id} data_len={data_len}");
+        }
+        // Debug: count base weights with empty data after offload.
+        let empty_count = base_only
+            .iter()
+            .filter(|&&id| store.get(id).map(|t| t.data.is_empty()).unwrap_or(true))
+            .count();
+        eprintln!(
+            "[arle train w2s] base weights with empty data after offload: {empty_count}/{}",
+            base_only.len()
+        );
     }
 
     // Load auxiliary models.
