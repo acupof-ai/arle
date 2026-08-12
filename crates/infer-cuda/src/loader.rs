@@ -431,18 +431,22 @@ impl PageMeta {
         // overhead on the default path.
         let quant = matches!(pool.format, KVFormat::INT8 | KVFormat::FP8E4M3);
         let (new_token_rows, prefix_token_rows, quant_decode_meta) = if quant {
-            // The refill/quantize row lists are indexed as one contiguous range.
-            ensure!(
-                batch == 1,
-                "quantized KV page table is single-row, got {batch}"
-            );
-            let (slot, start_pos, len) = rows[0];
-            let new_rows = pool
-                .token_rows_for_range(slot, start_pos, len)
-                .into_iter()
-                .map(|row| row as i32)
-                .collect::<Vec<_>>();
-            let prefix_rows = if start_pos > 0 {
+            // Multi-row: row lists concatenate in row order — the quantize
+            // kernel indexes them by flat Q-token position (the row index for
+            // decode, one Q token per row).
+            let mut new_rows = Vec::new();
+            for &(slot, start_pos, len) in rows {
+                new_rows.extend(
+                    pool.token_rows_for_range(slot, start_pos, len)
+                        .into_iter()
+                        .map(|row| row as i32),
+                );
+            }
+            // The prefix refill feeds the single-row prefill path only; a
+            // batched decode reads the already-quantized prefix straight from
+            // the pool planes, so no prefix list is built for multi-row.
+            let prefix_rows = if batch == 1 && rows[0].1 > 0 {
+                let (slot, start_pos, _) = rows[0];
                 let rows = pool
                     .token_rows_for_range(slot, 0, start_pos)
                     .into_iter()
@@ -452,12 +456,13 @@ impl PageMeta {
             } else {
                 None
             };
+            let slots: Vec<usize> = rows.iter().map(|&(slot, _, _)| slot).collect();
             (
                 Some(upload_i32(ctx, &new_rows)?),
                 prefix_rows,
                 Some(upload_i32(
                     ctx,
-                    &pool.build_quantized_decode_indptr(&[slot]),
+                    &pool.build_quantized_decode_indptr(&slots),
                 )?),
             )
         } else {
@@ -687,18 +692,14 @@ impl PageMeta {
         })
     }
 
-    /// Batched decode page table (BF16 only). `total_len` INCLUDES this step's
-    /// just-appended token.
+    /// Batched decode page table. `total_len` INCLUDES this step's
+    /// just-appended token. BF16 and INT8/FP8 pools both supported: the quant
+    /// row lists build one entry per row.
     pub(crate) fn for_decode_batch(
         ctx: &DeviceContext,
         pool: &PagedKVPool,
         rows: &[(usize, usize)],
     ) -> Result<Self> {
-        ensure!(
-            pool.format == KVFormat::BF16,
-            "batched paged decode is BF16-only, got {:?}",
-            pool.format
-        );
         let rows = rows
             .iter()
             .map(|&(slot, total_len)| {
@@ -6418,4 +6419,3 @@ impl MoeFp8ExpertGroup {
             .map_err(|e| anyhow!("FP8 MoE scale ptr table H2D failed: {e}"))
     }
 }
-
