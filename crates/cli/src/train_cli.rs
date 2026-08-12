@@ -455,6 +455,7 @@ fn run_opd(args: TrainOpdArgs) -> ExitCode {
 fn run_w2s(args: TrainW2sArgs) -> Result<()> {
     use crate::args::W2sAuxBackendArg;
     use autograd::{Tape, TensorId, optim::AdamW};
+    use std::collections::HashSet;
     use train::{
         lora::LoraConfig,
         qwen35::Qwen35Model,
@@ -500,26 +501,40 @@ fn run_w2s(args: TrainW2sArgs) -> Result<()> {
     // Initialize serving = shadow (both start from the same LoRA init).
     sync_lora_adapters(&student, &serving, &mut store)?;
 
-    // Upload all model weights to GPU upfront. The forward pass would
-    // otherwise upload them on-demand, which OOMs when aux engines are
-    // resident (54 GB student + 29 GB aux = 83 GB < 97 GB H20).
-    eprintln!("[arle train w2s] uploading student/base weights to GPU");
-    for id in student.all_parameter_ids() {
-        store.ensure_device(id)?;
-    }
-    for id in serving.all_parameter_ids() {
-        store.ensure_device(id)?;
+    // Offload the base (non-LoRA) weights to CPU. The loader uploads bf16
+    // frozen-base weights directly to GPU, but the 27B base (54 GB) plus the
+    // aux post-RL (55 GB) exceed the 97 GB H20. The base weights are reloaded
+    // to GPU after the aux engines are loaded/offloaded, and the w2s step
+    // offloads them again during the aux forward pass.
+    {
+        let base_ids: HashSet<TensorId> = base.all_parameter_ids().into_iter().collect();
+        let adapter_ids: HashSet<TensorId> = student.adapter_name_map().values().copied().collect();
+        eprintln!("[arle train w2s] offloading base weights to CPU");
+        for id in base_ids.difference(&adapter_ids) {
+            store.offload_to_host(*id)?;
+        }
     }
 
     // Load auxiliary models.
     let aux1 = match args.aux_backend {
         W2sAuxBackendArg::InProcess => {
-            eprintln!(
-                "[arle train w2s] loading aux1 pre-RL from {}",
-                args.aux1_pre.display()
-            );
-            let aux1_pre = load_qwen35_from_hf_dir(&args.aux1_pre, &mut store)
-                .with_context(|| format!("load aux1 pre-RL from {}", args.aux1_pre.display()))?;
+            // When --aux1-pre is omitted, reuse the student's base model as
+            // pre-RL. ΔT = post_RL_logits − base_logits captures how far the
+            // teacher sits above the student's starting point.
+            let aux1_pre = match &args.aux1_pre {
+                Some(path) => {
+                    eprintln!(
+                        "[arle train w2s] loading aux1 pre-RL from {}",
+                        path.display()
+                    );
+                    load_qwen35_from_hf_dir(path, &mut store)
+                        .with_context(|| format!("load aux1 pre-RL from {}", path.display()))?
+                }
+                None => {
+                    eprintln!("[arle train w2s] aux1 pre-RL = student base model (reused)");
+                    base.clone()
+                }
+            };
             eprintln!(
                 "[arle train w2s] loading aux1 post-RL from {}",
                 args.aux1_post.display()
@@ -534,10 +549,6 @@ fn run_w2s(args: TrainW2sArgs) -> Result<()> {
             use std::sync::{Arc, Mutex};
             use train::teacher_infer::{InferTeacher, TeacherForward};
 
-            eprintln!(
-                "[arle train w2s] loading aux1 pre-RL (infer) from {}",
-                args.aux1_pre.display()
-            );
             // Aux engines run forward passes over the full prompt+completion
             // (chain-of-thought KL), so the sequence budget must cover GSM8K
             // solutions (~500 tokens). `mem_fraction_static` keeps the KV pool
@@ -546,14 +557,19 @@ fn run_w2s(args: TrainW2sArgs) -> Result<()> {
                 mem_fraction_static: 0.1,
                 ..EngineLoadConfig::single_sequence(2048)
             };
+            let pre_path = args.aux1_pre.as_ref().unwrap_or(&args.student_model);
+            eprintln!(
+                "[arle train w2s] loading aux1 pre-RL (infer) from {}",
+                pre_path.display()
+            );
             let pre_engine = LoadedInferenceEngine::load_with_config(
-                args.aux1_pre
+                pre_path
                     .to_str()
                     .ok_or_else(|| anyhow!("aux1 pre path not UTF-8"))?,
                 true,
                 aux_cfg.clone(),
             )
-            .with_context(|| format!("load aux1 pre-RL infer from {}", args.aux1_pre.display()))?;
+            .with_context(|| format!("load aux1 pre-RL infer from {}", pre_path.display()))?;
             eprintln!(
                 "[arle train w2s] loading aux1 post-RL (infer) from {}",
                 args.aux1_post.display()
@@ -597,33 +613,60 @@ fn run_w2s(args: TrainW2sArgs) -> Result<()> {
 
     let aux2 = match args.aux_backend {
         W2sAuxBackendArg::InProcess => {
-            eprintln!(
-                "[arle train w2s] loading aux2 pre-RL from {}",
-                args.aux2_pre.display()
-            );
-            let aux2_pre = load_qwen35_from_hf_dir(&args.aux2_pre, &mut store)
-                .with_context(|| format!("load aux2 pre-RL from {}", args.aux2_pre.display()))?;
-            eprintln!(
-                "[arle train w2s] loading aux2 post-RL from {}",
-                args.aux2_post.display()
-            );
-            let aux2_post = load_qwen35_from_hf_dir(&args.aux2_post, &mut store)
-                .with_context(|| format!("load aux2 post-RL from {}", args.aux2_post.display()))?;
-            (W2sAuxModel::new_in_process(aux2_pre, aux2_post), false)
+            match (&args.aux2_pre, &args.aux2_post) {
+                (Some(pre_path), Some(post_path)) => {
+                    eprintln!(
+                        "[arle train w2s] loading aux2 pre-RL from {}",
+                        pre_path.display()
+                    );
+                    let aux2_pre = load_qwen35_from_hf_dir(pre_path, &mut store)
+                        .with_context(|| format!("load aux2 pre-RL from {}", pre_path.display()))?;
+                    eprintln!(
+                        "[arle train w2s] loading aux2 post-RL from {}",
+                        post_path.display()
+                    );
+                    let aux2_post =
+                        load_qwen35_from_hf_dir(post_path, &mut store).with_context(|| {
+                            format!("load aux2 post-RL from {}", post_path.display())
+                        })?;
+                    (W2sAuxModel::new_in_process(aux2_pre, aux2_post), false)
+                }
+                _ => {
+                    // No aux2 checkpoints: share aux1 (ΔT₁ == ΔT₂). The
+                    // consistency gate is a no-op but the rest of the w2s
+                    // pipeline still runs.
+                    eprintln!("[arle train w2s] no aux2 checkpoints — sharing aux1");
+                    (aux1.clone(), true)
+                }
+            }
         }
         #[cfg(feature = "cuda")]
         W2sAuxBackendArg::Infer => {
             use train::w2s::W2sAuxModel;
 
-            // Smoke-test memory optimization: share aux1's infer engines for
-            // aux2 (ΔT₁ == ΔT₂). Real runs load independent aux2 checkpoints.
-            eprintln!("[arle train w2s] reusing aux1 engines for aux2 (smoke-test sharing)");
-            match &aux1 {
-                W2sAuxModel::Infer { pre_rl, post_rl } => (
-                    W2sAuxModel::new_infer(pre_rl.clone(), post_rl.clone()),
-                    true,
-                ),
-                _ => unreachable!("aux_backend=infer but aux1 is not Infer"),
+            match (&args.aux2_pre, &args.aux2_post) {
+                (Some(_), Some(_)) => {
+                    // Independent aux2 engines would go here; for now we share
+                    // aux1 to keep memory bounded.
+                    eprintln!("[arle train w2s] reusing aux1 engines for aux2 (memory sharing)");
+                    match &aux1 {
+                        W2sAuxModel::Infer { pre_rl, post_rl } => (
+                            W2sAuxModel::new_infer(pre_rl.clone(), post_rl.clone()),
+                            true,
+                        ),
+                        _ => unreachable!("aux_backend=infer but aux1 is not Infer"),
+                    }
+                }
+                _ => {
+                    eprintln!("[arle train w2s] no aux2 checkpoints — sharing aux1");
+                    match &aux1 {
+                        W2sAuxModel::Infer { pre_rl, post_rl } => (
+                            W2sAuxModel::new_infer(pre_rl.clone(), post_rl.clone()),
+                            true,
+                        ),
+                        _ => unreachable!("aux_backend=infer but aux1 is not Infer"),
+                    }
+                }
             }
         }
         #[cfg(not(feature = "cuda"))]
@@ -632,6 +675,22 @@ fn run_w2s(args: TrainW2sArgs) -> Result<()> {
         }
     };
     let (aux2, share_aux) = aux2;
+
+    // Offload aux post-RL weights to CPU. The 27B base (54 GB) and aux post-RL
+    // (54 GB) cannot both reside on a 97 GB H20; the w2s step uploads the aux
+    // weights just-in-time for the ΔT forward and offloads them again before
+    // reloading the student's base weights.
+    {
+        eprintln!("[arle train w2s] offloading aux post-RL weights to CPU");
+        for id in aux1.post_rl_param_ids() {
+            store.offload_to_host(id)?;
+        }
+        if !share_aux {
+            for id in aux2.post_rl_param_ids() {
+                store.offload_to_host(id)?;
+            }
+        }
+    }
 
     let trainable_params: Vec<TensorId> = student
         .all_parameter_ids()
@@ -646,13 +705,26 @@ fn run_w2s(args: TrainW2sArgs) -> Result<()> {
     // Re-upload student/serving weights to GPU. The aux-engine load/offload
     // cycle may have evicted them from the device (the autograd store spills
     // to host under memory pressure), so the student forward would otherwise
-    // htod-copy them one-by-one and OOM.
+    // htod-copy them one-by-one and OOM. Base weights go up as bf16 (54 GB)
+    // rather than f32 (108 GB) to fit the 97 GB H20.
     eprintln!("[arle train w2s] re-uploading student/serving weights to GPU");
-    for id in student.all_parameter_ids() {
-        store.ensure_device(id)?;
-    }
-    for id in serving.all_parameter_ids() {
-        store.ensure_device(id)?;
+    {
+        let base_ids: HashSet<TensorId> = base.all_parameter_ids().into_iter().collect();
+        let adapter_ids: HashSet<TensorId> = student.adapter_name_map().values().copied().collect();
+        for id in student.all_parameter_ids() {
+            if base_ids.contains(&id) && !adapter_ids.contains(&id) {
+                store.upload_frozen_bf16_from_host(id)?;
+            } else {
+                store.ensure_device(id)?;
+            }
+        }
+        for id in serving.all_parameter_ids() {
+            if base_ids.contains(&id) && !adapter_ids.contains(&id) {
+                store.upload_frozen_bf16_from_host(id)?;
+            } else {
+                store.ensure_device(id)?;
+            }
+        }
     }
 
     let cfg = W2sConfig {

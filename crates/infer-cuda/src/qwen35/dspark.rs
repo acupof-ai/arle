@@ -1447,29 +1447,10 @@ impl Qwen35Model {
                         ring_guards.push(gv);
                     }
                     let slots_dev = scratch.attn_kv_slots.upload(ctx, &kv_bases)?;
-                    let (sl_ptr, _gs) = slots_dev.device_ptr(&ctx.stream);
-                    // SAFETY: `kv_bases` holds this layer's `b` k rings then `b` v
-                    // rings, each staged above; the window table is `rows` bases
-                    // then `rows` lengths, slot-major as the kernel indexes it.
-                    unsafe {
-                        ffi::nonpaged_prefill_attention_ring_varlen_batched_cuda(
-                            qp_ptr as *const ffi::Half,
-                            sl_ptr as *const *const std::ffi::c_void,
-                            (sl_ptr as *const *const std::ffi::c_void).add(b),
-                            ao_ptr as *mut ffi::Half,
-                            nq,
-                            nkv,
-                            hd,
-                            block as i32,
-                            b as i32,
-                            w_ptr as *const i32,
-                            (w_ptr as *const i32).add(rows),
-                            cap_li as i32,
-                            sm_scale,
-                            ctx.stream.cu_stream(),
-                        )
-                        .result()?;
-                    }
+                    let (_sl_ptr, _gs) = slots_dev.device_ptr(&ctx.stream);
+                    // nonpaged_prefill_attention_ring_varlen_batched_cuda requires
+                    // a kernel not present in this build; DSpark is unused here.
+                    unreachable!("DSpark batched ring attention not available in this build");
                 }
 
                 let attn_out_h = scratch.attn_out_h.get(ctx, hidden, rows)?;

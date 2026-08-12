@@ -19,6 +19,12 @@ Related governance docs:
 
 ## [Unreleased]
 
+## [0.5.4] - 2026-08-12
+
+- **FEATURE (accept) — INT8 KV cache support for Qwen3.5 paged attention** (2026-08-12; `b20859520`). Qwen3.5's paged attention path now supports `KVFormat::INT8` alongside BF16 and FP8E4M3. Quantization uses `quantize_paged_kv_single` (per-token per-head symmetric INT8, scale = absmax/127); attention reuses the FP8 split-KV varlen kernel `decode_attention_varlen_fp8` with `int8_kv=true`. The kernel gained runtime head_dim dispatch (128/256) since Qwen3.5 uses head_dim=256. Verified on Qwen3.6-27B-FP8: needle gate exact at 115/300/1000/4000/8000 tokens (deterministic, matches BF16), temp arm PASS (no glued repetition), GSM8K 17/17 = 100%.
+
+- **PERF (accept) — FP8 dequant GEMV floor lowered to M>=2: WMMA GEMM replaces cuBLAS for small batches** (2026-08-12; `b20859520`). `QWEN_FP8_DEQUANT_GEMM_MIN_M` dropped from 100000 to 2: M=1 decode stays on the batched GEMV, M>=2 uses the WMMA GEMM which avoids the 2× memory blowup of cuBLAS for small batches (DSpark verify, MoE expert routing).
+
 ## [0.5.3] - 2026-08-11
 
 - **PERF (accept) — DSv4 whole-slot KV tier serialization simplified: swap_out/swap_in only persist mutable fields, FP32 carry skipped via `fp32_carry_stale`** (2026-08-11; `3d499a4fb`). The whole-slot park image previously serialized every per-(slot,layer) buffer including constant-after-init fields and FP32 carry accumulators. `swap_out` now captures only `fp8_kv_sw_bootstrapped` and `fp8_kv_comp_packed_rows` from FlashMLA (the rest are init constants); the compressor's FP32 carry buffers are skipped when `fp32_carry_stale` is set, and on `swap_in` the flag is propagated so the next forward reseeds FP32 from the bf16 carry. `copy_pages_to_host_no_sync` removes the per-layer sync barrier in swap_out (one global sync at the end), and `flashmla_ensure_band(zero: false)` skips zeroing on swap-in since pages are overwritten. Verified on H20 TP=4 with `--kv-oversubscription`: 1184 park/promote cycles, 0 errors, correct output ("Paris", "42") after promote. Park latency ~57 ms, promote ~100 ms for seq_len 18–137 (fixed overhead dominates; KV data is ~38–80 KB).

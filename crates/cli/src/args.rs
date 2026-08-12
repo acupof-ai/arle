@@ -1450,9 +1450,10 @@ pub(crate) struct TrainW2sArgs {
     #[arg(long, value_name = "PATH")]
     pub(crate) student_model: PathBuf,
 
-    /// Auxiliary model 1 pre-RL (base) checkpoint.
+    /// Auxiliary model 1 pre-RL (base) checkpoint. When omitted, the student's
+    /// own base model is used as pre-RL (ΔT = teacher − student_base).
     #[arg(long, value_name = "PATH")]
-    pub(crate) aux1_pre: PathBuf,
+    pub(crate) aux1_pre: Option<PathBuf>,
 
     /// Auxiliary model 1 post-RL (instruct) checkpoint.
     #[arg(long, value_name = "PATH")]
@@ -1460,11 +1461,11 @@ pub(crate) struct TrainW2sArgs {
 
     /// Auxiliary model 2 pre-RL (base) checkpoint.
     #[arg(long, value_name = "PATH")]
-    pub(crate) aux2_pre: PathBuf,
+    pub(crate) aux2_pre: Option<PathBuf>,
 
     /// Auxiliary model 2 post-RL (instruct) checkpoint.
     #[arg(long, value_name = "PATH")]
-    pub(crate) aux2_post: PathBuf,
+    pub(crate) aux2_post: Option<PathBuf>,
 
     /// Prompt token ids (comma-separated). Defaults to a short BOS sequence.
     /// Ignored when `--train-data` is set.
