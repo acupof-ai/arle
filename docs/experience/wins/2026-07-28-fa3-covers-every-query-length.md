@@ -5,7 +5,7 @@
 The 2026-07-27 champion row measured DSpark net-negative at serving
 concurrency (−6.3% at c=8, −7.1% at c=16) and repriced it as "a speculation win
 that was really paying for a kernel defect"
-([repricing](../../research/2026-07-27-dspark-repriced-after-fa3.md)).
+(repricing; entry deleted).
 
 That comparison was rigged, by me. `full_attention_paged` selected FA3 with:
 
