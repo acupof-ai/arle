@@ -49,7 +49,6 @@ KERNELS_DIR = (
 KERNEL_MANIFEST = (
     "batch_prefill_paged_hd128",
     "batch_decode_paged_hd128",
-    "batch_decode_paged_hd128_fp8",
     "batch_prefill_paged_hd256",
     "batch_decode_paged_hd256",
     # E4 substrate (subagent in flight; auto-skip if not yet committed):

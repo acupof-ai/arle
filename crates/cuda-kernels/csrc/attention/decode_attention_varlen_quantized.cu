@@ -1,13 +1,14 @@
-// Variable-length Q + paged INT8 KV attention for Qwen3.5 HD128/256.
+// Variable-length Q + paged quantized (INT8/FP8) KV attention for Qwen3.5 HD128/256.
 //
 // FlashDecoding-style split-KV: phase 1 computes one partial softmax
 // accumulator per (q_token, q_head, split), phase 2 merges over splits.
 //
 // Pool layout is NHD durable storage:
-//   data:   [max_pages, page_size, num_kv_heads, HEAD_DIM] (int8)
+//   data:   [max_pages, page_size, num_kv_heads, HEAD_DIM] (int8 or fp8)
 //   scales: [max_pages * page_size, num_kv_heads] (f32, per-token per-head)
 
 #include <cuda_bf16.h>
+#include <cuda_fp8.h>
 #include <cuda_runtime.h>
 #include <cstdint>
 #include <cfloat>
@@ -37,7 +38,7 @@ static int choose_varlen_num_splits(int max_kv_len) {
     return splits;
 }
 
-extern "C" size_t decode_attention_varlen_int8_workspace_bytes(
+extern "C" size_t decode_attention_varlen_quantized_workspace_bytes(
     int total_q_tokens,
     int num_q_heads,
     int head_dim,
@@ -63,7 +64,17 @@ __device__ __forceinline__ float load_int8_value(
     return static_cast<float>(reinterpret_cast<const int8_t*>(data)[offset]) * scale;
 }
 
-template <int HEAD_DIM, bool CAUSAL>
+__device__ __forceinline__ float load_fp8_value(
+    const void* __restrict__ data,
+    size_t offset,
+    const float* __restrict__ scales,
+    int scale_offset)
+{
+    float scale = scales ? scales[scale_offset] : 1.0f;
+    return static_cast<float>(reinterpret_cast<const __nv_fp8_e4m3*>(data)[offset]) * scale;
+}
+
+template <int HEAD_DIM, bool CAUSAL, bool INT8_KV>
 __global__ void decode_attention_varlen_quantized_partial_kernel(
     const __nv_bfloat16* __restrict__ Q,
     const int* __restrict__ qo_indptr,
@@ -214,7 +225,9 @@ __global__ void decode_attention_varlen_quantized_partial_kernel(
             #pragma unroll
             for (int i = 0; i < EPT; i++) {
                 int d = lane_id * EPT + i;
-                float k_val = load_int8_value(K_pool, row_off + d, K_scales, scale_offset);
+                float k_val = INT8_KV
+                    ? load_int8_value(K_pool, row_off + d, K_scales, scale_offset)
+                    : load_fp8_value(K_pool, row_off + d, K_scales, scale_offset);
                 qk += q_reg[i] * k_val;
             }
             qk = vlf8_warp_reduce_sum(qk);
@@ -227,7 +240,9 @@ __global__ void decode_attention_varlen_quantized_partial_kernel(
             #pragma unroll
             for (int i = 0; i < EPT; i++) {
                 int d = lane_id * EPT + i;
-                float v_val = load_int8_value(V_pool, row_off + d, V_scales, scale_offset);
+                float v_val = INT8_KV
+                    ? load_int8_value(V_pool, row_off + d, V_scales, scale_offset)
+                    : load_fp8_value(V_pool, row_off + d, V_scales, scale_offset);
                 o_reg[i] = o_reg[i] * exp_diff + exp_qk * v_val;
             }
             m_local = m_new;
@@ -333,7 +348,7 @@ __global__ void decode_attention_varlen_quantized_merge_kernel(
     O[o_base + d] = __float2bfloat16(final_o);
 }
 
-extern "C" cudaError_t decode_attention_varlen_int8_cuda(
+extern "C" cudaError_t decode_attention_varlen_quantized_cuda(
     const __nv_bfloat16* q_packed,
     const int* qo_indptr,
     const void* k_pool,
@@ -352,6 +367,7 @@ extern "C" cudaError_t decode_attention_varlen_int8_cuda(
     int total_q_tokens,
     int max_kv_len,
     bool causal,
+    bool int8_kv,
     float sm_scale,
     cudaStream_t stream,
     void* workspace,
@@ -367,7 +383,7 @@ extern "C" cudaError_t decode_attention_varlen_int8_cuda(
     }
 
     int num_splits = choose_varlen_num_splits(max_kv_len);
-    size_t needed = decode_attention_varlen_int8_workspace_bytes(
+    size_t needed = decode_attention_varlen_quantized_workspace_bytes(
         total_q_tokens, num_q_heads, head_dim, num_splits);
     if (workspace == nullptr || workspace_bytes < needed) {
         return cudaErrorInvalidValue;
@@ -382,8 +398,8 @@ extern "C" cudaError_t decode_attention_varlen_int8_cuda(
     dim3 partial_grid(total_q_tokens, num_q_heads, num_splits);
     dim3 partial_block(VLF8_BLOCK_SIZE);
 
-#define LAUNCH_PARTIAL(HD, CAUSAL_FLAG) \
-    decode_attention_varlen_quantized_partial_kernel<HD, CAUSAL_FLAG> \
+#define LAUNCH_PARTIAL(HD, CAUSAL_FLAG, INT8_FLAG) \
+    decode_attention_varlen_quantized_partial_kernel<HD, CAUSAL_FLAG, INT8_FLAG> \
         <<<partial_grid, partial_block, 0, stream>>>( \
             q_packed, qo_indptr, k_pool, v_pool, k_scales, v_scales, \
             kv_indptr, kv_indices, last_page_len, partial_out, partial_m, partial_l, \
@@ -395,8 +411,13 @@ extern "C" cudaError_t decode_attention_varlen_int8_cuda(
 
 #define LAUNCH_AT_HD(HD) \
     do { \
-        if (causal) LAUNCH_PARTIAL(HD, true); \
-        else LAUNCH_PARTIAL(HD, false); \
+        if (int8_kv) { \
+            if (causal) LAUNCH_PARTIAL(HD, true, true); \
+            else LAUNCH_PARTIAL(HD, false, true); \
+        } else { \
+            if (causal) LAUNCH_PARTIAL(HD, true, false); \
+            else LAUNCH_PARTIAL(HD, false, false); \
+        } \
         err = cudaGetLastError(); \
         if (err == cudaSuccess) LAUNCH_MERGE(HD); \
     } while (0)

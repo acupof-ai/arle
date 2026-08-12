@@ -87,7 +87,7 @@ case "$cmd" in
     bash "$ROOT/scripts/kernel_artifacts.sh" sync || true   # source-matched AOT bundle → generated/ (no-op offline/miss)
     tarball_files > "$stage/files"
     git -C "$ROOT" ls-files -d -z > "$stage/deletes"
-    COPYFILE_DISABLE=1 tar -C "$ROOT" --null -T "$stage/files" -czf "$stage/tree.tgz"
+    COPYFILE_DISABLE=1 tar --no-xattrs -C "$ROOT" --null -T "$stage/files" -czf "$stage/tree.tgz"
     archive_sha="$(shasum -a 256 "$stage/tree.tgz" | cut -d' ' -f1)"
     git -C "$ROOT" bundle create "$stage/source.bundle" HEAD
     bundle_sha="$(shasum -a 256 "$stage/source.bundle" | cut -d' ' -f1)"
