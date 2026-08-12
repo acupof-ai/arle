@@ -2,12 +2,11 @@
 //
 // output[N, M] = weight[N, K] (int4) * input[M, K] (bf16)^T
 //
-// The weight is dequantized int4→fp16 in shared memory (no global memory write),
-// then mma.sync.m16n16k16 does the matmul on tensor cores. This avoids the
-// 2× memory blowup of the dequant-to-global + cuBLAS path while getting 8× the
-// compute throughput of the int-bit-bashing CUDA-core GEMV.
+// The weight is dequantized int4->fp16 in shared memory (no global memory write),
+// then mma.sync.m16n16k16 does the matmul on tensor cores.
 //
-// Only used for M >= 2 (the DSpark verify batch); M=1 decode keeps the GEMV.
+// Uses K-splitting to increase occupancy: each block processes a chunk of K,
+// and partial results are accumulated via atomicAdd to an fp32 buffer.
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -19,115 +18,166 @@ using namespace nvcuda;
 #define WMMA_TILE_N 16
 #define WMMA_TILE_M 16
 #define WMMA_TILE_K 16
+#define WMMA_WARPS 1
+#define WMMA_K_SPLITS 16
 
 __global__ void w4a16_gemm_wmma_kernel(
-    const uint8_t* __restrict__ weight,   // [N, K/2] int4
-    const __nv_bfloat16* __restrict__ scales, // [N, ceil(K/group_size)]
-    const __nv_bfloat16* __restrict__ input,  // [M, K] bf16
-    __nv_bfloat16* __restrict__ output,       // [N, M] bf16
-    int M, int N, int K, int group_size)
+    const uint8_t* __restrict__ weight,
+    const __nv_bfloat16* __restrict__ scales,
+    const __nv_bfloat16* __restrict__ input,
+    float* __restrict__ output,
+    int M, int N, int K, int group_size, int k_chunk_size)
 {
-    const int n0 = blockIdx.x * WMMA_TILE_N;
+    const int warp_id = threadIdx.x / 32;
+    const int lane = threadIdx.x % 32;
+    const int n0 = (blockIdx.x * WMMA_WARPS + warp_id) * WMMA_TILE_N;
     const int m0 = blockIdx.y * WMMA_TILE_M;
+    const int k_start = blockIdx.z * k_chunk_size;
+    const int k_end = min(k_start + k_chunk_size, K);
     if (n0 >= N || m0 >= M) return;
 
-    const int tid = threadIdx.x;
     const int groups_per_row = (K + group_size - 1) / group_size;
 
     wmma::fragment<wmma::accumulator, WMMA_TILE_N, WMMA_TILE_M, WMMA_TILE_K, float> c_frag;
     wmma::fill_fragment(c_frag, 0.0f);
 
-    // Shared memory for the dequantized weight tile [16, 16] fp16 and the
-    // input tile [16, 16] fp16.
-    __shared__ half w_smem[WMMA_TILE_N * WMMA_TILE_K];
+    __shared__ half w_smem[WMMA_WARPS * WMMA_TILE_N * WMMA_TILE_K];
     __shared__ half x_smem[WMMA_TILE_M * WMMA_TILE_K];
 
-    for (int k0 = 0; k0 < K; k0 += WMMA_TILE_K) {
-        // --- Dequant weight tile [n0..n0+16, k0..k0+16] into w_smem ---
-        // Each thread handles one row of the tile.
-        if (tid < WMMA_TILE_N) {
-            const int n = n0 + tid;
-            const int g = k0 / group_size;
-            const float scale_f = __bfloat162float(scales[n * groups_per_row + g]);
-            const uint8_t* wrow = weight + (size_t)n * (K / 2) + k0 / 2;
-            half* wout = w_smem + tid * WMMA_TILE_K;
-            // 16 int4 values = 8 bytes. Load as 2 uint32.
-            const uint32_t w0 = *reinterpret_cast<const uint32_t*>(wrow);
-            const uint32_t w1 = *reinterpret_cast<const uint32_t*>(wrow + 4);
-            // Unpack 8 nibbles from w0.
-            const uint32_t lo0 = w0 & 0x0F0F0F0Fu;
-            const uint32_t hi0 = (w0 >> 4) & 0x0F0F0F0Fu;
-            const uint32_t lo1 = w1 & 0x0F0F0F0Fu;
-            const uint32_t hi1 = (w1 >> 4) & 0x0F0F0F0Fu;
-            // Dequant: extract nibbles, subtract 8, multiply by scale.
-            // Use the same int->float path as the scalar GEMV for bit-exact
-            // dequant values; the Marlin OR-with-0x6400 trick is equivalent but
-            // we keep the obvious form here while debugging the WMMA path.
-            const uint8_t* lo0b = reinterpret_cast<const uint8_t*>(&lo0);
-            const uint8_t* hi0b = reinterpret_cast<const uint8_t*>(&hi0);
-            const uint8_t* lo1b = reinterpret_cast<const uint8_t*>(&lo1);
-            const uint8_t* hi1b = reinterpret_cast<const uint8_t*>(&hi1);
-            #pragma unroll
-            for (int i = 0; i < 4; i++) {
-                float w0 = (float)((int)lo0b[i] - 8) * scale_f;
-                float w1 = (float)((int)hi0b[i] - 8) * scale_f;
-                wout[i * 2]     = __float2half(w0);
-                wout[i * 2 + 1] = __float2half(w1);
-            }
-            #pragma unroll
-            for (int i = 0; i < 4; i++) {
-                float w0 = (float)((int)lo1b[i] - 8) * scale_f;
-                float w1 = (float)((int)hi1b[i] - 8) * scale_f;
-                wout[8 + i * 2]     = __float2half(w0);
-                wout[8 + i * 2 + 1] = __float2half(w1);
-            }
-        }
-        __syncthreads();
+    // Marlin dequant constants
+    const uint32_t MASK4 = 0x0f0f0f0fu;
+    const uint32_t SUB   = 0x64086408u;
+    const half2 SUB_H2   = *reinterpret_cast<const half2*>(&SUB);
 
-        // --- Load input tile [m0..m0+16, k0..k0+16], transpose to [K, M] ---
-        // Zero the whole tile first so padding rows (m >= M) are 0.
-        for (int i = tid; i < WMMA_TILE_M * WMMA_TILE_K; i += blockDim.x) {
-            x_smem[i] = __float2half(0.0f);
+    for (int k0 = k_start; k0 < k_end; k0 += WMMA_TILE_K) {
+        half* w_smem_warp = w_smem + warp_id * WMMA_TILE_N * WMMA_TILE_K;
+        {
+            const int row = lane;
+            if (row < WMMA_TILE_N) {
+                const int n = n0 + row;
+                const int g = k0 / group_size;
+                const float scale_f = __bfloat162float(scales[n * groups_per_row + g]);
+                half2 scale_h2 = __half2half2(__float2half(scale_f));
+                const uint8_t* wrow = weight + (size_t)n * (K / 2) + k0 / 2;
+                half* wout = w_smem_warp + row * WMMA_TILE_K;
+
+                uint32_t w0 = *reinterpret_cast<const uint32_t*>(wrow);
+                uint32_t w1 = *reinterpret_cast<const uint32_t*>(wrow + 4);
+
+                uint32_t lo0 = w0 & MASK4;
+                uint32_t hi0 = (w0 >> 4) & MASK4;
+
+                uint32_t lo01 = (0x6400u | (lo0 & 0xffu)) |
+                                ((0x6400u | ((lo0 >> 8) & 0xffu)) << 16);
+                uint32_t lo23 = (0x6400u | ((lo0 >> 16) & 0xffu)) |
+                                ((0x6400u | ((lo0 >> 24) & 0xffu)) << 16);
+                uint32_t hi01 = (0x6400u | (hi0 & 0xffu)) |
+                                ((0x6400u | ((hi0 >> 8) & 0xffu)) << 16);
+                uint32_t hi23 = (0x6400u | ((hi0 >> 16) & 0xffu)) |
+                                ((0x6400u | ((hi0 >> 24) & 0xffu)) << 16);
+
+                half2 w0h = __hsub2(*reinterpret_cast<half2*>(&lo01), SUB_H2);
+                half2 w1h = __hsub2(*reinterpret_cast<half2*>(&hi01), SUB_H2);
+                half2 w2h = __hsub2(*reinterpret_cast<half2*>(&lo23), SUB_H2);
+                half2 w3h = __hsub2(*reinterpret_cast<half2*>(&hi23), SUB_H2);
+
+                half2 wx = __halves2half2(w0h.x, w1h.x);
+                half2 wy = __halves2half2(w0h.y, w1h.y);
+                half2 wx2 = __halves2half2(w2h.x, w3h.x);
+                half2 wy2 = __halves2half2(w2h.y, w3h.y);
+
+                wx = __hmul2(wx, scale_h2);
+                wy = __hmul2(wy, scale_h2);
+                wx2 = __hmul2(wx2, scale_h2);
+                wy2 = __hmul2(wy2, scale_h2);
+
+                *reinterpret_cast<half2*>(&wout[0]) = wx;
+                *reinterpret_cast<half2*>(&wout[2]) = wy;
+                *reinterpret_cast<half2*>(&wout[4]) = wx2;
+                *reinterpret_cast<half2*>(&wout[6]) = wy2;
+
+                uint32_t lo1 = w1 & MASK4;
+                uint32_t hi1 = (w1 >> 4) & MASK4;
+
+                lo01 = (0x6400u | (lo1 & 0xffu)) |
+                       ((0x6400u | ((lo1 >> 8) & 0xffu)) << 16);
+                lo23 = (0x6400u | ((lo1 >> 16) & 0xffu)) |
+                       ((0x6400u | ((lo1 >> 24) & 0xffu)) << 16);
+                hi01 = (0x6400u | (hi1 & 0xffu)) |
+                       ((0x6400u | ((hi1 >> 8) & 0xffu)) << 16);
+                hi23 = (0x6400u | ((hi1 >> 16) & 0xffu)) |
+                       ((0x6400u | ((hi1 >> 24) & 0xffu)) << 16);
+
+                w0h = __hsub2(*reinterpret_cast<half2*>(&lo01), SUB_H2);
+                w1h = __hsub2(*reinterpret_cast<half2*>(&hi01), SUB_H2);
+                w2h = __hsub2(*reinterpret_cast<half2*>(&lo23), SUB_H2);
+                w3h = __hsub2(*reinterpret_cast<half2*>(&hi23), SUB_H2);
+
+                wx = __halves2half2(w0h.x, w1h.x);
+                wy = __halves2half2(w0h.y, w1h.y);
+                wx2 = __halves2half2(w2h.x, w3h.x);
+                wy2 = __halves2half2(w2h.y, w3h.y);
+
+                wx = __hmul2(wx, scale_h2);
+                wy = __hmul2(wy, scale_h2);
+                wx2 = __hmul2(wx2, scale_h2);
+                wy2 = __hmul2(wy2, scale_h2);
+
+                *reinterpret_cast<half2*>(&wout[8]) = wx;
+                *reinterpret_cast<half2*>(&wout[10]) = wy;
+                *reinterpret_cast<half2*>(&wout[12]) = wx2;
+                *reinterpret_cast<half2*>(&wout[14]) = wy2;
+            }
         }
-        __syncthreads();
-        if (tid < WMMA_TILE_M) {
-            const int m = m0 + tid;
-            if (m < M) {
-                const __nv_bfloat16* xrow = input + (size_t)m * K + k0;
-                // Store transposed: x_smem[k * WMMA_TILE_M + m_idx] = input[m, k].
-                for (int i = 0; i < WMMA_TILE_K; i++) {
-                    x_smem[i * WMMA_TILE_M + tid] = __float2half(__bfloat162float(xrow[i]));
+
+        if (warp_id == 0) {
+            for (int i = lane; i < WMMA_TILE_M * WMMA_TILE_K; i += 32) {
+                int m = i / WMMA_TILE_K;
+                int k = i % WMMA_TILE_K;
+                half val = __float2half(0.0f);
+                if (m0 + m < M) {
+                    val = __float2half(__bfloat162float(input[(size_t)(m0 + m) * K + k0 + k]));
                 }
+                x_smem[i] = val;
             }
         }
         __syncthreads();
 
-        // --- WMMA matmul ---
         wmma::fragment<wmma::matrix_a, WMMA_TILE_N, WMMA_TILE_M, WMMA_TILE_K, half, wmma::row_major> a_frag;
-        wmma::fragment<wmma::matrix_b, WMMA_TILE_N, WMMA_TILE_M, WMMA_TILE_K, half, wmma::row_major> b_frag;
-        wmma::load_matrix_sync(a_frag, w_smem, WMMA_TILE_K);
-        wmma::load_matrix_sync(b_frag, x_smem, WMMA_TILE_M);
+        wmma::fragment<wmma::matrix_b, WMMA_TILE_N, WMMA_TILE_M, WMMA_TILE_K, half, wmma::col_major> b_frag;
+        wmma::load_matrix_sync(a_frag, w_smem_warp, WMMA_TILE_K);
+        wmma::load_matrix_sync(b_frag, x_smem, WMMA_TILE_K);
         wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
         __syncthreads();
     }
 
-    // --- Store output tile ---
-    // output[batch, output_dim] = C[output_dim, batch]
-    __shared__ float c_smem[WMMA_TILE_N * WMMA_TILE_M];
-    wmma::store_matrix_sync(c_smem, c_frag, WMMA_TILE_M, wmma::mem_row_major);
+    // Accumulate partial results via atomicAdd to fp32 output.
+    __shared__ float c_smem[WMMA_WARPS * WMMA_TILE_N * WMMA_TILE_M];
+    float* c_smem_warp = c_smem + warp_id * WMMA_TILE_N * WMMA_TILE_M;
+    wmma::store_matrix_sync(c_smem_warp, c_frag, WMMA_TILE_M, wmma::mem_row_major);
     __syncthreads();
 
-    // Each thread stores multiple elements to cover the full 16x16 tile.
-    for (int i = tid; i < WMMA_TILE_N * WMMA_TILE_M; i += blockDim.x) {
-        const int n_idx = i / WMMA_TILE_M;  // output_dim
-        const int m_idx = i % WMMA_TILE_M;  // batch
+    for (int i = lane; i < WMMA_TILE_N * WMMA_TILE_M; i += 32) {
+        const int n_idx = i / WMMA_TILE_M;
+        const int m_idx = i % WMMA_TILE_M;
         const int n = n0 + n_idx;
         const int m = m0 + m_idx;
         if (n < N && m < M) {
-            output[(size_t)m * N + n] = __float2bfloat16(c_smem[n_idx * WMMA_TILE_M + m_idx]);
+            atomicAdd(&output[(size_t)m * N + n], c_smem_warp[n_idx * WMMA_TILE_M + m_idx]);
         }
     }
 }
+
+__global__ void convert_fp32_to_bf16_kernel(const float* __restrict__ in,
+                                             __nv_bfloat16* __restrict__ out, size_t n) {
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        out[i] = __float2bfloat16(in[i]);
+    }
+}
+
+static float* g_out_fp32 = nullptr;
+static size_t g_out_fp32_elems = 0;
 
 extern "C" cudaError_t w4a16_gemm_wmma_cuda(
     const uint8_t* weight,
@@ -137,10 +187,29 @@ extern "C" cudaError_t w4a16_gemm_wmma_cuda(
     int M, int N, int K, int group_size,
     cudaStream_t stream)
 {
-    dim3 grid((N + WMMA_TILE_N - 1) / WMMA_TILE_N,
-              (M + WMMA_TILE_M - 1) / WMMA_TILE_M);
-    dim3 block(32);  // one warp for WMMA; 16 threads dequant weight rows
+    const int k_chunk_size = (K + WMMA_K_SPLITS - 1) / WMMA_K_SPLITS;
+    const size_t out_elems = (size_t)M * N;
+
+    if (out_elems > g_out_fp32_elems) {
+        if (g_out_fp32) cudaFree(g_out_fp32);
+        cudaError_t err = cudaMalloc(&g_out_fp32, out_elems * sizeof(float));
+        if (err != cudaSuccess) return err;
+        g_out_fp32_elems = out_elems;
+    }
+    cudaError_t err = cudaMemsetAsync(g_out_fp32, 0, out_elems * sizeof(float), stream);
+    if (err != cudaSuccess) return err;
+
+    dim3 grid((N + WMMA_WARPS * WMMA_TILE_N - 1) / (WMMA_WARPS * WMMA_TILE_N),
+              (M + WMMA_TILE_M - 1) / WMMA_TILE_M,
+              WMMA_K_SPLITS);
+    dim3 block(WMMA_WARPS * 32);
     w4a16_gemm_wmma_kernel<<<grid, block, 0, stream>>>(
-        weight, scales, input, output, M, N, K, group_size);
+        weight, scales, input, g_out_fp32, M, N, K, group_size, k_chunk_size);
+    err = cudaGetLastError();
+    if (err != cudaSuccess) return err;
+
+    constexpr int CONV_BLOCK = 256;
+    convert_fp32_to_bf16_kernel<<<(out_elems + CONV_BLOCK - 1) / CONV_BLOCK, CONV_BLOCK, 0, stream>>>(
+        g_out_fp32, output, out_elems);
     return cudaGetLastError();
 }
