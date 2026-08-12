@@ -1006,7 +1006,7 @@ pub fn decode_attention_int8_per_channel_k(
 // Split-KV decode attention over INT8 paged KV. HD128/256, page_size=16.
 pub const VARLEN_QUANTIZED_MAX_SPLITS: usize = 16;
 
-pub fn decode_attention_varlen_int8_workspace_bytes(
+pub fn decode_attention_varlen_quantized_workspace_bytes(
     total_q_tokens: usize,
     num_q_heads: usize,
     head_dim: usize,
@@ -1014,7 +1014,7 @@ pub fn decode_attention_varlen_int8_workspace_bytes(
 ) -> usize {
     // SAFETY: pure host-side size computation — no pointers, no device work.
     unsafe {
-        ffi::decode_attention_varlen_int8_workspace_bytes(
+        ffi::decode_attention_varlen_quantized_workspace_bytes(
             total_q_tokens as i32,
             num_q_heads as i32,
             head_dim as i32,
@@ -1024,7 +1024,7 @@ pub fn decode_attention_varlen_int8_workspace_bytes(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn decode_attention_varlen_int8(
+pub fn decode_attention_varlen_quantized(
     ctx: &DeviceContext,
     q_packed: &HiddenStates,
     qo_indptr: u64,
@@ -1044,6 +1044,7 @@ pub fn decode_attention_varlen_int8(
     total_q_tokens: usize,
     max_kv_len: usize,
     causal: bool,
+    kv_format: KVFormat,
     sm_scale: f32,
     workspace: &CudaSlice<u8>,
     workspace_bytes: usize,
@@ -1052,6 +1053,7 @@ pub fn decode_attention_varlen_int8(
         return Ok(());
     }
 
+    let int8_kv = matches!(kv_format, KVFormat::INT8);
     let (q_ptr, _gq) = q_packed.data.device_ptr(&ctx.stream);
     let (o_ptr, _go) = output.data.device_ptr_mut(&ctx.stream);
     let (ws_ptr, _gws) = workspace.device_ptr(&ctx.stream);
@@ -1062,7 +1064,7 @@ pub fn decode_attention_varlen_int8(
     // named by `kv_indptr`/`kv_indices`, writes `total_q_tokens` output rows,
     // stream-ordered.
     unsafe {
-        ffi::decode_attention_varlen_int8_cuda(
+        ffi::decode_attention_varlen_quantized_cuda(
             q_ptr as *const ffi::Half,
             qo_indptr as *const i32,
             k_pool_ptr as *const u8,
@@ -1081,6 +1083,7 @@ pub fn decode_attention_varlen_int8(
             total_q_tokens as i32,
             max_kv_len as i32,
             causal,
+            int8_kv,
             sm_scale,
             ctx.stream.cu_stream(),
             ws_ptr as *mut u8,

@@ -625,7 +625,7 @@ fn calibrate_and_quantize_new_rows(
 
 /// Fused-dequant decode attention over the quantized pool planes (replaces
 /// the TileLang bf16 kernel for INT8/FP8 pools). NOT
-/// `decode_attention_varlen_int8` — that kernel consumes per-token K scales
+/// `decode_attention_varlen_quantized` — that kernel consumes per-token K scales
 /// and is incompatible with per-channel K.
 #[allow(clippy::too_many_arguments)]
 fn run_quant_decode(
