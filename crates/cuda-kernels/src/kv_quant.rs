@@ -3,10 +3,11 @@
 //! Also includes fused-dequant decode attention for quantized KV formats
 //! that TileLang BF16 attention doesn't support natively (INT8+scale, INT4+scale, etc.).
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 
 use crate::ffi;
+use crate::kv_types::KVFormat;
 use crate::tensor::{DeviceContext, DeviceVec, HiddenStates};
 
 const MAX_TOKEN_ROWS_PER_PAGED_KV_LAUNCH: usize = 65_535;
@@ -147,8 +148,69 @@ pub fn dequantize_paged_kv(
 
 // ─── FP8 E4M3 paged pool ops ───
 
+/// Quantize 1 new token per request: bf16 working → FP8 E4M3 or INT8 paged pool.
+/// FP8 uses self-contained E4M3 (scale = absmax/448); INT8 uses symmetric
+/// per-(token, kv_head) scaling (scale = absmax/127).
+#[allow(clippy::too_many_arguments)]
+pub fn quantize_paged_kv_per_token(
+    ctx: &DeviceContext,
+    kv_bf16_ptr: u64,
+    kv_ptr: u64,
+    scales_ptr: u64,
+    new_token_indices_gpu: &CudaSlice<i32>,
+    num_kv_heads: usize,
+    head_dim: usize,
+    kv_dim: usize,
+    batch_size: usize,
+    format: KVFormat,
+) -> Result<()> {
+    if batch_size == 0 {
+        return Ok(());
+    }
+    let mut offset = 0usize;
+    while offset < batch_size {
+        let chunk_tokens = (batch_size - offset).min(MAX_TOKEN_ROWS_PER_PAGED_KV_LAUNCH);
+        let rows = new_token_indices_gpu.slice(offset..offset + chunk_tokens);
+        let (nti_ptr, _g) = rows.device_ptr(&ctx.stream);
+        // SAFETY: raw u64 args are the pool's live bf16-work/quant/scale device
+        // buffers; the chunked `rows` slice is pinned by `_g`. Writes are
+        // limited to the `chunk_tokens` pool rows it names, stream-ordered.
+        unsafe {
+            match format {
+                KVFormat::FP8E4M3 => ffi::quantize_paged_kv_fp8_cuda(
+                    kv_bf16_ptr as *const ffi::Half,
+                    kv_ptr as *mut u8,
+                    scales_ptr as *mut f32,
+                    nti_ptr as *const i32,
+                    num_kv_heads as i32,
+                    head_dim as i32,
+                    kv_dim as i32,
+                    chunk_tokens as i32,
+                    ctx.stream.cu_stream(),
+                )
+                .result()?,
+                KVFormat::INT8 => ffi::quantize_paged_kv_single_cuda(
+                    kv_bf16_ptr as *const ffi::Half,
+                    kv_ptr as *mut i8,
+                    scales_ptr as *mut f32,
+                    nti_ptr as *const i32,
+                    num_kv_heads as i32,
+                    head_dim as i32,
+                    kv_dim as i32,
+                    chunk_tokens as i32,
+                    ctx.stream.cu_stream(),
+                )
+                .result()?,
+                other => bail!("quantize_paged_kv_per_token: unsupported format {other:?}"),
+            }
+        }
+        offset += chunk_tokens;
+    }
+    Ok(())
+}
+
 /// Quantize 1 new token per request: bf16 working → FP8 E4M3 paged pool.
-/// No separate scale — FP8 E4M3 is self-contained.
+/// Thin wrapper around `quantize_paged_kv_per_token` with `KVFormat::FP8E4M3`.
 #[allow(clippy::too_many_arguments)]
 pub fn quantize_paged_kv_fp8(
     ctx: &DeviceContext,
@@ -161,34 +223,18 @@ pub fn quantize_paged_kv_fp8(
     kv_dim: usize,
     batch_size: usize,
 ) -> Result<()> {
-    if batch_size == 0 {
-        return Ok(());
-    }
-    let mut offset = 0usize;
-    while offset < batch_size {
-        let chunk_tokens = (batch_size - offset).min(MAX_TOKEN_ROWS_PER_PAGED_KV_LAUNCH);
-        let rows = new_token_indices_gpu.slice(offset..offset + chunk_tokens);
-        let (nti_ptr, _g) = rows.device_ptr(&ctx.stream);
-        // SAFETY: raw u64 args are the pool's live bf16-work/FP8/scale device
-        // buffers; the chunked `rows` slice is pinned by `_g`. Writes are
-        // limited to the `chunk_tokens` pool rows it names, stream-ordered.
-        unsafe {
-            ffi::quantize_paged_kv_fp8_cuda(
-                kv_bf16_ptr as *const ffi::Half,
-                kv_fp8_ptr as *mut u8,
-                scales_ptr as *mut f32,
-                nti_ptr as *const i32,
-                num_kv_heads as i32,
-                head_dim as i32,
-                kv_dim as i32,
-                chunk_tokens as i32,
-                ctx.stream.cu_stream(),
-            )
-            .result()?;
-        }
-        offset += chunk_tokens;
-    }
-    Ok(())
+    quantize_paged_kv_per_token(
+        ctx,
+        kv_bf16_ptr,
+        kv_fp8_ptr,
+        scales_ptr,
+        new_token_indices_gpu,
+        num_kv_heads,
+        head_dim,
+        kv_dim,
+        batch_size,
+        KVFormat::FP8E4M3,
+    )
 }
 
 /// **KIVI per-channel K quantize.** Reads a pre-computed
@@ -957,16 +1003,10 @@ pub fn decode_attention_int8_per_channel_k(
 // ─── Varlen-Q + quantized paged KV attention (mixed batch path) ───
 //
 // Generalization of `decode_attention_fp8` to mixed prefill+decode batches.
-// Reads FP8 KV directly from the pool (no bf16 shadow); enables lifting the
-// K2 gate in `infer/src/model/qwen3/forward.rs::supports_mixed_batch` once
-// the kernel is wired into `decode_batch_with_prefill`.
-//
-// HD128 + page_size=16 only for now — same coverage envelope as the qlen=1
-// variant. FP8 and INT8 share the split-KV kernel; `int8_kv` controls how the
-// durable bytes are interpreted.
+// Split-KV decode attention over INT8 paged KV. HD128/256, page_size=16.
 pub const VARLEN_QUANTIZED_MAX_SPLITS: usize = 16;
 
-pub fn decode_attention_varlen_fp8_workspace_bytes(
+pub fn decode_attention_varlen_int8_workspace_bytes(
     total_q_tokens: usize,
     num_q_heads: usize,
     head_dim: usize,
@@ -974,7 +1014,7 @@ pub fn decode_attention_varlen_fp8_workspace_bytes(
 ) -> usize {
     // SAFETY: pure host-side size computation — no pointers, no device work.
     unsafe {
-        ffi::decode_attention_varlen_fp8_workspace_bytes(
+        ffi::decode_attention_varlen_int8_workspace_bytes(
             total_q_tokens as i32,
             num_q_heads as i32,
             head_dim as i32,
@@ -984,7 +1024,7 @@ pub fn decode_attention_varlen_fp8_workspace_bytes(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn decode_attention_varlen_fp8(
+pub fn decode_attention_varlen_int8(
     ctx: &DeviceContext,
     q_packed: &HiddenStates,
     qo_indptr: u64,
@@ -1003,7 +1043,6 @@ pub fn decode_attention_varlen_fp8(
     batch_size: usize,
     total_q_tokens: usize,
     max_kv_len: usize,
-    int8_kv: bool,
     causal: bool,
     sm_scale: f32,
     workspace: &CudaSlice<u8>,
@@ -1023,7 +1062,7 @@ pub fn decode_attention_varlen_fp8(
     // named by `kv_indptr`/`kv_indices`, writes `total_q_tokens` output rows,
     // stream-ordered.
     unsafe {
-        ffi::decode_attention_varlen_fp8_cuda(
+        ffi::decode_attention_varlen_int8_cuda(
             q_ptr as *const ffi::Half,
             qo_indptr as *const i32,
             k_pool_ptr as *const u8,
@@ -1041,7 +1080,6 @@ pub fn decode_attention_varlen_fp8(
             batch_size as i32,
             total_q_tokens as i32,
             max_kv_len as i32,
-            int8_kv,
             causal,
             sm_scale,
             ctx.stream.cu_stream(),
@@ -1054,6 +1092,7 @@ pub fn decode_attention_varlen_fp8(
 }
 
 /// Quantize 1 new token per request from bf16 working buffer → INT8 paged pool.
+/// Thin wrapper around `quantize_paged_kv_per_token` with `KVFormat::INT8`.
 #[allow(clippy::too_many_arguments)]
 pub fn quantize_paged_kv_single(
     ctx: &DeviceContext,
@@ -1066,35 +1105,18 @@ pub fn quantize_paged_kv_single(
     kv_dim: usize,
     batch_size: usize,
 ) -> Result<()> {
-    if batch_size == 0 {
-        return Ok(());
-    }
-    let mut offset = 0usize;
-    while offset < batch_size {
-        let chunk_tokens = (batch_size - offset).min(MAX_TOKEN_ROWS_PER_PAGED_KV_LAUNCH);
-        let rows = new_token_indices_gpu.slice(offset..offset + chunk_tokens);
-        let (nti_ptr, _gnti) = rows.device_ptr(&ctx.stream);
-        // SAFETY: raw u64 args are the pool's live bf16-work/INT8/scale
-        // buffers; chunked `rows` pinned by `_gnti`. Writes bounded by the
-        // `chunk_tokens` pool rows it names, stream-ordered.
-        unsafe {
-            ffi::quantize_paged_kv_single_cuda(
-                kv_bf16_ptr as *const ffi::Half,
-                kv_int8_ptr as *mut i8,
-                kv_scales_ptr as *mut f32,
-                nti_ptr as *const i32,
-                num_kv_heads as i32,
-                head_dim as i32,
-                kv_dim as i32,
-                chunk_tokens as i32,
-                ctx.stream.cu_stream(),
-            )
-            .result()?;
-        }
-        offset += chunk_tokens;
-    }
-
-    Ok(())
+    quantize_paged_kv_per_token(
+        ctx,
+        kv_bf16_ptr,
+        kv_int8_ptr,
+        kv_scales_ptr,
+        new_token_indices_gpu,
+        num_kv_heads,
+        head_dim,
+        kv_dim,
+        batch_size,
+        KVFormat::INT8,
+    )
 }
 
 #[cfg(test)]
