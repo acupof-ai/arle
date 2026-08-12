@@ -2,13 +2,6 @@
 //
 // For B=1: standard GEMV (1 row × 1 input).
 // For B>=2: batched GEMM where BTILE inputs share one weight read.
-//
-// Key optimizations:
-//   - uint4 (128-bit) weight loads via __ldg (read-only cache).
-//   - 1 warp (32 threads) per row; each thread owns K/32 columns.
-//   - Marlin FP16 dequant: nibble → FP16 mantissa trick.
-//   - Software pipelining: prefetch next weight while processing current.
-//   - Input loads hoisted ahead of FMAs for memory-level parallelism.
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -105,33 +98,26 @@ __global__ void w4a16_gemv_batch_kernel_marlin(
             half2 wsx2 = __hmul2(wx2, scale_h2);
             half2 wsy2 = __hmul2(wy2, scale_h2);
 
-            // Hoist input loads: load all batch inputs first, then FMAs.
-            half2 x01[W4A16_MARLIN_BTILE], x23[W4A16_MARLIN_BTILE];
-            half2 x45[W4A16_MARLIN_BTILE], x67[W4A16_MARLIN_BTILE];
-
             #pragma unroll
             for (int b = 0; b < W4A16_MARLIN_BTILE; b++) {
                 if (b >= valid_b) break;
                 const __nv_bfloat16* xb = input + (batch_base + b) * K;
+
                 uint4 xpacked = __ldg(reinterpret_cast<const uint4*>(&xb[kk]));
                 const __nv_bfloat16* xbv = reinterpret_cast<const __nv_bfloat16*>(&xpacked);
-                x01[b] = __halves2half2(__float2half(__bfloat162float(xbv[0])),
-                                        __float2half(__bfloat162float(xbv[1])));
-                x23[b] = __halves2half2(__float2half(__bfloat162float(xbv[2])),
-                                        __float2half(__bfloat162float(xbv[3])));
-                x45[b] = __halves2half2(__float2half(__bfloat162float(xbv[4])),
-                                        __float2half(__bfloat162float(xbv[5])));
-                x67[b] = __halves2half2(__float2half(__bfloat162float(xbv[6])),
-                                        __float2half(__bfloat162float(xbv[7])));
-            }
+                half2 x01 = __halves2half2(__float2half(__bfloat162float(xbv[0])),
+                                           __float2half(__bfloat162float(xbv[1])));
+                half2 x23 = __halves2half2(__float2half(__bfloat162float(xbv[2])),
+                                           __float2half(__bfloat162float(xbv[3])));
+                half2 x45 = __halves2half2(__float2half(__bfloat162float(xbv[4])),
+                                           __float2half(__bfloat162float(xbv[5])));
+                half2 x67 = __halves2half2(__float2half(__bfloat162float(xbv[6])),
+                                           __float2half(__bfloat162float(xbv[7])));
 
-            #pragma unroll
-            for (int b = 0; b < W4A16_MARLIN_BTILE; b++) {
-                if (b >= valid_b) break;
-                sum_h2[b] = __hfma2(wsx,  x01[b], sum_h2[b]);
-                sum_h2[b] = __hfma2(wsy,  x23[b], sum_h2[b]);
-                sum_h2[b] = __hfma2(wsx2, x45[b], sum_h2[b]);
-                sum_h2[b] = __hfma2(wsy2, x67[b], sum_h2[b]);
+                sum_h2[b] = __hfma2(wsx,  x01, sum_h2[b]);
+                sum_h2[b] = __hfma2(wsy,  x23, sum_h2[b]);
+                sum_h2[b] = __hfma2(wsx2, x45, sum_h2[b]);
+                sum_h2[b] = __hfma2(wsy2, x67, sum_h2[b]);
             }
         }
 
@@ -159,8 +145,8 @@ extern "C" cudaError_t w4a16_gemv_batch_cuda_marlin(
     dim3 block(GEMV_THREADS);
     static int printed = 0;
     if (!printed) {
-        fprintf(stderr, "MARLIN_GEMV: grid=(%d,%d) block=%d GEMV_ROWS=%d GEMV_THREADS=%d BTILE=%d B=%d N=%d K=%d\n",
-                grid.x, grid.y, block.x, GEMV_ROWS, GEMV_THREADS, W4A16_MARLIN_BTILE, B, N, K);
+        fprintf(stderr, "MARLIN_GEMV: grid=(%d,%d) block=%d GEMV_ROWS=%d GEMV_THREADS=%d BTILE=%d B=%d N=%d K=%d tpr=%d\n",
+                grid.x, grid.y, block.x, GEMV_ROWS, GEMV_THREADS, W4A16_MARLIN_BTILE, B, N, K, GEMV_THREADS/GEMV_ROWS);
         printed = 1;
     }
     w4a16_gemv_batch_kernel_marlin<<<grid, block, 0, stream>>>(
