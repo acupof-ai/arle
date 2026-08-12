@@ -987,14 +987,14 @@ pub fn decode_attention_varlen_fp8_workspace_bytes(
 pub fn decode_attention_varlen_fp8(
     ctx: &DeviceContext,
     q_packed: &HiddenStates,
-    qo_indptr: &CudaSlice<i32>,
+    qo_indptr: u64,
     k_pool_ptr: u64,
     v_pool_ptr: u64,
     k_scales_ptr: Option<u64>,
     v_scales_ptr: Option<u64>,
-    kv_indptr: &CudaSlice<i32>,
-    kv_indices: &CudaSlice<i32>,
-    last_page_len: &CudaSlice<i32>,
+    kv_indptr: u64,
+    kv_indices: u64,
+    last_page_len: u64,
     output: &mut HiddenStates,
     num_q_heads: usize,
     num_kv_heads: usize,
@@ -1014,29 +1014,25 @@ pub fn decode_attention_varlen_fp8(
     }
 
     let (q_ptr, _gq) = q_packed.data.device_ptr(&ctx.stream);
-    let (qoi_ptr, _gqoi) = qo_indptr.device_ptr(&ctx.stream);
-    let (kvi_ptr, _gkvi) = kv_indptr.device_ptr(&ctx.stream);
-    let (kvx_ptr, _gkvx) = kv_indices.device_ptr(&ctx.stream);
-    let (lpl_ptr, _glpl) = last_page_len.device_ptr(&ctx.stream);
     let (o_ptr, _go) = output.data.device_ptr_mut(&ctx.stream);
     let (ws_ptr, _gws) = workspace.device_ptr(&ctx.stream);
 
-    // SAFETY: packed-Q/indptr/indices/last-page/output/workspace pointers come
-    // from live buffers pinned by `_g*`; raw u64 args are the pool's FP8/INT8
-    // K/V planes, scale pointers are 0 exactly when the format carries none
-    // (kernel skips them). Reads only pages named by `kv_indptr`/`kv_indices`,
-    // writes `total_q_tokens` output rows, stream-ordered.
+    // SAFETY: packed-Q/output/workspace pointers come from live buffers pinned
+    // by `_g*`; raw u64 args (qo_indptr, kv_indptr, kv_indices, last_page_len,
+    // k/v pool, scales) are the caller's live device pointers. Reads only pages
+    // named by `kv_indptr`/`kv_indices`, writes `total_q_tokens` output rows,
+    // stream-ordered.
     unsafe {
         ffi::decode_attention_varlen_fp8_cuda(
             q_ptr as *const ffi::Half,
-            qoi_ptr as *const i32,
+            qo_indptr as *const i32,
             k_pool_ptr as *const u8,
             v_pool_ptr as *const u8,
             k_scales_ptr.unwrap_or(0) as *const f32,
             v_scales_ptr.unwrap_or(0) as *const f32,
-            kvi_ptr as *const i32,
-            kvx_ptr as *const i32,
-            lpl_ptr as *const i32,
+            kv_indptr as *const i32,
+            kv_indices as *const i32,
+            last_page_len as *const i32,
             o_ptr as *mut ffi::Half,
             num_q_heads as i32,
             num_kv_heads as i32,
