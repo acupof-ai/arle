@@ -607,59 +607,37 @@ impl Qwen35Model {
                 )
             })?;
             let kv_dim = self.local_full_attn_kv_dim();
-            match pool.format {
-                KVFormat::FP8E4M3 => {
-                    kv_quant::quantize_paged_kv_fp8(
-                        &self.ctx,
-                        pool.k_ptr(full_idx, &self.ctx.stream),
-                        pool.k_data_ptr(full_idx, &self.ctx.stream),
-                        pool.k_scales_ptr(full_idx, &self.ctx.stream),
-                        new_rows,
-                        self.local_kv_heads,
-                        c.head_dim,
-                        kv_dim,
-                        rows,
-                    )?;
-                    kv_quant::quantize_paged_kv_fp8(
-                        &self.ctx,
-                        pool.v_ptr(full_idx, &self.ctx.stream),
-                        pool.v_data_ptr(full_idx, &self.ctx.stream),
-                        pool.v_scales_ptr(full_idx, &self.ctx.stream),
-                        new_rows,
-                        self.local_kv_heads,
-                        c.head_dim,
-                        kv_dim,
-                        rows,
-                    )?;
-                }
-                KVFormat::INT8 => {
-                    kv_quant::quantize_paged_kv_single(
-                        &self.ctx,
-                        pool.k_ptr(full_idx, &self.ctx.stream),
-                        pool.k_data_ptr(full_idx, &self.ctx.stream),
-                        pool.k_scales_ptr(full_idx, &self.ctx.stream),
-                        new_rows,
-                        self.local_kv_heads,
-                        c.head_dim,
-                        kv_dim,
-                        rows,
-                    )?;
-                    kv_quant::quantize_paged_kv_single(
-                        &self.ctx,
-                        pool.v_ptr(full_idx, &self.ctx.stream),
-                        pool.v_data_ptr(full_idx, &self.ctx.stream),
-                        pool.v_scales_ptr(full_idx, &self.ctx.stream),
-                        new_rows,
-                        self.local_kv_heads,
-                        c.head_dim,
-                        kv_dim,
-                        rows,
-                    )?;
-                }
+            let quantize = match pool.format {
+                KVFormat::FP8E4M3 => kv_quant::quantize_paged_kv_fp8,
+                KVFormat::INT8 => kv_quant::quantize_paged_kv_single,
                 other => anyhow::bail!(
                     "Qwen35 full-attn paged: unsupported pool format {other:?} \
                      (only BF16, FP8E4M3 and INT8 are wired)"
                 ),
+            };
+            for &(src, data, scales) in &[
+                (
+                    pool.k_ptr(full_idx, &self.ctx.stream),
+                    pool.k_data_ptr(full_idx, &self.ctx.stream),
+                    pool.k_scales_ptr(full_idx, &self.ctx.stream),
+                ),
+                (
+                    pool.v_ptr(full_idx, &self.ctx.stream),
+                    pool.v_data_ptr(full_idx, &self.ctx.stream),
+                    pool.v_scales_ptr(full_idx, &self.ctx.stream),
+                ),
+            ] {
+                quantize(
+                    &self.ctx,
+                    src,
+                    data,
+                    scales,
+                    new_rows,
+                    self.local_kv_heads,
+                    c.head_dim,
+                    kv_dim,
+                    rows,
+                )?;
             }
         }
 
@@ -782,9 +760,7 @@ impl Qwen35Model {
                                 batch: meta.batch as i32,
                                 total_q: meta.total_q as i32,
                                 seqlen_q: meta.seq_len as i32,
-                                seqlen_k: meta.seqlen_k_capture.unwrap_or_else(|| {
-                                    meta.kv_lens.iter().copied().max().unwrap_or(0)
-                                }) as i32,
+                                seqlen_k: meta.max_kv_len() as i32,
                                 num_heads: self.local_q_heads as i32,
                                 num_heads_k: self.local_kv_heads as i32,
                                 head_dim: c.head_dim as i32,
@@ -929,26 +905,19 @@ impl Qwen35Model {
                                 // Per-(token, kv_head) symmetric INT8 KV: same
                                 // split-KV varlen kernel as FP8, `int8_kv` flips
                                 // the load to int8 + scale.
-                                let ws = pool.int8_attn_workspace.as_ref().ok_or_else(|| {
-                                    anyhow!("INT8 paged attn missing int8_attn_workspace")
-                                })?;
-                                let max_kv_len = meta
-                                    .kv_lens
-                                    .iter()
-                                    .copied()
-                                    .max()
-                                    .unwrap_or(0);
+                                let ws = pool.int8_attn_workspace()?;
+                                let max_kv_len = meta.max_kv_len();
                                 kv_quant::decode_attention_varlen_fp8(
                                     &self.ctx,
                                     &q_prepped,
-                                    &meta.q_indptr,
+                                    q_indptr_ptr,
                                     pool.k_data_ptr(full_idx, &self.ctx.stream),
                                     pool.v_data_ptr(full_idx, &self.ctx.stream),
                                     Some(pool.k_scales_ptr(full_idx, &self.ctx.stream)),
                                     Some(pool.v_scales_ptr(full_idx, &self.ctx.stream)),
-                                    &meta.kv_indptr,
-                                    &meta.kv_indices,
-                                    &meta.kv_last_page_len,
+                                    kv_indptr_ptr,
+                                    kv_indices_ptr,
+                                    last_page_len_ptr,
                                     attn_out,
                                     self.local_q_heads,
                                     self.local_kv_heads,
