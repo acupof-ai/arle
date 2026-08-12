@@ -1803,6 +1803,8 @@ __global__ void w4a16_grouped_gemv_batch_kernel(
     }
 }
 
+// Marlin-style grouped pair GEMV for MoE gate+up: two weight matrices share
+// the same input. Weight shared across all tokens routed to the same expert.
 __global__ void w4a16_grouped_gemv_pair_batch_kernel(
     const uint64_t* __restrict__ weight_a_ptrs,
     const uint64_t* __restrict__ scale_a_ptrs,
@@ -1819,86 +1821,171 @@ __global__ void w4a16_grouped_gemv_pair_batch_kernel(
     int K,
     int group_size)
 {
-    int row = blockIdx.x * GEMV_ROWS + threadIdx.x / (GEMV_THREADS / GEMV_ROWS);
-    int batch_idx = blockIdx.y;
+    int threads_per_row = GEMV_THREADS / GEMV_ROWS;
+    int row = blockIdx.x * GEMV_ROWS + threadIdx.x / threads_per_row;
+    int batch_base = blockIdx.y * GROUPED_BTILE;
     int compact_expert_idx = blockIdx.z;
     int expert_idx = expert_indices ? expert_indices[compact_expert_idx] : compact_expert_idx;
-    int tid_in_row = threadIdx.x % (GEMV_THREADS / GEMV_ROWS);
-    int threads_per_row = GEMV_THREADS / GEMV_ROWS;
+    int tid_in_row = threadIdx.x % threads_per_row;
     int lane_id = threadIdx.x % WARP_SIZE;
-    int row_in_block = threadIdx.x / threads_per_row;
-    if (row >= N || batch_idx >= max_count || batch_idx >= counts[compact_expert_idx]) return;
+
+    if (row >= N) return;
+    int valid_b = min(GROUPED_BTILE, counts[compact_expert_idx] - batch_base);
+    if (valid_b <= 0) return;
 
     const auto* weight_a = reinterpret_cast<const uint8_t*>(weight_a_ptrs[expert_idx]);
     const auto* scales_a = reinterpret_cast<const __nv_bfloat16*>(scale_a_ptrs[expert_idx]);
     const auto* weight_b = reinterpret_cast<const uint8_t*>(weight_b_ptrs[expert_idx]);
     const auto* scales_b = reinterpret_cast<const __nv_bfloat16*>(scale_b_ptrs[expert_idx]);
-    const int route = offsets[compact_expert_idx] + batch_idx;
-    const __nv_bfloat16* x = input + route * K;
-    float sum_a = 0.0f;
-    float sum_b = 0.0f;
     int num_groups = K / group_size;
     int bytes_per_row = K / 2;
 
-    for (int k = tid_in_row * 8; k < K; k += threads_per_row * 8) {
-        float scale_a = __bfloat162float(scales_a[row * num_groups + k / group_size]);
-        float scale_b = __bfloat162float(scales_b[row * num_groups + k / group_size]);
-        uint32_t packed_a = *reinterpret_cast<const uint32_t*>(&weight_a[row * bytes_per_row + k / 2]);
-        uint32_t packed_b = *reinterpret_cast<const uint32_t*>(&weight_b[row * bytes_per_row + k / 2]);
+    const uint32_t MASK4 = 0x0f0f0f0fu;
+    const uint32_t SUB   = 0x64086408u;
+    const half2 SUB_H2   = *reinterpret_cast<const half2*>(&SUB);
 
-        uint32_t lo4_a = packed_a & 0x0F0F0F0Fu;
-        uint32_t hi4_a = (packed_a >> 4) & 0x0F0F0F0Fu;
-        uint32_t lo4_b = packed_b & 0x0F0F0F0Fu;
-        uint32_t hi4_b = (packed_b >> 4) & 0x0F0F0F0Fu;
-
-        const float xv0 = __bfloat162float(x[k]);
-        const float xv1 = __bfloat162float(x[k + 1]);
-        const float xv2 = __bfloat162float(x[k + 2]);
-        const float xv3 = __bfloat162float(x[k + 3]);
-        const float xv4 = __bfloat162float(x[k + 4]);
-        const float xv5 = __bfloat162float(x[k + 5]);
-        const float xv6 = __bfloat162float(x[k + 6]);
-        const float xv7 = __bfloat162float(x[k + 7]);
-
-        sum_a += static_cast<float>(static_cast<int>(lo4_a & 0xFF) - 8) * scale_a * xv0;
-        sum_a += static_cast<float>(static_cast<int>(hi4_a & 0xFF) - 8) * scale_a * xv1;
-        sum_a += static_cast<float>(static_cast<int>((lo4_a >> 8) & 0xFF) - 8) * scale_a * xv2;
-        sum_a += static_cast<float>(static_cast<int>((hi4_a >> 8) & 0xFF) - 8) * scale_a * xv3;
-        sum_a += static_cast<float>(static_cast<int>((lo4_a >> 16) & 0xFF) - 8) * scale_a * xv4;
-        sum_a += static_cast<float>(static_cast<int>((hi4_a >> 16) & 0xFF) - 8) * scale_a * xv5;
-        sum_a += static_cast<float>(static_cast<int>((lo4_a >> 24) & 0xFF) - 8) * scale_a * xv6;
-        sum_a += static_cast<float>(static_cast<int>((hi4_a >> 24) & 0xFF) - 8) * scale_a * xv7;
-
-        sum_b += static_cast<float>(static_cast<int>(lo4_b & 0xFF) - 8) * scale_b * xv0;
-        sum_b += static_cast<float>(static_cast<int>(hi4_b & 0xFF) - 8) * scale_b * xv1;
-        sum_b += static_cast<float>(static_cast<int>((lo4_b >> 8) & 0xFF) - 8) * scale_b * xv2;
-        sum_b += static_cast<float>(static_cast<int>((hi4_b >> 8) & 0xFF) - 8) * scale_b * xv3;
-        sum_b += static_cast<float>(static_cast<int>((lo4_b >> 16) & 0xFF) - 8) * scale_b * xv4;
-        sum_b += static_cast<float>(static_cast<int>((hi4_b >> 16) & 0xFF) - 8) * scale_b * xv5;
-        sum_b += static_cast<float>(static_cast<int>((lo4_b >> 24) & 0xFF) - 8) * scale_b * xv6;
-        sum_b += static_cast<float>(static_cast<int>((hi4_b >> 24) & 0xFF) - 8) * scale_b * xv7;
+    half2 sum_a[GROUPED_BTILE];
+    half2 sum_b[GROUPED_BTILE];
+    #pragma unroll
+    for (int b = 0; b < GROUPED_BTILE; b++) {
+        sum_a[b] = __float2half2_rn(0.0f);
+        sum_b[b] = __float2half2_rn(0.0f);
     }
 
-    sum_a = warp_reduce_sum(sum_a);
-    sum_b = warp_reduce_sum(sum_b);
-    __shared__ float smem_a[GEMV_ROWS * 8];
-    __shared__ float smem_b[GEMV_ROWS * 8];
-    int warps_per_row = threads_per_row / WARP_SIZE;
-    int warp_in_row = (threadIdx.x % threads_per_row) / WARP_SIZE;
-    if (lane_id == 0) {
-        smem_a[row_in_block * warps_per_row + warp_in_row] = sum_a;
-        smem_b[row_in_block * warps_per_row + warp_in_row] = sum_b;
-    }
-    __syncthreads();
-    if (tid_in_row == 0) {
-        float total_a = 0.0f;
-        float total_b = 0.0f;
-        for (int w = 0; w < warps_per_row; w++) {
-            total_a += smem_a[row_in_block * warps_per_row + w];
-            total_b += smem_b[row_in_block * warps_per_row + w];
+    const uint8_t* wrow_a = weight_a + (int64_t)row * bytes_per_row;
+    const uint8_t* wrow_b = weight_b + (int64_t)row * bytes_per_row;
+
+    for (int k = tid_in_row * 32; k < K; k += threads_per_row * 32) {
+        float scale_a_f = __bfloat162float(scales_a[row * num_groups + k / group_size]);
+        float scale_b_f = __bfloat162float(scales_b[row * num_groups + k / group_size]);
+        half2 scale_a_h2 = __half2half2(__float2half(scale_a_f));
+        half2 scale_b_h2 = __half2half2(__float2half(scale_b_f));
+
+        uint4 packed_a = __ldg(reinterpret_cast<const uint4*>(wrow_a + k / 2));
+        uint4 packed_b = __ldg(reinterpret_cast<const uint4*>(wrow_b + k / 2));
+        uint32_t wa[4] = {packed_a.x, packed_a.y, packed_a.z, packed_a.w};
+        uint32_t wb[4] = {packed_b.x, packed_b.y, packed_b.z, packed_b.w};
+
+        #pragma unroll
+        for (int w = 0; w < 4; w++) {
+            uint32_t pa = wa[w];
+            uint32_t pb = wb[w];
+            int kk = k + w * 8;
+
+            // Dequant A
+            uint32_t lo_a = pa & MASK4;
+            uint32_t hi_a = (pa >> 4) & MASK4;
+            uint32_t lo01_a = (0x6400u | (lo_a & 0xffu)) | ((0x6400u | ((lo_a >> 8) & 0xffu)) << 16);
+            uint32_t lo23_a = (0x6400u | ((lo_a >> 16) & 0xffu)) | ((0x6400u | ((lo_a >> 24) & 0xffu)) << 16);
+            uint32_t hi01_a = (0x6400u | (hi_a & 0xffu)) | ((0x6400u | ((hi_a >> 8) & 0xffu)) << 16);
+            uint32_t hi23_a = (0x6400u | ((hi_a >> 16) & 0xffu)) | ((0x6400u | ((hi_a >> 24) & 0xffu)) << 16);
+            half2 w0a = __hsub2(*reinterpret_cast<half2*>(&lo01_a), SUB_H2);
+            half2 w1a = __hsub2(*reinterpret_cast<half2*>(&hi01_a), SUB_H2);
+            half2 w2a = __hsub2(*reinterpret_cast<half2*>(&lo23_a), SUB_H2);
+            half2 w3a = __hsub2(*reinterpret_cast<half2*>(&hi23_a), SUB_H2);
+            half2 wsx_a = __hmul2(__halves2half2(w0a.x, w1a.x), scale_a_h2);
+            half2 wsy_a = __hmul2(__halves2half2(w0a.y, w1a.y), scale_a_h2);
+            half2 wsx2_a = __hmul2(__halves2half2(w2a.x, w3a.x), scale_a_h2);
+            half2 wsy2_a = __hmul2(__halves2half2(w2a.y, w3a.y), scale_a_h2);
+
+            // Dequant B
+            uint32_t lo_b = pb & MASK4;
+            uint32_t hi_b = (pb >> 4) & MASK4;
+            uint32_t lo01_b = (0x6400u | (lo_b & 0xffu)) | ((0x6400u | ((lo_b >> 8) & 0xffu)) << 16);
+            uint32_t lo23_b = (0x6400u | ((lo_b >> 16) & 0xffu)) | ((0x6400u | ((lo_b >> 24) & 0xffu)) << 16);
+            uint32_t hi01_b = (0x6400u | (hi_b & 0xffu)) | ((0x6400u | ((hi_b >> 8) & 0xffu)) << 16);
+            uint32_t hi23_b = (0x6400u | ((hi_b >> 16) & 0xffu)) | ((0x6400u | ((hi_b >> 24) & 0xffu)) << 16);
+            half2 w0b = __hsub2(*reinterpret_cast<half2*>(&lo01_b), SUB_H2);
+            half2 w1b = __hsub2(*reinterpret_cast<half2*>(&hi01_b), SUB_H2);
+            half2 w2b = __hsub2(*reinterpret_cast<half2*>(&lo23_b), SUB_H2);
+            half2 w3b = __hsub2(*reinterpret_cast<half2*>(&hi23_b), SUB_H2);
+            half2 wsx_b = __hmul2(__halves2half2(w0b.x, w1b.x), scale_b_h2);
+            half2 wsy_b = __hmul2(__halves2half2(w0b.y, w1b.y), scale_b_h2);
+            half2 wsx2_b = __hmul2(__halves2half2(w2b.x, w3b.x), scale_b_h2);
+            half2 wsy2_b = __hmul2(__halves2half2(w2b.y, w3b.y), scale_b_h2);
+
+            #pragma unroll
+            for (int b = 0; b < GROUPED_BTILE; b++) {
+                if (b >= valid_b) break;
+                int route = offsets[compact_expert_idx] + batch_base + b;
+                const __nv_bfloat16* xb = input + route * K;
+
+                uint4 xpacked = __ldg(reinterpret_cast<const uint4*>(&xb[kk]));
+                const __nv_bfloat16* xbv = reinterpret_cast<const __nv_bfloat16*>(&xpacked);
+                half2 x01 = __halves2half2(__float2half(__bfloat162float(xbv[0])),
+                                           __float2half(__bfloat162float(xbv[1])));
+                half2 x23 = __halves2half2(__float2half(__bfloat162float(xbv[2])),
+                                           __float2half(__bfloat162float(xbv[3])));
+                half2 x45 = __halves2half2(__float2half(__bfloat162float(xbv[4])),
+                                           __float2half(__bfloat162float(xbv[5])));
+                half2 x67 = __halves2half2(__float2half(__bfloat162float(xbv[6])),
+                                           __float2half(__bfloat162float(xbv[7])));
+
+                sum_a[b] = __hfma2(wsx_a,  x01, sum_a[b]);
+                sum_a[b] = __hfma2(wsy_a,  x23, sum_a[b]);
+                sum_a[b] = __hfma2(wsx2_a, x45, sum_a[b]);
+                sum_a[b] = __hfma2(wsy2_a, x67, sum_a[b]);
+                sum_b[b] = __hfma2(wsx_b,  x01, sum_b[b]);
+                sum_b[b] = __hfma2(wsy_b,  x23, sum_b[b]);
+                sum_b[b] = __hfma2(wsx2_b, x45, sum_b[b]);
+                sum_b[b] = __hfma2(wsy2_b, x67, sum_b[b]);
+            }
         }
-        output_a[route * N + row] = __float2bfloat16(total_a);
-        output_b[route * N + row] = __float2bfloat16(total_b);
+    }
+
+    int warps_per_row = threads_per_row / WARP_SIZE;
+    int warp_in_row = tid_in_row / WARP_SIZE;
+    int row_in_block = threadIdx.x / threads_per_row;
+
+    if (warps_per_row == 1) {
+        #pragma unroll
+        for (int b = 0; b < GROUPED_BTILE; b++) {
+            if (b >= valid_b) break;
+            float sa = __half2float(__hadd(sum_a[b].x, sum_a[b].y));
+            float sb = __half2float(__hadd(sum_b[b].x, sum_b[b].y));
+            sa = warp_reduce_sum(sa);
+            sb = warp_reduce_sum(sb);
+            if (lane_id == 0) {
+                int route = offsets[compact_expert_idx] + batch_base + b;
+                output_a[route * N + row] = __float2bfloat16(sa);
+                output_b[route * N + row] = __float2bfloat16(sb);
+            }
+        }
+    } else {
+        __shared__ float warp_sa[GEMV_ROWS * GROUPED_BTILE * 8];
+        __shared__ float warp_sb[GEMV_ROWS * GROUPED_BTILE * 8];
+        #pragma unroll
+        for (int b = 0; b < GROUPED_BTILE; b++) {
+            if (b >= valid_b) break;
+            float sa = __half2float(__hadd(sum_a[b].x, sum_a[b].y));
+            float sb = __half2float(__hadd(sum_b[b].x, sum_b[b].y));
+            sa = warp_reduce_sum(sa);
+            sb = warp_reduce_sum(sb);
+            int idx = row_in_block * GROUPED_BTILE * warps_per_row + b * warps_per_row + warp_in_row;
+            if (lane_id == 0) {
+                warp_sa[idx] = sa;
+                warp_sb[idx] = sb;
+            }
+        }
+        __syncthreads();
+        if (warp_in_row == 0) {
+            #pragma unroll
+            for (int b = 0; b < GROUPED_BTILE; b++) {
+                if (b >= valid_b) break;
+                float ta = 0.0f, tb = 0.0f;
+                #pragma unroll
+                for (int w = 0; w < warps_per_row; w++) {
+                    int idx = row_in_block * GROUPED_BTILE * warps_per_row + b * warps_per_row + w;
+                    ta += warp_sa[idx];
+                    tb += warp_sb[idx];
+                }
+                if (lane_id == 0) {
+                    int route = offsets[compact_expert_idx] + batch_base + b;
+                    output_a[route * N + row] = __float2bfloat16(ta);
+                    output_b[route * N + row] = __float2bfloat16(tb);
+                }
+            }
+        }
     }
 }
 
@@ -2959,7 +3046,9 @@ cudaError_t moe_w4a16_grouped_gemv_batch_cuda(
         return cudaSuccess;
     }
     dim3 block(GEMV_THREADS);
-    dim3 grid((N + GEMV_ROWS - 1) / GEMV_ROWS, max_count, num_experts);
+    dim3 grid((N + GEMV_ROWS - 1) / GEMV_ROWS,
+              (max_count + GROUPED_BTILE - 1) / GROUPED_BTILE,
+              num_experts);
     w4a16_grouped_gemv_batch_kernel<<<grid, block, 0, stream>>>(
         weight_ptrs, scale_ptrs, input, output, offsets, counts, expert_indices,
         max_count, N, K, group_size);
@@ -2989,7 +3078,9 @@ cudaError_t moe_w4a16_grouped_gemv_pair_batch_cuda(
         return cudaSuccess;
     }
     dim3 block(GEMV_THREADS);
-    dim3 grid((N + GEMV_ROWS - 1) / GEMV_ROWS, max_count, num_experts);
+    dim3 grid((N + GEMV_ROWS - 1) / GEMV_ROWS,
+              (max_count + GROUPED_BTILE - 1) / GROUPED_BTILE,
+              num_experts);
     w4a16_grouped_gemv_pair_batch_kernel<<<grid, block, 0, stream>>>(
         weight_a_ptrs, scale_a_ptrs, weight_b_ptrs, scale_b_ptrs, input,
         output_a, output_b, offsets, counts, expert_indices, max_count, N, K,
