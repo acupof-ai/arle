@@ -169,6 +169,7 @@ use cudarc::cublas::{result as cublas_result, sys as cublas_sys};
 #[cfg(not(feature = "no-cuda"))]
 use cudarc::driver::sys::{
     CUdeviceptr, CUresult, CUstream, cuEventRecord, cuMemcpyDtoD_v2, cuMemcpyDtoDAsync_v2,
+    cuStreamWaitEvent,
 };
 #[cfg(not(feature = "no-cuda"))]
 use cudarc::driver::{
