@@ -650,37 +650,6 @@ __global__ __launch_bounds__(kTopKBlockSize) void deepseek_v4_topk_transform_ker
   }
 }
 
-// Device-side build of the batched-decode CSA "select metadata" — byte-identical
-// to the host loops it replaces (attention.rs csa_select_official_batched (b1)/(b2)
-// + dsv4.rs:3178-3188): per (r,b) block_table band, per-row positions/context_lens.
-// One launch over n*num_pages threads; no per-step H2D (graph-capturable).
-__global__ void dsv4_dsa_build_select_meta_kernel(
-    int32_t* block_table,      // [n*num_pages]
-    int32_t* context_lens,     // [n]
-    int32_t* positions,        // [n]
-    const int32_t* slot_ids,   // [n]
-    const int32_t* start_pos,   // [n] (= abs_pos = positions)
-    const int32_t* key_counts,  // [n]
-    int n,
-    int num_pages,
-    int ratio) {
-  const int tid = blockIdx.x * blockDim.x + threadIdx.x;
-  if (tid >= n * num_pages) return;
-  const int r = tid / num_pages;
-  const int b = tid - r * num_pages;
-  // block_table[r*num_pages + b] = slot_ids[r]*num_pages + b
-  block_table[tid] = slot_ids[r] * num_pages + b;
-  // Per-row scalars written once (by b==0): positions[r]=abs_pos,
-  // context_lens[r]=min(abs_pos/ratio, key_counts[r]) — integer div, matches host.
-  if (b == 0) {
-    const int abs_pos = start_pos[r];
-    int avail = abs_pos / ratio;
-    if (avail > key_counts[r]) avail = key_counts[r];
-    context_lens[r] = avail;
-    positions[r] = abs_pos;
-  }
-}
-
 }  // namespace
 
 extern "C" CUresult dsv4_dsa_fused_q_indexer_rope_hadamard_quant_cuda(
@@ -857,32 +826,5 @@ extern "C" CUresult dsv4_deepseek_v4_topk_transform_cuda(
   if (attr != cudaSuccess) return static_cast<CUresult>(attr);
   deepseek_v4_topk_transform_kernel<<<batch_size, kTopKBlockSize, kTopKSmem, reinterpret_cast<cudaStream_t>(stream)>>>(
       params);
-  return static_cast<CUresult>(cudaGetLastError());
-}
-
-// Device-side batched-decode select metadata: block_table [n*num_pages],
-// context_lens [n], positions [n] computed on-device from device inputs
-// (slot_ids/start_pos/key_counts), byte-identical to the host build it replaces.
-extern "C" CUresult dsv4_dsa_build_select_meta_cuda(
-    int32_t* block_table,
-    int32_t* context_lens,
-    int32_t* positions,
-    const int32_t* slot_ids,
-    const int32_t* start_pos,
-    const int32_t* key_counts,
-    int n,
-    int num_pages,
-    int ratio,
-    CUstream stream) {
-  if (block_table == nullptr || context_lens == nullptr || positions == nullptr ||
-      slot_ids == nullptr || start_pos == nullptr || key_counts == nullptr ||
-      n <= 0 || num_pages <= 0 || ratio <= 0) {
-    return CUDA_ERROR_INVALID_VALUE;
-  }
-  constexpr int kBlock = 128;
-  const int total = n * num_pages;
-  const int grid = (total + kBlock - 1) / kBlock;
-  dsv4_dsa_build_select_meta_kernel<<<grid, kBlock, 0, reinterpret_cast<cudaStream_t>(stream)>>>(
-      block_table, context_lens, positions, slot_ids, start_pos, key_counts, n, num_pages, ratio);
   return static_cast<CUresult>(cudaGetLastError());
 }
