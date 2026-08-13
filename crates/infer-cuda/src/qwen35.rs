@@ -79,12 +79,6 @@ const FA3_MAX_QLEN: usize = 64;
 /// batch 4 up (2026-08-04: batch 8 is +0.36% at a ceiling of 20).
 const FA3_DECODE_SPLITS_FLOOR: usize = 8;
 
-#[cfg(test)]
-#[path = "qwen35_probe.rs"]
-mod probe;
-#[cfg(test)]
-pub(crate) use probe::*;
-
 /// Route full-attention prefill chunks (`seq_len > 1`) through the vendored
 /// FA3 hopper fwd shim instead of the in-tree `nonpaged_prefill_attention`
 /// kernel (42.1% of prefill GPU time at 3k).

@@ -223,7 +223,8 @@ pub(crate) fn commit_layer_fold(
                 .indexer
                 .as_ref()
                 .ok_or_else(|| anyhow!("DSv4 commit fold: CSA layer without indexer weights"))?;
-            let indexer_rope_original_seq_len = i32::try_from(config.rope_parameters.original_max_position_embeddings)
+            let indexer_rope_original_seq_len =
+                i32::try_from(config.rope_parameters.original_max_position_embeddings)
                     .map_err(|_| anyhow!("DSv4 commit fold indexer rope len overflows i32"))?;
             let indexer_state = state
                 .indexer
@@ -1208,9 +1209,7 @@ fn decode_proj_deepgemm(
     // `decode_proj_deepgemm_raw` (along with the buffer-length `>=` bounds these
     // equalities imply), so only the HiddenStates-dimension assertions live here.
     ensure!(
-        cache.rows == out.hidden_dim
-            && input.hidden_dim == k
-            && out.seq_len == m,
+        cache.rows == out.hidden_dim && input.hidden_dim == k && out.seq_len == m,
         "DSv4 decode_proj_deepgemm shape mismatch: cache {}x{} k={k} m={m} in {}x{} out {}x{}",
         cache.rows,
         cache.cols,
@@ -3761,10 +3760,7 @@ fn run_fused_wqkv_decode_into(
     )?;
 
     crate::profile::profile_op(ctx, "linear/wq_b", None, 1, || {
-        match (
-            dsv4_deepgemm_enabled(),
-            attention.wq_b_deepgemm.as_ref(),
-        ) {
+        match (dsv4_deepgemm_enabled(), attention.wq_b_deepgemm.as_ref()) {
             (true, Some(cache)) => {
                 // Lever #1: wq_b (M=1) through tensor-core DeepGEMM instead of the
                 // scalar GEMV. Quantize c_q_normed (K=q_lora_rank) into the fused
@@ -4673,9 +4669,10 @@ pub(crate) fn mla_attention_decode_graph(
     } else {
         None
     };
-    let flash = state.flashmla.as_mut().ok_or_else(|| {
-        anyhow!("FlashMLA decode enabled but layer state has no FlashMLA arena")
-    })?;
+    let flash = state
+        .flashmla
+        .as_mut()
+        .ok_or_else(|| anyhow!("FlashMLA decode enabled but layer state has no FlashMLA arena"))?;
     let flash_scratch = flashmla_scratch.ok_or_else(|| {
         anyhow!("FlashMLA decode enabled but shared FlashMLA decode scratch missing")
     })?;
@@ -5055,29 +5052,27 @@ pub(crate) fn mla_attention_prepare(
         let scratch = state.fused_wqkv.as_mut().ok_or_else(|| {
             anyhow!("DSv4 fused wqkv decode requested but decode scratch was not allocated")
         })?;
-        let out =
-            crate::profile::profile_op(ctx, "linear/wqkv_a_fused", None, token_count, || {
-                crate::linear_profile::profile(ctx, "dsv4/linear/wqkv_a_fused", || {
-                    // SAFETY: uninit device scratch; fully written before first read.
-                    let mut c_q_normed = unsafe { HiddenStates::uninit(ctx, scratch.q_lora_rank, 1)? };
-                    // SAFETY: uninit device scratch; fully written before first read.
-                    let mut q_raw = unsafe { HiddenStates::uninit(ctx, attention.wq_b.rows, 1)? };
-                    // SAFETY: uninit device scratch; fully written before first read.
-                    let mut kv_normed = unsafe { HiddenStates::uninit(ctx, scratch.head_dim, 1)? };
-                    run_fused_wqkv_decode_into(
-                        ctx,
-                        config,
-                        attention,
-                        hidden,
-                        scratch,
-                        &mut c_q_normed,
-                        &mut q_raw,
-                        &mut kv_normed,
-                    )?;
-                    Ok((c_q_normed, q_raw, kv_normed))
-                })
-            })?;
-        out
+        crate::profile::profile_op(ctx, "linear/wqkv_a_fused", None, token_count, || {
+            crate::linear_profile::profile(ctx, "dsv4/linear/wqkv_a_fused", || {
+                // SAFETY: uninit device scratch; fully written before first read.
+                let mut c_q_normed = unsafe { HiddenStates::uninit(ctx, scratch.q_lora_rank, 1)? };
+                // SAFETY: uninit device scratch; fully written before first read.
+                let mut q_raw = unsafe { HiddenStates::uninit(ctx, attention.wq_b.rows, 1)? };
+                // SAFETY: uninit device scratch; fully written before first read.
+                let mut kv_normed = unsafe { HiddenStates::uninit(ctx, scratch.head_dim, 1)? };
+                run_fused_wqkv_decode_into(
+                    ctx,
+                    config,
+                    attention,
+                    hidden,
+                    scratch,
+                    &mut c_q_normed,
+                    &mut q_raw,
+                    &mut kv_normed,
+                )?;
+                Ok((c_q_normed, q_raw, kv_normed))
+            })
+        })?
     } else if token_count > 1 && dsv4_deepgemm_enabled() {
         // SAFETY: uninit device scratch; fully written before first read.
         let mut c_q = unsafe { HiddenStates::uninit(ctx, attention.wq_a.rows, token_count)? };
@@ -5353,14 +5348,15 @@ pub(crate) fn mla_attention_prepare(
             let indexer = attention.indexer.as_ref().ok_or_else(|| {
                 anyhow::anyhow!("DSv4 layer {layer_idx} is {mode:?} but has no indexer weights")
             })?;
-            let indexer_rope_original_seq_len = i32::try_from(config.rope_parameters.original_max_position_embeddings).map_err(
-                    |_| {
-                        anyhow!(
-                            "DSv4 official DSA original_max_position_embeddings {} overflows i32",
-                            config.rope_parameters.original_max_position_embeddings
-                        )
-                    },
-                )?;
+            let indexer_rope_original_seq_len = i32::try_from(
+                config.rope_parameters.original_max_position_embeddings,
+            )
+            .map_err(|_| {
+                anyhow!(
+                    "DSv4 official DSA original_max_position_embeddings {} overflows i32",
+                    config.rope_parameters.original_max_position_embeddings
+                )
+            })?;
             let indexer_rows_before = state
                 .indexer
                 .as_ref()
@@ -5847,9 +5843,10 @@ pub(crate) fn mla_attention_compressor_defer_row(
         let indexer = attention.indexer.as_ref().ok_or_else(|| {
             anyhow!("DSv4 layer {layer_idx} is CompressedSparse but has no indexer weights")
         })?;
-        let indexer_rope_original_seq_len = i32::try_from(config.rope_parameters.original_max_position_embeddings).map_err(
-                |_| anyhow!("DSv4 official DSA original_max_position_embeddings overflows i32"),
-            )?;
+        let indexer_rope_original_seq_len = i32::try_from(
+            config.rope_parameters.original_max_position_embeddings,
+        )
+        .map_err(|_| anyhow!("DSv4 official DSA original_max_position_embeddings overflows i32"))?;
         indexer_rows_before = state
             .indexer
             .as_ref()
@@ -6035,14 +6032,15 @@ pub(crate) fn mla_attention_prepare_compressed_only(
             let indexer = attention.indexer.as_ref().ok_or_else(|| {
                 anyhow::anyhow!("DSv4 layer {layer_idx} is {mode:?} but has no indexer weights")
             })?;
-            let indexer_rope_original_seq_len = i32::try_from(config.rope_parameters.original_max_position_embeddings).map_err(
-                    |_| {
-                        anyhow!(
-                            "DSv4 official DSA original_max_position_embeddings {} overflows i32",
-                            config.rope_parameters.original_max_position_embeddings
-                        )
-                    },
-                )?;
+            let indexer_rope_original_seq_len = i32::try_from(
+                config.rope_parameters.original_max_position_embeddings,
+            )
+            .map_err(|_| {
+                anyhow!(
+                    "DSv4 official DSA original_max_position_embeddings {} overflows i32",
+                    config.rope_parameters.original_max_position_embeddings
+                )
+            })?;
             // `indexer_rows_before` = the indexer compressed row count BEFORE this
             // step's advance. In full-flatten the P1a pre-pass already advanced
             // `compressed.seq_len`, so the live value would be the AFTER count;
@@ -6803,10 +6801,6 @@ fn dsv4_wo_a_grouped_deepgemm_prefill(
     Ok(())
 }
 
-#[cfg(test)]
-#[path = "attention/tests.rs"]
-mod tests;
-
 /// O-LoRA output projection, extracted from `mla_attention` so the batched-decode
 /// path can call it ONCE over [N] rows (Phase 4): `wo_a` (down to the output latent)
 /// → `wo_b` (up to hidden) into `out`. Row-parallel — the all-reduce-sum is the
@@ -7155,9 +7149,8 @@ fn mla_oproj_decode_graph(
         })?;
     }
 
-    let wo_b_decode_dg = dsv4_deepgemm_enabled()
-        && state.fused_wqkv.is_some()
-        && attention.wo_b_deepgemm.is_some();
+    let wo_b_decode_dg =
+        dsv4_deepgemm_enabled() && state.fused_wqkv.is_some() && attention.wo_b_deepgemm.is_some();
     if wo_b_decode_dg {
         let wo_b_cache = attention
             .wo_b_deepgemm

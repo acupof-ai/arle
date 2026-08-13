@@ -247,8 +247,6 @@ impl Dsv4CompressorState {
             prev_overlap_score,
             compressed,
             compressed_seq_len: self.compressed.seq_len,
-            compressed_capacity: self.compressed_capacity,
-            ring_rows: self.ring_rows,
             fp32_pending_kv,
             fp32_pending_score,
             fp32_prev_kv,

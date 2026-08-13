@@ -179,4 +179,3 @@ pub(crate) fn dsv4_decode_route_index(
         .ok_or_else(|| anyhow!("DSv4 decode routed index overflow"))?;
     i32::try_from(routed).map_err(|_| anyhow!("DSv4 decode routed index {routed} exceeds i32"))
 }
-

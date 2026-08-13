@@ -119,7 +119,6 @@ impl HsSlot {
 }
 
 impl Dsv4Model {
-
     /// One DSpark stage's dual-stream forward. Appends the noise `block` to the
     /// stage's `latent_kv` (the committed context is already accumulated there by
     /// prior [`Dsv4Model::dspark_append_context`] calls), runs dense non-causal
@@ -920,10 +919,7 @@ impl Dsv4Model {
         let mut chain = Vec::with_capacity(1 + draft_len);
         chain.push(anchor);
         chain.extend(drafts);
-        Ok(Dsv4DsparkProposal {
-            chain,
-            draft_len,
-        })
+        Ok(Dsv4DsparkProposal { chain, draft_len })
     }
 
     /// Confidence-head seam: draft-keep length over the block rows —

@@ -566,4 +566,3 @@ pub(crate) fn reject_dsv4_e8m0_scale_abi(
     }
     Ok(())
 }
-

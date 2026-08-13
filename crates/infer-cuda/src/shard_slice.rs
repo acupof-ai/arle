@@ -228,4 +228,3 @@ fn ensure_buffer(bytes: &[u8], rows: usize, cols: usize, elem_size: usize) -> Re
     );
     Ok(())
 }
-
