@@ -1865,14 +1865,7 @@ impl Dsv4Model {
         penalty: infer_plan::PenaltyHistory<'_>,
     ) -> Result<u32> {
         self.forward_tokens_impl(
-            slot,
-            kv_adapter,
-            tokens,
-            start_pos,
-            params,
-            position,
-            penalty,
-            None,
+            slot, kv_adapter, tokens, start_pos, params, position, penalty, None,
         )
     }
 
@@ -5148,7 +5141,7 @@ impl Dsv4Model {
                 let mut moe_out = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
                 // DeepEP combine already reduces the EP-sharded routed output; the
                 // non-deepep path needs the explicit TP all-reduce below.
-                let (mut shared_out, mut shared_scratch) = kv_adapter.shared_expert_decode_mut();
+                let (shared_out, mut shared_scratch) = kv_adapter.shared_expert_decode_mut();
                 let needs_moe_allreduce = if use_deepep_transport {
                     #[cfg(feature = "deepep")]
                     {

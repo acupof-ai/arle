@@ -2282,8 +2282,12 @@ impl Qwen35CudaExecutor {
             }
         }
         let dg = self.decode_graph.as_mut().expect("still present");
-        self.model
-            .sample_workspace_logits(&mut dg.ws, &row.params, position, penalty_of(&row.penalty_history, row.penalty_prompt_len))
+        self.model.sample_workspace_logits(
+            &mut dg.ws,
+            &row.params,
+            position,
+            penalty_of(&row.penalty_history, row.penalty_prompt_len),
+        )
     }
 
     /// Run one decode step through the captured whole-step graph. `Ok(None)` means
