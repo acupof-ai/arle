@@ -14,7 +14,7 @@ fn logit_bias_vetoes_the_raw_argmax_fast_path() {
     let mut params = greedy();
     assert!(params.is_raw_argmax());
 
-    params.logit_bias.insert(0, 5.0);
+    params.logit_bias.push((0, 5.0));
     assert!(
         params.is_greedy(),
         "bias does not change the sampling policy"

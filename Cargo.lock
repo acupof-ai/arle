@@ -1656,6 +1656,7 @@ name = "infer-plan"
 version = "0.5.5"
 dependencies = [
  "serde",
+ "serde_json",
  "thiserror 2.0.18",
 ]
 
