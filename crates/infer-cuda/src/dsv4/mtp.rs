@@ -1,5 +1,6 @@
 //! The MTP draft head: one frozen-KV draft level and its candidate selection.
 
+use super::layer_block::HcHalf;
 use super::*;
 
 /// One draft row to expand in an MTP head pass ([`Dsv4Model::mtp_forward_level`]).
@@ -147,24 +148,17 @@ impl Dsv4Model {
             self.config.head_dim
         );
 
-        let attn_mhc =
-            crate::profile::profile_op(ctx, "attn_hc_params", Some(target_layer_idx), m, || {
-                crate::hc::gen_mhc_params(ctx, &self.config, &layer.hc_attn, &stream)
-            })?;
         // SAFETY: scratch fully written before read.
         let mut attn_normed = unsafe { HiddenStates::uninit(ctx, hidden_size, m)? };
-        crate::profile::profile_op(ctx, "attn_hc_pre_norm", Some(target_layer_idx), m, || {
-            crate::hc::mhc_pre_rms_norm(
-                ctx,
-                &stream,
-                &attn_mhc.pre,
-                &layer.attn_norm,
-                eps,
-                hidden_size,
-                hc_mult,
-                &mut attn_normed,
-            )
-        })?;
+        let attn_mhc = self.hc_pre_norm(
+            layer,
+            HcHalf::Attn,
+            target_layer_idx,
+            m,
+            &stream,
+            &mut attn_normed,
+            &mut keepalive,
+        )?;
         keepalive.keep_hidden(&attn_normed);
         // SAFETY: scratch fully written before read.
         let mut attn_out = unsafe { HiddenStates::uninit(ctx, hidden_size, m)? };
@@ -202,8 +196,10 @@ impl Dsv4Model {
                     flashmla_scratch.as_deref_mut(),
                     prefill_shared.as_deref_mut(),
                     None,
-                    positions[r] as usize,
-                    Some(&pos_dev),
+                    crate::attention::Dsv4Position {
+                        start: positions[r] as usize,
+                        device: Some(&pos_dev),
+                    },
                     None,
                     &self.tp,
                     &mut attn_row,
@@ -223,39 +219,29 @@ impl Dsv4Model {
         })?;
         // SAFETY: uninit device scratch; fully written before first read.
         let mut attn_stream = unsafe { HiddenStates::uninit(ctx, stream_dim, m)? };
-        crate::profile::profile_op(ctx, "attn_hc_post", Some(target_layer_idx), m, || {
-            crate::hc::hc_post(
-                ctx,
-                &attn_out,
-                &stream,
-                &attn_mhc.post,
-                &attn_mhc.comb,
-                hidden_size,
-                hc_mult,
-                &mut attn_stream,
-            )
-        })?;
+        self.hc_post_fold(
+            attn_mhc.as_ref(),
+            HcHalf::Attn,
+            target_layer_idx,
+            m,
+            &attn_out,
+            &stream,
+            &mut attn_stream,
+        )?;
         keepalive.keep_hidden(&attn_out);
         keepalive.keep_hidden(&attn_stream);
 
-        let ffn_mhc =
-            crate::profile::profile_op(ctx, "ffn_hc_params", Some(target_layer_idx), m, || {
-                crate::hc::gen_mhc_params(ctx, &self.config, &layer.hc_ffn, &attn_stream)
-            })?;
         // SAFETY: uninit device scratch; fully written before first read.
         let mut ffn_normed = unsafe { HiddenStates::uninit(ctx, hidden_size, m)? };
-        crate::profile::profile_op(ctx, "ffn_hc_pre_norm", Some(target_layer_idx), m, || {
-            crate::hc::mhc_pre_rms_norm(
-                ctx,
-                &attn_stream,
-                &ffn_mhc.pre,
-                &layer.ffn_norm,
-                eps,
-                hidden_size,
-                hc_mult,
-                &mut ffn_normed,
-            )
-        })?;
+        let ffn_mhc = self.hc_pre_norm(
+            layer,
+            HcHalf::Ffn,
+            target_layer_idx,
+            m,
+            &attn_stream,
+            &mut ffn_normed,
+            &mut keepalive,
+        )?;
         keepalive.keep_hidden(&ffn_normed);
         let level_tokens: Vec<u32> = rows.iter().map(|r| r.token).collect();
         // SAFETY: uninit device scratch; fully written before first read.
@@ -298,18 +284,15 @@ impl Dsv4Model {
         })?;
         // SAFETY: uninit device scratch; fully written before first read.
         let mut ffn_stream = unsafe { HiddenStates::uninit(ctx, stream_dim, m)? };
-        crate::profile::profile_op(ctx, "ffn_hc_post", Some(target_layer_idx), m, || {
-            crate::hc::hc_post(
-                ctx,
-                &moe_with_shared,
-                &attn_stream,
-                &ffn_mhc.post,
-                &ffn_mhc.comb,
-                hidden_size,
-                hc_mult,
-                &mut ffn_stream,
-            )
-        })?;
+        self.hc_post_fold(
+            ffn_mhc.as_ref(),
+            HcHalf::Ffn,
+            target_layer_idx,
+            m,
+            &moe_with_shared,
+            &attn_stream,
+            &mut ffn_stream,
+        )?;
         keepalive.keep_hidden(&moe_out);
         keepalive.keep_hidden(&shared);
         keepalive.keep_hidden(&moe_with_shared);

@@ -19,6 +19,7 @@
 //! via tied-head logits → Markov semi-AR sampling → confidence truncation.
 //! `dead_code` until the verify tranche wires a caller.
 
+use super::layer_block::HcHalf;
 use super::*;
 use deepseek_spec::DeepSeekV4RopeParameters;
 
@@ -197,18 +198,16 @@ impl Dsv4Model {
 
         let mut keepalive = Dsv4ForwardKeepalive::new(false);
 
-        let attn_mhc = crate::hc::gen_mhc_params(ctx, config, &layer.hc_attn, stream_in)?;
         // SAFETY: uninit device scratch; fully written before first read.
         let mut attn_normed = unsafe { HiddenStates::uninit(ctx, hidden_size, block)? };
-        crate::hc::mhc_pre_rms_norm(
-            ctx,
+        let attn_mhc = self.hc_pre_norm(
+            layer,
+            HcHalf::Attn,
+            stage_idx,
+            block,
             stream_in,
-            &attn_mhc.pre,
-            &layer.attn_norm,
-            eps,
-            hidden_size,
-            hc_mult,
             &mut attn_normed,
+            &mut keepalive,
         )?;
         keepalive.keep_hidden(&attn_normed);
 
@@ -329,32 +328,29 @@ impl Dsv4Model {
         self.tp.all_reduce_sum(ctx, &mut attn_out)?;
         // SAFETY: uninit device scratch; fully written before first read.
         let mut attn_stream = unsafe { HiddenStates::uninit(ctx, stream_dim, block)? };
-        crate::hc::hc_post(
-            ctx,
+        self.hc_post_fold(
+            attn_mhc.as_ref(),
+            HcHalf::Attn,
+            stage_idx,
+            block,
             &attn_out,
             stream_in,
-            &attn_mhc.post,
-            &attn_mhc.comb,
-            hidden_size,
-            hc_mult,
             &mut attn_stream,
         )?;
         keepalive.keep_hidden(&attn_out);
         keepalive.keep_hidden(&attn_stream);
 
         // identical to mtp_forward_level.
-        let ffn_mhc = crate::hc::gen_mhc_params(ctx, config, &layer.hc_ffn, &attn_stream)?;
         // SAFETY: uninit device scratch; fully written before first read.
         let mut ffn_normed = unsafe { HiddenStates::uninit(ctx, hidden_size, block)? };
-        crate::hc::mhc_pre_rms_norm(
-            ctx,
+        let ffn_mhc = self.hc_pre_norm(
+            layer,
+            HcHalf::Ffn,
+            stage_idx,
+            block,
             &attn_stream,
-            &ffn_mhc.pre,
-            &layer.ffn_norm,
-            eps,
-            hidden_size,
-            hc_mult,
             &mut ffn_normed,
+            &mut keepalive,
         )?;
         keepalive.keep_hidden(&ffn_normed);
         let moe = layer.moe.as_ref().expect("DSpark draft layer.moe");
@@ -389,14 +385,13 @@ impl Dsv4Model {
         crate::ops::add_batch(ctx, &moe_out, &shared, &mut moe_with_shared)?;
         // SAFETY: uninit device scratch; fully written before first read.
         let mut ffn_stream = unsafe { HiddenStates::uninit(ctx, stream_dim, block)? };
-        crate::hc::hc_post(
-            ctx,
+        self.hc_post_fold(
+            ffn_mhc.as_ref(),
+            HcHalf::Ffn,
+            stage_idx,
+            block,
             &moe_with_shared,
             &attn_stream,
-            &ffn_mhc.post,
-            &ffn_mhc.comb,
-            hidden_size,
-            hc_mult,
             &mut ffn_stream,
         )?;
         keepalive.keep_hidden(&moe_out);
@@ -558,8 +553,6 @@ impl Dsv4Model {
         let hc_mult = config.hc_mult;
         let stream_dim = hidden * hc_mult;
         let head_dim = config.head_dim;
-        let rope_dim = config.qk_rope_head_dim;
-        let rope = &config.rope_parameters;
         let num_stages = config.dspark_num_stages();
         ensure!(
             draft.stages.len() == num_stages && num_stages > 0,
@@ -692,26 +685,13 @@ impl Dsv4Model {
         let start = df.ctx_end;
         let mut keepalive = Dsv4ForwardKeepalive::new(false);
         for (stage_idx, stage) in draft.stages.iter().enumerate() {
-            let attention = &stage.layer.attention;
-            let local_width = attention.wq_b.rows;
-            ensure!(
-                local_width.is_multiple_of(head_dim),
-                "DSpark local width {local_width} not a multiple of head_dim {head_dim}"
-            );
-            let local_heads = local_width / head_dim;
             self.dspark_append_latent(
                 df,
                 stage_idx,
-                attention,
+                &stage.layer.attention,
                 &context,
                 start,
                 &positions,
-                local_width,
-                local_heads,
-                head_dim,
-                rope_dim,
-                rope,
-                eps,
                 &mut keepalive,
             )?;
         }
@@ -726,7 +706,6 @@ impl Dsv4Model {
     /// each row RoPE'd at its own absolute position `positions[row]` (decoupled
     /// from the write offset). Context rows carry no query, so a discarded dummy q
     /// is driven through the fused prep kernel (which requires q heads).
-    #[allow(clippy::too_many_arguments)]
     fn dspark_append_latent(
         &self,
         df: &mut Dsv4DsparkSlotState,
@@ -735,15 +714,20 @@ impl Dsv4Model {
         feats: &HiddenStates,
         start: usize,
         positions: &[i32],
-        local_width: usize,
-        local_heads: usize,
-        head_dim: usize,
-        rope_dim: usize,
-        rope: &DeepSeekV4RopeParameters,
-        eps: f32,
         keepalive: &mut Dsv4ForwardKeepalive,
     ) -> Result<()> {
         let ctx = &self.ctx;
+        let config = &self.config;
+        let head_dim = config.head_dim;
+        let rope_dim = config.qk_rope_head_dim;
+        let eps = config.rms_norm_eps;
+        let rope = &config.rope_parameters;
+        let local_width = attention.wq_b.rows;
+        ensure!(
+            local_width.is_multiple_of(head_dim),
+            "DSpark local width {local_width} not a multiple of head_dim {head_dim}"
+        );
+        let local_heads = local_width / head_dim;
         let rows = feats.seq_len;
         ensure!(
             positions.len() == rows,

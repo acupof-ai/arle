@@ -190,7 +190,8 @@ impl Dsv4CudaExecutor {
             let token = if final_prefill {
                 self.forward_mtp_warm_step(slot_idx, tokens, start_pos, params, position, penalty)?
             } else {
-                let (token, _hidden) = self.model.forward_tokens_with_hidden(
+                self.spec_slots[slot_idx] = Dsv4SpecSlotState::default();
+                self.model.forward_tokens(
                     &mut self.slots[slot_idx],
                     &mut self.kv_adapter,
                     tokens,
@@ -198,9 +199,7 @@ impl Dsv4CudaExecutor {
                     params,
                     position,
                     penalty,
-                )?;
-                self.spec_slots[slot_idx] = Dsv4SpecSlotState::default();
-                token
+                )?
             };
             Ok(vec![token])
         } else {
