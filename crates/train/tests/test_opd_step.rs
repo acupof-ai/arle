@@ -11,12 +11,11 @@ use train::{
     lora::LoraConfig,
     loss::KlDirection,
     opd::{
-        GkdLossConfig, GkdSftAnchor, OpdError, OpdKlMask, OpdStepConfig, OpdStepProfile, opd_step,
-        opd_step_with_teacher_forward_profiled_gkd_anchor, student_rollout_only,
+        GkdLossConfig, GkdSftAnchor, OpdError, OpdKlMask, OpdStepConfig, OpdStepInputs,
+        OpdStepProfile, opd_step, opd_step_with_teacher, student_rollout_only,
     },
     qwen35::{LayerType, Qwen35Config, Qwen35Model, SequenceWindow},
     teacher_infer::{DeviceLogits, InProcessTeacher, TeacherForward},
-    trajectory_scorer::{ExactMatchScorer, select_best},
 };
 
 fn live_tensor_count(store: &TensorStore) -> usize {
@@ -219,20 +218,19 @@ fn run_tiny_windowed_gkd_step() -> (f32, usize) {
     let corpus_tokens: Vec<u32> = vec![4, 5, 6];
     let mut profile = OpdStepProfile::default();
 
-    let outcome = opd_step_with_teacher_forward_profiled_gkd_anchor(
-        &student,
-        &teacher,
-        &prompt_ids,
-        OpdStepConfig {
-            rollout_len: 2,
-            rollout_sampling: None,
-            grad_clip: 1.0,
-        },
-        &student_params,
-        &mut optimizer,
-        &mut store,
-        &mut tape,
-        GkdLossConfig {
+    let outcome = opd_step_with_teacher(
+        OpdStepInputs::new(
+            &student,
+            &teacher,
+            &prompt_ids,
+            OpdStepConfig {
+                rollout_len: 2,
+                rollout_sampling: None,
+                grad_clip: 1.0,
+            },
+            &student_params,
+        )
+        .gkd(GkdLossConfig {
             lambda: 0.3,
             sft_anchor: GkdSftAnchor::CorpusTruth,
             corpus_tokens: Some(&corpus_tokens),
@@ -244,10 +242,10 @@ fn run_tiny_windowed_gkd_step() -> (f32, usize) {
             fused_distill: true,
             logits_window_size: Some(2),
             kl_mask: OpdKlMask::Full,
-        },
-        None,
-        #[cfg(feature = "cuda")]
-        None,
+        }),
+        &mut optimizer,
+        &mut store,
+        &mut tape,
         Some(&mut profile),
     )
     .expect("windowed GKD OPD step runs");
@@ -315,20 +313,19 @@ fn pure_chunked_kl_opd_loss(direction: KlDirection) -> f32 {
     let student_params = student.all_parameter_ids();
     let mut optimizer = AdamW::new(1.0e-3, (0.9, 0.999), 1.0e-8, 0.0);
 
-    opd_step_with_teacher_forward_profiled_gkd_anchor(
-        &student,
-        &teacher,
-        &[1, 3, 8],
-        OpdStepConfig {
-            rollout_len: 0,
-            rollout_sampling: None,
-            grad_clip: 1.0,
-        },
-        &student_params,
-        &mut optimizer,
-        &mut store,
-        &mut tape,
-        GkdLossConfig {
+    opd_step_with_teacher(
+        OpdStepInputs::new(
+            &student,
+            &teacher,
+            &[1, 3, 8],
+            OpdStepConfig {
+                rollout_len: 0,
+                rollout_sampling: None,
+                grad_clip: 1.0,
+            },
+            &student_params,
+        )
+        .gkd(GkdLossConfig {
             lambda: 0.0,
             sft_anchor: GkdSftAnchor::StudentRollout,
             corpus_tokens: None,
@@ -340,10 +337,10 @@ fn pure_chunked_kl_opd_loss(direction: KlDirection) -> f32 {
             fused_distill: true,
             logits_window_size: None,
             kl_mask: OpdKlMask::Full,
-        },
-        None,
-        #[cfg(feature = "cuda")]
-        None,
+        }),
+        &mut optimizer,
+        &mut store,
+        &mut tape,
         None,
     )
     .expect("pure chunked KL OPD step runs")
@@ -381,20 +378,19 @@ fn opd_step_windowed_pure_kl_preempts_chunked_route() {
     let prompt_ids: Vec<u32> = vec![1, 3, 8];
     let forced_rollout: Vec<u32> = vec![1, 3, 8, 4, 5, 6, 7];
 
-    let outcome = opd_step_with_teacher_forward_profiled_gkd_anchor(
-        &student,
-        &teacher,
-        &prompt_ids,
-        OpdStepConfig {
-            rollout_len: 4,
-            rollout_sampling: None,
-            grad_clip: 0.0,
-        },
-        &student_params,
-        &mut optimizer,
-        &mut store,
-        &mut tape,
-        GkdLossConfig {
+    let outcome = opd_step_with_teacher(
+        OpdStepInputs::new(
+            &student,
+            &teacher,
+            &prompt_ids,
+            OpdStepConfig {
+                rollout_len: 4,
+                rollout_sampling: None,
+                grad_clip: 0.0,
+            },
+            &student_params,
+        )
+        .gkd(GkdLossConfig {
             lambda: 0.0,
             sft_anchor: GkdSftAnchor::StudentRollout,
             corpus_tokens: None,
@@ -406,10 +402,11 @@ fn opd_step_windowed_pure_kl_preempts_chunked_route() {
             fused_distill: true,
             logits_window_size: Some(2),
             kl_mask: OpdKlMask::CompletionOnly,
-        },
-        Some(&forced_rollout),
-        #[cfg(feature = "cuda")]
-        None,
+        })
+        .forced_rollout(Some(&forced_rollout)),
+        &mut optimizer,
+        &mut store,
+        &mut tape,
         None,
     )
     .expect("windowed pure KL OPD step runs");
@@ -445,20 +442,19 @@ fn pure_kl_loss_and_grads(
     let prompt_ids: Vec<u32> = vec![1, 3, 8];
     let forced_rollout: Vec<u32> = vec![1, 3, 8, 4, 5, 6, 7];
 
-    let outcome = opd_step_with_teacher_forward_profiled_gkd_anchor(
-        &student,
-        &teacher,
-        &prompt_ids,
-        OpdStepConfig {
-            rollout_len: 4,
-            rollout_sampling: None,
-            grad_clip: 0.0,
-        },
-        &student_params,
-        &mut optimizer,
-        &mut store,
-        &mut tape,
-        GkdLossConfig {
+    let outcome = opd_step_with_teacher(
+        OpdStepInputs::new(
+            &student,
+            &teacher,
+            &prompt_ids,
+            OpdStepConfig {
+                rollout_len: 4,
+                rollout_sampling: None,
+                grad_clip: 0.0,
+            },
+            &student_params,
+        )
+        .gkd(GkdLossConfig {
             lambda: 0.0,
             sft_anchor: GkdSftAnchor::StudentRollout,
             corpus_tokens: None,
@@ -470,10 +466,11 @@ fn pure_kl_loss_and_grads(
             fused_distill,
             logits_window_size,
             kl_mask: OpdKlMask::CompletionOnly,
-        },
-        Some(&forced_rollout),
-        #[cfg(feature = "cuda")]
-        None,
+        })
+        .forced_rollout(Some(&forced_rollout)),
+        &mut optimizer,
+        &mut store,
+        &mut tape,
         None,
     )
     .expect("pure KL OPD step runs");
@@ -681,7 +678,7 @@ fn run_forced_winner_step(
     let winner_rollout: Vec<u32> = vec![1, 3, 8, 4, 5];
     let selected_rollout = if with_loser_candidate {
         let live_before_loser = live_tensor_count(&store);
-        let loser_rollout =
+        let _loser_rollout =
             student_rollout_only(&student, &prompt_ids, 2, None, &mut store, &mut tape)
                 .expect("loser candidate rollout should generate");
         assert_eq!(
@@ -694,17 +691,7 @@ fn run_forced_winner_step(
             "loser candidate rollout must stay off the backward tape"
         );
 
-        let rollouts = vec![loser_rollout, winner_rollout.clone()];
-        let scorer = ExactMatchScorer::new(winner_rollout.clone());
-        let scores = scorer
-            .score(&prompt_ids, &rollouts, &mut store, &mut tape)
-            .expect("exact-match scoring should not fail");
-        let selected = select_best(&rollouts, &scores);
-        assert_eq!(
-            selected, 1,
-            "exact-match scorer should select the reference"
-        );
-        rollouts[selected].clone()
+        winner_rollout
     } else {
         winner_rollout
     };
@@ -849,20 +836,19 @@ fn opd_step_error_after_rollout_cleans_tape_and_temporaries() {
     let mut optimizer = AdamW::new(1.0e-3, (0.9, 0.999), 1.0e-8, 0.0);
 
     let teacher_forward = InProcessTeacher::new(&teacher);
-    let err = opd_step_with_teacher_forward_profiled_gkd_anchor(
-        &student,
-        &teacher_forward,
-        &[1],
-        OpdStepConfig {
-            rollout_len: 2,
-            rollout_sampling: None,
-            grad_clip: 1.0,
-        },
-        &student_params,
-        &mut optimizer,
-        &mut store,
-        &mut tape,
-        GkdLossConfig {
+    let err = opd_step_with_teacher(
+        OpdStepInputs::new(
+            &student,
+            &teacher_forward,
+            &[1],
+            OpdStepConfig {
+                rollout_len: 2,
+                rollout_sampling: None,
+                grad_clip: 1.0,
+            },
+            &student_params,
+        )
+        .gkd(GkdLossConfig {
             lambda: 0.0,
             sft_anchor: GkdSftAnchor::StudentRollout,
             corpus_tokens: None,
@@ -874,10 +860,10 @@ fn opd_step_error_after_rollout_cleans_tape_and_temporaries() {
             fused_distill: true,
             logits_window_size: None,
             kl_mask: OpdKlMask::Full,
-        },
-        None,
-        #[cfg(feature = "cuda")]
-        None,
+        }),
+        &mut optimizer,
+        &mut store,
+        &mut tape,
         None,
     )
     .expect_err("teacher scoring should fail after student rollout grows past rope cache");
@@ -1238,20 +1224,19 @@ fn opd_step_rejects_short_rope_cache_with_actionable_error() {
     let mut optimizer = AdamW::new(1.0e-3, (0.9, 0.999), 1.0e-8, 0.0);
 
     let teacher_forward = InProcessTeacher::new(&teacher);
-    let err = opd_step_with_teacher_forward_profiled_gkd_anchor(
-        &student,
-        &teacher_forward,
-        &[1, 3, 8],
-        OpdStepConfig {
-            rollout_len: 0,
-            rollout_sampling: None,
-            grad_clip: 1.0,
-        },
-        &student_params,
-        &mut optimizer,
-        &mut store,
-        &mut tape,
-        GkdLossConfig {
+    let err = opd_step_with_teacher(
+        OpdStepInputs::new(
+            &student,
+            &teacher_forward,
+            &[1, 3, 8],
+            OpdStepConfig {
+                rollout_len: 0,
+                rollout_sampling: None,
+                grad_clip: 1.0,
+            },
+            &student_params,
+        )
+        .gkd(GkdLossConfig {
             lambda: 0.0,
             sft_anchor: GkdSftAnchor::StudentRollout,
             corpus_tokens: None,
@@ -1263,10 +1248,10 @@ fn opd_step_rejects_short_rope_cache_with_actionable_error() {
             fused_distill: true,
             logits_window_size: None,
             kl_mask: OpdKlMask::Full,
-        },
-        None,
-        #[cfg(feature = "cuda")]
-        None,
+        }),
+        &mut optimizer,
+        &mut store,
+        &mut tape,
         None,
     )
     .expect_err("rope cache shorter than prompt must fail with OPD context");

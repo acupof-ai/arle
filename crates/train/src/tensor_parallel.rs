@@ -31,13 +31,6 @@ impl TpContext {
         Self { rank, world_size }
     }
 
-    pub fn from_coord(cfg: infer_topo::MultiAxisConfig, coord: infer_topo::RankCoord) -> Self {
-        Self {
-            rank: coord.attn_tp_rank,
-            world_size: cfg.attn_tp_size(),
-        }
-    }
-
     pub fn is_enabled(self) -> bool {
         self.world_size > 1
     }

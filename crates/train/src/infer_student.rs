@@ -6,8 +6,7 @@
 //! its LoRA weights update every training step via `sync_lora_from_store`.
 //!
 //! `generate_rollout` submits one request to infer-core so the backend owns a
-//! KV slot and decodes incrementally. `decode_next_token` remains as the
-//! raw-logits parity/debug surface.
+//! KV slot and decodes incrementally.
 
 #[cfg(feature = "cuda")]
 use std::collections::{BTreeMap, HashMap};
@@ -24,7 +23,7 @@ use infer_api::{
     StudentLoraProjectionUpdate, StudentLoraUpdate, parse_student_adapter_name,
 };
 #[cfg(feature = "cuda")]
-use infer_plan::{SamplingParams, sample_token};
+use infer_plan::SamplingParams;
 
 #[cfg(feature = "cuda")]
 use crate::lora::LoraConfig;
@@ -214,58 +213,6 @@ impl InferStudent {
             validate_token_ids("generated sample", ids, self.vocab_size)?;
         }
         Ok(generated)
-    }
-
-    pub fn decode_next_token(
-        &self,
-        input_ids: &[u32],
-        positions: &[u32],
-        sampling: Option<&SamplingParams>,
-        position: u64,
-    ) -> Result<u32> {
-        if input_ids.is_empty() {
-            bail!("InferStudent requires a non-empty token sequence");
-        }
-        if input_ids.len() != positions.len() {
-            bail!(
-                "InferStudent token/position length mismatch: tokens={} positions={}",
-                input_ids.len(),
-                positions.len()
-            );
-        }
-
-        let raw_logits = {
-            let engine = self
-                .engine
-                .lock()
-                .map_err(|err| anyhow!("LoadedInferenceEngine lock poisoned: {err}"))?;
-            engine.forward_token_logits(input_ids, positions)?
-        };
-
-        if raw_logits.vocab_size() != self.vocab_size {
-            bail!(
-                "InferStudent vocab mismatch: raw logits vocab={}, configured vocab={}",
-                raw_logits.vocab_size(),
-                self.vocab_size
-            );
-        }
-        if raw_logits.seq_len() != input_ids.len() {
-            bail!(
-                "InferStudent seq_len mismatch: raw logits seq_len={}, input token len={}",
-                raw_logits.seq_len(),
-                input_ids.len()
-            );
-        }
-
-        let host = raw_logits.to_host_f32()?;
-        let vocab = raw_logits.vocab_size();
-        let seq_len = raw_logits.seq_len();
-        let last_row = &host[(seq_len - 1) * vocab..seq_len * vocab];
-        let token = match sampling {
-            None => argmax(last_row)? as u32,
-            Some(params) => sample_token(last_row, params, position),
-        };
-        Ok(token)
     }
 
     /// D2H LoRA A/B from the train store and push into the infer engine, which
@@ -479,22 +426,6 @@ impl PartialProj {
             }
         }
     }
-}
-
-#[cfg(feature = "cuda")]
-fn argmax(logits: &[f32]) -> Result<usize> {
-    if logits.is_empty() {
-        bail!("argmax over empty logits");
-    }
-    let mut best_idx = 0usize;
-    let mut best_val = logits[0];
-    for (idx, &val) in logits.iter().enumerate().skip(1) {
-        if val > best_val {
-            best_val = val;
-            best_idx = idx;
-        }
-    }
-    Ok(best_idx)
 }
 
 #[cfg(feature = "cuda")]

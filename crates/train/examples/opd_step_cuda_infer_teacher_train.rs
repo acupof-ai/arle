@@ -45,8 +45,8 @@ mod app {
         infer_student::InferStudent,
         loss::{DEFAULT_KL_CHUNK_SIZE, KlDirection, kl_distill_loss, kl_distill_loss_chunked},
         opd::{
-            GkdLossConfig, GkdSftAnchor, InferRolloutCtx, OpdKlMask, OpdStepConfig, OpdStepProfile,
-            infer_rollout_flag_enabled, opd_step_with_teacher_forward_profiled_gkd_anchor,
+            GkdLossConfig, GkdSftAnchor, InferRolloutCtx, OpdKlMask, OpdStepConfig, OpdStepInputs,
+            OpdStepProfile, infer_rollout_flag_enabled, opd_step_with_teacher,
         },
         prompts::load_jsonl_prompt_sets,
         qwen35::{Qwen35Model, SequenceWindow},
@@ -56,10 +56,7 @@ mod app {
             save_qwen35_student_checkpoint,
         },
         qwen35_loader::{load_qwen35_from_hf_dir, load_qwen35_lora_from_hf_dir},
-        teacher_infer::{
-            ApiTeacher, InProcessTeacher, InferTeacher, MultiTeacher, TeacherEntry, TeacherForward,
-            TeacherRoute,
-        },
+        teacher_infer::{ApiTeacher, InProcessTeacher, InferTeacher, TeacherForward},
         trainer::extend_keep_with_params_and_grads,
     };
 
@@ -82,7 +79,6 @@ mod app {
         teacher_api_url: Option<String>,
         teacher_api_key_env: Option<String>,
         teacher_api_dtype: String,
-        teacher_config: Option<PathBuf>,
         prompts_file: Option<PathBuf>,
         steps: usize,
         rollout_len: usize,
@@ -112,45 +108,6 @@ mod app {
         source: String,
     }
 
-    #[derive(Debug, serde::Deserialize)]
-    struct TeacherConfigFile {
-        default_teacher: String,
-        teachers: Vec<ApiTeacherConfig>,
-        #[serde(default)]
-        routes: Vec<TeacherRouteConfig>,
-    }
-
-    #[derive(Debug, serde::Deserialize)]
-    struct ApiTeacherConfig {
-        id: String,
-        url: String,
-        #[serde(default)]
-        vocab_size: Option<usize>,
-        #[serde(default)]
-        dtype: Option<String>,
-        #[serde(default)]
-        api_key_env: Option<String>,
-        #[serde(default)]
-        timeout_seconds: Option<u64>,
-    }
-
-    #[derive(Debug, serde::Deserialize)]
-    struct TeacherRouteConfig {
-        teacher_id: String,
-        token_prefix: Vec<u32>,
-    }
-
-    struct NamedApiTeacher {
-        id: String,
-        teacher: ApiTeacher,
-    }
-
-    struct NamedApiTeachers {
-        default_teacher: String,
-        teachers: Vec<NamedApiTeacher>,
-        routes: Vec<TeacherRoute>,
-    }
-
     #[derive(Debug, Default, Clone, Copy)]
     struct RuntimeTeacherProfile {
         infer_forward_seconds: f64,
@@ -168,7 +125,7 @@ mod app {
         let prompts = load_prompts(&args)?;
         validate_prompt_sft_anchors(&args, &prompts)?;
         println!(
-            "config backend=cuda teacher_model={} teacher_api_url={} teacher_config={} \
+            "config backend=cuda teacher_model={} teacher_api_url={} \
              student_model={} student_mode=lora \
              lora_rank={} lora_alpha={:.6} lora_target_set={} \
              steps={} rollout_len={} lr={:.9e} grad_clip={GRAD_CLIP} \
@@ -178,10 +135,6 @@ mod app {
              opd_kl_mask={} eval_train_prompt_limit={}",
             args.teacher_model.display(),
             args.teacher_api_url.as_deref().unwrap_or("none"),
-            args.teacher_config
-                .as_ref()
-                .map(|path| path.display().to_string())
-                .unwrap_or_else(|| "none".to_owned()),
             args.student_model.display(),
             args.lora_rank,
             args.lora_alpha,
@@ -274,40 +227,6 @@ mod app {
         } else {
             None
         };
-
-        if let Some(config_path) = args.teacher_config.as_ref() {
-            let named_teachers = load_api_teacher_config(config_path, student.config().vocab_size)?;
-            let entries = named_teachers
-                .teachers
-                .iter()
-                .map(|teacher| {
-                    TeacherEntry::new(teacher.id.clone(), &teacher.teacher as &dyn TeacherForward)
-                })
-                .collect::<Vec<_>>();
-            let multi_teacher = MultiTeacher::with_routes(
-                entries,
-                &named_teachers.default_teacher,
-                named_teachers.routes,
-            )?;
-            return run_training(
-                &args,
-                &prompts,
-                &student,
-                &student_model_params,
-                &student_trainable_params,
-                &student_host_evict_params,
-                &mut store,
-                &mut tape,
-                cuda_backend,
-                &multi_teacher,
-                "api-multi",
-                student_load_seconds,
-                0.0,
-                infer_student.as_ref(),
-                RuntimeTeacherProfile::default,
-                |prompt| multi_teacher.selected_teacher_id(prompt).to_owned(),
-            );
-        }
 
         if let Some(endpoint) = args.teacher_api_url.as_ref() {
             let api_teacher = build_api_teacher(
@@ -404,7 +323,6 @@ mod app {
         let mut teacher_api_url = None;
         let mut teacher_api_key_env = None;
         let mut teacher_api_dtype = "bf16".to_owned();
-        let mut teacher_config = None;
         let mut prompts_file = None;
         let mut steps = DEFAULT_STEPS;
         let mut rollout_len = DEFAULT_ROLLOUT_LEN;
@@ -433,9 +351,6 @@ mod app {
                 "--teacher-api-url" => teacher_api_url = Some(next_arg(&mut args, &arg)?),
                 "--teacher-api-key-env" => teacher_api_key_env = Some(next_arg(&mut args, &arg)?),
                 "--teacher-api-dtype" => teacher_api_dtype = next_arg(&mut args, &arg)?,
-                "--teacher-config" => {
-                    teacher_config = Some(PathBuf::from(next_arg(&mut args, &arg)?))
-                }
                 "--prompts-file" => prompts_file = Some(PathBuf::from(next_arg(&mut args, &arg)?)),
                 "--steps" => steps = parse_positive_usize(&arg, &next_arg(&mut args, &arg)?)?,
                 "--rollout-len" => {
@@ -479,7 +394,7 @@ mod app {
                     println!(
                         "usage: cargo run -p train --example opd_step_cuda_infer_teacher_train \
                          --release --features cuda -- [--teacher-model DIR] [--student-model DIR] \
-                         [--teacher-api-url URL] [--teacher-config JSON] [--prompts-file JSONL] \
+                         [--teacher-api-url URL] [--prompts-file JSONL] \
                          [--steps N] [--rollout-len N] [--lr LR] \
                          [--eval-steps CSV] [--prompt-max-tokens N] [--max-step-seconds SEC] \
                          [--save-student-checkpoint DIR] [--save-every N] \
@@ -496,9 +411,6 @@ mod app {
                 }
                 _ => return Err(format!("unknown argument `{arg}`").into()),
             }
-        }
-        if teacher_api_url.is_some() && teacher_config.is_some() {
-            return Err("--teacher-api-url and --teacher-config are mutually exclusive".into());
         }
         if save_every > 0 && save_student_checkpoint.is_none() {
             return Err("--save-every requires --save-student-checkpoint".into());
@@ -518,7 +430,6 @@ mod app {
             teacher_api_url,
             teacher_api_key_env,
             teacher_api_dtype,
-            teacher_config,
             prompts_file,
             steps,
             rollout_len,
@@ -808,20 +719,19 @@ mod app {
                 },
             });
             let step_started = Instant::now();
-            let outcome = opd_step_with_teacher_forward_profiled_gkd_anchor(
-                student,
-                teacher,
-                prompt,
-                OpdStepConfig {
-                    rollout_len: args.rollout_len,
-                    rollout_sampling: None,
-                    grad_clip: GRAD_CLIP,
-                },
-                student_trainable_params,
-                &mut optimizer,
-                store,
-                tape,
-                GkdLossConfig {
+            let outcome = opd_step_with_teacher(
+                OpdStepInputs::new(
+                    student,
+                    teacher,
+                    prompt,
+                    OpdStepConfig {
+                        rollout_len: args.rollout_len,
+                        rollout_sampling: None,
+                        grad_clip: GRAD_CLIP,
+                    },
+                    student_trainable_params,
+                )
+                .gkd(GkdLossConfig {
                     lambda: args.gkd_lambda,
                     sft_anchor: args.sft_anchor,
                     corpus_tokens,
@@ -833,9 +743,11 @@ mod app {
                     fused_distill: true,
                     logits_window_size: args.logits_window_size,
                     kl_mask: args.opd_kl_mask,
-                },
-                None,
-                infer_rollout,
+                })
+                .infer_rollout(infer_rollout),
+                &mut optimizer,
+                store,
+                tape,
                 Some(&mut profile),
             )?;
             let elapsed = step_started.elapsed().as_secs_f64();
@@ -1104,48 +1016,6 @@ mod app {
             teacher = teacher.with_api_key(api_key);
         }
         Ok(teacher)
-    }
-
-    fn load_api_teacher_config(
-        path: &Path,
-        default_vocab_size: usize,
-    ) -> Result<NamedApiTeachers, Box<dyn std::error::Error>> {
-        let raw = fs::read_to_string(path)
-            .map_err(|err| format!("failed to read teacher config {}: {err}", path.display()))?;
-        let config: TeacherConfigFile = serde_json::from_str(&raw)
-            .map_err(|err| format!("invalid teacher config {}: {err}", path.display()))?;
-        if config.teachers.is_empty() {
-            return Err("teacher config requires at least one teacher".into());
-        }
-        let mut teachers = Vec::with_capacity(config.teachers.len());
-        for teacher in config.teachers {
-            if teacher.id.trim().is_empty() {
-                return Err("teacher config teacher id must be non-empty".into());
-            }
-            let vocab_size = teacher.vocab_size.unwrap_or(default_vocab_size);
-            let dtype = teacher.dtype.as_deref().unwrap_or("bf16");
-            let api_teacher = build_api_teacher(
-                &teacher.url,
-                vocab_size,
-                teacher.api_key_env.as_deref(),
-                dtype,
-                teacher.timeout_seconds,
-            )?;
-            teachers.push(NamedApiTeacher {
-                id: teacher.id,
-                teacher: api_teacher,
-            });
-        }
-        let routes = config
-            .routes
-            .into_iter()
-            .map(|route| TeacherRoute::new(route.teacher_id, route.token_prefix))
-            .collect();
-        Ok(NamedApiTeachers {
-            default_teacher: config.default_teacher,
-            teachers,
-            routes,
-        })
     }
 
     fn profile_from_infer(teacher: &InferTeacher) -> RuntimeTeacherProfile {

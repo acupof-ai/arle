@@ -128,16 +128,12 @@ impl EmaSelfTeacher {
         Ok(())
     }
 
-    pub fn student_adapter_pairs(student: &Qwen35Model) -> Vec<(TensorId, TensorId)> {
+    fn student_adapter_pairs(student: &Qwen35Model) -> Vec<(TensorId, TensorId)> {
         pair_adapters(&student.adapter_name_map())
             .expect("student adapter map must pair into (lora_a, lora_b) tuples")
     }
 
-    pub fn copy_from_student(
-        &mut self,
-        student: &Qwen35Model,
-        store: &mut TensorStore,
-    ) -> Result<()> {
+    fn copy_from_student(&mut self, student: &Qwen35Model, store: &mut TensorStore) -> Result<()> {
         let student_pairs = Self::student_adapter_pairs(student);
         if student_pairs.len() != self.adapter_ids.len() {
             return Err(anyhow!(
