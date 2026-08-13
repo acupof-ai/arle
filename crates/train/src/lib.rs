@@ -28,16 +28,12 @@ pub use autograd::grad_clip;
 pub mod infer_student;
 #[path = "lora.rs"]
 pub mod lora;
-#[path = "lora_shard.rs"]
-pub mod lora_shard;
 #[path = "loss.rs"]
 pub mod loss;
 #[path = "model_family.rs"]
 pub mod model_family;
 #[path = "opd.rs"]
 pub mod opd;
-#[path = "pipeline_parallel.rs"]
-pub mod pipeline_parallel;
 #[path = "prompts.rs"]
 pub mod prompts;
 #[path = "qwen35.rs"]
@@ -68,8 +64,6 @@ pub mod teacher_infer;
 pub mod tokenizer;
 #[path = "trainer.rs"]
 pub mod trainer;
-#[path = "trajectory_scorer.rs"]
-pub mod trajectory_scorer;
 #[path = "update_strategy.rs"]
 pub mod update_strategy;
 #[path = "w2s.rs"]

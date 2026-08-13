@@ -18,8 +18,7 @@ use train::{
     TrainRuntimeFlags, apply_runtime_flags,
     lora::{LoraConfig, LoraTargetSet},
     opd::{
-        capture_rollout_logprobs, masked_writeback_ce_step,
-        masked_writeback_ce_step_frozen_prompt_kv, rubric_writeback_ce_step_batched,
+        WritebackLoss, batched_writeback_ce_step, capture_rollout_logprobs, masked_writeback_step,
     },
     qwen35::{LayerType, Qwen35Config, Qwen35Model},
 };
@@ -399,47 +398,53 @@ fn frozen_prompt_kv_perturbed_lora_grads_bounded_and_response_path_matches() {
 
 #[test]
 fn frozen_prompt_kv_public_step_runs_and_matches_baseline_loss() {
-    // Exercise the public step fns end-to-end (forward+backward+optimizer) and
-    // confirm the frozen step's reported loss matches the baseline step's on a
-    // fresh, identical model (init grads, single step).
+    // Exercise the public entry point end-to-end (forward+backward+optimizer) and
+    // confirm its reported loss (pre-update, at init theta) matches the inline
+    // reference on a fresh, identical model.
     let prompt_ids: Vec<u32> = vec![1, 3, 8, 2, 7, 4, 9, 5];
     let response_ids: Vec<u32> = vec![6, 10, 11, 12, 13, 14];
     let response_mask: Vec<u8> = vec![1; response_ids.len()];
 
-    let run = |frozen: bool| -> f32 {
-        let mut store = TensorStore::default();
-        let student = build_student(&mut store);
-        let all_params = student.all_parameter_ids();
-        let trainable = trainable_ids(&store, &student);
-        let mut optimizer = AdamW::new(1.0e-3, (0.9, 0.999), 1.0e-8, 0.0);
-        let vocab = student.config().vocab_size;
-        let step = if frozen {
-            masked_writeback_ce_step_frozen_prompt_kv
-        } else {
-            masked_writeback_ce_step
-        };
-        step(
-            &student,
-            &all_params,
-            &trainable,
-            &mut optimizer,
-            &prompt_ids,
-            &response_ids,
-            &response_mask,
-            vocab,
-            64,
-            &mut store,
-        )
-        .expect("writeback step")
-    };
+    let mut store = TensorStore::default();
+    let student = build_student(&mut store);
+    let all_params = student.all_parameter_ids();
+    let trainable = trainable_ids(&store, &student);
+    let mut optimizer = AdamW::new(1.0e-3, (0.9, 0.999), 1.0e-8, 0.0);
+    let vocab = student.config().vocab_size;
+    let loss_step = masked_writeback_step(
+        WritebackLoss::Ce,
+        &student,
+        &all_params,
+        &trainable,
+        &mut optimizer,
+        true,
+        &prompt_ids,
+        &response_ids,
+        &response_mask,
+        vocab,
+        64,
+        train::context_parallel::CpContext::single(),
+        train::context_parallel::DpContext::single(),
+        &mut store,
+    )
+    .expect("writeback step")
+    .0;
 
-    let loss_baseline = run(false);
-    let loss_frozen = run(true);
-    let diff = (loss_baseline - loss_frozen).abs();
-    println!("[gate-a-step] baseline={loss_baseline:.8} frozen={loss_frozen:.8} diff={diff:.3e}");
+    let mut ref_store = TensorStore::default();
+    let ref_student = build_student(&mut ref_store);
+    let (loss_inline, _, _) = forward_backward_inline(
+        &mut ref_store,
+        &ref_student,
+        &prompt_ids,
+        &response_ids,
+        &response_mask,
+        false,
+    );
+    let diff = (loss_step - loss_inline).abs();
+    println!("[gate-a-step] inline={loss_inline:.8} step={loss_step:.8} diff={diff:.3e}");
     assert!(
         diff <= 1.0e-5,
-        "public-step frozen vs baseline loss diff {diff:.3e} exceeds 1e-5"
+        "public-step vs inline loss diff {diff:.3e} exceeds 1e-5"
     );
 }
 
@@ -561,7 +566,7 @@ fn frozen_prompt_kv_checkpoint_branch_matches_full() {
 /// The batched CE path (forward→hidden, per-row fused indexed CE over `lm_head`,
 /// mean-of-row-means) must equal running the single-trajectory masked writeback
 /// per row (mask all-1s ⇒ every completion token a target) and averaging,
-/// against the proven `masked_writeback_ce_step` reference — so the dense-logits →
+/// against the proven `masked_writeback_step` reference — so the dense-logits →
 /// fused-hidden rewrite is a pure VRAM change, not a loss-semantics change. Pins:
 ///
 /// - the flat row-stride indexing (row i occupies hidden rows `[i*max_len ..]`);
@@ -579,19 +584,24 @@ fn rubric_batched_writeback_matches_per_row_masked_writeback() {
         let mut optimizer = AdamW::new(1.0e-3, (0.9, 0.999), 1.0e-8, 0.0);
         let vocab = student.config().vocab_size;
         let mask = vec![1u8; completion.len()];
-        masked_writeback_ce_step(
+        masked_writeback_step(
+            WritebackLoss::Ce,
             &student,
             &all_params,
             &trainable,
             &mut optimizer,
+            true,
             prompt,
             completion,
             &mask,
             vocab,
             64,
+            train::context_parallel::CpContext::single(),
+            train::context_parallel::DpContext::single(),
             &mut store,
         )
         .expect("masked writeback row")
+        .0
     };
 
     // Two rows, UNEQUAL completion lengths.
@@ -608,7 +618,7 @@ fn rubric_batched_writeback_matches_per_row_masked_writeback() {
     let trainable = trainable_ids(&store, &student);
     let mut optimizer = AdamW::new(1.0e-3, (0.9, 0.999), 1.0e-8, 0.0);
     let vocab = student.config().vocab_size;
-    let batched = rubric_writeback_ce_step_batched(
+    let batched = batched_writeback_ce_step(
         &student,
         &all_params,
         &trainable,
@@ -648,7 +658,7 @@ fn rubric_batched_writeback_checkpoint_branch_matches_full_tape() {
         let trainable = trainable_ids(&store, &student);
         let mut optimizer = AdamW::new(1.0e-3, (0.9, 0.999), 1.0e-8, 0.0);
         let vocab = student.config().vocab_size;
-        rubric_writeback_ce_step_batched(
+        batched_writeback_ce_step(
             &student,
             &all_params,
             &trainable,

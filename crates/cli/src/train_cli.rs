@@ -1501,7 +1501,7 @@ fn run_opd_from_dirs(args: TrainOpdArgs) -> Result<()> {
     use autograd::{Tape, optim::AdamW};
     use train::{
         lora::LoraConfig,
-        opd::{GkdLossConfig, OpdStepConfig, opd_step_with_teacher_forward_profiled_gkd_anchor},
+        opd::{GkdLossConfig, OpdStepConfig, OpdStepInputs, opd_step_with_teacher},
         qwen35_loader::{load_qwen35_from_hf_dir, load_qwen35_lora_from_hf_dir_with_layer_start},
     };
 
@@ -1755,31 +1755,33 @@ fn run_opd_from_dirs(args: TrainOpdArgs) -> Result<()> {
                 student,
                 lora_config: lora,
             });
-        let outcome = opd_step_with_teacher_forward_profiled_gkd_anchor(
+        let inputs = OpdStepInputs::new(
             &student,
             &teacher_forward,
             prompt_ids,
             step_cfg.clone(),
             &student_params,
+        )
+        .gkd(GkdLossConfig {
+            lambda: args.gkd_lambda,
+            sft_anchor,
+            corpus_tokens,
+            kl_chunk_size: GkdLossConfig::default().kl_chunk_size,
+            kl_direction,
+            kl_temperature: args.kl_temperature,
+            kl_beta: args.kl_beta,
+            teacher_topk: args.teacher_topk,
+            fused_distill: args.fused_distill && !args.no_fused_distill,
+            logits_window_size: opd_logits_window_size_arg(args.logits_window_size),
+            kl_mask,
+        });
+        #[cfg(feature = "cuda")]
+        let inputs = inputs.infer_rollout(infer_rollout);
+        let outcome = opd_step_with_teacher(
+            inputs,
             &mut optimizer,
             &mut store,
             &mut tape,
-            GkdLossConfig {
-                lambda: args.gkd_lambda,
-                sft_anchor,
-                corpus_tokens,
-                kl_chunk_size: GkdLossConfig::default().kl_chunk_size,
-                kl_direction,
-                kl_temperature: args.kl_temperature,
-                kl_beta: args.kl_beta,
-                teacher_topk: args.teacher_topk,
-                fused_distill: args.fused_distill && !args.no_fused_distill,
-                logits_window_size: opd_logits_window_size_arg(args.logits_window_size),
-                kl_mask,
-            },
-            None,
-            #[cfg(feature = "cuda")]
-            infer_rollout,
             step_profile.as_mut(),
         )
         .with_context(|| format!("opd step {step} failed"))?;
@@ -1895,10 +1897,7 @@ fn run_opd_from_dirs(args: TrainOpdArgs) -> Result<()> {
 fn run_opd_smoke(args: TrainOpdArgs) -> Result<()> {
     use autograd::{Tape, optim::AdamW};
     use train::{
-        opd::{
-            GkdLossConfig, GkdSftAnchor, OpdStepConfig,
-            opd_step_with_teacher_forward_profiled_gkd_anchor,
-        },
+        opd::{GkdLossConfig, GkdSftAnchor, OpdStepConfig, OpdStepInputs, opd_step_with_teacher},
         qwen35::Qwen35Model,
     };
 
@@ -1957,16 +1956,15 @@ fn run_opd_smoke(args: TrainOpdArgs) -> Result<()> {
     let mut loss_sum = 0.0_f32;
     for step in 1..=args.steps {
         let step_lr = lr_schedule.apply_to_optimizer(&mut optimizer, (step - 1) as u64);
-        let outcome = opd_step_with_teacher_forward_profiled_gkd_anchor(
-            &student,
-            &teacher_forward,
-            &prompt_ids,
-            step_cfg.clone(),
-            &student_params,
-            &mut optimizer,
-            &mut store,
-            &mut tape,
-            GkdLossConfig {
+        let outcome = opd_step_with_teacher(
+            OpdStepInputs::new(
+                &student,
+                &teacher_forward,
+                &prompt_ids,
+                step_cfg.clone(),
+                &student_params,
+            )
+            .gkd(GkdLossConfig {
                 lambda: 0.0,
                 sft_anchor: GkdSftAnchor::StudentRollout,
                 corpus_tokens: None,
@@ -1978,10 +1976,10 @@ fn run_opd_smoke(args: TrainOpdArgs) -> Result<()> {
                 fused_distill: args.fused_distill && !args.no_fused_distill,
                 logits_window_size: opd_logits_window_size_arg(args.logits_window_size),
                 kl_mask,
-            },
-            None,
-            #[cfg(feature = "cuda")]
-            None,
+            }),
+            &mut optimizer,
+            &mut store,
+            &mut tape,
             None,
         )
         .with_context(|| format!("opd step {step} failed"))?;
@@ -2220,7 +2218,7 @@ fn run_rubric_opd_impl(args: TrainRubricOpdArgs) -> Result<()> {
     use train::{
         infer_student::{InferStudent, save_lora_adapters},
         lora::LoraConfig,
-        opd::rubric_writeback_ce_step_batched,
+        opd::batched_writeback_ce_step,
         qwen35_loader::{SharedFrozenBaseEntry, load_qwen35_lora_from_hf_dir_with_shared_base},
         rubric::{bfcl_agentic_rubric, math_rubric},
         rubric_opd::{FlashJudge, RubricOpdConfig, run_rubric_rounds},
@@ -2560,7 +2558,7 @@ fn run_rubric_opd_impl(args: TrainRubricOpdArgs) -> Result<()> {
                         .map_err(|err| anyhow!("decode rollout: {err}"))
                 },
                 |chunk: &[(Vec<u32>, Vec<u32>)]| {
-                    rubric_writeback_ce_step_batched(
+                    batched_writeback_ce_step(
                         student_ref,
                         all_ref,
                         trainable_ref,
@@ -3158,7 +3156,7 @@ fn run_agent_opd_replay(
     use autograd::optim::AdamW;
     use train::{
         ema_self_teacher::EmaSelfTeacher,
-        opd::{gkd_writeback_step, masked_writeback_ce_step_dispatch},
+        opd::{WritebackLoss, gkd_writeback_step, masked_writeback_step},
         qwen35_checkpoint::load_qwen35_lora_adapters,
         qwen35_loader::load_qwen35_lora_from_hf_dir_with_shared_base,
     };
@@ -3334,11 +3332,13 @@ fn run_agent_opd_replay(
                     }
                     step_loss
                 } else {
-                    masked_writeback_ce_step_dispatch(
+                    masked_writeback_step(
+                        WritebackLoss::Ce,
                         &student,
                         all_params.as_slice(),
                         trainable.as_slice(),
                         &mut optimizer,
+                        true,
                         &record.prompt_ids,
                         &record.response_ids,
                         &record.response_mask,
@@ -3348,6 +3348,7 @@ fn run_agent_opd_replay(
                         train::context_parallel::DpContext::from_env(),
                         &mut store,
                     )
+                    .map(|(loss, _, _)| loss)
                     .with_context(|| format!("replay writeback ({:?})", record.label))?
                 };
                 losses.push(loss);
@@ -4058,7 +4059,7 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
 
     use train::{
         lora::LoraConfig,
-        opd::{WritebackLoss, masked_writeback_ce_step_dispatch, masked_writeback_step},
+        opd::{WritebackLoss, masked_writeback_step},
         swe_dataset::SweTask,
     };
 
@@ -4235,7 +4236,7 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
     // Diagnostic: skip the (slow, stochastic) agent rollout and drive ONE masked-CE
     // writeback on a synthetic trajectory of length N, so the writeback's OOM
     // instrumentation fires deterministically. Same call the rollout closure below
-    // makes (masked_writeback_ce_step with the trained student + optimizer + store).
+    // makes (masked_writeback_step with the trained student + optimizer + store).
     if args.synthetic_writeback_seq > 0 {
         let n = args.synthetic_writeback_seq;
         let prompt_len = 256.min(n / 2);
@@ -4264,40 +4265,24 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
         let cp = train::context_parallel::CpContext::from_env();
         let dp = train::context_parallel::DpContext::from_env();
         let fd_target = std::env::var("ARLE_OPD_FD_PARAM").ok();
-        let loss = if fd_target.is_some() {
-            masked_writeback_step(
-                WritebackLoss::Ce,
-                &student,
-                all_params.as_slice(),
-                trainable.as_slice(),
-                &mut optimizer,
-                false,
-                &prompt_ids,
-                &response_ids,
-                &response_mask,
-                vocab,
-                args.writeback_window,
-                cp,
-                dp,
-                &mut store,
-            )?
-            .0
-        } else {
-            masked_writeback_ce_step_dispatch(
-                &student,
-                all_params.as_slice(),
-                trainable.as_slice(),
-                &mut optimizer,
-                &prompt_ids,
-                &response_ids,
-                &response_mask,
-                vocab,
-                args.writeback_window,
-                cp,
-                dp,
-                &mut store,
-            )?
-        };
+        // The FD probe reads raw grads, so it must not let the optimizer move them.
+        let loss = masked_writeback_step(
+            WritebackLoss::Ce,
+            &student,
+            all_params.as_slice(),
+            trainable.as_slice(),
+            &mut optimizer,
+            fd_target.is_none(),
+            &prompt_ids,
+            &response_ids,
+            &response_mask,
+            vocab,
+            args.writeback_window,
+            cp,
+            dp,
+            &mut store,
+        )?
+        .0;
         log_opd_vram("synthetic-writeback post-writeback", &train_backend);
         if let Some(target) = fd_target {
             synthetic_writeback_fd_probe(
@@ -5135,8 +5120,8 @@ fn run_self_opd_from_dir(args: TrainSelfOpdArgs) -> Result<()> {
         ema_self_teacher::EmaSelfTeacher,
         lora::LoraConfig,
         opd::{
-            GkdLossConfig, GkdSftAnchor, OpdKlMask, OpdStepConfig,
-            opd_step_with_teacher_forward_profiled_gkd_anchor,
+            GkdLossConfig, GkdSftAnchor, OpdKlMask, OpdStepConfig, OpdStepInputs,
+            opd_step_with_teacher,
         },
         qwen35_loader::load_qwen35_lora_from_hf_dir,
     };
@@ -5246,31 +5231,33 @@ fn run_self_opd_from_dir(args: TrainSelfOpdArgs) -> Result<()> {
             });
         let outcome = {
             let teacher = ema.as_teacher();
-            opd_step_with_teacher_forward_profiled_gkd_anchor(
+            let inputs = OpdStepInputs::new(
                 &student,
                 &teacher,
                 &prompt_ids,
                 step_cfg.clone(),
                 &student_trainable,
+            )
+            .gkd(GkdLossConfig {
+                lambda: args.gkd_lambda,
+                sft_anchor: GkdSftAnchor::StudentRollout,
+                corpus_tokens: None,
+                kl_chunk_size: GkdLossConfig::default().kl_chunk_size,
+                kl_direction,
+                kl_temperature: args.kl_temperature,
+                kl_beta: args.kl_beta,
+                teacher_topk: args.teacher_topk,
+                fused_distill: args.fused_distill,
+                logits_window_size: None,
+                kl_mask: OpdKlMask::CompletionOnly,
+            });
+            #[cfg(feature = "cuda")]
+            let inputs = inputs.infer_rollout(infer_rollout);
+            opd_step_with_teacher(
+                inputs,
                 &mut optimizer,
                 &mut store,
                 &mut tape,
-                GkdLossConfig {
-                    lambda: args.gkd_lambda,
-                    sft_anchor: GkdSftAnchor::StudentRollout,
-                    corpus_tokens: None,
-                    kl_chunk_size: GkdLossConfig::default().kl_chunk_size,
-                    kl_direction,
-                    kl_temperature: args.kl_temperature,
-                    kl_beta: args.kl_beta,
-                    teacher_topk: args.teacher_topk,
-                    fused_distill: args.fused_distill,
-                    logits_window_size: None,
-                    kl_mask: OpdKlMask::CompletionOnly,
-                },
-                None,
-                #[cfg(feature = "cuda")]
-                infer_rollout,
                 step_profile.as_mut(),
             )
             .with_context(|| format!("self-opd step {step} failed"))?
@@ -5404,8 +5391,8 @@ fn run_self_opd_smoke(args: TrainSelfOpdArgs) -> Result<()> {
         ema_self_teacher::EmaSelfTeacher,
         lora::LoraConfig,
         opd::{
-            GkdLossConfig, GkdSftAnchor, OpdKlMask, OpdStepConfig,
-            opd_step_with_teacher_forward_profiled_gkd_anchor,
+            GkdLossConfig, GkdSftAnchor, OpdKlMask, OpdStepConfig, OpdStepInputs,
+            opd_step_with_teacher,
         },
         qwen35::Qwen35Model,
     };
@@ -5459,16 +5446,15 @@ fn run_self_opd_smoke(args: TrainSelfOpdArgs) -> Result<()> {
         let _step_lr = lr_schedule.apply_to_optimizer(&mut optimizer, (step - 1) as u64);
         let outcome = {
             let teacher = ema.as_teacher();
-            opd_step_with_teacher_forward_profiled_gkd_anchor(
-                &student,
-                &teacher,
-                &prompt_ids,
-                step_cfg.clone(),
-                &student_trainable,
-                &mut optimizer,
-                &mut store,
-                &mut tape,
-                GkdLossConfig {
+            opd_step_with_teacher(
+                OpdStepInputs::new(
+                    &student,
+                    &teacher,
+                    &prompt_ids,
+                    step_cfg.clone(),
+                    &student_trainable,
+                )
+                .gkd(GkdLossConfig {
                     lambda: args.gkd_lambda,
                     sft_anchor: GkdSftAnchor::StudentRollout,
                     corpus_tokens: None,
@@ -5480,10 +5466,10 @@ fn run_self_opd_smoke(args: TrainSelfOpdArgs) -> Result<()> {
                     fused_distill: args.fused_distill,
                     logits_window_size: None,
                     kl_mask: OpdKlMask::CompletionOnly,
-                },
-                None,
-                #[cfg(feature = "cuda")]
-                None,
+                }),
+                &mut optimizer,
+                &mut store,
+                &mut tape,
                 None,
             )
             .with_context(|| format!("self-opd smoke step {step} failed"))?
