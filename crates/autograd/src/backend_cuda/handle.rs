@@ -414,14 +414,13 @@ impl CudaBackend {
     pub(super) fn copy_bf16_device_ptr_to_local(
         &self,
         src_device_ptr: u64,
+        src_stream: u64,
         len: usize,
     ) -> Result<CudaSlice<u16>> {
-        let mut staging = self
-            .stream
-            .alloc_zeros::<u16>(len)
-            .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (bf16 bridge)"))?;
         if len == 0 {
-            return Ok(staging);
+            return self.stream.alloc_zeros::<u16>(0).map_err(|_| {
+                AutogradError::TapeInvariant("cuda alloc_zeros failed (bf16 bridge)")
+            })?;
         }
 
         let byte_count =
@@ -429,38 +428,74 @@ impl CudaBackend {
                 .ok_or(AutogradError::TapeInvariant(
                     "bf16 bridge byte count overflow",
                 ))?;
-        {
+
+        if src_stream == 0 {
+            // No source stream to order against: sync copy, then drain the
+            // context so the foreign owner's `cuMemFreeAsync` cannot race it.
+            let mut staging = self.stream.alloc_zeros::<u16>(len).map_err(|_| {
+                AutogradError::TapeInvariant("cuda alloc_zeros failed (bf16 bridge)")
+            })?;
             let (dst_ptr, _dst_guard) = staging.device_ptr_mut(&self.stream);
-            // SAFETY: dst spans `staging`'s len*2 = byte_count bytes (`_dst_guard` held); the
-            // caller guarantees src_device_ptr covers byte_count bytes until the sync below.
-            let status = unsafe {
-                cuMemcpyDtoD_v2(
+            // SAFETY: dst spans byte_count bytes (`_dst_guard` held); the caller
+            // guarantees src_device_ptr covers byte_count bytes until the sync.
+            check_cuda_ffi(
+                unsafe {
+                    cuMemcpyDtoD_v2(
+                        dst_ptr as CUdeviceptr,
+                        src_device_ptr as CUdeviceptr,
+                        byte_count,
+                    )
+                },
+                "bf16 bridge D2D",
+            )?;
+            self.stream
+                .context()
+                .synchronize()
+                .map_err(|_| AutogradError::TapeInvariant("cuda D2D bridge sync failed"))?;
+            return Ok(staging);
+        }
+
+        // Stream-ordered path: the copy runs on the source stream (after the
+        // producer's kernels), and this backend's stream waits on a completion
+        // event. The source's later `cuMemFreeAsync` on the same stream is
+        // ordered after the copy, so the foreign owner may free as soon as this
+        // returns. Staging is uninitialized because the copy overwrites every
+        // element; `alloc_zeros` would memset on this stream and race the copy.
+        let mut staging = self
+            .stream
+            .alloc::<u16>(len)
+            .map_err(|_| AutogradError::TapeInvariant("cuda alloc failed (bf16 bridge)"))?;
+        let (dst_ptr, _dst_guard) = staging.device_ptr_mut(&self.stream);
+        // SAFETY: dst spans byte_count bytes (`_dst_guard` held); the caller
+        // guarantees src_device_ptr covers byte_count bytes and src_stream is a
+        // valid stream in this context whose queued work produced the source.
+        check_cuda_ffi(
+            unsafe {
+                cuMemcpyDtoDAsync_v2(
                     dst_ptr as CUdeviceptr,
                     src_device_ptr as CUdeviceptr,
                     byte_count,
+                    src_stream as CUstream,
                 )
-            };
-            if status != CUresult::CUDA_SUCCESS {
-                return Err(AutogradError::TapeInvariant(
-                    "cuda D2D copy failed (bf16 bridge)",
-                ));
-            }
-        };
-        // `cuMemcpyDtoD_v2` issues on the per-thread default stream, which is
-        // NOT host-blocking when the context disables event tracking (the OPD
-        // infer/train contexts do — see `DeviceContext::on_device`). The source
-        // pointer belongs to a *foreign* allocator (the infer engine's logits
-        // buffer); its owner frees it via `cuMemFreeAsync` as soon as this
-        // bridge returns. Without a fence the async free races the still-running
-        // D2D read → use-after-free / CUDA_ERROR_ILLEGAL_ADDRESS at the next
-        // sync (confirmed by compute-sanitizer: "Use-after-free ... accessed
-        // after it is free'd" at cuMemcpyDtoD_v2 vs cuMemFreeAsync, and the
-        // fault vanishes under CUDA_LAUNCH_BLOCKING=1). Drain the copy before
-        // the source can be freed.
-        self.stream
+            },
+            "bf16 bridge D2D async",
+        )?;
+        // Record the copy's completion on the source stream, then make this
+        // backend's stream wait for it. The event drops after the wait is
+        // enqueued; the driver defers destruction until the wait completes.
+        let event = self
+            .stream
             .context()
-            .synchronize()
-            .map_err(|_| AutogradError::TapeInvariant("cuda D2D bridge sync failed"))?;
+            .new_event(None)
+            .map_err(|_| AutogradError::TapeInvariant("bf16 bridge event create failed"))?;
+        // SAFETY: event and src_stream are valid in this (primary) context.
+        check_cuda_ffi(
+            unsafe { cuEventRecord(event.cu_event(), src_stream as CUstream) },
+            "bf16 bridge event record",
+        )?;
+        self.stream
+            .wait(&event)
+            .map_err(|_| AutogradError::TapeInvariant("bf16 bridge stream wait failed"))?;
         Ok(staging)
     }
 
@@ -711,6 +746,7 @@ pub(super) fn cuda_upload_fp8_block_scaled(
 pub(super) fn cuda_import_bf16_device_ptr_as_f32(
     backend: &CudaBackend,
     src_device_ptr: u64,
+    src_stream: u64,
     len: usize,
     shape: &[usize],
 ) -> Result<DeviceHandle> {
@@ -721,7 +757,7 @@ pub(super) fn cuda_import_bf16_device_ptr_as_f32(
             size: shape_size(shape),
         });
     }
-    let staging = backend.copy_bf16_device_ptr_to_local(src_device_ptr, len)?;
+    let staging = backend.copy_bf16_device_ptr_to_local(src_device_ptr, src_stream, len)?;
     let f32_slice = backend.import_local_bf16_as_f32(&staging, len)?;
     Ok(DeviceHandle::Cuda(CudaStorage::new(f32_slice)))
 }

@@ -201,3 +201,29 @@ hedge if partial adoption ever makes sense.
 | KernelFamily | Pattern only | Revisit when variant selection grows |
 | Rust-to-PTX compiler | Reject | Re-evaluate on a measured FFI tax or a stream of new training kernels |
 | Intrinsics catalog, gemm_sol_final | Reference | Use as documentation |
+
+## Outcome (2026-08-14)
+
+Site 1 (the bf16 teacher-logits bridge) shipped, but the implementation
+diverged from the limbo design above. Reading the actual free path showed
+that cudarc's `CudaSlice::drop` frees on the slice's own stream
+(`cuMemFreeAsync(ptr, slice.stream)`), so the source buffer's free is already
+stream-ordered. The correct fix is therefore cheaper than a limbo: enqueue the
+D2D copy on the source stream (ordered after the producer lm_head GEMM),
+record a completion event, and make the student stream wait on it. The
+source's later free is ordered after the copy on the same stream. No host
+sync, no limbo, ~40 LOC. A `src_stream == 0` fallback keeps the legacy sync
+path for callers without a source stream. See
+`docs/experience/wins/2026-08-14-bf16-bridge-event-ordered.md` (pending-remote
+bench).
+
+Site 2 (`release_kv_pool`) was not changed. Its two syncs are entangled with
+the OPD phase machine and VRAM accounting (the trim makes freed pool bytes
+visible to the co-resident student), and the load-bearing behavior was
+measured by the original author. Removing them blind (no GPU on the dev box)
+risks OOM in training; it needs a pod A/B of its own.
+
+The limbo pattern itself remains unbuilt. It solves a different problem
+(cancelled futures) that ARLE does not have; the two sync sites were both
+better addressed by stream ordering.
+
