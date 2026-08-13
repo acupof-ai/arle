@@ -6,7 +6,6 @@ use cuda_kernels::tensor::{WeightFormat, cache_ptr};
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut, sys::CUevent_flags};
 use half::bf16;
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
@@ -40,12 +39,6 @@ struct QwenFp8DenseScratch {
 struct QwenFp8DequantScratch {
     weight_bf16: Option<CudaSlice<bf16>>,
     capacity: usize,
-    // Cache of dequantized BF16 weights, keyed by the original quantized weight
-    // pointer. Only used for W4A16 prefill on sm<9: dequant is the dominant
-    // cost, so caching the smaller projections (attention qkv/o) avoids
-    // re-dequantizing them on every prefill. Larger MLP weights are not cached
-    // (they would exceed VRAM).
-    w4a16_fp16_cache: HashMap<u64, CudaSlice<bf16>>,
 }
 
 thread_local! {

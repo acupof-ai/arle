@@ -429,28 +429,6 @@ impl Qwen35Model {
         let v_pool_ptr = pool.v_ptr(full_idx, &self.ctx.stream);
 
         {
-            #[cfg(test)]
-            let prep_capture = if !decode && meta.batch == 1 {
-                prep_probe::begin(
-                    &self.ctx,
-                    full_idx,
-                    rows,
-                    self.local_q_heads,
-                    self.local_kv_heads,
-                    c.head_dim,
-                    c.rotary_dim,
-                    c.rms_norm_eps,
-                    &q_full.data,
-                    &k_batch.data,
-                    &attn.q_norm,
-                    &attn.k_norm,
-                    &self.cos_cache,
-                    &self.sin_cache,
-                    &meta.start_positions,
-                )?
-            } else {
-                None
-            };
             let (qf_ptr, _g0) = q_full.data.device_ptr(&self.ctx.stream);
             let (k_ptr, _g1) = k_batch.data.device_ptr(&self.ctx.stream);
             let (v_ptr, _g2) = v_batch.data.device_ptr(&self.ctx.stream);
@@ -538,8 +516,6 @@ impl Qwen35Model {
                     },
                 )?;
             }
-            #[cfg(test)]
-            prep_probe::finish(&self.ctx, prep_capture, q_prepped)?;
         }
 
         // For quantized pools: BF16 work buffer → quantized data buffer.
@@ -584,28 +560,6 @@ impl Qwen35Model {
         }
 
         {
-            #[cfg(test)]
-            let attn_capture = if !decode && meta.batch == 1 {
-                attn_probe::begin(
-                    &self.ctx,
-                    full_idx,
-                    rows,
-                    self.local_q_heads,
-                    self.local_kv_heads,
-                    c.head_dim,
-                    c.rotary_dim,
-                    &q_prepped.data,
-                    &k_batch.data,
-                    &v_batch.data,
-                    &attn.k_norm,
-                    &self.cos_cache,
-                    &self.sin_cache,
-                    c.rms_norm_eps,
-                    &meta.start_positions,
-                )?
-            } else {
-                None
-            };
             let (bsz, total_q, max_q) =
                 (meta.batch as i32, meta.total_q as i32, meta.seq_len as i32);
             let (q_indptr_ptr, _g1) = meta.q_indptr.device_ptr(&self.ctx.stream);
@@ -930,8 +884,6 @@ impl Qwen35Model {
                     },
                 )?;
             }
-            #[cfg(test)]
-            attn_probe::finish(&self.ctx, attn_capture, attn_out)?;
         }
 
         {
@@ -1450,17 +1402,6 @@ impl Qwen35Model {
             qkv_dim * (c.linear_conv_kernel_dim - 1)
         );
         {
-            #[cfg(test)]
-            let conv_capture = conv_probe::begin(
-                &self.ctx,
-                linear_idx,
-                seq_len,
-                qkv_dim,
-                c.linear_conv_kernel_dim,
-                qkv_in,
-                &attn.conv1d_weight,
-                conv_state,
-            )?;
             {
                 let (x_ptr, _g0) = qkv_in.device_ptr(&self.ctx.stream);
                 let (w_ptr, _g1) = attn.conv1d_weight.data.device_ptr(&self.ctx.stream);
@@ -1492,8 +1433,6 @@ impl Qwen35Model {
                     },
                 )?;
             }
-            #[cfg(test)]
-            conv_probe::finish(&self.ctx, conv_capture, qkv_conv, conv_state)?;
         }
 
         // Gated-delta rule. Decode (seq_len==1) is always the recurrent
@@ -1626,22 +1565,6 @@ impl Qwen35Model {
         }
         if !use_fq_chunked {
             let gdr_state = &mut slot.gdr_states[linear_idx];
-            #[cfg(test)]
-            let gdr_capture = gdr_probe::begin(
-                &self.ctx,
-                linear_idx,
-                seq_len,
-                self.local_linear_k_heads,
-                self.local_linear_v_heads,
-                c.linear_key_head_dim,
-                c.linear_value_head_dim,
-                qkv_conv,
-                b_in,
-                a_in,
-                &attn.dt_bias,
-                &attn.a_log,
-                gdr_state,
-            )?;
             {
                 let (qkv_ptr, _g0) = qkv_conv.device_ptr(&self.ctx.stream);
                 let (b_ptr, _g1) = b_in.device_ptr(&self.ctx.stream);
@@ -1697,8 +1620,6 @@ impl Qwen35Model {
                     },
                 )?;
             }
-            #[cfg(test)]
-            gdr_probe::finish(&self.ctx, gdr_capture, gdr_out, gdr_state)?;
         }
         Ok(())
     }

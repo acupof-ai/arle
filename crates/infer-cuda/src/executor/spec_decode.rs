@@ -4,7 +4,6 @@
 //! the chain in one target pass, then matches target top-1 against those
 //! candidates. `topk` does not add verify rows on this path.
 
-
 use anyhow::{Result, anyhow, ensure};
 
 use crate::dsv4::SpecVerifySchedule;
@@ -53,13 +52,11 @@ pub(super) fn route_decode(spec_kind: SpecKind, n_rows: usize, gate: usize) -> D
 /// matching acceptance rate the gate runs a warm no-spec step instead so
 /// typical prompts stop paying the speculation tax.
 
-
 /// Minimum running accept-rate EMA to keep speculating. Default 0.55 = the dt=3
 /// break-even on 8xH20 TP4 (t_mtp ~68ms / t_nospec ~26ms => need >2.6 tok/step =>
 /// accept >~0.55). Override with `--mtp-min-accept` for other depths.
 /// ponytail: a fixed depth-tuned threshold; upgrade path is to self-calibrate
 /// from measured step times.
-
 
 /// Force one real spec step after this many consecutive gated skips, to refresh
 /// the acceptance EMA — else a dip below threshold never recovers (no new accept
