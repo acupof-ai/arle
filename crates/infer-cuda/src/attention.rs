@@ -223,7 +223,7 @@ pub(crate) fn commit_layer_fold(
                 .indexer
                 .as_ref()
                 .ok_or_else(|| anyhow!("DSv4 commit fold: CSA layer without indexer weights"))?;
-            let use_official_dsa = dsv4_dsa_official_enabled()?;
+            let use_official_dsa = true;
             let indexer_rope_original_seq_len = if use_official_dsa {
                 i32::try_from(config.rope_parameters.original_max_position_embeddings)
                     .map_err(|_| anyhow!("DSv4 commit fold indexer rope len overflows i32"))?
@@ -1209,9 +1209,11 @@ fn decode_proj_deepgemm(
     // lane (byte-identical to the original assert seq_len==1); m==n is the
     // batched O-LoRA. The shape contract is the same in both.
     let m = input.seq_len;
+    // Typed-shape contract: `cache.cols == k` is re-checked by
+    // `decode_proj_deepgemm_raw` (along with the buffer-length `>=` bounds these
+    // equalities imply), so only the HiddenStates-dimension assertions live here.
     ensure!(
-        cache.cols == k
-            && cache.rows == out.hidden_dim
+        cache.rows == out.hidden_dim
             && input.hidden_dim == k
             && out.seq_len == m,
         "DSv4 decode_proj_deepgemm shape mismatch: cache {}x{} k={k} m={m} in {}x{} out {}x{}",
@@ -1639,15 +1641,6 @@ pub(crate) fn dsv4_flashmla_decode_enabled() -> Result<bool> {
     Ok(cuda_kernels::HAS_FLASHMLA)
 }
 
-pub(crate) fn dsv4_flashmla_prefill_enabled() -> Result<bool> {
-    // Default ON: vendored FlashMLA sparse prefill replaces the scalar
-    // SW/CSA/HCA attention math. Licensed 2026-06-07 on the TP=8/EP=8 H20 pod:
-    // 4096-token warm prefill 7189 -> 4299 ms, and the 2048-token edge case is
-    // within the legacy same-config floor on both synthetic and real-prose prompts.
-    // Compile-gated via `cuda_kernels::HAS_FLASHMLA`; scalar fallback when absent.
-    Ok(cuda_kernels::HAS_FLASHMLA)
-}
-
 fn dsv4_q8kv8_prefill_enabled() -> Result<bool> {
     // Experimental: fp8 q8kv8 sparse prefill (FlashMLA prefill's fp8 twin).
     // Default OFF; A/B only. Runs on the post-gather global-head Q, so it works
@@ -1655,52 +1648,14 @@ fn dsv4_q8kv8_prefill_enabled() -> Result<bool> {
     Ok(std::env::var("ARLE_DSV4_Q8KV8_PREFILL").as_deref() == Ok("1"))
 }
 
-fn dsv4_fp8_linear_deepgemm_enabled() -> Result<bool> {
-    // Default ON: prefill wq_a|wkv projection fusion routes the shared hidden
-    // activation through FP8 DeepGEMM instead of the scalar FP8 GEMV path. Licensed
-    // 2026-06-07 by the six-shape within-floor gate. Runtime preflight probe
-    // (`cuda_kernels::has_deepgemm_native()`, cached); scalar FP8-GEMV fallback
-    // when native DeepGEMM is not compiled in.
-    Ok(cuda_kernels::has_deepgemm_native())
-}
-
-fn dsv4_decode_proj_deepgemm_enabled() -> bool {
-    // Lever #1 (nsys decode breakdown): route the residual decode projection GEMVs
-    // (wq_b now; wo_a/wo_b next) through tensor-core DeepGEMM instead of the scalar
-    // `dsv4_fp8_gemv_batch` (3.62ms, #1 decode GPU kernel). Default ON: licensed
-    // 2026-06-07 on the TP=8/EP=8 pod, same-load A/B 38.2 -> 39.2 tok/s (+2.5%,
-    // reproduced ×2) with the 37-tok needle retrieved bit-identically (divergence
-    // only in the free-continuation tail = legitimate FP8 numerics).
+/// Native DeepGEMM availability gate for all DSv4 FP8 projection lanes
+/// (prefill wq_a|wkv fusion, decode/prefill residual projections wq_b/wo_a/wo_b,
+/// and the DSA indexer query projection). All four share the same compile-time
+/// feature: `cuda_kernels::has_deepgemm_native()`. Licensed 2026-06-07..09 on the
+/// TP=8/EP=8 H20 pod across prefill (−47% at M=1024) and decode (+2.5% tok/s);
+/// scalar FP8-GEMV fallback when native DeepGEMM is absent.
+fn dsv4_deepgemm_enabled() -> bool {
     cuda_kernels::has_deepgemm_native()
-}
-
-/// Prefill residual projections (wq_b now; wo/indexer next) → tensor-core DeepGEMM
-/// instead of the scalar `dsv4_fp8_gemv_batch` (62% of mla_attn prefill per the P/D
-/// nsys breakdown). Default ON: licensed 2026-06-08 on the TP=8 pod — at M=1024 the
-/// prefill wq_b A/B cut total prefill_ms 14382 → 7628 (−47%) with the needle answer
-/// retrieved byte-identically (scalar fp8_gemv scales O(M); it's a decode GEMV).
-fn dsv4_prefill_proj_deepgemm_enabled() -> bool {
-    cuda_kernels::has_deepgemm_native()
-}
-
-/// Prefill DSA indexer query projection → DeepGEMM (134.9 → 6.05ms, −95.5% at M=1024).
-/// **Default ON (licensed 2026-06-09).** This was the #1 prefill GPU kernel — the
-/// nsys 64K breakdown pinned `dsv4_fp8_gemv_batch_tiled` (this indexer query proj)
-/// at **38.4% of all GPU time** (25ms/call, scalar token-looped GEMV). It feeds the
-/// top-k block SELECTOR, so it was gated OFF pending a planted-answer long-context
-/// needle (an FP8 flip could shift selection). That gate is now MET: with it ON, the
-/// planted needle (738291) **retrieves** — 64K hit `738291` exact, 128K hit `738291`
-/// exact, and every run finds the needle region (selection intact). Same-binary A/B:
-/// 64K prefill 17.6s → 11.0s (−37%), 128K 42.7s → 23.0s (−46%). The exact-digit
-/// borderline at ≥2K is the pre-existing compression-fidelity residual (tracked
-/// separately), NOT a selection break.
-fn dsv4_prefill_indexer_deepgemm_enabled() -> bool {
-    cuda_kernels::has_deepgemm_native()
-}
-
-pub(crate) fn dsv4_dsa_official_enabled() -> Result<bool> {
-    // The vendored/official DSA selector is the only CSA select implementation.
-    Ok(true)
 }
 
 /// #150 opt-in correctness lever (default OFF): `ARLE_DSV4_PROJ_BATCHED_BF16=1`
@@ -1767,7 +1722,7 @@ pub(crate) fn dsv4_flashmla_slot_pages(
     max_seq_len: usize,
     page_block_size: usize,
 ) -> Result<usize> {
-    if !dsv4_flashmla_decode_alloc_enabled()? {
+    if !cuda_kernels::HAS_FLASHMLA {
         return Ok(0);
     }
     let sw_blocks = config.sliding_window.div_ceil(page_block_size);
@@ -1843,10 +1798,6 @@ pub(crate) fn dsv4_flashmla_layer_pool_pages(
 /// fallthrough this replaced sized every slot's band at 0 pages whenever the
 /// decode-kernel flag was off, so admission then rejected almost every
 /// request against the real per-request page need).
-fn dsv4_flashmla_decode_alloc_enabled() -> Result<bool> {
-    Ok(cuda_kernels::HAS_FLASHMLA)
-}
-
 pub(crate) fn dsv4_fused_wqkv_decode_alloc_enabled() -> Result<bool> {
     if env_flag("ARLE_DSV4_FUSED_WQKV_DECODE_ALLOC")? {
         return Ok(true);
@@ -1880,19 +1831,6 @@ fn env_flag(name: &str) -> Result<bool> {
         },
         Err(std::env::VarError::NotPresent) => Ok(false),
         Err(e) => bail!("{name} invalid env: {e}"),
-    }
-}
-
-fn flashmla_mode_int(mode: DeepSeekV4AttentionMode) -> i32 {
-    match mode {
-        DeepSeekV4AttentionMode::CompressedSparse => 1,
-        DeepSeekV4AttentionMode::SlidingWindow | DeepSeekV4AttentionMode::HybridCompressed => 2,
-        // GLM SparseIndexed selects via the indexer top-k over the FULL per-token
-        // latent pool — structurally the CSA sparse index build (uses `selected`),
-        // so it shares the CSA kernel mode_int=1. The V32 MODEL_TYPE (0) is a
-        // separate constant passed to the fwd kernel (DSV4_FLASHMLA_V32), not this.
-        // ponytail: pod-verify SparseIndexed uses the CSA-style (mode_int=1) sparse index build
-        DeepSeekV4AttentionMode::SparseIndexed => 1,
     }
 }
 
@@ -2281,7 +2219,7 @@ fn flashmla_prefill_attention(
     rope_beta_slow: f32,
 ) -> Result<()> {
     ensure!(
-        dsv4_flashmla_prefill_enabled()?,
+        cuda_kernels::HAS_FLASHMLA,
         "DSv4 FlashMLA prefill is not available"
     );
     ensure!(
@@ -2993,9 +2931,16 @@ fn flashmla_decode_attention(
         })?;
     }
 
-    let mode_int = flashmla_mode_int(mode);
     // Indexer modes (CSA + GLM SparseIndexed) feed the per-row top-k `selected`
     // (shared mode_int=1); SW/HCA pass selected_ptr=0.
+    // GLM SparseIndexed selects via the indexer top-k over the FULL per-token
+    // latent pool — structurally the CSA sparse index build (uses `selected`),
+    // so it shares the CSA kernel mode_int=1. The V32 MODEL_TYPE (0) is a
+    // separate constant passed to the fwd kernel (DSV4_FLASHMLA_V32), not this.
+    let mode_int = match mode {
+        DeepSeekV4AttentionMode::CompressedSparse | DeepSeekV4AttentionMode::SparseIndexed => 1,
+        DeepSeekV4AttentionMode::SlidingWindow | DeepSeekV4AttentionMode::HybridCompressed => 2,
+    };
     let selected_ptr_u64 = if mode.has_indexer() {
         let selected =
             selected.ok_or_else(|| anyhow!("DSv4 FlashMLA indexer missing selected topk"))?;
@@ -3702,32 +3647,6 @@ fn mla_rms_norm_decode_slice_into(
     Ok(())
 }
 
-fn run_fused_wqkv_decode(
-    ctx: &DeviceContext,
-    config: &DeepSeekV4Config,
-    attention: &Dsv4Attention,
-    hidden: &HiddenStates,
-    scratch: &mut Dsv4FusedWqkvDecodeScratch,
-) -> Result<(HiddenStates, HiddenStates, HiddenStates)> {
-    // SAFETY: uninit device scratch; fully written before first read.
-    let mut c_q_normed = unsafe { HiddenStates::uninit(ctx, scratch.q_lora_rank, 1)? };
-    // SAFETY: uninit device scratch; fully written before first read.
-    let mut q_raw = unsafe { HiddenStates::uninit(ctx, attention.wq_b.rows, 1)? };
-    // SAFETY: uninit device scratch; fully written before first read.
-    let mut kv_normed = unsafe { HiddenStates::uninit(ctx, scratch.head_dim, 1)? };
-    run_fused_wqkv_decode_into(
-        ctx,
-        config,
-        attention,
-        hidden,
-        scratch,
-        &mut c_q_normed,
-        &mut q_raw,
-        &mut kv_normed,
-    )?;
-    Ok((c_q_normed, q_raw, kv_normed))
-}
-
 #[allow(clippy::too_many_arguments)]
 fn run_fused_wqkv_decode_into(
     ctx: &DeviceContext,
@@ -3848,7 +3767,7 @@ fn run_fused_wqkv_decode_into(
 
     crate::profile::profile_op(ctx, "linear/wq_b", None, 1, || {
         match (
-            dsv4_decode_proj_deepgemm_enabled(),
+            dsv4_deepgemm_enabled(),
             attention.wq_b_deepgemm.as_ref(),
         ) {
             (true, Some(cache)) => {
@@ -5144,11 +5063,27 @@ pub(crate) fn mla_attention_prepare(
         let out =
             crate::profile::profile_op(ctx, "linear/wqkv_a_fused", None, token_count, || {
                 crate::linear_profile::profile(ctx, "dsv4/linear/wqkv_a_fused", || {
-                    run_fused_wqkv_decode(ctx, config, attention, hidden, scratch)
+                    // SAFETY: uninit device scratch; fully written before first read.
+                    let mut c_q_normed = unsafe { HiddenStates::uninit(ctx, scratch.q_lora_rank, 1)? };
+                    // SAFETY: uninit device scratch; fully written before first read.
+                    let mut q_raw = unsafe { HiddenStates::uninit(ctx, attention.wq_b.rows, 1)? };
+                    // SAFETY: uninit device scratch; fully written before first read.
+                    let mut kv_normed = unsafe { HiddenStates::uninit(ctx, scratch.head_dim, 1)? };
+                    run_fused_wqkv_decode_into(
+                        ctx,
+                        config,
+                        attention,
+                        hidden,
+                        scratch,
+                        &mut c_q_normed,
+                        &mut q_raw,
+                        &mut kv_normed,
+                    )?;
+                    Ok((c_q_normed, q_raw, kv_normed))
                 })
             })?;
         out
-    } else if token_count > 1 && dsv4_fp8_linear_deepgemm_enabled()? {
+    } else if token_count > 1 && dsv4_deepgemm_enabled() {
         // SAFETY: uninit device scratch; fully written before first read.
         let mut c_q = unsafe { HiddenStates::uninit(ctx, attention.wq_a.rows, token_count)? };
         // SAFETY: uninit device scratch; fully written before first read.
@@ -5179,7 +5114,7 @@ pub(crate) fn mla_attention_prepare(
             if let Some(cache) = attention
                 .wq_b_deepgemm
                 .as_ref()
-                .filter(|_| dsv4_prefill_proj_deepgemm_enabled())
+                .filter(|_| dsv4_deepgemm_enabled())
             {
                 let scratch = prefill_shared.as_deref_mut().ok_or_else(|| {
                     anyhow!(
@@ -5423,7 +5358,7 @@ pub(crate) fn mla_attention_prepare(
             let indexer = attention.indexer.as_ref().ok_or_else(|| {
                 anyhow::anyhow!("DSv4 layer {layer_idx} is {mode:?} but has no indexer weights")
             })?;
-            let use_official_dsa = dsv4_dsa_official_enabled()?;
+            let use_official_dsa = true;
             let indexer_rope_original_seq_len = if use_official_dsa {
                 i32::try_from(config.rope_parameters.original_max_position_embeddings).map_err(
                     |_| {
@@ -5607,7 +5542,7 @@ pub(crate) fn mla_attention_prepare(
 ///
 /// Routes the projections through the scalar batched [`dsv4_linear`] (FP8 GEMV at
 /// `num_tokens=N`, or bf16 cuBLAS for dense weights) rather than the per-slot
-/// fused-DeepGEMM `run_fused_wqkv_decode` (whose `Dsv4FusedWqkvDecodeScratch` is
+/// fused-DeepGEMM `run_fused_wqkv_decode_into` (whose `Dsv4FusedWqkvDecodeScratch` is
 /// PER-SLOT, sized for a single `m=1` row — it cannot stage an `m=N` batch
 /// without a new model-wide scratch). The batched-GEMV kernel's `(out_row,
 /// token)` grid is row-independent, so each row's projection result is
@@ -5714,7 +5649,7 @@ pub(crate) fn mla_attention_prepare_proj_batch(
     // route with the DenseBf16 weights (dsv4_linear ⇒ gemm_batch) so the n≥2
     // decode arithmetic matches the n=1 lane's.
     let use_deepgemm = attention.mla_proj_bf16.is_none()
-        && dsv4_fp8_linear_deepgemm_enabled()?
+        && dsv4_deepgemm_enabled()
         && attention.wqkv_a_deepgemm.is_some()
         && attention.wq_b_deepgemm.is_some()
         && prefill_shared.is_some();
@@ -5922,7 +5857,7 @@ pub(crate) fn mla_attention_compressor_defer_row(
         let indexer = attention.indexer.as_ref().ok_or_else(|| {
             anyhow!("DSv4 layer {layer_idx} is CompressedSparse but has no indexer weights")
         })?;
-        let use_official_dsa = dsv4_dsa_official_enabled()?;
+        let use_official_dsa = true;
         let indexer_rope_original_seq_len = if use_official_dsa {
             i32::try_from(config.rope_parameters.original_max_position_embeddings).map_err(
                 |_| anyhow!("DSv4 official DSA original_max_position_embeddings overflows i32"),
@@ -6115,7 +6050,7 @@ pub(crate) fn mla_attention_prepare_compressed_only(
             let indexer = attention.indexer.as_ref().ok_or_else(|| {
                 anyhow::anyhow!("DSv4 layer {layer_idx} is {mode:?} but has no indexer weights")
             })?;
-            let use_official_dsa = dsv4_dsa_official_enabled()?;
+            let use_official_dsa = true;
             let indexer_rope_original_seq_len = if use_official_dsa {
                 i32::try_from(config.rope_parameters.original_max_position_embeddings).map_err(
                     |_| {
@@ -6965,13 +6900,13 @@ pub(crate) fn mla_oproj(
     // is the per-row decode lane (byte-identical to the original M=1 path), and
     // token_count==n is the batched FINISH O-LoRA (token-major [n, cols] input).
     let wo_a_decode_dg = shape.groups == 1
-        && dsv4_decode_proj_deepgemm_enabled()
+        && dsv4_deepgemm_enabled()
         && state.fused_wqkv.is_some()
         && attention.wo_a_deepgemm.is_some()
         && prefill_shared.is_none();
     let wo_a_prefill_dg = shape.groups == 1
         && token_count > 1
-        && dsv4_prefill_proj_deepgemm_enabled()
+        && dsv4_deepgemm_enabled()
         && attention.wo_a_deepgemm.is_some()
         && prefill_shared.is_some();
     // Grouped decode DeepGEMM is now M-parametric (gather/GEMM/scatter per group
@@ -6979,13 +6914,13 @@ pub(crate) fn mla_oproj(
     // one grouped-GEMM per group, no per-row loop. Decode lane only (no prefill
     // scratch); grouped prefill stays on its own gate below.
     let wo_a_group_decode_dg = shape.groups > 1
-        && dsv4_decode_proj_deepgemm_enabled()
+        && dsv4_deepgemm_enabled()
         && state.fused_wqkv.is_some()
         && attention.wo_a_group_deepgemm.is_some()
         && prefill_shared.is_none();
     let wo_a_group_prefill_dg = shape.groups > 1
         && token_count > 1
-        && dsv4_prefill_proj_deepgemm_enabled()
+        && dsv4_deepgemm_enabled()
         && attention.wo_a_group_deepgemm.is_some()
         && prefill_shared.is_some();
     if wo_a_decode_dg {
@@ -7079,12 +7014,12 @@ pub(crate) fn mla_oproj(
 
     // wo_b is always a single-group [hidden, o_lora_rank] GEMM, so its decode
     // DeepGEMM lane is M-parametric like wo_a: M=token_count (1 per-row, n batched).
-    let wo_b_decode_dg = dsv4_decode_proj_deepgemm_enabled()
+    let wo_b_decode_dg = dsv4_deepgemm_enabled()
         && state.fused_wqkv.is_some()
         && attention.wo_b_deepgemm.is_some()
         && prefill_shared.is_none();
     let wo_b_prefill_dg = token_count > 1
-        && dsv4_prefill_proj_deepgemm_enabled()
+        && dsv4_deepgemm_enabled()
         && attention.wo_b_deepgemm.is_some()
         && prefill_shared.is_some();
     if wo_b_decode_dg {
@@ -7181,11 +7116,11 @@ fn mla_oproj_decode_graph(
         attention.wo_a.as_ref().expect("DSv4 wo_a").rows
     );
     let wo_a_decode_dg = shape.groups == 1
-        && dsv4_decode_proj_deepgemm_enabled()
+        && dsv4_deepgemm_enabled()
         && state.fused_wqkv.is_some()
         && attention.wo_a_deepgemm.is_some();
     let wo_a_group_decode_dg = shape.groups > 1
-        && dsv4_decode_proj_deepgemm_enabled()
+        && dsv4_deepgemm_enabled()
         && state.fused_wqkv.is_some()
         && attention.wo_a_group_deepgemm.is_some();
     if wo_a_decode_dg {
@@ -7240,7 +7175,7 @@ fn mla_oproj_decode_graph(
         })?;
     }
 
-    let wo_b_decode_dg = dsv4_decode_proj_deepgemm_enabled()
+    let wo_b_decode_dg = dsv4_deepgemm_enabled()
         && state.fused_wqkv.is_some()
         && attention.wo_b_deepgemm.is_some();
     if wo_b_decode_dg {
@@ -8825,7 +8760,7 @@ fn csa_select(
             // Prefill index-query (M=token_count) → DeepGEMM, off the scalar fp8_gemv (the #1
             // remaining projection at M=1024). Decode (seq_len==1) / no-cache stays scalar.
             let indexer_wq_b_dg = c_q_normed.seq_len > 1
-                && dsv4_prefill_indexer_deepgemm_enabled()
+                && dsv4_deepgemm_enabled()
                 && indexer.wq_b_deepgemm.is_some()
                 && prefill_scratch.is_some();
             if indexer_wq_b_dg {

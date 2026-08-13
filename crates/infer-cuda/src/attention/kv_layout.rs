@@ -419,7 +419,7 @@ pub(crate) struct Dsv4KvAdapter {
     /// (overwritten before read each layer step, serial on `ctx.stream`), so one
     /// instance sized for the worst-case layer shape serves every (slot, layer).
     /// Gated by the SAME predicate as the per-slot state alloc
-    /// (`dsv4_flashmla_decode_alloc_enabled`); `None` ⇒ byte-identical to before.
+    /// (`cuda_kernels::HAS_FLASHMLA`); `None` ⇒ byte-identical to before.
     pub(super) flashmla_scratch: Option<Dsv4FlashMlaDecodeScratch>,
     /// One shared FP8 prefill DeepGEMM linear (quantize→GEMM) staging scratch for
     /// ALL layers and slots. Hoisted out of the per-slot `Dsv4LayerAttentionState`
@@ -841,8 +841,8 @@ impl Dsv4KvAdapter {
         // is live; the batched shim now handles both dim mappings.
         // Build the per-layer FlashMLA decode shapes ONCE (shared by the batched
         // scratch and the new single-row shared scratch). Both gate on the same
-        // `dsv4_flashmla_decode_alloc_enabled` predicate as the per-slot state.
-        let (flashmla_batch, flashmla_scratch) = if dsv4_flashmla_decode_alloc_enabled()? {
+        // `cuda_kernels::HAS_FLASHMLA` predicate as the per-slot state.
+        let (flashmla_batch, flashmla_scratch) = if cuda_kernels::HAS_FLASHMLA {
             let layer_shapes = layer_specs
                 .iter()
                 .map(|&(mode, compress_ratio, local_heads)| {
@@ -1477,7 +1477,7 @@ impl Dsv4LayerKvLayout {
         num_slots: usize,
         pool_tokens: usize,
     ) -> Result<Self> {
-        let (flashmla_slot_pages, flashmla_sw_blocks) = if dsv4_flashmla_decode_alloc_enabled()? {
+        let (flashmla_slot_pages, flashmla_sw_blocks) = if cuda_kernels::HAS_FLASHMLA {
             let shape = Dsv4FlashMlaDecodeShape::new(
                 config,
                 mode,

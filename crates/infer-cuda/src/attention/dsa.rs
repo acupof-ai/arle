@@ -587,13 +587,13 @@ impl Dsv4SpecRingSnapshot {
     /// STATIC predictor of ONE layer's snapshot `device_bytes` — MUST mirror
     /// `alloc_spec_ring_snapshot`. `sw_slots` is `[head_dim]` bf16; the `[bytes_per_token]`
     /// u8 `fp8_slots` exists iff the layer has a FlashMLA decode state (the uniform
-    /// `dsv4_flashmla_decode_alloc_enabled` gate). Feeds `per_slot_device_bytes`.
+    /// `cuda_kernels::HAS_FLASHMLA` gate). Feeds `per_slot_device_bytes`.
     pub(crate) fn device_bytes_for(
         config: &DeepSeekV4Config,
         kv_arena: &Dsv4MlaKvArena,
     ) -> Result<usize> {
         let bf16 = std::mem::size_of::<half::bf16>();
-        let fp8 = if super::dsv4_flashmla_decode_alloc_enabled()? {
+        let fp8 = if cuda_kernels::HAS_FLASHMLA {
             kv_arena.bytes_per_token
         } else {
             0
@@ -802,7 +802,7 @@ impl Dsv4LayerAttentionState {
         } else {
             None
         };
-        let flashmla = if dsv4_flashmla_decode_alloc_enabled()? {
+        let flashmla = if cuda_kernels::HAS_FLASHMLA {
             Some(Dsv4FlashMlaDecodeState::new(
                 ctx,
                 config,
@@ -901,7 +901,7 @@ impl Dsv4LayerAttentionState {
             // key-cache band lives in `Dsv4LayerKvLayout`, budgeted separately).
             total += dsv4_dsa_rotated_keys_bytes(config, index_ratio, max_seq_len);
         }
-        if super::dsv4_flashmla_decode_alloc_enabled()? {
+        if cuda_kernels::HAS_FLASHMLA {
             total += Dsv4FlashMlaDecodeState::device_bytes_estimate();
         }
         if super::dsv4_fused_wqkv_decode_alloc_enabled()? {

@@ -2324,7 +2324,7 @@ impl Dsv4CudaExecutor {
             // The batched verify path requires FlashMLA sparse prefill
             // (`mla_attention` chain-verify lane); without it, fall back to
             // per-slot dispatch (the pre-batch behavior — correct but slower).
-            if crate::attention::dsv4_flashmla_prefill_enabled()? {
+            if cuda_kernels::HAS_FLASHMLA {
                 let tokens = self.dspark_decode_tokens_batched(&batch.rows)?;
                 let mut out = Vec::with_capacity(batch.rows.len());
                 for (row, toks) in batch.rows.iter().zip(tokens) {

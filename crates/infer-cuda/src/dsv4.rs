@@ -2967,7 +2967,7 @@ impl Dsv4Model {
                 // absent), the existing per-row `csa_select_official` +
                 // `gather_selected_row` path runs byte-identically.
                 let use_batched_dsa_select = runs_indexer
-                    && crate::attention::dsv4_dsa_official_enabled()?
+                    && true
                     && kv_adapter
                         .layer_dsa_and_flashmla_batch_mut(layer_idx)?
                         .1
@@ -3163,7 +3163,7 @@ impl Dsv4Model {
                         && let (Some((kv, score)), Some(indexer)) =
                             (indexer_kv_score.as_ref(), layer.attention.indexer.as_ref())
                     {
-                        let use_official_dsa = crate::attention::dsv4_dsa_official_enabled()?;
+                        let use_official_dsa = true;
                         let indexer_rope_original_seq_len = if use_official_dsa {
                             i32::try_from(
                                 self.config.rope_parameters.original_max_position_embeddings,
