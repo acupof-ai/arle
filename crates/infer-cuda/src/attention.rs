@@ -145,13 +145,7 @@ pub(crate) fn commit_layer_fold(
     let m = gathered.seq_len;
     ensure!(m > 0, "DSv4 commit fold needs at least the pending row");
     let head_dim = config.head_dim;
-    let rope = &config.rope_parameters;
-    let (rope_base, original_seq_len) = if compress_ratio > 0 {
-        let osl = rope.original_seq_len_i32()?;
-        (config.compress_rope_theta, osl)
-    } else {
-        (config.rope_theta, 0i32)
-    };
+    let rope = RopeParams::from_config(config, compress_ratio)?;
 
     // Compressor + indexer ingestion (compressor layers only), non-frozen. GLM ships
     // no MTP so SparseIndexed never reaches here - fail loud.
@@ -176,9 +170,11 @@ pub(crate) fn commit_layer_fold(
             head_dim,
             compress_ratio,
             overlap,
-            start_pos,
-            None,
-            original_seq_len,
+            Dsv4Position {
+                start: start_pos,
+                device: None,
+            },
+            rope,
             fp32_scratch.as_deref_mut(),
             None,
             None,
@@ -189,7 +185,6 @@ pub(crate) fn commit_layer_fold(
                 .indexer
                 .as_ref()
                 .ok_or_else(|| anyhow!("DSv4 commit fold: CSA layer without indexer weights"))?;
-            let indexer_rope_original_seq_len = config.rope_parameters.original_seq_len_i32()?;
             let indexer_state = state
                 .indexer
                 .as_mut()
@@ -206,9 +201,11 @@ pub(crate) fn commit_layer_fold(
                 config.index_head_dim,
                 compress_ratio,
                 true,
-                start_pos,
-                None,
-                indexer_rope_original_seq_len,
+                Dsv4Position {
+                    start: start_pos,
+                    device: None,
+                },
+                rope,
                 fp32_scratch,
                 None,
                 None,
@@ -255,8 +252,8 @@ pub(crate) fn commit_layer_fold(
                 config.qk_rope_head_dim as i32,
                 start_pos as i32,
                 config.rms_norm_eps,
-                rope_base,
-                original_seq_len,
+                rope.base,
+                rope.original_seq_len,
                 rope.factor,
                 rope.beta_fast,
                 rope.beta_slow,
@@ -273,8 +270,10 @@ pub(crate) fn commit_layer_fold(
         ctx,
         &mut state.sw_window_cache,
         &k_prepared,
-        start_pos,
-        None,
+        Dsv4Position {
+            start: start_pos,
+            device: None,
+        },
         config,
     )?;
 
@@ -1801,8 +1800,7 @@ fn update_bf16_sw_window(
     ctx: &DeviceContext,
     sw_window_cache: &mut CudaSlice<half::bf16>,
     k_prepared: &HiddenStates,
-    start_pos: usize,
-    start_pos_device: Option<&CudaSlice<i32>>,
+    pos: Dsv4Position<'_>,
     config: &DeepSeekV4Config,
 ) -> Result<()> {
     // GLM pure-SparseIndexed has no window (sliding_window==0) and the window-cache
@@ -1816,7 +1814,7 @@ fn update_bf16_sw_window(
     let (window_ptr, _wg) = sw_window_cache.device_ptr_mut(&ctx.stream);
     // SAFETY: ptrs from live device allocations sized to the dims passed.
     unsafe {
-        if let Some(start_pos_device) = start_pos_device {
+        if let Some(start_pos_device) = pos.device {
             // start_pos lives on device - the host can't tail-slice. Decode/MTP rows
             // are far
             // below the window; oversize here is a bug, not a path.
@@ -1840,7 +1838,7 @@ fn update_bf16_sw_window(
             .result()?;
         } else {
             let skip = k_prepared.seq_len.saturating_sub(config.sliding_window);
-            let start_pos = start_pos + skip;
+            let start_pos = pos.start + skip;
             let rows = k_prepared.seq_len - skip;
             let k_ptr = k_ptr + (skip * config.head_dim * 2) as u64;
             ffi::dsv4_update_window_cache_cuda(
@@ -1928,11 +1926,7 @@ fn flashmla_prefill_attention(
     local_heads: usize,
     local_attn: &mut HiddenStates,
     sm_scale: f32,
-    rope_base: f32,
-    original_seq_len: i32,
-    rope_factor: f32,
-    rope_beta_fast: f32,
-    rope_beta_slow: f32,
+    rope: RopeParams,
 ) -> Result<()> {
     ensure!(
         cuda_kernels::HAS_FLASHMLA,
@@ -2429,11 +2423,11 @@ fn flashmla_prefill_attention(
                             config.head_dim as i32,
                             config.qk_rope_head_dim as i32,
                             pos_ptr as *const i32,
-                            rope_base,
-                            original_seq_len,
-                            rope_factor,
-                            rope_beta_fast,
-                            rope_beta_slow,
+                            rope.base,
+                            rope.original_seq_len,
+                            rope.factor,
+                            rope.beta_fast,
+                            rope.beta_slow,
                             ctx.stream.cu_stream(),
                         )
                         .result()
@@ -2448,11 +2442,11 @@ fn flashmla_prefill_attention(
                             config.head_dim as i32,
                             config.qk_rope_head_dim as i32,
                             start_pos as i32,
-                            rope_base,
-                            original_seq_len,
-                            rope_factor,
-                            rope_beta_fast,
-                            rope_beta_slow,
+                            rope.base,
+                            rope.original_seq_len,
+                            rope.factor,
+                            rope.beta_fast,
+                            rope.beta_slow,
                             ctx.stream.cu_stream(),
                         )
                         .result()
@@ -2467,7 +2461,16 @@ fn flashmla_prefill_attention(
     }
 
     if chain_verify.is_none() {
-        update_bf16_sw_window(ctx, sw_window_cache, k_prepared, start_pos, None, config)?;
+        update_bf16_sw_window(
+            ctx,
+            sw_window_cache,
+            k_prepared,
+            Dsv4Position {
+                start: start_pos,
+                device: None,
+            },
+            config,
+        )?;
     }
 
     // Keep temporaries in scope until every launch using their raw pointers is
@@ -2502,17 +2505,12 @@ fn flashmla_decode_attention(
     flash: &mut Dsv4FlashMlaDecodeState,
     scratch: &mut Dsv4FlashMlaDecodeScratch,
     pool: &mut Dsv4LayerKvLayout,
-    start_pos: usize,
-    start_pos_device: Option<&CudaSlice<i32>>,
+    pos: Dsv4Position<'_>,
     tp: &TpRuntime,
     local_heads: usize,
     local_attn: &mut HiddenStates,
     sm_scale: f32,
-    rope_base: f32,
-    original_seq_len: i32,
-    rope_factor: f32,
-    rope_beta_fast: f32,
-    rope_beta_slow: f32,
+    rope: RopeParams,
 ) -> Result<()> {
     ensure!(
         dsv4_flashmla_decode_enabled()?,
@@ -2523,7 +2521,7 @@ fn flashmla_decode_attention(
         "DSv4 FlashMLA decode requires seq_len == 1, got {}",
         q_prepared.seq_len
     );
-    let start_pos_device = start_pos_device.ok_or_else(|| {
+    let start_pos_device = pos.device.ok_or_else(|| {
         anyhow!("DSv4 FlashMLA decode requires device start_pos for token_count=1")
     })?;
     // The FlashMLA shim reads q[heads, d_qk] and writes out[heads, d_v=512 latent]:
@@ -2848,11 +2846,11 @@ fn flashmla_decode_attention(
                     config.head_dim as i32,
                     config.qk_rope_head_dim as i32,
                     start_ptr as *const i32,
-                    rope_base,
-                    original_seq_len,
-                    rope_factor,
-                    rope_beta_fast,
-                    rope_beta_slow,
+                    rope.base,
+                    rope.original_seq_len,
+                    rope.factor,
+                    rope.beta_fast,
+                    rope.beta_slow,
                     ctx.stream.cu_stream(),
                 )
                 .result()
@@ -2874,14 +2872,7 @@ fn flashmla_decode_attention(
     drop(splits_guard);
     drop(sink_guard);
 
-    update_bf16_sw_window(
-        ctx,
-        sw_window_cache,
-        k_prepared,
-        start_pos,
-        Some(start_pos_device),
-        config,
-    )?;
+    update_bf16_sw_window(ctx, sw_window_cache, k_prepared, pos, config)?;
     Ok(())
 }
 
@@ -3021,15 +3012,13 @@ pub(crate) fn flashmla_decode_finish_row(
     sw_window_cache: &mut CudaSlice<half::bf16>,
     k_prepared: &HiddenStates,
     local_attn: &mut HiddenStates,
-    start_pos: usize,
-    start_pos_device: &CudaSlice<i32>,
+    pos: Dsv4Position<'_>,
     local_heads: usize,
-    rope_base: f32,
-    original_seq_len: i32,
-    rope_factor: f32,
-    rope_beta_fast: f32,
-    rope_beta_slow: f32,
+    rope: RopeParams,
 ) -> Result<()> {
+    let start_pos_device = pos
+        .device
+        .expect("DSv4 flashmla_decode_finish_row requires device start_pos");
     let (out_ptr, out_guard) = local_attn.data.device_ptr_mut(&ctx.stream);
     let (start_ptr, start_guard) = start_pos_device.device_ptr(&ctx.stream);
     {
@@ -3044,11 +3033,11 @@ pub(crate) fn flashmla_decode_finish_row(
                     config.head_dim as i32,
                     config.qk_rope_head_dim as i32,
                     start_ptr as *const i32,
-                    rope_base,
-                    original_seq_len,
-                    rope_factor,
-                    rope_beta_fast,
-                    rope_beta_slow,
+                    rope.base,
+                    rope.original_seq_len,
+                    rope.factor,
+                    rope.beta_fast,
+                    rope.beta_slow,
                     ctx.stream.cu_stream(),
                 )
                 .result()
@@ -3059,14 +3048,7 @@ pub(crate) fn flashmla_decode_finish_row(
     }
     drop(out_guard);
     drop(start_guard);
-    update_bf16_sw_window(
-        ctx,
-        sw_window_cache,
-        k_prepared,
-        start_pos,
-        Some(start_pos_device),
-        config,
-    )?;
+    update_bf16_sw_window(ctx, sw_window_cache, k_prepared, pos, config)?;
     Ok(())
 }
 
@@ -3083,11 +3065,7 @@ pub(crate) fn flashmla_decode_inverse_rope_batched(
     start_pos: &CudaSlice<i32>,
     n: usize,
     local_heads: usize,
-    rope_base: f32,
-    original_seq_len: i32,
-    rope_factor: f32,
-    rope_beta_fast: f32,
-    rope_beta_slow: f32,
+    rope: RopeParams,
 ) -> Result<()> {
     crate::profile::profile_op(ctx, "flashmla_inverse_rope_batched_ptr", None, n, || {
         let (out_ptr, og) = out_ptrs.device_ptr(&ctx.stream);
@@ -3102,11 +3080,11 @@ pub(crate) fn flashmla_decode_inverse_rope_batched(
                 config.head_dim as i32,
                 config.qk_rope_head_dim as i32,
                 start_ptr as *const i32,
-                rope_base,
-                original_seq_len,
-                rope_factor,
-                rope_beta_fast,
-                rope_beta_slow,
+                rope.base,
+                rope.original_seq_len,
+                rope.factor,
+                rope.beta_fast,
+                rope.beta_slow,
                 ctx.stream.cu_stream(),
             )
             .result()
@@ -3444,6 +3422,49 @@ fn run_fused_wqkv_decode_into(
     Ok(())
 }
 
+/// RoPE/YaRN parameters for a layer. Computed once from `config` + `compress_ratio`
+/// and threaded through the attention path. Compressed layers (cr > 0) use
+/// `compress_rope_theta` + YaRN(`original_max_position_embeddings`); pure-SW layers
+/// (cr == 0) use `rope_theta` with no YaRN (`original_seq_len = 0`).
+#[derive(Clone, Copy)]
+pub(crate) struct RopeParams {
+    pub(crate) base: f32,
+    pub(crate) original_seq_len: i32,
+    pub(crate) factor: f32,
+    pub(crate) beta_fast: f32,
+    pub(crate) beta_slow: f32,
+}
+
+impl RopeParams {
+    pub(crate) fn from_config(config: &DeepSeekV4Config, compress_ratio: usize) -> Result<Self> {
+        let rope = &config.rope_parameters;
+        let (base, original_seq_len) = if compress_ratio > 0 {
+            (config.compress_rope_theta, rope.original_seq_len_i32()?)
+        } else {
+            (config.rope_theta, 0i32)
+        };
+        Ok(Self {
+            base,
+            original_seq_len,
+            factor: rope.factor,
+            beta_fast: rope.beta_fast,
+            beta_slow: rope.beta_slow,
+        })
+    }
+}
+
+/// A single row's absolute start position, carried as both a host `usize` (for
+/// host-side math / ring-window indexing) and an optional device `i32` slice
+/// (for kernels that read the position from device memory, e.g. decode/MTP
+/// where the host cannot know the folded position). The two always describe the
+/// same logical position; `device` is `None` on the prefill path where the host
+/// `start` is authoritative.
+#[derive(Clone, Copy)]
+pub(crate) struct Dsv4Position<'a> {
+    pub start: usize,
+    pub device: Option<&'a CudaSlice<i32>>,
+}
+
 /// Prepared-but-not-attended MLA state: the boundary between `mla_attention`'s
 /// per-row PREPARE half (wq/wkv proj + RoPE +, for CSA/HCA, compressor / indexer /
 /// `selected`) and its FWD half (the FlashMLA kernel + O-LoRA). The split lets the
@@ -3460,8 +3481,7 @@ pub(crate) struct Dsv4MlaPrepared {
     pub(crate) selected: Option<CudaSlice<i32>>,
     pub(crate) local_heads: usize,
     pub(crate) sm_scale: f32,
-    pub(crate) rope_base: f32,
-    pub(crate) original_seq_len: i32,
+    pub(crate) rope: RopeParams,
 }
 
 pub(crate) struct Dsv4MlaDecodeScratch {
@@ -3700,8 +3720,7 @@ pub(crate) fn mla_attention(
     mut prefill_shared: Option<&mut Dsv4PrefillDeepGemmLinearScratch>,
     // Shared FP32 probe scratch — contract on `compressor_forward`'s param.
     fp32_scratch: Option<&mut Dsv4CompressorFp32Scratch>,
-    start_pos: usize,
-    start_pos_device: Option<&CudaSlice<i32>>,
+    pos: Dsv4Position<'_>,
     chain_verify: Option<&Dsv4ChainVerifyAttnMeta>,
     tp: &TpRuntime,
     out: &mut HiddenStates,
@@ -3722,8 +3741,7 @@ pub(crate) fn mla_attention(
         dsa_shared,
         prefill_shared.as_deref_mut(),
         fp32_scratch,
-        start_pos,
-        start_pos_device,
+        pos,
         chain_verify,
         tp,
         keepalive,
@@ -3738,8 +3756,7 @@ pub(crate) fn mla_attention(
         pool,
         flashmla_scratch,
         prefill_shared,
-        start_pos,
-        start_pos_device,
+        pos,
         chain_verify,
         tp,
         prepared,
@@ -3758,9 +3775,8 @@ fn compressor_forward_decode(
     head_dim: usize,
     ratio: usize,
     overlap: bool,
-    start_pos: usize,
-    start_pos_device: Option<&CudaSlice<i32>>,
-    rope_original_seq_len: i32,
+    pos: Dsv4Position<'_>,
+    rope: RopeParams,
     kv_scratch: &mut HiddenStates,
     score_scratch: &mut HiddenStates,
     keepalive: &mut Dsv4ForwardKeepalive,
@@ -3796,9 +3812,8 @@ fn compressor_forward_decode(
         head_dim,
         ratio,
         overlap,
-        start_pos,
-        start_pos_device,
-        rope_original_seq_len,
+        pos,
+        rope,
         None,
         Some((&*kv_scratch, &*score_scratch)),
         None,
@@ -3819,8 +3834,7 @@ pub(crate) fn mla_attention_decode(
     pool: &mut Dsv4LayerKvLayout,
     dsa_shared: Option<&mut Dsv4DsaSharedScratch>,
     flashmla_scratch: Option<&mut Dsv4FlashMlaDecodeScratch>,
-    start_pos: usize,
-    start_pos_device: Option<&CudaSlice<i32>>,
+    pos: Dsv4Position<'_>,
     tp: &TpRuntime,
     scratch: &mut Dsv4MlaDecodeScratch,
     out: &mut HiddenStates,
@@ -3838,7 +3852,7 @@ pub(crate) fn mla_attention_decode(
         "DSv4 MODEL1 decode MLA is MODEL1-only; GLM/plain-o uses eager decode"
     );
     ensure!(
-        start_pos_device.is_some(),
+        pos.device.is_some(),
         "DSv4 MODEL1 decode MLA requires device start_pos"
     );
     let head_dim = config.head_dim;
@@ -3881,13 +3895,7 @@ pub(crate) fn mla_attention_decode(
         sink_offset + local_heads
     );
 
-    let rope = &config.rope_parameters;
-    let (rope_base, original_seq_len) = if compress_ratio > 0 {
-        let osl = rope.original_seq_len_i32()?;
-        (config.compress_rope_theta, osl)
-    } else {
-        (config.rope_theta, 0i32)
-    };
+    let rope = RopeParams::from_config(config, compress_ratio)?;
     if dsv4_fused_wqkv_decode_enabled()? {
         let fused = state.fused_wqkv.as_mut().ok_or_else(|| {
             anyhow!("DSv4 fused wqkv decode requested but decode scratch was not allocated")
@@ -3944,7 +3952,7 @@ pub(crate) fn mla_attention_decode(
         let (k_raw_ptr, _kr) = scratch.kv_normed.data.device_ptr(&ctx.stream);
         let (q_out_ptr, _qo) = scratch.q_prepared.data.device_ptr_mut(&ctx.stream);
         let (k_out_ptr, _ko) = scratch.k_prepared.data.device_ptr_mut(&ctx.stream);
-        let start_pos_device = start_pos_device.expect("checked above");
+        let start_pos_device = pos.device.expect("checked above");
         let (start_ptr, _sg) = start_pos_device.device_ptr(&ctx.stream);
         // SAFETY: ptrs from live device allocations sized to the dims passed.
         unsafe {
@@ -3959,8 +3967,8 @@ pub(crate) fn mla_attention_decode(
                 config.qk_rope_head_dim as i32,
                 start_ptr as *const i32,
                 config.rms_norm_eps,
-                rope_base,
-                original_seq_len,
+                rope.base,
+                rope.original_seq_len,
                 rope.factor,
                 rope.beta_fast,
                 rope.beta_slow,
@@ -3990,9 +3998,8 @@ pub(crate) fn mla_attention_decode(
             head_dim,
             compress_ratio,
             compress_ratio < 16,
-            start_pos,
-            start_pos_device,
-            original_seq_len,
+            pos,
+            rope,
             kv,
             score,
             keepalive,
@@ -4032,9 +4039,8 @@ pub(crate) fn mla_attention_decode(
                 config.index_head_dim,
                 compress_ratio,
                 true,
-                start_pos,
-                start_pos_device,
-                config.rope_parameters.original_seq_len_i32()?,
+                pos,
+                rope,
                 kv,
                 score,
                 keepalive,
@@ -4115,8 +4121,7 @@ pub(crate) fn mla_attention_decode(
             pool,
             indexer_rows_before,
             indexer_rows_after,
-            start_pos,
-            start_pos_device,
+            pos,
             compress_ratio,
             csa_q_i,
             csa_weights,
@@ -4154,17 +4159,12 @@ pub(crate) fn mla_attention_decode(
         flash,
         flash_scratch,
         pool,
-        start_pos,
-        start_pos_device,
+        pos,
         tp,
         local_heads,
         &mut scratch.local_attn,
         sm_scale,
-        rope_base,
-        original_seq_len,
-        rope.factor,
-        rope.beta_fast,
-        rope.beta_slow,
+        rope,
     )?;
 
     mla_oproj_decode(
@@ -4384,8 +4384,7 @@ pub(crate) fn mla_attention_prepare(
     mut prefill_shared: Option<&mut Dsv4PrefillDeepGemmLinearScratch>,
     // Shared FP32 probe scratch — contract on `compressor_forward`'s param.
     mut fp32_scratch: Option<&mut Dsv4CompressorFp32Scratch>,
-    start_pos: usize,
-    start_pos_device: Option<&CudaSlice<i32>>,
+    pos: Dsv4Position<'_>,
     chain_verify: Option<&Dsv4ChainVerifyAttnMeta>,
     tp: &TpRuntime,
     keepalive: &mut Dsv4ForwardKeepalive,
@@ -4451,21 +4450,15 @@ pub(crate) fn mla_attention_prepare(
         sink_offset + local_heads
     );
 
-    let rope = &config.rope_parameters;
     // RoPE base/YaRN is PER-LAYER, matching SGLang (deepseek_v4.py:271): compressed
     // layers (CSA cr=4 / HCA cr=128) rope Q, SW-K, the output inverse-rope AND the
     // compressor with compress_rope_theta + YaRN(original_max_position_embeddings);
     // pure-SW layers (cr=0) use rope_theta with no YaRN. Q MUST share the
     // compressed-key theta or Q*compressed-K phase mismatches and long context
     // (>~80 tok) collapses to garbage.
-    let (rope_base, original_seq_len) = if compress_ratio > 0 {
-        let osl = rope.original_seq_len_i32()?;
-        (config.compress_rope_theta, osl)
-    } else {
-        (config.rope_theta, 0i32)
-    };
-    let start_pos_i32 = i32::try_from(start_pos)
-        .map_err(|_| anyhow::anyhow!("DSv4 MLA start_pos {start_pos} overflows i32"))?;
+    let rope = RopeParams::from_config(config, compress_ratio)?;
+    let start_pos_i32 = i32::try_from(pos.start)
+        .map_err(|_| anyhow::anyhow!("DSv4 MLA start_pos {} overflows i32", pos.start))?;
 
     // Q/KV LoRA: the fused wq_a|wkv weight cache when native DeepGEMM is available,
     // else the scalar reference order.
@@ -4631,15 +4624,15 @@ pub(crate) fn mla_attention_prepare(
                     config.qk_rope_head_dim as i32,
                     start_ptr as *const i32,
                     config.rms_norm_eps,
-                    rope_base,
-                    original_seq_len,
+                    rope.base,
+                    rope.original_seq_len,
                     rope.factor,
                     rope.beta_fast,
                     rope.beta_slow,
                     ctx.stream.cu_stream(),
                 )
                 .result()?;
-            } else if let Some(start_pos_device) = start_pos_device {
+            } else if let Some(start_pos_device) = pos.device {
                 let (start_ptr, _sg) = start_pos_device.device_ptr(&ctx.stream);
                 ffi::dsv4_prepare_qk_start_pos_ptr_cuda(
                     q_raw_ptr as *const ffi::Half,
@@ -4652,8 +4645,8 @@ pub(crate) fn mla_attention_prepare(
                     config.qk_rope_head_dim as i32,
                     start_ptr as *const i32,
                     config.rms_norm_eps,
-                    rope_base,
-                    original_seq_len,
+                    rope.base,
+                    rope.original_seq_len,
                     rope.factor,
                     rope.beta_fast,
                     rope.beta_slow,
@@ -4672,8 +4665,8 @@ pub(crate) fn mla_attention_prepare(
                     config.qk_rope_head_dim as i32,
                     start_pos_i32,
                     config.rms_norm_eps,
-                    rope_base,
-                    original_seq_len,
+                    rope.base,
+                    rope.original_seq_len,
                     rope.factor,
                     rope.beta_fast,
                     rope.beta_slow,
@@ -4727,12 +4720,8 @@ pub(crate) fn mla_attention_prepare(
                     head_dim,
                     compress_ratio,
                     overlap,
-                    start_pos,
-                    start_pos_device,
-                    // YaRN on for compressed layers (matches Q/SW-K + SGLang compressor
-                    // freqs_cis);
-                    // original_seq_len = orig_max_pos here.
-                    original_seq_len,
+                    pos,
+                    rope,
                     fp32_scratch.as_deref_mut(),
                     None,
                     None,
@@ -4743,7 +4732,6 @@ pub(crate) fn mla_attention_prepare(
 
         if mode.has_indexer() {
             let indexer = attention.indexer();
-            let indexer_rope_original_seq_len = config.rope_parameters.original_seq_len_i32()?;
             let indexer_rows_before = state
                 .indexer
                 .as_ref()
@@ -4773,9 +4761,8 @@ pub(crate) fn mla_attention_prepare(
                         config.index_head_dim,
                         compress_ratio,
                         true,
-                        start_pos,
-                        start_pos_device,
-                        indexer_rope_original_seq_len,
+                        pos,
+                        rope,
                         fp32_scratch,
                         None,
                         None,
@@ -4791,7 +4778,7 @@ pub(crate) fn mla_attention_prepare(
                         indexer,
                         hidden,
                         indexer_state,
-                        start_pos,
+                        pos.start,
                         keepalive,
                     )?;
                 }
@@ -4840,7 +4827,7 @@ pub(crate) fn mla_attention_prepare(
                 index_keys,
                 keys_capacity,
                 if mode == DeepSeekV4AttentionMode::SparseIndexed {
-                    start_pos
+                    pos.start
                 } else {
                     0
                 },
@@ -4849,8 +4836,7 @@ pub(crate) fn mla_attention_prepare(
                 pool,
                 indexer_rows_before,
                 indexer_rows_after,
-                start_pos,
-                start_pos_device,
+                pos,
                 index_ratio,
                 prefill_shared,
                 None,
@@ -4869,8 +4855,7 @@ pub(crate) fn mla_attention_prepare(
         selected,
         local_heads,
         sm_scale,
-        rope_base,
-        original_seq_len,
+        rope,
     })
 }
 
@@ -4898,8 +4883,7 @@ pub(crate) struct Dsv4MlaProjBatch {
     pub(crate) local_heads: usize,
     pub(crate) local_width: usize,
     pub(crate) sm_scale: f32,
-    pub(crate) rope_base: f32,
-    pub(crate) original_seq_len: i32,
+    pub(crate) rope: RopeParams,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4951,13 +4935,7 @@ pub(crate) fn mla_attention_prepare_proj_batch(
     );
 
     // RoPE base/YaRN is PER-LAYER, identical policy to `mla_attention_prepare`.
-    let rope = &config.rope_parameters;
-    let (rope_base, original_seq_len) = if compress_ratio > 0 {
-        let osl = rope.original_seq_len_i32()?;
-        (config.compress_rope_theta, osl)
-    } else {
-        (config.rope_theta, 0i32)
-    };
+    let rope = RopeParams::from_config(config, compress_ratio)?;
 
     // Q/KV LoRA at m=N. The weight read MUST amortize across the N decode rows: a real
     // batched FP8 GEMM (DeepGEMM, K-tiled, tensor-core, weight read ONCE for all N),
@@ -5065,8 +5043,8 @@ pub(crate) fn mla_attention_prepare_proj_batch(
                 config.qk_rope_head_dim as i32,
                 pos_ptr as *const i32,
                 config.rms_norm_eps,
-                rope_base,
-                original_seq_len,
+                rope.base,
+                rope.original_seq_len,
                 rope.factor,
                 rope.beta_fast,
                 rope.beta_slow,
@@ -5086,8 +5064,7 @@ pub(crate) fn mla_attention_prepare_proj_batch(
         local_heads,
         local_width,
         sm_scale,
-        rope_base,
-        original_seq_len,
+        rope,
     })
 }
 
@@ -5106,9 +5083,8 @@ pub(crate) fn mla_attention_compressor_defer_row(
     compress_ratio: usize,
     normed_row: &HiddenStates,
     state: &mut Dsv4LayerAttentionState,
-    start_pos: usize,
-    start_pos_device: Option<&CudaSlice<i32>>,
-    original_seq_len: i32,
+    pos: Dsv4Position<'_>,
+    rope: RopeParams,
     main_sink: &mut Dsv4CompressorBatchPtrs,
     indexer_sink: &mut Dsv4CompressorBatchPtrs,
     keepalive: &mut Dsv4ForwardKeepalive,
@@ -5138,9 +5114,8 @@ pub(crate) fn mla_attention_compressor_defer_row(
             head_dim,
             compress_ratio,
             overlap,
-            start_pos,
-            start_pos_device,
-            original_seq_len,
+            pos,
+            rope,
             None,
             // Defer mode ignores `precomputed` (the batched update reads the prepass
             // output
@@ -5153,7 +5128,6 @@ pub(crate) fn mla_attention_compressor_defer_row(
     let mut indexer_rows_before = 0usize;
     if mode == DeepSeekV4AttentionMode::CompressedSparse {
         let indexer = attention.indexer();
-        let indexer_rope_original_seq_len = config.rope_parameters.original_seq_len_i32()?;
         indexer_rows_before = state
             .indexer
             .as_ref()
@@ -5172,9 +5146,8 @@ pub(crate) fn mla_attention_compressor_defer_row(
             config.index_head_dim,
             compress_ratio,
             true,
-            start_pos,
-            start_pos_device,
-            indexer_rope_original_seq_len,
+            pos,
+            rope,
             None,
             None,
             Some(indexer_sink),
@@ -5207,8 +5180,7 @@ pub(crate) fn mla_attention_prepare_compressed_only(
     state: &mut Dsv4LayerAttentionState,
     pool: &mut Dsv4LayerKvLayout,
     dsa_shared: Option<&mut Dsv4DsaSharedScratch>,
-    start_pos: usize,
-    start_pos_device: Option<&CudaSlice<i32>>,
+    pos: Dsv4Position<'_>,
     // When `Some`, the CSA per-row READ/SELECT is skipped (cache writes still run),
     // this row's q_i/weights are gathered into the N-row staging, and the returned
     // `selected` is `None` (the batched select fills selected_batched).
@@ -5251,7 +5223,6 @@ pub(crate) fn mla_attention_prepare_compressed_only(
         state.sw_window_cache.len(),
         config.sliding_window * head_dim
     );
-    let original_seq_len = proj.original_seq_len;
 
     // SAFETY: the FlashMLA attention kernel writes the full local_attn buffer
     // in the batched fwd / single-row `mla_attention_fwd`.
@@ -5292,9 +5263,8 @@ pub(crate) fn mla_attention_prepare_compressed_only(
                     head_dim,
                     compress_ratio,
                     overlap,
-                    start_pos,
-                    start_pos_device,
-                    original_seq_len,
+                    pos,
+                    proj.rope,
                     None,
                     precomputed_main,
                     None,
@@ -5305,7 +5275,6 @@ pub(crate) fn mla_attention_prepare_compressed_only(
 
         if mode.has_indexer() {
             let indexer = attention.indexer();
-            let indexer_rope_original_seq_len = config.rope_parameters.original_seq_len_i32()?;
             // `indexer_rows_before` = the indexer compressed row count BEFORE this
             // step's
             // advance. In full-flatten the pre-pass already advanced
@@ -5340,9 +5309,8 @@ pub(crate) fn mla_attention_prepare_compressed_only(
                         config.index_head_dim,
                         compress_ratio,
                         true,
-                        start_pos,
-                        start_pos_device,
-                        indexer_rope_original_seq_len,
+                        pos,
+                        proj.rope,
                         None,
                         precomputed_indexer,
                         None,
@@ -5358,7 +5326,7 @@ pub(crate) fn mla_attention_prepare_compressed_only(
                         indexer,
                         normed_row,
                         indexer_state,
-                        start_pos,
+                        pos.start,
                         keepalive,
                     )?;
                 }
@@ -5408,7 +5376,7 @@ pub(crate) fn mla_attention_prepare_compressed_only(
                 index_keys,
                 keys_capacity,
                 if mode == DeepSeekV4AttentionMode::SparseIndexed {
-                    start_pos
+                    pos.start
                 } else {
                     0
                 },
@@ -5417,8 +5385,7 @@ pub(crate) fn mla_attention_prepare_compressed_only(
                 pool,
                 indexer_rows_before,
                 indexer_rows_after,
-                start_pos,
-                start_pos_device,
+                pos,
                 index_ratio,
                 // Decode (token_count=1) never takes the prefill indexer DeepGEMM lane,
                 // so the
@@ -5440,8 +5407,7 @@ pub(crate) fn mla_attention_prepare_compressed_only(
         selected,
         local_heads,
         sm_scale: proj.sm_scale,
-        rope_base: proj.rope_base,
-        original_seq_len,
+        rope: proj.rope,
     })
 }
 
@@ -5463,8 +5429,7 @@ fn mla_attention_fwd(
     // Shared FP8 prefill DeepGEMM linear scratch, forwarded to `mla_oproj` (its
     // token_count>1 prefill lane gates on it).
     prefill_shared: Option<&mut Dsv4PrefillDeepGemmLinearScratch>,
-    start_pos: usize,
-    start_pos_device: Option<&CudaSlice<i32>>,
+    pos: Dsv4Position<'_>,
     chain_verify: Option<&Dsv4ChainVerifyAttnMeta>,
     tp: &TpRuntime,
     prepared: Dsv4MlaPrepared,
@@ -5478,11 +5443,9 @@ fn mla_attention_fwd(
         selected,
         local_heads,
         sm_scale,
-        rope_base,
-        original_seq_len,
+        rope,
     } = prepared;
     let token_count = q_prepared.seq_len;
-    let rope = &config.rope_parameters;
     ensure!(
         attention.wo_b().rows == out.hidden_dim && out.seq_len == token_count,
         "DSv4 MLA output shape mismatch: wo_b rows {} out {}x{} expected {}x{}",
@@ -5510,17 +5473,13 @@ fn mla_attention_fwd(
             selected.as_ref(),
             compressed,
             &mut state.sw_window_cache,
-            start_pos,
+            pos.start,
             chain_verify,
             tp,
             local_heads,
             &mut local_attn,
             sm_scale,
-            rope_base,
-            original_seq_len,
-            rope.factor,
-            rope.beta_fast,
-            rope.beta_slow,
+            rope,
         )?;
     } else {
         let flash = state.flashmla.as_mut().ok_or_else(|| {
@@ -5543,17 +5502,12 @@ fn mla_attention_fwd(
             flash,
             scratch,
             pool,
-            start_pos,
-            start_pos_device,
+            pos,
             tp,
             local_heads,
             &mut local_attn,
             sm_scale,
-            rope_base,
-            original_seq_len,
-            rope.factor,
-            rope.beta_fast,
-            rope.beta_slow,
+            rope,
         )?;
     }
     if let Some(sel) = selected.as_ref() {
@@ -6493,7 +6447,7 @@ fn compressor_fp32_probe(
     start_pos: usize,
     token_count: usize,
     compressed_rows: usize,
-    rope_original_seq_len: i32,
+    rope: RopeParams,
 ) -> Result<()> {
     crate::profile::profile_op(ctx, "compressor_fp32_probe", None, token_count, || {
         let probe = &compressor.fp32_probe;
@@ -6583,9 +6537,7 @@ fn compressor_fp32_probe(
                 .result()?;
             }
         }
-        let rope = &config.rope_parameters;
         let rope_dim = config.qk_rope_head_dim;
-        let rope_base = config.compress_rope_theta;
         let start_pos_i32 = i32::try_from(start_pos).map_err(|_| {
             anyhow::anyhow!("DSv4 FP32 compressor start_pos {start_pos} exceeds i32")
         })?;
@@ -6641,8 +6593,8 @@ fn compressor_fp32_probe(
                     overlap_page_stride,
                     config.rms_norm_eps,
                     rope_dim as i32,
-                    rope_base,
-                    rope_original_seq_len,
+                    rope.base,
+                    rope.original_seq_len,
                     rope.factor,
                     rope.beta_fast,
                     rope.beta_slow,
@@ -6671,9 +6623,8 @@ fn compressor_forward(
     head_dim: usize,
     ratio: usize,
     overlap: bool,
-    start_pos: usize,
-    start_pos_device: Option<&CudaSlice<i32>>,
-    rope_original_seq_len: i32,
+    pos: Dsv4Position<'_>,
+    rope: RopeParams,
     // Shared FP32 probe scratch: required on every prefill lane (the probe branch
     // consumes it); decode lanes pass `None`.
     fp32_scratch: Option<&mut Dsv4CompressorFp32Scratch>,
@@ -6698,14 +6649,14 @@ fn compressor_forward(
         compressor.wgate.rows
     );
     let token_count = hidden.seq_len;
-    let total = start_pos + token_count;
+    let total = pos.start + token_count;
     let compressed_rows = total / ratio;
-    let start_pos_i32 = i32::try_from(start_pos)
-        .map_err(|_| anyhow::anyhow!("DSv4 compressor start_pos {start_pos} exceeds i32"))?;
-    let pending_len = start_pos % ratio;
+    let start_pos_i32 = i32::try_from(pos.start)
+        .map_err(|_| anyhow::anyhow!("DSv4 compressor start_pos {} exceeds i32", pos.start))?;
+    let pending_len = pos.start % ratio;
     let pending_len_i32 = i32::try_from(pending_len)
         .map_err(|_| anyhow::anyhow!("DSv4 compressor pending_len {pending_len} exceeds i32"))?;
-    let compressed_base = start_pos / ratio;
+    let compressed_base = pos.start / ratio;
     let compressed_base_i32 = i32::try_from(compressed_base).map_err(|_| {
         anyhow::anyhow!("DSv4 compressor compressed_base {compressed_base} exceeds i32")
     })?;
@@ -6722,7 +6673,7 @@ fn compressor_forward(
 
     // FP32 probe: prefill only. The #146/#150 corruption was a multi-token prefill
     // boundary issue; decode uses the BF16 path.
-    if !dsv4_verify_frozen() && token_count > 0 && start_pos_device.is_none() {
+    if !dsv4_verify_frozen() && token_count > 0 && pos.device.is_none() {
         let scratch = fp32_scratch.ok_or_else(|| {
             anyhow!("DSv4 FP32 compressor probe needs the model-wide scratch on prefill lanes")
         })?;
@@ -6737,10 +6688,10 @@ fn compressor_forward(
             ratio,
             width,
             overlap,
-            start_pos,
+            pos.start,
             token_count,
             compressed_rows,
-            rope_original_seq_len,
+            rope,
         )?;
         return Ok(());
     }
@@ -6752,7 +6703,7 @@ fn compressor_forward(
     // GEMV match below, or the per-row GEMVs this replaces would still run.
     if let Some(sink) = defer_update {
         ensure!(
-            start_pos_device.is_some(),
+            pos.device.is_some(),
             "DSv4 full-flatten compressor defer requires start_pos_device (decode path)"
         );
         ensure!(
@@ -6813,10 +6764,8 @@ fn compressor_forward(
         }
     };
 
-    let rope = &config.rope_parameters;
     // Compressed keys use compress_rope_theta with NO YaRN (original_seq_len = 0).
     let rope_dim = config.qk_rope_head_dim;
-    let rope_base = config.compress_rope_theta;
     // Raw bf16 read: on a quantized matrix `.data` is a 1-element dummy (#138 OOB
     // class). The loader dequants ape to dense.
     ensure!(
@@ -6843,7 +6792,7 @@ fn compressor_forward(
         if !dsv4_verify_frozen() {
             // SAFETY: ptrs from live device allocations sized to the dims passed.
             unsafe {
-                if let Some(start_pos_device) = start_pos_device {
+                if let Some(start_pos_device) = pos.device {
                     let (start_ptr, _spg) = start_pos_device.device_ptr(&ctx.stream);
                     ffi::dsv4_compressor_update_start_pos_ptr_cuda(
                         kv_ptr as *const ffi::Half,
@@ -6864,8 +6813,8 @@ fn compressor_forward(
                         overlap_page_stride,
                         config.rms_norm_eps,
                         rope_dim as i32,
-                        rope_base,
-                        rope_original_seq_len,
+                        rope.base,
+                        rope.original_seq_len,
                         rope.factor,
                         rope.beta_fast,
                         rope.beta_slow,
@@ -6895,8 +6844,8 @@ fn compressor_forward(
                         overlap_page_stride,
                         config.rms_norm_eps,
                         rope_dim as i32,
-                        rope_base,
-                        rope_original_seq_len,
+                        rope.base,
+                        rope.original_seq_len,
                         rope.factor,
                         rope.beta_fast,
                         rope.beta_slow,
@@ -7424,7 +7373,7 @@ pub(crate) fn dsv4_compressor_update_batched(
     head_dim: usize,
     ratio: usize,
     overlap: bool,
-    rope_original_seq_len: i32,
+    rope: RopeParams,
     ptr_keepalive: &mut Vec<CudaSlice<u64>>,
 ) -> Result<()> {
     ensure!(ratio > 0, "DSv4 batched compressor ratio must be non-zero");
@@ -7450,9 +7399,7 @@ pub(crate) fn dsv4_compressor_update_batched(
     );
     // Compressed keys use compress_rope_theta with NO YaRN (original_seq_len = 0),
     // identical to the per-row `compressor_forward`.
-    let rope = &config.rope_parameters;
     let rope_dim = config.qk_rope_head_dim;
-    let rope_base = config.compress_rope_theta;
     // Upload the five per-row pointer arrays + hold them alive to function return.
     let pkv_arr = crate::ops::upload_u64(ctx, &ptrs.pending_kv)?;
     let psc_arr = crate::ops::upload_u64(ctx, &ptrs.pending_score)?;
@@ -7502,8 +7449,8 @@ pub(crate) fn dsv4_compressor_update_batched(
                 0, // overlap_page_stride: per-slot register form (#154 D1)
                 config.rms_norm_eps,
                 rope_dim as i32,
-                rope_base,
-                rope_original_seq_len,
+                rope.base,
+                rope.original_seq_len,
                 rope.factor,
                 rope.beta_fast,
                 rope.beta_slow,
@@ -7582,8 +7529,7 @@ fn csa_select_decode(
     pool: &mut Dsv4LayerKvLayout,
     indexer_rows_before: usize,
     indexer_rows_after: usize,
-    start_pos: usize,
-    start_pos_device: Option<&CudaSlice<i32>>,
+    pos: Dsv4Position<'_>,
     ratio: usize,
     q_i: &mut HiddenStates,
     weights: &mut HiddenStates,
@@ -7620,7 +7566,7 @@ fn csa_select_decode(
         "DSv4 MODEL1 decode CSA weights width {} != local index heads {local_index_heads}",
         weights.hidden_dim
     );
-    let key_count = if start_pos_device.is_some() {
+    let key_count = if pos.device.is_some() {
         keys_capacity
     } else {
         keys.seq_len
@@ -7640,8 +7586,7 @@ fn csa_select_decode(
         indexer_rows_before,
         indexer_rows_after,
         key_count,
-        start_pos,
-        start_pos_device,
+        pos,
         keys_window_base,
         ratio,
         local_index_heads,
@@ -7680,8 +7625,7 @@ fn csa_select(
     pool: &mut Dsv4LayerKvLayout,
     indexer_rows_before: usize,
     indexer_rows_after: usize,
-    start_pos: usize,
-    start_pos_device: Option<&CudaSlice<i32>>,
+    pos: Dsv4Position<'_>,
     ratio: usize,
     prefill_scratch: Option<&mut Dsv4PrefillDeepGemmLinearScratch>,
     batched_gather: Option<Dsv4DsaBatchedGather<'_>>,
@@ -7787,7 +7731,7 @@ fn csa_select(
         weights.hidden_dim
     );
 
-    let key_count = if start_pos_device.is_some() {
+    let key_count = if pos.device.is_some() {
         if dsv4_verify_frozen() {
             // Frozen-KV: the selector computes `available = min(key_count,
             // abs_pos / ratio)`, and a frozen verify's `abs_pos` can cross a
@@ -7842,8 +7786,7 @@ fn csa_select(
                 indexer_rows_before,
                 indexer_rows_after,
                 key_count,
-                start_pos,
-                start_pos_device,
+                pos,
                 keys_window_base,
                 ratio,
                 local_index_heads,
@@ -7922,8 +7865,7 @@ fn csa_select(
         indexer_rows_before,
         indexer_rows_after,
         key_count,
-        start_pos,
-        start_pos_device,
+        pos,
         keys_window_base,
         ratio,
         local_index_heads,
@@ -7949,8 +7891,7 @@ fn csa_select_official(
     indexer_rows_before: usize,
     indexer_rows_after: usize,
     key_count: usize,
-    start_pos: usize,
-    start_pos_device: Option<&CudaSlice<i32>>,
+    pos: Dsv4Position<'_>,
     // Ring window base for reading the `keys` staging buffer: `start_pos` for the
     // SparseIndexed indexer (staged window-relative from ring row 0 every forward),
     // `0` for the full-retention compressor. Row `r` is at `(r - keys_window_base) *
@@ -7991,10 +7932,10 @@ fn csa_select_official(
         shared.compressed_capacity
     );
     ensure!(
-        start_pos + q_i.seq_len <= shared.max_tokens,
+        pos.start + q_i.seq_len <= shared.max_tokens,
         "DSv4 official DSA positions {}..{} exceed freqs_cis max {}",
-        start_pos,
-        start_pos + q_i.seq_len,
+        pos.start,
+        pos.start + q_i.seq_len,
         shared.max_tokens
     );
 
@@ -8185,7 +8126,7 @@ fn csa_select_official(
             {
                 let mut context_lens = shared.context_lens.slice_mut(0..tlen);
                 let mut positions = shared.positions.slice_mut(0..tlen);
-                if let Some(start_pos_device) = start_pos_device {
+                if let Some(start_pos_device) = pos.device {
                     let (lens_ptr, _lg) = context_lens.device_ptr_mut(&ctx.stream);
                     let (positions_ptr, _pg) = positions.device_ptr_mut(&ctx.stream);
                     let (start_ptr, _sg) = start_pos_device.device_ptr(&ctx.stream);
@@ -8208,12 +8149,12 @@ fn csa_select_official(
                 } else {
                     let context_lens_tile: Vec<i32> = (0..tlen)
                         .map(|i| {
-                            let abs_pos = start_pos + t0 + i;
+                            let abs_pos = pos.start + t0 + i;
                             i32::try_from(std::cmp::min(key_count, abs_pos / ratio))
                         })
                         .collect::<Result<Vec<_>, _>>()?;
                     let positions_tile: Vec<i32> = (0..tlen)
-                        .map(|i| i32::try_from(start_pos + t0 + i))
+                        .map(|i| i32::try_from(pos.start + t0 + i))
                         .collect::<Result<Vec<_>, _>>()?;
                     ctx.stream
                         .memcpy_htod(&context_lens_tile, &mut context_lens)

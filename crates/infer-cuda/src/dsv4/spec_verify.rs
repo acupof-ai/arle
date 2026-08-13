@@ -1,6 +1,7 @@
 //! Single-sequence speculative verify: the row schedule, its validation, and the
 //! verify entry points.
 
+use super::layer_block::HcHalf;
 use super::*;
 
 /// Max depth for the per-slot spec-ring snapshot. `topk` widens candidate
@@ -65,6 +66,32 @@ pub(crate) struct SpecVerifyResult {
 }
 
 impl Dsv4Model {
+    /// Build a [`SpecVerifyResult`] from a forward's output stream: capture the
+    /// per-row MTP stream hiddens, project the logits, and take the greedy
+    /// argmax. Shared by the commit-verify and the frozen scheduled-verify
+    /// lanes.
+    fn spec_verify_result_from_stream(
+        &self,
+        stream: &HiddenStates,
+        n: usize,
+        keepalive: &mut Dsv4ForwardKeepalive,
+    ) -> Result<SpecVerifyResult> {
+        let stream_dim = self.config.hidden_size * self.config.hc_mult;
+        let mut hiddens = Vec::with_capacity(n);
+        for i in 0..n {
+            let mut h = DeviceVec::zeros(&self.ctx, stream_dim)?;
+            self.capture_mtp_stream_hidden(stream, i, 1, &mut h, keepalive)?;
+            hiddens.push(h);
+        }
+        let logits = self.verify_logits_from_stream(stream, n, keepalive)?;
+        let argmax = self.mtp_argmax_batch(&logits)?;
+        Ok(SpecVerifyResult {
+            logits,
+            argmax,
+            hiddens,
+        })
+    }
+
     /// Commit/selftest forward for a contiguous token prefix. Not the frozen MTP
     /// verifier: it writes the slot KV state like a normal forward.
     pub(crate) fn forward_tokens_verify(
@@ -80,7 +107,6 @@ impl Dsv4Model {
             "DSv4 verify forward requires at least one token"
         );
         let n = tokens.len();
-        let stream_dim = self.config.hidden_size * self.config.hc_mult;
         let persist_spec_normed = slot.spec_normed.is_some();
         let (stream, mut keepalive) = self.forward_tokens_stream_impl(
             slot,
@@ -90,22 +116,10 @@ impl Dsv4Model {
             persist_spec_normed,
             None,
         )?;
-        let hiddens = (0..n)
-            .map(|i| -> Result<_> {
-                let mut h = DeviceVec::zeros(&self.ctx, stream_dim)?;
-                self.capture_mtp_stream_hidden(&stream, i, 1, &mut h, &mut keepalive)?;
-                Ok(h)
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let logits = self.verify_logits_from_stream(&stream, n, &mut keepalive)?;
-        let argmax = self.mtp_argmax_batch(&logits)?;
+        let result = self.spec_verify_result_from_stream(&stream, n, &mut keepalive)?;
         std::hint::black_box(keepalive.len());
         drop(keepalive);
-        Ok(SpecVerifyResult {
-            logits,
-            argmax,
-            hiddens,
-        })
+        Ok(result)
     }
 
     /// Verify `tokens` in ONE scheduled sparse forward under `sched`'s per-row
@@ -137,7 +151,6 @@ impl Dsv4Model {
         );
         // `hiddens[j]` = row j's MTP stream; `argmax[j]` = the target's argmax
         // AFTER `tokens[j]`. The frozen sparse verify lane commits no slot KV.
-        let stream_dim = self.config.hidden_size * self.config.hc_mult;
         let seq_len = tokens.len();
         let was_frozen = crate::attention::dsv4_verify_frozen();
         if !was_frozen {
@@ -152,22 +165,10 @@ impl Dsv4Model {
                 true,
                 Some(sched),
             )?;
-            let n = tokens.len();
-            let mut hiddens = Vec::with_capacity(n);
-            for i in 0..n {
-                let mut h = DeviceVec::zeros(&self.ctx, stream_dim)?;
-                self.capture_mtp_stream_hidden(&stream, i, 1, &mut h, &mut keepalive)?;
-                hiddens.push(h);
-            }
-            let logits = self.verify_logits_from_stream(&stream, n, &mut keepalive)?;
-            let argmax = self.mtp_argmax_batch(&logits)?;
+            let result = self.spec_verify_result_from_stream(&stream, seq_len, &mut keepalive)?;
             std::hint::black_box(keepalive.len());
             drop(keepalive);
-            Ok(SpecVerifyResult {
-                logits,
-                argmax,
-                hiddens,
-            })
+            Ok(result)
         });
         if !was_frozen {
             crate::attention::set_dsv4_verify_frozen(false);
@@ -219,7 +220,6 @@ impl Dsv4Model {
         let hidden_size = self.config.hidden_size;
         let hc_mult = self.config.hc_mult;
         let stream_dim = hidden_size * hc_mult;
-        let eps = self.config.rms_norm_eps;
         let ctx = &self.ctx;
         let mut keepalive = Dsv4ForwardKeepalive::new(false);
         let scratch = slot
@@ -264,43 +264,15 @@ impl Dsv4Model {
                     &prev_layers[layer_idx - 1].ffn_stream
                 };
                 let normed = &mut current.attn_normed;
-                let attn_mhc = if self.config.is_glm() {
-                    crate::profile::profile_op(
-                        ctx,
-                        "attn_hc_pre_norm",
-                        Some(layer_idx),
-                        seq_len,
-                        || crate::ops::rms_norm_batch(ctx, stream, &layer.attn_norm, eps, normed),
-                    )?;
-                    None
-                } else {
-                    let mhc = crate::profile::profile_op(
-                        ctx,
-                        "attn_hc_params",
-                        Some(layer_idx),
-                        seq_len,
-                        || crate::hc::gen_mhc_params(ctx, &self.config, &layer.hc_attn, stream),
-                    )?;
-                    crate::profile::profile_op(
-                        ctx,
-                        "attn_hc_pre_norm",
-                        Some(layer_idx),
-                        seq_len,
-                        || {
-                            crate::hc::mhc_pre_rms_norm(
-                                ctx,
-                                stream,
-                                &mhc.pre,
-                                &layer.attn_norm,
-                                eps,
-                                hidden_size,
-                                hc_mult,
-                                normed,
-                            )
-                        },
-                    )?;
-                    Some(mhc)
-                };
+                let attn_mhc = self.hc_pre_norm(
+                    layer,
+                    HcHalf::Attn,
+                    layer_idx,
+                    seq_len,
+                    stream,
+                    normed,
+                    &mut keepalive,
+                )?;
 
                 if let Some(cache) = slot.spec_normed.as_mut() {
                     let rows = seq_len * hidden_size;
@@ -328,8 +300,10 @@ impl Dsv4Model {
                         flashmla_scratch,
                         prefill_shared,
                         fp32,
-                        start_pos,
-                        None,
+                        crate::attention::Dsv4Position {
+                            start: start_pos,
+                            device: None,
+                        },
                         Some(&sparse_verify_meta),
                         &self.tp,
                         &mut current.attn_out,
@@ -345,83 +319,29 @@ impl Dsv4Model {
                     || self.tp.all_reduce_sum(ctx, &mut current.attn_out),
                 )?;
 
-                if let Some(mhc) = attn_mhc.as_ref() {
-                    crate::profile::profile_op(
-                        ctx,
-                        "attn_hc_post",
-                        Some(layer_idx),
-                        seq_len,
-                        || {
-                            crate::hc::hc_post(
-                                ctx,
-                                &current.attn_out,
-                                stream,
-                                &mhc.post,
-                                &mhc.comb,
-                                hidden_size,
-                                hc_mult,
-                                &mut current.attn_stream,
-                            )
-                        },
-                    )?;
-                } else {
-                    crate::profile::profile_op(
-                        ctx,
-                        "attn_hc_post",
-                        Some(layer_idx),
-                        seq_len,
-                        || {
-                            crate::ops::add_batch(
-                                ctx,
-                                &current.attn_out,
-                                stream,
-                                &mut current.attn_stream,
-                            )
-                        },
-                    )?;
-                }
+                self.hc_post_fold(
+                    attn_mhc.as_ref(),
+                    HcHalf::Attn,
+                    layer_idx,
+                    seq_len,
+                    &current.attn_out,
+                    stream,
+                    &mut current.attn_stream,
+                )?;
             }
 
             {
                 let stream = &current.attn_stream;
                 let normed = &mut current.ffn_normed;
-                let ffn_mhc = if self.config.is_glm() {
-                    crate::profile::profile_op(
-                        ctx,
-                        "ffn_hc_pre_norm",
-                        Some(layer_idx),
-                        seq_len,
-                        || crate::ops::rms_norm_batch(ctx, stream, &layer.ffn_norm, eps, normed),
-                    )?;
-                    None
-                } else {
-                    let mhc = crate::profile::profile_op(
-                        ctx,
-                        "ffn_hc_params",
-                        Some(layer_idx),
-                        seq_len,
-                        || crate::hc::gen_mhc_params(ctx, &self.config, &layer.hc_ffn, stream),
-                    )?;
-                    crate::profile::profile_op(
-                        ctx,
-                        "ffn_hc_pre_norm",
-                        Some(layer_idx),
-                        seq_len,
-                        || {
-                            crate::hc::mhc_pre_rms_norm(
-                                ctx,
-                                stream,
-                                &mhc.pre,
-                                &layer.ffn_norm,
-                                eps,
-                                hidden_size,
-                                hc_mult,
-                                normed,
-                            )
-                        },
-                    )?;
-                    Some(mhc)
-                };
+                let ffn_mhc = self.hc_pre_norm(
+                    layer,
+                    HcHalf::Ffn,
+                    layer_idx,
+                    seq_len,
+                    stream,
+                    normed,
+                    &mut keepalive,
+                )?;
 
                 if let Some(dense) = layer.dense_mlp.as_ref() {
                     crate::profile::profile_op(ctx, "mlp", Some(layer_idx), seq_len, || {
@@ -494,41 +414,15 @@ impl Dsv4Model {
                     })?;
                 }
 
-                if let Some(mhc) = ffn_mhc.as_ref() {
-                    crate::profile::profile_op(
-                        ctx,
-                        "ffn_hc_post",
-                        Some(layer_idx),
-                        seq_len,
-                        || {
-                            crate::hc::hc_post(
-                                ctx,
-                                &current.moe_with_shared,
-                                stream,
-                                &mhc.post,
-                                &mhc.comb,
-                                hidden_size,
-                                hc_mult,
-                                &mut current.ffn_stream,
-                            )
-                        },
-                    )?;
-                } else {
-                    crate::profile::profile_op(
-                        ctx,
-                        "ffn_hc_post",
-                        Some(layer_idx),
-                        seq_len,
-                        || {
-                            crate::ops::add_batch(
-                                ctx,
-                                &current.moe_with_shared,
-                                stream,
-                                &mut current.ffn_stream,
-                            )
-                        },
-                    )?;
-                }
+                self.hc_post_fold(
+                    ffn_mhc.as_ref(),
+                    HcHalf::Ffn,
+                    layer_idx,
+                    seq_len,
+                    &current.moe_with_shared,
+                    stream,
+                    &mut current.ffn_stream,
+                )?;
 
                 if self.config.is_dspark()
                     && let Some(tap_idx) = self
