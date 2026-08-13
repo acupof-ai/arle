@@ -3963,7 +3963,7 @@ impl SafetensorLoader {
     /// #150: dense-bf16 dequant copy of one DSv4 FP8 block-scaled tensor
     /// (host-side, via the shared block-dequant helper — the scale sidecar's
     /// shape defines the block dims), TP-sharded like the FP8 original. Built
-    /// only under `ARLE_DSV4_MLA_PROJ_BF16=1`; costs 2× the F8 bytes in VRAM.
+    /// costs 2× the F8 bytes in VRAM.
     fn load_dsv4_block_scaled_bf16_copy(
         &self,
         ctx: &DeviceContext,
