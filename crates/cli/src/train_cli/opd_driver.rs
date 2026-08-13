@@ -185,6 +185,7 @@ pub(super) fn run_opd_from_dirs(args: TrainOpdArgs) -> Result<()> {
                 let teacher = OpdCliTeacher::Infer(load_opd_infer_teacher(
                     teacher_dir,
                     args.prompt_max_tokens + args.rollout_len + 32,
+                    args.runtime.rollout_mem_fraction,
                     train_backend.clone(),
                     cfg.vocab_size,
                 )?);
