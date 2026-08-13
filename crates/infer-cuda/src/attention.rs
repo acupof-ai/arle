@@ -3580,14 +3580,12 @@ impl Dsv4MlaDecodeScratch {
         };
         let (compressor_index_kv, compressor_index_score) =
             if mode == DeepSeekV4AttentionMode::CompressedSparse {
-                let indexer = attention
-                    .indexer
-                    .as_ref()
-                    .ok_or_else(|| anyhow!("DSv4 MODEL1 decode CSA scratch requires indexer weights"))?;
-                let compressor = indexer
-                    .compressor
-                    .as_ref()
-                    .ok_or_else(|| anyhow!("DSv4 MODEL1 decode CSA scratch requires indexer compressor"))?;
+                let indexer = attention.indexer.as_ref().ok_or_else(|| {
+                    anyhow!("DSv4 MODEL1 decode CSA scratch requires indexer weights")
+                })?;
+                let compressor = indexer.compressor.as_ref().ok_or_else(|| {
+                    anyhow!("DSv4 MODEL1 decode CSA scratch requires indexer compressor")
+                })?;
                 (
                     // SAFETY: uninit device scratch; fully written before first read.
                     Some(unsafe { HiddenStates::uninit(ctx, compressor.wkv.rows, 1)? }),
@@ -3598,10 +3596,9 @@ impl Dsv4MlaDecodeScratch {
                 (None, None)
             };
         let (csa_q_i, csa_weights, csa_selected) = if mode.has_indexer() {
-            let indexer = attention
-                .indexer
-                .as_ref()
-                .ok_or_else(|| anyhow!("DSv4 MODEL1 decode scratch mode {mode:?} requires indexer"))?;
+            let indexer = attention.indexer.as_ref().ok_or_else(|| {
+                anyhow!("DSv4 MODEL1 decode scratch mode {mode:?} requires indexer")
+            })?;
             (
                 // SAFETY: uninit device scratch; fully written before first read.
                 Some(unsafe { HiddenStates::uninit(ctx, indexer.wq_b.rows, 1)? }),
@@ -3874,7 +3871,10 @@ pub(crate) fn mla_attention_decode(
         "DSv4 MODEL1 decode MLA local q width {local_width} is not a multiple of head_dim {head_dim}"
     );
     let local_heads = local_width / head_dim;
-    ensure!(local_heads > 0, "DSv4 MODEL1 decode MLA requires local heads");
+    ensure!(
+        local_heads > 0,
+        "DSv4 MODEL1 decode MLA requires local heads"
+    );
     let tp_rank = tp.config().rank;
     let sink_offset = tp_rank * local_heads;
     ensure!(
@@ -4048,10 +4048,9 @@ pub(crate) fn mla_attention_decode(
             .compressor_index_kv
             .as_mut()
             .ok_or_else(|| anyhow!("DSv4 MODEL1 decode indexer compressor kv scratch missing"))?;
-        let score = scratch
-            .compressor_index_score
-            .as_mut()
-            .ok_or_else(|| anyhow!("DSv4 MODEL1 decode indexer compressor score scratch missing"))?;
+        let score = scratch.compressor_index_score.as_mut().ok_or_else(|| {
+            anyhow!("DSv4 MODEL1 decode indexer compressor score scratch missing")
+        })?;
         {
             let indexer_state = state.indexer.as_mut().ok_or_else(|| {
                 anyhow!("DSv4 layer {layer_idx} is {mode:?} but has no indexer state")
@@ -4094,8 +4093,8 @@ pub(crate) fn mla_attention_decode(
                  value compressor rows {value_rows} (Shape drift — #146 guard)"
             );
         }
-        let shared =
-            dsa_shared.ok_or_else(|| anyhow!("DSv4 MODEL1 decode CSA shared DSA scratch missing"))?;
+        let shared = dsa_shared
+            .ok_or_else(|| anyhow!("DSv4 MODEL1 decode CSA shared DSA scratch missing"))?;
         // Read-only constants pulled BEFORE the mutable csa-scratch borrows below.
         let slot_idx = state
             .dsa_official_slot_idx()
