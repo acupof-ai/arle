@@ -92,9 +92,6 @@ pub struct CudaRuntimeFlags {
     pub dsv4_flashmla_decode: Option<bool>,
     #[serde(default = "d_dsa_indexer_sms")]
     pub dsv4_dsa_indexer_sms: usize,
-    /// DSv4 contiguous-decode MoE path (KILLED as default; A/B lever).
-    #[serde(default)]
-    pub dsv4_moe_contig_decode: bool,
     /// DSv4 decode-region prefix reuse: restore a later turn to the exact finish
     /// position. OFF here, ON in serve — the 2026-07-11 license measured serve
     /// only. OFF = byte-identical.
@@ -143,7 +140,6 @@ impl Default for CudaRuntimeFlags {
             comm_backend: CommBackend::default(),
             dsv4_flashmla_decode: None,
             dsv4_dsa_indexer_sms: d_dsa_indexer_sms(),
-            dsv4_moe_contig_decode: false,
             dsv4_decode_reuse: false,
             mtp_adaptive: false,
             mtp_min_accept: d_mtp_min_accept(),

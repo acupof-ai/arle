@@ -58,7 +58,6 @@ static QWEN35_GDR_CHUNKED: AtomicBool = AtomicBool::new(false);
 static NUMA_PIN: AtomicBool = AtomicBool::new(true);
 static COMM_NCCL_ONLY: AtomicBool = AtomicBool::new(false);
 static DSV4_DSA_INDEXER_SMS: AtomicUsize = AtomicUsize::new(78);
-static DSV4_MOE_CONTIG_DECODE: AtomicBool = AtomicBool::new(false);
 // Setter-only (NOT in `apply_runtime_flags`): the OPD trainer flips it right
 // before the rollout student loads, and the engine's own `apply_runtime_flags`
 // during load must not reset it. Off = serving default (grouped-FP8 experts).
@@ -95,7 +94,6 @@ pub fn apply_runtime_flags(f: &CudaRuntimeFlags) {
     NUMA_PIN.store(f.numa_pin, Relaxed);
     COMM_NCCL_ONLY.store(f.comm_backend == CommBackend::Nccl, Relaxed);
     DSV4_DSA_INDEXER_SMS.store(f.dsv4_dsa_indexer_sms, Relaxed);
-    DSV4_MOE_CONTIG_DECODE.store(f.dsv4_moe_contig_decode, Relaxed);
     DSV4_DECODE_REUSE.store(f.dsv4_decode_reuse, Relaxed);
     MTP_ADAPTIVE.store(f.mtp_adaptive, Relaxed);
     MTP_MIN_ACCEPT_BITS.store(f.mtp_min_accept.to_bits(), Relaxed);
@@ -162,13 +160,6 @@ pub(crate) fn comm_nccl_only() -> bool {
 }
 pub(crate) fn dsv4_dsa_indexer_sms() -> usize {
     DSV4_DSA_INDEXER_SMS.load(Relaxed)
-}
-pub(crate) fn dsv4_moe_contig_decode() -> bool {
-    DSV4_MOE_CONTIG_DECODE.load(Relaxed)
-}
-/// A/B-harness lever (`infer_cuda::set_dsv4_moe_contig_decode`).
-pub(crate) fn set_dsv4_moe_contig_decode(enabled: bool) {
-    DSV4_MOE_CONTIG_DECODE.store(enabled, Relaxed);
 }
 /// When set, the Qwen3.6 MoE loader dequantizes routed FP8 experts to BF16
 /// per-expert at load instead of building the fused grouped-FP8 cache, so

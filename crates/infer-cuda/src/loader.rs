@@ -1641,7 +1641,7 @@ impl SafetensorLoader {
         let mut down = Vec::with_capacity(split.experts_per_rank);
         let per_expert_probe = names.expert_gate_proj(split.local_expert_start);
         let per_expert_quant_probe = self.quant_view_for(&per_expert_probe)?.is_some();
-        let deepgemm_native_ready = crate::moe::qwen35_deepgemm_enabled()
+        let deepgemm_native_ready = crate::runtime_flags::qwen35_deepgemm()
             && match cuda_kernels::moe::dsv4_deepgemm_native_preflight() {
                 Ok(_) => true,
                 Err(err) => {
