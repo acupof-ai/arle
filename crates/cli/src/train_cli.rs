@@ -476,6 +476,20 @@ fn run_w2s(args: TrainW2sArgs) -> Result<()> {
 
     eprintln!("[arle train w2s] backend={backend_label}");
 
+    // Per-phase VRAM ledger — the 27B base + aux post-RL pair sits within a few
+    // GB of the 97 GB H20, so every load/offload boundary needs a measured number.
+    fn vram(store: &TensorStore, phase: &str) {
+        if let Some((free, total)) = store.backend().device_mem_info() {
+            let gb = |b: usize| b as f64 / (1u64 << 30) as f64;
+            eprintln!(
+                "[arle train w2s] vram after {phase}: used={:.1} GB free={:.1} GB total={:.1} GB",
+                gb(total - free),
+                gb(free),
+                gb(total)
+            );
+        }
+    }
+
     // Load base model (no LoRA) — π_base for the global KL regularizer.
     eprintln!(
         "[arle train w2s] loading base model from {}",
@@ -490,6 +504,7 @@ fn run_w2s(args: TrainW2sArgs) -> Result<()> {
     eprintln!("[arle train w2s] creating student (shadow adapter)");
     let student = Qwen35Model::new_lora_from_base(&base, lora, target_set, &mut store)
         .context("create student shadow adapter")?;
+    vram(&store, "base+student load");
 
     // Serving adapter — π_old for the local KL regularizer. Created from the
     // student (not the base) so `new_lora_from_base`'s retain_ids keeps the
@@ -523,6 +538,7 @@ fn run_w2s(args: TrainW2sArgs) -> Result<()> {
             store.offload_to_host(*id)?;
         }
     }
+    vram(&store, "base offload");
 
     // Load auxiliary models.
     let aux1 = match args.aux_backend {
@@ -700,6 +716,7 @@ fn run_w2s(args: TrainW2sArgs) -> Result<()> {
             }
         }
     }
+    vram(&store, "aux load+offload");
 
     let trainable_params: Vec<TensorId> = student
         .all_parameter_ids()
@@ -744,6 +761,7 @@ fn run_w2s(args: TrainW2sArgs) -> Result<()> {
             }
         }
     }
+    vram(&store, "student re-upload");
 
     let cfg = W2sConfig {
         alpha: args.alpha,
