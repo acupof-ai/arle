@@ -684,113 +684,215 @@ impl Qwen35Model {
                         // request cost on ragged batches; a single request is a
                         // single launch either way. Ragged multi-request prefill
                         // and non-Hopper keep TileLang.
-                        if (meta.seq_len <= FA3_MAX_QLEN || meta.batch == 1)
-                            && pool.format == KVFormat::BF16
-                            && c.head_dim == 256
-                            && qwen35_fa3_enabled(&self.ctx)
-                        {
-                            let (qp_ptr, _g0) = q_prepped.data.device_ptr_mut(&self.ctx.stream);
-                            let (ao_ptr, _g5) = attn_out.data.device_ptr_mut(&self.ctx.stream);
-                            // ONE launch for the whole batch: q/o are packed
-                            // [total_q, h, d] behind `q_indptr`, and each row's KV
-                            // extent comes from `kv_lens_dev` against the
-                            // rectangular page table. `seqused_k` does not drop the
-                            // K/V batch strides (only `cu_seqlens_k` does,
-                            // flash_api.cpp:105-108), which is what lets a paged
-                            // batch share a launch — per row it was 16 CTAs on 78
-                            // SMs, serialized.
-                            // Split-KV pays only when q is tiny vs kv; a long
-                            // prefill chunk saturates SMs on the q axis alone.
-                            // Upper bound only: FA3 picks the live value itself
-                            // (flash_prepare_scheduler.cu `num_splits_dynamic`),
-                            // clamped by what we pass. pack_gqa leaves batch ×
-                            // kv_heads tiles before splitting, so one tile per SM
-                            // is where the ceiling stops costing anything — raising
-                            // it further only grows the combine scratch, which
-                            // measured +0.36% at batch 8. The historical 8 is the
-                            // floor: it is the measured optimum from batch 4 up,
-                            // and it bound the scheduler only at batch 1, where
-                            // 4×8 = 32 tiles left 46 of 78 SMs idle.
-                            let splits = if meta.seq_len <= FA3_MAX_QLEN {
-                                match qwen35_fa3_decode_splits() {
-                                    0 => self
-                                        .ctx
-                                        .sm_count()
-                                        .div_ceil(meta.batch.max(1) * self.local_kv_heads.max(1))
-                                        .max(FA3_DECODE_SPLITS_FLOOR)
-                                        .clamp(2, 256),
-                                    n => n,
-                                }
-                            } else {
-                                1
-                            };
-                            let accum_rows = self.local_q_heads * meta.total_q;
-                            let lse = fa3_lse.get(&self.ctx, accum_rows)?;
-                            let oaccum =
-                                fa3_oaccum.get(&self.ctx, splits * accum_rows * c.head_dim)?;
-                            let lseaccum = fa3_lseaccum.get(&self.ctx, splits * accum_rows)?;
-                            let meta_cap = meta.batch.div_ceil(4) * 4 * 4 + 1;
-                            let sem = fa3_semaphore.get(&self.ctx, meta_cap)?;
-                            let (lse_ptr, _f0) = lse.device_ptr_mut(&self.ctx.stream);
-                            let (oaccum_ptr, _f1) = oaccum.device_ptr_mut(&self.ctx.stream);
-                            let (lseaccum_ptr, _f2) = lseaccum.device_ptr_mut(&self.ctx.stream);
-                            let (sem_ptr, _f3) = sem.device_ptr_mut(&self.ctx.stream);
-                            let (kv_lens_ptr, _f4) = meta.kv_lens_dev.device_ptr(&self.ctx.stream);
-                            let (rect_ptr, _f5) = meta.page_table_rect.device_ptr(&self.ctx.stream);
-                            let head_dim = c.head_dim as i64;
-                            let args = ffi::ArleFa3FwdHd256Args {
-                                q: qp_ptr as *const ffi::Half,
-                                k: k_pool_ptr as *const ffi::Half,
-                                v: v_pool_ptr as *const ffi::Half,
-                                o: ao_ptr as *mut ffi::Half,
-                                softmax_lse: lse_ptr as *mut f32,
-                                out_accum: oaccum_ptr as *mut f32,
-                                softmax_lse_accum: lseaccum_ptr as *mut f32,
-                                tile_count_semaphore: sem_ptr as *mut i32,
-                                metadata_capacity: meta_cap as i32,
-                                cu_seqlens_q: q_indptr_ptr as *const i32,
-                                seqused_k: kv_lens_ptr as *const i32,
-                                batch: meta.batch as i32,
-                                total_q: meta.total_q as i32,
-                                seqlen_q: meta.seq_len as i32,
-                                seqlen_k: meta.max_kv_len() as i32,
-                                num_heads: self.local_q_heads as i32,
-                                num_heads_k: self.local_kv_heads as i32,
-                                head_dim: c.head_dim as i32,
-                                q_row_stride: (self.local_q_heads * c.head_dim) as i64,
-                                // HND pool [page, h_k, page_size, d]: tokens are
-                                // contiguous inside a (page, head), heads stride
-                                // by a page's worth, pages by the whole page.
-                                k_row_stride: head_dim,
-                                v_row_stride: head_dim,
-                                o_row_stride: (self.local_q_heads * c.head_dim) as i64,
-                                q_head_stride: head_dim,
-                                k_head_stride: pool.page_size as i64 * head_dim,
-                                v_head_stride: pool.page_size as i64 * head_dim,
-                                o_head_stride: head_dim,
-                                softmax_scale: sm_scale,
-                                // Bottom-right aligned; the shim demotes to
-                                // non-causal at qlen 1.
-                                is_causal: 1,
-                                num_splits: splits as i32,
-                                page_table: rect_ptr as *const i32,
-                                page_table_batch_stride: meta.page_table_stride as i64,
-                                page_size: pool.page_size as i32,
-                                num_pages: pool.max_total_pages as i32,
-                                k_page_stride: stride_page as i64,
-                                v_page_stride: stride_page as i64,
-                            };
-                            // SAFETY: q/o are the live prepped/out buffers; k/v are
-                            // the layer's pool base; the page table is the meta's
-                            // rectangular mirror, `batch * page_table_stride` long.
-                            unsafe {
-                                ffi::arle_fa3_fwd_hd256_bf16_cuda(
-                                    &args,
-                                    self.ctx.stream.cu_stream(),
+                        //
+                        // Quantized pools (FP8/INT8): Path B first — the native
+                        // kernel reads the 1-byte pools + per-(token,head)
+                        // scales directly, no dequant temp. Decode-shaped and
+                        // self-contained (no Hopper requirement); prefill /
+                        // spec-verify rows and the workspace-overflow case fall
+                        // through to Path A (the FA3 quant shim's per-call
+                        // bf16 temp), then the varlen quantized kernel below.
+                        if (meta.seq_len <= FA3_MAX_QLEN || meta.batch == 1) && c.head_dim == 256 {
+                            if decode
+                                && matches!(
+                                    pool.format,
+                                    KVFormat::FP8E4M3 | KVFormat::INT8
                                 )
-                                .result()?;
+                            {
+                                // Same split derivation as the FA3 lane, capped
+                                // at 16: the pool's split-KV workspace is sized
+                                // for 16 splits at the Qwen3.6 GQA ratio (8).
+                                let splits = self
+                                    .ctx
+                                    .sm_count()
+                                    .div_ceil(meta.batch.max(1) * self.local_kv_heads.max(1))
+                                    .max(FA3_DECODE_SPLITS_FLOOR)
+                                    .clamp(2, 16);
+                                let needed =
+                                    kv_quant::paged_attention_quantized_fa3_workspace_bytes(
+                                        meta.total_q,
+                                        self.local_q_heads,
+                                        c.head_dim,
+                                        splits,
+                                    );
+                                if needed <= pool.quantized_attn_workspace_bytes {
+                                    let ws = pool.quantized_attn_workspace()?;
+                                    let (rect_ptr, _fr) =
+                                        meta.page_table_rect.device_ptr(&self.ctx.stream);
+                                    let (q_indptr_ptr, _fq) =
+                                        meta.q_indptr.device_ptr(&self.ctx.stream);
+                                    let (kv_lens_ptr, _fl) =
+                                        meta.kv_lens_dev.device_ptr(&self.ctx.stream);
+                                    kv_quant::paged_attention_quantized_fa3(
+                                        &self.ctx,
+                                        q_prepped,
+                                        pool.k_data_ptr(full_idx, &self.ctx.stream),
+                                        pool.v_data_ptr(full_idx, &self.ctx.stream),
+                                        pool.k_scales_ptr(full_idx, &self.ctx.stream),
+                                        pool.v_scales_ptr(full_idx, &self.ctx.stream),
+                                        rect_ptr,
+                                        q_indptr_ptr,
+                                        kv_lens_ptr,
+                                        attn_out,
+                                        self.local_q_heads,
+                                        self.local_kv_heads,
+                                        c.head_dim,
+                                        pool.page_size,
+                                        meta.page_table_stride,
+                                        meta.batch,
+                                        meta.total_q,
+                                        sm_scale,
+                                        pool.format,
+                                        splits,
+                                        ws,
+                                        pool.quantized_attn_workspace_bytes,
+                                    )?;
+                                    return Ok(());
+                                }
                             }
-                            return Ok(());
+                            if qwen35_fa3_enabled(&self.ctx)
+                                && matches!(
+                                    pool.format,
+                                    KVFormat::BF16 | KVFormat::FP8E4M3 | KVFormat::INT8
+                                )
+                            {
+                                let (qp_ptr, _g0) = q_prepped.data.device_ptr_mut(&self.ctx.stream);
+                                let (ao_ptr, _g5) = attn_out.data.device_ptr_mut(&self.ctx.stream);
+                                // ONE launch for the whole batch: q/o are packed
+                                // [total_q, h, d] behind `q_indptr`, and each row's KV
+                                // extent comes from `kv_lens_dev` against the
+                                // rectangular page table. `seqused_k` does not drop the
+                                // K/V batch strides (only `cu_seqlens_k` does,
+                                // flash_api.cpp:105-108), which is what lets a paged
+                                // batch share a launch — per row it was 16 CTAs on 78
+                                // SMs, serialized.
+                                // Split-KV pays only when q is tiny vs kv; a long
+                                // prefill chunk saturates SMs on the q axis alone.
+                                // Upper bound only: FA3 picks the live value itself
+                                // (flash_prepare_scheduler.cu `num_splits_dynamic`),
+                                // clamped by what we pass. pack_gqa leaves batch ×
+                                // kv_heads tiles before splitting, so one tile per SM
+                                // is where the ceiling stops costing anything — raising
+                                // it further only grows the combine scratch, which
+                                // measured +0.36% at batch 8. The historical 8 is the
+                                // floor: it is the measured optimum from batch 4 up,
+                                // and it bound the scheduler only at batch 1, where
+                                // 4×8 = 32 tiles left 46 of 78 SMs idle.
+                                let splits = if meta.seq_len <= FA3_MAX_QLEN {
+                                    match qwen35_fa3_decode_splits() {
+                                        0 => self
+                                            .ctx
+                                            .sm_count()
+                                            .div_ceil(
+                                                meta.batch.max(1) * self.local_kv_heads.max(1),
+                                            )
+                                            .max(FA3_DECODE_SPLITS_FLOOR)
+                                            .clamp(2, 256),
+                                        n => n,
+                                    }
+                                } else {
+                                    1
+                                };
+                                let accum_rows = self.local_q_heads * meta.total_q;
+                                let lse = fa3_lse.get(&self.ctx, accum_rows)?;
+                                let oaccum =
+                                    fa3_oaccum.get(&self.ctx, splits * accum_rows * c.head_dim)?;
+                                let lseaccum = fa3_lseaccum.get(&self.ctx, splits * accum_rows)?;
+                                let meta_cap = meta.batch.div_ceil(4) * 4 * 4 + 1;
+                                let sem = fa3_semaphore.get(&self.ctx, meta_cap)?;
+                                let (lse_ptr, _f0) = lse.device_ptr_mut(&self.ctx.stream);
+                                let (oaccum_ptr, _f1) = oaccum.device_ptr_mut(&self.ctx.stream);
+                                let (lseaccum_ptr, _f2) = lseaccum.device_ptr_mut(&self.ctx.stream);
+                                let (sem_ptr, _f3) = sem.device_ptr_mut(&self.ctx.stream);
+                                let (kv_lens_ptr, _f4) =
+                                    meta.kv_lens_dev.device_ptr(&self.ctx.stream);
+                                let (rect_ptr, _f5) =
+                                    meta.page_table_rect.device_ptr(&self.ctx.stream);
+                                let head_dim = c.head_dim as i64;
+                                let args = ffi::ArleFa3FwdHd256Args {
+                                    q: qp_ptr as *const ffi::Half,
+                                    k: k_pool_ptr as *const ffi::Half,
+                                    v: v_pool_ptr as *const ffi::Half,
+                                    o: ao_ptr as *mut ffi::Half,
+                                    softmax_lse: lse_ptr as *mut f32,
+                                    out_accum: oaccum_ptr as *mut f32,
+                                    softmax_lse_accum: lseaccum_ptr as *mut f32,
+                                    tile_count_semaphore: sem_ptr as *mut i32,
+                                    metadata_capacity: meta_cap as i32,
+                                    cu_seqlens_q: q_indptr_ptr as *const i32,
+                                    seqused_k: kv_lens_ptr as *const i32,
+                                    batch: meta.batch as i32,
+                                    total_q: meta.total_q as i32,
+                                    seqlen_q: meta.seq_len as i32,
+                                    seqlen_k: meta.max_kv_len() as i32,
+                                    num_heads: self.local_q_heads as i32,
+                                    num_heads_k: self.local_kv_heads as i32,
+                                    head_dim: c.head_dim as i32,
+                                    q_row_stride: (self.local_q_heads * c.head_dim) as i64,
+                                    // HND pool [page, h_k, page_size, d]: tokens are
+                                    // contiguous inside a (page, head), heads stride
+                                    // by a page's worth, pages by the whole page.
+                                    k_row_stride: head_dim,
+                                    v_row_stride: head_dim,
+                                    o_row_stride: (self.local_q_heads * c.head_dim) as i64,
+                                    q_head_stride: head_dim,
+                                    k_head_stride: pool.page_size as i64 * head_dim,
+                                    v_head_stride: pool.page_size as i64 * head_dim,
+                                    o_head_stride: head_dim,
+                                    softmax_scale: sm_scale,
+                                    // Bottom-right aligned; the shim demotes to
+                                    // non-causal at qlen 1.
+                                    is_causal: 1,
+                                    num_splits: splits as i32,
+                                    page_table: rect_ptr as *const i32,
+                                    page_table_batch_stride: meta.page_table_stride as i64,
+                                    page_size: pool.page_size as i32,
+                                    num_pages: pool.max_total_pages as i32,
+                                    k_page_stride: stride_page as i64,
+                                    v_page_stride: stride_page as i64,
+                                };
+                                if pool.format == KVFormat::BF16 {
+                                    // SAFETY: q/o are the live prepped/out buffers; k/v are
+                                    // the layer's pool base; the page table is the meta's
+                                    // rectangular mirror, `batch * page_table_stride` long.
+                                    unsafe {
+                                        ffi::arle_fa3_fwd_hd256_bf16_cuda(
+                                            &args,
+                                            self.ctx.stream.cu_stream(),
+                                        )
+                                        .result()?;
+                                    }
+                                } else {
+                                    let quant_args = ffi::ArleFa3FwdHd256QuantArgs {
+                                        base: args,
+                                        k_data: pool.k_data_ptr(full_idx, &self.ctx.stream)
+                                            as *const u8,
+                                        v_data: pool.v_data_ptr(full_idx, &self.ctx.stream)
+                                            as *const u8,
+                                        k_scales: pool.k_scales_ptr(full_idx, &self.ctx.stream)
+                                            as *const f32,
+                                        v_scales: pool.v_scales_ptr(full_idx, &self.ctx.stream)
+                                            as *const f32,
+                                        is_fp8: if pool.format == KVFormat::FP8E4M3 {
+                                            1
+                                        } else {
+                                            0
+                                        },
+                                    };
+                                    // SAFETY: same live buffers as the bf16 arm; the
+                                    // 1-byte pools and per-(token, head) scales are the
+                                    // layer's quantized planes, fresh from the quantize
+                                    // pass above.
+                                    unsafe {
+                                        ffi::arle_fa3_fwd_hd256_quant_cuda(
+                                            &quant_args,
+                                            self.ctx.stream.cu_stream(),
+                                        )
+                                        .result()?;
+                                    }
+                                }
+                                return Ok(());
+                            }
                         }
                         // A persistent-decode meta means a graph capture may be
                         // active — the TileLang lane below bakes `num_pages`
