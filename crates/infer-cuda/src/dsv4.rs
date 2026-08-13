@@ -132,8 +132,6 @@ pub(crate) struct Dsv4Attention {
     /// under `ARLE_DSV4_MLA_PROJ_BF16=1` (the checkpoint ships these F8_E4M3-only).
     /// Presence routes BOTH decode lanes (n=1 fused and n≥2 batched) through bf16
     /// cublasLt so every decode batch size shares one arithmetic; prefill keeps
-    /// the FP8 originals (DeepGEMM prefill licensed −47%). `None` ⇒ no VRAM cost.
-    pub mla_proj_bf16: Option<Dsv4MlaProjBf16>,
     /// DSv4 low-rank output down-projection. `None` ⇔ GLM (`config.plain_o_proj`,
     /// which uses `o_proj` instead).
     pub wo_a: Option<DeviceMatrix>,
@@ -176,25 +174,6 @@ pub(crate) struct Dsv4Attention {
     pub w_kc: Option<DeviceMatrix>,
     #[allow(dead_code)]
     pub w_vc: Option<DeviceMatrix>,
-}
-
-/// #150 bf16 dequant copies of the MLA Q/KV LoRA projections (see
-/// [`Dsv4Attention::mla_proj_bf16`]).
-pub(crate) struct Dsv4MlaProjBf16 {
-    pub wq_a: DeviceMatrix,
-    pub wq_b: DeviceMatrix,
-    pub wkv: DeviceMatrix,
-}
-
-impl Dsv4Attention {
-    /// #150: decode-lane `wq_a`/`wq_b`/`wkv` — the bf16 dequant copies when
-    /// `ARLE_DSV4_MLA_PROJ_BF16` built them at load, else the FP8 originals.
-    pub(crate) fn decode_proj_weights(&self) -> (&DeviceMatrix, &DeviceMatrix, &DeviceMatrix) {
-        match &self.mla_proj_bf16 {
-            Some(p) => (&p.wq_a, &p.wq_b, &p.wkv),
-            None => (&self.wq_a, &self.wq_b, &self.wkv),
-        }
-    }
 }
 
 pub(crate) struct Dsv4WoAGroupTables {
@@ -2538,10 +2517,6 @@ impl Dsv4Model {
         } else {
             None
         };
-        // Batched CSA select-metadata device build (default OFF). Read once; when
-        // ON, `csa_select_official_batched` computes block_table/context_lens/
-        // positions on-device instead of host-build + per-step H2D.
-        let use_device_meta = crate::attention::dsv4_dsa_device_meta_enabled()?;
         // Per-row [*, 1] scratch for the batched projection slice copy-in (each
         // row's c_q_normed / q_prepared / k_prepared sliced out of the batched
         // pre-pass output before the per-slot compressor/pack consume it).
@@ -3518,22 +3493,18 @@ impl Dsv4Model {
                     // Byte-equivalent to the single-row GPU fill:
                     //   context_lens[r] = min(key_count_r, abs_pos_r / ratio)
                     //   positions[r]    = abs_pos_r   (abs_pos_r = start_positions[r])
-                    // Skipped entirely on the device-meta path (kernel computes the
-                    // same values on-device); empty Vecs are ignored there.
                     let mut context_lens_host = Vec::with_capacity(n);
                     let mut positions_host = Vec::with_capacity(n);
-                    if !use_device_meta {
-                        for r in 0..n {
-                            let abs_pos = i32::try_from(start_positions[r]).map_err(|_| {
-                                anyhow!(
-                                    "DSv4 batched CSA abs_pos {} overflows i32",
-                                    start_positions[r]
-                                )
-                            })?;
-                            let avail = (abs_pos / ratio as i32).min(key_counts[r]);
-                            context_lens_host.push(avail);
-                            positions_host.push(abs_pos);
-                        }
+                    for r in 0..n {
+                        let abs_pos = i32::try_from(start_positions[r]).map_err(|_| {
+                            anyhow!(
+                                "DSv4 batched CSA abs_pos {} overflows i32",
+                                start_positions[r]
+                            )
+                        })?;
+                        let avail = (abs_pos / ratio as i32).min(key_counts[r]);
+                        context_lens_host.push(avail);
+                        positions_host.push(abs_pos);
                     }
                     let local_index_heads = self.config.index_n_heads;
                     let score_scale = (self.config.index_head_dim as f32).powf(-0.5)
@@ -3561,7 +3532,7 @@ impl Dsv4Model {
                         score_scale,
                         flash_batch.selected_batched_mut(),
                         &mut keepalive,
-                        use_device_meta,
+                        /* use_device_meta */ false,
                         i32::try_from(ratio)?,
                         batched_positions.as_ref(),
                         &key_counts,
@@ -6578,16 +6549,7 @@ impl Dsv4Model {
         // target physical layer 0. DSv4's shipped MTP layer is forced to
         // compress_ratio=0 (SW-only), so the draft reads that committed target
         // SW ring instead of a fresh one-token attention state.
-        let idx = if let Some(raw) = std::env::var_os("ARLE_DSV4_MTP_FROZEN_LAYER") {
-            raw.to_string_lossy().parse::<usize>().map_err(|err| {
-                anyhow!(
-                    "ARLE_DSV4_MTP_FROZEN_LAYER={} is not a usize: {err}",
-                    raw.to_string_lossy()
-                )
-            })?
-        } else {
-            0
-        };
+        let idx = 0;
         let layer = self.layers.get(idx).ok_or_else(|| {
             anyhow!(
                 "DSv4 MTP frozen-KV target layer {idx} outside base layer count {}",
