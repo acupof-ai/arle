@@ -466,6 +466,23 @@ impl CudaBackend {
             .alloc::<u16>(len)
             .map_err(|_| AutogradError::TapeInvariant("cuda alloc failed (bf16 bridge)"))?;
         let (dst_ptr, _dst_guard) = staging.device_ptr_mut(&self.stream);
+        // The allocation is stream-ordered on self.stream; the copy runs on
+        // src_stream. Record an event after the alloc and make src_stream wait
+        // for it, else the copy can race the allocation.
+        let alloc_event =
+            self.stream.context().new_event(None).map_err(|_| {
+                AutogradError::TapeInvariant("bf16 bridge alloc event create failed")
+            })?;
+        // SAFETY: event and self.stream are valid in this (primary) context.
+        check_cuda_ffi(
+            unsafe { cuEventRecord(alloc_event.cu_event(), self.stream.cu_stream()) },
+            "bf16 bridge alloc event record",
+        )?;
+        // SAFETY: event and src_stream are valid in this (primary) context.
+        check_cuda_ffi(
+            unsafe { cuStreamWaitEvent(src_stream as CUstream, alloc_event.cu_event(), 0) },
+            "bf16 bridge src stream wait alloc",
+        )?;
         // SAFETY: dst spans byte_count bytes (`_dst_guard` held); the caller
         // guarantees src_device_ptr covers byte_count bytes and src_stream is a
         // valid stream in this context whose queued work produced the source.
