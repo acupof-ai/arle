@@ -1465,6 +1465,11 @@ pub(crate) struct TrainW2sArgs {
     #[arg(long, value_name = "PATH")]
     pub(crate) save_adapter: Option<PathBuf>,
 
+    /// Save the adapter every N steps (0 = final adapter only). Without this a
+    /// run interrupted at step N-1 loses every step it ran.
+    #[arg(long, default_value_t = 0)]
+    pub(crate) save_every: usize,
+
     /// Distillation strength α. α·T·‖ΔT‖ should be comparable to ‖z_student‖.
     #[arg(long, default_value_t = 0.5)]
     pub(crate) alpha: f32,

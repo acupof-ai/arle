@@ -2,10 +2,17 @@ use anyhow::{Context, Result, anyhow, bail};
 use autograd::TensorStore;
 
 use super::{
-    opd_checkpoint::save_w2s_adapter,
+    opd_checkpoint::{save_w2s_adapter, should_save_step_checkpoint},
     opd_runtime::{build_opd_store, parse_lora_target_set, trainable_param_ids},
 };
 use crate::args::TrainW2sArgs;
+
+fn vram_gb(store: &TensorStore) -> Option<(f64, f64)> {
+    store.backend().device_mem_info().map(|(free, total)| {
+        let gb = |b: usize| b as f64 / (1u64 << 30) as f64;
+        (gb(total - free), gb(free))
+    })
+}
 
 /// `arle train w2s` — weak-to-strong online distillation.
 ///
@@ -36,14 +43,8 @@ pub(super) fn run_w2s(args: TrainW2sArgs) -> Result<()> {
     eprintln!("[arle train w2s] backend={backend_label}");
 
     fn vram(store: &TensorStore, phase: &str) {
-        if let Some((free, total)) = store.backend().device_mem_info() {
-            let gb = |b: usize| b as f64 / (1u64 << 30) as f64;
-            eprintln!(
-                "[arle train w2s] vram after {phase}: used={:.1} GB free={:.1} GB total={:.1} GB",
-                gb(total - free),
-                gb(free),
-                gb(total)
-            );
+        if let Some((used, free)) = vram_gb(store) {
+            eprintln!("[arle train w2s] vram after {phase}: used={used:.1} GB free={free:.1} GB");
         }
     }
 
@@ -280,14 +281,20 @@ pub(super) fn run_w2s(args: TrainW2sArgs) -> Result<()> {
             .collect::<Vec<_>>()
             .join(" ");
         let total: f64 = outcome.stages.iter().map(|(_, s)| s).sum();
+        // Per-step, not per-phase: an OOM mid-run is only attributable to us or
+        // to a co-tenant if the trend is on every line.
+        let vram_used = match vram_gb(&store) {
+            Some((used, free)) => format!(" vram_used={used:.1} vram_free={free:.1}"),
+            None => String::new(),
+        };
         if outcome.skipped {
             eprintln!(
-                "[arle train w2s] step={step} skipped reason={:?} max_prob={:.4} consistency={:.4} total={total:.3} {stages}",
+                "[arle train w2s] step={step} skipped reason={:?} max_prob={:.4} consistency={:.4} total={total:.3} {stages}{vram_used}",
                 outcome.skip_reason, outcome.max_prob, outcome.consistency
             );
         } else {
             eprintln!(
-                "[arle train w2s] step={step} loss={:.6} max_prob={:.4} consistency={:.4} total={total:.3} {stages}",
+                "[arle train w2s] step={step} loss={:.6} max_prob={:.4} consistency={:.4} total={total:.3} {stages}{vram_used}",
                 outcome.loss, outcome.max_prob, outcome.consistency
             );
             // Shadow → serving: the local KL regularizer now anchors against
@@ -296,22 +303,24 @@ pub(super) fn run_w2s(args: TrainW2sArgs) -> Result<()> {
             // step so the local KL tracks the latest shadow state.
             sync_lora_adapters(&student, &serving, &mut store)?;
         }
-    }
 
-    // Save the trained LoRA adapter if requested.
-    if let Some(adapter_dir) = &args.save_adapter {
-        save_w2s_adapter(
-            &student,
-            &mut store,
-            adapter_dir,
-            &args.student_model,
-            &lora,
-            target_set,
-        )?;
-        eprintln!(
-            "[arle train w2s] adapter saved to {}",
-            adapter_dir.display()
-        );
+        if let Some(adapter_dir) = &args.save_adapter
+            && should_save_step_checkpoint(step + 1, args.steps, args.save_every)
+        {
+            save_w2s_adapter(
+                &student,
+                &mut store,
+                adapter_dir,
+                &args.student_model,
+                &lora,
+                target_set,
+            )?;
+            eprintln!(
+                "[arle train w2s] adapter saved at step={} to {}",
+                step + 1,
+                adapter_dir.display()
+            );
+        }
     }
 
     Ok(())
