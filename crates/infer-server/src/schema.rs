@@ -177,8 +177,7 @@ pub struct CompletionRequest {
     /// accepted for client compatibility.
     #[serde(default)]
     pub logprobs: Option<u32>,
-    /// Token-id → bias map applied to logits before sampling. Engine does not
-    /// support it yet; accepted for client compatibility.
+    /// Token-id → bias map added to the logits before sampling.
     #[serde(default)]
     pub logit_bias: Option<std::collections::HashMap<u32, f32>>,
     /// End-user identifier for abuse monitoring. Accepted but unused.
@@ -191,7 +190,12 @@ impl CompletionRequest {
         if self.prompt.is_empty() {
             return Err(ApiError::bad_request("prompt must not be empty"));
         }
-        validate_common(self.stream, self.max_tokens)
+        validate_common(
+            self.max_tokens,
+            self.repetition_penalty,
+            self.frequency_penalty,
+            self.presence_penalty,
+        )
     }
 
     /// Convert compatible sampling fields into the shared pure-data contract.
@@ -268,8 +272,7 @@ pub struct ChatCompletionRequest {
     /// surface logprobs yet; accepted for client compatibility.
     #[serde(default)]
     pub top_logprobs: Option<u32>,
-    /// Token-id → bias map applied to logits before sampling. Engine does not
-    /// support it yet; accepted for client compatibility.
+    /// Token-id → bias map added to the logits before sampling.
     #[serde(default)]
     pub logit_bias: Option<std::collections::HashMap<u32, f32>>,
     /// End-user identifier for abuse monitoring. Accepted but unused.
@@ -297,7 +300,12 @@ impl ChatCompletionRequest {
                 "messages must contain at least one message",
             ));
         }
-        validate_common(self.stream, self.max_tokens)
+        validate_common(
+            self.max_tokens,
+            self.repetition_penalty,
+            self.frequency_penalty,
+            self.presence_penalty,
+        )
     }
 
     /// Convert compatible sampling fields into the shared pure-data contract.
@@ -509,11 +517,38 @@ impl ChatContentPart {
     }
 }
 
-fn validate_common(_stream: Option<bool>, max_tokens: Option<usize>) -> Result<(), ApiError> {
+fn validate_common(
+    max_tokens: Option<usize>,
+    repetition_penalty: Option<f32>,
+    frequency_penalty: Option<f32>,
+    presence_penalty: Option<f32>,
+) -> Result<(), ApiError> {
     if max_tokens == Some(0) {
         return Err(ApiError::bad_request(
             "max_tokens must be greater than zero",
         ));
+    }
+    // Rejected rather than clamped: a clamp silently answers a different
+    // question than the one asked. `repetition_penalty` 0 is also a NaN hazard —
+    // it maps a grammar-masked `-inf` to NaN, which outranks `+inf` in
+    // `total_cmp` and would hand the argmax to a forbidden token.
+    if let Some(p) = repetition_penalty
+        && !(p > 0.0 && p <= 2.0)
+    {
+        return Err(ApiError::bad_request(
+            "repetition_penalty must be in (0, 2]",
+        ));
+    }
+    for (name, value) in [
+        ("frequency_penalty", frequency_penalty),
+        ("presence_penalty", presence_penalty),
+    ] {
+        // NaN is not contained in any range, so it is rejected here too.
+        if let Some(p) = value
+            && !(-2.0..=2.0).contains(&p)
+        {
+            return Err(ApiError::bad_request(format!("{name} must be in [-2, 2]")));
+        }
     }
     Ok(())
 }
@@ -1305,5 +1340,55 @@ impl IntoResponse for ApiError {
             })),
         )
             .into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ChatCompletionRequest;
+
+    fn chat(penalties: &str) -> ChatCompletionRequest {
+        serde_json::from_str(&format!(
+            r#"{{"messages":[{{"role":"user","content":"hi"}}]{penalties}}}"#
+        ))
+        .expect("request parses")
+    }
+
+    /// An out-of-range penalty must be refused, not clamped and not dropped on
+    /// the floor — the sampler's own `> 0.0` guard would silently ignore it.
+    #[test]
+    fn out_of_range_penalties_are_rejected() {
+        assert!(chat("").validate().is_ok());
+        assert!(chat(r#","repetition_penalty":1.5"#).validate().is_ok());
+        assert!(chat(r#","frequency_penalty":-2.0"#).validate().is_ok());
+
+        for body in [
+            r#","repetition_penalty":0.0"#,
+            r#","repetition_penalty":-1.0"#,
+            r#","repetition_penalty":2.5"#,
+            r#","frequency_penalty":2.1"#,
+            r#","presence_penalty":-2.1"#,
+        ] {
+            assert!(chat(body).validate().is_err(), "{body} must be rejected");
+        }
+    }
+
+    /// NaN passes every naive range check written as `p < lo || p > hi`.
+    #[test]
+    fn nan_penalties_are_rejected() {
+        for body in [
+            r#","repetition_penalty":"#,
+            r#","frequency_penalty":"#,
+            r#","presence_penalty":"#,
+        ] {
+            let mut req = chat("");
+            let nan = Some(f32::NAN);
+            match body {
+                r#","repetition_penalty":"# => req.repetition_penalty = nan,
+                r#","frequency_penalty":"# => req.frequency_penalty = nan,
+                _ => req.presence_penalty = nan,
+            }
+            assert!(req.validate().is_err(), "NaN{body} must be rejected");
+        }
     }
 }
