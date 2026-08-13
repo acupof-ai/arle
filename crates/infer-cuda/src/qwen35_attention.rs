@@ -1577,7 +1577,8 @@ impl Qwen35Model {
             && qwen35_gdr_chunked_enabled()
             && c.linear_key_head_dim == 128
             && c.linear_value_head_dim == 128
-            && fq_fns.is_some_and(|(cumsum, _, _)| fq_kernels_available(&self.ctx, cumsum));
+            && fq_fns.is_some()
+            && fq_kernels_available(&self.ctx);
         if use_fq_chunked {
             // The AOT dispatch wrapper resolves SM + module via the DRIVER
             // context of the calling thread; the engine forward thread is not
