@@ -243,7 +243,6 @@ impl Qwen35Model {
         );
         let vocab = self.output_projection().rows;
         let hidden_size = self.config.hidden_size;
-        let mut pt = mtp_phase_start(&self.ctx);
 
         let mut h_prev = DeviceVec::zeros(&self.ctx, hidden_size)?;
         self.ctx
@@ -259,10 +258,8 @@ impl Qwen35Model {
             chain.push(tok);
             h_prev = h_out;
         }
-        let draft_ms = mtp_phase_lap(&self.ctx, &mut pt);
 
         spec.snapshot_trunk(&self.ctx, slot)?;
-        let snap_ms = mtp_phase_lap(&self.ctx, &mut pt);
 
         // Captures each linear layer's gated-delta inputs for all depth+1 rows
         // so the partial-accept replay can re-advance only the linear state.
@@ -279,7 +276,6 @@ impl Qwen35Model {
             "spec verify dims {dims:?} != [{}, {vocab}]",
             depth + 1
         );
-        let verify_ms = mtp_phase_lap(&self.ctx, &mut pt);
 
         let (emitted, bonus, k) = if params.is_greedy() {
             let mut k = 0usize;
@@ -313,7 +309,6 @@ impl Qwen35Model {
         } else {
             self.mtp_accept_commit_sampled(slot, spec, ws, &chain, &logits, start_pos, params)?
         };
-        let accept_ms = mtp_phase_lap(&self.ctx, &mut pt);
 
         let mut next_hidden = DeviceVec::zeros(&self.ctx, hidden_size)?;
         {
@@ -324,11 +319,6 @@ impl Qwen35Model {
                 .map_err(|e| anyhow!("spec next-hidden copy failed: {e}"))?;
         }
 
-        if pt.is_some() {
-            eprintln!(
-                "[mtp-phase] depth={depth} accept={k} draft={draft_ms:.2} snap={snap_ms:.2} verify={verify_ms:.2} accept_commit={accept_ms:.2} ms"
-            );
-        }
         Ok((emitted, bonus, next_hidden))
     }
 
@@ -446,38 +436,6 @@ impl Qwen35Model {
             slot.set_seq_len(start_pos + k + 1);
         }
         Ok((emitted, bonus, k))
-    }
-}
-
-/// Opt-in phase timing (set `ARLE_MTP_PHASE`); the per-phase sync needed for
-/// accurate GPU timing is off by default so the hot path pays nothing.
-pub(crate) fn mtp_phase_start(ctx: &DeviceContext) -> Option<std::time::Instant> {
-    phase_start(ctx, "ARLE_MTP_PHASE")
-}
-
-pub(crate) fn dspark_phase_start(ctx: &DeviceContext) -> Option<std::time::Instant> {
-    phase_start(ctx, "ARLE_DSPARK_PHASE")
-}
-
-pub(crate) fn phase_start(ctx: &DeviceContext, var: &str) -> Option<std::time::Instant> {
-    if std::env::var(var).is_ok() {
-        let _ = ctx.sync();
-        Some(std::time::Instant::now())
-    } else {
-        None
-    }
-}
-
-pub(crate) fn mtp_phase_lap(ctx: &DeviceContext, t: &mut Option<std::time::Instant>) -> f64 {
-    match t {
-        Some(prev) => {
-            let _ = ctx.sync();
-            let now = std::time::Instant::now();
-            let ms = now.duration_since(*prev).as_secs_f64() * 1000.0;
-            *t = Some(now);
-            ms
-        }
-        None => 0.0,
     }
 }
 
