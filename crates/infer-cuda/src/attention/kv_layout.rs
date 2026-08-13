@@ -385,7 +385,6 @@ pub(crate) struct Dsv4KvAdapter {
     pub(super) dsa_shared: Option<Dsv4DsaSharedScratch>,
     /// One shared MoE decode-graph scratch for ALL layers and slots (issue #60).
     /// `None` unless the DSv4 decode-graph path is enabled.
-    pub(super) moe_decode_shared: Option<crate::moe::Dsv4MoeDecodeScratch>,
     /// One shared compact-FP8 decode-band MoE tail scratch for ALL layers and
     /// slots (launch-bound Step 1). Sized to the band ceiling (128 routes), so
     /// one instance serves every layer/step. `None` only when the model has no
@@ -732,12 +731,8 @@ impl Dsv4KvAdapter {
         num_slots: usize,
         pool_tokens: usize,
         mla_decode: Vec<Option<Dsv4MlaDecodeGraphScratch>>,
-        moe_decode: Option<(
-            &infer_moe::MoeConfig,
-            &ExpertSplit,
-            &crate::dsv4::Dsv4MoeLayer,
-        )>,
         shared_expert_decode: Option<&crate::dsv4::Dsv4MoeLayer>,
+        experts_per_rank: usize,
         hidden_size: usize,
     ) -> Result<Self> {
         ensure!(num_slots > 0, "DSv4 attention pool needs at least one slot");
@@ -797,22 +792,17 @@ impl Dsv4KvAdapter {
             }
             _ => None,
         };
-        let moe_decode_shared = moe_decode
-            .map(|(cfg, split, layer)| {
-                crate::moe::Dsv4MoeDecodeScratch::new(ctx, cfg, split, layer)
-            })
-            .transpose()?;
         // Compact-FP8 decode-band MoE tail scratch — allocated whenever the model
-        // has a MoE layer (from the same `moe_decode` tuple), independent of the
-        // decode graph, since the batched-stream decode path (launch-bound Step 1
-        // target) is the primary consumer.
-        let moe_tail_scratch = moe_decode
-            .map(|(_cfg, split, layer)| {
+        // has a MoE layer, matching the fixed term `kv_budget_plan` already
+        // reserves for it. The batched-stream decode path is the consumer; with
+        // no scratch it falls back to a per-call alloc.
+        let moe_tail_scratch = shared_expert_decode
+            .map(|layer| {
                 crate::moe::Dsv4MoeTailScratch::new(
                     ctx,
                     layer.hidden_dim,
                     layer.intermediate,
-                    split.experts_per_rank,
+                    experts_per_rank,
                 )
             })
             .transpose()?;
@@ -899,7 +889,6 @@ impl Dsv4KvAdapter {
             ctx: ctx.clone(),
             flashmla_pool_tokens: pool_tokens,
             dsa_shared,
-            moe_decode_shared,
             moe_tail_scratch,
             mla_decode,
             shared_expert_out,
@@ -932,12 +921,6 @@ impl Dsv4KvAdapter {
             (
                 "dsa_shared",
                 self.dsa_shared.as_ref().map_or(0, |s| s.device_bytes()),
-            ),
-            (
-                "moe_decode_shared",
-                self.moe_decode_shared
-                    .as_ref()
-                    .map_or(0, |s| s.device_bytes_live()),
             ),
             (
                 "mla_decode",
@@ -1102,12 +1085,6 @@ impl Dsv4KvAdapter {
 
     pub(crate) fn has_flashmla_batch_scratch(&self) -> bool {
         self.flashmla_batch.is_some()
-    }
-
-    pub(crate) fn moe_decode_graph_scratch_mut(
-        &mut self,
-    ) -> Option<&mut crate::moe::Dsv4MoeDecodeScratch> {
-        self.moe_decode_shared.as_mut()
     }
 
     pub(crate) fn moe_tail_scratch_mut(&mut self) -> Option<&mut crate::moe::Dsv4MoeTailScratch> {

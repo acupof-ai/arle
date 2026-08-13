@@ -347,20 +347,6 @@ pub(crate) struct Dsv4DsparkDraft {
 /// rows `[rank*rows_per_rank, rank*rows_per_rank + local_rows)` plus zero-pad
 /// rows up to the uniform 128-aligned `rows_per_rank`. Padding exists only
 /// past the global vocab end, so a rank-order logits gather is vocab-ordered
-/// with the pad tail strictly after `vocab`.
-// The fields are read by the nccl-gated cross-rank sampler
-// (`executor::sample_cuda_token_vocab_sharded`); non-nccl builds bail before use.
-#[cfg_attr(not(feature = "nccl"), allow(dead_code))]
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct Dsv4LmHeadShard {
-    /// Global vocab rows (`config.vocab_size`).
-    pub vocab: usize,
-    /// Uniform padded rows per rank (128-aligned; the local `lm_head.rows`).
-    pub rows_per_rank: usize,
-    /// This rank's real (unpadded) row count; `<= rows_per_rank`.
-    pub local_rows: usize,
-}
-
 /// Loaded DSv4-Flash model for one TP/EP rank.
 pub(crate) struct Dsv4Model {
     pub ctx: DeviceContext,
@@ -370,9 +356,6 @@ pub(crate) struct Dsv4Model {
     pub kv_arena: Dsv4MlaKvArena,
     pub embed_tokens: DeviceMatrix,
     pub lm_head: DeviceMatrix,
-    /// `Some` iff `ARLE_DSV4_LM_HEAD_SHARD=1` at TP>1: `lm_head` then holds
-    /// this rank's vocab slice and decode sampling merges across ranks.
-    pub lm_head_shard: Option<Dsv4LmHeadShard>,
     pub layers: Vec<Dsv4Layer>,
     pub norm: DeviceVec,
     /// Head hyper-connection: folds the wide residual stream back to one hidden
@@ -553,7 +536,6 @@ pub(crate) struct Dsv4SlotState {
     /// it does not fall back to the generic prefill allocator on every layer.
     spec_verify: Option<Dsv4SpecVerifyScratch>,
     start_pos_device: CudaSlice<i32>,
-    decode_graph: Option<Dsv4DecodeGraphScratch>,
     /// Pre-allocated NVSHMEM low-latency MoE scratch, reused across all layers +
     /// decode steps (overwritten in place each `dsv4_moe_forward_deepep_ll`
     /// call). `Some` only when the `deepep_ll` transport is booted. Held once per
@@ -570,7 +552,7 @@ pub(crate) struct Dsv4SlotState {
     /// `[stream_dim, seq_len]` per target layer, consumed once by the DSpark
     /// prefix seed ([`crate::dsv4::dspark`]) and then dropped. Prefill-scoped and
     /// bounded by the chunked-prefill chunk size — deliberately EXCLUDED from the
-    /// per-slot VRAM ledger (like `decode_graph`, it is not resident at build).
+    /// per-slot VRAM ledger (not resident at build).
     dspark_prompt_taps: Option<Dsv4DsparkPromptTaps>,
     seq_len: usize,
     max_seq_len: usize,
@@ -1001,148 +983,6 @@ impl Dsv4SpecVerifyLayerScratch {
     }
 }
 
-pub(crate) struct Dsv4DecodeGraphScratch {
-    token_ids: CudaSlice<i32>,
-    token_ids_u32: CudaSlice<u32>,
-    embeddings: HiddenStates,
-    initial_stream: HiddenStates,
-    layers: Vec<Dsv4DecodeLayerGraphScratch>,
-    tail_graph: crate::graph::CudaGraphState,
-    whole_graph: crate::graph::CudaGraphState,
-    head_stream_row: HiddenStates,
-    head_mixes: HiddenStates,
-    last_hidden: DeviceVec,
-    last_normed: DeviceVec,
-    logits_batch: HiddenStates,
-    logits: DeviceVec,
-}
-
-impl Dsv4DecodeGraphScratch {
-    /// Request-boundary hook: re-arm one eager warm run on every graph state
-    /// (whole-step + per-portion + tail) without dropping the captures. See
-    /// [`crate::graph::CudaGraphState::rearm_warm`].
-    fn rearm_for_new_request(&mut self) {
-        self.whole_graph.rearm_warm(1);
-        self.tail_graph.rearm_warm(1);
-        for layer in &mut self.layers {
-            layer.attn_graph.rearm_warm(1);
-            layer.moe_graph.rearm_warm(1);
-        }
-    }
-}
-
-struct Dsv4DecodeLayerGraphScratch {
-    attn_graph: crate::graph::CudaGraphState,
-    moe_graph: crate::graph::CudaGraphState,
-    attn_mhc: crate::hc::MhcDecodeScratch,
-    ffn_mhc: crate::hc::MhcDecodeScratch,
-    mla: crate::attention::Dsv4MlaDecodeGraphScratch,
-    // Kept for the unfused HC-pre path; current decode graph uses fused MHC pre RMS.
-    #[allow(dead_code)]
-    attn_in: HiddenStates,
-    attn_normed: HiddenStates,
-    attn_out: HiddenStates,
-    attn_stream: HiddenStates,
-    // Kept for the unfused HC-pre path; current decode graph uses fused MHC pre RMS.
-    #[allow(dead_code)]
-    ffn_in: HiddenStates,
-    ffn_normed: HiddenStates,
-    moe_out: HiddenStates,
-    shared: HiddenStates,
-    moe_with_shared: HiddenStates,
-    ffn_stream: HiddenStates,
-}
-
-impl Dsv4DecodeGraphScratch {
-    fn new(model: &Dsv4Model) -> Result<Self> {
-        let hidden_size = model.config.hidden_size;
-        let stream_dim = hidden_size * model.config.hc_mult;
-        let token_ids = model
-            .ctx
-            .stream
-            .alloc_zeros::<i32>(1)
-            .map_err(|e| anyhow!("DSv4 decode graph token-id scratch alloc failed: {e}"))?;
-        let token_ids_u32 = model
-            .ctx
-            .stream
-            .alloc_zeros::<u32>(1)
-            .map_err(|e| anyhow!("DSv4 decode graph u32 token-id scratch alloc failed: {e}"))?;
-        // SAFETY: uninit device scratch; fully written before first read.
-        let embeddings = unsafe { HiddenStates::uninit(&model.ctx, hidden_size, 1)? };
-        // SAFETY: uninit device scratch; fully written before first read.
-        let initial_stream = unsafe { HiddenStates::uninit(&model.ctx, stream_dim, 1)? };
-        let layers: Vec<_> = model
-            .layers
-            .iter()
-            .map(|layer| Dsv4DecodeLayerGraphScratch::new(model, layer))
-            .collect::<Result<Vec<_>>>()?;
-        let last_hidden = DeviceVec::zeros(&model.ctx, hidden_size)?;
-        let last_normed = DeviceVec::zeros(&model.ctx, hidden_size)?;
-        // SAFETY: uninit device scratch; fully written before first read.
-        let head_stream_row = unsafe { HiddenStates::uninit(&model.ctx, stream_dim, 1)? };
-        // SAFETY: uninit device scratch; fully written before first read.
-        let head_mixes = unsafe { HiddenStates::uninit(&model.ctx, model.head_hc.mix_fn.rows, 1)? };
-        // SAFETY: uninit device scratch; fully written before first read.
-        let logits_batch = unsafe { HiddenStates::uninit(&model.ctx, model.lm_head.rows, 1)? };
-        let logits = DeviceVec::zeros(&model.ctx, model.lm_head.rows)?;
-        Ok(Self {
-            token_ids,
-            token_ids_u32,
-            embeddings,
-            initial_stream,
-            layers,
-            tail_graph: crate::graph::CudaGraphState::new(model.ctx.stream.clone()),
-            whole_graph: crate::graph::CudaGraphState::new(model.ctx.stream.clone()),
-            head_stream_row,
-            head_mixes,
-            last_hidden,
-            last_normed,
-            logits_batch,
-            logits,
-        })
-    }
-}
-
-impl Dsv4DecodeLayerGraphScratch {
-    fn new(model: &Dsv4Model, layer: &Dsv4Layer) -> Result<Self> {
-        let hidden_size = model.config.hidden_size;
-        let stream_dim = hidden_size * model.config.hc_mult;
-        Ok(Self {
-            attn_graph: crate::graph::CudaGraphState::new(model.ctx.stream.clone()),
-            moe_graph: crate::graph::CudaGraphState::new(model.ctx.stream.clone()),
-            attn_mhc: crate::hc::MhcDecodeScratch::new(&model.ctx, &model.config, &layer.hc_attn)?,
-            ffn_mhc: crate::hc::MhcDecodeScratch::new(&model.ctx, &model.config, &layer.hc_ffn)?,
-            mla: crate::attention::Dsv4MlaDecodeGraphScratch::new(
-                &model.ctx,
-                &model.config,
-                &layer.attention,
-                layer.mode,
-                layer.compress_ratio,
-            )?,
-            // SAFETY: uninit device scratch; fully written before first read.
-            attn_in: unsafe { HiddenStates::uninit(&model.ctx, hidden_size, 1)? },
-            // SAFETY: uninit device scratch; fully written before first read.
-            attn_normed: unsafe { HiddenStates::uninit(&model.ctx, hidden_size, 1)? },
-            // SAFETY: uninit device scratch; fully written before first read.
-            attn_out: unsafe { HiddenStates::uninit(&model.ctx, hidden_size, 1)? },
-            // SAFETY: uninit device scratch; fully written before first read.
-            attn_stream: unsafe { HiddenStates::uninit(&model.ctx, stream_dim, 1)? },
-            // SAFETY: uninit device scratch; fully written before first read.
-            ffn_in: unsafe { HiddenStates::uninit(&model.ctx, hidden_size, 1)? },
-            // SAFETY: uninit device scratch; fully written before first read.
-            ffn_normed: unsafe { HiddenStates::uninit(&model.ctx, hidden_size, 1)? },
-            // SAFETY: uninit device scratch; fully written before first read.
-            moe_out: unsafe { HiddenStates::uninit(&model.ctx, hidden_size, 1)? },
-            // SAFETY: uninit device scratch; fully written before first read.
-            shared: unsafe { HiddenStates::uninit(&model.ctx, hidden_size, 1)? },
-            // SAFETY: uninit device scratch; fully written before first read.
-            moe_with_shared: unsafe { HiddenStates::uninit(&model.ctx, hidden_size, 1)? },
-            // SAFETY: uninit device scratch; fully written before first read.
-            ffn_stream: unsafe { HiddenStates::uninit(&model.ctx, stream_dim, 1)? },
-        })
-    }
-}
-
 /// Explicit lifetime owner for DSv4 eager forward temporaries.
 ///
 /// `DeviceContext` disables cudarc's implicit event tracking so CUDA graph and
@@ -1387,7 +1227,6 @@ impl Dsv4SlotState {
             spec_normed,
             spec_verify,
             start_pos_device,
-            decode_graph: None,
             #[cfg(feature = "deepep")]
             deepep_ll_scratch,
             dspark_taps,
@@ -1402,9 +1241,6 @@ impl Dsv4SlotState {
     /// spec-normed commit-fold scratch + the `start_pos_device` scalar.
     ///
     /// EXCLUDED (and why):
-    /// - `decode_graph`: `None` at slot construction (lazy, captured on the
-    ///   first decode step — well after engine-build reconciliation). Its
-    ///   captured CUDA-graph internal allocations are opaque to a byte sum.
     /// - `deepep_ll_scratch`: lives behind `#[cfg(feature = "deepep")]` and is
     ///   only `Some` when the NVSHMEM LL transport is booted; sized off-band.
     pub(crate) fn device_bytes(&self) -> usize {
@@ -1548,13 +1384,6 @@ impl Dsv4SlotState {
         for (layer_idx, layer) in self.attention.iter_mut().enumerate() {
             let pool = kv_adapter.layer_mut(layer_idx)?;
             layer.reset(ctx, pool)?;
-        }
-        // Re-arm one eager warm step on every captured decode graph: the new
-        // request's first decode runs the host-side per-request work (SW ring
-        // bootstrap, compressed bulk pack) eagerly, then replay resumes with
-        // the SAME captured graph (capture cost paid once per slot lifetime).
-        if let Some(graph) = self.decode_graph.as_mut() {
-            graph.rearm_for_new_request();
         }
         Ok(())
     }
@@ -1784,12 +1613,6 @@ impl Dsv4SlotState {
             state.restore_prefix_counters(layers[idx].mode, layers[idx].compress_ratio, finish_len);
         }
         self.seq_len = finish_len;
-        // Same request-boundary discipline as reset/swap_in: re-arm one eager
-        // warm step so per-request host work (SW ring bootstrap, compressed
-        // bulk pack) reruns against the restored bands before replay resumes.
-        if let Some(graph) = self.decode_graph.as_mut() {
-            graph.rearm_for_new_request();
-        }
         ctx.sync()?;
         Ok(())
     }
@@ -2249,36 +2072,6 @@ impl Dsv4Model {
         last_hidden_out: Option<&mut DeviceVec>,
     ) -> Result<u32> {
         let seq_len = tokens.len();
-        let moe_transport = crate::runtime_flags::dsv4_moe_transport()?;
-        // FlashMLA-decode captures cleanly (capture-safety fixes e95e11b6).
-        // The graph routes on-device into fixed scratch and runs the masked
-        // MoE tail — no gpu_router/pooled dependency. GLM rides the same FP8 MoE
-        // path (routed + shared) with no per-call scratch alloc, so it captures
-        // like DSv4 (the bf16-shared per-call-alloc hazard that gated GLM off is
-        // gone). ponytail: pod-verify GLM V32 SparseIndexed decode captures+replays
-        // cleanly under the decode-graph (no host launches / per-call alloc in the
-        // indexer/sparse-attention forward) before relying on it for GLM serving.
-        // Lens needs the eager layer loop — a graph replay never executes it
-        // (the entropy probe is unaffected: sampling runs outside the graph).
-        // DSpark needs the eager per-layer loop to capture the 3 target-layer
-        // taps (a graph replay skips the loop), same reason lens / hidden-capture
-        // fall through here. Byte-identical when `is_dspark()` is false.
-        if dsv4_decode_graph_enabled()
-            && last_hidden_out.is_none()
-            && !self.config.is_dspark()
-            && !self.config.is_glm()
-            && seq_len == 1
-            && matches!(
-                moe_transport,
-                crate::runtime_flags::Dsv4MoeTransport::AllReduce
-            )
-            && crate::probe::lens_layers() == 0
-        {
-            return self.forward_tokens_decode_graph(
-                slot, kv_adapter, tokens[0], start_pos, params, position,
-            );
-        }
-
         let (stream, mut keepalive) =
             self.forward_tokens_stream_impl(slot, kv_adapter, tokens, start_pos, false, None)?;
         if seq_len > 1 && crate::probe::token_entropy() {
@@ -2576,8 +2369,7 @@ impl Dsv4Model {
             start_positions,
             capture_taps,
         )?;
-        let fast_head = self.lm_head_shard.is_none()
-            && params.iter().all(SamplingParams::is_greedy)
+        let fast_head = params.iter().all(SamplingParams::is_greedy)
             && !crate::probe::token_entropy()
             && crate::probe::lens_layers() == 0
             && std::env::var_os("INFER_DSV4_DUMP_TOPK_POSITIONS").is_none();
@@ -5186,12 +4978,7 @@ impl Dsv4Model {
         params: &SamplingParams,
         position: u64,
     ) -> Result<u32> {
-        match &self.lm_head_shard {
-            Some(shard) => crate::executor::sample_cuda_token_vocab_sharded(
-                &self.ctx, &self.tp, logits, shard, params, position,
-            ),
-            None => crate::executor::sample_cuda_token(&self.ctx, logits, params, position),
-        }
+        crate::executor::sample_cuda_token(&self.ctx, logits, params, position)
     }
 
     fn forward_tokens_verify_stream_persistent(
@@ -6670,15 +6457,6 @@ impl Dsv4Model {
     /// format (`dsv4_linear`: bf16 → cuBLAS gemm_batch, FP8/FP4 → mla_linear),
     /// weight read once for all `m` rows.
     fn lm_head_project_batch(&self, x: &HiddenStates, out: &mut HiddenStates) -> Result<()> {
-        // The batched consumers (MTP verify/draft heads, entropy probes) need
-        // full-vocab logits per row; the vocab-sharded lm_head only holds this
-        // rank's slice. The load-time gates make this unreachable in serving —
-        // keep it loud for probe/selftest paths.
-        ensure!(
-            self.lm_head_shard.is_none(),
-            "DSv4 batched lm_head consumers (MTP verify/draft, entropy probes) are \
-             not supported with ARLE_DSV4_LM_HEAD_SHARD=1"
-        );
         ensure!(
             self.lm_head.cols == x.hidden_dim
                 && self.lm_head.rows == out.hidden_dim
@@ -6829,385 +6607,6 @@ impl Dsv4Model {
         Ok(idx)
     }
 
-    fn forward_tokens_decode_graph(
-        &self,
-        slot: &mut Dsv4SlotState,
-        kv_adapter: &mut crate::attention::Dsv4KvAdapter,
-        token: u32,
-        start_pos: usize,
-        params: &SamplingParams,
-        position: u64,
-    ) -> Result<u32> {
-        // ponytail: pod-verify GLM decode-graph path (not wired; eager path is the GLM lane)
-        if self.config.is_glm() {
-            anyhow::bail!(
-                "DSv4 decode-graph path does not support GLM (hc_mult==1); use the eager decode path"
-            );
-        }
-        ensure!(
-            slot.seq_len == start_pos,
-            "DSv4 graph decode slot seq_len {} != start_pos {start_pos}",
-            slot.seq_len
-        );
-        let next_len = start_pos
-            .checked_add(1)
-            .ok_or_else(|| anyhow!("DSv4 graph decode start_pos overflow"))?;
-        ensure!(
-            start_pos < slot.max_seq_len,
-            "DSv4 graph decode sequence {} exceeds slot max_seq_len {}",
-            next_len,
-            slot.max_seq_len
-        );
-        ensure!(
-            matches!(
-                crate::runtime_flags::dsv4_moe_transport()?,
-                crate::runtime_flags::Dsv4MoeTransport::AllReduce
-            ),
-            "DSv4 decode graph v1 supports the allreduce transport only"
-        );
-
-        if slot.decode_graph.is_none() {
-            slot.decode_graph = Some(Dsv4DecodeGraphScratch::new(self)?);
-        }
-        let graph = slot
-            .decode_graph
-            .as_mut()
-            .expect("decode graph scratch initialized");
-        let start_pos_i32 = i32::try_from(start_pos)
-            .map_err(|_| anyhow!("DSv4 start_pos {start_pos} overflows i32"))?;
-        self.ctx
-            .stream
-            .memcpy_htod(&[start_pos_i32], &mut slot.start_pos_device)
-            .map_err(|e| anyhow!("DSv4 graph start_pos H2D failed: {e}"))?;
-        self.ctx
-            .stream
-            .memcpy_htod(&[token as i32], &mut graph.token_ids)
-            .map_err(|e| anyhow!("DSv4 graph token-id H2D failed: {e}"))?;
-        self.ctx
-            .stream
-            .memcpy_htod(&[token], &mut graph.token_ids_u32)
-            .map_err(|e| anyhow!("DSv4 graph u32 token-id H2D failed: {e}"))?;
-
-        let hidden_size = self.config.hidden_size;
-        let hc_mult = self.config.hc_mult;
-        let eps = self.config.rms_norm_eps;
-        let mut keepalive = Dsv4ForwardKeepalive::new(false);
-
-        let whole_step = dsv4_whole_step_graph_enabled();
-        ensure!(
-            !(whole_step && self.tp.oneshot_comm_active()),
-            "DSv4 whole-step CUDA graph cannot capture ARLE one-shot CustomAllreduce; \
-             set ARLE_COMM_BACKEND=nccl or disable ARLE_DSV4_WHOLE_STEP_GRAPH"
-        );
-        if whole_step {
-            for s in graph.layers.iter_mut() {
-                s.attn_graph.set_bypass(true);
-                s.moe_graph.set_bypass(true);
-            }
-            graph.tail_graph.set_bypass(true);
-        }
-        // Graph-safe CSA-read lane (opt-in): the READ is graph-capturable but the
-        // cache WRITE (block (a)) is not yet device-shape driven, so run the attn
-        // portion EAGER (bypass capture) to exercise + needle-verify the shape-
-        // stable read without baking the variable-shape cache write. The MoE
-        // portion still captures. When OFF (default), capture as before.
-        let csa_read_lane = crate::attention::dsv4_decode_graph_csa_read_enabled()?;
-        if csa_read_lane && !whole_step {
-            for s in graph.layers.iter_mut() {
-                s.attn_graph.set_bypass(true);
-            }
-        }
-        // The whole per-token forward (loop + tail) as one closure: when whole_step,
-        // captured as ONE graph (graph.whole_graph); else run eagerly with the existing
-        // per-portion captures. advance_decode_len is host bookkeeping that must run
-        // every replay, so it is hoisted OUT of the closure (post-capture) for whole_step.
-        let mut body = || -> Result<()> {
-            for layer_idx in 0..self.layers.len() {
-                let layer = &self.layers[layer_idx];
-                if layer_idx == 0 {
-                    let current = &mut graph.layers[0];
-                    let Dsv4DecodeLayerGraphScratch {
-                        attn_graph,
-                        attn_mhc,
-                        attn_in: _,
-                        attn_normed,
-                        attn_out,
-                        mla,
-                        ..
-                    } = current;
-                    let attn_state = &mut slot.attention[layer_idx];
-                    let (attn_pool, dsa_shared_raw, flashmla_scratch, _prefill, _fp32) =
-                        kv_adapter.layer_and_dsa_shared_mut(layer_idx)?;
-                    // Default decode stays byte-identical (None) unless the CSA read-lane is
-                    // on; the unconditional dsa_shared swap hung eager c=1 decode.
-                    let dsa_shared = dsa_shared_raw.filter(|_| csa_read_lane);
-                    attn_graph.run_or_capture(|| {
-                        crate::ops::embedding_batch(
-                            &self.ctx,
-                            &self.embed_tokens,
-                            &graph.token_ids,
-                            &mut graph.embeddings,
-                        )?;
-                        crate::hc::initial_stream_from_embeddings(
-                            &self.ctx,
-                            &graph.embeddings,
-                            hidden_size,
-                            hc_mult,
-                            &mut graph.initial_stream,
-                        )?;
-                        crate::hc::gen_mhc_params_pre_rms_norm_into(
-                            &self.ctx,
-                            &self.config,
-                            &layer.hc_attn,
-                            &graph.initial_stream,
-                            &layer.attn_norm,
-                            eps,
-                            hidden_size,
-                            attn_mhc,
-                            attn_normed,
-                        )?;
-                        crate::attention::mla_attention_decode_graph(
-                            &self.ctx,
-                            &self.config,
-                            &layer.attention,
-                            layer.mode,
-                            layer.compress_ratio,
-                            layer_idx,
-                            attn_normed,
-                            attn_state,
-                            attn_pool,
-                            dsa_shared,
-                            flashmla_scratch,
-                            start_pos,
-                            Some(&slot.start_pos_device),
-                            &self.tp,
-                            mla,
-                            attn_out,
-                            &mut keepalive,
-                        )
-                    })?;
-                } else {
-                    let (prev_layers, current_layers) = graph.layers.split_at_mut(layer_idx);
-                    let prev = &mut prev_layers[layer_idx - 1];
-                    let current = &mut current_layers[0];
-                    let Dsv4DecodeLayerGraphScratch {
-                        attn_graph,
-                        attn_mhc,
-                        attn_in: _,
-                        attn_normed,
-                        attn_out,
-                        mla,
-                        ..
-                    } = current;
-                    let attn_state = &mut slot.attention[layer_idx];
-                    let (attn_pool, dsa_shared_raw, flashmla_scratch, _prefill, _fp32) =
-                        kv_adapter.layer_and_dsa_shared_mut(layer_idx)?;
-                    // Default decode stays byte-identical (None) unless the CSA read-lane is
-                    // on; the unconditional dsa_shared swap hung eager c=1 decode.
-                    let dsa_shared = dsa_shared_raw.filter(|_| csa_read_lane);
-                    attn_graph.run_or_capture(|| {
-                        crate::ops::add_batch(
-                            &self.ctx,
-                            &prev.moe_out,
-                            &prev.shared,
-                            &mut prev.moe_with_shared,
-                        )?;
-                        crate::hc::hc_post(
-                            &self.ctx,
-                            &prev.moe_with_shared,
-                            &prev.attn_stream,
-                            &prev.ffn_mhc.post,
-                            &prev.ffn_mhc.comb,
-                            hidden_size,
-                            hc_mult,
-                            &mut prev.ffn_stream,
-                        )?;
-                        crate::hc::gen_mhc_params_pre_rms_norm_into(
-                            &self.ctx,
-                            &self.config,
-                            &layer.hc_attn,
-                            &prev.ffn_stream,
-                            &layer.attn_norm,
-                            eps,
-                            hidden_size,
-                            attn_mhc,
-                            attn_normed,
-                        )?;
-                        crate::attention::mla_attention_decode_graph(
-                            &self.ctx,
-                            &self.config,
-                            &layer.attention,
-                            layer.mode,
-                            layer.compress_ratio,
-                            layer_idx,
-                            attn_normed,
-                            attn_state,
-                            attn_pool,
-                            dsa_shared,
-                            flashmla_scratch,
-                            start_pos,
-                            Some(&slot.start_pos_device),
-                            &self.tp,
-                            mla,
-                            attn_out,
-                            &mut keepalive,
-                        )?;
-                        Ok(())
-                    })?;
-                }
-                if !whole_step {
-                    slot.attention[layer_idx].advance_decode_len(
-                        layer.mode,
-                        layer.compress_ratio,
-                        start_pos + 1,
-                    );
-                }
-                self.tp
-                    .all_reduce_sum(&self.ctx, &mut graph.layers[layer_idx].attn_out)?;
-
-                let (stream_in, layer_scratch) = if layer_idx == 0 {
-                    (&graph.initial_stream, &mut graph.layers[0])
-                } else {
-                    let (prev_layers, current_layers) = graph.layers.split_at_mut(layer_idx);
-                    (
-                        &prev_layers[layer_idx - 1].ffn_stream,
-                        &mut current_layers[0],
-                    )
-                };
-                let Dsv4DecodeLayerGraphScratch {
-                    moe_graph,
-                    attn_mhc,
-                    ffn_mhc,
-                    attn_out,
-                    attn_stream,
-                    ffn_in: _,
-                    ffn_normed,
-                    moe_out,
-                    shared,
-                    ..
-                } = layer_scratch;
-                let moe_scratch = kv_adapter.moe_decode_graph_scratch_mut().ok_or_else(|| {
-                    anyhow!("DSv4 decode graph requires shared MoE decode scratch")
-                })?;
-                moe_graph.run_or_capture(|| {
-                    crate::hc::hc_post(
-                        &self.ctx,
-                        attn_out,
-                        stream_in,
-                        &attn_mhc.post,
-                        &attn_mhc.comb,
-                        hidden_size,
-                        hc_mult,
-                        attn_stream,
-                    )?;
-                    crate::hc::gen_mhc_params_pre_rms_norm_into(
-                        &self.ctx,
-                        &self.config,
-                        &layer.hc_ffn,
-                        attn_stream,
-                        &layer.ffn_norm,
-                        eps,
-                        hidden_size,
-                        ffn_mhc,
-                        ffn_normed,
-                    )?;
-                    crate::moe::dsv4_moe_forward_decode_graph(
-                        self,
-                        layer.moe.as_ref().expect("DSv4 layer.moe"),
-                        &graph.token_ids_u32,
-                        ffn_normed,
-                        moe_out,
-                        moe_scratch,
-                    )?;
-                    crate::moe::dsv4_shared_expert_forward_decode_graph(
-                        &self.ctx,
-                        &self.ctx.stream,
-                        layer.moe.as_ref().expect("DSv4 layer.moe"),
-                        ffn_normed,
-                        shared,
-                        self.config.swiglu_limit,
-                        moe_scratch,
-                    )
-                })?;
-                self.tp
-                    .all_reduce_sum(&self.ctx, &mut graph.layers[layer_idx].moe_out)?;
-            }
-
-            let final_idx = self.layers.len() - 1;
-            {
-                // Field-access (no destructure-move) so the outer `body` closure can borrow
-                // `graph` by disjoint fields. Nested tail capture (bypassed under whole_step).
-                let final_scratch = &mut graph.layers[final_idx];
-                let head_stream_row_ref = &mut graph.head_stream_row;
-                let head_mixes_ref = &mut graph.head_mixes;
-                let last_hidden_ref = &mut graph.last_hidden;
-                let last_normed_ref = &mut graph.last_normed;
-                let logits_batch_ref = &mut graph.logits_batch;
-                let logits_ref = &mut graph.logits;
-                graph.tail_graph.run_or_capture(|| {
-                    crate::ops::add_batch(
-                        &self.ctx,
-                        &final_scratch.moe_out,
-                        &final_scratch.shared,
-                        &mut final_scratch.moe_with_shared,
-                    )?;
-                    crate::hc::hc_post(
-                        &self.ctx,
-                        &final_scratch.moe_with_shared,
-                        &final_scratch.attn_stream,
-                        &final_scratch.ffn_mhc.post,
-                        &final_scratch.ffn_mhc.comb,
-                        hidden_size,
-                        hc_mult,
-                        &mut final_scratch.ffn_stream,
-                    )?;
-                    crate::hc::head_hidden_from_stream_into(
-                        &self.ctx,
-                        &self.config,
-                        &self.head_hc,
-                        &final_scratch.ffn_stream,
-                        0,
-                        head_stream_row_ref,
-                        head_mixes_ref,
-                        last_hidden_ref,
-                    )?;
-                    crate::ops::rms_norm_vec(
-                        &self.ctx,
-                        last_hidden_ref,
-                        &self.norm,
-                        eps,
-                        last_normed_ref,
-                    )?;
-                    self.lm_head_project_decode_graph(
-                        last_normed_ref,
-                        logits_batch_ref,
-                        logits_ref,
-                    )?;
-                    Ok(())
-                })?;
-                Ok(())
-            }
-        }; // end `body` closure
-
-        if whole_step {
-            graph.whole_graph.run_or_capture(body)?;
-            // advance_decode_len is host bookkeeping — run every step (replay skips body).
-            for layer_idx in 0..self.layers.len() {
-                let layer = &self.layers[layer_idx];
-                slot.attention[layer_idx].advance_decode_len(
-                    layer.mode,
-                    layer.compress_ratio,
-                    start_pos + 1,
-                );
-            }
-        } else {
-            body()?;
-        }
-
-        slot.seq_len += 1;
-        self.sample_logits(&graph.logits, params, position)
-    }
-
     /// Project the final hidden vector through the LM head into `logits`. The
     /// head can be plain bf16 or DSv4 FP8/FP4 block-scaled, so dispatch the
     /// matching single-vector kernel (`seq_len == 1`).
@@ -7238,44 +6637,6 @@ impl Dsv4Model {
                     .stream
                     .memcpy_dtod(&out_batch.data, &mut logits.data)
                     .map_err(|e| anyhow!("DSv4 lm_head logits copy-back failed: {e}"))?;
-                Ok(())
-            }
-            other => anyhow::bail!("DSv4 lm_head unsupported weight format {other:?}"),
-        }
-    }
-
-    fn lm_head_project_decode_graph(
-        &self,
-        x: &DeviceVec,
-        logits_batch: &mut HiddenStates,
-        logits: &mut DeviceVec,
-    ) -> Result<()> {
-        use cuda_kernels::tensor::WeightFormat;
-        ensure!(
-            self.lm_head.cols == x.len && self.lm_head.rows == logits.len,
-            "DSv4 lm_head shape mismatch: [{}x{}] x.len {} logits.len {}",
-            self.lm_head.rows,
-            self.lm_head.cols,
-            x.len,
-            logits.len
-        );
-        match self.lm_head.weight_format {
-            WeightFormat::DenseBf16 => crate::ops::gemv(&self.ctx, &self.lm_head, x, logits),
-            WeightFormat::Dsv4Fp8BlockScaled | WeightFormat::Dsv4Fp4BlockScaled => {
-                ensure!(
-                    logits_batch.hidden_dim == logits.len && logits_batch.seq_len == 1,
-                    "DSv4 decode graph lm_head batch shape {}x{} != {}x1",
-                    logits_batch.hidden_dim,
-                    logits_batch.seq_len,
-                    logits.len
-                );
-                crate::attention::mla_linear_vec(&self.ctx, &self.lm_head, x, logits_batch)?;
-                self.ctx
-                    .stream
-                    .memcpy_dtod(&logits_batch.data, &mut logits.data)
-                    .map_err(|e| {
-                        anyhow!("DSv4 decode graph lm_head logits copy-back failed: {e}")
-                    })?;
                 Ok(())
             }
             other => anyhow::bail!("DSv4 lm_head unsupported weight format {other:?}"),
@@ -7349,43 +6710,4 @@ fn dsv4_dense_mlp_forward(
     // out = down_w · act  → [hidden, tok]
     crate::attention::dsv4_linear(ctx, &dense.down, &act, out)?;
     Ok(())
-}
-
-fn dsv4_decode_graph_enabled() -> bool {
-    matches!(
-        std::env::var("ARLE_DSV4_DECODE_GRAPH").as_deref(),
-        Ok("1" | "true" | "TRUE" | "yes" | "on" | "ON")
-    )
-}
-
-/// Opt-in decode lever #99 (H3):
-/// row-shard lm_head across TP ranks (replicated full-vocab GEMV → vocab/N rows
-/// per rank). Greedy sampling merges per-rank (max, argmax) via one 8-byte host
-/// all-gather; non-greedy all-gathers the bf16 logit slices to full vocab first.
-/// OFF by default; perf license pending pod A/B + needle gate. TP=1 no-ops.
-fn dsv4_lm_head_shard_enabled() -> bool {
-    matches!(
-        std::env::var("ARLE_DSV4_LM_HEAD_SHARD").as_deref(),
-        Ok("1" | "true" | "TRUE" | "yes" | "on" | "ON")
-    )
-}
-
-/// Whole-step decode CUDA graph: capture the ENTIRE per-token forward (all layers
-/// and the 86 all-reduces + tail) as ONE graph, replayed with ~0 host orchestration.
-///
-/// Requires ARLE_DSV4_DECODE_GRAPH=1 (reuses its pre-allocated scratch).
-///
-/// STATUS (2026-06-08): VALIDATED-CORRECT but WALL-NEUTRAL — kept as gated infra, not
-/// default. The 86-NCCL-all-reduces-in-one-graph capture WORKS and is byte-identical,
-/// but the A/B is wall-neutral (eager 30.38 / per-portion 30.13 / whole-step 30.32 tok/s):
-/// removing ALL host orchestration moves the wall 0%, which is the DEFINITIVE proof that
-/// B=1 decode is GPU/critical-path-bound, NOT host-bound (the earlier "94% GPU-idle" was a
-/// harness-window artifact). Retained as the re-runnable host-vs-GPU diagnostic and the only
-/// concrete capturable-whole-decode reference for future tree-EAGLE/fusion work.
-/// See docs/experience/wins/2026-06-08-dsv4-decode-6ms-FINAL-consolidated.md.
-fn dsv4_whole_step_graph_enabled() -> bool {
-    matches!(
-        std::env::var("ARLE_DSV4_WHOLE_STEP_GRAPH").as_deref(),
-        Ok("1" | "true" | "TRUE" | "yes" | "on" | "ON")
-    )
 }
