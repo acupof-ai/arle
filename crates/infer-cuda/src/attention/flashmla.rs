@@ -964,7 +964,11 @@ impl Dsv4FlashMlaDecodeBatchScratch {
             shape.topk_unified,
             self.max_topk_unified
         );
-        let mode_int = flashmla_mode_int(mode);
+        // Indexer modes (CSA + GLM SparseIndexed) share mode_int=1; SW/HCA use 2.
+        let mode_int = match mode {
+            DeepSeekV4AttentionMode::CompressedSparse | DeepSeekV4AttentionMode::SparseIndexed => 1,
+            DeepSeekV4AttentionMode::SlidingWindow | DeepSeekV4AttentionMode::HybridCompressed => 2,
+        };
         // Single-source sw_blocks / page_block_size for the batched index build.
         let bmap = shape.block_map();
         let (indices_ptr, indices_guard) = self.indices.device_ptr_mut(&ctx.stream);
