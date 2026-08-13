@@ -503,8 +503,6 @@ impl Qwen35Model {
             if let Some(t) = taps.as_deref_mut() {
                 t.capture(&self.ctx, layer_idx as i64, hidden)?;
             }
-            // Per-layer fingerprints (`ARLE_PROBE_STAGES`) so a cross-runtime
-            // disagreement can be bisected to a layer AND to a point inside it.
         }
 
         Ok(())
