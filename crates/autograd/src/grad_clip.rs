@@ -76,6 +76,29 @@ pub fn finite_optimizer_step<O: Optimizer>(
 
     let global_norm = compute_global_norm_f64(params, store);
     if !global_norm.is_finite() {
+        // Localize which params carry the non-finite grads before they are
+        // cleared; index+shape identifies the layer (tensors carry no names).
+        for (index, &param_id) in params.iter().enumerate() {
+            let Some(grad_id) = store.get(param_id).and_then(|tensor| tensor.grad) else {
+                continue;
+            };
+            let Some(grad) = store.get(grad_id) else {
+                continue;
+            };
+            let sq_norm = if grad.dirty != Dirty::Host
+                && let Some(handle) = grad.device_handle.as_ref()
+            {
+                store.backend().sum_squares(handle, &grad.shape).ok()
+            } else {
+                Some(grad.data.iter().map(|&v| f64::from(v) * f64::from(v)).sum())
+            };
+            if sq_norm.is_none_or(|n| !n.is_finite()) {
+                eprintln!(
+                    "[grad-nan] param_index={index} shape={:?} sq_norm={sq_norm:?}",
+                    grad.shape
+                );
+            }
+        }
         optimizer.zero_grad(store, params);
         return Err(FiniteStepError::NonFiniteGradNorm(global_norm));
     }
