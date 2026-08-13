@@ -1,32 +1,5 @@
-// ARLE → FlashMLA CSA prep: build the unified KV pool's per-token index
-// array and topk_length so FlashMLA's single-pool sparse-prefill kernel can
-// attend to ARLE's sliding-window + compressed pools jointly.
-//
-// Pool layout (Variant B1 — dense live range, -1 tail padding):
-//   kv_unified[s_kv_total, 1, d_qk]
-//     [0,             sw_window)         ← window_cache rebased to sw_base
-//     [sw_window,     sw_window + N)     ← k_prepared (current chunk K, RoPE'd)
-//     [sw_window + N, sw_window + N + C) ← compressed pool
-//   s_kv_total = sw_window + N + C
-//
-// Per-row indices [s_q, 1, topk_unified] where topk_unified = sw_window + index_topk
-// (multiple of FlashMLA's 2*B_TOPK = 128). Row layout:
-//   [0,             sw_count_i)               ← SW pool offsets, oldest→newest
-//   [sw_count_i,    sw_count_i + index_topk)  ← compressed pool offsets (with -1 for
-//                                                CSA selector padding or invalid)
-//   [sw_count_i + index_topk, topk_unified)   ← -1 padding
-// topk_length[i] = sw_count_i + index_topk.
-//
-// `selected` is the existing CSA top-k tensor; entries are compressed-block IDs
-// in [0, compressed_count). Negative entries (incomplete CSA selections in
-// early prefill) are propagated as -1 directly so FlashMLA masks them via
-// the `is_token_valid = t >= 0 && t < params.s_kv` check at phase1.cuh:485.
-//
-// Refs:
-//   crates/cuda-kernels/csrc/misc/arle_flashmla_shim.cu
-//   crates/cuda-kernels/vendor/flashmla/csrc/params.h::SparseAttnFwdParams
-//   crates/cuda-kernels/vendor/flashmla/csrc/sm90/prefill/sparse/phase1.cuh
-//   crates/cuda-kernels/csrc/misc/dsv4_attention.cu::dsv4_hybrid_attention_kernel
+// Build per-token index array + topk_length so FlashMLA's single-pool
+// sparse-prefill kernel attends to ARLE's SW + compressed pools jointly.
 
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
@@ -35,37 +8,29 @@
 
 namespace {
 
-// One block per Q token. Threads parallelise over the topk_unified row.
-// Grid:  (s_q, 1, 1)
-// Block: (kBlock=128, 1, 1)
 __global__ void arle_csa_build_indices_kernel(
-        int32_t* __restrict__ indices,       // [s_q, topk_unified] int32
-        int32_t* __restrict__ topk_length,   // [s_q] int32
-        const int32_t* __restrict__ selected,// [s_q, index_topk] int32
+        int32_t* __restrict__ indices,
+        int32_t* __restrict__ topk_length,
+        const int32_t* __restrict__ selected,
         int s_q,
         int start_pos,
-        int sw_window,        // 128
-        int index_topk,       // 512
-        int topk_unified,     // sw_window + index_topk = 640
-        int n_tokens,         // = s_q
-        int compressed_count, // C
-        int compress_ratio,   // for compress-block causality gate (4 for CSA)
-        int sw_base) {        // max(0, start_pos - sw_window)
+        int sw_window,
+        int index_topk,
+        int topk_unified,
+        int n_tokens,
+        int compressed_count,
+        int compress_ratio,
+        int sw_base) {
     int token = blockIdx.x;
     if (token >= s_q) return;
 
     const int abs_pos = start_pos + token;
     const int sw_start = max(0, abs_pos + 1 - sw_window);
-    const int sw_count = abs_pos - sw_start + 1;          // ∈ [1, sw_window]
+    const int sw_count = abs_pos - sw_start + 1;
 
-    const int comp_base_in_pool = sw_window + n_tokens;   // start of compressed region
-
+    const int comp_base_in_pool = sw_window + n_tokens;
     int32_t* row = indices + (size_t)token * topk_unified;
 
-    // [0, sw_count): SW pool offsets.
-    // p ∈ [sw_start, abs_pos]. Pool offset:
-    //   p <  start_pos  →  p - sw_base                  (rolling region [0, sw_window))
-    //   p >= start_pos  →  sw_window + (p - start_pos)  (linear k_prepared region)
     for (int j = threadIdx.x; j < sw_count; j += blockDim.x) {
         int p = sw_start + j;
         int slot = (p < start_pos)
@@ -74,16 +39,7 @@ __global__ void arle_csa_build_indices_kernel(
         row[j] = slot;
     }
 
-    // [sw_count, sw_count + index_topk): compressed pool offsets.
-    // Apply defensive compress-block causality gate (mirrors
-    // dsv4_hybrid_attention_kernel:898-901): selected block c covers
-    // tokens [c*compress_ratio .. (c+1)*compress_ratio - 1]; if
-    // block_end > abs_pos the block summarises future tokens — mask as -1.
-    //
-    // selected can be nullptr when the CSA selector hasn't run yet (very early
-    // prefill, or modes that hit this path without a selector populated). Treat
-    // as "no compressed entries selected" — fill -1 padding so FlashMLA masks
-    // the entire compressed range.
+    // selected == nullptr: no selector yet — fill -1 so FlashMLA masks the range.
     if (selected == nullptr) {
         for (int k = threadIdx.x; k < index_topk; k += blockDim.x) {
             row[sw_count + k] = -1;
@@ -93,6 +49,7 @@ __global__ void arle_csa_build_indices_kernel(
         for (int k = threadIdx.x; k < index_topk; k += blockDim.x) {
             int32_t c = sel[k];
             bool valid = (c >= 0) && (c < compressed_count);
+            // Causality: block c covers [c*ratio, (c+1)*ratio-1]; mask future blocks.
             if (valid && compress_ratio > 0) {
                 int block_end = c * compress_ratio + (compress_ratio - 1);
                 if (block_end > abs_pos) valid = false;
@@ -111,15 +68,9 @@ __global__ void arle_csa_build_indices_kernel(
     }
 }
 
-// Pack the rolling window_cache into linear absolute-position order.
-// dst[i] = key_at_absolute_position(sw_base + i) for i in [0, sw_window).
-// `slot = (sw_base + i) % sw_window` in the rolling buffer.
-//
-// Grid: (sw_window, 1, 1)
-// Block: (kBlock=256, 1, 1)
 __global__ void arle_csa_pack_sw_region_kernel(
-        __nv_bfloat16* __restrict__ dst,          // [sw_window, d_qk]
-        const __nv_bfloat16* __restrict__ window_cache, // [sw_window, d_qk] rolling
+        __nv_bfloat16* __restrict__ dst,
+        const __nv_bfloat16* __restrict__ window_cache,
         int sw_window,
         int sw_base,
         int d_qk) {
@@ -137,29 +88,13 @@ __global__ void arle_csa_pack_sw_region_kernel(
 
 namespace {
 
-// HCA build indices variant.
-//
-// HCA (HybridCompressed) attention has NO top-k selector — it attends to
-// all compressed pages whose block_end <= abs_pos (causal). For each Q-token,
-// the unified pool indices are:
-//   [0,           sw_count_t)            ← SW pool offsets (same as CSA)
-//   [sw_count_t,  sw_count_t + comp_t)   ← identity 0..comp_t-1 into compressed
-//   [sw_count_t + comp_t, topk_unified)  ← -1 padding
-//
-// where comp_t = min(compressed_count, (start_pos + t) / compress_ratio)
-// mirrors `comp_keys = dsv4_imin(compressed_count, abs_pos / compress_ratio)`
-// at dsv4_hybrid_attention_kernel:888 — floor(t/ratio) causal gate, matching
-// the CPU reference and the already-fixed siblings (dsv4_attention.cu:888,
-// dsv4_flashmla_decode_build_indices.cu:114).
-//
-// topk_length[t] = sw_count_t + comp_t.
 __global__ void arle_hca_build_indices_kernel(
-        int32_t* __restrict__ indices,       // [s_q, topk_unified] int32
-        int32_t* __restrict__ topk_length,   // [s_q] int32
+        int32_t* __restrict__ indices,
+        int32_t* __restrict__ topk_length,
         int s_q,
         int start_pos,
         int sw_window,
-        int topk_unified,                    // sw_window + max_compressed (padded to 128)
+        int topk_unified,
         int n_tokens,
         int compressed_count,
         int compress_ratio,
@@ -171,7 +106,7 @@ __global__ void arle_hca_build_indices_kernel(
     const int sw_start = max(0, abs_pos + 1 - sw_window);
     const int sw_count = abs_pos - sw_start + 1;
 
-    // HCA per-token compressed key count (mirrors dsv4_hybrid_attention_kernel:888).
+    // Causal floor: only compressed blocks fully past are visible.
     int comp_keys = (compress_ratio > 0) ? (abs_pos / compress_ratio) : 0;
     if (comp_keys > compressed_count) comp_keys = compressed_count;
     if (comp_keys < 0) comp_keys = 0;
@@ -179,7 +114,6 @@ __global__ void arle_hca_build_indices_kernel(
     const int comp_base_in_pool = sw_window + n_tokens;
     int32_t* row = indices + (size_t)token * topk_unified;
 
-    // [0, sw_count): SW pool offsets (same arithmetic as CSA path).
     for (int j = threadIdx.x; j < sw_count; j += blockDim.x) {
         int p = sw_start + j;
         int slot = (p < start_pos)
@@ -188,7 +122,6 @@ __global__ void arle_hca_build_indices_kernel(
         row[j] = slot;
     }
 
-    // [sw_count, sw_count + comp_keys): identity 0..comp_keys-1 into compressed.
     for (int k = threadIdx.x; k < comp_keys; k += blockDim.x) {
         row[sw_count + k] = comp_base_in_pool + k;
     }
@@ -203,14 +136,6 @@ __global__ void arle_hca_build_indices_kernel(
     }
 }
 
-// Sparse verify indices. Rows may be a top-1 chain or a bounded branch shape:
-//   positions[token] = absolute position for this row
-//   ancestors[token, :] = causal chunk ancestor rows, -1 padded
-//
-// Pool layout is still [SW cache | chunk K | compressed]. Row layout:
-//   committed SW offsets | prefix ancestors + self | compressed part | -1 tail.
-// This keeps D2/T2 at depth+1 rows and lets one FlashMLA sparse call verify the
-// whole chain chunk without writing the slot's rolling SW cache.
 __global__ void arle_chain_verify_build_indices_kernel(
         int32_t* __restrict__ indices,
         int32_t* __restrict__ topk_length,
@@ -301,15 +226,15 @@ __global__ void arle_chain_verify_build_indices_kernel(
     }
 }
 
-}  // namespace (FlashMLA index helpers)
+}  // namespace
 
 extern "C" {
 
 cudaError_t arle_flashmla_csa_pack_kv(
-        __nv_bfloat16* kv_unified,                // [s_kv_total, d_qk]
-        const __nv_bfloat16* window_cache,        // [sw_window, d_qk] rolling
-        const __nv_bfloat16* k_prepared,          // [n_tokens, d_qk] linear
-        const __nv_bfloat16* compressed,          // [compressed_count, d_qk], nullable iff C==0
+        __nv_bfloat16* kv_unified,
+        const __nv_bfloat16* window_cache,
+        const __nv_bfloat16* k_prepared,
+        const __nv_bfloat16* compressed,
         int start_pos,
         int sw_window,
         int n_tokens,
@@ -318,13 +243,7 @@ cudaError_t arle_flashmla_csa_pack_kv(
         cudaStream_t stream) {
     const size_t row_bytes = (size_t)d_qk * sizeof(__nv_bfloat16);
 
-    // [0, sw_window): SW region. Skip when start_pos == 0 — the SW window for
-    // every token in this chunk lies inside k_prepared; this slab is unreferenced.
     if (start_pos > 0) {
-        const int sw_base = std::max(0, start_pos - sw_window);
-        // sw_base == 0 still requires the copy when 0 < start_pos < sw_window
-        // because indices for early tokens reach into [0, sw_window).
-        (void)sw_base;
         constexpr int kBlock = 256;
         arle_csa_pack_sw_region_kernel<<<sw_window, kBlock, 0, stream>>>(
             kv_unified, window_cache, sw_window,
@@ -369,7 +288,7 @@ cudaError_t arle_flashmla_csa_build_indices(
         return cudaErrorInvalidValue;
     }
     const int topk_unified = sw_window + index_topk;
-    // FlashMLA's params.topk must satisfy topk % (2*B_TOPK) == 0 with B_TOPK=64.
+    // FlashMLA requires topk % 128 == 0.
     if ((topk_unified & 127) != 0) return cudaErrorInvalidValue;
 
     const int sw_base = std::max(0, start_pos - sw_window);
@@ -377,23 +296,17 @@ cudaError_t arle_flashmla_csa_build_indices(
     arle_csa_build_indices_kernel<<<s_q, kBlock, 0, stream>>>(
         indices, topk_length, selected,
         s_q, start_pos, sw_window, index_topk, topk_unified,
-        /*n_tokens=*/s_q, compressed_count, compress_ratio, sw_base);
+        s_q, compressed_count, compress_ratio, sw_base);
     return cudaGetLastError();
 }
 
-// HCA (HybridCompressed) indices launcher. No selector — attend to all
-// compressed pages causally. topk_unified must be a multiple of 128.
-//
-// max_compressed_keys is the cap padded into the indices buffer; pass the
-// total compressed_count for this chunk (or the next-multiple-of-128 padded
-// length the caller allocated).
 cudaError_t arle_flashmla_hca_build_indices(
         int32_t* indices,
         int32_t* topk_length,
         int s_q,
         int start_pos,
         int sw_window,
-        int max_compressed_keys,    // pool capacity for compressed slots in indices row
+        int max_compressed_keys,
         int compressed_count,
         int compress_ratio,
         cudaStream_t stream) {
@@ -409,7 +322,7 @@ cudaError_t arle_flashmla_hca_build_indices(
     arle_hca_build_indices_kernel<<<s_q, kBlock, 0, stream>>>(
         indices, topk_length,
         s_q, start_pos, sw_window, topk_unified,
-        /*n_tokens=*/s_q, compressed_count, compress_ratio, sw_base);
+        s_q, compressed_count, compress_ratio, sw_base);
     return cudaGetLastError();
 }
 
@@ -444,16 +357,13 @@ cudaError_t arle_flashmla_chain_verify_build_indices(
     arle_chain_verify_build_indices_kernel<<<s_q, kBlock, 0, stream>>>(
         indices, topk_length, positions, ancestors, max_anc, selected,
         s_q, start_pos, sw_window, index_topk, max_compressed, topk_unified,
-        /*n_tokens=*/s_q, compressed_count, compress_ratio);
+        s_q, compressed_count, compress_ratio);
     return cudaGetLastError();
 }
 
-// Fill padded indices/topk_length rows for V2.3 s_q padding. Rows
-// [s_q_actual..s_q_padded) get indices = -1 and topk_length = 0 so
-// FlashMLA produces well-defined (garbage we discard) outputs for them.
 cudaError_t arle_flashmla_fill_pad_rows(
-        int32_t* indices,           // [s_q_padded, topk_unified]
-        int32_t* topk_length,       // [s_q_padded]
+        int32_t* indices,
+        int32_t* topk_length,
         int s_q_actual,
         int s_q_padded,
         int topk_unified,

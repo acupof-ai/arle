@@ -34,7 +34,7 @@ impl Dsv4FlashMlaDecodeShape {
         // Two FlashMLA decode shapes are wired: MODEL1 (head_dim=512 / 584 B/tok,
         // DSv4 pre-absorbed) and V32 (head_dim=576 / 656 B/tok, GLM-5.2 latent =
         // kv_lora_rank(512)+rope(64)). Both ride the same sparse-FP8 decode kernel
-        // with a model_type/byte-stride switch (see `try_flashmla_decode_attention`).
+        // with a model_type/byte-stride switch (see `flashmla_decode_attention`).
         ensure!(
             (config.head_dim == 512 && kv_arena.bytes_per_token == 584)
                 || (config.head_dim == 576 && kv_arena.bytes_per_token == 656),
@@ -1208,7 +1208,7 @@ impl Dsv4FlashMlaDecodeBatchScratch {
     /// global-head Q. Single-GPU (tp_world==1): a straight D2D copy of the
     /// `[local_heads*head_dim]` row (h_q==local_heads). TP: NCCL all-gather of
     /// this rank's Q into `tp_gathered_q`, then `dsv4_tp_q_repack_cuda` into
-    /// `q_batched[r]` — identical to the single-row `try_flashmla_decode_attention`
+    /// `q_batched[r]` — identical to the single-row `flashmla_decode_attention`
     /// gather, run once per row instead of feeding a per-row fwd.
     pub(crate) fn gather_q_row(
         &mut self,
