@@ -584,7 +584,11 @@ fn sampling_params(
         seed,
         max_new_tokens: max_tokens,
         grammar_bitmask: None,
-        logit_bias: logit_bias.unwrap_or_default(),
+        logit_bias: {
+            let mut v: Vec<(u32, f32)> = logit_bias.unwrap_or_default().into_iter().collect();
+            v.sort_by_key(|&(tok, _)| tok);
+            v
+        },
         n: n.unwrap_or(1).max(1),
     }
 }

@@ -161,7 +161,10 @@ pub struct SamplingParams {
     /// accepted token.
     pub grammar_bitmask: Option<std::sync::Arc<[u32]>>,
     /// Token-id → logit bias added before sampling.
-    pub logit_bias: std::collections::HashMap<u32, f32>,
+    /// A map would serialize its keys as JSON strings, and the multiproc relay
+    /// then fails to read them back as `u32` — one biased request killed every
+    /// TP>1 worker. Pairs, sorted by token id, survive the round trip.
+    pub logit_bias: Vec<(u32, f32)>,
     /// Engine supports one; values > 1 are handled by the API layer.
     pub n: usize,
 }
@@ -181,7 +184,7 @@ impl Default for SamplingParams {
             seed: None,
             max_new_tokens: None,
             grammar_bitmask: None,
-            logit_bias: std::collections::HashMap::new(),
+            logit_bias: Vec::new(),
             n: 1,
         }
     }
