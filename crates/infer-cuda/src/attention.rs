@@ -161,9 +161,7 @@ pub(crate) fn commit_layer_fold(
          (num_nextn_predict_layers==0) so this path is unreachable"
     );
     if mode.has_compressor() {
-        let compressor = attention.compressor.as_ref().ok_or_else(|| {
-            anyhow!("DSv4 commit fold: {mode:?} layer without compressor weights")
-        })?;
+        let compressor = attention.compressor();
         let overlap = compress_ratio < 16;
         let compressor_state = state
             .compressor
@@ -1558,8 +1556,12 @@ pub(crate) fn dsv4_flashmla_layer_pool_pages(
 /// `--dsv4-flashmla-decode false` must NOT zero the pool's page budget, since the
 /// scalar kernel reads the same layout (pod-verified: sizing every band at 0 pages
 /// made admission reject almost every request).
+/// Must stay a forwarder, not a copy of the body: the A/B override can force the
+/// fused path ON, and a scratch-allocation gate that ignored it would let the two
+/// disagree - the decode then hits "fused wqkv decode requested but decode scratch
+/// was not allocated".
 pub(crate) fn dsv4_fused_wqkv_decode_alloc_enabled() -> Result<bool> {
-    Ok(cuda_kernels::has_deepgemm_native())
+    dsv4_fused_wqkv_decode_enabled()
 }
 
 fn dsv4_fused_wqkv_decode_enabled() -> Result<bool> {
@@ -3565,9 +3567,7 @@ impl Dsv4MlaDecodeScratch {
         let local_width = attention.wq_b.rows;
         let oproj_rows = attention.wo_a().rows;
         let (compressor_main_kv, compressor_main_score) = if mode.has_compressor() {
-            let compressor = attention.compressor.as_ref().ok_or_else(|| {
-                anyhow!("DSv4 MODEL1 decode scratch mode {mode:?} requires compressor weights")
-            })?;
+            let compressor = attention.compressor();
             (
                 // SAFETY: uninit device scratch; fully written before first read.
                 Some(unsafe { HiddenStates::uninit(ctx, compressor.wkv.rows, 1)? }),
@@ -3579,9 +3579,7 @@ impl Dsv4MlaDecodeScratch {
         };
         let (compressor_index_kv, compressor_index_score) =
             if mode == DeepSeekV4AttentionMode::CompressedSparse {
-                let indexer = attention.indexer.as_ref().ok_or_else(|| {
-                    anyhow!("DSv4 MODEL1 decode CSA scratch requires indexer weights")
-                })?;
+                let indexer = attention.indexer();
                 let compressor = indexer.compressor.as_ref().ok_or_else(|| {
                     anyhow!("DSv4 MODEL1 decode CSA scratch requires indexer compressor")
                 })?;
@@ -3595,9 +3593,7 @@ impl Dsv4MlaDecodeScratch {
                 (None, None)
             };
         let (csa_q_i, csa_weights, csa_selected) = if mode.has_indexer() {
-            let indexer = attention.indexer.as_ref().ok_or_else(|| {
-                anyhow!("DSv4 MODEL1 decode scratch mode {mode:?} requires indexer")
-            })?;
+            let indexer = attention.indexer();
             (
                 // SAFETY: uninit device scratch; fully written before first read.
                 Some(unsafe { HiddenStates::uninit(ctx, indexer.wq_b.rows, 1)? }),
@@ -3994,9 +3990,7 @@ pub(crate) fn mla_attention_decode(
 
     let mut selected_ready = false;
     if mode.has_compressor() {
-        let compressor = attention.compressor.as_ref().ok_or_else(|| {
-            anyhow!("DSv4 layer {layer_idx} is {mode:?} but has no compressor weights")
-        })?;
+        let compressor = attention.compressor();
         let kv = scratch
             .compressor_main_kv
             .as_mut()
@@ -4010,9 +4004,7 @@ pub(crate) fn mla_attention_decode(
             config,
             compressor,
             hidden,
-            state.compressor.as_mut().ok_or_else(|| {
-                anyhow!("DSv4 layer {layer_idx} is {mode:?} but has no compressor state")
-            })?,
+            state.compressor_mut(),
             head_dim,
             compress_ratio,
             compress_ratio < 16,
@@ -4030,9 +4022,7 @@ pub(crate) fn mla_attention_decode(
             mode == DeepSeekV4AttentionMode::CompressedSparse,
             "DSv4 MODEL1 decode does not support SparseIndexed/GLM indexer"
         );
-        let indexer = attention.indexer.as_ref().ok_or_else(|| {
-            anyhow!("DSv4 layer {layer_idx} is {mode:?} but has no indexer weights")
-        })?;
+        let indexer = attention.indexer();
         let indexer_rows_before = state
             .indexer
             .as_ref()
@@ -4051,9 +4041,7 @@ pub(crate) fn mla_attention_decode(
             anyhow!("DSv4 MODEL1 decode indexer compressor score scratch missing")
         })?;
         {
-            let indexer_state = state.indexer.as_mut().ok_or_else(|| {
-                anyhow!("DSv4 layer {layer_idx} is {mode:?} but has no indexer state")
-            })?;
+            let indexer_state = state.indexer_mut();
             compressor_forward_decode(
                 ctx,
                 config,
@@ -4760,20 +4748,14 @@ pub(crate) fn mla_attention_prepare(
         // SparseIndexed has no MAIN compressor, so gate on has_compressor().
         let overlap = compress_ratio < 16;
         if mode.has_compressor() {
-            let compressor = attention.compressor.as_ref().ok_or_else(|| {
-                anyhow::anyhow!("DSv4 layer {layer_idx} is {mode:?} but has no compressor weights")
-            })?;
+            let compressor = attention.compressor();
             if skip_frozen_compressor {
                 ensure!(
                     state.compressor.is_some(),
                     "DSv4 layer {layer_idx} is {mode:?} but has no compressor state"
                 );
             } else {
-                let compressor_state = state.compressor.as_mut().ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "DSv4 layer {layer_idx} is {mode:?} but has no compressor state"
-                    )
-                })?;
+                let compressor_state = state.compressor_mut();
                 compressor_forward(
                     ctx,
                     config,
@@ -4799,9 +4781,7 @@ pub(crate) fn mla_attention_prepare(
         }
 
         if mode.has_indexer() {
-            let indexer = attention.indexer.as_ref().ok_or_else(|| {
-                anyhow::anyhow!("DSv4 layer {layer_idx} is {mode:?} but has no indexer weights")
-            })?;
+            let indexer = attention.indexer();
             let indexer_rope_original_seq_len = config.rope_parameters.original_seq_len_i32()?;
             let indexer_rows_before = state
                 .indexer
@@ -4818,9 +4798,7 @@ pub(crate) fn mla_attention_prepare(
                     "DSv4 layer {layer_idx} is {mode:?} but has no indexer state"
                 );
             } else {
-                let indexer_state = state.indexer.as_mut().ok_or_else(|| {
-                    anyhow::anyhow!("DSv4 layer {layer_idx} is {mode:?} but has no indexer state")
-                })?;
+                let indexer_state = state.indexer_mut();
                 if mode == DeepSeekV4AttentionMode::CompressedSparse {
                     compressor_forward(
                         ctx,
@@ -5188,14 +5166,10 @@ pub(crate) fn mla_attention_compressor_defer_row(
         return Ok(0);
     }
     let head_dim = config.head_dim;
-    let compressor = attention.compressor.as_ref().ok_or_else(|| {
-        anyhow!("DSv4 layer {layer_idx} is {mode:?} but has no compressor weights")
-    })?;
+    let compressor = attention.compressor();
     let overlap = compress_ratio < 16;
     {
-        let compressor_state = state.compressor.as_mut().ok_or_else(|| {
-            anyhow!("DSv4 layer {layer_idx} is {mode:?} but has no compressor state")
-        })?;
+        let compressor_state = state.compressor_mut();
         compressor_forward(
             ctx,
             config,
@@ -5220,18 +5194,14 @@ pub(crate) fn mla_attention_compressor_defer_row(
     }
     let mut indexer_rows_before = 0usize;
     if mode == DeepSeekV4AttentionMode::CompressedSparse {
-        let indexer = attention.indexer.as_ref().ok_or_else(|| {
-            anyhow!("DSv4 layer {layer_idx} is CompressedSparse but has no indexer weights")
-        })?;
+        let indexer = attention.indexer();
         let indexer_rope_original_seq_len = config.rope_parameters.original_seq_len_i32()?;
         indexer_rows_before = state
             .indexer
             .as_ref()
             .map(|s| s.compressed.seq_len)
             .unwrap_or(0);
-        let indexer_state = state.indexer.as_mut().ok_or_else(|| {
-            anyhow!("DSv4 layer {layer_idx} is CompressedSparse but has no indexer state")
-        })?;
+        let indexer_state = state.indexer_mut();
         compressor_forward(
             ctx,
             config,
@@ -5354,15 +5324,9 @@ pub(crate) fn mla_attention_prepare_compressed_only(
         // already
         // ran the STATE update batched in the pre-pass, so skip it here.
         if mode.has_compressor() {
-            let compressor = attention.compressor.as_ref().ok_or_else(|| {
-                anyhow::anyhow!("DSv4 layer {layer_idx} is {mode:?} but has no compressor weights")
-            })?;
+            let compressor = attention.compressor();
             if !skip_compressor {
-                let compressor_state = state.compressor.as_mut().ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "DSv4 layer {layer_idx} is {mode:?} but has no compressor state"
-                    )
-                })?;
+                let compressor_state = state.compressor_mut();
                 compressor_forward(
                     ctx,
                     config,
@@ -5385,9 +5349,7 @@ pub(crate) fn mla_attention_prepare_compressed_only(
         }
 
         if mode.has_indexer() {
-            let indexer = attention.indexer.as_ref().ok_or_else(|| {
-                anyhow::anyhow!("DSv4 layer {layer_idx} is {mode:?} but has no indexer weights")
-            })?;
+            let indexer = attention.indexer();
             let indexer_rope_original_seq_len = config.rope_parameters.original_seq_len_i32()?;
             // `indexer_rows_before` = the indexer compressed row count BEFORE this
             // step's
@@ -5409,9 +5371,7 @@ pub(crate) fn mla_attention_prepare_compressed_only(
             // full-length
             // index key per token (ratio=1, no compressor).
             if !skip_compressor {
-                let indexer_state = state.indexer.as_mut().ok_or_else(|| {
-                    anyhow::anyhow!("DSv4 layer {layer_idx} is {mode:?} but has no indexer state")
-                })?;
+                let indexer_state = state.indexer_mut();
                 if mode == DeepSeekV4AttentionMode::CompressedSparse {
                     compressor_forward(
                         ctx,
