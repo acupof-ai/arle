@@ -67,8 +67,7 @@ workers see them; train flags apply via `train::apply_runtime_flags`):
 | `ARLE_GDR_CHUNKWISE_PREFILL` / `ARLE_LA_BACKWARD_MONO` / `ARLE_AUTOGRAD_DECODE_ATTN_LEGACY` | `arle train <opd> --gdr-chunkwise-prefill` / `--la-backward-mono` / `--autograd-decode-attn-legacy` |
 
 Deferred (read site inside frozen DSv4 files this pass):
-`ARLE_DSV4_DECODE_GRAPH`, `ARLE_DSV4_WHOLE_STEP_GRAPH`,
-`ARLE_DSV4_MOE_TRANSPORT`/`ARLE_DSV4_MOE_BACKEND`, `ARLE_DSV4_LM_HEAD_SHARD`.
+`ARLE_DSV4_MOE_TRANSPORT`/`ARLE_DSV4_MOE_BACKEND`.
 
 ---
 
@@ -145,25 +144,6 @@ export ARLE_MODEL=models/Qwen3.5-4B
 `1` = `madvise(MADV_HUGEPAGE)` on freshly created KV spill mmaps
 (`kv-native-sys`). Probe for the write-burst first-touch-fault ceiling;
 off by default until an A/B licenses it. Linux only.
-
-### `ARLE_PROBE_JSONL` / `ARLE_PROBE_LENS_LAYERS` / `ARLE_PROBE_TOKEN_ENTROPY` (debug/probe)
-
-CUDA inference-analysis probe (`infer-cuda/src/probe.rs`). `ARLE_PROBE_JSONL=
-<path>` is the master switch: TP rank 0 truncates/creates the file and writes
-one JSONL record per token — raw-logit (T=1, pre-penalty) entropy + NLL for
-every prefill position and every sampled decode token — plus, on the DSv4/GLM
-eager decode path, a logit-lens record per layer for the last
-`ARLE_PROBE_LENS_LAYERS` layers (default `10`; `0` disables the lens; a
-non-zero lens forces eager decode past the `ARLE_DSV4_DECODE_GRAPH` dispatch).
-`ARLE_PROBE_TOKEN_ENTROPY=0` turns off the per-token records. Unset = probe
-fully off (production default; one `OnceLock` load per hook, no alloc/D2H).
-Set via `arle serve --probe-out <path> [--probe-lens-layers N]
-[--probe-token-entropy BOOL]`; direct env also honored (multiproc rank
-children inherit it). Consumer caveats (measured 2026-07-02, see
-[wins entry](experience/wins/2026-07-02-cuda-probe-lens-entropy.md)): filter
-`decode` records to `pos ≥ prompt_len` (non-final prefill chunks emit one
-discarded boundary sample); positions restart per request; bf16 argmax ties
-can flag `agree=false` (detect via `top1_logprob == −nll`).
 
 ### `ARLE_KV_SSD_PATH`
 
@@ -377,7 +357,6 @@ as diagnostics and validation gates, not stable tuning API.
 |---|---|---|---|
 | `ARLE_DSV4_MOE_BACKEND` (alias `ARLE_DSV4_MOE_TRANSPORT`) | `allreduce` (default), `deepep`, `deepep_ll` | `allreduce` | Selects the DSv4 MoE transport (`infer-cuda/src/dsv4.rs::dsv4_use_deepep_transport`). `allreduce` = local routed experts + EP all-reduce (the licensed default). `deepep` / `deepep_ll` = NVSHMEM token-owned DeepEP paths; B=1 deepep_ll is fixed (`b5f00399`) but the batched lane license is open (#61) — not default-worthy yet. |
 | `ARLE_DSV4_INCREMENTAL_KV` | `1` / unset | unset | Enables the incremental DSv4 KV state path used by the 8-rank HTTP bring-up. |
-| `ARLE_DSV4_LM_HEAD_SHARD` | `1` / unset | unset | Opt-in decode perf experiment (#99): row-shards lm_head across TP ranks (contiguous 128-aligned vocab slices, uniform-padded), replacing the replicated full-vocab GEMV per rank. Greedy sampling merges per-rank `(max, argmax)` via one 8-byte host all-gather (exact vs replicated argmax, lowest-index tie rule); non-greedy all-gathers the bf16 logit slices to full vocab before the standard sampler. TP=1 no-ops (byte-identical). Refuses MTP spec decode and `ARLE_PROBE_TOKEN_ENTROPY` at load (full-vocab batched lm_head consumers); `INFER_DSV4_DUMP_TOPK*` is skipped on this path. Off by default — license pending pod A/B + needle gate. |
 | `ARLE_DSV4_OPERATOR_TRACE` | `1` / unset | unset | Enables the same CUDA-synchronizing DSv4 operator aggregate in `request_trace` JSON without emitting every per-layer event log line. The field is `dsv4_operator_trace_process_delta` and is valid for single-inflight profiling only. |
 | `ARLE_DSV4_OPERATOR_TRACE_EVENTS` | `1` / unset | unset | With `ARLE_DSV4_OPERATOR_TRACE=1`, also emits the legacy `dsv4_trace layer=... phase=...` event log lines. |
 | `ARLE_DSV4_COUNT_EXCHANGE` | `allgather`, `sendrecv` | `allgather` | Selects the tiny per-layer route-count exchange. `sendrecv` keeps the older grouped P2P fallback. |
@@ -387,8 +366,6 @@ as diagnostics and validation gates, not stable tuning API.
 | `ARLE_DSV4_GROUPED_EXPERTS` | `1` / unset | unset | Enables the raw grouped expert GEMV prototype. The current harness caches per-layer local expert weight pointer arrays and launches only indexed active experts, but remains slower than the default scratch-reuse path on B=1 decode until the raw GEMV work is replaced by real grouped GEMM/DeepGEMM. |
 | `ARLE_DSV4_PAIR_EXPERT_GEMV` | `1` / unset | unset | Enables the single-expert `w1`/`w3` pair GEMV experiment in the default local expert loop. The 8xH20 Nsight trace shows it is functionally correct but slower on the current B=1 decode shape, so it remains default-off. |
 | `ARLE_DSV4_ROUTE_GROUPED_EXPERTS` | `1` / unset | unset | Enables the route-wise grouped local expert experiment for padded B=1 decode. The opt-in path pairs route-local `w1`/`w3` GEMV when DSv4 block-scaled formats match and applies route weights after BF16 `w2` output to preserve baseline rounding. It removes D2H from the filtered decode nsys summary, but remains default-off: 2026-05-26 validation improved short decode only -4.60% and regressed longseq `max_tokens=32` by +1.36%. Use only for diagnostics until replaced by true grouped GEMM/DeepGEMM with DeepEP overlap. |
-| `ARLE_DSV4_PROJ_BATCHED_BF16` | `1`, `0`, unset | unset | #150 opt-in correctness lever: forces the bf16 cublasLt path in the batched decode compressor/indexer projections (`proj_batched`) even at m>1, skipping the FP8-repack DeepGEMM lane. Measured partial mitigation for concurrent-decode digit corruption (n=2 needle miss 57.1%→30.0%, truncation-class eliminated); the residual digit-substitution class originates upstream in the F8-only MLA projection and is not covered. Trades tensor-core throughput at n≥2 — off by default pending a perf license. |
-| `ARLE_DSV4_MLA_PROJ_BF16` | `1`, `0`, unset | unset | #150 opt-in correctness lever, sibling of `ARLE_DSV4_PROJ_BATCHED_BF16` covering the residual: the MLA `wq_a`/`wq_b`/`wkv` weights are F8_E4M3-only in the checkpoint, so at LOAD the loader also builds dense-bf16 dequant copies (host-side block dequant; +2× the F8 bytes VRAM, logged at load) and routes BOTH decode lanes — n=1 fused-wqkv and n≥2 batched (`mla_attention_prepare_proj_batch`) — through bf16 cublasLt, so every decode batch size shares one arithmetic. Prefill keeps FP8 DeepGEMM (licensed −47%). Checked at load only; no VRAM or dispatch change when unset. |
 | `ARLE_DSV4_EXPERT_BACKEND` | `native`, `deepgemm` | `deepgemm` | Selects the DSv4 local expert backend. The runtime default is required DeepGEMM: the native DeepGEMM JIT bridge and resident FP8 expert-weight cache must preflight successfully, or DSv4 fails before serving instead of silently falling back to native grouped GEMV. `native` keeps the current per-expert/raw grouped GEMV paths for controlled diagnosis only. There is no `deepgemm-auto` fallback in the DSv4 fast lane. |
 | `ARLE_DSV4_DEEPGEMM_DEVICE_COUNTS` | `1`, `0`, unset | `1` | Enables the padded B=1 DeepGEMM local-expert path that keeps recv-side local expert counts and offsets on device. It uses dense all-local-expert metadata, initializes unused compact route slots to `-1`, and skips them during scatter. Set `0` to force the older host `local_counts` D2H path for A/B diagnosis. |
 | `ARLE_DSV4_DEEPGEMM_ZERO_FP8_SCRATCH` | `1` / unset | unset | Forces the pre-2026-06-01 DeepGEMM behavior of clearing FP8 input/activation scratch every expert call. Default unset skips those large FP8 memsets and relies on `masked_m` plus valid-row unpad/scatter; scale buffers are still cleared for TMA-aligned padding safety. |
