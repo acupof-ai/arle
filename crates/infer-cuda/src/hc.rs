@@ -27,11 +27,6 @@ pub(crate) struct MhcParams {
     pub comb: CudaSlice<f32>,
 }
 
-#[allow(dead_code)]
-pub(crate) struct MhcParamsRef<'a> {
-    pub pre: &'a CudaSlice<f32>,
-}
-
 /// Expand token embeddings `[hidden_size, seq]` into the initial wide HC stream
 /// `[hidden_size * hc_mult, seq]` (each lane seeded from the embedding).
 pub(crate) fn initial_stream_from_embeddings(

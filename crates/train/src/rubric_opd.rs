@@ -45,10 +45,6 @@ impl FlashJudge {
                 ..SamplingParams::default()
             },
             stop: None,
-            logprobs: false,
-            session_id: None,
-            trace_context: None,
-            cancel: None,
         };
         let output = {
             let mut engine = self
@@ -92,10 +88,6 @@ impl FlashJudge {
                     ..SamplingParams::default()
                 },
                 stop: None,
-                logprobs: false,
-                session_id: None,
-                trace_context: None,
-                cancel: None,
             })
             .collect();
         let outputs = {
@@ -131,10 +123,6 @@ impl FlashJudge {
                 ..SamplingParams::default()
             },
             stop: None,
-            logprobs: false,
-            session_id: None,
-            trace_context: None,
-            cancel: None,
         };
         let output = {
             let mut engine = self

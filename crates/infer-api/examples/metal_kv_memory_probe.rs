@@ -154,10 +154,6 @@ fn main() -> anyhow::Result<()> {
             max_tokens,
             sampling: SamplingParams::default(),
             stop: None,
-            logprobs: false,
-            session_id: None,
-            trace_context: None,
-            cancel: None,
         })?;
         let wall_ms = start.elapsed().as_secs_f64() * 1000.0;
         let after_request = infer_metal::allocator_memory();

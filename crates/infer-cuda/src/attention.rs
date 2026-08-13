@@ -178,7 +178,6 @@ pub(crate) fn commit_layer_fold(
             overlap,
             start_pos,
             None,
-            true,
             original_seq_len,
             fp32_scratch.as_deref_mut(),
             None,
@@ -209,7 +208,6 @@ pub(crate) fn commit_layer_fold(
                 true,
                 start_pos,
                 None,
-                true,
                 indexer_rope_original_seq_len,
                 fp32_scratch,
                 None,
@@ -1946,7 +1944,7 @@ fn flashmla_prefill_attention(
         q_prepared.seq_len
     );
     // MODEL1 (head_dim=512) + V32 (GLM, head_dim=576 = 512 latent + 64 rope).
-    let _ = dsv4_flashmla_model_meta(config)?;
+    dsv4_flashmla_model_meta(config)?;
     ensure!(
         q_prepared.seq_len == k_prepared.seq_len && local_attn.seq_len == q_prepared.seq_len,
         "DSv4 FlashMLA prefill shape mismatch: q={} k={} out={}",
@@ -3762,7 +3760,6 @@ fn compressor_forward_decode(
     overlap: bool,
     start_pos: usize,
     start_pos_device: Option<&CudaSlice<i32>>,
-    apply_rope: bool,
     rope_original_seq_len: i32,
     kv_scratch: &mut HiddenStates,
     score_scratch: &mut HiddenStates,
@@ -3801,7 +3798,6 @@ fn compressor_forward_decode(
         overlap,
         start_pos,
         start_pos_device,
-        apply_rope,
         rope_original_seq_len,
         None,
         Some((&*kv_scratch, &*score_scratch)),
@@ -3996,7 +3992,6 @@ pub(crate) fn mla_attention_decode(
             compress_ratio < 16,
             start_pos,
             start_pos_device,
-            true,
             original_seq_len,
             kv,
             score,
@@ -4039,7 +4034,6 @@ pub(crate) fn mla_attention_decode(
                 true,
                 start_pos,
                 start_pos_device,
-                true,
                 config.rope_parameters.original_seq_len_i32()?,
                 kv,
                 score,
@@ -4115,11 +4109,7 @@ pub(crate) fn mla_attention_decode(
             c_q_normed,
             index_keys,
             keys_capacity,
-            if mode == DeepSeekV4AttentionMode::SparseIndexed {
-                start_pos
-            } else {
-                0
-            },
+            0,
             official,
             shared,
             pool,
@@ -4739,7 +4729,6 @@ pub(crate) fn mla_attention_prepare(
                     overlap,
                     start_pos,
                     start_pos_device,
-                    true,
                     // YaRN on for compressed layers (matches Q/SW-K + SGLang compressor
                     // freqs_cis);
                     // original_seq_len = orig_max_pos here.
@@ -4760,7 +4749,7 @@ pub(crate) fn mla_attention_prepare(
                 .as_ref()
                 .map(|s| s.compressed.seq_len)
                 .unwrap_or(0);
-            // CSA runs a second compressor over index_head_dim keys (apply_rope=true).
+            // CSA runs a second compressor over index_head_dim keys.
             // GLM
             // SparseIndexed has no key compressor - one full index key per token
             // (ratio=1).
@@ -4786,7 +4775,6 @@ pub(crate) fn mla_attention_prepare(
                         true,
                         start_pos,
                         start_pos_device,
-                        true,
                         indexer_rope_original_seq_len,
                         fp32_scratch,
                         None,
@@ -5152,7 +5140,6 @@ pub(crate) fn mla_attention_compressor_defer_row(
             overlap,
             start_pos,
             start_pos_device,
-            true,
             original_seq_len,
             None,
             // Defer mode ignores `precomputed` (the batched update reads the prepass
@@ -5187,7 +5174,6 @@ pub(crate) fn mla_attention_compressor_defer_row(
             true,
             start_pos,
             start_pos_device,
-            true,
             indexer_rope_original_seq_len,
             None,
             None,
@@ -5308,7 +5294,6 @@ pub(crate) fn mla_attention_prepare_compressed_only(
                     overlap,
                     start_pos,
                     start_pos_device,
-                    true,
                     original_seq_len,
                     None,
                     precomputed_main,
@@ -5357,7 +5342,6 @@ pub(crate) fn mla_attention_prepare_compressed_only(
                         true,
                         start_pos,
                         start_pos_device,
-                        true,
                         indexer_rope_original_seq_len,
                         None,
                         precomputed_indexer,
@@ -6423,10 +6407,9 @@ fn sparse_indexed_index_key_forward(
         // and
         // GLM ships a `k_norm.bias`. This path applies the bias-free `mla_rms_norm`
         // instead - an approximation to replace once a GPU forward confirms GLM's exact
-        // norm. `k_norm_bias` is kept live for that fix.
+        // norm.
         // ponytail: pod-verify GLM index k_norm = LayerNorm(eps=1e-6) with k_norm
         // weight+bias — current path is bias-free RMSNorm
-        let _ = indexer.k_norm_bias.as_ref();
         mla_rms_norm(ctx, &wk_out, k_norm, config.rms_norm_eps)?
     } else {
         // GLM's real `wk` is `[index_head_dim, hidden]` (single MQA key), so this
@@ -6510,7 +6493,6 @@ fn compressor_fp32_probe(
     start_pos: usize,
     token_count: usize,
     compressed_rows: usize,
-    apply_rope: bool,
     rope_original_seq_len: i32,
 ) -> Result<()> {
     crate::profile::profile_op(ctx, "compressor_fp32_probe", None, token_count, || {
@@ -6602,11 +6584,8 @@ fn compressor_fp32_probe(
             }
         }
         let rope = &config.rope_parameters;
-        let (rope_dim, rope_base) = if apply_rope {
-            (config.qk_rope_head_dim, config.compress_rope_theta)
-        } else {
-            (0, config.compress_rope_theta)
-        };
+        let rope_dim = config.qk_rope_head_dim;
+        let rope_base = config.compress_rope_theta;
         let start_pos_i32 = i32::try_from(start_pos).map_err(|_| {
             anyhow::anyhow!("DSv4 FP32 compressor start_pos {start_pos} exceeds i32")
         })?;
@@ -6681,8 +6660,7 @@ fn compressor_fp32_probe(
 /// Run one compressor sub-block over `hidden`, updating the per-slot bf16
 /// compressed-key pool for the absolute `[0, start_pos + token_count)` range.
 /// `dsv4_compressor_update_cuda` folds the wkv / wgate streams through `ape` +
-/// RMSNorm(`norm`) + compress-rope into one row per `compress_ratio` tokens;
-/// `apply_rope = false` skips the rope tail (indexer keys).
+/// RMSNorm(`norm`) + compress-rope into one row per `compress_ratio` tokens.
 #[allow(clippy::too_many_arguments)]
 fn compressor_forward(
     ctx: &DeviceContext,
@@ -6695,7 +6673,6 @@ fn compressor_forward(
     overlap: bool,
     start_pos: usize,
     start_pos_device: Option<&CudaSlice<i32>>,
-    apply_rope: bool,
     rope_original_seq_len: i32,
     // Shared FP32 probe scratch: required on every prefill lane (the probe branch
     // consumes it); decode lanes pass `None`.
@@ -6763,7 +6740,6 @@ fn compressor_forward(
             start_pos,
             token_count,
             compressed_rows,
-            apply_rope,
             rope_original_seq_len,
         )?;
         return Ok(());
@@ -6839,11 +6815,8 @@ fn compressor_forward(
 
     let rope = &config.rope_parameters;
     // Compressed keys use compress_rope_theta with NO YaRN (original_seq_len = 0).
-    let (rope_dim, rope_base) = if apply_rope {
-        (config.qk_rope_head_dim, config.compress_rope_theta)
-    } else {
-        (0, config.compress_rope_theta)
-    };
+    let rope_dim = config.qk_rope_head_dim;
+    let rope_base = config.compress_rope_theta;
     // Raw bf16 read: on a quantized matrix `.data` is a 1-element dummy (#138 OOB
     // class). The loader dequants ape to dense.
     ensure!(
@@ -7451,7 +7424,6 @@ pub(crate) fn dsv4_compressor_update_batched(
     head_dim: usize,
     ratio: usize,
     overlap: bool,
-    apply_rope: bool,
     rope_original_seq_len: i32,
     ptr_keepalive: &mut Vec<CudaSlice<u64>>,
 ) -> Result<()> {
@@ -7479,11 +7451,8 @@ pub(crate) fn dsv4_compressor_update_batched(
     // Compressed keys use compress_rope_theta with NO YaRN (original_seq_len = 0),
     // identical to the per-row `compressor_forward`.
     let rope = &config.rope_parameters;
-    let (rope_dim, rope_base) = if apply_rope {
-        (config.qk_rope_head_dim, config.compress_rope_theta)
-    } else {
-        (0usize, config.compress_rope_theta)
-    };
+    let rope_dim = config.qk_rope_head_dim;
+    let rope_base = config.compress_rope_theta;
     // Upload the five per-row pointer arrays + hold them alive to function return.
     let pkv_arr = crate::ops::upload_u64(ctx, &ptrs.pending_kv)?;
     let psc_arr = crate::ops::upload_u64(ctx, &ptrs.pending_score)?;

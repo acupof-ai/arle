@@ -16,12 +16,8 @@
 //! - **Streaming** — `ServeHandle` is blocking-`collect` only.
 //!   [`InferenceEngine::complete_stream`] emits the full text + a terminal delta,
 //!   not incremental tokens.
-//! - **Telemetry** — [`InferenceEngine::telemetry`] returns empty
-//!   [`EngineTelemetry`] (no scheduler counters across the thread channel; also
-//!   omits the legacy `model_arch` field).
-//! - **Per-token logprobs** — [`CompletionOutput::token_logprobs`] is always empty.
-//! - **`session_id` / `trace_context` / `cancel`** — carried on
-//!   [`CompletionRequest`] but not yet honored; every current consumer passes `None`.
+//! - **Telemetry** — [`InferenceEngine::telemetry`] returns only queue/active
+//!   counters (no latency / batch-occupancy / spec metrics).
 //! - **CUDA backend** — wired + typechecks, but [`LoadedInferenceEngine::load`]
 //!   errors: the real CUDA forward + builder are lead-owned.
 //! - **Train-only CUDA methods + LoRA types** — `forward_token_logits`,
@@ -127,5 +123,5 @@ pub use types::RawLogits;
 pub use types::{
     ChatPromptImage, ChatPromptMessage, CompletionOutput, CompletionRequest, CompletionStreamDelta,
     CompletionStreamError, EngineTelemetry, FinishReason, InferenceEngine, MultimodalChatRequest,
-    PrefillPathStats, SamplingParams, SessionId, TokenUsage,
+    SamplingParams, TokenUsage,
 };

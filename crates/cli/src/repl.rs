@@ -945,10 +945,6 @@ fn run_direct_chat_completion(
             // The checkpoint template and diffusion config own EOS handling. A
             // ChatML stop string here is wrong for DiffusionGemma.
             stop: None,
-            logprobs: false,
-            session_id: None,
-            trace_context: None,
-            cancel: None,
         })?
     } else {
         engine.complete_multimodal_chat(MultimodalChatRequest {

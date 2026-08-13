@@ -116,6 +116,8 @@ struct Dsv4DecodeBatchRow {
     start_pos: usize,
     position: u64,
     params: SamplingParams,
+    penalty_history: Option<std::sync::Arc<[u32]>>,
+    penalty_prompt_len: usize,
 }
 
 struct Dsv4DecodeBatch {
@@ -169,6 +171,8 @@ impl Dsv4DecodeBatch {
                 start_pos: row.kv_seq_len,
                 position,
                 params: row.params.clone(),
+                penalty_history: row.penalty_history.clone(),
+                penalty_prompt_len: row.penalty_prompt_len,
             });
         }
         Ok(Self {
@@ -1360,6 +1364,7 @@ impl Dsv4CudaExecutor {
         start_pos: usize,
         params: &SamplingParams,
         position: u64,
+        penalty: infer_plan::PenaltyHistory<'_>,
     ) -> Result<u32> {
         let (token, hidden) = self.model.forward_tokens_with_hidden(
             &mut self.slots[slot_idx],
@@ -1368,6 +1373,7 @@ impl Dsv4CudaExecutor {
             start_pos,
             params,
             position,
+            penalty,
         )?;
         self.spec_slots[slot_idx].pending = Some(token);
         self.spec_slots[slot_idx].hidden = Some(hidden);
@@ -1381,12 +1387,20 @@ impl Dsv4CudaExecutor {
         start_pos: usize,
         params: &SamplingParams,
         position: u64,
+        penalty: infer_plan::PenaltyHistory<'_>,
         final_prefill: bool,
     ) -> Result<Vec<u32>> {
         let spec_on = self.spec_requested();
-        if spec_on && params.is_greedy() {
+        if spec_on && params.is_raw_argmax() {
             let token = if final_prefill {
-                self.forward_mtp_warm_step(slot_idx, tokens, start_pos, params, position)?
+                self.forward_mtp_warm_step(
+                    slot_idx,
+                    tokens,
+                    start_pos,
+                    params,
+                    position,
+                    penalty,
+                )?
             } else {
                 let (token, _hidden) = self.model.forward_tokens_with_hidden(
                     &mut self.slots[slot_idx],
@@ -1395,6 +1409,7 @@ impl Dsv4CudaExecutor {
                     start_pos,
                     params,
                     position,
+                    penalty,
                 )?;
                 self.spec_slots[slot_idx] = Dsv4SpecSlotState::default();
                 token
@@ -1411,6 +1426,7 @@ impl Dsv4CudaExecutor {
                 start_pos,
                 params,
                 position,
+                penalty,
             )?])
         }
     }
@@ -1422,6 +1438,7 @@ impl Dsv4CudaExecutor {
         start_pos: usize,
         params: &SamplingParams,
         position: u64,
+        penalty: infer_plan::PenaltyHistory<'_>,
     ) -> Result<Vec<u32>> {
         if !self.spec_requested() {
             let token = self.model.forward_tokens(
@@ -1431,11 +1448,12 @@ impl Dsv4CudaExecutor {
                 start_pos,
                 params,
                 position,
+                penalty,
             )?;
             return Ok(vec![token]);
         }
 
-        if !params.is_greedy() {
+        if !params.is_raw_argmax() {
             self.spec_slots[slot_idx] = Dsv4SpecSlotState::default();
             let token = self.model.forward_tokens(
                 &mut self.slots[slot_idx],
@@ -1444,6 +1462,7 @@ impl Dsv4CudaExecutor {
                 start_pos,
                 params,
                 position,
+                penalty,
             )?;
             return Ok(vec![token]);
         }
@@ -1468,7 +1487,7 @@ impl Dsv4CudaExecutor {
         };
         if !seeded {
             let token =
-                self.forward_mtp_warm_step(slot_idx, &[last_token], start_pos, params, position)?;
+                self.forward_mtp_warm_step(slot_idx, &[last_token], start_pos, params, position, penalty)?;
             return Ok(vec![token]);
         }
         // When the acceptance EMA predicts MTP would lose to no-spec, run a warm
@@ -1478,7 +1497,7 @@ impl Dsv4CudaExecutor {
         if self.mtp_adaptive_skip() {
             self.mtp_skip_streak += 1;
             let token =
-                self.forward_mtp_warm_step(slot_idx, &[last_token], start_pos, params, position)?;
+                self.forward_mtp_warm_step(slot_idx, &[last_token], start_pos, params, position, penalty)?;
             return Ok(vec![token]);
         }
         self.spec_step(slot_idx, start_pos, position)
@@ -1625,6 +1644,7 @@ impl Dsv4CudaExecutor {
                 start_pos,
                 params,
                 position,
+                infer_plan::PenaltyHistory::default(),
             )?;
             return Ok(vec![token]);
         }
@@ -1637,6 +1657,7 @@ impl Dsv4CudaExecutor {
             start_pos,
             params,
             position,
+            infer_plan::PenaltyHistory::default(),
         )?;
         let verify_pos = start_pos + 1;
 
@@ -1813,6 +1834,7 @@ impl Dsv4CudaExecutor {
                     row.start_pos,
                     &row.params,
                     row.position,
+                    infer_plan::PenaltyHistory::default(),
                 )?;
                 fallback_tokens[i] = Some(vec![token]);
             } else {
@@ -1830,6 +1852,7 @@ impl Dsv4CudaExecutor {
                 .iter()
                 .map(|&i| rows[i].params.clone())
                 .collect();
+            let penalties = vec![infer_plan::PenaltyHistory::default(); params.len()];
             let anchors = self.model.forward_decode_batch(
                 &mut self.slots,
                 &mut self.kv_adapter,
@@ -1838,6 +1861,7 @@ impl Dsv4CudaExecutor {
                 &starts,
                 &positions,
                 &params,
+                &penalties,
                 true, // anchor: the draft reads these taps
             )?;
             // The draft stays per-slot: each slot has independent latent_kv
@@ -2029,6 +2053,7 @@ impl Dsv4CudaExecutor {
             row.start_pos,
             &row.params,
             row.position,
+            penalty_of(&row.penalty_history, row.penalty_prompt_len),
         )?;
         Ok(tokens
             .into_iter()
@@ -2096,7 +2121,9 @@ impl Dsv4CudaExecutor {
         // batched path that scales.
         use super::spec_decode::{DecodeRoute, SpecKind, route_decode};
         let spec_on = self.spec_requested();
-        let all_greedy = batch.rows.iter().all(|row| row.params.is_greedy());
+        let any_penalty = batch.rows.iter().any(|row| row.params.has_penalty());
+        // The batched MTP verify commits a device argmax over raw target logits.
+        let all_raw_argmax = batch.rows.iter().all(|row| row.params.is_raw_argmax());
         let spec_kind = if self.dspark.is_some() {
             SpecKind::Dspark
         } else if spec_on {
@@ -2110,6 +2137,7 @@ impl Dsv4CudaExecutor {
             spec_kind,
             batch.rows.len(),
             crate::runtime_flags::spec_max_batch().min(1),
+            any_penalty,
         );
 
         if route == DecodeRoute::Dspark {
@@ -2134,7 +2162,7 @@ impl Dsv4CudaExecutor {
             }
             return Ok(out);
         }
-        if route == DecodeRoute::Mtp && all_greedy {
+        if route == DecodeRoute::Mtp && all_raw_argmax {
             // Self-heal an un-seeded / desynced MTP stream (#140): warm-step
             // EVERY row for one tick to re-seed pending+hidden — cheaper than
             // splitting the batch, and batched MTP resumes next tick.
@@ -2161,6 +2189,7 @@ impl Dsv4CudaExecutor {
                         row.start_pos,
                         &row.params,
                         row.position,
+                        penalty_of(&row.penalty_history, row.penalty_prompt_len),
                     )?;
                     tokens.push(SlotToken {
                         slot: row.slot,
@@ -2202,6 +2231,11 @@ impl Dsv4CudaExecutor {
             }
         }
         let params: Vec<SamplingParams> = batch.rows.iter().map(|r| r.params.clone()).collect();
+        let penalties: Vec<infer_plan::PenaltyHistory<'_>> = batch
+            .rows
+            .iter()
+            .map(|r| penalty_of(&r.penalty_history, r.penalty_prompt_len))
+            .collect();
         let out = self.model.forward_decode_batch(
             &mut self.slots,
             &mut self.kv_adapter,
@@ -2210,6 +2244,7 @@ impl Dsv4CudaExecutor {
             &batch.start_positions,
             &batch.positions,
             &params,
+            &penalties,
             false, // plain decode: no draft consumes taps here
         )?;
         ensure!(
@@ -2347,6 +2382,7 @@ impl Dsv4CudaExecutor {
             row.start_pos,
             &row.params,
             position,
+            penalty_of(&row.penalty_history, row.penalty_prompt_len),
             final_prefill,
         )?;
         // Chunks accumulate in `df.ctx_end`, so a chunked prefill seeds the whole
@@ -2406,6 +2442,7 @@ impl Dsv4CudaExecutor {
             0,
             &params,
             start_pos as u64,
+            infer_plan::PenaltyHistory::default(),
         )?;
         let verify_one = self.model.forward_tokens_verify(
             &mut self.slots[slot_idx],
@@ -2423,6 +2460,7 @@ impl Dsv4CudaExecutor {
             0,
             &params,
             start_pos as u64,
+            infer_plan::PenaltyHistory::default(),
         )?;
         ensure!(
             token_a == token_a_again,
@@ -2435,6 +2473,7 @@ impl Dsv4CudaExecutor {
             start_pos,
             &params,
             (start_pos + 1) as u64,
+            infer_plan::PenaltyHistory::default(),
         )?;
         ensure!(
             verify_one.argmax.first().copied() == Some(normal_one),
@@ -2450,6 +2489,7 @@ impl Dsv4CudaExecutor {
             0,
             &params,
             start_pos as u64,
+            infer_plan::PenaltyHistory::default(),
         )?;
         let verify_one = self.model.forward_tokens_verify(
             &mut self.slots[slot_idx],
@@ -2472,6 +2512,7 @@ impl Dsv4CudaExecutor {
             0,
             &params,
             start_pos as u64,
+            infer_plan::PenaltyHistory::default(),
         )?;
         let verify_two = self.model.forward_tokens_verify(
             &mut self.slots[slot_idx],

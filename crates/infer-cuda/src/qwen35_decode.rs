@@ -125,6 +125,7 @@ impl Qwen35Model {
         kv_seq_lens: &[usize],
         params: &[SamplingParams],
         sample_positions: &[u64],
+        penalties: &[infer_plan::PenaltyHistory<'_>],
     ) -> Result<Vec<(u32, Option<f32>)>> {
         let b = tokens.len();
         ensure!(b >= 1, "Qwen3.5 batched decode requires at least one row");
@@ -132,7 +133,8 @@ impl Qwen35Model {
             slot_indices.len() == b
                 && kv_seq_lens.len() == b
                 && params.len() == b
-                && sample_positions.len() == b,
+                && sample_positions.len() == b
+                && penalties.len() == b,
             "Qwen3.5 batched decode surface length mismatch: slots={} tokens={} kv_lens={} params={} positions={}",
             slot_indices.len(),
             b,
@@ -377,10 +379,11 @@ impl Qwen35Model {
                 let row_vec = row_logits.get(&self.ctx, vocab)?;
                 copy_row_to_vec(&self.ctx, logits_buf, r, row_vec)?;
                 let host = row_vec.to_host(&self.ctx)?;
-                Ok(infer_plan::sample_token_logprob(
+                Ok(infer_plan::sample_token_logprob_penalized(
                     &host,
                     p,
                     sample_positions[r],
+                    penalties[r],
                 ))
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
@@ -398,6 +401,7 @@ impl Qwen35Model {
         kv_seq_lens: &[usize],
         params: &[SamplingParams],
         sample_positions: &[u64],
+        penalties: &[infer_plan::PenaltyHistory<'_>],
     ) -> Result<Vec<(u32, Option<f32>)>> {
         let b = tokens.len();
         ensure!(
@@ -408,7 +412,8 @@ impl Qwen35Model {
             slot_indices.len() == b
                 && kv_seq_lens.len() == b
                 && params.len() == b
-                && sample_positions.len() == b,
+                && sample_positions.len() == b
+                && penalties.len() == b,
             "Qwen3.6 paged batched decode surface length mismatch: slots={} tokens={} kv_lens={} params={} positions={}",
             slot_indices.len(),
             b,
@@ -632,10 +637,11 @@ impl Qwen35Model {
                 let row_vec = row_logits.get(&self.ctx, vocab)?;
                 copy_row_to_vec(&self.ctx, logits_buf, r, row_vec)?;
                 let host = row_vec.to_host(&self.ctx)?;
-                Ok(infer_plan::sample_token_logprob(
+                Ok(infer_plan::sample_token_logprob_penalized(
                     &host,
                     p,
                     sample_positions[r],
+                    penalties[r],
                 ))
             })
             .collect::<anyhow::Result<Vec<_>>>()?;

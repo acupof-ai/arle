@@ -55,10 +55,8 @@ pub(crate) struct Dsv4Indexer {
     /// GLM SparseIndexed only: indexer key projection `[index_n_heads*index_head_dim,
     /// hidden]`. `None` ⇒ DSv4 (keys come through the compressor).
     pub wk: Option<DeviceMatrix>,
-    /// GLM SparseIndexed only: indexer key RMSNorm weight + bias. `None` ⇒ DSv4.
+    /// GLM SparseIndexed only: indexer key RMSNorm weight. `None` ⇒ DSv4.
     pub k_norm: Option<DeviceVec>,
-    #[allow(dead_code)]
-    pub k_norm_bias: Option<DeviceVec>,
     /// DeepGEMM repack of `wq_b` for the prefill index-query projection (135ms /
     /// 67% of linear at M=1024). `None` falls back to scalar.
     pub wq_b_deepgemm: Option<Dsv4Fp8DeepGemmWeightCache>,
@@ -1864,8 +1862,18 @@ impl Dsv4Model {
         start_pos: usize,
         params: &SamplingParams,
         position: u64,
+        penalty: infer_plan::PenaltyHistory<'_>,
     ) -> Result<u32> {
-        self.forward_tokens_impl(slot, kv_adapter, tokens, start_pos, params, position, None)
+        self.forward_tokens_impl(
+            slot,
+            kv_adapter,
+            tokens,
+            start_pos,
+            params,
+            position,
+            penalty,
+            None,
+        )
     }
 
     pub(crate) fn forward_tokens_with_hidden(
@@ -1876,6 +1884,7 @@ impl Dsv4Model {
         start_pos: usize,
         params: &SamplingParams,
         position: u64,
+        penalty: infer_plan::PenaltyHistory<'_>,
     ) -> Result<(u32, DeviceVec)> {
         let mut last_hidden =
             DeviceVec::zeros(&self.ctx, self.config.hidden_size * self.config.hc_mult)?;
@@ -1886,6 +1895,7 @@ impl Dsv4Model {
             start_pos,
             params,
             position,
+            penalty,
             Some(&mut last_hidden),
         )?;
         Ok((token, last_hidden))
@@ -1899,6 +1909,7 @@ impl Dsv4Model {
         start_pos: usize,
         params: &SamplingParams,
         position: u64,
+        penalty: infer_plan::PenaltyHistory<'_>,
         last_hidden_out: Option<&mut DeviceVec>,
     ) -> Result<u32> {
         let seq_len = tokens.len();
@@ -1912,6 +1923,7 @@ impl Dsv4Model {
             seq_len,
             params,
             position,
+            penalty,
             None,
             &mut keepalive,
         )?;
@@ -2116,6 +2128,7 @@ impl Dsv4Model {
         start_positions: &[usize],
         positions: &[u64],
         params: &[SamplingParams],
+        penalties: &[infer_plan::PenaltyHistory<'_>],
         // false on the spec-off decode lane: nothing reads these taps.
         capture_taps: bool,
     ) -> Result<Vec<u32>> {
@@ -2125,12 +2138,14 @@ impl Dsv4Model {
             tokens.len() == n
                 && start_positions.len() == n
                 && positions.len() == n
-                && params.len() == n,
-            "DSv4 batched decode surface length mismatch (slots {n}, tokens {}, starts {}, positions {}, params {})",
+                && params.len() == n
+                && penalties.len() == n,
+            "DSv4 batched decode surface length mismatch (slots {n}, tokens {}, starts {}, positions {}, params {}, penalty histories {})",
             tokens.len(),
             start_positions.len(),
             positions.len(),
-            params.len()
+            params.len(),
+            penalties.len()
         );
         let (stream, mut keepalive) = self.forward_decode_batch_stream_impl(
             slots,
@@ -2154,6 +2169,7 @@ impl Dsv4Model {
                             r + 1,
                             &params[r],
                             positions[r],
+                            penalties[r],
                             None,
                             &mut keepalive,
                         )
@@ -2543,7 +2559,6 @@ impl Dsv4Model {
                             self.config.head_dim,
                             layer.compress_ratio,
                             overlap,
-                            true,
                             proj.original_seq_len,
                             &mut ptr_keepalive,
                         )?;
@@ -2572,7 +2587,6 @@ impl Dsv4Model {
                             self.config.index_head_dim,
                             layer.compress_ratio,
                             true, // indexer compressor always overlap
-                            true,
                             indexer_rope_original_seq_len,
                             &mut ptr_keepalive,
                         )?;
@@ -3557,9 +3571,7 @@ impl Dsv4Model {
                 // Reuse the model-wide pooled shared-expert output + FP8 scratch
                 // (#29) instead of per-layer `uninit` + fresh temporaries.
                 let (shared_out, shared_scratch) = kv_adapter.shared_expert_decode_mut();
-                let shared = shared_out.ok_or_else(|| {
-                    anyhow!("DSv4 batched decode requires shared-expert output buffer")
-                })?;
+                let shared = shared_out;
                 let scratch = shared_scratch
                     .ok_or_else(|| anyhow!("DSv4 batched decode requires shared-expert scratch"))?;
                 shared.seq_len = seq_len; // rows ≤ MAX_SPEC_VERIFY_ROWS ≤ max_m
@@ -4276,6 +4288,7 @@ impl Dsv4Model {
         seq_len: usize,
         params: &SamplingParams,
         position: u64,
+        penalty: infer_plan::PenaltyHistory<'_>,
         last_hidden_out: Option<&mut DeviceVec>,
         keepalive: &mut Dsv4ForwardKeepalive,
     ) -> Result<u32> {
@@ -4328,7 +4341,7 @@ impl Dsv4Model {
         })?;
         keepalive.keep_vec(&logits);
         let token = crate::profile::profile_op(ctx, "sample", None, seq_len, || {
-            self.sample_logits(&logits, params, position)
+            self.sample_logits(&logits, params, position, penalty)
         })?;
         Ok(token)
     }
@@ -4340,8 +4353,9 @@ impl Dsv4Model {
         logits: &DeviceVec,
         params: &SamplingParams,
         position: u64,
+        penalty: infer_plan::PenaltyHistory<'_>,
     ) -> Result<u32> {
-        crate::executor::sample_cuda_token(&self.ctx, logits, params, position)
+        crate::executor::sample_cuda_token(&self.ctx, logits, params, position, penalty)
     }
 
     fn forward_tokens_verify_stream_persistent(
@@ -4635,9 +4649,7 @@ impl Dsv4Model {
 
                     crate::profile::profile_op(ctx, "shared_hc", Some(layer_idx), seq_len, || {
                         let (shared_out, shared_scratch) = kv_adapter.shared_expert_decode_mut();
-                        let shared = shared_out.ok_or_else(|| {
-                            anyhow!("DSv4 verify requires shared-expert output buffer")
-                        })?;
+                        let shared = shared_out;
                         shared.seq_len = seq_len;
                         ensure!(
                             shared.hidden_dim == hidden_size,
@@ -5220,15 +5232,13 @@ impl Dsv4Model {
                     || {
                         let mut shared_owned = None;
                         let shared_ready = if use_comm_overlap {
-                            let shared = shared_out.as_deref_mut().ok_or_else(|| {
-                                anyhow!("DSv4 decode requires shared-expert output buffer")
-                            })?;
-                            shared.seq_len = seq_len;
+                            shared_out.seq_len = seq_len;
                             ensure!(
-                                shared.hidden_dim == hidden_size && shared.seq_len == seq_len,
+                                shared_out.hidden_dim == hidden_size
+                                    && shared_out.seq_len == seq_len,
                                 "DSv4 shared decode scratch shape {}x{} != {}x{}",
-                                shared.hidden_dim,
-                                shared.seq_len,
+                                shared_out.hidden_dim,
+                                shared_out.seq_len,
                                 hidden_size,
                                 seq_len
                             );
@@ -5243,7 +5253,7 @@ impl Dsv4Model {
                                 &self.ctx.comm_stream,
                                 layer.moe.as_ref().expect("DSv4 layer.moe"),
                                 &normed,
-                                shared,
+                                shared_out,
                                 self.config.swiglu_limit,
                                 scratch,
                             )?;
@@ -5266,15 +5276,13 @@ impl Dsv4Model {
                         if use_comm_overlap {
                             // Already launched on the comm stream above.
                         } else if seq_len == 1 {
-                            let shared = shared_out.as_deref_mut().ok_or_else(|| {
-                                anyhow!("DSv4 decode requires shared-expert output buffer")
-                            })?;
-                            shared.seq_len = seq_len;
+                            shared_out.seq_len = seq_len;
                             ensure!(
-                                shared.hidden_dim == hidden_size && shared.seq_len == seq_len,
+                                shared_out.hidden_dim == hidden_size
+                                    && shared_out.seq_len == seq_len,
                                 "DSv4 shared decode scratch shape {}x{} != {}x{}",
-                                shared.hidden_dim,
-                                shared.seq_len,
+                                shared_out.hidden_dim,
+                                shared_out.seq_len,
                                 hidden_size,
                                 seq_len
                             );
@@ -5286,7 +5294,7 @@ impl Dsv4Model {
                                 &self.ctx.stream,
                                 layer.moe.as_ref().expect("DSv4 layer.moe"),
                                 &normed,
-                                shared,
+                                shared_out,
                                 self.config.swiglu_limit,
                                 scratch,
                             )?;
@@ -5294,14 +5302,11 @@ impl Dsv4Model {
                             && sparse_verify_meta.is_some()
                             && seq_len <= MAX_SPEC_VERIFY_ROWS
                         {
-                            let shared = shared_out.as_deref_mut().ok_or_else(|| {
-                                anyhow!("DSv4 verify requires shared-expert output buffer")
-                            })?;
-                            shared.seq_len = seq_len;
+                            shared_out.seq_len = seq_len;
                             ensure!(
-                                shared.hidden_dim == hidden_size,
+                                shared_out.hidden_dim == hidden_size,
                                 "DSv4 shared verify scratch hidden {} != {}",
-                                shared.hidden_dim,
+                                shared_out.hidden_dim,
                                 hidden_size
                             );
                             let scratch = shared_scratch.ok_or_else(|| {
@@ -5312,7 +5317,7 @@ impl Dsv4Model {
                                 &self.ctx.stream,
                                 layer.moe.as_ref().expect("DSv4 layer.moe"),
                                 &normed,
-                                shared,
+                                shared_out,
                                 self.config.swiglu_limit,
                                 scratch,
                             )?;
@@ -5341,9 +5346,7 @@ impl Dsv4Model {
                                 && sparse_verify_meta.is_some()
                                 && seq_len <= MAX_SPEC_VERIFY_ROWS)
                         {
-                            shared_out.as_deref().ok_or_else(|| {
-                                anyhow!("DSv4 decode requires shared-expert output buffer")
-                            })?
+                            &*shared_out
                         } else {
                             shared_owned
                                 .as_ref()

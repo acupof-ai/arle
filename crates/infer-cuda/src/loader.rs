@@ -4935,7 +4935,7 @@ impl SafetensorLoader {
         let wq_b_deepgemm = self.decode_proj_cache(ctx, &wq_b)?;
         let weights_proj = self.load_dsv4_global_matrix(ctx, &names.weights_proj)?;
         let weights_proj_deepgemm = self.decode_proj_cache(ctx, &weights_proj)?;
-        let (compressor, wk, k_norm, k_norm_bias) = if glm {
+        let (compressor, wk, k_norm) = if glm {
             let wk = match names.wk.as_ref() {
                 Some(n) => Some(self.load_dsv4_block_scaled_dialect(ctx, n)?),
                 None => None,
@@ -4944,11 +4944,7 @@ impl SafetensorLoader {
                 Some(n) => Some(self.load_dsv4_vec(ctx, n)?),
                 None => None,
             };
-            let k_norm_bias = match names.k_norm_bias.as_ref() {
-                Some(n) => Some(self.load_dsv4_vec(ctx, n)?),
-                None => None,
-            };
-            (None, wk, k_norm, k_norm_bias)
+            (None, wk, k_norm)
         } else {
             let compressor = self.load_dsv4_compressor(
                 ctx,
@@ -4958,7 +4954,7 @@ impl SafetensorLoader {
                     .expect("DSv4 indexer always has a compressor"),
                 false,
             )?;
-            (Some(compressor), None, None, None)
+            (Some(compressor), None, None)
         };
         Ok(crate::dsv4::Dsv4Indexer {
             wq_b,
@@ -4966,7 +4962,6 @@ impl SafetensorLoader {
             compressor,
             wk,
             k_norm,
-            k_norm_bias,
             wq_b_deepgemm,
             weights_proj_deepgemm,
         })

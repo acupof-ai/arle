@@ -60,10 +60,6 @@ impl KvQuery for VulkanKvPool {
         self.free.len()
     }
 
-    fn free_tokens(&self) -> usize {
-        self.free.len() * self.page_size
-    }
-
     fn seq_len(&self, slot: usize) -> usize {
         self.slot_len.get(slot).copied().unwrap_or(0)
     }
@@ -82,16 +78,12 @@ impl KvQuery for VulkanKvPool {
         self.slot_pages.get(slot).map_or(&[], Vec::as_slice)
     }
 
-    fn page_indices_for_token_range(&self, slot: usize, start: usize, len: usize) -> &[u32] {
+    fn page_indices_for_token_range(&self, slot: usize, len: usize) -> &[u32] {
         let Some(pages) = self.slot_pages.get(slot) else {
             return &[];
         };
-        let start_page = start / self.page_size;
-        let end_page = (start + len).div_ceil(self.page_size).min(pages.len());
-        if start_page >= end_page {
-            return &[];
-        }
-        &pages[start_page..end_page]
+        let end_page = len.div_ceil(self.page_size).min(pages.len());
+        &pages[..end_page]
     }
 }
 
@@ -166,10 +158,6 @@ impl KvAllocator for VulkanKvPool {
         self.slot_len[slot] = new_len;
         Ok(())
     }
-
-    fn migrate(&mut self, _slot: usize, _start: usize, _len: usize) -> anyhow::Result<()> {
-        Ok(())
-    }
 }
 
 impl KvPrefixStore for VulkanKvPool {
@@ -189,10 +177,6 @@ impl KvPrefixStore for VulkanKvPool {
                 }
             }
         }
-    }
-
-    fn retained_count(&self) -> usize {
-        self.page_refs.values().filter(|&&c| c > 0).count()
     }
 
     fn attach_pages(

@@ -376,7 +376,7 @@ pub(crate) struct Dsv4KvAdapter {
     /// One shared-expert output for ALL layers and slots; capacity covers the multi-row
     /// MTP
     /// verify chunk, and callers set `seq_len` before dispatch.
-    pub(super) shared_expert_out: Option<HiddenStates>,
+    pub(super) shared_expert_out: HiddenStates,
     pub(super) shared_expert_scratch: Option<crate::moe::Dsv4SharedDecodeScratch>,
     /// One shared batched (`b = N`) FlashMLA sparse-decode scratch for ALL FlashMLA
     /// layers and
@@ -648,8 +648,6 @@ pub(crate) struct Dsv4KvBatchRowView {
     pub(crate) seq_len: usize,
     pub(crate) append_pos: usize,
     pub(crate) append_len: usize,
-    #[allow(dead_code)]
-    pub(crate) slot_epoch: u64,
     pub(crate) page_range: std::ops::Range<usize>,
     pub(crate) slot_page_range: std::ops::Range<usize>,
 }
@@ -751,9 +749,8 @@ impl Dsv4KvAdapter {
         // on both
         // the default decode and scheduled verify paths; B=1 decode sets `seq_len = 1`.
         // SAFETY: uninit device scratch; fully written before first read.
-        let shared_expert_out = Some(unsafe {
-            HiddenStates::uninit(ctx, hidden_size, crate::dsv4::MAX_SPEC_VERIFY_ROWS)?
-        });
+        let shared_expert_out =
+            unsafe { HiddenStates::uninit(ctx, hidden_size, crate::dsv4::MAX_SPEC_VERIFY_ROWS)? };
         let shared_expert_scratch = shared_expert_decode
             .map(|layer| {
                 crate::moe::Dsv4SharedDecodeScratch::new(
@@ -851,12 +848,7 @@ impl Dsv4KvAdapter {
                     .map(Dsv4MlaDecodeScratch::device_bytes)
                     .sum(),
             ),
-            (
-                "shared_expert_out",
-                self.shared_expert_out
-                    .as_ref()
-                    .map_or(0, |s| s.device_bytes()),
-            ),
+            ("shared_expert_out", self.shared_expert_out.device_bytes()),
             (
                 "shared_expert_scratch",
                 self.shared_expert_scratch
@@ -997,11 +989,11 @@ impl Dsv4KvAdapter {
     pub(crate) fn shared_expert_decode_mut(
         &mut self,
     ) -> (
-        Option<&mut HiddenStates>,
+        &mut HiddenStates,
         Option<&mut crate::moe::Dsv4SharedDecodeScratch>,
     ) {
         (
-            self.shared_expert_out.as_mut(),
+            &mut self.shared_expert_out,
             self.shared_expert_scratch.as_mut(),
         )
     }
@@ -1313,7 +1305,6 @@ impl ModelKvAdapter for Dsv4KvAdapter {
                 seq_len: row.seq_len,
                 append_pos: row.append_pos,
                 append_len: row.append_len,
-                slot_epoch: row.slot_epoch,
                 page_range: row.page_range.clone(),
                 slot_page_range: row.slot_page_range.clone(),
             });

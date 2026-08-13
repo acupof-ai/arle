@@ -10,13 +10,11 @@ mod planner;
 mod prefix;
 mod radix;
 mod recall;
-mod writethrough;
 
 pub use radix::{BlockId, PrefixMatch, RadixCache};
 pub use recall::{RecallConfig, RecallPlan, plan_recall};
-pub use writethrough::{cap_rep_pool, evict_drop_pages, prefetch_blocks, prefetch_query};
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 use infer_plan::{FinishReason, ForwardPlan, SamplingParams, SlotToken, StepOutput};
 use infer_seam::{
     AdmissionVerdict, BackendExecutor, DeviceRowDemand, KvPool, PermissiveGovernor, PollResult,
@@ -474,6 +472,17 @@ impl RequestState {
             .copied()
             .collect()
     }
+
+    /// Penalty state lives nowhere but here: the engine ships a snapshot per
+    /// row so preemption, prefix restore and spec rollback cannot desync a
+    /// mirrored copy below the seam. Default requests pay nothing.
+    pub(crate) fn penalty_history(&self) -> (Option<std::sync::Arc<[u32]>>, usize) {
+        if !self.sampling.has_penalty() {
+            return (None, 0);
+        }
+        let history: std::sync::Arc<[u32]> = self.committed_tokens().into();
+        (Some(history), self.prompt_tokens.len())
+    }
 }
 
 impl From<RequestState> for CompletedRequest {
@@ -728,23 +737,6 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         self.submit_request_with_options(prompt_tokens, max_tokens, RequestOptions::default())
     }
 
-    /// Submit a request with a specific priority.
-    pub fn submit_request_with_priority(
-        &mut self,
-        prompt_tokens: Vec<u32>,
-        max_tokens: usize,
-        priority: RequestPriority,
-    ) -> RequestHandle {
-        self.submit_request_with_options(
-            prompt_tokens,
-            max_tokens,
-            RequestOptions {
-                priority,
-                ..RequestOptions::default()
-            },
-        )
-    }
-
     /// Submit a request with full ingress options.
     pub fn submit_request_with_options(
         &mut self,
@@ -980,11 +972,6 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
     #[must_use]
     pub fn is_idle(&self) -> bool {
         self.waiting.is_empty() && self.active.is_empty() && self.inflight.is_none()
-    }
-
-    #[must_use]
-    pub fn has_inflight(&self) -> bool {
-        self.inflight.is_some()
     }
 
     #[must_use]
@@ -1485,10 +1472,6 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         match self.governor.admission_gate() {
             AdmissionVerdict::Admit | AdmissionVerdict::ShedTo(_) => {}
             AdmissionVerdict::Hold => return Ok(()),
-        }
-
-        if self.config.num_slots == 0 && !self.waiting.is_empty() {
-            bail!("infer-core engine has waiting requests but zero slots");
         }
 
         // TP-synced: a rank-local `free_pages()` can differ across ranks (e.g.

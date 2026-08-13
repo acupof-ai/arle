@@ -1204,6 +1204,7 @@ impl Qwen35CudaExecutor {
                 row.start_pos,
                 &row.params,
                 position,
+                penalty_of(&row.penalty_history, row.penalty_prompt_len),
                 &mut rc,
             );
         };
@@ -1219,6 +1220,7 @@ impl Qwen35CudaExecutor {
             row.start_pos,
             &row.params,
             position,
+            penalty_of(&row.penalty_history, row.penalty_prompt_len),
             &mut rc,
             Some(&mut ds.taps),
         )?;
@@ -1297,6 +1299,7 @@ impl Qwen35CudaExecutor {
             row.kv_seq_len,
             &row.params,
             position,
+            penalty_of(&row.penalty_history, row.penalty_prompt_len),
             &mut rc,
         )
     }
@@ -1398,6 +1401,7 @@ impl Qwen35CudaExecutor {
                     &row.params,
                     start.saturating_add(1) as u64,
                     spec.argmax_scratch_mut(),
+                    penalty_of(&row.penalty_history, row.penalty_prompt_len),
                 )?
             };
             mtp.as_mut().expect("mtp (gated)").slots[slot] = Some(MtpSlotState {
@@ -1440,6 +1444,7 @@ impl Qwen35CudaExecutor {
                     &row.params,
                     start.saturating_add(1) as u64,
                     spec.argmax_scratch_mut(),
+                    penalty_of(&row.penalty_history, row.penalty_prompt_len),
                 )?
             };
             mtp.as_mut().expect("mtp (gated)").slots[slot] = Some(MtpSlotState {
@@ -1613,6 +1618,7 @@ impl Qwen35CudaExecutor {
             row.kv_seq_len,
             &row.params,
             position,
+            penalty_of(&row.penalty_history, row.penalty_prompt_len),
             &mut rc,
             taps,
         )?;
@@ -2039,6 +2045,7 @@ impl Qwen35CudaExecutor {
                 row.start_pos,
                 &row.params,
                 position,
+                penalty_of(&row.penalty_history, row.penalty_prompt_len),
                 &mut rc,
             )?;
             (token, rc.layer0_query.expect("opted in above"))
@@ -2200,6 +2207,7 @@ impl Qwen35CudaExecutor {
             row.kv_seq_len,
             &row.params,
             position,
+            penalty_of(&row.penalty_history, row.penalty_prompt_len),
             &mut rc,
         )
     }
@@ -2275,7 +2283,7 @@ impl Qwen35CudaExecutor {
         }
         let dg = self.decode_graph.as_mut().expect("still present");
         self.model
-            .sample_workspace_logits(&mut dg.ws, &row.params, position)
+            .sample_workspace_logits(&mut dg.ws, &row.params, position, penalty_of(&row.penalty_history, row.penalty_prompt_len))
     }
 
     /// Run one decode step through the captured whole-step graph. `Ok(None)` means
@@ -2564,11 +2572,12 @@ impl Qwen35CudaExecutor {
         let batched = kind == SpecKind::Dspark
             && self.paged_kv_bf16()
             && decode_rows.iter().all(|r| r.params.is_greedy());
+        let any_penalty = decode_rows.iter().any(|r| r.params.has_penalty());
         let gate = match batched {
             true => crate::runtime_flags::spec_max_batch(),
             false => 1,
         };
-        match super::spec_decode::route_decode(kind, decode_rows.len(), gate) {
+        match super::spec_decode::route_decode(kind, decode_rows.len(), gate, any_penalty) {
             DecodeRoute::Dspark => self.dspark_decode_batch(decode_rows, host_kv),
             DecodeRoute::Mtp => {
                 let mut tokens = Vec::with_capacity(decode_rows.len());
@@ -2740,6 +2749,8 @@ impl Qwen35CudaExecutor {
                     start_pos: cursor,
                     total_tokens: row.total_tokens,
                     params: row.params.clone(),
+                    penalty_history: row.penalty_history.clone(),
+                    penalty_prompt_len: row.penalty_prompt_len,
                 };
                 self.prefill_row_paged_default(&seg, cut as u64, host_kv)?; // token discarded
                 cursor = cut;
@@ -2763,6 +2774,8 @@ impl Qwen35CudaExecutor {
             start_pos: cursor,
             total_tokens: row.total_tokens,
             params: row.params.clone(),
+            penalty_history: row.penalty_history.clone(),
+            penalty_prompt_len: row.penalty_prompt_len,
         };
         self.prefill_row_paged_default(&tail, position, host_kv)
     }
@@ -2820,6 +2833,7 @@ impl Qwen35CudaExecutor {
                 row.kv_seq_len,
                 &row.params,
                 position,
+                penalty_of(&row.penalty_history, row.penalty_prompt_len),
             ),
         }
     }
@@ -2918,6 +2932,10 @@ impl Qwen35CudaExecutor {
             .iter()
             .map(|r| r.kv_seq_len.saturating_add(1) as u64)
             .collect();
+        let penalties: Vec<infer_plan::PenaltyHistory<'_>> = rows
+            .iter()
+            .map(|r| penalty_of(&r.penalty_history, r.penalty_prompt_len))
+            .collect();
         let sampled = self.model.forward_decode_batch(
             &mut self.slots,
             bd,
@@ -2926,6 +2944,7 @@ impl Qwen35CudaExecutor {
             &kv_seq_lens,
             &params,
             &positions,
+            &penalties,
         )?;
         ensure!(
             sampled.len() == rows.len(),
@@ -2985,6 +3004,10 @@ impl Qwen35CudaExecutor {
             .collect();
         let batch_rows: Vec<(usize, usize)> =
             rows.iter().map(|r| (r.slot, r.kv_seq_len + 1)).collect();
+        let penalties: Vec<infer_plan::PenaltyHistory<'_>> = rows
+            .iter()
+            .map(|r| penalty_of(&r.penalty_history, r.penalty_prompt_len))
+            .collect();
 
         if self.batch_decode.is_none() {
             let num_full = self.model.config.num_full_attention_layers();
@@ -3017,6 +3040,7 @@ impl Qwen35CudaExecutor {
             &kv_seq_lens,
             &params,
             &sample_positions,
+            &penalties,
         )?;
         ensure!(
             sampled.len() == rows.len(),

@@ -188,7 +188,7 @@ impl KvBatchDescriptor {
         let page_start = self.flat_page_ids.len();
         if append_end > 0 {
             self.flat_page_ids
-                .extend_from_slice(kv.page_indices_for_token_range(slot, 0, append_end));
+                .extend_from_slice(kv.page_indices_for_token_range(slot, append_end));
         }
         let page_range = page_start..self.flat_page_ids.len();
         let slot_page_start = self.flat_slot_page_ids.len();

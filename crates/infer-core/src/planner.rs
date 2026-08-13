@@ -37,11 +37,14 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
                 else {
                     continue;
                 };
+                let (penalty_history, penalty_prompt_len) = request.penalty_history();
                 decode_rows.push(DecodeRow {
                     slot,
                     last_token,
                     kv_seq_len: self.kv.seq_len(slot),
                     params: request.sampling.clone(),
+                    penalty_history,
+                    penalty_prompt_len,
                 });
             }
         }
@@ -90,12 +93,15 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             if aligned_end > start_pos {
                 chunk = aligned_end - start_pos;
             }
+            let (penalty_history, penalty_prompt_len) = request.penalty_history();
             prefill_rows.push(PrefillRow {
                 slot,
                 tokens: request.committed_slice(start_pos, chunk),
                 start_pos,
                 total_tokens: target,
                 params: request.sampling.clone(),
+                penalty_history,
+                penalty_prompt_len,
             });
             budget -= chunk;
         }
@@ -189,12 +195,6 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             .map(|(pos, _)| pos)
     }
 
-    pub(crate) fn requeue_preempted_decode(&mut self, slot: usize) {
-        // KV-overflow retract: a retracted decode has the most progress, so it
-        // re-admits ASAP — `BeforeEqual` keeps it ahead of equal-priority peers.
-        self.requeue_preempted_decode_with_bias(slot, WaitingInsertBias::BeforeEqual);
-    }
-
     /// Oversubscription park — PARK-OR-NOTHING. Demote the victim's whole-slot
     /// image FIRST; only a successful park preempts (parked `AfterEqual` so the
     /// freed slot goes to the existing waiter). A refused/failed demote leaves
@@ -239,7 +239,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         self.free_slot_pages(slot);
         self.release_reused_prefix(&request.reused_prefix_pages);
         // Keep the generation: decode resumes at the demoted position after
-        // promote (see requeue_preempted_decode_with_bias for the length note).
+        // promote (see requeue_preempted_decode for the length note).
         request.swap_key = Some(key);
         request.swap_seq_len = demoted_seq_len;
         request.reused_prefix_pages.clear();
@@ -249,16 +249,10 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         true
     }
 
-    /// As [`Self::requeue_preempted_decode`] but with an explicit waiting-queue
-    /// bias. Oversubscription parks the victim `AfterEqual` so it yields its
-    /// place to the existing equal-priority waiter (the one it freed the slot
-    /// for) — without this the just-parked victim would jump back to the front
-    /// and be re-admitted on the spot (thrash).
-    pub(crate) fn requeue_preempted_decode_with_bias(
-        &mut self,
-        slot: usize,
-        bias: WaitingInsertBias,
-    ) {
+    /// Requeue a preempted decode back to the waiting queue. A retracted decode
+    /// has the most progress, so it re-admits ASAP — `BeforeEqual` keeps it
+    /// ahead of equal-priority peers.
+    pub(crate) fn requeue_preempted_decode(&mut self, slot: usize) {
         let Some(mut request) = self.active.remove(&slot) else {
             return;
         };
@@ -341,7 +335,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             );
             request.reset_for_recompute()
         };
-        self.enqueue_waiting_request(request, bias);
+        self.enqueue_waiting_request(request, WaitingInsertBias::BeforeEqual);
     }
 
     /// Inverse of the whole-slot demote: rebuild host KV accounting for the

@@ -281,7 +281,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         let sealed_tokens = sealed_blocks * block_size;
         let pages = self
             .kv
-            .page_indices_for_token_range(slot, 0, sealed_tokens)
+            .page_indices_for_token_range(slot, sealed_tokens)
             .to_vec();
         let mut publish_blocks = sealed_blocks.min(pages.len());
         // A recall-evicted prompt page leaves an EVICTED_PAGE sentinel; a cached
