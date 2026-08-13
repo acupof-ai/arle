@@ -809,7 +809,7 @@ impl Dsv4LayerAttentionState {
         } else {
             None
         };
-        let fused_wqkv = if dsv4_fused_wqkv_decode_alloc_enabled()? {
+        let fused_wqkv = if dsv4_fused_wqkv_decode_enabled()? {
             Some(Dsv4FusedWqkvDecodeScratch::new(ctx, config)?)
         } else {
             None
@@ -895,7 +895,7 @@ impl Dsv4LayerAttentionState {
         if cuda_kernels::HAS_FLASHMLA {
             total += Dsv4FlashMlaDecodeState::device_bytes_estimate();
         }
-        if super::dsv4_fused_wqkv_decode_alloc_enabled()? {
+        if super::dsv4_fused_wqkv_decode_enabled()? {
             total += Dsv4FusedWqkvDecodeScratch::device_bytes_for(config);
         }
         Ok(total)
