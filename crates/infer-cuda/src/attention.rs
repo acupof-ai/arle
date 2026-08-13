@@ -223,13 +223,8 @@ pub(crate) fn commit_layer_fold(
                 .indexer
                 .as_ref()
                 .ok_or_else(|| anyhow!("DSv4 commit fold: CSA layer without indexer weights"))?;
-            let use_official_dsa = true;
-            let indexer_rope_original_seq_len = if use_official_dsa {
-                i32::try_from(config.rope_parameters.original_max_position_embeddings)
-                    .map_err(|_| anyhow!("DSv4 commit fold indexer rope len overflows i32"))?
-            } else {
-                0
-            };
+            let indexer_rope_original_seq_len = i32::try_from(config.rope_parameters.original_max_position_embeddings)
+                    .map_err(|_| anyhow!("DSv4 commit fold indexer rope len overflows i32"))?;
             let indexer_state = state
                 .indexer
                 .as_mut()
@@ -248,7 +243,7 @@ pub(crate) fn commit_layer_fold(
                 true,
                 start_pos,
                 None,
-                use_official_dsa,
+                true,
                 indexer_rope_original_seq_len,
                 fp32_scratch,
                 None,
@@ -5358,19 +5353,14 @@ pub(crate) fn mla_attention_prepare(
             let indexer = attention.indexer.as_ref().ok_or_else(|| {
                 anyhow::anyhow!("DSv4 layer {layer_idx} is {mode:?} but has no indexer weights")
             })?;
-            let use_official_dsa = true;
-            let indexer_rope_original_seq_len = if use_official_dsa {
-                i32::try_from(config.rope_parameters.original_max_position_embeddings).map_err(
+            let indexer_rope_original_seq_len = i32::try_from(config.rope_parameters.original_max_position_embeddings).map_err(
                     |_| {
                         anyhow!(
                             "DSv4 official DSA original_max_position_embeddings {} overflows i32",
                             config.rope_parameters.original_max_position_embeddings
                         )
                     },
-                )?
-            } else {
-                0
-            };
+                )?;
             let indexer_rows_before = state
                 .indexer
                 .as_ref()
@@ -5403,7 +5393,7 @@ pub(crate) fn mla_attention_prepare(
                         true,
                         start_pos,
                         start_pos_device,
-                        use_official_dsa,
+                        true,
                         indexer_rope_original_seq_len,
                         fp32_scratch,
                         None,
@@ -5857,14 +5847,9 @@ pub(crate) fn mla_attention_compressor_defer_row(
         let indexer = attention.indexer.as_ref().ok_or_else(|| {
             anyhow!("DSv4 layer {layer_idx} is CompressedSparse but has no indexer weights")
         })?;
-        let use_official_dsa = true;
-        let indexer_rope_original_seq_len = if use_official_dsa {
-            i32::try_from(config.rope_parameters.original_max_position_embeddings).map_err(
+        let indexer_rope_original_seq_len = i32::try_from(config.rope_parameters.original_max_position_embeddings).map_err(
                 |_| anyhow!("DSv4 official DSA original_max_position_embeddings overflows i32"),
-            )?
-        } else {
-            0
-        };
+            )?;
         indexer_rows_before = state
             .indexer
             .as_ref()
@@ -5887,7 +5872,7 @@ pub(crate) fn mla_attention_compressor_defer_row(
             true,
             start_pos,
             start_pos_device,
-            use_official_dsa,
+            true,
             indexer_rope_original_seq_len,
             None,
             None,
@@ -6050,19 +6035,14 @@ pub(crate) fn mla_attention_prepare_compressed_only(
             let indexer = attention.indexer.as_ref().ok_or_else(|| {
                 anyhow::anyhow!("DSv4 layer {layer_idx} is {mode:?} but has no indexer weights")
             })?;
-            let use_official_dsa = true;
-            let indexer_rope_original_seq_len = if use_official_dsa {
-                i32::try_from(config.rope_parameters.original_max_position_embeddings).map_err(
+            let indexer_rope_original_seq_len = i32::try_from(config.rope_parameters.original_max_position_embeddings).map_err(
                     |_| {
                         anyhow!(
                             "DSv4 official DSA original_max_position_embeddings {} overflows i32",
                             config.rope_parameters.original_max_position_embeddings
                         )
                     },
-                )?
-            } else {
-                0
-            };
+                )?;
             // `indexer_rows_before` = the indexer compressed row count BEFORE this
             // step's advance. In full-flatten the P1a pre-pass already advanced
             // `compressed.seq_len`, so the live value would be the AFTER count;
@@ -6101,7 +6081,7 @@ pub(crate) fn mla_attention_prepare_compressed_only(
                         true,
                         start_pos,
                         start_pos_device,
-                        use_official_dsa,
+                        true,
                         indexer_rope_original_seq_len,
                         None,
                         precomputed_indexer,

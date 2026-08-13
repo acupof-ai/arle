@@ -784,7 +784,7 @@ impl Dsv4KvAdapter {
                 }
             });
         let dsa_shared = match csa_ratios.next() {
-            Some(first_cr) if dsv4_dsa_official_enabled()? => {
+            Some(first_cr) => {
                 ensure!(
                     csa_ratios.all(|cr| cr == first_cr),
                     "DSv4 shared DSA scratch requires a uniform CSA compress_ratio"
@@ -876,7 +876,7 @@ impl Dsv4KvAdapter {
         // single instance serves every layer and slot; layers run sequentially
         // and the engine runs one forward at a time, so it is never aliased
         // concurrently. OFF by default → byte-identical to the disabled path.
-        let prefill_linear = if dsv4_fp8_linear_deepgemm_enabled()? {
+        let prefill_linear = if dsv4_deepgemm_enabled() {
             Some(Dsv4PrefillDeepGemmLinearScratch::new(
                 ctx,
                 config,
@@ -1586,7 +1586,7 @@ impl Dsv4LayerKvLayout {
         // Widen the per-slot DSA key-cache to has_indexer() (CSA + GLM
         // SparseIndexed); sized at index_ratio (=1 for GLM) so the div_ceil in
         // dsv4_dsa_key_cache_bytes never sees compress_ratio==0.
-        let dsa_slot_bytes = if mode.has_indexer() && dsv4_dsa_official_enabled()? {
+        let dsa_slot_bytes = if mode.has_indexer() {
             dsv4_dsa_key_cache_bytes(config, index_ratio, max_seq_len)?
         } else {
             0

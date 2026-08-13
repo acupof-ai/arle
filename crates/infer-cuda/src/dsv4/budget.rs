@@ -297,7 +297,7 @@ impl Dsv4Model {
         // Official-DSA selector memory splits into the ONE model-wide shared
         // scratch (a fixed subtraction from the budget) and the per-(slot,
         // CSA-layer) transient rotated_keys staging (a per-slot term). #67.
-        let official_on = crate::attention::dsv4_dsa_official_enabled().unwrap_or(true);
+        let official_on = true;
         // First indexer layer's indexer ratio (CSA = compress_ratio; GLM
         // SparseIndexed → 1, full-sequence every-token-a-key). Widened from CSA-only
         // so the shared DSA scratch + batched per-slot scratch are budgeted for GLM.
