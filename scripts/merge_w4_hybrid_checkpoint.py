@@ -31,32 +31,16 @@ Usage:
 
 from __future__ import annotations
 import argparse
-import json
-import shutil
 import sys
 from pathlib import Path
 
-import safetensors.torch as st
 import torch
+
+from convert import load_all_tensors, save_checkpoint, copy_config_files
 
 
 W4A8_SUFFIXES = (".marlin_w4a8_qweight", ".marlin_w4a8_s_channel", ".marlin_w4a8_s_group")
 W4A16_SUFFIXES = (".marlin_qweight", ".marlin_scales")
-
-
-def load_all_tensors(src: Path) -> dict[str, torch.Tensor]:
-    """Load all tensors from a safetensors-only or sharded checkpoint."""
-    out: dict[str, torch.Tensor] = {}
-    idx_path = src / "model.safetensors.index.json"
-    if idx_path.exists():
-        files = sorted({v for v in json.loads(idx_path.read_text())["weight_map"].values()})
-    else:
-        files = [f.name for f in src.glob("*.safetensors")]
-    for fname in files:
-        with st.safe_open(src / fname, framework="pt") as h:
-            for k in h.keys():
-                out[k] = h.get_tensor(k)
-    return out
 
 
 def main():
@@ -71,7 +55,6 @@ def main():
         sys.exit(f"src w4a16 not found: {args.w4a16}")
     if not args.w4a8.exists():
         sys.exit(f"src w4a8 not found: {args.w4a8}")
-    args.dst.mkdir(parents=True, exist_ok=True)
 
     print(f"Loading W4A16 source: {args.w4a16}")
     a = load_all_tensors(args.w4a16)
@@ -103,26 +86,12 @@ def main():
     print(f"\nMerge: w4a16={n_w4a16_kept}, w4a8={n_w4a8_kept}, passthrough={n_passthrough}")
     print(f"Total tensors in hybrid: {len(merged)}")
 
-    out_path = args.dst / "model.safetensors"
-    st.save_file(merged, str(out_path))
-    print(f"Saved → {out_path}")
-
-    for cfg in ["config.json", "generation_config.json", "tokenizer.json",
-                "tokenizer_config.json", "special_tokens_map.json", "chat_template.jinja",
-                "added_tokens.json", "merges.txt", "vocab.json"]:
-        src_cfg = args.w4a16 / cfg
-        if src_cfg.exists():
-            shutil.copy2(src_cfg, args.dst / cfg)
-
-    cfg_path = args.dst / "config.json"
-    if cfg_path.exists():
-        cfg = json.loads(cfg_path.read_text())
-        cfg["quantization_config"] = {
-            "quant_type": "marlin_w4_hybrid",
-            "group_size": args.groupsize,
-        }
-        cfg_path.write_text(json.dumps(cfg, indent=2))
-        print(f"patched config.json with quant_type=marlin_w4_hybrid")
+    copy_config_files(args.w4a16, args.dst)
+    save_checkpoint(
+        merged, args.dst,
+        quant_config={"quant_type": "marlin_w4_hybrid", "group_size": args.groupsize},
+    )
+    print(f"patched config.json with quant_type=marlin_w4_hybrid")
 
 
 if __name__ == "__main__":

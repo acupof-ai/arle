@@ -27,11 +27,13 @@ directory unless noted.
 
 | Script | Purpose |
 |---|---|
+| `convert.py` | Shared checkpoint conversion IO (load_all_tensors, save_checkpoint, copy_config_files). Used by the conversion scripts below. |
 | `convert_gptq_to_w4a16.py` | Convert a local GPTQ v1 directory to ARLE W4A16; download first with `hf download REPO --local-dir DIR`. |
 | `convert_gptq_w4a16_to_w4a8_marlin.py` | Convert W4A16 to hybrid W4A8 Marlin format. |
 | `convert_dspark_speculators.py` | Convert DSpark speculator checkpoints. |
 | `gguf_to_safetensors.py` | Convert GGUF to safetensors format. |
 | `merge_w4_hybrid_checkpoint.py` | Merge hybrid W4A16/W4A8 checkpoint shards. |
+| `marlin_repack.py` | GPTQ int32 → Marlin tile layout repack. |
 | `setup_qwen3_yarn_config.py` | Set up YaRN RoPE config for Qwen models. |
 
 ## Quantization
