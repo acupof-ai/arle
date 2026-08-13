@@ -54,7 +54,6 @@ pub(crate) fn run_serve(args: &Args, serve_args: ServeArgs) -> ExitCode {
     // Lower the probe flags into the env the CUDA executor reads at first use.
     // MUST run pre-spawn: multiproc TP rank children inherit the parent env
     // (env is the transport; flags are the only public interface).
-    apply_probe_env(&serve_args);
     // CC-trajectory capture: install the /v1/messages dump sink before the
     // router (single- and multiproc coordinator both handle HTTP in-process).
     if let Some(dir) = serve_args.dump_messages_dir.as_deref() {
@@ -77,48 +76,6 @@ pub(crate) fn run_serve(args: &Args, serve_args: ServeArgs) -> ExitCode {
             ExitCode::FAILURE
         }
     }
-}
-
-/// Lower `--probe-out` / `--probe-lens-layers` / `--probe-token-entropy` into
-/// the `ARLE_PROBE_*` env the `infer-cuda` probe reads once (`OnceLock`). The
-/// path is absolutized so multiproc rank children resolve the same file.
-///
-/// SAFETY: single CLI thread, pre-spawn, pre-tokio (same contract as the
-/// env pre-spawn).
-fn apply_probe_env(serve_args: &ServeArgs) {
-    let Some(path) = serve_args.probe_out.as_ref() else {
-        return;
-    };
-    let abs = if path.is_absolute() {
-        path.clone()
-    } else {
-        env::current_dir()
-            .map(|dir| dir.join(path))
-            .unwrap_or_else(|_| path.clone())
-    };
-    // SAFETY: single CLI thread, pre-spawn, pre-tokio (children inherit the
-    // env pre-spawn).
-    unsafe {
-        std::env::set_var("ARLE_PROBE_JSONL", &abs);
-        std::env::set_var(
-            "ARLE_PROBE_LENS_LAYERS",
-            serve_args.probe_lens_layers.to_string(),
-        );
-        std::env::set_var(
-            "ARLE_PROBE_TOKEN_ENTROPY",
-            if serve_args.probe_token_entropy {
-                "1"
-            } else {
-                "0"
-            },
-        );
-    }
-    eprintln!(
-        "[probe] lens_layers={} token_entropy={} → {}",
-        serve_args.probe_lens_layers,
-        serve_args.probe_token_entropy,
-        abs.display()
-    );
 }
 
 fn run_config(config: ServeConfig) -> ExitCode {
