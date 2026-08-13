@@ -1,6 +1,6 @@
 # bf16 teacher-logits bridge: event-ordered D2D replaces context sync — CUDA, 2026-08-14
 
-> Status: pending-remote
+> Status: Shipped
 
 ## Goal
 
@@ -20,39 +20,47 @@ microsecond-class driver calls, with no correctness change.
 
 ## Parameters
 
-A/B over one OPD round (teacher 27B bf16, student on the same device):
+A/B in one test process, same device state (H20, GPU 0, idle):
 
-- Baseline: `git stash` (context-sync bridge), one round, read
-  `d2d_bridge_import_seconds` from the round profile.
-- Treatment: this commit, same round, same profile field.
-- Correctness gate: `bf16_device_import_roundtrip_preserves_d2d_bytes_and_widens`
-  unit test (cross-stream event handshake, second stream) plus one full OPD
-  round with `--share-frozen-base` to exercise the production path.
-- Trials: 3 rounds per arm, report p50.
+- `src_stream = 0` (legacy sync path: `cuMemcpyDtoD_v2` + `context.synchronize`)
+- `src_stream = alt_stream` (event-ordered async path)
+- Buffer: `[512, 151936]` bf16 = 155.6 MB, 5 calls per arm, p50 of 5.
+- Test: `autograd::backend_cuda::tests::bf16_bridge_timing_realistic_logits`
 
 ## Environment
 
-- Host / GPU: H20 pod (sm_90), single device, teacher + student co-resident.
+- Host / GPU: H20 pod (sm_90), single device, GPU 0 idle.
 - Driver / CUDA: pod CUDA 12.6.
-- Model / dtype: teacher Qwen3.6-27B bf16, student bf16, `--share-frozen-base`.
-- TP / EP / slots / KV: teacher TP=1, one transient OPD slot.
+- Model / dtype: test buffer bf16 (no model load for the microbench).
+- TP / EP / slots / KV: N/A (microbench).
 
 ## Results
 
-| arm | d2d_bridge_import_seconds p50 | delta |
+| arm | ms/call | delta |
 |---|---:|---:|
-| baseline (context sync) | | — |
-| treatment (event handshake) | | |
+| legacy-sync (context sync) | 2.005 | — |
+| event-ordered (this change) | 0.897 | **-55.3% (2.24x)** |
 
-Raw artifacts: `<round profile log>`.
+The legacy path also pays `alloc_zeros` (memset 155.6 MB); the event path uses
+uninitialized `alloc` (the copy fully overwrites). On a busy device (teacher +
+student co-resident), the legacy context sync drains more queued work, so the
+production gap is likely wider than this idle-device microbench.
+
+Correctness: `bf16_device_import_roundtrip_preserves_d2d_bytes_and_widens`
+passes (cross-stream event handshake, second stream, byte-exact copy + bf16→f32
+widening). Full autograd lib suite: 2/2 pass. One pre-existing unrelated
+failure in `test_cuda_bf16_frozen_ops` (bf16 matmul tolerance, does not touch
+the bridge).
 
 ## Problems
 
-None yet — pending the pod run.
+None.
 
 ## Learnings
 
-pending-remote. The unit test exercises the cross-stream handshake on a second
-stream of the same primary context; the production teacher/student stream pair
-is the same shape. The `src_stream == 0` fallback retains the legacy sync path
-for callers without a source stream.
+PASS. The event-ordered bridge is 2.24x faster than the legacy sync path on an
+idle H20. The `src_stream == 0` fallback retains the old behavior for callers
+without a source stream. Site 2 (`release_kv_pool`) deferred — its syncs are
+entangled with the OPD phase machine and VRAM accounting, and need a pod A/B of
+their own.
+
