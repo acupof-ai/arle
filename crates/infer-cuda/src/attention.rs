@@ -4156,21 +4156,7 @@ pub(crate) fn mla_attention_decode(
     } else {
         None
     };
-    let compressed: Option<&HiddenStates> = if mode.has_compressor() {
-        Some(
-            &state
-                .compressor
-                .as_ref()
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "DSv4 layer {layer_idx} is {mode:?} but has no compressor state"
-                    )
-                })?
-                .compressed,
-        )
-    } else {
-        None
-    };
+    let compressed = state.compressor.as_ref().map(|s| &s.compressed);
     let flash = state
         .flashmla
         .as_mut()
@@ -5543,21 +5529,7 @@ fn mla_attention_fwd(
     keepalive.keep_hidden(&k_prepared);
 
     // Compressed KV pool: CSA/HCA have a compressor; SparseIndexed and SWA do not.
-    let compressed: Option<&HiddenStates> = if mode.has_compressor() {
-        Some(
-            &state
-                .compressor
-                .as_ref()
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "DSv4 layer {layer_idx} is {mode:?} but has no compressor state"
-                    )
-                })?
-                .compressed,
-        )
-    } else {
-        None
-    };
+    let compressed = state.compressor.as_ref().map(|s| &s.compressed);
 
     if token_count > 1 {
         flashmla_prefill_attention(
