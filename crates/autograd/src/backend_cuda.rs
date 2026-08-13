@@ -2715,27 +2715,32 @@ mod tests {
         let src_stream = alt_stream.cu_stream() as u64;
         let shape = vec![seq_len, vocab];
 
-        // Warmup.
-        let _ = backend.import_bf16_device_ptr_as_f32(src_ptr, src_stream, len, &shape)?;
-        backend
-            .stream
-            .synchronize()
-            .map_err(|_| AutogradError::TapeInvariant("sync failed (bf16 timing)"))?;
+        // A/B in one process, same device state: src_stream=0 is the legacy
+        // sync path (cuMemcpyDtoD_v2 + context.synchronize), src_stream=alt
+        // is the event-ordered async path.
+        for (label, stream) in [("legacy-sync", 0u64), ("event-ordered", src_stream)] {
+            // Warmup.
+            let _ = backend.import_bf16_device_ptr_as_f32(src_ptr, stream, len, &shape)?;
+            backend
+                .stream
+                .synchronize()
+                .map_err(|_| AutogradError::TapeInvariant("sync failed (bf16 timing)"))?;
 
-        let start = std::time::Instant::now();
-        for _ in 0..5 {
-            let _ = backend.import_bf16_device_ptr_as_f32(src_ptr, src_stream, len, &shape)?;
+            let start = std::time::Instant::now();
+            for _ in 0..5 {
+                let _ = backend.import_bf16_device_ptr_as_f32(src_ptr, stream, len, &shape)?;
+            }
+            backend
+                .stream
+                .synchronize()
+                .map_err(|_| AutogradError::TapeInvariant("sync failed (bf16 timing)"))?;
+            let elapsed = start.elapsed();
+            println!(
+                "bf16_bridge_timing[{label}]: {:.3} ms/call (5 calls, {:.1} MB each)",
+                elapsed.as_secs_f64() * 1000.0 / 5.0,
+                (len * 2) as f64 / 1e6,
+            );
         }
-        backend
-            .stream
-            .synchronize()
-            .map_err(|_| AutogradError::TapeInvariant("sync failed (bf16 timing)"))?;
-        let elapsed = start.elapsed();
-        println!(
-            "bf16_bridge_timing: {:.3} ms/call (5 calls, {:.1} MB each)",
-            elapsed.as_secs_f64() * 1000.0 / 5.0,
-            (len * 2) as f64 / 1e6,
-        );
         Ok(())
     }
 }
