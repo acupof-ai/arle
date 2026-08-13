@@ -1393,14 +1393,7 @@ impl Dsv4CudaExecutor {
         let spec_on = self.spec_requested();
         if spec_on && params.is_raw_argmax() {
             let token = if final_prefill {
-                self.forward_mtp_warm_step(
-                    slot_idx,
-                    tokens,
-                    start_pos,
-                    params,
-                    position,
-                    penalty,
-                )?
+                self.forward_mtp_warm_step(slot_idx, tokens, start_pos, params, position, penalty)?
             } else {
                 let (token, _hidden) = self.model.forward_tokens_with_hidden(
                     &mut self.slots[slot_idx],
@@ -1486,8 +1479,14 @@ impl Dsv4CudaExecutor {
             None => false,
         };
         if !seeded {
-            let token =
-                self.forward_mtp_warm_step(slot_idx, &[last_token], start_pos, params, position, penalty)?;
+            let token = self.forward_mtp_warm_step(
+                slot_idx,
+                &[last_token],
+                start_pos,
+                params,
+                position,
+                penalty,
+            )?;
             return Ok(vec![token]);
         }
         // When the acceptance EMA predicts MTP would lose to no-spec, run a warm
@@ -1496,8 +1495,14 @@ impl Dsv4CudaExecutor {
         // executor-global; make them per-slot before defaulting the gate on.
         if self.mtp_adaptive_skip() {
             self.mtp_skip_streak += 1;
-            let token =
-                self.forward_mtp_warm_step(slot_idx, &[last_token], start_pos, params, position, penalty)?;
+            let token = self.forward_mtp_warm_step(
+                slot_idx,
+                &[last_token],
+                start_pos,
+                params,
+                position,
+                penalty,
+            )?;
             return Ok(vec![token]);
         }
         self.spec_step(slot_idx, start_pos, position)
