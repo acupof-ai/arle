@@ -1033,11 +1033,23 @@ pub(crate) const NS_SLOT_CHUNK: u64 = 2;
 pub(crate) const NS_SIDECAR: u64 = 3;
 pub(crate) const NS_SIDECAR_CHUNK: u64 = 4;
 
+/// Borrow a plan row's penalty snapshot; empty when the request set no penalty.
+pub(crate) fn penalty_of(
+    history: &Option<std::sync::Arc<[u32]>>,
+    prompt_len: usize,
+) -> infer_plan::PenaltyHistory<'_> {
+    infer_plan::PenaltyHistory {
+        tokens: history.as_deref().unwrap_or(&[]),
+        prompt_len,
+    }
+}
+
 pub(crate) fn sample_cuda_token(
     ctx: &DeviceContext,
     logits: &DeviceVec,
     params: &SamplingParams,
     position: u64,
+    penalty: infer_plan::PenaltyHistory<'_>,
 ) -> Result<u32> {
     // A grammar mask must reach the argmax, so greedy takes the host path too.
     if params.is_raw_argmax() {
@@ -1045,10 +1057,8 @@ pub(crate) fn sample_cuda_token(
         return Ok(token);
     }
 
-    // TODO: repetition/frequency/presence penalties need the per-request
-    // generated-token history threaded through the executor.
     let logits_host = logits.to_host(ctx)?;
-    let token = infer_plan::sample_token(&logits_host, params, position);
+    let token = infer_plan::sample_token_penalized(&logits_host, params, position, penalty);
     Ok(token)
 }
 
@@ -1065,12 +1075,14 @@ pub(crate) fn sample_cuda_token_scratched(
     params: &SamplingParams,
     position: u64,
     argmax_out: &mut cudarc::driver::CudaSlice<i32>,
+    penalty: infer_plan::PenaltyHistory<'_>,
 ) -> Result<(u32, Option<f32>)> {
     if params.is_raw_argmax() {
         let token = crate::ops::argmax_into(ctx, logits, argmax_out)?;
         return Ok((token, None));
     }
     let logits_host = logits.to_host(ctx)?;
-    let (token, logprob) = infer_plan::sample_token_logprob(&logits_host, params, position);
+    let (token, logprob) =
+        infer_plan::sample_token_logprob_penalized(&logits_host, params, position, penalty);
     Ok((token, logprob))
 }

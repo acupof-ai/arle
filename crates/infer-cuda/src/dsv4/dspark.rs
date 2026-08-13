@@ -901,7 +901,14 @@ impl Dsv4Model {
                 .memcpy_dtod(&corrected_row.data, &mut step_vec.data)
                 .map_err(|e| anyhow!("DSpark step row copy failed: {e}"))?;
 
-            let tok = crate::executor::sample_cuda_token(ctx, &step_vec, &params, i as u64)?;
+            // Draft proposal: the target verify re-decides, so no penalty here.
+            let tok = crate::executor::sample_cuda_token(
+                ctx,
+                &step_vec,
+                &params,
+                i as u64,
+                infer_plan::PenaltyHistory::default(),
+            )?;
             drafts.push(tok);
             prev = tok;
         }

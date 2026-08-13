@@ -3,8 +3,6 @@
 //! `infer::server_engine::{...}` today. `SamplingParams` is re-exported from
 //! `infer-plan` rather than duplicated.
 
-use std::collections::HashMap;
-
 use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 
@@ -61,34 +59,8 @@ impl RawLogits {
 #[cfg(feature = "cuda")]
 unsafe impl Send for RawLogits {}
 
-/// Sticky-routing / prefix-cache affinity key (an `Arc<str>` newtype). Carried
-/// on [`CompletionRequest::session_id`]; advisory until the rewrite engine wires
-/// host-side sticky routing.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct SessionId(std::sync::Arc<str>);
-
-impl SessionId {
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl From<&str> for SessionId {
-    fn from(value: &str) -> Self {
-        Self(std::sync::Arc::from(value))
-    }
-}
-
-impl From<String> for SessionId {
-    fn from(value: String) -> Self {
-        Self(std::sync::Arc::from(value.as_str()))
-    }
-}
-
 /// A single completion request (field-for-field compatible with the legacy
-/// `CompletionRequest`). `session_id`/`trace_context`/`cancel` are accepted but
-/// only partially honored (see the crate-level doc gaps).
+/// `CompletionRequest`).
 #[derive(Debug)]
 pub struct CompletionRequest {
     pub prompt: String,
@@ -96,15 +68,6 @@ pub struct CompletionRequest {
     pub sampling: SamplingParams,
     /// Stop generation when output ends with any of these strings (OpenAI-compatible).
     pub stop: Option<Vec<String>>,
-    /// Return per-token log-probabilities (greedy sampling only).
-    pub logprobs: bool,
-    /// Session identifier for sticky routing / prefix affinity (advisory).
-    pub session_id: Option<SessionId>,
-    /// Parent tracing context (carried for compatibility; not yet propagated).
-    pub trace_context: Option<fastrace::collector::SpanContext>,
-    /// Cooperative cancel flag (observed on finish; mid-generation cancel is a
-    /// follow-up).
-    pub cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl CompletionRequest {
@@ -116,10 +79,6 @@ impl CompletionRequest {
             max_tokens,
             sampling: SamplingParams::default(),
             stop: None,
-            logprobs: false,
-            session_id: None,
-            trace_context: None,
-            cancel: None,
         }
     }
 
@@ -132,18 +91,6 @@ impl CompletionRequest {
     #[must_use]
     pub fn with_stop(mut self, stop: Vec<String>) -> Self {
         self.stop = Some(stop);
-        self
-    }
-
-    #[must_use]
-    pub fn with_session(mut self, session_id: impl Into<SessionId>) -> Self {
-        self.session_id = Some(session_id.into());
-        self
-    }
-
-    #[must_use]
-    pub fn with_logprobs(mut self, logprobs: bool) -> Self {
-        self.logprobs = logprobs;
         self
     }
 }
@@ -231,8 +178,6 @@ pub struct CompletionOutput {
     pub text: String,
     pub finish_reason: FinishReason,
     pub usage: TokenUsage,
-    /// Per-token log-probabilities (greedy only); always empty (not yet surfaced).
-    pub token_logprobs: Vec<f32>,
     pub prompt_token_ids: Vec<u32>,
     pub response_token_ids: Vec<u32>,
 }
@@ -314,8 +259,6 @@ pub struct CompletionStreamDelta {
     pub text_delta: String,
     pub finish_reason: Option<FinishReason>,
     pub usage: Option<TokenUsage>,
-    /// Log-probability of the generated token (greedy only).
-    pub logprob: Option<f32>,
     pub token_ids: Vec<u32>,
     /// Terminal failure, if the request failed before a normal finish delta.
     pub error: Option<CompletionStreamError>,
@@ -329,7 +272,6 @@ impl CompletionStreamDelta {
             text_delta: s,
             finish_reason: None,
             usage: None,
-            logprob: None,
             token_ids: Vec::new(),
             error: None,
         }
@@ -341,7 +283,6 @@ impl CompletionStreamDelta {
             text_delta: String::new(),
             finish_reason: None,
             usage: None,
-            logprob: None,
             token_ids: Vec::new(),
             error: Some(CompletionStreamError::from_chain(kind, chain)),
         }
@@ -382,28 +323,13 @@ impl CompletionStreamError {
     }
 }
 
-/// Mixed decode+prefill path counters (telemetry sub-shape).
-#[derive(Clone, Debug, Default, Serialize)]
-pub struct PrefillPathStats {
-    pub ok_true_count: u64,
-    pub ok_false_count: u64,
-    pub ok_false_reasons: HashMap<String, u64>,
-}
-
 /// Backend-agnostic engine-level telemetry snapshot (legacy `EngineTelemetry`
-/// minus `model_arch`). The rewrite `ServeHandle` surfaces none of these today,
-/// so the adapter returns the default — treat empty as "unavailable", not zero.
+/// minus `model_arch`). The rewrite `ServeHandle` surfaces only queue/active
+/// counters; latency / batch-occupancy / spec metrics are not yet tracked.
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct EngineTelemetry {
-    pub ttft_us: Option<f64>,
-    pub itl_p50_us: Option<f64>,
-    pub itl_p99_us: Option<f64>,
     pub queue_depth: u32,
     pub active_requests: u32,
-    pub batch_occupancy: f64,
-    pub kv_tier_hit_rates: HashMap<String, f64>,
-    pub spec_acceptance_rate: Option<f64>,
-    pub prefill_path_stats: PrefillPathStats,
     pub timestamp_ms: u64,
 }
 

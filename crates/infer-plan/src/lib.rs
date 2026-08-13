@@ -14,7 +14,10 @@ pub use diffusion::{
     diffusion_prediction_from_logits, entropy_bound_acceptance_mask, generate_diffusion,
     generate_diffusion_with_cancel,
 };
-pub use sample::{argmax_logit, merge_vocab_shard_argmax, sample_token, sample_token_logprob};
+pub use sample::{
+    PenaltyHistory, argmax_logit, merge_vocab_shard_argmax, sample_token, sample_token_logprob,
+    sample_token_logprob_penalized, sample_token_penalized,
+};
 
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 #[derive(Debug, Clone)]
@@ -38,6 +41,11 @@ pub struct DecodeRow {
     /// Logical KV sequence length already present for this slot.
     pub kv_seq_len: usize,
     pub params: SamplingParams,
+    /// `prompt ++ generated` snapshot, set only when [`SamplingParams::has_penalty`].
+    pub penalty_history: Option<std::sync::Arc<[u32]>>,
+    /// Split point in `penalty_history`: repetition scores the whole slice,
+    /// frequency/presence only the generated tail.
+    pub penalty_prompt_len: usize,
 }
 
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
@@ -50,6 +58,11 @@ pub struct PrefillRow {
     /// Total logical token count for the request after this prefill chunk.
     pub total_tokens: usize,
     pub params: SamplingParams,
+    /// `prompt ++ generated` snapshot, set only when [`SamplingParams::has_penalty`].
+    pub penalty_history: Option<std::sync::Arc<[u32]>>,
+    /// Split point in `penalty_history`: repetition scores the whole slice,
+    /// frequency/presence only the generated tail.
+    pub penalty_prompt_len: usize,
 }
 
 /// Minimal speculative-decode plan placeholder.
@@ -182,6 +195,17 @@ impl SamplingParams {
         self.temperature <= 0.0
     }
 
+    /// Any of the three penalties is off its no-op value, so the request needs
+    /// a token history. Single source of truth: engine-core populates
+    /// `penalty_history` on exactly these requests, and [`Self::is_raw_argmax`]
+    /// vetoes exactly these requests.
+    #[must_use]
+    pub fn has_penalty(&self) -> bool {
+        self.repetition_penalty != 1.0
+            || self.frequency_penalty != 0.0
+            || self.presence_penalty != 0.0
+    }
+
     /// The token equals `argmax` over the model's raw logits, so a backend may
     /// skip [`crate::sample_token`]. Greedy is necessary but not sufficient:
     /// `grammar_bitmask` and `logit_bias` rewrite the logits first.
@@ -198,10 +222,6 @@ impl SamplingParams {
             top_p: _,
             min_p: _,
             seed: _,
-            // Unimplemented on every path, so they cannot veto.
-            repetition_penalty: _,
-            frequency_penalty: _,
-            presence_penalty: _,
             // Downstream of token choice.
             ignore_eos: _,
             stop_token_ids: _,
@@ -210,7 +230,15 @@ impl SamplingParams {
             // Rewrite the logits — must reach the argmax.
             grammar_bitmask,
             logit_bias,
+            // Also rewrite the logits; read through `has_penalty` so the veto
+            // and engine-core's history decision cannot drift apart.
+            repetition_penalty: _,
+            frequency_penalty: _,
+            presence_penalty: _,
         } = self;
-        *temperature <= 0.0 && grammar_bitmask.is_none() && logit_bias.is_empty()
+        *temperature <= 0.0
+            && grammar_bitmask.is_none()
+            && logit_bias.is_empty()
+            && !self.has_penalty()
     }
 }

@@ -516,6 +516,7 @@ impl Qwen35Model {
         start_pos: usize,
         params: &SamplingParams,
         position: u64,
+        penalty: infer_plan::PenaltyHistory<'_>,
     ) -> Result<(u32, Option<f32>)> {
         crate::profile::profile_op(&self.ctx, "forward_hidden", None, tokens.len(), || {
             self.forward_hidden(slot, ws, tokens, start_pos)
@@ -524,7 +525,7 @@ impl Qwen35Model {
             self.lm_head_logits(ws, tokens.len())
         })?;
         crate::profile::profile_op(&self.ctx, "sample", None, tokens.len(), || {
-            self.sample_workspace_logits(ws, params, position)
+            self.sample_workspace_logits(ws, params, position, penalty)
         })
     }
 
@@ -541,10 +542,19 @@ impl Qwen35Model {
         start_pos: usize,
         params: &SamplingParams,
         position: u64,
+        penalty: infer_plan::PenaltyHistory<'_>,
         recall: &mut Qwen35RecallForward,
     ) -> Result<(u32, Option<f32>)> {
         self.forward_tokens_recall_tapped(
-            slot, ws, tokens, start_pos, params, position, recall, None,
+            slot,
+            ws,
+            tokens,
+            start_pos,
+            params,
+            position,
+            penalty,
+            recall,
+            None,
         )
     }
 
@@ -560,6 +570,7 @@ impl Qwen35Model {
         start_pos: usize,
         params: &SamplingParams,
         position: u64,
+        penalty: infer_plan::PenaltyHistory<'_>,
         recall: &mut Qwen35RecallForward,
         taps: Option<&mut dspark::Qwen35DsparkTaps>,
     ) -> Result<(u32, Option<f32>)> {
@@ -582,7 +593,7 @@ impl Qwen35Model {
             self.lm_head_logits(ws, seq_len)
         })?;
         crate::profile::profile_op(&self.ctx, "sample", None, seq_len, || {
-            self.sample_workspace_logits(ws, params, position)
+            self.sample_workspace_logits(ws, params, position, penalty)
         })
     }
 
@@ -630,13 +641,14 @@ impl Qwen35Model {
         ws: &mut Qwen35Workspace,
         params: &SamplingParams,
         position: u64,
+        penalty: infer_plan::PenaltyHistory<'_>,
     ) -> Result<(u32, Option<f32>)> {
         let Qwen35Workspace {
             logits, argmax_out, ..
         } = ws;
         let logits = logits.get(&self.ctx, self.output_projection().rows)?;
         let argmax_out = argmax_out.get(&self.ctx, 1)?;
-        sample_cuda_token_scratched(&self.ctx, logits, params, position, argmax_out)
+        sample_cuda_token_scratched(&self.ctx, logits, params, position, argmax_out, penalty)
     }
 
     /// Device address of the workspace logits buffer (allocating it at vocab

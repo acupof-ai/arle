@@ -578,10 +578,6 @@ impl AgentSession {
                             ..SamplingParams::default()
                         },
                         stop: Some(vec!["<|im_end|>".to_string()]),
-                        logprobs: false,
-                        session_id: None,
-                        trace_context: None,
-                        cancel: cancel.clone(),
                     },
                     cancel.clone(),
                     Some(&mut stream_visible_chunk as &mut dyn FnMut(&str)),
@@ -1205,10 +1201,6 @@ If no tool is needed, output exactly NO_TOOL.",
                 ..SamplingParams::default()
             },
             stop: Some(vec!["<|im_end|>".to_string()]),
-            logprobs: false,
-            session_id: None,
-            trace_context: None,
-            cancel: cancel.clone(),
         },
         cancel,
         None,
@@ -1294,7 +1286,6 @@ fn complete_with_optional_cancel<E: InferenceEngine + ?Sized>(
                         text_delta,
                         finish_reason: delta_finish_reason,
                         usage: delta_usage,
-                        logprob: _,
                         token_ids,
                         error,
                     } = delta;
@@ -1347,7 +1338,6 @@ fn complete_with_optional_cancel<E: InferenceEngine + ?Sized>(
         text,
         finish_reason,
         usage,
-        token_logprobs: Vec::new(),
         prompt_token_ids,
         response_token_ids,
     }))

@@ -467,6 +467,7 @@ impl QwenCudaExecutor {
                 &mut self.kv,
                 &row.params,
                 position,
+                penalty_of(&row.penalty_history, row.penalty_prompt_len),
             )?
         } else {
             let row = &plan.decode_rows[0];
@@ -504,7 +505,11 @@ impl QwenCudaExecutor {
                 token
             } else {
                 match self.try_captured_decode(row.slot, row.last_token, row.kv_seq_len)? {
-                    Some(()) => self.sample_decode_logits(&row.params, position)?,
+                    Some(()) => self.sample_decode_logits(
+                        &row.params,
+                        position,
+                        penalty_of(&row.penalty_history, row.penalty_prompt_len),
+                    )?,
                     None => self.model.forward_tokens(
                         row.slot,
                         &[row.last_token],
@@ -512,6 +517,7 @@ impl QwenCudaExecutor {
                         &mut self.kv,
                         &row.params,
                         position,
+                        penalty_of(&row.penalty_history, row.penalty_prompt_len),
                     )?,
                 }
             }
@@ -625,6 +631,7 @@ impl QwenCudaExecutor {
             &mut self.kv,
             &row.params,
             position,
+            penalty_of(&row.penalty_history, row.penalty_prompt_len),
         )?;
         Ok(SlotToken {
             slot: row.slot,
@@ -707,6 +714,7 @@ impl QwenCudaExecutor {
                         &mut self.kv,
                         &row.params,
                         position,
+                        penalty_of(&row.penalty_history, row.penalty_prompt_len),
                     )?
                 };
                 tokens.push(SlotToken {
@@ -730,12 +738,17 @@ impl QwenCudaExecutor {
             .map(|r| (r.slot, r.kv_seq_len + 1))
             .collect();
         let meta = PageMeta::for_decode_batch(&self.model.ctx, &self.kv, &batch_rows)?;
+        let penalties: Vec<infer_plan::PenaltyHistory<'_>> = decode_rows
+            .iter()
+            .map(|r| penalty_of(&r.penalty_history, r.penalty_prompt_len))
+            .collect();
         let out_tokens = self.model.forward_decode_batch(
             &last_tokens,
             &mut self.kv,
             &meta,
             &params,
             &positions,
+            &penalties,
         )?;
         ensure!(
             out_tokens.len() == batch,
@@ -923,6 +936,7 @@ impl QwenCudaExecutor {
             &recall_meta,
             &row.params,
             position,
+            penalty_of(&row.penalty_history, row.penalty_prompt_len),
         )?;
 
         // Score this step's query against the resident reps and plan the NEXT
@@ -1069,13 +1083,24 @@ impl QwenCudaExecutor {
 
     /// Sample the next token from the captured graph's fixed logits buffer.
     /// Sampling stays outside the graph (replay ends at `decode_ctx.logits`).
-    fn sample_decode_logits(&self, params: &SamplingParams, position: u64) -> Result<u32> {
+    fn sample_decode_logits(
+        &self,
+        params: &SamplingParams,
+        position: u64,
+        penalty: infer_plan::PenaltyHistory<'_>,
+    ) -> Result<u32> {
         let decode_ctx = self
             .decode_ctx
             .as_ref()
             .expect("decode_ctx present when sampling captured logits");
         crate::profile::profile_op(&self.model.ctx, "sample", None, 1, || {
-            sample_cuda_token(&self.model.ctx, &decode_ctx.logits, params, position)
+            sample_cuda_token(
+                &self.model.ctx,
+                &decode_ctx.logits,
+                params,
+                position,
+                penalty,
+            )
         })
     }
 

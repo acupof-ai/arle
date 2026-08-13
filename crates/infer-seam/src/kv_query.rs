@@ -15,8 +15,6 @@ pub trait KvQuery {
 
     fn free_pages(&self) -> usize;
 
-    fn free_tokens(&self) -> usize;
-
     /// Pages currently resident in the fast working pool. Default 0 for pools
     /// that do not expose a standard host-indexed page pool.
     fn resident_pages(&self) -> usize {
@@ -57,5 +55,5 @@ pub trait KvQuery {
 
     fn page_indices(&self, slot: usize) -> &[u32];
 
-    fn page_indices_for_token_range(&self, slot: usize, start: usize, len: usize) -> &[u32];
+    fn page_indices_for_token_range(&self, slot: usize, len: usize) -> &[u32];
 }

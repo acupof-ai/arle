@@ -44,11 +44,6 @@ pub struct RecallPlan {
 }
 
 impl RecallPlan {
-    #[must_use]
-    pub fn token_count(&self) -> usize {
-        self.ranges.iter().map(|&(s, e)| e - s).sum()
-    }
-
     fn all_resident(cache_len: usize) -> Self {
         Self {
             ranges: if cache_len == 0 {

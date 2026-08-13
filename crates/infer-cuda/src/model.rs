@@ -108,6 +108,7 @@ impl CudaModel {
         pool: &mut PagedKVPool,
         params: &SamplingParams,
         position: u64,
+        penalty: infer_plan::PenaltyHistory<'_>,
     ) -> Result<u32> {
         ensure!(
             !tokens.is_empty(),
@@ -249,7 +250,7 @@ impl CudaModel {
         })
         .and_then(|logits| {
             crate::profile::profile_op(&self.ctx, "sample", None, seq_len, || {
-                sample_cuda_token(&self.ctx, &logits, params, position)
+                sample_cuda_token(&self.ctx, &logits, params, position, penalty)
             })
         })
     }
@@ -272,15 +273,17 @@ impl CudaModel {
         meta: &PageMeta,
         params: &[SamplingParams],
         positions: &[u64],
+        penalties: &[infer_plan::PenaltyHistory<'_>],
     ) -> Result<Vec<u32>> {
         let batch = tokens.len();
         ensure!(batch >= 1, "forward_decode_batch requires >=1 row");
         ensure!(
-            params.len() == batch && positions.len() == batch,
-            "forward_decode_batch length mismatch: {} tokens, {} params, {} positions",
+            params.len() == batch && positions.len() == batch && penalties.len() == batch,
+            "forward_decode_batch length mismatch: {} tokens, {} params, {} positions, {} penalty histories",
             batch,
             params.len(),
-            positions.len()
+            positions.len(),
+            penalties.len()
         );
         ensure!(
             meta.batch == batch && meta.seq_len == 1,
@@ -429,7 +432,15 @@ impl CudaModel {
                 "sample",
                 None,
                 seq_len,
-                || sample_cuda_token(&self.ctx, &logits, &params[row], positions[row]),
+                || {
+                    sample_cuda_token(
+                        &self.ctx,
+                        &logits,
+                        &params[row],
+                        positions[row],
+                        penalties[row],
+                    )
+                },
             )?);
         }
         Ok(out)
@@ -456,6 +467,7 @@ impl CudaModel {
         recall_meta: &PageMeta,
         params: &SamplingParams,
         position: u64,
+        penalty: infer_plan::PenaltyHistory<'_>,
     ) -> Result<(u32, Vec<f32>)> {
         ensure!(
             self.config.head_dim == 128,
@@ -595,7 +607,7 @@ impl CudaModel {
             Ok(logits)
         })?;
         let token = crate::profile::profile_op(&self.ctx, "sample", None, seq_len, || {
-            sample_cuda_token(&self.ctx, &logits, params, position)
+            sample_cuda_token(&self.ctx, &logits, params, position, penalty)
         })?;
         Ok((token, layer0_query))
     }

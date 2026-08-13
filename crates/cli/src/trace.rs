@@ -315,7 +315,6 @@ mod tests {
                     },
                     text,
                     finish_reason: FinishReason::Stop,
-                    token_logprobs: Vec::new(),
                     prompt_token_ids,
                     response_token_ids,
                 })
@@ -332,7 +331,6 @@ mod tests {
                         text_delta: output.text.clone(),
                         finish_reason: None,
                         usage: None,
-                        logprob: None,
                         token_ids: Vec::new(),
                         error: None,
                     });
@@ -341,7 +339,6 @@ mod tests {
                     text_delta: String::new(),
                     finish_reason: Some(output.finish_reason),
                     usage: Some(output.usage),
-                    logprob: None,
                     token_ids: output.response_token_ids.clone(),
                     error: None,
                 });

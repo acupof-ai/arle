@@ -72,6 +72,64 @@ pub fn sample_token(logits: &[f32], params: &SamplingParams, position: u64) -> u
     sample_token_logprob(logits, params, position).0
 }
 
+/// Token history the penalties are scored against.
+///
+/// `tokens` is `prompt ++ generated`; `prompt_len` is the split. Repetition
+/// penalty scores the whole slice (HF/vLLM semantics), frequency and presence
+/// only `tokens[prompt_len..]` (OpenAI's "text so far" is the completion).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PenaltyHistory<'a> {
+    pub tokens: &'a [u32],
+    pub prompt_len: usize,
+}
+
+/// [`sample_token`] with the penalties applied against `history`.
+#[must_use]
+pub fn sample_token_penalized(
+    logits: &[f32],
+    params: &SamplingParams,
+    position: u64,
+    history: PenaltyHistory<'_>,
+) -> u32 {
+    sample_token_logprob_penalized(logits, params, position, history).0
+}
+
+/// Rewrite `logits` in place per the repetition / frequency / presence
+/// penalties. Order is fixed: repetition (multiplicative, sign-sensitive) then
+/// the two additive ones, matching vLLM.
+fn apply_penalties(logits: &mut [f32], params: &SamplingParams, history: PenaltyHistory<'_>) {
+    let prompt_len = history.prompt_len.min(history.tokens.len());
+    // `p <= 0` maps -inf to NaN, and NaN outranks +inf in `total_cmp`.
+    if params.repetition_penalty != 1.0 && params.repetition_penalty > 0.0 {
+        let p = params.repetition_penalty;
+        let mut seen = std::collections::HashSet::with_capacity(history.tokens.len());
+        for &tok in history.tokens {
+            if !seen.insert(tok) {
+                continue;
+            }
+            if let Some(l) = logits.get_mut(tok as usize)
+                && l.is_finite()
+            {
+                *l = if *l > 0.0 { *l / p } else { *l * p };
+            }
+        }
+    }
+    if params.frequency_penalty == 0.0 && params.presence_penalty == 0.0 {
+        return;
+    }
+    let mut counts: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+    for &tok in &history.tokens[prompt_len..] {
+        *counts.entry(tok).or_default() += 1;
+    }
+    for (tok, count) in counts {
+        if let Some(l) = logits.get_mut(tok as usize)
+            && l.is_finite()
+        {
+            *l -= params.frequency_penalty * count as f32 + params.presence_penalty;
+        }
+    }
+}
+
 /// [`sample_token`] plus the behavior log-probability of the drawn token under
 /// the same filtered, renormalized distribution — the IS ratio denominator for
 /// on-policy RL. `None` for greedy (a delta policy) and for the
@@ -82,14 +140,29 @@ pub fn sample_token_logprob(
     params: &SamplingParams,
     position: u64,
 ) -> (u32, Option<f32>) {
-    if let Some(mask) = params.grammar_bitmask.as_deref() {
-        let masked = apply_grammar_bitmask(logits, mask);
-        let mut p = params.clone();
-        p.grammar_bitmask = None;
-        return sample_token_logprob(&masked, &p, position);
-    }
-    // Apply logit_bias before any temperature/filtering.
-    let biased = if params.logit_bias.is_empty() {
+    sample_token_logprob_penalized(logits, params, position, PenaltyHistory::default())
+}
+
+/// [`sample_token_logprob`] with the penalties applied against `history`.
+///
+/// Pipeline order matches vLLM: grammar mask, then `logit_bias`, then
+/// repetition / frequency / presence, then temperature and the filters. The
+/// penalties precede the greedy early return because they move the argmax.
+#[must_use]
+pub fn sample_token_logprob_penalized(
+    logits: &[f32],
+    params: &SamplingParams,
+    position: u64,
+    history: PenaltyHistory<'_>,
+) -> (u32, Option<f32>) {
+    let masked = params
+        .grammar_bitmask
+        .as_deref()
+        .map(|mask| apply_grammar_bitmask(logits, mask));
+    let logits = masked.as_deref().unwrap_or(logits);
+
+    let penalized = params.has_penalty() && !history.tokens.is_empty();
+    let rewritten = if params.logit_bias.is_empty() && !penalized {
         None
     } else {
         let mut v = logits.to_vec();
@@ -98,9 +171,12 @@ pub fn sample_token_logprob(
                 v[tok as usize] += bias;
             }
         }
+        if penalized {
+            apply_penalties(&mut v, params, history);
+        }
         Some(v)
     };
-    let logits = biased.as_deref().unwrap_or(logits);
+    let logits = rewritten.as_deref().unwrap_or(logits);
     if params.is_greedy() || logits.is_empty() {
         return (argmax_logit(logits), None);
     }
