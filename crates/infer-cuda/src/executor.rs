@@ -502,11 +502,7 @@ impl RealCudaExecutor {
     /// the content-keyed prefix-state pool instead (#154 Phase 2b): preempt =
     /// free pages + requeue, resume = prefix-attach restore + tail re-prefill.
     pub(crate) fn kv_slot_tier_enabled(&self) -> bool {
-        match self {
-            Self::Qwen35(q) => q.kv_slot_tier_enabled(),
-            Self::Dsv4(d) => d.kv_slot_tier_enabled(),
-            Self::Qwen(_) => false,
-        }
+        matches!(self, Self::Qwen35(_) | Self::Dsv4(_))
     }
 
     pub(crate) fn demote_slot(&mut self, slot: usize, key: u64) -> Result<bool> {

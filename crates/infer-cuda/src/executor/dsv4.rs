@@ -1069,10 +1069,6 @@ impl Dsv4CudaExecutor {
         self.slot_tier = KvTierStore::with_budget(bytes, BLOB_CHUNK_BYTES);
     }
 
-    pub(crate) fn kv_slot_tier_enabled(&self) -> bool {
-        true
-    }
-
     pub(crate) fn kv_tier_host_demoted_pages(&self) -> usize {
         self.prefix_state.host_pages() + self.slot_tier.host_demoted_pages()
     }

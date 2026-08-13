@@ -123,6 +123,8 @@ impl EngineOffloadMode {
     }
 }
 
+/// Public entry point for `runtime_flags::engine_offload` — that module is
+/// private, so the CLI and `opd::step` read the mode through here.
 #[cfg(feature = "cuda")]
 pub fn engine_offload_mode() -> EngineOffloadMode {
     crate::runtime_flags::engine_offload()
