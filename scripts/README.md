@@ -10,13 +10,11 @@ directory unless noted.
 | `bench_throughput.py` | Canonical OpenAI-compatible streaming throughput runner. |
 | `bench_ab.sh` | Matched A/B benchmark driver wrapping `bench_throughput.py`. |
 | `bench_compare.py` | Compare two benchmark JSON snapshots with Δ% and threshold. |
-| `bench_direct_http.py` | Direct HTTP streaming decode benchmark (no OpenAI client). |
 | `bench_dsv4_trace_http.py` | DSv4 trace-driven HTTP benchmark. |
 | `bench_local_metal.py` | Local Metal backend benchmark. |
 | `bench_local_metal_all.sh` | Run full Metal benchmark grid. |
 | `bench_local_metal_supplement.sh` | Supplemental Metal benchmark shapes. |
 | `bench_mlx_http_decode.py` | MLX HTTP decode benchmark. |
-| `bench_multi_request.py` | Multi-request concurrent decode benchmark. |
 | `bench_multitenant_burst.py` | Multi-tenant burst throughput benchmark. |
 | `bench_agent.py` | Local agent end-to-end benchmark. |
 | `bench_agent_trace.py` | Agent trace-driven benchmark. |
@@ -40,7 +38,6 @@ directory unless noted.
 
 | Script | Purpose |
 |---|---|
-| `quantize_weights.py` | General weight quantization utility. |
 | `quantize_qwen3_w4a8.py` | Quantize Qwen to W4A8 (pack_w4a8 + Marlin). |
 | `turboquant_weights.py` | TurboQuant 4-bit quantization. |
 | `qwen35_tq4_dense_parity.py` | Verify Qwen3.5 TQ4 dense parity. |
@@ -80,7 +77,6 @@ directory unless noted.
 | `arle_capability_eval.py` | ARLE capability evaluation (MMLU, GSM8K, etc.). |
 | `arle_capability_compare.py` | Compare capability eval results across backends. |
 | `arle_swe_pro_eval.py` | SWE-Pro evaluation harness. |
-| `llmbench.py` | Generic LLM benchmark runner. |
 | `score_rubric_eval.py` | Rubric-based evaluation scoring. |
 | `analyze_multi_seed.py` | Multi-seed eval analysis with mean±σ and Wilson CI. |
 | `hf_greedy_ref.py` | HuggingFace greedy-decode reference runner. |
