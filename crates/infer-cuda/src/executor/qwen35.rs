@@ -91,20 +91,6 @@ fn merge_tier_io_stats(
 /// num_slots keys; B=1/R=8/seq=1 are shape constants and kv enters via the
 /// staged device scalar, so there is exactly ONE graph per slot), replays ≈
 /// decoded tokens.
-/// Sub-phase micros inside the paged decode-graph lane, under `ARLE_STEP_PHASE`.
-/// `Engine::step` measures `submit` as one block because the CUDA submit is
-/// synchronous; this splits it into the host prologue, the GPU replay, and the
-/// sampling tail.
-static DECODE_PHASE_MICROS: [std::sync::atomic::AtomicU64; 5] = [
-    std::sync::atomic::AtomicU64::new(0),
-    std::sync::atomic::AtomicU64::new(0),
-    std::sync::atomic::AtomicU64::new(0),
-    std::sync::atomic::AtomicU64::new(0),
-    std::sync::atomic::AtomicU64::new(0),
-];
-static DECODE_PHASE_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-const DECODE_PHASE_NAMES: [&str; 5] = ["mirror", "meta", "stage", "gpu", "sample"];
-
 static QWEN35_GRAPH_CAPTURES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static QWEN35_GRAPH_REPLAYS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -421,13 +407,6 @@ impl Qwen35CudaExecutor {
             }
         };
         let key = crate::qwen35::hash_prefix_tokens(&tokens[..mat_len]);
-        if std::env::var_os("ARLE_KVDRIFT_DEBUG").is_some() {
-            eprintln!(
-                "[kvdrift] SAVE-SIDECAR slot={slot} mat_len={mat_len} key={key:#018x} \
-                 tokens_len={} boundary={boundary} matched_len_in={matched_len}",
-                tokens.len(),
-            );
-        }
         // PERIODIC sidecars at each stride boundary `0 < pos ≤ mat_len` snapshotted
         // during this prefill — for a FUTURE cross-conversation restore that shares
         // only a leading prefix. Each blob is the recurrent state captured at
@@ -526,21 +505,6 @@ impl Qwen35CudaExecutor {
         prefix_pages: &[u32],
     ) -> anyhow::Result<usize> {
         let matched_len = matched_len.min(tokens.len());
-        if std::env::var_os("ARLE_KVDRIFT_DEBUG").is_some() {
-            let pool_len = self
-                .full_attn_kv
-                .as_ref()
-                .map_or(usize::MAX, |p| p.seq_len(slot));
-            eprintln!(
-                "[kvdrift] RESTORE-SIDECAR slot={} matched_len={} prompt_tokens={} prefix_pages={} slot.seq_len(before)={} pool.seq_len(before)={}",
-                slot,
-                matched_len,
-                tokens.len(),
-                prefix_pages.len(),
-                self.slots[slot].seq_len(),
-                pool_len,
-            );
-        }
         let (num_linear, gdr_len, conv_len) = self.model.recurrent_dims();
         // Reused slot: start_pos != 0 skips the normal release+acquire in submit_prefill_row.
         self.slots[slot].release_recurrent(&mut self.recurrent_pool);
@@ -830,7 +794,7 @@ impl Qwen35CudaExecutor {
             mtp_draft_tokens,
         )?;
         cuda_startup_log(
-            "qwen35_model_load",
+            "executor.qwen35_model_load",
             model_t0,
             format_args!(
                 "requested_slots={num_slots} total_pages={total_pages} max_seq_len={max_seq_len}"
@@ -886,7 +850,7 @@ impl Qwen35CudaExecutor {
             .map_or(0, |h| h.slot_state_bytes(model.config.vocab_size));
         let num_slots = model.kv_budget_num_slots(num_slots, dspark_slot_bytes)?;
         cuda_startup_log(
-            "qwen35_kv_budget",
+            "executor.qwen35_kv_budget",
             budget_t0,
             format_args!("effective_slots={num_slots}"),
         );
@@ -897,7 +861,7 @@ impl Qwen35CudaExecutor {
         // request finish. The pool starts empty and grows on demand.
         let slots: Vec<_> = (0..num_slots).map(|_| model.new_slot_state()).collect();
         cuda_startup_log(
-            "qwen35_slot_alloc",
+            "executor.qwen35_slot_alloc",
             slots_t0,
             format_args!("slots={num_slots} max_seq_len={max_seq_len}"),
         );
@@ -919,7 +883,11 @@ impl Qwen35CudaExecutor {
             dspark_slot_bytes,
         )?;
         let kv_pool_sized_pages = full_attn_kv.max_total_pages;
-        cuda_startup_log("qwen35_paged_pool_alloc", pool_t0, format_args!("built"));
+        cuda_startup_log(
+            "executor.qwen35_paged_pool_alloc",
+            pool_t0,
+            format_args!("built"),
+        );
 
         // Pre-allocate the recurrent (GDR + conv) pool for ALL slots upfront.
         // Without this, each slot's ~144 MiB GDR state is allocated on its first
@@ -994,7 +962,7 @@ impl Qwen35CudaExecutor {
             }),
         };
         cuda_startup_log(
-            "qwen35_executor_total",
+            "executor.qwen35_executor_total",
             total_t0,
             format_args!("slots={num_slots} max_seq_len={max_seq_len}"),
         );
@@ -1214,7 +1182,7 @@ impl Qwen35CudaExecutor {
         let dense_t0 = Instant::now();
         let (warmed_shapes, warm_m) = self.model.warm_fp8_deepgemm_dense_prefill()?;
         cuda_startup_log(
-            "qwen35_warm_dense_deepgemm",
+            "executor.qwen35_warm_dense_deepgemm",
             dense_t0,
             format_args!("shapes={warmed_shapes} warm_m={warm_m}"),
         );
@@ -1227,7 +1195,7 @@ impl Qwen35CudaExecutor {
         let (grouped_shapes, grouped_tokens, grouped_min_rows, grouped_max_rows) =
             self.model.warm_fp8_deepgemm_grouped_prefill()?;
         cuda_startup_log(
-            "qwen35_warm_grouped_deepgemm",
+            "executor.qwen35_warm_grouped_deepgemm",
             grouped_t0,
             format_args!(
                 "shapes={grouped_shapes} tokens={grouped_tokens} rows={grouped_min_rows}..{grouped_max_rows}"
@@ -1244,7 +1212,7 @@ impl Qwen35CudaExecutor {
                  (set --qwen35-decode-graph to enable)"
             );
             cuda_startup_log(
-                "qwen35_warmup_total",
+                "executor.qwen35_warmup_total",
                 warmup_t0,
                 format_args!("graph=disabled"),
             );
@@ -1257,7 +1225,7 @@ impl Qwen35CudaExecutor {
                  using eager forward"
             );
             cuda_startup_log(
-                "qwen35_warmup_total",
+                "executor.qwen35_warmup_total",
                 warmup_t0,
                 format_args!("graph=tp_disabled"),
             );
@@ -1266,7 +1234,7 @@ impl Qwen35CudaExecutor {
         if let Some(reason) = self.model.decode_graph_unsupported_reason() {
             info!("Qwen3.5 whole-step decode graph disabled: {reason}; using eager forward");
             cuda_startup_log(
-                "qwen35_warmup_total",
+                "executor.qwen35_warmup_total",
                 warmup_t0,
                 format_args!("graph=unsupported"),
             );
@@ -1279,7 +1247,7 @@ impl Qwen35CudaExecutor {
             self.num_slots
         );
         cuda_startup_log(
-            "qwen35_warmup_total",
+            "executor.qwen35_warmup_total",
             warmup_t0,
             format_args!("graph=armed"),
         );
@@ -1436,21 +1404,6 @@ impl Qwen35CudaExecutor {
         host_kv: &dyn KvPool,
     ) -> Result<(u32, Option<f32>)> {
         let slot = row.slot;
-        if std::env::var_os("ARLE_KVDRIFT_DEBUG").is_some() {
-            let pool_len = self
-                .full_attn_kv
-                .as_ref()
-                .map_or(usize::MAX, |p| p.seq_len(slot));
-            eprintln!(
-                "[kvdrift] PREFILL slot={} start_pos={} tokens={} total={} slot.seq_len={} pool.seq_len={}",
-                slot,
-                row.start_pos,
-                row.tokens.len(),
-                row.total_tokens,
-                self.slots[slot].seq_len(),
-                pool_len,
-            );
-        }
         {
             // Both pools must sit at `start_pos` before the append; a mismatch
             // means an upstream restore left their cursors apart.
@@ -2159,7 +2112,6 @@ impl Qwen35CudaExecutor {
             false => Vec::new(),
         };
 
-        let rank_probe = std::env::var("ARLE_DSPARK_RANK").is_ok();
         let tap_ms = crate::qwen35::mtp_phase_lap(&model.ctx, &mut pt);
         let (mut accept_ms, mut cap_ms, mut trunc_ms, mut ext_ms) = (0.0, 0.0, 0.0, 0.0);
 
@@ -2201,16 +2153,6 @@ impl Qwen35CudaExecutor {
             // Draft logits live in the SLOT: a tick drafts every row before
             // verifying any, so a shared buffer would pair the wrong slot.
             let df = ds.slots[c.slot].as_mut().expect("seeded slot");
-            if let Some(draft_logits) = df.logits.as_ref() {
-                // Where the trunk's token sat in the draft's own ranking at the
-                // position that broke the chain — the width a candidate tree
-                // would need to survive it.
-                if rank_probe && k + 1 < c.chain.len() && !argmax.is_empty() {
-                    let row = k + usize::from(!ds.head.cfg.next_token_heads);
-                    let rank = model.draft_token_rank(draft_logits, row, argmax[c.row0 + k])?;
-                    eprintln!("[dspark-rank] k={k} rank={rank}");
-                }
-            }
             cap_ms += crate::qwen35::mtp_phase_lap(&model.ctx, &mut pt);
             if k + 1 < c.chain.len() {
                 let len = c.start + k + 1;
@@ -2734,24 +2676,9 @@ impl Qwen35CudaExecutor {
                 slot
             );
         }
-        static DPHASE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let mut dmark = DPHASE
-            .get_or_init(|| std::env::var_os("ARLE_STEP_PHASE").is_some())
-            .then(std::time::Instant::now);
-        let mut dbuf = [0u64; 5];
-        macro_rules! dphase {
-            ($i:expr) => {
-                if let Some(t) = dmark.as_mut() {
-                    let now = std::time::Instant::now();
-                    dbuf[$i] += now.duration_since(*t).as_micros() as u64;
-                    *t = now;
-                }
-            };
-        }
         // Host-side pool advance (page alloc + mirror) — identical to the eager
         // paged path, idempotent if the eager fallback re-runs it.
         self.mirror_host_slot(host_kv, slot, row.kv_seq_len + 1)?;
-        dphase!(0);
         if self.decode_graph.is_none() {
             self.decode_graph = Some(Qwen35DecodeGraph::new(
                 self.num_slots,
@@ -2774,7 +2701,6 @@ impl Qwen35CudaExecutor {
             };
             meta.refresh_decode(&self.model.ctx, pool, slot, row.kv_seq_len)?;
         }
-        dphase!(1);
         let Self {
             model,
             slots,
@@ -2787,7 +2713,6 @@ impl Qwen35CudaExecutor {
             .as_mut()
             .expect("decode_graph built above when armed");
         Self::stage_graph_step(model, dg, slot, row.last_token, row.kv_seq_len, "paged ")?;
-        dphase!(2);
         let Qwen35DecodeGraph { ws, graphs, .. } = dg;
         let state = &mut graphs[slot];
         let was_captured = state.is_captured();
@@ -2805,13 +2730,6 @@ impl Qwen35CudaExecutor {
         let run = state.run_or_capture(|| {
             model.forward_decode_step_paged_captured(slot_state, ws, row.kv_seq_len, &mut rc)
         });
-        // The replay is async, so without this the GPU wall lands in the
-        // sampling phase (which syncs on the argmax D2H) and the two cannot be
-        // told apart. Diagnostic-only: costs a full sync per step.
-        if dmark.is_some() {
-            model.ctx.sync()?;
-        }
-        dphase!(3);
         if let Err(e) = run {
             warn!(
                 "Qwen3.5 paged whole-step decode graph failed (slot {slot}), \
@@ -2823,24 +2741,6 @@ impl Qwen35CudaExecutor {
             return Ok(None);
         }
         let out = self.finish_graph_step(slot, was_captured, will_replay, "paged ", row, position);
-        dphase!(4);
-        if dmark.is_some() {
-            for (acc, v) in DECODE_PHASE_MICROS.iter().zip(dbuf) {
-                acc.fetch_add(v, std::sync::atomic::Ordering::Relaxed);
-            }
-            let n = DECODE_PHASE_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-            if n.is_multiple_of(500) {
-                let parts: Vec<String> = DECODE_PHASE_NAMES
-                    .iter()
-                    .zip(DECODE_PHASE_MICROS.iter())
-                    .map(|(name, acc)| {
-                        let us = acc.load(std::sync::atomic::Ordering::Relaxed);
-                        format!("{name}={:.3}ms", us as f64 / 1000.0 / n as f64)
-                    })
-                    .collect();
-                info!("[decode-phase] steps={n} {}", parts.join(" "));
-            }
-        }
         out.map(Some)
     }
 
@@ -3253,22 +3153,6 @@ impl Qwen35CudaExecutor {
             row.slot,
             self.num_slots
         );
-        if std::env::var_os("ARLE_KVDRIFT_DEBUG").is_some()
-            && self.slots[row.slot].seq_len() != row.kv_seq_len
-        {
-            let pool_len = self
-                .full_attn_kv
-                .as_ref()
-                .map_or(usize::MAX, |p| p.seq_len(row.slot));
-            eprintln!(
-                "[kvdrift] DECODE-ASSERT slot={} slot.seq_len={} row.kv_seq_len={} pool.seq_len={} (Δslot-row={})",
-                row.slot,
-                self.slots[row.slot].seq_len(),
-                row.kv_seq_len,
-                pool_len,
-                self.slots[row.slot].seq_len() as i64 - row.kv_seq_len as i64,
-            );
-        }
         ensure!(
             self.slots[row.slot].seq_len() == row.kv_seq_len,
             "Qwen3.5 materialized state len {} != DecodeRow.kv_seq_len {} for slot {}",

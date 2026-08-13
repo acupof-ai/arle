@@ -347,41 +347,6 @@ impl Qwen35Model {
                 }
             }
         }
-        if std::env::var("ARLE_SHARE_BASE_DIAG").is_ok() {
-            let mut attn = 0usize;
-            let mut lin = 0usize;
-            let mut mlp = 0usize;
-            let mut shared = 0usize;
-            let mut experts = 0usize;
-            for e in &out {
-                if e.proj_suffix.starts_with("self_attn") {
-                    attn += 1;
-                } else if e.proj_suffix.starts_with("linear_attn") {
-                    lin += 1;
-                } else if e.proj_suffix.starts_with("mlp.shared_expert") {
-                    shared += 1;
-                } else if e.proj_suffix.starts_with("mlp.experts") {
-                    experts += 1;
-                } else if e.proj_suffix.starts_with("mlp.") {
-                    mlp += 1;
-                }
-            }
-            eprintln!(
-                "[share-base-diag] emitted {} entries: full_attn={attn} linear_attn={lin} dense_mlp={mlp} shared_expert={shared} routed_experts={experts}; sample suffixes: {:?}",
-                out.len(),
-                out.iter()
-                    .take(10)
-                    .map(|e| (
-                        e.layer_idx,
-                        e.proj_suffix.as_str(),
-                        e.rows,
-                        e.cols,
-                        e.block_m,
-                        e.block_k
-                    ))
-                    .collect::<Vec<_>>()
-            );
-        }
         Ok(out)
     }
 
