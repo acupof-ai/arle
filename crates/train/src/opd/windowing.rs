@@ -131,7 +131,6 @@ pub(super) fn masked_gkd_windows(
             end += 1;
             j += 1;
         }
-        // Sub-window the contiguous run so no logit tile exceeds window_size rows.
         let mut s = start;
         while s < end {
             let e = (s + window_size).min(end);

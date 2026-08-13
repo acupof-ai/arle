@@ -200,8 +200,6 @@ impl ValueCritic {
         Ok(skip_obs_gae(&values, terminal_reward, self.gamma, self.lam))
     }
 
-    /// Frozen-attention: the masked hidden rows are a detached constant,
-    /// so backward accumulates grad on `weight` only.
     pub fn update(
         &mut self,
         student: &Qwen35Model,
