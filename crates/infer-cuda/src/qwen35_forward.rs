@@ -546,15 +546,7 @@ impl Qwen35Model {
         recall: &mut Qwen35RecallForward,
     ) -> Result<(u32, Option<f32>)> {
         self.forward_tokens_recall_tapped(
-            slot,
-            ws,
-            tokens,
-            start_pos,
-            params,
-            position,
-            penalty,
-            recall,
-            None,
+            slot, ws, tokens, start_pos, params, position, penalty, recall, None,
         )
     }
 
