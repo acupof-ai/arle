@@ -470,15 +470,10 @@ impl CudaBackend {
         // The allocation is stream-ordered on self.stream; the copy runs on
         // src_stream. Record an event after the alloc and make src_stream wait
         // for it, else the copy can race the allocation.
-        let alloc_event =
-            self.stream.context().new_event(None).map_err(|_| {
-                AutogradError::TapeInvariant("bf16 bridge alloc event create failed")
-            })?;
-        // SAFETY: event and self.stream are valid in this (primary) context.
-        check_cuda_ffi(
-            unsafe { cuEventRecord(alloc_event.cu_event(), self.stream.cu_stream()) },
-            "bf16 bridge alloc event record",
-        )?;
+        let alloc_event = self
+            .stream
+            .record_event(None)
+            .map_err(|_| AutogradError::TapeInvariant("bf16 bridge alloc event create failed"))?;
         // SAFETY: event and src_stream are valid in this (primary) context.
         check_cuda_ffi(
             unsafe { cuStreamWaitEvent(src_stream as CUstream, alloc_event.cu_event(), 0) },
