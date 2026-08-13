@@ -455,7 +455,6 @@ fn run_opd(args: TrainOpdArgs) -> ExitCode {
 fn run_w2s(args: TrainW2sArgs) -> Result<()> {
     use crate::args::W2sAuxBackendArg;
     use autograd::{Tape, TensorId, optim::AdamW};
-    use std::collections::HashSet;
     use train::{
         lora::LoraConfig,
         qwen35::Qwen35Model,
@@ -476,8 +475,6 @@ fn run_w2s(args: TrainW2sArgs) -> Result<()> {
 
     eprintln!("[arle train w2s] backend={backend_label}");
 
-    // Per-phase VRAM ledger — the 27B base + aux post-RL pair sits within a few
-    // GB of the 97 GB H20, so every load/offload boundary needs a measured number.
     fn vram(store: &TensorStore, phase: &str) {
         if let Some((free, total)) = store.backend().device_mem_info() {
             let gb = |b: usize| b as f64 / (1u64 << 30) as f64;
@@ -515,30 +512,6 @@ fn run_w2s(args: TrainW2sArgs) -> Result<()> {
 
     // Initialize serving = shadow (both start from the same LoRA init).
     sync_lora_adapters(&student, &serving, &mut store)?;
-
-    // Offload the base (non-LoRA) weights to CPU. The loader uploads bf16
-    // frozen-base weights directly to GPU, but the 27B base (54 GB) plus the
-    // aux post-RL (55 GB) exceed the 97 GB H20. The base weights are reloaded
-    // to GPU after the aux engines are loaded/offloaded, and the w2s step
-    // offloads them again during the aux forward pass.
-    {
-        let rope_ids: HashSet<TensorId> = base.rope_cache_ids().into_iter().collect();
-        let base_ids: HashSet<TensorId> = base
-            .all_parameter_ids()
-            .into_iter()
-            .filter(|id| !rope_ids.contains(id))
-            .collect();
-        let adapter_ids: HashSet<TensorId> = student.adapter_name_map().values().copied().collect();
-        let base_only: Vec<TensorId> = base_ids.difference(&adapter_ids).copied().collect();
-        eprintln!(
-            "[arle train w2s] offloading {} base weights to CPU",
-            base_only.len()
-        );
-        for id in &base_only {
-            store.offload_to_host(*id)?;
-        }
-    }
-    vram(&store, "base offload");
 
     // Load auxiliary models.
     let aux1 = match args.aux_backend {
@@ -701,22 +674,7 @@ fn run_w2s(args: TrainW2sArgs) -> Result<()> {
     };
     let (aux2, share_aux) = aux2;
 
-    // Offload aux post-RL weights to CPU. The 27B base (54 GB) and aux post-RL
-    // (54 GB) cannot both reside on a 97 GB H20; the w2s step uploads the aux
-    // weights just-in-time for the ΔT forward and offloads them again before
-    // reloading the student's base weights.
-    {
-        eprintln!("[arle train w2s] offloading aux post-RL weights to CPU");
-        for id in aux1.post_rl_param_ids() {
-            store.offload_to_host(id)?;
-        }
-        if !share_aux {
-            for id in aux2.post_rl_param_ids() {
-                store.offload_to_host(id)?;
-            }
-        }
-    }
-    vram(&store, "aux load+offload");
+    vram(&store, "aux load");
 
     let trainable_params: Vec<TensorId> = student
         .all_parameter_ids()
@@ -727,41 +685,6 @@ fn run_w2s(args: TrainW2sArgs) -> Result<()> {
         "[arle train w2s] trainable params: {}",
         trainable_params.len()
     );
-
-    // Re-upload student/serving weights to GPU. The aux-engine load/offload
-    // cycle may have evicted them from the device (the autograd store spills
-    // to host under memory pressure), so the student forward would otherwise
-    // htod-copy them one-by-one and OOM. Base weights go up as bf16 (54 GB)
-    // rather than f32 (108 GB) to fit the 97 GB H20.
-    eprintln!("[arle train w2s] re-uploading student/serving weights to GPU");
-    {
-        // RoPE cos/sin caches stay f32 with their host mirror (read by
-        // `select_cache_rows`); exclude them from the bf16 base set.
-        let rope_ids: HashSet<TensorId> = base.rope_cache_ids().into_iter().collect();
-        let base_ids: HashSet<TensorId> = base
-            .all_parameter_ids()
-            .into_iter()
-            .filter(|id| !rope_ids.contains(id))
-            .collect();
-        let adapter_ids: HashSet<TensorId> = student.adapter_name_map().values().copied().collect();
-        for id in student.all_parameter_ids() {
-            if base_ids.contains(&id) && !adapter_ids.contains(&id) {
-                store.upload_frozen_bf16_from_host(id)?;
-            } else {
-                store.ensure_device(id)?;
-            }
-        }
-        for id in serving.all_parameter_ids() {
-            // Base weights were already uploaded (and their host mirror cleared)
-            // by the student loop above. Re-running `upload_frozen_bf16_from_host`
-            // on them would fail with "data length 0". Only the serving adapter's
-            // own LoRA params need to be brought on-device.
-            if !base_ids.contains(&id) {
-                store.ensure_device(id)?;
-            }
-        }
-    }
-    vram(&store, "student re-upload");
 
     let cfg = W2sConfig {
         alpha: args.alpha,
