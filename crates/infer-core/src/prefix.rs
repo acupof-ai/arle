@@ -99,6 +99,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         }
         let prefix_match = self.clamp_prefix_to_backend(prefix_match, tokens);
         if prefix_match.is_empty() {
+            self.record_prefix_restore_metrics(0);
             request.prefill_start_pos = 0;
             request.phase = RequestPhase::Prefilling { progress: 0 };
             return Ok(());
@@ -130,6 +131,9 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
                 .attach_pages(slot, &prefix_match.block_ids, prefix_match.matched_len)
         {
             log::warn!("prefix attach failed for slot {slot}: {err:#}; full recompute fallback");
+            self.kv_system_metrics.fallback_recompute =
+                self.kv_system_metrics.fallback_recompute.saturating_add(1);
+            self.record_prefix_restore_metrics(0);
             self.radix.release_blocks(&prefix_match.block_ids);
             self.kv.release_pages(&prefix_match.block_ids);
             request.phase = RequestPhase::Prefilling { progress: 0 };
@@ -152,6 +156,9 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
                     "recurrent sidecar restore failed for slot {slot}: {err:#}; \
                      full recompute fallback"
                 );
+                self.kv_system_metrics.fallback_recompute =
+                    self.kv_system_metrics.fallback_recompute.saturating_add(1);
+                self.record_prefix_restore_metrics(0);
                 // Undo retain_pages + attach_pages; executor already reset full_attn_kv.
                 self.free_slot_pages(slot);
                 self.radix.release_blocks(&prefix_match.block_ids);
@@ -184,6 +191,9 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
                     "prefix-restore grow alloc failed for slot {slot}: {err:#}; \
                      full recompute fallback"
                 );
+                self.kv_system_metrics.fallback_recompute =
+                    self.kv_system_metrics.fallback_recompute.saturating_add(1);
+                self.record_prefix_restore_metrics(0);
                 self.free_slot_pages(slot);
                 self.radix.release_blocks(&prefix_match.block_ids);
                 self.kv.release_pages(&prefix_match.block_ids);
@@ -198,15 +208,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             "prefix-attach: slot={slot} matched={} restored={restored_len} committed={target}",
             prefix_match.matched_len,
         );
-        self.prefix_cache_stats.hits = self.prefix_cache_stats.hits.saturating_add(1);
-        self.prefix_cache_stats.hit_tokens = self
-            .prefix_cache_stats
-            .hit_tokens
-            .saturating_add(prefix_match.matched_len as u64);
-        self.prefix_cache_stats.hit_pages = self
-            .prefix_cache_stats
-            .hit_pages
-            .saturating_add(prefix_match.block_ids.len() as u64);
+        self.record_prefix_restore_metrics(restored_len);
 
         request.prefill_start_pos = restored_len;
         request.reused_prefix_pages = prefix_match.block_ids;
@@ -622,6 +624,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             let matched = self.radix.longest_prefix_match(tokens);
             let raw = matched.block_ids.len();
             let clamped = self.clamp_prefix_to_backend(matched, tokens);
+            self.record_prefix_match_metrics(raw, clamped.block_ids.len());
             log::info!(
                 "prefix-lookup: prompt={} raw_blocks={raw} licensed_blocks={}",
                 tokens.len(),
@@ -639,6 +642,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             .executor
             .reusable_prefix_blocks_for_prompt(&blocks, tokens)
             .min(blocks.len());
+        self.record_prefix_match_metrics(blocks.len(), reusable);
         log::info!(
             "prefix-lookup(tier): prompt={} raw_blocks={} resident_run={resident} licensed_blocks={reusable}",
             tokens.len(),

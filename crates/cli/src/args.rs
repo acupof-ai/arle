@@ -713,6 +713,10 @@ pub(crate) struct ServeArgs {
     #[arg(long, default_value_t = false)]
     pub(crate) kv_oversubscription: bool,
 
+    /// Minimum decode tokens before an oversubscribed request may be parked again.
+    #[arg(long, value_parser = parse_positive_usize)]
+    pub(crate) kv_oversubscription_min_slice: Option<usize>,
+
     /// Dump every raw `/v1/messages` request body to
     /// `<dir>/<epoch_ms>_<seq>.json` (CC-trajectory capture for
     /// `arle train cc-convert`). Fire-and-forget; unset = zero cost.
