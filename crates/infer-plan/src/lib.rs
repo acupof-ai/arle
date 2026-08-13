@@ -175,8 +175,42 @@ impl Default for SamplingParams {
 }
 
 impl SamplingParams {
+    /// Sampling POLICY only. To decide whether a backend may emit a device
+    /// argmax over raw logits, ask [`Self::is_raw_argmax`].
     #[must_use]
     pub fn is_greedy(&self) -> bool {
         self.temperature <= 0.0
+    }
+
+    /// The token equals `argmax` over the model's raw logits, so a backend may
+    /// skip [`crate::sample_token`]. Greedy is necessary but not sufficient:
+    /// `grammar_bitmask` and `logit_bias` rewrite the logits first.
+    ///
+    /// The destructure is load-bearing — a new field breaks this at compile
+    /// time, forcing the author to say whether it rewrites logits. `logit_bias`
+    /// silently kept the fast path until 2026-08-13.
+    #[must_use]
+    pub fn is_raw_argmax(&self) -> bool {
+        let Self {
+            temperature,
+            // Inert at temperature 0.
+            top_k: _,
+            top_p: _,
+            min_p: _,
+            seed: _,
+            // Unimplemented on every path, so they cannot veto.
+            repetition_penalty: _,
+            frequency_penalty: _,
+            presence_penalty: _,
+            // Downstream of token choice.
+            ignore_eos: _,
+            stop_token_ids: _,
+            max_new_tokens: _,
+            n: _,
+            // Rewrite the logits — must reach the argmax.
+            grammar_bitmask,
+            logit_bias,
+        } = self;
+        *temperature <= 0.0 && grammar_bitmask.is_none() && logit_bias.is_empty()
     }
 }

@@ -2140,7 +2140,7 @@ impl Dsv4Model {
             start_positions,
             capture_taps,
         )?;
-        let fast_head = params.iter().all(SamplingParams::is_greedy);
+        let fast_head = params.iter().all(SamplingParams::is_raw_argmax);
         let out_tokens = crate::profile::profile_op(&self.ctx, "lm_head", None, n, || {
             if fast_head {
                 let logits = self.verify_logits_from_stream(&stream, n, &mut keepalive)?;
