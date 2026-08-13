@@ -1566,13 +1566,6 @@ pub(crate) fn dsv4_flashmla_decode_enabled() -> Result<bool> {
     Ok(cuda_kernels::HAS_FLASHMLA)
 }
 
-fn dsv4_q8kv8_prefill_enabled() -> Result<bool> {
-    // Experimental: fp8 q8kv8 sparse prefill (FlashMLA prefill's fp8 twin).
-    // Default OFF; A/B only. Runs on the post-gather global-head Q, so it works
-    // under TP (gate is global_heads%64, the kernel's GMMA head-tile).
-    Ok(std::env::var("ARLE_DSV4_Q8KV8_PREFILL").as_deref() == Ok("1"))
-}
-
 /// Native DeepGEMM availability gate for all DSv4 FP8 projection lanes
 /// (prefill wq_a|wkv fusion, decode/prefill residual projections wq_b/wo_a/wo_b,
 /// and the DSA indexer query projection). All four share the same compile-time
@@ -1581,52 +1574,6 @@ fn dsv4_q8kv8_prefill_enabled() -> Result<bool> {
 /// scalar FP8-GEMV fallback when native DeepGEMM is absent.
 fn dsv4_deepgemm_enabled() -> bool {
     cuda_kernels::has_deepgemm_native()
-}
-
-/// #150 opt-in correctness lever (default OFF): `ARLE_DSV4_PROJ_BATCHED_BF16=1`
-/// forces the bf16 cublasLt path in [`proj_batched`] even at m>1, skipping the
-/// FP8-repack DeepGEMM lane. Measured partial mitigation for the concurrent-
-/// decode digit corruption: n=2 needle miss 57.1%→30.0% (= the n=1 floor),
-/// truncation-class corruption from this lane eliminated. Residual digit-
-/// substitution originates upstream (`mla_attention_prepare_proj_batch`,
-/// F8_E4M3-only weights — no bf16 fallback exists) and is NOT covered. Trades
-/// tensor-core throughput at n≥2 — no default flip without a perf license.
-fn dsv4_proj_batched_bf16_forced() -> Result<bool> {
-    env_flag("ARLE_DSV4_PROJ_BATCHED_BF16")
-}
-
-/// #150 opt-in correctness lever (default OFF): `ARLE_DSV4_MLA_PROJ_BF16=1`
-/// dequantizes the F8-only MLA `wq_a`/`wq_b`/`wkv` to dense bf16 at LOAD
-/// (host-side block dequant, `loader.rs`) and routes BOTH decode lanes — the
-/// n=1 fused-wqkv path and the n≥2 batched `mla_attention_prepare_proj_batch`
-/// — through bf16 cublasLt, so every decode batch size shares one arithmetic
-/// (the #150 near-tie digit-flip mechanism is batch-size-DEPENDENT numerics).
-/// Prefill keeps FP8 DeepGEMM (licensed −47%). Checked at load only; runtime
-/// gates on `Dsv4Attention::mla_proj_bf16` presence.
-pub(crate) fn dsv4_mla_proj_bf16_enabled() -> Result<bool> {
-    env_flag("ARLE_DSV4_MLA_PROJ_BF16")
-}
-
-/// Batched-decode CSA select-metadata DEVICE build (default OFF). When ON, the
-/// per-step block_table/context_lens/positions host builds + 3 `memcpy_htod` are
-/// replaced by ONE on-device kernel (removes the per-step H2D a CUDA graph can't
-/// bake). Default-off so the baseline stays byte-for-byte unchanged; flip on the
-/// pod to A/B via `ARLE_DSV4_DSA_DEVICE_META=1`.
-pub(crate) fn dsv4_dsa_device_meta_enabled() -> Result<bool> {
-    env_flag("ARLE_DSV4_DSA_DEVICE_META")
-}
-
-/// Single-row decode-graph CSA READ via the graph-safe n=1 batched device-meta
-/// select (opt-in, default OFF). When ON, the CSA decode-graph path runs the
-/// READ (logits + topk) through `csa_select_official_batched` at n=1 with
-/// PERSISTENT slot_id/key_count device buffers — no per-step `upload_i32` H2D,
-/// so the READ is graph-capturable. The cache WRITE (block (a), still host-shape
-/// driven) is NOT yet graph-capturable, so the surrounding `ARLE_DSV4_DECODE_GRAPH`
-/// bail stays until a device-driven index-key packer lands; this gate lets the
-/// READ path be exercised eagerly (warm runs) and A/B'd on the pod meanwhile.
-/// Implies device-meta (the READ needs the on-device build).
-pub(crate) fn dsv4_decode_graph_csa_read_enabled() -> Result<bool> {
-    env_flag("ARLE_DSV4_DECODE_GRAPH_CSA")
 }
 
 /// Pages one layer's FlashMLA shared-pool band needs at `max_seq_len` —
@@ -1724,9 +1671,6 @@ pub(crate) fn dsv4_flashmla_layer_pool_pages(
 /// decode-kernel flag was off, so admission then rejected almost every
 /// request against the real per-request page need).
 pub(crate) fn dsv4_fused_wqkv_decode_alloc_enabled() -> Result<bool> {
-    if env_flag("ARLE_DSV4_FUSED_WQKV_DECODE_ALLOC")? {
-        return Ok(true);
-    }
     dsv4_fused_wqkv_decode_enabled()
 }
 
@@ -1747,17 +1691,6 @@ fn dsv4_fused_wqkv_decode_enabled() -> Result<bool> {
     Ok(cuda_kernels::has_deepgemm_native())
 }
 
-fn env_flag(name: &str) -> Result<bool> {
-    match std::env::var(name) {
-        Ok(value) => match value.as_str() {
-            "1" | "true" | "TRUE" | "yes" | "on" | "ON" => Ok(true),
-            "0" | "false" | "FALSE" | "no" | "off" | "OFF" | "" => Ok(false),
-            other => bail!("unsupported {name} `{other}` (expected 0/1, true/false, on/off)"),
-        },
-        Err(std::env::VarError::NotPresent) => Ok(false),
-        Err(e) => bail!("{name} invalid env: {e}"),
-    }
-}
 
 pub(crate) fn flashmla_pack_sw_ring(
     ctx: &DeviceContext,
@@ -2548,100 +2481,36 @@ fn flashmla_prefill_attention(
 
     {
         crate::profile::profile_op(ctx, "flashmla_prefill_fwd", None, token_count, || {
-            // q8kv8 fp8 sparse prefill is FlashMLA prefill's fp8 twin: it occupies
-            // the SAME execution point (post-gather global-head Q, global out) so it
-            // runs on the production TP path. Gate on global_heads%64 (the kernel's
-            // GMMA head-tile), not local_heads — a TP=4 shard has local_heads=16 but
-            // the gathered Q here is all `global_heads`.
-            if dsv4_q8kv8_prefill_enabled()? && global_heads % 64 == 0 {
-                crate::profile::profile_op(ctx, "q8kv8_prefill", None, token_count, || {
-                    let head_dim = config.head_dim;
-                    let q_elems = token_count * global_width;
-                    let kv_elems = kv_rows * head_dim;
-                    let mut q_fp8 = ctx.stream.alloc_zeros::<u8>(q_elems)?;
-                    let mut kv_fp8 = ctx.stream.alloc_zeros::<u8>(kv_elems)?;
-                    let mut scale = ctx.stream.alloc_zeros::<f32>(2)?;
-                    ctx.stream.memcpy_htod(&[1.0f32, 1.0f32], &mut scale)?;
-                    // Cast the gathered global-head Q and the shared latent KV to fp8.
-                    let cast_fp8 =
-                        |src: *const ffi::Half, dst: &mut CudaSlice<u8>, n: usize| -> Result<()> {
-                            let (dst_ptr, _dg) = dst.device_ptr_mut(&ctx.stream);
-                            // SAFETY: src spans n elements; dst holds n bytes, fully written.
-                            unsafe {
-                                ffi::arle_bf16_to_fp8_e4m3_cuda(
-                                    src,
-                                    dst_ptr as *mut u8,
-                                    n as i64,
-                                    ctx.stream.cu_stream(),
-                                )
-                                .result()?;
-                            }
-                            Ok(())
-                        };
-                    cast_fp8(q_for_flashmla as *const ffi::Half, &mut q_fp8, q_elems)?;
-                    cast_fp8(kv_ptr as *const ffi::Half, &mut kv_fp8, kv_elems)?;
-                    let (q_fp8_ptr, _qfg) = q_fp8.device_ptr(&ctx.stream);
-                    let (kv_fp8_ptr, _kfg) = kv_fp8.device_ptr(&ctx.stream);
-                    let (scale_ptr, _sg) = scale.device_ptr(&ctx.stream);
-                    // indices/topk reuse FlashMLA's; topk_length=null → fixed-topk path.
-                    // SAFETY: fp8 buffers filled above; out is global-width, sliced below.
-                    unsafe {
-                        ffi::arle_q8kv8_sparse_prefill_fwd(
-                            q_fp8_ptr as *const u8,
-                            kv_fp8_ptr as *const u8,
-                            indices_ptr as *const i32,
-                            scale_ptr as *const f32,
-                            scale_ptr as *const f32,
-                            sink_ptr,
-                            std::ptr::null(),
-                            flash_out_ptr as *mut ffi::Half,
-                            max_ptr as *mut f32,
-                            lse_ptr as *mut f32,
-                            token_count as i32,
-                            kv_rows as i32,
-                            global_heads as i32,
-                            head_dim as i32,
-                            topk_unified as i32,
-                            sm_scale,
-                            ctx.stream.cu_stream(),
-                        )
-                        .result()
-                        .map_err(|e| anyhow!("DSv4 q8kv8 prefill failed: {e}"))?;
-                    }
-                    Ok(())
-                })?;
-            } else {
-                // SAFETY: ptrs from live device allocations sized to the dims passed.
-                unsafe {
-                    ffi::arle_flashmla_sm90_sparse_prefill_fwd(
-                        q_for_flashmla,
-                        kv_ptr as *const ffi::Half,
-                        indices_ptr as *const i32,
-                        sink_ptr,
-                        topk_ptr as *const i32,
-                        flash_out_ptr,
-                        max_ptr as *mut f32,
-                        lse_ptr as *mut f32,
-                        token_count as i32,
-                        kv_rows as i32,
-                        global_heads as i32,
-                        1,
-                        config.head_dim as i32,
-                        config.head_dim as i32,
-                        topk_unified as i32,
-                        sm_scale,
-                        global_width as i32,
-                        config.head_dim as i32,
-                        config.head_dim as i32,
-                        0,
-                        topk_unified as i32,
-                        0,
-                        0,
-                        ctx.stream.cu_stream(),
-                    )
-                    .result()
-                    .map_err(|e| anyhow!("DSv4 FlashMLA sparse prefill failed: {e}"))?;
-                }
+            // SAFETY: ptrs from live device allocations sized to the dims passed.
+            unsafe {
+                ffi::arle_flashmla_sm90_sparse_prefill_fwd(
+                    q_for_flashmla,
+                    kv_ptr as *const ffi::Half,
+                    indices_ptr as *const i32,
+                    sink_ptr,
+                    topk_ptr as *const i32,
+                    flash_out_ptr,
+                    max_ptr as *mut f32,
+                    lse_ptr as *mut f32,
+                    token_count as i32,
+                    kv_rows as i32,
+                    global_heads as i32,
+                    1,
+                    config.head_dim as i32,
+                    config.head_dim as i32,
+                    topk_unified as i32,
+                    sm_scale,
+                    global_width as i32,
+                    config.head_dim as i32,
+                    config.head_dim as i32,
+                    0,
+                    topk_unified as i32,
+                    0,
+                    0,
+                    ctx.stream.cu_stream(),
+                )
+                .result()
+                .map_err(|e| anyhow!("DSv4 FlashMLA sparse prefill failed: {e}"))?;
             }
             Ok(())
         })?;
@@ -3797,15 +3666,6 @@ pub(crate) struct Dsv4MlaDecodeGraphScratch {
     csa_q_i: Option<HiddenStates>,
     csa_weights: Option<HiddenStates>,
     csa_selected: Option<CudaSlice<i32>>,
-    // Persistent n=1 device-meta inputs for the graph-safe CSA READ (the batched
-    // device-meta select reads these instead of per-step `upload_i32`, which the
-    // capture audit rejects). Both are GRAPH-LIFETIME CONSTANTS: `csa_slot_id_dev`
-    // is the slot's index, `csa_key_count_dev` the indexer compressed capacity.
-    // Lazy-initialized on the first eager/warm run (H2D outside capture) and never
-    // rewritten — guarded by `csa_meta_initialized`.
-    csa_slot_id_dev: Option<CudaSlice<i32>>,
-    csa_key_count_dev: Option<CudaSlice<i32>>,
-    csa_meta_initialized: bool,
 }
 
 impl Dsv4MlaDecodeGraphScratch {
@@ -3908,8 +3768,7 @@ impl Dsv4MlaDecodeGraphScratch {
             } else {
                 (None, None)
             };
-        let (csa_q_i, csa_weights, csa_selected, csa_slot_id_dev, csa_key_count_dev) =
-            if mode.has_indexer() {
+        let (csa_q_i, csa_weights, csa_selected) = if mode.has_indexer() {
                 let indexer = attention
                     .indexer
                     .as_ref()
@@ -3926,16 +3785,9 @@ impl Dsv4MlaDecodeGraphScratch {
                                 anyhow!("DSv4 graph CSA selected scratch alloc failed: {e}")
                             })?,
                     ),
-                    // n=1 persistent device-meta inputs (one element each).
-                    Some(ctx.stream.alloc_zeros::<i32>(1).map_err(|e| {
-                        anyhow!("DSv4 graph CSA slot-id scratch alloc failed: {e}")
-                    })?),
-                    Some(ctx.stream.alloc_zeros::<i32>(1).map_err(|e| {
-                        anyhow!("DSv4 graph CSA key-count scratch alloc failed: {e}")
-                    })?),
                 )
             } else {
-                (None, None, None, None, None)
+                (None, None, None)
             };
         Ok(Self {
             // SAFETY: uninit device scratch; fully written before first read.
@@ -3963,9 +3815,6 @@ impl Dsv4MlaDecodeGraphScratch {
             csa_q_i,
             csa_weights,
             csa_selected,
-            csa_slot_id_dev,
-            csa_key_count_dev,
-            csa_meta_initialized: false,
         })
     }
 
@@ -4008,16 +3857,6 @@ impl Dsv4MlaDecodeGraphScratch {
             )
             .saturating_add(
                 self.csa_selected
-                    .as_ref()
-                    .map_or(0, |s| s.len().saturating_mul(std::mem::size_of::<i32>())),
-            )
-            .saturating_add(
-                self.csa_slot_id_dev
-                    .as_ref()
-                    .map_or(0, |s| s.len().saturating_mul(std::mem::size_of::<i32>())),
-            )
-            .saturating_add(
-                self.csa_key_count_dev
                     .as_ref()
                     .map_or(0, |s| s.len().saturating_mul(std::mem::size_of::<i32>())),
             )
@@ -4257,9 +4096,7 @@ pub(crate) fn mla_attention_decode_graph(
     } else {
         (config.rope_theta, 0i32)
     };
-    // #150: with the bf16 dequant copies present, force the scalar route so the
-    // n=1 decode arithmetic (bf16 cublasLt) matches the n≥2 batched lane's.
-    if attention.mla_proj_bf16.is_none() && dsv4_fused_wqkv_decode_enabled()? {
+    if dsv4_fused_wqkv_decode_enabled()? {
         let fused = state.fused_wqkv.as_mut().ok_or_else(|| {
             anyhow!("DSv4 fused wqkv decode requested but decode scratch was not allocated")
         })?;
@@ -4278,7 +4115,7 @@ pub(crate) fn mla_attention_decode_graph(
             })
         })?;
     } else {
-        let (wq_a, wq_b, wkv) = attention.decode_proj_weights();
+        let (wq_a, wq_b, wkv) = (&attention.wq_a, &attention.wq_b, &attention.wkv);
         crate::profile::profile_op(ctx, "linear/wq_a", None, 1, || {
             crate::linear_profile::profile(ctx, "dsv4/linear/wq_a", || {
                 dsv4_linear(ctx, wq_a, hidden, &mut scratch.c_q)
@@ -4375,23 +4212,6 @@ pub(crate) fn mla_attention_decode_graph(
         )?;
     }
     if mode.has_indexer() {
-        // Graph-safe READ lane (opt-in): route the CSA READ through the n=1 batched
-        // device-meta select reading persistent slot_id/key_count buffers. The cache
-        // WRITE (block (a)) is still host-shape driven (not yet graph-capturable), so
-        // this lane runs EAGER (the caller bypasses attn-graph capture); it makes the
-        // shape-stable read reachable + needle-testable. When OFF, the legacy bail
-        // keeps decode-graph from running the non-capturable per-tile CSA select.
-        let csa_read_lane = dsv4_decode_graph_csa_read_enabled()?;
-        if !csa_read_lane
-            && matches!(
-                std::env::var("ARLE_DSV4_DECODE_GRAPH").as_deref(),
-                Ok("1" | "true" | "TRUE" | "yes" | "on" | "ON")
-            )
-        {
-            anyhow::bail!(
-                "DSv4 decode-graph does not support the official CSA select; run without ARLE_DSV4_DECODE_GRAPH=1 (or set ARLE_DSV4_DECODE_GRAPH_CSA=1 for the eager graph-safe-read lane)"
-            );
-        }
         ensure!(
             mode == DeepSeekV4AttentionMode::CompressedSparse,
             "DSv4 decode graph does not support SparseIndexed/GLM indexer"
@@ -4476,40 +4296,12 @@ pub(crate) fn mla_attention_decode_graph(
             .dsa_official_slot_idx()
             .ok_or_else(|| anyhow!("DSv4 graph CSA official DSA state missing"))?;
         let keys_capacity = state.indexer_compressed_capacity().unwrap_or(0);
-        // LAZY-INIT the persistent n=1 device-meta inputs ONCE, on an eager/warm
-        // run (H2D OUTSIDE any capture). slot_id + key_count are graph-lifetime
-        // constants; the capture audit forbids re-doing the H2D inside replay.
-        if csa_read_lane && !scratch.csa_meta_initialized {
-            let slot_id_i32 = i32::try_from(slot_idx)
-                .map_err(|_| anyhow!("DSv4 graph CSA slot_idx {slot_idx} overflows i32"))?;
-            let key_count_i32 = i32::try_from(keys_capacity).map_err(|_| {
-                anyhow!("DSv4 graph CSA key capacity {keys_capacity} overflows i32")
-            })?;
-            let slot_id_dev = scratch
-                .csa_slot_id_dev
-                .as_mut()
-                .ok_or_else(|| anyhow!("DSv4 graph CSA slot-id device buffer missing"))?;
-            ctx.stream
-                .memcpy_htod(&[slot_id_i32], slot_id_dev)
-                .map_err(|e| anyhow!("DSv4 graph CSA slot-id H2D failed: {e}"))?;
-            let key_count_dev = scratch
-                .csa_key_count_dev
-                .as_mut()
-                .ok_or_else(|| anyhow!("DSv4 graph CSA key-count device buffer missing"))?;
-            ctx.stream
-                .memcpy_htod(&[key_count_i32], key_count_dev)
-                .map_err(|e| anyhow!("DSv4 graph CSA key-count H2D failed: {e}"))?;
-            scratch.csa_meta_initialized = true;
-        }
-        // Disjoint-field borrows: c_q_normed (read) + csa scratch (mut) + the
-        // persistent device-meta refs.
+        // Disjoint-field borrows: c_q_normed (read) + csa scratch (mut).
         let Dsv4MlaDecodeGraphScratch {
             c_q_normed,
             csa_q_i,
             csa_weights,
             csa_selected,
-            csa_slot_id_dev,
-            csa_key_count_dev,
             ..
         } = scratch;
         let csa_q_i = csa_q_i
@@ -4521,11 +4313,7 @@ pub(crate) fn mla_attention_decode_graph(
         let csa_selected = csa_selected
             .as_mut()
             .ok_or_else(|| anyhow!("DSv4 graph CSA selected scratch missing"))?;
-        let (slot_id_dev, key_count_dev) = if csa_read_lane {
-            (csa_slot_id_dev.as_ref(), csa_key_count_dev.as_ref())
-        } else {
-            (None, None)
-        };
+        let (slot_id_dev, key_count_dev) = (None, None);
         let Dsv4LayerAttentionState {
             indexer: indexer_state_ref,
             dsa_official,
@@ -4975,10 +4763,7 @@ pub(crate) fn mla_attention_prepare(
     // ── 1+2. Q/KV LoRA. Decode uses the existing B=1 fused (`wq_a | wkv`)
     // path. Prefill uses the same fused weight cache when native DeepGEMM is
     // available; otherwise the scalar reference order remains intact.
-    // #150: bf16 dequant copies present ⇒ decode (token_count==1) takes the
-    // scalar route with the bf16 weights; prefill (token_count>1) keeps FP8.
-    let decode_bf16 = token_count == 1 && attention.mla_proj_bf16.is_some();
-    let fused_wqkv = token_count == 1 && !decode_bf16 && dsv4_fused_wqkv_decode_enabled()?;
+    let fused_wqkv = token_count == 1 && dsv4_fused_wqkv_decode_enabled()?;
     let (c_q_normed, q_raw, kv_normed) = if fused_wqkv {
         let scratch = state.fused_wqkv.as_mut().ok_or_else(|| {
             anyhow!("DSv4 fused wqkv decode requested but decode scratch was not allocated")
@@ -5060,13 +4845,7 @@ pub(crate) fn mla_attention_prepare(
         (c_q_normed, q_raw, kv_normed)
     } else {
         // Q-LoRA: wq_a (down) → q_norm RMSNorm → wq_b (up to per-head Q).
-        // #150: decode with the bf16 copies present takes them (DenseBf16 ⇒
-        // gemm_batch); prefill/no-copies keeps the FP8 originals.
-        let (wq_a, wq_b, wkv) = if decode_bf16 {
-            attention.decode_proj_weights()
-        } else {
-            (&attention.wq_a, &attention.wq_b, &attention.wkv)
-        };
+        let (wq_a, wq_b, wkv) = (&attention.wq_a, &attention.wq_b, &attention.wkv);
         // SAFETY: dsv4_linear writes the full c_q buffer.
         let mut c_q = unsafe { HiddenStates::uninit(ctx, wq_a.rows, token_count)? };
         crate::profile::profile_op(ctx, "linear/wq_a", None, token_count, || {
@@ -5412,25 +5191,6 @@ pub(crate) fn mla_attention_prepare(
         }
     };
 
-    // TEMP #146 probe (self-gating; revert after the run): dump the LAST query
-    // row's DSA top-k selection per CSA layer, on BOTH lanes — prefill sel was
-    // proven healthy (round 2: needle blocks present at all 21 CSA layers), so
-    // round 3 asks whether the DECODE-step selection (scored over the FP8
-    // rotated key cache, a different input than prefill's bf16 staging) still
-    // carries the needle blocks once C > index_topk.
-    if let Some(sel) = selected.as_ref()
-        && env_flag("ARLE_DSV4_DSA_TOPK_PROBE")?
-    {
-        ctx.sync()?;
-        let host: Vec<i32> = ctx.stream.clone_dtoh(sel)?;
-        let k = config.index_topk;
-        let last = &host[host.len().saturating_sub(k)..];
-        let line = format!(
-            "[dsaprobe] pid={} layer={layer_idx} sp={start_pos} n={token_count} sel={last:?}\n",
-            std::process::id()
-        );
-        eprint!("{line}");
-    }
     Ok(Dsv4MlaPrepared {
         q_prepared,
         k_prepared,
@@ -5562,11 +5322,7 @@ pub(crate) fn mla_attention_prepare_proj_batch(
     // (max_m = DSV4_PREFILL_QUERY_CHUNK = 4096 >= N) stages the FP8 activation;
     // the per-(out_row,token) GEMV `else` branch is the DeepGEMM-disabled fallback
     // (byte-identical to the prior batched path).
-    // #150: bf16 dequant copies present ⇒ skip FP8 DeepGEMM, take the scalar
-    // route with the DenseBf16 weights (dsv4_linear ⇒ gemm_batch) so the n≥2
-    // decode arithmetic matches the n=1 lane's.
-    let use_deepgemm = attention.mla_proj_bf16.is_none()
-        && dsv4_deepgemm_enabled()
+    let use_deepgemm = dsv4_deepgemm_enabled()
         && attention.wqkv_a_deepgemm.is_some()
         && attention.wq_b_deepgemm.is_some()
         && prefill_shared.is_some();
@@ -5612,7 +5368,7 @@ pub(crate) fn mla_attention_prepare_proj_batch(
         // bf16 copies this dispatches DenseBf16 ⇒ gemm_batch (cublasLt); with the
         // FP8 originals, the per-(out_row, token) GEMV grid — byte path == the
         // non-fused `else` branch of `mla_attention_prepare`, at seq_len=N.
-        let (wq_a, wq_b, wkv) = attention.decode_proj_weights();
+        let (wq_a, wq_b, wkv) = (&attention.wq_a, &attention.wq_b, &attention.wkv);
         // SAFETY: dsv4_linear writes the full c_q buffer.
         let mut c_q = unsafe { HiddenStates::uninit(ctx, wq_a.rows, n)? };
         crate::profile::profile_op(ctx, "linear/wq_a_batched", None, n, || {
@@ -7734,9 +7490,8 @@ fn proj_batched(
     input: &HiddenStates,
     out: &mut HiddenStates,
 ) -> Result<()> {
-    let force_bf16 = dsv4_proj_batched_bf16_forced()?;
     match (cache, scratch) {
-        (Some(cache), Some(scratch)) if input.seq_len > 1 && !force_bf16 => {
+        (Some(cache), Some(scratch)) if input.seq_len > 1 => {
             prefill_proj_deepgemm(ctx, scratch, cache, input, out)
         }
         _ => dsv4_linear(ctx, weight, input, out),
