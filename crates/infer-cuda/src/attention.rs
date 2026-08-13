@@ -1551,20 +1551,7 @@ pub(crate) fn dsv4_flashmla_layer_pool_pages(
         .saturating_add(shared_comp))
 }
 
-/// Whether the FlashMLA shared-band pool is built at all - a compile-time question,
-/// not the runtime kernel choice `dsv4_flashmla_decode_enabled` answers.
-/// `--dsv4-flashmla-decode false` must NOT zero the pool's page budget, since the
-/// scalar kernel reads the same layout (pod-verified: sizing every band at 0 pages
-/// made admission reject almost every request).
-/// Must stay a forwarder, not a copy of the body: the A/B override can force the
-/// fused path ON, and a scratch-allocation gate that ignored it would let the two
-/// disagree - the decode then hits "fused wqkv decode requested but decode scratch
-/// was not allocated".
-pub(crate) fn dsv4_fused_wqkv_decode_alloc_enabled() -> Result<bool> {
-    dsv4_fused_wqkv_decode_enabled()
-}
-
-fn dsv4_fused_wqkv_decode_enabled() -> Result<bool> {
+pub(crate) fn dsv4_fused_wqkv_decode_enabled() -> Result<bool> {
     match DSV4_FUSED_WQKV_DECODE_OVERRIDE.load(Ordering::Relaxed) {
         DSV4_FLASHMLA_OVERRIDE_OFF => return Ok(false),
         DSV4_FLASHMLA_OVERRIDE_ON => return Ok(true),
