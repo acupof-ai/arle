@@ -5,9 +5,7 @@
 use anyhow::{Result, bail, ensure};
 use deepseek_spec::{DeepSeekV4AttentionMode, DeepSeekV4Config};
 
-use super::{
-    Dsv4Model, Dsv4SlotState, MAX_SPEC_DRAFT_DEPTH, MAX_SPEC_VERIFY_ROWS, dsv4_decode_graph_enabled,
-};
+use super::{Dsv4Model, Dsv4SlotState, MAX_SPEC_DRAFT_DEPTH, MAX_SPEC_VERIFY_ROWS};
 
 /// MLA latent KV arena descriptor (kv_heads = 1).
 ///
@@ -99,10 +97,6 @@ impl Dsv4Model {
         max_seq_len: usize,
         budget: Dsv4KvBudgetPlan,
     ) -> Result<crate::attention::Dsv4KvAdapter> {
-        // The eager B=1 path uses the FP8 decode-band MoE lane. The shared
-        // routed-MoE scratch is decode-graph-only; do not let GPU-router env
-        // selection switch eager decode back to the old pooled MoE path.
-        let needs_moe_decode_shared = dsv4_decode_graph_enabled();
         let specs: Vec<_> = self
             .layers
             .iter()
@@ -146,18 +140,8 @@ impl Dsv4Model {
             budget.num_slots,
             budget.flashmla_pool_tokens,
             mla_decode,
-            if needs_moe_decode_shared {
-                self.layers.first().map(|layer| {
-                    (
-                        &self.moe_config,
-                        &self.split,
-                        layer.moe.as_ref().expect("DSv4 layer.moe"),
-                    )
-                })
-            } else {
-                None
-            },
             self.layers.iter().find_map(|layer| layer.moe.as_ref()),
+            self.split.experts_per_rank,
             self.config.hidden_size,
         )
     }
@@ -328,23 +312,8 @@ impl Dsv4Model {
             ),
             max_seq_len,
         );
-        // Mirror new_kv_adapter's allocation gate: routed-MoE scratch is
-        // decode-graph-only. Eager B=1 uses the FP8 decode-band MoE lane.
-        let needs_moe_decode_shared = dsv4_decode_graph_enabled();
-        let moe_decode_shared_bytes = if needs_moe_decode_shared {
-            self.layers
-                .first()
-                .map(|layer| {
-                    crate::moe::Dsv4MoeDecodeScratch::device_bytes(
-                        &self.moe_config,
-                        &self.split,
-                        layer.moe.as_ref().expect("DSv4 layer.moe"),
-                    )
-                })
-                .unwrap_or(0)
-        } else {
-            0
-        };
+        // Eager B=1 uses the FP8 decode-band MoE lane, so no shared routed-MoE
+        // scratch is allocated; only the shared-expert output below counts.
         // The model-wide shared-expert output is allocated unconditionally on
         // the adapter (#60). It is sized for the bounded MTP verify chunk and
         // reused by B=1 decode with `seq_len = 1`; count it as a fixed term
@@ -354,8 +323,7 @@ impl Dsv4Model {
             .hidden_size
             .saturating_mul(MAX_SPEC_VERIFY_ROWS)
             .saturating_mul(std::mem::size_of::<half::bf16>());
-        let moe_decode_shared_bytes =
-            moe_decode_shared_bytes.saturating_add(shared_expert_out_bytes);
+        let moe_decode_shared_bytes = shared_expert_out_bytes;
         let shared_expert_scratch_bytes = self
             .layers
             .iter()
