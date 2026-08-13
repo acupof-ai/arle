@@ -1930,20 +1930,6 @@ impl Dsv4CudaExecutor {
                 self.mtp_accepts,
                 self.mtp_rejects
             );
-            // Token-level accept attribution (INFER_DSPARK_DEBUG): the drafted
-            // ids vs the target greedy argmax at each block position. `argmax[i]`
-            // is the target token AFTER chain[i]; accept requires
-            // argmax[i] == chain[i+1]. Reveals de-RoPE (plausible-but-shifted
-            // drafts) vs alignment off-by-one (drafts match a shifted argmax) vs
-            // geometry garbage (unrelated drafts).
-            if std::env::var_os("INFER_DSPARK_DEBUG").is_some() {
-                eprintln!(
-                    "[dspark-dbg] anchor={anchor} base_argmax={:?} drafts={:?} target_argmax={:?} accepted={accepted}",
-                    &proposal.base_argmax,
-                    &proposal.chain[1..],
-                    &verify.argmax,
-                );
-            }
         }
 
         // Emit the anchor (committed this step) + accepted drafts + the bonus (the

@@ -1907,7 +1907,6 @@ impl Qwen35CudaExecutor {
     ) -> Result<Vec<SlotToken>> {
         let mut out: Vec<Vec<SlotToken>> = (0..decode_rows.len()).map(|_| Vec::new()).collect();
         let mut batch: Vec<DsparkChain> = Vec::with_capacity(decode_rows.len());
-        let mut pt = crate::qwen35::dspark_phase_start(&self.model.ctx);
         let mut seeded = Vec::with_capacity(decode_rows.len());
         for row in decode_rows {
             ensure!(
@@ -2030,7 +2029,6 @@ impl Qwen35CudaExecutor {
                 partial_ctx,
             });
         }
-        let draft_ms = crate::qwen35::mtp_phase_lap(&self.model.ctx, &mut pt);
         if batch.is_empty() {
             return Ok(out.into_iter().flatten().collect());
         }
@@ -2076,7 +2074,6 @@ impl Qwen35CudaExecutor {
             model.batched_copy(&mut ds.copy, &gdr.0, &gdr.1, &[bytes.0])?;
             model.batched_copy(&mut ds.copy, &conv.0, &conv.1, &[bytes.1])?;
         }
-        let snap_ms = crate::qwen35::mtp_phase_lap(&self.model.ctx, &mut pt);
 
         // 3. Reserve + verify, all-or-nothing: seq_lens advance only on
         //    success, so any failure must give every reserved row back.
@@ -2092,7 +2089,6 @@ impl Qwen35CudaExecutor {
                 return Err(e);
             }
         };
-        let verify_ms = crate::qwen35::mtp_phase_lap(&self.model.ctx, &mut pt);
 
         let Self {
             model,
@@ -2112,8 +2108,6 @@ impl Qwen35CudaExecutor {
             false => Vec::new(),
         };
 
-        let tap_ms = crate::qwen35::mtp_phase_lap(&model.ctx, &mut pt);
-        let (mut accept_ms, mut cap_ms, mut trunc_ms, mut ext_ms) = (0.0, 0.0, 0.0, 0.0);
 
         // 5. Per row: accept, extend the draft ctx, stage the bonus as the next
         //    anchor. The greedy rollback batches below — nothing here reads the
@@ -2149,11 +2143,9 @@ impl Qwen35CudaExecutor {
                     params,
                 )?
             };
-            accept_ms += crate::qwen35::mtp_phase_lap(&model.ctx, &mut pt);
             // Draft logits live in the SLOT: a tick drafts every row before
             // verifying any, so a shared buffer would pair the wrong slot.
             let df = ds.slots[c.slot].as_mut().expect("seeded slot");
-            cap_ms += crate::qwen35::mtp_phase_lap(&model.ctx, &mut pt);
             if k + 1 < c.chain.len() {
                 let len = c.start + k + 1;
                 let pool = full_attn_kv.as_mut().expect("paged (gated by seeded)");
@@ -2161,9 +2153,7 @@ impl Qwen35CudaExecutor {
                 let need = len.div_ceil(pool.page_size);
                 pool.mirror_slot(c.slot, &host_kv.page_indices(c.slot)[..need], len)?;
             }
-            trunc_ms += crate::qwen35::mtp_phase_lap(&model.ctx, &mut pt);
             model.dspark_append_ctx(&ds.head, df, &mut ds.scratch, c.row0, k + 1, c.start)?;
-            ext_ms += crate::qwen35::mtp_phase_lap(&model.ctx, &mut pt);
             df.pending = Some(bonus);
             ds.accepts += k;
             ds.rejects += c.chain.len() - 1 - k;
@@ -2207,16 +2197,6 @@ impl Qwen35CudaExecutor {
                 &mut ds.copy,
                 workspace,
             )?;
-        }
-        let commit_ms = tap_ms + accept_ms + cap_ms + trunc_ms + ext_ms;
-        if pt.is_some() {
-            eprintln!(
-                "[dspark-commit] tap={tap_ms:.2} accept={accept_ms:.2} cap={cap_ms:.2} trunc={trunc_ms:.2} ext={ext_ms:.2} ms"
-            );
-            eprintln!(
-                "[dspark-phase] rows={} chain_rows={total_rows} draft={draft_ms:.2} snap={snap_ms:.2} verify={verify_ms:.2} commit={commit_ms:.2} ms",
-                batch.len()
-            );
         }
         Ok(out.into_iter().flatten().collect())
     }
