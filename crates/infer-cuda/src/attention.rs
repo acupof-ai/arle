@@ -22,7 +22,6 @@ use crate::dsv4::{
     Dsv4Attention, Dsv4Compressor, Dsv4ForwardKeepalive, Dsv4Indexer, Dsv4MlaKvArena,
 };
 use crate::loader::PageMeta;
-use crate::moe_config::ExpertSplit;
 use crate::paged_kv_table::{contiguous_page_table_byte_range, physical_page};
 use crate::tp::TpRuntime;
 
@@ -1529,74 +1528,6 @@ fn run_fused_wqkv_prefill(
         )
         .result()
         .map_err(|e| anyhow!("DSv4 fused wqkv prefill kv slice failed: {e}"))?;
-    }
-    Ok(())
-}
-
-pub(crate) fn mla_linear_vec(
-    ctx: &DeviceContext,
-    weight: &DeviceMatrix,
-    x: &DeviceVec,
-    out: &mut HiddenStates,
-) -> Result<()> {
-    ensure!(
-        weight.cols == x.len,
-        "mla_linear_vec input dim mismatch: weight cols {}, x len {}",
-        weight.cols,
-        x.len
-    );
-    ensure!(
-        weight.rows == out.hidden_dim && out.seq_len == 1,
-        "mla_linear_vec output shape mismatch: weight rows {}, out {}x{}",
-        weight.rows,
-        out.hidden_dim,
-        out.seq_len
-    );
-    let qw = weight
-        .qweight
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("DSv4 MLA matrix missing raw quant bytes (qweight)"))?;
-    let scales = weight
-        .dsv4_scales
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("DSv4 MLA matrix missing block scales (dsv4_scales)"))?;
-    let (qw_ptr, _gqw) = qw.device_ptr(&ctx.stream);
-    let (scales_ptr, _gs) = scales.device_ptr(&ctx.stream);
-    let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
-    let (out_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
-    let stream = ctx.stream.cu_stream();
-    // SAFETY: all buffers are valid on ctx.stream; shapes are checked above.
-    unsafe {
-        let res = match weight.weight_format {
-            WeightFormat::Dsv4Fp8BlockScaled => ffi::dsv4_fp8_gemv_batch_cuda(
-                qw_ptr as *const u8,
-                scales_ptr as *const u8,
-                x_ptr as *const ffi::Half,
-                out_ptr as *mut ffi::Half,
-                1,
-                weight.rows as i32,
-                weight.cols as i32,
-                weight.dsv4_scale_rows as i32,
-                weight.dsv4_scale_cols as i32,
-                stream,
-            ),
-            WeightFormat::Dsv4Fp4BlockScaled => ffi::dsv4_fp4_gemv_batch_cuda(
-                qw_ptr as *const u8,
-                scales_ptr as *const u8,
-                x_ptr as *const ffi::Half,
-                out_ptr as *mut ffi::Half,
-                1,
-                weight.rows as i32,
-                weight.cols as i32,
-                weight.dsv4_scale_rows as i32,
-                weight.dsv4_scale_cols as i32,
-                stream,
-            ),
-            other => {
-                bail!("mla_linear_vec: expected DSv4 FP8/FP4 block-scaled weight, got {other:?}")
-            }
-        };
-        res.result()?;
     }
     Ok(())
 }

@@ -371,35 +371,7 @@ impl Dsv4Model {
         let names = config.tensor_names();
 
         let embed_tokens = loader.load_dsv4_bf16_matrix(&ctx, names.embed_tokens())?;
-        // Opt-in lever #99 (`ARLE_DSV4_LM_HEAD_SHARD=1`): row-shard lm_head
-        // across TP ranks instead of replicating the full-vocab GEMV. TP=1
-        // no-ops (byte-identical load). The batched lm_head consumers (MTP
-        // verify/draft heads, entropy probes) still need full-vocab logits, so
-        // the knob refuses those configs loudly instead of degrading silently.
-        let (lm_head, lm_head_shard) = if dsv4_lm_head_shard_enabled() && !tp_cfg.is_single() {
-            ensure!(
-                tp.is_collective(),
-                "ARLE_DSV4_LM_HEAD_SHARD=1 needs real TP collectives (nccl build) at world_size {}",
-                tp_cfg.world_size
-            );
-            ensure!(
-                !spec_decode_on,
-                "ARLE_DSV4_LM_HEAD_SHARD=1 does not support MTP spec decode (the MTP \
-                 verify/draft heads consume full-vocab lm_head logits); disable spec \
-                 decode (drop --spec-type) or unset the shard knob"
-            );
-            ensure!(
-                !crate::probe::token_entropy(),
-                "ARLE_DSV4_LM_HEAD_SHARD=1 does not support the prefill token-entropy \
-                 probe (full-vocab batched lm_head); unset ARLE_PROBE_TOKEN_ENTROPY or \
-                 the shard knob"
-            );
-            let (matrix, shard) =
-                loader.load_dsv4_global_matrix_vocab_sharded(&ctx, names.lm_head(), &tp_cfg)?;
-            (matrix, Some(shard))
-        } else {
-            (loader.load_dsv4_global_matrix(&ctx, names.lm_head())?, None)
-        };
+        let lm_head = loader.load_dsv4_global_matrix(&ctx, names.lm_head())?;
 
         // GLM (`glm_moe_dsa`) markers: re-encode FP8 MoE experts from `weight_scale_inv`,
         // and bypass the absent hyper-connections (`hc_mult == 1`, identity mixers).
@@ -516,7 +488,6 @@ impl Dsv4Model {
             kv_arena,
             embed_tokens,
             lm_head,
-            lm_head_shard,
             layers,
             norm,
             head_hc,

@@ -622,5 +622,4 @@ mod tests {
             "device merge max-abs-err {max_abs:e} exceeds BF16 tolerance"
         );
     }
-
 }
