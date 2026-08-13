@@ -491,7 +491,13 @@ fn backward_windowed_kl_cached_hidden<T: TeacherForward + ?Sized>(
                 .as_ref()
                 .and_then(|h| store.backend().sum_squares(h, &t.shape).ok())
         });
-        eprintln!("[opd-diag] student_hidden sum_sq={hidden_sq:?}");
+        eprintln!(
+            "[opd-diag] student_hidden sum_sq={hidden_sq:?} rollout_len={} id_min={:?} id_max={:?} pos_max={:?}",
+            rollout.len(),
+            rollout.iter().min(),
+            rollout.iter().max(),
+            positions.iter().max()
+        );
     }
     record_profile(profile, |profile| {
         profile.student_forward_seconds += student_started.elapsed().as_secs_f64();
