@@ -316,7 +316,8 @@ fn engine_loop_with_tick_broadcaster<E, K>(
                 );
                 // Drop all back-channels so collectors observe the failure.
                 pending.clear();
-                std::process::exit(75); // EX_TEMPFAIL — watchdog restarts
+                #[allow(clippy::exit)] // EX_TEMPFAIL — watchdog restarts
+                std::process::exit(75);
             }
             // Cancel requests whose stream receiver hung up mid-decode so the
             // row frees its KV slot instead of decoding to max_tokens. Local
