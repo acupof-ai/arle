@@ -2973,11 +2973,11 @@ impl SafetensorLoader {
             let k_start = g * group_size;
             let k_end = k_start + group_size;
             let mut zeros = vec![0u8; n];
-            for j in 0..n {
+            for (j, zero) in zeros.iter_mut().enumerate() {
                 let word_idx = j / 8;
                 let shift = (j % 8) * 4;
                 let raw = ((qz[g * packed_n + word_idx] >> shift) & 0xF) as u8;
-                zeros[j] = raw + 1; // GPTQ stores actual_zero - 1
+                *zero = raw + 1; // GPTQ stores actual_zero - 1
             }
             let scale_offset = g * n * 2;
             for j in 0..n {

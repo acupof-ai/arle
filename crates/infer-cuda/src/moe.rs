@@ -96,13 +96,11 @@ pub(crate) const QWEN35_MOE_DECODE_MAX_ROUTES: usize = 256;
 /// contiguous grouped-B caches only when enabled, so flipping it requires a
 /// process restart.
 #[cfg(feature = "cuda")]
-
 /// `--qwen35-moe-decode-kernel` (default on): the decode-band weight-read-bound
 /// grouped kernels; `false` runs the hand batch kernels at every routed-row count
 /// below the DeepGEMM floor. Read per call — inside a captured decode graph the
 /// value read at capture time is what replays.
 #[cfg(feature = "cuda")]
-
 /// Allocate an i32 buffer pre-filled with `-1` ON DEVICE (memset 0xFF) — the
 /// "route slot not packed on this rank" sentinel.
 ///

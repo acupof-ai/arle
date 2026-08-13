@@ -912,10 +912,8 @@ fn load_linear_qkv_sharded(
     // `{name}.qweight` (no `.weight`). For TP=1 the whole matrix loads as one
     // quant view; head-block sharding for TP>1 is not yet implemented for
     // packed quant (falls through to the BF16 path, which errors clearly).
-    if tp.world_size == 1 {
-        if loader.quant_view_for(name)?.is_some() {
-            return loader.load_matrix_quant_aware(ctx, name);
-        }
+    if tp.world_size == 1 && loader.quant_view_for(name)?.is_some() {
+        return loader.load_matrix_quant_aware(ctx, name);
     }
     let tensor = loader.load_raw_tensor(name)?;
     ensure!(
