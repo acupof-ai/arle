@@ -372,7 +372,7 @@ pub(crate) struct Dsv4KvAdapter {
     /// Not graph state: eager no-spec decode reuses it to avoid allocating
     /// q/kv/CSA/O-proj
     /// temporaries inside every per-layer MLA dispatch.
-    pub(super) mla_decode: Vec<Option<Dsv4MlaDecodeGraphScratch>>,
+    pub(super) mla_decode: Vec<Option<Dsv4MlaDecodeScratch>>,
     /// One shared-expert output for ALL layers and slots; capacity covers the multi-row
     /// MTP
     /// verify chunk, and callers set `seq_len` before dispatch.
@@ -658,7 +658,7 @@ pub(crate) type LayerFlashMlaAndMlaDecode<'a> = (
     &'a mut Dsv4LayerKvLayout,
     Option<&'a mut Dsv4DsaSharedScratch>,
     Option<&'a mut Dsv4FlashMlaDecodeScratch>,
-    Option<&'a mut Dsv4MlaDecodeGraphScratch>,
+    Option<&'a mut Dsv4MlaDecodeScratch>,
 );
 
 impl Dsv4KvAdapter {
@@ -675,7 +675,7 @@ impl Dsv4KvAdapter {
         tp_world: usize,
         num_slots: usize,
         pool_tokens: usize,
-        mla_decode: Vec<Option<Dsv4MlaDecodeGraphScratch>>,
+        mla_decode: Vec<Option<Dsv4MlaDecodeScratch>>,
         shared_expert_decode: Option<&crate::dsv4::Dsv4MoeLayer>,
         experts_per_rank: usize,
         hidden_size: usize,
@@ -848,7 +848,7 @@ impl Dsv4KvAdapter {
                 self.mla_decode
                     .iter()
                     .filter_map(Option::as_ref)
-                    .map(Dsv4MlaDecodeGraphScratch::device_bytes)
+                    .map(Dsv4MlaDecodeScratch::device_bytes)
                     .sum(),
             ),
             (

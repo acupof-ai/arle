@@ -1,15 +1,7 @@
 //! DeepSeek-V4-Flash FP8 model: weight structs, MLA KV arena, EP-aware loader.
 //!
-//! The DSv4 port lives here: it loads the FP8 block-scaled weights (reusing the
-//! shared `cuda-kernels` DSv4 tensors), stands up the MLA latent KV arena, and
-//! drives the full forward — SlidingWindow / CompressedSparse / HybridCompressed
-//! MLA attention (`attention.rs`), hyper-connections (`hc_mult > 1`, this file),
-//! hash- and bias-routed FP8 DeepGEMM MoE (`moe.rs`). DSv4 is multi-GPU only
-//! (256 FP8 experts + MLA sharding don't fit one GPU); `ExpertSplit` carries the
-//! per-rank EP ownership, `ExpertSplit::single` is the dev/typecheck fallback.
-//!
-//! The `RealCudaExecutor` Dsv4 branch (`executor.rs`) constructs + runs this
-//! model; the lead wires the multi-process TP=8/EP=8 launcher + bench entry.
+//! Multi-GPU only (256 FP8 experts + MLA sharding don't fit one GPU);
+//! `ExpertSplit::single` is the dev/typecheck fallback.
 
 use anyhow::{Result, anyhow, ensure};
 use cuda_kernels::ffi;
@@ -33,20 +25,15 @@ pub(crate) use budget::Dsv4MlaKvArena;
 pub(crate) use load::load_dspark_draft;
 
 /// Compressor sub-block for CSA/HCA layers (`compress_ratio > 0`): projects the
-/// wide hidden into the compressed-key latent stream the sparse attention reads.
-/// `wkv`/`wgate` may be FP8/FP4 block-scaled or bf16 (`dsv4_linear` dispatches on
-/// `weight_format`); the main-value probe retains BF16 input projections and F32
-/// APE for the FP32 compressor forward. The indexer and default path stay
-/// unchanged.
+/// wide hidden into the compressed-key latent stream sparse attention reads.
 pub(crate) struct Dsv4Compressor {
     pub wkv: DeviceMatrix,
     pub wgate: DeviceMatrix,
     pub ape: DeviceMatrix,
     pub fp32_probe: Dsv4CompressorFp32Probe,
     pub norm: DeviceVec,
-    /// DeepGEMM repacks of the FP8 `wkv`/`wgate` projections for the batched (m=N)
-    /// decode pre-pass — tensor-core `sm90_fp8_gemm_1d2d` instead of the scalar
-    /// `dsv4_fp8_gemv_batch`. `None` ⇒ scalar (bf16 GLM dialect, or gate off).
+    /// DeepGEMM repacks of the FP8 `wkv`/`wgate` projections for the batched
+    /// (m=N) decode pre-pass. `None` ⇒ scalar `dsv4_fp8_gemv_batch`.
     pub wkv_deepgemm: Option<Dsv4Fp8DeepGemmWeightCache>,
     pub wgate_deepgemm: Option<Dsv4Fp8DeepGemmWeightCache>,
 }
@@ -58,37 +45,31 @@ pub(crate) struct Dsv4CompressorFp32Probe {
 }
 
 /// Sparse indexer sub-block. DSv4 CompressedSparse: a key compressor over
-/// `index_head_dim` keys + `wq_b`/`weights_proj`. GLM DSA (`SparseIndexed`): the
-/// indexer runs over the full (uncompressed) latent KV — no compressor; instead a
-/// plain key projection `wk` + key RMSNorm `k_norm`. Both feed the top-k block
-/// selector.
+/// `index_head_dim` keys + `wq_b`/`weights_proj`. GLM DSA (`SparseIndexed`): no
+/// compressor — a plain key projection `wk` + key RMSNorm `k_norm`.
 pub(crate) struct Dsv4Indexer {
     pub wq_b: DeviceMatrix,
     pub weights_proj: DeviceMatrix,
     /// DSv4 CSA key compressor. `None` ⇒ GLM SparseIndexed (uses `wk`/`k_norm`).
     pub compressor: Option<Dsv4Compressor>,
     /// GLM SparseIndexed only: indexer key projection `[index_n_heads*index_head_dim,
-    /// hidden]`. `None` ⇒ DSv4 (keys come through the compressor). Consumed by the
-    /// SparseIndexed index-key build (`sparse_indexed_index_key_forward`).
+    /// hidden]`. `None` ⇒ DSv4 (keys come through the compressor).
     pub wk: Option<DeviceMatrix>,
     /// GLM SparseIndexed only: indexer key RMSNorm weight + bias. `None` ⇒ DSv4.
-    /// Consumed by the SparseIndexed index-key build.
     pub k_norm: Option<DeviceVec>,
     #[allow(dead_code)]
     pub k_norm_bias: Option<DeviceVec>,
-    /// DeepGEMM repack of `wq_b` for the prefill index-query projection (the #1
-    /// remaining projection after wq_b/wo: 135ms / 67% of linear at M=1024). Built
-    /// when the prefill DeepGEMM scratch is enabled; `None` falls back to scalar.
+    /// DeepGEMM repack of `wq_b` for the prefill index-query projection (135ms /
+    /// 67% of linear at M=1024). `None` falls back to scalar.
     pub wq_b_deepgemm: Option<Dsv4Fp8DeepGemmWeightCache>,
-    /// DeepGEMM repack of `weights_proj` for the batched (m=N) decode indexer-query
-    /// pre-pass. Same gate as `wq_b_deepgemm`; `None` ⇒ scalar.
+    /// DeepGEMM repack of `weights_proj` for the batched (m=N) decode
+    /// indexer-query pre-pass. `None` ⇒ scalar.
     pub weights_proj_deepgemm: Option<Dsv4Fp8DeepGemmWeightCache>,
 }
 
 /// One hyper-connection mixing block (`hc_attn` / `hc_ffn` per layer, `hc_head`
 /// at the head). `mix_fn` projects the wide stream into the `(2+hc_mult)*hc_mult`
-/// mixing weights; `base`/`scale` are the learned bias + scale read by the
-/// sinkhorn `dsv4_mhc_params_cuda`.
+/// mixing weights; `base`/`scale` feed the sinkhorn `dsv4_mhc_params_cuda`.
 pub(crate) struct Dsv4HyperConnection {
     pub base: DeviceVec,
     pub mix_fn: DeviceMatrix,
@@ -96,10 +77,8 @@ pub(crate) struct Dsv4HyperConnection {
 }
 
 impl Dsv4HyperConnection {
-    /// Zero placeholder for GLM (`hc_mult == 1`, no hyper-connections): the mixers
-    /// are the identity (`stream_dim == hidden_size`), so the forward never reads
-    /// these weights. GLM checkpoints ship no `hc_*` tensors, so the loader builds
-    /// this instead of loading.
+    /// Zero placeholder for GLM (`hc_mult == 1`): the mixers are the identity, so
+    /// the forward never reads these weights and GLM checkpoints ship no `hc_*`.
     fn identity_placeholder(ctx: &DeviceContext) -> Result<Self> {
         Ok(Self {
             base: DeviceVec::zeros(ctx, 1)?,
@@ -112,42 +91,31 @@ impl Dsv4HyperConnection {
 /// One DSv4 MLA attention block's weights.
 ///
 /// Q-LoRA: `wq_a` (down) → `q_norm` → `wq_b` (up to per-head Q). KV is the
-/// compressed latent: `wkv` → `kv_norm`. Output is also low-rank: `wo_a` (per
-/// o-group) → `wo_b` (back to hidden). `attn_sink` is the per-head sink logit.
-/// `compressor`/`indexer` are present on CSA/HCA layers (`compress_ratio > 0`):
-/// the compressor on both CSA and HCA, the indexer on CSA only.
+/// compressed latent: `wkv` → `kv_norm`. Output is low-rank: `wo_a` → `wo_b`.
+/// `compressor`/`indexer` exist on CSA/HCA layers (indexer on CSA only).
 pub(crate) struct Dsv4Attention {
     pub wq_a: DeviceMatrix,
     pub wqkv_a_deepgemm: Option<Dsv4Fp8DeepGemmWeightCache>,
     pub q_norm: DeviceVec,
     pub wq_b: DeviceMatrix,
-    /// DeepGEMM-layout FP8 cache of `wq_b` for the decode projection (M=1) — lets
-    /// the residual scalar `dsv4_fp8_gemv_batch` GEMV (nsys #1, 3.62ms) route
-    /// through tensor-core DeepGEMM like the fused wq_a|wkv path. `None` unless
-    /// the fused-wqkv decode alloc gate is on.
+    /// DeepGEMM-layout FP8 cache of `wq_b` for the decode projection (M=1); the
+    /// residual scalar GEMV was nsys #1 at 3.62ms. `None` unless the fused-wqkv
+    /// decode alloc gate is on.
     pub wq_b_deepgemm: Option<Dsv4Fp8DeepGemmWeightCache>,
     pub wkv: DeviceMatrix,
     pub kv_norm: DeviceVec,
-    /// #150: dense-bf16 dequant copies of `wq_a`/`wq_b`/`wkv`, built at load only
-    /// (the checkpoint ships these F8_E4M3-only).
-    /// Presence routes BOTH decode lanes (n=1 fused and n≥2 batched) through bf16
-    /// cublasLt so every decode batch size shares one arithmetic; prefill keeps
     /// DSv4 low-rank output down-projection. `None` ⇔ GLM (`config.plain_o_proj`,
     /// which uses `o_proj` instead).
     pub wo_a: Option<DeviceMatrix>,
-    /// Per-output-group pointer table for `wo_a`. DSv4 output projection groups
-    /// attention heads before the low-rank down projection; one TP rank may own
-    /// more than one full output group (TP1/2/4 on DSv4-Flash), so `wo_a` is
-    /// launched as group-routed `[token, group]` rows instead of pretending the
-    /// rank-local attention row is one flat K. `None` ⇔ GLM plain-o.
+    /// Per-output-group pointer table for `wo_a`. One TP rank may own more than
+    /// one full output group (TP1/2/4 on DSv4-Flash), so `wo_a` is launched as
+    /// group-routed `[token, group]` rows. `None` ⇔ GLM plain-o.
     pub wo_a_groups: Option<Dsv4WoAGroupTables>,
     /// DSv4 low-rank output up-projection. `None` ⇔ GLM plain-o.
     pub wo_b: Option<DeviceMatrix>,
-    /// DeepGEMM-layout FP8 caches of the output projection (`wo_a`/`wo_b`) for the
-    /// decode path (lever #1b), companion to [`Self::wq_b_deepgemm`]. The flat
-    /// `wo_a` cache is present only when this rank owns exactly one output group.
-    /// Multi-group ranks use `wo_a_group_deepgemm` below so TP4 does not fall back
-    /// to the scalar route GEMV path.
+    /// DeepGEMM-layout FP8 caches of the output projection (`wo_a`/`wo_b`) for
+    /// decode. The flat `wo_a` cache exists only when this rank owns exactly one
+    /// output group; multi-group ranks use `wo_a_group_deepgemm`.
     pub wo_a_deepgemm: Option<Dsv4Fp8DeepGemmWeightCache>,
     /// Per-output-group DeepGEMM caches for `wo_a` on ranks that own multiple
     /// whole output groups (TP1/2/4). Each cache is `[o_lora_rank, group_width]`.
@@ -158,18 +126,14 @@ pub(crate) struct Dsv4Attention {
     pub attn_sink_f32: Option<CudaSlice<f32>>,
     pub compressor: Option<Dsv4Compressor>,
     pub indexer: Option<Dsv4Indexer>,
-    /// GLM plain output projection `[hidden, num_heads*v_head_dim]` (replaces the
-    /// DSv4 `wo_a`/`wo_b` low-rank). `Some` ⇔ `config.plain_o_proj`; DSv4 leaves
-    /// `None` and uses `wo_a`/`wo_b`/`wo_a_groups`. Consumed by the Tranche-D GLM
-    /// forward (not yet wired).
+    /// GLM plain output projection `[hidden, num_heads*v_head_dim]`, replacing the
+    /// DSv4 `wo_a`/`wo_b` low-rank. `Some` ⇔ `config.plain_o_proj`.
     #[allow(dead_code)]
     pub o_proj: Option<DeviceMatrix>,
-    /// GLM `kv_b` absorption split — the up-projection of the compressed KV latent,
-    /// folded at runtime around the V32 FlashMLA call (SGLang `forward_absorb_core`
-    /// `deepseek_v2.py`). `w_kc[heads, qk_nope_head_dim, kv_lora_rank]` lifts q_nope
-    /// into the 512-latent; `w_vc[heads, kv_lora_rank, v_head_dim]` projects the
-    /// latent output back to v. `Some` ⇔ GLM (`config.kv_lora_rank > 0`); DSv4's
-    /// pre-absorbed checkpoint leaves both `None`. Consumed by the Tranche-D forward.
+    /// GLM `kv_b` absorption split, folded at runtime around the V32 FlashMLA
+    /// call. `w_kc[heads, qk_nope_head_dim, kv_lora_rank]` lifts q_nope into the
+    /// 512-latent; `w_vc[heads, kv_lora_rank, v_head_dim]` projects back to v.
+    /// `Some` ⇔ GLM (`config.kv_lora_rank > 0`); DSv4 is pre-absorbed.
     #[allow(dead_code)]
     pub w_kc: Option<DeviceMatrix>,
     #[allow(dead_code)]
@@ -187,56 +151,40 @@ pub(crate) struct Dsv4WoAGroupTables {
 }
 
 /// One DSv4 routed-MoE block: prebuilt group-major FP8 DeepGEMM caches for
-/// w1/w3 (gate/up) and w2 (down), the router gate, and the dense shared expert.
-/// Only this rank's `ExpertSplit` slice is resident.
-///
-/// Routing kind is per-layer: bias-routed layers carry `gate_bias` (the
-/// `noaux_tc` correction); hash-routed layers (`layer_idx < num_hash_layers`)
-/// carry a device `hash_tid2eid` table mapping token id to experts directly and
-/// ignore the learned router gate.
+/// w1/w3 and w2, the router gate, and the dense shared expert. Only this rank's
+/// `ExpertSplit` slice is resident. Routing is per-layer: bias-routed layers
+/// carry `gate_bias`; hash-routed layers (`layer_idx < num_hash_layers`) map
+/// token id to experts through `hash_tid2eid` and ignore the router gate.
 pub(crate) struct Dsv4MoeLayer {
     /// Contiguous per-rank group-major fused gate+up FP8 cache (w1 over w3,
-    /// row-stacked) and down cache (w2). Built once by the loader; the masked
-    /// grouped GEMM reads these directly every step.
+    /// row-stacked) and down cache (w2).
     pub w13_grouped: crate::moe::GroupedCache,
     pub w2_grouped: crate::moe::GroupedCache,
     pub num_groups: usize,
     pub hidden_dim: usize,
     pub intermediate: usize,
-    /// Router gate `[n_routed_experts, hidden]` (BF16 — the small router GEMM is
-    /// not FP8). Read by bias-routed layers; hash layers still load it (harmless).
+    /// Router gate `[n_routed_experts, hidden]` (BF16). Hash layers ignore it.
     pub gate: DeviceMatrix,
     /// Bias-routed layers only: per-expert `noaux_tc` correction `[n_routed]`.
     pub gate_bias: Option<DeviceVec>,
-    /// Hash-routed layers only: device `tid2eid` table used by the on-device
-    /// router.
+    /// Hash-routed layers only: device `tid2eid` table for the on-device router.
     pub hash_tid2eid_device: Option<CudaSlice<i64>>,
     pub routing_kind: DeepSeekV4MoeRoutingKind,
-    /// Dense shared expert FP8 caches (always-on, n_shared_experts == 1).
-    /// Both DSv4 and GLM run the FP8 DeepGEMM shared path; GLM ships F32
-    /// `weight_scale_inv` block scales which the 1D2D FP8 GEMM consumes directly.
+    /// Dense shared expert FP8 caches (always-on, n_shared_experts == 1). GLM
+    /// ships F32 `weight_scale_inv` block scales the 1D2D FP8 GEMM reads directly.
     pub shared_w13: Dsv4Fp8DeepGemmWeightCache,
     pub shared_w2: Dsv4Fp8DeepGemmWeightCache,
-    /// Decode-band grouped-GEMV lane tables (per-expert weight/scale pointer
-    /// tables + UE8M0-re-encoded scales), built lazily on first decode-band
-    /// MoE forward. `Some(None)` = build attempted and failed the lossless
-    /// UE8M0 check — the contiguous DeepGEMM lane stays the fallback.
+    /// Decode-band grouped-GEMV lane tables, built lazily on first decode-band
+    /// MoE forward. `Some(None)` = build failed the lossless UE8M0 check; the
+    /// contiguous DeepGEMM lane stays the fallback.
     pub gemv_tables: std::sync::OnceLock<Option<crate::moe::Dsv4GemvTables>>,
 }
 
 /// GLM dense-MLP layer (the first `first_k_dense_replace` layers): a plain SwiGLU
-/// FFN at `intermediate_size` (12288) replacing the routed-expert stack. GLM ships
-/// FP8 + F32 `weight_scale_inv`; the loader dequantizes to dense bf16 (the FP8
-/// DeepGEMM caches need the E8M0 `dsv4_scales` layout GLM doesn't carry). Present
-/// only on GLM dense layers; DSv4 (all-MoE) never builds this.
-///
-/// GPU-UNVERIFIABLE (pod): keeping the dense FFN in bf16 (vs FP8) trades VRAM for
-/// a simpler bring-up; the GLM dense forward consumes `gate`/`up`/`down` directly.
-///
-/// All fields are consumed by the GLM dense forward `dsv4_dense_mlp_forward`
-/// (wired via `Dsv4Layer::dense_mlp`). The `allow(dead_code)` stays because the
-/// DSv4-only build (every layer MoE) never constructs this — `dense_mlp` is
-/// `None` there — so the GLM-only fields read as dead under that config.
+/// FFN at `intermediate_size` replacing the routed-expert stack. Dequantized to
+/// bf16 at load — GLM's F32 `weight_scale_inv` lacks the E8M0 `dsv4_scales`
+/// layout the FP8 DeepGEMM caches need. `allow(dead_code)`: the DSv4-only build
+/// (every layer MoE) never constructs this.
 #[allow(dead_code)]
 pub(crate) struct Dsv4DenseMlp {
     /// Gate projection `[intermediate, hidden]` (bf16).
@@ -249,9 +197,8 @@ pub(crate) struct Dsv4DenseMlp {
     pub intermediate: usize,
 }
 
-/// One DSv4 transformer layer: hyper-connection mixers (`hc_attn`/`hc_ffn`),
-/// pre-attn / pre-ffn norms, attention, and MoE. `mode` records the attention
-/// variant (SW / CSA / HCA) the forward dispatches on.
+/// One DSv4 transformer layer. `mode` records the attention variant (SW / CSA /
+/// HCA) the forward dispatches on.
 pub(crate) struct Dsv4Layer {
     pub hc_attn: Dsv4HyperConnection,
     pub hc_ffn: Dsv4HyperConnection,
@@ -263,18 +210,14 @@ pub(crate) struct Dsv4Layer {
     pub moe: Option<Dsv4MoeLayer>,
     pub mode: DeepSeekV4AttentionMode,
     pub compress_ratio: usize,
-    /// GLM dense layers only (`config.per_layer_dense_mlp[i]`): a plain FFN that
-    /// replaces the routed-expert forward. `Some` ⇒ the forward runs `dense_mlp`
-    /// instead of `moe`. DSv4 layers leave this `None`. Consumed by the GLM dense
-    /// forward `dsv4_dense_mlp_forward`; `allow(dead_code)` stays for the
-    /// DSv4-only build, where every layer is MoE and this is always `None`.
+    /// GLM dense layers only (`config.per_layer_dense_mlp[i]`): `Some` ⇒ the
+    /// forward runs `dense_mlp` instead of `moe`. DSv4 layers leave this `None`.
     #[allow(dead_code)]
     pub dense_mlp: Option<Dsv4DenseMlp>,
 }
 
 /// One shipped DSv4 MTP draft head (`mtp.0.*`): a full transformer layer plus
-/// the DeepSeek MTP input-combine and output-head tensors. Loaded when
-/// `--spec-type mtp`/`--mtp-draft-tokens` requests MTP.
+/// the DeepSeek MTP input-combine and output-head tensors.
 pub(crate) struct Dsv4MtpLayer {
     pub layer: Dsv4Layer,
     pub head_hc: Dsv4HyperConnection,
@@ -286,21 +229,12 @@ pub(crate) struct Dsv4MtpLayer {
 }
 
 /// One stage of the DSpark spec-decode draft — a full DSv4 transformer block
-/// (`layer`: MLA attn + FP8 MoE, same body as `Dsv4MtpLayer`) plus the
-/// position-dependent extras. The draft stacks 3 such stages (`mtp.0` → `mtp.1`
-/// → `mtp.2`):
-///
-/// - `mtp.0` (entry): `main_proj` (fp8-block, F8_E4M3+F8_E8M0 like the attn
-///   `wq_a`/`wkv` projections) + `main_norm` for the 3-tap context fusion.
-/// - `mtp.{n-1}` (exit): `hc_head`, final `norm`, the low-rank Markov
-///   token-transition head (`markov_w1`/`markov_w2`), and the scalar
-///   `confidence_proj`. Output logits decode via the base model's separate
-///   `head.weight` output head (`tie_word_embeddings=false`; our loader exposes
-///   it as `model.lm_head`), NOT a draft-local or embed-tied head — the draft
-///   checkpoint ships that same `head.weight`. (codex T4.3 flagged "tie to embed"
-///   — a false positive: DSv4 has a distinct `head.weight`, verified in the index.)
-/// - middle stages: bare block, all extras `None`.
-// Fields are read only by the DSpark forward tranche (T4); inert until then.
+/// plus position-dependent extras. The draft stacks 3 stages (`mtp.0` → `mtp.2`):
+/// entry carries `main_proj` + `main_norm` for the 3-tap context fusion; exit
+/// carries `hc_head`, the final `norm`, the low-rank Markov token-transition head
+/// (`markov_w1`/`markov_w2`) and `confidence_proj`; middle stages leave all
+/// extras `None`. Logits decode through the base model's separate `head.weight`
+/// (`tie_word_embeddings=false`), not a draft-local or embed-tied head.
 #[allow(dead_code)]
 pub(crate) struct Dsv4DsparkStage {
     pub layer: Dsv4Layer,
@@ -335,10 +269,9 @@ pub(crate) struct Dsv4Model {
     /// row before the final RMSNorm + lm_head projection.
     pub head_hc: Dsv4HyperConnection,
     pub mtp: Option<Dsv4MtpLayer>,
-    /// Resolved at construction: spec decode is on when the serve config
-    /// requested `--spec-type mtp` / `--spec-type dspark`. Per-slot construction
-    /// (`Dsv4SlotState::new`) reads this so the MTP-head load and the per-slot
-    /// rollback snapshots agree on one decision.
+    /// Resolved at construction from `--spec-type mtp` / `dspark`. Per-slot
+    /// construction reads this so the MTP-head load and the per-slot rollback
+    /// snapshots agree on one decision.
     pub spec_decode_on: bool,
     pub tp: crate::tp::TpRuntime,
     #[cfg(all(feature = "cuda", feature = "nccl"))]
@@ -424,20 +357,17 @@ impl Dsv4MegaMoeTransport {
 }
 
 /// Max depth for the per-slot spec-ring snapshot. `topk` widens candidate
-/// matching only; verifier rows remain chain-shaped. `spec_depth` clamps
-/// runtime requests to this ceiling before capture.
+/// matching only; verifier rows remain chain-shaped.
 pub(crate) const MAX_SPEC_DRAFT_DEPTH: usize = 8;
-/// Bounded chain verifier rows per slot. Current MTP uses `depth + 1` rows;
-/// `topk` does not increase this count.
+/// Bounded chain verifier rows per slot. MTP uses `depth + 1`; `topk` adds none.
 pub(crate) const MAX_SPEC_VERIFY_ROWS: usize = 64;
 pub(crate) const DEFAULT_SPEC_DRAFT_DEPTH: usize = 2;
 
 pub(crate) const DEFAULT_SPEC_DRAFT_TOPK: usize = 1;
 
-/// Row schedule for one speculative verify forward. Sparse FlashMLA verifies
-/// the scheduled rows in one target pass. `ancestors` is the prefix metadata
-/// used by the batched FlashMLA sparse verify lane: row `r` attends committed
-/// KV plus the listed earlier chunk rows and self.
+/// Row schedule for one speculative verify forward. `ancestors` is the prefix
+/// metadata the batched FlashMLA sparse verify lane reads: row `r` attends
+/// committed KV plus the listed earlier chunk rows and self.
 pub(crate) struct SpecVerifySchedule {
     /// Per row: absolute position (`start_pos + node depth`).
     pub(crate) positions: Vec<usize>,
@@ -495,37 +425,28 @@ pub(crate) struct MtpDraftRow {
 pub(crate) struct Dsv4SlotState {
     attention: Vec<crate::attention::Dsv4LayerAttentionState>,
     /// Per-attention-layer one-slot snapshot of speculative-verify ring writes.
-    /// `Some` only when `model.spec_decode_on`; pre-allocated once and
-    /// index-aligned with `attention`.
+    /// `Some` only when `model.spec_decode_on`; index-aligned with `attention`.
     spec_rings: Option<Vec<crate::attention::Dsv4SpecRingSnapshot>>,
-    /// P2 commit-fold scratch: per-layer attn-normed verify rows
-    /// (`[hidden, MAX_SPEC_VERIFY_ROWS]`), persisted by the verify lane so
-    /// the commit can re-ingest the accepted prefix (compressor/indexer + ring
-    /// K) without a second full forward. `Some` only when
-    /// `model.spec_decode_on`.
+    /// Per-layer attn-normed verify rows (`[hidden, MAX_SPEC_VERIFY_ROWS]`),
+    /// persisted by the verify lane so the commit can re-ingest the accepted
+    /// prefix without a second full forward. `Some` only when spec decode is on.
     spec_normed: Option<Vec<HiddenStates>>,
-    /// Scheduled MTP verify forward workspace. The verifier runs a tiny
-    /// `depth + 1` row forward; keep the row-major layer temporaries resident so
-    /// it does not fall back to the generic prefill allocator on every layer.
+    /// Scheduled MTP verify forward workspace: row-major layer temporaries kept
+    /// resident so the tiny `depth + 1` row forward avoids the prefill allocator.
     spec_verify: Option<Dsv4SpecVerifyScratch>,
     start_pos_device: CudaSlice<i32>,
-    /// Pre-allocated NVSHMEM low-latency MoE scratch, reused across all layers +
-    /// decode steps (overwritten in place each `dsv4_moe_forward_deepep_ll`
-    /// call). `Some` only when the `deepep_ll` transport is booted. Held once per
-    /// slot — layers run sequentially so a single scratch suffices.
+    /// Pre-allocated NVSHMEM low-latency MoE scratch, overwritten in place each
+    /// `dsv4_moe_forward_deepep_ll` call. One per slot suffices — layers run
+    /// sequentially. `Some` only when the `deepep_ll` transport is booted.
     #[cfg(feature = "deepep")]
     deepep_ll_scratch: Option<crate::deepep::DeepEpLlScratch>,
     /// DSpark T3 tap buffers: the wide HC residual stream captured at each
-    /// `config.dspark_target_layer_ids` layer OUTPUT (`hidden_states[layer+1]`),
-    /// one `DeviceVec` sized for a verify block, index-aligned with the id list.
-    /// Decode writes row 0; verify writes its full batch. Empty unless DSpark.
+    /// `config.dspark_target_layer_ids` layer OUTPUT, index-aligned with the id
+    /// list. Empty unless DSpark.
     dspark_taps: Vec<DeviceVec>,
-    /// Transient multi-row prompt taps captured during a PREFILL forward
-    /// (`seq_len > 1` under `is_dspark()`): the full wide HC stream
-    /// `[stream_dim, seq_len]` per target layer, consumed once by the DSpark
-    /// prefix seed ([`crate::dsv4::dspark`]) and then dropped. Prefill-scoped and
-    /// bounded by the chunked-prefill chunk size — deliberately EXCLUDED from the
-    /// per-slot VRAM ledger (not resident at build).
+    /// Transient multi-row prompt taps captured during a PREFILL forward, consumed
+    /// once by the DSpark prefix seed. Prefill-scoped and bounded by the chunked-
+    /// prefill chunk size — deliberately EXCLUDED from the per-slot VRAM ledger.
     dspark_prompt_taps: Option<Dsv4DsparkPromptTaps>,
     seq_len: usize,
     max_seq_len: usize,
@@ -839,16 +760,14 @@ fn read_dsa(bytes: &[u8], pos: &mut usize) -> Result<Option<crate::attention::Ds
 /// Full-prompt-chunk tap capture for the DSpark prefix seed. Each buffer holds
 /// one target layer's wide HC stream `[stream_dim * rows]` token-major (column
 /// `j*hc_mult + r` at `(j*hc_mult + r) * hidden`), index-aligned with
-/// `dspark_target_layer_ids`. Transient: allocated per prefill forward, taken by
-/// the seed.
+/// `dspark_target_layer_ids`.
 pub(crate) struct Dsv4DsparkPromptTaps {
     pub(crate) bufs: Vec<DeviceVec>,
     pub(crate) rows: usize,
 }
 
 struct Dsv4SpecVerifyScratch {
-    /// Allocated row capacity ([`Dsv4Model::spec_verify_rows`]) — the ceiling
-    /// `set_rows` validates against.
+    /// Allocated row capacity — the ceiling `set_rows` validates against.
     rows: usize,
     embeddings: HiddenStates,
     initial_stream: HiddenStates,
@@ -958,17 +877,10 @@ impl Dsv4SpecVerifyLayerScratch {
 
 /// Explicit lifetime owner for DSv4 eager forward temporaries.
 ///
-/// `DeviceContext` disables cudarc's implicit event tracking so CUDA graph and
-/// copy/comm stream dependencies stay explicit. DSv4's eager decode launches a
-/// long chain of kernels over per-call buffers; without an owner that lives until
-/// the final host-sync sample, Rust can drop/reuse those allocations while the
-/// stream still has in-flight work that reads them.
-///
-/// #29's decode scratch pool now owns the small DeepGEMM/MoE temporaries that
-/// originally needed this bridge. Leave the deep-copy keepalive as an explicit
-/// diagnostic fallback only: `CudaSlice::clone()` is a device-to-device copy,
-/// not a cheap handle clone, so enabling it in production reintroduces tens of
-/// thousands of D2D API calls per decode window.
+/// `DeviceContext` disables cudarc's implicit event tracking, so without an owner
+/// living until the final host-sync sample, Rust can drop and reuse allocations
+/// the stream still reads. Default-off: `CudaSlice::clone()` is a device-to-device
+/// copy, so enabling it adds tens of thousands of D2D calls per decode window.
 pub(crate) struct Dsv4ForwardKeepalive {
     active: bool,
     bf16: Vec<CudaSlice<half::bf16>>,
@@ -1037,9 +949,6 @@ impl Dsv4ForwardKeepalive {
         self.u8.push(value.clone());
     }
 
-    /// Legacy deep-copy fallback for small device-router buffers. Default-off:
-    /// #29's persistent scratch owns the decode buffers, and `CudaSlice::clone`
-    /// would otherwise add a D2D copy for each retained slice.
     pub(crate) fn keep_route_hidden(&mut self, value: &HiddenStates) {
         if !self.active {
             return;
@@ -1119,8 +1028,6 @@ impl Dsv4SlotState {
                 )
             })
             .collect::<Result<Vec<_>>>()?;
-        // Pre-allocate the per-layer spec-ring snapshot when spec decode is on.
-        // No per-step allocation; capture/restore only copies into these buffers.
         let spec_rings = model
             .spec_decode_on
             .then(|| {
@@ -1137,7 +1044,6 @@ impl Dsv4SlotState {
                     .collect::<Result<Vec<_>>>()
             })
             .transpose()?;
-        // P2 commit-fold scratch: per-layer persisted verify rows.
         let spec_normed = model
             .spec_decode_on
             .then(|| {
@@ -1165,9 +1071,7 @@ impl Dsv4SlotState {
             .stream
             .alloc_zeros::<i32>(1)
             .map_err(|e| anyhow!("DSv4 slot start_pos device scalar alloc failed: {e}"))?;
-        // Pre-allocate the LL MoE scratch ONCE when the deepep_ll transport is
-        // booted. `intermediate` is uniform across layers (all share the MoE
-        // config), so layer 0's value sizes the SwiGLU/w2 stages.
+        // `intermediate` is uniform across layers, so layer 0's value sizes it.
         #[cfg(feature = "deepep")]
         let deepep_ll_scratch = match model.deepep.as_ref() {
             Some(transport) if transport.is_low_latency() => {
@@ -1180,8 +1084,6 @@ impl Dsv4SlotState {
             }
             _ => None,
         };
-        // DSpark tap buffers: one verify-block capture per target layer.
-        // Empty (no alloc) unless this is a DSpark checkpoint.
         let dspark_taps = if model.config.is_dspark() {
             let stream_dim = model.config.hidden_size * model.config.hc_mult;
             let rows = model.config.dspark_block_size + 1;
@@ -1209,20 +1111,15 @@ impl Dsv4SlotState {
         })
     }
 
-    /// Exact requested device bytes owned by this ONE slot: the per-layer
-    /// attention states + the per-layer spec-ring snapshots + the per-layer
-    /// spec-normed commit-fold scratch + the `start_pos_device` scalar.
-    ///
-    /// EXCLUDED (and why):
-    /// - `deepep_ll_scratch`: lives behind `#[cfg(feature = "deepep")]` and is
-    ///   only `Some` when the NVSHMEM LL transport is booted; sized off-band.
+    /// Exact requested device bytes owned by this ONE slot. EXCLUDES
+    /// `deepep_ll_scratch`: only `Some` when the NVSHMEM LL transport is booted,
+    /// and sized off-band.
     pub(crate) fn device_bytes(&self) -> usize {
         self.device_bytes_breakdown().iter().map(|(_, b)| *b).sum()
     }
 
-    /// Per-component byte breakdown for the VRAM ledger log. The per-layer
-    /// `attention` Vec collapses to one summed entry (40+ layers); the spec
-    /// scratches are itemized.
+    /// Per-component byte breakdown for the VRAM ledger log; the per-layer
+    /// `attention` Vec collapses to one summed entry.
     #[allow(dead_code)]
     pub(crate) fn device_bytes_breakdown(&self) -> Vec<(&'static str, usize)> {
         let attention_bytes: usize = self.attention.iter().map(|s| s.device_bytes()).sum();
@@ -1256,26 +1153,22 @@ impl Dsv4SlotState {
         ]
     }
 
-    /// DSpark T3: wide-stream taps captured at `config.dspark_target_layer_ids`
-    /// (index-aligned), empty off the DSpark path. The T4 draft reads these to
-    /// build its fused context; unused until then.
+    /// DSpark T3 wide-stream taps, index-aligned with
+    /// `config.dspark_target_layer_ids`. Empty off the DSpark path.
     #[allow(dead_code)]
     pub(crate) fn dspark_taps(&self) -> &[DeviceVec] {
         &self.dspark_taps
     }
 
     /// Take the transient prompt-chunk taps captured by the last prefill forward
-    /// (`None` off the DSpark path or when the forward was single-row). Consumed
-    /// once by the DSpark prefix seed.
+    /// (`None` off the DSpark path or when it was single-row). Consumed once.
     #[allow(dead_code)]
     pub(crate) fn take_dspark_prompt_taps(&mut self) -> Option<Dsv4DsparkPromptTaps> {
         self.dspark_prompt_taps.take()
     }
 
-    /// Sub-struct byte totals summed across ALL attention layers (sw_window /
-    /// compressor / indexer / flashmla / fused_wqkv / dsa_official). The
-    /// [vram-ledger] uses this to attribute the per-slot `attention(per-layer)`
-    /// bulk to the exact buffer family — every bit's source named.
+    /// Sub-struct byte totals summed across ALL attention layers, so the VRAM
+    /// ledger can attribute the per-slot `attention(per-layer)` bulk by family.
     #[allow(dead_code)]
     pub(crate) fn attention_breakdown_total(&self) -> Vec<(&'static str, usize)> {
         let mut totals: std::collections::BTreeMap<&'static str, usize> =
@@ -1362,11 +1255,8 @@ impl Dsv4SlotState {
     }
 
     /// Re-sync every layer's FlashMLA device page table from the host pool.
-    /// Called whenever the adapter reports the slot's host band changed —
-    /// dirty-bit driven, prefill AND decode (see
-    /// `Dsv4KvAdapter::take_device_table_dirty`); host tables carry only real
-    /// pages, padding to the fixed device size happens in
-    /// [`crate::attention::Dsv4LayerAttentionState::refresh_flashmla_device_page_table`].
+    /// Dirty-bit driven (prefill AND decode); host tables carry only real pages,
+    /// padding to the fixed device size happens per layer.
     pub(crate) fn refresh_flashmla_device_page_tables(
         &mut self,
         ctx: &DeviceContext,
@@ -1380,11 +1270,10 @@ impl Dsv4SlotState {
     }
 
     /// D2H one completed host page's state across every layer into a
-    /// content-keyed pool entry (#154 Phase 2 publish hook). `boundary` = the
-    /// forward ended exactly at this page's end (the only moment the page-end
-    /// overlap registers + ring are observable). The D2H clones are
-    /// stream-ordered; the CALLER syncs once after all pages of the tick
-    /// before reading any entry (one sync per tick, not per page).
+    /// content-keyed pool entry. `boundary` = the forward ended exactly at this
+    /// page's end (the only moment the page-end overlap registers + ring are
+    /// observable). The D2H clones are stream-ordered; the CALLER syncs once
+    /// after all pages of the tick, not per page.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn capture_prefix_page(
         &self,
@@ -1428,11 +1317,10 @@ impl Dsv4SlotState {
         })
     }
 
-    /// Capture the finish frontier page (`--dsv4-decode-reuse`): the frontier
-    /// page's own content + carry (boundary) PLUS the sub-page tail the radix
-    /// match can't cover (`[matched_len, finish_len)`). `page_index =
-    /// matched_len/page_tokens − 1`; the whole carry reflects `finish_len`
-    /// because capture runs after the finish forward.
+    /// Capture the finish frontier page: the frontier page's own content + carry
+    /// PLUS the sub-page tail the radix match can't cover (`[matched_len,
+    /// finish_len)`). The whole carry reflects `finish_len` because capture runs
+    /// after the finish forward.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn capture_frontier_page(
         &self,
@@ -1489,10 +1377,8 @@ impl Dsv4SlotState {
     }
 
     /// Restore a cross-request prefix into this slot from content-keyed pool
-    /// entries (#154 Phase 2 read hook). `entries[k]` is host page k's state;
-    /// the last entry must carry the boundary sections. The caller has already
-    /// mirrored the identity band (`Dsv4KvAdapter::mirror_full_band`), which
-    /// also set the band cursor and the device-table dirty bit.
+    /// entries. `entries[k]` is host page k's state; the last must carry the
+    /// boundary sections. The caller has already mirrored the identity band.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn restore_prefix_state(
         &mut self,
@@ -1563,8 +1449,7 @@ impl Dsv4SlotState {
             }
         }
         // Frontier tail: the sub-page leftover the last matched page's own rows
-        // don't cover. A no-op when finish_len == matched_len (aligned finish /
-        // plain restore) — every tail section is then empty.
+        // don't cover. A no-op when finish_len == matched_len.
         if let Some(frontier) = entries.last() {
             for (idx, (state, layer_state)) in
                 self.attention.iter_mut().zip(&frontier.layers).enumerate()
@@ -1610,7 +1495,6 @@ impl Dsv4SlotState {
         self.seq_len = new_len;
         for (layer_idx, (layer, state)) in layers.iter().zip(&mut self.attention).enumerate() {
             state.truncate_decode_len(layer.mode, layer.compress_ratio, new_len);
-            // H2: clamp the FlashMLA pool cursor in lockstep (see flashmla_truncate_slot).
             if let Some(slot_idx) = state.flashmla_slot_idx() {
                 kv_adapter
                     .layer_mut(layer_idx)?
@@ -1727,9 +1611,8 @@ impl Dsv4Model {
     }
 
     /// Per-forward owned-token cap when the deepep_ll MoE transport is booted
-    /// (`None` for allreduce / intranode / non-deepep builds → unbounded). Core
-    /// caps decode_rows + prefill chunk tokens to this so the LL dispatch buffer
-    /// is never overrun.
+    /// (`None` ⇒ unbounded). Core caps decode rows + prefill chunk tokens to this
+    /// so the LL dispatch buffer is never overrun.
     pub(crate) fn max_tokens_per_step(&self) -> Option<usize> {
         #[cfg(all(feature = "cuda", feature = "nccl"))]
         if let Some(mega_moe) = &self.mega_moe {
@@ -1874,9 +1757,8 @@ impl Dsv4Model {
     }
 
     /// Commit the accepted prefix (`accepted_rows` = verify row indices in
-    /// schedule order, root first) from the persisted verify rows — per layer:
-    /// compressor/indexer re-ingestion + ring K re-derivation — then advance the
-    /// slot length. Caller order: truncate → rejected-tail restore → THIS.
+    /// schedule order, root first) from the persisted verify rows, then advance
+    /// the slot length. Caller order: truncate → rejected-tail restore → THIS.
     pub(crate) fn commit_accepted_fold<I>(
         &self,
         slot: &mut Dsv4SlotState,
@@ -1891,7 +1773,6 @@ impl Dsv4Model {
         ensure!(m > 0, "DSv4 commit fold needs at least the pending row");
         let hidden_size = self.config.hidden_size;
         let mut keepalive = Dsv4ForwardKeepalive::new(false);
-        // Gather scratch reused across layers.
         // SAFETY: uninit device scratch; fully written before first read.
         let mut gathered = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, m)? };
         keepalive.keep_hidden(&gathered);
@@ -1933,11 +1814,9 @@ impl Dsv4Model {
         }
         std::hint::black_box(keepalive.len());
         drop(keepalive);
-        // H2: advance the FlashMLA pool cursor by the committed token count so
-        // `pool.seq_len(slot) == start_pos + m` matches `slot.seq_len` — the next
-        // decode tick's prepare_kv_batch validates `pool.seq_len == append_pos`.
-        // commit_layer_fold packs the accepted ring positions but does NOT draw
-        // pool tokens; the prior truncate rolled the cursor back to start_pos.
+        // Advance the FlashMLA pool cursor by the committed token count so
+        // `pool.seq_len(slot) == start_pos + m`: the next decode tick validates
+        // it against `append_pos`. commit_layer_fold draws no pool tokens.
         for (layer_idx, state) in slot.attention.iter().enumerate() {
             if let Some(slot_idx) = state.flashmla_slot_idx() {
                 kv_adapter
@@ -1953,11 +1832,8 @@ impl Dsv4Model {
     /// returning the next greedy/sampled token.
     ///
     /// The residual is the `hidden_size * hc_mult`-wide hyper-connection STREAM,
-    /// not a plain hidden vector. Per layer the flow is:
-    ///   `gen_mhc(hc_attn) → hc_pre → attn_norm → mla_attention → hc_post`
-    ///   (+TP all-reduce of the O-LoRA partials) then the same wrap around
-    ///   `ffn_norm → dsv4_moe_forward` via `hc_ffn`. The head HC then folds the
-    ///   wide stream to one hidden row before the final RMSNorm + lm_head + sample.
+    /// not a plain hidden vector; the head HC folds it to one hidden row before
+    /// the final RMSNorm + lm_head + sample.
     pub(crate) fn forward_tokens(
         &self,
         slot: &mut Dsv4SlotState,
@@ -2022,9 +1898,8 @@ impl Dsv4Model {
         Ok(token)
     }
 
-    /// Commit/selftest forward for a contiguous token prefix. This is not the
-    /// frozen MTP verifier: it writes the slot KV state like a normal forward and
-    /// returns the per-row logits/hidden view used by verify-forward selftests.
+    /// Commit/selftest forward for a contiguous token prefix. Not the frozen MTP
+    /// verifier: it writes the slot KV state like a normal forward.
     pub(crate) fn forward_tokens_verify(
         &self,
         slot: &mut Dsv4SlotState,
@@ -2090,7 +1965,8 @@ impl Dsv4Model {
         for (i, row) in rows.enumerate() {
             if self.config.is_glm() {
                 // GLM: head hidden = stream row (stream_dim==hidden, no head HC mixer).
-                // ponytail: pod-verify GLM hc_mult==1 head hidden = stream row (identity)
+                // ponytail: pod-verify GLM hc_mult==1 head hidden = stream row
+                // (identity)
                 crate::ops::copy_row_to_vec(&self.ctx, stream, row, &mut last_hidden)?;
             } else {
                 crate::hc::head_hidden_from_stream(
@@ -2137,10 +2013,8 @@ impl Dsv4Model {
     }
 
     /// Verify `tokens` in ONE scheduled sparse forward under `sched`'s per-row
-    /// positions. MTP schedules are chain-shaped (`depth + 1` rows), so this path
-    /// requires at least two rows and never falls back to a plain single-token
-    /// forward. Ordinary non-spec decode uses `forward_tokens_verify` /
-    /// `forward_tokens` instead.
+    /// positions. MTP schedules are chain-shaped (`depth + 1` rows), so this
+    /// requires at least two rows.
     pub(crate) fn forward_tokens_verify_scheduled(
         &self,
         slot: &mut Dsv4SlotState,
@@ -2165,11 +2039,8 @@ impl Dsv4Model {
             sched.ancestors.len(),
             tokens.len()
         );
-        // ONE scheduled sparse verify forward. `hiddens[j]` = row j's MTP
-        // stream; `argmax[j]` = the target's argmax AFTER `tokens[j]` (so
-        // `argmax[i]` is exactly what an accepted child of node i must equal).
-        // Attention uses the frozen sparse verify lane and does not commit slot
-        // KV state.
+        // `hiddens[j]` = row j's MTP stream; `argmax[j]` = the target's argmax
+        // AFTER `tokens[j]`. The frozen sparse verify lane commits no slot KV.
         let stream_dim = self.config.hidden_size * self.config.hc_mult;
         let seq_len = tokens.len();
         let was_frozen = crate::attention::dsv4_verify_frozen();
@@ -2208,15 +2079,12 @@ impl Dsv4Model {
         result
     }
 
-    /// Layer-major batched decode over N independent slots (one decode token each).
-    ///
-    /// Each row `r` decodes slot `slot_ids[r]` at `start_positions[r]`. The
-    /// point-wise pipeline (embed / HC wrap / rms_norm / MoE / shared expert /
-    /// all-reduce) runs over the whole `seq_len = N` batch exactly as the prefill
-    /// path does — those ops are token-independent, so stacking N rows is
-    /// math-identical to N separate single-row forwards. For MODEL1 B>1, the
-    /// attention lane is the canonical batched FlashMLA sparse decode path; B=1
-    /// stays on the single-row reference path. Returns one sampled token per row.
+    /// Layer-major batched decode over N independent slots (one decode token
+    /// each). Row `r` decodes slot `slot_ids[r]` at `start_positions[r]`. The
+    /// point-wise pipeline runs over the whole `seq_len = N` batch — those ops are
+    /// token-independent, so stacking N rows is math-identical to N single-row
+    /// forwards. B>1 uses the batched FlashMLA sparse decode lane; B=1 stays on
+    /// the single-row path.
     pub(crate) fn forward_decode_batch(
         &self,
         slots: &mut [Dsv4SlotState],
@@ -2287,14 +2155,9 @@ impl Dsv4Model {
     ) -> Result<(HiddenStates, Dsv4ForwardKeepalive)> {
         let n = slot_ids.len();
         let mega_epoch = self.begin_mega_moe_forward(n)?;
-        // Per-GEMV breakdown for this decode step (self-gates on
-        // ARLE_DSV4_LINEAR_PROFILE; no-op otherwise). Reset here + print after the
-        // print scopes the stats to ONE decode forward, exposing which linear
-        // (compressor_wkv/wgate, indexer_wq_b/weights, …) dominates compidx. The
-        // batched-compressor pre-pass is default-on (P1a/P1b + prepass, since
-        // 2026-06-26); this profiler measures its residual per-GEMV cost —
-        // pending-remote on TP=4. NOTE: when enabled the profiler syncs per call,
-        // inflating absolute step ms; read it for the RELATIVE per-GEMV split.
+        // Scopes the per-GEMV stats to ONE decode forward (self-gates on
+        // ARLE_DSV4_LINEAR_PROFILE). When enabled it syncs per call, inflating
+        // absolute step ms — read it for the RELATIVE per-GEMV split.
         crate::linear_profile::reset();
         for r in 0..n {
             let slot = &slots[slot_ids[r]];
@@ -2322,19 +2185,16 @@ impl Dsv4Model {
         let stream_dim = hidden_size * hc_mult;
         let seq_len = n; // batch dimension: N independent decode rows
         let eps = self.config.rms_norm_eps;
-        // capture only when the caller (spec anchor) consumes taps, not on
-        // is_dspark() alone — plain decode never reads them.
+        // capture only when the caller consumes taps; plain decode never reads them.
         let dspark = capture_taps && self.config.is_dspark();
         let use_deepep_transport = crate::runtime_flags::dsv4_moe_transport()?.is_deepep();
-        // N>1: mirror the prefill keepalive discipline (the per-token decode
-        // scratch / comm-overlap fast paths are seq_len==1 only).
+        // N>1: the per-token decode scratch / comm-overlap fast paths are seq_len==1
+        // only.
         let mut keepalive = Dsv4ForwardKeepalive::new(false);
         let ctx = &self.ctx;
 
-        // Batched (b=N) FlashMLA decode lane (#60, the #1 concurrency lever).
-        // B>1 uses this as the canonical path when the model-wide batched
-        // scratch exists (both MODEL1 and V32/GLM). N=1 never reaches this
-        // function.
+        // Batched (b=N) FlashMLA decode lane; canonical for B>1 when the
+        // model-wide batched scratch exists. N=1 never reaches this function.
         let batched_attn_lane = crate::attention::dsv4_flashmla_decode_enabled()?
             && kv_adapter.has_flashmla_batch_scratch();
 
@@ -2370,24 +2230,18 @@ impl Dsv4Model {
         keepalive.keep_hidden(&stream);
 
         // Reusable [hidden,1] scratch for the per-row attention copy-in/out.
-        // Declared once (lives to function return → stream-ordered free, like the
-        // single-row intermediates); reuse across rows/layers is safe because all
-        // ops run on `ctx.stream` (WAR/RAW resolved by stream ordering).
+        // Reuse across rows/layers is safe because all ops run on `ctx.stream`
+        // (WAR/RAW resolved by stream ordering).
         // SAFETY: fully written by the copy-in / mla_attention each row before read.
         let mut normed_row = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, 1)? };
         // SAFETY: uninit device scratch; fully written before first read.
         let mut attn_out_row = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, 1)? };
         keepalive.keep_hidden(&normed_row);
         keepalive.keep_hidden(&attn_out_row);
-        // MoE/shared are now grouped over [N] (Phase 6a) — no per-row MoE scratch.
 
-        // PHASE C (#60): contiguous [N] absolute-position array for the batched
-        // projection pre-pass RoPE (`positions[token]` = each row's
-        // start_positions[r]). The per-slot scalar `slot.start_pos_device`
-        // buffers above stay for the per-row compressor/pack/finish; this is the
-        // packed form the batched RoPE kernel reads. Uploaded once, reused every
-        // layer (positions are fixed across the layer loop). Only allocated when
-        // the batched lane is engaged.
+        // Contiguous [N] absolute-position array for the batched projection
+        // pre-pass RoPE. Uploaded once, reused every layer (positions are fixed
+        // across the layer loop). Only allocated on the batched lane.
         let batched_positions = if batched_attn_lane {
             let positions_host: Vec<i32> = (0..n)
                 .map(|r| {
@@ -2401,19 +2255,14 @@ impl Dsv4Model {
         } else {
             None
         };
-        // Per-row [*, 1] scratch for the batched projection slice copy-in (each
-        // row's c_q_normed / q_prepared / k_prepared sliced out of the batched
-        // pre-pass output before the per-slot compressor/pack consume it).
-        // Declared once, reused across rows/layers (WAR resolved by stream
-        // order, like normed_row). Only allocated when the batched lane runs.
+        // Per-row [*, 1] scratch for the batched projection slice copy-in.
+        // Reused across rows/layers (WAR resolved by stream order).
         let local_width = self.layers[0].attention.wq_b.rows;
         let q_lora_rank = self.config.q_lora_rank;
         let mla_head_dim = self.config.head_dim;
         // Reused per-row [q_lora_rank, 1] scratch for this row's batched
-        // c_q_normed slice (read by reference for the CSA indexer query proj).
-        // q_prepared / k_prepared rows are copied into fresh OWNED buffers inside
-        // the loop (taken by value into Dsv4MlaPrepared), so only c_q needs the
-        // reused scratch. Only allocated when the batched lane runs.
+        // c_q_normed slice. q_prepared / k_prepared rows go into fresh OWNED
+        // buffers instead (taken by value into Dsv4MlaPrepared).
         let mut c_q_normed_row = if batched_attn_lane {
             // SAFETY: fully written by the per-row slice copy-in before read.
             let cq = unsafe { HiddenStates::uninit(&self.ctx, q_lora_rank, 1)? };
@@ -2426,12 +2275,9 @@ impl Dsv4Model {
         };
 
         // FINISH F1 batched destination: ONE contiguous token-major
-        // `[n, local_width]` buffer for `slice_out_batched` (replaces N per-row
-        // `slice_out_row` calls). Reused across layers (each layer overwrites all
-        // n rows before the finish reads them; WAR resolved by stream order).
-        // local_width is uniform across DSv4 layers (all wq_b.rows equal), so
-        // layer 0's value sizes it for every layer. Only allocated on the batched
-        // lane. Held in keepalive (premature-free hazard under disabled events).
+        // `[n, local_width]` buffer for `slice_out_batched`, reused across layers.
+        // local_width is uniform across DSv4 layers. Held in keepalive
+        // (premature-free hazard under disabled events).
         let mut local_attn_batched = if batched_attn_lane {
             // SAFETY: every [r*local_width, (r+1)*local_width) span is written by
             // slice_out_batched before the finish kernels / O-LoRA read it.
@@ -2442,30 +2288,20 @@ impl Dsv4Model {
             // SAFETY: zero-size placeholder; never read.
             unsafe { HiddenStates::uninit(&self.ctx, 0, 1)? }
         };
-        // Full-flatten is canonical for MODEL1 B>1 decode. Per layer it batches
-        // compressor state update (where a compressor exists), inverse-RoPE, and
-        // SW-window write into one launch over N rows. SparseIndexed has no main
-        // compressor and is explicitly excluded below.
-        // Holds the host-uploaded per-row device-pointer ARRAYS for the batched
-        // compressor/finish kernels alive to function return (the N>1 keepalive is
-        // inert; pointer arrays must outlive their kernel launch under the
-        // disabled-event-tracking premature-free hazard). Only pushed when
-        // `full_flatten` is on.
+        // Full-flatten batches compressor state update, inverse-RoPE and SW-window
+        // write into one launch over N rows; SparseIndexed has no main compressor
+        // and is excluded below. `ptr_keepalive` holds the host-uploaded per-row
+        // device-pointer ARRAYS past their kernel launch (the N>1 keepalive is
+        // inert; premature-free hazard under disabled event tracking).
         let mut ptr_keepalive: Vec<CudaSlice<u64>> = Vec::new();
-        // Op "c" batched pack: the per-slot device page tables feeding the batched
-        // pack's pointer array. Held to function return (same premature-free guard
-        // as `ptr_keepalive`; the inert N>1 `keep_i32` would not retain them).
-        let mut pack_pt_keepalive: Vec<CudaSlice<i32>> = Vec::new();
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             let full_flatten = layer.mode != DeepSeekV4AttentionMode::SparseIndexed;
 
-            // ── Attention half: HC params + pre + norm over the whole [N] batch.
-            // GLM (hc_mult==1): no hyper-connection; the stream IS the hidden, so
-            // the pre-mixer is identity. Replace the mhc pre+norm with a plain
-            // RMSNorm of the stream (the C identity placeholders are 1x1 ZERO
-            // mixers — running them through gen_mhc/mhc_pre would zero the stream).
-            // ponytail: pod-verify GLM hc_mult==1 plain residual + identity stream (no hyper-connection)
+            // GLM (hc_mult==1): the C identity placeholders are 1x1 ZERO mixers,
+            // so run a plain RMSNorm — gen_mhc/mhc_pre would zero the stream.
+            // ponytail: pod-verify GLM hc_mult==1 plain residual + identity stream (no
+            // hyper-connection)
             // SAFETY: uninit device scratch; fully written before first read.
             let mut normed = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
             let attn_mhc = if self.config.is_glm() {
@@ -2496,7 +2332,8 @@ impl Dsv4Model {
                 keepalive.keep_f32(&mhc.pre);
                 keepalive.keep_f32(&mhc.post);
                 keepalive.keep_f32(&mhc.comb);
-                // SAFETY: fused hc_pre+rms_norm writes the full [seq_len, hidden_size] buffer.
+                // SAFETY: fused hc_pre+rms_norm writes the full [seq_len, hidden_size]
+                // buffer.
                 crate::profile::profile_op(
                     ctx,
                     "attn_hc_pre_norm",
@@ -2519,81 +2356,53 @@ impl Dsv4Model {
             };
             keepalive.keep_hidden(&normed);
 
-            // ── Attention: per-row independent single-token MLA into row r.
             // SAFETY: every [r*hidden, (r+1)*hidden) span of attn_out is written by
             // the copy-out below before attn_out is read by hc_post.
             let mut attn_out = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
-            // PHASE B (#60): the batched FlashMLA decode lane. For a batched-
-            // eligible layer (FlashMLA decode on, ALL modes) the per-row FlashMLA
-            // KERNEL launch is replaced by ONE `sparse_decode_fwd(b=N)`:
-            //   1. per row: PREPARE (wq/wkv+RoPE, compressor, CSA indexer top-k
-            //      `selected`) → pack KV into the shared pool → gather this row's
-            //      global-head Q into q_batched[r]; for CSA also gather this row's
-            //      `selected` into selected_batched[r];
-            //   2. build_layer_batch_meta(b=N) (indices/sched_meta; CSA feeds the
-            //      gathered `selected` ptr) → ONE batched fwd;
-            //   3. per row: slice the global-head output → local_attn → inverse-rope
-            //      + SW-window update (the cheap per-row tail) → O-LoRA into attn_out[r].
-            // The prepare/pack/finish/oproj loops stay per-row (cheap); only the
+            // Batched FlashMLA decode lane: per row PREPARE (wq/wkv+RoPE,
+            // compressor, CSA indexer top-k) → pack KV → gather Q; then ONE
+            // `sparse_decode_fwd(b=N)`; then the per-row finish tail. Only the
             // attention kernel is batched (the 74k tiny gridX=1 launches).
-            // Non-batched (FlashMLA
-            // decode off) layers fall through to the per-row `mla_attention` loop,
-            // byte-unchanged. SW/HCA index builds are byte-identical (selected_ptr
-            // stays 0); only CSA passes the gathered per-row top-k.
+            // SW/HCA pass selected_ptr=0; CSA passes the gathered per-row top-k.
             let use_batched_kernel = batched_attn_lane;
             if use_batched_kernel {
-                // CSA (cr 1..=15) and HCA (cr≥16) both pack + attend a separate
-                // compressed pool. GLM SparseIndexed has NO main compressor — it
-                // attends the full latent via the FlashMLA KV pool (no separate
-                // compressed pool), so it must NOT request the compressed pack
-                // (flashmla_pack_borrow(true) fetches state.compressor == None and
-                // would error). Gate on has_compressor() so SparseIndexed packs only
-                // SW + current. Byte-identical for SW/HCA/CSA.
+                // GLM SparseIndexed has NO main compressor — it attends the full
+                // latent via the FlashMLA KV pool, so it must NOT request the
+                // compressed pack (`flashmla_pack_borrow(true)` would error).
                 let want_compressed = layer.mode.has_compressor();
-                // CSA + GLM SparseIndexed both run the indexer top-k select. The
-                // batched-decode DSA select lane widens to has_indexer() so GLM
-                // shares it; CSA-only compressor-batch / full-flatten paths below
-                // stay gated on CompressedSparse (SparseIndexed has no compressor).
-                // ponytail: pod-verify SparseIndexed batched-decode DSA select lane end-to-end
+                // CSA + GLM SparseIndexed both run the indexer top-k select; the
+                // CSA-only compressor / full-flatten paths below stay gated on
+                // CompressedSparse.
+                // ponytail: pod-verify SparseIndexed batched-decode DSA select lane
+                // end-to-end
                 let runs_indexer = layer.mode.has_indexer();
-                // BATCHED CSA-SELECT (#60): when this CSA layer runs on the
-                // official DSA path AND the shared scratch is present, defer the
-                // per-row READ (paged-MQA logits + topk) into ONE batch_size=N
-                // call after the prepare loop. The per-row CACHE WRITES still run
-                // inside the prepare loop. When off (non-official DSA, or scratch
-                // absent), the existing per-row `csa_select_official` +
-                // `gather_selected_row` path runs byte-identically.
+                // Defer the per-row READ (paged-MQA logits + topk) into ONE
+                // batch_size=N call after the prepare loop; the per-row CACHE
+                // WRITES still run inside it.
                 let use_batched_dsa_select = runs_indexer
                     && kv_adapter
                         .layer_dsa_and_flashmla_batch_mut(layer_idx)?
                         .1
                         .is_some();
-                // N-row staging for the batched CSA select. CompressedSparse uses the
-                // batched indexer-query prepass output directly; lanes without that
-                // prepass (SparseIndexed) stage per-row q_i/weights here.
+                // N-row staging for the batched CSA select. CompressedSparse uses
+                // the batched indexer-query prepass output; SparseIndexed stages
+                // per-row q_i/weights here.
                 let mut dsa_stage_q_i: Option<HiddenStates> = None;
                 let mut dsa_stage_weights: Option<HiddenStates> = None;
                 let mut dsa_key_counts =
                     use_batched_dsa_select.then(|| Vec::<i32>::with_capacity(n));
-                // ── 1. per-row PREPARE + pack + Q-gather.
                 let mut prepared: Vec<crate::attention::Dsv4MlaPrepared> = Vec::with_capacity(n);
                 let mut slot_block_offsets = Vec::with_capacity(n);
                 let mut page_tables = Vec::with_capacity(n);
-                // ── 0. Batched (m=N) slot-INDEPENDENT projection pre-pass
-                // (#60 PHASE C): wq_a / wkv / wq_b + RoPE over all N rows at once
-                // (weights read ONCE across the N-token grid), replacing the N
-                // per-row m=1 projection GEMVs that dominated PREPARE. The per-row
-                // loop below then reads each row's SLICE of these batched outputs
-                // for the per-slot compressor / pack / gather — no per-row
-                // projection recompute. Touches no slot state.
+                // Batched (m=N) slot-INDEPENDENT projection pre-pass: wq_a / wkv /
+                // wq_b + RoPE over all N rows at once (weights read ONCE across
+                // the N-token grid). The per-row loop below reads each row's SLICE.
                 let positions = batched_positions.as_ref().ok_or_else(|| {
                     anyhow!("DSv4 batched decode lane: batched positions buffer missing")
                 })?;
                 // Borrow the model-wide shared FP8 prefill DeepGEMM scratch for the
-                // batched (m=N) projection. `None` when DeepGEMM is disabled — the
-                // pre-pass then takes its scalar fallback. This borrow is scoped to
-                // the pre-pass and released before the per-row loop re-borrows the
-                // pool / batch scratch via the same accessor.
+                // batched (m=N) projection; `None` ⇒ scalar fallback. Scoped to the
+                // pre-pass and released before the per-row loop re-borrows.
                 let proj = {
                     let (_layer_pool, _dsa, _flash_batch, _flashmla_scratch, prefill_shared) =
                         kv_adapter.layer_dsa_and_flashmla_batch_mut(layer_idx)?;
@@ -2608,23 +2417,14 @@ impl Dsv4Model {
                         &mut keepalive,
                     )?
                 };
-                // ── 0b. Batched (m=N) compressor/indexer projection pre-pass. The
-                // per-row m=1 `compressor_forward` wkv/wgate GEMVs re-read the full
-                // weight per decode row; batch them over the same `normed` batch the
-                // proj pre-pass used. Each row then reads its `[width,1]` column slice
-                // below unless full-flatten consumes the batched outputs directly.
+                // Batched (m=N) compressor/indexer key + query projections: the
+                // per-row m=1 GEMVs re-read the full weight per decode row.
                 // Touches NO slot state.
-                // Batched (m=N) compressor/indexer key + query projections, routing
-                // FP8 weights through tensor-core DeepGEMM via the shared prefill
-                // scratch (same accessor as the proj pre-pass; one borrow for all).
                 let (compressor_kv_score, indexer_kv_score, indexer_query_kv_score) = {
                     let (_lp, _dsa, _fb, _fs, mut prefill_shared) =
                         kv_adapter.layer_dsa_and_flashmla_batch_mut(layer_idx)?;
-                    // Decode multi-stream overlap (Aux-stream fork of this prepass)
-                    // was KILLed 2026-07-06: pod A/B at n=8 (above its own
-                    // activation threshold) showed a ~9% wall-clock REGRESSION
-                    // (9.65s -> 10.53s mean, zero overlap across 6 trials) — see
-                    // docs/experience/wins/2026-07-06-dsv4-decode-multistream-overlap-pending-remote.md.
+                    // Aux-stream fork of this prepass was killed: pod A/B at n=8
+                    // regressed ~9% wall-clock (9.65s -> 10.53s, zero overlap).
                     let main = match layer.attention.compressor.as_ref() {
                         Some(c) => crate::attention::compressor_batch_prepass(
                             &self.ctx,
@@ -2664,17 +2464,12 @@ impl Dsv4Model {
                     };
                     (main, indexer, query)
                 };
-                // ── 0c. Full-flatten P1a: per-row compressor
-                // STATE-update DEFER (gather each row's ring-state pointers + advance
-                // compressed.seq_len, NO per-row FFI) → ONE
-                // `dsv4_compressor_update_batched` over all N rows (main + indexer),
-                // reading the batched prepass outputs directly. This replaces the N
-                // per-row `dsv4_compressor_update_*` launches (the remaining ∝n
-                // `perrow`). The batched update runs BEFORE the P1b loop's per-row
-                // consumers (pack reads main `compressed`; csa cache-write reads
-                // indexer `compressed`), so they see the written keys. `indexer_rows_before`
-                // is captured per row here (P1a advances seq_len) and handed to P1b's
-                // CSA path. SparseIndexed skips this path because it has no compressor.
+                // Full-flatten P1a: defer each row's compressor STATE update
+                // (gather ring-state pointers + advance compressed.seq_len, no
+                // per-row FFI) into ONE `dsv4_compressor_update_batched`. Runs
+                // BEFORE P1b's consumers so they see the written keys.
+                // `indexer_rows_before` is captured per row here since P1a advances
+                // seq_len. SparseIndexed has no compressor and skips this.
                 let indexer_rows_before: Vec<usize> = if full_flatten {
                     let mut main_sink = crate::attention::Dsv4CompressorBatchPtrs::with_capacity(n);
                     let mut indexer_sink =
@@ -2682,12 +2477,9 @@ impl Dsv4Model {
                     let mut before = Vec::with_capacity(n);
                     let original_seq_len = proj.original_seq_len;
                     for r in 0..n {
-                        // Defer mode reads NO `normed_row` data (the projection was
-                        // already batched in the prepass; defer only gathers state
-                        // pointers + advances seq_len), so the per-row copy-in is
-                        // skipped. `normed_row` is a `[hidden,1]` handle with
-                        // seq_len==1 — exactly the shape `compressor_forward`'s asserts
-                        // require for the token_count==1 decode path.
+                        // Defer mode reads NO `normed_row` data — it only gathers
+                        // state pointers and advances seq_len — but the handle's
+                        // `[hidden,1]` shape satisfies compressor_forward's asserts.
                         let slot = &mut slots[slot_ids[r]];
                         let b = crate::attention::mla_attention_compressor_defer_row(
                             &self.ctx,
@@ -2707,10 +2499,9 @@ impl Dsv4Model {
                         )?;
                         before.push(b);
                     }
-                    // ONE batched update each for the main + indexer compressor (only
-                    // when this layer's rows actually have that compressor; the sinks
-                    // are all-or-nothing per layer since `layer.mode` is uniform).
-                    // `ptrs.prev_overlap_*` are per-row per-slot registers (#154).
+                    // ONE batched update each for the main + indexer compressor;
+                    // the sinks are all-or-nothing per layer since `layer.mode` is
+                    // uniform. `ptrs.prev_overlap_*` are per-row per-slot registers.
                     let overlap = layer.compress_ratio < 16;
                     if let (Some((kv, score)), Some(compressor)) = (
                         compressor_kv_score.as_ref(),
@@ -2740,10 +2531,8 @@ impl Dsv4Model {
                         && let (Some((kv, score)), Some(indexer)) =
                             (indexer_kv_score.as_ref(), layer.attention.indexer.as_ref())
                     {
-                        let indexer_rope_original_seq_len = i32::try_from(
-                            self.config.rope_parameters.original_max_position_embeddings,
-                        )
-                        .map_err(|_| anyhow!("DSv4 full-flatten indexer rope len overflows i32"))?;
+                        let indexer_rope_original_seq_len =
+                            self.config.rope_parameters.original_seq_len_i32()?;
                         let positions = batched_positions.as_ref().ok_or_else(|| {
                             anyhow!("DSv4 full-flatten P1a: batched positions missing")
                         })?;
@@ -2771,16 +2560,11 @@ impl Dsv4Model {
                 } else {
                     Vec::new()
                 };
-                // ── 0d. Full-flatten P1b: per-row DSA CACHE WRITE (block (a) of
-                // `csa_select_official`: Hadamard rotate of the newly-packed index
-                // keys + FP8 fused-store into each slot's cache band + `packed_rows`
-                // advance) hoisted out of the prepare loop into ONE batched pre-pass
-                // over all N slots. Runs AFTER P1a (the batched compressor-update
-                // wrote `indexer.compressed`, the staging ring this reads) and
-                // BEFORE the prepare loop (whose per-row `csa_select` then skips the
-                // cache write via `cache_writes_in_prepass`). Gated to the
-                // CompressedSparse full-flatten lane with the official DSA path
-                // engaged; SparseIndexed keeps its per-row cache write in the loop.
+                // Full-flatten P1b: hoist the per-row DSA CACHE WRITE (Hadamard
+                // rotate of newly-packed index keys + FP8 fused-store + packed_rows
+                // advance) into ONE pre-pass. Runs AFTER P1a wrote
+                // `indexer.compressed` and BEFORE the prepare loop, whose
+                // `csa_select` then skips the write. SparseIndexed keeps it per-row.
                 let cache_writes_in_prepass = use_batched_dsa_select
                     && full_flatten
                     && layer.mode == DeepSeekV4AttentionMode::CompressedSparse;
@@ -2809,8 +2593,7 @@ impl Dsv4Model {
                             dsa_shared,
                             indexer_rows_before[r],
                             indexer_rows_after,
-                            // CompressedSparse compressor-indexer retains full
-                            // history → window base 0 (matches csa_select).
+                            // Full history → window base 0 (matches csa_select).
                             0,
                             &mut cache_ptrs,
                         )?;
@@ -2829,21 +2612,14 @@ impl Dsv4Model {
                     Some(layer_idx),
                     seq_len,
                     || {
-                        // Op "c" batched KV pack (MODEL1 only): when `pack_batched` is on,
-                        // the per-row pack's SW one-token + compressed-delta launches are
-                        // HOISTED out of this loop into ONE batched launch each after it
-                        // (the SW-ring BOOTSTRAP stays per-row — once per slot). Gather
-                        // each row's k_prepared NoPE/RoPE base, compressor `compressed`
-                        // base (0 = no-op for no-compressor rows), and per-slot device
-                        // page-table pointer here; the persistent device page tables live
-                        // in `flash.device_page_table` (not per-call temporaries — #8).
-                        // V32 (head_dim==576) and SparseIndexed (!full_flatten) keep the
-                        // per-row pack byte-for-byte.
-                        // Post-restore/bulk gap (codex R3): the batched pack only
-                        // packs THIS step's delta; a restored slot re-enters decode
-                        // with fp8_kv_comp_packed_rows=0 and needs the single-row
-                        // path's [packed_rows, seq_len) bulk rebuild — run the whole
-                        // layer per-row this tick. Batched gap-fill is future work.
+                        // Op "c" batched KV pack (MODEL1 only): the per-row pack's
+                        // SW one-token + compressed-delta launches are HOISTED into
+                        // ONE batched launch each after this loop (the SW-ring
+                        // BOOTSTRAP stays per-row). Persistent device page tables
+                        // live in `flash.device_page_table`, not per-call
+                        // temporaries. A restored slot re-enters decode with
+                        // fp8_kv_comp_packed_rows=0 and needs the single-row bulk
+                        // rebuild, so that whole layer runs per-row this tick.
                         let comp_bulk_gap = (0..n).any(|r| {
                             slots[slot_ids[r]].attention[layer_idx].flashmla_comp_bulk_gap()
                         });
@@ -2875,12 +2651,10 @@ impl Dsv4Model {
                                     .memcpy_dtod(&cq_src, &mut c_q_normed_row.data)
                                     .map_err(|e| anyhow!("DSv4 batched c_q copy-in failed: {e}"))?;
                             }
-                            // This row's q_prepared / k_prepared slices → fresh OWNED
-                            // [*, 1] HiddenStates the compressed-only finish takes by
-                            // value into the returned Dsv4MlaPrepared (the batched fwd
-                            // reads the gathered Q; the finish loop reads
-                            // k_prepared/local_attn — both must outlive the reused row
-                            // scratch). Cheap [*, 1] bf16 alloc per row.
+                            // This row's q_prepared / k_prepared slices → fresh
+                            // OWNED [*, 1] buffers taken by value into the returned
+                            // Dsv4MlaPrepared: both must outlive the reused row
+                            // scratch.
                             // SAFETY: each dtod copy fills the full buffer before read.
                             let mut q_prepared_owned =
                                 unsafe { HiddenStates::uninit(&self.ctx, local_width, 1)? };
@@ -2896,7 +2670,8 @@ impl Dsv4Model {
                                     })?;
                             }
                             let mut k_prepared_owned =
-                            // SAFETY: uninit device scratch; fully written before first read.
+                            // SAFETY: uninit device scratch; fully written before first
+                            // read.
                             unsafe { HiddenStates::uninit(&self.ctx, mla_head_dim, 1)? };
                             {
                                 let kp_src = proj
@@ -2929,21 +2704,20 @@ impl Dsv4Model {
                                 .push(layer_pool.flashmla_slot_first_block_or_zero(slot_ids[r])?);
                             page_tables
                                 .push(layer_pool.flashmla_page_table_padded_i32(slot_ids[r])?);
-                            // Batched CSA select: thread this row's gather sink (q_i /
-                            // weights staging + key_count capture). `csa_select` then
-                            // runs cache writes only and returns `selected: None`; the
-                            // ONE `csa_select_official_batched` after the loop fills
-                            // `selected_batched`. When not batching DSA, `None` →
-                            // byte-identical per-row select.
+                            // Batched CSA select: thread this row's gather sink.
+                            // `csa_select` then runs cache writes only and returns
+                            // `selected: None`. `None` ⇒ per-row select.
                             let need_dsa_stage =
                                 use_batched_dsa_select && indexer_query_kv_score.is_none();
                             if need_dsa_stage && dsa_stage_q_i.is_none() {
                                 let index_heads = self.config.index_n_heads;
                                 let q_width = index_heads * self.config.index_head_dim;
-                                // SAFETY: each row's slice is fully written by the per-row
+                                // SAFETY: each row's slice is fully written by the
+                                // per-row
                                 // gather before the batched select reads it.
                                 let q_b = unsafe { HiddenStates::uninit(&self.ctx, q_width, n)? };
-                                // SAFETY: uninit device scratch; fully written before first read.
+                                // SAFETY: uninit device scratch; fully written before
+                                // first read.
                                 let w_b =
                                     unsafe { HiddenStates::uninit(&self.ctx, index_heads, n)? };
                                 keepalive.keep_hidden(&q_b);
@@ -2959,24 +2733,21 @@ impl Dsv4Model {
                                     key_counts: dsa_key_counts
                                         .as_mut()
                                         .expect("batched DSA key_counts present"),
-                                    // CompressedSparse full-flatten: P1b already wrote
-                                    // the cache; csa_select skips the per-row write.
-                                    // SparseIndexed (no P1b): false → per-row write.
+                                    // CompressedSparse full-flatten: P1b already
+                                    // wrote the cache. SparseIndexed ⇒ per-row write.
                                     cache_writes_in_prepass,
                                 })
                             } else {
                                 None
                             };
                             // Slice this row's `[width,1]` column out of the batched
-                            // compressor/indexer pre-pass outputs (gate ON). Mirrors the
-                            // q_prepared_owned slice convention above: a fresh owned
-                            // [width,1] bf16 buffer per row, filled by a single dtod copy,
-                            // referenced (not consumed) by the precomputed struct so it
-                            // outlives the prepare call. `None` means no batched
-                            // projection exists for this layer.
+                            // compressor/indexer pre-pass outputs into a fresh owned
+                            // buffer, referenced (not consumed) so it outlives the
+                            // prepare call.
                             let slice_row = |src: &HiddenStates| -> Result<HiddenStates> {
                                 let width = src.hidden_dim;
-                                // SAFETY: the dtod copy fills the full buffer before read.
+                                // SAFETY: the dtod copy fills the full buffer before
+                                // read.
                                 let mut row_buf =
                                     unsafe { HiddenStates::uninit(&self.ctx, width, 1)? };
                                 let col = src.data.slice(r * width..(r + 1) * width);
@@ -2989,16 +2760,11 @@ impl Dsv4Model {
                                 Ok(row_buf)
                             };
                             // Full-flatten: the compressor STATE update already ran
-                            // batched in P1a, so the per-row `[width,1]` slice copies (the
-                            // ∝n per-row work this campaign removes) are SKIPPED — pass
-                            // `skip_compressor=true` + the P1a-captured `indexer_rows_before`
-                            // and NO precomputed slices. Without full-flatten, build the
-                            // per-row slices and run the per-row compressor as before.
-                            //
-                            // The owned slice buffers are bound at iteration scope so they
-                            // outlive the prepare call that borrows them through
-                            // `compressor_precomputed` (dropping at iteration end). Empty
-                            // (`None`) under full-flatten — no per-row slice work.
+                            // batched in P1a, so pass `skip_compressor=true` + the
+                            // P1a-captured `indexer_rows_before` and no precomputed
+                            // slices. The owned slice buffers are bound at iteration
+                            // scope so they outlive the prepare call that borrows
+                            // them through `compressor_precomputed`.
                             let (comp_main_row, comp_indexer_row) = if full_flatten {
                                 (None, None)
                             } else {
@@ -3022,13 +2788,9 @@ impl Dsv4Model {
                                     }
                                 });
                             // CSA indexer-query batched pre-pass: borrow this row's
-                            // `[width,1]` column VIEW of `q_i`/`weights` so `csa_select`
-                            // skips the per-row m=1 GEMVs AND the per-row D2D re-copy —
-                            // the view feeds the prepass column's device pointer straight
-                            // into the gather (zero copy; same address the old per-row
-                            // copy produced → byte-identical). `None` when the pre-pass
-                            // didn't run (SparseIndexed / no indexer) → byte-identical
-                            // per-row GEMVs.
+                            // `[width,1]` column VIEW so `csa_select` skips the
+                            // per-row m=1 GEMVs AND the D2D re-copy. `None` when the
+                            // pre-pass didn't run (SparseIndexed / no indexer).
                             let indexer_query_precomputed =
                                 indexer_query_kv_score.as_ref().map(|(q_i, weights)| {
                                     crate::attention::Dsv4IndexerQueryPrecomputed {
@@ -3067,16 +2829,14 @@ impl Dsv4Model {
                                     idx_before_override,
                                     &mut keepalive,
                                 )?;
-                            // Pack this row's KV into the shared pool, then gather its
-                            // global-head Q into q_batched[r]. flash arena + pool +
-                            // batch scratch are disjoint (slots vs kv_adapter fields).
+                            // Pack this row's KV into the shared pool, then gather
+                            // its global-head Q into q_batched[r].
                             let (flash, sw_window, compressed) =
                                 slot.attention[layer_idx].flashmla_pack_borrow(want_compressed)?;
                             if pack_batched {
-                                // Op "c": run the once-per-slot SW-ring BOOTSTRAP here
-                                // (no-op after the first decode); gather this row's pack
-                                // pointers + per-slot device page table for the ONE
-                                // batched SW+compressed pack issued after the loop.
+                                // Run the once-per-slot SW-ring BOOTSTRAP here, then
+                                // gather this row's pack pointers + page table for
+                                // the ONE batched pack issued after the loop.
                                 crate::attention::flashmla_pack_sw_ring(
                                     &self.ctx,
                                     flash,
@@ -3104,9 +2864,9 @@ impl Dsv4Model {
                                     }
                                     None => pack_compressed_ptrs.push(0),
                                 }
-                                // Use the persistent device page table from flash
-                                // state (not a per-call temporary that would be freed
-                                // before the batched kernel runs — #8 graph UAF).
+                                // Persistent device page table from flash state: a
+                                // per-call temporary would be freed before the
+                                // batched kernel runs (#8 graph UAF).
                                 pack_num_logical_pages =
                                     pack_num_logical_pages.max(flash.device_page_table.len());
                                 let (pt, pg) = flash.device_page_table.device_ptr(&self.ctx.stream);
@@ -3134,20 +2894,12 @@ impl Dsv4Model {
                                 r,
                                 row_prepared.local_heads,
                             )?;
-                            // CSA only: gather this row's indexer top-k `selected`
-                            // (`[index_topk]` i32, == this layer's max_compressed_keys)
-                            // into the contiguous `selected_batched[r * index_topk..]`,
-                            // so the ONE batched index build can read it per row
-                            // (`selected + row * max_compressed_keys`). SW/HCA skip this
-                            // (selected is None) and the batched build sees selected_ptr=0
-                            // — byte-identical to the prior SW/HCA-only lane.
-                            //
-                            // When the batched DSA select is engaged, `selected` is
-                            // None (the per-row read was deferred); `selected_batched`
-                            // is filled by the ONE `csa_select_official_batched` after
-                            // this loop, so skip the per-row gather here.
-                            // CSA + GLM SparseIndexed (has_indexer) both produce a per-row
-                            // `selected`; gather it when the batched select lane is off.
+                            // Gather this row's indexer top-k `selected` into the
+                            // contiguous `selected_batched[r * index_topk..]` so the
+                            // ONE batched index build can read it per row. SW/HCA
+                            // skip this (selected is None, selected_ptr=0). Under the
+                            // batched DSA select `selected` is None — filled after
+                            // this loop — so skip the per-row gather.
                             if runs_indexer && !use_batched_dsa_select {
                                 let sel = row_prepared.selected.as_ref().ok_or_else(|| {
                                 anyhow!(
@@ -3156,11 +2908,9 @@ impl Dsv4Model {
                             })?;
                                 flash_batch.gather_selected_row(&self.ctx, sel, r)?;
                             }
-                            // Keep the prepared buffers alive to function return — the
-                            // batched fwd (after this loop) reads the gathered Q, and
-                            // the finish loop reads k_prepared/local_attn. Mirrors the
-                            // keepalive discipline of the per-row intermediates
-                            // (guards the disabled-event-tracking premature free).
+                            // Keep the prepared buffers alive to function return: the
+                            // batched fwd reads the gathered Q and the finish loop
+                            // reads k_prepared/local_attn (premature-free guard).
                             keepalive.keep_hidden(&row_prepared.q_prepared);
                             keepalive.keep_hidden(&row_prepared.k_prepared);
                             keepalive.keep_hidden(&row_prepared.local_attn);
@@ -3169,13 +2919,10 @@ impl Dsv4Model {
                             }
                             prepared.push(row_prepared);
                         }
-                        // Op "c": ONE batched SW one-token + compressed-delta pack over
-                        // all N rows, replacing the 2×N per-row launches above. Issued
-                        // here (after the prepare loop's per-row gathers, before
-                        // build_layer_batch_meta / the batched fwd read the pool).
-                        // Per-slot device page tables are persistent in
-                        // `flash.device_page_table` (#8 fix); uploaded ptr arrays are
-                        // kept alive past the launch via `ptr_keepalive` / `keepalive`.
+                        // ONE batched SW one-token + compressed-delta pack over all
+                        // N rows, issued before build_layer_batch_meta / the batched
+                        // fwd read the pool. Uploaded ptr arrays are kept alive past
+                        // the launch via `ptr_keepalive` / `keepalive`.
                         if pack_batched && n > 0 {
                             crate::profile::profile_op(
                                 ctx,
@@ -3232,12 +2979,10 @@ impl Dsv4Model {
                         Ok(())
                     },
                 )?;
-                // ── 1b. ONE batched CSA select (#60): the per-row READ (paged-MQA
-                // logits + topk) for all N rows in ONE batch_size=N call, writing
-                // directly into the FlashMLA batch scratch's `selected_batched`.
-                // Runs AFTER all N rows' DSA caches are populated (per-row cache
-                // writes happened in the prepare loop) and BEFORE
-                // `build_layer_batch_meta` reads `selected_batched`.
+                // ONE batched CSA select: the per-row paged-MQA logits + topk for
+                // all N rows, writing into `selected_batched`. Runs AFTER all N
+                // rows' DSA caches are populated and BEFORE `build_layer_batch_meta`
+                // reads it.
                 if use_batched_dsa_select {
                     let (q_i_batch, weights_batch) =
                         if let Some((q_i, weights)) = indexer_query_kv_score.as_ref() {
@@ -3302,7 +3047,6 @@ impl Dsv4Model {
                     crate::attention::csa_select_official_batched(
                         &self.ctx,
                         &self.config,
-                        layer_idx,
                         q_i_batch,
                         weights_batch,
                         dsa_shared,
@@ -3315,19 +3059,8 @@ impl Dsv4Model {
                         score_scale,
                         flash_batch.selected_batched_mut(),
                         &mut keepalive,
-                        /* use_device_meta */ false,
-                        i32::try_from(ratio)?,
-                        batched_positions.as_ref(),
-                        &key_counts,
-                        &mut pack_pt_keepalive,
-                        // Eager batched lane: slot_ids/key_counts uploaded inside
-                        // (not graph-replayed). The graph-safe persistent-buffer
-                        // lane is the single-row decode-graph path only.
-                        None,
-                        None,
                     )?;
                 }
-                // ── 2. ONE batched indices/sched_meta build + ONE batched fwd.
                 crate::profile::profile_op(ctx, "attention_fwd", Some(layer_idx), seq_len, || {
                     let (layer_pool, _dsa, flash_batch, _flashmla_scratch, _prefill) =
                         kv_adapter.layer_dsa_and_flashmla_batch_mut(layer_idx)?;
@@ -3335,8 +3068,8 @@ impl Dsv4Model {
                         anyhow!("DSv4 batched decode lane: batch scratch missing")
                     })?;
                     // For CSA, build_layer_batch_meta sources the per-row top-k from
-                    // the internal `selected_batched` buffer the prepare loop just
-                    // filled (`[n, index_topk]`); SW/HCA pass selected_ptr=0 inside.
+                    // the internal `selected_batched` buffer; SW/HCA pass
+                    // selected_ptr=0 inside.
                     flash_batch.build_layer_batch_meta(
                         &self.ctx,
                         &self.config,
@@ -3358,23 +3091,19 @@ impl Dsv4Model {
                         sm_scale,
                     )
                 })?;
-                // ── 3. per-row slice-out → inverse-rope + SW-update → O-LoRA.
                 crate::profile::profile_op(
                     ctx,
                     "attention_finish",
                     Some(layer_idx),
                     seq_len,
                     || {
-                        // FINISH order is identical between the two gate states; only
-                        // the inverse-RoPE + SW-window WRITE switch from N per-row
-                        // launches to ONE batched launch each when `full_flatten` is on
-                        // (the heavy ∝n FINISH tail). Both must run BEFORE the per-row
-                        // O-LoRA (which consumes the inverse-roped `local_attn`).
-                        //
-                        // Pass F1: slice each row's global-head output into its
-                        // `local_attn` (per-row, cheap memcpy/TP-slice). When
-                        // full_flatten, also gather this row's local_attn / k_prepared /
-                        // sw_window device pointers for the batched FINISH kernels.
+                        // The inverse-RoPE + SW-window WRITE switch from N per-row
+                        // launches to ONE batched launch each when `full_flatten` is
+                        // on; both must run BEFORE the per-row O-LoRA, which consumes
+                        // the inverse-roped `local_attn`. Pass F1 slices each row's
+                        // global-head output into its `local_attn` and, under
+                        // full_flatten, gathers the device pointers for the batched
+                        // FINISH kernels.
                         let mut out_ptrs: Vec<u64> = if full_flatten {
                             Vec::with_capacity(n)
                         } else {
@@ -3390,9 +3119,7 @@ impl Dsv4Model {
                         } else {
                             Vec::new()
                         };
-                        // F1 batched: when full_flatten, slice ALL n rows' global-head
-                        // output into the contiguous `local_attn_batched` in ONE launch,
-                        // replacing the N per-row `slice_out_row` memcpy/TP-slices.
+                        // F1 batched: slice ALL n rows in ONE launch.
                         if full_flatten {
                             let local_heads = prepared[0].local_heads;
                             let (_layer_pool, _dsa, flash_batch, _flashmla_scratch, _prefill) =
@@ -3411,15 +3138,13 @@ impl Dsv4Model {
                         }
                         let local_width_row = local_attn_batched.hidden_dim;
                         for r in 0..n {
-                            // One mutable borrow of row r's prepared state; field
-                            // accesses below are disjoint (k_prepared/scalars `&`,
+                            // Field accesses below are disjoint (k_prepared `&`,
                             // local_attn `&mut`) so the borrow checker splits them.
                             let p = &mut prepared[r];
                             if full_flatten {
-                                // Gather this row's device pointers for the batched
-                                // FINISH kernels. The output pointer is row r's slice of
-                                // the contiguous `local_attn_batched` (the F2 O-LoRA then
-                                // reads the same buffer). Single-stream: ptrs stay valid.
+                                // The output pointer is row r's slice of the
+                                // contiguous `local_attn_batched`, which the F2
+                                // O-LoRA then reads. Single-stream: ptrs stay valid.
                                 let row_view = local_attn_batched
                                     .data
                                     .slice(r * local_width_row..(r + 1) * local_width_row);
@@ -3435,8 +3160,6 @@ impl Dsv4Model {
                                 swcache_ptrs.push(cp);
                                 drop(cg);
                             } else {
-                                // Per-row lane (unchanged): slice this row out, then
-                                // per-row inverse-RoPE + SW-window write, one launch each.
                                 {
                                     let (
                                         _layer_pool,
@@ -3476,9 +3199,8 @@ impl Dsv4Model {
                                 )?;
                             }
                         }
-                        // Batched FINISH tail (gate ON): ONE inverse-RoPE + ONE SW-window
-                        // write over all N rows, replacing the per-row launches above.
-                        // local_heads / rope params are uniform across the layer's rows.
+                        // Batched FINISH tail: ONE inverse-RoPE + ONE SW-window write
+                        // over all N rows. local_heads / rope params are uniform.
                         if full_flatten {
                             let positions = batched_positions.as_ref().ok_or_else(|| {
                                 anyhow!("DSv4 full-flatten finish: batched positions missing")
@@ -3514,26 +3236,21 @@ impl Dsv4Model {
                             ptr_keepalive.push(kprep_arr);
                             ptr_keepalive.push(swcache_arr);
                         }
-                        // Pass F2: O-LoRA → attn_out (consumes the inverse-roped output).
-                        // full_flatten batches over N in ONE mla_oproj(token_count=n):
-                        // plain-o (GLM, seq-parametric dsv4_linear), single-output-group
-                        // (Qwen3.6 MODEL1 at TP>1, decode-DeepGEMM M=n), AND grouped
-                        // (groups>1, gather/GEMM/scatter M=n per group) all converge here
-                        // reading the contiguous `local_attn_batched` and writing directly
-                        // into `attn_out` ([hidden, n]) — no per-row alloc, no copy-out.
-                        // The !full_flatten lane (SparseIndexed) stays per-row over
-                        // `prepared[r].local_attn`.
+                        // Pass F2: O-LoRA → attn_out (consumes the inverse-roped
+                        // output). full_flatten batches over N in ONE
+                        // mla_oproj(token_count=n) — plain-o, single-output-group and
+                        // grouped all read `local_attn_batched` and write straight
+                        // into `attn_out`. The !full_flatten lane stays per-row.
                         if full_flatten {
-                            // Batched O-LoRA over all N rows in one call. local_attn_batched
-                            // is [local_width, n]; the decode lane reads it token-major.
+                            // local_attn_batched is [local_width, n], read token-major.
                             let slot = &mut slots[slot_ids[0]];
                             crate::attention::mla_oproj(
                                 &self.ctx,
                                 &layer.attention,
                                 &mut slot.attention[layer_idx],
-                                // Decode: prefill DeepGEMM lane never taken. The decode
-                                // lane reuses slot 0's shared transient fused_wqkv scratch
-                                // at M=n (active_counts=[n], restored to [1] internally).
+                                // Decode: prefill DeepGEMM lane never taken. The
+                                // decode lane reuses slot 0's shared transient
+                                // fused_wqkv scratch at M=n.
                                 None,
                                 &local_attn_batched,
                                 n,
@@ -3605,20 +3322,17 @@ impl Dsv4Model {
                         ctx.stream
                             .memcpy_dtod(&attn_out_row.data, &mut dst)
                             .map_err(|e| anyhow!("DSv4 batched attn copy-out failed: {e}"))?;
-                        // No per-row host sync: every op (memcpy, mla_attention's
-                        // FlashMLA/compressor/indexer FFI, copy-out) runs on ctx.stream,
-                        // so stream ordering already serializes row r's reads of the
-                        // shared {normed,attn_out}_row scratch before row r+1's writes
-                        // (WAR resolved by stream order). The sync was debug isolation.
+                        // No per-row host sync: every op runs on ctx.stream, so
+                        // stream ordering serializes row r's reads of the shared
+                        // scratch before row r+1's writes.
                     }
                     Ok(())
                 })?;
             }
             keepalive.keep_hidden(&attn_out);
             // Row-parallel O-LoRA: one all-reduce over [N, hidden]. NOT bit-identical
-            // to N per-row all-reduces: NCCL tiles a [hidden,N] message differently
-            // than N×[hidden,1], so identical-input rows pick up ~1 bf16 ULP of
-            // per-row drift here. This is the legitimate batched-numerics seed.
+            // to N per-row all-reduces — NCCL tiles a [hidden,N] message differently,
+            // so identical-input rows pick up ~1 bf16 ULP of drift.
             crate::profile::profile_op(ctx, "attn_allreduce", Some(layer_idx), seq_len, || {
                 self.tp.all_reduce_sum(&self.ctx, &mut attn_out)
             })?;
@@ -3646,8 +3360,7 @@ impl Dsv4Model {
             keepalive.keep_hidden(&attn_stream);
             stream = attn_stream;
 
-            // ── MoE half: HC-wrap the grouped FP8 DeepGEMM MoE over the [N] batch.
-            // GLM (hc_mult==1): plain RMSNorm of the stream (no ffn hyper-connection).
+            // MoE half. GLM (hc_mult==1): plain RMSNorm, no ffn hyper-connection.
             // SAFETY: uninit device scratch; fully written before first read.
             let mut normed = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
             let ffn_mhc = if self.config.is_glm() {
@@ -3678,7 +3391,8 @@ impl Dsv4Model {
                 keepalive.keep_f32(&mhc.pre);
                 keepalive.keep_f32(&mhc.post);
                 keepalive.keep_f32(&mhc.comb);
-                // SAFETY: fused hc_pre+rms_norm writes the full [seq_len, hidden_size] buffer.
+                // SAFETY: fused hc_pre+rms_norm writes the full [seq_len, hidden_size]
+                // buffer.
                 crate::profile::profile_op(
                     ctx,
                     "ffn_hc_pre_norm",
@@ -3700,17 +3414,12 @@ impl Dsv4Model {
                 Some(mhc)
             };
             keepalive.keep_hidden(&normed);
-            // Routed MoE over the whole [N] batch. allreduce transport: Phase 6a
-            // grouped path (one router gemm + one DeepGEMM grouped expert GEMM
-            // over N×topk routes, decode_scratch=None) + one EP all-reduce.
-            // deepep transport: the token-owned LL / intranode pipelines, which
-            // are natively [N]-batched — same owned-slice structure as the
-            // single-row forward (see its collective-participation invariants).
-            // Bit-identity vs per-row is NOT expected (grouped GEMM / LL combine
-            // tile over N differently); gated on needle retrieval, not byte-parity.
-            //
-            // GLM dense layer (`per_layer_dense_mlp[i]`): a plain SwiGLU FFN
-            // replaces the routed-expert + shared-expert MoE entirely.
+            // Routed MoE over the whole [N] batch. allreduce transport: one router
+            // gemm + one DeepGEMM grouped expert GEMM over N×topk routes + one EP
+            // all-reduce. deepep transport: the token-owned LL / intranode pipelines,
+            // natively [N]-batched. Bit-identity vs per-row is NOT expected; gated on
+            // needle retrieval, not byte-parity. A GLM dense layer replaces the whole
+            // routed + shared MoE with a plain SwiGLU FFN.
             let mut moe_with_shared =
                 // SAFETY: uninit device scratch; fully written before first read.
                 unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
@@ -3739,11 +3448,9 @@ impl Dsv4Model {
                         })?;
                         if transport.is_low_latency() {
                             // Token-owned LL path: DeepEP dispatch/combine are
-                            // collectives every rank enters even at owned_n == 0
-                            // (seq_len < world). The LL scratch is whole-forward
-                            // scratch (fully overwritten per call); it is parked
-                            // per-slot for the single-row path, so the batch
-                            // borrows row 0's.
+                            // collectives every rank enters even at owned_n == 0.
+                            // The LL scratch is whole-forward scratch, parked
+                            // per-slot, so the batch borrows row 0's.
                             let scratch = slots[slot_ids[0]]
                                 .deepep_ll_scratch
                                 .as_mut()
@@ -3773,8 +3480,8 @@ impl Dsv4Model {
                                 },
                             )?;
                         } else {
-                            // Intranode normal-mode DeepEP: already [N]-shaped; its
-                            // combine reduces across EP, no moe all-reduce needed.
+                            // Intranode normal-mode DeepEP: its combine reduces
+                            // across EP, so no moe all-reduce is needed.
                             crate::moe::dsv4_moe_forward_deepep(
                                 self,
                                 transport,
@@ -3824,22 +3531,11 @@ impl Dsv4Model {
                     }
                 }
                 keepalive.keep_hidden(&moe_out);
-                // Phase 6a: grouped shared expert over [N] (dense FFN, prefill path)
-                // — one batched SwiGLU GEMM pair, replacing the per-row loop + N
-                // host syncs.
-                //
-                // Waterfill (per-rank token-sharded shared-expert compute) was
-                // KILLed 2026-07-06: pod A/B at n=64 (its own activation
-                // threshold) showed no measurable wall-clock gain over this
-                // unconditional path (75.9s vs 73.8s mean, well within
-                // trial-to-trial noise — see
-                // docs/experience/wins/2026-07-06-dsv4-deepep-waterfill-pending-remote.md).
-                // Reuse the model-wide shared-expert output + FP8 scratch held on
-                // the kv_adapter (#29) instead of a per-layer `uninit` + fresh
-                // `dsv4_shared_expert` temporaries — batched decode was the last
-                // path still allocating these every layer (launch-bound Step 1).
-                // Same kernel sequence as the eager/verify template
-                // (dsv4.rs:5440), byte-identical math, pooled provenance only.
+                // Grouped shared expert over [N]: one batched SwiGLU GEMM pair.
+                // Per-rank token-sharded waterfill was killed 2026-07-06: at n=64 it
+                // showed no wall-clock gain (75.9s vs 73.8s, within trial noise).
+                // Reuse the model-wide pooled shared-expert output + FP8 scratch
+                // (#29) instead of per-layer `uninit` + fresh temporaries.
                 let (shared_out, shared_scratch) = kv_adapter.shared_expert_decode_mut();
                 let shared = shared_out.ok_or_else(|| {
                     anyhow!("DSv4 batched decode requires shared-expert output buffer")
@@ -3894,8 +3590,7 @@ impl Dsv4Model {
             keepalive.keep_hidden(&ffn_stream);
             stream = ffn_stream;
             // DSpark T3: capture each row's wide HC stream at this layer's OUTPUT
-            // into its slot's tap buffer (decode: 1 token per row). Gated by
-            // `dspark` so the default path is byte-identical.
+            // into its slot's tap buffer, gated so the default path is unchanged.
             if dspark
                 && let Some(tap_idx) = self
                     .config
@@ -3914,50 +3609,30 @@ impl Dsv4Model {
             slots[slot_ids[r]].seq_len += 1;
         }
         // Per-step per-GEMV breakdown (rank-0 only; self-gates on
-        // ARLE_DSV4_LINEAR_PROFILE). Sums the compressor/indexer m=1 GEMVs that
-        // compose compidx — the residual after the default-on
-        // batched-compressor pre-pass.
+        // ARLE_DSV4_LINEAR_PROFILE).
         crate::linear_profile::print_rank0("decode-step");
         Ok((stream, keepalive))
     }
 
-    /// Cross-slot batched MTP verify (batched-MTP Stage 1). Verify N draft
-    /// chains in ONE layer-major forward over `M = Σ_s row_count_s` rows, grouped
-    /// contiguously by slot. The MoE / HC-wrap / norm / head math runs over all
-    /// M rows at once; attention stays PER-SLOT but not PER-ROW: each slot's
-    /// chain chunk runs through one FlashMLA sparse verify call per layer. Per
-    /// slot s, rows `[off_s .. off_s + len_s)` are its chain in schedule order;
-    /// ancestor metadata makes row r attend slot s's committed KV + exactly the
-    /// chain rows listed in `scheds[s].ancestors[r]`.
+    /// Cross-slot batched MTP verify: N draft chains in ONE layer-major forward
+    /// over `M = Σ_s row_count_s` rows, grouped contiguously by slot. MoE / HC-wrap
+    /// / norm / head run over all M rows; attention stays per-slot — one FlashMLA
+    /// sparse verify call per chain chunk per layer, with ancestor metadata making
+    /// row r attend slot s's committed KV plus `scheds[s].ancestors[r]`. The
+    /// lm_head extraction batches fold + projection + argmax over all M rows (one
+    /// GEMM, one argmax, one D2H).
     ///
     /// Returns per slot `(argmax, hiddens)`: `argmax[j]` is the target's argmax
-    /// AFTER chain row j (so the accepted next chain token must equal it), and
-    /// `hiddens[j]` is that row's MTP stream hidden (for the commit path head).
-    /// The lm_head extraction batches the greedy fold + projection + argmax over
-    /// all M rows (one GEMM, one argmax, one D2H), then slices per slot — the
-    /// per-row GEMV loop in the old verify cost N×depth syncs.
+    /// AFTER chain row j; `hiddens[j]` is that row's MTP stream hidden.
     ///
     /// PRECONDITIONS: each slot's `seq_len == start_pos_s` (contiguous append);
     /// allreduce transport only (the deepep_ll owned-shard partition is keyed on
-    /// the whole-batch `seq_len`, not per-slot verify chunks — Stage 1/2 stay on
-    /// allreduce, matching `mtp_forward_level`); the draft already wrote each
-    /// slot's frozen-layer rings (the verify is pure: it READS the frozen KV).
+    /// the whole-batch `seq_len`, not per-slot verify chunks); the draft already
+    /// wrote each slot's frozen-layer rings.
     ///
-    /// §0.1 mutated-buffer enumeration (every device buffer this fn WRITES):
-    /// - All function-local `HiddenStates` (embeddings / stream / normed /
-    ///   normed_chunk / attn_chunk / attn_out / moe_out / shared / *_stream /
-    ///   head_normed / logits): SCRATCH — fully written before read each layer;
-    ///   freed in stream order at fn return (keepalive guards the disabled-event-
-    ///   tracking premature-free). No rollback needed.
-    /// - `slots[s].attention[layer_idx]` rings (sw_window / fp8 / compressor):
-    ///   NOT mutated by verify. The sparse verify lane is frozen and skips SW
-    ///   cache updates; compressor/indexer updates are skipped by
-    ///   `set_dsv4_verify_frozen(true)`. Accepted rows are written later by commit.
-    /// - `slots[s].seq_len`: NOT mutated here (no commit). The caller advances it
-    ///   in the fold commit. (Contrast `forward_decode_batch_stream_impl`, which
-    ///   advances seq_len because it IS the commit.)
-    /// - `slot.spec_normed`: the combined `[M,hidden]` normed is sliced by slot
-    ///   and copied into the owning slot's cache for commit fold.
+    /// Mutates only function-local scratch plus `slot.spec_normed` (the combined
+    /// `[M,hidden]` normed sliced per slot). Slot rings and `slot.seq_len` are NOT
+    /// touched — the verify lane is frozen and the caller commits.
     #[allow(clippy::too_many_arguments, clippy::type_complexity)]
     pub(crate) fn forward_decode_batch_verify(
         &self,
@@ -3984,7 +3659,6 @@ impl Dsv4Model {
               seq_len, not per-slot verify chunks)"
         );
 
-        // Per-slot row-block offsets into the combined [M, *] buffers.
         let lens: Vec<usize> = row_tokens.iter().map(|c| c.len()).collect();
         for (s, &len) in lens.iter().enumerate() {
             ensure!(
@@ -4027,7 +3701,6 @@ impl Dsv4Model {
         let dspark = self.config.is_dspark();
         let mut keepalive = Dsv4ForwardKeepalive::new(false);
 
-        // Combined token list, grouped by slot (slot s's chain at [off_s..]).
         let tokens: Vec<u32> = row_tokens.iter().flat_map(|c| c.iter().copied()).collect();
         let token_ids_host: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
 
@@ -4055,9 +3728,8 @@ impl Dsv4Model {
         keepalive.keep_hidden(&embeddings);
         keepalive.keep_hidden(&stream);
 
-        // Per-slot chain verify: one FlashMLA sparse forward over each slot
-        // chunk per layer. The prefix metadata expresses row r -> ancestors
-        // explicitly. Current topk does not add rows: D2 verifies 3 rows.
+        // Per-slot chain verify: one FlashMLA sparse forward per slot chunk per
+        // layer, with prefix metadata expressing row r -> ancestors explicitly.
         let max_chunk = *lens.iter().max().unwrap_or(&1);
         // SAFETY: uninit device scratch; fully written before first read.
         let mut normed_chunk = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, max_chunk)? };
@@ -4079,8 +3751,8 @@ impl Dsv4Model {
         crate::attention::set_dsv4_verify_frozen(true);
         let result = (|| -> Result<()> {
             for (layer_idx, layer) in self.layers.iter().enumerate() {
-                // ── Attention half: HC params + pre-norm over the whole [M] batch.
-                // ponytail: pod-verify GLM hc_mult==1 plain residual + identity stream (no hyper-connection)
+                // ponytail: pod-verify GLM hc_mult==1 plain residual + identity stream
+                // (no hyper-connection)
                 // SAFETY: uninit device scratch; fully written before first read.
                 let mut normed = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
                 let attn_mhc = if self.config.is_glm() {
@@ -4119,7 +3791,8 @@ impl Dsv4Model {
                     keepalive.keep_f32(&mhc.pre);
                     keepalive.keep_f32(&mhc.post);
                     keepalive.keep_f32(&mhc.comb);
-                    // SAFETY: fused hc_pre+rms_norm writes the full [m, hidden_size] buffer.
+                    // SAFETY: fused hc_pre+rms_norm writes the full [m, hidden_size]
+                    // buffer.
                     crate::profile::profile_op(
                         &self.ctx,
                         "attn_hc_pre_norm",
@@ -4142,9 +3815,8 @@ impl Dsv4Model {
                 };
                 keepalive.keep_hidden(&normed);
 
-                // ── Attention PER SLOT / PER CHUNK: write the slot block into
-                // chunk scratch, run the sparse chain-verify lane once, then
-                // scatter it back into the combined block.
+                // Attention PER SLOT / PER CHUNK: write the slot block into chunk
+                // scratch, run the sparse chain-verify lane once, then scatter back.
                 // SAFETY: each [off..off+len) block of attn_out is written by the
                 // copy-out below before attn_out is read by hc_post.
                 let mut attn_out =
@@ -4273,7 +3945,8 @@ impl Dsv4Model {
                         },
                     )?;
                 } else {
-                    // GLM plain residual: stream = attn_out + stream (stream_dim==hidden).
+                    // GLM plain residual: stream = attn_out + stream
+                    // (stream_dim==hidden).
                     crate::profile::profile_op(
                         &self.ctx,
                         "attn_hc_post",
@@ -4285,11 +3958,10 @@ impl Dsv4Model {
                 keepalive.keep_hidden(&attn_stream);
                 stream = attn_stream;
 
-                // ── MoE half: HC-wrap the grouped MoE over the whole [M] batch
-                // (the dominant amortization — math-identical to per-row, byte
-                // parity NOT expected: grouped GEMM tiles over M differently;
-                // gated on needle, not byte-parity). Allreduce transport only.
-                // GLM (hc_mult==1): plain RMSNorm of the stream (no ffn hyper-connection).
+                // MoE half over the whole [M] batch (the dominant amortization —
+                // byte parity NOT expected: grouped GEMM tiles over M differently;
+                // gated on needle). Allreduce transport only. GLM (hc_mult==1):
+                // plain RMSNorm, no ffn hyper-connection.
                 // SAFETY: uninit device scratch; fully written before first read.
                 let mut normed = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
                 let ffn_mhc = if self.config.is_glm() {
@@ -4327,7 +3999,8 @@ impl Dsv4Model {
                     keepalive.keep_f32(&mhc.pre);
                     keepalive.keep_f32(&mhc.post);
                     keepalive.keep_f32(&mhc.comb);
-                    // SAFETY: fused hc_pre+rms_norm writes the full [m, hidden_size] buffer.
+                    // SAFETY: fused hc_pre+rms_norm writes the full [m, hidden_size]
+                    // buffer.
                     crate::profile::profile_op(
                         &self.ctx,
                         "ffn_hc_pre_norm",
@@ -4400,7 +4073,8 @@ impl Dsv4Model {
                     }
                     // Grouped shared expert over [M] (dense FFN, prefill path).
                     let mut shared =
-                        // SAFETY: uninit device scratch; fully written before first read.
+                        // SAFETY: uninit device scratch; fully written before first
+                        // read.
                         unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
                     crate::profile::profile_op(
                         &self.ctx,
@@ -4460,7 +4134,8 @@ impl Dsv4Model {
                         },
                     )?;
                 } else {
-                    // GLM plain residual: stream = ffn_out + stream (stream_dim==hidden).
+                    // GLM plain residual: stream = ffn_out + stream
+                    // (stream_dim==hidden).
                     crate::profile::profile_op(
                         &self.ctx,
                         "ffn_hc_post",
@@ -4478,10 +4153,9 @@ impl Dsv4Model {
                 }
                 keepalive.keep_hidden(&ffn_stream);
                 stream = ffn_stream;
-                // DSpark T3: capture each slot's chain rows' wide HC stream at
-                // this layer's OUTPUT into its tap buffer. Row block [off_s..off_s+len_s)
-                // belongs to slot s; writes len_s rows (the full chain — the
-                // commit fold later reads only the accepted prefix).
+                // DSpark T3: capture each slot's chain rows at this layer's OUTPUT.
+                // Row block [off_s..off_s+len_s) belongs to slot s; the full chain is
+                // written (the commit fold later reads only the accepted prefix).
                 if dspark
                     && let Some(tap_idx) = self
                         .config
@@ -4506,7 +4180,6 @@ impl Dsv4Model {
         crate::attention::set_dsv4_verify_frozen(false);
         result?;
 
-        // ── Per-row MTP stream hidden capture (all M rows), then per-slot slice.
         let mut hiddens_all = Vec::with_capacity(m);
         for i in 0..m {
             let mut h = DeviceVec::zeros(&self.ctx, stream_dim)?;
@@ -4514,7 +4187,6 @@ impl Dsv4Model {
             hiddens_all.push(h);
         }
 
-        // ── Target logits matrix over all M rows, then its greedy top-1 view.
         let (logits, argmax_all) =
             crate::profile::profile_op(&self.ctx, "lm_head", None, m, || {
                 let logits = self.verify_logits_from_stream(&stream, m, &mut keepalive)?;
@@ -4524,8 +4196,7 @@ impl Dsv4Model {
         std::hint::black_box(keepalive.len());
         drop(keepalive);
 
-        // Slice argmax + hiddens back per slot (own row block). hiddens are
-        // moved out (DeviceVec owns the data; the caller keeps the accepted one).
+        // Slice argmax + hiddens back per slot; hiddens are moved out.
         let mut hiddens_iter = hiddens_all.into_iter();
         let mut out = Vec::with_capacity(n);
         for s in 0..n {
@@ -4593,7 +4264,6 @@ impl Dsv4Model {
         let eps = self.config.rms_norm_eps;
         let ctx = &self.ctx;
 
-        // ── Head HC: fold the last token's wide stream row → one hidden vector.
         let mut last_hidden = DeviceVec::zeros(ctx, hidden_size)?;
         if self.config.is_glm() {
             // GLM: head hidden = stream row (stream_dim==hidden, no head HC mixer).
@@ -4627,7 +4297,6 @@ impl Dsv4Model {
             keepalive.keep_vec(out);
         }
 
-        // ── Final norm + lm_head projection + sample (last token row).
         let mut last_normed = DeviceVec::zeros(ctx, hidden_size)?;
         crate::profile::profile_op(ctx, "head_norm", None, seq_len, || {
             crate::ops::rms_norm_vec(ctx, &last_hidden, &self.norm, eps, &mut last_normed)
@@ -4644,9 +4313,8 @@ impl Dsv4Model {
         Ok(token)
     }
 
-    /// Sample the next token from the decode-tail logits: the standard
-    /// full-vocab sampler, or the cross-rank merge when the vocab-sharded
-    /// lm_head is active (`logits` then hold this rank's padded slice).
+    /// Sample the next token from the decode-tail logits, or the cross-rank merge
+    /// when the vocab-sharded lm_head is active (`logits` = this rank's padded slice).
     fn sample_logits(
         &self,
         logits: &DeviceVec,
@@ -5052,10 +4720,9 @@ impl Dsv4Model {
         tokens: &[u32],
         start_pos: usize,
         persist_spec_normed: bool,
-        // `Some`: verify a scheduled row chunk. Ancestor metadata routes
-        // attention through one FlashMLA sparse verify call per layer; point-wise
-        // and MoE stay batched for weight-read amortization. Current top-k only
-        // widens candidate matching; it does not add scheduled rows.
+        // `Some`: verify a scheduled row chunk. Ancestor metadata routes attention
+        // through one FlashMLA sparse verify call per layer; point-wise and MoE
+        // stay batched for weight-read amortization.
         verify: Option<&SpecVerifySchedule>,
     ) -> Result<(HiddenStates, Dsv4ForwardKeepalive)> {
         ensure!(
@@ -5089,16 +4756,14 @@ impl Dsv4Model {
         let mega_epoch = self.begin_mega_moe_forward(seq_len)?;
         let eps = self.config.rms_norm_eps;
         let use_deepep_transport = crate::runtime_flags::dsv4_moe_transport()?.is_deepep();
-        // DSpark T3: capture the wide stream at each target layer output. One bool
-        // check per layer when off; the position scan only runs when on.
+        // DSpark T3: capture the wide stream at each target layer output.
         let dspark = self.config.is_dspark();
         let mut keepalive = Dsv4ForwardKeepalive::new(false);
         let ctx = &self.ctx;
         // DSpark prefix seed: a PREFILL forward (`seq_len > 1`) additionally
         // captures ALL rows per target layer into transient `[stream_dim, seq_len]`
-        // buffers (token-major), so the executor can seed the full committed
-        // context (the per-slot single-row `dspark_taps` only holds `seq_len-1`).
-        // Prefill-scoped; bounded by the chunk size. Stashed on the slot post-loop.
+        // buffers, so the executor can seed the full committed context (the
+        // per-slot single-row `dspark_taps` only holds `seq_len-1`).
         let mut dspark_prompt_bufs: Option<Vec<DeviceVec>> = if dspark && seq_len > 1 {
             let n_taps = self.config.dspark_target_layer_ids.len();
             Some(
@@ -5109,7 +4774,7 @@ impl Dsv4Model {
         } else {
             None
         };
-        // DEBUG: catch any deferred CUDA error from init/boot before first forward op.
+        // Catch any deferred CUDA error from init/boot before the first forward op.
         if use_deepep_transport {
             self.ctx.stream.synchronize().map_err(|e| {
                 anyhow!("DSv4 deepep: stream error at forward entry (before embed): {e}")
@@ -5132,7 +4797,6 @@ impl Dsv4Model {
         keepalive.keep_i32(&token_ids);
         // SAFETY: embedding_batch writes the full [seq_len, hidden_size] buffer.
         let mut embeddings = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
-        // Wide HC residual stream from the token embeddings.
         // SAFETY: initial_stream_from_embeddings writes the full stream buffer.
         let mut stream = unsafe { HiddenStates::uninit(&self.ctx, stream_dim, seq_len)? };
         crate::profile::profile_op(&self.ctx, "embedding", None, seq_len, || {
@@ -5166,8 +4830,8 @@ impl Dsv4Model {
             _ => None,
         };
         for (layer_idx, layer) in self.layers.iter().enumerate() {
-            // ── Attention half: HC-wrap MLA attention.
-            // ponytail: pod-verify GLM hc_mult==1 plain residual + identity stream (no hyper-connection)
+            // ponytail: pod-verify GLM hc_mult==1 plain residual + identity stream (no
+            // hyper-connection)
             // SAFETY: fused hc_pre+rms_norm / plain rms_norm writes the full
             // [seq_len, hidden_size] buffer.
             let mut normed = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
@@ -5237,10 +4901,9 @@ impl Dsv4Model {
             // SAFETY: mla_attention writes the full [seq_len, hidden_size] buffer.
             let mut attn_out = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
             if let Some(meta) = sparse_verify_meta.as_ref() {
-                // Scheduled verify: one sparse FlashMLA attention over the
-                // whole row chunk. Ancestors carry row `r`'s chain dependency,
-                // so no row replay or slot-ring mutation is needed; commit
-                // writes accepted rows later.
+                // Scheduled verify: one sparse FlashMLA attention over the whole
+                // row chunk. Ancestors carry row `r`'s chain dependency, so no row
+                // replay or slot-ring mutation is needed.
                 crate::profile::profile_op(
                     &self.ctx,
                     "attention",
@@ -5290,7 +4953,7 @@ impl Dsv4Model {
                             let mla_scratch = mla_scratch.ok_or_else(|| {
                                 anyhow!("DSv4 MODEL1 layer {layer_idx} missing MLA decode scratch")
                             })?;
-                            crate::attention::mla_attention_decode_graph(
+                            crate::attention::mla_attention_decode(
                                 &self.ctx,
                                 &self.config,
                                 &layer.attention,
@@ -5370,8 +5033,7 @@ impl Dsv4Model {
             keepalive.keep_hidden(&attn_stream);
             stream = attn_stream;
 
-            // ── MoE half: HC-wrap the FP8 DeepGEMM MoE block.
-            // GLM (hc_mult==1): plain RMSNorm of the stream (no ffn hyper-connection).
+            // MoE half. GLM (hc_mult==1): plain RMSNorm, no ffn hyper-connection.
             // SAFETY: fused hc_pre+rms_norm / plain rms_norm writes the full
             // [seq_len, hidden_size] buffer.
             let mut normed = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
@@ -5464,16 +5126,13 @@ impl Dsv4Model {
                             )
                         })?;
                         if transport.is_low_latency() {
-                            // ── deepep_ll token-owned path ──────────────────────
-                            // TP8 replicates `normed` [hidden, n]; HiddenStates is
-                            // token-major (token i at i*hidden), so this rank's owned
-                            // shard cols [start..end] is a CONTIGUOUS byte range. The
-                            // LL dispatch + combine are COLLECTIVES: EVERY rank must
-                            // participate every step or the symmetric protocol
-                            // deadlocks (DeepEP "timeout for dispatch receive") — the
-                            // shared helper always runs `compute_fn`, even at
-                            // owned_n == 0. This REPLACES the moe all-reduce
-                            // (needs_moe_allreduce=false).
+                            // deepep_ll token-owned path: TP8 replicates `normed`
+                            // and HiddenStates is token-major, so this rank's owned
+                            // shard is a CONTIGUOUS byte range. LL dispatch + combine
+                            // are COLLECTIVES: every rank must participate every step
+                            // or the symmetric protocol deadlocks, so the helper runs
+                            // `compute_fn` even at owned_n == 0. This REPLACES the
+                            // moe all-reduce.
                             let scratch = slot.deepep_ll_scratch.as_mut().ok_or_else(|| {
                                 anyhow!("deepep_ll selected but slot LL scratch not allocated")
                             })?;
@@ -5572,10 +5231,9 @@ impl Dsv4Model {
                         } else {
                             None
                         };
-                        // Routed experts are EP-sharded; sum them first, then add the replicated
-                        // shared expert exactly once per rank. In the comm-overlap path, shared
-                        // expert depends on `normed`, while this compute-stream collective depends
-                        // on the routed `moe_out`; the two can run concurrently.
+                        // Routed experts are EP-sharded; sum them first, then add the
+                        // replicated shared expert once per rank. In the comm-overlap
+                        // path the two depend on different inputs and run concurrently.
                         if needs_moe_allreduce {
                             crate::profile::profile_op(
                                 &self.ctx,
@@ -5639,11 +5297,12 @@ impl Dsv4Model {
                                 scratch,
                             )?;
                         } else {
-                            // Keep the default masked path order byte-for-byte with main:
-                            // routed MoE → all-reduce → allocate/run shared expert. Moving
-                            // shared scratch allocation before all-reduce can reuse in-flight
+                            // Keep the default masked path order: routed MoE →
+                            // all-reduce → allocate/run shared expert. Allocating
+                            // shared scratch before the all-reduce can reuse in-flight
                             // helper buffers under disabled cudarc event tracking.
-                            // SAFETY: dsv4_shared_expert_forward writes the full shared output.
+                            // SAFETY: dsv4_shared_expert_forward writes the full shared
+                            // output.
                             let mut shared =
                                 unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
                             crate::moe::dsv4_shared_expert_forward(
@@ -5674,7 +5333,8 @@ impl Dsv4Model {
                         if let Some(fence) = shared_ready.as_ref() {
                             ctx.wait_on_pipeline_fence(fence, CudaPipelineStreamKind::Compute)?;
                         }
-                        // SAFETY: add_batch writes the full [seq_len, hidden_size] buffer.
+                        // SAFETY: add_batch writes the full [seq_len, hidden_size]
+                        // buffer.
                         crate::ops::add_batch(&self.ctx, &moe_out, shared, &mut moe_with_shared)?;
                         keepalive.keep_hidden(&moe_with_shared);
                         Ok(())
@@ -5704,10 +5364,8 @@ impl Dsv4Model {
             }
             keepalive.keep_hidden(&ffn_stream);
             stream = ffn_stream;
-            // DSpark T3: capture the wide HC stream at this layer's OUTPUT
-            // (hidden_states[layer_idx+1]) for the row being predicted, when this
-            // layer is a DSpark target. D2D copy only (graph-safe, no readback);
-            // gated by `dspark` so the default path is byte-identical.
+            // DSpark T3: capture the wide HC stream at this layer's OUTPUT for the
+            // row being predicted. D2D copy only (graph-safe, no readback).
             if dspark
                 && let Some(tap_idx) = self
                     .config
@@ -5749,14 +5407,11 @@ impl Dsv4Model {
     }
 
     /// Draft one MTP matrix level. `rows` is the draft batch for this level
-    /// (single-slot path uses `m == 1`; cross-slot batched draft uses one row per
-    /// slot). The point-wise pipeline batches over `m`, target-layer attention
-    /// runs per row at each row's `position`, and candidates come from k rounds
-    /// of device argmax + mask — no full-vocab D2H.
-    ///
-    /// `slot_ids[r]` selects the KV cache slot for row `r`; `positions[r]` is
-    /// that row's draft position. Returns per row: top-k candidate tokens
-    /// (highest first) + the wide MTP stream the next draft row branches from.
+    /// (`m == 1` single-slot; one row per slot for the cross-slot batched draft).
+    /// `slot_ids[r]` selects row `r`'s KV slot; `positions[r]` is its draft
+    /// position. Returns per row: top-k candidate tokens (highest first) + the
+    /// wide MTP stream the next draft row branches from. Candidates come from k
+    /// rounds of device argmax + mask — no full-vocab D2H.
     pub(crate) fn mtp_forward_level(
         &self,
         slots: &mut [Dsv4SlotState],
@@ -5872,9 +5527,8 @@ impl Dsv4Model {
         keepalive.keep_hidden(&h_proj);
         keepalive.keep_hidden(&stream);
 
-        // ── ONE MTP transformer layer over the batch; attention per row at the
-        // draft position. Top-k widens this draft readout; the caller decides
-        // which candidate rows are scheduled for target verify.
+        // ONE MTP transformer layer over the batch; attention per row at the draft
+        // position. Top-k widens this draft readout only.
         let layer = &mtp.layer;
         let target_layer_idx = self.mtp_frozen_target_layer_idx(mtp)?;
         for &sid in slot_ids {
@@ -6059,7 +5713,6 @@ impl Dsv4Model {
         keepalive.keep_hidden(&moe_with_shared);
         keepalive.keep_hidden(&ffn_stream);
 
-        // ── Head: per-row HC fold + norm, batched lm_head, device top-k.
         // SAFETY: uninit device scratch; fully written before first read.
         let mut head_normed = unsafe { HiddenStates::uninit(ctx, hidden_size, m)? };
         crate::profile::profile_op(ctx, "head_hc", Some(target_layer_idx), m, || {
@@ -6109,9 +5762,8 @@ impl Dsv4Model {
         Ok(out)
     }
 
-    /// Batched lm_head: `[m, hidden] → [m, vocab]` — ONE GEMM for every weight
-    /// format (`dsv4_linear`: bf16 → cuBLAS gemm_batch, FP8/FP4 → mla_linear),
-    /// weight read once for all `m` rows.
+    /// Batched lm_head: `[m, hidden] → [m, vocab]`, one GEMM for every weight
+    /// format (`dsv4_linear`).
     fn lm_head_project_batch(&self, x: &HiddenStates, out: &mut HiddenStates) -> Result<()> {
         ensure!(
             self.lm_head.cols == x.hidden_dim
@@ -6125,11 +5777,9 @@ impl Dsv4Model {
             out.hidden_dim,
             out.seq_len
         );
-        // ONE batched GEMM for every weight format (bf16 → cuBLAS gemm_batch,
-        // FP8/FP4 → mla_linear) — the lm_head weight is read ONCE for all `m` rows.
-        // The old bf16 path looped a per-row GEMV, re-reading the whole ~1 GB bf16
-        // lm_head weight PER ROW — at a c=16×depth verify that was ~48× the HBM
-        // traffic and the #1 decode GPU kernel (nsys: gemv_handwritten 19%, 558µs).
+        // The lm_head weight is read ONCE for all `m` rows. The old per-row GEMV
+        // re-read the whole ~1 GB bf16 weight PER ROW — at c=16×depth verify ~48×
+        // the HBM traffic and the #1 decode kernel (nsys 19%, 558µs).
         crate::attention::dsv4_linear(&self.ctx, &self.lm_head, x, out)
     }
 
@@ -6173,9 +5823,8 @@ impl Dsv4Model {
             .collect()
     }
 
-    /// Batched device top-k over `[m, vocab]` logits. Highest-first per row.
-    /// Mutates the logits scratch by masking each selected id to `-inf`; callers
-    /// only use draft logits for candidate extraction.
+    /// Batched device top-k over `[m, vocab]` logits, highest-first per row.
+    /// Masks each selected id to `-inf` in the caller's logits scratch.
     fn mtp_topk_device(&self, logits: &mut HiddenStates, k: usize) -> Result<Vec<Vec<u32>>> {
         let ctx = &self.ctx;
         let m = logits.seq_len;
@@ -6230,10 +5879,9 @@ impl Dsv4Model {
     }
 
     fn mtp_frozen_target_layer_idx(&self, mtp: &Dsv4MtpLayer) -> Result<usize> {
-        // SGLang's frozen-KV MTP harness maps assistant logical layer 0 to
-        // target physical layer 0. DSv4's shipped MTP layer is forced to
-        // compress_ratio=0 (SW-only), so the draft reads that committed target
-        // SW ring instead of a fresh one-token attention state.
+        // DSv4's shipped MTP layer is forced to compress_ratio=0 (SW-only), so the
+        // draft reads target physical layer 0's committed SW ring instead of a
+        // fresh one-token attention state.
         let idx = 0;
         let layer = self.layers.get(idx).ok_or_else(|| {
             anyhow!(
@@ -6254,9 +5902,8 @@ impl Dsv4Model {
         Ok(idx)
     }
 
-    /// Project the final hidden vector through the LM head into `logits`. The
-    /// head can be plain bf16 or DSv4 FP8/FP4 block-scaled, so dispatch the
-    /// matching single-vector kernel (`seq_len == 1`).
+    /// Project the final hidden vector through the LM head. The head can be bf16
+    /// or DSv4 FP8/FP4 block-scaled, so dispatch the matching kernel.
     fn lm_head_project(&self, x: &DeviceVec, logits: &mut DeviceVec) -> Result<()> {
         use cuda_kernels::tensor::WeightFormat;
         ensure!(
@@ -6305,15 +5952,9 @@ impl Dsv4Model {
     }
 }
 
-/// GLM dense layer (`config.per_layer_dense_mlp[i]`) forward: a plain SwiGLU
-/// FFN that replaces the routed-expert + shared-expert MoE. bf16 throughout
-/// (gate/up/down are `DeviceMatrix` DenseBf16). DSv4 never has `dense_mlp`, so
-/// this is GLM-only.
-///
-///   gate = down·SiLU(gate_w·x) ⊙ (up_w·x)
-///
-/// `out` must be `[hidden, tok]` (== `x` hidden). Writes the FFN output for the
-/// MoE half; the caller folds it into the residual.
+/// GLM dense layer (`config.per_layer_dense_mlp[i]`) forward: a plain SwiGLU FFN
+/// replacing the routed-expert + shared-expert MoE, bf16 throughout. `out` must
+/// be `[hidden, tok]` (== `x` hidden); the caller folds it into the residual.
 fn dsv4_dense_mlp_forward(
     ctx: &DeviceContext,
     dense: &Dsv4DenseMlp,
@@ -6335,26 +5976,22 @@ fn dsv4_dense_mlp_forward(
     );
     let tok = x.seq_len;
     let inter = dense.intermediate;
-    // gate = gate_w · x  → [intermediate, tok]
     // SAFETY: uninit device scratch; fully written before first read.
     let mut gate = unsafe { HiddenStates::uninit(ctx, inter, tok)? };
     crate::attention::dsv4_linear(ctx, &dense.gate, x, &mut gate)?;
     keepalive.keep_hidden(&gate);
-    // up = up_w · x  → [intermediate, tok]
     // SAFETY: uninit device scratch; fully written before first read.
     let mut up = unsafe { HiddenStates::uninit(ctx, inter, tok)? };
     crate::attention::dsv4_linear(ctx, &dense.up, x, &mut up)?;
     keepalive.keep_hidden(&up);
-    // act = SiLU(gate) ⊙ up. GLM dense uses plain SiLU(gate)*up with NO clamp
-    // (into_deepseek_v4 sets swiglu_limit=0.0, which the clamped kernel rejects),
-    // so use the unclamped silu_mul.
+    // GLM dense uses plain SiLU(gate)*up with NO clamp (into_deepseek_v4 sets
+    // swiglu_limit=0.0, which the clamped kernel rejects).
     // ponytail: pod-verify GLM dense FFN activation = silu(gate)*up (unclamped)
     let _ = swiglu_limit;
     // SAFETY: uninit device scratch; fully written before first read.
     let mut act = unsafe { HiddenStates::uninit(ctx, inter, tok)? };
     crate::ops::silu_mul(ctx, &gate, &up, &mut act)?;
     keepalive.keep_hidden(&act);
-    // out = down_w · act  → [hidden, tok]
     crate::attention::dsv4_linear(ctx, &dense.down, &act, out)?;
     Ok(())
 }

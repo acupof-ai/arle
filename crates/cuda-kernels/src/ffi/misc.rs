@@ -733,25 +733,6 @@ unsafe extern "C" {
         stream: super::CUstream,
     ) -> super::CUresult;
 
-    /// Device-side build of the batched-decode CSA select metadata. ONE launch
-    /// over `n*num_pages` threads computes `block_table[r*num_pages+b] =
-    /// slot_ids[r]*num_pages + b`, and per-row `positions[r]=start_pos[r]`,
-    /// `context_lens[r]=min(start_pos[r]/ratio, key_counts[r])` — byte-identical
-    /// to the host loops in `csa_select_official_batched`, removing the per-step
-    /// H2D (graph-capturable).
-    pub fn dsv4_dsa_build_select_meta_cuda(
-        block_table: *mut i32,
-        context_lens: *mut i32,
-        positions: *mut i32,
-        slot_ids: *const i32,
-        start_pos: *const i32,
-        key_counts: *const i32,
-        n: i32,
-        num_pages: i32,
-        ratio: i32,
-        stream: super::CUstream,
-    ) -> super::CUresult;
-
     pub fn dsv4_deepseek_v4_topk_transform_cuda(
         scores: *const f32,
         seq_lens: *const i32,
