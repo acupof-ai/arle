@@ -23,7 +23,7 @@ use super::{
     backward_with_optional_profile, log_opd_window_trace,
     loss::{kl_distill_loss_for_config, next_token_sft_loss_from_logits},
     map_qwen35_forward_error, map_teacher_forward_error, opd_backward_profile_enabled,
-    print_backward_profile, record_profile,
+    print_backward_profile, record_profile, step_trace_enabled,
     validation::{validate_logits_shape, validate_loss_value},
     windowing::{kl_logit_range, sequence_windows, sequence_windows_for_range},
 };
@@ -483,6 +483,16 @@ fn backward_windowed_kl_cached_hidden<T: TeacherForward + ?Sized>(
         student_started,
         format!("tensor_id={student_hidden}"),
     );
+    if step_trace_enabled() {
+        // Diagnostic: an all-zero hidden state makes every window's CE exactly
+        // ln(vocab) and NaNs the norm backward; surface it before the loss.
+        let hidden_sq = store.get(student_hidden).and_then(|t| {
+            t.device_handle
+                .as_ref()
+                .and_then(|h| store.backend().sum_squares(h, &t.shape).ok())
+        });
+        eprintln!("[opd-diag] student_hidden sum_sq={hidden_sq:?}");
+    }
     record_profile(profile, |profile| {
         profile.student_forward_seconds += student_started.elapsed().as_secs_f64();
     });
@@ -558,6 +568,20 @@ fn backward_windowed_kl_cached_hidden<T: TeacherForward + ?Sized>(
             let student_logits = student
                 .logits_from_hidden_window(store, &mut window_tape, student_hidden, window)
                 .map_err(|err| map_qwen35_forward_error("student cached-hidden KL beta", err))?;
+            if window_offset == 0 && step_trace_enabled() {
+                let sq = |id: TensorId| {
+                    store.get(id).and_then(|t| {
+                        t.device_handle
+                            .as_ref()
+                            .and_then(|h| store.backend().sum_squares(h, &t.shape).ok())
+                    })
+                };
+                eprintln!(
+                    "[opd-diag] window0 student_logits sum_sq={:?} teacher_logits sum_sq={:?}",
+                    sq(student_logits),
+                    sq(teacher_tensor_id)
+                );
+            }
             record_profile(profile, |profile| {
                 profile.student_forward_seconds += logits_started.elapsed().as_secs_f64();
             });
