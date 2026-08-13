@@ -19,6 +19,8 @@ Related governance docs:
 
 ## [Unreleased]
 
+- **FIX (accept) — prefix-cache metrics report actual restored work** (2026-08-13; `c112b81de`, [bench](docs/experience/wins/2026-08-13-kv-prefix-metrics-and-oversubscription-slice.md)). Raw and backend-licensed radix matches are counted at lookup; hits, tokens, pages, and resident reuse are counted from the restored token boundary. A Qwen3.6 8191-token common prefix with no sidecar now reports zero hit and one fallback, while the 8192 boundary reports 8192 restored tokens and 512 pages. Needle retrieval passed 3/3 at 512, 4096, 8192, and 12000 tokens. The existing whole-slot minimum decode slice is configurable; its default remains 8 because formal 32K A/B trials were blocked by external GPU-process termination.
+
 ## [0.5.5] - 2026-08-13
 
 - **FEATURE (accept) — batched paged decode for FP8/INT8 KV pools** (2026-08-13; `ff33bdb77`). Removed three BF16-only gates that blocked quantized KV from batched decode (batch > 1): the `for_rows` batch==1 restriction on quant metadata, the `for_decode_batch` format check, and the `submit_decode_batch` `paged_kv_bf16()` gate. Multi-row `new_token_rows` concatenates per-slot; `quant_decode_meta` uses all slots. The `decode_attention_varlen_quantized` kernel already accepted batch_size, so no kernel change was needed. Verified: 4 concurrent needle requests with FP8 KV all passed, needle ladder 115-2000 tok 3/3 exact.
