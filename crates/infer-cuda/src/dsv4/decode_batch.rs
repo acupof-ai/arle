@@ -345,7 +345,6 @@ impl Dsv4Model {
                     let mut indexer_sink =
                         crate::attention::Dsv4CompressorBatchPtrs::with_capacity(n);
                     let mut before = Vec::with_capacity(n);
-                    let original_seq_len = proj.rope.original_seq_len;
                     for r in 0..n {
                         // Defer mode reads NO `normed_row` data — it only gathers
                         // state pointers and advances seq_len — but the handle's
@@ -359,8 +358,10 @@ impl Dsv4Model {
                             layer.compress_ratio,
                             &normed_row,
                             &mut slot.attention[layer_idx],
-                            start_positions[r],
-                            Some(&slot.start_pos_device),
+                            crate::attention::Dsv4Position {
+                                start: start_positions[r],
+                                device: Some(&slot.start_pos_device),
+                            },
                             proj.rope,
                             &mut main_sink,
                             &mut indexer_sink,
@@ -684,8 +685,10 @@ impl Dsv4Model {
                                     &mut slot.attention[layer_idx],
                                     layer_pool,
                                     dsa_shared,
-                                    start_positions[r],
-                                    Some(&slot.start_pos_device),
+                                    crate::attention::Dsv4Position {
+                                        start: start_positions[r],
+                                        device: Some(&slot.start_pos_device),
+                                    },
                                     batched_gather,
                                     compressor_precomputed,
                                     indexer_query_precomputed,
@@ -1052,8 +1055,10 @@ impl Dsv4Model {
                                     sw_window,
                                     &p.k_prepared,
                                     &mut p.local_attn,
-                                    start_positions[r],
-                                    &slot.start_pos_device,
+                                    crate::attention::Dsv4Position {
+                                        start: start_positions[r],
+                                        device: Some(&slot.start_pos_device),
+                                    },
                                     p.local_heads,
                                     p.rope,
                                 )?;
@@ -1164,8 +1169,10 @@ impl Dsv4Model {
                             prefill_shared,
                             // Decode lane (start_pos_device Some): probe unreachable.
                             None,
-                            start_positions[r],
-                            Some(&slot.start_pos_device),
+                            crate::attention::Dsv4Position {
+                                start: start_positions[r],
+                                device: Some(&slot.start_pos_device),
+                            },
                             None,
                             &self.tp,
                             &mut attn_out_row,
@@ -1611,8 +1618,10 @@ impl Dsv4Model {
                                     flashmla_scratch,
                                     prefill_shared,
                                     fp32,
-                                    start_positions[s],
-                                    None,
+                                    crate::attention::Dsv4Position {
+                                        start: start_positions[s],
+                                        device: None,
+                                    },
                                     Some(&sparse_metas[s]),
                                     &self.tp,
                                     &mut attn_chunk,
