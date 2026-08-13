@@ -22,7 +22,7 @@ pub(super) enum F32Operand<'a> {
 
 #[cfg(not(feature = "no-cuda"))]
 impl F32Operand<'_> {
-    fn get(&self) -> &CudaSlice<f32> {
+    pub(super) fn get(&self) -> &CudaSlice<f32> {
         match self {
             Self::Borrowed(slice) => slice,
             Self::Imported(slice) => slice,
@@ -38,7 +38,7 @@ pub(super) enum Bf16Operand<'a> {
 
 #[cfg(not(feature = "no-cuda"))]
 impl Bf16Operand<'_> {
-    fn get(&self) -> &CudaSlice<u16> {
+    pub(super) fn get(&self) -> &CudaSlice<u16> {
         match self {
             Self::Borrowed(slice) => slice,
             Self::Quantized(slice) => slice,
