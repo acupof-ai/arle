@@ -2695,4 +2695,47 @@ mod tests {
         assert_eq!(widened, expected);
         Ok(())
     }
+
+    #[test]
+    fn bf16_bridge_timing_realistic_logits() -> Result<()> {
+        let backend = CudaBackend::new(0)?;
+        let alt_stream = backend
+            .stream
+            .context()
+            .new_stream()
+            .map_err(|_| AutogradError::TapeInvariant("new_stream failed (bf16 timing)"))?;
+        // Realistic teacher logits: [512, 151936] bf16 ~= 155 MB.
+        let seq_len = 512usize;
+        let vocab = 151_936usize;
+        let len = seq_len * vocab;
+        let src: CudaSlice<u16> = alt_stream
+            .alloc_zeros(len)
+            .map_err(|_| AutogradError::TapeInvariant("alloc failed (bf16 timing)"))?;
+        let (src_ptr, _src_guard) = src.device_ptr(&alt_stream);
+        let src_stream = alt_stream.cu_stream() as u64;
+        let shape = vec![seq_len, vocab];
+
+        // Warmup.
+        let _ = backend.import_bf16_device_ptr_as_f32(src_ptr, src_stream, len, &shape)?;
+        backend
+            .stream
+            .synchronize()
+            .map_err(|_| AutogradError::TapeInvariant("sync failed (bf16 timing)"))?;
+
+        let start = std::time::Instant::now();
+        for _ in 0..5 {
+            let _ = backend.import_bf16_device_ptr_as_f32(src_ptr, src_stream, len, &shape)?;
+        }
+        backend
+            .stream
+            .synchronize()
+            .map_err(|_| AutogradError::TapeInvariant("sync failed (bf16 timing)"))?;
+        let elapsed = start.elapsed();
+        println!(
+            "bf16_bridge_timing: {:.3} ms/call (5 calls, {:.1} MB each)",
+            elapsed.as_secs_f64() * 1000.0 / 5.0,
+            (len * 2) as f64 / 1e6,
+        );
+        Ok(())
+    }
 }
