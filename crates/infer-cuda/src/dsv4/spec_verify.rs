@@ -287,12 +287,15 @@ impl Dsv4Model {
                     let (layer_pool, dsa_shared, flashmla_scratch, prefill_shared, fp32) =
                         kv_adapter.layer_and_dsa_shared_mut(layer_idx)?;
                     crate::attention::mla_attention(
-                        ctx,
-                        &self.config,
-                        &layer.attention,
-                        layer.mode,
-                        layer.compress_ratio,
-                        layer_idx,
+                        &self.attn_ctx(
+                            layer,
+                            layer_idx,
+                            crate::attention::Dsv4Position {
+                                start: start_pos,
+                                device: None,
+                            },
+                            Some(&sparse_verify_meta),
+                        ),
                         normed,
                         &mut slot.attention[layer_idx],
                         layer_pool,
@@ -300,12 +303,6 @@ impl Dsv4Model {
                         flashmla_scratch,
                         prefill_shared,
                         fp32,
-                        crate::attention::Dsv4Position {
-                            start: start_pos,
-                            device: None,
-                        },
-                        Some(&sparse_verify_meta),
-                        &self.tp,
                         &mut current.attn_out,
                         &mut keepalive,
                     )
