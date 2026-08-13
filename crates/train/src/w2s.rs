@@ -16,6 +16,7 @@ use std::collections::HashSet;
 use anyhow::{Result, anyhow};
 use autograd::{
     Optimizer, Tape, TensorId, TensorStore,
+    grad_clip::finite_optimizer_step,
     ops::{add, mul_scalar, softmax},
 };
 
@@ -23,26 +24,7 @@ use crate::loss::{KlDirection, kl_distill_loss};
 use crate::qwen35::Qwen35Model;
 #[cfg(feature = "cuda")]
 use crate::teacher_infer::{InferTeacher, TeacherForward};
-
-/// Copy host data into a tensor and mark it dirty for device upload.
-fn write_tensor_data(store: &mut TensorStore, id: TensorId, data: &[f32]) -> Result<()> {
-    {
-        let tensor = store
-            .get_mut(id)
-            .ok_or_else(|| anyhow!("write_tensor_data: tensor {id} not found"))?;
-        if tensor.data.len() != data.len() {
-            return Err(anyhow!(
-                "write_tensor_data: length mismatch for {id}: tensor has {}, data has {}",
-                tensor.data.len(),
-                data.len()
-            ));
-        }
-        tensor.data.copy_from_slice(data);
-        tensor.dirty = autograd::tensor::Dirty::Host;
-    }
-    store.ensure_device(id)?;
-    Ok(())
-}
+use crate::trainer::cleanup_after_backward;
 
 /// Copy all LoRA adapter weights from `src` to `dst` (shadow → serving or
 /// serving → shadow). Both models must share the same adapter layout (created
@@ -55,11 +37,23 @@ pub fn sync_lora_adapters(
     let src_map = src.adapter_name_map();
     let dst_map = dst.adapter_name_map();
     for (name, src_id) in &src_map {
-        let dst_id = dst_map
+        let dst_id = *dst_map
             .get(name)
             .ok_or_else(|| anyhow!("sync_lora_adapters: dst missing adapter {name:?}"))?;
         let data = store.to_host(*src_id)?;
-        write_tensor_data(store, *dst_id, &data)?;
+        let tensor = store
+            .get_mut(dst_id)
+            .ok_or_else(|| anyhow!("sync_lora_adapters: tensor {dst_id} not found"))?;
+        if tensor.data.len() != data.len() {
+            return Err(anyhow!(
+                "sync_lora_adapters: length mismatch for {dst_id}: tensor has {}, data has {}",
+                tensor.data.len(),
+                data.len()
+            ));
+        }
+        tensor.data.copy_from_slice(&data);
+        tensor.dirty = autograd::tensor::Dirty::Host;
+        store.ensure_device(dst_id)?;
     }
     Ok(())
 }
@@ -282,25 +276,19 @@ pub fn w2s_step<O: Optimizer>(
     let num_positions = input_ids.len();
     let mut timer = StageTimer::new();
 
-    // Cleanup: keep all model params, free everything else. Grads are freed by
-    // `zero_grad` after the optimizer step — keeping them here would silently
-    // accumulate across steps (backward adds to existing grads).
-    let cleanup = |store: &mut TensorStore, tape: &mut Tape| {
-        let mut keep = HashSet::new();
-        for model in [
-            student.all_parameter_ids(),
-            student_old.all_parameter_ids(),
-            student_base.all_parameter_ids(),
-            aux1.pre_rl_param_ids(),
-            aux1.post_rl_param_ids(),
-            aux2.pre_rl_param_ids(),
-            aux2.post_rl_param_ids(),
-        ] {
-            keep.extend(model);
-        }
-        store.retain_ids(&keep);
-        tape.entries.clear();
-    };
+    // Cleanup keeps every model param and frees the rest. Grads are already gone
+    // by then: `zero_grad` frees the tensor and clears the param's grad slot.
+    let keep_params: Vec<TensorId> = [
+        student.all_parameter_ids(),
+        student_old.all_parameter_ids(),
+        student_base.all_parameter_ids(),
+        aux1.pre_rl_param_ids(),
+        aux1.post_rl_param_ids(),
+        aux2.pre_rl_param_ids(),
+        aux2.post_rl_param_ids(),
+    ]
+    .concat();
+    let keep_extra = HashSet::new();
 
     // 1. Student forward → z_s
     let z_s = student
@@ -324,7 +312,7 @@ pub fn w2s_step<O: Optimizer>(
         .copied()
         .fold(f32::NEG_INFINITY, f32::max);
     if max_prob > cfg.confidence_threshold {
-        cleanup(store, tape);
+        cleanup_after_backward(store, tape, &keep_params, &keep_extra);
         return Ok(W2sStepOutcome {
             loss: 0.0,
             skipped: true,
@@ -357,7 +345,7 @@ pub fn w2s_step<O: Optimizer>(
     // quantization overflow on some inputs). Skip rather than poisoning the
     // student's adapter weights with a NaN gradient.
     if consistency.is_nan() || consistency < cfg.consistency_threshold {
-        cleanup(store, tape);
+        cleanup_after_backward(store, tape, &keep_params, &keep_extra);
         return Ok(W2sStepOutcome {
             loss: 0.0,
             skipped: true,
@@ -432,14 +420,16 @@ pub fn w2s_step<O: Optimizer>(
     let loss_value = store.to_host(loss)?[0];
     tape.backward(loss, store)?;
     timer.stage("backward", store);
-    if cfg.grad_clip > 0.0 {
-        crate::grad_clip::clip_grad_norm(trainable_params, cfg.grad_clip, store);
-    }
-    optimizer.step(store, trainable_params)?;
-    optimizer.zero_grad(store, trainable_params);
+    finite_optimizer_step(
+        loss_value,
+        trainable_params,
+        cfg.grad_clip,
+        optimizer,
+        store,
+    )?;
     timer.stage("optimizer", store);
 
-    cleanup(store, tape);
+    cleanup_after_backward(store, tape, &keep_params, &keep_extra);
     timer.stage("cleanup", store);
 
     Ok(W2sStepOutcome {

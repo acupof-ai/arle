@@ -193,14 +193,6 @@ impl DpContext {
     pub fn is_enabled(self) -> bool {
         self.size > 1
     }
-
-    pub fn batch_shard(self, batch_len: usize) -> SeqShard {
-        if self.size <= 1 {
-            return SeqShard::contiguous(0, batch_len);
-        }
-        let range = crate::lora_shard::shard_range(batch_len, self.rank, self.size);
-        SeqShard::contiguous(range.start, range.end)
-    }
 }
 
 pub fn global_inv_n(dp_group_sum: usize) -> Option<f32> {

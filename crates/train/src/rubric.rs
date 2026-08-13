@@ -211,7 +211,7 @@ pub fn select(rollouts: &[String], verdicts: &[Verdict]) -> Selection {
     }
 }
 
-pub fn extract_last_braced(text: &str, marker: &str) -> Option<String> {
+fn extract_last_braced(text: &str, marker: &str) -> Option<String> {
     if marker.is_empty() {
         return None;
     }
@@ -250,7 +250,7 @@ pub fn extract_last_braced(text: &str, marker: &str) -> Option<String> {
     }
 }
 
-pub fn normalize_math_answer(answer: &str) -> String {
+fn normalize_math_answer(answer: &str) -> String {
     let mut s = answer.trim().to_string();
     if let Some(boxed) = extract_last_braced(&s, "\\boxed{") {
         s = boxed;

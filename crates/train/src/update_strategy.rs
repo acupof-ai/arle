@@ -8,8 +8,7 @@ use autograd::{TensorId, TensorStore, optim::Optimizer};
 
 use crate::grad_clip::finite_optimizer_step;
 use crate::opd::{
-    OpdError, Result, ValueCritic, WritebackLoss, capture_rollout_logprobs,
-    masked_writeback_ce_step_dispatch, masked_writeback_step,
+    OpdError, Result, ValueCritic, WritebackLoss, capture_rollout_logprobs, masked_writeback_step,
 };
 use crate::qwen35::Qwen35Model;
 
@@ -31,11 +30,10 @@ pub struct ScoredTrajectory {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SampleFilter {
+enum SampleFilter {
     PassOnly,
     KeepAll,
     DropZeroAdvGroup,
-    DropTruncated,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -52,14 +50,14 @@ pub enum Advantage {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RatioGrain {
+enum RatioGrain {
     None,
     PerToken,
     PerSequence,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub enum ClipForm {
+enum ClipForm {
     HardGate { lo: f32, hi: f32 },
     DetachedSoftClamp { lo: f32, hi: f32 },
     PpoClip { lo: f32, hi: f32 },
@@ -76,7 +74,7 @@ impl ClipForm {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Aggregation {
+enum Aggregation {
     PerSeqTokenMean,
     GlobalTokenMean { norm_const: Option<usize> },
 }
@@ -94,11 +92,11 @@ pub struct UpdateReport {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct UpdatePreset {
-    pub filter: SampleFilter,
+    filter: SampleFilter,
     pub advantage: Advantage,
-    pub ratio: RatioGrain,
-    pub clip: ClipForm,
-    pub agg: Aggregation,
+    ratio: RatioGrain,
+    clip: ClipForm,
+    agg: Aggregation,
 }
 
 impl UpdatePreset {
@@ -195,7 +193,7 @@ impl UpdatePreset {
         }
     }
 
-    pub fn needs_value_critic(&self) -> bool {
+    fn needs_value_critic(&self) -> bool {
         matches!(self.advantage, Advantage::ValueGae { .. })
     }
 
@@ -203,7 +201,6 @@ impl UpdatePreset {
         match self.filter {
             SampleFilter::PassOnly => batch.iter().filter(|t| t.reward >= 1.0).collect(),
             SampleFilter::KeepAll => batch.iter().collect(),
-            SampleFilter::DropTruncated => batch.iter().filter(|t| !t.truncated).collect(),
             SampleFilter::DropZeroAdvGroup => {
                 let live = |t: &ScoredTrajectory| {
                     batch
@@ -662,11 +659,13 @@ fn update_ce<O: Optimizer>(
     let mut tokens = 0usize;
     let mut trained = 0usize;
     for traj in survivors {
-        loss_sum += masked_writeback_ce_step_dispatch(
+        loss_sum += masked_writeback_step(
+            WritebackLoss::Ce,
             student,
             all_params,
             trainable,
             opt,
+            true,
             &traj.prompt_ids,
             &traj.response_ids,
             &traj.response_mask,
@@ -675,7 +674,8 @@ fn update_ce<O: Optimizer>(
             crate::context_parallel::CpContext::from_env(),
             crate::context_parallel::DpContext::from_env(),
             store,
-        )?;
+        )?
+        .0;
         tokens += traj.response_mask.iter().filter(|&&m| m == 1).count();
         trained += 1;
     }

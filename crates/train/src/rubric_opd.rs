@@ -68,7 +68,7 @@ impl FlashJudge {
         Ok(verdict)
     }
 
-    pub fn judge_resilient(&self, rubric: &Rubric, problem: &str, rollout: &str) -> Verdict {
+    fn judge_resilient(&self, rubric: &Rubric, problem: &str, rollout: &str) -> Verdict {
         match self.judge(rubric, problem, rollout) {
             Ok(v) => v,
             Err(err) => {
@@ -78,7 +78,7 @@ impl FlashJudge {
         }
     }
 
-    pub fn judge_batch(&self, rubric: &Rubric, problem: &str, rollouts: &[String]) -> Vec<Verdict> {
+    fn judge_batch(&self, rubric: &Rubric, problem: &str, rollouts: &[String]) -> Vec<Verdict> {
         if rollouts.is_empty() {
             return Vec::new();
         }

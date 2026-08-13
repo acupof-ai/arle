@@ -3,7 +3,6 @@ use autograd::{
     ops::fused_linear_distill::{
         FusedLinearDistillDirection,
         fused_linear_distill_loss as autograd_fused_linear_distill_loss,
-        fused_linear_distill_loss_sparse as autograd_fused_linear_distill_loss_sparse,
         generalized_jsd_loss as autograd_generalized_jsd_loss,
     },
     ops::{add, gather_last_dim, log_softmax, mean, mul, mul_scalar, slice, softmax},
@@ -327,39 +326,6 @@ pub fn fused_linear_distill_loss(
         chunk_size,
         temperature,
         direction,
-        store,
-        tape,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn fused_linear_distill_loss_sparse(
-    hidden: TensorId,
-    lm_head: TensorId,
-    teacher_topk_log_probs: TensorId,
-    teacher_topk_indices: &[i32],
-    row_start: usize,
-    num_positions: usize,
-    chunk_size: usize,
-    temperature: f32,
-    direction: KlDirection,
-    store: &mut TensorStore,
-    tape: &mut Tape,
-) -> Result<TensorId> {
-    if direction != KlDirection::Forward {
-        return Err(AutogradError::TapeInvariant(
-            "fused_linear_distill_loss_sparse: sparse teacher top-k is forward-KL only",
-        ));
-    }
-    autograd_fused_linear_distill_loss_sparse(
-        hidden,
-        lm_head,
-        teacher_topk_log_probs,
-        teacher_topk_indices,
-        row_start,
-        num_positions,
-        chunk_size,
-        temperature,
         store,
         tape,
     )

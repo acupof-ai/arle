@@ -20,8 +20,8 @@ pub mod app {
         infer_student::InferStudent,
         opd::{
             DEFAULT_LOGITS_WINDOW_SIZE, GkdLossConfig, GkdSftAnchor, InferRolloutCtx, OpdKlMask,
-            OpdStepConfig, OpdStepProfile, infer_rollout_flag_enabled,
-            opd_step_with_teacher_forward_profiled_gkd_anchor,
+            OpdStepConfig, OpdStepInputs, OpdStepProfile, infer_rollout_flag_enabled,
+            opd_step_with_teacher,
         },
         prompts::load_jsonl_prompt_sets,
         qwen35::{Qwen35KvCache, Qwen35Model, forward_rollout_cached},
@@ -452,16 +452,15 @@ pub mod app {
                     .expect("infer rollout student is only loaded for LoRA mode"),
             });
             let mut profile = OpdStepProfile::default();
-            let outcome = opd_step_with_teacher_forward_profiled_gkd_anchor(
-                &student,
-                &teacher_forward,
-                prompt,
-                step_config.clone(),
-                &student_trainable_params,
-                &mut optimizer,
-                &mut store,
-                &mut tape,
-                GkdLossConfig {
+            let outcome = opd_step_with_teacher(
+                OpdStepInputs::new(
+                    &student,
+                    &teacher_forward,
+                    prompt,
+                    step_config.clone(),
+                    &student_trainable_params,
+                )
+                .gkd(GkdLossConfig {
                     lambda: 0.0,
                     sft_anchor: GkdSftAnchor::StudentRollout,
                     corpus_tokens: None,
@@ -473,9 +472,11 @@ pub mod app {
                     fused_distill: true,
                     logits_window_size: Some(args.logits_window_size),
                     kl_mask: OpdKlMask::CompletionOnly,
-                },
-                None,
-                infer_rollout,
+                })
+                .infer_rollout(infer_rollout),
+                &mut optimizer,
+                &mut store,
+                &mut tape,
                 Some(&mut profile),
             )?;
             let elapsed = step_started.elapsed().as_secs_f64();
