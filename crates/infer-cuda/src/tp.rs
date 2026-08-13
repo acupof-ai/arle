@@ -1,9 +1,5 @@
-//! Tensor-parallel runtime config + communicator handle.
-//!
-//! [`resolve_tp_config`] resolves env → [`TpConfig`] (CPU-testable);
-//! [`TpRuntime`] pairs it with a communicator (the NCCL handle is
-//! `nccl`-gated; `world_size == 1` is the no-op path). The sharding math lives in
-//! `infer-topo`.
+//! Tensor-parallel runtime config + communicator handle. Sharding math lives in
+//! `infer-topo`; `world_size == 1` is the no-op path.
 
 use infer_topo::TpConfig;
 
@@ -17,8 +13,7 @@ fn lookup_usize(
         .and_then(|value| value.trim().parse::<usize>().ok())
 }
 
-/// Count the ordinals in a comma-separated `INFER_CUDA_DEVICES` list (empty
-/// entries ignored). The count is the TP world size (8 ordinals ⇒ TP=8).
+/// Ordinal count of a comma-separated `INFER_CUDA_DEVICES` list = the TP world size.
 fn count_cuda_devices(value: &str) -> Option<usize> {
     let count = value
         .split(',')
@@ -27,11 +22,11 @@ fn count_cuda_devices(value: &str) -> Option<usize> {
     (count > 0).then_some(count)
 }
 
-/// Resolve [`TpConfig`] from an env lookup. World size: `INFER_TP_SIZE`/`ARLE_*`,
-/// else `INFER_CUDA_DEVICES` count, else 1. Rank: `INFER_TP_RANK`/`ARLE_*` (0).
+/// World size: `INFER_TP_SIZE`/`ARLE_*`, else `INFER_CUDA_DEVICES` count, else 1.
+/// Rank: `INFER_TP_RANK`/`ARLE_*`, else 0.
 ///
 /// # Errors
-/// Errors if the resolved `(world_size, rank)` is invalid, via [`TpConfig::new`].
+/// Errors if the resolved `(world_size, rank)` is invalid.
 pub fn resolve_tp_config(
     mut lookup: impl FnMut(&str) -> Option<String>,
 ) -> infer_topo::Result<TpConfig> {
@@ -44,33 +39,24 @@ pub fn resolve_tp_config(
     TpConfig::new(world_size, rank)
 }
 
-/// Resolve [`TpConfig`] from the process environment.
-///
 /// # Errors
 /// Errors if the resolved `(world_size, rank)` pair is invalid.
 pub fn resolve_tp_config_from_env() -> infer_topo::Result<TpConfig> {
     resolve_tp_config(|key| std::env::var(key).ok())
 }
 
-/// Tensor-parallel communicator handle. [`Self::Nccl`] (only in `nccl` builds)
-/// wraps `cuda_kernels::collective::NcclBackend`; everything else uses the
-/// [`Self::Single`] no-op so the code compiles GPU-free.
 pub enum TpComm {
-    /// Single rank: no collectives needed.
     Single,
-    /// Multi-rank NCCL-backed communicator (real collectives).
     #[cfg(feature = "nccl")]
     Nccl(Box<cuda_kernels::collective::NcclBackend>),
 }
 
 impl TpComm {
-    /// The single-rank no-op communicator.
     #[must_use]
     pub fn single() -> Self {
         Self::Single
     }
 
-    /// Whether this communicator performs real cross-rank collectives.
     #[must_use]
     pub fn is_collective(&self) -> bool {
         match self {
@@ -81,24 +67,15 @@ impl TpComm {
     }
 }
 
-/// Tensor-parallel runtime: the resolved [`TpConfig`] plus its communicator.
 pub struct TpRuntime {
     config: TpConfig,
     comm: TpComm,
-    /// Attention tensor-parallel sub-communicator (DSv4 DP-attention).
-    /// Under the default TP8/EP8 route this aliases [`TpComm::Single`] because
-    /// the attn_tp groups equal the global comm (attn_dp=1).
-    // T2.3 will consume this (DP-attention token-owned EP sub-collectives).
+    /// Aliases [`TpComm::Single`] when attn_dp=1 (the default TP8/EP8 route).
     attn_tp: TpComm,
-    /// MoE expert-parallel sub-communicator (DSv4 token-owned EP).
-    /// Under the default TP8/EP8 route this aliases [`TpComm::Single`] because
-    /// `ep_size == tp_size` ⇒ the moe_ep groups equal the global comm.
-    // T2.3 will consume this (DP-attention token-owned EP sub-collectives).
+    /// Aliases [`TpComm::Single`] when `ep_size == tp_size` (default TP8/EP8).
     moe_ep: TpComm,
-    /// One-shot small-message collective path (vendored sgl-kernel/vLLM custom
-    /// allreduce + ARLE one-shot all-gather) for the decode critical chain.
-    /// `None` = NCCL everywhere (single rank, `--comm-backend nccl`, or any
-    /// boot probe/self-test failure — every degrade logs WARN, never silent).
+    /// `None` = NCCL everywhere (single rank, `--comm-backend nccl`, or a failed
+    /// boot probe/self-test — every degrade logs WARN).
     #[cfg(all(feature = "cuda", feature = "nccl"))]
     oneshot: Option<oneshot::OneShotComm>,
 }
@@ -141,7 +118,6 @@ impl Drop for SymmetricIpcBuffer {
 }
 
 impl TpRuntime {
-    /// Single-GPU runtime (no parallelism, no-op communicator).
     #[must_use]
     pub fn single() -> Self {
         Self {
@@ -154,9 +130,8 @@ impl TpRuntime {
         }
     }
 
-    /// Build a runtime from a resolved [`TpConfig`] with the no-op communicator.
-    /// A `world_size > 1` config here is a valid CPU/typecheck shape that
-    /// performs no collectives (NCCL is wired separately).
+    /// A `world_size > 1` config here performs no collectives (NCCL is wired
+    /// separately).
     #[must_use]
     pub fn new(config: TpConfig) -> Self {
         Self {
@@ -169,9 +144,7 @@ impl TpRuntime {
         }
     }
 
-    /// Build a runtime from a config and an explicit communicator. The sub-comms
-    /// default to the no-op [`TpComm::single`]; [`Self::from_env_with_nccl`] is
-    /// the path that builds real attn_tp / moe_ep sub-comms.
+    /// Sub-comms default to the no-op; [`Self::from_env_with_nccl`] builds real ones.
     #[must_use]
     pub fn with_comm(config: TpConfig, comm: TpComm) -> Self {
         Self {
@@ -184,19 +157,14 @@ impl TpRuntime {
         }
     }
 
-    /// Resolve the runtime from env with the no-op communicator.
-    ///
     /// # Errors
     /// Errors if the resolved `(world_size, rank)` pair is invalid.
     pub fn from_env() -> infer_topo::Result<Self> {
         Ok(Self::new(resolve_tp_config_from_env()?))
     }
 
-    /// Resolve from env and, on a multi-rank `nccl` build, bring up the real NCCL
-    /// communicator via `ncclCommInitRank(unique_id, world_size, rank)`.
-    /// `world_size == 1` is exactly [`Self::from_env`] (no-op), so this is safe on
-    /// every path. The launcher owns acquiring + broadcasting the same `unique_id`
-    /// to all ranks; the CUDA device must already be bound to this rank.
+    /// The launcher owns acquiring + broadcasting the same `unique_id` to all
+    /// ranks; the CUDA device must already be bound to this rank.
     ///
     /// # Errors
     /// Errors if the resolved `(world_size, rank)` is invalid or NCCL init fails.
@@ -215,18 +183,13 @@ impl TpRuntime {
         let backend =
             cuda_kernels::collective::NcclBackend::init_rank(unique_id, world_size, rank)?;
 
-        // Env-driven axis config. Under the default TP8/EP8 this yields attn_dp=1
-        // ⇒ attn_tp groups == the global group, and ep_size == tp_size ⇒ moe_ep
-        // groups == the global group, so both splits below alias the global comm.
-        // `cfg` is identical on every rank, so the skip-if-single-group decision
-        // (and thus the sequence of `split` collectives) is identical across all
-        // ranks — required for `ncclCommSplit` collective-ordering correctness.
+        // `cfg` is identical on every rank, so the skip-if-single-group decision (and
+        // thus the `split` collective sequence) matches across ranks — required for
+        // `ncclCommSplit` ordering correctness.
         let cfg = MultiAxisConfig::current_route_from_env_with_defaults(world_size, world_size)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-        // IMPORTANT: do attn_tp then moe_ep, unconditionally-in-the-same-order on
-        // every rank. `split_sub_comm` skips the split only when the partition is
-        // a single global group (identical decision on all ranks).
+        // attn_tp then moe_ep, unconditionally in this order on every rank.
         let attn_tp = Self::split_sub_comm(&backend, &build_attn_tp_groups(cfg), rank)?;
         let moe_ep = Self::split_sub_comm(&backend, &build_moe_ep_groups(cfg), rank)?;
 
@@ -240,24 +203,16 @@ impl TpRuntime {
         })
     }
 
-    /// Build a sub-communicator for `rank` from a rank-partition `groups`
-    /// (each inner Vec = the ranks in one group). If `groups.len() == 1` the
-    /// partition is a single global group (sub-size == tp_size, the builder
-    /// returned the global group), so we skip the redundant `ncclCommSplit`
-    /// (all ranks share one color ⇒ a wasteful global-comm clone + extra
-    /// collective) and return the no-op [`TpComm::single`]. Otherwise we locate
-    /// this rank's `color`/`key` and split the parent comm.
-    ///
-    /// Collective-ordering: callers MUST invoke this in the same order on every
-    /// rank with the same (identical-per-rank) `groups`, so the skip-or-split
-    /// decision and the resulting `split` collective sequence match across ranks.
+    /// `groups` is a rank-partition (each inner Vec = one group's ranks);
+    /// `groups.len() == 1` means the partition is the global group, so the
+    /// redundant `ncclCommSplit` is skipped. Callers MUST invoke this in the
+    /// same order on every rank with identical `groups` (collective ordering).
     #[cfg(feature = "nccl")]
     fn split_sub_comm(
         backend: &cuda_kernels::collective::NcclBackend,
         groups: &[Vec<usize>],
         rank: usize,
     ) -> anyhow::Result<TpComm> {
-        // Single global group ⇒ sub-comm aliases the global comm. Skip the split.
         if groups.len() == 1 {
             return Ok(TpComm::single());
         }
@@ -274,48 +229,40 @@ impl TpRuntime {
         Ok(TpComm::Nccl(Box::new(sub)))
     }
 
-    /// The resolved tensor-parallel placement.
     #[must_use]
     pub fn config(&self) -> &TpConfig {
         &self.config
     }
 
-    /// The communicator handle.
     #[must_use]
     pub fn comm(&self) -> &TpComm {
         &self.comm
     }
 
-    /// The attention tensor-parallel sub-communicator (DSv4 DP-attention).
-    /// Aliases [`TpComm::Single`] under the default TP8/EP8 route.
     #[must_use]
     #[allow(dead_code)] // T2.3 will consume this
     pub fn attn_tp(&self) -> &TpComm {
         &self.attn_tp
     }
 
-    /// The MoE expert-parallel sub-communicator (DSv4 token-owned EP).
-    /// Aliases [`TpComm::Single`] under the default TP8/EP8 route.
     #[must_use]
     #[allow(dead_code)] // T2.3 will consume this
     pub fn moe_ep(&self) -> &TpComm {
         &self.moe_ep
     }
 
-    /// Whether this runtime is single-GPU (no all-reduce needed).
     #[must_use]
     pub fn is_single(&self) -> bool {
         self.config.is_single()
     }
 
-    /// Whether the runtime will perform real cross-rank collectives.
     #[must_use]
     pub fn is_collective(&self) -> bool {
         self.comm.is_collective()
     }
 
-    /// Whether the decode small-message path is currently using ARLE's
-    /// one-shot CustomAllreduce instead of plain NCCL.
+    /// Whether the decode small-message path uses the one-shot CustomAllreduce
+    /// instead of NCCL.
     #[must_use]
     pub fn oneshot_comm_active(&self) -> bool {
         #[cfg(all(feature = "cuda", feature = "nccl"))]
@@ -328,21 +275,9 @@ impl TpRuntime {
         }
     }
 
-    /// All-reduce (sum) a row-parallel GEMM output across the TP group, in place.
-    ///
-    /// Row-parallel linears (`o_proj`/`down_proj`) produce a partial per rank;
-    /// summing reconstructs the full output. Runs in place on the compute stream
-    /// — stream ordering alone sequences GEMM → all-reduce → residual-add, so no
-    /// cross-stream event is needed. [`TpComm::Single`] is a no-op (single rank
-    /// already holds the full output).
-    ///
-    /// # Errors
-    /// Propagates the NCCL all-reduce error on multi-rank builds.
-    /// Bring up the one-shot small-message collective path (default-on with
-    /// automatic loud degrade). COLLECTIVE: every rank must call at the same
-    /// construction point. `--comm-backend nccl` skips it entirely; any
+    /// COLLECTIVE: every rank must call at the same construction point. Any
     /// probe/boot/self-test failure on ANY rank degrades EVERY rank to NCCL via
-    /// the built-in ok-votes (never a silent fallback, never a desynced boot).
+    /// the built-in ok-votes.
     #[cfg(all(feature = "cuda", feature = "nccl"))]
     pub fn init_oneshot_comm(&mut self, ctx: &cuda_kernels::prelude::DeviceContext) {
         if crate::runtime_flags::comm_nccl_only() {
@@ -350,7 +285,7 @@ impl TpRuntime {
             return;
         }
         let TpComm::Nccl(backend) = &self.comm else {
-            return; // single rank — nothing to accelerate
+            return;
         };
         let world = self.config.world_size;
         let rank = self.config.rank;
@@ -385,8 +320,8 @@ impl TpRuntime {
         ctx: &cuda_kernels::prelude::DeviceContext,
         buf: &mut cuda_kernels::prelude::HiddenStates,
     ) -> anyhow::Result<()> {
-        // One-shot path: decode-sized bf16 messages over the GLOBAL comm only
-        // (sub-comms keep NCCL). Oversized (prefill) buffers fall through.
+        // One-shot runs on the global comm only; sub-comms and oversized
+        // (prefill) buffers fall through to NCCL.
         #[cfg(all(feature = "cuda", feature = "nccl"))]
         if let Some(os) = &self.oneshot
             && buf.data.len() * 2 <= os.scratch_bytes()
@@ -396,24 +331,14 @@ impl TpRuntime {
         self.all_reduce_sum_over(&self.comm, ctx, buf)
     }
 
-    /// Token-owned shard + all-reduce: split `input`'s `[seq_len]` rows into
-    /// contiguous `world_size`-way blocks (`div_ceil`), run `compute_fn` over
-    /// just this rank's owned rows, scatter the result into `out`'s owned
-    /// slice, then all-reduce so every rank ends up holding the full
-    /// `[seq_len]` result (unowned rows are zero going into the reduction).
-    ///
-    /// Used by DSv4's DeepEP-LL token-owned MoE dispatch (both prefill and
-    /// decode call sites) for its shard/zero/scatter/all-reduce bookkeeping.
-    /// (The Waterfill shared-expert shard also routed through this primitive
-    /// briefly, then was KILLed 2026-07-06 for no measurable perf gain — see
-    /// `docs/experience/wins/2026-07-06-dsv4-deepep-waterfill-pending-remote.md`.)
+    /// Splits `input`'s `[seq_len]` rows into contiguous `world_size`-way blocks,
+    /// runs `compute_fn` over this rank's rows, then all-reduces so every rank
+    /// holds the full `[seq_len]` result (unowned rows are zero into the reduction).
     ///
     /// `compute_fn(owned_in, owned_out, start, owned_n)` always runs, even at
-    /// `owned_n == 0` (`seq_len < world_size` starves some ranks): DeepEP LL
-    /// dispatch/combine are collectives that every rank must enter regardless.
-    /// `start` is the owned range's first row index (into `input`'s
-    /// `[seq_len]` rows) — callers slicing a parallel per-token array (e.g.
-    /// token ids) need it alongside `owned_n`.
+    /// `owned_n == 0`: DeepEP LL dispatch/combine are collectives that every rank
+    /// must enter regardless. `start` is the owned range's first row index into
+    /// `input`, for callers slicing a parallel per-token array.
     ///
     /// # Errors
     /// Propagates device alloc/copy, `compute_fn`, and all-reduce errors.
@@ -475,18 +400,11 @@ impl TpRuntime {
         self.all_reduce_sum(ctx, out)
     }
 
-    /// All-reduce (sum) in place over an explicit communicator (the global TP
-    /// comm, or one of the [`Self::attn_tp`] / [`Self::moe_ep`] sub-comms).
-    /// Same body as [`Self::all_reduce_sum`] but on the passed `comm`.
-    /// `// T2.3 will consume this` — DSv4 DP-attention token-owned EP reductions.
-    ///
     /// # Errors
     /// Propagates the NCCL all-reduce error on multi-rank builds.
     #[cfg(feature = "cuda")]
     #[allow(dead_code)]
-    // T2.3 will consume this
-    // Without `nccl` the only arm is `Single => Ok(())`, so the args are unused;
-    // that is the intended single-GPU no-op, not a bug.
+    // Without `nccl` the only arm is `Single => Ok(())`, so the args are unused.
     #[cfg_attr(not(feature = "nccl"), allow(unused_variables))]
     pub fn all_reduce_sum_over(
         &self,
@@ -521,21 +439,15 @@ impl TpRuntime {
         }
     }
 
-    /// All-reduce MIN of one host `i32` across ranks (1-element device round
-    /// trip). [`TpComm::Single`] is the identity.
-    ///
-    /// Use this for capacity decisions that feed the scheduler (e.g. the DSv4
-    /// KV-budget slot clamp): each rank's `mem_get_info` can differ, and any
-    /// per-rank divergence in scheduler-visible capacity diverges the
-    /// deterministic planner and deadlocks NCCL — min-reducing makes the
-    /// decision identical on every rank by construction. Collective: every
-    /// rank MUST call this at the same construction point.
+    /// For capacity decisions feeding the scheduler: each rank's `mem_get_info`
+    /// can differ, and divergent scheduler-visible capacity diverges the
+    /// deterministic planner and deadlocks NCCL. Collective: every rank MUST
+    /// call this at the same construction point.
     ///
     /// # Errors
     /// Propagates device alloc/copy and NCCL errors on multi-rank builds.
     #[cfg(feature = "cuda")]
-    // Without `nccl` the only arm is `Single => Ok(value)`, so `ctx` is unused;
-    // that is the intended single-GPU identity, not a bug.
+    // Without `nccl` the only arm is `Single => Ok(value)`, so `ctx` is unused.
     #[cfg_attr(not(feature = "nccl"), allow(unused_variables))]
     pub fn all_reduce_min_scalar_i32(
         &self,
@@ -580,21 +492,17 @@ impl TpRuntime {
         }
     }
 
-    /// Raw BF16 all-gather for TP-local attention slabs.
-    ///
-    /// FlashMLA's sparse decode kernel wants global heads (`h_q` 64/128), while
-    /// TP=8 ranks only hold their local head slab. This helper gathers one
-    /// local BF16 row from every rank into a rank-major receive buffer; the
-    /// caller repacks that buffer into FlashMLA's head-major layout.
+    /// FlashMLA's sparse decode kernel wants global heads (`h_q` 64/128) while a
+    /// TP rank holds only its local head slab. Gathers one local BF16 row per
+    /// rank rank-major; the caller repacks into FlashMLA's head-major layout.
     ///
     /// # Safety
     ///
     /// `sendbuf` must point to at least `sendcount` contiguous BF16 elements on
-    /// this rank's current CUDA device. `recvbuf` must point to writable device
-    /// memory large enough for `sendcount * world_size` BF16 elements. Both
-    /// buffers must remain valid until the collective enqueued on `ctx.stream`
-    /// completes, and every rank in the TP group must call this method with the
-    /// same `sendcount`.
+    /// this rank's current CUDA device; `recvbuf` to writable device memory for
+    /// `sendcount * world_size` BF16 elements. Both must stay valid until the
+    /// collective enqueued on `ctx.stream` completes, and every rank in the TP
+    /// group must call with the same `sendcount`.
     #[cfg(feature = "cuda")]
     #[cfg_attr(not(feature = "nccl"), allow(unused_variables))]
     pub unsafe fn all_gather_bf16_raw(
@@ -619,7 +527,8 @@ impl TpRuntime {
                 use cuda_kernels::collective::{CollectiveBackend, DType};
 
                 // SAFETY: this fn's contract — `sendbuf` holds `sendcount` bf16 and
-                // `recvbuf` `sendcount * world`, both live on `ctx`'s device and stream.
+                // `recvbuf` `sendcount * world`, both live on `ctx`'s device and
+                // stream.
                 unsafe {
                     backend.all_gather(
                         sendbuf,
@@ -634,10 +543,8 @@ impl TpRuntime {
         }
     }
 
-    /// Host-visible all-gather for small byte payloads such as CUDA IPC handles.
-    ///
-    /// Thin TP-level wrapper over the NCCL backend helper. DeepEP boot uses this
-    /// for CUDA IPC handles and device ids after NCCL is initialized.
+    /// Host-visible all-gather for small byte payloads (CUDA IPC handles, device
+    /// ids); requires NCCL to be initialized.
     #[cfg(all(feature = "cuda", feature = "nccl"))]
     pub fn all_gather_bytes(
         &self,
@@ -795,13 +702,9 @@ impl TpRuntime {
         Ok(buffer)
     }
 
-    /// Broadcast rank-0's `values` to every rank (rank-0 authoritative).
-    ///
-    /// Single-rank / non-NCCL builds are identity. DSpark spec-decode uses this
-    /// to keep the rank-local proposal (sampling + confidence truncation) and
-    /// accept decision consistent: a divergent draft length feeds the
-    /// variable-length verify a different token count per rank, mismatching the
-    /// per-forward collective count and deadlocking the lockstep coordinator.
+    /// Broadcast rank-0's `values` to every rank; identity on single-rank builds.
+    /// DSpark spec-decode needs it: a divergent per-rank draft length mismatches
+    /// the per-forward collective count and deadlocks the lockstep coordinator.
     #[cfg(feature = "cuda")]
     #[cfg_attr(not(all(feature = "cuda", feature = "nccl")), allow(unused_variables))]
     pub fn broadcast_rank0_i32(
@@ -910,8 +813,10 @@ mod cuda_ipc {
             bind(ctx)?;
             let mut ptr = 0u64;
             check(
-                // SAFETY: `ptr` is a live out-param and `bind` above made `ctx` current;
-                // the callee reads 64 bytes from `handle`, whose length is unchecked here.
+                // SAFETY: `ptr` is a live out-param and `bind` above made `ctx`
+                // current;
+                // the callee reads 64 bytes from `handle`, whose length is unchecked
+                // here.
                 unsafe { car::arle_car_open_peer(handle.as_ptr(), &mut ptr) },
                 label,
             )?;
@@ -946,16 +851,13 @@ mod cuda_ipc {
     }
 }
 
-/// One-shot small-message collective path: vendored sgl-kernel/vLLM custom
-/// allreduce + ARLE one-shot all-gather over IPC-shared buffers
-/// (`csrc/comm/custom_all_reduce.cu`), staged through one persistent registered
-/// scratch per rank. Decode-chain messages (2×AR 14 KB + Q-AG 18 KB per layer)
-/// measured 2.6–3.6× faster than NCCL on 8×H20
-/// (`wins/2026-06-10-dsv4-comm-bench-oneshot-licensed.md`).
+/// One-shot small-message collectives (custom allreduce + all-gather over
+/// IPC-shared buffers, one persistent registered scratch per rank): decode-chain
+/// messages (2×AR 14 KB + Q-AG 18 KB per layer) measured 2.6–3.6× faster than
+/// NCCL on 8×H20.
 ///
-/// Boot is COLLECTIVE-SAFE by construction: every local step is followed by an
-/// all-ranks ok-vote (1-byte allgather), so one rank failing alloc/IPC/create
-/// degrades EVERY rank to NCCL instead of desyncing the boot collectives.
+/// Every boot step is followed by an all-ranks ok-vote, so one rank failing
+/// alloc/IPC/create degrades EVERY rank instead of desyncing boot collectives.
 #[cfg(all(feature = "cuda", feature = "nccl"))]
 mod oneshot {
     use super::cuda_ipc::{PeerMapping, SharedRegion, check};
@@ -965,12 +867,11 @@ mod oneshot {
     use cuda_kernels::prelude::DeviceContext;
     use std::ffi::c_void;
 
-    /// Persistent registered scratch per rank. Covers every decode shape
-    /// (B=1..32 AR ≤ 448 KB, Q-AG ≤ 18 KB/rank); prefill-sized buffers fall
-    /// through to NCCL at the call sites.
+    /// Covers every decode shape (B=1..32 AR ≤ 448 KB, Q-AG ≤ 18 KB/rank);
+    /// prefill-sized buffers fall through to NCCL at the call sites.
     const SCRATCH_BYTES: usize = 512 * 1024;
-    /// Signal region = sgl `Signal` struct (≈3.5 KB) + two-shot staging tmp;
-    /// 8 KB margin keeps us independent of upstream Signal layout drift.
+    /// sgl `Signal` struct (≈3.5 KB) + two-shot staging tmp; the 8 KB margin
+    /// absorbs upstream Signal layout drift.
     const SIGNAL_BYTES: usize = 8192 + SCRATCH_BYTES;
 
     pub(super) struct OneShotComm {
@@ -988,7 +889,6 @@ mod oneshot {
 
     impl Drop for OneShotComm {
         fn drop(&mut self) {
-            // Frees own regions + rank data, IPC-closes peer mappings.
             // SAFETY: `handle` came from `arle_car_create` and is owned solely here —
             // `BootHandle::into_comm` nulls the boot copy, so this destroys once.
             unsafe { car::arle_car_destroy_prod(self.handle) };
@@ -1018,17 +918,16 @@ mod oneshot {
     impl Drop for BootHandle {
         fn drop(&mut self) {
             if !self.handle.is_null() {
-                // SAFETY: non-null means boot failed before `into_comm` moved ownership,
+                // SAFETY: non-null means boot failed before `into_comm` moved
+                // ownership,
                 // so this `arle_car_create` handle is still ours to destroy.
                 unsafe { car::arle_car_destroy_prod(self.handle) };
             }
         }
     }
 
-    /// All-ranks ok-vote (4-byte payload — `all_gather_bytes` stages through
-    /// an i32 device buffer and requires 4-byte alignment). Returns whether
-    /// EVERY rank reported ok — the same verdict on every rank, so degrade
-    /// decisions stay collective.
+    /// All-ranks ok-vote; the 4-byte payload is required because
+    /// `all_gather_bytes` stages through an i32 device buffer.
     fn vote(ctx: &DeviceContext, backend: &NcclBackend, ok: bool) -> Result<bool> {
         let payload = [u8::from(ok), 0, 0, 0];
         let gathered = backend.all_gather_bytes(ctx, &payload, 4)?;
@@ -1040,17 +939,15 @@ mod oneshot {
             SCRATCH_BYTES
         }
 
-        /// Collective constructor: every rank must call at the same point.
-        /// Returns `Ok(None)` when any rank voted a local failure (all ranks
-        /// then degrade together); `Err` only on collective-infrastructure
-        /// failures (which already imply a broken NCCL comm).
+        /// Collective: every rank must call at the same point. `Ok(None)` = a
+        /// rank voted a local failure and all ranks degrade together; `Err` only
+        /// on collective-infrastructure failures.
         pub(super) fn build(
             ctx: &DeviceContext,
             backend: &NcclBackend,
             world: usize,
             rank: usize,
         ) -> Result<Option<Self>> {
-            // Stage 1: own allocations (local) + vote.
             let alloc_ok = (|| -> Result<(SharedRegion, SharedRegion, [u8; 64], [u8; 64])> {
                 let mut sig_handle = [0u8; 64];
                 let mut in_handle = [0u8; 64];
@@ -1078,14 +975,12 @@ mod oneshot {
                 return Ok(None);
             };
 
-            // Stage 2: handle exchange (collective; all ranks reach it).
             let mut payload = [0u8; 128];
             payload[..64].copy_from_slice(&sig_handle);
             payload[64..].copy_from_slice(&in_handle);
             let all = backend.all_gather_bytes(ctx, &payload, 128)?;
             ensure!(all.len() == world * 128, "one-shot handle exchange size");
 
-            // Stage 3: open peers + create (local) + vote.
             let scratch_ptr = in_region.ptr();
             let built = (|| -> Result<BootHandle> {
                 let mut sigs = [0u64; 8];
@@ -1110,7 +1005,8 @@ mod oneshot {
                     ins[r] = input.ptr();
                     peer_ins.push(input);
                 }
-                // SAFETY: `sigs`/`ins` are live `world`-length arrays of device pointers —
+                // SAFETY: `sigs`/`ins` are live `world`-length arrays of device
+                // pointers —
                 // this rank's own regions plus one opened peer mapping per other rank.
                 let handle = unsafe {
                     car::arle_car_create(rank as i32, world as i32, sigs.as_ptr(), ins.as_ptr())
@@ -1139,9 +1035,8 @@ mod oneshot {
                 return Ok(None);
             };
 
-            // Stage 4: self-test (one-shot vs NCCL on identical inputs +
-            // cross-rank digest) + final vote. Catches memory-ordering issues
-            // on this driver/HW combo before any production traffic.
+            // Self-test catches memory-ordering issues on this driver/HW combo
+            // before any production traffic.
             let tested = boot.self_test(ctx, backend, rank);
             if let Err(err) = &tested {
                 log::warn!("[comm-oneshot] rank {rank} self-test failed: {err:#}");
@@ -1164,7 +1059,6 @@ mod oneshot {
 
             const ELEMS: usize = 7168;
             let stream = &ctx.stream;
-            // One-shot arm: fill the registered scratch, reduce into `got`.
             check(
                 // SAFETY: `scratch_ptr` is the registered SCRATCH_BYTES region and
                 // ELEMS bf16 (14 KB) fits it; `stream` is this rank's own.
@@ -1184,7 +1078,8 @@ mod oneshot {
             {
                 let (got_ptr, _g) = got.device_ptr_mut(stream);
                 check(
-                    // SAFETY: `got_ptr` is live for `_g` and holds ELEMS u16; `handle` is
+                    // SAFETY: `got_ptr` is live for `_g` and holds ELEMS u16; `handle`
+                    // is
                     // the booted one-shot comm on this rank's `stream`.
                     unsafe {
                         car::arle_car_allreduce_bf16_into(
@@ -1198,14 +1093,14 @@ mod oneshot {
                     "self-test one-shot AR",
                 )?;
             }
-            // NCCL reference: identical fill (same seed), in-place AR.
             let mut reference = stream
                 .alloc_zeros::<u16>(ELEMS)
                 .map_err(|e| anyhow!("self-test ref alloc: {e}"))?;
             {
                 let (ref_ptr, _g) = reference.device_ptr_mut(stream);
                 check(
-                    // SAFETY: `ref_ptr` is live for `_g` and holds ELEMS u16 — same seed
+                    // SAFETY: `ref_ptr` is live for `_g` and holds ELEMS u16 — same
+                    // seed
                     // and count as the one-shot fill above.
                     unsafe {
                         car::arle_car_fill_bf16(
@@ -1217,7 +1112,8 @@ mod oneshot {
                     },
                     "self-test ref fill",
                 )?;
-                // SAFETY: `ref_ptr` is live for `_g` and holds ELEMS bf16 on this rank's
+                // SAFETY: `ref_ptr` is live for `_g` and holds ELEMS bf16 on this
+                // rank's
                 // device; every rank runs this self-test in the same order.
                 unsafe {
                     backend.all_reduce(
@@ -1245,8 +1141,7 @@ mod oneshot {
                 max_delta <= 0.05,
                 "one-shot vs NCCL max delta {max_delta} exceeds tolerance"
             );
-            // Cross-rank identity (lockstep hard requirement): FNV digest of
-            // the one-shot output must be byte-identical on every rank.
+            // Lockstep requires the one-shot output to be byte-identical on every rank.
             let mut digest: u64 = 0xcbf2_9ce4_8422_2325;
             for v in &got_host {
                 for b in v.to_le_bytes() {
@@ -1262,9 +1157,8 @@ mod oneshot {
             Ok(())
         }
 
-        /// In-place bf16 sum allreduce: stage `buf` into the registered
-        /// scratch, one-shot/two-shot kernel writes the reduced result back
-        /// into `buf`. Caller guarantees `len*2 <= scratch_bytes()`.
+        /// In-place bf16 sum allreduce through the registered scratch. Caller
+        /// guarantees `len*2 <= scratch_bytes()`.
         pub(super) fn all_reduce_sum_inplace(
             &self,
             ctx: &DeviceContext,
@@ -1299,14 +1193,13 @@ mod oneshot {
             Ok(())
         }
 
-        /// Raw bf16 all-gather: stage the local chunk into the registered
-        /// scratch, the one-shot kernel writes `[world × sendcount]` rank-major
-        /// into `recvbuf` (ncclAllGather layout). Caller guarantees
+        /// Raw bf16 all-gather: writes `[world × sendcount]` rank-major into
+        /// `recvbuf` (ncclAllGather layout). Caller guarantees
         /// `sendcount*2 <= scratch_bytes()` and `recvbuf` capacity.
         ///
         /// # Safety
-        /// Same contract as the NCCL `all_gather` arm: both pointers are live
-        /// device allocations on this rank's device, sized as documented.
+        /// Both pointers are live device allocations on this rank's device,
+        /// sized as documented.
         pub(super) unsafe fn all_gather_bf16(
             &self,
             ctx: &DeviceContext,

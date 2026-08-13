@@ -1,15 +1,11 @@
 //! DSpark block drafter for Qwen3.6 CUDA speculative decode.
 //!
-//! One draft step proposes a whole block (`block_size` positions) in a single
-//! 5-layer non-causal forward conditioned on trunk "context features": per
-//! accepted trunk token the residual stream is tapped at
-//! `target_layer_ids`, projected through `fc` (+ `hidden_norm`) to one 5120-d
+//! One draft step proposes `block_size` positions in a single 5-layer
+//! non-causal forward: per accepted trunk token the residual stream is tapped
+//! at `target_layer_ids`, projected through `fc` (+ `hidden_norm`) to one
 //! feature, and cached as the draft's per-layer K/V context. Covers both
-//! checkpoint flavors (see [`qwen35_spec::DsparkConfig`]): z-lab DFlash
-//! (backbone only, same-position denoising) and DeepSpec DSpark (next-token
-//! labels + optional Markov / confidence heads). The trunk verify + rollback
-//! substrate ([`Qwen35SpecSlotState`], `replay_linear_only`) is reused
-//! unchanged — this module only swaps the draft-token source.
+//! checkpoint flavors of [`qwen35_spec::DsparkConfig`] — DFlash (same-position
+//! denoising) and DSpark (next-token labels + optional Markov / confidence).
 
 use super::*;
 
@@ -17,10 +13,9 @@ use crate::ops::rms_norm_batch;
 use qwen35_spec::{DsparkConfig, DsparkSps, dspark_tensor_names, dspark_verify_lens};
 
 struct DsparkLayer {
-    /// Gate-padded `[2*q_dim, hidden]`: head `h` occupies rows
-    /// `2h*head_dim..(2h+1)*head_dim`, odd bands zero — so the trunk's fused
-    /// prep kernel (which assumes the gated q layout) reads the real q values
-    /// and the unused gate half stays untouched.
+    /// Gate-padded `[2*q_dim, hidden]`: head `h` at rows
+    /// `2h*head_dim..(2h+1)*head_dim`, odd bands zero — the trunk's fused prep
+    /// kernel assumes the gated q layout.
     q_proj: DeviceMatrix,
     k_proj: DeviceMatrix,
     v_proj: DeviceMatrix,
@@ -34,9 +29,7 @@ struct DsparkLayer {
 }
 
 struct DsparkMarkovHead {
-    /// `[vocab, rank]` embedding table (`markov_w1`).
     w1: DeviceMatrix,
-    /// `[vocab, rank]` bias projection (`markov_w2`).
     w2: DeviceMatrix,
     rank: usize,
 }
@@ -60,14 +53,10 @@ pub(crate) struct Qwen35DsparkHead {
     confidence: Option<DsparkConfidenceHead>,
     /// Verify-step cost model driving the goodput budget (`--dspark-sps-*-ms`).
     sps: DsparkSps,
-    /// Draft RoPE tables (full rotary over head_dim, `rope_theta`), `rope_cap`
-    /// absolute positions.
     cos_cache: DeviceVec,
     sin_cache: DeviceVec,
-    /// Per-layer ctx-cache rows (== per-head cache stride): `sliding_window +
-    /// block_size`, or the whole per-request ceiling when the draft config
-    /// declares no window. Addressed as an absolute-position ring (`row = pos %
-    /// cap`).
+    /// Per-layer ctx-cache rows, addressed as an absolute-position ring
+    /// (`row = pos % cap`).
     cap: usize,
     /// RoPE table length = `min(max_seq_len, max_total_tokens) + block_size` —
     /// the per-request token ceiling, NOT the whole KV-pool `max_seq_len`.
@@ -87,9 +76,9 @@ impl Qwen35DsparkHead {
     pub(crate) fn target_layer_ids(&self) -> &[i64] {
         &self.cfg.target_layer_ids
     }
-    /// Per-slot bytes: draft ctx K/V plus the draft outputs. All lazily
-    /// allocated, so they must be reserved out of the KV budget or the first
-    /// dspark step OOMs behind an already-sized pool.
+    /// Per-slot bytes: draft ctx K/V plus the draft outputs. Lazily allocated,
+    /// so they must be reserved out of the KV budget or the first dspark step
+    /// OOMs behind an already-sized pool.
     pub(crate) fn slot_state_bytes(&self, vocab: usize) -> usize {
         let per_head = self.cfg.num_key_value_heads * self.cfg.head_dim;
         let ctx = 2 * self.cap * per_head * self.layers.len() * std::mem::size_of::<bf16>();
@@ -115,14 +104,9 @@ impl Qwen35DsparkHead {
         }
     }
 
-    /// Hot-swap the Markov head weights from a host f32 snapshot.
-    ///
-    /// Called by the train sidecar after each acceptance-weighted step. The new
-    /// weights are uploaded to a staging buffer, then the `data` pointer is
-    /// flipped under the device stream's ordering guarantee (the hot path
-    /// reads `markov.w1`/`markov.w2` only after a stream sync at step entry).
-    /// `w1` is `[vocab * rank]`, `w2` is `[vocab * rank]` (both `[vocab, rank]`
-    /// row-major — the `gemm_batch` weight frame).
+    /// Hot-swap the Markov head weights from a host f32 snapshot. `w1`/`w2` are
+    /// `[vocab, rank]` row-major. Safe mid-run because the hot path reads them
+    /// only after a stream sync at step entry.
     pub(crate) fn update_markov_weights(
         &mut self,
         ctx: &DeviceContext,
@@ -170,28 +154,24 @@ impl Qwen35DsparkHead {
 }
 
 /// Per-slot draft context K/V cache: for each draft layer, the RoPE'd/normed K
-/// and raw V of accepted positions, laid out `[kv_head][cap][head_dim]`.
-/// All layers are sliding-window: an absolute-position RING (`row = abs % cap`,
-/// `cap = window + block`), keeping only the last `window` keys the sliding
-/// attention ever reads. Noise rows are written speculatively at their positions
-/// and self-heal: rejected rows are overwritten by the next block's ctx/noise
-/// writes before any read. A ring never aliases a live key within a block — the
-/// live span (window ctx + block noise) equals `cap`, so distinct positions
-/// never collide mod `cap`.
+/// and raw V of accepted positions, laid out `[kv_head][cap][head_dim]` as an
+/// absolute-position ring (`row = abs % cap`, `cap = window + block`).
+/// Speculative noise rows self-heal: rejected rows are overwritten by the next
+/// block's writes before any read, and the live span (window ctx + block noise)
+/// equals `cap`, so distinct live positions never collide mod `cap`.
 pub(crate) struct Qwen35DsparkSlotState {
     k_ctx: Vec<DeviceVec>,
     v_ctx: Vec<DeviceVec>,
     /// Absolute trunk position of ctx buffer row 0. Non-zero after a
     /// prefix-restore rebase: the suffix-only ctx is exact once the tail ≥ window.
     pub(crate) ctx_base: usize,
-    /// Absolute end (exclusive) of materialized ctx rows; buffer holds
-    /// `ctx_end - ctx_base` rows. The spec step requires `ctx_end == start_pos`.
+    /// Absolute end (exclusive) of materialized ctx rows. The spec step
+    /// requires `ctx_end == start_pos`.
     pub(crate) ctx_end: usize,
     /// Last emitted token (the next block's anchor), staged by prefill/verify.
     pub(crate) pending: Option<u32>,
-    /// Draft outputs that outlive the draft call — a batched step drafts every
-    /// slot before verifying any, so a shared scratch would hand row `i`'s
-    /// accept row `B-1`'s distributions. Lazy: greedy never allocates `q_probs`.
+    /// Per-slot, not shared scratch: a batched step drafts every slot before
+    /// verifying any. Lazy — greedy never allocates `q_probs`.
     pub(crate) logits: HiddenSlot,
     q_probs: SliceSlot<f32>,
     q_rows: usize,
@@ -223,8 +203,8 @@ impl Qwen35DsparkSlotState {
     }
 
     /// Re-key the (empty) ctx buffer so row 0 is absolute position `pos`. No
-    /// buffer zeroing needed: stale rows are overwritten by post-rebase
-    /// appends before any read (attention lo never drops below `ctx_base`).
+    /// zeroing needed: attention `lo` never drops below `ctx_base`, so stale
+    /// rows are overwritten before any read.
     pub(crate) fn rebase(&mut self, pos: usize) {
         self.ctx_base = pos;
         self.ctx_end = pos;
@@ -234,8 +214,7 @@ impl Qwen35DsparkSlotState {
 
 /// Trunk residual-stream tap capture. `prepare` arms it for one forward; the
 /// layer loop D2D-copies the residual stream after each target layer (`-1` =
-/// the embedding output). `None` in the forward keeps baseline decode
-/// byte-identical (no kernels, no allocations).
+/// the embedding output).
 #[derive(Default)]
 pub(crate) struct Qwen35DsparkTaps {
     targets: Vec<i64>,
@@ -247,10 +226,9 @@ pub(crate) struct Qwen35DsparkTaps {
 }
 
 impl Qwen35DsparkTaps {
-    /// Every id must name a layer the forward will actually reach, exactly
-    /// once — a duplicate or out-of-range id would leave `capture` with nothing
-    /// to write and hand the reader a zero buffer it cannot tell from a real
-    /// one.
+    /// Every id must name a reachable layer exactly once — a duplicate or
+    /// out-of-range id leaves `capture` nothing to write and hands the reader a
+    /// zero buffer indistinguishable from a real one.
     pub(crate) fn validate(targets: &[i64], num_layers: usize) -> Result<()> {
         let mut seen = targets.to_vec();
         seen.sort_unstable();
@@ -315,9 +293,7 @@ impl Qwen35DsparkTaps {
         self.armed = false;
     }
 
-    /// Captured tap `i` as host f32, token-major `[seq, hidden]`. Offline draft
-    /// training reads the taps raw; serving fuses them on device through
-    /// [`Qwen35Model::dspark_tap_features`] instead.
+    /// Captured tap `i` as host f32, token-major `[seq, hidden]`.
     pub(crate) fn tap_to_host(&mut self, ctx: &DeviceContext, i: usize) -> Result<Vec<f32>> {
         ensure!(self.armed, "dspark tap readback without an armed capture");
         ensure!(i < self.bufs.len(), "tap {i} of {}", self.bufs.len());
@@ -335,9 +311,9 @@ impl Qwen35DsparkTaps {
     }
 }
 
-/// Draft-side persistent scratch, one per executor — every buffer here is
-/// written then read inside one draft or one accept, and those never
-/// interleave. Separate from [`Qwen35Workspace`] so the shapes never thrash.
+/// Draft-side persistent scratch, one per executor — every buffer is written
+/// then read inside one draft or one accept, and those never interleave.
+/// Separate from [`Qwen35Workspace`] so the shapes never thrash.
 #[derive(Default)]
 pub(crate) struct DsparkScratch {
     ids: SliceSlot<i32>,
@@ -346,8 +322,7 @@ pub(crate) struct DsparkScratch {
     /// Per-row draft attention windows, `[ring_base; block] ++ [kv_len; block]`
     /// — identical for every layer, so one upload serves the whole forward.
     attn_win: SliceSlot<i32>,
-    /// `[k_ctx base; slots] ++ [v_ctx base; slots]` for the current draft
-    /// layer — the slot-batched attention launch reads the rings through it.
+    /// `[k_ctx base; slots] ++ [v_ctx base; slots]` for the current draft layer.
     attn_kv_slots: SliceSlot<u64>,
     hidden: HiddenSlot,
     normed: HiddenSlot,
@@ -372,30 +347,22 @@ pub(crate) struct DsparkScratch {
     markov_bias: HiddenSlot,
     step_logits: HiddenSlot,
     step_sum: HiddenSlot,
-    /// Row-shaped twins of the four above, grouped so a caller can borrow the
-    /// base logits out of this same scratch and pass these beside them.
     mk: MarkovScratch,
     conf: ConfScratch,
     /// Batched-draft logits `[B*block, vocab]`; per-slot `df.logits` copy from here.
     logits_b: HiddenSlot,
     /// Row count of the tap features held in `feat_b` (the whole batch).
     feat_seq: usize,
-    /// Sampled-mode device buffers (allocated on first temp>0 spec step only;
-    /// greedy never touches them). Fixed caps — no per-step realloc:
-    /// `p_probs [block+1, vocab] f32` verify filtered dists (leading
-    /// `chain_len` rows fully written per accept; the stale tail is never
-    /// read — the chain kernel indexes rows `<= depth < chain_len`);
-    /// `sample_tok [1]` / `accept_out [2]` fully written before D2H;
-    /// `chain_draft [block]` / `u_accept [block]` / `u_residual [block+1]`
-    /// host-uploaded prefixes — the kernel reads only the uploaded prefix.
+    /// Sampled-mode buffers, fixed caps, allocated on the first temp>0 step.
+    /// Only written prefixes are ever read: `p_probs` rows past `chain_len` and
+    /// the `chain_draft`/`u_*` tails past `depth` hold stale data.
     p_probs: SliceSlot<f32>,
     sample_tok: SliceSlot<i32>,
     accept_out: SliceSlot<i32>,
     chain_draft: SliceSlot<i32>,
     u_accept: SliceSlot<f32>,
     u_residual: SliceSlot<f32>,
-    /// Pinned staging for the draft loop's token readbacks. `clone_dtoh` into a
-    /// `Vec` makes the driver page-lock and free a buffer per call.
+    /// Pinned: `clone_dtoh` into a `Vec` page-locks and frees per call.
     tok_host: PinnedSlot<i32>,
     /// Device argmax ids; verify runs one per tick, so it must not allocate.
     argmax_ids: SliceSlot<i32>,
@@ -408,7 +375,6 @@ struct MarkovScratch {
     bias: HiddenSlot,
     sum: HiddenSlot,
     ids: SliceSlot<i32>,
-    /// Pinned staging for this loop's argmax readbacks (see `PinnedSlot`).
     host: PinnedSlot<i32>,
 }
 
@@ -424,7 +390,6 @@ struct ConfScratch {
 
 /// Uniform-stream salts: draft draw / accept test / residual+bonus draw at the
 /// same position must be independent or the rejection identity breaks.
-/// `pub(super)`: the MTP lane's rejection twin shares the same streams.
 pub(super) const SALT_DRAW: u64 = 0;
 pub(super) const SALT_ACCEPT: u64 = 0x9E37_79B9_7F4A_7C15;
 pub(super) const SALT_RESIDUAL: u64 = 0xC2B2_AE3D_27D4_EB4F;
@@ -438,9 +403,9 @@ fn splitmix64(x: u64) -> u64 {
 }
 
 /// Deterministic uniform in [0, 1) from `(seed, salt, position)` — the engine
-/// sampler's `(seed, position)` stream (`infer_plan::sample_token`), so
-/// same-config-twice reproduces. `SALT_DRAW = 0` makes the draft draw consume
-/// exactly the uniform plain decode would at that position.
+/// sampler's stream (`infer_plan::sample_token`), so same-config-twice
+/// reproduces. `SALT_DRAW = 0` makes the draft draw consume exactly the uniform
+/// plain decode would at that position.
 pub(super) fn unit_uniform(seed: Option<u64>, salt: u64, position: u64) -> f32 {
     let bits = splitmix64(
         seed.unwrap_or(0)
@@ -451,23 +416,20 @@ pub(super) fn unit_uniform(seed: Option<u64>, salt: u64, position: u64) -> f32 {
     (bits >> 40) as f32 / (1u32 << 24) as f32
 }
 
-/// Executor-side DSpark runtime: the loaded head + per-slot draft state + the
-/// shared tap/scratch buffers. Built only under `--spec-type dspark`, so the
-/// baseline executor allocates nothing.
+/// Built only under `--spec-type dspark`, so the baseline executor allocates
+/// nothing.
 pub(crate) struct Qwen35DsparkExec {
     pub(crate) head: Qwen35DsparkHead,
     pub(crate) slots: Vec<Option<Qwen35DsparkSlotState>>,
     pub(crate) spec: Vec<Option<Qwen35SpecSlotState>>,
     pub(crate) taps: Qwen35DsparkTaps,
     pub(crate) scratch: DsparkScratch,
-    /// Pointer tables for the batched rollback replay.
     pub(crate) replay_tables: Qwen35ReplayTables,
-    /// Staging for the batched state snapshot/restore.
     pub(crate) copy: Qwen35CopyScratch,
     pub(crate) accepts: usize,
     pub(crate) rejects: usize,
-    /// Verified draft chains, and the subset drafted from a partial
-    /// (ctx_base > 0) draft context.
+    /// Verified chains, and the subset drafted from a partial
+    /// (`ctx_base > 0`) draft context.
     pub(crate) chains: usize,
     pub(crate) partial_ctx_chains: usize,
 }
@@ -490,7 +452,6 @@ impl Qwen35DsparkExec {
     }
 }
 
-/// Load a raw 1D bf16/f32 vector as host bf16.
 fn load_host_vec(loader: &SafetensorLoader, name: &str) -> Result<Vec<bf16>> {
     let t = loader.load_raw_tensor(name)?;
     let bytes = SafetensorLoader::tensor_bytes_to_bf16(name, t.dtype, &t.bytes)?;
@@ -547,12 +508,10 @@ pub(crate) fn load_dspark_head(
 ) -> Result<Qwen35DsparkHead> {
     let mut cfg = DsparkConfig::from_dir(dir)
         .map_err(|e| anyhow!("dspark draft config at {}: {e}", dir.display()))?;
-    // A block longer than the accepted prefix is pure waste: the chain stops at
-    // the first rejection, so every position past it costs a draft forward and a
-    // verify row and can never be committed. Measured on TC-27B + DFlash:
-    // accept_rate 0.205 at block 16 keeps 3.28 tokens, discarding 79.5% of the
-    // drafted work. Clamping here is the single correct point — rope_cap, the ctx
-    // ring, and the per-slot scratch all size off `cfg.block_size`.
+    // Positions past the accepted prefix are pure waste: TC-27B + DFlash keeps
+    // 3.28 tokens at block 16 (accept_rate 0.205), discarding 79.5% of the
+    // drafted work. Clamp here — rope_cap, the ctx ring and the per-slot
+    // scratch all size off `cfg.block_size`.
     if let Some(cap) = block_size_cap {
         let capped = cfg.block_size.min(cap.max(1));
         if capped != cfg.block_size {
@@ -598,7 +557,6 @@ pub(crate) fn load_dspark_head(
         .layers
         .iter()
         .map(|n| {
-            // Gate-pad q_proj rows into the trunk's gated layout (odd bands zero).
             let q_host = load_host_matrix(&loader, &n.q_proj, q_dim, hidden)?;
             let mut q_padded = vec![bf16::ZERO; 2 * q_dim * hidden];
             for h in 0..cfg.num_attention_heads {
@@ -642,8 +600,8 @@ pub(crate) fn load_dspark_head(
         let rank = w1.cols;
         Some(DsparkMarkovHead { w1, w2, rank })
     } else if let Some(rank) = markov_head_rank {
-        // `--dspark-markov-init` installs a head over a DFlash backbone that
-        // ships none; only the slot's shape matters, both halves are overwritten.
+        // Zeros: `--dspark-markov-init` only needs the slot shape, both halves
+        // are overwritten before use.
         ensure!(rank > 0, "dspark markov head rank must be positive");
         let zeros = vec![0u8; trunk_vocab * rank * 2];
         Some(DsparkMarkovHead {
@@ -694,13 +652,10 @@ pub(crate) fn load_dspark_head(
         );
     }
 
-    // Every draft layer runs one ring cache. RoPE tables cover the full
-    // per-request token ceiling (absolute positions).
     let rope_cap = max_seq_len.min(max_total_tokens.max(1)) + cfg.block_size;
     let cap = cfg.sliding_window.map_or(rope_cap, |w| w + cfg.block_size);
     match cfg.sliding_window {
-        // A config with no window buys full attention with a request-length ring
-        // (671 MB/slot at 32k vs 42 MB windowed) — worth one line at load.
+        // No window costs a request-length ring: 671 MB/slot at 32k vs 42 MB.
         None => log::info!(
             "dspark draft: no sliding_window declared; every layer runs full \
              attention over a {cap}-row ctx ring"
@@ -712,9 +667,8 @@ pub(crate) fn load_dspark_head(
                 .filter(|t| matches!(t, qwen35_spec::DsparkLayerType::Full))
                 .count();
             if full > 0 {
-                // Honoring them needs a ctx ring the length of the request, so
-                // they are windowed on purpose — but silently windowing a
-                // full-attention layer moves acceptance, so say it.
+                // Windowed on purpose (honoring them needs a request-length
+                // ring), but it moves acceptance, so say it.
                 log::warn!(
                     "dspark draft: {full}/{} layers declare full attention; all run the \
                      {window}-token sliding window (ctx ring is {cap} rows)",
@@ -749,15 +703,13 @@ pub(crate) struct DsparkRollback<'a> {
     pub(crate) k: usize,
 }
 
-/// Lowest absolute key position a draft row at `pos` may read. HF sliding
-/// window keeps keys with `q_pos - k_pos < window`; no window reaches the
-/// whole prefix.
+/// Lowest absolute key position a draft row at `pos` may read: HF sliding
+/// window keeps keys with `q_pos - k_pos < window`.
 fn window_lo(cfg: &DsparkConfig, pos: usize) -> usize {
     cfg.sliding_window
         .map_or(0, |w| pos.saturating_sub(w.saturating_sub(1)))
 }
 
-/// Elementwise add over two same-length device buffers.
 fn add_vec_into(ctx: &DeviceContext, a: &HiddenStates, b: &HiddenStates) -> Result<HiddenStates> {
     let mut out = HiddenStates::zeros(ctx, a.hidden_dim, a.seq_len)?;
     add_batch(ctx, a, b, &mut out)?;
@@ -765,8 +717,8 @@ fn add_vec_into(ctx: &DeviceContext, a: &HiddenStates, b: &HiddenStates) -> Resu
 }
 
 impl Qwen35Model {
-    /// `feat = hidden_norm(Σ_t fc_t · tap_t)` over the WHOLE tap — the fc GEMMs
-    /// are batch-wide, so this runs once per forward. Disarms the tap.
+    /// `feat = hidden_norm(Σ_t fc_t · tap_t)` over the whole tap; runs once per
+    /// forward and disarms the tap.
     pub(crate) fn dspark_tap_features(
         &self,
         head: &Qwen35DsparkHead,
@@ -848,9 +800,8 @@ impl Qwen35Model {
                 gemm_batch(ctx, &layer.k_proj, feat_rows, k_new)?;
                 gemm_batch(ctx, &layer.v_proj, feat_rows, v_new)
             })?;
-            // K-norm + RoPE + cache write via the fused prep kernel. The
-            // wrapper requires q heads, so drive `num_kv_heads` dummy q heads
-            // over a zeroed gated-layout buffer (0/rms(0+eps)=0, discarded).
+            // The fused prep wrapper requires q heads, so drive `num_kv_heads`
+            // dummy ones over a zeroed gated-layout buffer (0/rms(0+eps)=0).
             let q_dummy = scratch.ctx_q_dummy.get_zeroed(ctx, 2 * kv_dim, rows)?;
             let q_out = scratch.ctx_q_out.get(ctx, kv_dim, rows)?;
             crate::profile::profile_op(ctx, "ctx_prep", Some(li), rows, || {
@@ -865,8 +816,7 @@ impl Qwen35Model {
                 let (vc_ptr, _g8) = df.v_ctx[li].data.device_ptr_mut(&ctx.stream);
                 let nkv = head.cfg.num_key_value_heads as i32;
                 let hd = head.cfg.head_dim as i32;
-                // One launch must not wrap the ring (else two tokens alias one
-                // row); chunk sizes (≤32) sit far below cap here.
+                // One launch must not wrap the ring, else two tokens alias one row.
                 ensure!(
                     rows <= cap_li,
                     "dspark sliding append rows {rows} > ring cap {cap_li}; lower chunked_prefill_size"
@@ -904,13 +854,10 @@ impl Qwen35Model {
         Ok(())
     }
 
-    /// One DSpark block draft: propose up to `max_draft_tokens` tokens from a
-    /// single non-causal 5-layer forward over `[ctx cache ++ block]`.
-    /// Returns the verify chain `[anchor, d1..dL]` (`L` truncated by the
-    /// confidence head when present). In sampling mode (`!params.is_greedy()`)
-    /// each draft is a device draw from the engine-sampler-filtered dist `q`,
-    /// retained on device in `scratch.q_probs` row `i` for `chain[i+1]`
-    /// (greedy: argmax path, byte-identical, no q buffers touched).
+    /// One DSpark block draft over `[ctx cache ++ block]`. Returns the verify
+    /// chain `[anchor, d1..dL]` (`L` truncated by the confidence head when
+    /// present). Sampling mode draws each draft from the engine-sampler-filtered
+    /// dist `q`, retained in `df.q_probs` row `i` for `chain[i+1]`.
     pub(crate) fn dspark_draft_block(
         &self,
         head: &Qwen35DsparkHead,
@@ -942,11 +889,9 @@ impl Qwen35Model {
         })?;
 
         let start_abs = scratch.start_pos_abs.upload(&self.ctx, &[start as i32])?;
-        // Per-row attention windows, never below `ctx_base`; the ctx buffer is an
-        // absolute ring, so row `row` walks `[lo, start+block)` mapped through
-        // `% cap`. `lo` reads only start/row/window/ctx_base — layer-independent,
-        // so one table serves all 5 layers and one ragged-window launch replaces
-        // `block` single-row ones.
+        // Per-row attention windows, never below `ctx_base`. `lo` is
+        // layer-independent, so one table serves all layers and one
+        // ragged-window launch replaces `block` single-row ones.
         let mut win = vec![0i32; 2 * block];
         for row in 0..block {
             let lo = window_lo(cfg, start + row).max(df.ctx_base);
@@ -974,9 +919,8 @@ impl Qwen35Model {
                 let v_new = scratch.v_new.get(ctx, kv_dim, block)?;
                 gemm_batch(ctx, &layer.v_proj, normed, v_new)?;
 
-                // q/k head-RMSNorm + RoPE at absolute positions start..start+block;
-                // noise K/V land at their positions in the ctx cache (self-healing
-                // speculative rows — see the slot-state doc).
+                // Noise K/V land at their absolute positions in the ctx ring
+                // (self-healing speculative rows — see the slot-state doc).
                 let q_prepped = scratch.q_prepped.get(ctx, q_dim, block)?;
                 {
                     let (qf_ptr, _g0) = q_full.data.device_ptr(&ctx.stream);
@@ -993,8 +937,8 @@ impl Qwen35Model {
                     let nkv = cfg.num_key_value_heads as i32;
                     let hd = cfg.head_dim as i32;
                     let (sp_ptr, _g10) = start_abs.device_ptr(&ctx.stream);
+                    // SAFETY: ring cache cap_li*kv_dim; abs pos < rope_cap;
                     // block (≤ cap_li) noise rows write distinct ring rows.
-                    // SAFETY: ring cache cap_li*kv_dim; abs pos < rope_cap.
                     unsafe {
                         ffi::prefill_attention_hd256_prep_ring_cuda(
                             qf_ptr as *const ffi::Half,
@@ -1021,8 +965,8 @@ impl Qwen35Model {
                     }
                 }
 
-                // Non-causal attention: every noise row attends its whole window of
-                // the `[ctx ++ block]` key range, in one ragged-window launch.
+                // Non-causal: every noise row attends its whole window of the
+                // `[ctx ++ block]` key range.
                 let attn_heads = scratch.attn_heads.get(ctx, q_dim, block)?;
                 {
                     let sm_scale = 1.0 / (cfg.head_dim as f32).sqrt();
@@ -1113,9 +1057,6 @@ impl Qwen35Model {
             gemm_batch(ctx, self.output_projection(), final_normed, logits)
         })?;
 
-        // Left-to-right token selection: argmax (greedy) or a rejection-ready
-        // device draw from the engine-sampler-filtered distribution q (full
-        // row retained in `df.q_probs` — only the token id comes back).
         // Next-token heads (DSpark) draft from every row; same-position
         // (DFlash) rows 1.. fill their own positions.
         let sampling = !params.is_greedy();
@@ -1193,8 +1134,6 @@ impl Qwen35Model {
             0..0
         };
         for row in sample_rows {
-            // Corrected logits row: base + markov bias when the head is present
-            // (`step_logits = base_row + markov_w2 · markov_w1[prev]`).
             let (src, src_row) = if let Some(m) = &head.markov {
                 crate::profile::profile_op(ctx, "mtp_fc", None, 1, || {
                     let tok_dev = scratch.markov_tok.upload(ctx, &[prev as i32])?;
@@ -1224,8 +1163,7 @@ impl Qwen35Model {
                 (df.logits.get(ctx, vocab, block)?, row)
             };
             let tok = crate::profile::profile_op(ctx, "sample", None, 1, || {
-                // Filter + q-row store + multinomial draw in one device call;
-                // uniform from the host (seed, position) stream plain decode
+                // Uniform from the host (seed, position) stream plain decode
                 // would consume at this position (SALT_DRAW = 0).
                 let u = unit_uniform(params.seed, SALT_DRAW, (start + row) as u64);
                 let q_all = df.q_probs.get(ctx, block * vocab)?;
@@ -1267,8 +1205,7 @@ impl Qwen35Model {
             prev = tok;
         }
 
-        // Confidence seam: goodput-budget the proposal (R=1 on this per-slot
-        // path); absent head = keep the whole block.
+        // Goodput-budget the proposal (R=1 here); absent head keeps the block.
         let prev_tokens: Vec<u32> = std::iter::once(anchor)
             .chain(drafts.iter().copied())
             .take(drafts.len())
@@ -1291,9 +1228,8 @@ impl Qwen35Model {
     }
 
     /// Batched [`Self::dspark_draft_block`]: one forward over every slot's
-    /// block. The draft GEMMs are weight-bound at `block` rows, so B serial
-    /// drafts re-read the same weights B times. Only the ring kernels stay
-    /// per-slot. Greedy only — a sampled draw syncs per row.
+    /// block, since the draft GEMMs are weight-bound at `block` rows. Only the
+    /// ring kernels stay per-slot. Greedy only — a sampled draw syncs per row.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn dspark_draft_blocks(
         &self,
@@ -1389,9 +1325,8 @@ impl Qwen35Model {
                     let nkv = cfg.num_key_value_heads as i32;
                     let hd = cfg.head_dim as i32;
                     let sm_scale = 1.0 / (cfg.head_dim as f32).sqrt();
-                    // `[k bases][v bases]`, one entry per slot: staged here so the
-                    // attention below runs once at gridZ = slots instead of once
-                    // per slot on a 192-block grid.
+                    // `[k bases][v bases]`, one entry per slot, so the attention
+                    // below runs once at gridZ = slots instead of once per slot.
                     let mut kv_bases = vec![0u64; 2 * b];
                     let mut ring_guards = Vec::with_capacity(2 * b);
                     for (s, df) in dfs.iter_mut().enumerate() {
@@ -1512,7 +1447,6 @@ impl Qwen35Model {
             gemm_batch(ctx, self.output_projection(), final_normed, logits)
         })?;
 
-        // One D2H for the whole tick, and one markov settle over every slot.
         let first_row = usize::from(!cfg.next_token_heads);
         let am = crate::profile::profile_op(ctx, "sample", None, rows, || {
             self.dspark_settle_rows(
@@ -1565,13 +1499,10 @@ impl Qwen35Model {
 
     /// Greedy token for every row of a `[vocab, b*block]` draft output. A markov
     /// `bias = w2·w1[prev]` makes row r depend on row r-1, so the chain
-    /// speculates on itself: the base argmax is a near-perfect guess for `prev`,
-    /// so guess every predecessor, correct all rows at once, and re-run while a
-    /// guess disagreed. Each round confirms one more row, so `block` bounds it.
-    ///
-    /// Every slot settles in the same rounds — `w2` is `[vocab, rank]`, so the
-    /// GEMM is weight-bound and B serial settles re-read it B times. Costs two
-    /// `[vocab, b*block]` buffers, 48 MB each at block 6 / B 16.
+    /// speculates on itself: guess every predecessor from the base argmax,
+    /// correct all rows at once, re-run while a guess disagreed. Each round
+    /// confirms one more row, so `block` bounds it. Costs two `[vocab, b*block]`
+    /// buffers, 48 MB each at block 6 / B 16.
     fn dspark_settle_rows(
         &self,
         m: Option<&DsparkMarkovHead>,
@@ -1637,11 +1568,9 @@ impl Qwen35Model {
     }
 
     /// Per-slot draft-keep lengths: confidence
-    /// `sigmoid(proj([hidden_i ; markov_w1[prev_i]]))` over a `[hidden,
-    /// b*block]` draft forward, cumprod'd into survival and fed to the goodput
-    /// budget ([`dspark_verify_lens`]). `prevs` is slot-major, `b*(block -
-    /// first_row)` long. Head absent → the whole block survives. One GEMM, two
-    /// copy launches and one sync for the batch.
+    /// `sigmoid(proj([hidden_i ; markov_w1[prev_i]]))` cumprod'd into survival
+    /// and fed to the goodput budget ([`dspark_verify_lens`]). `prevs` is
+    /// slot-major, `b*(block - first_row)` long. Head absent → whole block.
     #[allow(clippy::too_many_arguments)]
     fn dspark_verify_keeps(
         &self,
@@ -1741,16 +1670,13 @@ impl Qwen35Model {
         self.spec_draft_tokens = n;
     }
 
-    /// Per-row argmax over a whole verify output in one launch + one D2H. The
-    /// accept scan is host arithmetic once this lands, so a batched tick costs
-    /// one sync instead of one per chain row per slot.
+    /// Per-row argmax over a whole verify output in one launch + one D2H, so a
+    /// batched tick costs one sync instead of one per chain row per slot.
     pub(crate) fn argmax_rows(
         &self,
         logits: &HiddenStates,
         scratch: &mut DsparkScratch,
     ) -> Result<Vec<u32>> {
-        // Verify runs this every tick, so it goes through the same
-        // no-allocation contract as the draft path's `argmax_rows_into`.
         let mut ids_dev = std::mem::take(&mut scratch.argmax_ids);
         let out = {
             let dev = ids_dev.get(&self.ctx, logits.seq_len)?;
@@ -1803,15 +1729,11 @@ impl Qwen35Model {
             .collect()
     }
 
-    /// Accept scan + trunk rollback over a DSpark verify (`spec_step` steps 4-5
-    /// with the draft source swapped out). This chain occupies `logits` rows
-    /// `[row0, row0 + chain_len)` of the (possibly batched) verify output; the
-    /// pre-verify trunk snapshot must already be in `spec`.
-    /// Returns `(emitted, bonus, k)`; the caller crops the paged pool to
-    /// `start_pos + k + 1` when `k + 1 < chain.len()`.
-    /// `argmax` is the whole verify output's per-row argmax (see
-    /// [`Self::argmax_rows`]) — reading it row by row on device would drain the
-    /// pipeline once per chain row per slot.
+    /// Accept scan over a DSpark verify. This chain occupies `logits` rows
+    /// `[row0, row0 + chain_len)` of the (possibly batched) verify output;
+    /// `argmax` is that whole output's per-row argmax. Returns `(emitted,
+    /// bonus, k)`; the caller crops the paged pool to `start_pos + k + 1` when
+    /// `k + 1 < chain.len()`.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn dspark_accept_commit(
         &self,
@@ -1868,13 +1790,6 @@ impl Qwen35Model {
         // Restore: live <- snapshot, so the snapshot side is the source.
         self.batched_copy(copy, &gdr.1, &gdr.0, &[gdr_bytes])?;
         self.batched_copy(copy, &conv.1, &conv.0, &[conv_bytes])?;
-        // Always the batched varlen replay. It gated on `--qwen35-gdr-chunked`
-        // while that flag was opt-in; the flag defaulted on in c2eb5de9e and the
-        // per-slot loop silently became the only route, at rows x 48 x ~6
-        // launches a tick against 48 x 3 here. The replay recomputes from the
-        // restored snapshot, so it never had to match the trunk's kernel — and
-        // since the trunk's uniform short rows now take this same recurrent
-        // varlen kernel, matching it is the more consistent choice anyway.
         let ks: Vec<usize> = rolls.iter().map(|r| r.k).collect();
         let mut slots: Vec<&mut Qwen35SlotState> = Vec::with_capacity(rolls.len());
         let mut captures: Vec<&Qwen35LinearCapture> = Vec::with_capacity(rolls.len());
@@ -1893,14 +1808,9 @@ impl Qwen35Model {
     /// flashinfer/SGLang `chain_speculative_sampling`): accept `chain[j+1]`
     /// with prob min(1, p_j(tok)/q_j(tok)) under the engine-sampler-filtered
     /// distributions; the first reject commits a residual `max(0, p−q)` draw
-    /// (falling back to `p` on ~0 mass), full accept a bonus draw from the
-    /// last row — committed tokens are distributed exactly as filtered target
-    /// sampling. Fully on device: one batched filter launch over the verify
-    /// logits + one chain kernel; the host receives only `[accepted_len,
-    /// token]` (8 bytes) plus one 4-byte filtered prob per committed token
-    /// (the P6 behavior logprob, read after the verdict sync). All uniforms
-    /// come from host salted `(seed, position)` streams, so same-config-twice
-    /// reproduces.
+    /// (falling back to `p` on ~0 mass), full accept a bonus draw from the last
+    /// row. All uniforms come from host salted `(seed, position)` streams, so
+    /// same-config-twice reproduces.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn dspark_accept_commit_sampled(
         &self,
@@ -1925,8 +1835,7 @@ impl Qwen35Model {
             df.q_rows
         );
         let vocab = self.output_projection().rows;
-        // Uniform streams at pos = start_pos + j + 1 (identical to the host
-        // path's per-step draws — position-salted, so batching changes nothing).
+        // Position-salted, so batching draws the same uniforms as the host path.
         let pos = |j: usize| (start_pos + j + 1) as u64;
         let u_acc: Vec<f32> = (0..depth)
             .map(|j| unit_uniform(params.seed, SALT_ACCEPT, pos(j)))
@@ -2004,8 +1913,7 @@ impl Qwen35Model {
         );
         let mut tokens: Vec<u32> = chain[1..=k].to_vec();
         tokens.push(bonus);
-        // Behavior logprobs from the still-materialized filtered p rows
-        // (verdict D2H synced above) — see `chain_commit_logprobs`.
+        // Behavior logprobs read from the still-materialized filtered p rows.
         let logprobs = super::chain_commit_logprobs(ctx, p_all, vocab, &tokens)?;
         let emitted = tokens
             .into_iter()
@@ -2020,11 +1928,9 @@ impl Qwen35Model {
         Ok((emitted, bonus, k))
     }
 
-    /// Trunk verify of every chain in ONE forward over the paged pool, with
+    /// Trunk verify of every chain in one forward over the paged pool, with
     /// per-slot linear capture + a batch-wide tap: logits `[total_q, vocab]`
-    /// where chain `i` owns rows `[Σ_{j<i} len_j, ..)`. The paged twin of
-    /// [`Self::forward_tokens_verify`] (that one drives the legacy
-    /// contiguous lane and the MTP gate test).
+    /// where chain `i` owns rows `[Σ_{j<i} len_j, ..)`.
     pub(crate) fn dspark_verify_logits(
         &self,
         rows: &mut [super::LinearRow<'_>],
@@ -2061,8 +1967,8 @@ impl Qwen35Model {
             gemm_batch(&self.ctx, self.output_projection(), normed, &mut logits)
         })?;
         self.ctx.sync()?;
-        // Last: the caller rolls the pool back on any error here, and that only
-        // restores consistency while the trunk seq_lens have not moved.
+        // Last: the caller's error rollback only restores consistency while the
+        // trunk seq_lens have not moved.
         for r in rows.iter_mut() {
             r.slot.advance_seq_len(r.len);
         }

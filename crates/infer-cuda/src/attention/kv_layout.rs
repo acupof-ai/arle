@@ -2,10 +2,8 @@ use super::*;
 
 pub(crate) const DSV4_PREFILL_QUERY_CHUNK: usize = 4096;
 
-/// Probe/pending row width of a compressor state: both halves when `overlap`.
-/// Single source for `Dsv4CompressorState::{new, device_bytes_for}` and
-/// `dsv4_compressor_fp32_max_width` — these MUST agree or the shared FP32
-/// scratch mis-sizes against its consumers.
+/// Probe/pending row width: both halves when `overlap`. Every caller must agree or the
+/// shared FP32 scratch mis-sizes.
 pub(crate) fn dsv4_compressor_width(head_dim: usize, overlap: bool) -> usize {
     if overlap { 2 * head_dim } else { head_dim }
 }
@@ -17,21 +15,15 @@ pub(crate) struct Dsv4CompressorState {
     pub(super) compressed: HiddenStates,
     pub(super) compressed_capacity: usize,
     pub(super) ring_rows: usize,
-    // FP32 probe carry (pending partial-group + prev-overlap rows) — genuine
-    // persistent per-state carry; the big per-call kv/score GEMM scratch is
-    // the model-wide [`Dsv4CompressorFp32Scratch`].
     pub(super) fp32_pending_kv: CudaSlice<f32>,
     pub(super) fp32_pending_score: CudaSlice<f32>,
     pub(super) fp32_prev_kv: CudaSlice<f32>,
     pub(super) fp32_prev_score: CudaSlice<f32>,
-    /// The bf16 carry advanced past the FP32 carry (decode-lane update, prefix
-    /// restore, reset) — the next `compressor_fp32_probe` must reseed FP32
-    /// from bf16 before reading pending/prev. Every bf16-carry writer sets it;
-    /// only the probe clears it.
+    /// Set by every bf16-carry writer; only `compressor_fp32_probe` clears it, and it
+    /// must reseed FP32 from bf16 first.
     pub(super) fp32_carry_stale: bool,
 }
 
-/// Indexer key-staging ring depth (rows): 2 × the max per-forward query chunk.
 pub(super) const DSV4_INDEXER_STAGING_RING_ROWS: usize = 2 * DSV4_PREFILL_QUERY_CHUNK;
 
 impl Dsv4CompressorState {
@@ -116,21 +108,15 @@ impl Dsv4CompressorState {
             .memset_zeros(&mut self.compressed.data)
             .map_err(|e| anyhow::anyhow!("DSv4 compressor compressed reset failed: {e}"))?;
         self.compressed.seq_len = 0;
-        // The FP32 carry still holds the previous occupant; the next probe
-        // reseeds it from the zeroed bf16 carry.
         self.fp32_carry_stale = true;
         Ok(())
     }
 
-    /// Raw mutable device pointers (as `u64`) for gathering into the
-    /// batched-compressor-update pointer arrays: `(pending_kv, pending_score,
-    /// prev_overlap_kv, prev_overlap_score, compressed)` — all THIS ROW's own
-    /// per-slot buffers (#154: the shared pool was deleted with Route A).
-    /// Resolved on `ctx.stream`; the returned `u64`s stay valid because the
-    /// buffers are not reallocated for the rest of the forward (same
-    /// single-stream discipline the per-row path uses). The cudarc borrow
-    /// guards are dropped before returning so the caller can re-borrow
-    /// `state` later.
+    /// Returns `(pending_kv, pending_score, prev_overlap_kv, prev_overlap_score,
+    /// compressed)`,
+    /// valid for the rest of the forward (buffers are not reallocated); guards are
+    /// dropped so
+    /// the caller can re-borrow `state`.
     pub(crate) fn batched_update_ptrs(&mut self, ctx: &DeviceContext) -> (u64, u64, u64, u64, u64) {
         let (pkv, g0) = self.pending_kv.device_ptr_mut(&ctx.stream);
         let (psc, g1) = self.pending_score.device_ptr_mut(&ctx.stream);
@@ -160,9 +146,8 @@ impl Dsv4CompressorState {
             + self.fp32_prev_score.len() * f32
     }
 
-    /// STATIC predictor of `device_bytes` from `new`'s dims — MUST mirror `new`
-    /// (kept adjacent so drift is visible). Feeds `Dsv4Model::per_slot_device_bytes`
-    /// (the KV budget runs before any slot exists, so it cannot measure one).
+    /// Static predictor of `device_bytes` — MUST mirror `new`; the KV budget runs
+    /// before any slot exists.
     pub(crate) fn device_bytes_for(
         head_dim: usize,
         ratio: usize,
@@ -302,14 +287,12 @@ impl Dsv4CompressorState {
     }
 }
 
-/// Model-wide (one instance, NOT per-slot/per-layer) FP32 compressor-probe GEMM
-/// scratch, hoisted off the per-(slot,layer) [`Dsv4CompressorState`] (#85 P3
-/// pattern, like [`Dsv4FlashMlaDecodeScratch`]): `kv_raw`/`score_raw` are written
-/// by the probe's two GEMMs and consumed inside the SAME `compressor_fp32_probe`
-/// call — layers run sequentially and the engine runs one forward at a time, so
-/// one instance sized `max_width × max_seq_len` serves every (slot, layer). The
-/// per-slot copies inflated the ledger by 2×width×max_seq_len×4 B per compressor
-/// state ("per_slot 9922MB" clamped 256 slots to 1).
+/// Model-wide FP32 compressor-probe GEMM scratch: written and consumed inside one
+/// `compressor_fp32_probe` call, and layers run sequentially under one forward at a
+/// time,
+/// so a single `max_width × max_seq_len` instance serves every (slot, layer).
+/// Per-slot copies cost 2×width×max_seq_len×4 B each (per_slot 9922 MB clamped 256
+/// slots to 1).
 pub(crate) struct Dsv4CompressorFp32Scratch {
     pub(super) kv_raw: CudaSlice<f32>,
     pub(super) score_raw: CudaSlice<f32>,
@@ -330,8 +313,8 @@ impl Dsv4CompressorFp32Scratch {
         Ok(Self { kv_raw, score_raw })
     }
 
-    /// STATIC predictor of `device_bytes` — MUST mirror `new` (feeds
-    /// `Dsv4Model::kv_budget_plan`'s fixed subtraction before the adapter exists).
+    /// Static predictor of `device_bytes` — MUST mirror `new`; runs before the adapter
+    /// exists.
     pub(crate) fn device_bytes_for(max_width: usize, max_seq_len: usize) -> usize {
         2 * max_width * max_seq_len * std::mem::size_of::<f32>()
     }
@@ -341,9 +324,8 @@ impl Dsv4CompressorFp32Scratch {
     }
 }
 
-/// Max FP32-probe row width over every compressor `compressor_fp32_probe` can
-/// run — main compressor on `has_compressor()` (overlap ⇔ cr<16), indexer
-/// compressor on CSA only. 0 ⇔ no probing layer (no scratch).
+/// Max FP32-probe row width over every compressor that can be probed; 0 ⇔ no probing
+/// layer.
 pub(crate) fn dsv4_compressor_fp32_max_width(
     config: &DeepSeekV4Config,
     layers: impl IntoIterator<Item = (DeepSeekV4AttentionMode, usize)>,
@@ -356,8 +338,8 @@ pub(crate) fn dsv4_compressor_fp32_max_width(
             } else {
                 0
             };
-            // Narrower than has_indexer() on purpose: SparseIndexed (GLM) index
-            // keys go through sparse_indexed_index_key_forward and never probe.
+            // Narrower than has_indexer() on purpose: SparseIndexed index keys never
+            // probe.
             let indexer = if mode == DeepSeekV4AttentionMode::CompressedSparse {
                 dsv4_compressor_width(config.index_head_dim, true)
             } else {
@@ -373,81 +355,64 @@ pub(crate) struct Dsv4KvAdapter {
     pub(super) layers: Vec<Dsv4LayerKvLayout>,
     pub(super) num_slots: usize,
     pub(super) slot_epochs: Vec<Option<u64>>,
-    /// Stream handle for `prepare_kv_batch`-time demand-page zeroing (#154
-    /// Phase 3b) — the `ModelKvAdapter` trait signature carries no ctx.
+    /// Stream handle for `prepare_kv_batch`-time demand-page zeroing — the
+    /// `ModelKvAdapter` trait signature carries no ctx.
     pub(super) ctx: DeviceContext,
-    /// Shared comp token capacity the demand-paged pools were sized for
-    /// (`kv_budget_plan`); the engine host pool mirrors `pool_tokens / page`
-    /// as its admission page count.
+    /// Shared comp token capacity the demand-paged pools were sized for; the engine
+    /// host pool
+    /// mirrors `pool_tokens / page` as its admission page count.
     pub(super) flashmla_pool_tokens: usize,
-    /// One shared official-DSA selector scratch for ALL CSA layers and slots
-    /// (issue #67). `None` only when the model has no CSA/DSA indexer layer.
+    /// One shared official-DSA selector scratch for ALL CSA layers and slots. `None`
+    /// only when the model has no indexer layer.
     pub(super) dsa_shared: Option<Dsv4DsaSharedScratch>,
-    /// One shared MoE decode-graph scratch for ALL layers and slots (issue #60).
-    /// `None` unless the DSv4 decode-graph path is enabled.
-    /// One shared compact-FP8 decode-band MoE tail scratch for ALL layers and
-    /// slots (launch-bound Step 1). Sized to the band ceiling (128 routes), so
-    /// one instance serves every layer/step. `None` only when the model has no
-    /// MoE layer; independent of the decode graph (the batched-stream decode
-    /// path — the launch-bound target — never captures a graph).
+    /// One shared decode-band MoE tail scratch for ALL layers and slots, sized to the
+    /// band
+    /// ceiling (128 routes). `None` only when the model has no MoE layer.
     pub(super) moe_tail_scratch: Option<crate::moe::Dsv4MoeTailScratch>,
-    /// One persistent B=1 MLA decode scratch per MODEL1 layer. This is not graph
-    /// state; eager no-spec decode reuses it to avoid allocating q/kv/CSA/O-proj
+    /// Not graph state: eager no-spec decode reuses it to avoid allocating
+    /// q/kv/CSA/O-proj
     /// temporaries inside every per-layer MLA dispatch.
     pub(super) mla_decode: Vec<Option<Dsv4MlaDecodeGraphScratch>>,
-    /// One shared-expert output for ALL layers and slots. Capacity covers both
-    /// B=1 decode and the tiny multi-row MTP verify chunk; callers set
-    /// `seq_len` before dispatch.
+    /// One shared-expert output for ALL layers and slots; capacity covers the multi-row
+    /// MTP
+    /// verify chunk, and callers set `seq_len` before dispatch.
     pub(super) shared_expert_out: Option<HiddenStates>,
-    /// One shared-expert FP8 scratch for ALL layers and slots. Replaces the
-    /// per-layer `dsv4_shared_expert` temporary allocations on eager decode and
-    /// scheduled MTP verify.
     pub(super) shared_expert_scratch: Option<crate::moe::Dsv4SharedDecodeScratch>,
-    /// One shared batched (`b = N`) FlashMLA sparse-decode scratch for ALL
-    /// FlashMLA layers and slots (#60). `None` when FlashMLA decode is disabled
-    /// at the build/override level (no arena), or when the model has no FlashMLA
-    /// layer. Sized for `max_batch = num_slots` rows. Engaged only on the n>1
-    /// batched lane when `dsv4_flashmla_decode_enabled()`.
+    /// One shared batched (`b = N`) FlashMLA sparse-decode scratch for ALL FlashMLA
+    /// layers and
+    /// slots, sized for `max_batch = num_slots` rows. Engaged only on the n>1 batched
+    /// lane.
     pub(super) flashmla_batch: Option<Dsv4FlashMlaDecodeBatchScratch>,
-    /// One shared SINGLE-ROW (`s_q = 1`) FlashMLA decode SCRATCH for ALL FlashMLA
-    /// layers and slots (#85 P3). Hoisted out of the per-(slot,layer)
-    /// `Dsv4FlashMlaDecodeState` — its 13 per-forward accumulator/staging buffers
-    /// (`o_accum` dominant at ~33.7 MB/layer) carry NO cross-call/cross-slot state
-    /// (overwritten before read each layer step, serial on `ctx.stream`), so one
-    /// instance sized for the worst-case layer shape serves every (slot, layer).
-    /// Gated by the SAME predicate as the per-slot state alloc
-    /// (`cuda_kernels::HAS_FLASHMLA`); `None` ⇒ byte-identical to before.
+    /// One shared single-row (`s_q = 1`) FlashMLA decode scratch for ALL FlashMLA
+    /// layers and
+    /// slots: its accumulator/staging buffers carry no cross-call/cross-slot state
+    /// (overwritten
+    /// before read each layer step, serial on `ctx.stream`), so the worst-case layer
+    /// shape serves all.
     pub(super) flashmla_scratch: Option<Dsv4FlashMlaDecodeScratch>,
-    /// One shared FP8 prefill DeepGEMM linear (quantize→GEMM) staging scratch for
-    /// ALL layers and slots. Hoisted out of the per-slot `Dsv4LayerAttentionState`
-    /// (it was the biggest single per-(slot,layer) offender, ~30 MB/layer): the
-    /// scratch is M-chunk-bounded and fully overwritten from each chunk's
-    /// activations before read, carrying NO cross-call/cross-slot state (the
-    /// 2026-06 whole-slot-swap SCRATCH verdict). Sized by
-    /// `config` + `max_seq_len` only (no layer-specific dimensions), so a single
-    /// instance is valid for every layer and slot — DSv4 forward runs layers
-    /// sequentially and the engine runs one forward at a time, so it is reused,
-    /// never aliased concurrently (exactly like `dsa_shared`/`flashmla_batch`/
-    /// decode-graph scratch). `None` when native DeepGEMM is unavailable.
+    /// One shared FP8 prefill DeepGEMM linear staging scratch for ALL layers and slots:
+    /// M-chunk
+    /// bounded, fully overwritten before read, and sized from `config` + `max_seq_len`
+    /// only, so
+    /// sequential layers under one forward at a time never alias it. `None` when native
+    /// DeepGEMM is unavailable.
     pub(super) prefill_linear: Option<Dsv4PrefillDeepGemmLinearScratch>,
-    /// One shared FP32 compressor-probe GEMM scratch for ALL compressor layers
-    /// and slots, hoisted off the per-(slot,layer) `Dsv4CompressorState` (its
-    /// two `width×max_seq_len` f32 buffers collapsed the slot budget). `None`
-    /// only when the model has no compressor layer.
+    /// One shared FP32 compressor-probe GEMM scratch for ALL compressor layers and
+    /// slots.
+    /// `None` only when the model has no compressor layer.
     pub(super) compressor_fp32: Option<Dsv4CompressorFp32Scratch>,
-    /// Per-slot "host FlashMLA band changed since last device-table sync" bit
-    /// (#154 Phase 0). Set by the mirror/attach sites; consumed once per
-    /// forward via [`Self::take_device_table_dirty`] to drive the
-    /// graph-referenced device-table refresh.
+    /// Per-slot "host FlashMLA band changed since last device-table sync" bit; consumed
+    /// once per
+    /// forward via [`Self::take_device_table_dirty`] to drive the graph-referenced
+    /// table refresh.
     pub(super) device_table_dirty: Vec<bool>,
 }
 
-/// Index-layer map: the ONE `compressed-row → (slot-logical page, in-page row)`
-/// function for a DSv4 FlashMLA band. The SW ring owns pages `[0, sw_blocks)`;
-/// the compressed region follows. `page_size` is the FlashMLA MODEL1 block (64).
-/// Replaces the inline `sw_blocks + r/64, r%64` scattered across the write paths
-/// so drift between sites is structurally impossible (#146: above 2048 the
-/// per-path maps diverged and a shared wrong-row write garbled both read lanes).
+/// The ONE `compressed-row → (slot-logical page, in-page row)` map for a DSv4 FlashMLA
+/// band:
+/// SW ring owns pages `[0, sw_blocks)`, compressed region follows, `page_size` = 64.
+/// Single source so write paths cannot drift (#146: diverged maps garbled both read
+/// lanes above 2048).
 #[derive(Clone, Copy)]
 pub(crate) struct Dsv4BlockMap {
     sw_blocks: usize,
@@ -466,42 +431,35 @@ impl Dsv4BlockMap {
         (self.sw_blocks + r / self.page_size, r % self.page_size)
     }
 
-    /// SW sub-pool block count — the compressed region's page base.
     pub(crate) fn sw_blocks(&self) -> usize {
         self.sw_blocks
     }
 
-    /// FlashMLA MODEL1 page size (64). The ONE page-size source the pack/index
-    /// kernel params draw from, so `Dsv4BlockMap` and those params cannot drift.
+    /// FlashMLA MODEL1 page size (64) — the ONE source the pack/index kernel params
+    /// draw from.
     pub(crate) fn page_size(&self) -> usize {
         self.page_size
     }
 }
 
 pub(crate) struct Dsv4LayerKvLayout {
-    /// Shared FP8 MLA latent pool for this layer (#85 P2 Stage A): a
-    /// `TokenKVPool` of opaque packed records (`KVFormat::PackedBytes`,
-    /// 584 B/token), page = FlashMLA block = 64 tokens, single plane (records
-    /// in the K plane, no V/scale buffers). Every slot's band is addressed
-    /// ONLY through its block table ([`Self::flashmla_page_table`] /
-    /// [`Self::flashmla_pages_byte_range`]) — never by `slot_idx × slot_bytes`
-    /// arithmetic. Stage A allocates each slot's pages up-front in slot
-    /// order, so tables are contiguous identity runs and the physical layout
-    /// is byte-identical to the pre-paging band arena.
+    /// Packed MLA latent records (584 B/token) in the K plane only, page = FlashMLA
+    /// block = 64
+    /// tokens. Every slot's band is addressed ONLY through its block table, never by
+    /// `slot_idx × slot_bytes` arithmetic.
     pub(super) flashmla_kv_pool: Option<TokenKVPool>,
     pub(super) dsa_key_cache: Option<CudaSlice<u8>>,
-    /// Slot-logical FlashMLA blocks per slot (`sw_blocks + comp_blocks` for
-    /// this layer's shape) — every slot's MAX block-table length.
+    /// Every slot's MAX block-table length (`sw_blocks + comp_blocks` for this layer's
+    /// shape).
     pub(super) flashmla_slot_pages: usize,
     pub(super) flashmla_page_bytes: usize,
-    /// Demand-paged band (#154 Phase 3b, `dsv4_flashmla_demand_paged`): comp
-    /// pages come from the pool free list as the sequence grows; false = the
-    /// V32 identity full band (its pack lane needs band-base contiguity).
+    /// Comp pages come from the pool free list as the sequence grows; false = the V32
+    /// identity
+    /// full band, whose pack lane needs band-base contiguity.
     pub(super) flashmla_demand_paged: bool,
     /// Ring blocks at the band's logical head (`[0, sw_blocks)`).
     pub(super) flashmla_sw_blocks: usize,
-    /// Tokens one comp page covers (`page_block_size × compress_ratio`);
-    /// 0 = no comp region (SlidingWindow-only layer).
+    /// Tokens one comp page covers; 0 = no comp region (SlidingWindow-only layer).
     pub(super) flashmla_comp_tokens_per_page: usize,
     pub(super) dsa_slot_bytes: usize,
     pub(super) num_slots: usize,
@@ -526,16 +484,12 @@ impl Dsv4LayerKvLayout {
 
     /// Advance the FlashMLA band cursor by `append_len` tokens.
     ///
-    /// The band is NOT a sequential KV cache: the sliding-window ring lives at
-    /// slot-logical pages `[0, sw_blocks)` and the compressed region at
-    /// `[sw_blocks, total_blocks)`, both addressed by FIXED slot-logical block id
-    /// (see `flashmla_pack_sw_ring` / `flashmla_pack_compressed_delta` /
-    /// `fp8_sw_offsets`). So the readers/pack kernels need ALL `total_blocks`
-    /// pages resident from the first token — a `ceil(seq_len/page_size)` draw
-    /// would leave the SW ring / comp region unmapped. The band is adopted from
-    /// the host slot page table by `prepare_kv_batch`; this method only advances
-    /// the logical cursor, so the `seq_len == append_pos` invariant tracks
-    /// position, not band size.
+    /// The band is not a sequential KV cache — ring and comp region are addressed by
+    /// fixed
+    /// slot-logical block id, so all `total_blocks` pages must be resident from the
+    /// first token.
+    /// This only advances the cursor, so `seq_len == append_pos` tracks position, not
+    /// band size.
     pub(crate) fn flashmla_alloc_append(
         &mut self,
         slot_idx: usize,
@@ -546,7 +500,6 @@ impl Dsv4LayerKvLayout {
         }
         let band_pages = self.flashmla_slot_pages;
         let pool = self.flashmla_pool_mut()?;
-        // Host tables carry only real pages (#154 Phase 0): non-empty, ≤ band.
         ensure!(
             (1..=band_pages).contains(&pool.page_indices(slot_idx).len()),
             "DSv4 FlashMLA slot {slot_idx} band not mirrored ({} pages, band capacity {band_pages}) before cursor advance",
@@ -565,10 +518,6 @@ impl Dsv4LayerKvLayout {
         Ok(())
     }
 
-    /// Band pages a demand-paged slot needs to hold `tokens`: the ring blocks
-    /// plus `ceil(tokens / (page × ratio))` comp pages (floored at one comp
-    /// page — the shape's `compressed_rows.max(1)` capacity floor), capped at
-    /// the full band.
     pub(super) fn flashmla_band_pages_for(&self, tokens: usize) -> usize {
         let comp = if self.flashmla_comp_tokens_per_page == 0 {
             0
@@ -578,15 +527,13 @@ impl Dsv4LayerKvLayout {
         (self.flashmla_sw_blocks + comp).min(self.flashmla_slot_pages)
     }
 
-    /// Grow `slot_idx`'s demand-paged band to cover `tokens` (#154 Phase 3b):
-    /// missing pages come from the layer pool's free list and are ZEROED
-    /// before use (a recycled page carries a prior occupant's bytes; the ring
-    /// bootstrap and comp readers assume zeroed tails). Returns whether the
-    /// table changed (drives the device-table dirty bit). No-op (false) on
-    /// identity (V32) layers — `mirror_band` owns their tables — and when the
-    /// table already covers `tokens`. Exhaustion here is a HARD error: the
-    /// engine's device-budget plan gate (`kv_device_fit`, #160 — parks
-    /// over-admitted rows before submit) must make it unreachable.
+    /// Grow `slot_idx`'s demand-paged band to cover `tokens`; missing pages are zeroed
+    /// before
+    /// use because a recycled page carries a prior occupant's bytes and the ring
+    /// bootstrap and
+    /// comp readers assume zeroed tails. Returns whether the table changed (drives the
+    /// device-table dirty bit); false on identity layers, whose tables `mirror_band`
+    /// owns.
     pub(crate) fn flashmla_ensure_band(
         &mut self,
         ctx: &DeviceContext,
@@ -618,12 +565,11 @@ impl Dsv4LayerKvLayout {
         Ok(true)
     }
 
-    /// H2: clamp the FlashMLA pool's per-slot append cursor back to `new_len`
-    /// tokens on an MTP reject — the pool advances 1 token/decode-tick but the
-    /// MTP commit can roll back N drafted tokens, so the pool seq_len must shrink
-    /// in lockstep with the compressor/indexer/DSA truncate or the next tick's
-    /// `append_pos != pool seq_len` aborts the prepare invariant. Cursor-only:
-    /// the fixed-layout band stays fully resident (never recycle band pages).
+    /// Clamp the per-slot append cursor to `new_len` on an MTP reject: the pool seq_len
+    /// must
+    /// shrink in lockstep with the compressor/indexer/DSA truncate, or the next tick's
+    /// `append_pos != pool seq_len` aborts the prepare invariant. Cursor-only — band
+    /// pages stay resident.
     pub(crate) fn flashmla_truncate_slot(&mut self, slot_idx: usize, new_len: usize) -> Result<()> {
         if self.flashmla_slot_pages == 0 {
             return Ok(());
@@ -668,10 +614,9 @@ impl Dsv4LayerKvLayout {
         if self.flashmla_slot_pages == 0 {
             return Ok(());
         }
-        // Demand-paged bands are claim-zeroed page-by-page (`ensure_band`);
-        // a fresh occupant's table only ever holds pages zeroed for THIS
-        // occupancy (free_slot empties it at request end), so the occupancy
-        // whole-band zero is both redundant and a blocking H2D.
+        // Demand-paged bands are claim-zeroed page-by-page in `ensure_band`, so a
+        // whole-band
+        // zero here is redundant and a blocking H2D.
         if self.flashmla_demand_paged {
             return Ok(());
         }
@@ -759,13 +704,9 @@ impl Dsv4KvAdapter {
                 )
             })
             .collect::<Result<Vec<_>>>()?;
-        // Build the ONE shared official-DSA scratch when any indexer layer
-        // exists. Widened to has_indexer() so GLM SparseIndexed (every layer)
-        // also builds the scratch. All indexer layers must agree on the indexer
-        // ratio: CSA = compress_ratio (uniform cr=4 on DSv4-Flash); GLM
-        // SparseIndexed maps to ratio=1 (full-sequence, every token a key). A
-        // mixed CSA+SparseIndexed model trips the uniform-ratio assertion below
-        // (out of scope: GLM is pure SparseIndexed, DSv4 pure CSA).
+        // All indexer layers must agree on the ratio: CSA uses compress_ratio,
+        // SparseIndexed
+        // maps to 1 (every token a key). A mixed model trips the assertion below.
         let mut csa_ratios = layer_specs
             .iter()
             .filter(|(mode, _, _)| mode.has_indexer())
@@ -792,10 +733,10 @@ impl Dsv4KvAdapter {
             }
             _ => None,
         };
-        // Compact-FP8 decode-band MoE tail scratch — allocated whenever the model
-        // has a MoE layer, matching the fixed term `kv_budget_plan` already
-        // reserves for it. The batched-stream decode path is the consumer; with
-        // no scratch it falls back to a per-call alloc.
+        // Allocated whenever the model has a MoE layer, matching the fixed term
+        // `kv_budget_plan`
+        // reserves; without it the batched-stream decode path falls back to a per-call
+        // alloc.
         let moe_tail_scratch = shared_expert_decode
             .map(|layer| {
                 crate::moe::Dsv4MoeTailScratch::new(
@@ -806,11 +747,9 @@ impl Dsv4KvAdapter {
                 )
             })
             .transpose()?;
-        // ALWAYS allocate the model-wide shared-expert output. Capacity is the
-        // bounded MTP verify chunk (`MAX_SPEC_VERIFY_ROWS`); B=1 decode simply
-        // sets `seq_len = 1` before dispatch. Keeping it pre-allocated avoids a
-        // per-layer `uninit` on both the default decode and scheduled verify
-        // paths.
+        // Pre-allocated at the bounded MTP verify chunk to avoid a per-layer `uninit`
+        // on both
+        // the default decode and scheduled verify paths; B=1 decode sets `seq_len = 1`.
         // SAFETY: uninit device scratch; fully written before first read.
         let shared_expert_out = Some(unsafe {
             HiddenStates::uninit(ctx, hidden_size, crate::dsv4::MAX_SPEC_VERIFY_ROWS)?
@@ -824,12 +763,9 @@ impl Dsv4KvAdapter {
                 )
             })
             .transpose()?;
-        // One model-wide batched (b=N) FlashMLA decode scratch (#60). Built for
-        // both MODEL1 (head_dim=512) and V32/GLM (head_dim=576) when the arena
-        // is live; the batched shim now handles both dim mappings.
-        // Build the per-layer FlashMLA decode shapes ONCE (shared by the batched
-        // scratch and the new single-row shared scratch). Both gate on the same
-        // `cuda_kernels::HAS_FLASHMLA` predicate as the per-slot state.
+        // Per-layer FlashMLA decode shapes built ONCE, shared by the batched and
+        // single-row
+        // scratches; both gate on the same predicate as the per-slot state.
         let (flashmla_batch, flashmla_scratch) = if cuda_kernels::HAS_FLASHMLA {
             let layer_shapes = layer_specs
                 .iter()
@@ -851,19 +787,12 @@ impl Dsv4KvAdapter {
                 num_slots,
                 &layer_shapes,
             )?);
-            // ONE model-wide single-row decode scratch (#85 P3), hoisted from the
-            // per-(slot,layer) state. Worst-case-sized across all FlashMLA layers.
+            // Worst-case-sized across all FlashMLA layers.
             let single = Dsv4FlashMlaDecodeScratch::new(ctx, config, &layer_shapes)?;
             (batch, Some(single))
         } else {
             (None, None)
         };
-        // ONE model-wide FP8 prefill DeepGEMM linear scratch (hoisted from the
-        // per-slot `Dsv4LayerAttentionState`). Same gate the per-slot alloc used.
-        // Sized by `config` + `max_seq_len` only (no layer-specific dims), so a
-        // single instance serves every layer and slot; layers run sequentially
-        // and the engine runs one forward at a time, so it is never aliased
-        // concurrently. OFF by default → byte-identical to the disabled path.
         let prefill_linear = if dsv4_deepgemm_enabled() {
             Some(Dsv4PrefillDeepGemmLinearScratch::new(
                 ctx,
@@ -873,8 +802,7 @@ impl Dsv4KvAdapter {
         } else {
             None
         };
-        // ONE model-wide FP32 compressor-probe scratch (hoisted off the
-        // per-(slot,layer) compressor state). max_width 0 ⇔ no compressor layer.
+        // max_width 0 ⇔ no compressor layer.
         let fp32_width = dsv4_compressor_fp32_max_width(
             config,
             layer_specs.iter().map(|&(mode, cr, _)| (mode, cr)),
@@ -901,18 +829,11 @@ impl Dsv4KvAdapter {
         })
     }
 
-    /// Exact requested device bytes owned by the model-wide KV adapter: the
-    /// per-layer KV layouts (the FlashMLA FP8 latent pools + DSA key caches,
-    /// sized for ALL slots — the dominant DSv4 KV byte sink) + the four
-    /// model-wide shared scratches. `slot_epochs`/`num_slots` are host-only.
     #[allow(dead_code)]
     pub(crate) fn device_bytes(&self) -> usize {
         self.device_bytes_breakdown().iter().map(|(_, b)| *b).sum()
     }
 
-    /// Per-component byte breakdown for the VRAM ledger log. `layers` collapses
-    /// to one summed entry (per-layer detail would be 40+ rows); the four
-    /// shared scratches are itemized.
     #[allow(dead_code)]
     pub(crate) fn device_bytes_breakdown(&self) -> Vec<(&'static str, usize)> {
         let layers_bytes: usize = self.layers.iter().map(|l| l.device_bytes()).sum();
@@ -965,14 +886,7 @@ impl Dsv4KvAdapter {
         ]
     }
 
-    /// Split-borrow accessor: one layer's KV layout, the model-wide shared DSA
-    /// scratch, the model-wide single-row FlashMLA decode scratch, the
-    /// model-wide shared FP8 prefill DeepGEMM linear scratch, AND the model-wide
-    /// FP32 compressor-probe scratch (all disjoint fields, so all can be `&mut`
-    /// at once). The FlashMLA scratch is `None` when FlashMLA decode is disabled
-    /// at the build/override level (same gate as the per-slot state); the
-    /// prefill scratch is `None` when native DeepGEMM is unavailable; the FP32
-    /// scratch is `None` when the model has no compressor layer.
+    /// Split borrow of disjoint fields, so all can be `&mut` at once.
     #[allow(clippy::type_complexity)]
     pub(crate) fn layer_and_dsa_shared_mut(
         &mut self,
@@ -998,13 +912,9 @@ impl Dsv4KvAdapter {
         ))
     }
 
-    /// Split-borrow accessor for the commit-fold path: one layer's KV layout +
-    /// the model-wide single-row FlashMLA decode scratch + the model-wide FP32
-    /// compressor-probe scratch (all disjoint fields). The fold's FP8 SW ring
-    /// pack reuses the shared scratch's `sw_bulk_*` buffers; its compressor
-    /// re-ingestion runs the FP32 probe. `None` for the FlashMLA scratch when
-    /// FlashMLA decode is disabled; `None` for the FP32 scratch when the model
-    /// has no compressor layer.
+    /// Split borrow for the commit-fold path: its FP8 SW ring pack reuses the shared
+    /// scratch's
+    /// `sw_bulk_*` buffers and its compressor re-ingestion runs the FP32 probe.
     #[allow(clippy::type_complexity)]
     pub(crate) fn layer_and_flashmla_scratch_mut(
         &mut self,
@@ -1026,9 +936,6 @@ impl Dsv4KvAdapter {
         ))
     }
 
-    /// Split-borrow accessor for eager B=1 MODEL1 MLA decode: one layer's KV
-    /// layout + shared DSA scratch + FlashMLA scratch + that layer's persistent
-    /// MLA scratch.
     pub(crate) fn layer_flashmla_and_mla_decode_mut(
         &mut self,
         layer_idx: usize,
@@ -1051,13 +958,9 @@ impl Dsv4KvAdapter {
         ))
     }
 
-    /// Split-borrow accessor for the batched (`b = N`) FlashMLA decode lane
-    /// (#60): one layer's KV layout, the model-wide shared DSA scratch, the
-    /// model-wide batched-decode scratch, AND the model-wide shared FP8 prefill
-    /// DeepGEMM linear scratch (all disjoint fields). `None` for the batched
-    /// scratch when the build/override disabled FlashMLA decode — the caller
-    /// then takes the per-row lane; `None` for the prefill scratch when native
-    /// DeepGEMM is unavailable.
+    /// Split borrow for the batched (`b = N`) FlashMLA decode lane; a `None` batched
+    /// scratch
+    /// means the caller must take the per-row lane.
     #[allow(clippy::type_complexity)]
     pub(crate) fn layer_dsa_and_flashmla_batch_mut(
         &mut self,
@@ -1117,23 +1020,19 @@ impl Dsv4KvAdapter {
             .ok_or_else(|| anyhow!("DSv4 attention pool layer {layer_idx} outside len {len}"))
     }
 
-    /// Whether the model's FlashMLA bands are demand-paged (#154 Phase 3b) —
-    /// uniform across layers (MODEL1 vs V32 is a model-wide shape).
+    /// Uniform across layers — MODEL1 vs V32 is a model-wide shape.
     pub(crate) fn flashmla_demand_paged(&self) -> bool {
         self.layers.iter().any(|l| l.flashmla_demand_paged)
     }
 
-    /// Per-row fit for the engine's device-budget gate (#160): every row
-    /// whose band growth some demand-paged layer cannot serve is pushed
-    /// unfit (ascending); fitting rows debit each layer's headroom
-    /// cumulatively, unfit rows debit nothing so later smaller rows are
-    /// still tested. Need is paired with headroom PER LAYER — a saturated
-    /// SW-only layer is free=0 AND need=0, which a scalar min-free/max-need
-    /// projection misreads as permanent exhaustion. Per row and layer the
-    /// growth is the exact `needed - have` draw `flashmla_ensure_band` will
-    /// make at submit, including `prepare_kv_batch`'s MTP verify margin;
-    /// free counts are the host free-list lengths (plan slots are distinct,
-    /// so `have` stays current). No device readback (CUDA-graph safe).
+    /// Per-row fit for the engine's device-budget gate: rows that no demand-paged layer
+    /// can
+    /// grow for are pushed unfit and debit nothing, so later smaller rows are still
+    /// tested.
+    /// Need is paired with headroom PER LAYER — a saturated SW-only layer is free=0 AND
+    /// need=0,
+    /// which a scalar min-free/max-need projection misreads as permanent exhaustion.
+    /// No device readback (CUDA-graph safe).
     pub(crate) fn flashmla_demand_fit(
         &self,
         rows: &[infer_seam::DeviceRowDemand],
@@ -1177,13 +1076,11 @@ impl Dsv4KvAdapter {
         }
     }
 
-    /// Engine-facing admission page count. Demand-paged (#154 Phase 3b): the
-    /// solved shared token capacity in engine 64-token pages — the host pool
-    /// gates admission on token-projection availability against this.
-    /// Identity (V32): the physical page count of the binding layer's pool,
-    /// which must track the same layer `flashmla_max_slot_pages` maximizes
-    /// over (#85; see
-    /// docs/experience/errors/2026-07-08-dsv4-slot-abort-band-leak-crash.md).
+    /// Engine-facing admission page count: demand-paged models report the shared token
+    /// capacity
+    /// in 64-token pages; identity models report the binding layer's physical page
+    /// count, which
+    /// must track the same layer `flashmla_max_slot_pages` maximizes over.
     pub(crate) fn flashmla_total_pages(&self) -> Option<usize> {
         if self.flashmla_demand_paged() {
             let page = self.flashmla_page_size().unwrap_or(0).max(1);
@@ -1201,9 +1098,9 @@ impl Dsv4KvAdapter {
             .map(Dsv4LayerKvLayout::flashmla_page_size)
     }
 
-    /// Fixed-band admission (identity/V32 only): every slot draws its whole
-    /// band up front. Demand-paged models return None — admission becomes
-    /// token-projection page availability (#154 Phase 3b).
+    /// Fixed-band admission: every slot draws its whole band up front. `None` for
+    /// demand-paged
+    /// models, whose admission is token-projection page availability instead.
     pub(crate) fn flashmla_max_slot_pages(&self) -> Option<usize> {
         if self.flashmla_demand_paged() {
             return None;
@@ -1217,10 +1114,8 @@ impl Dsv4KvAdapter {
         (pages > 0).then_some(pages)
     }
 
-    /// Materialize `slot`'s band for a prefix restore at `seq_len` matched
-    /// tokens: demand-paged layers allocate ring + comp pages for `seq_len`;
-    /// identity (V32) layers mirror the full identity band (restored content
-    /// is copied into the slot's own pages). Cursor set to `seq_len`.
+    /// Materialize `slot`'s band for a prefix restore at `seq_len` matched tokens;
+    /// cursor set to `seq_len`.
     pub(crate) fn mirror_full_band(
         &mut self,
         ctx: &DeviceContext,
@@ -1255,13 +1150,11 @@ impl Dsv4KvAdapter {
         Ok(())
     }
 
-    /// Materialize `slot`'s band for a DIRECT forward that bypasses
-    /// `prepare_kv_batch` (boot selftest / parity examples), cursor at 0:
-    /// demand layers allocate ring + comp pages for `tokens` (claim-zeroed);
-    /// identity layers mirror their full identity band. The caller must
-    /// consume the dirty bit and refresh the device page tables before the
-    /// forward — the codex-flagged selftest bug was running kernels against
-    /// never-refreshed (all-zero) device tables.
+    /// Materialize `slot`'s band for a direct forward that bypasses `prepare_kv_batch`,
+    /// cursor
+    /// at 0. The caller must consume the dirty bit and refresh the device page tables
+    /// before
+    /// the forward, or kernels run against never-refreshed all-zero tables.
     pub(crate) fn prepare_direct_forward(
         &mut self,
         ctx: &DeviceContext,
@@ -1307,9 +1200,8 @@ impl Dsv4KvAdapter {
         Ok(())
     }
 
-    /// Consume the slot's "host band changed since last device-table sync" bit
-    /// (#154 Phase 0). `true` ⇒ the caller must refresh the graph-referenced
-    /// device page tables before the forward.
+    /// `true` ⇒ the caller must refresh the graph-referenced device page tables before
+    /// the forward.
     pub(crate) fn take_device_table_dirty(&mut self, slot: usize) -> bool {
         std::mem::take(&mut self.device_table_dirty[slot])
     }
@@ -1327,8 +1219,7 @@ impl ModelKvAdapter for Dsv4KvAdapter {
 
     fn prepare_kv_batch(&mut self, desc: &KvBatchDescriptor) -> Result<Self::BatchView> {
         let mut rows = Vec::with_capacity(desc.rows.len());
-        // Reused per (row, layer) — the identity band is rebuilt in place so a
-        // decode tick doesn't heap-alloc per layer.
+        // Rebuilt in place so a decode tick doesn't heap-alloc per layer.
         let mut layer_pages: Vec<BandPage> = Vec::new();
         for (idx, row) in desc.rows.iter().enumerate() {
             ensure!(
@@ -1370,15 +1261,13 @@ impl ModelKvAdapter for Dsv4KvAdapter {
             };
             let layer_count = self.layers.len();
             let mut band_changed = false;
-            // Demand bands reserve the row's KNOWN span (prefill: the whole
-            // prompt at the FIRST chunk — one growth event + one device-table
-            // refresh per request instead of one per 256-token chunk crossing;
-            // the pages are needed regardless, so capacity cost is zero) plus
-            // the MTP verify margin: a spec step writes ring/comp state for up
-            // to depth+1 draft positions beyond the committed cursor, and the
-            // commit fold advances by up to the same — all inside ONE tick,
-            // after this (the only) alloc point. ≤ one extra comp page,
-            // budgeted by `DSV4_COMP_SAFETY_PAGES_PER_SLOT`.
+            // Reserve the row's whole known span at the first chunk (one growth event
+            // per
+            // request instead of one per chunk crossing) plus the MTP verify margin: a
+            // spec
+            // step and its commit fold write up to depth+1 positions past the committed
+            // cursor,
+            // all inside ONE tick after this, the only alloc point.
             let ensure_tokens = row.total_tokens.max(row.append_pos + row.append_len)
                 + crate::dsv4::MAX_SPEC_DRAFT_DEPTH
                 + 1;
@@ -1393,9 +1282,9 @@ impl ModelKvAdapter for Dsv4KvAdapter {
                     band_changed |=
                         layer.flashmla_ensure_band(&ctx, row.slot, ensure_tokens, true)?;
                 } else {
-                    // Identity band (#154): band page = slot*lsp + i. Engine
-                    // logical ids never enter physical tables — V32 pack
-                    // needs band contiguity; reuse crosses slots by copy.
+                    // Engine logical ids never enter physical tables — V32 pack needs
+                    // band
+                    // contiguity, so reuse crosses slots by copy.
                     layer_pages.clear();
                     layer_pages.extend(
                         (0..slot_pages.len().min(lsp))
@@ -1481,12 +1370,10 @@ impl Dsv4LayerKvLayout {
             .checked_mul(kv_arena.bytes_per_token)
             .ok_or_else(|| anyhow!("DSv4 shared FlashMLA page byte size overflow"))?;
         let flashmla_kv_pool = if flashmla_slot_pages > 0 {
-            // Shared packed MLA latent pool. DSv4 does not self-allocate a
-            // sequential table here: `prepare_kv_batch` mirrors the
-            // host-owned fixed band (`flat_slot_page_ids`) into this pool, so
-            // engine/radix/tier page identity is the single source of truth.
-            // The band is total_blocks pages (SW ring + comp region addressed
-            // by fixed slot-logical block id, NOT ceil(seq_len)).
+            // No sequential table here: `prepare_kv_batch` mirrors the host-owned fixed
+            // band
+            // into this pool, so engine/radix/tier page identity stays the single
+            // source.
             let format = KVFormat::PackedBytes {
                 bytes_per_token: kv_arena.bytes_per_token,
             };
@@ -1496,13 +1383,9 @@ impl Dsv4LayerKvLayout {
                 format.default_page_size(),
                 kv_arena.page_block_size
             );
-            // #154 Phase 3b: each layer is sized by the ONE shared formula
-            // (`dsv4_flashmla_layer_pool_pages`) — identity layers get
-            // `num_slots` whole bands; demand-paged layers get per-slot
-            // ring/safety pages plus the SHARED comp capacity for
-            // `pool_tokens` total tokens. `kv_budget_plan` solves
-            // `pool_tokens` against the SAME formula, so budget and alloc
-            // cannot drift.
+            // `kv_budget_plan` solves `pool_tokens` against this SAME formula, so
+            // budget and
+            // alloc cannot drift.
             let pool_pages = super::dsv4_flashmla_layer_pool_pages(
                 config,
                 mode,
@@ -1523,15 +1406,9 @@ impl Dsv4LayerKvLayout {
                 format,
             )
             .map_err(|e| anyhow!("DSv4 shared FlashMLA pool alloc failed: {e}"))?;
-            // Sanity: identity pools must cover every slot's whole band;
-            // demand pools at least one full-length request's band on top of
-            // the per-slot ring/safety reserve — catches a `kv_budget_plan`
-            // regression here instead of a mid-serve exhaustion bail
-            // (pod-verified 2026-07-06: the two gates disagreeing crashed
-            // every worker rank).
-            // Demand floor: every slot's ring + ONE full-length comp region
-            // (`lsp − sw` — zero for ring-only SW layers, whose pool is
-            // exactly `num_slots × sw_blocks`).
+            // Catches a `kv_budget_plan` regression here instead of a mid-serve
+            // exhaustion bail:
+            // the two gates disagreeing crashed every worker rank.
             let min_pages = if flashmla_demand_paged {
                 num_slots
                     .saturating_mul(flashmla_sw_blocks)
@@ -1551,16 +1428,14 @@ impl Dsv4LayerKvLayout {
             None
         };
 
-        // GLM SparseIndexed: full-sequence indexer, every token a key (ratio=1,
-        // no compressor). CompressedSparse keeps its real compress_ratio.
+        // SparseIndexed is a full-sequence indexer: every token a key, no compressor.
         let index_ratio = if mode == DeepSeekV4AttentionMode::SparseIndexed {
             1
         } else {
             compress_ratio
         };
-        // Widen the per-slot DSA key-cache to has_indexer() (CSA + GLM
-        // SparseIndexed); sized at index_ratio (=1 for GLM) so the div_ceil in
-        // dsv4_dsa_key_cache_bytes never sees compress_ratio==0.
+        // Sized at index_ratio so the div_ceil in dsv4_dsa_key_cache_bytes never sees
+        // 0.
         let dsa_slot_bytes = if mode.has_indexer() {
             dsv4_dsa_key_cache_bytes(config, index_ratio, max_seq_len)?
         } else {
@@ -1592,10 +1467,6 @@ impl Dsv4LayerKvLayout {
         })
     }
 
-    /// Exact requested device bytes owned by this ONE layer's KV layout (sized
-    /// for ALL slots): the shared FlashMLA FP8 latent `TokenKVPool` (the
-    /// dominant DSv4 KV byte sink) + the shared DSA key-cache band. The
-    /// `flashmla_page_table` / scalar shape fields are host-only.
     #[allow(dead_code)]
     pub(crate) fn device_bytes(&self) -> usize {
         self.flashmla_kv_pool
@@ -1622,8 +1493,6 @@ impl Dsv4LayerKvLayout {
         Ok(start..end)
     }
 
-    /// The layer's shared FlashMLA latent pool (present iff the decode-alloc
-    /// gate is on and this layer has a non-empty FlashMLA shape).
     pub(crate) fn flashmla_pool(&self) -> Result<&TokenKVPool> {
         self.flashmla_kv_pool
             .as_ref()
@@ -1645,8 +1514,8 @@ impl Dsv4LayerKvLayout {
         Ok(self.flashmla_pool_mut()?.k_data_slice_mut(0))
     }
 
-    /// Shared FlashMLA pool base device pointer (batched pack: one base, N rows
-    /// write disjoint bands via their per-slot page tables). Uniform across rows.
+    /// Uniform across rows: batched pack uses one base, N rows write disjoint bands via
+    /// their page tables.
     pub(crate) fn flashmla_pool_base_ptr(&mut self, ctx: &DeviceContext) -> Result<u64> {
         let pool_buf = self.flashmla_pool_data_mut()?;
         let (ptr, guard) = pool_buf.device_ptr_mut(&ctx.stream);
@@ -1654,10 +1523,8 @@ impl Dsv4LayerKvLayout {
         Ok(ptr)
     }
 
-    /// One slot's page table: slot-logical page → physical pool page
-    /// (FlashMLA's FFI calls our 64-token page a "block"). The ONLY source of band addresses (#85 P2) — token counts and
-    /// block counts come from the pool's table, never re-derived from
-    /// `slot_idx` arithmetic.
+    /// Slot-logical page → physical pool page: the ONLY source of band addresses, never
+    /// re-derived from `slot_idx` arithmetic.
     pub(crate) fn flashmla_page_table(&self, slot_idx: usize) -> Result<&[u32]> {
         ensure!(
             slot_idx < self.num_slots,
@@ -1667,21 +1534,12 @@ impl Dsv4LayerKvLayout {
         Ok(self.flashmla_pool()?.page_indices(slot_idx))
     }
 
-    /// Table-routed byte range of one slot's FlashMLA band.
-    ///
-    /// Invariant (#85 P2 Stage A): the range derives from the slot's PAGE
-    /// TABLE, and the helper errors unless the table is a contiguous identity
-    /// run — that contiguity is what licenses the band-base addressing the
-    /// device-side pack/index kernels still use. Stage B must hand those
-    /// kernels a device-resident table before tables may fragment.
-    ///
-    /// The expected page count is the slot's ACTUAL drawn pages (`table.len()`),
-    /// not the per-slot reservation (`flashmla_slot_pages`): a slot with no band
-    /// yet has an empty table (handled by `contiguous_page_table_byte_range`'s
-    /// `expected_pages > 0` guard), and a live slot draws its WHOLE band on
-    /// admission (`flashmla_alloc_append`), so for the single-request/sequential
-    /// case `table.len() == flashmla_slot_pages`. The contiguity check stays —
-    /// the draw remains contiguous per slot.
+    /// Table-routed byte range of one slot's FlashMLA band. Errors unless the table is
+    /// a
+    /// contiguous identity run — that contiguity is what licenses the band-base
+    /// addressing the
+    /// device-side pack/index kernels use. Expected page count is the slot's ACTUAL
+    /// drawn pages.
     pub(super) fn flashmla_pages_byte_range(
         &self,
         slot_idx: usize,

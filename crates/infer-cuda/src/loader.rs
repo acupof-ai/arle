@@ -1,7 +1,4 @@
 //! Cold path: safetensors loading, paging metadata, and config validation.
-//!
-//! Holds the BF16 safetensors loader, `CudaModel::from_safetensors` weight
-//! upload, the per-step paging metadata (`PageMeta`), and the BF16 config gate.
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -61,8 +58,6 @@ impl CudaModel {
         Self::from_safetensors_with_tp(model_path, tp)
     }
 
-    /// Load with an explicit [`crate::tp::TpRuntime`] (tests inject a single-GPU
-    /// runtime).
     pub(crate) fn from_safetensors_with_tp(
         model_path: &Path,
         tp: crate::tp::TpRuntime,
@@ -72,9 +67,7 @@ impl CudaModel {
         validate_clean_bf16_config(&config)?;
 
         let tp_cfg = *tp.config();
-        // Per-rank GQA head counts. `head_shard` requires both counts divide the
-        // world size, keeping every rank's attention shape uniform — the kv8
-        // TileLang kernels and the all-reduce both rely on it.
+        // kv8 kernels and the all-reduce require a uniform per-rank attention shape.
         let (local_q_heads, local_kv_heads) = if tp_cfg.is_single() {
             (config.num_attention_heads, config.num_key_value_heads)
         } else {
@@ -89,8 +82,9 @@ impl CudaModel {
         let ctx = DeviceContext::new()?;
         let loader = SafetensorLoader::new(model_path)?;
 
-        // lm_head / embed_tokens stay replicated across ranks (avoids an
-        // all-gather of logits); only per-layer Q/K/V/O + MLP are sharded.
+        // lm_head / embed_tokens stay replicated — sharding them would need an
+        // all-gather
+        // of logits.
         let embed_tokens = loader.load_matrix(&ctx, config.embed_tokens_tensor_name())?;
         let lm_head = if config.tie_word_embeddings {
             None
@@ -104,7 +98,6 @@ impl CudaModel {
             let names = config.layer_tensor_names(layer_idx);
             let (q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj) =
                 if tp_cfg.is_single() {
-                    // Single GPU: full tensors.
                     (
                         loader.load_matrix(&ctx, &names.q_proj)?,
                         loader.load_matrix(&ctx, &names.k_proj)?,
@@ -115,12 +108,8 @@ impl CudaModel {
                         loader.load_matrix(&ctx, &names.mlp_down_proj)?,
                     )
                 } else {
-                    // TP: Q/K/V column-parallel on whole-head boundaries (so the
-                    // o_proj input shard and head count agree); gate/up plain
-                    // column-parallel; o_proj/down_proj row-parallel.
-                    // Q partitions by rank; K/V use the replica-aware KV block
-                    // index (== rank when kv_heads >= world_size; shared within a
-                    // replica group when kv_heads < world_size).
+                    // Whole-head boundaries keep o_proj's input shard and head count in
+                    // agreement; K/V index by replica-aware KV block, not by rank.
                     let kv_block =
                         infer_topo::kv_load_block_index(config.num_key_value_heads, &tp_cfg)?;
                     (
@@ -222,9 +211,8 @@ impl CudaModel {
     }
 }
 
-/// Build the tensor-parallel runtime for model load. Multi-rank `nccl` builds
-/// take the NCCL `unique_id` from `INFER_NCCL_UNIQUE_ID`; otherwise the no-op
-/// single runtime.
+/// Multi-rank `nccl` builds read the NCCL `unique_id` from `INFER_NCCL_UNIQUE_ID`;
+/// otherwise the no-op single runtime.
 pub(crate) fn build_tp_runtime(
     #[cfg_attr(not(feature = "nccl"), allow(unused_variables))] pin_numa: bool,
 ) -> Result<crate::tp::TpRuntime> {
@@ -245,8 +233,7 @@ pub(crate) fn build_tp_runtime(
     crate::tp::TpRuntime::from_env().map_err(|e| anyhow!("{e}"))
 }
 
-/// Decode the NCCL `unique_id` from `INFER_NCCL_UNIQUE_ID` (128 hex bytes = 256
-/// chars).
+/// Decode the NCCL `unique_id` from `INFER_NCCL_UNIQUE_ID` (256 hex chars = 128 bytes).
 #[cfg(feature = "nccl")]
 pub fn nccl_unique_id_from_env() -> Result<cuda_kernels::ffi::nccl::ncclUniqueId> {
     let hex = std::env::var("INFER_NCCL_UNIQUE_ID").map_err(|_| {
@@ -270,11 +257,9 @@ pub fn nccl_unique_id_from_env() -> Result<cuda_kernels::ffi::nccl::ncclUniqueId
     Ok(cuda_kernels::ffi::nccl::ncclUniqueId { internal })
 }
 
-/// Mint a fresh NCCL `unique_id` (rank-0 launcher / multiproc coordinator) and
-/// return it as 256 hex chars, ready to publish via `INFER_NCCL_UNIQUE_ID` so
-/// every spawned worker rank inherits the SAME rendezvous handle (which the DSv4
-/// executor decodes via [`nccl_unique_id_from_env`] during construction).
-/// `ncclGetUniqueId` is a host call — no CUDA context / GPU is required to mint.
+/// Mint a fresh NCCL `unique_id` as 256 hex chars for `INFER_NCCL_UNIQUE_ID` — every
+/// rank
+/// must inherit the SAME handle. Host call: no CUDA context required.
 #[cfg(feature = "nccl")]
 pub fn mint_nccl_unique_id_hex() -> Result<String> {
     use cuda_kernels::ffi::nccl;
@@ -295,10 +280,9 @@ pub fn mint_nccl_unique_id_hex() -> Result<String> {
 }
 
 pub(crate) fn validate_clean_bf16_config(config: &Qwen3Config) -> Result<()> {
-    // Qwen3 decouples head_dim from hidden_size/num_heads (e.g. Qwen3-0.6B:
-    // hidden 1024, heads 16, head_dim 128), so `hidden_size == heads*head_dim`
-    // is NOT an invariant. Real constraints: head_dim==128 (checked in model.rs)
-    // + GQA divisibility below.
+    // Qwen3 decouples head_dim from hidden_size/num_heads, so `hidden_size ==
+    // heads*head_dim`
+    // is NOT an invariant; only GQA divisibility is.
     ensure!(
         config
             .num_attention_heads
@@ -317,20 +301,21 @@ pub(crate) struct PageMeta {
     pub(crate) page_table_offsets: CudaSlice<i32>,
     pub(crate) start_positions: CudaSlice<i32>,
     pub(crate) positions: CudaSlice<i32>,
-    /// Host mirrors of `q_indptr` / `kv_indptr` — the multi-token prep kernel
-    /// is single-row, so it is launched per row at these offsets.
+    /// Host mirrors of `q_indptr` / `kv_indptr` — the prep kernel is single-row, so it
+    /// is
+    /// launched per row at these offsets.
     pub(crate) q_offsets: Vec<usize>,
     pub(crate) page_offsets: Vec<usize>,
     /// Host mirror of each row's total KV length (prefix + this forward's new
     /// tokens).
     pub(crate) kv_lens: Vec<usize>,
-    /// Device `[batch]` copy of `kv_lens` — FA3's `seqused_k`, which is what
-    /// lets one launch cover a ragged batch.
+    /// Device `[batch]` copy of `kv_lens` — FA3's `seqused_k`.
     pub(crate) kv_lens_dev: CudaSlice<i32>,
-    /// RECTANGULAR page table `[batch, page_table_stride]`, each row padded with
-    /// its own last page. FA3 strides rows by a scalar, so the ragged
-    /// `kv_indices` cannot be shared; rows never read past `kv_lens`, so the
-    /// padding is unreachable.
+    /// RECTANGULAR page table `[batch, page_table_stride]`, each row padded with its
+    /// own last
+    /// page: FA3 strides rows by a scalar, so the ragged `kv_indices` cannot be shared;
+    /// rows
+    /// never read past `kv_lens`.
     pub(crate) page_table_rect: CudaSlice<i32>,
     /// Row stride of `page_table_rect` — the longest row's page count.
     pub(crate) page_table_stride: usize,
@@ -339,36 +324,33 @@ pub(crate) struct PageMeta {
     /// Sum of every row's new-token count — the kernel's `total_q_tokens`.
     pub(crate) total_q: usize,
     pub(crate) num_pages: usize,
-    /// Row count — the kernel's `batch_size`.
     pub(crate) batch: usize,
-    /// Host copy of the request's prefix length (tokens already in the pool
-    /// before this forward). Quant formats use it to size the prefix refill.
+    /// Tokens already in the pool before this forward.
     pub(crate) start_pos: usize,
     /// Global pool token rows for the NEW tokens [start_pos, start_pos+seq_len).
-    /// Quant formats only (refill/quantize row lists); None for BF16.
+    /// Quant formats only; None for BF16.
     pub(crate) new_token_rows: Option<CudaSlice<i32>>,
     /// Global pool token rows for the prefix [0, start_pos). Quant + start_pos>0 only.
     pub(crate) prefix_token_rows: Option<CudaSlice<i32>>,
     /// Packed fused-decode metadata `[page_indptr(b+1) | last_page_len(b)]`
     /// from `build_quantized_decode_indptr`. Quant formats only.
     pub(crate) quant_decode_meta: Option<CudaSlice<i32>>,
-    /// When set, the FA3 launch uses this as `seqlen_k` (scheduling capacity)
-    /// instead of the step's true max KV length — required under CUDA graph
-    /// capture, where the true length is only on device (`kv_lens_dev`).
+    /// When set, the FA3 launch uses this as `seqlen_k` instead of the step's true max
+    /// KV
+    /// length — required under CUDA graph capture, where the true length is only on
+    /// device.
     pub(crate) seqlen_k_capture: Option<usize>,
 }
 
 impl PageMeta {
-    /// Max KV length across all rows (prefix + new tokens). Under CUDA graph
-    /// capture the host `kv_lens` can be stale, so `seqlen_k_capture` wins.
+    /// Under CUDA graph capture the host `kv_lens` can be stale, so `seqlen_k_capture`
+    /// wins.
     pub(crate) fn max_kv_len(&self) -> usize {
         self.seqlen_k_capture
             .unwrap_or_else(|| self.kv_lens.iter().copied().max().unwrap_or(0))
     }
 
-    /// Ragged page table over `rows` of `(slot, start_pos, len)`. The prefix-sum
-    /// indptrs cover 1×T (prefill/verify), B×1 (decode) and the B×T middle;
-    /// the kernel triple is `(batch, total_q, seq_len)`.
+    /// Ragged page table over `rows` of `(slot, start_pos, len)`.
     pub(crate) fn for_rows(
         ctx: &DeviceContext,
         pool: &PagedKVPool,
@@ -424,16 +406,13 @@ impl PageMeta {
             q_indptr.push(total_q as i32);
             kv_indptr.push(total_pages as i32);
         }
-        // Quant formats (INT8/FP8) need explicit token-row lists: the prefix
-        // refill + new-row quantize kernels address the pool by global token
-        // row, and the fused decode kernel consumes the packed
-        // `[page_indptr | last_page_len]` metadata. BF16 carries None — zero
-        // overhead on the default path.
+        // Quant formats address the pool by global token row and consume packed decode
+        // metadata; BF16 carries None.
         let quant = matches!(pool.format, KVFormat::INT8 | KVFormat::FP8E4M3);
         let (new_token_rows, prefix_token_rows, quant_decode_meta) = if quant {
-            // Multi-row: row lists concatenate in row order — the quantize
-            // kernel indexes them by flat Q-token position (the row index for
-            // decode, one Q token per row).
+            // Row lists concatenate in row order — the quantize kernel indexes them by
+            // flat
+            // Q-token position.
             let mut new_rows = Vec::new();
             for &(slot, start_pos, len) in rows {
                 new_rows.extend(
@@ -442,9 +421,9 @@ impl PageMeta {
                         .map(|row| row as i32),
                 );
             }
-            // The prefix refill feeds the single-row prefill path only; a
-            // batched decode reads the already-quantized prefix straight from
-            // the pool planes, so no prefix list is built for multi-row.
+            // The prefix refill feeds the single-row prefill path only; a batched
+            // decode reads
+            // the already-quantized prefix straight from the pool planes.
             let prefix_rows = if batch == 1 && rows[0].1 > 0 {
                 let (slot, start_pos, _) = rows[0];
                 let rows = pool
@@ -468,8 +447,8 @@ impl PageMeta {
         } else {
             (None, None, None)
         };
-        // Rectangular mirror for FA3's scalar row stride. Pad with each row's
-        // own last page so a stray read stays inside the request's KV.
+        // Pad each row with its own last page so a stray read stays inside the
+        // request's KV.
         let stride = (1..=batch)
             .map(|r| kv_indptr[r] as usize - kv_indptr[r - 1] as usize)
             .max()
@@ -517,12 +496,12 @@ impl PageMeta {
         Self::for_rows(ctx, pool, &[(slot, start_pos, seq_len)])
     }
 
-    /// Fixed-capacity single-slot decode metadata whose device buffers never
-    /// move: [`Self::refresh_decode`] rewrites the CONTENTS each step, so a
-    /// captured CUDA graph keeps reading the same addresses while the page
-    /// table grows. `capacity_pages` bounds `kv_indices`/`page_table_rect`
-    /// (also the FA3 rect row stride); `seqlen_k_capture` is pinned to the
-    /// capacity so the FA3 scheduling ceiling is capture-stable. BF16 only.
+    /// Fixed-capacity single-slot decode metadata whose device buffers never move:
+    /// [`Self::refresh_decode`] rewrites the CONTENTS each step, so a captured CUDA
+    /// graph
+    /// keeps reading the same addresses. `seqlen_k_capture` is pinned to the capacity
+    /// so the
+    /// FA3 scheduling ceiling is capture-stable. BF16 only.
     pub(crate) fn persistent_decode(
         ctx: &DeviceContext,
         page_size: usize,
@@ -555,8 +534,8 @@ impl PageMeta {
         })
     }
 
-    /// Rewrite a [`Self::persistent_decode`] meta for one decode step
-    /// (`start_pos` prefix tokens + 1 new token) — contents only, no
+    /// Rewrite a [`Self::persistent_decode`] meta for one decode step — contents only,
+    /// no
     /// reallocation. Must run OUTSIDE any graph capture/replay.
     pub(crate) fn refresh_decode(
         &mut self,
@@ -631,18 +610,15 @@ impl PageMeta {
         Ok(())
     }
 
-    /// Session KV-recall decode page table (BF16 only): build the metadata over a
-    /// SELECTED page subset (`recall_pages`, in ascending temporal order ending
-    /// with the current local page) instead of the slot's full page list.
-    ///
-    /// The decode TileLang kernel derives the KV length entirely from the page
-    /// table (`num_pages * page_size`, last page filled to `kv_last_page_len`) and
-    /// carries NO per-KV-token position array, so a non-contiguous page subset
-    /// attends exactly those pages — correct because RoPE is baked into the cached
-    /// K at write time and the query's RoPE position (`positions = total_len - 1`)
-    /// is independent of which KV pages are attended. The last selected page IS the
-    /// current page, so `kv_last_page_len` matches the true tail fill. Decode-only
-    /// (`seq_len == 1`); BF16 only (no quant row lists — recall is BF16-gated).
+    /// Session KV-recall decode page table: build the metadata over a SELECTED page
+    /// subset
+    /// (`recall_pages`, ascending, ending with the current local page) instead of the
+    /// slot's
+    /// full page list. Correct because RoPE is baked into the cached K at write time
+    /// and the
+    /// query's RoPE position is independent of which KV pages are attended.
+    /// Decode-only,
+    /// BF16 only.
     pub(crate) fn for_recall_decode(
         ctx: &DeviceContext,
         pool: &PagedKVPool,
@@ -692,9 +668,7 @@ impl PageMeta {
         })
     }
 
-    /// Batched decode page table. `total_len` INCLUDES this step's
-    /// just-appended token. BF16 and INT8/FP8 pools both supported: the quant
-    /// row lists build one entry per row.
+    /// Batched decode page table. `total_len` INCLUDES this step's just-appended token.
     pub(crate) fn for_decode_batch(
         ctx: &DeviceContext,
         pool: &PagedKVPool,
@@ -717,10 +691,11 @@ pub(crate) struct SafetensorLoader {
     weight_map: HashMap<String, usize>,
     tensor_headers: std::cell::RefCell<Option<Rc<BTreeMap<String, TensorHeader>>>>,
     quant_manifest: Option<QuantManifest>,
-    /// Bounded mmap shard cache: without it, loading tensors that alternate
-    /// across two shards re-opens multi-GiB files on every tensor touch. `Rc`
-    /// lets [`SharedTensor`] expose a tensor's byte range zero-copy while the
-    /// cache entry itself can be evicted after the layer no longer needs it.
+    /// Bounded mmap shard cache: tensors that alternate across two shards would
+    /// otherwise
+    /// re-open multi-GiB files on every touch. `Rc` lets [`SharedTensor`] alias a byte
+    /// range
+    /// zero-copy while the entry itself stays evictable.
     shard_cache: std::cell::RefCell<ShardByteCache>,
     shard_meta_cache: std::cell::RefCell<HashMap<usize, Rc<BTreeMap<String, ShardTensorMeta>>>>,
 }
@@ -749,10 +724,10 @@ struct DirectFp8MoeRouted {
     down_quant_signature: ExpertQuantDispatchSignature,
 }
 
-/// Transpose each group's `[rows, cols]` row-major block-scale slab to
-/// `[cols, rows]` row-major, in place. Maps the checkpoint's K-contiguous
-/// `weight_scale_inv` (`n_block*k_blocks + k_block`) to the CUTLASS sm_120
-/// N-contiguous SFB layout (`n_block + k_block*n_blocks`). Load-time only.
+/// Transpose each group's `[rows, cols]` row-major block-scale slab to `[cols, rows]`
+/// in
+/// place: maps the checkpoint's K-contiguous `weight_scale_inv` to the CUTLASS sm_120
+/// N-contiguous SFB layout.
 fn transpose_group_block_scales(scales: &mut [f32], groups: usize, rows: usize, cols: usize) {
     let per = rows * cols;
     debug_assert_eq!(scales.len(), groups * per);
@@ -871,7 +846,8 @@ impl MmapShard {
             "{} length {len} exceeds mmap addressable range",
             path.display()
         );
-        // SAFETY: fd is a live read-only file; 0 < len <= isize::MAX checked above; MAP_FAILED handled below.
+        // SAFETY: fd is a live read-only file; 0 < len <= isize::MAX checked above;
+        // MAP_FAILED handled below.
         let mapped = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
@@ -1127,9 +1103,9 @@ impl SafetensorLoader {
             .with_context(|| format!("upload tensor {name}"))
     }
 
-    /// Load a 1D vector that may be BF16 or F32 on disk (Qwen3.5 `dt_bias` ships
-    /// BF16; this normalizes F32→BF16 so the recurrent kernel's bf16 input ABI
-    /// holds), uploaded as a [`DeviceVec`].
+    /// Load a 1D vector that is BF16 or F32 on disk, normalized to BF16 so the
+    /// recurrent
+    /// kernel's bf16 input ABI holds.
     pub(crate) fn load_vec_any(&self, ctx: &DeviceContext, name: &str) -> Result<DeviceVec> {
         let tensor = self.borrow_raw_tensor(name)?;
         ensure!(
@@ -1144,9 +1120,9 @@ impl SafetensorLoader {
         .with_context(|| format!("upload vec {name}"))
     }
 
-    /// Load a 1D F32 tensor (Qwen3.5 `A_log` / gated-norm scale) directly into a
-    /// device `f32` slice — the recurrent + gated-RMSNorm kernels read these as
-    /// `*const f32`. Accepts F32 (passthrough) or BF16 (widened to F32).
+    /// Load a 1D F32 tensor into a device `f32` slice — the recurrent + gated-RMSNorm
+    /// kernels
+    /// read these as `*const f32`. Accepts F32 (passthrough) or BF16 (widened to F32).
     pub(crate) fn load_f32_vec(&self, ctx: &DeviceContext, name: &str) -> Result<CudaSlice<f32>> {
         let tensor = self.borrow_raw_tensor(name)?;
         ensure!(
@@ -1172,9 +1148,8 @@ impl SafetensorLoader {
             .map_err(|e| anyhow!("upload f32 vec {name}: {e}"))
     }
 
-    /// Load a Qwen3.5 depthwise conv1d weight (`[qkv_dim, 1, kernel]` BF16) as a
-    /// flat `[qkv_dim*kernel]` [`DeviceVec`] (the conv1d kernel's channel-major
-    /// ABI). The singleton middle dim is squeezed by the flat byte upload.
+    /// Load a Qwen3.5 depthwise conv1d weight (`[qkv_dim, 1, kernel]` BF16) as a flat
+    /// `[qkv_dim*kernel]` [`DeviceVec`] — the conv1d kernel's channel-major ABI.
     pub(crate) fn load_conv1d_vec(&self, ctx: &DeviceContext, name: &str) -> Result<DeviceVec> {
         let tensor = self.borrow_bf16_tensor(name)?;
         ensure!(
@@ -1196,9 +1171,9 @@ impl SafetensorLoader {
             .with_context(|| format!("upload tensor {name}"))
     }
 
-    /// Load a 2D BF16 weight, slice it to this TP rank via [`crate::shard_slice`],
-    /// and upload the shard. Column kind (`q/k/v/gate/up`) slices rows; row kind
-    /// (`o/down`) slices cols. Single-GPU is the identity slice.
+    /// Load a 2D BF16 weight sliced to this TP rank. Column kind (`q/k/v/gate/up`)
+    /// slices
+    /// rows; row kind (`o/down`) slices cols. Single-GPU is the identity slice.
     pub(crate) fn load_matrix_sharded(
         &self,
         ctx: &DeviceContext,
@@ -1240,26 +1215,19 @@ impl SafetensorLoader {
             .with_context(|| format!("upload sharded tensor {name}"))
     }
 
-    /// Load a head-aligned column-parallel Q/K/V projection for this TP rank.
+    /// Load a head-aligned column-parallel Q/K/V projection for this TP rank. The split
+    /// MUST
+    /// land on whole-head boundaries; a plain `column_shard` on the raw output dim
+    /// would
+    /// split a head on the last rank.
     ///
-    /// The split MUST land on whole-head boundaries (so head count, o_proj input
-    /// shard, and RoPE/RMSNorm agree); a plain `column_shard` on the raw output
-    /// dim would split a head on the last rank. `local_heads` (from `head_shard`,
-    /// which requires global heads divide world size) gives a contiguous shard at
-    /// offset `rank * local_heads * head_dim`.
+    /// `head_dim` is the PER-HEAD ROW COUNT: the gated Qwen3.5/3.6 q_proj interleaves
+    /// `[query; gate]` per head, so its per-head row block is `2 * head_dim`.
     ///
-    /// `head_dim` is the PER-HEAD ROW COUNT, not necessarily the attention
-    /// head_dim: the gated Qwen3.5/3.6 q_proj interleaves `[query; gate]` per
-    /// head, so its per-head row block is `2 * head_dim`.
-    ///
-    /// `block_index` selects which `local_heads`-wide head block this rank loads.
-    /// Q passes `tp.rank` (distinct heads per rank). KV passes
-    /// [`infer_topo::kv_load_block_index`]: in the shard regime that equals
-    /// `tp.rank` (byte-identical to the legacy `rank * local_rows` offset); in the
-    /// KV-replication regime (kv_heads < world_size) consecutive ranks in a
-    /// replica group share the same `block_index`, so they load IDENTICAL K/V
-    /// weights — the cache-identity invariant that lets each replica compute GQA
-    /// independently.
+    /// `block_index` selects the head block. Q passes `tp.rank`; KV passes
+    /// [`infer_topo::kv_load_block_index`], which makes ranks in a replica group load
+    /// IDENTICAL K/V weights — the cache-identity invariant behind independent
+    /// per-replica GQA.
     pub(crate) fn load_qkv_head_sharded(
         &self,
         ctx: &DeviceContext,
@@ -1301,8 +1269,6 @@ impl SafetensorLoader {
             .with_context(|| format!("upload head-sharded tensor {name}"))
     }
 
-    /// Load a Qwen3.5/3.6 matrix as resident quant when the checkpoint exposes
-    /// a supported quant sidecar ABI; otherwise use the legacy BF16/F32 path.
     pub(crate) fn load_matrix_quant_aware(
         &self,
         ctx: &DeviceContext,
@@ -1314,11 +1280,11 @@ impl SafetensorLoader {
         }
     }
 
-    /// Load two same-K projections as ONE row-fused matrix (`[a; b]` along
-    /// output rows) so a single GEMM serves both — the decode launch-count
-    /// lever (SGLang's MergedColumnParallelLinear equivalent). W8A16 pairs
-    /// fuse before the Marlin repack (fused matrix repacks + frees INT8 once);
-    /// every other format loads normally and fuses on device.
+    /// Load two same-K projections as ONE row-fused matrix (`[a; b]` along output rows)
+    /// so a
+    /// single GEMM serves both. W8A16 pairs fuse before the Marlin repack; every other
+    /// format
+    /// loads normally and fuses on device.
     pub(crate) fn load_matrix_pair_fused(
         &self,
         ctx: &DeviceContext,
@@ -1358,7 +1324,6 @@ impl SafetensorLoader {
         )
     }
 
-    /// Upload one row-shard window of a 2D BF16 tensor.
     fn load_bf16_row_sharded(
         &self,
         ctx: &DeviceContext,
@@ -1406,12 +1371,11 @@ impl SafetensorLoader {
         }
     }
 
-    /// Load N same-K projections as ONE row-fused matrix (concatenated along
-    /// output rows, in `parts` order) so a single GEMM serves them all. Each
-    /// part carries its own optional row-shard spec (None = full matrix), so
-    /// column-parallel and head-sharded TP layouts both route here. W8A16
-    /// parts fuse before the Marlin repack (the fused matrix repacks + frees
-    /// INT8 once); every other format loads normally and fuses on device.
+    /// Load N same-K projections as ONE row-fused matrix (concatenated along output
+    /// rows, in
+    /// `parts` order). Each part carries its own optional row-shard spec (None = full
+    /// matrix).
+    /// W8A16 parts fuse before the Marlin repack; every other format fuses on device.
     pub(crate) fn load_matrices_row_fused(
         &self,
         ctx: &DeviceContext,
@@ -1532,19 +1496,16 @@ impl SafetensorLoader {
         )
     }
 
-    /// Quant-aware twin of the BF16 fused-qkv head shard
-    /// ([`crate::shard_slice::shard_head_blocks_column_parallel`] over the
-    /// `[q; k; v]` blocks): if the checkpoint exposes a `Fp8BlockScaled` view
-    /// for `name`, shard the F8_E4M3 weight AND its block-scale sidecar with the
-    /// SAME head-block helper and build an `Fp8BlockScaled` [`DeviceMatrix`];
-    /// otherwise the caller keeps its byte-for-byte BF16 path.
+    /// Quant-aware twin of the BF16 fused-qkv head shard: shard the F8_E4M3 weight AND
+    /// its
+    /// block-scale sidecar with the SAME head-block helper, or return None so the
+    /// caller
+    /// keeps its BF16 path.
     ///
-    /// The scale rows map 1:1 to head-block rows because (and only because)
-    /// `head_rows` is a whole multiple of `block_m` — the per-head row group is
-    /// one (or more) complete scale block(s), so re-stacking the three blocks in
-    /// scale-row units mirrors the weight shard exactly. The blocks are
-    /// re-expressed in scale units (`head_rows / block_m` scale rows per head,
-    /// `cols / block_k` scale cols) and fed through the identical helper.
+    /// Scale rows map 1:1 to head-block rows only because `head_rows` is a whole
+    /// multiple of
+    /// `block_m`, so the blocks can be re-expressed in scale units and fed through the
+    /// identical helper.
     pub(crate) fn load_linear_qkv_fp8_head_sharded(
         &self,
         ctx: &DeviceContext,
@@ -1561,9 +1522,7 @@ impl SafetensorLoader {
             scale_apply,
         } = view.format
         else {
-            // A non-FP8 quant sidecar (per-shard FP8 / FP4 / dense-F32) on the
-            // fused qkv is unsupported here; fall back to the caller's existing
-            // path rather than silently mis-sharding.
+            // A non-FP8 quant sidecar on the fused qkv would silently mis-shard here.
             return Ok(None);
         };
         ensure!(
@@ -1574,7 +1533,6 @@ impl SafetensorLoader {
         let rows = view.logical_shape[0];
         let cols = view.logical_shape[1];
 
-        // (a) borrow the raw F8_E4M3 weight + the BF16/F32 block-scale sidecar.
         let weight = self.borrow_raw_tensor(&view.name)?;
         ensure!(
             weight.dtype == Dtype::F8_E4M3 && weight.shape == view.logical_shape,
@@ -1594,8 +1552,8 @@ impl SafetensorLoader {
             scale.shape
         );
 
-        // Each head block's row count must tile the scale-block grid exactly, or
-        // a scale row would straddle two head blocks and the 1:1 re-stack breaks.
+        // A head block's rows must tile the scale-block grid, or a scale row straddles
+        // two.
         let scale_blocks = blocks
             .iter()
             .enumerate()
@@ -1617,7 +1575,6 @@ impl SafetensorLoader {
             "{name}: cols {cols} not a multiple of block_k {block_k}"
         );
 
-        // (b) shard the FP8 weight with the SAME head-block helper as BF16.
         let weight_shard = crate::shard_slice::shard_head_blocks_column_parallel(
             weight.bytes(),
             cols,
@@ -1625,8 +1582,6 @@ impl SafetensorLoader {
             blocks,
             tp,
         )?;
-        // (c) shard the scale bytes in scale-row units (head_rows/block_m rows
-        // per head, cols/block_k scale cols).
         let scale_shard = crate::shard_slice::shard_head_blocks_column_parallel(
             scale.bytes(),
             scale_cols,
@@ -1634,15 +1589,12 @@ impl SafetensorLoader {
             &scale_blocks,
             tp,
         )?;
-        // (d) decode the scale bytes to f32 using the view's own scale_apply
-        // (Multiply/Divide) — never hardcoded.
         let scales = tensor_bytes_to_f32(
             &view.scale_names[0],
             scale.dtype,
             &scale_shard.bytes,
             scale_apply,
         )?;
-        // (e) build the resident FP8 block-scaled matrix for this rank's slice.
         let matrix = DeviceMatrix::from_fp8_block_scaled(
             ctx,
             &weight_shard.bytes,
@@ -1656,27 +1608,23 @@ impl SafetensorLoader {
         Ok(Some(matrix))
     }
 
-    /// Load this EP rank's MoE weights for one layer (routed gate/up/down +
-    /// router gate + shared expert) and build the per-expert weight-pointer
-    /// tables. Only the experts in
-    /// `split.local_expert_start..local_expert_end()` are loaded (single-GPU
-    /// loads all).
+    /// Load this EP rank's MoE weights for one layer (routed gate/up/down + router gate
+    /// +
+    /// shared expert) and build the per-expert weight-pointer tables. Only the experts
+    /// in
+    /// `split.local_expert_start..local_expert_end()` are loaded.
     ///
-    /// Routed experts ship in one of two layouts (see
-    /// [`qwen35_spec::Qwen35MoeTensorNames`]), auto-detected per layer:
-    ///   • per-expert `experts.{i}.{gate,up,down}_proj.weight` — loaded as
-    ///     separate matrices (byte-identical to the pre-stacked-support path);
-    ///   • stacked+fused `experts.gate_up_proj` `[E, 2*moe_inter, hidden]`
-    ///     (gate rows `[0, moe_inter)`, up rows `[moe_inter, 2*moe_inter)`)
-    ///     + `experts.down_proj` `[E, hidden, moe_inter]` (production
-    ///     Qwen3.6-35B-A3B) — each local expert's contiguous 2D block is
-    ///     sliced out by byte range and uploaded into the same
-    ///     `Vec<DeviceMatrix>` the per-expert path builds.
+    /// Routed experts ship either per-expert (`experts.{i}.{gate,up,down}_proj.weight`)
+    /// or
+    /// stacked+fused (`experts.gate_up_proj` `[E, 2*moe_inter, hidden]`, gate rows
+    /// first, plus
+    /// `experts.down_proj` `[E, hidden, moe_inter]`), auto-detected per layer.
     ///
-    /// Under TP the router gate (and the shared-expert sigmoid gate) stay
-    /// replicated — routing must be computed identically on every rank — while
-    /// the shared expert is column/row-sharded like a dense MLP so its partial
-    /// lands in the same post-MoE all-reduce as the routed partial.
+    /// Under TP the router gate and the shared-expert sigmoid gate stay replicated —
+    /// routing
+    /// must be computed identically on every rank — while the shared expert is sharded
+    /// like a
+    /// dense MLP so its partial lands in the same post-MoE all-reduce.
     pub(crate) fn load_moe_layer_experts(
         &self,
         ctx: &DeviceContext,
@@ -1704,20 +1652,20 @@ impl SafetensorLoader {
                     false
                 }
             };
-        // sm_120 (Blackwell) has no DeepGEMM native bridge, but the CUTLASS
-        // sm_120a grouped collective consumes the SAME contiguous grouped FP8
-        // caches — so build them here regardless of the (Hopper-only) preflight,
-        // and transpose the weight scales to CUTLASS's N-contiguous SFB layout.
+        // sm_120 has no DeepGEMM native bridge, but the CUTLASS sm_120a grouped
+        // collective
+        // consumes the SAME contiguous grouped FP8 caches — build them regardless of
+        // the
+        // Hopper-only preflight, with weight scales transposed to N-contiguous SFB.
         let sm120 = ctx.is_sm120();
         let mut direct_fp8_routed = None;
-        // The OPD rollout student re-merges LoRA into experts each step, which
-        // needs a mutable per-expert BF16 `DeviceMatrix`. Suppress the fused
-        // grouped-FP8 path so experts load per-expert (below) and get
-        // dequantized to BF16 after the format is known.
+        // The OPD rollout student re-merges LoRA into experts each step, which needs a
+        // mutable
+        // per-expert BF16 `DeviceMatrix` — suppress the fused grouped-FP8 path.
         let experts_bf16_resident = crate::runtime_flags::qwen35_moe_experts_bf16_resident();
-        // The stacked tensors are HF `nn.Parameter`s — no `.weight` suffix on
-        // the real Qwen3.6-35B-A3B checkpoint — but accept a `.weight`-suffixed
-        // export too.
+        // The stacked tensors are HF `nn.Parameter`s (no `.weight` suffix), but accept
+        // a
+        // `.weight`-suffixed export too.
         let resolve_stacked = |base: &str| -> Option<String> {
             [base.to_string(), format!("{base}.weight")]
                 .into_iter()
@@ -1734,8 +1682,8 @@ impl SafetensorLoader {
             )?;
         }
         if direct_fp8_routed.is_some() {
-            // The direct FP8 path fills the resident DeepGEMM grouped caches
-            // without constructing the transient per-expert DeviceMatrix list.
+            // The direct FP8 path already filled the grouped caches; no per-expert
+            // list.
         } else if self.has_tensor(&per_expert_probe) || per_expert_quant_probe {
             for e in split.local_expert_start..split.local_expert_end() {
                 gate.push(self.load_matrix_quant_aware(ctx, &names.expert_gate_proj(e))?);
@@ -1760,10 +1708,10 @@ impl SafetensorLoader {
                 names.mlp_prefix
             );
             let stacked_rows = 2 * moe_intermediate_size;
-            // Borrow each stacked tensor ONCE from the read-once shard cache and
-            // slice every local expert directly out of the cached bytes — the
-            // previous owned load (`view.data().to_vec()`) added ~1 GiB + 512 MiB
-            // of host memcpy per MoE layer on top of the cache. Uploads unchanged.
+            // Borrow each stacked tensor ONCE and slice every local expert out of the
+            // cached
+            // bytes — an owned load costs ~1 GiB + 512 MiB of host memcpy per MoE
+            // layer.
             let gate_up_t = self.borrow_bf16_tensor(&gate_up_name)?;
             ensure!(
                 gate_up_t.shape == [split.num_experts, stacked_rows, hidden_size],
@@ -1783,8 +1731,8 @@ impl SafetensorLoader {
                 down_t.shape
             );
             for e in split.local_expert_start..split.local_expert_end() {
-                // gate_up_proj [E, 2*mi, hidden]: gate = rows [0, mi),
-                // up = rows [mi, 2*mi) of expert e's contiguous block.
+                // gate = rows [0, mi), up = rows [mi, 2*mi) of expert e's contiguous
+                // block.
                 let gate_bytes = crate::shard_slice::slice_stacked_expert(
                     gate_up_t.bytes(),
                     split.num_experts,
@@ -1926,15 +1874,13 @@ impl SafetensorLoader {
             format_args!("layer={}", names.mlp_prefix),
         );
 
-        // DeepGEMM grouped-B caches: concat the per-expert matrices
-        // into one contiguous [G, n, k] buffer per projection, repoint the
-        // pointer tables into it, and DROP the per-expert copies — keeping
-        // both would double the routed-expert VRAM (~2x model weights on
-        // Qwen3.6-35B). The hand kernels keep working through the rebuilt
-        // tables (same [n, k] row-major slabs, new addresses).
-        // Default-ON safety: an unavailable native bridge must degrade to the hand-kernel
-        // path instead of erroring at the first MoE forward — probe once here
-        // and skip the grouped caches so `use_deepgemm` self-disables.
+        // Concat the per-expert matrices into one contiguous [G, n, k] buffer per
+        // projection
+        // and DROP the per-expert copies — keeping both doubles routed-expert VRAM (~2x
+        // model
+        // weights on Qwen3.6-35B). An unavailable native bridge must skip the grouped
+        // caches
+        // so `use_deepgemm` self-disables instead of erroring at the first MoE forward.
         let (expert_weight_format, gate_sig, down_sig) =
             if let Some(direct) = direct_fp8_routed.as_ref() {
                 (
@@ -1945,11 +1891,11 @@ impl SafetensorLoader {
             } else {
                 routed_expert_weight_format(&gate, &up, &down)?
             };
-        // BF16-resident student: dequantize the per-expert FP8 experts to dense
-        // BF16 in place, so the whole layer is one BF16 kernel + a stable ptr
-        // table the per-step LoRA re-merge can fold into. Must run before the
-        // grouped-cache decision and pointer-table build below so both see the
-        // final DenseBf16 format.
+        // BF16-resident student: dequantize the per-expert FP8 experts in place so the
+        // layer
+        // is one BF16 kernel with a stable ptr table the LoRA re-merge can fold into.
+        // Must run
+        // before the grouped-cache decision and pointer-table build below.
         let mut expert_weight_format = expert_weight_format;
         let mut gate_sig = gate_sig;
         let mut down_sig = down_sig;
@@ -1968,12 +1914,13 @@ impl SafetensorLoader {
         }
         let routed_quant = expert_weight_format.is_quantized();
         let grouped_t0 = Instant::now();
-        // BF16 grouped DeepGEMM is Hopper-only: the contiguous kernel reads
-        // m_indices, which the sm_120 path leaves None (moe.rs), so building the
-        // caches there would panic on first prefill. Self-disable to the eager
-        // per-expert MoE, mirroring the sm120-aware FP8 gate above.
-        // Also skip when BF16-resident: the grouped concat clears the per-expert
-        // Vecs, but the OPD LoRA re-merge needs them mutable per expert.
+        // BF16 grouped DeepGEMM is Hopper-only: the contiguous kernel reads m_indices,
+        // which
+        // the sm_120 path leaves None, so building the caches there would panic on
+        // first
+        // prefill. Also skipped when BF16-resident: the concat clears the per-expert
+        // Vecs the
+        // LoRA re-merge needs mutable.
         let deepgemm_ready =
             !routed_quant && deepgemm_native_ready && !sm120 && !experts_bf16_resident;
         let fp8_deepgemm_ready =
@@ -2004,9 +1951,9 @@ impl SafetensorLoader {
                 hidden_size,
             )?;
             let down_g = MoeFp8ExpertGroup::concat(ctx, &down, hidden_size, moe_intermediate_size)?;
-            // The grouped caches now own the resident FP8 expert bytes. Sync
-            // before dropping sources because cudarc event tracking is disabled
-            // and the D2D concats above are async on the compute stream.
+            // Event tracking is disabled: sync before dropping the sources, whose bytes
+            // the
+            // async D2D concats above may still be reading.
             ctx.sync()?;
             (Some(w13_g), Some(down_g))
         } else {
@@ -2080,9 +2027,9 @@ impl SafetensorLoader {
         split: &crate::moe_config::ExpertSplit,
         moe_intermediate_size: usize,
         hidden_size: usize,
-        // sm_120: transpose each expert's block scales from the checkpoint's
-        // `[n_blocks, k_blocks]` (K-contiguous) to CUTLASS's `[k_blocks,
-        // n_blocks]` (N-contiguous SFB). Hopper/DeepGEMM keeps the raw layout.
+        // Transpose each expert's block scales from the checkpoint's K-contiguous
+        // `[n_blocks, k_blocks]` to CUTLASS's N-contiguous SFB. Hopper keeps the raw
+        // layout.
         transpose_sfb: bool,
     ) -> Result<Option<DirectFp8MoeRouted>> {
         let t0 = Instant::now();
@@ -2202,7 +2149,6 @@ impl SafetensorLoader {
         }
 
         // CUTLASS SFB is N-contiguous per group; the checkpoint is K-contiguous.
-        // Transpose each expert's [n_blocks, k_blocks] scale block in place.
         if transpose_sfb {
             transpose_group_block_scales(&mut w13_scales, groups, w13_scale_rows, w13_scale_cols);
             transpose_group_block_scales(
@@ -2213,9 +2159,9 @@ impl SafetensorLoader {
             );
         }
 
-        // `transpose_sfb` (== sm_120) both repacks the host scales to
-        // N-contiguous above AND records the layout on the cache, so the
-        // executor's dispatch reads one source of truth.
+        // `transpose_sfb` (== sm_120) also records the layout on the cache, so the
+        // executor's
+        // dispatch reads one source of truth.
         let w13 = MoeFp8ExpertGroup::from_host(
             ctx,
             &w13_weight,
@@ -2365,10 +2311,9 @@ impl SafetensorLoader {
         Ok(())
     }
 
-    /// Whether `name` exists in the checkpoint: weight-map lookup when an
-    /// index is present, otherwise each shard header is parsed (from the
-    /// read-once byte cache). Used to probe which routed-expert layout a MoE
-    /// checkpoint ships before committing to a load path.
+    /// Whether `name` exists in the checkpoint: weight-map lookup when an index is
+    /// present,
+    /// otherwise each shard header is parsed.
     pub(crate) fn has_tensor(&self, name: &str) -> bool {
         if !self.weight_map.is_empty() {
             return self.weight_map.contains_key(name);
@@ -2967,14 +2912,12 @@ impl SafetensorLoader {
         );
         let num_groups = k / group_size;
 
-        // Read qweight as i32 words
         let qw_bytes = qweight.bytes();
         // SAFETY: qweight is I32 [packed_k, n], so its bytes are a valid i32 slice.
         let qw: &[i32] = unsafe {
             std::slice::from_raw_parts(qw_bytes.as_ptr().cast::<i32>(), qw_bytes.len() / 4)
         };
 
-        // Read scales (BF16 or F16 [num_groups, n])
         let scales = self.borrow_raw_tensor(&view.scale_names[0])?;
         ensure!(
             (scales.dtype == Dtype::BF16 || scales.dtype == Dtype::F16)
@@ -2987,7 +2930,6 @@ impl SafetensorLoader {
             scales.shape
         );
         let scales_bytes = scales.bytes();
-        // Convert F16 scales to BF16 if needed.
         let scales_bf16: Cow<[u8]> = if scales.dtype == Dtype::F16 {
             Cow::Owned(
                 scales_bytes
@@ -3003,7 +2945,6 @@ impl SafetensorLoader {
         };
         let scales_bytes = scales_bf16.as_ref();
 
-        // Read qzeros (I32 [num_groups, n//8])
         let qzeros = self.borrow_raw_tensor(&view.scale_names[1])?;
         let packed_n = n / 8;
         ensure!(
@@ -3016,14 +2957,14 @@ impl SafetensorLoader {
             qzeros.shape
         );
         let qz_bytes = qzeros.bytes();
-        // SAFETY: qzeros is I32 [num_groups, packed_n], so its bytes are a valid i32 slice.
+        // SAFETY: qzeros is I32 [num_groups, packed_n], so its bytes are a valid i32
+        // slice.
         let qz: &[i32] = unsafe {
             std::slice::from_raw_parts(qz_bytes.as_ptr().cast::<i32>(), qz_bytes.len() / 4)
         };
 
-        // Convert GPTQ qweight [packed_k, n] -> ARLE weight [n, packed_k*4] (U8).
-        // GPTQ: each i32 holds 8 uint4; ARLE: each u8 holds 2 uint4 (lo=even, hi=odd).
-        // Logical layout after conversion: [n, k] signed int4, packed to [n, k/2].
+        // GPTQ packs 8 uint4 per i32; ARLE packs 2 per u8 (lo=even, hi=odd), logical
+        // [n, k].
         let arle_packed_cols = k / 2;
         let mut arle_weight = vec![0u8; n * arle_packed_cols];
         let mut arle_scales = vec![0u8; n * num_groups * 2]; // BF16
@@ -3031,7 +2972,6 @@ impl SafetensorLoader {
         for g in 0..num_groups {
             let k_start = g * group_size;
             let k_end = k_start + group_size;
-            // Unpack qzeros for this group: qzeros[g, :] is I32 [n//8]
             let mut zeros = vec![0u8; n];
             for j in 0..n {
                 let word_idx = j / 8;
@@ -3039,14 +2979,12 @@ impl SafetensorLoader {
                 let raw = ((qz[g * packed_n + word_idx] >> shift) & 0xF) as u8;
                 zeros[j] = raw + 1; // GPTQ stores actual_zero - 1
             }
-            // Copy scales for this group: scales[g, :] is BF16 [n]
             let scale_offset = g * n * 2;
             for j in 0..n {
                 arle_scales[j * num_groups * 2 + g * 2] = scales_bytes[scale_offset + j * 2];
                 arle_scales[j * num_groups * 2 + g * 2 + 1] =
                     scales_bytes[scale_offset + j * 2 + 1];
             }
-            // Convert qweight rows for this group
             for k_idx in k_start..k_end {
                 let packed_row = k_idx / 8;
                 let nibble = k_idx % 8;
@@ -3055,9 +2993,8 @@ impl SafetensorLoader {
                 let is_high = k_idx % 2 == 1;
                 for j in 0..n {
                     let raw = ((qw[packed_row * n + j] >> shift) & 0xF) as u8;
-                    // GPTQ dequant: (raw - zero) * scale.
-                    // ARLE dequant: (arle_uint4 - 8) * scale.
-                    // => arle_uint4 = raw - zero + 8.
+                    // GPTQ (raw - zero)*scale vs ARLE (uint4 - 8)*scale ⇒ uint4 = raw -
+                    // zero + 8.
                     let arle_val = raw.wrapping_sub(zeros[j]).wrapping_add(8);
                     let arle_idx = j * arle_packed_cols + arle_byte_idx_base;
                     if is_high {
@@ -3069,11 +3006,9 @@ impl SafetensorLoader {
             }
         }
 
-        // Apply the TP shard to the converted ARLE-layout tensors. GPTQ packs
-        // both K (into i32 words) and N (into qzeros words), so sharding the
-        // raw tensors directly is error-prone; convert first, then shard the
-        // canonical [n, k//2] weight and [n, groups] scales with the shared
-        // W4A16 shard helpers.
+        // Shard the converted ARLE-layout tensors: GPTQ packs both K (into i32 words)
+        // and N
+        // (into qzeros words), so sharding the raw tensors directly is error-prone.
         let weight_shard =
             self.shard_fp4_packed_weight_cow(&arle_weight, n, k, group_size, shard)?;
         let scale_shard = self.shard_w4a16_scales_cow(&arle_scales, n, k, group_size, shard)?;
@@ -3097,9 +3032,9 @@ impl SafetensorLoader {
         .with_context(|| format!("upload GPTQ W4A16 tensor {}", view.name))
     }
 
-    /// Load a W8A16 view: signed INT8 weights (non-packed, [rows, cols]) with
-    /// per-row per-column-group BF16 scales. Mirrors `load_w4a16_view` minus the
-    /// nibble packing — the CUDA `w8a16_gemv` kernel reads 1 byte per weight.
+    /// Load a W8A16 view: signed INT8 weights (non-packed, [rows, cols]) with per-row
+    /// per-column-group BF16 scales — the CUDA `w8a16_gemv` kernel reads 1 byte per
+    /// weight.
     fn load_w8a16_view(
         &self,
         ctx: &DeviceContext,
@@ -3116,9 +3051,8 @@ impl SafetensorLoader {
         Ok(matrix)
     }
 
-    /// W8A16 view load WITHOUT the Marlin repack — the row-fusion path concats
-    /// two INT8 sources first so the fused matrix repacks (and frees its INT8)
-    /// once.
+    /// W8A16 view load WITHOUT the Marlin repack — the row-fusion path concats two INT8
+    /// sources first so the fused matrix repacks once.
     fn load_w8a16_view_unpacked(
         &self,
         ctx: &DeviceContext,
@@ -3334,11 +3268,12 @@ impl SafetensorLoader {
         }
     }
 
-    /// Shard bytes: mmap into the bounded LRU on first touch, then hand out a cheap
-    /// `Rc` clone (no `RefCell` guard escapes, so nested loads that fill other
-    /// shards never hit a `BorrowMutError`). Loading beyond the byte budget
-    /// evicts older entries; outstanding [`SharedTensor`] borrows keep their
-    /// shard alive through their own `Rc`.
+    /// Shard bytes: mmap into the bounded LRU on first touch, then hand out an `Rc`
+    /// clone (no
+    /// `RefCell` guard escapes, so nested loads that fill other shards never hit a
+    /// `BorrowMutError`). Loading beyond the byte budget evicts older entries;
+    /// outstanding
+    /// [`SharedTensor`] borrows keep their shard alive through their own `Rc`.
     fn shard_bytes(&self, idx: usize) -> Result<Rc<ShardBytes>> {
         let path = self
             .shards
@@ -3418,8 +3353,9 @@ impl SafetensorLoader {
         Ok(metas)
     }
 
-    /// Dtype-agnostic shard read (DSv4 FP8/FP4/E8M0). Same read-once cache as the
-    /// BF16 path; the typed gate lives in the callers.
+    /// Dtype-agnostic shard read. Same read-once cache as the BF16 path; the typed gate
+    /// lives
+    /// in the callers.
     fn load_raw_from_shard(&self, idx: usize, name: &str) -> Result<OwnedTensor> {
         let t0 = Instant::now();
         let tensor = self.borrow_raw_from_shard(idx, name)?;
@@ -3441,11 +3377,11 @@ impl SafetensorLoader {
         Ok(owned)
     }
 
-    /// Zero-copy shard read: the returned [`SharedTensor`] aliases the tensor's
-    /// byte range inside the read-once shard cache (an `Rc` clone, no host
-    /// memcpy). The stacked-expert loader slices ~1.5 GiB per MoE layer out of
-    /// these bytes; the owned path (`load_raw_from_shard`) copied that whole
-    /// range per tensor on top of the cache. (audit MOE-P2-1)
+    /// Zero-copy shard read: the returned [`SharedTensor`] aliases the tensor's byte
+    /// range
+    /// inside the read-once shard cache. The stacked-expert loader slices ~1.5 GiB per
+    /// MoE
+    /// layer out of these bytes.
     fn borrow_raw_from_shard(&self, idx: usize, name: &str) -> Result<SharedTensor> {
         let shard = self.shard_bytes(idx)?;
         let path = &self.shards[idx];
@@ -3469,8 +3405,7 @@ impl SafetensorLoader {
         })
     }
 
-    /// Zero-copy tensor lookup across shards (the borrow-path twin of
-    /// [`Self::load_raw_tensor`]).
+    /// Zero-copy tensor lookup across shards.
     pub(crate) fn borrow_raw_tensor(&self, name: &str) -> Result<SharedTensor> {
         if let Some(&idx) = self.weight_map.get(name) {
             return self.borrow_raw_from_shard(idx, name);
@@ -3486,8 +3421,6 @@ impl SafetensorLoader {
         ))
     }
 
-    /// Zero-copy BF16 tensor borrow (the borrow-path twin of `load_tensor`'s
-    /// dtype gate).
     fn borrow_bf16_tensor(&self, name: &str) -> Result<SharedTensor> {
         let tensor = self.borrow_raw_tensor(name)?;
         ensure!(
@@ -3499,8 +3432,8 @@ impl SafetensorLoader {
     }
 }
 
-/// A tensor whose bytes alias the loader's mmap shard cache (`Rc` share,
-/// zero host copies). [`Self::bytes`] yields the tensor's exact byte range.
+/// A tensor whose bytes alias the loader's mmap shard cache (`Rc` share, zero host
+/// copies).
 pub(crate) struct SharedTensor {
     pub(crate) shape: Vec<usize>,
     pub(crate) dtype: Dtype,
@@ -3563,10 +3496,9 @@ fn tensor_bytes_to_f32(
     Ok(values)
 }
 
-/// Saturating encode of `val` into the FP8 E4M3FN byte format used by DeepSeek V4.
-/// E4M3FN: 1 sign + 4 exp + 3 mant, bias=7, NaN={0x7F,0xFF}, no Inf.
-/// Max normal = 0x7E = (1+6/8)×2^8 = 448.0. Values are clamped to ±448 before
-/// encoding; NaN input is mapped to zero (weight tensors should never be NaN).
+/// Saturating encode of `val` into FP8 E4M3FN: 1 sign + 4 exp + 3 mant, bias 7, max
+/// normal
+/// 0x7E = 448.0. Values are clamped to ±448; NaN input maps to zero.
 fn encode_f8_e4m3fn_sat(val: f32) -> u8 {
     const E4M3_MAX: f32 = 448.0;
     const BIAS: i32 = 7;
@@ -3596,7 +3528,6 @@ fn encode_f8_e4m3fn_sat(val: f32) -> u8 {
     // Round-to-nearest: add the guard bit (bit 19) before truncating to 3 bits.
     let fp8_mant_raw = (f32_mant + (1 << 19)) >> 20;
     if fp8_mant_raw > 7 {
-        // Carry into exponent; re-check saturation.
         let new_exp = fp8_biased_exp + 1;
         return if new_exp >= 15 {
             sign | 0x7E
@@ -3607,16 +3538,14 @@ fn encode_f8_e4m3fn_sat(val: f32) -> u8 {
     sign | (fp8_biased_exp << 3) | (fp8_mant_raw as u8)
 }
 
-// DSv4 FP8/FP4 + E8M0 loaders, reachable from
-// `Dsv4Model::from_dsv4_fp8_safetensors` (wired through the executor enum branch
-// and the DSv4/GLM forward). The `allow(dead_code)` is retained on necessity
-// grounds, not caller count (see `feedback_necessity_not_callers`): individual
-// dtype loaders are config-selected, so some read as dead under a given build.
+// DSv4 FP8/FP4 + E8M0 loaders. The `allow(dead_code)` is retained on necessity grounds,
+// not
+// caller count: individual dtype loaders are config-selected, so some read as dead
+// under a
+// given build.
 #[allow(dead_code)]
 impl SafetensorLoader {
-    /// Dtype-agnostic full-tensor read (shape + raw bytes + dtype). The Qwen3.5
-    /// hybrid TP loader slices fused-block tensors (`in_proj_qkv`, `conv1d`,
-    /// per-v-head vectors) from these bytes before upload.
+    /// Dtype-agnostic full-tensor read (shape + raw bytes + dtype).
     pub(crate) fn load_raw_tensor(&self, name: &str) -> Result<OwnedTensor> {
         if let Some(&idx) = self.weight_map.get(name) {
             return self.load_raw_from_shard(idx, name);
@@ -3632,11 +3561,11 @@ impl SafetensorLoader {
         ))
     }
 
-    /// Normalize a small 1D/2D tensor to BF16 bytes — these ship as BF16
-    /// (norms) or F32 (attn_sink, router gate, Qwen3.5 `dt_bias`) depending on
-    /// the checkpoint. Shared by the DSv4 vec loaders and the Qwen3.5 hybrid
-    /// TP slicers (which must match `load_vec_any`'s conversion exactly so the
-    /// sharded load is byte-identical to slicing the single-GPU upload).
+    /// Normalize a small 1D/2D tensor to BF16 bytes — these ship BF16 or F32 depending
+    /// on the
+    /// checkpoint. Must match `load_vec_any`'s conversion exactly so a sharded load
+    /// stays
+    /// byte-identical to slicing the single-GPU upload.
     pub(crate) fn dsv4_bytes_to_bf16<'a>(
         name: &str,
         tensor: &'a OwnedTensor,
@@ -3671,8 +3600,8 @@ impl SafetensorLoader {
         }
     }
 
-    /// Load a DSv4 1D norm/bias vector (q_norm, kv_norm, attn_sink, layer norms,
-    /// gate bias) — BF16 or F32 in the checkpoint, normalized to BF16.
+    /// Load a DSv4 1D norm/bias vector — BF16 or F32 in the checkpoint, normalized to
+    /// BF16.
     pub(crate) fn load_dsv4_vec(&self, ctx: &DeviceContext, name: &str) -> Result<DeviceVec> {
         let tensor = self.borrow_raw_tensor(name)?;
         ensure!(
@@ -3687,8 +3616,7 @@ impl SafetensorLoader {
         .with_context(|| format!("upload DSv4 vec {name}"))
     }
 
-    /// Load a DSv4 2D router gate (the only non-FP8 2D weight) — BF16 or F32 in
-    /// the checkpoint, normalized to BF16.
+    /// Load a DSv4 2D router gate (the only non-FP8 2D weight), normalized to BF16.
     pub(crate) fn load_dsv4_bf16_matrix(
         &self,
         ctx: &DeviceContext,
@@ -3709,11 +3637,8 @@ impl SafetensorLoader {
         .with_context(|| format!("upload DSv4 gate {name}"))
     }
 
-    /// Sharded dense BF16/F32 load — the dense-weight twin of
-    /// [`Self::load_dsv4_block_scaled_sharded`]. Used for `wo_a` when a checkpoint
-    /// leaves the tiny low-rank output down-projection unquantized (e.g.
-    /// `/host/DeepSeek-V4-Flash-FP8`). Converts to bf16, then slices rows for the
-    /// `Shard::Column { dim: 0 }` case `wo_a` takes when `o_groups % tp == 0`.
+    /// Sharded dense BF16/F32 load, for checkpoints that leave the tiny low-rank `wo_a`
+    /// unquantized. Converts to bf16, then slices rows.
     /// ponytail: only Column{0}/Replicated — the only shards `wo_a` uses; bail else.
     pub(crate) fn load_dsv4_bf16_sharded(
         &self,
@@ -3747,17 +3672,12 @@ impl SafetensorLoader {
         }
     }
 
-    /// Load a DSv4 block-scaled FP8 (`F8_E4M3`) or packed FP4 (`I8`) `<name>` plus
-    /// its sibling `<prefix>.scale` (`F8_E8M0`) into a [`DeviceMatrix`]. The whole
-    /// tensor is loaded (EP rank selection happens by expert index in the caller;
-    /// TP weight sharding is Piece 4). Returns the block-scaled `DeviceMatrix` the
-    /// shared `Dsv4Fp8DeepGemmWeightCache` consumes.
-    /// DSv4 block-scales feed a 1-byte E8M0 decode (`bits << 23`) downstream. Accept
-    /// either native `F8_E8M0`, or the common `F32` power-of-two serialization
-    /// (vLLM / DeepSeek-V3 `weight_block_size` FP8): a power-of-two f32's biased
-    /// exponent byte IS its E8M0 code, so `(bits >> 23) & 0xff` is the lossless encode.
-    /// Returns owned E8M0 bytes (scale tensors are tiny). Errors on a non-power-of-two
-    /// F32 scale (would need the dequant route) or any other dtype.
+    /// Normalize a DSv4 block scale to E8M0 bytes. Accepts native `F8_E8M0`, or the
+    /// common
+    /// `F32` power-of-two serialization: a power-of-two f32's biased exponent byte IS
+    /// its
+    /// E8M0 code, so `(bits >> 23) & 0xff` is lossless. Errors on a non-power-of-two
+    /// F32.
     fn dsv4_block_scale_e8m0(scale_name: &str, dtype: Dtype, bytes: &[u8]) -> Result<Vec<u8>> {
         match dtype {
             Dtype::F8_E8M0 => Ok(bytes.to_vec()),
@@ -3826,12 +3746,9 @@ impl SafetensorLoader {
                 )
                 .with_context(|| format!("upload DSv4 FP8 matrix {name}"))
             }
-            // FP4 E2M1 (I8-packed, 2 nibbles/byte). FAIL-CLOSED: the FP4/MX
-            // checkpoint lane produces NaN from the first compressed-attention
-            // layer (#137, decoded 2026-07-02: L3→L2 at 4-token chunk
-            // boundaries; the FP8-native export is clean on the same binary).
-            // Reject at load rather than serve invisible output. The FP4
-            // dequant plumbing below it stays for a future re-license.
+            // FAIL-CLOSED: the FP4/MX lane NaNs from the first compressed-attention
+            // layer
+            // (#137); the FP4 dequant plumbing below stays for a future re-license.
             Dtype::I8 => bail!(
                 "{name}: FP4/MX DSv4 checkpoints are unsupported — the compressed-attention \
                  path NaNs (#137). Use the FP8-native export."
@@ -3864,9 +3781,11 @@ impl SafetensorLoader {
         })
     }
 
-    /// Load a DSv4 block-scaled FP8 matrix and apply a TP shard before upload.
-    /// The FP8 payload and E8M0 block scales must be sliced together; otherwise
-    /// the shard reads valid FP8 bytes with the wrong scale blocks.
+    /// Load a DSv4 block-scaled FP8 matrix and apply a TP shard before upload. The FP8
+    /// payload
+    /// and E8M0 block scales must be sliced together, or the shard reads valid FP8
+    /// bytes with
+    /// the wrong scale blocks.
     pub(crate) fn load_dsv4_block_scaled_sharded(
         &self,
         ctx: &DeviceContext,
@@ -3960,10 +3879,9 @@ impl SafetensorLoader {
         }
     }
 
-    /// #150: dense-bf16 dequant copy of one DSv4 FP8 block-scaled tensor
-    /// (host-side, via the shared block-dequant helper — the scale sidecar's
-    /// shape defines the block dims), TP-sharded like the FP8 original. Built
-    /// costs 2× the F8 bytes in VRAM.
+    /// Dense-bf16 dequant copy of one DSv4 FP8 block-scaled tensor, TP-sharded like the
+    /// FP8
+    /// original. Costs 2× the F8 bytes in VRAM.
     fn load_dsv4_block_scaled_bf16_copy(
         &self,
         ctx: &DeviceContext,
@@ -4012,12 +3930,11 @@ impl SafetensorLoader {
         );
         let groups = weight.rows / rows_per_group;
         ensure!(groups > 0, "DSv4 wo_a grouped table has zero groups");
-        // Dense BF16 wo_a (unquantized re-serialization): the grouped route-GEMV
-        // kernel is FP8/FP4-only, so the per-group pointer/scale tables are consumed
-        // only when groups>1 — which `dsv4_wo_a_grouped_linear` rejects for dense. On
-        // the production groups==1 (TP=o_groups) path the forward reads only the shape
-        // fields and runs `dsv4_linear`→`gemm_batch`. Carry the shape; build trivial
-        // base-pointer tables so the struct stays well-formed.
+        // Dense BF16 wo_a: the grouped route-GEMV kernel is FP8/FP4-only, so these
+        // tables are
+        // consumed only when groups>1, which the dense path rejects. Carry the shape
+        // and build
+        // trivial base-pointer tables so the struct stays well-formed.
         if weight.weight_format == WeightFormat::DenseBf16 {
             let (base, _bg) = weight.data.device_ptr(&ctx.stream);
             let stride_bytes = rows_per_group
@@ -4144,12 +4061,11 @@ impl SafetensorLoader {
             crate::runtime_flags::Dsv4MoeTransport::MegaMoe
         );
 
-        // Both DSv4 and GLM run FP8 MoE. DSv4 ships FP8 E4M3 + E8M0 (`<prefix>.scale`),
-        // consumed by `from_dsv4_weight*`. GLM ships FP8 E4M3 + F32 `weight_scale_inv`
-        // (general 128×128 block scales), consumed losslessly by
-        // `from_fp8_block_scaled_weight*` (the 1D2D `sfb` F32-scale path — no E8M0
-        // re-encode, no dequant). Both produce a `Dsv4Fp8DeepGemmWeightCache` and
-        // ride the SAME `build_grouped_cache`.
+        // DSv4 ships FP8 E4M3 + E8M0 `<prefix>.scale`; GLM ships FP8 E4M3 + F32
+        // `weight_scale_inv` (128×128 block scales), consumed losslessly by the 1D2D
+        // `sfb`
+        // path — no E8M0 re-encode, no dequant. Both ride the SAME
+        // `build_grouped_cache`.
         let build_w13 =
             |first: &DeviceMatrix, second: &DeviceMatrix| -> Result<Dsv4Fp8DeepGemmWeightCache> {
                 if glm {
@@ -4257,9 +4173,8 @@ impl SafetensorLoader {
             }
         };
 
-        // SHARED expert (always-on, n_shared_experts == 1). Both DSv4 and GLM run
-        // the FP8 DeepGEMM shared path; `build_w13`/`build_w2` pick the E8M0 (DSv4)
-        // or F32-block-scale (GLM 1D2D) builder, matching the routed experts.
+        // SHARED expert (always-on, n_shared_experts == 1); same builders as the routed
+        // ones.
         let shared = names
             .shared_experts
             .as_ref()
@@ -4286,10 +4201,9 @@ impl SafetensorLoader {
         })
     }
 
-    /// Load a GLM dense-MLP layer (`first_k_dense_replace` layers): a plain SwiGLU
-    /// FFN (`gate_proj`/`up_proj`/`down_proj` at `intermediate_size`). GLM ships
-    /// FP8 + F32 `weight_scale_inv`; dequantize each to dense bf16 (the FP8 grouped
-    /// caches need E8M0 scales GLM doesn't carry — Tranche-D may revisit).
+    /// Load a GLM dense-MLP layer (`first_k_dense_replace` layers). GLM ships FP8 + F32
+    /// `weight_scale_inv`; each projection is dequantized to dense bf16 because the FP8
+    /// grouped caches need E8M0 scales GLM does not carry.
     pub(crate) fn load_dsv4_dense_mlp(
         &self,
         ctx: &DeviceContext,
@@ -4324,8 +4238,7 @@ impl SafetensorLoader {
         })
     }
 
-    /// Load a DSv4 1D `i64` table (hash routing `gate.tid2eid`) into host memory
-    /// so the loader can upload the device routing table.
+    /// Load a DSv4 1D `i64` hash-routing table (`gate.tid2eid`) into host memory.
     pub(crate) fn load_dsv4_i64_host(&self, name: &str) -> Result<Vec<i64>> {
         use safetensors::tensor::Dtype;
         let tensor = self.borrow_raw_tensor(name)?;
@@ -4360,11 +4273,11 @@ impl SafetensorLoader {
         })
     }
 
-    /// Load a DSv4 2D matrix dispatching on its on-disk dtype: BF16/F32 tensors are
-    /// quantized to FP8 E4M3FN block-scaled (128×128 blocks, E8M0 scales) on the host
-    /// so every downstream linear routes through `mla_linear` / `dsv4_fp8_gemv_batch`
-    /// instead of the BF16 `gemv_handwritten_kernel`. F8_E4M3/I8 tensors keep the
-    /// native block-scaled path unchanged.
+    /// Load a DSv4 2D matrix dispatching on its on-disk dtype: BF16/F32 are quantized
+    /// to FP8
+    /// E4M3FN block-scaled (128×128 blocks, E8M0 scales) on the host so downstream
+    /// linears
+    /// route through `mla_linear`; F8_E4M3/I8 keep the native block-scaled path.
     pub(crate) fn load_dsv4_global_matrix(
         &self,
         ctx: &DeviceContext,
@@ -4397,9 +4310,10 @@ impl SafetensorLoader {
     }
 
     /// Build one DSv4 MLA attention block. The Q/KV/O LoRA matrices are FP8/FP4
-    /// block-scaled; CSA/HCA layers also carry a `compressor` (and CSA an
-    /// `indexer`) — their matrices may be FP8/FP4 or bf16, so they route through
-    /// the dtype-dispatching [`Self::load_dsv4_global_matrix`].
+    /// block-scaled;
+    /// `compressor` / `indexer` matrices may be FP8/FP4 or bf16, so they route through
+    /// the
+    /// dtype-dispatching [`Self::load_dsv4_global_matrix`].
     pub(crate) fn load_dsv4_attention(
         &self,
         ctx: &DeviceContext,
@@ -4407,8 +4321,8 @@ impl SafetensorLoader {
         names: &deepseek_spec::DeepSeekV4AttentionTensorNames,
         tp: &TpConfig,
     ) -> Result<crate::dsv4::Dsv4Attention> {
-        // GLM (`plain_o_proj`) ships no `attn_sink` tensor — its MLA has no per-head
-        // sink logit. DSv4 loads `attn_sink` + an f32 mirror.
+        // GLM (`plain_o_proj`) ships no `attn_sink` — its MLA has no per-head sink
+        // logit.
         let (attn_sink, attn_sink_f32) = if config.plain_o_proj {
             (None, None)
         } else {
@@ -4434,11 +4348,11 @@ impl SafetensorLoader {
             drop(_sg);
             (Some(attn_sink), Some(dst))
         };
-        // GLM (`plain_o_proj`) ships FP8 + F32 `weight_scale_inv` scales: dequant the
-        // Q/KV down/up projections to dense bf16 (the FP8 DeepGEMM caches below are
-        // DSv4-only — they need the E8M0 `dsv4_scales` layout). TP head-sharding of
-        // the GLM projections is a Tranche-D concern; load replicated for the
-        // single-GPU typecheck/bring-up.
+        // GLM (`plain_o_proj`) ships FP8 + F32 `weight_scale_inv`: dequant the Q/KV
+        // projections
+        // to dense bf16, since the FP8 DeepGEMM caches below need the E8M0
+        // `dsv4_scales`
+        // layout.
         let glm = config.plain_o_proj;
         let (wq_a, wkv) = if glm {
             (
@@ -4472,15 +4386,10 @@ impl SafetensorLoader {
                 tp,
             )?
         };
-        // DeepGEMM-layout cache for the decode wq_b projection (residual scalar
-        // GEMV → tensor-core).
         let wq_b_deepgemm = self.decode_proj_cache(ctx, &wq_b)?;
-        // #150: opt-in dense-bf16 dequant copies of the F8-only wq_a/wq_b/wkv so
-        // BOTH decode lanes can share one bf16 arithmetic; the FP8 originals stay
-        // (prefill DeepGEMM untouched). None when the flag is off — no VRAM cost.
         // Output projection. DSv4: low-rank wo_a→wo_b (+ per-group tables). GLM
-        // (`plain_o_proj`): a single plain `o_proj` [hidden, num_heads*v_head_dim],
-        // and the kv_b absorption split (w_kc/w_vc).
+        // (`plain_o_proj`): a single plain `o_proj`, plus the kv_b absorption split
+        // (w_kc/w_vc).
         let (
             wo_a,
             wo_a_groups,
@@ -4512,11 +4421,11 @@ impl SafetensorLoader {
                 Some(w_vc),
             )
         } else {
-            // `wo_a` is FP8/FP4 block-scaled in native DSv4 checkpoints, but some FP8
-            // re-serializations (e.g. /host/DeepSeek-V4-Flash-FP8) leave the tiny
-            // low-rank `wo_a` as dense BF16. Route by dtype: block-scaled keeps the
-            // grouped route-GEMV + DeepGEMM levers; dense BF16 rides `dsv4_linear`
-            // (gemm_batch) on the groups==1 (TP=o_groups) path. `wo_b` stays FP8.
+            // Some FP8 re-serializations leave the tiny low-rank `wo_a` as dense BF16.
+            // Route by
+            // dtype: block-scaled keeps the grouped route-GEMV + DeepGEMM levers; dense
+            // BF16
+            // rides `dsv4_linear` (gemm_batch). `wo_b` stays FP8.
             let wo_a_shard = names
                 .shard_for(config, &names.wo_a, tp.world_size)
                 .unwrap_or(Shard::Replicated);
@@ -4539,9 +4448,9 @@ impl SafetensorLoader {
                     .unwrap_or(Shard::Replicated),
                 tp,
             )?;
-            // DeepGEMM caches for the decode output projection (lever #1b). `wo_b` is
-            // always FP8 → cache under the alloc gate. `wo_a` caches only when `wo_a`
-            // is itself block-scaled (dense BF16 has no FP8 cache; it uses gemm_batch).
+            // DeepGEMM caches for the decode output projection. `wo_b` is always FP8;
+            // `wo_a`
+            // caches only when it is itself block-scaled (dense BF16 uses gemm_batch).
             let decode_alloc = crate::attention::dsv4_fused_wqkv_decode_alloc_enabled()?;
             let (wo_a_deepgemm, wo_a_group_deepgemm) = if decode_alloc && wo_a_is_block_scaled {
                 let group_caches = if wo_a_groups.groups > 1 {
@@ -4622,30 +4531,18 @@ impl SafetensorLoader {
         })
     }
 
-    /// GLM `kv_b` absorption split (SGLang `deepseek_weight_loader.py:567-590`,
-    /// the non-`use_deep_gemm_bmm` path that yields bf16 `w_kc`/`w_vc`).
+    /// GLM `kv_b` absorption split (SGLang `deepseek_weight_loader.py:567-590`, the
+    /// non-`use_deep_gemm_bmm` path).
     ///
-    /// `kv_b_proj.weight` is `[num_heads*(qk_nope_head_dim + v_head_dim), kv_lora_rank]`
-    /// (FP8 block-scaled). We:
-    ///   1. dequantize to bf16,
-    ///   2. `unflatten(0, (num_heads, qk_nope+v_head_dim))`,
-    ///   3. split dim-1 into source `w_kc_src[h, qk_nope, kv_lora]` and
-    ///      `w_vc_src[h, v_head, kv_lora]`,
-    ///   4. emit BOTH in `gemm_batch` orientation `[out, in]` so the Tranche-D
-    ///      per-head absorption (`q_latent = w_kc · q_nope`, `v = w_vc · attn_out`)
-    ///      consumes them directly via `gemm_batch` (`weight[R=out, C=in] · x[in, tok]`).
-    ///
-    /// `w_kc[h]` = `w_kc_src[h]` transposed → `[kv_lora, qk_nope]`, emitted
-    /// `[num_heads*kv_lora, qk_nope]` (contracts qk_nope → kv_lora). `w_vc[h]` =
-    /// `w_vc_src[h]` AS-IS → `[v_head, kv_lora]`, emitted `[num_heads*v_head, kv_lora]`
-    /// (contracts kv_lora → v_head; the natural row layout of `kv_b`'s value rows, so
-    /// no transpose). This differs from SGLang's `bmm`-orientation `[h, qk_nope,
-    /// kv_lora]` / `[h, kv_lora, v_head]` because ARLE's `gemm_batch` is `weight·x`
-    /// (not `x·weight^T`); the contraction is mathematically identical.
-    ///
-    /// GPU-UNVERIFIABLE (pod): the exact dequant scale application (F32
-    /// `weight_scale_inv`, block [128,128]) and the per-head BMM contraction the
-    /// Tranche-D forward feeds these into need a pod load+forward to confirm.
+    /// `kv_b_proj.weight` is `[num_heads*(qk_nope_head_dim + v_head_dim),
+    /// kv_lora_rank]`, FP8
+    /// block-scaled. Dequantize to bf16, split per head, and emit BOTH halves in
+    /// `gemm_batch`
+    /// orientation `[out, in]`: `w_kc` is the per-head transpose → `[num_heads*kv_lora,
+    /// qk_nope]`, `w_vc` is as-is → `[num_heads*v_head, kv_lora]`. SGLang's `bmm`
+    /// orientation
+    /// is transposed from this because ARLE's `gemm_batch` computes `weight·x`, not
+    /// `x·weight^T`; the contraction is identical.
     pub(crate) fn load_dsv4_kv_b_absorb(
         &self,
         ctx: &DeviceContext,
@@ -4666,11 +4563,8 @@ impl SafetensorLoader {
             "GLM kv_b split needs qk_nope_head_dim/v_head_dim/kv_lora_rank > 0, \
              got {qk_nope}/{v_head}/{kv_lora}"
         );
-        // Dequantize kv_b to host f32 [num_heads*(qk_nope+v_head), kv_lora].
         let rows = num_heads * (qk_nope + v_head);
         let kv_b = self.dequantize_dsv4_block_scaled_to_f32_host(kv_b_name, rows, kv_lora)?;
-        // Split per head into w_kc / w_vc host buffers in `gemm_batch` orientation
-        // `[out, in]` (row-major), emit bf16 LE bytes. See the fn doc step 4.
         let per_head = qk_nope + v_head;
         // w_kc[h] = w_kc_src[h] transposed: [kv_lora(out), qk_nope(in)].
         let mut w_kc = vec![0.0f32; num_heads * kv_lora * qk_nope];
@@ -4678,16 +4572,12 @@ impl SafetensorLoader {
         let mut w_vc = vec![0.0f32; num_heads * v_head * kv_lora];
         for h in 0..num_heads {
             let head_base = h * per_head * kv_lora;
-            // Source w_kc rows [0, qk_nope) of head h: kv_b[head_base + i*kv_lora + j]
-            // is the (i=qk_nope, j=kv_lora) element. Transpose → dst[h, j, i].
             for i in 0..qk_nope {
                 for j in 0..kv_lora {
                     w_kc[h * kv_lora * qk_nope + j * qk_nope + i] =
                         kv_b[head_base + i * kv_lora + j];
                 }
             }
-            // Source w_vc rows [qk_nope, qk_nope+v_head) of head h: already
-            // [v_head(out), kv_lora(in)] row-major — copy verbatim into dst[h, r, c].
             let vc_src_base = head_base + qk_nope * kv_lora;
             for r in 0..v_head {
                 for c in 0..kv_lora {
@@ -4704,9 +4594,8 @@ impl SafetensorLoader {
             .iter()
             .flat_map(|v| half::bf16::from_f32(*v).to_le_bytes())
             .collect();
-        // kv_b absorption is per-head and replicated at the head grain;
-        // TP head-sharding of w_kc/w_vc is a Tranche-D concern (matches o_proj/wq_b).
-        // w_kc: [num_heads*kv_lora, qk_nope]; w_vc: [num_heads*v_head, kv_lora].
+        // Replicated at the head grain; TP head-sharding of w_kc/w_vc is not
+        // implemented.
         let _ = tp;
         let w_kc = DeviceMatrix::from_safetensors(ctx, &w_kc_bytes, num_heads * kv_lora, qk_nope)
             .with_context(|| format!("upload GLM w_kc from {kv_b_name}"))?;
@@ -4715,15 +4604,12 @@ impl SafetensorLoader {
         Ok((w_kc, w_vc))
     }
 
-    /// Load a GLM (`weight_scale_inv`) FP8 E4M3 matrix into a `Fp8BlockScaled`
-    /// `DeviceMatrix` (raw FP8 bytes + F32 per-128×128-block scales), WITHOUT
-    /// dequantizing. This is the lossless 1D2D DeepGEMM weight format: the
-    /// `Dsv4Fp8DeepGemmWeightCache::from_fp8_block_scaled_weight*` builders copy
-    /// the FP8 bytes + F32 scales straight into the grouped cache's `weight`/`scales`,
-    /// which the `sm90_fp8_gemm_1d2d` kernel reads via `const float* sfb` (F32 weight
-    /// scales). GLM's `weight_scale_inv` is already `[N/128, K/128]` row-major F32 —
-    /// the exact `[scale_rows, scale_cols]` layout the cache expects, no transpose,
-    /// no E8M0 re-encode (which is lossy for GLM's general non-pow2 F32 scales).
+    /// Load a GLM (`weight_scale_inv`) FP8 E4M3 matrix as a `Fp8BlockScaled`
+    /// [`DeviceMatrix`]
+    /// (raw FP8 bytes + F32 per-128×128-block scales), WITHOUT dequantizing: GLM's
+    /// `weight_scale_inv` is already the `[N/128, K/128]` row-major F32 grid the
+    /// `sm90_fp8_gemm_1d2d` kernel reads as `sfb` — no transpose, no lossy E8M0
+    /// re-encode.
     fn load_dsv4_glm_fp8_as_block_scaled(
         &self,
         ctx: &DeviceContext,
@@ -4766,8 +4652,6 @@ impl SafetensorLoader {
             scale.shape
         );
         let (scale_rows, scale_cols) = (scale.shape[0], scale.shape[1]);
-        // Assert GLM's weight_scale_inv resolves to the expected [N/128, K/128]
-        // F32 grid the 1D2D grouped GEMM's `sfb` consumes (fail loudly pre-pod).
         let want_rows = rows.div_ceil(BLOCK);
         let want_cols = cols.div_ceil(BLOCK);
         ensure!(
@@ -4784,12 +4668,11 @@ impl SafetensorLoader {
             .with_context(|| format!("upload GLM FP8 block-scaled MoE weight {name}"))
     }
 
-    /// Quantize a BF16 or F32 row-major matrix to DSv4 FP8 E4M3FN block-scaled format
-    /// on the host. Uses 128×128 blocks with E8M0 per-block scales — the same layout
-    /// the DSv4 checkpoint uses for natively quantized weights. Returns
-    /// `(fp8_bytes, e8m0_scale_bytes, scale_rows, scale_cols)`. The caller uploads
-    /// via [`DeviceMatrix::from_dsv4_fp8_block_scaled`], then [`mla_linear`] dispatches
-    /// to `dsv4_fp8_gemv_batch_cuda` instead of the BF16 `gemv_handwritten_kernel`.
+    /// Quantize a BF16 or F32 row-major matrix to DSv4 FP8 E4M3FN block-scaled on the
+    /// host:
+    /// 128×128 blocks with E8M0 per-block scales, the layout natively quantized DSv4
+    /// weights
+    /// use. Returns `(fp8_bytes, e8m0_scale_bytes, scale_rows, scale_cols)`.
     fn quantize_to_dsv4_fp8_host(
         name: &str,
         dtype: Dtype,
@@ -4836,7 +4719,6 @@ impl SafetensorLoader {
             for bc in 0..scale_cols {
                 let col_start = bc * BLOCK;
                 let col_end = (col_start + BLOCK).min(cols);
-                // Max abs value in this block drives the E8M0 scale.
                 let mut max_abs = 0.0f32;
                 for r in row_start..row_end {
                     for c in col_start..col_end {
@@ -4866,15 +4748,10 @@ impl SafetensorLoader {
         Ok((fp8_out, scale_out, scale_rows, scale_cols))
     }
 
-    /// Dequantize a DSv4/GLM block-scaled FP8 E4M3 matrix to host f32, applying the
-    /// block scale. DSv4 ships `<prefix>.scale` (F8_E8M0, 1 byte/block); GLM ships
-    /// `<name>.weight_scale_inv` (F32, block [128,128]). The block scale multiplies
-    /// (SGLang `w.to(bf16) * weight_scale_inv`, `deepseek_weight_loader.py:557-563`).
-    ///
-    /// GPU-UNVERIFIABLE (pod): the F32 `weight_scale_inv` block layout (row-major
-    /// `[ceil(rows/128), ceil(cols/128)]`, multiply) is taken from the SGLang loader
-    /// plus the index.json scale shape `[224, 4]` for kv_b `[28672, 512]`; the exact
-    /// dequant must be confirmed against a pod forward.
+    /// Dequantize a DSv4/GLM block-scaled FP8 E4M3 matrix to host f32. DSv4 ships
+    /// `<prefix>.scale` (F8_E8M0, 1 byte/block); GLM ships `<name>.weight_scale_inv`
+    /// (F32,
+    /// block [128,128]). The block scale multiplies.
     fn dequantize_dsv4_block_scaled_to_f32_host(
         &self,
         name: &str,
@@ -4900,8 +4777,8 @@ impl SafetensorLoader {
             weight.len(),
             rows * cols
         );
-        // Resolve the block scale: prefer GLM `weight_scale_inv` (F32), else the
-        // DSv4 `<prefix>.scale` (F8_E8M0).
+        // Prefer the GLM `weight_scale_inv` (F32) dialect, else DSv4 `<prefix>.scale`
+        // (E8M0).
         let base = name
             .strip_suffix(".weight")
             .ok_or_else(|| anyhow!("{name}: quantized tensor name must end with .weight"))?;
@@ -4920,7 +4797,8 @@ impl SafetensorLoader {
                     .chunks_exact(4)
                     .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                     .collect();
-                // Block dims inferred from the weight/scale shapes (GLM uses [128,128]).
+                // Block dims inferred from the weight/scale shapes (GLM uses
+                // [128,128]).
                 let block_m = rows.div_ceil(sr);
                 let block_k = cols.div_ceil(sc);
                 (vals, sr, sc, block_m, block_k)
@@ -4929,9 +4807,8 @@ impl SafetensorLoader {
                 let s = self.borrow_raw_tensor(&dsv4_scale)?;
                 ensure!(s.shape.len() == 2, "{dsv4_scale}: expected 2D scale");
                 let (sr, sc) = (s.shape[0], s.shape[1]);
-                // Same dtype policy as the main FP8 load path: E8M0 bytes or F32
-                // power-of-two, normalized to E8M0 (= biased exponent, bias 127)
-                // → scale = 2^(byte-127).
+                // E8M0 bytes or F32 power-of-two, normalized to E8M0 → scale =
+                // 2^(byte-127).
                 let e8m0 = Self::dsv4_block_scale_e8m0(&dsv4_scale, s.dtype, s.bytes())?;
                 let vals: Vec<f32> = e8m0.iter().map(|&b| 2.0f32.powi(b as i32 - 127)).collect();
                 let block_m = rows.div_ceil(sr);
@@ -4955,11 +4832,10 @@ impl SafetensorLoader {
         Ok(out)
     }
 
-    /// DeepGEMM repack of one decode projection weight, or `None`. Built only when
-    /// the decode-DeepGEMM alloc gate is on AND the weight is raw FP8 block-scaled
-    /// — the GLM dialect dequantizes to bf16, so the FP8 check alone excludes it
-    /// (no `!glm` needed). The single canonical builder for every per-projection
-    /// decode cache (wq_b, wo, compressor wkv/wgate, indexer weights_proj).
+    /// DeepGEMM repack of one decode projection weight, or `None`. Built only when the
+    /// decode-DeepGEMM alloc gate is on AND the weight is raw FP8 block-scaled — the
+    /// GLM
+    /// dialect dequantizes to bf16, so the FP8 check alone excludes it.
     fn decode_proj_cache(
         &self,
         ctx: &DeviceContext,
@@ -4976,9 +4852,10 @@ impl SafetensorLoader {
         }
     }
 
-    /// Load one compressor sub-block (`wkv`/`wgate`/`ape` matrices + `norm` vec).
-    /// GLM uses F32 `weight_scale_inv` scales, so its compressor projections are
-    /// dequantized to bf16. DSv4 keeps the original dtype-dispatching path.
+    /// Load one compressor sub-block (`wkv`/`wgate`/`ape` matrices + `norm` vec). GLM's
+    /// F32
+    /// `weight_scale_inv` scales mean its compressor projections are dequantized to
+    /// bf16.
     pub(crate) fn load_dsv4_compressor(
         &self,
         ctx: &DeviceContext,
@@ -5028,9 +4905,9 @@ impl SafetensorLoader {
         Ok(crate::dsv4::Dsv4Compressor {
             wkv_deepgemm: self.decode_proj_cache(ctx, &wkv)?,
             wgate_deepgemm: self.decode_proj_cache(ctx, &wgate)?,
-            // `ape` is read RAW as bf16 by the compressor kernel (not via the
-            // quant-aware `dsv4_linear` like wkv/wgate), so it must be dense
-            // bf16 — the dialect dequants FP8 in both GLM and DSv4 (#138).
+            // `ape` is read RAW as bf16 by the compressor kernel, not through
+            // `dsv4_linear`, so
+            // it must be dense bf16 (#138).
             ape: self.load_dsv4_block_scaled_dialect(ctx, &names.ape)?,
             fp32_probe,
             norm: self.load_dsv4_vec(ctx, &names.norm)?,
@@ -5055,8 +4932,6 @@ impl SafetensorLoader {
         } else {
             self.load_dsv4_global_matrix(ctx, &names.wq_b)?
         };
-        // The decode DeepGEMM cache is built only for the FP8 DSv4 wq_b; GLM's
-        // dequantized bf16 wq_b uses the scalar/dense path.
         let wq_b_deepgemm = self.decode_proj_cache(ctx, &wq_b)?;
         let weights_proj = self.load_dsv4_global_matrix(ctx, &names.weights_proj)?;
         let weights_proj_deepgemm = self.decode_proj_cache(ctx, &weights_proj)?;
@@ -5097,15 +4972,12 @@ impl SafetensorLoader {
         })
     }
 
-    /// Load a block-scaled FP8 matrix choosing the scale dialect by sibling:
-    /// GLM `<base>.weight_scale_inv` (F32) ⇒ dequantize to a dense bf16
-    /// [`DeviceMatrix`] (full F32 scale precision, no E8M0 lossy round-trip);
-    /// DSv4 `<base>.scale` (E8M0) ⇒ the existing FP8 block-scaled path. BF16/F32
-    /// on disk falls through to the dense loader.
-    ///
-    /// GPU-UNVERIFIABLE (pod): the dequant-to-bf16 choice for GLM (vs keeping FP8)
-    /// trades VRAM for correctness and must be re-checked against a pod forward —
-    /// the F32 block scale cannot ride the E8M0 `dsv4_scales` path losslessly.
+    /// Load a block-scaled FP8 matrix choosing the scale dialect by sibling: GLM
+    /// `<base>.weight_scale_inv` (F32) ⇒ dequantize to a dense bf16 [`DeviceMatrix`]
+    /// (the F32
+    /// block scale cannot ride the E8M0 path losslessly); DSv4 `<base>.scale` (E8M0) ⇒
+    /// the
+    /// FP8 block-scaled path. BF16/F32 on disk falls through to the dense loader.
     pub(crate) fn load_dsv4_block_scaled_dialect(
         &self,
         ctx: &DeviceContext,
@@ -5118,11 +4990,7 @@ impl SafetensorLoader {
         let base = name
             .strip_suffix(".weight")
             .ok_or_else(|| anyhow!("{name}: quantized tensor name must end with .weight"))?;
-        // Dequant when a block scale is present in EITHER dialect: GLM's F32
-        // `weight_scale_inv` or DSv4's E8M0 `<base>.scale`. `dequantize_..._host`
-        // handles both. (Before, DSv4 fell through to the quantized form whose
-        // `.data` is a 1-element dummy — fatal for a raw-bf16 reader like the
-        // compressor `ape`, #138.)
+        // Dequant when a block scale is present in EITHER dialect (#138).
         let has_scale = self
             .borrow_raw_tensor(&format!("{base}.weight_scale_inv"))
             .is_ok()
@@ -5189,11 +5057,11 @@ impl ExpertQuantDispatchSignature {
     }
 }
 
-/// Dequantize one FP8-block-scaled routed expert to dense BF16 in place, swapping
-/// its `DeviceMatrix` storage to `DenseBf16`. Mirrors `promote_lora_target_to_bf16`
-/// (qwen35.rs) but runs at load for the whole layer so the MoE forward sees one
-/// uniform BF16 kernel — the per-expert lazy promote can't apply to grouped MoE
-/// (the forward dispatches one kernel per layer and reads a static ptr table).
+/// Dequantize one FP8-block-scaled routed expert to dense BF16 in place. Runs at load
+/// for the
+/// whole layer because grouped MoE dispatches one kernel per layer off a static ptr
+/// table,
+/// so the per-expert lazy promote cannot apply.
 fn dequantize_fp8_expert_to_bf16_in_place(
     ctx: &DeviceContext,
     matrix: &mut DeviceMatrix,
@@ -5326,15 +5194,15 @@ fn routed_expert_weight_format(
     Ok((first, gate_sig, down_sig))
 }
 
-/// This EP rank's loaded MoE weights for one sparse layer: per-expert
-/// gate/up/down stacks + their weight-pointer tables, the router gate, and the
-/// shared expert. Built by [`SafetensorLoader::load_moe_layer_experts`],
-/// consumed by [`crate::moe::moe_forward`].
+/// This EP rank's loaded MoE weights for one sparse layer. Built by
+/// [`SafetensorLoader::load_moe_layer_experts`], consumed by
+/// [`crate::moe::moe_forward`].
 pub(crate) struct MoeLayerWeights {
-    /// Per-expert weight matrices (hand grouped-GEMM path). EMPTY when the
-    /// DeepGEMM grouped caches below are built (`--qwen35-deepgemm` at
-    /// load) — the grouped buffer then owns the only copy of the bytes and
-    /// the `*_ptrs` tables point into it, so the hand kernels stay runnable.
+    /// Per-expert weight matrices (hand grouped-GEMM path). EMPTY when the grouped
+    /// caches
+    /// below are built — the grouped buffer then owns the only copy of the bytes and
+    /// the
+    /// `*_ptrs` tables point into it, so the hand kernels stay runnable.
     pub(crate) gate: Vec<DeviceMatrix>,
     pub(crate) up: Vec<DeviceMatrix>,
     pub(crate) down: Vec<DeviceMatrix>,
@@ -5350,9 +5218,9 @@ pub(crate) struct MoeLayerWeights {
     pub(crate) gate_global_ptrs: Option<CudaSlice<u64>>,
     pub(crate) up_global_ptrs: Option<CudaSlice<u64>>,
     pub(crate) down_global_ptrs: Option<CudaSlice<u64>>,
-    /// DeepGEMM grouped-B caches (`[groups, n, k]` contiguous row-major BF16,
-    /// this rank's EP experts only). `Some` iff `--qwen35-deepgemm` at
-    /// load; the default load path is byte-identical (fields stay `None`).
+    /// DeepGEMM grouped-B caches (`[groups, n, k]` contiguous row-major BF16, this
+    /// rank's EP
+    /// experts only).
     pub(crate) gate_grouped: Option<MoeExpertGroup>,
     pub(crate) up_grouped: Option<MoeExpertGroup>,
     pub(crate) down_grouped: Option<MoeExpertGroup>,
@@ -5869,11 +5737,11 @@ impl MoeExpertGroup {
         ))
     }
 
-    /// Concatenate per-expert `[rows, cols]` matrices into one contiguous
-    /// group-major buffer (D2D). Weights are static after load; the source
-    /// matrices may be dropped afterwards **only after a stream sync** (event
-    /// tracking is disabled, so a Rust drop frees device memory immediately —
-    /// before the async copies may have run).
+    /// Concatenate per-expert `[rows, cols]` matrices into one contiguous group-major
+    /// buffer
+    /// (D2D). The source matrices may be dropped afterwards **only after a stream
+    /// sync** —
+    /// event tracking is disabled, so a Rust drop frees device memory immediately.
     fn concat(ctx: &DeviceContext, experts: &[DeviceMatrix]) -> Result<Self> {
         let first = experts
             .first()
@@ -5910,9 +5778,9 @@ impl MoeExpertGroup {
         })
     }
 
-    /// Device table of per-group base pointers (`data + g * rows * cols`) in
-    /// the same `*const u64` format as [`cuda_kernels::moe::build_expert_weight_ptr_table`],
-    /// so the hand grouped-GEMM kernels run unchanged on the grouped memory.
+    /// Device table of per-group base pointers in the same `*const u64` format as
+    /// [`cuda_kernels::moe::build_expert_weight_ptr_table`], so the hand kernels run
+    /// unchanged.
     fn ptr_table(&self, ctx: &DeviceContext) -> Result<CudaSlice<u64>> {
         let (base, _guard) = self.data.device_ptr(&ctx.stream);
         let stride_bytes = (self.rows * self.cols * std::mem::size_of::<half::bf16>()) as u64;
@@ -5935,11 +5803,11 @@ pub(crate) struct MoeFp8ExpertGroup {
     pub(crate) cols: usize,
     pub(crate) scale_rows: usize,
     pub(crate) scale_cols: usize,
-    /// SFB scale layout, decided once at load: `true` = N-contiguous per group
-    /// (transposed for the CUTLASS sm_120a collective), `false` = the
-    /// checkpoint's K-contiguous packing (Hopper DeepGEMM). The executor
-    /// dispatches on this field, never re-deriving the SM — so loader and
-    /// executor cannot silently disagree on the operand layout.
+    /// SFB scale layout, decided once at load: `true` = N-contiguous per group (CUTLASS
+    /// sm_120a), `false` = the checkpoint's K-contiguous packing (Hopper DeepGEMM). The
+    /// executor dispatches on this field and never re-derives the SM, so loader and
+    /// executor
+    /// cannot silently disagree on the operand layout.
     pub(crate) sfb_n_contiguous: bool,
 }
 
@@ -6175,12 +6043,11 @@ impl MoeFp8ExpertGroup {
         Ok(())
     }
 
-    /// Device weight+scale pointers for the `[num_rows, cols]` sub-matrix of
-    /// expert `group` starting at `row_offset` rows. For `--share-frozen-base`
-    /// MoE borrow: lets the train student alias a routed expert's FP8 gate/up/down
-    /// slice zero-copy. `row_offset` and `num_rows` must be 128-aligned (block grid).
-    /// Scale pointer carries the f32 element-size stride (mirrors `scale_ptr_table`).
-    /// Returns (weight_ptr, scale_ptr, rows, cols, block_m=128, block_k=128).
+    /// Device weight+scale pointers for the `[num_rows, cols]` sub-matrix of expert
+    /// `group`
+    /// starting at `row_offset` rows, letting a borrower alias an expert's FP8 slice
+    /// zero-copy. `row_offset` and `num_rows` must be 128-aligned (block grid). Returns
+    /// (weight_ptr, scale_ptr, rows, cols, block_m=128, block_k=128).
     pub(crate) fn expert_slice_fp8_ptrs(
         &self,
         ctx: &DeviceContext,

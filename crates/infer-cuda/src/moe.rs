@@ -1,42 +1,15 @@
 //! Single-GPU BF16 MoE forward — Qwen3.5/3.6 SparseMoeBlock (all experts local).
 //!
-//! ```text
-//!  router gemm  → logits[T, E]
-//!    → dsv4_route (DEVICE, zero bias)  → route_indices[T*topk], route_weights[T*topk]
-//!    → qwen36_renorm_topk_weights      → norm_topk_prob renorm (in-place)
-//!      [--qwen35-gpu-router false fallback: infer_moe::route (HOST) + flatten_routing
-//!       + ctx.sync + logits D2H + indices/weights H2D]
-//!    → dsv4_count_local_experts        → counts[E]
-//!    → dsv4_exclusive_scan_i32         → offsets[E]
-//!    → dsv4_pack_local_experts_with_slots
-//!                                      → packed_hidden[R,H], packed_route_slot[R],
-//!                                        packed_weight[R]   (R = T*topk)
-//!    → R ≤ 256: moe_bf16_grouped_gemm_swiglu_decode (fused gate+up+SwiGLU,
-//!               weight-read-bound decode kernels; --qwen35-moe-decode-kernel false
-//!               opts out) → moe_bf16_grouped_gemm_decode (down)
-//!      R > 256: moe_bf16_grouped_gemm_pair_batch (gate+up)
-//!               → silu_mul (unclamped SwiGLU — Qwen3.6 has no clamp)
-//!               → moe_bf16_grouped_gemm_batch (down)
-//!    → dsv4_scatter_all_route_slots    → route_out[R,H]   (weight·expert_out, by slot)
-//!    → dsv4_combine_route_slot_outputs → routed[T,H]      (sum over topk)
-//!    → shared expert dense SwiGLU + qwen36_add_shared_expert_gated
-//! ```
-//!
-//! Routing runs on DEVICE by default (`dsv4_route` with a zero selection bias is
-//! exactly greedy top-k; audit lane MOE-OK-3 established host/device semantic
-//! identity for Qwen3.6). The Qwen host `infer_moe::route` path stays as the
-//! `--qwen35-gpu-router false` fallback for the pod A/B license — it costs a
-//! full-stream `ctx.sync` + logits D2H + 2×H2D per layer per step. DSv4 uses the
-//! same device route kernel unconditionally.
-//! W4/4-bit is a separate follow-up: the two `moe_bf16_grouped_gemm_*` call sites
-//! are the swap points; everything else is dtype-agnostic on BF16 activations.
+//! Routing runs on DEVICE: `dsv4_route` with a zero selection bias is exactly
+//! greedy top-k. `--qwen35-gpu-router false` selects the host `infer_moe::route`
+//! reference, which costs a full-stream `ctx.sync` + logits D2H + 2×H2D per layer
+//! per step. DSv4 uses the device route kernel unconditionally.
 
 use infer_moe::RoutingDecision;
 
-/// Flatten per-token [`RoutingDecision`]s into the token-major flat buffers the
-/// `dsv4_*` kernels read at `route = token * topk + k`: `route_indices` (expert
-/// id), `route_weights` (gate weight), each length `num_tokens * topk`. Each
-/// decision must carry exactly `topk` experts; selection order is preserved.
+/// Flatten per-token routing into the token-major flat buffers the `dsv4_*`
+/// kernels read at `route = token * topk + k`, each of length `num_tokens *
+/// topk`. Each decision must carry exactly `topk` experts; order is preserved.
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 pub(crate) fn flatten_routing(
     decisions: &[RoutingDecision],
@@ -63,44 +36,33 @@ pub(crate) fn flatten_routing(
     Ok((indices, weights))
 }
 
-/// DeepGEMM m-grouped-contiguous row alignment on SM90 (the upstream
-/// `get_mk_alignment_for_contiguous_layout()`): the kernel resolves the B-side
-/// expert group ONCE per BLOCK_M output tile from `m_indices[tile_start]`
-/// (vendor `deep_gemm/scheduler/gemm.cuh::get_global_idx`), and BLOCK_M for
-/// the contiguous layout is pinned to 128 upstream — so every expert group's
-/// row segment must start at a multiple of 128, with `-1` on every pad row.
+/// DeepGEMM m-grouped-contiguous row alignment on SM90: the kernel resolves the
+/// B-side expert group ONCE per BLOCK_M output tile from `m_indices[tile_start]`
+/// and BLOCK_M is pinned to 128 upstream — so every group's row segment must
+/// start at a multiple of 128, with `-1` on every pad row.
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 pub(crate) const DEEPGEMM_CONTIG_ALIGN: usize = 128;
 
 /// DSv4 decode-band per-group row alignment. 64 is the smallest legal value:
-/// the SM90 warpgroup MMA grants only block_m ∈ {64, 128}, and the native
-/// bridge caps its block_m candidates at the alignment the caller packed with
-/// (`mk_align`), so 64-aligned groups + block_m=64 tiles satisfy the same
-/// per-tile single-group contract at half the pad rows. At decode shapes
-/// (R = topk·B ≤ 128 routes) the row-linear kernels (pack/swiglu/scatter)
-/// dominate the grouped-lane cost, so halving pad rows halves them
-/// (2026-06-12 nsys: 128-alignment inflated the lane 149× vs the pre-ba1dd607
-/// compact-but-contract-violating packing, −23% e2e B=1).
+/// the SM90 warpgroup MMA grants only block_m ∈ {64, 128}, and the native bridge
+/// caps block_m at the alignment the caller packed with. At decode shapes
+/// (R = topk·B ≤ 128) the row-linear kernels dominate, so halving pad rows halves
+/// them (128-alignment inflated the lane 149×, −23% e2e B=1).
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 pub(crate) const DSV4_DECODE_CONTIG_ALIGN: usize = 64;
 
 /// Routed-row ceiling for the 64-aligned decode band: `topk(8) × B_max(16)`.
-/// Above it (prefill chunks), the GEMM tail dominates and block_m=128
-/// configs win — use [`DEEPGEMM_CONTIG_ALIGN`].
+/// Above it the GEMM tail dominates and block_m=128 wins — use
+/// [`DEEPGEMM_CONTIG_ALIGN`].
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 pub(crate) const DSV4_DECODE_CONTIG_MAX_ROUTES: usize = 128;
 
 /// Host upper bound on the `align`-aligned packed row count for the DeepGEMM
-/// contiguous grouped layout. The true total `Σ_g align(count_g, a)` is
-/// device-resident (counts come from the on-device router), and the GEMM's
-/// `m` / the TMA descriptors are host values — so the launch uses this cap
+/// contiguous grouped layout. The true total is device-resident while the GEMM's
+/// `m` and the TMA descriptors are host values, so the launch uses this cap
 /// instead of a per-layer D2H sync:
-///
-/// `Σ_g align(c_g, a) ≤ R + (a−1)·G_active ≤ align(R, a) + a·min(R, G)`
-///
-/// (G_active ≤ min(R, G) since every active group has ≥ 1 route). Tiles past
-/// the true aligned total carry `m_indices = -1` and compute excluded garbage.
-/// Always a multiple of `align`.
+/// `Σ_g align(c_g, a) ≤ align(R, a) + a·min(R, G)`. Tiles past the true aligned
+/// total carry `m_indices = -1`. Always a multiple of `align`.
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 pub(crate) fn deepgemm_contig_rows_cap(
     total_routes: usize,
@@ -112,83 +74,46 @@ pub(crate) fn deepgemm_contig_rows_cap(
 
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 /// Routed-row floor below which the DeepGEMM grouped path loses to the hand
-/// CUDA-core kernels (pod A/B 2026-06-11: decode R=8 hand wins +8%, prefill
-/// R=16384 DeepGEMM wins -33% needle wall; 1024 = 128-token chunk x top-8
-/// keeps both measured regimes on their winning side).
-///
-/// The DEFAULT — the live value is `--qwen35-deepgemm-min-routes`, so the
-/// mid-band the A/B never covered (batched decode is `R = top_k * B`, so
-/// R=128 at c=16) is reachable without a rebuild.
+/// CUDA-core kernels (decode R=8 hand +8%, prefill R=16384 DeepGEMM -33% needle
+/// wall; 1024 = 128-token chunk x top-8). The live value is
+/// `--qwen35-deepgemm-min-routes`.
 pub(crate) const QWEN35_DEEPGEMM_MIN_ROUTES: usize = 1024;
 
 /// Routed-row ceiling for the decode-specialized weight-read-bound grouped
-/// kernels (`moe_bf16_grouped_gemm_{swiglu_,}decode`).
+/// kernels: `256 = top_k(8) × B_max(32)`, the batched-decode envelope where each
+/// expert receives ≤ B rows so weight traffic dominates (the batch kernels burn
+/// 487 µs/layer at R=8 on scalar 2B loads, ≈3% of HBM bandwidth, vs a 25-60
+/// µs/layer target).
 ///
-/// Formula: `256 = top_k(8) × B_max(32)` — the batched-decode envelope. The
-/// decode band is exactly `R = top_k · B` (stage-1 batched decode steps;
-/// B=1 single decode is R=8), where each expert receives ≤ B rows (one route
-/// per token per expert), so:
-/// * `B ≤ ACT_TILE(8)`: every touched weight row is read EXACTLY once
-///   (nsys 2026-06-11 root cause: the batch kernels burn 487 µs/layer at R=8
-///   on scalar 2B loads + zero M-reuse ≈ 3% of HBM bandwidth; ideal bytes
-///   `E_active × (gate[512,2048] + up[512,2048] + down[2048,512]) × 2B =
-///   E_active × 6.29 MB` → 50.3 MB at E_active=8 → 12.6 µs at 4 TB/s,
-///   realistic 25-60 µs/layer target).
-/// * `8 < B ≤ 32`: ≤ `ceil(32/8) = 4` weight passes with ≥8-way activation
-///   reuse per pass — still weight-traffic-dominated.
-/// * `R > 256`: only prefill remainder chunks land here (full 128-token
-///   chunks go DeepGEMM at `R ≥ 1024`). The batch kernels' 32-row M-tile
-///   reads weights `ceil(c/32)` times vs the decode kernels' `ceil(c/8)` —
-///   up to 4× less traffic — and the regime is unmeasured, so the batch
-///   kernels keep it (status quo; folding the mid-band is a follow-up pod
-///   A/B, not a default flip).
-///
-/// Must stay `< QWEN35_DEEPGEMM_MIN_ROUTES` so the decode band never
-/// shadows the licensed DeepGEMM prefill dispatch.
+/// Must stay `< QWEN35_DEEPGEMM_MIN_ROUTES` so the decode band never shadows the
+/// DeepGEMM prefill dispatch.
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 pub(crate) const QWEN35_MOE_DECODE_MAX_ROUTES: usize = 256;
 
-/// `--qwen35-deepgemm` (default on): swap the Qwen3.5/3.6 hand CUDA-core grouped
-/// expert GEMMs (~3.9 TFLOP/s class) for DeepGEMM SM90 BF16 m-grouped GEMMs
-/// (vendored official kernels, JIT-compiled through the torch-free native
-/// bridge; default-on for sm_90 builds with vendored DeepGEMM present, with
-/// runtime preflight failing loud otherwise).
-///
-/// Default ON (licensed 2026-06-11 pod A/B, warm JIT cache, n=3 each):
-/// hybrid dispatch keeps decode on the hand kernels (40.86 vs 40.46 tok/s,
-/// neutral) and puts prefill on DeepGEMM tensor cores — needle 3k wall
-/// 9.10 -> 2.32 s (-74.5%); smoke x3 consistent + needle PASS both arms.
-/// First-ever run on a box pays the DeepGEMM JIT compile into
-/// `~/.deep_gemm` (~3.7 s across needle shapes, once per cache lifetime).
-/// `--qwen35-deepgemm false` restores the hand-kernel-only path. Read at
-/// LOAD time as well: the loader builds the contiguous grouped-B weight
-/// caches (and drops the per-expert copies) only when enabled, so flipping
-/// requires a process restart. Native DeepGEMM is default-on when buildable;
-/// `false` is the operator's escape hatch.
+/// `--qwen35-deepgemm` (default on): DeepGEMM SM90 BF16 m-grouped GEMMs for the
+/// expert GEMMs — decode neutral (40.86 vs 40.46 tok/s), prefill needle 3k wall
+/// 9.10 -> 2.32 s (-74.5%). Also read at LOAD time: the loader builds the
+/// contiguous grouped-B caches only when enabled, so flipping it requires a
+/// process restart.
 #[cfg(feature = "cuda")]
 pub(crate) fn qwen35_deepgemm_enabled() -> bool {
     crate::runtime_flags::qwen35_deepgemm()
 }
 
-/// `--qwen35-moe-decode-kernel false`: run the original hand batch grouped
-/// kernels at every routed-row count below the DeepGEMM floor — the
-/// same-binary A/B arm for the pod license of the decode-band
-/// weight-read-bound kernels. Default ON. Read per call (per layer per
-/// step), mirroring [`qwen35_deepgemm_enabled`]; inside a captured decode
-/// graph the value read at capture time is what replays.
+/// `--qwen35-moe-decode-kernel` (default on): the decode-band weight-read-bound
+/// grouped kernels; `false` runs the hand batch kernels at every routed-row count
+/// below the DeepGEMM floor. Read per call — inside a captured decode graph the
+/// value read at capture time is what replays.
 #[cfg(feature = "cuda")]
 pub(crate) fn qwen35_moe_decode_kernel_enabled() -> bool {
     crate::runtime_flags::qwen35_moe_decode_kernel()
 }
 
-/// Allocate an i32 buffer pre-filled with `-1` ON DEVICE (memset 0xFF).
+/// Allocate an i32 buffer pre-filled with `-1` ON DEVICE (memset 0xFF) — the
+/// "route slot not packed on this rank" sentinel.
 ///
-/// A `clone_htod(&vec![-1; n])` here would record a CUDA-graph memcpy node
-/// whose HOST source dies with this call — replay reads freed memory (the
-/// same hazard class as the topk_length IMA, 2026-06-10). Device memset is
-/// capture-safe and cheaper. Shared by the BF16 (`gpu`) and DSv4 FP8
-/// (`dsv4_gpu`) forwards — both use `-1` as the "route slot not packed on this
-/// rank" sentinel.
+/// A `clone_htod(&vec![-1; n])` would record a CUDA-graph memcpy node whose HOST
+/// source dies with this call, so replay reads freed memory.
 #[cfg(feature = "cuda")]
 fn alloc_neg1_i32(
     ctx: &cuda_kernels::prelude::DeviceContext,
@@ -236,8 +161,7 @@ mod gpu {
     /// DeepGEMM masked per-group band capacity (rows). Must be a multiple of
     /// 128: the masked GEMM's TMA store writes full BLOCK_M (64/128) output
     /// tiles, so a smaller band would let a tile cross into the next group's
-    /// band. The masked layout is host-shape-fixed (`[G, 128, K]` regardless
-    /// of routing), which also makes it the CUDA-graph-safe variant.
+    /// band. Host-shape-fixed (`[G, 128, K]`), hence CUDA-graph-safe.
     const DEEPGEMM_MASKED_BAND: usize = 128;
 
     fn qwen_moe_profile_enabled() -> bool {
@@ -276,61 +200,16 @@ mod gpu {
         result
     }
 
-    /// Persistent device scratch for [`moe_forward_into`] — one slot per
-    /// per-call buffer the old path allocated fresh (~10 device allocations per
-    /// MoE layer per step). Exact-shape reuse: decode (`R = topk`) hits the
-    /// cache every step; prefill re-allocates only when the chunk shape
-    /// changes. (audit MOE-P3-1)
+    /// Persistent device scratch for [`moe_forward_into`], exact-shape reuse:
+    /// decode (`R = topk`) hits the cache every step, prefill re-allocates only
+    /// when the chunk shape changes.
     ///
-    /// Write-before-read proof per slot (kernels verified in
-    /// `csrc/moe/dsv4_route.cu`, `csrc/gemm/moe_grouped_gemm.cu`,
-    /// `csrc/gemm/gemv.cu`, `csrc/misc/elementwise_basic.cu`):
-    ///
-    /// | slot              | shape       | init on reuse | proof |
-    /// |-------------------|-------------|---------------|-------|
-    /// | `logits`          | `[E, T]`    | none          | router `gemm_cuda` is beta=0, writes all `E*T` |
-    /// | `route_indices`   | `[R]` i32   | none / H2D    | device route: `dsv4_route` phase 3 writes all `topk` slots per token unconditionally; host fallback: H2D overwrite every call |
-    /// | `route_weights`   | `[R]` f32   | none / H2D    | same as `route_indices` (renorm kernel is in-place over freshly written slots) |
-    /// | `router_bias_zero`| `[E]` bf16  | `upload_const`| pure function of length (all-zero greedy selection bias), uploaded once |
-    /// | `counts`          | `[E_l]` i32 | memset 0      | REQUIRED: count kernel `atomicAdd`s |
-    /// | `offsets`         | `[E_l]` i32 | none          | exclusive scan writes all `tid < n` |
-    /// | `scan_total`      | `[1]` i32   | none          | scan writes it before any read |
-    /// | `packed_hidden`   | `[H, R]`    | none          | single-GPU: pack writes every slot row (offsets+cursors partition `[0,R)`); EP: tail rows unwritten but only read by the grouped GEMMs WITHIN `offsets/counts` |
-    /// | `packed_route_slot`| `[R]` i32  | memset -1 (EP only) | single-GPU: pack writes all `R` slots; EP: sentinel REQUIRED (scatter skips `< 0`; stale/zero tail would alias slot 0) |
-    /// | `packed_weight`   | `[R]` f32   | none          | scatter reads `packed_weight[r]` only where `packed_route_slot[r] >= 0`, which pack wrote |
-    /// | `cursors`         | `[E_l]` i32 | memset 0      | REQUIRED: pack kernel `atomicAdd`s slot cursors |
-    /// | `expert_indices`  | `[E_l]` i32 | none          | identity table, pure function of length (`upload_const`) |
-    /// | `gate_out`/`up_out`| `[I, R]`   | none          | batch path only (`R > QWEN35_MOE_DECODE_MAX_ROUTES` or decode kernels opted out): grouped GEMM writes rows within `counts`; `silu_mul` READS the (EP) tail but its outputs there land in the `act` tail, which nothing reads (down-GEMM reads `act` within `counts` only) — final bytes unchanged. Decode-kernel path never allocates/touches these slots |
-    /// | `act`             | `[I, R]`    | none          | batch path: `silu_mul` writes all `I*R`. Decode path: the fused swiglu kernel writes rows within `offsets/counts` only; the (EP) tail keeps stale rows, read by nothing (the down decode GEMM also reads strictly within `offsets/counts`) |
-    /// | `expert_out`      | `[H, R]`    | none          | down grouped GEMM (batch or decode) writes within `counts`; scatter reads only packed slots |
-    /// | `route_out`       | `[H, R]`    | memset 0 (EP only) | single-GPU: scatter writes ALL `R` slots (route↔slot bijection) then combine reads all; EP: zero-init LOAD-BEARING (combine sums non-local slots as 0 into the partial) |
-    /// | `shared_gate`/`shared_up`| `[S_i, T]` | none    | dense `gemm_cuda` beta=0 |
-    /// | `shared_act`      | `[S_i, T]`  | none          | `silu_mul` writes all |
-    /// | `shared_out`      | `[H, T]`    | none          | dense `gemm_cuda` beta=0 |
-    /// | `gate_logit`      | `[1, T]`    | none          | dense `gemm_cuda` beta=0 |
-    ///
-    /// The caller-provided `out` (`[H, T]`) needs no init: the combine kernel
-    /// writes every element before `qwen36_add_shared_expert_gated` RMWs it.
-    ///
-    /// DeepGEMM path (`--qwen35-deepgemm`) — extra slots + reused slots
-    /// at PADDED shapes (`rows_p` = `G·128` masked band / `contig_rows_cap`):
-    ///
-    /// | slot                 | shape        | init on reuse | proof |
-    /// |----------------------|--------------|---------------|-------|
-    /// | `dg_band_offsets`    | `[E_l]` i32  | `upload_const`| pure function of length (`g * 128` band bases) |
-    /// | `dg_aligned_offsets` | `[E_l]` i32  | none          | aligned scan writes all `tid < n` |
-    /// | `dg_m_indices`       | `[rows_p]`   | memset -1     | REQUIRED: fill kernel writes only `count_g` rows per group; every pad row must read -1 (contiguous-GEMM group resolution + garbage marker) |
-    /// | `packed_route_slot`  | `[rows_p]`   | memset -1     | REQUIRED even single-GPU (unlike the hand path): pack writes only the `R` real rows; pad rows must read -1 so the scatter skips them |
-    /// | `packed_hidden`      | `[H, rows_p]`| none          | pack writes the `R` real rows; PAD rows: zero from the slot's `alloc_zeros`, or stale rows from a previous call — both safe by induction: a pad A-row only feeds the matching pad D-row (GEMM rows are independent), every pad D-row has `packed_route_slot = -1` so the scatter never reads it, and every stale value traces back to a finite prior GEMM output or the zero init (never uninitialized memory) |
-    /// | `packed_weight`      | `[rows_p]`   | none          | scatter reads it only where `packed_route_slot >= 0`, which pack wrote |
-    /// | `gate_out`/`up_out`  | `[I, rows_p]`| none          | masked/contiguous GEMM writes rows within its tile coverage; rows outside coverage are read only by `silu_mul`, whose outputs land in the matching `act` pad rows (down-GEMM tile coverage is identical, scatter skips pads) |
-    /// | `act`                | `[I, rows_p]`| none          | `silu_mul` writes all elements |
-    /// | `expert_out`         | `[H, rows_p]`| none          | GEMM writes within tile coverage; scatter reads only `packed_route_slot >= 0` rows, all within coverage |
-    /// | `dg_input_fp8`        | `[rows_p,H]` u8 | none       | FP8 DeepGEMM path only: pack-quantize overwrites every row/block consumed by the contiguous GEMM; pad rows may contain stale quantized values but remain paired with `packed_route_slot=-1` |
-    /// | `dg_input_scales`     | `[ceil(rows_p/4), H/128]` f32 | none | pack-quantize writes the scale block rows consumed by the contiguous GEMM |
-    /// | `dg_act_fp8`          | `[rows_p,I]` u8 | none       | SwiGLU+requant writes all rows consumed by the down GEMM |
-    /// | `dg_act_scales`       | `[ceil(rows_p/4), I/128]` f32 | none | SwiGLU+requant writes the scale block rows consumed by the down GEMM |
-    /// | `dg_active_*`         | `[1]` i32    | upload       | single flat active span for Qwen FP8 contiguous packing; `active_counts` is uploaded every call because `rows_p` changes |
+    /// Only slots their writer does not fully overwrite need per-call init:
+    /// `counts`/`cursors` → 0 (atomicAdd accumulators); under EP additionally
+    /// `packed_route_slot` → -1 (the scatter skips `< 0`; a stale tail would alias
+    /// a live slot) and `route_out` → 0 (the combine sums non-local slots as 0
+    /// into the partial). The DeepGEMM path also needs `dg_m_indices` → -1 and
+    /// `packed_route_slot` → -1 even single-GPU, since pad rows stay unwritten.
     #[derive(Default)]
     pub(crate) struct MoeForwardScratch {
         logits: HiddenSlot,
@@ -372,7 +251,6 @@ mod gpu {
             Self::default()
         }
 
-        /// Drop every cached buffer (frees the VRAM; OPD weight time-share).
         pub(crate) fn release(&mut self) {
             let Self {
                 logits,
@@ -443,39 +321,23 @@ mod gpu {
         }
     }
 
-    /// Default ON: route fully on-device (no per-layer logits D2H +
-    /// `ctx.sync()` full-stream drain). Opt out with
-    /// `--qwen35-gpu-router false` to run the verified
-    /// `infer_moe::route` host reference — the pod A/B license lever. DSv4
-    /// routing is device-only.
     fn use_gpu_router() -> bool {
         crate::runtime_flags::qwen35_gpu_router()
     }
 
-    /// Whether this routing config can run on the DEVICE route kernel (greedy
-    /// top-k, no group-limited masking). Shared by the per-layer dispatch in
-    /// [`moe_forward_into`] and the decode-graph gate below.
     fn device_route_eligible(cfg: &MoeConfig) -> bool {
         cfg.topk_method == TopkMethod::Greedy && cfg.n_group.is_none() && cfg.topk_group.is_none()
     }
 
-    /// Decode-graph gate: TRUE iff a `seq_len == 1` MoE step through
-    /// [`moe_forward_into`] is a pure device-kernel sequence (CUDA-graph
-    /// capturable) for `cfg` — i.e. it takes the device router (no per-layer
-    /// `ctx.sync` + logits D2H + indices/weights H2D of the host fallback) AND
-    /// the decode routed-row count stays under the DeepGEMM hybrid-dispatch
-    /// floor so the shape-constant hand grouped kernels run (DeepGEMM JIT is
-    /// not capture-safe and never fires at decode: `R = top_k <
-    /// QWEN35_DEEPGEMM_MIN_ROUTES`).
+    /// Decode-graph gate: TRUE iff a `seq_len == 1` MoE step is a pure
+    /// device-kernel sequence — the device router (no host sync + D2H) and
+    /// `R = top_k` below the DeepGEMM floor, whose JIT is not capture-safe.
     pub(crate) fn qwen35_decode_moe_graph_capturable(cfg: &MoeConfig) -> bool {
         use_gpu_router() && device_route_eligible(cfg) && cfg.top_k < QWEN35_DEEPGEMM_MIN_ROUTES
     }
 
-    /// BF16 MoE forward for one sparse layer (allocate-per-call compatibility
-    /// wrapper): builds a transient [`MoeForwardScratch`] + output buffer and
-    /// delegates to [`moe_forward_into`]. Same allocation behavior as the
-    /// pre-scratch path; the Qwen3.5/3.6 hot loop passes a persistent scratch
-    /// through [`moe_forward_into`] instead.
+    /// Allocate-per-call wrapper around [`moe_forward_into`]; the hot loop passes
+    /// a persistent scratch instead.
     pub(crate) fn moe_forward(
         ctx: &DeviceContext,
         weights: &MoeLayerWeights,
@@ -490,17 +352,12 @@ mod gpu {
     }
 
     /// BF16 MoE forward for one sparse layer. `normed` is the post-LN hidden
-    /// `[num_tokens, hidden]`; writes the block output (routed + sigmoid-gated
-    /// shared expert) into `out` (`[hidden, num_tokens]`, fully overwritten).
+    /// `[num_tokens, hidden]`; the block output (routed + sigmoid-gated shared
+    /// expert) fully overwrites `out` (`[hidden, num_tokens]`).
     ///
-    /// `split` is this rank's EP expert ownership. Routing runs over ALL
-    /// `cfg.num_experts` (router gate replicated; activations identical across
-    /// ranks because every row-parallel output was all-reduced upstream), but
-    /// only routes landing on `split`'s local experts contribute — so under
-    /// `ep_size > 1` the output buffer is a PARTIAL sum (routed locals +
-    /// column/row-sharded shared expert) and the caller must `all_reduce_sum`
-    /// it once before the residual add. `ExpertSplit::single` is the unchanged
-    /// single-GPU path (every expert local, nothing to reduce).
+    /// Routing runs over ALL `cfg.num_experts`, but only routes landing on
+    /// `split`'s local experts contribute — under `ep_size > 1` `out` is a
+    /// PARTIAL sum the caller must `all_reduce_sum` before the residual add.
     pub(crate) fn moe_forward_into(
         ctx: &DeviceContext,
         weights: &MoeLayerWeights,
@@ -528,24 +385,16 @@ mod gpu {
             hidden_dim,
             num_experts
         );
-        // DeepGEMM expert path: grouped-B caches present (built at load when
-        // `--qwen35-deepgemm`) and the flag still set. HYBRID
-        // dispatch by routed-row count (pod A/B 2026-06-11, same binary,
-        // n=3): at decode R=8 the masked grouped path loses to the hand
-        // CUDA-core kernels (37.5 vs 40.8 tok/s, JIT/TMA fixed overhead on
-        // tiny bands), while at prefill R=16384 the contiguous tensor-core
-        // path wins big (needle 3k wall 9.07 -> 6.10 s). The crossover
-        // between the measured endpoints is uncharacterized; 1024 routed
-        // rows (= 128-token chunk x top-8) keeps every measured regime on
-        // its winning side and only remainder chunks land in between.
+        // Hybrid dispatch by routed-row count: at decode R=8 the masked grouped
+        // path loses to the hand CUDA-core kernels (37.5 vs 40.8 tok/s, fixed
+        // JIT/TMA overhead on tiny bands), at prefill R=16384 the contiguous
+        // tensor-core path wins (needle 3k wall 9.07 -> 6.10 s).
         let has_deepgemm_grouped = weights.gate_grouped.is_some()
             || (weights.w13_fp8_grouped.is_some() && weights.down_fp8_grouped.is_some());
         // FP8 experts only have the CONTIGUOUS DeepGEMM layout; the masked band
-        // (`R <= DEEPGEMM_MASKED_BAND`) is BF16-only and errors out mid-step. The
-        // routed-row floor is a tunable, so this must gate rather than assert —
-        // a lowered floor falls back to the hand kernels instead of killing the
-        // engine (measured 2026-07-28: `--qwen35-deepgemm-min-routes 64` at c=16
-        // is R=128, exactly the masked band).
+        // is BF16-only and errors out mid-step. The routed-row floor is tunable,
+        // so gate rather than assert — a lowered floor must fall back to the hand
+        // kernels instead of killing the engine.
         let fp8_masked_unsupported = weights.expert_weight_format == WeightFormat::Fp8BlockScaled
             && num_tokens * topk <= DEEPGEMM_MASKED_BAND;
         let use_deepgemm = qwen35_deepgemm_enabled()
@@ -553,9 +402,8 @@ mod gpu {
             && !fp8_masked_unsupported
             && num_tokens * topk >= crate::runtime_flags::qwen35_deepgemm_min_routes();
         if !use_deepgemm {
-            // Grouped-mode loads cleared the per-expert Vecs (the hand
-            // kernels run through the rebuilt ptr tables into the grouped
-            // buffer). Accept either weight form here.
+            // Grouped-mode loads cleared the per-expert Vecs (the hand kernels
+            // run through the rebuilt ptr tables), so accept either weight form.
             ensure!(
                 has_deepgemm_grouped
                     || (weights.gate.len() == local_experts
@@ -577,28 +425,16 @@ mod gpu {
             out.seq_len
         );
 
-        // Router gemm → logits[T, E] (token-major).
         let logits = scratch.logits.get(ctx, num_experts, num_tokens)?;
         gemm_batch(ctx, &weights.router_gate, normed, logits)?;
 
-        // Route: DEVICE kernel (default) or host reference fallback.
         let total_routes = num_tokens * topk;
-        // The device kernel implements greedy top-k (zero selection bias) with
-        // no group-limited masking; any other routing config falls back to the
-        // host reference rather than silently mis-routing.
         let (route_indices, route_weights) = if use_gpu_router() && device_route_eligible(cfg) {
-            // `dsv4_route` with routing_kind=1 (learned-bias selection key) and
-            // an all-zero bias IS greedy top-k: key = scores + 0.0 exactly
-            // (softmax scores are >= +0.0, so `x + 0.0f == x` bitwise).
-            // scoring_kind=0 (softmax) pins the weight denom at 1.0 — raw
-            // softmax probs — and the Qwen3.6 `norm_topk_prob` renorm is the
-            // separate `qwen36_renorm_topk_weights` launch, mirroring
-            // `infer_moe::route`'s separate step 5 (same 1e-20 zero guard,
-            // same serial sum order). Audit lane MOE-OK-3 (2026-06-11)
-            // established host/device semantic identity for Qwen3.6: stable
-            // softmax over all experts, greedy top-k ties-to-lower-index,
-            // renorm to sum 1, scaling 1.0. The bias table is a pure function
-            // of its length (all zeros), so `upload_const` uploads once.
+            // `dsv4_route` with routing_kind=1 and an all-zero bias IS greedy
+            // top-k: key = scores + 0.0 exactly (softmax scores are >= +0.0, so
+            // `x + 0.0f == x` bitwise). The `norm_topk_prob` renorm is the
+            // separate launch below. The bias table is a pure function of its
+            // length, so `upload_const` uploads once.
             let bias_zero_host = vec![bf16::ZERO; num_experts];
             let bias_zero = scratch
                 .router_bias_zero
@@ -627,9 +463,7 @@ mod gpu {
                     cfg.routed_scaling_factor,
                     ctx.stream.cu_stream(),
                 )?;
-                // Host-route gate equivalent: norm_topk_prob ∧ Greedy ∧
-                // softmax (non-softmax scoring already normalizes inside the
-                // route kernel; Greedy is guaranteed by the eligibility gate).
+                // Non-softmax scoring already normalizes inside the route kernel.
                 if cfg.norm_topk_prob && cfg.scoring_func == ScoringFunc::Softmax {
                     moe::qwen36_renorm_topk_weights(
                         cache_ptr(route_weights, ctx),
@@ -641,9 +475,7 @@ mod gpu {
             }
             (&*route_indices, &*route_weights)
         } else {
-            // HOST route (verified infer_moe reference,
-            // `--qwen35-gpu-router false` or a non-greedy/grouped config).
-            // Sync so the gemm has landed before the D2H read.
+            // Sync so the router gemm has landed before the D2H read.
             ctx.sync()?;
             let logits_bf16: Vec<bf16> = ctx
                 .stream
@@ -663,14 +495,11 @@ mod gpu {
             (route_indices, route_weights)
         };
 
-        // Raw-ptr conversions end the `route_indices`/`route_weights` scratch
-        // field borrows so the downstream tails (fused / DeepGEMM) can take
-        // `&mut scratch`; the buffers themselves persist in the scratch.
+        // Raw-ptr conversion ends the scratch field borrows so the downstream
+        // tails can take `&mut scratch`; the buffers persist in the scratch.
         let route_indices_ptr = cache_ptr(route_indices, ctx);
         let route_weights_ptr = cache_ptr(route_weights, ctx);
 
-        // Per-expert route counts (LOCAL experts only).
-        // Kernels write these through raw device pointers, so no Rust `mut`.
         // counts MUST be zeroed every call (atomicAdd accumulator).
         let counts_ptr = cache_ptr(scratch.counts.get_zeroed(ctx, local_experts)?, ctx);
         // SAFETY: all buffers are valid on ctx.stream for the given shapes.
@@ -687,8 +516,6 @@ mod gpu {
         }
 
         if use_deepgemm {
-            // DeepGEMM: aligned/banded pack → SM90 BF16 m-grouped
-            // GEMMs → scatter/combine. Fills `out` exactly like the scatter/combine stage.
             deepgemm_routed_tail(
                 ctx,
                 weights,
@@ -704,8 +531,6 @@ mod gpu {
             return add_shared_expert_gated(ctx, weights, normed, scratch, out);
         }
 
-        // Group offsets for the hand path (compact exclusive scan).
-        // offsets and scan_total are fully written by the scan before any read.
         let offsets = scratch.offsets.get(ctx, local_experts)?;
         let scan_total = scratch.scan_total.get(ctx, 1)?;
         // SAFETY: counts/offsets/scan_total valid on ctx.stream.
@@ -719,16 +544,10 @@ mod gpu {
             )?;
         }
 
-        // Pack routed tokens grouped-by-expert (with route slots).
-        // Single-GPU packs every one of the `total_routes` slots exactly once
-        // (offsets + cursors partition `[0, R)`), so the reused buffers need no
-        // re-init. Under EP only routes hitting LOCAL experts get packed, so
-        // the tail of `packed_route_slot` past this rank's route count would
-        // keep a STALE slot id on reuse. The scatter kernel skips
-        // `route_slot < 0` — a stale/zero tail would alias a live route slot
-        // and race its legitimate write — so EP re-fills the -1 sentinel every
-        // call (same memset the old per-call `alloc_neg1_i32` did).
-        // cursors MUST be zeroed every call (atomicAdd slot allocator).
+        // Under EP only routes hitting LOCAL experts get packed, so the tail of
+        // `packed_route_slot` keeps a STALE slot id on reuse; the scatter skips
+        // `< 0`, so EP re-fills the -1 sentinel every call. cursors MUST be
+        // zeroed every call (atomicAdd slot allocator).
         let packed_hidden = scratch.packed_hidden.get(ctx, hidden_dim, total_routes)?;
         let packed_route_slot = if split.ep_size == 1 {
             scratch.packed_route_slot.get(ctx, total_routes.max(1))?
@@ -759,19 +578,16 @@ mod gpu {
             )?;
         }
 
-        // Identity compact→local remap: the weight-pointer tables hold ONLY this
-        // rank's experts (loader walks `split`'s range), so group g indexes table
-        // entry g (explicit table keeps the RawDevicePtr contract — no null hack).
-        // The table is a pure function of `local_experts`, so a length-matched
-        // reuse skips the per-call H2D copy entirely.
+        // The weight-pointer tables hold ONLY this rank's experts, so group g
+        // indexes table entry g. Pure function of `local_experts`, so a
+        // length-matched reuse skips the H2D.
         let expert_index_table: Vec<i32> = (0..local_experts as i32).collect();
         let expert_indices = scratch
             .expert_indices
             .upload_const(ctx, &expert_index_table)?;
 
-        // Shape resolution. Grouped-mode loads carry shapes on the
-        // group (per-expert Vecs are cleared); concat already enforced
-        // uniformity + the same [n, k] slab layout the ptr tables expose.
+        // Grouped-mode loads carry the shapes on the group (per-expert Vecs are
+        // cleared); concat already enforced uniformity.
         let moe_inter = match (
             &weights.gate_grouped,
             &weights.w13_fp8_grouped,
@@ -797,9 +613,6 @@ mod gpu {
         };
         // `max_count` only sizes grid Y; total_routes is a safe upper bound.
         let max_count = total_routes.max(1);
-        // Down dims up front (shared by both expert-GEMM paths). Grouped-mode
-        // loads cleared the per-expert Vec; the group carries the (uniform,
-        // concat-ensured) dims instead.
         let (down_rows, down_cols) = match (
             &weights.down_grouped,
             &weights.down_fp8_grouped,
@@ -821,15 +634,10 @@ mod gpu {
             moe_inter
         );
 
-        // Decode-band dispatch: at `R <= QWEN35_MOE_DECODE_MAX_ROUTES` the
-        // weight-read-bound decode kernels replace pair-GEMM + silu_mul +
-        // down-GEMM (3 launches -> 2; one warp per weight row, 16B-vector
-        // loads, weights of touched experts read once per <=8-row activation
-        // chunk — see the formula on the const). Both contraction dims must
-        // be 16B-vector rows (gate/up k = H, down k = I); otherwise the batch
-        // kernels keep the shape. `--qwen35-moe-decode-kernel false` is the
-        // same-binary A/B arm. Shape-constant pure kernel launches — decode
-        // CUDA-graph capture-safe, same as the batch kernels.
+        // Decode-band dispatch: the weight-read-bound decode kernels replace
+        // pair-GEMM + silu_mul + down-GEMM (3 launches -> 2). Both contraction
+        // dims must be 16B-vector rows (gate/up k = H, down k = I); otherwise the
+        // batch kernels keep the shape. Shape-constant, so capture-safe.
         let use_bf16_decode_kernels = weights.expert_weight_format == WeightFormat::DenseBf16
             && total_routes <= QWEN35_MOE_DECODE_MAX_ROUTES
             && hidden_dim.is_multiple_of(8)
@@ -872,13 +680,8 @@ mod gpu {
         };
 
         // Gate+up GEMM + SwiGLU (UNCLAMPED — Qwen3.6 has no clamp).
-        // act rows are written within `offsets/counts` (decode path) or fully
-        // (batch path's silu_mul); under EP the act tail past the local route
-        // count is stale either way, and nothing reads it (both down GEMMs
-        // consume `act` strictly within offsets/counts).
         let act = scratch.act.get(ctx, moe_inter, total_routes)?;
         if use_bf16_decode_kernels {
-            // Fused: act = silu(gate·x) * (up·x), no gate_out/up_out slots.
             // SAFETY: weight-ptr tables + packed buffers valid on ctx.stream;
             // k = hidden_dim % 8 == 0 checked by the dispatch above.
             unsafe {
@@ -899,10 +702,9 @@ mod gpu {
                 )?;
             }
         } else if let Some((gate_scale_cols, _down_scale_cols)) = fp8_decode_scale_cols {
-            // FP8/f32-scale decode-fused ABI: same compact decode-band kernel
-            // family as the DSv4 FP8 lane, but with Qwen's unclamped SwiGLU
-            // (`limit = inf`). This avoids the generic grouped batch GEMV's
-            // [num_experts, max_count] launch grid on the R<=256 decode band.
+            // Same compact decode-band kernel family as the DSv4 FP8 lane with
+            // Qwen's unclamped SwiGLU (`limit = inf`), avoiding the generic batch
+            // GEMV's [num_experts, max_count] launch grid on the decode band.
             // SAFETY: ptrs from live device allocations sized to the dims passed.
             unsafe {
                 moe::dsv4_fp8_grouped_swiglu_decode(
@@ -943,14 +745,9 @@ mod gpu {
                     hidden_dim,
                 )?;
             }
-            // silu_mul covers all `moe_inter * total_routes` elements; under
-            // EP the gate/up tails past the local route count are stale (not
-            // zero), but their products land only in the matching `act` tail,
-            // which nothing reads.
             silu_mul(ctx, gate_out, up_out, act)?;
         }
 
-        // Grouped down GEMM → expert_out[R, H].
         let expert_out = scratch.expert_out.get(ctx, hidden_dim, total_routes)?;
         if use_bf16_decode_kernels {
             // SAFETY: down weight table + act/expert_out valid on ctx.stream;
@@ -1008,13 +805,9 @@ mod gpu {
             }
         }
 
-        // Scatter weighted expert outputs to route slots, combine topk.
-        // route_out[slot] = weight · expert_out[slot]; combine sums over topk.
         // Single-GPU the scatter writes ALL `total_routes` slots (route↔slot
-        // bijection), so reuse needs no re-init; under EP the unwritten
-        // non-local slots MUST read zero in the combine (the partial-sum
-        // contract), so EP re-zeros every call — exactly the zero-init the old
-        // per-call alloc provided.
+        // bijection); under EP the unwritten non-local slots MUST read zero in
+        // the combine (partial-sum contract), so EP re-zeros every call.
         let route_out = if split.ep_size == 1 {
             scratch.route_out.get(ctx, hidden_dim, total_routes)?
         } else {
@@ -1043,13 +836,11 @@ mod gpu {
             )?;
         }
 
-        // Shared expert: dense SwiGLU · sigmoid(x @ shared_gate_router).
         add_shared_expert_gated(ctx, weights, normed, scratch, out)
     }
 
-    /// Shared dense expert of the MoE block, shared by the hand and DeepGEMM expert paths:
-    /// dense shared-expert SwiGLU, sigmoid-gated and accumulated into the
-    /// routed output (`out` is RMW'd; the scatter/combine stage fully wrote it).
+    /// Dense shared expert, sigmoid-gated and accumulated into the routed output
+    /// (`out` is RMW'd; the scatter/combine stage fully wrote it).
     fn add_shared_expert_gated(
         ctx: &DeviceContext,
         weights: &MoeLayerWeights,
@@ -1085,36 +876,17 @@ mod gpu {
         Ok(())
     }
 
-    /// Expert path of the MoE block on the DeepGEMM SM90 BF16 m-grouped GEMMs
-    /// (`--qwen35-deepgemm`): pack → gate GEMM + up GEMM → silu_mul →
-    /// down GEMM → scatter/combine into `out`. `counts` was already filled by
-    /// the per-expert route-count kernel.
+    /// Expert path on the DeepGEMM m-grouped GEMMs: pack → gate/up GEMM →
+    /// silu_mul → down GEMM → scatter/combine into `out`.
     ///
-    /// Per-call dispatch (masked vs contiguous):
-    ///
-    /// * **Masked** (`R = total_routes <= 128`, i.e. decode): A/D are fixed
-    ///   per-group bands `[G, 128, *]` and `masked_m = counts` bounds each
-    ///   group on-device. The band capacity is a HOST constant while the
-    ///   per-group counts are device-resident, so the only host-provable
-    ///   capacity bound is `max_g count_g <= Σ_g count_g = R <= 128` — which
-    ///   is exactly the dispatch threshold. Wasted compute is
-    ///   `Σ_g (align(count_g, BLOCK_M ∈ {64,128}) − count_g) <= 64·G_active`
-    ///   rows per GEMM; shapes are routing-independent (CUDA-graph-safe).
-    /// * **Contiguous** (`R > 128`, i.e. prefill): compact-ish `[m_cap, K]` A
-    ///   with 128-aligned per-group segments and `m_indices` row→group ids
-    ///   (-1 pads). Masked CANNOT serve this regime — a single hot expert can
-    ///   receive up to R rows, so the band capacity would have to be R per
-    ///   group (`G·R` rows of scratch). Contiguous pays
-    ///   `m_cap − Σ_g count_g <= align(R,128) + 128·min(R,G) − R` padding
-    ///   rows of garbage compute (pad tiles resolve to group 0 and are
-    ///   excluded from the scatter via the route-slot -1 sentinel).
-    ///
-    /// Gate and up run as TWO grouped GEMMs over the same A (fusing them into
-    /// one `[G, 2I, K]` grouped B — the checkpoint's native stacked layout —
-    /// is a follow-up: it halves A traffic and launch count but needs the
-    /// loader to keep the fused `gate_up` tensor un-split plus a strided
-    /// silu_mul over `[gate | up]` halves; deferred to keep this diff at the
-    /// licensed two-GEMM numerics of the hand path).
+    /// * **Masked** (`R <= 128`, decode): fixed per-group bands `[G, 128, *]`
+    ///   with `masked_m = counts`. 128 is exactly the dispatch threshold because
+    ///   the only host-provable capacity bound is `max_g count_g <= R`; shapes
+    ///   are routing-independent (CUDA-graph-safe).
+    /// * **Contiguous** (`R > 128`, prefill): 128-aligned per-group segments plus
+    ///   `m_indices` row→group ids (-1 pads). Masked cannot serve this regime —
+    ///   one hot expert can take all R rows, needing `G·R` rows of scratch. Pad
+    ///   tiles resolve to group 0 and the route-slot -1 sentinel excludes them.
     #[allow(clippy::too_many_arguments)]
     fn deepgemm_routed_tail(
         ctx: &DeviceContext,
@@ -1133,9 +905,8 @@ mod gpu {
         let total_routes = num_tokens * topk;
         let local_experts = split.experts_per_rank;
         let stream = ctx.stream.cu_stream();
-        // sm_120 (Blackwell) has no DeepGEMM native bridge (Hopper-only); the FP8
-        // grouped GEMMs route to the CUTLASS sm_120a grouped blockwise collective
-        // instead, on the SAME contiguous grouped buffers.
+        // sm_120 has no DeepGEMM native bridge (Hopper-only); its FP8 grouped
+        // GEMMs use the CUTLASS sm_120a collective on the same buffers.
         let sm120 = ctx.is_sm120();
 
         let fp8_grouped = match (&weights.w13_fp8_grouped, &weights.down_fp8_grouped) {
@@ -1213,8 +984,8 @@ mod gpu {
                 "DeepGEMM MoE path requires grouped expert caches (load with --qwen35-deepgemm)"
             )
         };
-        // Fail loud if the native DeepGEMM bridge is a build-time stub (Hopper
-        // path only; sm_120 uses the CUTLASS collective, no DeepGEMM preflight).
+        // Fail loud if the native DeepGEMM bridge is a build-time stub (sm_120
+        // uses the CUTLASS collective instead).
         if !sm120 {
             moe::dsv4_deepgemm_native_preflight()?;
         }
@@ -1231,24 +1002,18 @@ mod gpu {
             "DeepGEMM MoE padded rows {rows} x max(H={hidden_dim}, I={moe_inter_for_abi}) exceeds the i32 kernel ABI"
         );
 
-        // DG: Pack routed tokens + pad-row sentinels.
-        // packed_route_slot MUST be -1-refilled every call even single-GPU:
-        // the pack writes only the R real rows, and every PAD row has to read
-        // -1 so the scatter skips it (pad GEMM outputs are garbage — masked
-        // rows beyond count_g, contiguous tiles resolved against group 0).
-        // packed_hidden pad rows are zero-from-alloc or stale-from-prior-call;
-        // safe by the slot-table induction (GEMM rows are independent, pads
-        // never reach `out`).
+        // packed_route_slot MUST be -1-refilled every call even single-GPU: the
+        // pack writes only the R real rows, and every PAD row has to read -1 so
+        // the scatter skips its garbage GEMM output.
         let offsets_ptr = if use_masked {
-            // Fixed band bases `g * 128` — a pure function of the length.
+            // Band bases `g * 128` — a pure function of the length.
             let band_table: Vec<i32> = (0..local_experts as i32)
                 .map(|g| g * DEEPGEMM_MASKED_BAND as i32)
                 .collect();
             cache_ptr(scratch.dg_band_offsets.upload_const(ctx, &band_table)?, ctx)
         } else {
-            // 128-aligned per-group segment starts (device-side scan of the
-            // device-resident counts; the total is not read back — `rows` is
-            // the host cap).
+            // 128-aligned segment starts; the total is never read back (`rows`
+            // is the host cap).
             let aligned_offsets =
                 cache_ptr(scratch.dg_aligned_offsets.get(ctx, local_experts)?, ctx);
             let scan_total = cache_ptr(scratch.scan_total.get(ctx, 1)?, ctx);
@@ -1308,10 +1073,8 @@ mod gpu {
             },
         )?;
 
-        // Contiguous only: row → local-expert map (-1 pads, refilled every
-        // call for the same sentinel reason as packed_route_slot).
-        // sm_120's CUTLASS collective consumes offsets+counts directly and never
-        // reads `m_indices` — skip the fill + the neg1 buffer there.
+        // Contiguous only: row → local-expert map (-1 pads). sm_120's CUTLASS
+        // collective consumes offsets+counts directly and never reads it.
         let m_indices = if use_masked || sm120 {
             None
         } else {
@@ -1354,9 +1117,9 @@ mod gpu {
                 "Qwen FP8 DeepGEMM MoE is prefill-only and requires contiguous layout"
             );
             let moe_inter = w13.rows / 2;
-            // Layout contract from the cache — the loader recorded whether SFB is
-            // N-contiguous (CUTLASS sm_120a) or K-contiguous (Hopper DeepGEMM).
-            // Dispatch on THIS, not a re-derived SM, so the two can't disagree.
+            // The loader recorded whether SFB is N-contiguous (CUTLASS sm_120a)
+            // or K-contiguous (Hopper DeepGEMM); dispatch on THAT, not a
+            // re-derived SM, so the two can't disagree.
             let fp8_n_contiguous = w13.sfb_n_contiguous;
             ensure!(
                 down_g.sfb_n_contiguous == fp8_n_contiguous,
@@ -1386,19 +1149,16 @@ mod gpu {
                 .map_err(|_| anyhow::anyhow!("FP8 DeepGEMM MoE rows overflow i32"))?;
             let active_counts = scratch.dg_active_counts.upload(ctx, &[rows_i32])?;
             let stream = ctx.stream.cu_stream();
-            // sm_120 CUTLASS grouped GEMM: the w13 + down GEMMs share identical
-            // group geometry, so D2H offsets/counts ONCE here (one sync/layer)
-            // and reuse the host slices — the kernel no longer re-reads + syncs
-            // per call. Non-sm120 (Hopper DeepGEMM) consumes device m_indices, so
-            // skip the readback there.
+            // The w13 + down GEMMs share group geometry, so D2H offsets/counts
+            // ONCE here (one sync/layer). Hopper DeepGEMM consumes device
+            // m_indices, so it skips the readback.
             let (host_offsets, host_counts) = if fp8_n_contiguous {
                 moe::dtoh_i32_pair(ctx, offsets_ptr, counts, local_experts)?
             } else {
                 (Vec::new(), Vec::new())
             };
-            // One dispatch for both grouped FP8 GEMMs (w13 + down): identical
-            // group geometry, differing only in operands + (n,k). The cache's
-            // layout contract picks the backend.
+            // One dispatch for both grouped FP8 GEMMs, differing only in
+            // operands + (n,k).
             let run_grouped_gemm = |a: RawDevicePtr<u8>,
                                     sfa: RawDevicePtr<f32>,
                                     b: RawDevicePtr<u8>,
@@ -1568,7 +1328,6 @@ mod gpu {
         })?;
         let moe_inter = gate_g.rows;
 
-        // DG: gate GEMM + up GEMM → silu_mul → down GEMM.
         // Heuristics-only hint: expected valid rows per group.
         let expected_m = total_routes.div_ceil(local_experts).max(1);
         let gate_out = scratch.gate_out.get(ctx, moe_inter, rows)?;
@@ -1610,9 +1369,7 @@ mod gpu {
                 }
             })?;
         }
-        // SwiGLU over the full padded buffers (UNCLAMPED — Qwen3.6 has no
-        // clamp); pad-row products land in `act` pad rows, which the down
-        // GEMM tiles cover only as further pad rows the scatter skips.
+        // SwiGLU over the full padded buffers (UNCLAMPED — Qwen3.6 has no clamp).
         let act = scratch.act.get(ctx, moe_inter, rows)?;
         qwen_moe_profile(ctx, "qwen/bf16/silu_mul", rows, moe_inter, 0, || {
             silu_mul(ctx, gate_out, up_out, act)
@@ -1657,12 +1414,9 @@ mod gpu {
             },
         )?;
 
-        // DG: Scatter weighted expert rows to route slots, combine.
-        // The scatter walks ALL `rows` padded rows and skips route_slot < 0,
-        // so exactly the R real rows land in route_out. Single-GPU that is a
-        // route↔slot bijection (all experts local → all R slots written);
-        // under EP the unwritten non-local slots MUST read zero in the
-        // combine (partial-sum contract) → zero-refill, same as the hand path.
+        // The scatter walks ALL `rows` padded rows and skips route_slot < 0.
+        // Under EP the unwritten non-local slots MUST read zero in the combine
+        // (partial-sum contract), so EP re-zeros.
         let route_out = if split.ep_size == 1 {
             scratch.route_out.get(ctx, hidden_dim, total_routes)?
         } else {
@@ -1701,11 +1455,9 @@ mod gpu {
         Ok(())
     }
 
-    /// Dense shared-expert SwiGLU: `down(silu(gate(x)) * up(x))` into the
-    /// `out_slot` buffer (every stage fully overwrites its buffer: beta=0
-    /// GEMMs + full-range silu_mul). Takes the four slots individually so the
-    /// caller's other scratch fields stay borrowable while the returned
-    /// reference (tied to `out_slot` only) is alive.
+    /// Dense shared-expert SwiGLU into `out_slot`. Takes the four slots
+    /// individually so the caller's other scratch fields stay borrowable while
+    /// the returned reference (tied to `out_slot`) is alive.
     fn shared_expert_forward<'a>(
         ctx: &DeviceContext,
         weights: &MoeLayerWeights,
@@ -2056,11 +1808,7 @@ mod gpu {
     }
 }
 
-// The DSv4 FP8 MoE forward is consumed by the Piece 2 `model.rs` layer loop
-// (the `RealCudaExecutor` DSv4 branch); until that integration edit lands there
-// is no in-crate caller, matching the `dsv4.rs` pending-consumer gate. The
-// `dead_code`/`unused_imports` allowance marks pending-consumer infra, not cruft
-// (see `feedback_necessity_not_callers`).
+// `dead_code` marks pending-consumer infra (the `model.rs` DSv4 branch), not cruft.
 #[cfg(feature = "cuda")]
 #[allow(dead_code)]
 mod dsv4_gpu {
@@ -2133,16 +1881,10 @@ mod dsv4_gpu {
         masked_m: CudaSlice<i32>,
     }
 
-    /// Model-wide reusable scratch for the compact FP8 decode-band MoE tail
-    /// (`dsv4_moe_forward_decode_fp8`). Sized to the band's hard route ceiling
-    /// (`DSV4_DECODE_CONTIG_MAX_ROUTES = 128`) so one instance serves every layer
-    /// and step — layers run sequentially, one forward at a time, serial on
-    /// `ctx.stream`, so no concurrent aliasing (same discipline as the shared /
-    /// flashmla scratch). Replaces the ~8 per-layer allocs on the launch-bound
-    /// batched decode path. Six buffers are pure-output (writer fully overwrites
-    /// the rows it later reads); four need per-step re-init before dispatch:
-    /// `counts`/`cursors`/`route_out` → 0, `packed_route_slot` → -1 (the scatter
-    /// sentinel that keeps `packed_weight`/`expert_out` pure-output).
+    /// Model-wide reusable scratch for the compact FP8 decode-band MoE tail,
+    /// sized to `DSV4_DECODE_CONTIG_MAX_ROUTES`. Layers run sequentially, serial
+    /// on `ctx.stream`, so one instance serves every layer with no aliasing. Six
+    /// buffers are pure-output; the other four need per-step re-init.
     pub(crate) struct Dsv4MoeTailScratch {
         max_rows: usize,
         experts_per_rank: usize,
@@ -2199,9 +1941,7 @@ mod dsv4_gpu {
                 + bf16(intermediate, max_rows)
         }
 
-        /// Re-init the four non-pure-output buffers before a decode dispatch:
-        /// `counts`/`cursors`/`route_out` → 0, `packed_route_slot` → -1. The
-        /// other six are fully overwritten by their writers this step.
+        /// `counts`/`cursors`/`route_out` → 0, `packed_route_slot` → -1.
         fn reinit(&mut self, ctx: &DeviceContext, rows: usize) -> Result<()> {
             use cudarc::driver::DevicePtrMut;
             ensure!(
@@ -2224,7 +1964,6 @@ mod dsv4_gpu {
             };
             zero_i32(&mut self.counts, self.experts_per_rank)?;
             zero_i32(&mut self.cursors, self.experts_per_rank)?;
-            // route_out is bf16 [hidden_dim, rows]; zero the live [0, rows) span.
             {
                 let hidden_dim = self.route_out.hidden_dim;
                 let (ptr, _g) = self.route_out.data.device_ptr_mut(&ctx.stream);
@@ -2238,7 +1977,7 @@ mod dsv4_gpu {
                     )?;
                 }
             }
-            // packed_route_slot → -1 (0xFF bytes) over the live [0, rows) span.
+            // packed_route_slot → -1 (0xFF bytes).
             {
                 let (ptr, _g) = self.packed_route_slot.device_ptr_mut(&ctx.stream);
                 // SAFETY: live device alloc of >= rows i32 on this stream.
@@ -2301,7 +2040,6 @@ mod dsv4_gpu {
             })
         }
 
-        /// Exact requested device bytes (Σ over live `CudaSlice`/`HiddenStates`).
         #[allow(dead_code)]
         fn device_bytes_live(&self) -> usize {
             let f32_sz = std::mem::size_of::<f32>();
@@ -2325,10 +2063,9 @@ mod dsv4_gpu {
             intermediate: usize,
             route_capacity: usize,
         ) -> Result<Self> {
-            // DeepGEMM's contiguous grouped layout expects each expert segment
-            // to be M-tile aligned, with invalid padding rows marked -1. Decode
-            // has at most `topk` active routes, so give each route one aligned
-            // tile instead of materialising every local expert group.
+            // Each expert segment must be M-tile aligned with pad rows marked
+            // -1. Decode has at most `topk` active routes, so give each route one
+            // aligned tile instead of materialising every local expert group.
             let rows = route_capacity.max(1) * CONTIG_ROUTE_ALIGN;
             let scale_stride_m = rows.div_ceil(4) * 4;
             let hidden_scale_cols = hidden_dim.div_ceil(128);
@@ -2381,7 +2118,6 @@ mod dsv4_gpu {
             })
         }
 
-        /// Exact requested device bytes (Σ over live `CudaSlice`/`HiddenStates`).
         #[allow(dead_code)]
         fn device_bytes_live(&self) -> usize {
             let f32_sz = std::mem::size_of::<f32>();
@@ -2474,7 +2210,6 @@ mod dsv4_gpu {
                 .saturating_add(4usize.saturating_mul(std::mem::size_of::<i32>()))
         }
 
-        /// Exact requested device bytes (Σ over live `CudaSlice`/`HiddenStates`).
         #[allow(dead_code)]
         pub(crate) fn device_bytes_live(&self) -> usize {
             let f32_sz = std::mem::size_of::<f32>();
@@ -2495,7 +2230,8 @@ mod dsv4_gpu {
     fn memset_i32_minus_one(ctx: &DeviceContext, slice: &mut CudaSlice<i32>) -> Result<()> {
         let bytes = slice.len() * std::mem::size_of::<i32>();
         let (ptr, _record) = slice.device_ptr_mut(&ctx.stream);
-        // SAFETY: ptr/bytes span exactly the live slice, memset async on its own stream.
+        // SAFETY: ptr/bytes span exactly the live slice, memset async on its own
+        // stream.
         unsafe {
             cudarc::driver::result::memset_d8_async(ptr, 0xFF, bytes, ctx.stream.cu_stream())
                 .map_err(|e| anyhow::anyhow!("DSv4 decode i32 -1 memset failed: {e}"))?;
@@ -2594,19 +2330,13 @@ mod dsv4_gpu {
     }
 
     /// FP8 DeepGEMM MoE forward for one DSv4 routed-MoE layer (this EP rank's
-    /// experts only). Mirrors the BF16 [`super::gpu::moe_forward`] route/pack/
-    /// scatter/combine plumbing but swaps the two BF16 grouped GEMMs for the
-    /// native DeepGEMM 5-call FP8 pipeline (`f8f8bf16`, 128-block scale).
+    /// experts only).
     ///
-    /// Routing is per-layer: bias-routed layers run the learned router gemm +
-    /// `noaux_tc` correction bias through `infer_moe::route`; hash-routed layers
-    /// (`layer.hash_tid2eid` present) pick experts directly from the `tid2eid`
-    /// table by token id (no router gate), weighting them by the router scores.
-    ///
-    /// `tokens` are the input token ids (needed for hash routing); `hidden` is
-    /// the post-LN `[num_tokens, hidden]`; `out` receives routed experts only.
-    /// Callers all-reduce this EP-sharded output, then add the replicated shared
-    /// expert exactly once per rank via [`dsv4_shared_expert_forward`].
+    /// `tokens` are the input token ids, needed by hash-routed layers, which pick
+    /// experts from the `tid2eid` table by token id instead of a router gate.
+    /// `out` receives routed experts only: callers all-reduce this EP-sharded
+    /// output, then add the replicated shared expert exactly once per rank via
+    /// [`dsv4_shared_expert_forward`].
     pub(crate) fn dsv4_moe_forward(
         model: &Dsv4Model,
         layer: &Dsv4MoeLayer,
@@ -2657,7 +2387,6 @@ mod dsv4_gpu {
         // Fail loud if the native DeepGEMM bridge is a build-time stub.
         moe::dsv4_deepgemm_native_preflight()?;
 
-        // Router gemm → logits[T, E] → route on device.
         let (route_indices, route_weights) =
             crate::stage_profile::profile(ctx, "dsv4/stage/moe_route", || -> Result<_> {
                 crate::profile::profile_op(ctx, "moe_route", None, num_tokens, || {
@@ -2757,19 +2486,14 @@ mod dsv4_gpu {
         Ok(true)
     }
 
-    /// Routed-row ceiling for the compact FP8 decode lane.
-    ///
-    /// The kernels operate on real routed rows only (`max_count` chunks of 8 rows per
-    /// active expert), so the same decode-band ceiling as the 64-aligned contiguous
-    /// fallback keeps B<=~16 off padded DeepGEMM materialization. Larger prefill
-    /// shapes still use tensor-core DeepGEMM.
+    /// Routed-row ceiling for the compact FP8 decode lane: the kernels operate on
+    /// real routed rows only, so the 64-aligned contiguous band's ceiling keeps
+    /// B<=~16 off padded DeepGEMM materialization.
     const DSV4_DECODE_GEMV_MAX_ROUTES: usize = DSV4_DECODE_CONTIG_MAX_ROUTES;
 
     /// Per-expert pointer tables over the layer's f32 block-scale buffers for the
-    /// decode-band grouped-GEMM MoE lane. Built once per layer on first use; the
-    /// scale pointers index directly into the existing f32 DeepGEMM scale buffers
-    /// (no re-encoding). The build is infallible for a well-shaped layer — the
-    /// call site maps any error to `None` and falls back to the contiguous lane.
+    /// decode-band grouped-GEMM MoE lane; the scale pointers index directly into
+    /// the existing DeepGEMM scale buffers (no re-encoding).
     pub(crate) struct Dsv4GemvTables {
         gate_w: CudaSlice<u64>,
         gate_s: CudaSlice<u64>,
@@ -2777,10 +2501,9 @@ mod dsv4_gpu {
         up_s: CudaSlice<u64>,
         w2_w: CudaSlice<u64>,
         w2_s: CudaSlice<u64>,
-        /// w13-half scale columns (= H/128) — used as the swiglu kernel's
-        /// `scale_cols`; the per-row scale row is derived in-kernel.
+        /// w13-half scale columns (= H/128), the swiglu kernel's `scale_cols`.
         sc13: usize,
-        /// w2 scale columns (= I/128) — the down kernel's `scale_cols`.
+        /// w2 scale columns (= I/128), the down kernel's `scale_cols`.
         sc2: usize,
     }
 
@@ -2825,10 +2548,8 @@ mod dsv4_gpu {
             g * stride2
         );
 
-        // Scale tables point straight into the layer's f32 DeepGEMM scale
-        // buffers (the GEMV kernels read f32 block scales — the MoE expert
-        // caches do NOT store UE8M0; that encoding is attention-side only).
-        // Offsets below are in BYTES (f32 ⇒ ×4).
+        // The MoE expert caches store f32 block scales, not UE8M0 (that encoding
+        // is attention-side only). Offsets below are in BYTES (f32 ⇒ ×4).
         let (w13_base, w2_base, s13_base, s2_base) = {
             let (a, _g13) = w13.weight.device_ptr(&ctx.stream);
             let (b, _g2) = w2.weight.device_ptr(&ctx.stream);
@@ -2871,13 +2592,10 @@ mod dsv4_gpu {
         })
     }
 
-    /// Decode-band routed-MoE forward via grouped w8a16 GEMM (warp-per-row,
-    /// `dsv4_fp8_grouped_swiglu_decode` + `dsv4_fp8_grouped_down_decode`):
-    /// compact pack (no pad rows), one fused gate/up pass with clamped SwiGLU,
-    /// one w2 pass, then the same scatter/combine tail as the contiguous lane.
-    /// Zero pad rows and zero activation-quantize work: at B=1 this removes the
-    /// grouped lane's padding tax entirely (the −23% regression's residual
-    /// after the 64-align fix).
+    /// Decode-band routed-MoE forward via grouped w8a16 GEMM (warp-per-row):
+    /// compact pack, one fused gate/up pass with clamped SwiGLU, one w2 pass,
+    /// then the shared scatter/combine tail. Zero pad rows and zero
+    /// activation-quantize work, which removes the grouped lane's padding tax.
     #[allow(clippy::too_many_arguments)]
     fn dsv4_moe_forward_decode_fp8(
         model: &Dsv4Model,
@@ -2902,11 +2620,9 @@ mod dsv4_gpu {
         let total_routes = num_tokens * topk;
         let rows = total_routes.max(1);
 
-        // Reuse the model-wide tail scratch when provided (launch-bound Step 1):
-        // pre-allocated to the band ceiling, so no per-layer alloc/free churn.
-        // Fall back to a throwaway scratch (byte-identical to the old per-call
-        // allocs) when None. `reinit` re-zeros the 4 non-pure-output buffers;
-        // the throwaway path is born zero/-1 so it skips reinit.
+        // The model-wide scratch is pre-allocated to the band ceiling, so no
+        // per-layer alloc churn; the throwaway fallback is born zero/-1 and so
+        // skips `reinit`.
         let mut owned_tail;
         let scratch: &mut Dsv4MoeTailScratch = match tail {
             Some(s) => {
@@ -2918,8 +2634,7 @@ mod dsv4_gpu {
                 &mut owned_tail
             }
         };
-        // Bind the buffers (kernels take `rows` as the explicit work bound; the
-        // scratch capacity is `max_rows >= rows`).
+        // Kernels take `rows` as the work bound; capacity is `max_rows >= rows`.
         let counts = &scratch.counts;
         let offsets = &scratch.offsets;
         let scan_total = &scratch.scan_total;
@@ -2971,12 +2686,8 @@ mod dsv4_gpu {
             )?;
         }
 
-        // Fused gate+up+clamped-SwiGLU decode GEMM → down (w2) decode GEMM.
-        // BF16 activations throughout (w8a16); each kernel reads its expert
-        // weights once with 16-byte vectorized FP8 loads and writes only the
-        // real routed rows — no pad rows, no activation quantize. max_count =
-        // total_routes is the safe host upper bound on per-expert row count
-        // (kernels exit early on `chunk_base >= counts[e]`).
+        // max_count = total_routes is the safe host upper bound on per-expert row
+        // count (kernels exit early on `chunk_base >= counts[e]`).
         // SAFETY: pointer tables hold experts_per_rank entries built over the
         // layer's grouped caches; packed rows are bounded by offsets+counts.
         unsafe {
@@ -3013,8 +2724,6 @@ mod dsv4_gpu {
             )?;
         }
 
-        // Scatter weighted expert outputs to route slots, combine topk —
-        // identical tail to the contiguous lane.
         // SAFETY: all buffers valid on ctx.stream for the given shapes.
         unsafe {
             moe::dsv4_scatter_all_route_slots(
@@ -3038,11 +2747,9 @@ mod dsv4_gpu {
         Ok(())
     }
 
-    /// Masked-path MoE tail (count → scan → pack → DeepGEMM grouped → scatter/
-    /// combine), shared by the eager forward and the decode graph. Fully
-    /// device-driven: routing buffers are read by kernels, intermediates are
-    /// stream-ordered allocs (legal inside graph capture, freed via
-    /// AUTO_FREE_ON_LAUNCH), and the -1 route-slot sentinel is a device memset.
+    /// Masked-path MoE tail shared by the eager forward and the decode graph.
+    /// Fully device-driven: intermediates are stream-ordered allocs (legal inside
+    /// graph capture) and the -1 route-slot sentinel is a device memset.
     #[allow(clippy::too_many_arguments)]
     fn dsv4_moe_forward_masked_tail(
         model: &Dsv4Model,
@@ -3064,11 +2771,8 @@ mod dsv4_gpu {
         let experts_per_rank = split.experts_per_rank;
         let local_start = split.local_expert_start;
         let total_routes = num_tokens * topk;
-        // Decode-band FP8 grouped GEMM lane (B=1): compact (real routed rows
-        // only, no pad), 16-byte vectorized FP8 weight loads, per-route
-        // correct. Locked default-on in band (native kernel, always compiled —
-        // the bandwidth-fixed successor to the scalar-GEMV lane that lost at 25%
-        // HBM, errors/2026-06-13-dsv4-decode-gemv-lane-bandwidth-kill).
+        // Decode-band FP8 grouped GEMM lane: compact (real routed rows only, no
+        // pad), 16-byte vectorized FP8 weight loads.
         if total_routes <= DSV4_DECODE_GEMV_MAX_ROUTES {
             let tables = layer.gemv_tables.get_or_init(|| {
                 build_gemv_tables(ctx, layer).map(Some).unwrap_or_else(|e| {
@@ -3090,7 +2794,6 @@ mod dsv4_gpu {
                 );
             }
         }
-        // Per-local-expert counts → group offsets (EP-aware start/range).
         let counts = ctx
             .stream
             .alloc_zeros::<i32>(experts_per_rank)
@@ -3106,9 +2809,8 @@ mod dsv4_gpu {
         keepalive.keep_i32(&counts);
         keepalive.keep_i32(&offsets);
         keepalive.keep_i32(&scan_total);
-        // Decode band (R = topk·B ≤ 128 routes): pack 64-aligned and cap the
-        // GEMM's block_m at 64 — same per-tile single-group contract, half the
-        // pad rows ground by the row-linear kernels (pack/swiglu/scatter).
+        // Decode band: pack 64-aligned and cap the GEMM's block_m at 64 — same
+        // per-tile single-group contract, half the pad rows.
         let contig_align = if total_routes <= DSV4_DECODE_CONTIG_MAX_ROUTES {
             DSV4_DECODE_CONTIG_ALIGN
         } else {
@@ -3135,16 +2837,13 @@ mod dsv4_gpu {
             )?;
         }
 
-        // Pack routed tokens grouped-by-local-expert (aligned rows).
         let packed_rows =
             deepgemm_contig_rows_cap(total_routes.max(1), experts_per_rank, contig_align);
         let packed_hidden = HiddenStates::zeros(ctx, hidden_dim, packed_rows)?;
         keepalive.keep_hidden(&packed_hidden);
-        // Initialize to -1 (the invalid sentinel), NOT 0. The scatter kernel
-        // treats only route_slot < 0 as invalid; zero-init left unfilled compact
-        // rows looking like valid slot-0 rows, which in m=1 decode overwrote
-        // route slot 0 with zero output. Pad rows from the aligned layout must
-        // also stay -1 so the scatter skips their garbage GEMM output.
+        // -1, NOT 0: the scatter treats only route_slot < 0 as invalid, and
+        // zero-init made unfilled rows look like valid slot-0 rows (m=1 decode
+        // overwrote route slot 0 with zero output).
         let packed_route_slot = alloc_neg1_i32(ctx, packed_rows)?;
         let packed_weight = ctx
             .stream
@@ -3177,7 +2876,6 @@ mod dsv4_gpu {
             )?;
         }
 
-        // FP8 DeepGEMM 5-call grouped expert pipeline → aligned rows.
         let intermediate = layer.intermediate;
         ensure!(
             hidden_dim.is_multiple_of(128) && intermediate.is_multiple_of(128),
@@ -3215,7 +2913,6 @@ mod dsv4_gpu {
             })?;
         keepalive.keep_hidden(&expert_out);
 
-        // Scatter weighted expert outputs to route slots, combine topk.
         crate::profile::profile_op(ctx, "combine_scatter", None, num_tokens, || {
             let route_out = HiddenStates::zeros(ctx, hidden_dim, total_routes.max(1))?;
             keepalive.keep_hidden(&route_out);
@@ -3242,9 +2939,8 @@ mod dsv4_gpu {
             Ok(())
         })?;
 
-        // The shared expert is replicated on every rank. Callers must all-reduce
-        // the routed local expert contribution first, then add the shared expert
-        // exactly once per rank.
+        // The shared expert is replicated: callers all-reduce the routed local
+        // contribution first, then add it exactly once per rank.
         Ok(())
     }
 
@@ -3291,13 +2987,11 @@ mod dsv4_gpu {
             "DSv4 DeepEP expert hidden dim {} != runtime hidden dim {hidden_dim}",
             layer.hidden_dim
         );
-        // Local DSv4 MoE is DeepGEMM-only (no scalar/native expert fallback exists
-        // in this tree), so the production path is always the DeepGEMM backend. The
-        // preflight below is the real guard against a build-time stub.
+        // Fail loud if the native DeepGEMM bridge is a build-time stub.
         moe::dsv4_deepgemm_native_preflight()?;
 
-        // Route exactly like the allreduce path. DeepEP dispatch consumes global
-        // expert ids as i64 and remaps received ids to rank-local expert ids.
+        // DeepEP dispatch consumes global expert ids as i64 and remaps received
+        // ids to rank-local expert ids.
         let mut logits = HiddenStates::zeros(ctx, cfg.num_experts, num_tokens)?;
         gemm_batch(ctx, &layer.gate, hidden, &mut logits)?;
         let total_routes = num_tokens * topk;
@@ -3346,8 +3040,7 @@ mod dsv4_gpu {
         let recv_slots = num_recv.saturating_mul(topk);
         let local_routed = HiddenStates::zeros(ctx, hidden_dim, scratch.capacity_recv)?;
         if recv_slots > 0 {
-            // DeepEP gives rank-local expert ids as i64. Convert the valid prefix
-            // to i32 for the existing local count/pack kernels.
+            // The local count/pack kernels take i32, DeepEP returns i64.
             let recv_i64 = ctx
                 .stream
                 .clone_dtoh(&scratch.recv_topk_idx)
@@ -3529,11 +3222,10 @@ mod dsv4_gpu {
         dsv4_shared_expert_pooled(ctx, stream, layer, hidden, out, swiglu_limit, scratch)
     }
 
-    /// Run the FP8 DeepGEMM 5-call grouped expert pipeline over this rank's local
-    /// experts; returns the padded/aligned expert output. The caller's
-    /// `packed_route_slot = -1` pad rows decide which rows reach route slots.
-    /// `contig_align` must match the per-group alignment `offsets` were packed
-    /// with (the bridge caps block_m at it so tiles never span groups).
+    /// FP8 DeepGEMM grouped expert pipeline over this rank's local experts;
+    /// returns the padded/aligned expert output. `contig_align` must match the
+    /// per-group alignment `offsets` were packed with (the bridge caps block_m at
+    /// it so tiles never span groups).
     #[allow(clippy::too_many_arguments)]
     fn deepgemm_grouped_experts(
         ctx: &DeviceContext,
@@ -3572,12 +3264,9 @@ mod dsv4_gpu {
             w2.groups,
         );
 
-        // Prefill can have tens of thousands of routes. The old masked layout
-        // materialized `num_groups * max_m` rows and overflowed the unpad kernel's
-        // work-size at ~1.5K prompt tokens (32 * T * topk * H > i32::MAX), long
-        // before the 8K/32K SLO shapes. Use DeepGEMM's contiguous grouped layout
-        // over 128-aligned route rows instead: `m_indices[row]` names the local
-        // expert for each activation row, and every pad row stays -1.
+        // Contiguous grouped layout over 128-aligned route rows: the masked
+        // layout materialized `num_groups * max_m` rows and overflowed the unpad
+        // kernel's i32 work size at ~1.5K prompt tokens.
         let rows = packed_hidden.seq_len.max(1);
         let scale_stride_m = rows.div_ceil(4) * 4;
         let hidden_scale_cols = hidden_dim.div_ceil(128);
@@ -3740,17 +3429,15 @@ mod dsv4_gpu {
             w2.cols,
             w2.groups,
         );
-        // `masked_m` is the per-group valid-row count = `counts`; alias it directly
-        // (the masked GEMM only reads it, and `counts` is already passed read-only to
-        // pack_quantize + swiglu below) instead of a per-layer D2D copy into
-        // `scratch.masked_m` — kills one cuMemcpyDtoD/layer (the 17.8% D2D bucket).
+        // `masked_m` is the per-group valid-row count = `counts`, read-only in the
+        // masked GEMM: alias it instead of a per-layer D2D copy into
+        // `scratch.masked_m` (one cuMemcpyDtoD/layer, the 17.8% D2D bucket).
         let p_hidden = cache_ptr(&packed_hidden.data, ctx);
         let p_in_fp8 = cache_ptr(&scratch.input_fp8, ctx);
         let p_in_scales = cache_ptr(&scratch.input_scales, ctx);
         let p_active = cache_ptr(&scratch.active_experts, ctx);
         let p_offsets = cache_ptr(offsets, ctx);
         let p_counts = cache_ptr(counts, ctx);
-        // Alias masked_m to counts (same data, read-only in the masked GEMM).
         let p_masked = p_counts;
         let p_w13_out = cache_ptr(&scratch.w13_out.data, ctx);
         let p_act_fp8 = cache_ptr(&scratch.act_fp8, ctx);
@@ -3946,8 +3633,7 @@ mod dsv4_gpu {
         Ok(())
     }
 
-    /// DSv4 dense shared expert via a single-group FP8 DeepGEMM pass: w13 fused
-    /// gate+up → clamped SwiGLU → w2 down, over every token. No routing/scatter.
+    /// Dense shared expert: one single-group FP8 DeepGEMM pass, no routing.
     fn dsv4_shared_expert_pooled(
         ctx: &DeviceContext,
         stream: &Arc<CudaStream>,
@@ -4077,8 +3763,7 @@ mod dsv4_gpu {
         Ok(())
     }
 
-    /// DSv4 dense shared expert via a single-group FP8 DeepGEMM pass: w13 fused
-    /// gate+up → clamped SwiGLU → w2 down, over every token. No routing/scatter.
+    /// Dense shared expert: one single-group FP8 DeepGEMM pass, no routing.
     fn dsv4_shared_expert(
         ctx: &DeviceContext,
         stream: &Arc<CudaStream>,
@@ -4108,11 +3793,7 @@ mod dsv4_gpu {
             "DSv4 shared expert needs H and I aligned to 128, got H={hidden_dim} I={shared_inter}"
         );
 
-        // Floor at 128 for the SAME reason as the routed grouped path: the shared
-        // expert runs the identical `dsv4_deepgemm_m_grouped_fp8_gemm_nt_masked`
-        // kernel, whose small-m (m=1 decode) tile path diverges below 128. The
-        // routed-only floor left this reachable (codex review P2); a prompt whose
-        // next-token margin leans on the shared expert could flip at m<128.
+        // Floor at 128: the masked GEMM's small-m tile path diverges below it.
         let max_m = num_tokens.max(128);
         let scale_stride_m = max_m.div_ceil(4) * 4;
         let hidden_scale_cols = hidden_dim.div_ceil(128);
@@ -4206,7 +3887,8 @@ mod dsv4_gpu {
             stream.cu_stream()
         };
 
-        // SAFETY: single-group buffers valid on the selected stream; masked_m bounds rows.
+        // SAFETY: single-group buffers valid on the selected stream; masked_m bounds
+        // rows.
         unsafe {
             moe::dsv4_deepgemm_pack_quantize_bf16_to_fp8(
                 p_hidden,
@@ -4288,11 +3970,9 @@ mod dsv4_gpu {
     }
 
     /// Concatenate the per-expert FP8 caches into one contiguous group-major
-    /// buffer (D2D), validating uniform `[rows, cols]` shape + 128-row alignment.
-    ///
-    /// The loader stores this grouped cache in [`crate::dsv4::Dsv4MoeLayer`] and
-    /// drops the per-expert Vecs. The weights are static after load; rebuilding
-    /// this concat during decode would copy hundreds of MiB per layer per token.
+    /// buffer (D2D), validating uniform `[rows, cols]` + 128-row alignment. Built
+    /// once at load: the weights are static, and rebuilding this concat during
+    /// decode would copy hundreds of MiB per layer per token.
     pub(crate) fn build_grouped_cache(
         ctx: &DeviceContext,
         caches: &[Dsv4Fp8DeepGemmWeightCache],
@@ -4415,16 +4095,10 @@ mod dsv4_gpu {
         })
     }
 
-    /// NVSHMEM low-latency (token-owned) DSv4 MoE forward for THIS rank's owned
-    /// token slice. Implements the EP pipeline over the owned `[hidden, owned_n]`
-    /// activations: route → LL dispatch (FP8 pack) → masked grouped GEMM w13 →
-    /// masked SwiGLU+requant → masked grouped GEMM w2 → LL combine → add shared
-    /// expert. The caller (dsv4.rs) owns the token slicing + the final all-gather.
-    ///
-    /// `out` is this rank's owned routed+shared output `[hidden, owned_n]`. The
-    /// LL packed recv / GEMM-output scratch is pre-allocated once in `scratch`;
-    /// this path only overwrites it (no per-step alloc beyond the small route +
-    /// topk-id buffers + the routed/shared temporaries).
+    /// NVSHMEM low-latency DSv4 MoE forward for THIS rank's owned token slice:
+    /// route → LL dispatch (FP8 pack) → masked grouped GEMM w13 → masked
+    /// SwiGLU+requant → masked grouped GEMM w2 → LL combine. The caller owns the
+    /// token slicing and the final all-gather; `out` is `[hidden, owned_n]`.
     #[cfg(feature = "deepep")]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn dsv4_moe_forward_deepep_ll(
@@ -4471,12 +4145,9 @@ mod dsv4_gpu {
         );
         moe::dsv4_deepgemm_native_preflight()?;
 
-        // ── Step 2: route the OWNED tokens on device → topk_idx (i64, global
-        // expert ids, kept on device — no host i32→i64 glue) + topk weights.
         // owned_n may be 0 (seq_len < world): this rank still participates in the
-        // dispatch/combine COLLECTIVE with num_tokens=0 (sends nothing, receives
-        // tokens routed to its local experts), so allocate 1-slot dummies for the
-        // route buffers and skip the actual route compute.
+        // dispatch/combine COLLECTIVE, so allocate 1-slot dummies for the route
+        // buffers and skip the route compute.
         let total_routes = owned_n * topk;
         let topk_idx_i64 = ctx
             .stream
@@ -4508,9 +4179,8 @@ mod dsv4_gpu {
             w
         };
 
-        // ── Step 3: LL dispatch the owned tokens → packed FP8 recv into scratch.
-        // `scratch` is model-owned (outlives the forward), so it does not need
-        // the forward-keepalive guard the transient buffers below get.
+        // `scratch` is model-owned (outlives the forward), so it does not need the
+        // forward-keepalive guard the transient buffers below get.
         let _expected_m = transport.ll_dispatch(ctx, scratch, hidden, &topk_idx_i64, topk)?;
 
         let m = scratch.m_padded;
@@ -4543,8 +4213,6 @@ mod dsv4_gpu {
         let p_expert_out = cache_ptr(&scratch.expert_out, ctx);
         let stream = ctx.stream.cu_stream();
 
-        // ── Step 4: masked grouped GEMM w13 (fused gate+up): recv FP8 → bf16
-        //    [E_local, m, 2*intermediate]. masked_m = recv_count (per expert).
         // SAFETY: all buffers are scratch sized for `[E_local, m, *]`; masked_m
         // bounds rows; sfa_aligned_m == m (TMA-aligned, asserted at scratch alloc).
         unsafe {
@@ -4562,12 +4230,9 @@ mod dsv4_gpu {
                 sfa_aligned_m,
                 stream,
             )?;
-            // ── Step 5: masked SwiGLU(clamp) + per-128-block FP8 requant →
-            //    [E_local, m, intermediate] FP8 + column-major scales. The grid
-            //    covers only `expected_m = min(global_tokens, m)` rows per
-            //    expert (per-expert recv count ≤ the step's global token count;
-            //    a full-band grid measured 631 µs/layer of empty-block drain at
-            //    B=1 — 52.9% of deepep_ll GPU time).
+            // The grid covers only `min(global_tokens, m)` rows per expert: a
+            // full-band grid measured 631 µs/layer of empty-block drain at B=1,
+            // 52.9% of deepep_ll GPU time.
             moe::dsv4_deepgemm_silu_mul_masked_quant(
                 p_w13_out,
                 p_act_fp8,
@@ -4580,8 +4245,7 @@ mod dsv4_gpu {
                 swiglu_limit,
                 stream,
             )?;
-            // ── Step 6: masked grouped GEMM w2 (down): act FP8 → bf16
-            //    [E_local, m, hidden]. This IS the LL-combine input layout.
+            // The w2 output layout IS the LL-combine input layout.
             moe::dsv4_deepgemm_m_grouped_fp8_gemm_nt_masked(
                 p_act_fp8,
                 p_act_sc,
@@ -4598,11 +4262,8 @@ mod dsv4_gpu {
             )?;
         }
 
-        // ── Step 7: LL combine → this rank's owned routed output [hidden, owned_n].
-        // The shared expert is NOT added here: the dsv4.rs forward adds the
-        // replicated shared expert on the FULL gathered `moe_out` afterward
-        // (identical to the intranode `dsv4_moe_forward_deepep` contract), so
-        // adding it here would double-count. `out` holds routed-only.
+        // The shared expert is NOT added here — dsv4.rs adds it on the FULL
+        // gathered `moe_out` afterward, so adding it here would double-count.
         transport.ll_combine(
             ctx,
             scratch,
@@ -4617,7 +4278,7 @@ mod dsv4_gpu {
 }
 
 #[cfg(feature = "cuda")]
-#[allow(unused_imports)] // consumed by the Piece 2 model.rs DSv4 branch
+#[allow(unused_imports)] // consumed by the model.rs DSv4 branch
 pub(crate) use dsv4_gpu::{
     Dsv4GemvTables, Dsv4MoeTailScratch, Dsv4SharedDecodeScratch, GroupedCache, GroupedWeightLayout,
     build_grouped_cache, dsv4_moe_forward, dsv4_shared_expert_forward,

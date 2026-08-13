@@ -1,36 +1,31 @@
 use super::*;
 
 pub(crate) enum Qwen35Attn {
-    // Boxed: `FullAttn`/`LinearAttn` are large (multiple DeviceMatrix) and
-    // size-skewed; boxing keeps the enum small (clippy::large_enum_variant).
+    // Size-skewed variants; boxing keeps the enum small (clippy::large_enum_variant).
     Full(Box<FullAttn>),
     Linear(Box<LinearAttn>),
 }
 
-/// Gated full attention (the q rows carry the per-head sigmoid gate → q part
-/// rows = `heads*head_dim*2`).
+/// Gated full attention: the q rows carry the per-head sigmoid gate, so the q
+/// part is `heads*head_dim*2` rows.
 pub(crate) struct FullAttn {
-    /// Row-fused `[q; k; v]` (`[q_gated + 2*kv, hidden]`): one GEMM per step,
-    /// split into the q/k/v buffers downstream.
+    /// Row-fused `[q; k; v]` (`[q_gated + 2*kv, hidden]`).
     pub(crate) qkv_proj: DeviceMatrix,
     pub(crate) o_proj: DeviceMatrix,
     pub(crate) q_norm: DeviceVec,
     pub(crate) k_norm: DeviceVec,
 }
 
-/// Gated-delta-rule linear attention.
 pub(crate) struct LinearAttn {
-    /// Row-fused `[qkv; z]` (`[qkv_dim + z_dim, hidden]`): one GEMM per step,
-    /// split into the conv-input qkv and the z gate downstream.
+    /// Row-fused `[qkv; z]` (`[qkv_dim + z_dim, hidden]`).
     pub(crate) in_proj_qkvz: DeviceMatrix,
-    /// Row-fused `[b; a]` (`[2*Vh, hidden]`): one GEMM per step, split into
-    /// the per-head b/a scalars downstream. b = rows `0..Vh`, a = `Vh..2*Vh`.
+    /// Row-fused `[b; a]` (`[2*Vh, hidden]`): b = rows `0..Vh`, a = `Vh..2*Vh`.
     pub(crate) in_proj_ba: DeviceMatrix,
     pub(crate) conv1d_weight: DeviceVec,
     pub(crate) dt_bias: DeviceVec,
     /// This rank's v-head shard under TP.
     pub(crate) a_log: CudaSlice<f32>,
-    /// Gated output RMSNorm scale, broadcast across heads; replicated under TP.
+    /// Broadcast across heads; replicated under TP.
     pub(crate) norm_weight: CudaSlice<f32>,
     pub(crate) out_proj: DeviceMatrix,
 }
@@ -63,17 +58,9 @@ impl Qwen35Model {
     }
 
     /// Gated full attention over an explicit contiguous K/V cache (`max_seq_len`
-    /// derived from `k_cache.len / kv_dim`), uncached recompute over
-    /// `[0, start_pos+seq_len)` each call, into `out` (`[hidden, seq]`, beta=0
-    /// o_proj GEMM). The prep kernel fuses q/k RMSNorm + RoPE + cache write; the
-    /// gate kernel applies the per-head sigmoid gate carried in `q_full`.
-    /// `start_pos_dev` is the GPU-resident `start_pos` (same for every layer of
-    /// one call). Prefill chunks (`seq_len > 1`) route through the vendored FA3
-    /// hopper fwd when [`qwen35_fa3_enabled`]; decode keeps the devpos kernel
-    /// (graph-captured) untouched. The trunk passes its per-slot cache via
-    /// [`Self::full_attention`]; the MTP draft head passes its own fresh
-    /// per-block cache. `full_idx` is only a profiling label. Numerics, kernels,
-    /// and launch order are identical to the pre-extraction trunk path.
+    /// = `k_cache.len / kv_dim`), into `out` (`[hidden, seq]`, beta=0 o_proj
+    /// GEMM). `start_pos_dev` is the GPU-resident `start_pos`, same for every
+    /// layer of one call; `full_idx` is only a profiling label.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn full_attention_into(
         &self,
@@ -89,9 +76,8 @@ impl Qwen35Model {
     ) -> Result<()> {
         let c = &self.config;
         let seq_len = normed.seq_len;
-        // LOCAL per-rank widths (= global config on a single GPU): the sharded
-        // q/k/v GEMM outputs, the per-slot caches, and the kernel launches must
-        // all agree on this rank's head shard.
+        // LOCAL per-rank widths: GEMM outputs, caches, and launches must all
+        // agree on this rank's head shard.
         let q_dim = self.local_full_attn_q_dim();
         let kv_dim = self.local_full_attn_kv_dim();
         let q_proj_dim = self.local_full_attn_q_proj_dim();
@@ -141,7 +127,8 @@ impl Qwen35Model {
             let (vc_ptr, _g9) = v_cache.data.device_ptr_mut(&self.ctx.stream);
             let (sp_ptr, _g10) = start_pos_dev.device_ptr(&self.ctx.stream);
             crate::profile::profile_op(&self.ctx, "full/prep", Some(full_idx), seq_len, || {
-                // SAFETY: all buffers valid on ctx.stream; cache sized max_seq_len*kv_dim.
+                // SAFETY: all buffers valid on ctx.stream; cache sized
+                // max_seq_len*kv_dim.
                 unsafe {
                     ffi::prefill_attention_hd256_prep_cuda(
                         qf_ptr as *const ffi::Half,
@@ -170,14 +157,9 @@ impl Qwen35Model {
             })?;
         }
 
-        // Attention over the contiguous cache (causal; decode = qlen 1).
-        // Decode (`seq_len == 1`) takes the devpos entry: the kv length is read
-        // from the staged `start_pos` DEVICE buffer inside the kernel (same
-        // math — kv_len = start_pos + token + 1 either way), so the launch is
-        // CUDA-graph capture-safe and ONE captured graph replays across
-        // positions. Eager decode uses the same entry, keeping the graph lane
-        // kernel-for-kernel identical to its eager warm runs. Prefill keeps
-        // the host-scalar entry (multi-token, never captured).
+        // Decode takes the devpos entry: kv_len is read from the staged
+        // `start_pos` device buffer, so one captured graph replays across
+        // positions. Prefill keeps the host-scalar entry (never captured).
         {
             let (q_ptr, _g0) = q_prepped.data.device_ptr(&self.ctx.stream);
             let (kc_ptr, _g1) = k_cache.data.device_ptr(&self.ctx.stream);
@@ -192,15 +174,15 @@ impl Qwen35Model {
                 Some(full_idx),
                 seq_len,
                 || {
-                    // SAFETY: ptrs from live device allocations sized to the dims passed.
+                    // SAFETY: ptrs from live device allocations sized to the dims
+                    // passed.
                     unsafe {
                         if seq_len == 1
                             && qwen35_fa2_sm70_enabled(&self.ctx)
                             && !crate::runtime_flags::qwen35_decode_graph()
                         {
-                            // FA2 sm_70 decode (eager). The host kv_len arg is
-                            // not graph-replay safe, so captured decode falls
-                            // through to the devpos kernel below.
+                            // The host kv_len arg is not graph-replay safe, so
+                            // captured decode falls through to devpos below.
                             ffi::arle_fa2_sm70_attention_cuda(
                                 q_ptr as *const ffi::Half,
                                 kc_ptr as *const ffi::Half,
@@ -234,13 +216,10 @@ impl Qwen35Model {
                             )
                             .result()?;
                         } else if c.head_dim == 256 && qwen35_fa3_enabled(&self.ctx) {
-                            // FA3 fwd over the SAME buffers the in-tree kernel uses:
-                            // q/out token-major [S, h, 256] (HD256 prep layout),
-                            // cache head-major [h_k, max_seq, 256]. Passing the
-                            // exact `kv_len` as seqlen_k keeps the shim on the
-                            // non-varlen path; causal is bottom-right aligned =
-                            // chunked-prefill semantics. Gate + o_proj follow
-                            // unchanged.
+                            // q/out token-major [S, h, 256], cache head-major
+                            // [h_k, max_seq, 256]. An exact `kv_len` as seqlen_k
+                            // keeps the shim non-varlen; causal is bottom-right
+                            // aligned = chunked-prefill semantics.
                             let lse = fa3_lse.get(&self.ctx, self.local_q_heads * seq_len)?;
                             let sem = fa3_semaphore.get(&self.ctx, 5)?;
                             let (lse_ptr, _g4) = lse.device_ptr_mut(&self.ctx.stream);
@@ -286,8 +265,7 @@ impl Qwen35Model {
                             ffi::arle_fa3_fwd_hd256_bf16_cuda(&args, self.ctx.stream.cu_stream())
                                 .result()?;
                         } else if qwen35_fa2_sm70_enabled(&self.ctx) {
-                            // FA2 sm_70 prefill (SOTA on V100; FA3 is sm_80+).
-                            // Causal chunked-prefill; same buffers as naive.
+                            // sm_70 lane: FA3 needs sm_80+.
                             ffi::arle_fa2_sm70_attention_cuda(
                                 q_ptr as *const ffi::Half,
                                 kc_ptr as *const ffi::Half,
@@ -330,7 +308,8 @@ impl Qwen35Model {
             let (qf_ptr, _g0) = q_full.data.device_ptr(&self.ctx.stream);
             let (o_ptr, _g1) = attn_out.data.device_ptr_mut(&self.ctx.stream);
             crate::profile::profile_op(&self.ctx, "full/gate", Some(full_idx), seq_len, || {
-                // SAFETY: q_full/attn_out valid on ctx.stream; gate layout per full-attn prep.
+                // SAFETY: q_full/attn_out valid on ctx.stream; gate layout per
+                // full-attn prep.
                 unsafe {
                     ffi::attention_gate_batch_hd256_cuda(
                         qf_ptr as *const ffi::Half,
@@ -349,22 +328,18 @@ impl Qwen35Model {
         crate::profile::profile_op(&self.ctx, "full/o_proj", Some(full_idx), seq_len, || {
             gemm_batch(&self.ctx, &attn.o_proj, attn_out, out)
         })?;
-        // Row-parallel o_proj: sum the per-rank partials (no-op single-GPU).
         crate::profile::profile_op(&self.ctx, "full/allreduce", Some(full_idx), seq_len, || {
             self.tp.all_reduce_sum(&self.ctx, out)
         })?;
         Ok(())
     }
 
-    /// Paged full attention over `meta`'s ragged page table: qkv GEMM → prep →
-    /// paged attention → sigmoid gate → o_proj → all-reduce. The dispatch
-    /// `(batch, total_q, max_qlen)` makes 1×T, B×1 and the B×T middle one path.
-    /// RoPE is baked into the cached K at write time, so a recall-restricted
-    /// page subset attends exactly those pages (the dense-Qwen3 argument).
+    /// Paged full attention over `meta`'s ragged page table. RoPE is baked into
+    /// the cached K at write time, so a recall-restricted page subset attends
+    /// exactly those pages.
     ///
-    /// `layer0_query` is the `--kv-recall` sink: on a multi-row prefill the
-    /// post-RoPE layer-0 Q is read back for the next step's recall score
-    /// (head-major `[num_q_heads * head_dim]`, matching `recompute_recall_plan`).
+    /// `layer0_query` is the recall sink: on a multi-row prefill the post-RoPE
+    /// layer-0 Q is read back head-major `[num_q_heads * head_dim]`.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn full_attention_paged(
         &self,
@@ -384,8 +359,7 @@ impl Qwen35Model {
             "Qwen3.6 paged full attention: page table covers {} query tokens != {rows} rows",
             meta.total_q
         );
-        // `max_qlen == 1` is the decode kernel's contract (one q row per batch
-        // element); anything longer goes through the ragged prefill kernel.
+        // One q row per batch element is the decode kernel's contract.
         let decode = meta.seq_len == 1;
         let q_dim = self.local_full_attn_q_dim();
         let kv_dim = self.local_full_attn_kv_dim();
@@ -518,11 +492,8 @@ impl Qwen35Model {
             }
         }
 
-        // For quantized pools: BF16 work buffer → quantized data buffer.
-        // The prep kernel above wrote the new tokens BF16 into `k_work` / `v_work`
-        // (= `k_ptr` / `v_ptr` for FP8/INT8 pools). Quantize them into `k_data[layer]`
-        // so the FP8 attention kernel can read the complete token history (prefix from
-        // prior steps + new tokens just written) from one contiguous FP8 pool.
+        // Quantize the BF16 tokens the prep just wrote into `k_data[layer]`, so
+        // the attention kernel reads the whole history from one quantized pool.
         if pool.format != KVFormat::BF16 {
             let new_rows = meta.new_token_rows.as_ref().ok_or_else(|| {
                 anyhow!(
@@ -578,28 +549,16 @@ impl Qwen35Model {
                     Some(full_idx),
                     rows,
                     || {
-                        // sm_90 short queries — decode (1 row) and spec verify
-                        // (block+1): FA3 paged split-KV + PackGQA. The TileLang
-                        // kernel it replaces pads BLOCK_M=64 around the real rows
-                        // and gives one CTA per query head, 6× the KV traffic.
-                        // batch==1 prefill chunks also route here: the 2026-07-28
-                        // kill (c=8 TTFT 12.07→18.23 s) was the one-launch-per-
-                        // request cost on ragged batches; a single request is a
-                        // single launch either way. Ragged multi-request prefill
-                        // and non-Hopper keep TileLang.
-                        //
-                        // Quantized pools (FP8/INT8): Path B first — the native
-                        // kernel reads the 1-byte pools + per-(token,head)
-                        // scales directly, no dequant temp. Decode-shaped and
-                        // self-contained (no Hopper requirement); prefill /
-                        // spec-verify rows and the workspace-overflow case fall
-                        // through to Path A (the FA3 quant shim's per-call
-                        // bf16 temp), then the varlen quantized kernel below.
+                        // Short queries and batch==1 prefill take FA3 paged
+                        // split-KV; ragged multi-request prefill keeps TileLang
+                        // (routing it here cost c=8 TTFT 12.07→18.23 s).
+                        // Quantized pools try the native 1-byte kernel first;
+                        // prefill rows and workspace overflow fall through to
+                        // the FA3 quant shim, then the varlen kernel below.
                         if (meta.seq_len <= FA3_MAX_QLEN || meta.batch == 1) && c.head_dim == 256 {
                             if decode && matches!(pool.format, KVFormat::FP8E4M3 | KVFormat::INT8) {
-                                // Same split derivation as the FA3 lane, capped
-                                // at 16: the pool's split-KV workspace is sized
-                                // for 16 splits at the Qwen3.6 GQA ratio (8).
+                                // Capped at 16: the pool's split-KV workspace is
+                                // sized for 16 splits at the GQA ratio 8.
                                 let splits = self
                                     .ctx
                                     .sm_count()
@@ -656,26 +615,15 @@ impl Qwen35Model {
                             {
                                 let (qp_ptr, _g0) = q_prepped.data.device_ptr_mut(&self.ctx.stream);
                                 let (ao_ptr, _g5) = attn_out.data.device_ptr_mut(&self.ctx.stream);
-                                // ONE launch for the whole batch: q/o are packed
-                                // [total_q, h, d] behind `q_indptr`, and each row's KV
-                                // extent comes from `kv_lens_dev` against the
-                                // rectangular page table. `seqused_k` does not drop the
-                                // K/V batch strides (only `cu_seqlens_k` does,
-                                // flash_api.cpp:105-108), which is what lets a paged
-                                // batch share a launch — per row it was 16 CTAs on 78
-                                // SMs, serialized.
-                                // Split-KV pays only when q is tiny vs kv; a long
-                                // prefill chunk saturates SMs on the q axis alone.
-                                // Upper bound only: FA3 picks the live value itself
-                                // (flash_prepare_scheduler.cu `num_splits_dynamic`),
-                                // clamped by what we pass. pack_gqa leaves batch ×
-                                // kv_heads tiles before splitting, so one tile per SM
-                                // is where the ceiling stops costing anything — raising
-                                // it further only grows the combine scratch, which
-                                // measured +0.36% at batch 8. The historical 8 is the
-                                // floor: it is the measured optimum from batch 4 up,
-                                // and it bound the scheduler only at batch 1, where
-                                // 4×8 = 32 tiles left 46 of 78 SMs idle.
+                                // ONE launch for the whole batch: `seqused_k`
+                                // keeps the K/V batch strides (only `cu_seqlens_k`
+                                // drops them, flash_api.cpp:105-108), which is what
+                                // lets a paged batch share a launch.
+                                // `splits` is an upper bound; FA3 picks the live
+                                // value. One tile per SM is where raising it stops
+                                // paying (+0.36% at batch 8); the floor 8 is the
+                                // measured optimum from batch 4 up and bound only
+                                // batch 1 (32 tiles, 46 of 78 SMs idle).
                                 let splits = if meta.seq_len <= FA3_MAX_QLEN {
                                     match crate::runtime_flags::qwen35_fa3_decode_splits() {
                                         0 => self
@@ -727,9 +675,7 @@ impl Qwen35Model {
                                     num_heads_k: self.local_kv_heads as i32,
                                     head_dim: c.head_dim as i32,
                                     q_row_stride: (self.local_q_heads * c.head_dim) as i64,
-                                    // HND pool [page, h_k, page_size, d]: tokens are
-                                    // contiguous inside a (page, head), heads stride
-                                    // by a page's worth, pages by the whole page.
+                                    // HND pool [page, h_k, page_size, d].
                                     k_row_stride: head_dim,
                                     v_row_stride: head_dim,
                                     o_row_stride: (self.local_q_heads * c.head_dim) as i64,
@@ -750,9 +696,12 @@ impl Qwen35Model {
                                     v_page_stride: stride_page as i64,
                                 };
                                 if pool.format == KVFormat::BF16 {
-                                    // SAFETY: q/o are the live prepped/out buffers; k/v are
-                                    // the layer's pool base; the page table is the meta's
-                                    // rectangular mirror, `batch * page_table_stride` long.
+                                    // SAFETY: q/o are the live prepped/out buffers; k/v
+                                    // are
+                                    // the layer's pool base; the page table is the
+                                    // meta's
+                                    // rectangular mirror, `batch * page_table_stride`
+                                    // long.
                                     unsafe {
                                         ffi::arle_fa3_fwd_hd256_bf16_cuda(
                                             &args,
@@ -792,10 +741,8 @@ impl Qwen35Model {
                                 return Ok(());
                             }
                         }
-                        // A persistent-decode meta means a graph capture may be
-                        // active — the TileLang lane below bakes `num_pages`
-                        // as a host arg and would replay stale, so refuse (the
-                        // capture error downgrades the lane to eager).
+                        // The TileLang lane bakes `num_pages` as a host arg and
+                        // would replay stale under graph capture.
                         ensure!(
                             meta.seqlen_k_capture.is_none(),
                             "paged decode graph capture requires the FA3 BF16 lane"
@@ -804,7 +751,8 @@ impl Qwen35Model {
                             KVFormat::BF16 => {
                                 let (qp_ptr, _g0) = q_prepped.data.device_ptr_mut(&self.ctx.stream);
                                 let (ao_ptr, _g5) = attn_out.data.device_ptr_mut(&self.ctx.stream);
-                                // SAFETY: kernel signature from paged_attn_v1 ABI (18-arg BF16).
+                                // SAFETY: kernel signature from paged_attn_v1 ABI
+                                // (18-arg BF16).
                                 let kernel = ffi::resolve_paged_attn_v1(
                                     c.head_dim as u32,
                                     self.local_q_heads as u32,
@@ -819,7 +767,8 @@ impl Qwen35Model {
                                         self.local_kv_heads
                                     )
                                 })?;
-                                // SAFETY: ptrs from live device allocations sized to the dims passed.
+                                // SAFETY: ptrs from live device allocations sized to
+                                // the dims passed.
                                 unsafe {
                                     kernel(
                                         qp_ptr as *mut ffi::Half,
@@ -845,9 +794,8 @@ impl Qwen35Model {
                                 }
                             }
                             KVFormat::FP8E4M3 | KVFormat::INT8 => {
-                                // Per-(token, kv_head) symmetric quantized KV
-                                // (FP8 E4M3 or INT8). Both share the split-KV
-                                // varlen kernel; `kv_format` selects the load.
+                                // Per-(token, kv_head) symmetric quant; both
+                                // formats share the split-KV varlen kernel.
                                 let ws = pool.quantized_attn_workspace()?;
                                 let max_kv_len = meta.max_kv_len();
                                 kv_quant::decode_attention_varlen_quantized(
@@ -907,13 +855,9 @@ impl Qwen35Model {
             })?;
         }
 
-        // Layer-0 PREFILL: read back the post-RoPE prepped Q for the recall score
-        // (head-major `[num_q_heads * head_dim]`). Under the write-through model the
-        // whole recall cycle (score → evict → prefetch) runs ONCE per prefill, not
-        // per decode step, so only the multi-token prefill needs this signal — the
-        // D2H stays off every other paged forward. `q_prepped` is token-major
-        // `[rows, q_dim]`; the recall query is the mean of the last `m` prompt
-        // tokens' queries (R3 — "what am I about to generate").
+        // The recall cycle runs once per prefill, so the D2H stays off every
+        // other paged forward. The query is the mean of the last `m` prompt
+        // tokens' post-RoPE queries.
         if let Some(dst) = layer0_query
             && full_idx == 0
             && rows > 1
@@ -923,7 +867,7 @@ impl Qwen35Model {
                 .stream
                 .clone_dtoh(&q_prepped.data)
                 .map_err(|e| anyhow!("recall layer0 q dtoh: {e}"))?;
-            const RECALL_PREFILL_Q_TOKENS: usize = 16; // R3 default `m`.
+            const RECALL_PREFILL_Q_TOKENS: usize = 16;
             let m = RECALL_PREFILL_Q_TOKENS.min(rows);
             let mut q = vec![0.0_f32; q_dim];
             for t in (rows - m)..rows {
@@ -942,7 +886,6 @@ impl Qwen35Model {
         crate::profile::profile_op(&self.ctx, "full_paged/o_proj", Some(full_idx), rows, || {
             gemm_batch(&self.ctx, &attn.o_proj, attn_out, out)
         })?;
-        // Row-parallel o_proj: sum the per-rank partials (no-op single-GPU).
         crate::profile::profile_op(
             &self.ctx,
             "full_paged/allreduce",
@@ -954,12 +897,11 @@ impl Qwen35Model {
     }
 
     /// Gated-delta-rule linear attention into `out` (`[hidden, rows]`, beta=0
-    /// out-proj GEMM): in-proj → depthwise conv1d → RECURRENT gated-delta
-    /// (advances the per-slot state in place) → gated output RMSNorm →
-    /// out-proj. The conv ring + recurrent state carry across prefill/decode.
+    /// out-proj GEMM). The conv ring + recurrent state advance in place and
+    /// carry across prefill/decode.
     ///
-    /// `rows = normed.seq_len` is the FLAT column count. Every weight-heavy
-    /// step runs once over all of them; only [`LinearCore`] is per-slot.
+    /// `rows = normed.seq_len` is the FLAT column count: every weight-heavy
+    /// step runs once over all of them, only [`LinearCore`] is per-slot.
     pub(crate) fn linear_attention(
         &self,
         attn: &LinearAttn,
@@ -971,10 +913,8 @@ impl Qwen35Model {
     ) -> Result<()> {
         let c = &self.config;
         let rows = normed.seq_len;
-        // LOCAL per-rank widths (= global config on a single GPU): the fused
-        // [q|k|v] shard, conv channels, recurrent state, and kernel launches all
-        // follow this rank's linear k/v head shard. b/a widths come off the
-        // sharded projection rows directly (`[local_Vh, hidden]`).
+        // LOCAL per-rank widths: conv channels, recurrent state, and launches
+        // all follow this rank's linear k/v head shard.
         let qkv_dim = self.local_linear_qkv_dim();
         let z_dim = self.local_linear_z_dim();
         let b_dim = attn.in_proj_ba.rows / 2;
@@ -1027,8 +967,7 @@ impl Qwen35Model {
                     "linear rows total {total} != {rows} staged columns"
                 );
                 // Each row's columns land at ITS capture offset 0, so a
-                // partial-accept replay re-runs only that slot's prefix. Three
-                // launches for the whole batch, not three per row.
+                // partial-accept replay re-runs only that slot's prefix.
                 if rs.iter().any(|r| r.capture.is_some()) {
                     let (mut dst, mut src, mut sz) = (Vec::new(), Vec::new(), Vec::new());
                     let mut off = 0usize;
@@ -1059,10 +998,9 @@ impl Qwen35Model {
                     }
                     self.batched_copy(capture_copy, &dst, &src, &sz)?;
                 }
-                // Uniform short rows (a DSpark verify tick) pack identically to
-                // the varlen kernels' `s * len` stride, so the whole batch is
-                // one conv + one GDR launch. The per-row loop below is B times
-                // the launches for the same work.
+                // Uniform short rows pack identically to the varlen kernels'
+                // `s * len` stride, so the whole batch is one conv + one GDR
+                // launch instead of B of each.
                 let uniform = rs.first().map(|r| r.len).filter(|len| {
                     (1..=LINEAR_BATCH_MAX_LEN).contains(len) && rs.iter().all(|r| r.len == *len)
                 });
@@ -1183,14 +1121,10 @@ impl Qwen35Model {
             let (w_ptr, _g1) = attn.norm_weight.device_ptr(&self.ctx.stream);
             let (gate_ptr, _g2) = z.data.device_ptr(&self.ctx.stream);
             let (o_ptr, _g3) = normed_out.data.device_ptr_mut(&self.ctx.stream);
-            // SAFETY: gdr_out/norm/z/out valid on ctx.stream; per-head layout from config.
-            // The kernel launches exactly `num_heads` blocks, each normalizing one
-            // flat `[val_dim]` slice at `blockIdx.x * val_dim` — gdr_out/z are
-            // `[rows, Vh*Vd]` row-major, so the grid must cover all
-            // rows*Vh (token, head) slices, not just token 0. `weight[tid]`
-            // is a per-[Vd] broadcast (no blockIdx dependence), so the
-            // extension is exact (the monolith's `rms_norm_gated_batch_into`
-            // passed `seq_len * num_heads` identically).
+            // SAFETY: gdr_out/norm/z/out valid on ctx.stream; per-head layout from
+            // config.
+            // One block per `[val_dim]` slice, so the grid must cover all
+            // rows*Vh (token, head) slices; `weight` is a per-[Vd] broadcast.
             crate::profile::profile_op(&self.ctx, "linear/norm", Some(linear_idx), rows, || {
                 // SAFETY: ptrs from live device allocations sized to the dims passed.
                 unsafe {
@@ -1213,8 +1147,6 @@ impl Qwen35Model {
         crate::profile::profile_op(&self.ctx, "linear/out_proj", Some(linear_idx), rows, || {
             gemm_batch(&self.ctx, &attn.out_proj, normed_out, out)
         })?;
-        // Row-parallel out_proj: ONE all-reduce over the exact `[hidden, rows]`
-        // buffer (no-op single-GPU).
         crate::profile::profile_op(
             &self.ctx,
             "linear/allreduce",
@@ -1226,13 +1158,9 @@ impl Qwen35Model {
     }
 
     /// [`Self::advance_linear_conv_gdr`] for B rows of the SAME `len` in one
-    /// conv + one GDR launch, through the varlen kernels
-    /// [`Self::replay_linear_only_batched`] already uses. Uniform `len` makes
-    /// their `s * len` row stride identical to the trunk's ragged packing, so
-    /// the shared scratch needs no repack.
-    ///
-    /// The recurrent lane, not FlashQLA: a verify chain fits in one FlashQLA
-    /// chunk, so chunk parallelism buys nothing against B times the launches.
+    /// conv + one GDR launch. Uniform `len` makes the varlen kernels' `s * len`
+    /// row stride identical to the trunk's ragged packing, so the shared
+    /// scratch needs no repack.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn advance_linear_conv_gdr_batched(
         &self,
@@ -1259,8 +1187,8 @@ impl Qwen35Model {
         let (b_base, _g1) = b_proj.data.device_ptr(&ctx.stream);
         let (a_base, _g2) = a_proj.data.device_ptr(&ctx.stream);
         let elem = std::mem::size_of::<bf16>() as u64;
-        // Five contiguous B-entry tables in one upload, in the order the
-        // kernels take them: conv x, conv ring, b, a, GDR state.
+        // Five contiguous B-entry tables in one upload, in kernel argument
+        // order: conv x, conv ring, b, a, GDR state.
         host.clear();
         host.resize(5 * b, 0);
         for (i, r) in rs.iter_mut().enumerate() {
@@ -1283,8 +1211,8 @@ impl Qwen35Model {
             .memcpy_htod(host, tbl)
             .map_err(|e| anyhow!("H2D linear batch pointer table: {e}"))?;
         let (base, _gt) = tbl.device_ptr(&ctx.stream);
-        // Same for every layer of a tick, so upload only when the tick's shape
-        // changes. `get` zero-fills a resize, so both dims must be checked.
+        // Same for every layer of a tick, so upload only when its shape
+        // changes; `get` zero-fills a resize, so both dims must be checked.
         let d = batch_len.get(ctx, b)?;
         if len_host.len() != b || len_host[0] != len as i32 {
             len_host.clear();
@@ -1356,20 +1284,12 @@ impl Qwen35Model {
     /// Conv1d (advances `slot.conv_states[linear_idx]`) + gated-delta rule
     /// (advances `slot.gdr_states[linear_idx]`) for one linear layer over
     /// `seq_len` rows. The ONLY persistent-state-mutating core of
-    /// [`Self::linear_attention`], factored out so the partial-accept replay
-    /// re-runs the IDENTICAL kernel dispatch (same conv1d + same
-    /// recurrent/chunked GDR branch, same inputs) — guaranteeing the conv and
-    /// recurrent state advance is byte-identical between the trunk forward and
-    /// the replay.
+    /// [`Self::linear_attention`], so the partial-accept replay re-runs the
+    /// identical dispatch and advances the state byte-identically.
     ///
     /// `qkv_in` is the post-in_proj fused `[q|k|v]` PRE-conv1d (`qkv_dim` wide,
-    /// token-major); conv1d reads it and writes the SEPARATE `qkv_conv`, which
-    /// the GDR then consumes. `b_in`/`a_in` are the `in_proj_b`/`in_proj_a`
-    /// gate projections. Every view spans EXACTLY this slot's `seq_len` rows —
-    /// in a ragged batch that is a column-range slice of the shared scratch, so
+    /// token-major). Every view spans EXACTLY this slot's `seq_len` rows, so
     /// each slot's state sees only its own tokens.
-    /// `gdr_out` is written but discarded by the replay (only the state
-    /// side-effect matters); the trunk path norms it.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn advance_linear_conv_gdr(
         &self,
@@ -1415,7 +1335,8 @@ impl Qwen35Model {
                     Some(linear_idx),
                     seq_len,
                     || {
-                        // SAFETY: ptrs from live device allocations sized to the dims passed.
+                        // SAFETY: ptrs from live device allocations sized to the dims
+                        // passed.
                         unsafe {
                             ffi::conv1d_prefill_cuda(
                                 x_ptr as *const ffi::Half,
@@ -1435,13 +1356,8 @@ impl Qwen35Model {
             }
         }
 
-        // Gated-delta rule. Decode (seq_len==1) is always the recurrent
-        // kernel. Prefill chunks default to the recurrent kernel; the
-        // FlashQLA chunked path (--qwen35-gdr-chunked) replaces the
-        // serial token scan with chunk-parallel TileLang kernels, one AOT
-        // instantiation per (Hg, H) geometry — unknown geometry falls back
-        // to recurrent. The legacy in-tree chunkwise TileLang path stays
-        // dead (sm_90 hang was in ITS kernels).
+        // The FlashQLA chunked path has one AOT instantiation per (Hg, H)
+        // geometry; unknown geometry falls back to the recurrent kernel.
         let fq_fns: Option<(ffi::FqCumsumFn, ffi::FqKktFn, ffi::FqFwdFn)> =
             match (self.local_linear_k_heads, self.local_linear_v_heads) {
                 (16, 32) => Some((
@@ -1463,11 +1379,9 @@ impl Qwen35Model {
             && fq_fns.is_some()
             && fq_kernels_available(&self.ctx);
         if use_fq_chunked {
-            // The AOT dispatch wrapper resolves SM + module via the DRIVER
-            // context of the calling thread; the engine forward thread is not
-            // guaranteed to have one bound (runtime-API kernels don't need
-            // it), which made the fq path a per-thread lottery returning
-            // NOT_SUPPORTED. Bind explicitly.
+            // The AOT dispatch wrapper resolves SM + module via the calling
+            // thread's DRIVER context, which runtime-API kernels never need;
+            // without this bind the fq path returns NOT_SUPPORTED.
             self.ctx
                 .ctx
                 .bind_to_thread()
@@ -1508,7 +1422,8 @@ impl Qwen35Model {
                 Some(linear_idx),
                 seq_len,
                 || {
-                    // SAFETY: ptrs from live device allocations sized to the dims passed.
+                    // SAFETY: ptrs from live device allocations sized to the dims
+                    // passed.
                     unsafe {
                         ffi::gdr_fq_prep_cuda(
                             qkv_ptr as *const ffi::Half,
@@ -1579,7 +1494,8 @@ impl Qwen35Model {
                     Some(linear_idx),
                     seq_len,
                     || {
-                        // SAFETY: all buffers valid on ctx.stream; head dims from config.
+                        // SAFETY: all buffers valid on ctx.stream; head dims from
+                        // config.
                         unsafe {
                             if seq_len == 1 {
                                 ffi::gated_delta_rule_decode_cuda(
@@ -1624,33 +1540,17 @@ impl Qwen35Model {
         Ok(())
     }
 
-    /// Partial-accept linear-only replay: advance ONLY the 48 gated-delta
-    /// recurrent + conv states over the accepted prefix `[pending, d1..dk]`
-    /// (`k+1` rows) from the verify capture, leaving them byte-identical to the
-    /// old full-trunk `forward_hidden` replay at a tiny fraction of its cost.
+    /// Partial-accept linear-only replay: advance ONLY the gated-delta
+    /// recurrent + conv states over the accepted prefix (`k+1` rows) from the
+    /// verify capture.
     ///
     /// Precondition: the caller has just `restore_trunk`-ed the conv + gdr
-    /// states to `S_{start_pos}` (the pre-verify snapshot), so re-running the
-    /// first `k+1` recurrent steps reproduces the verify's `S_{start_pos+k+1}`.
-    /// This re-uses the SAME [`Self::advance_linear_conv_gdr`] dispatch the
-    /// verify forward used, fed the captured per-layer inputs — same conv1d +
-    /// same recurrent/chunked GDR branch + same in-place accumulation, so the
-    /// result is bit-for-bit the verify's first `k+1` steps. The
-    /// recurrent-vs-chunked branch is re-selected from `seq_len = k+1`
-    /// IDENTICALLY to how the old `forward_hidden` replay's `linear_attention`
-    /// selected it (preserving any k==0 decode-vs-chunked path choice).
+    /// states to the pre-verify snapshot, so re-running the first `k+1`
+    /// recurrent steps reproduces the verify's state bit-for-bit.
     ///
-    /// Mutated device buffers (full enumeration):
-    ///   - `slot.conv_states[li]` for every linear layer `li` — advanced k+1
-    ///     steps from the restored S_start (conv1d ring shift, content-based).
-    ///   - `slot.gdr_states[li]` for every linear layer `li` — advanced k+1
-    ///     steps from the restored S_start (recurrent in-place).
-    ///   - `ws.linear` scratch (`qkv_conv`/`gdr_out`/`fq_*`) — fully overwritten
-    ///     per layer before read; transient, no persistent meaning.
-    ///
-    /// Explicitly NOT touched: the 16 full-attn KV caches (self-heal via the
-    /// caller's `set_seq_len` position rewind), `slot.seq_len` (caller sets it),
-    /// MLP/MoE/lm_head (no persistent state). Numerics-only; no H2D/D2H/sync.
+    /// Mutates `slot.conv_states[li]` / `slot.gdr_states[li]` for every linear
+    /// layer plus the `ws.linear` scratch. The full-attn KV caches and
+    /// `slot.seq_len` are the caller's to rewind. No H2D/D2H/sync.
     pub(crate) fn replay_linear_only(
         &self,
         slot: &mut Qwen35SlotState,
@@ -1675,7 +1575,7 @@ impl Qwen35Model {
             capture.rows
         );
         // Each slot's capture holds ITS OWN rows token-major from offset 0, so
-        // the accepted prefix is the leading `rows = k+1` columns.
+        // the accepted prefix is the leading `k+1` columns.
         let qkv_dim = self.local_linear_qkv_dim();
         let z_dim = self.local_linear_z_dim();
         let Qwen35Workspace { linear, .. } = ws;
@@ -1728,8 +1628,7 @@ impl Qwen35Model {
 
     /// [`Self::replay_linear_only`] for a whole batch: one conv1d and one
     /// gated-delta launch per layer instead of two per slot per layer. Each
-    /// slot keeps its own capture and state, reached through `tables`. The
-    /// launches are sub-100 µs, so the win is their count.
+    /// slot keeps its own capture and state, reached through `tables`.
     pub(crate) fn replay_linear_only_batched(
         &self,
         slots: &mut [&mut Qwen35SlotState],
@@ -1837,11 +1736,9 @@ impl Qwen35Model {
         Ok(())
     }
 
-    /// Batched-decode full attention: batched q/k/v projections over all B
-    /// rows, then one split-KV fused decode launch over grid.z = B. The kernel
-    /// reads per-row positions / seq_lens and per-row K/V cache pointers from
-    /// device arrays, so the host never loops over rows for full-attn decode.
-    /// head_dim != 256 keeps the per-row path.
+    /// Batched-decode full attention: one split-KV fused decode launch over
+    /// grid.z = B, reading per-row positions / seq_lens / cache pointers from
+    /// device arrays. head_dim != 256 keeps the per-row path.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn full_attention_batch_rows(
         &self,
@@ -2050,9 +1947,6 @@ impl Qwen35Model {
         }
 
         gemm_batch(&self.ctx, &attn.o_proj, attn_heads, out)?;
-        // Row-parallel o_proj: ONE all-reduce over the exact `[hidden, B]`
-        // buffer — message length is B valid columns by construction (no-op
-        // single-GPU).
         self.tp.all_reduce_sum(&self.ctx, out)?;
         Ok(())
     }

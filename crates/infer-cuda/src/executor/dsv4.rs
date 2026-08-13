@@ -50,87 +50,59 @@ struct PendingPrefixCapture {
 }
 
 /// DSv4-Flash executor: drives [`crate::dsv4::Dsv4Model::forward_tokens`].
-/// Prefill/mixed still run one scheduled row. Pure decode uses B=1 as the
-/// single-row reference and B>1 as the canonical layer-major batched lane for
-/// MODEL1 FlashMLA decode. DSv4 owns its MLA KV state inside the forward (bf16
-/// SW rings + compressor pending/compressed pools), so it does NOT use a
-/// [`PagedKVPool`]. The decode graph is disabled (MLA host-routing per step).
+/// DSv4 owns its MLA KV state inside the forward, so it does NOT use a
+/// [`PagedKVPool`]; the decode graph is disabled (MLA host-routing per step).
 pub(crate) struct Dsv4CudaExecutor {
     pub(crate) model: crate::dsv4::Dsv4Model,
     pub(crate) slots: Vec<crate::dsv4::Dsv4SlotState>,
     pub(crate) kv_adapter: crate::attention::Dsv4KvAdapter,
     pub(crate) spec_slots: Vec<Dsv4SpecSlotState>,
-    /// `Some(n)` = config-driven MTP spec decode on (draft depth `n`, from the
-    /// serve path's `--spec-type mtp`); `None` = no MTP head.
+    /// `Some(n)` = MTP spec decode on at draft depth `n`; `None` = no MTP head.
     pub(crate) spec_draft_tokens: Option<usize>,
-    /// MTP draft candidate width. `None`/`Some(1)` keeps chain-only candidates;
-    /// `Some(k>1)` widens the draft matrix while verifier rows stay chain-shaped.
+    /// MTP draft candidate width; `None`/`Some(1)` keeps chain-only candidates.
     pub(crate) spec_draft_topk: Option<usize>,
     pub(crate) num_slots: usize,
     pub(crate) mtp_accepts: usize,
     pub(crate) mtp_rejects: usize,
     /// Verified MTP draft chains (one per spec row that reached verify).
     pub(crate) mtp_chains: usize,
-    /// Adaptive MTP gate (B=1): EMA of per-step accepted/depth, plus the count of
-    /// consecutive gated skips since the last real spec step (drives the periodic
-    /// probe). MTP only beats no-spec when it emits > t_mtp/t_nospec tok/step, so
-    /// below that acceptance the gate runs a warm no-spec step instead. Init
-    /// optimistic (1.0) so MTP runs until the running acceptance proves it loses.
-    /// See `mtp_should_speculate`. Opt-in via `--mtp-adaptive` (bring-up;
-    /// promote to a `--mtp-adaptive` CLI flag once pod-calibrated).
+    /// EMA of per-step accepted/depth; init 1.0 so MTP runs until the running
+    /// acceptance proves it loses to no-spec. See `mtp_should_speculate`.
     pub(crate) mtp_accept_ema: f32,
     pub(crate) mtp_skip_streak: usize,
-    /// Content-keyed cross-request prefix-state pool (#154 Phase 2): one
-    /// host-resident entry per completed host page, written from the
-    /// post-forward choke point, consumed by the prefix restore path. Also
-    /// the preemption store (Phase 2b): published pages are already captured
-    /// here, so preempt = free pages + requeue, resume = prefix-attach.
+    /// Content-keyed cross-request prefix-state pool: one host-resident entry
+    /// per completed host page, written from the post-forward choke point.
     prefix_state: crate::attention::Dsv4PrefixStatePool,
     pending_prefix_captures: VecDeque<PendingPrefixCapture>,
-    /// DSpark block-drafter state (`--spec-type dspark`). `Some` = the draft is
-    /// loaded and greedy B=1 decode routes through the DSpark
-    /// draft→verify→accept loop instead of MTP; `None` = MTP or no spec. The
-    /// per-slot draft caches ride here (serial spec state, like `spec_slots`).
+    /// `Some` = the DSpark drafter is loaded and greedy decode routes through
+    /// its draft→verify→accept loop instead of MTP.
     pub(crate) dspark: Option<Dsv4DsparkExec>,
-    /// Whole-slot capacity spill store: a demoted slot's complete device image
-    /// (FP8 KV band + per-layer compressor/indexer/DSA/SW-ring carry) is
-    /// serialized here and restored on promote. Without this, KV overflow falls
-    /// back to recompute (expensive for long contexts). Uses the same
-    /// `KvTierStore` transport as the prefix-state pool; NVMe spill is opt-in
-    /// via `set_kv_tier_disk`.
+    /// Whole-slot spill store: a demoted slot's complete device image, restored
+    /// on promote (without it, KV overflow falls back to recompute). NVMe spill
+    /// is opt-in via `set_kv_tier_disk`.
     slot_tier: KvTierStore,
 }
 
-/// Loaded DSpark drafter + its per-slot runtime caches. Present only under
-/// `--spec-type dspark`; off the DSpark path this whole struct is absent (zero
-/// cost). `draft` is the 3-stage block drafter weights; `slots` holds one
-/// per-request latent cache + attention state set, indexed by slot.
 pub(crate) struct Dsv4DsparkExec {
     draft: crate::dsv4::Dsv4DsparkDraft,
     /// Verify-step cost model driving the goodput budget (`--dspark-sps-*-ms`).
     sps: qwen35_spec::DsparkSps,
-    /// Per-request token ceiling — the block spec step falls back to a single
-    /// non-spec token when the worst-case chain would cross it.
+    /// Per-request token ceiling; a block whose worst-case chain crosses it
+    /// falls back to one non-spec token.
     max_seq_len: usize,
     slots: Vec<Dsv4DsparkRuntime>,
 }
 
-/// One slot's DSpark draft runtime: the per-stage latent KV cache (`df`), the
-/// pooled block-shaped scratch, and one attention state per draft stage
-/// (`config.dspark_num_stages()`). Pre-allocated at construction — spec steps
-/// are serial, so exact-shape reuse (no per-step alloc) holds.
+/// Pre-allocated at construction — spec steps are serial, so exact-shape reuse
+/// (no per-step alloc) holds.
 struct Dsv4DsparkRuntime {
     df: crate::dsv4::dspark::Dsv4DsparkSlotState,
     scratch: crate::dsv4::dspark::Dsv4DsparkScratch,
     attn_states: Vec<crate::attention::Dsv4LayerAttentionState>,
 }
 
-/// One demoted slot: the device-state image plus the executor-level MTP spec
-/// chain. `spec_pending`/`spec_hidden` MUST ride along (not reset): under
-/// `--spec-type mtp` the resumed decode hard-requires the pending token and
-/// the previous MTP stream (`forward_decode_tokens` errors on a missing
-/// pending), and the slot's spec state is overwritten by whichever request
-/// occupies the slot while this one is demoted.
+/// MTP spec carry; must ride along a demote/promote, since a resumed decode
+/// requires the pending token and the hidden staged with it.
 #[derive(Default)]
 pub(crate) struct Dsv4SpecSlotState {
     pub(crate) pending: Option<u32>,
@@ -423,13 +395,12 @@ impl std::fmt::Debug for Dsv4CudaExecutor {
 }
 
 impl Dsv4CudaExecutor {
-    /// Gate active only for demand-paged bands; identity/V32 draw the full
-    /// band at slot alloc.
+    /// Active only for demand-paged bands; identity/V32 draw the full band at
+    /// slot alloc.
     pub(crate) fn kv_device_gate_active(&self) -> bool {
         self.kv_adapter.flashmla_demand_paged()
     }
 
-    /// Device-budget plan gate (#160): per-layer, per-row band fit.
     /// Lockstep-safe without a collective: band pools mutate only from the
     /// rank-identical plan stream, so every rank computes the same fit.
     pub(crate) fn kv_device_fit(
@@ -463,17 +434,13 @@ impl Dsv4CudaExecutor {
         ensure!(max_seq_len > 0, "Dsv4CudaExecutor requires max_seq_len > 0");
         let mtp_draft_tokens_for_load = mtp_draft_tokens
             .or_else(|| mtp_draft_topk.map(|_| crate::dsv4::DEFAULT_SPEC_DRAFT_DEPTH));
-        // Pass the draft dir through: the builder reads its config for DSpark
-        // metadata and derives `spec_decode_on` (which allocates the per-slot
-        // spec-ring snapshots MTP and DSpark share).
+        // The builder reads the draft config to derive `spec_decode_on`, which
+        // allocates the per-slot spec-ring snapshots MTP and DSpark share.
         let mut model = crate::dsv4::Dsv4Model::from_dsv4_fp8_safetensors(
             model_path.as_ref(),
             mtp_draft_tokens_for_load,
             dspark_draft_model,
         )?;
-        // [vram-probe] TEMP bit-exact VRAM attribution (remove after budget unification).
-        // Returns measured-used bytes (or None when mem_get_info fails) so the
-        // ledger can reconcile predicted device_bytes() against the measured used.
         let mem_dbg = |tag: &str| -> Option<usize> {
             match cudarc::driver::result::mem_get_info() {
                 Ok((free, total)) => {
@@ -513,31 +480,26 @@ impl Dsv4CudaExecutor {
                 Ok(draft)
             })
             .transpose()?;
-        // Reclaim the cuMemAllocAsync pool BEFORE measuring free VRAM: weight
-        // loading allocs+frees large device scratch (FP8 dequant, DeepGEMM cache
-        // build, staging), and the retain-threshold=MAX pool holds it — so
-        // `mem_get_info` in the budget would count freed loading scratch as USED
-        // and starve the KV slot count. Trim returns it to the OS so the budget
-        // sees the true free (recovers the KV slots those GB should fund).
+        // Reclaim the cuMemAllocAsync pool BEFORE measuring free VRAM: it retains
+        // freed weight-load scratch, which the budget would count as USED and
+        // starve the KV slot count.
         if let Err(e) = model.ctx.trim_memory_pool() {
             log::warn!("pre-KV-budget trim_memory_pool failed (non-fatal): {e}");
         }
         let weights_used_at_model_load = mem_dbg("after weight-load pool trim");
-        // DSpark per-slot runtime (latent KV + draft attention states) is allocated
-        // after kv_budget_plan; count it here so num_slots doesn't over-commit.
+        // DSpark per-slot runtime is allocated after kv_budget_plan; count it
+        // here so num_slots doesn't over-commit.
         let dspark_per_slot_bytes = if dspark_draft.is_some() {
             let num_stages = model.config.dspark_num_stages();
             let block_size = model.config.dspark_block_size;
             let head_dim = model.config.head_dim;
             // Sliding-window draft latent: fixed `window + block`, no prompt growth.
             let draft_span = model.config.sliding_window + block_size;
-            // latent_kv: num_stages buffers, each [draft_span * head_dim] bf16.
             let latent_kv = num_stages
                 .saturating_mul(draft_span)
                 .saturating_mul(head_dim)
                 .saturating_mul(std::mem::size_of::<half::bf16>());
-            // Draft attention states: num_stages KV caches at draft_span. Rough
-            // estimate; the adapter's per_slot already covers the trunk layers.
+            // Rough estimate; the adapter's per_slot already covers the trunk layers.
             let attn = num_stages
                 .saturating_mul(draft_span)
                 .saturating_mul(head_dim)
@@ -550,7 +512,6 @@ impl Dsv4CudaExecutor {
         let num_slots = budget.num_slots;
         let kv_adapter = model.new_kv_adapter(max_seq_len, budget)?;
         mem_dbg("after new_kv_adapter (KV pools)");
-        // [vram-ledger] PREDICTED adapter device bytes + per-component breakdown.
         log::info!(
             "[vram-ledger] adapter predicted {}MB; breakdown {:?}",
             kv_adapter.device_bytes() >> 20,
@@ -565,7 +526,6 @@ impl Dsv4CudaExecutor {
             slots.push(model.new_slot_state(max_seq_len, slot_idx, &kv_adapter)?);
             if slot_idx == 0 {
                 mem_dbg("after slot 0 (per-slot state)");
-                // [vram-ledger] PREDICTED slot-0 device bytes + per-component breakdown.
                 log::info!(
                     "[vram-ledger] slot0 predicted {}MB; breakdown {:?}",
                     slots[0].device_bytes() >> 20,
@@ -575,8 +535,6 @@ impl Dsv4CudaExecutor {
                         .map(|(name, bytes)| (*name, bytes >> 20))
                         .collect::<Vec<_>>()
                 );
-                // [vram-ledger] Attribute the per-slot attention bulk to the exact
-                // buffer family, summed across all layers (every bit's source named).
                 log::info!(
                     "[vram-ledger] slot0 attention sub-totals (Σ layers) {:?}",
                     slots[0]
@@ -585,10 +543,9 @@ impl Dsv4CudaExecutor {
                         .map(|(name, bytes)| (*name, bytes >> 20))
                         .collect::<Vec<_>>()
                 );
-                // Drift guard: the KV budget divides free VRAM by the STATIC
-                // `per_slot_device_bytes`; if it drifts from the real slot alloc,
-                // `affordable` mis-clamps num_slots and engine build OOMs (the
-                // 43→382 MB under-count). Warn on >5% so it can't silently return.
+                // The KV budget divides free VRAM by the STATIC
+                // `per_slot_device_bytes`; drift from the real slot alloc
+                // mis-clamps num_slots and engine build OOMs. Warn above 5%.
                 let predicted = model.per_slot_device_bytes(max_seq_len)?;
                 let actual = slots[0].device_bytes();
                 let drift = (predicted as i64 - actual as i64).unsigned_abs() as usize;
@@ -604,13 +561,9 @@ impl Dsv4CudaExecutor {
             }
         }
         let measured_used_after_all = mem_dbg("after all slots (build complete)");
-        // [vram-ledger] Reconcile PREDICTED cumulative device_bytes against the
-        // measured used. residual = measured_used
-        //   - (weights_used_at_model_load + adapter.device_bytes() + Σ slot.device_bytes()).
-        // The residual is everything NOT in the named-buffer ledger: CUDA context
-        // + library reservations + per-cudaMalloc allocation rounding across the
-        // ~258 tiny per-layer allocs/slot. A large residual points the gap there,
-        // a small one means the named buffers fully account for the slot cost.
+        // Residual = measured used - (weights + adapter + Σ slots): everything not
+        // in the named-buffer ledger — CUDA context, library reservations, and
+        // per-cudaMalloc rounding across the ~258 tiny per-layer allocs/slot.
         let adapter_bytes = kv_adapter.device_bytes();
         let slots_bytes: usize = slots.iter().map(|s| s.device_bytes()).sum();
         log::info!(
@@ -625,8 +578,7 @@ impl Dsv4CudaExecutor {
             (measured_used_after_all, weights_used_at_model_load)
         {
             let predicted_total = weights + adapter_bytes + slots_bytes;
-            // Saturating signed residual: usually positive (ctx/libs/rounding),
-            // but guard the rare measured < predicted (measurement skew).
+            // Signed: measured can dip below predicted on measurement skew.
             let residual_mb = (measured as i64 - predicted_total as i64) >> 20;
             log::info!(
                 "[vram-ledger] residual (ctx+libs+cudaMalloc rounding) = {residual_mb}MB \
@@ -648,8 +600,7 @@ impl Dsv4CudaExecutor {
             &layer_specs,
             model.kv_arena.page_block_size,
         );
-        // DSpark weights were loaded before KV budgeting; only per-slot runtime
-        // state is allocated here.
+        // Weights were loaded before KV budgeting; only per-slot runtime here.
         let dspark = dspark_draft
             .map(|draft| {
                 Self::load_dspark_exec(
@@ -664,9 +615,7 @@ impl Dsv4CudaExecutor {
             })
             .transpose()?;
         model.boot_mega_moe(num_slots.max(256))?;
-        // Whole-slot spill tier: same `KvTierStore` transport as the prefix
-        // pool, 16 MiB chunked blobs (a DSv4 slot image is far larger than one
-        // fixed page). NVMe spill is opt-in via `set_kv_tier_disk`.
+        // Chunked blobs: a DSv4 slot image is far larger than one fixed page.
         let slot_tier = KvTierStore::with_budget(
             default_t1_budget_bytes(DEFAULT_DRAM_FRACTION),
             BLOB_CHUNK_BYTES,
@@ -700,11 +649,7 @@ impl Dsv4CudaExecutor {
         Ok(exec)
     }
 
-    /// Provision per-slot caches for the preloaded DSpark drafter. The
-    /// main checkpoint's config MUST be DSpark-capable (`is_dspark()`, i.e. it
-    /// carries `dspark_block_size` + target-layer ids so the T3 taps exist); the
-    /// isolated MLA attention (`compress_ratio == 0`) gets its own attention state;
-    /// the draft latent cache is sized to the request token ceiling.
+    /// Provision per-slot caches for the preloaded DSpark drafter.
     fn load_dspark_exec(
         model: &crate::dsv4::Dsv4Model,
         kv_adapter: &crate::attention::Dsv4KvAdapter,
@@ -721,15 +666,12 @@ impl Dsv4CudaExecutor {
         );
         let num_stages = model.config.dspark_num_stages();
         let block_size = model.config.dspark_block_size;
-        // Draft-stage attention is pure MLA (`compress_ratio == 0`, no CSA/HCA):
-        // the same mode the trunk uses for a ratio-0 layer. The stage attends its
-        // OWN `latent_kv`, not the trunk KV pool, so the pool arg is a bookkeeping
-        // handle only (layer 0's), and `max_seq_len` sizes the draft's own span.
+        // A draft stage attends its OWN `latent_kv`, not the trunk KV pool, so
+        // the pool arg is a bookkeeping handle only (layer 0's).
         let stage_mode = model.config.attention_mode_for_compress_ratio(0);
         let stage_pool = kv_adapter.layer(0)?;
-        // Draft latent KV cache is sliding-window: fixed `sliding_window + block`
-        // ring, independent of prompt length. Full-context draft latent OOMs on
-        // long prompts (linear growth → router disabled DSpark on >64 tok).
+        // Sliding-window draft latent, independent of prompt length: a
+        // full-context latent grows linearly and OOMs on long prompts.
         let draft_span = model.config.sliding_window + block_size;
         let slots = (0..num_slots)
             .map(|slot_idx| -> Result<_> {
@@ -785,9 +727,8 @@ impl Dsv4CudaExecutor {
         })
     }
 
-    /// Publish every host page this forward completed for `slot` into the
-    /// content-keyed prefix-state pool (#154 Phase 2 write hook). Best-effort:
-    /// a publish failure only forfeits a future reuse, never the forward.
+    /// Best-effort: a publish failure only forfeits a future reuse, never the
+    /// forward.
     fn enqueue_prefix_capture(
         &mut self,
         slot: usize,
@@ -798,10 +739,8 @@ impl Dsv4CudaExecutor {
             return Ok(());
         }
         let slot_epoch = self.kv_adapter.slot_epoch(slot).unwrap_or(u64::MAX);
-        // A fence-record failure DROPS the capture (its pages are host-only
-        // clones, released by plain drop — same as poll's cancelled path): a
-        // fence-less entry at the front would never poll Ready, pinning
-        // `prefix_capture_queue_full` true forever.
+        // A fence-record failure DROPS the capture: a fence-less entry at the
+        // front would never poll Ready, pinning the queue full forever.
         let fence = self
             .model
             .ctx
@@ -830,8 +769,8 @@ impl Dsv4CudaExecutor {
             match status {
                 Ok(CudaPipelineFenceStatus::NotReady) => return,
                 Err(err) => {
-                    // Sticky query error: drop the capture so the queue drains
-                    // instead of re-warning every tick behind a stuck front.
+                    // Query errors are sticky: drop the capture so the queue
+                    // drains instead of stalling behind a stuck front.
                     warn!("DSv4 prefix capture fence failed; dropping capture: {err:#}");
                     self.pending_prefix_captures.pop_front();
                     continue;
@@ -898,7 +837,6 @@ impl Dsv4CudaExecutor {
             return;
         }
         let align = self.model.config.sliding_window.max(1);
-        // Phase 1: enqueue every page's D2H clones (stream-ordered, no sync).
         let mut captured = Vec::new();
         let mut capture_failed = false;
         for page_index in (start_pos / page_tokens)..(end_pos / page_tokens) {
@@ -911,14 +849,10 @@ impl Dsv4CudaExecutor {
                 capture_failed = true;
                 break;
             };
-            // Boundary sections exist only when the forward ended exactly here;
-            // restore commits only at `align` multiples, so skip odd page ends.
-            // An MTP multi-token commit that CROSSES a boundary (page_end <
-            // end_pos) also skips: the SW ring advances every token, so the
-            // boundary-instant ring (and, once a compress block completes, the
-            // overlap registers) is unrecoverable — correctness over coverage;
-            // the presence-check (`reusable_prefix_blocks`) simply won't
-            // commit there.
+            // Boundary sections exist only when the forward ended exactly here,
+            // and restore commits only at `align` multiples. A commit that
+            // CROSSES the page end is unrecoverable — the SW ring advances every
+            // token, so the boundary-instant ring is already gone.
             let boundary = page_end == end_pos && page_end.is_multiple_of(align);
             match self.slots[slot].capture_prefix_page(
                 &self.model.ctx,
@@ -955,15 +889,11 @@ impl Dsv4CudaExecutor {
         }
     }
 
-    /// Finish write-through (`--dsv4-decode-reuse`): publish content-keyed pool
-    /// entries for the finished slot's whole sealed region + the frontier tail,
-    /// so a later turn restores to the EXACT finish position instead of flooring
-    /// at a page boundary. Publication waits on the capture's compute-stream
-    /// fence; decode-lane per-tick publish is a no-op under this flag. Publishes
-    /// PROVISIONAL onto the slot's own page ids exactly like the prefill publish;
-    /// the finish's `save_prefix_sidecar` confirm/repair (running right after)
-    /// reconciles them to the radix's canonical ids. Best-effort: a failure only
-    /// forfeits a future reuse, never the finish.
+    /// Publish pool entries for the finished slot's sealed region + frontier
+    /// tail, so a later turn restores to the EXACT finish position instead of
+    /// flooring at a page boundary. Entries land PROVISIONAL on the slot's own
+    /// page ids; the finish's `save_prefix_sidecar` reconciles them to the
+    /// radix's canonical ids. Best-effort: a failure only forfeits a reuse.
     pub(crate) fn capture_finish_frontier(
         &mut self,
         slot: usize,
@@ -989,9 +919,8 @@ impl Dsv4CudaExecutor {
         let matched_len = sealed_pages * page_tokens;
         let index_head_dim = self.model.config.index_head_dim;
         let frontier = sealed_pages - 1;
-        // Phase 1: enqueue D2H clones (stream-ordered, no sync). A content page
-        // the prefill publish already stored is skipped; the frontier is always
-        // (re)captured to attach its tail + carry at finish_len.
+        // A page the prefill publish already stored is skipped; the frontier is
+        // always recaptured to attach its tail + carry at finish_len.
         let mut captured = Vec::new();
         let mut capture_failed = false;
         for page_index in 0..sealed_pages {
@@ -1007,9 +936,8 @@ impl Dsv4CudaExecutor {
             if !is_frontier && self.prefix_state.page_meta(page_id).is_some() {
                 continue;
             }
-            // A tail-less chunk-end boundary entry licenses ANY continuation; a
-            // finish-frontier recapture (tail-gated at finish_len) would veto every
-            // diverging suffix (#166). Keep it — the finish forfeits only the sub-page tail.
+            // A tail-less boundary entry licenses ANY continuation; a tail-gated
+            // recapture would veto every diverging suffix (#166).
             if is_frontier
                 && self
                     .prefix_state
@@ -1070,8 +998,8 @@ impl Dsv4CudaExecutor {
         Ok(())
     }
 
-    /// Radix evicted these host pages: drop their pool entries (the pool's
-    /// lifetime rides the radix, no independent lifetime above the DRAM budget).
+    /// Radix evicted these host pages: drop their pool entries — the pool's
+    /// lifetime rides the radix, it has no independent one.
     pub(crate) fn release_prefix_pages(&mut self, pages: &[u32]) {
         for capture in &mut self.pending_prefix_captures {
             for page in &mut capture.pages {
@@ -1081,8 +1009,7 @@ impl Dsv4CudaExecutor {
         self.prefix_state.remove_pages(pages);
     }
 
-    /// Slot free/abort returned these pages to the pool: drop provisional
-    /// entries only (see `Dsv4PrefixStatePool::remove_provisional_pages`).
+    /// Slot free/abort returned these pages: drop provisional entries only.
     pub(crate) fn release_provisional_prefix_pages(&mut self, pages: &[u32]) {
         for capture in &mut self.pending_prefix_captures {
             for page in &mut capture.pages {
@@ -1092,8 +1019,8 @@ impl Dsv4CudaExecutor {
         self.prefix_state.remove_provisional_pages(pages);
     }
 
-    /// Radix publish confirmed these pages (engine `save_prefix_sidecar` arm):
-    /// flip their pool entries from provisional to readable.
+    /// Radix publish confirmed these pages: flip their pool entries from
+    /// provisional to readable.
     pub(crate) fn confirm_prefix_pages(&mut self, pages: &[u32]) {
         for capture in &mut self.pending_prefix_captures {
             for page in &mut capture.pages {
@@ -1103,10 +1030,10 @@ impl Dsv4CudaExecutor {
         self.prefix_state.confirm_pages(pages);
     }
 
-    /// #157 confirm-time repair. `canonical` is the radix chain the sidecar
-    /// rides; `slot_pages` is the finishing slot's own chain at the same
-    /// positions. Where dedup diverged them and the canonical entry is
-    /// missing, adopt the slot's provisional entry under the canonical id.
+    /// `canonical` is the radix chain the sidecar rides; `slot_pages` is the
+    /// finishing slot's own chain at the same positions. Where dedup diverged
+    /// them and the canonical entry is missing, adopt the slot's provisional
+    /// entry under the canonical id.
     pub(crate) fn repair_prefix_pool_chain(&mut self, canonical: &[u32], slot_pages: &[u32]) {
         for (&canon, &own) in canonical.iter().zip(slot_pages) {
             if canon != own {
@@ -1122,11 +1049,9 @@ impl Dsv4CudaExecutor {
         self.poll_prefix_captures();
     }
 
-    /// Attach the opt-in NVMe disk spill level (pre-serve only). The whole
-    /// `--kv-disk` cap funds the prefix pool (Phase 2b deleted the whole-slot
-    /// park store). The cap is soft: over it, publish drops the pool's oldest
-    /// entries — capacity never blocks a forward and never enters the reuse
-    /// license.
+    /// Attach the opt-in NVMe disk spill level (pre-serve only). The cap is
+    /// soft: over it, publish drops the oldest entries — capacity never blocks
+    /// a forward and never enters the reuse license.
     pub(crate) fn set_kv_tier_disk(
         &mut self,
         root: std::path::PathBuf,
@@ -1259,15 +1184,10 @@ impl Dsv4CudaExecutor {
         }
     }
 
-    /// Content-keyed reuse license (#154 Phase 2): a leading page is
-    /// attachable only while every page before and including it has a pool
-    /// entry; the COMMIT point additionally requires the page to carry the
-    /// carry (boundary) sections. Pages between commit points keep the scan
-    /// alive without advancing it. Pool presence covers host DRAM and disk
-    /// alike — licensing never does capacity math. Finish write-through
-    /// (`--dsv4-decode-reuse`) captures the carry at the exact finish position
-    /// (rides the frontier entry, not a ring boundary), so it commits at any
-    /// carry-bearing page; the default path keeps the `sliding_window` gate.
+    /// Reuse license: a leading page is attachable only while every page up to
+    /// and including it has a pool entry; committing additionally requires the
+    /// page to carry the boundary sections. Pool presence covers host DRAM and
+    /// disk alike — licensing never does capacity math.
     pub(crate) fn reusable_prefix_blocks(&self, blocks: &[PrefixBlock]) -> usize {
         let page_tokens = self.model.kv_arena.page_block_size;
         if page_tokens == 0 {
@@ -1277,8 +1197,8 @@ impl Dsv4CudaExecutor {
         let reuse = crate::runtime_flags::dsv4_decode_reuse_enabled();
         let mut committed = 0usize;
         for (idx, block) in blocks.iter().enumerate() {
-            // Fail closed on demoted keys: DSv4 pages never demote through
-            // the radix tier (demote_prefix_pages returns 0).
+            // Fail closed on demoted keys: DSv4 pages never demote through the
+            // radix tier.
             let PrefixBlock::ResidentPage(page_id) = *block else {
                 break;
             };
@@ -1293,16 +1213,11 @@ impl Dsv4CudaExecutor {
         committed
     }
 
-    /// Request-admission reuse length: like [`Self::reusable_prefix_blocks`] but
-    /// a finish-write-through frontier (a boundary page carrying a sub-page tail)
-    /// commits ONLY when `prompt` is a verified continuation through the finish
-    /// position — `prompt[page_end..page_end+tail] == entry.tail_tokens`. The
-    /// radix proves content identity to the page boundary; the tail is a prior
-    /// turn's continuation and a divergent/shorter prompt must not restore it
-    /// (else a page-prefix collision injects a different request's KV, or the
-    /// over-restore crashes on `seq_len > append_pos`). A tail-less boundary page
-    /// (carry at its own page boundary) commits unconditionally. Flag OFF →
-    /// strict page-aligned count, unchanged.
+    /// Like [`Self::reusable_prefix_blocks`], but a frontier page carrying a
+    /// sub-page tail commits ONLY when `tokens` is a verified continuation
+    /// through the finish position: the radix proves identity to the page
+    /// boundary only, so a divergent prompt would otherwise restore a different
+    /// request's KV (or over-restore into `seq_len > append_pos`).
     pub(crate) fn reusable_prefix_blocks_for_prompt(
         &self,
         blocks: &[PrefixBlock],
@@ -1328,9 +1243,7 @@ impl Dsv4CudaExecutor {
             }
             let page_end = (idx + 1) * page_tokens;
             let commit = match self.prefix_state.frontier_tail_tokens(page_id) {
-                // Carry at this page's own boundary — always valid.
                 None => true,
-                // Frontier tail: valid only for a verified continuation.
                 Some(tail) => {
                     let finish = page_end + tail.len();
                     tokens.len() >= finish && tokens[page_end..finish] == *tail
@@ -1343,18 +1256,15 @@ impl Dsv4CudaExecutor {
         committed
     }
 
-    /// The boundary sections only exist at a forward's own end position —
-    /// without this, a single-call prefill never visits an earlier boundary.
+    /// Boundary sections exist only at a forward's own end position, so without
+    /// this a single-call prefill never visits an earlier boundary.
     pub(crate) fn prefill_restore_boundary_alignment(&self) -> usize {
         self.model.config.sliding_window.max(1)
     }
 
     /// Largest single prefill forward; also the restore-snapshot grain when it
-    /// exceeds the boundary alignment. Default 2048 (plan Phase 3 flip,
-    /// 2026-07-17 gates: c1 TTFT 3031→1088 ms, c16 out +138%, ITL p99 −293 ms,
-    /// needle zero-miss ×2 passes). Clamped to `[128, DSV4_PREFILL_QUERY_CHUNK]`
-    /// (the shared prefill scratch M bound), min'd with the deepep_ll per-forward
-    /// token cap, and rounded down to a 128 multiple so chunk ends stay on the
+    /// exceeds the boundary alignment. 2048 licensed by c1 TTFT 3031→1088 ms,
+    /// c16 out +138%. Rounded down to a 128 multiple so chunk ends stay on the
     /// ring/snapshot alignment.
     pub(crate) fn max_prefill_chunk(&self) -> usize {
         const DEFAULT_PREFILL_CHUNK: usize = 2048;
@@ -1365,16 +1275,11 @@ impl Dsv4CudaExecutor {
         (cap / 128 * 128).max(grain)
     }
 
-    /// Restore a radix-matched prefix into `slot` from the content-keyed pool
-    /// (#154 Phase 2 read hook; engine calls via the restore_prefix_sidecar
-    /// seam AFTER attaching the host pages). Every entry decodes to owned
-    /// host state first, so a missing/undecodable page aborts before any
-    /// device byte moves; an `Err` propagates to the engine's fallback
-    /// (free slot, full recompute) — never a partial restore.
-    /// Returns the EXTRA tokens restored beyond `matched_len` (`0` = restored
-    /// exactly the page-aligned match). Finish write-through (`--dsv4-decode-
-    /// reuse`) restores the sub-page tail carried on the last entry, so the slot
-    /// advances to the exact finish position and the engine prefills only past it.
+    /// Restore a radix-matched prefix into `slot`; call AFTER attaching the
+    /// host pages. Every entry decodes to owned host state first, so a
+    /// missing/undecodable page aborts before any device byte moves — never a
+    /// partial restore. Returns the EXTRA tokens restored beyond `matched_len`
+    /// (`0` = restored exactly the page-aligned match).
     pub(crate) fn restore_prefix_state(
         &mut self,
         slot: usize,
@@ -1395,11 +1300,8 @@ impl Dsv4CudaExecutor {
             page_tokens > 0 && matched_len > 0,
             "DSv4 prefix restore needs a non-empty match (matched_len {matched_len})"
         );
-        // D4 hard error: an unaligned match means the engine trim/clamp
-        // ordering regressed — fail loud, never silently skip the ring restore.
-        // Finish write-through reuses at any page boundary (the ring alignment
-        // rides the frontier entry's captured carry, not `matched_len`), so it
-        // only requires page alignment.
+        // An unaligned match means the engine trim/clamp ordering regressed —
+        // fail loud, never silently skip the ring restore.
         ensure!(
             matched_len.is_multiple_of(page_tokens) && (reuse || matched_len.is_multiple_of(align)),
             "DSv4 prefix restore matched_len {matched_len} not aligned to ring {align} / page {page_tokens}"
@@ -1413,13 +1315,9 @@ impl Dsv4CudaExecutor {
             .iter()
             .map(|&page_id| self.prefix_state.read_entry(page_id))
             .collect::<Result<Vec<_>>>()?;
-        // The frontier entry may carry a sub-page tail (a finish write-through
-        // that landed off a page boundary). Reuse it ONLY for a verified
-        // continuation: the tail `[matched_len, finish_len)` has no radix key,
-        // so the prompt must actually contain those exact tokens. A divergent or
-        // shorter prompt falls back to the page-aligned match (`tail_len 0`) —
-        // never restore a prior turn's tail. The carry lives only at the finish
-        // position, so restore is atomic to `finish_len`.
+        // The frontier's sub-page tail has no radix key, so reuse it only when
+        // the prompt actually contains those exact tokens; otherwise fall back
+        // to the page-aligned match.
         let frontier = *prefix_pages.last().expect("matched_len > 0 ⇒ ≥1 page");
         let tail_len = match self.prefix_state.frontier_tail_tokens(frontier) {
             Some(tail)
@@ -1434,10 +1332,9 @@ impl Dsv4CudaExecutor {
         let finish_len = matched_len + tail_len;
         self.kv_adapter
             .mirror_full_band(&self.model.ctx, slot, finish_len)?;
-        // A17: a restored occupant enters Decoding without a tail warm step
-        // for its MTP chain; stale spec state belongs to the prior occupant. The
-        // DSpark draft latent cache is the same story — rebase it to the restored
-        // frontier so the first block drafts against fresh, in-request features.
+        // A restored occupant enters Decoding without a tail warm step, so any
+        // spec state here belongs to the prior occupant; rebase the DSpark
+        // latent cache to the restored frontier for the same reason.
         self.spec_slots[slot] = Dsv4SpecSlotState::default();
         self.reset_dspark_slot(slot, finish_len);
         self.slots[slot].restore_prefix_state(
@@ -1453,16 +1350,13 @@ impl Dsv4CudaExecutor {
         Ok(tail_len)
     }
 
-    /// `BackendExecutor::tp_sync_min` — see there for why the scheduler needs
-    /// this (2026-07-05 TP=4 admission livelock).
+    /// `BackendExecutor::tp_sync_min` — see there for why the scheduler needs it.
     pub(crate) fn tp_sync_min(&self, local: usize) -> Result<usize> {
         self.tp_min_usize(local, "admission free pages")
     }
 
     /// One no-spec greedy forward that ALSO stages the MTP draft state (pending
-    /// token + stream hidden) so a subsequent `spec_step` can resume. Shared by
-    /// final-prefill (seeds the first chain) and the adaptive gate's fallback (a
-    /// low-acceptance step runs at no-spec cost but keeps the draft head warm).
+    /// token + stream hidden) so a subsequent `spec_step` can resume.
     fn forward_mtp_warm_step(
         &mut self,
         slot_idx: usize,
@@ -1498,7 +1392,6 @@ impl Dsv4CudaExecutor {
             let token = if final_prefill {
                 self.forward_mtp_warm_step(slot_idx, tokens, start_pos, params, position)?
             } else {
-                // Non-final chunk: emit the token, drop any stale draft state.
                 let (token, _hidden) = self.model.forward_tokens_with_hidden(
                     &mut self.slots[slot_idx],
                     &mut self.kv_adapter,
@@ -1558,23 +1451,14 @@ impl Dsv4CudaExecutor {
             )?;
             return Ok(vec![token]);
         }
-        // DSpark block spec (`--spec-type dspark`): the draft→verify→accept loop
-        // replaces MTP for greedy decode. Off the DSpark path (`dspark` is
-        // `None`), MTP runs below byte-identically.
         if self.dspark.is_some() {
             return self.dspark_decode_tokens(slot_idx, last_token, start_pos, params, position);
         }
-        // Self-heal an un-seeded / desynced MTP stream (#140). A request that
-        // enters Decoding WITHOUT a tail prefill — a full position-0 prefix-cache
-        // hit or a whole-slot promote, both of which reset `spec_slots` to
-        // default (pending=None) and rely on a tail warm-step that never runs on
-        // a full hit — reaches its first decode spec_step with no pending token.
-        // The old code bailed the whole TP group (crash observed ~613 verify
-        // ticks into sustained serving once the prefix cache warmed). Instead
-        // re-seed via one warm no-spec step for `last_token`: it stages
-        // pending + hidden and emits the token, so the NEXT step runs real MTP.
-        // A pending that disagrees with `last_token` is a stream desync (the
-        // staged hidden belongs to a different token) — same recovery, warned.
+        // Self-heal an un-seeded / desynced MTP stream (#140): a request that
+        // enters Decoding without a tail prefill (full prefix-cache hit or
+        // whole-slot promote) has no pending token, and a pending disagreeing
+        // with `last_token` means the staged hidden belongs to another token.
+        // Re-seed with one warm step instead of bailing the TP group.
         let seeded = match self.spec_slots[slot_idx].pending {
             Some(pending) if pending == last_token => true,
             Some(pending) => {
@@ -1591,15 +1475,10 @@ impl Dsv4CudaExecutor {
                 self.forward_mtp_warm_step(slot_idx, &[last_token], start_pos, params, position)?;
             return Ok(vec![token]);
         }
-        // Adaptive gate (B=1): when the running acceptance EMA predicts MTP would
-        // lose to no-spec, run a warm no-spec step instead — keeps the draft head
-        // staged so MTP resumes the moment acceptance recovers (a periodic probe
-        // forces one real step to refresh the EMA). The warm step needs the MTP
-        // hidden so it takes the eager forward (not the decode-graph fast path):
-        // it costs eager-no-spec, a touch above t_nospec, which only narrows the
-        // win — calibrate MIN_ACCEPT against that. NOTE: the EMA + skip_streak are
-        // executor-global (fine for this B=1 bring-up flag); make them per-slot
-        // before promoting the gate to a default.
+        // When the acceptance EMA predicts MTP would lose to no-spec, run a warm
+        // no-spec step instead — it keeps the draft head staged so MTP resumes
+        // the moment acceptance recovers. The EMA + skip_streak are
+        // executor-global; make them per-slot before defaulting the gate on.
         if self.mtp_adaptive_skip() {
             self.mtp_skip_streak += 1;
             let token =
@@ -1609,9 +1488,8 @@ impl Dsv4CudaExecutor {
         self.spec_step(slot_idx, start_pos, position)
     }
 
-    /// Reset the DSpark draft latent cache for `slot`, rebasing it to absolute
-    /// trunk position `pos` (a request boundary: fresh prefill → 0, restored
-    /// prefix → the restored frontier). No-op off the DSpark path.
+    /// Rebase `slot`'s DSpark draft latent cache to absolute trunk position
+    /// `pos` (fresh prefill → 0, restored prefix → the restored frontier).
     fn reset_dspark_slot(&mut self, slot: usize, pos: usize) {
         if let Some(ds) = self.dspark.as_mut() {
             ds.slots[slot].df.rebase(pos);
@@ -1619,11 +1497,7 @@ impl Dsv4CudaExecutor {
     }
 
     /// Hot-swap the DSpark Markov head weights from a host f32 snapshot.
-    ///
-    /// Called by the train sidecar after each acceptance-weighted step. The new
-    /// weights are converted to bf16 and uploaded; the device `data` pointer is
-    /// flipped under the stream's ordering guarantee. `w1` is `[vocab * rank]`,
-    /// `w2` is `[rank * vocab]`.
+    /// `w1` is `[vocab * rank]`, `w2` is `[rank * vocab]`.
     pub(crate) fn update_dspark_markov_weights(&mut self, w1: &[f32], w2: &[f32]) -> Result<()> {
         let dspark = self
             .dspark
@@ -1667,11 +1541,8 @@ impl Dsv4CudaExecutor {
         Ok(())
     }
 
-    /// Seed a freshly-prefilled prompt chunk into the DSpark draft context: pull
-    /// the transient multi-row taps the prefill forward stashed on the slot and
-    /// append them at absolute trunk positions `start_abs..` (the canonical
-    /// `dspark_append_context` path). No-op off the DSpark path or when the
-    /// forward captured no multi-row taps (single-token prompt / chunk).
+    /// Append the prefill forward's stashed multi-row taps to the DSpark draft
+    /// context at absolute trunk positions `start_abs..`.
     fn seed_dspark_prompt(&mut self, slot: usize, start_abs: usize) -> Result<()> {
         let Self {
             model,
@@ -1732,17 +1603,8 @@ impl Dsv4CudaExecutor {
         Ok((r0[0] as usize, r0[1] as u32))
     }
 
-    /// One DSpark block decode step (`--spec-type dspark`, greedy). Forward the
-    /// last token to emit the block anchor + capture the T3 trunk taps, draft a
-    /// whole block from those taps in ONE non-causal pass, verify the chain in one
-    /// contiguous target forward, accept the longest greedy-matching prefix, and
-    /// roll the rejected tail back. Mirrors the MTP `spec_step` bookkeeping
-    /// (`capture_spec_rings` / `truncate_slot` / `restore_spec_ring_tail`),
-    /// swapping the autoregressive MTP draft for the single-pass block drafter and
-    /// the sparse frozen verify for the contiguous commit verify + truncate.
-    ///
-    /// Every committed token is a target greedy argmax (anchor + verified
-    /// accepted drafts + bonus).
+    /// One DSpark block decode step (greedy). Every committed token is a target
+    /// greedy argmax (anchor + verified accepted drafts + bonus).
     fn dspark_decode_tokens(
         &mut self,
         slot_idx: usize,
@@ -1751,12 +1613,9 @@ impl Dsv4CudaExecutor {
         params: &SamplingParams,
         position: u64,
     ) -> Result<Vec<u32>> {
-        // Sequence-cap fallback: the block verify appends the anchor + up to
-        // `block_size` drafts (chain rows at `verify_pos .. verify_pos + block`),
-        // plus a bonus row. Request normalization caps EMITTED tokens but NOT the
-        // speculative chain, so near `max_seq_len` a full block would overflow the
-        // KV/ring and abort an otherwise-valid request. Mirror the Qwen DSpark
-        // guard: when the worst-case chain does not fit, take one non-spec token.
+        // Request normalization caps EMITTED tokens but NOT the speculative
+        // chain, so near `max_seq_len` a full block would overflow the KV/ring
+        // and abort an otherwise-valid request: take one non-spec token instead.
         let ds = self
             .dspark
             .as_ref()
@@ -1773,9 +1632,8 @@ impl Dsv4CudaExecutor {
             )?;
             return Ok(vec![token]);
         }
-        // Anchor forward: a normal eager decode step commits `last_token`, emits
-        // the block anchor (a real target greedy token), and — under `is_dspark()`
-        // — populates `slot.dspark_taps()` at the target layers (no arming flag).
+        // Under `is_dspark()` this also populates `slot.dspark_taps()` at the
+        // target layers — no arming flag.
         let anchor = self.model.forward_tokens(
             &mut self.slots[slot_idx],
             &mut self.kv_adapter,
@@ -1786,9 +1644,8 @@ impl Dsv4CudaExecutor {
         )?;
         let verify_pos = start_pos + 1;
 
-        // Draft the block, then build the proposal (tied-head logits → Markov
-        // semi-AR sampling → confidence truncation). Split-borrow: model, slot
-        // taps, and the draft + this slot's caches are disjoint fields.
+        // Split-borrow: model, slot taps, and the draft + this slot's caches are
+        // disjoint fields.
         let mut proposal = {
             let Self {
                 model,
@@ -1805,10 +1662,8 @@ impl Dsv4CudaExecutor {
                 .as_mut()
                 .expect("dspark_decode_tokens without dspark");
             let rt = &mut ds_slots[slot_idx];
-            // Append the anchor-forward token to the accumulated draft context
-            // (committed at absolute position `start_pos`, i.e. `verify_pos - 1`)
-            // BEFORE the block forward — the canonical context path (prompt prefix
-            // seeded at prefill, per-step anchor here).
+            // The anchor token must enter the draft context BEFORE the block
+            // forward reads it.
             model.dspark_append_context(
                 draft,
                 &mut rt.df,
@@ -1833,10 +1688,9 @@ impl Dsv4CudaExecutor {
             proposal.draft_len,
         );
 
-        // TP lockstep: the rank-local proposal (confidence-truncated draft_len)
-        // drifts by FP across ranks; a divergent length feeds verify a different
-        // token count per rank → per-forward collective-count mismatch → deadlock.
-        // Adopt rank 0's `[draft_len, chain..]` so every rank verifies one shape.
+        // The confidence-truncated draft_len drifts by FP across ranks, and a
+        // divergent length feeds verify a different token count per rank →
+        // collective-count mismatch → deadlock. Adopt rank 0's shape.
         Self::tp_lockstep_proposal(&self.model, &mut proposal)?;
         let draft_len = proposal.draft_len;
 
@@ -1860,21 +1714,18 @@ impl Dsv4CudaExecutor {
             proposal.chain.len()
         );
 
-        // Accept scan: `argmax[i]` is the target greedy token AFTER chain[i];
-        // accept chain[i+1] while it matches. Longest matching prefix.
+        // `argmax[i]` is the target greedy token AFTER chain[i].
         let mut accepted = 0usize;
         while accepted < draft_len && verify.argmax[accepted] == proposal.chain[accepted + 1] {
             accepted += 1;
         }
         let mut bonus = verify.argmax[accepted];
 
-        // TP lockstep: accepted/bonus are rank-local FP; adopt rank 0's so every
-        // rank commits an identical KV tail (next tick's combined attention reads
-        // all ranks' shards — an inconsistent commit corrupts it).
+        // accepted/bonus are rank-local FP; adopt rank 0's so every rank commits
+        // an identical KV tail — next tick's combined attention reads all ranks'
+        // shards, and an inconsistent commit corrupts it.
         (accepted, bonus) = Self::tp_lockstep_accept(&self.model, accepted, bonus)?;
 
-        // Return to the real frontier, restore the aliased ring boundary, then
-        // fold anchor + accepted drafts exactly once from persisted verify rows.
         self.model
             .truncate_slot(&mut self.slots[slot_idx], &mut self.kv_adapter, verify_pos)?;
         self.model.restore_spec_ring_tail(
@@ -1891,8 +1742,8 @@ impl Dsv4CudaExecutor {
             verify_pos,
         )?;
 
-        // The verify taps cover [anchor, drafts..]. Only its committed prefix
-        // belongs in the next block's context; the rejected tail must not leak.
+        // The verify taps cover [anchor, drafts..]; only the committed prefix
+        // belongs in the next block's context.
         {
             let Self {
                 model,
@@ -1928,9 +1779,8 @@ impl Dsv4CudaExecutor {
             );
         }
 
-        // Emit the anchor (committed this step) + accepted drafts + the bonus (the
-        // next block's anchor, committed by the next step's anchor forward). The
-        // DSpark step is self-contained — clear any MTP spec carry.
+        // The bonus is the next block's anchor, committed by the next step's
+        // anchor forward.
         self.spec_slots[slot_idx] = Dsv4SpecSlotState::default();
         let mut out = Vec::with_capacity(accepted + 2);
         out.push(anchor);
@@ -1939,13 +1789,8 @@ impl Dsv4CudaExecutor {
         Ok(out)
     }
 
-    /// Batched DSpark block decode for B>1. Drafts each slot's block independently
-    /// (the 3-stage draft forward is per-slot), then verifies ALL chains in ONE
-    /// batched target forward (`forward_decode_batch_verify`) instead of N serial
-    /// verifies. Accept/commit remain per-slot (the proven fold path).
-    ///
-    /// This amortizes the heaviest phase (target-model verify) across the batch,
-    /// matching the no-spec baseline's batched decode at B>1.
+    /// Batched DSpark block decode for B>1: drafts per slot, then verifies ALL
+    /// chains in ONE batched target forward, amortizing the heaviest phase.
     fn dspark_decode_tokens_batched(
         &mut self,
         rows: &[Dsv4DecodeBatchRow],
@@ -1958,7 +1803,6 @@ impl Dsv4CudaExecutor {
             .max_seq_len;
         let block = self.model.config.dspark_block_size;
 
-        // ── Phase 1a: separate fallback slots (sequence-cap) from DSpark slots.
         let mut proposals: Vec<Option<crate::dsv4::dspark::Dsv4DsparkProposal>> =
             (0..n).map(|_| None).collect();
         let mut verify_positions: Vec<usize> = vec![0; n];
@@ -1981,9 +1825,6 @@ impl Dsv4CudaExecutor {
             }
         }
 
-        // ── Phase 1b: batched anchor forward (ONE target forward over N slots),
-        // capturing DSpark taps in the batched decode lane. Replaces N serial
-        // single-token target forwards.
         if !dspark_idxs.is_empty() {
             let slot_ids: Vec<usize> = dspark_idxs.iter().map(|&i| rows[i].slot).collect();
             let tokens: Vec<u32> = dspark_idxs.iter().map(|&i| rows[i].last_token).collect();
@@ -2003,10 +1844,9 @@ impl Dsv4CudaExecutor {
                 &params,
                 true, // anchor: the draft reads these taps
             )?;
-            // ── Phase 1c: per-slot draft + proposal (draft is a small 3-stage
-            // model; each slot has independent latent_kv context, so batching
-            // the draft would require unifying variable-length context — not
-            // worth the complexity vs the already-amortized target verify).
+            // The draft stays per-slot: each slot has independent latent_kv
+            // context, so batching it would mean unifying variable-length
+            // context for a phase the batched verify already dominates.
             for (k, &i) in dspark_idxs.iter().enumerate() {
                 let anchor = anchors[k];
                 let verify_pos = verify_positions[i];
@@ -2053,16 +1893,12 @@ impl Dsv4CudaExecutor {
             }
         }
 
-        // ── Phase 2: TP lockstep on proposals (rank 0's draft_len + chain wins,
-        // same as the B=1 path — divergent lengths deadlock the verify collective).
+        // Divergent chain lengths deadlock the verify collective — rank 0 wins.
         for prop in proposals.iter_mut() {
             let Some(p) = prop else { continue };
             Self::tp_lockstep_proposal(&self.model, p)?;
         }
 
-        // ── Phase 3: batched verify over all chains (the amortized phase).
-        // If every slot hit the sequence-cap fallback, there are no chains to
-        // verify — return the fallback tokens directly.
         let (mut slot_ids, mut chains, mut starts) = (Vec::new(), Vec::new(), Vec::new());
         for i in 0..n {
             if fallback_tokens[i].is_some() {
@@ -2089,8 +1925,7 @@ impl Dsv4CudaExecutor {
             })
             .collect();
 
-        // capture_spec_rings per slot (cheap host snapshot, must run before verify
-        // overwrites the speculative KV band).
+        // Must run before verify overwrites the speculative KV band.
         for (s, &slot_idx) in slot_ids.iter().enumerate() {
             self.model.capture_spec_rings(
                 &mut self.slots[slot_idx],
@@ -2109,7 +1944,6 @@ impl Dsv4CudaExecutor {
             &scheds,
         )?;
 
-        // ── Phase 4: per-slot accept + rollback + commit (proven fold path).
         let mut out: Vec<Vec<u32>> = vec![Vec::new(); n];
         let mut verified_iter = verified.into_iter();
         for i in 0..n {
@@ -2134,8 +1968,8 @@ impl Dsv4CudaExecutor {
             }
             let mut bonus = argmax[accepted];
 
-            // TP lockstep on accepted/bonus (rank 0 wins — KV tail must be identical
-            // across ranks, else next tick's combined attention corrupts).
+            // The KV tail must be identical across ranks, else next tick's
+            // combined attention corrupts.
             (accepted, bonus) = Self::tp_lockstep_accept(&self.model, accepted, bonus)?;
 
             self.model.truncate_slot(
@@ -2157,8 +1991,7 @@ impl Dsv4CudaExecutor {
                 verify_pos,
             )?;
 
-            // Append only the committed prefix (anchor + accepted drafts) to the
-            // draft context; the rejected tail must not leak into the next block.
+            // Only the committed prefix belongs in the next block's context.
             {
                 let Self {
                     model,
@@ -2212,20 +2045,17 @@ impl Dsv4CudaExecutor {
             .collect())
     }
 
-    /// One decode sub-batch, then the prefix-state publish hook: any row that
-    /// crossed a host-page boundary this tick publishes its completed pages.
-    /// The hook runs AFTER the inner forward's MTP verify+commit+truncate, so
-    /// `seq_len` reflects only committed tokens — rejected drafts never enter
-    /// the pool.
+    /// The publish hook runs AFTER the inner forward's verify+commit+truncate,
+    /// so `seq_len` reflects only committed tokens — rejected drafts never
+    /// enter the pool.
     fn forward_decode_batch(
         &mut self,
         rows: &[DecodeRow],
         kv_batch: &KvBatchDescriptor,
     ) -> Result<Vec<SlotToken>> {
         let out = self.forward_decode_batch_inner(rows, kv_batch)?;
-        // Finish write-through owns the decode region: per-tick D2H capture is
-        // graph-incompatible, so under --dsv4-decode-reuse it's a no-op and the
-        // whole generated region is captured once at finish.
+        // Per-tick D2H capture is graph-incompatible, so finish write-through
+        // captures the whole generated region once at finish instead.
         if !crate::runtime_flags::dsv4_decode_reuse_enabled() {
             for (row, kv_row) in rows.iter().zip(&kv_batch.rows) {
                 let slot_pages = &kv_batch.flat_slot_page_ids[kv_row.slot_page_range.clone()];
@@ -2245,8 +2075,7 @@ impl Dsv4CudaExecutor {
         let kv_view = self.kv_adapter.prepare_kv_batch(kv_batch)?;
         validate_dsv4_decode_kv_view(rows, &kv_view)?;
         // Host band changed since last sync (page growth at a page boundary) —
-        // refresh the graph-referenced device tables BEFORE the forward. Decode
-        // growth previously never resynced the device table (#154 Phase 0).
+        // refresh the graph-referenced device tables BEFORE the forward.
         for row in rows {
             if self.kv_adapter.take_device_table_dirty(row.slot) {
                 self.slots[row.slot]
@@ -2263,16 +2092,12 @@ impl Dsv4CudaExecutor {
         );
         if batch.rows.len() == 1 {
             let out = self.forward_decode_row(&batch.rows[0])?;
-            // B=1 bypasses `Dsv4Model::forward_decode_batch` (the CUDA-graph
-            // decode-graph lane, `forward_tokens_decode_graph`) — mirror its
-            // trace call here so the diagnostic covers both lanes uniformly.
             return Ok(out);
         }
 
-        // B>1 path. The concurrency gate (`--spec-max-batch`, default 1) decides
-        // the route: spec drafts only at or below the gate (the c=1 win); above
-        // it spec is a compute-bound loss, so decode falls to the plain batched
-        // path that scales. Same `route_decode` the qwen35 executor uses.
+        // The concurrency gate drafts spec only at or below `--spec-max-batch`;
+        // above it spec is a compute-bound loss and decode takes the plain
+        // batched path that scales.
         use super::spec_decode::{DecodeRoute, SpecKind, route_decode};
         let spec_on = self.spec_requested();
         let all_greedy = batch.rows.iter().all(|row| row.params.is_greedy());
@@ -2283,22 +2108,17 @@ impl Dsv4CudaExecutor {
         } else {
             SpecKind::None
         };
-        // DSv4 still drafts per slot, so it keeps the c=1 gate the 2026-07-26
-        // campaign licensed (−47.7% at c=16 with the gate open). Only Qwen3.5,
-        // whose draft and rollback batch, honours a wider `--spec-max-batch`.
+        // DSv4 still drafts per slot, so it pins the gate at c=1: −47.7% at c=16
+        // with the gate open. Only Qwen3.5 honours a wider `--spec-max-batch`.
         let route = route_decode(
             spec_kind,
             batch.rows.len(),
             crate::runtime_flags::spec_max_batch().min(1),
         );
 
-        // DSpark drafts per-slot (serial 3-stage forward) but verifies ALL chains
-        // in ONE batched target forward (`dspark_decode_tokens_batched`),
-        // amortizing the heaviest phase across the batch.
         if route == DecodeRoute::Dspark {
-            // The batched verify path requires FlashMLA sparse prefill
-            // (`mla_attention` chain-verify lane); without it, fall back to
-            // per-slot dispatch (the pre-batch behavior — correct but slower).
+            // The batched verify needs FlashMLA's sparse-prefill chain-verify
+            // lane; without it, per-slot dispatch is correct but slower.
             if cuda_kernels::HAS_FLASHMLA {
                 let tokens = self.dspark_decode_tokens_batched(&batch.rows)?;
                 let mut out = Vec::with_capacity(batch.rows.len());
@@ -2319,13 +2139,9 @@ impl Dsv4CudaExecutor {
             return Ok(out);
         }
         if route == DecodeRoute::Mtp && all_greedy {
-            // Self-heal an un-seeded / desynced MTP stream (#140), the batched
-            // twin of the B=1 path: a slot entering Decoding without a tail
-            // prefill (full prefix-cache hit / whole-slot promote) has pending=
-            // None. Rather than bail the TP group, warm-step EVERY row this one
-            // tick to (re)seed pending+hidden, then batched MTP resumes next
-            // tick. Cheaper than splitting the batch; a one-tick per-slot
-            // degradation only when a slot joins un-seeded.
+            // Self-heal an un-seeded / desynced MTP stream (#140): warm-step
+            // EVERY row for one tick to re-seed pending+hidden — cheaper than
+            // splitting the batch, and batched MTP resumes next tick.
             let needs_seed = batch
                 .rows
                 .iter()
@@ -2382,10 +2198,7 @@ impl Dsv4CudaExecutor {
             return Ok(tokens);
         }
 
-        // True batched decode (layer-major driver, batched attention + grouped
-        // MoE). B=1 is the single-row reference above; B>1 always batches.
-        // Reached when spec was requested but this batch routed to Plain — the
-        // concurrency gate (n_rows > spec_max_batch) or non-greedy sampling. Drop
+        // Reached when spec was requested but this batch routed to Plain; drop
         // the per-row spec state so a later c=1 tick re-seeds cleanly.
         if spec_on {
             for row in &batch.rows {
@@ -2429,10 +2242,8 @@ impl Dsv4CudaExecutor {
     ) -> Result<StepOutput> {
         self.poll_prefix_captures();
         let rows = plan.decode_rows.len() + plan.prefill_rows.len();
-        // Cross-rank lockstep debug surface: every rank logs a per-forward plan
-        // fingerprint. Divergence at tick K (different rows on different ranks)
-        // is the NCCL-deadlock root cause for multi-rank serve; diff the per-rank
-        // streams with RUST_LOG=infer_cuda=debug.
+        // Per-rank plan fingerprint: divergence at tick K is the NCCL-deadlock
+        // root cause for multi-rank serve.
         if rows > 0 && log::log_enabled!(log::Level::Debug) {
             static PLAN_TICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let tick = PLAN_TICK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2463,13 +2274,10 @@ impl Dsv4CudaExecutor {
             });
         }
 
-        // Mixed / multi-prefill plans split into per-prefill single-row
-        // sub-steps plus one decode sub-batch. Plan rows always address
-        // disjoint slots (a request is either Prefilling or Decoding), so the
-        // sequential sub-steps are math-identical to consecutive single-mode
-        // ticks. Descriptor commit order is prefill rows first, then decode
-        // rows (`KvBatchDescriptor::from_plan`), mapping plan rows onto
-        // descriptor rows by index.
+        // Plan rows always address disjoint slots, so splitting a mixed plan into
+        // per-prefill sub-steps plus one decode sub-batch is math-identical to
+        // consecutive single-mode ticks. Descriptor order is prefill rows first,
+        // then decode rows, mapping plan rows onto descriptor rows by index.
         ensure!(
             kv_batch.rows.len() == rows,
             "DSv4 KV batch descriptor has {} rows for a {rows}-row plan",
@@ -2501,9 +2309,7 @@ impl Dsv4CudaExecutor {
         Ok(StepOutput { tokens })
     }
 
-    /// One prefill row as its own single-row sub-step. `kv_batch` must be the
-    /// row's single-row (sub-)descriptor — indistinguishable from what a
-    /// prefill-only tick delivers.
+    /// `kv_batch` must be the row's own single-row (sub-)descriptor.
     fn submit_prefill_row(
         &mut self,
         row: &infer_plan::PrefillRow,
@@ -2517,10 +2323,9 @@ impl Dsv4CudaExecutor {
             self.num_slots
         );
         ensure!(!row.tokens.is_empty(), "prefill row must carry tokens");
-        // C2: free+reset BEFORE prepare_kv_batch (free-then-alloc, matching the
-        // Qwen3.5 executor). prepare_kv_batch draws pages + advances seq_len; if
-        // the reset ran after, fresh prefill wrote into an EMPTY page table and a
-        // reused slot aborted the prepare seq_len==append_pos invariant.
+        // Free+reset must precede prepare_kv_batch, which draws pages and
+        // advances seq_len: resetting after leaves fresh prefill writing into an
+        // EMPTY page table and breaks the seq_len==append_pos invariant.
         if row.start_pos == 0 {
             self.kv_adapter.flashmla_free_slot(row.slot)?;
             self.slots[row.slot].reset(&self.model.ctx, &mut self.kv_adapter)?;
@@ -2532,7 +2337,8 @@ impl Dsv4CudaExecutor {
         if row.start_pos == 0 {
             self.kv_adapter.zero_slot_band(&self.model.ctx, row.slot)?;
         }
-        // Host band changed since last sync — refresh the graph-referenced device tables.
+        // Host band changed since last sync — refresh the graph-referenced device
+        // tables.
         if self.kv_adapter.take_device_table_dirty(row.slot) {
             self.slots[row.slot]
                 .refresh_flashmla_device_page_tables(&self.model.ctx, &self.kv_adapter)?;
@@ -2547,19 +2353,11 @@ impl Dsv4CudaExecutor {
             position,
             final_prefill,
         )?;
-        // Seed THIS prompt chunk into the DSpark draft context (the canonical
-        // context path). The forward captured the chunk's full multi-row taps;
-        // append them at their absolute trunk positions `row.start_pos..`. Chunks
-        // accumulate in `df.ctx_end`, so a chunked prefill seeds the whole prompt
-        // across chunks; the frontier the first decode block reads is thus the
-        // prompt context, not an empty rebase. No-op off the DSpark path or when
-        // the chunk was single-row. A restored (cache-hit) prefix's context is
-        // genuinely absent — its taps were never captured (partial-window, still
-        // strictly better than the prior empty seed).
+        // Chunks accumulate in `df.ctx_end`, so a chunked prefill seeds the whole
+        // prompt; a restored (cache-hit) prefix's taps were never captured, so
+        // its context is genuinely absent.
         self.seed_dspark_prompt(row.slot, row.start_pos)?;
         let slot = row.slot;
-        // Prefix-state publish hook: this chunk completed pages
-        // [start_pos/page, (start_pos+len)/page).
         let slot_pages = &kv_batch.flat_slot_page_ids[kv_batch.rows[0].slot_page_range.clone()];
         self.publish_completed_prefix_pages(
             slot,
@@ -2578,10 +2376,8 @@ impl Dsv4CudaExecutor {
             .collect())
     }
 
-    /// Selftest band prep: free + reset, then materialize the band and
-    /// refresh the device page tables — the selftest drives `forward_tokens`
-    /// directly (no `prepare_kv_batch`), which used to run kernels against
-    /// never-refreshed all-zero device tables (#154 Phase 3b fix).
+    /// The selftest drives `forward_tokens` directly (no `prepare_kv_batch`), so
+    /// the band and device page tables must be materialized here.
     fn selftest_reset_band(&mut self, slot_idx: usize, prompt_len: usize) -> Result<()> {
         self.kv_adapter.flashmla_free_slot(slot_idx)?;
         self.slots[slot_idx].reset(&self.model.ctx, &mut self.kv_adapter)?;
@@ -2695,18 +2491,9 @@ impl Dsv4CudaExecutor {
             verify_two.argmax
         );
 
-        // NOTE: no col1/bonus byte-identity gate here. The 2-token verify's col1
-        // (bonus) on a FORCED-WRONG draft is DISCARDED in real decode (rejects emit
-        // only base_next), and any byte-identity check is confounded by the M=2-vs-M=1
-        // FP8 kernel path (SWA-prefill + prefill-DeepGEMM vs FlashMLA-decode +
-        // decode-DeepGEMM). The real correctness gate is full-decode byte-identity vs
-        // non-spec (validated 2026-06-08: batched MTP byte-identical on needle+capital,
-        // +61/+70%). See errors/2026-06-08-dsv4-batched-verify-col1-wrong.md.
-
-        // Depth-2 sequential MTP probe REMOVED 2026-06-08 (killed): measured depth-1 3/3,
-        // depth-2-top1 1/3 (~33% accept) → sequential chain is only ~+15%, not the 6ms
-        // path. The single MTP head caps multi-step drafts; tree-EAGLE (top-K) is the
-        // amortization lever beyond depth-1. See the consolidated decode-6ms report.
+        // No col1/bonus gate here: col1 on a forced-wrong draft is discarded in
+        // real decode, and comparing it is confounded by the M=2-vs-M=1 FP8
+        // kernel path. See errors/2026-06-08-dsv4-batched-verify-col1-wrong.md.
 
         self.kv_adapter.flashmla_free_slot(slot_idx)?;
         self.slots[slot_idx].reset(&self.model.ctx, &mut self.kv_adapter)?;
