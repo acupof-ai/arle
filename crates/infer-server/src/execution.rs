@@ -311,10 +311,12 @@ fn engine_loop_with_tick_broadcaster<E, K>(
             let pending_before = pending.len();
             if let Err(err) = engine.step() {
                 log::error!("infer-server engine step failed: {err}");
-                // Drop all back-channels so collectors observe the failure as a
-                // closed channel rather than hanging forever.
+                log::error!(
+                    "engine state unreliable after step failure; exiting for watchdog restart"
+                );
+                // Drop all back-channels so collectors observe the failure.
                 pending.clear();
-                return;
+                std::process::exit(75); // EX_TEMPFAIL — watchdog restarts
             }
             // Cancel requests whose stream receiver hung up mid-decode so the
             // row frees its KV slot instead of decoding to max_tokens. Local
