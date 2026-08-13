@@ -351,17 +351,17 @@ impl Dsv4Model {
                         // `[hidden,1]` shape satisfies compressor_forward's asserts.
                         let slot = &mut slots[slot_ids[r]];
                         let b = crate::attention::mla_attention_compressor_defer_row(
-                            &self.ctx,
-                            &self.config,
-                            &layer.attention,
-                            layer.mode,
-                            layer.compress_ratio,
+                            &self.attn_ctx(
+                                layer,
+                                layer_idx,
+                                crate::attention::Dsv4Position {
+                                    start: start_positions[r],
+                                    device: Some(&slot.start_pos_device),
+                                },
+                                None,
+                            ),
                             &normed_row,
                             &mut slot.attention[layer_idx],
-                            crate::attention::Dsv4Position {
-                                start: start_positions[r],
-                                device: Some(&slot.start_pos_device),
-                            },
                             proj.rope,
                             &mut main_sink,
                             &mut indexer_sink,
@@ -672,11 +672,15 @@ impl Dsv4Model {
                             };
                             let row_prepared =
                                 crate::attention::mla_attention_prepare_compressed_only(
-                                    &self.ctx,
-                                    &self.config,
-                                    &layer.attention,
-                                    layer.mode,
-                                    layer.compress_ratio,
+                                    &self.attn_ctx(
+                                        layer,
+                                        layer_idx,
+                                        crate::attention::Dsv4Position {
+                                            start: start_positions[r],
+                                            device: Some(&slot.start_pos_device),
+                                        },
+                                        None,
+                                    ),
                                     &normed_row,
                                     &c_q_normed_row,
                                     q_prepared_owned,
@@ -685,10 +689,6 @@ impl Dsv4Model {
                                     &mut slot.attention[layer_idx],
                                     layer_pool,
                                     dsa_shared,
-                                    crate::attention::Dsv4Position {
-                                        start: start_positions[r],
-                                        device: Some(&slot.start_pos_device),
-                                    },
                                     batched_gather,
                                     compressor_precomputed,
                                     indexer_query_precomputed,
@@ -1155,12 +1155,15 @@ impl Dsv4Model {
                             kv_adapter.layer_and_dsa_shared_mut(layer_idx)?;
                         let slot = &mut slots[slot_ids[r]];
                         crate::attention::mla_attention(
-                            &self.ctx,
-                            &self.config,
-                            &layer.attention,
-                            layer.mode,
-                            layer.compress_ratio,
-                            layer_idx,
+                            &self.attn_ctx(
+                                layer,
+                                layer_idx,
+                                crate::attention::Dsv4Position {
+                                    start: start_positions[r],
+                                    device: Some(&slot.start_pos_device),
+                                },
+                                None,
+                            ),
                             &normed_row,
                             &mut slot.attention[layer_idx],
                             layer_pool,
@@ -1169,12 +1172,6 @@ impl Dsv4Model {
                             prefill_shared,
                             // Decode lane (start_pos_device Some): probe unreachable.
                             None,
-                            crate::attention::Dsv4Position {
-                                start: start_positions[r],
-                                device: Some(&slot.start_pos_device),
-                            },
-                            None,
-                            &self.tp,
                             &mut attn_out_row,
                             &mut keepalive,
                         )?;
@@ -1605,12 +1602,15 @@ impl Dsv4Model {
                                 ) = kv_adapter.layer_and_dsa_shared_mut(layer_idx)?;
                                 let slot = &mut slots[slot_ids[s]];
                                 crate::attention::mla_attention(
-                                    &self.ctx,
-                                    &self.config,
-                                    &layer.attention,
-                                    layer.mode,
-                                    layer.compress_ratio,
-                                    layer_idx,
+                                    &self.attn_ctx(
+                                        layer,
+                                        layer_idx,
+                                        crate::attention::Dsv4Position {
+                                            start: start_positions[s],
+                                            device: None,
+                                        },
+                                        Some(&sparse_metas[s]),
+                                    ),
                                     &normed_chunk,
                                     &mut slot.attention[layer_idx],
                                     layer_pool,
@@ -1618,12 +1618,6 @@ impl Dsv4Model {
                                     flashmla_scratch,
                                     prefill_shared,
                                     fp32,
-                                    crate::attention::Dsv4Position {
-                                        start: start_positions[s],
-                                        device: None,
-                                    },
-                                    Some(&sparse_metas[s]),
-                                    &self.tp,
                                     &mut attn_chunk,
                                     &mut keepalive,
                                 )?;
