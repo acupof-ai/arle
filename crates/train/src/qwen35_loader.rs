@@ -655,10 +655,6 @@ enum LoadMode {
     },
 }
 
-fn opd_gradient_checkpointing_enabled() -> bool {
-    crate::runtime_flags::gradient_checkpointing()
-}
-
 fn load_qwen35_from_hf_dir_inner(
     dir: &Path,
     store: &mut TensorStore,
@@ -735,7 +731,7 @@ fn load_qwen35_from_hf_dir_inner(
     if load_trace {
         eprintln!("[opd-load-trace] post model-construct OK");
     }
-    if !matches!(mode, LoadMode::FrozenEval) && opd_gradient_checkpointing_enabled() {
+    if !matches!(mode, LoadMode::FrozenEval) && crate::runtime_flags::gradient_checkpointing() {
         model.set_gradient_checkpointing(true);
     }
     let param_map = model.param_name_map();

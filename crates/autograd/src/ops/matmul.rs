@@ -381,10 +381,6 @@ pub(crate) fn matmul_bt_backward(
     Ok(grads)
 }
 
-fn lora_linear_backward_tile_rows() -> usize {
-    crate::runtime_flags::lora_linear_bwd_tile_rows()
-}
-
 fn is_lora_matmul_site(site: &str) -> bool {
     site.ends_with(".lora_a") || site.ends_with(".lora_b")
 }
@@ -405,7 +401,7 @@ fn matmul_bt_lora_backward_tiled(
     if !is_lora_matmul_site(site) {
         return Ok(None);
     }
-    let tile_rows = lora_linear_backward_tile_rows();
+    let tile_rows = crate::runtime_flags::lora_linear_bwd_tile_rows();
     if a_shape[0] <= tile_rows {
         return Ok(None);
     }

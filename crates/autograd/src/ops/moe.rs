@@ -118,10 +118,6 @@ impl MoeGroupedLinearProfile {
     }
 }
 
-fn moe_lora_backward_expert_tile() -> usize {
-    crate::runtime_flags::moe_lora_bwd_expert_tile()
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MoeRoute {
     pub token: usize,
@@ -957,7 +953,7 @@ pub(crate) fn moe_grouped_linear_backward(
         let packed_input = packed_input.as_ref().ok_or(AutogradError::TapeInvariant(
             "moe grouped linear LoRA path missing packed input",
         ))?;
-        let expert_tile = moe_lora_backward_expert_tile();
+        let expert_tile = crate::runtime_flags::moe_lora_bwd_expert_tile();
         if active_len > expert_tile {
             grouped_lora_backward_tiled(
                 store,
