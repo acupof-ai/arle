@@ -12,8 +12,6 @@ pub trait KvPrefixStore {
 
     fn release_pages(&mut self, pages: &[u32]);
 
-    fn retained_count(&self) -> usize;
-
     fn attach_pages(
         &mut self,
         slot: usize,

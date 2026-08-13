@@ -891,9 +891,11 @@ pub(crate) fn qwen35_speculative_block(
     target_cache_len: &mut usize,
     draft_state: &mut DFlashDraftState,
 ) -> Result<DFlashBlockResult> {
+    // Draft and verify both take a raw device argmax, so anything that rewrites
+    // the logits first (penalties, grammar, logit_bias) has no DFlash equivalent.
     ensure!(
-        params.is_greedy(),
-        "Metal DFlash currently supports greedy sampling only; refusing non-greedy request"
+        params.is_raw_argmax(),
+        "Metal DFlash currently supports raw-argmax greedy sampling only; refusing request with temperature / penalties / grammar / logit_bias"
     );
     let block_size_i32 =
         i32::try_from(runtime.block_size).context("DFlash block_size does not fit in i32")?;

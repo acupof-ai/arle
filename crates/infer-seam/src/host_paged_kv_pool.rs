@@ -160,10 +160,6 @@ impl KvQuery for HostPagedKvPool {
         self.free.len()
     }
 
-    fn free_tokens(&self) -> usize {
-        self.free.len() * self.page_size
-    }
-
     fn resident_pages(&self) -> usize {
         self.total_pages.saturating_sub(self.free.len())
     }
@@ -205,16 +201,12 @@ impl KvQuery for HostPagedKvPool {
         self.slot_pages.get(slot).map_or(&[], Vec::as_slice)
     }
 
-    fn page_indices_for_token_range(&self, slot: usize, start: usize, len: usize) -> &[u32] {
+    fn page_indices_for_token_range(&self, slot: usize, len: usize) -> &[u32] {
         let Some(pages) = self.slot_pages.get(slot) else {
             return &[];
         };
-        let start_page = start / self.page_size;
-        let end_page = (start + len).div_ceil(self.page_size).min(pages.len());
-        if start_page >= end_page {
-            return &[];
-        }
-        &pages[start_page..end_page]
+        let end_page = len.div_ceil(self.page_size).min(pages.len());
+        &pages[..end_page]
     }
 }
 
@@ -327,10 +319,6 @@ impl KvAllocator for HostPagedKvPool {
         self.slot_len[slot] = new_len;
         Ok(())
     }
-
-    fn migrate(&mut self, _slot: usize, _start: usize, _len: usize) -> anyhow::Result<()> {
-        Ok(())
-    }
 }
 
 impl KvPrefixStore for HostPagedKvPool {
@@ -354,10 +342,6 @@ impl KvPrefixStore for HostPagedKvPool {
             }
             self.sync_evictable(page, was);
         }
-    }
-
-    fn retained_count(&self) -> usize {
-        self.page_refs.values().filter(|&&c| c > 0).count()
     }
 
     fn attach_pages(

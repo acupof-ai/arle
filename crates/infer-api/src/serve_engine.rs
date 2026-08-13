@@ -250,7 +250,6 @@ where
             text,
             finish_reason,
             usage: TokenUsage::new(prompt_tokens, completion_tokens),
-            token_logprobs: Vec::new(), // not yet surfaced
             prompt_token_ids,
             response_token_ids,
         })
@@ -323,7 +322,6 @@ where
             text,
             finish_reason: FinishReason::from_plan(&output.finish),
             usage: TokenUsage::new(prompt_token_ids.len(), response_token_ids.len()),
-            token_logprobs: Vec::new(),
             prompt_token_ids,
             response_token_ids,
         })
@@ -509,7 +507,6 @@ where
                             text_delta: delta,
                             finish_reason: None,
                             usage: None,
-                            logprob: None,
                             token_ids,
                             error: None,
                         });
@@ -554,7 +551,6 @@ where
                 text_delta,
                 finish_reason: None,
                 usage: None,
-                logprob: None,
                 token_ids: remaining_ids,
                 error: None,
             });
@@ -566,7 +562,6 @@ where
             text_delta: String::new(),
             finish_reason: Some(finish_reason),
             usage: Some(TokenUsage::new(prompt_tokens, completion_tokens)),
-            logprob: None,
             token_ids: Vec::new(),
             error: None,
         });
@@ -596,7 +591,6 @@ where
             queue_depth: counters.queue_depth as u32,
             active_requests: counters.active_requests as u32,
             timestamp_ms,
-            ..EngineTelemetry::default()
         }
     }
 }

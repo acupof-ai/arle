@@ -1,6 +1,6 @@
 //! Mutating KV pool allocation.
 //!
-//! Slot growth, detached-page allocation, truncation, release, and migration —
+//! Slot growth, detached-page allocation, truncation, and release —
 //! the write surface the scheduler drives as requests advance.
 
 /// Mutating host-indexed KV pool allocation visible to engine-core.
@@ -45,6 +45,4 @@ pub trait KvAllocator {
     }
 
     fn truncate_slot(&mut self, slot: usize, new_len: usize) -> anyhow::Result<()>;
-
-    fn migrate(&mut self, slot: usize, start: usize, len: usize) -> anyhow::Result<()>;
 }

@@ -15,7 +15,6 @@ publish = false
 spec-train = { path = "../spec-train" }
 anyhow = "1.0"
 axum = "0.8"
-fastrace = { version = "0.7.16", features = ["enable"] }
 infer-core = { path = "../infer-core" }
 infer-plan = { path = "../infer-plan", features = ["serde"] }
 infer-seam = { path = "../infer-seam" }

@@ -184,20 +184,24 @@ impl std::fmt::Debug for MetalInflight {
 
 /// Turn a logits array into an in-flight result under `params`.
 ///
-/// Greedy keeps the device `argmax` + async path. Non-greedy Metal sampling
-/// used to materialize host f32 logits and sample on CPU every token, which
-/// creates synchronous D2H stalls on the local desktop path. Default behavior is
-/// therefore constrained to device greedy; opt back into the old host sampler
-/// with `--metal-host-sampling` for debugging.
+/// The raw-argmax fast path keeps the device `argmax` + async path. Non-greedy
+/// Metal sampling used to materialize host f32 logits and sample on CPU every
+/// token, which creates synchronous D2H stalls on the local desktop path;
+/// the temperature path is therefore downgraded to device greedy unless
+/// `--metal-host-sampling` opts into the blocking sampler. A greedy request
+/// whose logits are rewritten first (penalties, grammar, logit_bias) has no
+/// device equivalent, so it always pays the D2H and reaches the host sampler.
 #[cfg(feature = "metal")]
 fn sample_inflight(
     slot: usize,
     logits: &mlx::MlxArray,
     params: &infer_plan::SamplingParams,
+    history: Option<infer_plan::PenaltyHistory<'_>>,
     position: u64,
 ) -> MetalInflight {
-    if params.is_raw_argmax() || !crate::runtime_flags::host_sampling() {
-        if !params.is_raw_argmax() {
+    let downgrade = !params.is_greedy() && !crate::runtime_flags::host_sampling();
+    if params.is_raw_argmax() || downgrade {
+        if downgrade {
             warn_host_sampling_downgrade();
         }
         let sampled = mlx::argmax(logits);
@@ -206,7 +210,11 @@ fn sample_inflight(
     }
     let logits_f32 = mlx::as_dtype(logits, mlx::Dtype::Float32);
     mlx::eval(&[&logits_f32]);
-    let token = infer_plan::sample_token(logits_f32.as_slice_f32(), params, position);
+    let logits_f32 = logits_f32.as_slice_f32();
+    let token = match history {
+        Some(history) => infer_plan::sample_token_penalized(logits_f32, params, position, history),
+        None => infer_plan::sample_token(logits_f32, params, position),
+    };
     MetalInflight::Ready(StepOutput {
         tokens: vec![SlotToken {
             slot,
@@ -908,7 +916,20 @@ impl RealMetalExecutor {
         // from a prior turn is stale.
         self.pending = None;
 
-        Ok(sample_inflight(row.slot, &logits, &row.params, position))
+        let history = row
+            .penalty_history
+            .as_deref()
+            .map(|tokens| infer_plan::PenaltyHistory {
+                tokens,
+                prompt_len: row.penalty_prompt_len,
+            });
+        Ok(sample_inflight(
+            row.slot,
+            &logits,
+            &row.params,
+            history,
+            position,
+        ))
     }
 
     fn submit_dflash_decode_rows(
@@ -1163,7 +1184,14 @@ impl RealMetalExecutor {
         self.active_session_slot = None;
         self.maybe_recompute_recall(row.slot)?;
 
-        let inflight = sample_inflight(row.slot, &logits, &row.params, position);
+        let history = row
+            .penalty_history
+            .as_deref()
+            .map(|tokens| infer_plan::PenaltyHistory {
+                tokens,
+                prompt_len: row.penalty_prompt_len,
+            });
+        let inflight = sample_inflight(row.slot, &logits, &row.params, history, position);
 
         // Cold start of a greedy decode run: seed the pipeline. Record this
         // step's sampled token and issue the next step's forward so subsequent

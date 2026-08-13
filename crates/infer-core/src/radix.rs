@@ -248,20 +248,6 @@ impl RadixCache {
         true
     }
 
-    /// Peek the page id of the least-recently-used evictable resident block.
-    #[must_use]
-    pub fn lru_evictable_page(&self) -> Option<BlockId> {
-        self.least_recent_evictable_leaf()
-            .and_then(|idx| self.nodes[idx].page_id)
-    }
-
-    #[must_use]
-    pub fn evictable_page_count(&self) -> usize {
-        (1..self.nodes.len())
-            .filter(|&idx| self.is_evictable_leaf(idx))
-            .count()
-    }
-
     /// Return up to `limit` currently evictable resident pages in LRU order.
     ///
     /// This is a snapshot of the current frontier. Demoting a child can expose
