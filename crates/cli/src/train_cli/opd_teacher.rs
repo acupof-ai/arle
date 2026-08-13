@@ -150,6 +150,7 @@ impl train::teacher_infer::TeacherForward for OpdCliTeacher<'_> {
 pub(super) fn load_opd_infer_teacher(
     teacher_dir: &Path,
     max_seq_len: usize,
+    mem_fraction_static: f64,
     train_backend: std::sync::Arc<dyn autograd::Backend>,
     vocab_size: usize,
 ) -> Result<train::teacher_infer::InferTeacher> {
@@ -167,7 +168,12 @@ pub(super) fn load_opd_infer_teacher(
             .to_str()
             .ok_or_else(|| anyhow!("teacher model path is not valid UTF-8"))?,
         true,
-        EngineLoadConfig::single_sequence(max_seq_len),
+        EngineLoadConfig {
+            // Scoring is single-sequence; the default 0.9 fraction lets the teacher
+            // pool starve a co-resident student on one GPU.
+            mem_fraction_static,
+            ..EngineLoadConfig::single_sequence(max_seq_len)
+        },
     )
     .with_context(|| format!("load infer teacher from {}", teacher_dir.display()))?;
 
