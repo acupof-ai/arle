@@ -612,13 +612,21 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         self.upload(&f32_host, shape)
     }
 
+    /// Import bf16 bytes from a foreign device buffer as an f32 handle.
+    ///
+    /// `src_stream` is the raw `CUstream` (as `u64`) that produced the source
+    /// buffer and will free it. The CUDA backend enqueues the D2D copy on that
+    /// stream and orders this backend's stream after it with an event, so the
+    /// source may be freed on `src_stream` as soon as this returns. A null
+    /// `src_stream` (0) falls back to the legacy synchronous copy.
     fn import_bf16_device_ptr_as_f32(
         &self,
         src_device_ptr: u64,
+        src_stream: u64,
         len: usize,
         shape: &[usize],
     ) -> Result<DeviceHandle> {
-        let _ = (src_device_ptr, len, shape);
+        let _ = (src_device_ptr, src_stream, len, shape);
         Err(crate::AutogradError::TapeInvariant(
             "backend does not support importing bf16 device pointers",
         ))

@@ -472,9 +472,17 @@ impl TeacherForward for InferTeacher {
         let sync_seconds = sync_started.elapsed().as_secs_f64();
         let shape = vec![1, raw_logits.seq_len(), raw_logits.vocab_size()];
         let bridge_started = Instant::now();
+        // The logits buffer is bound to the engine's compute stream; passing it
+        // lets the bridge order the D2D copy and the source's later free on
+        // that stream, skipping the bridge's context sync.
+        let src_stream = raw_logits.device.stream.cu_stream() as u64;
         let handle = raw_logits.with_logits_device_ptr(|src_ptr| {
-            self.train_backend
-                .import_bf16_device_ptr_as_f32(src_ptr, raw_logits.logits.len, &shape)
+            self.train_backend.import_bf16_device_ptr_as_f32(
+                src_ptr,
+                src_stream,
+                raw_logits.logits.len,
+                &shape,
+            )
         })?;
         let d2d_bridge_import_seconds = bridge_started.elapsed().as_secs_f64();
         if let Ok(mut profile) = self.last_profile.lock() {
