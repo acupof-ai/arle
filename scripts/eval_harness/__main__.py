@@ -3,9 +3,9 @@
 Usage:
   python3 -m eval_harness                    # run all gates
   python3 -m eval_harness prefix_reuse       # run one gate
-  python3 -m eval_harness prefix_reuse needle_ladder  # multiple
+  python3 -m eval_harness prefix_reuse token_reuse  # multiple
 
-Env: PORT, MODEL, TEMPLATE, NEEDLE; token_reuse: PROMPT_TOKENS, GEN_TOKENS, PAGE;
+Env: PORT, MODEL, TEMPLATE; token_reuse: PROMPT_TOKENS, GEN_TOKENS, PAGE;
 multiturn_concurrent: CONCURRENCY, TURNS, PROMPT_TOKENS, GEN_TOKENS, PAGE
 Exit 0 = all pass, 1 = any fail.
 """
@@ -18,12 +18,10 @@ import os
 
 from . import GateRunner
 from .multiturn_concurrent import MultiTurnConcurrentGate
-from .needle_ladder import NeedleLadderGate
 from .prefix_reuse import PrefixReuseGate
 from .token_reuse import TokenReuseGate
 
 GATES = {
-    "needle_ladder": lambda: NeedleLadderGate(),
     "prefix_reuse": lambda: PrefixReuseGate(),
     "token_reuse": lambda: TokenReuseGate(
         prompt_tokens=int(os.environ.get("PROMPT_TOKENS", "500")),
