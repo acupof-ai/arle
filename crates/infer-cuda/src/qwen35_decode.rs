@@ -313,7 +313,7 @@ impl Qwen35Model {
                     .as_ref()
                     .ok_or_else(|| anyhow!("dense layer missing both mlp and moe weights"))?;
                 crate::profile::profile_op(&self.ctx, "dense_ffn", Some(layer_idx), b, || {
-                    self.dense_mlp(mlp, mlp_in, dense, mlp_out, None)
+                    self.dense_mlp(mlp, mlp_in, dense, mlp_out)
                 })?;
             }
             // ONE all-reduce covers the whole FFN partial (see the per-layer
@@ -575,7 +575,7 @@ impl Qwen35Model {
                     .as_ref()
                     .ok_or_else(|| anyhow!("dense layer missing both mlp and moe weights"))?;
                 crate::profile::profile_op(&self.ctx, "dense_ffn", Some(layer_idx), b, || {
-                    self.dense_mlp(mlp, mlp_in, dense, mlp_out, None)
+                    self.dense_mlp(mlp, mlp_in, dense, mlp_out)
                 })?;
             }
             crate::profile::profile_op(&self.ctx, "ffn_allreduce", Some(layer_idx), b, || {

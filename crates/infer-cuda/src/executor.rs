@@ -1046,7 +1046,6 @@ pub(crate) fn sample_cuda_token(
     // A grammar mask must reach the argmax, so greedy takes the host path too.
     if params.is_greedy() && params.grammar_bitmask.is_none() {
         let token = argmax(ctx, logits)?;
-        probe_decode_entropy(ctx, logits, None, token, position)?;
         return Ok(token);
     }
 
@@ -1054,7 +1053,6 @@ pub(crate) fn sample_cuda_token(
     // generated-token history threaded through the executor.
     let logits_host = logits.to_host(ctx)?;
     let token = infer_plan::sample_token(&logits_host, params, position);
-    probe_decode_entropy(ctx, logits, Some(&logits_host), token, position)?;
     Ok(token)
 }
 
@@ -1074,40 +1072,9 @@ pub(crate) fn sample_cuda_token_scratched(
 ) -> Result<(u32, Option<f32>)> {
     if params.is_greedy() && params.grammar_bitmask.is_none() {
         let token = crate::ops::argmax_into(ctx, logits, argmax_out)?;
-        probe_decode_entropy(ctx, logits, None, token, position)?;
         return Ok((token, None));
     }
     let logits_host = logits.to_host(ctx)?;
     let (token, logprob) = infer_plan::sample_token_logprob(&logits_host, params, position);
-    probe_decode_entropy(ctx, logits, Some(&logits_host), token, position)?;
     Ok((token, logprob))
 }
-
-/// Per-token entropy probe over the raw (pre-penalty, T=1) logits at the
-/// single-row sampling convergence point (all backends' eager + graph decode
-/// plus the prefill last token; spec-decode/MTP verify paths are NOT
-/// instrumented). Off = one `OnceLock` load. `host` reuses an already
-/// materialized copy; `None` costs one D2H (probe-on only).
-fn probe_decode_entropy(
-    ctx: &DeviceContext,
-    logits: &DeviceVec,
-    host: Option<&[f32]>,
-    token: u32,
-    position: u64,
-) -> Result<()> {
-    if !crate::probe::token_entropy() {
-        return Ok(());
-    }
-    let owned;
-    let host = match host {
-        Some(host) => host,
-        None => {
-            owned = logits.to_host(ctx)?;
-            &owned
-        }
-    };
-    let (entropy, nll) = crate::probe::entropy_nll(host, Some(token));
-    crate::probe::emit_token("decode", position, Some(token), nll, entropy);
-    Ok(())
-}
-

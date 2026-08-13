@@ -121,7 +121,7 @@ impl Qwen35Model {
                 .as_ref()
                 .ok_or_else(|| anyhow!("MTP head layer missing MLP"))?;
             crate::profile::profile_op(&self.ctx, "dense_ffn", None, 1, || {
-                self.dense_mlp(mlp, &normed, &mut ws.dense, &mut mlp_out, None)
+                self.dense_mlp(mlp, &normed, &mut ws.dense, &mut mlp_out)
             })?;
         }
         let mut h_layer = HiddenStates::zeros(&self.ctx, hidden, 1)?;

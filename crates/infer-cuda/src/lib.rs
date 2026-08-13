@@ -73,12 +73,6 @@ mod nvtx;
 mod ops;
 #[cfg(feature = "cuda")]
 mod profile;
-// Inference-analysis probe (per-token entropy + decode logit lens), env-gated
-// JSONL. Off = one OnceLock load per hook. Config/math/writer are host-only
-// (CPU-testable); the device lens stash is cuda-gated inside.
-#[cfg(any(feature = "cuda", feature = "no-cuda"))]
-#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
-mod probe;
 // Session KV-recall (infinite memory): resident mean-key reps + restricted page
 // table on the dense-Qwen3 paged decode path. The `default_recall_config`
 // budget is device-neutral; the rep/score machinery is cuda-gated inside.

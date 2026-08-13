@@ -1085,7 +1085,6 @@ impl Qwen35Model {
                     scratch.normed.get(ctx, hidden, block)?,
                     &mut scratch.dense,
                     mlp_out,
-                    None,
                 )
             })?;
             crate::profile::profile_op(ctx, "ffn_residual", Some(li), block, || {
@@ -1485,7 +1484,6 @@ impl Qwen35Model {
                     scratch.normed.get(ctx, hidden, rows)?,
                     &mut scratch.dense,
                     mlp_out,
-                    None,
                 )
             })?;
             crate::profile::profile_op(ctx, "ffn_residual", Some(li), rows, || {
