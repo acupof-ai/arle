@@ -1639,13 +1639,6 @@ pub(crate) fn dsv4_flashmla_decode_enabled() -> Result<bool> {
     Ok(cuda_kernels::HAS_FLASHMLA)
 }
 
-/// Batched (`b = N`) FlashMLA sparse decode lane gate (#60). Canonical for
-/// MODEL1 n>1 decode when FlashMLA decode is available; N=1 forwards never
-/// consult this and always take the cached-meta single-row path.
-pub(crate) fn dsv4_flashmla_decode_batched_enabled() -> Result<bool> {
-    dsv4_flashmla_decode_enabled()
-}
-
 pub(crate) fn dsv4_flashmla_prefill_enabled() -> Result<bool> {
     // Default ON: vendored FlashMLA sparse prefill replaces the scalar
     // SW/CSA/HCA attention math. Licensed 2026-06-07 on the TP=8/EP=8 H20 pod:
@@ -2149,11 +2142,6 @@ fn flashmla_pack_compressed_delta(
 /// dsv4_swa.cu) — nondeterministic SWA keys for the next chunk once prefill
 /// chunks exceed the window. Returns `(rows_skipped, adjusted_start_pos,
 /// rows_to_write)`; a no-op `(0, start_pos, seq_len)` at `seq_len <= window`.
-fn sw_ring_tail_slice(seq_len: usize, window: usize, start_pos: usize) -> (usize, usize, usize) {
-    let skip = seq_len.saturating_sub(window);
-    (skip, start_pos + skip, seq_len - skip)
-}
-
 fn update_bf16_sw_window(
     ctx: &DeviceContext,
     sw_window_cache: &mut CudaSlice<half::bf16>,
@@ -2195,8 +2183,9 @@ fn update_bf16_sw_window(
             )
             .result()?;
         } else {
-            let (skip, start_pos, rows) =
-                sw_ring_tail_slice(k_prepared.seq_len, config.sliding_window, start_pos);
+            let skip = k_prepared.seq_len.saturating_sub(config.sliding_window);
+            let start_pos = start_pos + skip;
+            let rows = k_prepared.seq_len - skip;
             let k_ptr = k_ptr + (skip * config.head_dim * 2) as u64;
             ffi::dsv4_update_window_cache_cuda(
                 k_ptr as *const ffi::Half,

@@ -2680,7 +2680,7 @@ impl Dsv4Model {
         // B>1 uses this as the canonical path when the model-wide batched
         // scratch exists (both MODEL1 and V32/GLM). N=1 never reaches this
         // function.
-        let batched_attn_lane = crate::attention::dsv4_flashmla_decode_batched_enabled()?
+        let batched_attn_lane = crate::attention::dsv4_flashmla_decode_enabled()?
             && kv_adapter.has_flashmla_batch_scratch();
 
         // Per-slot decode position scalars (each row's attention reads its own).
