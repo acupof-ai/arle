@@ -1381,7 +1381,7 @@ impl Qwen35CudaExecutor {
             )?;
             let vocab = dims[1];
             let mut spec = model.new_spec_slot_state()?;
-            let (pending, logprob) = if row.params.is_greedy() {
+            let (pending, logprob) = if row.params.is_raw_argmax() {
                 let tok = crate::ops::argmax_row_into(
                     &model.ctx,
                     &logits,
@@ -1423,7 +1423,7 @@ impl Qwen35CudaExecutor {
             )?;
             let vocab = dims[1];
             let mut spec = model.new_spec_slot_state()?;
-            let (pending, logprob) = if row.params.is_greedy() {
+            let (pending, logprob) = if row.params.is_raw_argmax() {
                 let tok = crate::ops::argmax_row_into(
                     &model.ctx,
                     &logits,

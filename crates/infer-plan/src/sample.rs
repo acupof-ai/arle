@@ -9,11 +9,14 @@ use crate::SamplingParams;
 
 /// Index of the maximum logit. Ties resolve to the lowest index.
 #[must_use]
+/// Ties resolve to the LOWEST index, matching `sampling.cu`'s
+/// `warp_reduce_argmax` — the device fast path and this must agree or greedy
+/// decode depends on which one ran.
 pub fn argmax_logit(logits: &[f32]) -> u32 {
     logits
         .iter()
         .enumerate()
-        .max_by(|(_, a), (_, b)| a.total_cmp(b))
+        .max_by(|(ai, a), (bi, b)| a.total_cmp(b).then(bi.cmp(ai)))
         .map(|(i, _)| i as u32)
         .unwrap_or(0)
 }
@@ -21,12 +24,8 @@ pub fn argmax_logit(logits: &[f32]) -> u32 {
 /// Merge per-rank `(max_logit, global_argmax)` pairs from a vocab-sharded
 /// lm_head into the global greedy token.
 ///
-/// Reproduces the CUDA device argmax (`sampling.cu` `warp_reduce_argmax`):
-/// max value wins, ties resolve to the LOWEST index. (`argmax_logit`'s
-/// `max_by` resolves ties to the highest index — the device kernel, not the
-/// host helper, is this merge's parity reference.) Pure host math, so every
-/// TP rank derives the same winner from the same gathered pairs. `None` iff
-/// `pairs` is empty.
+/// Ties resolve to the lowest index, like [`argmax_logit`] and the device
+/// kernel. Pure host math, so every TP rank derives the same winner.
 #[must_use]
 pub fn merge_vocab_shard_argmax(pairs: impl IntoIterator<Item = (f32, u32)>) -> Option<u32> {
     pairs

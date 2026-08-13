@@ -371,7 +371,7 @@ impl Qwen35Model {
             .iter()
             .enumerate()
             .map(|(r, p)| -> anyhow::Result<(u32, Option<f32>)> {
-                if p.is_greedy() {
+                if p.is_raw_argmax() {
                     return Ok((greedy_ids[r] as u32, None));
                 }
                 let row_vec = row_logits.get(&self.ctx, vocab)?;
@@ -626,7 +626,7 @@ impl Qwen35Model {
             .iter()
             .enumerate()
             .map(|(r, p)| -> anyhow::Result<(u32, Option<f32>)> {
-                if p.is_greedy() {
+                if p.is_raw_argmax() {
                     return Ok((greedy_ids[r] as u32, None));
                 }
                 let row_vec = row_logits.get(&self.ctx, vocab)?;

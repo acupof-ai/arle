@@ -196,8 +196,8 @@ fn sample_inflight(
     params: &infer_plan::SamplingParams,
     position: u64,
 ) -> MetalInflight {
-    if params.is_greedy() || !crate::runtime_flags::host_sampling() {
-        if !params.is_greedy() {
+    if params.is_raw_argmax() || !crate::runtime_flags::host_sampling() {
+        if !params.is_raw_argmax() {
             warn_host_sampling_downgrade();
         }
         let sampled = mlx::argmax(logits);
@@ -1091,7 +1091,7 @@ impl RealMetalExecutor {
         // the prior request's stale token; these checks send that case to the
         // cold path (which resets the slot and drops the stale pending).
         if pipeline_decode_enabled()
-            && row.params.is_greedy()
+            && row.params.is_raw_argmax()
             && self.pending_matches_live_slot(row, kv)
         {
             probe_pipeline_fast_path();
@@ -1169,7 +1169,7 @@ impl RealMetalExecutor {
         // step's sampled token and issue the next step's forward so subsequent
         // ticks take the fast path and overlap.
         if pipeline_decode_enabled()
-            && row.params.is_greedy()
+            && row.params.is_raw_argmax()
             && let MetalInflight::Sampled { sampled, .. } = &inflight
         {
             if let Some(slot) = self.slots.get_mut(&row.slot) {
