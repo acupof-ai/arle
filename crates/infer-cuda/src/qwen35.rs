@@ -145,20 +145,18 @@ fn qwen35_gdr_chunked_enabled() -> bool {
     crate::runtime_flags::qwen35_gdr_chunked()
 }
 
-/// One-shot probe: stub builds and non-sm90 devices return
-/// CUDA_ERROR_NOT_SUPPORTED from the dispatch wrapper before touching any
-/// pointer; a real kernel rejects the seq_len=0 launch with a different code.
-fn fq_kernels_available(ctx: &DeviceContext, cumsum: ffi::FqCumsumFn) -> bool {
+/// The two conditions the AOT dispatch wrapper itself switches on: the flashqla
+/// rows were compiled into this build, and the device is sm_90 (the only SM they
+/// are emitted for). Probing by launching `seq_len = 0` instead would issue a
+/// zero-block grid, which is an illegal launch that compute-sanitizer reports on
+/// every run.
+fn fq_kernels_available(ctx: &DeviceContext) -> bool {
     static AVAILABLE: OnceLock<bool> = OnceLock::new();
     *AVAILABLE.get_or_init(|| {
-        // The dispatch wrapper resolves SM via the calling thread's DRIVER
-        // context — bind first or the probe is a per-thread lottery.
-        if ctx.ctx.bind_to_thread().is_err() {
-            return false;
-        }
-        // SAFETY: seq_len=0 → zero grid; no pointer is dereferenced.
-        let r = unsafe { cumsum(std::ptr::null(), std::ptr::null_mut(), 0, std::ptr::null_mut()) };
-        let ok = r != cudarc::driver::sys::CUresult::CUDA_ERROR_NOT_SUPPORTED;
+        let ok = cuda_kernels::KERNEL_CAPABILITIES
+            .split(',')
+            .any(|c| c == "flashqla")
+            && ctx.compute_capability() == (9, 0);
         if !ok {
             log::warn!("FlashQLA chunked GDR unavailable (stub build or non-sm90); using the recurrent scan");
         }
