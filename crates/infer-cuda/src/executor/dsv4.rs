@@ -1352,11 +1352,10 @@ impl Dsv4CudaExecutor {
     /// Largest single prefill forward; also the restore-snapshot grain when it
     /// exceeds the boundary alignment. Default 2048 (plan Phase 3 flip,
     /// 2026-07-17 gates: c1 TTFT 3031→1088 ms, c16 out +138%, ITL p99 −293 ms,
-    /// needle zero-miss ×2 passes). `ARLE_DSV4_PREFILL_CHUNK` overrides:
-    /// clamped to `[128, DSV4_PREFILL_QUERY_CHUNK]` (the shared prefill
-    /// scratch M bound), min'd with the deepep_ll per-forward token cap, and
-    /// rounded down to a 128 multiple so chunk ends stay on the ring/snapshot
-    /// alignment.
+    /// needle zero-miss ×2 passes). Clamped to `[128, DSV4_PREFILL_QUERY_CHUNK]`
+    /// (the shared prefill scratch M bound), min'd with the deepep_ll per-forward
+    /// token cap, and rounded down to a 128 multiple so chunk ends stay on the
+    /// ring/snapshot alignment.
     pub(crate) fn max_prefill_chunk(&self) -> usize {
         const DEFAULT_PREFILL_CHUNK: usize = 2048;
         let grain = self.model.config.sliding_window.max(1);
@@ -2267,13 +2266,6 @@ impl Dsv4CudaExecutor {
             // B=1 bypasses `Dsv4Model::forward_decode_batch` (the CUDA-graph
             // decode-graph lane, `forward_tokens_decode_graph`) — mirror its
             // trace call here so the diagnostic covers both lanes uniformly.
-            // See ARLE_DSV4_DECODE_TRACE, crate::dsv4::dsv4_decode_trace.
-            crate::dsv4::dsv4_decode_trace(
-                self.model.tp.config().rank,
-                &batch.slot_ids,
-                &batch.start_positions,
-                &out.iter().map(|t| t.token).collect::<Vec<_>>(),
-            );
             return Ok(out);
         }
 
