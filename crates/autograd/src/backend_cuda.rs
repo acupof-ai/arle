@@ -49,6 +49,8 @@ mod state;
 #[cfg(not(feature = "no-cuda"))]
 #[path = "backend_cuda/matmul.rs"]
 mod matmul;
+#[cfg(not(feature = "no-cuda"))]
+use self::matmul::*;
 
 #[cfg(not(feature = "no-cuda"))]
 #[path = "backend_cuda/checkpoint.rs"]
