@@ -2080,7 +2080,7 @@ mod dsv4_gpu {
                 .stream
                 .clone_htod(tokens)
                 .map_err(|e| anyhow::anyhow!("DSv4 device route token-id H2D failed: {e}"))?;
-            keepalive.keep_route_u32(&token_ids);
+            keepalive.keep_u32(&token_ids);
             Some(token_ids)
         } else {
             None
@@ -2100,9 +2100,9 @@ mod dsv4_gpu {
             .map(|table| cache_ptr(table, ctx));
         let token_ids_ptr = token_ids.as_ref().map(|ids| cache_ptr(ids, ctx));
 
-        keepalive.keep_route_hidden(logits);
-        keepalive.keep_route_i32(&route_indices);
-        keepalive.keep_route_f32(&route_weights);
+        keepalive.keep_hidden(logits);
+        keepalive.keep_i32(&route_indices);
+        keepalive.keep_f32(&route_weights);
         // SAFETY: buffers are allocated for `[num_tokens * topk]`; optional
         // pointers are validated by the wrapper according to `routing_kind`.
         unsafe {
@@ -2799,7 +2799,7 @@ mod dsv4_gpu {
             .stream
             .alloc_zeros::<i64>(total_routes)
             .map_err(|e| anyhow::anyhow!("DSv4 DeepEP route-index i64 alloc failed: {e}"))?;
-        keepalive.keep_route_i64(&topk_idx_i64);
+        keepalive.keep_i64(&topk_idx_i64);
         unsafe {
             moe::dsv4_cast_i32_to_i64(
                 cache_ptr(&routing.indices, ctx),
@@ -3706,13 +3706,13 @@ mod dsv4_gpu {
             .stream
             .alloc_zeros::<i64>(total_routes.max(1))
             .map_err(|e| anyhow::anyhow!("deepep_ll route-index i64 alloc failed: {e}"))?;
-        keepalive.keep_route_i64(&topk_idx_i64);
+        keepalive.keep_i64(&topk_idx_i64);
         let route_weights = if owned_n > 0 {
             let mut logits = HiddenStates::zeros(ctx, cfg.num_experts, owned_n)?;
             gemm_batch(ctx, &layer.gate, hidden, &mut logits)?;
             keepalive.keep_hidden(&logits);
             let routing = dsv4_route_device(model, layer, tokens, &logits, keepalive)?;
-            keepalive.keep_route_f32(&routing.weights);
+            keepalive.keep_f32(&routing.weights);
             // SAFETY: both buffers hold `total_routes` elements on `ctx.stream`.
             unsafe {
                 moe::dsv4_cast_i32_to_i64(
@@ -3728,7 +3728,7 @@ mod dsv4_gpu {
                 .stream
                 .alloc_zeros::<f32>(1)
                 .map_err(|e| anyhow::anyhow!("deepep_ll empty route-weight alloc failed: {e}"))?;
-            keepalive.keep_route_f32(&w);
+            keepalive.keep_f32(&w);
             w
         };
 
