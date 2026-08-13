@@ -420,7 +420,7 @@ impl CudaBackend {
         if len == 0 {
             return self.stream.alloc_zeros::<u16>(0).map_err(|_| {
                 AutogradError::TapeInvariant("cuda alloc_zeros failed (bf16 bridge)")
-            })?;
+            });
         }
 
         let byte_count =
