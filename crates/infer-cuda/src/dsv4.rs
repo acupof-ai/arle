@@ -2967,7 +2967,6 @@ impl Dsv4Model {
                 // absent), the existing per-row `csa_select_official` +
                 // `gather_selected_row` path runs byte-identically.
                 let use_batched_dsa_select = runs_indexer
-                    && true
                     && kv_adapter
                         .layer_dsa_and_flashmla_batch_mut(layer_idx)?
                         .1
@@ -3163,17 +3162,12 @@ impl Dsv4Model {
                         && let (Some((kv, score)), Some(indexer)) =
                             (indexer_kv_score.as_ref(), layer.attention.indexer.as_ref())
                     {
-                        let use_official_dsa = true;
-                        let indexer_rope_original_seq_len = if use_official_dsa {
-                            i32::try_from(
+                        let indexer_rope_original_seq_len = i32::try_from(
                                 self.config.rope_parameters.original_max_position_embeddings,
                             )
                             .map_err(|_| {
                                 anyhow!("DSv4 full-flatten indexer rope len overflows i32")
-                            })?
-                        } else {
-                            0
-                        };
+                            }?;
                         let positions = batched_positions.as_ref().ok_or_else(|| {
                             anyhow!("DSv4 full-flatten P1a: batched positions missing")
                         })?;
