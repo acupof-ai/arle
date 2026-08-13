@@ -1717,7 +1717,6 @@ impl std::fmt::Debug for Dsv4Model {
     }
 }
 
-
 impl Dsv4Model {
     pub(crate) fn begin_mega_moe_forward(&self, _num_tokens: usize) -> Result<Option<u64>> {
         #[cfg(all(feature = "cuda", feature = "nccl"))]
@@ -2007,9 +2006,6 @@ impl Dsv4Model {
         let seq_len = tokens.len();
         let (stream, mut keepalive) =
             self.forward_tokens_stream_impl(slot, kv_adapter, tokens, start_pos, false, None)?;
-        if seq_len > 1 && crate::probe::token_entropy() {
-            self.probe_prefill_entropy(&stream, tokens, start_pos)?;
-        }
         if let Some(out) = last_hidden_out {
             self.capture_mtp_stream_hidden(&stream, seq_len - 1, 1, out, &mut keepalive)?;
         }
@@ -2021,12 +2017,6 @@ impl Dsv4Model {
             None,
             &mut keepalive,
         )?;
-        // Post-sampling sync point: the emitted token is known, stashed lens
-        // logits can D2H without adding a mid-loop sync. seq_len==1 mirrors the
-        // arming condition — a prefill call must not drain another step's stash.
-        if seq_len == 1 {
-            crate::probe::lens_flush(&self.ctx, &[position], &[token]);
-        }
         std::hint::black_box(keepalive.len());
         drop(keepalive);
         Ok(token)
@@ -2146,48 +2136,6 @@ impl Dsv4Model {
         Ok(logits)
     }
 
-    /// Prefill per-position entropy/NLL: head recipe + lm_head over 256-row
-    /// chunks of the full prefill stream, one D2H per chunk (prefill already
-    /// syncs at its sample tail; the probe is ON here, so the extra sync is
-    /// probe-only cost). Buffers drop after the chunk's D2H sync — safe.
-    fn probe_prefill_entropy(
-        &self,
-        stream: &HiddenStates,
-        tokens: &[u32],
-        start_pos: usize,
-    ) -> Result<()> {
-        const CHUNK: usize = 256;
-        let hidden_size = self.config.hidden_size;
-        let vocab = self.lm_head.rows;
-        for chunk_start in (0..tokens.len()).step_by(CHUNK) {
-            let chunk_end = (chunk_start + CHUNK).min(tokens.len());
-            let rows = chunk_end - chunk_start;
-            // SAFETY: uninit device scratch; fully written before first read.
-            let mut head_normed = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, rows)? };
-            self.head_normed_rows(stream, chunk_start..chunk_end, &mut head_normed)?;
-            // SAFETY: uninit device scratch; fully written before first read.
-            let mut logits = unsafe { HiddenStates::uninit(&self.ctx, vocab, rows)? };
-            self.lm_head_project_batch(&head_normed, &mut logits)?;
-            let host = crate::probe::stream_to_host_f32(&self.ctx, &logits)?;
-            for i in 0..rows {
-                let global = chunk_start + i;
-                // Target = the actual next prompt token; None on the call's last
-                // row (the target is in the next prefill chunk / the sampled token).
-                let target = tokens.get(global + 1).copied();
-                let (entropy, nll) =
-                    crate::probe::entropy_nll(&host[i * vocab..(i + 1) * vocab], target);
-                crate::probe::emit_token(
-                    "prefill",
-                    (start_pos + global) as u64,
-                    target,
-                    nll,
-                    entropy,
-                );
-            }
-        }
-        Ok(())
-    }
-
     /// Verify `tokens` in ONE scheduled sparse forward under `sched`'s per-row
     /// positions. MTP schedules are chain-shaped (`depth + 1` rows), so this path
     /// requires at least two rows and never falls back to a plain single-token
@@ -2302,9 +2250,7 @@ impl Dsv4Model {
             start_positions,
             capture_taps,
         )?;
-        let fast_head = params.iter().all(SamplingParams::is_greedy)
-            && !crate::probe::token_entropy()
-            && crate::probe::lens_layers() == 0;
+        let fast_head = params.iter().all(SamplingParams::is_greedy);
         let out_tokens = crate::profile::profile_op(&self.ctx, "lm_head", None, n, || {
             if fast_head {
                 let logits = self.verify_logits_from_stream(&stream, n, &mut keepalive)?;
@@ -2325,8 +2271,6 @@ impl Dsv4Model {
                     .collect::<Result<Vec<_>>>()
             }
         })?;
-        // Post-sampling sync point: all rows' emitted tokens are known.
-        crate::probe::lens_flush(&self.ctx, positions, &out_tokens);
         std::hint::black_box(keepalive.len());
         drop(keepalive);
         Ok(out_tokens)
@@ -2513,38 +2457,8 @@ impl Dsv4Model {
         // as `ptr_keepalive`; the inert N>1 `keep_i32` would not retain them).
         let mut pack_pt_keepalive: Vec<CudaSlice<i32>> = Vec::new();
 
-        // Logit lens (batched decode is always a decode step): capture the last
-        // N layers' head projections; off = one Option compare per layer.
-        let lens_from = match crate::probe::lens_layers() {
-            0 => None,
-            depth => Some(self.layers.len().saturating_sub(depth)),
-        };
-        if lens_from.is_some() {
-            crate::probe::lens_begin();
-        }
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             let full_flatten = layer.mode != DeepSeekV4AttentionMode::SparseIndexed;
-
-            // Diagnostic-only substage fingerprint (`ARLE_PROBE_STAGES`, see
-            // docs/experience/errors/2026-07-06-dsv4-concurrent-decode-digit-corruption-unresolved.md).
-            // D2H's one row's slice per call; `stage_want` is a cheap OnceLock
-            // compare when off, so this closure costs nothing on the hot path.
-            let stage_all = |name: &str, buf: &HiddenStates| {
-                let width = buf.hidden_dim;
-                for (r, &pos) in start_positions.iter().enumerate().take(buf.seq_len) {
-                    let pos = pos as u64;
-                    if crate::probe::stage_want(pos) {
-                        crate::probe::stage_bf16(
-                            ctx,
-                            name,
-                            layer_idx,
-                            r,
-                            pos,
-                            buf.data.slice(r * width..(r + 1) * width),
-                        );
-                    }
-                }
-            };
 
             // ── Attention half: HC params + pre + norm over the whole [N] batch.
             // GLM (hc_mult==1): no hyper-connection; the stream IS the hidden, so
@@ -2604,7 +2518,6 @@ impl Dsv4Model {
                 Some(mhc)
             };
             keepalive.keep_hidden(&normed);
-            stage_all("attn_norm", &normed);
 
             // ── Attention: per-row independent single-token MLA into row r.
             // SAFETY: every [r*hidden, (r+1)*hidden) span of attn_out is written by
@@ -2751,9 +2664,6 @@ impl Dsv4Model {
                     };
                     (main, indexer, query)
                 };
-                if let Some((kv, _score)) = compressor_kv_score.as_ref() {
-                    stage_all("compressor_out", kv);
-                }
                 // ── 0c. Full-flatten P1a: per-row compressor
                 // STATE-update DEFER (gather each row's ring-state pointers + advance
                 // compressed.seq_len, NO per-row FFI) → ONE
@@ -3712,7 +3622,6 @@ impl Dsv4Model {
             crate::profile::profile_op(ctx, "attn_allreduce", Some(layer_idx), seq_len, || {
                 self.tp.all_reduce_sum(&self.ctx, &mut attn_out)
             })?;
-            stage_all("attn_out", &attn_out);
             // SAFETY: hc_post / add_batch writes the full stream buffer.
             let mut attn_stream = unsafe { HiddenStates::uninit(&self.ctx, stream_dim, seq_len)? };
             if let Some(mhc) = attn_mhc.as_ref() {
@@ -3736,7 +3645,6 @@ impl Dsv4Model {
             }
             keepalive.keep_hidden(&attn_stream);
             stream = attn_stream;
-            stage_all("attn_residual", &stream);
 
             // ── MoE half: HC-wrap the grouped FP8 DeepGEMM MoE over the [N] batch.
             // GLM (hc_mult==1): plain RMSNorm of the stream (no ffn hyper-connection).
@@ -3792,7 +3700,6 @@ impl Dsv4Model {
                 Some(mhc)
             };
             keepalive.keep_hidden(&normed);
-            stage_all("ffn_input", &normed);
             // Routed MoE over the whole [N] batch. allreduce transport: Phase 6a
             // grouped path (one router gemm + one DeepGEMM grouped expert GEMM
             // over N×topk routes, decode_scratch=None) + one EP all-reduce.
@@ -3963,7 +3870,6 @@ impl Dsv4Model {
                 })?;
                 keepalive.keep_hidden(&moe_with_shared);
             }
-            stage_all("moe_out", &moe_with_shared);
             // SAFETY: hc_post / add_batch writes the full stream buffer.
             let mut ffn_stream = unsafe { HiddenStates::uninit(&self.ctx, stream_dim, seq_len)? };
             if let Some(mhc) = ffn_mhc.as_ref() {
@@ -3987,7 +3893,6 @@ impl Dsv4Model {
             }
             keepalive.keep_hidden(&ffn_stream);
             stream = ffn_stream;
-            stage_all("ffn_residual", &stream);
             // DSpark T3: capture each row's wide HC stream at this layer's OUTPUT
             // into its slot's tap buffer (decode: 1 token per row). Gated by
             // `dspark` so the default path is byte-identical.
@@ -4002,12 +3907,6 @@ impl Dsv4Model {
                     let tap = &mut slots[slot_ids[r]].dspark_taps[tap_idx];
                     self.capture_mtp_stream_hidden(&stream, r, 1, tap, &mut keepalive)?;
                 }
-            }
-            // Lens capture: head-project the layer's final stream for all rows
-            // and stash the DEVICE logits (no sync/D2H until lens_flush).
-            if lens_from.is_some_and(|from| layer_idx >= from) {
-                let logits = self.verify_logits_from_stream(&stream, seq_len, &mut keepalive)?;
-                crate::probe::lens_push(layer_idx, logits);
             }
         }
 
@@ -5266,18 +5165,6 @@ impl Dsv4Model {
             }
             _ => None,
         };
-        // Logit lens: single-row eager DECODE steps only (prefill and
-        // spec-decode/MTP verify are not lens-instrumented); off = one Option
-        // compare per layer.
-        let lens_from = match crate::probe::lens_layers() {
-            depth if depth > 0 && seq_len == 1 && verify.is_none() => {
-                Some(self.layers.len().saturating_sub(depth))
-            }
-            _ => None,
-        };
-        if lens_from.is_some() {
-            crate::probe::lens_begin();
-        }
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             // ── Attention half: HC-wrap MLA attention.
             // ponytail: pod-verify GLM hc_mult==1 plain residual + identity stream (no hyper-connection)
@@ -5847,13 +5734,6 @@ impl Dsv4Model {
                         .map_err(|e| anyhow!("DSpark prompt tap capture D2D failed: {e}"))?;
                     keepalive.keep_vec(&bufs[tap_idx]);
                 }
-            }
-            // Lens capture: head-project the layer's final stream (row 0, the
-            // decode token) and stash the DEVICE logits (no sync/D2H until
-            // lens_flush at the post-sampling sync point).
-            if lens_from.is_some_and(|from| layer_idx >= from) {
-                let logits = self.verify_logits_from_stream(&stream, seq_len, &mut keepalive)?;
-                crate::probe::lens_push(layer_idx, logits);
             }
         }
 
