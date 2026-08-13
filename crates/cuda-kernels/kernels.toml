@@ -1107,3 +1107,78 @@ out_name = "tilelang_flashqla_gdr_bwd_h16g8"
 allow_sm70 = false
 gate = "flashqla"
 ffi = false
+# H=16/Hg=16 — Qwen3.5-0.8B GDN.
+[[kernel]]
+q_heads = 16
+kv_heads = 16
+phase = "fq_cumsum"
+abi = "fq_cumsum_v1"
+kernel_family = "flashqla"
+kernel_key = "fq_cumsum"
+py_module = "tools/tilelang/flashqla_gdr.py"
+artifact_dir = "flashqla_gdr_cumsum_h16g16"
+kernel_name = "gdr_fq_cumsum_h16g16"
+out_name = "tilelang_flashqla_gdr_cumsum_h16g16"
+allow_sm70 = false
+gate = "flashqla"
+ffi = false
+
+[[kernel]]
+q_heads = 16
+kv_heads = 16
+phase = "fq_kkt"
+abi = "fq_kkt_v1"
+kernel_family = "flashqla"
+kernel_key = "fq_kkt"
+py_module = "tools/tilelang/flashqla_gdr.py"
+artifact_dir = "flashqla_gdr_kkt_h16g16"
+kernel_name = "gdr_fq_kkt_h16g16"
+out_name = "tilelang_flashqla_gdr_kkt_h16g16"
+allow_sm70 = false
+gate = "flashqla"
+ffi = false
+
+[[kernel]]
+q_heads = 16
+kv_heads = 16
+phase = "fq_fwd"
+abi = "fq_fwd_v1"
+kernel_family = "flashqla"
+kernel_key = "fq_fwd"
+py_module = "tools/tilelang/flashqla_gdr.py"
+artifact_dir = "flashqla_gdr_fwd_h16g16"
+kernel_name = "gdr_fq_fwd_h16g16"
+out_name = "tilelang_flashqla_gdr_fwd_h16g16"
+allow_sm70 = false
+gate = "flashqla"
+ffi = false
+
+[[kernel]]
+q_heads = 16
+kv_heads = 16
+phase = "fq_prepare_h"
+abi = "fq_prepare_h_v1"
+kernel_family = "flashqla"
+kernel_key = "fq_prepare_h"
+py_module = "tools/tilelang/flashqla_gdr.py"
+artifact_dir = "flashqla_gdr_prepare_h_h16g16"
+kernel_name = "gdr_fq_prepare_h_h16g16"
+out_name = "tilelang_flashqla_gdr_prepare_h_h16g16"
+allow_sm70 = false
+gate = "flashqla"
+ffi = false
+
+[[kernel]]
+q_heads = 16
+kv_heads = 16
+phase = "fq_bwd"
+abi = "fq_bwd_v1"
+kernel_family = "flashqla"
+kernel_key = "fq_bwd"
+py_module = "tools/tilelang/flashqla_gdr.py"
+artifact_dir = "flashqla_gdr_bwd_h16g16"
+kernel_name = "gdr_fq_bwd_h16g16"
+out_name = "tilelang_flashqla_gdr_bwd_h16g16"
+allow_sm70 = false
+gate = "flashqla"
+ffi = false
