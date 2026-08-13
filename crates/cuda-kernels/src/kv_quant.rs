@@ -1094,6 +1094,99 @@ pub fn decode_attention_varlen_quantized(
     Ok(())
 }
 
+// ─── Native persistent paged attention for quantized KV (Path B) ───
+//
+// FA3-style split-KV over the 1-byte pools directly — no dequant temp. The
+// kernel is decode-shaped (one q token per batch row) and consumes the same
+// rectangular page table + cu_seqlens_q / seqused_k metadata as the FA3 lane.
+pub const PAGED_QUANT_FA3_MAX_SPLITS: usize = 16;
+
+pub fn paged_attention_quantized_fa3_workspace_bytes(
+    total_q_tokens: usize,
+    num_q_heads: usize,
+    head_dim: usize,
+    num_splits: usize,
+) -> usize {
+    // SAFETY: pure host-side size computation — no pointers, no device work.
+    unsafe {
+        ffi::paged_attention_quantized_fa3_workspace_bytes(
+            total_q_tokens as i32,
+            num_q_heads as i32,
+            head_dim as i32,
+            num_splits as i32,
+        )
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn paged_attention_quantized_fa3(
+    ctx: &DeviceContext,
+    q_packed: &HiddenStates,
+    k_pool_ptr: u64,
+    v_pool_ptr: u64,
+    k_scales_ptr: u64,
+    v_scales_ptr: u64,
+    page_table: u64,
+    cu_seqlens_q: u64,
+    seqused_k: u64,
+    output: &mut HiddenStates,
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    page_size: usize,
+    page_table_stride: usize,
+    batch: usize,
+    total_q: usize,
+    sm_scale: f32,
+    kv_format: KVFormat,
+    num_splits: usize,
+    workspace: &CudaSlice<u8>,
+    workspace_bytes: usize,
+) -> Result<()> {
+    if batch == 0 || total_q == 0 {
+        return Ok(());
+    }
+
+    let is_fp8 = matches!(kv_format, KVFormat::FP8E4M3);
+    let (q_ptr, _gq) = q_packed.data.device_ptr(&ctx.stream);
+    let (o_ptr, _go) = output.data.device_ptr_mut(&ctx.stream);
+    let (ws_ptr, _gws) = workspace.device_ptr(&ctx.stream);
+
+    // SAFETY: packed-Q/output/workspace pointers come from live buffers pinned
+    // by `_g*`; raw u64 args (page table, indptr, seqused, K/V pool, scales)
+    // are the caller's live device pointers. The kernel reads only pages the
+    // table names, bounded by `seqused_k`, and writes `total_q` output rows,
+    // stream-ordered.
+    unsafe {
+        ffi::paged_attention_quantized_fa3_cuda(
+            q_ptr as *const ffi::Half,
+            k_pool_ptr as *const u8,
+            v_pool_ptr as *const u8,
+            k_scales_ptr as *const f32,
+            v_scales_ptr as *const f32,
+            page_table as *const i32,
+            cu_seqlens_q as *const i32,
+            seqused_k as *const i32,
+            o_ptr as *mut ffi::Half,
+            num_q_heads as i32,
+            num_kv_heads as i32,
+            head_dim as i32,
+            page_size as i32,
+            page_table_stride as i32,
+            batch as i32,
+            total_q as i32,
+            sm_scale,
+            is_fp8,
+            num_splits as i32,
+            ctx.stream.cu_stream(),
+            ws_ptr as *mut u8,
+            workspace_bytes,
+        )
+        .result()?;
+    }
+    Ok(())
+}
+
 /// Quantize 1 new token per request from bf16 working buffer → INT8 paged pool.
 /// Thin wrapper around `quantize_paged_kv_per_token` with `KVFormat::INT8`.
 #[allow(clippy::too_many_arguments)]
