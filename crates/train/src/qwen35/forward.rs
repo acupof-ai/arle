@@ -386,6 +386,7 @@ impl Qwen35Model {
             // #170 attribution probe: full-tape per-layer VRAM ramp. free is
             // pool-reserved-aware (cuMemGetInfo), so slope = tape + transients.
             let vram_ramp = std::env::var("ARLE_OPD_VRAM_TRACE").is_ok();
+            let layer_trace = std::env::var("ARLE_OPD_LAYER_TRACE").is_ok();
             for (layer_index, layer) in self.layers.iter().enumerate() {
                 hidden = self.detach_before_lora_layer(hidden, layer_index, store, tape)?;
                 hidden = layer.forward(
@@ -401,6 +402,14 @@ impl Qwen35Model {
                 )?;
                 if vram_ramp && let Some((free, _)) = store.backend().device_mem_info() {
                     eprintln!("[vram-ramp] layer={layer_index} free={free}");
+                }
+                if layer_trace {
+                    let sq = store.get(hidden).and_then(|t| {
+                        t.device_handle
+                            .as_ref()
+                            .and_then(|h| store.backend().sum_squares(h, &t.shape).ok())
+                    });
+                    eprintln!("[layer-trace] layer={layer_index} hidden_sum_sq={sq:?}");
                 }
             }
         }
