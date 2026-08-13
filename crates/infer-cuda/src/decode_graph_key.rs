@@ -29,4 +29,3 @@ pub(crate) fn decode_graph_key_for(page_size: usize, kv_seq_len: usize) -> Decod
         num_pages,
     }
 }
-

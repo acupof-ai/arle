@@ -3163,11 +3163,9 @@ impl Dsv4Model {
                             (indexer_kv_score.as_ref(), layer.attention.indexer.as_ref())
                     {
                         let indexer_rope_original_seq_len = i32::try_from(
-                                self.config.rope_parameters.original_max_position_embeddings,
-                            )
-                            .map_err(|_| {
-                                anyhow!("DSv4 full-flatten indexer rope len overflows i32")
-                            }?;
+                            self.config.rope_parameters.original_max_position_embeddings,
+                        )
+                        .map_err(|_| anyhow!("DSv4 full-flatten indexer rope len overflows i32"))?;
                         let positions = batched_positions.as_ref().ok_or_else(|| {
                             anyhow!("DSv4 full-flatten P1a: batched positions missing")
                         })?;
@@ -3186,7 +3184,7 @@ impl Dsv4Model {
                             self.config.index_head_dim,
                             layer.compress_ratio,
                             true, // indexer compressor always overlap
-                            use_official_dsa,
+                            true,
                             indexer_rope_original_seq_len,
                             &mut ptr_keepalive,
                         )?;
