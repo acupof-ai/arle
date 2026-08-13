@@ -693,21 +693,23 @@ the token count, which is why total tok/s scales 10453 → 33780 while decode
 tok/s scales 118 → 145 (§2.3). The two views answer different questions and
 neither substitutes for the other.
 
-**The four largest costs are measured and none of them is attributed.** Each is
-sized precisely and its cause is unknown. Quantized GEMM, DeepGEMM FP8, and
-launch gaps have all been measured and priced out (§6) — the FP8 GEMM
-decisively so, at 87–93% of peak (§1.3).
+**Three of the four are measured; the sampling row is a mislabeled end-to-end
+number and is not yet a measured cost.** Each measured cost is sized precisely
+and its cause is unknown. Quantized GEMM, DeepGEMM FP8, and launch gaps have all
+been measured and priced out (§6) — the FP8 GEMM decisively so, at 87–93% of
+peak (§1.3).
 
 | cost | size | what is known | what is not | § |
 |---|---|---|---|---|
 | per-row verify term at c=16 | **5.69 ms/row, 85% of the tick, 9.2× off roofline** | measured 2026-08-08: FA3 decode-verify achieves **1.02 TB/s = 29.2%** at 32.5K/9 rows and 47% at 2.5K/16 rows | why the achieved bandwidth falls with context when row count moved too — two points cannot separate them | ceiling, §2.0 |
-| sampling penalty | −30 to −40% decode tok/s at c ≥ 8 | the concurrency shape is a per-row loop; acceptance-vs-concurrency is withdrawn | the size of the batched-draft gate's share | §2.4 |
+| sampling penalty | −30 to −40% end-to-end out tok/s at c ≥ 8, not decode-only | arms differ 120 vs 128 complete; cache parity unreported; per-row loop is a hypothesis | the batched-draft gate's share, after a same-envelope re-run | §2.4 |
 | prefill GPU idle | 3.97 s vs SGLang 0.19 s | GPU-busy is within 0.93 s on identical kernels | what the idle is waiting on | §1.2 |
 | sidecar writes | 9.4% of wall, 83 GB per bench | the cost, exactly | the restore hit rate, so whether it is earned | §4.2 |
 
-They are ranked by size at the batch that is served, which is why the per-row
-verify term leads despite the prefill idle being the larger raw number — see
-*Where the ceiling is* above.
+The three measured costs are ranked by size at the batch that is served, which
+is why the per-row verify term leads despite the prefill idle being the larger
+raw number — see *Where the ceiling is* above. The sampling row is excluded
+until it is re-run with equal completion counts and reported prefix hits.
 
 ---
 
@@ -1046,7 +1048,7 @@ over the same range; and c=16 is offered concurrency, against a measured mean of
 Aggregate *total* throughput still scales (10453 → 33780 tok/s) because prefill
 tokens dominate the token count on the anchor workload.
 
-### 2.4 Sampling costs 30–40% of decode throughput at c ≥ 8
+### 2.4 Sampling's cost is not yet isolated (end-to-end metric, envelope mismatch)
 
 Counterbalanced greedy/sampled sweep, 2026-08-07, `7b8a66603`, long-agent 32K,
 128 requests per point, order greedy, sampled, sampled, greedy.
@@ -1057,15 +1059,21 @@ Counterbalanced greedy/sampled sweep, 2026-08-07, `7b8a66603`, long-agent 32K,
 | 8 | 108.65 | 65.4 | **−39.8%** |
 | 16 | 113.8 | 78.6 | **−30.9%** |
 
-out tok/s, each cell the mean of that arm's two sweeps. Within-arm spread is
-8.4% at c=16 and 6.4% at c=8, so the effect clears its own noise by 4–6×.
-Greedy completed 128/128 everywhere; sampled completed 120/128 at every point,
-cause unknown.
+The cells are `out tok/s` — output tokens over wall time — not decode-only
+throughput. The earlier "decode tok/s" label on this table and in the lever
+register was wrong.
 
-**The concurrency shape is the evidence.** At c=1 sampling costs 3.6%; at c=8 it
-costs 39.8%. A lower acceptance rate under temperature would cost roughly the
-same fraction at every concurrency. A per-row host loop costs nothing at c=1 and
-grows with row count — which is the shape measured.
+The sweep is not a valid decode comparison as published:
+
+- greedy completed 128/128 every point; sampled completed 120/128 every point,
+  cause unknown. The arms therefore carry different scheduling envelopes before
+  any decode-path effect.
+- prefix-hit / hit-token parity between arms is unreported, so cache state is
+  unverified on a workload whose reuse rate is the governing variable.
+
+The concurrency shape (flat at c=1, growing at c≥8) is consistent with a
+per-row loop, but that is a hypothesis, not a measured effect, until the two
+arms are re-run with equal completion counts and reported prefix hits.
 
 The candidate mechanism is the batched-draft gate at
 `infer-cuda/src/executor/qwen35.rs:1984`:
@@ -1078,12 +1086,10 @@ if idx.len() >= 2 && decode_rows.iter().all(|r| r.params.is_greedy())
 sampled request drops every greedy row to per-row drafting. In this sweep every
 row is sampled, so the batched path never fires.
 
-**Not yet isolated:** the sampled arm has no `accept_rate` figure, so the gate's
-share is unattributed. Note the rival hypothesis is already dead — "accept
-halves at concurrency" was withdrawn in `baselines.md:137`; `accept` tracks
-prefix-cache state, not `c` (0.532 vs 0.313 at matched c=16). This stays a
-top-ranked item because production serving is sampled while every optimization
-on this row was measured at temp 0.
+**Not yet isolated:** the sampled arm has no `accept_rate` figure, and the
+envelope mismatch above means the gate's share is unattributed. The rival
+hypothesis that "accept halves at concurrency" is already withdrawn
+(`baselines.md:137`); `accept` tracks prefix-cache state, not `c`.
 
 ---
 
@@ -1291,8 +1297,8 @@ Ceilings belong to levers, not to categories.
 | GDN / gated-delta at c=16 | decode | c=16, 2.5K ctx | 21.0% of a decode tick | open — a same-binary A/B nulled it at 33K, untested here |
 | >1 ms gaps inside decode ticks | decode | c=16, 2.5K ctx | 13.8% of tick span, 53 gaps | open, cause unknown |
 | full-attn KV bandwidth | decode | c=16 | **47% of achievable at 2.5K, 29.2% at 32.5K** | open, but only 1.8% of a tick at short context |
-| batched-draft gate under sampling | decode | c=1…16, 32K | −30 to −40% decode tok/s at c ≥ 8 | **open, #2** — `executor/qwen35.rs:1984` tests all rows greedy; one-line narrowing to `idx` |
-| prefill GPU idle | prefill | c=1, 33K | 3.97 vs SGLang 0.19 s | **open, #3** — largest single gap, own SLO (TTFT) |
+| batched-draft gate under sampling | decode | c=1…16, 32K | unverified: −30 to −40% end-to-end out tok/s at c ≥ 8 (120 vs 128 complete, cache parity unreported) | hypothesis — `executor/qwen35.rs:1984` tests all rows greedy; re-run same-envelope before ranking |
+| prefill GPU idle | prefill | c=1, 33K | 3.97 vs SGLang 0.19 s | **open** — largest single gap, own SLO (TTFT) |
 | sidecar write policy | prefill | c=1…16 | 83 GB / 9.4% of wall | open — hit rate unmeasured |
 | host tail (refresh H2D, sampling sync) | decode | **batch 1** | part of ~4.3 ms residual | open, needs re-pricing at c=16 |
 | GDN decode kernel | decode | **batch 1** | 1.21 vs 0.53 ms | open at batch 1; the GDN lane is a measured null at c=16 |
@@ -1478,11 +1484,13 @@ TTFT ratios are hypotheses pending a complete matched run.
    corrected 192-CTA `block_DV=32` candidate fails in-forward numerical parity.
    **The stall is confirmed and the tile-size lever is closed.**
 
-9. **Sampling costs 30–40% of decode throughput at c ≥ 8** (§2.4) — measured on
-   the anchor, so its size needs re-measuring on §2.0's shape. The gate at
-   `executor/qwen35.rs:1984` tests *all* rows greedy. Do **not** re-open
-   "acceptance collapses with concurrency": withdrawn (`baselines.md:137`), and
-   both 08-08 captures measured `accept_rate` ≈ 0.475.
+9. **Sampling's −30 to −40% end-to-end out tok/s at c ≥ 8 is not yet a
+   measured decode cost** (§2.4) — the metric was mislabeled, the arms differ
+   120 vs 128 complete, and cache parity is unreported. The gate at
+   `executor/qwen35.rs:1984` tests *all* rows greedy; that stays a hypothesis
+   until a same-envelope re-run. Do **not** re-open "acceptance collapses with
+   concurrency": withdrawn (`baselines.md:137`), and both 08-08 captures
+   measured `accept_rate` ≈ 0.475.
 10. **Sidecar write policy** — restore hit rate still unmeasured.
 
 ## Measurement debt
@@ -1493,8 +1501,8 @@ Facts this chain rests on that have not been measured:
 |---|---|
 | **full-run phase accounting** | the selected window over-represents `pack_quantize` by 2.02x; the run-level shares of every other term and the critical-path split remain unknown |
 | prefix sidecar restore hit rate | decides whether 9.4% of wall is earned |
-| acceptance rate under temperature | the sampled arm has no matching `accept_rate`; its 30–40% throughput penalty is still unattributed |
+| acceptance rate under temperature | the sampled arm has no matching `accept_rate`; its −30 to −40% end-to-end out tok/s is still unattributed |
 | whole-slot park cost | `a546ba80a` shipped unmeasured; both routes default-off |
 | tokenize / detokenize share | folded into "GPU idle" in every prefill capture |
 | TP > 1 | every number here is single-GPU |
-| the 8/128 incomplete requests under sampling | uniform across arms, cause unknown |
+| the 8/128 incomplete requests under sampling | 120/128 complete at every concurrency, cause unknown |
