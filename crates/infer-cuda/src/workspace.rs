@@ -91,10 +91,6 @@ impl HiddenSlot {
     pub(crate) fn release(&mut self) {
         self.0 = None;
     }
-
-    pub(crate) fn as_ref(&self) -> Option<&HiddenStates> {
-        self.0.as_ref()
-    }
 }
 
 /// One cached [`DeviceVec`] buffer (`[len]` bf16).

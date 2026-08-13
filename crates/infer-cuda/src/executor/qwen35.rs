@@ -3671,31 +3671,6 @@ impl Qwen35CudaExecutor {
 #[cfg(test)]
 mod tier_io_tests {
     use super::*;
-    use half::bf16;
-    use infer_plan::{ForwardMode, PrefillRow};
-    use infer_seam::{HostPagedKvPool, KvAllocator};
-
-    /// The engine allocates the host pages `submit` mirrors from; these probes
-    /// drive the executor directly, so they allocate their own.
-    fn host_pool(slot: usize, tokens: usize) -> HostPagedKvPool {
-        let mut pool = HostPagedKvPool::new(slot + 1, 4096, SUPPORTED_PAGE_SIZE);
-        pool.alloc(slot, tokens).expect("host pages for the probe");
-        pool
-    }
-
-    const FACTUAL_S33: [u32; 33] = [
-        248045, 846, 198, 3710, 369, 279, 6511, 314, 8071, 30, 30299, 391, 30982, 66463, 494,
-        20620, 13, 21134, 303, 799, 466, 1330, 22157, 13, 248046, 198, 248045, 74455, 198, 248068,
-        271, 248069, 271,
-    ];
-    const NEEDLE_S75: [u32; 75] = [
-        248045, 846, 198, 4274, 411, 2716, 2193, 321, 4087, 1132, 279, 10897, 3177, 13, 9321, 25,
-        561, 6105, 8265, 369, 383, 26748, 220, 18, 13, 561, 2528, 1970, 369, 220, 19, 23, 16, 17,
-        13, 561, 2313, 6725, 66351, 682, 1141, 1534, 3286, 303, 11751, 13, 561, 2438, 8265, 369,
-        383, 26748, 220, 22, 13, 15380, 25, 733, 864, 3177, 369, 5606, 66351, 1534, 3286, 30,
-        248046, 198, 248045, 74455, 198, 248068, 271, 248069, 271,
-    ];
-
     #[test]
     fn speculative_chain_boundary_falls_back_before_verify_exceeds_max_seq_len() {
         assert!(speculative_chain_fits(12, 3, 16));
