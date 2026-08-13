@@ -1908,26 +1908,30 @@ impl Dsv4ChainVerifyAttnMeta {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn flashmla_prefill_attention(
-    ctx: &DeviceContext,
-    config: &DeepSeekV4Config,
-    attention: &Dsv4Attention,
-    mode: DeepSeekV4AttentionMode,
-    compress_ratio: usize,
+    attn: &Dsv4AttnCtx<'_>,
     q_prepared: &HiddenStates,
     k_prepared: &HiddenStates,
     selected: Option<&CudaSlice<i32>>,
     compressed: Option<&HiddenStates>,
     sw_window_cache: &mut CudaSlice<half::bf16>,
-    start_pos: usize,
-    chain_verify: Option<&Dsv4ChainVerifyAttnMeta>,
-    tp: &TpRuntime,
     local_heads: usize,
     local_attn: &mut HiddenStates,
     sm_scale: f32,
     rope: RopeParams,
 ) -> Result<()> {
+    let Dsv4AttnCtx {
+        ctx,
+        config,
+        attention,
+        mode,
+        compress_ratio,
+        tp,
+        pos,
+        chain_verify,
+        ..
+    } = *attn;
+    let start_pos = pos.start;
     ensure!(
         cuda_kernels::HAS_FLASHMLA,
         "DSv4 FlashMLA prefill is not available"
@@ -2490,13 +2494,8 @@ fn flashmla_prefill_attention(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 fn flashmla_decode_attention(
-    ctx: &DeviceContext,
-    config: &DeepSeekV4Config,
-    attention: &Dsv4Attention,
-    mode: DeepSeekV4AttentionMode,
-    compress_ratio: usize,
+    attn: &Dsv4AttnCtx<'_>,
     q_prepared: &HiddenStates,
     k_prepared: &HiddenStates,
     selected: Option<&CudaSlice<i32>>,
@@ -2505,13 +2504,21 @@ fn flashmla_decode_attention(
     flash: &mut Dsv4FlashMlaDecodeState,
     scratch: &mut Dsv4FlashMlaDecodeScratch,
     pool: &mut Dsv4LayerKvLayout,
-    pos: Dsv4Position<'_>,
-    tp: &TpRuntime,
     local_heads: usize,
     local_attn: &mut HiddenStates,
     sm_scale: f32,
     rope: RopeParams,
 ) -> Result<()> {
+    let Dsv4AttnCtx {
+        ctx,
+        config,
+        attention,
+        mode,
+        compress_ratio,
+        tp,
+        pos,
+        ..
+    } = *attn;
     ensure!(
         dsv4_flashmla_decode_enabled()?,
         "DSv4 FlashMLA decode is not available"
@@ -3465,6 +3472,22 @@ pub(crate) struct Dsv4Position<'a> {
     pub device: Option<&'a CudaSlice<i32>>,
 }
 
+/// Immutable execution context for one DSv4 MLA attention call. Bundles the
+/// per-call handles that `mla_attention` / `_prepare` / `_fwd` / `_decode` all
+/// thread through, so the mutable per-call state (`state`, `pool`, scratch
+/// buffers, `out`) stays explicit in the signature.
+pub(crate) struct Dsv4AttnCtx<'a> {
+    pub ctx: &'a DeviceContext,
+    pub config: &'a DeepSeekV4Config,
+    pub attention: &'a Dsv4Attention,
+    pub mode: DeepSeekV4AttentionMode,
+    pub compress_ratio: usize,
+    pub layer_idx: usize,
+    pub tp: &'a TpRuntime,
+    pub pos: Dsv4Position<'a>,
+    pub chain_verify: Option<&'a Dsv4ChainVerifyAttnMeta>,
+}
+
 /// Prepared-but-not-attended MLA state: the boundary between `mla_attention`'s
 /// per-row PREPARE half (wq/wkv proj + RoPE +, for CSA/HCA, compressor / indexer /
 /// `selected`) and its FWD half (the FlashMLA kernel + O-LoRA). The split lets the
@@ -3692,22 +3715,16 @@ impl Dsv4MlaDecodeScratch {
 /// One DSv4 MLA attention block (SlidingWindow / CompressedSparse /
 /// HybridCompressed, dispatched on `mode` / `compress_ratio`).
 ///
-/// `hidden` is the post-attn-LN input `[hidden_size, token_count]`; `start_pos` is
-/// the absolute position of its first token. Writes the O-LoRA output into `out`,
+/// `hidden` is the post-attn-LN input `[hidden_size, token_count]`; `attn.pos.start`
+/// is the absolute position of its first token. Writes the O-LoRA output into `out`,
 /// pre-TP-all-reduce (the model layer-loop owns the row-parallel sum).
 ///
 /// The per-head `attn_sink` vector is loaded WHOLE on every rank, so the attention
 /// kernel must skip to this rank's head block via `sink_offset = tp_rank *
 /// local_heads` - otherwise every non-zero rank reads rank-0's sink logits and the
 /// output diverges by a small head-dependent margin (multi-GPU only).
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn mla_attention(
-    ctx: &DeviceContext,
-    config: &DeepSeekV4Config,
-    attention: &Dsv4Attention,
-    mode: DeepSeekV4AttentionMode,
-    compress_ratio: usize,
-    layer_idx: usize,
+    attn: &Dsv4AttnCtx<'_>,
     hidden: &HiddenStates,
     state: &mut Dsv4LayerAttentionState,
     pool: &mut Dsv4LayerKvLayout,
@@ -3720,45 +3737,27 @@ pub(crate) fn mla_attention(
     mut prefill_shared: Option<&mut Dsv4PrefillDeepGemmLinearScratch>,
     // Shared FP32 probe scratch — contract on `compressor_forward`'s param.
     fp32_scratch: Option<&mut Dsv4CompressorFp32Scratch>,
-    pos: Dsv4Position<'_>,
-    chain_verify: Option<&Dsv4ChainVerifyAttnMeta>,
-    tp: &TpRuntime,
     out: &mut HiddenStates,
     keepalive: &mut Dsv4ForwardKeepalive,
 ) -> Result<()> {
     // Single-row and chunked-prefill callers run PREPARE then FWD back-to-back; only
     // the batched decode lane calls the two halves separately.
     let prepared = mla_attention_prepare(
-        ctx,
-        config,
-        attention,
-        mode,
-        compress_ratio,
-        layer_idx,
+        attn,
         hidden,
         state,
         pool,
         dsa_shared,
         prefill_shared.as_deref_mut(),
         fp32_scratch,
-        pos,
-        chain_verify,
-        tp,
         keepalive,
     )?;
     mla_attention_fwd(
-        ctx,
-        config,
-        attention,
-        mode,
-        compress_ratio,
+        attn,
         state,
         pool,
         flashmla_scratch,
         prefill_shared,
-        pos,
-        chain_verify,
-        tp,
         prepared,
         out,
         keepalive,
@@ -3821,25 +3820,28 @@ fn compressor_forward_decode(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn mla_attention_decode(
-    ctx: &DeviceContext,
-    config: &DeepSeekV4Config,
-    attention: &Dsv4Attention,
-    mode: DeepSeekV4AttentionMode,
-    compress_ratio: usize,
-    layer_idx: usize,
+    attn: &Dsv4AttnCtx<'_>,
     hidden: &HiddenStates,
     state: &mut Dsv4LayerAttentionState,
     pool: &mut Dsv4LayerKvLayout,
     dsa_shared: Option<&mut Dsv4DsaSharedScratch>,
     flashmla_scratch: Option<&mut Dsv4FlashMlaDecodeScratch>,
-    pos: Dsv4Position<'_>,
-    tp: &TpRuntime,
     scratch: &mut Dsv4MlaDecodeScratch,
     out: &mut HiddenStates,
     keepalive: &mut Dsv4ForwardKeepalive,
 ) -> Result<()> {
+    let Dsv4AttnCtx {
+        ctx,
+        config,
+        attention,
+        mode,
+        compress_ratio,
+        layer_idx,
+        tp,
+        pos,
+        ..
+    } = *attn;
     ensure!(
         hidden.hidden_dim == config.hidden_size && hidden.seq_len == 1,
         "DSv4 MODEL1 decode MLA requires one hidden row [{}x1], got {}x{}",
@@ -4146,11 +4148,7 @@ pub(crate) fn mla_attention_decode(
         anyhow!("FlashMLA decode enabled but shared FlashMLA decode scratch missing")
     })?;
     flashmla_decode_attention(
-        ctx,
-        config,
-        attention,
-        mode,
-        compress_ratio,
+        attn,
         &scratch.q_prepared,
         &scratch.k_prepared,
         selected,
@@ -4159,8 +4157,6 @@ pub(crate) fn mla_attention_decode(
         flash,
         flash_scratch,
         pool,
-        pos,
-        tp,
         local_heads,
         &mut scratch.local_attn,
         sm_scale,
@@ -4367,14 +4363,8 @@ fn glm_absorb_v(
 /// RoPE, and for CSA/HCA the compressor + (CSA) indexer top-k `selected`, leaving
 /// `state.compressor` / `state.indexer` populated for the fwd's re-borrow. No
 /// FlashMLA kernel and no pool writes, so the batched lane can run it per row.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn mla_attention_prepare(
-    ctx: &DeviceContext,
-    config: &DeepSeekV4Config,
-    attention: &Dsv4Attention,
-    mode: DeepSeekV4AttentionMode,
-    compress_ratio: usize,
-    layer_idx: usize,
+    attn: &Dsv4AttnCtx<'_>,
     hidden: &HiddenStates,
     state: &mut Dsv4LayerAttentionState,
     pool: &mut Dsv4LayerKvLayout,
@@ -4384,11 +4374,19 @@ pub(crate) fn mla_attention_prepare(
     mut prefill_shared: Option<&mut Dsv4PrefillDeepGemmLinearScratch>,
     // Shared FP32 probe scratch — contract on `compressor_forward`'s param.
     mut fp32_scratch: Option<&mut Dsv4CompressorFp32Scratch>,
-    pos: Dsv4Position<'_>,
-    chain_verify: Option<&Dsv4ChainVerifyAttnMeta>,
-    tp: &TpRuntime,
     keepalive: &mut Dsv4ForwardKeepalive,
 ) -> Result<Dsv4MlaPrepared> {
+    let Dsv4AttnCtx {
+        ctx,
+        config,
+        attention,
+        mode,
+        compress_ratio,
+        layer_idx,
+        tp,
+        pos,
+        chain_verify,
+    } = *attn;
     ensure!(
         hidden.hidden_dim == config.hidden_size,
         "DSv4 MLA hidden dim {} != hidden_size {}",
@@ -5074,21 +5072,24 @@ pub(crate) fn mla_attention_prepare_proj_batch(
 /// `indexer_rows_before` (the count BEFORE this step's advance; `0` for non-CSA
 /// rows). The GPU state writes run later in ONE [`dsv4_compressor_update_batched`]
 /// over all N rows, before any reader. SW rows are a no-op.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn mla_attention_compressor_defer_row(
-    ctx: &DeviceContext,
-    config: &DeepSeekV4Config,
-    attention: &Dsv4Attention,
-    mode: DeepSeekV4AttentionMode,
-    compress_ratio: usize,
+    attn: &Dsv4AttnCtx<'_>,
     normed_row: &HiddenStates,
     state: &mut Dsv4LayerAttentionState,
-    pos: Dsv4Position<'_>,
     rope: RopeParams,
     main_sink: &mut Dsv4CompressorBatchPtrs,
     indexer_sink: &mut Dsv4CompressorBatchPtrs,
     keepalive: &mut Dsv4ForwardKeepalive,
 ) -> Result<usize> {
+    let Dsv4AttnCtx {
+        ctx,
+        config,
+        attention,
+        mode,
+        compress_ratio,
+        pos,
+        ..
+    } = *attn;
     // GLM SparseIndexed has no compressor and the batched-defer kernel is
     // compressor-specific; the MODEL1-only batch scratch keeps GLM off this path -
     // fail loud if a caller violates that boundary.
@@ -5165,13 +5166,8 @@ pub(crate) fn mla_attention_compressor_defer_row(
 /// `q_prepared_row` / `k_prepared_row` slices the caller copied out of the batch.
 /// `c_q_normed_row` MUST hold byte-identical data to what `mla_attention_prepare`
 /// would have produced for this row, so `csa_select` selects the same blocks.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn mla_attention_prepare_compressed_only(
-    ctx: &DeviceContext,
-    config: &DeepSeekV4Config,
-    attention: &Dsv4Attention,
-    mode: DeepSeekV4AttentionMode,
-    compress_ratio: usize,
+    attn: &Dsv4AttnCtx<'_>,
     normed_row: &HiddenStates,
     c_q_normed_row: &HiddenStates,
     q_prepared_row: HiddenStates,
@@ -5180,7 +5176,6 @@ pub(crate) fn mla_attention_prepare_compressed_only(
     state: &mut Dsv4LayerAttentionState,
     pool: &mut Dsv4LayerKvLayout,
     dsa_shared: Option<&mut Dsv4DsaSharedScratch>,
-    pos: Dsv4Position<'_>,
     // When `Some`, the CSA per-row READ/SELECT is skipped (cache writes still run),
     // this row's q_i/weights are gathered into the N-row staging, and the returned
     // `selected` is `None` (the batched select fills selected_batched).
@@ -5202,6 +5197,15 @@ pub(crate) fn mla_attention_prepare_compressed_only(
     indexer_rows_before_override: Option<usize>,
     keepalive: &mut Dsv4ForwardKeepalive,
 ) -> Result<Dsv4MlaPrepared> {
+    let Dsv4AttnCtx {
+        ctx,
+        config,
+        attention,
+        mode,
+        compress_ratio,
+        pos,
+        ..
+    } = *attn;
     let head_dim = config.head_dim;
     let local_heads = proj.local_heads;
     let local_width = proj.local_width;
@@ -5414,13 +5418,8 @@ pub(crate) fn mla_attention_prepare_compressed_only(
 /// FWD half of `mla_attention` (see [`Dsv4MlaPrepared`]): the FlashMLA attention
 /// kernel over the PREPARE output, then the O-LoRA. The compressed-key pool is
 /// re-borrowed from `state` here.
-#[allow(clippy::too_many_arguments)]
 fn mla_attention_fwd(
-    ctx: &DeviceContext,
-    config: &DeepSeekV4Config,
-    attention: &Dsv4Attention,
-    mode: DeepSeekV4AttentionMode,
-    compress_ratio: usize,
+    attn: &Dsv4AttnCtx<'_>,
     state: &mut Dsv4LayerAttentionState,
     pool: &mut Dsv4LayerKvLayout,
     // Shared single-row FlashMLA decode scratch; consumed only on the single-row
@@ -5429,13 +5428,16 @@ fn mla_attention_fwd(
     // Shared FP8 prefill DeepGEMM linear scratch, forwarded to `mla_oproj` (its
     // token_count>1 prefill lane gates on it).
     prefill_shared: Option<&mut Dsv4PrefillDeepGemmLinearScratch>,
-    pos: Dsv4Position<'_>,
-    chain_verify: Option<&Dsv4ChainVerifyAttnMeta>,
-    tp: &TpRuntime,
     prepared: Dsv4MlaPrepared,
     out: &mut HiddenStates,
     keepalive: &mut Dsv4ForwardKeepalive,
 ) -> Result<()> {
+    let Dsv4AttnCtx {
+        ctx,
+        config,
+        attention,
+        ..
+    } = *attn;
     let Dsv4MlaPrepared {
         q_prepared,
         k_prepared,
@@ -5463,19 +5465,12 @@ fn mla_attention_fwd(
 
     if token_count > 1 {
         flashmla_prefill_attention(
-            ctx,
-            config,
-            attention,
-            mode,
-            compress_ratio,
+            attn,
             &q_prepared,
             &k_prepared,
             selected.as_ref(),
             compressed,
             &mut state.sw_window_cache,
-            pos.start,
-            chain_verify,
-            tp,
             local_heads,
             &mut local_attn,
             sm_scale,
@@ -5489,11 +5484,7 @@ fn mla_attention_fwd(
             anyhow!("FlashMLA decode enabled but shared FlashMLA decode scratch missing")
         })?;
         flashmla_decode_attention(
-            ctx,
-            config,
-            attention,
-            mode,
-            compress_ratio,
+            attn,
             &q_prepared,
             &k_prepared,
             selected.as_ref(),
@@ -5502,8 +5493,6 @@ fn mla_attention_fwd(
             flash,
             scratch,
             pool,
-            pos,
-            tp,
             local_heads,
             &mut local_attn,
             sm_scale,

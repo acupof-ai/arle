@@ -183,12 +183,15 @@ impl Dsv4Model {
                     .clone_htod(&[positions[r] as i32])
                     .map_err(|e| anyhow!("DSv4 MTP start_pos H2D failed: {e}"))?;
                 crate::attention::mla_attention(
-                    ctx,
-                    &self.config,
-                    &layer.attention,
-                    layer.mode,
-                    layer.compress_ratio,
-                    target_layer_idx,
+                    &self.attn_ctx(
+                        layer,
+                        target_layer_idx,
+                        crate::attention::Dsv4Position {
+                            start: positions[r] as usize,
+                            device: Some(&pos_dev),
+                        },
+                        None,
+                    ),
                     &normed_row,
                     &mut slots[slot_ids[r]].attention[target_layer_idx],
                     layer_pool,
@@ -196,12 +199,6 @@ impl Dsv4Model {
                     flashmla_scratch.as_deref_mut(),
                     prefill_shared.as_deref_mut(),
                     None,
-                    crate::attention::Dsv4Position {
-                        start: positions[r] as usize,
-                        device: Some(&pos_dev),
-                    },
-                    None,
-                    &self.tp,
                     &mut attn_row,
                     &mut keepalive,
                 )?;

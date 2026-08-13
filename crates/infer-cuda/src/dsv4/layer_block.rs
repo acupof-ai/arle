@@ -49,6 +49,27 @@ impl HcHalf {
 }
 
 impl Dsv4Model {
+    /// Build the per-call attention context for `layer` at `layer_idx`.
+    pub(super) fn attn_ctx<'a>(
+        &'a self,
+        layer: &'a Dsv4Layer,
+        layer_idx: usize,
+        pos: crate::attention::Dsv4Position<'a>,
+        chain_verify: Option<&'a crate::attention::Dsv4ChainVerifyAttnMeta>,
+    ) -> crate::attention::Dsv4AttnCtx<'a> {
+        crate::attention::Dsv4AttnCtx {
+            ctx: &self.ctx,
+            config: &self.config,
+            attention: &layer.attention,
+            mode: layer.mode,
+            compress_ratio: layer.compress_ratio,
+            layer_idx,
+            tp: &self.tp,
+            pos,
+            chain_verify,
+        }
+    }
+
     /// Embedding lookup for `token_ids` folded into the wide `[stream_dim, seq_len]`
     /// hyper-connection stream. `stream` must be `[stream_dim, seq_len]`.
     pub(super) fn embed_stream(
