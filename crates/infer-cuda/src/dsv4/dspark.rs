@@ -119,41 +119,6 @@ impl HsSlot {
 }
 
 impl Dsv4Model {
-    /// DIAG (INFER_DSPARK_DEBUG, rank 0): per-row L2 + cross-row spread of a
-    /// `[dim, rows]` buffer, to bisect where the draft forward collapses to a
-    /// constant. `spread` = mean over dims of (max−min across rows); ~0 means all
-    /// rows are identical (a constant block). Blocking D2H — debug serve only.
-    fn dspark_dbg_stats(&self, label: &str, hs: &HiddenStates) {
-        if std::env::var_os("INFER_DSPARK_DEBUG").is_none() || self.tp.config().rank != 0 {
-            return;
-        }
-        let Ok(host) = crate::probe::stream_to_host_f32(&self.ctx, hs) else {
-            return;
-        };
-        let (dim, rows) = (hs.hidden_dim, hs.seq_len);
-        let row_l2: Vec<f32> = (0..rows)
-            .map(|p| {
-                host[p * dim..(p + 1) * dim]
-                    .iter()
-                    .map(|x| x * x)
-                    .sum::<f32>()
-                    .sqrt()
-            })
-            .collect();
-        let spread = (0..dim)
-            .map(|d| {
-                let col = (0..rows).map(|p| host[p * dim + d]);
-                let (mn, mx) = col.fold((f32::INFINITY, f32::NEG_INFINITY), |(a, b), v| {
-                    (a.min(v), b.max(v))
-                });
-                mx - mn
-            })
-            .sum::<f32>()
-            / dim.max(1) as f32;
-        eprintln!(
-            "[dspark-stat] {label} dim={dim} rows={rows} row_l2={row_l2:?} row_spread={spread:.5}"
-        );
-    }
 
     /// One DSpark stage's dual-stream forward. Appends the noise `block` to the
     /// stage's `latent_kv` (the committed context is already accumulated there by
@@ -505,7 +470,6 @@ impl Dsv4Model {
         // SAFETY: initial_stream_from_embeddings writes the full stream buffer.
         let mut hidden_stream = unsafe { HiddenStates::uninit(ctx, stream_dim, block)? };
         crate::hc::initial_stream_from_embeddings(ctx, &emb, hidden, hc_mult, &mut hidden_stream)?;
-        self.dspark_dbg_stats("embed", &hidden_stream);
 
         // Draft MoE routing is LearnedBias, so these hash ids are unused — but the
         // stage forward's shape gate requires `block_tokens.len() == block`.
@@ -525,7 +489,6 @@ impl Dsv4Model {
                 &block_tokens,
                 block_abs,
             )?;
-            self.dspark_dbg_stats(&format!("stage{stage_idx}"), &hidden_stream);
         }
 
         // Exit: block_hidden = mtp.{n-1}.norm(mtp.{n-1}.hc_head(stream)). DSv4
@@ -564,7 +527,6 @@ impl Dsv4Model {
         // `df.ctx_end` is NOT advanced: the noise block self-heals (overwritten by
         // the next block's context/noise writes). The committed context cursor is
         // owned solely by `dspark_append_context`.
-        self.dspark_dbg_stats("exit", &block_hidden);
         Ok(block_hidden)
     }
 
@@ -719,7 +681,6 @@ impl Dsv4Model {
         let mut context_raw = unsafe { HiddenStates::uninit(ctx, hidden, cols)? };
         crate::attention::dsv4_linear(ctx, main_proj, &fuse_in, &mut context_raw)?;
         let context = crate::attention::mla_rms_norm(ctx, &context_raw, main_norm, eps)?;
-        self.dspark_dbg_stats("context", &context);
 
         let positions: Vec<i32> = (start_abs..start_abs + cols)
             .map(|pos| pos as i32)
@@ -858,11 +819,6 @@ pub(crate) struct Dsv4DsparkProposal {
     pub chain: Vec<u32>,
     /// Number of drafted tokens `L` surviving confidence truncation.
     pub draft_len: usize,
-    /// DIAG: base-only (pre-Markov) greedy argmax per block row `[block]`. Splits
-    /// "Markov masks a working forward" from "forward is context-blind" — if
-    /// `base_argmax[0]` is constant per anchor while target varies, the forward is
-    /// the bug, not the Markov bias. Remove with the INFER_DSPARK_DEBUG dump.
-    pub base_argmax: Vec<u32>,
 }
 
 impl Dsv4Model {
@@ -900,10 +856,6 @@ impl Dsv4Model {
         // SAFETY: uninit scratch; `lm_head_project_batch` writes every row.
         let mut base_logits = unsafe { HiddenStates::uninit(ctx, vocab, block)? };
         self.lm_head_project_batch(block_hidden, &mut base_logits)?;
-        // DIAG (INFER_DSPARK_DEBUG): base-only greedy per row, before the Markov
-        // bias — reveals whether the forward's gating-position prediction is
-        // context-sensitive independent of the Markov prior.
-        let base_argmax = self.mtp_argmax_batch(&base_logits)?;
 
         // Markov semi-AR L→R: step bias = markov_w2 · markov_w1[prev], added to the
         // base row; sample via the shared DSv4 sampler; feed the sampled token as
@@ -971,7 +923,6 @@ impl Dsv4Model {
         Ok(Dsv4DsparkProposal {
             chain,
             draft_len,
-            base_argmax,
         })
     }
 

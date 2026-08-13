@@ -4,11 +4,8 @@
 //! the chain in one target pass, then matches target top-1 against those
 //! candidates. `topk` does not add verify rows on this path.
 
-use std::sync::OnceLock;
-use std::time::Instant;
 
 use anyhow::{Result, anyhow, ensure};
-use cuda_kernels::prelude::DeviceContext;
 
 use crate::dsv4::SpecVerifySchedule;
 
@@ -41,7 +38,7 @@ pub(super) enum DecodeRoute {
 /// plain batched path that scales. `gate` is `--spec-max-batch` (default 1).
 /// Pure so the routing is unit-tested without a GPU.
 pub(super) fn route_decode(spec_kind: SpecKind, n_rows: usize, gate: usize) -> DecodeRoute {
-    if spec_kind == SpecKind::None || n_rows > gate {
+    if n_rows > gate {
         return DecodeRoute::Plain;
     }
     match spec_kind {
@@ -51,61 +48,23 @@ pub(super) fn route_decode(spec_kind: SpecKind, n_rows: usize, gate: usize) -> D
     }
 }
 
-fn mtp_phase_time_enabled() -> bool {
-    matches!(
-        std::env::var("ARLE_DSV4_MTP_PHASE_TIME").as_deref(),
-        Ok("1" | "true" | "TRUE" | "yes" | "on" | "ON")
-    )
-}
-
-fn mtp_phase_start(ctx: &DeviceContext, enabled: bool) -> Instant {
-    if enabled {
-        ctx.stream.synchronize().ok();
-    }
-    Instant::now()
-}
-
-fn mtp_phase_mark(ctx: &DeviceContext, last: &mut Instant, enabled: bool) -> f64 {
-    if !enabled {
-        return 0.0;
-    }
-    ctx.stream.synchronize().ok();
-    let now = Instant::now();
-    let ms = now.duration_since(*last).as_secs_f64() * 1000.0;
-    *last = now;
-    ms
-}
-
 /// Adaptive MTP gate (B=1), opt-in via `--mtp-adaptive`. MTP only beats
 /// no-spec when it emits more than `t_mtp/t_nospec` tok/step; below the
 /// matching acceptance rate the gate runs a warm no-spec step instead so
 /// typical prompts stop paying the speculation tax.
-fn mtp_adaptive_gate_enabled() -> bool {
-    crate::runtime_flags::mtp_adaptive()
-}
+
 
 /// Minimum running accept-rate EMA to keep speculating. Default 0.55 = the dt=3
 /// break-even on 8xH20 TP4 (t_mtp ~68ms / t_nospec ~26ms => need >2.6 tok/step =>
 /// accept >~0.55). Override with `--mtp-min-accept` for other depths.
 /// ponytail: a fixed depth-tuned threshold; upgrade path is to self-calibrate
 /// from measured step times.
-fn mtp_min_accept() -> f32 {
-    crate::runtime_flags::mtp_min_accept()
-}
+
 
 /// Force one real spec step after this many consecutive gated skips, to refresh
 /// the acceptance EMA — else a dip below threshold never recovers (no new accept
-/// data arrives while skipping). Override with `ARLE_DSV4_MTP_PROBE`.
-fn mtp_probe_interval() -> usize {
-    static PROBE: OnceLock<usize> = OnceLock::new();
-    *PROBE.get_or_init(|| {
-        std::env::var("ARLE_DSV4_MTP_PROBE")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|v| *v > 0)
-            .unwrap_or(8)
-    })
-}
+/// data arrives while skipping).
+const MTP_PROBE_INTERVAL: usize = 8;
 
 /// EMA smoothing for the per-step accept rate (accepted/depth): higher reacts
 /// faster to an acceptance shift, noisier.
@@ -292,8 +251,6 @@ impl Dsv4CudaExecutor {
     ) -> Result<Vec<u32>> {
         let depth = self.spec_depth();
         let topk = self.spec_topk();
-        let phase_time = mtp_phase_time_enabled();
-        let mut phase_last = mtp_phase_start(&self.model.ctx, phase_time);
         let pending = self.spec_slots[slot_idx]
             .pending
             .ok_or_else(|| anyhow!("DSv4 MTP decode missing pending token"))?;
@@ -312,14 +269,12 @@ impl Dsv4CudaExecutor {
             start_pos,
             depth,
         )?;
-        let capture_ms = mtp_phase_mark(&self.model.ctx, &mut phase_last, phase_time);
 
         // 1. Draft only the top-1 chain. `topk` samples extra candidates from
         // each existing draft logits row; siblings are verify-only candidates,
         // not additional MTP forwards.
         let chain = self.draft_chain(slot_idx, pending, &hidden, depth, topk, start_pos)?;
         chain.validate()?;
-        let draft_ms = mtp_phase_mark(&self.model.ctx, &mut phase_last, phase_time);
 
         // 2. Verify the whole chain in ONE frozen target forward.
         let tokens = chain.tokens();
@@ -335,7 +290,6 @@ impl Dsv4CudaExecutor {
         );
         crate::attention::set_dsv4_verify_frozen(false);
         let mut verify = res?;
-        let verify_ms = mtp_phase_mark(&self.model.ctx, &mut phase_last, phase_time);
         ensure!(
             verify.argmax.len() == chain.nodes.len()
                 && verify.hiddens.len() == chain.nodes.len()
@@ -397,14 +351,6 @@ impl Dsv4CudaExecutor {
         let accepted_tokens = chain.accepted_tokens(&path);
         let mut out = accepted_tokens;
         out.push(bonus);
-        let commit_ms = mtp_phase_mark(&self.model.ctx, &mut phase_last, phase_time);
-        if phase_time && self.model.tp.config().rank == 0 {
-            eprintln!(
-                "[dsv4-mtp-phase] n=1 depth={depth} topk={topk} capture={capture_ms:.3}ms draft={draft_ms:.3}ms verify={verify_ms:.3}ms commit={commit_ms:.3}ms total={:.3}ms accepted={accepted} out_tokens={}",
-                capture_ms + draft_ms + verify_ms + commit_ms,
-                out.len()
-            );
-        }
         Ok(out)
     }
 
@@ -442,8 +388,6 @@ impl Dsv4CudaExecutor {
         );
         let depth = self.spec_depth();
         let topk = self.spec_topk();
-        let phase_time = mtp_phase_time_enabled();
-        let mut phase_last = mtp_phase_start(&self.model.ctx, phase_time);
 
         // ── 1. Per-slot pre-draft ring capture, then draft the N chains.
         // Ring capture is per-slot (cheap host snapshot, never batched). Draft
@@ -475,7 +419,6 @@ impl Dsv4CudaExecutor {
             pendings.push(pending);
             h_prevs.push(hidden);
         }
-        let capture_ms = mtp_phase_mark(&self.model.ctx, &mut phase_last, phase_time);
         // Batched draft: `depth` levels, each level runs ONE `mtp_forward_level`
         // over all N slots (one row per slot) instead of N×depth serial m=1 calls.
         let mut chains: Vec<DraftChain> = (0..n)
@@ -512,7 +455,6 @@ impl Dsv4CudaExecutor {
             chains[s].validate()?;
             scheds.push(chains[s].verify_schedule(start_positions[s]));
         }
-        let draft_ms = mtp_phase_mark(&self.model.ctx, &mut phase_last, phase_time);
 
         // ── 2. ONE batched verify over the N chains (MoE grouped over all rows,
         // attention currently runs once per slot chunk, not once per row). The
@@ -526,7 +468,6 @@ impl Dsv4CudaExecutor {
             start_positions,
             &scheds,
         )?;
-        let verify_ms = mtp_phase_mark(&self.model.ctx, &mut phase_last, phase_time);
         ensure!(
             verified.len() == n,
             "DSv4 batched verify returned {} chains for {n} slots",
@@ -588,14 +529,6 @@ impl Dsv4CudaExecutor {
             slot_out.push(bonus);
             out.push(slot_out);
         }
-        let commit_ms = mtp_phase_mark(&self.model.ctx, &mut phase_last, phase_time);
-        if phase_time && self.model.tp.config().rank == 0 {
-            let out_tokens: usize = out.iter().map(Vec::len).sum();
-            eprintln!(
-                "[dsv4-mtp-phase] n={n} depth={depth} topk={topk} capture={capture_ms:.3}ms draft={draft_ms:.3}ms verify={verify_ms:.3}ms commit={commit_ms:.3}ms total={:.3}ms out_tokens={out_tokens}",
-                capture_ms + draft_ms + verify_ms + commit_ms
-            );
-        }
         Ok(out)
     }
 
@@ -636,12 +569,12 @@ impl Dsv4CudaExecutor {
     /// Adaptive gate (B=1): true when MTP should be skipped for a warm no-spec
     /// step this decode. Off unless `--mtp-adaptive` is set.
     pub(super) fn mtp_adaptive_skip(&self) -> bool {
-        mtp_adaptive_gate_enabled()
+        crate::runtime_flags::mtp_adaptive()
             && !mtp_should_speculate(
                 self.mtp_accept_ema,
                 self.mtp_skip_streak,
-                mtp_min_accept(),
-                mtp_probe_interval(),
+                crate::runtime_flags::mtp_min_accept(),
+                MTP_PROBE_INTERVAL,
             )
     }
 
@@ -699,4 +632,3 @@ impl Dsv4CudaExecutor {
         Ok(chain)
     }
 }
-

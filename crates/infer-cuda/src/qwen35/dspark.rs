@@ -933,8 +933,6 @@ impl Qwen35Model {
         let eps = cfg.rms_norm_eps;
         let kv_len_total = start + block;
 
-        let mut pt = super::dspark_phase_start(ctx);
-        let (mut prep_ms, mut attn_ms, mut mlp_ms) = (0.0f64, 0.0f64, 0.0f64);
         let mut ids = vec![cfg.mask_token_id as i32; block];
         ids[0] = anchor as i32;
         let ids_dev = scratch.ids.upload(ctx, &ids)?;
@@ -942,7 +940,6 @@ impl Qwen35Model {
         crate::profile::profile_op(ctx, "embedding", None, block, || {
             embedding_batch(ctx, &self.embed_tokens, ids_dev, h)
         })?;
-        let embed_ms = super::mtp_phase_lap(ctx, &mut pt);
 
         let start_abs = scratch.start_pos_abs.upload(&self.ctx, &[start as i32])?;
         // Per-row attention windows, never below `ctx_base`; the ctx buffer is an
@@ -1064,8 +1061,6 @@ impl Qwen35Model {
                 Ok(())
             })?;
 
-            prep_ms += super::mtp_phase_lap(ctx, &mut pt);
-            attn_ms += 0.0;
             let hidden_mid = scratch.hidden_mid.get(ctx, hidden, block)?;
             crate::profile::profile_op(ctx, "post_attn_norm", Some(li), block, || {
                 add_batch(
@@ -1101,7 +1096,6 @@ impl Qwen35Model {
                     scratch.hidden.get(ctx, hidden, block)?,
                 )
             })?;
-            mlp_ms += super::mtp_phase_lap(ctx, &mut pt);
         }
 
         let final_normed = scratch.final_normed.get(ctx, hidden, block)?;
@@ -1119,7 +1113,6 @@ impl Qwen35Model {
         crate::profile::profile_op(ctx, "lm_head_gemm", None, block, || {
             gemm_batch(ctx, self.output_projection(), final_normed, logits)
         })?;
-        let head_ms = super::mtp_phase_lap(ctx, &mut pt);
 
         // Left-to-right token selection: argmax (greedy) or a rejection-ready
         // device draw from the engine-sampler-filtered distribution q (full
@@ -1281,12 +1274,6 @@ impl Qwen35Model {
             .chain(drafts.iter().copied())
             .take(drafts.len())
             .collect();
-        let argmax_ms = super::mtp_phase_lap(ctx, &mut pt);
-        if pt.is_some() {
-            eprintln!(
-                "[dspark-draft] embed={embed_ms:.2} prep={prep_ms:.2} attn={attn_ms:.2} mlp={mlp_ms:.2} head={head_ms:.2} argmax={argmax_ms:.2} ms"
-            );
-        }
         let keep = self.dspark_verify_keeps(
             head,
             scratch.final_normed.get(ctx, hidden, block)?,
@@ -1360,7 +1347,6 @@ impl Qwen35Model {
             }
         }
 
-        let mut pt = super::dspark_phase_start(ctx);
         let ids_dev = scratch.ids.upload(ctx, &ids)?;
         let h = scratch.hidden.get(ctx, hidden, rows)?;
         crate::profile::profile_op(ctx, "embedding", None, rows, || {
@@ -1368,10 +1354,8 @@ impl Qwen35Model {
         })?;
         let pos_dev = scratch.start_pos_abs.upload(ctx, &pos)?;
         let win_dev = scratch.attn_win.upload(ctx, &win)?;
-        let embed_ms = super::mtp_phase_lap(ctx, &mut pt);
 
         let elem = std::mem::size_of::<bf16>() as u64;
-        let (mut qkv_ms, mut attn_ms, mut mlp_ms) = (0.0f64, 0.0f64, 0.0f64);
         for (li, layer) in head.layers.iter().enumerate() {
             let cap_li = head.cap;
             let h = scratch.hidden.get(ctx, hidden, rows)?;
@@ -1477,8 +1461,6 @@ impl Qwen35Model {
                 Ok(())
             })?;
 
-            qkv_ms += 0.0;
-            attn_ms += 0.0;
             let hidden_mid = scratch.hidden_mid.get(ctx, hidden, rows)?;
             crate::profile::profile_op(ctx, "post_attn_norm", Some(li), rows, || {
                 add_batch(
@@ -1514,9 +1496,7 @@ impl Qwen35Model {
                     scratch.hidden.get(ctx, hidden, rows)?,
                 )
             })?;
-            mlp_ms += super::mtp_phase_lap(ctx, &mut pt);
         }
-        let layers_ms = qkv_ms + attn_ms + mlp_ms;
 
         let final_normed = scratch.final_normed.get(ctx, hidden, rows)?;
         crate::profile::profile_op(ctx, "final_norm", None, rows, || {
@@ -1533,7 +1513,6 @@ impl Qwen35Model {
         crate::profile::profile_op(ctx, "lm_head_gemm", None, rows, || {
             gemm_batch(ctx, self.output_projection(), final_normed, logits)
         })?;
-        let head_ms = super::mtp_phase_lap(ctx, &mut pt);
 
         // One D2H for the whole tick, and one markov settle over every slot.
         let first_row = usize::from(!cfg.next_token_heads);
@@ -1547,7 +1526,6 @@ impl Qwen35Model {
                 first_row,
             )
         })?;
-        let settle_ms = super::mtp_phase_lap(ctx, &mut pt);
 
         let n = block - first_row;
         let mut prevs = Vec::with_capacity(b * n);
@@ -1576,14 +1554,6 @@ impl Qwen35Model {
             block,
             first_row,
         )?;
-        if pt.is_some() {
-            let conf_ms = super::mtp_phase_lap(ctx, &mut pt);
-            eprintln!(
-                "[dspark-draft-b] rows={rows} embed={embed_ms:.2} qkv={qkv_ms:.2} \
-                 attn={attn_ms:.2} mlp={mlp_ms:.2} layers={layers_ms:.2} \
-                 head={head_ms:.2} settle={settle_ms:.2} conf={conf_ms:.2} ms"
-            );
-        }
         let mut chains = Vec::with_capacity(b);
         for (s, &anchor) in anchors.iter().enumerate() {
             let drafts = &am[s * block + first_row..(s + 1) * block];
@@ -1886,7 +1856,6 @@ impl Qwen35Model {
         if rolls.is_empty() {
             return Ok(());
         }
-        let mut pt = super::dspark_phase_start(&self.ctx);
         let (mut gdr, mut conv) = ((Vec::new(), Vec::new()), (Vec::new(), Vec::new()));
         let (gdr_bytes, conv_bytes) = self.linear_state_bytes();
         for r in rolls.iter_mut() {
@@ -1901,7 +1870,6 @@ impl Qwen35Model {
         // Restore: live <- snapshot, so the snapshot side is the source.
         self.batched_copy(copy, &gdr.1, &gdr.0, &[gdr_bytes])?;
         self.batched_copy(copy, &conv.1, &conv.0, &[conv_bytes])?;
-        let restore_ms = super::mtp_phase_lap(&self.ctx, &mut pt);
         // Always the batched varlen replay. It gated on `--qwen35-gdr-chunked`
         // while that flag was opt-in; the flag defaulted on in c2eb5de9e and the
         // per-slot loop silently became the only route, at rows x 48 x ~6
@@ -1917,13 +1885,6 @@ impl Qwen35Model {
             captures.push(&spec.capture);
         }
         self.replay_linear_only_batched(&mut slots, &captures, &ks, tables, ws)?;
-        let replay_ms = super::mtp_phase_lap(&self.ctx, &mut pt);
-        if pt.is_some() {
-            eprintln!(
-                "[dspark-rollback] rows={} restore={restore_ms:.2} replay={replay_ms:.2} ms",
-                rolls.len()
-            );
-        }
         for r in rolls.iter_mut() {
             r.slot.set_seq_len(r.start_pos + r.k + 1);
         }
