@@ -42,7 +42,7 @@ pub(crate) struct Dsv4CudaExecutor {
     /// Content-keyed cross-request prefix-state pool: one host-resident entry
     /// per completed host page, written from the post-forward choke point.
     pub(super) prefix_state: crate::attention::Dsv4PrefixStatePool,
-    pub(super) pending_prefix_captures: VecDeque<PendingPrefixCapture>,
+    pending_prefix_captures: VecDeque<PendingPrefixCapture>,
     /// `Some` = the DSpark drafter is loaded and greedy decode routes through
     /// its draft→verify→accept loop instead of MTP.
     pub(crate) dspark: Option<Dsv4DsparkExec>,
@@ -59,7 +59,7 @@ pub(crate) struct Dsv4DsparkExec {
     /// Per-request token ceiling; a block whose worst-case chain crosses it
     /// falls back to one non-spec token.
     pub(super) max_seq_len: usize,
-    pub(super) slots: Vec<Dsv4DsparkRuntime>,
+    slots: Vec<Dsv4DsparkRuntime>,
 }
 
 /// Pre-allocated at construction — spec steps are serial, so exact-shape reuse
