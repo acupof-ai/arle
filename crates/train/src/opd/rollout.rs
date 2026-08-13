@@ -507,7 +507,7 @@ fn student_rollout_only_with_keep(
 
 #[allow(clippy::too_many_arguments)]
 #[cfg_attr(not(feature = "cuda"), allow(unused_variables))]
-pub(super) fn run_opd_rollout_phase(
+pub(super) fn rollout_phase(
     student: &Qwen35Model,
     prompt_ids: &[u32],
     cfg: &OpdStepConfig,
@@ -584,7 +584,7 @@ pub(super) fn run_opd_rollout_phase(
             // forward allocates from it, racing the async frees → illegal
             // address. Instead both idle engines are offloaded together AFTER
             // the teacher scores, just before the student backward (see
-            // `backward_chunked_kl_rollout`), on a quiesced device.
+            // `backward_chunked_kl`), on a quiesced device.
             rollout
         } else {
             log_opd_step_trace(total_started, "train_rollout_start", "");

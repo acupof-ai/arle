@@ -46,7 +46,7 @@ use super::{
 /// target (no `response_mask`), the reduction is the mean of per-row token-means
 /// (not one global token-mean), and neither frozen-prompt-KV nor CP/DP applies.
 #[allow(clippy::too_many_arguments)]
-pub fn batched_writeback_ce_step<O: Optimizer>(
+pub fn full_batch_ce_writeback_step<O: Optimizer>(
     student: &Qwen35Model,
     all_model_params: &[TensorId],
     trainable_params: &[TensorId],
@@ -783,7 +783,7 @@ pub fn capture_rollout_logprobs(
 /// needs the pre-reduction per-position KL, which `kl_distill_loss_chunked`
 /// collapses; it is flagged (loud TODO log), never silently dropped.
 #[allow(clippy::too_many_arguments)]
-pub fn gkd_writeback_step<O: Optimizer, T: TeacherForward + ?Sized>(
+pub fn masked_gkd_writeback_step<O: Optimizer, T: TeacherForward + ?Sized>(
     student: &Qwen35Model,
     teacher: &T,
     all_model_params: &[TensorId],

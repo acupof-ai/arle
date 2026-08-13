@@ -2218,7 +2218,7 @@ fn run_rubric_opd_impl(args: TrainRubricOpdArgs) -> Result<()> {
     use train::{
         infer_student::{InferStudent, save_lora_adapters},
         lora::LoraConfig,
-        opd::batched_writeback_ce_step,
+        opd::full_batch_ce_writeback_step,
         qwen35_loader::{SharedFrozenBaseEntry, load_qwen35_lora_from_hf_dir_with_shared_base},
         rubric::{bfcl_agentic_rubric, math_rubric},
         rubric_opd::{FlashJudge, RubricOpdConfig, run_rubric_rounds},
@@ -2558,7 +2558,7 @@ fn run_rubric_opd_impl(args: TrainRubricOpdArgs) -> Result<()> {
                         .map_err(|err| anyhow!("decode rollout: {err}"))
                 },
                 |chunk: &[(Vec<u32>, Vec<u32>)]| {
-                    batched_writeback_ce_step(
+                    full_batch_ce_writeback_step(
                         student_ref,
                         all_ref,
                         trainable_ref,
@@ -3156,7 +3156,7 @@ fn run_agent_opd_replay(
     use autograd::optim::AdamW;
     use train::{
         ema_self_teacher::EmaSelfTeacher,
-        opd::{WritebackLoss, gkd_writeback_step, masked_writeback_step},
+        opd::{WritebackLoss, masked_gkd_writeback_step, masked_writeback_step},
         qwen35_checkpoint::load_qwen35_lora_adapters,
         qwen35_loader::load_qwen35_lora_from_hf_dir_with_shared_base,
     };
@@ -3309,7 +3309,7 @@ fn run_agent_opd_replay(
                     // EMA teacher toward the just-updated student.
                     let step_loss = {
                         let teacher = ema.as_teacher();
-                        gkd_writeback_step(
+                        masked_gkd_writeback_step(
                             &student,
                             &teacher,
                             all_params.as_slice(),
