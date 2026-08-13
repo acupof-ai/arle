@@ -152,6 +152,14 @@ impl Dsv4Attention {
     pub(crate) fn attn_sink(&self) -> &DeviceVec {
         self.attn_sink.as_ref().expect("DSv4 attn_sink")
     }
+
+    pub(crate) fn compressor(&self) -> &Dsv4Compressor {
+        self.compressor.as_ref().expect("DSv4 compressor")
+    }
+
+    pub(crate) fn indexer(&self) -> &Dsv4Indexer {
+        self.indexer.as_ref().expect("DSv4 indexer")
+    }
 }
 
 pub(crate) struct Dsv4WoAGroupTables {
