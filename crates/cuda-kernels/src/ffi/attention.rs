@@ -617,6 +617,89 @@ unsafe extern "C" {
         workspace_bytes: usize,
     ) -> CUresult;
 
+    /// Workspace bytes for [`paged_attention_quantized_fa3_cuda`]:
+    /// `num_splits * total_q_tokens * num_q_heads * (head_dim + 2)` f32
+    /// (partial out + m + l).
+    pub fn paged_attention_quantized_fa3_workspace_bytes(
+        total_q_tokens: i32,
+        num_q_heads: i32,
+        head_dim: i32,
+        num_splits: i32,
+    ) -> usize;
+
+    /// Native persistent paged attention for 1-byte quantized KV (Path B).
+    ///
+    /// Reads the FP8 e4m3 / INT8 pools and per-(token, kv_head) f32 scales
+    /// directly from the paged pool (no dequant temp). FA3-style persistent
+    /// split-KV: one CTA per (batch row, q-head, split), grid
+    /// `[num_q_heads * num_splits, batch]`, plus a merge kernel. Decode-shaped
+    /// (one q token per row; `cu_seqlens_q` names each row's q token).
+    /// `page_table` is the rectangular `[batch, page_table_stride]` table;
+    /// `seqused_k` is the per-row KV extent in tokens — the same device
+    /// metadata the FA3 lane consumes. `is_fp8 = true` selects e4m3,
+    /// `false` signed int8.
+    pub fn paged_attention_quantized_fa3_cuda(
+        q_packed: *const Half,
+        k_pool: *const u8,
+        v_pool: *const u8,
+        k_scales: *const f32,
+        v_scales: *const f32,
+        page_table: *const i32,
+        cu_seqlens_q: *const i32,
+        seqused_k: *const i32,
+        output: *mut Half,
+        num_q_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        page_size: i32,
+        page_table_stride: i32,
+        batch: i32,
+        total_q: i32,
+        sm_scale: f32,
+        is_fp8: bool,
+        num_splits: i32,
+        stream: CUstream,
+        workspace: *mut u8,
+        workspace_bytes: usize,
+    ) -> CUresult;
+
+    /// Dequantize a 1-byte quantized (FP8 e4m3 or INT8) token-major buffer
+    /// `[num_tokens, num_kv_heads, head_dim]` with KIVI per-(token, head) f32
+    /// scales `[num_tokens, num_kv_heads]` into a bf16 buffer of the same
+    /// shape. `is_fp8 = 1` selects e4m3, `0` signed int8.
+    pub fn dequantize_paged_kv_to_bf16_cuda(
+        data: *const u8,
+        scales: *const f32,
+        out: *mut Half,
+        num_tokens: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        is_fp8: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    /// Page-table compaction dequant for the FA3 quant shim. Each
+    /// `(batch row b, logical page j)` of the rectangular page table
+    /// `[batch, page_table_stride]` lands in compact slot `b * stride + j`
+    /// of the bf16 output pool (same HND per-page layout as the source), and
+    /// `compact_table` is written as the identity over those slots. Fixed
+    /// launch shape per `(batch, stride)`, no host reads — replay-safe under
+    /// CUDA graph capture. `head_dim` must be a multiple of 16.
+    pub fn dequantize_paged_kv_compact_cuda(
+        data: *const u8,
+        scales: *const f32,
+        out: *mut Half,
+        page_table: *const i32,
+        compact_table: *mut i32,
+        batch: i32,
+        page_table_stride: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        page_size: i32,
+        is_fp8: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
 }
 
 // TileLang AOT paged-attention FFI — generated from `crates/cuda-kernels/kernels.toml`.
@@ -963,6 +1046,27 @@ pub struct ArleFa3FwdHd256Args {
     pub v_page_stride: i64,
 }
 
+/// Quantized-KV variant of [`ArleFa3FwdHd256Args`] (Path A): the shim
+/// dequantizes the 1-byte paged K/V pools into a per-call bf16 temp — only
+/// the pages `base.page_table` names, compacted to slots `b * stride + j` —
+/// and runs the bf16 FA3 fwd on it. The temp allocations are stream-ordered
+/// and the dequant reads only device tables, so the call stays CUDA-graph
+/// capture-safe. `base.k` / `base.v` / `base.num_pages` are overwritten by
+/// the shim; the compact pool keeps the HND per-page layout, so the caller's
+/// `k_page_stride` / `v_page_stride` describe it too.
+#[repr(C)]
+pub struct ArleFa3FwdHd256QuantArgs {
+    pub base: ArleFa3FwdHd256Args,
+    /// 1-byte quantized K pool `[max_pages, num_kv_heads, page_size, head_dim]`.
+    pub k_data: *const u8,
+    pub v_data: *const u8,
+    /// Per-(token, kv_head) f32 scales `[max_total_tokens, num_kv_heads]`.
+    pub k_scales: *const f32,
+    pub v_scales: *const f32,
+    /// 1 = FP8 e4m3, 0 = INT8.
+    pub is_fp8: i32,
+}
+
 /// Mirror of `ArleFa3BwdHd256Args` in `csrc/attention/arle_fa3_shim.cu`.
 /// Backward substrate: NON-varlen, NON-paged, batch=1 contiguous `[S, h, d]`
 /// bf16 views; no dropout/softcap, deterministic=false. All scratch is
@@ -1030,6 +1134,11 @@ pub struct ArleFa3BwdHd256Args {
 unsafe extern "C" {
     pub fn arle_fa3_fwd_hd256_bf16_cuda(
         args: *const ArleFa3FwdHd256Args,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn arle_fa3_fwd_hd256_quant_cuda(
+        args: *const ArleFa3FwdHd256QuantArgs,
         stream: CUstream,
     ) -> CUresult;
 
