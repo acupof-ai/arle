@@ -2571,8 +2571,11 @@ impl Qwen35CudaExecutor {
         use super::spec_decode::{DecodeRoute, SpecKind};
         let kind = self.spec_kind();
         // Only a batched greedy DSpark draft pays above c=1: sampling loses −15.5% at
-        // c=8 and −26.4% at c=16.
-        let batched = kind == SpecKind::Dspark && decode_rows.iter().all(|r| r.params.is_greedy());
+        // c=8 and −26.4% at c=16. The batched path is unvalidated with quant-KV
+        // pools, so gate it to BF16 until a parity entry lands.
+        let batched = kind == SpecKind::Dspark
+            && self.paged_kv_bf16()
+            && decode_rows.iter().all(|r| r.params.is_greedy());
         let any_penalty = decode_rows.iter().any(|r| r.params.has_penalty());
         let gate = match batched {
             true => crate::runtime_flags::spec_max_batch(),
