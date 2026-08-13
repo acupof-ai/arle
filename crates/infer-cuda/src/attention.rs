@@ -8192,11 +8192,8 @@ fn csa_select_decode_graph(
     weights: &mut HiddenStates,
     selected: &mut CudaSlice<i32>,
     layer_idx: usize,
-    // GRAPH-SAFE READ lane (opt-in `ARLE_DSV4_DECODE_GRAPH_CSA`): when both are
-    // `Some`, route the READ (logits + topk) through the n=1 batched device-meta
-    // select reading these PERSISTENT slot_id/key_count buffers (no per-step H2D).
-    // When `None`, fall back to the per-tile `csa_select_official` READ (eager only;
-    // not graph-capturable, used when the read lane is off).
+    // Always `None` since the graph-safe READ lane was removed; the per-tile
+    // `csa_select_official` READ is the only path.
     slot_id_dev: Option<&CudaSlice<i32>>,
     key_count_dev: Option<&CudaSlice<i32>>,
     slot_idx: usize,
@@ -8677,15 +8674,6 @@ fn csa_select_official(
     cache_writes_only: bool,
     keepalive: &mut Dsv4ForwardKeepalive,
 ) -> Result<Option<CudaSlice<i32>>> {
-    if !cache_writes_only
-        && start_pos_device.is_some()
-        && matches!(
-            std::env::var("ARLE_DSV4_DECODE_GRAPH").as_deref(),
-            Ok("1" | "true" | "TRUE" | "yes" | "on" | "ON")
-        )
-    {
-        return Ok(None);
-    }
     ensure!(
         local_index_heads == shared.num_heads && config.index_head_dim == shared.head_dim,
         "DSv4 official DSA shape mismatch local_heads={} official_heads={} dim={} official_dim={}",
@@ -9100,7 +9088,6 @@ fn csa_select_official(
 /// the per-row block_table band.
 ///
 /// Never graph-replayed (the batched lane is eager, N>1), so unlike
-/// `csa_select_official` it does NOT early-return on `ARLE_DSV4_DECODE_GRAPH`.
 ///
 /// `context_lens_host` / `positions_host` are captured ON HOST during the per-row
 /// prepare (`context_lens[r] = min(key_count_r, abs_pos_r/ratio)`,

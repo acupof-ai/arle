@@ -129,7 +129,7 @@ pub(crate) struct Dsv4Attention {
     pub wkv: DeviceMatrix,
     pub kv_norm: DeviceVec,
     /// #150: dense-bf16 dequant copies of `wq_a`/`wq_b`/`wkv`, built at load only
-    /// under `ARLE_DSV4_MLA_PROJ_BF16=1` (the checkpoint ships these F8_E4M3-only).
+    /// (the checkpoint ships these F8_E4M3-only).
     /// Presence routes BOTH decode lanes (n=1 fused and n≥2 batched) through bf16
     /// cublasLt so every decode batch size shares one arithmetic; prefill keeps
     /// DSv4 low-rank output down-projection. `None` ⇔ GLM (`config.plain_o_proj`,
@@ -320,12 +320,6 @@ pub(crate) struct Dsv4DsparkDraft {
     pub stages: Vec<Dsv4DsparkStage>,
 }
 
-/// Vocab-shard geometry for the opt-in `ARLE_DSV4_LM_HEAD_SHARD=1` lever
-/// (#99 H3). When set,
-/// `lm_head` holds `[rows_per_rank, hidden]` = this rank's contiguous vocab
-/// rows `[rank*rows_per_rank, rank*rows_per_rank + local_rows)` plus zero-pad
-/// rows up to the uniform 128-aligned `rows_per_rank`. Padding exists only
-/// past the global vocab end, so a rank-order logits gather is vocab-ordered
 /// Loaded DSv4-Flash model for one TP/EP rank.
 pub(crate) struct Dsv4Model {
     pub ctx: DeviceContext,
@@ -1723,46 +1717,6 @@ impl std::fmt::Debug for Dsv4Model {
     }
 }
 
-/// Temporary diagnostic-only trace for the 2026-07 concurrent-decode digit-
-/// corruption investigation (`docs/experience/errors/2026-07-06-dsv4-concurrent-decode-digit-corruption-unresolved.md`).
-/// Env-gated (`ARLE_DSV4_DECODE_TRACE=1`), zero cost otherwise (one env::var
-/// read per batched decode call). Rank-gated to `rank==0` only: all TP ranks
-/// redundantly execute this per-row loop with identical results, and letting
-/// >1 rank's process write to the shared serve-log fd caused byte-level
-/// > interleaving between processes even with a single `write_all` call.
-/// > Prints one line per call: the batch's slot/start_position/token triples,
-/// > so a post-hoc script can (a) pick out a tracked slot's per-step token-id
-/// > sequence via its `start_position` == its own prompt-token count, and (b)
-/// > see the exact batch composition (which other slots were co-resident) at
-/// > each step, without touching the hot sampling path's signature.
-pub(crate) fn dsv4_decode_trace(
-    rank: usize,
-    slot_ids: &[usize],
-    start_positions: &[usize],
-    out_tokens: &[u32],
-) {
-    use std::io::Write;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    if rank != 0 || std::env::var_os("ARLE_DSV4_DECODE_TRACE").is_none() {
-        return;
-    }
-    static CALL_ID: AtomicU64 = AtomicU64::new(0);
-    let call = CALL_ID.fetch_add(1, Ordering::Relaxed);
-    let rows: Vec<String> = slot_ids
-        .iter()
-        .zip(start_positions)
-        .zip(out_tokens)
-        .map(|((slot, start_pos), tok)| format!("{slot}:{start_pos}:{tok}"))
-        .collect();
-    // Single pre-formatted `write_all` call (one write() syscall) so the line
-    // can't tear even if another writer shares the fd.
-    let line = format!(
-        "DSV4_TRACE call={call} n={} rows=[{}]\n",
-        slot_ids.len(),
-        rows.join(",")
-    );
-    let _ = std::io::stderr().write_all(line.as_bytes());
-}
 
 impl Dsv4Model {
     pub(crate) fn begin_mega_moe_forward(&self, _num_tokens: usize) -> Result<Option<u64>> {
@@ -2350,8 +2304,7 @@ impl Dsv4Model {
         )?;
         let fast_head = params.iter().all(SamplingParams::is_greedy)
             && !crate::probe::token_entropy()
-            && crate::probe::lens_layers() == 0
-            && std::env::var_os("INFER_DSV4_DUMP_TOPK_POSITIONS").is_none();
+            && crate::probe::lens_layers() == 0;
         let out_tokens = crate::profile::profile_op(&self.ctx, "lm_head", None, n, || {
             if fast_head {
                 let logits = self.verify_logits_from_stream(&stream, n, &mut keepalive)?;
@@ -2374,12 +2327,6 @@ impl Dsv4Model {
         })?;
         // Post-sampling sync point: all rows' emitted tokens are known.
         crate::probe::lens_flush(&self.ctx, positions, &out_tokens);
-        dsv4_decode_trace(
-            self.tp.config().rank,
-            slot_ids,
-            start_positions,
-            &out_tokens,
-        );
         std::hint::black_box(keepalive.len());
         drop(keepalive);
         Ok(out_tokens)
@@ -2396,21 +2343,14 @@ impl Dsv4Model {
     ) -> Result<(HiddenStates, Dsv4ForwardKeepalive)> {
         let n = slot_ids.len();
         let mega_epoch = self.begin_mega_moe_forward(n)?;
-        // Opt-in decode-phase timing probe (env-gated). When unset: zero behavior
-        // change, zero extra syncs. Pure instrumentation — see ARLE_DSV4_DECODE_PHASE_TIME.
-        let phase_time = matches!(
-            std::env::var("ARLE_DSV4_DECODE_PHASE_TIME").as_deref(),
-            Ok("1" | "true" | "TRUE" | "yes" | "on" | "ON")
-        );
         // Per-GEMV breakdown for this decode step (self-gates on
         // ARLE_DSV4_LINEAR_PROFILE; no-op otherwise). Reset here + print after the
-        // phase log scopes the stats to ONE decode forward, exposing which linear
+        // print scopes the stats to ONE decode forward, exposing which linear
         // (compressor_wkv/wgate, indexer_wq_b/weights, …) dominates compidx. The
         // batched-compressor pre-pass is default-on (P1a/P1b + prepass, since
         // 2026-06-26); this profiler measures its residual per-GEMV cost —
         // pending-remote on TP=4. NOTE: when enabled the profiler syncs per call,
-        // inflating absolute step ms; read it for the RELATIVE per-GEMV split, not
-        // the clean compidx (use phase_time alone for that).
+        // inflating absolute step ms; read it for the RELATIVE per-GEMV split.
         crate::linear_profile::reset();
         for r in 0..n {
             let slot = &slots[slot_ids[r]];
@@ -2573,23 +2513,6 @@ impl Dsv4Model {
         // as `ptr_keepalive`; the inert N>1 `keep_i32` would not retain them).
         let mut pack_pt_keepalive: Vec<CudaSlice<i32>> = Vec::new();
 
-        // Decode-phase timing accumulators (only ever touched when phase_time).
-        let (mut csa_ms, mut sw_ms, mut moe_ms) = (0f64, 0f64, 0f64);
-        // Batched-lane (sw_ms) sub-block split: prep loop / batched fwd / finish loop.
-        // These sum ≈ sw_ms. Only touched when phase_time.
-        let (mut prep_ms, mut fwd_ms, mut finish_ms) = (0f64, 0f64, 0f64);
-        // PREPARE sub-split: batched projection pre-pass vs per-row compressor/indexer.
-        // These sum ≈ prep_ms. Only touched when phase_time.
-        let (mut proj_ms, mut compidx_ms) = (0f64, 0f64);
-        // compidx sub-split (coarse): the whole per-row prepare loop (compressor +
-        // Hadamard rotate + cache writes + indexer GEMM + per-row gathers — all
-        // fused inside the single `mla_attention_prepare_compressed_only` call, so
-        // writes vs gemm-gather are NOT separable without touching the callee) vs
-        // the ONE batched `csa_select_official_batched` READ (logits + topk). These
-        // two sum ≈ compidx_ms + the batched read. Only touched
-        // when phase_time.
-        let (mut perrow_ms, mut batchedread_ms) = (0f64, 0f64);
-
         // Logit lens (batched decode is always a decode step): capture the last
         // N layers' head projections; off = one Option compare per layer.
         let lens_from = match crate::probe::lens_layers() {
@@ -2706,12 +2629,6 @@ impl Dsv4Model {
             // stays 0); only CSA passes the gathered per-row top-k.
             let use_batched_kernel = batched_attn_lane;
             if use_batched_kernel {
-                let _sw_t = if phase_time {
-                    ctx.stream.synchronize().ok();
-                    Some(std::time::Instant::now())
-                } else {
-                    None
-                };
                 // CSA (cr 1..=15) and HCA (cr≥16) both pack + attend a separate
                 // compressed pool. GLM SparseIndexed has NO main compressor — it
                 // attends the full latent via the FlashMLA KV pool (no separate
@@ -2749,12 +2666,6 @@ impl Dsv4Model {
                 let mut prepared: Vec<crate::attention::Dsv4MlaPrepared> = Vec::with_capacity(n);
                 let mut slot_block_offsets = Vec::with_capacity(n);
                 let mut page_tables = Vec::with_capacity(n);
-                let _prep_t = if phase_time {
-                    ctx.stream.synchronize().ok();
-                    Some(std::time::Instant::now())
-                } else {
-                    None
-                };
                 // ── 0. Batched (m=N) slot-INDEPENDENT projection pre-pass
                 // (#60 PHASE C): wq_a / wkv / wq_b + RoPE over all N rows at once
                 // (weights read ONCE across the N-token grid), replacing the N
@@ -2770,12 +2681,6 @@ impl Dsv4Model {
                 // pre-pass then takes its scalar fallback. This borrow is scoped to
                 // the pre-pass and released before the per-row loop re-borrows the
                 // pool / batch scratch via the same accessor.
-                let _proj_t = if phase_time {
-                    ctx.stream.synchronize().ok();
-                    Some(std::time::Instant::now())
-                } else {
-                    None
-                };
                 let proj = {
                     let (_layer_pool, _dsa, _flash_batch, _flashmla_scratch, prefill_shared) =
                         kv_adapter.layer_dsa_and_flashmla_batch_mut(layer_idx)?;
@@ -2790,10 +2695,6 @@ impl Dsv4Model {
                         &mut keepalive,
                     )?
                 };
-                if let Some(t) = _proj_t {
-                    ctx.stream.synchronize().ok();
-                    proj_ms += t.elapsed().as_secs_f64() * 1000.0;
-                }
                 // ── 0b. Batched (m=N) compressor/indexer projection pre-pass. The
                 // per-row m=1 `compressor_forward` wkv/wgate GEMVs re-read the full
                 // weight per decode row; batch them over the same `normed` batch the
@@ -3012,12 +2913,6 @@ impl Dsv4Model {
                         &mut keepalive,
                     )?;
                 }
-                let _compidx_t = if phase_time {
-                    ctx.stream.synchronize().ok();
-                    Some(std::time::Instant::now())
-                } else {
-                    None
-                };
                 crate::profile::profile_op(
                     ctx,
                     "attention_prepare",
@@ -3427,34 +3322,12 @@ impl Dsv4Model {
                         Ok(())
                     },
                 )?;
-                if let Some(t) = _compidx_t {
-                    ctx.stream.synchronize().ok();
-                    // `_compidx_t` brackets exactly the per-row prepare loop above
-                    // (compressor + Hadamard rotate + cache writes + indexer GEMM +
-                    // per-row gathers, all fused inside
-                    // `mla_attention_prepare_compressed_only`). Attribute this to the
-                    // coarse `perrow_ms`; the batched READ is timed separately below
-                    // and both fold into `compidx_ms` so the split sums to compidx.
-                    let dt = t.elapsed().as_secs_f64() * 1000.0;
-                    perrow_ms += dt;
-                    compidx_ms += dt;
-                }
-                if let Some(t) = _prep_t {
-                    ctx.stream.synchronize().ok();
-                    prep_ms += t.elapsed().as_secs_f64() * 1000.0;
-                }
                 // ── 1b. ONE batched CSA select (#60): the per-row READ (paged-MQA
                 // logits + topk) for all N rows in ONE batch_size=N call, writing
                 // directly into the FlashMLA batch scratch's `selected_batched`.
                 // Runs AFTER all N rows' DSA caches are populated (per-row cache
                 // writes happened in the prepare loop) and BEFORE
                 // `build_layer_batch_meta` reads `selected_batched`.
-                let _batchedread_t = if phase_time {
-                    ctx.stream.synchronize().ok();
-                    Some(std::time::Instant::now())
-                } else {
-                    None
-                };
                 if use_batched_dsa_select {
                     let (q_i_batch, weights_batch) =
                         if let Some((q_i, weights)) = indexer_query_kv_score.as_ref() {
@@ -3544,22 +3417,7 @@ impl Dsv4Model {
                         None,
                     )?;
                 }
-                if let Some(t) = _batchedread_t {
-                    ctx.stream.synchronize().ok();
-                    // The ONE batched `csa_select_official_batched` READ (logits +
-                    // topk). Folds into `compidx_ms` so the coarse split
-                    // (perrow + batchedread) sums to the full PREPARE-tail compidx.
-                    let dt = t.elapsed().as_secs_f64() * 1000.0;
-                    batchedread_ms += dt;
-                    compidx_ms += dt;
-                }
                 // ── 2. ONE batched indices/sched_meta build + ONE batched fwd.
-                let _fwd_t = if phase_time {
-                    ctx.stream.synchronize().ok();
-                    Some(std::time::Instant::now())
-                } else {
-                    None
-                };
                 crate::profile::profile_op(ctx, "attention_fwd", Some(layer_idx), seq_len, || {
                     let (layer_pool, _dsa, flash_batch, _flashmla_scratch, _prefill) =
                         kv_adapter.layer_dsa_and_flashmla_batch_mut(layer_idx)?;
@@ -3590,17 +3448,7 @@ impl Dsv4Model {
                         sm_scale,
                     )
                 })?;
-                if let Some(t) = _fwd_t {
-                    ctx.stream.synchronize().ok();
-                    fwd_ms += t.elapsed().as_secs_f64() * 1000.0;
-                }
                 // ── 3. per-row slice-out → inverse-rope + SW-update → O-LoRA.
-                let _finish_t = if phase_time {
-                    ctx.stream.synchronize().ok();
-                    Some(std::time::Instant::now())
-                } else {
-                    None
-                };
                 crate::profile::profile_op(
                     ctx,
                     "attention_finish",
@@ -3809,21 +3657,7 @@ impl Dsv4Model {
                         Ok(())
                     },
                 )?;
-                if let Some(t) = _finish_t {
-                    ctx.stream.synchronize().ok();
-                    finish_ms += t.elapsed().as_secs_f64() * 1000.0;
-                }
-                if let Some(t) = _sw_t {
-                    ctx.stream.synchronize().ok();
-                    sw_ms += t.elapsed().as_secs_f64() * 1000.0;
-                }
             } else {
-                let _csa_t = if phase_time {
-                    ctx.stream.synchronize().ok();
-                    Some(std::time::Instant::now())
-                } else {
-                    None
-                };
                 crate::profile::profile_op(ctx, "attention", Some(layer_idx), seq_len, || {
                     for r in 0..n {
                         let src = normed.data.slice(r * hidden_size..(r + 1) * hidden_size);
@@ -3869,10 +3703,6 @@ impl Dsv4Model {
                     }
                     Ok(())
                 })?;
-                if let Some(t) = _csa_t {
-                    ctx.stream.synchronize().ok();
-                    csa_ms += t.elapsed().as_secs_f64() * 1000.0;
-                }
             }
             keepalive.keep_hidden(&attn_out);
             // Row-parallel O-LoRA: one all-reduce over [N, hidden]. NOT bit-identical
@@ -3909,12 +3739,6 @@ impl Dsv4Model {
             stage_all("attn_residual", &stream);
 
             // ── MoE half: HC-wrap the grouped FP8 DeepGEMM MoE over the [N] batch.
-            let _moe_t = if phase_time {
-                ctx.stream.synchronize().ok();
-                Some(std::time::Instant::now())
-            } else {
-                None
-            };
             // GLM (hc_mult==1): plain RMSNorm of the stream (no ffn hyper-connection).
             // SAFETY: uninit device scratch; fully written before first read.
             let mut normed = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
@@ -4179,10 +4003,6 @@ impl Dsv4Model {
                     self.capture_mtp_stream_hidden(&stream, r, 1, tap, &mut keepalive)?;
                 }
             }
-            if let Some(t) = _moe_t {
-                ctx.stream.synchronize().ok();
-                moe_ms += t.elapsed().as_secs_f64() * 1000.0;
-            }
             // Lens capture: head-project the layer's final stream for all rows
             // and stash the DEVICE logits (no sync/D2H until lens_flush).
             if lens_from.is_some_and(|from| layer_idx >= from) {
@@ -4194,25 +4014,10 @@ impl Dsv4Model {
         for r in 0..n {
             slots[slot_ids[r]].seq_len += 1;
         }
-        if phase_time {
-            log::info!(
-                "[decode-phase] n={n} csa_attn={:.1}ms sw_attn={:.1}ms (prep={:.1} [proj={:.1} compidx={:.1} compidx_split=[perrow={:.1} read={:.1}]] fwd={:.1} finish={:.1}) moe={:.1}ms",
-                csa_ms,
-                sw_ms,
-                prep_ms,
-                proj_ms,
-                compidx_ms,
-                perrow_ms,
-                batchedread_ms,
-                fwd_ms,
-                finish_ms,
-                moe_ms
-            );
-        }
         // Per-step per-GEMV breakdown (rank-0 only; self-gates on
         // ARLE_DSV4_LINEAR_PROFILE). Sums the compressor/indexer m=1 GEMVs that
-        // compose compidx — the residual after the default-on batched-compressor
-        // pre-pass, for the pending-remote TP=4 perf measurement.
+        // compose compidx — the residual after the default-on
+        // batched-compressor pre-pass.
         crate::linear_profile::print_rank0("decode-step");
         Ok((stream, keepalive))
     }
