@@ -79,7 +79,7 @@ impl PinnedCheckpointPool {
     }
 
     /// Idempotent: a double release cannot hand the same slot to two tensors.
-    fn release(&mut self, slot: u32) {
+    pub(super) fn release(&mut self, slot: u32) {
         if (slot as usize) < self.slots.len() && !self.free.contains(&slot) {
             self.free.push(slot);
         }
