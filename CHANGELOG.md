@@ -19,6 +19,16 @@ Related governance docs:
 
 ## [Unreleased]
 
+## [0.5.5] - 2026-08-13
+
+- **FEATURE (accept) — batched paged decode for FP8/INT8 KV pools** (2026-08-13; `ff33bdb77`). Removed three BF16-only gates that blocked quantized KV from batched decode (batch > 1): the `for_rows` batch==1 restriction on quant metadata, the `for_decode_batch` format check, and the `submit_decode_batch` `paged_kv_bf16()` gate. Multi-row `new_token_rows` concatenates per-slot; `quant_decode_meta` uses all slots. The `decode_attention_varlen_quantized` kernel already accepted batch_size, so no kernel change was needed. Verified: 4 concurrent needle requests with FP8 KV all passed, needle ladder 115-2000 tok 3/3 exact.
+
+- **REFACTOR (accept) — unify qwen35 FP8/INT8 KV on the NHD split-KV kernel, delete the dead TileLang FP8 path** (2026-08-13; `64be73980`). The TileLang `paged_attn_fp8_v1` kernel read HND layout but the FP8 quantizer writes NHD, so every FP8 paged decode read garbage. qwen35 FP8 now routes through the NHD split-KV varlen kernel (same as INT8), selected by an `int8_kv` bool; `decode_attention_varlen_int8` is renamed `decode_attention_varlen_quantized`. The dead TileLang FP8 path is deleted (3 .py sources, the build.rs emitter, kernels.toml ABI + 11 entries). Net: -880 lines.
+
+- **INFRA — build/sync hardening** (2026-08-13; `64be73980`). `CARGO_BUILD_JOBS=32` in pod-build-env.sh (the 180-way nvcc build OOMs the shared box); `tar --no-xattrs` in pod.sh sync (silences macOS provenance pax warnings).
+
+- **BENCH — KV dtype comparison on H20, ThinkingCap-Qwen3.6-27B-FP8** (2026-08-13). BF16 / INT8 / FP8 KV compared at c=1/4/8, 16 requests per level, fixed 214-token outputs. All three formats completed 16/16 at every level with 0 errors and 0 correctness failures. Throughput (out tok/s): BF16 53.4 / 125.8 / 185.7, INT8 — / 123.9 / 175.0, FP8 49.8 / 126.6 / 185.9 at c=1/4/8. TTFT p50: BF16 48 / 347 / 352 ms, FP8 49 / 344 / 363 ms. ITL p50: BF16 15.8 / 20.2 / 21.3 ms, FP8 17.3 / 20.3 / 21.3 ms. e2e p50: BF16 1.87 / 3.14 / 4.13 s, FP8 2.00 / 3.15 / 4.09 s. FP8 scales near-linearly (49.8 → 185.9 tok/s, 3.73x at c=1→8) and is statistically tied with BF16 at c=4/8; INT8 trails both by ~6% at c=8. Concurrent needle (4 batched requests, ctx=2000, pool=4096): 4/4 passed on all three formats — each request recovered its own per-request code, so batched decode does not cross-contaminate requests under any KV format. Raw JSON: `/tmp/bench-{bf16,int8,fp8}.json` on the pod.
+
 ## [0.5.4] - 2026-08-12
 
 - **FEATURE (accept) — INT8 KV cache support for Qwen3.5 paged attention** (2026-08-12; `b20859520`). Qwen3.5's paged attention path now supports `KVFormat::INT8` alongside BF16 and FP8E4M3. Quantization uses `quantize_paged_kv_single` (per-token per-head symmetric INT8, scale = absmax/127); attention reuses the FP8 split-KV varlen kernel `decode_attention_varlen_fp8` with `int8_kv=true`. The kernel gained runtime head_dim dispatch (128/256) since Qwen3.5 uses head_dim=256. Verified on Qwen3.6-27B-FP8: needle gate exact at 115/300/1000/4000/8000 tokens (deterministic, matches BF16), temp arm PASS (no glued repetition), GSM8K 17/17 = 100%.
