@@ -30,6 +30,14 @@ pub struct DeepSeekV4RopeParameters {
     pub rope_theta: Option<f32>,
 }
 
+impl DeepSeekV4RopeParameters {
+    pub fn original_seq_len_i32(&self) -> Result<i32> {
+        i32::try_from(self.original_max_position_embeddings).map_err(|_| {
+            DeepSeekConfigError::InvalidConfig("original_max_position_embeddings overflows i32")
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DeepSeekV4Config {
     pub architectures: Vec<String>,
@@ -540,6 +548,13 @@ impl DeepSeekV4AttentionMode {
 
     pub fn has_indexer(self) -> bool {
         matches!(self, Self::CompressedSparse | Self::SparseIndexed)
+    }
+
+    pub fn flashmla_mode_int(self) -> i32 {
+        match self {
+            Self::CompressedSparse | Self::SparseIndexed => 1,
+            Self::SlidingWindow | Self::HybridCompressed => 2,
+        }
     }
 }
 

@@ -119,7 +119,7 @@ impl Dsv4Model {
                     && layer.attention.o_proj.is_none();
                 model1
                     .then(|| {
-                        crate::attention::Dsv4MlaDecodeGraphScratch::new(
+                        crate::attention::Dsv4MlaDecodeScratch::new(
                             &self.ctx,
                             &self.config,
                             &layer.attention,
@@ -354,7 +354,7 @@ impl Dsv4Model {
             .layers
             .iter()
             .map(|layer| {
-                crate::attention::Dsv4MlaDecodeGraphScratch::device_bytes_for(
+                crate::attention::Dsv4MlaDecodeScratch::device_bytes_for(
                     &self.config,
                     &layer.attention,
                     layer.mode,

@@ -7,14 +7,12 @@ pub(super) struct Dsv4FlashMlaDecodeShape {
     pub(super) topk_unified: usize,
     pub(super) total_blocks: usize,
     pub(super) h_q: usize,
-    /// FlashMLA MODEL1 page size (== `kv_arena.page_block_size`, asserted 64).
-    /// Stored so the block→(page,row) map and the pack/index kernel params draw
-    /// page size from ONE source (the arena), never a re-typed literal.
+    /// Page size from the arena (asserted 64) — the one source for the block map
+    /// and the pack/index kernel params.
     pub(super) page_block_size: usize,
 }
 
 impl Dsv4FlashMlaDecodeShape {
-    /// The ONE block→(page,row) map for this shape's band.
     pub(super) fn block_map(&self) -> Dsv4BlockMap {
         Dsv4BlockMap::new(self.sw_blocks, self.page_block_size)
     }
@@ -31,10 +29,6 @@ impl Dsv4FlashMlaDecodeShape {
         local_heads: usize,
         tp_world: usize,
     ) -> Result<Self> {
-        // Two FlashMLA decode shapes are wired: MODEL1 (head_dim=512 / 584 B/tok,
-        // DSv4 pre-absorbed) and V32 (head_dim=576 / 656 B/tok, GLM-5.2 latent =
-        // kv_lora_rank(512)+rope(64)). Both ride the same sparse-FP8 decode kernel
-        // with a model_type/byte-stride switch (see `flashmla_decode_attention`).
         ensure!(
             (config.head_dim == 512 && kv_arena.bytes_per_token == 584)
                 || (config.head_dim == 576 && kv_arena.bytes_per_token == 656),
@@ -62,10 +56,8 @@ impl Dsv4FlashMlaDecodeShape {
         let compressed_rows = if mode == DeepSeekV4AttentionMode::SlidingWindow {
             0
         } else {
-            // CSA/HCA genuinely compress — a zero ratio there is a config bug.
-            // GLM SparseIndexed doesn't compress (ratio 0): its latent pool spans
-            // the full sequence, so treat ratio as 1 to mirror the page budget in
-            // `dsv4_flashmla_slot_pages` (keeps `total_blocks` == pool pages).
+            // GLM SparseIndexed doesn't compress (ratio 0); treat it as 1 to mirror
+            // the page budget in `dsv4_flashmla_slot_pages`.
             ensure!(
                 compress_ratio > 0 || mode == DeepSeekV4AttentionMode::SparseIndexed,
                 "DSv4 FlashMLA compressed decode requires non-zero ratio"
@@ -77,8 +69,7 @@ impl Dsv4FlashMlaDecodeShape {
             DeepSeekV4AttentionMode::SlidingWindow => 0,
             DeepSeekV4AttentionMode::CompressedSparse => config.index_topk,
             DeepSeekV4AttentionMode::HybridCompressed => compressed_rows.div_ceil(128) * 128,
-            // GLM SparseIndexed: top-k cap over the full latent pool == CSA.
-            // GLM topk_unified = sliding_window(0) + index_topk(2048) = 2048 (128-multiple).
+            // GLM: sliding_window(0) + index_topk(2048) = 2048, a 128-multiple.
             DeepSeekV4AttentionMode::SparseIndexed => config.index_topk,
         };
         let topk_unified = config
@@ -111,25 +102,19 @@ pub(crate) struct Dsv4FlashMlaDecodeState {
     pub(super) comp_blocks: usize,
     pub(super) max_compressed_keys: usize,
     pub(super) topk_unified: usize,
-    /// FlashMLA page size (== arena `page_block_size`, asserted 64) — the ONE
-    /// page-size source for this slot's block map and pack/index kernel params.
+    /// Page size from the arena (asserted 64) — the one source for this slot's
+    /// block map and pack/index kernel params.
     pub(super) page_block_size: usize,
     pub(super) fp8_kv_sw_bootstrapped: bool,
     pub(super) fp8_kv_comp_packed_rows: usize,
-    // CONSTANT-after-init scheduler metadata + slot-shape constants. The 13
-    // per-forward SCRATCH buffers (`sw_bulk_*`/`one_*`/`comp_*`/`indices`/
-    // `lse_*`/`o_accum`/`tp_*`) were hoisted to the model-wide
-    // [`Dsv4FlashMlaDecodeScratch`] (#85 P3) — they carry no cross-call/cross-slot
-    // state, so one shared instance serves every (slot, layer).
     pub(super) topk_length: CudaSlice<i32>,
     pub(super) sched_meta: CudaSlice<i32>,
     pub(super) num_splits: CudaSlice<i32>,
     pub(super) num_sm_parts: i32,
     pub(super) fixed_overhead_num_blocks: i32,
     pub(super) block_size_topk: i32,
-    /// Persistent device copy of the slot's page table (`flashmla_page_table`).
-    /// Kept alive for the slot's lifetime so CUDA-graph-captured kernel args
-    /// never reference a freed temporary (prefix-cache restore UAF, #8).
+    /// Lives as long as the slot so CUDA-graph-captured kernel args never
+    /// reference a freed temporary (prefix-cache restore UAF, #8).
     pub(crate) device_page_table: CudaSlice<i32>,
 }
 
@@ -156,10 +141,6 @@ impl Dsv4FlashMlaDecodeState {
             local_heads,
             tp_world,
         )?;
-        // #85 P2 Stage B: slots start EMPTY (the band is drawn on admission), so
-        // the band length is derived from the SHAPE, not the table. The decode
-        // shape must agree with the layout's per-slot block count (both derive
-        // from the same plan-pinned construction params).
         ensure!(
             shape.total_blocks == pool.flashmla_slot_pages && shape.total_blocks > 0,
             "DSv4 FlashMLA shared slot band shape mismatch for slot {slot_idx} \
@@ -190,10 +171,6 @@ impl Dsv4FlashMlaDecodeState {
         }
         let num_sm_parts_max = (num_sm_parts as usize).max(256);
 
-        // SCRATCH buffers (`sw_bulk_*`/`one_*`/`comp_*`/`indices`/`lse_*`/`o_accum`/
-        // `tp_*`) are not allocated here — they live in the model-wide
-        // [`Dsv4FlashMlaDecodeScratch`] (#85). Only the slot-shape constants +
-        // CONSTANT-after-init scheduler metadata remain per (slot, layer).
         let mut state = Self {
             slot_idx,
             fp8_kv_pool_len,
@@ -213,21 +190,14 @@ impl Dsv4FlashMlaDecodeState {
             device_page_table: ctx.stream.alloc_zeros::<i32>(shape.total_blocks)?,
         };
         state.init_constant_sched_meta(ctx)?;
-        // NOT refreshed here: at construction the host page table is
-        // legitimately EMPTY (band drawn on first admission, #85 P2 Stage B).
-        // The zeroed placeholder is safe — FlashMLA kernels never read this
-        // buffer before the first band mirror marks the slot dirty and the
-        // executor's dirty-driven refresh fills it.
+        // The zeroed page table is safe: kernels never read it before the first
+        // band mirror marks the slot dirty and the refresh fills it.
         Ok(state)
     }
 
-    /// Fill `topk_length` and the FlashMLA scheduler metadata ONCE: both
-    /// depend only on slot constants (`topk_unified`, sm-part shape), so
-    /// computing them per decode step was (a) wasted work (43 calls/token)
-    /// and (b) a CUDA-graph capture hazard — the per-step
-    /// `memcpy_htod(&[topk], ..)` recorded a memcpy node whose HOST source
-    /// was a dead stack temporary, so replay read a dangling pointer
-    /// (garbage topk → insane splits → the 2026-06-10 IMA).
+    /// Fill `topk_length` and the scheduler metadata ONCE: a per-step
+    /// `memcpy_htod(&[topk], ..)` records a graph node whose host source is a dead
+    /// stack temporary, so replay reads a dangling pointer.
     pub(super) fn init_constant_sched_meta(&mut self, ctx: &DeviceContext) -> Result<()> {
         let topk = i32::try_from(self.topk_unified)
             .map_err(|_| anyhow!("DSv4 FlashMLA topk {} overflows i32", self.topk_unified))?;
@@ -259,10 +229,8 @@ impl Dsv4FlashMlaDecodeState {
         Ok(())
     }
 
-    /// Re-sync the persistent device page table from the host page table —
-    /// the CUDA-graph-captured kernel arg points at this fixed buffer, so a
-    /// stale copy reads garbage. Dirty-bit driven (#154 Phase 0:
-    /// `Dsv4KvAdapter::take_device_table_dirty`).
+    /// Re-sync the device page table from the host table — the graph-captured
+    /// kernel arg points at this fixed buffer, so a stale copy reads garbage.
     pub(super) fn refresh_device_page_table(
         &mut self,
         ctx: &DeviceContext,
@@ -279,9 +247,8 @@ impl Dsv4FlashMlaDecodeState {
             table_i32.len(),
             self.device_page_table.len()
         );
-        // Host tables carry only real pages (#154 Phase 0); the graph-captured
-        // device table is fixed-size, so pad HERE — the one device-format
-        // padding boundary.
+        // Host tables carry only real pages; the graph-captured device table is
+        // fixed-size, so pad here.
         let pad = table_i32.last().copied().unwrap_or(0);
         table_i32.resize(self.device_page_table.len(), pad);
         ctx.stream
@@ -295,26 +262,18 @@ impl Dsv4FlashMlaDecodeState {
         self.fp8_kv_comp_packed_rows = 0;
     }
 
-    /// SW sub-pool block count (= `ceil(sliding_window/page_block_size)`, uniform
-    /// across a layer's slots); the batched compressed-delta pack's `sw_blocks`.
     pub(crate) fn sw_blocks(&self) -> usize {
         self.sw_blocks
     }
 
-    /// The ONE block→(page,row) map for this slot's band. The pack/index kernel
-    /// `sw_blocks`/`page_block_size` params draw from this same source so they
-    /// cannot drift from the map (#146 Index-layer single-source).
+    /// The one block→(page,row) map for this slot's band; the pack/index kernel
+    /// params draw from it so they cannot drift.
     pub(crate) fn block_map(&self) -> Dsv4BlockMap {
         Dsv4BlockMap::new(self.sw_blocks, self.page_block_size)
     }
 
-    /// Exact requested device bytes owned by this per-(slot,layer) FlashMLA
-    /// decode state. After the #85 P3 hoist this is only the CONSTANT-after-init
-    /// scheduler metadata (`topk_length`/`sched_meta`/`num_splits`); the 13
-    /// per-forward SCRATCH buffers live in the model-wide
-    /// [`Dsv4FlashMlaDecodeScratch`]. The FP8 KV pool pages it reads through the
-    /// slot block table are NOT owned here — they live in
-    /// [`Dsv4LayerKvLayout::flashmla_kv_pool`] and are summed there once.
+    /// Scheduler metadata only; the FP8 KV pool pages this slot reads are owned
+    /// (and summed) by [`Dsv4LayerKvLayout::flashmla_kv_pool`].
     #[allow(dead_code)]
     pub(crate) fn device_bytes(&self) -> usize {
         let i32_sz = std::mem::size_of::<i32>();
@@ -323,15 +282,11 @@ impl Dsv4FlashMlaDecodeState {
             + self.num_splits.len() * i32_sz
     }
 
-    /// STATIC estimate of `device_bytes` for `Dsv4Model::per_slot_device_bytes`.
-    /// `sched_meta`'s exact length uses `num_sm_parts` from a device-only FFI meta
-    /// call; `new` floors it at `max(num_sm_parts, 256)`, so this static value uses
-    /// the 256 floor. The whole term is ~8 KB/layer (<0.1% of a slot) — any
-    /// FFI-driven excess is caught by the executor's per-slot drift guard.
+    /// Static estimate of `device_bytes`: `num_sm_parts` comes from a device-only
+    /// FFI call, so use `new`'s 256 floor (~8 KB/layer).
     pub(crate) fn device_bytes_estimate() -> usize {
         let i32_sz = std::mem::size_of::<i32>();
         let num_sm_parts_max = 256usize;
-        // topk_length[1] + sched_meta[num_sm_parts_max * 8] + num_splits[2].
         (1 + num_sm_parts_max * 8 + 2) * i32_sz
     }
 
@@ -359,66 +314,42 @@ impl Dsv4FlashMlaDecodeState {
     }
 }
 
-/// Model-wide (one instance, NOT per-slot/per-layer) per-forward SCRATCH for the
-/// SINGLE-ROW (`s_q = 1`) FlashMLA sparse decode lane (#85 P3). These are the
-/// per-step accumulators / staging buffers that the single-row pack + decode +
-/// TP path overwrite-before-read every layer step; they carry NO cross-call or
-/// cross-slot state (the 2026-06 whole-slot-swap SCRATCH verdict).
-/// They were wrongly allocated PER (slot, layer) inside `Dsv4FlashMlaDecodeState`
-/// — `o_accum` alone is `(num_sm_parts+1) × h_q × head_dim × f32 ≈ 33.7 MB/layer`,
-/// so 43 FlashMLA layers cost ~1392 MB PER SLOT. DSv4 runs its layers
-/// sequentially and the engine runs one forward at a time, so ONE shared instance
-/// suffices (exactly like `dsa_shared`/`flashmla_batch`/`prefill_linear`): the
-/// single-row decode loop overwrites the shared scratch before reading every
-/// iteration, serial on `ctx.stream`. Hoisting drops per-slot from ~1466 MB to
-/// ~74 MB.
-///
-/// Every buffer is sized for the WORST CASE across all FlashMLA layer shapes
-/// (the per-mode `topk_unified` / compressed-row span differ by layer; `h_q` is
-/// uniform 64/128). `num_sm_parts` depends only on `(h_q, s_q=1, model)` — the
-/// same FFI meta the single-row state queried — so it is computed once.
+/// Model-wide per-forward scratch for the single-row (`s_q = 1`) FlashMLA sparse
+/// decode lane. Buffers carry no cross-call or cross-slot state, so one shared
+/// instance serves every (slot, layer): per-slot cost drops from ~1466 MB to
+/// ~74 MB (`o_accum` alone is ~33.7 MB/layer × 43 layers). Every buffer is sized
+/// for the worst case across FlashMLA layer shapes; `h_q` is uniform 64/128.
 pub(crate) struct Dsv4FlashMlaDecodeScratch {
-    /// `[sliding_window]` i32 — SW bulk pack block-ids (ring-identity constants),
-    /// written immediately before their single read in `flashmla_pack_sw_ring`.
+    /// `[sliding_window]` i32 — SW bulk pack block-ids.
     pub(super) sw_bulk_block_ids: CudaSlice<i32>,
-    /// `[sliding_window]` i32 — SW bulk pack row offsets (same lifecycle).
+    /// `[sliding_window]` i32 — SW bulk pack row offsets.
     pub(super) sw_bulk_rows: CudaSlice<i32>,
-    /// `[1]` i32 — one-token SW pack block-id, device-written from `start_pos`
-    /// at the top of every `flashmla_pack_one_sw_token` before its single read.
+    /// `[1]` i32 — one-token SW pack block-id.
     pub(super) one_block_id: CudaSlice<i32>,
-    /// `[1]` i32 — one-token SW pack row offset (same lifecycle).
+    /// `[1]` i32 — one-token SW pack row offset.
     pub(super) one_row: CudaSlice<i32>,
-    /// `[max comp_slots]` i32 — compressed-delta bulk pack block-ids, H2D-written
-    /// immediately before their single read in `flashmla_pack_compressed_delta`.
-    /// Sized `max(comp_blocks × 64) over layers` (`.max(1)`) — a shape-derived
-    /// upper bound on each layer's `comp_slots = max_seq_len.div_ceil(ratio)`.
+    /// `[max comp_slots]` i32 — compressed-delta bulk pack block-ids.
     pub(super) comp_block_ids: CudaSlice<i32>,
-    /// `[max comp_slots]` i32 — compressed-delta bulk pack row offsets (same).
+    /// `[max comp_slots]` i32 — compressed-delta bulk pack row offsets.
     pub(super) comp_rows: CudaSlice<i32>,
-    /// `[max topk_unified]` i32 — the unified sparse indices the build-indices
-    /// kernel writes each decode step before the sparse-decode kernel reads them.
+    /// `[max topk_unified]` i32 — unified sparse indices.
     pub(super) indices: CudaSlice<i32>,
-    /// `[h_q]` f32 — decode-kernel LSE output, fully overwritten per launch.
+    /// `[h_q]` f32 — decode-kernel LSE output.
     pub(super) lse_out: CudaSlice<f32>,
-    /// `[(num_sm_parts+1) × h_q]` f32 — split-KV LSE accumulator (same lifecycle).
+    /// `[(num_sm_parts+1) × h_q]` f32 — split-KV LSE accumulator.
     pub(super) lse_accum: CudaSlice<f32>,
-    /// `[(num_sm_parts+1) × h_q × head_dim]` f32 — split-KV O accumulator. The
-    /// dominant byte sink; fully overwritten per launch before read.
+    /// `[(num_sm_parts+1) × h_q × head_dim]` f32 — split-KV O accumulator.
     pub(super) o_accum: CudaSlice<f32>,
-    /// `[h_q × head_dim]` bf16 — TP all-gather landing buffer for the global-head
-    /// Q (TP path only), written each decode step before read.
+    /// `[h_q × head_dim]` bf16 — TP all-gather landing buffer for global-head Q.
     pub(super) tp_gathered_q: CudaSlice<half::bf16>,
-    /// `[h_q × head_dim]` bf16 — repacked global-head Q (TP path), written each step.
+    /// `[h_q × head_dim]` bf16 — repacked global-head Q (TP path).
     pub(super) tp_packed_q: CudaSlice<half::bf16>,
-    /// `[h_q × head_dim]` bf16 — full global-head fwd output staging (TP path),
-    /// written by the fwd then read by the out-slice each step.
+    /// `[h_q × head_dim]` bf16 — full global-head fwd output staging (TP path).
     pub(super) tp_full_out: CudaSlice<half::bf16>,
 }
 
 impl Dsv4FlashMlaDecodeScratch {
-    /// Allocate the ONE model-wide single-row FlashMLA decode scratch, each
-    /// buffer sized for the worst case across `layer_shapes` (every FlashMLA
-    /// layer's decode shape). All shapes must share `h_q`.
+    /// `layer_shapes` is every FlashMLA layer's decode shape; all must share `h_q`.
     pub(super) fn new(
         ctx: &DeviceContext,
         config: &DeepSeekV4Config,
@@ -437,13 +368,9 @@ impl Dsv4FlashMlaDecodeScratch {
         let h_q_d = h_q
             .checked_mul(head_dim)
             .ok_or_else(|| anyhow!("DSv4 FlashMLA scratch h_q*d overflow"))?;
-        // `sw_*` are config-constant (`sliding_window`) like the per-slot alloc.
         let sw_slots = config.sliding_window;
-        // Worst-case compressed-row span: `comp_blocks * page_block_size` is a
-        // shape-derived upper bound on each layer's `comp_slots` (the per-slot
-        // alloc used `max_seq_len.div_ceil(ratio)`, and `comp_blocks =
-        // compressed_rows.div_ceil(64)` ⇒ `comp_blocks*64 ≥ comp_slots`). SW
-        // layers have `comp_blocks=0`; the `.max(1)` matches the per-slot floor.
+        // `comp_blocks * 64` upper-bounds each layer's `comp_slots`; SW layers have
+        // `comp_blocks = 0`, hence the `.max(1)` floor.
         let comp_slots = layer_shapes
             .iter()
             .map(|s| s.comp_blocks * 64)
@@ -455,8 +382,7 @@ impl Dsv4FlashMlaDecodeScratch {
             .map(|s| s.topk_unified)
             .max()
             .unwrap_or(0);
-        // num_sm_parts depends only on (h_q, s_q=1, model) — uniform across
-        // layers; same call the single-row state + batch scratch use.
+        // num_sm_parts depends only on (h_q, s_q=1, model) — uniform across layers.
         let mut num_sm_parts = 0_i32;
         let mut fixed_overhead_num_blocks = 0_i32;
         let mut block_size_topk = 0_i32;
@@ -492,8 +418,6 @@ impl Dsv4FlashMlaDecodeScratch {
         })
     }
 
-    /// Exact requested device bytes owned by this ONE model-wide single-row
-    /// FlashMLA decode scratch.
     #[allow(dead_code)]
     pub(crate) fn device_bytes(&self) -> usize {
         let i32_sz = std::mem::size_of::<i32>();
@@ -515,96 +439,62 @@ impl Dsv4FlashMlaDecodeScratch {
     }
 }
 
-/// Model-wide (one instance, NOT per-slot/per-layer) scratch for the batched
-/// (`b = N`) FlashMLA sparse decode lane (#60). The single-row
-/// [`Dsv4FlashMlaDecodeState`] is per-(slot, layer) and sized for `s_q = 1`;
-/// the batched lane runs ONE `sparse_decode_fwd(b=N)` over N DIFFERENT slots
-/// that all share one layer's KV pool, so its row-major buffers must live in a
-/// single shared instance sized for `max_batch` rows. Mirrors the
-/// allocate-once / reuse-every-forward discipline of the other model-wide
-/// scratches ([`Dsv4DsaSharedScratch`], `Dsv4MoeDecodeScratch`).
-///
-/// All row-dimension buffers are `[max_batch, …]`; a forward over `n ≤ max_batch`
-/// rows uses the `[0, n)` prefix. `max_topk_unified` is the MAX across every
-/// FlashMLA layer mode (SW vs HCA vs CSA differ in `topk_unified`); `h_q` is
-/// uniform (global heads 64 or 128). The split-KV accum scratch is sized
-/// `[num_sm_parts + max_batch, …]` and SHARED across the batch. Pool addressing:
-/// the batched indices builder emits POOL-ABSOLUTE block coords (it adds
-/// `slot_block_offsets[row] * page_block_size`), so the single batched fwd reads
-/// one pool base pointer — unlike the single-row path's per-slot `pool_view`.
+/// Model-wide scratch for the batched (`b = N`) FlashMLA sparse decode lane: one
+/// `sparse_decode_fwd(b=N)` runs over N different slots sharing one layer's KV
+/// pool, so the row-major buffers live in a single instance sized for
+/// `max_batch`; a forward over `n ≤ max_batch` rows uses the `[0, n)` prefix.
+/// The batched indices builder emits POOL-ABSOLUTE block coords, so the fwd
+/// reads one pool base pointer.
 pub(crate) struct Dsv4FlashMlaDecodeBatchScratch {
     /// `[max_batch, max_topk_unified]` i32 — per-row unified sparse indices in
-    /// pool-absolute block coords. Written by the batched indices builder each
-    /// forward (all `n` rows) before the fwd reads it.
+    /// pool-absolute block coords.
     pub(super) indices: CudaSlice<i32>,
-    /// `[max_batch]` i32 — per-row effective topk length (= each row's mode's
-    /// `topk_unified`). Written by the batched indices builder.
+    /// `[max_batch]` i32 — per-row effective topk length.
     pub(super) topk_length: CudaSlice<i32>,
-    /// `[max_batch]` i32 — per-row absolute decode position. Host→device each
-    /// forward; feeds the batched indices builder's causal gate.
+    /// `[max_batch]` i32 — per-row absolute decode position (causal gate input).
     pub(super) start_pos: CudaSlice<i32>,
-    /// `[max_batch]` i32 — each row's slot's first FlashMLA pool block (the
-    /// slot→pool translation the batched indices builder applies). Host→device
-    /// each forward from the slot page tables.
+    /// `[max_batch]` i32 — each row's slot's first FlashMLA pool block.
     pub(super) slot_block_offsets: CudaSlice<i32>,
-    /// `[max_batch, total_blocks]` i32 — padded per-row logical->physical page
-    /// tables for the Stage-B batched indices build. Identity rows reproduce the
-    /// old band path byte-for-byte; fragmented rows route directly to
-    /// pool-absolute physical blocks and the kernel skips `slot_block_offsets`.
+    /// `[max_batch, total_blocks]` i32 — padded per-row logical→physical page
+    /// tables; fragmented rows route to pool-absolute blocks and the kernel then
+    /// skips `slot_block_offsets`.
     pub(super) page_table_batched: CudaSlice<i32>,
     /// `[max_batch, h_q]` f32 — per-row LSE output of the sparse decode.
     pub(super) lse_out: CudaSlice<f32>,
-    /// `[num_sm_parts + max_batch, h_q]` f32 — split-KV LSE accumulator, SHARED
-    /// across the batch (split dim folds b in via `num_splits`). Strides match
-    /// the single-row path (split stride = s_q*h_q).
+    /// `[num_sm_parts + max_batch, h_q]` f32 — split-KV LSE accumulator, shared
+    /// across the batch (b folds into the split dim via `num_splits`).
     pub(super) lse_accum: CudaSlice<f32>,
-    /// `[num_sm_parts + max_batch, h_q * d_v]` f32 — split-KV O accumulator,
-    /// shared across the batch (see `lse_accum`). d_v=512 always.
+    /// `[num_sm_parts + max_batch, h_q * d_v]` f32 — split-KV O accumulator.
     pub(super) o_accum: CudaSlice<f32>,
-    /// `[num_sm_parts_max * 8]` i32 — tile-scheduler metadata. RECOMPUTED PER
-    /// FORWARD via `sched_meta(b=n)` (the cached-constant pitfall: the b=1 cached
-    /// meta is WRONG for n>1 — wrong split-KV merge).
+    /// `[num_sm_parts_max * 8]` i32 — tile-scheduler metadata, recomputed per
+    /// forward: a cached b=1 meta merges split-KV wrongly for n>1.
     pub(super) sched_meta: CudaSlice<i32>,
-    /// `[max_batch + 1]` i32 — split offsets. Written per forward by `sched_meta`.
+    /// `[max_batch + 1]` i32 — split offsets, written per forward by `sched_meta`.
     pub(super) num_splits: CudaSlice<i32>,
-    /// `[max_batch, h_q * head_dim]` bf16 — gathered+repacked global-head Q
-    /// (TP path) or the row-major batched Q (single-GPU). Fed as the fwd's q.
-    /// PHASE B: each row r's prepared Q is written into `[r, ..]` by the per-row
-    /// pack/gather before the ONE batched fwd reads the whole `[0, n)` prefix.
+    /// `[max_batch, h_q * head_dim]` bf16 — the fwd's q: gathered+repacked
+    /// global-head Q (TP) or the row-major batched Q (single-GPU).
     pub(super) q_batched: CudaSlice<half::bf16>,
-    /// `[max_batch, h_q * d_v]` bf16 — full global-head fwd output, read
-    /// per-row by the finish step (TP out-slice on the TP path, direct copy on
-    /// single-GPU). PHASE B. d_v=512 always.
+    /// `[max_batch, h_q * d_v]` bf16 — full global-head fwd output.
     pub(super) out_batched: CudaSlice<half::bf16>,
     /// `[max_batch, tp_world * local_heads * head_dim]` bf16 — TP all-gather
-    /// landing buffer (TP path only). PHASE B: the gather loop uses the `[0,
-    /// h_q_d)` slice per row (one row's allgather at a time), then
-    /// repacks the global Q into `q_batched[r]`.
+    /// landing buffer; the gather loop uses the `[0, h_q_d)` slice per row.
     pub(super) tp_gathered_q: CudaSlice<half::bf16>,
-    /// `[max_batch, csa_topk]` i32 — CSA ONLY: the prepare loop gathers each
-    /// row's indexer top-k `selected` (`[index_topk]`) into row r, then the ONE
-    /// batched index build reads `selected + row * max_compressed_keys`
-    /// (== `index_topk` for CSA). Disjoint from `indices`/`q_batched`/etc.
-    /// `csa_topk == 0` (zero-len alloc, never read) when the model has no CSA
-    /// layer; SW/HCA never touch this buffer (their `selected_ptr` stays 0).
+    /// `[max_batch, csa_topk]` i32 — indexer modes only; the batched index build
+    /// reads `selected + row * max_compressed_keys`. Zero-len and never read when
+    /// the model has no CSA layer (SW/HCA pass `selected_ptr = 0`).
     pub(super) selected_batched: CudaSlice<i32>,
-    /// CSA per-row `selected` length (= `config.index_topk` = a CSA layer's
-    /// `max_compressed_keys`); the row stride of `selected_batched`. 0 if the
-    /// model has no CSA layer.
+    /// Row stride of `selected_batched` (= `config.index_topk`); 0 if the model
+    /// has no CSA layer.
     pub(super) csa_topk: usize,
-    /// Per-layer decode shape (`topk_unified`/`sw_blocks`/`comp_blocks`/… per
-    /// mode), indexed by layer. The batched build_indices / fwd read the
-    /// engaged layer's shape; stored here so the dsv4 loop needs only `layer_idx`.
+    /// Per-layer decode shape, indexed by layer, so the dsv4 loop needs only
+    /// `layer_idx`.
     pub(super) layer_shapes: Vec<Dsv4FlashMlaDecodeShape>,
     pub(super) max_batch: usize,
     pub(super) max_topk_unified: usize,
-    /// Global heads (64/128); PHASE B: row stride component of q_batched
-    /// (`h_q*head_dim`) and out_batched (`h_q*d_v`).
+    /// Global heads (64/128).
     pub(super) h_q: usize,
-    /// PHASE B: `h_q_d` row stride component.
     pub(super) head_dim: usize,
-    /// Output latent dim (d_v=512 always; == head_dim for MODEL1, < head_dim
-    /// for V32). Sizes out_batched/o_accum and the finish-step output slice.
+    /// Output latent dim: 512 always; == head_dim for MODEL1, < head_dim for V32.
     pub(super) d_v: usize,
     pub(super) num_sm_parts: i32,
     pub(super) fixed_overhead_num_blocks: i32,
@@ -612,10 +502,8 @@ pub(crate) struct Dsv4FlashMlaDecodeBatchScratch {
 }
 
 impl Dsv4FlashMlaDecodeBatchScratch {
-    /// Allocate the batched-decode scratch sized for `max_batch` concurrent
-    /// decode rows over the model's FlashMLA layers. `layer_shapes` are every
-    /// FlashMLA layer's decode shape (so `max_topk_unified` / `accum_rows_max`
-    /// cover the worst mode); all must share `h_q` and `head_dim`.
+    /// `layer_shapes` is every FlashMLA layer's decode shape (so the buffers cover
+    /// the worst mode); all must share `h_q` and `head_dim`.
     pub(super) fn new(
         ctx: &DeviceContext,
         config: &DeepSeekV4Config,
@@ -642,9 +530,7 @@ impl Dsv4FlashMlaDecodeBatchScratch {
             .map(|s| s.topk_unified)
             .max()
             .unwrap_or(0);
-        // The scheduler tuning meta (num_sm_parts/fixed_overhead/block_size_topk)
-        // depends only on (h_q, s_q=1, model). Same call the single-row state
-        // uses; the resulting `num_sm_parts` sizes the accum + sched buffers.
+        // Scheduler tuning meta depends only on (h_q, s_q=1, model).
         let mut num_sm_parts = 0_i32;
         let mut fixed_overhead_num_blocks = 0_i32;
         let mut block_size_topk = 0_i32;
@@ -662,18 +548,13 @@ impl Dsv4FlashMlaDecodeBatchScratch {
             .map_err(|e| anyhow!("DSv4 batched FlashMLA decode meta failed: {e}"))?;
         }
         let num_sm_parts_max = (num_sm_parts as usize).max(256);
-        // Split-KV accum scratch is shared across the whole batch: the shim
-        // documents lse_accum/o_accum as `[num_sm_parts + b, s_q, h_q(*d_v)]`
-        // (arle_flashmla_decode_shim.cu:202-203) — the split dimension is
-        // `num_sm_parts + b`, NOT `b * num_sm_parts`. Accum strides therefore
-        // stay the single-row values (split stride = s_q*h_q etc.); b is folded
-        // into the split index via `num_splits[b+1]`, not a separate batch axis.
+        // The shim's accum split dimension is `num_sm_parts + b`, not
+        // `b * num_sm_parts` (arle_flashmla_decode_shim.cu:202-203).
         let accum_splits_max = num_sm_parts_max + max_batch;
         let h_q_d = h_q
             .checked_mul(head_dim)
             .ok_or_else(|| anyhow!("DSv4 batched FlashMLA h_q*d overflow"))?;
-        // Output (out_batched/o_accum) is [b, h_q, d_v]: d_v=512 always (shim
-        // hard-asserts). For MODEL1 d_v==head_dim; for V32 d_v=512 < head_dim=576.
+        // d_v=512 always (the shim hard-asserts); == head_dim only for MODEL1.
         let d_v = if model_type_int == DSV4_FLASHMLA_V32 {
             512
         } else {
@@ -682,8 +563,7 @@ impl Dsv4FlashMlaDecodeBatchScratch {
         let h_q_d_v = h_q
             .checked_mul(d_v)
             .ok_or_else(|| anyhow!("DSv4 batched FlashMLA h_q*d_v overflow"))?;
-        // Size the per-row page table for the WIDEST layer's band (CSA total_blocks);
-        // narrower SW-only layers use a row_width prefix of this shared buffer.
+        // Sized for the widest layer's band; narrower layers use a row_width prefix.
         let max_total_blocks = layer_shapes
             .iter()
             .map(|s| s.total_blocks)
@@ -707,12 +587,8 @@ impl Dsv4FlashMlaDecodeBatchScratch {
             q_batched: ctx.stream.alloc_zeros::<half::bf16>(max_batch * h_q_d)?,
             out_batched: ctx.stream.alloc_zeros::<half::bf16>(max_batch * h_q_d_v)?,
             tp_gathered_q: ctx.stream.alloc_zeros::<half::bf16>(max_batch * h_q_d)?,
-            // CSA per-row top-k gather buffer. `config.index_topk` is the single
-            // config-level top-k width every CSA layer uses (== a CSA layer's
-            // `max_compressed_keys`), so one fixed row stride serves all CSA
-            // layers. Sized `max_batch * index_topk` (≈ slots × 512 × 4B, tiny).
-            // For a model with no DSA/CSA layer index_topk is 0 → a zero-len alloc
-            // that is never read (SW/HCA pass selected_ptr=0).
+            // `config.index_topk` is the one top-k width every CSA layer uses, so a
+            // single row stride serves all of them; 0 → zero-len, never read.
             selected_batched: ctx
                 .stream
                 .alloc_zeros::<i32>(max_batch * config.index_topk)?,
@@ -729,8 +605,6 @@ impl Dsv4FlashMlaDecodeBatchScratch {
         })
     }
 
-    /// Exact requested device bytes owned by this ONE model-wide batched
-    /// FlashMLA decode scratch (`layer_shapes` is host-only metadata, excluded).
     #[allow(dead_code)]
     pub(crate) fn device_bytes(&self) -> usize {
         let i32_sz = std::mem::size_of::<i32>();
@@ -752,13 +626,10 @@ impl Dsv4FlashMlaDecodeBatchScratch {
             + self.selected_batched.len() * i32_sz
     }
 
-    /// Upload the per-row decode positions + slot→pool block offsets + padded
-    /// per-row page tables for an `n`-row forward. `slot_block_offsets[r]`
-    /// remains for the legacy band path (`page_table == None`); Stage-B routes
-    /// the batched kernel through `page_table_batched` and the offsets are
-    /// ignored. Writes the `[0, n)` prefix of `self.start_pos` /
-    /// `self.slot_block_offsets` and the `[0, n*row_width)` prefix of
-    /// `self.page_table_batched`.
+    /// Upload the per-row decode positions, slot→pool block offsets and padded
+    /// page tables for an `n`-row forward: writes the `[0, n)` prefix of
+    /// `start_pos` / `slot_block_offsets` and `[0, n*row_width)` of
+    /// `page_table_batched`.
     pub(super) fn upload_row_meta(
         &mut self,
         ctx: &DeviceContext,
@@ -806,9 +677,6 @@ impl Dsv4FlashMlaDecodeBatchScratch {
             .map_err(|e| anyhow!("DSv4 batched decode block-offset H2D failed: {e}"))?;
         if n > 0 {
             let row_width = page_tables[0].len();
-            // Capacity check: the scratch is sized for the WIDEST layer's band
-            // (max_total_blocks); narrower layers write a row_width prefix and the
-            // kernel strides by this layer's shape.total_blocks (== row_width).
             ensure!(
                 row_width * self.max_batch <= self.page_table_batched.len(),
                 "DSv4 batched decode page-table width {} exceeds scratch len {} max_batch {}",
@@ -835,13 +703,9 @@ impl Dsv4FlashMlaDecodeBatchScratch {
         Ok(())
     }
 
-    /// CSA ONLY: gather row `r`'s indexer top-k `selected` into the contiguous
-    /// `selected_batched[r * csa_topk ..]` band the batched index build reads
-    /// (`selected + row * max_compressed_keys`, max_compressed_keys == csa_topk
-    /// for CSA). `selected` is `[index_topk]` i32 (decode seq_len=1); its length
-    /// must equal `csa_topk` (the single config top-k width). A single per-row
-    /// `memcpy_dtod` on `ctx.stream` — stream-ordered before the index build that
-    /// reads the buffer. Disjoint from `indices`/`q_batched`/etc.
+    /// Gather row `r`'s indexer top-k into `selected_batched[r * csa_topk ..]`.
+    /// `selected` is `[index_topk]` i32 and its length must equal `csa_topk`; the
+    /// D2D is stream-ordered before the index build that reads the buffer.
     pub(crate) fn gather_selected_row(
         &mut self,
         ctx: &DeviceContext,
@@ -872,24 +736,16 @@ impl Dsv4FlashMlaDecodeBatchScratch {
         Ok(())
     }
 
-    /// Mutable handle to the `[max_batch, csa_topk]` CSA per-row top-k buffer the
-    /// batched index build reads (`selected + row * csa_topk`). The batched CSA
-    /// select (`csa_select_official_batched`, #60) writes the N rows here directly,
-    /// replacing the per-row `gather_selected_row` copies. The buffer's row stride
-    /// (`csa_topk`) equals `config.index_topk`, so the batched select's
-    /// `out_selected` row stride matches.
+    /// Handle for the batched CSA select to write all N rows directly; its
+    /// `out_selected` row stride must be `csa_topk`.
     pub(crate) fn selected_batched_mut(&mut self) -> &mut CudaSlice<i32> {
         &mut self.selected_batched
     }
 
-    /// Phase A convenience: build a layer's complete per-forward batched
-    /// metadata — `upload_row_meta(n)` → `build_indices_batched(b=N)` →
-    /// `sched_meta_for_batch(b=N)` — using the layer's STORED decode shape
-    /// (`self.layer_shapes[layer_idx]`, the exact per-mode shape). SW/HCA pass
-    /// `selected_ptr=0`; CSA sources the per-row top-k from `self.selected_batched`
-    /// (which the prepare loop filled this forward via `gather_selected_row`).
-    /// Leaves `self.indices`/`topk_length`/`sched_meta`/`num_splits` populated
-    /// for this layer, ready for `sparse_decode_fwd_batched`.
+    /// Build a layer's complete per-forward batched metadata, leaving
+    /// `indices`/`topk_length`/`sched_meta`/`num_splits` ready for
+    /// `sparse_decode_fwd_batched`. Indexer modes require `selected_batched` to
+    /// have been filled this forward.
     pub(crate) fn build_layer_batch_meta(
         &mut self,
         ctx: &DeviceContext,
@@ -909,11 +765,8 @@ impl Dsv4FlashMlaDecodeBatchScratch {
             )
         })?;
         self.upload_row_meta(ctx, start_positions, slot_block_offsets, page_tables)?;
-        // Indexer modes (CSA + GLM SparseIndexed): feed the gathered per-row top-k
-        // buffer; SW/HCA: selected_ptr=0 (byte-identical to the prior SW/HCA-only
-        // batched index build). The kernel asserts `mode==CSA ⟹ selected != null`
-        // (build_indices.cu:318); SparseIndexed shares mode_int=1, so its ptr must
-        // be live too — `gather_selected_row` ran for every row in prepare.
+        // The kernel asserts `mode==CSA ⟹ selected != null` (build_indices.cu:318);
+        // SparseIndexed shares mode_int=1, so its ptr must be live too.
         let selected_ptr = if mode.has_indexer() {
             ensure!(
                 self.csa_topk == shape.max_compressed_keys,
@@ -933,16 +786,11 @@ impl Dsv4FlashMlaDecodeBatchScratch {
         Ok(())
     }
 
-    /// ONE batched indices build over all `n` rows (the orphaned
-    /// `dsv4_flashmla_decode_build_indices_batched` kernel, #60). Emits
-    /// `indices[n, topk_unified]` in pool-absolute block coords (slot→pool via
-    /// `slot_block_offsets`) and `topk_length[n]`. `mode`/`compress_ratio` are
-    /// uniform within a layer; `total_blocks` is this layer's `sw+comp` block
-    /// count (bounds the offset translation). `selected` is the CSA per-row topk
+    /// Emits `indices[n, topk_unified]` in pool-absolute block coords and
+    /// `topk_length[n]`. `selected_ptr` is the CSA per-row topk
     /// (`[n, max_compressed_keys]`) device ptr, or 0 for SW/HCA.
     ///
-    /// Precondition: `upload_row_meta(n)` already ran this forward (reads
-    /// `self.start_pos`/`self.slot_block_offsets` `[0,n)`).
+    /// Precondition: `upload_row_meta(n)` already ran this forward.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn build_indices_batched(
         &mut self,
@@ -965,11 +813,7 @@ impl Dsv4FlashMlaDecodeBatchScratch {
             self.max_topk_unified
         );
         // Indexer modes (CSA + GLM SparseIndexed) share mode_int=1; SW/HCA use 2.
-        let mode_int = match mode {
-            DeepSeekV4AttentionMode::CompressedSparse | DeepSeekV4AttentionMode::SparseIndexed => 1,
-            DeepSeekV4AttentionMode::SlidingWindow | DeepSeekV4AttentionMode::HybridCompressed => 2,
-        };
-        // Single-source sw_blocks / page_block_size for the batched index build.
+        let mode_int = mode.flashmla_mode_int();
         let bmap = shape.block_map();
         let (indices_ptr, indices_guard) = self.indices.device_ptr_mut(&ctx.stream);
         let (start_ptr, start_guard) = self.start_pos.device_ptr(&ctx.stream);
@@ -986,9 +830,8 @@ impl Dsv4FlashMlaDecodeBatchScratch {
             bmap.sw_blocks(),
             config.sliding_window,
             shape.max_compressed_keys,
-            // GLM SparseIndexed: full-sequence indexer, every token a key
-            // (ratio=1); the kernel causality gate block_end = c*ratio + (ratio-1)
-            // needs ratio=1. SW also passes 1; CSA/HCA keep compress_ratio.
+            // SparseIndexed is a full-sequence indexer, so the kernel's causality
+            // gate `block_end = c*ratio + (ratio-1)` needs ratio=1, as does SW.
             if mode == DeepSeekV4AttentionMode::SlidingWindow
                 || mode == DeepSeekV4AttentionMode::SparseIndexed
             {
@@ -998,18 +841,12 @@ impl Dsv4FlashMlaDecodeBatchScratch {
             },
             mode_int,
             bmap.page_size(),
-            // POOL-absolute offset bound (Phase-B correctness fix). `slot_block_offsets[r]`
-            // = slot_idx × shape.total_blocks is a POOL-absolute block offset (the pool
-            // packs `num_slots == max_batch` contiguous per-slot bands), so the batched
-            // kernel's `block_offset >= bound` guard must use the WHOLE-POOL block count,
-            // not the per-slot `total_blocks` — the per-slot bound masked every index of
-            // every row r≥1 to -1 (offset r*tb >= tb), yielding garbled decode (KILL
-            // errors/2026-06-14-dsv4-batched-flashmla-decode-phaseB-correctness-kill.md).
+            // `slot_block_offsets[r]` is pool-absolute, so the kernel's
+            // `block_offset >= bound` guard needs the whole-pool block count; the
+            // per-slot count masks every index of every row r≥1 to -1.
             shape.total_blocks * self.max_batch,
             Some(&self.page_table_batched),
-            // Fixed row stride the host writes at (upload_row_meta row_width =
-            // page_table_batched.len()/max_batch = per-slot total_blocks),
-            // independent of active n — the kernel reads page_table + row*width.
+            // Fixed row stride the host writes at, independent of active n.
             shape.total_blocks,
         )?;
         drop(indices_guard);
@@ -1019,11 +856,9 @@ impl Dsv4FlashMlaDecodeBatchScratch {
         Ok(())
     }
 
-    /// Recompute the tile-scheduler metadata + split offsets for `b = n` THIS
-    /// forward (the cached-constant pitfall, #60: the b=1 cached meta is wrong
-    /// for n>1). Reads `self.topk_length[0..n]` (filled by `build_indices_batched`),
-    /// writes `self.sched_meta` + `self.num_splits[0..=n]`. `layer_topk` is this
-    /// layer's `topk_unified` (uniform per row in one layer).
+    /// Recompute the tile-scheduler metadata + split offsets for `b = n` this
+    /// forward (a cached b=1 meta is wrong for n>1). Reads `topk_length[0..n]`,
+    /// writes `sched_meta` + `num_splits[0..=n]`.
     pub(super) fn sched_meta_for_batch(
         &mut self,
         ctx: &DeviceContext,
@@ -1064,21 +899,12 @@ impl Dsv4FlashMlaDecodeBatchScratch {
         Ok(())
     }
 
-    /// ONE batched `sparse_decode_fwd(b=n)` over the whole shared KV pool base
-    /// (#60 — the actual concurrency win, one launch over N rows replacing the
-    /// per-row loop). `q_ptr` is `[n, h_q*head_dim]` bf16 (= `self.q_batched`
-    /// prefix on the TP path, or the row-major global Q on single-GPU);
-    /// `pool_ptr` is the layer's whole FP8 KV pool base (indices are
-    /// pool-absolute); `out_ptr` is `[n, h_q*head_dim]` bf16.
+    /// One batched `sparse_decode_fwd(b=n)` over the whole shared KV pool base.
+    /// `q_ptr` is `[n, h_q*head_dim]` bf16, `pool_ptr` the layer's whole FP8 KV
+    /// pool base (indices are pool-absolute), `out_ptr` `[n, h_q*head_dim]` bf16.
     ///
     /// Precondition: `build_indices_batched(n)` + `sched_meta_for_batch(n)` ran
     /// this forward; `shape` is this layer's decode shape.
-    ///
-    /// PHASE B (#60): the actual batched kernel call — ONE launch over `n` rows.
-    /// Wired by [`Self::decode_lane_fwd`] (which sources `pool_ptr`/`sink_ptr`
-    /// and the `q_batched`/`out_batched` bases) after the per-row pack/gather
-    /// loop fills `q_batched[0..n]` and `build_layer_batch_meta(n)` populated the
-    /// indices/sched_meta. Stride mapping verified against the shim.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn sparse_decode_fwd_batched(
         &mut self,
@@ -1096,9 +922,6 @@ impl Dsv4FlashMlaDecodeBatchScratch {
             n > 0 && n <= self.max_batch,
             "DSv4 batched fwd n={n} invalid"
         );
-        // MODEL1 (head_dim=512, d_qk=d_v=512, 584 B/tok) and V32/GLM
-        // (head_dim=576, d_qk=576, d_v=512 latent, 656 B/tok). Mirrors the
-        // single-row decode path's dim mapping; the shim hard-asserts d_v==512.
         let meta = dsv4_flashmla_model_meta(config)?;
         let (model_type_int, bytes_per_token) = (meta.model_type_int, meta.bytes_per_token);
         let global_heads = shape.h_q;
@@ -1108,15 +931,9 @@ impl Dsv4FlashMlaDecodeBatchScratch {
         let stride_kv_block_bytes = 64_i32 * bytes_per_token;
         let stride_q = (global_heads * head_dim) as i32; // s_q=1
         let stride_o = (global_heads as i32) * d_v;
-        // Reader pitch MUST equal the writer pitch: the batched indices builder
-        // (dsv4_flashmla_decode_build_indices.cu:210) writes row r at
-        // `r * shape.topk_unified` (this layer's actual topk, mode-dependent), NOT
-        // the scratch's allocated `max_topk_unified` (= max over ALL layers). Using
-        // max here made row r≥1 read `r*max` while the writer put it at
-        // `r*topk_unified` → garbled every row but row 0 (Phase-B correctness KILL,
-        // numdiff FIRST-EXCEEDANCE L0 row1). SGLang's invariant: builder pitch ==
-        // reader pitch by construction.
-        let stride_indices = shape.topk_unified as i32; // writer pitch
+        // Reader pitch must equal the writer pitch: the builder writes row r at
+        // `r * shape.topk_unified`, not the scratch's `max_topk_unified`.
+        let stride_indices = shape.topk_unified as i32;
         let stride_lse = global_heads as i32;
         let (indices_ptr, indices_guard) = self.indices.device_ptr(&ctx.stream);
         let (topk_ptr, topk_guard) = self.topk_length.device_ptr(&ctx.stream);
@@ -1163,10 +980,8 @@ impl Dsv4FlashMlaDecodeBatchScratch {
                 stride_o,
                 stride_o,
                 d_v,
-                // Split-KV accum strides: the accum buffers are `[num_sm_parts+b,
-                // s_q=1, h_q(*d_v)]` (shim:202-203), so split stride = s_q*h_q etc.
-                // — identical to the single-row path; b folds into the split index
-                // via num_splits, NOT a stride.
+                // Accum buffers are `[num_sm_parts+b, s_q=1, h_q(*d_v)]`, so b folds
+                // into the split index via num_splits rather than into a stride.
                 stride_lse, // stride_lse_accum_split = s_q*h_q = global_heads
                 stride_lse, // stride_lse_accum_s_q  = h_q     = global_heads
                 stride_o,   // stride_o_accum_split  = s_q*h_q*d_v
@@ -1187,8 +1002,6 @@ impl Dsv4FlashMlaDecodeBatchScratch {
         Ok(())
     }
 
-    /// This layer's stored decode shape (PHASE B: the batched lane reads
-    /// `topk_unified` / `sw_blocks` / `comp_blocks` / `h_q` per layer).
     pub(super) fn layer_shape(&self, layer_idx: usize) -> Result<Dsv4FlashMlaDecodeShape> {
         self.layer_shapes.get(layer_idx).copied().ok_or_else(|| {
             anyhow!(
@@ -1202,18 +1015,13 @@ impl Dsv4FlashMlaDecodeBatchScratch {
         self.h_q * self.head_dim
     }
 
-    /// Output row stride: `h_q * d_v` (d_v=512 always). For MODEL1 == h_q_d();
-    /// for V32 (d_v=512 < head_dim=576) this is the out_batched/o_accum row pitch.
+    /// Output row pitch of out_batched/o_accum; `< h_q_d()` for V32 (d_v=512).
     pub(super) fn h_q_d_v(&self) -> usize {
         self.h_q * self.d_v
     }
 
-    /// PHASE B: gather row `r`'s prepared local Q into `q_batched[r]` as
-    /// global-head Q. Single-GPU (tp_world==1): a straight D2D copy of the
-    /// `[local_heads*head_dim]` row (h_q==local_heads). TP: NCCL all-gather of
-    /// this rank's Q into `tp_gathered_q`, then `dsv4_tp_q_repack_cuda` into
-    /// `q_batched[r]` — identical to the single-row `flashmla_decode_attention`
-    /// gather, run once per row instead of feeding a per-row fwd.
+    /// Gather row `r`'s prepared local Q into `q_batched[r]` as global-head Q:
+    /// a D2D copy on single-GPU, all-gather + repack under TP.
     pub(crate) fn gather_q_row(
         &mut self,
         ctx: &DeviceContext,
@@ -1251,8 +1059,7 @@ impl Dsv4FlashMlaDecodeBatchScratch {
             }
             drop(gather_guard);
             let (gather_ptr, gather_guard) = self.tp_gathered_q.device_ptr(&ctx.stream);
-            // `dst_view` holds the mutable borrow of `self.q_batched[r]` alive
-            // across the FFI call; `dst_ptr` is its raw device ptr.
+            // `dst_view` keeps the borrow of `q_batched[r]` alive across the FFI call.
             let mut dst_view = self.q_batched.slice_mut(r * d..(r + 1) * d);
             let (dst_ptr, dst_guard) = dst_view.device_ptr_mut(&ctx.stream);
             drop(dst_guard);
@@ -1277,9 +1084,7 @@ impl Dsv4FlashMlaDecodeBatchScratch {
                 })?;
             }
             drop(gather_guard);
-            // dst_view drops at the end of this branch, ending the q_batched borrow.
         } else {
-            // Single-GPU: global heads == local heads; copy the row verbatim.
             ensure!(
                 q_prepared.hidden_dim == d && q_prepared.seq_len == 1,
                 "DSv4 batched q row src {}x{} != [{d},1]",
@@ -1295,10 +1100,8 @@ impl Dsv4FlashMlaDecodeBatchScratch {
         Ok(())
     }
 
-    /// PHASE B: read row `r`'s global-head fwd output from `out_batched` into the
-    /// row's per-rank `local_attn`. Single-GPU: a straight D2D copy. TP:
-    /// `dsv4_tp_out_slice_cuda` slices this rank's `[tp_rank*local_heads, +)`
-    /// head block — identical to the single-row finish, run once per row.
+    /// Read row `r`'s global-head fwd output into the row's per-rank `local_attn`:
+    /// a D2D copy on single-GPU, this rank's head-block slice under TP.
     pub(crate) fn slice_out_row(
         &self,
         ctx: &DeviceContext,
@@ -1357,13 +1160,8 @@ impl Dsv4FlashMlaDecodeBatchScratch {
         Ok(())
     }
 
-    /// FINISH F1 batched: slice ALL `n` global-head rows of `out_batched` into a
-    /// contiguous token-major `[n, local_width]` `local_attn_batched` in ONE
-    /// launch. The n=1 result is byte-identical to a single `slice_out_row`:
-    /// TP>1 calls the same `dsv4_tp_out_slice_cuda` with `s_q=n` (the kernel
-    /// strides src by global width `h_q*d`, dst by `local_width` per row, slicing
-    /// `[rank*local_width, +local_width]` — verified against the .cu); TP==1 is
-    /// one D2D copy of the whole `[n, d]` block (local_width==global_width).
+    /// Slice all `n` global-head rows of `out_batched` into a contiguous
+    /// token-major `[n, local_width]` `local_attn_batched` in one launch.
     pub(crate) fn slice_out_batched(
         &self,
         ctx: &DeviceContext,
@@ -1394,7 +1192,8 @@ impl Dsv4FlashMlaDecodeBatchScratch {
             let (dst_ptr, dst_guard) = local_attn_batched.data.device_ptr_mut(&ctx.stream);
             {
                 crate::profile::profile_op(ctx, "flashmla_out_slice_batched", None, n, || {
-                    // SAFETY: src is `n` global-head output rows (stride h_q*d_v), dst is
+                    // SAFETY: src is `n` global-head output rows (stride h_q*d_v), dst
+                    // is
                     // n local rows (stride local_width); same per-row args as
                     // `slice_out_row`, with s_q=n so the kernel loops rows internally.
                     unsafe {
@@ -1416,8 +1215,8 @@ impl Dsv4FlashMlaDecodeBatchScratch {
             drop(src_guard);
             drop(dst_guard);
         } else {
-            // TP==1: local_width == global_width == d, so the whole [n, d] block
-            // copies contiguously into local_attn_batched.
+            // TP==1: local_width == global_width, so the whole [n, d] block copies
+            // contiguously.
             ctx.stream
                 .memcpy_dtod(&src_view, &mut local_attn_batched.data)
                 .map_err(|e| anyhow!("DSv4 batched out copy failed: {e}"))?;
@@ -1425,13 +1224,9 @@ impl Dsv4FlashMlaDecodeBatchScratch {
         Ok(())
     }
 
-    /// PHASE B: ONE batched `sparse_decode_fwd(b=n)` for `layer_idx` over the
-    /// shared FlashMLA pool base, reading the `q_batched[0..n]` prefix the
-    /// per-row gather filled and writing global-head output into `out_batched`.
-    /// Sources `pool_ptr` (the whole pool base — indices are pool-absolute),
-    /// `sink_ptr` (the f32 sink base; the kernel computes ALL global heads so it
-    /// needs the global sink, not a per-rank slice), and runs the kernel via
-    /// [`Self::sparse_decode_fwd_batched`]. Precondition: `build_layer_batch_meta(n)`
+    /// Run `layer_idx`'s batched fwd over the `q_batched[0..n]` prefix into
+    /// `out_batched`. The sink is the global f32 base, not a per-rank slice — the
+    /// kernel computes all global heads. Precondition: `build_layer_batch_meta(n)`
     /// ran this forward for `layer_idx`.
     pub(crate) fn decode_lane_fwd(
         &mut self,
@@ -1459,11 +1254,8 @@ impl Dsv4FlashMlaDecodeBatchScratch {
                 .len(),
             shape.h_q
         );
-        // Resolve raw device pointers and release the cudarc borrow guards BEFORE
-        // the `&mut self` fwd call (the SyncOnDrop guards would otherwise alias
-        // `self.q_batched`/`self.out_batched`). The raw u64 ptrs stay valid —
-        // the buffers are not reallocated; same single-stream discipline the
-        // per-row path uses.
+        // Release the cudarc borrow guards before the `&mut self` fwd call, which
+        // they would otherwise alias; the raw ptrs stay valid (no reallocation).
         let (sink_ptr, sink_guard) = attention
             .attn_sink_f32
             .as_ref()
@@ -1543,7 +1335,6 @@ impl Dsv4FusedWqkvDecodeScratch {
         })
     }
 
-    /// Exact requested device bytes owned by this fused-wqkv decode scratch.
     #[allow(dead_code)]
     pub(crate) fn device_bytes(&self) -> usize {
         let i32_sz = std::mem::size_of::<i32>();
@@ -1556,8 +1347,7 @@ impl Dsv4FusedWqkvDecodeScratch {
             + self.active_counts.len() * i32_sz
     }
 
-    /// STATIC predictor of `device_bytes` from config dims — MUST mirror `new`.
-    /// Feeds `Dsv4Model::per_slot_device_bytes`.
+    /// Static predictor of `device_bytes` from config dims — must mirror `new`.
     pub(crate) fn device_bytes_for(config: &DeepSeekV4Config) -> usize {
         let i32_sz = std::mem::size_of::<i32>();
         let f32_sz = std::mem::size_of::<f32>();
@@ -1566,8 +1356,6 @@ impl Dsv4FusedWqkvDecodeScratch {
         let scale_stride_m = 128usize;
         let hidden_dim = config.hidden_size;
         let scale_cols = hidden_dim.div_ceil(128);
-        // input_fp8 (u8, max_m*hidden) + input_scales (f32, scale_stride_m*scale_cols)
-        // + qkv_raw[q_lora_rank+head_dim, 1] (bf16) + active_experts/offsets/counts (1 i32 each).
         max_m * hidden_dim
             + scale_stride_m * scale_cols * f32_sz
             + (config.q_lora_rank + config.head_dim) * bf16
@@ -1613,13 +1401,9 @@ impl Dsv4PrefillDeepGemmLinearScratch {
         config: &DeepSeekV4Config,
         max_seq_len: usize,
     ) -> Result<Self> {
-        // M (query/token) dimension is chunk-bounded: under chunked prefill the
-        // layer forward processes at most `chunked_prefill_size` (<= chunk) query
-        // tokens per call, so the M×K `input_fp8` / `input_scales` / `qkv_raw`
-        // activation scratch is sized by `query_chunk`, not the slot's full
-        // `max_seq_len` context (which would OOM at 900K). K = hidden_size stays
-        // full. A debug assert at each forward call site (`prefill_proj_deepgemm`,
-        // `run_fused_wqkv_prefill`) guards `seq_len <= max_m`.
+        // M is chunk-bounded: sizing the activation scratch by the slot's full
+        // `max_seq_len` instead would OOM at 900K. Call sites debug-assert
+        // `seq_len <= max_m`.
         let query_chunk = DSV4_PREFILL_QUERY_CHUNK.min(max_seq_len.max(1));
         let max_m = query_chunk;
         let max_k = config.hidden_size;
@@ -1700,8 +1484,6 @@ impl Dsv4PrefillDeepGemmLinearScratch {
         })
     }
 
-    /// Exact requested device bytes owned by this ONE model-wide FP8 prefill
-    /// DeepGEMM linear staging scratch.
     #[allow(dead_code)]
     pub(crate) fn device_bytes(&self) -> usize {
         let i32_sz = std::mem::size_of::<i32>();
