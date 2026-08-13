@@ -3799,14 +3799,6 @@ impl Qwen35Model {
         self.param_ids.clone()
     }
 
-    /// RoPE cos/sin caches are read from host memory by `select_cache_rows`, so
-    /// they must keep their host mirror even after being uploaded to the device.
-    /// Callers that clear host data (e.g. `upload_frozen_bf16_from_host`) must
-    /// skip these IDs.
-    pub fn rope_cache_ids(&self) -> [TensorId; 2] {
-        [self.cos_cache, self.sin_cache]
-    }
-
     pub fn lm_head_weight_id(&self) -> TensorId {
         self.lm_head
     }
