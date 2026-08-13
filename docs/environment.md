@@ -48,7 +48,6 @@ workers see them; train flags apply via `train::apply_runtime_flags`):
 | `ARLE_COMM_BACKEND` | `arle serve --comm-backend` (already existed; env transport removed) |
 | `ARLE_DSV4_FLASHMLA_DECODE` | `arle serve --dsv4-flashmla-decode` |
 | `ARLE_DSV4_DSA_INDEXER_SMS` | `arle serve --dsv4-dsa-indexer-sms` |
-| `ARLE_DSV4_MOE_CONTIG_DECODE` | `arle serve --dsv4-moe-contig-decode` (A/B harness: `infer_cuda::set_dsv4_moe_contig_decode`) |
 | `ARLE_DSV4_MTP_ADAPTIVE` / `ARLE_DSV4_MTP_MIN_ACCEPT` | `arle serve --mtp-adaptive` / `--mtp-min-accept` |
 | `ARLE_DSV4_DEEPEP_NUM_SMS` | `arle serve --deepep-num-sms` |
 | `ARLE_DSV4_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK` | `arle serve --deepep-max-dispatch-tokens-per-rank` (SGLANG env still honored when unset) |

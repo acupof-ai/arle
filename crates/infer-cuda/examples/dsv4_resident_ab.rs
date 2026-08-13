@@ -66,7 +66,6 @@ mod real {
         name: &'static str,
         flashmla: bool,
         fused_wqkv: bool,
-        contig_moe: bool,
     }
 
     #[derive(Debug)]
@@ -74,7 +73,6 @@ mod real {
         name: &'static str,
         flashmla: bool,
         fused_wqkv: bool,
-        contig_moe: bool,
         tokens: Vec<u32>,
         prefill_ms: f64,
         decode_ms: f64,
@@ -253,7 +251,6 @@ mod real {
     ) -> Result<VariantResult> {
         set_dsv4_flashmla_decode_override(Some(variant.flashmla));
         set_dsv4_fused_wqkv_decode_override(Some(variant.fused_wqkv));
-        infer_cuda::set_dsv4_moe_contig_decode(variant.contig_moe);
         set_env_var("INFER_DSV4_AB_CURRENT_VARIANT", variant.name);
         reset_dsv4_linear_profile();
         reset_dsv4_stage_profile();
@@ -342,7 +339,6 @@ mod real {
             name: variant.name,
             flashmla: variant.flashmla,
             fused_wqkv: variant.fused_wqkv,
-            contig_moe: variant.contig_moe,
             tokens,
             prefill_ms,
             decode_ms,
@@ -376,7 +372,7 @@ mod real {
             Some(idx) => format!("FAIL@{idx}"),
         };
         println!(
-            "ab_variant={} rep={} flashmla={} fused_wqkv={} contig_moe={} tokens={:?} oracle16={} scalar_ref={} \
+            "ab_variant={} rep={} flashmla={} fused_wqkv={}  tokens={:?} oracle16={} scalar_ref={} \
              load_ms={:.3} prefill_ms={:.3} decode_steps={} decode_ms={:.3} \
              decode_tok_s={:.3} warmup_decode_steps={} timed_decode_steps={} \
              timed_decode_ms={:.3} steady_tok_s={:.3}",
@@ -384,7 +380,6 @@ mod real {
             rep,
             u8::from(result.flashmla),
             u8::from(result.fused_wqkv),
-            u8::from(result.contig_moe),
             result.tokens,
             oracle16_text,
             scalar_ref_text,
@@ -583,45 +578,27 @@ mod real {
                     name: "scalar",
                     flashmla: false,
                     fused_wqkv: false,
-                    contig_moe: false,
                 }),
                 "flashmla" | "flash" => variants.push(Variant {
                     name: "flashmla",
                     flashmla: true,
                     fused_wqkv: false,
-                    contig_moe: false,
                 }),
                 "fused_wqkv" | "fused_linear" | "flashmla_fused" | "flashmla_fused_wqkv" => {
                     variants.push(Variant {
                         name: "flashmla_fused_wqkv",
                         flashmla: true,
                         fused_wqkv: true,
-                        contig_moe: false,
                     })
                 }
-                "contig_moe" | "flashmla_fused_wqkv_contig" | "flashmla_fused_wqkv_contig_moe" => {
-                    variants.push(Variant {
-                        name: "flashmla_fused_wqkv_contig_moe",
-                        flashmla: true,
-                        fused_wqkv: true,
-                        contig_moe: true,
-                    })
-                }
-                "flashmla_contig_moe" => variants.push(Variant {
-                    name: "flashmla_contig_moe",
-                    flashmla: true,
-                    fused_wqkv: false,
-                    contig_moe: true,
-                }),
                 "scalar_fused_wqkv" => variants.push(Variant {
                     name: "scalar_fused_wqkv",
                     flashmla: false,
                     fused_wqkv: true,
-                    contig_moe: false,
                 }),
                 other => bail!(
                     "unsupported INFER_DSV4_AB_VARIANTS item `{other}` \
-                     (expected scalar, flashmla, flashmla_fused_wqkv, flashmla_fused_wqkv_contig_moe)"
+                     (expected scalar, flashmla, flashmla_fused_wqkv, scalar_fused_wqkv)"
                 ),
             }
         }

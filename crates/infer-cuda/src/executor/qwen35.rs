@@ -1,14 +1,6 @@
 use super::*;
 use crate::qwen35::alloc_recurrent_block;
 
-fn qwen35_decode_graph_enabled() -> bool {
-    crate::runtime_flags::qwen35_decode_graph()
-}
-
-fn qwen35_batched_decode_enabled() -> bool {
-    crate::runtime_flags::qwen35_batched_decode()
-}
-
 /// Spec decode writes a whole draft chain past the one token the engine pre-allocated.
 fn grow_host_slot_to(host_kv: &mut dyn KvPool, slot: usize, target: usize) -> Result<()> {
     match target.checked_sub(host_kv.seq_len(slot)) {
@@ -732,7 +724,7 @@ impl Qwen35CudaExecutor {
         let slot_tier = KvTierStore::with_budget(tier_budget_bytes, BLOB_CHUNK_BYTES);
 
         // Single-GPU only: NCCL all-reduce is not graph-capturable on this stack.
-        let decode_graph_armed = qwen35_decode_graph_enabled()
+        let decode_graph_armed = crate::runtime_flags::qwen35_decode_graph()
             && model.tp.is_single()
             && model.decode_graph_unsupported_reason().is_none();
         let model_path_buf = model_path.as_ref().to_path_buf();
@@ -995,7 +987,7 @@ impl Qwen35CudaExecutor {
                 "Qwen3.5 FP8 grouped DeepGEMM warmed {grouped_shapes} GEMM shape(s) at tokens<={grouped_tokens} rows={grouped_min_rows}..{grouped_max_rows}"
             );
         }
-        if !qwen35_decode_graph_enabled() {
+        if !crate::runtime_flags::qwen35_decode_graph() {
             info!(
                 "Qwen3.5 whole-step decode graph disabled \
                  (set --qwen35-decode-graph to enable)"
@@ -2871,7 +2863,9 @@ impl Qwen35CudaExecutor {
         // allocated, so B>1 runs the PAGED batched kernels; recall and TP stay on the
         // serial per-row path.
         if self.full_attn_paged() {
-            if qwen35_batched_decode_enabled() && !self.recall_active() && self.model.tp.is_single()
+            if crate::runtime_flags::qwen35_batched_decode()
+                && !self.recall_active()
+                && self.model.tp.is_single()
             {
                 return self.submit_decode_batch_paged(rows, host_kv);
             }
@@ -2890,7 +2884,7 @@ impl Qwen35CudaExecutor {
         }
 
         // Legacy contiguous build (no paged pool — e.g. an OPD weight offload).
-        if !qwen35_batched_decode_enabled() || self.recall_active() {
+        if !crate::runtime_flags::qwen35_batched_decode() || self.recall_active() {
             let mut tokens = Vec::with_capacity(rows.len());
             for row in rows {
                 let (token, logprob) =

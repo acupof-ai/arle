@@ -96,18 +96,12 @@ pub(crate) const QWEN35_MOE_DECODE_MAX_ROUTES: usize = 256;
 /// contiguous grouped-B caches only when enabled, so flipping it requires a
 /// process restart.
 #[cfg(feature = "cuda")]
-pub(crate) fn qwen35_deepgemm_enabled() -> bool {
-    crate::runtime_flags::qwen35_deepgemm()
-}
 
 /// `--qwen35-moe-decode-kernel` (default on): the decode-band weight-read-bound
 /// grouped kernels; `false` runs the hand batch kernels at every routed-row count
 /// below the DeepGEMM floor. Read per call — inside a captured decode graph the
 /// value read at capture time is what replays.
 #[cfg(feature = "cuda")]
-pub(crate) fn qwen35_moe_decode_kernel_enabled() -> bool {
-    crate::runtime_flags::qwen35_moe_decode_kernel()
-}
 
 /// Allocate an i32 buffer pre-filled with `-1` ON DEVICE (memset 0xFF) — the
 /// "route slot not packed on this rank" sentinel.
@@ -151,7 +145,7 @@ mod gpu {
 
     use super::{
         DEEPGEMM_CONTIG_ALIGN, QWEN35_DEEPGEMM_MIN_ROUTES, QWEN35_MOE_DECODE_MAX_ROUTES,
-        deepgemm_contig_rows_cap, qwen35_deepgemm_enabled, qwen35_moe_decode_kernel_enabled,
+        deepgemm_contig_rows_cap,
     };
     use crate::loader::{ExpertQuantDispatchSignature, MoeLayerWeights};
     use crate::moe_config::ExpertSplit;
@@ -321,10 +315,6 @@ mod gpu {
         }
     }
 
-    fn use_gpu_router() -> bool {
-        crate::runtime_flags::qwen35_gpu_router()
-    }
-
     fn device_route_eligible(cfg: &MoeConfig) -> bool {
         cfg.topk_method == TopkMethod::Greedy && cfg.n_group.is_none() && cfg.topk_group.is_none()
     }
@@ -333,7 +323,9 @@ mod gpu {
     /// device-kernel sequence — the device router (no host sync + D2H) and
     /// `R = top_k` below the DeepGEMM floor, whose JIT is not capture-safe.
     pub(crate) fn qwen35_decode_moe_graph_capturable(cfg: &MoeConfig) -> bool {
-        use_gpu_router() && device_route_eligible(cfg) && cfg.top_k < QWEN35_DEEPGEMM_MIN_ROUTES
+        crate::runtime_flags::qwen35_gpu_router()
+            && device_route_eligible(cfg)
+            && cfg.top_k < QWEN35_DEEPGEMM_MIN_ROUTES
     }
 
     /// Allocate-per-call wrapper around [`moe_forward_into`]; the hot loop passes
@@ -397,7 +389,7 @@ mod gpu {
         // kernels instead of killing the engine.
         let fp8_masked_unsupported = weights.expert_weight_format == WeightFormat::Fp8BlockScaled
             && num_tokens * topk <= DEEPGEMM_MASKED_BAND;
-        let use_deepgemm = qwen35_deepgemm_enabled()
+        let use_deepgemm = crate::runtime_flags::qwen35_deepgemm()
             && has_deepgemm_grouped
             && !fp8_masked_unsupported
             && num_tokens * topk >= crate::runtime_flags::qwen35_deepgemm_min_routes();
@@ -429,71 +421,72 @@ mod gpu {
         gemm_batch(ctx, &weights.router_gate, normed, logits)?;
 
         let total_routes = num_tokens * topk;
-        let (route_indices, route_weights) = if use_gpu_router() && device_route_eligible(cfg) {
-            // `dsv4_route` with routing_kind=1 and an all-zero bias IS greedy
-            // top-k: key = scores + 0.0 exactly (softmax scores are >= +0.0, so
-            // `x + 0.0f == x` bitwise). The `norm_topk_prob` renorm is the
-            // separate launch below. The bias table is a pure function of its
-            // length, so `upload_const` uploads once.
-            let bias_zero_host = vec![bf16::ZERO; num_experts];
-            let bias_zero = scratch
-                .router_bias_zero
-                .upload_const(ctx, &bias_zero_host)?;
-            let bias_zero_ptr = cache_ptr(bias_zero, ctx);
-            let route_indices = scratch.route_indices.get(ctx, total_routes)?;
-            let route_weights = scratch.route_weights.get(ctx, total_routes)?;
-            // SAFETY: logits `[E, T]`, indices/weights `[T*topk]`, bias `[E]`
-            // are live scratch buffers on ctx.stream. Phase 3 of the route
-            // kernel writes EVERY indices/weights slot unconditionally, so
-            // length-matched slot reuse needs no re-init; the renorm kernel
-            // rewrites the same freshly written slots in place.
-            unsafe {
-                moe::dsv4_route(
-                    cache_ptr(&logits.data, ctx),
-                    Some(bias_zero_ptr),
-                    None,
-                    None,
-                    cache_ptr(route_indices, ctx),
-                    cache_ptr(route_weights, ctx),
-                    num_tokens,
-                    num_experts,
-                    topk,
-                    1, // learned-bias selection key; zero bias ⇒ greedy
-                    cfg.scoring_func.scoring_kind(),
-                    cfg.routed_scaling_factor,
-                    ctx.stream.cu_stream(),
-                )?;
-                // Non-softmax scoring already normalizes inside the route kernel.
-                if cfg.norm_topk_prob && cfg.scoring_func == ScoringFunc::Softmax {
-                    moe::qwen36_renorm_topk_weights(
+        let (route_indices, route_weights) =
+            if crate::runtime_flags::qwen35_gpu_router() && device_route_eligible(cfg) {
+                // `dsv4_route` with routing_kind=1 and an all-zero bias IS greedy
+                // top-k: key = scores + 0.0 exactly (softmax scores are >= +0.0, so
+                // `x + 0.0f == x` bitwise). The `norm_topk_prob` renorm is the
+                // separate launch below. The bias table is a pure function of its
+                // length, so `upload_const` uploads once.
+                let bias_zero_host = vec![bf16::ZERO; num_experts];
+                let bias_zero = scratch
+                    .router_bias_zero
+                    .upload_const(ctx, &bias_zero_host)?;
+                let bias_zero_ptr = cache_ptr(bias_zero, ctx);
+                let route_indices = scratch.route_indices.get(ctx, total_routes)?;
+                let route_weights = scratch.route_weights.get(ctx, total_routes)?;
+                // SAFETY: logits `[E, T]`, indices/weights `[T*topk]`, bias `[E]`
+                // are live scratch buffers on ctx.stream. Phase 3 of the route
+                // kernel writes EVERY indices/weights slot unconditionally, so
+                // length-matched slot reuse needs no re-init; the renorm kernel
+                // rewrites the same freshly written slots in place.
+                unsafe {
+                    moe::dsv4_route(
+                        cache_ptr(&logits.data, ctx),
+                        Some(bias_zero_ptr),
+                        None,
+                        None,
+                        cache_ptr(route_indices, ctx),
                         cache_ptr(route_weights, ctx),
                         num_tokens,
+                        num_experts,
                         topk,
+                        1, // learned-bias selection key; zero bias ⇒ greedy
+                        cfg.scoring_func.scoring_kind(),
+                        cfg.routed_scaling_factor,
                         ctx.stream.cu_stream(),
                     )?;
+                    // Non-softmax scoring already normalizes inside the route kernel.
+                    if cfg.norm_topk_prob && cfg.scoring_func == ScoringFunc::Softmax {
+                        moe::qwen36_renorm_topk_weights(
+                            cache_ptr(route_weights, ctx),
+                            num_tokens,
+                            topk,
+                            ctx.stream.cu_stream(),
+                        )?;
+                    }
                 }
-            }
-            (&*route_indices, &*route_weights)
-        } else {
-            // Sync so the router gemm has landed before the D2H read.
-            ctx.sync()?;
-            let logits_bf16: Vec<bf16> = ctx
-                .stream
-                .clone_dtoh(&logits.data)
-                .map_err(|e| anyhow::anyhow!("MoE router logits D2H failed: {e}"))?;
-            let logits_host: Vec<f32> = logits_bf16.iter().map(|&v| v.to_f32()).collect();
-            let decisions = infer_moe::route(&logits_host, &[], cfg)
-                .map_err(|e| anyhow::anyhow!("MoE host route failed: {e}"))?;
-            let (indices_host, weights_host) = super::flatten_routing(&decisions, topk)?;
-            ensure!(
-                indices_host.len() == total_routes && weights_host.len() == total_routes,
-                "flattened routing length mismatch"
-            );
+                (&*route_indices, &*route_weights)
+            } else {
+                // Sync so the router gemm has landed before the D2H read.
+                ctx.sync()?;
+                let logits_bf16: Vec<bf16> = ctx
+                    .stream
+                    .clone_dtoh(&logits.data)
+                    .map_err(|e| anyhow::anyhow!("MoE router logits D2H failed: {e}"))?;
+                let logits_host: Vec<f32> = logits_bf16.iter().map(|&v| v.to_f32()).collect();
+                let decisions = infer_moe::route(&logits_host, &[], cfg)
+                    .map_err(|e| anyhow::anyhow!("MoE host route failed: {e}"))?;
+                let (indices_host, weights_host) = super::flatten_routing(&decisions, topk)?;
+                ensure!(
+                    indices_host.len() == total_routes && weights_host.len() == total_routes,
+                    "flattened routing length mismatch"
+                );
 
-            let route_indices = scratch.route_indices.upload(ctx, &indices_host)?;
-            let route_weights = scratch.route_weights.upload(ctx, &weights_host)?;
-            (route_indices, route_weights)
-        };
+                let route_indices = scratch.route_indices.upload(ctx, &indices_host)?;
+                let route_weights = scratch.route_weights.upload(ctx, &weights_host)?;
+                (route_indices, route_weights)
+            };
 
         // Raw-ptr conversion ends the scratch field borrows so the downstream
         // tails can take `&mut scratch`; the buffers persist in the scratch.
@@ -642,12 +635,12 @@ mod gpu {
             && total_routes <= QWEN35_MOE_DECODE_MAX_ROUTES
             && hidden_dim.is_multiple_of(8)
             && moe_inter.is_multiple_of(8)
-            && qwen35_moe_decode_kernel_enabled();
+            && crate::runtime_flags::qwen35_moe_decode_kernel();
         let fp8_decode_scale_cols = if weights.expert_weight_format == WeightFormat::Fp8BlockScaled
             && total_routes <= QWEN35_MOE_DECODE_MAX_ROUTES
             && hidden_dim.is_multiple_of(16)
             && moe_inter.is_multiple_of(16)
-            && qwen35_moe_decode_kernel_enabled()
+            && crate::runtime_flags::qwen35_moe_decode_kernel()
         {
             let (gate_scale_rows, gate_scale_cols, gate_block_m, gate_block_k) =
                 fp8_signature_shape(weights.gate_up_quant_signature, "gate/up")?;
@@ -2237,10 +2230,6 @@ mod dsv4_gpu {
                 .map_err(|e| anyhow::anyhow!("DSv4 decode i32 -1 memset failed: {e}"))?;
         }
         Ok(())
-    }
-
-    fn use_contiguous_decode_moe() -> bool {
-        crate::runtime_flags::dsv4_moe_contig_decode()
     }
 
     fn dsv4_route_device(

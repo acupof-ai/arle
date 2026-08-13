@@ -898,10 +898,6 @@ pub(crate) struct ServeArgs {
     #[arg(long, default_value_t = 78, value_name = "N")]
     pub(crate) dsv4_dsa_indexer_sms: usize,
 
-    /// DSv4 contiguous-decode MoE path (KILLED as default; A/B lever).
-    #[arg(long, default_value_t = false, action = clap::ArgAction::Set, value_name = "BOOL")]
-    pub(crate) dsv4_moe_contig_decode: bool,
-
     /// DSv4 decode-region prefix reuse: restore a later turn to the exact prior
     /// finish position. Default ON (2026-07-11 pod license: multi-turn
     /// concurrent +25% throughput at c=16, no single-shot regression); pass
@@ -1000,7 +996,6 @@ impl ServeArgs {
             },
             dsv4_flashmla_decode: self.dsv4_flashmla_decode,
             dsv4_dsa_indexer_sms: self.dsv4_dsa_indexer_sms,
-            dsv4_moe_contig_decode: self.dsv4_moe_contig_decode,
             dsv4_decode_reuse: self.dsv4_decode_reuse,
             mtp_adaptive: self.mtp_adaptive,
             mtp_min_accept: self.mtp_min_accept,
