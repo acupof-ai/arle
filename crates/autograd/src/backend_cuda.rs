@@ -125,9 +125,6 @@ fn linear_attention_debug_stage_done(
 }
 
 #[cfg(not(feature = "no-cuda"))]
-fn linear_attention_gdr_chunkwise_prefill_enabled() -> bool {
-    crate::runtime_flags::gdr_chunkwise_prefill()
-}
 
 /// (H, Hg) is an AOT instantiation parameter; under context parallelism each
 /// rank owns H/cp value heads and Hg/cp key heads, so the built set is one
@@ -153,9 +150,6 @@ fn flashqla_gdr_symbols(h: usize, hg: usize) -> Result<&'static ffi::FlashqlaGdr
 /// A/B escape hatch: force the legacy monolithic chunked-scan backward (one
 /// block per batch x value_head) instead of the staged chunk-parallel path.
 #[cfg(not(feature = "no-cuda"))]
-fn linear_attention_mono_backward_forced() -> bool {
-    crate::runtime_flags::la_backward_mono()
-}
 
 /// Max concurrent chunk lanes in the stage-3 grad kernel. Bounds the per-block
 /// history slab at `wave x rows x 64 x state_elems` f32 (1.6 GiB at 48 heads,
@@ -6372,7 +6366,7 @@ fn cuda_linear_attention_forward_device_row(
     let a_len = p.seq_len * p.num_value_heads * 64;
     let state_len = p.num_value_heads * p.key_dim * p.value_dim;
     // The old seq<=32 clamp guarded a WGMMA deadlock in the chunk kernel 778fef873 replaced.
-    let use_chunkwise = linear_attention_gdr_chunkwise_prefill_enabled();
+    let use_chunkwise = crate::runtime_flags::gdr_chunkwise_prefill();
     // FlashQLA recomputes the per-chunk states in the backward, so only the
     // carry (chunk 0) survives on the tape.
     let chunk_state_len = if use_chunkwise {
@@ -7027,7 +7021,7 @@ fn cuda_linear_attention_backward_device_row(
     );
     let staged_bytes = staged_elems.saturating_mul(std::mem::size_of::<f32>());
     let use_mono = args.raw_output.is_none()
-        && (linear_attention_mono_backward_forced()
+        && (crate::runtime_flags::la_backward_mono()
             || staged_bytes > backend.mem_get_info().map_or(0, |(free, _)| free) / 2);
 
     if args.raw_output.is_some() {
@@ -11395,7 +11389,7 @@ fn cuda_causal_sdpa_decode_gqa_cache(
     // The online kernel uses HEAD_DIM threads per block (vs 256 in the legacy),
     // one-pass running-max softmax (vs two-pass with shared-mem scores buffer),
     // and warp-level reductions throughout.
-    let use_online = head_dim == 256 && !force_legacy_decode_attn();
+    let use_online = head_dim == 256 && !crate::runtime_flags::decode_attn_legacy();
     if use_online {
         const BLOCK_ONLINE: u32 = 256; // = HEAD_DIM
         let n_warps = BLOCK_ONLINE / 32;
@@ -11465,10 +11459,6 @@ fn cuda_causal_sdpa_decode_gqa_cache(
 }
 
 #[cfg(not(feature = "no-cuda"))]
-fn force_legacy_decode_attn() -> bool {
-    crate::runtime_flags::decode_attn_legacy()
-}
-
 #[cfg(not(feature = "no-cuda"))]
 #[allow(clippy::too_many_arguments)]
 fn cuda_qwen_decode_prepare_q(

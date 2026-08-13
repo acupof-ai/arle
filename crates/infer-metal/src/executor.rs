@@ -196,7 +196,7 @@ fn sample_inflight(
     params: &infer_plan::SamplingParams,
     position: u64,
 ) -> MetalInflight {
-    if params.is_greedy() || !host_sampling_enabled() {
+    if params.is_greedy() || !crate::runtime_flags::host_sampling() {
         if !params.is_greedy() {
             warn_host_sampling_downgrade();
         }
@@ -236,10 +236,6 @@ fn materialize_inflight_now(inflight: MetalInflight) -> anyhow::Result<StepOutpu
 }
 
 #[cfg(feature = "metal")]
-fn host_sampling_enabled() -> bool {
-    crate::runtime_flags::host_sampling()
-}
-
 #[cfg(feature = "metal")]
 fn warn_host_sampling_downgrade() {
     use std::sync::atomic::{AtomicBool, Ordering};

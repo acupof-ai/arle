@@ -429,10 +429,6 @@ impl Qwen35CudaExecutor {
         Ok(boundary)
     }
 
-    pub(crate) fn kv_slot_tier_enabled(&self) -> bool {
-        true
-    }
-
     pub(crate) fn kv_tier_host_demoted_pages(&self) -> usize {
         self.slot_tier.host_demoted_pages()
     }
