@@ -36,11 +36,7 @@ and `start_pos_device` (filled only when `seq_len==1`).
 
 ```
 forward_tokens_impl (dsv4.rs:1917)
-├─ decode-graph branch (dsv4.rs:1986) seq_len==1 && !deepep && ARLE_DSV4_DECODE_GRAPH
-│ && last_hidden_out.is_none() && probe lens off; MODEL1 only (GLM bails)
-│ → forward_tokens_decode_graph (dsv4.rs:5736)
-└─ eager branch (dsv4.rs:1947)
- → forward_tokens_stream_impl (dsv4.rs:4661) ← prefill (seq_len>1) AND eager decode (seq_len==1)
+└─ forward_tokens_stream_impl ← prefill (seq_len>1) AND decode (seq_len==1)
 
 forward_decode_batch (dsv4.rs:2125) → forward_decode_batch_stream_impl (dsv4.rs:2175)
  → batched decode lane, MODEL1-only, concurrency lever #60 → decode_lane_fwd (dsv4.rs:3275)
@@ -157,23 +153,14 @@ is opt-in:
 - **Comm-overlap**: shared expert runs on `comm_stream` concurrent with the
  routed all-reduce (`dsv4.rs:4989/5140`, pipeline fence).
 
-### 2.2 CUDA-graph decode (`forward_tokens_decode_graph`, `dsv4.rs:5736`)
-Gate: `seq_len==1 && !deepep && ARLE_DSV4_DECODE_GRAPH && last_hidden_out.is_none()
-&& probe lens off`; MODEL1 only (GLM `hc_mult==1` bails, `dsv4.rs:5899`). Capture-safe (all metadata
-derived on-device from `start_pos_device`). Same `try_flashmla_decode_attention`
-core; MoE via `deepgemm_grouped_experts_pooled` (masked, persistent scratch) +
-`dsv4_shared_expert_forward_decode_graph`.
-**B=1 decode-graph is a wash (~−1.5%) on H20 — off by default**:
-execution is GPU-bound, not host-pacer bound.
-
-### 2.3 Batched decode lane (`forward_decode_batch_stream_impl`, MODEL1-only, lever #60)
+### 2.2 Batched decode lane (`forward_decode_batch_stream_impl`, MODEL1-only, lever #60)
 `decode_lane_fwd` (`attention.rs:2510`): `build_indices_batched` (per-row page
 table) → `sched_meta_for_batch` → **one** batched
 `arle_flashmla_sm90_sparse_decode_fwd` over n rows (`attention.rs:2218`). This is
 the **21→76 slot concurrency payoff** executor (commit `5352e247`, TP=4/EP=4,
 max_seq=16384, ~3.62×).
 
-### 2.4 LM-head tail (all lanes)
+### 2.3 LM-head tail (all lanes)
 `forward_stream_last_token` (`dsv4.rs:4285`): last-token wide-stream row → head HC
 fold (MODEL1) / `copy_row_to_vec` (GLM) → final `rms_norm_vec` →
 `lm_head_project` (GEMV, replicated full-vocab per rank) → `sample_cuda_token`
@@ -609,7 +596,6 @@ Priority follows measured TP=4 B=4 wall-clock/kernels.
 | Concern | Symbol | File |
 |---------|--------|------|
 | Forward dispatch | `forward_tokens_impl`, `forward_tokens_stream_impl` | `dsv4.rs` |
-| Decode graph | `forward_tokens_decode_graph` | `dsv4.rs` |
 | Batched decode lane | `forward_decode_batch_stream_impl`, `decode_lane_fwd` | `dsv4.rs`, `attention.rs` |
 | MLA attention | `mla_attention`, `mla_attention_prepare`, `mla_attention_fwd` | `attention.rs` |
 | FlashMLA decode | `try_flashmla_decode_attention`, `sparse_decode_fwd_batched` | `attention.rs` |
