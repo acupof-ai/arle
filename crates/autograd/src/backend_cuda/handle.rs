@@ -448,6 +448,7 @@ impl CudaBackend {
                 },
                 "bf16 bridge D2D",
             )?;
+            drop(_dst_guard);
             self.stream
                 .context()
                 .synchronize()
@@ -461,9 +462,9 @@ impl CudaBackend {
         // ordered after the copy, so the foreign owner may free as soon as this
         // returns. Staging is uninitialized because the copy overwrites every
         // element; `alloc_zeros` would memset on this stream and race the copy.
-        let mut staging = self
-            .stream
-            .alloc::<u16>(len)
+        // SAFETY: `alloc` is unsafe in cudarc; the slice is fully written by the
+        // D2D copy before any read.
+        let mut staging = unsafe { self.stream.alloc::<u16>(len) }
             .map_err(|_| AutogradError::TapeInvariant("cuda alloc failed (bf16 bridge)"))?;
         let (dst_ptr, _dst_guard) = staging.device_ptr_mut(&self.stream);
         // The allocation is stream-ordered on self.stream; the copy runs on
@@ -513,6 +514,7 @@ impl CudaBackend {
         self.stream
             .wait(&event)
             .map_err(|_| AutogradError::TapeInvariant("bf16 bridge stream wait failed"))?;
+        drop(_dst_guard);
         Ok(staging)
     }
 
