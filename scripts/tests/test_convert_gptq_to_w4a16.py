@@ -298,17 +298,6 @@ class GptqToW4A16Conversion(unittest.TestCase):
 
             self.assertFalse(output.exists())
 
-    def test_legacy_wrapper_defaults_output_next_to_input(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            source, _ = write_fixture(root)
-            output = Path(f"{source}-converted")
-            wrapper = SCRIPTS_DIR / "convert_gptq.py"
-            subprocess.run([sys.executable, wrapper, source], check=True, cwd=root)
-
-            self.assertTrue(output.is_dir())
-            self.assertTrue((output / converter.INDEX_NAME).is_file())
-
     def test_failed_second_shard_leaves_no_output_or_staging(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

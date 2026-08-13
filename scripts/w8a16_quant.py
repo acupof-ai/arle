@@ -159,8 +159,7 @@ def _selfcheck() -> None:
     # 2.65% on the same data (uniform INT8 grid vs E4M3 within a group).
     import sys
     sys.path.insert(0, str(Path(__file__).resolve().parent))
-    from fp8_block_cast import per_block_cast_to_fp8
-    from fp8_cast_loss_probe import dequant as fp8_dequant
+    from fp8_block_cast import per_block_cast_to_fp8, dequant as fp8_dequant
 
     torch.manual_seed(0)
     rows, cols = 256, 512

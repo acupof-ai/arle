@@ -30,7 +30,6 @@ directory unless noted.
 | Script | Purpose |
 |---|---|
 | `convert_gptq_to_w4a16.py` | Convert a local GPTQ v1 directory to ARLE W4A16; download first with `hf download REPO --local-dir DIR`. |
-| `convert_gptq.py` | Compatibility wrapper for the legacy `INPUT_DIR --output OUTPUT_DIR` CLI. |
 | `convert_gptq_w4a16_to_w4a8_marlin.py` | Convert W4A16 to hybrid W4A8 Marlin format. |
 | `convert_dspark_speculators.py` | Convert DSpark speculator checkpoints. |
 | `gguf_to_safetensors.py` | Convert GGUF to safetensors format. |
@@ -50,7 +49,6 @@ directory unless noted.
 | `marlin_repack.py` | GPTQ int32 → Marlin tile layout repack. |
 | `verify_gptq_w4a8_repack_quality.py` | Verify W4A8 repack quality vs baseline. |
 | `diag_w4a8_pack_roundtrip.py` | W4A8 pack round-trip diagnostic. |
-| `diag_w4a8_pack_roundtrip_multishape.py` | Multi-shape W4A8 pack round-trip diagnostic. |
 
 ## Correctness Gates
 
@@ -70,11 +68,7 @@ directory unless noted.
 | Script | Purpose |
 |---|---|
 | `dsv4_c_sweep.py` | DSv4 concurrency sweep benchmark. |
-| `dsv4_concurrent_probe.py` | DSv4 concurrent inference probe. |
 | `dsv4_resident_ab.sh` | DSv4 resident-set A/B test. |
-| `dsv4_sparse_adversarial_probe.py` | DSv4 sparse attention adversarial probe. |
-| `dsv4_ttft_probe.py` | DSv4 TTFT measurement probe. |
-| `dsv4_plan_diff.py` | DSv4 plan diff visualization. |
 | `dsv4_beat_sglang_bench.sh` | DSv4 vs SGLang comparison benchmark. |
 | `dsv4_fast_build.sh` | Fast DSv4 CUDA build. |
 | `dsv4_toolchain.sh` | DSv4 native DeepEP/DeepGEMM toolchain validator. |
@@ -191,7 +185,6 @@ GPU gate manually per target and hand `qualify-publish` the aggregated fragments
 | `profile_bench_common.sh` | Shared profiling benchmark functions. |
 | `profile_ncu_bench.sh` | Nsight Compute (ncu) profiling benchmark. |
 | `profile_nsys_bench.sh` | Nsight Systems (nsys) profiling benchmark. |
-| `analyze_nsys_overlap.py` | Analyze nsys trace overlap. |
 
 ## Kernel Dev
 

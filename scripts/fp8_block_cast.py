@@ -51,6 +51,18 @@ def per_block_cast_to_fp8(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     return fp8, sf.view(pm // BLOCK, pn // BLOCK).to(torch.bfloat16).contiguous()
 
 
+def dequant(fp8: torch.Tensor, sf: torch.Tensor) -> torch.Tensor:
+    """Inverse of per_block_cast_to_fp8: pad, multiply by block scale, slice.
+    Mirrors the loader's dequant (w ~= fp8 * sf)."""
+    m, n = fp8.shape
+    pm, pn = ((m + BLOCK - 1) // BLOCK) * BLOCK, ((n + BLOCK - 1) // BLOCK) * BLOCK
+    padded = torch.zeros(pm, pn, dtype=torch.float32)
+    padded[:m, :n] = fp8.float()
+    view = padded.view(pm // BLOCK, BLOCK, pn // BLOCK, BLOCK)
+    deq = (view * sf.float().view(pm // BLOCK, 1, pn // BLOCK, 1)).reshape(pm, pn)
+    return deq[:m, :n]
+
+
 def fp8_weight_names(ref_dir: Path) -> set[str]:
     """Base names ({...}.weight) that the reference FP8 checkpoint stores as
     block-scaled FP8 (i.e. carry a .weight_scale_inv sidecar)."""
