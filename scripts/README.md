@@ -12,7 +12,6 @@ directory unless noted.
 | `bench_compare.py` | Compare two benchmark JSON snapshots with Δ% and threshold. |
 | `bench_direct_http.py` | Direct HTTP streaming decode benchmark (no OpenAI client). |
 | `bench_dsv4_trace_http.py` | DSv4 trace-driven HTTP benchmark. |
-| `bench_kv_cache.py` | KV cache hit-rate and sharing benchmark. |
 | `bench_local_metal.py` | Local Metal backend benchmark. |
 | `bench_local_metal_all.sh` | Run full Metal benchmark grid. |
 | `bench_local_metal_supplement.sh` | Supplemental Metal benchmark shapes. |
@@ -59,12 +58,8 @@ directory unless noted.
 |---|---|
 | `needle_gate.py` | Needle-in-haystack retrieval correctness gate. |
 | `lever_gate.sh` | Multi-step reasoning gate; validates complete summaries and caps candidate misses at the baseline miss count. |
-| `prefix_reuse_gate.py` | Prefix-cache reuse correctness gate. |
 | `longctx_numerical_gate.py` | Long-context numerical quality gate. |
-| `verify_kv_cache.py` | KV cache correctness verification. |
-| `kv_recall_quality_eval.py` | KV-recall quality evaluation (Metal). |
-| `cuda_recall_needle.py` | CUDA recall needle test. |
-| `cuda_kv_capacity_probe.py` | CUDA KV cache capacity probe. |
+| `kv_recall_quality_eval.py` | KV-recall (importance-based block recall) quality evaluation (Metal). |
 | `dsv4_batched_decode_validate.py` | DSv4 batched decode correctness. |
 | `dsv4_variable_shape_dsa_gate.py` | DSv4 variable-shape DSA correctness gate. |
 | `dsv4_multigpu_parity.sh` | DSv4 multi-GPU parity test. |
@@ -76,7 +71,6 @@ directory unless noted.
 |---|---|
 | `dsv4_c_sweep.py` | DSv4 concurrency sweep benchmark. |
 | `dsv4_concurrent_probe.py` | DSv4 concurrent inference probe. |
-| `dsv4_hot_cache_probe.py` | DSv4 hot-cache reuse probe. |
 | `dsv4_resident_ab.sh` | DSv4 resident-set A/B test. |
 | `dsv4_sparse_adversarial_probe.py` | DSv4 sparse attention adversarial probe. |
 | `dsv4_ttft_probe.py` | DSv4 TTFT measurement probe. |
