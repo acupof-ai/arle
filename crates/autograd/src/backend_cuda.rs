@@ -167,7 +167,9 @@ use cudarc::cublas::sys::cublasOperation_t;
 #[cfg(not(feature = "no-cuda"))]
 use cudarc::cublas::{result as cublas_result, sys as cublas_sys};
 #[cfg(not(feature = "no-cuda"))]
-use cudarc::driver::sys::{CUdeviceptr, CUresult, cuMemcpyDtoD_v2};
+use cudarc::driver::sys::{
+    CUdeviceptr, CUresult, CUstream, cuEventRecord, cuMemcpyDtoD_v2, cuMemcpyDtoDAsync_v2,
+};
 #[cfg(not(feature = "no-cuda"))]
 use cudarc::driver::{
     CudaContext, CudaSlice, CudaStream, DevicePtr, DevicePtrMut, DeviceRepr, PinnedHostSlice,
@@ -406,18 +408,19 @@ impl Backend for CudaBackend {
     fn import_bf16_device_ptr_as_f32(
         &self,
         src_device_ptr: u64,
+        src_stream: u64,
         len: usize,
         shape: &[usize],
     ) -> Result<DeviceHandle> {
         #[cfg(feature = "no-cuda")]
         {
-            let _ = (src_device_ptr, len, shape);
+            let _ = (src_device_ptr, src_stream, len, shape);
             todo!("GPU required: cuda bf16 device import is unavailable under feature no-cuda")
         }
 
         #[cfg(not(feature = "no-cuda"))]
         {
-            cuda_import_bf16_device_ptr_as_f32(self, src_device_ptr, len, shape)
+            cuda_import_bf16_device_ptr_as_f32(self, src_device_ptr, src_stream, len, shape)
         }
     }
 
@@ -2652,13 +2655,21 @@ mod tests {
     fn bf16_device_import_roundtrip_preserves_d2d_bytes_and_widens() -> Result<()> {
         let backend = CudaBackend::new(0)?;
         let bf16_bits: Vec<u16> = vec![0x3f80, 0xc020, 0x0000, 0x3e80, 0x7f7f];
-        let src = backend
+        // Source on a second stream of the same context to exercise the
+        // cross-stream event handshake (the production teacher/student shape).
+        let alt_stream = backend
             .stream
+            .context()
+            .new_stream()
+            .map_err(|_| AutogradError::TapeInvariant("new_stream failed (bf16 test)"))?;
+        let src = alt_stream
             .clone_htod(&bf16_bits)
             .map_err(|_| AutogradError::TapeInvariant("cuda htod copy failed (bf16 test)"))?;
-        let (src_ptr, _src_guard) = src.device_ptr(&backend.stream);
+        let (src_ptr, _src_guard) = src.device_ptr(&alt_stream);
+        let src_stream = alt_stream.cu_stream() as u64;
 
-        let staging = backend.copy_bf16_device_ptr_to_local(src_ptr, bf16_bits.len())?;
+        let staging =
+            backend.copy_bf16_device_ptr_to_local(src_ptr, src_stream, bf16_bits.len())?;
         let copied = backend
             .stream
             .clone_dtoh(&staging)
@@ -2669,8 +2680,12 @@ mod tests {
             .map_err(|_| AutogradError::TapeInvariant("cuda synchronize failed (bf16 test)"))?;
         assert_eq!(copied, bf16_bits);
 
-        let handle =
-            backend.import_bf16_device_ptr_as_f32(src_ptr, bf16_bits.len(), &[bf16_bits.len()])?;
+        let handle = backend.import_bf16_device_ptr_as_f32(
+            src_ptr,
+            src_stream,
+            bf16_bits.len(),
+            &[bf16_bits.len()],
+        )?;
         let widened = backend.readback(&handle)?;
         let expected: Vec<f32> = bf16_bits
             .iter()
