@@ -24,13 +24,12 @@ Codex KILL criteria(see `8bb57ea`):
 from __future__ import annotations
 import argparse
 import importlib.util
-import json
-import shutil
 import sys
 from pathlib import Path
 
-import safetensors.torch as st
 import torch
+
+from convert import load_all_tensors, save_checkpoint, copy_config_files
 
 
 def load_pack_w4a8():
@@ -72,75 +71,45 @@ def main():
 
     if not args.src.exists():
         sys.exit(f"src not found: {args.src}")
-    args.dst.mkdir(parents=True, exist_ok=True)
 
     pack_w4a8 = load_pack_w4a8()
-
-    idx_path = args.src / "model.safetensors.index.json"
-    if idx_path.exists():
-        idx = json.loads(idx_path.read_text())
-        weight_map = idx["weight_map"]
-        files = sorted(set(weight_map.values()))
-    else:
-        files = [f.name for f in args.src.glob("*.safetensors")]
-        weight_map = None
+    tensors = load_all_tensors(args.src)
 
     new_state: dict[str, torch.Tensor] = {}
     n_repacked = 0
     n_passthrough = 0
 
-    for fname in files:
-        fpath = args.src / fname
-        with st.safe_open(fpath, framework="pt") as h:
-            keys = list(h.keys())
-            tensors = {k: h.get_tensor(k) for k in keys}
-
-        for k, t in tensors.items():
-            if k.endswith(".qweight"):
-                base = k[:-len(".qweight")]
-                scales_key = f"{base}.scales"
-                if scales_key not in tensors:
-                    print(f"  skip {base}: missing {scales_key}")
-                    continue
-                qweight, s_channel, s_group = repack_w4a16_to_w4a8(
-                    t, tensors[scales_key], args.groupsize, pack_w4a8
-                )
-                new_state[f"{base}.marlin_w4a8_qweight"] = qweight
-                new_state[f"{base}.marlin_w4a8_s_channel"] = s_channel
-                new_state[f"{base}.marlin_w4a8_s_group"] = s_group
-                n_repacked += 1
-                if n_repacked == 1:
-                    print(f"  first re-pack: {base} → qweight={list(qweight.shape)} "
-                          f"s_channel={list(s_channel.shape)} s_group={list(s_group.shape)}")
-            elif k.endswith((".scales", ".marlin_qweight", ".marlin_scales", ".g_idx", ".qzeros")):
-                continue  # consumed or W4A16-only intermediate
-            else:
-                new_state[k] = t
-                n_passthrough += 1
+    for k, t in tensors.items():
+        if k.endswith(".qweight"):
+            base = k[:-len(".qweight")]
+            scales_key = f"{base}.scales"
+            if scales_key not in tensors:
+                print(f"  skip {base}: missing {scales_key}")
+                continue
+            qweight, s_channel, s_group = repack_w4a16_to_w4a8(
+                t, tensors[scales_key], args.groupsize, pack_w4a8
+            )
+            new_state[f"{base}.marlin_w4a8_qweight"] = qweight
+            new_state[f"{base}.marlin_w4a8_s_channel"] = s_channel
+            new_state[f"{base}.marlin_w4a8_s_group"] = s_group
+            n_repacked += 1
+            if n_repacked == 1:
+                print(f"  first re-pack: {base} → qweight={list(qweight.shape)} "
+                      f"s_channel={list(s_channel.shape)} s_group={list(s_group.shape)}")
+        elif k.endswith((".scales", ".marlin_qweight", ".marlin_scales", ".g_idx", ".qzeros")):
+            continue  # consumed or W4A16-only intermediate
+        else:
+            new_state[k] = t
+            n_passthrough += 1
 
     print(f"\n{n_repacked} layers re-packed, {n_passthrough} tensors passthrough")
-    out_path = args.dst / "model.safetensors"
-    st.save_file(new_state, str(out_path))
-    print(f"saved → {out_path}")
 
-    for cfg in ["config.json", "generation_config.json", "tokenizer.json",
-                "tokenizer_config.json", "special_tokens_map.json", "chat_template.jinja",
-                "added_tokens.json", "merges.txt", "vocab.json"]:
-        src_cfg = args.src / cfg
-        if src_cfg.exists():
-            shutil.copy2(src_cfg, args.dst / cfg)
-
-    # Patch config.json to add inline quantization_config that infer's loader
-    # reads to detect the W4A8 path (overrides any GPTQ-source block).
-    cfg_path = args.dst / "config.json"
-    if cfg_path.exists():
-        cfg = json.loads(cfg_path.read_text())
-        cfg["quantization_config"] = {
-            "quant_type": "marlin_w4a8",
-            "group_size": args.groupsize,
-        }
-        cfg_path.write_text(json.dumps(cfg, indent=2))
-        print(f"patched config.json with quant_type=marlin_w4a8")
+    copy_config_files(args.src, args.dst)
+    save_checkpoint(
+        new_state, args.dst,
+        quant_config={"quant_type": "marlin_w4a8", "group_size": args.groupsize},
+    )
+    print(f"patched config.json with quant_type=marlin_w4a8")
 
     # Do NOT write a separate quantize_config.json — loader's
     # load_quant_meta order is GGUF > TurboQuant > GPTQ-via-quantize_config.json

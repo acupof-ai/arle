@@ -12,14 +12,14 @@ Usage:
 
 import argparse
 import json
-import os
-import shutil
 from pathlib import Path
 
 import numpy as np
 import torch
 from safetensors import safe_open
 from safetensors.torch import save_file
+
+from convert import copy_config_files
 
 
 def get_perms():
@@ -136,9 +136,7 @@ def main():
     print(f"Repacking {model_path} → {output_path} (bits={bits}, group_size={group_size})")
 
     # Copy non-weight files
-    for f in model_path.iterdir():
-        if f.suffix in (".json", ".txt", ".model", ".tiktoken"):
-            shutil.copy2(f, output_path / f.name)
+    copy_config_files(model_path, output_path)
 
     # Process safetensor files
     quant_patterns = [
