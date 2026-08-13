@@ -18,7 +18,8 @@ use train::{
     TrainRuntimeFlags, apply_runtime_flags,
     lora::{LoraConfig, LoraTargetSet},
     opd::{
-        WritebackLoss, batched_writeback_ce_step, capture_rollout_logprobs, masked_writeback_step,
+        WritebackLoss, capture_rollout_logprobs, full_batch_ce_writeback_step,
+        masked_writeback_step,
     },
     qwen35::{LayerType, Qwen35Config, Qwen35Model},
 };
@@ -618,7 +619,7 @@ fn rubric_batched_writeback_matches_per_row_masked_writeback() {
     let trainable = trainable_ids(&store, &student);
     let mut optimizer = AdamW::new(1.0e-3, (0.9, 0.999), 1.0e-8, 0.0);
     let vocab = student.config().vocab_size;
-    let batched = batched_writeback_ce_step(
+    let batched = full_batch_ce_writeback_step(
         &student,
         &all_params,
         &trainable,
@@ -658,7 +659,7 @@ fn rubric_batched_writeback_checkpoint_branch_matches_full_tape() {
         let trainable = trainable_ids(&store, &student);
         let mut optimizer = AdamW::new(1.0e-3, (0.9, 0.999), 1.0e-8, 0.0);
         let vocab = student.config().vocab_size;
-        batched_writeback_ce_step(
+        full_batch_ce_writeback_step(
             &student,
             &all_params,
             &trainable,

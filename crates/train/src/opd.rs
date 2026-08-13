@@ -61,8 +61,8 @@ pub use critic::{ValueCritic, skip_obs_gae};
 pub use rollout::student_rollout_only;
 pub use step::{OpdStepInputs, opd_step, opd_step_with_teacher};
 pub use writeback::{
-    WritebackLoss, batched_writeback_ce_step, capture_rollout_logprobs, fmt_hoarded,
-    gkd_writeback_step, masked_writeback_step,
+    WritebackLoss, capture_rollout_logprobs, fmt_hoarded, full_batch_ce_writeback_step,
+    masked_gkd_writeback_step, masked_writeback_step,
 };
 
 /// Routes the OPD rollout through the in-process infer engine (`InferStudent`)
@@ -232,7 +232,7 @@ fn record_profile(
     }
 }
 
-fn opd_step_trace_enabled() -> bool {
+fn step_trace_enabled() -> bool {
     match std::env::var("ARLE_OPD_STEP_TRACE") {
         Ok(value) => !(value == "0" || value.eq_ignore_ascii_case("false")),
         Err(_) => false,
@@ -240,7 +240,7 @@ fn opd_step_trace_enabled() -> bool {
 }
 
 fn log_opd_step_trace(step_started: Instant, event: &str, detail: impl AsRef<str>) {
-    if opd_step_trace_enabled() {
+    if step_trace_enabled() {
         eprintln!(
             "opd_step_trace event={event} elapsed_seconds={:.6} {}",
             step_started.elapsed().as_secs_f64(),
@@ -256,7 +256,7 @@ fn log_opd_window_trace(
     window_started: Instant,
     detail: impl AsRef<str>,
 ) {
-    if opd_step_trace_enabled() {
+    if step_trace_enabled() {
         eprintln!(
             "opd_window_trace kind={kind} event={event} index={index} \
              elapsed_seconds={:.6} {}",

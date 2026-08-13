@@ -29,7 +29,7 @@ use super::{
 };
 
 #[allow(clippy::too_many_arguments)]
-pub(super) fn backward_chunked_kl_rollout<T: TeacherForward + ?Sized>(
+pub(super) fn backward_chunked_kl<T: TeacherForward + ?Sized>(
     student: &Qwen35Model,
     teacher: &T,
     rollout: &[u32],
@@ -370,7 +370,7 @@ fn accumulate_tensor_grad(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn backward_windowed_pure_kl_cached_student_hidden<T: TeacherForward + ?Sized>(
+fn backward_windowed_kl_cached_hidden<T: TeacherForward + ?Sized>(
     student: &Qwen35Model,
     teacher: &T,
     prompt_ids: &[u32],
@@ -722,7 +722,7 @@ fn backward_windowed_pure_kl_cached_student_hidden<T: TeacherForward + ?Sized>(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) fn backward_windowed_gkd_loss<T: TeacherForward + ?Sized>(
+pub(super) fn backward_windowed_gkd<T: TeacherForward + ?Sized>(
     student: &Qwen35Model,
     teacher: &T,
     prompt_ids: &[u32],
@@ -743,7 +743,7 @@ pub(super) fn backward_windowed_gkd_loss<T: TeacherForward + ?Sized>(
     let mut backward_windows = 0usize;
 
     if gkd_config.lambda == 0.0 {
-        return backward_windowed_pure_kl_cached_student_hidden(
+        return backward_windowed_kl_cached_hidden(
             student,
             teacher,
             prompt_ids,

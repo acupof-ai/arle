@@ -1,4 +1,4 @@
-//! The OPD step driver: validation, rollout, route selection, backward, optimizer step.
+//! The OPD step driver: validation, rollout, step-body selection, backward, optimizer step.
 
 use std::{collections::HashSet, time::Instant};
 
@@ -14,11 +14,11 @@ use crate::{
 use super::{
     EngineOffloadMode, GkdLossConfig, OpdError, OpdStepConfig, OpdStepOutcome, OpdStepProfile,
     Result,
-    backward::{backward_chunked_kl_rollout, backward_windowed_gkd_loss},
+    backward::{backward_chunked_kl, backward_windowed_gkd},
     backward_with_optional_profile, log_opd_step_trace,
     loss::{gkd_sft_loss, kl_distill_loss_for_config, mix_gkd_losses},
     map_qwen35_forward_error, map_teacher_forward_error, record_profile,
-    rollout::run_opd_rollout_phase,
+    rollout::rollout_phase,
     validation::{
         validate_gkd_loss_config, validate_loss_value, validate_rollout_shape,
         validate_step_config, validate_student_param_ownership, validate_student_params,
@@ -53,7 +53,7 @@ pub fn opd_step<O: Optimizer>(
 
 /// Holds the `&`/Copy fields common to both GKD backward routes;
 /// `&mut` store/tape/optimizer/profile stay explicit.
-struct GkdRouteCtx<'a, T: TeacherForward + ?Sized> {
+struct GkdStepCtx<'a, T: TeacherForward + ?Sized> {
     student: &'a Qwen35Model,
     teacher: &'a T,
     prompt_ids: &'a [u32],
@@ -71,10 +71,11 @@ struct GkdRouteCtx<'a, T: TeacherForward + ?Sized> {
     infer_rollout: Option<&'a InferRolloutCtx<'a>>,
 }
 
-/// Route B — windowed scoring/backward: the memory path for long rollouts /
-/// large vocabs. `kl_chunk_size` chunks softmax inside each window.
-fn run_windowed_gkd_route<O: Optimizer, T: TeacherForward + ?Sized>(
-    rt: &GkdRouteCtx<'_, T>,
+/// Windowed scoring/backward: the memory path for long rollouts / large
+/// vocabs. `kl_chunk_size` chunks softmax inside each window. User-facing
+/// errors call this "Route B".
+fn windowed_gkd_step<O: Optimizer, T: TeacherForward + ?Sized>(
+    rt: &GkdStepCtx<'_, T>,
     window_size: usize,
     optimizer: &mut O,
     store: &mut TensorStore,
@@ -83,7 +84,7 @@ fn run_windowed_gkd_route<O: Optimizer, T: TeacherForward + ?Sized>(
 ) -> Result<OpdStepOutcome> {
     log_opd_step_trace(
         rt.total_started,
-        "windowed_route_start",
+        "windowed_step_start",
         format!("window_size={window_size}"),
     );
     let phase_started = Instant::now();
@@ -116,7 +117,7 @@ fn run_windowed_gkd_route<O: Optimizer, T: TeacherForward + ?Sized>(
     };
 
     log_opd_step_trace(rt.total_started, "windowed_backward_start", "");
-    let loss_result = backward_windowed_gkd_loss(
+    let loss_result = backward_windowed_gkd(
         rt.student,
         rt.teacher,
         rt.prompt_ids,
@@ -171,8 +172,8 @@ fn run_windowed_gkd_route<O: Optimizer, T: TeacherForward + ?Sized>(
     })
 }
 
-fn run_chunked_kl_route<O: Optimizer, T: TeacherForward + ?Sized>(
-    rt: &GkdRouteCtx<'_, T>,
+fn chunked_kl_step<O: Optimizer, T: TeacherForward + ?Sized>(
+    rt: &GkdStepCtx<'_, T>,
     chunk_size: usize,
     optimizer: &mut O,
     store: &mut TensorStore,
@@ -226,7 +227,7 @@ fn run_chunked_kl_route<O: Optimizer, T: TeacherForward + ?Sized>(
     #[cfg(not(feature = "cuda"))]
     let student_reload_fn: Option<Box<dyn Fn() -> Result<()>>> = None;
 
-    let loss_value = backward_chunked_kl_rollout(
+    let loss_value = backward_chunked_kl(
         rt.student,
         rt.teacher,
         rt.rollout,
@@ -399,7 +400,7 @@ pub fn opd_step_with_teacher<O: Optimizer, T: TeacherForward + ?Sized>(
         #[cfg(not(feature = "cuda"))]
         let engine_offload = EngineOffloadMode::Off;
 
-        let rollout = run_opd_rollout_phase(
+        let rollout = rollout_phase(
             student,
             prompt_ids,
             &cfg,
@@ -416,7 +417,7 @@ pub fn opd_step_with_teacher<O: Optimizer, T: TeacherForward + ?Sized>(
         )?;
 
         let positions: Vec<u32> = (0..rollout.len() as u32).collect();
-        let rt = GkdRouteCtx {
+        let rt = GkdStepCtx {
             student,
             teacher,
             prompt_ids,
@@ -434,12 +435,12 @@ pub fn opd_step_with_teacher<O: Optimizer, T: TeacherForward + ?Sized>(
             infer_rollout: infer_rollout.as_ref(),
         };
         if let Some(window_size) = gkd_config.logits_window_size {
-            return run_windowed_gkd_route(&rt, window_size, optimizer, store, tape, &mut profile);
+            return windowed_gkd_step(&rt, window_size, optimizer, store, tape, &mut profile);
         }
         if let Some(chunk_size) = gkd_config.kl_chunk_size
             && gkd_config.lambda == 0.0
         {
-            return run_chunked_kl_route(&rt, chunk_size, optimizer, store, tape, &mut profile);
+            return chunked_kl_step(&rt, chunk_size, optimizer, store, tape, &mut profile);
         }
 
         // Tape is still disabled by the rollout phase here; teacher params are
