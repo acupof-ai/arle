@@ -138,7 +138,6 @@ pub fn set_dsv4_fused_wqkv_decode_override(enabled: Option<bool>) {
 /// Process-local toggle for the DSv4 contiguous-decode MoE path
 /// (`--dsv4-moe-contig-decode`). Same A/B-harness intent as the overrides above.
 #[cfg(feature = "cuda")]
-
 /// Make the Qwen3.6 MoE loader keep routed experts as per-expert BF16
 /// `DeviceMatrix` (dequantized from FP8 at load) so the OPD rollout student can
 /// re-merge LoRA into experts each step. Call BEFORE loading the student engine;

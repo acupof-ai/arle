@@ -275,7 +275,6 @@ pub(super) fn read_compressor(
         fp32_prev_kv,
         fp32_prev_score,
         fp32_carry_stale,
-        ..Default::default()
     }))
 }
 
@@ -292,7 +291,6 @@ pub(super) fn read_flashmla(
     Ok(Some(crate::attention::Dsv4FlashMlaImage {
         fp8_kv_sw_bootstrapped,
         fp8_kv_comp_packed_rows,
-        ..Default::default()
     }))
 }
 
@@ -309,6 +307,5 @@ pub(super) fn read_dsa(
     Ok(Some(crate::attention::Dsv4DsaImage {
         rotated_keys,
         packed_rows,
-        ..Default::default()
     }))
 }

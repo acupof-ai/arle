@@ -12,14 +12,14 @@ pub(super) enum HcHalf {
 }
 
 impl HcHalf {
-    fn norm<'a>(self, layer: &'a Dsv4Layer) -> &'a DeviceVec {
+    fn norm(self, layer: &Dsv4Layer) -> &DeviceVec {
         match self {
             HcHalf::Attn => &layer.attn_norm,
             HcHalf::Ffn => &layer.ffn_norm,
         }
     }
 
-    fn hc<'a>(self, layer: &'a Dsv4Layer) -> &'a Dsv4HyperConnection {
+    fn hc(self, layer: &Dsv4Layer) -> &Dsv4HyperConnection {
         match self {
             HcHalf::Attn => &layer.hc_attn,
             HcHalf::Ffn => &layer.hc_ffn,

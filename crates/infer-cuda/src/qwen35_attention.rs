@@ -800,7 +800,7 @@ impl Qwen35Model {
                                 let max_kv_len = meta.max_kv_len();
                                 kv_quant::decode_attention_varlen_quantized(
                                     &self.ctx,
-                                    &q_prepped,
+                                    q_prepped,
                                     q_indptr_ptr,
                                     pool.k_data_ptr(full_idx, &self.ctx.stream),
                                     pool.v_data_ptr(full_idx, &self.ctx.stream),

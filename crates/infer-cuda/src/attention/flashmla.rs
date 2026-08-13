@@ -298,7 +298,6 @@ impl Dsv4FlashMlaDecodeState {
         Ok(crate::attention::Dsv4FlashMlaImage {
             fp8_kv_sw_bootstrapped: self.fp8_kv_sw_bootstrapped,
             fp8_kv_comp_packed_rows: self.fp8_kv_comp_packed_rows,
-            ..Default::default()
         })
     }
 

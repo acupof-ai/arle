@@ -1004,9 +1004,8 @@ impl RealCudaExecutor {
     /// has been promoted to dense BF16. Call ONLY after the train student has
     /// re-aliased its frozen base to the BF16 `data` pointer.
     pub(crate) fn free_retired_fp8_buffers(&mut self) {
-        match self {
-            Self::Qwen35(q) => q.free_retired_fp8_buffers(),
-            _ => {}
+        if let Self::Qwen35(q) = self {
+            q.free_retired_fp8_buffers();
         }
     }
 }
