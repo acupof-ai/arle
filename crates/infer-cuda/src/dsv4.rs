@@ -140,6 +140,20 @@ pub(crate) struct Dsv4Attention {
     pub w_vc: Option<DeviceMatrix>,
 }
 
+impl Dsv4Attention {
+    pub(crate) fn wo_a(&self) -> &DeviceMatrix {
+        self.wo_a.as_ref().expect("DSv4 wo_a")
+    }
+
+    pub(crate) fn wo_b(&self) -> &DeviceMatrix {
+        self.wo_b.as_ref().expect("DSv4 wo_b")
+    }
+
+    pub(crate) fn attn_sink(&self) -> &DeviceVec {
+        self.attn_sink.as_ref().expect("DSv4 attn_sink")
+    }
+}
+
 pub(crate) struct Dsv4WoAGroupTables {
     pub weight_ptrs: CudaSlice<u64>,
     pub scale_ptrs: CudaSlice<u64>,

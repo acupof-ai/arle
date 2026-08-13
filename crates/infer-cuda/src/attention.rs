@@ -3472,7 +3472,6 @@ pub(crate) struct Dsv4MlaPrepared {
     pub(crate) local_attn: HiddenStates,
     pub(crate) selected: Option<CudaSlice<i32>>,
     pub(crate) local_heads: usize,
-    token_count: usize,
     pub(crate) sm_scale: f32,
     pub(crate) rope_base: f32,
     pub(crate) original_seq_len: i32,
@@ -3518,7 +3517,7 @@ impl Dsv4MlaDecodeScratch {
             .saturating_add(local_width) // q_prepared
             .saturating_add(config.head_dim) // k_prepared
             .saturating_add(local_width) // local_attn
-            .saturating_add(attention.wo_a.as_ref().expect("DSv4 wo_a").rows); // oproj_latent
+            .saturating_add(attention.wo_a().rows); // oproj_latent
         if mode.has_compressor() {
             let compressor = attention
                 .compressor
@@ -3564,7 +3563,7 @@ impl Dsv4MlaDecodeScratch {
             "DSv4 MODEL1 decode scratch is MODEL1-only; GLM/plain-o attention must use eager decode"
         );
         let local_width = attention.wq_b.rows;
-        let oproj_rows = attention.wo_a.as_ref().expect("DSv4 wo_a").rows;
+        let oproj_rows = attention.wo_a().rows;
         let (compressor_main_kv, compressor_main_score) = if mode.has_compressor() {
             let compressor = attention.compressor.as_ref().ok_or_else(|| {
                 anyhow!("DSv4 MODEL1 decode scratch mode {mode:?} requires compressor weights")
@@ -3898,9 +3897,9 @@ pub(crate) fn mla_attention_decode(
         config.sliding_window * head_dim
     );
     ensure!(
-        attention.attn_sink.as_ref().expect("DSv4 attn_sink").len >= sink_offset + local_heads,
+        attention.attn_sink().len >= sink_offset + local_heads,
         "DSv4 MODEL1 decode MLA attn_sink len {} cannot cover rank {tp_rank} heads [{sink_offset}, {})",
-        attention.attn_sink.as_ref().expect("DSv4 attn_sink").len,
+        attention.attn_sink().len,
         sink_offset + local_heads
     );
 
@@ -4496,9 +4495,9 @@ pub(crate) fn mla_attention_prepare(
         config.sliding_window * head_dim
     );
     ensure!(
-        attention.attn_sink.as_ref().expect("DSv4 attn_sink").len >= sink_offset + local_heads,
+        attention.attn_sink().len >= sink_offset + local_heads,
         "DSv4 MLA attn_sink len {} cannot cover rank {tp_rank} heads [{sink_offset}, {})",
-        attention.attn_sink.as_ref().expect("DSv4 attn_sink").len,
+        attention.attn_sink().len,
         sink_offset + local_heads
     );
 
@@ -4931,7 +4930,6 @@ pub(crate) fn mla_attention_prepare(
         local_attn,
         selected,
         local_heads,
-        token_count,
         sm_scale,
         rope_base,
         original_seq_len,
@@ -5527,7 +5525,6 @@ pub(crate) fn mla_attention_prepare_compressed_only(
         local_attn,
         selected,
         local_heads,
-        token_count: 1,
         sm_scale: proj.sm_scale,
         rope_base: proj.rope_base,
         original_seq_len,
@@ -5567,20 +5564,19 @@ fn mla_attention_fwd(
         mut local_attn,
         selected,
         local_heads,
-        token_count,
         sm_scale,
         rope_base,
         original_seq_len,
     } = prepared;
+    let token_count = q_prepared.seq_len;
     let rope = &config.rope_parameters;
     ensure!(
-        attention.wo_b.as_ref().expect("DSv4 wo_b").rows == out.hidden_dim
-            && out.seq_len == token_count,
+        attention.wo_b().rows == out.hidden_dim && out.seq_len == token_count,
         "DSv4 MLA output shape mismatch: wo_b rows {} out {}x{} expected {}x{}",
-        attention.wo_b.as_ref().expect("DSv4 wo_b").rows,
+        attention.wo_b().rows,
         out.hidden_dim,
         out.seq_len,
-        attention.wo_b.as_ref().expect("DSv4 wo_b").rows,
+        attention.wo_b().rows,
         token_count
     );
     keepalive.keep_hidden(&q_prepared);
@@ -5765,11 +5761,11 @@ fn dsv4_wo_a_grouped_linear(
     // path, so route through a per-group dense BF16 GEMM: gather group `g`'s column
     // slice out of the token-major activation, `gemm_cuda` with group `g`'s weight
     // block, then scatter the result back into the latent.
-    if attention.wo_a.as_ref().expect("DSv4 wo_a").weight_format == WeightFormat::DenseBf16 {
+    if attention.wo_a().weight_format == WeightFormat::DenseBf16 {
         let seq = local_attn.seq_len;
         let cols = shape.cols_per_group;
         let rows = shape.rows_per_group;
-        let wo_a = attention.wo_a.as_ref().expect("DSv4 wo_a");
+        let wo_a = attention.wo_a();
         // SAFETY: uninit device scratch; fully written before first read.
         let mut in_g = unsafe { HiddenStates::uninit(ctx, cols, seq)? };
         // SAFETY: uninit device scratch; fully written before first read.
@@ -5868,7 +5864,7 @@ fn dsv4_wo_a_grouped_linear(
     // which is exactly the `HiddenStates` token-major layout when each group is
     // `cols_per_group` wide.
     unsafe {
-        match attention.wo_a.as_ref().expect("DSv4 wo_a").weight_format {
+        match attention.wo_a().weight_format {
             WeightFormat::Dsv4Fp8BlockScaled => ffi::dsv4_fp8_route_gemv_batch_cuda(
                 weight_ptrs as *const u64,
                 scale_ptrs as *const u64,
@@ -6166,8 +6162,8 @@ pub(crate) fn mla_oproj(
         return Ok(());
     }
     let shape = dsv4_oproj_group_shape(
-        attention.wo_a.as_ref().expect("DSv4 wo_a").rows,
-        attention.wo_a.as_ref().expect("DSv4 wo_a").cols,
+        attention.wo_a().rows,
+        attention.wo_a().cols,
         attention
             .wo_a_groups
             .as_ref()
@@ -6187,13 +6183,7 @@ pub(crate) fn mla_oproj(
         token_count,
     )?;
     // SAFETY: uninit device scratch; fully written before first read.
-    let mut latent = unsafe {
-        HiddenStates::uninit(
-            ctx,
-            attention.wo_a.as_ref().expect("DSv4 wo_a").rows,
-            token_count,
-        )?
-    };
+    let mut latent = unsafe { HiddenStates::uninit(ctx, attention.wo_a().rows, token_count)? };
     // Captured before any branch consumes `prefill_shared` (the wo_b prefill lane
     // moves it); drives the batched-O-LoRA active_counts restore at the end.
     let is_decode = prefill_shared.is_none();
@@ -6228,7 +6218,7 @@ pub(crate) fn mla_oproj(
             .wo_a_deepgemm
             .as_ref()
             .expect("wo_dg gate checked");
-        let wo_a_cols = attention.wo_a.as_ref().expect("DSv4 wo_a").cols;
+        let wo_a_cols = attention.wo_a().cols;
         crate::profile::profile_op(ctx, "linear/wo_a", None, token_count, || {
             crate::linear_profile::profile(ctx, "dsv4/linear/wo_a", || {
                 decode_proj_deepgemm(ctx, scratch, wo_a_cache, local_attn, &mut latent, wo_a_cols)
@@ -6292,12 +6282,7 @@ pub(crate) fn mla_oproj(
     } else if shape.groups == 1 {
         crate::profile::profile_op(ctx, "linear/wo_a", None, token_count, || {
             crate::linear_profile::profile(ctx, "dsv4/linear/wo_a", || {
-                dsv4_linear(
-                    ctx,
-                    attention.wo_a.as_ref().expect("DSv4 wo_a"),
-                    local_attn,
-                    &mut latent,
-                )
+                dsv4_linear(ctx, attention.wo_a(), local_attn, &mut latent)
             })
         })?;
     } else {
@@ -6325,7 +6310,7 @@ pub(crate) fn mla_oproj(
             .wo_b_deepgemm
             .as_ref()
             .expect("wo_b dg gate checked");
-        let wo_b_cols = attention.wo_b.as_ref().expect("DSv4 wo_b").cols;
+        let wo_b_cols = attention.wo_b().cols;
         crate::profile::profile_op(ctx, "linear/wo_b", None, token_count, || {
             crate::linear_profile::profile(ctx, "dsv4/linear/wo_b", || {
                 decode_proj_deepgemm(ctx, scratch, wo_b_cache, &latent, out, wo_b_cols)
@@ -6345,12 +6330,7 @@ pub(crate) fn mla_oproj(
     } else {
         crate::profile::profile_op(ctx, "linear/wo_b", None, token_count, || {
             crate::linear_profile::profile(ctx, "dsv4/linear/wo_b", || {
-                dsv4_linear(
-                    ctx,
-                    attention.wo_b.as_ref().expect("DSv4 wo_b"),
-                    &latent,
-                    out,
-                )
+                dsv4_linear(ctx, attention.wo_b(), &latent, out)
             })
         })?;
     }
@@ -6382,8 +6362,8 @@ fn mla_oproj_decode(
     );
     let token_count = 1usize;
     let shape = dsv4_oproj_group_shape(
-        attention.wo_a.as_ref().expect("DSv4 wo_a").rows,
-        attention.wo_a.as_ref().expect("DSv4 wo_a").cols,
+        attention.wo_a().rows,
+        attention.wo_a().cols,
         attention
             .wo_a_groups
             .as_ref()
@@ -6403,12 +6383,11 @@ fn mla_oproj_decode(
         token_count,
     )?;
     ensure!(
-        latent.hidden_dim == attention.wo_a.as_ref().expect("DSv4 wo_a").rows
-            && latent.seq_len == token_count,
+        latent.hidden_dim == attention.wo_a().rows && latent.seq_len == token_count,
         "DSv4 MODEL1 decode O-LoRA latent scratch {}x{} != {}x1",
         latent.hidden_dim,
         latent.seq_len,
-        attention.wo_a.as_ref().expect("DSv4 wo_a").rows
+        attention.wo_a().rows
     );
     let wo_a_decode_dg = shape.groups == 1
         && dsv4_deepgemm_enabled()
@@ -6423,7 +6402,7 @@ fn mla_oproj_decode(
             .wo_a_deepgemm
             .as_ref()
             .expect("wo_dg gate checked");
-        let wo_a_cols = attention.wo_a.as_ref().expect("DSv4 wo_a").cols;
+        let wo_a_cols = attention.wo_a().cols;
         let scratch = state.fused_wqkv.as_mut().expect("wo_dg gate checked");
         crate::profile::profile_op(ctx, "linear/wo_a", None, 1, || {
             crate::linear_profile::profile(ctx, "dsv4/linear/wo_a", || {
@@ -6454,12 +6433,7 @@ fn mla_oproj_decode(
     } else if shape.groups == 1 {
         crate::profile::profile_op(ctx, "linear/wo_a", None, 1, || {
             crate::linear_profile::profile(ctx, "dsv4/linear/wo_a", || {
-                dsv4_linear(
-                    ctx,
-                    attention.wo_a.as_ref().expect("DSv4 wo_a"),
-                    local_attn,
-                    latent,
-                )
+                dsv4_linear(ctx, attention.wo_a(), local_attn, latent)
             })
         })?;
     } else {
@@ -6477,7 +6451,7 @@ fn mla_oproj_decode(
             .wo_b_deepgemm
             .as_ref()
             .expect("wo_b dg gate checked");
-        let wo_b_cols = attention.wo_b.as_ref().expect("DSv4 wo_b").cols;
+        let wo_b_cols = attention.wo_b().cols;
         let scratch = state.fused_wqkv.as_mut().expect("wo_b dg gate checked");
         crate::profile::profile_op(ctx, "linear/wo_b", None, 1, || {
             crate::linear_profile::profile(ctx, "dsv4/linear/wo_b", || {
@@ -6487,12 +6461,7 @@ fn mla_oproj_decode(
     } else {
         crate::profile::profile_op(ctx, "linear/wo_b", None, 1, || {
             crate::linear_profile::profile(ctx, "dsv4/linear/wo_b", || {
-                dsv4_linear(
-                    ctx,
-                    attention.wo_b.as_ref().expect("DSv4 wo_b"),
-                    latent,
-                    out,
-                )
+                dsv4_linear(ctx, attention.wo_b(), latent, out)
             })
         })?;
     }
