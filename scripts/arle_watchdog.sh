@@ -19,6 +19,7 @@ LOG="/tmp/arle_serve.log"
 WATCH_LOG="/tmp/arle_watchdog.log"
 MAX_RESTARTS="${ARLE_MAX_RESTARTS:-10}"
 RESTART_WINDOW="${ARLE_RESTART_WINDOW:-300}"
+STARTUP_GRACE="${ARLE_STARTUP_GRACE:-300}"  # seconds before health checks begin
 HEALTH_URL="http://127.0.0.1:${PORT}/health"
 
 restart_count=0
@@ -39,6 +40,7 @@ start_serve() {
         ${ARLE_EXTRA_ARGS:-} \
         >> "$LOG" 2>&1 &
     SERVE_PID=$!
+    SERVE_START=$(date +%s)
     log "serve pid=$SERVE_PID"
 }
 
@@ -65,7 +67,9 @@ while true; do
         wait "$SERVE_PID" 2>/dev/null || true
         exit_code=$?
         log "serve exited (code=$exit_code)"
-    # Check engine responsive (process alive but engine dead/stuck)
+    # Health check only after startup grace (model load takes ~60-90s)
+    elif [ $((now - SERVE_START)) -lt "$STARTUP_GRACE" ]; then
+        continue
     elif ! curl -sf --max-time 5 "$HEALTH_URL" | grep -q '"healthy"' 2>/dev/null; then
         log "health check failed, killing serve"
         kill_serve
