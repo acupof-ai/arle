@@ -1047,8 +1047,8 @@ impl SafetensorLoader {
                 ),
                 shard_meta_cache: std::cell::RefCell::new(HashMap::new()),
             };
-            loader.log_startup_phase(
-                "new.index",
+            crate::executor::cuda_startup_log(
+                "loader.new.index",
                 t0,
                 format_args!(
                     "shards={} weight_map={} quant_manifest={}",
@@ -1073,8 +1073,8 @@ impl SafetensorLoader {
                 ),
                 shard_meta_cache: std::cell::RefCell::new(HashMap::new()),
             };
-            loader.log_startup_phase(
-                "new.single",
+            crate::executor::cuda_startup_log(
+                "loader.new.single",
                 t0,
                 format_args!(
                     "shards=1 quant_manifest={}",
@@ -1104,8 +1104,8 @@ impl SafetensorLoader {
             shard_cache: std::cell::RefCell::new(ShardByteCache::new(shard_cache_bytes_limit())),
             shard_meta_cache: std::cell::RefCell::new(HashMap::new()),
         };
-        loader.log_startup_phase(
-            "new.scan",
+        crate::executor::cuda_startup_log(
+            "loader.new.scan",
             t0,
             format_args!(
                 "shards={} quant_manifest={}",
@@ -1114,20 +1114,6 @@ impl SafetensorLoader {
             ),
         );
         Ok(loader)
-    }
-
-    fn startup_profile_enabled(&self) -> bool {
-        std::env::var_os("ARLE_CUDA_STARTUP_PROFILE").is_some()
-    }
-
-    fn log_startup_phase(&self, phase: &str, start: Instant, extra: std::fmt::Arguments<'_>) {
-        if self.startup_profile_enabled() {
-            log::info!(
-                target: "infer_cuda::startup",
-                "cuda_startup phase=loader.{phase} elapsed_ms={:.1} {extra}",
-                start.elapsed().as_secs_f64() * 1000.0
-            );
-        }
     }
 
     pub(crate) fn load_vec(&self, ctx: &DeviceContext, name: &str) -> Result<DeviceVec> {
@@ -1858,8 +1844,8 @@ impl SafetensorLoader {
                     .with_context(|| format!("upload expert {e} down slice of {down_name}"))?,
                 );
             }
-            self.log_startup_phase(
-                "moe.stacked_routed_load",
+            crate::executor::cuda_startup_log(
+                "loader.moe.stacked_routed_load",
                 routed_t0,
                 format_args!(
                     "layer={} local_experts={} gate={} up={} down={}",
@@ -1890,8 +1876,8 @@ impl SafetensorLoader {
                 }
             );
         }
-        self.log_startup_phase(
-            "moe.routed_load",
+        crate::executor::cuda_startup_log(
+            "loader.moe.routed_load",
             layer_t0,
             format_args!(
                 "layer={} local_experts={} gate={} up={} down={} direct_fp8_grouped={}",
@@ -1934,8 +1920,8 @@ impl SafetensorLoader {
             )
         };
         let shared_gate_router = self.load_matrix(ctx, &names.shared_expert_gate)?;
-        self.log_startup_phase(
-            "moe.shared_load",
+        crate::executor::cuda_startup_log(
+            "loader.moe.shared_load",
             shared_t0,
             format_args!("layer={}", names.mlp_prefix),
         );
@@ -2044,8 +2030,8 @@ impl SafetensorLoader {
             up.clear();
             down.clear();
         }
-        self.log_startup_phase(
-            "moe.grouped_cache",
+        crate::executor::cuda_startup_log(
+            "loader.moe.grouped_cache",
             grouped_t0,
             format_args!(
                 "layer={} format={expert_weight_format:?} fp8_deepgemm_ready={} routed_quant={} retained_gate={} retained_up={} retained_down={}",
@@ -2248,8 +2234,8 @@ impl SafetensorLoader {
             moe_intermediate_size,
             transpose_sfb,
         )?;
-        self.log_startup_phase(
-            "moe.direct_fp8_grouped_load",
+        crate::executor::cuda_startup_log(
+            "loader.moe.direct_fp8_grouped_load",
             t0,
             format_args!(
                 "layer={} shard_idx={} local_experts={} w13_bytes={} down_bytes={}",
@@ -2427,8 +2413,8 @@ impl SafetensorLoader {
             let shard_headers = self.read_shard_headers(idx)?;
             let tensor_count = shard_headers.len();
             let header_bytes = self.safetensors_header_len(idx)?;
-            self.log_startup_phase(
-                "tensor_headers.shard",
+            crate::executor::cuda_startup_log(
+                "loader.tensor_headers.shard",
                 shard_t0,
                 format_args!(
                     "idx={idx} header_bytes={} tensors={} path={}",
@@ -2441,8 +2427,8 @@ impl SafetensorLoader {
         }
         let headers = Rc::new(headers);
         *self.tensor_headers.borrow_mut() = Some(Rc::clone(&headers));
-        self.log_startup_phase(
-            "tensor_headers.total",
+        crate::executor::cuda_startup_log(
+            "loader.tensor_headers.total",
             t0,
             format_args!(
                 "shards={} tensors={} cached_shards={}",
@@ -3367,14 +3353,14 @@ impl SafetensorLoader {
         let evicted = cache.insert(idx, Rc::clone(&bytes));
         drop(cache);
         for (evicted_idx, evicted_bytes) in evicted {
-            self.log_startup_phase(
-                "shard_cache_evict",
+            crate::executor::cuda_startup_log(
+                "loader.shard_cache_evict",
                 Instant::now(),
                 format_args!("idx={evicted_idx} bytes={evicted_bytes}"),
             );
         }
-        self.log_startup_phase(
-            "shard_mmap",
+        crate::executor::cuda_startup_log(
+            "loader.shard_mmap",
             t0,
             format_args!("idx={idx} bytes={} path={}", bytes.len(), path.display()),
         );
@@ -3419,8 +3405,8 @@ impl SafetensorLoader {
         self.shard_meta_cache
             .borrow_mut()
             .insert(idx, Rc::clone(&metas));
-        self.log_startup_phase(
-            "shard_deserialize",
+        crate::executor::cuda_startup_log(
+            "loader.shard_deserialize",
             t0,
             format_args!(
                 "idx={idx} tensors={} bytes={} path={}",
@@ -3442,8 +3428,8 @@ impl SafetensorLoader {
             bytes: tensor.bytes().to_vec(),
             dtype: tensor.dtype,
         };
-        self.log_startup_phase(
-            "tensor.owned_copy",
+        crate::executor::cuda_startup_log(
+            "loader.tensor.owned_copy",
             t0,
             format_args!(
                 "name={name} idx={idx} bytes={} dtype={:?} shape={:?}",

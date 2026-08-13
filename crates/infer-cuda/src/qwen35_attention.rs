@@ -35,57 +35,6 @@ pub(crate) struct LinearAttn {
     pub(crate) out_proj: DeviceMatrix,
 }
 
-fn format_fq_parity_metrics(reference: &[f64], actual: &[f64], rel_floor: f64) -> String {
-    assert_eq!(reference.len(), actual.len());
-    let mut abs_errors = Vec::with_capacity(reference.len());
-    let mut squared_error = 0.0;
-    let mut max_rel = 0.0f64;
-    let mut dot = 0.0;
-    let mut reference_norm = 0.0;
-    let mut actual_norm = 0.0;
-    let mut non_finite_mismatch = 0;
-    for (&reference, &actual) in reference.iter().zip(actual) {
-        if !reference.is_finite() || !actual.is_finite() {
-            non_finite_mismatch += usize::from(reference.to_bits() != actual.to_bits());
-            continue;
-        }
-        let abs = (reference - actual).abs();
-        abs_errors.push(abs);
-        squared_error += abs * abs;
-        max_rel = max_rel.max(abs / reference.abs().max(rel_floor));
-        dot += reference * actual;
-        reference_norm += reference * reference;
-        actual_norm += actual * actual;
-    }
-    abs_errors.sort_unstable_by(f64::total_cmp);
-    let max_abs = abs_errors.last().copied().unwrap_or(0.0);
-    let p99_index = (99 * abs_errors.len()).div_ceil(100).saturating_sub(1);
-    let p99_abs = abs_errors.get(p99_index).copied().unwrap_or(0.0);
-    let rmse = (squared_error / abs_errors.len().max(1) as f64).sqrt();
-    let rel_l2 = (squared_error / reference_norm.max(1e-30)).sqrt();
-    let cosine = if reference_norm == 0.0 && actual_norm == 0.0 {
-        1.0
-    } else if reference_norm == 0.0 || actual_norm == 0.0 {
-        0.0
-    } else {
-        dot / (reference_norm * actual_norm).sqrt()
-    };
-    format!(
-        "max_abs={max_abs:.9e} p99_abs={p99_abs:.9e} rmse={rmse:.9e} \
-         max_rel={max_rel:.9e} rel_floor={rel_floor:.1e} rel_l2={rel_l2:.9e} \
-         cosine={cosine:.9} non_finite_mismatch={non_finite_mismatch}"
-    )
-}
-
-#[cfg(test)]
-#[test]
-fn fq_parity_metrics_reports_distribution_and_non_finite_mismatch() {
-    let report = format_fq_parity_metrics(&[0.0, 1.0, f64::INFINITY], &[0.0, 1.5, 0.0], 1e-6);
-    assert!(report.contains("max_abs=5.000000000e-1"));
-    assert!(report.contains("rmse=3.535533906e-1"));
-    assert!(report.contains("non_finite_mismatch=1"));
-}
-
 impl Qwen35Model {
     pub(crate) fn full_attention(
         &self,
@@ -693,12 +642,7 @@ impl Qwen35Model {
                         // through to Path A (the FA3 quant shim's per-call
                         // bf16 temp), then the varlen quantized kernel below.
                         if (meta.seq_len <= FA3_MAX_QLEN || meta.batch == 1) && c.head_dim == 256 {
-                            if decode
-                                && matches!(
-                                    pool.format,
-                                    KVFormat::FP8E4M3 | KVFormat::INT8
-                                )
-                            {
+                            if decode && matches!(pool.format, KVFormat::FP8E4M3 | KVFormat::INT8) {
                                 // Same split derivation as the FA3 lane, capped
                                 // at 16: the pool's split-KV workspace is sized
                                 // for 16 splits at the Qwen3.6 GQA ratio (8).
@@ -779,7 +723,7 @@ impl Qwen35Model {
                                 // and it bound the scheduler only at batch 1, where
                                 // 4×8 = 32 tiles left 46 of 78 SMs idle.
                                 let splits = if meta.seq_len <= FA3_MAX_QLEN {
-                                    match qwen35_fa3_decode_splits() {
+                                    match crate::runtime_flags::qwen35_fa3_decode_splits() {
                                         0 => self
                                             .ctx
                                             .sm_count()
@@ -1574,7 +1518,7 @@ impl Qwen35Model {
                 _ => None,
             };
         let use_fq_chunked = seq_len > 1
-            && qwen35_gdr_chunked_enabled()
+            && crate::runtime_flags::qwen35_gdr_chunked()
             && c.linear_key_head_dim == 128
             && c.linear_value_head_dim == 128
             && fq_fns.is_some()
@@ -1590,14 +1534,6 @@ impl Qwen35Model {
                 .bind_to_thread()
                 .map_err(|e| anyhow!("bind CUDA context for chunked GDR failed: {e}"))?;
             let (fq_cumsum, fq_kkt, fq_fwd) = fq_fns.unwrap();
-            let fq_parity = std::env::var_os("ARLE_FQ_PARITY").is_some();
-            let mut fq_par_snap: Option<cudarc::driver::CudaSlice<f32>> = None;
-            if fq_parity {
-                let st = &slot.gdr_states[linear_idx];
-                let mut snap = self.ctx.stream.alloc_zeros::<f32>(st.len())?;
-                self.ctx.stream.memcpy_dtod(st, &mut snap)?;
-                fq_par_snap = Some(snap);
-            }
             let hg_dim = self.local_linear_k_heads * c.linear_key_head_dim;
             let fq_q = fq_q.get(&self.ctx, hg_dim, seq_len)?;
             let fq_k = fq_k.get(&self.ctx, hg_dim, seq_len)?;
@@ -1687,58 +1623,6 @@ impl Qwen35Model {
                     Ok(())
                 },
             )?;
-            if let Some(mut snap) = fq_par_snap {
-                drop(_g12);
-                drop(_g13);
-                let o_ref = DeviceVec::zeros(&self.ctx, seq_len * z_dim)?;
-                {
-                    let (qkv_ptr, _g0) = qkv_conv.device_ptr(&self.ctx.stream);
-                    let (b_ptr, _g1) = b_in.device_ptr(&self.ctx.stream);
-                    let (a_ptr, _g2) = a_in.device_ptr(&self.ctx.stream);
-                    let (dt_ptr, _g3) = attn.dt_bias.data.device_ptr(&self.ctx.stream);
-                    let (alog_ptr, _g4) = attn.a_log.device_ptr(&self.ctx.stream);
-                    let (s_ptr, _g5) = snap.device_ptr_mut(&self.ctx.stream);
-                    let (o_ptr, _g6) = o_ref.data.device_ptr(&self.ctx.stream);
-                    // SAFETY: same buffers/dims as the fq calls above.
-                    unsafe {
-                        ffi::gated_delta_rule_prefill_recurrent_cuda(
-                            qkv_ptr as *const ffi::Half,
-                            b_ptr as *const ffi::Half,
-                            a_ptr as *const ffi::Half,
-                            dt_ptr as *const ffi::Half,
-                            alog_ptr as *const f32,
-                            s_ptr as *mut f32,
-                            o_ptr as *mut ffi::Half,
-                            self.local_linear_k_heads as i32,
-                            self.local_linear_v_heads as i32,
-                            c.linear_key_head_dim as i32,
-                            c.linear_value_head_dim as i32,
-                            seq_len as i32,
-                            self.ctx.stream.cu_stream(),
-                        )
-                        .result()?;
-                    }
-                }
-                let a = self.ctx.stream.clone_dtoh(&*gdr_state)?;
-                let b = self.ctx.stream.clone_dtoh(&snap)?;
-                let oc = self.ctx.stream.clone_dtoh(&*gdr_out)?;
-                let orf = self.ctx.stream.clone_dtoh(&o_ref.data)?;
-                let state_actual = a.iter().map(|value| f64::from(*value)).collect::<Vec<_>>();
-                let state_reference = b.iter().map(|value| f64::from(*value)).collect::<Vec<_>>();
-                let output_actual = oc
-                    .iter()
-                    .map(|value| f64::from(value.to_f32()))
-                    .collect::<Vec<_>>();
-                let output_reference = orf
-                    .iter()
-                    .map(|value| f64::from(value.to_f32()))
-                    .collect::<Vec<_>>();
-                eprintln!(
-                    "[fq-parity] layer={linear_idx} seq={seq_len} state_{} output_{}",
-                    format_fq_parity_metrics(&state_reference, &state_actual, 1e-9),
-                    format_fq_parity_metrics(&output_reference, &output_actual, 1e-6),
-                );
-            }
         }
         if !use_fq_chunked {
             let gdr_state = &mut slot.gdr_states[linear_idx];
