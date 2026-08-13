@@ -19,6 +19,8 @@ Related governance docs:
 
 ## [Unreleased]
 
+- **FIX (accept) — w2s no longer round-trips the FP8 base through host** (2026-08-13; `62017ec8a`, `bc96d29ec`, `f77ca2eb5`, [errors](docs/experience/errors/2026-08-13-w2s-fp8-base-offload-roundtrip-was-lossy.md)). Offloading the 27B `CudaFp8BlockScaled` base dequantized it to f32 host and re-uploaded it as bf16, doubling 27.9 GB to 54 GB (OOM on a 95.2 GB H20) and leaving π_base for the global KL no longer equal to the checkpoint. The mechanism existed for a "27B aux" that is actually 0.8B, so it is deleted along with `upload_frozen_bf16_from_host` and `rope_cache_ids` (net -271 lines). Base stays FP8-resident: 27.9 GB after base+student, 33.5 GB after four 0.8B aux, 61.7 GB free. Added the missing flashqla AOT GDN geometry H=16/Hg=16 for the 0.8B aux forward. `--steps 2` reaches `RUN_EXIT=0` with step 0 loss=25.158342, consistency=0.7372.
+
 - **FIX (accept) — prefix-cache metrics report actual restored work** (2026-08-13; `c112b81de`, [bench](docs/experience/wins/2026-08-13-kv-prefix-metrics-and-oversubscription-slice.md)). Raw and backend-licensed radix matches are counted at lookup; hits, tokens, pages, and resident reuse are counted from the restored token boundary. A Qwen3.6 8191-token common prefix with no sidecar now reports zero hit and one fallback, while the 8192 boundary reports 8192 restored tokens and 512 pages. Needle retrieval passed 3/3 at 512, 4096, 8192, and 12000 tokens. The existing whole-slot minimum decode slice is configurable; its default remains 8 because formal 32K A/B trials were blocked by external GPU-process termination.
 
 ## [0.5.5] - 2026-08-13
