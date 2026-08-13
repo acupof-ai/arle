@@ -219,13 +219,37 @@ pub enum SkipReason {
     Consistency,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct W2sStepOutcome {
     pub loss: f32,
     pub skipped: bool,
     pub skip_reason: Option<SkipReason>,
     pub max_prob: f32,
     pub consistency: f32,
+    pub stages: Vec<(&'static str, f64)>,
+}
+
+/// Wall-clock per stage, appended in execution order. Every device op the stage
+/// enqueued is fenced before the timer stops, so the numbers are GPU time and
+/// not launch time.
+struct StageTimer {
+    stages: Vec<(&'static str, f64)>,
+    mark: std::time::Instant,
+}
+
+impl StageTimer {
+    fn new() -> Self {
+        Self {
+            stages: Vec::new(),
+            mark: std::time::Instant::now(),
+        }
+    }
+
+    fn stage(&mut self, label: &'static str, store: &TensorStore) {
+        let _ = store.backend().device_synchronize();
+        self.stages.push((label, self.mark.elapsed().as_secs_f64()));
+        self.mark = std::time::Instant::now();
+    }
 }
 
 /// One w2s training step.
@@ -256,6 +280,7 @@ pub fn w2s_step<O: Optimizer>(
 ) -> Result<W2sStepOutcome> {
     let positions: Vec<u32> = (0..input_ids.len() as u32).collect();
     let num_positions = input_ids.len();
+    let mut timer = StageTimer::new();
 
     // Cleanup: keep all model params, free everything else. Grads are freed by
     // `zero_grad` after the optimizer step — keeping them here would silently
@@ -281,6 +306,7 @@ pub fn w2s_step<O: Optimizer>(
     let z_s = student
         .forward(store, tape, input_ids, &positions)
         .map_err(|e| anyhow!("student forward: {e}"))?;
+    timer.stage("student_fwd", store);
 
     // 2. Confidence filter (host-side for Phase 1).
     // Only the last position matters for generation — prompt positions are
@@ -305,8 +331,11 @@ pub fn w2s_step<O: Optimizer>(
             skip_reason: Some(SkipReason::Confidence),
             max_prob,
             consistency: 0.0,
+            stages: timer.stages,
         });
     }
+
+    timer.stage("confidence", store);
 
     // 3. Aux policy shifts ΔT₁, ΔT₂.
     let delta1 = aux1.forward_delta(input_ids, &positions, store, tape)?;
@@ -317,6 +346,8 @@ pub fn w2s_step<O: Optimizer>(
     } else {
         aux2.forward_delta(input_ids, &positions, store, tape)?
     };
+
+    timer.stage("aux_delta", store);
 
     // 4. Consistency gate (host-side for Phase 1).
     let d1_host = store.to_host(delta1)?;
@@ -333,8 +364,11 @@ pub fn w2s_step<O: Optimizer>(
             skip_reason: Some(SkipReason::Consistency),
             max_prob,
             consistency,
+            stages: timer.stages,
         });
     }
+
+    timer.stage("consistency", store);
 
     // 5. Build proxy teacher: z_proxy = z_s.detach() + α·T·(ΔT₁ + ΔT₂)/2.
     let z_s_detached = store.detach(z_s)?;
@@ -353,6 +387,8 @@ pub fn w2s_step<O: Optimizer>(
         tape,
     )?;
 
+    timer.stage("kd_loss", store);
+
     // 6b. Local KL regularizer: π_new vs π_old (previous adapter).
     let z_old = student_old
         .forward(store, tape, input_ids, &positions)
@@ -367,6 +403,8 @@ pub fn w2s_step<O: Optimizer>(
         store,
         tape,
     )?;
+
+    timer.stage("local_kl", store);
 
     // 6c. Global KL regularizer: π_new vs π_base (no adapter).
     let z_base = student_base
@@ -388,16 +426,21 @@ pub fn w2s_step<O: Optimizer>(
     let loss_reg = add(loss_local_scaled, loss_global_scaled, store, tape)?;
     let loss = add(loss_kd, loss_reg, store, tape)?;
 
+    timer.stage("global_kl", store);
+
     // 7. Backward + optimizer step.
     let loss_value = store.to_host(loss)?[0];
     tape.backward(loss, store)?;
+    timer.stage("backward", store);
     if cfg.grad_clip > 0.0 {
         crate::grad_clip::clip_grad_norm(trainable_params, cfg.grad_clip, store);
     }
     optimizer.step(store, trainable_params)?;
     optimizer.zero_grad(store, trainable_params);
+    timer.stage("optimizer", store);
 
     cleanup(store, tape);
+    timer.stage("cleanup", store);
 
     Ok(W2sStepOutcome {
         loss: loss_value,
@@ -405,6 +448,7 @@ pub fn w2s_step<O: Optimizer>(
         skip_reason: None,
         max_prob,
         consistency,
+        stages: timer.stages,
     })
 }
 

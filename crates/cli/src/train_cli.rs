@@ -717,14 +717,21 @@ fn run_w2s(args: TrainW2sArgs) -> Result<()> {
             share_aux,
         )?;
 
+        let stages = outcome
+            .stages
+            .iter()
+            .map(|(label, secs)| format!("{label}={secs:.3}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let total: f64 = outcome.stages.iter().map(|(_, s)| s).sum();
         if outcome.skipped {
             eprintln!(
-                "[arle train w2s] step={step} skipped reason={:?} max_prob={:.4} consistency={:.4}",
+                "[arle train w2s] step={step} skipped reason={:?} max_prob={:.4} consistency={:.4} total={total:.3} {stages}",
                 outcome.skip_reason, outcome.max_prob, outcome.consistency
             );
         } else {
             eprintln!(
-                "[arle train w2s] step={step} loss={:.6} max_prob={:.4} consistency={:.4}",
+                "[arle train w2s] step={step} loss={:.6} max_prob={:.4} consistency={:.4} total={total:.3} {stages}",
                 outcome.loss, outcome.max_prob, outcome.consistency
             );
             // Shadow → serving: the local KL regularizer now anchors against
