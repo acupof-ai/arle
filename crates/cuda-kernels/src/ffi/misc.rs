@@ -247,52 +247,6 @@ unsafe extern "C" {
         stream: super::CUstream,
     ) -> super::CUresult;
 
-    pub fn dsv4_swa_attention_cuda(
-        q: *const super::Half,
-        k_new: *const super::Half,
-        window_cache: *mut super::Half,
-        attn_sink: *const super::Half,
-        out: *mut super::Half,
-        num_tokens: i32,
-        local_heads: i32,
-        head_dim: i32,
-        sliding_window: i32,
-        start_pos: i32,
-        sink_offset: i32,
-        scale_value: f32,
-        rope_dim: i32,
-        rope_base: f32,
-        original_seq_len: i32,
-        factor: f32,
-        beta_fast: f32,
-        beta_slow: f32,
-        write_window_cache: i32,
-        stream: super::CUstream,
-    ) -> super::CUresult;
-
-    pub fn dsv4_swa_attention_start_pos_ptr_cuda(
-        q: *const super::Half,
-        k_new: *const super::Half,
-        window_cache: *mut super::Half,
-        attn_sink: *const super::Half,
-        out: *mut super::Half,
-        num_tokens: i32,
-        local_heads: i32,
-        head_dim: i32,
-        sliding_window: i32,
-        start_pos: *const i32,
-        sink_offset: i32,
-        scale_value: f32,
-        rope_dim: i32,
-        rope_base: f32,
-        original_seq_len: i32,
-        factor: f32,
-        beta_fast: f32,
-        beta_slow: f32,
-        write_window_cache: i32,
-        stream: super::CUstream,
-    ) -> super::CUresult;
-
     pub fn dsv4_update_window_cache_cuda(
         k_new: *const super::Half,
         window_cache: *mut super::Half,
@@ -477,72 +431,11 @@ unsafe extern "C" {
         stream: super::CUstream,
     ) -> super::CUresult;
 
-    pub fn dsv4_hybrid_attention_cuda(
-        q: *const super::Half,
-        k_new: *const super::Half,
-        window_cache: *mut super::Half,
-        compressed: *const super::Half,
-        selected: *const i32,
-        attn_sink: *const super::Half,
-        out: *mut super::Half,
-        num_tokens: i32,
-        local_heads: i32,
-        head_dim: i32,
-        sliding_window: i32,
-        start_pos: i32,
-        sink_offset: i32,
-        scale_value: f32,
-        rope_dim: i32,
-        rope_base: f32,
-        original_seq_len: i32,
-        factor: f32,
-        beta_fast: f32,
-        beta_slow: f32,
-        mode: i32,
-        compress_ratio: i32,
-        compressed_count: i32,
-        selected_topk: i32,
-        write_window_cache: i32,
-        stream: super::CUstream,
-    ) -> super::CUresult;
-
-    pub fn dsv4_hybrid_attention_start_pos_ptr_cuda(
-        q: *const super::Half,
-        k_new: *const super::Half,
-        window_cache: *mut super::Half,
-        compressed: *const super::Half,
-        selected: *const i32,
-        attn_sink: *const super::Half,
-        out: *mut super::Half,
-        num_tokens: i32,
-        local_heads: i32,
-        head_dim: i32,
-        sliding_window: i32,
-        start_pos: *const i32,
-        sink_offset: i32,
-        scale_value: f32,
-        rope_dim: i32,
-        rope_base: f32,
-        original_seq_len: i32,
-        factor: f32,
-        beta_fast: f32,
-        beta_slow: f32,
-        mode: i32,
-        compress_ratio: i32,
-        compressed_count: i32,
-        selected_topk: i32,
-        write_window_cache: i32,
-        stream: super::CUstream,
-    ) -> super::CUresult;
-
     /// In-place attention-output inverse-rope for the FlashMLA decode/prefill
-    /// paths. The legacy `dsv4_hybrid_attention_cuda` kernel un-rotates the
-    /// last `rope_dim` cols of each (token, head) output vector with the MAIN
-    /// rope (sign=-1.0) before output-projection (mirroring the CPU reference
-    /// `apply_partial_rope(.., sign=-1.0)` at reference.rs:417-423). The
-    /// FlashMLA SM90 sparse decode/prefill kernels do NOT, so callers on those
-    /// paths must apply this explicitly. `out` is bf16 (u16 bits), layout
-    /// [token_count, local_heads, head_dim] with head_dim contiguous and rope
+    /// paths. The FlashMLA SM90 sparse decode/prefill kernels do NOT un-rotate
+    /// the output rope tail, so callers must apply this explicitly. `out` is bf16
+    /// (u16 bits), layout [token_count, local_heads, head_dim] with head_dim
+    /// contiguous and rope
     /// tail = the last `rope_dim` cols; abs_pos = start_pos + token. NEVER call
     /// this on the legacy hybrid path (double-apply).
     pub fn arle_dsv4_output_inverse_rope_cuda(

@@ -3020,7 +3020,6 @@ impl Dsv4Model {
                         layer.compress_ratio,
                         &normed,
                         positions,
-                        &self.tp,
                         prefill_shared,
                         &mut keepalive,
                     )?

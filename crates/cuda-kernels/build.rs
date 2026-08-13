@@ -1970,8 +1970,6 @@ const PREBUILT_REQUIRED_DSV4_SYMBOLS: &[&str] = &[
     "arle_dsv4_flashmla_decode_build_indices_batched_cuda",
     "dsv4_prepare_qk_start_pos_ptr_cuda",
     "dsv4_prepare_qk_fused_start_pos_ptr_cuda",
-    "dsv4_swa_attention_start_pos_ptr_cuda",
-    "dsv4_hybrid_attention_start_pos_ptr_cuda",
     "arle_dsv4_output_inverse_rope_cuda",
     "arle_dsv4_output_inverse_rope_start_pos_ptr_cuda",
     "dsv4_update_window_cache_start_pos_ptr_cuda",

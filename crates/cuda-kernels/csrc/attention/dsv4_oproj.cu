@@ -72,21 +72,8 @@ extern "C" CUresult dsv4_oproj_group_scatter_cuda(
   return (CUresult)cudaGetLastError();
 }
 
-// In-place attention-output inverse-rope for the FlashMLA decode/prefill paths.
-//
-// The legacy `dsv4_hybrid_attention_kernel` un-rotates the last `rope_dim` cols
-// of every (token, head) output vector with the MAIN rope (sign=-1.0f) before
-// output-projection (lines 966-981) — mirroring the CPU reference
-// `apply_partial_rope(.., sign=-1.0)` at reference.rs:417-423. The FlashMLA
-// SM90 sparse decode/prefill kernels do NOT perform this output inverse-rope,
-// so callers on those paths must apply it explicitly via this entry.
-//
-// Layout: `out` is [token_count, local_heads, head_dim] bf16 (uint16 bits),
-// head_dim contiguous, rope tail = the last `rope_dim` cols. abs_pos =
-// start_pos + token. One thread per RoPE PAIR (grid = token_count*local_heads,
-// block = rope_dim/2): each thread reads BOTH originals out[..pair_col] and
-// out[..pair_col+1] before writing either back, avoiding the read-after-write
-// hazard of the legacy per-col loop.
+// FlashMLA sparse kernels don't apply output inverse-rope; callers must.
+// One thread per RoPE pair reads both cols before writing to avoid RAW hazard.
 __global__ void dsv4_output_inverse_rope_kernel(
     uint16_t *__restrict__ out,
     int token_count,
@@ -158,13 +145,7 @@ __global__ void dsv4_output_inverse_rope_batch_start_pos_kernel(
   out[base + pair_col + 1] = dsv4_attn_f32_to_bf16_bits(out_b);
 }
 
-// Pointer-array batched output inverse-RoPE: ONE launch over N rows whose
-// `local_attn` buffers are NOT contiguous (each row is a separate `[local_width,
-// 1]` allocation). `out_arr[row]` is this row's buffer base, `start_pos[row]` its
-// absolute decode position. Grid = N*local_heads blocks; per (row, head) it
-// un-rotates that row's rope tail EXACTLY as the single-row kernel does (one row
-// → token=0 within its own buffer). Replaces n single-row
-// `arle_dsv4_output_inverse_rope_start_pos_ptr_cuda` calls.
+// Batched over non-contiguous per-row buffers; replaces n single-row launches.
 __global__ void dsv4_output_inverse_rope_batched_ptr_kernel(
     uint16_t *const *__restrict__ out_arr,
     int n,

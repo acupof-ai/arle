@@ -1011,20 +1011,19 @@ fn run_tilelang_paged(
 // sink logit + (on CSA/HCA layers) a compressed-key stream, and a low-rank O
 // projection (`wo_a → wo_b`).
 //
-// All three modes run through the bf16 correctness core (the perf-optimized
-// FlashMLA sparse path stays gated and uses the shared per-layer FP8 KV pool:
-//   - SlidingWindow (`compress_ratio == 0`): Q/K prep RoPE + `dsv4_swa_attention`
-//     over the bf16 SW ring cache, with the output inverse-RoPE fused.
-//   - CompressedSparse (`0 < ratio < 16`): a compressor produces compressed keys,
-//     an indexer + the official DSA select path picks the top-k blocks, then
-//     `dsv4_hybrid_attention_cuda` (mode 1) attends over SW window + selected
-//     compressed blocks.
-//   - HybridCompressed (`ratio >= 16`): compressor + `dsv4_hybrid_attention_cuda`
-//     (mode 2) attending over SW window + ALL compressed blocks (no selector).
+// All modes run through FlashMLA sparse attention (the shared per-layer FP8 KV
+// pool):
+//   - SlidingWindow (`compress_ratio == 0`): SW window only.
+//   - CompressedSparse (`0 < ratio < 16`): compressor + indexer top-k select,
+//     then SW window + selected compressed blocks.
+//   - HybridCompressed (`ratio >= 16`): compressor + SW window + ALL compressed
+//     blocks (no selector).
+//   - SparseIndexed (GLM DSA): indexer top-k over the full latent (no
+//     compressor), then SW window + selected full-latent blocks.
 //
 // Shared kernels: `dsv4_{fp8,fp4}_gemv_batch_cuda` / `gemm_cuda` (LoRA matmuls),
-// `dsv4_prepare_qk_cuda`, `dsv4_swa_attention_cuda`, `dsv4_compressor_update_cuda`,
-// official DSA select, `dsv4_hybrid_attention_cuda`.
+// `dsv4_prepare_qk_cuda`, `dsv4_compressor_update_cuda`, official DSA select,
+// FlashMLA sparse prefill/decode.
 
 /// Run one DSv4 FP8/FP4 block-scaled LoRA matmul: `out[N, T] = W[N, K] · x[K, T]`.
 ///
@@ -1631,18 +1630,12 @@ pub(crate) fn dsv4_flashmla_decode_enabled() -> Result<bool> {
         DSV4_FLASHMLA_OVERRIDE_ON => return Ok(true),
         _ => {}
     }
-    // Runtime A/B gate (the serve-side knob the #138 lane isolation needs):
-    // `--dsv4-flashmla-decode false` forces the eager dsv4_swa/hybrid fallback
-    // kernels, `true` forces on (still compile-gated in apply_runtime_flags),
+    // Runtime A/B gate:
+    // `--dsv4-flashmla-decode false` forces FlashMLA decode off, `true` forces on,
     // unset keeps the default below.
-    // Default ON: FlashMLA SM90 sparse decode is the adopted decode attention — the
-    // same vendored kernel SGLang uses. Licensed 2026-06-06 on the TP=8/EP=8 pod:
-    // 64-tok resident same-load A/B token-exact vs scalar, 29.47 -> 36.59 tok/s
-    // (+24%). `dsv4_flashmla_decode_alloc_enabled` falls through to this, so the
-    // arena allocates under the default. Compile-gated via `cuda_kernels::HAS_FLASHMLA`
-    // (build.rs sets it from `enable_flashmla`); a build without the FlashMLA kernels
-    // reports false and falls back to scalar. The AtomicI8 override above also
-    // serves tests/A-B.
+    // Default ON: FlashMLA SM90 sparse decode is the adopted decode attention.
+    // Compile-gated via `cuda_kernels::HAS_FLASHMLA`; a build without FlashMLA
+    // reports false and decode is unavailable.
     Ok(cuda_kernels::HAS_FLASHMLA)
 }
 
@@ -2275,7 +2268,7 @@ impl Dsv4ChainVerifyAttnMeta {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn try_flashmla_prefill_attention(
+fn flashmla_prefill_attention(
     ctx: &DeviceContext,
     config: &DeepSeekV4Config,
     attention: &Dsv4Attention,
@@ -2297,16 +2290,16 @@ fn try_flashmla_prefill_attention(
     rope_factor: f32,
     rope_beta_fast: f32,
     rope_beta_slow: f32,
-) -> Result<bool> {
-    if !dsv4_flashmla_prefill_enabled()? {
-        return Ok(false);
-    }
-    if q_prepared.seq_len <= 1 {
-        return Ok(false);
-    }
-    if mode == DeepSeekV4AttentionMode::SlidingWindow && chain_verify.is_none() {
-        return Ok(false);
-    }
+) -> Result<()> {
+    ensure!(
+        dsv4_flashmla_prefill_enabled()?,
+        "DSv4 FlashMLA prefill is not available"
+    );
+    ensure!(
+        q_prepared.seq_len > 1,
+        "DSv4 FlashMLA prefill requires seq_len > 1, got {}",
+        q_prepared.seq_len
+    );
     // MODEL1 (head_dim=512) + V32 (GLM, head_dim=576 = 512 latent + 64 rope).
     let meta = dsv4_flashmla_model_meta(config)?;
     let (model_type_int, bytes_per_token) = (meta.model_type_int, meta.bytes_per_token);
@@ -2504,7 +2497,27 @@ fn try_flashmla_prefill_attention(
                                     anyhow!("DSv4 FlashMLA HCA prefill indices failed: {e}")
                                 })?;
                             }
-                            DeepSeekV4AttentionMode::SlidingWindow => unreachable!(),
+                            DeepSeekV4AttentionMode::SlidingWindow => {
+                                // SWA: no compressed pool — reuse the CSA index
+                                // builder with selected=null (fills -1) and
+                                // index_topk=0, so indices hold SW blocks only.
+                                ffi::arle_flashmla_csa_build_indices(
+                                    indices_ptr as *mut i32,
+                                    topk_ptr as *mut i32,
+                                    std::ptr::null(),
+                                    token_count as i32,
+                                    start_pos as i32,
+                                    config.sliding_window as i32,
+                                    max_compressed_keys as i32,
+                                    compressed_count as i32,
+                                    compress_ratio as i32,
+                                    ctx.stream.cu_stream(),
+                                )
+                                .result()
+                                .map_err(|e| {
+                                    anyhow!("DSv4 FlashMLA SWA prefill indices failed: {e}")
+                                })?;
+                            }
                             DeepSeekV4AttentionMode::SparseIndexed => {
                                 // GLM SparseIndexed mirrors the CSA index build (top-k over
                                 // `selected`), but over the FULL per-token latent (no
@@ -2888,11 +2901,11 @@ fn try_flashmla_prefill_attention(
     drop(lse_guard);
     drop(sink_guard);
 
-    Ok(true)
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
-fn try_flashmla_decode_attention(
+fn flashmla_decode_attention(
     ctx: &DeviceContext,
     config: &DeepSeekV4Config,
     attention: &Dsv4Attention,
@@ -2917,13 +2930,16 @@ fn try_flashmla_decode_attention(
     rope_factor: f32,
     rope_beta_fast: f32,
     rope_beta_slow: f32,
-) -> Result<bool> {
-    if !dsv4_flashmla_decode_enabled()? {
-        return Ok(false);
-    }
-    if q_prepared.seq_len != 1 {
-        return Ok(false);
-    }
+) -> Result<()> {
+    ensure!(
+        dsv4_flashmla_decode_enabled()?,
+        "DSv4 FlashMLA decode is not available"
+    );
+    ensure!(
+        q_prepared.seq_len == 1,
+        "DSv4 FlashMLA decode requires seq_len == 1, got {}",
+        q_prepared.seq_len
+    );
     let start_pos_device = start_pos_device.ok_or_else(|| {
         anyhow!("DSv4 FlashMLA decode requires device start_pos for token_count=1")
     })?;
@@ -3295,7 +3311,7 @@ fn try_flashmla_decode_attention(
         Some(start_pos_device),
         config,
     )?;
-    Ok(true)
+    Ok(())
 }
 
 /// Canonical batched KV pack for the MODEL1 batched decode lane (#60 op "c"):
@@ -3380,7 +3396,7 @@ pub(crate) fn flashmla_pack_rope_offset_bytes(config: &DeepSeekV4Config) -> u64 
 }
 
 /// PHASE B (#60) per-row KV pack for the batched decode lane: the EXACT pack
-/// sequence the single-row [`try_flashmla_decode_attention`] runs before the
+/// sequence the single-row [`flashmla_decode_attention`] runs before the
 /// fwd (SW ring bootstrap → one-token SW pack → compressed-delta), writing this
 /// row's slot KV into the shared pool. Run once per row in the batched lane's
 /// pack loop; the ONE batched fwd then reads the filled pool. SW passes
@@ -3435,7 +3451,7 @@ pub(crate) fn flashmla_decode_pack_row(
 }
 
 /// PHASE B (#60) per-row finish for the batched decode lane: the EXACT output
-/// tail the single-row [`try_flashmla_decode_attention`] runs AFTER the fwd —
+/// tail the single-row [`flashmla_decode_attention`] runs AFTER the fwd —
 /// output inverse-RoPE on this row's `local_attn`, then the bf16 SW-window
 /// update — minus the TP out-slice (the lane runs [`Dsv4FlashMlaDecodeBatchScratch::slice_out_row`]
 /// before this) and minus the kernel (batched). `local_attn` must already hold
@@ -3910,13 +3926,12 @@ fn run_fused_wqkv_decode_into(
 
 /// Prepared-but-not-attended MLA state, the boundary between `mla_attention`'s
 /// per-row PREPARE half (wq/wkv proj + RoPE + — for CSA/HCA — compressor /
-/// indexer / `selected`) and its FWD half (the FlashMLA decode kernel + the
-/// SW/hybrid scalar fallback + O-LoRA). The split (#60 Phase B) lets the batched
-/// decode lane run PREPARE per row, gather each row's `q_prepared` into one
-/// batched Q buffer, then issue ONE `sparse_decode_fwd(b=N)` — replacing the
-/// per-row FlashMLA launch loop. Single-row callers go through `mla_attention`,
-/// which runs `mla_attention_prepare` then `mla_attention_fwd` back-to-back in
-/// the exact original order, so their byte path is unchanged.
+/// indexer / `selected`) and its FWD half (the FlashMLA attention kernel +
+/// O-LoRA). The split (#60 Phase B) lets the batched decode lane run PREPARE
+/// per row, gather each row's `q_prepared` into one batched Q buffer, then
+/// issue ONE `sparse_decode_fwd(b=N)` — replacing the per-row FlashMLA launch
+/// loop. Single-row callers go through `mla_attention`, which runs
+/// `mla_attention_prepare` then `mla_attention_fwd` back-to-back.
 ///
 /// `selected` is the CSA per-row top-k (owned, `[max_compressed_keys]`); `None`
 /// for SW/HCA. The compressed-key pool is re-borrowed from `state` inside the
@@ -3930,11 +3945,9 @@ pub(crate) struct Dsv4MlaPrepared {
     pub(crate) selected: Option<CudaSlice<i32>>,
     pub(crate) local_heads: usize,
     token_count: usize,
-    sink_offset: usize,
     pub(crate) sm_scale: f32,
     pub(crate) rope_base: f32,
     pub(crate) original_seq_len: i32,
-    pub(crate) start_pos_i32: i32,
 }
 
 pub(crate) struct Dsv4MlaDecodeGraphScratch {
@@ -4192,7 +4205,7 @@ impl Dsv4MlaDecodeGraphScratch {
 /// row-parallel sum). FlashMLA-FP8 decode stays gated (perf path).
 ///
 /// `tp_rank` is this rank's tensor-parallel index. The per-head `attn_sink`
-/// vector is loaded WHOLE on every rank (no TP slice), so the SW/hybrid kernels
+/// vector is loaded WHOLE on every rank (no TP slice), so the attention kernel
 /// must skip to this rank's head block via `sink_offset = tp_rank * local_heads`
 /// — otherwise every non-zero rank reads rank-0's sink logits and the attention
 /// output diverges by a small head-dependent margin (multi-GPU only).
@@ -4737,201 +4750,58 @@ pub(crate) fn mla_attention_decode_graph(
     }
 
     let sm_scale = 1.0f32 / (head_dim as f32).sqrt();
-    let token_count = 1usize;
     let selected = if selected_ready {
         scratch.csa_selected.as_ref()
     } else {
         None
     };
-    if mode == DeepSeekV4AttentionMode::SlidingWindow {
-        let flashmla_used = if dsv4_flashmla_decode_enabled()? {
-            let flash = state.flashmla.as_mut().ok_or_else(|| {
-                anyhow!("FlashMLA decode enabled but layer state has no FlashMLA arena")
-            })?;
-            let flash_scratch = flashmla_scratch.ok_or_else(|| {
-                anyhow!("FlashMLA decode enabled but shared FlashMLA decode scratch missing")
-            })?;
-            try_flashmla_decode_attention(
-                ctx,
-                config,
-                attention,
-                mode,
-                compress_ratio,
-                &scratch.q_prepared,
-                &scratch.k_prepared,
-                None,
-                None,
-                &mut state.sw_window_cache,
-                flash,
-                flash_scratch,
-                pool,
-                start_pos,
-                start_pos_device,
-                tp,
-                local_heads,
-                &mut scratch.local_attn,
-                sm_scale,
-                rope_base,
-                original_seq_len,
-                rope.factor,
-                rope.beta_fast,
-                rope.beta_slow,
-            )?
-        } else {
-            false
-        };
-        if !flashmla_used {
-            let (q_ptr, _qg) = scratch.q_prepared.data.device_ptr(&ctx.stream);
-            let (k_ptr, _kg) = scratch.k_prepared.data.device_ptr(&ctx.stream);
-            let (window_ptr, _wg) = state.sw_window_cache.device_ptr_mut(&ctx.stream);
-            let (sink_ptr, _sg) = attention
-                .attn_sink
+    let compressed: Option<&HiddenStates> = if mode.has_compressor() {
+        Some(
+            &state
+                .compressor
                 .as_ref()
-                .expect("DSv4 attn_sink")
-                .data
-                .device_ptr(&ctx.stream);
-            let (out_ptr, _og) = scratch.local_attn.data.device_ptr_mut(&ctx.stream);
-            let start_pos_device = start_pos_device.expect("checked above");
-            let (start_ptr, _spg) = start_pos_device.device_ptr(&ctx.stream);
-            // SAFETY: ptrs from live device allocations sized to the dims passed.
-            unsafe {
-                ffi::dsv4_swa_attention_start_pos_ptr_cuda(
-                    q_ptr as *const ffi::Half,
-                    k_ptr as *const ffi::Half,
-                    window_ptr as *mut ffi::Half,
-                    sink_ptr as *const ffi::Half,
-                    out_ptr as *mut ffi::Half,
-                    token_count as i32,
-                    local_heads as i32,
-                    head_dim as i32,
-                    config.sliding_window as i32,
-                    start_ptr as *const i32,
-                    sink_offset as i32,
-                    sm_scale,
-                    config.qk_rope_head_dim as i32,
-                    rope_base,
-                    original_seq_len,
-                    rope.factor,
-                    rope.beta_fast,
-                    rope.beta_slow,
-                    1,
-                    ctx.stream.cu_stream(),
-                )
-                .result()?;
-            }
-        }
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "DSv4 layer {layer_idx} is {mode:?} but has no compressor state"
+                    )
+                })?
+                .compressed,
+        )
     } else {
-        let compressed_hidden = &state
-            .compressor
-            .as_ref()
-            .ok_or_else(|| {
-                anyhow::anyhow!("DSv4 layer {layer_idx} is {mode:?} but has no compressor state")
-            })?
-            .compressed;
-        let compressed = Some(compressed_hidden);
-        let compressed_capacity = compressed.map_or(0, |c| c.data.len() / head_dim);
-        let compressed_count_arg = if start_pos_device.is_some() {
-            compressed_capacity
-        } else {
-            compressed.map_or(0, |c| c.seq_len)
-        };
-        let mode_int = match mode {
-            DeepSeekV4AttentionMode::CompressedSparse => 1,
-            DeepSeekV4AttentionMode::HybridCompressed => 2,
-            DeepSeekV4AttentionMode::SlidingWindow => unreachable!(),
-            DeepSeekV4AttentionMode::SparseIndexed => unreachable!(),
-        };
-        let flashmla_used = if dsv4_flashmla_decode_enabled()? {
-            let flash = state.flashmla.as_mut().ok_or_else(|| {
-                anyhow!("FlashMLA decode enabled but layer state has no FlashMLA arena")
-            })?;
-            let flash_scratch = flashmla_scratch.ok_or_else(|| {
-                anyhow!("FlashMLA decode enabled but shared FlashMLA decode scratch missing")
-            })?;
-            try_flashmla_decode_attention(
-                ctx,
-                config,
-                attention,
-                mode,
-                compress_ratio,
-                &scratch.q_prepared,
-                &scratch.k_prepared,
-                selected,
-                compressed,
-                &mut state.sw_window_cache,
-                flash,
-                flash_scratch,
-                pool,
-                start_pos,
-                start_pos_device,
-                tp,
-                local_heads,
-                &mut scratch.local_attn,
-                sm_scale,
-                rope_base,
-                original_seq_len,
-                rope.factor,
-                rope.beta_fast,
-                rope.beta_slow,
-            )?
-        } else {
-            false
-        };
-        if !flashmla_used {
-            let (q_ptr, _qg) = scratch.q_prepared.data.device_ptr(&ctx.stream);
-            let (k_ptr, _kg) = scratch.k_prepared.data.device_ptr(&ctx.stream);
-            let (window_ptr, _wg) = state.sw_window_cache.device_ptr_mut(&ctx.stream);
-            let (sink_ptr, _sg) = attention
-                .attn_sink
-                .as_ref()
-                .expect("DSv4 attn_sink")
-                .data
-                .device_ptr(&ctx.stream);
-            let (out_ptr, _og) = scratch.local_attn.data.device_ptr_mut(&ctx.stream);
-            let (comp_ptr, _cguard) = compressed_hidden.data.device_ptr(&ctx.stream);
-            let (sel_ptr, _sguard) = match selected {
-                Some(sel) => {
-                    let (p, g) = sel.device_ptr(&ctx.stream);
-                    (p as *const i32, Some(g))
-                }
-                None => (std::ptr::null(), None),
-            };
-            let start_pos_device = start_pos_device.expect("checked above");
-            let (start_ptr, _spg) = start_pos_device.device_ptr(&ctx.stream);
-            // SAFETY: ptrs from live device allocations sized to the dims passed.
-            unsafe {
-                ffi::dsv4_hybrid_attention_start_pos_ptr_cuda(
-                    q_ptr as *const ffi::Half,
-                    k_ptr as *const ffi::Half,
-                    window_ptr as *mut ffi::Half,
-                    comp_ptr as *const ffi::Half,
-                    sel_ptr,
-                    sink_ptr as *const ffi::Half,
-                    out_ptr as *mut ffi::Half,
-                    token_count as i32,
-                    local_heads as i32,
-                    head_dim as i32,
-                    config.sliding_window as i32,
-                    start_ptr as *const i32,
-                    sink_offset as i32,
-                    sm_scale,
-                    config.qk_rope_head_dim as i32,
-                    rope_base,
-                    original_seq_len,
-                    rope.factor,
-                    rope.beta_fast,
-                    rope.beta_slow,
-                    mode_int,
-                    compress_ratio as i32,
-                    compressed_count_arg as i32,
-                    config.index_topk as i32,
-                    1,
-                    ctx.stream.cu_stream(),
-                )
-                .result()?;
-            }
-        }
-    }
+        None
+    };
+    let flash = state.flashmla.as_mut().ok_or_else(|| {
+        anyhow!("FlashMLA decode enabled but layer state has no FlashMLA arena")
+    })?;
+    let flash_scratch = flashmla_scratch.ok_or_else(|| {
+        anyhow!("FlashMLA decode enabled but shared FlashMLA decode scratch missing")
+    })?;
+    flashmla_decode_attention(
+        ctx,
+        config,
+        attention,
+        mode,
+        compress_ratio,
+        &scratch.q_prepared,
+        &scratch.k_prepared,
+        selected,
+        compressed,
+        &mut state.sw_window_cache,
+        flash,
+        flash_scratch,
+        pool,
+        start_pos,
+        start_pos_device,
+        tp,
+        local_heads,
+        &mut scratch.local_attn,
+        sm_scale,
+        rope_base,
+        original_seq_len,
+        rope.factor,
+        rope.beta_fast,
+        rope.beta_slow,
+    )?;
 
     mla_oproj_decode_graph(
         ctx,
@@ -5492,7 +5362,7 @@ pub(crate) fn mla_attention_prepare(
     keepalive.keep_hidden(&q_prepared);
     keepalive.keep_hidden(&k_prepared);
     let sm_scale = 1.0f32 / (head_dim as f32).sqrt();
-    // SAFETY: the SW/hybrid attention kernel writes the full local_attn buffer
+    // SAFETY: the FlashMLA attention kernel writes the full local_attn buffer
     // in `mla_attention_fwd`.
     let local_attn = unsafe { HiddenStates::uninit(ctx, local_width, token_count)? };
 
@@ -5727,11 +5597,9 @@ pub(crate) fn mla_attention_prepare(
         selected,
         local_heads,
         token_count,
-        sink_offset,
         sm_scale,
         rope_base,
         original_seq_len,
-        start_pos_i32,
     })
 }
 
@@ -5770,7 +5638,6 @@ pub(crate) struct Dsv4MlaProjBatch {
     pub(crate) k_prepared: HiddenStates,
     pub(crate) local_heads: usize,
     pub(crate) local_width: usize,
-    pub(crate) sink_offset: usize,
     pub(crate) sm_scale: f32,
     pub(crate) rope_base: f32,
     pub(crate) original_seq_len: i32,
@@ -5784,7 +5651,6 @@ pub(crate) fn mla_attention_prepare_proj_batch(
     compress_ratio: usize,
     normed: &HiddenStates,
     positions: &CudaSlice<i32>,
-    tp: &TpRuntime,
     prefill_shared: Option<&mut Dsv4PrefillDeepGemmLinearScratch>,
     keepalive: &mut Dsv4ForwardKeepalive,
 ) -> Result<Dsv4MlaProjBatch> {
@@ -5815,8 +5681,6 @@ pub(crate) fn mla_attention_prepare_proj_batch(
         local_heads > 0,
         "DSv4 MLA proj-batch requires at least one local head"
     );
-    let tp_rank = tp.config().rank;
-    let sink_offset = tp_rank * local_heads;
     ensure!(
         attention.wkv.rows == head_dim,
         "DSv4 MLA proj-batch wkv rows {} != head_dim {head_dim}",
@@ -5991,7 +5855,6 @@ pub(crate) fn mla_attention_prepare_proj_batch(
         k_prepared,
         local_heads,
         local_width,
-        sink_offset,
         sm_scale,
         rope_base,
         original_seq_len,
@@ -6197,11 +6060,9 @@ pub(crate) fn mla_attention_prepare_compressed_only(
         state.sw_window_cache.len(),
         config.sliding_window * head_dim
     );
-    let start_pos_i32 = i32::try_from(start_pos)
-        .map_err(|_| anyhow::anyhow!("DSv4 MLA start_pos {start_pos} overflows i32"))?;
     let original_seq_len = proj.original_seq_len;
 
-    // SAFETY: the SW/hybrid attention kernel writes the full local_attn buffer
+    // SAFETY: the FlashMLA attention kernel writes the full local_attn buffer
     // in the batched fwd / single-row `mla_attention_fwd`.
     let local_attn = unsafe { HiddenStates::uninit(ctx, local_width, 1)? };
 
@@ -6418,19 +6279,17 @@ pub(crate) fn mla_attention_prepare_compressed_only(
         selected,
         local_heads,
         token_count: 1,
-        sink_offset: proj.sink_offset,
         sm_scale: proj.sm_scale,
         rope_base: proj.rope_base,
         original_seq_len,
-        start_pos_i32,
     })
 }
 
 /// FWD half of `mla_attention` (see [`Dsv4MlaPrepared`]). Runs the FlashMLA
-/// decode kernel (or the prefill / scalar SW/hybrid fallback) over the PREPARE
-/// output, then the O-LoRA. The compressed-key pool is re-borrowed from `state`
-/// here. Single-row + chunked-prefill callers reach this through `mla_attention`;
-/// the batched lane runs PREPARE per row and the batched fwd separately.
+/// attention kernel over the PREPARE output, then the O-LoRA. The compressed-key
+/// pool is re-borrowed from `state` here. Single-row + chunked-prefill callers
+/// reach this through `mla_attention`; the batched lane runs PREPARE per row and
+/// the batched fwd separately.
 #[allow(clippy::too_many_arguments)]
 fn mla_attention_fwd(
     ctx: &DeviceContext,
@@ -6463,13 +6322,10 @@ fn mla_attention_fwd(
         selected,
         local_heads,
         token_count,
-        sink_offset,
         sm_scale,
         rope_base,
         original_seq_len,
-        start_pos_i32,
     } = prepared;
-    let head_dim = config.head_dim;
     let rope = &config.rope_parameters;
     ensure!(
         attention.wo_b.as_ref().expect("DSv4 wo_b").rows == out.hidden_dim
@@ -6484,187 +6340,26 @@ fn mla_attention_fwd(
     keepalive.keep_hidden(&q_prepared);
     keepalive.keep_hidden(&k_prepared);
 
-    if mode == DeepSeekV4AttentionMode::SlidingWindow {
-        // ── 4a. SW: windowed attention + per-head sink + output inverse-RoPE.
-        // The kernel reads the pre-roped q/k, attends over the bf16 SW ring cache
-        // (which it also updates), adds the sink, and un-rotates the rope tail of
-        // the OUTPUT (sign = -1) before returning.
-        // Chain verify with a single-row chain (draft_len=0) has no sparse
-        // ancestors to exploit; fall through to the normal decode path instead
-        // of failing the FlashMLA prefill `ensure!` (q_prepared.seq_len <= 1).
-        if let Some(meta) = chain_verify
-            && token_count > 1
-        {
-            let used = try_flashmla_prefill_attention(
-                ctx,
-                config,
-                attention,
-                mode,
-                compress_ratio,
-                &q_prepared,
-                &k_prepared,
-                None,
-                None,
-                &mut state.sw_window_cache,
-                start_pos,
-                Some(meta),
-                tp,
-                local_heads,
-                &mut local_attn,
-                sm_scale,
-                rope_base,
-                original_seq_len,
-                rope.factor,
-                rope.beta_fast,
-                rope.beta_slow,
-            )?;
-            ensure!(
-                used,
-                "DSv4 chain verify requires the FlashMLA sparse prefill path"
-            );
-        } else {
-            let flashmla_used = if dsv4_flashmla_decode_enabled()? {
-                let flash = state.flashmla.as_mut().ok_or_else(|| {
-                    anyhow!("FlashMLA decode enabled but layer state has no FlashMLA arena")
-                })?;
-                let scratch = flashmla_scratch.ok_or_else(|| {
-                    anyhow!("FlashMLA decode enabled but shared FlashMLA decode scratch missing")
-                })?;
-                try_flashmla_decode_attention(
-                    ctx,
-                    config,
-                    attention,
-                    mode,
-                    compress_ratio,
-                    &q_prepared,
-                    &k_prepared,
-                    None,
-                    None,
-                    &mut state.sw_window_cache,
-                    flash,
-                    scratch,
-                    pool,
-                    start_pos,
-                    start_pos_device,
-                    tp,
-                    local_heads,
-                    &mut local_attn,
-                    sm_scale,
-                    rope_base,
-                    original_seq_len,
-                    rope.factor,
-                    rope.beta_fast,
-                    rope.beta_slow,
-                )?
-            } else {
-                false
-            };
-            if !flashmla_used {
-                let (q_ptr, _qg) = q_prepared.data.device_ptr(&ctx.stream);
-                let (k_ptr, _kg) = k_prepared.data.device_ptr(&ctx.stream);
-                let (window_ptr, _wg) = state.sw_window_cache.device_ptr_mut(&ctx.stream);
-                let (sink_ptr, _sg) = attention
-                    .attn_sink
-                    .as_ref()
-                    .expect("DSv4 attn_sink")
-                    .data
-                    .device_ptr(&ctx.stream);
-                let (out_ptr, _og) = local_attn.data.device_ptr_mut(&ctx.stream);
-                // SAFETY: all buffers valid on ctx.stream; window sized above; sink_offset
-                // skips to this rank's head block in the whole-loaded attn_sink vector.
-                unsafe {
-                    if let Some(start_pos_device) = start_pos_device {
-                        let (start_ptr, _spg) = start_pos_device.device_ptr(&ctx.stream);
-                        ffi::dsv4_swa_attention_start_pos_ptr_cuda(
-                            q_ptr as *const ffi::Half,
-                            k_ptr as *const ffi::Half,
-                            window_ptr as *mut ffi::Half,
-                            sink_ptr as *const ffi::Half,
-                            out_ptr as *mut ffi::Half,
-                            token_count as i32,
-                            local_heads as i32,
-                            head_dim as i32,
-                            config.sliding_window as i32,
-                            start_ptr as *const i32,
-                            sink_offset as i32,
-                            sm_scale,
-                            config.qk_rope_head_dim as i32,
-                            rope_base,
-                            original_seq_len,
-                            rope.factor,
-                            rope.beta_fast,
-                            rope.beta_slow,
-                            1,
-                            ctx.stream.cu_stream(),
-                        )
-                        .result()?;
-                    } else {
-                        ffi::dsv4_swa_attention_cuda(
-                            q_ptr as *const ffi::Half,
-                            k_ptr as *const ffi::Half,
-                            window_ptr as *mut ffi::Half,
-                            sink_ptr as *const ffi::Half,
-                            out_ptr as *mut ffi::Half,
-                            token_count as i32,
-                            local_heads as i32,
-                            head_dim as i32,
-                            config.sliding_window as i32,
-                            start_pos_i32,
-                            sink_offset as i32,
-                            sm_scale,
-                            config.qk_rope_head_dim as i32,
-                            rope_base,
-                            original_seq_len,
-                            rope.factor,
-                            rope.beta_fast,
-                            rope.beta_slow,
-                            1,
-                            ctx.stream.cu_stream(),
-                        )
-                        .result()?;
-                    }
-                }
-            }
-        }
+    // Compressed KV pool: CSA/HCA have a compressor; SparseIndexed (GLM DSA)
+    // and SWA do not.
+    let compressed: Option<&HiddenStates> = if mode.has_compressor() {
+        Some(
+            &state
+                .compressor
+                .as_ref()
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "DSv4 layer {layer_idx} is {mode:?} but has no compressor state"
+                    )
+                })?
+                .compressed,
+        )
     } else {
-        // ── 4b(fwd). CSA / HCA: hybrid windowed+compressed attention over the
-        // compressor pool (re-borrowed from `state`) + PREPARE's `selected`.
-        // GLM SparseIndexed has NO compressor (pure indexer top-k over the full
-        // latent); it must be served by the FlashMLA sparse prefill path below,
-        // so leave `compressed` absent and feed nulls to the kernel args.
-        let compressed: Option<&HiddenStates> = if mode == DeepSeekV4AttentionMode::SparseIndexed {
-            None
-        } else {
-            Some(
-                &state
-                    .compressor
-                    .as_ref()
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "DSv4 layer {layer_idx} is {mode:?} but has no compressor state"
-                        )
-                    })?
-                    .compressed,
-            )
-        };
-        let compressed_count = compressed.map_or(0, |c| c.seq_len);
-        let compressed_capacity = compressed.map_or(0, |c| c.data.len() / head_dim);
-        let compressed_count_arg = if start_pos_device.is_some() {
-            // CUDA graph replay bakes scalar launch args. In decode, the causal
-            // bound is `abs_pos / compress_ratio`, so the kernel may safely see
-            // the fixed capacity instead of the current compressed seq_len.
-            compressed_capacity
-        } else {
-            compressed_count
-        };
-        let mode_int = match mode {
-            DeepSeekV4AttentionMode::CompressedSparse => 1,
-            DeepSeekV4AttentionMode::HybridCompressed => 2,
-            DeepSeekV4AttentionMode::SlidingWindow => unreachable!(),
-            // GLM SparseIndexed uses the CSA-style hybrid kernel arg.
-            DeepSeekV4AttentionMode::SparseIndexed => 1,
-        };
-        let flashmla_used = if try_flashmla_prefill_attention(
+        None
+    };
+
+    if token_count > 1 {
+        flashmla_prefill_attention(
             ctx,
             config,
             attention,
@@ -6686,146 +6381,43 @@ fn mla_attention_fwd(
             rope.factor,
             rope.beta_fast,
             rope.beta_slow,
-        )? {
-            true
-        } else if chain_verify.is_some() && token_count > 1 {
-            bail!("DSv4 chain verify requires the FlashMLA sparse prefill path");
-        } else if dsv4_flashmla_decode_enabled()? {
-            let flash = state.flashmla.as_mut().ok_or_else(|| {
-                anyhow!("FlashMLA decode enabled but layer state has no FlashMLA arena")
-            })?;
-            let scratch = flashmla_scratch.ok_or_else(|| {
-                anyhow!("FlashMLA decode enabled but shared FlashMLA decode scratch missing")
-            })?;
-            try_flashmla_decode_attention(
-                ctx,
-                config,
-                attention,
-                mode,
-                compress_ratio,
-                &q_prepared,
-                &k_prepared,
-                selected.as_ref(),
-                compressed,
-                &mut state.sw_window_cache,
-                flash,
-                scratch,
-                pool,
-                start_pos,
-                start_pos_device,
-                tp,
-                local_heads,
-                &mut local_attn,
-                sm_scale,
-                rope_base,
-                original_seq_len,
-                rope.factor,
-                rope.beta_fast,
-                rope.beta_slow,
-            )?
-        } else {
-            false
-        };
-        if !flashmla_used {
-            let (q_ptr, _qg) = q_prepared.data.device_ptr(&ctx.stream);
-            let (k_ptr, _kg) = k_prepared.data.device_ptr(&ctx.stream);
-            let (window_ptr, _wg) = state.sw_window_cache.device_ptr_mut(&ctx.stream);
-            let (sink_ptr, _sg) = attention
-                .attn_sink
-                .as_ref()
-                .expect("DSv4 attn_sink")
-                .data
-                .device_ptr(&ctx.stream);
-            let (out_ptr, _og) = local_attn.data.device_ptr_mut(&ctx.stream);
-            let (comp_ptr, _cguard) = if compressed_count_arg > 0 {
-                // compressed_count_arg > 0 implies `compressed` is Some (SparseIndexed
-                // has no compressor → compressed_count_arg == 0 → this branch is skipped).
-                let (p, g) = compressed
-                    .expect("compressed present when compressed_count_arg > 0")
-                    .data
-                    .device_ptr(&ctx.stream);
-                (p as *const ffi::Half, Some(g))
-            } else {
-                (std::ptr::null(), None)
-            };
-            let (sel_ptr, _sguard) = match selected.as_ref() {
-                Some(sel) => {
-                    let (p, g) = sel.device_ptr(&ctx.stream);
-                    (p as *const i32, Some(g))
-                }
-                None => (std::ptr::null(), None),
-            };
-            // SAFETY: all buffers valid on ctx.stream; compressed/selected may be null
-            // (the kernel branches on compressed_count / mode). write_window_cache=1
-            // updates the bf16 SW ring inline.
-            unsafe {
-                if let Some(start_pos_device) = start_pos_device {
-                    let (start_ptr, _spg) = start_pos_device.device_ptr(&ctx.stream);
-                    ffi::dsv4_hybrid_attention_start_pos_ptr_cuda(
-                        q_ptr as *const ffi::Half,
-                        k_ptr as *const ffi::Half,
-                        window_ptr as *mut ffi::Half,
-                        comp_ptr,
-                        sel_ptr,
-                        sink_ptr as *const ffi::Half,
-                        out_ptr as *mut ffi::Half,
-                        token_count as i32,
-                        local_heads as i32,
-                        head_dim as i32,
-                        config.sliding_window as i32,
-                        start_ptr as *const i32,
-                        sink_offset as i32,
-                        sm_scale,
-                        config.qk_rope_head_dim as i32,
-                        rope_base,
-                        original_seq_len,
-                        rope.factor,
-                        rope.beta_fast,
-                        rope.beta_slow,
-                        mode_int,
-                        compress_ratio as i32,
-                        compressed_count_arg as i32,
-                        config.index_topk as i32,
-                        1,
-                        ctx.stream.cu_stream(),
-                    )
-                    .result()?;
-                } else {
-                    ffi::dsv4_hybrid_attention_cuda(
-                        q_ptr as *const ffi::Half,
-                        k_ptr as *const ffi::Half,
-                        window_ptr as *mut ffi::Half,
-                        comp_ptr,
-                        sel_ptr,
-                        sink_ptr as *const ffi::Half,
-                        out_ptr as *mut ffi::Half,
-                        token_count as i32,
-                        local_heads as i32,
-                        head_dim as i32,
-                        config.sliding_window as i32,
-                        start_pos_i32,
-                        sink_offset as i32,
-                        sm_scale,
-                        config.qk_rope_head_dim as i32,
-                        rope_base,
-                        original_seq_len,
-                        rope.factor,
-                        rope.beta_fast,
-                        rope.beta_slow,
-                        mode_int,
-                        compress_ratio as i32,
-                        compressed_count_arg as i32,
-                        config.index_topk as i32,
-                        1,
-                        ctx.stream.cu_stream(),
-                    )
-                    .result()?;
-                }
-            }
-        }
-        if let Some(sel) = selected.as_ref() {
-            keepalive.keep_i32(sel);
-        }
+        )?;
+    } else {
+        let flash = state.flashmla.as_mut().ok_or_else(|| {
+            anyhow!("FlashMLA decode enabled but layer state has no FlashMLA arena")
+        })?;
+        let scratch = flashmla_scratch.ok_or_else(|| {
+            anyhow!("FlashMLA decode enabled but shared FlashMLA decode scratch missing")
+        })?;
+        flashmla_decode_attention(
+            ctx,
+            config,
+            attention,
+            mode,
+            compress_ratio,
+            &q_prepared,
+            &k_prepared,
+            selected.as_ref(),
+            compressed,
+            &mut state.sw_window_cache,
+            flash,
+            scratch,
+            pool,
+            start_pos,
+            start_pos_device,
+            tp,
+            local_heads,
+            &mut local_attn,
+            sm_scale,
+            rope_base,
+            original_seq_len,
+            rope.factor,
+            rope.beta_fast,
+            rope.beta_slow,
+        )?;
+    }
+    if let Some(sel) = selected.as_ref() {
+        keepalive.keep_i32(sel);
     }
     keepalive.keep_hidden(&local_attn);
 
