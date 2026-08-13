@@ -166,7 +166,7 @@ pub fn sample_token_logprob_penalized(
         None
     } else {
         let mut v = logits.to_vec();
-        for (&tok, &bias) in &params.logit_bias {
+        for &(tok, bias) in &params.logit_bias {
             if (tok as usize) < v.len() {
                 v[tok as usize] += bias;
             }
