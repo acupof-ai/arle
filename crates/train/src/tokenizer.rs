@@ -1,6 +1,5 @@
 //! Thin wrapper around HF `tokenizers` for the training side.
 //!
-//! Mirrors the split already in `infer/` (which only ever decodes today).
 //! Training needs both encode + decode + chat-template assembly against
 //! existing vocabs (the supported Qwen families share the `<|im_start|>` template).
 

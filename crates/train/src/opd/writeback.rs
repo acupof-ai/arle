@@ -78,8 +78,6 @@ pub fn batched_writeback_ce_step<O: Optimizer>(
     let b = batch.len();
 
     let mut tape = Tape::new();
-    // The batched forward spans b*max_len tokens — offload grad-checkpoints past
-    // the length that needs it.
     tape.set_offload_checkpoints(crate::runtime_flags::writeback_offload_for_seq(b * max_len));
 
     // Flat [B * max_len] input, each row = prompt ++ completion ++ pad(0). Causal
@@ -624,7 +622,6 @@ pub fn masked_writeback_step<O: Optimizer>(
     eprintln!("[masked-writeback] phase=optimizer_cleanup seconds={opt_secs:.3}");
 
     eprintln!("[masked-writeback] DONE loss={loss_value:.6} total_targets={total_targets}");
-    // Mean CE per masked token (the fused loss already applied the 1/N mean).
     Ok((loss_value, pg_stats, grad_norm))
 }
 
@@ -894,8 +891,6 @@ pub fn gkd_writeback_step<O: Optimizer, T: TeacherForward + ?Sized>(
     let mut total_loss: Option<TensorId> = None;
     for window in &windows {
         let w = window.end - window.start;
-        // Student logits for this window: slice the hidden rows, project through
-        // the lm_head, reshape to [1, w, vocab] to match the teacher window shape.
         let hidden_slice = slice(
             hidden,
             &[0, window.start, 0],

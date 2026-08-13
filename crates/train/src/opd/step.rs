@@ -415,8 +415,6 @@ pub fn opd_step_with_teacher<O: Optimizer, T: TeacherForward + ?Sized>(
             infer_rollout.as_ref(),
         )?;
 
-        // Route B (windowed) is the memory path for long rollouts and large
-        // vocabs; pure chunked-KL (lambda == 0.0) is next. Both early-return.
         let positions: Vec<u32> = (0..rollout.len() as u32).collect();
         let rt = GkdRouteCtx {
             student,
@@ -444,8 +442,8 @@ pub fn opd_step_with_teacher<O: Optimizer, T: TeacherForward + ?Sized>(
             return run_chunked_kl_route(&rt, chunk_size, optimizer, store, tape, &mut profile);
         }
 
-        // Teacher forward — tape-disabled. Teacher params have
-        // `requires_grad = false`, but disabling cheap-defends against rogue
+        // Tape is still disabled by the rollout phase here; teacher params are
+        // `requires_grad = false` anyway, so this only defends against rogue
         // grad-bearing weights.
         let phase_started = Instant::now();
         let teacher_logits = teacher
@@ -468,7 +466,6 @@ pub fn opd_step_with_teacher<O: Optimizer, T: TeacherForward + ?Sized>(
         keep_teacher_logits.insert(teacher_logits.tensor_id);
         store.retain_ids(&keep_teacher_logits);
 
-        // Student forward — tape enabled so backward can flow.
         tape.set_enabled(true);
         let phase_started = Instant::now();
         let student_logits = student
@@ -478,7 +475,6 @@ pub fn opd_step_with_teacher<O: Optimizer, T: TeacherForward + ?Sized>(
             profile.student_forward_seconds += phase_started.elapsed().as_secs_f64();
         });
 
-        // KL distill loss, optionally blended with a GKD hard-token SFT anchor.
         let phase_started = Instant::now();
         let kl_range = kl_logit_range(gkd_config.kl_mask, prompt_ids.len(), rollout.len())?;
         let (student_kl_logits, teacher_kl_logits) =
@@ -522,7 +518,6 @@ pub fn opd_step_with_teacher<O: Optimizer, T: TeacherForward + ?Sized>(
             profile.kl_loss_seconds += phase_started.elapsed().as_secs_f64();
         });
 
-        // Backward + grad clip + optimizer step.
         let phase_started = Instant::now();
         optimizer.zero_grad(store, student_params);
         record_profile(&mut profile, |profile| {

@@ -1,8 +1,4 @@
 //! Free post-backward cleanup helpers shared by the OPD training loops.
-//!
-//! The two `pub use` re-exports preserve the legacy import paths
-//! (`trainer::clip_grad_norm` / `trainer::cross_entropy_loss`) used by the
-//! OPD binaries, examples, and tests.
 
 pub use crate::grad_clip::clip_grad_norm;
 pub use crate::loss::cross_entropy_loss;
@@ -12,10 +8,6 @@ use std::collections::HashSet;
 use autograd::{Tape, TensorId, TensorStore};
 
 /// Post-backward cleanup: prune the store down to `keep_extra ∪ params ∪ grads`.
-///
-/// Matches the `tape.entries.clear(); tape.set_enabled(true);
-/// store.retain_ids(...)` idiom used across the historic hand-written
-/// training loops before the shared trainer/runtime factoring landed.
 ///
 /// Exposed `pub` so OPD eval closures that produce multi-forward activations
 /// can prune the store between windows. Note: this unconditionally re-enables

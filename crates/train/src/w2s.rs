@@ -100,7 +100,6 @@ impl W2sAuxModel {
         }
     }
 
-    /// Post-RL model parameter IDs.
     pub fn post_rl_param_ids(&self) -> Vec<TensorId> {
         match self {
             Self::InProcess { post_rl, .. } => post_rl.all_parameter_ids(),
@@ -140,8 +139,6 @@ impl W2sAuxModel {
             }
             #[cfg(feature = "cuda")]
             Self::Infer { pre_rl, post_rl } => {
-                // InferTeacher imports logits as device constants into the store;
-                // the tape is not involved (no grad flows into aux models).
                 // Reload each teacher's weights onto GPU just-in-time and offload
                 // immediately after, so only one aux engine is resident at a time.
                 post_rl
@@ -207,9 +204,7 @@ impl Default for W2sConfig {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SkipReason {
-    /// Student's max probability exceeded the confidence threshold.
     Confidence,
-    /// cos(ΔT₁, ΔT₂) was below the consistency threshold.
     Consistency,
 }
 
@@ -246,17 +241,12 @@ impl StageTimer {
     }
 }
 
-/// One w2s training step.
+/// z_proxy = z_s.detach() + α·T·(ΔT₁ + ΔT₂)/2
+/// L = T²·KL(softmax(z_s/T) ‖ softmax(z_proxy/T))
+///     + β₁·KL(π_new ‖ π_old) + β₂·KL(π_new ‖ π_base)
 ///
-/// Flow:
-/// 1. Student forward → z_s
-/// 2. Confidence filter: max(softmax(z_s)) > threshold → skip
-/// 3. Aux ΔT: ΔT₁, ΔT₂
-/// 4. Consistency gate: cos(ΔT₁, ΔT₂) < threshold → skip
-/// 5. z_proxy = z_s.detach() + α·T·(ΔT₁ + ΔT₂)/2
-/// 6. L = T²·KL(softmax(z_s/T) ‖ softmax(z_proxy/T))
-///      + β₁·KL(π_new ‖ π_old) + β₂·KL(π_new ‖ π_base)
-/// 7. Backward → shadow adapter
+/// Skips on max(softmax(z_s)) > confidence_threshold or
+/// cos(ΔT₁, ΔT₂) < consistency_threshold.
 #[allow(clippy::too_many_arguments)]
 pub fn w2s_step<O: Optimizer>(
     student: &Qwen35Model,
@@ -290,13 +280,11 @@ pub fn w2s_step<O: Optimizer>(
     .concat();
     let keep_extra = HashSet::new();
 
-    // 1. Student forward → z_s
     let z_s = student
         .forward(store, tape, input_ids, &positions)
         .map_err(|e| anyhow!("student forward: {e}"))?;
     timer.stage("student_fwd", store);
 
-    // 2. Confidence filter (host-side for Phase 1).
     // Only the last position matters for generation — prompt positions are
     // always high-confidence (the next token is the fixed prompt text), so
     // max-prob over the whole sequence would skip every sample.
@@ -325,7 +313,6 @@ pub fn w2s_step<O: Optimizer>(
 
     timer.stage("confidence", store);
 
-    // 3. Aux policy shifts ΔT₁, ΔT₂.
     let delta1 = aux1.forward_delta(input_ids, &positions, store, tape)?;
     let delta2 = if share_aux {
         // Both aux models are identical — reuse ΔT₁ instead of running the
@@ -337,7 +324,6 @@ pub fn w2s_step<O: Optimizer>(
 
     timer.stage("aux_delta", store);
 
-    // 4. Consistency gate (host-side for Phase 1).
     let d1_host = store.to_host(delta1)?;
     let d2_host = store.to_host(delta2)?;
     let consistency = cosine_similarity(&d1_host, &d2_host);
@@ -358,13 +344,11 @@ pub fn w2s_step<O: Optimizer>(
 
     timer.stage("consistency", store);
 
-    // 5. Build proxy teacher: z_proxy = z_s.detach() + α·T·(ΔT₁ + ΔT₂)/2.
     let z_s_detached = store.detach(z_s)?;
     let avg_delta = mul_scalar(add(delta1, delta2, store, tape)?, 0.5, store, tape)?;
     let scaled_delta = mul_scalar(avg_delta, cfg.alpha * cfg.temperature, store, tape)?;
     let z_proxy = add(z_s_detached, scaled_delta, store, tape)?;
 
-    // 6a. Reverse KL distillation loss.
     let loss_kd = kl_distill_loss(
         z_s,
         z_proxy,
@@ -377,7 +361,6 @@ pub fn w2s_step<O: Optimizer>(
 
     timer.stage("kd_loss", store);
 
-    // 6b. Local KL regularizer: π_new vs π_old (previous adapter).
     let z_old = student_old
         .forward(store, tape, input_ids, &positions)
         .map_err(|e| anyhow!("student_old forward: {e}"))?;
@@ -394,7 +377,6 @@ pub fn w2s_step<O: Optimizer>(
 
     timer.stage("local_kl", store);
 
-    // 6c. Global KL regularizer: π_new vs π_base (no adapter).
     let z_base = student_base
         .forward(store, tape, input_ids, &positions)
         .map_err(|e| anyhow!("student_base forward: {e}"))?;
@@ -416,7 +398,6 @@ pub fn w2s_step<O: Optimizer>(
 
     timer.stage("global_kl", store);
 
-    // 7. Backward + optimizer step.
     let loss_value = store.to_host(loss)?[0];
     tape.backward(loss, store)?;
     timer.stage("backward", store);
@@ -442,7 +423,6 @@ pub fn w2s_step<O: Optimizer>(
     })
 }
 
-/// Host-side cosine similarity of two flat f32 vectors.
 fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     debug_assert_eq!(a.len(), b.len(), "cosine_similarity: length mismatch");
     let mut dot = 0.0f32;

@@ -1,8 +1,8 @@
 //! Teacher-forward abstraction for OPD.
 //!
 //! Phase 2 of the large-to-small OPD path needs two teacher sources behind
-//! the same train-side contract: the existing in-process `Qwen35Model` teacher
-//! and, next, an `infer` runtime teacher. `DeviceLogits` intentionally carries
+//! the same train-side contract: the in-process `Qwen35Model` teacher and an
+//! `infer` runtime teacher. `DeviceLogits` intentionally carries
 //! a `TensorId` in the caller's `TensorStore` so the KL path can stay on the
 //! same backend without a host materialization.
 
