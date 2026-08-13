@@ -39,7 +39,6 @@ impl Qwen35Model {
     /// sized from LOCAL shard widths (each rank carries only its own v-head
     /// recurrent slabs / qkv conv channels). Single source for both
     /// [`Qwen35SlotState::acquire_recurrent`] and the spec snapshot scratch.
-
     pub(crate) fn recurrent_dims(&self) -> (usize, usize, usize) {
         let c = &self.config;
         let num_linear = c.num_hidden_layers - c.num_full_attention_layers();
@@ -52,7 +51,6 @@ impl Qwen35Model {
     /// A fresh idle slot — allocates nothing. The recurrent state is drawn from
     /// the executor's free-list on activation ([`Qwen35SlotState::acquire_recurrent`]);
     /// the full-attn K/V lives in the shared `PagedKVPool`.
-
     pub(crate) fn new_slot_state(&self) -> Qwen35SlotState {
         Qwen35SlotState::new_linear_only()
     }
@@ -154,7 +152,6 @@ impl Qwen35Model {
     /// Unified with DSv4 through the infer-seam budget kernel; the affordable
     /// count is NCCL min-reduced for TP-consistent slot counts. Call AFTER
     /// weights load so `mem_get_info().free` already excludes them.
-
     pub(crate) fn kv_budget_num_slots(
         &self,
         requested: usize,

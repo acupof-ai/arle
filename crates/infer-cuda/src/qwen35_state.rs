@@ -680,7 +680,6 @@ impl Qwen35SlotState {
 }
 
 #[allow(dead_code)] // consumed by mtp_forward_level + spec_step
-
 impl DenseMlp {
     /// Half the fused projection's output rows (SwiGLU gate+up).
     pub(crate) fn inter_dim(&self) -> usize {

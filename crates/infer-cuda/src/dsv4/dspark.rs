@@ -21,7 +21,6 @@
 
 use super::layer_block::HcHalf;
 use super::*;
-use deepseek_spec::DeepSeekV4RopeParameters;
 
 /// Per-slot draft context cache. Per stage, ONE `latent_kv` buffer (K==V) laid
 /// out `[position][head_dim]`, LINEAR from `ctx_base` (`row = abs − ctx_base`).

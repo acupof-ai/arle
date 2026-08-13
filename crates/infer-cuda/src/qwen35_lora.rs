@@ -375,7 +375,7 @@ impl Qwen35Model {
             out.push(SharedBf16BaseProjection {
                 layer_idx,
                 proj_suffix: suffix,
-                data_ptr: ptr as u64,
+                data_ptr: ptr,
                 rows: m.rows,
                 cols: m.cols,
             });

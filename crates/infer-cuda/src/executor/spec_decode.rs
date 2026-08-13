@@ -60,13 +60,13 @@ pub(super) fn route_decode(
 /// no-spec when it emits more than `t_mtp/t_nospec` tok/step; below the
 /// matching acceptance rate the gate runs a warm no-spec step instead so
 /// typical prompts stop paying the speculation tax.
-
+///
 /// Minimum running accept-rate EMA to keep speculating. Default 0.55 = the dt=3
 /// break-even on 8xH20 TP4 (t_mtp ~68ms / t_nospec ~26ms => need >2.6 tok/step =>
 /// accept >~0.55). Override with `--mtp-min-accept` for other depths.
 /// ponytail: a fixed depth-tuned threshold; upgrade path is to self-calibrate
 /// from measured step times.
-
+///
 /// Force one real spec step after this many consecutive gated skips, to refresh
 /// the acceptance EMA — else a dip below threshold never recovers (no new accept
 /// data arrives while skipping).
