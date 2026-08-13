@@ -410,7 +410,7 @@ pub(crate) struct Dsv4KvAdapter {
     /// FlashMLA layers and slots (#60). `None` when FlashMLA decode is disabled
     /// at the build/override level (no arena), or when the model has no FlashMLA
     /// layer. Sized for `max_batch = num_slots` rows. Engaged only on the n>1
-    /// batched lane when `dsv4_flashmla_decode_batched_enabled()`.
+    /// batched lane when `dsv4_flashmla_decode_enabled()`.
     pub(super) flashmla_batch: Option<Dsv4FlashMlaDecodeBatchScratch>,
     /// One shared SINGLE-ROW (`s_q = 1`) FlashMLA decode SCRATCH for ALL FlashMLA
     /// layers and slots (#85 P3). Hoisted out of the per-(slot,layer)
