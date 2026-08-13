@@ -234,7 +234,7 @@ fn record_profile(
     }
 }
 
-fn step_trace_enabled() -> bool {
+pub(crate) fn step_trace_enabled() -> bool {
     match std::env::var("ARLE_OPD_STEP_TRACE") {
         Ok(value) => !(value == "0" || value.eq_ignore_ascii_case("false")),
         Err(_) => false,
