@@ -1,123 +1,76 @@
-//! DSv4 cross-request prefix-state pool (#154 Phase 2 reland).
+//! DSv4 cross-request prefix-state pool: one HOST-resident entry per host page
+//! id, holding what a restore at token boundary `page_tokens·(k+1)` needs from
+//! every layer. Content identity rides the host page id — the radix dedupes
+//! prefix chains, so matching prefixes share ids and non-matching content never
+//! collides. Storage is the `KvTierStore` host level plus its mmap spill.
 //!
-//! One HOST-resident entry per (host page id): everything a restore at token
-//! boundary `page_tokens·(k+1)` needs from every layer, D2H'd once when the
-//! page completes. Content identity rides the host page id — the radix
-//! dedupes prefix chains, so matching prefixes share host page ids and
-//! non-matching content never collides (the D1 flaw is unrepresentable).
-//! Zero HBM footprint: the pool IS the L2 tier (`KvTierStore` host level);
-//! L3 is the same store's mmap spill.
-//!
-//! Entry sections split by observability: content sections (staging/dsa
-//! rows) are positional storage, capturable post-forward for every completed
-//! page; boundary sections (overlap registers + ring) are transient — the
-//! registers are overwritten every `ratio` tokens and the ring wraps every
-//! `sliding_window` tokens, so they exist only at the forward's own end.
-//! v1 therefore restores at chunk/tick-end boundaries (the planner already
-//! forces prefill chunk ends onto `sliding_window` alignment). v2 (per-page
-//! boundary granularity) needs a kernel-side per-block overlap output buffer
-//! — the CUDA compressor's `overlap_page_stride` param can target a per-slot
-//! capture buffer (no sharing, no D1 risk); design-only, not implemented.
-//!
-//! Under TP every rank redundantly holds its own shard's entries (state is
-//! rank-replicated by construction) — DRAM cost is ×world; a rank-0-only
-//! layout is a later optimization. Weight updates: DSv4 has no live-reload
-//! path (both executor arms bail), the L3 namespace is per-process ephemeral,
-//! and the engine's `invalidate_prefix_cache` drops every entry through the
-//! `release_prefix_pages` seam — no cross-epoch reuse window.
+//! Boundary sections (overlap registers + ring) are transient — the registers
+//! are overwritten every `ratio` tokens and the ring wraps every
+//! `sliding_window` tokens — so they exist only at the forward's own end;
+//! restores therefore commit at chunk/tick-end boundaries.
 
 use std::collections::BTreeMap;
 
 use super::*;
 use kv_native_sys::{KvTierStore, tier_key};
 
-/// DSv4 cross-request prefix-state entries (key = host page id) — the
-/// content-keyed per-page pool (#154 Phase 2). Registry note: NS 1-4 (slot
-/// park + sidecar) live in `executor.rs`.
+/// Namespace of the prefix-state entries (NS 1-4 live in `executor.rs`).
 const NS_PREFIX_STATE: u64 = 5;
 
-/// Rows per FP8 DSA key-cache page (`dsv4_dsa_official.cu` fused-store:
-/// `kPageBytes = 132 << 6` = 64 rows × (128 B data + 4 B f32 scale)).
+/// Rows per FP8 DSA key-cache page (`dsv4_dsa_official.cu`: `kPageBytes =
+/// 132 << 6` = 64 rows × (128 B data + 4 B f32 scale)).
 const DSA_PAGE_ROWS: usize = 64;
 
-/// One layer's share of a per-page entry. Content sections (`staging`,
-/// `dsa_*`) are captured for EVERY completed page; boundary sections
-/// (`overlap_*`, `idx_overlap_*`, `ring`) only when the forward ended
-/// exactly at the page end (the registers/ring for an overshot boundary are
-/// already advanced past it and unrecoverable). Empty vec = section absent
-/// for this layer/page.
+/// One layer's share of a per-page entry; empty vec = section absent. Boundary
+/// sections (`overlap_*`, `idx_overlap_*`, `ring`) only exist when the forward
+/// ended exactly at the page end — an overshot boundary is unrecoverable.
 ///
-/// The FP8 compressed band is NOT captured: it is derived state (staging
-/// quantized), only written on the DECODE lane (`flashmla_pack_compressed_delta`),
-/// so at prefill-time capture it is still the `zero_slot_band` zeros —
-/// restoring it corrupted every warm decode (E2, pod-proven 2026-07-09:
-/// publish fingerprints showed `band=0/196224` for every prefill-published
-/// page). Restore instead leaves `fp8_kv_comp_packed_rows=0` and the first
-/// post-restore decode's bulk pack rebuilds the band from the restored
-/// staging.
+/// The FP8 compressed band is NOT captured: it is written only on the decode
+/// lane, so a prefill-time capture holds zeros and restoring it corrupts every
+/// warm decode; the first post-restore decode's bulk pack rebuilds it from the
+/// restored staging.
 #[derive(Default, PartialEq)]
 pub(crate) struct Dsv4LayerPageState {
-    /// Main compressor bf16 staging rows (A2: read as full history by the
-    /// hybrid CSA/HCA attention). Indexer staging is NOT captured — its only
-    /// reader drains the delta `[packed_rows, seq_len)`, empty at a boundary.
+    /// Main compressor bf16 staging rows. Indexer staging is NOT captured — its
+    /// only reader drains the delta `[packed_rows, seq_len)`, empty at a boundary.
     pub(super) staging: Vec<half::bf16>,
-    /// FP8 DSA key-cache rows (paged data bytes, B1-B3 layout).
     pub(super) dsa_data: Vec<u8>,
-    /// FP8 DSA key-cache f32 scales for the same rows.
     pub(super) dsa_scale: Vec<u8>,
-    /// Main compressor `prev_overlap_kv` at the page-end boundary.
     pub(super) overlap_kv: Vec<half::bf16>,
-    /// Main compressor `prev_overlap_score` at the page-end boundary.
     pub(super) overlap_score: Vec<half::bf16>,
-    /// Indexer `prev_overlap_kv` at the page-end boundary.
     pub(super) idx_overlap_kv: Vec<half::bf16>,
-    /// Indexer `prev_overlap_score` at the page-end boundary.
     pub(super) idx_overlap_score: Vec<half::bf16>,
-    /// Full bf16 SW ring at the page-end boundary (FP8 ring region is NOT
-    /// stored: restore sets `fp8_kv_sw_bootstrapped=false` and the existing
-    /// bootstrap repacks from this ring — the bf16 ring stays the single
-    /// source, A14 resolved by design).
+    /// Full bf16 SW ring (the FP8 ring region is rebuilt from it by the
+    /// bootstrap, so bf16 stays the single source).
     pub(super) ring: Vec<half::bf16>,
-    /// Frontier-tail sections (finish write-through, `--dsv4-decode-reuse`):
-    /// the sub-page `tail` the radix match can't cover (`[matched_len,
-    /// finish_len)`, < page_tokens). Present ONLY on the frontier entry when a
-    /// finish landed off a page boundary; empty otherwise (aligned finishes and
-    /// every non-frontier page). Captured after the finish forward, so the whole
-    /// frontier carry (overlap/idx_overlap/ring/pending) reflects `finish_len`.
-    ///
-    /// `pending_kv/score`: the incomplete compress block's raw rows (`finish_len
-    /// % ratio` tokens × width) — the next forward derives `pending_len =
-    /// finish_len % ratio` and reads exactly these.
+    /// Frontier-tail sections: the sub-page tail `[matched_len, finish_len)` the
+    /// radix match can't cover, present only on the frontier entry when a finish
+    /// landed off a page boundary. `pending_*` = the incomplete compress block's
+    /// raw rows (`finish_len % ratio` tokens × width).
     pub(super) pending_kv: Vec<half::bf16>,
     pub(super) pending_score: Vec<half::bf16>,
-    /// Indexer pending of the same tail (`finish_len % index_ratio` tokens ×
-    /// indexer width) — #165: without it an off-ratio restore left the prior
-    /// occupant's rows in the indexer's bf16 pending.
+    /// #165: without it an off-ratio restore left the prior occupant's rows in
+    /// the indexer's bf16 pending.
     pub(super) idx_pending_kv: Vec<half::bf16>,
     pub(super) idx_pending_score: Vec<half::bf16>,
-    /// Completed compress rows of the tail page (`[matched_len/ratio,
-    /// finish_len/ratio)`), restored past the frontier page's own rows.
     pub(super) tail_staging: Vec<half::bf16>,
-    /// FP8 DSA key-cache rows of the tail page (`[matched_len/ir,
-    /// finish_len/ir)`, no cache-page straddle: starts at a 16-row multiple,
+    /// Tail-page DSA rows; no cache-page straddle (starts at a 16-row multiple,
     /// < 16 rows).
     pub(super) tail_dsa_data: Vec<u8>,
     pub(super) tail_dsa_scale: Vec<u8>,
 }
 
-/// One host page's captured state across all layers.
 pub(crate) struct Dsv4PrefixPageEntry {
-    /// Slot-logical page index the entry was captured at. KV content is
-    /// position-dependent, so a restore must see the same index — a mismatch
-    /// means the host page id was recycled into different content.
+    /// KV content is position-dependent, so a restore must see the same index —
+    /// a mismatch means the host page id was recycled into different content.
     pub(crate) page_index: u32,
     /// Boundary sections present (forward ended exactly at this page's end).
     pub(crate) boundary: bool,
     pub(crate) layers: Vec<Dsv4LayerPageState>,
 }
 
-// Magic doubles as format version: bumped on layout change so stale entries
-// fail-close at the header instead of misparsing positional sections.
+// Doubles as format version: bumped on layout change so stale entries fail-close
+// at the header instead of misparsing positional sections.
 const ENTRY_MAGIC: &[u8; 4] = b"DSP2";
 
 fn push_bytes(buf: &mut Vec<u8>, v: &[u8]) {
@@ -253,8 +206,7 @@ impl Dsv4PrefixPageEntry {
 }
 
 /// STATIC upper bound on one encoded entry — MUST mirror the capture fns +
-/// codec framing (kept adjacent so drift is visible). Sizes the pool store's
-/// fixed page slots (worst case = boundary entry with ring).
+/// codec framing. Sizes the pool store's fixed page slots.
 pub(crate) fn dsv4_prefix_entry_max_bytes(
     config: &DeepSeekV4Config,
     layer_specs: &[(DeepSeekV4AttentionMode, usize)],
@@ -264,16 +216,14 @@ pub(crate) fn dsv4_prefix_entry_max_bytes(
     let mut total = 13usize; // entry header (magic + page_index + boundary + n_layers)
     for &(mode, ratio) in layer_specs {
         total += 15 * 4; // section length prefixes
-        // ring — every layer has an SW window cache.
         total += config.sliding_window * config.head_dim * bf16;
         // ceil, not floor: for ratio > page_tokens a page can still complete
-        // one row (page_row_span), and the predictor must never undersize.
+        // one row, and the predictor must never undersize.
         if mode.has_compressor() && ratio > 0 {
             let rpp = page_tokens.div_ceil(ratio);
-            // staging + tail_staging (both ≤ one page of compress rows).
             total += 2 * rpp * config.head_dim * bf16;
-            total += 2 * ratio * config.head_dim * bf16; // overlap kv+score
-            // pending kv+score: `ratio·width`, width ≤ 2·head_dim (overlap).
+            total += 2 * ratio * config.head_dim * bf16;
+            // pending kv+score width ≤ 2·head_dim (overlap).
             total += 2 * ratio * (2 * config.head_dim) * bf16;
         }
         if mode.has_indexer() {
@@ -283,11 +233,10 @@ pub(crate) fn dsv4_prefix_entry_max_bytes(
                 ratio.max(1)
             };
             let rpp = page_tokens.div_ceil(index_ratio);
-            // dsa data+scale + tail dsa data+scale (both ≤ one page of rows).
             total += 2 * rpp * (config.index_head_dim + 4);
-            total += 2 * index_ratio * config.index_head_dim * bf16; // idx overlap
-            // idx pending kv+score: indexer is built with overlap=true, width
-            // = 2·index_head_dim.
+            total += 2 * index_ratio * config.index_head_dim * bf16;
+            // idx pending: indexer is built with overlap=true, width =
+            // 2·index_head_dim.
             total += 2 * index_ratio * (2 * config.index_head_dim) * bf16;
         }
     }
@@ -298,34 +247,26 @@ pub(crate) fn dsv4_prefix_entry_max_bytes(
 pub(crate) struct Dsv4PrefixPageMeta {
     /// Entry carries the boundary sections (restore may commit here).
     pub(crate) boundary: bool,
-    /// Radix publish confirmed this page (executor `save_prefix_sidecar` arm).
-    /// A provisional entry's page id may recycle after an unpublished free —
-    /// its content stays write-only (restore rejects) until confirmed.
+    /// A provisional entry's page id may recycle after an unpublished free — its
+    /// content stays write-only (restore rejects) until confirmed.
     pub(crate) confirmed: bool,
     /// Last publish/read stamp — the entry's key into `lru`.
     stamp: u64,
 }
 
 /// Host-resident content-keyed pool: page id → encoded [`Dsv4PrefixPageEntry`].
-/// Storage rides ONE dedicated [`KvTierStore`] (host DRAM level = L2;
-/// `set_disk` adds the mmap L3). `meta` is the exact host index — the store
-/// never drops keys on its own, so the two cannot drift.
+/// `meta` is the exact host index — the store never drops keys on its own.
 pub(crate) struct Dsv4PrefixStatePool {
     store: KvTierStore,
     meta: BTreeMap<u32, Dsv4PrefixPageMeta>,
-    /// Over-cap eviction index `(confirmed, stamp, page id)`: provisional
-    /// entries drop before confirmed ones (a confirmed boundary entry is the
-    /// most valuable byte in the pool), LRU within each tier. Reads touch
-    /// (restore traffic keeps a hot shared preamble resident); a FIFO here
-    /// evicted the hottest first-published preamble under DRAM pressure and
-    /// floor-0-locked the whole chain.
+    /// Over-cap eviction index `(confirmed, stamp, page id)`: provisional entries
+    /// drop before confirmed ones, LRU within each tier. A FIFO here evicted the
+    /// hottest first-published preamble and floor-0-locked the whole chain.
     lru: std::collections::BTreeSet<(bool, u64, u32)>,
-    /// Frontier page id → the sub-page tail token ids `[matched_len, finish_len)`
-    /// carried by that page's finish-write-through entry. The content-identity
-    /// index: the radix proves identity only to the page boundary, so a restore
-    /// that extends into the tail MUST verify these against the requesting
-    /// prompt (a `&self` reusable scan can't `read_entry`, which is `&mut`, so
-    /// the ids live here in memory, not just in the serialized entry).
+    /// Frontier page id → the sub-page tail token ids `[matched_len, finish_len)`.
+    /// The radix proves identity only to the page boundary, so a restore that
+    /// extends into the tail must verify these against the requesting prompt;
+    /// they live in memory because a `&self` scan can't `read_entry` (`&mut`).
     frontier_tails: BTreeMap<u32, Vec<u32>>,
     clock: u64,
     entry_bytes: usize,
@@ -357,7 +298,6 @@ impl Dsv4PrefixStatePool {
     }
 
     /// Record the finish-frontier tail token ids for `page_id` (empty ⇒ clear).
-    /// Set by `capture_finish_frontier` after publishing the frontier entry.
     pub(crate) fn set_frontier_tail(&mut self, page_id: u32, tokens: Vec<u32>) {
         if tokens.is_empty() {
             self.frontier_tails.remove(&page_id);
@@ -366,7 +306,6 @@ impl Dsv4PrefixStatePool {
         }
     }
 
-    /// The finish-frontier tail token ids for `page_id`, if it carries one.
     pub(crate) fn frontier_tail_tokens(&self, page_id: u32) -> Option<&[u32]> {
         self.frontier_tails.get(&page_id).map(Vec::as_slice)
     }
@@ -376,8 +315,7 @@ impl Dsv4PrefixStatePool {
         self.clock
     }
 
-    /// Move `page_id` to the back of its LRU tier (and optionally across
-    /// tiers on confirm). Meta must exist.
+    /// Move `page_id` to the back of its LRU tier (and across tiers on confirm).
     fn touch(&mut self, page_id: u32, confirm: bool) {
         let stamp = self.next_stamp();
         let Some(meta) = self.meta.get_mut(&page_id) else {
@@ -417,13 +355,11 @@ impl Dsv4PrefixStatePool {
         self.store.io_stats()
     }
 
-    /// Insert (LAST producer wins). Host page ids recycle when freed, so a
-    /// republish under a recycled id MUST overwrite — a page a slot completes
-    /// is either radix-shared (content-identical) or slot-exclusive, so the
-    /// newest content is always the correct one. When both levels are full,
-    /// drop oldest entries and retry (capacity never blocks the forward).
-    /// Eviction skips `protected` (the publishing slot's chain) — else page k
-    /// evicts its own provisional page k-1 and the chain never confirms.
+    /// Insert (LAST producer wins): a recycled id's newest content is always the
+    /// correct one, since a completed page is radix-shared or slot-exclusive.
+    /// When both levels are full, drop oldest entries and retry. Eviction skips
+    /// `protected` (the publishing slot's chain) — else page k evicts its own
+    /// provisional page k-1 and the chain never confirms.
     pub(crate) fn publish(
         &mut self,
         page_id: u32,
@@ -445,9 +381,8 @@ impl Dsv4PrefixStatePool {
                 }
             }
         }
-        // Carry `confirmed` forward: a confirmed id still present is still
-        // radix-held (evict would have dropped it), so any overwrite is a
-        // content-identical sharer's republish.
+        // Carry `confirmed` forward: a confirmed id still present is radix-held,
+        // so any overwrite is a content-identical sharer's republish.
         let old = self.meta.get(&page_id).copied();
         let confirmed = old.is_some_and(|m| m.confirmed);
         if let Some(old) = old {
@@ -471,8 +406,8 @@ impl Dsv4PrefixStatePool {
                 stamp,
             },
         );
-        // A republish overwrites content; the finish tail (if any) is set
-        // separately by `set_frontier_tail` right after — clear any stale one.
+        // A republish overwrites content; `set_frontier_tail` re-sets the tail
+        // right after — clear any stale one.
         self.frontier_tails.remove(&page_id);
         true
     }
@@ -487,10 +422,9 @@ impl Dsv4PrefixStatePool {
         }
     }
 
-    /// Fill a canonical id's frontier tail from the finishing slot's own id
-    /// when the canonical lacks one (content-identical by construction) — never
-    /// clobber an existing tail. Lets a finish tail attach to an already-present
-    /// canonical entry across the `adopt_canonical` early returns (#159).
+    /// Fill a canonical id's frontier tail from the finishing slot's own id when
+    /// the canonical lacks one (content-identical by construction) — never
+    /// clobber an existing tail.
     fn adopt_frontier_tail(&mut self, canonical: u32, own: u32) {
         if !self.frontier_tails.contains_key(&canonical)
             && let Some(tail) = self.frontier_tails.get(&own).cloned()
@@ -499,26 +433,21 @@ impl Dsv4PrefixStatePool {
         }
     }
 
-    /// #157 repair — the floor-0 self-lock breaker. Radix dedup keeps the
-    /// CANONICAL page id; a recomputing slot publishes onto its OWN page id,
-    /// so once a canonical entry evicts, nothing ever re-attaches state to
-    /// the canonical chain. At confirm time, adopt the finishing slot's
-    /// provisional entry for the same position: content is identical by
-    /// construction (same token positions, recomputed). Guard: never clobber
+    /// #157: radix dedup keeps the CANONICAL page id while a recomputing slot
+    /// publishes onto its OWN, so once a canonical entry evicts nothing
+    /// re-attaches state to the canonical chain. Adopt the finishing slot's
+    /// provisional entry (content-identical by construction), never clobbering
     /// an existing confirmed canonical entry.
     pub(crate) fn adopt_canonical(&mut self, canonical: u32, own: u32) {
         match self.meta.get(&canonical) {
-            // Canonical entry already exists (confirmed or provisional). Carry
-            // the finishing slot's frontier tail onto it — else a continuation
-            // after radix dedup loses the sub-page tail reuse (#159). Content is
-            // identical by construction; only fill a gap, never clobber.
+            // Only fill a missing tail — else a continuation after radix dedup
+            // loses the sub-page tail reuse (#159).
             Some(m) if m.confirmed => {
                 self.adopt_frontier_tail(canonical, own);
                 return;
             }
-            // Canonical id is radix-retained (never recycled while cached), so
-            // a provisional entry under it holds the canonical content —
-            // confirm in place.
+            // Canonical id is radix-retained, so a provisional entry under it
+            // holds the canonical content — confirm in place.
             Some(_) => {
                 self.adopt_frontier_tail(canonical, own);
                 self.touch(canonical, true);
@@ -526,7 +455,6 @@ impl Dsv4PrefixStatePool {
             }
             None => {}
         }
-        // Re-key the slot's own provisional entry to the canonical id.
         let Some(own_meta) = self.meta.get(&own).copied().filter(|m| !m.confirmed) else {
             return;
         };
@@ -535,7 +463,7 @@ impl Dsv4PrefixStatePool {
         let Ok(bytes) = self.store.read(own_key).map(|b| b.into_owned()) else {
             return;
         };
-        // Carry the frontier tail across the re-key (remove_pages drops own's).
+        // Carry the tail across the re-key — `remove_pages` drops own's.
         let own_tail = self.frontier_tails.get(&own).cloned();
         self.remove_pages(&[own]);
         let canonical_key = tier_key(NS_PREFIX_STATE, u64::from(canonical));
@@ -585,12 +513,10 @@ impl Dsv4PrefixStatePool {
         } else {
             self.host_read_hits = self.host_read_hits.saturating_add(1);
         }
-        // Read-on-miss promote: a disk-resident entry that restores is hot —
-        // re-insert to the host level (its LRU spills something colder), then
-        // drop the now-superseded disk record (else the key is double-resident
-        // and the soft-cap math counts it twice). Only when the insert actually
-        // landed in HOST — a full host level routes the insert back to disk,
-        // and removing the record then would lose the entry.
+        // Promote a restored disk entry to host, then drop the superseded disk
+        // record (else double-resident and the soft-cap counts it twice). Only
+        // when the insert landed in HOST — a full host level routes it back to
+        // disk, and removing the record then would lose the entry.
         if promote
             && self.store.insert(key, bytes)
             && matches!(
@@ -600,13 +526,11 @@ impl Dsv4PrefixStatePool {
         {
             self.store.remove_disk_only(key);
         }
-        // Touch-on-read: a restored entry is hot — LRU, not publish-order FIFO.
         self.touch(page_id, false);
         Ok(entry)
     }
 
-    /// Radix evicted these host pages: drop their entries (eviction rides the
-    /// radix; the pool holds no independent lifetime).
+    /// Radix evicted these host pages — the pool holds no independent lifetime.
     pub(crate) fn remove_pages(&mut self, pages: &[u32]) {
         let keys: Vec<u64> = pages
             .iter()
@@ -622,11 +546,9 @@ impl Dsv4PrefixStatePool {
         }
     }
 
-    /// A slot freed these pages back to the pool: drop only the NON-confirmed
-    /// entries (write-only, never radix-published). A freed id recycles, and a
-    /// lingering provisional entry could later be confirmed as if it held the
-    /// new occupant's content. Confirmed entries are radix-retained (their
-    /// pages never free while the entry lives) and stay.
+    /// A slot freed these pages: drop only the NON-confirmed entries. A freed id
+    /// recycles, and a lingering provisional entry could later be confirmed as if
+    /// it held the new occupant's content.
     pub(crate) fn remove_provisional_pages(&mut self, pages: &[u32]) {
         let provisional: Vec<u32> = pages
             .iter()
@@ -640,8 +562,8 @@ impl Dsv4PrefixStatePool {
 impl Dsv4LayerAttentionState {
     /// D2H one host page's share of this layer's state. `boundary` additionally
     /// captures the page-end registers + ring — valid only when the forward
-    /// ended exactly at `page_tokens·(page_index+1)` (the caller's contract).
-    /// Host vectors are stream-ordered; the caller fences after all layers.
+    /// ended exactly at `page_tokens·(page_index+1)`. Host vectors are
+    /// stream-ordered; the caller fences after all layers.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn capture_prefix_page(
         &self,
@@ -752,8 +674,8 @@ impl Dsv4LayerAttentionState {
                     .memcpy_htod(&state.staging, &mut view)
                     .map_err(|e| anyhow!("DSv4 prefix restore staging H2D failed: {e}"))?;
             } else {
-                // Capture derives the same span from the same config — a
-                // stored section here means capture-era shape drift.
+                // Capture derives the same span from the same config — a stored
+                // section here means capture-era shape drift.
                 ensure!(
                     state.staging.is_empty(),
                     "DSv4 prefix restore: entry has staging rows for a page the live shape completes none"
@@ -842,12 +764,9 @@ impl Dsv4LayerAttentionState {
         Ok(())
     }
 
-    /// D2H the frontier-tail sections onto `out` (already holding this frontier
-    /// page's own content+carry): the sub-page tail the radix match can't cover,
-    /// `[matched_len, finish_len)`. `pending_kv/score` = the incomplete compress
-    /// block (`finish_len % ratio` tokens); `tail_staging`/`tail_dsa_*` = the
-    /// tail page's completed compress / DSA rows. The caller fences after all
-    /// layers before reading them.
+    /// D2H the sub-page tail `[matched_len, finish_len)` onto `out` (already
+    /// holding this frontier page's own content+carry). The caller fences after
+    /// all layers before reading them.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn capture_frontier_tail(
         &self,
@@ -1030,17 +949,12 @@ impl Dsv4LayerAttentionState {
         Ok(())
     }
 
-    /// Host counters for a restore at `restore_len` (the frontier position:
-    /// page-aligned `matched_len` for a plain restore, or `finish_len` for a
-    /// finish write-through — the formula floors either way): staging/indexer
-    /// row counts, DSA packed rows, and the FlashMLA FP8 counters.
-    /// `fp8_kv_sw_bootstrapped=false` forces the SW-ring repack from the restored
-    /// bf16 ring (A14); `fp8_kv_comp_packed_rows=0` forces the first post-restore
-    /// decode's bulk pack to rebuild the FP8 band from the restored staging (the
-    /// band itself is never captured — see [`Dsv4LayerPageState`]). `pending_kv/
-    /// score` are NOT zeroed here: an off-`ratio` `restore_len` carries a
+    /// Host counters for a restore at `restore_len` (page-aligned `matched_len`,
+    /// or `finish_len` for a finish write-through). The zeroed FP8 counters force
+    /// the SW-ring repack and the band rebuild from the restored bf16 state.
+    /// `pending_kv/score` are NOT zeroed: an off-`ratio` `restore_len` carries a
     /// sub-`ratio` tail that [`Self::restore_frontier_tail`] wrote and the next
-    /// forward reads (`pending_len = restore_len % ratio`, `attention.rs:7638`).
+    /// forward reads.
     pub(crate) fn restore_prefix_counters(
         &mut self,
         mode: DeepSeekV4AttentionMode,
@@ -1062,10 +976,9 @@ impl Dsv4LayerAttentionState {
         } else {
             0
         };
-        // The restore rewrote the bf16 carry (overlap registers + pending tail)
-        // while the FP32 probe carry still holds the previous occupant — the
-        // next probe reseeds FP32 from the restored bf16 (cross-request
-        // contamination otherwise).
+        // The restore rewrote the bf16 carry while the FP32 probe carry still
+        // holds the previous occupant — reseed it, else cross-request
+        // contamination.
         if let Some(c) = &mut self.compressor {
             c.compressed.seq_len = comp_rows;
             c.fp32_carry_stale = true;
@@ -1085,9 +998,8 @@ impl Dsv4LayerAttentionState {
 }
 
 /// Compressed rows newly COMPLETED by host page `page_index`:
-/// `[page_start/ratio, page_end/ratio)`. Uniform over every ratio — cr=4 →
-/// 16 rows/page; cr=128 → a row lands on the page whose tokens complete it
-/// (0 rows on the other page); ratio=1 → 64 rows/page.
+/// `[page_start/ratio, page_end/ratio)`. Uniform over every ratio — for
+/// ratio > page_tokens a row lands on the page whose tokens complete it.
 fn page_row_span(page_tokens: usize, ratio: usize, page_index: usize) -> (usize, usize) {
     let start = (page_index * page_tokens) / ratio;
     let end = ((page_index + 1) * page_tokens) / ratio;
@@ -1155,10 +1067,9 @@ fn staging_tail_range(
     Ok(Some(staging_elem_range(c, row0, count)?))
 }
 
-/// Byte ranges of one host page's rows in the slot's FP8 DSA key-cache band
-/// (`None` when the page completes no row): paged layout
-/// `[64×index_head_dim data][64×f32 scales]` per page — the B1-B3 lesson:
-/// never flat `row × (dim+4)` math.
+/// Byte ranges of rows in the slot's FP8 DSA key-cache band: paged layout
+/// `[64×index_head_dim data][64×f32 scales]` per page, never flat
+/// `row × (dim+4)` math.
 #[allow(clippy::type_complexity)]
 fn dsa_byte_ranges(
     pool: &Dsv4LayerKvLayout,

@@ -1,30 +1,15 @@
 use super::*;
 use crate::qwen35::alloc_recurrent_block;
 
-/// Whole-step Qwen3.5/3.6 decode graph enabled? Default ON;
-/// `--qwen35-decode-graph false` is the escape hatch and the same-binary A/B
-/// arm. The eager path stays the correctness floor; `Qwen35CudaExecutor::warmup`
-/// additionally gates TP and host-routed MoE off regardless of this.
 fn qwen35_decode_graph_enabled() -> bool {
     crate::runtime_flags::qwen35_decode_graph()
 }
 
-/// Batched rows>1 decode for Qwen3.5/3.6 (stage 1, contiguous KV) — re-port
-/// of the deleted monolith's `decode_batch` design
-/// ([`crate::qwen35::Qwen35BatchDecodeState`]). DEFAULT ON: before this path
-/// existed, a rows>1 plan was a hard executor error (`rows == 1` ensure →
-/// engine death), so even a conservative batched path strictly dominates the
-/// status quo. `--qwen35-batched-decode false` is the escape hatch AND the
-/// honest same-binary A/B arm: it processes rows>1 decode plans as sequential
-/// per-row single-row forwards instead (a NEW loop — the old behavior was
-/// death, not a fallback). rows==1 plans never consult this gate (the
-/// single-row path is byte-identical either way).
 fn qwen35_batched_decode_enabled() -> bool {
     crate::runtime_flags::qwen35_batched_decode()
 }
 
-/// Grow the host pool's `slot` to `target` — spec decode writes a whole draft
-/// chain past the one token the engine pre-allocated.
+/// Spec decode writes a whole draft chain past the one token the engine pre-allocated.
 fn grow_host_slot_to(host_kv: &mut dyn KvPool, slot: usize, target: usize) -> Result<()> {
     match target.checked_sub(host_kv.seq_len(slot)) {
         Some(0) | None => Ok(()),
@@ -38,8 +23,8 @@ fn speculative_chain_fits(start: usize, depth: usize, max_seq_len: usize) -> boo
         .is_some_and(|last_position| last_position < max_seq_len)
 }
 
-/// One chain in a batched DSpark verify. `row0` indexes both the shared
-/// logits and the tap features.
+/// One chain in a batched DSpark verify; `row0` indexes the shared logits and tap
+/// features.
 struct DsparkChain {
     /// Index of the originating row in the tick's `decode_rows`.
     out: usize,
@@ -85,22 +70,11 @@ fn merge_tier_io_stats(
     }
 }
 
-/// Decode-graph replay/capture probes — static so the pod bench can PROVE
-/// replay reuse from server logs (license requires reuse evidence, not
-/// capture-exists). Expected steady state: captures == live slots (≤
-/// num_slots keys; B=1/R=8/seq=1 are shape constants and kv enters via the
-/// staged device scalar, so there is exactly ONE graph per slot), replays ≈
-/// decoded tokens.
 static QWEN35_GRAPH_CAPTURES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static QWEN35_GRAPH_REPLAYS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Device addresses a slot's captured decode graph was baked against. The
-/// graph replays kernel launches against FIXED pointers, so if any anchor
-/// moved (workspace `release()` → re-alloc, a length-flip on the staging
-/// slots) the capture is stale and must be dropped — replaying it would read
-/// freed memory (the 2026-06-10 IMA class). `ws_epoch` covers wholesale
-/// releases; the three pointer anchors cover the staged-input and output
-/// buffers directly.
+/// Device addresses a slot's captured decode graph was baked against: the graph
+/// replays against FIXED pointers, so replaying a stale bake reads freed memory.
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct Qwen35GraphBake {
     token_ids_ptr: u64,
@@ -109,13 +83,8 @@ struct Qwen35GraphBake {
     ws_epoch: u64,
 }
 
-/// Per-executor whole-step decode-graph state: a DEDICATED decode workspace
-/// (only ever sees `seq_len == 1` shapes, so its buffer addresses are stable
-/// across prefill interleaves — the main workspace re-shapes on every
-/// prefill chunk and would invalidate captures every request) plus one
-/// [`CudaGraphState`] per slot (captured buffers bake the slot's k/v cache +
-/// GDR/conv state addresses, which live for the executor's lifetime and are
-/// only memset by `reset`).
+/// Per-slot decode-graph state on a DEDICATED `seq_len == 1` workspace — the main
+/// workspace re-shapes on every prefill chunk and would invalidate captures.
 struct Qwen35DecodeGraph {
     ws: crate::qwen35::Qwen35Workspace,
     graphs: Vec<crate::graph::CudaGraphState>,
@@ -134,171 +103,90 @@ impl Qwen35DecodeGraph {
     }
 }
 
-/// Qwen3.5 / Qwen3.6 HYBRID executor: drives
-/// [`crate::qwen35::Qwen35Model::forward_tokens`] per single-row sub-step and
-/// [`crate::qwen35::Qwen35Model::forward_decode_batch`] for rows>1 pure-decode
-/// sub-batches (stage-1 batched decode, contiguous KV). Owns per-slot KV state
-/// inside the model (full-attn contiguous caches + gated-delta recurrent
-/// state), so it does NOT use a [`PagedKVPool`]; it relies on the host
-/// [`KvPool`] only for the slot's logical `seq_len` to derive `start_pos`.
-/// The whole-step decode graph is opt-in (`--qwen35-decode-graph`,
-/// single-GPU + device-routed MoE only, rows==1 plans only).
-///
-/// Scope: prefill stays single-row (mixed plans run per-prefill sub-steps,
-/// then one decode sub-batch — the DSv4 executor pattern), uncached
-/// full-prefix (each full-attn layer recomputes over its contiguous cache;
-/// each linear-attn layer advances the recurrent state in place). A
-/// continuous-batching paged + packed-batch path is the stage-2 follow-up
-/// (legacy `infer/src/model/qwen35`).
+/// Qwen3.5 / Qwen3.6 hybrid executor. Owns per-slot KV + recurrent state inside the
+/// model, so the host [`KvPool`] is consulted only for the slot's logical `seq_len`.
+/// Prefill stays single-row; mixed plans run per-prefill sub-steps, then one decode
+/// sub-batch.
 pub(crate) struct Qwen35CudaExecutor {
     pub(crate) model: crate::qwen35::Qwen35Model,
-    /// Per-slot KV + recurrent state (one [`crate::qwen35::Qwen35SlotState`] per slot).
     /// A slot's recurrent state is EMPTY until its first request activates it.
     slots: Vec<crate::qwen35::Qwen35SlotState>,
-    /// G3 whole-slot capacity spill: an inactive/retracted request parks its
-    /// whole slot snapshot here (instead of being dropped + recomputed) and is
-    /// restored byte-exact on resume. Routes through the SAME `KvTierStore`
-    /// transport as the page-granular `recall_tier` (the unified-tier plan — all
-    /// grains move bytes through ONE store kind by opaque `u64` key), so G3 gets
-    /// the managed 850 GB DRAM budget + NVMe spill + durability for free instead
-    /// of a private DRAM map. Sized for whole-slot snapshots (one entry ≈ one
-    /// recurrent-block image), so its count cap = budget / image-bytes (the
-    /// budget-aware ~5500 cap, not the old `num_slots*2`). Always built — G3 is
-    /// default-on and independent of `--kv-recall` (the page grain). Keyed by the
-    /// engine's session key, a namespace disjoint from `recall_tier`'s
-    /// `tier_block_u64(slot, page)` keys (separate store ⇒ no aliasing).
+    /// Whole-slot capacity spill: a parked request's snapshot, restored byte-exact on
+    /// resume. Keyed by the engine session key — a namespace disjoint from
+    /// `recall_tier`'s `tier_block_u64(slot, page)` keys.
     slot_tier: KvTierStore,
-    /// Per-unit size (one whole-slot recurrent-block image) for the `slot_tier`
-    /// budget, stored so `set_kv_tier_budget_bytes` can
-    /// re-budget the tier post-construction without recomputing it (L2).
-    /// Free-list of detached recurrent blocks (~147 MiB each). Released here by a
-    /// finished request, popped by the next — so only ACTIVE slots hold a block,
-    /// not all `num_slots`. Grows to `num_slots` at full concurrency (then HBM ==
-    /// the old upfront reservation); idle/partial load costs proportionally less.
+    /// Free-list of detached recurrent blocks (~147 MiB each), so only ACTIVE slots
+    /// hold a block rather than all `num_slots`.
     recurrent_pool: Vec<crate::qwen35::RecurrentBlock>,
-    /// Persistent forward workspace (exact-shape buffer reuse): forwards are
-    /// strictly serial on this executor, so ONE workspace serves every slot.
-    /// Mirrors the DSv4 persistent decode scratch (passed `&mut` per forward).
+    /// Forwards are strictly serial on this executor, so ONE workspace serves every
+    /// slot.
     workspace: crate::qwen35::Qwen35Workspace,
     pub(crate) num_slots: usize,
-    /// Whole-step decode graph armed (env gate + TP-single + device-routed
-    /// MoE, resolved at construction; `warmup` logs the verdict). ANY capture
-    /// failure clears this — eager is the permanent fallback, never fatal.
+    /// ANY capture failure clears this — eager is the permanent fallback, never fatal.
     decode_graph_armed: bool,
-    /// Lazily-built per-slot graph state (`None` until the first gated decode,
-    /// and re-`None`d whenever baked addresses go stale: OPD weight
-    /// offload/reload, student-LoRA re-merge).
+    /// Re-`None`d whenever baked addresses go stale: weight offload/reload, LoRA
+    /// re-merge.
     decode_graph: Option<Qwen35DecodeGraph>,
-    /// Per-slot fixed-capacity page-table metadata for the PAGED decode-graph
-    /// lane ([`crate::loader::PageMeta::persistent_decode`]): device addresses
-    /// are capture-stable, contents refresh each step outside the graph.
-    /// Empty until the lane first runs.
+    /// Per-slot fixed-capacity page table for the paged decode-graph lane: device
+    /// addresses are capture-stable, contents refresh each step outside the graph.
     paged_decode_meta: Vec<Option<crate::loader::PageMeta>>,
-    /// Lazily-built batched rows>1 decode state: a dedicated `[*, B]`
-    /// workspace plus per-layer recurrent-state pointer tables (see
-    /// [`crate::qwen35::Qwen35BatchDecodeState`]). `None` until the first
-    /// batched decode.
     batch_decode: Option<crate::qwen35::Qwen35BatchDecodeState>,
-    /// Session KV-recall opt-in (`--kv-recall`, default off). When true the
-    /// recall *cycle* (score → evict → prefetch) layers a working-set
-    /// restriction on the SAME paged `full_attn_kv` pool the default path uses;
-    /// off → the default attends the full resident page set (no eviction). The
-    /// full-attn KV is paged in BOTH cases since the shared-paged migration.
+    /// Recall cycle opt-in (`--kv-recall`): layers a working-set restriction on the
+    /// SAME paged `full_attn_kv` pool; off attends the full resident page set.
     kv_recall: bool,
-    /// Recall budget (sink/local/block/top_k). Mirrors the dense arm.
     recall_cfg: infer_core::RecallConfig,
-    /// Per-slot recall state (reps + next-step page plan + evict list).
     recall: Vec<crate::recall::CudaRecallState>,
-    /// Shared paged full-attn KV pool (HD256, `num_full` layers), the DEFAULT
-    /// full-attn KV substrate since the shared-paged migration — built eagerly
-    /// in the constructor, profile-sized from measured free VRAM (not
-    /// `num_slots × max_seq_len`). Both the default forward and the `--kv-recall`
-    /// cycle read/write THIS one pool; `Option` only so the OPD-offload path can
-    /// drop it. Device-only, self-allocating.
+    /// Shared paged full-attn KV pool, profile-sized from measured free VRAM. Both the
+    /// default forward and the recall cycle use it; `Option` only so OPD offload can
+    /// drop it.
     full_attn_kv: Option<PagedKVPool>,
-    /// KV pool format (BF16 / FP8E4M3 / INT8). Captured at construction from the
-    /// `--kv-cache-dtype` flag; stored so `ensure_kv_pool` can rebuild the pool
-    /// with the same format after `release_kv_pool` drops it on the OPD path.
+    /// Stored so `ensure_kv_pool` rebuilds the pool with the same format after release.
     kv_format: KVFormat,
-    /// L3 write-through tier for the recall cycle (host DRAM, optional NVMe spill):
-    /// the source of truth for evict-dropped middle blocks. Allocated lazily on
-    /// the first `set_kv_recall(true)` and sized to ONE pool page image. Keyed by
-    /// `tier_block_u64(slot, logical_page)` — a session-scoped namespace, so slot A
-    /// never prefetches slot B's KV. `None` until `--kv-recall` is enabled.
+    /// L3 write-through tier: source of truth for evict-dropped middle blocks, sized to
+    /// ONE pool page image. Keyed by `tier_block_u64(slot, page)`, so slot A never
+    /// prefetches slot B's KV.
     recall_tier: Option<KvTierStore>,
-    /// Per-slot one-step eviction keepalive (the race fix). A page evict-dropped at
-    /// decode step N is parked here, NOT returned to `free_pages`, until the START
-    /// of step N+1 — by which point step N's attention (and its argmax `ctx.sync()`
-    /// at the step boundary) has completed, so `alloc_tokens` can never hand the
-    /// in-flight attention's page to the new token. Drained at the top of each
-    /// `decode_row_recall` for that slot. Holds (logical, physical) so the parked
-    /// physical page is the one actually returned to the pool one step later.
+    /// One-step eviction keepalive: a page dropped at step N is parked here until the
+    /// start of step N+1, so `alloc_tokens` can never hand the in-flight attention's
+    /// page to the new token. Holds (logical, physical).
     recall_keepalive: Vec<Vec<(usize, u32)>>,
-    /// Resolved per-rank L2 byte budget (`--kv-dram` ÷ world size). Recorded by
-    /// `set_kv_tier_budget_bytes` alongside the `slot_tier` rebuild; consumed
-    /// when `set_kv_recall(true)` lazily builds `recall_tier`.
+    /// Per-rank L2 byte budget (`--kv-dram` ÷ world size).
     recall_budget_bytes: usize,
 
-    /// Weights-version tag from the checkpoint (`weights_epoch_tag`). Stamped
-    /// into the durable recall manifest so a restart drops stale KV after an
+    /// Stamped into the durable recall manifest so a restart drops stale KV after an
     /// OPD weight update.
     weights_epoch: String,
-    /// Operator-provided NVMe root for durable recall spill (`--kv-disk`).
-    /// `None` until `set_kv_tier_disk` wires it.
+    /// NVMe root for durable recall spill (`--kv-disk`).
     disk_root: Option<std::path::PathBuf>,
     /// Budget bytes for durable NVMe recall spill (`--kv-disk-limit`).
-    /// `None` until `set_kv_tier_disk` wires it.
     disk_budget: Option<usize>,
-    /// The constructed pool's own `max_total_pages`; `ensure_kv_pool` rebuilds at
-    /// this size. Not on the serve path.
+    /// The constructed pool's own `max_total_pages`; `ensure_kv_pool` rebuilds at this
+    /// size.
     kv_pool_sized_pages: usize,
-    /// Recurrent prefix sidecars live in `slot_tier` under `NS_SIDECAR` (blob =
-    /// recurrent state + full-attn KV, keyed by token-prefix hash), so they share
-    /// the ONE budget-managed store instead of a private capped RAM map — the
-    /// 32-cap that always-missed beyond the hottest prefixes is gone (issue #85).
-    /// This map is eviction coordination ONLY: the tail host-pool page of each
-    /// published prefix → its sidecar key. `release_prefix_pages` drops the blob
-    /// when the radix evicts that page, so the sidecar's lifetime rides the radix
-    /// blocks — no independent LRU. (The store's own budget is the memory
-    /// backstop for any blob whose tail page LRU-evicted before drop reached it.)
+    /// Eviction coordination only: the tail host-pool page of each published prefix →
+    /// its sidecar key in `slot_tier`, so a sidecar's lifetime rides the radix blocks.
     sidecar_page_key: std::collections::HashMap<u32, u64>,
-    /// Per-slot recurrent snapshot captured DURING prefill exactly at the
-    /// last-page boundary `L* = align_down16(prompt_len - 1)` — the restore
-    /// target for an exact resend (un-popped for non-aligned, pop-trimmed for
-    /// aligned; see `prefix.rs:72`). The device recurrent state has no position
-    /// index and cannot rewind, so a snapshot taken at prompt-completion (`P`)
-    /// keyed at `L*` would bake the residue `[L*..P]` and double-advance it on
-    /// restore's re-prefill — corrupting page-aligned lengths. Capturing at `L*`
-    /// makes snapshot-position == key-position. Consumed by
-    /// `save_recurrent_sidecar`; cleared on the next request (`start_pos == 0`)
-    /// so no cross-request state leaks.
+    /// Per-slot recurrent snapshot captured at `L* = align_down16(prompt_len - 1)`, the
+    /// exact-resend restore target. The device recurrent state cannot rewind, so
+    /// snapshot-position must equal key-position or restore double-advances the
+    /// residue.
     prefill_boundary_snapshot: Vec<Option<(usize, crate::qwen35::Qwen35RecurrentSnapshot)>>,
-    /// Per-slot recurrent snapshots captured DURING prefill at every periodic
-    /// stride boundary `S = k * SIDECAR_SNAPSHOT_STRIDE_PAGES * 16` crossed in
-    /// `[start_pos..prompt)` (excluding `L*`, which `prefill_boundary_snapshot`
-    /// owns). Each carries the state at EXACTLY `S` (snapshot-position ==
-    /// key-position), so `save_recurrent_sidecar` can store a sidecar keyed at
-    /// `hash(tokens[..S])` for a future cross-conversation restore at `S`. Drained
-    /// at save; cleared on a fresh request (`start_pos == 0`) and on prefix-reuse
-    /// attach so no prior occupant's snapshots leak into this request's saves.
+    /// Per-slot recurrent snapshots at every stride boundary `S` crossed during
+    /// prefill,
+    /// each carrying the state at EXACTLY `S` for a future cross-conversation restore.
     periodic_boundary_snapshots: Vec<Vec<(usize, crate::qwen35::Qwen35RecurrentSnapshot)>>,
-    /// DSpark block-draft runtime (`--spec-type dspark`): draft head + per-slot
-    /// ctx caches + tap/scratch buffers. `None` (the default) keeps the
-    /// baseline executor byte-identical — nothing is allocated or captured.
+    /// DSpark block-draft runtime (`--spec-type dspark`): draft head, per-slot ctx
+    /// caches, tap/scratch buffers.
     pub(crate) dspark: Option<crate::qwen35::dspark::Qwen35DsparkExec>,
-    /// MTP spec-decode per-slot state (`--spec-type mtp`): the spec draft/verify
-    /// state + the seed (pending token + hidden) for the next spec step.
-    /// `None` (the default) keeps the baseline executor byte-identical.
+    /// MTP spec-decode state (`--spec-type mtp`): the spec state plus the seed
+    /// (pending token + hidden) for the next spec step.
     pub(crate) mtp: Option<MtpExec>,
 }
 
-/// Per-slot MTP spec-decode runtime state. The spec state is created lazily on
-/// the first decode step that needs it (a warm forward captures the seed
-/// hidden + pending token); subsequent steps run `spec_step` directly.
+/// Per-slot MTP spec-decode state; created lazily by the first warm decode step.
 pub(crate) struct MtpExec {
     slots: Vec<Option<MtpSlotState>>,
-    /// Cumulative accept-commit counters (host-side, no device sync) — the
-    /// /v1/stats spec-decode source, same shape as DSv4's mtp_* counters.
+    /// Cumulative counters (host-side, no device sync) — the /v1/stats spec source.
     pub(crate) accepts: usize,
     pub(crate) rejects: usize,
     pub(crate) chains: usize,
@@ -328,14 +216,14 @@ impl std::fmt::Debug for Qwen35CudaExecutor {
 }
 
 impl Qwen35CudaExecutor {
-    /// `|_| false`: demote/promote is a no-op for Qwen35, so demoted pages are never restorable.
+    /// `|_| false`: demote/promote is a no-op for Qwen35, so demoted pages are never
+    /// restorable.
     pub(crate) fn reusable_prefix_blocks(&self, blocks: &[PrefixBlock]) -> usize {
         pages_only_reusable_prefix_blocks(blocks, |_| false)
     }
 
-    /// Lower the host pool's page table into the device pool (`mirror_slot`), as
-    /// `executor/qwen.rs` does. Host page ids index device storage rows 1:1, so a
-    /// mirrored prefix reads its KV straight out of HBM.
+    /// Host page ids index device storage rows 1:1, so a mirrored prefix reads its KV
+    /// straight out of HBM.
     fn mirror_host_slot(
         &mut self,
         host_kv: &dyn KvPool,
@@ -356,21 +244,12 @@ impl Qwen35CudaExecutor {
         pool.mirror_slot(slot, &host_pages[..need], seq_len)
     }
 
-    /// Serialize the slot's recurrent state and store it into `slot_tier` under
-    /// `NS_SIDECAR`, keyed by the token hash
-    /// of the published radix prefix. Records the prefix's tail page → key so
-    /// `release_sidecar_pages` drops the blob when the radix evicts that page.
-    ///
-    /// Boundary: the sidecar is keyed at `L* = align_down16(tokens.len() - 1)` —
-    /// the largest page boundary strictly below the sequence length, i.e. the
-    /// restore target a future exact resend lands on (pop-trimmed for aligned,
-    /// un-popped for non-aligned; `prefix.rs:72`). When a prefill boundary
-    /// snapshot was captured at exactly `L*` (`submit_prefill_row`), it is used
-    /// verbatim — snapshot-position == key-position, so restore's re-prefill of
-    /// `[L*..len]` advances the recurrent state exactly once. Otherwise (finish/
-    /// decode publish, recall path, or tiny prompt) fall back to the live
-    /// snapshot keyed at the sealed page grain — the pre-existing best-effort
-    /// path for supersequence (agentic follow-up) reuse.
+    /// Store the slot's recurrent state into `slot_tier`, keyed by the token hash of
+    /// the
+    /// published radix prefix at `L* = align_down16(tokens.len() - 1)` — the boundary a
+    /// future exact resend restores to (`prefix.rs:72`). Falls back to the live
+    /// snapshot
+    /// keyed at the sealed page grain when no prefill snapshot was captured at `L*`.
     pub(crate) fn save_recurrent_sidecar(
         &mut self,
         slot: usize,
@@ -379,19 +258,18 @@ impl Qwen35CudaExecutor {
         prefix_pages: &[u32],
     ) -> anyhow::Result<()> {
         if !self.slots[slot].has_recurrent() {
-            return Ok(()); // pure full-attn path — nothing to capture
+            return Ok(());
         }
-        // Drain the periodic snapshots up front so EVERY exit path (incl. the
-        // mat_len==0 / D2H-fail early returns) leaves the slot clean for its next
-        // occupant — a leaked entry would double-save under a later publish.
+        // Drain up front so every exit path leaves the slot clean for its next
+        // occupant;
+        // a leaked entry would double-save under a later publish.
         let periodic = std::mem::take(&mut self.periodic_boundary_snapshots[slot]);
         let boundary = tokens.len().saturating_sub(1) / SUPPORTED_PAGE_SIZE * SUPPORTED_PAGE_SIZE;
         let pending = self.prefill_boundary_snapshot[slot].take();
         let (mat_len, snap) = match pending {
             Some((pos, snap)) if pos == boundary && boundary > 0 => (pos, snap),
             _ => {
-                // Legacy best-effort: raw seq_len aligns to a page ~1/16 of the
-                // time, so page-align to keep capture-key == restore's matched_len.
+                // Page-align so the capture key equals restore's matched_len.
                 let mat_len = matched_len
                     .min(self.slots[slot].seq_len())
                     .min(tokens.len())
@@ -407,28 +285,23 @@ impl Qwen35CudaExecutor {
             }
         };
         let key = crate::qwen35::hash_prefix_tokens(&tokens[..mat_len]);
-        // PERIODIC sidecars at each stride boundary `0 < pos ≤ mat_len` snapshotted
-        // during this prefill — for a FUTURE cross-conversation restore that shares
-        // only a leading prefix. Each blob is the recurrent state captured at
-        // EXACTLY `pos` (snapshot-position == key-position). The full-attention KV
-        // is NOT in here: restore mirrors the radix prefix's own device pages.
+        // Periodic sidecars for a future cross-conversation restore, each keyed at its
+        // exact snapshot position. Full-attn KV is not in the blob: restore mirrors the
+        // radix prefix's own device pages.
         for (pos, psnap) in periodic {
             if pos == 0 || pos > mat_len {
-                continue; // beyond the published prefix — nothing to key
+                continue;
             }
             let pkey = crate::qwen35::hash_prefix_tokens(&tokens[..pos]);
             self.store_sidecar_blob(pos, pkey, psnap.to_bytes(), prefix_pages);
         }
 
-        // PRIMARY sidecar at `mat_len` (the exact-resend restore target).
         self.store_sidecar_blob(mat_len, key, snap.to_bytes(), prefix_pages);
         Ok(())
     }
 
-    /// Insert a sidecar blob under `key` and coordinate its eviction off the last
-    /// radix page it COVERS (`prefix_pages[pos/16 - 1]`): leaves evict
-    /// deepest-first, so the blob drops the moment its own prefix erodes. Shared
-    /// by the primary (`mat_len`) and periodic (`pos ≤ mat_len`) saves.
+    /// Insert a sidecar blob and coordinate its eviction off the last radix page it
+    /// covers: leaves evict deepest-first, so the blob drops as its own prefix erodes.
     fn store_sidecar_blob(&mut self, pos: usize, key: u64, bytes: Vec<u8>, prefix_pages: &[u32]) {
         if !self
             .slot_tier
@@ -446,8 +319,8 @@ impl Qwen35CudaExecutor {
         }
     }
 
-    /// Radix evicted these host-pool prefix pages: drop the sidecar blob keyed to
-    /// any of them. Eviction rides the radix — no independent sidecar LRU.
+    /// Drop sidecar blobs keyed to evicted radix pages — eviction rides the radix,
+    /// no independent sidecar LRU.
     pub(crate) fn release_sidecar_pages(&mut self, pages: &[u32]) {
         for &page in pages {
             if let Some(key) = self.sidecar_page_key.remove(&page) {
@@ -457,13 +330,10 @@ impl Qwen35CudaExecutor {
         }
     }
 
-    /// Engine freed `slot`'s host pages (finish/park/requeue): return its device
-    /// pages NOW. The old lazy free at the next occupant's prefill left the host
-    /// admission pool over-reporting free pages by the whole dead slot, so the
-    /// planner licensed prefill chunks the device pool could not hold — an
-    /// engine-fatal alloc error at submit. Safe here: sidecar/tier capture runs
-    /// before the engine frees host pages, and no forward is in flight for a
-    /// slot being released. Idempotent with the prefill-start mirror clear.
+    /// Return `slot`'s device pages NOW: a lazy free leaves the host admission pool
+    /// over-reporting free pages, so the planner licenses prefill chunks the device
+    /// pool
+    /// cannot hold. Idempotent with the prefill-start mirror clear.
     pub(crate) fn release_kv_slot(&mut self, slot: usize) -> Result<()> {
         if slot >= self.num_slots {
             return Ok(());
@@ -478,25 +348,12 @@ impl Qwen35CudaExecutor {
         Ok(())
     }
 
-    /// Restore the recurrent sidecar for a page-radix prefix hit, returning the
-    /// ABSOLUTE token length restored — `matched_len` on an exact hit, or the
-    /// largest periodic stride boundary `B ≤ matched_len` whose sidecar is present
-    /// (a cross-conversation hit where no sidecar was saved exactly at
-    /// `matched_len`). Acquires recurrent buffers, restores the recurrent state,
-    /// mirrors the prefix's own pages, and sets the device pool seq_len to `B` for the
-    /// `prefill_row_paged_default` invariant; the engine truncates the host pool
-    /// to `B` and re-prefills `[B..prompt]`. A MISS at every boundary returns
-    /// `Err` so the caller full-recomputes.
-    ///
-    /// Correctness of the `[B..matched_len]` re-prefill: the blob keyed at
-    /// `hash(tokens[..B])` holds the recurrent state and KV captured at EXACTLY
-    /// `B` (snapshot-position == key-position). The tail prefill re-runs
-    /// `[B..prompt]`, advancing the recurrent state and recomputing full-attn KV
-    /// from `B` — identical to a fresh prefill, since both are deterministic
-    /// functions of the token prefix. The radix KV pages `[B..matched_len]` are
-    /// NOT laid over the `B`-boundary state (device pool is rebuilt to `B` here,
-    /// re-prefill allocates fresh tail pages) — avoiding the "one block too many"
-    /// corruption.
+    /// Restore the recurrent sidecar for a prefix hit, returning the ABSOLUTE token
+    /// length restored — `matched_len`, or the largest stride boundary `B ≤
+    /// matched_len`
+    /// whose sidecar is present. Sets the device pool seq_len to `B`; the engine
+    /// truncates the host pool to `B` and re-prefills `[B..prompt]`. A miss at every
+    /// boundary returns `Err` so the caller full-recomputes.
     pub(crate) fn restore_recurrent_sidecar(
         &mut self,
         slot: usize,
@@ -506,7 +363,8 @@ impl Qwen35CudaExecutor {
     ) -> anyhow::Result<usize> {
         let matched_len = matched_len.min(tokens.len());
         let (num_linear, gdr_len, conv_len) = self.model.recurrent_dims();
-        // Reused slot: start_pos != 0 skips the normal release+acquire in submit_prefill_row.
+        // Reused slot: start_pos != 0 skips the normal release+acquire in
+        // submit_prefill_row.
         self.slots[slot].release_recurrent(&mut self.recurrent_pool);
         self.slots[slot].acquire_recurrent(
             &self.model.ctx,
@@ -516,19 +374,13 @@ impl Qwen35CudaExecutor {
             &mut self.recurrent_pool,
         )?;
 
-        // A sidecar-restored prefix has no draft ctx features for the matched
-        // span — clear stale DSpark state; the tail prefill rebases the draft
-        // ctx at start_pos (suffix-only drafting).
+        // A sidecar-restored prefix has no draft ctx for the matched span; the tail
+        // prefill rebases the draft ctx at start_pos.
         if let Some(df) = self.dspark.as_mut().and_then(|ds| ds.slots[slot].as_mut()) {
             df.reset();
         }
 
-        // Probe boundaries largest-first: the exact `matched_len` (today's
-        // within-conversation fast path), then descending stride multiples
-        // `≤ matched_len`. The first present blob wins — a miss on a higher
-        // boundary reads nothing heavy (key-absent short-circuits), and we never
-        // read-then-discard a hit. Each boundary is page-aligned (matched_len is
-        // a radix page match, stride is a page multiple), so `hash(tokens[..B])`
+        // Probe largest-first; each boundary is page-aligned, so `hash(tokens[..B])`
         // rendezvous with the save keys.
         let stride = SIDECAR_SNAPSHOT_STRIDE_PAGES * SUPPORTED_PAGE_SIZE; // const, > 0
         let mut candidates: Vec<usize> = Vec::new();
@@ -542,8 +394,7 @@ impl Qwen35CudaExecutor {
             }
             b -= stride;
         }
-        // Read the atomic blob from the tier (transparently spans L1/L2 host →
-        // L3 disk); a corrupt/foreign payload deserializes to None and is skipped.
+        // A corrupt/foreign payload deserializes to None and is skipped.
         let restored = candidates.into_iter().find_map(|b| {
             let key = crate::qwen35::hash_prefix_tokens(&tokens[..b]);
             self.slot_tier
@@ -554,9 +405,7 @@ impl Qwen35CudaExecutor {
         });
 
         let Some((boundary, snap)) = restored else {
-            // MISS at every boundary → reset slot state, then Err so the caller
-            // full-recomputes. Must clean up full_attn_kv and seq_len here — the
-            // caller's Err handler won't do it.
+            // Clean up full_attn_kv and seq_len here — the caller's Err handler won't.
             if let Some(pool) = self.full_attn_kv.as_mut() {
                 pool.mirror_slot(slot, &[], 0)?;
             }
@@ -567,13 +416,12 @@ impl Qwen35CudaExecutor {
             ));
         };
 
-        // restore_recurrent_from_snapshot doesn't advance seq_len; set it to the
-        // restored boundary for the submit_decode_row / prefill readiness invariant.
+        // restore_recurrent_from_snapshot doesn't advance seq_len.
         self.slots[slot].restore_recurrent_from_snapshot(&self.model.ctx, &snap)?;
         self.slots[slot].set_seq_len(boundary);
 
-        // Point the device pool at the prefix's OWN pages, already attached by the
-        // engine and resident in HBM — the sidecar carries recurrent state only.
+        // The sidecar carries recurrent state only; the prefix's own pages are already
+        // attached and resident.
         if let Some(pool) = self.full_attn_kv.as_mut() {
             let need = boundary.div_ceil(SUPPORTED_PAGE_SIZE);
             ensure!(
@@ -583,14 +431,12 @@ impl Qwen35CudaExecutor {
             );
             pool.mirror_slot(slot, &prefix_pages[..need], boundary)?;
         }
-        // Fresh prefill sequence for [boundary..prompt]: drop any prior occupant's
-        // periodic snapshots so this request's saves never inherit stale entries.
+        // Drop any prior occupant's periodic snapshots so this request's saves are
+        // clean.
         self.periodic_boundary_snapshots[slot].clear();
         Ok(boundary)
     }
 
-    /// Whole-slot swap is rank-local bytes plus TP-wide scalar consensus
-    /// ([`Self::tp_min_usize`] in demote/promote), mirroring DSv4's arm.
     pub(crate) fn kv_slot_tier_enabled(&self) -> bool {
         true
     }
@@ -621,21 +467,15 @@ impl Qwen35CudaExecutor {
             .map_err(|e| anyhow::anyhow!("Qwen3.6 TP min-reduce {what} failed: {e}"))
     }
 
-    /// `BackendExecutor::tp_sync_min` — see there for why the scheduler needs
-    /// this (2026-07-05 TP=4 admission livelock).
+    /// See `BackendExecutor::tp_sync_min` (2026-07-05 TP=4 admission livelock).
     pub(crate) fn tp_sync_min(&self, local: usize) -> Result<usize> {
         self.tp_min_usize(local, "admission free pages")
     }
 
-    /// Demote `slot`'s entire device state into the host `slot_tier` under `key`.
-    /// The copy is complete before returning (`swap_out_image` ends in
-    /// `ctx.sync()`), so the engine may free the slot immediately. The image is
-    /// serialized byte-exact ([`Qwen35SlotImage::to_bytes`]) and handed to the
-    /// shared `KvTierStore` transport, which manages the 850 GB DRAM budget
-    /// (+ optional NVMe spill). Returns `Ok(false)` when the tier is at budget
-    /// on ANY rank (engine falls back to plain recompute, same contract as the
-    /// old cap). Exactly TWO collectives on every path (capture consensus,
-    /// insert consensus), so the lockstep collective count is rank-invariant.
+    /// Demote `slot`'s entire device state into `slot_tier` under `key`. The copy is
+    /// complete before returning, so the engine may free the slot immediately. Returns
+    /// `Ok(false)` when the tier is at budget on ANY rank. Exactly TWO collectives on
+    /// every path, so the lockstep collective count is rank-invariant.
     pub(crate) fn demote_slot(&mut self, slot: usize, key: u64) -> Result<bool> {
         ensure!(
             slot < self.num_slots,
@@ -661,12 +501,11 @@ impl Qwen35CudaExecutor {
                 anyhow::anyhow!("peer rank failed Qwen3.6 slot demote capture")
             }));
         }
-        // Chunked like DSv4 (16 MiB store pages): the whole image never fit a
-        // recurrent-floor-sized page — the review-6 blocker where every insert
-        // was refused post-oversize-guard and park degraded to pure recompute.
-        // Per-rank DRAM headroom can diverge, so the verdict is min-reduced; on
-        // a mixed verdict, locally-successful ranks roll their insert back so
-        // no rank keeps a blob the others lack.
+        // Chunked (16 MiB store pages): a whole image never fits one page. Per-rank
+        // DRAM
+        // headroom can diverge, so the verdict is min-reduced and locally-successful
+        // ranks
+        // roll their insert back on a mixed verdict.
         let bytes = image?.to_bytes();
         let inserted = self
             .slot_tier
@@ -680,26 +519,20 @@ impl Qwen35CudaExecutor {
         Ok(true)
     }
 
-    /// Restore the whole-slot snapshot stored under `key` into `slot`. The engine
-    /// resumes decode at the demoted position right after this returns, and drops
-    /// the entry via [`Self::drop_kv_slot_entries`] — the entry intentionally
-    /// stays in the tier here. `swap_in_image` ends in `ctx.sync()`, so the
-    /// device restore is complete before the host image can be dropped. Exactly
-    /// TWO collectives on every path (read+parse consensus, restore consensus) —
-    /// nothing rank-local errs between them.
+    /// Restore the whole-slot snapshot stored under `key` into `slot`. The entry stays
+    /// in the tier — the engine drops it via [`Self::drop_kv_slot_entries`]. Exactly
+    /// TWO
+    /// collectives on every path; nothing rank-local errs between them.
     pub(crate) fn promote_slot(&mut self, key: u64, slot: usize, slot_pages: &[u32]) -> Result<()> {
         ensure!(
             slot < self.num_slots,
             "Qwen3.6 promote slot {slot} outside executor slots {}",
             self.num_slots
         );
-        // The slot image carries no draft ctx cache — clear stale state; the
-        // first warm decode rebases the draft ctx at the promoted position.
+        // The slot image carries no draft ctx cache; the first warm decode rebases it.
         if let Some(df) = self.dspark.as_mut().and_then(|ds| ds.slots[slot].as_mut()) {
             df.reset();
         }
-        // Read the serialized image out of the tier (host hit or NVMe read) and
-        // deserialize it byte-exact before touching the device.
         let image = self
             .slot_tier
             .read_chunked(NS_SLOT, NS_SLOT_CHUNK, key)
@@ -779,15 +612,12 @@ impl Qwen35CudaExecutor {
             dspark_draft_model.is_none() || mtp_draft_tokens.is_none(),
             "Qwen3.5/3.6 DSpark and MTP speculative decode are mutually exclusive"
         );
-        // `max_seq_len` is the per-request token ceiling (the model's positional
-        // budget + the host CudaKvPool admission span). The full-attn KV is now a
-        // SHARED profile-sized paged pool (built below), not a per-slot
-        // contiguous cache, so this no longer scales VRAM by num_slots.
+        // Per-request token ceiling: the model's positional budget + the host pool's
+        // admission span.
         let max_seq_len = total_pages * SUPPORTED_PAGE_SIZE;
         let model_t0 = Instant::now();
-        // `None`: the checkpoint-native NextN-MTP head stays unwired here; the
-        // baseline load is byte-identical (no draft head loaded). DSpark is the
-        // external block drafter, loaded below from its own checkpoint dir.
+        // `None`: the checkpoint-native NextN-MTP head stays unwired; DSpark is loaded
+        // below from its own checkpoint dir.
         let mut model = crate::qwen35::Qwen35Model::from_safetensors(
             model_path.as_ref(),
             max_seq_len,
@@ -800,8 +630,8 @@ impl Qwen35CudaExecutor {
                 "requested_slots={num_slots} total_pages={total_pages} max_seq_len={max_seq_len}"
             ),
         );
-        // DSpark draft head: loaded BEFORE the KV budget/pool profiling so its
-        // weights are subtracted from the measured free VRAM.
+        // Loaded BEFORE the KV budget/pool profiling so its weights are subtracted from
+        // the measured free VRAM.
         let dspark_head = dspark_draft_model
             .map(|dir| {
                 ensure!(
@@ -835,13 +665,10 @@ impl Qwen35CudaExecutor {
                 Ok(head)
             })
             .transpose()?;
-        // Dynamic KV mem budget (unified with DSv4 via the infer-seam kernel):
-        // clamp num_slots to what post-weights free VRAM affords. Qwen3.5/3.6
-        // previously admitted the requested count as-is → OOM at large
-        // max_seq_len. Deterministic + NCCL min-reduced ⇒ TP-consistent.
+        // Clamp num_slots to what post-weights free VRAM affords; deterministic and
+        // NCCL min-reduced, so it stays TP-consistent.
         let budget_t0 = Instant::now();
-        // Reclaim retained loading scratch before the budget measures free VRAM
-        // (see the DSv4 path above — same starvation otherwise).
+        // Reclaim retained loading scratch before the budget measures free VRAM.
         if let Err(e) = model.ctx.trim_memory_pool() {
             log::warn!("pre-KV-budget trim_memory_pool failed (non-fatal): {e}");
         }
@@ -855,10 +682,8 @@ impl Qwen35CudaExecutor {
             format_args!("effective_slots={num_slots}"),
         );
         let slots_t0 = Instant::now();
-        // Empty slots — zero recurrent HBM upfront. Each slot's ~147 MiB
-        // recurrent block is drawn from `recurrent_pool` on its first request
-        // (`acquire_recurrent` at the `start_pos == 0` prefill) and returned on
-        // request finish. The pool starts empty and grows on demand.
+        // Empty slots: each slot's ~147 MiB recurrent block is drawn from
+        // `recurrent_pool` on its first request and returned on finish.
         let slots: Vec<_> = (0..num_slots).map(|_| model.new_slot_state()).collect();
         cuda_startup_log(
             "executor.qwen35_slot_alloc",
@@ -866,11 +691,8 @@ impl Qwen35CudaExecutor {
             format_args!("slots={num_slots} max_seq_len={max_seq_len}"),
         );
 
-        // Shared paged full-attn KV pool — the DEFAULT substrate (Phase 2 of the
-        // shared-paged-KV migration). Built EAGERLY here, profile-sized from
-        // MEASURED free VRAM after weights load (SGLang's mem_fraction_static),
-        // NOT `num_slots × max_seq_len` (the per-slot contiguous waste). The ONLY
-        // profile — see `ensure_kv_pool`.
+        // Profile-sized from MEASURED free VRAM after weights load. The ONLY profile —
+        // see `ensure_kv_pool`.
         let pool_t0 = Instant::now();
         let requested_pages = total_pages.max(1);
         let kv_format = kv_dtype.kv_format();
@@ -889,12 +711,8 @@ impl Qwen35CudaExecutor {
             format_args!("built"),
         );
 
-        // Pre-allocate the recurrent (GDR + conv) pool for ALL slots upfront.
-        // Without this, each slot's ~144 MiB GDR state is allocated on its first
-        // request; a burst of concurrent requests can then OOM even though the
-        // budget (`num_slots × per_slot`) was profiled into the KV-pool sizing.
-        // Pre-allocating reserves the VRAM at construction: if it doesn't fit,
-        // the engine fails fast here instead of mid-request.
+        // Reserve the recurrent VRAM for ALL slots at construction: allocating each
+        // ~144 MiB block on first request lets a concurrent burst OOM mid-request.
         let (num_linear, gdr_state_len, conv_len) = model.recurrent_dims();
         let (gdr_per_layer, conv_per_layer) = model.linear_state_bytes();
         let gdr_bytes = num_linear * gdr_per_layer;
@@ -908,18 +726,12 @@ impl Qwen35CudaExecutor {
             .map(|_| alloc_recurrent_block(&model.ctx, num_linear, gdr_state_len, conv_len))
             .collect::<Result<Vec<_>>>()?;
 
-        // G3 whole-slot spill tier: snapshots stored as 16 MiB chunked blobs
-        // (manifest + chunks, the DSv4 pattern) — a whole image never fits one
-        // fixed page, and the store's size contract is per-page. Same
-        // `KvTierStore` transport as the page-granular recall tier — the
-        // unified plan: every grain moves bytes through ONE store kind. NVMe
-        // spill is opt-in via `set_kv_tier_disk` (shared with the dense arm).
+        // Whole-slot spill: snapshots stored as 16 MiB chunked blobs — a whole image
+        // never fits one fixed page, and the store's size contract is per-page.
         let tier_budget_bytes = default_t1_budget_bytes(DEFAULT_DRAM_FRACTION);
         let slot_tier = KvTierStore::with_budget(tier_budget_bytes, BLOB_CHUNK_BYTES);
 
-        // Whole-step decode graph: env opt-in ∧ single-GPU (NCCL all-reduce is
-        // not graph-capturable on this stack — TP≥2 stays eager, same as
-        // dense) ∧ every layer's decode step is a pure device-kernel sequence.
+        // Single-GPU only: NCCL all-reduce is not graph-capturable on this stack.
         let decode_graph_armed = qwen35_decode_graph_enabled()
             && model.tp.is_single()
             && model.decode_graph_unsupported_reason().is_none();
@@ -969,9 +781,8 @@ impl Qwen35CudaExecutor {
         Ok(executor)
     }
 
-    /// Build the shared paged full-attn KV pool, profile-sized from MEASURED free
-    /// VRAM (SGLang's `mem_fraction_static`); `requested_pages` is the fallback
-    /// for a failed probe, not a floor over it (#178).
+    /// Profile-sized from MEASURED free VRAM; `requested_pages` is the fallback for a
+    /// failed probe, not a floor over it (#178).
     fn build_full_attn_kv_pool(
         model: &crate::qwen35::Qwen35Model,
         num_slots: usize,
@@ -986,15 +797,11 @@ impl Qwen35CudaExecutor {
         let cell_bytes_per_token =
             PagedKVPool::budget_bytes_for_tokens(num_full, local_kv_heads, head_dim, 1, kv_format)
                 as u64;
-        // H1: the per-slot recurrent block (gdr + conv) is reserved out of the
-        // SAME free VRAM `kv_budget_num_slots` clamped against. Subtract that
-        // reservation from free BEFORE profiling the full-attn pool, so
-        // weights + recurrent×slots + pool ≤ mem_fraction×free (mirrors DSv4
-        // dsv4.rs:1687-1691). Per-rank free, num_slots already min-reduced.
+        // Subtract the recurrent reservation from free BEFORE profiling the pool, so
+        // weights + recurrent×slots + pool ≤ mem_fraction×free.
         let (_, _, gdr_bytes, conv_bytes) = model.per_slot_kv_bytes();
-        // DSpark draft ctx caches are per-slot lazily-allocated device buffers —
-        // reserve them here too, or the pool eats the VRAM the first dspark
-        // prefill needs.
+        // Reserve the per-slot DSpark ctx caches too, or the pool eats the VRAM the
+        // first dspark prefill needs.
         let per_slot_recurrent = gdr_bytes
             .saturating_add(conv_bytes)
             .saturating_add(dspark_slot_bytes);
@@ -1012,11 +819,11 @@ impl Qwen35CudaExecutor {
                 // #178: flooring the profile at a constant books HBM the card lacks.
                 let sized = profiled_pages.max(1);
                 if profiled_tokens == infer_seam::PROFILE_KV_TOKENS_FLOOR {
-                    // `mem_fraction_static` bounds the engine's share of TOTAL, so any
-                    // value under the weights' own share leaves nothing and admission
-                    // silently caps at 4096 tokens — every longer prompt aborts. The
-                    // operands ride along: the adjacent info! is suppressed at the
-                    // default level, and without them this needs nvidia-smi to diagnose.
+                    // `mem_fraction_static` bounds the engine's share of TOTAL, so a
+                    // value
+                    // under the weights' own share caps admission at 4096 tokens. The
+                    // operands ride along: the adjacent info! is off at the default
+                    // level.
                     let reserve = (total as f64 * (1.0 - mem_fraction_static)) as u64;
                     log::warn!(
                         "KV pool collapsed to the {}-token floor: free_after_recurrent {}MB − \
@@ -1094,39 +901,25 @@ impl Qwen35CudaExecutor {
         Ok(full_attn_kv)
     }
 
-    /// Drop the shared paged full-attn KV pool, returning its HBM to the device
-    /// async pool (trimmed to the OS so a co-resident allocator sees it free).
-    /// agent-OPD ONLY: the masked-CE writeback's `forward_hidden_states` is a
-    /// FRESH autograd forward that does NOT read this engine's KV cache, so the
-    /// rollout pool is DEAD during the writeback — freeing it widens the writeback
-    /// headroom. `ensure_kv_pool` re-acquires it before the next round's rollout.
-    /// Precondition: all in-flight rollout work has synced (the round's rollout
-    /// completed + LoRA synced before the writeback closure runs). No-op if the
-    /// pool was already released. Errors if any slot still holds resident pages
-    /// (a live request would lose its KV) — agent-OPD finishes all rollouts before
-    /// the writeback, so the pool is empty.
+    /// Drop the paged pool and trim its HBM to the OS. agent-OPD only: the writeback's
+    /// autograd forward does not read this KV, so freeing it widens writeback headroom;
+    /// `ensure_kv_pool` re-acquires it. Precondition: all in-flight rollout work
+    /// synced.
     pub(crate) fn release_kv_pool(&mut self) -> Result<()> {
         let Some(pool) = self.full_attn_kv.as_ref() else {
             return Ok(());
         };
         let freed = pool.device_bytes();
-        // Drain in-flight device work referencing the pool BEFORE dropping it (no
-        // kernel may still read the slices we are about to free).
+        // No kernel may still read the slices we are about to free.
         self.model.ctx.sync()?;
-        // Drop enqueues `cuMemFreeAsync` for every pool slice on the model stream
-        // — the frees are ASYNC, so they have NOT executed yet here.
+        // Drop only ENQUEUES `cuMemFreeAsync` for every pool slice.
         self.full_attn_kv = None;
-        // Sync AGAIN so the enqueued async frees actually complete and the blocks
-        // return to the device async pool; only THEN can the trim return them to
-        // the OS. Without this second sync the trim runs before any block is back
-        // in the pool → nothing trimmed → `mem_get_info` still shows them used (the
-        // bug the first version hit: pool dropped but VRAM not reclaimed).
+        // Sync again so those async frees complete and the blocks return to the async
+        // pool; a trim before that returns nothing and `mem_get_info` still shows them
+        // used.
         self.model.ctx.sync()?;
-        // Return the freed async-pool blocks to the OS so the co-resident autograd
-        // writeback's allocator + `mem_get_info` see them free (the pool's release
-        // threshold is u64::MAX, so a drop alone only caches the blocks). The
-        // device default async pool is per-DEVICE (shared across the infer + train
-        // contexts on this GPU), so the trimmed bytes are available to autograd.
+        // The device async pool is per-DEVICE, so trimmed bytes are visible to the
+        // co-resident autograd writeback; a drop alone only caches the blocks.
         if let Err(e) = self.model.ctx.trim_memory_pool() {
             log::warn!("release_kv_pool: trim_memory_pool failed (non-fatal): {e}");
         }
@@ -1137,11 +930,9 @@ impl Qwen35CudaExecutor {
         Ok(())
     }
 
-    /// Re-acquire the pool at `kv_pool_sized_pages`; no-op if resident.
-    ///
-    /// Deliberately does NOT re-profile: `release_kv_pool` handed this VRAM to the
-    /// co-resident student, so a profile here shrinks the pool every round until
-    /// it collapses to `PROFILE_KV_TOKENS_FLOOR`.
+    /// Re-acquire the pool at `kv_pool_sized_pages`; no-op if resident. Deliberately
+    /// does NOT re-profile: `release_kv_pool` handed this VRAM to the co-resident
+    /// student, so a profile here shrinks the pool every round until it hits the floor.
     pub(crate) fn ensure_kv_pool(&mut self) -> Result<()> {
         if self.full_attn_kv.is_some() {
             return Ok(());
@@ -1173,10 +964,8 @@ impl Qwen35CudaExecutor {
         Ok(())
     }
 
-    /// Boot-time decode-graph verdict log (mirrors the dense `warmup` info
-    /// messages). Capture itself is lazy — one whole-step capture per slot on
-    /// its first gated decode (after `CudaGraphState`'s universal eager warm
-    /// run), so unused slots never pay capture/instantiation memory.
+    /// Boot-time decode-graph verdict log. Capture itself is lazy — one per slot on its
+    /// first gated decode, so unused slots never pay capture/instantiation memory.
     pub(crate) fn warmup(&mut self) -> Result<()> {
         let warmup_t0 = Instant::now();
         let dense_t0 = Instant::now();
@@ -1254,19 +1043,17 @@ impl Qwen35CudaExecutor {
         Ok(())
     }
 
-    /// Resolved per-rank L2 byte cap (`--kv-dram` ÷ world size) for the G3
-    /// `slot_tier`, also recorded for the lazily-built recall tier. Pre-serve
-    /// only (drops any existing entries).
+    /// Per-rank L2 byte cap (`--kv-dram` ÷ world size). Pre-serve only (drops any
+    /// existing entries).
     pub(crate) fn set_kv_tier_budget_bytes(&mut self, bytes: usize) {
         self.recall_budget_bytes = bytes;
         self.slot_tier = KvTierStore::with_budget(bytes, BLOB_CHUNK_BYTES);
     }
 
-    /// Attach NVMe spill (`--kv-disk`): an ephemeral disk level under the
-    /// G3 `slot_tier` (whole-slot capacity spill) plus a durable level for the
-    /// recall tier (attached now if built, else stashed for `set_kv_recall`).
-    /// Pre-serve only. The budget is a per-store cap, not a reservation — both
-    /// stores are sparse mmaps, so disk is consumed only by actual spill.
+    /// Attach NVMe spill (`--kv-disk`): ephemeral under `slot_tier`, durable for the
+    /// recall tier (attached now if built, else stashed for `set_kv_recall`). Pre-serve
+    /// only. The budget is a per-store cap, not a reservation — both stores are sparse
+    /// mmaps, so disk is consumed only by actual spill.
     pub(crate) fn set_kv_tier_disk(
         &mut self,
         root: std::path::PathBuf,
@@ -1296,12 +1083,9 @@ impl Qwen35CudaExecutor {
             || recall_attached
     }
 
-    /// Opt into session KV-recall (`--kv-recall`, default off). The paged
-    /// full-attn pool (`full_attn_kv`) is ALWAYS resident since the shared-paged
-    /// migration — the DEFAULT forward already attends it (full resident set, no
-    /// eviction). Enabling recall layers the eviction/scoring *cycle* on the
-    /// SAME pool (working-set restriction) and lazily builds its L3 tier on the
-    /// first enable. Default-off keeps the full resident attention.
+    /// Opt into the recall eviction/scoring cycle (`--kv-recall`): a working-set
+    /// restriction on the SAME always-resident paged pool, with its L3 tier built
+    /// lazily on the first enable.
     pub(crate) fn set_kv_recall(&mut self, enabled: bool) -> Result<()> {
         ensure!(
             !(enabled && self.dspark.is_some()),
@@ -1310,13 +1094,7 @@ impl Qwen35CudaExecutor {
         );
         self.kv_recall = enabled;
         if enabled && self.recall_tier.is_none() {
-            // L3 write-through tier: source of truth for evict-dropped middle
-            // blocks. One entry == one pool page image (all `num_full` layers,
-            // K+V). Host-DRAM budget is the resolved per-rank `--kv-dram` share
-            // (same cap as the slot tier); NVMe spill is opt-in via the
-            // prefix-tier `--kv-disk` wiring. Reuses the SAME `KvTierStore`
-            // transport the dense arm's prefix/write-through tier uses (R5 —
-            // one store kind).
+            // One entry == one pool page image (all `num_full` layers, K+V).
             let page_bytes = self
                 .full_attn_kv
                 .as_ref()
@@ -1325,7 +1103,6 @@ impl Qwen35CudaExecutor {
                     anyhow::anyhow!("--kv-recall: full-attn paged pool not allocated")
                 })?;
             let mut tier = KvTierStore::with_budget(self.recall_budget_bytes, page_bytes);
-            // Try loading prior session durable NVMe spill if disk is configured.
             // Falls through to set_disk_durable on first run or epoch mismatch.
             if let (Some(root), Some(budget)) = (self.disk_root.as_ref(), self.disk_budget) {
                 let format_tag = self
@@ -1360,43 +1137,31 @@ impl Qwen35CudaExecutor {
         Ok(())
     }
 
-    /// Whether the full-attn KV path is paged (the shared pool is resident).
-    /// TRUE by default since the shared-paged migration — the default forward
-    /// attends the full resident page set. (`Option` is `None` only after an
-    /// OPD weight offload dropped the pool.)
+    /// `Option` is `None` only after an OPD weight offload dropped the pool.
     fn full_attn_paged(&self) -> bool {
         self.full_attn_kv.is_some()
     }
 
-    /// Whether the pool is BF16. Still gates the whole-step decode graph
-    /// (persistent page table is BF16-only) and DSpark batched draft.
+    /// Gates the whole-step decode graph (persistent page table is BF16-only) and the
+    /// DSpark batched draft.
     fn paged_kv_bf16(&self) -> bool {
         self.full_attn_kv
             .as_ref()
             .is_some_and(|p| p.format == KVFormat::BF16)
     }
 
-    /// Actual shared full-attn paged-pool page count, so the host admission pool
-    /// mirrors the device pool 1:1 (like dense). `None` only if the pool was
-    /// dropped (OPD offload), in which case the caller falls back to the
-    /// requested config value.
+    /// Actual pool page count, so the host admission pool mirrors the device 1:1.
+    /// `None` only if the pool was dropped (OPD offload).
     pub(crate) fn full_attn_pool_pages(&self) -> Option<usize> {
         self.full_attn_kv.as_ref().map(|p| p.max_total_pages)
     }
 
-    /// Whether the recall eviction/scoring *cycle* runs this session
-    /// (`--kv-recall`). When false the default paged path still runs — it just
-    /// attends the full resident set (no working-set restriction, no tier I/O).
     fn recall_active(&self) -> bool {
         self.kv_recall && self.recall_tier.is_some() && self.full_attn_kv.is_some()
     }
 
-    /// One DEFAULT paged prefill row (no recall cycle): self-allocate the prompt
-    /// tokens into the shared `full_attn_kv` pool, build the FULL-resident page
-    /// table (`PageMeta::for_slot`), and run the paged forward over it. This is
-    /// the dense-Qwen3 model applied to Qwen3.6 — full attention over every
-    /// resident page, no eviction/scoring/prefetch. Mirrors the prefill steps of
-    /// [`Self::prefill_row_recall`] but stops after the forward.
+    /// One paged prefill row with no recall cycle: full attention over every resident
+    /// page, no eviction/scoring/prefetch.
     fn prefill_row_paged_default(
         &mut self,
         row: &infer_plan::PrefillRow,
@@ -1405,8 +1170,7 @@ impl Qwen35CudaExecutor {
     ) -> Result<(u32, Option<f32>)> {
         let slot = row.slot;
         {
-            // Both pools must sit at `start_pos` before the append; a mismatch
-            // means an upstream restore left their cursors apart.
+            // A mismatch means an upstream restore left the two pools' cursors apart.
             let pool = self
                 .full_attn_kv
                 .as_ref()
@@ -1455,8 +1219,6 @@ impl Qwen35CudaExecutor {
                 &mut rc,
             );
         };
-        // DSpark: capture the trunk taps, extend the draft ctx cache with this
-        // chunk's rows, and stage the pending anchor on the final chunk.
         ds.taps.prepare(
             ds.head.target_layer_ids(),
             model.config.hidden_size,
@@ -1479,10 +1241,8 @@ impl Qwen35CudaExecutor {
         }
         let df = ds.slots[slot].as_mut().expect("built above");
         if df.ctx_end != row.start_pos {
-            // Gap (prefix-cache / sidecar-restored prefix): rebase the draft
-            // ctx at the suffix instead of degrading to plain decode — exact
-            // for sliding draft layers once the tail ≥ window, approximate
-            // only for the full-attention layer.
+            // Gap (prefix-cache / sidecar-restored prefix): rebase at the suffix rather
+            // than degrade to plain decode — approximate only for the full-attn layer.
             df.rebase(row.start_pos);
         }
         model.dspark_tap_features(&ds.head, &mut ds.taps, &mut ds.scratch)?;
@@ -1499,10 +1259,8 @@ impl Qwen35CudaExecutor {
         Ok((token, logprob))
     }
 
-    /// One DEFAULT paged decode row (no recall cycle): append this step's token
-    /// to the shared `full_attn_kv` pool and attend the FULL resident page set
-    /// (`PageMeta::for_slot`). Mirrors [`Self::decode_row_recall`] but without
-    /// the working-set restriction and without any tier I/O.
+    /// One paged decode row with no recall cycle: append and attend the full resident
+    /// page set, no tier I/O.
     fn decode_row_paged_default(
         &mut self,
         row: &DecodeRow,
@@ -1515,11 +1273,9 @@ impl Qwen35CudaExecutor {
                 .full_attn_kv
                 .as_ref()
                 .expect("full_attn_kv present (full_attn_paged)");
-            // The pool must already hold exactly this step's cache length before
-            // appending the new token; a mismatch means an upstream prefill left
-            // the slot's `seq_len` inconsistent with the engine's `kv_seq_len`
-            // (e.g. a leaked radix-reuse prefill — see `prefill_row_paged_default`).
-            // Catch it at the append, not via `PageMeta::for_slot` math downstream.
+            // Catch a slot whose pool seq_len drifted from the engine's kv_seq_len
+            // here,
+            // not via `PageMeta::for_slot` math downstream.
             ensure!(
                 pool.seq_len(slot) == row.kv_seq_len,
                 "Qwen3.6 default-paged decode: pool seq_len {} != kv_seq_len {} for slot {}",
@@ -1557,12 +1313,10 @@ impl Qwen35CudaExecutor {
         )
     }
 
-    /// One MTP spec-decode row (`--spec-type mtp`): the spec draft/verify step
-    /// when the slot is seeded (pending token + hidden captured by the warm
-    /// step), else a warm forward that captures the seed. Emits 1..=depth+1
-    /// tokens for this slot. Greedy rows verify by argmax match (token-exact
-    /// to no-spec greedy); sampling rows by rejection sampling (exact w.r.t.
-    /// the filtered target policy).
+    /// One MTP spec-decode row: the spec step when the slot is seeded, else a warm
+    /// forward that captures the seed. Emits 1..=depth+1 tokens. Greedy rows verify by
+    /// argmax match (token-exact to no-spec greedy), sampling rows by rejection
+    /// sampling.
     fn mtp_decode_row(
         &mut self,
         row: &DecodeRow,
@@ -1575,8 +1329,7 @@ impl Qwen35CudaExecutor {
             self.num_slots
         );
         let depth = self.model.spec_draft_tokens().max(1);
-        // Seeded iff we have a stored pending+hidden AND the pending matches the
-        // token the scheduler will feed (a gap = re-seed at the warm step).
+        // Seeded iff the stored pending matches the token the scheduler will feed.
         let seeded = speculative_chain_fits(row.kv_seq_len, depth, self.model.max_seq_len())
             && matches!(
                 self.mtp.as_ref().and_then(|m| m.slots[row.slot].as_ref()),
@@ -1594,11 +1347,8 @@ impl Qwen35CudaExecutor {
         self.mtp_spec_row(row, depth, host_kv)
     }
 
-    /// Warm step: a single forward that ALSO captures the seed hidden + pending
-    /// (argmax, or a policy-distributed sample under temp>0) for the next spec
-    /// step. Returns the pending token as the
-    /// decode output (the prefill already returned the first token; this is the
-    /// second). The spec step starts from the stored (pending, hidden).
+    /// Warm step: one forward that also captures the seed (pending token + hidden) for
+    /// the next spec step, and returns the pending token as this step's output.
     fn mtp_warm_decode_row(
         &mut self,
         row: &DecodeRow,
@@ -1653,8 +1403,7 @@ impl Qwen35CudaExecutor {
                 )?;
                 (tok, None)
             } else {
-                // Sampled seed so the pending token is policy-distributed (the
-                // warm forward is seq=1, so `logits` is exactly one vocab row).
+                // Sampled seed so the pending token is policy-distributed.
                 sample_cuda_token_scratched(
                     &model.ctx,
                     &logits,
@@ -1696,8 +1445,7 @@ impl Qwen35CudaExecutor {
                 )?;
                 (tok, None)
             } else {
-                // Sampled seed so the pending token is policy-distributed (the
-                // warm forward is seq=1, so `logits` is exactly one vocab row).
+                // Sampled seed so the pending token is policy-distributed.
                 sample_cuda_token_scratched(
                     &model.ctx,
                     &logits,
@@ -1715,11 +1463,9 @@ impl Qwen35CudaExecutor {
         }
     }
 
-    /// Spec step: draft a depth-token chain, verify in ONE trunk forward, accept
-    /// the longest matching prefix. On partial accept the trunk linear state is
-    /// rolled back + the paged pool truncated to the accepted prefix. Returns the
-    /// emitted tokens (accepted drafts + bonus); updates the seed state for the
-    /// next step.
+    /// Spec step: draft a depth-token chain, verify in ONE trunk forward, accept the
+    /// longest matching prefix. Partial accept rolls the trunk linear state back and
+    /// truncates the paged pool. Returns the accepted drafts plus the bonus token.
     fn mtp_spec_row(
         &mut self,
         row: &DecodeRow,
@@ -1728,8 +1474,9 @@ impl Qwen35CudaExecutor {
     ) -> Result<Vec<SlotToken>> {
         let slot = row.slot;
         let start = row.kv_seq_len;
-        // Verify appends depth+1; the engine pre-allocated one. Grow the host
-        // pool by the rest, truncate both back on partial accept.
+        // Verify appends depth+1 and the engine pre-allocated one; grow the host pool
+        // by
+        // the rest, truncate both back on partial accept.
         if self.full_attn_paged() {
             {
                 let pool = self.full_attn_kv.as_ref().expect("paged (gated)");
@@ -1784,9 +1531,7 @@ impl Qwen35CudaExecutor {
                 rc.as_mut(),
             )?
         };
-        // Partial accept: truncate both pools to the accepted prefix.
         let truncate_to = (emitted.len() < depth + 1).then(|| start + emitted.len());
-        // Commit: accumulate the spec-decode counters + update the next seed.
         let mtp_exec = mtp.as_mut().expect("mtp (gated)");
         let accepted = emitted.len() - 1;
         mtp_exec.accepts += accepted;
@@ -1814,9 +1559,8 @@ impl Qwen35CudaExecutor {
             .collect())
     }
 
-    /// Warm-decode one DSpark row with tap capture, extending the ctx cache +
-    /// pending anchor when the cache is contiguous. Non-paged rows run plain
-    /// and clear the draft state (speculation re-seeds at the next paged step).
+    /// Warm-decode one DSpark row with tap capture. Non-paged rows run plain and clear
+    /// the draft state, so speculation re-seeds at the next paged step.
     fn dspark_warm_decode_row(
         &mut self,
         row: &DecodeRow,
@@ -1860,8 +1604,8 @@ impl Qwen35CudaExecutor {
             layer0_query: None,
         };
         let ds = dspark.as_mut().expect("dspark warm without dspark");
-        // Gap (whole-slot promote / restored prefix): rebase at the current
-        // position and start rebuilding the suffix-only ctx from this step.
+        // Gap (whole-slot promote / restored prefix): rebase and rebuild the
+        // suffix-only ctx from this step.
         if let Some(df) = ds.slots[slot].as_mut()
             && df.ctx_end != row.kv_seq_len
         {
@@ -1893,13 +1637,10 @@ impl Qwen35CudaExecutor {
         Ok((token, logprob))
     }
 
-    /// One DSpark tick: draft per slot, verify EVERY chain in ONE trunk
-    /// forward, then accept/roll back per row. Greedy stays token-exact to
-    /// no-spec decode; sampling commits rejection-sampled tokens.
-    ///
-    /// A row falls back to its own warm step (unpaged pool, chain past the
-    /// trunk cap, no contiguous anchor, or an empty block) without stopping
-    /// the rest of the tick.
+    /// One DSpark tick: draft per slot, verify EVERY chain in ONE trunk forward, then
+    /// accept/roll back per row. Greedy stays token-exact to no-spec decode. A row
+    /// falls
+    /// back to its own warm step without stopping the rest of the tick.
     fn dspark_decode_batch(
         &mut self,
         decode_rows: &[DecodeRow],
@@ -1941,8 +1682,8 @@ impl Qwen35CudaExecutor {
             );
         }
 
-        // 1. Draft — no trunk/pool state touched; noise K/V self-heal. Weight-
-        //    bound at block rows, so every seeded slot shares one forward.
+        // Draft: no trunk/pool state touched, and weight-bound at block rows, so every
+        // seeded slot shares one forward.
         let mut pre: Vec<Option<Vec<u32>>> = vec![None; decode_rows.len()];
         let mut idx: Vec<usize> = (0..decode_rows.len()).filter(|&i| seeded[i]).collect();
         if idx.len() >= 2 && decode_rows.iter().all(|r| r.params.is_greedy()) {
@@ -2003,11 +1744,11 @@ impl Qwen35CudaExecutor {
                     })
                     .transpose()?,
             }
-            // A chain the budget cut to bare anchor stays in the batched verify
-            // as one decode row (sglang keeps min_verify_len=1 in the ragged
-            // batch) — falling back per slot would cost a serial trunk forward
-            // each. Sampled chains keep the fallback: the rejection kernel's
-            // depth-0 path is unexercised.
+            // A bare-anchor chain stays in the batched verify as one decode row
+            // (min_verify_len=1); a per-slot fallback would cost a serial trunk
+            // forward.
+            // Sampled chains keep the fallback: the rejection kernel's depth-0 path is
+            // unexercised.
             .filter(|(chain, _)| chain.len() >= 2 || row.params.is_greedy());
             let Some((chain, partial_ctx)) = drafted else {
                 let (token, logprob) =
@@ -2039,8 +1780,7 @@ impl Qwen35CudaExecutor {
         }
         let chains: Vec<u32> = batch.iter().flat_map(|c| c.chain.iter().copied()).collect();
 
-        // 2. Snapshot every trunk's linear state (partial-accept rollback base)
-        //    in one launch per state kind.
+        // Snapshot every trunk's linear state as the partial-accept rollback base.
         for c in &batch {
             if self.dspark.as_ref().expect("dspark").spec[c.slot].is_none() {
                 let st = self.model.new_spec_slot_state()?;
@@ -2075,8 +1815,8 @@ impl Qwen35CudaExecutor {
             model.batched_copy(&mut ds.copy, &conv.0, &conv.1, &[bytes.1])?;
         }
 
-        // 3. Reserve + verify, all-or-nothing: seq_lens advance only on
-        //    success, so any failure must give every reserved row back.
+        // All-or-nothing: seq_lens advance only on success, so any failure must give
+        // every reserved row back.
         let logits = match self.dspark_verify_forward(&batch, &chains, total_rows, host_kv) {
             Ok(logits) => logits,
             Err(e) => {
@@ -2101,22 +1841,21 @@ impl Qwen35CudaExecutor {
         let ds = dspark.as_mut().expect("dspark");
         // The tap fc projection is batch-wide; only the K/V append is per slot.
         model.dspark_tap_features(&ds.head, &mut ds.taps, &mut ds.scratch)?;
-        // One argmax over every chain's rows: the greedy accept scan is host
-        // arithmetic from here, so the loop below adds no device syncs.
+        // One argmax over every chain's rows: the accept scan is host arithmetic from
+        // here, so the loop below adds no device syncs.
         let argmax = match decode_rows.iter().any(|r| r.params.is_greedy()) {
             true => model.argmax_rows(&logits, &mut ds.scratch)?,
             false => Vec::new(),
         };
 
-        // 5. Per row: accept, extend the draft ctx, stage the bonus as the next
-        //    anchor. The greedy rollback batches below — nothing here reads the
-        //    trunk linear state or `seq_len`.
+        // Nothing in this loop reads the trunk linear state or `seq_len`, so the greedy
+        // rollback batches below.
         let mut rollback: Vec<(usize, usize, usize)> = Vec::with_capacity(batch.len());
         for c in &batch {
             let params = &decode_rows[c.out].params;
             let spec = ds.spec[c.slot].as_mut().expect("built above");
             let (emitted, bonus, k) = if params.is_greedy() {
-                // Greedy: delta policy, no behavior logprob (P6 sidecar skips greedy).
+                // Greedy: no behavior logprob.
                 let (tokens, bonus, k) = model.dspark_accept_commit(&c.chain, &argmax, c.row0)?;
                 if k + 1 < c.chain.len() {
                     rollback.push((c.slot, c.start, k));
@@ -2168,7 +1907,6 @@ impl Qwen35CudaExecutor {
                 })
                 .collect();
         }
-        // One replay launch per layer for every partially-accepted chain.
         if !rollback.is_empty() {
             rollback.sort_by_key(|r| r.0);
             let mut pick = vec![false; slots.len()];
@@ -2200,9 +1938,8 @@ impl Qwen35CudaExecutor {
         Ok(out.into_iter().flatten().collect())
     }
 
-    /// Reserve, build the ragged page table, run the one trunk forward.
-    /// Chain `i` owns logits rows `[c.row0, +len)`. The caller rolls the pool
-    /// back on any error.
+    /// Chain `i` owns logits rows `[c.row0, +len)`. The caller rolls the pool back on
+    /// any error.
     fn dspark_verify_forward(
         &mut self,
         batch: &[DsparkChain],
@@ -2210,8 +1947,6 @@ impl Qwen35CudaExecutor {
         total_rows: usize,
         host_kv: &mut dyn KvPool,
     ) -> Result<cuda_kernels::prelude::HiddenStates> {
-        // One forward writes each chain's whole KV; the caller truncates both
-        // pools back on partial accept.
         for c in batch {
             {
                 let pool = self.full_attn_kv.as_ref().expect("paged (gated by seeded)");
@@ -2271,15 +2006,10 @@ impl Qwen35CudaExecutor {
         model.dspark_verify_logits(&mut fwd, workspace, chains, &mut rc, &mut ds.taps)
     }
 
-    /// One prefill row over the recall pool (`--kv-recall`). The ONLY place the whole
-    /// recall cycle runs (write-through model: "decode 不召回; prefetch 只在 prefill").
-    ///
-    /// 1. Self-allocate tokens, run paged forward — captures layer-0 query for scoring.
-    /// 2. Score history (`recompute_recall_plan`): select evict + prefetch pages.
-    /// 3. Batched-H2D prefetch tier-resident blocks, resolve fixed `recall_pages` working set.
-    /// 4. Write-back-evict cold middle to tier, free physical pages immediately (no in-flight attn race).
-    ///
-    /// After return, `recall[slot].recall_pages()` is the immutable working set for decode.
+    /// One prefill row over the recall pool (`--kv-recall`) — the ONLY place the whole
+    /// recall cycle runs: decode never recalls, prefetch happens only here. After
+    /// return,
+    /// `recall[slot].recall_pages()` is the immutable working set for decode.
     fn prefill_row_recall(
         &mut self,
         row: &infer_plan::PrefillRow,
@@ -2299,7 +2029,7 @@ impl Qwen35CudaExecutor {
                 row.tokens.len(),
             )?
         };
-        // (1) Forward. Borrow split: &model + &mut slot + &mut workspace + &mut pool (via rc). `rc` carries back layer-0 query.
+        // `rc` carries back the layer-0 query used for scoring below.
         let (token, layer0_query) = {
             let Self {
                 model,
@@ -2339,7 +2069,7 @@ impl Qwen35CudaExecutor {
             ps
         );
 
-        // Score history against prefill query, plan fixed working set. `allow_prefetch=true` lets tier-resident blocks re-enter.
+        // `allow_prefetch=true` lets tier-resident blocks re-enter the working set.
         let num_q_heads = self.model.local_q_heads();
         let num_kv_heads = self.model.local_kv_heads();
         let head_dim = self.model.config.head_dim;
@@ -2370,7 +2100,7 @@ impl Qwen35CudaExecutor {
             }
         };
 
-        // Prefetch tier-resident blocks back into HBM. Decode never does this — one batched prefill sync point.
+        // Decode never prefetches — one batched sync point, here.
         for logical in prefetch_pages {
             let key = tier_block_u64(slot as u64, logical as u64);
             let Some(tier) = self.recall_tier.as_mut() else {
@@ -2397,7 +2127,9 @@ impl Qwen35CudaExecutor {
             state.resolve_recall_pages(pool, slot);
         }
 
-        // Write-back-evict cold middle: mirror to L3, free physical pages. Prefill drained compute stream — no in-flight attn race.
+        // Prefill drained the compute stream, so freeing physical pages here cannot
+        // race
+        // an in-flight attention.
         for logical in evict_pages {
             let physical = {
                 let pool = self.full_attn_kv.as_ref().expect("full_attn_kv");
@@ -2432,8 +2164,8 @@ impl Qwen35CudaExecutor {
         Ok(token)
     }
 
-    /// One decode row over the recall pool (`--kv-recall`): append + attend, ZERO tier I/O.
-    /// Working set fixed at prefill. Alloc token, read fixed `recall_pages`, forward + sample.
+    /// One decode row over the recall pool: ZERO tier I/O, working set fixed at
+    /// prefill.
     fn decode_row_recall(
         &mut self,
         row: &DecodeRow,
@@ -2460,7 +2192,6 @@ impl Qwen35CudaExecutor {
                 &recall_pages,
             )?
         };
-        // Forward (paged decode) + sample. `rc.layer0_query` collected but unused on decode.
         let Self {
             model,
             slots,
@@ -2520,8 +2251,7 @@ impl Qwen35CudaExecutor {
         Ok(())
     }
 
-    /// Shared graph-lane epilogue: advance the slot, bump the reuse-evidence
-    /// counters (the license needs replay counts, not capture-exists), then
+    /// Shared graph-lane epilogue: advance the slot, bump the replay counters, then
     /// sample OUTSIDE the graph from the logits the run just wrote.
     fn finish_graph_step(
         &mut self,
@@ -2560,12 +2290,10 @@ impl Qwen35CudaExecutor {
             .sample_workspace_logits(&mut dg.ws, &row.params, position)
     }
 
-    /// Run one decode step through the captured whole-step graph. Returns
-    /// `Ok(None)` for eager fallback (gate off, out-of-budget, or capture/replay
-    /// failure which permanently downgrades to eager, never fatal).
-    ///
-    /// See [`crate::qwen35::Qwen35Model::forward_decode_step_captured`] for
-    /// capture-safety table and perf formula.
+    /// Run one decode step through the captured whole-step graph. `Ok(None)` means
+    /// eager
+    /// fallback: gate off, out-of-budget, or a capture/replay failure that permanently
+    /// downgrades to eager.
     fn try_graph_decode(
         &mut self,
         row: &DecodeRow,
@@ -2574,8 +2302,8 @@ impl Qwen35CudaExecutor {
         if !self.decode_graph_armed {
             return Ok(None);
         }
-        // Budget check must run every step — host ensures inside captured closure
-        // only run on warm/capture steps. Out-of-budget falls back to eager.
+        // Must run every step: host ensures inside the captured closure only run on
+        // warm/capture steps.
         if row.kv_seq_len + 1 > self.model.max_seq_len() {
             return Ok(None);
         }
@@ -2585,7 +2313,6 @@ impl Qwen35CudaExecutor {
                 &self.model.ctx.stream,
             ));
         }
-        // Split borrows: capture closure needs &model + &mut slot + &mut workspace.
         let Self {
             model,
             slots,
@@ -2605,8 +2332,7 @@ impl Qwen35CudaExecutor {
         let run = state
             .run_or_capture(|| model.forward_decode_step_captured(slot_state, ws, row.kv_seq_len));
         if let Err(e) = run {
-            // Any capture/replay failure downgrades to eager permanently — never fatal.
-            // Mid-capture error only recorded kernels, so device state untouched.
+            // A mid-capture error only recorded kernels, so device state is untouched.
             warn!(
                 "Qwen3.5 whole-step decode graph failed (slot {slot}), \
                  downgrading to eager forward: {e}"
@@ -2619,13 +2345,10 @@ impl Qwen35CudaExecutor {
             .map(Some)
     }
 
-    /// Whole-step decode graph over the PAGED pool (the serving default): the
-    /// same per-slot capture/replay lane as [`Self::try_graph_decode`], with
-    /// the growing page table absorbed by a fixed-capacity per-slot
-    /// [`crate::loader::PageMeta::persistent_decode`] refreshed outside the
-    /// graph, and FA3's scheduling ceiling pinned via `seqlen_k_capture`.
-    /// Returns `Ok(None)` on any gate miss (eager fallback); any
-    /// capture/replay failure permanently downgrades to eager.
+    /// Whole-step decode graph over the PAGED pool: the growing page table is absorbed
+    /// by a fixed-capacity per-slot [`crate::loader::PageMeta::persistent_decode`]
+    /// refreshed outside the graph, with FA3's scheduling ceiling pinned via
+    /// `seqlen_k_capture`. `Ok(None)` on any gate miss.
     fn try_graph_decode_paged(
         &mut self,
         row: &DecodeRow,
@@ -2655,8 +2378,7 @@ impl Qwen35CudaExecutor {
                 slot
             );
         }
-        // Host-side pool advance (page alloc + mirror) — identical to the eager
-        // paged path, idempotent if the eager fallback re-runs it.
+        // Idempotent, so the eager fallback may re-run it.
         self.mirror_host_slot(host_kv, slot, row.kv_seq_len + 1)?;
         if self.decode_graph.is_none() {
             self.decode_graph = Some(Qwen35DecodeGraph::new(
@@ -2723,46 +2445,32 @@ impl Qwen35CudaExecutor {
         out.map(Some)
     }
 
-    /// Offload the model's device weights to host RAM (OPD teacher time-share),
-    /// returning the device bytes freed. Per-slot KV / recurrent state is left
-    /// resident — only the shared model weights move. The forward workspace is
-    /// released too (AFTER the offload's full device sync, so no in-flight
-    /// kernel can still reference the dropped buffers) — it may hold
-    /// prefill-shaped scratch the student backward wants as headroom.
+    /// Offload the model's device weights to host RAM, returning the bytes freed;
+    /// per-slot KV / recurrent state stays resident. The forward workspace is released
+    /// AFTER the offload's device sync, so no in-flight kernel references it.
     pub(crate) fn offload_engine_weights(&mut self) -> Result<usize> {
         self.ensure_not_collective("offload_engine_weights")?;
         let freed = self.model.offload_engine_weights()?;
         self.workspace.release();
-        // The batched-decode workspace holds `[*, B]` scratch (incl. MoE) —
-        // release it for the same headroom reason. Its pointer TABLES survive:
-        // they address per-slot state, which the weight offload leaves
-        // resident (see `Qwen35BatchDecodeState::release`).
+        // The pointer TABLES survive: they address per-slot state, which the offload
+        // leaves resident.
         if let Some(bd) = self.batch_decode.as_mut() {
             bd.release();
         }
-        // Captured decode graphs bake the (now freed/placeholder) weight
-        // addresses — drop them wholesale. Re-built + re-captured lazily after
-        // reload (the gate flag stays armed).
+        // Captured graphs bake the now-freed weight addresses.
         self.decode_graph = None;
-        // Release the KV pool too: the w2s aux engines only run short forward
-        // passes, and leaving N KV pools resident OOMs the student forward.
-        // `reload_engine_weights` re-acquires it via `ensure_kv_pool`.
+        // Leaving N KV pools resident OOMs the co-resident student forward.
         self.release_kv_pool()?;
-        // Trim the async pool AFTER releasing workspace + batch-decode scratch
-        // so the co-resident autograd store (cudaMalloc) sees the freed VRAM.
+        // Trim AFTER releasing the scratch so the autograd store sees the freed VRAM.
         self.model.ctx.trim_memory_pool()?;
         let (free, total) = self.model.ctx.mem_info_bytes()?;
         eprintln!("[executor-offload] free={free} total={total}");
         Ok(freed)
     }
 
-    /// Release the inference forward scratch (24K-shaped workspace + batched-decode
-    /// scratch + captured decode graphs) WITHOUT offloading weights or touching KV.
-    /// The freed device blocks return to the shared CUmemAllocAsync caching pool the
-    /// co-resident OPD writeback's autograd reuses (OPD `EngineOffloadMode::Off`
-    /// rollout->writeback never offloads, so the scratch otherwise OOMs the writeback).
-    /// This is `offload_engine_weights`'s scratch-teardown MINUS the weight offload —
-    /// weights and per-slot KV / recurrent state stay resident.
+    /// Release the inference forward scratch WITHOUT offloading weights or touching KV:
+    /// the freed blocks return to the shared async pool the co-resident OPD writeback
+    /// reuses, which would otherwise OOM.
     pub(crate) fn release_inference_scratch(&mut self) -> Result<()> {
         self.workspace.release();
         if let Some(bd) = self.batch_decode.as_mut() {
@@ -2772,19 +2480,16 @@ impl Qwen35CudaExecutor {
         Ok(())
     }
 
-    /// Reload the model's device weights from the host snapshot.
     pub(crate) fn reload_engine_weights(&mut self) -> Result<()> {
         self.ensure_not_collective("reload_engine_weights")?;
         self.model.reload_engine_weights()?;
-        // Re-acquire the KV pool released by `offload_engine_weights`.
         self.ensure_kv_pool()?;
         Ok(())
     }
 
-    /// OPD surfaces are rank-0 control-seam calls: under multi-rank TP they
-    /// would run on one rank only, desyncing the per-step NCCL collective
-    /// sequence (and, for LoRA/offload, diverging the resident weights across
-    /// ranks). Bail loudly instead of silently corrupting the lockstep.
+    /// OPD surfaces are rank-0 control-seam calls: under multi-rank TP they would run
+    /// on
+    /// one rank only, desyncing the per-step NCCL collective sequence.
     fn ensure_not_collective(&self, what: &str) -> Result<()> {
         ensure!(
             !self.model.tp.is_collective(),
@@ -2810,14 +2515,11 @@ impl Qwen35CudaExecutor {
             return Ok(StepOutput { tokens: Vec::new() });
         }
 
-        // A decode-only single-row plan is the only one eligible for the
-        // whole-step B=1 decode-graph lane (`allow_graph`); it is gated to
-        // rows==1 PLANS so batched/mixed steps never capture or replay.
+        // Gated to rows==1 PLANS so batched/mixed steps never capture or replay.
         let allow_graph = plan.prefill_rows.is_empty() && plan.decode_rows.len() == 1;
 
-        // Plan rows always address disjoint slots (a request is either
-        // Prefilling or Decoding), so the sequential prefill sub-steps below are
-        // math-identical to consecutive single-mode ticks.
+        // Plan rows always address disjoint slots, so the sequential prefill sub-steps
+        // below are math-identical to consecutive single-mode ticks.
         let mut seen_slots = std::collections::BTreeSet::new();
         for slot in plan
             .prefill_rows
@@ -2856,11 +2558,10 @@ impl Qwen35CudaExecutor {
         }
     }
 
-    /// Route a decode sub-batch through the concurrency gate, then execute the
-    /// chosen path. This is the single `dspark → mtp → plain` dispatch ladder for
-    /// both the B=1 and batched entry points. At or below `--spec-max-batch` a
-    /// spec scheme drafts per row (the c=1 win); above it — where spec is a
-    /// compute-bound loss — decode falls to the plain batched path that scales.
+    /// The single `dspark → mtp → plain` dispatch ladder. At or below
+    /// `--spec-max-batch`
+    /// a spec scheme drafts per row; above it spec is a compute-bound loss, so decode
+    /// falls to the plain batched path that scales.
     fn dispatch_decode_rows(
         &mut self,
         decode_rows: &[DecodeRow],
@@ -2869,10 +2570,9 @@ impl Qwen35CudaExecutor {
     ) -> Result<Vec<SlotToken>> {
         use super::spec_decode::{DecodeRoute, SpecKind};
         let kind = self.spec_kind();
-        // Only a batched greedy DSpark draft pays above c=1. MTP still drafts
-        // per row; sampling loses −15.5% at c=8 and −26.4% at c=16 because the
-        // rejection test commits far less per verify row; the batched DSpark
-        // path is unvalidated with quant-KV pools. Each holds the gate at 1.
+        // Only a batched greedy DSpark draft pays above c=1: sampling loses −15.5% at
+        // c=8 and −26.4% at c=16, and batched DSpark is unvalidated with quant-KV
+        // pools.
         let batched = kind == SpecKind::Dspark
             && self.paged_kv_bf16()
             && decode_rows.iter().all(|r| r.params.is_greedy());
@@ -2905,8 +2605,6 @@ impl Qwen35CudaExecutor {
         }
     }
 
-    /// One prefill row as its own single-row sub-step (the pre-batching
-    /// single-row prefill arm, factored).
     fn submit_prefill_row(
         &mut self,
         row: &infer_plan::PrefillRow,
@@ -2919,24 +2617,17 @@ impl Qwen35CudaExecutor {
             self.num_slots
         );
         ensure!(!row.tokens.is_empty(), "prefill row must carry tokens");
-        // A fresh prefill (start_pos == 0) rewinds this slot's recurrent +
-        // conv state and cache cursor before appending. Request-boundary
-        // rearm discipline (the e95e11b6 lesson): the slot's captured
-        // decode graph stays valid (state buffers are memset, not
-        // re-allocated), but its FIRST decode of the new occupant runs one
-        // eager warm step so any per-request host work executes without
-        // dropping the capture — capture cost stays once per slot, not
-        // once per request.
+        // A fresh prefill rewinds this slot's recurrent + conv state. The captured
+        // graph
+        // stays valid (state buffers are memset, not re-allocated), but the new
+        // occupant's
+        // FIRST decode runs one eager warm step, so capture cost stays once per slot.
         if row.start_pos == 0 {
-            // Request boundary: the prior occupant is finished (the scheduler
-            // only reassigns a slot after its request completes — no in-flight
-            // forward references the slot), so return its recurrent block to the
-            // free-list, then acquire (pop the same block back, or alloc) and
-            // zero it for the new occupant. This replaces the old in-place
-            // `reset()` zeroing; the block MUST be resident before the forward.
+            // The prior occupant is finished, so return its recurrent block to the
+            // free-list, then acquire and zero one; it MUST be resident before the
+            // forward.
             self.slots[row.slot].release_recurrent(&mut self.recurrent_pool);
-            // Drop any prior occupant's pending boundary snapshots: this slot is a
-            // new request, so a stale snapshot must never key a future sidecar.
+            // A stale snapshot must never key this new request's sidecar.
             self.prefill_boundary_snapshot[row.slot] = None;
             self.periodic_boundary_snapshots[row.slot].clear();
             // New occupant: the prior request's draft ctx cache is dead.
@@ -2947,8 +2638,7 @@ impl Qwen35CudaExecutor {
             {
                 df.reset();
             }
-            // New occupant: drop the prior request's MTP seed (pending+hidden);
-            // the warm step re-seeds from the prefill's last token.
+            // New occupant: drop the prior request's MTP seed; the warm step re-seeds.
             if let Some(mtp) = self.mtp.as_mut() {
                 mtp.slots[row.slot] = None;
             }
@@ -2960,33 +2650,26 @@ impl Qwen35CudaExecutor {
                 conv_len,
                 &mut self.recurrent_pool,
             )?;
-            // The new block's `gdr_states`/`conv_states` addresses differ from the
-            // prior occupant's, so the batched-decode pointer-table cache (keyed
-            // on slot_indices only) must restage on the next decode batch.
+            // The new block's addresses differ from the prior occupant's, so the
+            // pointer-table cache (keyed on slot_indices only) must restage.
             if let Some(bd) = self.batch_decode.as_mut() {
                 bd.invalidate_staged_pointers();
             }
-            // The captured decode graph (legacy contiguous lane) bakes this slot's
-            // recurrent-block addresses; a different block invalidates it. Drop the
-            // slot's capture (the `baked` staleness check only tracks workspace
-            // ptrs, not recurrent ptrs) so it re-captures against the new block —
-            // `rearm_warm` alone keeps the stale capture and would replay freed mem.
+            // The capture bakes this slot's recurrent-block addresses and `baked`
+            // tracks
+            // only workspace ptrs, so drop it — `rearm_warm` alone would replay freed
+            // mem.
             if let Some(dg) = self.decode_graph.as_mut() {
                 dg.graphs[row.slot] =
                     crate::graph::CudaGraphState::new(self.model.ctx.stream.clone());
                 dg.baked[row.slot] = None;
             }
-            // Default paged path: free the prior occupant's pages back to the
-            // shared pool so a fresh prefill starts at logical page 0. (Under
-            // recall the keepalive release below also runs.)
+            // Free the prior occupant's pages so a fresh prefill starts at logical page
+            // 0.
             if self.recall_active() {
                 self.recall[row.slot].reset();
-                // Release any pages still parked in the eviction keepalive from the
-                // prior occupant's last decode step BEFORE freeing the slot, so the
-                // detached physical pages rejoin the pool instead of leaking (they
-                // are sentinels in the table, so `free_slot` alone would not recycle
-                // them). The prior request finished, so its attention has long since
-                // completed — no race with the one-step deferral.
+                // Release keepalive-parked pages BEFORE freeing the slot: they are
+                // sentinels in the table, so `free_slot` alone would not recycle them.
                 let parked = std::mem::take(&mut self.recall_keepalive[row.slot]);
                 if let Some(pool) = self.full_attn_kv.as_mut() {
                     for (_logical, physical) in parked {
@@ -2994,13 +2677,9 @@ impl Qwen35CudaExecutor {
                     }
                     pool.mirror_slot(row.slot, &[], 0)?;
                 }
-                // Stale L3 tier entries keyed by (slot, logical) from the prior
-                // occupant are left to the store's LRU/capacity eviction: re-recall
-                // only reads a block whose resident REP exists, and `reset()` just
-                // cleared all reps, so a fresh occupant can never read a prior
-                // occupant's tier block before overwriting that key — tenant-safe
-                // without a per-session key registry (the dense arm's
-                // `drop_tier_session` makes the same call, see its doc).
+                // Stale L3 entries are left to the store's LRU: `reset()` cleared all
+                // reps, so a fresh occupant can never read a prior occupant's block
+                // before overwriting that key.
             } else if let Some(pool) = self.full_attn_kv.as_mut() {
                 // Drop the mirror; the host pool owns these pages.
                 pool.mirror_slot(row.slot, &[], 0)?;
@@ -3010,33 +2689,24 @@ impl Qwen35CudaExecutor {
         if self.recall_active() {
             return self.prefill_row_recall(row, position, host_kv);
         }
-        // Default paged prefill: full attention over all resident pages, no
-        // eviction (the dense model applied to Qwen3.6 — Phase 2).
         if self.slots[row.slot].has_recurrent() {
             return self.prefill_row_snapshotted(row, position, host_kv);
         }
         self.prefill_row_paged_default(row, position, host_kv)
     }
 
-    /// Prefill a hybrid row, splitting the forward at recurrent-snapshot
-    /// boundaries so a later prefix hit can restore the linear-attn state.
+    /// Prefill a hybrid row, splitting the forward at recurrent-snapshot boundaries so
+    /// a
+    /// later prefix hit can restore the linear-attn state.
     ///
-    /// Recurrent state is only observable at a forward's END, so a snapshot keyed
-    /// at position `S` requires a forward that ends at `S` (else keying a
-    /// later-position state at `S` bakes the residue `[S..end]` and double-advances
-    /// it on restore). Two families of boundary:
-    /// - **`L*` = align_down16(total - 1)** (final chunk only) — the exact-resend
-    ///   restore target (popped for aligned, un-popped for non-aligned; see
-    ///   `prefix.rs:72`). Owns `prefill_boundary_snapshot` (the within-conversation
-    ///   fast path), unchanged.
-    /// - **Periodic stride multiples `S = k * SIDECAR_SNAPSHOT_STRIDE_PAGES * 16`**
-    ///   crossed in `(start, end)` — for a future CROSS-conversation restore. Each
-    ///   feeds `periodic_boundary_snapshots`, saved at publish.
-    ///
-    /// Every cut is `< end`, so a real tail always remains to forward with the
-    /// real `position` and return the sampled token. All cuts are page-aligned
-    /// (stride is a page multiple, `L*` is `align16`), so `hash(tokens[..S])`
-    /// rendezvous with the restore probe's page-aligned boundaries.
+    /// Recurrent state is only observable at a forward's END, so a snapshot keyed at
+    /// `S`
+    /// requires a forward that ends at `S` — otherwise it bakes the residue `[S..end]`
+    /// and double-advances it on restore. Cuts are `L*` (the exact-resend target) and
+    /// the
+    /// stride multiples crossed in `(start, end)`. Every cut is `< end`, so a real tail
+    /// always remains, and all cuts are page-aligned so `hash(tokens[..S])` rendezvous
+    /// with the restore probe's boundaries.
     fn prefill_row_snapshotted(
         &mut self,
         row: &infer_plan::PrefillRow,
@@ -3049,18 +2719,13 @@ impl Qwen35CudaExecutor {
         let lstar = row.total_tokens.saturating_sub(1) / SUPPORTED_PAGE_SIZE * SUPPORTED_PAGE_SIZE;
         let stride = SIDECAR_SNAPSHOT_STRIDE_PAGES * SUPPORTED_PAGE_SIZE; // const, > 0
 
-        // Ordered snapshot cuts in `[start, end)`. `bool` = is-`L*` (routes to the
-        // exact-resend `prefill_boundary_snapshot`; a boundary coinciding with `L*`
-        // is marked here so the L* insert below dedups it).
+        // Ordered snapshot cuts in `[start, end)`; `bool` = is-`L*`.
         let mut cuts: Vec<(usize, bool)> = Vec::new();
-        // Boundary at `start`: a prior chunk ended exactly on a stride multiple, so
-        // that boundary is never `< end` of any chunk — snapshot the already-
-        // materialized state here (no forward). Without this, chunking aligned to
-        // the stride (e.g. chunked_prefill_size == stride) would snapshot nothing.
+        // A prior chunk ending exactly on a stride multiple leaves a boundary that is
+        // never `< end` of any chunk, so snapshot the already-materialized state here.
         if start > 0 && start.is_multiple_of(stride) {
             cuts.push((start, is_final && start == lstar));
         }
-        // Interior stride multiples (strictly `> start`, `< end`).
         let mut s = (start / stride + 1) * stride;
         while s < end {
             cuts.push((s, is_final && s == lstar));
@@ -3077,8 +2742,6 @@ impl Qwen35CudaExecutor {
         }
         cuts.sort_unstable_by_key(|&(p, _)| p);
 
-        // Forward each `[cursor..cut]` segment (state materialized at `cut`),
-        // snapshot there, then the final `[cursor..end]` tail returns the token.
         let mut cursor = start;
         let mut did_cut = false;
         for (cut, is_lstar) in cuts {
@@ -3093,8 +2756,7 @@ impl Qwen35CudaExecutor {
                 self.prefill_row_paged_default(&seg, cut as u64, host_kv)?; // token discarded
                 cursor = cut;
             }
-            // State is now materialized at exactly `cut` (either forwarded to it,
-            // or `cut == start` already reached by a prior chunk).
+            // State is now materialized at exactly `cut`.
             let snap = self.slots[row.slot].snapshot_recurrent(&self.model.ctx)?;
             if is_lstar {
                 self.prefill_boundary_snapshot[row.slot] = Some((cut, snap));
@@ -3104,9 +2766,9 @@ impl Qwen35CudaExecutor {
             did_cut = true;
         }
         if !did_cut {
-            return self.prefill_row_paged_default(row, position, host_kv); // no boundary crossed
+            return self.prefill_row_paged_default(row, position, host_kv);
         }
-        // Final tail `[cursor..end]` (cuts are all `< end`, so this is non-empty).
+        // Cuts are all `< end`, so this tail is non-empty.
         let tail = infer_plan::PrefillRow {
             slot: row.slot,
             tokens: row.tokens[cursor - start..].to_vec(),
@@ -3117,9 +2779,8 @@ impl Qwen35CudaExecutor {
         self.prefill_row_paged_default(&tail, position, host_kv)
     }
 
-    /// One decode row as a single-row forward (the pre-batching single-row
-    /// decode arm, factored). `allow_graph` admits the whole-step B=1
-    /// decode-graph lane — true only for rows==1 plans.
+    /// `allow_graph` admits the whole-step B=1 decode-graph lane — true only for
+    /// rows==1 plans.
     fn submit_decode_row(
         &mut self,
         row: &DecodeRow,
@@ -3140,18 +2801,13 @@ impl Qwen35CudaExecutor {
             row.slot
         );
         let position = row.kv_seq_len.saturating_add(1) as u64;
-        // Session KV-recall (opt-in): decode reads the recall-restricted page
-        // table (the fixed working set chosen at prefill). The seq_len invariant
-        // above still holds — the slot's seq_len is advanced in lockstep inside
-        // the recall forward.
+        // Recall decode reads the fixed working set chosen at prefill; the seq_len
+        // invariant above holds because the recall forward advances it in lockstep.
         if self.recall_active() {
             return self.decode_row_recall(row, position, host_kv);
         }
-        // Default paged decode: append + attend the full resident page set.
-        // The whole-step graph lane runs first when armed — the growing page
-        // table is absorbed by per-slot persistent metadata refreshed outside
-        // the capture; the eager paged forward stays the correctness floor
-        // and the fallback for every gate miss.
+        // The graph lane runs first when armed; the eager paged forward is the
+        // correctness floor and the fallback for every gate miss.
         if self.full_attn_paged() {
             if allow_graph
                 && let Some(token) = self.try_graph_decode_paged(row, position, host_kv)?
@@ -3160,9 +2816,8 @@ impl Qwen35CudaExecutor {
             }
             return self.decode_row_paged_default(row, position, host_kv);
         }
-        // Legacy contiguous path (no paged pool — e.g. OPD weight offload dropped
-        // it): the whole-step graph lane first (opt-in), with eager
-        // `forward_tokens` as the correctness floor / graph-miss fallback.
+        // Legacy contiguous path (no paged pool — e.g. an OPD weight offload dropped
+        // it).
         let graph_token = if allow_graph {
             self.try_graph_decode(row, position)?
         } else {
@@ -3181,31 +2836,21 @@ impl Qwen35CudaExecutor {
         }
     }
 
-    /// A rows>1 pure-decode sub-batch: ONE batched forward over all rows
-    /// ([`crate::qwen35::Qwen35Model::forward_decode_batch`] — stage 1
-    /// re-port of the monolith batched decode; the c=4 amortization formula
-    /// and the TP/all-reduce proof live on that method). With
-    /// `--qwen35-batched-decode false`, runs the rows sequentially as
-    /// single-row forwards instead (the honest A/B arm; the pre-batching
-    /// behavior was a hard error, not a fallback).
+    /// A rows>1 pure-decode sub-batch: ONE batched forward over all rows. With
+    /// `--qwen35-batched-decode false`, runs the rows sequentially instead.
     ///
-    /// Decode-graph interaction (stage 1): batched steps NEVER capture or
-    /// replay, and they cannot invalidate existing B=1 captures — the
-    /// captured graphs bake (a) per-slot state addresses, which the batched
-    /// path mutates strictly IN PLACE through pointer tables over the same
-    /// allocations, and (b) the dedicated decode-graph workspace's buffer
-    /// addresses, which the batched path never touches (it owns a third,
-    /// batch-only workspace). The per-step position is read from a staged
-    /// device scalar at replay, so a slot's seq_len advancing via a batched
-    /// step replays correctly on its next single-row graphed step.
+    /// Batched steps never capture or replay, and cannot invalidate existing B=1
+    /// captures: they mutate per-slot state strictly IN PLACE through pointer tables
+    /// and
+    /// own a separate workspace, and the per-step position is read from a staged device
+    /// scalar at replay.
     fn submit_decode_batch(
         &mut self,
         rows: &[DecodeRow],
         host_kv: &mut dyn KvPool,
     ) -> Result<Vec<SlotToken>> {
         debug_assert!(rows.len() > 1);
-        // Per-row watermark/validation BEFORE any device mutation (dup-slot
-        // ensure ran at plan level in `submit`).
+        // Validate BEFORE any device mutation (the dup-slot ensure ran in `submit`).
         for row in rows {
             ensure!(
                 row.slot < self.num_slots,
@@ -3222,21 +2867,14 @@ impl Qwen35CudaExecutor {
             );
         }
 
-        // Under the shared-paged default (always-on), B>1 decode batches over the
-        // shared `full_attn_kv` pool via the PAGED batched kernels (the contiguous
-        // `k_caches`/`v_caches` the legacy batched path reads are never allocated).
-        // BF16 and INT8/FP8 pools both run here: the quant arm quantizes each
-        // row's new token into the pool planes, then runs the varlen quantized
-        // decode kernel. A TP collective per-rank lockstep is handled by
-        // `forward_decode_batch_paged`'s all-reduces — the correctness floor
-        // keeps `--kv-recall` (per-row restricted page table) on the serial
-        // per-row path.
+        // Under the shared-paged default the contiguous `k_caches`/`v_caches` are never
+        // allocated, so B>1 runs the PAGED batched kernels; recall and TP stay on the
+        // serial per-row path.
         if self.full_attn_paged() {
             if qwen35_batched_decode_enabled() && !self.recall_active() && self.model.tp.is_single()
             {
                 return self.submit_decode_batch_paged(rows, host_kv);
             }
-            // Correctness floor: recall / TP → serial per-row paged.
             let mut tokens = Vec::with_capacity(rows.len());
             for row in rows {
                 let (token, logprob) =
@@ -3251,8 +2889,7 @@ impl Qwen35CudaExecutor {
             return Ok(tokens);
         }
 
-        // Legacy contiguous build (no paged pool — e.g. OPD weight offload): the
-        // contiguous batched lane (env-gated) or its serial A/B arm.
+        // Legacy contiguous build (no paged pool — e.g. an OPD weight offload).
         if !qwen35_batched_decode_enabled() || self.recall_active() {
             let mut tokens = Vec::with_capacity(rows.len());
             for row in rows {
@@ -3318,27 +2955,19 @@ impl Qwen35CudaExecutor {
             .collect())
     }
 
-    /// A rows>1 pure-decode sub-batch over the SHARED-PAGED default lane: append
-    /// each row's new token to its slot in `full_attn_kv`, build ONE B-row page
-    /// table ([`PageMeta::for_decode_batch`]), and run a single batched-paged
-    /// forward ([`Qwen35Model::forward_decode_batch_paged`]). This is the paged
-    /// analogue of the contiguous [`Self::submit_decode_batch`] true-batch arm:
-    /// the per-row append + page-table build mirrors the single-row
-    /// [`Self::decode_row_paged_default`], so a B-row batch is byte-equivalent to
-    /// B sequential single-row paged decodes (each row attends only its own
-    /// slot's pages via its `kv_indptr` slice). BF16 and INT8/FP8 pools both
-    /// run; single-GPU, no recall (gated by the caller in `submit_decode_batch`).
+    /// A rows>1 decode sub-batch over the shared-paged lane: ONE B-row page table and a
+    /// single batched-paged forward. Each row attends only its own slot's pages via its
+    /// `kv_indptr` slice, so a B-row batch is equivalent to B sequential single-row
+    /// paged
+    /// decodes. Single-GPU, no recall (gated by the caller).
     fn submit_decode_batch_paged(
         &mut self,
         rows: &[DecodeRow],
         host_kv: &mut dyn KvPool,
     ) -> Result<Vec<SlotToken>> {
         debug_assert!(rows.len() > 1);
-        // Append this step's token to every row's slot BEFORE building the page
-        // table (the pool must hold the POST-append length the meta encodes). The
-        // pool seq_len must equal the engine's kv_seq_len pre-append, exactly as
-        // `decode_row_paged_default` checks — a mismatch means an upstream prefill
-        // left the slot inconsistent (e.g. leaked radix reuse).
+        // Append before building the page table: the meta encodes POST-append lengths,
+        // and the pool seq_len must equal the engine's kv_seq_len pre-append.
         for row in rows {
             {
                 let pool = self
@@ -3364,7 +2993,6 @@ impl Qwen35CudaExecutor {
             .iter()
             .map(|r| r.kv_seq_len.saturating_add(1) as u64)
             .collect();
-        // Page table over the POST-append lengths (one row per slot).
         let batch_rows: Vec<(usize, usize)> =
             rows.iter().map(|r| (r.slot, r.kv_seq_len + 1)).collect();
 
@@ -3418,16 +3046,9 @@ impl Qwen35CudaExecutor {
             .collect())
     }
 
-    /// OPD teacher raw-logits forward: run the full hybrid forward over
-    /// `(input_ids, positions)` on a FRESH transient slot state and return the
-    /// FULL `[seq_len, vocab]` logits (every row) plus the model's device
-    /// context, WITHOUT sampling.
-    ///
-    /// This does not touch the serving slots: the teacher scores a sequence
-    /// in one shot (positions are contiguous from `positions[0]`), so a private
-    /// slot state is allocated, advanced once, and dropped. `positions` must be
-    /// the contiguous absolute positions of `input_ids` (the OPD teacher always
-    /// scores a full prompt starting at `positions[0]`).
+    /// OPD teacher raw-logits forward on a FRESH transient slot: returns the FULL
+    /// `[seq_len, vocab]` logits without sampling and never touches the serving slots.
+    /// `positions` must be the contiguous absolute positions of `input_ids`.
     pub(crate) fn forward_token_logits(
         &mut self,
         input_ids: &[u32],
@@ -3452,12 +3073,9 @@ impl Qwen35CudaExecutor {
                 start_pos + i
             );
         }
-        // Private transient slot: the teacher scores the whole sequence in one
-        // forward, so it never shares the serving slots' KV/recurrent state.
-        // The shared workspace IS reused (serial forwards; its buffers reshape
-        // to the teacher's seq_len and back on the next serving call).
-        // Recurrent state is acquired into a throwaway local pool (the block is
-        // dropped with the slot, never pooled — this path is rare and transient).
+        // The shared workspace IS reused (forwards are serial). The recurrent block
+        // goes
+        // to a throwaway local pool — this path is rare and transient.
         let mut slot = self.model.new_slot_state();
         let (num_linear, gdr_len, conv_len) = self.model.recurrent_dims();
         let mut scratch_pool = Vec::new();
@@ -3468,9 +3086,8 @@ impl Qwen35CudaExecutor {
             conv_len,
             &mut scratch_pool,
         )?;
-        // Full-attn KV is paged (the contiguous per-slot k_caches are never
-        // allocated), so the transient forward borrows a FREE pool slot for its
-        // KV pages and returns them before this call completes.
+        // The transient forward borrows a FREE pool slot for its KV pages and returns
+        // them before this call completes.
         let Some(pool_probe) = self.full_attn_kv.as_ref() else {
             return self.model.forward_token_logits_full(
                 &mut slot,
@@ -3496,8 +3113,8 @@ impl Qwen35CudaExecutor {
             ..
         } = self;
         let pool = full_attn_kv.as_mut().expect("full_attn_kv present");
-        // No scheduler row, so no host pool to lower from: detached pages, not
-        // the slot allocator (which must not be mixed with `mirror_slot`).
+        // No host pool to lower from: detached pages, not the slot allocator (which
+        // must not be mixed with `mirror_slot`).
         let scratch = pool.alloc_detached_pages(input_ids.len().div_ceil(pool.page_size))?;
         pool.mirror_slot(kv_slot, &scratch, input_ids.len())?;
         let result =
@@ -3522,13 +3139,10 @@ impl Qwen35CudaExecutor {
         result
     }
 
-    /// One-shot trunk forward for offline DSpark draft training: the raw taps
-    /// at `target_layer_ids` as `[seq, taps·hidden]` and the final-normed
-    /// hidden states as `[seq, hidden]`, both host-side.
-    ///
-    /// Same transient-slot discipline as [`Self::forward_token_logits`] — a
-    /// private slot and borrowed KV pages, returned before this returns — so it
-    /// never disturbs the serving slots.
+    /// One-shot trunk forward for offline DSpark draft training: the raw taps at
+    /// `target_layer_ids` as `[seq, taps·hidden]` and the final-normed hidden states as
+    /// `[seq, hidden]`, both host-side. Same transient-slot discipline as
+    /// [`Self::forward_token_logits`].
     pub(crate) fn forward_training_taps(
         &mut self,
         input_ids: &[u32],
@@ -3602,21 +3216,16 @@ impl Qwen35CudaExecutor {
         &self.model.ctx
     }
 
-    /// Fold a fresh student LoRA update into the resident projection weights
-    /// (OPD per-step re-merge). Delegates to [`crate::qwen35::Qwen35Model`].
+    /// Fold a fresh student LoRA update into the resident projection weights.
     pub(crate) fn remerge_student_lora(
         &mut self,
         update: crate::qwen35::StudentLoraUpdate,
     ) -> Result<()> {
         self.ensure_not_collective("remerge_student_lora")?;
-        // The merge REPLACES `DeviceMatrix` buffers (new device addresses);
-        // captured decode graphs bake the old ones — drop and recapture lazily.
+        // The merge REPLACES `DeviceMatrix` buffers; captured graphs bake the old ones.
         self.decode_graph = None;
-        // Weight epoch changed: sidecar recurrent snapshots are as stale as the
-        // radix the caller invalidates — drop every tracked sidecar blob from the
-        // tier so a skipped capture never serves old-epoch state. (Blobs whose
-        // tail page already LRU-evicted are unreachable — the radix is invalidated
-        // too — and are reclaimed by the store's budget.)
+        // Weight epoch changed: drop every tracked sidecar blob so a skipped capture
+        // never serves old-epoch state.
         for (_, key) in self.sidecar_page_key.drain() {
             self.slot_tier
                 .remove_chunked(NS_SIDECAR, NS_SIDECAR_CHUNK, key);
@@ -3625,9 +3234,7 @@ impl Qwen35CudaExecutor {
     }
 
     /// Read-only borrow of resident FP8 block-scaled base projection pointers
-    /// (train-infer weight sharing, `--share-frozen-base`). Delegates to
-    /// [`crate::qwen35::Qwen35Model`]. Read-only; does not mutate resident
-    /// weights, so no decode-graph invalidation is needed.
+    /// (`--share-frozen-base`); no decode-graph invalidation is needed.
     pub(crate) fn frozen_base_fp8_pointers(
         &self,
     ) -> Result<Vec<crate::qwen35::SharedFp8BaseProjection>> {
@@ -3645,18 +3252,17 @@ impl Qwen35CudaExecutor {
         self.model.frozen_base_bf16_pointers()
     }
 
-    /// Free the retired FP8 qweight/scales buffers for every projection that
-    /// has been promoted to dense BF16. Call ONLY after the train student has
-    /// re-aliased its frozen base to the BF16 `data` pointer.
+    /// Free the retired FP8 qweight/scales buffers of every projection promoted to
+    /// dense
+    /// BF16. Call ONLY after the train student re-aliased its frozen base to BF16
+    /// `data`.
     pub(crate) fn free_retired_fp8_buffers(&mut self) {
         self.model.free_retired_fp8_buffers();
     }
 
-    /// Hot-swap the DSpark Markov head weights from a host f32 snapshot.
-    ///
-    /// Called by the train sidecar after each acceptance-weighted step. Invalidates
-    /// the decode graph (which bakes the old weight pointers) and updates the
-    /// resident `markov_w1` / `markov_w2` device buffers in place.
+    /// Hot-swap the DSpark Markov head weights from a host f32 snapshot; invalidates
+    /// the
+    /// decode graph, which bakes the old weight pointers.
     pub(crate) fn update_dspark_markov_weights(&mut self, w1: &[f32], w2: &[f32]) -> Result<()> {
         self.ensure_not_collective("update_dspark_markov_weights")?;
         self.decode_graph = None;
