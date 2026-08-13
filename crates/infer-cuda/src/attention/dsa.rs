@@ -656,6 +656,14 @@ pub(crate) struct Dsv4DsaImage {
 }
 
 impl Dsv4LayerAttentionState {
+    pub(crate) fn compressor_mut(&mut self) -> &mut Dsv4CompressorState {
+        self.compressor.as_mut().expect("DSv4 compressor state")
+    }
+
+    pub(crate) fn indexer_mut(&mut self) -> &mut Dsv4CompressorState {
+        self.indexer.as_mut().expect("DSv4 indexer state")
+    }
+
     /// This layer-state's indexer compressed-key row count (`compressed.seq_len`),
     /// or `None` if the layer has no indexer. Used by the batched P1b cache-write
     /// pre-pass to read `indexer_rows_after` (P1a already advanced it).
