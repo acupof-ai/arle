@@ -184,22 +184,6 @@ pub(crate) fn set_qwen35_moe_experts_bf16_resident(enabled: bool) {
 pub(crate) fn dsv4_decode_reuse_enabled() -> bool {
     DSV4_DECODE_REUSE.load(Relaxed)
 }
-/// `ARLE_DSV4_PREFILL_CHUNK` — opt-in prefill chunk above the 128-token
-/// snapshot grain (2026-07-17 chunked-prefill plan, Phase 2). Parsed once;
-/// unset/unparsable → `None` (capability stays at one sliding_window).
-pub(crate) fn dsv4_prefill_chunk() -> Option<usize> {
-    static FLAG: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| {
-        let value = std::env::var("ARLE_DSV4_PREFILL_CHUNK").ok()?;
-        value.parse().map_or_else(
-            |_| {
-                log::warn!("ignoring unparsable ARLE_DSV4_PREFILL_CHUNK=`{value}`");
-                None
-            },
-            Some,
-        )
-    })
-}
 pub(crate) fn mtp_adaptive() -> bool {
     MTP_ADAPTIVE.load(Relaxed)
 }

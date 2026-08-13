@@ -693,10 +693,8 @@ impl Dsv4CudaExecutor {
             slot_tier,
         };
         log::info!(
-            "DSv4 prefill chunk capability: {} tokens (ARLE_DSV4_PREFILL_CHUNK {:?}, deepep \
-             per-forward cap {:?})",
+            "DSv4 prefill chunk capability: {} tokens (deepep per-forward cap {:?})",
             exec.max_prefill_chunk(),
-            crate::runtime_flags::dsv4_prefill_chunk(),
             exec.model.max_tokens_per_step(),
         );
         Ok(exec)
@@ -1362,8 +1360,7 @@ impl Dsv4CudaExecutor {
     pub(crate) fn max_prefill_chunk(&self) -> usize {
         const DEFAULT_PREFILL_CHUNK: usize = 2048;
         let grain = self.model.config.sliding_window.max(1);
-        let requested = crate::runtime_flags::dsv4_prefill_chunk().unwrap_or(DEFAULT_PREFILL_CHUNK);
-        let cap = requested
+        let cap = DEFAULT_PREFILL_CHUNK
             .clamp(128, crate::attention::DSV4_PREFILL_QUERY_CHUNK)
             .min(self.model.max_tokens_per_step().unwrap_or(usize::MAX));
         (cap / 128 * 128).max(grain)
