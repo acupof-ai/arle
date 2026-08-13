@@ -69,7 +69,7 @@ pub(crate) fn render_prometheus(counters: &CounterSnapshot, model: &str) -> Stri
     push(
         "prefix_cache_hits_total",
         "counter",
-        "Lookups that attached at least one reusable prefix page.",
+        "Lookups that restored at least one reusable prefix token.",
         prefix.hits,
     );
     push(
@@ -81,7 +81,7 @@ pub(crate) fn render_prometheus(counters: &CounterSnapshot, model: &str) -> Stri
     push(
         "prefix_cache_hit_pages_total",
         "counter",
-        "Prefix pages attached to admitted requests.",
+        "Page coverage of prompt tokens skipped by prefix restore.",
         prefix.hit_pages,
     );
     push(
@@ -293,7 +293,7 @@ pub(crate) fn render_prometheus(counters: &CounterSnapshot, model: &str) -> Stri
     push(
         "kv_system_reuse_miss_total",
         "counter",
-        "Prefix attach lookups with no reusable block.",
+        "Prefix attach lookups that restored no token.",
         kv_system.reuse_miss,
     );
     push(

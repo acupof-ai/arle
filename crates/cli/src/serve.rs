@@ -537,6 +537,9 @@ fn resolve_engine_config(
         config.max_num_batched_tokens = Some(value);
     }
     config.slot_oversubscription = serve_args.kv_oversubscription;
+    if let Some(value) = serve_args.kv_oversubscription_min_slice {
+        config.oversubscription_min_slice = value;
+    }
     config.memory_budget_bytes = serve_args.memory_budget_bytes;
     config.system_reserve_bytes = serve_args.system_reserve_bytes;
     config.allow_swap = serve_args.allow_swap;

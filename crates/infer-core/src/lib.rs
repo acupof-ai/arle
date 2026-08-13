@@ -61,6 +61,8 @@ pub struct SchedulerConfig {
     pub enable_prefix_cache: bool,
     /// Admit waiters beyond `max_running_requests` by parking longest-running decode.
     pub slot_oversubscription: bool,
+    /// Minimum decode tokens before an oversubscribed request may be parked again.
+    pub oversubscription_min_slice: usize,
 }
 
 impl SchedulerConfig {
@@ -108,6 +110,7 @@ impl Default for SchedulerConfig {
             chunked_prefill_size: 2_048,
             enable_prefix_cache: true,
             slot_oversubscription: false,
+            oversubscription_min_slice: DEFAULT_OVERSUBSCRIPTION_MIN_SLICE,
         }
     }
 }
@@ -285,7 +288,7 @@ pub struct KvSystemMetrics {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PrefixCacheStats {
     pub lookups: u64,
-    /// Attached at least one backend-reusable prefix page.
+    /// Restored at least one backend-reusable prefix token.
     pub hits: u64,
     pub hit_tokens: u64,
     pub hit_pages: u64,
@@ -303,7 +306,7 @@ enum WaitingInsertBias {
 /// is eligible to be parked again. A just-resumed request runs at least this
 /// many steps before yielding, bounding park/resume ping-pong (most binding at
 /// num_slots=1, where two requests would otherwise swap every step).
-const OVERSUBSCRIPTION_MIN_SLICE: usize = 8;
+pub const DEFAULT_OVERSUBSCRIPTION_MIN_SLICE: usize = 8;
 
 /// Cap on retained completions. The in-process consumer drains each engine step
 /// and reads its own completion synchronously, so only recent (largest,
@@ -366,7 +369,7 @@ struct RequestState {
     /// gets the largest stamp so it is never the immediate victim (no thrash).
     admit_seq: u64,
     /// `generated_tokens.len()` captured at the last admit. The oversubscription
-    /// victim must have decoded at least `OVERSUBSCRIPTION_MIN_SLICE` tokens
+    /// victim must have decoded the configured minimum slice
     /// since then, so a just-resumed request runs a bit before it can be parked
     /// again — bounding ping-pong churn at num_slots=1.
     admit_gen_mark: usize,
@@ -1438,28 +1441,43 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         self.mode == EngineMode::Quiesced
     }
 
-    fn record_attached_prefix_metrics(&mut self, attached_pages: usize) {
+    fn record_prefix_match_metrics(&mut self, raw_pages: usize, licensed_pages: usize) {
         if !self.config.enable_prefix_cache {
             return;
         }
-        if attached_pages == 0 {
-            self.kv_system_metrics.reuse_miss = self.kv_system_metrics.reuse_miss.saturating_add(1);
-            return;
-        }
-        let pages = attached_pages as u64;
         self.kv_system_metrics.prefix_match_full_blocks = self
             .kv_system_metrics
             .prefix_match_full_blocks
-            .saturating_add(pages);
+            .saturating_add(raw_pages as u64);
         self.kv_system_metrics.prefix_match_clamped_blocks = self
             .kv_system_metrics
             .prefix_match_clamped_blocks
-            .saturating_add(pages);
+            .saturating_add(licensed_pages as u64);
+    }
+
+    fn record_prefix_restore_metrics(&mut self, restored_tokens: usize) {
+        if !self.config.enable_prefix_cache {
+            return;
+        }
+        if restored_tokens == 0 {
+            self.kv_system_metrics.reuse_miss = self.kv_system_metrics.reuse_miss.saturating_add(1);
+            return;
+        }
+        self.prefix_cache_stats.hits = self.prefix_cache_stats.hits.saturating_add(1);
+        self.prefix_cache_stats.hit_tokens = self
+            .prefix_cache_stats
+            .hit_tokens
+            .saturating_add(restored_tokens as u64);
+        let restored_pages = restored_tokens.div_ceil(self.radix.block_size()) as u64;
+        self.prefix_cache_stats.hit_pages = self
+            .prefix_cache_stats
+            .hit_pages
+            .saturating_add(restored_pages);
         if self.kv_tier_capacity() == 0 {
             self.kv_system_metrics.reuse_hit_resident = self
                 .kv_system_metrics
                 .reuse_hit_resident
-                .saturating_add(pages);
+                .saturating_add(restored_pages);
         }
     }
 
@@ -1636,7 +1654,6 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
                 PrefixMatch::empty()
             };
             self.attach_prefix_to_request(slot, &mut request, &committed, prefix_match)?;
-            self.record_attached_prefix_metrics(request.reused_prefix_pages.len());
         }
 
         *remaining_pages = remaining_pages.saturating_sub(pages_needed);
@@ -1706,7 +1723,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
     }
 
     /// The oversubscription victim: among `Decoding` requests that have decoded
-    /// at least `OVERSUBSCRIPTION_MIN_SLICE` tokens since their last admit, the
+    /// at least `oversubscription_min_slice` tokens since their last admit, the
     /// one with the smallest `admit_seq` (longest continuous run). Prefilling /
     /// just-admitted requests are skipped — only a materialized decode has a
     /// whole-slot image to park; the min-slice floor + oldest-first selection
@@ -1720,7 +1737,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
                         .generated_tokens
                         .len()
                         .saturating_sub(request.admit_gen_mark)
-                        >= OVERSUBSCRIPTION_MIN_SLICE
+                        >= self.config.oversubscription_min_slice.max(1)
             })
             .min_by_key(|(_, request)| request.admit_seq)
             .map(|(&slot, _)| slot)

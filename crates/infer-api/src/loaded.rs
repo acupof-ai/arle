@@ -110,6 +110,9 @@ pub struct EngineLoadConfig {
     /// backend). Default false → byte-identical.
     #[serde(default)]
     pub slot_oversubscription: bool,
+    /// Minimum decode tokens before an oversubscribed request may be parked again.
+    #[serde(default = "default_oversubscription_min_slice")]
+    pub oversubscription_min_slice: usize,
     /// `--lora-adapters`: trained student LoRA safetensors (train
     /// `--save-lora-adapters` output) re-merged into the resident projection
     /// weights once at engine build. Rides the engine config so multiproc
@@ -181,6 +184,10 @@ fn default_mem_fraction_static() -> f64 {
     0.9
 }
 
+fn default_oversubscription_min_slice() -> usize {
+    infer_core::DEFAULT_OVERSUBSCRIPTION_MIN_SLICE
+}
+
 impl Default for EngineLoadConfig {
     fn default() -> Self {
         // Conservative local-serving defaults shared by every backend builder.
@@ -217,6 +224,7 @@ impl Default for EngineLoadConfig {
             kv_ssd_root: None,
             kv_disk_limit: None,
             slot_oversubscription: false,
+            oversubscription_min_slice: default_oversubscription_min_slice(),
             student_lora_adapters: None,
             student_lora_alpha: default_student_lora_alpha(),
             dspark_draft_model: None,
@@ -473,6 +481,7 @@ mod backend {
             }
             config.max_running_requests = self.max_running_requests;
             config.slot_oversubscription = self.slot_oversubscription;
+            config.oversubscription_min_slice = self.oversubscription_min_slice.max(1);
             // Diagnostic-only escape hatch (not a shipped feature) for the
             // concurrent-decode digit-corruption investigation — see
             // docs/experience/errors/2026-07-06-dsv4-concurrent-decode-digit-corruption-unresolved.md.
