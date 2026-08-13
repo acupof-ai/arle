@@ -23,3 +23,19 @@ pod-gated task (P6b plan); this split is API-preserving.
 ## Rule
 Extraction is licensed by byte-identical ordering, not cleverness. Don't collapse
 an overload chain with live callers without a path to behavior verification.
+
+## Renamed 2026-08-13
+
+The helpers this entry names were renamed in `18096ec7f`..HEAD; `route` was
+dropped because the word already means MoE expert routing in this crate, and
+both functions run a complete step body (zero_grad → backward →
+finite_optimizer_step → `OpdStepOutcome`) rather than a segment of one.
+
+| Then | Now |
+|------|-----|
+| `run_windowed_gkd_route` | `windowed_gkd_step` |
+| `run_chunked_kl_route` | `chunked_kl_step` |
+| `GkdRouteCtx` | `GkdStepCtx` |
+| `run_opd_rollout_phase` | `rollout_phase` |
+
+User-facing error text still says "Route B" for the windowed path.
