@@ -1773,30 +1773,6 @@ impl Qwen35Model {
         self.spec_draft_tokens = n;
     }
 
-    /// Rank of `token` in the draft's row-`row` logits (0 == the draft already
-    /// proposed it). Answers "would a width-w candidate tree have survived this
-    /// rejection" without building one. Opt-in probe: a whole-vocab D2H per call.
-    pub(crate) fn draft_token_rank(
-        &self,
-        logits: &HiddenStates,
-        row: usize,
-        token: u32,
-    ) -> Result<usize> {
-        let vocab = logits.hidden_dim;
-        ensure!(
-            row < logits.seq_len && (token as usize) < vocab,
-            "dspark rank probe: row {row} / token {token} outside [{}, {vocab})",
-            logits.seq_len
-        );
-        let host: Vec<bf16> = self
-            .ctx
-            .stream
-            .clone_dtoh(&logits.data.slice(row * vocab..(row + 1) * vocab))
-            .map_err(|e| anyhow!("D2H dspark rank row failed: {e}"))?;
-        let target = host[token as usize];
-        Ok(host.iter().filter(|v| **v > target).count())
-    }
-
     /// Per-row argmax over a whole verify output in one launch + one D2H. The
     /// accept scan is host arithmetic once this lands, so a batched tick costs
     /// one sync instead of one per chain row per slot.

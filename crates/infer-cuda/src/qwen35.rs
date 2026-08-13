@@ -85,21 +85,6 @@ mod probe;
 #[cfg(test)]
 pub(crate) use probe::*;
 
-fn qwen35_startup_profile_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("ARLE_CUDA_STARTUP_PROFILE").is_some())
-}
-
-fn qwen35_startup_log(phase: &str, start: Instant, extra: std::fmt::Arguments<'_>) {
-    if qwen35_startup_profile_enabled() {
-        log::info!(
-            target: "infer_cuda::startup",
-            "cuda_startup phase=qwen35.{phase} elapsed_ms={:.1} {extra}",
-            start.elapsed().as_secs_f64() * 1000.0
-        );
-    }
-}
-
 /// Route full-attention prefill chunks (`seq_len > 1`) through the vendored
 /// FA3 hopper fwd shim instead of the in-tree `nonpaged_prefill_attention`
 /// kernel (42.1% of prefill GPU time at 3k).
@@ -129,22 +114,6 @@ fn qwen35_fa3_enabled(ctx: &DeviceContext) -> bool {
     ctx.compute_capability() == (9, 0)
 }
 
-fn qwen35_fa3_decode_splits() -> usize {
-    crate::runtime_flags::qwen35_fa3_decode_splits()
-}
-
-/// `--qwen35-gdr-chunked true`: route GDN prefill chunks (`seq_len > 1`)
-/// through the FlashQLA chunked kernels (TileLang AOT, sm_90a) instead of
-/// the serial `gated_delta_rule_prefill_recurrent` kernel (28.0% of prefill
-/// GPU time pre-FA3).
-/// Default ON (licensed 2026-08-02). The call site shape-guards the head
-/// geometry, and builds without an sm_90 target link NOT_SUPPORTED stubs that
-/// the probe below detects. Decode (`seq_len == 1`) stays on the recurrent
-/// kernel.
-fn qwen35_gdr_chunked_enabled() -> bool {
-    crate::runtime_flags::qwen35_gdr_chunked()
-}
-
 /// The two conditions the AOT dispatch wrapper itself switches on: the flashqla
 /// rows were compiled into this build, and the device is sm_90 (the only SM they
 /// are emitted for). Probing by launching `seq_len = 0` instead would issue a
@@ -166,18 +135,9 @@ fn fq_kernels_available(ctx: &DeviceContext) -> bool {
 
 /// sm_70 (V100) has no FA3 (sm_80+ CUTLASS-3.x) and no BF16 compute — the
 /// hand-written `arle_fa2_sm70_attention_cuda` (FA2, FP16 half2 math, BF16 I/O)
-/// is the SOTA option. `major < 8` covers sm_70 and sm_75. Latched once.
-/// `ARLE_QWEN35_FA2_SM70=0` forces the naive FP32 SIMT fallback (A/B use).
+/// is the SOTA option. `major < 8` covers sm_70 and sm_75.
 fn qwen35_fa2_sm70_enabled(ctx: &DeviceContext) -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        let (major, _minor) = ctx.compute_capability();
-        major < 8
-            && !matches!(
-                std::env::var("ARLE_QWEN35_FA2_SM70").as_deref(),
-                Ok("0") | Ok("false") | Ok("off")
-            )
-    })
+    ctx.compute_capability().0 < 8
 }
 
 #[path = "qwen35_lora.rs"]

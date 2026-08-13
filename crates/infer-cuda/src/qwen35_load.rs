@@ -210,8 +210,8 @@ impl Qwen35Model {
         let m = Qwen35Config::from_model_dir(model_path)
             .map_err(|e| anyhow!("load Qwen3.5 config from {}: {e}", model_path.display()))?;
         validate_qwen35_cuda_config(&m)?;
-        qwen35_startup_log(
-            "config",
+        crate::executor::cuda_startup_log(
+            "qwen35.config",
             config_t0,
             format_args!(
                 "layers={} hidden={} moe={} model_path={}",
@@ -323,7 +323,7 @@ impl Qwen35Model {
         let loader_t0 = Instant::now();
         let ctx = DeviceContext::new()?;
         let loader = SafetensorLoader::new(model_path)?;
-        qwen35_startup_log("ctx_loader", loader_t0, format_args!(""));
+        crate::executor::cuda_startup_log("qwen35.ctx_loader", loader_t0, format_args!(""));
 
         let embed_t0 = Instant::now();
         let embed_tokens = loader.load_matrix(&ctx, m.embed_tokens_tensor_name())?;
@@ -332,8 +332,8 @@ impl Qwen35Model {
         } else {
             Some(loader.load_matrix(&ctx, m.lm_head_tensor_name())?)
         };
-        qwen35_startup_log(
-            "embeddings",
+        crate::executor::cuda_startup_log(
+            "qwen35.embeddings",
             embed_t0,
             format_args!("tie_word_embeddings={}", m.tie_word_embeddings),
         );
@@ -501,8 +501,8 @@ impl Qwen35Model {
                     }))
                 }
             };
-            qwen35_startup_log(
-                "layer.attn",
+            crate::executor::cuda_startup_log(
+                "qwen35.layer.attn",
                 attn_t0,
                 format_args!("layer={layer_idx} type={:?}", m.layer_types[layer_idx]),
             );
@@ -550,8 +550,8 @@ impl Qwen35Model {
                     None,
                 )
             };
-            qwen35_startup_log(
-                "layer.ffn",
+            crate::executor::cuda_startup_log(
+                "qwen35.layer.ffn",
                 ffn_t0,
                 format_args!("layer={layer_idx} moe={}", m.is_moe_layer(layer_idx)),
             );
@@ -564,8 +564,8 @@ impl Qwen35Model {
                 mlp,
                 moe,
             });
-            qwen35_startup_log(
-                "layer.total",
+            crate::executor::cuda_startup_log(
+                "qwen35.layer.total",
                 layer_t0,
                 format_args!("layer={layer_idx} moe={}", m.is_moe_layer(layer_idx)),
             );
@@ -590,13 +590,13 @@ impl Qwen35Model {
         let (cos_cache, sin_cache) =
             crate::ops::precompute_rope(&ctx, m.rotary_dim, rope_len, m.rope_theta, None)?;
         ctx.sync()?;
-        qwen35_startup_log(
-            "tail_norm_rope_sync",
+        crate::executor::cuda_startup_log(
+            "qwen35.tail_norm_rope_sync",
             tail_t0,
             format_args!("rope_len={rope_len} max_seq_len={max_seq_len}"),
         );
-        qwen35_startup_log(
-            "total",
+        crate::executor::cuda_startup_log(
+            "qwen35.total",
             total_t0,
             format_args!("layers={} max_seq_len={max_seq_len}", m.num_hidden_layers),
         );
@@ -614,8 +614,8 @@ impl Qwen35Model {
                  (TP-sharded MTP draft head not yet wired)"
             );
             let head = load_qwen35_mtp_head(&loader, &ctx, &m, &split, &tp_cfg)?;
-            qwen35_startup_log(
-                "mtp_head",
+            crate::executor::cuda_startup_log(
+                "qwen35.mtp_head",
                 mtp_t0,
                 format_args!("draft_tokens={}", mtp_draft_tokens.unwrap_or(0)),
             );

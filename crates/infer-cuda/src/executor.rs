@@ -99,7 +99,7 @@ pub(crate) fn cuda_startup_log(phase: &str, start: Instant, extra: std::fmt::Arg
     if cuda_startup_profile_enabled() {
         info!(
             target: "infer_cuda::startup",
-            "cuda_startup phase=executor.{phase} elapsed_ms={:.1} {extra}",
+            "cuda_startup phase={phase} elapsed_ms={:.1} {extra}",
             start.elapsed().as_secs_f64() * 1000.0
         );
     }
@@ -1312,4 +1312,3 @@ fn maybe_dump_sample_topk(ctx: &DeviceContext, logits: &DeviceVec, position: u64
     );
     Ok(())
 }
-
