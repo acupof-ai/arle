@@ -341,6 +341,8 @@ mod tests {
                     last_token: 7,
                     kv_seq_len: 3,
                     params: SamplingParams::default(),
+                    penalty_history: None,
+                    penalty_prompt_len: 0,
                 }]
             } else {
                 Vec::new()
@@ -354,6 +356,8 @@ mod tests {
                     start_pos: 0,
                     total_tokens: 3,
                     params: SamplingParams::default(),
+                    penalty_history: None,
+                    penalty_prompt_len: 0,
                 }]
             },
             microbatch: None,
