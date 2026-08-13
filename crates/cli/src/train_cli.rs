@@ -487,13 +487,20 @@ fn run_w2s(args: TrainW2sArgs) -> Result<()> {
         }
     }
 
-    // Load base model (no LoRA) — π_base for the global KL regularizer.
-    eprintln!(
-        "[arle train w2s] loading base model from {}",
-        args.student_model.display()
-    );
-    let base = load_qwen35_from_hf_dir(&args.student_model, &mut store)
-        .with_context(|| format!("load base from {}", args.student_model.display()))?;
+    macro_rules! load_model {
+        ($label:expr, $path:expr, $store:expr) => {{
+            eprintln!(
+                "[arle train w2s] loading {} from {}",
+                $label,
+                $path.display()
+            );
+            load_qwen35_from_hf_dir($path, $store)
+                .with_context(|| format!("load {} from {}", $label, $path.display()))?
+        }};
+    }
+
+    // π_base for the global KL regularizer.
+    let base = load_model!("base", &args.student_model, &mut store);
     #[cfg(feature = "cuda")]
     let vocab_size = base.config().vocab_size;
 
@@ -513,32 +520,18 @@ fn run_w2s(args: TrainW2sArgs) -> Result<()> {
     // Initialize serving = shadow (both start from the same LoRA init).
     sync_lora_adapters(&student, &serving, &mut store)?;
 
-    // Load auxiliary models.
     let aux1 = match args.aux_backend {
         W2sAuxBackendArg::InProcess => {
-            // When --aux1-pre is omitted, reuse the student's base model as
-            // pre-RL. ΔT = post_RL_logits − base_logits captures how far the
-            // teacher sits above the student's starting point.
+            // Omitted --aux1-pre reuses the base: ΔT = post_RL − base measures
+            // how far the teacher sits above the student's starting point.
             let aux1_pre = match &args.aux1_pre {
-                Some(path) => {
-                    eprintln!(
-                        "[arle train w2s] loading aux1 pre-RL from {}",
-                        path.display()
-                    );
-                    load_qwen35_from_hf_dir(path, &mut store)
-                        .with_context(|| format!("load aux1 pre-RL from {}", path.display()))?
-                }
+                Some(path) => load_model!("aux1 pre-RL", path, &mut store),
                 None => {
                     eprintln!("[arle train w2s] aux1 pre-RL = student base model (reused)");
                     base.clone()
                 }
             };
-            eprintln!(
-                "[arle train w2s] loading aux1 post-RL from {}",
-                args.aux1_post.display()
-            );
-            let aux1_post = load_qwen35_from_hf_dir(&args.aux1_post, &mut store)
-                .with_context(|| format!("load aux1 post-RL from {}", args.aux1_post.display()))?;
+            let aux1_post = load_model!("aux1 post-RL", &args.aux1_post, &mut store);
             W2sAuxModel::new_in_process(aux1_pre, aux1_post)
         }
         #[cfg(feature = "cuda")]
@@ -555,52 +548,36 @@ fn run_w2s(args: TrainW2sArgs) -> Result<()> {
                 mem_fraction_static: 0.1,
                 ..EngineLoadConfig::single_sequence(2048)
             };
-            let pre_path = args.aux1_pre.as_ref().unwrap_or(&args.student_model);
-            eprintln!(
-                "[arle train w2s] loading aux1 pre-RL (infer) from {}",
-                pre_path.display()
-            );
-            let pre_engine = LoadedInferenceEngine::load_with_config(
-                pre_path
-                    .to_str()
-                    .ok_or_else(|| anyhow!("aux1 pre path not UTF-8"))?,
-                true,
-                aux_cfg.clone(),
-            )
-            .with_context(|| format!("load aux1 pre-RL infer from {}", pre_path.display()))?;
-            eprintln!(
-                "[arle train w2s] loading aux1 post-RL (infer) from {}",
-                args.aux1_post.display()
-            );
-            let pre_teacher = InferTeacher::new(
-                Arc::new(Mutex::new(pre_engine)),
-                train_backend.clone(),
-                vocab_size,
-            );
-            // Offload pre-RL weights to CPU so the post-RL engine fits on GPU.
-            let pre_freed = pre_teacher
-                .offload_engine_weights()
-                .context("offload aux1 pre-RL engine weights")?;
-            eprintln!("[arle train w2s] aux1 pre-RL offload freed {pre_freed} bytes");
-            let post_engine = LoadedInferenceEngine::load_with_config(
-                args.aux1_post
-                    .to_str()
-                    .ok_or_else(|| anyhow!("aux1 post path not UTF-8"))?,
-                true,
-                aux_cfg,
-            )
-            .with_context(|| {
-                format!("load aux1 post-RL infer from {}", args.aux1_post.display())
-            })?;
-            let post_teacher = InferTeacher::new(
-                Arc::new(Mutex::new(post_engine)),
-                train_backend.clone(),
-                vocab_size,
-            );
-            let post_freed = post_teacher
-                .offload_engine_weights()
-                .context("offload aux1 post-RL engine weights")?;
-            eprintln!("[arle train w2s] aux1 post-RL offload freed {post_freed} bytes");
+            // Each engine offloads right after load so only one aux is resident;
+            // the w2s step reloads it just-in-time for the delta forward.
+            let load_teacher = |label: &str, path: &std::path::Path| -> Result<InferTeacher> {
+                eprintln!(
+                    "[arle train w2s] loading aux1 {label} (infer) from {}",
+                    path.display()
+                );
+                let engine = LoadedInferenceEngine::load_with_config(
+                    path.to_str()
+                        .ok_or_else(|| anyhow!("aux1 {} path not UTF-8", label))?,
+                    true,
+                    aux_cfg.clone(),
+                )
+                .with_context(|| format!("load aux1 {label} infer from {}", path.display()))?;
+                let teacher = InferTeacher::new(
+                    Arc::new(Mutex::new(engine)),
+                    train_backend.clone(),
+                    vocab_size,
+                );
+                let freed = teacher
+                    .offload_engine_weights()
+                    .with_context(|| format!("offload aux1 {label} engine weights"))?;
+                eprintln!("[arle train w2s] aux1 {label} offload freed {freed} bytes");
+                Ok(teacher)
+            };
+            let pre_teacher = load_teacher(
+                "pre-RL",
+                args.aux1_pre.as_ref().unwrap_or(&args.student_model),
+            )?;
+            let post_teacher = load_teacher("post-RL", &args.aux1_post)?;
             W2sAuxModel::new_infer(pre_teacher, post_teacher)
         }
         #[cfg(not(feature = "cuda"))]
@@ -613,26 +590,13 @@ fn run_w2s(args: TrainW2sArgs) -> Result<()> {
         W2sAuxBackendArg::InProcess => {
             match (&args.aux2_pre, &args.aux2_post) {
                 (Some(pre_path), Some(post_path)) => {
-                    eprintln!(
-                        "[arle train w2s] loading aux2 pre-RL from {}",
-                        pre_path.display()
-                    );
-                    let aux2_pre = load_qwen35_from_hf_dir(pre_path, &mut store)
-                        .with_context(|| format!("load aux2 pre-RL from {}", pre_path.display()))?;
-                    eprintln!(
-                        "[arle train w2s] loading aux2 post-RL from {}",
-                        post_path.display()
-                    );
-                    let aux2_post =
-                        load_qwen35_from_hf_dir(post_path, &mut store).with_context(|| {
-                            format!("load aux2 post-RL from {}", post_path.display())
-                        })?;
+                    let aux2_pre = load_model!("aux2 pre-RL", pre_path, &mut store);
+                    let aux2_post = load_model!("aux2 post-RL", post_path, &mut store);
                     (W2sAuxModel::new_in_process(aux2_pre, aux2_post), false)
                 }
                 _ => {
-                    // No aux2 checkpoints: share aux1 (ΔT₁ == ΔT₂). The
-                    // consistency gate is a no-op but the rest of the w2s
-                    // pipeline still runs.
+                    // Sharing aux1 makes the consistency gate a no-op; the rest
+                    // of the pipeline still runs.
                     eprintln!("[arle train w2s] no aux2 checkpoints — sharing aux1");
                     (aux1.clone(), true)
                 }
@@ -640,32 +604,9 @@ fn run_w2s(args: TrainW2sArgs) -> Result<()> {
         }
         #[cfg(feature = "cuda")]
         W2sAuxBackendArg::Infer => {
-            use train::w2s::W2sAuxModel;
-
-            match (&args.aux2_pre, &args.aux2_post) {
-                (Some(_), Some(_)) => {
-                    // Independent aux2 engines would go here; for now we share
-                    // aux1 to keep memory bounded.
-                    eprintln!("[arle train w2s] reusing aux1 engines for aux2 (memory sharing)");
-                    match &aux1 {
-                        W2sAuxModel::Infer { pre_rl, post_rl } => (
-                            W2sAuxModel::new_infer(pre_rl.clone(), post_rl.clone()),
-                            true,
-                        ),
-                        _ => unreachable!("aux_backend=infer but aux1 is not Infer"),
-                    }
-                }
-                _ => {
-                    eprintln!("[arle train w2s] no aux2 checkpoints — sharing aux1");
-                    match &aux1 {
-                        W2sAuxModel::Infer { pre_rl, post_rl } => (
-                            W2sAuxModel::new_infer(pre_rl.clone(), post_rl.clone()),
-                            true,
-                        ),
-                        _ => unreachable!("aux_backend=infer but aux1 is not Infer"),
-                    }
-                }
-            }
+            // Independent aux2 engines are not wired for the infer backend.
+            eprintln!("[arle train w2s] sharing aux1 engines for aux2");
+            (aux1.clone(), true)
         }
         #[cfg(not(feature = "cuda"))]
         W2sAuxBackendArg::Infer => {
