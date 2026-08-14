@@ -17,10 +17,10 @@ use anyhow::{Result, anyhow};
 use autograd::{
     Optimizer, Tape, TensorId, TensorStore,
     grad_clip::finite_optimizer_step,
-    ops::{add, mul_scalar, softmax},
+    ops::{add, gather_last_dim, mul, mul_scalar, slice, softmax, sum},
 };
 
-use crate::loss::{KlDirection, kl_distill_loss};
+use crate::loss::{DEFAULT_KL_CHUNK_SIZE, KlDirection, kl_distill_loss, kl_distill_loss_chunked};
 use crate::qwen35::Qwen35Model;
 #[cfg(feature = "cuda")]
 use crate::teacher_infer::{InferTeacher, TeacherForward};
@@ -287,18 +287,49 @@ pub fn w2s_step<O: Optimizer>(
 
     // Only the last position matters for generation — prompt positions are
     // always high-confidence (the next token is the fixed prompt text), so
-    // max-prob over the whole sequence would skip every sample.
-    let student_probs = softmax(z_s, store, tape)?;
-    let probs_host = store.to_host(student_probs)?;
-    let vocab = store
-        .get(z_s)
-        .and_then(|t| t.shape.last().copied())
-        .unwrap_or(0);
-    let last_pos_start = probs_host.len().saturating_sub(vocab);
-    let max_prob = probs_host[last_pos_start..]
-        .iter()
-        .copied()
-        .fold(f32::NEG_INFINITY, f32::max);
+    // max-prob over the whole sequence would skip every sample. Slice that
+    // position first so the softmax and argmax reduce a single row on device;
+    // only scalars come back to host (was: full [seq, vocab] softmax + copy).
+    let max_prob = {
+        let was_enabled = tape.enabled;
+        tape.set_enabled(false);
+        let z_shape = store
+            .get(z_s)
+            .ok_or_else(|| anyhow!("w2s_step: student logits tensor not found"))?
+            .shape
+            .clone();
+        let rank = z_shape.len();
+        let seq_axis = rank.saturating_sub(2);
+        let mut starts = vec![0; rank];
+        let ends = z_shape.clone();
+        if rank >= 2 {
+            starts[seq_axis] = z_shape[seq_axis].saturating_sub(1);
+        }
+        let last_logits = slice(z_s, &starts, &ends, store, tape)?;
+        let last_probs = softmax(last_logits, store, tape)?;
+        store.ensure_device(last_probs)?;
+        let (probs_handle, probs_shape) = {
+            let tensor = store
+                .get(last_probs)
+                .ok_or_else(|| anyhow!("w2s_step: last-position probs tensor not found"))?;
+            let handle = tensor
+                .device_handle
+                .clone()
+                .ok_or_else(|| anyhow!("w2s_step: last-position probs missing device handle"))?;
+            (handle, tensor.shape.clone())
+        };
+        let vocab = probs_shape.last().copied().unwrap_or(1).max(1);
+        let rows = probs_shape.iter().product::<usize>() / vocab;
+        let idx_handle = store
+            .backend()
+            .argmax_last_dim(&probs_handle, &probs_shape)?;
+        let idx_id = store.alloc_device_tensor(vec![rows], idx_handle)?;
+        let indices: Vec<usize> = store.to_host(idx_id)?.iter().map(|&v| v as usize).collect();
+        let row_max = gather_last_dim(last_probs, &indices, store, tape)?;
+        let max_prob = store.to_host(row_max)?.last().copied().unwrap_or(0.0);
+        tape.set_enabled(was_enabled);
+        max_prob
+    };
     if max_prob > cfg.confidence_threshold {
         cleanup_after_backward(store, tape, &keep_params, &keep_extra);
         return Ok(W2sStepOutcome {
@@ -324,9 +355,28 @@ pub fn w2s_step<O: Optimizer>(
 
     timer.stage("aux_delta", store);
 
-    let d1_host = store.to_host(delta1)?;
-    let d2_host = store.to_host(delta2)?;
-    let consistency = cosine_similarity(&d1_host, &d2_host);
+    // Device-side cosine: one elementwise product plus three reductions on
+    // device; only scalars cross to host (was: two [seq, vocab] host copies).
+    let consistency = {
+        let was_enabled = tape.enabled;
+        tape.set_enabled(false);
+        let prod = mul(delta1, delta2, store, tape)?;
+        let dot_id = sum(prod, store, tape)?;
+        let dot = f64::from(store.to_host(dot_id)?[0]);
+        let na = device_sum_squares(delta1, store)?;
+        let nb = if delta2 == delta1 {
+            na
+        } else {
+            device_sum_squares(delta2, store)?
+        };
+        tape.set_enabled(was_enabled);
+        let denom = (na * nb).sqrt();
+        if denom == 0.0 {
+            0.0
+        } else {
+            (dot / denom) as f32
+        }
+    };
     // NaN consistency means the aux forward produced NaN logits (e.g. INT8
     // quantization overflow on some inputs). Skip rather than poisoning the
     // student's adapter weights with a NaN gradient.
@@ -365,10 +415,11 @@ pub fn w2s_step<O: Optimizer>(
         .forward(store, tape, input_ids, &positions)
         .map_err(|e| anyhow!("student_old forward: {e}"))?;
     let z_old_detached = store.detach(z_old)?;
-    let loss_local = kl_distill_loss(
+    let loss_local = kl_distill_loss_chunked(
         z_s,
         z_old_detached,
         num_positions,
+        DEFAULT_KL_CHUNK_SIZE,
         1.0,
         KlDirection::Reverse,
         store,
@@ -381,10 +432,11 @@ pub fn w2s_step<O: Optimizer>(
         .forward(store, tape, input_ids, &positions)
         .map_err(|e| anyhow!("student_base forward: {e}"))?;
     let z_base_detached = store.detach(z_base)?;
-    let loss_global = kl_distill_loss(
+    let loss_global = kl_distill_loss_chunked(
         z_s,
         z_base_detached,
         num_positions,
+        DEFAULT_KL_CHUNK_SIZE,
         1.0,
         KlDirection::Reverse,
         store,
@@ -423,16 +475,17 @@ pub fn w2s_step<O: Optimizer>(
     })
 }
 
-fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
-    debug_assert_eq!(a.len(), b.len(), "cosine_similarity: length mismatch");
-    let mut dot = 0.0f32;
-    let mut na = 0.0f32;
-    let mut nb = 0.0f32;
-    for i in 0..a.len() {
-        dot += a[i] * b[i];
-        na += a[i] * a[i];
-        nb += b[i] * b[i];
-    }
-    let denom = na.sqrt() * nb.sqrt();
-    if denom == 0.0 { 0.0 } else { dot / denom }
+fn device_sum_squares(id: TensorId, store: &mut TensorStore) -> Result<f64> {
+    store.ensure_device(id)?;
+    let (handle, shape) = {
+        let tensor = store
+            .get(id)
+            .ok_or_else(|| anyhow!("device_sum_squares: tensor {id} not found"))?;
+        let handle = tensor
+            .device_handle
+            .clone()
+            .ok_or_else(|| anyhow!("device_sum_squares: tensor {id} missing device handle"))?;
+        (handle, tensor.shape.clone())
+    };
+    Ok(store.backend().sum_squares(&handle, &shape)?)
 }
