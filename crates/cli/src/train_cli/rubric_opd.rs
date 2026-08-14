@@ -646,7 +646,7 @@ impl JudgeServer {
     ) -> Result<Self> {
         let port = free_port();
         let exe = std::env::current_exe().context("current_exe")?;
-        let child = std::process::Command::new(exe)
+        let mut child = std::process::Command::new(exe)
             .args([
                 "serve",
                 "--model-path",
