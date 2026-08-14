@@ -220,6 +220,7 @@ fn sample_inflight(
             slot,
             token,
             logprob: None,
+            top_logprobs: Vec::new(),
             finish: None,
         }],
     })
@@ -236,6 +237,7 @@ fn materialize_inflight_now(inflight: MetalInflight) -> anyhow::Result<StepOutpu
                     slot,
                     token: sampled.item_i32() as u32,
                     logprob: None,
+                    top_logprobs: Vec::new(),
                     finish: None,
                 }],
             })
@@ -388,12 +390,14 @@ impl MetalExecutor {
                 slot: row.slot,
                 token: row.last_token.wrapping_add(1),
                 logprob: None,
+                top_logprobs: Vec::new(),
                 finish: None,
             })
             .chain(plan.prefill_rows.iter().map(|row| SlotToken {
                 slot: row.slot,
                 token: row.tokens.last().copied().unwrap_or(0).wrapping_add(1),
                 logprob: None,
+                top_logprobs: Vec::new(),
                 finish: None,
             }))
             .collect();
@@ -432,6 +436,7 @@ impl BackendExecutor for MetalExecutor {
                         slot,
                         token,
                         logprob: None,
+                        top_logprobs: Vec::new(),
                         finish: None,
                     }],
                 }))

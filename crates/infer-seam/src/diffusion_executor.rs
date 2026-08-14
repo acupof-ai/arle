@@ -118,6 +118,7 @@ impl<M> BufferedDiffusionExecutor<M> {
                 slot,
                 token: token.token,
                 logprob: None,
+                top_logprobs: Vec::new(),
                 finish: token.finish,
             }],
         })

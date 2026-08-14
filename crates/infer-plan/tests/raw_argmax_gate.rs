@@ -157,3 +157,29 @@ fn fast_path_agrees_with_the_sampler_wherever_it_is_taken() {
         assert_eq!(sample_token(&logits, &params, 0), raw_argmax);
     }
 }
+
+/// The OpenAI logprobs capture needs host logits, so requesting it vetoes the
+/// device-argmax fast path; under greedy the capture's top-1 IS the sampled
+/// token, at the exact log-softmax value.
+#[test]
+fn top_logprobs_vetoes_the_fast_path_and_top1_matches_the_sampled_token() {
+    let logits = [0.0f32, 2.0, 1.0, -1.0];
+    let mut params = greedy();
+    params.top_logprobs = Some(2);
+    assert!(params.is_greedy(), "the capture does not change the policy");
+    assert!(!params.is_raw_argmax(), "the capture reads host logits");
+
+    let sampled = sample_token(&logits, &params, 0);
+    assert_eq!(sampled, 1);
+    let cap =
+        infer_plan::sampled_top_logprobs(&logits, &params, PenaltyHistory::default(), sampled);
+    assert_eq!(cap.len(), 3, "sampled entry + top-2 alternatives");
+    assert_eq!(cap[0].0, sampled);
+    assert_eq!(cap[1].0, sampled, "greedy: top-1 is the sampled token");
+    assert_eq!(cap[0].1, cap[1].1);
+    assert_eq!(cap[2].0, 2, "second alternative is the runner-up");
+    assert!(cap[1].1 > cap[2].1);
+    // Exact log-softmax of the sampled token over the full row.
+    let sum: f32 = logits.iter().map(|&l| (l - 2.0).exp()).sum();
+    assert!((cap[0].1 - (0.0 - sum.ln())).abs() < 1e-6);
+}

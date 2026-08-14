@@ -588,6 +588,7 @@ impl CudaExecutor {
                 slot: row.slot,
                 token: row.last_token.wrapping_add(1),
                 logprob: None,
+                top_logprobs: Vec::new(),
                 finish: None,
             });
         }
@@ -597,6 +598,7 @@ impl CudaExecutor {
                 slot: row.slot,
                 token,
                 logprob: None,
+                top_logprobs: Vec::new(),
                 finish: None,
             });
         }

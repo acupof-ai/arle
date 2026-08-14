@@ -16,7 +16,7 @@ pub use diffusion::{
 };
 pub use sample::{
     PenaltyHistory, argmax_logit, merge_vocab_shard_argmax, sample_token, sample_token_logprob,
-    sample_token_logprob_penalized, sample_token_penalized,
+    sample_token_logprob_penalized, sample_token_penalized, sampled_top_logprobs,
 };
 
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
@@ -122,6 +122,12 @@ pub struct SlotToken {
     pub slot: usize,
     pub token: u32,
     pub logprob: Option<f32>,
+    /// OpenAI logprobs capture, present only when [`SamplingParams::top_logprobs`]
+    /// asked for it: entry 0 = the sampled token's logprob under the full
+    /// (rewritten, temperature-scaled) softmax; entries 1.. = the top-N
+    /// alternatives, probability-descending.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub top_logprobs: Vec<(u32, f32)>,
     /// Set when this token terminates the slot.
     pub finish: Option<FinishReason>,
 }
@@ -167,6 +173,12 @@ pub struct SamplingParams {
     pub logit_bias: Vec<(u32, f32)>,
     /// Engine supports one; values > 1 are handled by the API layer.
     pub n: usize,
+    /// `Some(n)`: capture OpenAI-style logprobs — the sampled token's logprob
+    /// under the full softmax plus the top-n alternatives (`n` may be 0:
+    /// sampled-token logprob only). Vetoes the device-argmax fast path (the
+    /// capture needs host logits) and speculative decode for this request.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub top_logprobs: Option<usize>,
 }
 
 impl Default for SamplingParams {
@@ -186,6 +198,7 @@ impl Default for SamplingParams {
             grammar_bitmask: None,
             logit_bias: Vec::new(),
             n: 1,
+            top_logprobs: None,
         }
     }
 }
@@ -238,10 +251,14 @@ impl SamplingParams {
             repetition_penalty: _,
             frequency_penalty: _,
             presence_penalty: _,
+            // The capture reads host logits, so the request must take the
+            // host sampling path.
+            top_logprobs,
         } = self;
         *temperature <= 0.0
             && grammar_bitmask.is_none()
             && logit_bias.is_empty()
+            && top_logprobs.is_none()
             && !self.has_penalty()
     }
 }

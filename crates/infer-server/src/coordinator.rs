@@ -493,6 +493,10 @@ struct CollectedGeneration {
     generated_tokens: Vec<u32>,
     /// Behavior logprobs accumulated from the deltas (empty when uncaptured).
     gen_logprobs: Vec<f32>,
+    /// OpenAI logprobs capture, one entry per generated token (entry 0 =
+    /// sampled token's full-dist logprob, 1.. = top-N alternatives). Empty
+    /// when the request did not ask or the backend does not surface it.
+    top_logprobs: Vec<Vec<(u32, f32)>>,
     finish: Option<FinishReason>,
 }
 
@@ -598,11 +602,13 @@ async fn submit_and_collect(
         streaming_submit(state, prompt_tokens, max_tokens, sampling, response_format)?;
     let mut generated_tokens: Vec<u32> = Vec::new();
     let mut gen_logprobs: Vec<f32> = Vec::new();
+    let mut top_logprobs: Vec<Vec<(u32, f32)>> = Vec::new();
     let mut finish: Option<FinishReason> = None;
     let mut error: Option<String> = None;
-    while let Some(delta) = rx.recv().await {
+    while let Some(mut delta) = rx.recv().await {
         generated_tokens.extend_from_slice(&delta.token_ids);
         gen_logprobs.extend_from_slice(&delta.logprobs);
+        top_logprobs.append(&mut delta.top_logprobs);
         let done = delta.is_done();
         error = error.or(delta.error);
         if done {
@@ -617,6 +623,7 @@ async fn submit_and_collect(
         prompt_tokens: prompt_len,
         generated_tokens,
         gen_logprobs,
+        top_logprobs,
         finish,
     })
 }
@@ -695,6 +702,98 @@ fn prompt_prefills_think(prompt: &str) -> bool {
     prompt.trim_end().ends_with("<think>")
 }
 
+/// OpenAI completions `logprobs` object from the engine capture
+/// (`SlotToken::top_logprobs`: entry 0 = the sampled token's full-distribution
+/// logprob, 1.. = the top-N alternatives). 501 when the capture is missing —
+/// the backend/model path does not surface logprobs.
+fn completion_logprobs_value(
+    state: &Arc<CoordinatorHandle>,
+    token_ids: &[u32],
+    captures: &[Vec<(u32, f32)>],
+) -> Result<serde_json::Value, ApiError> {
+    if captures.len() != token_ids.len() || captures.iter().any(Vec::is_empty) {
+        return Err(ApiError::not_implemented(
+            "logprobs are not surfaced by this backend/model path \
+             (supported: the CUDA Qwen3.5/3.6 executor)",
+        ));
+    }
+    let tokenizer = state
+        .tokenizer
+        .lock()
+        .map_err(|_| ApiError::internal("tokenizer lock poisoned"))?;
+    let mut tokens: Vec<String> = Vec::with_capacity(token_ids.len());
+    let mut token_logprobs: Vec<f32> = Vec::with_capacity(token_ids.len());
+    let mut top_logprobs: Vec<serde_json::Value> = Vec::with_capacity(token_ids.len());
+    let mut text_offset: Vec<usize> = Vec::with_capacity(token_ids.len());
+    let mut offset = 0usize;
+    for (&tid, cap) in token_ids.iter().zip(captures) {
+        let piece = tokenizer.decode(&[tid])?;
+        text_offset.push(offset);
+        offset += piece.len();
+        tokens.push(piece);
+        token_logprobs.push(cap[0].1);
+        let mut alts = serde_json::Map::with_capacity(cap.len() - 1);
+        for &(alt, lp) in &cap[1..] {
+            let key = tokenizer.decode(&[alt])?;
+            // Distinct token ids can decode to one string; keep the more
+            // probable (first, entries are probability-descending).
+            alts.entry(key).or_insert_with(|| lp.into());
+        }
+        top_logprobs.push(serde_json::Value::Object(alts));
+    }
+    Ok(serde_json::json!({
+        "tokens": tokens,
+        "token_logprobs": token_logprobs,
+        "top_logprobs": top_logprobs,
+        "text_offset": text_offset,
+    }))
+}
+
+/// OpenAI chat `logprobs` object (`content` entries). Uses the full capture
+/// when present; otherwise falls back to the legacy behavior-logprob shape
+/// (token-id strings, empty `top_logprobs`) so backends without the capture
+/// keep their previous wire behavior.
+fn chat_logprobs_value(
+    state: &Arc<CoordinatorHandle>,
+    token_ids: &[u32],
+    behavior_logprobs: &[f32],
+    captures: &[Vec<(u32, f32)>],
+) -> Result<serde_json::Value, ApiError> {
+    if captures.len() == token_ids.len() && !captures.iter().any(Vec::is_empty) {
+        let tokenizer = state
+            .tokenizer
+            .lock()
+            .map_err(|_| ApiError::internal("tokenizer lock poisoned"))?;
+        let mut content: Vec<serde_json::Value> = Vec::with_capacity(token_ids.len());
+        for (&tid, cap) in token_ids.iter().zip(captures) {
+            let mut alts: Vec<serde_json::Value> = Vec::with_capacity(cap.len() - 1);
+            for &(alt, lp) in &cap[1..] {
+                alts.push(serde_json::json!({
+                    "token": tokenizer.decode(&[alt])?,
+                    "logprob": lp,
+                }));
+            }
+            content.push(serde_json::json!({
+                "token": tokenizer.decode(&[tid])?,
+                "logprob": cap[0].1,
+                "top_logprobs": alts,
+            }));
+        }
+        return Ok(serde_json::json!({ "content": content }));
+    }
+    if behavior_logprobs.len() != token_ids.len() {
+        return Ok(serde_json::Value::Null);
+    }
+    let content: Vec<serde_json::Value> = token_ids
+        .iter()
+        .zip(behavior_logprobs)
+        .map(|(&t, &lp)| {
+            serde_json::json!({"token": t.to_string(), "logprob": lp, "top_logprobs": []})
+        })
+        .collect();
+    Ok(serde_json::json!({ "content": content }))
+}
+
 async fn completions(
     State(state): State<Arc<CoordinatorHandle>>,
     request: Result<Json<CompletionRequest>, axum::extract::rejection::JsonRejection>,
@@ -730,6 +829,11 @@ async fn completions(
         .is_some_and(|o| o.include_usage);
 
     if request.stream.unwrap_or(false) {
+        if request.logprobs.is_some() {
+            return Err(ApiError::bad_request(
+                "logprobs with stream=true is not supported yet",
+            ));
+        }
         let prompt_len = prompt_tokens.len();
         let (mut rx, guard) = streaming_submit(
             &state,
@@ -844,21 +948,14 @@ async fn completions(
                 .stop
                 .as_deref()
                 .map_or_else(|| text.clone(), |stop| strip_stop_strings(&text, stop));
-            let lps = request
-                .logprobs
-                .is_some()
-                .then_some(outcome.gen_logprobs.clone());
-            let logprobs_value = lps.and_then(|lps_vec| {
-                if lps_vec.len() != outcome.generated_tokens.len() {
-                    return None;
-                }
-                Some(serde_json::json!({
-                    "tokens": outcome.generated_tokens.iter().map(|&t| t.to_string()).collect::<Vec<_>>(),
-                    "token_logprobs": lps_vec,
-                    "top_logprobs": vec![serde_json::Value::Null; lps_vec.len()],
-                    "text_offset": (0..outcome.generated_tokens.len()).collect::<Vec<_>>(),
-                }))
-            });
+            let logprobs_value = match request.logprobs {
+                Some(_) => Some(completion_logprobs_value(
+                    &state,
+                    &outcome.generated_tokens,
+                    &outcome.top_logprobs,
+                )?),
+                None => None,
+            };
             choices.push(CompletionChoice {
                 text,
                 index: i,
@@ -894,10 +991,14 @@ async fn completions(
         .stop
         .as_deref()
         .map_or_else(|| text.clone(), |stop| strip_stop_strings(&text, stop));
-    let return_lps = request
-        .logprobs
-        .is_some()
-        .then_some(outcome.gen_logprobs.clone());
+    let logprobs_value = match request.logprobs {
+        Some(_) => Some(completion_logprobs_value(
+            &state,
+            &outcome.generated_tokens,
+            &outcome.top_logprobs,
+        )?),
+        None => None,
+    };
     Ok(Json(CompletionResponse::from_parts(
         state.model.clone(),
         text,
@@ -906,7 +1007,7 @@ async fn completions(
         outcome.finish.as_ref(),
         return_token_ids.then_some(outcome.generated_tokens),
         prompt_token_ids,
-        return_lps,
+        logprobs_value,
     ))
     .into_response())
 }
@@ -1266,21 +1367,16 @@ async fn chat_completions(
             } else {
                 "tool_calls".to_string()
             };
-            let logprobs_value = want_lps.then(|| {
-                let toks = &outcome.generated_tokens;
-                let lps = &outcome.gen_logprobs;
-                if lps.len() != toks.len() {
-                    return serde_json::Value::Null;
-                }
-                let cl: Vec<serde_json::Value> = toks
-                    .iter()
-                    .zip(lps.iter())
-                    .map(|(&t, &lp)| {
-                        serde_json::json!({"token": t.to_string(), "logprob": lp, "top_logprobs": []})
-                    })
-                    .collect();
-                serde_json::json!({"content": cl})
-            });
+            let logprobs_value = if want_lps {
+                Some(chat_logprobs_value(
+                    &state,
+                    &outcome.generated_tokens,
+                    &outcome.gen_logprobs,
+                    &outcome.top_logprobs,
+                )?)
+            } else {
+                None
+            };
             choices.push(ChatChoice {
                 index: i,
                 message: AssistantMessage {
@@ -1321,10 +1417,16 @@ async fn chat_completions(
     );
     let (content, tool_calls, split_thinking) =
         finalize_chat_content(decoded, tools_active, thinking);
-    let return_lps = request.logprobs.unwrap_or(false).then_some((
-        outcome.generated_tokens.clone(),
-        outcome.gen_logprobs.clone(),
-    ));
+    let logprobs_value = if request.logprobs.unwrap_or(false) {
+        Some(chat_logprobs_value(
+            &state,
+            &outcome.generated_tokens,
+            &outcome.gen_logprobs,
+            &outcome.top_logprobs,
+        )?)
+    } else {
+        None
+    };
     Ok(Json(ChatCompletionResponse::from_parts(
         state.model.clone(),
         content,
@@ -1333,7 +1435,7 @@ async fn chat_completions(
         outcome.finish.as_ref(),
         split_thinking,
         tool_calls,
-        return_lps,
+        logprobs_value,
     ))
     .into_response())
 }

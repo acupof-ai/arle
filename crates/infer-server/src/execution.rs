@@ -35,7 +35,12 @@ const IDLE_PARK: Duration = Duration::from_millis(2);
 /// commits, then exactly one terminal `Done` carrying the same completion the
 /// blocking `collect()` path delivers. Streaming is additive; blocking is intact.
 pub enum StreamItem {
-    Token { token: u32, logprob: Option<f32> },
+    Token {
+        token: u32,
+        logprob: Option<f32>,
+        /// OpenAI logprobs capture (empty unless the request asked for it).
+        top_logprobs: Vec<(u32, f32)>,
+    },
     Done(CompletedRequest),
 }
 
@@ -175,6 +180,7 @@ fn engine_loop_with_tick_broadcaster<E, K>(
                     .send(StreamItem::Token {
                         token: token.token,
                         logprob: token.logprob,
+                        top_logprobs: token.top_logprobs.clone(),
                     })
                     .is_err()
             {

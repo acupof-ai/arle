@@ -761,11 +761,22 @@ impl Qwen35Model {
         penalty: infer_plan::PenaltyHistory<'_>,
     ) -> Result<(u32, Option<f32>)> {
         let Qwen35Workspace {
-            logits, argmax_out, ..
+            logits,
+            argmax_out,
+            top_logprobs,
+            ..
         } = ws;
         let logits = logits.get(&self.ctx, self.output_projection().rows)?;
         let argmax_out = argmax_out.get(&self.ctx, 1)?;
-        sample_cuda_token_scratched(&self.ctx, logits, params, position, argmax_out, penalty)
+        crate::executor::sample_cuda_token_captured(
+            &self.ctx,
+            logits,
+            params,
+            position,
+            argmax_out,
+            penalty,
+            top_logprobs,
+        )
     }
 
     /// Device address of the workspace logits buffer (allocating it at vocab

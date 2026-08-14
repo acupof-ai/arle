@@ -1239,7 +1239,10 @@ impl Qwen35CudaExecutor {
         );
         let depth = self.model.spec_draft_tokens().max(1);
         // Seeded iff the stored pending matches the token the scheduler will feed.
-        let seeded = speculative_chain_fits(row.kv_seq_len, depth, self.model.max_seq_len())
+        // A logprobs capture vetoes spec: the verify commits tokens without full
+        // per-position distributions, so the row stays on the warm path.
+        let seeded = row.params.top_logprobs.is_none()
+            && speculative_chain_fits(row.kv_seq_len, depth, self.model.max_seq_len())
             && matches!(
                 self.mtp.as_ref().and_then(|m| m.slots[row.slot].as_ref()),
                 Some(s) if s.pending == row.last_token
@@ -1250,6 +1253,7 @@ impl Qwen35CudaExecutor {
                 slot: row.slot,
                 token,
                 logprob,
+                top_logprobs: self.take_top_logprobs(&row.params),
                 finish: None,
             }]);
         }
@@ -1314,13 +1318,14 @@ impl Qwen35CudaExecutor {
                 (tok, None)
             } else {
                 // Sampled seed so the pending token is policy-distributed.
-                sample_cuda_token_scratched(
+                crate::executor::sample_cuda_token_captured(
                     &model.ctx,
                     &logits,
                     &row.params,
                     start.saturating_add(1) as u64,
                     spec.argmax_scratch_mut(),
                     penalty_of(&row.penalty_history, row.penalty_prompt_len),
+                    &mut workspace.top_logprobs,
                 )?
             };
             mtp.as_mut().expect("mtp (gated)").slots[slot] = Some(MtpSlotState {
@@ -1357,13 +1362,14 @@ impl Qwen35CudaExecutor {
                 (tok, None)
             } else {
                 // Sampled seed so the pending token is policy-distributed.
-                sample_cuda_token_scratched(
+                crate::executor::sample_cuda_token_captured(
                     &model.ctx,
                     &logits,
                     &row.params,
                     start.saturating_add(1) as u64,
                     spec.argmax_scratch_mut(),
                     penalty_of(&row.penalty_history, row.penalty_prompt_len),
+                    &mut workspace.top_logprobs,
                 )?
             };
             mtp.as_mut().expect("mtp (gated)").slots[slot] = Some(MtpSlotState {
@@ -1466,6 +1472,8 @@ impl Qwen35CudaExecutor {
                 slot,
                 token,
                 logprob,
+                // Spec is vetoed for logprobs requests, so no capture here.
+                top_logprobs: Vec::new(),
                 finish: None,
             })
             .collect())
@@ -1582,8 +1590,11 @@ impl Qwen35CudaExecutor {
                 .dspark
                 .as_ref()
                 .expect("dspark_decode_batch without dspark");
+            // A logprobs capture vetoes spec (no full per-position distributions
+            // in the verify); the row falls to its warm step below.
             seeded.push(
-                self.full_attn_paged()
+                row.params.top_logprobs.is_none()
+                    && self.full_attn_paged()
                     && speculative_chain_fits(
                         row.kv_seq_len,
                         ds.head.block_size(),
@@ -1671,6 +1682,7 @@ impl Qwen35CudaExecutor {
                     slot: row.slot,
                     token,
                     logprob,
+                    top_logprobs: self.take_top_logprobs(&row.params),
                     finish: None,
                 }];
                 continue;
@@ -1817,6 +1829,8 @@ impl Qwen35CudaExecutor {
                     slot: c.slot,
                     token,
                     logprob,
+                    // Spec is vetoed for logprobs requests, so no capture here.
+                    top_logprobs: Vec::new(),
                     finish: None,
                 })
                 .collect();
@@ -2476,6 +2490,7 @@ impl Qwen35CudaExecutor {
                 slot: row.slot,
                 token,
                 logprob,
+                top_logprobs: self.take_top_logprobs(&row.params),
                 finish: None,
             });
         }
@@ -2535,11 +2550,22 @@ impl Qwen35CudaExecutor {
                         slot: row.slot,
                         token,
                         logprob,
+                        top_logprobs: self.take_top_logprobs(&row.params),
                         finish: None,
                     }])
                 }
                 rows => self.submit_decode_batch(rows, host_kv),
             },
+        }
+    }
+
+    /// Drain the workspace's OpenAI logprobs capture for a row that asked for
+    /// it (written by the model's LAST host sampling in the preceding call).
+    fn take_top_logprobs(&mut self, params: &SamplingParams) -> Vec<(u32, f32)> {
+        if params.top_logprobs.is_some() {
+            std::mem::take(&mut self.workspace.top_logprobs)
+        } else {
+            Vec::new()
         }
     }
 
@@ -2828,6 +2854,7 @@ impl Qwen35CudaExecutor {
                     slot: row.slot,
                     token,
                     logprob,
+                    top_logprobs: self.take_top_logprobs(&row.params),
                     finish: None,
                 });
             }
@@ -2844,6 +2871,7 @@ impl Qwen35CudaExecutor {
                     slot: row.slot,
                     token,
                     logprob,
+                    top_logprobs: self.take_top_logprobs(&row.params),
                     finish: None,
                 });
             }
@@ -2896,10 +2924,11 @@ impl Qwen35CudaExecutor {
         Ok(slot_indices
             .into_iter()
             .zip(sampled)
-            .map(|(slot, (token, logprob))| SlotToken {
+            .map(|(slot, (token, logprob, top_logprobs))| SlotToken {
                 slot,
                 token,
                 logprob,
+                top_logprobs,
                 finish: None,
             })
             .collect())
@@ -2992,10 +3021,11 @@ impl Qwen35CudaExecutor {
         Ok(slot_indices
             .into_iter()
             .zip(sampled)
-            .map(|(slot, (token, logprob))| SlotToken {
+            .map(|(slot, (token, logprob, top_logprobs))| SlotToken {
                 slot,
                 token,
                 logprob,
+                top_logprobs,
                 finish: None,
             })
             .collect())

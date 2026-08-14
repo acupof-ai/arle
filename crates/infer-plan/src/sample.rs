@@ -155,27 +155,7 @@ pub fn sample_token_logprob_penalized(
     position: u64,
     history: PenaltyHistory<'_>,
 ) -> (u32, Option<f32>) {
-    let masked = params
-        .grammar_bitmask
-        .as_deref()
-        .map(|mask| apply_grammar_bitmask(logits, mask));
-    let logits = masked.as_deref().unwrap_or(logits);
-
-    let penalized = params.has_penalty() && !history.tokens.is_empty();
-    let rewritten = if params.logit_bias.is_empty() && !penalized {
-        None
-    } else {
-        let mut v = logits.to_vec();
-        for &(tok, bias) in &params.logit_bias {
-            if (tok as usize) < v.len() {
-                v[tok as usize] += bias;
-            }
-        }
-        if penalized {
-            apply_penalties(&mut v, params, history);
-        }
-        Some(v)
-    };
+    let rewritten = rewrite_logits(logits, params, history);
     let logits = rewritten.as_deref().unwrap_or(logits);
     if params.is_greedy() || logits.is_empty() {
         return (argmax_logit(logits), None);
@@ -248,6 +228,86 @@ pub fn sample_token_logprob_penalized(
     }
     cand.last()
         .map_or((0, None), |(idx, p)| (*idx, Some((*p / total).ln())))
+}
+
+/// The grammar-mask / logit-bias / penalty rewrite the sampler draws from.
+/// `None` = logits unchanged (no rewriting parameter is active).
+fn rewrite_logits(
+    logits: &[f32],
+    params: &SamplingParams,
+    history: PenaltyHistory<'_>,
+) -> Option<Vec<f32>> {
+    let masked = params
+        .grammar_bitmask
+        .as_deref()
+        .map(|mask| apply_grammar_bitmask(logits, mask));
+    let penalized = params.has_penalty() && !history.tokens.is_empty();
+    if masked.is_none() && params.logit_bias.is_empty() && !penalized {
+        return None;
+    }
+    let mut v = masked.unwrap_or_else(|| logits.to_vec());
+    for &(tok, bias) in &params.logit_bias {
+        if (tok as usize) < v.len() {
+            v[tok as usize] += bias;
+        }
+    }
+    if penalized {
+        apply_penalties(&mut v, params, history);
+    }
+    Some(v)
+}
+
+/// OpenAI logprobs capture for one sampled position, keyed off
+/// [`SamplingParams::top_logprobs`]: entry 0 = the sampled token's logprob
+/// under the FULL (rewritten, temperature-scaled) softmax; entries 1.. = the
+/// top-N alternatives, probability-descending (ties resolve to the lowest
+/// token id). Temperature <= 0 scores the unscaled logits. Empty when the
+/// capture was not requested.
+#[must_use]
+pub fn sampled_top_logprobs(
+    logits: &[f32],
+    params: &SamplingParams,
+    history: PenaltyHistory<'_>,
+    sampled: u32,
+) -> Vec<(u32, f32)> {
+    let Some(n) = params.top_logprobs else {
+        return Vec::new();
+    };
+    if logits.is_empty() {
+        return Vec::new();
+    }
+    let rewritten = rewrite_logits(logits, params, history);
+    let logits = rewritten.as_deref().unwrap_or(logits);
+    let inv_t = if params.temperature > 0.0 {
+        1.0 / params.temperature
+    } else {
+        1.0
+    };
+    let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let mut sum = 0.0f32;
+    // Top-n scaled logits, descending; ties keep the earlier (lower) token id.
+    let mut top: Vec<(u32, f32)> = Vec::with_capacity(n + 1);
+    for (i, &l) in logits.iter().enumerate() {
+        let s = (l - max) * inv_t;
+        sum += s.exp();
+        if n > 0 && (top.len() < n || s > top[top.len() - 1].1) {
+            let at = top.partition_point(|&(_, ts)| ts >= s);
+            top.insert(at, (i as u32, s));
+            top.truncate(n);
+        }
+    }
+    // All-(-inf)/NaN row: no distribution to report.
+    if !(sum.is_finite() && sum > 0.0) {
+        return vec![(sampled, f32::NEG_INFINITY)];
+    }
+    let ln_sum = sum.ln();
+    let sampled_lp = logits
+        .get(sampled as usize)
+        .map_or(f32::NEG_INFINITY, |&l| (l - max) * inv_t - ln_sum);
+    let mut out = Vec::with_capacity(top.len() + 1);
+    out.push((sampled, sampled_lp));
+    out.extend(top.into_iter().map(|(i, s)| (i, s - ln_sum)));
+    out
 }
 
 fn sample_unfiltered_temperature(

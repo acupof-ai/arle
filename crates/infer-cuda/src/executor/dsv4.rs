@@ -139,6 +139,7 @@ impl Dsv4CudaExecutor {
             slot,
             token,
             logprob: None,
+            top_logprobs: Vec::new(),
             finish: None,
         }
     }

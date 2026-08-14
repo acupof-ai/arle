@@ -685,12 +685,14 @@ impl BackendExecutor for EchoExecutor {
                 slot: row.slot,
                 token: row.tokens.last().copied().map_or(1, |last| last + 1),
                 logprob: None,
+                top_logprobs: Vec::new(),
                 finish: None,
             })
             .chain(plan.decode_rows.iter().map(|row| SlotToken {
                 slot: row.slot,
                 token: row.last_token + 1,
                 logprob: None,
+                top_logprobs: Vec::new(),
                 finish: None,
             }))
             .collect();
@@ -760,13 +762,20 @@ fn relay_stream(
     use multiproc_relay::RelayEnvelope;
     for item in rx {
         let delta = match item {
-            execution::StreamItem::Token { token, logprob } => {
-                multiproc_relay::RelayCompletionDelta {
-                    token_ids: vec![token],
-                    logprobs: logprob.into_iter().collect(),
-                    ..Default::default()
-                }
-            }
+            execution::StreamItem::Token {
+                token,
+                logprob,
+                top_logprobs,
+            } => multiproc_relay::RelayCompletionDelta {
+                token_ids: vec![token],
+                logprobs: logprob.into_iter().collect(),
+                top_logprobs: if top_logprobs.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![top_logprobs]
+                },
+                ..Default::default()
+            },
             execution::StreamItem::Done(completed) => multiproc_relay::RelayCompletionDelta {
                 finish: true,
                 finish_reason: completed.finish.clone(),
