@@ -47,6 +47,18 @@ make install-hooks
 make pre-push
 ```
 
+## Build Requirements
+
+- **RAM**: a cold `--release` build (codegen-units=1 + thin-LTO) needs more
+  than 16 GB — it OOM-killed a 16 GB CI runner. On memory-constrained machines
+  use `--profile release-fast` (cu=16, no LTO), the CI test profile.
+- **Disk**: the cuda / metal / cpu feature lanes clobber each other in a shared
+  `target/`; pin one `CARGO_TARGET_DIR` per lane (expect ~3× single-lane disk).
+- **CUDA first build**: TileLang AOT codegen takes ~1h without the prebuilt
+  bundle — `make kernels-sync` (or `make build-cuda`) skips it. Each parallel
+  nvcc worker uses 1-2 GB RAM; `ARLE_NVCC_PARALLEL` defaults to
+  `min(cores, 8)`.
+
 ## Development Workflow
 
 ```bash
