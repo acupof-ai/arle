@@ -186,7 +186,7 @@ Model `iso-tc-huihui-w8a16` (Huihui-Qwen3.6-27B abliterated, W8A16 gs=128,
 29 GB), GPU 6, `bench-agent-32k-64.jsonl`, c=1, 16 requests × 256 tokens,
 temperature 0, seed 20260416. TTFT is cold — 16 distinct prompts, no prefix
 hits. SGLang 0.5.13 row serves the GPTQ v1 twin repacked by
-`scripts/w8a16_to_gptq.py` — identical int8 values, identical kernel.
+a one-off uint8→int8 GPTQ repack (script since deleted) — identical int8 values, identical kernel.
 
 ### SOTA — snapshot stride 8192 (2026-08-06)
 
