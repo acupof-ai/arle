@@ -664,8 +664,19 @@ impl JudgeServer {
             .spawn()
             .context("spawn judge serve process")?;
         let endpoint = format!("http://127.0.0.1:{port}");
-        wait_for_health(&endpoint)?;
-        Ok(Self { child, endpoint })
+        let url = format!("{endpoint}/health");
+        // Large models (DSv4-Flash ~236B) can take 30+ minutes to load across
+        // TP workers. Poll for up to an hour, and fail fast if the child exits.
+        for _ in 0..7200 {
+            if reqwest::blocking::get(&url).is_ok() {
+                return Ok(Self { child, endpoint });
+            }
+            if let Ok(Some(status)) = child.try_wait() {
+                bail!("judge serve child exited with {status} before becoming healthy");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+        bail!("judge serve at {endpoint} did not become healthy within 1h")
     }
 
     fn endpoint(&self) -> &str {
@@ -688,16 +699,4 @@ fn free_port() -> u16 {
         .local_addr()
         .expect("local addr")
         .port()
-}
-
-#[cfg(feature = "cuda")]
-fn wait_for_health(endpoint: &str) -> Result<()> {
-    let url = format!("{endpoint}/health");
-    for _ in 0..600 {
-        if reqwest::blocking::get(&url).is_ok() {
-            return Ok(());
-        }
-        std::thread::sleep(std::time::Duration::from_millis(500));
-    }
-    bail!("judge serve at {endpoint} did not become healthy")
 }
