@@ -896,10 +896,9 @@ impl Qwen35CudaExecutor {
         Ok(full_attn_kv)
     }
 
-    /// Drop the paged pool. Freed blocks return to the device pool via a
-    /// background trim once the enqueued frees complete; the co-resident
-    /// writeback reuses cached blocks immediately. `ensure_kv_pool`
-    /// re-acquires it.
+    /// Drop the paged pool and trim the device pool once the enqueued frees
+    /// complete, so a co-resident allocator never races an in-flight free.
+    /// `ensure_kv_pool` re-acquires it.
     pub(crate) fn release_kv_pool(&mut self) -> Result<()> {
         let Some(pool) = self.full_attn_kv.as_ref() else {
             return Ok(());
@@ -907,16 +906,8 @@ impl Qwen35CudaExecutor {
         let freed = pool.device_bytes();
         self.full_attn_kv = None;
         let event = self.model.ctx.stream.record_event(None)?;
-        let ctx = self.model.ctx.clone();
-        std::thread::spawn(move || {
-            if let Err(e) = event.synchronize() {
-                log::warn!("release_kv_pool: event sync failed: {e}");
-                return;
-            }
-            if let Err(e) = ctx.trim_memory_pool() {
-                log::warn!("release_kv_pool: trim failed (non-fatal): {e}");
-            }
-        });
+        event.synchronize()?;
+        self.model.ctx.trim_memory_pool()?;
         log::info!(
             "Qwen3.6 released full-attn KV pool: freed {}MB (agent-OPD writeback headroom)",
             freed >> 20

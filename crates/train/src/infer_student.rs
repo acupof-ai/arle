@@ -309,7 +309,7 @@ impl InferStudent {
             alpha: lora_config.alpha,
         };
 
-        let engine = self
+        let mut engine = self
             .engine
             .lock()
             .map_err(|err| anyhow!("LoadedInferenceEngine lock poisoned: {err}"))?;
@@ -317,39 +317,43 @@ impl InferStudent {
 
         // Re-point the student's frozen-base tensors at the engine's merged BF16
         // bytes, then free the retired FP8 buffers (~27 GB) that would OOM the
-        // next round's forward.
-        let bf16_ptrs = engine.frozen_base_bf16_pointers()?;
-        drop(engine);
+        // next round's forward. SKIPPED under offload=student|all: the same
+        // step's offload_engine_weights frees these buffers, so the trainer must
+        // keep its own frozen-base copies (a re-point would read freed memory).
+        if !crate::opd::engine_offload_mode().offloads_student() {
+            let bf16_ptrs = engine.frozen_base_bf16_pointers()?;
+            drop(engine);
 
-        for entry in &bf16_ptrs {
-            let suffix = format!(".layers.{}.{}.weight", entry.layer_idx, entry.proj_suffix);
-            let Some((&name, &id)) = param_name_map
-                .iter()
-                .find(|(name, _)| name.ends_with(&suffix))
-            else {
-                continue;
-            };
-            let shape = vec![entry.rows, entry.cols];
-            let handle = {
-                let backend = store.backend();
-                backend
-                    .import_bf16_device_ptr(entry.data_ptr, &shape)
-                    .map_err(|err| {
-                        anyhow!("LoRA sync: import BF16 base for {name} failed: {err}")
-                    })?
-            };
-            store
-                .replace_device_handle(id, handle)
-                .map_err(|err| anyhow!("LoRA sync: replace BF16 base for {name} failed: {err}"))?;
-            store.set_requires_grad(id, false).map_err(|err| {
-                anyhow!("LoRA sync: set requires_grad=false for {name} failed: {err}")
-            })?;
+            for entry in &bf16_ptrs {
+                let suffix = format!(".layers.{}.{}.weight", entry.layer_idx, entry.proj_suffix);
+                let Some((&name, &id)) = param_name_map
+                    .iter()
+                    .find(|(name, _)| name.ends_with(&suffix))
+                else {
+                    continue;
+                };
+                let shape = vec![entry.rows, entry.cols];
+                let handle = {
+                    let backend = store.backend();
+                    backend
+                        .import_bf16_device_ptr(entry.data_ptr, &shape)
+                        .map_err(|err| {
+                            anyhow!("LoRA sync: import BF16 base for {name} failed: {err}")
+                        })?
+                };
+                store.replace_device_handle(id, handle).map_err(|err| {
+                    anyhow!("LoRA sync: replace BF16 base for {name} failed: {err}")
+                })?;
+                store.set_requires_grad(id, false).map_err(|err| {
+                    anyhow!("LoRA sync: set requires_grad=false for {name} failed: {err}")
+                })?;
+            }
+
+            engine = self
+                .engine
+                .lock()
+                .map_err(|err| anyhow!("LoadedInferenceEngine lock poisoned: {err}"))?;
         }
-
-        let mut engine = self
-            .engine
-            .lock()
-            .map_err(|err| anyhow!("LoadedInferenceEngine lock poisoned: {err}"))?;
         engine.free_retired_fp8_buffers();
         Ok(())
     }

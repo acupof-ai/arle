@@ -360,6 +360,10 @@ impl Qwen35Model {
             "frozen-base BF16 sharing is single-GPU only; got TP world_size={}",
             self.tp.config().world_size
         );
+        // The trainer holds non-owning views of these buffers from here on;
+        // offload_engine_weights refuses to free them (see its ensure!).
+        self.frozen_base_ptrs_exported
+            .store(true, Ordering::Relaxed);
         let ctx = &self.ctx;
         fn push(
             out: &mut Vec<SharedBf16BaseProjection>,
