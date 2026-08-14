@@ -628,7 +628,8 @@ mod app {
                 page_size,
                 total_pages: max_seq_len.div_ceil(page_size),
                 ..EngineLoadConfig::default()
-            },
+            tp_size: None,
+        },
         )
     }
 

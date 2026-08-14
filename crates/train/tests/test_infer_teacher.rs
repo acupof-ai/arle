@@ -112,6 +112,7 @@ fn load_infer_engine(model_dir: &Path) -> anyhow::Result<LoadedInferenceEngine> 
             total_pages: 8,
             page_size: 16,
             ..EngineLoadConfig::default()
+            tp_size: None,
         },
     )
 }
