@@ -107,8 +107,8 @@ pub(super) fn run_w2s(args: TrainW2sArgs) -> Result<()> {
             // small so the student's activations + aux weights fit on one GPU.
             let aux_cfg = EngineLoadConfig {
                 mem_fraction_static: 0.1,
+                tp_size: None,
                 ..EngineLoadConfig::single_sequence(2048)
-            tp_size: None,
         };
             // Each engine offloads right after load so only one aux is resident;
             // the w2s step reloads it just-in-time for the delta forward.
