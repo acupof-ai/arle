@@ -2157,6 +2157,7 @@ mod backend {
                 config.markov_head_rank,
                 config.dspark_block_size,
                 config.mtp_draft_tokens,
+                config.memory_budget_bytes,
             )?,
             // DSv4 multi-rank serve. The DSv4 executor resolves its TP
             // rank/world-size + EP expert split + NCCL communicator from the

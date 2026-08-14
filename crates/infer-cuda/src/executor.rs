@@ -223,6 +223,7 @@ impl RealCudaExecutor {
         markov_head_rank: Option<usize>,
         dspark_block_size: Option<usize>,
         mtp_draft_tokens: Option<usize>,
+        memory_budget_bytes: Option<usize>,
     ) -> Result<Self> {
         Ok(Self::Qwen35(Box::new(
             Qwen35CudaExecutor::from_qwen35_safetensors(
@@ -238,6 +239,7 @@ impl RealCudaExecutor {
                 markov_head_rank,
                 dspark_block_size,
                 mtp_draft_tokens,
+                memory_budget_bytes,
             )?,
         )))
     }
