@@ -794,61 +794,68 @@ impl Qwen35CudaExecutor {
             .saturating_add(conv_bytes)
             .saturating_add(dspark_slot_bytes);
         let recurrent_reservation = per_slot_recurrent.saturating_mul(num_slots) as u64;
-        let total_pool_pages = match model.ctx.mem_info_bytes() {
-            Ok((free, total)) => {
-                let free_after_recurrent = (free as u64).saturating_sub(recurrent_reservation);
-                let profiled_tokens = infer_seam::profile_kv_pool_tokens(
-                    free_after_recurrent,
-                    total as u64,
-                    cell_bytes_per_token,
-                    mem_fraction_static,
-                );
-                let profiled_pages = (profiled_tokens / SUPPORTED_PAGE_SIZE as u64) as usize;
-                // #178: flooring the profile at a constant books HBM the card lacks.
-                let sized = profiled_pages.max(1);
-                if profiled_tokens == infer_seam::PROFILE_KV_TOKENS_FLOOR {
-                    // `mem_fraction_static` bounds the engine's share of TOTAL, so a
-                    // value
-                    // under the weights' own share caps admission at 4096 tokens. The
-                    // operands ride along: the adjacent info! is off at the default
-                    // level.
-                    let reserve = (total as f64 * (1.0 - mem_fraction_static)) as u64;
-                    log::warn!(
-                        "KV pool collapsed to the {}-token floor: free_after_recurrent {}MB − \
+        // Single-sequence engines (e.g., the OPD teacher scorer) know their exact
+        // KV need from EngineLoadConfig::single_sequence; the VRAM fraction probe
+        // over-provisions tens of GB for one ~8K-token sequence.
+        let total_pool_pages = if num_slots == 1 {
+            requested_pages
+        } else {
+            match model.ctx.mem_info_bytes() {
+                Ok((free, total)) => {
+                    let free_after_recurrent = (free as u64).saturating_sub(recurrent_reservation);
+                    let profiled_tokens = infer_seam::profile_kv_pool_tokens(
+                        free_after_recurrent,
+                        total as u64,
+                        cell_bytes_per_token,
+                        mem_fraction_static,
+                    );
+                    let profiled_pages = (profiled_tokens / SUPPORTED_PAGE_SIZE as u64) as usize;
+                    // #178: flooring the profile at a constant books HBM the card lacks.
+                    let sized = profiled_pages.max(1);
+                    if profiled_tokens == infer_seam::PROFILE_KV_TOKENS_FLOOR {
+                        // `mem_fraction_static` bounds the engine's share of TOTAL, so a
+                        // value
+                        // under the weights' own share caps admission at 4096 tokens. The
+                        // operands ride along: the adjacent info! is off at the default
+                        // level.
+                        let reserve = (total as f64 * (1.0 - mem_fraction_static)) as u64;
+                        log::warn!(
+                            "KV pool collapsed to the {}-token floor: free_after_recurrent {}MB − \
                          reserve {}MB (= total {}MB × (1 − mem_fraction_static \
                          {mem_fraction_static})) leaves nothing for {cell_bytes_per_token}B/tok \
                          cells. Raise mem_fraction_static above {:.2}, or free VRAM: every \
                          prompt over {} tokens will abort.",
-                        infer_seam::PROFILE_KV_TOKENS_FLOOR,
-                        free_after_recurrent >> 20,
-                        reserve >> 20,
-                        total >> 20,
-                        1.0 - (free_after_recurrent as f64 / total as f64),
-                        infer_seam::PROFILE_KV_TOKENS_FLOOR,
-                    );
-                }
-                log::info!(
-                    "CUDA Qwen3.6 full-attn KV pool profiled from measured VRAM: free {}MB / \
+                            infer_seam::PROFILE_KV_TOKENS_FLOOR,
+                            free_after_recurrent >> 20,
+                            reserve >> 20,
+                            total >> 20,
+                            1.0 - (free_after_recurrent as f64 / total as f64),
+                            infer_seam::PROFILE_KV_TOKENS_FLOOR,
+                        );
+                    }
+                    log::info!(
+                        "CUDA Qwen3.6 full-attn KV pool profiled from measured VRAM: free {}MB / \
                      total {}MB, recurrent reservation {}MB ({num_slots} slots × {}MB), \
                      free_after_recurrent {}MB, mem_fraction_static {mem_fraction_static}, cell \
                      {cell_bytes_per_token}B/tok ({num_full} full-attn layers × {local_kv_heads} \
                      kv-heads × {head_dim} hd) -> max_total_tokens {profiled_tokens} \
                      ({profiled_pages} pages); requested {requested_pages} pages (advisory) \
                      -> sizing {sized} pages",
-                    free >> 20,
-                    total >> 20,
-                    recurrent_reservation >> 20,
-                    per_slot_recurrent >> 20,
-                    free_after_recurrent >> 20,
-                );
-                sized
-            }
-            Err(e) => {
-                log::warn!(
-                    "CUDA Qwen3.6 full-attn KV pool: free-VRAM probe failed ({e}); falling back \
+                        free >> 20,
+                        total >> 20,
+                        recurrent_reservation >> 20,
+                        per_slot_recurrent >> 20,
+                        free_after_recurrent >> 20,
+                    );
+                    sized
+                }
+                Err(e) => {
+                    log::warn!(
+                        "CUDA Qwen3.6 full-attn KV pool: free-VRAM probe failed ({e}); falling back \
                      to requested floor {requested_pages} pages"
-                );
-                requested_pages
+                    );
+                    requested_pages
+                }
             }
         };
         Self::alloc_full_attn_kv_pool(model, num_slots, total_pool_pages, kv_format)
@@ -2570,8 +2577,9 @@ impl Qwen35CudaExecutor {
         use super::spec_decode::{DecodeRoute, SpecKind};
         let kind = self.spec_kind();
         // Only a batched greedy DSpark draft pays above c=1: sampling loses −15.5% at
-        // c=8 and −26.4% at c=16. The batched path is unvalidated with quant-KV
-        // pools, so gate it to BF16 until a parity entry lands.
+        // c=8 and −26.4% at c=16.
+        // ponytail: batched DSpark is gated to BF16 KV; upgrade path is a quant-KV
+        // parity entry (needle gate ×3 same-config vs the BF16 baseline).
         let batched = kind == SpecKind::Dspark
             && self.paged_kv_bf16()
             && decode_rows.iter().all(|r| r.params.is_greedy());
