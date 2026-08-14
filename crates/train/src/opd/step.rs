@@ -109,13 +109,6 @@ fn windowed_gkd_step<O: Optimizer, T: TeacherForward + ?Sized>(
                 "opd_engine_offload student_offloaded freed_bytes={freed} freed_mib={:.1}",
                 freed as f64 / (1024.0 * 1024.0)
             );
-            // Fence AFTER the offload too: its frees are enqueued on the infer
-            // context; without draining them the train allocator's next pool
-            // allocations race the frees (same class as the pre-offload fence).
-            store
-                .backend()
-                .device_synchronize()
-                .map_err(OpdError::from)?;
             true
         } else {
             false
