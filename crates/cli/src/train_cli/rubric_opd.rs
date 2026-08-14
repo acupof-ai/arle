@@ -351,38 +351,84 @@ pub(super) fn run_rubric_opd_impl(args: TrainRubricOpdArgs) -> Result<()> {
     // Judge engine (DeepSeek-V4-Flash) — text in, verdict out (own tokenizer).
     // Self-consistency mode loads NO judge (the student majority-votes on its own
     // \boxed answer), freeing the ~35GB judge VRAM; teacher-model is ignored.
+    // Multi-GPU models (DSv4, Qwen35 MoE) spawn a multiproc coordinator + workers
+    // and the judge connects over HTTP; single-GPU models load in-process.
     let judge = if args.self_consistency {
         eprintln!(
             "[arle train rubric-opd] self-consistency mode: no judge engine loaded (majority-vote on \\boxed)"
         );
         None
     } else {
+        let teacher_str = teacher_dir
+            .to_str()
+            .ok_or_else(|| anyhow!("teacher path is not valid UTF-8"))?;
         let judge_prompt_cap = (student_seq * 2 + 1024).max(2048);
         let judge_total = judge_prompt_cap + args.max_verdict_tokens;
-        eprintln!(
-            "[arle train rubric-opd] loading Flash judge from {} (max_total={judge_total})",
-            teacher_dir.display()
-        );
-        let judge_engine = LoadedInferenceEngine::load_with_config(
-            teacher_dir
-                .to_str()
-                .ok_or_else(|| anyhow!("teacher path is not valid UTF-8"))?,
-            true,
-            EngineLoadConfig {
-                num_slots: args.judge_num_slots,
-                page_size: 16,
-                total_pages: args.judge_num_slots.max(1) * judge_total.div_ceil(16),
-                max_prompt_tokens: judge_prompt_cap,
-                max_total_tokens: judge_total,
-                chunked_prefill_size: Some(judge_prompt_cap),
-                ..EngineLoadConfig::default()
-            },
-        )
-        .with_context(|| format!("load Flash judge from {}", teacher_dir.display()))?;
-        Some(FlashJudge::new(
-            Arc::new(Mutex::new(judge_engine)),
-            args.max_verdict_tokens,
-        ))
+        let judge_config = EngineLoadConfig {
+            num_slots: args.judge_num_slots,
+            page_size: 16,
+            total_pages: args.judge_num_slots.max(1) * judge_total.div_ceil(16),
+            max_prompt_tokens: judge_prompt_cap,
+            max_total_tokens: judge_total,
+            chunked_prefill_size: Some(judge_prompt_cap),
+            ..EngineLoadConfig::default()
+        };
+        if infer_api::cuda_model_takes_multiproc_serve(teacher_str) {
+            let world_size = crate::serve_multiproc::world_size_from_env();
+            if world_size > 1 {
+                eprintln!(
+                    "[arle train rubric-opd] launching multi-GPU judge (world_size={world_size})"
+                );
+                let coordinator = crate::serve_multiproc::bind_relay_and_spawn_workers(
+                    teacher_str,
+                    &judge_config,
+                )?
+                .ok_or_else(|| {
+                    anyhow!("multiproc coordinator returned None for world_size={world_size}")
+                })?;
+                let crate::serve_multiproc::MultiprocCoordinator { relay, guard } = coordinator;
+                let port = free_port();
+                let teacher_owned = teacher_str.to_string();
+                std::thread::spawn(move || {
+                    if let Err(e) = infer_api::serve_coordinator_http(
+                        &teacher_owned,
+                        "127.0.0.1",
+                        port,
+                        0,
+                        relay,
+                    ) {
+                        eprintln!("judge coordinator HTTP error: {e}");
+                    }
+                });
+                wait_for_port(port);
+                Some(FlashJudge::new_remote(
+                    format!("http://127.0.0.1:{port}"),
+                    args.max_verdict_tokens,
+                ))
+            } else {
+                eprintln!(
+                    "[arle train rubric-opd] WARNING: model {} wants multi-GPU but world_size=1; loading in-process (may OOM)",
+                    teacher_dir.display()
+                );
+                let judge_engine =
+                    LoadedInferenceEngine::load_with_config(teacher_str, true, judge_config)
+                        .with_context(|| {
+                            format!("load Flash judge from {}", teacher_dir.display())
+                        })?;
+                Some(FlashJudge::new(
+                    Arc::new(Mutex::new(judge_engine)),
+                    args.max_verdict_tokens,
+                ))
+            }
+        } else {
+            let judge_engine =
+                LoadedInferenceEngine::load_with_config(teacher_str, true, judge_config)
+                    .with_context(|| format!("load Flash judge from {}", teacher_dir.display()))?;
+            Some(FlashJudge::new(
+                Arc::new(Mutex::new(judge_engine)),
+                args.max_verdict_tokens,
+            ))
+        }
     };
 
     let mut optimizer = AdamW::new(args.lr, (0.9, 0.999), 1.0e-8, 0.0);
@@ -600,4 +646,24 @@ pub(super) fn run_rubric_opd_impl(args: TrainRubricOpdArgs) -> Result<()> {
 
     eprintln!("[arle train rubric-opd] done ({} rounds)", args.rounds);
     Ok(())
+}
+
+#[cfg(feature = "cuda")]
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("bind free port")
+        .local_addr()
+        .expect("local addr")
+        .port()
+}
+
+#[cfg(feature = "cuda")]
+fn wait_for_port(port: u16) {
+    for _ in 0..100 {
+        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    panic!("judge coordinator HTTP on port {port} did not come up");
 }
