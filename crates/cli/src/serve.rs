@@ -442,7 +442,7 @@ fn resolve_engine_config(
         kv_cache_dtype,
         tp_size: None,
         ..EngineLoadConfig::default()
-        };
+    };
 
     // Quant KV dtypes route to the backend that implements them. Reject the
     // mismatched combos at the CLI boundary; the per-backend `*KvCacheDtype::

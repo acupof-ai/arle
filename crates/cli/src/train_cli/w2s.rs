@@ -109,7 +109,7 @@ pub(super) fn run_w2s(args: TrainW2sArgs) -> Result<()> {
                 mem_fraction_static: 0.1,
                 tp_size: None,
                 ..EngineLoadConfig::single_sequence(2048)
-        };
+            };
             // Each engine offloads right after load so only one aux is resident;
             // the w2s step reloads it just-in-time for the delta forward.
             let load_teacher = |label: &str, path: &std::path::Path| -> Result<InferTeacher> {
