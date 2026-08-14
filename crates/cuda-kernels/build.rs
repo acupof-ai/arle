@@ -781,7 +781,11 @@ fn find_tilelang_python() -> Result<String, String> {
     }
 
     Err(format!(
-        "Could not find a Python interpreter with TileLang installed. Set INFER_TILELANG_PYTHON, bootstrap tools/tilelang/.venv, or `pip install -e .[tilelang]`. Probe results: {}.",
+        "Could not find a Python interpreter with TileLang installed. Either install TileLang \
+(set INFER_TILELANG_PYTHON, bootstrap tools/tilelang/.venv, or `pip install -e .[tilelang]`), \
+or avoid regeneration entirely: run `scripts/kernel_artifacts.sh fetch` to restore the vendored \
+generated/ tier, or set ARLE_CUDA_KERNELS_PREBUILT_DIR to a prebuilt kernel bundle. \
+Probe results: {}.",
         diagnostics.join(" | ")
     ))
 }
