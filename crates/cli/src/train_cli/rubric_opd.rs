@@ -351,10 +351,9 @@ pub(super) fn run_rubric_opd_impl(args: TrainRubricOpdArgs) -> Result<()> {
     // Judge engine (DeepSeek-V4-Flash) — text in, verdict out (own tokenizer).
     // Self-consistency mode loads NO judge (the student majority-votes on its own
     // \boxed answer), freeing the ~35GB judge VRAM; teacher-model is ignored.
-    // Multi-GPU models (DSv4, Qwen35 MoE) spawn a multiproc coordinator + workers
-    // and the judge connects over HTTP; single-GPU models load in-process.
-    // The coordinator guard must outlive the OPD run to keep workers alive.
-    let mut judge_guard: Option<crate::serve_multiproc::CoordinatorGuard> = None;
+    // Multi-GPU models (DSv4, Qwen35 MoE) spawn a separate `arle serve` child
+    // process with its own TP env; the parent stays single-GPU for the student.
+    let mut judge_server: Option<JudgeServer> = None;
     let judge = if args.self_consistency {
         eprintln!(
             "[arle train rubric-opd] self-consistency mode: no judge engine loaded (majority-vote on \\boxed)"
@@ -376,41 +375,23 @@ pub(super) fn run_rubric_opd_impl(args: TrainRubricOpdArgs) -> Result<()> {
             ..EngineLoadConfig::default()
         };
         if infer_api::cuda_model_takes_multiproc_serve(teacher_str) {
-            let world_size = crate::serve_multiproc::world_size_from_env();
-            if world_size > 1 {
-                eprintln!(
-                    "[arle train rubric-opd] launching multi-GPU judge (world_size={world_size})"
-                );
-                let coordinator = crate::serve_multiproc::bind_relay_and_spawn_workers(
-                    teacher_str,
-                    &judge_config,
-                )?
-                .ok_or_else(|| {
-                    anyhow!("multiproc coordinator returned None for world_size={world_size}")
-                })?;
-                let crate::serve_multiproc::MultiprocCoordinator { relay, guard } = coordinator;
-                judge_guard = Some(guard);
-                let port = free_port();
-                let teacher_owned = teacher_str.to_string();
-                std::thread::spawn(move || {
-                    if let Err(e) = infer_api::serve_coordinator_http(
-                        &teacher_owned,
-                        "127.0.0.1",
-                        port,
-                        0,
-                        relay,
-                    ) {
-                        eprintln!("judge coordinator HTTP error: {e}");
-                    }
-                });
-                wait_for_port(port);
-                Some(FlashJudge::new_remote(
-                    format!("http://127.0.0.1:{port}"),
-                    args.max_verdict_tokens,
-                ))
+            let tp_size = crate::serve_multiproc::world_size_from_env();
+            if tp_size > 1 {
+                eprintln!("[arle train rubric-opd] spawning judge serve child (TP={tp_size})");
+                // The child inherits TP via its own env; the parent unsets the
+                // global vars so the student engine loads single-GPU.
+                unsafe {
+                    std::env::remove_var("INFER_TP_SIZE");
+                    std::env::remove_var("INFER_CUDA_DEVICES");
+                }
+                let server =
+                    JudgeServer::spawn(teacher_str, tp_size, judge_prompt_cap, judge_total)?;
+                let endpoint = server.endpoint().to_string();
+                judge_server = Some(server);
+                Some(FlashJudge::new_remote(endpoint, args.max_verdict_tokens))
             } else {
                 eprintln!(
-                    "[arle train rubric-opd] WARNING: model {} wants multi-GPU but world_size=1; loading in-process (may OOM)",
+                    "[arle train rubric-opd] WARNING: model {} wants multi-GPU but INFER_TP_SIZE=1; loading in-process (may OOM)",
                     teacher_dir.display()
                 );
                 let judge_engine =
@@ -652,6 +633,57 @@ pub(super) fn run_rubric_opd_impl(args: TrainRubricOpdArgs) -> Result<()> {
 }
 
 #[cfg(feature = "cuda")]
+struct JudgeServer {
+    child: std::process::Child,
+    endpoint: String,
+}
+
+#[cfg(feature = "cuda")]
+impl JudgeServer {
+    fn spawn(
+        model_path: &str,
+        tp_size: usize,
+        max_prompt_tokens: usize,
+        max_total_tokens: usize,
+    ) -> Result<Self> {
+        let port = free_port();
+        let exe = std::env::current_exe().context("current_exe")?;
+        let child = std::process::Command::new(exe)
+            .args([
+                "serve",
+                "--model-path",
+                model_path,
+                "--port",
+                &port.to_string(),
+                "--bind",
+                "127.0.0.1",
+                "--max-prompt-tokens",
+                &max_prompt_tokens.to_string(),
+                "--max-total-tokens",
+                &max_total_tokens.to_string(),
+            ])
+            .env("INFER_TP_SIZE", tp_size.to_string())
+            .spawn()
+            .context("spawn judge serve process")?;
+        let endpoint = format!("http://127.0.0.1:{port}");
+        wait_for_health(&endpoint)?;
+        Ok(Self { child, endpoint })
+    }
+
+    fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl Drop for JudgeServer {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+#[cfg(feature = "cuda")]
 fn free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0")
         .expect("bind free port")
@@ -661,12 +693,13 @@ fn free_port() -> u16 {
 }
 
 #[cfg(feature = "cuda")]
-fn wait_for_port(port: u16) {
-    for _ in 0..100 {
-        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
-            return;
+fn wait_for_health(endpoint: &str) -> Result<()> {
+    let url = format!("{endpoint}/health");
+    for _ in 0..600 {
+        if reqwest::blocking::get(&url).is_ok() {
+            return Ok(());
         }
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        std::thread::sleep(std::time::Duration::from_millis(500));
     }
-    panic!("judge coordinator HTTP on port {port} did not come up");
+    bail!("judge serve at {endpoint} did not become healthy")
 }
