@@ -277,7 +277,7 @@ where
         let (control_tx, control_rx) = mpsc::channel::<ControlMessage<E, K>>();
         let counters = Arc::new(Mutex::new(CounterSnapshot::default()));
         let loop_counters = Arc::clone(&counters);
-        let max_live_requests = executor.max_live_requests().max(1);
+        let max_live_requests = executor.step_limits().max_live_requests.max(1);
         let join = thread::Builder::new()
             .name("infer-engine".to_string())
             .spawn(move || {
@@ -571,13 +571,19 @@ where
     /// control seam, so the weight movement never races an in-flight forward
     /// step. Blocks until the round-trip completes.
     pub fn offload_engine_weights(&self) -> Result<usize> {
-        self.run_on_executor(|executor| executor.offload_weights())?
+        self.run_on_executor(|executor| match executor.weight_residency() {
+            Some(residency) => residency.offload_weights(),
+            None => Ok(0),
+        })?
     }
 
     /// Reload the engine's device weights from the host snapshot (OPD teacher
     /// weight time-share). Blocks until the H2D round-trip completes.
     pub fn reload_engine_weights(&self) -> Result<()> {
-        self.run_on_executor(|executor| executor.reload_weights())?
+        self.run_on_executor(|executor| match executor.weight_residency() {
+            Some(residency) => residency.reload_weights(),
+            None => Ok(()),
+        })?
     }
 
     /// Release the engine's inference forward scratch WITHOUT offloading weights or
@@ -585,25 +591,34 @@ where
     /// (between scheduler steps) via the out-of-band control seam, so the release
     /// never races an in-flight forward step. Blocks until the round-trip completes.
     pub fn release_inference_scratch(&self) -> Result<()> {
-        self.run_on_executor(|executor| executor.release_inference_scratch())?
+        self.run_on_executor(|executor| match executor.weight_residency() {
+            Some(residency) => residency.release_inference_scratch(),
+            None => Ok(()),
+        })?
     }
 
     /// Drop the engine's KV pool WITHOUT offloading weights (OPD writeback
     /// headroom). Runs on the engine thread via the control seam, so it never
     /// races an in-flight forward. Blocks until the round-trip completes.
     pub fn release_kv_pool(&self) -> Result<()> {
-        self.run_on_executor(|executor| executor.release_kv_pool())?
+        self.run_on_executor(|executor| match executor.weight_residency() {
+            Some(residency) => residency.release_kv_pool(),
+            None => Ok(()),
+        })?
     }
 
     pub fn ensure_kv_pool(&self) -> Result<()> {
-        self.run_on_executor(|executor| executor.ensure_kv_pool())?
+        self.run_on_executor(|executor| match executor.weight_residency() {
+            Some(residency) => residency.ensure_kv_pool(),
+            None => Ok(()),
+        })?
     }
 
     /// Re-acquire the engine's KV pool, then resume admission atomically on the
     /// engine thread. A failed ensure leaves the engine quiesced.
     pub fn ensure_kv_pool_and_resume_admissions(&self) -> Result<()> {
         self.run_on_engine(|engine| {
-            engine.executor_mut().ensure_kv_pool()?;
+            engine.ensure_kv_pool()?;
             engine.resume_serving();
             Ok(())
         })?
@@ -797,13 +812,14 @@ fn serve_handle_relay_driver<E, K>(
                 for req in rx {
                     let serve_clone = std::sync::Arc::clone(&serve_mm);
                     std::thread::spawn(move || {
-                        let result = serve_clone.run_on_executor(move |e| {
-                            e.generate_multimodal(
+                        let result = serve_clone.run_on_executor(move |e| match e.multimodal() {
+                            Some(mm) => mm.generate_multimodal(
                                 &req.prompt_tokens,
                                 &req.images,
                                 req.max_tokens,
                                 &req.sampling,
-                            )
+                            ),
+                            None => Ok(None),
                         });
                         let delta = match result {
                             Ok(Ok(Some(out))) => multiproc_relay::RelayCompletionDelta {

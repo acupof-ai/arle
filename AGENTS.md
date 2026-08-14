@@ -31,8 +31,11 @@ Two backends plug into one seam (`infer_seam::{BackendExecutor, KvPool}`, two
 host-only traits): CUDA continuous batching (`cudarc` + vendored FlashMLA /
 DeepGEMM / DeepEP + TileLang AOT + native CUDA C) and Metal (`crates/mlx-sys`
 C++ bridge, packed varlen decode). One `infer_core::Engine<E, K>` drives both —
-**a new backend means implementing the two seam traits; scheduler / cache /
-server stay untouched.**
+**the seam is the engine's cost contract (submit/poll + `StepLimits` +
+explicit capability accessors): a new backend implements the core loop and
+declares its capabilities, and a family whose decode is not submit-poll
+shaped forks the loop (precedent: `diffusion_executor.rs`) rather than
+bending the trait.**
 
 Non-obvious ownership:
 - **`infer-*` owns serving/runtime truth.** The monolithic `infer/` crate was

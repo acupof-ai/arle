@@ -584,7 +584,8 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         mut config: SchedulerConfig,
         governor: Box<dyn ResourceGovernor>,
     ) -> Self {
-        let max_rows = executor.max_rows_per_step().max(1);
+        let limits = executor.step_limits();
+        let max_rows = limits.max_rows_per_step.max(1);
         if config.num_slots > max_rows {
             log::warn!(
                 "executor caps rows per step at {max_rows}; scheduler slots {} -> {max_rows}",
@@ -594,7 +595,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         }
         // Per-forward token cap (deepep_ll LL dispatch buffer): clamp num_slots so
         // a pure-decode forward (one token per slot) never exceeds it.
-        let max_tokens_per_step = executor.max_tokens_per_step().max(1);
+        let max_tokens_per_step = limits.max_tokens_per_step.max(1);
         config.num_slots = config.num_slots.min(max_tokens_per_step);
         config.num_slots = config.num_slots.max(1);
         if let Some(cap) = config.max_running_requests
@@ -657,7 +658,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
     /// Frontend live-request capacity requested by the backend executor.
     #[must_use]
     pub fn max_live_requests(&self) -> usize {
-        self.executor.max_live_requests().max(1)
+        self.executor.step_limits().max_live_requests.max(1)
     }
 
     /// Run backend warmup exactly once.
@@ -688,7 +689,10 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
     /// # Errors
     /// Propagates any error returned by the backend executor's offload.
     pub fn offload_engine_weights(&mut self) -> Result<usize> {
-        self.executor.offload_weights()
+        match self.executor.weight_residency() {
+            Some(residency) => residency.offload_weights(),
+            None => Ok(0),
+        }
     }
 
     /// Restore the backend's device weights from the host snapshot (OPD teacher
@@ -697,7 +701,10 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
     /// # Errors
     /// Propagates any error returned by the backend executor's reload.
     pub fn reload_engine_weights(&mut self) -> Result<()> {
-        self.executor.reload_weights()
+        match self.executor.weight_residency() {
+            Some(residency) => residency.reload_weights(),
+            None => Ok(()),
+        }
     }
 
     /// Release the backend's inference forward scratch (workspace / batched-decode /
@@ -709,7 +716,10 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
     /// # Errors
     /// Propagates any error returned by the backend executor's scratch release.
     pub fn release_inference_scratch(&mut self) -> Result<()> {
-        self.executor.release_inference_scratch()
+        match self.executor.weight_residency() {
+            Some(residency) => residency.release_inference_scratch(),
+            None => Ok(()),
+        }
     }
 
     /// Drop the backend's KV pool WITHOUT offloading weights (OPD writeback
@@ -720,7 +730,10 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
     /// # Errors
     /// Propagates any error returned by the backend executor's pool release.
     pub fn release_kv_pool(&mut self) -> Result<()> {
-        self.executor.release_kv_pool()
+        match self.executor.weight_residency() {
+            Some(residency) => residency.release_kv_pool(),
+            None => Ok(()),
+        }
     }
 
     /// Re-acquire the KV pool dropped by [`Self::release_kv_pool`] before the next
@@ -729,7 +742,10 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
     /// # Errors
     /// Propagates any error returned by the backend executor's pool re-acquire.
     pub fn ensure_kv_pool(&mut self) -> Result<()> {
-        self.executor.ensure_kv_pool()
+        match self.executor.weight_residency() {
+            Some(residency) => residency.ensure_kv_pool(),
+            None => Ok(()),
+        }
     }
 
     /// Submit a normal-priority request into the waiting queue.
@@ -1016,40 +1032,52 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
     /// Cumulative speculative-decode counters from the backend executor.
     #[must_use]
     pub fn spec_decode_stats(&self) -> infer_seam::SpecDecodeStats {
-        self.executor.spec_decode_stats()
+        self.executor.stats().spec_decode
     }
 
     /// Cumulative operator-policy identity and dispatch counters from the backend.
     #[must_use]
     pub fn operator_dispatch_stats(&self) -> infer_seam::OperatorDispatchStats {
-        self.executor.operator_dispatch_stats()
+        self.executor.stats().operator_dispatch
     }
 
     #[must_use]
     pub fn op_timing_stats(&self) -> infer_seam::OpTimingStats {
-        self.executor.op_timing_stats()
+        self.executor.stats().op_timing
     }
 
     /// Exact backend artifact identity, if the build verified one.
     #[must_use]
     pub fn artifact_identity(&self) -> infer_seam::BackendArtifactIdentity {
-        self.executor.artifact_identity()
+        self.executor.stats().artifact
     }
 
     #[must_use]
-    pub fn kv_system_metrics(&self) -> KvSystemMetrics {
+    pub fn kv_system_metrics(&mut self) -> KvSystemMetrics {
         let mut metrics = self.kv_system_metrics;
         metrics.resident_pages = self.kv.resident_pages();
         metrics.resident_evictable_pages = self.kv.resident_evictable_pages();
-        metrics.host_demoted_pages = self.executor.kv_tier_host_demoted_pages();
+        let (host_demoted_pages, disk_pages, tier_hits, io) = match self.executor.kv_page_tier() {
+            Some(tier) => (
+                tier.kv_tier_host_demoted_pages(),
+                tier.kv_tier_disk_pages(),
+                tier.kv_tier_read_hits(),
+                tier.kv_tier_io_stats(),
+            ),
+            None => (
+                0,
+                0,
+                infer_seam::KvTierReadHits::default(),
+                infer_seam::KvTierIoStats::default(),
+            ),
+        };
+        metrics.host_demoted_pages = host_demoted_pages;
         metrics.host_demoted_pending_inflight = 0;
-        metrics.disk_pages = self.executor.kv_tier_disk_pages();
-        let tier_hits = self.executor.kv_tier_read_hits();
+        metrics.disk_pages = disk_pages;
         metrics.reuse_hit_host_demoted = metrics
             .reuse_hit_host_demoted
             .saturating_add(tier_hits.host_demoted);
         metrics.reuse_hit_disk = metrics.reuse_hit_disk.saturating_add(tier_hits.disk);
-        let io = self.executor.kv_tier_io_stats();
         metrics.tier_io_mode = io.mode;
         metrics.tier_io_useful_read_bytes = io.useful_read_bytes;
         metrics.tier_io_useful_write_bytes = io.useful_write_bytes;
@@ -1114,8 +1142,10 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
     /// so it cannot leak — restore_swapped_slot (planner.rs) is the only other
     /// release path — then record the Abort completion.
     fn abort_waiter(&mut self, request: RequestState) {
-        if let Some(key) = request.swap_key {
-            self.executor.drop_kv_slot_entries(&[key]);
+        if let Some(key) = request.swap_key
+            && let Some(tier) = self.executor.kv_slot_tier()
+        {
+            tier.drop_kv_slot_entries(&[key]);
         }
         self.record_completed(
             request.handle,
@@ -1313,7 +1343,9 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
     fn free_slot_pages(&mut self, slot: usize) {
         let pages = self.kv.page_indices(slot).to_vec();
         self.kv.free_slot(slot);
-        self.executor.release_provisional_prefix_pages(&pages);
+        if let Some(reuse) = self.executor.prefix_reuse() {
+            reuse.release_provisional_prefix_pages(&pages);
+        }
         self.executor.release_kv_slot(slot);
     }
 
@@ -1339,9 +1371,8 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         // path the prefill publish rides). Best-effort; default no-op (only DSv4
         // under --dsv4-decode-reuse captures).
         let slot_pages = self.kv.page_indices(slot).to_vec();
-        if let Err(err) = self
-            .executor
-            .capture_finish_frontier(slot, &full_tokens, &slot_pages)
+        if let Some(reuse) = self.executor.prefix_reuse()
+            && let Err(err) = reuse.capture_finish_frontier(slot, &full_tokens, &slot_pages)
         {
             log::warn!("finish frontier capture failed for slot {slot}: {err:#}");
         }
@@ -1521,7 +1552,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         // waiters may rotate in by parking the longest-running decode's
         // whole-slot image. Executor capacity stays independent from this cap.
         if self.config.slot_oversubscription
-            && self.executor.kv_slot_tier_enabled()
+            && self.executor.kv_slot_tier().is_some()
             && self.active.len() >= running_cap
         {
             self.admit_via_oversubscription(
@@ -1556,7 +1587,12 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         let reuse_matched_len = if self.config.enable_prefix_cache {
             let committed = candidate.committed_cow();
             let matched = self.radix.peek_longest_prefix_match(&committed);
-            let prefix_match = self.clamp_prefix_to_backend(matched, &committed);
+            let prefix_match = Self::clamp_prefix_to_backend(
+                &mut self.executor,
+                self.radix.block_size(),
+                matched,
+                &committed,
+            );
             // Backends without page-radix reuse (DSv4) may still hold a
             // position-0 whole-slot prefix image. The page route reports
             // `matched_len == 0` for them, so budget the prefill/pages against
@@ -1567,9 +1603,12 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             // the cached-prefix attach path, so the cached length is
             // irrelevant to their prefill (which is 0).
             let cached = if candidate.swap_key.is_none() {
-                self.executor
-                    .cached_prefix_match_len(&committed)?
-                    .min(committed.len())
+                match self.executor.prefix_reuse() {
+                    Some(reuse) => reuse
+                        .cached_prefix_match_len(&committed)?
+                        .min(committed.len()),
+                    None => 0,
+                }
             } else {
                 0
             };
@@ -1758,7 +1797,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         // rows park/shed; later fitting rows keep running (a stuck row must
         // not starve the rest of the batch). Inert backends skip the gate —
         // no demand rows are built.
-        if self.executor.kv_device_gate_active() {
+        if self.executor.device_kv_fit().is_some() {
             let page_size = self.kv.page_size();
             self.device_demand_scratch.clear();
             self.device_unfit_scratch.clear();
@@ -1774,8 +1813,9 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
                     target_tokens: row.total_tokens,
                     pages_hint: row.tokens.len().div_ceil(page_size) + 1,
                 }));
-            self.executor
-                .kv_device_fit(&self.device_demand_scratch, &mut self.device_unfit_scratch);
+            if let Some(fit) = self.executor.device_kv_fit() {
+                fit.kv_device_fit(&self.device_demand_scratch, &mut self.device_unfit_scratch);
+            }
             if !self.device_unfit_scratch.is_empty() {
                 let mut idx = 0;
                 plan.decode_rows.retain(|row| {
@@ -1806,7 +1846,9 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             }
         }
         plan.decode_rows.retain(|row| {
-            match self.alloc_with_prefix_reclaim(row.slot, self.executor.spec_row_tokens()) {
+            match self
+                .alloc_with_prefix_reclaim(row.slot, self.executor.step_limits().spec_row_tokens)
+            {
                 Ok(()) => true,
                 Err(err) => {
                     log::warn!(

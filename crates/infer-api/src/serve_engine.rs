@@ -261,7 +261,7 @@ where
         }
         let multimodal_kind = self
             .serve
-            .run_on_executor(|executor| executor.multimodal_kind())
+            .run_on_executor(|executor| executor.multimodal().and_then(|mm| mm.multimodal_kind()))
             .unwrap_or(None);
         let images = req
             .messages
@@ -308,9 +308,14 @@ where
         let exec_images = images;
         let sampling = req.sampling.clone();
         let max_tokens = req.max_tokens;
-        let output = self.serve.run_on_executor(move |executor| {
-            executor.generate_multimodal(&exec_prompt, &exec_images, max_tokens, &sampling)
-        })??;
+        let output =
+            self.serve
+                .run_on_executor(move |executor| match executor.multimodal() {
+                    Some(mm) => {
+                        mm.generate_multimodal(&exec_prompt, &exec_images, max_tokens, &sampling)
+                    }
+                    None => Ok(None),
+                })??;
         let output =
             output.ok_or_else(|| anyhow!("backend does not expose multimodal chat completion"))?;
         let response_token_ids = output.generated_tokens;

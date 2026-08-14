@@ -641,95 +641,101 @@ impl BackendExecutor for CudaExecutor {
         }
     }
 
-    fn kv_tier_capacity_pages(&self) -> usize {
+    fn model_stop_token_ids(&self) -> Vec<u32> {
         match &self.inner {
-            CudaExecutorInner::Placeholder => 0,
+            CudaExecutorInner::Placeholder => Vec::new(),
             #[cfg(feature = "cuda")]
-            CudaExecutorInner::Real(real) => real.kv_tier_capacity_pages(),
+            CudaExecutorInner::Real(real) => real.model_stop_token_ids(),
         }
     }
 
-    fn kv_tier_page_bytes(&self) -> usize {
+    fn step_limits(&self) -> infer_seam::StepLimits {
         match &self.inner {
-            CudaExecutorInner::Placeholder => 0,
+            CudaExecutorInner::Placeholder => infer_seam::StepLimits::default(),
             #[cfg(feature = "cuda")]
-            CudaExecutorInner::Real(real) => real.kv_tier_page_bytes(),
+            CudaExecutorInner::Real(real) => infer_seam::StepLimits {
+                max_tokens_per_step: real.max_tokens_per_step(),
+                max_prefill_chunk: real.max_prefill_chunk(),
+                prefill_restore_boundary_alignment: real.prefill_restore_boundary_alignment(),
+                spec_row_tokens: real.spec_row_tokens(),
+                ..infer_seam::StepLimits::default()
+            },
         }
     }
 
-    fn kv_tier_host_demoted_pages(&self) -> usize {
-        match &self.inner {
-            CudaExecutorInner::Placeholder => 0,
+    fn stats(&self) -> infer_seam::BackendStats {
+        let (spec_decode, operator_dispatch, op_timing) = match &self.inner {
+            CudaExecutorInner::Placeholder => Default::default(),
             #[cfg(feature = "cuda")]
-            CudaExecutorInner::Real(real) => real.kv_tier_host_demoted_pages(),
+            CudaExecutorInner::Real(real) => (
+                real.spec_decode_stats(),
+                real.operator_dispatch_stats(),
+                real.op_timing_stats(),
+            ),
+        };
+        infer_seam::BackendStats {
+            spec_decode,
+            operator_dispatch,
+            op_timing,
+            artifact: infer_seam::BackendArtifactIdentity {
+                kernel_bundle_id: cuda_kernels::KERNEL_BUILD_ID.to_string(),
+            },
         }
     }
 
-    fn spec_decode_stats(&self) -> infer_seam::SpecDecodeStats {
+    fn tp_sync_min(&self, local: usize) -> anyhow::Result<usize> {
         match &self.inner {
-            CudaExecutorInner::Placeholder => infer_seam::SpecDecodeStats::default(),
+            CudaExecutorInner::Placeholder => Ok(local),
             #[cfg(feature = "cuda")]
-            CudaExecutorInner::Real(real) => real.spec_decode_stats(),
+            CudaExecutorInner::Real(real) => real.tp_sync_min(local),
         }
     }
 
-    fn operator_dispatch_stats(&self) -> infer_seam::OperatorDispatchStats {
-        match &self.inner {
-            CudaExecutorInner::Placeholder => infer_seam::OperatorDispatchStats::default(),
-            #[cfg(feature = "cuda")]
-            CudaExecutorInner::Real(real) => real.operator_dispatch_stats(),
-        }
-    }
-
-    fn op_timing_stats(&self) -> infer_seam::OpTimingStats {
-        match &self.inner {
-            CudaExecutorInner::Placeholder => infer_seam::OpTimingStats::default(),
-            #[cfg(feature = "cuda")]
-            CudaExecutorInner::Real(real) => real.op_timing_stats(),
-        }
-    }
-
-    fn artifact_identity(&self) -> infer_seam::BackendArtifactIdentity {
-        infer_seam::BackendArtifactIdentity {
-            kernel_bundle_id: cuda_kernels::KERNEL_BUILD_ID.to_string(),
-        }
-    }
-
-    fn kv_tier_disk_pages(&self) -> usize {
-        match &self.inner {
-            CudaExecutorInner::Placeholder => 0,
-            #[cfg(feature = "cuda")]
-            CudaExecutorInner::Real(real) => real.kv_tier_disk_pages(),
-        }
-    }
-
-    fn kv_tier_read_hits(&self) -> infer_seam::KvTierReadHits {
-        match &self.inner {
-            CudaExecutorInner::Placeholder => infer_seam::KvTierReadHits::default(),
-            #[cfg(feature = "cuda")]
-            CudaExecutorInner::Real(real) => real.kv_tier_read_hits(),
-        }
-    }
-
-    fn kv_tier_io_stats(&self) -> infer_seam::KvTierIoStats {
-        match &self.inner {
-            CudaExecutorInner::Placeholder => infer_seam::KvTierIoStats::default(),
-            #[cfg(feature = "cuda")]
-            CudaExecutorInner::Real(real) => real.kv_tier_io_stats(),
-        }
-    }
-
-    fn kv_tier_location(&self, key: u64) -> Option<KvTierLocation> {
-        match &self.inner {
+    fn release_kv_slot(&mut self, slot: usize) {
+        match &mut self.inner {
             CudaExecutorInner::Placeholder => {
-                let _ = key;
-                None
+                let _ = slot;
             }
             #[cfg(feature = "cuda")]
-            CudaExecutorInner::Real(real) => real.kv_tier_location(key),
+            CudaExecutorInner::Real(real) => real.release_kv_slot(slot),
         }
     }
 
+    fn prefix_reuse(&mut self) -> Option<&mut dyn infer_seam::PrefixReuse> {
+        Some(self)
+    }
+
+    fn kv_page_tier(&mut self) -> Option<&mut dyn infer_seam::KvPageTier> {
+        Some(self)
+    }
+
+    fn kv_slot_tier(&mut self) -> Option<&mut dyn infer_seam::KvSlotTier> {
+        // Presence replaces the old `kv_slot_tier_enabled` bool: only models
+        // with a whole-slot store expose the capability.
+        let enabled = match &self.inner {
+            CudaExecutorInner::Placeholder => false,
+            #[cfg(feature = "cuda")]
+            CudaExecutorInner::Real(real) => real.kv_slot_tier_enabled(),
+        };
+        if enabled { Some(self) } else { None }
+    }
+
+    fn device_kv_fit(&self) -> Option<&dyn infer_seam::DeviceKvFit> {
+        // Presence replaces the old `kv_device_gate_active` bool.
+        let active = match &self.inner {
+            CudaExecutorInner::Placeholder => false,
+            #[cfg(feature = "cuda")]
+            CudaExecutorInner::Real(real) => real.kv_device_gate_active(),
+        };
+        if active { Some(self) } else { None }
+    }
+
+    fn weight_residency(&mut self) -> Option<&mut dyn infer_seam::WeightResidency> {
+        Some(self)
+    }
+}
+
+impl infer_seam::PrefixReuse for CudaExecutor {
     fn reusable_prefix_blocks(&self, blocks: &[PrefixBlock]) -> usize {
         match &self.inner {
             CudaExecutorInner::Placeholder => {
@@ -752,115 +758,23 @@ impl BackendExecutor for CudaExecutor {
         }
     }
 
-    fn prefill_restore_boundary_alignment(&self) -> usize {
-        match &self.inner {
-            CudaExecutorInner::Placeholder => 1,
-            #[cfg(feature = "cuda")]
-            CudaExecutorInner::Real(real) => real.prefill_restore_boundary_alignment(),
-        }
-    }
-
-    fn max_prefill_chunk(&self) -> usize {
-        match &self.inner {
-            CudaExecutorInner::Placeholder => usize::MAX,
-            #[cfg(feature = "cuda")]
-            CudaExecutorInner::Real(real) => real.max_prefill_chunk(),
-        }
-    }
-
-    fn model_stop_token_ids(&self) -> Vec<u32> {
-        match &self.inner {
-            CudaExecutorInner::Placeholder => Vec::new(),
-            #[cfg(feature = "cuda")]
-            CudaExecutorInner::Real(real) => real.model_stop_token_ids(),
-        }
-    }
-
-    fn max_tokens_per_step(&self) -> usize {
-        match &self.inner {
-            CudaExecutorInner::Placeholder => usize::MAX,
-            #[cfg(feature = "cuda")]
-            CudaExecutorInner::Real(real) => real.max_tokens_per_step(),
-        }
-    }
-
-    fn spec_row_tokens(&self) -> usize {
-        match &self.inner {
-            CudaExecutorInner::Placeholder => 1,
-            #[cfg(feature = "cuda")]
-            CudaExecutorInner::Real(real) => real.spec_row_tokens(),
-        }
-    }
-
-    fn demote_prefix_pages(&mut self, entries: &[(u32, u64)]) -> anyhow::Result<usize> {
+    fn release_prefix_pages(&mut self, pages: &[u32]) {
         match &mut self.inner {
             CudaExecutorInner::Placeholder => {
-                let _ = entries;
-                Ok(0)
+                let _ = pages;
             }
             #[cfg(feature = "cuda")]
-            CudaExecutorInner::Real(real) => real.demote_prefix_pages(entries),
+            CudaExecutorInner::Real(real) => real.release_prefix_pages(pages),
         }
     }
 
-    fn promote_prefix_pages(&mut self, entries: &[(u64, u32)]) -> anyhow::Result<()> {
+    fn release_provisional_prefix_pages(&mut self, pages: &[u32]) {
         match &mut self.inner {
             CudaExecutorInner::Placeholder => {
-                let _ = entries;
-                anyhow::bail!("placeholder CUDA executor has no KV tier store")
+                let _ = pages;
             }
             #[cfg(feature = "cuda")]
-            CudaExecutorInner::Real(real) => real.promote_prefix_pages(entries),
-        }
-    }
-
-    fn drop_kv_tier_entries(&mut self, keys: &[u64]) {
-        match &mut self.inner {
-            CudaExecutorInner::Placeholder => {
-                let _ = keys;
-            }
-            #[cfg(feature = "cuda")]
-            CudaExecutorInner::Real(real) => real.drop_kv_tier_entries(keys),
-        }
-    }
-
-    fn kv_slot_tier_enabled(&self) -> bool {
-        match &self.inner {
-            CudaExecutorInner::Placeholder => false,
-            #[cfg(feature = "cuda")]
-            CudaExecutorInner::Real(real) => real.kv_slot_tier_enabled(),
-        }
-    }
-
-    fn demote_slot(&mut self, slot: usize, key: u64) -> anyhow::Result<bool> {
-        match &mut self.inner {
-            CudaExecutorInner::Placeholder => {
-                let _ = (slot, key);
-                Ok(false)
-            }
-            #[cfg(feature = "cuda")]
-            CudaExecutorInner::Real(real) => real.demote_slot(slot, key),
-        }
-    }
-
-    fn promote_slot(&mut self, key: u64, slot: usize, slot_pages: &[u32]) -> anyhow::Result<()> {
-        match &mut self.inner {
-            CudaExecutorInner::Placeholder => {
-                let _ = (key, slot, slot_pages);
-                anyhow::bail!("placeholder CUDA executor has no whole-slot KV tier store")
-            }
-            #[cfg(feature = "cuda")]
-            CudaExecutorInner::Real(real) => real.promote_slot(key, slot, slot_pages),
-        }
-    }
-
-    fn drop_kv_slot_entries(&mut self, keys: &[u64]) {
-        match &mut self.inner {
-            CudaExecutorInner::Placeholder => {
-                let _ = keys;
-            }
-            #[cfg(feature = "cuda")]
-            CudaExecutorInner::Real(real) => real.drop_kv_slot_entries(keys),
+            CudaExecutorInner::Real(real) => real.release_provisional_prefix_pages(pages),
         }
     }
 
@@ -872,14 +786,6 @@ impl BackendExecutor for CudaExecutor {
             }
             #[cfg(feature = "cuda")]
             CudaExecutorInner::Real(real) => real.cached_prefix_match_len(tokens),
-        }
-    }
-
-    fn tp_sync_min(&self, local: usize) -> anyhow::Result<usize> {
-        match &self.inner {
-            CudaExecutorInner::Placeholder => Ok(local),
-            #[cfg(feature = "cuda")]
-            CudaExecutorInner::Real(real) => real.tp_sync_min(local),
         }
     }
 
@@ -969,45 +875,140 @@ impl BackendExecutor for CudaExecutor {
             ),
         }
     }
+}
 
-    fn release_prefix_pages(&mut self, pages: &[u32]) {
-        match &mut self.inner {
-            CudaExecutorInner::Placeholder => {
-                let _ = pages;
-            }
-            #[cfg(feature = "cuda")]
-            CudaExecutorInner::Real(real) => real.release_prefix_pages(pages),
-        }
-    }
-
-    fn release_provisional_prefix_pages(&mut self, pages: &[u32]) {
-        match &mut self.inner {
-            CudaExecutorInner::Placeholder => {
-                let _ = pages;
-            }
-            #[cfg(feature = "cuda")]
-            CudaExecutorInner::Real(real) => real.release_provisional_prefix_pages(pages),
-        }
-    }
-
-    fn release_kv_slot(&mut self, slot: usize) {
-        match &mut self.inner {
-            CudaExecutorInner::Placeholder => {
-                let _ = slot;
-            }
-            #[cfg(feature = "cuda")]
-            CudaExecutorInner::Real(real) => real.release_kv_slot(slot),
-        }
-    }
-
-    fn kv_device_gate_active(&self) -> bool {
+impl infer_seam::KvPageTier for CudaExecutor {
+    fn kv_tier_capacity_pages(&self) -> usize {
         match &self.inner {
-            CudaExecutorInner::Placeholder => false,
+            CudaExecutorInner::Placeholder => 0,
             #[cfg(feature = "cuda")]
-            CudaExecutorInner::Real(real) => real.kv_device_gate_active(),
+            CudaExecutorInner::Real(real) => real.kv_tier_capacity_pages(),
         }
     }
 
+    fn kv_tier_page_bytes(&self) -> usize {
+        match &self.inner {
+            CudaExecutorInner::Placeholder => 0,
+            #[cfg(feature = "cuda")]
+            CudaExecutorInner::Real(real) => real.kv_tier_page_bytes(),
+        }
+    }
+
+    fn kv_tier_host_demoted_pages(&self) -> usize {
+        match &self.inner {
+            CudaExecutorInner::Placeholder => 0,
+            #[cfg(feature = "cuda")]
+            CudaExecutorInner::Real(real) => real.kv_tier_host_demoted_pages(),
+        }
+    }
+
+    fn kv_tier_disk_pages(&self) -> usize {
+        match &self.inner {
+            CudaExecutorInner::Placeholder => 0,
+            #[cfg(feature = "cuda")]
+            CudaExecutorInner::Real(real) => real.kv_tier_disk_pages(),
+        }
+    }
+
+    fn kv_tier_read_hits(&self) -> infer_seam::KvTierReadHits {
+        match &self.inner {
+            CudaExecutorInner::Placeholder => infer_seam::KvTierReadHits::default(),
+            #[cfg(feature = "cuda")]
+            CudaExecutorInner::Real(real) => real.kv_tier_read_hits(),
+        }
+    }
+
+    fn kv_tier_io_stats(&self) -> infer_seam::KvTierIoStats {
+        match &self.inner {
+            CudaExecutorInner::Placeholder => infer_seam::KvTierIoStats::default(),
+            #[cfg(feature = "cuda")]
+            CudaExecutorInner::Real(real) => real.kv_tier_io_stats(),
+        }
+    }
+
+    fn kv_tier_transfer_is_zero_copy(&self) -> bool {
+        false
+    }
+
+    fn kv_tier_location(&self, key: u64) -> Option<KvTierLocation> {
+        match &self.inner {
+            CudaExecutorInner::Placeholder => {
+                let _ = key;
+                None
+            }
+            #[cfg(feature = "cuda")]
+            CudaExecutorInner::Real(real) => real.kv_tier_location(key),
+        }
+    }
+
+    fn demote_prefix_pages(&mut self, entries: &[(u32, u64)]) -> anyhow::Result<usize> {
+        match &mut self.inner {
+            CudaExecutorInner::Placeholder => {
+                let _ = entries;
+                Ok(0)
+            }
+            #[cfg(feature = "cuda")]
+            CudaExecutorInner::Real(real) => real.demote_prefix_pages(entries),
+        }
+    }
+
+    fn promote_prefix_pages(&mut self, entries: &[(u64, u32)]) -> anyhow::Result<()> {
+        match &mut self.inner {
+            CudaExecutorInner::Placeholder => {
+                let _ = entries;
+                anyhow::bail!("placeholder CUDA executor has no KV tier store")
+            }
+            #[cfg(feature = "cuda")]
+            CudaExecutorInner::Real(real) => real.promote_prefix_pages(entries),
+        }
+    }
+
+    fn drop_kv_tier_entries(&mut self, keys: &[u64]) {
+        match &mut self.inner {
+            CudaExecutorInner::Placeholder => {
+                let _ = keys;
+            }
+            #[cfg(feature = "cuda")]
+            CudaExecutorInner::Real(real) => real.drop_kv_tier_entries(keys),
+        }
+    }
+}
+
+impl infer_seam::KvSlotTier for CudaExecutor {
+    fn demote_slot(&mut self, slot: usize, key: u64) -> anyhow::Result<bool> {
+        match &mut self.inner {
+            CudaExecutorInner::Placeholder => {
+                let _ = (slot, key);
+                Ok(false)
+            }
+            #[cfg(feature = "cuda")]
+            CudaExecutorInner::Real(real) => real.demote_slot(slot, key),
+        }
+    }
+
+    fn promote_slot(&mut self, key: u64, slot: usize, slot_pages: &[u32]) -> anyhow::Result<()> {
+        match &mut self.inner {
+            CudaExecutorInner::Placeholder => {
+                let _ = (key, slot, slot_pages);
+                anyhow::bail!("placeholder CUDA executor has no whole-slot KV tier store")
+            }
+            #[cfg(feature = "cuda")]
+            CudaExecutorInner::Real(real) => real.promote_slot(key, slot, slot_pages),
+        }
+    }
+
+    fn drop_kv_slot_entries(&mut self, keys: &[u64]) {
+        match &mut self.inner {
+            CudaExecutorInner::Placeholder => {
+                let _ = keys;
+            }
+            #[cfg(feature = "cuda")]
+            CudaExecutorInner::Real(real) => real.drop_kv_slot_entries(keys),
+        }
+    }
+}
+
+impl infer_seam::DeviceKvFit for CudaExecutor {
     fn kv_device_fit(&self, rows: &[infer_seam::DeviceRowDemand], unfit: &mut Vec<usize>) {
         match &self.inner {
             CudaExecutorInner::Placeholder => {
@@ -1017,7 +1018,9 @@ impl BackendExecutor for CudaExecutor {
             CudaExecutorInner::Real(real) => real.kv_device_fit(rows, unfit),
         }
     }
+}
 
+impl infer_seam::WeightResidency for CudaExecutor {
     fn offload_weights(&mut self) -> anyhow::Result<usize> {
         match &mut self.inner {
             // No real device weights to offload without the cuda backend.

@@ -44,8 +44,11 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
     /// a backend may only be able to restore KV plus side state at boundaries
     /// it explicitly snapshotted. Trim the match to the executor-reported
     /// reusable page count and re-prefill the tail.
+    /// Associated fn over `executor` + `block_size` so callers can keep other
+    /// `self` borrows (e.g. the waiting queue's committed stream) alive.
     pub(crate) fn clamp_prefix_to_backend(
-        &self,
+        executor: &mut E,
+        block_size: usize,
         mut prefix_match: PrefixMatch,
         tokens: &[u32],
     ) -> PrefixMatch {
@@ -57,15 +60,23 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             .collect();
         // `_for_prompt`: a finish-write-through frontier is reusable only when
         // `tokens` continues through the cached tail (the tail has no radix key).
-        let serveable = self
-            .executor
-            .reusable_prefix_blocks_for_prompt(&blocks, tokens)
-            .min(prefix_match.block_ids.len());
+        let serveable = match executor.prefix_reuse() {
+            Some(reuse) => reuse.reusable_prefix_blocks_for_prompt(&blocks, tokens),
+            None => 0,
+        }
+        .min(prefix_match.block_ids.len());
         if serveable < prefix_match.block_ids.len() {
             prefix_match.block_ids.truncate(serveable);
-            prefix_match.matched_len = serveable.saturating_mul(self.radix.block_size());
+            prefix_match.matched_len = serveable.saturating_mul(block_size);
         }
         prefix_match
+    }
+
+    /// Forward evicted prefix pages to the backend's prefix-reuse mirror drop.
+    pub(crate) fn executor_release_prefix_pages(&mut self, pages: &[u32]) {
+        if let Some(reuse) = self.executor.prefix_reuse() {
+            reuse.release_prefix_pages(pages);
+        }
     }
 
     /// `tokens` is the request's committed stream (prompt + generated, #156) —
@@ -97,7 +108,12 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             prefix_match.block_ids.pop();
             prefix_match.matched_len = prefix_match.block_ids.len() * self.radix.block_size();
         }
-        let prefix_match = self.clamp_prefix_to_backend(prefix_match, tokens);
+        let prefix_match = Self::clamp_prefix_to_backend(
+            &mut self.executor,
+            self.radix.block_size(),
+            prefix_match,
+            tokens,
+        );
         if prefix_match.is_empty() {
             self.record_prefix_restore_metrics(0);
             request.prefill_start_pos = 0;
@@ -144,12 +160,16 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         // full-attention-only backends. On miss, release the attached pages and fall
         // back to full recompute — a zeroed linear-attn state with non-zero full-attn
         // KV causes a cross-type mismatch that corrupts model output.
-        let restored = match self.executor.restore_prefix_sidecar(
-            slot,
-            tokens,
-            prefix_match.matched_len,
-            &prefix_match.block_ids,
-        ) {
+        let sidecar_restore = match self.executor.prefix_reuse() {
+            Some(reuse) => reuse.restore_prefix_sidecar(
+                slot,
+                tokens,
+                prefix_match.matched_len,
+                &prefix_match.block_ids,
+            ),
+            None => Ok(prefix_match.matched_len),
+        };
+        let restored = match sidecar_restore {
             Ok(restored) => restored,
             Err(err) => {
                 log::warn!(
@@ -304,10 +324,11 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             .copied()
             .map(PrefixBlock::ResidentPage)
             .collect();
-        publish_blocks = self
-            .executor
-            .reusable_prefix_blocks(&blocks)
-            .min(publish_blocks);
+        publish_blocks = match self.executor.prefix_reuse() {
+            Some(reuse) => reuse.reusable_prefix_blocks(&blocks),
+            None => 0,
+        }
+        .min(publish_blocks);
         if publish_blocks == 0 {
             return Vec::new();
         }
@@ -346,14 +367,16 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
                 .block_ids
         });
         let sidecar_pages = radix_pages.as_deref().unwrap_or(&pages[..publish_blocks]);
-        if let Err(err) = self.executor.save_prefix_sidecar(
-            slot,
-            tokens,
-            token_len,
-            sidecar_pages,
-            &pages[..publish_blocks],
-            &newly_cached,
-        ) {
+        if let Some(reuse) = self.executor.prefix_reuse()
+            && let Err(err) = reuse.save_prefix_sidecar(
+                slot,
+                tokens,
+                token_len,
+                sidecar_pages,
+                &pages[..publish_blocks],
+                &newly_cached,
+            )
+        {
             log::debug!("recurrent sidecar save failed for slot {slot}: {err:#}");
         }
         // Publishing over a demoted node revives it with the re-prefilled
@@ -374,7 +397,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             let demoted = self.try_demote_pages(&pages[offset..]);
             for &page in &pages[offset..offset + demoted] {
                 self.kv.release_pages(&[page]);
-                self.executor.release_prefix_pages(&[page]);
+                self.executor_release_prefix_pages(&[page]);
             }
             offset += demoted;
             if offset >= pages.len() {
@@ -393,7 +416,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
                 continue;
             }
             self.kv.release_pages(&[page]);
-            self.executor.release_prefix_pages(&[page]);
+            self.executor_release_prefix_pages(&[page]);
             offset += 1;
         }
         self.drain_dropped_tier_keys();
@@ -449,7 +472,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             };
             for &page in &victims[..demoted] {
                 self.kv.release_pages(&[page]);
-                self.executor.release_prefix_pages(&[page]);
+                self.executor_release_prefix_pages(&[page]);
             }
             if demoted > 0 {
                 continue;
@@ -460,7 +483,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
                     break;
                 }
                 self.kv.release_pages(&[page]);
-                self.executor.release_prefix_pages(&[page]);
+                self.executor_release_prefix_pages(&[page]);
                 severed += 1;
             }
             if severed == 0 {
@@ -501,7 +524,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             let pages = self.radix.evict_lru(resident);
             if !pages.is_empty() {
                 self.kv.release_pages(&pages);
-                self.executor.release_prefix_pages(&pages);
+                self.executor_release_prefix_pages(&pages);
             }
         }
         // 2. Drop every idle host-tier demoted block — also stale-epoch KV that
@@ -520,9 +543,11 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
     /// Host-tier capacity in pages; `0` disables every tier path. Tier use is
     /// gated on the prefix cache because demoted blocks are only reachable
     /// through radix prefix matches.
-    pub(crate) fn kv_tier_capacity(&self) -> usize {
+    pub(crate) fn kv_tier_capacity(&mut self) -> usize {
         if self.config.enable_prefix_cache {
-            self.executor.kv_tier_capacity_pages()
+            self.executor
+                .kv_page_tier()
+                .map_or(0, |tier| tier.kv_tier_capacity_pages())
         } else {
             0
         }
@@ -531,7 +556,10 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
     /// Copy pages into the backend host tier and mark accepted radix nodes
     /// demoted. Makes room by severing cold demoted blocks before the batch.
     fn try_demote_pages(&mut self, pages: &[BlockId]) -> usize {
-        let capacity = self.executor.kv_tier_capacity_pages();
+        let capacity = self
+            .executor
+            .kv_page_tier()
+            .map_or(0, |tier| tier.kv_tier_capacity_pages());
         if capacity == 0 || pages.is_empty() {
             return 0;
         }
@@ -569,9 +597,15 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         }
 
         let started = Instant::now();
-        let result = self.executor.demote_prefix_pages(&entries);
+        // capacity > 0 above proves the tier accessor is Some.
+        let (result, charge_copy) = match self.executor.kv_page_tier() {
+            Some(tier) => (
+                tier.demote_prefix_pages(&entries),
+                !tier.kv_tier_transfer_is_zero_copy(),
+            ),
+            None => (Ok(0), true),
+        };
         let elapsed_ms = elapsed_ms(started);
-        let charge_copy = !self.executor.kv_tier_transfer_is_zero_copy();
         self.kv_system_metrics.demote_mset_count =
             self.kv_system_metrics.demote_mset_count.saturating_add(1);
         if charge_copy {
@@ -588,7 +622,11 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             }
         };
         if charge_copy {
-            let bytes = (accepted as u64).saturating_mul(self.executor.kv_tier_page_bytes() as u64);
+            let page_bytes = self
+                .executor
+                .kv_page_tier()
+                .map_or(0, |tier| tier.kv_tier_page_bytes());
+            let bytes = (accepted as u64).saturating_mul(page_bytes as u64);
             self.kv_system_metrics.demote_mset_copy_bytes = self
                 .kv_system_metrics
                 .demote_mset_copy_bytes
@@ -608,7 +646,9 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
                     .iter()
                     .map(|&(_, stale_key)| stale_key)
                     .collect();
-                self.executor.drop_kv_tier_entries(&stale);
+                if let Some(tier) = self.executor.kv_page_tier() {
+                    tier.drop_kv_tier_entries(&stale);
+                }
                 break;
             }
         }
@@ -623,7 +663,12 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         if self.kv_tier_capacity() == 0 {
             let matched = self.radix.longest_prefix_match(tokens);
             let raw = matched.block_ids.len();
-            let clamped = self.clamp_prefix_to_backend(matched, tokens);
+            let clamped = Self::clamp_prefix_to_backend(
+                &mut self.executor,
+                self.radix.block_size(),
+                matched,
+                tokens,
+            );
             self.record_prefix_match_metrics(raw, clamped.block_ids.len());
             log::info!(
                 "prefix-lookup: prompt={} raw_blocks={raw} licensed_blocks={}",
@@ -638,10 +683,11 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             .take_while(|b| matches!(b, PrefixBlock::ResidentPage(_)))
             .count();
         let mut blocks = blocks_all;
-        let reusable = self
-            .executor
-            .reusable_prefix_blocks_for_prompt(&blocks, tokens)
-            .min(blocks.len());
+        let reusable = match self.executor.prefix_reuse() {
+            Some(reuse) => reuse.reusable_prefix_blocks_for_prompt(&blocks, tokens),
+            None => 0,
+        }
+        .min(blocks.len());
         self.record_prefix_match_metrics(blocks.len(), reusable);
         log::info!(
             "prefix-lookup(tier): prompt={} raw_blocks={} resident_run={resident} licensed_blocks={reusable}",
@@ -697,7 +743,11 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
                     self.kv_system_metrics.reuse_hit_resident =
                         self.kv_system_metrics.reuse_hit_resident.saturating_add(1);
                 }
-                PrefixBlock::DemotedKey(key) => match self.executor.kv_tier_location(key) {
+                PrefixBlock::DemotedKey(key) => match self
+                    .executor
+                    .kv_page_tier()
+                    .and_then(|tier| tier.kv_tier_location(key))
+                {
                     Some(KvTierLocation::HostDemoted) | None => {
                         self.kv_system_metrics.reuse_hit_host_demoted = self
                             .kv_system_metrics
@@ -735,9 +785,15 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             .collect();
 
         let started = Instant::now();
-        let result = self.executor.promote_prefix_pages(&promote_entries);
+        // Only reached through the tiered lookup, so the accessor is Some.
+        let (result, charge_copy) = match self.executor.kv_page_tier() {
+            Some(tier) => (
+                tier.promote_prefix_pages(&promote_entries),
+                !tier.kv_tier_transfer_is_zero_copy(),
+            ),
+            None => (Err(anyhow!("backend has no KV tier store")), true),
+        };
         let elapsed_ms = elapsed_ms(started);
-        let charge_copy = !self.executor.kv_tier_transfer_is_zero_copy();
         self.kv_system_metrics.promote_mget_count =
             self.kv_system_metrics.promote_mget_count.saturating_add(1);
         if charge_copy {
@@ -755,7 +811,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
                 "KV tier promote failed for {} pages: {err:#}; recomputing tail",
                 promote_entries.len()
             );
-            self.executor.release_prefix_pages(&promoted_pages);
+            self.executor_release_prefix_pages(&promoted_pages);
             self.kv.free_detached_pages(&promoted_pages);
             for &(key, _) in &promote_entries {
                 self.radix.drop_demoted(key);
@@ -769,8 +825,11 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             return leading_resident_pages(blocks);
         }
         if charge_copy {
-            let bytes = (promote_entries.len() as u64)
-                .saturating_mul(self.executor.kv_tier_page_bytes() as u64);
+            let page_bytes = self
+                .executor
+                .kv_page_tier()
+                .map_or(0, |tier| tier.kv_tier_page_bytes());
+            let bytes = (promote_entries.len() as u64).saturating_mul(page_bytes as u64);
             self.kv_system_metrics.promote_mget_copy_bytes = self
                 .kv_system_metrics
                 .promote_mget_copy_bytes
@@ -793,14 +852,16 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
                     } else {
                         self.kv_system_metrics.fallback_recompute =
                             self.kv_system_metrics.fallback_recompute.saturating_add(1);
-                        self.executor.release_prefix_pages(&[page]);
+                        self.executor_release_prefix_pages(&[page]);
                         self.kv.free_detached_pages(&[page]);
-                        self.executor.drop_kv_tier_entries(&[key]);
+                        if let Some(tier) = self.executor.kv_page_tier() {
+                            tier.drop_kv_tier_entries(&[key]);
+                        }
                         let tail_pages: Vec<_> = promote_entries[promoted_idx..]
                             .iter()
                             .map(|&(_, tail_page)| tail_page)
                             .collect();
-                        self.executor.release_prefix_pages(&tail_pages);
+                        self.executor_release_prefix_pages(&tail_pages);
                         self.kv.free_detached_pages(&tail_pages);
                         break;
                     }
@@ -815,8 +876,10 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
     /// path can leak a store entry.
     pub(crate) fn drain_dropped_tier_keys(&mut self) {
         let keys = self.radix.take_dropped_tier_keys();
-        if !keys.is_empty() {
-            self.executor.drop_kv_tier_entries(&keys);
+        if !keys.is_empty()
+            && let Some(tier) = self.executor.kv_page_tier()
+        {
+            tier.drop_kv_tier_entries(&keys);
         }
     }
 }
