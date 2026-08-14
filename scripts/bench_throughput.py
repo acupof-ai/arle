@@ -108,7 +108,8 @@ def synthetic_prompts(count: int, seed: int) -> list[str]:
 
 
 def repetition_error(text: str) -> str | None:
-    words = re.findall(r"\w+|[^\w\s]", text.casefold())
+    # CJK runs carry no whitespace; split per ideograph or the checks see one word.
+    words = re.findall(r"[぀-ヿ一-鿿]|\w+|[^\w\s]", text.casefold())
     if len(words) < 8:
         return None
     if len(set(words)) / len(words) <= 0.12:

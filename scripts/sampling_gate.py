@@ -42,19 +42,37 @@ def first_divergence(ref, out):
     return None if len(ref) == len(out) else n
 
 
-def dominance(out):
+def dominance(out, expect_text=None):
     toks = out.split()
     if not toks:
         return 0.0
     top = max(set(toks), key=toks.count)
+    # A dominant word that is not the biased token (degenerate repetition of
+    # something else) must not pass as a working veto.
+    if expect_text is not None and expect_text not in top:
+        return 0.0
     return toks.count(top) / len(toks)
+
+
+def fetch_spec_counters(base):
+    _, j = http_json(f"{base}/v1/stats", timeout=10)
+    body = j.get("body", j) if isinstance(j, dict) else j
+    if isinstance(body, str):
+        body = json.loads(body)
+    return body
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("port")
     ap.add_argument("--biased-token", type=int, default=73233)
+    ap.add_argument("--biased-text", default=None,
+                    help="decoded text of --biased-token; when set, the dominant word must contain it")
     ap.add_argument("--model", default=None)
+    ap.add_argument("--require-spec", action="store_true",
+                    help="fail unless spec decode drafted tokens DURING the arm window (per the wins-doc rule: text arm alone cannot prove penalties did not push requests off the spec path)")
+    ap.add_argument("--expect-binary-sha", default=None,
+                    help="fail unless /v1/stats product_binary_sha256 matches")
     args = ap.parse_args()
 
     base = f"http://127.0.0.1:{args.port}"
@@ -77,7 +95,12 @@ def main():
     rows = []
     ok = True
     ref_text = None
+    spec_before = None
     try:
+        try:
+            spec_before = fetch_spec_counters(base)
+        except Exception:
+            spec_before = None
         for name, extra in arms:
             st, r = http_json(f"{base}/v1/chat/completions", {**ask, **extra})
             out = decoded_text(r)
@@ -87,12 +110,13 @@ def main():
                 rows.append((name, st, "-", f"len={len(out)}", passed))
             elif name == "logit_bias":
                 div = first_divergence(ref_text, out)
-                dom = dominance(out)
-                passed = st == 200 and div is not None and div <= 2 and dom >= 0.5
+                dom = dominance(out, args.biased_text)
+                passed = st == 200 and len(out) > 0 and div is not None and div <= 2 and dom >= 0.5
                 rows.append((name, st, div, f"dom={dom:.2f}", passed))
             else:
                 div = first_divergence(ref_text, out)
-                passed = st == 200 and div is not None
+                # Empty output "diverges at 0" but demonstrates nothing.
+                passed = st == 200 and len(out) > 0 and div is not None
                 rows.append((name, st, div, f"len={len(out)}", passed))
             ok &= passed
 
@@ -110,17 +134,28 @@ def main():
 
     stats_line = "stats: unavailable"
     try:
-        _, j = http_json(f"{base}/v1/stats", timeout=10)
-        body = j.get("body", j) if isinstance(j, dict) else j
-        if isinstance(body, str):
-            body = json.loads(body)
+        body = fetch_spec_counters(base)
+        # Counters are cumulative since boot; only the delta across the arm
+        # window proves the arms themselves stayed on the spec path.
+        delta = {
+            k: (body.get(k) or 0) - ((spec_before or {}).get(k) or 0)
+            for k in ("chains", "drafted", "accepted")
+        }
+        sha = body.get("product_binary_sha256")
         stats_line = (
-            f"stats: chains={body.get('chains')} drafted={body.get('drafted')} "
-            f"accepted={body.get('accepted')} "
-            f"product_binary_sha256={body.get('product_binary_sha256')}"
+            f"stats: window delta chains={delta['chains']} drafted={delta['drafted']} "
+            f"accepted={delta['accepted']} product_binary_sha256={sha}"
         )
+        if args.require_spec and (spec_before is None or delta["drafted"] <= 0):
+            stats_line += " [FAIL: no spec engagement in window]"
+            ok = False
+        if args.expect_binary_sha and sha != args.expect_binary_sha:
+            stats_line += f" [FAIL: expected {args.expect_binary_sha}]"
+            ok = False
     except Exception as e:
         stats_line = f"stats: unavailable ({e})"
+        if args.require_spec or args.expect_binary_sha:
+            ok = False
 
     print(f"{'arm':<20} {'http':>4} {'diverge@':>8} {'detail':<12} verdict")
     for name, st, div, detail, passed in rows:
