@@ -20,7 +20,7 @@ use crate::{
 
 use super::{
     EngineOffloadMode, GkdLossConfig, GkdSftAnchor, OpdError, OpdKlMask, OpdStepProfile, Result,
-    backward_with_optional_profile, log_opd_window_trace,
+    backward_with_optional_profile, log_free_vram, log_opd_window_trace,
     loss::{kl_distill_loss_for_config, next_token_sft_loss_from_logits},
     map_qwen35_forward_error, map_teacher_forward_error, opd_backward_profile_enabled,
     print_backward_profile, record_profile, step_trace_enabled,
@@ -162,6 +162,7 @@ pub(super) fn backward_chunked_kl<T: TeacherForward + ?Sized>(
             freed as f64 / (1024.0 * 1024.0)
         );
     }
+    log_free_vram(store, "before_student_backward_forward");
 
     tape.set_enabled(true);
     let student_phase_started = Instant::now();
