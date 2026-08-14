@@ -1,6 +1,6 @@
 # w2s device-side gates and chunked KL regularizers — CUDA, 2026-08-14
 
-> Status: pending-remote
+> Status: Confirmed
 
 ## Goal
 
@@ -47,15 +47,57 @@ step skips and every stage runs:
 
 ## Results
 
-Pending-remote: CUDA unavailable locally; the Run phase executes the A/B on
-the pod. Both lanes typecheck clean
-(`cargo check -p train --release --no-default-features --features cuda,no-cuda`
-and `--features metal,no-cuda`).
+Run 2026-08-14, one H20 (GPU 0), 8 steps per arm, `--confidence-threshold
+0.99`, GSM8K `/host/gsm8k-train-wrong.jsonl`. Before arm build `w2s-before2`
+at `cb63dbe34`, after arm build `w2s-after-7b9b133` at `7b9b13393`; both
+`RUN_EXIT=0`. Steady-state means over steps 1–7:
+
+| Stage | Before s | After s | Delta |
+|-------|----------|---------|-------|
+| confidence | 0.284 | 0.000 | −100% |
+| consistency | 0.583 | 0.006 | −99.0% |
+| local_kl | 0.534 | 0.620 | +16% (one 0.988 outlier; 0.558 without it, wash) |
+| global_kl | 0.620 | 0.566 | −9% (one 1.175 outlier in before; wash without it) |
+| student_fwd | 0.528 | 0.533 | wash |
+| backward | 0.774 | 0.776 | wash |
+| aux_delta | 0.152 | 0.146 | wash |
+| kd_loss | 0.008 | 0.008 | wash |
+| cleanup | 0.110 | 0.070 | −36% |
+| total | 3.614 | 2.742 | −24.1% |
+
+Correctness:
+
+- Loss per step (before vs after): 25.158342/25.158342, 23.383511/23.387928,
+  20.914721/20.906494, 22.125345/22.108746, 19.475698/19.484320,
+  22.873857/22.870569, 22.877493/22.870110, 18.022076/18.020435 — max
+  divergence 0.017 (0.08%), within MoE-nondeterminism noise.
+- `max_prob` matches per step within 4e-4.
+- Skip-parity spot run at `--confidence-threshold 0.9` (8 steps, both arms):
+  identical trained set {0, 3} and skipped set {1, 2, 4, 5, 6, 7}.
 
 ## Problems
 
-None yet.
+- The reported `consistency` gate value shifted (step 0: 0.7372 before, 0.6442
+  after). The before path accumulated dot and norms in serial naive f32 over
+  the ~20M-element `[seq, vocab]` tensors; the after path uses device tree
+  reductions with an f64 host combine, which is the more accurate value. With
+  the default `consistency_threshold 0.0` no skip decision changes; a run
+  using a nonzero consistency threshold recalibrates against the new values.
+- The chunked regularizers did not beat the unchunked path: local_kl +
+  global_kl was 1.154 s before and 1.186 s after (each stage is dominated by
+  its 27B forward, ~0.53 s). The budget entry's 1.396 s combined figure was
+  not reproduced in the before arm either; the reachable KL-beyond-forward
+  saving at seq ~140 is within noise.
+- One mid-run failure: the shared `/host/arle-build` tree was re-synced and
+  rebuilt by a concurrent session between build and run, tripping the run
+  helper's binary-SHA check. Re-ran from a dedicated tree
+  (`POD_TREE=/host/arle-w2sab`).
 
 ## Learnings
 
-pending-remote.
+The win came from the two host-round-trip gates (0.87 s/step, −24.1% total),
+not from chunking the regularizers. Chunked KL only pays where the full-tensor
+KL materialization dominates the stage; here each regularizer stage is a 27B
+forward plus a small KL, so both KL paths are equivalent. kd_loss reached
+0.010 s in the budget entry because it has no forward, not because chunking is
+intrinsically ~60× cheaper.
