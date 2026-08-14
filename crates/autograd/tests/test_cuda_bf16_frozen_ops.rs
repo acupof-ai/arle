@@ -93,7 +93,10 @@ fn cuda_matmul_bt_accepts_frozen_bf16_rhs() {
         .collect();
     let expected_shape = vec![2, 3];
     assert_eq!(expected_shape, out_shape);
-    assert_close(&got, &expected, 2e-3, 2e-3);
+    // bf16 GEMM: GPU and CPU accumulation orders can round to adjacent bf16
+    // values (1 ULP ~= 0.016 at magnitude ~5), so the f32 tolerance must
+    // cover one bf16 ULP at the result magnitude.
+    assert_close(&got, &expected, 2e-2, 2e-3);
 }
 
 #[test]
