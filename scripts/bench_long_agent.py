@@ -25,7 +25,7 @@ try:
 except ImportError:
     sys.exit("pip install httpx")
 
-from arle_stats import message_text, unwrap_body
+from arle_stats import unwrap_body
 
 
 SYSTEM_PROMPT = (
@@ -161,7 +161,9 @@ async def run_scenario(client: httpx.AsyncClient, url: str, scenario: dict, max_
                     choices = chunk.get("choices", [])
                     if choices:
                         delta = choices[0].get("delta", {})
-                        content = message_text(delta)
+                        # Content-only on purpose: keeps TTFT/token metrics comparable
+                        # with pre-2ac78e5f3 recordings (reasoning deltas excluded).
+                        content = delta.get("content")
                         if content:
                             now = time.time()
                             if ttft is None:
