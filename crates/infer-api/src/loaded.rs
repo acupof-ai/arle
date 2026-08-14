@@ -161,6 +161,12 @@ pub struct EngineLoadConfig {
     /// (TDR/latency safety valve). `None` = whole token in one submit.
     #[serde(default)]
     pub vulkan_submit_cap: Option<usize>,
+    /// Explicit TP world size for this engine. `None` = resolve from
+    /// `INFER_TP_SIZE` / `INFER_CUDA_DEVICES` env (the legacy path).
+    /// Set this to give different engines different TP sizes in the same
+    /// process (e.g. a single-GPU student beside a multi-GPU judge).
+    #[serde(default)]
+    pub tp_size: Option<usize>,
 }
 
 fn default_dspark_sps_bias_ms() -> f32 {
@@ -236,6 +242,7 @@ impl Default for EngineLoadConfig {
             metal: infer_seam::MetalRuntimeFlags::default(),
             diffusion_max_denoising_steps: None,
             vulkan_submit_cap: None,
+            tp_size: None,
         }
     }
 }
@@ -2209,7 +2216,7 @@ mod backend {
         // L2 budget: deployment-total → per-rank share, resolved at the ONE
         // constructor every rank runs (world size is env-identical per rank, so
         // the division is lockstep-deterministic).
-        let world = tp_world_size();
+        let world = config.tp_size.unwrap_or_else(tp_world_size);
         let dram_rank_bytes = infer_cuda::resolve_dram_budget_bytes(config.kv_dram, world);
         executor.set_kv_tier_budget_bytes(dram_rank_bytes);
         // Opt-in L3 NVMe spill (`--kv-disk`): attached HERE so single-proc
