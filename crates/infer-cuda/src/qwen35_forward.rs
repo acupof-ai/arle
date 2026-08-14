@@ -945,7 +945,8 @@ impl Qwen35Model {
         crate::profile::profile_op(&self.ctx, "lm_head_gemm", None, seq_len, || {
             gemm_batch(&self.ctx, self.output_projection(), normed, &mut logits)
         })?;
-        self.ctx.sync()?;
+        // No sync: the caller's argmax_row_into reads these logits on the same
+        // stream — stream ordering already guarantees the GEMM completed (#198).
         let logits_vec = DeviceVec {
             data: logits.data,
             len: seq_len * vocab,
