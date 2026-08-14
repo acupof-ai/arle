@@ -353,6 +353,8 @@ pub(super) fn run_rubric_opd_impl(args: TrainRubricOpdArgs) -> Result<()> {
     // \boxed answer), freeing the ~35GB judge VRAM; teacher-model is ignored.
     // Multi-GPU models (DSv4, Qwen35 MoE) spawn a multiproc coordinator + workers
     // and the judge connects over HTTP; single-GPU models load in-process.
+    // The coordinator guard must outlive the OPD run to keep workers alive.
+    let mut judge_guard: Option<crate::serve_multiproc::CoordinatorGuard> = None;
     let judge = if args.self_consistency {
         eprintln!(
             "[arle train rubric-opd] self-consistency mode: no judge engine loaded (majority-vote on \\boxed)"
@@ -387,6 +389,7 @@ pub(super) fn run_rubric_opd_impl(args: TrainRubricOpdArgs) -> Result<()> {
                     anyhow!("multiproc coordinator returned None for world_size={world_size}")
                 })?;
                 let crate::serve_multiproc::MultiprocCoordinator { relay, guard } = coordinator;
+                judge_guard = Some(guard);
                 let port = free_port();
                 let teacher_owned = teacher_str.to_string();
                 std::thread::spawn(move || {
