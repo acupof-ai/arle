@@ -25,6 +25,7 @@ pub enum FlashJudge {
     Local {
         engine: Arc<Mutex<LoadedInferenceEngine>>,
         max_verdict_tokens: usize,
+        offloaded: std::sync::atomic::AtomicBool,
     },
     Remote {
         endpoint: String,
@@ -51,7 +52,27 @@ impl FlashJudge {
         Self::Local {
             engine,
             max_verdict_tokens,
+            offloaded: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Lazy reload before use: the judge stays offloaded through training and
+    /// the LoRA re-merge, and callers may span multiple `run_rubric_rounds`
+    /// invocations, so residency is tracked here rather than in the loop.
+    fn ensure_resident(&self) -> Result<()> {
+        if let Self::Local {
+            engine, offloaded, ..
+        } = self
+            && offloaded.load(std::sync::atomic::Ordering::Acquire)
+        {
+            eprintln!("[rubric] reloading judge engine weights");
+            engine
+                .lock()
+                .map_err(|err| anyhow!("Flash judge engine lock poisoned: {err}"))?
+                .reload_engine_weights()?;
+            offloaded.store(false, std::sync::atomic::Ordering::Release);
+        }
+        Ok(())
     }
 
     pub fn new_remote(endpoint: impl Into<String>, max_verdict_tokens: usize) -> Self {
@@ -99,6 +120,7 @@ impl FlashJudge {
     }
 
     pub fn judge(&self, rubric: &Rubric, problem: &str, rollout: &str) -> Result<Verdict> {
+        self.ensure_resident()?;
         let prompt = rubric.judge_prompt(problem, rollout);
         let max_tokens = self.max_verdict_tokens();
         let text = match self {
@@ -190,6 +212,7 @@ impl FlashJudge {
         problem: &str,
         max_tokens: usize,
     ) -> Result<Option<String>> {
+        self.ensure_resident()?;
         let prompt = rubric.solve_prompt(problem);
         let solution = match self {
             Self::Local { engine, .. } => {
@@ -215,20 +238,32 @@ impl FlashJudge {
 
     pub fn offload_engine_weights(&self) -> Result<usize> {
         match self {
-            Self::Local { engine, .. } => engine
-                .lock()
-                .map_err(|err| anyhow!("Flash judge engine lock poisoned: {err}"))?
-                .offload_engine_weights(),
+            Self::Local {
+                engine, offloaded, ..
+            } => {
+                let freed = engine
+                    .lock()
+                    .map_err(|err| anyhow!("Flash judge engine lock poisoned: {err}"))?
+                    .offload_engine_weights()?;
+                offloaded.store(true, std::sync::atomic::Ordering::Release);
+                Ok(freed)
+            }
             Self::Remote { .. } => Ok(0),
         }
     }
 
     pub fn reload_engine_weights(&self) -> Result<()> {
         match self {
-            Self::Local { engine, .. } => engine
-                .lock()
-                .map_err(|err| anyhow!("Flash judge engine lock poisoned: {err}"))?
-                .reload_engine_weights(),
+            Self::Local {
+                engine, offloaded, ..
+            } => {
+                engine
+                    .lock()
+                    .map_err(|err| anyhow!("Flash judge engine lock poisoned: {err}"))?
+                    .reload_engine_weights()?;
+                offloaded.store(false, std::sync::atomic::Ordering::Release);
+                Ok(())
+            }
             Self::Remote { .. } => Ok(()),
         }
     }
@@ -285,13 +320,7 @@ where
     E: FnMut(&str) -> Result<Vec<u32>>,
 {
     let mut reports = Vec::with_capacity(cfg.rounds);
-    let mut judge_offloaded = false;
     for round in 0..cfg.rounds {
-        if judge_offloaded && let Some(j) = judge {
-            eprintln!("[rubric] round {round} phase-A: reloading judge");
-            j.reload_engine_weights()?;
-            judge_offloaded = false;
-        }
         let mut rep = RoundReport {
             round,
             ..Default::default()
@@ -414,10 +443,7 @@ where
             student.offload_engine_weights().unwrap_or(0)
         };
         let freed_judge = match judge {
-            Some(j) => {
-                judge_offloaded = true;
-                j.offload_engine_weights().unwrap_or(0)
-            }
+            Some(j) => j.offload_engine_weights().unwrap_or(0),
             None => 0,
         };
         eprintln!(
