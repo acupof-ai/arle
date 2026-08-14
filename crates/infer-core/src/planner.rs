@@ -56,6 +56,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         // executor's per-forward limit (deepep_ll LL dispatch buffer). With the
         // default `usize::MAX` both `saturating_sub` and `min` are no-ops.
         let cap = self.max_tokens_per_step;
+        let limits = self.executor.step_limits();
         let mut budget = self
             .config
             .prefill_step_budget()
@@ -64,7 +65,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             .config
             .prefill_chunk_size()
             .min(cap)
-            .min(self.executor.max_prefill_chunk());
+            .min(limits.max_prefill_chunk);
         let max_prefills = self.config.max_concurrent_prefill();
         for (&slot, request) in &self.active {
             if prefill_rows.len() >= max_prefills || budget == 0 {
@@ -86,7 +87,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             // coarser boundary. Chunk SIZE is bounded by max_prefill_chunk()
             // in chunk_cap above; this only aligns where the chunk ends.
             let page_size = self.kv.page_size().max(1);
-            let restore_alignment = self.executor.prefill_restore_boundary_alignment().max(1);
+            let restore_alignment = limits.prefill_restore_boundary_alignment.max(1);
             let alignment_unit = lcm(page_size, restore_alignment);
             let chunk_end = start_pos + chunk;
             let aligned_end = chunk_end - (chunk_end % alignment_unit);
@@ -220,7 +221,11 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         // The park stalls the whole engine (whole-slot D2H + sync), so its cost
         // is a scheduling input, not a detail: surface it per event.
         let started = std::time::Instant::now();
-        match self.executor.demote_slot(slot, key) {
+        let demoted = match self.executor.kv_slot_tier() {
+            Some(tier) => tier.demote_slot(slot, key),
+            None => Ok(false),
+        };
+        match demoted {
             Ok(true) => {}
             Ok(false) => return false,
             Err(err) => {
@@ -274,13 +279,17 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             // Publish ensures radix + sidecar are captured (idempotent for
             // already-cached blocks — returns empty in that case).
             let _ = self.publish_prefix_blocks(slot, &committed_tokens);
-        } else if self.executor.kv_slot_tier_enabled()
+        } else if self.executor.kv_slot_tier().is_some()
             && matches!(request.phase, RequestPhase::Decoding)
             && demoted_seq_len > 0
         {
             let key = self.next_tier_key;
             self.next_tier_key = self.next_tier_key.wrapping_add(1);
-            match self.executor.demote_slot(slot, key) {
+            let demoted = match self.executor.kv_slot_tier() {
+                Some(tier) => tier.demote_slot(slot, key),
+                None => Ok(false),
+            };
+            match demoted {
                 Ok(true) => {
                     slot_swap_key = Some(key);
                     self.kv_tier_stats.demoted_slots =
@@ -356,11 +365,16 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             .alloc_with_prefix_reclaim(slot, seq_len)
             .and_then(|()| {
                 let slot_pages = self.kv.page_indices(slot).to_vec();
-                self.executor.promote_slot(key, slot, &slot_pages)
+                match self.executor.kv_slot_tier() {
+                    Some(tier) => tier.promote_slot(key, slot, &slot_pages),
+                    None => anyhow::bail!("backend has no whole-slot KV tier store"),
+                }
             });
         match restored {
             Ok(()) => {
-                self.executor.drop_kv_slot_entries(&[key]);
+                if let Some(tier) = self.executor.kv_slot_tier() {
+                    tier.drop_kv_slot_entries(&[key]);
+                }
                 request.phase = RequestPhase::Decoding;
                 request.prefill_start_pos = request.prompt_len();
                 self.kv_tier_stats.promoted_slots =
@@ -378,7 +392,9 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
                     "whole-slot KV promote failed for request {}: {err:#}; recomputing",
                     request.handle.id()
                 );
-                self.executor.drop_kv_slot_entries(&[key]);
+                if let Some(tier) = self.executor.kv_slot_tier() {
+                    tier.drop_kv_slot_entries(&[key]);
+                }
                 self.free_slot_pages(slot);
                 self.kv_tier_stats.slot_promote_failures =
                     self.kv_tier_stats.slot_promote_failures.saturating_add(1);
@@ -408,7 +424,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             .iter()
             .map(|row| {
                 self.kv
-                    .append_pages_needed(row.slot, self.executor.spec_row_tokens())
+                    .append_pages_needed(row.slot, self.executor.step_limits().spec_row_tokens)
             })
             .sum::<usize>();
         prefill_pages + decode_pages

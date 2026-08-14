@@ -1,9 +1,15 @@
 //! Inference execution seam traits.
 //!
-//! The engine-core facing seam is host-only: [`ForwardPlan`], [`StepOutput`],
-//! and [`KvPool`] expose slots, page ids, token ids, and lengths. Device
-//! tensors, collectives, sampling, and the model forward all live inside the
-//! backend executors ([`BackendExecutor`]), never crossing this seam.
+//! The seam is the engine's COST CONTRACT: a submit/poll core loop whose costs
+//! are parameterized by [`StepLimits`] and whose optional behaviors are explicit
+//! capability accessors ([`PrefixReuse`], [`KvPageTier`], [`KvSlotTier`],
+//! [`DeviceKvFit`], [`WeightResidency`], [`MultimodalGenerate`]). The seam is
+//! host-only: [`ForwardPlan`], [`StepOutput`], and [`KvPool`] expose slots, page
+//! ids, token ids, and lengths. Device tensors, collectives, sampling, and the
+//! model forward all live inside the backend executors ([`BackendExecutor`]),
+//! never crossing this seam. A model family whose decode is no longer
+//! submit-poll shaped forks the loop (precedent: `diffusion_executor.rs`)
+//! rather than bending this trait.
 
 use std::cell::Cell;
 
@@ -177,7 +183,7 @@ pub struct BackendArtifactIdentity {
     pub kernel_bundle_id: String,
 }
 
-/// One planned row's device-pool demand for [`BackendExecutor::kv_device_fit`],
+/// One planned row's device-pool demand for [`DeviceKvFit::kv_device_fit`],
 /// in plan order (decode rows first, then prefill chunks).
 #[derive(Debug, Clone, Copy)]
 pub struct DeviceRowDemand {
@@ -192,10 +198,83 @@ pub struct DeviceRowDemand {
     pub pages_hint: usize,
 }
 
-/// Host-only engine-core to backend-executor seam.
+/// Per-step cost parameters of a backend executor: the engine sizes plans and
+/// admission against these. `Default` is the unconstrained backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StepLimits {
+    /// Maximum number of plan rows the backend can execute in one scheduler
+    /// step. Backend-neutral schedulers use this as a capability, not a type
+    /// dependency: batched backends keep the unbounded default, while scalar
+    /// backends (Metal/MLX today) report `1` so core never submits a plan shape
+    /// the executor must reject.
+    pub max_rows_per_step: usize,
+    /// Maximum total plan tokens (decode rows + prefill chunk tokens) per
+    /// forward. Backends with a hard per-forward token limit (e.g. the
+    /// deepep_ll NVSHMEM dispatch buffer) report it so core never builds a
+    /// forward the executor must reject; default unbounded.
+    pub max_tokens_per_step: usize,
+    /// Maximum number of live frontend requests this backend wants the serve
+    /// layer to allow at once. Batched/server backends keep the unbounded
+    /// default. Desktop scalar backends can return `1` so the frontend rejects a
+    /// second request instead of queueing it and pretending concurrency is
+    /// supported.
+    pub max_live_requests: usize,
+    /// Largest single prefill forward this executor accepts, in tokens; also
+    /// the restore-snapshot grain when > restore alignment (a forward
+    /// snapshots boundary state only at its own end, so a bigger chunk
+    /// coarsens the boundary grid). Default: unbounded.
+    pub max_prefill_chunk: usize,
+    /// Extra chunk-END alignment beyond KV pages, in tokens: the planner
+    /// aligns each prefill chunk's end position to `lcm(page_size, this)`, so
+    /// backend side state that snapshots at forward-call ends (e.g. DSv4's
+    /// ring) lands on restorable boundaries. End alignment only — chunk SIZE
+    /// is bounded by `max_prefill_chunk`. Default `1`: no constraint.
+    pub prefill_restore_boundary_alignment: usize,
+    /// Total KV tokens one decode row may reach in a single
+    /// [`BackendExecutor::submit`]: the committed token plus any speculative
+    /// chain the executor drafts and verifies in that step. The engine budgets
+    /// and pre-allocates this many tokens per decode row through its
+    /// reclaim/preempt path, so a speculative executor never grows the KV pool
+    /// inside `submit` — where an alloc failure is engine-fatal. Default 1:
+    /// non-speculative executors append one token.
+    pub spec_row_tokens: usize,
+}
+
+impl Default for StepLimits {
+    fn default() -> Self {
+        Self {
+            max_rows_per_step: usize::MAX,
+            max_tokens_per_step: usize::MAX,
+            max_live_requests: usize::MAX,
+            max_prefill_chunk: usize::MAX,
+            prefill_restore_boundary_alignment: 1,
+            spec_row_tokens: 1,
+        }
+    }
+}
+
+/// Backend-reported counters and identity, read at stats-request boundaries.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct BackendStats {
+    /// Cumulative speculative-decode counters from the accept-commit path.
+    pub spec_decode: SpecDecodeStats,
+    /// Operator-policy identity and cumulative dispatch counters.
+    pub operator_dispatch: OperatorDispatchStats,
+    /// Per-operation CUDA timing accumulated since process start. Backends that
+    /// implement per-op profiling return their stats; the default is empty.
+    pub op_timing: OpTimingStats,
+    /// Exact backend build-artifact identity, if the build verified one.
+    pub artifact: BackendArtifactIdentity,
+}
+
+/// Host-only engine-core to backend-executor seam: the core submit/poll loop,
+/// its cost parameters ([`StepLimits`]), and explicit capability accessors.
 ///
 /// The plan and step output contain only host data. Any device tensors needed
 /// for KV, logits, collectives, graphs, or sampling remain inside the executor.
+///
+/// A capability accessor returning `None` (the default) is a written opt-out:
+/// the engine substitutes the documented inert behavior at each call site.
 pub trait BackendExecutor {
     /// Opaque backend-owned in-flight handle.
     type Inflight;
@@ -224,81 +303,74 @@ pub trait BackendExecutor {
         Vec::new()
     }
 
-    fn spec_decode_stats(&self) -> SpecDecodeStats {
-        SpecDecodeStats::default()
+    /// Per-step cost parameters. Backends override by returning a filled
+    /// struct; the default is unconstrained.
+    fn step_limits(&self) -> StepLimits {
+        StepLimits::default()
     }
 
-    fn operator_dispatch_stats(&self) -> OperatorDispatchStats {
-        OperatorDispatchStats::default()
+    /// Backend counters and artifact identity.
+    fn stats(&self) -> BackendStats {
+        BackendStats::default()
     }
 
-    /// Per-operation CUDA timing accumulated since process start. Backends that
-    /// implement per-op profiling return their stats; the default is empty.
-    fn op_timing_stats(&self) -> OpTimingStats {
-        OpTimingStats::default()
+    /// The engine freed `slot`'s host pages (finish/preempt/abort): release
+    /// any backend device-side per-slot KV the executor allocates on demand
+    /// (#154 Phase 3b: DSv4's FlashMLA band pages return to the layer pools
+    /// here — waiting for the next occupant would starve the free lists).
+    /// Default no-op for backends whose per-slot device KV is slot-fixed.
+    fn release_kv_slot(&mut self, _slot: usize) {}
+
+    /// Cross-TP-rank min-reduce of a per-rank-local scalar. Single-rank/no-TP
+    /// backends (default) return `local` unchanged. TP backends MUST call
+    /// this symmetrically on every rank, every tick that reaches it — same
+    /// discipline as [`PrefixReuse::cached_prefix_match_len`]'s reduce. Skipping
+    /// the sync on one rank while another still calls it desyncs the admission
+    /// collective permanently (2026-07-05 TP=4 admission livelock — see
+    /// docs/experience/errors/2026-07-05-multiproc-lockstep-ack-hang-no-timeout.md).
+    fn tp_sync_min(&self, local: usize) -> anyhow::Result<usize> {
+        Ok(local)
     }
 
-    fn artifact_identity(&self) -> BackendArtifactIdentity {
-        BackendArtifactIdentity::default()
-    }
-
-    /// Optional direct multimodal generation path for scalar backends whose
-    /// image/text fusion happens inside the backend-owned model wrapper.
-    fn generate_multimodal(
-        &mut self,
-        _prompt_tokens: &[u32],
-        _images: &[MultimodalImage],
-        _max_tokens: usize,
-        _sampling: &SamplingParams,
-    ) -> anyhow::Result<Option<DiffusionGenerateOutput>> {
-        Ok(None)
-    }
-
-    /// Which VLM image-preprocessing/marker convention this backend expects.
-    /// The serving layer dispatches preprocessing on this so a second VLM
-    /// (DeepSeek-OCR) doesn't run Gemma4's resize/marker logic. Default `None`
-    /// = text-only backend.
-    fn multimodal_kind(&self) -> Option<MultimodalKind> {
+    /// Prefix-cache restore/publish coordination below the seam.
+    fn prefix_reuse(&mut self) -> Option<&mut dyn PrefixReuse> {
         None
     }
 
-    /// Maximum number of plan rows the backend can execute in one scheduler
-    /// step. Backend-neutral schedulers use this as a capability, not a type
-    /// dependency: batched backends keep the unbounded default, while scalar
-    /// backends (Metal/MLX today) report `1` so core never submits a plan shape
-    /// the executor must reject.
-    fn max_rows_per_step(&self) -> usize {
-        usize::MAX
+    /// Page-granular host/disk KV tier store.
+    fn kv_page_tier(&mut self) -> Option<&mut dyn KvPageTier> {
+        None
     }
 
-    /// Maximum total plan tokens (decode rows + prefill chunk tokens) per
-    /// forward. Backends with a hard per-forward token limit (e.g. the
-    /// deepep_ll NVSHMEM dispatch buffer) report it so core never builds a
-    /// forward the executor must reject; default unbounded.
-    fn max_tokens_per_step(&self) -> usize {
-        usize::MAX
+    /// Whole-slot KV tier store, for models whose restore state is not
+    /// page-addressable. Presence gates the oversubscription park path.
+    fn kv_slot_tier(&mut self) -> Option<&mut dyn KvSlotTier> {
+        None
     }
 
-    /// Total KV tokens one decode row may reach in a single [`Self::submit`]:
-    /// the committed token plus any speculative chain the executor drafts and
-    /// verifies in that step. The engine budgets and pre-allocates this many
-    /// tokens per decode row through its reclaim/preempt path, so a
-    /// speculative executor never grows the KV pool inside `submit` — where
-    /// an alloc failure is engine-fatal. Default 1: non-speculative
-    /// executors append one token.
-    fn spec_row_tokens(&self) -> usize {
-        1
+    /// Device KV pool(s) separate from the engine's accounting pool, so plan
+    /// rows must clear [`DeviceKvFit::kv_device_fit`] before submit. `None`
+    /// (the default) skips the gate — the engine builds no demand rows at all.
+    fn device_kv_fit(&self) -> Option<&dyn DeviceKvFit> {
+        None
     }
 
-    /// Maximum number of live frontend requests this backend wants the serve
-    /// layer to allow at once. Batched/server backends keep the unbounded
-    /// default. Desktop scalar backends can return `1` so the frontend rejects a
-    /// second request instead of queueing it and pretending concurrency is
-    /// supported.
-    fn max_live_requests(&self) -> usize {
-        usize::MAX
+    /// OPD weight/scratch/KV-pool VRAM residency control.
+    fn weight_residency(&mut self) -> Option<&mut dyn WeightResidency> {
+        None
     }
 
+    /// Direct multimodal generation path. Returning `Some` IS the "this is a
+    /// VLM backend" statement; `None` (the default) = text-only backend.
+    fn multimodal(&mut self) -> Option<&mut dyn MultimodalGenerate> {
+        None
+    }
+}
+
+/// Prefix-cache restore/publish capability: restore boundaries, sidecar side
+/// state, and position-0 whole-prefix snapshots. A backend without this
+/// capability publishes nothing and restores nothing (fail-closed).
+pub trait PrefixReuse {
     /// How many leading prefix-cache blocks are complete restore boundaries
     /// that the executor can materialize and attach to a slot.
     ///
@@ -309,12 +381,9 @@ pub trait BackendExecutor {
     /// engine-core not to promote or attach the tail. A nonzero return value is
     /// a promise that after promote/attach, the backend's attention path can
     /// consume the resulting resident page table without any missing side state.
-    /// The default is fail-closed; pages-only executors explicitly opt in with
+    /// Pages-only executors explicitly opt in with
     /// [`pages_only_reusable_prefix_blocks`].
-    fn reusable_prefix_blocks(&self, blocks: &[PrefixBlock]) -> usize {
-        let _ = blocks;
-        0
-    }
+    fn reusable_prefix_blocks(&self, blocks: &[PrefixBlock]) -> usize;
 
     /// Reuse length for admitting a REQUEST, when the backend may reuse content
     /// that extends PAST the radix page-match and must verify it against the
@@ -322,34 +391,15 @@ pub trait BackendExecutor {
     /// tail whose content the radix key does not cover — it reuses that tail
     /// only for a verified continuation (`tokens` contains the cached sequence
     /// through the finish position), else falls back to the strict page-aligned
-    /// count. Default ignores `tokens` and defers to [`Self::reusable_prefix_blocks`].
-    fn reusable_prefix_blocks_for_prompt(&self, blocks: &[PrefixBlock], tokens: &[u32]) -> usize {
-        let _ = tokens;
-        self.reusable_prefix_blocks(blocks)
-    }
-
-    /// Extra chunk-END alignment beyond KV pages, in tokens: the planner
-    /// aligns each prefill chunk's end position to `lcm(page_size, this)`, so
-    /// backend side state that snapshots at forward-call ends (e.g. DSv4's
-    /// ring) lands on restorable boundaries. End alignment only — chunk SIZE
-    /// is bounded by [`Self::max_prefill_chunk`]. Default `1`: no constraint.
-    fn prefill_restore_boundary_alignment(&self) -> usize {
-        1
-    }
-
-    /// Largest single prefill forward this executor accepts, in tokens; also
-    /// the restore-snapshot grain when > restore alignment (a forward
-    /// snapshots boundary state only at its own end, so a bigger chunk
-    /// coarsens the boundary grid). Default: unbounded.
-    fn max_prefill_chunk(&self) -> usize {
-        usize::MAX
-    }
+    /// count. Backends without such content defer to
+    /// [`Self::reusable_prefix_blocks`], ignoring `tokens`.
+    fn reusable_prefix_blocks_for_prompt(&self, blocks: &[PrefixBlock], tokens: &[u32]) -> usize;
 
     /// Notify the backend that host prefix-cache pages were evicted from the
     /// radix cache and released by the host KV pool. Backends that mirror page
     /// contents or restore-boundary side state below the seam can drop those
-    /// mirrors here; the default is a no-op for executors with no such mirrors.
-    fn release_prefix_pages(&mut self, _pages: &[u32]) {}
+    /// mirrors here.
+    fn release_prefix_pages(&mut self, pages: &[u32]);
 
     /// Notify the backend that a slot's pages are returning to the free pool
     /// (slot free/abort/preempt). Backends drop any NON-confirmed (write-only,
@@ -357,132 +407,8 @@ pub trait BackendExecutor {
     /// id recycles, and a stale provisional entry under a recycled id could
     /// later be confirmed as if it were the new occupant's content. Confirmed
     /// entries ride the radix lifetime ([`Self::release_prefix_pages`]) and
-    /// are untouched. Default no-op.
-    fn release_provisional_prefix_pages(&mut self, _pages: &[u32]) {}
-
-    /// The engine freed `slot`'s host pages (finish/preempt/abort): release
-    /// any backend device-side per-slot KV the executor allocates on demand
-    /// (#154 Phase 3b: DSv4's FlashMLA band pages return to the layer pools
-    /// here — waiting for the next occupant would starve the free lists).
-    /// Default no-op for backends whose per-slot device KV is slot-fixed.
-    fn release_kv_slot(&mut self, _slot: usize) {}
-
-    /// Whether the backend keeps device KV pool(s) separate from the
-    /// engine's accounting pool, so plan rows must clear
-    /// [`Self::kv_device_fit`] before submit. `false` (the default) skips
-    /// the gate — the engine builds no demand rows at all.
-    fn kv_device_gate_active(&self) -> bool {
-        false
-    }
-
-    /// Per-row fit of the planned rows (decode rows first, then prefill
-    /// chunks — the engine's shed-priority order) against the backend's own
-    /// device KV pool(s). Push the index of EVERY row that does not fit into
-    /// `unfit` (ascending); a fitting row debits the remaining headroom
-    /// cumulatively, an unfit row debits nothing so later smaller rows are
-    /// still tested — shedding exactly the unfit rows, never the tail (a
-    /// stuck low-index row must not starve later fitting rows). The engine
-    /// parks/sheds the pushed rows so device-side exhaustion degrades (#162)
-    /// instead of failing an alloc inside [`Self::submit`] — which is
-    /// engine-fatal (#164). Backends with heterogeneous pools (DSv4
-    /// per-layer FlashMLA bands, #160) must pair need and headroom PER POOL
-    /// — a saturated pool with zero incremental need is not exhaustion. Host
-    /// bookkeeping only — never a device readback (CUDA-graph hot loop).
-    fn kv_device_fit(&self, _rows: &[DeviceRowDemand], _unfit: &mut Vec<usize>) {}
-
-    /// Number of KV pages the backend's host-demoted store can
-    /// hold. `0` (the default) means the backend has no tier store and the
-    /// engine never calls the demote/promote hooks — the baseline eviction
-    /// path stays byte-for-byte unchanged.
-    fn kv_tier_capacity_pages(&self) -> usize {
-        0
-    }
-
-    fn kv_tier_page_bytes(&self) -> usize {
-        0
-    }
-
-    fn kv_tier_host_demoted_pages(&self) -> usize {
-        0
-    }
-
-    fn kv_tier_disk_pages(&self) -> usize {
-        0
-    }
-
-    fn kv_tier_read_hits(&self) -> KvTierReadHits {
-        KvTierReadHits::default()
-    }
-
-    fn kv_tier_io_stats(&self) -> KvTierIoStats {
-        KvTierIoStats::default()
-    }
-
-    fn kv_tier_transfer_is_zero_copy(&self) -> bool {
-        false
-    }
-
-    fn kv_tier_location(&self, _key: u64) -> Option<KvTierLocation> {
-        None
-    }
-
-    /// Copy the contents of device KV pages into the backend's host tier
-    /// store, keyed by the engine-assigned tier keys.
-    ///
-    /// The copy MUST be complete (host copy durable, no in-flight device
-    /// reads pending) before this returns: the engine frees each accepted
-    /// page immediately after, and a later allocation may overwrite it.
-    /// Returns how many *leading* entries were accepted; entries past that
-    /// count were rejected (store full) and the engine falls back to plain
-    /// eviction for them. The default backend has no tier store and accepts
-    /// nothing.
-    fn demote_prefix_pages(&mut self, _entries: &[(u32, u64)]) -> anyhow::Result<usize> {
-        Ok(0)
-    }
-
-    /// Copy tier-store entries back into freshly allocated device KV pages
-    /// (`(tier_key, dst_page)` pairs).
-    ///
-    /// The copy MUST be complete before this returns: the engine attaches the
-    /// destination pages to a slot immediately after and the next forward
-    /// step reads them. Promoted entries stay in the store until the engine
-    /// drops them via [`BackendExecutor::drop_kv_tier_entries`]. Only called
-    /// when [`BackendExecutor::kv_tier_capacity_pages`] is nonzero.
-    fn promote_prefix_pages(&mut self, _entries: &[(u64, u32)]) -> anyhow::Result<()> {
-        anyhow::bail!("backend has no KV tier store")
-    }
-
-    /// Drop tier-store entries whose radix nodes were severed or restored to
-    /// device residency. The default is a no-op for backends without a tier.
-    fn drop_kv_tier_entries(&mut self, _keys: &[u64]) {}
-
-    /// Whether the backend can demote/promote a whole slot's complete restore
-    /// state as one image when page-addressed restore is not sufficient for
-    /// that model. Default: no.
-    fn kv_slot_tier_enabled(&self) -> bool {
-        false
-    }
-
-    /// Snapshot the complete restore state of `slot` into the backend host
-    /// store under `key`: KV at its exact positions plus every backend-owned
-    /// sidecar needed to resume from the materialized sequence position. The
-    /// copy MUST be complete before returning — the engine frees the slot
-    /// immediately after. Returns `false` when the store has no room (the
-    /// engine falls back to plain recompute).
-    fn demote_slot(&mut self, _slot: usize, _key: u64) -> anyhow::Result<bool> {
-        Ok(false)
-    }
-
-    /// Restore a whole-slot snapshot into `slot`. The engine resumes from the
-    /// exact demoted materialized position right after, so every byte of
-    /// required backend state MUST be restored before returning. Only called
-    /// when [`BackendExecutor::kv_slot_tier_enabled`] is `true`.
-    fn promote_slot(&mut self, _key: u64, _slot: usize, _slot_pages: &[u32]) -> anyhow::Result<()> {
-        anyhow::bail!("backend has no whole-slot KV tier store")
-    }
-
-    /// Drop whole-slot store entries (promoted, cancelled, or abandoned).
-    fn drop_kv_slot_entries(&mut self, _keys: &[u64]) {}
+    /// are untouched.
+    fn release_provisional_prefix_pages(&mut self, pages: &[u32]);
 
     /// Length of the longest leading prefix of `tokens` for which the backend
     /// holds a position-0-anchored cached KV snapshot it can restore into a fresh
@@ -493,23 +419,10 @@ pub trait BackendExecutor {
     /// sliding-window ring indexed by `abs_pos % window`, and the DSA indexer
     /// keys are all position-locked). The only safe reuse is a prefix captured
     /// at absolute positions `[0, len)` and reattached as the leading prefix of
-    /// a new request that also starts at position 0. The default `0` means the
+    /// a new request that also starts at position 0. Returning `0` means the
     /// backend has no such store and the engine never calls the capture/restore
     /// hooks — the page-radix reuse path stays byte-for-byte unchanged.
-    fn cached_prefix_match_len(&self, _tokens: &[u32]) -> anyhow::Result<usize> {
-        Ok(0)
-    }
-
-    /// Cross-TP-rank min-reduce of a per-rank-local scalar. Single-rank/no-TP
-    /// backends (default) return `local` unchanged. TP backends MUST call
-    /// this symmetrically on every rank, every tick that reaches it — same
-    /// discipline as [`Self::cached_prefix_match_len`]'s reduce. Skipping the
-    /// sync on one rank while another still calls it desyncs the admission
-    /// collective permanently (2026-07-05 TP=4 admission livelock — see
-    /// docs/experience/errors/2026-07-05-multiproc-lockstep-ack-hang-no-timeout.md).
-    fn tp_sync_min(&self, local: usize) -> anyhow::Result<usize> {
-        Ok(local)
-    }
+    fn cached_prefix_match_len(&self, tokens: &[u32]) -> anyhow::Result<usize>;
 
     /// Restore the cached position-0 prefix snapshot for `tokens[..matched_len]`
     /// into `slot`, setting the slot's materialized length to `matched_len`.
@@ -521,22 +434,19 @@ pub trait BackendExecutor {
     /// returning. Only called when `cached_prefix_match_len > 0`.
     fn restore_cached_prefix(
         &mut self,
-        _slot: usize,
-        _tokens: &[u32],
-        _matched_len: usize,
-        _slot_pages: &[u32],
-    ) -> anyhow::Result<()> {
-        anyhow::bail!("backend has no position-0 prefix store")
-    }
+        slot: usize,
+        tokens: &[u32],
+        matched_len: usize,
+        slot_pages: &[u32],
+    ) -> anyhow::Result<()>;
 
     /// Restore the sidecar side state for `slot` when reusing a page-radix prefix
     /// of length `matched_len`, returning the ABSOLUTE token length actually
     /// restored — the position the engine sets `prefill_start_pos` to. Called by
-    /// `attach_prefix_to_request` after `kv.attach_pages()` succeeds. Default
-    /// returns `matched_len` (byte-identical to a page-aligned restore — the
-    /// engine prefills from `matched_len`) for full-attention-only backends (CUDA
-    /// Qwen dense, Metal); a backend that forgets to override falls back to the
-    /// conservative correct `matched_len`.
+    /// `attach_prefix_to_request` after `kv.attach_pages()` succeeds. Returning
+    /// `matched_len` is byte-identical to a page-aligned restore (the engine
+    /// prefills from `matched_len`) — the conservative correct answer for
+    /// full-attention-only backends (CUDA Qwen dense, Metal).
     ///
     /// Two backends restore a length OTHER than `matched_len`:
     /// - **DSv4 finish-write-through** restores PAST the 64-block-aligned
@@ -553,13 +463,11 @@ pub trait BackendExecutor {
     /// slot — the hybrid override uses them to sync the device KV pool seq_len.
     fn restore_prefix_sidecar(
         &mut self,
-        _slot: usize,
-        _tokens: &[u32],
+        slot: usize,
+        tokens: &[u32],
         matched_len: usize,
-        _prefix_pages: &[u32],
-    ) -> anyhow::Result<usize> {
-        Ok(matched_len)
-    }
+        prefix_pages: &[u32],
+    ) -> anyhow::Result<usize>;
 
     /// Write the finishing slot's full frontier state THROUGH to the backend's
     /// content-keyed prefix store, so a later turn restores to the exact finish
@@ -567,16 +475,14 @@ pub trait BackendExecutor {
     /// confirm/repair reconciles the provisional entries this publishes) and
     /// before `free_slot_pages`, at the eager finish sync point (graph-safe).
     /// `slot_pages` is the slot's own host page chain. Best-effort: a failure
-    /// only forfeits future reuse, never the finish. Default no-op; only DSv4
-    /// (behind `--dsv4-decode-reuse`) overrides.
+    /// only forfeits future reuse, never the finish. Only DSv4 (behind
+    /// `--dsv4-decode-reuse`) captures; others return `Ok`.
     fn capture_finish_frontier(
         &mut self,
-        _slot: usize,
-        _tokens: &[u32],
-        _slot_pages: &[u32],
-    ) -> anyhow::Result<()> {
-        Ok(())
-    }
+        slot: usize,
+        tokens: &[u32],
+        slot_pages: &[u32],
+    ) -> anyhow::Result<()>;
 
     /// Capture the sidecar restore-boundary side state for `slot` at the
     /// just-published radix prefix `tokens[..matched_len]`, keyed so a later
@@ -592,59 +498,152 @@ pub trait BackendExecutor {
     /// `slot_pages` is the slot's OWN page chain over the same token range —
     /// where radix dedup diverged it from `prefix_pages`, a backend can repair
     /// canonical-keyed state from the slot's freshly recomputed (content-
-    /// identical) pages. Default no-op for full-attention-only backends;
-    /// Qwen3.5/3.6 hybrid and DSv4 override this.
+    /// identical) pages. A no-op `Ok` for full-attention-only backends;
+    /// Qwen3.5/3.6 hybrid and DSv4 capture here.
     fn save_prefix_sidecar(
         &mut self,
-        _slot: usize,
-        _tokens: &[u32],
-        _matched_len: usize,
-        _prefix_pages: &[u32],
-        _slot_pages: &[u32],
-        _newly_cached: &[u32],
-    ) -> anyhow::Result<()> {
-        Ok(())
-    }
+        slot: usize,
+        tokens: &[u32],
+        matched_len: usize,
+        prefix_pages: &[u32],
+        slot_pages: &[u32],
+        newly_cached: &[u32],
+    ) -> anyhow::Result<()>;
+}
 
+/// Page-granular host/disk KV tier store capability.
+pub trait KvPageTier {
+    /// Number of KV pages the backend's host-demoted store can hold. `0`
+    /// means the tier store is currently unbudgeted and the engine never calls
+    /// the demote/promote hooks — the baseline eviction path stays
+    /// byte-for-byte unchanged.
+    fn kv_tier_capacity_pages(&self) -> usize;
+
+    fn kv_tier_page_bytes(&self) -> usize;
+
+    fn kv_tier_host_demoted_pages(&self) -> usize;
+
+    fn kv_tier_disk_pages(&self) -> usize;
+
+    fn kv_tier_read_hits(&self) -> KvTierReadHits;
+
+    fn kv_tier_io_stats(&self) -> KvTierIoStats;
+
+    fn kv_tier_transfer_is_zero_copy(&self) -> bool;
+
+    fn kv_tier_location(&self, key: u64) -> Option<KvTierLocation>;
+
+    /// Copy the contents of device KV pages into the backend's host tier
+    /// store, keyed by the engine-assigned tier keys.
+    ///
+    /// The copy MUST be complete (host copy durable, no in-flight device
+    /// reads pending) before this returns: the engine frees each accepted
+    /// page immediately after, and a later allocation may overwrite it.
+    /// Returns how many *leading* entries were accepted; entries past that
+    /// count were rejected (store full) and the engine falls back to plain
+    /// eviction for them.
+    fn demote_prefix_pages(&mut self, entries: &[(u32, u64)]) -> anyhow::Result<usize>;
+
+    /// Copy tier-store entries back into freshly allocated device KV pages
+    /// (`(tier_key, dst_page)` pairs).
+    ///
+    /// The copy MUST be complete before this returns: the engine attaches the
+    /// destination pages to a slot immediately after and the next forward
+    /// step reads them. Promoted entries stay in the store until the engine
+    /// drops them via [`Self::drop_kv_tier_entries`]. Only called
+    /// when [`Self::kv_tier_capacity_pages`] is nonzero.
+    fn promote_prefix_pages(&mut self, entries: &[(u64, u32)]) -> anyhow::Result<()>;
+
+    /// Drop tier-store entries whose radix nodes were severed or restored to
+    /// device residency.
+    fn drop_kv_tier_entries(&mut self, keys: &[u64]);
+}
+
+/// Whole-slot KV tier capability: demote/promote a slot's complete restore
+/// state as one image when page-addressed restore is not sufficient for that
+/// model. Accessor presence gates the engine's oversubscription park path.
+pub trait KvSlotTier {
+    /// Snapshot the complete restore state of `slot` into the backend host
+    /// store under `key`: KV at its exact positions plus every backend-owned
+    /// sidecar needed to resume from the materialized sequence position. The
+    /// copy MUST be complete before returning — the engine frees the slot
+    /// immediately after. Returns `false` when the store has no room (the
+    /// engine falls back to plain recompute).
+    fn demote_slot(&mut self, slot: usize, key: u64) -> anyhow::Result<bool>;
+
+    /// Restore a whole-slot snapshot into `slot`. The engine resumes from the
+    /// exact demoted materialized position right after, so every byte of
+    /// required backend state MUST be restored before returning.
+    fn promote_slot(&mut self, key: u64, slot: usize, slot_pages: &[u32]) -> anyhow::Result<()>;
+
+    /// Drop whole-slot store entries (promoted, cancelled, or abandoned).
+    fn drop_kv_slot_entries(&mut self, keys: &[u64]);
+}
+
+/// Device-pool fit gate capability, for backends whose device KV pool(s) are
+/// separate from the engine's accounting pool.
+pub trait DeviceKvFit {
+    /// Per-row fit of the planned rows (decode rows first, then prefill
+    /// chunks — the engine's shed-priority order) against the backend's own
+    /// device KV pool(s). Push the index of EVERY row that does not fit into
+    /// `unfit` (ascending); a fitting row debits the remaining headroom
+    /// cumulatively, an unfit row debits nothing so later smaller rows are
+    /// still tested — shedding exactly the unfit rows, never the tail (a
+    /// stuck low-index row must not starve later fitting rows). The engine
+    /// parks/sheds the pushed rows so device-side exhaustion degrades (#162)
+    /// instead of failing an alloc inside [`BackendExecutor::submit`] — which is
+    /// engine-fatal (#164). Backends with heterogeneous pools (DSv4
+    /// per-layer FlashMLA bands, #160) must pair need and headroom PER POOL
+    /// — a saturated pool with zero incremental need is not exhaustion. Host
+    /// bookkeeping only — never a device readback (CUDA-graph hot loop).
+    fn kv_device_fit(&self, rows: &[DeviceRowDemand], unfit: &mut Vec<usize>);
+}
+
+/// OPD VRAM residency capability: weight offload/reload plus scratch and KV
+/// pool release for the co-resident writeback bracket.
+pub trait WeightResidency {
     /// Move the model's device weights to host RAM and free the VRAM (OPD teacher
-    /// time-share), returning the device bytes freed. The default is a no-op
-    /// (returns 0) so backends that do not support weight offload are unaffected.
+    /// time-share), returning the device bytes freed.
     /// After a successful offload the executor must NOT run a forward step until
-    /// [`BackendExecutor::reload_weights`].
-    fn offload_weights(&mut self) -> anyhow::Result<usize> {
-        Ok(0)
-    }
+    /// [`Self::reload_weights`].
+    fn offload_weights(&mut self) -> anyhow::Result<usize>;
 
     /// Restore the model's device weights from the host snapshot (OPD teacher
-    /// time-share). The default is a no-op so non-offloading backends are
-    /// unaffected; idempotent if no offload is pending.
-    fn reload_weights(&mut self) -> anyhow::Result<()> {
-        Ok(())
-    }
+    /// time-share). Idempotent if no offload is pending.
+    fn reload_weights(&mut self) -> anyhow::Result<()>;
 
     /// Release the inference forward scratch (workspace / batched-decode scratch /
     /// captured graphs) WITHOUT offloading weights or evicting KV, so a co-resident
-    /// OPD writeback reuses the VRAM (the OPD rollout->writeback path never offloads).
-    /// The default is a no-op (returns `Ok`) so backends without an inference
-    /// scratch surface are unaffected; the scratch rebuilds lazily on the next step.
-    fn release_inference_scratch(&mut self) -> anyhow::Result<()> {
-        Ok(())
-    }
+    /// OPD writeback reuses the VRAM (the OPD rollout->writeback path never
+    /// offloads). The scratch rebuilds lazily on the next step.
+    fn release_inference_scratch(&mut self) -> anyhow::Result<()>;
 
     /// Drop the engine's KV pool WITHOUT offloading weights, freeing its HBM for a
     /// co-resident OPD writeback whose fresh autograd forward does NOT use this
-    /// engine's KV cache (so the pool is dead during the writeback). Default no-op
-    /// (backends without a droppable pool are unaffected). Paired with
+    /// engine's KV cache (so the pool is dead during the writeback). Paired with
     /// [`Self::ensure_kv_pool`], which re-acquires it before the next rollout.
-    fn release_kv_pool(&mut self) -> anyhow::Result<()> {
-        Ok(())
-    }
+    fn release_kv_pool(&mut self) -> anyhow::Result<()>;
 
     /// Re-acquire the KV pool dropped by [`Self::release_kv_pool`] before the next
-    /// rollout. Default no-op; idempotent if the pool is already resident.
-    fn ensure_kv_pool(&mut self) -> anyhow::Result<()> {
-        Ok(())
-    }
+    /// rollout. Idempotent if the pool is already resident.
+    fn ensure_kv_pool(&mut self) -> anyhow::Result<()>;
+}
+
+/// Direct multimodal generation capability for scalar backends whose
+/// image/text fusion happens inside the backend-owned model wrapper.
+pub trait MultimodalGenerate {
+    fn generate_multimodal(
+        &mut self,
+        prompt_tokens: &[u32],
+        images: &[MultimodalImage],
+        max_tokens: usize,
+        sampling: &SamplingParams,
+    ) -> anyhow::Result<Option<DiffusionGenerateOutput>>;
+
+    /// Which VLM image-preprocessing/marker convention this backend expects.
+    /// The serving layer dispatches preprocessing on this so a second VLM
+    /// (DeepSeek-OCR) doesn't run Gemma4's resize/marker logic.
+    fn multimodal_kind(&self) -> Option<MultimodalKind>;
 }
 
 /// Verdict returned by the resource governor at the admission boundary.

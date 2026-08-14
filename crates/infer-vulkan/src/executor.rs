@@ -7,7 +7,7 @@
 
 use anyhow::{Result, bail, ensure};
 use infer_plan::{ForwardPlan, SamplingParams, SlotToken, StepOutput};
-use infer_seam::{BackendExecutor, KvPool, PollResult, PrefixBlock};
+use infer_seam::{BackendExecutor, KvPool, PollResult};
 
 use crate::kv_pool::VulkanKvPool;
 
@@ -191,10 +191,6 @@ impl VulkanExecutor {
 
 impl BackendExecutor for VulkanExecutor {
     type Inflight = VulkanInflight;
-
-    fn reusable_prefix_blocks(&self, _blocks: &[PrefixBlock]) -> usize {
-        0
-    }
 
     fn submit(&mut self, plan: &ForwardPlan, kv: &mut dyn KvPool) -> Result<VulkanInflight> {
         if plan.is_idle() {

@@ -9,7 +9,7 @@ use infer_plan::{
     SamplingParams, SlotToken, StepOutput, generate_diffusion_with_cancel,
 };
 
-use crate::{BackendExecutor, KvPool, PollResult, PrefixBlock};
+use crate::{BackendExecutor, KvPool, PollResult};
 
 #[derive(Debug, Clone)]
 struct BufferedToken {
@@ -239,6 +239,23 @@ where
         self.base_config.stop_token_ids.clone()
     }
 
+    fn step_limits(&self) -> crate::StepLimits {
+        crate::StepLimits {
+            max_rows_per_step: 1,
+            max_live_requests: 1,
+            ..crate::StepLimits::default()
+        }
+    }
+
+    fn multimodal(&mut self) -> Option<&mut dyn crate::MultimodalGenerate> {
+        Some(self)
+    }
+}
+
+impl<M> crate::MultimodalGenerate for BufferedDiffusionExecutor<M>
+where
+    M: DiffusionBlockModel,
+{
     fn generate_multimodal(
         &mut self,
         prompt_tokens: &[u32],
@@ -254,19 +271,7 @@ where
             .map_err(|err| anyhow::anyhow!("{err}"))
     }
 
-    fn max_rows_per_step(&self) -> usize {
-        1
-    }
-
     fn multimodal_kind(&self) -> Option<infer_plan::MultimodalKind> {
         self.model.multimodal_kind()
-    }
-
-    fn max_live_requests(&self) -> usize {
-        1
-    }
-
-    fn reusable_prefix_blocks(&self, _blocks: &[PrefixBlock]) -> usize {
-        0
     }
 }

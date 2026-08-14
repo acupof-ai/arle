@@ -447,22 +447,40 @@ impl BackendExecutor for MetalExecutor {
         Vec::new()
     }
 
-    fn max_rows_per_step(&self) -> usize {
+    fn step_limits(&self) -> infer_seam::StepLimits {
         #[cfg(feature = "metal")]
         if let Some(real) = self.real.as_ref() {
-            return real.max_rows_per_step();
+            return infer_seam::StepLimits {
+                max_rows_per_step: real.max_rows_per_step(),
+                max_live_requests: real.max_live_requests(),
+                ..infer_seam::StepLimits::default()
+            };
         }
-        1
+        infer_seam::StepLimits {
+            max_rows_per_step: 1,
+            max_live_requests: 1,
+            ..infer_seam::StepLimits::default()
+        }
     }
 
-    fn max_live_requests(&self) -> usize {
+    fn prefix_reuse(&mut self) -> Option<&mut dyn infer_seam::PrefixReuse> {
+        Some(self)
+    }
+
+    fn kv_page_tier(&mut self) -> Option<&mut dyn infer_seam::KvPageTier> {
+        Some(self)
+    }
+
+    fn warmup(&mut self) -> anyhow::Result<()> {
         #[cfg(feature = "metal")]
-        if let Some(real) = self.real.as_ref() {
-            return real.max_live_requests();
+        if let Some(real) = self.real.as_mut() {
+            return real.warmup();
         }
-        1
+        Ok(())
     }
+}
 
+impl infer_seam::PrefixReuse for MetalExecutor {
     fn reusable_prefix_blocks(&self, blocks: &[PrefixBlock]) -> usize {
         #[cfg(feature = "metal")]
         if let Some(real) = self.real.as_ref() {
@@ -478,6 +496,11 @@ impl BackendExecutor for MetalExecutor {
         blocks.len()
     }
 
+    fn reusable_prefix_blocks_for_prompt(&self, blocks: &[PrefixBlock], _tokens: &[u32]) -> usize {
+        // No content-verified tail on Metal: defer to the strict block count.
+        self.reusable_prefix_blocks(blocks)
+    }
+
     fn release_prefix_pages(&mut self, _pages: &[u32]) {
         #[cfg(feature = "metal")]
         if let Some(real) = self.real.as_mut() {
@@ -485,6 +508,56 @@ impl BackendExecutor for MetalExecutor {
         }
     }
 
+    fn release_provisional_prefix_pages(&mut self, _pages: &[u32]) {}
+
+    fn cached_prefix_match_len(&self, _tokens: &[u32]) -> anyhow::Result<usize> {
+        Ok(0)
+    }
+
+    fn restore_cached_prefix(
+        &mut self,
+        _slot: usize,
+        _tokens: &[u32],
+        _matched_len: usize,
+        _slot_pages: &[u32],
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("Metal backend has no position-0 prefix store")
+    }
+
+    fn restore_prefix_sidecar(
+        &mut self,
+        _slot: usize,
+        _tokens: &[u32],
+        matched_len: usize,
+        _prefix_pages: &[u32],
+    ) -> anyhow::Result<usize> {
+        // Full-attention restore: pages carry the whole state.
+        Ok(matched_len)
+    }
+
+    fn capture_finish_frontier(
+        &mut self,
+        _slot: usize,
+        _tokens: &[u32],
+        _slot_pages: &[u32],
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn save_prefix_sidecar(
+        &mut self,
+        _slot: usize,
+        _tokens: &[u32],
+        _matched_len: usize,
+        _prefix_pages: &[u32],
+        _slot_pages: &[u32],
+        _newly_cached: &[u32],
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+impl infer_seam::KvPageTier for MetalExecutor {
     fn kv_tier_capacity_pages(&self) -> usize {
         #[cfg(feature = "metal")]
         if let Some(real) = self.real.as_ref() {
@@ -499,6 +572,15 @@ impl BackendExecutor for MetalExecutor {
             return real.page_store.kv_tier_page_bytes();
         }
         0
+    }
+
+    fn kv_tier_host_demoted_pages(&self) -> usize {
+        // Metal's tier store is disk-backed only; nothing sits host-demoted.
+        0
+    }
+
+    fn kv_tier_read_hits(&self) -> infer_seam::KvTierReadHits {
+        infer_seam::KvTierReadHits::default()
     }
 
     fn kv_tier_transfer_is_zero_copy(&self) -> bool {
@@ -557,14 +639,6 @@ impl BackendExecutor for MetalExecutor {
         }
         #[cfg(not(feature = "metal"))]
         let _ = keys;
-    }
-
-    fn warmup(&mut self) -> anyhow::Result<()> {
-        #[cfg(feature = "metal")]
-        if let Some(real) = self.real.as_mut() {
-            return real.warmup();
-        }
-        Ok(())
     }
 }
 

@@ -66,7 +66,7 @@ pub struct CounterSnapshot {
 type CounterHandle = Arc<Mutex<CounterSnapshot>>;
 
 fn publish_counters<E: BackendExecutor, K: KvPool>(
-    engine: &Engine<E, K>,
+    engine: &mut Engine<E, K>,
     counters: &CounterHandle,
 ) {
     if let Ok(mut snap) = counters.lock() {
@@ -197,7 +197,7 @@ fn engine_loop_with_tick_broadcaster<E, K>(
     loop {
         if shutdown.is_requested() {
             abort_pending(&mut pending, &streamers);
-            publish_counters(&engine, &counters);
+            publish_counters(&mut engine, &counters);
             return;
         }
 
@@ -236,7 +236,7 @@ fn engine_loop_with_tick_broadcaster<E, K>(
             // Keep telemetry live: `quiesce_serve` polls `active_requests == 0`
             // after `quiesce()` cancelled everything — without this publish the
             // counter stays stale and that poll never clears (60s timeout).
-            publish_counters(&engine, &counters);
+            publish_counters(&mut engine, &counters);
             // Frontend gone (submit channel closed) → exit like the idle path,
             // so engine teardown never deadlocks on a quiesced engine.
             if !submit_open {
@@ -282,7 +282,7 @@ fn engine_loop_with_tick_broadcaster<E, K>(
                      stopping rank-0 engine before local admission/step: {err:#}"
                 );
                 abort_pending(&mut pending, &streamers);
-                publish_counters(&engine, &counters);
+                publish_counters(&mut engine, &counters);
                 return;
             }
             tick_seq += 1;
@@ -346,13 +346,13 @@ fn engine_loop_with_tick_broadcaster<E, K>(
                     pending.len()
                 );
             }
-            publish_counters(&engine, &counters);
+            publish_counters(&mut engine, &counters);
             continue;
         }
 
         // Idle pass: the stepping branch above publishes on every tick, so this
         // is the only other place counters can go stale.
-        publish_counters(&engine, &counters);
+        publish_counters(&mut engine, &counters);
 
         if !submit_open {
             // Flush any straggler completions before leaving.
