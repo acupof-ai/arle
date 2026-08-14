@@ -662,6 +662,11 @@ impl Qwen35Model {
         if self.offloaded.is_some() {
             return Ok(0);
         }
+        ensure!(
+            !self.frozen_base_ptrs_exported.load(Ordering::Relaxed),
+            "cannot offload engine weights: frozen-base device pointers are exported to the \
+             trainer; offloading would free aliased memory"
+        );
         let ctx = self.ctx.clone();
         // Drain ALL in-flight GPU work before snapshotting. The OPD step has
         // co-resident allocators (infer-teacher + train autograd) sharing one
@@ -763,9 +768,9 @@ impl Qwen35Model {
         }
 
         // Quiesce again after the block frees so reload (or a co-resident
-        // backward) sees a settled pool. Trim the pool to the OS so the
-        // co-resident autograd store (which uses cudaMalloc, not the async
-        // pool) can reuse the freed VRAM for the student forward.
+        // backward) sees a settled pool. Trim the pool to the OS so the freed
+        // VRAM is reusable for the co-resident autograd student forward (which
+        // allocates from the same device default async pool).
         ctx.sync()?;
         let (free_before, _) = ctx.mem_info_bytes()?;
         ctx.trim_memory_pool()?;

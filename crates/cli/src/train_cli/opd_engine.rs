@@ -192,6 +192,15 @@ pub(super) fn load_agent_opd_serve_student(
         .div_ceil(16);
     let cc_total_pages = cc_pages + cc_pages / 4;
 
+    // Shared frozen-base pointers alias engine weight buffers that a student
+    // offload frees mid-step — refuse the combination at load time.
+    if !args.no_share_frozen_base && train::opd::engine_offload_mode().offloads_student() {
+        bail!(
+            "--engine-offload student is incompatible with frozen-base sharing; \
+             pass --no-share-frozen-base"
+        );
+    }
+
     // Load order: default loads the autograd student FIRST (engine then sees
     // post-student free VRAM — byte-identical). --share-frozen-base loads the
     // engine FIRST so the student can import (zero-copy) its resident FP8 base.

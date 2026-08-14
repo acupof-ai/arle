@@ -213,6 +213,15 @@ pub(super) fn run_rubric_opd_impl(args: TrainRubricOpdArgs) -> Result<()> {
     let gen_budget = args.max_new_tokens.max(args.eval_max_new_tokens);
     let student_seq = (max_prompt_len + gen_budget + 32).max(128);
 
+    // Shared frozen-base pointers alias engine weight buffers that a student
+    // offload frees mid-step — refuse the combination at load time.
+    if !args.no_share_frozen_base && train::opd::engine_offload_mode().offloads_student() {
+        bail!(
+            "--engine-offload student is incompatible with frozen-base sharing; \
+             pass --no-share-frozen-base"
+        );
+    }
+
     // Load order matters for the rollout engine's num_slots clamp (computed from
     // post-weights free VRAM). Default: load the autograd student FIRST so the
     // engine then sees post-student free VRAM — byte-identical to the
