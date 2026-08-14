@@ -640,3 +640,36 @@ fn qwen35_gradient_checkpointing_lora_cuda_finite_diff_gate() -> TestResult {
     run_qwen35_checkpoint_lora_fd_gate(&mut store)?;
     Ok(())
 }
+
+/// Issue #201 guard: `sync_lora_from_store` skips re-pointing a frozen base at
+/// the engine's merged bytes iff the projection is LoRA-targeted, keyed by
+/// `{param_name}.lora_a` in the adapter map. If either map's naming drifts, the
+/// skip silently stops matching and the trainer double-applies the LoRA delta.
+#[test]
+fn lora_targeted_projections_are_never_repointed_at_merged_bytes() -> TestResult {
+    let mut store = TensorStore::default();
+    let cfg = tiny_qwen35_config(8);
+    let lora = LoraConfig {
+        rank: 2,
+        alpha: 4.0,
+    };
+    let model =
+        Qwen35Model::new_with_lora_targets(&cfg, lora, LoraTargetSet::AttentionQv, &mut store)?;
+    let params = model.param_name_map();
+    let adapters = model.adapter_name_map();
+
+    let mut targeted = 0;
+    for &name in params.keys() {
+        let merged = crate::infer_student::engine_bytes_are_merged(name, &adapters);
+        assert_eq!(
+            merged,
+            LoraTargetSet::AttentionQv.includes(name),
+            "sync_lora_from_store skip predicate disagrees with the LoRA target set for {name}"
+        );
+        targeted += merged as usize;
+    }
+    // Both arms must engage: 2 layers x (q_proj + v_proj) targeted, rest not.
+    assert_eq!(targeted, 4);
+    assert!(params.len() > targeted);
+    Ok(())
+}

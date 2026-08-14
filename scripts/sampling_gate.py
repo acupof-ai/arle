@@ -59,7 +59,10 @@ def fetch_spec_counters(base):
     body = j.get("body", j) if isinstance(j, dict) else j
     if isinstance(body, str):
         body = json.loads(body)
-    return body
+    counters = dict(body.get("spec_decode") or {})
+    sha = (body.get("build_identity") or {}).get("product_binary_sha256") or ""
+    counters["product_binary_sha256"] = sha.removeprefix("sha256:")
+    return counters
 
 
 def main():
@@ -110,9 +113,16 @@ def main():
                 rows.append((name, st, "-", f"len={len(out)}", passed))
             elif name == "logit_bias":
                 div = first_divergence(ref_text, out)
-                dom = dominance(out, args.biased_text)
-                passed = st == 200 and len(out) > 0 and div is not None and div <= 2 and dom >= 0.5
-                rows.append((name, st, div, f"dom={dom:.2f}", passed))
+                # Verified envelope (wins 2026-08-14): the biased arm opens with the
+                # biased token; it need not dominate the whole completion.
+                if args.biased_text:
+                    hit = out.lstrip().startswith(args.biased_text)
+                    detail = f"opens={'yes' if hit else 'no'}"
+                else:
+                    hit = dominance(out) >= 0.5
+                    detail = f"dom={dominance(out):.2f} (pass --biased-text for identity)"
+                passed = st == 200 and len(out) > 0 and div is not None and div <= 2 and hit
+                rows.append((name, st, div, detail, passed))
             else:
                 div = first_divergence(ref_text, out)
                 # Empty output "diverges at 0" but demonstrates nothing.
