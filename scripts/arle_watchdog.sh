@@ -20,6 +20,7 @@ WATCH_LOG="/tmp/arle_watchdog.log"
 MAX_RESTARTS="${ARLE_MAX_RESTARTS:-10}"
 RESTART_WINDOW="${ARLE_RESTART_WINDOW:-300}"
 STARTUP_GRACE="${ARLE_STARTUP_GRACE:-300}"  # seconds before health checks begin
+MAX_RUNNING="${ARLE_MAX_RUNNING:-8}"  # cap slots; each slot reserves 146MB recurrent state
 HEALTH_URL="http://127.0.0.1:${PORT}/health"
 
 restart_count=0
@@ -37,6 +38,7 @@ start_serve() {
         --bind 0.0.0.0 \
         --port "$PORT" \
         --cuda-mempool-retain false \
+        --max-running-requests "$MAX_RUNNING" \
         ${ARLE_EXTRA_ARGS:-} \
         >> "$LOG" 2>&1 &
     SERVE_PID=$!
