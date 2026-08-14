@@ -21,44 +21,110 @@ use crate::infer_student::InferStudent;
 use crate::rubric::{Rubric, Verdict, select, select_by_self_consistency};
 
 #[cfg(feature = "cuda")]
-pub struct FlashJudge {
-    engine: Arc<Mutex<LoadedInferenceEngine>>,
-    max_verdict_tokens: usize,
+pub enum FlashJudge {
+    Local {
+        engine: Arc<Mutex<LoadedInferenceEngine>>,
+        max_verdict_tokens: usize,
+    },
+    Remote {
+        endpoint: String,
+        max_verdict_tokens: usize,
+        agent: ureq::Agent,
+    },
+}
+
+#[cfg(feature = "cuda")]
+#[derive(serde::Deserialize)]
+struct RemoteCompletionChoice {
+    text: String,
+}
+
+#[cfg(feature = "cuda")]
+#[derive(serde::Deserialize)]
+struct RemoteCompletionResponse {
+    choices: Vec<RemoteCompletionChoice>,
 }
 
 #[cfg(feature = "cuda")]
 impl FlashJudge {
     pub fn new(engine: Arc<Mutex<LoadedInferenceEngine>>, max_verdict_tokens: usize) -> Self {
-        Self {
+        Self::Local {
             engine,
             max_verdict_tokens,
         }
     }
 
+    pub fn new_remote(endpoint: impl Into<String>, max_verdict_tokens: usize) -> Self {
+        Self::Remote {
+            endpoint: endpoint.into(),
+            max_verdict_tokens,
+            agent: ureq::Agent::new(),
+        }
+    }
+
+    fn max_verdict_tokens(&self) -> usize {
+        match self {
+            Self::Local {
+                max_verdict_tokens, ..
+            } => *max_verdict_tokens,
+            Self::Remote {
+                max_verdict_tokens, ..
+            } => *max_verdict_tokens,
+        }
+    }
+
+    fn complete_remote(&self, prompt: &str, max_tokens: usize) -> Result<String> {
+        let (endpoint, agent) = match self {
+            Self::Remote {
+                endpoint, agent, ..
+            } => (endpoint, agent),
+            _ => unreachable!("complete_remote called on Local judge"),
+        };
+        let body = serde_json::json!({
+            "prompt": prompt,
+            "max_tokens": max_tokens,
+            "temperature": 0.0,
+        });
+        let resp: RemoteCompletionResponse = agent
+            .post(&format!("{endpoint}/v1/completions"))
+            .send_json(body)
+            .map_err(|e| anyhow!("judge HTTP request failed: {e}"))?
+            .into_json()
+            .map_err(|e| anyhow!("judge HTTP response parse failed: {e}"))?;
+        resp.choices
+            .into_iter()
+            .next()
+            .map(|c| c.text)
+            .ok_or_else(|| anyhow!("judge HTTP response had no choices"))
+    }
+
     pub fn judge(&self, rubric: &Rubric, problem: &str, rollout: &str) -> Result<Verdict> {
         let prompt = rubric.judge_prompt(problem, rollout);
-        let req = CompletionRequest {
-            prompt,
-            max_tokens: self.max_verdict_tokens,
-            sampling: SamplingParams {
-                temperature: 0.0,
-                ..SamplingParams::default()
-            },
-            stop: None,
+        let max_tokens = self.max_verdict_tokens();
+        let text = match self {
+            Self::Local { engine, .. } => {
+                let req = CompletionRequest {
+                    prompt,
+                    max_tokens,
+                    sampling: SamplingParams {
+                        temperature: 0.0,
+                        ..SamplingParams::default()
+                    },
+                    stop: None,
+                };
+                let mut engine = engine
+                    .lock()
+                    .map_err(|err| anyhow!("Flash judge engine lock poisoned: {err}"))?;
+                engine.complete(req)?.text
+            }
+            Self::Remote { .. } => self.complete_remote(&prompt, max_tokens)?,
         };
-        let output = {
-            let mut engine = self
-                .engine
-                .lock()
-                .map_err(|err| anyhow!("Flash judge engine lock poisoned: {err}"))?;
-            engine.complete(req)?
-        };
-        let verdict = rubric.parse_verdict(&output.text);
+        let verdict = rubric.parse_verdict(&text);
         if std::env::var("ARLE_RUBRIC_DEBUG").is_ok() {
-            let snip: String = output.text.chars().take(900).collect();
+            let snip: String = text.chars().take(900).collect();
             eprintln!(
-                "[rubric judge] finish={:?} parse_err={} accepted={} raw_verdict={snip:?}",
-                output.finish_reason, verdict.parse_error, verdict.accepted
+                "[rubric judge] finish=? parse_err={} accepted={} raw_verdict={snip:?}",
+                verdict.parse_error, verdict.accepted
             );
         }
         Ok(verdict)
@@ -78,34 +144,43 @@ impl FlashJudge {
         if rollouts.is_empty() {
             return Vec::new();
         }
-        let reqs: Vec<CompletionRequest> = rollouts
-            .iter()
-            .map(|r| CompletionRequest {
-                prompt: rubric.judge_prompt(problem, r),
-                max_tokens: self.max_verdict_tokens,
-                sampling: SamplingParams {
-                    temperature: 0.0,
-                    ..SamplingParams::default()
-                },
-                stop: None,
-            })
-            .collect();
-        let outputs = {
-            let engine = match self.engine.lock() {
-                Ok(e) => e,
-                Err(err) => {
-                    eprintln!("rubric_opd: judge_batch lock poisoned: {err}");
-                    return vec![Verdict::parse_error(); rollouts.len()];
+        match self {
+            Self::Local { engine, .. } => {
+                let max_tokens = self.max_verdict_tokens();
+                let reqs: Vec<CompletionRequest> = rollouts
+                    .iter()
+                    .map(|r| CompletionRequest {
+                        prompt: rubric.judge_prompt(problem, r),
+                        max_tokens,
+                        sampling: SamplingParams {
+                            temperature: 0.0,
+                            ..SamplingParams::default()
+                        },
+                        stop: None,
+                    })
+                    .collect();
+                let outputs = {
+                    let engine = match engine.lock() {
+                        Ok(e) => e,
+                        Err(err) => {
+                            eprintln!("rubric_opd: judge_batch lock poisoned: {err}");
+                            return vec![Verdict::parse_error(); rollouts.len()];
+                        }
+                    };
+                    engine.complete_batch(reqs)
+                };
+                match outputs {
+                    Ok(outs) => outs.iter().map(|o| rubric.parse_verdict(&o.text)).collect(),
+                    Err(err) => {
+                        eprintln!("rubric_opd: judge_batch failed (all parse_error): {err}");
+                        vec![Verdict::parse_error(); rollouts.len()]
+                    }
                 }
-            };
-            engine.complete_batch(reqs)
-        };
-        match outputs {
-            Ok(outs) => outs.iter().map(|o| rubric.parse_verdict(&o.text)).collect(),
-            Err(err) => {
-                eprintln!("rubric_opd: judge_batch failed (all parse_error): {err}");
-                vec![Verdict::parse_error(); rollouts.len()]
             }
+            Self::Remote { .. } => rollouts
+                .iter()
+                .map(|r| self.judge_resilient(rubric, problem, r))
+                .collect(),
         }
     }
 
@@ -115,39 +190,47 @@ impl FlashJudge {
         problem: &str,
         max_tokens: usize,
     ) -> Result<Option<String>> {
-        let req = CompletionRequest {
-            prompt: rubric.solve_prompt(problem),
-            max_tokens,
-            sampling: SamplingParams {
-                temperature: 0.0,
-                ..SamplingParams::default()
-            },
-            stop: None,
+        let prompt = rubric.solve_prompt(problem);
+        let solution = match self {
+            Self::Local { engine, .. } => {
+                let req = CompletionRequest {
+                    prompt,
+                    max_tokens,
+                    sampling: SamplingParams {
+                        temperature: 0.0,
+                        ..SamplingParams::default()
+                    },
+                    stop: None,
+                };
+                let mut engine = engine
+                    .lock()
+                    .map_err(|err| anyhow!("Flash judge engine lock poisoned: {err}"))?;
+                engine.complete(req)?.text
+            }
+            Self::Remote { .. } => self.complete_remote(&prompt, max_tokens)?,
         };
-        let output = {
-            let mut engine = self
-                .engine
-                .lock()
-                .map_err(|err| anyhow!("Flash judge engine lock poisoned: {err}"))?;
-            engine.complete(req)?
-        };
-        let solution = output.text;
         let verdict = self.judge_resilient(rubric, problem, &solution);
         Ok(verdict.accepted.then_some(solution))
     }
 
     pub fn offload_engine_weights(&self) -> Result<usize> {
-        self.engine
-            .lock()
-            .map_err(|err| anyhow!("Flash judge engine lock poisoned: {err}"))?
-            .offload_engine_weights()
+        match self {
+            Self::Local { engine, .. } => engine
+                .lock()
+                .map_err(|err| anyhow!("Flash judge engine lock poisoned: {err}"))?
+                .offload_engine_weights(),
+            Self::Remote { .. } => Ok(0),
+        }
     }
 
     pub fn reload_engine_weights(&self) -> Result<()> {
-        self.engine
-            .lock()
-            .map_err(|err| anyhow!("Flash judge engine lock poisoned: {err}"))?
-            .reload_engine_weights()
+        match self {
+            Self::Local { engine, .. } => engine
+                .lock()
+                .map_err(|err| anyhow!("Flash judge engine lock poisoned: {err}"))?
+                .reload_engine_weights(),
+            Self::Remote { .. } => Ok(()),
+        }
     }
 }
 
