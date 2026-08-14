@@ -18,8 +18,8 @@ CURVE_DIR="${CURVE_DIR:-$RUN_ROOT/curve}"
 LOG_DIR="${LOG_DIR:-$RUN_ROOT/logs}"
 MANIFEST="${MANIFEST:-$RUN_ROOT/curve_manifest.json}"
 
-STUDENT_MODEL="${STUDENT_MODEL:-/data01/modelscope-cache/Qwen/Qwen3___5-4B}"
-TEACHER_MODEL="${TEACHER_MODEL:-/data01/models/Qwen3.6-35B-A3B}"
+STUDENT_MODEL="${STUDENT_MODEL:-/data00/qwen35-08b-clean}"
+TEACHER_MODEL="${TEACHER_MODEL:-/data00/models/Qwen3.6-35B-A3B}"
 TEACHER_RUNTIME="${TEACHER_RUNTIME:-infer}"
 
 STEPS="${STEPS:-10000}"

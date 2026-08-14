@@ -219,7 +219,7 @@ detect_deepep_dir() {
         for candidate in \
             "$ROOT/../DeepEP" \
             "$ROOT/../deepep" \
-            "/data01/build/DeepEP" \
+            "${DEEPEP_BUILD:-/data00/build/DeepEP}" \
             "/workspace/DeepEP" \
             "/workspace/deepep"; do
             if deepep_dir_valid "$candidate"; then
