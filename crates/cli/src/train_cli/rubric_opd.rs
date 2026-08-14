@@ -355,7 +355,8 @@ pub(super) fn run_rubric_opd_impl(args: TrainRubricOpdArgs) -> Result<()> {
     // \boxed answer), freeing the ~35GB judge VRAM; teacher-model is ignored.
     // Multi-GPU models (DSv4, Qwen35 MoE) spawn a separate `arle serve` child
     // process with its own TP env; the parent stays single-GPU for the student.
-    let mut judge_server: Option<JudgeServer> = None;
+    // Keep-alive handle: the server must outlive the rounds loop.
+    let mut _judge_server: Option<JudgeServer> = None;
     let judge = if args.self_consistency {
         eprintln!(
             "[arle train rubric-opd] self-consistency mode: no judge engine loaded (majority-vote on \\boxed)"
@@ -384,7 +385,7 @@ pub(super) fn run_rubric_opd_impl(args: TrainRubricOpdArgs) -> Result<()> {
                 let server =
                     JudgeServer::spawn(teacher_str, tp_size, judge_prompt_cap, judge_total)?;
                 let endpoint = server.endpoint().to_string();
-                judge_server = Some(server);
+                _judge_server = Some(server);
                 Some(FlashJudge::new_remote(endpoint, args.max_verdict_tokens))
             } else {
                 eprintln!(

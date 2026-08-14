@@ -157,7 +157,7 @@ fn task_key(label: Option<&str>) -> &str {
 /// loop select on this identical predicate.
 #[cfg(feature = "cuda")]
 fn ce_trainable(record: &ReplayRecord) -> bool {
-    record.reward >= 1.0 && record.response_mask.iter().any(|&mask| mask == 1)
+    record.reward >= 1.0 && record.response_mask.contains(&1)
 }
 
 /// PG-preset replay: group cc records by task and apply the same

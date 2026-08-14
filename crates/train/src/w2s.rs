@@ -68,6 +68,9 @@ pub fn sync_lora_adapters(
 ///   would otherwise OOM the training process. The logits are imported into
 ///   the train store as constants (no gradient flows into the aux models).
 #[derive(Clone)]
+// In-process aux models are the whole point of the variant; boxing them
+// would add indirection on the per-step hot path for no VRAM/host win.
+#[allow(clippy::large_enum_variant)]
 pub enum W2sAuxModel {
     InProcess {
         pre_rl: Qwen35Model,
