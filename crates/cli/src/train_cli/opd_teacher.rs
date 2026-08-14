@@ -153,6 +153,7 @@ pub(super) fn load_opd_infer_teacher(
     mem_fraction_static: f64,
     train_backend: std::sync::Arc<dyn autograd::Backend>,
     vocab_size: usize,
+    memory_budget_bytes: Option<usize>,
 ) -> Result<train::teacher_infer::InferTeacher> {
     use std::sync::{Arc, Mutex};
 
@@ -172,6 +173,7 @@ pub(super) fn load_opd_infer_teacher(
             // Scoring is single-sequence; the default 0.9 fraction lets the teacher
             // pool starve a co-resident student on one GPU.
             mem_fraction_static,
+            memory_budget_bytes,
             ..EngineLoadConfig::single_sequence(max_seq_len)
         },
     )

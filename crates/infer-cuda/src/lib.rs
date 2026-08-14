@@ -335,6 +335,7 @@ impl CudaExecutor {
         markov_head_rank: Option<usize>,
         dspark_block_size: Option<usize>,
         mtp_draft_tokens: Option<usize>,
+        memory_budget_bytes: Option<usize>,
     ) -> anyhow::Result<Self> {
         Ok(Self {
             inner: CudaExecutorInner::Real(Box::new(
@@ -351,6 +352,7 @@ impl CudaExecutor {
                     markov_head_rank,
                     dspark_block_size,
                     mtp_draft_tokens,
+                    memory_budget_bytes,
                 )?,
             )),
         })

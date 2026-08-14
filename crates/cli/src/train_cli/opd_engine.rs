@@ -33,6 +33,7 @@ pub(super) fn load_opd_infer_student(
     train_backend: std::sync::Arc<dyn autograd::Backend>,
     vocab_size: usize,
     runtime: &crate::args::OpdRuntimeArgs,
+    memory_budget_bytes: Option<usize>,
 ) -> Result<Option<train::infer_student::InferStudent>> {
     if !train::opd::infer_rollout_flag_enabled() {
         return Ok(None);
@@ -57,6 +58,7 @@ pub(super) fn load_opd_infer_student(
             dspark_sps_bias_ms: runtime.dspark_sps_bias_ms,
             dspark_sps_row_ms: runtime.dspark_sps_row_ms,
             mem_fraction_static: runtime.rollout_mem_fraction,
+            memory_budget_bytes,
             // Whole-step decode graph for the rollout: eager per-token decode is
             // host-launch-bound (~156 ms/token), the OPD step's dominant cost.
             cuda: runtime.cuda_runtime_flags(),
