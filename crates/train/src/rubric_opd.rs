@@ -166,6 +166,10 @@ impl FlashJudge {
         if rollouts.is_empty() {
             return Vec::new();
         }
+        if let Err(err) = self.ensure_resident() {
+            eprintln!("rubric_opd: judge reload failed: {err:#}");
+            return vec![Verdict::parse_error(); rollouts.len()];
+        }
         match self {
             Self::Local { engine, .. } => {
                 let max_tokens = self.max_verdict_tokens();
