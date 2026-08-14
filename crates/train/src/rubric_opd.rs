@@ -285,7 +285,13 @@ where
     E: FnMut(&str) -> Result<Vec<u32>>,
 {
     let mut reports = Vec::with_capacity(cfg.rounds);
+    let mut judge_offloaded = false;
     for round in 0..cfg.rounds {
+        if judge_offloaded && let Some(j) = judge {
+            eprintln!("[rubric] round {round} phase-A: reloading judge");
+            j.reload_engine_weights()?;
+            judge_offloaded = false;
+        }
         let mut rep = RoundReport {
             round,
             ..Default::default()
@@ -408,7 +414,10 @@ where
             student.offload_engine_weights().unwrap_or(0)
         };
         let freed_judge = match judge {
-            Some(j) => j.offload_engine_weights().unwrap_or(0),
+            Some(j) => {
+                judge_offloaded = true;
+                j.offload_engine_weights().unwrap_or(0)
+            }
             None => 0,
         };
         eprintln!(
@@ -429,8 +438,10 @@ where
             rep.trained += chunk.len();
         }
 
-        // Reload engines. `share_frozen_base`: rollout base was never offloaded
-        // (aliased by student), so skip its reload — only re-acquire the KV pool.
+        // `share_frozen_base`: rollout base was never offloaded (aliased by
+        // student) — only re-acquire the KV pool. Judge reload is deferred to
+        // the next round's phase-A so the post-round LoRA re-merge gets its
+        // FP8+BF16 peak headroom.
         eprintln!("[rubric] round {round} phase-D: reloading engines");
         if !cfg.share_frozen_base {
             student.reload_engine_weights()?;
@@ -438,9 +449,6 @@ where
             if let Err(err) = student.ensure_kv_pool() {
                 eprintln!("[rubric] ensure KV pool failed: {err}");
             }
-        }
-        if let Some(j) = judge {
-            j.reload_engine_weights()?;
         }
 
         rep.mean_train_loss = if rep.trained > 0 {
