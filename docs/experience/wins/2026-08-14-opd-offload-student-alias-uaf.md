@@ -1,6 +1,6 @@
 # OPD offload=student frozen-base alias UAF fix — CUDA, 2026-08-14
 
-> Status: pending-remote
+> Status: Shipped
 
 ## Goal
 
@@ -52,13 +52,22 @@ train opd --backend auto \
 
 ## Results
 
-| arm | steps | grad-nan | outcome |
-|---|---:|---|---|
-| pre-fix, offload=student | 0 (NaN at step 1) | yes | established 2026-08-13 |
-| post-fix, offload=student | pending-remote | pending-remote | pending-remote |
-| post-fix, offload=off control | pending-remote | pending-remote | pending-remote |
+| arm | steps | losses | NaN/illegal lines | outcome |
+|---|---:|---|---|---|
+| pre-fix, offload=student | 0 (NaN at step 1) | non-finite | yes (sanitizer: illegal READ) | established 2026-08-13 |
+| post-fix, offload=student | 3/3 | 26.849 / 27.136 / 14.958 | 0 | PASS |
+| post-fix, offload=off control | 3/3 | 25.917 / 27.033 / 14.919 | 0 | PASS |
+| post-fix, offload=student, compute-sanitizer memcheck (1 step) | 1/1 | 25.277 | ERROR SUMMARY: 0 errors | PASS |
 
-Raw artifacts: pod log `/host/wf-uaf1-repro.log` (pending).
+`[probe-forward]` hidden_sum_sq at after_autograd_load / after_engine_load /
+after_init_offload: `2263590.243214886` — byte-identical to the established
+pre-fix probes.
+`[opd-vram-plan]` (H20, 95387 MiB free): student_engine 23846 MiB,
+teacher_engine 23846 MiB, autograd_reserve 47693 MiB.
+
+Raw artifacts: pod logs `/host/wf-uaf1-repro.log`, `/host/wf-uaf1-control.log`,
+`/host/wf-uaf1-sanitizer.log`; build receipt `build:wf-uaf1` (BUILD_EXIT=0 at
+`4b8b02f9f`).
 
 ## Problems
 
