@@ -406,7 +406,10 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         let decode_pages = plan
             .decode_rows
             .iter()
-            .map(|row| self.kv.append_pages_needed(row.slot, 1))
+            .map(|row| {
+                self.kv
+                    .append_pages_needed(row.slot, self.executor.spec_row_tokens())
+            })
             .sum::<usize>();
         prefill_pages + decode_pages
     }

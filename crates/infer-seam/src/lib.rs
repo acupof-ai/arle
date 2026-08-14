@@ -279,6 +279,17 @@ pub trait BackendExecutor {
         usize::MAX
     }
 
+    /// Total KV tokens one decode row may reach in a single [`Self::submit`]:
+    /// the committed token plus any speculative chain the executor drafts and
+    /// verifies in that step. The engine budgets and pre-allocates this many
+    /// tokens per decode row through its reclaim/preempt path, so a
+    /// speculative executor never grows the KV pool inside `submit` — where
+    /// an alloc failure is engine-fatal. Default 1: non-speculative
+    /// executors append one token.
+    fn spec_row_tokens(&self) -> usize {
+        1
+    }
+
     /// Maximum number of live frontend requests this backend wants the serve
     /// layer to allow at once. Batched/server backends keep the unbounded
     /// default. Desktop scalar backends can return `1` so the frontend rejects a

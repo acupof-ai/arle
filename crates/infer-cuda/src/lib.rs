@@ -795,6 +795,14 @@ impl BackendExecutor for CudaExecutor {
         }
     }
 
+    fn spec_row_tokens(&self) -> usize {
+        match &self.inner {
+            CudaExecutorInner::Placeholder => 1,
+            #[cfg(feature = "cuda")]
+            CudaExecutorInner::Real(real) => real.spec_row_tokens(),
+        }
+    }
+
     fn demote_prefix_pages(&mut self, entries: &[(u32, u64)]) -> anyhow::Result<usize> {
         match &mut self.inner {
             CudaExecutorInner::Placeholder => {
