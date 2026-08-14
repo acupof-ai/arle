@@ -48,7 +48,17 @@ fn available_ram_bytes() -> Option<usize> {
         })
 }
 
-fn should_prefetch_shards(rank: usize, available: usize, checkpoint: usize) -> bool {
+fn should_prefetch_shards(
+    rank: usize,
+    world_size: usize,
+    available: usize,
+    checkpoint: usize,
+) -> bool {
+    // With TP>1, each rank only reads its own shard; prefetching all shards
+    // on rank 0 wastes host memory (294 GB for DSv4-Flash) and can OOM the pod.
+    if world_size > 1 {
+        return false;
+    }
     rank == 0 && checkpoint > 0 && available >= checkpoint.saturating_add(PREFETCH_CACHE_HEADROOM)
 }
 
@@ -920,8 +930,9 @@ impl SafetensorLoader {
             .sum();
         let available = available_ram_bytes().unwrap_or(0);
         let rank = tp.config().rank;
+        let world_size = tp.config().world_size as usize;
         let enabled = std::env::var_os("ARLE_LOADER_PREFETCH").is_none_or(|value| value != "0");
-        let prefetch = enabled && should_prefetch_shards(rank, available, checkpoint);
+        let prefetch = enabled && should_prefetch_shards(rank, world_size, available, checkpoint);
         if prefetch {
             self.prefetch_all_shards();
         }
