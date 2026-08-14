@@ -24,6 +24,10 @@ pub(crate) struct Qwen35Workspace {
     /// steady-state per-token device allocation (`ops::argmax`'s
     /// `alloc_zeros(1)`).
     pub(crate) argmax_out: SliceSlot<i32>,
+    /// OpenAI logprobs capture written by the LAST host sampling in a submit
+    /// (`SamplingParams::top_logprobs` requests only); the executor drains it
+    /// with `mem::take` right after the model call that sampled it.
+    pub(crate) top_logprobs: Vec<(u32, f32)>,
     /// Buffer-address generation. Bumped whenever cached buffers are dropped
     /// wholesale ([`Self::release`]) — i.e. whenever previously-cached device
     /// ADDRESSES may change on the next `get`. The captured decode graph bakes
@@ -154,6 +158,8 @@ impl Qwen35Workspace {
             last_normed,
             logits,
             argmax_out,
+            // Host-side capture; no device buffer to release.
+            top_logprobs: _,
             epoch: _,
         } = self;
         token_ids.release();

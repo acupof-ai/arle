@@ -1088,3 +1088,27 @@ pub(crate) fn sample_cuda_token_scratched(
         infer_plan::sample_token_logprob_penalized(&logits_host, params, position, penalty);
     Ok((token, logprob))
 }
+
+/// [`sample_cuda_token_scratched`] plus the OpenAI logprobs capture
+/// (`SamplingParams::top_logprobs`) written into `capture`; one host copy
+/// feeds both the draw and the capture. Requests without the capture take the
+/// scratched path unchanged.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn sample_cuda_token_captured(
+    ctx: &DeviceContext,
+    logits: &DeviceVec,
+    params: &SamplingParams,
+    position: u64,
+    argmax_out: &mut cudarc::driver::CudaSlice<i32>,
+    penalty: infer_plan::PenaltyHistory<'_>,
+    capture: &mut Vec<(u32, f32)>,
+) -> Result<(u32, Option<f32>)> {
+    if params.top_logprobs.is_none() {
+        return sample_cuda_token_scratched(ctx, logits, params, position, argmax_out, penalty);
+    }
+    let logits_host = logits.to_host(ctx)?;
+    let (token, logprob) =
+        infer_plan::sample_token_logprob_penalized(&logits_host, params, position, penalty);
+    *capture = infer_plan::sampled_top_logprobs(&logits_host, params, penalty, token);
+    Ok((token, logprob))
+}

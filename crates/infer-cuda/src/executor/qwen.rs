@@ -532,6 +532,7 @@ impl QwenCudaExecutor {
                     .unwrap_or_else(|| plan.decode_rows[0].slot),
                 token,
                 logprob: None,
+                top_logprobs: Vec::new(),
                 finish: None,
             }],
         })
@@ -637,6 +638,7 @@ impl QwenCudaExecutor {
             slot: row.slot,
             token,
             logprob: None,
+            top_logprobs: Vec::new(),
             finish: None,
         })
     }
@@ -721,6 +723,7 @@ impl QwenCudaExecutor {
                     slot: row.slot,
                     token,
                     logprob: None,
+                    top_logprobs: Vec::new(),
                     finish: None,
                 });
             }
@@ -762,6 +765,7 @@ impl QwenCudaExecutor {
                 slot: row.slot,
                 token,
                 logprob: None,
+                top_logprobs: Vec::new(),
                 finish: None,
             })
             .collect())

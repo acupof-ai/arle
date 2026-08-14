@@ -562,6 +562,11 @@ pub struct RelayCompletionDelta {
     /// default so pre-P6 workers interoperate.
     #[serde(default)]
     pub logprobs: Vec<f32>,
+    /// OpenAI logprobs capture, one entry per `token_ids` entry (entry 0 =
+    /// sampled token's full-dist logprob, 1.. = top-N alternatives) — or empty
+    /// when the request did not ask / the executor does not surface it.
+    #[serde(default)]
+    pub top_logprobs: Vec<Vec<(u32, f32)>>,
     pub finish: bool,
     /// Finish reason on the terminal delta, so the coordinator reports the real
     /// OpenAI `finish_reason` rather than always "stop".

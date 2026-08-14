@@ -173,12 +173,14 @@ impl BackendExecutor for EchoExecutor {
                 slot: row.slot,
                 token: row.tokens.last().copied().unwrap_or(0).wrapping_add(1),
                 logprob: None,
+                top_logprobs: Vec::new(),
                 finish: None,
             })
             .chain(plan.decode_rows.iter().map(|row| SlotToken {
                 slot: row.slot,
                 token: row.last_token.wrapping_add(1),
                 logprob: None,
+                top_logprobs: Vec::new(),
                 finish: None,
             }))
             .collect();

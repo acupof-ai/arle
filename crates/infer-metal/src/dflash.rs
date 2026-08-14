@@ -1027,6 +1027,7 @@ pub(crate) fn qwen35_speculative_block(
                     slot,
                     token,
                     logprob: None,
+                    top_logprobs: Vec::new(),
                     finish: None,
                 })
                 .collect(),

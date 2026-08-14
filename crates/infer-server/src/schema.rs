@@ -173,8 +173,9 @@ pub struct CompletionRequest {
     /// for client compatibility (values > 1 are ignored).
     #[serde(default)]
     pub n: Option<usize>,
-    /// Per-token logprobs depth (0–20). Engine does not surface logprobs yet;
-    /// accepted for client compatibility.
+    /// OpenAI completions `logprobs`: per-token logprob of the sampled token
+    /// plus the top-N alternatives (0–8; larger is rejected). Surfaced by the
+    /// CUDA Qwen3.5/3.6 executor; other backends answer 501.
     #[serde(default)]
     pub logprobs: Option<u32>,
     /// Token-id → bias map added to the logits before sampling.
@@ -189,6 +190,13 @@ impl CompletionRequest {
     pub(crate) fn validate(&self) -> Result<(), ApiError> {
         if self.prompt.is_empty() {
             return Err(ApiError::bad_request("prompt must not be empty"));
+        }
+        if let Some(n) = self.logprobs
+            && n > MAX_LOGPROBS
+        {
+            return Err(ApiError::bad_request(format!(
+                "logprobs must be at most {MAX_LOGPROBS}"
+            )));
         }
         validate_common(
             self.max_tokens,
@@ -215,6 +223,7 @@ impl CompletionRequest {
             self.seed,
             self.logit_bias.clone(),
             self.n,
+            self.logprobs.map(|n| n as usize),
         )
     }
 }
@@ -264,12 +273,12 @@ pub struct ChatCompletionRequest {
     /// accepted for client compatibility (values > 1 are ignored).
     #[serde(default)]
     pub n: Option<usize>,
-    /// Whether to return per-token logprobs. Engine does not surface logprobs
-    /// yet; accepted for client compatibility.
+    /// Whether to return per-token logprobs. Surfaced (with `top_logprobs`
+    /// alternatives) by the CUDA Qwen3.5/3.6 executor; other backends fall
+    /// back to the legacy behavior-logprob shape.
     #[serde(default)]
     pub logprobs: Option<bool>,
-    /// Number of top-k logprobs to return per token (0–20). Engine does not
-    /// surface logprobs yet; accepted for client compatibility.
+    /// Number of top-k logprobs to return per token (0–8; larger is rejected).
     #[serde(default)]
     pub top_logprobs: Option<u32>,
     /// Token-id → bias map added to the logits before sampling.
@@ -300,6 +309,13 @@ impl ChatCompletionRequest {
                 "messages must contain at least one message",
             ));
         }
+        if let Some(n) = self.top_logprobs
+            && n > MAX_LOGPROBS
+        {
+            return Err(ApiError::bad_request(format!(
+                "top_logprobs must be at most {MAX_LOGPROBS}"
+            )));
+        }
         validate_common(
             self.max_tokens,
             self.repetition_penalty,
@@ -325,6 +341,9 @@ impl ChatCompletionRequest {
             self.seed,
             self.logit_bias.clone(),
             self.n,
+            self.logprobs
+                .unwrap_or(false)
+                .then(|| self.top_logprobs.unwrap_or(0) as usize),
         )
     }
 
@@ -553,6 +572,10 @@ fn validate_common(
     Ok(())
 }
 
+/// Cap on requested logprobs alternatives (OpenAI allows up to 5 on
+/// completions / 20 on chat; the capture is host-side O(vocab·n) per token).
+pub(crate) const MAX_LOGPROBS: u32 = 8;
+
 #[allow(clippy::too_many_arguments)]
 fn sampling_params(
     max_tokens: Option<usize>,
@@ -568,6 +591,7 @@ fn sampling_params(
     seed: Option<u64>,
     logit_bias: Option<std::collections::HashMap<u32, f32>>,
     n: Option<usize>,
+    top_logprobs: Option<usize>,
 ) -> SamplingParams {
     let default = SamplingParams::default();
     let serve = sampling_defaults();
@@ -590,6 +614,7 @@ fn sampling_params(
             v
         },
         n: n.unwrap_or(1).max(1),
+        top_logprobs,
     }
 }
 
@@ -617,20 +642,8 @@ impl CompletionResponse {
         finish: Option<&FinishReason>,
         token_ids: Option<Vec<u32>>,
         prompt_token_ids: Option<Vec<u32>>,
-        logprobs: Option<Vec<f32>>,
+        logprobs_value: Option<serde_json::Value>,
     ) -> Self {
-        let logprobs_value = logprobs.and_then(|lps| {
-            let toks = token_ids.as_ref()?;
-            if lps.len() != toks.len() {
-                return None;
-            }
-            Some(serde_json::json!({
-                "tokens": toks.iter().map(|&t| t.to_string()).collect::<Vec<_>>(),
-                "token_logprobs": lps,
-                "top_logprobs": vec![serde_json::Value::Null; lps.len()],
-                "text_offset": (0..toks.len()).collect::<Vec<_>>(),
-            }))
-        });
         Self {
             id: format!("cmpl-{}", uuid::Uuid::new_v4().simple()),
             object: "text_completion",
@@ -968,7 +981,8 @@ fn ratio(numerator: u64, denominator: u64) -> Option<f64> {
 pub struct CompletionChoice {
     pub text: String,
     pub index: usize,
-    /// Per-token logprobs (always `null` — not yet surfaced by the engine).
+    /// OpenAI completions logprobs object (`tokens` / `token_logprobs` /
+    /// `top_logprobs` / `text_offset`), present when the request asked for it.
     pub logprobs: Option<serde_json::Value>,
     pub finish_reason: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1002,7 +1016,7 @@ impl ChatCompletionResponse {
         finish: Option<&FinishReason>,
         enable_thinking: bool,
         tool_calls: Vec<ResponseToolCall>,
-        logprobs: Option<(Vec<u32>, Vec<f32>)>,
+        logprobs_value: Option<serde_json::Value>,
     ) -> Self {
         let (reasoning_content, content) = split_reasoning(&content, enable_thinking);
         // OpenAI semantics: any emitted tool call overrides the finish reason.
@@ -1016,23 +1030,6 @@ impl ChatCompletionResponse {
         } else {
             Usage::new(prompt_tokens, completion_tokens)
         };
-        let logprobs_value = logprobs.and_then(|(toks, lps)| {
-            if lps.len() != toks.len() {
-                return None;
-            }
-            let content_logprobs: Vec<serde_json::Value> = toks
-                .iter()
-                .zip(lps.iter())
-                .map(|(&t, &lp)| {
-                    serde_json::json!({
-                        "token": t.to_string(),
-                        "logprob": lp,
-                        "top_logprobs": [],
-                    })
-                })
-                .collect();
-            Some(serde_json::json!({ "content": content_logprobs }))
-        });
         Self {
             id: format!("chatcmpl-{}", uuid::Uuid::new_v4().simple()),
             object: "chat.completion",
@@ -1059,7 +1056,8 @@ impl ChatCompletionResponse {
 pub struct ChatChoice {
     pub index: usize,
     pub message: AssistantMessage,
-    /// Per-token logprobs (always `null` — not yet surfaced by the engine).
+    /// OpenAI chat logprobs object (`content` entries), present when the
+    /// request asked for it.
     pub logprobs: Option<serde_json::Value>,
     pub finish_reason: String,
 }

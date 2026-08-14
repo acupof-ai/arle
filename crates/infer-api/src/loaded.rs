@@ -2359,7 +2359,10 @@ mod backend {
     #[cfg(feature = "cuda")]
     type PendingTokens = std::rc::Rc<
         std::cell::RefCell<
-            std::collections::HashMap<infer_core::RequestHandle, Vec<(u32, Option<f32>)>>,
+            std::collections::HashMap<
+                infer_core::RequestHandle,
+                Vec<(u32, Option<f32>, Vec<(u32, f32)>)>,
+            >,
         >,
     >;
 
@@ -2394,11 +2397,11 @@ mod backend {
             if owns_output {
                 let pending = std::rc::Rc::clone(&pending);
                 engine.set_token_observer(Box::new(move |handle, token| {
-                    pending
-                        .borrow_mut()
-                        .entry(handle)
-                        .or_default()
-                        .push((token.token, token.logprob));
+                    pending.borrow_mut().entry(handle).or_default().push((
+                        token.token,
+                        token.logprob,
+                        token.top_logprobs.clone(),
+                    ));
                 }));
             }
             Ok(Self {
@@ -2532,15 +2535,24 @@ mod backend {
                 // misalign the sidecar's token↔logprob pairing downstream).
                 let logprobs = new_tokens
                     .iter()
-                    .map(|&(_, lp)| lp)
+                    .map(|&(_, lp, _)| lp)
                     .collect::<Option<Vec<f32>>>()
                     .unwrap_or_default();
+                // Same all-or-nothing rule for the OpenAI logprobs capture.
+                let top_logprobs = if !new_tokens.is_empty()
+                    && new_tokens.iter().all(|(_, _, top)| !top.is_empty())
+                {
+                    new_tokens.iter().map(|(_, _, top)| top.clone()).collect()
+                } else {
+                    Vec::new()
+                };
                 out.push((
                     request_id,
                     infer_server::RelayCompletionDelta {
                         text_delta: String::new(),
-                        token_ids: new_tokens.into_iter().map(|(t, _)| t).collect(),
+                        token_ids: new_tokens.into_iter().map(|(t, _, _)| t).collect(),
                         logprobs,
+                        top_logprobs,
                         finish,
                         finish_reason,
                         error,

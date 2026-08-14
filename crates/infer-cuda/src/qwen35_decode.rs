@@ -1,5 +1,10 @@
 use super::*;
 
+/// One batched-decode row's sample: `(token, behavior logprob, OpenAI
+/// logprobs capture)` — the capture is empty unless the row's
+/// `SamplingParams::top_logprobs` asked for it.
+pub(crate) type BatchSample = (u32, Option<f32>, Vec<(u32, f32)>);
+
 impl Qwen35Model {
     pub(crate) fn forward_decode_step_captured(
         &self,
@@ -126,7 +131,7 @@ impl Qwen35Model {
         params: &[SamplingParams],
         sample_positions: &[u64],
         penalties: &[infer_plan::PenaltyHistory<'_>],
-    ) -> Result<Vec<(u32, Option<f32>)>> {
+    ) -> Result<Vec<BatchSample>> {
         let b = tokens.len();
         ensure!(b >= 1, "Qwen3.5 batched decode requires at least one row");
         ensure!(
@@ -372,19 +377,21 @@ impl Qwen35Model {
         let out = params
             .iter()
             .enumerate()
-            .map(|(r, p)| -> anyhow::Result<(u32, Option<f32>)> {
+            .map(|(r, p)| -> anyhow::Result<BatchSample> {
                 if p.is_raw_argmax() {
-                    return Ok((greedy_ids[r] as u32, None));
+                    return Ok((greedy_ids[r] as u32, None, Vec::new()));
                 }
                 let row_vec = row_logits.get(&self.ctx, vocab)?;
                 copy_row_to_vec(&self.ctx, logits_buf, r, row_vec)?;
                 let host = row_vec.to_host(&self.ctx)?;
-                Ok(infer_plan::sample_token_logprob_penalized(
+                let (token, logprob) = infer_plan::sample_token_logprob_penalized(
                     &host,
                     p,
                     sample_positions[r],
                     penalties[r],
-                ))
+                );
+                let top = infer_plan::sampled_top_logprobs(&host, p, penalties[r], token);
+                Ok((token, logprob, top))
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
         Ok(out)
@@ -402,7 +409,7 @@ impl Qwen35Model {
         params: &[SamplingParams],
         sample_positions: &[u64],
         penalties: &[infer_plan::PenaltyHistory<'_>],
-    ) -> Result<Vec<(u32, Option<f32>)>> {
+    ) -> Result<Vec<BatchSample>> {
         let b = tokens.len();
         ensure!(
             b >= 1,
@@ -630,19 +637,21 @@ impl Qwen35Model {
         let out = params
             .iter()
             .enumerate()
-            .map(|(r, p)| -> anyhow::Result<(u32, Option<f32>)> {
+            .map(|(r, p)| -> anyhow::Result<BatchSample> {
                 if p.is_raw_argmax() {
-                    return Ok((greedy_ids[r] as u32, None));
+                    return Ok((greedy_ids[r] as u32, None, Vec::new()));
                 }
                 let row_vec = row_logits.get(&self.ctx, vocab)?;
                 copy_row_to_vec(&self.ctx, logits_buf, r, row_vec)?;
                 let host = row_vec.to_host(&self.ctx)?;
-                Ok(infer_plan::sample_token_logprob_penalized(
+                let (token, logprob) = infer_plan::sample_token_logprob_penalized(
                     &host,
                     p,
                     sample_positions[r],
                     penalties[r],
-                ))
+                );
+                let top = infer_plan::sampled_top_logprobs(&host, p, penalties[r], token);
+                Ok((token, logprob, top))
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
         Ok(out)

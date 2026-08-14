@@ -40,3 +40,22 @@ fn penalties_and_stop_tokens_survive_the_relay_wire_format() {
     assert_eq!(back.seed, params.seed);
     assert!(back.has_penalty());
 }
+
+/// The logprobs capture request must survive the relay wire, and its absence
+/// must deserialize from pre-capture peers (serde default).
+#[test]
+fn top_logprobs_survives_the_relay_wire_format() {
+    let mut params = SamplingParams::default();
+    params.top_logprobs = Some(2);
+    let back = roundtrip(&params);
+    assert_eq!(back.top_logprobs, Some(2));
+    assert!(
+        !back.is_raw_argmax(),
+        "the capture still vetoes the fast path"
+    );
+
+    let legacy: SamplingParams =
+        serde_json::from_str(r#"{"temperature":0.0,"top_k":-1,"top_p":1.0,"min_p":0.0,"repetition_penalty":1.0,"frequency_penalty":0.0,"presence_penalty":0.0,"ignore_eos":false,"stop_token_ids":[],"seed":null,"max_new_tokens":null,"grammar_bitmask":null,"logit_bias":[],"n":1}"#)
+            .expect("pre-capture wire format still parses");
+    assert_eq!(legacy.top_logprobs, None);
+}

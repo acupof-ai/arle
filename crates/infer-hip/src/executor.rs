@@ -115,6 +115,7 @@ impl BackendExecutor for HipDsv4Executor {
                     slot: row.slot,
                     token,
                     logprob: None,
+                    top_logprobs: Vec::new(),
                     finish: None,
                 }],
             }));
@@ -135,6 +136,7 @@ impl BackendExecutor for HipDsv4Executor {
                     slot: row.slot,
                     token,
                     logprob: None,
+                    top_logprobs: Vec::new(),
                     finish: None,
                 }],
             }));

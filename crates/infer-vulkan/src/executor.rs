@@ -218,6 +218,7 @@ impl BackendExecutor for VulkanExecutor {
                     slot: row.slot,
                     token,
                     logprob: None,
+                    top_logprobs: Vec::new(),
                     finish: None,
                 }],
             }));
@@ -239,6 +240,7 @@ impl BackendExecutor for VulkanExecutor {
                     slot: row.slot,
                     token,
                     logprob: None,
+                    top_logprobs: Vec::new(),
                     finish: None,
                 }],
             }));
