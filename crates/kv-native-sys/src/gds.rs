@@ -82,6 +82,7 @@ fn libcufile_loadable() -> bool {
 }
 
 #[cfg(any(target_os = "linux", test))]
+#[allow(dead_code)]
 fn json_bool(config: &str, key: &str) -> Option<bool> {
     let value = config
         .split_once(&format!("\"{key}\""))?
@@ -105,6 +106,7 @@ fn p2pmem_available(devices: &Path) -> bool {
 }
 
 #[cfg(any(target_os = "linux", test))]
+#[allow(dead_code)]
 fn mount_for(mountinfo: &str, root: &Path) -> Option<(String, String)> {
     mountinfo
         .lines()
@@ -122,6 +124,7 @@ fn mount_for(mountinfo: &str, root: &Path) -> Option<(String, String)> {
 }
 
 #[cfg(any(target_os = "linux", test))]
+#[allow(dead_code)]
 fn unescape_mount(value: &str) -> String {
     value
         .replace("\\040", " ")
