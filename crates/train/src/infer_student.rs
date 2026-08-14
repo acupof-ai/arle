@@ -311,7 +311,7 @@ impl InferStudent {
             alpha: lora_config.alpha,
         };
 
-        let mut engine = self
+        let engine = self
             .engine
             .lock()
             .map_err(|err| anyhow!("LoadedInferenceEngine lock poisoned: {err}"))?;
@@ -354,11 +354,6 @@ impl InferStudent {
                     anyhow!("LoRA sync: set requires_grad=false for {name} failed: {err}")
                 })?;
             }
-
-            engine = self
-                .engine
-                .lock()
-                .map_err(|err| anyhow!("LoadedInferenceEngine lock poisoned: {err}"))?;
         }
         Ok(())
     }
