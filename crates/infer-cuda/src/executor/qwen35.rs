@@ -252,6 +252,13 @@ impl Qwen35CudaExecutor {
         if !self.slots[slot].has_recurrent() {
             return Ok(());
         }
+        // The D2H copy costs ~80ms (146.8 MiB). For short prompts the recompute
+        // saved by a future prefix restore is less than the serialization cost,
+        // so skip — this is the c=4 ITL p99 tail (multiple serializations in
+        // one tick stacked to 240-320ms).
+        if tokens.len() < 256 {
+            return Ok(());
+        }
         // Drain up front so every exit path leaves the slot clean for its next
         // occupant;
         // a leaked entry would double-save under a later publish.
