@@ -32,7 +32,16 @@ question has two genuinely competing continuations: answer form (`A: …`) and
 document form (a Wikipedia body plus reference list). `ignore_eos=true` then
 forces 128 tokens, so the document form runs into repeated citation dates.
 
-## Cause unknown
+## Cause — resolved 2026-08-15
+
+The logit-bias threshold measurement
+(wins/2026-08-15-dsv4-first-token-flip-near-tied-pair.md) established the
+near-tied arm: c=1 top-2 margin < 0.125 logit units, c=16 unstable at zero
+bias (6/10 vs 4/10), and the winner also flips between TP=8 and TP=4. The
+pair is tied within FP8 MoE + reduction-order noise; no batching defect.
+The section below is the pre-measurement state, kept as filed.
+
+## Cause unknown (as filed 2026-08-14)
 
 Whether the first-token flip is batch-dependent numerics on a near-tied logit
 pair, or a batching defect, is **not** established. The two carry opposite
