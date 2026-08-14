@@ -348,7 +348,7 @@ where
             .spawn(move || match builder() {
                 Ok(mut engine) => {
                     if let Err(err) = engine.warmup() {
-                        let _ = ready_tx.send(Err(err.to_string()));
+                        let _ = ready_tx.send(Err(format!("{err:#}")));
                         return;
                     }
                     let max_live_requests = engine.max_live_requests();
@@ -356,7 +356,8 @@ where
                     engine_loop(engine, submit_rx, control_rx, loop_counters, shutdown);
                 }
                 Err(err) => {
-                    let _ = ready_tx.send(Err(err.to_string()));
+                    // {err:#} keeps the context chain across the String channel.
+                    let _ = ready_tx.send(Err(format!("{err:#}")));
                 }
             })
             .expect("spawn infer-engine thread");
