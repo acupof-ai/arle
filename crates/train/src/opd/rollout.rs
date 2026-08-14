@@ -15,8 +15,8 @@ use crate::{
 #[cfg(feature = "cuda")]
 use super::InferRolloutCtx;
 use super::{
-    EngineOffloadMode, OpdError, OpdStepConfig, OpdStepProfile, Result, log_opd_step_trace,
-    map_qwen35_forward_error, record_profile,
+    EngineOffloadMode, OpdError, OpdStepConfig, OpdStepProfile, Result, log_free_vram,
+    log_opd_step_trace, map_qwen35_forward_error, record_profile,
     validation::{validate_forced_rollout, validate_rollout_shape, validate_token_ids},
 };
 
@@ -554,6 +554,7 @@ pub(super) fn rollout_phase(
                     OpdError::InvalidInput(format!("infer student reload failed: {err}"))
                 })?;
             }
+            log_free_vram(store, "after_student_reload");
             log_opd_step_trace(total_started, "infer_rollout_sync_lora_start", "");
             ctx.student
                 .sync_lora_from_store(
@@ -577,6 +578,7 @@ pub(super) fn rollout_phase(
                 "infer_rollout_generate_done",
                 format!("actual_rollout_len={}", rollout.len()),
             );
+            log_free_vram(store, "after_rollout_generate");
             store.retain_ids(rollout_keep_base);
             // NB: the infer student engine is idle after the rollout, but we do
             // NOT offload it here. Offloading mid-step (before the teacher

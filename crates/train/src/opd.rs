@@ -241,6 +241,19 @@ pub(crate) fn step_trace_enabled() -> bool {
     }
 }
 
+/// Phase-boundary free-VRAM ledger line (step-trace gated).
+fn log_free_vram(store: &TensorStore, label: &str) {
+    if step_trace_enabled()
+        && let Some((free, total)) = store.backend().device_mem_info()
+    {
+        eprintln!(
+            "[vram-phase] {label} free_gb={:.2} total_gb={:.2}",
+            free as f64 / (1u64 << 30) as f64,
+            total as f64 / (1u64 << 30) as f64
+        );
+    }
+}
+
 fn log_opd_step_trace(step_started: Instant, event: &str, detail: impl AsRef<str>) {
     if step_trace_enabled() {
         eprintln!(
