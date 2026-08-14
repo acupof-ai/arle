@@ -66,10 +66,11 @@ pub struct CounterSnapshot {
 type CounterHandle = Arc<Mutex<CounterSnapshot>>;
 
 fn publish_counters<E: BackendExecutor, K: KvPool>(
-    engine: &mut Engine<E, K>,
+    engine: &Engine<E, K>,
     counters: &CounterHandle,
 ) {
     if let Ok(mut snap) = counters.lock() {
+        let stats = engine.backend_stats();
         snap.active_requests = engine.active_count();
         snap.queue_depth = engine.waiting_count();
         snap.kv_free_pages = engine.kv_free_pages();
@@ -77,8 +78,8 @@ fn publish_counters<E: BackendExecutor, K: KvPool>(
         snap.throughput = engine.throughput_stats();
         snap.kv_tier = engine.kv_tier_stats();
         snap.kv_system = engine.kv_system_metrics();
-        snap.spec_decode = engine.spec_decode_stats();
-        snap.op_timing = engine.op_timing_stats();
+        snap.spec_decode = stats.spec_decode;
+        snap.op_timing = stats.op_timing;
     }
 }
 
@@ -197,7 +198,7 @@ fn engine_loop_with_tick_broadcaster<E, K>(
     loop {
         if shutdown.is_requested() {
             abort_pending(&mut pending, &streamers);
-            publish_counters(&mut engine, &counters);
+            publish_counters(&engine, &counters);
             return;
         }
 
@@ -236,7 +237,7 @@ fn engine_loop_with_tick_broadcaster<E, K>(
             // Keep telemetry live: `quiesce_serve` polls `active_requests == 0`
             // after `quiesce()` cancelled everything — without this publish the
             // counter stays stale and that poll never clears (60s timeout).
-            publish_counters(&mut engine, &counters);
+            publish_counters(&engine, &counters);
             // Frontend gone (submit channel closed) → exit like the idle path,
             // so engine teardown never deadlocks on a quiesced engine.
             if !submit_open {
@@ -282,7 +283,7 @@ fn engine_loop_with_tick_broadcaster<E, K>(
                      stopping rank-0 engine before local admission/step: {err:#}"
                 );
                 abort_pending(&mut pending, &streamers);
-                publish_counters(&mut engine, &counters);
+                publish_counters(&engine, &counters);
                 return;
             }
             tick_seq += 1;
@@ -346,13 +347,13 @@ fn engine_loop_with_tick_broadcaster<E, K>(
                     pending.len()
                 );
             }
-            publish_counters(&mut engine, &counters);
+            publish_counters(&engine, &counters);
             continue;
         }
 
         // Idle pass: the stepping branch above publishes on every tick, so this
         // is the only other place counters can go stale.
-        publish_counters(&mut engine, &counters);
+        publish_counters(&engine, &counters);
 
         if !submit_open {
             // Flush any straggler completions before leaving.

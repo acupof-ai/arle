@@ -279,17 +279,13 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             // Publish ensures radix + sidecar are captured (idempotent for
             // already-cached blocks — returns empty in that case).
             let _ = self.publish_prefix_blocks(slot, &committed_tokens);
-        } else if self.executor.kv_slot_tier().is_some()
-            && matches!(request.phase, RequestPhase::Decoding)
+        } else if matches!(request.phase, RequestPhase::Decoding)
             && demoted_seq_len > 0
+            && let Some(tier) = self.executor.kv_slot_tier()
         {
             let key = self.next_tier_key;
             self.next_tier_key = self.next_tier_key.wrapping_add(1);
-            let demoted = match self.executor.kv_slot_tier() {
-                Some(tier) => tier.demote_slot(slot, key),
-                None => Ok(false),
-            };
-            match demoted {
+            match tier.demote_slot(slot, key) {
                 Ok(true) => {
                     slot_swap_key = Some(key);
                     self.kv_tier_stats.demoted_slots =
@@ -419,13 +415,11 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             .iter()
             .map(|row| self.kv.append_pages_needed(row.slot, row.tokens.len()))
             .sum::<usize>();
+        let spec_row_tokens = self.executor.step_limits().spec_row_tokens;
         let decode_pages = plan
             .decode_rows
             .iter()
-            .map(|row| {
-                self.kv
-                    .append_pages_needed(row.slot, self.executor.step_limits().spec_row_tokens)
-            })
+            .map(|row| self.kv.append_pages_needed(row.slot, spec_row_tokens))
             .sum::<usize>();
         prefill_pages + decode_pages
     }

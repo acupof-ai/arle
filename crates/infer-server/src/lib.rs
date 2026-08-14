@@ -282,7 +282,7 @@ where
             .name("infer-engine".to_string())
             .spawn(move || {
                 engine_loop(
-                    Engine::with_config(executor, kv, config),
+                    Engine::with_config(executor, kv, config).expect("engine config rejected"),
                     submit_rx,
                     control_rx,
                     loop_counters,
@@ -497,7 +497,10 @@ where
         infer_seam::OperatorDispatchStats,
         infer_seam::BackendArtifactIdentity,
     )> {
-        self.run_on_engine(|engine| (engine.operator_dispatch_stats(), engine.artifact_identity()))
+        self.run_on_engine(|engine| {
+            let stats = engine.backend_stats();
+            (stats.operator_dispatch, stats.artifact)
+        })
     }
 
     fn acquire_live_request(&self) -> Result<()> {
@@ -573,19 +576,13 @@ where
     /// control seam, so the weight movement never races an in-flight forward
     /// step. Blocks until the round-trip completes.
     pub fn offload_engine_weights(&self) -> Result<usize> {
-        self.run_on_executor(|executor| match executor.weight_residency() {
-            Some(residency) => residency.offload_weights(),
-            None => Ok(0),
-        })?
+        self.run_on_engine(|engine| engine.offload_engine_weights())?
     }
 
     /// Reload the engine's device weights from the host snapshot (OPD teacher
     /// weight time-share). Blocks until the H2D round-trip completes.
     pub fn reload_engine_weights(&self) -> Result<()> {
-        self.run_on_executor(|executor| match executor.weight_residency() {
-            Some(residency) => residency.reload_weights(),
-            None => Ok(()),
-        })?
+        self.run_on_engine(|engine| engine.reload_engine_weights())?
     }
 
     /// Release the engine's inference forward scratch WITHOUT offloading weights or
@@ -593,27 +590,18 @@ where
     /// (between scheduler steps) via the out-of-band control seam, so the release
     /// never races an in-flight forward step. Blocks until the round-trip completes.
     pub fn release_inference_scratch(&self) -> Result<()> {
-        self.run_on_executor(|executor| match executor.weight_residency() {
-            Some(residency) => residency.release_inference_scratch(),
-            None => Ok(()),
-        })?
+        self.run_on_engine(|engine| engine.release_inference_scratch())?
     }
 
     /// Drop the engine's KV pool WITHOUT offloading weights (OPD writeback
     /// headroom). Runs on the engine thread via the control seam, so it never
     /// races an in-flight forward. Blocks until the round-trip completes.
     pub fn release_kv_pool(&self) -> Result<()> {
-        self.run_on_executor(|executor| match executor.weight_residency() {
-            Some(residency) => residency.release_kv_pool(),
-            None => Ok(()),
-        })?
+        self.run_on_engine(|engine| engine.release_kv_pool())?
     }
 
     pub fn ensure_kv_pool(&self) -> Result<()> {
-        self.run_on_executor(|executor| match executor.weight_residency() {
-            Some(residency) => residency.ensure_kv_pool(),
-            None => Ok(()),
-        })?
+        self.run_on_engine(|engine| engine.ensure_kv_pool())?
     }
 
     /// Re-acquire the engine's KV pool, then resume admission atomically on the

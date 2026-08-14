@@ -471,6 +471,10 @@ impl BackendExecutor for MetalExecutor {
         Some(self)
     }
 
+    fn kv_page_tier_view(&self) -> Option<&dyn infer_seam::KvPageTier> {
+        Some(self)
+    }
+
     fn warmup(&mut self) -> anyhow::Result<()> {
         #[cfg(feature = "metal")]
         if let Some(real) = self.real.as_mut() {

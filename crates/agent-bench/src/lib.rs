@@ -552,7 +552,8 @@ pub fn echo_engine() -> (Engine<TtftObserver<EchoExecutor>, MetalKvPool>, TtftHa
     config.chunked_prefill_size = 512;
     let (executor, ttft) = TtftObserver::new(EchoExecutor);
     // page_size 16, 8192 pages -> 131072 token capacity
-    let engine = Engine::with_config(executor, MetalKvPool::new(4, 8192, 16), config);
+    let engine = Engine::with_config(executor, MetalKvPool::new(4, 8192, 16), config)
+        .expect("echo engine config is always accepted");
     (engine, ttft)
 }
 
@@ -582,7 +583,7 @@ pub fn metal_engine_from_model_path(
     let executor = infer_metal::MetalExecutor::from_model_path(model_path)?;
     let (executor, ttft) = TtftObserver::new(executor);
     // page_size 16, 8192 pages -> 131072 token capacity
-    let engine = Engine::with_config(executor, MetalKvPool::new(4, 8192, 16), config);
+    let engine = Engine::with_config(executor, MetalKvPool::new(4, 8192, 16), config)?;
     Ok((engine, ttft))
 }
 
@@ -613,7 +614,7 @@ pub fn cuda_engine_from_model_path(
         executor,
         infer_cuda::CudaKvPool::new(1, total_pages, 16),
         config,
-    );
+    )?;
     Ok(engine)
 }
 
@@ -652,7 +653,7 @@ pub fn cuda_qwen35_engine_from_model_path(
         executor,
         infer_cuda::CudaKvPool::new(1, total_pages, 16),
         config,
-    );
+    )?;
     Ok(engine)
 }
 

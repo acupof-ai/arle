@@ -709,6 +709,10 @@ impl BackendExecutor for CudaExecutor {
         Some(self)
     }
 
+    fn kv_page_tier_view(&self) -> Option<&dyn infer_seam::KvPageTier> {
+        Some(self)
+    }
+
     fn kv_slot_tier(&mut self) -> Option<&mut dyn infer_seam::KvSlotTier> {
         // Presence replaces the old `kv_slot_tier_enabled` bool: only models
         // with a whole-slot store expose the capability.

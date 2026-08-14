@@ -565,25 +565,41 @@ pub type TokenObserver = Box<dyn FnMut(RequestHandle, &SlotToken)>;
 
 impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
     /// Create an engine with permissive resource governance.
-    #[must_use]
-    pub fn new(executor: E, kv: K, max_slots: usize) -> Self {
+    ///
+    /// # Errors
+    /// Rejects a config that requests a capability this backend does not have.
+    pub fn new(executor: E, kv: K, max_slots: usize) -> Result<Self> {
         Self::with_config(executor, kv, SchedulerConfig::for_slots(max_slots))
     }
 
     /// Create an engine with explicit scheduler config.
-    #[must_use]
-    pub fn with_config(executor: E, kv: K, config: SchedulerConfig) -> Self {
+    ///
+    /// # Errors
+    /// Rejects a config that requests a capability this backend does not have.
+    pub fn with_config(executor: E, kv: K, config: SchedulerConfig) -> Result<Self> {
         Self::with_config_and_governor(executor, kv, config, Box::new(PermissiveGovernor))
     }
 
     /// Create an engine with explicit scheduler config and resource governor.
-    #[must_use]
+    ///
+    /// # Errors
+    /// Rejects a config that requests a capability this backend does not have.
     pub fn with_config_and_governor(
-        executor: E,
+        mut executor: E,
         kv: K,
         mut config: SchedulerConfig,
         governor: Box<dyn ResourceGovernor>,
-    ) -> Self {
+    ) -> Result<Self> {
+        // Backend-neutral flag check at the one place config and executor meet;
+        // without it a tier-less backend serves with the flag silently ignored.
+        if config.slot_oversubscription {
+            anyhow::ensure!(
+                executor.kv_slot_tier().is_some(),
+                "--kv-oversubscription is set, but backend {} has no whole-slot \
+                 KV tier, so the flag would do nothing",
+                std::any::type_name::<E>()
+            );
+        }
         let limits = executor.step_limits();
         let max_rows = limits.max_rows_per_step.max(1);
         if config.num_slots > max_rows {
@@ -608,7 +624,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         }
         let radix = RadixCache::new(kv.page_size().max(1));
         let model_stop_token_ids = executor.model_stop_token_ids();
-        Self {
+        Ok(Self {
             executor,
             kv,
             config,
@@ -634,7 +650,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             mode: EngineMode::Serving,
             device_demand_scratch: Vec::new(),
             device_unfit_scratch: Vec::new(),
-        }
+        })
     }
 
     /// Install a per-token observer invoked with `(handle, &token)` as each token
@@ -1029,48 +1045,32 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         stats
     }
 
-    /// Cumulative speculative-decode counters from the backend executor.
+    /// Backend counters and artifact identity, in one executor round-trip.
     #[must_use]
-    pub fn spec_decode_stats(&self) -> infer_seam::SpecDecodeStats {
-        self.executor.stats().spec_decode
-    }
-
-    /// Cumulative operator-policy identity and dispatch counters from the backend.
-    #[must_use]
-    pub fn operator_dispatch_stats(&self) -> infer_seam::OperatorDispatchStats {
-        self.executor.stats().operator_dispatch
+    pub fn backend_stats(&self) -> infer_seam::BackendStats {
+        self.executor.stats()
     }
 
     #[must_use]
-    pub fn op_timing_stats(&self) -> infer_seam::OpTimingStats {
-        self.executor.stats().op_timing
-    }
-
-    /// Exact backend artifact identity, if the build verified one.
-    #[must_use]
-    pub fn artifact_identity(&self) -> infer_seam::BackendArtifactIdentity {
-        self.executor.stats().artifact
-    }
-
-    #[must_use]
-    pub fn kv_system_metrics(&mut self) -> KvSystemMetrics {
+    pub fn kv_system_metrics(&self) -> KvSystemMetrics {
         let mut metrics = self.kv_system_metrics;
         metrics.resident_pages = self.kv.resident_pages();
         metrics.resident_evictable_pages = self.kv.resident_evictable_pages();
-        let (host_demoted_pages, disk_pages, tier_hits, io) = match self.executor.kv_page_tier() {
-            Some(tier) => (
-                tier.kv_tier_host_demoted_pages(),
-                tier.kv_tier_disk_pages(),
-                tier.kv_tier_read_hits(),
-                tier.kv_tier_io_stats(),
-            ),
-            None => (
-                0,
-                0,
-                infer_seam::KvTierReadHits::default(),
-                infer_seam::KvTierIoStats::default(),
-            ),
-        };
+        let (host_demoted_pages, disk_pages, tier_hits, io) =
+            match self.executor.kv_page_tier_view() {
+                Some(tier) => (
+                    tier.kv_tier_host_demoted_pages(),
+                    tier.kv_tier_disk_pages(),
+                    tier.kv_tier_read_hits(),
+                    tier.kv_tier_io_stats(),
+                ),
+                None => (
+                    0,
+                    0,
+                    infer_seam::KvTierReadHits::default(),
+                    infer_seam::KvTierIoStats::default(),
+                ),
+            };
         metrics.host_demoted_pages = host_demoted_pages;
         metrics.host_demoted_pending_inflight = 0;
         metrics.disk_pages = disk_pages;
@@ -1805,7 +1805,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         // rows park/shed; later fitting rows keep running (a stuck row must
         // not starve the rest of the batch). Inert backends skip the gate —
         // no demand rows are built.
-        if self.executor.device_kv_fit().is_some() {
+        if let Some(fit) = self.executor.device_kv_fit() {
             let page_size = self.kv.page_size();
             self.device_demand_scratch.clear();
             self.device_unfit_scratch.clear();
@@ -1821,9 +1821,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
                     target_tokens: row.total_tokens,
                     pages_hint: row.tokens.len().div_ceil(page_size) + 1,
                 }));
-            if let Some(fit) = self.executor.device_kv_fit() {
-                fit.kv_device_fit(&self.device_demand_scratch, &mut self.device_unfit_scratch);
-            }
+            fit.kv_device_fit(&self.device_demand_scratch, &mut self.device_unfit_scratch);
             if !self.device_unfit_scratch.is_empty() {
                 let mut idx = 0;
                 plan.decode_rows.retain(|row| {
@@ -1853,10 +1851,9 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
                 });
             }
         }
+        let spec_row_tokens = self.executor.step_limits().spec_row_tokens;
         plan.decode_rows.retain(|row| {
-            match self
-                .alloc_with_prefix_reclaim(row.slot, self.executor.step_limits().spec_row_tokens)
-            {
+            match self.alloc_with_prefix_reclaim(row.slot, spec_row_tokens) {
                 Ok(()) => true,
                 Err(err) => {
                     log::warn!(

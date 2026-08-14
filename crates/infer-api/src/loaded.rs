@@ -1545,14 +1545,14 @@ mod backend {
                         max_micros: 20_000,
                     })
                     .with_yield_every_ticks(8);
-                    Ok(infer_core::Engine::with_config_and_governor(
+                    infer_core::Engine::with_config_and_governor(
                         executor,
                         kv,
                         scheduler,
                         Box::new(governor),
-                    ))
+                    )
                 } else {
-                    Ok(infer_core::Engine::with_config(executor, kv, scheduler))
+                    infer_core::Engine::with_config(executor, kv, scheduler)
                 }
             },
             shutdown,
@@ -1674,14 +1674,14 @@ mod backend {
                         max_micros: 20_000,
                     })
                     .with_yield_every_ticks(8);
-                    Ok(infer_core::Engine::with_config_and_governor(
+                    infer_core::Engine::with_config_and_governor(
                         executor,
                         kv,
                         scheduler,
                         Box::new(governor),
-                    ))
+                    )
                 } else {
-                    Ok(infer_core::Engine::with_config(executor, kv, scheduler))
+                    infer_core::Engine::with_config(executor, kv, scheduler)
                 }
             },
             shutdown,
@@ -1757,14 +1757,14 @@ mod backend {
                         max_micros: 20_000,
                     })
                     .with_yield_every_ticks(8);
-                    Ok(infer_core::Engine::with_config_and_governor(
+                    infer_core::Engine::with_config_and_governor(
                         executor,
                         kv,
                         scheduler,
                         Box::new(governor),
-                    ))
+                    )
                 } else {
-                    Ok(infer_core::Engine::with_config(executor, kv, scheduler))
+                    infer_core::Engine::with_config(executor, kv, scheduler)
                 }
             },
             shutdown,
@@ -1841,14 +1841,14 @@ mod backend {
                         max_micros: 20_000,
                     })
                     .with_yield_every_ticks(8);
-                    Ok(infer_core::Engine::with_config_and_governor(
+                    infer_core::Engine::with_config_and_governor(
                         executor,
                         kv,
                         scheduler,
                         Box::new(governor),
-                    ))
+                    )
                 } else {
-                    Ok(infer_core::Engine::with_config(executor, kv, scheduler))
+                    infer_core::Engine::with_config(executor, kv, scheduler)
                 }
             },
             shutdown,
@@ -2222,14 +2222,6 @@ mod backend {
                 "--kv-recall is not wired for {kind:?}; it would be silently ignored"
             );
         }
-        if config.slot_oversubscription {
-            anyhow::ensure!(
-                executor.kv_slot_tier().is_some(),
-                "--kv-oversubscription: {kind:?} has no whole-slot tier \
-                 (dense Qwen3 preempts via its page tier; DSv4 preempts via \
-                 KV-overflow requeue + prefix-state pool restore, #154 Phase 2b)"
-            );
-        }
         if config.cuda.dsv4_decode_reuse {
             anyhow::ensure!(
                 executor.prefix_reuse().is_some(),
@@ -2361,7 +2353,7 @@ mod backend {
         if let Some(pages) = executor.effective_fixed_pages_per_slot() {
             kv.set_fixed_pages_per_slot(pages);
         }
-        Ok(infer_core::Engine::with_config(executor, kv, scheduler))
+        infer_core::Engine::with_config(executor, kv, scheduler)
     }
 
     #[cfg(feature = "cuda")]
@@ -2485,24 +2477,12 @@ mod backend {
             self.engine.kv_tier_stats()
         }
 
-        pub fn kv_system_metrics(&mut self) -> infer_core::KvSystemMetrics {
+        pub fn kv_system_metrics(&self) -> infer_core::KvSystemMetrics {
             self.engine.kv_system_metrics()
         }
 
-        pub fn spec_decode_stats(&self) -> infer_seam::SpecDecodeStats {
-            self.engine.spec_decode_stats()
-        }
-
-        pub fn operator_dispatch_stats(&self) -> infer_seam::OperatorDispatchStats {
-            self.engine.operator_dispatch_stats()
-        }
-
-        pub fn op_timing_stats(&self) -> infer_seam::OpTimingStats {
-            self.engine.op_timing_stats()
-        }
-
-        pub fn artifact_identity(&self) -> infer_seam::BackendArtifactIdentity {
-            self.engine.artifact_identity()
+        pub fn backend_stats(&self) -> infer_seam::BackendStats {
+            self.engine.backend_stats()
         }
 
         pub fn active_count(&self) -> usize {
@@ -2688,7 +2668,7 @@ mod backend {
         let serve = ServeHandle::spawn_with_engine_builder_and_shutdown(
             move || {
                 let (executor, kv) = infer_hip::load_dsv4_gguf(&gguf_path, num_slots, max_seq_len)?;
-                Ok(infer_core::Engine::with_config(executor, kv, scheduler))
+                infer_core::Engine::with_config(executor, kv, scheduler)
             },
             shutdown,
         )?;
@@ -2742,7 +2722,7 @@ mod backend {
             move || {
                 let (executor, kv) =
                     infer_vulkan::load_qwen3_gguf(&gguf_path, num_slots, max_seq_len)?;
-                Ok(infer_core::Engine::with_config(executor, kv, scheduler))
+                infer_core::Engine::with_config(executor, kv, scheduler)
             },
             shutdown,
         )?;
