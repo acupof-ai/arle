@@ -23,6 +23,43 @@ use super::{
 };
 use crate::args::{OpdSftAnchorArg, OpdTeacherRuntimeArg, TrainOpdArgs, TrainSelfOpdArgs};
 
+/// Diagnostic (ARLE_OPD_STEP_TRACE): 128-token probe forward through the
+/// autograd student, bracketing engine load/offload phases to localize when
+/// the weights stop producing finite hidden states.
+#[cfg(feature = "cuda")]
+fn probe_student_forward(
+    student: &train::qwen35::Qwen35Model,
+    store: &mut autograd::TensorStore,
+    label: &str,
+) {
+    if std::env::var("ARLE_OPD_STEP_TRACE").is_err() {
+        return;
+    }
+    let keep = train::causal_lm::live_tensor_ids(store);
+    let mut tape = autograd::Tape::new();
+    tape.set_enabled(false);
+    let ids: Vec<u32> = (1..=128).collect();
+    let pos: Vec<u32> = (0..128).collect();
+    match student.forward_hidden_states(
+        store,
+        &mut tape,
+        &ids,
+        &pos,
+        train::context_parallel::CpContext::single(),
+    ) {
+        Ok(hidden) => {
+            let sq = store.get(hidden).and_then(|t| {
+                t.device_handle
+                    .as_ref()
+                    .and_then(|h| store.backend().sum_squares(h, &t.shape).ok())
+            });
+            eprintln!("[probe-forward] {label} hidden_sum_sq={sq:?}");
+        }
+        Err(err) => eprintln!("[probe-forward] {label} error={err}"),
+    }
+    store.retain_ids(&keep);
+}
+
 pub(super) fn run_opd_from_dirs(args: TrainOpdArgs) -> Result<()> {
     use autograd::{Tape, optim::AdamW};
     use train::{
@@ -83,6 +120,8 @@ pub(super) fn run_opd_from_dirs(args: TrainOpdArgs) -> Result<()> {
         &mut store,
     )
     .with_context(|| format!("load LoRA student from {}", student_dir.display()))?;
+    #[cfg(feature = "cuda")]
+    probe_student_forward(&student, &mut store, "after_autograd_load");
     let student_params = trainable_param_ids(&student.all_parameter_ids(), &store);
     if std::env::var_os("ARLE_OPD_LOG_TRAINABLE_PARAMS").is_some() {
         let mut names = std::collections::HashMap::new();
@@ -181,7 +220,9 @@ pub(super) fn run_opd_from_dirs(args: TrainOpdArgs) -> Result<()> {
             }
             #[cfg(feature = "cuda")]
             {
+                probe_student_forward(&student, &mut store, "after_engine_load");
                 maybe_preoffload_infer_student_before_teacher(&infer_student, &train_backend)?;
+                probe_student_forward(&student, &mut store, "after_init_offload");
                 let teacher = OpdCliTeacher::Infer(load_opd_infer_teacher(
                     teacher_dir,
                     args.prompt_max_tokens + args.rollout_len + 32,
