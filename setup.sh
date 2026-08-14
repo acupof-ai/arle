@@ -13,8 +13,8 @@
 #   ./setup.sh --clean      # Remove venv and build artifacts
 #
 # Environment variables:
-#   MODEL_ID      — HuggingFace model ID  (default: Qwen/Qwen3-8B)
-#   MODEL_DIR     — Local path for model  (default: models/Qwen3-8B)
+#   MODEL_ID      — HuggingFace model ID  (default: Qwen/Qwen3.5-4B)
+#   MODEL_DIR     — Local path for model  (default: models/Qwen3.5-4B)
 #   CUDA_HOME     — CUDA toolkit path     (autodetect: /usr/local/cuda, /opt/cuda, or `nvcc` on PATH)
 #   SKIP_MODEL    — Set to 1 to skip model download
 #   ARLE_SKIP_WEB — Set to 1 to skip the web/ frontend (bun + Astro) bootstrap
@@ -76,8 +76,8 @@ if [ "$PLATFORM" = "unsupported" ]; then
 fi
 
 VENV_DIR="$SCRIPT_DIR/.venv"
-MODEL_ID="${MODEL_ID:-Qwen/Qwen3-8B}"
-MODEL_DIR="${MODEL_DIR:-models/Qwen3-8B}"
+MODEL_ID="${MODEL_ID:-Qwen/Qwen3.5-4B}"
+MODEL_DIR="${MODEL_DIR:-models/Qwen3.5-4B}"
 SKIP_MODEL="${SKIP_MODEL:-0}"
 PYTHON="${PYTHON:-python3}"
 

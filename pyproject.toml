@@ -2,7 +2,7 @@
 # `pip install -e ".[bench|dev|observe|serve]"` resolves the named bundles
 # of Python tooling that ARLE's CI / bench scripts / wandb sidecar use.
 # The Rust crates that actually ship under the name "ARLE" live in
-# Cargo.toml, infer/Cargo.toml, and crates/*/Cargo.toml.
+# Cargo.toml and crates/*/Cargo.toml.
 #
 # Do not upload this to PyPI. The `Private :: Do Not Upload` classifier
 # below makes that explicit; the package name is `arle-pytools` for the
