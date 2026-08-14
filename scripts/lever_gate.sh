@@ -15,7 +15,7 @@
 #   # Qwen (single GPU) KV-dtype matrix — pass serve flags, generic profile.
 #   # MODEL is any on-pod single-GPU Qwen: Qwen3-0.6B (dense, cleanest gate) or
 #   # Qwen3.6-35B-A3B (qwen3_5_moe family). No Qwen3.5-4B checkpoint on the pod.
-#   GATE_PROFILE=generic MODEL=/data01/models/Qwen3-0.6B \
+#   GATE_PROFILE=generic MODEL=/data00/models/Qwen3-0.6B \
 #     SERVE_FLAGS="--kv-cache-dtype fp8" scripts/lever_gate.sh qwen_fp8
 #
 # Each invocation: boots a serve with the lever env, runs the gate matrix,
@@ -30,7 +30,7 @@ shift || true
 # Default to THIS tree's release binary; the old /data01 absolute default
 # broke on every other box layout (silent exit 3 at serve boot).
 BIN="${BIN:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/target/release/arle}"
-MODEL="${MODEL:-/data01/models/DeepSeek-V4-Flash}"
+MODEL="${MODEL:-/data00/DeepSeek-V4-Flash-FP8}"
 PORT="${PORT:-18189}"
 LENGTHS="${LENGTHS:-115,300,446,2000,8000}"
 RUNS="${RUNS:-3}"
