@@ -175,6 +175,7 @@ pub(super) fn load_opd_infer_teacher(
             mem_fraction_static,
             memory_budget_bytes,
             ..EngineLoadConfig::single_sequence(max_seq_len)
+            tp_size: None,
         },
     )
     .with_context(|| format!("load infer teacher from {}", teacher_dir.display()))?;

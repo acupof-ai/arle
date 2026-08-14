@@ -624,7 +624,8 @@ pub mod app {
                 max_total_tokens: max_seq_len,
                 chunked_prefill_size: Some(max_seq_len),
                 ..EngineLoadConfig::default()
-            },
+            tp_size: None,
+        },
         )
     }
 
