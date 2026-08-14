@@ -1,7 +1,13 @@
 # Frozen-base sharing correctness (OPD single-GPU)
 
-Status: draft accepted 2026-08-14. Follow-up to the alias-UAF fix
-(`a1a3fda92`, wins entry 2026-08-14-opd-offload-student-alias-uaf).
+Status: implemented and verified 2026-08-14 (`7c4c9082f`). Follow-up to the
+alias-UAF fix (`a1a3fda92`, wins entry 2026-08-14-opd-offload-student-alias-uaf).
+
+Verification result: 5-step arms (offload=student vs off, same seed) track
+within ±0.5 loss with no divergence trend (D1 closed); layer-0 hidden
+sum-squares are digit-identical across arms (167.8612689715945), so the D2
+step-1 loss spread is teacher-engine run-to-run nondeterminism, and the same
+spread appears between two runs of one arm. Weights carry no defect.
 
 ## Problem
 
