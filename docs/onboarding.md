@@ -160,4 +160,5 @@ Canonical bench 流程：[`bench-and-trace-spec.md`](bench-and-trace-spec.md) + 
 | 完整文件地图 | [`codebase-map.md`](codebase-map.md) |
 | 支持/量化/API 状态 | [`support-matrix.md`](support-matrix.md) |
 | 贡献者操作契约 | [`AGENTS.md`](../AGENTS.md) |
+| 贡献流程（PR / commit 规范） | [`CONTRIBUTING.md`](../CONTRIBUTING.md) |
 | 环境变量 | [`environment.md`](environment.md) |
