@@ -162,6 +162,15 @@ pub(super) fn backward_chunked_kl<T: TeacherForward + ?Sized>(
             freed as f64 / (1024.0 * 1024.0)
         );
     }
+    // Fence AFTER the offloads too: their frees are enqueued on the infer
+    // context; without draining them the student backward's pool allocations
+    // race the frees (same class as the pre-offload fence).
+    if engine_offload.is_enabled() {
+        store
+            .backend()
+            .device_synchronize()
+            .map_err(OpdError::from)?;
+    }
     log_free_vram(store, "before_student_backward_forward");
     log_param_checksum(
         store,
