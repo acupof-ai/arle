@@ -25,8 +25,12 @@ old = 86 slots / 4096 pool tokens; new = 68 slots / ~36.7K pool tokens —
 
 ## Measured
 
-- H20 (97 GB, plentiful regime): boot line identical before/after — pending
-  the sgate3 boot check below, updated in place.
+- H20 (97 GB, plentiful regime): boot capacity line identical before/after —
+  `free 64731MB / total 97508MB, recurrent reservation 3127MB (16 slots x
+  195MB) -> max_total_tokens 829654 (51853 pages)` on both the pre-change
+  binary (run sgserve2, build sgate2) and the fixed one (run sgserve7, build
+  sgate7 at 8ad726e1c). Same serve then passed the full sampling gate
+  (7 arms, window delta drafted=640 accepted=385, binary sha byte-match).
 - V100 32 GB (starved regime): `pending-remote` — re-run the #178 serve on the
   V100 box, expect ~68 slots / ~36K-token pool (issue #182 tracks it).
 
