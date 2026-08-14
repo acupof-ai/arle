@@ -889,28 +889,27 @@ impl Qwen35CudaExecutor {
         Ok(full_attn_kv)
     }
 
-    /// Drop the paged pool and trim its HBM to the OS. agent-OPD only: the writeback's
-    /// autograd forward does not read this KV, so freeing it widens writeback headroom;
-    /// `ensure_kv_pool` re-acquires it. Precondition: all in-flight rollout work
-    /// synced.
+    /// Drop the paged pool. Freed blocks return to the device pool via a
+    /// background trim once the enqueued frees complete; the co-resident
+    /// writeback reuses cached blocks immediately. `ensure_kv_pool`
+    /// re-acquires it.
     pub(crate) fn release_kv_pool(&mut self) -> Result<()> {
         let Some(pool) = self.full_attn_kv.as_ref() else {
             return Ok(());
         };
         let freed = pool.device_bytes();
-        // No kernel may still read the slices we are about to free.
-        self.model.ctx.sync()?;
-        // Drop only ENQUEUES `cuMemFreeAsync` for every pool slice.
         self.full_attn_kv = None;
-        // Sync again so those async frees complete and the blocks return to the async
-        // pool; a trim before that returns nothing and `mem_get_info` still shows them
-        // used.
-        self.model.ctx.sync()?;
-        // The device async pool is per-DEVICE, so trimmed bytes are visible to the
-        // co-resident autograd writeback; a drop alone only caches the blocks.
-        if let Err(e) = self.model.ctx.trim_memory_pool() {
-            log::warn!("release_kv_pool: trim_memory_pool failed (non-fatal): {e}");
-        }
+        let event = self.model.ctx.stream.record_event(None)?;
+        let ctx = self.model.ctx.clone();
+        std::thread::spawn(move || {
+            if let Err(e) = event.synchronize() {
+                log::warn!("release_kv_pool: event sync failed: {e}");
+                return;
+            }
+            if let Err(e) = ctx.trim_memory_pool() {
+                log::warn!("release_kv_pool: trim failed (non-fatal): {e}");
+            }
+        });
         log::info!(
             "Qwen3.6 released full-attn KV pool: freed {}MB (agent-OPD writeback headroom)",
             freed >> 20
