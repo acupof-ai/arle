@@ -123,8 +123,8 @@ pub(crate) fn run_spec_draft(args: TrainSpecDraftArgs) -> Result<()> {
         /*cuda_graph=*/ false,
         EngineLoadConfig {
             mem_fraction_static: args.trunk_mem_fraction,
-            ..EngineLoadConfig::single_sequence(args.max_len)
             tp_size: None,
+            ..EngineLoadConfig::single_sequence(args.max_len)
         },
     )
     .with_context(|| format!("load engine from {model_path}"))?;

@@ -440,8 +440,8 @@ fn resolve_engine_config(
     };
     let mut config = EngineLoadConfig {
         kv_cache_dtype,
+        tp_size: None,
         ..EngineLoadConfig::default()
-            tp_size: None,
         };
 
     // Quant KV dtypes route to the backend that implements them. Reject the
