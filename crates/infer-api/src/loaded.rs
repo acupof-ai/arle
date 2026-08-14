@@ -2019,6 +2019,42 @@ mod backend {
             .unwrap_or(1)
     }
 
+    /// RAII guard that temporarily overrides `INFER_TP_SIZE` for the executor's
+    /// `TpRuntime` resolution. Restores the previous value on drop. When
+    /// `tp_size` is `None`, no override is applied (env is used as-is).
+    #[cfg(feature = "cuda")]
+    struct TpEnvGuard {
+        saved: Option<Option<String>>,
+    }
+
+    #[cfg(feature = "cuda")]
+    impl TpEnvGuard {
+        fn new(tp_size: Option<usize>) -> Self {
+            let saved = tp_size.map(|ws| {
+                let saved = std::env::var("INFER_TP_SIZE").ok();
+                // SAFETY: single-threaded during engine build, no other readers.
+                unsafe { std::env::set_var("INFER_TP_SIZE", ws.to_string()) };
+                saved
+            });
+            Self { saved }
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    impl Drop for TpEnvGuard {
+        fn drop(&mut self) {
+            if let Some(saved) = self.saved.take() {
+                // SAFETY: single-threaded during engine build, no other readers.
+                unsafe {
+                    match saved {
+                        Some(v) => std::env::set_var("INFER_TP_SIZE", v),
+                        None => std::env::remove_var("INFER_TP_SIZE"),
+                    }
+                }
+            }
+        }
+    }
+
     /// Build the CUDA `Engine` (executor + admission KV pool + scheduler) for
     /// `model_path` — the ONE engine constructor every rank uses. rank 0 runs it
     /// inside [`ServeHandle::spawn_with_engine_builder`]; multiproc worker ranks
@@ -2116,6 +2152,11 @@ mod backend {
         // pool size; Qwen3.5/3.6: per-slot token budget / page_size). The host
         // admission pool capacity is derived separately below — after the
         // executor reports its EFFECTIVE slot count (post KV-budget clamp).
+        //
+        // When config.tp_size is set, temporarily override INFER_TP_SIZE so the
+        // executor's TpRuntime resolves to it. Restored on drop — scoped to
+        // this synchronous constructor call, no global side effects.
+        let _tp_guard = TpEnvGuard::new(config.tp_size);
         let executor = match kind {
             CudaModelKind::Qwen3Dense => CudaExecutor::from_qwen3_bf16_safetensors(
                 model_path,
@@ -2183,10 +2224,17 @@ mod backend {
         }
         if config.slot_oversubscription {
             anyhow::ensure!(
-                executor.kv_slot_tier_enabled(),
+                executor.kv_slot_tier().is_some(),
                 "--kv-oversubscription: {kind:?} has no whole-slot tier \
                  (dense Qwen3 preempts via its page tier; DSv4 preempts via \
                  KV-overflow requeue + prefix-state pool restore, #154 Phase 2b)"
+            );
+        }
+        if config.cuda.dsv4_decode_reuse {
+            anyhow::ensure!(
+                executor.prefix_reuse().is_some(),
+                "--dsv4-decode-reuse: the {kind:?} CUDA executor exposes no \
+                 prefix-reuse capability, so the flag would be silently ignored"
             );
         }
         // L2 budget: deployment-total → per-rank share, resolved at the ONE
@@ -2437,7 +2485,7 @@ mod backend {
             self.engine.kv_tier_stats()
         }
 
-        pub fn kv_system_metrics(&self) -> infer_core::KvSystemMetrics {
+        pub fn kv_system_metrics(&mut self) -> infer_core::KvSystemMetrics {
             self.engine.kv_system_metrics()
         }
 
