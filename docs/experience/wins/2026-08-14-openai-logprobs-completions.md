@@ -29,11 +29,16 @@ device argmax fast path never produced alternatives.
 
 ## Bench
 
-pending-remote — needs the H20 pod (issue #202 serve). Plan: matched A/B
-c=1 greedy decode with and without `logprobs=2` on ThinkingCap-27B-FP8
-(the veto only affects requests that ask; the no-logprobs path is untouched —
-control expected to be a wash), plus a curl shape check: `top_logprobs[0]`
-top-1 equals `token_logprobs[0]`.
+H20 pod, build `lp202` (a8150bc6b), ThinkingCap-27B-FP8, DSpark serve
+(`--spec-type dspark`), 2026-08-14. 13/13 e2e checks PASS:
+
+- Shape: `tokens` / `token_logprobs` / `top_logprobs` / `text_offset` equal
+  length; greedy `top_logprobs[i]` max equals `token_logprobs[i]` at every
+  position (8/8); all values finite. Chat entry shape + top-1 identity PASS.
+- Rejects: `logprobs=9` → 400, `stream=true`+`logprobs` → 400.
+- Matched A/B c=1 greedy 64 tok ×6: median 0.589 s without logprobs, 1.045 s
+  with (+77.5%) — the expected cost of the per-request spec veto on a DSpark
+  serve, paid only by requests that ask; the no-logprobs arm keeps spec.
 
 ## Rule
 
