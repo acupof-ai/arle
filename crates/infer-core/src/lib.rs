@@ -1805,8 +1805,8 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
                 });
             }
         }
-        plan.decode_rows
-            .retain(|row| match self.alloc_with_prefix_reclaim(row.slot, 1) {
+        plan.decode_rows.retain(|row| {
+            match self.alloc_with_prefix_reclaim(row.slot, self.executor.spec_row_tokens()) {
                 Ok(()) => true,
                 Err(err) => {
                     log::warn!(
@@ -1817,7 +1817,8 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
                     self.requeue_preempted_decode(row.slot);
                     false
                 }
-            });
+            }
+        });
         plan.prefill_rows.retain(|row| {
             match self.alloc_with_prefix_reclaim(row.slot, row.tokens.len()) {
                 Ok(()) => true,

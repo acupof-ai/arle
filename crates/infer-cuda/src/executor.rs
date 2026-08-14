@@ -400,6 +400,16 @@ impl RealCudaExecutor {
         }
     }
 
+    /// KV tokens a decode row reaches in one submit. Only the Qwen3.5/3.6 arm
+    /// grows the host pool for its spec chain (MTP/DSpark); DSv4 MTP grows its
+    /// own device bands instead, and dense Qwen has no spec.
+    pub(crate) fn spec_row_tokens(&self) -> usize {
+        match self {
+            Self::Qwen35(q) => q.spec_row_tokens(),
+            Self::Qwen(_) | Self::Dsv4(_) => 1,
+        }
+    }
+
     /// Reads host atomics and performs no device synchronization.
     pub(crate) fn operator_dispatch_stats(&self) -> infer_seam::OperatorDispatchStats {
         crate::ops::qwen_fp8_dense_operator_stats()
