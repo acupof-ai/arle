@@ -62,6 +62,8 @@ try:
 except ImportError:
     sys.exit("pip install httpx>=0.27 (see pyproject.toml [bench] extra)")
 
+from arle_stats import message_text
+
 
 DEFAULT_TRACE = Path(__file__).parent / "data" / "agent_trace_default.jsonl"
 WORKLOAD_TRACE = "trace"
@@ -799,7 +801,7 @@ async def _stream_one_turn(
                         continue
                     choice = choices[0]
                     delta = choice.get("delta") or {}
-                    content = delta.get("content")
+                    content = message_text(delta)
                     if content:
                         now = time.perf_counter()
                         if first_token_at is None:
