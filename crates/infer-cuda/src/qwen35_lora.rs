@@ -890,7 +890,20 @@ impl Qwen35Model {
                 ctx.stream.memcpy_dtod(&src, &mut dst).map_err(|e| {
                     anyhow!("layer {layer_idx} {label}: base window D2D copy failed: {e}")
                 })?;
-            } else if !self.lora_base_dev.contains_key(&cache_key) {
+            } else if let Some(cache) = self.lora_base_dev.remove(&cache_key) {
+                // Dirty re-merge: restore the pristine window first so
+                // W = base + Δ stays idempotent (no Δ accumulation across syncs).
+                let copied = {
+                    let src = cache.data.slice(0..needed);
+                    let matrix = self.lora_matrix_mut(layer_idx, projection)?;
+                    let mut dst = matrix.data.slice_mut(window.clone());
+                    ctx.stream.memcpy_dtod(&src, &mut dst)
+                };
+                self.lora_base_dev.insert(cache_key, cache);
+                copied.map_err(|e| {
+                    anyhow!("layer {layer_idx} {label}: BF16 base window restore failed: {e}")
+                })?;
+            } else {
                 // Native-BF16 base: cache the row window once (before the first
                 // merge) so restore can put it back.
                 let mut cache = DeviceVec::zeros(&ctx, needed)?;
