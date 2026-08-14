@@ -1315,6 +1315,14 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
                     break;
                 }
             }
+            // Return the #197 spec pre-budget the committed chain did not use (#205).
+            let committed_len = row.kv_seq_len + token_idx;
+            if token_idx > 0
+                && self.active.contains_key(&row.slot)
+                && self.kv.seq_len(row.slot) > committed_len
+            {
+                self.kv.truncate_slot(row.slot, committed_len)?;
+            }
         }
 
         self.throughput_stats.generated_tokens = self
