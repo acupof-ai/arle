@@ -376,7 +376,9 @@ where
             }),
             Err(err) => {
                 let _ = join.join();
-                Err(anyhow!("engine build failed: {err}"))
+                // {err:#} keeps the full context chain: "{err}" flattened it and
+                // hid an OOM root cause behind "row fuse + <tensor>".
+                Err(anyhow!("engine build failed: {err:#}"))
             }
         }
     }
