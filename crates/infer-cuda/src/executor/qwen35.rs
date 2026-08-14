@@ -2420,6 +2420,21 @@ impl Qwen35CudaExecutor {
         Ok(())
     }
 
+    /// KV tokens a decode row reaches in one submit: MTP verifies depth+1,
+    /// DSpark verifies a block_size chain (the anchor included). The engine
+    /// pre-allocates through its reclaim path, so `grow_host_slot_to` below
+    /// never hits an empty pool mid-submit (#197).
+    pub(crate) fn spec_row_tokens(&self) -> usize {
+        let depth = self.model.spec_draft_tokens().max(1);
+        if self.mtp.is_some() {
+            depth + 1
+        } else if self.dspark.is_some() {
+            depth
+        } else {
+            1
+        }
+    }
+
     pub(crate) fn submit(
         &mut self,
         plan: &ForwardPlan,
