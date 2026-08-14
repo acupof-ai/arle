@@ -392,10 +392,11 @@ fn run_lockstep_driver(
                 let throughput = engine.throughput_stats();
                 let tier = engine.kv_tier_stats();
                 let system = engine.kv_system_metrics();
-                let spec = engine.spec_decode_stats();
-                let operator_dispatch = engine.operator_dispatch_stats();
-                let op_timing = engine.op_timing_stats();
-                let artifact = engine.artifact_identity();
+                let stats = engine.backend_stats();
+                let spec = stats.spec_decode;
+                let operator_dispatch = stats.operator_dispatch;
+                let op_timing = stats.op_timing;
+                let artifact = stats.artifact;
                 let data = WireStats {
                     build_identity: infer_api::build_identity(artifact),
                     active_requests: engine.active_count(),

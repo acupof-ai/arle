@@ -35,6 +35,14 @@ workspace check). Pod smoke on the refactored binary (build fix205b,
 381b681c…, HEAD incl. the #205 fix): ENGINE_READY, sampling gate PASS on all
 7 arms, spec window delta drafted=640 accepted=387, binary sha byte-match.
 
+Follow-up /simplify tranche (net −37 lines): one `backend_stats()`
+destructure per tick, unreachable `None` arms bound at their gates,
+weight-residency dedup via `run_on_engine`, `kv_page_tier_view(&self)`
+reverting the `&mut` ripple on stats paths, `step_limits` hoisted out of
+per-row loops. One intended behavior change: `--kv-oversubscription` on a
+backend without a slot tier now fails at engine construction instead of
+silently no-oping (the check moved from the CUDA-only path to `Engine`).
+
 ## Rule
 
 A trait method with a silent `{}` default is an unverifiable promise. Costs

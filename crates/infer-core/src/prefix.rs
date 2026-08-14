@@ -58,18 +58,23 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             .copied()
             .map(PrefixBlock::ResidentPage)
             .collect();
-        // `_for_prompt`: a finish-write-through frontier is reusable only when
-        // `tokens` continues through the cached tail (the tail has no radix key).
-        let serveable = match executor.prefix_reuse() {
-            Some(reuse) => reuse.reusable_prefix_blocks_for_prompt(&blocks, tokens),
-            None => 0,
-        }
-        .min(prefix_match.block_ids.len());
+        let serveable = Self::licensed_prefix_blocks(executor, &blocks, tokens);
         if serveable < prefix_match.block_ids.len() {
             prefix_match.block_ids.truncate(serveable);
             prefix_match.matched_len = serveable.saturating_mul(block_size);
         }
         prefix_match
+    }
+
+    /// Backend-licensed reusable leading blocks, clamped to the match length.
+    /// `_for_prompt`: a finish-write-through frontier is reusable only when
+    /// `tokens` continues through the cached tail (the tail has no radix key).
+    fn licensed_prefix_blocks(executor: &mut E, blocks: &[PrefixBlock], tokens: &[u32]) -> usize {
+        match executor.prefix_reuse() {
+            Some(reuse) => reuse.reusable_prefix_blocks_for_prompt(blocks, tokens),
+            None => 0,
+        }
+        .min(blocks.len())
     }
 
     /// Forward evicted prefix pages to the backend's prefix-reuse mirror drop.
@@ -543,10 +548,10 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
     /// Host-tier capacity in pages; `0` disables every tier path. Tier use is
     /// gated on the prefix cache because demoted blocks are only reachable
     /// through radix prefix matches.
-    pub(crate) fn kv_tier_capacity(&mut self) -> usize {
+    pub(crate) fn kv_tier_capacity(&self) -> usize {
         if self.config.enable_prefix_cache {
             self.executor
-                .kv_page_tier()
+                .kv_page_tier_view()
                 .map_or(0, |tier| tier.kv_tier_capacity_pages())
         } else {
             0
@@ -598,13 +603,11 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
 
         let started = Instant::now();
         // capacity > 0 above proves the tier accessor is Some.
-        let (result, charge_copy) = match self.executor.kv_page_tier() {
-            Some(tier) => (
-                tier.demote_prefix_pages(&entries),
-                !tier.kv_tier_transfer_is_zero_copy(),
-            ),
-            None => (Ok(0), true),
+        let Some(tier) = self.executor.kv_page_tier() else {
+            return 0;
         };
+        let result = tier.demote_prefix_pages(&entries);
+        let charge_copy = !tier.kv_tier_transfer_is_zero_copy();
         let elapsed_ms = elapsed_ms(started);
         self.kv_system_metrics.demote_mset_count =
             self.kv_system_metrics.demote_mset_count.saturating_add(1);
@@ -622,10 +625,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             }
         };
         if charge_copy {
-            let page_bytes = self
-                .executor
-                .kv_page_tier()
-                .map_or(0, |tier| tier.kv_tier_page_bytes());
+            let page_bytes = tier.kv_tier_page_bytes();
             let bytes = (accepted as u64).saturating_mul(page_bytes as u64);
             self.kv_system_metrics.demote_mset_copy_bytes = self
                 .kv_system_metrics
@@ -683,11 +683,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             .take_while(|b| matches!(b, PrefixBlock::ResidentPage(_)))
             .count();
         let mut blocks = blocks_all;
-        let reusable = match self.executor.prefix_reuse() {
-            Some(reuse) => reuse.reusable_prefix_blocks_for_prompt(&blocks, tokens),
-            None => 0,
-        }
-        .min(blocks.len());
+        let reusable = Self::licensed_prefix_blocks(&mut self.executor, &blocks, tokens);
         self.record_prefix_match_metrics(blocks.len(), reusable);
         log::info!(
             "prefix-lookup(tier): prompt={} raw_blocks={} resident_run={resident} licensed_blocks={reusable}",
@@ -734,6 +730,10 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             return ids;
         }
 
+        // Only reached through the tiered lookup, so the accessor is Some.
+        let Some(tier) = self.executor.kv_page_tier() else {
+            return leading_resident_pages(blocks);
+        };
         // Snapshot per-block location BEFORE promotion (the promote path
         // removes entries from the tier store, so a post-promote query
         // would lose the disk/host attribution).
@@ -743,11 +743,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
                     self.kv_system_metrics.reuse_hit_resident =
                         self.kv_system_metrics.reuse_hit_resident.saturating_add(1);
                 }
-                PrefixBlock::DemotedKey(key) => match self
-                    .executor
-                    .kv_page_tier()
-                    .and_then(|tier| tier.kv_tier_location(key))
-                {
+                PrefixBlock::DemotedKey(key) => match tier.kv_tier_location(key) {
                     Some(KvTierLocation::HostDemoted) | None => {
                         self.kv_system_metrics.reuse_hit_host_demoted = self
                             .kv_system_metrics
@@ -785,14 +781,8 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             .collect();
 
         let started = Instant::now();
-        // Only reached through the tiered lookup, so the accessor is Some.
-        let (result, charge_copy) = match self.executor.kv_page_tier() {
-            Some(tier) => (
-                tier.promote_prefix_pages(&promote_entries),
-                !tier.kv_tier_transfer_is_zero_copy(),
-            ),
-            None => (Err(anyhow!("backend has no KV tier store")), true),
-        };
+        let result = tier.promote_prefix_pages(&promote_entries);
+        let charge_copy = !tier.kv_tier_transfer_is_zero_copy();
         let elapsed_ms = elapsed_ms(started);
         self.kv_system_metrics.promote_mget_count =
             self.kv_system_metrics.promote_mget_count.saturating_add(1);
@@ -825,10 +815,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             return leading_resident_pages(blocks);
         }
         if charge_copy {
-            let page_bytes = self
-                .executor
-                .kv_page_tier()
-                .map_or(0, |tier| tier.kv_tier_page_bytes());
+            let page_bytes = tier.kv_tier_page_bytes();
             let bytes = (promote_entries.len() as u64).saturating_mul(page_bytes as u64);
             self.kv_system_metrics.promote_mget_copy_bytes = self
                 .kv_system_metrics

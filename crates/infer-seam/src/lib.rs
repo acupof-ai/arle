@@ -342,6 +342,12 @@ pub trait BackendExecutor {
         None
     }
 
+    /// Read-only [`Self::kv_page_tier`] counterpart for telemetry reads;
+    /// presence MUST match, or tier counters silently read as zero.
+    fn kv_page_tier_view(&self) -> Option<&dyn KvPageTier> {
+        None
+    }
+
     /// Whole-slot KV tier store, for models whose restore state is not
     /// page-addressable. Presence gates the oversubscription park path.
     fn kv_slot_tier(&mut self) -> Option<&mut dyn KvSlotTier> {
