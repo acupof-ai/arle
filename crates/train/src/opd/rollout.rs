@@ -14,9 +14,11 @@ use crate::{
 
 #[cfg(feature = "cuda")]
 use super::InferRolloutCtx;
+#[cfg(feature = "cuda")]
+use super::log_free_vram;
 use super::{
-    EngineOffloadMode, OpdError, OpdStepConfig, OpdStepProfile, Result, log_free_vram,
-    log_opd_step_trace, map_qwen35_forward_error, record_profile,
+    EngineOffloadMode, OpdError, OpdStepConfig, OpdStepProfile, Result, log_opd_step_trace,
+    map_qwen35_forward_error, record_profile,
     validation::{validate_forced_rollout, validate_rollout_shape, validate_token_ids},
 };
 
