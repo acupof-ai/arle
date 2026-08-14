@@ -93,7 +93,7 @@ crates/cli/src/train_cli.rs → train::opd → autograd
 | --- | --- | --- |
 | Linux + NVIDIA 完整构建 | `cargo build --release --features cuda --bin arle` | 需要 nvcc |
 | Apple Silicon | `cargo build --release --no-default-features --features metal,no-cuda,cli --bin arle` | 无 CUDA 链接 |
-| Mac 上 CUDA Rust 类型检查 | `CUDARC_CUDA_VERSION=12060 cargo check -p infer-api --no-default-features --features cuda,no-cuda` | 无 GPU 也可过类型 |
+| Mac 上 CUDA Rust 类型检查 | `CUDARC_CUDA_VERSION=12080 cargo check -p infer-api --no-default-features --features cuda,no-cuda` | 无 GPU 也可过类型 |
 | CPU smoke | `cargo build --release --no-default-features --features cpu,no-cuda,cli --bin arle` | 合成 token，非真实推理 |
 | Multi-GPU NCCL | `cargo build --release --features cuda,nccl --bin arle` | 需 ≥2 GPU；`nccl` feature 经 cli → infer-api → infer-cuda → cuda-kernels 透传 |
 | 默认 feature | `cli` only | **不含** cuda/metal；须显式选 backend |

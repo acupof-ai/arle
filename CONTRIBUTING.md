@@ -32,7 +32,13 @@ Or manually:
 
 1. **Rust**: use the pinned toolchain from [`rust-toolchain.toml`](rust-toolchain.toml)
 2. **CUDA 12.x** (for GPU builds)
-3. **Python 3.10+** with `flashinfer-python` and `triton` (build-time only)
+3. **Python 3.10+** with the build-time deps from
+   [`requirements-build.txt`](requirements-build.txt) (torch, tilelang,
+   cuda-python, z3-solver, huggingface_hub — CUDA builds only)
+
+New to the repo? [docs/onboarding.md](docs/onboarding.md) is a 30-minute guided
+path — what runs today, where to start reading, how to verify a change
+(currently Chinese-only).
 
 For first-time contributor setup, install the repo-managed hook path:
 
@@ -50,7 +56,11 @@ cargo build --no-default-features --features no-cuda
 # Build the CLI smoke path
 cargo build -p arle --release --no-default-features --features cpu,no-cuda,cli --bin arle
 
-# Build (GPU). The cuda feature is no longer the default — pass it explicitly:
+# Build (GPU). The cuda feature is no longer the default — pass it explicitly.
+# kernels-sync pulls the source-matched prebuilt AOT kernel bundle, skipping
+# ~1h of TileLang codegen (no-op offline / on a cache miss). make build-cuda
+# runs it automatically; the manual path needs it explicitly:
+make kernels-sync
 CUDA_HOME=/usr/local/cuda cargo build --release --features cuda
 
 # Test
