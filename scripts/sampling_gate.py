@@ -28,8 +28,7 @@ def http_json(url, body=None, timeout=240):
 
 
 def decoded_text(response):
-    # Thinking models answer in reasoning_content and leave content empty;
-    # reading only content reports a healthy serve as a dead one.
+    # Thinking models answer in reasoning_content and leave content empty.
     m = response["choices"][0]["message"]
     return (m.get("reasoning_content") or "") + (m.get("content") or "")
 
@@ -47,8 +46,7 @@ def dominance(out, expect_text=None):
     if not toks:
         return 0.0
     top = max(set(toks), key=toks.count)
-    # A dominant word that is not the biased token (degenerate repetition of
-    # something else) must not pass as a working veto.
+    # A dominant word that is not the biased token must not pass as a veto.
     if expect_text is not None and expect_text not in top:
         return 0.0
     return toks.count(top) / len(toks)
@@ -113,8 +111,7 @@ def main():
                 rows.append((name, st, "-", f"len={len(out)}", passed))
             elif name == "logit_bias":
                 div = first_divergence(ref_text, out)
-                # Verified envelope (wins 2026-08-14): the biased arm opens with the
-                # biased token; it need not dominate the whole completion.
+                # Verified envelope: opens with the biased token, need not dominate.
                 if args.biased_text:
                     hit = out.lstrip().startswith(args.biased_text)
                     detail = f"opens={'yes' if hit else 'no'}"
@@ -125,13 +122,11 @@ def main():
                 rows.append((name, st, div, detail, passed))
             else:
                 div = first_divergence(ref_text, out)
-                # Empty output "diverges at 0" but demonstrates nothing.
                 passed = st == 200 and len(out) > 0 and div is not None
                 rows.append((name, st, div, f"len={len(out)}", passed))
             ok &= passed
 
-        # Liveness: the relay failure this gate exists for returns 200 on the
-        # biased request and then kills every rank — judge two more on text.
+        # The TP relay failure answers 200 and then kills every rank.
         for i in range(2):
             st, r = http_json(f"{base}/v1/chat/completions", ask)
             out = decoded_text(r)
@@ -145,8 +140,7 @@ def main():
     stats_line = "stats: unavailable"
     try:
         body = fetch_spec_counters(base)
-        # Counters are cumulative since boot; only the delta across the arm
-        # window proves the arms themselves stayed on the spec path.
+        # Cumulative since boot; only the window delta proves engagement.
         delta = {
             k: (body.get(k) or 0) - ((spec_before or {}).get(k) or 0)
             for k in ("chains", "drafted", "accepted")

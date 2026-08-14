@@ -161,8 +161,7 @@ async def run_scenario(client: httpx.AsyncClient, url: str, scenario: dict, max_
                     choices = chunk.get("choices", [])
                     if choices:
                         delta = choices[0].get("delta", {})
-                        # Content-only on purpose: keeps TTFT/token metrics comparable
-                        # with pre-2ac78e5f3 recordings (reasoning deltas excluded).
+                        # Content-only: reasoning deltas would redefine TTFT/token metrics.
                         content = delta.get("content")
                         if content:
                             now = time.time()
