@@ -4,6 +4,7 @@
 import argparse
 import asyncio
 import csv
+import hashlib
 import json
 import os
 import random
@@ -12,6 +13,7 @@ import statistics
 import sys
 import tempfile
 import time
+from collections import Counter
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -20,6 +22,8 @@ try:
     import httpx
 except ImportError:
     sys.exit("Install httpx: pip install httpx")
+
+from arle_stats import message_text, unwrap_body
 
 
 DEFAULT_CONCURRENCY_GRID = (1, 4, 8, 16)
@@ -113,6 +117,15 @@ def repetition_error(text: str) -> str | None:
         matches = sum(word == words[index % period] for index, word in enumerate(words))
         if matches / len(words) >= 0.9:
             return f"repeating period {period}"
+    # Degenerate loops with varied surface (repeated citation dates) clear the
+    # diversity check; duplicated 8-token windows catch them (#202).
+    ngram = 8
+    if len(words) >= 2 * ngram:
+        windows = Counter(tuple(words[i : i + ngram]) for i in range(len(words) - ngram + 1))
+        duplicated = sum(count for count in windows.values() if count > 1)
+        rate = duplicated / sum(windows.values())
+        if rate >= 0.5:
+            return f"duplicated {ngram}-gram rate {rate:.2f}"
     return None
 
 
@@ -209,7 +222,7 @@ async def send_streaming(
                         # A thinking model streams the block as reasoning_content;
                         # those are output tokens and usage counts them, so not
                         # reading them reports zero events on a short cap.
-                        text = delta.get("content") or delta.get("reasoning_content")
+                        text = message_text(delta)
                     if not text:
                         continue
                     now = time.perf_counter()
@@ -342,10 +355,18 @@ def summarize(concurrency: int, results: list[RequestResult], wall_time_s: float
         "complete": len(complete),
         "incomplete": sum(result.status == "incomplete" for result in results),
         "error": sum(result.status == "error" for result in results),
-        "correctness_failed": sum(not result.gate_pass for result in complete),
+        # Diversity heuristic: bounds degenerate responses from below, never above.
+        "correctness_failed_lower_bound": sum(not result.gate_pass for result in complete),
         "prompt_tokens": prompt_tokens,
         "output_tokens": output_tokens,
         "total_tokens": total_tokens,
+        "output_tokens_per_request_mean": output_tokens / len(complete) if complete else None,
+        "output_tokens_per_request_exact": (
+            complete[0].completion_tokens
+            if complete
+            and all(result.completion_tokens == complete[0].completion_tokens for result in complete)
+            else None
+        ),
         "output_tokens_per_s": output_tokens / wall_time_s if wall_time_s else 0.0,
         "total_tokens_per_s": total_tokens / wall_time_s if wall_time_s else 0.0,
         "requests_per_s": len(complete) / wall_time_s if wall_time_s else 0.0,
@@ -379,7 +400,7 @@ def write_outputs(output_prefix: Path, report: dict[str, Any]) -> None:
 
     columns = (
         "concurrency", "wall_time_s", "requests", "complete", "incomplete", "error",
-        "correctness_failed", "prompt_tokens", "output_tokens", "total_tokens",
+        "correctness_failed_lower_bound", "prompt_tokens", "output_tokens", "total_tokens",
         "output_tokens_per_s", "total_tokens_per_s", "requests_per_s",
         "ttft_mean_ms", "ttft_p50_ms", "ttft_p90_ms", "ttft_p99_ms",
         "itl_mean_ms", "itl_p50_ms", "itl_p90_ms", "itl_p99_ms",
@@ -444,6 +465,13 @@ async def async_main(args: argparse.Namespace) -> int:
         if args.prompts_jsonl
         else synthetic_prompts(args.synthetic_prompts, args.seed)
     )
+    # docs/baselines.md rule 3: file bytes for a jsonl dataset (matches the
+    # recorded baseline hashes), resolved prompt list for synthetic.
+    dataset_sha256 = hashlib.sha256(
+        args.prompts_jsonl.read_bytes()
+        if args.prompts_jsonl
+        else "\n".join(prompts).encode("utf-8")
+    ).hexdigest()
     report: dict[str, Any] = {
         "schema": "arle.bench_throughput.v1",
         "started_unix_s": time.time(),
@@ -457,6 +485,10 @@ async def async_main(args: argparse.Namespace) -> int:
             "max_tokens": args.max_tokens,
             "temperature": args.temperature,
             "ignore_eos": True,
+        },
+        "fingerprint": {
+            "dataset_sha256": dataset_sha256,
+            "serve_identity": None,
         },
         "points": [],
     }
@@ -477,6 +509,10 @@ async def async_main(args: argparse.Namespace) -> int:
             return 2
         for concurrency in args.concurrency_grid:
             stats_before = await fetch_stats(client, args.url)
+            if report["fingerprint"]["serve_identity"] is None:
+                body = unwrap_body(stats_before)
+                if isinstance(body.get("build_identity"), dict):
+                    report["fingerprint"]["serve_identity"] = body["build_identity"]
             results, wall_time_s = await run_point(
                 client,
                 args.url,
@@ -506,7 +542,7 @@ async def async_main(args: argparse.Namespace) -> int:
     failed = any(
         summary["requests"] == 0
         or summary["complete"] != summary["requests"]
-        or summary["correctness_failed"]
+        or summary["correctness_failed_lower_bound"]
         for summary in (point["summary"] for point in report["points"])
     )
     return int(failed)

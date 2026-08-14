@@ -22,6 +22,8 @@ try:
 except ImportError:
     sys.exit("Install httpx: pip install httpx")
 
+from arle_stats import spec_decode
+
 PROMPTS = [
     "Explain how a transformer model works in one paragraph.",
     "Write a Python function that computes the Fibonacci sequence.",
@@ -45,7 +47,7 @@ def get_stats(client: httpx.Client) -> dict:
     """Fetch /v1/stats and return the spec_decode counters."""
     r = client.get("/v1/stats")
     r.raise_for_status()
-    return r.json()["spec_decode"]
+    return spec_decode(r.json())
 
 
 def send_requests(client: httpx.Client, n: int, max_tokens: int) -> None:

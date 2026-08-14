@@ -25,6 +25,8 @@ try:
 except ImportError:
     sys.exit("pip install httpx")
 
+from arle_stats import message_text, unwrap_body
+
 
 SYSTEM_PROMPT = (
     "You are a helpful AI assistant with access to tools. "
@@ -159,7 +161,7 @@ async def run_scenario(client: httpx.AsyncClient, url: str, scenario: dict, max_
                     choices = chunk.get("choices", [])
                     if choices:
                         delta = choices[0].get("delta", {})
-                        content = delta.get("content", "")
+                        content = message_text(delta)
                         if content:
                             now = time.time()
                             if ttft is None:
@@ -242,7 +244,8 @@ async def main():
                 for _ in range(30):
                     try:
                         sr = await client.get(f"{args.url}/v1/stats", timeout=2)
-                        if "active=0" in sr.text:
+                        sched = unwrap_body(sr.json()).get("scheduler") or {}
+                        if sched.get("active_requests") == 0:
                             break
                     except Exception:
                         pass

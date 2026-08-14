@@ -96,6 +96,15 @@ Source: root `Cargo.toml` `[features]`. Full notes:
 
 `default = ["cli"]` — no backend by default; pick one explicitly.
 
+**Mac typecheck lane coverage.** The `cuda,no-cuda` lane compiles only the
+host-side stubs: enabling `no-cuda` removes every block guarded by
+`#[cfg(not(feature = "no-cuda"))]`, which is exactly the code that runs on the
+pod. A return-expression bug inside such a block (fixed `e4f0a3017`) passed
+this lane green and broke the pod build. When a change touches code inside
+`cfg(not(feature = "no-cuda"))`, local green is not evidence; the authoritative
+gate runs on the pod: `cargo check -p autograd --release --features cuda --lib`
+(~5 min).
+
 **Set `CARGO_TARGET_DIR` per lane.** Feature unification makes the lanes
 clobber each other's artifacts in a shared `target/`; alternating lanes pays a
 full dep rebuild every switch. Pin one dir per lane (disk ~3×, pruned by

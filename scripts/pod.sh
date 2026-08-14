@@ -145,7 +145,18 @@ case "$cmd" in
     label="${1:-}"; timeout_s="${2:-1200}"
     valid_label "$label"
     case "$timeout_s" in ''|*[!0-9]*) echo "usage: pod.sh ready <run-label> [timeout_s]" >&2; exit 2;; esac
-    "$POD" "POD_TREE='$TREE' POD_STATE='$STATE' bash '$TREE/scripts/pod-remote-run.sh' ready '$label' '$timeout_s'"
+    # The run wrapper writes runs/<label>/terminal (RUN_EXIT=<rc>) on exit; a
+    # dead serve otherwise makes the HTTP poll wait out the full timeout.
+    marker="$STATE/runs/$label/terminal"
+    run_log="$STATE/runs/$label/log"
+    "$POD" "fail_dead() { echo \"run exited before ready: $label \$(head -n1 '$marker' 2>/dev/null)\" >&2; tail -n 20 '$run_log' >&2; exit 1; }
+      [ -f '$marker' ] && fail_dead
+      POD_TREE='$TREE' POD_STATE='$STATE' bash '$TREE/scripts/pod-remote-run.sh' ready '$label' '$timeout_s' & rp=\$!
+      while kill -0 \"\$rp\" 2>/dev/null; do
+        [ -f '$marker' ] && { kill \"\$rp\" 2>/dev/null; wait \"\$rp\" 2>/dev/null; fail_dead; }
+        sleep 1
+      done
+      wait \"\$rp\""
     ;;
   status|log|kill)
     label="${1:-}"

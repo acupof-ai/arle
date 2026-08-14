@@ -6,18 +6,15 @@ throughput. Ctrl-C to exit.
 """
 
 import argparse
-import json
 import time
 import urllib.request
+
+from arle_stats import fetch_stats, spec_decode
 
 
 def fetch(url):
     with urllib.request.urlopen(url, timeout=5) as r:
         return r.read().decode()
-
-
-def fetch_stats(base):
-    return json.loads(fetch(f"{base}/v1/stats"))
 
 
 def fetch_metrics(base):
@@ -69,7 +66,7 @@ def main():
 
             sched = stats.get("scheduler", {})
             tp = stats.get("throughput", {})
-            spec = stats.get("spec_decode", {})
+            spec = spec_decode(stats)
             kv = stats.get("kv_system", {})
 
             active = sched.get("active_requests", 0)

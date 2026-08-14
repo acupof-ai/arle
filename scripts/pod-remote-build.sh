@@ -215,6 +215,16 @@ PY
     fi
     binary_sha=""; manifest=""; manifest_sha=""; producer_id=""; embedded_id=""
     [ "$rc" -eq 0 ] && [ -f "$binary" ] && binary_sha="$(sha256 "$binary")" || rc=1
+    if [ "$rc" -eq 0 ]; then
+      # Feature sets share target/release/<bin>; pin this build under a
+      # per-label name so a later build cannot clobber it before its runs.
+      artifact="$(dirname "$binary")/$binary_name-$LABEL"
+      if { ln -f "$binary" "$artifact" 2>/dev/null || cp -f "$binary" "$artifact"; }; then
+        binary="$artifact"
+      else
+        echo "failed to pin per-label binary: $artifact"; rc=1
+      fi
+    fi
     if [ -n "${ARLE_CUDA_KERNELS_PREBUILT_DIR:-}" ]; then
       manifest="$ARLE_CUDA_KERNELS_PREBUILT_DIR/arle-cuda-kernels.manifest"
     else
