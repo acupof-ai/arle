@@ -799,9 +799,7 @@ async def _stream_one_turn(
                         continue
                     choice = choices[0]
                     delta = choice.get("delta") or {}
-                    # Content-only on purpose: TTFT/tokens_out here are defined at the
-                    # first VISIBLE token; counting reasoning deltas would re-define the
-                    # metric and break comparability with prior recordings.
+                    # Content-only: reasoning deltas would redefine TTFT/tokens_out.
                     content = delta.get("content")
                     if content:
                         now = time.perf_counter()

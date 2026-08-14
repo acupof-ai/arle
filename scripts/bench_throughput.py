@@ -118,8 +118,7 @@ def repetition_error(text: str) -> str | None:
         matches = sum(word == words[index % period] for index, word in enumerate(words))
         if matches / len(words) >= 0.9:
             return f"repeating period {period}"
-    # Degenerate loops with varied surface (repeated citation dates) clear the
-    # diversity check; duplicated 8-token windows catch them (#202).
+    # Varied-surface degenerate loops clear the diversity check (#202).
     ngram = 8
     if len(words) >= 2 * ngram:
         windows = Counter(tuple(words[i : i + ngram]) for i in range(len(words) - ngram + 1))
@@ -356,7 +355,6 @@ def summarize(concurrency: int, results: list[RequestResult], wall_time_s: float
         "complete": len(complete),
         "incomplete": sum(result.status == "incomplete" for result in results),
         "error": sum(result.status == "error" for result in results),
-        # Diversity heuristic: bounds degenerate responses from below, never above.
         "correctness_failed_lower_bound": sum(not result.gate_pass for result in complete),
         "prompt_tokens": prompt_tokens,
         "output_tokens": output_tokens,
