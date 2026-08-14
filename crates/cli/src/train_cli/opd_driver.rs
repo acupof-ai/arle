@@ -60,6 +60,46 @@ fn probe_student_forward(
     store.retain_ids(&keep);
 }
 
+/// Startup-fixed VRAM grants for the OPD step's co-resident engines, from ONE
+/// probe taken before any engine load. Each grant rides
+/// `EngineLoadConfig::memory_budget_bytes` and caps that engine's KV/slot
+/// budget for the whole run, so no later engine decision reads instantaneous
+/// free VRAM (which co-resident offload/reload churns).
+#[cfg(feature = "cuda")]
+#[derive(Clone, Copy)]
+struct OpdVramPlan {
+    student_engine_bytes: Option<usize>,
+    teacher_engine_bytes: Option<usize>,
+}
+
+#[cfg(feature = "cuda")]
+impl OpdVramPlan {
+    fn probe(backend: &std::sync::Arc<dyn autograd::Backend>, rollout_mem_fraction: f64) -> Self {
+        let Some((free, total)) = backend.device_mem_info() else {
+            // No CUDA probe (CPU backend): engines keep measured-free behavior.
+            return Self {
+                student_engine_bytes: None,
+                teacher_engine_bytes: None,
+            };
+        };
+        let share = (free as f64 * rollout_mem_fraction) as usize;
+        let autograd_reserve = free.saturating_sub(2 * share);
+        eprintln!(
+            "[opd-vram-plan] free={}MiB total={}MiB student_engine={}MiB teacher_engine={}MiB \
+             autograd_reserve={}MiB (rollout_mem_fraction={rollout_mem_fraction})",
+            free >> 20,
+            total >> 20,
+            share >> 20,
+            share >> 20,
+            autograd_reserve >> 20,
+        );
+        Self {
+            student_engine_bytes: Some(share),
+            teacher_engine_bytes: Some(share),
+        }
+    }
+}
+
 pub(super) fn run_opd_from_dirs(args: TrainOpdArgs) -> Result<()> {
     use autograd::{Tape, optim::AdamW};
     use train::{
@@ -173,6 +213,8 @@ pub(super) fn run_opd_from_dirs(args: TrainOpdArgs) -> Result<()> {
     }
     let cfg = student.config().clone();
     #[cfg(feature = "cuda")]
+    let vram_plan = OpdVramPlan::probe(&train_backend, args.runtime.rollout_mem_fraction);
+    #[cfg(feature = "cuda")]
     let infer_student = if corpus_sft_only {
         None
     } else {
@@ -189,6 +231,7 @@ pub(super) fn run_opd_from_dirs(args: TrainOpdArgs) -> Result<()> {
             train_backend.clone(),
             cfg.vocab_size,
             &args.runtime,
+            vram_plan.student_engine_bytes,
         )?
     };
     #[cfg(not(feature = "cuda"))]
@@ -229,6 +272,7 @@ pub(super) fn run_opd_from_dirs(args: TrainOpdArgs) -> Result<()> {
                     args.runtime.rollout_mem_fraction,
                     train_backend.clone(),
                     cfg.vocab_size,
+                    vram_plan.teacher_engine_bytes,
                 )?);
                 maybe_preoffload_infer_teacher_before_steps(&teacher, &train_backend)?;
                 teacher
@@ -657,6 +701,7 @@ pub(super) fn run_self_opd_from_dir(args: TrainSelfOpdArgs) -> Result<()> {
         train_backend.clone(),
         vocab,
         &args.runtime,
+        OpdVramPlan::probe(&train_backend, args.runtime.rollout_mem_fraction).student_engine_bytes,
     )?;
     #[cfg(not(feature = "cuda"))]
     let _ = &train_backend;

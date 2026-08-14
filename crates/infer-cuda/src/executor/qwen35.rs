@@ -586,6 +586,7 @@ impl Qwen35CudaExecutor {
         markov_head_rank: Option<usize>,
         dspark_block_size: Option<usize>,
         mtp_draft_tokens: Option<usize>,
+        memory_budget_bytes: Option<usize>,
     ) -> Result<Self> {
         let total_t0 = Instant::now();
         ensure!(
@@ -663,7 +664,8 @@ impl Qwen35CudaExecutor {
         let dspark_slot_bytes = dspark_head
             .as_ref()
             .map_or(0, |h| h.slot_state_bytes(model.config.vocab_size));
-        let num_slots = model.kv_budget_num_slots(num_slots, dspark_slot_bytes)?;
+        let num_slots =
+            model.kv_budget_num_slots(num_slots, dspark_slot_bytes, memory_budget_bytes)?;
         cuda_startup_log(
             "executor.qwen35_kv_budget",
             budget_t0,

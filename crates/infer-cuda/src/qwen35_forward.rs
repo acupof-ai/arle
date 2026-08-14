@@ -152,16 +152,34 @@ impl Qwen35Model {
     /// Unified with DSv4 through the infer-seam budget kernel; the affordable
     /// count is NCCL min-reduced for TP-consistent slot counts. Call AFTER
     /// weights load so `mem_get_info().free` already excludes them.
+    /// `memory_budget_bytes`: a startup-fixed grant (co-resident allocators,
+    /// e.g. the OPD driver's VRAM plan) capping the free-VRAM input, so the
+    /// slot budget is decided by the grant rather than instantaneous free.
+    /// `None` keeps the measured-free serve behavior.
     pub(crate) fn kv_budget_num_slots(
         &self,
         requested: usize,
         extra_per_slot_bytes: usize,
+        memory_budget_bytes: Option<usize>,
     ) -> Result<usize> {
         const MEM_FRACTION: f64 = 0.7;
         let (per_slot, kv_bytes, gdr_bytes, conv_bytes) = self.per_slot_kv_bytes();
         let per_slot = per_slot.saturating_add(extra_per_slot_bytes);
         let affordable_local: i32 = match cudarc::driver::result::mem_get_info() {
             Ok((free, _total)) => {
+                let free = match memory_budget_bytes {
+                    Some(grant) => {
+                        let capped = free.min(grant);
+                        log::info!(
+                            "Qwen3.5 KV budget: fixed grant {}MB caps measured free {}MB -> {}MB",
+                            grant >> 20,
+                            free >> 20,
+                            capped >> 20,
+                        );
+                        capped
+                    }
+                    None => free,
+                };
                 // Same neutral kernel as DSv4: floor(free × fraction) / per_slot.
                 let budget = infer_seam::SlotBudget::from_free(free, MEM_FRACTION, 0, per_slot);
                 log::info!(
