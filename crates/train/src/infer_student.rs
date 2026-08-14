@@ -9,14 +9,16 @@
 //! KV slot and decodes incrementally.
 
 #[cfg(feature = "cuda")]
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
+use std::collections::HashMap;
 #[cfg(feature = "cuda")]
 use std::sync::{Arc, Mutex};
 
 #[cfg(feature = "cuda")]
 use anyhow::{Result, anyhow, bail};
+use autograd::TensorId;
 #[cfg(feature = "cuda")]
-use autograd::{Backend, TensorId, TensorStore};
+use autograd::{Backend, TensorStore};
 #[cfg(feature = "cuda")]
 use infer_api::{
     LoadedInferenceEngine, LoraHalf, StudentLoraLayer, StudentLoraMatrices, StudentLoraProjection,
@@ -332,10 +334,7 @@ impl InferStudent {
                 else {
                     continue;
                 };
-                // The engine buffer holds MERGED bytes (base + LoRA delta); the
-                // trainer's forward adds its delta on top, so a LoRA-targeted
-                // projection must keep the trainer-owned pristine base.
-                if adapter_map.contains_key(format!("{name}.lora_a").as_str()) {
+                if engine_bytes_are_merged(name, adapter_map) {
                     continue;
                 }
                 let shape = vec![entry.rows, entry.cols];
@@ -363,6 +362,18 @@ impl InferStudent {
         engine.free_retired_fp8_buffers();
         Ok(())
     }
+}
+
+/// True when the engine's buffer for `param_name` holds MERGED bytes (base +
+/// LoRA delta). The trainer's forward re-adds A·B, so re-pointing the frozen
+/// base at such a buffer would double-apply the delta (issue #201).
+// Non-cuda builds reach this only from the #[cfg(test)] naming-contract guard.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+pub(crate) fn engine_bytes_are_merged(
+    param_name: &str,
+    adapter_map: &HashMap<&'static str, TensorId>,
+) -> bool {
+    adapter_map.contains_key(format!("{param_name}.lora_a").as_str())
 }
 
 /// Save LoRA A/B adapters to a single safetensors file (bf16). The cheap

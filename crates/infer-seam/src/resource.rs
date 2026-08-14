@@ -17,8 +17,8 @@
 //! host-only character and is exhaustively unit-testable.
 //!
 //! Consumers:
-//! - DSv4 CUDA `kv_budget_num_slots` (slot budget, then NCCL min-reduce)
-//! - Qwen3/Qwen3.5 CUDA (slot budget — the clamp they previously lacked)
+//! - DSv4 / Qwen3.5 CUDA `kv_budget_plan` (joint slot/pool budget, then NCCL
+//!   min-reduce); Qwen3 CUDA (slot budget — the clamp it previously lacked)
 //! - Metal `plan_resource_budget` (page clamp + below-fixed guard)
 //! - CUDA KV tier store (host RAM/SSD tier split)
 

@@ -193,8 +193,8 @@ impl Default for EngineLoadConfig {
         // Conservative local-serving defaults shared by every backend builder.
         Self {
             // Auto-budget ceiling, NOT a concurrency cap: the executor clamps
-            // this to what post-weights VRAM affords (`kv_budget_plan` /
-            // `kv_budget_num_slots`), and `max_running_requests` is the
+            // this to what post-weights VRAM affords (each backend's
+            // `kv_budget_plan`), and `max_running_requests` is the
             // user-facing concurrency knob — when set it replaces this ceiling
             // as the executor slot budget (`hot_workspace_slots`; post-#154-3b
             // slots trade against comp-pool tokens, so "VRAM budget always
@@ -2142,7 +2142,7 @@ mod backend {
                 config.mem_fraction_static,
             )?,
             // Qwen35 clamps `num_slots` to free HBM inside the constructor
-            // (`Qwen35Model::kv_budget_num_slots`, unified with DSv4 via the
+            // (`Qwen35Model::kv_budget_plan`, the DSv4 joint solve via the
             // infer-seam budget kernel) — no longer the #60 OOM risk.
             CudaModelKind::Qwen35 => CudaExecutor::from_qwen35_safetensors(
                 model_path,

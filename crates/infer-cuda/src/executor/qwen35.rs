@@ -1,11 +1,16 @@
 use super::*;
 use crate::qwen35::alloc_recurrent_block;
+use std::cmp::Ordering;
 
-/// Spec decode writes a whole draft chain past the one token the engine pre-allocated.
-fn grow_host_slot_to(host_kv: &mut dyn KvPool, slot: usize, target: usize) -> Result<()> {
-    match target.checked_sub(host_kv.seq_len(slot)) {
-        Some(0) | None => Ok(()),
-        Some(missing) => host_kv.alloc(slot, missing),
+/// Set the host slot's accounted length to `target`. The engine pre-budgets
+/// the full spec chain (#197), so this normally no-ops; a warm row or a chain
+/// shorter than the budget truncates the over-allocation instead of leaving
+/// the host pool ahead of the device truth.
+fn set_host_slot_to(host_kv: &mut dyn KvPool, slot: usize, target: usize) -> Result<()> {
+    match target.cmp(&host_kv.seq_len(slot)) {
+        Ordering::Less => host_kv.truncate_slot(slot, target),
+        Ordering::Equal => Ok(()),
+        Ordering::Greater => host_kv.alloc(slot, target - host_kv.seq_len(slot)),
     }
 }
 
@@ -667,12 +672,23 @@ impl Qwen35CudaExecutor {
         let dspark_slot_bytes = dspark_head
             .as_ref()
             .map_or(0, |h| h.slot_state_bytes(model.config.vocab_size));
-        let num_slots =
-            model.kv_budget_num_slots(num_slots, dspark_slot_bytes, memory_budget_bytes)?;
+        let requested_pages = total_pages.max(1);
+        let kv_format = kv_dtype.kv_format();
+        // Joint (num_slots, pool_pages) solve (#182): slots and the shared pool
+        // trade against the same free VRAM, so they are planned together.
+        let plan = model.kv_budget_plan(
+            num_slots,
+            requested_pages,
+            dspark_slot_bytes,
+            memory_budget_bytes,
+            mem_fraction_static,
+            kv_format,
+        )?;
+        let num_slots = plan.num_slots;
         cuda_startup_log(
             "executor.qwen35_kv_budget",
             budget_t0,
-            format_args!("effective_slots={num_slots}"),
+            format_args!("effective_slots={num_slots} pool_pages={}", plan.pool_pages),
         );
         let slots_t0 = Instant::now();
         // Empty slots: each slot's ~147 MiB recurrent block is drawn from
@@ -684,19 +700,11 @@ impl Qwen35CudaExecutor {
             format_args!("slots={num_slots} max_seq_len={max_seq_len}"),
         );
 
-        // Profile-sized from MEASURED free VRAM after weights load. The ONLY profile —
-        // see `ensure_kv_pool`.
+        // Sized by the joint budget plan above (the ONLY profile — see
+        // `ensure_kv_pool`).
         let pool_t0 = Instant::now();
-        let requested_pages = total_pages.max(1);
-        let kv_format = kv_dtype.kv_format();
-        let full_attn_kv = Self::build_full_attn_kv_pool(
-            &model,
-            num_slots,
-            requested_pages,
-            mem_fraction_static,
-            kv_format,
-            dspark_slot_bytes,
-        )?;
+        let full_attn_kv =
+            Self::alloc_full_attn_kv_pool(&model, num_slots, plan.pool_pages, kv_format)?;
         let kv_pool_sized_pages = full_attn_kv.max_total_pages;
         cuda_startup_log(
             "executor.qwen35_paged_pool_alloc",
@@ -772,98 +780,6 @@ impl Qwen35CudaExecutor {
             format_args!("slots={num_slots} max_seq_len={max_seq_len}"),
         );
         Ok(executor)
-    }
-
-    /// Profile-sized from MEASURED free VRAM; `requested_pages` is the fallback for a
-    /// failed probe, not a floor over it (#178).
-    fn build_full_attn_kv_pool(
-        model: &crate::qwen35::Qwen35Model,
-        num_slots: usize,
-        requested_pages: usize,
-        mem_fraction_static: f64,
-        kv_format: KVFormat,
-        dspark_slot_bytes: usize,
-    ) -> Result<PagedKVPool> {
-        let num_full = model.config.num_full_attention_layers();
-        let local_kv_heads = model.local_kv_heads();
-        let head_dim = model.config.head_dim;
-        let cell_bytes_per_token =
-            PagedKVPool::budget_bytes_for_tokens(num_full, local_kv_heads, head_dim, 1, kv_format)
-                as u64;
-        // Subtract the recurrent reservation from free BEFORE profiling the pool, so
-        // weights + recurrent×slots + pool ≤ mem_fraction×free.
-        let (_, _, gdr_bytes, conv_bytes) = model.per_slot_kv_bytes();
-        // Reserve the per-slot DSpark ctx caches too, or the pool eats the VRAM the
-        // first dspark prefill needs.
-        let per_slot_recurrent = gdr_bytes
-            .saturating_add(conv_bytes)
-            .saturating_add(dspark_slot_bytes);
-        let recurrent_reservation = per_slot_recurrent.saturating_mul(num_slots) as u64;
-        // Single-sequence engines (e.g., the OPD teacher scorer) know their exact
-        // KV need from EngineLoadConfig::single_sequence; the VRAM fraction probe
-        // over-provisions tens of GB for one ~8K-token sequence.
-        let total_pool_pages = if num_slots == 1 {
-            requested_pages
-        } else {
-            match model.ctx.mem_info_bytes() {
-                Ok((free, total)) => {
-                    let free_after_recurrent = (free as u64).saturating_sub(recurrent_reservation);
-                    let profiled_tokens = infer_seam::profile_kv_pool_tokens(
-                        free_after_recurrent,
-                        total as u64,
-                        cell_bytes_per_token,
-                        mem_fraction_static,
-                    );
-                    let profiled_pages = (profiled_tokens / SUPPORTED_PAGE_SIZE as u64) as usize;
-                    // #178: flooring the profile at a constant books HBM the card lacks.
-                    let sized = profiled_pages.max(1);
-                    if profiled_tokens == infer_seam::PROFILE_KV_TOKENS_FLOOR {
-                        // `mem_fraction_static` bounds the engine's share of TOTAL, so a
-                        // value
-                        // under the weights' own share caps admission at 4096 tokens. The
-                        // operands ride along: the adjacent info! is off at the default
-                        // level.
-                        let reserve = (total as f64 * (1.0 - mem_fraction_static)) as u64;
-                        log::warn!(
-                            "KV pool collapsed to the {}-token floor: free_after_recurrent {}MB − \
-                         reserve {}MB (= total {}MB × (1 − mem_fraction_static \
-                         {mem_fraction_static})) leaves nothing for {cell_bytes_per_token}B/tok \
-                         cells. Raise mem_fraction_static above {:.2}, or free VRAM: every \
-                         prompt over {} tokens will abort.",
-                            infer_seam::PROFILE_KV_TOKENS_FLOOR,
-                            free_after_recurrent >> 20,
-                            reserve >> 20,
-                            total >> 20,
-                            1.0 - (free_after_recurrent as f64 / total as f64),
-                            infer_seam::PROFILE_KV_TOKENS_FLOOR,
-                        );
-                    }
-                    log::info!(
-                        "CUDA Qwen3.6 full-attn KV pool profiled from measured VRAM: free {}MB / \
-                     total {}MB, recurrent reservation {}MB ({num_slots} slots × {}MB), \
-                     free_after_recurrent {}MB, mem_fraction_static {mem_fraction_static}, cell \
-                     {cell_bytes_per_token}B/tok ({num_full} full-attn layers × {local_kv_heads} \
-                     kv-heads × {head_dim} hd) -> max_total_tokens {profiled_tokens} \
-                     ({profiled_pages} pages); requested {requested_pages} pages (advisory) \
-                     -> sizing {sized} pages",
-                        free >> 20,
-                        total >> 20,
-                        recurrent_reservation >> 20,
-                        per_slot_recurrent >> 20,
-                        free_after_recurrent >> 20,
-                    );
-                    sized
-                }
-                Err(e) => {
-                    log::warn!(
-                        "CUDA Qwen3.6 full-attn KV pool: free-VRAM probe failed ({e}); falling back \
-                     to requested floor {requested_pages} pages"
-                    );
-                    requested_pages
-                }
-            }
-        };
-        Self::alloc_full_attn_kv_pool(model, num_slots, total_pool_pages, kv_format)
     }
 
     /// Allocate the pool at an exact page count, no profiling.
@@ -1358,6 +1274,7 @@ impl Qwen35CudaExecutor {
                     pool.seq_len(slot),
                 );
             }
+            set_host_slot_to(host_kv, slot, start + 1)?;
             self.mirror_host_slot(host_kv, slot, start + 1)?;
             let meta = {
                 let pool = self.full_attn_kv.as_ref().expect("paged (gated)");
@@ -1481,7 +1398,7 @@ impl Qwen35CudaExecutor {
                     pool.seq_len(slot),
                 );
             }
-            grow_host_slot_to(host_kv, slot, start + depth + 1)?;
+            set_host_slot_to(host_kv, slot, start + depth + 1)?;
             self.mirror_host_slot(host_kv, slot, start + depth + 1)?;
         }
         let meta = if self.full_attn_paged() {
@@ -1579,6 +1496,7 @@ impl Qwen35CudaExecutor {
                 slot
             );
         }
+        set_host_slot_to(host_kv, slot, row.kv_seq_len + 1)?;
         self.mirror_host_slot(host_kv, slot, row.kv_seq_len + 1)?;
         let meta = {
             let pool = self.full_attn_kv.as_ref().expect("paged (checked)");
@@ -1954,7 +1872,7 @@ impl Qwen35CudaExecutor {
                     c.slot
                 );
             }
-            grow_host_slot_to(host_kv, c.slot, c.start + c.chain.len())?;
+            set_host_slot_to(host_kv, c.slot, c.start + c.chain.len())?;
             self.mirror_host_slot(host_kv, c.slot, c.start + c.chain.len())?;
         }
         let Self {

@@ -1,5 +1,13 @@
 use super::*;
 
+/// Joint slot/pool capacity split, mirroring DSv4's `Dsv4KvBudgetPlan`.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Qwen35KvBudgetPlan {
+    pub(crate) num_slots: usize,
+    /// Shared full-attn paged-pool size the executor allocates verbatim.
+    pub(crate) pool_pages: usize,
+}
+
 impl Qwen35Model {
     pub(crate) fn output_projection(&self) -> &DeviceMatrix {
         self.lm_head.as_ref().unwrap_or(&self.embed_tokens)
@@ -146,62 +154,100 @@ impl Qwen35Model {
         (per_slot, kv_bytes, gdr_bytes, conv_bytes)
     }
 
-    /// Clamp `requested` slots to what post-weights free VRAM affords — the
-    /// dynamic KV-memory budget Qwen3.5/3.6 previously lacked (requested slots
-    /// were admitted as-is → OOM at large max_seq_len, the #60 failure class).
-    /// Unified with DSv4 through the infer-seam budget kernel; the affordable
-    /// count is NCCL min-reduced for TP-consistent slot counts. Call AFTER
-    /// weights load so `mem_get_info().free` already excludes them.
+    /// Jointly pick `(num_slots, pool_pages)` — the DSv4
+    /// [`crate::dsv4::Dsv4Model::kv_budget_plan`] pattern (#182): the per-slot recurrent state and the shared full-attn
+    /// paged pool trade against the same post-weights free VRAM, so solving
+    /// slots alone let the recurrent reservation eat the headroom and starve
+    /// the pool (86 slots × 47 tokens each on a 32 GB card). The plan is the
+    /// largest state-affordable slot count whose pool remainder still funds
+    /// one full-length (`max_seq_len`) request; feasibility is monotone in
+    /// decreasing n, so the first feasible n scanning down is the max. When
+    /// the pool is easily funded (H20-class VRAM) the scan accepts n at the
+    /// old slots-only clamp on the first probe and the pool profiles the same
+    /// remainder — the joint solve degenerates to the previous answer.
+    /// NCCL min-reduced (slots, then pages at the reduced slot count) for
+    /// TP-consistent capacity. Call AFTER weights load so `mem_get_info().free`
+    /// already excludes them.
     /// `memory_budget_bytes`: a startup-fixed grant (co-resident allocators,
     /// e.g. the OPD driver's VRAM plan) capping the free-VRAM input, so the
-    /// slot budget is decided by the grant rather than instantaneous free.
+    /// budget is decided by the grant rather than instantaneous free.
     /// `None` keeps the measured-free serve behavior.
-    pub(crate) fn kv_budget_num_slots(
+    /// `requested == 1` (single-sequence engines, e.g. the OPD teacher scorer)
+    /// keeps its exact `requested_pages` — the fraction probe over-provisions
+    /// tens of GB for one ~8K-token sequence.
+    pub(crate) fn kv_budget_plan(
         &self,
         requested: usize,
+        requested_pages: usize,
         extra_per_slot_bytes: usize,
         memory_budget_bytes: Option<usize>,
-    ) -> Result<usize> {
+        mem_fraction_static: f64,
+        kv_format: cuda_kernels::KVFormat,
+    ) -> Result<Qwen35KvBudgetPlan> {
         const MEM_FRACTION: f64 = 0.7;
+        const PAGE: usize = crate::executor::SUPPORTED_PAGE_SIZE;
         let (per_slot, kv_bytes, gdr_bytes, conv_bytes) = self.per_slot_kv_bytes();
         let per_slot = per_slot.saturating_add(extra_per_slot_bytes);
-        let affordable_local: i32 = match cudarc::driver::result::mem_get_info() {
-            Ok((free, _total)) => {
-                let free = match memory_budget_bytes {
-                    Some(grant) => {
-                        let capped = free.min(grant);
-                        log::info!(
-                            "Qwen3.5 KV budget: fixed grant {}MB caps measured free {}MB -> {}MB",
-                            grant >> 20,
-                            free >> 20,
-                            capped >> 20,
-                        );
-                        capped
-                    }
-                    None => free,
-                };
-                // Same neutral kernel as DSv4: floor(free × fraction) / per_slot.
-                let budget = infer_seam::SlotBudget::from_free(free, MEM_FRACTION, 0, per_slot);
-                log::info!(
-                    "Qwen3.5 KV budget: free {}MB, per_slot {}MB (K+V {}MB + gdr {}MB + conv {}MB + draft {}MB)",
-                    free >> 20,
-                    per_slot >> 20,
-                    kv_bytes >> 20,
-                    gdr_bytes >> 20,
-                    conv_bytes >> 20,
-                    extra_per_slot_bytes >> 20,
-                );
-                budget
-                    .affordable()
-                    .map_or(i32::MAX, |n| i32::try_from(n).unwrap_or(i32::MAX))
-            }
-            // Can't query (no active context / driver error) → don't bind the
-            // min; the other ranks' budgets still apply.
-            Err(_) => i32::MAX,
+        let num_full = self.config.num_full_attention_layers();
+        let local_kv_heads = self.local_kv_heads();
+        let head_dim = self.config.head_dim;
+        let cell_bytes_per_token =
+            PagedKVPool::budget_bytes_for_tokens(num_full, local_kv_heads, head_dim, 1, kv_format)
+                as u64;
+        let pool_tokens_at = |free: usize, total: usize, n: usize| -> u64 {
+            infer_seam::profile_kv_pool_tokens(
+                (free as u64).saturating_sub(per_slot.saturating_mul(n) as u64),
+                total as u64,
+                cell_bytes_per_token,
+                mem_fraction_static,
+            )
         };
-        let affordable =
-            self.tp
-                .all_reduce_min_scalar_i32(&self.ctx, affordable_local)? as usize;
+        let (n_local, probe): (i32, Option<(usize, usize)>) =
+            match cudarc::driver::result::mem_get_info() {
+                Ok((free, total)) => {
+                    let free = match memory_budget_bytes {
+                        Some(grant) => {
+                            let capped = free.min(grant);
+                            log::info!(
+                                "Qwen3.5 KV budget: fixed grant {}MB caps measured free {}MB -> {}MB",
+                                grant >> 20,
+                                free >> 20,
+                                capped >> 20,
+                            );
+                            capped
+                        }
+                        None => free,
+                    };
+                    // Same neutral kernel as DSv4: floor(free × fraction) / per_slot.
+                    let budget = infer_seam::SlotBudget::from_free(free, MEM_FRACTION, 0, per_slot);
+                    log::info!(
+                        "Qwen3.5 KV budget: free {}MB, per_slot {}MB (K+V {}MB + gdr {}MB + conv {}MB + draft {}MB)",
+                        free >> 20,
+                        per_slot >> 20,
+                        kv_bytes >> 20,
+                        gdr_bytes >> 20,
+                        conv_bytes >> 20,
+                        extra_per_slot_bytes >> 20,
+                    );
+                    let affordable = budget.affordable().unwrap_or(usize::MAX);
+                    // Joint solve: shed slots until the pool remainder funds one
+                    // full-length request. n=1 is the best-effort floor — the
+                    // pool collapse warning below reports it, matching the old
+                    // profile path instead of DSv4's hard reject.
+                    let mut n = requested.max(1).min(affordable);
+                    while n > 1 && pool_tokens_at(free, total, n) < self.max_seq_len as u64 {
+                        n -= 1;
+                    }
+                    if affordable == 0 {
+                        n = 0;
+                    }
+                    (i32::try_from(n).unwrap_or(i32::MAX), Some((free, total)))
+                }
+                // Can't query (no active context / driver error) → don't bind the
+                // min; the other ranks' budgets still apply.
+                Err(_) => (i32::MAX, None),
+            };
+        let affordable = self.tp.all_reduce_min_scalar_i32(&self.ctx, n_local)? as usize;
         // Reject-below-fixed guard (parity with Metal's fits_fixed + DSv4): a
         // cross-rank-min affordable of 0 means post-weights free VRAM cannot
         // hold even one slot at this max_seq_len. Fail closed uniformly
@@ -219,14 +265,78 @@ impl Qwen35Model {
         if clamped {
             log::warn!(
                 "Qwen3.5 KV budget: requested {requested} slots × ~{}MB/slot exceeds the \
-                 cross-rank-min affordable {affordable} (local affordable {affordable_local}, \
-                 {MEM_FRACTION} of post-weights free); clamping num_slots to {affordable}. \
-                 Lower --max-total-tokens (max_seq_len {}) to raise concurrency.",
+                 cross-rank-min joint-affordable {affordable} (local {n_local}, {MEM_FRACTION} \
+                 of post-weights free minus the shared-pool funding for one full-length \
+                 request); clamping num_slots to {affordable}. Lower --max-total-tokens \
+                 (max_seq_len {}) to raise concurrency.",
                 per_slot >> 20,
                 self.max_seq_len,
             );
         }
-        Ok(planned)
+        if requested == 1 {
+            return Ok(Qwen35KvBudgetPlan {
+                num_slots: planned,
+                pool_pages: requested_pages,
+            });
+        }
+        // Pool pages at the REDUCED slot count: n is rank-identical, and pages
+        // shrink as n grows, so min-reducing the per-rank profile at the same n
+        // yields a capacity every rank can hold.
+        let pages_local: i32 = match probe {
+            Some((free, total)) => {
+                let profiled_tokens = pool_tokens_at(free, total, planned);
+                if profiled_tokens == infer_seam::PROFILE_KV_TOKENS_FLOOR {
+                    // `mem_fraction_static` bounds the engine's share of TOTAL, so a
+                    // value under the weights' own share caps admission at 4096
+                    // tokens even at num_slots 1.
+                    let reserve = (total as f64 * (1.0 - mem_fraction_static)) as u64;
+                    log::warn!(
+                        "KV pool collapsed to the {}-token floor even at num_slots {planned}: \
+                         free {}MB − recurrent {}MB − reserve {}MB (= total {}MB × (1 − \
+                         mem_fraction_static {mem_fraction_static})) leaves nothing for \
+                         {cell_bytes_per_token}B/tok cells. Raise mem_fraction_static, or free \
+                         VRAM: every prompt over {} tokens will abort.",
+                        infer_seam::PROFILE_KV_TOKENS_FLOOR,
+                        free >> 20,
+                        per_slot.saturating_mul(planned) >> 20,
+                        reserve >> 20,
+                        total >> 20,
+                        infer_seam::PROFILE_KV_TOKENS_FLOOR,
+                    );
+                }
+                let profiled_pages = (profiled_tokens / PAGE as u64).max(1) as usize;
+                log::info!(
+                    "CUDA Qwen3.6 full-attn KV pool profiled from measured VRAM: free {}MB / \
+                     total {}MB, recurrent reservation {}MB ({planned} slots × {}MB), \
+                     mem_fraction_static {mem_fraction_static}, cell {cell_bytes_per_token}B/tok \
+                     ({num_full} full-attn layers × {local_kv_heads} kv-heads × {head_dim} hd) \
+                     -> max_total_tokens {profiled_tokens} ({profiled_pages} pages); requested \
+                     {requested_pages} pages (advisory)",
+                    free >> 20,
+                    total >> 20,
+                    per_slot.saturating_mul(planned) >> 20,
+                    per_slot >> 20,
+                );
+                i32::try_from(profiled_pages).unwrap_or(i32::MAX)
+            }
+            None => i32::MAX,
+        };
+        let pool_pages = self.tp.all_reduce_min_scalar_i32(&self.ctx, pages_local)? as usize;
+        let pool_pages = if pool_pages == i32::MAX as usize {
+            // Every rank's free-VRAM probe failed → the requested floor, matching
+            // the old profile-failure fallback.
+            log::warn!(
+                "CUDA Qwen3.6 full-attn KV pool: free-VRAM probe failed on every rank; \
+                 falling back to requested floor {requested_pages} pages"
+            );
+            requested_pages
+        } else {
+            pool_pages
+        };
+        Ok(Qwen35KvBudgetPlan {
+            num_slots: planned,
+            pool_pages,
+        })
     }
 
     pub(crate) fn forward_hidden(
