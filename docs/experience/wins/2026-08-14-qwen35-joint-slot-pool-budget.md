@@ -31,8 +31,13 @@ old = 86 slots / 4096 pool tokens; new = 68 slots / ~36.7K pool tokens —
   binary (run sgserve2, build sgate2) and the fixed one (run sgserve7, build
   sgate7 at 8ad726e1c). Same serve then passed the full sampling gate
   (7 arms, window delta drafted=640 accepted=385, binary sha byte-match).
-- V100 32 GB (starved regime): `pending-remote` — re-run the #178 serve on the
-  V100 box, expect ~68 slots / ~36K-token pool (issue #182 tracks it).
+- V100 32 GB (starved regime): matched pair, same card/model/default flags,
+  identical post-weights free 15116MB. Old 72 slots / 20720 pool tokens
+  (288/slot); new 25 slots / 131120 pool tokens (5245/slot) — the joint solve
+  sheds 47 slots to fund the pool to exactly one full-length request
+  (max_seq_len 131072). The issue's 86/4096 numbers were a lower-free
+  snapshot; a contaminated first run at free 6630MB reproduced the old
+  formula's collapse to the 4096-token floor, corroborating that regime.
 
 ## Rule
 
