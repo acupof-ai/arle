@@ -318,10 +318,11 @@ impl InferStudent {
         engine.remerge_student_lora(update)?;
 
         // Re-point the student's frozen-base tensors at the engine's merged BF16
-        // bytes, then free the retired FP8 buffers (~27 GB) that would OOM the
-        // next round's forward. SKIPPED under offload=student|all: the same
-        // step's offload_engine_weights frees these buffers, so the trainer must
-        // keep its own frozen-base copies (a re-point would read freed memory).
+        // bytes. SKIPPED under offload=student|all: the same step's
+        // offload_engine_weights frees these buffers, so the trainer must keep
+        // its own frozen-base copies (a re-point would read freed memory).
+        // Retired FP8 qweight/scales are never freed: they are the pristine
+        // source for the idempotent re-merge and the trainer's shared alias.
         if !crate::opd::engine_offload_mode().offloads_student() {
             let bf16_ptrs = engine.frozen_base_bf16_pointers()?;
             drop(engine);
@@ -359,7 +360,6 @@ impl InferStudent {
                 .lock()
                 .map_err(|err| anyhow!("LoadedInferenceEngine lock poisoned: {err}"))?;
         }
-        engine.free_retired_fp8_buffers();
         Ok(())
     }
 }

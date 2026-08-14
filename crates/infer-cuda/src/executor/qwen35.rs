@@ -3207,14 +3207,6 @@ impl Qwen35CudaExecutor {
         self.model.frozen_base_bf16_pointers()
     }
 
-    /// Free the retired FP8 qweight/scales buffers of every projection promoted to
-    /// dense
-    /// BF16. Call ONLY after the train student re-aliased its frozen base to BF16
-    /// `data`.
-    pub(crate) fn free_retired_fp8_buffers(&mut self) {
-        self.model.free_retired_fp8_buffers();
-    }
-
     /// Hot-swap the DSpark Markov head weights from a host f32 snapshot; invalidates
     /// the
     /// decode graph, which bakes the old weight pointers.

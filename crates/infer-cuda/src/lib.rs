@@ -557,17 +557,6 @@ impl CudaExecutor {
         }
     }
 
-    /// Free the retired FP8 qweight/scales buffers for every projection that
-    /// has been promoted to dense BF16. Call ONLY after the train student has
-    /// re-aliased its frozen base to the BF16 `data` pointer.
-    #[cfg(feature = "cuda")]
-    pub fn free_retired_fp8_buffers(&mut self) {
-        match &mut self.inner {
-            CudaExecutorInner::Placeholder => {}
-            CudaExecutorInner::Real(real) => real.free_retired_fp8_buffers(),
-        }
-    }
-
     /// Hot-swap the DSpark Markov head weights from a host f32 snapshot.
     /// Called by the train sidecar after each acceptance-weighted step.
     #[cfg(feature = "cuda")]

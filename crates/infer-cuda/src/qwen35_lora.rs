@@ -531,60 +531,6 @@ impl Qwen35Model {
         Ok(())
     }
 
-    /// Free the retired FP8 qweight/scales buffers for every projection that has
-    /// been promoted to dense BF16. Call ONLY after the train student has
-    /// re-aliased its frozen base to the BF16 `data` pointer (see
-    /// [`Qwen35Model::frozen_base_bf16_pointers`]) — otherwise the student's
-    /// FP8 alias dangles. Frees ~27 GB on the 27B model.
-    pub(crate) fn free_retired_fp8_buffers(&mut self) {
-        fn clear(m: &mut DeviceMatrix) {
-            if m.weight_format() == WeightFormat::DenseBf16 {
-                m.qweight_u8 = None;
-                m.scale_f32 = None;
-                m.quant_block_m = 0;
-                m.quant_block_k = 0;
-                m.quant_scale_rows = 0;
-                m.quant_scale_cols = 0;
-            }
-        }
-        for layer in self.layers.iter_mut() {
-            if let Qwen35Attn::Full(full) = &mut layer.attn {
-                clear(&mut full.qkv_proj);
-                clear(&mut full.o_proj);
-            }
-            if let Qwen35Attn::Linear(lin) = &mut layer.attn {
-                clear(&mut lin.in_proj_qkvz);
-                clear(&mut lin.in_proj_ba);
-                clear(&mut lin.out_proj);
-            }
-            if let Some(mlp) = &mut layer.mlp {
-                clear(&mut mlp.gate_up_proj);
-                clear(&mut mlp.down_proj);
-            }
-            if let Some(moe) = &mut layer.moe {
-                clear(&mut moe.shared_gate);
-                clear(&mut moe.shared_up);
-                clear(&mut moe.shared_down);
-                for m in moe.gate.iter_mut() {
-                    clear(m);
-                }
-                for m in moe.up.iter_mut() {
-                    clear(m);
-                }
-                for m in moe.down.iter_mut() {
-                    clear(m);
-                }
-            }
-        }
-        // The frozen base now IS the merged BF16 `data` (the student re-aliases
-        // it). Reset the per-merge dirty set and the one-shot BF16 base cache:
-        // the next round's first merge treats the current `data` as the pristine
-        // base, and a zero-adapter round is a no-op rather than a
-        // restore-from-FP8.
-        self.lora_dirty.clear();
-        self.lora_base_dev.clear();
-    }
-
     /// Promote FP8-block-scaled LoRA targets to dense BF16 on first touch.
     /// Replaces the former host remerge lane (O(rows·cols·rank) triple loop +
     /// re-quant + full-W upload, 60-83s/round) with a one-time kernel; every
@@ -674,16 +620,10 @@ impl Qwen35Model {
     /// Projections that live inside a row-fused matrix (MlpUp shares
     /// `gate_up_proj` with MlpGate) map to one canonical key so the pristine
     /// device base is cached once per underlying buffer.
+    // Each projection caches its OWN row window: collapsing row-fused siblings
+    // (e.g. FullK/FullV onto FullQ) made a restore return the other
+    // projection's bytes.
     fn lora_base_cache_key(layer_idx: usize, projection: StudentLoraProjection) -> LoraBaseKey {
-        let projection = match projection {
-            StudentLoraProjection::MlpUp => StudentLoraProjection::MlpGate,
-            StudentLoraProjection::LinearA => StudentLoraProjection::LinearB,
-            StudentLoraProjection::FullK | StudentLoraProjection::FullV => {
-                StudentLoraProjection::FullQ
-            }
-            StudentLoraProjection::LinearZ => StudentLoraProjection::LinearQkv,
-            other => other,
-        };
         LoraBaseKey {
             layer_idx,
             projection,
