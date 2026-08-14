@@ -217,11 +217,12 @@ path for callers without a source stream. See
 `docs/experience/wins/2026-08-14-bf16-bridge-event-ordered.md` (pending-remote
 bench).
 
-Site 2 (`release_kv_pool`) was not changed. Its two syncs are entangled with
-the OPD phase machine and VRAM accounting (the trim makes freed pool bytes
-visible to the co-resident student), and the load-bearing behavior was
-measured by the original author. Removing them blind (no GPU on the dev box)
-risks OOM in training; it needs a pod A/B of its own.
+Site 2 (`release_kv_pool`) also shipped: the two full-context syncs are
+replaced by a single event sync (record after drop, wait for the frees, then
+trim). The event sync is cheaper than a context sync because it only waits
+for the frees, not all queued work. See
+`docs/research/2026-08-14-stream-ordered-gpu-memory-long-term.md` for the
+long-term plan and the remaining sync sites.
 
 The limbo pattern itself remains unbuilt. It solves a different problem
 (cancelled futures) that ARLE does not have; the two sync sites were both
