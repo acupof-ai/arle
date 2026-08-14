@@ -254,26 +254,6 @@ fn log_free_vram(store: &TensorStore, label: &str) {
     }
 }
 
-/// Sum-squares checksum over every model param's device data (step-trace
-/// gated). A drift between two phases means someone scribbled the weights.
-fn log_param_checksum(store: &TensorStore, params: &[TensorId], label: &str) {
-    if !step_trace_enabled() {
-        return;
-    }
-    let mut total = 0.0f64;
-    let mut counted = 0usize;
-    for &id in params {
-        if let Some(t) = store.get(id)
-            && let Some(h) = t.device_handle.as_ref()
-            && let Ok(sq) = store.backend().sum_squares(h, &t.shape)
-        {
-            total += sq;
-            counted += 1;
-        }
-    }
-    eprintln!("[param-checksum] {label} params={counted} sum_sq={total:.6e}");
-}
-
 fn log_opd_step_trace(step_started: Instant, event: &str, detail: impl AsRef<str>) {
     if step_trace_enabled() {
         eprintln!(
