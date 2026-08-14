@@ -464,12 +464,11 @@ impl TeacherForward for InferTeacher {
             )));
         }
 
-        let sync_started = Instant::now();
-        raw_logits
-            .device
-            .sync()
-            .map_err(|err| TeacherForwardError::InferRuntime(err.to_string()))?;
-        let sync_seconds = sync_started.elapsed().as_secs_f64();
+        // The bridge is stream-ordered on the logits' own stream (after the
+        // lm_head GEMM), so the old pre-bridge device sync is redundant: the
+        // D2D copy and the source's later free are both ordered on that
+        // stream. `sync_seconds` stays in the profile for compatibility, 0.0.
+        let sync_seconds = 0.0;
         let shape = vec![1, raw_logits.seq_len(), raw_logits.vocab_size()];
         let bridge_started = Instant::now();
         // The logits buffer is bound to the engine's compute stream; passing it
