@@ -1,8 +1,10 @@
 use std::{
     fs,
     path::{Path, PathBuf},
-    process::ExitCode,
 };
+
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
+use std::process::ExitCode;
 
 use anyhow::{Context, Result, bail};
 use deepseek_spec::{DeepSeekV4AttentionMode, DeepSeekV4Config};
