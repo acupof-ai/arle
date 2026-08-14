@@ -9,20 +9,17 @@
 #   - same per-SM dispatch wrapper, same generator invocation args
 #   - the consumer dispatch (decode,q_heads -> fn) is reproduced by resolve().
 #
-# Each [[kernel]] row is one TileLangKernelSpec. Fields map 1:1 to the old
-# inline struct construction in compile_tilelang_aot_kernels():
-#   family       -> grouping + drives generated_dir/symbol prefixes
-#   head_dim     -> documentation/resolve key (baked into the cubin, not a py arg)
+# Each [[kernel]] row is one RegKernel (build.rs). Fields:
+#   head_dim     -> resolve() key (baked into the cubin, not a py arg)
 #   q_heads/kv_heads -> --num-q-heads/--num-kv-heads (omit for non-attn rows)
-#   kv_dtype     -> bf16 (selects the abi; resolve() key)
 #   phase        -> prefill | decode | split_partial | split_merge | <gdr phase> | <fq phase>
 #   abi          -> names a [abi.*] shared C signature block (below)
 #   py_module    -> --kernel-path
 #   kernel_name  -> generator --kernel-name stem (==> symbol "{kernel_name}_cuda")
 #   out_name     -> generator --out-name (artifact basename)
 #   artifact_dir -> generated/<dir> base (per-SM gets _sm{N}, dispatch gets _dispatch)
-#   kernel_family-> generator --kernel-family (NOT the registry `family`; the py
-#                   codegen tag: attention | attention_bf16_split_partial |
+#   kernel_family-> generator --kernel-family (the py codegen tag:
+#                   attention | attention_bf16_split_partial |
 #                   attention_bf16_split_merge | gdr | flashqla)
 #   kernel_key   -> generator --kernel-key (optional; split_partial/merge/gdr/fq)
 #   allow_sm70   -> include sm_70 in the per-SM loop (Qwen3.5 dense subset + GDR)
@@ -144,16 +141,6 @@ rust = [
 # stay hand-written in ffi/recurrent.rs (they are individual pub fn decls, not
 # macro lockstep — outside the FFI-collapse scope). C signature is still required
 # here so build.rs emits the matching dispatch wrapper.
-
-[abi.gdr_prepare_v1]
-fn_ty = "GdrPrepareV1Fn"
-c = """const uint16_t* qkv, const uint16_t* b_proj, const uint16_t* a_proj, \
-const uint16_t* dt_bias, const float* a_log, uint16_t* q_out, uint16_t* k_out, \
-uint16_t* v_out, float* g_out, float* beta_out, int32_t num_key_heads, \
-int32_t num_value_heads, int32_t qkv_dim, int32_t seq_len, CUstream stream"""
-call = """qkv, b_proj, a_proj, dt_bias, a_log, q_out, k_out, v_out, g_out, beta_out, \
-num_key_heads, num_value_heads, qkv_dim, seq_len, stream"""
-rust = []  # build-only
 
 [abi.gdr_cumsum_v1]
 fn_ty = "GdrCumsumV1Fn"
@@ -348,11 +335,9 @@ ffi = true
 
 # Qwen3.6-27B full-attn: 24 q heads / 4 kv heads, HD256 (KV-recall paged path).
 [[kernel]]
-family = "batch_prefill_paged"
 head_dim = 256
 q_heads = 24
 kv_heads = 4
-kv_dtype = "bf16"
 phase = "prefill"
 abi = "paged_attn_v1"
 kernel_family = "attention"
@@ -439,11 +424,9 @@ ffi = true
 
 # Qwen3.6-27B full-attn: 24 q heads / 4 kv heads, HD256 (KV-recall paged decode).
 [[kernel]]
-family = "batch_decode_paged"
 head_dim = 256
 q_heads = 24
 kv_heads = 4
-kv_dtype = "bf16"
 phase = "decode"
 abi = "paged_attn_v1"
 kernel_family = "attention"
