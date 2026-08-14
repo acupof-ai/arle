@@ -14,6 +14,9 @@ import json
 import sys
 import urllib.error
 import urllib.request
+from collections import Counter
+
+from arle_stats import fetch_stats, message_text, spec_decode
 
 PROMPT = "List ten common fruits, one per line, then explain which is your favorite and why."
 
@@ -28,9 +31,7 @@ def http_json(url, body=None, timeout=240):
 
 
 def decoded_text(response):
-    # Thinking models answer in reasoning_content and leave content empty.
-    m = response["choices"][0]["message"]
-    return (m.get("reasoning_content") or "") + (m.get("content") or "")
+    return message_text(response["choices"][0]["message"])
 
 
 def first_divergence(ref, out):
@@ -45,22 +46,17 @@ def dominance(out, expect_text=None):
     toks = out.split()
     if not toks:
         return 0.0
-    top = max(set(toks), key=toks.count)
+    top, count = Counter(toks).most_common(1)[0]
     # A dominant word that is not the biased token must not pass as a veto.
     if expect_text is not None and expect_text not in top:
         return 0.0
-    return toks.count(top) / len(toks)
+    return count / len(toks)
 
 
 def fetch_spec_counters(base):
-    _, j = http_json(f"{base}/v1/stats", timeout=10)
-    body = j.get("body", j) if isinstance(j, dict) else j
-    if isinstance(body, str):
-        body = json.loads(body)
-    counters = dict(body.get("spec_decode") or {})
+    body = fetch_stats(base, timeout=10)
     sha = (body.get("build_identity") or {}).get("product_binary_sha256") or ""
-    counters["product_binary_sha256"] = sha.removeprefix("sha256:")
-    return counters
+    return spec_decode(body), sha.removeprefix("sha256:")
 
 
 def main():
@@ -99,7 +95,7 @@ def main():
     spec_before = None
     try:
         try:
-            spec_before = fetch_spec_counters(base)
+            spec_before, _ = fetch_spec_counters(base)
         except Exception:
             spec_before = None
         for name, extra in arms:
@@ -116,8 +112,9 @@ def main():
                     hit = out.lstrip().startswith(args.biased_text)
                     detail = f"opens={'yes' if hit else 'no'}"
                 else:
-                    hit = dominance(out) >= 0.5
-                    detail = f"dom={dominance(out):.2f} (pass --biased-text for identity)"
+                    dom = dominance(out)
+                    hit = dom >= 0.5
+                    detail = f"dom={dom:.2f} (pass --biased-text for identity)"
                 passed = st == 200 and len(out) > 0 and div is not None and div <= 2 and hit
                 rows.append((name, st, div, detail, passed))
             else:
@@ -139,13 +136,12 @@ def main():
 
     stats_line = "stats: unavailable"
     try:
-        body = fetch_spec_counters(base)
+        counters, sha = fetch_spec_counters(base)
         # Cumulative since boot; only the window delta proves engagement.
         delta = {
-            k: (body.get(k) or 0) - ((spec_before or {}).get(k) or 0)
+            k: (counters.get(k) or 0) - ((spec_before or {}).get(k) or 0)
             for k in ("chains", "drafted", "accepted")
         }
-        sha = body.get("product_binary_sha256")
         stats_line = (
             f"stats: window delta chains={delta['chains']} drafted={delta['drafted']} "
             f"accepted={delta['accepted']} product_binary_sha256={sha}"

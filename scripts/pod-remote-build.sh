@@ -216,9 +216,9 @@ PY
     binary_sha=""; manifest=""; manifest_sha=""; producer_id=""; embedded_id=""
     [ "$rc" -eq 0 ] && [ -f "$binary" ] && binary_sha="$(sha256 "$binary")" || rc=1
     if [ "$rc" -eq 0 ]; then
-      # Feature sets share target/release/<bin>; pin this build under a
-      # per-label name so a later build cannot clobber it before its runs.
-      artifact="$(dirname "$binary")/$binary_name-$LABEL"
+      # Feature sets share target/release/<bin>; pin the artifact in the
+      # build's own state dir, out of cargo clean/sweep's reach.
+      artifact="$DIR/$binary_name"
       if { ln -f "$binary" "$artifact" 2>/dev/null || cp -f "$binary" "$artifact"; }; then
         binary="$artifact"
       else

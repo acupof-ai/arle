@@ -140,6 +140,8 @@ case "${1:-}" in
     deadline=$((SECONDS + TIMEOUT)); models_ok=0
     while [ "$SECONDS" -le "$deadline" ]; do
       valid_process "$DIR" || { echo "run process ownership changed: $LABEL" >&2; exit 1; }
+      # A dead serve otherwise makes this poll wait out the full timeout.
+      [ -f "$DIR/terminal" ] && { echo "run exited before ready: $LABEL $(head -n1 "$DIR/terminal")" >&2; tail -n 20 "$DIR/log" >&2; exit 1; }
       remaining=$((deadline - SECONDS + 1))
       [ "$remaining" -gt 5 ] && request_timeout=5 || request_timeout="$remaining"
       if curl --max-time "$request_timeout" -sf "http://127.0.0.1:$port/v1/models" >/dev/null; then models_ok=1; break; fi

@@ -14,6 +14,11 @@ def unwrap_body(stats):
     """Return the stats counters dict, unwrapping a {status_code, body} record."""
     if isinstance(stats, dict) and "body" in stats and "status_code" in stats:
         stats = stats["body"]
+    if isinstance(stats, str):
+        try:
+            stats = json.loads(stats)
+        except ValueError:
+            return {}
     return stats if isinstance(stats, dict) else {}
 
 
