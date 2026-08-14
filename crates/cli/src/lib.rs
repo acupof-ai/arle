@@ -59,6 +59,7 @@ use infer_api::{InferenceEngine, LoadedInferenceEngine};
 /// global. Every such test takes this lock first. Poison-tolerant so one
 /// failing test doesn't cascade into every later env test.
 #[cfg(all(test, any(feature = "cuda", feature = "metal", feature = "cpu")))]
+#[allow(dead_code)]
 pub(crate) fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     LOCK.lock()
