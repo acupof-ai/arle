@@ -29,25 +29,24 @@ python3 scripts/gen_bench_prompts.py bench-agent-32k-16x8.jsonl 16 32000 214 8
 
 ## Qwen3.6-27B-FP8 · 1×H20 · single-GPU · eager — LONG-AGENT ANCHOR
 
-### SOTA — DSpark, runtime `9b38ba6c0`, runner `c98c4e0b2` (2026-08-10)
+### SOTA — DSpark, runtime `fad8f4d5b`, runner `c98c4e0b2` (2026-08-14)
 
-This row re-anchors the corrected model and benchmark semantics. The Qwen3Next
-target final norm uses `(1+w)`; the Qwen3 DFlash draft uses plain-weight
-RMSNorm. The fixed-output runner sends `ignore_eos=true`, and its
+The Qwen3Next target final norm uses `(1+w)`; the Qwen3 DFlash draft uses
+plain-weight RMSNorm. The fixed-output runner sends `ignore_eos=true`, and its
 production-length warmup has a disjoint prefix-cache key.
 
 Features on: batched draft · replay · snapshot · capture · markov+confidence
 head driving the goodput budget. Serve adds `--spec-type dspark
---mtp-draft-model /host/Qwen3.6-27B-DFlash --dspark-block-size 6`; 16 slots,
-195 MiB per slot.
+--mtp-draft-model /host/nvme0/Qwen3.6-27B-DFlash --dspark-block-size 6`; 16
+slots, 195 MiB per slot.
 
 Identity:
 
-- Runtime commit `9b38ba6c01def7b44c8dc6ee90c38249aee2bf8d`
+- Runtime commit `fad8f4d5b715698fcada7d2ce382682f18788e03`
 - Runner commit `c98c4e0b2`
-- Binary SHA-256 `5df97e8711ecda7787106a503b7dea432adbab5e865587c9f8a85725d0f078ca`
-- Kernel bundle `e9454f1fc2320f4a62cabe87407442759f956cb4941cb632db953e19ca882cec`
-- GPU `GPU-77551814-ffe0-d267-728e-a3a20a0612de` (H20)
+- Binary SHA-256 `7ba56981695cbdd759b5d6b96e74a0b9b851549c3c55469c0b62d8701c94e9de`
+- Kernel bundle `79d522d1bc4f2d4fd6d706c8d7a5ea2040d44b4aeaeac5fcc96472d3040bdd72`
+- GPU `GPU-1769a5e7-852b-74f9-e109-f52dbb2c4859` (H20)
 - Dataset SHA-256 `8867f63eaac2f0537bb2b17847a7d0d3c1bb8d504c1ad191e97d673e9ecc4f34`
 
 One fresh serve, ascending concurrency. ITL mean is the per-output-token latency
@@ -56,31 +55,30 @@ must not be converted into per-token throughput.
 
 | c | prefix hits | accept | TTFT p50/p99 | ITL mean/p99 | output tok/s | total tok/s | req/s |
 |---:|---:|---:|---:|---:|---:|---:|---:|
-| 1 | 112/128 | 41.57% | 951.9 / 10276.7 ms | 10.56 / 49.46 ms | 47.47 | 7762.61 | 0.222 |
-| 2 | 128/128 | 27.45% | 564.4 / 976.2 ms | 17.08 / 94.75 ms | 98.85 | 16165.85 | 0.462 |
-| 4 | 128/128 | 27.81% | 625.2 / 1470.3 ms | 29.57 / 513.63 ms | 123.07 | 20125.66 | 0.575 |
-| 8 | 128/128 | 26.90% | 613.0 / 3668.8 ms | 49.85 / 542.96 ms | 151.59 | 24790.76 | 0.708 |
-| 16 | 128/128 | 27.32% | 939.0 / 8141.3 ms | 92.27 / 760.58 ms | 162.60 | 26590.69 | 0.760 |
+| 1 | 112/128 | 40.64% | 978.4 / 10308.6 ms | 10.89 / 49.53 ms | 46.94 | 7675.73 | 0.219 |
+| 2 | 128/128 | 27.35% | 581.3 / 930.8 ms | 17.06 / 94.93 ms | 99.48 | 16268.54 | 0.465 |
+| 4 | 128/128 | 27.06% | 584.8 / 1395.3 ms | 29.46 / 505.06 ms | 124.42 | 20347.14 | 0.581 |
+| 8 | 128/128 | 27.63% | 625.1 / 3408.2 ms | 48.86 / 544.12 ms | 152.94 | 25011.24 | 0.715 |
+| 16 | 128/128 | 27.28% | 878.6 / 7646.0 ms | 89.34 / 723.44 ms | 168.30 | 27522.30 | 0.786 |
 
 Every point completed 128/128 with zero incomplete, error, empty, or
-correctness-failed responses. Prompt tokens are 32425 / 34827.5 / 37248
-min/p50/max; p50 is +8.84% from the 32K target and passes the ±10% gate.
-Completion tokens are exactly 214 / 214 / 214.
+correctness-failed responses. Completion tokens are exactly 214.
 
 The c=1 point has the expected 112 warm hits: 16 cold turn-0 requests followed
-by seven reusable turns per session. The old runner reported 113 because its
-warmup used dataset prompt zero. Later points are fully warm because the grid is
-ascending, so this row is the canonical workload baseline and not a pure
+by seven reusable turns per session. Later points are fully warm because the
+grid is ascending, so this row is the canonical workload baseline and not a pure
 concurrency-scaling experiment.
 
-Correctness: concurrent needle c=2/8/16 ×3 passed 78/78 exact with zero misses.
-The same repaired runtime produced 26.90-27.81% acceptance at c=2-16, recovering
-from the pre-fix 0.334% and matching the historical ~27.6% range.
+Correctness: needle ladder 512/4096/16384/32768 ×3 passed 12/12 exact,
+deterministic at every length.
 
-Raw artifacts:
-`/host/agent-infer-9b38-g2/artifacts/c98-baseline/`. This fingerprint has one
-valid sweep; use a matched A/B for candidate deltas until a repeat establishes
-its drift band.
+This row replaces `9b38ba6c0` (2026-08-10) under rule 1 taken as
+latest-is-reference, not because a delta was demonstrated. Output tok/s moves
+−1.1 / +0.6 / +1.1 / +0.9 / +3.5% across the grid and acceptance moves under
+1 pp at every point, so the two runtimes are indistinguishable on this
+fingerprint; c=16 alone sits just outside the ±3% band on a single sweep and is
+not a claim of improvement. The GPU differs from the prior row
+(`GPU-77551814`), which rule 3 counts as part of the fingerprint.
 ### Step budget — where the time goes (2026-08-01, `nsys`, dense FP8)
 
 The SOTA table says how fast; this says what to fix.
@@ -233,27 +231,51 @@ build: TTFT 24.94/24.95 s vs 24.97/25.05, zero fallback lines in the serve log.
 
 ## DSv4-Flash-FP8 · 8×H20 · TP=8/EP=8 · eager
 
-### SOTA — DSpark, runtime `868043f5f` (2026-08-10)
+### SOTA — DSpark, runtime `fad8f4d5b`, runner `c98c4e0b2` (2026-08-14)
 
 Serve `--spec-type dspark --mtp-draft-model
-/host/nvme0/DeepSeek-V4-Flash-DSpark-draft-fp8`. DSpark runtime: stages=3
-block=5 target_layers=[40,41,42], +2592 MB weights/GPU. Base model + draft on
-NVMe (HDD load timed out the engine-ready barrier at 924 s).
+/host/nvme0/DeepSeek-V4-Flash-DSpark-draft-fp8 --comm-backend nccl`, no other
+flags. DSpark runtime: stages=3 block=5 target_layers=[40,41,42],
+`confidence_threshold: None`, sps bias 211.0 ms / row 0.53 ms. Base model +
+draft on NVMe (HDD load timed out the engine-ready barrier at 924 s); weights
+land at 41737 MB/rank, prefetch 17.46 GB/s.
 
-Synthetic prompts (64), 30 s/point, max_tokens 128, greedy, seed 42. Not the
-32K agent fingerprint — a first DSv4 DSpark measurement; re-anchor on the
-agent workload before ranking.
+Identity: binary SHA-256
+`08fa6f89c1de04b01d87ab9a19198db9377c6407816d69925eb8985110a36878`, kernel
+bundle `cb52441a46a39bfe4e65d4dc2c02d21fb5d799d9a3be324ae5f35635bd7e7286`.
 
-| c | complete | out tok/s | total tok/s | accept |
-|---|---:|---:|---:|---:|
-| 1 | 18/18 | 72.4 | 76.9 | 58.7% |
-| 8 | 48/48 | 176.2 | 187.6 | — |
-| 16 | 64/64 | 242.2 | 257.9 | — |
+Synthetic prompts (64) over raw `/v1/completions`, **120 s/point**, max_tokens
+128, greedy, seed 42. Not the 32K agent fingerprint — re-anchor on the agent
+workload before ranking.
 
-Acceptance 58.7% (1390 accepted / 2367 drafted, 574 chains), 2.42 tokens/chain
-(block size 5). c=1 is +37% over the plain-decode 53 tok/s. The speedup is
-smaller than Qwen3.6-27B's 2.9× because DSv4's verify cost (larger model, FP8
-MoE) eats more of the draft gain.
+| c | complete | out tok/s | total tok/s | TTFT p50/p99 | accept | acc/chain | chains/s |
+|---|---:|---:|---:|---|---:|---:|---:|
+| 1 | 62 | 65.56 | 69.82 | 169.8 / 266.7 ms | 50.36% | 2.00 | 16.5 |
+| 8 | 177 | 182.10 | 193.87 | 443.5 / 627.1 ms | 49.02% | 1.84 | 0.5 |
+| 16 | 241 | 244.77 | 260.60 | 870.8 / 971.1 ms | 44.52% | 1.70 | 0.6 |
+
+**Speculation only engages at c=1.** At c=8/16 the run completes ~60 chains in
+~125 s against >22000 output tokens, so DSpark contributes under 1% there and
+those acceptance figures are a few-dozen-chain sample, not an indicator. The
+c=8/16 throughput is plain decode.
+
+Rule 3 re-anchor, not a regression against `868043f5f` (2026-08-10). That row
+predates `ef8bcd61e`, which added `ignore_eos=true`: its points average
+120.7 / 110.1 / 113.5 completion tokens per request, so its requests stopped at
+EOS, while every request here emits exactly 128. Forcing generation past EOS is
+where the drafter agrees least, which moves acceptance 58.7% → 50.4%; the
+throughput follows from acceptance at an unchanged chain rate — restoring
+2.42 acc/chain at the measured 16.5 chains/s gives 65.6 + 0.42 × 16.5 =
+72.5 tok/s against the old row's 72.4.
+
+Correctness: needle ladder 512/4096/16384 ×3 passed 9/9 exact (NONDET at
+4096/16384 is MoE routing). The c=16 point flags 7/241 responses, all from the
+one prompt `Explain bloom filters and their use cases.`, whose continuation
+style is concurrency-dependent — see
+[`errors/2026-08-14-raw-completion-continuation-flips-with-concurrency.md`](experience/errors/2026-08-14-raw-completion-continuation-flips-with-concurrency.md).
+The `logit_bias` relay gate passes at TP=8: a biased request returns 200 with
+the biased token dominating, two ordinary requests then answer correctly, and
+the serve log carries zero `relay deserialize` lines.
 
 ---
 
