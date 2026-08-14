@@ -39,6 +39,7 @@ start_serve() {
         --port "$PORT" \
         --cuda-mempool-retain false \
         --max-running-requests "$MAX_RUNNING" \
+        --mem-fraction-static 0.7 \
         ${ARLE_EXTRA_ARGS:-} \
         >> "$LOG" 2>&1 &
     SERVE_PID=$!
