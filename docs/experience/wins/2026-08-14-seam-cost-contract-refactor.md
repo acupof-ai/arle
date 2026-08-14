@@ -31,8 +31,9 @@ the trait.
 Zero-behavior-change refactor by construction: every engine call site's
 `None` arm reproduces the deleted default verbatim (audited per site). All
 lanes green (CUDA host, Metal, core/seam/server/metal tests, clippy -D,
-workspace check). Pod smoke: serve + sampling gate on the refactored binary —
-recorded below when run.
+workspace check). Pod smoke on the refactored binary (build fix205b,
+381b681c…, HEAD incl. the #205 fix): ENGINE_READY, sampling gate PASS on all
+7 arms, spec window delta drafted=640 accepted=387, binary sha byte-match.
 
 ## Rule
 
