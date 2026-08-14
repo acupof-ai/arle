@@ -15,7 +15,7 @@ use super::{
     EngineOffloadMode, GkdLossConfig, OpdError, OpdStepConfig, OpdStepOutcome, OpdStepProfile,
     Result,
     backward::{backward_chunked_kl, backward_windowed_gkd},
-    backward_with_optional_profile, log_opd_step_trace,
+    backward_with_optional_profile, log_opd_step_trace, log_param_checksum,
     loss::{gkd_sft_loss, kl_distill_loss_for_config, mix_gkd_losses},
     map_qwen35_forward_error, map_teacher_forward_error, record_profile,
     rollout::rollout_phase,
@@ -87,6 +87,7 @@ fn windowed_gkd_step<O: Optimizer, T: TeacherForward + ?Sized>(
         "windowed_step_start",
         format!("window_size={window_size}"),
     );
+    log_param_checksum(store, rt.student_model_params, "windowed_step_start");
     let phase_started = Instant::now();
     optimizer.zero_grad(store, rt.student_params);
     record_profile(profile, |profile| {
