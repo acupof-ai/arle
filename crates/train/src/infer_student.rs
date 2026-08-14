@@ -332,6 +332,12 @@ impl InferStudent {
                 else {
                     continue;
                 };
+                // The engine buffer holds MERGED bytes (base + LoRA delta); the
+                // trainer's forward adds its delta on top, so a LoRA-targeted
+                // projection must keep the trainer-owned pristine base.
+                if adapter_map.contains_key(format!("{name}.lora_a").as_str()) {
+                    continue;
+                }
                 let shape = vec![entry.rows, entry.cols];
                 let handle = {
                     let backend = store.backend();
