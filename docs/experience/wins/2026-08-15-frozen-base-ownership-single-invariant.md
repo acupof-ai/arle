@@ -24,12 +24,15 @@ the fix is a deletion, not a mechanism. Ownership is now one invariant:
 exported or promoted base bytes are never freed while the model lives.
 
 Verification: regression arm (0.8B, attention-qv, offload=student, 5 steps)
-finite losses 26.59 / 26.09 / 27.31 / 28.65 / 25.18. The FP8-shared
-all-linear lane (rubric-opd, 27B) is blocked before the fixed code runs by a
-pre-existing engine load failure — `engine build failed: row fuse +
-model.language_model.layers.17.mlp.up_proj.weight` under the all-linear
-bf16-resident-experts load path — recorded separately; the lane's runtime
-exercise stays pending until that load bug is fixed.
+finite losses 26.59 / 26.09 / 27.31 / 28.65 / 25.18. The "row fuse" load
+failure first blamed here was a misdiagnosis: the card held a foreign 4x84 GB
+job and the flattened error chain hid the OOM root cause (fixed by printing
+`{err:#}` in the engine-build error). On a free GPU the FP8-shared all-linear
+lane ran two full rubric-opd rounds clean: 23.2 GB of shared FP8 base stayed
+resident through both engine offload/reload cycles, no UAF, named errors
+only. The non-zero-delta merge on the FP8 lane remains unexercised because
+the acceptance path needs the Flash judge (8 GPUs); the BF16 merge lane with
+real deltas is covered by a 5-step all-linear run.
 
 ## Rule
 
