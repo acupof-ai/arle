@@ -1569,7 +1569,7 @@ async fn anthropic_messages(
             }
             // Anthropic pipeline: reasoning is emitted as `thinking` blocks even
             // in tools mode (unlike OpenAI which drops it).
-            let mut pipeline = StreamPipeline::new_anthropic(thinking, tools_active);
+            let mut pipeline = StreamPipeline::new(thinking, tools_active);
             let mut saw_tool_use = false;
             let mut output_tokens = 0usize;
             let mut gen_ids: Vec<u32> = Vec::new();
