@@ -35,6 +35,7 @@ pub struct InferStudent {
     engine: Arc<Mutex<LoadedInferenceEngine>>,
     train_backend: Arc<dyn Backend>,
     vocab_size: usize,
+    lora_merge_fp8: bool,
 }
 
 #[cfg(feature = "cuda")]
@@ -48,7 +49,13 @@ impl InferStudent {
             engine,
             train_backend,
             vocab_size,
+            lora_merge_fp8: false,
         }
+    }
+
+    pub fn with_lora_merge_fp8(mut self, on: bool) -> Self {
+        self.lora_merge_fp8 = on;
+        self
     }
 
     pub fn engine(&self) -> &Arc<Mutex<LoadedInferenceEngine>> {
@@ -309,6 +316,7 @@ impl InferStudent {
             layers: out_layers,
             rank: lora_config.rank,
             alpha: lora_config.alpha,
+            requant_fp8: self.lora_merge_fp8,
         };
 
         let engine = self

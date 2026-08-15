@@ -144,6 +144,80 @@ extern "C" cudaError_t dequantize_fp8_block_scaled_to_bf16_cuda(
     return cudaGetLastError();
 }
 
+// Inverse of the dequant above: BF16 → FP8 E4M3 + per-block f32 scales
+// (amax/448). One CUDA block per weight block. LoRA merge-requant path.
+__global__ void quantize_bf16_to_fp8_block_scaled_kernel(
+    const __nv_bfloat16* __restrict__ input,
+    uint8_t* __restrict__ weight,
+    float* __restrict__ scales,
+    int N,
+    int K,
+    int scale_rows,
+    int scale_cols,
+    int block_m,
+    int block_k)
+{
+    const int sr = blockIdx.y;
+    const int sc = blockIdx.x;
+    if (sr >= scale_rows || sc >= scale_cols) return;
+    const int row0 = sr * block_m;
+    const int col0 = sc * block_k;
+    const int rows = min(block_m, N - row0);
+    const int cols = min(block_k, K - col0);
+    const int elems = rows * cols;
+
+    __shared__ float red[256];
+    float amax = 0.0f;
+    for (int i = threadIdx.x; i < elems; i += blockDim.x) {
+        const int r = row0 + i / cols;
+        const int c = col0 + i % cols;
+        amax = fmaxf(amax, fabsf(__bfloat162float(input[(long)r * K + c])));
+    }
+    red[threadIdx.x] = amax;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) red[threadIdx.x] = fmaxf(red[threadIdx.x], red[threadIdx.x + s]);
+        __syncthreads();
+    }
+    const float scale = red[0] > 0.0f ? red[0] / 448.0f : 1.0f;
+    if (threadIdx.x == 0) scales[sr * scale_cols + sc] = scale;
+    __syncthreads();
+
+    const float inv = 1.0f / scale;
+    for (int i = threadIdx.x; i < elems; i += blockDim.x) {
+        const int r = row0 + i / cols;
+        const int c = col0 + i % cols;
+        const float w = __bfloat162float(input[(long)r * K + c]) * inv;
+        weight[(long)r * K + c] = __nv_cvt_float_to_fp8(w, __NV_SATFINITE, __NV_E4M3);
+    }
+}
+
+extern "C" cudaError_t quantize_bf16_to_fp8_block_scaled_cuda(
+    const __nv_bfloat16* input,
+    uint8_t* weight,
+    float* scales,
+    int N,
+    int K,
+    int scale_rows,
+    int scale_cols,
+    int block_m,
+    int block_k,
+    cudaStream_t stream)
+{
+    if (N <= 0 || K <= 0 || scale_rows <= 0 || scale_cols <= 0 || block_m <= 0 ||
+        block_k <= 0) {
+        return cudaErrorInvalidValue;
+    }
+    // scale grid must tile the matrix exactly (ceil-div)
+    if (scale_rows != (N + block_m - 1) / block_m || scale_cols != (K + block_k - 1) / block_k) {
+        return cudaErrorInvalidValue;
+    }
+    dim3 grid((unsigned int)scale_cols, (unsigned int)scale_rows, 1);
+    quantize_bf16_to_fp8_block_scaled_kernel<<<grid, 256, 0, stream>>>(
+        input, weight, scales, N, K, scale_rows, scale_cols, block_m, block_k);
+    return cudaGetLastError();
+}
+
 // W8A16 dequant: INT8 weight [N, K] × per-row per-column-group BF16 scale
 // [N, K/group_size] → BF16 [N, K]. Prefill path — dequant once (N*K), then one
 // cuBLAS BF16 GEMM over all M rows, instead of re-reading weight per token via

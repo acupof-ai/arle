@@ -1766,6 +1766,8 @@ pub struct DeviceMatrix {
     pub qweight: Option<CudaSlice<i8>>,
     /// ABI-generic unsigned quantized weights (FP8 bytes or packed FP4 bytes).
     pub qweight_u8: Option<CudaSlice<u8>>,
+    /// Merge-requant: pristine FP8 base; `qweight_u8`/`scale_f32` then hold merged bytes.
+    pub pristine_fp8: Option<(CudaSlice<u8>, CudaSlice<f32>)>,
     /// Per-group bf16 scales for quantized weights. Shape: [rows, cols/group_size].
     pub qscales: Option<CudaSlice<bf16>>,
     /// ABI-generic FP8 E4M3 scale bytes.
@@ -1959,6 +1961,17 @@ impl DeviceMatrix {
     /// The returned `u64`s are raw `CUdeviceptr`s into THIS matrix's resident
     /// VRAM; the borrower must keep this `DeviceMatrix` resident (no offload,
     /// no LoRA re-merge replacing the buffers) for the borrow's lifetime.
+    /// Pristine FP8 pair once merge-requant split it out, else the live slots.
+    pub fn merge_base_fp8(&self) -> Option<(&CudaSlice<u8>, &CudaSlice<f32>)> {
+        if let Some((qw, sc)) = self.pristine_fp8.as_ref() {
+            return Some((qw, sc));
+        }
+        match (self.qweight_u8.as_ref(), self.scale_f32.as_ref()) {
+            (Some(qw), Some(sc)) => Some((qw, sc)),
+            _ => None,
+        }
+    }
+
     pub fn fp8_block_scaled_ptrs(
         &self,
         ctx: &DeviceContext,
@@ -1967,8 +1980,7 @@ impl DeviceMatrix {
         if self.weight_format != WeightFormat::Fp8BlockScaled {
             return None;
         }
-        let qweight = self.qweight_u8.as_ref()?;
-        let scales = self.scale_f32.as_ref()?;
+        let (qweight, scales) = self.merge_base_fp8()?;
         let (wptr, _wsync) = qweight.device_ptr(&ctx.stream);
         let (sptr, _ssync) = scales.device_ptr(&ctx.stream);
         Some((
@@ -2122,6 +2134,7 @@ impl DeviceMatrix {
             weight_format: WeightFormat::DenseBf16,
             qweight: None,
             qweight_u8: None,
+            pristine_fp8: None,
             qscales: None,
             qscale_fp8: None,
             scale_f32: None,
@@ -2183,6 +2196,7 @@ impl DeviceMatrix {
             weight_format: WeightFormat::W8A16,
             qweight: Some(qw),
             qweight_u8: None,
+            pristine_fp8: None,
             qscales: Some(qs),
             qscale_fp8: None,
             scale_f32: None,
@@ -2220,6 +2234,7 @@ impl DeviceMatrix {
             weight_format: WeightFormat::DenseBf16,
             qweight: None,
             qweight_u8: None,
+            pristine_fp8: None,
             qscales: None,
             qscale_fp8: None,
             scale_f32: None,
@@ -2466,6 +2481,7 @@ impl DeviceMatrix {
             weight_format: WeightFormat::W4A16,
             qweight: Some(qw),
             qweight_u8: None,
+            pristine_fp8: None,
             qscales: Some(qs),
             qscale_fp8: None,
             scale_f32: None,
@@ -2545,6 +2561,7 @@ impl DeviceMatrix {
             weight_format: WeightFormat::Dsv4Fp8BlockScaled,
             qweight: Some(qw),
             qweight_u8: None,
+            pristine_fp8: None,
             qscales: None,
             qscale_fp8: None,
             scale_f32: None,
@@ -2625,6 +2642,7 @@ impl DeviceMatrix {
             weight_format: WeightFormat::Dsv4Fp4BlockScaled,
             qweight: Some(qw),
             qweight_u8: None,
+            pristine_fp8: None,
             qscales: None,
             qscale_fp8: None,
             scale_f32: None,
@@ -2701,6 +2719,7 @@ impl DeviceMatrix {
             weight_format: WeightFormat::Fp8BlockScaled,
             qweight: None,
             qweight_u8: Some(qweight),
+            pristine_fp8: None,
             qscales: None,
             qscale_fp8: None,
             scale_f32: Some(scales),
@@ -2777,6 +2796,7 @@ impl DeviceMatrix {
             weight_format: WeightFormat::Fp8PerShard,
             qweight: None,
             qweight_u8: Some(qweight),
+            pristine_fp8: None,
             qscales: None,
             qscale_fp8: None,
             scale_f32: Some(scales),
@@ -2867,6 +2887,7 @@ impl DeviceMatrix {
             weight_format: WeightFormat::Fp4E2M1Group,
             qweight: None,
             qweight_u8: Some(qweight),
+            pristine_fp8: None,
             qscales: None,
             qscale_fp8: Some(qscale),
             scale_f32: Some(global),
@@ -2948,6 +2969,7 @@ impl DeviceMatrix {
             weight_format: WeightFormat::MarlinW4A8,
             qweight: None,
             qweight_u8: None,
+            pristine_fp8: None,
             qscales: None,
             qscale_fp8: None,
             scale_f32: None,
@@ -3081,6 +3103,7 @@ impl DeviceMatrix {
             weight_format: WeightFormat::W4A16,
             qweight: None,
             qweight_u8: None,
+            pristine_fp8: None,
             qscales: None,
             qscale_fp8: None,
             scale_f32: None,
@@ -3152,6 +3175,7 @@ impl DeviceMatrix {
             weight_format: WeightFormat::GgufQ6K,
             qweight: Some(qw),
             qweight_u8: None,
+            pristine_fp8: None,
             qscales: Some(dummy_scales),
             qscale_fp8: None,
             scale_f32: None,
@@ -3223,6 +3247,7 @@ impl DeviceMatrix {
             weight_format: WeightFormat::GgufQ3K,
             qweight: Some(qw),
             qweight_u8: None,
+            pristine_fp8: None,
             qscales: Some(dummy_scales),
             qscale_fp8: None,
             scale_f32: None,
@@ -3300,6 +3325,7 @@ impl DeviceMatrix {
             weight_format: WeightFormat::GgufQ4K,
             qweight: Some(qw),
             qweight_u8: None,
+            pristine_fp8: None,
             qscales: Some(dummy_scales),
             qscale_fp8: None,
             scale_f32: None,
@@ -3371,6 +3397,7 @@ impl DeviceMatrix {
             weight_format: WeightFormat::GgufQ5K,
             qweight: Some(qw),
             qweight_u8: None,
+            pristine_fp8: None,
             qscales: Some(dummy_scales),
             qscale_fp8: None,
             scale_f32: None,
@@ -3441,6 +3468,7 @@ impl DeviceMatrix {
             weight_format: WeightFormat::W2A16,
             qweight: Some(qw),
             qweight_u8: None,
+            pristine_fp8: None,
             qscales: Some(qs),
             qscale_fp8: None,
             scale_f32: None,
@@ -3566,6 +3594,7 @@ impl DeviceMatrix {
             weight_format: WeightFormat::TurboQuant,
             qweight: None,
             qweight_u8: None,
+            pristine_fp8: None,
             qscales: None,
             qscale_fp8: None,
             scale_f32: None,
@@ -3861,6 +3890,7 @@ impl DeviceMatrix {
             weight_format: WeightFormat::DenseBf16,
             qweight: None,
             qweight_u8: None,
+            pristine_fp8: None,
             qscales: None,
             qscale_fp8: None,
             scale_f32: None,
@@ -3920,6 +3950,7 @@ impl DeviceMatrix {
             weight_format: WeightFormat::DenseBf16,
             qweight: None,
             qweight_u8: None,
+            pristine_fp8: None,
             qscales: None,
             qscale_fp8: None,
             scale_f32: None,
@@ -3972,6 +4003,7 @@ impl DeviceMatrix {
                 weight_format: WeightFormat::DenseBf16,
                 qweight: None,
                 qweight_u8: None,
+                pristine_fp8: None,
                 qscales: None,
                 qscale_fp8: None,
                 scale_f32: None,
@@ -4021,6 +4053,7 @@ impl DeviceMatrix {
             weight_format: WeightFormat::DenseBf16,
             qweight: None,
             qweight_u8: None,
+            pristine_fp8: None,
             qscales: None,
             qscale_fp8: None,
             scale_f32: None,

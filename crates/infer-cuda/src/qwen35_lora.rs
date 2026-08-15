@@ -97,6 +97,8 @@ pub struct StudentLoraUpdate {
     pub layers: Vec<StudentLoraLayer>,
     pub rank: usize,
     pub alpha: f32,
+    /// Requantize merged weights back to FP8 (2× base residency instead of 3×).
+    pub requant_fp8: bool,
 }
 
 /// Resident FP8 block-scaled device pointers, exposed read-only for the
@@ -507,6 +509,7 @@ impl Qwen35Model {
         let scale = update.alpha / update.rank as f32;
         let num_layers = self.config.num_hidden_layers;
 
+        let mut touched: Vec<(usize, StudentLoraProjection)> = Vec::new();
         for layer in &update.layers {
             let layer_idx = layer.layer_idx;
             ensure!(
@@ -525,9 +528,101 @@ impl Qwen35Model {
                     &projection.matrices,
                     scale,
                 )?;
+                touched.push((layer_idx, projection.projection));
+            }
+        }
+        if update.requant_fp8 {
+            for (layer_idx, projection) in touched {
+                self.requant_merged_matrix(layer_idx, projection)?;
             }
         }
         self.ctx.sync()?;
+        Ok(())
+    }
+
+    /// Quantize the merged dense back into the FP8 serving slots; the pristine
+    /// pair moves to `pristine_fp8` (device addresses unchanged, aliases valid).
+    fn requant_merged_matrix(
+        &mut self,
+        layer_idx: usize,
+        projection: StudentLoraProjection,
+    ) -> Result<()> {
+        let label = projection.label();
+        let ctx = self.ctx.clone();
+        let matrix = self.lora_matrix_mut(layer_idx, projection)?;
+        if !matrix.is_dense_bf16() {
+            return Ok(());
+        }
+        if matrix.pristine_fp8.is_none() {
+            match (matrix.qweight_u8.take(), matrix.scale_f32.take()) {
+                (Some(qw), Some(sc)) => matrix.pristine_fp8 = Some((qw, sc)),
+                (qw, sc) => {
+                    matrix.qweight_u8 = qw;
+                    matrix.scale_f32 = sc;
+                    return Ok(());
+                }
+            }
+        }
+        ensure!(
+            matrix.quant_block_m > 0
+                && matrix.quant_block_k > 0
+                && matrix.quant_scale_rows > 0
+                && matrix.quant_scale_cols > 0,
+            "layer {layer_idx} {label}: merge-requant missing block-scale metadata"
+        );
+        if matrix.qweight_u8.is_none() {
+            matrix.qweight_u8 = Some(
+                ctx.stream
+                    .alloc_zeros::<u8>(matrix.rows * matrix.cols)
+                    .map_err(|e| {
+                        anyhow!("layer {layer_idx} {label}: merged qweight alloc failed: {e}")
+                    })?,
+            );
+        }
+        if matrix.scale_f32.is_none() {
+            matrix.scale_f32 = Some(
+                ctx.stream
+                    .alloc_zeros::<f32>(matrix.quant_scale_rows * matrix.quant_scale_cols)
+                    .map_err(|e| {
+                        anyhow!("layer {layer_idx} {label}: merged scales alloc failed: {e}")
+                    })?,
+            );
+        }
+        {
+            let (in_ptr, _gi) = matrix.data.device_ptr(&ctx.stream);
+            let (qw_ptr, _gq) = matrix
+                .qweight_u8
+                .as_mut()
+                .expect("allocated above")
+                .device_ptr_mut(&ctx.stream);
+            let (sc_ptr, _gs) = matrix
+                .scale_f32
+                .as_mut()
+                .expect("allocated above")
+                .device_ptr_mut(&ctx.stream);
+            // SAFETY: ptrs from live device allocations sized to the dims passed.
+            unsafe {
+                ffi::quantize_bf16_to_fp8_block_scaled_cuda(
+                    in_ptr as *const ffi::Half,
+                    qw_ptr as *mut u8,
+                    sc_ptr as *mut f32,
+                    matrix.rows as i32,
+                    matrix.cols as i32,
+                    matrix.quant_scale_rows as i32,
+                    matrix.quant_scale_cols as i32,
+                    matrix.quant_block_m as i32,
+                    matrix.quant_block_k as i32,
+                    ctx.stream.cu_stream(),
+                )
+            }
+            .result()
+            .map_err(|e| anyhow!("layer {layer_idx} {label}: merge-requant failed: {e}"))?;
+        }
+        matrix.weight_format = WeightFormat::Fp8BlockScaled;
+        matrix.data = ctx
+            .stream
+            .alloc_zeros::<bf16>(1)
+            .map_err(|e| anyhow!("layer {layer_idx} {label}: dense placeholder alloc: {e}"))?;
         Ok(())
     }
 
@@ -569,11 +664,8 @@ impl Qwen35Model {
             .alloc_zeros::<bf16>(matrix.rows * matrix.cols)
             .map_err(|e| anyhow!("layer {layer_idx} {label}: BF16 promotion alloc failed: {e}"))?;
         {
-            let qweight = matrix.qweight_u8.as_ref().ok_or_else(|| {
-                anyhow!("layer {layer_idx} {label}: FP8 LoRA target missing qweight")
-            })?;
-            let scales = matrix.scale_f32.as_ref().ok_or_else(|| {
-                anyhow!("layer {layer_idx} {label}: FP8 LoRA target missing f32 scales")
+            let (qweight, scales) = matrix.merge_base_fp8().ok_or_else(|| {
+                anyhow!("layer {layer_idx} {label}: FP8 LoRA target missing qweight/scales")
             })?;
             ensure!(
                 qweight.len() == matrix.rows * matrix.cols,
@@ -790,13 +882,7 @@ impl Qwen35Model {
                 row_offset + rows
             );
             let cache_key = Self::lora_base_cache_key(layer_idx, projection);
-            if matrix.qweight_u8.is_some() {
-                let qweight = matrix.qweight_u8.as_ref().ok_or_else(|| {
-                    anyhow!("layer {layer_idx} {label}: FP8 base missing qweight for merge")
-                })?;
-                let scales = matrix.scale_f32.as_ref().ok_or_else(|| {
-                    anyhow!("layer {layer_idx} {label}: FP8 base missing f32 scales for merge")
-                })?;
+            if let Some((qweight, scales)) = matrix.merge_base_fp8() {
                 let mut base_scratch = DeviceVec::zeros(&ctx, matrix.rows * matrix.cols)?;
                 {
                     let (qw_ptr, _gq) = qweight.device_ptr(&ctx.stream);
@@ -912,13 +998,7 @@ impl Qwen35Model {
         );
         let cols = matrix.cols;
         let window = row_offset * cols..(row_offset + rows) * cols;
-        if matrix.qweight_u8.is_some() {
-            let qweight = matrix.qweight_u8.as_ref().ok_or_else(|| {
-                anyhow!("layer {layer_idx} {label}: FP8 base missing qweight for restore")
-            })?;
-            let scales = matrix.scale_f32.as_ref().ok_or_else(|| {
-                anyhow!("layer {layer_idx} {label}: FP8 base missing f32 scales for restore")
-            })?;
+        if let Some((qweight, scales)) = matrix.merge_base_fp8() {
             let mut scratch = DeviceVec::zeros(&ctx, matrix.rows * matrix.cols)?;
             {
                 let (qw_ptr, _gq) = qweight.device_ptr(&ctx.stream);
