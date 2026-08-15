@@ -124,6 +124,19 @@ fn windowed_gkd_step<O: Optimizer, T: TeacherForward + ?Sized>(
     if let Err(err) = store.backend().trim_memory_pool() {
         eprintln!("trim_memory_pool before backward failed (non-fatal): {err}");
     }
+    // Release the rollout engine's KV pool for the backward — the teacher
+    // forward needs the VRAM at long sequences. Re-acquired after the step.
+    #[cfg(feature = "cuda")]
+    let kv_pool_released = if let Some(ctx) = rt.infer_rollout {
+        if let Err(err) = ctx.student.release_kv_pool() {
+            eprintln!("release_kv_pool before backward failed (non-fatal): {err}");
+            false
+        } else {
+            true
+        }
+    } else {
+        false
+    };
     let loss_result = backward_windowed_gkd(
         rt.student,
         rt.teacher,
@@ -170,6 +183,16 @@ fn windowed_gkd_step<O: Optimizer, T: TeacherForward + ?Sized>(
         profile.grad_clip_seconds += phase_started.elapsed().as_secs_f64();
     });
     log_opd_step_trace(rt.total_started, "optimizer_step_done", "");
+
+    // Re-acquire the KV pool for the next rollout.
+    #[cfg(feature = "cuda")]
+    if kv_pool_released {
+        if let Some(ctx) = rt.infer_rollout {
+            if let Err(err) = ctx.student.ensure_kv_pool() {
+                eprintln!("ensure_kv_pool after backward failed: {err}");
+            }
+        }
+    }
 
     Ok(OpdStepOutcome {
         loss: loss_value,
