@@ -48,15 +48,6 @@ fn available_ram_bytes() -> Option<usize> {
         })
 }
 
-fn should_prefetch_shards(
-    rank: usize,
-    _world_size: usize,
-    available: usize,
-    checkpoint: usize,
-) -> bool {
-    rank == 0 && checkpoint > 0 && available >= checkpoint.saturating_add(PREFETCH_CACHE_HEADROOM)
-}
-
 impl CudaModel {
     pub(crate) fn from_safetensors(model_path: &Path) -> Result<Self> {
         let tp = build_tp_runtime(false)?;
@@ -911,44 +902,53 @@ fn shard_cache_bytes_limit() -> usize {
 }
 
 impl SafetensorLoader {
-    /// Rank zero warms the shared page cache when it can retain the checkpoint;
-    /// the collective holds other TP ranks until that read completes.
+    /// Rank zero warms the page cache by advising the kernel to read ahead
+    /// all checkpoint shards (`posix_fadvise(WILLNEED)`). Nonblocking —
+    /// the kernel reads asynchronously and pages stay reclaimable under
+    /// memory pressure (unlike the old read-to-buffer approach which pinned
+    /// every page). Other ranks wait on the broadcast until rank 0 finishes.
     pub(crate) fn prefetch_shards_rank0(
         &self,
         ctx: &DeviceContext,
         tp: &crate::tp::TpRuntime,
     ) -> Result<()> {
-        let checkpoint = self
-            .shards
-            .iter()
-            .filter_map(|path| fs::metadata(path).ok().map(|m| m.len() as usize))
-            .sum();
-        let available = available_ram_bytes().unwrap_or(0);
         let rank = tp.config().rank;
-        let world_size = tp.config().world_size as usize;
         let enabled = std::env::var_os("ARLE_LOADER_PREFETCH").is_none_or(|value| value != "0");
-        let prefetch = enabled && should_prefetch_shards(rank, world_size, available, checkpoint);
-        if prefetch {
+        let should_prefetch = enabled && rank == 0 && self.has_memory_for_prefetch();
+
+        if should_prefetch {
             self.prefetch_all_shards();
         }
-        let rank0_prefetched = tp.broadcast_rank0_i32(ctx, &[i32::from(prefetch)])?[0] != 0;
-        if rank == 0 && !rank0_prefetched {
-            if enabled {
-                log::info!(
-                    "loader prefetch skipped: MemAvailable {:.1} GB < checkpoint {:.1} GB + 64.0 GB headroom",
-                    available as f64 / 1e9,
-                    checkpoint as f64 / 1e9,
-                );
-            } else {
-                log::info!("loader prefetch skipped: ARLE_LOADER_PREFETCH=0");
-            }
+
+        let rank0_prefetched = tp.broadcast_rank0_i32(ctx, &[i32::from(should_prefetch)])?[0] != 0;
+        if rank == 0 && enabled && !rank0_prefetched {
+            log::info!("loader prefetch skipped: insufficient memory or disabled");
         }
         Ok(())
     }
 
+    /// Check if the host has enough free memory to benefit from prefetch.
+    /// With fadvise, pages are reclaimable, so this is a soft check to
+    /// avoid thrashing when memory is already tight.
+    fn has_memory_for_prefetch(&self) -> bool {
+        let checkpoint: usize = self
+            .shards
+            .iter()
+            .filter_map(|path| fs::metadata(path).ok().map(|m| m.len() as usize))
+            .sum();
+        if checkpoint == 0 {
+            return false;
+        }
+        let available = available_ram_bytes().unwrap_or(0);
+        available >= checkpoint.saturating_add(PREFETCH_CACHE_HEADROOM)
+    }
+
+    /// Advise the kernel to read ahead all shards. Multi-threaded for
+    /// parallel fadvise calls; each call is nonblocking.
     fn prefetch_all_shards(&self) {
         use std::os::fd::AsRawFd;
         use std::sync::atomic::{AtomicUsize, Ordering};
+
         let t0 = Instant::now();
         let n = self.shards.len();
         if n == 0 {
@@ -972,10 +972,7 @@ impl SafetensorLoader {
                         if let Ok(meta) = fs::metadata(&shards[i]) {
                             let len = meta.len() as usize;
                             if let Ok(file) = fs::File::open(&shards[i]) {
-                                // Advise the kernel to read ahead asynchronously.
-                                // The kernel manages the page cache; pages are
-                                // reclaimable under memory pressure (unlike the
-                                // old read-to-buffer approach which pinned them).
+                                // SAFETY: fd is valid; fadvise is a hint, no safety invariants.
                                 #[cfg(target_os = "linux")]
                                 unsafe {
                                     libc::posix_fadvise(
