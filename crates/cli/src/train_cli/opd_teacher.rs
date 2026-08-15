@@ -91,14 +91,13 @@ impl train::teacher_infer::TeacherForward for OpdCliTeacher<'_> {
         &self,
         input_ids: &[u32],
         positions: &[u32],
-        retain_set: &std::collections::HashSet<TensorId>,
         store: &mut TensorStore,
         tape: &mut Tape,
     ) -> std::result::Result<TensorId, train::teacher_infer::TeacherForwardError> {
         match self {
             Self::InProcess(teacher) => {
                 train::teacher_infer::TeacherForward::forward_hidden_device(
-                    teacher, input_ids, positions, retain_set, store, tape,
+                    teacher, input_ids, positions, store, tape,
                 )
             }
             _ => Err(train::teacher_infer::TeacherForwardError::InvalidInput(

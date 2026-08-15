@@ -310,15 +310,10 @@ pub(super) fn backward_windowed_gkd<T: TeacherForward + ?Sized>(
         // Then per window, compute logits from the cached hidden. This avoids
         // re-running the growing prefix (0..window.end) for each window, which
         // OOMs at long sequences (the last window processes the entire sequence).
-        // The retain set keeps student params + caller tensors alive across the
-        // teacher's per-layer scratch pruning.
-        let mut teacher_retain: HashSet<TensorId> = keep_extra.clone();
-        teacher_retain.extend(student_model_params.iter().copied());
-        teacher_retain.extend(teacher.parameter_ids().iter().copied());
         tape.entries.clear();
         tape.set_enabled(false);
         let teacher_hidden = teacher
-            .forward_hidden_device(rollout, positions, &teacher_retain, store, tape)
+            .forward_hidden_device(rollout, positions, store, tape)
             .map_err(|err| map_teacher_forward_error("teacher full-seq hidden", err))?;
 
         let mut keep_with_hidden = keep_extra.clone();
