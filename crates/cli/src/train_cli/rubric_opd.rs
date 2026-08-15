@@ -653,9 +653,15 @@ impl JudgeServer {
         // is the first entry of the parent's CUDA_VISIBLE_DEVICES, or 0 if unset.
         let student_gpu: usize = std::env::var("CUDA_VISIBLE_DEVICES")
             .ok()
-            .and_then(|s| s.split(',').next().map(str::to_owned))
-            .and_then(|s| s.trim().parse().ok())
-            .unwrap_or(0);
+            .and_then(|s| {
+                s.split(',')
+                    .next()
+                    .and_then(|first| first.trim().parse().ok())
+            })
+            .unwrap_or_else(|| {
+                log::warn!("CUDA_VISIBLE_DEVICES parse failed, defaulting judge to GPU 0");
+                0
+            });
         let judge_gpus: String = (1..=tp_size)
             .map(|i| (student_gpu + i).to_string())
             .collect::<Vec<_>>()

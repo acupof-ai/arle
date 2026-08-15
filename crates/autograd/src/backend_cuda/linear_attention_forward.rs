@@ -401,63 +401,50 @@ pub(super) fn cuda_linear_attention_forward_device_row(
     let a_bf16 = backend.local_f32_as_bf16(a_proj, head_len)?;
     let dt_bf16 = backend.local_f32_as_bf16(dt_bias, p.num_value_heads)?;
 
-    let la_alloc = |label: &'static str, len: usize| {
-        move |err: cudarc::driver::DriverError| {
-            let (free, total) = backend.device_mem_info().unwrap_or((0, 0));
-            AutogradError::TapeInvariant(Box::leak(
-                format!(
-                    "cuda alloc_zeros failed ({label}): len={len} err={err:?} free={}MiB total={}MiB",
-                    free >> 20,
-                    total >> 20
-                )
-                .into_boxed_str(),
-            ))
-        }
-    };
     let mut preact = backend
         .stream
         .alloc_zeros::<f32>(qkv_len)
-        .map_err(la_alloc("la preact", qkv_len))?;
+        .map_err(|e| cuda_alloc_failed_rich(backend, "la preact", qkv_len * 4, &e))?;
     let mut qkv_conv = backend
         .stream
         .alloc_zeros::<u16>(qkv_len)
-        .map_err(la_alloc("la qkv_conv", qkv_len))?;
+        .map_err(|e| cuda_alloc_failed_rich(backend, "la qkv_conv", qkv_len * 2, &e))?;
     let mut q = backend
         .stream
         .alloc_zeros::<u16>(q_len)
-        .map_err(la_alloc("la q", q_len))?;
+        .map_err(|e| cuda_alloc_failed_rich(backend, "la q", q_len * 2, &e))?;
     let mut k = backend
         .stream
         .alloc_zeros::<u16>(q_len)
-        .map_err(la_alloc("la k", q_len))?;
+        .map_err(|e| cuda_alloc_failed_rich(backend, "la k", q_len * 2, &e))?;
     let mut v = backend
         .stream
         .alloc_zeros::<u16>(v_len)
-        .map_err(la_alloc("la v", v_len))?;
+        .map_err(|e| cuda_alloc_failed_rich(backend, "la v", v_len * 2, &e))?;
     let mut g = backend
         .stream
         .alloc_zeros::<f32>(head_len)
-        .map_err(la_alloc("la g", head_len))?;
+        .map_err(|e| cuda_alloc_failed_rich(backend, "la g", head_len * 4, &e))?;
     let mut g_cumsum = backend
         .stream
         .alloc_zeros::<f32>(head_len)
-        .map_err(la_alloc("la g_cumsum", head_len))?;
+        .map_err(|e| cuda_alloc_failed_rich(backend, "la g_cumsum", head_len * 4, &e))?;
     let mut beta = backend
         .stream
         .alloc_zeros::<f32>(head_len)
-        .map_err(la_alloc("la beta", head_len))?;
+        .map_err(|e| cuda_alloc_failed_rich(backend, "la beta", head_len * 4, &e))?;
     let mut a_inv = backend
         .stream
         .alloc_zeros::<u16>(a_len)
-        .map_err(la_alloc("la a_inv", a_len))?;
+        .map_err(|e| cuda_alloc_failed_rich(backend, "la a_inv", a_len * 2, &e))?;
     let mut chunk_state = backend
         .stream
         .alloc_zeros::<f32>(chunk_state_len)
-        .map_err(la_alloc("la chunk_state", chunk_state_len))?;
+        .map_err(|e| cuda_alloc_failed_rich(backend, "la chunk_state", chunk_state_len * 4, &e))?;
     let mut final_state = backend
         .stream
         .alloc_zeros::<f32>(state_len)
-        .map_err(la_alloc("la final_state", state_len))?;
+        .map_err(|e| cuda_alloc_failed_rich(backend, "la final_state", state_len * 4, &e))?;
     // Seed carry so chunk_state[0] = carry. FlashQLA reads it as h0 directly; the
     // recurrent branch runs final_state → chunk_state[0].
     if let Some(state) = carry_state {

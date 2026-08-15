@@ -78,13 +78,11 @@ pub trait TeacherForward {
     /// Run the full-sequence forward and return the hidden states (not logits).
     /// Used by the windowed KL path to avoid re-running the growing prefix
     /// for each window: one full forward, then `logits_from_hidden_window_device`
-    /// per window. `retain_set` lists tensor IDs that must survive the
-    /// per-layer scratch pruning (student params, LoRA, optimizer state).
+    /// per window.
     fn forward_hidden_device(
         &self,
         _input_ids: &[u32],
         _positions: &[u32],
-        _retain_set: &std::collections::HashSet<TensorId>,
         _store: &mut TensorStore,
         _tape: &mut Tape,
     ) -> Result<TensorId> {
@@ -355,13 +353,7 @@ impl TeacherForward for InProcessTeacher<'_> {
         tape: &mut Tape,
     ) -> Result<DeviceLogits> {
         let tensor_id = self.model.forward(store, tape, input_ids, positions)?;
-        store.ensure_device(tensor_id)?;
-        let shape = store
-            .get(tensor_id)
-            .ok_or(AutogradError::InvalidTensorId(tensor_id))?
-            .shape
-            .clone();
-        Ok(DeviceLogits { tensor_id, shape })
+        into_device_logits(store, tensor_id)
     }
 
     fn forward_logits_window_device(
@@ -375,20 +367,13 @@ impl TeacherForward for InProcessTeacher<'_> {
         let tensor_id = self
             .model
             .forward_logits_window(store, tape, input_ids, positions, window)?;
-        store.ensure_device(tensor_id)?;
-        let shape = store
-            .get(tensor_id)
-            .ok_or(AutogradError::InvalidTensorId(tensor_id))?
-            .shape
-            .clone();
-        Ok(DeviceLogits { tensor_id, shape })
+        into_device_logits(store, tensor_id)
     }
 
     fn forward_hidden_device(
         &self,
         input_ids: &[u32],
         positions: &[u32],
-        retain_set: &std::collections::HashSet<TensorId>,
         store: &mut TensorStore,
         tape: &mut Tape,
     ) -> Result<TensorId> {
@@ -401,7 +386,6 @@ impl TeacherForward for InProcessTeacher<'_> {
             &pos,
             1,
             crate::context_parallel::CpContext::single(),
-            retain_set,
         )?)
     }
 
@@ -415,13 +399,7 @@ impl TeacherForward for InProcessTeacher<'_> {
         let tensor_id = self
             .model
             .logits_from_hidden_window(store, tape, hidden, window)?;
-        store.ensure_device(tensor_id)?;
-        let shape = store
-            .get(tensor_id)
-            .ok_or(AutogradError::InvalidTensorId(tensor_id))?
-            .shape
-            .clone();
-        Ok(DeviceLogits { tensor_id, shape })
+        into_device_logits(store, tensor_id)
     }
 
     fn vocab_size(&self) -> usize {
@@ -431,6 +409,16 @@ impl TeacherForward for InProcessTeacher<'_> {
     fn parameter_ids(&self) -> &[TensorId] {
         &self.parameter_ids
     }
+}
+
+fn into_device_logits(store: &mut TensorStore, tensor_id: TensorId) -> Result<DeviceLogits> {
+    store.ensure_device(tensor_id)?;
+    let shape = store
+        .get(tensor_id)
+        .ok_or(AutogradError::InvalidTensorId(tensor_id))?
+        .shape
+        .clone();
+    Ok(DeviceLogits { tensor_id, shape })
 }
 
 #[cfg(feature = "cuda")]
