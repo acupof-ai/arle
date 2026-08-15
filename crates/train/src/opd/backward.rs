@@ -305,6 +305,25 @@ pub(super) fn backward_windowed_gkd<T: TeacherForward + ?Sized>(
 
     if gkd_config.lambda < 1.0 {
         let kl_range = kl_logit_range(gkd_config.kl_mask, prompt_ids.len(), rollout.len())?;
+
+        // Run the teacher forward ONCE on the full sequence to get hidden states.
+        // Then per window, compute logits from the cached hidden. This avoids
+        // re-running the growing prefix (0..window.end) for each window, which
+        // OOMs at long sequences (the last window processes the entire sequence).
+        // The retain set keeps student params + caller tensors alive across the
+        // teacher's per-layer scratch pruning.
+        let mut teacher_retain: HashSet<TensorId> = keep_extra.clone();
+        teacher_retain.extend(student_model_params.iter().copied());
+        teacher_retain.extend(teacher.parameter_ids().iter().copied());
+        tape.entries.clear();
+        tape.set_enabled(false);
+        let teacher_hidden = teacher
+            .forward_hidden_device(rollout, positions, &teacher_retain, store, tape)
+            .map_err(|err| map_teacher_forward_error("teacher full-seq hidden", err))?;
+
+        let mut keep_with_hidden = keep_extra.clone();
+        keep_with_hidden.insert(teacher_hidden);
+
         for window in sequence_windows_for_range(kl_range, window_size)? {
             let window_index = backward_windows + 1;
             let window_started = Instant::now();
@@ -332,13 +351,7 @@ pub(super) fn backward_windowed_gkd<T: TeacherForward + ?Sized>(
                 "",
             );
             let teacher_logits = teacher
-                .forward_logits_window_device(
-                    &rollout[..window.end],
-                    &positions[..window.end],
-                    window,
-                    store,
-                    tape,
-                )
+                .logits_from_hidden_window_device(teacher_hidden, window, store, tape)
                 .map_err(|err| map_teacher_forward_error("teacher windowed KL", err))?;
             log_opd_window_trace(
                 "kl",
@@ -427,9 +440,11 @@ pub(super) fn backward_windowed_gkd<T: TeacherForward + ?Sized>(
             );
             backward_windows += 1;
             log_opd_window_trace("kl", "cleanup_start", window_index, window_started, "");
-            cleanup_after_backward(store, tape, student_model_params, keep_extra);
+            cleanup_after_backward(store, tape, student_model_params, &keep_with_hidden);
             log_opd_window_trace("kl", "done", window_index, window_started, "");
         }
+        // Free the cached teacher hidden states after all windows are done.
+        let _ = store.free(teacher_hidden);
     }
 
     if gkd_config.lambda > 0.0 {

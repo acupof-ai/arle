@@ -647,11 +647,17 @@ impl JudgeServer {
     ) -> Result<Self> {
         let port = free_port();
         let exe = std::env::current_exe().context("current_exe")?;
-        // The student (TP=1) owns GPU 0. Pin the judge's TP workers to GPUs
-        // 1..=tp_size so rank-0's ~74 GB weight load doesn't OOM against the
-        // student's ~27 GB on a 96 GB GPU.
+        // The student (TP=1) uses the first visible GPU. Pin the judge's TP
+        // workers to the next `tp_size` physical GPUs so its rank-0 weight load
+        // does not OOM against the student on a shared GPU. The student's GPU
+        // is the first entry of the parent's CUDA_VISIBLE_DEVICES, or 0 if unset.
+        let student_gpu: usize = std::env::var("CUDA_VISIBLE_DEVICES")
+            .ok()
+            .and_then(|s| s.split(',').next().map(str::to_owned))
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(0);
         let judge_gpus: String = (1..=tp_size)
-            .map(|i| i.to_string())
+            .map(|i| (student_gpu + i).to_string())
             .collect::<Vec<_>>()
             .join(",");
         let mut child = std::process::Command::new(exe)

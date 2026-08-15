@@ -75,6 +75,37 @@ pub trait TeacherForward {
         ))
     }
 
+    /// Run the full-sequence forward and return the hidden states (not logits).
+    /// Used by the windowed KL path to avoid re-running the growing prefix
+    /// for each window: one full forward, then `logits_from_hidden_window_device`
+    /// per window. `retain_set` lists tensor IDs that must survive the
+    /// per-layer scratch pruning (student params, LoRA, optimizer state).
+    fn forward_hidden_device(
+        &self,
+        _input_ids: &[u32],
+        _positions: &[u32],
+        _retain_set: &std::collections::HashSet<TensorId>,
+        _store: &mut TensorStore,
+        _tape: &mut Tape,
+    ) -> Result<TensorId> {
+        Err(TeacherForwardError::InvalidInput(
+            "forward_hidden_device not supported by this teacher".to_owned(),
+        ))
+    }
+
+    /// Compute logits for a window from cached hidden states.
+    fn logits_from_hidden_window_device(
+        &self,
+        _hidden: TensorId,
+        _window: SequenceWindow,
+        _store: &mut TensorStore,
+        _tape: &mut Tape,
+    ) -> Result<DeviceLogits> {
+        Err(TeacherForwardError::InvalidInput(
+            "logits_from_hidden_window_device not supported by this teacher".to_owned(),
+        ))
+    }
+
     fn vocab_size(&self) -> usize;
 
     fn parameter_ids(&self) -> &[TensorId] {
@@ -344,6 +375,46 @@ impl TeacherForward for InProcessTeacher<'_> {
         let tensor_id = self
             .model
             .forward_logits_window(store, tape, input_ids, positions, window)?;
+        store.ensure_device(tensor_id)?;
+        let shape = store
+            .get(tensor_id)
+            .ok_or(AutogradError::InvalidTensorId(tensor_id))?
+            .shape
+            .clone();
+        Ok(DeviceLogits { tensor_id, shape })
+    }
+
+    fn forward_hidden_device(
+        &self,
+        input_ids: &[u32],
+        positions: &[u32],
+        retain_set: &std::collections::HashSet<TensorId>,
+        store: &mut TensorStore,
+        tape: &mut Tape,
+    ) -> Result<TensorId> {
+        let token_indices = input_ids.iter().map(|&id| id as usize).collect::<Vec<_>>();
+        let pos = positions.iter().map(|&id| id as usize).collect::<Vec<_>>();
+        Ok(self.model.forward_hidden_freeing_intermediates(
+            store,
+            tape,
+            &token_indices,
+            &pos,
+            1,
+            crate::context_parallel::CpContext::single(),
+            retain_set,
+        )?)
+    }
+
+    fn logits_from_hidden_window_device(
+        &self,
+        hidden: TensorId,
+        window: SequenceWindow,
+        store: &mut TensorStore,
+        tape: &mut Tape,
+    ) -> Result<DeviceLogits> {
+        let tensor_id = self
+            .model
+            .logits_from_hidden_window(store, tape, hidden, window)?;
         store.ensure_device(tensor_id)?;
         let shape = store
             .get(tensor_id)
