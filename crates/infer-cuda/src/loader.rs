@@ -949,6 +949,11 @@ impl SafetensorLoader {
     /// separate fd which on some kernels does not populate the mmap page cache
     /// (observed: rank-0 deadlocked in page faults after fadvise). Pages stay
     /// reclaimable under memory pressure.
+    ///
+    /// `madvise(MADV_WILLNEED)` is asynchronous: it schedules readahead but
+    /// does not wait for the pages to be resident. By the time the loader
+    /// touches a shard (after all shards have been advised), the I/O has
+    /// typically completed.
     fn prefetch_all_shards(&self) {
         use std::os::fd::AsRawFd;
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -996,6 +1001,12 @@ impl SafetensorLoader {
                                     if ptr != libc::MAP_FAILED {
                                         libc::madvise(ptr, len, libc::MADV_WILLNEED);
                                         libc::munmap(ptr, len);
+                                    } else {
+                                        log::debug!(
+                                            "prefetch mmap failed for {}: {}",
+                                            shards[i].display(),
+                                            std::io::Error::last_os_error()
+                                        );
                                     }
                                 }
                                 bytes.fetch_add(len, Ordering::Relaxed);

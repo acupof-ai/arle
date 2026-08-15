@@ -651,17 +651,19 @@ impl JudgeServer {
         // workers to the next `tp_size` physical GPUs so its rank-0 weight load
         // does not OOM against the student on a shared GPU. The student's GPU
         // is the first entry of the parent's CUDA_VISIBLE_DEVICES, or 0 if unset.
-        let student_gpu: usize = std::env::var("CUDA_VISIBLE_DEVICES")
-            .ok()
-            .and_then(|s| {
-                s.split(',')
-                    .next()
-                    .and_then(|first| first.trim().parse().ok())
-            })
-            .unwrap_or_else(|| {
-                log::warn!("CUDA_VISIBLE_DEVICES parse failed, defaulting judge to GPU 0");
-                0
-            });
+        let student_gpu: usize = match std::env::var("CUDA_VISIBLE_DEVICES") {
+            Ok(s) => s
+                .split(',')
+                .next()
+                .and_then(|first| first.trim().parse().ok())
+                .unwrap_or_else(|| {
+                    log::warn!(
+                        "CUDA_VISIBLE_DEVICES={s:?} unparseable, defaulting student GPU to 0"
+                    );
+                    0
+                }),
+            Err(_) => 0,
+        };
         let judge_gpus: String = (1..=tp_size)
             .map(|i| (student_gpu + i).to_string())
             .collect::<Vec<_>>()
