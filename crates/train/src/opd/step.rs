@@ -122,7 +122,7 @@ fn windowed_gkd_step<O: Optimizer, T: TeacherForward + ?Sized>(
     // mark and doesn't release without an explicit trim).
     #[cfg(feature = "cuda")]
     if let Err(err) = store.backend().trim_memory_pool() {
-        log::warn!("trim_memory_pool before backward failed (non-fatal): {err}");
+        eprintln!("trim_memory_pool before backward failed (non-fatal): {err}");
     }
     let loss_result = backward_windowed_gkd(
         rt.student,
