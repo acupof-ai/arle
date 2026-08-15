@@ -943,8 +943,12 @@ impl SafetensorLoader {
         available >= checkpoint.saturating_add(PREFETCH_CACHE_HEADROOM)
     }
 
-    /// Advise the kernel to read ahead all shards. Multi-threaded for
-    /// parallel fadvise calls; each call is nonblocking.
+    /// Advise the kernel to read ahead all shards. Each shard is mmapped and
+    /// `madvise(MADV_WILLNEED)`d — this operates on the same page-cache pages
+    /// the subsequent weight-load mmap reads, unlike `posix_fadvise` on a
+    /// separate fd which on some kernels does not populate the mmap page cache
+    /// (observed: rank-0 deadlocked in page faults after fadvise). Pages stay
+    /// reclaimable under memory pressure.
     fn prefetch_all_shards(&self) {
         use std::os::fd::AsRawFd;
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -971,16 +975,28 @@ impl SafetensorLoader {
                         }
                         if let Ok(meta) = fs::metadata(&shards[i]) {
                             let len = meta.len() as usize;
+                            if len == 0 {
+                                continue;
+                            }
                             if let Ok(file) = fs::File::open(&shards[i]) {
-                                // SAFETY: fd is valid; fadvise is a hint, no safety invariants.
+                                // SAFETY: mmap the whole shard read-only, then
+                                // madvise WILLNEED to fault the pages into the
+                                // page cache. The munmap on drop does not
+                                // reclaim the cached pages.
                                 #[cfg(target_os = "linux")]
                                 unsafe {
-                                    libc::posix_fadvise(
+                                    let ptr = libc::mmap(
+                                        std::ptr::null_mut(),
+                                        len,
+                                        libc::PROT_READ,
+                                        libc::MAP_PRIVATE,
                                         file.as_raw_fd(),
                                         0,
-                                        0,
-                                        libc::POSIX_FADV_WILLNEED,
                                     );
+                                    if ptr != libc::MAP_FAILED {
+                                        libc::madvise(ptr, len, libc::MADV_WILLNEED);
+                                        libc::munmap(ptr, len);
+                                    }
                                 }
                                 bytes.fetch_add(len, Ordering::Relaxed);
                             }
@@ -992,7 +1008,7 @@ impl SafetensorLoader {
         let gb = bytes.load(Ordering::Relaxed) as f64 / 1e9;
         let secs = t0.elapsed().as_secs_f64().max(1e-6);
         log::info!(
-            "loader prefetch (fadvise): {gb:.1} GB across {n} shards in {secs:.1}s ({:.2} GB/s, {threads} threads)",
+            "loader prefetch (mmap+madvise): {gb:.1} GB across {n} shards in {secs:.1}s ({:.2} GB/s, {threads} threads)",
             gb / secs
         );
     }

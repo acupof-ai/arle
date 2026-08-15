@@ -647,6 +647,13 @@ impl JudgeServer {
     ) -> Result<Self> {
         let port = free_port();
         let exe = std::env::current_exe().context("current_exe")?;
+        // The student (TP=1) owns GPU 0. Pin the judge's TP workers to GPUs
+        // 1..=tp_size so rank-0's ~74 GB weight load doesn't OOM against the
+        // student's ~27 GB on a 96 GB GPU.
+        let judge_gpus: String = (1..=tp_size)
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
         let mut child = std::process::Command::new(exe)
             .args([
                 "serve",
@@ -662,6 +669,7 @@ impl JudgeServer {
                 &max_total_tokens.to_string(),
             ])
             .env("INFER_TP_SIZE", tp_size.to_string())
+            .env("CUDA_VISIBLE_DEVICES", judge_gpus)
             .spawn()
             .context("spawn judge serve process")?;
         let endpoint = format!("http://127.0.0.1:{port}");
