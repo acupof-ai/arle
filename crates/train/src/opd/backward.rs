@@ -332,7 +332,13 @@ pub(super) fn backward_windowed_gkd<T: TeacherForward + ?Sized>(
                 "",
             );
             let teacher_logits = teacher
-                .forward_logits_window_device(rollout, positions, window, store, tape)
+                .forward_logits_window_device(
+                    &rollout[..window.end],
+                    &positions[..window.end],
+                    window,
+                    store,
+                    tape,
+                )
                 .map_err(|err| map_teacher_forward_error("teacher windowed KL", err))?;
             log_opd_window_trace(
                 "kl",
@@ -361,7 +367,13 @@ pub(super) fn backward_windowed_gkd<T: TeacherForward + ?Sized>(
                 "",
             );
             let student_logits = student
-                .forward_logits_window(store, tape, rollout, positions, window)
+                .forward_logits_window(
+                    store,
+                    tape,
+                    &rollout[..window.end],
+                    &positions[..window.end],
+                    window,
+                )
                 .map_err(|err| map_qwen35_forward_error("student windowed KL", err))?;
             log_opd_window_trace(
                 "kl",
@@ -444,7 +456,13 @@ pub(super) fn backward_windowed_gkd<T: TeacherForward + ?Sized>(
                     let logits_window = target_window;
                     let phase_started = Instant::now();
                     let student_logits = student
-                        .forward_logits_window(store, tape, rollout, positions, logits_window)
+                        .forward_logits_window(
+                            store,
+                            tape,
+                            &rollout[..logits_window.end],
+                            &positions[..logits_window.end],
+                            logits_window,
+                        )
                         .map_err(|err| {
                             map_qwen35_forward_error("student windowed rollout SFT", err)
                         })?;
@@ -537,8 +555,8 @@ pub(super) fn backward_windowed_gkd<T: TeacherForward + ?Sized>(
                         .forward_logits_window(
                             store,
                             tape,
-                            &sft_sequence,
-                            &sft_positions,
+                            &sft_sequence[..logits_window.end],
+                            &sft_positions[..logits_window.end],
                             logits_window,
                         )
                         .map_err(|err| {
