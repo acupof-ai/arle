@@ -259,7 +259,7 @@ impl Qwen35Model {
         Ok((logits, profile))
     }
 
-    pub(super) fn forward_batch_hidden_indices(
+    pub fn forward_batch_hidden_indices(
         &self,
         store: &mut TensorStore,
         tape: &mut Tape,
@@ -267,6 +267,42 @@ impl Qwen35Model {
         positions: &[usize],
         batch: usize,
         cp: crate::context_parallel::CpContext,
+    ) -> Result<TensorId> {
+        self.forward_batch_hidden_indices_retaining(
+            store, tape, token_indices, positions, batch, cp, None,
+        )
+    }
+
+    /// Like `forward_batch_hidden_indices`, but frees per-layer scratch from
+    /// the store after each layer. The teacher full-sequence forward at 65K
+    /// tokens OOMs without this: the store would otherwise hold every layer's
+    /// linear-attention scratch (~3 GB/layer) until cleanup_after_backward.
+    /// `retain_set` lists tensor IDs that must survive the per-layer pruning
+    /// (e.g. student params, LoRA adapters, optimizer state).
+    pub fn forward_hidden_freeing_intermediates(
+        &self,
+        store: &mut TensorStore,
+        tape: &mut Tape,
+        token_indices: &[usize],
+        positions: &[usize],
+        batch: usize,
+        cp: crate::context_parallel::CpContext,
+        retain_set: &HashSet<TensorId>,
+    ) -> Result<TensorId> {
+        self.forward_batch_hidden_indices_retaining(
+            store, tape, token_indices, positions, batch, cp, Some(retain_set),
+        )
+    }
+
+    fn forward_batch_hidden_indices_retaining(
+        &self,
+        store: &mut TensorStore,
+        tape: &mut Tape,
+        token_indices: &[usize],
+        positions: &[usize],
+        batch: usize,
+        cp: crate::context_parallel::CpContext,
+        free_intermediates: Option<&HashSet<TensorId>>,
     ) -> Result<TensorId> {
         let seq_len = positions.len();
         if token_indices.len() != batch * seq_len {
@@ -387,6 +423,16 @@ impl Qwen35Model {
             // pool-reserved-aware (cuMemGetInfo), so slope = tape + transients.
             let vram_ramp = std::env::var("ARLE_OPD_VRAM_TRACE").is_ok();
             let layer_trace = std::env::var("ARLE_OPD_LAYER_TRACE").is_ok();
+            // When freeing intermediates (teacher full-seq forward), build the
+            // retain set once: model params + cos/sin + caller's retain set.
+            // The per-layer `hidden` is added inside the loop.
+            let free_base: Option<HashSet<TensorId>> = free_intermediates.map(|retain| {
+                let mut keep: HashSet<TensorId> = self.param_ids.iter().copied().collect();
+                keep.insert(cos);
+                keep.insert(sin);
+                keep.extend(retain.iter().copied());
+                keep
+            });
             for (layer_index, layer) in self.layers.iter().enumerate() {
                 hidden = self.detach_before_lora_layer(hidden, layer_index, store, tape)?;
                 hidden = layer.forward(
@@ -400,6 +446,11 @@ impl Qwen35Model {
                     store,
                     tape,
                 )?;
+                if let Some(base) = &free_base {
+                    let mut keep = base.clone();
+                    keep.insert(hidden);
+                    store.retain_ids(&keep);
+                }
                 if vram_ramp && let Some((free, _)) = store.backend().device_mem_info() {
                     eprintln!("[vram-ramp] layer={layer_index} free={free}");
                 }

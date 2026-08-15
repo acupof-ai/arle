@@ -121,8 +121,31 @@ fn windowed_gkd_step<O: Optimizer, T: TeacherForward + ?Sized>(
     // forward has contiguous VRAM (the pool grows to the rollout's high-water
     // mark and doesn't release without an explicit trim).
     #[cfg(feature = "cuda")]
-    if let Err(err) = store.backend().trim_memory_pool() {
-        eprintln!("trim_memory_pool before backward failed (non-fatal): {err}");
+    {
+        // cuCtxSynchronize first: the infer engine's streams may still hold
+        // pool memory from the rollout, and trim only frees what the pool
+        // marks unused (stream-ordered). A per-stream sync on the train
+        // backend alone leaves foreign-stream allocs marked in-use.
+        if let Err(err) = store.backend().device_synchronize() {
+            eprintln!("device_synchronize before backward failed (non-fatal): {err}");
+        }
+        if let Some((free, total)) = store.backend().device_mem_info() {
+            eprintln!(
+                "[opd-vram] before trim: free={}MiB total={}MiB",
+                free >> 20,
+                total >> 20
+            );
+        }
+        if let Err(err) = store.backend().trim_memory_pool() {
+            eprintln!("trim_memory_pool before backward failed (non-fatal): {err}");
+        }
+        if let Some((free, total)) = store.backend().device_mem_info() {
+            eprintln!(
+                "[opd-vram] after trim: free={}MiB total={}MiB",
+                free >> 20,
+                total >> 20
+            );
+        }
     }
     // Release the rollout engine's KV pool for the backward — the teacher
     // forward needs the VRAM at long sequences. Re-acquired after the step.
@@ -132,11 +155,26 @@ fn windowed_gkd_step<O: Optimizer, T: TeacherForward + ?Sized>(
             eprintln!("release_kv_pool before backward failed (non-fatal): {err}");
             false
         } else {
+            if let Some((free, total)) = store.backend().device_mem_info() {
+                eprintln!(
+                    "[opd-vram] after kv_pool release: free={}MiB total={}MiB",
+                    free >> 20,
+                    total >> 20
+                );
+            }
             true
         }
     } else {
         false
     };
+    #[cfg(feature = "cuda")]
+    if let Some((free, total)) = store.backend().device_mem_info() {
+        eprintln!(
+            "[opd-vram] before backward: free={}MiB total={}MiB",
+            free >> 20,
+            total >> 20
+        );
+    }
     let loss_result = backward_windowed_gkd(
         rt.student,
         rt.teacher,

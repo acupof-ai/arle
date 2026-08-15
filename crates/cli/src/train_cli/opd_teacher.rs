@@ -87,6 +87,48 @@ impl train::teacher_infer::TeacherForward for OpdCliTeacher<'_> {
         }
     }
 
+    fn forward_hidden_device(
+        &self,
+        input_ids: &[u32],
+        positions: &[u32],
+        retain_set: &std::collections::HashSet<TensorId>,
+        store: &mut TensorStore,
+        tape: &mut Tape,
+    ) -> std::result::Result<TensorId, train::teacher_infer::TeacherForwardError> {
+        match self {
+            Self::InProcess(teacher) => {
+                train::teacher_infer::TeacherForward::forward_hidden_device(
+                    teacher, input_ids, positions, retain_set, store, tape,
+                )
+            }
+            _ => Err(train::teacher_infer::TeacherForwardError::InvalidInput(
+                "forward_hidden_device only supported by in-process teacher".to_owned(),
+            )),
+        }
+    }
+
+    fn logits_from_hidden_window_device(
+        &self,
+        hidden: TensorId,
+        window: train::qwen35::SequenceWindow,
+        store: &mut TensorStore,
+        tape: &mut Tape,
+    ) -> std::result::Result<
+        train::teacher_infer::DeviceLogits,
+        train::teacher_infer::TeacherForwardError,
+    > {
+        match self {
+            Self::InProcess(teacher) => {
+                train::teacher_infer::TeacherForward::logits_from_hidden_window_device(
+                    teacher, hidden, window, store, tape,
+                )
+            }
+            _ => Err(train::teacher_infer::TeacherForwardError::InvalidInput(
+                "logits_from_hidden_window_device only supported by in-process teacher".to_owned(),
+            )),
+        }
+    }
+
     fn vocab_size(&self) -> usize {
         match self {
             Self::InProcess(teacher) => train::teacher_infer::TeacherForward::vocab_size(teacher),
