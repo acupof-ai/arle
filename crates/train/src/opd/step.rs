@@ -126,12 +126,10 @@ fn windowed_gkd_step<O: Optimizer, T: TeacherForward + ?Sized>(
         rt.vocab,
         rt.gkd_config,
         window_size,
-        rt.student_params,
         rt.student_model_params,
         rt.keep_extra,
         store,
         tape,
-        rt.engine_offload,
         profile,
     );
     log_opd_step_trace(rt.total_started, "windowed_backward_done", "");
