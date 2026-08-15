@@ -247,21 +247,13 @@ fn trimmed_once<'a>(started: &mut bool, text: &'a str) -> Option<&'a str> {
 /// opening tag — the tool stream's opening-tag-triggered hiding misses it and
 /// leaks reasoning + a stray `</think>` into visible text. Only the content
 /// half then feeds tool-call extraction (so reasoning that merely *mentions*
-/// a tool block never parses as a call). In tools mode reasoning is dropped,
-/// matching the non-streaming finalize; tool-less thinking keeps emitting
-/// `Reasoning` deltas (the OpenAI `reasoning_content` lane — Anthropic has no
-/// lane and drops them at the encoder).
+/// a tool block never parses as a call). Reasoning always reaches the wire:
+/// `reasoning_content` deltas on OpenAI, `thinking` blocks on Anthropic —
+/// including in tools mode, and including reasoning a model emits without the
+/// request asking for it.
 pub(crate) struct StreamPipeline {
     splitter: StreamingReasoningSplitter,
     tool_stream: Option<chat::StreamingToolCalls>,
-    /// Whether reasoning deltas are emitted on the wire. When false (thinking
-    /// disabled), the splitter still strips a leading `<think>` block so it
-    /// doesn't leak into content, but the reasoning text is dropped.
-    emit_reasoning: bool,
-    /// Whether reasoning is emitted even when tools are active. OpenAI drops
-    /// reasoning in tools mode (no wire lane); Anthropic emits thinking blocks
-    /// alongside tool_use blocks.
-    emit_reasoning_in_tools: bool,
 }
 
 impl StreamPipeline {
@@ -269,20 +261,6 @@ impl StreamPipeline {
         Self {
             splitter: StreamingReasoningSplitter::new(thinking),
             tool_stream: tools_active.then(chat::StreamingToolCalls::default),
-            emit_reasoning: thinking,
-            emit_reasoning_in_tools: false,
-        }
-    }
-
-    /// Construct a pipeline that emits reasoning deltas even in tools mode —
-    /// the Anthropic streaming path, where `thinking` blocks precede
-    /// `tool_use` blocks.
-    pub(crate) fn new_anthropic(thinking: bool, tools_active: bool) -> Self {
-        Self {
-            splitter: StreamingReasoningSplitter::new(thinking),
-            tool_stream: tools_active.then(chat::StreamingToolCalls::default),
-            emit_reasoning: thinking,
-            emit_reasoning_in_tools: true,
         }
     }
 
@@ -293,15 +271,10 @@ impl StreamPipeline {
         calls: &mut Vec<chat::ToolCall>,
     ) {
         match piece {
-            // Tools mode: reasoning has no wire lane for OpenAI (dropped), but
-            // Anthropic emits it as `thinking` blocks.
-            ChatDelta::Reasoning(_)
-                if self.tool_stream.is_some() && !self.emit_reasoning_in_tools => {}
-            ChatDelta::Reasoning(text) => {
-                if self.emit_reasoning {
-                    deltas.push(ChatDelta::Reasoning(text));
-                }
-            }
+            // Reasoning the model actually produced always reaches the client:
+            // `reasoning_content` on OpenAI, `thinking` blocks on Anthropic.
+            // Dropping it left the client with a silent multi-second stall.
+            ChatDelta::Reasoning(text) => deltas.push(ChatDelta::Reasoning(text)),
             ChatDelta::Content(text) => match self.tool_stream.as_mut() {
                 Some(stream) => {
                     let (visible, new_calls) = stream.push(&text);

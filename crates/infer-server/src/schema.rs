@@ -1150,8 +1150,9 @@ pub(crate) fn split_reasoning(text: &str, enable_thinking: bool) -> (Option<Stri
                     .trim_start_matches("<think>")
                     .trim();
                 let content = trimmed[idx + THINK_END.len()..].trim_start();
-                let reasoning_content =
-                    (enable_thinking && !reasoning.is_empty()).then(|| reasoning.to_string());
+                // The model emitted the block itself, so it is reasoning whether
+                // or not the request asked for thinking.
+                let reasoning_content = (!reasoning.is_empty()).then(|| reasoning.to_string());
                 (reasoning_content, content.to_string())
             }
             // No closer: if thinking is on, it's truncated reasoning; if off,
