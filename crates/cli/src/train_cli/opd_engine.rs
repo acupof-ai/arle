@@ -371,7 +371,8 @@ pub(super) fn load_agent_opd_serve_student(
         Arc::new(Mutex::new(student_engine)),
         train_backend.clone(),
         vocab,
-    );
+    )
+    .with_lora_merge_fp8(args.lora_merge_fp8);
     log_opd_vram(
         "after autograd student load (resident floor)",
         &train_backend,

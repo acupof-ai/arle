@@ -359,6 +359,20 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    // BF16 → FP8 E4M3 + per-block f32 scales (amax/448). LoRA merge-requant.
+    pub fn quantize_bf16_to_fp8_block_scaled_cuda(
+        input: *const Half,
+        weight: *mut u8,
+        scales: *mut f32,
+        n: i32,
+        k: i32,
+        scale_rows: i32,
+        scale_cols: i32,
+        block_m: i32,
+        block_k: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     /// W8A16 INT8 weight → BF16 via per-row per-column-group scale. Prefill
     /// path: dequant once, then one cuBLAS BF16 GEMM over all M rows.
     pub fn dequantize_w8a16_to_bf16_cuda(

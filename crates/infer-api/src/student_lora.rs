@@ -167,6 +167,7 @@ pub fn load_student_lora_update(path: &Path, alpha: f32) -> Result<StudentLoraUp
         layers: out_layers,
         rank: rank.expect("non-empty layers imply a rank"),
         alpha,
+        requant_fp8: false,
     })
 }
 

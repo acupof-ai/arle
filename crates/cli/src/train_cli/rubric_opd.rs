@@ -348,7 +348,8 @@ pub(super) fn run_rubric_opd_impl(args: TrainRubricOpdArgs) -> Result<()> {
         Arc::new(Mutex::new(student_engine)),
         train_backend.clone(),
         vocab,
-    );
+    )
+    .with_lora_merge_fp8(args.lora_merge_fp8);
 
     // Judge engine (DeepSeek-V4-Flash) — text in, verdict out (own tokenizer).
     // Self-consistency mode loads NO judge (the student majority-votes on its own

@@ -2206,6 +2206,10 @@ pub(crate) struct TrainRubricOpdArgs {
     #[arg(long, default_value = "all-linear")]
     pub(crate) lora_target_set: String,
 
+    /// Requantize merged LoRA weights back to FP8 at each sync (needed to fit a 27B all-linear merge on one GPU).
+    #[arg(long, default_value_t = false)]
+    pub(crate) lora_merge_fp8: bool,
+
     /// Suffix-detach: train LoRA only on layers >= N and detach the autograd
     /// backward before layer N (cuts the backward to the top suffix). Needed to fit
     /// a 27B dense student CE backward; unset = all layers (OOMs at 27B/seq~1k).
@@ -2501,6 +2505,10 @@ pub(crate) struct TrainAgentOpdArgs {
     /// LoRA target set: `attention-qv`, `attention-full` (q/k/v/o + linear-attn), or `all-linear`.
     #[arg(long, default_value = "all-linear")]
     pub(crate) lora_target_set: String,
+
+    /// Requantize merged LoRA weights back to FP8 at each sync (needed to fit a 27B all-linear merge on one GPU).
+    #[arg(long, default_value_t = false)]
+    pub(crate) lora_merge_fp8: bool,
 
     /// Suffix-detach: train LoRA only on layers >= N and detach the autograd
     /// backward before layer N (cuts the backward to the top suffix). Needed to
