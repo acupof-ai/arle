@@ -214,6 +214,14 @@ pub(super) fn run_opd_from_dirs(args: TrainOpdArgs) -> Result<()> {
     let cfg = student.config().clone();
     #[cfg(feature = "cuda")]
     let vram_plan = OpdVramPlan::probe(&train_backend, args.runtime.rollout_mem_fraction);
+    // scheduler_config() reserves 1/8 of per_req_cap for generation, so
+    // max_prompt_tokens = max_seq_len * 7/8. Compensate by scaling
+    // max_seq_len by 8/7 so the prompt cap covers prompt_max_tokens.
+    #[cfg(feature = "cuda")]
+    let engine_seq = {
+        let seq = args.prompt_max_tokens + args.rollout_len + 32;
+        (seq * 8 / 7 + 15) / 16 * 16
+    };
     #[cfg(feature = "cuda")]
     let infer_student = if corpus_sft_only {
         None
@@ -225,11 +233,6 @@ pub(super) fn run_opd_from_dirs(args: TrainOpdArgs) -> Result<()> {
         if matches!(target_set, train::lora::LoraTargetSet::AllLinear) {
             infer_api::set_qwen35_moe_experts_bf16_resident(true);
         }
-        // scheduler_config() reserves 1/8 of per_req_cap for generation, so
-        // max_prompt_tokens = max_seq_len * 7/8. Compensate by scaling
-        // max_seq_len by 8/7 so the prompt cap covers prompt_max_tokens.
-        let seq = args.prompt_max_tokens + args.rollout_len + 32;
-        let engine_seq = (seq * 8 / 7 + 15) / 16 * 16;
         load_opd_infer_student(
             student_dir,
             engine_seq,
