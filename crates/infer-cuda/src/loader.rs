@@ -50,15 +50,10 @@ fn available_ram_bytes() -> Option<usize> {
 
 fn should_prefetch_shards(
     rank: usize,
-    world_size: usize,
+    _world_size: usize,
     available: usize,
     checkpoint: usize,
 ) -> bool {
-    // With TP>1, each rank only reads its own shard; prefetching all shards
-    // on rank 0 wastes host memory (294 GB for DSv4-Flash) and can OOM the pod.
-    if world_size > 1 {
-        return false;
-    }
     rank == 0 && checkpoint > 0 && available >= checkpoint.saturating_add(PREFETCH_CACHE_HEADROOM)
 }
 
@@ -952,7 +947,7 @@ impl SafetensorLoader {
     }
 
     fn prefetch_all_shards(&self) {
-        use std::io::Read;
+        use std::os::fd::AsRawFd;
         use std::sync::atomic::{AtomicUsize, Ordering};
         let t0 = Instant::now();
         let n = self.shards.len();
@@ -969,18 +964,28 @@ impl SafetensorLoader {
         std::thread::scope(|scope| {
             for _ in 0..threads {
                 scope.spawn(|| {
-                    let mut buf = vec![0u8; 8 << 20];
                     loop {
                         let i = next.fetch_add(1, Ordering::Relaxed);
                         if i >= n {
                             break;
                         }
-                        if let Ok(mut f) = fs::File::open(&shards[i]) {
-                            while let Ok(read) = f.read(&mut buf) {
-                                if read == 0 {
-                                    break;
+                        if let Ok(meta) = fs::metadata(&shards[i]) {
+                            let len = meta.len() as usize;
+                            if let Ok(file) = fs::File::open(&shards[i]) {
+                                // Advise the kernel to read ahead asynchronously.
+                                // The kernel manages the page cache; pages are
+                                // reclaimable under memory pressure (unlike the
+                                // old read-to-buffer approach which pinned them).
+                                #[cfg(target_os = "linux")]
+                                unsafe {
+                                    libc::posix_fadvise(
+                                        file.as_raw_fd(),
+                                        0,
+                                        0,
+                                        libc::POSIX_FADV_WILLNEED,
+                                    );
                                 }
-                                bytes.fetch_add(read, Ordering::Relaxed);
+                                bytes.fetch_add(len, Ordering::Relaxed);
                             }
                         }
                     }
@@ -990,7 +995,7 @@ impl SafetensorLoader {
         let gb = bytes.load(Ordering::Relaxed) as f64 / 1e9;
         let secs = t0.elapsed().as_secs_f64().max(1e-6);
         log::info!(
-            "loader prefetch: {gb:.1} GB across {n} shards in {secs:.1}s ({:.2} GB/s, {threads} threads)",
+            "loader prefetch (fadvise): {gb:.1} GB across {n} shards in {secs:.1}s ({:.2} GB/s, {threads} threads)",
             gb / secs
         );
     }
