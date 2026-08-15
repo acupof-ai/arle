@@ -1035,6 +1035,11 @@ async fn chat_completions(
         }
     }
     let stream = request.stream.unwrap_or(false);
+    if stream && request.logprobs.unwrap_or(false) {
+        return Err(ApiError::bad_request(
+            "logprobs with stream=true is not supported yet",
+        ));
+    }
     let include_usage = request
         .stream_options
         .as_ref()
