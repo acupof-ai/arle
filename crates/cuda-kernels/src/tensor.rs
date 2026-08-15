@@ -1966,10 +1966,7 @@ impl DeviceMatrix {
         if let Some((qw, sc)) = self.pristine_fp8.as_ref() {
             return Some((qw, sc));
         }
-        match (self.qweight_u8.as_ref(), self.scale_f32.as_ref()) {
-            (Some(qw), Some(sc)) => Some((qw, sc)),
-            _ => None,
-        }
+        self.qweight_u8.as_ref().zip(self.scale_f32.as_ref())
     }
 
     pub fn fp8_block_scaled_ptrs(

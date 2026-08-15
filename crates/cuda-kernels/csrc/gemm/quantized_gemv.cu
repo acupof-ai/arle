@@ -152,26 +152,23 @@ __global__ void quantize_bf16_to_fp8_block_scaled_kernel(
     float* __restrict__ scales,
     int N,
     int K,
-    int scale_rows,
     int scale_cols,
     int block_m,
     int block_k)
 {
     const int sr = blockIdx.y;
     const int sc = blockIdx.x;
-    if (sr >= scale_rows || sc >= scale_cols) return;
     const int row0 = sr * block_m;
     const int col0 = sc * block_k;
     const int rows = min(block_m, N - row0);
     const int cols = min(block_k, K - col0);
-    const int elems = rows * cols;
 
     __shared__ float red[256];
     float amax = 0.0f;
-    for (int i = threadIdx.x; i < elems; i += blockDim.x) {
-        const int r = row0 + i / cols;
-        const int c = col0 + i % cols;
-        amax = fmaxf(amax, fabsf(__bfloat162float(input[(long)r * K + c])));
+    for (int r = row0; r < row0 + rows; ++r) {
+        for (int c = col0 + threadIdx.x; c < col0 + cols; c += blockDim.x) {
+            amax = fmaxf(amax, fabsf(__bfloat162float(input[(long)r * K + c])));
+        }
     }
     red[threadIdx.x] = amax;
     __syncthreads();
@@ -181,14 +178,13 @@ __global__ void quantize_bf16_to_fp8_block_scaled_kernel(
     }
     const float scale = red[0] > 0.0f ? red[0] / 448.0f : 1.0f;
     if (threadIdx.x == 0) scales[sr * scale_cols + sc] = scale;
-    __syncthreads();
 
     const float inv = 1.0f / scale;
-    for (int i = threadIdx.x; i < elems; i += blockDim.x) {
-        const int r = row0 + i / cols;
-        const int c = col0 + i % cols;
-        const float w = __bfloat162float(input[(long)r * K + c]) * inv;
-        weight[(long)r * K + c] = __nv_cvt_float_to_fp8(w, __NV_SATFINITE, __NV_E4M3);
+    for (int r = row0; r < row0 + rows; ++r) {
+        for (int c = col0 + threadIdx.x; c < col0 + cols; c += blockDim.x) {
+            const float w = __bfloat162float(input[(long)r * K + c]) * inv;
+            weight[(long)r * K + c] = __nv_cvt_float_to_fp8(w, __NV_SATFINITE, __NV_E4M3);
+        }
     }
 }
 
@@ -198,23 +194,18 @@ extern "C" cudaError_t quantize_bf16_to_fp8_block_scaled_cuda(
     float* scales,
     int N,
     int K,
-    int scale_rows,
-    int scale_cols,
     int block_m,
     int block_k,
     cudaStream_t stream)
 {
-    if (N <= 0 || K <= 0 || scale_rows <= 0 || scale_cols <= 0 || block_m <= 0 ||
-        block_k <= 0) {
+    if (N <= 0 || K <= 0 || block_m <= 0 || block_k <= 0) {
         return cudaErrorInvalidValue;
     }
-    // scale grid must tile the matrix exactly (ceil-div)
-    if (scale_rows != (N + block_m - 1) / block_m || scale_cols != (K + block_k - 1) / block_k) {
-        return cudaErrorInvalidValue;
-    }
+    const int scale_rows = (N + block_m - 1) / block_m;
+    const int scale_cols = (K + block_k - 1) / block_k;
     dim3 grid((unsigned int)scale_cols, (unsigned int)scale_rows, 1);
     quantize_bf16_to_fp8_block_scaled_kernel<<<grid, 256, 0, stream>>>(
-        input, weight, scales, N, K, scale_rows, scale_cols, block_m, block_k);
+        input, weight, scales, N, K, scale_cols, block_m, block_k);
     return cudaGetLastError();
 }
 

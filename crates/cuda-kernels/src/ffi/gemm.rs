@@ -366,8 +366,6 @@ unsafe extern "C" {
         scales: *mut f32,
         n: i32,
         k: i32,
-        scale_rows: i32,
-        scale_cols: i32,
         block_m: i32,
         block_k: i32,
         stream: CUstream,
