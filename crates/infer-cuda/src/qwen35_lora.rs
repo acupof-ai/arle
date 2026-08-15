@@ -554,23 +554,20 @@ impl Qwen35Model {
             return Ok(());
         }
         if matrix.pristine_fp8.is_none() {
-            match (matrix.qweight_u8.take(), matrix.scale_f32.take()) {
-                (Some(qw), Some(sc)) => matrix.pristine_fp8 = Some((qw, sc)),
-                (qw, sc) => {
-                    matrix.qweight_u8 = qw;
-                    matrix.scale_f32 = sc;
-                    return Ok(());
-                }
+            if matrix.qweight_u8.is_none() || matrix.scale_f32.is_none() {
+                return Ok(());
             }
-        }
-        ensure!(
-            matrix.quant_block_m > 0
-                && matrix.quant_block_k > 0
-                && matrix.quant_scale_rows > 0
-                && matrix.quant_scale_cols > 0,
-            "layer {layer_idx} {label}: merge-requant missing block-scale metadata"
-        );
-        if matrix.qweight_u8.is_none() {
+            ensure!(
+                matrix.quant_block_m > 0
+                    && matrix.quant_block_k > 0
+                    && matrix.quant_scale_rows > 0
+                    && matrix.quant_scale_cols > 0,
+                "layer {layer_idx} {label}: merge-requant missing block-scale metadata"
+            );
+            matrix.pristine_fp8 = Some((
+                matrix.qweight_u8.take().expect("checked above"),
+                matrix.scale_f32.take().expect("checked above"),
+            ));
             matrix.qweight_u8 = Some(
                 ctx.stream
                     .alloc_zeros::<u8>(matrix.rows * matrix.cols)
@@ -578,8 +575,6 @@ impl Qwen35Model {
                         anyhow!("layer {layer_idx} {label}: merged qweight alloc failed: {e}")
                     })?,
             );
-        }
-        if matrix.scale_f32.is_none() {
             matrix.scale_f32 = Some(
                 ctx.stream
                     .alloc_zeros::<f32>(matrix.quant_scale_rows * matrix.quant_scale_cols)
@@ -593,12 +588,12 @@ impl Qwen35Model {
             let (qw_ptr, _gq) = matrix
                 .qweight_u8
                 .as_mut()
-                .expect("allocated above")
+                .expect("split out above")
                 .device_ptr_mut(&ctx.stream);
             let (sc_ptr, _gs) = matrix
                 .scale_f32
                 .as_mut()
-                .expect("allocated above")
+                .expect("split out above")
                 .device_ptr_mut(&ctx.stream);
             // SAFETY: ptrs from live device allocations sized to the dims passed.
             unsafe {
@@ -608,8 +603,6 @@ impl Qwen35Model {
                     sc_ptr as *mut f32,
                     matrix.rows as i32,
                     matrix.cols as i32,
-                    matrix.quant_scale_rows as i32,
-                    matrix.quant_scale_cols as i32,
                     matrix.quant_block_m as i32,
                     matrix.quant_block_k as i32,
                     ctx.stream.cu_stream(),
