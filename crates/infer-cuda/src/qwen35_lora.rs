@@ -509,7 +509,6 @@ impl Qwen35Model {
         let scale = update.alpha / update.rank as f32;
         let num_layers = self.config.num_hidden_layers;
 
-        let mut touched: Vec<(usize, StudentLoraProjection)> = Vec::new();
         for layer in &update.layers {
             let layer_idx = layer.layer_idx;
             ensure!(
@@ -528,12 +527,13 @@ impl Qwen35Model {
                     &projection.matrices,
                     scale,
                 )?;
-                touched.push((layer_idx, projection.projection));
             }
-        }
-        if update.requant_fp8 {
-            for (layer_idx, projection) in touched {
-                self.requant_merged_matrix(layer_idx, projection)?;
+            // Per layer, not per update: the dense promotions of one layer are
+            // the peak, and row-fused siblings share a layer.
+            if update.requant_fp8 {
+                for projection in &layer.projections {
+                    self.requant_merged_matrix(layer_idx, projection.projection)?;
+                }
             }
         }
         self.ctx.sync()?;
