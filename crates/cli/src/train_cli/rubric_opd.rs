@@ -647,27 +647,43 @@ impl JudgeServer {
     ) -> Result<Self> {
         let port = free_port();
         let exe = std::env::current_exe().context("current_exe")?;
-        // The student (TP=1) uses the first visible GPU. Pin the judge's TP
-        // workers to the next `tp_size` physical GPUs so its rank-0 weight load
-        // does not OOM against the student on a shared GPU. The student's GPU
-        // is the first entry of the parent's CUDA_VISIBLE_DEVICES, or 0 if unset.
-        let student_gpu: usize = match std::env::var("CUDA_VISIBLE_DEVICES") {
-            Ok(s) => s
-                .split(',')
-                .next()
-                .and_then(|first| first.trim().parse().ok())
-                .unwrap_or_else(|| {
-                    log::warn!(
-                        "CUDA_VISIBLE_DEVICES={s:?} unparseable, defaulting student GPU to 0"
-                    );
-                    0
-                }),
-            Err(_) => 0,
+        // The student (TP=1) uses one GPU; the judge (TP=tp_size) must not
+        // share it. Resolve the student's physical GPU from the parent's
+        // CUDA_VISIBLE_DEVICES + INFER_CUDA_DEVICE, then assign the judge the
+        // remaining visible devices.
+        let visible: Vec<usize> = match std::env::var("CUDA_VISIBLE_DEVICES") {
+            Ok(s) => s.split(',').filter_map(|x| x.trim().parse().ok()).collect(),
+            Err(_) => Vec::new(), // unset: physical ordinals 0,1,2,...
         };
-        let judge_gpus: String = (1..=tp_size)
-            .map(|i| (student_gpu + i).to_string())
-            .collect::<Vec<_>>()
-            .join(",");
+        let student_idx = std::env::var("INFER_CUDA_DEVICE")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let student_gpu = visible.get(student_idx).copied().unwrap_or(student_idx);
+        // Judge GPUs: all visible devices except the student's slot. If
+        // CUDA_VISIBLE_DEVICES is unset, use physical ordinals 1..=tp_size
+        // (student is on 0).
+        let judge_gpus: String = if visible.is_empty() {
+            (1..=tp_size)
+                .map(|i| i.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        } else {
+            visible
+                .iter()
+                .enumerate()
+                .filter(|(idx, _)| *idx != student_idx)
+                .map(|(_, gpu)| gpu.to_string())
+                .take(tp_size)
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        if judge_gpus.is_empty() {
+            bail!(
+                "not enough GPUs for judge TP={tp_size}: student uses GPU {student_gpu}, \
+                 no remaining visible devices"
+            );
+        }
         let mut child = std::process::Command::new(exe)
             .args([
                 "serve",

@@ -903,7 +903,7 @@ fn shard_cache_bytes_limit() -> usize {
 
 impl SafetensorLoader {
     /// Rank zero warms the page cache by advising the kernel to read ahead
-    /// all checkpoint shards (`posix_fadvise(WILLNEED)`). Nonblocking —
+    /// all checkpoint shards (`mmap` + `madvise(MADV_WILLNEED)`). Nonblocking —
     /// the kernel reads asynchronously and pages stay reclaimable under
     /// memory pressure (unlike the old read-to-buffer approach which pinned
     /// every page). Other ranks wait on the broadcast until rank 0 finishes.
@@ -928,8 +928,8 @@ impl SafetensorLoader {
     }
 
     /// Check if the host has enough free memory to benefit from prefetch.
-    /// With fadvise, pages are reclaimable, so this is a soft check to
-    /// avoid thrashing when memory is already tight.
+    /// Pages are reclaimable, so this is a soft check to avoid thrashing
+    /// when memory is already tight.
     fn has_memory_for_prefetch(&self) -> bool {
         let checkpoint: usize = self
             .shards
@@ -955,7 +955,6 @@ impl SafetensorLoader {
     /// touches a shard (after all shards have been advised), the I/O has
     /// typically completed.
     fn prefetch_all_shards(&self) {
-        use std::os::fd::AsRawFd;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         let t0 = Instant::now();
@@ -978,38 +977,28 @@ impl SafetensorLoader {
                         if i >= n {
                             break;
                         }
-                        if let Ok(meta) = fs::metadata(&shards[i]) {
-                            let len = meta.len() as usize;
-                            if len == 0 {
-                                continue;
-                            }
-                            if let Ok(file) = fs::File::open(&shards[i]) {
-                                // SAFETY: mmap the whole shard read-only, then
-                                // madvise WILLNEED to fault the pages into the
-                                // page cache. The munmap on drop does not
-                                // reclaim the cached pages.
+                        // Reuse MmapShard for the open+mmap+munmap cycle; its
+                        // Drop handles munmap. madvise(MADV_WILLNEED) on the
+                        // mapping populates the same page-cache pages the
+                        // weight-load mmap reads.
+                        match MmapShard::map(&shards[i]) {
+                            Ok(shard) => {
+                                let slice = shard.as_slice();
                                 #[cfg(target_os = "linux")]
                                 unsafe {
-                                    let ptr = libc::mmap(
-                                        std::ptr::null_mut(),
-                                        len,
-                                        libc::PROT_READ,
-                                        libc::MAP_PRIVATE,
-                                        file.as_raw_fd(),
-                                        0,
+                                    libc::madvise(
+                                        slice.as_ptr() as *mut libc::c_void,
+                                        slice.len(),
+                                        libc::MADV_WILLNEED,
                                     );
-                                    if ptr != libc::MAP_FAILED {
-                                        libc::madvise(ptr, len, libc::MADV_WILLNEED);
-                                        libc::munmap(ptr, len);
-                                    } else {
-                                        log::debug!(
-                                            "prefetch mmap failed for {}: {}",
-                                            shards[i].display(),
-                                            std::io::Error::last_os_error()
-                                        );
-                                    }
                                 }
-                                bytes.fetch_add(len, Ordering::Relaxed);
+                                bytes.fetch_add(slice.len(), Ordering::Relaxed);
+                            }
+                            Err(e) => {
+                                log::debug!(
+                                    "prefetch mmap failed for {}: {e}",
+                                    shards[i].display()
+                                );
                             }
                         }
                     }
