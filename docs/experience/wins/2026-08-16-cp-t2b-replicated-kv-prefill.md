@@ -1,6 +1,6 @@
 # CP T2.b: replicated-KV CP prefill in the qwen35 CUDA executor
 
-Status: pending-remote (needs the H20 pod; see gates below).
+Status: shipped 2026-08-16 (pod H20, ThinkingCap-Qwen3.6-27B-FP8, BF16 KV).
 
 ## Context
 
@@ -26,11 +26,39 @@ plans, engine-core, and the seam are unchanged.
   full-chunk FFN input restores it and makes lm_head/sampling rank-identical
   (no token broadcast needed).
 
-## Gates (pending-remote)
+## What worked
 
-- needle ladder x3 at cp=2 (tp=8, attn_cp=2) vs the cp=1 envelope.
-- 128K prefill wall-clock, target >= 1.6x at cp=2 on the FA3 path.
-- cp=1 A/B: byte-identical behavior (all CP branches key off attn_cp_size>1).
+The lockstep invariant held: every rank builds the identical plan, every
+rank's `PagedKVPool` covers the whole prefix, and CP shards compute only.
+The GDN state chain relays (gdr f32 state + conv tail window) across cp ranks
+in chunk order, with the last slice broadcasting its terminal state so every
+rank converges.
+
+The gate battery surfaced one real kernel bug, fixed before acceptance:
+a missing `__syncthreads()` in the GDR prefill recurrent kernel's smem
+publication — latent at cp=1, fired once NCCL interleaving perturbed the warp
+schedule. Full post-mortem:
+`docs/experience/errors/2026-08-16-gdr-prefill-smem-race.md`.
+
+## Results (H20 pod, 27B FP8, BF16 KV, needle `738291`)
+
+| Gate | Result |
+|---|---|
+| needle ladder, world=4 (attn_tp=2 × attn_cp=2) | 12/12 exact |
+| needle ladder, world=2 (attn_tp=1, attn_cp=2, global-comm alias) | 4/4 exact |
+| cp=1 control | exact, unchanged |
+| differential self-check (CP arm vs full-chunk reference, 48 layers) | bit-zero after the barrier fix |
+| 128K cold-prefill TTFT, cp=1 → cp=2 | 54.14s → 30.93s = **1.75×** (target ≥1.6×) |
+
+## Limits
+
+- cp=2 decode rate regressed at world=2 / 128K: 60 → 43 tok/s vs cp=1.
+  Decode under CP is T3's scope (graph-captured merge over sharded KV); the
+  regression is recorded here, not diagnosed.
+- CP engages only when `cp>1 && dspark off && len >= cp*256`; short prompts
+  stay on the cp=1 path byte-identically.
+- attn_dp>1 is rejected at load under CP (the attn_tp sharding would
+  double-count attention); guard, not support.
 
 ## Rule
 

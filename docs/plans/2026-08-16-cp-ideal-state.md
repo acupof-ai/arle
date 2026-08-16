@@ -2,8 +2,12 @@
 
 > Status: accepted 2026-08-16 (ckl: "把 cp 重构成理想态,引擎和训练都得支持").
 > T1 accepted 2026-08-16 (083e2e89a; gates in
-> `docs/experience/wins/2026-08-16-cp-t1-ring-core-extraction.md`). T2 in
-> progress; T2/T3 validation gates listed per tranche.
+> `docs/experience/wins/2026-08-16-cp-t1-ring-core-extraction.md`). T2 accepted
+> 2026-08-16 (gates in
+> `docs/experience/wins/2026-08-16-cp-t2b-replicated-kv-prefill.md`; GDR smem
+> race found and fixed en route,
+> `docs/experience/errors/2026-08-16-gdr-prefill-smem-race.md`). T3 next;
+> T2/T3 validation gates listed per tranche.
 
 ## Current state (grounded)
 
@@ -115,6 +119,6 @@ replicated, which needs no ring:
 | Tranche | Content | Acceptance |
 |---|---|---|
 | T1 | Extract shared ring core into `cuda-kernels`; autograd calls it | CP gate battery byte-stable; `cargo test --workspace`; no new public surface beyond the core fns |
-| T2 | Engine prefill CP + KV shard ownership + GDN state relay | needle ×3 cp=2 vs cp=1; 128K prefill ≥1.6× |
+| T2 | Engine prefill CP + KV shard ownership + GDN state relay | needle ×3 cp=2 vs cp=1; 128K prefill ≥1.6× — **accepted 2026-08-16** (1.75×) |
 | T3 | Graph-captured decode merge over sharded KV, thresholded | 4K decode wash; 256K decode win; needle ×3 |
 | T4 | Cleanup (scalar kernel), GDN a2a scaling decision, cp=4 256K curve | dated wins/errors entries |
