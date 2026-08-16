@@ -1,7 +1,9 @@
 # CP ideal state: one mesh, one attention-CP core, engine + training
 
 > Status: accepted 2026-08-16 (ckl: "把 cp 重构成理想态,引擎和训练都得支持").
-> Tranche T1 in progress; T2/T3 pending-remote validation gates listed per tranche.
+> T1 accepted 2026-08-16 (083e2e89a; gates in
+> `docs/experience/wins/2026-08-16-cp-t1-ring-core-extraction.md`). T2 in
+> progress; T2/T3 validation gates listed per tranche.
 
 ## Current state (grounded)
 
