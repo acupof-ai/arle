@@ -1,8 +1,8 @@
-# OPD 65536 Long-Sequence OOM Fix
+# OPD Long-Sequence OOM Fix (65536 + 131072)
 
 **Date:** 2026-08-16
 **Scope:** `crates/train/src/opd/`, `crates/train/src/qwen35/`, `crates/train/src/teacher_infer.rs`, `crates/cli/src/train_cli/`
-**Commit:** `cd9784f6c`
+**Commits:** `cd9784f6c`, `a52761816`, `e96ee6a43`
 
 ## Context
 
@@ -54,16 +54,26 @@ Two compounding issues:
 
 ## Result
 
+65536:
 ```
 step 1/1 loss 4.334862 rollout_len 65544
-ARLE train opd: ran 1 step(s) on Qwen3.x (backend=cuda:0)
 ```
+Peak VRAM ~26 GB. ~21 min on H20 GPU 5.
 
-OPD completes at 65536 prompt + 8 rollout on qwen35-08b-clean, GPU 5 (H20).
-Peak VRAM ~26 GB. No OOM.
+131072 (after O(n) student forward refactor, `e96ee6a43`):
+```
+step 1/1 loss 0.151320 rollout_len 131080
+```
+Peak VRAM ~44 GB. ~90 min on H20 GPU 5. Gradient checkpointing engaged
+(`[ckpt-gate] engage=true seq=131080`). The O(n²) growing-prefix approach
+was killed at 48 min without completing; the O(n) single-forward approach
+completes.
 
 ## Rule
 
 When a windowed/distillation path re-runs a forward per window, the forward
 must process only the window's tokens — not a growing prefix. Cache the
-full-seq hidden once and derive per-window logits from it.
+full-seq hidden once and derive per-window logits from it. The student
+forward follows the same pattern: one full-seq forward with gradient
+checkpointing, then per-window logits from the cached hidden, with a single
+backward for the accumulated loss.
