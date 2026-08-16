@@ -515,6 +515,7 @@ impl Qwen35Model {
                                     full_idx,
                                     rc.pool,
                                     rc.meta,
+                                    rc.cp.as_ref(),
                                     full,
                                     attn_out,
                                     rc.layer0_query.as_mut(),
@@ -536,6 +537,7 @@ impl Qwen35Model {
                     full_idx += 1;
                 }
                 Qwen35Attn::Linear(lin) => {
+                    let cp = recall.as_deref().and_then(|rc| rc.cp.as_ref());
                     crate::profile::profile_op(
                         &self.ctx,
                         "linear_attention",
@@ -548,6 +550,7 @@ impl Qwen35Model {
                                 LinearCore::Rows(&mut *rows),
                                 linear_idx,
                                 linear,
+                                cp,
                                 attn_out,
                             )
                         },

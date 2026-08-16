@@ -58,6 +58,12 @@ impl CudaModel {
         model_path: &Path,
         tp: crate::tp::TpRuntime,
     ) -> Result<Self> {
+        // CP prefill (T2.b) is a qwen35 path; this loader shards by raw tp
+        // rank and its attention reduces run on the global comm.
+        ensure!(
+            tp.attn_cp_size() == 1,
+            "attn_cp>1 is not supported by the dense Qwen executor (qwen35-only)"
+        );
         let config = Qwen3Config::from_json_file(model_path.join("config.json"))
             .with_context(|| format!("load Qwen3 config from {}", model_path.display()))?;
         validate_clean_bf16_config(&config)?;
@@ -352,6 +358,41 @@ impl PageMeta {
         pool: &PagedKVPool,
         rows: &[(usize, usize, usize)],
     ) -> Result<Self> {
+        Self::for_rows_impl(ctx, pool, rows, false)
+    }
+
+    /// CP prefill q-slice: q rows `[start_pos, start_pos+seq_len)` attend kv
+    /// `[0, kv_len)`. `kv_len` is passed explicitly (== the causal slice end);
+    /// the pool is already mirrored to the WHOLE chunk, so coverage is checked
+    /// as `>= kv_len` here without weakening `for_rows`' exact-match ensure.
+    pub(crate) fn for_slot_slice(
+        ctx: &DeviceContext,
+        pool: &PagedKVPool,
+        slot: usize,
+        start_pos: usize,
+        seq_len: usize,
+        kv_len: usize,
+    ) -> Result<Self> {
+        ensure!(
+            kv_len == start_pos + seq_len,
+            "CP slice page table: kv_len {kv_len} != causal slice end {} for slot {slot}",
+            start_pos + seq_len
+        );
+        ensure!(
+            pool.seq_len(slot) >= kv_len,
+            "CP slice page table: pool seq_len {} < slice kv_len {kv_len} for slot {slot} \
+             (chunk not fully mirrored)",
+            pool.seq_len(slot)
+        );
+        Self::for_rows_impl(ctx, pool, &[(slot, start_pos, seq_len)], true)
+    }
+
+    fn for_rows_impl(
+        ctx: &DeviceContext,
+        pool: &PagedKVPool,
+        rows: &[(usize, usize, usize)],
+        kv_prefix_of_pool: bool,
+    ) -> Result<Self> {
         ensure!(!rows.is_empty(), "page table needs at least one row");
         let batch = rows.len();
         let mut q_indptr = Vec::with_capacity(batch + 1);
@@ -370,13 +411,25 @@ impl PageMeta {
                 "page-table row for slot {slot} has no query tokens"
             );
             let total_len = start_pos + len;
-            ensure!(
-                pool.seq_len(slot) == total_len,
-                "PagedKVPool seq_len {} != materialized total_len {} for slot {}",
-                pool.seq_len(slot),
-                total_len,
-                slot
-            );
+            // A CP q-slice covers a PREFIX of the mirrored chunk; every other
+            // path requires the exact cursor match.
+            if kv_prefix_of_pool {
+                ensure!(
+                    pool.seq_len(slot) >= total_len,
+                    "PagedKVPool seq_len {} < slice total_len {} for slot {}",
+                    pool.seq_len(slot),
+                    total_len,
+                    slot
+                );
+            } else {
+                ensure!(
+                    pool.seq_len(slot) == total_len,
+                    "PagedKVPool seq_len {} != materialized total_len {} for slot {}",
+                    pool.seq_len(slot),
+                    total_len,
+                    slot
+                );
+            }
             let num_pages = total_len.div_ceil(pool.page_size);
             let pages = pool.page_indices(slot);
             ensure!(
