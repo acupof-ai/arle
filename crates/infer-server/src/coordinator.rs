@@ -823,10 +823,13 @@ async fn completions(
         crate::schema::PromptInput::Tokens(ids) => ids.clone(),
         crate::schema::PromptInput::Text(text) => encode(&state, text)?,
     };
+    // Local engine: send usage by default (a client may opt out with
+    // stream_options.include_usage=false). Cloud providers gate this behind
+    // the flag; a local server has no reason to withhold token counts.
     let include_usage = request
         .stream_options
         .as_ref()
-        .is_some_and(|o| o.include_usage);
+        .map_or(true, |o| o.include_usage);
 
     if request.stream.unwrap_or(false) {
         if request.logprobs.is_some() {
@@ -1040,10 +1043,13 @@ async fn chat_completions(
             "logprobs with stream=true is not supported yet",
         ));
     }
+    // Local engine: send usage by default (a client may opt out with
+    // stream_options.include_usage=false). Cloud providers gate this behind
+    // the flag; a local server has no reason to withhold token counts.
     let include_usage = request
         .stream_options
         .as_ref()
-        .is_some_and(|o| o.include_usage);
+        .map_or(true, |o| o.include_usage);
     // Thinking defaults on when a budget is configured OR the checkpoint is a
     // reasoning model (DeepSeek-V4-Flash) that degenerates when forced
     // non-thinking; `0` + non-reasoning keeps it off and byte-identical.
