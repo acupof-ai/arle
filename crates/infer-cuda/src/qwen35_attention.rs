@@ -985,6 +985,21 @@ impl Qwen35Model {
         Ok(())
     }
 
+    fn cp_all_gather_in_place(&self, gather: &mut HiddenStates, sect: usize) -> Result<()> {
+        let cp_rank = self.tp.attn_cp_rank();
+        let elem = std::mem::size_of::<ffi::Half>() as u64;
+        let (g_ptr, _g) = gather.data.device_ptr_mut(&self.ctx.stream);
+        // SAFETY: live `cp_size*sect` buffer; equal `sect` on every cp rank.
+        unsafe {
+            self.tp.attn_cp_all_gather_bf16(
+                &self.ctx,
+                (g_ptr + (cp_rank * sect) as u64 * elem) as *const std::ffi::c_void,
+                sect,
+                g_ptr as *mut std::ffi::c_void,
+            )
+        }
+    }
+
     /// CP prefill KV share: stage this rank's raw (pre-norm/RoPE) k/v slice
     /// into its section of the padded gather buffer, all-gather within the cp
     /// group, then run the pool-write prep over every REMOTE slice. The prep
@@ -1028,21 +1043,9 @@ impl Qwen35Model {
                     .slice_mut(base + pad * kv_dim..base + pad * kv_dim + my_len * kv_dim),
             )
             .map_err(|e| anyhow!("CP kv-share v stage failed: {e}"))?;
-        let elem = std::mem::size_of::<ffi::Half>() as u64;
-        {
-            let (g_ptr, _g) = gather.data.device_ptr_mut(&self.ctx.stream);
-            // SAFETY: in-place all-gather — send section `cp_rank*sect` of the
-            // live `cp_size*sect` gather buffer; equal `sect` on every cp rank.
-            unsafe {
-                self.tp.attn_cp_all_gather_bf16(
-                    &self.ctx,
-                    (g_ptr + base as u64 * elem) as *const std::ffi::c_void,
-                    sect,
-                    g_ptr as *mut std::ffi::c_void,
-                )?;
-            }
-        }
+        self.cp_all_gather_in_place(gather, sect)?;
 
+        let elem = std::mem::size_of::<ffi::Half>() as u64;
         let qf = cp_scrap_qf.get(&self.ctx, self.local_full_attn_q_proj_dim(), pad)?;
         let qp = cp_scrap_qp.get(&self.ctx, self.local_full_attn_q_dim(), pad)?;
         let k_pool_ptr = pool.k_ptr(full_idx, &self.ctx.stream);
@@ -1125,20 +1128,7 @@ impl Qwen35Model {
                     .slice_mut(cp_rank * sect..cp_rank * sect + my_len * dim),
             )
             .map_err(|e| anyhow!("CP row-gather stage failed: {e}"))?;
-        {
-            let elem = std::mem::size_of::<ffi::Half>() as u64;
-            let (g_ptr, _g) = gather.data.device_ptr_mut(&self.ctx.stream);
-            // SAFETY: in-place all-gather over the live `cp_size*sect` buffer;
-            // equal `sect` on every cp rank.
-            unsafe {
-                self.tp.attn_cp_all_gather_bf16(
-                    &self.ctx,
-                    (g_ptr + (cp_rank * sect) as u64 * elem) as *const std::ffi::c_void,
-                    sect,
-                    g_ptr as *mut std::ffi::c_void,
-                )?;
-            }
-        }
+        self.cp_all_gather_in_place(gather, sect)?;
         for (peer, &(off, len)) in cp.slices.iter().enumerate() {
             self.ctx
                 .stream
