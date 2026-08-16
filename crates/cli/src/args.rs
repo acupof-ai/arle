@@ -668,6 +668,12 @@ pub(crate) struct ServeArgs {
     #[arg(long, default_value_t = false)]
     pub(crate) allow_swap: bool,
 
+    /// Exit when this process disappears. A supervising app that is killed
+    /// (SIGKILL, crash) never runs its own cleanup, so the engine — holding
+    /// tens of GiB of weights — has to notice on its own.
+    #[arg(long, value_name = "PID")]
+    pub(crate) parent_pid: Option<i32>,
+
     /// Soft cap on concurrently-running requests (SGLang `max_running_requests`).
     /// The executor derives hot-workspace capacity from this plus model/VRAM budget.
     #[arg(long, value_parser = parse_positive_usize)]
@@ -2207,7 +2213,7 @@ pub(crate) struct TrainRubricOpdArgs {
     pub(crate) lora_target_set: String,
 
     /// Requantize merged LoRA weights back to FP8 at each sync (needed to fit a 27B all-linear merge on one GPU).
-    #[arg(long, default_value_t = false)]
+    #[arg(long, default_value_t = true)]
     pub(crate) lora_merge_fp8: bool,
 
     /// Suffix-detach: train LoRA only on layers >= N and detach the autograd
@@ -2507,7 +2513,7 @@ pub(crate) struct TrainAgentOpdArgs {
     pub(crate) lora_target_set: String,
 
     /// Requantize merged LoRA weights back to FP8 at each sync (needed to fit a 27B all-linear merge on one GPU).
-    #[arg(long, default_value_t = false)]
+    #[arg(long, default_value_t = true)]
     pub(crate) lora_merge_fp8: bool,
 
     /// Suffix-detach: train LoRA only on layers >= N and detach the autograd
