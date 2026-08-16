@@ -27,31 +27,55 @@
 
 ### 1. One attention-CP core, engine- and train-callable (T1)
 
-The ring merge math ((m, l, out) accumulators), the per-block FA3 kernel glue,
-and the NCCL ring transport move from `autograd` (train-only) into
-`cuda-kernels` as tape-free functions:
+Done 2026-08-16 (083e2e89a). The ring merge math ((m, l, out) forward +
+backward adjoint), the FA3 pair route, and the per-block FA3 launches moved
+into `cuda-kernels/src/ring_attention.rs`, tape-free, on `&Arc<CudaStream>`.
+autograd keeps DeviceHandle adapters, f32↔bf16 staging, scalar fallback
+kernels, the NCCL ring rotation, and the tape op. Gates green
+(`wins/2026-08-16-cp-t1-ring-core-extraction.md`).
 
-- `cuda-kernels/src/ring_attention.rs`: `RingMergeState`, `merge_block`,
-  per-block SDPA launch, device ring step (send/recv KV block, GQA-aware).
-- `autograd/src/ops/ring_attention.rs` keeps ONLY the tape op
-  (`BackwardOp::RingAttention`), its backward, and the host reference math for
-  gates — it calls the extracted core.
-- No behavior change; the existing CP gates (`cph_parity`, cp=2 seq=32768
-  losses, FA3 compounding gate) re-run as the acceptance bar.
+### 2. Engine CP prefill (T2) — revised 2026-08-16 after the executor scout
 
-### 2. Engine CP prefill (T2)
+Design correction: the engine's load-bearing invariant is lockstep SPMD —
+every rank builds the identical plan and every rank's `PagedKVPool` covers the
+whole prefix (`infer-core/src/lib.rs:1790` identical-admissions comment;
+prefix-coverage ensures at `executor/qwen35.rs:1085`, `loader.rs` `for_rows`).
+Sharding KV *ownership* in T2 breaks that everywhere for no T2 benefit; KV
+ownership sharding is T3's problem. T2 shards prefill *compute* and keeps KV
+replicated, which needs no ring:
 
-- `EngineLoadConfig.attn_cp_size` (default 1) → `ParallelTopology` →
-  `Qwen35Model`; multiproc serve spawns `tp × attn_cp` workers on the existing
-  relay coordinator.
-- A long prompt's prefill rows shard across the attn_cp group (contiguous
-  blocks; zigzag only if imbalance measures >10%). Each rank runs the shared
-  ring core over its shard and writes ITS OWN KV pages — KV ownership is the
-  shard map, recorded per request.
-- Linear-attn (GDN) prefill under CP is a state relay, not a ring: rank r
-  forwards its final recurrence state (`[heads, d, d]`, KBs) to rank r+1.
-  Sequential across ranks but each rank's chunk runs at full speed; the state
-  hop is negligible vs the chunk compute.
+- **All CP logic lives inside the CUDA executor's `submit_prefill_row` path**
+  (`executor/qwen35.rs:2572`). Plans, planner, `KvPool`, engine-core stay
+  byte-identical across ranks — lockstep is preserved trivially.
+- Per prefill chunk, rank r takes its contiguous cp-slice of the chunk's rows,
+  runs the full layer stack on `rows/cp` rows, and after computing its slice's
+  k/v at each full-attention layer, all-gathers the KV page writes within the
+  attn_cp group so every rank's pool again covers the whole prefix. Attention
+  reuses `full_attention_paged` (`qwen35_attention.rs:344`) unchanged — a
+  q-slice attending a covered prefix is exactly the chunked-prefill shape it
+  already handles via `positions`/`start_positions`.
+- Causality makes the pipeline natural: with contiguous slices rank r never
+  needs rank >r's KV, so rank 0 never stalls and rank r lags only by the state
+  chain. Zigzag only if the measured attention imbalance costs >10% wall-clock
+  at 128K (contiguous cp=2: rank 1 carries 3/4 of the O(n²) attention work but
+  GEMM/GDN work is row-balanced).
+- GDN prefill: cross-rank state relay on the existing per-slot recurrent state
+  (`Qwen35SlotState.gdr_states`/`conv_states`, `qwen35_state.rs:15`; snapshot
+  machinery `qwen35_state.rs:46` already serializes it). Rank r starts layer
+  l's GDN after receiving rank r−1's layer-l state (`[heads, d_k, d_v]`, KBs);
+  the chain telescopes to shard-stack time + (cp−1) per-layer hops.
+- Sampling: only the last-slice rank holds the final row
+  (`qwen35_forward.rs:740`); it samples and NCCL-broadcasts the token in the
+  cp group so every rank's engine loop stays identical.
+- `TpRuntime::from_env_with_nccl` (`tp.rs:172`) appends an `attn_cp` sub-comm
+  split after `attn_tp`/`moe_ep` (same fixed collective order on all ranks);
+  mesh math already exists (`build_attn_cp_groups`, `topology.rs:335`, zero
+  callers today). `attn_cp` divides the tp world per the existing
+  `tp % (attn_dp·attn_cp) == 0` rule — world size does not change.
+- Known preconditions: RoPE cache default caps `max_seq_len` at 32,768
+  (`qwen35_load.rs:577`); the 128K gate config must raise it. DSpark taps and
+  sidecar prefix hashing assume whole-prefix visibility — CP prefill is
+  mutually exclusive with those features in T2 (guard, don't solve).
 - Gate: needle ladder ×3 at cp=2 vs cp=1 envelope, plus prefill wall-clock on
   a 128K prompt (target ≥1.6× at cp=2 on the FA3 path).
 
