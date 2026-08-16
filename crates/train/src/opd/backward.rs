@@ -4,7 +4,7 @@ use std::{collections::HashSet, time::Instant};
 
 use autograd::{
     AutogradError, Tape, TensorId, TensorStore,
-    ops::{mul_scalar, slice},
+    ops::{add, mul_scalar, slice},
 };
 
 use crate::{
@@ -316,9 +316,21 @@ pub(super) fn backward_windowed_gkd<T: TeacherForward + ?Sized>(
             .forward_hidden_device(rollout, positions, store, tape)
             .map_err(|err| map_teacher_forward_error("teacher full-seq hidden", err))?;
 
-        let mut keep_with_hidden = keep_extra.clone();
-        keep_with_hidden.insert(teacher_hidden);
+        // Run the student forward ONCE on the full sequence (tape enabled for
+        // gradient checkpointing). Per-window logits derive from the cached
+        // hidden — O(n) total instead of O(n²) growing-prefix re-computation.
+        tape.set_enabled(true);
+        let rollout_ids: Vec<usize> = rollout.iter().map(|&id| id as usize).collect();
+        let student_hidden = student
+            .forward_batch_hidden(&rollout_ids, 1, rollout.len(), store, tape)
+            .map_err(|err| {
+                map_qwen35_forward_error(
+                    "student full-seq hidden",
+                    crate::qwen35::Qwen35Error::Autograd(err),
+                )
+            })?;
 
+        let mut total_loss_tensor: Option<TensorId> = None;
         for window in sequence_windows_for_range(kl_range, window_size)? {
             let window_index = backward_windows + 1;
             let window_started = Instant::now();
@@ -334,30 +346,10 @@ pub(super) fn backward_windowed_gkd<T: TeacherForward + ?Sized>(
                     window.len()
                 ),
             );
-            tape.entries.clear();
             tape.set_enabled(false);
-
-            let phase_started = Instant::now();
-            log_opd_window_trace(
-                "kl",
-                "teacher_forward_start",
-                window_index,
-                window_started,
-                "",
-            );
             let teacher_logits = teacher
                 .logits_from_hidden_window_device(teacher_hidden, window, store, tape)
                 .map_err(|err| map_teacher_forward_error("teacher windowed KL", err))?;
-            log_opd_window_trace(
-                "kl",
-                "teacher_forward_done",
-                window_index,
-                window_started,
-                format!("shape={:?}", teacher_logits.shape),
-            );
-            record_profile(profile, |profile| {
-                profile.teacher_forward_seconds += phase_started.elapsed().as_secs_f64();
-            });
             validate_logits_shape(
                 "teacher windowed KL",
                 &teacher_logits.shape,
@@ -366,42 +358,17 @@ pub(super) fn backward_windowed_gkd<T: TeacherForward + ?Sized>(
             )?;
 
             tape.set_enabled(true);
-            let phase_started = Instant::now();
-            log_opd_window_trace(
-                "kl",
-                "student_forward_start",
-                window_index,
-                window_started,
-                "",
-            );
             let student_logits = student
-                .forward_logits_window(
-                    store,
-                    tape,
-                    &rollout[..window.end],
-                    &positions[..window.end],
-                    window,
-                )
+                .logits_from_hidden_window(store, tape, student_hidden, window)
                 .map_err(|err| map_qwen35_forward_error("student windowed KL", err))?;
-            log_opd_window_trace(
-                "kl",
-                "student_forward_done",
-                window_index,
-                window_started,
-                format!("tensor_id={student_logits}"),
-            );
             let student_shape = store
                 .get(student_logits)
                 .ok_or(AutogradError::InvalidTensorId(student_logits))?
                 .shape
                 .clone();
             validate_logits_shape("student windowed KL", &student_shape, window.len(), vocab)?;
-            record_profile(profile, |profile| {
-                profile.student_forward_seconds += phase_started.elapsed().as_secs_f64();
-            });
 
             let phase_started = Instant::now();
-            log_opd_window_trace("kl", "kl_loss_start", window_index, window_started, "");
             let kl_loss = kl_distill_loss_for_config(
                 student_logits,
                 teacher_logits.tensor_id,
@@ -413,33 +380,46 @@ pub(super) fn backward_windowed_gkd<T: TeacherForward + ?Sized>(
                 store,
                 tape,
             )?;
-            log_opd_window_trace(
-                "kl",
-                "kl_loss_done",
-                window_index,
-                window_started,
-                format!("tensor_id={kl_loss}"),
-            );
             record_profile(profile, |profile| {
                 profile.kl_loss_seconds += phase_started.elapsed().as_secs_f64();
             });
-            let weight = (1.0 - gkd_config.lambda) * (window.len() as f32 / kl_range.len() as f32);
-            log_opd_window_trace("kl", "backward_start", window_index, window_started, "");
-            total_loss += backward_weighted_window_loss(kl_loss, weight, store, tape, profile)?;
+            let weight =
+                (1.0 - gkd_config.lambda) * (window.len() as f32 / kl_range.len() as f32);
+            let weighted = if (weight - 1.0).abs() < f32::EPSILON {
+                kl_loss
+            } else {
+                mul_scalar(kl_loss, weight, store, tape)?
+            };
+            total_loss_tensor = Some(match total_loss_tensor {
+                Some(prev) => add(prev, weighted, store, tape)?,
+                None => weighted,
+            });
+            backward_windows += 1;
             log_opd_window_trace(
                 "kl",
-                "backward_done",
+                "done",
                 window_index,
                 window_started,
-                format!("loss_accum={total_loss:.12e}"),
+                format!("loss_accum_windows={backward_windows}"),
             );
-            backward_windows += 1;
-            log_opd_window_trace("kl", "cleanup_start", window_index, window_started, "");
-            cleanup_after_backward(store, tape, student_model_params, &keep_with_hidden);
-            log_opd_window_trace("kl", "done", window_index, window_started, "");
         }
-        // Free the cached teacher hidden states after all windows are done.
+
+        // Single backward for all windows — the tape holds the full-seq
+        // student forward graph; per-window logits/loss ops are cheap.
+        if let Some(loss_tensor) = total_loss_tensor {
+            let phase_started = Instant::now();
+            let loss_value = store.to_host(loss_tensor)?[0];
+            validate_loss_value(loss_value)?;
+            backward_with_optional_profile(loss_tensor, loss_value, store, tape)?;
+            record_profile(profile, |profile| {
+                profile.backward_seconds += phase_started.elapsed().as_secs_f64();
+            });
+            total_loss += loss_value;
+        }
+
+        cleanup_after_backward(store, tape, student_model_params, keep_extra);
         let _ = store.free(teacher_hidden);
+        let _ = store.free(student_hidden);
     }
 
     if gkd_config.lambda > 0.0 {
