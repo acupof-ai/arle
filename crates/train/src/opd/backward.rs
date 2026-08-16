@@ -4,14 +4,11 @@ use std::{collections::HashSet, time::Instant};
 
 use autograd::{
     AutogradError, Tape, TensorId, TensorStore,
-    ops::{add, mul_scalar, slice},
+    ops::{mul, mul_scalar, slice, sum},
 };
 
 use crate::{
-    loss::{
-        KlDirection, generalized_beta_jsd_loss_chunked,
-        kl_distill_loss_chunked,
-    },
+    loss::{KlDirection, generalized_beta_jsd_loss_chunked, kl_distill_loss_chunked},
     qwen35::{Qwen35Model, SequenceWindow},
     teacher_infer::TeacherForward,
     trainer::cleanup_after_backward,
@@ -21,8 +18,7 @@ use super::{
     EngineOffloadMode, GkdLossConfig, GkdSftAnchor, OpdError, OpdKlMask, OpdStepProfile, Result,
     backward_with_optional_profile, log_free_vram, log_opd_window_trace,
     loss::{kl_distill_loss_for_config, next_token_sft_loss_from_logits},
-    map_qwen35_forward_error, map_teacher_forward_error,
-    record_profile,
+    map_qwen35_forward_error, map_teacher_forward_error, record_profile,
     validation::{validate_logits_shape, validate_loss_value},
     windowing::{kl_logit_range, sequence_windows, sequence_windows_for_range},
 };
@@ -312,15 +308,20 @@ pub(super) fn backward_windowed_gkd<T: TeacherForward + ?Sized>(
         // OOMs at long sequences (the last window processes the entire sequence).
         tape.entries.clear();
         tape.set_enabled(false);
+        let phase_started = Instant::now();
         let teacher_hidden = teacher
             .forward_hidden_device(rollout, positions, store, tape)
             .map_err(|err| map_teacher_forward_error("teacher full-seq hidden", err))?;
+        record_profile(profile, |profile| {
+            profile.teacher_forward_seconds += phase_started.elapsed().as_secs_f64();
+        });
 
         // Run the student forward ONCE on the full sequence (tape enabled for
         // gradient checkpointing). Per-window logits derive from the cached
         // hidden — O(n) total instead of O(n²) growing-prefix re-computation.
         tape.set_enabled(true);
         let rollout_ids: Vec<usize> = rollout.iter().map(|&id| id as usize).collect();
+        let phase_started = Instant::now();
         let student_hidden = student
             .forward_batch_hidden(&rollout_ids, 1, rollout.len(), store, tape)
             .map_err(|err| {
@@ -329,8 +330,20 @@ pub(super) fn backward_windowed_gkd<T: TeacherForward + ?Sized>(
                     crate::qwen35::Qwen35Error::Autograd(err),
                 )
             })?;
+        record_profile(profile, |profile| {
+            profile.student_forward_seconds += phase_started.elapsed().as_secs_f64();
+        });
 
-        let mut total_loss_tensor: Option<TensorId> = None;
+        // Park the trunk tape segment so each window's tape covers only the
+        // head+KL ops, with `student_hidden` as an off-tape leaf. Backward per
+        // window then accumulates d(student_hidden) and the lm_head grads into
+        // the store and frees that window's [window_len, vocab] intermediates
+        // before the next window starts, so peak memory stays window-sized
+        // instead of seq×vocab. Only `entries` moves: `checkpoint_fns` stays
+        // on the tape because entries reference replay closures by absolute
+        // index.
+        let trunk_entries = std::mem::take(&mut tape.entries);
+        let mut kl_loss_total = 0.0f32;
         for window in sequence_windows_for_range(kl_range, window_size)? {
             let window_index = backward_windows + 1;
             let window_started = Instant::now();
@@ -383,43 +396,59 @@ pub(super) fn backward_windowed_gkd<T: TeacherForward + ?Sized>(
             record_profile(profile, |profile| {
                 profile.kl_loss_seconds += phase_started.elapsed().as_secs_f64();
             });
-            let weight =
-                (1.0 - gkd_config.lambda) * (window.len() as f32 / kl_range.len() as f32);
+            let weight = (1.0 - gkd_config.lambda) * (window.len() as f32 / kl_range.len() as f32);
             let weighted = if (weight - 1.0).abs() < f32::EPSILON {
                 kl_loss
             } else {
                 mul_scalar(kl_loss, weight, store, tape)?
             };
-            total_loss_tensor = Some(match total_loss_tensor {
-                Some(prev) => add(prev, weighted, store, tape)?,
-                None => weighted,
+            let loss_value = store.to_host(weighted)?[0];
+            validate_loss_value(loss_value)?;
+            let phase_started = Instant::now();
+            backward_with_optional_profile(weighted, loss_value, store, tape)?;
+            record_profile(profile, |profile| {
+                profile.backward_seconds += phase_started.elapsed().as_secs_f64();
             });
+            let _ = store.free(teacher_logits.tensor_id);
+            tape.entries.clear();
+            kl_loss_total += loss_value;
             backward_windows += 1;
             log_opd_window_trace(
                 "kl",
                 "done",
                 window_index,
                 window_started,
-                format!("loss_accum_windows={backward_windows}"),
+                format!("loss={loss_value:.6e} accum_windows={backward_windows}"),
             );
         }
+        validate_loss_value(kl_loss_total)?;
+        total_loss += kl_loss_total;
+        let _ = store.free(teacher_hidden);
 
-        // Single backward for all windows — the tape holds the full-seq
-        // student forward graph; per-window logits/loss ops are cheap.
-        if let Some(loss_tensor) = total_loss_tensor {
+        // Restore the trunk segment and backward it seeded with the
+        // accumulated d(student_hidden). The seed enters the tape as
+        // sum(student_hidden ⊙ d_hidden), whose backward multiplies d_hidden
+        // by an all-ones grad (1.0 ⊙ x = x in f32), so the gradient injected
+        // into the trunk is bit-identical to seeding d_hidden directly — and
+        // by linearity of backward, identical to one backward of the summed
+        // window loss. The walk frees `student_hidden` (it is a trunk tape
+        // output) and its id may be recycled into a grad tensor within the
+        // same walk, so it must NOT be freed again by id afterwards.
+        tape.entries = trunk_entries;
+        if let Some(hidden_grad) = store.get(student_hidden).and_then(|tensor| tensor.grad) {
+            tape.set_enabled(true);
+            let seed_product = mul(student_hidden, hidden_grad, store, tape)?;
+            let seed_loss = sum(seed_product, store, tape)?;
             let phase_started = Instant::now();
-            let loss_value = store.to_host(loss_tensor)?[0];
-            validate_loss_value(loss_value)?;
-            backward_with_optional_profile(loss_tensor, loss_value, store, tape)?;
+            backward_with_optional_profile(seed_loss, kl_loss_total, store, tape)?;
             record_profile(profile, |profile| {
                 profile.backward_seconds += phase_started.elapsed().as_secs_f64();
             });
-            total_loss += loss_value;
+        } else {
+            let _ = store.free(student_hidden);
         }
 
         cleanup_after_backward(store, tape, student_model_params, keep_extra);
-        let _ = store.free(teacher_hidden);
-        let _ = store.free(student_hidden);
     }
 
     if gkd_config.lambda > 0.0 {

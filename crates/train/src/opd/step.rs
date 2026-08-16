@@ -130,18 +130,22 @@ fn windowed_gkd_step<O: Optimizer, T: TeacherForward + ?Sized>(
             eprintln!("device_synchronize before backward failed (non-fatal): {err}");
         }
         let vram_trace = std::env::var("ARLE_OPD_VRAM_TRACE").is_ok();
-        if vram_trace
-            && let Some((free, total)) = store.backend().device_mem_info()
-        {
-            eprintln!("[opd-vram] before trim: free={}MiB total={}MiB", free >> 20, total >> 20);
+        if vram_trace && let Some((free, total)) = store.backend().device_mem_info() {
+            eprintln!(
+                "[opd-vram] before trim: free={}MiB total={}MiB",
+                free >> 20,
+                total >> 20
+            );
         }
         if let Err(err) = store.backend().trim_memory_pool() {
             eprintln!("trim_memory_pool before backward failed (non-fatal): {err}");
         }
-        if vram_trace
-            && let Some((free, total)) = store.backend().device_mem_info()
-        {
-            eprintln!("[opd-vram] after trim: free={}MiB total={}MiB", free >> 20, total >> 20);
+        if vram_trace && let Some((free, total)) = store.backend().device_mem_info() {
+            eprintln!(
+                "[opd-vram] after trim: free={}MiB total={}MiB",
+                free >> 20,
+                total >> 20
+            );
         }
     }
     // Release the rollout engine's KV pool for the backward — the teacher
@@ -170,7 +174,11 @@ fn windowed_gkd_step<O: Optimizer, T: TeacherForward + ?Sized>(
     if std::env::var("ARLE_OPD_VRAM_TRACE").is_ok()
         && let Some((free, total)) = store.backend().device_mem_info()
     {
-        eprintln!("[opd-vram] before backward: free={}MiB total={}MiB", free >> 20, total >> 20);
+        eprintln!(
+            "[opd-vram] before backward: free={}MiB total={}MiB",
+            free >> 20,
+            total >> 20
+        );
     }
     let loss_result = backward_windowed_gkd(
         rt.student,
@@ -221,12 +229,11 @@ fn windowed_gkd_step<O: Optimizer, T: TeacherForward + ?Sized>(
 
     // Re-acquire the KV pool for the next rollout.
     #[cfg(feature = "cuda")]
-    if kv_pool_released {
-        if let Some(ctx) = rt.infer_rollout {
-            if let Err(err) = ctx.student.ensure_kv_pool() {
-                eprintln!("ensure_kv_pool after backward failed: {err}");
-            }
-        }
+    if kv_pool_released
+        && let Some(ctx) = rt.infer_rollout
+        && let Err(err) = ctx.student.ensure_kv_pool()
+    {
+        eprintln!("ensure_kv_pool after backward failed: {err}");
     }
 
     Ok(OpdStepOutcome {
