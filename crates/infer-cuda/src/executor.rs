@@ -47,6 +47,11 @@ pub(crate) const SUPPORTED_PAGE_SIZE: usize = 16;
 /// the sharded compute saves.
 pub(crate) const CP_PREFILL_MIN_ROWS_PER_RANK: usize = 256;
 
+/// Minimum KV length (tokens) before a decode step head-shards across the
+/// attn_cp group (B2, T3.1). Below this the cp all-reduce costs more than the
+/// halved qkv/KV/GDN traffic saves — keeps short decode a wash.
+pub(crate) const CP_DECODE_MIN_KV_TOKENS: usize = 8192;
+
 /// Recurrent-sidecar snapshot stride in KV pages (8192 tokens), bounding how
 /// much a cross-conversation prefix hit must re-prefill. Every snapshot retains
 /// a full state copy (~150 MB at 27B) until publish, so halving the stride
