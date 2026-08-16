@@ -74,6 +74,10 @@ pub struct TpRuntime {
     attn_tp: TpComm,
     /// Aliases [`TpComm::Single`] when `ep_size == tp_size` (default TP8/EP8).
     moe_ep: TpComm,
+    /// Aliases [`TpComm::Single`] when attn_cp=1 (the default).
+    attn_cp: TpComm,
+    attn_cp_rank: usize,
+    attn_cp_size: usize,
     /// `None` = NCCL everywhere (single rank, `--comm-backend nccl`, or a failed
     /// boot probe/self-test — every degrade logs WARN).
     #[cfg(all(feature = "cuda", feature = "nccl"))]
@@ -125,6 +129,9 @@ impl TpRuntime {
             comm: TpComm::single(),
             attn_tp: TpComm::single(),
             moe_ep: TpComm::single(),
+            attn_cp: TpComm::single(),
+            attn_cp_rank: 0,
+            attn_cp_size: 1,
             #[cfg(all(feature = "cuda", feature = "nccl"))]
             oneshot: None,
         }
@@ -139,6 +146,9 @@ impl TpRuntime {
             comm: TpComm::single(),
             attn_tp: TpComm::single(),
             moe_ep: TpComm::single(),
+            attn_cp: TpComm::single(),
+            attn_cp_rank: 0,
+            attn_cp_size: 1,
             #[cfg(all(feature = "cuda", feature = "nccl"))]
             oneshot: None,
         }
@@ -152,6 +162,9 @@ impl TpRuntime {
             comm,
             attn_tp: TpComm::single(),
             moe_ep: TpComm::single(),
+            attn_cp: TpComm::single(),
+            attn_cp_rank: 0,
+            attn_cp_size: 1,
             #[cfg(all(feature = "cuda", feature = "nccl"))]
             oneshot: None,
         }
@@ -172,7 +185,10 @@ impl TpRuntime {
     pub fn from_env_with_nccl(
         unique_id: cuda_kernels::ffi::nccl::ncclUniqueId,
     ) -> anyhow::Result<Self> {
-        use infer_topo::{MultiAxisConfig, build_attn_tp_groups, build_moe_ep_groups};
+        use infer_topo::{
+            MultiAxisConfig, RankCoord, build_attn_cp_groups, build_attn_tp_groups,
+            build_moe_ep_groups,
+        };
 
         let config = resolve_tp_config_from_env().map_err(|e| anyhow::anyhow!("{e}"))?;
         if config.is_single() {
@@ -189,15 +205,27 @@ impl TpRuntime {
         let cfg = MultiAxisConfig::current_route_from_env_with_defaults(world_size, world_size)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-        // attn_tp then moe_ep, unconditionally in this order on every rank.
+        // attn_tp then moe_ep then attn_cp, unconditionally in this order on every
+        // rank.
         let attn_tp = Self::split_sub_comm(&backend, &build_attn_tp_groups(cfg), rank)?;
         let moe_ep = Self::split_sub_comm(&backend, &build_moe_ep_groups(cfg), rank)?;
+        // attn_cp=1 yields per-rank singleton groups (not the global group), so the
+        // skip must key off `cfg` — still identical on every rank.
+        let attn_cp = if cfg.attn_cp_size == 1 {
+            TpComm::single()
+        } else {
+            Self::split_sub_comm(&backend, &build_attn_cp_groups(cfg), rank)?
+        };
+        let coord = RankCoord::from_world_rank(cfg, rank).map_err(|e| anyhow::anyhow!("{e}"))?;
 
         Ok(Self {
             config,
             comm: TpComm::Nccl(Box::new(backend)),
             attn_tp,
             moe_ep,
+            attn_cp,
+            attn_cp_rank: coord.attn_cp_rank,
+            attn_cp_size: cfg.attn_cp_size,
             #[cfg(all(feature = "cuda", feature = "nccl"))]
             oneshot: None,
         })
@@ -249,6 +277,23 @@ impl TpRuntime {
     #[allow(dead_code)] // T2.3 will consume this
     pub fn moe_ep(&self) -> &TpComm {
         &self.moe_ep
+    }
+
+    #[must_use]
+    #[allow(dead_code)] // T2.b will consume this
+    pub fn attn_cp(&self) -> &TpComm {
+        &self.attn_cp
+    }
+
+    #[must_use]
+    pub fn attn_cp_size(&self) -> usize {
+        self.attn_cp_size
+    }
+
+    #[must_use]
+    #[allow(dead_code)] // T2.b will consume this
+    pub fn attn_cp_rank(&self) -> usize {
+        self.attn_cp_rank
     }
 
     #[must_use]
