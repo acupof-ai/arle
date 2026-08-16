@@ -7,20 +7,21 @@ publish = false
 
 [features]
 default = []
-no-cuda = ["cuda-kernels?/no-cuda"]
+no-cuda = ["cuda-kernels/no-cuda"]
 # Metal backend (Apple Silicon) via mlx-sys C++ bridge. Host Vec<f32> stays
 # authoritative; backend uploads per call, computes `mlx_matmul`, downloads.
 metal = ["dep:mlx-sys"]
 # CUDA backend via cudarc cuBLAS SGEMM. Same per-call upload/download model.
 # PENDING REMOTE CUDA VERIFICATION — user validates on GPU box.
-cuda = ["dep:cudarc", "dep:cuda-kernels", "cuda-kernels/cuda"]
-nccl = ["cuda", "dep:cuda-kernels", "cuda-kernels/nccl"]
+cuda = ["dep:cudarc", "cuda-kernels/cuda"]
+nccl = ["cuda", "cuda-kernels/nccl"]
 safetensors = ["dep:safetensors", "dep:memmap2", "dep:half"]
 
 [dependencies]
 anyhow = "1.0"
 bytemuck = "1"
-cuda-kernels = { path = "../cuda-kernels", optional = true, default-features = false }
+# Always-on: the ring-attention host math (merge forward/adjoint) lives there.
+cuda-kernels = { path = "../cuda-kernels", default-features = false }
 cudarc = { version = "0.19", features = [
     "cuda-version-from-build-system",
     "cublas",

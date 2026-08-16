@@ -21,21 +21,7 @@ pub enum Device {
 
 pub type CausalSdpaHostGradTriplet = (Option<Vec<f32>>, Option<Vec<f32>>, Option<Vec<f32>>);
 
-/// Geometry for one context-parallel ring-attention block op. `num_q_tiles =
-/// batch * num_q_heads`; `q_rows` = this rank's local q length; `blk_len` = the
-/// current ring block's KV length; `q_abs`/`k_abs` = absolute row of q row 0 /
-/// block col 0 for the causal mask. GQA is resolved device-side via
-/// `num_q_heads / num_kv_heads`.
-#[derive(Debug, Clone, Copy)]
-pub struct RingBlockDims {
-    pub num_q_tiles: usize,
-    pub num_q_heads: usize,
-    pub num_kv_heads: usize,
-    pub head_dim: usize,
-    pub q_rows: usize,
-    pub blk_len: usize,
-    pub sm_scale: f32,
-}
+pub use cuda_kernels::ring_attention::RingBlockDims;
 
 #[derive(Debug, Clone, Copy)]
 pub struct CausalSdpaDeviceBackwardArgs<'a> {
