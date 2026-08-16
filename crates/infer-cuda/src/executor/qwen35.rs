@@ -620,6 +620,10 @@ impl Qwen35CudaExecutor {
             max_seq_len,
             mtp_draft_tokens,
         )?;
+        ensure!(
+            model.tp.attn_cp_size() == 1,
+            "attn_cp>1: engine CP prefill not implemented yet (T2.b)"
+        );
         cuda_startup_log(
             "executor.qwen35_model_load",
             model_t0,
