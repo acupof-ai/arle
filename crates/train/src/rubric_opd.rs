@@ -11,7 +11,7 @@
 use std::sync::{Arc, Mutex};
 
 #[cfg(feature = "cuda")]
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, ensure};
 #[cfg(feature = "cuda")]
 use infer_api::{CompletionRequest, InferenceEngine, LoadedInferenceEngine, SamplingParams};
 
@@ -26,6 +26,7 @@ pub enum FlashJudge {
         engine: Arc<Mutex<LoadedInferenceEngine>>,
         max_verdict_tokens: usize,
         offloaded: std::sync::atomic::AtomicBool,
+        reload_failed: std::sync::atomic::AtomicBool,
     },
     Remote {
         endpoint: String,
@@ -53,6 +54,7 @@ impl FlashJudge {
             engine,
             max_verdict_tokens,
             offloaded: std::sync::atomic::AtomicBool::new(false),
+            reload_failed: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -63,16 +65,43 @@ impl FlashJudge {
         if let Self::Local {
             engine, offloaded, ..
         } = self
-            && offloaded.load(std::sync::atomic::Ordering::Acquire)
         {
-            eprintln!("[rubric] reloading judge engine weights");
-            engine
-                .lock()
-                .map_err(|err| anyhow!("Flash judge engine lock poisoned: {err}"))?
-                .reload_engine_weights()?;
-            offloaded.store(false, std::sync::atomic::Ordering::Release);
+            // A failed reload has already consumed the host snapshot, so the
+            // engine can never be made resident again — refuse instead of
+            // judging against half-restored weights.
+            ensure!(
+                !self.reload_failed(),
+                "Flash judge engine reload failed earlier; weights are unrecoverable"
+            );
+            if offloaded.load(std::sync::atomic::Ordering::Acquire) {
+                eprintln!("[rubric] reloading judge engine weights");
+                let reloaded = engine
+                    .lock()
+                    .map_err(|err| anyhow!("Flash judge engine lock poisoned: {err}"))?
+                    .reload_engine_weights();
+                if reloaded.is_err() {
+                    self.mark_reload_failed();
+                }
+                reloaded?;
+                offloaded.store(false, std::sync::atomic::Ordering::Release);
+            }
         }
         Ok(())
+    }
+
+    fn reload_failed(&self) -> bool {
+        match self {
+            Self::Local { reload_failed, .. } => {
+                reload_failed.load(std::sync::atomic::Ordering::Acquire)
+            }
+            Self::Remote { .. } => false,
+        }
+    }
+
+    fn mark_reload_failed(&self) {
+        if let Self::Local { reload_failed, .. } = self {
+            reload_failed.store(true, std::sync::atomic::Ordering::Release);
+        }
     }
 
     pub fn new_remote(endpoint: impl Into<String>, max_verdict_tokens: usize) -> Self {

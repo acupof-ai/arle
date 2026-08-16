@@ -1839,6 +1839,8 @@ pub struct HostMatrixSnapshot {
     data: Vec<bf16>,
     qweight: OptHostBuf<i8>,
     qweight_u8: OptHostBuf<u8>,
+    pristine_fp8_qweight: OptHostBuf<u8>,
+    pristine_fp8_scales: OptHostBuf<f32>,
     qscales: OptHostBuf<bf16>,
     qscale_fp8: OptHostBuf<u8>,
     scale_f32: OptHostBuf<f32>,
@@ -2017,10 +2019,16 @@ impl DeviceMatrix {
             .map_err(|e| anyhow!("offload D2H copy (data) failed: {e}"))?;
         freed += data.len() * std::mem::size_of::<bf16>();
 
+        let (pristine_qweight, pristine_scales) = match self.pristine_fp8.take() {
+            Some((qw, sc)) => (Some(qw), Some(sc)),
+            None => (None, None),
+        };
         let snapshot = HostMatrixSnapshot {
             data,
             qweight: snapshot_opt_slice(ctx, &self.qweight, &mut freed)?,
             qweight_u8: snapshot_opt_slice(ctx, &self.qweight_u8, &mut freed)?,
+            pristine_fp8_qweight: snapshot_opt_slice(ctx, &pristine_qweight, &mut freed)?,
+            pristine_fp8_scales: snapshot_opt_slice(ctx, &pristine_scales, &mut freed)?,
             qscales: snapshot_opt_slice(ctx, &self.qscales, &mut freed)?,
             qscale_fp8: snapshot_opt_slice(ctx, &self.qscale_fp8, &mut freed)?,
             scale_f32: snapshot_opt_slice(ctx, &self.scale_f32, &mut freed)?,
@@ -2097,6 +2105,13 @@ impl DeviceMatrix {
             .map_err(|e| anyhow!("reload H2D copy (data) failed: {e}"))?;
         self.qweight = restore_opt_slice(ctx, &snapshot.qweight)?;
         self.qweight_u8 = restore_opt_slice(ctx, &snapshot.qweight_u8)?;
+        self.pristine_fp8 = match (
+            restore_opt_slice(ctx, &snapshot.pristine_fp8_qweight)?,
+            restore_opt_slice(ctx, &snapshot.pristine_fp8_scales)?,
+        ) {
+            (Some(qw), Some(sc)) => Some((qw, sc)),
+            _ => None,
+        };
         self.qscales = restore_opt_slice(ctx, &snapshot.qscales)?;
         self.qscale_fp8 = restore_opt_slice(ctx, &snapshot.qscale_fp8)?;
         self.scale_f32 = restore_opt_slice(ctx, &snapshot.scale_f32)?;

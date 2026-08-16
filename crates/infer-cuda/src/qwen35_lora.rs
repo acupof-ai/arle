@@ -520,6 +520,22 @@ impl Qwen35Model {
                 "student LoRA layer {layer_idx} carries no projection updates"
             );
 
+            if update.requant_fp8 {
+                // Requant hands the next merge a pristine FP8 base, so that
+                // merge restores the WHOLE matrix and re-applies only the
+                // windows it carries: a dirty row-fused sibling left out of
+                // this update would lose its delta silently.
+                let present: Vec<StudentLoraProjection> =
+                    layer.projections.iter().map(|p| p.projection).collect();
+                for key in self.lora_dirty.iter() {
+                    ensure!(
+                        key.layer_idx != layer_idx || present.contains(&key.projection),
+                        "layer {layer_idx} {}: merged under --lora-merge-fp8 but absent from this \
+                         update; requant needs every dirty projection of a layer in one update",
+                        key.projection.label()
+                    );
+                }
+            }
             for projection in &layer.projections {
                 self.merge_lora_proj(
                     layer_idx,
@@ -564,24 +580,26 @@ impl Qwen35Model {
                     && matrix.quant_scale_cols > 0,
                 "layer {layer_idx} {label}: merge-requant missing block-scale metadata"
             );
+            // Both allocations first: a failure between them would leave a
+            // half-split state that no retry can repair.
+            let merged_qweight = ctx
+                .stream
+                .alloc_zeros::<u8>(matrix.rows * matrix.cols)
+                .map_err(|e| {
+                    anyhow!("layer {layer_idx} {label}: merged qweight alloc failed: {e}")
+                })?;
+            let merged_scales = ctx
+                .stream
+                .alloc_zeros::<f32>(matrix.quant_scale_rows * matrix.quant_scale_cols)
+                .map_err(|e| {
+                    anyhow!("layer {layer_idx} {label}: merged scales alloc failed: {e}")
+                })?;
             matrix.pristine_fp8 = Some((
                 matrix.qweight_u8.take().expect("checked above"),
                 matrix.scale_f32.take().expect("checked above"),
             ));
-            matrix.qweight_u8 = Some(
-                ctx.stream
-                    .alloc_zeros::<u8>(matrix.rows * matrix.cols)
-                    .map_err(|e| {
-                        anyhow!("layer {layer_idx} {label}: merged qweight alloc failed: {e}")
-                    })?,
-            );
-            matrix.scale_f32 = Some(
-                ctx.stream
-                    .alloc_zeros::<f32>(matrix.quant_scale_rows * matrix.quant_scale_cols)
-                    .map_err(|e| {
-                        anyhow!("layer {layer_idx} {label}: merged scales alloc failed: {e}")
-                    })?,
-            );
+            matrix.qweight_u8 = Some(merged_qweight);
+            matrix.scale_f32 = Some(merged_scales);
         }
         {
             let (in_ptr, _gi) = matrix.data.device_ptr(&ctx.stream);

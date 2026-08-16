@@ -176,7 +176,9 @@ __global__ void quantize_bf16_to_fp8_block_scaled_kernel(
         if (threadIdx.x < s) red[threadIdx.x] = fmaxf(red[threadIdx.x], red[threadIdx.x + s]);
         __syncthreads();
     }
-    const float scale = red[0] > 0.0f ? red[0] / 448.0f : 1.0f;
+    // Below this the reciprocal below overflows to inf and every element
+    // would saturate to 448 instead of quantizing to ~0.
+    const float scale = red[0] > 1e-30f ? red[0] / 448.0f : 1.0f;
     if (threadIdx.x == 0) scales[sr * scale_cols + sc] = scale;
 
     const float inv = 1.0f / scale;
