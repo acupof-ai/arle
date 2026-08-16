@@ -8,6 +8,9 @@
 > race found and fixed en route,
 > `docs/experience/errors/2026-08-16-gdr-prefill-smem-race.md`). T3 next;
 > T2/T3 validation gates listed per tranche.
+> T3 revised 2026-08-16 after the engine architecture audit: KV ownership
+> sharding priced as the one seam-level change in the 5D program; CP×quant-KV
+> and CP×spec combination debts made explicit; position vs DP routing stated.
 
 ## Current state (grounded)
 
@@ -17,7 +20,9 @@
 | Training full-attn CP (ring, flash-2 merge, zigzag positions-as-data) | `autograd/src/ops/ring_attention.rs` (850 L), `autograd/src/backend_cuda/ring_attn.rs` (728 L, FA3 glue + NCCL ring) | Verified: 27B cp=2 seq=131072, backward peak 94,175 MiB (2026-08-02/03 wins) |
 | Training linear-attn CP (a2a sequence→head axis) | `autograd/src/ops/linear_attention.rs:366` | Verified same runs; needs `value_heads % cp == 0` (27B: 48) |
 | Training launcher | CLI `cp_size`/`dp_size` (`args.rs:2557`), env `ARLE_TRAIN_{DP,CP}_SIZE` | world = cp×dp, weights replicated (no TP) |
-| Engine CP | — | `attn_cp_size` parses in the mesh (`topology.rs:144`) but has **zero consumers** in `infer-cuda`; engine parallelism is TP-only |
+| Engine CP prefill (replicated-KV) | `executor/qwen35.rs:1124-1180`, `qwen35_attention.rs:1394-1479` (GDN relay) | **T2 accepted 2026-08-16** (1.75× at 128K); prefill-only, every cp rank's pool covers the whole prefix |
+| Engine CP decode | — | Not built (T3) |
+| Engine CP combination matrix | `executor/qwen35.rs:643-644,1025-1029,1989` | Hard mutex today: quant-KV (attn_cp>1 forces bf16), `--kv-recall`, all spec paths (`cp: None`); decode unimplemented |
 
 ## Why the engine needs CP
 
@@ -83,19 +88,96 @@ replicated, which needs no ring:
 - Gate: needle ladder ×3 at cp=2 vs cp=1 envelope, plus prefill wall-clock on
   a 128K prompt (target ≥1.6× at cp=2 on the FA3 path).
 
-### 3. Engine CP decode over sharded KV (T3)
+### 3. Engine CP decode (T3) — phased: B2 head-sharding first, then KV ownership
 
-- Decode q broadcasts to the cp group; each rank computes partial attention
-  over its resident KV shard; partials merge with the same (m, l, out)
-  recurrence (flash-decoding across ranks: one small collective per layer).
-- Must be graph-compatible (decode graph capture is the fast path): the
-  collective is a fixed-shape NCCL all-gather of `[b, h, 1, d]+stats`, captured
-  in the decode graph like the TP all-reduce already is.
-- Engage by threshold: `cp_decode_min_kv_tokens` (default: only when a
-  request's KV exceeds one rank's pool share). Short requests decode on their
-  prefill-owner rank alone — no cross-rank cost.
-- Gate: decode tok/s at 4K (must be a wash — the threshold keeps CP out of the
-  short path) and at 256K KV (the win case), plus needle ladder.
+T3 is a phased program. **T3.1 (B2) is self-contained and ships the 256K gate**;
+T3.2+ are the strategic KV-ownership program. B2 keeps KV replicated, so it does
+not depend on T3.2 and lands first.
+
+#### T3.1 — B2: CP decode = head-sharding across the cp group (ships 256K gate)
+
+The decode regression is not KV capacity. 27B has 16 full-attn layers × 4
+kv_heads × head_dim 256, so 256K paged KV = 16×4×256×2×2B = **17 GB** — fits one
+H20. The regression is that cp=2 cannibalizes attn_tp (world=2: attn_tp 2→1), so
+every rank holds ALL attention heads and doubles qkv/o_proj weight read, KV read,
+attention compute, and GDN.
+
+B2: under CP decode the cp group acts as additional attn_tp ranks. Each rank
+computes 1/(attn_tp×cp) of the attention stack's heads; the cp group all-reduces
+the partial hidden; the existing attn_tp all-reduce then runs (no-op at
+attn_tp=1). Mathematically identical to attn_tp=world decode — recovers the full
+regression. Reuses the attn_tp head-shard machinery; no kernel changes; KV stays
+replicated (zero engine-core invariant breaks).
+
+- Engage: `cp>1 && dspark off && kv_seq_len+1 >= cp_decode_min_kv_tokens`
+  (default 8192, CLI `--cp-decode-min-kv-tokens`). Below threshold decode runs
+  as today — the 4K wash gate.
+- Head subset: q subset = attn_tp shard ÷ cp (`local_q_heads/cp`, offset
+  `cp_rank × local_q_heads/cp`); kv subset = q ÷ GQA. Guards: `local_q_heads %
+  cp == 0`, `local_kv_heads % cp == 0`, linear k/v heads % cp == 0.
+- Full-attn decode: qkv proj sliced to the head subset, attention kernel on the
+  subset, o_proj row-sliced, then cp all-reduce of the partial hidden.
+- GDN decode: recurrent state sharded by cp (`gdr_state_len/cp`, `conv_len/cp`;
+  cp_rank is a stable process property and state/snapshot never cross cp-ranks);
+  decode computes the head subset, cp all-reduce. The prefill relay's
+  terminal-state broadcast scatters head-subsets so decode starts sharded.
+- All-reduce routing: `attn_all_reduce_sum` under CP decode routes over the cp
+  group (fused with attn_tp when attn_tp>1). FFN all-reduce stays global.
+- Graph-compatible: the cp all-reduce is NCCL on the captured stream (same
+  mechanism as the FFN all-reduce already in the decode graph closure).
+- Gate: needle ×3 cp=2 vs cp=1; 4K decode wash; 128K decode recover 43→~60
+  tok/s at world=2; 256K decode win; graph capture active.
+
+#### T3.2 — KV ownership sharding (strategic; 3 load-bearing assumptions)
+
+T3.2 is the seam-level change in the 5D program (2026-08-16 architecture audit).
+It is NOT needed for the 256K gate (T3.1 meets it) — it future-proofs capacity
+past ~512K and quant-KV at 256K. Two pieces of work:
+
+1. **KV ownership sharding.** T2's replicated KV means every rank's pool
+   covers the whole prefix. Sharding ownership breaks three load-bearing
+   assumptions, each with a known fix site:
+   - `KvPool` page identity is per-rank (`infer-seam/src/kv_query.rs:56-58`);
+     sharded KV needs a `(rank, page)` identity or location table.
+   - RadixCache match means "this rank holds the full matched KV"
+     (`infer-core/src/radix.rs:167-181`); sharded KV needs partial-match
+     semantics ("match covers this rank's shard").
+   - Prefix match length has no cross-rank min-reduce today
+     (`infer-core/src/prefix.rs:662-702`); under sharded KV a rank-local match
+     truncation desyncs TP collectives. This min-reduce is a live divergence
+     window under tier pressure even without CP — it is a prerequisite, not
+     T3-specific work.
+2. **Decode merge (T3.3).** Decode q broadcasts to the cp group; each rank computes
+   partial attention over its resident shard; partials merge with the (m, l,
+   out) recurrence (flash-decoding across ranks, one collective per layer).
+   The collective must go on `comm_stream` (used at exactly one site today,
+   `dsv4/prefill.rs:482`) or it serializes against the GEMMs. The one-shot IPC
+   fast path does not cover sub-comms (`tp.rs:432-439`), so the attention AR
+   on the attn_tp sub-comm falls back to NCCL (2.6-3.6× penalty) — measure
+   before committing the decode topology.
+
+Must be graph-compatible: fixed-shape NCCL collectives captured in the decode
+graph like the TP all-reduce.
+
+#### T3.4 — Combination debts T2 guarded rather than solved
+
+- **CP × quant-KV**: `attn_cp>1` forces bf16 today (`executor/qwen35.rs:643-644`).
+  256K is the regime where quantized KV matters most; T3 must decide whether
+  the shard format carries quantized KV (per-rank scales/norms planes,
+  `cuda-kernels/src/paged_kv.rs:1080`) or the mutex stays.
+- **CP × spec**: every spec path hardcodes `cp: None`
+  (`executor/qwen35.rs:1989` et al.) and the verify signature has no CP
+  parameter. Decode-time spec under CP needs cross-rank accepted-length
+  negotiation — no rank sees all positions; the DSv4 `tp_lockstep_accept`
+  broadcast (`dsv4/dspark.rs:84-119`) is the template.
+- **CP × recall**: `--kv-recall` is rejected with `attn_cp>1`
+  (`executor/qwen35.rs:1025-1029`) because rank-local recall scores diverge the
+  cp group's collective schedule.
+
+T3.1 engage by threshold: `cp_decode_min_kv_tokens` (default 8192). Short
+requests decode as today (replicated heads, no cp reduce) — no cross-rank cost.
+T3.1 gate: decode tok/s at 4K (wash) and 256K KV (win), plus needle ladder ×3.
+T3.2+ gates are set with their own designs.
 
 ### 4. Training composition stays, walls get owners (T4)
 
@@ -112,13 +194,32 @@ replicated, which needs no ring:
 - Weight sharding for training (base is frozen + LoRA; replication is correct
   at 27B — revisit only past ~30 GB resident).
 - PP anywhere.
+- SP as an independent axis (reduce-scatter exists in the collective trait,
+  zero callers; decode is memory-bound, not activation-comm-bound — revisit on
+  a measured signature).
 - CP for the diffusion executor family.
+
+## Position in the 5D sequence (2026-08-16 architecture audit)
+
+- TP is complete on the engine side (example-level on the training side). CP —
+  this plan — is the main 256K SLO axis. DP routing (N engine instances + a
+  router above, in infer-server) is the first *new* structure for train/infer
+  unification: the router does not exist today despite `architecture.md:163`
+  claiming DP is clean. It neither blocks nor is blocked by this plan.
+- PP and SP stay non-goals: neither the 31.2 GB target model nor any measured
+  decode signature justifies their cost.
+- Prerequisites that touch CP and should land before or with T3, tracked on
+  their own tickets: prefix-match min-reduce (live divergence window, see T3),
+  hot-path collectives onto `comm_stream`, DeepEP per-layer host stalls
+  (`deepep.rs:376,449,599,659` — four sync points per MoE layer).
 
 ## Tranche order and gates
 
 | Tranche | Content | Acceptance |
 |---|---|---|
 | T1 | Extract shared ring core into `cuda-kernels`; autograd calls it | CP gate battery byte-stable; `cargo test --workspace`; no new public surface beyond the core fns |
-| T2 | Engine prefill CP + KV shard ownership + GDN state relay | needle ×3 cp=2 vs cp=1; 128K prefill ≥1.6× — **accepted 2026-08-16** (1.75×) |
-| T3 | Graph-captured decode merge over sharded KV, thresholded | 4K decode wash; 256K decode win; needle ×3 |
-| T4 | Cleanup (scalar kernel), GDN a2a scaling decision, cp=4 256K curve | dated wins/errors entries |
+| T2 | Engine prefill CP (replicated KV) + GDN state relay | needle ×3 cp=2 vs cp=1; 128K prefill ≥1.6× — **accepted 2026-08-16** (1.75×) |
+| T3.1 | B2: CP decode head-sharding across cp group (replicated KV) | needle ×3 cp=2 vs cp=1; 4K decode wash; 128K decode recover 43→~60 at world=2; 256K decode win; graph active |
+| T3.2 | KV ownership sharding (3 seam-level assumptions, §3.2) + decode merge on comm_stream (§3.3) | capacity past 512K; 256K quant-KV; dated wins entry |
+| T3.4 | Settle CP×quant-KV, CP×spec, CP×recall (§3.4) | per-debt gates |
+| T4 | Cleanup (scalar kernel), GDN a2a scaling decision, cp=4 256K curve; GDR smem-race fix (1f7948070) measured-after pod re-gate before T3 baselines | dated wins/errors entries |
