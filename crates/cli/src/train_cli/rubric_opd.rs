@@ -561,12 +561,8 @@ pub(super) fn run_rubric_opd_impl(args: TrainRubricOpdArgs) -> Result<()> {
             eprintln!("[rubric-opd] device-pool trim before LoRA sync failed: {err}");
         }
         log_opd_vram("rubric post-trim", &train_backend);
-        // The rollout KV pool was re-acquired in run_rubric_rounds' Phase D, but
-        // the LoRA re-merge needs headroom for the per-layer BF16 promotion
-        // (FP8 base stays resident as keepalive for the share-frozen-base
-        // student alias, so peak = FP8 + BF16 ≈ 3× base bytes). The KV pool is
-        // dead during the merge — release it and re-acquire after, symmetric
-        // with the agent-OPD sync_and_restore_engines pattern.
+        // KV pool is dead during the LoRA merge; release for BF16 promotion
+        // headroom and re-acquire after. (inference scratch was freed in phase B.)
         if let Err(err) = infer_student.release_kv_pool() {
             eprintln!("[rubric-opd] release KV pool before LoRA sync failed: {err}");
         }
