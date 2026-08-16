@@ -366,6 +366,7 @@ impl Qwen35Model {
                         o_proj: loader.load_matrix_quant_aware(&ctx, &full.o_proj)?,
                         q_norm: loader.load_vec(&ctx, &full.q_norm)?,
                         k_norm: loader.load_vec(&ctx, &full.k_norm)?,
+                        decode: None,
                     }))
                 }
                 Qwen35AttentionTensorNames::Full(full) => Qwen35Attn::Full(Box::new(FullAttn {
@@ -411,6 +412,7 @@ impl Qwen35Model {
                     // full-attention prep kernel — replicated.
                     q_norm: loader.load_vec(&ctx, &full.q_norm)?,
                     k_norm: loader.load_vec(&ctx, &full.k_norm)?,
+                    decode: None,
                 })),
                 Qwen35AttentionTensorNames::Linear(lin) if attn_cfg.is_single() => {
                     Qwen35Attn::Linear(Box::new(LinearAttn {
@@ -429,6 +431,7 @@ impl Qwen35Model {
                         a_log: loader.load_f32_vec(&ctx, &lin.a_log)?,
                         norm_weight: loader.load_f32_vec(&ctx, &lin.norm)?,
                         out_proj: loader.load_matrix_quant_aware(&ctx, &lin.out_proj)?,
+                        decode: None,
                     }))
                 }
                 Qwen35AttentionTensorNames::Linear(lin) => {
@@ -507,6 +510,7 @@ impl Qwen35Model {
                             infer_topo::ParallelLinearKind::Row,
                             &attn_cfg,
                         )?,
+                        decode: None,
                     }))
                 }
             };
@@ -577,6 +581,74 @@ impl Qwen35Model {
                 "qwen35.layer.total",
                 layer_t0,
                 format_args!("layer={layer_idx} moe={}", m.is_moe_layer(layer_idx)),
+            );
+        }
+        // B2 CP decode (T3.1): a second, finer-sharded copy of the attention
+        // weights (1/(attn_tp x cp) heads per rank) for the decode head-shard.
+        // The primary load above is untouched; when cp=1 the gate is false and
+        // `decode` stays None, so the baseline is byte-identical.
+        let cp_size = tp.attn_cp_size();
+        if cp_size > 1
+            && local_q_heads.is_multiple_of(cp_size)
+            && local_kv_heads.is_multiple_of(cp_size)
+            && local_linear_k_heads.is_multiple_of(cp_size)
+            && local_linear_v_heads.is_multiple_of(cp_size)
+        {
+            // decode_rank = attn_tp_rank*cp + attn_cp_rank enumerates the
+            // attn_tp x cp product (attn_dp=1 under CP) as the head-block index
+            // each rank computes: its attn_tp shard's cp sub-block, contiguous.
+            let decode_attn_cfg = infer_topo::TpConfig {
+                world_size: attn_cfg.world_size * cp_size,
+                rank: attn_cfg.rank * cp_size + tp.attn_cp_rank(),
+            };
+            let decode_q = local_q_heads / cp_size;
+            let decode_kv = local_kv_heads / cp_size;
+            let decode_lk = local_linear_k_heads / cp_size;
+            let decode_lv = local_linear_v_heads / cp_size;
+            debug_assert_eq!(
+                m.linear_num_key_heads / decode_attn_cfg.world_size,
+                decode_lk
+            );
+            let decode_t0 = Instant::now();
+            for (layer_idx, layer) in layers.iter_mut().enumerate() {
+                let names = m.layer_tensor_names(layer_idx);
+                match (&mut layer.attn, &names.attention) {
+                    (Qwen35Attn::Full(full), Qwen35AttentionTensorNames::Full(fnames)) => {
+                        full.decode = Some(load_full_attn_decode(
+                            &loader,
+                            &ctx,
+                            fnames,
+                            &m,
+                            &decode_attn_cfg,
+                            decode_q,
+                            decode_kv,
+                        )?);
+                    }
+                    (Qwen35Attn::Linear(lin), Qwen35AttentionTensorNames::Linear(lnames)) => {
+                        lin.decode = Some(load_linear_attn_decode(
+                            &loader,
+                            &ctx,
+                            lnames,
+                            &m,
+                            &decode_attn_cfg,
+                            decode_lv,
+                            &lin.conv1d_weight,
+                            local_linear_k_heads,
+                            decode_lk,
+                            tp.attn_cp_rank(),
+                        )?);
+                    }
+                    _ => unreachable!("layer attn kind matches its tensor names"),
+                }
+            }
+            crate::executor::cuda_startup_log(
+                "qwen35.cp_decode_weights",
+                decode_t0,
+                format_args!(
+                    "cp={cp_size} decode_world={} decode_q={decode_q} decode_kv={decode_kv} \
+                     decode_lv={decode_lv}",
+                    decode_attn_cfg.world_size
+                ),
             );
         }
         let tail_t0 = Instant::now();
@@ -952,6 +1024,120 @@ fn load_linear_qkv_sharded(
         .map_err(|e| anyhow!("upload sharded fused qkv {name}: {e}"))
 }
 
+/// B2 CP decode subset of a full-attention layer: the q/k/v rows and o_proj
+/// cols for this rank's 1/(attn_tp x cp) head block, via the same quant-aware
+/// sharded path as the primary TP load (W8A16/Marlin preserved).
+fn load_full_attn_decode(
+    loader: &SafetensorLoader,
+    ctx: &DeviceContext,
+    full: &qwen35_spec::Qwen35FullAttentionTensorNames,
+    m: &Qwen35Config,
+    decode_cfg: &TpConfig,
+    decode_q: usize,
+    decode_kv: usize,
+) -> Result<FullAttnDecode> {
+    let head_spec =
+        |name: &str, local_rows: usize, block: usize| -> Result<infer_topo::ShardingSpec> {
+            let total = loader.logical_rows(name)?;
+            Ok(infer_topo::ShardingSpec {
+                offset: block * local_rows,
+                size: local_rows,
+                total,
+            })
+        };
+    // The engage guard (local_kv % cp == 0) puts the decode world in the KV-shard
+    // regime, so kv_block == decode_cfg.rank; kv_load_block_index is the robust form.
+    let kv_block = infer_topo::kv_load_block_index(m.num_key_value_heads, decode_cfg)?;
+    let q_spec = head_spec(&full.q_proj, decode_q * m.head_dim * 2, decode_cfg.rank)?;
+    let k_spec = head_spec(&full.k_proj, decode_kv * m.head_dim, kv_block)?;
+    let v_spec = head_spec(&full.v_proj, decode_kv * m.head_dim, kv_block)?;
+    let qkv_proj = loader.load_matrices_row_fused(
+        ctx,
+        &[
+            (full.q_proj.as_str(), Some(q_spec)),
+            (full.k_proj.as_str(), Some(k_spec)),
+            (full.v_proj.as_str(), Some(v_spec)),
+        ],
+    )?;
+    let o_proj = loader.load_matrix_sharded_quant_aware(
+        ctx,
+        &full.o_proj,
+        infer_topo::ParallelLinearKind::Row,
+        decode_cfg,
+    )?;
+    Ok(FullAttnDecode { qkv_proj, o_proj })
+}
+
+/// B2 CP decode subset of a linear-attention layer: the qkvz/ba rows,
+/// out_proj cols, and a compact `[qkv_dim', K]` conv1d weight for this rank's
+/// 1/(attn_tp x cp) v-head block. dt_bias / a_log are head-indexed by the
+/// decode kernel, which offsets into the primary buffers, so they need no
+/// second copy; the conv weight's subset channels are three disjoint blocks,
+/// so it gets a compact copy.
+#[allow(clippy::too_many_arguments)]
+fn load_linear_attn_decode(
+    loader: &SafetensorLoader,
+    ctx: &DeviceContext,
+    lin: &qwen35_spec::Qwen35LinearAttentionTensorNames,
+    m: &Qwen35Config,
+    decode_cfg: &TpConfig,
+    decode_lv: usize,
+    full_conv1d: &DeviceVec,
+    local_lk: usize,
+    decode_lk: usize,
+    cp_rank: usize,
+) -> Result<LinearAttnDecode> {
+    let qkv = load_linear_qkv_sharded(loader, ctx, &lin.in_proj_qkv, m, decode_cfg)?;
+    let z = loader.load_qkv_head_sharded_quant_aware(
+        ctx,
+        &lin.in_proj_z,
+        decode_lv,
+        m.linear_value_head_dim,
+        decode_cfg.rank,
+    )?;
+    let in_proj_qkvz = DeviceMatrix::fuse_rows(ctx, &qkv, &z)
+        .map_err(|e| anyhow!("fuse CP-decode in_proj_qkv + in_proj_z: {e}"))?;
+    let b = loader.load_qkv_head_sharded(ctx, &lin.in_proj_b, decode_lv, 1, decode_cfg.rank)?;
+    let a = loader.load_qkv_head_sharded(ctx, &lin.in_proj_a, decode_lv, 1, decode_cfg.rank)?;
+    let in_proj_ba = DeviceMatrix::fuse_rows(ctx, &b, &a)?;
+    let out_proj = loader.load_matrix_sharded_quant_aware(
+        ctx,
+        &lin.out_proj,
+        infer_topo::ParallelLinearKind::Row,
+        decode_cfg,
+    )?;
+    // Compact conv weight: the subset's q/k/v channel blocks are disjoint in
+    // the primary `[local_qkv, K]` weight, so three D2D copies restack them
+    // into `[qkv_dim', K]` (channel-major, each channel's K rows contiguous).
+    let (kd, vd, k) = (
+        m.linear_key_head_dim,
+        m.linear_value_head_dim,
+        m.linear_conv_kernel_dim,
+    );
+    let qk_ch = decode_lk * kd;
+    let v_ch = decode_lv * vd;
+    let mut conv1d_weight = DeviceVec::zeros(ctx, 2 * qk_ch * k + v_ch * k)?;
+    let copies: [(usize, usize, usize); 3] = [
+        (cp_rank * qk_ch, 0, qk_ch),
+        (local_lk * kd + cp_rank * qk_ch, qk_ch, qk_ch),
+        (2 * local_lk * kd + cp_rank * v_ch, 2 * qk_ch, v_ch),
+    ];
+    for (src_ch, dst_ch, cnt) in copies {
+        ctx.stream
+            .memcpy_dtod(
+                &full_conv1d.data.slice(src_ch * k..(src_ch + cnt) * k),
+                &mut conv1d_weight.data.slice_mut(dst_ch * k..(dst_ch + cnt) * k),
+            )
+            .map_err(|e| anyhow!("compact B2 conv1d weight copy failed: {e}"))?;
+    }
+    Ok(LinearAttnDecode {
+        in_proj_qkvz,
+        in_proj_ba,
+        out_proj,
+        conv1d_weight,
+    })
+}
+
 fn load_conv1d_sharded(
     loader: &SafetensorLoader,
     ctx: &DeviceContext,
@@ -1066,6 +1252,7 @@ fn load_qwen35_mtp_head(
         o_proj: loader.load_matrix_quant_aware(ctx, &full.o_proj)?,
         q_norm: loader.load_vec(ctx, &full.q_norm)?,
         k_norm: loader.load_vec(ctx, &full.k_norm)?,
+        decode: None,
     }));
     let (mlp, moe) = if m.is_moe() {
         let moe = loader.load_moe_layer_experts(

@@ -41,6 +41,35 @@ impl Qwen35Model {
         self.config.head_dim == 256 && qwen35_fa3_enabled(&self.ctx)
     }
 
+    /// B2 CP decode (T3.1): build the head-shard handle when the cp group can
+    /// divide every attention head count evenly. `None` when cp=1 or a head
+    /// count is indivisible — decode then runs replicated, as today.
+    pub(crate) fn cp_decode_handle(&self) -> Option<crate::qwen35::Qwen35CpDecode> {
+        let cp_size = self.tp.attn_cp_size();
+        if cp_size <= 1 {
+            return None;
+        }
+        if !self.local_q_heads.is_multiple_of(cp_size)
+            || !self.local_kv_heads.is_multiple_of(cp_size)
+            || !self.local_linear_k_heads.is_multiple_of(cp_size)
+            || !self.local_linear_v_heads.is_multiple_of(cp_size)
+        {
+            log::info!(
+                "CP decode disabled: a head count is indivisible by cp={cp_size} \
+                 (q={} kv={} lin_k={} lin_v={})",
+                self.local_q_heads,
+                self.local_kv_heads,
+                self.local_linear_k_heads,
+                self.local_linear_v_heads
+            );
+            return None;
+        }
+        Some(crate::qwen35::Qwen35CpDecode {
+            cp_size,
+            cp_rank: self.tp.attn_cp_rank(),
+        })
+    }
+
     pub(crate) fn decode_graph_unsupported_reason(&self) -> Option<&'static str> {
         let has_moe = self.layers.iter().any(|l| l.moe.is_some());
         if !has_moe {
@@ -279,6 +308,7 @@ impl Qwen35Model {
                                 },
                                 linear_idx,
                                 linear,
+                                None,
                                 None,
                                 attn_out,
                             )
@@ -520,7 +550,8 @@ impl Qwen35Model {
                         b,
                         || {
                             self.full_attention_paged(
-                                full_attn, normed, full_idx, pool, meta, None, full, attn_out, None,
+                                full_attn, normed, full_idx, pool, meta, None, None, full,
+                                attn_out, None,
                             )
                         },
                     )?;
@@ -547,6 +578,7 @@ impl Qwen35Model {
                                 },
                                 linear_idx,
                                 linear,
+                                None,
                                 None,
                                 attn_out,
                             )

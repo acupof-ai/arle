@@ -83,6 +83,27 @@ pub(crate) struct Qwen35RecallForward<'a> {
     /// forward's token/residual buffers stay full-chunk, and each attention
     /// layer computes only the slice (T2.b). `None` everywhere else.
     pub(crate) cp: Option<Qwen35CpPrefill>,
+    /// `Some` = B2 CP decode (T3.1): the cp group acts as additional attn_tp
+    /// ranks — each rank computes 1/cp of its attn_tp head shard and the
+    /// partial hidden is reduced over the global comm (attn_dp=1 under CP, so
+    /// attn_tp×cp == world). `None` on prefill and short-KV decode.
+    pub(crate) cp_decode: Option<Qwen35CpDecode>,
+}
+
+/// Per-step CP decode geometry (B2, T3.1), built once in the executor when a
+/// decode step's KV is long enough to amortize the cp all-reduce.
+pub(crate) struct Qwen35CpDecode {
+    pub(crate) cp_size: usize,
+    pub(crate) cp_rank: usize,
+}
+
+impl Qwen35CpDecode {
+    /// This rank's head subset `[off, off+cnt)` within a layer's `local`
+    /// heads (the attn_tp shard). Engage guards `local % cp_size == 0`.
+    pub(crate) fn subset(&self, local: usize) -> (usize, usize) {
+        let cnt = local / self.cp_size;
+        (self.cp_rank * cnt, cnt)
+    }
 }
 
 /// Per-chunk CP prefill geometry, built once in the executor. The chunk's rows

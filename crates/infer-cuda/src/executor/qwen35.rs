@@ -266,25 +266,14 @@ impl Qwen35CudaExecutor {
         let periodic = std::mem::take(&mut self.periodic_boundary_snapshots[slot]);
         let boundary = tokens.len().saturating_sub(1) / SUPPORTED_PAGE_SIZE * SUPPORTED_PAGE_SIZE;
         let pending = self.prefill_boundary_snapshot[slot].take();
-        let (mat_len, snap) = match pending {
-            Some((pos, snap)) if pos == boundary && boundary > 0 => (pos, snap),
-            _ => {
-                // Page-align so the capture key equals restore's matched_len.
-                let mat_len = matched_len
-                    .min(self.slots[slot].seq_len())
-                    .min(tokens.len())
-                    / SUPPORTED_PAGE_SIZE
-                    * SUPPORTED_PAGE_SIZE;
-                if mat_len == 0 {
-                    return Ok(());
-                }
-                (
-                    mat_len,
-                    self.slots[slot].snapshot_recurrent(&self.model.ctx)?,
-                )
-            }
-        };
-        let key = crate::qwen35::hash_prefix_tokens(&tokens[..mat_len]);
+        let mat_len = matched_len
+            .min(self.slots[slot].seq_len())
+            .min(tokens.len())
+            / SUPPORTED_PAGE_SIZE
+            * SUPPORTED_PAGE_SIZE;
+        if mat_len == 0 {
+            return Ok(());
+        }
         // Periodic sidecars for a future cross-conversation restore, each keyed at its
         // exact snapshot position. Full-attn KV is not in the blob: restore mirrors the
         // radix prefix's own device pages.
@@ -295,8 +284,20 @@ impl Qwen35CudaExecutor {
             let pkey = crate::qwen35::hash_prefix_tokens(&tokens[..pos]);
             self.store_sidecar_blob(pos, pkey, psnap.to_bytes(), prefix_pages);
         }
-
-        self.store_sidecar_blob(mat_len, key, snap.to_bytes(), prefix_pages);
+        // The L* prefill snapshot (full pair) is always restorable. A fresh
+        // snapshot on a B2-live slot is not: the live state is the 1/cp decode
+        // subset and the full pair is frozen at the scatter point, so a
+        // tail-prefill resume would advance a stale full pair. Skip it; the
+        // prefix recomputes on a future hit.
+        let snap = match pending {
+            Some((pos, snap)) if pos == boundary && boundary > 0 => Some(snap),
+            _ if self.slots[slot].decode_recurrent_live => None,
+            _ => Some(self.slots[slot].snapshot_recurrent(&self.model.ctx)?),
+        };
+        if let Some(snap) = snap {
+            let key = crate::qwen35::hash_prefix_tokens(&tokens[..mat_len]);
+            self.store_sidecar_blob(mat_len, key, snap.to_bytes(), prefix_pages);
+        }
         Ok(())
     }
 
@@ -1187,6 +1188,7 @@ impl Qwen35CudaExecutor {
             meta: &meta,
             layer0_query: None,
             cp,
+            cp_decode: None,
         };
         let Some(ds) = dspark.as_mut() else {
             return model.forward_tokens_recall(
@@ -1271,6 +1273,14 @@ impl Qwen35CudaExecutor {
             let pool = self.full_attn_kv.as_ref().expect("full_attn_kv present");
             crate::loader::PageMeta::for_slot(&self.model.ctx, pool, slot, row.kv_seq_len, 1)?
         };
+        // B2 CP decode (T3.1): head-shard across the cp group once the KV is
+        // long enough to amortize the cp all-reduce. DSpark taps need the full
+        // head set on every rank, like prefill CP.
+        let cp_decode = if self.dspark.is_none() && row.kv_seq_len + 1 >= CP_DECODE_MIN_KV_TOKENS {
+            self.model.cp_decode_handle()
+        } else {
+            None
+        };
         let Self {
             model,
             slots,
@@ -1284,6 +1294,7 @@ impl Qwen35CudaExecutor {
             meta: &meta,
             layer0_query: None,
             cp: None,
+            cp_decode,
         };
         model.forward_tokens_recall(
             &mut slots[slot],
@@ -1373,6 +1384,7 @@ impl Qwen35CudaExecutor {
                 meta: &meta,
                 layer0_query: None,
                 cp: None,
+                cp_decode: None,
             };
             let (logits, dims, hidden) = model.forward_tokens_with_hidden(
                 &mut slots[slot],
@@ -1513,6 +1525,7 @@ impl Qwen35CudaExecutor {
                     meta: meta.as_ref().expect("paged (gated)"),
                     layer0_query: None,
                     cp: None,
+                    cp_decode: None,
                 });
             model.spec_step(
                 &mut slots[slot],
@@ -1601,6 +1614,7 @@ impl Qwen35CudaExecutor {
             meta: &meta,
             layer0_query: None,
             cp: None,
+            cp_decode: None,
         };
         let ds = dspark.as_mut().expect("dspark warm without dspark");
         // Gap (whole-slot promote / restored prefix): rebase and rebuild the
@@ -1987,6 +2001,7 @@ impl Qwen35CudaExecutor {
             meta: &meta,
             layer0_query: None,
             cp: None,
+            cp_decode: None,
         };
         ds.taps.prepare(
             ds.head.target_layer_ids(),
@@ -2051,6 +2066,7 @@ impl Qwen35CudaExecutor {
                 meta: &meta,
                 layer0_query: Some(Vec::new()),
                 cp: None,
+                cp_decode: None,
             };
             let token = model.forward_tokens_recall(
                 &mut slots[slot],
@@ -2214,6 +2230,7 @@ impl Qwen35CudaExecutor {
             meta: &meta,
             layer0_query: None,
             cp: None,
+            cp_decode: None,
         };
         model.forward_tokens_recall(
             &mut slots[slot],
@@ -2443,6 +2460,7 @@ impl Qwen35CudaExecutor {
             meta,
             layer0_query: None,
             cp: None,
+            cp_decode: None,
         };
         let run = state.run_or_capture(|| {
             model.forward_decode_step_paged_captured(slot_state, ws, row.kv_seq_len, &mut rc)
@@ -3192,6 +3210,7 @@ impl Qwen35CudaExecutor {
                         meta: &meta,
                         layer0_query: None,
                         cp: None,
+                        cp_decode: None,
                     };
                     model.forward_token_logits_full(
                         &mut slot,
@@ -3265,6 +3284,7 @@ impl Qwen35CudaExecutor {
                         meta: &meta,
                         layer0_query: None,
                         cp: None,
+                        cp_decode: None,
                     };
                     model.forward_training_taps(
                         &mut slot,

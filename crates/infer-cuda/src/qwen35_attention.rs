@@ -14,6 +14,17 @@ pub(crate) struct FullAttn {
     pub(crate) o_proj: DeviceMatrix,
     pub(crate) q_norm: DeviceVec,
     pub(crate) k_norm: DeviceVec,
+    /// B2 CP decode: 1/(attn_tp x cp) head subset, loaded only when cp>1.
+    /// Stays resident for the serving lifetime; the OPD offload snapshot runs
+    /// cp=1 and never sees it.
+    pub(crate) decode: Option<FullAttnDecode>,
+}
+
+/// B2 CP decode weight subset: the q/k/v rows and o_proj cols for this rank's
+/// 1/(attn_tp x cp) head block, same quant format as the primary sharded load.
+pub(crate) struct FullAttnDecode {
+    pub(crate) qkv_proj: DeviceMatrix,
+    pub(crate) o_proj: DeviceMatrix,
 }
 
 pub(crate) struct LinearAttn {
@@ -28,6 +39,32 @@ pub(crate) struct LinearAttn {
     /// Broadcast across heads; replicated under TP.
     pub(crate) norm_weight: CudaSlice<f32>,
     pub(crate) out_proj: DeviceMatrix,
+    /// B2 CP decode: 1/(attn_tp x cp) head subset, loaded only when cp>1.
+    /// dt_bias/a_log are offset into the primary buffers by the decode kernel
+    /// (head-indexed), so they need no second copy; the conv weight's subset
+    /// channels are three disjoint blocks, so it gets a compact copy.
+    pub(crate) decode: Option<LinearAttnDecode>,
+}
+
+/// B2 CP decode weight subset: the qkvz/ba rows, out_proj cols, and the compact
+/// `[qkv_dim', K]` conv weight for this rank's 1/(attn_tp x cp) v-head block,
+/// same quant format as the primary.
+pub(crate) struct LinearAttnDecode {
+    pub(crate) in_proj_qkvz: DeviceMatrix,
+    pub(crate) in_proj_ba: DeviceMatrix,
+    pub(crate) out_proj: DeviceMatrix,
+    pub(crate) conv1d_weight: DeviceVec,
+}
+
+/// B2 CP decode geometry for one linear layer's recurrent advance: the subset
+/// dims plus the v-head offset into the primary dt_bias / a_log buffers.
+#[derive(Clone, Copy)]
+pub(crate) struct LinearDecodeGeom {
+    qkv_dim: usize,
+    z_dim: usize,
+    k_heads: usize,
+    v_heads: usize,
+    v_off: usize,
 }
 
 impl Qwen35Model {
@@ -350,14 +387,33 @@ impl Qwen35Model {
         pool: &PagedKVPool,
         meta: &crate::loader::PageMeta,
         cp: Option<&Qwen35CpPrefill>,
+        cp_decode: Option<&Qwen35CpDecode>,
         fw: &mut FullAttnScratch,
         out: &mut HiddenStates,
         layer0_query: Option<&mut Vec<f32>>,
     ) -> Result<()> {
         let c = &self.config;
-        let q_dim = self.local_full_attn_q_dim();
-        let kv_dim = self.local_full_attn_kv_dim();
-        let q_proj_dim = self.local_full_attn_q_proj_dim();
+        // One q row per batch element is the decode kernel's contract.
+        let decode = meta.seq_len == 1;
+        // B2: cp ranks shard the attn_tp heads via model-load subset weights.
+        let b2 = decode && cp_decode.is_some();
+        let (qkv_proj, o_proj): (&DeviceMatrix, &DeviceMatrix) = if b2 {
+            let d = attn
+                .decode
+                .as_ref()
+                .expect("B2 decode weights present when cp_decode active");
+            (&d.qkv_proj, &d.o_proj)
+        } else {
+            (&attn.qkv_proj, &attn.o_proj)
+        };
+        let (q_heads, kv_heads) = if b2 {
+            (self.decode_q_heads(), self.decode_kv_heads())
+        } else {
+            (self.local_q_heads, self.local_kv_heads)
+        };
+        let q_dim = q_heads * c.head_dim;
+        let kv_dim = kv_heads * c.head_dim;
+        let q_proj_dim = q_heads * c.head_dim * 2;
         let sm_scale = 1.0f32 / (c.head_dim as f32).sqrt();
         let stride_page = pool.kv_dim * pool.page_size;
 
@@ -408,8 +464,6 @@ impl Qwen35Model {
             "Qwen3.6 paged full attention: page table covers {} query tokens != {rows} rows",
             meta.total_q
         );
-        // One q row per batch element is the decode kernel's contract.
-        let decode = meta.seq_len == 1;
         let qkv_fused = qkv_fused.get(&self.ctx, q_proj_dim + 2 * kv_dim, rows)?;
         let q_full = q_full.get(&self.ctx, q_proj_dim, rows)?;
         let k_batch = k_batch.get(&self.ctx, kv_dim, rows)?;
@@ -420,7 +474,7 @@ impl Qwen35Model {
             Some(full_idx),
             rows,
             || {
-                gemm_batch(&self.ctx, &attn.qkv_proj, normed, qkv_fused)?;
+                gemm_batch(&self.ctx, qkv_proj, normed, qkv_fused)?;
                 split_qkv(&self.ctx, qkv_fused, q_full, k_batch, v_batch)?;
                 Ok(())
             },
@@ -429,8 +483,25 @@ impl Qwen35Model {
         let q_prepped = q_prepped.get(&self.ctx, q_dim, rows)?;
         let attn_out = attn_heads.get(&self.ctx, q_dim, rows)?;
 
-        let k_pool_ptr = pool.k_ptr(full_idx, &self.ctx.stream);
-        let v_pool_ptr = pool.v_ptr(full_idx, &self.ctx.stream);
+        // B2: history pages hold every cp rank's KV (prefill keeps the pool
+        // replicated); this rank's subset lives at its natural head offset, so
+        // shift the pool base for both the prep write and the attention read.
+        let (k_pool_ptr, v_pool_ptr) = if b2 {
+            let (kv_off, _) = cp_decode
+                .expect("b2 ⇒ cp_decode present")
+                .subset(self.local_kv_heads);
+            let off =
+                (kv_off * pool.page_size * c.head_dim * std::mem::size_of::<ffi::Half>()) as u64;
+            (
+                pool.k_ptr(full_idx, &self.ctx.stream) + off,
+                pool.v_ptr(full_idx, &self.ctx.stream) + off,
+            )
+        } else {
+            (
+                pool.k_ptr(full_idx, &self.ctx.stream),
+                pool.v_ptr(full_idx, &self.ctx.stream),
+            )
+        };
 
         {
             let (qf_ptr, _g0) = q_full.data.device_ptr(&self.ctx.stream);
@@ -458,6 +529,9 @@ impl Qwen35Model {
                         // prefix sums, so each launch stays inside its row.
                         unsafe {
                             if decode {
+                                // B2: k_pool_ptr/v_pool_ptr are offset to this
+                                // rank's head block, so the subset K/V lands at
+                                // its natural offset in the full-head pool.
                                 ffi::decode_prep_paged_hd256_cuda(
                                     qf_ptr as *const ffi::Half,
                                     qp_ptr as *mut ffi::Half,
@@ -473,8 +547,8 @@ impl Qwen35Model {
                                     kv_indices_ptr as *const i32,
                                     kv_indptr_ptr as *const i32,
                                     last_page_len_ptr as *const i32,
-                                    self.local_q_heads as i32,
-                                    self.local_kv_heads as i32,
+                                    q_heads as i32,
+                                    kv_heads as i32,
                                     pool.page_size as i32,
                                     stride_page as i32,
                                     meta.batch as i32,
@@ -684,9 +758,7 @@ impl Qwen35Model {
                                         0 => self
                                             .ctx
                                             .sm_count()
-                                            .div_ceil(
-                                                meta.batch.max(1) * self.local_kv_heads.max(1),
-                                            )
+                                            .div_ceil(meta.batch.max(1) * kv_heads.max(1))
                                             .max(FA3_DECODE_SPLITS_FLOOR)
                                             .clamp(2, 256),
                                         n => n,
@@ -694,7 +766,7 @@ impl Qwen35Model {
                                 } else {
                                     1
                                 };
-                                let accum_rows = self.local_q_heads * meta.total_q;
+                                let accum_rows = q_heads * meta.total_q;
                                 let lse = fa3_lse.get(&self.ctx, accum_rows)?;
                                 let oaccum =
                                     fa3_oaccum.get(&self.ctx, splits * accum_rows * c.head_dim)?;
@@ -726,14 +798,14 @@ impl Qwen35Model {
                                     total_q: meta.total_q as i32,
                                     seqlen_q: meta.seq_len as i32,
                                     seqlen_k: meta.max_kv_len() as i32,
-                                    num_heads: self.local_q_heads as i32,
-                                    num_heads_k: self.local_kv_heads as i32,
+                                    num_heads: q_heads as i32,
+                                    num_heads_k: kv_heads as i32,
                                     head_dim: c.head_dim as i32,
-                                    q_row_stride: (self.local_q_heads * c.head_dim) as i64,
+                                    q_row_stride: (q_heads * c.head_dim) as i64,
                                     // HND pool [page, h_k, page_size, d].
                                     k_row_stride: head_dim,
                                     v_row_stride: head_dim,
-                                    o_row_stride: (self.local_q_heads * c.head_dim) as i64,
+                                    o_row_stride: (q_heads * c.head_dim) as i64,
                                     q_head_stride: head_dim,
                                     k_head_stride: pool.page_size as i64 * head_dim,
                                     v_head_stride: pool.page_size as i64 * head_dim,
@@ -810,16 +882,16 @@ impl Qwen35Model {
                                 // (18-arg BF16).
                                 let kernel = ffi::resolve_paged_attn_v1(
                                     c.head_dim as u32,
-                                    self.local_q_heads as u32,
-                                    self.local_kv_heads as u32,
+                                    q_heads as u32,
+                                    kv_heads as u32,
                                     phase,
                                 )
                                 .ok_or_else(|| {
                                     anyhow!(
                                         "no HD256 paged {} kernel for q{}_kv{}",
                                         if decode { "decode" } else { "prefill" },
-                                        self.local_q_heads,
-                                        self.local_kv_heads
+                                        q_heads,
+                                        kv_heads
                                     )
                                 })?;
                                 // SAFETY: ptrs from live device allocations sized to
@@ -839,8 +911,8 @@ impl Qwen35Model {
                                         max_q,
                                         pool.max_total_pages as i32,
                                         meta.num_pages as i32,
-                                        self.local_q_heads as i32,
-                                        self.local_kv_heads as i32,
+                                        q_heads as i32,
+                                        kv_heads as i32,
                                         pool.page_size as i32,
                                         sm_scale,
                                         self.ctx.stream.cu_stream(),
@@ -900,7 +972,7 @@ impl Qwen35Model {
                     ffi::attention_gate_paged_hd256_cuda(
                         qf_ptr as *const ffi::Half,
                         o_ptr as *mut ffi::Half,
-                        self.local_q_heads as i32,
+                        q_heads as i32,
                         rows as i32,
                         self.ctx.stream.cu_stream(),
                     )
@@ -972,14 +1044,21 @@ impl Qwen35Model {
                 "full_paged/o_proj",
                 Some(full_idx),
                 rows,
-                || gemm_batch(&self.ctx, &attn.o_proj, attn_out, out),
+                || gemm_batch(&self.ctx, o_proj, attn_out, out),
             )?;
             crate::profile::profile_op(
                 &self.ctx,
                 "full_paged/allreduce",
                 Some(full_idx),
                 rows,
-                || self.tp.attn_all_reduce_sum(&self.ctx, out),
+                || {
+                    if b2 {
+                        // B2: partials span attn_tp x cp == world (attn_dp=1).
+                        self.tp.all_reduce_sum(&self.ctx, out)
+                    } else {
+                        self.tp.attn_all_reduce_sum(&self.ctx, out)
+                    }
+                },
             )?;
         }
         Ok(())
@@ -1155,14 +1234,46 @@ impl Qwen35Model {
         linear_idx: usize,
         lw: &mut LinearAttnScratch,
         cp: Option<&Qwen35CpPrefill>,
+        cp_decode: Option<&Qwen35CpDecode>,
         out: &mut HiddenStates,
     ) -> Result<()> {
         let c = &self.config;
+        // B2: cp ranks shard the v heads via the decode subset weights. Only
+        // the single-row decode core is sharded; anything else (Tables,
+        // multi-row) runs replicated for this step.
+        let b2 = cp_decode.is_some()
+            && cp.is_none()
+            && matches!(
+                &core,
+                LinearCore::Rows(rs) if rs.len() == 1 && rs[0].len == 1 && rs[0].capture.is_none()
+            );
+        if cp_decode.is_some() && !b2 {
+            log::warn!(
+                "B2 CP decode: linear layer {linear_idx} core is not single-row decode; running replicated"
+            );
+        }
+        let (in_qkvz, in_ba, out_proj): (&DeviceMatrix, &DeviceMatrix, &DeviceMatrix) = if b2 {
+            let d = attn
+                .decode
+                .as_ref()
+                .expect("B2 decode weights present when cp_decode active");
+            (&d.in_proj_qkvz, &d.in_proj_ba, &d.out_proj)
+        } else {
+            (&attn.in_proj_qkvz, &attn.in_proj_ba, &attn.out_proj)
+        };
         // LOCAL per-rank widths: conv channels, recurrent state, and launches
-        // all follow this rank's linear k/v head shard.
-        let qkv_dim = self.local_linear_qkv_dim();
-        let z_dim = self.local_linear_z_dim();
-        let b_dim = attn.in_proj_ba.rows / 2;
+        // all follow this rank's linear k/v head shard (B2: the 1/cp subset).
+        let (qkv_dim, z_dim) = if b2 {
+            let lk = self.decode_linear_k_heads();
+            let lv = self.decode_linear_v_heads();
+            (
+                2 * lk * c.linear_key_head_dim + lv * c.linear_value_head_dim,
+                lv * c.linear_value_head_dim,
+            )
+        } else {
+            (self.local_linear_qkv_dim(), self.local_linear_z_dim())
+        };
+        let b_dim = in_ba.rows / 2;
         let a_dim = b_dim;
 
         let LinearAttnScratch {
@@ -1217,9 +1328,9 @@ impl Qwen35Model {
         let b_proj = b_proj.get(&self.ctx, b_dim, rows)?;
         let a_proj = a_proj.get(&self.ctx, a_dim, rows)?;
         crate::profile::profile_op(&self.ctx, "linear/in_proj", Some(linear_idx), rows, || {
-            gemm_batch(&self.ctx, &attn.in_proj_qkvz, normed, qkvz)?;
+            gemm_batch(&self.ctx, in_qkvz, normed, qkvz)?;
             split2(&self.ctx, qkvz, qkv, z)?;
-            gemm_batch(&self.ctx, &attn.in_proj_ba, normed, ba)?;
+            gemm_batch(&self.ctx, in_ba, normed, ba)?;
             split2(&self.ctx, ba, b_proj, a_proj)?;
             Ok(())
         })?;
@@ -1285,6 +1396,7 @@ impl Qwen35Model {
                     fq_g,
                     fq_g_cumsum,
                     fq_beta,
+                    None,
                 )?;
                 {
                     let (g_ptr, _g0) = slot.gdr_states[linear_idx].device_ptr_mut(&self.ctx.stream);
@@ -1370,6 +1482,39 @@ impl Qwen35Model {
                     }
                     self.batched_copy(capture_copy, &dst, &src, &sz)?;
                 }
+                // B2: allocate the decode recurrent pair (first B2 step for
+                // this slot) and scatter this layer's head subset into it.
+                if b2 {
+                    let cp = cp_decode.unwrap();
+                    let (num_linear, gdr_len_d, conv_len_d) =
+                        self.recurrent_dims_decode(cp.cp_size);
+                    let slot = &mut *rs[0].slot;
+                    slot.ensure_decode_recurrent(&self.ctx, num_linear, gdr_len_d, conv_len_d)?;
+                    slot.scatter_decode_state(
+                        &self.ctx,
+                        linear_idx,
+                        self.local_linear_k_heads,
+                        self.decode_linear_k_heads(),
+                        self.decode_linear_v_heads(),
+                        cp.cp_rank,
+                        c.linear_key_head_dim,
+                        c.linear_value_head_dim,
+                        c.linear_conv_kernel_dim,
+                    )?;
+                }
+                let decode_geom = if b2 {
+                    let cp = cp_decode.unwrap();
+                    let (v_off, _) = cp.subset(self.local_linear_v_heads);
+                    Some(LinearDecodeGeom {
+                        qkv_dim,
+                        z_dim,
+                        k_heads: self.decode_linear_k_heads(),
+                        v_heads: self.decode_linear_v_heads(),
+                        v_off,
+                    })
+                } else {
+                    None
+                };
                 // Uniform short rows pack identically to the varlen kernels'
                 // `s * len` stride, so the whole batch is one conv + one GDR
                 // launch instead of B of each.
@@ -1414,6 +1559,7 @@ impl Qwen35Model {
                             fq_g,
                             fq_g_cumsum,
                             fq_beta,
+                            decode_geom,
                         )?;
                         off += r.len;
                     }
@@ -1505,7 +1651,7 @@ impl Qwen35Model {
                         w_ptr as *const f32,
                         gate_ptr as *const ffi::Half,
                         o_ptr as *mut ffi::Half,
-                        (self.local_linear_v_heads * rows) as i32,
+                        (z_dim / c.linear_value_head_dim * rows) as i32,
                         c.linear_value_head_dim as i32,
                         c.rms_norm_eps,
                         self.ctx.stream.cu_stream(),
@@ -1548,14 +1694,21 @@ impl Qwen35Model {
                 "linear/out_proj",
                 Some(linear_idx),
                 rows,
-                || gemm_batch(&self.ctx, &attn.out_proj, normed_out, out),
+                || gemm_batch(&self.ctx, out_proj, normed_out, out),
             )?;
             crate::profile::profile_op(
                 &self.ctx,
                 "linear/allreduce",
                 Some(linear_idx),
                 rows,
-                || self.tp.attn_all_reduce_sum(&self.ctx, out),
+                || {
+                    if b2 {
+                        // B2: partials span attn_tp x cp == world (attn_dp=1).
+                        self.tp.all_reduce_sum(&self.ctx, out)
+                    } else {
+                        self.tp.attn_all_reduce_sum(&self.ctx, out)
+                    }
+                },
             )?;
         }
         Ok(())
@@ -1713,22 +1866,46 @@ impl Qwen35Model {
         fq_g: &mut SliceSlot<f32>,
         fq_g_cumsum: &mut SliceSlot<f32>,
         fq_beta: &mut SliceSlot<f32>,
+        decode: Option<LinearDecodeGeom>,
     ) -> Result<()> {
         let c = &self.config;
-        let qkv_dim = self.local_linear_qkv_dim();
-        let z_dim = self.local_linear_z_dim();
+        let b2 = decode.is_some();
+        let (qkv_dim, z_dim, k_heads, v_heads, v_off) = decode.map_or(
+            (
+                self.local_linear_qkv_dim(),
+                self.local_linear_z_dim(),
+                self.local_linear_k_heads,
+                self.local_linear_v_heads,
+                0usize,
+            ),
+            |d| (d.qkv_dim, d.z_dim, d.k_heads, d.v_heads, d.v_off),
+        );
 
-        let conv_state = &mut slot.conv_states[linear_idx];
+        let conv_state = if b2 {
+            &mut slot.conv_states_decode[linear_idx]
+        } else {
+            &mut slot.conv_states[linear_idx]
+        };
         ensure!(
             conv_state.len == qkv_dim * (c.linear_conv_kernel_dim - 1),
             "Qwen3.5 conv state len {} != qkv_dim*(kernel-1) {}",
             conv_state.len,
             qkv_dim * (c.linear_conv_kernel_dim - 1)
         );
+        let conv_weight = if b2 {
+            &attn
+                .decode
+                .as_ref()
+                .expect("B2 decode weights present when cp_decode active")
+                .conv1d_weight
+                .data
+        } else {
+            &attn.conv1d_weight.data
+        };
         {
             {
                 let (x_ptr, _g0) = qkv_in.device_ptr(&self.ctx.stream);
-                let (w_ptr, _g1) = attn.conv1d_weight.data.device_ptr(&self.ctx.stream);
+                let (w_ptr, _g1) = conv_weight.device_ptr(&self.ctx.stream);
                 let (s_ptr, _g2) = conv_state.data.device_ptr_mut(&self.ctx.stream);
                 let (o_ptr, _g3) = qkv_conv.device_ptr_mut(&self.ctx.stream);
                 // SAFETY: qkv/weight/state/out valid on ctx.stream; weight len checked
@@ -1762,20 +1939,20 @@ impl Qwen35Model {
 
         // The FlashQLA chunked path has one AOT instantiation per (Hg, H)
         // geometry; unknown geometry falls back to the recurrent kernel.
-        let fq_fns: Option<(ffi::FqCumsumFn, ffi::FqKktFn, ffi::FqFwdFn)> =
-            match (self.local_linear_k_heads, self.local_linear_v_heads) {
-                (16, 32) => Some((
-                    ffi::gdr_fq_cumsum_cuda as _,
-                    ffi::gdr_fq_kkt_cuda as _,
-                    ffi::gdr_fq_fwd_cuda as _,
-                )),
-                (16, 48) => Some((
-                    ffi::gdr_fq_cumsum_h48_cuda as _,
-                    ffi::gdr_fq_kkt_h48_cuda as _,
-                    ffi::gdr_fq_fwd_h48_cuda as _,
-                )),
-                _ => None,
-            };
+        let fq_fns: Option<(ffi::FqCumsumFn, ffi::FqKktFn, ffi::FqFwdFn)> = match (k_heads, v_heads)
+        {
+            (16, 32) => Some((
+                ffi::gdr_fq_cumsum_cuda as _,
+                ffi::gdr_fq_kkt_cuda as _,
+                ffi::gdr_fq_fwd_cuda as _,
+            )),
+            (16, 48) => Some((
+                ffi::gdr_fq_cumsum_h48_cuda as _,
+                ffi::gdr_fq_kkt_h48_cuda as _,
+                ffi::gdr_fq_fwd_h48_cuda as _,
+            )),
+            _ => None,
+        };
         let use_fq_chunked = seq_len > 1
             && crate::runtime_flags::qwen35_gdr_chunked()
             && c.linear_key_head_dim == 128
@@ -1791,22 +1968,28 @@ impl Qwen35Model {
                 .bind_to_thread()
                 .map_err(|e| anyhow!("bind CUDA context for chunked GDR failed: {e}"))?;
             let (fq_cumsum, fq_kkt, fq_fwd) = fq_fns.unwrap();
-            let hg_dim = self.local_linear_k_heads * c.linear_key_head_dim;
+            let hg_dim = k_heads * c.linear_key_head_dim;
             let fq_q = fq_q.get(&self.ctx, hg_dim, seq_len)?;
             let fq_k = fq_k.get(&self.ctx, hg_dim, seq_len)?;
             let fq_v = fq_v.get(&self.ctx, z_dim, seq_len)?;
-            let fq_a = fq_a.get(&self.ctx, self.local_linear_v_heads * 64, seq_len)?;
-            let g_len = self.local_linear_v_heads * seq_len;
+            let fq_a = fq_a.get(&self.ctx, v_heads * 64, seq_len)?;
+            let g_len = v_heads * seq_len;
             let fq_g = fq_g.get(&self.ctx, g_len)?;
             let fq_g_cumsum = fq_g_cumsum.get(&self.ctx, g_len)?;
             let fq_beta = fq_beta.get(&self.ctx, g_len)?;
-            let gdr_state = &mut slot.gdr_states[linear_idx];
+            let gdr_state = if b2 {
+                &mut slot.gdr_states_decode[linear_idx]
+            } else {
+                &mut slot.gdr_states[linear_idx]
+            };
 
             let (qkv_ptr, _g0) = qkv_conv.device_ptr(&self.ctx.stream);
             let (b_ptr, _g1) = b_in.device_ptr(&self.ctx.stream);
             let (a_ptr, _g2) = a_in.device_ptr(&self.ctx.stream);
             let (dt_ptr, _g3) = attn.dt_bias.data.device_ptr(&self.ctx.stream);
             let (alog_ptr, _g4) = attn.a_log.device_ptr(&self.ctx.stream);
+            let dt_ptr = dt_ptr + (v_off * std::mem::size_of::<ffi::Half>()) as u64;
+            let alog_ptr = alog_ptr + (v_off * std::mem::size_of::<f32>()) as u64;
             let (q_ptr, _g5) = fq_q.data.device_ptr_mut(&self.ctx.stream);
             let (k_ptr, _g6) = fq_k.data.device_ptr_mut(&self.ctx.stream);
             let (v_ptr, _g7) = fq_v.data.device_ptr_mut(&self.ctx.stream);
@@ -1840,8 +2023,8 @@ impl Qwen35Model {
                             v_ptr as *mut ffi::Half,
                             g_ptr as *mut f32,
                             beta_ptr as *mut f32,
-                            self.local_linear_k_heads as i32,
-                            self.local_linear_v_heads as i32,
+                            k_heads as i32,
+                            v_heads as i32,
                             c.linear_key_head_dim as i32,
                             c.linear_value_head_dim as i32,
                             seq_len as i32,
@@ -1883,13 +2066,19 @@ impl Qwen35Model {
             )?;
         }
         if !use_fq_chunked {
-            let gdr_state = &mut slot.gdr_states[linear_idx];
+            let gdr_state = if b2 {
+                &mut slot.gdr_states_decode[linear_idx]
+            } else {
+                &mut slot.gdr_states[linear_idx]
+            };
             {
                 let (qkv_ptr, _g0) = qkv_conv.device_ptr(&self.ctx.stream);
                 let (b_ptr, _g1) = b_in.device_ptr(&self.ctx.stream);
                 let (a_ptr, _g2) = a_in.device_ptr(&self.ctx.stream);
                 let (dt_ptr, _g3) = attn.dt_bias.data.device_ptr(&self.ctx.stream);
                 let (alog_ptr, _g4) = attn.a_log.device_ptr(&self.ctx.stream);
+                let dt_ptr = dt_ptr + (v_off * std::mem::size_of::<ffi::Half>()) as u64;
+                let alog_ptr = alog_ptr + (v_off * std::mem::size_of::<f32>()) as u64;
                 let (s_ptr, _g5) = gdr_state.device_ptr_mut(&self.ctx.stream);
                 let (o_ptr, _g6) = gdr_out.device_ptr_mut(&self.ctx.stream);
                 crate::profile::profile_op(
@@ -1910,8 +2099,8 @@ impl Qwen35Model {
                                     alog_ptr as *const f32,
                                     s_ptr as *mut f32,
                                     o_ptr as *mut ffi::Half,
-                                    self.local_linear_k_heads as i32,
-                                    self.local_linear_v_heads as i32,
+                                    k_heads as i32,
+                                    v_heads as i32,
                                     c.linear_key_head_dim as i32,
                                     c.linear_value_head_dim as i32,
                                     self.ctx.stream.cu_stream(),
@@ -1926,8 +2115,8 @@ impl Qwen35Model {
                                     alog_ptr as *const f32,
                                     s_ptr as *mut f32,
                                     o_ptr as *mut ffi::Half,
-                                    self.local_linear_k_heads as i32,
-                                    self.local_linear_v_heads as i32,
+                                    k_heads as i32,
+                                    v_heads as i32,
                                     c.linear_key_head_dim as i32,
                                     c.linear_value_head_dim as i32,
                                     seq_len as i32,
@@ -2019,6 +2208,7 @@ impl Qwen35Model {
                     fq_g,
                     fq_g_cumsum,
                     fq_beta,
+                    None,
                 )?;
                 li += 1;
             }

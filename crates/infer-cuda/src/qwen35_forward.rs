@@ -43,6 +43,29 @@ impl Qwen35Model {
         self.local_linear_v_heads * self.config.linear_value_head_dim
     }
 
+    /// B2 CP decode per-rank head counts: 1/cp of the local attn_tp shard.
+    /// Equal to the local counts when cp=1 or a head count is indivisible
+    /// (decode then runs replicated, `cp_decode_handle` is None).
+    pub(crate) fn decode_q_heads(&self) -> usize {
+        self.local_q_heads / self.cp_decode_divisor()
+    }
+
+    pub(crate) fn decode_kv_heads(&self) -> usize {
+        self.local_kv_heads / self.cp_decode_divisor()
+    }
+
+    pub(crate) fn decode_linear_k_heads(&self) -> usize {
+        self.local_linear_k_heads / self.cp_decode_divisor()
+    }
+
+    pub(crate) fn decode_linear_v_heads(&self) -> usize {
+        self.local_linear_v_heads / self.cp_decode_divisor()
+    }
+
+    fn cp_decode_divisor(&self) -> usize {
+        self.cp_decode_handle().map_or(1, |h| h.cp_size)
+    }
+
     /// `(num_linear, gdr_state_len, conv_len)` for this rank's recurrent state,
     /// sized from LOCAL shard widths (each rank carries only its own v-head
     /// recurrent slabs / qkv conv channels). Single source for both
@@ -53,6 +76,18 @@ impl Qwen35Model {
         let gdr_state_len =
             self.local_linear_v_heads * c.linear_key_head_dim * c.linear_value_head_dim;
         let conv_len = self.local_linear_qkv_dim() * (c.linear_conv_kernel_dim - 1);
+        (num_linear, gdr_state_len, conv_len)
+    }
+
+    /// B2 CP decode dims for the 1/cp-head recurrent pair: same layer count,
+    /// 1/cp the gdr/conv widths (the engage guard makes both head counts
+    /// divisible by cp).
+    pub(crate) fn recurrent_dims_decode(&self, cp_size: usize) -> (usize, usize, usize) {
+        let c = &self.config;
+        let num_linear = c.num_hidden_layers - c.num_full_attention_layers();
+        let gdr_state_len =
+            (self.local_linear_v_heads / cp_size) * c.linear_key_head_dim * c.linear_value_head_dim;
+        let conv_len = (self.local_linear_qkv_dim() / cp_size) * (c.linear_conv_kernel_dim - 1);
         (num_linear, gdr_state_len, conv_len)
     }
 
@@ -516,6 +551,7 @@ impl Qwen35Model {
                                     rc.pool,
                                     rc.meta,
                                     rc.cp.as_ref(),
+                                    rc.cp_decode.as_ref(),
                                     full,
                                     attn_out,
                                     rc.layer0_query.as_mut(),
@@ -538,6 +574,7 @@ impl Qwen35Model {
                 }
                 Qwen35Attn::Linear(lin) => {
                     let cp = recall.as_deref().and_then(|rc| rc.cp.as_ref());
+                    let cp_decode = recall.as_deref().and_then(|rc| rc.cp_decode.as_ref());
                     crate::profile::profile_op(
                         &self.ctx,
                         "linear_attention",
@@ -551,6 +588,7 @@ impl Qwen35Model {
                                 linear_idx,
                                 linear,
                                 cp,
+                                cp_decode,
                                 attn_out,
                             )
                         },
