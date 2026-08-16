@@ -61,47 +61,39 @@ impl FlashJudge {
     /// Lazy reload before use: the judge stays offloaded through training and
     /// the LoRA re-merge, and callers may span multiple `run_rubric_rounds`
     /// invocations, so residency is tracked here rather than in the loop.
-    fn ensure_resident(&self) -> Result<()> {
-        if let Self::Local {
-            engine, offloaded, ..
+    /// Reload-if-offloaded and submit under ONE lock: an offload landing
+    /// between the two would submit to unloaded weights. A failed reload has
+    /// already consumed the host snapshot, so the judge is poisoned from then
+    /// on rather than judging against half-restored weights.
+    fn with_resident_engine<T>(
+        &self,
+        f: impl FnOnce(&mut LoadedInferenceEngine) -> Result<T>,
+    ) -> Result<T> {
+        let Self::Local {
+            engine,
+            offloaded,
+            reload_failed,
+            ..
         } = self
-        {
-            // A failed reload has already consumed the host snapshot, so the
-            // engine can never be made resident again — refuse instead of
-            // judging against half-restored weights.
-            ensure!(
-                !self.reload_failed(),
-                "Flash judge engine reload failed earlier; weights are unrecoverable"
-            );
-            if offloaded.load(std::sync::atomic::Ordering::Acquire) {
-                eprintln!("[rubric] reloading judge engine weights");
-                let reloaded = engine
-                    .lock()
-                    .map_err(|err| anyhow!("Flash judge engine lock poisoned: {err}"))?
-                    .reload_engine_weights();
-                if reloaded.is_err() {
-                    self.mark_reload_failed();
-                }
-                reloaded?;
-                offloaded.store(false, std::sync::atomic::Ordering::Release);
+        else {
+            unreachable!("with_resident_engine called on Remote judge");
+        };
+        ensure!(
+            !reload_failed.load(std::sync::atomic::Ordering::Acquire),
+            "Flash judge engine reload failed earlier; weights are unrecoverable"
+        );
+        let mut engine = engine
+            .lock()
+            .map_err(|err| anyhow!("Flash judge engine lock poisoned: {err}"))?;
+        if offloaded.load(std::sync::atomic::Ordering::Acquire) {
+            eprintln!("[rubric] reloading judge engine weights");
+            if let Err(err) = engine.reload_engine_weights() {
+                reload_failed.store(true, std::sync::atomic::Ordering::Release);
+                return Err(err);
             }
+            offloaded.store(false, std::sync::atomic::Ordering::Release);
         }
-        Ok(())
-    }
-
-    fn reload_failed(&self) -> bool {
-        match self {
-            Self::Local { reload_failed, .. } => {
-                reload_failed.load(std::sync::atomic::Ordering::Acquire)
-            }
-            Self::Remote { .. } => false,
-        }
-    }
-
-    fn mark_reload_failed(&self) {
-        if let Self::Local { reload_failed, .. } = self {
-            reload_failed.store(true, std::sync::atomic::Ordering::Release);
-        }
+        f(&mut engine)
     }
 
     pub fn new_remote(endpoint: impl Into<String>, max_verdict_tokens: usize) -> Self {
@@ -149,11 +141,10 @@ impl FlashJudge {
     }
 
     pub fn judge(&self, rubric: &Rubric, problem: &str, rollout: &str) -> Result<Verdict> {
-        self.ensure_resident()?;
         let prompt = rubric.judge_prompt(problem, rollout);
         let max_tokens = self.max_verdict_tokens();
         let text = match self {
-            Self::Local { engine, .. } => {
+            Self::Local { .. } => {
                 let req = CompletionRequest {
                     prompt,
                     max_tokens,
@@ -163,10 +154,7 @@ impl FlashJudge {
                     },
                     stop: None,
                 };
-                let mut engine = engine
-                    .lock()
-                    .map_err(|err| anyhow!("Flash judge engine lock poisoned: {err}"))?;
-                engine.complete(req)?.text
+                self.with_resident_engine(|engine| Ok(engine.complete(req)?.text))?
             }
             Self::Remote { .. } => self.complete_remote(&prompt, max_tokens)?,
         };
@@ -195,12 +183,8 @@ impl FlashJudge {
         if rollouts.is_empty() {
             return Vec::new();
         }
-        if let Err(err) = self.ensure_resident() {
-            eprintln!("rubric_opd: judge reload failed: {err:#}");
-            return vec![Verdict::parse_error(); rollouts.len()];
-        }
         match self {
-            Self::Local { engine, .. } => {
+            Self::Local { .. } => {
                 let max_tokens = self.max_verdict_tokens();
                 let reqs: Vec<CompletionRequest> = rollouts
                     .iter()
@@ -214,16 +198,7 @@ impl FlashJudge {
                         stop: None,
                     })
                     .collect();
-                let outputs = {
-                    let engine = match engine.lock() {
-                        Ok(e) => e,
-                        Err(err) => {
-                            eprintln!("rubric_opd: judge_batch lock poisoned: {err}");
-                            return vec![Verdict::parse_error(); rollouts.len()];
-                        }
-                    };
-                    engine.complete_batch(reqs)
-                };
+                let outputs = self.with_resident_engine(|engine| engine.complete_batch(reqs));
                 match outputs {
                     Ok(outs) => outs.iter().map(|o| rubric.parse_verdict(&o.text)).collect(),
                     Err(err) => {
@@ -245,10 +220,9 @@ impl FlashJudge {
         problem: &str,
         max_tokens: usize,
     ) -> Result<Option<String>> {
-        self.ensure_resident()?;
         let prompt = rubric.solve_prompt(problem);
         let solution = match self {
-            Self::Local { engine, .. } => {
+            Self::Local { .. } => {
                 let req = CompletionRequest {
                     prompt,
                     max_tokens,
@@ -258,10 +232,7 @@ impl FlashJudge {
                     },
                     stop: None,
                 };
-                let mut engine = engine
-                    .lock()
-                    .map_err(|err| anyhow!("Flash judge engine lock poisoned: {err}"))?;
-                engine.complete(req)?.text
+                self.with_resident_engine(|engine| Ok(engine.complete(req)?.text))?
             }
             Self::Remote { .. } => self.complete_remote(&prompt, max_tokens)?,
         };
