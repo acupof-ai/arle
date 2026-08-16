@@ -11,6 +11,9 @@
 > T3 revised 2026-08-16 after the engine architecture audit: KV ownership
 > sharding priced as the one seam-level change in the 5D program; CP×quant-KV
 > and CP×spec combination debts made explicit; position vs DP routing stated.
+> T3.1 (B2) implemented 2026-08-17 (807e6c0b4): load-time weight subset
+> (W8A16/Marlin preserved), full-head pool at natural head offset, two-buffer
+> GDN, global all-reduce, eager (decode graph off at world>1). Pod gate pending.
 
 ## Current state (grounded)
 
@@ -96,6 +99,14 @@ not depend on T3.2 and lands first.
 
 #### T3.1 — B2: CP decode = head-sharding across the cp group (ships 256K gate)
 
+> As built 2026-08-17 (807e6c0b4). Decode is **weight-bandwidth-bound**, not
+> compute-bound (marlin W8A16 GEMMs ≈52% of the 27B decode step; FA3 chain
+> <4%), so the win is sharding the attention *weights*, not the compute. The
+> v1 "per-step slice" design was rejected: `slice_rows` dequantizes W8A16 to
+> DenseBf16 (loses Marlin) and a per-step D2D copy costs 1.5× the weight traffic
+> it saves at cp=2. The as-built design loads a second, finer-sharded weight
+> copy once at model load.
+
 The decode regression is not KV capacity. 27B has 16 full-attn layers × 4
 kv_heads × head_dim 256, so 256K paged KV = 16×4×256×2×2B = **17 GB** — fits one
 H20. The regression is that cp=2 cannibalizes attn_tp (world=2: attn_tp 2→1), so
@@ -103,30 +114,52 @@ every rank holds ALL attention heads and doubles qkv/o_proj weight read, KV read
 attention compute, and GDN.
 
 B2: under CP decode the cp group acts as additional attn_tp ranks. Each rank
-computes 1/(attn_tp×cp) of the attention stack's heads; the cp group all-reduces
-the partial hidden; the existing attn_tp all-reduce then runs (no-op at
-attn_tp=1). Mathematically identical to attn_tp=world decode — recovers the full
-regression. Reuses the attn_tp head-shard machinery; no kernel changes; KV stays
-replicated (zero engine-core invariant breaks).
+computes 1/(attn_tp×cp) of the attention stack's heads; the partial hidden
+all-reduces over the **global** comm (attn_dp=1 under CP, so attn_tp×cp==world).
+Mathematically identical to attn_tp=world decode — recovers the full regression.
 
-- Engage: `cp>1 && dspark off && kv_seq_len+1 >= cp_decode_min_kv_tokens`
-  (default 8192, CLI `--cp-decode-min-kv-tokens`). Below threshold decode runs
-  as today — the 4K wash gate.
+- Engage: `cp>1 && dspark off && kv_seq_len+1 >= 8192`
+  (`CP_DECODE_MIN_KV_TOKENS`, the cp all-reduce amortization floor). Below
+  threshold decode runs replicated — the 4K wash gate.
 - Head subset: q subset = attn_tp shard ÷ cp (`local_q_heads/cp`, offset
-  `cp_rank × local_q_heads/cp`); kv subset = q ÷ GQA. Guards: `local_q_heads %
-  cp == 0`, `local_kv_heads % cp == 0`, linear k/v heads % cp == 0.
-- Full-attn decode: qkv proj sliced to the head subset, attention kernel on the
-  subset, o_proj row-sliced, then cp all-reduce of the partial hidden.
-- GDN decode: recurrent state sharded by cp (`gdr_state_len/cp`, `conv_len/cp`;
-  cp_rank is a stable process property and state/snapshot never cross cp-ranks);
-  decode computes the head subset, cp all-reduce. The prefill relay's
-  terminal-state broadcast scatters head-subsets so decode starts sharded.
-- All-reduce routing: `attn_all_reduce_sum` under CP decode routes over the cp
-  group (fused with attn_tp when attn_tp>1). FFN all-reduce stays global.
-- Graph-compatible: the cp all-reduce is NCCL on the captured stream (same
-  mechanism as the FFN all-reduce already in the decode graph closure).
-- Gate: needle ×3 cp=2 vs cp=1; 4K decode wash; 128K decode recover 43→~60
-  tok/s at world=2; 256K decode win; graph capture active.
+  `cp_rank × local_q_heads/cp`); kv subset = q ÷ GQA. Guards: q/kv/linear-k/
+  linear-v head counts all divisible by cp.
+- **Weights (load-time subset, W8A16/Marlin preserved):** a second
+  `FullAttnDecode`/`LinearAttnDecode` weight copy at 1/(attn_tp×cp) heads, loaded
+  once via the quant-aware sharded load (`load_matrices_row_fused` for qkv rows,
+  `load_matrix_sharded_quant_aware(Row)` for o_proj cols). Zero per-step slicing.
+  `decode_attn_cfg = TpConfig{world: attn_tp×cp, rank: attn_tp_rank×cp +
+  attn_cp_rank}` — a fresh head-shard enumeration (bijection onto the mesh).
+- **KV pool (full-head, subset at natural offset):** the pool keeps the full-head
+  layout — prefill all-gathers KV so every rank's history covers the whole
+  prefix. The decode subset reads/writes its head block at offset
+  `cp_rank×decode_kv` (pointer arithmetic on the pool base, no kernel change, no
+  migration). GQA maps compact Q head `qh` to compact KV head `qh//GQA`; the
+  offset translates it to the correct absolute KV head (`q_off = GQA×kv_off`).
+  New-token pages hold only this rank's subset (the other heads' slots are stale
+  but unread under B2).
+- **GDN decode (two-buffer):** the full pair (all heads) serves prefill and
+  non-B2 decode; a 1/cp-head `gdr_states_decode`/`conv_states_decode` pair is
+  scattered from the full pair on the first B2 step (idempotent per layer) and
+  is the live state B2 advances. `decode_recurrent_live` marks which pair is
+  live. The decode pair is fresh-allocated (the executor's recurrent free-list
+  blocks are full-dim).
+- **All-reduce: global `all_reduce_sum`**, NOT `attn_all_reduce_sum` (the latter
+  routes to attn_tp-only under cp>1 — the CP-prefill semantic, wrong for decode
+  where the reduce must span the cp group too). FFN all-reduce stays global.
+- **Eager, not graph:** the decode graph is disabled at world>1
+  (`decode_graph_armed = qwen35_decode_graph() && tp.is_single()`), so B2 decode
+  runs eager. (The plan's "graph-compatible" gate was wrong for world>1.)
+- **Sidecar/restore:** `save_recurrent_sidecar` skips the fresh snapshot on a
+  B2-live slot (the full pair is frozen at the scatter point); `restore`
+  refuses a 1/cp decode-pair snapshot (dim mismatch → Err → engine full
+  recompute) rather than routing it into the decode pair, which would let the
+  next tail-prefill advance the frozen full pair. A B2-live slot cannot
+  tail-prefill in-place today (no Decoding→Prefilling transition; multi-turn
+  re-enters via prefix-attach, which restores a full-pair sidecar).
+- Gate: needle ×3 cp=2 vs cp=1 (short prompts = non-B2 wash; prompts ≥8192 =
+  B2 engaged); 4K decode wash; 128K decode recover 43→~60 tok/s at world=2;
+  256K decode win.
 
 #### T3.2 — KV ownership sharding (strategic; 3 load-bearing assumptions)
 
@@ -219,7 +252,7 @@ T3.2+ gates are set with their own designs.
 |---|---|---|
 | T1 | Extract shared ring core into `cuda-kernels`; autograd calls it | CP gate battery byte-stable; `cargo test --workspace`; no new public surface beyond the core fns |
 | T2 | Engine prefill CP (replicated KV) + GDN state relay | needle ×3 cp=2 vs cp=1; 128K prefill ≥1.6× — **accepted 2026-08-16** (1.75×) |
-| T3.1 | B2: CP decode head-sharding across cp group (replicated KV) | needle ×3 cp=2 vs cp=1; 4K decode wash; 128K decode recover 43→~60 at world=2; 256K decode win; graph active |
+| T3.1 | B2: CP decode head-sharding across cp group (load-time weight subset, full-head pool at natural offset) | needle ×3 cp=2 vs cp=1 (wash + B2-engaged); 4K decode wash; 128K decode recover 43→~60 at world=2; 256K decode win — **implemented 2026-08-17 (807e6c0b4), pod gate pending** |
 | T3.2 | KV ownership sharding (3 seam-level assumptions, §3.2) + decode merge on comm_stream (§3.3) | capacity past 512K; 256K quant-KV; dated wins entry |
 | T3.4 | Settle CP×quant-KV, CP×spec, CP×recall (§3.4) | per-debt gates |
 | T4 | Cleanup (scalar kernel), GDN a2a scaling decision, cp=4 256K curve; GDR smem-race fix (1f7948070) measured-after pod re-gate before T3 baselines | dated wins/errors entries |
