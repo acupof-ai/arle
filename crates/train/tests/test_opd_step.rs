@@ -158,6 +158,31 @@ impl TeacherForward for CountingTeacher<'_> {
             .forward_logits_window_device(input_ids, positions, window, store, tape)
     }
 
+    // The cached-hidden route's single full-seq scoring pass; window logits
+    // sliced from it are not per-window forwards, so `window_calls` stays 0.
+    fn forward_hidden_device(
+        &self,
+        input_ids: &[u32],
+        positions: &[u32],
+        store: &mut TensorStore,
+        tape: &mut Tape,
+    ) -> train::teacher_infer::Result<TensorId> {
+        self.full_calls.set(self.full_calls.get() + 1);
+        self.inner
+            .forward_hidden_device(input_ids, positions, store, tape)
+    }
+
+    fn logits_from_hidden_window_device(
+        &self,
+        hidden: TensorId,
+        window: SequenceWindow,
+        store: &mut TensorStore,
+        tape: &mut Tape,
+    ) -> train::teacher_infer::Result<DeviceLogits> {
+        self.inner
+            .logits_from_hidden_window_device(hidden, window, store, tape)
+    }
+
     fn vocab_size(&self) -> usize {
         self.inner.vocab_size()
     }
