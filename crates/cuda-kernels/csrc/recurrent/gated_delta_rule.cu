@@ -308,6 +308,9 @@ __global__ void gated_delta_rule_prefill_recurrent_kernel(
 
         smem_q[val_idx] = q_val;
         smem_k[val_idx] = k_val;
+        // Publish q/k before the cross-thread smem_k/smem_q reads below; a
+        // lagging warp otherwise reads the previous token's values.
+        __syncthreads();
 
         float exp_g = s_exp_g;
         float beta = s_beta;
