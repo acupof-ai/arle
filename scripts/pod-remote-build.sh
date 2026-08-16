@@ -126,36 +126,58 @@ case "${1:-}" in
     archive="$stage.tree.tgz"
     deletes="$stage.deletes"
     bundle="$stage.source.bundle"
-    [ -f "$meta" ] && [ -f "$archive" ] && [ -f "$deletes" ] && [ -f "$bundle" ] || { echo "incomplete sync stage" >&2; exit 1; }
+    [ -f "$meta" ] && [ -f "$archive" ] && [ -f "$deletes" ] || { echo "incomplete sync stage" >&2; exit 1; }
     archive_sha="$(awk -F= '$1=="archive_sha" {print $2}' "$meta")"
     bundle_sha="$(awk -F= '$1=="bundle_sha" {print $2}' "$meta")"
-    [ "$(sha256 "$archive")" = "$archive_sha" ] && [ "$(sha256 "$bundle")" = "$bundle_sha" ] || { echo "sync digest mismatch" >&2; exit 1; }
-    parent="$(dirname "$TREE")"
-    incoming="$parent/.arle-incoming.$$"
-    backup="$parent/.arle-backup.$$"
-    git clone -q "$bundle" "$incoming"
-    tar -C "$incoming" -xzf "$archive"
-    while IFS= read -r -d '' path; do rm -f "$incoming/$path"; done < "$deletes"
-    if ! mv "$TREE" "$backup" || ! mv "$incoming" "$TREE"; then
-      [ -d "$backup" ] && mv "$backup" "$TREE"
-      exit 1
-    fi
-    if ! restore_persistent "$backup" "$TREE"; then
-      restore_persistent "$TREE" "$backup" || true
-      rm -rf "$TREE"; mv "$backup" "$TREE"; exit 1
-    fi
+    bundle_mode="$(awk -F= '$1=="bundle_mode" {print $2}' "$meta")"
+    bundle_mode="${bundle_mode:-full}"
     head="$(awk -F= '$1=="head" {print $2}' "$meta")"
+    [ "$(sha256 "$archive")" = "$archive_sha" ] || { echo "sync digest mismatch" >&2; exit 1; }
+    backup=""
+    if [ "$bundle_mode" = none ]; then
+      [ "$bundle_sha" = none ] || { echo "sync digest mismatch" >&2; exit 1; }
+      overlay="$TREE"
+    elif [ "$bundle_mode" = incremental ]; then
+      [ -f "$bundle" ] && [ "$(sha256 "$bundle")" = "$bundle_sha" ] || { echo "sync digest mismatch" >&2; exit 1; }
+      git -C "$TREE" bundle unbundle "$bundle" >/dev/null || { echo "incremental unbundle failed" >&2; exit 1; }
+      git -C "$TREE" reset --hard "$head" >/dev/null || { echo "incremental reset failed" >&2; exit 1; }
+      overlay="$TREE"
+    else
+      [ -f "$bundle" ] && [ "$(sha256 "$bundle")" = "$bundle_sha" ] || { echo "sync digest mismatch" >&2; exit 1; }
+      parent="$(dirname "$TREE")"
+      incoming="$parent/.arle-incoming.$$"
+      backup="$parent/.arle-backup.$$"
+      git clone -q "$bundle" "$incoming"
+      overlay="$incoming"
+    fi
+    tar -C "$overlay" -xzf "$archive"
+    while IFS= read -r -d '' path; do rm -f "$overlay/$path"; done < "$deletes"
+    if [ "$bundle_mode" = full ]; then
+      if ! mv "$TREE" "$backup" || ! mv "$incoming" "$TREE"; then
+        [ -d "$backup" ] && mv "$backup" "$TREE"
+        exit 1
+      fi
+      if ! restore_persistent "$backup" "$TREE"; then
+        restore_persistent "$TREE" "$backup" || true
+        rm -rf "$TREE"; mv "$backup" "$TREE"; exit 1
+      fi
+    fi
     actual_head="$(git -C "$TREE" rev-parse HEAD)"
     expected_digest="$(awk -F= '$1=="dirty_digest" {print $2}' "$meta")"
     actual_digest="$(source_digest)"
     if [ "$actual_head" != "$head" ] || [ "$actual_digest" != "$expected_digest" ]; then
-      restore_persistent "$TREE" "$backup" || true
-      rm -rf "$TREE"; mv "$backup" "$TREE"; echo "sync source mismatch: head=$actual_head expected_head=$head digest=$actual_digest expected_digest=$expected_digest" >&2; exit 1
+      [ -z "$backup" ] || { restore_persistent "$TREE" "$backup" || true; rm -rf "$TREE"; mv "$backup" "$TREE"; }
+      echo "sync source mismatch: head=$actual_head expected_head=$head digest=$actual_digest expected_digest=$expected_digest" >&2; exit 1
     fi
     receipt="$TREE/.arle-source-receipt"
     write_receipt "$receipt" "schema=arle-source-v1" "head=$actual_head" "digest=$actual_digest" "archive_sha=$archive_sha" "bundle_sha=$bundle_sha" "applied_at=$(date -u +%FT%TZ)"
-    rm -rf "$backup" "$archive" "$deletes" "$bundle" "$meta"
-    echo "synced source head=$actual_head digest=$actual_digest"
+    if [ "$bundle_mode" = full ]; then
+      rm -rf "$backup" "$archive" "$deletes" "$bundle" "$meta"
+    else
+      rm -f "$archive" "$deletes" "$meta"
+      [ "$bundle_mode" = none ] || rm -f "$bundle"
+    fi
+    echo "synced source head=$actual_head digest=$actual_digest bundle_mode=$bundle_mode"
     ;;
   build)
     LABEL="${2:?missing label}"; OP="${3:?missing operation}"; ARGV_FILE="${4:?missing argv file}"
