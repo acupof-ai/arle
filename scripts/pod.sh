@@ -79,7 +79,7 @@ case "$cmd" in
     "$POD" "bash '$TREE/scripts/pod-tilelang-env.sh'"
     ;;
   sync)
-    [ $# -eq 0 ] || { echo "sync is full-tree only" >&2; exit 2; }
+    [ $# -eq 0 ] || { [ "${1:-}" = --full ] || { echo "sync: unknown arg $1" >&2; exit 2; }; }
     stage="$(mktemp -d -t arle-sync-XXXXXX)"
     trap 'rm -rf "$stage"' EXIT
     head="$(git -C "$ROOT" rev-parse HEAD)"
@@ -89,13 +89,22 @@ case "$cmd" in
     git -C "$ROOT" ls-files -d -z > "$stage/deletes"
     COPYFILE_DISABLE=1 tar --no-xattrs -C "$ROOT" --null -T "$stage/files" -czf "$stage/tree.tgz"
     archive_sha="$(shasum -a 256 "$stage/tree.tgz" | cut -d' ' -f1)"
-    git -C "$ROOT" bundle create "$stage/source.bundle" HEAD
-    bundle_sha="$(shasum -a 256 "$stage/source.bundle" | cut -d' ' -f1)"
-    printf 'schema=arle-source-stage-v1\nhead=%s\ndirty_digest=%s\narchive_sha=%s\nbundle_sha=%s\n' "$head" "$dirty_digest" "$archive_sha" "$bundle_sha" > "$stage/source.meta"
+    pod_head="$("$POD" "git -C '$TREE' rev-parse HEAD" 2>/dev/null | tr -d '[:space:]')"
+    bundle_mode=full
+    if [ "${1:-}" != --full ] && [ "$pod_head" = "$head" ]; then
+      bundle_mode=none
+    elif [ "${1:-}" != --full ] && [ -n "$pod_head" ] && git -C "$ROOT" merge-base --is-ancestor "$pod_head" HEAD 2>/dev/null; then
+      bundle_mode=incremental
+      git -C "$ROOT" bundle create "$stage/source.bundle" "$pod_head"..HEAD
+    else
+      git -C "$ROOT" bundle create "$stage/source.bundle" HEAD
+    fi
+    if [ "$bundle_mode" = none ]; then bundle_sha=none; else bundle_sha="$(shasum -a 256 "$stage/source.bundle" | cut -d' ' -f1)"; fi
+    printf 'schema=arle-source-stage-v1\nhead=%s\ndirty_digest=%s\narchive_sha=%s\nbundle_sha=%s\nbundle_mode=%s\n' "$head" "$dirty_digest" "$archive_sha" "$bundle_sha" "$bundle_mode" > "$stage/source.meta"
     remote_stage="$NODE_TREE.sync.$$.${RANDOM}"
     push_or_die "$stage/tree.tgz" "$remote_stage.tree.tgz"
     push_or_die "$stage/deletes" "$remote_stage.deletes"
-    push_or_die "$stage/source.bundle" "$remote_stage.source.bundle"
+    [ "$bundle_mode" = none ] || push_or_die "$stage/source.bundle" "$remote_stage.source.bundle"
     push_or_die "$stage/source.meta" "$remote_stage.source.meta"
     pod_stage="$(pod_path "$remote_stage")"
     "$POD" "POD_TREE='$TREE' POD_STATE='$STATE' bash '$TREE/scripts/pod-remote-build.sh' apply-sync '$pod_stage'" || { echo "remote sync apply failed" >&2; exit 1; }
