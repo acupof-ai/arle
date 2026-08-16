@@ -247,6 +247,21 @@ impl TpRuntime {
             }
         };
         let coord = RankCoord::from_world_rank(cfg, rank).map_err(|e| anyhow::anyhow!("{e}"))?;
+        // CP prefill staging offsets assume the cp sub-comm rank equals
+        // `attn_cp_rank` (split key = position in group); log the mapping so a
+        // runtime mismatch is visible without a debugger.
+        if cfg.attn_cp_size > 1 {
+            log::info!(
+                "[tp] rank {rank}: attn_tp_rank={} attn_cp_rank={} (cp comm {})",
+                coord.attn_tp_rank,
+                coord.attn_cp_rank,
+                if attn_cp_uses_global {
+                    "GLOBAL"
+                } else {
+                    "split"
+                },
+            );
+        }
 
         Ok(Self {
             config,
