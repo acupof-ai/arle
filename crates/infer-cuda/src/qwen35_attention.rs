@@ -96,6 +96,7 @@ impl Qwen35Model {
             batch_partial_out: _,
             batch_partial_m: _,
             batch_partial_l: _,
+            ..
         } = fw;
         let qkv_fused = qkv_fused.get(&self.ctx, q_proj_dim + 2 * kv_dim, seq_len)?;
         let q_full = q_full.get(&self.ctx, q_proj_dim, seq_len)?;
@@ -329,7 +330,7 @@ impl Qwen35Model {
             gemm_batch(&self.ctx, &attn.o_proj, attn_out, out)
         })?;
         crate::profile::profile_op(&self.ctx, "full/allreduce", Some(full_idx), seq_len, || {
-            self.tp.all_reduce_sum(&self.ctx, out)
+            self.tp.attn_all_reduce_sum(&self.ctx, out)
         })?;
         Ok(())
     }
@@ -348,19 +349,12 @@ impl Qwen35Model {
         full_idx: usize,
         pool: &PagedKVPool,
         meta: &crate::loader::PageMeta,
+        cp: Option<&Qwen35CpPrefill>,
         fw: &mut FullAttnScratch,
         out: &mut HiddenStates,
         layer0_query: Option<&mut Vec<f32>>,
     ) -> Result<()> {
         let c = &self.config;
-        let rows = normed.seq_len;
-        ensure!(
-            meta.total_q == rows,
-            "Qwen3.6 paged full attention: page table covers {} query tokens != {rows} rows",
-            meta.total_q
-        );
-        // One q row per batch element is the decode kernel's contract.
-        let decode = meta.seq_len == 1;
         let q_dim = self.local_full_attn_q_dim();
         let kv_dim = self.local_full_attn_kv_dim();
         let q_proj_dim = self.local_full_attn_q_proj_dim();
@@ -378,8 +372,44 @@ impl Qwen35Model {
             fa3_oaccum,
             fa3_lseaccum,
             fa3_semaphore,
+            cp_in,
+            cp_out,
+            cp_kv_gather,
+            cp_row_gather,
+            cp_scrap_qf,
+            cp_scrap_qp,
             ..
         } = fw;
+        // CP prefill: `normed` is the full chunk but this rank computes only
+        // its contiguous q-slice; `meta` is already slice-shaped.
+        let normed: &HiddenStates = match cp {
+            Some(cpx) => {
+                ensure!(
+                    pool.format == KVFormat::BF16,
+                    "CP prefill requires the BF16 KV pool (guarded at construction)"
+                );
+                let (off, len) = cpx.slices[self.tp.attn_cp_rank()];
+                let h = c.hidden_size;
+                let buf = cp_in.get(&self.ctx, h, len)?;
+                self.ctx
+                    .stream
+                    .memcpy_dtod(
+                        &normed.data.slice(off * h..(off + len) * h),
+                        &mut buf.data.slice_mut(0..len * h),
+                    )
+                    .map_err(|e| anyhow!("CP q-slice copy failed: {e}"))?;
+                buf
+            }
+            None => normed,
+        };
+        let rows = normed.seq_len;
+        ensure!(
+            meta.total_q == rows,
+            "Qwen3.6 paged full attention: page table covers {} query tokens != {rows} rows",
+            meta.total_q
+        );
+        // One q row per batch element is the decode kernel's contract.
+        let decode = meta.seq_len == 1;
         let qkv_fused = qkv_fused.get(&self.ctx, q_proj_dim + 2 * kv_dim, rows)?;
         let q_full = q_full.get(&self.ctx, q_proj_dim, rows)?;
         let k_batch = k_batch.get(&self.ctx, kv_dim, rows)?;
@@ -490,6 +520,31 @@ impl Qwen35Model {
                     },
                 )?;
             }
+        }
+
+        // CP prefill: all-gather this slice's RAW k/v within the cp group and
+        // write every remote slice's pages locally, so the pool covers the
+        // whole chunk again (replicated-KV invariant) with zero kernel changes.
+        if let Some(cpx) = cp {
+            crate::profile::profile_op(
+                &self.ctx,
+                "full_paged/cp_kv_share",
+                Some(full_idx),
+                rows,
+                || {
+                    self.cp_share_chunk_kv(
+                        attn,
+                        cpx,
+                        full_idx,
+                        pool,
+                        k_batch,
+                        v_batch,
+                        cp_kv_gather,
+                        cp_scrap_qf,
+                        cp_scrap_qp,
+                    )
+                },
+            )?;
         }
 
         // Quantize the BF16 tokens the prep just wrote into `k_data[layer]`, so
@@ -883,16 +938,216 @@ impl Qwen35Model {
             *dst = q;
         }
 
-        crate::profile::profile_op(&self.ctx, "full_paged/o_proj", Some(full_idx), rows, || {
-            gemm_batch(&self.ctx, &attn.o_proj, attn_out, out)
-        })?;
-        crate::profile::profile_op(
-            &self.ctx,
-            "full_paged/allreduce",
-            Some(full_idx),
-            rows,
-            || self.tp.all_reduce_sum(&self.ctx, out),
-        )?;
+        if let Some(cpx) = cp {
+            // Reduce this slice's o_proj partial over the head-shard (attn_tp)
+            // group, then gather the cp slices back into the full-chunk `out`.
+            let local = cp_out.get(&self.ctx, c.hidden_size, rows)?;
+            crate::profile::profile_op(
+                &self.ctx,
+                "full_paged/o_proj",
+                Some(full_idx),
+                rows,
+                || gemm_batch(&self.ctx, &attn.o_proj, attn_out, local),
+            )?;
+            crate::profile::profile_op(
+                &self.ctx,
+                "full_paged/allreduce",
+                Some(full_idx),
+                rows,
+                || {
+                    self.tp
+                        .all_reduce_sum_over(self.tp.attn_tp(), &self.ctx, local)
+                },
+            )?;
+            crate::profile::profile_op(
+                &self.ctx,
+                "full_paged/cp_row_gather",
+                Some(full_idx),
+                rows,
+                || self.cp_all_gather_rows(cpx, local, cp_row_gather, out),
+            )?;
+        } else {
+            crate::profile::profile_op(
+                &self.ctx,
+                "full_paged/o_proj",
+                Some(full_idx),
+                rows,
+                || gemm_batch(&self.ctx, &attn.o_proj, attn_out, out),
+            )?;
+            crate::profile::profile_op(
+                &self.ctx,
+                "full_paged/allreduce",
+                Some(full_idx),
+                rows,
+                || self.tp.attn_all_reduce_sum(&self.ctx, out),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// CP prefill KV share: stage this rank's raw (pre-norm/RoPE) k/v slice
+    /// into its section of the padded gather buffer, all-gather within the cp
+    /// group, then run the pool-write prep over every REMOTE slice. The prep
+    /// fuses q prep with the page write, so remote q is computed into scrap
+    /// buffers and discarded (per-row RoPE+norm — cheap next to the GEMMs).
+    #[allow(clippy::too_many_arguments)]
+    fn cp_share_chunk_kv(
+        &self,
+        attn: &FullAttn,
+        cp: &Qwen35CpPrefill,
+        full_idx: usize,
+        pool: &PagedKVPool,
+        k_batch: &HiddenStates,
+        v_batch: &HiddenStates,
+        cp_kv_gather: &mut HiddenSlot,
+        cp_scrap_qf: &mut HiddenSlot,
+        cp_scrap_qp: &mut HiddenSlot,
+    ) -> Result<()> {
+        let c = &self.config;
+        let kv_dim = self.local_full_attn_kv_dim();
+        let (cp_size, cp_rank) = (self.tp.attn_cp_size(), self.tp.attn_cp_rank());
+        let pad = cp.pad;
+        // Per-rank section layout: [k (pad rows) | v (pad rows)].
+        let sect = 2 * pad * kv_dim;
+        let my_len = cp.slices[cp_rank].1;
+        let gather = cp_kv_gather.get(&self.ctx, 2 * kv_dim, cp_size * pad)?;
+        let base = cp_rank * sect;
+        self.ctx
+            .stream
+            .memcpy_dtod(
+                &k_batch.data.slice(0..my_len * kv_dim),
+                &mut gather.data.slice_mut(base..base + my_len * kv_dim),
+            )
+            .map_err(|e| anyhow!("CP kv-share k stage failed: {e}"))?;
+        self.ctx
+            .stream
+            .memcpy_dtod(
+                &v_batch.data.slice(0..my_len * kv_dim),
+                &mut gather
+                    .data
+                    .slice_mut(base + pad * kv_dim..base + pad * kv_dim + my_len * kv_dim),
+            )
+            .map_err(|e| anyhow!("CP kv-share v stage failed: {e}"))?;
+        let elem = std::mem::size_of::<ffi::Half>() as u64;
+        {
+            let (g_ptr, _g) = gather.data.device_ptr_mut(&self.ctx.stream);
+            // SAFETY: in-place all-gather — send section `cp_rank*sect` of the
+            // live `cp_size*sect` gather buffer; equal `sect` on every cp rank.
+            unsafe {
+                self.tp.attn_cp_all_gather_bf16(
+                    &self.ctx,
+                    (g_ptr + base as u64 * elem) as *const std::ffi::c_void,
+                    sect,
+                    g_ptr as *mut std::ffi::c_void,
+                )?;
+            }
+        }
+
+        let qf = cp_scrap_qf.get(&self.ctx, self.local_full_attn_q_proj_dim(), pad)?;
+        let qp = cp_scrap_qp.get(&self.ctx, self.local_full_attn_q_dim(), pad)?;
+        let k_pool_ptr = pool.k_ptr(full_idx, &self.ctx.stream);
+        let v_pool_ptr = pool.v_ptr(full_idx, &self.ctx.stream);
+        let (g_ptr, _g0) = gather.data.device_ptr(&self.ctx.stream);
+        let (qf_ptr, _g1) = qf.data.device_ptr(&self.ctx.stream);
+        let (qp_ptr, _g2) = qp.data.device_ptr_mut(&self.ctx.stream);
+        let (qn_ptr, _g3) = attn.q_norm.data.device_ptr(&self.ctx.stream);
+        let (kn_ptr, _g4) = attn.k_norm.data.device_ptr(&self.ctx.stream);
+        let (cos_ptr, _g5) = self.cos_cache.data.device_ptr(&self.ctx.stream);
+        let (sin_ptr, _g6) = self.sin_cache.data.device_ptr(&self.ctx.stream);
+        let (kvidx_ptr, _g7) = cp.kv_indices.device_ptr(&self.ctx.stream);
+        let (sp_ptr, _g8) = cp.start_positions.device_ptr(&self.ctx.stream);
+        for (peer, &(_, len)) in cp.slices.iter().enumerate() {
+            if peer == cp_rank {
+                continue;
+            }
+            // SAFETY: gathered k/v sections and scrap q buffers are live and
+            // sized `pad >= len` rows; `kv_indices` covers the whole chunk and
+            // the peer's `start_positions` entry keeps the write inside it.
+            unsafe {
+                ffi::prefill_attention_paged_prep_hd256_cuda(
+                    qf_ptr as *const ffi::Half,
+                    qp_ptr as *mut ffi::Half,
+                    (g_ptr + (peer * sect) as u64 * elem) as *const ffi::Half,
+                    (g_ptr + (peer * sect + pad * kv_dim) as u64 * elem) as *const ffi::Half,
+                    qn_ptr as *const ffi::Half,
+                    kn_ptr as *const ffi::Half,
+                    cos_ptr as *const ffi::Half,
+                    sin_ptr as *const ffi::Half,
+                    kvidx_ptr as *const i32,
+                    pool.page_size as i32,
+                    k_pool_ptr as *mut ffi::Half,
+                    v_pool_ptr as *mut ffi::Half,
+                    self.local_q_heads as i32,
+                    self.local_kv_heads as i32,
+                    len as i32,
+                    (sp_ptr + (peer * 4) as u64) as *const i32,
+                    c.rotary_dim as i32,
+                    c.rms_norm_eps,
+                    self.ctx.stream.cu_stream(),
+                )
+                .result()?;
+            }
+        }
+        Ok(())
+    }
+
+    /// All-gather cp slices of `[dim, slice_rows]` `local` back into the
+    /// full-chunk `out` rows (in-place NCCL gather over the padded buffer,
+    /// then per-slice D2D copies to the chunk-relative row offsets).
+    fn cp_all_gather_rows(
+        &self,
+        cp: &Qwen35CpPrefill,
+        local: &HiddenStates,
+        cp_row_gather: &mut HiddenSlot,
+        out: &mut HiddenStates,
+    ) -> Result<()> {
+        let dim = local.hidden_dim;
+        ensure!(
+            out.hidden_dim == dim,
+            "CP row gather: local dim {dim} != out dim {}",
+            out.hidden_dim
+        );
+        let (cp_size, cp_rank) = (self.tp.attn_cp_size(), self.tp.attn_cp_rank());
+        let pad = cp.pad;
+        let sect = pad * dim;
+        let my_len = cp.slices[cp_rank].1;
+        ensure!(
+            local.seq_len == my_len,
+            "CP row gather: slice rows mismatch"
+        );
+        let gather = cp_row_gather.get(&self.ctx, dim, cp_size * pad)?;
+        self.ctx
+            .stream
+            .memcpy_dtod(
+                &local.data.slice(0..my_len * dim),
+                &mut gather
+                    .data
+                    .slice_mut(cp_rank * sect..cp_rank * sect + my_len * dim),
+            )
+            .map_err(|e| anyhow!("CP row-gather stage failed: {e}"))?;
+        {
+            let elem = std::mem::size_of::<ffi::Half>() as u64;
+            let (g_ptr, _g) = gather.data.device_ptr_mut(&self.ctx.stream);
+            // SAFETY: in-place all-gather over the live `cp_size*sect` buffer;
+            // equal `sect` on every cp rank.
+            unsafe {
+                self.tp.attn_cp_all_gather_bf16(
+                    &self.ctx,
+                    (g_ptr + (cp_rank * sect) as u64 * elem) as *const std::ffi::c_void,
+                    sect,
+                    g_ptr as *mut std::ffi::c_void,
+                )?;
+            }
+        }
+        for (peer, &(off, len)) in cp.slices.iter().enumerate() {
+            self.ctx
+                .stream
+                .memcpy_dtod(
+                    &gather.data.slice(peer * sect..peer * sect + len * dim),
+                    &mut out.data.slice_mut(off * dim..(off + len) * dim),
+                )
+                .map_err(|e| anyhow!("CP row-gather scatter failed: {e}"))?;
+        }
         Ok(())
     }
 
@@ -909,10 +1164,10 @@ impl Qwen35Model {
         core: LinearCore<'_, '_>,
         linear_idx: usize,
         lw: &mut LinearAttnScratch,
+        cp: Option<&Qwen35CpPrefill>,
         out: &mut HiddenStates,
     ) -> Result<()> {
         let c = &self.config;
-        let rows = normed.seq_len;
         // LOCAL per-rank widths: conv channels, recurrent state, and launches
         // all follow this rank's linear k/v head shard.
         let qkv_dim = self.local_linear_qkv_dim();
@@ -942,7 +1197,29 @@ impl Qwen35Model {
             batch_len,
             batch_host,
             batch_len_host,
+            cp_in,
+            cp_out,
+            cp_row_gather,
         } = lw;
+        // CP prefill: weight-heavy steps run over this rank's q-slice only;
+        // the GDN state chain is relayed across cp ranks below.
+        let normed: &HiddenStates = match cp {
+            Some(cpx) => {
+                let (off, len) = cpx.slices[self.tp.attn_cp_rank()];
+                let h = c.hidden_size;
+                let buf = cp_in.get(&self.ctx, h, len)?;
+                self.ctx
+                    .stream
+                    .memcpy_dtod(
+                        &normed.data.slice(off * h..(off + len) * h),
+                        &mut buf.data.slice_mut(0..len * h),
+                    )
+                    .map_err(|e| anyhow!("CP linear q-slice copy failed: {e}"))?;
+                buf
+            }
+            None => normed,
+        };
+        let rows = normed.seq_len;
         let qkvz = qkvz.get(&self.ctx, qkv_dim + z_dim, rows)?;
         let qkv = qkv.get(&self.ctx, qkv_dim, rows)?;
         let z = z.get(&self.ctx, z_dim, rows)?;
@@ -960,6 +1237,111 @@ impl Qwen35Model {
         let qkv_conv = qkv_conv.get(&self.ctx, qkv_dim, rows)?;
         let gdr_out = gdr_out.get(&self.ctx, z_dim, rows)?;
         match core {
+            LinearCore::Rows(rs) if cp.is_some() => {
+                ensure!(
+                    rs.len() == 1 && rs[0].capture.is_none(),
+                    "CP prefill linear attention is single-row and capture-free"
+                );
+                let (cp_size, cp_rank) = (self.tp.attn_cp_size(), self.tp.attn_cp_rank());
+                let slot = &mut *rs[0].slot;
+                ensure!(
+                    linear_idx < slot.gdr_states.len() && linear_idx < slot.conv_states.len(),
+                    "CP prefill: slot recurrent state missing for linear layer {linear_idx}"
+                );
+                let gdr_len = slot.gdr_states[linear_idx].len();
+                let conv_len = slot.conv_states[linear_idx].len;
+                // Chunk-order state chain: slice r starts from slice r-1's
+                // post-slice recurrent + conv-tail state (rank 0 starts from
+                // the slot's own state — chunk continuity).
+                use cuda_kernels::collective::DType;
+                if cp_rank > 0 {
+                    let (g_ptr, _g0) = slot.gdr_states[linear_idx].device_ptr_mut(&self.ctx.stream);
+                    let (c_ptr, _g1) = slot.conv_states[linear_idx]
+                        .data
+                        .device_ptr_mut(&self.ctx.stream);
+                    // SAFETY: live per-slot state buffers; the previous cp rank
+                    // posts the matching sends in the same (gdr, conv) order.
+                    unsafe {
+                        self.tp.attn_cp_recv(
+                            &self.ctx,
+                            g_ptr as *mut std::ffi::c_void,
+                            gdr_len,
+                            DType::F32,
+                            cp_rank - 1,
+                        )?;
+                        self.tp.attn_cp_recv(
+                            &self.ctx,
+                            c_ptr as *mut std::ffi::c_void,
+                            conv_len,
+                            DType::BF16,
+                            cp_rank - 1,
+                        )?;
+                    }
+                }
+                self.advance_linear_conv_gdr(
+                    attn,
+                    &qkv.data.slice(0..rows * qkv_dim),
+                    &b_proj.data.slice(0..rows * b_dim),
+                    &a_proj.data.slice(0..rows * a_dim),
+                    slot,
+                    linear_idx,
+                    rows,
+                    &mut qkv_conv.data.slice_mut(0..rows * qkv_dim),
+                    &mut gdr_out.data.slice_mut(0..rows * z_dim),
+                    fq_q,
+                    fq_k,
+                    fq_v,
+                    fq_a,
+                    fq_g,
+                    fq_g_cumsum,
+                    fq_beta,
+                )?;
+                {
+                    let (g_ptr, _g0) = slot.gdr_states[linear_idx].device_ptr_mut(&self.ctx.stream);
+                    let (c_ptr, _g1) = slot.conv_states[linear_idx]
+                        .data
+                        .device_ptr_mut(&self.ctx.stream);
+                    if cp_rank + 1 < cp_size {
+                        // SAFETY: same buffers, matching recvs on the next rank.
+                        unsafe {
+                            self.tp.attn_cp_send(
+                                &self.ctx,
+                                g_ptr as *const std::ffi::c_void,
+                                gdr_len,
+                                DType::F32,
+                                cp_rank + 1,
+                            )?;
+                            self.tp.attn_cp_send(
+                                &self.ctx,
+                                c_ptr as *const std::ffi::c_void,
+                                conv_len,
+                                DType::BF16,
+                                cp_rank + 1,
+                            )?;
+                        }
+                    }
+                    // The LAST slice's post-state is the true end-of-chunk state;
+                    // broadcast it so every rank's slot agrees before the next
+                    // chunk / decode.
+                    // SAFETY: live state buffers, same count/root on every cp rank.
+                    unsafe {
+                        self.tp.attn_cp_broadcast(
+                            &self.ctx,
+                            g_ptr as *mut std::ffi::c_void,
+                            gdr_len,
+                            DType::F32,
+                            cp_size - 1,
+                        )?;
+                        self.tp.attn_cp_broadcast(
+                            &self.ctx,
+                            c_ptr as *mut std::ffi::c_void,
+                            conv_len,
+                            DType::BF16,
+                            cp_size - 1,
+                        )?;
+                    }
+                }
+            }
             LinearCore::Rows(rs) => {
                 let total: usize = rs.iter().map(|r| r.len).sum();
                 ensure!(
@@ -1144,16 +1526,48 @@ impl Qwen35Model {
             })?;
         }
 
-        crate::profile::profile_op(&self.ctx, "linear/out_proj", Some(linear_idx), rows, || {
-            gemm_batch(&self.ctx, &attn.out_proj, normed_out, out)
-        })?;
-        crate::profile::profile_op(
-            &self.ctx,
-            "linear/allreduce",
-            Some(linear_idx),
-            rows,
-            || self.tp.all_reduce_sum(&self.ctx, out),
-        )?;
+        if let Some(cpx) = cp {
+            let local = cp_out.get(&self.ctx, c.hidden_size, rows)?;
+            crate::profile::profile_op(
+                &self.ctx,
+                "linear/out_proj",
+                Some(linear_idx),
+                rows,
+                || gemm_batch(&self.ctx, &attn.out_proj, normed_out, local),
+            )?;
+            crate::profile::profile_op(
+                &self.ctx,
+                "linear/allreduce",
+                Some(linear_idx),
+                rows,
+                || {
+                    self.tp
+                        .all_reduce_sum_over(self.tp.attn_tp(), &self.ctx, local)
+                },
+            )?;
+            crate::profile::profile_op(
+                &self.ctx,
+                "linear/cp_row_gather",
+                Some(linear_idx),
+                rows,
+                || self.cp_all_gather_rows(cpx, local, cp_row_gather, out),
+            )?;
+        } else {
+            crate::profile::profile_op(
+                &self.ctx,
+                "linear/out_proj",
+                Some(linear_idx),
+                rows,
+                || gemm_batch(&self.ctx, &attn.out_proj, normed_out, out),
+            )?;
+            crate::profile::profile_op(
+                &self.ctx,
+                "linear/allreduce",
+                Some(linear_idx),
+                rows,
+                || self.tp.attn_all_reduce_sum(&self.ctx, out),
+            )?;
+        }
         Ok(())
     }
 
@@ -1775,6 +2189,7 @@ impl Qwen35Model {
             batch_partial_out,
             batch_partial_m,
             batch_partial_l,
+            ..
         } = fw;
         let qkv_fused = qkv_fused.get(&self.ctx, q_proj_dim + 2 * kv_dim, b)?;
         let q_full = q_full.get(&self.ctx, q_proj_dim, b)?;
@@ -1947,7 +2362,7 @@ impl Qwen35Model {
         }
 
         gemm_batch(&self.ctx, &attn.o_proj, attn_heads, out)?;
-        self.tp.all_reduce_sum(&self.ctx, out)?;
+        self.tp.attn_all_reduce_sum(&self.ctx, out)?;
         Ok(())
     }
 }

@@ -620,10 +620,22 @@ impl Qwen35CudaExecutor {
             max_seq_len,
             mtp_draft_tokens,
         )?;
-        ensure!(
-            model.tp.attn_cp_size() == 1,
-            "attn_cp>1: engine CP prefill not implemented yet (T2.b)"
-        );
+        // CP prefill (T2.b) preconditions: a real NCCL cp sub-comm, and the
+        // BF16 pool (the quant-KV write path does not cover remote cp slices).
+        // DSpark is rejected below by its own single-GPU ensure; --kv-recall is
+        // rejected at enable time (rank-local eviction scoring would diverge
+        // the cp group's collective schedule).
+        if model.tp.attn_cp_size() > 1 {
+            ensure!(
+                model.tp.attn_cp().is_collective(),
+                "attn_cp>1 requires the NCCL attn_cp sub-comm (build with --features nccl)"
+            );
+            ensure!(
+                kv_dtype == CudaKvCacheDtype::Bf16,
+                "attn_cp>1 requires --kv-cache-dtype bf16 (CP prefill KV all-gather writes \
+                 raw BF16 pages; the quantized-pool path is not CP-aware)"
+            );
+        }
         cuda_startup_log(
             "executor.qwen35_model_load",
             model_t0,
@@ -1002,6 +1014,11 @@ impl Qwen35CudaExecutor {
             "--kv-recall is not supported with --spec-type dspark (the verify \
              forward would race the recall eviction cycle)"
         );
+        ensure!(
+            !(enabled && self.model.tp.attn_cp_size() > 1),
+            "--kv-recall is not supported with attn_cp>1 (rank-local recall scoring \
+             diverges the cp group's collective schedule)"
+        );
         self.kv_recall = enabled;
         if enabled && self.recall_tier.is_none() {
             // One entry == one pool page image (all `num_full` layers, K+V).
@@ -1094,15 +1111,59 @@ impl Qwen35CudaExecutor {
             );
         }
         self.mirror_host_slot(host_kv, slot, row.start_pos + row.tokens.len())?;
-        let meta = {
+        let (meta, cp) = {
             let pool = self.full_attn_kv.as_ref().expect("full_attn_kv present");
-            crate::loader::PageMeta::for_slot(
-                &self.model.ctx,
-                pool,
-                slot,
-                row.start_pos,
-                row.tokens.len(),
-            )?
+            let len = row.tokens.len();
+            let cp_size = self.model.tp.attn_cp_size();
+            // Replicated-KV CP prefill (T2.b): shard this chunk's compute into
+            // contiguous cp slices when the chunk amortizes the per-layer
+            // collectives. DSpark taps need the full chunk on every rank. The
+            // decision is a pure function of the (rank-identical) plan, so the
+            // cp group's collective schedule stays lockstep.
+            if cp_size > 1 && self.dspark.is_none() && len >= cp_size * CP_PREFILL_MIN_ROWS_PER_RANK
+            {
+                let per = len.div_ceil(cp_size);
+                let slices: Vec<(usize, usize)> = (0..cp_size)
+                    .map(|p| (p * per, ((p + 1) * per).min(len) - p * per))
+                    .collect();
+                let (off, my_len) = slices[self.model.tp.attn_cp_rank()];
+                let meta = crate::loader::PageMeta::for_slot_slice(
+                    &self.model.ctx,
+                    pool,
+                    slot,
+                    row.start_pos + off,
+                    my_len,
+                    row.start_pos + off + my_len,
+                )?;
+                let chunk_pages = (row.start_pos + len).div_ceil(SUPPORTED_PAGE_SIZE);
+                let pages = pool.page_indices(slot);
+                ensure!(
+                    pages.len() >= chunk_pages,
+                    "CP prefill: slot {slot} has {} pages, chunk needs {chunk_pages}",
+                    pages.len()
+                );
+                let kv_indices: Vec<i32> = pages[..chunk_pages].iter().map(|&p| p as i32).collect();
+                let starts: Vec<i32> = slices
+                    .iter()
+                    .map(|&(o, _)| (row.start_pos + o) as i32)
+                    .collect();
+                let cp = crate::qwen35::Qwen35CpPrefill {
+                    slices,
+                    pad: per,
+                    start_positions: crate::ops::upload_i32(&self.model.ctx, &starts)?,
+                    kv_indices: crate::ops::upload_i32(&self.model.ctx, &kv_indices)?,
+                };
+                (meta, Some(cp))
+            } else {
+                let meta = crate::loader::PageMeta::for_slot(
+                    &self.model.ctx,
+                    pool,
+                    slot,
+                    row.start_pos,
+                    len,
+                )?;
+                (meta, None)
+            }
         };
         let Self {
             model,
@@ -1117,6 +1178,7 @@ impl Qwen35CudaExecutor {
             pool,
             meta: &meta,
             layer0_query: None,
+            cp,
         };
         let Some(ds) = dspark.as_mut() else {
             return model.forward_tokens_recall(
@@ -1213,6 +1275,7 @@ impl Qwen35CudaExecutor {
             pool,
             meta: &meta,
             layer0_query: None,
+            cp: None,
         };
         model.forward_tokens_recall(
             &mut slots[slot],
@@ -1301,6 +1364,7 @@ impl Qwen35CudaExecutor {
                 pool,
                 meta: &meta,
                 layer0_query: None,
+                cp: None,
             };
             let (logits, dims, hidden) = model.forward_tokens_with_hidden(
                 &mut slots[slot],
@@ -1440,6 +1504,7 @@ impl Qwen35CudaExecutor {
                     pool,
                     meta: meta.as_ref().expect("paged (gated)"),
                     layer0_query: None,
+                    cp: None,
                 });
             model.spec_step(
                 &mut slots[slot],
@@ -1527,6 +1592,7 @@ impl Qwen35CudaExecutor {
             pool,
             meta: &meta,
             layer0_query: None,
+            cp: None,
         };
         let ds = dspark.as_mut().expect("dspark warm without dspark");
         // Gap (whole-slot promote / restored prefix): rebase and rebuild the
@@ -1912,6 +1978,7 @@ impl Qwen35CudaExecutor {
             pool,
             meta: &meta,
             layer0_query: None,
+            cp: None,
         };
         ds.taps.prepare(
             ds.head.target_layer_ids(),
@@ -1975,6 +2042,7 @@ impl Qwen35CudaExecutor {
                 pool,
                 meta: &meta,
                 layer0_query: Some(Vec::new()),
+                cp: None,
             };
             let token = model.forward_tokens_recall(
                 &mut slots[slot],
@@ -2137,6 +2205,7 @@ impl Qwen35CudaExecutor {
             pool,
             meta: &meta,
             layer0_query: None,
+            cp: None,
         };
         model.forward_tokens_recall(
             &mut slots[slot],
@@ -2365,6 +2434,7 @@ impl Qwen35CudaExecutor {
             pool,
             meta,
             layer0_query: None,
+            cp: None,
         };
         let run = state.run_or_capture(|| {
             model.forward_decode_step_paged_captured(slot_state, ws, row.kv_seq_len, &mut rc)
@@ -3113,6 +3183,7 @@ impl Qwen35CudaExecutor {
                         pool,
                         meta: &meta,
                         layer0_query: None,
+                        cp: None,
                     };
                     model.forward_token_logits_full(
                         &mut slot,
@@ -3185,6 +3256,7 @@ impl Qwen35CudaExecutor {
                         pool,
                         meta: &meta,
                         layer0_query: None,
+                        cp: None,
                     };
                     model.forward_training_taps(
                         &mut slot,

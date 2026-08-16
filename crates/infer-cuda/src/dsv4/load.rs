@@ -302,6 +302,12 @@ impl Dsv4Model {
         mtp_draft_tokens: Option<usize>,
         dspark_draft_model: Option<&Path>,
     ) -> Result<Self> {
+        // CP prefill (T2.b) is a qwen35 path; DSv4 shards by raw tp rank and
+        // its attention reduces run on the global comm.
+        ensure!(
+            tp.attn_cp_size() == 1,
+            "attn_cp>1 is not supported by the DSv4 executor (qwen35-only)"
+        );
         // DSpark metadata (block_size / target taps / stage count) ships on the
         // DRAFT checkpoint, not the base — merged below. `dspark_on` gates the
         // shared spec-ring snapshots.

@@ -42,6 +42,11 @@ use qwen35::Qwen35CudaExecutor;
 
 pub(crate) const SUPPORTED_PAGE_SIZE: usize = 16;
 
+/// Minimum prefill rows PER CP RANK before a chunk is compute-sharded across
+/// the attn_cp group — below this the per-layer cp collectives cost more than
+/// the sharded compute saves.
+pub(crate) const CP_PREFILL_MIN_ROWS_PER_RANK: usize = 256;
+
 /// Recurrent-sidecar snapshot stride in KV pages (8192 tokens), bounding how
 /// much a cross-conversation prefix hit must re-prefill. Every snapshot retains
 /// a full state copy (~150 MB at 27B) until publish, so halving the stride

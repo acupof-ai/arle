@@ -279,6 +279,7 @@ impl Qwen35Model {
                                 },
                                 linear_idx,
                                 linear,
+                                None,
                                 attn_out,
                             )
                         },
@@ -519,7 +520,7 @@ impl Qwen35Model {
                         b,
                         || {
                             self.full_attention_paged(
-                                full_attn, normed, full_idx, pool, meta, full, attn_out, None,
+                                full_attn, normed, full_idx, pool, meta, None, full, attn_out, None,
                             )
                         },
                     )?;
@@ -546,6 +547,7 @@ impl Qwen35Model {
                                 },
                                 linear_idx,
                                 linear,
+                                None,
                                 attn_out,
                             )
                         },

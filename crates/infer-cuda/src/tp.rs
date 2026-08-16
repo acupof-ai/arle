@@ -78,6 +78,10 @@ pub struct TpRuntime {
     attn_cp: TpComm,
     attn_cp_rank: usize,
     attn_cp_size: usize,
+    /// Attention head-shard coordinates: equal to `(rank, world_size)` when
+    /// attn_cp=1, so cp=1 sharding stays byte-identical to raw-TP sharding.
+    attn_tp_rank: usize,
+    attn_tp_size: usize,
     /// `None` = NCCL everywhere (single rank, `--comm-backend nccl`, or a failed
     /// boot probe/self-test — every degrade logs WARN).
     #[cfg(all(feature = "cuda", feature = "nccl"))]
@@ -132,6 +136,8 @@ impl TpRuntime {
             attn_cp: TpComm::single(),
             attn_cp_rank: 0,
             attn_cp_size: 1,
+            attn_tp_rank: 0,
+            attn_tp_size: 1,
             #[cfg(all(feature = "cuda", feature = "nccl"))]
             oneshot: None,
         }
@@ -142,15 +148,17 @@ impl TpRuntime {
     #[must_use]
     pub fn new(config: TpConfig) -> Self {
         Self {
-            config,
             comm: TpComm::single(),
             attn_tp: TpComm::single(),
             moe_ep: TpComm::single(),
             attn_cp: TpComm::single(),
             attn_cp_rank: 0,
             attn_cp_size: 1,
+            attn_tp_rank: config.rank,
+            attn_tp_size: config.world_size,
             #[cfg(all(feature = "cuda", feature = "nccl"))]
             oneshot: None,
+            config,
         }
     }
 
@@ -158,15 +166,17 @@ impl TpRuntime {
     #[must_use]
     pub fn with_comm(config: TpConfig, comm: TpComm) -> Self {
         Self {
-            config,
             comm,
             attn_tp: TpComm::single(),
             moe_ep: TpComm::single(),
             attn_cp: TpComm::single(),
             attn_cp_rank: 0,
             attn_cp_size: 1,
+            attn_tp_rank: config.rank,
+            attn_tp_size: config.world_size,
             #[cfg(all(feature = "cuda", feature = "nccl"))]
             oneshot: None,
+            config,
         }
     }
 
@@ -226,6 +236,8 @@ impl TpRuntime {
             attn_cp,
             attn_cp_rank: coord.attn_cp_rank,
             attn_cp_size: cfg.attn_cp_size,
+            attn_tp_rank: coord.attn_tp_rank,
+            attn_tp_size: cfg.attn_tp_size(),
             #[cfg(all(feature = "cuda", feature = "nccl"))]
             oneshot: None,
         })
@@ -280,7 +292,6 @@ impl TpRuntime {
     }
 
     #[must_use]
-    #[allow(dead_code)] // T2.b will consume this
     pub fn attn_cp(&self) -> &TpComm {
         &self.attn_cp
     }
@@ -291,9 +302,20 @@ impl TpRuntime {
     }
 
     #[must_use]
-    #[allow(dead_code)] // T2.b will consume this
     pub fn attn_cp_rank(&self) -> usize {
         self.attn_cp_rank
+    }
+
+    /// This rank's attention head-shard index (== `config().rank` at attn_cp=1).
+    #[must_use]
+    pub fn attn_tp_rank(&self) -> usize {
+        self.attn_tp_rank
+    }
+
+    /// Attention head-shard world (== `config().world_size` at attn_cp=1).
+    #[must_use]
+    pub fn attn_tp_size(&self) -> usize {
+        self.attn_tp_size
     }
 
     #[must_use]
@@ -374,6 +396,23 @@ impl TpRuntime {
             return os.all_reduce_sum_inplace(ctx, buf);
         }
         self.all_reduce_sum_over(&self.comm, ctx, buf)
+    }
+
+    /// Attention-side partial-sum reduce. Attention (full + linear) weights
+    /// shard over the attn_tp axis, so under attn_cp>1 their o/out_proj
+    /// partials span only the attn_tp group; the global comm would double-count
+    /// the cp replicas. attn_cp=1 keeps the global (one-shot-capable) path.
+    #[cfg(feature = "cuda")]
+    pub fn attn_all_reduce_sum(
+        &self,
+        ctx: &cuda_kernels::prelude::DeviceContext,
+        buf: &mut cuda_kernels::prelude::HiddenStates,
+    ) -> anyhow::Result<()> {
+        if self.attn_cp_size > 1 {
+            self.all_reduce_sum_over(&self.attn_tp, ctx, buf)
+        } else {
+            self.all_reduce_sum(ctx, buf)
+        }
     }
 
     /// Splits `input`'s `[seq_len]` rows into contiguous `world_size`-way blocks,
@@ -580,6 +619,154 @@ impl TpRuntime {
                         recvbuf,
                         sendcount,
                         DType::BF16,
+                        ctx.stream.cu_stream().cast::<std::ffi::c_void>(),
+                    )?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// All-gather over the attn_cp sub-comm (CP prefill KV/row exchange).
+    /// In-place is allowed: `sendbuf == recvbuf + attn_cp_rank * sendcount`.
+    ///
+    /// # Safety
+    ///
+    /// `sendbuf` must hold `sendcount` BF16 elements and `recvbuf`
+    /// `sendcount * attn_cp_size` BF16 elements on this rank's device; both
+    /// stay valid until the collective enqueued on `ctx.stream` completes, and
+    /// every cp-group rank calls with the same `sendcount`.
+    #[cfg(feature = "cuda")]
+    #[cfg_attr(not(feature = "nccl"), allow(unused_variables))]
+    pub unsafe fn attn_cp_all_gather_bf16(
+        &self,
+        ctx: &cuda_kernels::prelude::DeviceContext,
+        sendbuf: *const std::ffi::c_void,
+        sendcount: usize,
+        recvbuf: *mut std::ffi::c_void,
+    ) -> anyhow::Result<()> {
+        match &self.attn_cp {
+            TpComm::Single => anyhow::bail!("attn_cp all-gather requires the NCCL cp sub-comm"),
+            #[cfg(feature = "nccl")]
+            TpComm::Nccl(backend) => {
+                use cuda_kernels::collective::{CollectiveBackend, DType};
+                // SAFETY: this fn's contract.
+                unsafe {
+                    backend.all_gather(
+                        sendbuf,
+                        recvbuf,
+                        sendcount,
+                        DType::BF16,
+                        ctx.stream.cu_stream().cast::<std::ffi::c_void>(),
+                    )?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Point-to-point send to `peer` (cp-group rank) over the attn_cp sub-comm
+    /// (GDN prefill state relay).
+    ///
+    /// # Safety
+    ///
+    /// `buf` must hold `count` elements of `dtype` on this rank's device and
+    /// stay valid until the op enqueued on `ctx.stream` completes; `peer` must
+    /// post the matching [`Self::attn_cp_recv`].
+    #[cfg(feature = "cuda")]
+    #[cfg_attr(not(feature = "nccl"), allow(unused_variables))]
+    pub unsafe fn attn_cp_send(
+        &self,
+        ctx: &cuda_kernels::prelude::DeviceContext,
+        buf: *const std::ffi::c_void,
+        count: usize,
+        dtype: cuda_kernels::collective::DType,
+        peer: usize,
+    ) -> anyhow::Result<()> {
+        match &self.attn_cp {
+            TpComm::Single => anyhow::bail!("attn_cp send requires the NCCL cp sub-comm"),
+            #[cfg(feature = "nccl")]
+            TpComm::Nccl(backend) => {
+                use cuda_kernels::collective::CollectiveBackend;
+                // SAFETY: this fn's contract.
+                unsafe {
+                    backend.send(
+                        buf,
+                        count,
+                        dtype,
+                        peer,
+                        ctx.stream.cu_stream().cast::<std::ffi::c_void>(),
+                    )?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Matching recv for [`Self::attn_cp_send`].
+    ///
+    /// # Safety
+    ///
+    /// See [`Self::attn_cp_send`]; `buf` must be writable for `count` elements.
+    #[cfg(feature = "cuda")]
+    #[cfg_attr(not(feature = "nccl"), allow(unused_variables))]
+    pub unsafe fn attn_cp_recv(
+        &self,
+        ctx: &cuda_kernels::prelude::DeviceContext,
+        buf: *mut std::ffi::c_void,
+        count: usize,
+        dtype: cuda_kernels::collective::DType,
+        peer: usize,
+    ) -> anyhow::Result<()> {
+        match &self.attn_cp {
+            TpComm::Single => anyhow::bail!("attn_cp recv requires the NCCL cp sub-comm"),
+            #[cfg(feature = "nccl")]
+            TpComm::Nccl(backend) => {
+                use cuda_kernels::collective::CollectiveBackend;
+                // SAFETY: this fn's contract.
+                unsafe {
+                    backend.recv(
+                        buf,
+                        count,
+                        dtype,
+                        peer,
+                        ctx.stream.cu_stream().cast::<std::ffi::c_void>(),
+                    )?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// In-place broadcast from cp-group rank `root` over the attn_cp sub-comm
+    /// (end-of-chunk GDN state agreement).
+    ///
+    /// # Safety
+    ///
+    /// See [`Self::attn_cp_send`]; every cp-group rank calls with the same
+    /// `count`/`dtype`/`root`.
+    #[cfg(feature = "cuda")]
+    #[cfg_attr(not(feature = "nccl"), allow(unused_variables))]
+    pub unsafe fn attn_cp_broadcast(
+        &self,
+        ctx: &cuda_kernels::prelude::DeviceContext,
+        buf: *mut std::ffi::c_void,
+        count: usize,
+        dtype: cuda_kernels::collective::DType,
+        root: usize,
+    ) -> anyhow::Result<()> {
+        match &self.attn_cp {
+            TpComm::Single => anyhow::bail!("attn_cp broadcast requires the NCCL cp sub-comm"),
+            #[cfg(feature = "nccl")]
+            TpComm::Nccl(backend) => {
+                use cuda_kernels::collective::CollectiveBackend;
+                // SAFETY: this fn's contract.
+                unsafe {
+                    backend.broadcast(
+                        buf,
+                        count,
+                        dtype,
+                        root,
                         ctx.stream.cu_stream().cast::<std::ffi::c_void>(),
                     )?;
                 }

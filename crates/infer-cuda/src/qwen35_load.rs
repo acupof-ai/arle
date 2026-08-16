@@ -241,25 +241,33 @@ impl Qwen35Model {
 
         let tp_cfg = *tp.config();
         let world = tp_cfg.world_size;
+        // Attention (full + linear) weights shard over the mesh's attn_tp axis
+        // and REPLICATE across attn_cp (cp peers need identical head shards for
+        // the CP-prefill KV all-gather + GDN state relay). attn_cp=1 makes this
+        // exactly `tp_cfg`, so raw-TP sharding is byte-identical.
+        let attn_cfg = infer_topo::TpConfig {
+            world_size: tp.attn_tp_size(),
+            rank: tp.attn_tp_rank(),
+        };
         // Per-rank full-attn GQA head counts. `head_shard` shards KV when
         // num_kv_heads >= world (e.g. Qwen3.6-35B kv=8 @ TP8 -> 1/rank) and
         // REPLICATES when num_kv_heads < world (Qwen3.5-122B kv=2 @ TP4 -> every
         // rank holds 1 replicated KV head + its Q-head shard). Replicas load
         // identical K/V weights (`kv_load_block_index`) so each computes GQA
         // independently; the divisible case stays byte-identical.
-        let (local_q_heads, local_kv_heads) = if tp_cfg.is_single() {
+        let (local_q_heads, local_kv_heads) = if attn_cfg.is_single() {
             (m.num_attention_heads, m.num_key_value_heads)
         } else {
-            infer_topo::head_shard(m.num_attention_heads, m.num_key_value_heads, &tp_cfg)
+            infer_topo::head_shard(m.num_attention_heads, m.num_key_value_heads, &attn_cfg)
                 .map_err(|e| anyhow!("Qwen3.5 TP full-attention head shard failed: {e}"))?
         };
-        // KV-head block index this rank loads (== rank in the shard regime;
-        // shared within a replica group in the replication regime). Q always
-        // partitions by `tp_cfg.rank`.
-        let kv_block = if tp_cfg.is_single() {
+        // KV-head block index this rank loads (== attn-tp rank in the shard
+        // regime; shared within a replica group in the replication regime). Q
+        // always partitions by `attn_cfg.rank`.
+        let kv_block = if attn_cfg.is_single() {
             0
         } else {
-            infer_topo::kv_load_block_index(m.num_key_value_heads, &tp_cfg)
+            infer_topo::kv_load_block_index(m.num_key_value_heads, &attn_cfg)
                 .map_err(|e| anyhow!("Qwen3.5 TP full-attention KV block index: {e}"))?
         };
         // Gated-delta head counts. The linear (gated-delta) heads are large
@@ -271,20 +279,21 @@ impl Qwen35Model {
         // own k-head range. Linear-head replication would need a different shard
         // (the k/v grouping can't be split by replica), so reject it loudly
         // rather than silently mis-shard.
+        let attn_world = attn_cfg.world_size;
         ensure!(
-            m.linear_num_key_heads.is_multiple_of(world),
-            "Qwen3.5 TP: linear_num_key_heads ({}) not divisible by world_size ({world}) \
+            m.linear_num_key_heads.is_multiple_of(attn_world),
+            "Qwen3.5 TP: linear_num_key_heads ({}) not divisible by attn_tp ({attn_world}) \
              — gated-delta linear heads must shard (replication unsupported on the linear path)",
             m.linear_num_key_heads
         );
         ensure!(
-            m.linear_num_value_heads.is_multiple_of(world),
-            "Qwen3.5 TP: linear_num_value_heads ({}) not divisible by world_size ({world}) \
+            m.linear_num_value_heads.is_multiple_of(attn_world),
+            "Qwen3.5 TP: linear_num_value_heads ({}) not divisible by attn_tp ({attn_world}) \
              — gated-delta linear heads must shard (replication unsupported on the linear path)",
             m.linear_num_value_heads
         );
-        let local_linear_k_heads = m.linear_num_key_heads / world;
-        let local_linear_v_heads = m.linear_num_value_heads / world;
+        let local_linear_k_heads = m.linear_num_key_heads / attn_world;
+        let local_linear_v_heads = m.linear_num_value_heads / attn_world;
         // Shared expert is column/row-sharded like a dense MLP (its partial
         // joins the routed partial in one post-MoE all-reduce).
         ensure!(
@@ -344,7 +353,7 @@ impl Qwen35Model {
             let names = m.layer_tensor_names(layer_idx);
             let attn_t0 = Instant::now();
             let attn = match &names.attention {
-                Qwen35AttentionTensorNames::Full(full) if tp_cfg.is_single() => {
+                Qwen35AttentionTensorNames::Full(full) if attn_cfg.is_single() => {
                     Qwen35Attn::Full(Box::new(FullAttn {
                         qkv_proj: loader.load_matrices_row_fused(
                             &ctx,
@@ -378,7 +387,7 @@ impl Qwen35Model {
                             })
                         };
                         let q_spec =
-                            head_spec(&full.q_proj, local_q_heads * m.head_dim * 2, tp_cfg.rank)?;
+                            head_spec(&full.q_proj, local_q_heads * m.head_dim * 2, attn_cfg.rank)?;
                         let k_spec =
                             head_spec(&full.k_proj, local_kv_heads * m.head_dim, kv_block)?;
                         let v_spec =
@@ -396,14 +405,14 @@ impl Qwen35Model {
                         &ctx,
                         &full.o_proj,
                         infer_topo::ParallelLinearKind::Row,
-                        &tp_cfg,
+                        &attn_cfg,
                     )?,
                     // q/k_norm are `[head_dim]`, broadcast across heads by the
                     // full-attention prep kernel — replicated.
                     q_norm: loader.load_vec(&ctx, &full.q_norm)?,
                     k_norm: loader.load_vec(&ctx, &full.k_norm)?,
                 })),
-                Qwen35AttentionTensorNames::Linear(lin) if tp_cfg.is_single() => {
+                Qwen35AttentionTensorNames::Linear(lin) if attn_cfg.is_single() => {
                     Qwen35Attn::Linear(Box::new(LinearAttn {
                         in_proj_qkvz: loader.load_matrix_pair_fused(
                             &ctx,
@@ -433,7 +442,7 @@ impl Qwen35Model {
                                 &ctx,
                                 &lin.in_proj_qkv,
                                 &m,
-                                &tp_cfg,
+                                &attn_cfg,
                             )?;
                             // z gate is v-head-major `[Vh*Vd]` (rms_norm_gated
                             // reads the gate at `head*Vd + d`).
@@ -442,7 +451,7 @@ impl Qwen35Model {
                                 &lin.in_proj_z,
                                 local_linear_v_heads,
                                 m.linear_value_head_dim,
-                                tp_cfg.rank,
+                                attn_cfg.rank,
                             )?;
                             DeviceMatrix::fuse_rows(&ctx, &qkv, &z)
                                 .map_err(|e| anyhow!("fuse TP in_proj_qkv + in_proj_z: {e}"))?
@@ -456,14 +465,14 @@ impl Qwen35Model {
                                 &lin.in_proj_b,
                                 local_linear_v_heads,
                                 1,
-                                tp_cfg.rank,
+                                attn_cfg.rank,
                             )?;
                             let a = loader.load_qkv_head_sharded(
                                 &ctx,
                                 &lin.in_proj_a,
                                 local_linear_v_heads,
                                 1,
-                                tp_cfg.rank,
+                                attn_cfg.rank,
                             )?;
                             DeviceMatrix::fuse_rows(&ctx, &b, &a)?
                         },
@@ -472,21 +481,21 @@ impl Qwen35Model {
                             &ctx,
                             &lin.conv1d_weight,
                             &m,
-                            &tp_cfg,
+                            &attn_cfg,
                         )?,
                         dt_bias: load_v_head_vec_sharded(
                             &loader,
                             &ctx,
                             &lin.dt_bias,
                             m.linear_num_value_heads,
-                            &tp_cfg,
+                            &attn_cfg,
                         )?,
                         a_log: load_v_head_f32_sharded(
                             &loader,
                             &ctx,
                             &lin.a_log,
                             m.linear_num_value_heads,
-                            &tp_cfg,
+                            &attn_cfg,
                         )?,
                         // Gated-norm scale is `[Vd]`, broadcast across heads by
                         // rms_norm_gated (norm.cu `weight[tid]`) — replicated,
@@ -496,7 +505,7 @@ impl Qwen35Model {
                             &ctx,
                             &lin.out_proj,
                             infer_topo::ParallelLinearKind::Row,
-                            &tp_cfg,
+                            &attn_cfg,
                         )?,
                     }))
                 }

@@ -51,6 +51,19 @@ pub(crate) struct FullAttnScratch {
     pub(crate) batch_partial_out: SliceSlot<f32>,
     pub(crate) batch_partial_m: SliceSlot<f32>,
     pub(crate) batch_partial_l: SliceSlot<f32>,
+    /// CP prefill only: this rank's q-slice copy of the full-chunk `normed`.
+    pub(crate) cp_in: HiddenSlot,
+    /// CP prefill only: pre-o_proj-reduce slice output.
+    pub(crate) cp_out: HiddenSlot,
+    /// CP prefill only: `[cp, pad, 2*kv_dim]` raw k/v all-gather (in-place).
+    pub(crate) cp_kv_gather: HiddenSlot,
+    /// CP prefill only: `[cp, pad, hidden]` row all-gather (in-place).
+    pub(crate) cp_row_gather: HiddenSlot,
+    /// CP prefill only: dummy q in/out for the remote-slice pool-write prep
+    /// launches (the prep fuses q prep with the k/v page write; remote q is
+    /// computed into scrap and discarded).
+    pub(crate) cp_scrap_qf: HiddenSlot,
+    pub(crate) cp_scrap_qp: HiddenSlot,
 }
 
 /// Paged full-attn forwarding context for Qwen3.6 — the DEFAULT path since the
@@ -66,6 +79,25 @@ pub(crate) struct Qwen35RecallForward<'a> {
     pub(crate) pool: &'a mut PagedKVPool,
     pub(crate) meta: &'a crate::loader::PageMeta,
     pub(crate) layer0_query: Option<Vec<f32>>,
+    /// `Some` = replicated-KV CP prefill: `meta` is this rank's q-slice, the
+    /// forward's token/residual buffers stay full-chunk, and each attention
+    /// layer computes only the slice (T2.b). `None` everywhere else.
+    pub(crate) cp: Option<Qwen35CpPrefill>,
+}
+
+/// Per-chunk CP prefill geometry, built once in the executor. The chunk's rows
+/// split into `attn_cp_size` contiguous slices; rank r computes slice r.
+pub(crate) struct Qwen35CpPrefill {
+    /// Per cp rank: (chunk-relative row offset, row count). Every entry > 0.
+    pub(crate) slices: Vec<(usize, usize)>,
+    /// `ceil(chunk_len / cp)` — fixed per-rank row count for the collectives.
+    pub(crate) pad: usize,
+    /// `[cp]` absolute start position per slice (device, for the remote-slice
+    /// pool-write prep launches).
+    pub(crate) start_positions: CudaSlice<i32>,
+    /// Slot page indices covering the WHOLE chunk, logical-page-0 based (the
+    /// prep kernel indexes `kv_indices[(start_pos + i) / page_size]`).
+    pub(crate) kv_indices: CudaSlice<i32>,
 }
 
 #[derive(Default)]
@@ -91,6 +123,12 @@ pub(crate) struct LinearAttnScratch {
     pub(crate) batch_len: SliceSlot<i32>,
     pub(crate) batch_host: Vec<u64>,
     pub(crate) batch_len_host: Vec<i32>,
+    /// CP prefill only: this rank's q-slice copy of the full-chunk `normed`.
+    pub(crate) cp_in: HiddenSlot,
+    /// CP prefill only: pre-out_proj-reduce slice output.
+    pub(crate) cp_out: HiddenSlot,
+    /// CP prefill only: `[cp, pad, hidden]` row all-gather (in-place).
+    pub(crate) cp_row_gather: HiddenSlot,
 }
 
 /// Rows this long or shorter take the batched recurrent core instead of
@@ -181,6 +219,15 @@ impl Qwen35Workspace {
         full.batch_partial_out.release();
         full.batch_partial_m.release();
         full.batch_partial_l.release();
+        full.cp_in.release();
+        full.cp_out.release();
+        full.cp_kv_gather.release();
+        full.cp_row_gather.release();
+        full.cp_scrap_qf.release();
+        full.cp_scrap_qp.release();
+        linear.cp_in.release();
+        linear.cp_out.release();
+        linear.cp_row_gather.release();
         linear.qkv.release();
         linear.z.release();
         linear.b_proj.release();
