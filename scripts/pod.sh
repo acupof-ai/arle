@@ -104,7 +104,7 @@ case "$cmd" in
     label="${1:-}"
     if [ -n "$label" ]; then shift; else label="$(new_label build)"; fi
     valid_label "$label"
-    [ $# -gt 0 ] || set -- --release --features cuda --bin arle
+    [ $# -gt 0 ] || set -- --release --features cuda,nccl --bin arle
     tmp="$(mktemp -t arle-build-argv-XXXXXX)"
     trap 'rm -f "$tmp"' EXIT
     args_file "$tmp" "$@"
