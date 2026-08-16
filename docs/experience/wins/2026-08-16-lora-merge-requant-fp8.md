@@ -5,8 +5,9 @@ merged dense BF16 (46.4 GB) resident — about 3× base bytes — so a 27B
 `all-linear` LoRA sync OOMed on one 96 GB H20 (previous failure: layer 59
 `mlp.gate_proj` BF16 promotion alloc).
 
-**What worked.** `--lora-merge-fp8` (default off) quantizes each merged matrix
-back into the FP8 serving slots and drops the dense copy:
+**What worked.** `--lora-merge-fp8` (default **on** as of 2026-08-16; was off)
+quantizes each merged matrix back into the FP8 serving slots and drops the
+dense copy:
 - New kernel `quantize_bf16_to_fp8_block_scaled_cuda`, dual of the existing
   dequant: one CUDA block per weight block, shared-memory amax reduction,
   scale = amax/448.

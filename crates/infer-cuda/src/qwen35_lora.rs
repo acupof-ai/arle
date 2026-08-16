@@ -10,6 +10,7 @@
 //!   can put it back.
 
 use super::*;
+use StudentLoraProjection::*;
 
 #[derive(Debug, Clone)]
 pub struct StudentLoraMatrices {
@@ -158,150 +159,104 @@ impl Qwen35Model {
         self.frozen_base_ptrs_exported
             .store(true, Ordering::Relaxed);
         let ctx = &self.ctx;
-        // Plain helper (not a closure) so the grouped-buffer `out.push` calls
-        // below don't conflict with a captured `&mut out` borrow.
-        fn push(
+        // `row_offset` must be a multiple of `block_m` (FP8 block-scaled invariant).
+        fn push_row_slice(
             out: &mut Vec<SharedFp8BaseProjection>,
             ctx: &DeviceContext,
             layer_idx: usize,
             suffix: String,
             m: &DeviceMatrix,
+            row_offset: usize,
+            sub_rows: usize,
         ) {
-            if let Some((weight_ptr, scale_ptr, rows, cols, block_m, block_k)) =
+            let Some((weight_ptr, scale_ptr, rows, cols, block_m, block_k)) =
                 m.fp8_block_scaled_ptrs(ctx)
-            {
-                out.push(SharedFp8BaseProjection {
-                    layer_idx,
-                    proj_suffix: suffix,
-                    weight_ptr,
-                    scale_ptr,
-                    rows,
-                    cols,
-                    block_m,
-                    block_k,
-                });
-            }
+            else {
+                return;
+            };
+            debug_assert!(row_offset.is_multiple_of(block_m));
+            debug_assert!(row_offset + sub_rows <= rows);
+            let scale_row_offset = (row_offset / block_m) * m.quant_scale_cols;
+            out.push(SharedFp8BaseProjection {
+                layer_idx,
+                proj_suffix: suffix,
+                weight_ptr: weight_ptr + (row_offset * cols) as u64,
+                scale_ptr: scale_ptr + (scale_row_offset * std::mem::size_of::<f32>()) as u64,
+                rows: sub_rows,
+                cols,
+                block_m,
+                block_k,
+            });
         }
         let mut out = Vec::new();
         for (layer_idx, layer) in self.layers.iter().enumerate() {
-            if let Qwen35Attn::Full(full) = &layer.attn {
-                push(
+            let dense: &[StudentLoraProjection] = match &layer.attn {
+                Qwen35Attn::Full(_) => &[FullQ, FullK, FullV, FullO],
+                Qwen35Attn::Linear(_) => &[LinearQkv, LinearZ, LinearB, LinearA, LinearOut],
+            };
+            for &proj in dense {
+                let m = self.lora_matrix(layer_idx, proj)?;
+                let (off, n) = self.lora_row_window(layer_idx, proj, m.rows);
+                push_row_slice(
                     &mut out,
                     ctx,
                     layer_idx,
-                    "self_attn.qkv_proj".to_string(),
-                    &full.qkv_proj,
-                );
-                push(
-                    &mut out,
-                    ctx,
-                    layer_idx,
-                    "self_attn.o_proj".to_string(),
-                    &full.o_proj,
-                );
-            }
-            if let Qwen35Attn::Linear(lin) = &layer.attn {
-                // in_proj_qkv/z + out_proj ship as resident FP8 in the
-                // Qwen3.5/3.6 hybrid checkpoint; in_proj_a/b are tiny per-head
-                // BF16 (skipped by the format filter). The train student names
-                // these `linear_attn.{in_proj_qkv,in_proj_z,out_proj}`.
-                push(
-                    &mut out,
-                    ctx,
-                    layer_idx,
-                    "linear_attn.in_proj_qkvz".to_string(),
-                    &lin.in_proj_qkvz,
-                );
-                push(
-                    &mut out,
-                    ctx,
-                    layer_idx,
-                    "linear_attn.in_proj_ba".to_string(),
-                    &lin.in_proj_ba,
-                );
-                push(
-                    &mut out,
-                    ctx,
-                    layer_idx,
-                    "linear_attn.out_proj".to_string(),
-                    &lin.out_proj,
+                    proj.label().into_owned(),
+                    m,
+                    off,
+                    n,
                 );
             }
-            if let Some(mlp) = &layer.mlp {
-                push(
-                    &mut out,
-                    ctx,
-                    layer_idx,
-                    "mlp.gate_up_proj".to_string(),
-                    &mlp.gate_up_proj,
-                );
-                push(
-                    &mut out,
-                    ctx,
-                    layer_idx,
-                    "mlp.down_proj".to_string(),
-                    &mlp.down_proj,
-                );
+            if let Some(_mlp) = &layer.mlp {
+                for &proj in &[MlpGate, MlpUp, MlpDown] {
+                    let m = self.lora_matrix(layer_idx, proj)?;
+                    let (off, n) = self.lora_row_window(layer_idx, proj, m.rows);
+                    push_row_slice(
+                        &mut out,
+                        ctx,
+                        layer_idx,
+                        proj.label().into_owned(),
+                        m,
+                        off,
+                        n,
+                    );
+                }
             }
             if let Some(moe) = &layer.moe {
-                // Shared expert: always individual FP8 DeviceMatrix (mirror dense).
-                push(
-                    &mut out,
-                    ctx,
-                    layer_idx,
-                    "mlp.shared_expert.gate_proj".to_string(),
-                    &moe.shared_gate,
-                );
-                push(
-                    &mut out,
-                    ctx,
-                    layer_idx,
-                    "mlp.shared_expert.up_proj".to_string(),
-                    &moe.shared_up,
-                );
-                push(
-                    &mut out,
-                    ctx,
-                    layer_idx,
-                    "mlp.shared_expert.down_proj".to_string(),
-                    &moe.shared_down,
-                );
-
-                // Two storage layouts:
-                //  (A) per-expert Vec<DeviceMatrix> (DeepGEMM disabled) -> borrow each directly.
-                //  (B) fused FP8 grouped buffers (default) -> slice per-expert ptrs into the group.
+                for &proj in &[MoeSharedGate, MoeSharedUp, MoeSharedDown] {
+                    let m = self.lora_matrix(layer_idx, proj)?;
+                    push_row_slice(
+                        &mut out,
+                        ctx,
+                        layer_idx,
+                        proj.label().into_owned(),
+                        m,
+                        0,
+                        m.rows,
+                    );
+                }
                 if !moe.gate.is_empty() {
-                    for (e, m) in moe.gate.iter().enumerate() {
-                        push(
-                            &mut out,
-                            ctx,
-                            layer_idx,
-                            format!("mlp.experts.{e}.gate_proj"),
-                            m,
-                        );
-                    }
-                    for (e, m) in moe.up.iter().enumerate() {
-                        push(
-                            &mut out,
-                            ctx,
-                            layer_idx,
-                            format!("mlp.experts.{e}.up_proj"),
-                            m,
-                        );
-                    }
-                    for (e, m) in moe.down.iter().enumerate() {
-                        push(
-                            &mut out,
-                            ctx,
-                            layer_idx,
-                            format!("mlp.experts.{e}.down_proj"),
-                            m,
-                        );
+                    for e in 0..moe.gate.len() {
+                        for &proj in &[
+                            MoeExpertGate { expert_idx: e },
+                            MoeExpertUp { expert_idx: e },
+                            MoeExpertDown { expert_idx: e },
+                        ] {
+                            let m = self.lora_matrix(layer_idx, proj)?;
+                            push_row_slice(
+                                &mut out,
+                                ctx,
+                                layer_idx,
+                                proj.label().into_owned(),
+                                m,
+                                0,
+                                m.rows,
+                            );
+                        }
                     }
                 } else {
-                    // Single-GPU: group index == global expert index.
+                    // Grouped FP8 buffers: slice per-expert ptrs directly.
                     if let Some(w13) = &moe.w13_fp8_grouped {
-                        // rows = 2*moe_intermediate; gate = rows[0..mi], up = rows[mi..2*mi].
                         let mi = w13.rows / 2;
                         for e in 0..w13.groups {
                             if let Some(p) = w13.expert_slice_fp8_ptrs(ctx, e, 0, mi) {
@@ -367,130 +322,92 @@ impl Qwen35Model {
         self.frozen_base_ptrs_exported
             .store(true, Ordering::Relaxed);
         let ctx = &self.ctx;
-        fn push(
+        fn push_row_slice(
             out: &mut Vec<SharedBf16BaseProjection>,
             ctx: &DeviceContext,
             layer_idx: usize,
             suffix: String,
             m: &DeviceMatrix,
+            row_offset: usize,
+            sub_rows: usize,
         ) {
             if m.weight_format() != WeightFormat::DenseBf16 {
                 return;
             }
+            debug_assert!(row_offset + sub_rows <= m.rows);
             let (ptr, _g) = m.data.device_ptr(ctx.stream.as_ref());
             out.push(SharedBf16BaseProjection {
                 layer_idx,
                 proj_suffix: suffix,
-                data_ptr: ptr,
-                rows: m.rows,
+                data_ptr: ptr + (row_offset * m.cols * std::mem::size_of::<bf16>()) as u64,
+                rows: sub_rows,
                 cols: m.cols,
             });
         }
         let mut out = Vec::new();
         for (layer_idx, layer) in self.layers.iter().enumerate() {
-            if let Qwen35Attn::Full(full) = &layer.attn {
-                push(
+            let dense: &[StudentLoraProjection] = match &layer.attn {
+                Qwen35Attn::Full(_) => &[FullQ, FullK, FullV, FullO],
+                Qwen35Attn::Linear(_) => &[LinearQkv, LinearZ, LinearB, LinearA, LinearOut],
+            };
+            for &proj in dense {
+                let m = self.lora_matrix(layer_idx, proj)?;
+                let (off, n) = self.lora_row_window(layer_idx, proj, m.rows);
+                push_row_slice(
                     &mut out,
                     ctx,
                     layer_idx,
-                    "self_attn.qkv_proj".to_string(),
-                    &full.qkv_proj,
-                );
-                push(
-                    &mut out,
-                    ctx,
-                    layer_idx,
-                    "self_attn.o_proj".to_string(),
-                    &full.o_proj,
-                );
-            }
-            if let Qwen35Attn::Linear(lin) = &layer.attn {
-                push(
-                    &mut out,
-                    ctx,
-                    layer_idx,
-                    "linear_attn.in_proj_qkvz".to_string(),
-                    &lin.in_proj_qkvz,
-                );
-                push(
-                    &mut out,
-                    ctx,
-                    layer_idx,
-                    "linear_attn.in_proj_ba".to_string(),
-                    &lin.in_proj_ba,
-                );
-                push(
-                    &mut out,
-                    ctx,
-                    layer_idx,
-                    "linear_attn.out_proj".to_string(),
-                    &lin.out_proj,
+                    proj.label().into_owned(),
+                    m,
+                    off,
+                    n,
                 );
             }
-            if let Some(mlp) = &layer.mlp {
-                push(
-                    &mut out,
-                    ctx,
-                    layer_idx,
-                    "mlp.gate_up_proj".to_string(),
-                    &mlp.gate_up_proj,
-                );
-                push(
-                    &mut out,
-                    ctx,
-                    layer_idx,
-                    "mlp.down_proj".to_string(),
-                    &mlp.down_proj,
-                );
+            if let Some(_mlp) = &layer.mlp {
+                for &proj in &[MlpGate, MlpUp, MlpDown] {
+                    let m = self.lora_matrix(layer_idx, proj)?;
+                    let (off, n) = self.lora_row_window(layer_idx, proj, m.rows);
+                    push_row_slice(
+                        &mut out,
+                        ctx,
+                        layer_idx,
+                        proj.label().into_owned(),
+                        m,
+                        off,
+                        n,
+                    );
+                }
             }
             if let Some(moe) = &layer.moe {
-                push(
-                    &mut out,
-                    ctx,
-                    layer_idx,
-                    "mlp.shared_expert.gate_proj".to_string(),
-                    &moe.shared_gate,
-                );
-                push(
-                    &mut out,
-                    ctx,
-                    layer_idx,
-                    "mlp.shared_expert.up_proj".to_string(),
-                    &moe.shared_up,
-                );
-                push(
-                    &mut out,
-                    ctx,
-                    layer_idx,
-                    "mlp.shared_expert.down_proj".to_string(),
-                    &moe.shared_down,
-                );
-                for (e, m) in moe.gate.iter().enumerate() {
-                    push(
+                for &proj in &[MoeSharedGate, MoeSharedUp, MoeSharedDown] {
+                    let m = self.lora_matrix(layer_idx, proj)?;
+                    push_row_slice(
                         &mut out,
                         ctx,
                         layer_idx,
-                        format!("mlp.experts.{e}.gate_proj"),
+                        proj.label().into_owned(),
                         m,
+                        0,
+                        m.rows,
                     );
                 }
-                for (e, m) in moe.up.iter().enumerate() {
-                    push(
-                        &mut out,
-                        ctx,
-                        layer_idx,
-                        format!("mlp.experts.{e}.up_proj"),
-                        m,
-                    );
-                }
-                for (e, m) in moe.down.iter().enumerate() {
-                    push(
-                        &mut out,
-                        ctx,
-                        layer_idx,
-                        format!("mlp.experts.{e}.down_proj"),
-                        m,
-                    );
+                for e in 0..moe.gate.len() {
+                    for &proj in &[
+                        MoeExpertGate { expert_idx: e },
+                        MoeExpertUp { expert_idx: e },
+                        MoeExpertDown { expert_idx: e },
+                    ] {
+                        let m = self.lora_matrix(layer_idx, proj)?;
+                        push_row_slice(
+                            &mut out,
+                            ctx,
+                            layer_idx,
+                            proj.label().into_owned(),
+                            m,
+                            0,
+                            m.rows,
+                        );
+                    }
                 }
             }
         }
@@ -752,15 +669,15 @@ impl Qwen35Model {
         let kv = self.local_kv_heads * self.config.head_dim;
         let qkv = self.local_linear_qkv_dim();
         match projection {
-            StudentLoraProjection::MlpGate => (0, inter()),
-            StudentLoraProjection::MlpUp => (inter(), inter()),
-            StudentLoraProjection::LinearB => (0, vh()),
-            StudentLoraProjection::LinearA => (vh(), vh()),
-            StudentLoraProjection::FullQ => (0, q_gated),
-            StudentLoraProjection::FullK => (q_gated, kv),
-            StudentLoraProjection::FullV => (q_gated + kv, kv),
-            StudentLoraProjection::LinearQkv => (0, qkv),
-            StudentLoraProjection::LinearZ => (qkv, self.local_linear_z_dim()),
+            MlpGate => (0, inter()),
+            MlpUp => (inter(), inter()),
+            LinearB => (0, vh()),
+            LinearA => (vh(), vh()),
+            FullQ => (0, q_gated),
+            FullK => (q_gated, kv),
+            FullV => (q_gated + kv, kv),
+            LinearQkv => (0, qkv),
+            LinearZ => (qkv, self.local_linear_z_dim()),
             _ => (0, matrix_rows),
         }
     }
@@ -1083,10 +1000,7 @@ impl Qwen35Model {
     ) -> Result<&DeviceMatrix> {
         let layer = &self.layers[layer_idx];
         match projection {
-            StudentLoraProjection::FullQ
-            | StudentLoraProjection::FullK
-            | StudentLoraProjection::FullV
-            | StudentLoraProjection::FullO => {
+            FullQ | FullK | FullV | FullO => {
                 let Qwen35Attn::Full(full) = &layer.attn else {
                     return Err(anyhow!(
                         "layer {layer_idx} {} requires a full-attention layer",
@@ -1096,18 +1010,12 @@ impl Qwen35Model {
                 Ok(match projection {
                     // q/k/v live in the row-fused `qkv_proj`; callers address
                     // their window via `lora_row_window`.
-                    StudentLoraProjection::FullQ
-                    | StudentLoraProjection::FullK
-                    | StudentLoraProjection::FullV => &full.qkv_proj,
-                    StudentLoraProjection::FullO => &full.o_proj,
+                    FullQ | FullK | FullV => &full.qkv_proj,
+                    FullO => &full.o_proj,
                     _ => unreachable!("full projection arm checked above"),
                 })
             }
-            StudentLoraProjection::LinearQkv
-            | StudentLoraProjection::LinearZ
-            | StudentLoraProjection::LinearB
-            | StudentLoraProjection::LinearA
-            | StudentLoraProjection::LinearOut => {
+            LinearQkv | LinearZ | LinearB | LinearA | LinearOut => {
                 let Qwen35Attn::Linear(lin) = &layer.attn else {
                     return Err(anyhow!(
                         "layer {layer_idx} {} requires a linear-attention layer",
@@ -1115,19 +1023,13 @@ impl Qwen35Model {
                     ));
                 };
                 Ok(match projection {
-                    StudentLoraProjection::LinearQkv | StudentLoraProjection::LinearZ => {
-                        &lin.in_proj_qkvz
-                    }
-                    StudentLoraProjection::LinearB | StudentLoraProjection::LinearA => {
-                        &lin.in_proj_ba
-                    }
-                    StudentLoraProjection::LinearOut => &lin.out_proj,
+                    LinearQkv | LinearZ => &lin.in_proj_qkvz,
+                    LinearB | LinearA => &lin.in_proj_ba,
+                    LinearOut => &lin.out_proj,
                     _ => unreachable!("linear projection arm checked above"),
                 })
             }
-            StudentLoraProjection::MlpGate
-            | StudentLoraProjection::MlpUp
-            | StudentLoraProjection::MlpDown => {
+            MlpGate | MlpUp | MlpDown => {
                 let dense = layer.mlp.as_ref().ok_or_else(|| {
                     anyhow!(
                         "layer {layer_idx} {} requires a dense MLP layer; MoE student LoRA sync is not supported",
@@ -1137,18 +1039,12 @@ impl Qwen35Model {
                 Ok(match projection {
                     // Gate/up live in the row-fused `gate_up_proj`; callers
                     // address their half via `lora_row_window`.
-                    StudentLoraProjection::MlpGate | StudentLoraProjection::MlpUp => {
-                        &dense.gate_up_proj
-                    }
-                    StudentLoraProjection::MlpDown => &dense.down_proj,
+                    MlpGate | MlpUp => &dense.gate_up_proj,
+                    MlpDown => &dense.down_proj,
                     _ => unreachable!("mlp projection arm checked above"),
                 })
             }
-            StudentLoraProjection::MoeRouter
-            | StudentLoraProjection::MoeSharedGate
-            | StudentLoraProjection::MoeSharedUp
-            | StudentLoraProjection::MoeSharedDown
-            | StudentLoraProjection::MoeSharedExpertGate => {
+            MoeRouter | MoeSharedGate | MoeSharedUp | MoeSharedDown | MoeSharedExpertGate => {
                 let moe = layer.moe.as_ref().ok_or_else(|| {
                     anyhow!(
                         "layer {layer_idx} {} requires a Qwen3.6 MoE layer",
@@ -1156,17 +1052,17 @@ impl Qwen35Model {
                     )
                 })?;
                 Ok(match projection {
-                    StudentLoraProjection::MoeRouter => &moe.router_gate,
-                    StudentLoraProjection::MoeSharedGate => &moe.shared_gate,
-                    StudentLoraProjection::MoeSharedUp => &moe.shared_up,
-                    StudentLoraProjection::MoeSharedDown => &moe.shared_down,
-                    StudentLoraProjection::MoeSharedExpertGate => &moe.shared_gate_router,
+                    MoeRouter => &moe.router_gate,
+                    MoeSharedGate => &moe.shared_gate,
+                    MoeSharedUp => &moe.shared_up,
+                    MoeSharedDown => &moe.shared_down,
+                    MoeSharedExpertGate => &moe.shared_gate_router,
                     _ => unreachable!("shared MoE projection arm checked above"),
                 })
             }
-            StudentLoraProjection::MoeExpertGate { expert_idx }
-            | StudentLoraProjection::MoeExpertUp { expert_idx }
-            | StudentLoraProjection::MoeExpertDown { expert_idx } => {
+            MoeExpertGate { expert_idx }
+            | MoeExpertUp { expert_idx }
+            | MoeExpertDown { expert_idx } => {
                 let local_idx = self.local_expert_idx(expert_idx)?;
                 let moe = layer.moe.as_ref().ok_or_else(|| {
                     anyhow!(
@@ -1175,9 +1071,9 @@ impl Qwen35Model {
                     )
                 })?;
                 let experts = match projection {
-                    StudentLoraProjection::MoeExpertGate { .. } => &moe.gate,
-                    StudentLoraProjection::MoeExpertUp { .. } => &moe.up,
-                    StudentLoraProjection::MoeExpertDown { .. } => &moe.down,
+                    MoeExpertGate { .. } => &moe.gate,
+                    MoeExpertUp { .. } => &moe.up,
+                    MoeExpertDown { .. } => &moe.down,
                     _ => unreachable!("expert MoE projection arm checked above"),
                 };
                 experts.get(local_idx).ok_or_else(|| {
@@ -1199,10 +1095,7 @@ impl Qwen35Model {
     ) -> Result<&mut DeviceMatrix> {
         let layer = &mut self.layers[layer_idx];
         match projection {
-            StudentLoraProjection::FullQ
-            | StudentLoraProjection::FullK
-            | StudentLoraProjection::FullV
-            | StudentLoraProjection::FullO => {
+            FullQ | FullK | FullV | FullO => {
                 let Qwen35Attn::Full(full) = &mut layer.attn else {
                     return Err(anyhow!(
                         "layer {layer_idx} {} requires a full-attention layer",
@@ -1210,18 +1103,12 @@ impl Qwen35Model {
                     ));
                 };
                 Ok(match projection {
-                    StudentLoraProjection::FullQ
-                    | StudentLoraProjection::FullK
-                    | StudentLoraProjection::FullV => &mut full.qkv_proj,
-                    StudentLoraProjection::FullO => &mut full.o_proj,
+                    FullQ | FullK | FullV => &mut full.qkv_proj,
+                    FullO => &mut full.o_proj,
                     _ => unreachable!("full projection arm checked above"),
                 })
             }
-            StudentLoraProjection::LinearQkv
-            | StudentLoraProjection::LinearZ
-            | StudentLoraProjection::LinearB
-            | StudentLoraProjection::LinearA
-            | StudentLoraProjection::LinearOut => {
+            LinearQkv | LinearZ | LinearB | LinearA | LinearOut => {
                 let Qwen35Attn::Linear(lin) = &mut layer.attn else {
                     return Err(anyhow!(
                         "layer {layer_idx} {} requires a linear-attention layer",
@@ -1229,19 +1116,13 @@ impl Qwen35Model {
                     ));
                 };
                 Ok(match projection {
-                    StudentLoraProjection::LinearQkv | StudentLoraProjection::LinearZ => {
-                        &mut lin.in_proj_qkvz
-                    }
-                    StudentLoraProjection::LinearB | StudentLoraProjection::LinearA => {
-                        &mut lin.in_proj_ba
-                    }
-                    StudentLoraProjection::LinearOut => &mut lin.out_proj,
+                    LinearQkv | LinearZ => &mut lin.in_proj_qkvz,
+                    LinearB | LinearA => &mut lin.in_proj_ba,
+                    LinearOut => &mut lin.out_proj,
                     _ => unreachable!("linear projection arm checked above"),
                 })
             }
-            StudentLoraProjection::MlpGate
-            | StudentLoraProjection::MlpUp
-            | StudentLoraProjection::MlpDown => {
+            MlpGate | MlpUp | MlpDown => {
                 let dense = layer.mlp.as_mut().ok_or_else(|| {
                     anyhow!(
                         "layer {layer_idx} {} requires a dense MLP layer; MoE student LoRA sync is not supported",
@@ -1249,18 +1130,12 @@ impl Qwen35Model {
                     )
                 })?;
                 Ok(match projection {
-                    StudentLoraProjection::MlpGate | StudentLoraProjection::MlpUp => {
-                        &mut dense.gate_up_proj
-                    }
-                    StudentLoraProjection::MlpDown => &mut dense.down_proj,
+                    MlpGate | MlpUp => &mut dense.gate_up_proj,
+                    MlpDown => &mut dense.down_proj,
                     _ => unreachable!("mlp projection arm checked above"),
                 })
             }
-            StudentLoraProjection::MoeRouter
-            | StudentLoraProjection::MoeSharedGate
-            | StudentLoraProjection::MoeSharedUp
-            | StudentLoraProjection::MoeSharedDown
-            | StudentLoraProjection::MoeSharedExpertGate => {
+            MoeRouter | MoeSharedGate | MoeSharedUp | MoeSharedDown | MoeSharedExpertGate => {
                 let moe = layer.moe.as_mut().ok_or_else(|| {
                     anyhow!(
                         "layer {layer_idx} {} requires a Qwen3.6 MoE layer",
@@ -1268,17 +1143,17 @@ impl Qwen35Model {
                     )
                 })?;
                 Ok(match projection {
-                    StudentLoraProjection::MoeRouter => &mut moe.router_gate,
-                    StudentLoraProjection::MoeSharedGate => &mut moe.shared_gate,
-                    StudentLoraProjection::MoeSharedUp => &mut moe.shared_up,
-                    StudentLoraProjection::MoeSharedDown => &mut moe.shared_down,
-                    StudentLoraProjection::MoeSharedExpertGate => &mut moe.shared_gate_router,
+                    MoeRouter => &mut moe.router_gate,
+                    MoeSharedGate => &mut moe.shared_gate,
+                    MoeSharedUp => &mut moe.shared_up,
+                    MoeSharedDown => &mut moe.shared_down,
+                    MoeSharedExpertGate => &mut moe.shared_gate_router,
                     _ => unreachable!("shared MoE projection arm checked above"),
                 })
             }
-            StudentLoraProjection::MoeExpertGate { expert_idx }
-            | StudentLoraProjection::MoeExpertUp { expert_idx }
-            | StudentLoraProjection::MoeExpertDown { expert_idx } => {
+            MoeExpertGate { expert_idx }
+            | MoeExpertUp { expert_idx }
+            | MoeExpertDown { expert_idx } => {
                 let local_start = self.expert_split.local_expert_start;
                 let local_end = self.expert_split.local_expert_end();
                 ensure!(
@@ -1294,9 +1169,9 @@ impl Qwen35Model {
                     )
                 })?;
                 let experts = match projection {
-                    StudentLoraProjection::MoeExpertGate { .. } => &mut moe.gate,
-                    StudentLoraProjection::MoeExpertUp { .. } => &mut moe.up,
-                    StudentLoraProjection::MoeExpertDown { .. } => &mut moe.down,
+                    MoeExpertGate { .. } => &mut moe.gate,
+                    MoeExpertUp { .. } => &mut moe.up,
+                    MoeExpertDown { .. } => &mut moe.down,
                     _ => unreachable!("expert MoE projection arm checked above"),
                 };
                 experts.get_mut(local_idx).ok_or_else(|| {
