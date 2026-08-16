@@ -76,6 +76,14 @@ pub struct TpRuntime {
     moe_ep: TpComm,
     /// Aliases [`TpComm::Single`] when attn_cp=1 (the default).
     attn_cp: TpComm,
+    /// True when the attn_cp partition IS the single global group (attn_tp=1,
+    /// e.g. world=2 cp=2): `split_sub_comm` skips the redundant `ncclCommSplit`
+    /// there, so the cp collectives run on the GLOBAL comm instead. Safe: the
+    /// cp group contains every rank and the per-layer schedule is
+    /// rank-identical, so global-comm collective ordering is unchanged.
+    /// (attn_tp has no such case: attn_tp==world forces cp=1, and
+    /// `attn_all_reduce_sum` already routes cp=1 to the global comm.)
+    attn_cp_uses_global: bool,
     attn_cp_rank: usize,
     attn_cp_size: usize,
     /// Attention head-shard coordinates: equal to `(rank, world_size)` when
@@ -134,6 +142,7 @@ impl TpRuntime {
             attn_tp: TpComm::single(),
             moe_ep: TpComm::single(),
             attn_cp: TpComm::single(),
+            attn_cp_uses_global: false,
             attn_cp_rank: 0,
             attn_cp_size: 1,
             attn_tp_rank: 0,
@@ -152,6 +161,7 @@ impl TpRuntime {
             attn_tp: TpComm::single(),
             moe_ep: TpComm::single(),
             attn_cp: TpComm::single(),
+            attn_cp_uses_global: false,
             attn_cp_rank: 0,
             attn_cp_size: 1,
             attn_tp_rank: config.rank,
@@ -170,6 +180,7 @@ impl TpRuntime {
             attn_tp: TpComm::single(),
             moe_ep: TpComm::single(),
             attn_cp: TpComm::single(),
+            attn_cp_uses_global: false,
             attn_cp_rank: 0,
             attn_cp_size: 1,
             attn_tp_rank: config.rank,
@@ -221,10 +232,19 @@ impl TpRuntime {
         let moe_ep = Self::split_sub_comm(&backend, &build_moe_ep_groups(cfg), rank)?;
         // attn_cp=1 yields per-rank singleton groups (not the global group), so the
         // skip must key off `cfg` — still identical on every rank.
-        let attn_cp = if cfg.attn_cp_size == 1 {
-            TpComm::single()
+        let (attn_cp, attn_cp_uses_global) = if cfg.attn_cp_size == 1 {
+            (TpComm::single(), false)
         } else {
-            Self::split_sub_comm(&backend, &build_attn_cp_groups(cfg), rank)?
+            let groups = build_attn_cp_groups(cfg);
+            if groups.len() == 1 {
+                // The cp partition IS the global group (attn_tp=1, e.g. world=2
+                // cp=2): `split_sub_comm` would collapse it to the no-op Single
+                // comm. Alias the global comm instead — same membership, and
+                // the rank-identical schedule keeps its collective order.
+                (TpComm::single(), true)
+            } else {
+                (Self::split_sub_comm(&backend, &groups, rank)?, false)
+            }
         };
         let coord = RankCoord::from_world_rank(cfg, rank).map_err(|e| anyhow::anyhow!("{e}"))?;
 
@@ -234,6 +254,7 @@ impl TpRuntime {
             attn_tp,
             moe_ep,
             attn_cp,
+            attn_cp_uses_global,
             attn_cp_rank: coord.attn_cp_rank,
             attn_cp_size: cfg.attn_cp_size,
             attn_tp_rank: coord.attn_tp_rank,
@@ -291,9 +312,15 @@ impl TpRuntime {
         &self.moe_ep
     }
 
+    /// The comm the attn_cp collectives run on: the split sub-comm, or the
+    /// GLOBAL comm when the cp partition is the single global group.
     #[must_use]
     pub fn attn_cp(&self) -> &TpComm {
-        &self.attn_cp
+        if self.attn_cp_uses_global {
+            &self.comm
+        } else {
+            &self.attn_cp
+        }
     }
 
     #[must_use]
@@ -645,7 +672,7 @@ impl TpRuntime {
         sendcount: usize,
         recvbuf: *mut std::ffi::c_void,
     ) -> anyhow::Result<()> {
-        match &self.attn_cp {
+        match self.attn_cp() {
             TpComm::Single => anyhow::bail!("attn_cp all-gather requires the NCCL cp sub-comm"),
             #[cfg(feature = "nccl")]
             TpComm::Nccl(backend) => {
@@ -683,7 +710,7 @@ impl TpRuntime {
         dtype: cuda_kernels::collective::DType,
         peer: usize,
     ) -> anyhow::Result<()> {
-        match &self.attn_cp {
+        match self.attn_cp() {
             TpComm::Single => anyhow::bail!("attn_cp send requires the NCCL cp sub-comm"),
             #[cfg(feature = "nccl")]
             TpComm::Nccl(backend) => {
@@ -718,7 +745,7 @@ impl TpRuntime {
         dtype: cuda_kernels::collective::DType,
         peer: usize,
     ) -> anyhow::Result<()> {
-        match &self.attn_cp {
+        match self.attn_cp() {
             TpComm::Single => anyhow::bail!("attn_cp recv requires the NCCL cp sub-comm"),
             #[cfg(feature = "nccl")]
             TpComm::Nccl(backend) => {
@@ -755,7 +782,7 @@ impl TpRuntime {
         dtype: cuda_kernels::collective::DType,
         root: usize,
     ) -> anyhow::Result<()> {
-        match &self.attn_cp {
+        match self.attn_cp() {
             TpComm::Single => anyhow::bail!("attn_cp broadcast requires the NCCL cp sub-comm"),
             #[cfg(feature = "nccl")]
             TpComm::Nccl(backend) => {
