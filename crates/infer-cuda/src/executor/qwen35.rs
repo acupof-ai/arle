@@ -625,6 +625,14 @@ impl Qwen35CudaExecutor {
         // DSpark is rejected below by its own single-GPU ensure; --kv-recall is
         // rejected at enable time (rank-local eviction scoring would diverge
         // the cp group's collective schedule).
+        // attn_dp>1 would replicate attn_tp-sharded weights across dp peers
+        // while the cp=1 reduce stays global — double-counted attention. No
+        // engine dp routing exists; reject until it does.
+        ensure!(
+            model.tp.attn_tp_size() * model.tp.attn_cp_size() == model.tp.config().world_size
+                || model.tp.config().is_single(),
+            "attn_dp>1 is not supported by the qwen35 engine (attention would double-count)"
+        );
         if model.tp.attn_cp_size() > 1 {
             ensure!(
                 model.tp.attn_cp().is_collective(),
