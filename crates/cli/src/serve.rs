@@ -50,7 +50,38 @@ struct ServeConfig {
     options: ServeHttpOptions,
 }
 
+/// Exits when the supervising process is gone — the only cleanup that survives
+/// the supervisor being SIGKILLed, since no handler of its own gets to run.
+///
+/// Two signals, because neither alone is sufficient: reparenting is exact but
+/// only applies when the engine is a direct child (a shell wrapper breaks it),
+/// while `kill(pid, 0)` works for any ancestor but can be fooled by a recycled
+/// pid.
+fn watch_parent(pid: i32) {
+    // SAFETY: getppid/kill with signal 0 only read process state.
+    let direct_child = unsafe { libc::getppid() } == pid;
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            let reparented = direct_child && unsafe { libc::getppid() } != pid;
+            let gone = unsafe { libc::kill(pid, 0) } != 0
+                && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+            if reparented || gone {
+                eprintln!("[ARLE serve] parent {pid} exited; shutting down");
+                // `_exit`, not `exit`: during a multi-GiB weight load another
+                // thread holds the allocator lock, and atexit handlers would
+                // block there — the orphan this watchdog exists to prevent.
+                // SAFETY: immediate termination; the kernel reclaims everything.
+                unsafe { libc::_exit(0) };
+            }
+        }
+    });
+}
+
 pub(crate) fn run_serve(args: &Args, serve_args: ServeArgs) -> ExitCode {
+    if let Some(pid) = serve_args.parent_pid {
+        watch_parent(pid);
+    }
     // Lower the probe flags into the env the CUDA executor reads at first use.
     // MUST run pre-spawn: multiproc TP rank children inherit the parent env
     // (env is the transport; flags are the only public interface).

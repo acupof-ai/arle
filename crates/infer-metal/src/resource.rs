@@ -524,13 +524,18 @@ fn resolve_memory_limit(
                 available / GIB,
                 reserve / GIB,
             );
-            anyhow::ensure!(
-                budget <= available - reserve,
-                "--memory-budget-bytes {} GiB exceeds current anti-swap budget {} GiB \
-                 (available memory minus reserve); {system_status_line}.",
-                budget / GIB,
-                (available - reserve) / GIB,
-            );
+            // The rejection message tells the operator to pass this flag "after
+            // verifying headroom", so an explicit budget overrides the
+            // available-memory heuristic; the physical bound above still holds.
+            if budget > available - reserve {
+                log::warn!(
+                    "Metal resource guard: --memory-budget-bytes {} GiB is above the anti-swap \
+                     budget {} GiB (available memory minus reserve). Honouring the explicit \
+                     budget; macOS may compress or swap under load. {system_status_line}",
+                    budget / GIB,
+                    (available - reserve) / GIB,
+                );
+            }
         }
         return Ok(budget);
     }
