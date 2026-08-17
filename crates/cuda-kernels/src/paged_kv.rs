@@ -18,8 +18,7 @@ use log::info;
 
 use super::ffi;
 use super::tensor::DeviceContext;
-use crate::kv_quant::{decode_attention_int8_workspace_bytes, quantize_scatter_kv_fp8_range};
-use crate::kv_turboquant::turboquant_quantize_paged_single;
+use crate::kv_quant::decode_attention_int8_workspace_bytes;
 use crate::kv_types::{KVCacheDtype, KVFormat};
 use crate::turboquant_state::TurboQuantLayerState;
 
@@ -139,21 +138,6 @@ pub struct TokenKVPool {
     pub num_slots: usize,
     /// `num_kv_heads * head_dim` — stride for one token row in the pool buffer.
     pub kv_dim: usize,
-}
-
-/// TileLang-compatible metadata for a batch of requests.
-///
-/// With `page_size = 16`:
-/// - `indptr[i+1] - indptr[i]` = number of pages for request `i`
-/// - `indices` = concatenated physical pool indices for all requests
-/// - `last_page_len` = tokens used in the final page for each request
-pub struct PagedKVBatchMeta {
-    /// Cumulative token counts: `[batch_size + 1]`
-    pub indptr: Vec<i32>,
-    /// Concatenated physical pool indices for the batch.
-    pub indices: Vec<i32>,
-    /// Tokens used in the final page for each request.
-    pub last_page_len: Vec<i32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -978,7 +962,7 @@ impl TokenKVPool {
     /// Borrowed full pages are sealed shared prefix blocks. If `token_count`
     /// leaves the final page partial, that borrowed frontier is a read-only hot
     /// tail and the caller must pass through
-    /// [`Self::cow_tail_page_for_append`] before mutating it.
+    /// [`Self::detach_shared_hot_tail_page_for_append`] before mutating it.
     pub fn attach_pages(&mut self, slot: usize, pages: &[u32], token_count: usize) -> Result<()> {
         if !self.page_indices[slot].is_empty() || self.seq_lens[slot] != 0 {
             return Err(anyhow!(
@@ -1476,10 +1460,9 @@ impl TokenKVPool {
             "detach_shared_hot_tail_page_for_append requires the live shared hot tail",
         );
 
-        let new_page = self
-            .free_pages
-            .pop()
-            .ok_or_else(|| anyhow!("TokenKVPool::cow_tail_page_for_append out of free pages"))?;
+        let new_page = self.free_pages.pop().ok_or_else(|| {
+            anyhow!("TokenKVPool::detach_shared_hot_tail_page_for_append out of free pages")
+        })?;
         self.page_attach_count[new_page as usize] = 1;
         self.copy_page_device_to_device(ctx, shared_tail_page, new_page)?;
 
@@ -1500,33 +1483,6 @@ impl TokenKVPool {
         self.page_attach_count[old_tail_idx] -= 1;
         self.recycle_page_if_unreferenced(old_tail_page);
         Ok(())
-    }
-
-    /// Detach the shared hot tail before append.
-    ///
-    /// Sealed full pages stay shared and read-only. The only mutable
-    /// shared-prefix write path is detaching a partially-filled shared hot tail
-    /// page immediately before append. Once that tail fills, the next append
-    /// allocates a fresh page instead of mutating the sealed prefix in place.
-    ///
-    /// Returns `true` only when a shared hot tail was detached.
-    pub fn cow_tail_page_for_append(&mut self, ctx: &DeviceContext, slot: usize) -> Result<bool> {
-        #[cfg(not(feature = "cuda"))]
-        {
-            let _ = ctx;
-            let _ = slot;
-            return Ok(false);
-        }
-
-        #[cfg(feature = "cuda")]
-        {
-            let Some(shared_tail_page) = self.slot_shared_hot_tail_page(slot) else {
-                return Ok(false);
-            };
-
-            self.detach_shared_hot_tail_page_for_append(ctx, slot, shared_tail_page)?;
-            Ok(true)
-        }
     }
 
     /// Free all token slots for a request.
@@ -1645,41 +1601,11 @@ impl TokenKVPool {
         Some(page)
     }
 
-    /// **Deferred evict-drop** (the use-after-free race fix): same as
-    /// [`Self::evict_slot_page`] — drop this slot's attachment and replace the
-    /// logical page with the [`EVICTED_PAGE`] sentinel — but DO NOT return the
-    /// physical page to `free_pages`. The caller parks the returned physical id in
-    /// a one-step keepalive and hands it to [`Self::release_evicted_page`] one
-    /// decode step later, so the just-launched attention that may still be reading
-    /// this page has completed before `alloc_tokens` can reuse it.
-    ///
-    /// Returns the detached physical page id, or `None` (page already evicted,
-    /// shared/pinned, or out of range) on the same conditions as `evict_slot_page`.
-    /// A `None` means nothing was detached, so the caller must NOT later release it.
-    pub fn evict_slot_page_deferred(&mut self, slot: usize, logical_page: usize) -> Option<u32> {
-        let page = *self.page_indices.get(slot)?.get(logical_page)?;
-        if page == EVICTED_PAGE {
-            return None; // already evicted
-        }
-        let page_idx = page as usize;
-        if self.page_ref_count[page_idx] > 0 || self.page_attach_count[page_idx] > 1 {
-            return None; // shared / radix-pinned: not ours to free
-        }
-        self.page_attach_count[page_idx] = self.page_attach_count[page_idx].saturating_sub(1);
-        debug_assert_eq!(
-            self.page_attach_count[page_idx], 0,
-            "evict_slot_page_deferred: single-owner page must reach zero attach"
-        );
-        // Keep logical length intact: sentinel now, physical page parked by caller.
-        self.page_indices[slot][logical_page] = EVICTED_PAGE;
-        Some(page)
-    }
-
-    /// Return a page previously detached by [`Self::evict_slot_page_deferred`] to
-    /// the free list (the keepalive's one-step-later free). The page was parked OUT
-    /// of `free_pages` for the whole keepalive step, so no `alloc_tokens` /
-    /// `reinstate_slot_page` could have re-popped it; at release it is single-owner
-    /// detached (attach 0, ref 0) and recycles cleanly.
+    /// Return a previously parked evicted page to the free list (the
+    /// keepalive's one-step-later free). The page was parked OUT of `free_pages`
+    /// for the whole keepalive step, so no `alloc_tokens` / `reinstate_slot_page`
+    /// could have re-popped it; at release it is single-owner detached (attach 0,
+    /// ref 0) and recycles cleanly.
     pub fn release_evicted_page(&mut self, page: u32) {
         if page == EVICTED_PAGE {
             return;
@@ -1767,15 +1693,6 @@ impl TokenKVPool {
         newly_freed
     }
 
-    /// Number of pages currently pinned by an external reference
-    /// (i.e. `page_ref_count > 0`). M2 observability: the scheduler
-    /// `/v1/stats` endpoint will want this alongside `free_count` so
-    /// operators can see how much of the pool is owned by the radix
-    /// cache vs available for fresh allocation.
-    pub fn retained_count(&self) -> usize {
-        self.page_ref_count.iter().filter(|&&rc| rc > 0).count()
-    }
-
     /// Get the page table for a request (physical page ids in logical-page order).
     pub fn page_indices(&self, slot: usize) -> &[u32] {
         &self.page_indices[slot]
@@ -1789,28 +1706,6 @@ impl TokenKVPool {
     /// Monotonic identifier for the current logical occupant of `slot`.
     pub fn slot_epoch(&self, slot: usize) -> u64 {
         self.slot_epochs[slot]
-    }
-
-    /// Number of logical tokens that can still be allocated without eviction.
-    ///
-    /// This includes:
-    /// - every token position inside completely free pages
-    /// - unused tail space in each live slot's last partially-filled page
-    pub fn free_count(&self) -> usize {
-        let partial_capacity = self
-            .seq_lens
-            .iter()
-            .enumerate()
-            .map(|(slot, _)| {
-                let hot_tail_len = self.slot_hot_tail_len(slot);
-                if hot_tail_len == 0 {
-                    0
-                } else {
-                    self.page_size - hot_tail_len
-                }
-            })
-            .sum::<usize>();
-        self.free_pages.len() * self.page_size + partial_capacity
     }
 
     /// Number of currently free physical pages.
@@ -1931,28 +1826,6 @@ impl TokenKVPool {
             .ok_or_else(|| anyhow::anyhow!("quantized KV pool missing quantized_attn_workspace"))
     }
 
-    /// K norms device pointer for a layer (TurboQuant only).
-    pub fn k_norms_ptr(&self, layer: usize, stream: &cudarc::driver::CudaStream) -> u64 {
-        let (ptr, _guard) = self.k_norms[layer].device_ptr(stream);
-        ptr
-    }
-
-    /// V norms device pointer for a layer (TurboQuant only).
-    pub fn v_norms_ptr(&self, layer: usize, stream: &cudarc::driver::CudaStream) -> u64 {
-        let (ptr, _guard) = self.v_norms[layer].device_ptr(stream);
-        ptr
-    }
-
-    /// K norms CudaSlice ref for a layer (TurboQuant only).
-    pub fn k_norms_slice(&self, layer: usize) -> &CudaSlice<u16> {
-        &self.k_norms[layer]
-    }
-
-    /// V norms CudaSlice ref for a layer (TurboQuant only).
-    pub fn v_norms_slice(&self, layer: usize) -> &CudaSlice<u16> {
-        &self.v_norms[layer]
-    }
-
     /// K data CudaSlice ref for a layer.
     pub fn k_data_slice(&self, layer: usize) -> &CudaSlice<u8> {
         &self.k_data[layer]
@@ -1964,29 +1837,6 @@ impl TokenKVPool {
     /// memset / D2D restore paths that the raw-pointer accessors can't serve.
     pub fn k_data_slice_mut(&mut self, layer: usize) -> &mut CudaSlice<u8> {
         &mut self.k_data[layer]
-    }
-
-    /// V data CudaSlice ref for a layer.
-    pub fn v_data_slice(&self, layer: usize) -> &CudaSlice<u8> {
-        &self.v_data[layer]
-    }
-
-    /// K scales CudaSlice ref for a layer (FP8/INT8 only).
-    pub fn k_scales_slice(&self, layer: usize) -> &CudaSlice<f32> {
-        &self.k_scales[layer]
-    }
-
-    /// V scales CudaSlice ref for a layer (FP8/INT8 only).
-    pub fn v_scales_slice(&self, layer: usize) -> &CudaSlice<f32> {
-        &self.v_scales[layer]
-    }
-
-    /// KIVI per-channel K scale CudaSlice ref for a layer.
-    /// Returns `None` when the pool format carries no per-channel K table
-    /// (the table is allocated for FP8E4M3 / INT8 / INT4; BF16 needs no
-    /// scales and TQ keeps its own norm/codebook state).
-    pub fn k_static_scales_slice(&self, layer: usize) -> Option<&CudaSlice<f32>> {
-        self.k_static_scales.as_ref().map(|s| &s[layer])
     }
 
     /// KIVI per-channel K scale pointer for a layer (raw device address),
@@ -2013,32 +1863,6 @@ impl TokenKVPool {
     pub fn v_work_ptr(&self, stream: &cudarc::driver::CudaStream) -> u64 {
         let (ptr, _guard) = self.v_work.as_ref().expect("v_work").device_ptr(stream);
         ptr
-    }
-
-    /// Build TileLang-compatible metadata for a batch of slots.
-    pub fn build_paged_kv_metadata(&self, slots: &[usize]) -> PagedKVBatchMeta {
-        let mut indptr = Vec::with_capacity(slots.len() + 1);
-        let mut indices = Vec::new();
-        let mut last_page_len = Vec::with_capacity(slots.len());
-
-        indptr.push(0i32);
-        for &slot in slots {
-            let pages = &self.page_indices[slot];
-            for &idx in pages {
-                indices.push(idx as i32);
-            }
-            let prev = *indptr
-                .last()
-                .expect("invariant: indptr always has at least one element (initialized with 0)");
-            indptr.push(prev + pages.len() as i32);
-            last_page_len.push(self.slot_last_page_len(slot) as i32);
-        }
-
-        PagedKVBatchMeta {
-            indptr,
-            indices,
-            last_page_len,
-        }
     }
 
     // Convenience accessors that mirror the old PagedKVPool API so callers can
@@ -2138,372 +1962,6 @@ impl TokenKVPool {
         ctx.stream
             .clone_htod(&page_indices_i32)
             .map_err(|e| anyhow!("H2D page_indices failed: {e}"))
-    }
-
-    fn migrate_from_contiguous_range_bf16(
-        &self,
-        ctx: &super::tensor::DeviceContext,
-        contiguous_k_caches: &[super::tensor::DeviceVec],
-        contiguous_v_caches: &[super::tensor::DeviceVec],
-        max_seq_len_contiguous: usize,
-        slot: usize,
-        start_pos: usize,
-        token_count: usize,
-        k_dst_ptr: impl Fn(usize) -> u64,
-        v_dst_ptr: impl Fn(usize) -> u64,
-    ) -> Result<()> {
-        // PackedBytes is the MLA latent record format; per-head KV migration
-        // kernels do not consume it (P2 brings the FlashMLA pack path).
-        ensure!(
-            !self.is_single_plane(),
-            "paged_kv bf16 migration does not support packed-record formats ({:?})",
-            self.format
-        );
-        if token_count == 0 || self.k_data.is_empty() {
-            return Ok(());
-        }
-
-        let page_indices_gpu = self.upload_page_indices(
-            ctx,
-            self.page_indices_for_token_range(slot, 0, self.seq_len(slot)),
-        )?;
-        let (pi_ptr, _gpi) = page_indices_gpu.device_ptr(&ctx.stream);
-        let stride_page = self.kv_dim * self.page_size;
-
-        for layer in 0..self.num_layers.min(contiguous_k_caches.len()) {
-            let (k_src_ptr, _gk) = contiguous_k_caches[layer].data.device_ptr(&ctx.stream);
-            let (v_src_ptr, _gv) = contiguous_v_caches[layer].data.device_ptr(&ctx.stream);
-            // SAFETY: src pointers are this layer's live contiguous caches and
-            // `pi_ptr` the uploaded page table, all pinned by `_g*` guards;
-            // `k_dst_ptr`/`v_dst_ptr` map `layer` to this pool's device planes.
-            // The kernel copies `token_count` tokens from rows
-            // `[start_pos, start_pos + token_count)` (within
-            // `max_seq_len_contiguous`) into pages named by the table,
-            // stream-ordered on `ctx.stream`.
-            unsafe {
-                ffi::kv_cache_to_paged_range_hnd_cuda(
-                    k_src_ptr as *const ffi::Half,
-                    v_src_ptr as *const ffi::Half,
-                    k_dst_ptr(layer) as *mut ffi::Half,
-                    v_dst_ptr(layer) as *mut ffi::Half,
-                    pi_ptr as *const i32,
-                    start_pos as i32,
-                    max_seq_len_contiguous as i32,
-                    token_count as i32,
-                    self.num_kv_heads as i32,
-                    self.page_size as i32,
-                    self.head_dim as i32,
-                    stride_page as i32,
-                    ctx.stream.cu_stream(),
-                )
-                .result()?;
-            }
-        }
-
-        Ok(())
-    }
-
-    pub fn migrate_from_contiguous_range(
-        &self,
-        ctx: &super::tensor::DeviceContext,
-        contiguous_k_caches: &[super::tensor::DeviceVec],
-        contiguous_v_caches: &[super::tensor::DeviceVec],
-        max_seq_len_contiguous: usize,
-        slot: usize,
-        start_pos: usize,
-        token_count: usize,
-    ) -> Result<()> {
-        self.migrate_from_contiguous_range_bf16(
-            ctx,
-            contiguous_k_caches,
-            contiguous_v_caches,
-            max_seq_len_contiguous,
-            slot,
-            start_pos,
-            token_count,
-            |layer| self.k_data_ptr(layer, &ctx.stream),
-            |layer| self.v_data_ptr(layer, &ctx.stream),
-        )
-    }
-
-    pub fn migrate_from_contiguous(
-        &self,
-        ctx: &super::tensor::DeviceContext,
-        slot: usize,
-        contiguous_k_caches: &[super::tensor::DeviceVec],
-        contiguous_v_caches: &[super::tensor::DeviceVec],
-        max_seq_len_contiguous: usize,
-    ) -> Result<()> {
-        self.migrate_from_contiguous_range(
-            ctx,
-            contiguous_k_caches,
-            contiguous_v_caches,
-            max_seq_len_contiguous,
-            slot,
-            0,
-            self.seq_len(slot),
-        )
-    }
-
-    /// Migrate INT8 KV data from contiguous per-slot cache into the INT8 token pool.
-    ///
-    /// Copies quantized INT8 data + scales from HND contiguous layout to NHD paged
-    /// layout with scale transposition.
-    pub fn migrate_from_contiguous_int8_range(
-        &self,
-        ctx: &super::tensor::DeviceContext,
-        contiguous_k_q: &[cudarc::driver::CudaSlice<i8>],
-        contiguous_v_q: &[cudarc::driver::CudaSlice<i8>],
-        contiguous_k_scales: &[cudarc::driver::CudaSlice<f32>],
-        contiguous_v_scales: &[cudarc::driver::CudaSlice<f32>],
-        max_seq_len_contiguous: usize,
-        start_pos: usize,
-        new_token_indices: &[u32],
-    ) -> Result<()> {
-        // PackedBytes is the MLA latent record format; per-head KV migration
-        // kernels do not consume it (P2 brings the FlashMLA pack path).
-        ensure!(
-            !self.is_single_plane(),
-            "paged_kv int8 migration does not support packed-record formats ({:?})",
-            self.format
-        );
-        let token_count = new_token_indices.len();
-        if token_count == 0 || self.k_data.is_empty() {
-            return Ok(());
-        }
-
-        let token_indices_gpu = self.upload_page_indices(ctx, new_token_indices)?;
-        let (ti_ptr, _gti) = token_indices_gpu.device_ptr(&ctx.stream);
-
-        for layer in 0..self.num_layers.min(contiguous_k_q.len()) {
-            let (k_src_ptr, _gk) = contiguous_k_q[layer].device_ptr(&ctx.stream);
-            let (v_src_ptr, _gv) = contiguous_v_q[layer].device_ptr(&ctx.stream);
-            let (ks_src_ptr, _gks) = contiguous_k_scales[layer].device_ptr(&ctx.stream);
-            let (vs_src_ptr, _gvs) = contiguous_v_scales[layer].device_ptr(&ctx.stream);
-            let (k_dst_ptr, _gkd) = self.k_data[layer].device_ptr(&ctx.stream);
-            let (v_dst_ptr, _gvd) = self.v_data[layer].device_ptr(&ctx.stream);
-            let (ks_dst_ptr, _gksd) = self.k_scales[layer].device_ptr(&ctx.stream);
-            let (vs_dst_ptr, _gvsd) = self.v_scales[layer].device_ptr(&ctx.stream);
-
-            // SAFETY: all eight data/scale pointers are this layer's live
-            // CudaSlices pinned by `_g*` guards; `ti_ptr` is the uploaded
-            // token-row table. The kernel moves exactly `token_count` tokens
-            // from contiguous rows `[start_pos, ..)` into the pool rows named
-            // by the table, stream-ordered on `ctx.stream`.
-            unsafe {
-                ffi::kv_cache_to_paged_int8_range_cuda(
-                    k_src_ptr as *const i8,
-                    v_src_ptr as *const i8,
-                    ks_src_ptr as *const f32,
-                    vs_src_ptr as *const f32,
-                    k_dst_ptr as *mut i8,
-                    v_dst_ptr as *mut i8,
-                    ks_dst_ptr as *mut f32,
-                    vs_dst_ptr as *mut f32,
-                    ti_ptr as *const i32,
-                    start_pos as i32,
-                    max_seq_len_contiguous as i32,
-                    token_count as i32,
-                    self.num_kv_heads as i32,
-                    self.head_dim as i32,
-                    self.kv_dim as i32,
-                    ctx.stream.cu_stream(),
-                )
-                .result()?;
-            }
-        }
-
-        Ok(())
-    }
-
-    pub fn migrate_from_contiguous_int8(
-        &self,
-        ctx: &super::tensor::DeviceContext,
-        slot: usize,
-        contiguous_k_q: &[cudarc::driver::CudaSlice<i8>],
-        contiguous_v_q: &[cudarc::driver::CudaSlice<i8>],
-        contiguous_k_scales: &[cudarc::driver::CudaSlice<f32>],
-        contiguous_v_scales: &[cudarc::driver::CudaSlice<f32>],
-        max_seq_len_contiguous: usize,
-    ) -> Result<()> {
-        let token_idxs = self.token_rows_for_range(slot, 0, self.seq_len(slot));
-        self.migrate_from_contiguous_int8_range(
-            ctx,
-            contiguous_k_q,
-            contiguous_v_q,
-            contiguous_k_scales,
-            contiguous_v_scales,
-            max_seq_len_contiguous,
-            0,
-            &token_idxs,
-        )
-    }
-
-    /// Migrate BF16 contiguous KV to FP8 paged pool (quantize + scatter).
-    ///
-    /// Reads bf16 from contiguous HND layout, quantizes to FP8 E4M3, and
-    /// scatters to NHD paged layout in a single fused kernel per layer.
-    pub fn migrate_from_contiguous_fp8_range(
-        &self,
-        ctx: &super::tensor::DeviceContext,
-        contiguous_k_caches: &[super::tensor::DeviceVec],
-        contiguous_v_caches: &[super::tensor::DeviceVec],
-        max_seq_len_contiguous: usize,
-        start_pos: usize,
-        new_token_indices: &[u32],
-    ) -> Result<()> {
-        // PackedBytes is the MLA latent record format; per-head KV migration
-        // kernels do not consume it (P2 brings the FlashMLA pack path).
-        ensure!(
-            !self.is_single_plane(),
-            "paged_kv fp8 migration does not support packed-record formats ({:?})",
-            self.format
-        );
-        let token_count = new_token_indices.len();
-        if token_count == 0 || self.k_data.is_empty() {
-            return Ok(());
-        }
-
-        let token_indices_gpu = self.upload_page_indices(ctx, new_token_indices)?;
-        for layer in 0..self.num_layers.min(contiguous_k_caches.len()) {
-            quantize_scatter_kv_fp8_range(
-                ctx,
-                &contiguous_k_caches[layer],
-                self.k_data_ptr(layer, &ctx.stream),
-                self.k_scales_ptr(layer, &ctx.stream),
-                &token_indices_gpu,
-                start_pos,
-                max_seq_len_contiguous,
-                token_count,
-                self.num_kv_heads,
-                self.head_dim,
-                self.kv_dim,
-            )?;
-            quantize_scatter_kv_fp8_range(
-                ctx,
-                &contiguous_v_caches[layer],
-                self.v_data_ptr(layer, &ctx.stream),
-                self.v_scales_ptr(layer, &ctx.stream),
-                &token_indices_gpu,
-                start_pos,
-                max_seq_len_contiguous,
-                token_count,
-                self.num_kv_heads,
-                self.head_dim,
-                self.kv_dim,
-            )?;
-        }
-
-        Ok(())
-    }
-
-    pub fn migrate_from_contiguous_fp8(
-        &self,
-        ctx: &super::tensor::DeviceContext,
-        slot: usize,
-        contiguous_k_caches: &[super::tensor::DeviceVec],
-        contiguous_v_caches: &[super::tensor::DeviceVec],
-        max_seq_len_contiguous: usize,
-    ) -> Result<()> {
-        let token_idxs = self.token_rows_for_range(slot, 0, self.seq_len(slot));
-        self.migrate_from_contiguous_fp8_range(
-            ctx,
-            contiguous_k_caches,
-            contiguous_v_caches,
-            max_seq_len_contiguous,
-            0,
-            &token_idxs,
-        )
-    }
-
-    pub fn migrate_from_contiguous_turboquant_range(
-        &self,
-        ctx: &super::tensor::DeviceContext,
-        contiguous_k_caches: &[super::tensor::DeviceVec],
-        contiguous_v_caches: &[super::tensor::DeviceVec],
-        max_seq_len_contiguous: usize,
-        start_pos: usize,
-        new_token_indices: &[u32],
-    ) -> Result<()> {
-        // PackedBytes is the MLA latent record format; per-head KV migration
-        // kernels do not consume it (P2 brings the FlashMLA pack path).
-        ensure!(
-            !self.is_single_plane(),
-            "paged_kv turboquant migration does not support packed-record formats ({:?})",
-            self.format
-        );
-        let token_count = new_token_indices.len();
-        if token_count == 0 || self.k_data.is_empty() {
-            return Ok(());
-        }
-
-        let token_indices_gpu = self.upload_page_indices(ctx, new_token_indices)?;
-        let k_state = self
-            .tq_k_state
-            .as_ref()
-            .ok_or_else(|| anyhow!("TurboQuant K state missing"))?;
-        let v_state = self
-            .tq_v_state
-            .as_ref()
-            .ok_or_else(|| anyhow!("TurboQuant V state missing"))?;
-
-        let (ti_ptr, _gti) = token_indices_gpu.device_ptr(&ctx.stream);
-        for layer in 0..self.num_layers.min(contiguous_k_caches.len()) {
-            let (k_src_ptr, _gk) = contiguous_k_caches[layer].data.device_ptr(&ctx.stream);
-            let (v_src_ptr, _gv) = contiguous_v_caches[layer].data.device_ptr(&ctx.stream);
-            // SAFETY: src pointers are this layer's live contiguous caches
-            // pinned by `_g*` guards; dst is the pool-owned bf16 K/V work
-            // buffer (sized for every pool token row). The kernel writes only
-            // the `token_count` rows named by `ti_ptr`, stream-ordered on
-            // `ctx.stream` — the TQ quantize pass below consumes them on the
-            // same stream.
-            unsafe {
-                ffi::kv_cache_to_paged_range_cuda(
-                    k_src_ptr as *const ffi::Half,
-                    v_src_ptr as *const ffi::Half,
-                    self.k_work_ptr(&ctx.stream) as *mut ffi::Half,
-                    self.v_work_ptr(&ctx.stream) as *mut ffi::Half,
-                    ti_ptr as *const i32,
-                    start_pos as i32,
-                    max_seq_len_contiguous as i32,
-                    token_count as i32,
-                    self.num_kv_heads as i32,
-                    self.head_dim as i32,
-                    self.kv_dim as i32,
-                    ctx.stream.cu_stream(),
-                )
-                .result()?;
-            }
-        }
-
-        for layer in 0..self.num_layers.min(contiguous_k_caches.len()) {
-            turboquant_quantize_paged_single(
-                ctx,
-                self.k_work_ptr(&ctx.stream),
-                self.k_data_slice(layer),
-                self.k_norms_slice(layer),
-                &token_indices_gpu,
-                k_state,
-                layer,
-                self.num_kv_heads,
-                self.head_dim,
-                token_count,
-            )?;
-            turboquant_quantize_paged_single(
-                ctx,
-                self.v_work_ptr(&ctx.stream),
-                self.v_data_slice(layer),
-                self.v_norms_slice(layer),
-                &token_indices_gpu,
-                v_state,
-                layer,
-                self.num_kv_heads,
-                self.head_dim,
-                token_count,
-            )?;
-        }
-
-        Ok(())
     }
 }
 
