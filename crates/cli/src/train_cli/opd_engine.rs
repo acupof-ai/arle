@@ -62,7 +62,7 @@ pub(super) fn load_opd_infer_student(
             // Whole-step decode graph for the rollout: eager per-token decode is
             // host-launch-bound (~156 ms/token), the OPD step's dominant cost.
             cuda: runtime.cuda_runtime_flags(),
-            tp_size: None,
+            world_size: None,
             ..EngineLoadConfig::single_sequence(max_seq_len)
         },
     )
@@ -261,7 +261,7 @@ pub(super) fn load_agent_opd_serve_student(
             // depth sweep + an in-loop A/B.
             mtp_draft_tokens: args.runtime.mtp_draft_tokens,
             cuda: args.runtime.cuda_runtime_flags(),
-            tp_size: None,
+            world_size: None,
             ..EngineLoadConfig::default()
         },
     )

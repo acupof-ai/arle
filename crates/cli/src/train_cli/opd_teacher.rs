@@ -215,7 +215,7 @@ pub(super) fn load_opd_infer_teacher(
             // pool starve a co-resident student on one GPU.
             mem_fraction_static,
             memory_budget_bytes,
-            tp_size: None,
+            world_size: None,
             ..EngineLoadConfig::single_sequence(max_seq_len)
         },
     )

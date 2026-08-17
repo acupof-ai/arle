@@ -123,7 +123,7 @@ pub(crate) fn run_spec_draft(args: TrainSpecDraftArgs) -> Result<()> {
         /*cuda_graph=*/ false,
         EngineLoadConfig {
             mem_fraction_static: args.trunk_mem_fraction,
-            tp_size: None,
+            world_size: None,
             ..EngineLoadConfig::single_sequence(args.max_len)
         },
     )

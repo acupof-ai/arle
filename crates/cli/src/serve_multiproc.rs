@@ -52,25 +52,6 @@ fn engine_ready_timeout(model_path: &str) -> Duration {
 // one classifier shared with `build_cuda_engine`, covering DSv4 AND the
 // Qwen3.5/3.6 MoE TpRuntime consumer.)
 
-/// Resolve the multiproc world size from the environment. `INFER_TP_SIZE` wins,
-/// else the comma-separated `INFER_CUDA_DEVICES` count, else 1 (single GPU — no
-/// worker spawn, the coordinator serves alone).
-#[must_use]
-pub(crate) fn world_size_from_env() -> usize {
-    if let Some(n) = std::env::var("INFER_TP_SIZE")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|&n| n > 0)
-    {
-        return n;
-    }
-    std::env::var("INFER_CUDA_DEVICES")
-        .ok()
-        .map(|list| list.split(',').filter(|s| !s.trim().is_empty()).count())
-        .filter(|&n| n > 0)
-        .unwrap_or(1)
-}
-
 /// DP group count (default 1). Each group is an independent TP world of
 /// `world_size` ranks on disjoint GPUs.
 #[must_use]
@@ -120,7 +101,7 @@ pub(crate) fn bind_relay_and_spawn_workers(
     model_path: &str,
     engine_config: &EngineLoadConfig,
 ) -> Result<Vec<MultiprocCoordinator>> {
-    let world_size = world_size_from_env();
+    let world_size = engine_config.world_size.unwrap_or(1);
     if world_size <= 1 {
         log::info!(
             "[multiproc-coord] world_size={world_size}; serving single-process (no workers)"
@@ -692,8 +673,10 @@ fn spawn_workers(
         cmd.env("INFER_CUDA_DEVICE", cuda_ordinal.to_string());
         // The TP executors read their TP rank from INFER_TP_RANK; bind it to this
         // worker's rank so the per-rank EP split + NCCL rank match.
+        // INFER_TP_SIZE / INFER_ATTN_CP_SIZE are set by TpEnvGuard inside
+        // build_cuda_engine from EngineLoadConfig — the config is the single
+        // source of truth, not a parallel env-var channel.
         cmd.env("INFER_TP_RANK", rank.to_string());
-        cmd.env("INFER_TP_SIZE", world_size.to_string());
         // MASTER_ADDR/PORT + INFER_NCCL_ID_FILE/INFER_NCCL_UNIQUE_ID are
         // inherited from the coordinator's env (set before spawning workers).
 

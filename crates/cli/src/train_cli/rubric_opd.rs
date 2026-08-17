@@ -279,7 +279,7 @@ pub(super) fn run_rubric_opd_impl(args: TrainRubricOpdArgs) -> Result<()> {
             dspark_sps_bias_ms: args.runtime.dspark_sps_bias_ms,
             dspark_sps_row_ms: args.runtime.dspark_sps_row_ms,
             // The student is always single-GPU; the judge may be multi-GPU.
-            tp_size: Some(1),
+            world_size: Some(1),
             ..EngineLoadConfig::default()
         },
     )
@@ -369,7 +369,11 @@ pub(super) fn run_rubric_opd_impl(args: TrainRubricOpdArgs) -> Result<()> {
             .ok_or_else(|| anyhow!("teacher path is not valid UTF-8"))?;
         let judge_prompt_cap = (student_seq * 2 + 1024).max(2048);
         let judge_total = judge_prompt_cap + args.max_verdict_tokens;
-        let tp_size = crate::serve_multiproc::world_size_from_env();
+        let tp_size = std::env::var("INFER_TP_SIZE")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(1);
         let judge_config = EngineLoadConfig {
             num_slots: args.judge_num_slots,
             page_size: 16,
@@ -377,7 +381,7 @@ pub(super) fn run_rubric_opd_impl(args: TrainRubricOpdArgs) -> Result<()> {
             max_prompt_tokens: judge_prompt_cap,
             max_total_tokens: judge_total,
             chunked_prefill_size: Some(judge_prompt_cap),
-            tp_size: Some(tp_size),
+            world_size: Some(tp_size),
             ..EngineLoadConfig::default()
         };
         if infer_api::cuda_model_takes_multiproc_serve(teacher_str) {
@@ -689,12 +693,13 @@ impl JudgeServer {
                 &port.to_string(),
                 "--bind",
                 "127.0.0.1",
+                "--tensor-parallel-size",
+                &tp_size.to_string(),
                 "--max-prompt-tokens",
                 &max_prompt_tokens.to_string(),
                 "--max-total-tokens",
                 &max_total_tokens.to_string(),
             ])
-            .env("INFER_TP_SIZE", tp_size.to_string())
             .env("CUDA_VISIBLE_DEVICES", judge_gpus)
             .spawn()
             .context("spawn judge serve process")?;

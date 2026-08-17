@@ -115,13 +115,13 @@ fn run_config(config: ServeConfig) -> ExitCode {
     // coordinator returns before that hook exists. Fail fast rather than serve
     // with the sidecar silently inert — a no-op flag must reject, not no-op.
     // Gate on the RESOLVED world size, not just model kind: a multiproc-capable
-    // model (Qwen3.5/3.6, DSv4) at INFER_TP_SIZE=1 serves single-process, where
-    // the sidecar DOES run — rejecting that would block DSpark test-time training
-    // on the one config that supports it.
+    // model (Qwen3.5/3.6, DSv4) at --tensor-parallel-size 1 serves single-process,
+    // where the sidecar DOES run — rejecting that would block DSpark test-time
+    // training on the one config that supports it.
     #[cfg(all(unix, feature = "cuda"))]
     if config.backend == ServeBackend::Cuda
         && config.options.spec.dspark_markov_init.is_some()
-        && crate::serve_multiproc::world_size_from_env() > 1
+        && config.options.engine_config.world_size.unwrap_or(1) > 1
         && infer_api::cuda_model_takes_multiproc_serve(&config.options.model_path)
     {
         eprintln!(
@@ -472,7 +472,8 @@ fn resolve_engine_config(
     };
     let mut config = EngineLoadConfig {
         kv_cache_dtype,
-        tp_size: None,
+        world_size: Some(serve_args.tensor_parallel_size * serve_args.context_parallel_size),
+        context_parallel_size: Some(serve_args.context_parallel_size),
         ..EngineLoadConfig::default()
     };
 
