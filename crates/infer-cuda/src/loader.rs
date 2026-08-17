@@ -4294,7 +4294,7 @@ impl SafetensorLoader {
         let first_expert = names.expert(split.local_expert_start);
         let is_w4a16 = self
             .quant_view_for(&first_expert.w1)?
-            .map(|v| matches!(v.format, QuantFormat::W4A16))
+            .map(|v| matches!(v.format, QuantFormat::W4A16 { .. }))
             .unwrap_or(false);
 
         let (w13_grouped, w2_grouped, w13_w4a16, w2_w4a16, hidden_dim, intermediate, num_groups) =
