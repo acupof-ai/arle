@@ -269,7 +269,13 @@ impl Qwen35Model {
         cp: crate::context_parallel::CpContext,
     ) -> Result<TensorId> {
         self.forward_batch_hidden_indices_retaining(
-            store, tape, token_indices, positions, batch, cp, false,
+            store,
+            tape,
+            token_indices,
+            positions,
+            batch,
+            cp,
+            false,
         )
     }
 
@@ -289,7 +295,13 @@ impl Qwen35Model {
         cp: crate::context_parallel::CpContext,
     ) -> Result<TensorId> {
         self.forward_batch_hidden_indices_retaining(
-            store, tape, token_indices, positions, batch, cp, true,
+            store,
+            tape,
+            token_indices,
+            positions,
+            batch,
+            cp,
+            true,
         )
     }
 

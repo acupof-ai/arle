@@ -57,7 +57,8 @@ def one_run(base, prompt, seed):
                 continue
             if ttft is None:
                 ttft = time.time() - t0
-            choice = d.get("choices", [{}])[0]
+            choices = d.get("choices") or [{}]
+            choice = choices[0]
             text += choice.get("text", "")
             if d.get("usage"):
                 prompt_tokens = d["usage"].get("prompt_tokens")
