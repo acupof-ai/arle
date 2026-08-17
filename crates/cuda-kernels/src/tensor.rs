@@ -188,6 +188,11 @@ pub struct DeviceContext {
     pub comm_stream: Arc<CudaStream>,
     /// CUDA device ordinal this context is bound to.
     pub ordinal: u32,
+    /// Reusable CUDA events for pipeline fences. A fence returns its event here
+    /// on drop; the next fence re-uses it only after `cuEventQuery` confirms
+    /// the previous record completed. Eliminates per-fence `cuEventCreate`/
+    /// `cuEventDestroy` (160/step at TP=8 decode).
+    event_pool: Arc<Mutex<Vec<CudaEvent>>>,
 }
 
 /// Logical stream lane used by the serving pipeline.
@@ -221,7 +226,8 @@ pub enum CudaPipelineFenceStatus {
 pub struct CudaPipelineFence {
     device_ordinal: u32,
     producer: CudaPipelineStreamKind,
-    event: CudaEvent,
+    event: Option<CudaEvent>,
+    event_pool: Arc<Mutex<Vec<CudaEvent>>>,
 }
 
 impl CudaPipelineFence {
@@ -237,13 +243,14 @@ impl CudaPipelineFence {
 
     /// Poll the event without blocking the host.
     pub fn query(&self) -> Result<CudaPipelineFenceStatus> {
-        self.event
+        let event = self.event.as_ref().expect("fence event taken");
+        event
             .context()
             .bind_to_thread()
             .map_err(|e| anyhow!("Bind CUDA context before pipeline fence query failed: {e}"))?;
         // SAFETY: `self.event` is a live CudaEvent owned by this fence and its
         // context was bound to the thread above; query has no other effects.
-        match unsafe { cudarc::driver::result::event::query(self.event.cu_event()) } {
+        match unsafe { cudarc::driver::result::event::query(event.cu_event()) } {
             Ok(()) => Ok(CudaPipelineFenceStatus::Ready),
             Err(err) if err.0 == cudarc::driver::sys::CUresult::CUDA_ERROR_NOT_READY => {
                 Ok(CudaPipelineFenceStatus::NotReady)
@@ -255,6 +262,17 @@ impl CudaPipelineFence {
     /// Convenience wrapper for callers that only need a boolean readiness check.
     pub fn is_ready(&self) -> Result<bool> {
         Ok(matches!(self.query()?, CudaPipelineFenceStatus::Ready))
+    }
+}
+
+impl Drop for CudaPipelineFence {
+    fn drop(&mut self) {
+        // Return the event to the pool for re-use. The GPU may still be
+        // touching it; `record_pipeline_fence` skips in-flight events via
+        // cuEventQuery before re-recording.
+        if let Some(event) = self.event.take() {
+            self.event_pool.lock().unwrap().push(event);
+        }
     }
 }
 
@@ -428,6 +446,7 @@ impl DeviceContext {
             copy_stream,
             comm_stream,
             ordinal,
+            event_pool: Arc::new(Mutex::new(Vec::new())),
         })
     }
 
@@ -549,17 +568,41 @@ impl DeviceContext {
         &self,
         producer: CudaPipelineStreamKind,
     ) -> Result<CudaPipelineFence> {
-        let event = self
-            .ctx
-            .new_event(None)
-            .map_err(|e| anyhow!("Alloc CUDA pipeline fence failed: {e}"))?;
+        let event = {
+            let mut pool = self.event_pool.lock().unwrap();
+            // Find a completed event to re-use. cuEventQuery on an in-flight
+            // record returns NOT_READY — skip it. An empty pool or all-in-flight
+            // pool allocates fresh; the pool grows to the max in-flight count
+            // and stays there.
+            let mut ready = None;
+            for (i, e) in pool.iter().enumerate() {
+                match unsafe { cudarc::driver::result::event::query(e.cu_event()) } {
+                    Ok(()) => {
+                        ready = Some(i);
+                        break;
+                    }
+                    Err(err) if err.0 == cudarc::driver::sys::CUresult::CUDA_ERROR_NOT_READY => {
+                        continue;
+                    }
+                    Err(err) => return Err(anyhow!("CUDA event query in pool failed: {err}")),
+                }
+            }
+            match ready {
+                Some(i) => pool.swap_remove(i),
+                None => self
+                    .ctx
+                    .new_event(None)
+                    .map_err(|e| anyhow!("Alloc CUDA pipeline fence failed: {e}"))?,
+            }
+        };
         event
             .record(self.pipeline_stream(producer))
             .map_err(|e| anyhow!("Record CUDA pipeline fence on {producer:?} failed: {e}"))?;
         Ok(CudaPipelineFence {
             device_ordinal: self.ordinal,
             producer,
-            event,
+            event: Some(event),
+            event_pool: self.event_pool.clone(),
         })
     }
 
@@ -576,7 +619,7 @@ impl DeviceContext {
             self.ordinal
         );
         self.pipeline_stream(consumer)
-            .wait(&fence.event)
+            .wait(fence.event.as_ref().expect("fence event taken"))
             .map_err(|e| {
                 anyhow!(
                     "CUDA pipeline fence wait failed for {consumer:?} waiting on {:?}: {e}",
