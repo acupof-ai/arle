@@ -359,6 +359,11 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         if !self.kv.is_active() || !self.config.enable_prefix_cache {
             return Vec::new();
         }
+        // 2D (attn_tp × cp): attach is skipped, so the radix is write-only —
+        // publish would burn tp_sync_min + retain for blocks no rank re-attaches.
+        if self.executor.kv_shard_spec().is_some() {
+            return Vec::new();
+        }
 
         let shard = self.cp_shard_identity();
         self.radix.set_cp_shard(shard);
@@ -400,26 +405,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         }
         .min(local_sealed);
 
-        // Exchange the sealed extent across the cp group. Every rank seals the
-        // same rank-identical token stream (SPMD lockstep), so the exchange
-        // degenerates to a min-reduce: rank c contributes `rank + local*size`
-        // (the first global block it did NOT seal), and the world min is the
-        // common prefix every shard sealed. tp_sync_min spans the full world;
-        // attn_tp peers of one cp column are pool-identical under lockstep, so
-        // the world min equals the cp min. Symmetric on every rank — publish
-        // runs at SPMD request completion — and once per publish batch.
-        let sealed_extent = shard.rank + local_sealed * shard.size;
-        let common_extent = if shard.size > 1 {
-            match self.executor.tp_sync_min(sealed_extent) {
-                Ok(extent) => extent,
-                Err(err) => {
-                    log::error!("prefix publish seal exchange failed for slot {slot}: {err:#}");
-                    return Vec::new();
-                }
-            }
-        } else {
-            sealed_extent
-        };
+        let common_extent = shard.rank + local_sealed * shard.size;
         if common_extent == 0 {
             return Vec::new();
         }
