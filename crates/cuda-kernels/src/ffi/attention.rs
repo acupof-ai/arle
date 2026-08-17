@@ -345,13 +345,17 @@ unsafe extern "C" {
 
     /// 2D cross-cp flash-decoding merge (`csrc/attention/cross_cp_merge.cu`):
     /// combine `cp` sequence-shard partials into the full attention output.
-    /// `lse_gather` is `[cp, rows]` f32, `out_gather` is `[cp, rows, head_dim]`
-    /// bf16 (rank-major: rank r's partial at row `r * rows`); `out` is
-    /// `[rows, head_dim]` bf16. `out = sum_c w_c * out_c / sum_c w_c`,
-    /// `w_c = exp(lse_c - max lse)`, f32 accumulation.
+    /// `packed` is `[cp, section_bf16]` bf16 rank-major; per-rank section holds
+    /// `rows` f32 lse (as bf16 pairs) then `rows * head_dim` bf16 out.
+    /// `lse_stride_f32 = section_bf16 / 2`, `out_off_bf16 = rows * 2`,
+    /// `out_stride_bf16 = section_bf16`. `out` is `[rows, head_dim]` bf16.
+    /// `out = sum_c w_c * out_c / sum_c w_c`, `w_c = exp(lse_c - max lse)`,
+    /// f32 accumulation.
     pub fn cross_cp_merge_bf16_hd256_cuda(
-        lse_gather: *const f32,
-        out_gather: *const Half,
+        packed: *const Half,
+        lse_stride_f32: i32,
+        out_off_bf16: i32,
+        out_stride_bf16: i32,
         out: *mut Half,
         cp_size: i32,
         rows: i32,
