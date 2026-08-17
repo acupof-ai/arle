@@ -227,6 +227,8 @@ pub struct KvTierStore {
     host_lru: BTreeSet<(u64, u64)>,
     clock: u64,
     disk: Option<DiskTier>,
+    host_read_hits: u64,
+    disk_read_hits: u64,
 }
 
 struct HostDemotedEntry {
@@ -982,6 +984,8 @@ impl KvTierStore {
             host_lru: BTreeSet::new(),
             clock: 0,
             disk: None,
+            host_read_hits: 0,
+            disk_read_hits: 0,
         }
     }
 
@@ -1324,6 +1328,13 @@ impl KvTierStore {
         })
     }
 
+    pub fn read_hits(&self) -> infer_seam::KvTierReadHits {
+        infer_seam::KvTierReadHits {
+            host_demoted: self.host_read_hits,
+            disk: self.disk_read_hits,
+        }
+    }
+
     pub fn is_full(&self) -> bool {
         let host_full = self.host.len() >= self.host_capacity_pages;
         let disk_full = self
@@ -1539,10 +1550,12 @@ impl KvTierStore {
     }
 
     /// Fetch a payload for promotion. Host and mmap hits borrow their payload;
-    /// direct-I/O hits own the aligned read result.
+    /// direct-I/O hits own the aligned read result. Disk hits are re-inserted
+    /// into host L2 (evict-if-full) so repeated promotes don't re-read NVMe.
     pub fn read(&mut self, key: u64) -> Result<Cow<'_, [u8]>> {
-        // Host hit: bump LRU, return owned payload.
+        // Host hit: bump LRU, return borrowed payload.
         if let Some(old_stamp) = self.host.get(&key).map(|entry| entry.stamp) {
+            self.host_read_hits += 1;
             let stamp = self.next_stamp();
             self.host_lru.remove(&(old_stamp, key));
             self.host_lru.insert((stamp, key));
@@ -1550,25 +1563,33 @@ impl KvTierStore {
             entry.stamp = stamp;
             return Ok(Cow::Borrowed(entry.payload.as_slice()));
         }
-        if let Some(disk) = self.disk.as_mut() {
+        let disk_payload = if let Some(disk) = self.disk.as_mut() {
             disk.drain_completions();
             if disk.pending.contains_key(&key) {
                 let len = disk.pending[&key].payload.len();
                 disk.stats.read_ops += 1;
                 disk.stats.useful_read_bytes += len as u64;
-                return Ok(Cow::Borrowed(disk.pending[&key].payload.as_slice()));
-            }
-            let Some(record) = disk.keys.get(&key).copied() else {
-                return Err(anyhow!("KV tier store has no entry for key {key}"));
-            };
-            let len = if record.len == 0 {
-                self.bytes_per_page
+                self.disk_read_hits += 1;
+                (*disk.pending[&key].payload).clone()
             } else {
-                record.len.min(self.bytes_per_page)
-            };
-            return Ok(disk.read_payload(record.slot, len)?);
-        }
-        Err(anyhow!("KV tier store has no entry for key {key}"))
+                let Some(record) = disk.keys.get(&key).copied() else {
+                    return Err(anyhow!("KV tier store has no entry for key {key}"));
+                };
+                let len = if record.len == 0 {
+                    self.bytes_per_page
+                } else {
+                    record.len.min(self.bytes_per_page)
+                };
+                let payload = disk.read_payload(record.slot, len)?.into_owned();
+                self.disk_read_hits += 1;
+                payload
+            }
+        } else {
+            return Err(anyhow!("KV tier store has no entry for key {key}"));
+        };
+        // Promote to host L2 (best-effort: evict-if-full via insert_inner).
+        self.insert_inner(key, disk_payload.clone());
+        Ok(Cow::Owned(disk_payload))
     }
 
     pub fn read_many(&mut self, keys: &[u64]) -> Result<Vec<Vec<u8>>> {
@@ -1579,6 +1600,7 @@ impl KvTierStore {
         let mut disk_reads = Vec::new();
         for (index, key) in keys.iter().copied().enumerate() {
             if let Some(old_stamp) = self.host.get(&key).map(|entry| entry.stamp) {
+                self.host_read_hits += 1;
                 let stamp = self.next_stamp();
                 self.host_lru.remove(&(old_stamp, key));
                 self.host_lru.insert((stamp, key));
@@ -1599,6 +1621,7 @@ impl KvTierStore {
                     .expect("pending disk payload observed above");
                 disk.stats.read_ops += 1;
                 disk.stats.useful_read_bytes += payload.len() as u64;
+                self.disk_read_hits += 1;
                 values[index] = Some(payload);
                 continue;
             }
@@ -1608,6 +1631,7 @@ impl KvTierStore {
                 .and_then(|disk| disk.keys.get(&key))
                 .copied()
                 .ok_or_else(|| anyhow!("KV tier store has no entry for key {key}"))?;
+            self.disk_read_hits += 1;
             let len = if record.len == 0 {
                 self.bytes_per_page
             } else {

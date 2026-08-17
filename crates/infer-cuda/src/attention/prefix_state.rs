@@ -355,6 +355,10 @@ impl Dsv4PrefixStatePool {
         self.store.io_stats()
     }
 
+    pub(crate) fn location(&self, key: u64) -> Option<infer_seam::KvTierLocation> {
+        self.store.location(key)
+    }
+
     /// Insert (LAST producer wins): a recycled id's newest content is always the
     /// correct one, since a completed page is radix-shared or slot-exclusive.
     /// When both levels are full, drop oldest entries and retry. Eviction skips

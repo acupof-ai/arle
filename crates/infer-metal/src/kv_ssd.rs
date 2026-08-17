@@ -137,6 +137,12 @@ impl MetalPageStore {
         self.tier_to_logical.len()
     }
 
+    pub(super) fn kv_tier_read_hits(&self) -> infer_seam::KvTierReadHits {
+        self.tier
+            .as_ref()
+            .map_or_else(infer_seam::KvTierReadHits::default, KvTierStore::read_hits)
+    }
+
     pub(super) fn kv_tier_io_stats(&self) -> infer_seam::KvTierIoStats {
         let stats = self
             .tier

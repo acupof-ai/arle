@@ -282,7 +282,11 @@ pub fn dram_l2_budget(
     policy: DramTierPolicy,
 ) -> usize {
     let (Some(avail), Some(total)) = (available_ram_bytes, total_ram_bytes) else {
-        return policy.floor_bytes;
+        // /proc is Linux-only; on other OSes there is no L2 host tier to budget.
+        if cfg!(target_os = "linux") {
+            return policy.floor_bytes;
+        }
+        return 0;
     };
     tier_budget_with_reserve(
         avail,

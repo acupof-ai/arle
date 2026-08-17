@@ -460,6 +460,22 @@ impl Qwen35CudaExecutor {
         merge_tier_io_stats(&slot, &recall)
     }
 
+    pub(crate) fn kv_tier_read_hits(&self) -> infer_seam::KvTierReadHits {
+        let mut hits = self.slot_tier.read_hits();
+        if let Some(recall) = self.recall_tier.as_ref() {
+            let r = recall.read_hits();
+            hits.host_demoted += r.host_demoted;
+            hits.disk += r.disk;
+        }
+        hits
+    }
+
+    pub(crate) fn kv_tier_location(&self, key: u64) -> Option<infer_seam::KvTierLocation> {
+        self.slot_tier
+            .location(key)
+            .or_else(|| self.recall_tier.as_ref().and_then(|r| r.location(key)))
+    }
+
     fn tp_min_usize(&self, value: usize, what: &str) -> Result<usize> {
         let capped = i32::try_from(value.min(i32::MAX as usize)).unwrap_or(i32::MAX);
         self.model
@@ -742,7 +758,7 @@ impl Qwen35CudaExecutor {
         // so the device pool is sized at plan.pool_pages / cp; the host
         // admission pool follows via effective_total_pages (1:1 id contract).
         let pool_pages = if model.tp.two_d_engaged() {
-            plan.pool_pages / model.tp.attn_cp_size()
+            plan.pool_pages.div_ceil(model.tp.attn_cp_size())
         } else {
             plan.pool_pages
         };
@@ -1328,11 +1344,9 @@ impl Qwen35CudaExecutor {
                 .expect("full_attn_kv present (full_attn_paged)");
             let cp_rank = self.model.tp.attn_cp_rank();
             let cp_size = self.model.tp.attn_cp_size();
-            let max_local_pages = self
-                .model
-                .max_seq_len()
-                .div_ceil(pool.page_size)
-                .div_ceil(cp_size);
+            let max_global_pages = self.model.max_seq_len().div_ceil(pool.page_size);
+            let max_local_pages =
+                infer_seam::ShardSpec::new(cp_rank, cp_size).local_page_count(max_global_pages);
             let meta = match &mut self.sharded_decode_meta[slot] {
                 Some(m) => m,
                 none => none.insert(crate::loader::PageMeta::persistent_sharded_decode(
