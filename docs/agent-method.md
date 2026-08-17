@@ -106,6 +106,15 @@ reading the code collapsed it to "one per-row `for` at `dsv4.rs:1872` → batch 
 - **Greedy-decode the actual generation when a metric looks catastrophic** — 3
   weeks of "FP8 KV broken" collapsed when one `eprintln!` showed a test-framework
   artifact.
+- **Cross-rank state that feeds a collective or a shared budget must be aligned
+  explicitly** — a rank-local fallback (prefix-attach failure, sidecar miss,
+  budget solve) degrades one rank while peers proceed; without an align step the
+  next collective desyncs (garble or hang). Align once per admission, off the
+  hot path: min-reduce for lengths (prefix matched + restored), divide-by-world
+  for budgets (KV tier), lockstep for shapes (`seq_len` — under CP only page
+  ownership may diverge, never the lengths themselves). Three hits in one week:
+  tier-budget-not-divided-by-world, prefix-match-no-cross-rank-min-reduce,
+  prefix-restore-min-reduce.
 
 ## Execution hygiene (Claude and delegated agents alike)
 
