@@ -645,9 +645,12 @@ impl Qwen35CudaExecutor {
             dspark_draft_model.is_none() || mtp_draft_tokens.is_none(),
             "Qwen3.5/3.6 DSpark and MTP speculative decode are mutually exclusive"
         );
-        // Per-request token ceiling: the model's positional budget + the host pool's
-        // admission span.
-        let max_seq_len = total_pages * SUPPORTED_PAGE_SIZE;
+        // Per-request token ceiling: the admission cap (`--max-total-tokens`)
+        // or the advisory pool span, whichever is larger — the same formula the
+        // scheduler uses (loaded.rs `scheduler_config`). The device pool is
+        // profiled from free VRAM below and can exceed both; the post-load M2
+        // clamp binds admission down to it if it is smaller.
+        let max_seq_len = max_total_tokens.max(total_pages * SUPPORTED_PAGE_SIZE);
         let model_t0 = Instant::now();
         // `None`: the checkpoint-native NextN-MTP head stays unwired; DSpark is loaded
         // below from its own checkpoint dir.

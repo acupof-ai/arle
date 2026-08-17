@@ -438,7 +438,10 @@ impl TpRuntime {
         ctx: &cuda_kernels::prelude::DeviceContext,
         buf: &mut cuda_kernels::prelude::HiddenStates,
     ) -> anyhow::Result<()> {
-        self.all_reduce_sum_on(ctx, buf, CudaPipelineStreamKind::Comm)
+        // Compute stream: the AR is on the layer's critical path (the next
+        // layer reads its output), so comm-stream overlap cannot hide it and
+        // the fence bracket only adds per-AR event alloc + stream-wait cost.
+        self.all_reduce_sum_on(ctx, buf, CudaPipelineStreamKind::Compute)
     }
 
     /// Like [`Self::all_reduce_sum`] but selects the stream the NCCL arm runs
@@ -791,7 +794,7 @@ impl TpRuntime {
                         count,
                         dtype,
                         peer,
-                        ctx.comm_send_stream.cu_stream().cast::<std::ffi::c_void>(),
+                        ctx.comm_stream.cu_stream().cast::<std::ffi::c_void>(),
                     )?;
                 }
                 Ok(())
@@ -870,6 +873,33 @@ impl TpRuntime {
                     )?;
                 }
                 Ok(())
+            }
+        }
+    }
+
+    /// Open an NCCL group on the attn_cp sub-comm. P2P sends/recvs inside a
+    /// group are submitted together at `attn_cp_group_end`, so the host never
+    /// blocks in `ncclSend` waiting for a peer recv that hasn't been posted.
+    pub fn attn_cp_group_start(&self) -> anyhow::Result<()> {
+        match self.attn_cp() {
+            TpComm::Single => Ok(()),
+            #[cfg(feature = "nccl")]
+            TpComm::Nccl(backend) => {
+                use cuda_kernels::collective::CollectiveBackend;
+                backend.group_start()
+            }
+        }
+    }
+
+    /// Close an NCCL group opened by `attn_cp_group_start`. May block until
+    /// all operations in the group are submitted to the device.
+    pub fn attn_cp_group_end(&self) -> anyhow::Result<()> {
+        match self.attn_cp() {
+            TpComm::Single => Ok(()),
+            #[cfg(feature = "nccl")]
+            TpComm::Nccl(backend) => {
+                use cuda_kernels::collective::CollectiveBackend;
+                backend.group_end()
             }
         }
     }
