@@ -162,7 +162,9 @@ def process_file(st_file: Path, output_path: Path) -> int:
             packed, scales_out = quantize_w4afp8(dequant)
 
             base = key[: -len(".weight")]
-            tensors[key] = torch.from_numpy(packed)
+            # Signed INT4 two's complement: store as I8 so the loader's W4AFP8
+            # detection (I8+BF16 scale) fires, not the W4A16 (U8) branch.
+            tensors[key] = torch.from_numpy(packed).view(torch.int8)
             tensors[f"{base}.weight_scale"] = torch.from_numpy(scales_out).to(
                 torch.bfloat16
             )
