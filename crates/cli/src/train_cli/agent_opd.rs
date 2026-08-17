@@ -529,10 +529,7 @@ pub(super) fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
             // Staleness 1: admit the NEXT window's rollout now, BEFORE this
             // window's train + merge — cc rolls while the GPU trains; the
             // version tag + sidecar IS ratio below correct the one-step drift.
-            // The remerge is safe against this in-flight traffic: it runs as
-            // an atomic engine-thread closure between scheduler steps and
-            // drops the prefix cache in the same closure (serve_engine.rs),
-            // so no step reads new weights against a stale cache.
+            // The remerge is atomic vs this in-flight traffic — see ServeEngine::remerge_student_lora.
             if args.staleness > 0 {
                 launcher.top_up(&mut pending, &mut launched, &work, policy_version);
             }
