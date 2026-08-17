@@ -161,36 +161,83 @@ Mathematically identical to attn_tp=world decode — recovers the full regressio
   B2 engaged); 4K decode wash; 128K decode recover 43→~60 tok/s at world=2;
   256K decode win.
 
-#### T3.2 — KV ownership sharding (strategic; 3 load-bearing assumptions)
+#### T3.2 — 2D KV ownership sharding (attn_tp × cp), world ≥ 4
 
-T3.2 is the seam-level change in the 5D program (2026-08-16 architecture audit).
-It is NOT needed for the 256K gate (T3.1 meets it) — it future-proofs capacity
-past ~512K and quant-KV at 256K. Two pieces of work:
+> Decided 2026-08-17 (ckl: "2D 分片（world≥4）"). Sequence-sharded KV with
+> attn_tp × cp 2D sharding. world=2 keeps B2 (T3.1) — the 2D path needs
+> attn_tp ≥ 2 AND cp ≥ 2, so world ≥ 4. No decode regression: weights are
+> attn_tp-sharded, KV is cp-sequence-sharded, both sharded at world ≥ 4.
+> Rejected: head-shard pool (ties KV to head count, no prefill speedup);
+> T3.2-replaces-B2 (flash-decoding at world=2 regresses decode ~20-25% —
+> decode is weight-bound, marlin ≈52%, flash-decoding doesn't shard weights);
+> B2+T3.2 coexist (two pool layouts, half-state).
 
-1. **KV ownership sharding.** T2's replicated KV means every rank's pool
-   covers the whole prefix. Sharding ownership breaks three load-bearing
-   assumptions, each with a known fix site:
-   - `KvPool` page identity is per-rank (`infer-seam/src/kv_query.rs:56-58`);
-     sharded KV needs a `(rank, page)` identity or location table.
-   - RadixCache match means "this rank holds the full matched KV"
-     (`infer-core/src/radix.rs:167-181`); sharded KV needs partial-match
-     semantics ("match covers this rank's shard").
-   - Prefix match length has no cross-rank min-reduce today
-     (`infer-core/src/prefix.rs:662-702`); under sharded KV a rank-local match
-     truncation desyncs TP collectives. This min-reduce is a live divergence
-     window under tier pressure even without CP — it is a prerequisite, not
-     T3-specific work.
-2. **Decode merge (T3.3).** Decode q broadcasts to the cp group; each rank computes
-   partial attention over its resident shard; partials merge with the (m, l,
-   out) recurrence (flash-decoding across ranks, one collective per layer).
-   The collective must go on `comm_stream` (used at exactly one site today,
-   `dsv4/prefill.rs:482`) or it serializes against the GEMMs. The one-shot IPC
-   fast path does not cover sub-comms (`tp.rs:432-439`), so the attention AR
-   on the attn_tp sub-comm falls back to NCCL (2.6-3.6× penalty) — measure
-   before committing the decode topology.
+**Layout.** Rank (t, c) holds attn_tp shard t's heads for cp sequence shard c:
+- Full-attention KV: attn_tp head-sharded + cp sequence-sharded (capacity win, 1/cp per rank).
+- GDN recurrent state: attn_tp head-sharded, cp replicated (T2 relay unchanged — state is KBs/layer, recurrence is full-sequence so it can't be sequence-sharded).
+- Weights: attn_tp head-sharded (unchanged).
 
-Must be graph-compatible: fixed-shape NCCL collectives captured in the decode
-graph like the TP all-reduce.
+**Why 2D (not the v1 flash-decoding merge).** The v1 decode merge
+(flash-decoding, all heads per rank) loses B2's weight-sharding: at world=2
+(attn_tp=1, cp=2) each rank reads ALL heads' weights — 2× B2's weight read,
+~20-25% decode regression. 2D keeps weight-sharding (attn_tp) AND adds
+KV-sharding (cp). At world ≥ 4 both shard; at world=2 the 2D path is
+unavailable (attn_tp·cp needs world ≥ 4) so B2 stands.
+
+**Phases.**
+
+T3.2a — prefix matched-length min-reduce (independent prerequisite).
+A live divergence window under tier pressure even without CP: rank A and rank B
+match different prefix lengths (promote-alloc/mget failure, promote_block
+refusal, rank-local top-up eviction, attach_pages failure, sidecar miss —
+prefix.rs:761-771,799-816,839-854,138-144,150-162,177-195), then
+`prefill_start_pos` diverges (prefix.rs:238) and the planner emits mismatched
+rows → TP collectives desync (lib.rs:933). Fix: cross-rank min-reduce of the
+restored length via the existing `BackendExecutor::tp_sync_min`
+(infer-seam/lib.rs:331; sole caller lib.rs:1523), then truncate the slot and
+clamp `prefill_start_pos` to the reduced minimum before `build_forward_plan`
+(lib.rs:906). Files: infer-core/src/prefix.rs, infer-core/src/lib.rs.
+
+T3.2b — 2D sharding (big-bang; pool sharding breaks prefill and decode
+simultaneously, so B–E land together behind the world≥4 2D mode):
+
+- B. Pool sequence-sharding. `TokenKVPool` (cuda-kernels/paged_kv.rs:57) keeps
+  per-rank bare-u32 identity, but under 2D rank (t,c) allocates only shard c's
+  pages. `KvPrefixStore::attach_pages` (infer-seam/prefix_store.rs:10) attaches
+  only the local shard's block ids.
+- C. Radix replicated across cp + location table. The radix match is from the
+  start of the prefix, so a per-rank partial radix cannot match (rank c has no
+  block 0). The radix is instead replicated across cp: every cp rank holds the
+  full block→page mapping with a location table (block B → shard c(B), page_id
+  on rank c(B)), built by a collective exchange (each rank broadcasts its
+  shard's blocks+page_ids). Residency is per-shard (block B resident iff rank
+  c(B)'s page is live); the T3.2a min-reduce aligns the matched length across
+  cp ranks — a missing block on any shard truncates the match for all.
+  `publish_prefix_blocks` (prefix.rs:294) publishes the local shard's pages.
+- D. Ring prefill. Replace `cp_share_chunk_kv` (qwen35_attention.rs:1088,
+  replicated gather) with ring attention: each rank computes its q-slice's
+  attention over all shards via K/V rotation, writes only its shard's KV. Use
+  T1's ring core (cuda-kernels/ring_attention.rs: `ring_forward_tile`,
+  `ring_block_fwd_merge_fa3`). GDN relay unchanged (qwen35_attention.rs:1341).
+- E. Flash-decoding decode merge. Decode: rank (t,c) computes shard t's heads'
+  partial attention over shard c (FA3 split-KV over the local shard), merges
+  the (m,l,out) partials across cp (one collective per layer on `comm_stream`),
+  then all-reduces across attn_tp (global). Needs a new cross-rank (m,l,out)
+  merge device kernel (none exists — FA3's split-KV merge is fused in-kernel;
+  host `merge_block` is U2-gate-only). Collective on `comm_stream`
+  (tensor.rs:182, unused by collectives today) with compute↔comm fences
+  (tensor.rs:637). GDN decode: attn_tp-sharded, cp-replicated (redundant
+  across cp, but GDN compute is small).
+
+Files: cuda-kernels/src/{paged_kv,ring_attention}.rs,
+infer-seam/src/{kv_query,prefix_store,lib}.rs,
+infer-core/src/{radix,prefix,lib}.rs,
+infer-cuda/src/{tp,qwen35_attention,qwen35_workspace,qwen35_forward}.rs,
+infer-cuda/src/executor/qwen35.rs, + one new merge kernel (cuda-kernels).
+
+Gate: needle ladder ×3 at world=4 (attn_tp=2, cp=2) vs the world=2 B2 /
+world=4 attn_tp=4 envelope; 256K capacity at world=4; decode no-regression vs
+B2; dated wins entry.
 
 #### T3.4 — Combination debts T2 guarded rather than solved
 
