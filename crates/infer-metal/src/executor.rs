@@ -589,6 +589,10 @@ impl infer_seam::KvPageTier for MetalExecutor {
     }
 
     fn kv_tier_read_hits(&self) -> infer_seam::KvTierReadHits {
+        #[cfg(feature = "metal")]
+        if let Some(real) = self.real.as_ref() {
+            return real.page_store.kv_tier_read_hits();
+        }
         infer_seam::KvTierReadHits::default()
     }
 

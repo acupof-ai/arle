@@ -305,10 +305,9 @@ impl EngineLoadConfig {
                         let budget = default_budget(root, 0.5);
                         if budget == 0 {
                             log::warn!(
-                                "--kv-disk {}: derived budget is 0 (free space is \
-                                 below the reserve, max(50 GiB, 10% of disk)) — \
-                                 disabling the KV disk tier; pass --kv-disk-limit \
-                                 to force a budget",
+                                "--kv-disk {}: derived budget is 0 (no free disk \
+                                 space) — disabling the KV disk tier; pass \
+                                 --kv-disk-limit to force a budget",
                                 root.display()
                             );
                             return Ok(None);

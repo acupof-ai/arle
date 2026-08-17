@@ -33,11 +33,26 @@ impl Dsv4CudaExecutor {
     }
 
     pub(crate) fn kv_tier_read_hits(&self) -> infer_seam::KvTierReadHits {
-        self.prefix_state.read_hits()
+        let mut hits = self.prefix_state.read_hits();
+        let slot = self.slot_tier.read_hits();
+        hits.host_demoted += slot.host_demoted;
+        hits.disk += slot.disk;
+        hits
     }
 
     pub(crate) fn kv_tier_io_stats(&self) -> infer_seam::KvTierIoStats {
-        let stats = self.prefix_state.io_stats();
+        let prefix = self.prefix_state.io_stats();
+        let slot = self.slot_tier.io_stats();
+        let stats = kv_native_sys::TierIoStats {
+            useful_read_bytes: prefix.useful_read_bytes + slot.useful_read_bytes,
+            useful_write_bytes: prefix.useful_write_bytes + slot.useful_write_bytes,
+            submitted_read_bytes: prefix.submitted_read_bytes + slot.submitted_read_bytes,
+            submitted_write_bytes: prefix.submitted_write_bytes + slot.submitted_write_bytes,
+            metadata_write_bytes: prefix.metadata_write_bytes + slot.metadata_write_bytes,
+            failures: prefix.failures + slot.failures,
+            completion_wait_ns: prefix.completion_wait_ns + slot.completion_wait_ns,
+            ..prefix
+        };
         infer_seam::KvTierIoStats {
             mode: match stats.mode {
                 kv_native_sys::DiskIoMode::Disabled => infer_seam::KvTierIoMode::Disabled,
@@ -52,6 +67,12 @@ impl Dsv4CudaExecutor {
             failures: stats.failures,
             completion_wait_ns: stats.completion_wait_ns,
         }
+    }
+
+    pub(crate) fn kv_tier_location(&self, key: u64) -> Option<infer_seam::KvTierLocation> {
+        self.slot_tier
+            .location(key)
+            .or_else(|| self.prefix_state.location(key))
     }
 
     pub(crate) fn demote_slot(&mut self, slot: usize, key: u64) -> Result<bool> {

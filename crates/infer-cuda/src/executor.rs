@@ -444,7 +444,8 @@ impl RealCudaExecutor {
     pub(crate) fn kv_tier_read_hits(&self) -> infer_seam::KvTierReadHits {
         match self {
             Self::Dsv4(d) => d.kv_tier_read_hits(),
-            Self::Qwen(_) | Self::Qwen35(_) => infer_seam::KvTierReadHits::default(),
+            Self::Qwen(q) => q.kv_tier_read_hits(),
+            Self::Qwen35(q) => q.kv_tier_read_hits(),
         }
     }
 
@@ -459,8 +460,8 @@ impl RealCudaExecutor {
     pub(crate) fn kv_tier_location(&self, key: u64) -> Option<infer_seam::KvTierLocation> {
         match self {
             Self::Qwen(q) => q.kv_tier_location(key),
-            Self::Dsv4(_) => None,
-            Self::Qwen35(_) => None,
+            Self::Dsv4(d) => d.kv_tier_location(key),
+            Self::Qwen35(q) => q.kv_tier_location(key),
         }
     }
 
@@ -513,11 +514,9 @@ impl RealCudaExecutor {
         }
     }
 
-    /// Whole-slot KV tier hooks. CUDA implements these only for the Qwen3.6
-    /// (G3 capacity spill) executor arm; dense Qwen3 reports no slot tier (its
-    /// page-granular radix tier handles capacity), and DSv4 preemption rides
-    /// the content-keyed prefix-state pool instead (#154 Phase 2b): preempt =
-    /// free pages + requeue, resume = prefix-attach restore + tail re-prefill.
+    /// Whole-slot KV tier hooks. Qwen3.6 and DSv4 park a demoted slot's full
+    /// device image in the tier; dense Qwen3 reports no slot tier (its
+    /// page-granular radix tier handles capacity).
     pub(crate) fn kv_slot_tier_enabled(&self) -> bool {
         matches!(self, Self::Qwen35(_) | Self::Dsv4(_))
     }

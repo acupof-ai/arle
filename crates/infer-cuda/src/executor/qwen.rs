@@ -232,6 +232,10 @@ impl QwenCudaExecutor {
         self.tier.location(key)
     }
 
+    pub(crate) fn kv_tier_read_hits(&self) -> infer_seam::KvTierReadHits {
+        self.tier.read_hits()
+    }
+
     pub(crate) fn kv_tier_io_stats(&self) -> infer_seam::KvTierIoStats {
         let stats = self.tier.io_stats();
         infer_seam::KvTierIoStats {
