@@ -107,6 +107,9 @@ typedef struct ArleDeepEpDispatchParams {
     uintptr_t d_num_tokens_per_expert; // int[num_experts]
     uintptr_t d_is_token_in_rank;      // bool[num_tokens, world_size]
     uintptr_t d_channel_prefix_matrix; // int[world_size, num_channels]
+    // Caller's COMPUTE stream (cudaStream_t). When non-zero, the dispatch uses
+    // event-based stream_wait instead of host cudaStreamSynchronize. 0 = host sync.
+    uintptr_t compute_stream;
     // Out — actual recv token count, filled by host-poll after kernel.
     int32_t *out_num_recv_tokens;
 } ArleDeepEpDispatchParams;

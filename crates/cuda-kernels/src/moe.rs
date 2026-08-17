@@ -1025,6 +1025,24 @@ pub unsafe fn dsv4_cast_i32_to_i64(
     Ok(())
 }
 
+/// Cast a flat `i64` device buffer to `i32` on-device.
+///
+/// # Safety
+/// `src` / `dst` must be valid on `stream` for `n` elements. Values must fit
+/// in `i32` (expert ids always do).
+pub unsafe fn dsv4_cast_i64_to_i32(
+    src: RawDevicePtr<i64>,
+    dst: RawDevicePtr<i32>,
+    n: usize,
+    stream: CUstream,
+) -> Result<()> {
+    unsafe {
+        ffi::dsv4_cast_i64_to_i32_cuda(src.as_ptr(), dst.as_mut_ptr(), i32::try_from(n)?, stream)
+            .result()?;
+    }
+    Ok(())
+}
+
 /// Exclusive prefix-sum over per-expert counts with each group's span padded
 /// up to `alignment` rows — the DeepGEMM m-grouped-contiguous layout builder
 /// (group segments must start BLOCK_M=128-aligned because the kernel resolves

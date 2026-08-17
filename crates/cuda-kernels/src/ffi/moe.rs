@@ -97,6 +97,13 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    pub fn dsv4_cast_i64_to_i32_cuda(
+        src: *const i64,
+        dst: *mut i32,
+        n: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn dsv4_interleave_gate_up_fp8_rows_cuda(
         gate: *const u8,
         up: *const u8,
