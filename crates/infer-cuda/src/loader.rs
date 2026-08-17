@@ -2524,6 +2524,20 @@ impl SafetensorLoader {
     }
 
     pub(crate) fn quant_view_for(&self, name: &str) -> Result<Option<QuantTensorView>> {
+        self.quant_view_for_inner(name, true)
+    }
+
+    /// DSv4 loading path: E8M0 scales are native (block-scaled FP8), so skip
+    /// the Qwen safety rejection.
+    pub(crate) fn quant_view_for_dsv4(&self, name: &str) -> Result<Option<QuantTensorView>> {
+        self.quant_view_for_inner(name, false)
+    }
+
+    fn quant_view_for_inner(
+        &self,
+        name: &str,
+        reject_e8m0: bool,
+    ) -> Result<Option<QuantTensorView>> {
         if self.quant_manifest.is_none() {
             return Ok(None);
         }
@@ -2537,7 +2551,9 @@ impl SafetensorLoader {
             if !headers.contains_key(&candidate) {
                 continue;
             }
-            reject_dsv4_e8m0_scale_abi(&candidate, headers.as_ref())?;
+            if reject_e8m0 {
+                reject_dsv4_e8m0_scale_abi(&candidate, headers.as_ref())?;
+            }
             if let Some(view) =
                 detect_quant_format(&candidate, headers.as_ref(), self.quant_manifest.as_ref())?
             {
@@ -4293,10 +4309,10 @@ impl SafetensorLoader {
 
         // Detect W4A16: the first routed expert's w1 carries a W4A16 quant view.
         let first_expert = names.expert(split.local_expert_start);
-        let is_w4a16 = self
-            .quant_view_for(&first_expert.w1)?
-            .map(|v| matches!(v.format, QuantFormat::W4A16 { .. }))
-            .unwrap_or(false);
+        let first_view = self.quant_view_for_dsv4(&first_expert.w1)?;
+        let is_w4a16 = first_view
+            .as_ref()
+            .is_some_and(|v| matches!(v.format, QuantFormat::W4A16 { .. }));
 
         let (w13_grouped, w2_grouped, w13_w4a16, w2_w4a16, hidden_dim, intermediate, num_groups) =
             if is_w4a16 {
