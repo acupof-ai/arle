@@ -54,7 +54,8 @@ pub use execution::{CounterSnapshot, StreamItem};
 
 pub use anthropic::messages_body_to_chat_request;
 pub use coordinator::{
-    TokensSidecar, coordinator_router, set_messages_dump_dir, tokens_sidecar_path,
+    TokensSidecar, coordinator_router, dp_coordinator_router, set_messages_dump_dir,
+    tokens_sidecar_path,
 };
 
 /// In-process channel for multimodal requests from coordinator → relay driver.

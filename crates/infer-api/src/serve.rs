@@ -321,6 +321,30 @@ pub fn serve_coordinator_http(
     bind_and_serve(bind, port, router, model_path, shutdown)
 }
 
+/// Multi-group DP variant of [`serve_coordinator_http`]: one relay per TP group,
+/// routed by a least-in-flight [`infer_server::DpCoordinator`].
+#[cfg(feature = "cuda")]
+pub fn serve_coordinator_http_dp(
+    model_path: &str,
+    bind: &str,
+    port: u16,
+    max_thinking_tokens: usize,
+    relays: Vec<infer_server::RelayCoordinator>,
+) -> Result<()> {
+    let tokenizer = infer_server::OpenAiTokenizer::from_model_dir(model_path)
+        .with_context(|| format!("coordinator tokenizer load for {model_path}"))?;
+    let model_id = crate::serve_engine::model_id_from_path(model_path);
+    let shutdown = infer_server::ServeShutdown::new();
+    let router = infer_server::dp_coordinator_router(
+        relays,
+        tokenizer,
+        model_id,
+        max_thinking_tokens,
+        Some(shutdown.clone()),
+    );
+    bind_and_serve(bind, port, router, model_path, shutdown)
+}
+
 #[cfg(any(
     feature = "metal",
     feature = "cuda",

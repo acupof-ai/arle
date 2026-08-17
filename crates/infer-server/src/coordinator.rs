@@ -7,6 +7,7 @@
 //! every worker, and per-rank completion readers route rank-0's deltas into the
 //! per-request sinks the async handlers await. TP=1 never reaches here.
 
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver as SyncReceiver, RecvTimeoutError, Sender as SyncSender};
@@ -264,6 +265,36 @@ impl CoordinatorHandle {
     }
 }
 
+/// Data-parallel coordinator: wraps M independent TP groups and routes each
+/// request to the least-in-flight one. `Deref` selects the target group so
+/// handler bodies stay unchanged — shared fields (model, tokenizer) are
+/// identical across groups, and per-group operations (sinks, submit_tx) are
+/// consistent within a single function call (the Deref coercion happens once
+/// at the call site, fixing the group for that call).
+pub struct DpCoordinator {
+    groups: Vec<Arc<CoordinatorHandle>>,
+}
+
+impl DpCoordinator {
+    pub fn new(groups: Vec<Arc<CoordinatorHandle>>) -> Self {
+        Self { groups }
+    }
+
+    fn select(&self) -> &Arc<CoordinatorHandle> {
+        self.groups
+            .iter()
+            .min_by_key(|g| g.in_flight.load(Ordering::Acquire))
+            .unwrap_or(&self.groups[0])
+    }
+}
+
+impl Deref for DpCoordinator {
+    type Target = CoordinatorHandle;
+    fn deref(&self) -> &Self::Target {
+        self.select()
+    }
+}
+
 /// Build the coordinator router + spawn the lockstep loop thread. `relay` is the
 /// accepted [`RelayCoordinator`] (all N ranks connected via `accept_symmetric`).
 /// The lockstep loop runs for the process lifetime. Pass `multimodal` for VLM
@@ -277,6 +308,53 @@ pub fn coordinator_router(
     multimodal: Option<(crate::LocalMultimodalTx, MultimodalKind)>,
     shutdown: Option<crate::ServeShutdown>,
 ) -> Router {
+    let handle = coordinator_handle(
+        relay,
+        tokenizer,
+        model,
+        max_thinking_tokens,
+        multimodal,
+        shutdown,
+    );
+    build_router(Arc::new(DpCoordinator::new(vec![handle])))
+}
+
+/// Multi-group DP coordinator router: one [`CoordinatorHandle`] per relay (each
+/// with its own lockstep loop), wrapped in a [`DpCoordinator`] that routes
+/// requests to the least-in-flight group.
+#[allow(private_interfaces)]
+pub fn dp_coordinator_router(
+    relays: Vec<RelayCoordinator>,
+    tokenizer: OpenAiTokenizer,
+    model: impl Into<String>,
+    max_thinking_tokens: usize,
+    shutdown: Option<crate::ServeShutdown>,
+) -> Router {
+    let model = model.into();
+    let handles: Vec<Arc<CoordinatorHandle>> = relays
+        .into_iter()
+        .map(|relay| {
+            coordinator_handle(
+                relay,
+                tokenizer.clone(),
+                model.clone(),
+                max_thinking_tokens,
+                None,
+                shutdown.clone(),
+            )
+        })
+        .collect();
+    build_router(Arc::new(DpCoordinator::new(handles)))
+}
+
+fn coordinator_handle(
+    relay: RelayCoordinator,
+    tokenizer: OpenAiTokenizer,
+    model: impl Into<String>,
+    max_thinking_tokens: usize,
+    multimodal: Option<(crate::LocalMultimodalTx, MultimodalKind)>,
+    shutdown: Option<crate::ServeShutdown>,
+) -> Arc<CoordinatorHandle> {
     let sinks = relay.completion_sinks();
     let relay = Arc::new(Mutex::new(relay));
     let in_flight = Arc::new(AtomicUsize::new(0));
@@ -295,7 +373,7 @@ pub fn coordinator_router(
     let (multimodal_tx, multimodal_kind) = multimodal.unzip();
 
     let template_defaults_thinking = tokenizer.defaults_thinking_on();
-    let state = Arc::new(CoordinatorHandle {
+    Arc::new(CoordinatorHandle {
         model: model.into(),
         tokenizer: Mutex::new(tokenizer),
         max_thinking_tokens,
@@ -308,8 +386,10 @@ pub fn coordinator_router(
         stats_request_id: AtomicU64::new(0),
         multimodal_tx,
         multimodal_kind,
-    });
+    })
+}
 
+fn build_router(state: Arc<DpCoordinator>) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/v1/completions", post(completions))
@@ -552,7 +632,7 @@ fn sse_final_frame(
 /// Returns the per-token delta receiver and the guard (caller must keep alive
 /// until streaming ends so `in_flight` is decremented only after the last delta).
 fn streaming_submit(
-    state: &Arc<CoordinatorHandle>,
+    state: &CoordinatorHandle,
     prompt_tokens: Vec<u32>,
     max_tokens: usize,
     sampling: SamplingParams,
@@ -591,7 +671,7 @@ fn streaming_submit(
 }
 
 async fn submit_and_collect(
-    state: &Arc<CoordinatorHandle>,
+    state: &CoordinatorHandle,
     prompt_tokens: Vec<u32>,
     max_tokens: usize,
     sampling: SamplingParams,
@@ -628,7 +708,7 @@ async fn submit_and_collect(
     })
 }
 
-fn encode(state: &Arc<CoordinatorHandle>, text: &str) -> Result<Vec<u32>, ApiError> {
+fn encode(state: &CoordinatorHandle, text: &str) -> Result<Vec<u32>, ApiError> {
     let tokenizer = state
         .tokenizer
         .lock()
@@ -636,7 +716,7 @@ fn encode(state: &Arc<CoordinatorHandle>, text: &str) -> Result<Vec<u32>, ApiErr
     Ok(tokenizer.encode(text)?)
 }
 
-fn decode(state: &Arc<CoordinatorHandle>, tokens: &[u32]) -> Result<String, ApiError> {
+fn decode(state: &CoordinatorHandle, tokens: &[u32]) -> Result<String, ApiError> {
     let tokenizer = state
         .tokenizer
         .lock()
@@ -707,7 +787,7 @@ fn prompt_prefills_think(prompt: &str) -> bool {
 /// logprob, 1.. = the top-N alternatives). 501 when the capture is missing —
 /// the backend/model path does not surface logprobs.
 fn completion_logprobs_value(
-    state: &Arc<CoordinatorHandle>,
+    state: &CoordinatorHandle,
     token_ids: &[u32],
     captures: &[Vec<(u32, f32)>],
 ) -> Result<serde_json::Value, ApiError> {
@@ -754,7 +834,7 @@ fn completion_logprobs_value(
 /// (token-id strings, empty `top_logprobs`) so backends without the capture
 /// keep their previous wire behavior.
 fn chat_logprobs_value(
-    state: &Arc<CoordinatorHandle>,
+    state: &CoordinatorHandle,
     token_ids: &[u32],
     behavior_logprobs: &[f32],
     captures: &[Vec<(u32, f32)>],
@@ -795,7 +875,7 @@ fn chat_logprobs_value(
 }
 
 async fn completions(
-    State(state): State<Arc<CoordinatorHandle>>,
+    State(state): State<Arc<DpCoordinator>>,
     request: Result<Json<CompletionRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Response, ApiError> {
     let Json(request) = request.map_err(|rejection| {
@@ -829,7 +909,7 @@ async fn completions(
     let include_usage = request
         .stream_options
         .as_ref()
-        .map_or(true, |o| o.include_usage);
+        .is_none_or(|o| o.include_usage);
 
     if request.stream.unwrap_or(false) {
         if request.logprobs.is_some() {
@@ -1016,7 +1096,7 @@ async fn completions(
 }
 
 async fn chat_completions(
-    State(state): State<Arc<CoordinatorHandle>>,
+    State(state): State<Arc<DpCoordinator>>,
     request: Result<Json<ChatCompletionRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Response, ApiError> {
     let Json(request) = request.map_err(|rejection| {
@@ -1049,7 +1129,7 @@ async fn chat_completions(
     let include_usage = request
         .stream_options
         .as_ref()
-        .map_or(true, |o| o.include_usage);
+        .is_none_or(|o| o.include_usage);
     // Thinking defaults on when a budget is configured OR the checkpoint is a
     // reasoning model (DeepSeek-V4-Flash) that degenerates when forced
     // non-thinking; `0` + non-reasoning keeps it off and byte-identical.
@@ -1456,7 +1536,7 @@ async fn chat_completions(
 /// [`chat_completions`]) and tokenize. Returns the mapped chat request plus
 /// the resolved `(thinking, tools_active)` switches and prompt tokens.
 fn anthropic_prompt(
-    state: &Arc<CoordinatorHandle>,
+    state: &CoordinatorHandle,
     request: &MessagesRequest,
 ) -> Result<(ChatCompletionRequest, bool, bool, Vec<u32>), ApiError> {
     let chat_request = request.to_chat_request();
@@ -1523,7 +1603,7 @@ fn push_anthropic_events(
 
 /// `POST /v1/messages` — Anthropic Messages API onto the OpenAI chat machinery.
 async fn anthropic_messages(
-    State(state): State<Arc<CoordinatorHandle>>,
+    State(state): State<Arc<DpCoordinator>>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Response, MessagesError> {
     let dump_path = dump_messages_body(&body);
@@ -1723,7 +1803,7 @@ async fn anthropic_messages(
 /// `POST /v1/messages/count_tokens` — render the prompt exactly like
 /// [`anthropic_messages`] would and return its token count.
 async fn anthropic_count_tokens(
-    State(state): State<Arc<CoordinatorHandle>>,
+    State(state): State<Arc<DpCoordinator>>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Response, MessagesError> {
     let request: MessagesRequest = serde_json::from_value(body)
@@ -1737,7 +1817,7 @@ async fn health() -> Json<serde_json::Value> {
     Json(serde_json::json!({"status": "healthy"}))
 }
 
-async fn list_models(State(state): State<Arc<CoordinatorHandle>>) -> Json<ModelsResponse> {
+async fn list_models(State(state): State<Arc<DpCoordinator>>) -> Json<ModelsResponse> {
     Json(ModelsResponse::single(state.model.clone()))
 }
 
@@ -1767,7 +1847,7 @@ async fn fallback_404(req: axum::extract::Request) -> (StatusCode, Json<serde_js
 }
 
 async fn metrics(
-    State(state): State<Arc<CoordinatorHandle>>,
+    State(state): State<Arc<DpCoordinator>>,
 ) -> ([(header::HeaderName, &'static str); 1], String) {
     let request_id = state.stats_request_id.fetch_add(1, Ordering::Relaxed);
     let (rx, query_ok) = {
@@ -1801,9 +1881,7 @@ async fn metrics(
     )
 }
 
-async fn stats(
-    State(state): State<Arc<CoordinatorHandle>>,
-) -> Result<Json<StatsResponse>, ApiError> {
+async fn stats(State(state): State<Arc<DpCoordinator>>) -> Result<Json<StatsResponse>, ApiError> {
     let request_id = state.stats_request_id.fetch_add(1, Ordering::Relaxed);
     // Register awaiter BEFORE sending to avoid a race with the reader thread.
     let (rx, send_result) = {
