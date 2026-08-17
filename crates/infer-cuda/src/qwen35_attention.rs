@@ -1898,28 +1898,33 @@ impl Qwen35Model {
                     )?;
                 }
                 if cp_rank > 0 {
-                    let (g_ptr, _g0) = slot.gdr_states[linear_idx].device_ptr_mut(&self.ctx.stream);
-                    let (c_ptr, _g1) = slot.conv_states[linear_idx]
-                        .data
-                        .device_ptr_mut(&self.ctx.stream);
-                    self.ctx.comm_waits_for_compute()?;
-                    // SAFETY: live per-slot state buffers; the previous cp rank
-                    // posts the matching sends after its own advance.
-                    unsafe {
-                        self.tp.attn_cp_recv_unfenced(
-                            &self.ctx,
-                            g_ptr as *mut std::ffi::c_void,
-                            gdr_len,
-                            DType::F32,
-                            cp_rank - 1,
-                        )?;
-                        self.tp.attn_cp_recv_unfenced(
-                            &self.ctx,
-                            c_ptr as *mut std::ffi::c_void,
-                            conv_len,
-                            DType::BF16,
-                            cp_rank - 1,
-                        )?;
+                    // Scope the device-ptr guards so their SyncOnDrop borrow of
+                    // `slot` ends before advance_linear_conv_gdr re-borrows it.
+                    {
+                        let (g_ptr, _g0) =
+                            slot.gdr_states[linear_idx].device_ptr_mut(&self.ctx.stream);
+                        let (c_ptr, _g1) = slot.conv_states[linear_idx]
+                            .data
+                            .device_ptr_mut(&self.ctx.stream);
+                        self.ctx.comm_waits_for_compute()?;
+                        // SAFETY: live per-slot state buffers; the previous cp rank
+                        // posts the matching sends after its own advance.
+                        unsafe {
+                            self.tp.attn_cp_recv_unfenced(
+                                &self.ctx,
+                                g_ptr as *mut std::ffi::c_void,
+                                gdr_len,
+                                DType::F32,
+                                cp_rank - 1,
+                            )?;
+                            self.tp.attn_cp_recv_unfenced(
+                                &self.ctx,
+                                c_ptr as *mut std::ffi::c_void,
+                                conv_len,
+                                DType::BF16,
+                                cp_rank - 1,
+                            )?;
+                        }
                     }
                     self.ctx.compute_waits_for_comm()?;
                     self.advance_linear_conv_gdr(
