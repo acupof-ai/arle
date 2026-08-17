@@ -6,8 +6,8 @@
 //!
 //! 1. **Stable consumer surface.** Model code says
 //!    `use cuda_kernels::prelude::{DeviceContext, DeviceVec, …};`
-//!    instead of three separate `use cuda_kernels::{tensor::…,
-//!    paged_kv::…, tilelang::…}` lines. The consumer's import block is
+//!    instead of two separate `use cuda_kernels::{tensor::…,
+//!    paged_kv::…}` lines. The consumer's import block is
 //!    insulated from the underlying module layout.
 //!
 //! 2. **Proto-API for the eventual `cuda-kernels` crate extraction.**
@@ -56,4 +56,3 @@ pub use super::paged_kv::{EVICTED_PAGE, PagedKVPool};
 pub use super::tensor::{
     DeviceContext, DeviceMatrix, DeviceVec, HiddenStates, HiddenStatesView, RawDevicePtr,
 };
-pub use super::tilelang::TileLangDecodeMetadata;

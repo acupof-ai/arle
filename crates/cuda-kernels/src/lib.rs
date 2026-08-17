@@ -20,8 +20,6 @@ pub mod ring_attention;
 #[cfg(feature = "cuda")]
 pub mod tensor;
 #[cfg(feature = "cuda")]
-pub mod tilelang;
-#[cfg(feature = "cuda")]
 pub mod turboquant_state;
 
 pub use kv_types::{KVCacheDtype, KVFormat};
