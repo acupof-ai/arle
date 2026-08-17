@@ -904,6 +904,16 @@ impl TpRuntime {
         }
     }
 
+    /// RAII attn_cp NCCL group: `drop` closes it after an early `?`, so the
+    /// thread-local group depth can't leak and hang the next collective.
+    pub fn attn_cp_group(&self) -> anyhow::Result<AttnCpGroupGuard<'_>> {
+        self.attn_cp_group_start()?;
+        Ok(AttnCpGroupGuard {
+            tp: self,
+            finished: false,
+        })
+    }
+
     /// Host-visible all-gather for small byte payloads (CUDA IPC handles, device
     /// ids); requires NCCL to be initialized.
     #[cfg(all(feature = "cuda", feature = "nccl"))]
@@ -1589,6 +1599,30 @@ mod oneshot {
                 )?;
             }
             Ok(())
+        }
+    }
+}
+
+/// RAII guard for an attn_cp NCCL group; see [`TpRuntime::attn_cp_group`].
+pub struct AttnCpGroupGuard<'a> {
+    tp: &'a TpRuntime,
+    finished: bool,
+}
+
+impl<'a> AttnCpGroupGuard<'a> {
+    /// Close the group, propagating errors; consumes self so drop won't double-close.
+    pub fn finish(mut self) -> anyhow::Result<()> {
+        self.finished = true;
+        self.tp.attn_cp_group_end()
+    }
+}
+
+impl Drop for AttnCpGroupGuard<'_> {
+    fn drop(&mut self) {
+        if !self.finished {
+            if let Err(e) = self.tp.attn_cp_group_end() {
+                log::error!("attn_cp group closed on drop after error: {e}");
+            }
         }
     }
 }
