@@ -883,55 +883,66 @@ impl Qwen35Model {
                                         }
                                     }
                                     if two_d {
-                                        // Cross-cp flash-decoding merge: gather each
-                                        // shard's (lse, out), then the weighted
-                                        // average accumulated in f32. The lse rides
-                                        // the bf16 collective as f32 pairs — NCCL
-                                        // moves bytes, so it stays f32 end to end.
+                                        // Cross-cp flash-decoding merge: pack this
+                                        // rank's (lse, out) into one rank-major
+                                        // section, single all-gather, weighted
+                                        // average in f32. The lse rides the bf16
+                                        // collective as f32 pairs — NCCL moves
+                                        // bytes, so it stays f32 end to end.
                                         let cp_size = self.tp.attn_cp_size();
                                         let cp_rank = self.tp.attn_cp_rank();
                                         let sect = accum_rows * c.head_dim;
+                                        let lse_bf16 = accum_rows * 2;
+                                        let section_bf16 = lse_bf16 + sect;
                                         let merge_gather =
-                                            cp_row_gather.get(&self.ctx, sect, cp_size)?;
+                                            cp_row_gather.get(&self.ctx, section_bf16, cp_size)?;
+                                        let (mg_ptr, _gp) =
+                                            merge_gather.data.device_ptr_mut(&self.ctx.stream);
+                                        // SAFETY: mg_ptr is the gather base; lse
+                                        // holds cp_size*accum_rows f32 with this
+                                        // rank's partial at my_lse_byte_off; both
+                                        // live on ctx.stream.
+                                        unsafe {
+                                            cudarc::driver::result::memcpy_dtod_async(
+                                                mg_ptr + cp_rank as u64 * section_bf16 as u64 * 2,
+                                                lse_ptr + my_lse_byte_off,
+                                                accum_rows * 4,
+                                                self.ctx.stream.cu_stream(),
+                                            )
+                                        }
+                                        .map_err(|e| anyhow!("2D merge lse stage failed: {e}"))?;
+                                        drop(_gp);
                                         self.ctx
                                             .stream
                                             .memcpy_dtod(
                                                 &attn_out.data.slice(0..sect),
                                                 &mut merge_gather.data.slice_mut(
-                                                    cp_rank * sect..(cp_rank + 1) * sect,
+                                                    cp_rank * section_bf16 + lse_bf16
+                                                        ..cp_rank * section_bf16 + lse_bf16 + sect,
                                                 ),
                                             )
-                                            .map_err(|e| anyhow!("2D merge stage failed: {e}"))?;
-                                        // SAFETY: lse holds cp_size*accum_rows f32; the
-                                        // send slot is this rank's rank-major section,
-                                        // in-place gather per the collective's contract.
-                                        // One fence bracket for both collects (lse +
-                                        // merge_gather): the D2D stage above runs on
-                                        // compute, the gathers on comm (ordered), and
-                                        // the merge kernel below waits once.
+                                            .map_err(|e| {
+                                                anyhow!("2D merge out stage failed: {e}")
+                                            })?;
+                                        // One fence bracket: both D2D stages run on
+                                        // compute, the gather on comm, the merge
+                                        // kernel below waits once.
                                         self.ctx.comm_waits_for_compute()?;
-                                        unsafe {
-                                            self.tp.attn_cp_all_gather_bf16_unfenced(
-                                                &self.ctx,
-                                                (lse_ptr + my_lse_byte_off)
-                                                    as *const std::ffi::c_void,
-                                                accum_rows * 2,
-                                                lse_ptr as *mut std::ffi::c_void,
-                                            )?;
-                                        }
-                                        self.cp_all_gather_in_place(merge_gather, sect)?;
+                                        self.cp_all_gather_in_place(merge_gather, section_bf16)?;
                                         self.ctx.compute_waits_for_comm()?;
                                         let (mg_ptr, _gm) =
-                                            merge_gather.data.device_ptr_mut(&self.ctx.stream);
+                                            merge_gather.data.device_ptr(&self.ctx.stream);
                                         let (ao_ptr, _ga) =
                                             attn_out.data.device_ptr_mut(&self.ctx.stream);
                                         // SAFETY: buffers live on ctx.stream; the
-                                        // gathers' compute-waits-comm fence orders
-                                        // them before this launch.
+                                        // gather's compute-waits-comm fence orders
+                                        // it before this launch.
                                         unsafe {
                                             ffi::cross_cp_merge_bf16_hd256_cuda(
-                                                lse_ptr as *const f32,
                                                 mg_ptr as *const ffi::Half,
+                                                (section_bf16 / 2) as i32,
+                                                lse_bf16 as i32,
+                                                section_bf16 as i32,
                                                 ao_ptr as *mut ffi::Half,
                                                 cp_size as i32,
                                                 accum_rows as i32,
