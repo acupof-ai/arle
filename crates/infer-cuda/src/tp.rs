@@ -729,6 +729,7 @@ impl TpRuntime {
     /// and every cp-group rank calls with the same `sendcount`. The caller
     /// must fence `comm_waits_for_compute` before the op and
     /// `compute_waits_for_comm` before the first compute reading `recvbuf`.
+    #[cfg_attr(not(feature = "nccl"), allow(unused_variables))]
     pub unsafe fn attn_cp_all_gather_bf16_unfenced(
         &self,
         ctx: &cuda_kernels::prelude::DeviceContext,
@@ -769,6 +770,7 @@ impl TpRuntime {
     /// `comm_waits_for_compute` before the first op reading a compute-written
     /// buffer and `compute_waits_for_comm` before the first compute reading a
     /// comm-written buffer.
+    #[cfg_attr(not(feature = "nccl"), allow(unused_variables))]
     pub unsafe fn attn_cp_send_unfenced(
         &self,
         ctx: &cuda_kernels::prelude::DeviceContext,
@@ -805,6 +807,7 @@ impl TpRuntime {
     ///
     /// `buf` must be writable for `count` elements of `dtype`; the peer must
     /// post the matching send.
+    #[cfg_attr(not(feature = "nccl"), allow(unused_variables))]
     pub unsafe fn attn_cp_recv_unfenced(
         &self,
         ctx: &cuda_kernels::prelude::DeviceContext,
@@ -842,6 +845,7 @@ impl TpRuntime {
     ///
     /// Every cp-group rank calls with the same `count`/`dtype`/`root`; `buf`
     /// must hold `count` elements and stay valid until the op completes.
+    #[cfg_attr(not(feature = "nccl"), allow(unused_variables))]
     pub unsafe fn attn_cp_broadcast_unfenced(
         &self,
         ctx: &cuda_kernels::prelude::DeviceContext,
