@@ -2417,11 +2417,11 @@ mod dsv4_gpu {
         let w13 = layer
             .w13_w4a16
             .as_ref()
-            .ok_or_else(|| anyhow!("W4A16 GEMV tables: layer has no W4A16 experts"))?;
+            .ok_or_else(|| anyhow::anyhow!("W4A16 GEMV tables: layer has no W4A16 experts"))?;
         let w2 = layer
             .w2_w4a16
             .as_ref()
-            .ok_or_else(|| anyhow!("W4A16 GEMV tables: layer has no W4A16 down experts"))?;
+            .ok_or_else(|| anyhow::anyhow!("W4A16 GEMV tables: layer has no W4A16 down experts"))?;
         let g = w13.len();
         ensure!(
             w2.len() == g,
@@ -2429,7 +2429,7 @@ mod dsv4_gpu {
         );
         let first = w13
             .first()
-            .ok_or_else(|| anyhow!("W4A16 GEMV tables: no experts"))?;
+            .ok_or_else(|| anyhow::anyhow!("W4A16 GEMV tables: no experts"))?;
         let group_size = first.group_size;
         let i_dim = first.rows / 2;
         let h = first.cols;
@@ -2449,22 +2449,22 @@ mod dsv4_gpu {
             let (w13_ptr, _g13) = w13e
                 .qweight
                 .as_ref()
-                .ok_or_else(|| anyhow!("W4A16 expert {e} missing qweight"))?
+                .ok_or_else(|| anyhow::anyhow!("W4A16 expert {e} missing qweight"))?
                 .device_ptr(&ctx.stream);
             let (s13_ptr, _gs13) = w13e
                 .qscales
                 .as_ref()
-                .ok_or_else(|| anyhow!("W4A16 expert {e} missing qscales"))?
+                .ok_or_else(|| anyhow::anyhow!("W4A16 expert {e} missing qscales"))?
                 .device_ptr(&ctx.stream);
             let (w2_ptr, _gw2) = w2e
                 .qweight
                 .as_ref()
-                .ok_or_else(|| anyhow!("W4A16 down expert {e} missing qweight"))?
+                .ok_or_else(|| anyhow::anyhow!("W4A16 down expert {e} missing qweight"))?
                 .device_ptr(&ctx.stream);
             let (s2_ptr, _gs2) = w2e
                 .qscales
                 .as_ref()
-                .ok_or_else(|| anyhow!("W4A16 down expert {e} missing qscales"))?
+                .ok_or_else(|| anyhow::anyhow!("W4A16 down expert {e} missing qscales"))?
                 .device_ptr(&ctx.stream);
             gate_w.push(w13_ptr);
             up_w.push(w13_ptr + up_weight_off);
@@ -2476,7 +2476,7 @@ mod dsv4_gpu {
         let h2d = |v: &[u64]| -> Result<CudaSlice<u64>> {
             ctx.stream
                 .clone_htod(v)
-                .map_err(|e| anyhow!("W4A16 GEMV table H2D failed: {e}"))
+                .map_err(|e| anyhow::anyhow!("W4A16 GEMV table H2D failed: {e}"))
         };
         let expert_indices: Vec<i32> = (0..g as i32).collect();
         Ok(Dsv4W4A16GemvTables {
@@ -2489,7 +2489,7 @@ mod dsv4_gpu {
             expert_indices: ctx
                 .stream
                 .clone_htod(&expert_indices)
-                .map_err(|e| anyhow!("W4A16 expert_indices H2D failed: {e}"))?,
+                .map_err(|e| anyhow::anyhow!("W4A16 expert_indices H2D failed: {e}"))?,
             group_size,
         })
     }
@@ -2523,15 +2523,15 @@ mod dsv4_gpu {
         let counts = ctx
             .stream
             .alloc_zeros::<i32>(experts_per_rank)
-            .map_err(|e| anyhow!("DSv4 W4A16 count alloc failed: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("DSv4 W4A16 count alloc failed: {e}"))?;
         let offsets = ctx
             .stream
             .alloc_zeros::<i32>(experts_per_rank)
-            .map_err(|e| anyhow!("DSv4 W4A16 offset alloc failed: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("DSv4 W4A16 offset alloc failed: {e}"))?;
         let scan_total = ctx
             .stream
             .alloc_zeros::<i32>(1)
-            .map_err(|e| anyhow!("DSv4 W4A16 scan-total alloc failed: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("DSv4 W4A16 scan-total alloc failed: {e}"))?;
         keepalive.keep_i32(&counts);
         keepalive.keep_i32(&offsets);
         keepalive.keep_i32(&scan_total);
@@ -2560,11 +2560,11 @@ mod dsv4_gpu {
         let packed_weight = ctx
             .stream
             .alloc_zeros::<f32>(rows)
-            .map_err(|e| anyhow!("DSv4 W4A16 packed_weight alloc failed: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("DSv4 W4A16 packed_weight alloc failed: {e}"))?;
         let cursors = ctx
             .stream
             .alloc_zeros::<i32>(experts_per_rank)
-            .map_err(|e| anyhow!("DSv4 W4A16 cursors alloc failed: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("DSv4 W4A16 cursors alloc failed: {e}"))?;
         keepalive.keep_hidden(&packed_hidden);
         keepalive.keep_i32(&packed_route_slot);
         keepalive.keep_f32(&packed_weight);
@@ -4143,8 +4143,8 @@ mod dsv4_gpu {
 #[cfg(feature = "cuda")]
 #[allow(unused_imports)] // consumed by the model.rs DSv4 branch
 pub(crate) use dsv4_gpu::{
-    Dsv4GemvTables, Dsv4MoeTailScratch, Dsv4SharedDecodeScratch, GroupedCache, GroupedWeightLayout,
-    build_grouped_cache, dsv4_moe_forward, dsv4_shared_expert_forward,
+    Dsv4GemvTables, Dsv4MoeTailScratch, Dsv4SharedDecodeScratch, Dsv4W4A16GemvTables, GroupedCache,
+    GroupedWeightLayout, build_grouped_cache, dsv4_moe_forward, dsv4_shared_expert_forward,
     dsv4_shared_expert_forward_decode_scratch,
 };
 #[cfg(feature = "deepep")]
