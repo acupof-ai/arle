@@ -1675,14 +1675,18 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             self.restore_swapped_slot(slot, &mut request, key)?;
         } else {
             let committed = request.committed_tokens();
-            let prefix_match = if self.config.enable_prefix_cache {
-                // Tier-aware: demoted blocks in the match are promoted
-                // back into fresh pages here, so attach sees a
-                // resident-only match.
-                self.lookup_prefix_for_attach(&committed)?
-            } else {
-                PrefixMatch::empty()
-            };
+            // C.3: under 2D the ring pass recomputes the whole prompt — the ring
+            // path does not gather the paged cached-prefix shard into the ring
+            // block (a follow-up). Skip match+attach so prefill starts at 0.
+            let prefix_match =
+                if self.config.enable_prefix_cache && self.executor.kv_shard_spec().is_none() {
+                    // Tier-aware: demoted blocks in the match are promoted
+                    // back into fresh pages here, so attach sees a
+                    // resident-only match.
+                    self.lookup_prefix_for_attach(&committed)?
+                } else {
+                    PrefixMatch::empty()
+                };
             self.attach_prefix_to_request(slot, &mut request, &committed, prefix_match)?;
         }
 
