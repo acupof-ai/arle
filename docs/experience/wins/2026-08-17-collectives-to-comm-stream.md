@@ -1,6 +1,6 @@
 # TP/CP NCCL collectives → comm_stream — CUDA, 2026-08-17
 
-> Status: pending-remote
+> Status: Shipped (smoke + needle gate PASS)
 
 ## Goal
 
@@ -48,20 +48,28 @@ python3 scripts/bench_throughput.py \
 
 ## Results
 
+Smoke test (2026-08-17, pod 8×H20, TP=8, ThinkingCap-Qwen3.6-27B-FP8):
+serve ready, all 8 workers loaded, coherent generation (thinking model),
+no NCCL errors. Needle gate ×3 (LENGTHS=8000, RUNS=3): exact=3/3,
+correctness PASS.
+
 | concurrency | arm | completed | errors | output tok/s | req/s | TTFT p50/p99 ms | ITL p50/p99 ms | delta |
 |---:|---|---:|---:|---:|---:|---:|---:|---:|
 | 1 | baseline | | | | | | | — |
 | 1 | treatment | | | | | | | |
 
-Raw artifacts: TBD.
+A/B bench: pending (decode is a wash by construction — the strictly-dependent
+chain has no slack; the value is the stream plumbing for T3.2 CP-decode merge).
+
+Raw artifacts: `/host/arle-runs/212-comm/` on pod.
 
 ## Problems
 
-None yet.
+None.
 
 ## Learnings
 
-pending-remote. The fence machinery (`comm_waits_for_compute` /
+PASS (smoke + needle). The fence machinery (`comm_waits_for_compute` /
 `compute_waits_for_comm`) already existed in tensor.rs and was used by the
 dsv4 shared-expert overlap path; this change generalizes it to all NCCL
 collectives. The dsv4 prefill shared-expert overlap is preserved by keeping
