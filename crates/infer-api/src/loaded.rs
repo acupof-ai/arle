@@ -161,12 +161,16 @@ pub struct EngineLoadConfig {
     /// (TDR/latency safety valve). `None` = whole token in one submit.
     #[serde(default)]
     pub vulkan_submit_cap: Option<usize>,
-    /// Explicit TP world size for this engine. `None` = resolve from
-    /// `INFER_TP_SIZE` / `INFER_CUDA_DEVICES` env (the legacy path).
-    /// Set this to give different engines different TP sizes in the same
-    /// process (e.g. a single-GPU student beside a multi-GPU judge).
+    /// Explicit world size (total GPU ranks) for this engine. `None` = resolve
+    /// from `INFER_TP_SIZE` / `INFER_CUDA_DEVICES` env (the legacy path).
+    /// Set from `--tensor-parallel-size × --context-parallel-size`.
     #[serde(default)]
-    pub tp_size: Option<usize>,
+    pub world_size: Option<usize>,
+    /// Context-parallel degree (sequence sharded across N GPUs). `None` = 1.
+    /// Set from `--context-parallel-size`; threaded to the executor's
+    /// `MultiAxisConfig` via `TpEnvGuard`.
+    #[serde(default)]
+    pub context_parallel_size: Option<usize>,
 }
 
 fn default_dspark_sps_bias_ms() -> f32 {
@@ -242,7 +246,8 @@ impl Default for EngineLoadConfig {
             metal: infer_seam::MetalRuntimeFlags::default(),
             diffusion_max_denoising_steps: None,
             vulkan_submit_cap: None,
-            tp_size: None,
+            world_size: None,
+            context_parallel_size: None,
         }
     }
 }
@@ -1999,8 +2004,8 @@ mod backend {
         Ok((serve, tokenizer, model_id))
     }
 
-    /// TP world size, mirroring cli::serve_multiproc::world_size_from_env —
-    /// INFER_TP_SIZE, else the INFER_CUDA_DEVICES count, else 1. Every rank
+    /// TP world size fallback when `config.world_size` is `None`:
+    /// `INFER_TP_SIZE`, else the `INFER_CUDA_DEVICES` count, else 1. Every rank
     /// sees identical env, so budget division is rank-invariant.
     #[cfg(feature = "cuda")]
     fn tp_world_size() -> usize {
@@ -2018,36 +2023,53 @@ mod backend {
             .unwrap_or(1)
     }
 
-    /// RAII guard that temporarily overrides `INFER_TP_SIZE` for the executor's
-    /// `TpRuntime` resolution. Restores the previous value on drop. When
-    /// `tp_size` is `None`, no override is applied (env is used as-is).
+    /// RAII guard that temporarily overrides `INFER_TP_SIZE` and
+    /// `INFER_ATTN_CP_SIZE` for the executor's `TpRuntime` / `MultiAxisConfig`
+    /// resolution. Restores the previous values on drop. `None` fields leave
+    /// the corresponding env var untouched.
     #[cfg(feature = "cuda")]
     struct TpEnvGuard {
-        saved: Option<Option<String>>,
+        saved_tp: Option<Option<String>>,
+        saved_cp: Option<Option<String>>,
     }
 
     #[cfg(feature = "cuda")]
     impl TpEnvGuard {
-        fn new(tp_size: Option<usize>) -> Self {
-            let saved = tp_size.map(|ws| {
+        fn new(world_size: Option<usize>, cp_size: Option<usize>) -> Self {
+            let saved_tp = world_size.map(|ws| {
                 let saved = std::env::var("INFER_TP_SIZE").ok();
                 // SAFETY: single-threaded during engine build, no other readers.
                 unsafe { std::env::set_var("INFER_TP_SIZE", ws.to_string()) };
                 saved
             });
-            Self { saved }
+            let saved_cp = cp_size.map(|cp| {
+                let saved = std::env::var("INFER_ATTN_CP_SIZE").ok();
+                // SAFETY: single-threaded during engine build, no other readers.
+                unsafe { std::env::set_var("INFER_ATTN_CP_SIZE", cp.to_string()) };
+                saved
+            });
+            Self { saved_tp, saved_cp }
         }
     }
 
     #[cfg(feature = "cuda")]
     impl Drop for TpEnvGuard {
         fn drop(&mut self) {
-            if let Some(saved) = self.saved.take() {
+            if let Some(saved) = self.saved_tp.take() {
                 // SAFETY: single-threaded during engine build, no other readers.
                 unsafe {
                     match saved {
                         Some(v) => std::env::set_var("INFER_TP_SIZE", v),
                         None => std::env::remove_var("INFER_TP_SIZE"),
+                    }
+                }
+            }
+            if let Some(saved) = self.saved_cp.take() {
+                // SAFETY: single-threaded during engine build, no other readers.
+                unsafe {
+                    match saved {
+                        Some(v) => std::env::set_var("INFER_ATTN_CP_SIZE", v),
+                        None => std::env::remove_var("INFER_ATTN_CP_SIZE"),
                     }
                 }
             }
@@ -2155,7 +2177,7 @@ mod backend {
         // When config.tp_size is set, temporarily override INFER_TP_SIZE so the
         // executor's TpRuntime resolves to it. Restored on drop — scoped to
         // this synchronous constructor call, no global side effects.
-        let _tp_guard = TpEnvGuard::new(config.tp_size);
+        let _tp_guard = TpEnvGuard::new(config.world_size, config.context_parallel_size);
         let executor = match kind {
             CudaModelKind::Qwen3Dense => CudaExecutor::from_qwen3_bf16_safetensors(
                 model_path,
@@ -2231,7 +2253,7 @@ mod backend {
         // L2 budget: deployment-total → per-rank share, resolved at the ONE
         // constructor every rank runs (world size is env-identical per rank, so
         // the division is lockstep-deterministic).
-        let world = config.tp_size.unwrap_or_else(tp_world_size);
+        let world = config.world_size.unwrap_or_else(tp_world_size);
         let dram_rank_bytes = infer_cuda::resolve_dram_budget_bytes(config.kv_dram, world);
         executor.set_kv_tier_budget_bytes(dram_rank_bytes);
         // Opt-in L3 NVMe spill (`--kv-disk`): attached HERE so single-proc

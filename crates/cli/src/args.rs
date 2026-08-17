@@ -754,6 +754,17 @@ pub(crate) struct ServeArgs {
     #[arg(long, value_enum, default_value_t = ServeCommBackendArg::Auto)]
     pub(crate) comm_backend: ServeCommBackendArg,
 
+    /// Tensor-parallel degree: attention heads sharded across N GPUs. World
+    /// size = `tensor_parallel_size × context_parallel_size`. Default 1.
+    #[arg(long, default_value_t = 1, value_parser = parse_positive_usize, value_name = "N")]
+    pub(crate) tensor_parallel_size: usize,
+
+    /// Context-parallel degree: the sequence dimension sharded across N GPUs
+    /// (ring prefill + flash-decoding decode). World size =
+    /// `tensor_parallel_size × context_parallel_size`. Default 1.
+    #[arg(long, default_value_t = 1, value_parser = parse_positive_usize, value_name = "N")]
+    pub(crate) context_parallel_size: usize,
+
     /// External drafter checkpoint dir. Consumed by `--spec-type dspark`
     /// (DSpark/DFlash block drafter, CUDA Qwen3.6); rejected otherwise.
     #[arg(long, value_name = "PATH_OR_REPO")]
