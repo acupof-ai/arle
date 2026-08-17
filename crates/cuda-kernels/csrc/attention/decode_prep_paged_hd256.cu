@@ -13,7 +13,6 @@
 
 #include "common.cuh"
 
-#define HD256 256
 #define NUM_WARPS_HD256 (HD256 / WARP_SIZE)  // 8
 
 // Per-head RMSNorm, OFFSET convention: output = x * rms_inv * (1 + weight).
@@ -45,34 +44,6 @@ __device__ __forceinline__ float rms_norm_head_hd256(
     __syncthreads();
 
     return val * scratch[0] * (1.0f + weight);
-}
-
-// Partial RoPE: pair-wise rotation on first rotary_dim elements.
-// Pairs are (d, d + rotary_dim/2) for d in [0, rotary_dim/2).
-// Requires shared memory pre-filled with normed values.
-__device__ __forceinline__ float apply_rope_partial_hd256(
-    float* smem,
-    const __nv_bfloat16* cos_cache,
-    const __nv_bfloat16* sin_cache,
-    int pos,
-    int tid,
-    int rotary_dim
-) {
-    int half_rotary = rotary_dim / 2;
-
-    if (tid < half_rotary) {
-        float cos_val = __bfloat162float(cos_cache[pos * rotary_dim + tid]);
-        float sin_val = __bfloat162float(sin_cache[pos * rotary_dim + tid]);
-        return smem[tid] * cos_val - smem[tid + half_rotary] * sin_val;
-    } else if (tid < rotary_dim) {
-        int pair = tid - half_rotary;
-        float cos_val = __bfloat162float(cos_cache[pos * rotary_dim + pair]);
-        float sin_val = __bfloat162float(sin_cache[pos * rotary_dim + pair]);
-        return smem[pair] * sin_val + smem[tid] * cos_val;
-    } else {
-        // Non-rotated dimensions: pass through
-        return smem[tid];
-    }
 }
 
 // Main kernel: one block per (kv_head, batch_element)

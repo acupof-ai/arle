@@ -477,15 +477,6 @@ impl Qwen35CudaExecutor {
         self.model.tp.two_d_engaged()
     }
 
-    /// `BackendExecutor::kv_shard_factor` — cp_size under 2D, else 1.
-    pub(crate) fn kv_shard_factor(&self) -> usize {
-        if self.two_d_engaged() {
-            self.model.tp.attn_cp_size()
-        } else {
-            1
-        }
-    }
-
     /// This rank's (cp_rank, cp_size) for the host pool's shard filter, or
     /// `None` when 2D is not engaged.
     pub(crate) fn kv_shard_spec(&self) -> Option<(usize, usize)> {
@@ -1426,16 +1417,17 @@ impl Qwen35CudaExecutor {
         // A shard with no resident pages (total_len < page_size * cp) still
         // needs a 1-entry table: FA3 dereferences page_table[0], and kv_lens=0
         // bounds the read to zero tokens.
-        let (table, stride) = if local_num_pages == 0 {
-            (vec![0i32], 1usize)
+        let kv_indices_dev = crate::ops::upload_i32(ctx, &local_pages)?;
+        let (page_table_rect, stride) = if local_num_pages == 0 {
+            (crate::ops::upload_i32(ctx, &[0])?, 1usize)
         } else {
-            (local_pages.clone(), local_num_pages)
+            (kv_indices_dev.clone(), local_num_pages)
         };
         let zero = crate::ops::upload_i32(ctx, &[0])?;
         Ok(PageMeta {
             q_indptr: crate::ops::upload_i32(ctx, &[0, 1])?,
             kv_indptr: crate::ops::upload_i32(ctx, &[0, local_num_pages as i32])?,
-            kv_indices: crate::ops::upload_i32(ctx, &local_pages)?,
+            kv_indices: kv_indices_dev,
             kv_last_page_len: crate::ops::upload_i32(ctx, &[local_last_fill as i32])?,
             page_table_offsets: zero.clone(),
             start_positions: crate::ops::upload_i32(ctx, &[kv_seq_len as i32])?,
@@ -1444,7 +1436,7 @@ impl Qwen35CudaExecutor {
             page_offsets: vec![0, local_num_pages],
             kv_lens: vec![local_token_count],
             kv_lens_dev: crate::ops::upload_i32(ctx, &[local_token_count as i32])?,
-            page_table_rect: crate::ops::upload_i32(ctx, &table)?,
+            page_table_rect,
             page_table_stride: stride,
             seq_len: 1,
             total_q: 1,

@@ -706,11 +706,11 @@ impl BackendExecutor for CudaExecutor {
         }
     }
 
-    fn kv_shard_factor(&self) -> usize {
+    fn kv_shard_spec(&self) -> Option<(usize, usize)> {
         match &self.inner {
-            CudaExecutorInner::Placeholder => 1,
+            CudaExecutorInner::Placeholder => None,
             #[cfg(feature = "cuda")]
-            CudaExecutorInner::Real(real) => real.kv_shard_factor(),
+            CudaExecutorInner::Real(real) => real.kv_shard_spec(),
         }
     }
 

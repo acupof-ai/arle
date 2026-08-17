@@ -814,13 +814,13 @@ impl Qwen35Model {
                                     let meta_cap = meta.batch.div_ceil(4) * 4 * 4 + 1;
                                     let sem = fa3_semaphore.get(&self.ctx, meta_cap)?;
                                     let (lse_ptr, _f0) = lse.device_ptr_mut(&self.ctx.stream);
+                                    let my_lse_byte_off = (self.tp.attn_cp_rank()
+                                        * accum_rows
+                                        * std::mem::size_of::<f32>())
+                                        as u64;
                                     let softmax_lse_ptr = if two_d {
                                         // lse is sized cp_size*accum_rows f32 above.
-                                        lse_ptr
-                                            + (self.tp.attn_cp_rank()
-                                                * accum_rows
-                                                * std::mem::size_of::<f32>())
-                                                as u64
+                                        lse_ptr + my_lse_byte_off
                                     } else {
                                         lse_ptr
                                     };
@@ -942,11 +942,7 @@ impl Qwen35Model {
                                         unsafe {
                                             self.tp.attn_cp_all_gather_bf16(
                                                 &self.ctx,
-                                                (lse_ptr
-                                                    + (cp_rank
-                                                        * accum_rows
-                                                        * std::mem::size_of::<f32>())
-                                                        as u64)
+                                                (lse_ptr + my_lse_byte_off)
                                                     as *const std::ffi::c_void,
                                                 accum_rows * 2,
                                                 lse_ptr as *mut std::ffi::c_void,

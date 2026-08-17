@@ -3,7 +3,6 @@
 #define PREFILL_PAGED_HD128 128
 #define PREFILL_PAGED_HD256 256
 #define PREFILL_PAGED_NUM_WARPS_HD128 (PREFILL_PAGED_HD128 / WARP_SIZE)
-#define PREFILL_PAGED_NUM_WARPS_HD256 (PREFILL_PAGED_HD256 / WARP_SIZE)
 
 __global__ void prefill_attention_paged_qk_norm_rope_hd128_kernel(
     __nv_bfloat16* __restrict__ q,
@@ -109,55 +108,6 @@ __global__ void prefill_attention_paged_kv_write_hd128_kernel(
   v_pool[pool_offset] = v[src_offset];
 }
 
-__device__ __forceinline__ float prefill_attention_paged_rms_norm_hd256(
-    float val,
-    float weight,
-    float eps,
-    int tid) {
-  float sq_sum = warp_reduce_sum(val * val);
-
-  __shared__ float scratch[PREFILL_PAGED_NUM_WARPS_HD256];
-  int warp_id = tid / WARP_SIZE;
-  int lane_id = tid % WARP_SIZE;
-  if (lane_id == 0) {
-    scratch[warp_id] = sq_sum;
-  }
-  __syncthreads();
-
-  if (tid == 0) {
-    float total = 0.0f;
-    for (int i = 0; i < PREFILL_PAGED_NUM_WARPS_HD256; ++i) {
-      total += scratch[i];
-    }
-    scratch[0] = 1.0f / sqrtf(total / PREFILL_PAGED_HD256 + eps);
-  }
-  __syncthreads();
-
-  return val * scratch[0] * (1.0f + weight);  // #58: hd256 q/k_norm OFFSET (mean|w|<0.75)
-}
-
-__device__ __forceinline__ float prefill_attention_paged_apply_rope_partial_hd256(
-    float* smem,
-    const __nv_bfloat16* cos_cache,
-    const __nv_bfloat16* sin_cache,
-    int pos,
-    int tid,
-    int rotary_dim) {
-  int half_rotary = rotary_dim / 2;
-  if (tid < half_rotary) {
-    float cos_val = __bfloat162float(cos_cache[pos * rotary_dim + tid]);
-    float sin_val = __bfloat162float(sin_cache[pos * rotary_dim + tid]);
-    return smem[tid] * cos_val - smem[tid + half_rotary] * sin_val;
-  }
-  if (tid < rotary_dim) {
-    int pair = tid - half_rotary;
-    float cos_val = __bfloat162float(cos_cache[pos * rotary_dim + pair]);
-    float sin_val = __bfloat162float(sin_cache[pos * rotary_dim + pair]);
-    return smem[pair] * sin_val + smem[tid] * cos_val;
-  }
-  return smem[tid];
-}
-
 __global__ void prefill_attention_paged_hd256_kernel(
     const __nv_bfloat16* __restrict__ q_full_batch,
     __nv_bfloat16* __restrict__ q_out_batch,
@@ -197,12 +147,12 @@ __global__ void prefill_attention_paged_hd256_kernel(
 
     float q_val = __bfloat162float(q_full_batch[q_src]);
     float q_normed =
-        prefill_attention_paged_rms_norm_hd256(q_val, q_norm_w, rms_eps, tid);
+        rms_norm_hd256(q_val, q_norm_w, rms_eps, tid);
 
     smem_rope[tid] = q_normed;
     __syncthreads();
 
-    float q_roped = prefill_attention_paged_apply_rope_partial_hd256(
+    float q_roped = apply_rope_partial_hd256(
         smem_rope, cos_cache, sin_cache, pos, tid, rotary_dim);
     __syncthreads();
 
@@ -214,12 +164,12 @@ __global__ void prefill_attention_paged_hd256_kernel(
   int kv_src = token * kv_dim + kv_head_idx * PREFILL_PAGED_HD256 + tid;
   float k_val = __bfloat162float(k_batch[kv_src]);
   float k_normed =
-      prefill_attention_paged_rms_norm_hd256(k_val, k_norm_w, rms_eps, tid);
+      rms_norm_hd256(k_val, k_norm_w, rms_eps, tid);
 
   smem_rope[tid] = k_normed;
   __syncthreads();
 
-  float k_roped = prefill_attention_paged_apply_rope_partial_hd256(
+  float k_roped = apply_rope_partial_hd256(
       smem_rope, cos_cache, sin_cache, pos, tid, rotary_dim);
   float v_val = __bfloat162float(v_batch[kv_src]);
 
