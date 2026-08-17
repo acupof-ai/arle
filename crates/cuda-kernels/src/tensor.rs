@@ -568,6 +568,9 @@ impl DeviceContext {
         &self,
         producer: CudaPipelineStreamKind,
     ) -> Result<CudaPipelineFence> {
+        self.ctx
+            .bind_to_thread()
+            .map_err(|e| anyhow!("Bind CUDA context before pipeline fence record failed: {e}"))?;
         let event = {
             let mut pool = self.event_pool.lock().unwrap();
             // Find a completed event to re-use. cuEventQuery on an in-flight
