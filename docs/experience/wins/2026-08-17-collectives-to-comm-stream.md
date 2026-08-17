@@ -6,6 +6,12 @@
 > 78.7 → 55–59 tok/s (−25–30%). Partial fix (all-reduce back to compute
 > stream) recovered to 63 tok/s; remaining −19% gap under investigation.
 > Single-GPU (no NCCL) is unaffected.
+>
+> **Root-cause fix: event pool** (`9a82dbe4d`, 2026-08-17). The regression
+> was per-fence `cuEventCreate`/`cuEventDestroy` — 80 all-reduces × 2 fences
+> = 160 event allocations per decode step at TP=8. The pool reuses events
+> (`Arc<Mutex<Vec<CudaEvent>>>` in `DeviceContext`), eliminating steady-state
+> allocation. Bench: pending-remote ([entry](2026-08-17-cuda-event-pool-pipeline-fences.md)).
 
 ## Goal
 
