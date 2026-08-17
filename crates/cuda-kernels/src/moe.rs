@@ -6,7 +6,7 @@ use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 use half::bf16;
 
 use crate::ffi::{self, Half};
-use crate::tensor::{DeviceContext, DeviceMatrix, DeviceVec, RawDevicePtr};
+use crate::tensor::{DeviceContext, DeviceMatrix, RawDevicePtr};
 
 // Safe wrappers over the grouped-GEMM + DSv4/Qwen3.6 expert-dispatch FFI: they
 // centralize device-pointer extraction + the i32-ABI casts. `RawDevicePtr<T>`
@@ -2177,12 +2177,6 @@ pub unsafe fn dsv4_fp8_grouped_down_decode(
         .result()?;
     }
     Ok(())
-}
-
-/// Convenience: build a [`RawDevicePtr`] over a [`DeviceVec`]'s dense data.
-#[must_use]
-pub fn device_vec_ptr(vec: &DeviceVec, ctx: &DeviceContext) -> RawDevicePtr<bf16> {
-    crate::tensor::cache_ptr(&vec.data, ctx)
 }
 
 // W4A16 (INT4) MoE grouped GEMV — numerical correctness vs a dequantized

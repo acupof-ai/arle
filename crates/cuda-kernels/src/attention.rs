@@ -71,47 +71,6 @@ pub fn dsv4_fp8_kv_pack(
     Ok(())
 }
 
-/// Pack variant that accepts raw u64 pointers for NoPE/RoPE (used when the
-/// caller has already lifted the bf16 buffers out of `DeviceVec` for
-/// fused-launch scheduling). The packed_kv pointer is u64 too.
-#[allow(clippy::too_many_arguments)]
-pub fn dsv4_fp8_kv_pack_raw(
-    ctx: &DeviceContext,
-    nope_ptr: u64,
-    rope_ptr: u64,
-    packed_kv_ptr: u64,
-    token_block_id: &CudaSlice<i32>,
-    token_in_block_row: &CudaSlice<i32>,
-    n_tokens: usize,
-    page_block_size: usize,
-) -> Result<()> {
-    if n_tokens == 0 {
-        return Ok(());
-    }
-
-    let (tbid_ptr, _gt) = token_block_id.device_ptr(&ctx.stream);
-    let (tibr_ptr, _gi) = token_in_block_row.device_ptr(&ctx.stream);
-
-    // SAFETY: same kernel contract as `dsv4_fp8_kv_pack`; `nope_ptr`/`rope_ptr`
-    // are caller-lifted device addresses covering `n_tokens` bf16 rows on
-    // `ctx.stream`, index slices are pinned by the `_g*` guards.
-    unsafe {
-        ffi::arle_dsv4_fp8_kv_pack_cuda(
-            nope_ptr as *const ffi::Half,
-            rope_ptr as *const ffi::Half,
-            packed_kv_ptr as *mut u8,
-            tbid_ptr as *const i32,
-            tibr_ptr as *const i32,
-            n_tokens as i32,
-            page_block_size as i32,
-            ctx.stream.cu_stream(),
-        )
-        .result()?;
-    }
-
-    Ok(())
-}
-
 /// Strided-input pack variant — accepts raw u64 NoPE/RoPE pointers plus an
 /// explicit element stride per axis. Phase D-4 runtime hooks feed this
 /// from `k_prepared` (interleaved [NoPE 448 | RoPE 64] bf16, head_dim=512
@@ -249,39 +208,6 @@ pub fn dsv4_fp8_kv_fill_one_sw_slot_from_start_pos_raw(
             token_block_id_ptr as *mut i32,
             token_in_block_row_ptr as *mut i32,
             start_pos_ptr as *const i32,
-            sliding_window as i32,
-            page_block_size as i32,
-            ctx.stream.cu_stream(),
-        )
-        .result()?;
-    }
-    Ok(())
-}
-
-/// Fill the `[block_id,row]` scratch arrays for a batch of FlashMLA decode SW
-/// packs. `token_block_id[row]` is absolute in the shared FP8 KV arena.
-#[allow(clippy::too_many_arguments)]
-pub fn dsv4_fp8_kv_fill_sw_slots_from_start_pos_raw(
-    ctx: &DeviceContext,
-    token_block_id_ptr: u64,
-    token_in_block_row_ptr: u64,
-    start_pos_ptr: u64,
-    slot_layer_block_offsets_ptr: u64,
-    n_tokens: usize,
-    sliding_window: usize,
-    page_block_size: usize,
-) -> Result<()> {
-    // SAFETY: all raw pointers are caller device addresses valid for
-    // `n_tokens` i32 entries (scratch outputs, per-row `start_pos`, per-slot
-    // block offsets) on `ctx.stream`; writes are bounded by `n_tokens`,
-    // stream-ordered.
-    unsafe {
-        ffi::arle_dsv4_fp8_kv_fill_sw_slots_from_start_pos_cuda(
-            token_block_id_ptr as *mut i32,
-            token_in_block_row_ptr as *mut i32,
-            start_pos_ptr as *const i32,
-            slot_layer_block_offsets_ptr as *const i32,
-            n_tokens as i32,
             sliding_window as i32,
             page_block_size as i32,
             ctx.stream.cu_stream(),
@@ -439,82 +365,9 @@ pub fn dsv4_fp8_kv_pack_completed_compressor_row_batched_raw(
     Ok(())
 }
 
-/// Phase D-4 step 1 — DSv4 FlashMLA sparse-decode indices builder.
-///
-/// Builds the unified per-decode-token indices row in block-paged coords
-/// (s_q = 1). See `csrc/attention/dsv4_flashmla_decode_build_indices.cu`
-/// for the row layout (SW slots | compressed selections | -1 padding).
-///
-/// Parameters:
-/// - `indices_ptr`: u64 device pointer to `int32[topk_unified]` output.
-/// - `selected_ptr`: u64 device pointer to `int32[max_compressed_keys]`
-///   for CSA mode (mode_int=1); pass `0` for HCA mode (mode_int=2).
-/// - `sw_blocks`: SW sub-pool block count (`ceil(sliding_window / page_block_size)`).
-/// - `sliding_window`: bf16 SW ring length.
-/// - `start_pos`: absolute position of the decode token.
-/// - `max_compressed_keys`: `index_topk` (CSA) or padded compressed count (HCA).
-/// - `compress_ratio`: causality-gate ratio.
-/// - `mode_int`: 1 = CSA, 2 = HCA.
-/// - `page_block_size`: 64 for DSv4-Flash MODEL1.
-///
-/// `topk_unified = sliding_window + max_compressed_keys` must be %128==0
-/// (FlashMLA invariant); the kernel returns `cudaErrorInvalidValue` otherwise.
-///
-/// `page_table` is the OPTIONAL Stage-B logical→physical page table: `None` (the
-/// default for every current caller) keeps the Stage-A slot-relative path
-/// byte-for-byte; `Some(table)` routes each emitted index's logical page through
-/// the table (identity table = the Stage-A index, index-for-index).
-#[allow(clippy::too_many_arguments)]
-pub fn dsv4_flashmla_decode_build_indices_raw(
-    ctx: &DeviceContext,
-    indices_ptr: u64,
-    selected_ptr: u64,
-    sw_blocks: usize,
-    sliding_window: usize,
-    start_pos: usize,
-    max_compressed_keys: usize,
-    compress_ratio: usize,
-    mode_int: i32,
-    page_block_size: usize,
-    page_table: Option<&CudaSlice<i32>>,
-    total_blocks: usize,
-) -> Result<()> {
-    let (pt_ptr, num_logical_pages, _gp) = match page_table {
-        Some(table) => {
-            let (ptr, guard) = table.device_ptr(&ctx.stream);
-            (ptr as *const i32, table.len() as i32, Some(guard))
-        }
-        None => (std::ptr::null(), 0, None),
-    };
-    // SAFETY: `indices_ptr` is the caller's `int32[topk_unified]` output and
-    // `selected_ptr` the CSA selection row (0/null in HCA mode, which the
-    // kernel never dereferences); `pt_ptr` is null exactly when no Stage-B
-    // table is supplied, else bounds-checked by `num_logical_pages`.
-    // Stream-ordered on `ctx.stream`.
-    unsafe {
-        ffi::arle_dsv4_flashmla_decode_build_indices_cuda(
-            indices_ptr as *mut i32,
-            selected_ptr as *const i32,
-            sw_blocks as i32,
-            sliding_window as i32,
-            start_pos as i32,
-            max_compressed_keys as i32,
-            compress_ratio as i32,
-            mode_int,
-            page_block_size as i32,
-            pt_ptr,
-            num_logical_pages,
-            total_blocks as i32,
-            ctx.stream.cu_stream(),
-        )
-        .result()?;
-    }
-    Ok(())
-}
-
-/// Same as [`dsv4_flashmla_decode_build_indices_raw`], but reads
-/// `start_pos` from a single `int32` device scalar. This is the graph-ready
-/// entrypoint for decode paths that stamp per-step metadata on the stream.
+/// Build FlashMLA decode indices, reading `start_pos` from a single `int32`
+/// device scalar. This is the graph-ready entrypoint for decode paths that
+/// stamp per-step metadata on the stream.
 #[allow(clippy::too_many_arguments)]
 pub fn dsv4_flashmla_decode_build_indices_start_pos_ptr_raw(
     ctx: &DeviceContext,
