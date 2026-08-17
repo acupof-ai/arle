@@ -177,6 +177,7 @@ fn acquire_writer_lock(dir: &std::path::Path) -> Option<std::fs::File> {
     let file = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
+        .truncate(false)
         .open(&path)
         .ok()?;
     // SAFETY: flock on a valid open fd; LOCK_NB makes it non-blocking.

@@ -19,9 +19,11 @@ them; one finding was also a multiproc correctness bug.
   Deleted the endpoint; tiles now read `samples[samples.length-1]` from
   `/v1/observe/query`, which works in every mode (a flock-winning worker
   writes JSONL).
-- Dropped dead `.truncate(false)` calls (default; append never truncates).
+- Dropped `.truncate(false)` in append_sample (redundant under
+  `.append(true)`); the lock-file open keeps it to satisfy
+  clippy::suspicious_open_options.
 
-Net -63 lines. No perf delta (background sampling + dashboard, not the
+Net -62 lines. No perf delta (background sampling + dashboard, not the
 inference hot path). Device-neutral crates checked with `-D warnings`;
 observe tests pass. `gpu_sample.rs` typechecks in CI's `cuda,no-cuda` lane.
 
