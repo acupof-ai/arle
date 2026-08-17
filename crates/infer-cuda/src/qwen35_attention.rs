@@ -1879,9 +1879,9 @@ impl Qwen35Model {
                         .data
                         .device_ptr_mut(&self.ctx.stream);
                     self.ctx.comm_waits_for_compute()?;
-                    let nccl_group = self.tp.attn_cp_group()?;
                     // SAFETY: live per-slot state buffers; the previous cp rank
                     // posts the matching sends in the same (gdr, conv) order.
+                    // Ungrouped P2P: host rendezvous blocks briefly, never deadlocks.
                     unsafe {
                         self.tp.attn_cp_recv_unfenced(
                             &self.ctx,
@@ -1898,7 +1898,6 @@ impl Qwen35Model {
                             cp_rank - 1,
                         )?;
                     }
-                    nccl_group.finish()?;
                     self.ctx.compute_waits_for_comm()?;
                 }
                 self.advance_linear_conv_gdr(
@@ -1926,11 +1925,6 @@ impl Qwen35Model {
                         .data
                         .device_ptr_mut(&self.ctx.stream);
                     self.ctx.comm_waits_for_compute()?;
-                    // Group the send (if any) with the broadcast so NCCL
-                    // submits both directions together — the host never blocks
-                    // in ncclSend waiting for a peer recv that hasn't been
-                    // posted.
-                    let nccl_group = self.tp.attn_cp_group()?;
                     if cp_rank + 1 < cp_size {
                         // SAFETY: same buffers, matching recvs on the next rank.
                         unsafe {
@@ -1970,7 +1964,6 @@ impl Qwen35Model {
                             cp_size - 1,
                         )?;
                     }
-                    nccl_group.finish()?;
                     self.ctx.compute_waits_for_comm()?;
                 }
             }
