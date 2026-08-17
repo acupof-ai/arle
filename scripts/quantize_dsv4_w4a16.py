@@ -32,6 +32,8 @@ SCALE_BLOCK_COLS = 16  # E8M0 scale covers 1 row x 16 cols
 
 # Matches: model.layers.N.mlp.experts.M.w{1,2,3}.weight
 EXPERT_WEIGHT_RE = re.compile(r"\.experts\.\d+\.w[123]\.weight$")
+# Matches: model.layers.N.mlp.experts.M.w{1,2,3}.scale (E8M0, dropped in output)
+EXPERT_SCALE_RE = re.compile(r"\.experts\.\d+\.w[123]\.scale$")
 
 
 def decode_e8m0_scale(scale_bytes: bytes, rows: int, cols: int) -> np.ndarray:
@@ -154,6 +156,11 @@ def process_file(st_file: Path, output_path: Path) -> int:
     with safe_open(str(st_file), framework="pt") as f:
         keys = set(f.keys())
         for key in sorted(keys):
+            # Drop original E8M0 expert scales — the W4A16 weight_scale replaces
+            # them, and reject_dsv4_e8m0_scale_abi would reject the checkpoint.
+            if EXPERT_SCALE_RE.search(key):
+                continue
+
             tensor = f.get_tensor(key)
 
             if not EXPERT_WEIGHT_RE.search(key):
