@@ -1916,16 +1916,14 @@ struct ObserveQueryParams {
 
 fn parse_range_ms(s: &str) -> Option<u64> {
     let s = s.trim();
-    if s.is_empty() {
-        return None;
-    }
-    let (num, unit) = s.split_at(s.len() - 1);
+    let unit = s.chars().last()?;
+    let num = &s[..s.len() - unit.len_utf8()];
     let n: u64 = num.parse().ok()?;
     match unit {
-        "s" => Some(n * 1_000),
-        "m" => Some(n * 60_000),
-        "h" => Some(n * 3_600_000),
-        "d" => Some(n * 86_400_000),
+        's' => Some(n * 1_000),
+        'm' => Some(n * 60_000),
+        'h' => Some(n * 3_600_000),
+        'd' => Some(n * 86_400_000),
         _ => None,
     }
 }
@@ -1936,7 +1934,9 @@ async fn observe_query(Query(params): Query<ObserveQueryParams>) -> Json<serde_j
         .as_deref()
         .and_then(parse_range_ms)
         .unwrap_or(3_600_000);
-    let samples = crate::observe::query(range_ms);
+    let samples = tokio::task::spawn_blocking(move || crate::observe::query(range_ms))
+        .await
+        .unwrap_or_default();
     Json(serde_json::json!({ "samples": samples }))
 }
 

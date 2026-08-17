@@ -413,37 +413,19 @@ pub(crate) fn render_prometheus(counters: &CounterSnapshot, model: &str) -> Stri
     if let Some(ref gpu) = counters.gpu {
         for i in 0..gpu.device_count as usize {
             let d = &gpu.devices[i];
-            let idx = d.gpu_index.to_string();
-            out.push_str(&format!(
-                "arle_gpu_util_pct{{model_name=\"{}\",gpu_index=\"{}\"}} {}\n",
-                escape_label_value(model),
-                idx,
-                d.util_pct
-            ));
-            out.push_str(&format!(
-                "arle_gpu_memory_used_mb{{model_name=\"{}\",gpu_index=\"{}\"}} {}\n",
-                escape_label_value(model),
-                idx,
-                d.memory_used_mb
-            ));
-            out.push_str(&format!(
-                "arle_gpu_memory_total_mb{{model_name=\"{}\",gpu_index=\"{}\"}} {}\n",
-                escape_label_value(model),
-                idx,
-                d.memory_total_mb
-            ));
-            out.push_str(&format!(
-                "arle_gpu_temp_c{{model_name=\"{}\",gpu_index=\"{}\"}} {}\n",
-                escape_label_value(model),
-                idx,
-                d.temp_c
-            ));
-            out.push_str(&format!(
-                "arle_gpu_power_w{{model_name=\"{}\",gpu_index=\"{}\"}} {}\n",
-                escape_label_value(model),
-                idx,
-                d.power_w
-            ));
+            for (suffix, value) in [
+                ("util_pct", d.util_pct as u64),
+                ("memory_used_mb", d.memory_used_mb as u64),
+                ("memory_total_mb", d.memory_total_mb as u64),
+                ("temp_c", d.temp_c as u64),
+                ("power_w", d.power_w as u64),
+            ] {
+                out.push_str(&format!(
+                    "arle_gpu_{suffix}{{model_name=\"{}\",gpu_index=\"{}\"}} {value}\n",
+                    escape_label_value(model),
+                    d.gpu_index
+                ));
+            }
         }
     }
     out

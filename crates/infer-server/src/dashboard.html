@@ -139,10 +139,6 @@ const STAT_DEFS = [
   { label: 'Active requests', f: s => s.active_requests },
   { label: 'Queue depth', f: s => s.queue_depth },
   { label: 'KV free pages', f: s => s.kv_free_pages },
-  { label: 'GPU util', f: s => { const d = gpu0(s); return d == null ? null : d.util_pct + ' %'; } },
-  { label: 'VRAM used', f: s => { const d = gpu0(s); return d == null ? null : (d.memory_used_mb / 1024).toFixed(1) + ' GB'; } },
-  { label: 'CPU', f: s => s.cpu_pct == null ? null : s.cpu_pct.toFixed(1) + ' %' },
-  { label: 'RAM used', f: s => s.ram_used_mb == null ? null : (s.ram_used_mb / 1024).toFixed(1) + ' GB' },
 ];
 
 const hhmm = t => {
