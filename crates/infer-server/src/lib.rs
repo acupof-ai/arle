@@ -279,7 +279,8 @@ where
         let (control_tx, control_rx) = mpsc::channel::<ControlMessage<E, K>>();
         let counters = Arc::new(Mutex::new(CounterSnapshot::default()));
         let loop_counters = Arc::clone(&counters);
-        observe::spawn_observe_task(Arc::clone(&counters));
+        let observe_counters = Arc::clone(&counters);
+        observe::spawn_observe_task(move || observe_counters.lock().ok().map(|s| s.clone()));
         let max_live_requests = executor.step_limits().max_live_requests.max(1);
         let join = thread::Builder::new()
             .name("infer-engine".to_string())
@@ -346,7 +347,8 @@ where
         let (ready_tx, ready_rx) = mpsc::sync_channel::<std::result::Result<usize, String>>(1);
         let counters = Arc::new(Mutex::new(CounterSnapshot::default()));
         let loop_counters = Arc::clone(&counters);
-        observe::spawn_observe_task(Arc::clone(&counters));
+        let observe_counters = Arc::clone(&counters);
+        observe::spawn_observe_task(move || observe_counters.lock().ok().map(|s| s.clone()));
         let join = thread::Builder::new()
             .name("infer-engine".to_string())
             .spawn(move || match builder() {
@@ -756,6 +758,7 @@ where
         coord_multimodal,
         // Local lane: the engine thread and this process share fate already.
         None,
+        false,
     )
 }
 
