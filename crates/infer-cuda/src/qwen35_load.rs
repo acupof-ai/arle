@@ -202,7 +202,7 @@ impl Qwen35Model {
     pub(crate) fn from_safetensors_with_tp(
         model_path: &Path,
         max_seq_len: usize,
-        tp: crate::tp::TpRuntime,
+        mut tp: crate::tp::TpRuntime,
         mtp_draft_tokens: Option<usize>,
     ) -> Result<Self> {
         let total_t0 = Instant::now();
@@ -331,6 +331,10 @@ impl Qwen35Model {
 
         let loader_t0 = Instant::now();
         let ctx = DeviceContext::new()?;
+        // One-shot small-message collectives (default-on, loud auto-degrade).
+        // COLLECTIVE boot — identical construction point on every rank.
+        #[cfg(feature = "nccl")]
+        tp.init_oneshot_comm(&ctx);
         let loader = SafetensorLoader::new(model_path)?;
         crate::executor::cuda_startup_log("qwen35.ctx_loader", loader_t0, format_args!(""));
 
