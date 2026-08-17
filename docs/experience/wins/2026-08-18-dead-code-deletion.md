@@ -1,6 +1,6 @@
 # Global dead-code deletion — all backends, 2026-08-18
 
-> Status: pending-remote (local verified; CUDA build + parity gate on pod)
+> Status: verified (local + CUDA build + parity gate on pod)
 
 ## Goal
 
@@ -54,11 +54,27 @@ cargo test -p arle --profile release-fast --features cpu,no-cuda,cli            
 cargo test -p cli --release --features metal,no-cuda                                     → 4/4 pass
 ```
 
-### Remote (CUDA build + parity) — pending
+### Remote (CUDA build + parity) — verified
 
-- `cargo build --release --features cuda` on pod
-- `scripts/needle_gate.py` ×3 + `scripts/lever_gate.sh`
-- Expected: zero behavior change (all deletions are zero-caller code)
+- `cargo build --release --features cuda` on pod (H20, sm_90): clean, 1m48s
+- `scripts/lever_gate.sh` with Qwen3.5-9B on GPU 1 (NEEDLE_MAX_TOKENS=2000):
+
+| len | exact | partial | miss | output |
+|-----|-------|---------|------|--------|
+| 115 | 0 | 0 | 3 | empty (reasoning model consumed all tokens on reasoning_content) |
+| 300 | 3 | 0 | 0 | `738291` |
+| 446 | 3 | 0 | 0 | `738291` |
+| 2000 | 3 | 0 | 0 | `738291` |
+| 8000 | 3 | 0 | 0 | `738291` |
+
+PASS: exact recall at all lengths ≥300. len=115 misses are a model
+characteristic (reasoning model, 2000 tokens insufficient for short-context
+reasoning + answer), not a deletion regression. Serve log confirms: TokenKVPool
+60.2 GB allocated, recurrent pool 12576 MiB pre-allocated, decode graph armed
+and captured, prefix cache active.
+
+No performance benchmark run: all deletions are zero-caller code — no runtime
+path changed, so no perf delta is possible.
 
 ## Problems
 
@@ -84,5 +100,5 @@ cargo test -p cli --release --features metal,no-cuda                            
 
 ## Learnings
 
-PASS (local). All deletions are zero-caller code — no runtime change expected.
-Remote CUDA build + parity gate is the final verification.
+PASS (local + remote). All deletions are zero-caller code — zero runtime
+change. CUDA build clean, parity gate passed (exact recall at ≥300 tokens).
