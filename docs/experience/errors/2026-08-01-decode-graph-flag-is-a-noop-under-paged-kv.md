@@ -61,15 +61,11 @@ consistent with a flag that changes nothing.
 
 ## Fix
 
-Not fixed. Two separable pieces, in order:
-
-1. **Stop the log lying.** ARMED should not print when `full_attn_paged()` will
-   bypass the lane; the startup message belongs behind the same predicate the
-   dispatch uses.
-2. **Make graphs reachable over paged KV** — the actual 4 ms. The industry shape
-   is fixed-capacity page-table buffers plus one graph per (batch-size,
-   page-count) bucket, so the baked addresses stop moving. That is a phase, not
-   a flag flip.
+**Fixed 2026-08-03 by `cb6b3389d`** ("whole-step decode CUDA graph under paged
+KV — capture the serving default"): the unconditional paged-KV early return was
+removed and `try_graph_decode_paged` now captures the serving default. The flag
+went default-on the same day. 35B c=1 TPOT 16.22 → 6.70 ms (−58.7%); see the
+35B SOTA row in `docs/baselines.md`.
 
 ## Rule
 

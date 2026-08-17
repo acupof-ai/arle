@@ -79,6 +79,14 @@ latest-is-reference, not because a delta was demonstrated. Output tok/s moves
 fingerprint; c=16 alone sits just outside the ±3% band on a single sweep and is
 not a claim of improvement. The GPU differs from the prior row
 (`GPU-77551814`), which rule 3 counts as part of the fingerprint.
+
+**Re-run 2026-08-17, runtime `5ea12daaa`, same GPU (`GPU-1769a5e7`):**
+47.7 / 95.4 / 118.2 / 139.3 / 154.0 out tok/s at c=1/2/4/8/16 — c=1 matches
+(+1.6%), c≥2 regresses −4.1 / −5.0 / −9.0 / −8.5%. Acceptance is within 2 pp
+of the SOTA row at every point, so the regression is in chain rate, not
+speculation quality. Root cause not yet isolated; 78 commits landed between
+the SOTA row and this re-run (2D KV sharding, decode-path collapse, event
+pool, observability). The SOTA row stands. Needle 12/12 PASS.
 ### Step budget — where the time goes (2026-08-01, `nsys`, dense FP8)
 
 The SOTA table says how fast; this says what to fix.
@@ -131,19 +139,37 @@ costs what decoding 1 costs. Spec decode is working; the intercept is the wall.
 
 ## Qwen3.6-35B-A3B-FP8 (MoE) · 1×H20 · single-GPU · eager
 
-### SOTA — `a956f69b1` (2026-07-28) · `arle-fa3b2`
+### SOTA — decode graph, runtime `02867728d` (2026-08-17)
 
-No spec. Features on: host-authoritative KV mirror · batched FA3 (one launch
-per layer).
+No spec. Features on: whole-step decode graph (default-on, `cb6b3389d`) ·
+batched FA3 (one launch per layer) · host-authoritative KV mirror · GDR
+chunked (default-on, `c2eb5de9e`).
 
-| c | TTFT cold | TTFT warm | TPOT | ITL p50 | decode tok/s | total tok/s |
+Identity:
+
+- Runtime commit `02867728d`
+- Binary SHA-256 `9567bbccaacdbac585dabb55de10b0931575c17fb83c1a205b31df9c92093de7`
+- Kernel bundle `ee06c0c3aea4429ac51d5c32d784e9948fd6c0e85842bf0a87d66fb6186c3c15`
+- Dataset SHA-256 `8867f63eaac2f0537bb2b17847a7d0d3c1bb8d504c1ad191e97d673e9ecc4f34`
+
+Same dataset, params, and seed as the 27B row (128 req/point, max_tokens 214,
+greedy, seed 20260416). Throughput bench — TTFT cold is not separately
+measured; TTFT warm is the p50 across all 128 requests.
+
+| c | TTFT warm | TPOT | ITL p50 | decode tok/s | output tok/s | total tok/s |
 |---|---:|---:|---:|---:|---:|---:|
-| 1 | 9.2 s | 0.7 s | 16.22 ms | 16.17 ms | 61.7 | 6707.2 |
-| 8 | 0.6 s | 0.5 s | 44.10 ms | 38.31 ms | 22.7 | 27967.8 |
-| 16 | 1.8 s | 0.6 s | 73.74 ms | 60.90 ms | 13.6 | 33858.9 |
+| 1 | 0.70 s | 6.70 ms | 6.69 ms | 149.3 | 72.5 | 11860.2 |
+| 8 | 0.60 s | 36.12 ms | 29.34 ms | 27.7 | 199.3 | 32589.4 |
+| 16 | 0.75 s | 66.41 ms | 47.71 ms | 15.1 | 220.6 | 36075.0 |
 
-ITL p50 fit `15.7 + 2.82·B` ms. Gate exact=3 DET at 512/4k/16k/32k. 0 errors,
-128/128. Anchor audit 2026-07-30 bounds accumulated drift under 2.3%.
+vs the prior row (`a956f69b1`, 2026-07-28, pre-decode-graph): TPOT −58.7% /
+−18.1% / −9.9% at c=1/8/16; total tok/s +77% / +17% / +7%. The c=1 effect is
+the decode graph; c≥8 gains are smaller because the GPU is already saturated.
+1–3/128 responses per point tripped the repetition checker (greedy, long
+context) — no errors, no incomplete.
+
+Correctness: needle ladder 512/4096/16384/32768 ×3 passed 12/12 exact,
+deterministic at every length.
 
 ---
 
@@ -165,9 +191,11 @@ ITL p50 fit `15.7 + 2.82·B` ms. Gate exact=3 DET at 512/4k/16k/32k. 0 errors,
   warm = turns 1–7. `total tok/s` = prompt+generated over wall: capacity, not
   latency.
 
-**Inert flag — do not cost this into a plan.** `--qwen35-decode-graph` prints
-`ARMED` but produces zero `cuGraph*` calls (its call site sits below an
-unconditional paged-KV early return).
+**`--qwen35-decode-graph` is DEFAULT-ON and working** (2026-08-03, `cb6b3389d`):
+the paged-KV early return that made it a no-op was removed, and the graph now
+captures the serving default. 35B c=1 TPOT 16.22 → 6.70 ms (−58.7%); see the
+35B SOTA row below. The earlier no-op diagnosis is at
+[errors/2026-08-01-decode-graph-flag-is-a-noop-under-paged-kv.md](experience/errors/2026-08-01-decode-graph-flag-is-a-noop-under-paged-kv.md).
 
 **`--qwen35-gdr-chunked` is DEFAULT-ON** (2026-08-02, `c2eb5de9e`): 33K cold
 prefill −26%; license = chat GSM8K 100 **95/100 both arms, zero
@@ -276,6 +304,14 @@ style is concurrency-dependent — see
 The `logit_bias` relay gate passes at TP=8: a biased request returns 200 with
 the biased token dominating, two ordinary requests then answer correctly, and
 the serve log carries zero `relay deserialize` lines.
+
+**Re-run 2026-08-17, runtime `5cc681759`** (E8M0 loading fix + event pool +
+comm-stream fix): 64.68 / 178.31 / 241.09 out tok/s at c=1/8/16 — within
+±2% of the SOTA row, net neutral. Needle 512/4096/16384 ×3 = 9/9 exact.
+The E8M0 fix (`5cc681759`) unblocks DSv4 FP8 loading: the W4A16 detection
+probe called `quant_view_for()` which rejected DSv4's native E8M0 scales;
+the DSv4 path now skips that rejection. See
+[`errors/2026-08-17-dsv4-e8m0-scale-rejection-blocks-fp8-loading.md`](experience/errors/2026-08-17-dsv4-e8m0-scale-rejection-blocks-fp8-loading.md).
 
 ---
 
