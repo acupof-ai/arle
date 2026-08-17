@@ -23,10 +23,12 @@ out = sum_c w_c * out_c / sum_c w_c,  w_c = exp(lse_c - max_c lse_c)
 
 accumulated in f32 (SGLang #21637 "separate local combine kernel" shape).
 The ratio is invariant to the max choice, so no global pre-reduce is needed.
-lse rides the bf16 all-gather as f32 pairs (NCCL moves bytes, so it stays
-f32 end to end); out gathers as bf16. The new-token KV write is
-owner-conditional: only the shard with `page_idx % cp == c` writes, so the
-sharded pool stays exactly-once without a location table.
+This rank's (lse, out) pack into one rank-major section — lse as f32 pairs
+(NCCL moves bytes, so it stays f32 end to end) followed by bf16 out — and
+gather once; the merge kernel reads the packed layout via stride params.
+The new-token KV write is owner-conditional: only the shard with
+`page_idx % cp == c` writes, so the sharded pool stays exactly-once without
+a location table.
 
 ## Parameters
 
@@ -41,8 +43,9 @@ python3 scripts/needle_gate.py --url <url> --model <model> --runs 3
 
 - Baseline: parent of the Part E commit (Part B pool sharding + Part D ring
   prefill; decode under 2D not yet correct)
-- Treatment: Part E commit (sharded decode meta + owner-conditional write +
-  cross-cp merge + FA3-only 2D lane)
+- Treatment: Part E commit (persistent sharded decode meta + owner-conditional
+  write + cross-cp merge + FA3-only 2D lane); E2 refinement packs (lse, out)
+  into one all-gather (was two)
 - Trials: 3 (needle ladder ×3, same config)
 
 ## Environment
