@@ -1,6 +1,11 @@
 # TP/CP NCCL collectives → comm_stream — CUDA, 2026-08-17
 
-> Status: Shipped (smoke + needle gate PASS)
+> Status: **Shipped; decode regression found post-ship.** The A/B bench below
+> was never run (table left empty, "pending"); the "wash by construction"
+> hypothesis was wrong. Measured 2026-08-17 at TP=8, 128K context: decode
+> 78.7 → 55–59 tok/s (−25–30%). Partial fix (all-reduce back to compute
+> stream) recovered to 63 tok/s; remaining −19% gap under investigation.
+> Single-GPU (no NCCL) is unaffected.
 
 ## Goal
 
@@ -16,6 +21,12 @@ Bracketing each NCCL collective with `comm_waits_for_compute` /
 `compute_waits_for_comm` fences and running the NCCL enqueue on
 `comm_stream` produces identical results with no decode regression (the
 fences add event create/destroy overhead but no host stall).
+
+**Disproven.** The fences allocate a new CUDA event per call
+(`new_event(None)` in `record_pipeline_fence`). At TP=8 a decode step issues
+80 all-reduces (64 MLP + 16 attention) × 2 fences = 160 event allocations
+per step, adding ~3–5 ms/step host overhead. The strictly-dependent chain
+has no slack to hide it.
 
 ## Parameters
 
@@ -55,17 +66,33 @@ correctness PASS.
 
 | concurrency | arm | completed | errors | output tok/s | req/s | TTFT p50/p99 ms | ITL p50/p99 ms | delta |
 |---:|---|---:|---:|---:|---:|---:|---:|---:|
-| 1 | baseline | | | | | | | — |
-| 1 | treatment | | | | | | | |
+| 1 | baseline | — | — | — | — | — | — | — |
+| 1 | treatment | — | — | — | — | — | — | — |
 
-A/B bench: pending (decode is a wash by construction — the strictly-dependent
-chain has no slack; the value is the stream plumbing for T3.2 CP-decode merge).
+A/B bench: **never run.** The "wash by construction" claim was accepted
+without measurement. The decode regression was found by a separate
+128K decode-rate probe (TP=8, CP=1, `decode_rate_probe.py
+--target-tokens 128000 --max-tokens 128`):
+
+| build | decode tok/s @ 128K | Δ vs baseline |
+|---|---:|---:|
+| pre-comm-stream (4bcefcb57) | 78.7 | — |
+| comm-stream (a59c6c661) | 55–59 | −25–30% |
+| + all-reduce → compute stream fix | 63 | −20% |
+
+The remaining −19% gap (63 vs 78.7) is under investigation. Single-GPU
+(no NCCL, no fences) is unaffected by construction.
 
 Raw artifacts: `/host/arle-runs/212-comm/` on pod.
 
 ## Problems
 
-None.
+**Decode regression shipped undetected.** The A/B bench was deferred
+("pending") and the "wash by construction" hypothesis was accepted without
+measurement. The per-fence event allocation cost is host-side, not GPU-side,
+so it does not appear in a GPU profile — only a wall-clock decode probe
+catches it. The regression was found by a separate 128K decode-rate probe,
+not by this entry's bench.
 
 ## Learnings
 
@@ -77,3 +104,9 @@ the moe all-reduce on the compute stream via `all_reduce_sum_on(Compute)`.
 One-shot all-reduce stays on the compute stream (small-message fast path;
 moving it is a follow-up — `arle_car_allreduce_bf16_into` already takes a
 stream parameter).
+
+**"Wash by construction" is not a bench.** A strictly-dependent chain has no
+slack to hide overhead, so any added host cost lands directly on the critical
+path. The A/B table must be filled before shipping, not after. The
+`decode_rate_probe.py` 128K probe is the gate for decode-path changes at
+TP≥2 — smoke + needle only validates correctness, not performance.

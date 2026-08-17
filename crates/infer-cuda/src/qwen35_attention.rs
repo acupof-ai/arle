@@ -1288,14 +1288,17 @@ impl Qwen35Model {
                     // The current pair was recv'd at the prior hop's start; wait
                     // for that transfer before this hop's compute reads it.
                     self.ctx.compute_waits_for_comm()?;
-                    // The idle pair was sent at the prior hop's end; wait for
-                    // that send to finish before this hop's recv reuses it.
-                    self.ctx.comm_waits_for_comm_send()?;
                 }
                 let next_owner = (cur_owner + cp_size - 1) % cp_size;
-                // Post the next hop's recv into the idle pair now, so it overlaps
-                // with this hop's compute. The idle pair is not touched here.
                 if hop + 1 < cp_size {
+                    // Group recv+send so NCCL submits both directions together —
+                    // the host never blocks in ncclSend waiting for a peer recv.
+                    // The send reads the current pair (stable: compute only reads
+                    // it, scatter writes to the pool), so posting it before the
+                    // compute is safe. The recv lands in the idle pair and
+                    // overlaps with this hop's compute.
+                    self.ctx.comm_waits_for_compute()?;
+                    self.tp.attn_cp_group_start()?;
                     let recv_len = cp.slices[next_owner].1;
                     if cur_pair == 0 {
                         self.ring_prefill_post_recv(
@@ -1306,6 +1309,17 @@ impl Qwen35Model {
                             &mut *k0, &mut *v0, recv_len, kv_heads, head_dim, cp_size,
                         )?;
                     }
+                    let send_len = cp.slices[cur_owner].1;
+                    if cur_pair == 0 {
+                        self.ring_prefill_post_send(
+                            &*k0, &*v0, send_len, kv_heads, head_dim, cp_size,
+                        )?;
+                    } else {
+                        self.ring_prefill_post_send(
+                            &*k1, &*v1, send_len, kv_heads, head_dim, cp_size,
+                        )?;
+                    }
+                    self.tp.attn_cp_group_end()?;
                 }
                 let blk_len = cp.k_pos[cur_owner].len();
                 let dims = cuda_kernels::ring_attention::RingBlockDims { blk_len, ..dims0 };
@@ -1345,21 +1359,6 @@ impl Qwen35Model {
                     kv_heads,
                 )?;
                 if hop + 1 < cp_size {
-                    // Send the current pair only after compute+scatter finish
-                    // reading it. Sends run on comm_send_stream (separate from
-                    // the recv stream) so a recv-before-send pattern on both
-                    // ranks cannot deadlock on stream serialization.
-                    self.ctx.comm_send_waits_for_compute()?;
-                    let send_len = cp.slices[cur_owner].1;
-                    if cur_pair == 0 {
-                        self.ring_prefill_post_send(
-                            &*k0, &*v0, send_len, kv_heads, head_dim, cp_size,
-                        )?;
-                    } else {
-                        self.ring_prefill_post_send(
-                            &*k1, &*v1, send_len, kv_heads, head_dim, cp_size,
-                        )?;
-                    }
                     cur_owner = next_owner;
                     cur_pair = 1 - cur_pair;
                 }
@@ -1377,10 +1376,11 @@ impl Qwen35Model {
             for hop in 0..cp_size {
                 if hop > 0 {
                     self.ctx.compute_waits_for_comm()?;
-                    self.ctx.comm_waits_for_comm_send()?;
                 }
                 let next_owner = (cur_owner + cp_size - 1) % cp_size;
                 if hop + 1 < cp_size {
+                    self.ctx.comm_waits_for_compute()?;
+                    self.tp.attn_cp_group_start()?;
                     let recv_len = cp.slices[next_owner].1;
                     if cur_pair == 0 {
                         self.ring_prefill_post_recv(
@@ -1391,6 +1391,17 @@ impl Qwen35Model {
                             &mut *k0, &mut *v0, recv_len, kv_heads, head_dim, cp_size,
                         )?;
                     }
+                    let send_len = cp.slices[cur_owner].1;
+                    if cur_pair == 0 {
+                        self.ring_prefill_post_send(
+                            &*k0, &*v0, send_len, kv_heads, head_dim, cp_size,
+                        )?;
+                    } else {
+                        self.ring_prefill_post_send(
+                            &*k1, &*v1, send_len, kv_heads, head_dim, cp_size,
+                        )?;
+                    }
+                    self.tp.attn_cp_group_end()?;
                 }
                 let blk_len = cp.k_pos[cur_owner].len();
                 let (k_ref, v_ref): (&CudaSlice<u16>, &CudaSlice<u16>) = if cur_pair == 0 {
@@ -1403,7 +1414,7 @@ impl Qwen35Model {
                 } else {
                     (&*m_b, &*l_b, &*o_b, &mut *m_a, &mut *l_a, &mut *o_a)
                 };
-                // Guards drop before the scatter/send reborrow the pair.
+                // Guards drop before the scatter reborrows the pair.
                 {
                     let (q_ptr, _g0) = q_ring.device_ptr(&self.ctx.stream);
                     let (k_ptr, _g1) = k_ref.device_ptr(&self.ctx.stream);
@@ -1463,17 +1474,6 @@ impl Qwen35Model {
                     kv_heads,
                 )?;
                 if hop + 1 < cp_size {
-                    self.ctx.comm_send_waits_for_compute()?;
-                    let send_len = cp.slices[cur_owner].1;
-                    if cur_pair == 0 {
-                        self.ring_prefill_post_send(
-                            &*k0, &*v0, send_len, kv_heads, head_dim, cp_size,
-                        )?;
-                    } else {
-                        self.ring_prefill_post_send(
-                            &*k1, &*v1, send_len, kv_heads, head_dim, cp_size,
-                        )?;
-                    }
                     cur_owner = next_owner;
                     cur_pair = 1 - cur_pair;
                 }
@@ -1839,12 +1839,8 @@ impl Qwen35Model {
                     let (c_ptr, _g1) = slot.conv_states[linear_idx]
                         .data
                         .device_ptr_mut(&self.ctx.stream);
-                    // One fence bracket for the whole recv group: NCCL orders
-                    // the two recvs on comm_stream, so only the group's real
-                    // deps need fencing — wait for the state buffer's prior
-                    // compute writes, then let this layer's advance wait for
-                    // the recv'd state.
                     self.ctx.comm_waits_for_compute()?;
+                    self.tp.attn_cp_group_start()?;
                     // SAFETY: live per-slot state buffers; the previous cp rank
                     // posts the matching sends in the same (gdr, conv) order.
                     unsafe {
@@ -1863,6 +1859,7 @@ impl Qwen35Model {
                             cp_rank - 1,
                         )?;
                     }
+                    self.tp.attn_cp_group_end()?;
                     self.ctx.compute_waits_for_comm()?;
                 }
                 self.advance_linear_conv_gdr(
@@ -1889,12 +1886,12 @@ impl Qwen35Model {
                     let (c_ptr, _g1) = slot.conv_states[linear_idx]
                         .data
                         .device_ptr_mut(&self.ctx.stream);
-                    // One fence bracket for the send+broadcast group: wait for
-                    // this layer's advance to produce the state, then let the
-                    // next layer's compute wait for the broadcast agreement.
-                    // Sends run on comm_send_stream; broadcast on comm_stream.
                     self.ctx.comm_waits_for_compute()?;
-                    self.ctx.comm_send_waits_for_compute()?;
+                    // Group the send (if any) with the broadcast so NCCL
+                    // submits both directions together — the host never blocks
+                    // in ncclSend waiting for a peer recv that hasn't been
+                    // posted.
+                    self.tp.attn_cp_group_start()?;
                     if cp_rank + 1 < cp_size {
                         // SAFETY: same buffers, matching recvs on the next rank.
                         unsafe {
@@ -1934,6 +1931,7 @@ impl Qwen35Model {
                             cp_size - 1,
                         )?;
                     }
+                    self.tp.attn_cp_group_end()?;
                     self.ctx.compute_waits_for_comm()?;
                 }
             }
