@@ -39,6 +39,7 @@ pub(crate) struct DeepEpDispatchScratch {
     pub recv_x: HiddenStates,
     pub recv_src_idx: CudaSlice<i32>,
     pub recv_topk_idx: CudaSlice<i64>,
+    pub recv_topk_idx_i32: CudaSlice<i32>,
     pub recv_topk_weights: CudaSlice<f32>,
     pub rank_prefix: CudaSlice<i32>,
     pub recv_channel_prefix: CudaSlice<i32>,
@@ -326,6 +327,9 @@ impl DeepEpTransport {
             recv_topk_idx: ctx
                 .stream
                 .alloc_zeros::<i64>(capacity_recv.saturating_mul(topk))?,
+            recv_topk_idx_i32: ctx
+                .stream
+                .alloc_zeros::<i32>(capacity_recv.saturating_mul(topk))?,
             recv_topk_weights: ctx
                 .stream
                 .alloc_zeros::<f32>(capacity_recv.saturating_mul(topk))?,
@@ -373,7 +377,6 @@ impl DeepEpTransport {
             hidden.hidden_dim.is_multiple_of(16),
             "DeepEP hidden must be int4-aligned"
         );
-        ctx.stream.synchronize()?;
 
         let (x_ptr, _gx) = hidden.data.device_ptr(&ctx.stream);
         let (idx_ptr, _gi) = topk_idx_i64.device_ptr(&ctx.stream);
@@ -412,6 +415,7 @@ impl DeepEpTransport {
             d_num_tokens_per_expert: ntpe_ptr as usize,
             d_is_token_in_rank: titr_ptr as usize,
             d_channel_prefix_matrix: chan_pref_ptr as usize,
+            compute_stream: ctx.stream.cu_stream() as usize,
         };
         let mut guard = self
             .buffer
@@ -444,9 +448,6 @@ impl DeepEpTransport {
         topk: usize,
         num_sms: u32,
     ) -> Result<()> {
-        // compute_stream=0 host-syncs DeepEP after combine, but it does not
-        // wait for ARLE compute-stream kernels that produce local_expert_out.
-        ctx.stream.synchronize()?;
         let (x_ptr, _gx) = local_expert_out.data.device_ptr(&ctx.stream);
         let (topk_w_ptr, _gtw) = scratch.recv_topk_weights.device_ptr(&ctx.stream);
         let (recv_src_ptr, _grs) = scratch.recv_src_idx.device_ptr(&ctx.stream);
@@ -471,7 +472,7 @@ impl DeepEpTransport {
             d_send_head: send_head_ptr as usize,
             d_combined_x: out_ptr as usize,
             d_combined_topk_w: combined_w_ptr as usize,
-            compute_stream: 0,
+            compute_stream: ctx.stream.cu_stream() as usize,
         };
         let mut guard = self
             .buffer
@@ -593,10 +594,8 @@ impl DeepEpTransport {
             "deepep_ll owned tokens {owned_n} exceed num_max_dispatch_tokens_per_rank {}",
             ll.num_max_dispatch_tokens_per_rank
         );
-        // The LL kernel runs on its own comm stream ordered after `compute_stream`
-        // via on-device events; pass ARLE's compute stream so it does not host-block
-        // and correctly waits for the route kernels that produced topk_idx_i64.
-        ctx.stream.synchronize()?;
+        // The LL kernel runs on its own comm stream, ordered after ARLE's
+        // compute stream via on-device events (compute_stream below).
         let (x_ptr, _gx) = hidden.data.device_ptr(&ctx.stream);
         let (idx_ptr, _gi) = topk_idx_i64.device_ptr(&ctx.stream);
         let (recv_x_ptr, _gr0) = scratch.recv_x_fp8.device_ptr_mut(&ctx.stream);
@@ -620,7 +619,7 @@ impl DeepEpTransport {
             d_recv_src_info: recv_si_ptr as usize,
             d_recv_layout_range: recv_lr_ptr as usize,
             d_recv_count: recv_cnt_ptr as usize,
-            compute_stream: 0,
+            compute_stream: ctx.stream.cu_stream() as usize,
         };
         let mut guard = ll
             .buffer
@@ -656,7 +655,6 @@ impl DeepEpTransport {
             ll.hidden,
             owned_n
         );
-        ctx.stream.synchronize()?;
         let (x_ptr, _gx) = scratch.expert_out.device_ptr(&ctx.stream);
         let (idx_ptr, _gi) = topk_idx_i64.device_ptr(&ctx.stream);
         let (w_ptr, _gw) = topk_weights.device_ptr(&ctx.stream);
@@ -677,7 +675,7 @@ impl DeepEpTransport {
             d_src_info: si_ptr as usize,
             d_layout_range: lr_ptr as usize,
             d_combined_x: out_ptr as usize,
-            compute_stream: 0,
+            compute_stream: ctx.stream.cu_stream() as usize,
         };
         let mut guard = ll
             .buffer

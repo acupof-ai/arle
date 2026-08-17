@@ -2814,6 +2814,7 @@ mod dsv4_gpu {
         keepalive.keep_hidden(&scratch.recv_x);
         keepalive.keep_i32(&scratch.recv_src_idx);
         keepalive.keep_i64(&scratch.recv_topk_idx);
+        keepalive.keep_i32(&scratch.recv_topk_idx_i32);
         keepalive.keep_f32(&scratch.recv_topk_weights);
         keepalive.keep_i32(&scratch.rank_prefix);
         keepalive.keep_i32(&scratch.recv_channel_prefix);
@@ -2838,20 +2839,14 @@ mod dsv4_gpu {
         let local_routed = HiddenStates::zeros(ctx, hidden_dim, scratch.capacity_recv)?;
         if recv_slots > 0 {
             // The local count/pack kernels take i32, DeepEP returns i64.
-            let recv_i64 = ctx
-                .stream
-                .clone_dtoh(&scratch.recv_topk_idx)
-                .map_err(|e| anyhow::anyhow!("DSv4 DeepEP recv_topk_idx D2H failed: {e}"))?;
-            let mut recv_i32 = vec![0i32; scratch.capacity_recv.saturating_mul(topk)];
-            for (dst, &src) in recv_i32.iter_mut().zip(recv_i64.iter()).take(recv_slots) {
-                *dst = i32::try_from(src).map_err(|_| {
-                    anyhow::anyhow!("DSv4 DeepEP recv expert id {src} overflows i32")
-                })?;
+            unsafe {
+                moe::dsv4_cast_i64_to_i32(
+                    cache_ptr(&scratch.recv_topk_idx, ctx),
+                    cache_ptr(&scratch.recv_topk_idx_i32, ctx),
+                    recv_slots,
+                    ctx.stream.cu_stream(),
+                )?;
             }
-            let recv_topk_i32 = ctx
-                .stream
-                .clone_htod(&recv_i32)
-                .map_err(|e| anyhow::anyhow!("DSv4 DeepEP recv_topk_i32 H2D failed: {e}"))?;
             let counts = ctx
                 .stream
                 .alloc_zeros::<i32>(experts_per_rank)
@@ -2864,7 +2859,6 @@ mod dsv4_gpu {
                 .stream
                 .alloc_zeros::<i32>(1)
                 .map_err(|e| anyhow::anyhow!("DSv4 DeepEP scan-total alloc failed: {e}"))?;
-            keepalive.keep_i32(&recv_topk_i32);
             keepalive.keep_i32(&counts);
             keepalive.keep_i32(&offsets);
             keepalive.keep_i32(&scan_total);
@@ -2877,7 +2871,7 @@ mod dsv4_gpu {
             };
             unsafe {
                 moe::dsv4_count_local_experts(
-                    cache_ptr(&recv_topk_i32, ctx),
+                    cache_ptr(&scratch.recv_topk_idx_i32, ctx),
                     cache_ptr(&counts, ctx),
                     num_recv,
                     topk,
@@ -2914,7 +2908,7 @@ mod dsv4_gpu {
             unsafe {
                 moe::dsv4_pack_local_experts_with_slots(
                     cache_ptr(&scratch.recv_x.data, ctx),
-                    cache_ptr(&recv_topk_i32, ctx),
+                    cache_ptr(&scratch.recv_topk_idx_i32, ctx),
                     cache_ptr(&scratch.recv_topk_weights, ctx),
                     cache_ptr(&offsets, ctx),
                     cache_ptr(&cursors, ctx),

@@ -53,6 +53,11 @@ pub struct DispatchParams {
     pub d_num_tokens_per_expert: usize,
     pub d_is_token_in_rank: usize,
     pub d_channel_prefix_matrix: usize,
+    /// Caller's COMPUTE stream handle (cudaStream_t as usize) — the stream
+    /// that produces `d_x`/`d_topk_idx`/`d_topk_weights` and consumes the
+    /// recv buffers. When non-zero, the wrapper does event-based stream_wait
+    /// instead of host `cudaStreamSynchronize`. 0 = fall back to host sync.
+    pub compute_stream: usize,
 }
 
 pub struct CombineParams {
@@ -253,6 +258,9 @@ mod native {
         pub d_num_tokens_per_expert: usize,
         pub d_is_token_in_rank: usize,
         pub d_channel_prefix_matrix: usize,
+        /// Caller's COMPUTE stream handle (cudaStream_t as usize). When
+        /// non-zero, event-based stream_wait replaces host sync. 0 = host sync.
+        pub compute_stream: usize,
         pub out_num_recv_tokens: *mut i32,
     }
 
@@ -483,6 +491,7 @@ impl Buffer {
             d_num_tokens_per_expert: p.d_num_tokens_per_expert,
             d_is_token_in_rank: p.d_is_token_in_rank,
             d_channel_prefix_matrix: p.d_channel_prefix_matrix,
+            compute_stream: p.compute_stream,
             out_num_recv_tokens: &mut out_num_recv,
         };
         let status = unsafe { native::arle_deepep_buffer_dispatch(self.handle, &c) };

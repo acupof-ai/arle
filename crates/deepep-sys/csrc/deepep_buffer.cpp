@@ -339,6 +339,12 @@ extern "C" ArleDeepEpStatus arle_deepep_buffer_sync(
 
 extern "C" ArleDeepEpStatus arle_deepep_buffer_dispatch(
     ArleDeepEpBuffer *self, const ArleDeepEpDispatchParams *p) {
+    // ABI guard: compute_stream must sit immediately before out_num_recv_tokens
+    // so the Rust repr(C) struct and this C struct stay field-order-identical.
+    static_assert(offsetof(ArleDeepEpDispatchParams, out_num_recv_tokens) ==
+                          offsetof(ArleDeepEpDispatchParams, compute_stream) +
+                              sizeof(uintptr_t),
+                  "ArleDeepEpDispatchParams ABI drift: compute_stream/out_num_recv_tokens");
     if (!self || !p) {
         record_error("null arg");
         return -1;
@@ -377,6 +383,20 @@ extern "C" ArleDeepEpStatus arle_deepep_buffer_dispatch(
     auto *d_is_token_in_rank = reinterpret_cast<bool *>(p->d_is_token_in_rank);
     auto *d_channel_prefix =
         reinterpret_cast<int *>(p->d_channel_prefix_matrix);
+
+    // Event-in: the dispatch reads d_x/d_topk_idx/d_topk_weights produced on
+    // the caller's COMPUTE stream. Make the comm stream (self->stream) wait
+    // ON-DEVICE rather than host-syncing the caller. (Falls back to a host
+    // sync at the end when compute_stream == 0.)
+    cudaStream_t compute_stream =
+        reinterpret_cast<cudaStream_t>(p->compute_stream);
+    if (compute_stream) {
+        cudaEvent_t ev_in;
+        cudaEventCreateWithFlags(&ev_in, cudaEventDisableTiming);
+        cudaEventRecord(ev_in, compute_stream);
+        cudaStreamWaitEvent(self->stream, ev_in, 0);
+        cudaEventDestroy(ev_in);
+    }
 
     // 1. layout
     deep_ep_layout_ns::get_dispatch_layout(
@@ -430,7 +450,16 @@ extern "C" ArleDeepEpStatus arle_deepep_buffer_dispatch(
         static_cast<int>(p->num_sms),
         static_cast<int>(p->nvl_chunked_send),
         static_cast<int>(p->nvl_chunked_recv));
-    CK(cudaStreamSynchronize(self->stream), "sync after dispatch");
+    if (compute_stream) {
+        // Compute stream waits for the dispatch output ON-DEVICE; no host block.
+        cudaEvent_t ev_out;
+        cudaEventCreateWithFlags(&ev_out, cudaEventDisableTiming);
+        cudaEventRecord(ev_out, self->stream);
+        cudaStreamWaitEvent(compute_stream, ev_out, 0);
+        cudaEventDestroy(ev_out);
+    } else {
+        CK(cudaStreamSynchronize(self->stream), "sync after dispatch");
+    }
 
     if (p->out_num_recv_tokens) *p->out_num_recv_tokens = num_recv_tokens;
     return 0;
