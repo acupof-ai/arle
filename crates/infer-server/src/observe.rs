@@ -2,9 +2,11 @@
 //! thread only writes the snapshot it already publishes per tick.
 
 use crate::execution::CounterSnapshot;
+use crate::multiproc_relay::RelayCoordinator;
 use serde::{Deserialize, Serialize};
 use std::os::unix::io::AsRawFd;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -123,6 +125,40 @@ fn sweep_retention(dir: &std::path::Path, retention_days: u64) {
     }
 }
 
+fn retention_days() -> u64 {
+    std::env::var("ARLE_OBSERVE_RETENTION_DAYS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(30)
+}
+
+fn sample_host(sys: &mut sysinfo::System, disks: &mut sysinfo::Disks, tick: u32) -> HostSample {
+    sys.refresh_cpu_all();
+    sys.refresh_memory();
+    if tick.is_multiple_of(30) {
+        disks.refresh(true);
+    }
+    let cpu_pct = if sys.cpus().is_empty() {
+        0.0
+    } else {
+        sys.cpus().iter().map(|c| c.cpu_usage()).sum::<f32>() / sys.cpus().len() as f32
+    };
+    let ram_used_mb =
+        (sys.total_memory() / (1024 * 1024)).saturating_sub(sys.available_memory() / (1024 * 1024));
+    HostSample {
+        cpu_pct,
+        ram_used_mb,
+        disk_used_pct: disk_used_pct(disks),
+    }
+}
+
+fn write_sample(dir: &std::path::Path, snap: &CounterSnapshot, host: HostSample) {
+    let sample = StoredSample::from_snapshot(snap, host, infer_seam::now_ms());
+    if let Err(e) = append_sample(dir, &sample) {
+        log::warn!("observe: append failed: {e}");
+    }
+}
+
 pub fn spawn_observe_task(counters: Arc<Mutex<CounterSnapshot>>) {
     std::thread::spawn(move || {
         let dir = observe_dir();
@@ -130,44 +166,81 @@ pub fn spawn_observe_task(counters: Arc<Mutex<CounterSnapshot>>) {
             Some(f) => f,
             None => return,
         };
-        let retention_days: u64 = std::env::var("ARLE_OBSERVE_RETENTION_DAYS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(30);
-        sweep_retention(&dir, retention_days);
+        sweep_retention(&dir, retention_days());
         let mut sys = sysinfo::System::new();
         let mut disks = sysinfo::Disks::new_with_refreshed_list();
         let mut tick: u32 = 0;
         loop {
             std::thread::sleep(Duration::from_secs(10));
-            sys.refresh_cpu_all();
-            sys.refresh_memory();
-            if tick.is_multiple_of(30) {
-                disks.refresh(true);
-            }
-            let cpu_pct = if sys.cpus().is_empty() {
-                0.0
-            } else {
-                sys.cpus().iter().map(|c| c.cpu_usage()).sum::<f32>() / sys.cpus().len() as f32
-            };
-            let ram_used_mb = (sys.total_memory() / (1024 * 1024))
-                .saturating_sub(sys.available_memory() / (1024 * 1024));
-            let host = HostSample {
-                cpu_pct,
-                ram_used_mb,
-                disk_used_pct: disk_used_pct(&disks),
-            };
+            let host = sample_host(&mut sys, &mut disks, tick);
             let snap = match counters.lock() {
                 Ok(s) => s.clone(),
                 Err(_) => continue,
             };
-            let sample = StoredSample::from_snapshot(&snap, host, infer_seam::now_ms());
-            if let Err(e) = append_sample(&dir, &sample) {
-                log::warn!("observe: append failed: {e}");
-            }
+            write_sample(&dir, &snap, host);
             tick += 1;
         }
     });
+}
+
+/// Multiproc coordinator observe task: queries rank-0 stats via the relay
+/// every 10 s. The flock singleton dedupes against the single-process task
+/// when both run (local relay mode).
+pub fn spawn_observe_task_coordinator(relay: Arc<std::sync::Mutex<RelayCoordinator>>) {
+    std::thread::Builder::new()
+        .name("arle-observe-coordinator".to_string())
+        .spawn(move || {
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(e) => {
+                    log::error!("observe: tokio runtime build failed: {e}");
+                    return;
+                }
+            };
+            let stats_id = AtomicU64::new(0);
+            let dir = observe_dir();
+            let _lock = match acquire_writer_lock(&dir) {
+                Some(f) => f,
+                None => return,
+            };
+            sweep_retention(&dir, retention_days());
+            let mut sys = sysinfo::System::new();
+            let mut disks = sysinfo::Disks::new_with_refreshed_list();
+            let mut tick: u32 = 0;
+            loop {
+                std::thread::sleep(Duration::from_secs(10));
+                let host = sample_host(&mut sys, &mut disks, tick);
+                let snap = rt.block_on(query_snapshot(&relay, &stats_id));
+                write_sample(&dir, &snap, host);
+                tick += 1;
+            }
+        })
+        .ok();
+}
+
+async fn query_snapshot(
+    relay: &std::sync::Mutex<RelayCoordinator>,
+    stats_id: &AtomicU64,
+) -> CounterSnapshot {
+    let request_id = stats_id.fetch_add(1, Ordering::Relaxed);
+    let rx = {
+        let mut r = relay.lock().unwrap_or_else(PoisonError::into_inner);
+        let rx = r.register_stats_awaiter(request_id);
+        if r.send_stats_query(request_id).is_err() {
+            r.unregister_stats_awaiter(request_id);
+            return CounterSnapshot::default();
+        }
+        rx
+    };
+    tokio::time::timeout(Duration::from_secs(5), rx)
+        .await
+        .ok()
+        .and_then(|r| r.ok())
+        .map(|w| w.into_counter_snapshot())
+        .unwrap_or_default()
 }
 
 // flock ensures only one process per machine writes; the kernel releases it on exit.
