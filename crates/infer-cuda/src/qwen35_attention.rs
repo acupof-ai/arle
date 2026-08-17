@@ -395,8 +395,20 @@ impl Qwen35Model {
         let c = &self.config;
         // One q row per batch element is the decode kernel's contract.
         let decode = meta.seq_len == 1;
+        // 2D (attn_tp × cp): the pool is sequence-sharded (block-cyclic), so
+        // decode is flash-decoding — FA3 over the local shard then a cross-cp
+        // (lse, out) merge. Heads stay on the attn_tp shard (no cp head
+        // subdivision), unlike B2 below.
+        let two_d = decode && self.tp.two_d_engaged();
         // B2: cp ranks shard the attn_tp heads via model-load subset weights.
-        let b2 = decode && cp_decode.is_some();
+        let b2 = decode && cp_decode.is_some() && !two_d;
+        // The merge needs each shard's lse; only the FA3 lane produces one.
+        if two_d {
+            ensure!(
+                qwen35_fa3_enabled(&self.ctx),
+                "2D decode merge requires the FA3 paged lane (TileLang produces no lse)"
+            );
+        }
         let (qkv_proj, o_proj): (&DeviceMatrix, &DeviceMatrix) = if b2 {
             let d = attn
                 .decode
@@ -429,11 +441,8 @@ impl Qwen35Model {
             fa3_lseaccum,
             fa3_semaphore,
             cp_in,
-            cp_out,
-            cp_kv_gather,
+            ring_prefill,
             cp_row_gather,
-            cp_scrap_qf,
-            cp_scrap_qp,
             ..
         } = fw;
         // CP prefill: `normed` is the full chunk but this rank computes only
@@ -480,484 +489,614 @@ impl Qwen35Model {
             },
         )?;
 
-        let q_prepped = q_prepped.get(&self.ctx, q_dim, rows)?;
         let attn_out = attn_heads.get(&self.ctx, q_dim, rows)?;
 
-        // B2: history pages hold every cp rank's KV (prefill keeps the pool
-        // replicated); this rank's subset lives at its natural head offset, so
-        // shift the pool base for both the prep write and the attention read.
-        let (k_pool_ptr, v_pool_ptr) = if b2 {
-            let (kv_off, _) = cp_decode
-                .expect("b2 ⇒ cp_decode present")
-                .subset(self.local_kv_heads);
-            let off =
-                (kv_off * pool.page_size * c.head_dim * std::mem::size_of::<ffi::Half>()) as u64;
-            (
-                pool.k_ptr(full_idx, &self.ctx.stream) + off,
-                pool.v_ptr(full_idx, &self.ctx.stream) + off,
-            )
-        } else {
-            (
-                pool.k_ptr(full_idx, &self.ctx.stream),
-                pool.v_ptr(full_idx, &self.ctx.stream),
-            )
-        };
+        if let Some(cpx) = cp {
+            // 2D ring prefill: one ring pass over the whole prompt. The pool is
+            // sharded block-cyclic (logical page g on shard g % cp); each rank
+            // scatters its owned pages as the KV blocks rotate through.
+            self.ring_prefill_full_attention(
+                attn,
+                cpx,
+                full_idx,
+                pool,
+                ring_prefill,
+                q_full,
+                k_batch,
+                v_batch,
+                attn_out,
+            )?;
+        }
 
-        {
-            let (qf_ptr, _g0) = q_full.data.device_ptr(&self.ctx.stream);
-            let (k_ptr, _g1) = k_batch.data.device_ptr(&self.ctx.stream);
-            let (v_ptr, _g2) = v_batch.data.device_ptr(&self.ctx.stream);
-            let (qn_ptr, _g3) = attn.q_norm.data.device_ptr(&self.ctx.stream);
-            let (kn_ptr, _g4) = attn.k_norm.data.device_ptr(&self.ctx.stream);
-            let (cos_ptr, _g5) = self.cos_cache.data.device_ptr(&self.ctx.stream);
-            let (sin_ptr, _g6) = self.sin_cache.data.device_ptr(&self.ctx.stream);
-            let (positions_ptr, _gp) = meta.positions.device_ptr(&self.ctx.stream);
-            let (kv_indices_ptr, _gi) = meta.kv_indices.device_ptr(&self.ctx.stream);
-            let (kv_indptr_ptr, _gpi) = meta.kv_indptr.device_ptr(&self.ctx.stream);
-            let (last_page_len_ptr, _gl) = meta.kv_last_page_len.device_ptr(&self.ctx.stream);
-            let (start_pos_ptr, _gs) = meta.start_positions.device_ptr(&self.ctx.stream);
+        if cp.is_none() {
+            let q_prepped = q_prepped.get(&self.ctx, q_dim, rows)?;
+
+            // B2: history pages hold every cp rank's KV (prefill keeps the pool
+            // replicated); this rank's subset lives at its natural head offset, so
+            // shift the pool base for both the prep write and the attention read.
+            let (k_pool_ptr, v_pool_ptr) = if b2 {
+                let (kv_off, _) = cp_decode
+                    .expect("b2 ⇒ cp_decode present")
+                    .subset(self.local_kv_heads);
+                let off = (kv_off * pool.page_size * c.head_dim * std::mem::size_of::<ffi::Half>())
+                    as u64;
+                (
+                    pool.k_ptr(full_idx, &self.ctx.stream) + off,
+                    pool.v_ptr(full_idx, &self.ctx.stream) + off,
+                )
+            } else {
+                (
+                    pool.k_ptr(full_idx, &self.ctx.stream),
+                    pool.v_ptr(full_idx, &self.ctx.stream),
+                )
+            };
+
             {
-                let (qp_ptr, _g7) = q_prepped.data.device_ptr_mut(&self.ctx.stream);
-                crate::profile::profile_op(
-                    &self.ctx,
-                    "full_paged/prep",
-                    Some(full_idx),
-                    rows,
-                    || {
-                        // SAFETY: all buffers valid on ctx.stream; pool tail page
-                        // allocated; per-row offsets come from the meta's own
-                        // prefix sums, so each launch stays inside its row.
-                        unsafe {
-                            if decode {
-                                // B2: k_pool_ptr/v_pool_ptr are offset to this
-                                // rank's head block, so the subset K/V lands at
-                                // its natural offset in the full-head pool.
-                                ffi::decode_prep_paged_hd256_cuda(
-                                    qf_ptr as *const ffi::Half,
-                                    qp_ptr as *mut ffi::Half,
-                                    k_ptr as *const ffi::Half,
-                                    v_ptr as *const ffi::Half,
-                                    qn_ptr as *const ffi::Half,
-                                    kn_ptr as *const ffi::Half,
-                                    cos_ptr as *const ffi::Half,
-                                    sin_ptr as *const ffi::Half,
-                                    positions_ptr as *const i32,
-                                    k_pool_ptr as *mut ffi::Half,
-                                    v_pool_ptr as *mut ffi::Half,
-                                    kv_indices_ptr as *const i32,
-                                    kv_indptr_ptr as *const i32,
-                                    last_page_len_ptr as *const i32,
-                                    q_heads as i32,
-                                    kv_heads as i32,
-                                    pool.page_size as i32,
-                                    stride_page as i32,
-                                    meta.batch as i32,
-                                    c.rotary_dim as i32,
-                                    c.rms_norm_eps,
-                                    self.ctx.stream.cu_stream(),
-                                )
-                                .result()?;
-                            } else {
-                                // The prep reads ONE scalar start_pos off a
-                                // table based at element 0 — launch per row.
-                                let elem = std::mem::size_of::<ffi::Half>() as u64;
-                                for b in 0..meta.batch {
-                                    let (col, pages) = (meta.q_offsets[b], meta.page_offsets[b]);
-                                    let len = meta.q_offsets[b + 1] - col;
-                                    ffi::prefill_attention_paged_prep_hd256_cuda(
-                                        (qf_ptr + (col * q_proj_dim) as u64 * elem)
-                                            as *const ffi::Half,
-                                        (qp_ptr + (col * q_dim) as u64 * elem) as *mut ffi::Half,
-                                        (k_ptr + (col * kv_dim) as u64 * elem) as *const ffi::Half,
-                                        (v_ptr + (col * kv_dim) as u64 * elem) as *const ffi::Half,
+                let (qf_ptr, _g0) = q_full.data.device_ptr(&self.ctx.stream);
+                let (k_ptr, _g1) = k_batch.data.device_ptr(&self.ctx.stream);
+                let (v_ptr, _g2) = v_batch.data.device_ptr(&self.ctx.stream);
+                let (qn_ptr, _g3) = attn.q_norm.data.device_ptr(&self.ctx.stream);
+                let (kn_ptr, _g4) = attn.k_norm.data.device_ptr(&self.ctx.stream);
+                let (cos_ptr, _g5) = self.cos_cache.data.device_ptr(&self.ctx.stream);
+                let (sin_ptr, _g6) = self.sin_cache.data.device_ptr(&self.ctx.stream);
+                let (positions_ptr, _gp) = meta.positions.device_ptr(&self.ctx.stream);
+                let (kv_indices_ptr, _gi) = meta.kv_indices.device_ptr(&self.ctx.stream);
+                let (kv_indptr_ptr, _gpi) = meta.kv_indptr.device_ptr(&self.ctx.stream);
+                let (last_page_len_ptr, _gl) = meta.kv_last_page_len.device_ptr(&self.ctx.stream);
+                let (start_pos_ptr, _gs) = meta.start_positions.device_ptr(&self.ctx.stream);
+                {
+                    let (qp_ptr, _g7) = q_prepped.data.device_ptr_mut(&self.ctx.stream);
+                    crate::profile::profile_op(
+                        &self.ctx,
+                        "full_paged/prep",
+                        Some(full_idx),
+                        rows,
+                        || {
+                            // SAFETY: all buffers valid on ctx.stream; pool tail page
+                            // allocated; per-row offsets come from the meta's own
+                            // prefix sums, so each launch stays inside its row.
+                            unsafe {
+                                if decode {
+                                    // B2: k_pool_ptr/v_pool_ptr are offset to this
+                                    // rank's head block, so the subset K/V lands at
+                                    // its natural offset in the full-head pool.
+                                    // 2D: only the shard owning the new token's
+                                    // page (logical page start_pos/page_size)
+                                    // writes; the others skip.
+                                    let write_kv = if two_d {
+                                        let shard = infer_seam::ShardSpec::new(
+                                            self.tp.attn_cp_rank(),
+                                            self.tp.attn_cp_size(),
+                                        );
+                                        i32::from(shard.owns_page(meta.start_pos / pool.page_size))
+                                    } else {
+                                        1
+                                    };
+                                    ffi::decode_prep_paged_hd256_cuda(
+                                        qf_ptr as *const ffi::Half,
+                                        qp_ptr as *mut ffi::Half,
+                                        k_ptr as *const ffi::Half,
+                                        v_ptr as *const ffi::Half,
                                         qn_ptr as *const ffi::Half,
                                         kn_ptr as *const ffi::Half,
                                         cos_ptr as *const ffi::Half,
                                         sin_ptr as *const ffi::Half,
-                                        (kv_indices_ptr + (pages * 4) as u64) as *const i32,
-                                        pool.page_size as i32,
+                                        positions_ptr as *const i32,
                                         k_pool_ptr as *mut ffi::Half,
                                         v_pool_ptr as *mut ffi::Half,
-                                        self.local_q_heads as i32,
-                                        self.local_kv_heads as i32,
-                                        len as i32,
-                                        (start_pos_ptr + (b * 4) as u64) as *const i32,
-                                        c.rotary_dim as i32,
-                                        c.rms_norm_eps,
-                                        self.ctx.stream.cu_stream(),
-                                    )
-                                    .result()?;
-                                }
-                            }
-                        }
-                        Ok(())
-                    },
-                )?;
-            }
-        }
-
-        // CP prefill: all-gather this slice's RAW k/v within the cp group and
-        // write every remote slice's pages locally, so the pool covers the
-        // whole chunk again (replicated-KV invariant) with zero kernel changes.
-        if let Some(cpx) = cp {
-            crate::profile::profile_op(
-                &self.ctx,
-                "full_paged/cp_kv_share",
-                Some(full_idx),
-                rows,
-                || {
-                    self.cp_share_chunk_kv(
-                        attn,
-                        cpx,
-                        full_idx,
-                        pool,
-                        k_batch,
-                        v_batch,
-                        cp_kv_gather,
-                        cp_scrap_qf,
-                        cp_scrap_qp,
-                    )
-                },
-            )?;
-        }
-
-        // Quantize the BF16 tokens the prep just wrote into `k_data[layer]`, so
-        // the attention kernel reads the whole history from one quantized pool.
-        if pool.format != KVFormat::BF16 {
-            let new_rows = meta.new_token_rows.as_ref().ok_or_else(|| {
-                anyhow!(
-                    "Qwen35 full-attn FP8/INT8 pool missing new_token_rows in PageMeta \
-                     (format={:?})",
-                    pool.format
-                )
-            })?;
-            let kv_dim = self.local_full_attn_kv_dim();
-            for &(src, data, scales) in &[
-                (
-                    pool.k_ptr(full_idx, &self.ctx.stream),
-                    pool.k_data_ptr(full_idx, &self.ctx.stream),
-                    pool.k_scales_ptr(full_idx, &self.ctx.stream),
-                ),
-                (
-                    pool.v_ptr(full_idx, &self.ctx.stream),
-                    pool.v_data_ptr(full_idx, &self.ctx.stream),
-                    pool.v_scales_ptr(full_idx, &self.ctx.stream),
-                ),
-            ] {
-                kv_quant::quantize_paged_kv_per_token(
-                    &self.ctx,
-                    src,
-                    data,
-                    scales,
-                    new_rows,
-                    self.local_kv_heads,
-                    c.head_dim,
-                    kv_dim,
-                    rows,
-                    pool.format,
-                )?;
-            }
-        }
-
-        {
-            let (bsz, total_q, max_q) =
-                (meta.batch as i32, meta.total_q as i32, meta.seq_len as i32);
-            let (q_indptr_ptr, _g1) = meta.q_indptr.device_ptr(&self.ctx.stream);
-            let (kv_indptr_ptr, _g2) = meta.kv_indptr.device_ptr(&self.ctx.stream);
-            let (kv_indices_ptr, _g3) = meta.kv_indices.device_ptr(&self.ctx.stream);
-            let (last_page_len_ptr, _g4) = meta.kv_last_page_len.device_ptr(&self.ctx.stream);
-            let phase = if decode {
-                ffi::AttnPhase::Decode
-            } else {
-                ffi::AttnPhase::Prefill
-            };
-            {
-                crate::profile::profile_op(
-                    &self.ctx,
-                    "full_paged/attention",
-                    Some(full_idx),
-                    rows,
-                    || {
-                        // Short queries and batch==1 prefill take FA3 paged
-                        // split-KV; ragged multi-request prefill keeps TileLang
-                        // (routing it here cost c=8 TTFT 12.07→18.23 s).
-                        // Quantized pools try the native 1-byte kernel first;
-                        // prefill rows and workspace overflow fall through to
-                        // the FA3 quant shim, then the varlen kernel below.
-                        if (meta.seq_len <= FA3_MAX_QLEN || meta.batch == 1) && c.head_dim == 256 {
-                            if decode && matches!(pool.format, KVFormat::FP8E4M3 | KVFormat::INT8) {
-                                // Capped at 16: the pool's split-KV workspace is
-                                // sized for 16 splits at the GQA ratio 8.
-                                let splits = self
-                                    .ctx
-                                    .sm_count()
-                                    .div_ceil(meta.batch.max(1) * self.local_kv_heads.max(1))
-                                    .max(FA3_DECODE_SPLITS_FLOOR)
-                                    .clamp(2, 16);
-                                let needed =
-                                    kv_quant::paged_attention_quantized_fa3_workspace_bytes(
-                                        meta.total_q,
-                                        self.local_q_heads,
-                                        c.head_dim,
-                                        splits,
-                                    );
-                                if needed <= pool.quantized_attn_workspace_bytes {
-                                    let ws = pool.quantized_attn_workspace()?;
-                                    let (rect_ptr, _fr) =
-                                        meta.page_table_rect.device_ptr(&self.ctx.stream);
-                                    let (q_indptr_ptr, _fq) =
-                                        meta.q_indptr.device_ptr(&self.ctx.stream);
-                                    let (kv_lens_ptr, _fl) =
-                                        meta.kv_lens_dev.device_ptr(&self.ctx.stream);
-                                    kv_quant::paged_attention_quantized_fa3(
-                                        &self.ctx,
-                                        q_prepped,
-                                        pool.k_data_ptr(full_idx, &self.ctx.stream),
-                                        pool.v_data_ptr(full_idx, &self.ctx.stream),
-                                        pool.k_scales_ptr(full_idx, &self.ctx.stream),
-                                        pool.v_scales_ptr(full_idx, &self.ctx.stream),
-                                        rect_ptr,
-                                        q_indptr_ptr,
-                                        kv_lens_ptr,
-                                        attn_out,
-                                        self.local_q_heads,
-                                        self.local_kv_heads,
-                                        c.head_dim,
-                                        pool.page_size,
-                                        meta.page_table_stride,
-                                        meta.batch,
-                                        meta.total_q,
-                                        sm_scale,
-                                        pool.format,
-                                        splits,
-                                        ws,
-                                        pool.quantized_attn_workspace_bytes,
-                                    )?;
-                                    return Ok(());
-                                }
-                            }
-                            if qwen35_fa3_enabled(&self.ctx)
-                                && matches!(
-                                    pool.format,
-                                    KVFormat::BF16 | KVFormat::FP8E4M3 | KVFormat::INT8
-                                )
-                            {
-                                let (qp_ptr, _g0) = q_prepped.data.device_ptr_mut(&self.ctx.stream);
-                                let (ao_ptr, _g5) = attn_out.data.device_ptr_mut(&self.ctx.stream);
-                                // ONE launch for the whole batch: `seqused_k`
-                                // keeps the K/V batch strides (only `cu_seqlens_k`
-                                // drops them, flash_api.cpp:105-108), which is what
-                                // lets a paged batch share a launch.
-                                // `splits` is an upper bound; FA3 picks the live
-                                // value. One tile per SM is where raising it stops
-                                // paying (+0.36% at batch 8); the floor 8 is the
-                                // measured optimum from batch 4 up and bound only
-                                // batch 1 (32 tiles, 46 of 78 SMs idle).
-                                let splits = if meta.seq_len <= FA3_MAX_QLEN {
-                                    match crate::runtime_flags::qwen35_fa3_decode_splits() {
-                                        0 => self
-                                            .ctx
-                                            .sm_count()
-                                            .div_ceil(meta.batch.max(1) * kv_heads.max(1))
-                                            .max(FA3_DECODE_SPLITS_FLOOR)
-                                            .clamp(2, 256),
-                                        n => n,
-                                    }
-                                } else {
-                                    1
-                                };
-                                let accum_rows = q_heads * meta.total_q;
-                                let lse = fa3_lse.get(&self.ctx, accum_rows)?;
-                                let oaccum =
-                                    fa3_oaccum.get(&self.ctx, splits * accum_rows * c.head_dim)?;
-                                let lseaccum = fa3_lseaccum.get(&self.ctx, splits * accum_rows)?;
-                                let meta_cap = meta.batch.div_ceil(4) * 4 * 4 + 1;
-                                let sem = fa3_semaphore.get(&self.ctx, meta_cap)?;
-                                let (lse_ptr, _f0) = lse.device_ptr_mut(&self.ctx.stream);
-                                let (oaccum_ptr, _f1) = oaccum.device_ptr_mut(&self.ctx.stream);
-                                let (lseaccum_ptr, _f2) = lseaccum.device_ptr_mut(&self.ctx.stream);
-                                let (sem_ptr, _f3) = sem.device_ptr_mut(&self.ctx.stream);
-                                let (kv_lens_ptr, _f4) =
-                                    meta.kv_lens_dev.device_ptr(&self.ctx.stream);
-                                let (rect_ptr, _f5) =
-                                    meta.page_table_rect.device_ptr(&self.ctx.stream);
-                                let head_dim = c.head_dim as i64;
-                                let args = ffi::ArleFa3FwdHd256Args {
-                                    q: qp_ptr as *const ffi::Half,
-                                    k: k_pool_ptr as *const ffi::Half,
-                                    v: v_pool_ptr as *const ffi::Half,
-                                    o: ao_ptr as *mut ffi::Half,
-                                    softmax_lse: lse_ptr as *mut f32,
-                                    out_accum: oaccum_ptr as *mut f32,
-                                    softmax_lse_accum: lseaccum_ptr as *mut f32,
-                                    tile_count_semaphore: sem_ptr as *mut i32,
-                                    metadata_capacity: meta_cap as i32,
-                                    cu_seqlens_q: q_indptr_ptr as *const i32,
-                                    seqused_k: kv_lens_ptr as *const i32,
-                                    batch: meta.batch as i32,
-                                    total_q: meta.total_q as i32,
-                                    seqlen_q: meta.seq_len as i32,
-                                    seqlen_k: meta.max_kv_len() as i32,
-                                    num_heads: q_heads as i32,
-                                    num_heads_k: kv_heads as i32,
-                                    head_dim: c.head_dim as i32,
-                                    q_row_stride: (q_heads * c.head_dim) as i64,
-                                    // HND pool [page, h_k, page_size, d].
-                                    k_row_stride: head_dim,
-                                    v_row_stride: head_dim,
-                                    o_row_stride: (q_heads * c.head_dim) as i64,
-                                    q_head_stride: head_dim,
-                                    k_head_stride: pool.page_size as i64 * head_dim,
-                                    v_head_stride: pool.page_size as i64 * head_dim,
-                                    o_head_stride: head_dim,
-                                    softmax_scale: sm_scale,
-                                    // Bottom-right aligned; the shim demotes to
-                                    // non-causal at qlen 1.
-                                    is_causal: 1,
-                                    num_splits: splits as i32,
-                                    page_table: rect_ptr as *const i32,
-                                    page_table_batch_stride: meta.page_table_stride as i64,
-                                    page_size: pool.page_size as i32,
-                                    num_pages: pool.max_total_pages as i32,
-                                    k_page_stride: stride_page as i64,
-                                    v_page_stride: stride_page as i64,
-                                };
-                                if pool.format == KVFormat::BF16 {
-                                    // SAFETY: q/o are the live prepped/out buffers; k/v
-                                    // are
-                                    // the layer's pool base; the page table is the
-                                    // meta's
-                                    // rectangular mirror, `batch * page_table_stride`
-                                    // long.
-                                    unsafe {
-                                        ffi::arle_fa3_fwd_hd256_bf16_cuda(
-                                            &args,
-                                            self.ctx.stream.cu_stream(),
-                                        )
-                                        .result()?;
-                                    }
-                                } else {
-                                    let quant_args = ffi::ArleFa3FwdHd256QuantArgs {
-                                        base: args,
-                                        k_data: pool.k_data_ptr(full_idx, &self.ctx.stream)
-                                            as *const u8,
-                                        v_data: pool.v_data_ptr(full_idx, &self.ctx.stream)
-                                            as *const u8,
-                                        k_scales: pool.k_scales_ptr(full_idx, &self.ctx.stream)
-                                            as *const f32,
-                                        v_scales: pool.v_scales_ptr(full_idx, &self.ctx.stream)
-                                            as *const f32,
-                                        is_fp8: if pool.format == KVFormat::FP8E4M3 {
-                                            1
-                                        } else {
-                                            0
-                                        },
-                                    };
-                                    // SAFETY: same live buffers as the bf16 arm; the
-                                    // 1-byte pools and per-(token, head) scales are the
-                                    // layer's quantized planes, fresh from the quantize
-                                    // pass above.
-                                    unsafe {
-                                        ffi::arle_fa3_fwd_hd256_quant_cuda(
-                                            &quant_args,
-                                            self.ctx.stream.cu_stream(),
-                                        )
-                                        .result()?;
-                                    }
-                                }
-                                return Ok(());
-                            }
-                        }
-                        // The TileLang lane bakes `num_pages` as a host arg and
-                        // would replay stale under graph capture.
-                        ensure!(
-                            meta.seqlen_k_capture.is_none(),
-                            "paged decode graph capture requires the FA3 BF16 lane"
-                        );
-                        match pool.format {
-                            KVFormat::BF16 => {
-                                let (qp_ptr, _g0) = q_prepped.data.device_ptr_mut(&self.ctx.stream);
-                                let (ao_ptr, _g5) = attn_out.data.device_ptr_mut(&self.ctx.stream);
-                                // SAFETY: kernel signature from paged_attn_v1 ABI
-                                // (18-arg BF16).
-                                let kernel = ffi::resolve_paged_attn_v1(
-                                    c.head_dim as u32,
-                                    q_heads as u32,
-                                    kv_heads as u32,
-                                    phase,
-                                )
-                                .ok_or_else(|| {
-                                    anyhow!(
-                                        "no HD256 paged {} kernel for q{}_kv{}",
-                                        if decode { "decode" } else { "prefill" },
-                                        q_heads,
-                                        kv_heads
-                                    )
-                                })?;
-                                // SAFETY: ptrs from live device allocations sized to
-                                // the dims passed.
-                                unsafe {
-                                    kernel(
-                                        qp_ptr as *mut ffi::Half,
-                                        q_indptr_ptr as *const i32,
-                                        k_pool_ptr as *mut ffi::Half,
-                                        v_pool_ptr as *mut ffi::Half,
-                                        kv_indptr_ptr as *const i32,
                                         kv_indices_ptr as *const i32,
+                                        kv_indptr_ptr as *const i32,
                                         last_page_len_ptr as *const i32,
-                                        ao_ptr as *mut ffi::Half,
-                                        bsz,
-                                        total_q,
-                                        max_q,
-                                        pool.max_total_pages as i32,
-                                        meta.num_pages as i32,
                                         q_heads as i32,
                                         kv_heads as i32,
                                         pool.page_size as i32,
-                                        sm_scale,
+                                        stride_page as i32,
+                                        meta.batch as i32,
+                                        c.rotary_dim as i32,
+                                        c.rms_norm_eps,
+                                        write_kv,
                                         self.ctx.stream.cu_stream(),
                                     )
                                     .result()?;
+                                } else {
+                                    // The prep reads ONE scalar start_pos off a
+                                    // table based at element 0 — launch per row.
+                                    let elem = std::mem::size_of::<ffi::Half>() as u64;
+                                    for b in 0..meta.batch {
+                                        let (col, pages) =
+                                            (meta.q_offsets[b], meta.page_offsets[b]);
+                                        let len = meta.q_offsets[b + 1] - col;
+                                        ffi::prefill_attention_paged_prep_hd256_cuda(
+                                            (qf_ptr + (col * q_proj_dim) as u64 * elem)
+                                                as *const ffi::Half,
+                                            (qp_ptr + (col * q_dim) as u64 * elem)
+                                                as *mut ffi::Half,
+                                            (k_ptr + (col * kv_dim) as u64 * elem)
+                                                as *const ffi::Half,
+                                            (v_ptr + (col * kv_dim) as u64 * elem)
+                                                as *const ffi::Half,
+                                            qn_ptr as *const ffi::Half,
+                                            kn_ptr as *const ffi::Half,
+                                            cos_ptr as *const ffi::Half,
+                                            sin_ptr as *const ffi::Half,
+                                            (kv_indices_ptr + (pages * 4) as u64) as *const i32,
+                                            pool.page_size as i32,
+                                            k_pool_ptr as *mut ffi::Half,
+                                            v_pool_ptr as *mut ffi::Half,
+                                            self.local_q_heads as i32,
+                                            self.local_kv_heads as i32,
+                                            len as i32,
+                                            (start_pos_ptr + (b * 4) as u64) as *const i32,
+                                            c.rotary_dim as i32,
+                                            c.rms_norm_eps,
+                                            self.ctx.stream.cu_stream(),
+                                        )
+                                        .result()?;
+                                    }
                                 }
                             }
-                            KVFormat::FP8E4M3 | KVFormat::INT8 => {
-                                // Per-(token, kv_head) symmetric quant; both
-                                // formats share the split-KV varlen kernel.
-                                let ws = pool.quantized_attn_workspace()?;
-                                let max_kv_len = meta.max_kv_len();
-                                kv_quant::decode_attention_varlen_quantized(
-                                    &self.ctx,
-                                    q_prepped,
-                                    q_indptr_ptr,
-                                    pool.k_data_ptr(full_idx, &self.ctx.stream),
-                                    pool.v_data_ptr(full_idx, &self.ctx.stream),
-                                    Some(pool.k_scales_ptr(full_idx, &self.ctx.stream)),
-                                    Some(pool.v_scales_ptr(full_idx, &self.ctx.stream)),
-                                    kv_indptr_ptr,
-                                    kv_indices_ptr,
-                                    last_page_len_ptr,
-                                    attn_out,
-                                    self.local_q_heads,
-                                    self.local_kv_heads,
-                                    c.head_dim,
-                                    pool.page_size,
-                                    meta.batch,
-                                    meta.total_q,
-                                    max_kv_len,
-                                    true, // causal
-                                    pool.format,
-                                    sm_scale,
-                                    ws,
-                                    pool.quantized_attn_workspace_bytes,
-                                )?;
+                            Ok(())
+                        },
+                    )?;
+                }
+            }
+
+            // Quantize the BF16 tokens the prep just wrote into `k_data[layer]`, so
+            // the attention kernel reads the whole history from one quantized pool.
+            if pool.format != KVFormat::BF16 {
+                let new_rows = meta.new_token_rows.as_ref().ok_or_else(|| {
+                    anyhow!(
+                        "Qwen35 full-attn FP8/INT8 pool missing new_token_rows in PageMeta \
+                     (format={:?})",
+                        pool.format
+                    )
+                })?;
+                let kv_dim = self.local_full_attn_kv_dim();
+                for &(src, data, scales) in &[
+                    (
+                        pool.k_ptr(full_idx, &self.ctx.stream),
+                        pool.k_data_ptr(full_idx, &self.ctx.stream),
+                        pool.k_scales_ptr(full_idx, &self.ctx.stream),
+                    ),
+                    (
+                        pool.v_ptr(full_idx, &self.ctx.stream),
+                        pool.v_data_ptr(full_idx, &self.ctx.stream),
+                        pool.v_scales_ptr(full_idx, &self.ctx.stream),
+                    ),
+                ] {
+                    kv_quant::quantize_paged_kv_per_token(
+                        &self.ctx,
+                        src,
+                        data,
+                        scales,
+                        new_rows,
+                        self.local_kv_heads,
+                        c.head_dim,
+                        kv_dim,
+                        rows,
+                        pool.format,
+                    )?;
+                }
+            }
+
+            {
+                let (bsz, total_q, max_q) =
+                    (meta.batch as i32, meta.total_q as i32, meta.seq_len as i32);
+                let (q_indptr_ptr, _g1) = meta.q_indptr.device_ptr(&self.ctx.stream);
+                let (kv_indptr_ptr, _g2) = meta.kv_indptr.device_ptr(&self.ctx.stream);
+                let (kv_indices_ptr, _g3) = meta.kv_indices.device_ptr(&self.ctx.stream);
+                let (last_page_len_ptr, _g4) = meta.kv_last_page_len.device_ptr(&self.ctx.stream);
+                let phase = if decode {
+                    ffi::AttnPhase::Decode
+                } else {
+                    ffi::AttnPhase::Prefill
+                };
+                {
+                    crate::profile::profile_op(
+                        &self.ctx,
+                        "full_paged/attention",
+                        Some(full_idx),
+                        rows,
+                        || {
+                            // Short queries and batch==1 prefill take FA3 paged
+                            // split-KV; ragged multi-request prefill keeps TileLang
+                            // (routing it here cost c=8 TTFT 12.07→18.23 s).
+                            // Quantized pools try the native 1-byte kernel first;
+                            // prefill rows and workspace overflow fall through to
+                            // the FA3 quant shim, then the varlen kernel below.
+                            if (meta.seq_len <= FA3_MAX_QLEN || meta.batch == 1)
+                                && c.head_dim == 256
+                            {
+                                if decode
+                                    && matches!(pool.format, KVFormat::FP8E4M3 | KVFormat::INT8)
+                                {
+                                    // Capped at 16: the pool's split-KV workspace is
+                                    // sized for 16 splits at the GQA ratio 8.
+                                    let splits = self
+                                        .ctx
+                                        .sm_count()
+                                        .div_ceil(meta.batch.max(1) * kv_heads.max(1))
+                                        .max(FA3_DECODE_SPLITS_FLOOR)
+                                        .clamp(2, 16);
+                                    let needed =
+                                        kv_quant::paged_attention_quantized_fa3_workspace_bytes(
+                                            meta.total_q,
+                                            q_heads,
+                                            c.head_dim,
+                                            splits,
+                                        );
+                                    if needed <= pool.quantized_attn_workspace_bytes {
+                                        let ws = pool.quantized_attn_workspace()?;
+                                        let (rect_ptr, _fr) =
+                                            meta.page_table_rect.device_ptr(&self.ctx.stream);
+                                        let (q_indptr_ptr, _fq) =
+                                            meta.q_indptr.device_ptr(&self.ctx.stream);
+                                        let (kv_lens_ptr, _fl) =
+                                            meta.kv_lens_dev.device_ptr(&self.ctx.stream);
+                                        kv_quant::paged_attention_quantized_fa3(
+                                            &self.ctx,
+                                            q_prepped,
+                                            pool.k_data_ptr(full_idx, &self.ctx.stream),
+                                            pool.v_data_ptr(full_idx, &self.ctx.stream),
+                                            pool.k_scales_ptr(full_idx, &self.ctx.stream),
+                                            pool.v_scales_ptr(full_idx, &self.ctx.stream),
+                                            rect_ptr,
+                                            q_indptr_ptr,
+                                            kv_lens_ptr,
+                                            attn_out,
+                                            q_heads,
+                                            kv_heads,
+                                            c.head_dim,
+                                            pool.page_size,
+                                            meta.page_table_stride,
+                                            meta.batch,
+                                            meta.total_q,
+                                            sm_scale,
+                                            pool.format,
+                                            splits,
+                                            ws,
+                                            pool.quantized_attn_workspace_bytes,
+                                        )?;
+                                        return Ok(());
+                                    }
+                                }
+                                if qwen35_fa3_enabled(&self.ctx)
+                                    && matches!(
+                                        pool.format,
+                                        KVFormat::BF16 | KVFormat::FP8E4M3 | KVFormat::INT8
+                                    )
+                                {
+                                    let (qp_ptr, _g0) =
+                                        q_prepped.data.device_ptr_mut(&self.ctx.stream);
+                                    // Scoped: the guard releases the attn_out borrow so
+                                    // the 2D merge stage can read it below; the u64
+                                    // address stays valid (attn_out owns the allocation).
+                                    let ao_ptr = {
+                                        let (p, _g5) =
+                                            attn_out.data.device_ptr_mut(&self.ctx.stream);
+                                        p
+                                    };
+                                    // ONE launch for the whole batch: `seqused_k`
+                                    // keeps the K/V batch strides (only `cu_seqlens_k`
+                                    // drops them, flash_api.cpp:105-108), which is what
+                                    // lets a paged batch share a launch.
+                                    // `splits` is an upper bound; FA3 picks the live
+                                    // value. One tile per SM is where raising it stops
+                                    // paying (+0.36% at batch 8); the floor 8 is the
+                                    // measured optimum from batch 4 up and bound only
+                                    // batch 1 (32 tiles, 46 of 78 SMs idle).
+                                    let splits = if meta.seq_len <= FA3_MAX_QLEN {
+                                        match crate::runtime_flags::qwen35_fa3_decode_splits() {
+                                            0 => self
+                                                .ctx
+                                                .sm_count()
+                                                .div_ceil(meta.batch.max(1) * kv_heads.max(1))
+                                                .max(FA3_DECODE_SPLITS_FLOOR)
+                                                .clamp(2, 256),
+                                            n => n,
+                                        }
+                                    } else {
+                                        1
+                                    };
+                                    let accum_rows = q_heads * meta.total_q;
+                                    // 2D: room for every cp shard's partial; FA3
+                                    // writes this rank's at its rank-major slot.
+                                    let lse = if two_d {
+                                        fa3_lse
+                                            .get(&self.ctx, self.tp.attn_cp_size() * accum_rows)?
+                                    } else {
+                                        fa3_lse.get(&self.ctx, accum_rows)?
+                                    };
+                                    let oaccum = fa3_oaccum
+                                        .get(&self.ctx, splits * accum_rows * c.head_dim)?;
+                                    let lseaccum =
+                                        fa3_lseaccum.get(&self.ctx, splits * accum_rows)?;
+                                    let meta_cap = meta.batch.div_ceil(4) * 4 * 4 + 1;
+                                    let sem = fa3_semaphore.get(&self.ctx, meta_cap)?;
+                                    let (lse_ptr, _f0) = lse.device_ptr_mut(&self.ctx.stream);
+                                    let softmax_lse_ptr = if two_d {
+                                        // lse is sized cp_size*accum_rows f32 above.
+                                        lse_ptr
+                                            + (self.tp.attn_cp_rank()
+                                                * accum_rows
+                                                * std::mem::size_of::<f32>())
+                                                as u64
+                                    } else {
+                                        lse_ptr
+                                    };
+                                    let (oaccum_ptr, _f1) = oaccum.device_ptr_mut(&self.ctx.stream);
+                                    let (lseaccum_ptr, _f2) =
+                                        lseaccum.device_ptr_mut(&self.ctx.stream);
+                                    let (sem_ptr, _f3) = sem.device_ptr_mut(&self.ctx.stream);
+                                    let (kv_lens_ptr, _f4) =
+                                        meta.kv_lens_dev.device_ptr(&self.ctx.stream);
+                                    let (rect_ptr, _f5) =
+                                        meta.page_table_rect.device_ptr(&self.ctx.stream);
+                                    let head_dim = c.head_dim as i64;
+                                    let args = ffi::ArleFa3FwdHd256Args {
+                                        q: qp_ptr as *const ffi::Half,
+                                        k: k_pool_ptr as *const ffi::Half,
+                                        v: v_pool_ptr as *const ffi::Half,
+                                        o: ao_ptr as *mut ffi::Half,
+                                        softmax_lse: softmax_lse_ptr as *mut f32,
+                                        out_accum: oaccum_ptr as *mut f32,
+                                        softmax_lse_accum: lseaccum_ptr as *mut f32,
+                                        tile_count_semaphore: sem_ptr as *mut i32,
+                                        metadata_capacity: meta_cap as i32,
+                                        cu_seqlens_q: q_indptr_ptr as *const i32,
+                                        seqused_k: kv_lens_ptr as *const i32,
+                                        batch: meta.batch as i32,
+                                        total_q: meta.total_q as i32,
+                                        seqlen_q: meta.seq_len as i32,
+                                        seqlen_k: meta.max_kv_len() as i32,
+                                        num_heads: q_heads as i32,
+                                        num_heads_k: kv_heads as i32,
+                                        head_dim: c.head_dim as i32,
+                                        q_row_stride: (q_heads * c.head_dim) as i64,
+                                        // HND pool [page, h_k, page_size, d].
+                                        k_row_stride: head_dim,
+                                        v_row_stride: head_dim,
+                                        o_row_stride: (q_heads * c.head_dim) as i64,
+                                        q_head_stride: head_dim,
+                                        k_head_stride: pool.page_size as i64 * head_dim,
+                                        v_head_stride: pool.page_size as i64 * head_dim,
+                                        o_head_stride: head_dim,
+                                        softmax_scale: sm_scale,
+                                        // Bottom-right aligned; the shim demotes to
+                                        // non-causal at qlen 1.
+                                        is_causal: 1,
+                                        num_splits: splits as i32,
+                                        page_table: rect_ptr as *const i32,
+                                        page_table_batch_stride: meta.page_table_stride as i64,
+                                        page_size: pool.page_size as i32,
+                                        num_pages: pool.max_total_pages as i32,
+                                        k_page_stride: stride_page as i64,
+                                        v_page_stride: stride_page as i64,
+                                    };
+                                    if pool.format == KVFormat::BF16 {
+                                        // SAFETY: q/o are the live prepped/out buffers; k/v
+                                        // are
+                                        // the layer's pool base; the page table is the
+                                        // meta's
+                                        // rectangular mirror, `batch * page_table_stride`
+                                        // long.
+                                        unsafe {
+                                            ffi::arle_fa3_fwd_hd256_bf16_cuda(
+                                                &args,
+                                                self.ctx.stream.cu_stream(),
+                                            )
+                                            .result()?;
+                                        }
+                                    } else {
+                                        let quant_args = ffi::ArleFa3FwdHd256QuantArgs {
+                                            base: args,
+                                            k_data: pool.k_data_ptr(full_idx, &self.ctx.stream)
+                                                as *const u8,
+                                            v_data: pool.v_data_ptr(full_idx, &self.ctx.stream)
+                                                as *const u8,
+                                            k_scales: pool.k_scales_ptr(full_idx, &self.ctx.stream)
+                                                as *const f32,
+                                            v_scales: pool.v_scales_ptr(full_idx, &self.ctx.stream)
+                                                as *const f32,
+                                            is_fp8: if pool.format == KVFormat::FP8E4M3 {
+                                                1
+                                            } else {
+                                                0
+                                            },
+                                        };
+                                        // SAFETY: same live buffers as the bf16 arm; the
+                                        // 1-byte pools and per-(token, head) scales are the
+                                        // layer's quantized planes, fresh from the quantize
+                                        // pass above.
+                                        unsafe {
+                                            ffi::arle_fa3_fwd_hd256_quant_cuda(
+                                                &quant_args,
+                                                self.ctx.stream.cu_stream(),
+                                            )
+                                            .result()?;
+                                        }
+                                    }
+                                    if two_d {
+                                        // Cross-cp flash-decoding merge: gather each
+                                        // shard's (lse, out), then the weighted
+                                        // average accumulated in f32. The lse rides
+                                        // the bf16 collective as f32 pairs — NCCL
+                                        // moves bytes, so it stays f32 end to end.
+                                        let cp_size = self.tp.attn_cp_size();
+                                        let cp_rank = self.tp.attn_cp_rank();
+                                        let sect = accum_rows * c.head_dim;
+                                        let merge_gather =
+                                            cp_row_gather.get(&self.ctx, sect, cp_size)?;
+                                        self.ctx
+                                            .stream
+                                            .memcpy_dtod(
+                                                &attn_out.data.slice(0..sect),
+                                                &mut merge_gather.data.slice_mut(
+                                                    cp_rank * sect..(cp_rank + 1) * sect,
+                                                ),
+                                            )
+                                            .map_err(|e| anyhow!("2D merge stage failed: {e}"))?;
+                                        // SAFETY: lse holds cp_size*accum_rows f32; the
+                                        // send slot is this rank's rank-major section,
+                                        // in-place gather per the collective's contract.
+                                        unsafe {
+                                            self.tp.attn_cp_all_gather_bf16(
+                                                &self.ctx,
+                                                (lse_ptr
+                                                    + (cp_rank
+                                                        * accum_rows
+                                                        * std::mem::size_of::<f32>())
+                                                        as u64)
+                                                    as *const std::ffi::c_void,
+                                                accum_rows * 2,
+                                                lse_ptr as *mut std::ffi::c_void,
+                                            )?;
+                                        }
+                                        self.cp_all_gather_in_place(merge_gather, sect)?;
+                                        let (mg_ptr, _gm) =
+                                            merge_gather.data.device_ptr_mut(&self.ctx.stream);
+                                        let (ao_ptr, _ga) =
+                                            attn_out.data.device_ptr_mut(&self.ctx.stream);
+                                        // SAFETY: buffers live on ctx.stream; the
+                                        // gathers' compute-waits-comm fence orders
+                                        // them before this launch.
+                                        unsafe {
+                                            ffi::cross_cp_merge_bf16_hd256_cuda(
+                                                lse_ptr as *const f32,
+                                                mg_ptr as *const ffi::Half,
+                                                ao_ptr as *mut ffi::Half,
+                                                cp_size as i32,
+                                                accum_rows as i32,
+                                                c.head_dim as i32,
+                                                self.ctx.stream.cu_stream(),
+                                            )
+                                            .result()?;
+                                        }
+                                    }
+                                    return Ok(());
+                                }
                             }
-                            other => anyhow::bail!(
-                                "Qwen35 full-attn paged attention: unsupported pool format {other:?}"
-                            ),
-                        }
-                        Ok(())
-                    },
-                )?;
+                            // The TileLang lane bakes `num_pages` as a host arg and
+                            // would replay stale under graph capture.
+                            ensure!(
+                                meta.seqlen_k_capture.is_none(),
+                                "paged decode graph capture requires the FA3 BF16 lane"
+                            );
+                            match pool.format {
+                                KVFormat::BF16 => {
+                                    let (qp_ptr, _g0) =
+                                        q_prepped.data.device_ptr_mut(&self.ctx.stream);
+                                    let (ao_ptr, _g5) =
+                                        attn_out.data.device_ptr_mut(&self.ctx.stream);
+                                    // SAFETY: kernel signature from paged_attn_v1 ABI
+                                    // (18-arg BF16).
+                                    let kernel = ffi::resolve_paged_attn_v1(
+                                        c.head_dim as u32,
+                                        q_heads as u32,
+                                        kv_heads as u32,
+                                        phase,
+                                    )
+                                    .ok_or_else(|| {
+                                        anyhow!(
+                                            "no HD256 paged {} kernel for q{}_kv{}",
+                                            if decode { "decode" } else { "prefill" },
+                                            q_heads,
+                                            kv_heads
+                                        )
+                                    })?;
+                                    // SAFETY: ptrs from live device allocations sized to
+                                    // the dims passed.
+                                    unsafe {
+                                        kernel(
+                                            qp_ptr as *mut ffi::Half,
+                                            q_indptr_ptr as *const i32,
+                                            k_pool_ptr as *mut ffi::Half,
+                                            v_pool_ptr as *mut ffi::Half,
+                                            kv_indptr_ptr as *const i32,
+                                            kv_indices_ptr as *const i32,
+                                            last_page_len_ptr as *const i32,
+                                            ao_ptr as *mut ffi::Half,
+                                            bsz,
+                                            total_q,
+                                            max_q,
+                                            pool.max_total_pages as i32,
+                                            meta.num_pages as i32,
+                                            q_heads as i32,
+                                            kv_heads as i32,
+                                            pool.page_size as i32,
+                                            sm_scale,
+                                            self.ctx.stream.cu_stream(),
+                                        )
+                                        .result()?;
+                                    }
+                                }
+                                KVFormat::FP8E4M3 | KVFormat::INT8 => {
+                                    // Per-(token, kv_head) symmetric quant; both
+                                    // formats share the split-KV varlen kernel.
+                                    let ws = pool.quantized_attn_workspace()?;
+                                    let max_kv_len = meta.max_kv_len();
+                                    kv_quant::decode_attention_varlen_quantized(
+                                        &self.ctx,
+                                        q_prepped,
+                                        q_indptr_ptr,
+                                        pool.k_data_ptr(full_idx, &self.ctx.stream),
+                                        pool.v_data_ptr(full_idx, &self.ctx.stream),
+                                        Some(pool.k_scales_ptr(full_idx, &self.ctx.stream)),
+                                        Some(pool.v_scales_ptr(full_idx, &self.ctx.stream)),
+                                        kv_indptr_ptr,
+                                        kv_indices_ptr,
+                                        last_page_len_ptr,
+                                        attn_out,
+                                        q_heads,
+                                        kv_heads,
+                                        c.head_dim,
+                                        pool.page_size,
+                                        meta.batch,
+                                        meta.total_q,
+                                        max_kv_len,
+                                        true, // causal
+                                        pool.format,
+                                        sm_scale,
+                                        ws,
+                                        pool.quantized_attn_workspace_bytes,
+                                    )?;
+                                }
+                                other => anyhow::bail!(
+                                    "Qwen35 full-attn paged attention: unsupported pool format {other:?}"
+                                ),
+                            }
+                            Ok(())
+                        },
+                    )?;
+                }
+            }
+
+            // The recall cycle runs once per prefill, so the D2H stays off every
+            // other paged forward. The query is the mean of the last `m` prompt
+            // tokens' post-RoPE queries.
+            if let Some(dst) = layer0_query
+                && full_idx == 0
+                && rows > 1
+            {
+                let host: Vec<bf16> = self
+                    .ctx
+                    .stream
+                    .clone_dtoh(&q_prepped.data)
+                    .map_err(|e| anyhow!("recall layer0 q dtoh: {e}"))?;
+                const RECALL_PREFILL_Q_TOKENS: usize = 16;
+                let m = RECALL_PREFILL_Q_TOKENS.min(rows);
+                let mut q = vec![0.0_f32; q_dim];
+                for t in (rows - m)..rows {
+                    let base = t * q_dim;
+                    for (d, slot) in q.iter_mut().enumerate() {
+                        *slot += host[base + d].to_f32();
+                    }
+                }
+                let inv = 1.0_f32 / m as f32;
+                for v in &mut q {
+                    *v *= inv;
+                }
+                *dst = q;
             }
         }
 
@@ -982,38 +1121,10 @@ impl Qwen35Model {
             })?;
         }
 
-        // The recall cycle runs once per prefill, so the D2H stays off every
-        // other paged forward. The query is the mean of the last `m` prompt
-        // tokens' post-RoPE queries.
-        if let Some(dst) = layer0_query
-            && full_idx == 0
-            && rows > 1
-        {
-            let host: Vec<bf16> = self
-                .ctx
-                .stream
-                .clone_dtoh(&q_prepped.data)
-                .map_err(|e| anyhow!("recall layer0 q dtoh: {e}"))?;
-            const RECALL_PREFILL_Q_TOKENS: usize = 16;
-            let m = RECALL_PREFILL_Q_TOKENS.min(rows);
-            let mut q = vec![0.0_f32; q_dim];
-            for t in (rows - m)..rows {
-                let base = t * q_dim;
-                for (d, slot) in q.iter_mut().enumerate() {
-                    *slot += host[base + d].to_f32();
-                }
-            }
-            let inv = 1.0_f32 / m as f32;
-            for v in &mut q {
-                *v *= inv;
-            }
-            *dst = q;
-        }
-
         if let Some(cpx) = cp {
             // Reduce this slice's o_proj partial over the head-shard (attn_tp)
             // group, then gather the cp slices back into the full-chunk `out`.
-            let local = cp_out.get(&self.ctx, c.hidden_size, rows)?;
+            let local = fw.cp_out.get(&self.ctx, c.hidden_size, rows)?;
             crate::profile::profile_op(
                 &self.ctx,
                 "full_paged/o_proj",
@@ -1036,7 +1147,7 @@ impl Qwen35Model {
                 "full_paged/cp_row_gather",
                 Some(full_idx),
                 rows,
-                || self.cp_all_gather_rows(cpx, local, cp_row_gather, out),
+                || self.cp_all_gather_rows(cpx, local, &mut fw.cp_row_gather, out),
             )?;
         } else {
             crate::profile::profile_op(
@@ -1079,97 +1190,443 @@ impl Qwen35Model {
         }
     }
 
-    /// CP prefill KV share: stage this rank's raw (pre-norm/RoPE) k/v slice
-    /// into its section of the padded gather buffer, all-gather within the cp
-    /// group, then run the pool-write prep over every REMOTE slice. The prep
-    /// fuses q prep with the page write, so remote q is computed into scrap
-    /// buffers and discarded (per-row RoPE+norm — cheap next to the GEMMs).
+    /// 2D ring prefill: one ring-attention pass over the whole prompt. Each rank
+    /// preps its own q-slice and KV slice into dense head-major buffers, rotates
+    /// the KV slice around the cp ring, scatters its owned pages (block-cyclic)
+    /// into the sharded pool as the blocks pass through, and finalizes the
+    /// flash-2 accumulator into the gate's row-major bf16 `attn_out`.
     #[allow(clippy::too_many_arguments)]
-    fn cp_share_chunk_kv(
+    fn ring_prefill_full_attention(
         &self,
         attn: &FullAttn,
         cp: &Qwen35CpPrefill,
         full_idx: usize,
         pool: &PagedKVPool,
+        ring: &mut RingPrefillScratch,
+        q_full: &HiddenStates,
         k_batch: &HiddenStates,
         v_batch: &HiddenStates,
-        cp_kv_gather: &mut HiddenSlot,
-        cp_scrap_qf: &mut HiddenSlot,
-        cp_scrap_qp: &mut HiddenSlot,
+        attn_out: &mut HiddenStates,
     ) -> Result<()> {
         let c = &self.config;
-        let kv_dim = self.local_full_attn_kv_dim();
+        let head_dim = c.head_dim;
         let (cp_size, cp_rank) = (self.tp.attn_cp_size(), self.tp.attn_cp_rank());
+        let (q_heads, kv_heads) = (self.local_q_heads, self.local_kv_heads);
+        let rows = cp.slices[cp_rank].1;
+        let sm_scale = 1.0f32 / (head_dim as f32).sqrt();
+        let stride_page = pool.kv_dim * pool.page_size;
         let pad = cp.pad;
-        // Per-rank section layout: [k (pad rows) | v (pad rows)].
-        let sect = 2 * pad * kv_dim;
-        let my_len = cp.slices[cp_rank].1;
-        let gather = cp_kv_gather.get(&self.ctx, 2 * kv_dim, cp_size * pad)?;
-        let base = cp_rank * sect;
-        self.ctx
-            .stream
-            .memcpy_dtod(
-                &k_batch.data.slice(0..my_len * kv_dim),
-                &mut gather.data.slice_mut(base..base + my_len * kv_dim),
-            )
-            .map_err(|e| anyhow!("CP kv-share k stage failed: {e}"))?;
-        self.ctx
-            .stream
-            .memcpy_dtod(
-                &v_batch.data.slice(0..my_len * kv_dim),
-                &mut gather
-                    .data
-                    .slice_mut(base + pad * kv_dim..base + pad * kv_dim + my_len * kv_dim),
-            )
-            .map_err(|e| anyhow!("CP kv-share v stage failed: {e}"))?;
-        self.cp_all_gather_in_place(gather, sect)?;
 
-        let elem = std::mem::size_of::<ffi::Half>() as u64;
-        let qf = cp_scrap_qf.get(&self.ctx, self.local_full_attn_q_proj_dim(), pad)?;
-        let qp = cp_scrap_qp.get(&self.ctx, self.local_full_attn_q_dim(), pad)?;
-        let k_pool_ptr = pool.k_ptr(full_idx, &self.ctx.stream);
-        let v_pool_ptr = pool.v_ptr(full_idx, &self.ctx.stream);
-        let (g_ptr, _g0) = gather.data.device_ptr(&self.ctx.stream);
-        let (qf_ptr, _g1) = qf.data.device_ptr(&self.ctx.stream);
-        let (qp_ptr, _g2) = qp.data.device_ptr_mut(&self.ctx.stream);
-        let (qn_ptr, _g3) = attn.q_norm.data.device_ptr(&self.ctx.stream);
-        let (kn_ptr, _g4) = attn.k_norm.data.device_ptr(&self.ctx.stream);
-        let (cos_ptr, _g5) = self.cos_cache.data.device_ptr(&self.ctx.stream);
-        let (sin_ptr, _g6) = self.sin_cache.data.device_ptr(&self.ctx.stream);
-        let (kvidx_ptr, _g7) = cp.kv_indices.device_ptr(&self.ctx.stream);
-        let (sp_ptr, _g8) = cp.start_positions.device_ptr(&self.ctx.stream);
-        for (peer, &(_, len)) in cp.slices.iter().enumerate() {
-            if peer == cp_rank {
-                continue;
-            }
-            // SAFETY: gathered k/v sections and scrap q buffers are live and
-            // sized `pad >= len` rows; `kv_indices` covers the whole chunk and
-            // the peer's `start_positions` entry keeps the write inside it.
-            unsafe {
-                ffi::prefill_attention_paged_prep_hd256_cuda(
-                    qf_ptr as *const ffi::Half,
-                    qp_ptr as *mut ffi::Half,
-                    (g_ptr + (peer * sect) as u64 * elem) as *const ffi::Half,
-                    (g_ptr + (peer * sect + pad * kv_dim) as u64 * elem) as *const ffi::Half,
-                    qn_ptr as *const ffi::Half,
-                    kn_ptr as *const ffi::Half,
-                    cos_ptr as *const ffi::Half,
-                    sin_ptr as *const ffi::Half,
-                    kvidx_ptr as *const i32,
-                    pool.page_size as i32,
-                    k_pool_ptr as *mut ffi::Half,
-                    v_pool_ptr as *mut ffi::Half,
-                    self.local_q_heads as i32,
-                    self.local_kv_heads as i32,
-                    len as i32,
-                    (sp_ptr + (peer * 4) as u64) as *const i32,
-                    c.rotary_dim as i32,
-                    c.rms_norm_eps,
-                    self.ctx.stream.cu_stream(),
-                )
-                .result()?;
-            }
+        // Dense prep: q/k-norm + partial RoPE into head-major buffers (no pool
+        // write — the scatter below owns the pool write).
+        let q_ring = ring.q.get(&self.ctx, q_heads * rows * head_dim)?;
+        let k0 = ring.k0.get(&self.ctx, kv_heads * pad * head_dim)?;
+        let v0 = ring.v0.get(&self.ctx, kv_heads * pad * head_dim)?;
+        let k1 = ring.k1.get(&self.ctx, kv_heads * pad * head_dim)?;
+        let v1 = ring.v1.get(&self.ctx, kv_heads * pad * head_dim)?;
+        {
+            let (qf_ptr, _g0) = q_full.data.device_ptr(&self.ctx.stream);
+            let (k_ptr, _g1) = k_batch.data.device_ptr(&self.ctx.stream);
+            let (v_ptr, _g2) = v_batch.data.device_ptr(&self.ctx.stream);
+            let (qn_ptr, _g3) = attn.q_norm.data.device_ptr(&self.ctx.stream);
+            let (kn_ptr, _g4) = attn.k_norm.data.device_ptr(&self.ctx.stream);
+            let (cos_ptr, _g5) = self.cos_cache.data.device_ptr(&self.ctx.stream);
+            let (sin_ptr, _g6) = self.sin_cache.data.device_ptr(&self.ctx.stream);
+            let (qo_ptr, _g7) = q_ring.device_ptr_mut(&self.ctx.stream);
+            let (ko_ptr, _g8) = k0.device_ptr_mut(&self.ctx.stream);
+            let (vo_ptr, _g9) = v0.device_ptr_mut(&self.ctx.stream);
+            crate::profile::profile_op(
+                &self.ctx,
+                "full_paged/ring_prep",
+                Some(full_idx),
+                rows,
+                || {
+                    // SAFETY: buffers live on ctx.stream, sized to the dims passed.
+                    unsafe {
+                        ffi::ring_prefill_dense_prep_hd256_cuda(
+                            qf_ptr as *const ffi::Half,
+                            k_ptr as *const ffi::Half,
+                            v_ptr as *const ffi::Half,
+                            qn_ptr as *const ffi::Half,
+                            kn_ptr as *const ffi::Half,
+                            cos_ptr as *const ffi::Half,
+                            sin_ptr as *const ffi::Half,
+                            qo_ptr as *mut ffi::Half,
+                            ko_ptr as *mut ffi::Half,
+                            vo_ptr as *mut ffi::Half,
+                            q_heads as i32,
+                            kv_heads as i32,
+                            rows as i32,
+                            cp.q_pos[0] as i32,
+                            c.rotary_dim as i32,
+                            c.rms_norm_eps,
+                            self.ctx.stream.cu_stream(),
+                        )
+                        .result()?;
+                    }
+                    Ok(())
+                },
+            )?;
         }
+
+        // Accumulator init: m=-inf, l=0, o=0 (flash-2 online softmax).
+        let acc_rows = q_heads * rows;
+        let acc_o_len = acc_rows * head_dim;
+        let m_a = ring.m_a.get(&self.ctx, acc_rows)?;
+        let l_a = ring.l_a.get_zeroed(&self.ctx, acc_rows)?;
+        let o_a = ring.o_a.get_zeroed(&self.ctx, acc_o_len)?;
+        {
+            let neg_inf = vec![f32::NEG_INFINITY; acc_rows];
+            self.ctx
+                .stream
+                .memcpy_htod(&neg_inf, m_a)
+                .map_err(|e| anyhow!("ring m -inf upload: {e}"))?;
+        }
+
+        let dims0 = cuda_kernels::ring_attention::RingBlockDims {
+            num_q_tiles: q_heads,
+            num_q_heads: q_heads,
+            num_kv_heads: kv_heads,
+            head_dim,
+            q_rows: rows,
+            blk_len: cp.k_pos[cp_rank].len(),
+            sm_scale,
+        };
+        let fa3 = cuda_kernels::ring_attention::ring_fa3_route(
+            &self.ctx.stream,
+            dims0,
+            &cp.q_pos,
+            &cp.k_pos[cp_rank],
+        );
+
+        if fa3 {
+            // FA3 route: thread internally-allocated accumulator copies.
+            let mut fa3_m: Option<CudaSlice<f32>> = None;
+            let mut fa3_l: Option<CudaSlice<f32>> = None;
+            let mut fa3_o: Option<CudaSlice<f32>> = None;
+            let mut cur_owner = cp_rank;
+            let mut cur_pair = 0usize;
+            for hop in 0..cp_size {
+                let blk_len = cp.k_pos[cur_owner].len();
+                let dims = cuda_kernels::ring_attention::RingBlockDims { blk_len, ..dims0 };
+                let (k_ref, v_ref): (&CudaSlice<u16>, &CudaSlice<u16>) = if cur_pair == 0 {
+                    (&*k0, &*v0)
+                } else {
+                    (&*k1, &*v1)
+                };
+                let (m_in, l_in, o_in): (&CudaSlice<f32>, &CudaSlice<f32>, &CudaSlice<f32>) =
+                    if hop == 0 {
+                        (&*m_a, &*l_a, &*o_a)
+                    } else {
+                        (
+                            fa3_m.as_ref().unwrap(),
+                            fa3_l.as_ref().unwrap(),
+                            fa3_o.as_ref().unwrap(),
+                        )
+                    };
+                let (m_out, l_out, o_out) = cuda_kernels::ring_attention::ring_block_fwd_merge_fa3(
+                    &self.ctx.stream,
+                    q_ring,
+                    k_ref,
+                    v_ref,
+                    m_in,
+                    l_in,
+                    o_in,
+                    &cp.q_pos,
+                    &cp.k_pos[cur_owner],
+                    dims,
+                )?;
+                fa3_m = Some(m_out);
+                fa3_l = Some(l_out);
+                fa3_o = Some(o_out);
+                self.ring_prefill_scatter(
+                    cp,
+                    full_idx,
+                    pool,
+                    k_ref,
+                    v_ref,
+                    cur_owner,
+                    stride_page,
+                    kv_heads,
+                )?;
+                if hop + 1 < cp_size {
+                    let next_owner = (cur_owner + cp_size - 1) % cp_size;
+                    let send_len = cp.slices[cur_owner].1;
+                    let recv_len = cp.slices[next_owner].1;
+                    // Explicit pair match so borrowck sees send/recv are disjoint.
+                    if cur_pair == 0 {
+                        self.ring_prefill_rotate(
+                            &*k0, &*v0, &mut *k1, &mut *v1, send_len, recv_len, kv_heads, head_dim,
+                            cp_size,
+                        )?;
+                    } else {
+                        self.ring_prefill_rotate(
+                            &*k1, &*v1, &mut *k0, &mut *v0, send_len, recv_len, kv_heads, head_dim,
+                            cp_size,
+                        )?;
+                    }
+                    cur_owner = next_owner;
+                    cur_pair = 1 - cur_pair;
+                }
+            }
+            self.ring_prefill_finalize(
+                fa3_l.as_ref().unwrap(),
+                fa3_o.as_ref().unwrap(),
+                attn_out,
+                q_heads,
+                rows,
+                full_idx,
+            )?;
+        } else {
+            // Scalar route: A/B ping-pong (the merge is functional, in != out).
+            let m_b = ring.m_b.get(&self.ctx, acc_rows)?;
+            let l_b = ring.l_b.get(&self.ctx, acc_rows)?;
+            let o_b = ring.o_b.get(&self.ctx, acc_o_len)?;
+            let mut cur_owner = cp_rank;
+            let mut cur_pair = 0usize;
+            let mut out_in_a = false;
+            for hop in 0..cp_size {
+                let blk_len = cp.k_pos[cur_owner].len();
+                let (k_ref, v_ref): (&CudaSlice<u16>, &CudaSlice<u16>) = if cur_pair == 0 {
+                    (&*k0, &*v0)
+                } else {
+                    (&*k1, &*v1)
+                };
+                let (mi, li, oi, mo, lo, oo) = if hop % 2 == 0 {
+                    (&*m_a, &*l_a, &*o_a, &mut *m_b, &mut *l_b, &mut *o_b)
+                } else {
+                    (&*m_b, &*l_b, &*o_b, &mut *m_a, &mut *l_a, &mut *o_a)
+                };
+                // Scoped so device_ptr guards drop before the rotate borrows
+                // the other pair.
+                {
+                    let (q_ptr, _g0) = q_ring.device_ptr(&self.ctx.stream);
+                    let (k_ptr, _g1) = k_ref.device_ptr(&self.ctx.stream);
+                    let (v_ptr, _g2) = v_ref.device_ptr(&self.ctx.stream);
+                    let (mi_ptr, _g3) = mi.device_ptr(&self.ctx.stream);
+                    let (li_ptr, _g4) = li.device_ptr(&self.ctx.stream);
+                    let (oi_ptr, _g5) = oi.device_ptr(&self.ctx.stream);
+                    let (mo_ptr, _g6) = mo.device_ptr_mut(&self.ctx.stream);
+                    let (lo_ptr, _g7) = lo.device_ptr_mut(&self.ctx.stream);
+                    let (oo_ptr, _g8) = oo.device_ptr_mut(&self.ctx.stream);
+                    let (qpos_ptr, _g9) = cp.q_pos_f32.device_ptr(&self.ctx.stream);
+                    let (kpos_ptr, _g10) = cp.k_pos_f32[cur_owner].device_ptr(&self.ctx.stream);
+                    crate::profile::profile_op(
+                        &self.ctx,
+                        "full_paged/ring_merge",
+                        Some(full_idx),
+                        rows,
+                        || {
+                            // SAFETY: buffers live on ctx.stream, sized to the dims passed.
+                            unsafe {
+                                ffi::ring_block_attention_fwd_merge_cuda(
+                                    q_ptr as *const ffi::Half,
+                                    k_ptr as *const ffi::Half,
+                                    v_ptr as *const ffi::Half,
+                                    mi_ptr as *const f32,
+                                    li_ptr as *const f32,
+                                    oi_ptr as *const f32,
+                                    mo_ptr as *mut f32,
+                                    lo_ptr as *mut f32,
+                                    oo_ptr as *mut f32,
+                                    qpos_ptr as *const f32,
+                                    kpos_ptr as *const f32,
+                                    q_heads as i32,
+                                    q_heads as i32,
+                                    kv_heads as i32,
+                                    head_dim as i32,
+                                    rows as i32,
+                                    blk_len as i32,
+                                    sm_scale,
+                                    self.ctx.stream.cu_stream(),
+                                )
+                                .result()?;
+                            }
+                            Ok(())
+                        },
+                    )?;
+                }
+                out_in_a = hop % 2 == 1;
+                self.ring_prefill_scatter(
+                    cp,
+                    full_idx,
+                    pool,
+                    k_ref,
+                    v_ref,
+                    cur_owner,
+                    stride_page,
+                    kv_heads,
+                )?;
+                if hop + 1 < cp_size {
+                    let next_owner = (cur_owner + cp_size - 1) % cp_size;
+                    let send_len = cp.slices[cur_owner].1;
+                    let recv_len = cp.slices[next_owner].1;
+                    // Explicit pair match so borrowck sees send/recv are disjoint.
+                    if cur_pair == 0 {
+                        self.ring_prefill_rotate(
+                            &*k0, &*v0, &mut *k1, &mut *v1, send_len, recv_len, kv_heads, head_dim,
+                            cp_size,
+                        )?;
+                    } else {
+                        self.ring_prefill_rotate(
+                            &*k1, &*v1, &mut *k0, &mut *v0, send_len, recv_len, kv_heads, head_dim,
+                            cp_size,
+                        )?;
+                    }
+                    cur_owner = next_owner;
+                    cur_pair = 1 - cur_pair;
+                }
+            }
+            let (l_fin, o_fin): (&CudaSlice<f32>, &CudaSlice<f32>) = if out_in_a {
+                (&*l_a, &*o_a)
+            } else {
+                (&*l_b, &*o_b)
+            };
+            self.ring_prefill_finalize(l_fin, o_fin, attn_out, q_heads, rows, full_idx)?;
+        }
+        Ok(())
+    }
+
+    /// Scatter the current ring block's tokens whose global page is owned by
+    /// this shard into the sharded HND pool (block-cyclic).
+    #[allow(clippy::too_many_arguments)]
+    fn ring_prefill_scatter(
+        &self,
+        cp: &Qwen35CpPrefill,
+        full_idx: usize,
+        pool: &PagedKVPool,
+        k_dense: &CudaSlice<u16>,
+        v_dense: &CudaSlice<u16>,
+        owner: usize,
+        stride_page: usize,
+        kv_heads: usize,
+    ) -> Result<()> {
+        let cp_size = self.tp.attn_cp_size();
+        let cp_rank = self.tp.attn_cp_rank();
+        let blk_start = cp.k_pos[owner][0] as i32;
+        let blk_len = cp.k_pos[owner].len();
+        let (k_ptr, _g0) = k_dense.device_ptr(&self.ctx.stream);
+        let (v_ptr, _g1) = v_dense.device_ptr(&self.ctx.stream);
+        let (pt_ptr, _g2) = cp.kv_indices.device_ptr(&self.ctx.stream);
+        let k_pool = pool.k_ptr(full_idx, &self.ctx.stream);
+        let v_pool = pool.v_ptr(full_idx, &self.ctx.stream);
+        // SAFETY: dense buffers hold the block's prepped K/V (head-major,
+        // stride = blk_len); kv_indices is this shard's local page table.
+        unsafe {
+            ffi::ring_prefill_scatter_sharded_hd256_cuda(
+                k_ptr as *const ffi::Half,
+                v_ptr as *const ffi::Half,
+                pt_ptr as *const i32,
+                cp.kv_indices.len() as i32,
+                pool.page_size as i32,
+                kv_heads as i32,
+                blk_start,
+                blk_len as i32,
+                cp_rank as i32,
+                cp_size as i32,
+                stride_page as i32,
+                k_pool as *mut ffi::Half,
+                v_pool as *mut ffi::Half,
+                self.ctx.stream.cu_stream(),
+            )
+            .result()?;
+        }
+        Ok(())
+    }
+
+    /// Rotate the ring: recv the next block from the previous cp rank, then
+    /// send the current block to the next cp rank (NCCL P2P on comm stream).
+    #[allow(clippy::too_many_arguments)]
+    fn ring_prefill_rotate(
+        &self,
+        send_k: &CudaSlice<u16>,
+        send_v: &CudaSlice<u16>,
+        recv_k: &mut CudaSlice<u16>,
+        recv_v: &mut CudaSlice<u16>,
+        send_len: usize,
+        recv_len: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        cp_size: usize,
+    ) -> Result<()> {
+        let cp_rank = self.tp.attn_cp_rank();
+        let send_peer = (cp_rank + 1) % cp_size;
+        let recv_peer = (cp_rank + cp_size - 1) % cp_size;
+        let count = |len: usize| kv_heads * len * head_dim;
+        let (sk_ptr, _g0) = send_k.device_ptr(&self.ctx.stream);
+        let (sv_ptr, _g1) = send_v.device_ptr(&self.ctx.stream);
+        let (rk_ptr, _g2) = recv_k.device_ptr_mut(&self.ctx.stream);
+        let (rv_ptr, _g3) = recv_v.device_ptr_mut(&self.ctx.stream);
+        // SAFETY: send buffers hold `send_len` live rows; recv buffers are
+        // pad-sized (>= recv_len); peers post matching send/recv in (k, v) order.
+        unsafe {
+            self.tp.attn_cp_recv(
+                &self.ctx,
+                rk_ptr as *mut std::ffi::c_void,
+                count(recv_len),
+                cuda_kernels::collective::DType::BF16,
+                recv_peer,
+            )?;
+            self.tp.attn_cp_recv(
+                &self.ctx,
+                rv_ptr as *mut std::ffi::c_void,
+                count(recv_len),
+                cuda_kernels::collective::DType::BF16,
+                recv_peer,
+            )?;
+            self.tp.attn_cp_send(
+                &self.ctx,
+                sk_ptr as *const std::ffi::c_void,
+                count(send_len),
+                cuda_kernels::collective::DType::BF16,
+                send_peer,
+            )?;
+            self.tp.attn_cp_send(
+                &self.ctx,
+                sv_ptr as *const std::ffi::c_void,
+                count(send_len),
+                cuda_kernels::collective::DType::BF16,
+                send_peer,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Finalize the ring accumulator into the gate's row-major bf16 `attn_out`.
+    fn ring_prefill_finalize(
+        &self,
+        acc_l: &CudaSlice<f32>,
+        acc_o: &CudaSlice<f32>,
+        attn_out: &mut HiddenStates,
+        q_heads: usize,
+        rows: usize,
+        full_idx: usize,
+    ) -> Result<()> {
+        let (l_ptr, _g0) = acc_l.device_ptr(&self.ctx.stream);
+        let (o_ptr, _g1) = acc_o.device_ptr(&self.ctx.stream);
+        let (out_ptr, _g2) = attn_out.data.device_ptr_mut(&self.ctx.stream);
+        crate::profile::profile_op(
+            &self.ctx,
+            "full_paged/ring_finalize",
+            Some(full_idx),
+            rows,
+            || {
+                // SAFETY: acc buffers are [q_heads*rows] / [q_heads*rows*d];
+                // attn_out is [rows, q_heads*d] bf16.
+                unsafe {
+                    ffi::ring_prefill_finalize_bf16_hd256_cuda(
+                        l_ptr as *const f32,
+                        o_ptr as *const f32,
+                        out_ptr as *mut ffi::Half,
+                        q_heads as i32,
+                        rows as i32,
+                        self.ctx.stream.cu_stream(),
+                    )
+                    .result()?;
+                }
+                Ok(())
+            },
+        )?;
         Ok(())
     }
 

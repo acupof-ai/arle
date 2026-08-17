@@ -42,11 +42,6 @@ use qwen35::Qwen35CudaExecutor;
 
 pub(crate) const SUPPORTED_PAGE_SIZE: usize = 16;
 
-/// Minimum prefill rows PER CP RANK before a chunk is compute-sharded across
-/// the attn_cp group — below this the per-layer cp collectives cost more than
-/// the sharded compute saves.
-pub(crate) const CP_PREFILL_MIN_ROWS_PER_RANK: usize = 256;
-
 /// Minimum KV length (tokens) before a decode step head-shards across the
 /// attn_cp group (B2, T3.1). Below this the cp all-reduce costs more than the
 /// halved qkv/KV/GDN traffic saves — keeps short decode a wash.
@@ -565,6 +560,24 @@ impl RealCudaExecutor {
             Self::Qwen(q) => q.tp_sync_min(local),
             Self::Qwen35(q) => q.tp_sync_min(local),
             Self::Dsv4(d) => d.tp_sync_min(local),
+        }
+    }
+
+    /// `BackendExecutor::kv_shard_factor` — cp_size under 2D, else 1. Only the
+    /// Qwen3.5/3.6 arm engages 2D today.
+    pub(crate) fn kv_shard_factor(&self) -> usize {
+        match self {
+            Self::Qwen35(q) => q.kv_shard_factor(),
+            Self::Qwen(_) | Self::Dsv4(_) => 1,
+        }
+    }
+
+    /// This rank's (cp_rank, cp_size) for the host pool's shard filter, or
+    /// `None` when 2D is not engaged.
+    pub(crate) fn kv_shard_spec(&self) -> Option<(usize, usize)> {
+        match self {
+            Self::Qwen35(q) => q.kv_shard_spec(),
+            Self::Qwen(_) | Self::Dsv4(_) => None,
         }
     }
 

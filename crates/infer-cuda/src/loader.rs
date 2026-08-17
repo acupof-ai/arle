@@ -358,40 +358,13 @@ impl PageMeta {
         pool: &PagedKVPool,
         rows: &[(usize, usize, usize)],
     ) -> Result<Self> {
-        Self::for_rows_impl(ctx, pool, rows, false)
-    }
-
-    /// CP prefill q-slice: q rows `[start_pos, start_pos+seq_len)` attend kv
-    /// `[0, kv_len)`. `kv_len` is passed explicitly (== the causal slice end);
-    /// the pool is already mirrored to the WHOLE chunk, so coverage is checked
-    /// as `>= kv_len` here without weakening `for_rows`' exact-match ensure.
-    pub(crate) fn for_slot_slice(
-        ctx: &DeviceContext,
-        pool: &PagedKVPool,
-        slot: usize,
-        start_pos: usize,
-        seq_len: usize,
-        kv_len: usize,
-    ) -> Result<Self> {
-        ensure!(
-            kv_len == start_pos + seq_len,
-            "CP slice page table: kv_len {kv_len} != causal slice end {} for slot {slot}",
-            start_pos + seq_len
-        );
-        ensure!(
-            pool.seq_len(slot) >= kv_len,
-            "CP slice page table: pool seq_len {} < slice kv_len {kv_len} for slot {slot} \
-             (chunk not fully mirrored)",
-            pool.seq_len(slot)
-        );
-        Self::for_rows_impl(ctx, pool, &[(slot, start_pos, seq_len)], true)
+        Self::for_rows_impl(ctx, pool, rows)
     }
 
     fn for_rows_impl(
         ctx: &DeviceContext,
         pool: &PagedKVPool,
         rows: &[(usize, usize, usize)],
-        kv_prefix_of_pool: bool,
     ) -> Result<Self> {
         ensure!(!rows.is_empty(), "page table needs at least one row");
         let batch = rows.len();
@@ -411,25 +384,13 @@ impl PageMeta {
                 "page-table row for slot {slot} has no query tokens"
             );
             let total_len = start_pos + len;
-            // A CP q-slice covers a PREFIX of the mirrored chunk; every other
-            // path requires the exact cursor match.
-            if kv_prefix_of_pool {
-                ensure!(
-                    pool.seq_len(slot) >= total_len,
-                    "PagedKVPool seq_len {} < slice total_len {} for slot {}",
-                    pool.seq_len(slot),
-                    total_len,
-                    slot
-                );
-            } else {
-                ensure!(
-                    pool.seq_len(slot) == total_len,
-                    "PagedKVPool seq_len {} != materialized total_len {} for slot {}",
-                    pool.seq_len(slot),
-                    total_len,
-                    slot
-                );
-            }
+            ensure!(
+                pool.seq_len(slot) == total_len,
+                "PagedKVPool seq_len {} != materialized total_len {} for slot {}",
+                pool.seq_len(slot),
+                total_len,
+                slot
+            );
             let num_pages = total_len.div_ceil(pool.page_size);
             let pages = pool.page_indices(slot);
             ensure!(
@@ -543,6 +504,42 @@ impl PageMeta {
         seq_len: usize,
     ) -> Result<Self> {
         Self::for_rows(ctx, pool, &[(slot, start_pos, seq_len)])
+    }
+
+    /// 2D ring prefill: this rank's q-slice attends via the ring pass, which
+    /// never reads the paged page table. The device page-table buffers are
+    /// 1-element dummies; only `total_q`/`seq_len` (== this rank's q rows) and
+    /// `start_pos` are live.
+    pub(crate) fn for_ring_prefill(
+        ctx: &DeviceContext,
+        start_pos: usize,
+        rows: usize,
+    ) -> Result<Self> {
+        let zero = upload_i32(ctx, &[0])?;
+        Ok(Self {
+            q_indptr: upload_i32(ctx, &[0, rows as i32])?,
+            kv_indptr: upload_i32(ctx, &[0, 0])?,
+            kv_indices: zero.clone(),
+            kv_last_page_len: zero.clone(),
+            page_table_offsets: zero.clone(),
+            start_positions: upload_i32(ctx, &[start_pos as i32])?,
+            positions: upload_i32(ctx, &[(start_pos + rows - 1) as i32])?,
+            q_offsets: vec![0, rows],
+            page_offsets: vec![0, 0],
+            kv_lens: vec![0],
+            kv_lens_dev: zero.clone(),
+            page_table_rect: zero,
+            page_table_stride: 1,
+            seq_len: rows,
+            total_q: rows,
+            num_pages: 0,
+            batch: 1,
+            start_pos,
+            new_token_rows: None,
+            prefix_token_rows: None,
+            quant_decode_meta: None,
+            seqlen_k_capture: None,
+        })
     }
 
     /// Fixed-capacity single-slot decode metadata whose device buffers never move:

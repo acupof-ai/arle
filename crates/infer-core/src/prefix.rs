@@ -25,6 +25,8 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             .saturating_sub(matched_tokens)
             .saturating_add(request.max_tokens);
         let token_pages = tokens.div_ceil(page_size);
+        let shard = self.executor.kv_shard_factor().max(1);
+        let token_pages = token_pages.div_ceil(shard);
 
         // Fixed-band pools (DSv4): each slot consumes exactly
         // `fixed_pages_per_slot` physical pages regardless of token count.
@@ -37,6 +39,25 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         }
 
         token_pages
+    }
+
+    /// This rank's CP shard assignment for the replicated radix.
+    ///
+    /// The seam exposes the shard SIZE ([`BackendExecutor::kv_shard_factor`])
+    /// but no rank; the rank is recovered from the pool's shard filter:
+    /// `shard_local_page_count(n) == 0` iff `n <= rank`, so the count of
+    /// zeros over `n in 1..=size` is the rank. The default spec for an
+    /// unsharded pool. Pure arithmetic on the pool — cheap enough to call
+    /// per publish/attach.
+    fn cp_shard_identity(&self) -> infer_seam::ShardSpec {
+        let size = self.executor.kv_shard_factor().max(1);
+        if size <= 1 {
+            return infer_seam::ShardSpec::default();
+        }
+        let rank = (1..=size)
+            .filter(|&n| self.kv.shard_local_page_count(n) == 0)
+            .count();
+        infer_seam::ShardSpec::new(rank.min(size - 1), size)
     }
 
     /// Clamp a radix prefix match to leading pages that are complete backend
@@ -62,6 +83,28 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         if serveable < prefix_match.block_ids.len() {
             prefix_match.block_ids.truncate(serveable);
             prefix_match.matched_len = serveable.saturating_mul(block_size);
+        }
+        // CP replication: the raw matched length diverges across cp ranks —
+        // a rank-local eviction severs the block only on the owning shard
+        // while peers keep walking the stale replica. Align to the world min
+        // (the residency rule: block B is resident iff shard B%cp's page is
+        // live). This is the one choke point every prefix match passes
+        // through — admission budgeting AND attach — so the admission
+        // decision sees aligned lengths too; a divergent budget would
+        // desync the SPMD admission loop. Gated to sharded pools: with
+        // cp=1 the per-rank trees are identical.
+        if executor.kv_shard_factor() > 1 {
+            match executor.tp_sync_min(prefix_match.matched_len) {
+                Ok(aligned) if aligned < prefix_match.matched_len => {
+                    let keep = aligned / block_size;
+                    prefix_match.block_ids.truncate(keep);
+                    prefix_match.matched_len = keep.saturating_mul(block_size);
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    log::error!("prefix match cross-rank align failed: {err:#}");
+                }
+            }
         }
         prefix_match
     }
@@ -189,10 +232,19 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             return Ok(0);
         }
 
+        // CP replication: the slot's page table holds only THIS shard's pages
+        // (block B lives on shard B%cp). Filter before every pool/backend
+        // touch — a foreign page id would alias a local page and corrupt the
+        // slot's table. This is the safety net that keeps a stale radix hit
+        // degrading to recompute, never corruption.
+        let shard = self.cp_shard_identity();
+        self.radix.set_cp_shard(shard);
+        let local_blocks = prefix_match.local_block_ids(shard);
+
         // Pin matched pages first (page_refs++ / radix ref_count++) so the
         // pre-eviction below can't reclaim pages we're about to attach.
-        self.kv.retain_pages(&prefix_match.block_ids);
-        self.radix.retain_blocks(&prefix_match.block_ids);
+        self.kv.retain_pages(&local_blocks);
+        self.radix.retain_blocks(&local_blocks);
 
         // Fixed-band pools (DSv4): attach_pages tops up to `fixed_pages_per_slot`
         // from the free pool. Pre-evict prefix cache if free is short, so the
@@ -210,15 +262,15 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         // sits on the step path and the error is fatal to the whole TP group
         // (#164). Fixed-band top-up exhaustion degrades to full recompute;
         // the prefill then allocates through the shed-able plan path.
-        if let Err(err) =
-            self.kv
-                .attach_pages(slot, &prefix_match.block_ids, prefix_match.matched_len)
+        if let Err(err) = self
+            .kv
+            .attach_pages(slot, &local_blocks, prefix_match.matched_len)
         {
             log::warn!("prefix attach failed for slot {slot}: {err:#}; full recompute fallback");
             self.kv_system_metrics.fallback_recompute =
                 self.kv_system_metrics.fallback_recompute.saturating_add(1);
-            self.radix.release_blocks(&prefix_match.block_ids);
-            self.kv.release_pages(&prefix_match.block_ids);
+            self.radix.release_blocks(&local_blocks);
+            self.kv.release_pages(&local_blocks);
             return Ok(0);
         }
 
@@ -227,12 +279,9 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         // back to full recompute — a zeroed linear-attn state with non-zero full-attn
         // KV causes a cross-type mismatch that corrupts model output.
         let sidecar_restore = match self.executor.prefix_reuse() {
-            Some(reuse) => reuse.restore_prefix_sidecar(
-                slot,
-                tokens,
-                prefix_match.matched_len,
-                &prefix_match.block_ids,
-            ),
+            Some(reuse) => {
+                reuse.restore_prefix_sidecar(slot, tokens, prefix_match.matched_len, &local_blocks)
+            }
             None => Ok(prefix_match.matched_len),
         };
         let restored = match sidecar_restore {
@@ -246,8 +295,8 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
                     self.kv_system_metrics.fallback_recompute.saturating_add(1);
                 // Undo retain_pages + attach_pages; executor already reset full_attn_kv.
                 self.free_slot_pages(slot);
-                self.radix.release_blocks(&prefix_match.block_ids);
-                self.kv.release_pages(&prefix_match.block_ids);
+                self.radix.release_blocks(&local_blocks);
+                self.kv.release_pages(&local_blocks);
                 return Ok(0);
             }
         };
@@ -277,8 +326,8 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
                 self.kv_system_metrics.fallback_recompute =
                     self.kv_system_metrics.fallback_recompute.saturating_add(1);
                 self.free_slot_pages(slot);
-                self.radix.release_blocks(&prefix_match.block_ids);
-                self.kv.release_pages(&prefix_match.block_ids);
+                self.radix.release_blocks(&local_blocks);
+                self.kv.release_pages(&local_blocks);
                 return Ok(0);
             }
         } else if restored_len < prefix_match.matched_len {
@@ -332,57 +381,101 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
     /// captures, so an agentic follow-up turn radix-matches THROUGH the
     /// previous turn's generated tokens instead of re-prefilling them.
     /// Returns the newly cached pages (already cache-retained), in order.
+    ///
+    /// Under CP sequence-sharding, each rank seals only its own shard's
+    /// blocks (`local_pages[k]` backs global block `rank + k*size`), then a
+    /// min-reduce exchanges the sealed extent across the cp group so every
+    /// rank inserts the SAME token span — pages only for its own blocks,
+    /// replica nodes elsewhere (content-addressed → identical tree on all
+    /// ranks).
     pub(crate) fn publish_prefix_blocks(&mut self, slot: usize, tokens: &[u32]) -> Vec<BlockId> {
         if !self.kv.is_active() || !self.config.enable_prefix_cache {
             return Vec::new();
         }
 
+        let shard = self.cp_shard_identity();
+        self.radix.set_cp_shard(shard);
+
         let block_size = self.radix.block_size().max(1);
         let publishable_tokens = tokens.len().min(self.kv.seq_len(slot));
-        let sealed_blocks = publishable_tokens / block_size;
-        if sealed_blocks == 0 {
+        let sealed_global = publishable_tokens / block_size;
+        if sealed_global == 0 {
             return Vec::new();
         }
 
-        let sealed_tokens = sealed_blocks * block_size;
-        let pages = self
+        let sealed_tokens = sealed_global * block_size;
+        // Shard-local pages: `local_pages[k]` backs GLOBAL block (rank + k*size).
+        let local_pages = self
             .kv
             .page_indices_for_token_range(slot, sealed_tokens)
             .to_vec();
-        let mut publish_blocks = sealed_blocks.min(pages.len());
         // A recall-evicted prompt page leaves an EVICTED_PAGE sentinel; a cached
         // prefix must be contiguous-resident, so truncate at the first hole — never
         // publish a sentinel as a ResidentPage (it would later mirror u32::MAX →
         // -1 in kv_indices and corrupt attention).
-        if let Some(hole) = pages
+        let mut local_sealed = local_pages.len();
+        if let Some(hole) = local_pages
             .iter()
-            .take(publish_blocks)
             .position(|&p| p == infer_seam::EVICTED_PAGE)
         {
-            publish_blocks = hole;
+            local_sealed = hole;
         }
-        if publish_blocks == 0 {
-            return Vec::new();
-        }
-        let blocks: Vec<_> = pages
+        // Backend restore-boundary license over the local block run.
+        let blocks: Vec<_> = local_pages
             .iter()
-            .take(publish_blocks)
+            .take(local_sealed)
             .copied()
             .map(PrefixBlock::ResidentPage)
             .collect();
-        publish_blocks = match self.executor.prefix_reuse() {
+        local_sealed = match self.executor.prefix_reuse() {
             Some(reuse) => reuse.reusable_prefix_blocks(&blocks),
             None => 0,
         }
-        .min(publish_blocks);
-        if publish_blocks == 0 {
+        .min(local_sealed);
+
+        // Exchange the sealed extent across the cp group. Every rank seals the
+        // same rank-identical token stream (SPMD lockstep), so the exchange
+        // degenerates to a min-reduce: rank c contributes `rank + local*size`
+        // (the first global block it did NOT seal), and the world min is the
+        // common prefix every shard sealed. tp_sync_min spans the full world;
+        // attn_tp peers of one cp column are pool-identical under lockstep, so
+        // the world min equals the cp min. Symmetric on every rank — publish
+        // runs at SPMD request completion — and once per publish batch.
+        let sealed_extent = shard.rank + local_sealed * shard.size;
+        let common_extent = if shard.size > 1 {
+            match self.executor.tp_sync_min(sealed_extent) {
+                Ok(extent) => extent,
+                Err(err) => {
+                    log::error!("prefix publish seal exchange failed for slot {slot}: {err:#}");
+                    return Vec::new();
+                }
+            }
+        } else {
+            sealed_extent
+        };
+        if common_extent == 0 {
             return Vec::new();
         }
+        let token_len = common_extent.min(sealed_global) * block_size;
+        let local_published = common_extent
+            .saturating_sub(shard.rank)
+            .div_ceil(shard.size);
 
-        let token_len = publish_blocks * block_size;
-        let newly_cached = self
-            .radix
-            .insert(&tokens[..token_len], &pages[..publish_blocks]);
+        let newly_cached = self.radix.insert_replicated(&tokens[..token_len], &|j| {
+            if shard.owns_page(j) {
+                let idx = if shard.size <= 1 {
+                    j
+                } else {
+                    (j - shard.rank) / shard.size
+                };
+                local_pages
+                    .get(idx)
+                    .copied()
+                    .filter(|&p| p != infer_seam::EVICTED_PAGE)
+            } else {
+                None
+            }
+        });
         if !newly_cached.is_empty() {
             self.prefix_cache_stats.published_pages = self
                 .prefix_cache_stats
@@ -407,19 +500,27 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         // chain the sidecar rides — key it to the radix's own pages, else the
         // eviction key is a finish-freed slot page: the blob leaks, then drops
         // on page-id reuse while the cached prefix still expects it.
-        let radix_pages = (newly_cached.len() != publish_blocks).then(|| {
-            self.radix
-                .peek_longest_prefix_match(&tokens[..token_len])
-                .block_ids
-        });
-        let sidecar_pages = radix_pages.as_deref().unwrap_or(&pages[..publish_blocks]);
-        if let Some(reuse) = self.executor.prefix_reuse()
+        //
+        // Under CP replication the sidecar rides LOCAL pages only (a replica
+        // marker would never evict and leak the blob); on dedup the radix's own
+        // local pages are the canonical chain.
+        let radix_pages =
+            (newly_cached.len() != local_published && local_published > 0).then(|| {
+                self.radix
+                    .peek_longest_prefix_match(&tokens[..token_len])
+                    .local_block_ids(shard)
+            });
+        let sidecar_pages = radix_pages
+            .as_deref()
+            .unwrap_or(&local_pages[..local_published]);
+        if !sidecar_pages.is_empty()
+            && let Some(reuse) = self.executor.prefix_reuse()
             && let Err(err) = reuse.save_prefix_sidecar(
                 slot,
                 tokens,
                 token_len,
                 sidecar_pages,
-                &pages[..publish_blocks],
+                &local_pages[..local_sealed],
                 &newly_cached,
             )
         {

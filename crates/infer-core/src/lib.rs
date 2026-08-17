@@ -1266,7 +1266,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         }
 
         // Seal just-prefilled prompts into radix at PROMPT boundary — a chat/messages-resend restores at
-        // prompt_len, not post-generation. Without this, prompt-only resends full-recompute. `radix.insert` dedups.
+        // prompt_len, not post-generation. Without this, prompt-only resends full-recompute. `radix.insert_replicated` dedups.
         for slot in prompt_sealed_slots {
             let Some(prompt_tokens) = self.active.get(&slot).map(|r| r.prompt_tokens.clone())
             else {

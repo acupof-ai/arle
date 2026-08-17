@@ -56,4 +56,11 @@ pub trait KvQuery {
     fn page_indices(&self, slot: usize) -> &[u32];
 
     fn page_indices_for_token_range(&self, slot: usize, len: usize) -> &[u32];
+
+    /// Number of pages this pool holds per `global_pages` total pages.
+    /// Under CP sequence-sharding, returns the local shard's share; without
+    /// sharding, returns `global_pages`.
+    fn shard_local_page_count(&self, global_pages: usize) -> usize {
+        global_pages
+    }
 }

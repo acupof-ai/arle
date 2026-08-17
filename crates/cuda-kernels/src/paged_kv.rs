@@ -885,9 +885,12 @@ impl TokenKVPool {
             "TokenKVPool::mirror_slot slot {slot} out of range {}",
             self.num_slots
         );
+        // Under 2D the host pool passes only this shard's local pages (1/cp of
+        // the global count), so `<=` covers both the replicated (==) and
+        // sharded (<) cases.
         ensure!(
-            pages.len() == seq_len.div_ceil(self.page_size),
-            "TokenKVPool::mirror_slot pages {} do not exactly cover seq_len {} at page_size {}",
+            pages.len() <= seq_len.div_ceil(self.page_size),
+            "TokenKVPool::mirror_slot pages {} exceed seq_len {} at page_size {}",
             pages.len(),
             seq_len,
             self.page_size
