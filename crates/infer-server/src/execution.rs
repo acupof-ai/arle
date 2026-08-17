@@ -64,6 +64,7 @@ pub struct CounterSnapshot {
     pub kv_system: KvSystemMetrics,
     pub spec_decode: infer_seam::SpecDecodeStats,
     pub op_timing: infer_seam::OpTimingStats,
+    pub gpu: Option<infer_seam::GpuSample>,
 }
 
 /// Cross-thread handle to the latest [`CounterSnapshot`]: the engine loop writes
@@ -85,6 +86,7 @@ fn publish_counters<E: BackendExecutor, K: KvPool>(
         snap.kv_system = engine.kv_system_metrics();
         snap.spec_decode = stats.spec_decode;
         snap.op_timing = stats.op_timing;
+        snap.gpu = stats.gpu;
     }
 }
 

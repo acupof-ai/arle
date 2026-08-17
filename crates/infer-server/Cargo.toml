@@ -19,10 +19,12 @@ image = { version = "0.25", default-features = false, features = ["gif", "jpeg",
 infer-core = { path = "../infer-core" }
 infer-plan = { path = "../infer-plan", features = ["serde"] }
 infer-seam = { path = "../infer-seam" }
+libc = "0.2"
 log = "0.4"
 ring = "0.17"
 serde = { workspace = true }
 serde_json = { workspace = true }
+sysinfo = "0.35"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 tokio-stream = "0.1"
 tokenizers = { workspace = true }

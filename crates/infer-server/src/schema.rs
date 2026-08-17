@@ -705,6 +705,7 @@ pub struct StatsResponse {
     pub spec_decode: SpecDecodeStatsResponse,
     pub operator_dispatch: infer_seam::OperatorDispatchStats,
     pub op_timing: infer_seam::OpTimingStats,
+    pub gpu: Option<infer_seam::GpuSample>,
 }
 
 impl StatsResponse {
@@ -843,6 +844,7 @@ impl StatsResponse {
             },
             operator_dispatch,
             op_timing: counters.op_timing,
+            gpu: counters.gpu,
         }
     }
 }

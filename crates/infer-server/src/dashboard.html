@@ -1,0 +1,349 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ARLE — Inference Observability</title>
+<style>
+:root {
+  --page: #0d0d0d;
+  --surface: #1a1a19;
+  --ink: #ffffff;
+  --ink-2: #c3c2b7;
+  --muted: #898781;
+  --grid: #2c2c2a;
+  --axis: #383835;
+  --series: #3987e5;
+  --border: rgba(255, 255, 255, 0.10);
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--page);
+  color: var(--ink);
+  font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+  padding: 20px 24px 40px;
+}
+header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+  margin-bottom: 16px;
+}
+h1 { font-size: 18px; font-weight: 600; margin: 0; }
+h1 span { color: var(--muted); font-weight: 400; font-size: 13px; margin-left: 8px; }
+.updated { color: var(--muted); font-size: 12px; }
+.stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+  gap: 10px;
+  margin-bottom: 16px;
+}
+.stat {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 10px 14px;
+  min-width: 0;
+}
+.stat .label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; }
+.stat .value { font-size: 22px; font-weight: 600; margin-top: 2px; white-space: nowrap; }
+.grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+@media (max-width: 1100px) { .grid { grid-template-columns: repeat(2, 1fr); } }
+@media (max-width: 680px) {
+  .grid { grid-template-columns: 1fr; }
+  body { padding: 14px; }
+}
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 12px 14px 10px;
+  min-width: 0;
+}
+.card-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 8px;
+  margin-bottom: 2px;
+}
+.card-title { color: var(--ink-2); font-size: 13px; }
+.card-now { font-size: 15px; font-weight: 600; white-space: nowrap; }
+.card svg { display: block; width: 100%; height: auto; }
+.card-body.empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 210px;
+  color: var(--muted);
+  font-size: 13px;
+}
+.tick { fill: var(--muted); font-size: 10px; font-variant-numeric: tabular-nums; }
+.unit { fill: var(--muted); font-size: 10px; }
+.tooltip {
+  position: fixed;
+  z-index: 10;
+  pointer-events: none;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 4px 9px;
+  font-size: 12px;
+  color: var(--ink-2);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.4);
+  white-space: nowrap;
+}
+.tooltip b { color: var(--ink); font-weight: 600; }
+</style>
+</head>
+<body>
+<header>
+  <h1>ARLE <span>inference observability</span></h1>
+  <div id="updated" class="updated">loading…</div>
+</header>
+<section id="stats" class="stats"></section>
+<main id="grid" class="grid"></main>
+<div id="tooltip" class="tooltip" hidden></div>
+<script>
+const grid = document.getElementById('grid');
+const statsEl = document.getElementById('stats');
+const updatedEl = document.getElementById('updated');
+const tooltip = document.getElementById('tooltip');
+const SVG_NS = 'http://www.w3.org/2000/svg';
+const W = 640, H = 210, ML = 42, MR = 10, MT = 18, MB = 22;
+
+const gpu0 = s => (s.gpu && s.gpu.devices && s.gpu.devices[0]) || null;
+
+const CHARTS = [
+  { id: 'gpu-util', title: 'GPU utilization', unit: '%', yMax: 100,
+    f: s => { const d = gpu0(s); return d ? d.util_pct : null; } },
+  { id: 'vram', title: 'VRAM used', unit: 'GB',
+    f: s => { const d = gpu0(s); return d ? d.memory_used_mb / 1024 : null; } },
+  { id: 'cpu', title: 'CPU utilization', unit: '%', yMax: 100, f: s => s.cpu_pct },
+  { id: 'ram', title: 'RAM used', unit: 'GB',
+    f: s => s.ram_used_mb == null ? null : s.ram_used_mb / 1024 },
+  { id: 'disk', title: 'Disk used', unit: '%', yMax: 100, f: s => s.disk_used_pct },
+  { id: 'tok-s', title: 'Token throughput', unit: 'tok/s', rate: s => s.generated_tokens },
+  { id: 'cache-hit', title: 'Cache hit rate', unit: '%', yMax: 100,
+    f: s => s.prefix_lookups > 0 ? (s.prefix_hits / s.prefix_lookups) * 100 : null },
+  { id: 'ttft', title: 'TTFT', unit: 'ms',
+    f: s => s.ttft_count > 0 ? s.ttft_micros_total / s.ttft_count / 1000 : null },
+  { id: 'tpot', title: 'TPOT', unit: 'ms',
+    f: s => s.tpot_count > 0 ? s.tpot_micros_total / s.tpot_count / 1000 : null },
+];
+
+const STAT_DEFS = [
+  { label: 'Active requests', f: s => s.active_requests },
+  { label: 'Queue depth', f: s => s.queue_depth },
+  { label: 'KV free pages', f: s => s.kv_free_pages },
+  { label: 'GPU util', f: s => { const d = gpu0(s); return d == null ? null : d.util_pct + ' %'; } },
+  { label: 'VRAM used', f: s => { const d = gpu0(s); return d == null ? null : (d.memory_used_mb / 1024).toFixed(1) + ' GB'; } },
+  { label: 'CPU', f: s => s.cpu_pct == null ? null : s.cpu_pct.toFixed(1) + ' %' },
+  { label: 'RAM used', f: s => s.ram_used_mb == null ? null : (s.ram_used_mb / 1024).toFixed(1) + ' GB' },
+];
+
+const hhmm = t => {
+  const d = new Date(t);
+  return String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
+};
+
+function fmtV(v, unit) {
+  if (v == null || !isFinite(v)) return '— ' + unit;
+  const a = Math.abs(v);
+  const n = a >= 1000 ? v.toLocaleString(undefined, { maximumFractionDigits: 0 })
+    : a >= 100 ? v.toFixed(0)
+    : a >= 10 ? v.toFixed(1)
+    : v.toFixed(2);
+  return n + ' ' + unit;
+}
+
+const tickLabel = v => (Number.isInteger(v) ? String(v) : String(+v.toFixed(1)));
+
+function niceStep(raw) {
+  const mag = Math.pow(10, Math.floor(Math.log10(raw)));
+  const n = raw / mag;
+  const s = n <= 1 ? 1 : n <= 2 ? 2 : n <= 2.5 ? 2.5 : n <= 5 ? 5 : 10;
+  return s * mag;
+}
+
+function mapSeries(samples, f) {
+  const out = [];
+  for (const s of samples) {
+    const v = f(s);
+    if (v != null && isFinite(v)) out.push({ t: s.ts_ms, v });
+  }
+  return out;
+}
+
+function rateSeries(samples, counter) {
+  const out = [];
+  for (let i = 1; i < samples.length; i++) {
+    const dt = samples[i].ts_ms - samples[i - 1].ts_ms;
+    const dv = (counter(samples[i]) || 0) - (counter(samples[i - 1]) || 0);
+    if (dt > 0 && dv >= 0) out.push({ t: samples[i].ts_ms, v: (dv / dt) * 1000 });
+  }
+  return out;
+}
+
+function el(name, attrs) {
+  const e = document.createElementNS(SVG_NS, name);
+  for (const k in attrs) e.setAttribute(k, attrs[k]);
+  return e;
+}
+
+function renderChart(card, cfg, samples) {
+  const head = card.querySelector('.card-head');
+  const body = card.querySelector('.card-body');
+  const now = card.querySelector('.card-now');
+  const pts = cfg.rate ? rateSeries(samples, cfg.rate) : mapSeries(samples, cfg.f);
+  if (!pts.length) {
+    head.style.display = 'none';
+    body.className = 'card-body empty';
+    body.textContent = 'No data in range';
+    return;
+  }
+  head.style.display = '';
+  body.className = 'card-body';
+  now.textContent = fmtV(pts[pts.length - 1].v, cfg.unit);
+
+  const n = pts.length;
+  let vmax, step;
+  if (cfg.yMax != null) {
+    vmax = cfg.yMax;
+    step = vmax / 4;
+  } else {
+    let m = Math.max.apply(null, pts.map(p => p.v));
+    if (!(m > 0)) m = 1;
+    step = niceStep(m / 4);
+    vmax = step * Math.ceil(m / step);
+  }
+
+  const xAt = i => ML + (n === 1 ? (W - ML - MR) / 2 : (i * (W - ML - MR)) / (n - 1));
+  const yAt = v => MT + (1 - v / vmax) * (H - MT - MB);
+
+  const svg = el('svg', { viewBox: '0 0 ' + W + ' ' + H, role: 'img' });
+
+  for (let i = 0; i <= 4; i++) {
+    const v = step * i;
+    const y = yAt(v);
+    svg.appendChild(el('line', { x1: ML, x2: W - MR, y1: y, y2: y,
+      stroke: i === 0 ? 'var(--axis)' : 'var(--grid)', 'stroke-width': 1 }));
+    const t = el('text', { x: ML - 6, y: y + 3, 'text-anchor': 'end', class: 'tick' });
+    t.textContent = tickLabel(v);
+    svg.appendChild(t);
+  }
+
+  for (let k = 0; k < 5; k++) {
+    const i = Math.round((k * (n - 1)) / 4);
+    const t = el('text', { x: xAt(i), y: H - 6,
+      'text-anchor': k === 0 ? 'start' : k === 4 ? 'end' : 'middle', class: 'tick' });
+    t.textContent = hhmm(pts[i].t);
+    svg.appendChild(t);
+  }
+
+  const u = el('text', { x: ML, y: 11, class: 'unit' });
+  u.textContent = cfg.unit;
+  svg.appendChild(u);
+
+  let d = '';
+  for (let i = 0; i < n; i++) {
+    d += (i ? 'L' : 'M') + xAt(i).toFixed(1) + ' ' + yAt(pts[i].v).toFixed(1);
+  }
+  const dArea = d + 'L' + xAt(n - 1).toFixed(1) + ' ' + yAt(0).toFixed(1) +
+    'L' + xAt(0).toFixed(1) + ' ' + yAt(0).toFixed(1) + 'Z';
+  svg.appendChild(el('path', { d: dArea, fill: 'var(--series)', 'fill-opacity': 0.1 }));
+  svg.appendChild(el('path', { d: d, fill: 'none', stroke: 'var(--series)',
+    'stroke-width': 2, 'stroke-linejoin': 'round', 'stroke-linecap': 'round' }));
+
+  const ex = xAt(n - 1), ey = yAt(pts[n - 1].v);
+  svg.appendChild(el('circle', { cx: ex, cy: ey, r: 4.5,
+    fill: 'var(--series)', stroke: 'var(--surface)', 'stroke-width': 2 }));
+
+  const hoverLine = el('line', { y1: MT, y2: H - MB, stroke: 'var(--axis)', 'stroke-width': 1, visibility: 'hidden' });
+  const hoverDot = el('circle', { r: 4.5, fill: 'var(--series)',
+    stroke: 'var(--surface)', 'stroke-width': 2, visibility: 'hidden' });
+  svg.appendChild(hoverLine);
+  svg.appendChild(hoverDot);
+
+  svg.addEventListener('mousemove', e => {
+    const r = svg.getBoundingClientRect();
+    const mx = ((e.clientX - r.left) * W) / r.width;
+    let bi = 0, bd = Infinity;
+    for (let i = 0; i < n; i++) {
+      const dd = Math.abs(xAt(i) - mx);
+      if (dd < bd) { bd = dd; bi = i; }
+    }
+    const px = xAt(bi), py = yAt(pts[bi].v);
+    hoverLine.setAttribute('x1', px);
+    hoverLine.setAttribute('x2', px);
+    hoverLine.setAttribute('visibility', 'visible');
+    hoverDot.setAttribute('cx', px);
+    hoverDot.setAttribute('cy', py);
+    hoverDot.setAttribute('visibility', 'visible');
+    tooltip.innerHTML = hhmm(pts[bi].t) + ' &nbsp;<b>' + fmtV(pts[bi].v, cfg.unit) + '</b>';
+    tooltip.hidden = false;
+    let tx = e.clientX + 14;
+    const ty = e.clientY - 12;
+    if (tx + 140 > window.innerWidth) tx = e.clientX - 150;
+    tooltip.style.left = tx + 'px';
+    tooltip.style.top = ty + 'px';
+  });
+  svg.addEventListener('mouseleave', () => {
+    tooltip.hidden = true;
+    hoverLine.setAttribute('visibility', 'hidden');
+    hoverDot.setAttribute('visibility', 'hidden');
+  });
+
+  body.innerHTML = '';
+  body.appendChild(svg);
+}
+
+const cards = CHARTS.map(cfg => {
+  const card = document.createElement('div');
+  card.className = 'card';
+  card.innerHTML = '<div class="card-head"><span class="card-title">' + cfg.title +
+    '</span><span class="card-now"></span></div><div class="card-body"></div>';
+  grid.appendChild(card);
+  return { cfg, card };
+});
+
+const statTiles = STAT_DEFS.map(def => {
+  const t = document.createElement('div');
+  t.className = 'stat';
+  t.innerHTML = '<div class="label">' + def.label + '</div><div class="value">—</div>';
+  statsEl.appendChild(t);
+  return { def, valueEl: t.querySelector('.value') };
+});
+
+async function load() {
+  try {
+    const results = await Promise.all([
+      fetch('/v1/observe/query?range=1h').then(r => r.json()),
+      fetch('/v1/observe/latest').then(r => (r.ok ? r.json() : null)),
+    ]);
+    const samples = (results[0] && results[0].samples) || [];
+    const latest = results[1];
+    for (const { cfg, card } of cards) renderChart(card, cfg, samples);
+    if (latest) {
+      for (const t of statTiles) {
+        const v = t.def.f(latest);
+        t.valueEl.textContent = v == null ? '—' : String(v);
+      }
+      updatedEl.textContent = 'updated ' + new Date(latest.ts_ms).toTimeString().slice(0, 8);
+    } else {
+      for (const t of statTiles) t.valueEl.textContent = '—';
+      updatedEl.textContent = 'No data yet';
+    }
+  } catch (e) {
+    updatedEl.textContent = 'fetch failed';
+  }
+}
+
+load();
+setInterval(load, 10000);
+</script>
+</body>
+</html>

@@ -410,6 +410,42 @@ pub(crate) fn render_prometheus(counters: &CounterSnapshot, model: &str) -> Stri
     out.push_str("\",io_mode=\"");
     out.push_str(mode);
     out.push_str("\"} 1\n");
+    if let Some(ref gpu) = counters.gpu {
+        for i in 0..gpu.device_count as usize {
+            let d = &gpu.devices[i];
+            let idx = d.gpu_index.to_string();
+            out.push_str(&format!(
+                "arle_gpu_util_pct{{model_name=\"{}\",gpu_index=\"{}\"}} {}\n",
+                escape_label_value(model),
+                idx,
+                d.util_pct
+            ));
+            out.push_str(&format!(
+                "arle_gpu_memory_used_mb{{model_name=\"{}\",gpu_index=\"{}\"}} {}\n",
+                escape_label_value(model),
+                idx,
+                d.memory_used_mb
+            ));
+            out.push_str(&format!(
+                "arle_gpu_memory_total_mb{{model_name=\"{}\",gpu_index=\"{}\"}} {}\n",
+                escape_label_value(model),
+                idx,
+                d.memory_total_mb
+            ));
+            out.push_str(&format!(
+                "arle_gpu_temp_c{{model_name=\"{}\",gpu_index=\"{}\"}} {}\n",
+                escape_label_value(model),
+                idx,
+                d.temp_c
+            ));
+            out.push_str(&format!(
+                "arle_gpu_power_w{{model_name=\"{}\",gpu_index=\"{}\"}} {}\n",
+                escape_label_value(model),
+                idx,
+                d.power_w
+            ));
+        }
+    }
     out
 }
 

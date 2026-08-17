@@ -14,7 +14,7 @@ use std::sync::mpsc::{Receiver as SyncReceiver, RecvTimeoutError, Sender as Sync
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use axum::extract::{DefaultBodyLimit, State};
+use axum::extract::{DefaultBodyLimit, Query, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -400,6 +400,9 @@ fn build_router(state: Arc<DpCoordinator>) -> Router {
         .route("/v1/embeddings", post(embeddings_not_implemented))
         .route("/v1/stats", get(stats))
         .route("/metrics", get(metrics))
+        .route("/v1/observe/query", get(observe_query))
+        .route("/v1/observe/latest", get(observe_latest))
+        .route("/dashboard", get(dashboard_page))
         .fallback(fallback_404)
         .layer(DefaultBodyLimit::max(256 * 1024 * 1024))
         .with_state(state)
@@ -1904,4 +1907,48 @@ async fn stats(State(state): State<Arc<DpCoordinator>>) -> Result<Json<StatsResp
         .map_err(|_| ApiError::internal("stats query timed out"))?
         .map_err(|_| ApiError::internal("stats oneshot closed"))?;
     Ok(Json(StatsResponse::from_wire(wire)))
+}
+
+#[derive(serde::Deserialize)]
+struct ObserveQueryParams {
+    range: Option<String>,
+}
+
+fn parse_range_ms(s: &str) -> Option<u64> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let (num, unit) = s.split_at(s.len() - 1);
+    let n: u64 = num.parse().ok()?;
+    match unit {
+        "s" => Some(n * 1_000),
+        "m" => Some(n * 60_000),
+        "h" => Some(n * 3_600_000),
+        "d" => Some(n * 86_400_000),
+        _ => None,
+    }
+}
+
+async fn observe_query(Query(params): Query<ObserveQueryParams>) -> Json<serde_json::Value> {
+    let range_ms = params
+        .range
+        .as_deref()
+        .and_then(parse_range_ms)
+        .unwrap_or(3_600_000);
+    let samples = crate::observe::query(range_ms);
+    Json(serde_json::json!({ "samples": samples }))
+}
+
+async fn observe_latest() -> Result<Json<crate::observe::StoredSample>, StatusCode> {
+    crate::observe::latest()
+        .map(Json)
+        .ok_or(StatusCode::NOT_FOUND)
+}
+
+async fn dashboard_page() -> ([(header::HeaderName, &'static str); 1], &'static str) {
+    (
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        include_str!("dashboard.html"),
+    )
 }
