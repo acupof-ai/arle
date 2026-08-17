@@ -1271,6 +1271,26 @@ impl Qwen35Model {
             let mut cur_owner = cp_rank;
             let mut cur_pair = 0usize;
             for hop in 0..cp_size {
+                if hop > 0 {
+                    // The current pair was recv'd at the prior hop's start; wait
+                    // for that transfer before this hop's compute reads it.
+                    self.ctx.compute_waits_for_comm()?;
+                }
+                let next_owner = (cur_owner + cp_size - 1) % cp_size;
+                // Post the next hop's recv into the idle pair now, so it overlaps
+                // with this hop's compute. The idle pair is not touched here.
+                if hop + 1 < cp_size {
+                    let recv_len = cp.slices[next_owner].1;
+                    if cur_pair == 0 {
+                        self.ring_prefill_post_recv(
+                            &mut *k1, &mut *v1, recv_len, kv_heads, head_dim, cp_size,
+                        )?;
+                    } else {
+                        self.ring_prefill_post_recv(
+                            &mut *k0, &mut *v0, recv_len, kv_heads, head_dim, cp_size,
+                        )?;
+                    }
+                }
                 let blk_len = cp.k_pos[cur_owner].len();
                 let dims = cuda_kernels::ring_attention::RingBlockDims { blk_len, ..dims0 };
                 let (k_ref, v_ref): (&CudaSlice<u16>, &CudaSlice<u16>) = if cur_pair == 0 {
@@ -1314,19 +1334,17 @@ impl Qwen35Model {
                     kv_heads,
                 )?;
                 if hop + 1 < cp_size {
-                    let next_owner = (cur_owner + cp_size - 1) % cp_size;
+                    // Send the current pair only after compute+scatter finish
+                    // reading it.
+                    self.ctx.comm_waits_for_compute()?;
                     let send_len = cp.slices[cur_owner].1;
-                    let recv_len = cp.slices[next_owner].1;
-                    // Explicit pair match so borrowck sees send/recv are disjoint.
                     if cur_pair == 0 {
-                        self.ring_prefill_rotate(
-                            &*k0, &*v0, &mut *k1, &mut *v1, send_len, recv_len, kv_heads, head_dim,
-                            cp_size,
+                        self.ring_prefill_post_send(
+                            &*k0, &*v0, send_len, kv_heads, head_dim, cp_size,
                         )?;
                     } else {
-                        self.ring_prefill_rotate(
-                            &*k1, &*v1, &mut *k0, &mut *v0, send_len, recv_len, kv_heads, head_dim,
-                            cp_size,
+                        self.ring_prefill_post_send(
+                            &*k1, &*v1, send_len, kv_heads, head_dim, cp_size,
                         )?;
                     }
                     cur_owner = next_owner;
@@ -1350,6 +1368,22 @@ impl Qwen35Model {
             let mut cur_pair = 0usize;
             let mut out_in_a = false;
             for hop in 0..cp_size {
+                if hop > 0 {
+                    self.ctx.compute_waits_for_comm()?;
+                }
+                let next_owner = (cur_owner + cp_size - 1) % cp_size;
+                if hop + 1 < cp_size {
+                    let recv_len = cp.slices[next_owner].1;
+                    if cur_pair == 0 {
+                        self.ring_prefill_post_recv(
+                            &mut *k1, &mut *v1, recv_len, kv_heads, head_dim, cp_size,
+                        )?;
+                    } else {
+                        self.ring_prefill_post_recv(
+                            &mut *k0, &mut *v0, recv_len, kv_heads, head_dim, cp_size,
+                        )?;
+                    }
+                }
                 let blk_len = cp.k_pos[cur_owner].len();
                 let (k_ref, v_ref): (&CudaSlice<u16>, &CudaSlice<u16>) = if cur_pair == 0 {
                     (&*k0, &*v0)
@@ -1361,8 +1395,7 @@ impl Qwen35Model {
                 } else {
                     (&*m_b, &*l_b, &*o_b, &mut *m_a, &mut *l_a, &mut *o_a)
                 };
-                // Scoped so device_ptr guards drop before the rotate borrows
-                // the other pair.
+                // Guards drop before the scatter/send reborrow the pair.
                 {
                     let (q_ptr, _g0) = q_ring.device_ptr(&self.ctx.stream);
                     let (k_ptr, _g1) = k_ref.device_ptr(&self.ctx.stream);
@@ -1422,19 +1455,15 @@ impl Qwen35Model {
                     kv_heads,
                 )?;
                 if hop + 1 < cp_size {
-                    let next_owner = (cur_owner + cp_size - 1) % cp_size;
+                    self.ctx.comm_waits_for_compute()?;
                     let send_len = cp.slices[cur_owner].1;
-                    let recv_len = cp.slices[next_owner].1;
-                    // Explicit pair match so borrowck sees send/recv are disjoint.
                     if cur_pair == 0 {
-                        self.ring_prefill_rotate(
-                            &*k0, &*v0, &mut *k1, &mut *v1, send_len, recv_len, kv_heads, head_dim,
-                            cp_size,
+                        self.ring_prefill_post_send(
+                            &*k0, &*v0, send_len, kv_heads, head_dim, cp_size,
                         )?;
                     } else {
-                        self.ring_prefill_rotate(
-                            &*k1, &*v1, &mut *k0, &mut *v0, send_len, recv_len, kv_heads, head_dim,
-                            cp_size,
+                        self.ring_prefill_post_send(
+                            &*k1, &*v1, send_len, kv_heads, head_dim, cp_size,
                         )?;
                     }
                     cur_owner = next_owner;
@@ -1501,54 +1530,76 @@ impl Qwen35Model {
     /// Rotate the ring: recv the next block from the previous cp rank, then
     /// send the current block to the next cp rank (NCCL P2P on comm stream).
     #[allow(clippy::too_many_arguments)]
-    fn ring_prefill_rotate(
+    /// Post two unfenced cp recvs (k, v) into the idle pair from the upstream
+    /// peer. Issued before this hop's compute so the transfer overlaps; the
+    /// caller must run `compute_waits_for_comm` before the next hop's compute
+    /// reads this pair.
+    fn ring_prefill_post_recv(
         &self,
-        send_k: &CudaSlice<u16>,
-        send_v: &CudaSlice<u16>,
         recv_k: &mut CudaSlice<u16>,
         recv_v: &mut CudaSlice<u16>,
-        send_len: usize,
         recv_len: usize,
         kv_heads: usize,
         head_dim: usize,
         cp_size: usize,
     ) -> Result<()> {
         let cp_rank = self.tp.attn_cp_rank();
-        let send_peer = (cp_rank + 1) % cp_size;
         let recv_peer = (cp_rank + cp_size - 1) % cp_size;
-        let count = |len: usize| kv_heads * len * head_dim;
-        let (sk_ptr, _g0) = send_k.device_ptr(&self.ctx.stream);
-        let (sv_ptr, _g1) = send_v.device_ptr(&self.ctx.stream);
-        let (rk_ptr, _g2) = recv_k.device_ptr_mut(&self.ctx.stream);
-        let (rv_ptr, _g3) = recv_v.device_ptr_mut(&self.ctx.stream);
-        // SAFETY: send buffers hold `send_len` live rows; recv buffers are
-        // pad-sized (>= recv_len); peers post matching send/recv in (k, v) order.
+        let count = kv_heads * recv_len * head_dim;
+        let (rk_ptr, _g0) = recv_k.device_ptr_mut(&self.ctx.stream);
+        let (rv_ptr, _g1) = recv_v.device_ptr_mut(&self.ctx.stream);
+        // SAFETY: recv buffers are pad-sized (>= recv_len); peers post matching
+        // sends in (k, v) order.
         unsafe {
-            self.tp.attn_cp_recv(
+            self.tp.attn_cp_recv_unfenced(
                 &self.ctx,
                 rk_ptr as *mut std::ffi::c_void,
-                count(recv_len),
+                count,
                 cuda_kernels::collective::DType::BF16,
                 recv_peer,
             )?;
-            self.tp.attn_cp_recv(
+            self.tp.attn_cp_recv_unfenced(
                 &self.ctx,
                 rv_ptr as *mut std::ffi::c_void,
-                count(recv_len),
+                count,
                 cuda_kernels::collective::DType::BF16,
                 recv_peer,
             )?;
-            self.tp.attn_cp_send(
+        }
+        Ok(())
+    }
+
+    /// Post two unfenced cp sends (k, v) of the current pair to the downstream
+    /// peer. Caller must run `comm_waits_for_compute` first so the compute that
+    /// reads this pair has finished.
+    fn ring_prefill_post_send(
+        &self,
+        send_k: &CudaSlice<u16>,
+        send_v: &CudaSlice<u16>,
+        send_len: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        cp_size: usize,
+    ) -> Result<()> {
+        let cp_rank = self.tp.attn_cp_rank();
+        let send_peer = (cp_rank + 1) % cp_size;
+        let count = kv_heads * send_len * head_dim;
+        let (sk_ptr, _g0) = send_k.device_ptr(&self.ctx.stream);
+        let (sv_ptr, _g1) = send_v.device_ptr(&self.ctx.stream);
+        // SAFETY: send buffers hold `send_len` live rows; peers post matching
+        // recvs in (k, v) order.
+        unsafe {
+            self.tp.attn_cp_send_unfenced(
                 &self.ctx,
                 sk_ptr as *const std::ffi::c_void,
-                count(send_len),
+                count,
                 cuda_kernels::collective::DType::BF16,
                 send_peer,
             )?;
-            self.tp.attn_cp_send(
+            self.tp.attn_cp_send_unfenced(
                 &self.ctx,
                 sv_ptr as *const std::ffi::c_void,
-                count(send_len),
+                count,
                 cuda_kernels::collective::DType::BF16,
                 send_peer,
             )?;
