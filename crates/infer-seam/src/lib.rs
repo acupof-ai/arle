@@ -273,6 +273,13 @@ pub struct GpuSample {
     pub stale: bool,
 }
 
+pub fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 /// Backend-reported counters and identity, read at stats-request boundaries.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct BackendStats {

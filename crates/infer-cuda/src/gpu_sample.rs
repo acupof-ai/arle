@@ -18,9 +18,8 @@ pub(crate) fn latest() -> Option<GpuSample> {
 }
 
 fn spawn() {
-    let rank = std::env::var("INFER_TP_RANK")
-        .ok()
-        .and_then(|r| r.parse::<usize>().ok())
+    let rank = crate::tp::resolve_tp_config_from_env()
+        .map(|c| c.rank)
         .unwrap_or(0);
     if rank != 0 {
         return;
@@ -44,13 +43,6 @@ fn spawn() {
             }
         }
     });
-}
-
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
 }
 
 /// Parses `nvidia-smi --query-gpu=... --format=csv,noheader,nounits` output.
@@ -79,7 +71,7 @@ fn parse_nvidia_smi(stdout: &str) -> GpuSample {
     GpuSample {
         devices,
         device_count: count,
-        sampled_at_ms: now_ms(),
+        sampled_at_ms: infer_seam::now_ms(),
         stale: false,
     }
 }

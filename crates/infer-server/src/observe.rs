@@ -22,6 +22,7 @@ static HOST: RwLock<HostSample> = RwLock::new(HostSample {
     disk_used_pct: 0.0,
 });
 static HOST_INIT: OnceLock<()> = OnceLock::new();
+static LATEST: RwLock<Option<StoredSample>> = RwLock::new(None);
 
 pub fn host_sample() -> HostSample {
     HOST_INIT.get_or_init(spawn_host_sampler);
@@ -31,9 +32,14 @@ pub fn host_sample() -> HostSample {
 fn spawn_host_sampler() {
     std::thread::spawn(|| {
         let mut sys = sysinfo::System::new();
+        let mut disks = sysinfo::Disks::new_with_refreshed_list();
+        let mut tick: u32 = 0;
         loop {
             sys.refresh_cpu_all();
             sys.refresh_memory();
+            if tick.is_multiple_of(30) {
+                disks.refresh(true);
+            }
             let cpu_pct = if sys.cpus().is_empty() {
                 0.0
             } else {
@@ -45,18 +51,18 @@ fn spawn_host_sampler() {
                 cpu_pct,
                 ram_used_mb,
                 ram_total_mb,
-                disk_used_pct: disk_used_pct(),
+                disk_used_pct: disk_used_pct(&disks),
             };
             if let Ok(mut h) = HOST.write() {
                 *h = sample;
             }
+            tick += 1;
             std::thread::sleep(Duration::from_secs(10));
         }
     });
 }
 
-fn disk_used_pct() -> f32 {
-    let disks = sysinfo::Disks::new_with_refreshed_list();
+fn disk_used_pct(disks: &sysinfo::Disks) -> f32 {
     for disk in disks.list() {
         if disk.mount_point() == std::path::Path::new("/") {
             let total = disk.total_space();
@@ -76,83 +82,39 @@ pub struct StoredSample {
     pub active_requests: u32,
     pub queue_depth: u32,
     pub kv_free_pages: u32,
-    pub cached_pages: u32,
     pub cpu_pct: f32,
     pub ram_used_mb: u64,
     pub ram_total_mb: u64,
     pub disk_used_pct: f32,
     pub gpu: Option<infer_seam::GpuSample>,
-    pub steps: u64,
-    pub prefill_tokens: u64,
     pub generated_tokens: u64,
-    pub requests_completed: u64,
-    pub requests_succeeded: u64,
-    pub requests_failed: u64,
+    pub prefix_lookups: u64,
+    pub prefix_hits: u64,
     pub ttft_micros_total: u64,
     pub ttft_count: u64,
     pub tpot_micros_total: u64,
     pub tpot_count: u64,
-    pub forward_busy_micros: u64,
-    pub prefill_forward_steps: u64,
-    pub prefill_forward_busy_micros: u64,
-    pub decode_forward_steps: u64,
-    pub decode_forward_busy_micros: u64,
-    pub mixed_forward_steps: u64,
-    pub mixed_forward_busy_micros: u64,
-    pub prefix_lookups: u64,
-    pub prefix_hits: u64,
-    pub prefix_hit_tokens: u64,
-    pub spec_drafted: u64,
-    pub spec_accepted: u64,
-    pub kv_demoted_pages: u64,
-    pub kv_promoted_pages: u64,
-    pub kv_disk_pages: u64,
-    pub kv_reuse_hit_disk: u64,
 }
 
 impl StoredSample {
     fn from_snapshot(snap: &CounterSnapshot, host: HostSample, ts_ms: u64) -> Self {
-        let t = &snap.throughput;
-        let p = &snap.prefix_cache;
-        let k = &snap.kv_tier;
-        let ks = &snap.kv_system;
         Self {
             ts_ms,
             active_requests: snap.active_requests as u32,
             queue_depth: snap.queue_depth as u32,
             kv_free_pages: snap.kv_free_pages as u32,
-            cached_pages: p.cached_pages as u32,
             cpu_pct: host.cpu_pct,
             ram_used_mb: host.ram_used_mb,
             ram_total_mb: host.ram_total_mb,
             disk_used_pct: host.disk_used_pct,
             gpu: snap.gpu,
-            steps: t.steps,
-            prefill_tokens: t.prefill_tokens,
-            generated_tokens: t.generated_tokens,
-            requests_completed: t.requests_completed,
-            requests_succeeded: t.requests_succeeded,
-            requests_failed: t.requests_failed,
-            ttft_micros_total: t.ttft_micros_total,
-            ttft_count: t.ttft_count,
-            tpot_micros_total: t.tpot_micros_total,
-            tpot_count: t.tpot_count,
-            forward_busy_micros: t.forward_busy_micros,
-            prefill_forward_steps: t.prefill_forward_steps,
-            prefill_forward_busy_micros: t.prefill_forward_busy_micros,
-            decode_forward_steps: t.decode_forward_steps,
-            decode_forward_busy_micros: t.decode_forward_busy_micros,
-            mixed_forward_steps: t.mixed_forward_steps,
-            mixed_forward_busy_micros: t.mixed_forward_busy_micros,
-            prefix_lookups: p.lookups,
-            prefix_hits: p.hits,
-            prefix_hit_tokens: p.hit_tokens,
-            spec_drafted: snap.spec_decode.drafted,
-            spec_accepted: snap.spec_decode.accepted,
-            kv_demoted_pages: k.demoted_pages,
-            kv_promoted_pages: k.promoted_pages,
-            kv_disk_pages: ks.disk_pages as u64,
-            kv_reuse_hit_disk: ks.reuse_hit_disk,
+            generated_tokens: snap.throughput.generated_tokens,
+            prefix_lookups: snap.prefix_cache.lookups,
+            prefix_hits: snap.prefix_cache.hits,
+            ttft_micros_total: snap.throughput.ttft_micros_total,
+            ttft_count: snap.throughput.ttft_count,
+            tpot_micros_total: snap.throughput.tpot_micros_total,
+            tpot_count: snap.throughput.tpot_count,
         }
     }
 }
@@ -161,13 +123,6 @@ fn observe_dir() -> std::path::PathBuf {
     std::env::var("ARLE_OBSERVE_DIR")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| std::path::PathBuf::from("observe-data"))
-}
-
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
 }
 
 // Howard Hinnant's days-from-civil algorithm.
@@ -200,51 +155,23 @@ fn append_sample(dir: &std::path::Path, sample: &StoredSample) -> std::io::Resul
         .truncate(false)
         .open(path)?;
     writeln!(file, "{line}")?;
-    file.flush()
+    Ok(())
 }
-
 fn sweep_retention(dir: &std::path::Path, retention_days: u64) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
-    let cutoff_ms = now_ms().saturating_sub(retention_days * 86_400_000);
+    let cutoff = day_string(infer_seam::now_ms().saturating_sub(retention_days * 86_400_000));
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().to_string();
         if !name.starts_with("observe-") || !name.ends_with(".jsonl") {
             continue;
         }
         let day = &name["observe-".len()..name.len() - ".jsonl".len()];
-        let ts = parse_day_to_ms(day).unwrap_or(0);
-        if ts < cutoff_ms {
+        if day < cutoff.as_str() {
             let _ = std::fs::remove_file(entry.path());
         }
     }
-}
-
-fn parse_day_to_ms(day: &str) -> Option<u64> {
-    let parts: Vec<&str> = day.split('-').collect();
-    if parts.len() != 3 {
-        return None;
-    }
-    let y: i64 = parts[0].parse().ok()?;
-    let m: u32 = parts[1].parse().ok()?;
-    let d: u32 = parts[2].parse().ok()?;
-    let days = days_from_ymd(y, m, d)?;
-    Some(days as u64 * 86_400_000)
-}
-
-fn days_from_ymd(y: i64, m: u32, d: u32) -> Option<i64> {
-    let y = y - i64::from(m <= 2);
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = y - era * 400;
-    let m_adj: i64 = if m > 2 {
-        i64::from(m) - 3
-    } else {
-        i64::from(m) + 9
-    };
-    let doy = (153 * m_adj + 2) / 5 + i64::from(d) - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    Some(era * 146_097 + doe - 719_468)
 }
 
 pub fn spawn_observe_task(counters: Arc<Mutex<CounterSnapshot>>) {
@@ -266,9 +193,12 @@ pub fn spawn_observe_task(counters: Arc<Mutex<CounterSnapshot>>) {
                 Err(_) => continue,
             };
             let host = host_sample();
-            let sample = StoredSample::from_snapshot(&snap, host, now_ms());
+            let sample = StoredSample::from_snapshot(&snap, host, infer_seam::now_ms());
             if let Err(e) = append_sample(&dir, &sample) {
                 log::warn!("observe: append failed: {e}");
+            }
+            if let Ok(mut latest) = LATEST.write() {
+                *latest = Some(sample);
             }
         }
     });
@@ -291,53 +221,31 @@ fn acquire_writer_lock(dir: &std::path::Path) -> Option<std::fs::File> {
 
 pub fn query(range_ms: u64) -> Vec<StoredSample> {
     let dir = observe_dir();
-    let now = now_ms();
+    let now = infer_seam::now_ms();
     let start = now.saturating_sub(range_ms);
-    let start_day = day_string(start);
-    let end_day = day_string(now);
     let mut samples = Vec::new();
-    let mut day = start_day.clone();
-    loop {
-        let path = dir.join(format!("observe-{day}.jsonl"));
+    for day in (start / 86_400_000)..=(now / 86_400_000) {
+        let path = dir.join(format!("observe-{}.jsonl", day_string(day * 86_400_000)));
         if let Ok(content) = std::fs::read_to_string(&path) {
             for line in content.lines() {
                 if let Ok(s) = serde_json::from_str::<StoredSample>(line)
                     && s.ts_ms >= start
-                    && s.ts_ms <= now
                 {
                     samples.push(s);
                 }
             }
         }
-        if day == end_day {
-            break;
-        }
-        let ts = parse_day_to_ms(&day).unwrap_or(0);
-        day = day_string(ts + 86_400_000);
     }
     samples
 }
 
 pub fn latest() -> Option<StoredSample> {
-    let dir = observe_dir();
-    let path = dir.join(format!("observe-{}.jsonl", day_string(now_ms())));
-    let content = std::fs::read_to_string(&path).ok()?;
-    content
-        .lines()
-        .rev()
-        .find_map(|l| serde_json::from_str(l).ok())
+    LATEST.read().ok()?.clone()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn ymd_roundtrip() {
-        let days = days_from_ymd(2026, 8, 17).unwrap();
-        let (y, m, d) = days_to_ymd(days);
-        assert_eq!((y, m, d), (2026, 8, 17));
-    }
 
     #[test]
     fn ymd_epoch() {
@@ -346,9 +254,8 @@ mod tests {
     }
 
     #[test]
-    fn day_string_format() {
-        let ts = days_from_ymd(2026, 8, 17).unwrap() as u64 * 86_400_000;
-        assert_eq!(day_string(ts), "2026-08-17");
+    fn day_string_known_date() {
+        assert_eq!(day_string(1_786_924_800_000), "2026-08-17");
     }
 
     #[test]
@@ -358,38 +265,18 @@ mod tests {
             active_requests: 3,
             queue_depth: 1,
             kv_free_pages: 100,
-            cached_pages: 50,
             cpu_pct: 45.5,
             ram_used_mb: 32000,
             ram_total_mb: 64000,
             disk_used_pct: 60.0,
             gpu: None,
-            steps: 1000,
-            prefill_tokens: 50000,
             generated_tokens: 100000,
-            requests_completed: 200,
-            requests_succeeded: 195,
-            requests_failed: 5,
+            prefix_lookups: 500,
+            prefix_hits: 400,
             ttft_micros_total: 30_000_000,
             ttft_count: 200,
             tpot_micros_total: 7_000_000,
             tpot_count: 100_000,
-            forward_busy_micros: 35_000_000,
-            prefill_forward_steps: 200,
-            prefill_forward_busy_micros: 20_000_000,
-            decode_forward_steps: 1000,
-            decode_forward_busy_micros: 15_000_000,
-            mixed_forward_steps: 0,
-            mixed_forward_busy_micros: 0,
-            prefix_lookups: 500,
-            prefix_hits: 400,
-            prefix_hit_tokens: 40000,
-            spec_drafted: 0,
-            spec_accepted: 0,
-            kv_demoted_pages: 10,
-            kv_promoted_pages: 5,
-            kv_disk_pages: 10,
-            kv_reuse_hit_disk: 3,
         };
         let json = serde_json::to_string(&sample).unwrap();
         let parsed: StoredSample = serde_json::from_str(&json).unwrap();
@@ -402,12 +289,13 @@ mod tests {
     fn append_and_read_back() {
         let dir = std::env::temp_dir().join(format!("arle-observe-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
+        let ts = 1_786_924_800_000 + 3_600_000; // 2026-08-17 01:00 UTC
         let sample = StoredSample {
-            ts_ms: days_from_ymd(2026, 8, 17).unwrap() as u64 * 86_400_000 + 3600_000,
+            ts_ms: ts,
             ..Default::default()
         };
         append_sample(&dir, &sample).unwrap();
-        let path = dir.join("observe-2026-08-17.jsonl");
+        let path = dir.join(format!("observe-{}.jsonl", day_string(ts)));
         let content = std::fs::read_to_string(&path).unwrap();
         let parsed: StoredSample = serde_json::from_str(content.trim()).unwrap();
         assert_eq!(parsed.ts_ms, sample.ts_ms);
