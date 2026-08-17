@@ -1186,9 +1186,19 @@ impl Qwen35CudaExecutor {
             // function of the (rank-identical) plan, so the cp group's
             // collective schedule stays lockstep.
             if self.two_d_engaged() && self.dspark.is_none() {
+                // Balanced distribution: `base` rows each, one extra to the first
+                // `rem` ranks. Unlike ceil-div (which leaves trailing ranks at 0
+                // rows whenever len % cp != 0), every rank holds >= 1 row when
+                // len >= cp; the len < cp case still has 0-row ranks, handled by
+                // the ring path's active guard.
                 let per = len.div_ceil(cp_size);
+                let base = len / cp_size;
+                let rem = len % cp_size;
                 let slices: Vec<(usize, usize)> = (0..cp_size)
-                    .map(|p| (p * per, ((p + 1) * per).min(len) - p * per))
+                    .map(|p| {
+                        let l = base + usize::from(p < rem);
+                        (p * base + p.min(rem), l)
+                    })
                     .collect();
                 let (off, my_len) = slices[self.model.tp.attn_cp_rank()];
                 let meta = crate::loader::PageMeta::for_ring_prefill(

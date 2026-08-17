@@ -839,7 +839,34 @@ impl Qwen35Model {
                                         k_page_stride: stride_page as i64,
                                         v_page_stride: stride_page as i64,
                                     };
-                                    if pool.format == KVFormat::BF16 {
+                                    if two_d && meta.max_kv_len() == 0 {
+                                        // Empty shard: FA3 rejects seqlen_k=0, so write
+                                        // -inf lse + zero out; the cross-cp merge then
+                                        // weights this rank at zero.
+                                        let neg_inf = vec![f32::NEG_INFINITY; accum_rows];
+                                        unsafe {
+                                            cudarc::driver::result::memcpy_htod_async(
+                                                softmax_lse_ptr,
+                                                &neg_inf,
+                                                self.ctx.stream.cu_stream(),
+                                            )
+                                        }
+                                        .map_err(|e| {
+                                            anyhow!("2D empty-shard lse fill failed: {e}")
+                                        })?;
+                                        let sect = accum_rows * c.head_dim;
+                                        unsafe {
+                                            cudarc::driver::result::memset_d8_async(
+                                                ao_ptr,
+                                                0,
+                                                sect * 2,
+                                                self.ctx.stream.cu_stream(),
+                                            )
+                                        }
+                                        .map_err(|e| {
+                                            anyhow!("2D empty-shard out zero failed: {e}")
+                                        })?;
+                                    } else if pool.format == KVFormat::BF16 {
                                         // SAFETY: q/o are the live prepped/out buffers; k/v
                                         // are
                                         // the layer's pool base; the page table is the
@@ -1192,18 +1219,21 @@ impl Qwen35Model {
         let (cp_size, cp_rank) = (self.tp.attn_cp_size(), self.tp.attn_cp_rank());
         let (q_heads, kv_heads) = (self.local_q_heads, self.local_kv_heads);
         let rows = cp.slices[cp_rank].1;
+        // A 0-row rank (prompt shorter than cp_size leaves trailing ranks empty)
+        // still rotates the ring so peers' KV reaches them; it skips all compute.
+        let active = rows > 0;
         let sm_scale = 1.0f32 / (head_dim as f32).sqrt();
         let stride_page = pool.kv_dim * pool.page_size;
         let pad = cp.pad;
 
         // Dense prep: q/k-norm + partial RoPE into head-major buffers (no pool
         // write — the scatter below owns the pool write).
-        let q_ring = ring.q.get(&self.ctx, q_heads * rows * head_dim)?;
+        let q_ring = ring.q.get(&self.ctx, q_heads * rows.max(1) * head_dim)?;
         let k0 = ring.k0.get(&self.ctx, kv_heads * pad * head_dim)?;
         let v0 = ring.v0.get(&self.ctx, kv_heads * pad * head_dim)?;
         let k1 = ring.k1.get(&self.ctx, kv_heads * pad * head_dim)?;
         let v1 = ring.v1.get(&self.ctx, kv_heads * pad * head_dim)?;
-        {
+        if active {
             let (qf_ptr, _g0) = q_full.data.device_ptr(&self.ctx.stream);
             let (k_ptr, _g1) = k_batch.data.device_ptr(&self.ctx.stream);
             let (v_ptr, _g2) = v_batch.data.device_ptr(&self.ctx.stream);
@@ -1251,9 +1281,9 @@ impl Qwen35Model {
         // Accumulator init: m=-inf, l=0, o=0 (flash-2 online softmax).
         let acc_rows = q_heads * rows;
         let acc_o_len = acc_rows * head_dim;
-        let m_a = ring.m_a.get(&self.ctx, acc_rows)?;
-        let l_a = ring.l_a.get_zeroed(&self.ctx, acc_rows)?;
-        let o_a = ring.o_a.get_zeroed(&self.ctx, acc_o_len)?;
+        let m_a = ring.m_a.get(&self.ctx, acc_rows.max(1))?;
+        let l_a = ring.l_a.get_zeroed(&self.ctx, acc_rows.max(1))?;
+        let o_a = ring.o_a.get_zeroed(&self.ctx, acc_o_len.max(1))?;
         {
             let neg_inf = vec![f32::NEG_INFINITY; acc_rows];
             self.ctx
@@ -1322,54 +1352,59 @@ impl Qwen35Model {
                     self.tp.attn_cp_group_end()?;
                 }
                 let blk_len = cp.k_pos[cur_owner].len();
-                let dims = cuda_kernels::ring_attention::RingBlockDims { blk_len, ..dims0 };
-                let (k_ref, v_ref): (&CudaSlice<u16>, &CudaSlice<u16>) = if cur_pair == 0 {
-                    (&*k0, &*v0)
-                } else {
-                    (&*k1, &*v1)
-                };
-                let (m_in, l_in, o_in): (&CudaSlice<f32>, &CudaSlice<f32>, &CudaSlice<f32>) =
-                    if hop == 0 {
-                        (&*m_a, &*l_a, &*o_a)
+                if active && blk_len > 0 {
+                    let dims = cuda_kernels::ring_attention::RingBlockDims { blk_len, ..dims0 };
+                    let (k_ref, v_ref): (&CudaSlice<u16>, &CudaSlice<u16>) = if cur_pair == 0 {
+                        (&*k0, &*v0)
                     } else {
-                        let acc = fa3_acc.as_ref().unwrap();
-                        (&acc.0, &acc.1, &acc.2)
+                        (&*k1, &*v1)
                     };
-                let (m_out, l_out, o_out) = cuda_kernels::ring_attention::ring_block_fwd_merge_fa3(
-                    &self.ctx.stream,
-                    q_ring,
-                    k_ref,
-                    v_ref,
-                    m_in,
-                    l_in,
-                    o_in,
-                    &cp.q_pos,
-                    &cp.k_pos[cur_owner],
-                    dims,
-                )?;
-                fa3_acc = Some((m_out, l_out, o_out));
-                self.ring_prefill_scatter(
-                    cp,
-                    full_idx,
-                    pool,
-                    k_ref,
-                    v_ref,
-                    cur_owner,
-                    stride_page,
-                    kv_heads,
-                )?;
+                    let (m_in, l_in, o_in): (&CudaSlice<f32>, &CudaSlice<f32>, &CudaSlice<f32>) =
+                        if hop == 0 {
+                            (&*m_a, &*l_a, &*o_a)
+                        } else {
+                            let acc = fa3_acc.as_ref().unwrap();
+                            (&acc.0, &acc.1, &acc.2)
+                        };
+                    let (m_out, l_out, o_out) =
+                        cuda_kernels::ring_attention::ring_block_fwd_merge_fa3(
+                            &self.ctx.stream,
+                            q_ring,
+                            k_ref,
+                            v_ref,
+                            m_in,
+                            l_in,
+                            o_in,
+                            &cp.q_pos,
+                            &cp.k_pos[cur_owner],
+                            dims,
+                        )?;
+                    fa3_acc = Some((m_out, l_out, o_out));
+                    self.ring_prefill_scatter(
+                        cp,
+                        full_idx,
+                        pool,
+                        k_ref,
+                        v_ref,
+                        cur_owner,
+                        stride_page,
+                        kv_heads,
+                    )?;
+                }
                 if hop + 1 < cp_size {
                     cur_owner = next_owner;
                     cur_pair = 1 - cur_pair;
                 }
             }
-            let acc = fa3_acc.as_ref().unwrap();
-            self.ring_prefill_finalize(&acc.1, &acc.2, attn_out, q_heads, rows, full_idx)?;
+            if active {
+                let acc = fa3_acc.as_ref().unwrap();
+                self.ring_prefill_finalize(&acc.1, &acc.2, attn_out, q_heads, rows, full_idx)?;
+            }
         } else {
             // Scalar route: A/B ping-pong (the merge is functional, in != out).
-            let m_b = ring.m_b.get(&self.ctx, acc_rows)?;
-            let l_b = ring.l_b.get(&self.ctx, acc_rows)?;
-            let o_b = ring.o_b.get(&self.ctx, acc_o_len)?;
+            let m_b = ring.m_b.get(&self.ctx, acc_rows.max(1))?;
+            let l_b = ring.l_b.get(&self.ctx, acc_rows.max(1))?;
+            let o_b = ring.o_b.get(&self.ctx, acc_o_len.max(1))?;
             let mut cur_owner = cp_rank;
             let mut cur_pair = 0usize;
             let mut out_in_a = false;
@@ -1404,86 +1439,90 @@ impl Qwen35Model {
                     self.tp.attn_cp_group_end()?;
                 }
                 let blk_len = cp.k_pos[cur_owner].len();
-                let (k_ref, v_ref): (&CudaSlice<u16>, &CudaSlice<u16>) = if cur_pair == 0 {
-                    (&*k0, &*v0)
-                } else {
-                    (&*k1, &*v1)
-                };
-                let (mi, li, oi, mo, lo, oo) = if hop % 2 == 0 {
-                    (&*m_a, &*l_a, &*o_a, &mut *m_b, &mut *l_b, &mut *o_b)
-                } else {
-                    (&*m_b, &*l_b, &*o_b, &mut *m_a, &mut *l_a, &mut *o_a)
-                };
-                // Guards drop before the scatter reborrows the pair.
-                {
-                    let (q_ptr, _g0) = q_ring.device_ptr(&self.ctx.stream);
-                    let (k_ptr, _g1) = k_ref.device_ptr(&self.ctx.stream);
-                    let (v_ptr, _g2) = v_ref.device_ptr(&self.ctx.stream);
-                    let (mi_ptr, _g3) = mi.device_ptr(&self.ctx.stream);
-                    let (li_ptr, _g4) = li.device_ptr(&self.ctx.stream);
-                    let (oi_ptr, _g5) = oi.device_ptr(&self.ctx.stream);
-                    let (mo_ptr, _g6) = mo.device_ptr_mut(&self.ctx.stream);
-                    let (lo_ptr, _g7) = lo.device_ptr_mut(&self.ctx.stream);
-                    let (oo_ptr, _g8) = oo.device_ptr_mut(&self.ctx.stream);
-                    let (qpos_ptr, _g9) = cp.q_pos_f32.device_ptr(&self.ctx.stream);
-                    let (kpos_ptr, _g10) = cp.k_pos_f32[cur_owner].device_ptr(&self.ctx.stream);
-                    crate::profile::profile_op(
-                        &self.ctx,
-                        "full_paged/ring_merge",
-                        Some(full_idx),
-                        rows,
-                        || {
-                            // SAFETY: buffers live on ctx.stream, sized to the dims passed.
-                            unsafe {
-                                ffi::ring_block_attention_fwd_merge_cuda(
-                                    q_ptr as *const ffi::Half,
-                                    k_ptr as *const ffi::Half,
-                                    v_ptr as *const ffi::Half,
-                                    mi_ptr as *const f32,
-                                    li_ptr as *const f32,
-                                    oi_ptr as *const f32,
-                                    mo_ptr as *mut f32,
-                                    lo_ptr as *mut f32,
-                                    oo_ptr as *mut f32,
-                                    qpos_ptr as *const f32,
-                                    kpos_ptr as *const f32,
-                                    q_heads as i32,
-                                    q_heads as i32,
-                                    kv_heads as i32,
-                                    head_dim as i32,
-                                    rows as i32,
-                                    blk_len as i32,
-                                    sm_scale,
-                                    self.ctx.stream.cu_stream(),
-                                )
-                                .result()?;
-                            }
-                            Ok(())
-                        },
+                if active && blk_len > 0 {
+                    let (k_ref, v_ref): (&CudaSlice<u16>, &CudaSlice<u16>) = if cur_pair == 0 {
+                        (&*k0, &*v0)
+                    } else {
+                        (&*k1, &*v1)
+                    };
+                    let (mi, li, oi, mo, lo, oo) = if hop % 2 == 0 {
+                        (&*m_a, &*l_a, &*o_a, &mut *m_b, &mut *l_b, &mut *o_b)
+                    } else {
+                        (&*m_b, &*l_b, &*o_b, &mut *m_a, &mut *l_a, &mut *o_a)
+                    };
+                    // Guards drop before the scatter reborrows the pair.
+                    {
+                        let (q_ptr, _g0) = q_ring.device_ptr(&self.ctx.stream);
+                        let (k_ptr, _g1) = k_ref.device_ptr(&self.ctx.stream);
+                        let (v_ptr, _g2) = v_ref.device_ptr(&self.ctx.stream);
+                        let (mi_ptr, _g3) = mi.device_ptr(&self.ctx.stream);
+                        let (li_ptr, _g4) = li.device_ptr(&self.ctx.stream);
+                        let (oi_ptr, _g5) = oi.device_ptr(&self.ctx.stream);
+                        let (mo_ptr, _g6) = mo.device_ptr_mut(&self.ctx.stream);
+                        let (lo_ptr, _g7) = lo.device_ptr_mut(&self.ctx.stream);
+                        let (oo_ptr, _g8) = oo.device_ptr_mut(&self.ctx.stream);
+                        let (qpos_ptr, _g9) = cp.q_pos_f32.device_ptr(&self.ctx.stream);
+                        let (kpos_ptr, _g10) = cp.k_pos_f32[cur_owner].device_ptr(&self.ctx.stream);
+                        crate::profile::profile_op(
+                            &self.ctx,
+                            "full_paged/ring_merge",
+                            Some(full_idx),
+                            rows,
+                            || {
+                                // SAFETY: buffers live on ctx.stream, sized to the dims passed.
+                                unsafe {
+                                    ffi::ring_block_attention_fwd_merge_cuda(
+                                        q_ptr as *const ffi::Half,
+                                        k_ptr as *const ffi::Half,
+                                        v_ptr as *const ffi::Half,
+                                        mi_ptr as *const f32,
+                                        li_ptr as *const f32,
+                                        oi_ptr as *const f32,
+                                        mo_ptr as *mut f32,
+                                        lo_ptr as *mut f32,
+                                        oo_ptr as *mut f32,
+                                        qpos_ptr as *const f32,
+                                        kpos_ptr as *const f32,
+                                        q_heads as i32,
+                                        q_heads as i32,
+                                        kv_heads as i32,
+                                        head_dim as i32,
+                                        rows as i32,
+                                        blk_len as i32,
+                                        sm_scale,
+                                        self.ctx.stream.cu_stream(),
+                                    )
+                                    .result()?;
+                                }
+                                Ok(())
+                            },
+                        )?;
+                    }
+                    out_in_a = hop % 2 == 1;
+                    self.ring_prefill_scatter(
+                        cp,
+                        full_idx,
+                        pool,
+                        k_ref,
+                        v_ref,
+                        cur_owner,
+                        stride_page,
+                        kv_heads,
                     )?;
                 }
-                out_in_a = hop % 2 == 1;
-                self.ring_prefill_scatter(
-                    cp,
-                    full_idx,
-                    pool,
-                    k_ref,
-                    v_ref,
-                    cur_owner,
-                    stride_page,
-                    kv_heads,
-                )?;
                 if hop + 1 < cp_size {
                     cur_owner = next_owner;
                     cur_pair = 1 - cur_pair;
                 }
             }
-            let (l_fin, o_fin): (&CudaSlice<f32>, &CudaSlice<f32>) = if out_in_a {
-                (&*l_a, &*o_a)
-            } else {
-                (&*l_b, &*o_b)
-            };
-            self.ring_prefill_finalize(l_fin, o_fin, attn_out, q_heads, rows, full_idx)?;
+            if active {
+                let (l_fin, o_fin): (&CudaSlice<f32>, &CudaSlice<f32>) = if out_in_a {
+                    (&*l_a, &*o_a)
+                } else {
+                    (&*l_b, &*o_b)
+                };
+                self.ring_prefill_finalize(l_fin, o_fin, attn_out, q_heads, rows, full_idx)?;
+            }
         }
         Ok(())
     }
