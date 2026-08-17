@@ -41,15 +41,21 @@ process exit.
   auto-refresh 10 s, 9 charts: GPU util, VRAM, CPU, RAM, disk, token throughput,
   cache hit rate, TTFT, TPOT)
 
-**Multiproc coordinator** (`cf028de9d`): the coordinator process is engine-less
+**Multiproc coordinator** (`0d5f58970`): the coordinator process is engine-less
 in TP mode — workers use `CudaWorkerEngine` directly, so `spawn_observe_task`
 was never called and the JSONL store stayed empty. Fixed by adding
-`spawn_observe_task_coordinator`: a background thread with its own
-current-thread tokio runtime that queries rank-0 stats via the existing
-`StatsQuery` relay every 10 s and writes to the same JSONL store. The flock
-singleton dedupes against the single-process task when both run (local relay
-mode). Shared sampling/persistence logic extracted into `sample_host`,
-`write_sample`, `retention_days`.
+`CoordinatorHandle::query_stats()` (shared with the `metrics()` handler) and
+spawning the observe task from the router call sites that know the topology:
+local relay skips (ServeHandle owns sampling), multiproc coordinator and DP
+spawn exactly one. The task is a single closure-parameterized
+`spawn_observe_task<F: FnMut() -> Option<CounterSnapshot>>` — one loop, one
+implementation. The flock singleton handles cross-process dedup.
+
+An earlier version (`cf028de9d`) minted a private stats-request ID counter in
+the observe thread, colliding with the HTTP handlers' counter over the shared
+`stats_sinks` map — collisions silently evicted awaiters, producing zeroed
+samples. Fixed by routing all stats queries through `query_stats()` which
+allocates from the handle's own counter.
 
 **Existing endpoints extended**: `/v1/stats` and `/metrics` now include GPU
 samples (utilization, memory, temperature, power per device).
@@ -62,13 +68,14 @@ samples (utilization, memory, temperature, power per device).
 | `crates/infer-cuda/src/gpu_sample.rs` | New: nvidia-smi background sampler |
 | `crates/infer-cuda/src/lib.rs` | Wire `gpu_sample::latest()` into `stats()` |
 | `crates/infer-server/src/observe.rs` | New: host sampler + JSONL storage + query |
-| `crates/infer-server/src/coordinator.rs` | 2 new routes + `spawn_observe_task_coordinator` |
+| `crates/infer-server/src/coordinator.rs` | 2 new routes + `query_stats()` + topology-aware observe spawn |
 | `crates/infer-server/src/dashboard.html` | New: 349-line dashboard |
 | `crates/infer-server/src/execution.rs` | `CounterSnapshot.gpu` |
 | `crates/infer-server/src/metrics.rs` | 5 per-GPU Prometheus series |
 | `crates/infer-server/src/schema.rs` | `StatsResponse.gpu` |
 | `crates/infer-server/src/multiproc_relay.rs` | `WireStats.gpu` |
-| `crates/infer-server/src/lib.rs` | `mod observe` + `spawn_observe_task` |
+| `crates/infer-server/src/lib.rs` | `mod observe` + closure-based `spawn_observe_task` |
+| `crates/infer-api/src/serve.rs` | `observe: true` for multiproc coordinator |
 | `crates/infer-server/Cargo.toml` | `+sysinfo 0.35`, `+libc 0.2` |
 
 ## Performance
