@@ -1036,6 +1036,7 @@ pub unsafe fn dsv4_cast_i64_to_i32(
     n: usize,
     stream: CUstream,
 ) -> Result<()> {
+    // SAFETY: caller guarantees src/dst are valid device allocations of >= n elements.
     unsafe {
         ffi::dsv4_cast_i64_to_i32_cuda(src.as_ptr(), dst.as_mut_ptr(), i32::try_from(n)?, stream)
             .result()?;
