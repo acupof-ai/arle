@@ -4,51 +4,12 @@
 // q-slice and KV slice into DENSE head-major buffers, rotates the KV slice
 // around the cp ring, and scatters only the pages it owns (logical page
 // `g` on shard `g % cp`) into the sharded paged pool as the blocks pass
-// through. The norm+RoPE math is identical to prefill_attention_paged_prep.cu
-// (copied device helpers — that file's helpers are file-local).
+// through. Norm+RoPE helpers live in common.cuh (shared with the paged
+// prefill prep).
 #include "common.cuh"
 
 #define RING_PREFILL_HD 256
 #define RING_PREFILL_NUM_WARPS (RING_PREFILL_HD / WARP_SIZE)
-
-__device__ __forceinline__ float ring_prefill_rms_norm_hd256(
-    float val, float weight, float eps, int tid) {
-  float sq_sum = warp_reduce_sum(val * val);
-  __shared__ float scratch[RING_PREFILL_NUM_WARPS];
-  int warp_id = tid / WARP_SIZE;
-  int lane_id = tid % WARP_SIZE;
-  if (lane_id == 0) {
-    scratch[warp_id] = sq_sum;
-  }
-  __syncthreads();
-  if (tid == 0) {
-    float total = 0.0f;
-    for (int i = 0; i < RING_PREFILL_NUM_WARPS; ++i) {
-      total += scratch[i];
-    }
-    scratch[0] = 1.0f / sqrtf(total / RING_PREFILL_HD + eps);
-  }
-  __syncthreads();
-  return val * scratch[0] * (1.0f + weight);  // #58: hd256 q/k_norm OFFSET
-}
-
-__device__ __forceinline__ float ring_prefill_apply_rope_partial_hd256(
-    float* smem, const __nv_bfloat16* cos_cache, const __nv_bfloat16* sin_cache,
-    int pos, int tid, int rotary_dim) {
-  int half_rotary = rotary_dim / 2;
-  if (tid < half_rotary) {
-    float cos_val = __bfloat162float(cos_cache[pos * rotary_dim + tid]);
-    float sin_val = __bfloat162float(sin_cache[pos * rotary_dim + tid]);
-    return smem[tid] * cos_val - smem[tid + half_rotary] * sin_val;
-  }
-  if (tid < rotary_dim) {
-    int pair = tid - half_rotary;
-    float cos_val = __bfloat162float(cos_cache[pos * rotary_dim + pair]);
-    float sin_val = __bfloat162float(sin_cache[pos * rotary_dim + pair]);
-    return smem[pair] * sin_val + smem[tid] * cos_val;
-  }
-  return smem[tid];
-}
 
 // Dense prep: q/k-norm + partial RoPE into DENSE head-major buffers
 // `[heads, rows, hd]` (the ring core's tile-major layout), with NO pool write.
@@ -84,10 +45,10 @@ __global__ void ring_prefill_dense_prep_hd256_kernel(
     int q_src = token * q_full_dim + q_head * 2 * RING_PREFILL_HD + tid;
     float q_val = __bfloat162float(q_full[q_src]);
     float q_normed =
-        ring_prefill_rms_norm_hd256(q_val, q_norm_w, rms_eps, tid);
+        rms_norm_hd256(q_val, q_norm_w, rms_eps, tid);
     smem_rope[tid] = q_normed;
     __syncthreads();
-    float q_roped = ring_prefill_apply_rope_partial_hd256(
+    float q_roped = apply_rope_partial_hd256(
         smem_rope, cos_cache, sin_cache, pos, tid, rotary_dim);
     __syncthreads();
     q_out[q_head * rows * RING_PREFILL_HD + token * RING_PREFILL_HD + tid] =
@@ -98,10 +59,10 @@ __global__ void ring_prefill_dense_prep_hd256_kernel(
   int kv_src = token * kv_dim + kv_head_idx * RING_PREFILL_HD + tid;
   float k_val = __bfloat162float(k_in[kv_src]);
   float k_normed =
-      ring_prefill_rms_norm_hd256(k_val, k_norm_w, rms_eps, tid);
+      rms_norm_hd256(k_val, k_norm_w, rms_eps, tid);
   smem_rope[tid] = k_normed;
   __syncthreads();
-  float k_roped = ring_prefill_apply_rope_partial_hd256(
+  float k_roped = apply_rope_partial_hd256(
       smem_rope, cos_cache, sin_cache, pos, tid, rotary_dim);
   __syncthreads();
   k_out[kv_head_idx * rows * RING_PREFILL_HD + token * RING_PREFILL_HD + tid] =

@@ -332,11 +332,12 @@ pub trait BackendExecutor {
         Ok(local)
     }
 
-    /// KV pool sequence-shard factor. Under 2D (attn_tp × cp) parallelism, each
-    /// rank's pool holds 1/cp of the sequence pages, so the engine's page
-    /// budgeting divides by this factor. Default 1 (no sharding).
-    fn kv_shard_factor(&self) -> usize {
-        1
+    /// This rank's (cp_rank, cp_size) for the host pool's CP sequence-shard
+    /// filter, or `None` when 2D (attn_tp × cp) is not engaged. The engine
+    /// divides page budgeting by `cp_size` and recovers the rank directly —
+    /// no pool probe needed. Default `None` (no sharding).
+    fn kv_shard_spec(&self) -> Option<(usize, usize)> {
+        None
     }
 
     /// Prefix-cache restore/publish coordination below the seam.

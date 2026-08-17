@@ -67,7 +67,6 @@ impl PrefixMatch {
             .enumerate()
             .filter(|(block_idx, _)| shard.owns_page(*block_idx))
             .map(|(_, &page)| page)
-            .filter(|&page| page != REPLICA_PAGE)
             .collect()
     }
 }
@@ -177,6 +176,11 @@ impl RadixCache {
     /// 2D, so a block's owning shard is known while the tree grows.
     pub fn set_cp_shard(&mut self, shard: ShardSpec) {
         self.cp_shard = shard;
+    }
+
+    #[must_use]
+    pub fn cp_shard(&self) -> ShardSpec {
+        self.cp_shard
     }
 
     #[must_use]

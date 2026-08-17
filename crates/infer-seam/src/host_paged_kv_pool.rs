@@ -64,6 +64,19 @@ impl ShardSpec {
     pub fn owns_page(&self, page: usize) -> bool {
         self.size <= 1 || page % self.size == self.rank
     }
+
+    /// Local index of a global page owned by this shard, or `None` if not
+    /// owned. The inverse of the block-cyclic mapping.
+    #[must_use]
+    pub fn local_index(&self, page: usize) -> Option<usize> {
+        (self.size <= 1 || page % self.size == self.rank).then(|| {
+            if self.size <= 1 {
+                page
+            } else {
+                (page - self.rank) / self.size
+            }
+        })
+    }
 }
 
 /// Host-side paged KV bookkeeping for a backend executor.

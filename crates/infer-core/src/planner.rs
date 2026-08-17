@@ -311,8 +311,9 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         // blocks from the normal step() publish, not just newly-published above).
         if self.kv_tier_capacity() > 0 {
             let matched = self.radix.peek_longest_prefix_match(&committed_tokens);
-            if !matched.block_ids.is_empty() {
-                self.demote_published_pages(&matched.block_ids);
+            let local = matched.local_block_ids(self.radix.cp_shard());
+            if !local.is_empty() {
+                self.demote_published_pages(&local);
             }
         }
         let request = if let Some(key) = slot_swap_key {

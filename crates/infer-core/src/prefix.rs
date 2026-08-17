@@ -25,8 +25,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             .saturating_sub(matched_tokens)
             .saturating_add(request.max_tokens);
         let token_pages = tokens.div_ceil(page_size);
-        let shard = self.executor.kv_shard_factor().max(1);
-        let token_pages = token_pages.div_ceil(shard);
+        let token_pages = self.kv.shard_local_page_count(token_pages);
 
         // Fixed-band pools (DSv4): each slot consumes exactly
         // `fixed_pages_per_slot` physical pages regardless of token count.
@@ -42,22 +41,12 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
     }
 
     /// This rank's CP shard assignment for the replicated radix.
-    ///
-    /// The seam exposes the shard SIZE ([`BackendExecutor::kv_shard_factor`])
-    /// but no rank; the rank is recovered from the pool's shard filter:
-    /// `shard_local_page_count(n) == 0` iff `n <= rank`, so the count of
-    /// zeros over `n in 1..=size` is the rank. The default spec for an
-    /// unsharded pool. Pure arithmetic on the pool — cheap enough to call
-    /// per publish/attach.
     fn cp_shard_identity(&self) -> infer_seam::ShardSpec {
-        let size = self.executor.kv_shard_factor().max(1);
-        if size <= 1 {
-            return infer_seam::ShardSpec::default();
-        }
-        let rank = (1..=size)
-            .filter(|&n| self.kv.shard_local_page_count(n) == 0)
-            .count();
-        infer_seam::ShardSpec::new(rank.min(size - 1), size)
+        self.executor
+            .kv_shard_spec()
+            .map_or(infer_seam::ShardSpec::default(), |(rank, size)| {
+                infer_seam::ShardSpec::new(rank, size)
+            })
     }
 
     /// Clamp a radix prefix match to leading pages that are complete backend
@@ -93,7 +82,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         // decision sees aligned lengths too; a divergent budget would
         // desync the SPMD admission loop. Gated to sharded pools: with
         // cp=1 the per-rank trees are identical.
-        if executor.kv_shard_factor() > 1 {
+        if executor.kv_shard_spec().is_some() && prefix_match.matched_len > 0 {
             match executor.tp_sync_min(prefix_match.matched_len) {
                 Ok(aligned) if aligned < prefix_match.matched_len => {
                     let keep = aligned / block_size;
@@ -462,19 +451,10 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             .div_ceil(shard.size);
 
         let newly_cached = self.radix.insert_replicated(&tokens[..token_len], &|j| {
-            if shard.owns_page(j) {
-                let idx = if shard.size <= 1 {
-                    j
-                } else {
-                    (j - shard.rank) / shard.size
-                };
-                local_pages
-                    .get(idx)
-                    .copied()
-                    .filter(|&p| p != infer_seam::EVICTED_PAGE)
-            } else {
-                None
-            }
+            shard
+                .local_index(j)
+                .and_then(|idx| local_pages.get(idx).copied())
+                .filter(|&p| p != infer_seam::EVICTED_PAGE)
         });
         if !newly_cached.is_empty() {
             self.prefix_cache_stats.published_pages = self

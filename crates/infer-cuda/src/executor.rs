@@ -563,15 +563,6 @@ impl RealCudaExecutor {
         }
     }
 
-    /// `BackendExecutor::kv_shard_factor` — cp_size under 2D, else 1. Only the
-    /// Qwen3.5/3.6 arm engages 2D today.
-    pub(crate) fn kv_shard_factor(&self) -> usize {
-        match self {
-            Self::Qwen35(q) => q.kv_shard_factor(),
-            Self::Qwen(_) | Self::Dsv4(_) => 1,
-        }
-    }
-
     /// This rank's (cp_rank, cp_size) for the host pool's shard filter, or
     /// `None` when 2D is not engaged.
     pub(crate) fn kv_shard_spec(&self) -> Option<(usize, usize)> {
