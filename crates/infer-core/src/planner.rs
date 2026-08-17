@@ -67,8 +67,13 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             .min(cap)
             .min(limits.max_prefill_chunk);
         let max_prefills = self.config.max_concurrent_prefill();
+        // D.3: under 2D the ring pass attends only to the row's own KV, so the
+        // prompt must land in one row — chunking would break causal attention
+        // across chunks. One full-prompt row per tick; decode-interleaving is
+        // sacrificed for 2D requests (Option A decision).
+        let two_d = self.executor.kv_shard_spec().is_some();
         for (&slot, request) in &self.active {
-            if prefill_rows.len() >= max_prefills || budget == 0 {
+            if prefill_rows.len() >= max_prefills || (!two_d && budget == 0) {
                 break;
             }
             if !matches!(request.phase, RequestPhase::Prefilling { .. }) {
@@ -77,22 +82,28 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             let target = request.committed_len();
             let start_pos = request.prefill_start_pos.min(target);
             let remaining = target - start_pos;
-            let mut chunk = remaining.min(chunk_cap).min(budget);
+            let mut chunk = if two_d {
+                remaining
+            } else {
+                remaining.min(chunk_cap).min(budget)
+            };
             if chunk == 0 {
                 continue;
             }
-            // Align chunk ends to lcm(page_size, restore_alignment) (LCM, not
-            // max — neither is guaranteed to divide the other): some backends
-            // restore side state (ring/compressor snapshots) only at their own
-            // coarser boundary. Chunk SIZE is bounded by max_prefill_chunk()
-            // in chunk_cap above; this only aligns where the chunk ends.
-            let page_size = self.kv.page_size().max(1);
-            let restore_alignment = limits.prefill_restore_boundary_alignment.max(1);
-            let alignment_unit = lcm(page_size, restore_alignment);
-            let chunk_end = start_pos + chunk;
-            let aligned_end = chunk_end - (chunk_end % alignment_unit);
-            if aligned_end > start_pos {
-                chunk = aligned_end - start_pos;
+            if !two_d {
+                // Align chunk ends to lcm(page_size, restore_alignment) (LCM, not
+                // max — neither is guaranteed to divide the other): some backends
+                // restore side state (ring/compressor snapshots) only at their own
+                // coarser boundary. Chunk SIZE is bounded by max_prefill_chunk()
+                // in chunk_cap above; this only aligns where the chunk ends.
+                let page_size = self.kv.page_size().max(1);
+                let restore_alignment = limits.prefill_restore_boundary_alignment.max(1);
+                let alignment_unit = lcm(page_size, restore_alignment);
+                let chunk_end = start_pos + chunk;
+                let aligned_end = chunk_end - (chunk_end % alignment_unit);
+                if aligned_end > start_pos {
+                    chunk = aligned_end - start_pos;
+                }
             }
             let (penalty_history, penalty_prompt_len) = request.penalty_history();
             prefill_rows.push(PrefillRow {
@@ -104,7 +115,9 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
                 penalty_history,
                 penalty_prompt_len,
             });
-            budget -= chunk;
+            if !two_d {
+                budget -= chunk;
+            }
         }
 
         ForwardPlan {
@@ -400,11 +413,12 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
                 let fresh = request.clone().reset_for_recompute();
                 *request = fresh;
                 let committed = request.committed_tokens();
-                let prefix_match = if self.config.enable_prefix_cache {
-                    self.lookup_prefix_for_attach(&committed)?
-                } else {
-                    crate::PrefixMatch::empty()
-                };
+                let prefix_match =
+                    if self.config.enable_prefix_cache && self.executor.kv_shard_spec().is_none() {
+                        self.lookup_prefix_for_attach(&committed)?
+                    } else {
+                        crate::PrefixMatch::empty()
+                    };
                 self.attach_prefix_to_request(slot, request, &committed, prefix_match)
             }
         }
