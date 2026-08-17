@@ -27,7 +27,7 @@ pub const EVICTED_PAGE: u32 = u32::MAX;
 /// Under 2D (attn_tp × cp) parallelism, rank (t, c) holds only the pages
 /// owned by shard c: logical page `i` lives on shard `i % size` (block-cyclic,
 /// stable under sequence growth). `size == 1` means no sharding (the default).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ShardSpec {
     pub rank: usize,
     pub size: usize,

@@ -82,7 +82,10 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         // decision sees aligned lengths too; a divergent budget would
         // desync the SPMD admission loop. Gated to sharded pools: with
         // cp=1 the per-rank trees are identical.
-        if executor.kv_shard_spec().is_some() && prefix_match.matched_len > 0 {
+        // SPMD: call the reduce unconditionally under sharding — a rank with
+        // matched_len=0 must still enter the collective, else a peer's reduce
+        // hangs on collective-count divergence. Reducing 0 is harmless.
+        if executor.kv_shard_spec().is_some() {
             match executor.tp_sync_min(prefix_match.matched_len) {
                 Ok(aligned) if aligned < prefix_match.matched_len => {
                     let keep = aligned / block_size;
@@ -446,9 +449,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             return Vec::new();
         }
         let token_len = common_extent.min(sealed_global) * block_size;
-        let local_published = common_extent
-            .saturating_sub(shard.rank)
-            .div_ceil(shard.size);
+        let local_published = shard.local_page_count(common_extent);
 
         let newly_cached = self.radix.insert_replicated(&tokens[..token_len], &|j| {
             shard
