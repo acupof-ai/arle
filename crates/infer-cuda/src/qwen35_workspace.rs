@@ -327,8 +327,7 @@ impl Qwen35Workspace {
 /// ring / GDR state `CudaSlice`s are allocated once at executor construction
 /// and never re-allocated (`Qwen35SlotState::reset` memsets in place; the OPD
 /// weight offload leaves slot state untouched), so restaging is needed only
-/// when the row→slot mapping changes (monolith `TileLangDecodeMetadata.update`
-/// pattern).
+/// when the row→slot mapping changes.
 pub(crate) struct Qwen35BatchDecodeState {
     pub(crate) ws: Qwen35Workspace,
     pub(crate) positions: SliceSlot<i32>,

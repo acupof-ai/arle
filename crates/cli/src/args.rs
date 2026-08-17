@@ -875,10 +875,6 @@ pub(crate) struct ServeArgs {
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set, value_name = "BOOL")]
     pub(crate) qwen35_gdr_chunked: bool,
 
-    /// Fast page-16 decode-metadata kernel path.
-    #[arg(long, default_value_t = false, action = clap::ArgAction::Set, value_name = "BOOL")]
-    pub(crate) decode_metadata_fast_page16: bool,
-
     /// Marlin W4 FP8 prefill weights at load.
     #[arg(long, default_value_t = false, action = clap::ArgAction::Set, value_name = "BOOL")]
     pub(crate) marlin_w4_fp8_prefill: bool,
@@ -991,7 +987,6 @@ impl ServeArgs {
             qwen35_fa3_decode_splits: self.qwen35_fa3_decode_splits,
             qwen35_deepgemm_min_routes: self.qwen35_deepgemm_min_routes,
             qwen35_gdr_chunked: self.qwen35_gdr_chunked,
-            decode_metadata_fast_page16: self.decode_metadata_fast_page16,
             marlin_w4_fp8_prefill: self.marlin_w4_fp8_prefill,
             mempool_retain: self.cuda_mempool_retain,
             shard_cache_bytes: self.shard_cache_bytes,
