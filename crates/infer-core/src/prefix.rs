@@ -119,11 +119,74 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             prefix_match,
             tokens,
         );
-        if prefix_match.is_empty() {
+
+        let local_restored = self.attach_prefix_restore(slot, &prefix_match, tokens, attach_cap)?;
+
+        // Cross-rank min-reduce of the restored length. A rank-local attach or
+        // sidecar failure degrades that rank to full recompute (0); without
+        // this reduce its `prefill_start_pos` runs ahead of its peers, the
+        // planner emits mismatched rows, and the TP collectives desync. The
+        // tier path's own min-reduce in `lookup_prefix_for_attach` aligns the
+        // matched length, but the restored length can still diverge (attach
+        // alloc failure, sidecar miss, grow alloc failure). Symmetric on every
+        // rank — `attach_prefix_to_request` runs under lockstep admission.
+        let restored_len = self.executor.tp_sync_min(local_restored)?;
+
+        if restored_len < local_restored {
+            // A peer fell back to full recompute where this rank succeeded:
+            // undo the attach so every rank recomputes from the same position.
+            // The recurrent sidecar state is NOT reset here — the resulting
+            // fresh prefill (start_pos=0) rewinds it in `submit_prefill_row`.
+            log::info!(
+                "prefix-attach: slot={slot} cross-rank min truncated restore \
+                 {local_restored} -> {restored_len} (peer fallback)"
+            );
+            self.free_slot_pages(slot);
+            self.radix.release_blocks(&prefix_match.block_ids);
+            self.kv.release_pages(&prefix_match.block_ids);
+        }
+
+        if restored_len == 0 {
             self.record_prefix_restore_metrics(0);
             request.prefill_start_pos = 0;
+            request.reused_prefix_pages = Vec::new();
             request.phase = RequestPhase::Prefilling { progress: 0 };
             return Ok(());
+        }
+
+        log::info!(
+            "prefix-attach: slot={slot} matched={} restored={restored_len} committed={target}",
+            prefix_match.matched_len,
+        );
+        self.record_prefix_restore_metrics(restored_len);
+
+        request.prefill_start_pos = restored_len;
+        request.reused_prefix_pages = prefix_match.block_ids;
+        request.phase = if request.prefill_start_pos == target {
+            RequestPhase::Decoding
+        } else {
+            RequestPhase::Prefilling {
+                progress: request.prefill_start_pos,
+            }
+        };
+        Ok(())
+    }
+
+    /// Attach the matched prefix pages and restore the recurrent sidecar,
+    /// returning the ABSOLUTE restored length. Rank-local failures (attach
+    /// alloc, sidecar miss, grow alloc) degrade to `Ok(0)` — full recompute,
+    /// with the attach already undone — so the caller's `tp_sync_min` aligns
+    /// every rank to the same `prefill_start_pos`. A truncate failure
+    /// propagates (matches the prior `?` semantics).
+    fn attach_prefix_restore(
+        &mut self,
+        slot: usize,
+        prefix_match: &PrefixMatch,
+        tokens: &[u32],
+        attach_cap: usize,
+    ) -> Result<usize> {
+        if prefix_match.is_empty() {
+            return Ok(0);
         }
 
         // Pin matched pages first (page_refs++ / radix ref_count++) so the
@@ -154,11 +217,9 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             log::warn!("prefix attach failed for slot {slot}: {err:#}; full recompute fallback");
             self.kv_system_metrics.fallback_recompute =
                 self.kv_system_metrics.fallback_recompute.saturating_add(1);
-            self.record_prefix_restore_metrics(0);
             self.radix.release_blocks(&prefix_match.block_ids);
             self.kv.release_pages(&prefix_match.block_ids);
-            request.phase = RequestPhase::Prefilling { progress: 0 };
-            return Ok(());
+            return Ok(0);
         }
 
         // Restore the recurrent sidecar for hybrid models (Qwen3.5/3.6). No-op for
@@ -183,14 +244,11 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
                 );
                 self.kv_system_metrics.fallback_recompute =
                     self.kv_system_metrics.fallback_recompute.saturating_add(1);
-                self.record_prefix_restore_metrics(0);
                 // Undo retain_pages + attach_pages; executor already reset full_attn_kv.
                 self.free_slot_pages(slot);
                 self.radix.release_blocks(&prefix_match.block_ids);
                 self.kv.release_pages(&prefix_match.block_ids);
-                // request.prefill_start_pos stays at 0 (the pre-attach default).
-                request.phase = RequestPhase::Prefilling { progress: 0 };
-                return Ok(());
+                return Ok(0);
             }
         };
 
@@ -218,33 +276,16 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
                 );
                 self.kv_system_metrics.fallback_recompute =
                     self.kv_system_metrics.fallback_recompute.saturating_add(1);
-                self.record_prefix_restore_metrics(0);
                 self.free_slot_pages(slot);
                 self.radix.release_blocks(&prefix_match.block_ids);
                 self.kv.release_pages(&prefix_match.block_ids);
-                request.phase = RequestPhase::Prefilling { progress: 0 };
-                return Ok(());
+                return Ok(0);
             }
         } else if restored_len < prefix_match.matched_len {
             self.kv.truncate_slot(slot, restored_len)?;
         }
 
-        log::info!(
-            "prefix-attach: slot={slot} matched={} restored={restored_len} committed={target}",
-            prefix_match.matched_len,
-        );
-        self.record_prefix_restore_metrics(restored_len);
-
-        request.prefill_start_pos = restored_len;
-        request.reused_prefix_pages = prefix_match.block_ids;
-        request.phase = if request.prefill_start_pos == target {
-            RequestPhase::Decoding
-        } else {
-            RequestPhase::Prefilling {
-                progress: request.prefill_start_pos,
-            }
-        };
-        Ok(())
+        Ok(restored_len)
     }
 
     // record_prefix_tier_hits moved into materialize_prefix_blocks.
