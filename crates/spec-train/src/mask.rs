@@ -45,22 +45,3 @@ pub fn additive(blocks: &[Block], ctx_len: usize, window: Option<usize>) -> Vec<
     }
     m
 }
-
-/// Visible fraction of the score matrix.
-#[must_use]
-pub fn density(blocks: &[Block], ctx_len: usize, window: Option<usize>) -> f32 {
-    let Some(block_size) = blocks.first().map(|b| b.targets.len()) else {
-        return 0.0;
-    };
-    let q_len = blocks.len() * block_size;
-    let visible: usize = blocks
-        .iter()
-        .flat_map(|b| {
-            (0..block_size).map(move |t| {
-                let (lo, hi) = ctx_span(b.anchor, t, ctx_len, window);
-                hi - lo + block_size
-            })
-        })
-        .sum();
-    visible as f32 / (q_len * (ctx_len + q_len)) as f32
-}

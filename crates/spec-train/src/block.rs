@@ -35,14 +35,6 @@ pub struct Block {
     pub eval: Vec<bool>,
 }
 
-impl Block {
-    /// Rows carrying loss — always a prefix of the block.
-    #[must_use]
-    pub fn trained_rows(&self) -> usize {
-        self.eval.iter().take_while(|&&e| e).count()
-    }
-}
-
 /// Positions that may anchor a block: `p` is trainable and so is `p+1`, so the
 /// block has at least one supervised target.
 #[must_use]

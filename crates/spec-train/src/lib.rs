@@ -13,8 +13,6 @@ pub mod backbone;
 pub mod block;
 #[path = "data.rs"]
 pub mod data;
-#[path = "iso_spectrum.rs"]
-pub mod iso_spectrum;
 #[path = "loss.rs"]
 pub mod loss;
 #[path = "markov_head.rs"]
