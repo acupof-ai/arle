@@ -202,7 +202,7 @@ impl Qwen35Model {
     pub(crate) fn from_safetensors_with_tp(
         model_path: &Path,
         max_seq_len: usize,
-        tp: crate::tp::TpRuntime,
+        #[cfg_attr(not(feature = "nccl"), allow(unused_mut))] mut tp: crate::tp::TpRuntime,
         mtp_draft_tokens: Option<usize>,
     ) -> Result<Self> {
         let total_t0 = Instant::now();
