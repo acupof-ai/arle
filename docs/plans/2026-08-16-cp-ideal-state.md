@@ -199,7 +199,18 @@ clamp `prefill_start_pos` to the reduced minimum before `build_forward_plan`
 (lib.rs:906). Files: infer-core/src/prefix.rs, infer-core/src/lib.rs.
 
 T3.2b — 2D sharding (big-bang; pool sharding breaks prefill and decode
-simultaneously, so B–E land together behind the world≥4 2D mode):
+simultaneously, so B–E land together behind the world≥4 2D mode).
+
+Prefill decision (2026-08-17, ckl "A 单次 ring pass"): under 2D the prefill is
+a **single ring pass over the whole prompt** (Megatron model) — chunked
+prefill is abandoned in the 2D regime. The 256K capacity SLO is decode-bound
+(prefill KV is transient), so the ring pass's loss of decode-interleaving /
+preemption / chunked-TTFT for 2D requests is accepted. Industry survey
+(vLLM #26133/#46358, SGLang #21637, Megatron CP): sequence sharding and the
+decode merge are precedented; **chunked-prefill-under-CP is unsolved
+everywhere** (vLLM deferred, Megatron N/A), which is what the single-pass
+decision avoids. Two industry gaps are ARLE differentiators: prefix cache
+under CP (phase C) and hybrid GDN under CP (vLLM Phase 3).
 
 - B. Pool sequence-sharding. `TokenKVPool` (cuda-kernels/paged_kv.rs:57) keeps
   per-rank bare-u32 identity, but under 2D rank (t,c) allocates only shard c's
@@ -214,20 +225,29 @@ simultaneously, so B–E land together behind the world≥4 2D mode):
   c(B)'s page is live); the T3.2a min-reduce aligns the matched length across
   cp ranks — a missing block on any shard truncates the match for all.
   `publish_prefix_blocks` (prefix.rs:294) publishes the local shard's pages.
-- D. Ring prefill. Replace `cp_share_chunk_kv` (qwen35_attention.rs:1088,
-  replicated gather) with ring attention: each rank computes its q-slice's
-  attention over all shards via K/V rotation, writes only its shard's KV. Use
-  T1's ring core (cuda-kernels/ring_attention.rs: `ring_forward_tile`,
-  `ring_block_fwd_merge_fa3`). GDN relay unchanged (qwen35_attention.rs:1341).
+  **Prefill reuse is disabled under 2D initially** (the ring pass recomputes
+  the whole prompt — gathering the paged cached-prefix shard into the ring
+  block is a follow-up); the location table serves decode reuse (multi-turn
+  attach) first.
+- D. Ring prefill (single pass). Replace `cp_share_chunk_kv`
+  (qwen35_attention.rs:1088, replicated gather) with one ring pass over the
+  whole prompt: rank c computes its q-shard (prompt/cp) and KV shard, ring-
+  rotates the KV shards (P2P), attends to all shards via T1's ring core
+  (cuda-kernels/ring_attention.rs: `ring_forward_tile`, `ring_block_fwd_merge_fa3`),
+  writes only its shard's KV. No chunking under 2D. GDN relay unchanged
+  (qwen35_attention.rs:1341) — the recurrent state is cp-replicated, relayed
+  alongside the ring.
 - E. Flash-decoding decode merge. Decode: rank (t,c) computes shard t's heads'
   partial attention over shard c (FA3 split-KV over the local shard), merges
   the (m,l,out) partials across cp (one collective per layer on `comm_stream`),
-  then all-reduces across attn_tp (global). Needs a new cross-rank (m,l,out)
-  merge device kernel (none exists — FA3's split-KV merge is fused in-kernel;
-  host `merge_block` is U2-gate-only). Collective on `comm_stream`
-  (tensor.rs:182, unused by collectives today) with compute↔comm fences
-  (tensor.rs:637). GDN decode: attn_tp-sharded, cp-replicated (redundant
-  across cp, but GDN compute is small).
+  then all-reduces across attn_tp (global). SGLang #21637 validates the shape:
+  pack (output + fp32 LSE), one collective per layer, then a **separate local
+  merge kernel** (not fused) — ARLE's merge math is T1's `merge_block`.
+  Collective = all-gather the cp partials (small: [batch·heads, head_dim]) then
+  a local device merge kernel (new — FA3's split-KV merge is fused in-kernel;
+  host `merge_block` is U2-gate-only). On `comm_stream` (tensor.rs:182, unused
+  by collectives today) with compute↔comm fences (tensor.rs:637). GDN decode:
+  attn_tp-sharded, cp-replicated (redundant across cp, but GDN compute is small).
 
 Files: cuda-kernels/src/{paged_kv,ring_attention}.rs,
 infer-seam/src/{kv_query,prefix_store,lib}.rs,
