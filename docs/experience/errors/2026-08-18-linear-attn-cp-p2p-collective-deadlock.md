@@ -32,10 +32,17 @@ group, not a real NULL pointer — the buffers were properly allocated.
 
 ## Fix
 
-Remove all NCCL groups from the linear attention CP state chain. Ungrouped
-P2P does a host-side rendezvous (brief blocking until the peer posts) but
-never deadlocks — the recv is always posted before the send on the peer
-rank. The broadcast is a standard collective outside a group.
+Remove all NCCL groups from the linear attention CP state chain. NCCL docs
+state `ncclSend`/`ncclRecv` are "blocking for the GPU" — the host call
+returns after enqueuing on the stream; the GPU stream waits for the peer's
+matching op. No host blocking, no deadlock: the recv is always posted
+before the send on the peer rank. The broadcast is a standard collective
+outside a group.
+
+Ungrouped P2P is safe here because the pattern is one-directional (rank N
+recvs, rank N-1 sends) — not mutual send/recv, which is the only case
+NCCL's group-fusion rule applies to ("if multiple ncclSend and ncclRecv
+operations need to progress concurrently to complete, they must be fused").
 
 Deletion-style: 1 insertion, 8 deletions. The dense attention ring prefill
 keeps its groups (P2P-only, no collective — safe).
@@ -43,7 +50,11 @@ keeps its groups (P2P-only, no collective — safe).
 ## Rule
 
 Never group a P2P send/recv with a collective in the same NCCL group.
-`ncclGroupEnd()` blocks on collective submission, trapping the P2P op
-inside. If the P2P op is the prerequisite for the peer reaching the
-collective, the result is a circular wait. P2P and collective get separate
-groups (or no group at all — ungrouped P2P rendezvous is correct).
+`ncclGroupEnd()` blocks until all ops in the group are enqueued — for a
+collective, that means waiting for all ranks to post it. If a P2P op in
+the same group is the prerequisite for the peer reaching that collective,
+the P2P op is trapped inside the blocked `ncclGroupEnd()`, and the result
+is a circular wait. P2P and collective get separate groups, or no group
+at all — ungrouped P2P is GPU-blocking (stream waits for the peer's
+matching op), not host-blocking, and is correct for one-directional
+patterns.
