@@ -66,37 +66,21 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-metal-ninja-
 
-      # Verify Metal C++ shim compiles and Rust type-checks cleanly.
-      - name: cargo check (metal + no-cuda infer lib)
-        run: cargo check -p infer-api --no-default-features --features metal,no-cuda --lib --release
-
-      - name: cargo check (metal + no-cuda CLI)
-        run: cargo check --no-default-features --features metal,no-cuda,cli -p arle --release --bin arle
+      # Test subsumes check: one merged Metal test run for the binary crates
+      # (none have tests/ dirs, so --lib is a no-op) + one Metal typecheck for
+      # the train/autograd libs (their tests/ hold CUDA cases skipped on macOS).
+      # kv-native-sys is covered on Linux (ci.yml test-neutral lane).
+      - name: cargo test (metal + no-cuda)
+        run: >
+          cargo test -p infer-api -p cli -p arle
+          --no-default-features --features metal,no-cuda,cli
+          --lib --release
+          -- --test-threads 1
 
       - name: cargo check (metal train/autograd libs)
         run: |
           cargo check -p autograd --release --features metal --lib
           cargo check -p train --release --features metal --lib
-
-      - name: cargo test + clippy (kv-native-sys POSIX substrate)
-        # POSIX-only persistence substrate (no Metal feature). macOS is the
-        # canonical second POSIX target alongside Linux, so test + clippy here.
-        run: |
-          cargo test -p kv-native-sys --release
-          cargo clippy -p kv-native-sys --release --all-targets -- -D warnings
-
-      - name: cargo test (metal + no-cuda)
-        run: >
-          cargo test -p infer-api
-          --no-default-features --features metal,no-cuda
-          --lib --release
-          -- --test-threads 1
-
-      - name: cargo test (metal + no-cuda CLI crate unit tests)
-        run: cargo test -p cli --release --no-default-features --features metal,no-cuda
-
-      - name: cargo test (metal + no-cuda ARLE CLI tests)
-        run: cargo test --no-default-features --features metal,no-cuda,cli -p arle --release
 
       # Serving is `arle serve` (cli/src/serve.rs); this build is the Metal
       # serve/bench surface and the release-shaped artifact.

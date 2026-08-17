@@ -109,47 +109,23 @@ jobs:
           cargo check -p arle --release --no-default-features --features cuda,no-cuda,cli --bin arle
           cargo check -p cli --release --no-default-features --features cuda,no-cuda,nccl
 
-  # Five parallel lanes; wall-clock = the slowest lane, not the sum.
-  # `--profile release-fast` (cu=16, no LTO, incremental), NOT `--release`:
-  # the release profile's codegen-units=1 + thin-LTO cold build OOM-killed
-  # the 16 GB runner twice ("lost communication", ~50 min in) — test
-  # binaries don't need runtime-perf codegen. Lint stays fast because
-  # clippy runs the dev profile; same lever.
-  test:
-    name: Test (${{ matrix.lane.name }})
+  # Two lanes by feature set (cargo rebuilds on feature change, so crates
+  # sharing a set share one build). `--lib` on the backend lane is a no-op for
+  # infer-api/cli/arle (no tests/ dir) and load-bearing for autograd/train
+  # (their tests/ hold ungated CUDA cases). `--profile release-fast` (cu=16,
+  # no LTO, incremental), NOT `--release`: the release profile's cu=1 +
+  # thin-LTO cold build OOM-killed the 16 GB runner twice — test binaries
+  # don't need runtime-perf codegen.
+  test-backend:
+    name: Test (backend)
     runs-on: ubuntu-latest
     timeout-minutes: 60
-    strategy:
-      fail-fast: false
-      matrix:
-        lane:
-          - name: infer-api
-            cmd: cargo test -p infer-api --profile release-fast --no-default-features --features cpu,no-cuda --lib
-          - name: cli
-            cmd: cargo test -p cli --profile release-fast --no-default-features --features no-cuda
-          - name: arle
-            cmd: cargo test -p arle --profile release-fast --no-default-features --features cpu,no-cuda,cli
-          # Device-neutral crates above the backend seam. infer-core is the
-          # scheduler/RadixCache — the most actively changed runtime code.
-          - name: core
-            cmd: >-
-              cargo test --profile release-fast
-              -p infer-core -p infer-server -p infer-plan -p infer-seam
-              -p infer-moe -p infer-topo -p infer-util -p deepseek-spec -p agent
-          - name: support
-            cmd: cargo test -p chat -p tools -p qwen3-spec -p qwen35-spec -p kv-native-sys -p spec-train --profile release-fast
-          # autograd: leaf crate, lightweight. Always completes, warms the
-          # shared dep cache for the train lane below.
-          - name: autograd
-            cmd: cargo test -p autograd --profile release-fast --features no-cuda --lib
-          # train: heaviest compile chain (train → agent → infer-api → infer-core).
-          # Cold build OOMs the 16 GB runner at default parallelism ("lost
-          # communication" at ~48 min). Cap parallelism to stay under memory;
-          # once warm cache lands the lane runs in budget.
-          - name: train
-            cmd: >-
-              CARGO_BUILD_JOBS=2 CARGO_PROFILE_RELEASE_FAST_CODEGEN_UNITS=4
-              cargo test -p train --profile release-fast --features no-cuda --lib
+    # train is the heaviest chain (train → agent → infer-api → infer-core);
+    # its cold build OOMs the 16 GB runner at default parallelism. Cap jobs
+    # for the whole lane — train dominates wall-clock anyway.
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_PROFILE_RELEASE_FAST_CODEGEN_UNITS: 4
     steps:
       - uses: actions/checkout@v7
 
@@ -159,15 +135,40 @@ jobs:
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
-          # `v2` prefix abandons the poisoned `test-support` cache (an OOM-killed
-          # job never runs the save step, so `cache-on-failure` couldn't rescue it).
-          key: test-v2-${{ matrix.lane.name }}
-          # A failed/cancelled lane still saves its build cache — otherwise one
-          # broken test strands every later run cold (support lane, 2026-07-02).
+          key: test-backend
+          # A failed/cancelled lane still saves its build cache — otherwise
+          # one broken test strands every later run cold.
           cache-on-failure: true
 
-      - name: cargo test (${{ matrix.lane.name }})
-        run: ${{ matrix.lane.cmd }}
+      - name: cargo test (backend)
+        run: >-
+          cargo test -p infer-api -p arle -p cli -p autograd -p train
+          --profile release-fast --no-default-features
+          --features cpu,no-cuda,cli --lib
+
+  test-neutral:
+    name: Test (device-neutral)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: test-neutral
+          cache-on-failure: true
+
+      - name: cargo test (device-neutral)
+        run: >-
+          cargo test --profile release-fast
+          -p infer-core -p infer-server -p infer-plan -p infer-seam
+          -p infer-moe -p infer-topo -p infer-util -p deepseek-spec -p agent
+          -p chat -p tools -p qwen3-spec -p qwen35-spec -p kv-native-sys
+          -p spec-train
 
   fmt:
     name: Format
