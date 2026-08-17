@@ -135,8 +135,8 @@ fn run_config(config: ServeConfig) -> ExitCode {
 
     // Multi-rank TP CUDA models (DSv4, Qwen3.5/3.6 MoE): SPMD (B) split. The parent
     // becomes the engine-less coordinator — binds the relay, spawns all N workers,
-    // and runs the thin coordinator HTTP loop. Single GPU returns `None` and falls
-    // through to the byte-identical in-process path below; dense Qwen3 skips it.
+    // and runs the thin coordinator HTTP loop. Single GPU returns an empty vec and
+    // falls through to the byte-identical in-process path below; dense Qwen3 skips it.
     #[cfg(all(unix, feature = "cuda"))]
     if config.backend == ServeBackend::Cuda
         && infer_api::cuda_model_takes_multiproc_serve(&config.options.model_path)
@@ -145,21 +145,22 @@ fn run_config(config: ServeConfig) -> ExitCode {
             &config.options.model_path,
             &config.options.engine_config,
         ) {
-            Ok(Some(coordinator)) => {
-                let crate::serve_multiproc::MultiprocCoordinator { relay, guard } = coordinator;
+            Ok(groups) if !groups.is_empty() => {
+                let (relays, guards): (Vec<_>, Vec<_>) =
+                    groups.into_iter().map(|c| (c.relay, c.guard)).unzip();
                 eprintln!(
                     "[ARLE serve] starting cuda multiproc coordinator on {}:{}",
                     config.options.bind, config.options.port,
                 );
-                let result = infer_api::serve_coordinator_http(
+                let result = infer_api::serve_coordinator_http_dp(
                     &config.options.model_path,
                     &config.options.bind,
                     config.options.port,
                     config.options.engine_config.max_thinking_tokens,
-                    relay,
+                    relays,
                 );
                 // Keep the worker children alive until the serve loop returns.
-                drop(guard);
+                drop(guards);
                 return match result {
                     Ok(()) => ExitCode::SUCCESS,
                     Err(err) => {
@@ -168,8 +169,8 @@ fn run_config(config: ServeConfig) -> ExitCode {
                     }
                 };
             }
-            // None: single GPU — fall through to the in-process serve below.
-            Ok(None) => {}
+            // Empty: single GPU — fall through to the in-process serve below.
+            Ok(_) => {}
             Err(err) => {
                 eprintln!("[ARLE serve] multiproc coordinator setup failed: {err:#}");
                 return ExitCode::FAILURE;

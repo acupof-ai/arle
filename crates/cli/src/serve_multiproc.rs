@@ -71,6 +71,17 @@ pub(crate) fn world_size_from_env() -> usize {
         .unwrap_or(1)
 }
 
+/// DP group count (default 1). Each group is an independent TP world of
+/// `world_size` ranks on disjoint GPUs.
+#[must_use]
+fn dp_size_from_env() -> usize {
+    std::env::var("INFER_DP_SIZE")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(1)
+}
+
 /// The comma-separated CUDA device ordinals from `INFER_CUDA_DEVICES`, or
 /// `0..world_size` when unset. Used to assign one GPU per worker rank.
 fn cuda_ordinals(world_size: usize) -> Vec<usize> {
@@ -101,19 +112,23 @@ pub(crate) struct MultiprocCoordinator {
 /// COORDINATOR: bind the relay, publish its port, spawn ALL N workers (rank
 /// 0..N-1; rank 0 owns the visible output), accept their connects, and boot-ping.
 /// Returns the accepted relay + child guard for the coordinator HTTP loop; on
-/// `world_size <= 1` returns `None` (single GPU, byte-identical serve). The parent
-/// owns no TP rank and joins no collective, so it is never the missing rank.
+/// `world_size <= 1` returns an empty vec (single GPU, byte-identical serve). The
+/// parent owns no TP rank and joins no collective, so it is never the missing
+/// rank. With `INFER_DP_SIZE > 1`, spawns M independent TP groups on disjoint
+/// GPUs and returns one [`MultiprocCoordinator`] per group.
 pub(crate) fn bind_relay_and_spawn_workers(
     model_path: &str,
     engine_config: &EngineLoadConfig,
-) -> Result<Option<MultiprocCoordinator>> {
+) -> Result<Vec<MultiprocCoordinator>> {
     let world_size = world_size_from_env();
     if world_size <= 1 {
         log::info!(
             "[multiproc-coord] world_size={world_size}; serving single-process (no workers)"
         );
-        return Ok(None);
+        return Ok(Vec::new());
     }
+
+    let dp_size = dp_size_from_env();
 
     // Config parity (load-bearing): workers must build from the SAME config — any
     // scheduler-knob divergence diverges the planner across ranks → NCCL deadlock.
@@ -125,18 +140,6 @@ pub(crate) fn bind_relay_and_spawn_workers(
         std::env::set_var("ARLE_WORKER_ENGINE_CONFIG", &config_json);
     }
 
-    // 0. Mint the NCCL rendezvous id ONCE and publish via env before spawn so every
-    //    worker inherits the SAME handle (executors read `INFER_NCCL_UNIQUE_ID` at
-    //    construction). Skip if already set (an external launcher provided it).
-    #[cfg(feature = "nccl")]
-    if std::env::var("INFER_NCCL_UNIQUE_ID").is_err() {
-        let hex = infer_api::mint_nccl_unique_id_hex().context("mint NCCL unique id")?;
-        // SAFETY: single CLI thread, pre-spawn, pre-tokio (same as the relay-port write).
-        unsafe {
-            std::env::set_var("INFER_NCCL_UNIQUE_ID", &hex);
-        }
-        log::info!("[multiproc-coord] minted NCCL unique id (published via INFER_NCCL_UNIQUE_ID)");
-    }
     // cfg!() (not #[cfg]) so the relay/spawn code below stays reachable in
     // non-nccl builds — an attribute-cfg bail makes the rest of the function
     // unreachable and trips -D warnings on the cuda,no-cuda typecheck lane.
@@ -147,51 +150,76 @@ pub(crate) fn bind_relay_and_spawn_workers(
         );
     }
 
-    // 1. Bind relay BEFORE spawning workers so the port can be exported via env.
-    let pending = RelayCoordinator::bind().context("multiproc relay bind")?;
-    // SAFETY: env write happens before child spawn, on the single CLI thread
-    // (clap parsing is done, no tokio runtime built yet for the serve path).
-    unsafe {
-        std::env::set_var("ARLE_COORDINATOR_RELAY_PORT", pending.port().to_string());
+    let mut groups = Vec::with_capacity(dp_size);
+    for g in 0..dp_size {
+        // Per-group NCCL rendezvous id: each TP group needs its own communicator.
+        // For dp_size=1, skip if an external launcher already set it.
+        #[cfg(feature = "nccl")]
+        if dp_size > 1 || std::env::var("INFER_NCCL_UNIQUE_ID").is_err() {
+            let hex = infer_api::mint_nccl_unique_id_hex().context("mint NCCL unique id")?;
+            // SAFETY: single CLI thread, pre-spawn, pre-tokio (same as the relay-port write).
+            unsafe {
+                std::env::set_var("INFER_NCCL_UNIQUE_ID", &hex);
+            }
+            log::info!(
+                "[multiproc-coord] DP group {g}: minted NCCL unique id \
+                 (published via INFER_NCCL_UNIQUE_ID)"
+            );
+        }
+
+        // Bind relay BEFORE spawning workers so the port can be exported via env.
+        let pending = RelayCoordinator::bind().context("multiproc relay bind")?;
+        // SAFETY: env write happens before child spawn, on the single CLI thread
+        // (clap parsing is done, no tokio runtime built yet for the serve path).
+        unsafe {
+            std::env::set_var("ARLE_COORDINATOR_RELAY_PORT", pending.port().to_string());
+        }
+        log::info!(
+            "[multiproc-coord] DP group {g}: relay bound at 127.0.0.1:{} \
+             (published via ARLE_COORDINATOR_RELAY_PORT)",
+            pending.port()
+        );
+
+        // Spawn ALL N worker processes (rank 0..world_size); rank 0 is a child too.
+        let mut children = spawn_workers(model_path, world_size, g, dp_size)?;
+
+        // Accept ALL N worker relay connects (rank 0 included).
+        let mut relay = pending
+            .accept_symmetric(world_size, RELAY_TIMEOUT)
+            .context("multiproc relay accept")?;
+        log::info!(
+            "[multiproc-coord] DP group {g}: relay accepted {} worker connects (ranks {:?})",
+            relay.worker_count(),
+            relay.worker_ranks()
+        );
+
+        // Boot ping — proves every worker's relay-receiver thread is alive before
+        // the coordinator opens HTTP.
+        relay
+            .broadcast(&RelayEnvelope::BootPing { request_id: 0 })
+            .context("multiproc relay boot-ping")?;
+
+        // Engine-ready barrier: block until all N ranks report `EngineReady` before
+        // binding HTTP, else requests broadcast into socket buffers while workers are
+        // still in NCCL rendezvous. Fails fast if a child exits during the build.
+        let ready_timeout = engine_ready_timeout(model_path);
+        log::info!(
+            "[multiproc-coord] DP group {g}: engine-ready barrier: {ready_timeout:?} \
+             (checkpoint-scaled)"
+        );
+        wait_all_engines_ready(&relay, &mut children, world_size, ready_timeout)?;
+        log::info!("[multiproc-coord] DP group {g}: all {world_size} worker engines ready");
+
+        groups.push(MultiprocCoordinator {
+            relay,
+            guard: CoordinatorGuard {
+                _children: children,
+            },
+        });
     }
-    log::info!(
-        "[multiproc-coord] relay bound at 127.0.0.1:{} (published via ARLE_COORDINATOR_RELAY_PORT)",
-        pending.port()
-    );
 
-    // 2. Spawn ALL N worker processes (rank 0..world_size); rank 0 is a child too.
-    let mut children = spawn_workers(model_path, world_size)?;
-
-    // 3. Accept ALL N worker relay connects (rank 0 included).
-    let mut relay = pending
-        .accept_symmetric(world_size, RELAY_TIMEOUT)
-        .context("multiproc relay accept")?;
-    log::info!(
-        "[multiproc-coord] relay accepted {} worker connects (ranks {:?})",
-        relay.worker_count(),
-        relay.worker_ranks()
-    );
-
-    // 4. Boot ping — proves every worker's relay-receiver thread is alive before
-    //    the coordinator opens HTTP.
-    relay
-        .broadcast(&RelayEnvelope::BootPing { request_id: 0 })
-        .context("multiproc relay boot-ping")?;
-
-    // 5. Engine-ready barrier: block until all N ranks report `EngineReady` before
-    //    binding HTTP, else requests broadcast into socket buffers while workers are
-    //    still in NCCL rendezvous. Fails fast if a child exits during the build.
-    let ready_timeout = engine_ready_timeout(model_path);
-    log::info!("[multiproc-coord] engine-ready barrier: {ready_timeout:?} (checkpoint-scaled)");
-    wait_all_engines_ready(&relay, &mut children, world_size, ready_timeout)?;
-    log::info!("[multiproc-coord] all {world_size} worker engines ready; opening HTTP");
-
-    Ok(Some(MultiprocCoordinator {
-        relay,
-        guard: CoordinatorGuard {
-            _children: children,
-        },
-    }))
+    log::info!("[multiproc-coord] all {dp_size} DP group(s) ready; opening HTTP");
+    Ok(groups)
 }
 
 /// Block until all `world_size` ranks report [`RelayEnvelope::EngineReady`], or
@@ -626,9 +654,14 @@ fn dummy_file() -> std::fs::File {
         .expect("/dev/null open for dummy_file")
 }
 
-fn spawn_workers(model_path: &str, world_size: usize) -> Result<WorkerChildren> {
+fn spawn_workers(
+    model_path: &str,
+    world_size: usize,
+    group: usize,
+    dp_size: usize,
+) -> Result<WorkerChildren> {
     let exe = std::env::current_exe().context("current_exe")?;
-    let ordinals = cuda_ordinals(world_size);
+    let ordinals = cuda_ordinals(world_size * dp_size);
     let mut children = Vec::with_capacity(world_size);
 
     // SPMD (B): spawn ALL ranks 0..world_size as identical child workers (rank 0 is
@@ -640,7 +673,8 @@ fn spawn_workers(model_path: &str, world_size: usize) -> Result<WorkerChildren> 
         let (child_read_end, parent_write_end) = worker_parent_pipe(rank)?;
         let child_read_raw = child_read_end.as_raw_fd();
 
-        let cuda_ordinal = ordinals.get(rank).copied().unwrap_or(rank);
+        let gpu_index = group * world_size + rank;
+        let cuda_ordinal = ordinals.get(gpu_index).copied().unwrap_or(gpu_index);
 
         let mut cmd = std::process::Command::new(&exe);
         // Forward every CLI arg so the child sees identical args; it short-
