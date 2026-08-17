@@ -37,6 +37,10 @@ pub(crate) enum QuantFormat {
     W8A16 {
         group_size: usize,
     },
+    /// SGLang CUTLASS W4AFP8: packed signed INT4 weight (I8 [N, K//2]),
+    /// interleaved BF16 scales [K//512, N*4]. Activations quantized to FP8
+    /// per-tensor at runtime.
+    W4Afp8,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -258,32 +262,43 @@ pub(crate) fn detect_quant_format(
                 scale_names: vec![format!("{base}.weight_scale")],
             }
         }
-        // W8A16: signed INT8 weights, NOT packed (1 byte/elem, shape ==
-        // logical), per-row per-column-group BF16 scale. Distinct from W4A16
-        // by dtype (I8 vs U8), so no ambiguity.
+        // W4AFP8 (SGLang CUTLASS): packed signed INT4 weight (I8 [N, K//2]),
+        // interleaved BF16 scales [K//512, N*4]. Must be checked before W8A16
+        // (both are I8+BF16; the scale shape distinguishes them).
         Dtype::I8
             if tensors
                 .get(&format!("{base}.weight_scale"))
                 .is_some_and(|s| s.dtype == Dtype::BF16) =>
         {
             let scale = tensor_by_name(tensors, &format!("{base}.weight_scale"))?;
-            ensure!(
-                scale.shape.len() == 2 && scale.shape[1] != 0,
-                "{name}: W8A16 weight_scale must be rank-2 with nonzero K, got {:?}",
-                scale.shape
-            );
-            let group_size = tensor.shape[1] / scale.shape[1];
-            ensure!(
-                group_size > 0 && tensor.shape[1] % group_size == 0,
-                "{name}: W8A16 logical K {} not group-aligned to {group_size}",
-                tensor.shape[1]
-            );
-            QuantTensorView {
-                name: name.to_owned(),
-                logical_shape: tensor.shape.clone(),
-                storage_dtype: tensor.dtype,
-                format: QuantFormat::W8A16 { group_size },
-                scale_names: vec![format!("{base}.weight_scale")],
+            if scale.shape.len() == 2
+                && scale.shape[1] == tensor.shape[0] * 4
+                && tensor.shape[1] / 256 == scale.shape[0]
+                && tensor.shape[1].is_multiple_of(256)
+            {
+                QuantTensorView {
+                    name: name.to_owned(),
+                    logical_shape: vec![tensor.shape[0], tensor.shape[1] * 2],
+                    storage_dtype: tensor.dtype,
+                    format: QuantFormat::W4Afp8,
+                    scale_names: vec![format!("{base}.weight_scale")],
+                }
+            } else {
+                // W8A16: signed INT8 weights, NOT packed (1 byte/elem, shape ==
+                // logical), per-row per-column-group BF16 scale.
+                let group_size = tensor.shape[1] / scale.shape[1];
+                ensure!(
+                    group_size > 0 && tensor.shape[1] % group_size == 0,
+                    "{name}: W8A16 logical K {} not group-aligned to {group_size}",
+                    tensor.shape[1]
+                );
+                QuantTensorView {
+                    name: name.to_owned(),
+                    logical_shape: tensor.shape.clone(),
+                    storage_dtype: tensor.dtype,
+                    format: QuantFormat::W8A16 { group_size },
+                    scale_names: vec![format!("{base}.weight_scale")],
+                }
             }
         }
         _ => return Ok(None),
@@ -487,6 +502,31 @@ pub(crate) fn validate_scale_shapes(
             ensure!(
                 scale.shape == expected,
                 "{}: W8A16 weight_scale shape {:?} != {:?}",
+                view.scale_names[0],
+                scale.shape,
+                expected
+            );
+            Ok(())
+        }
+        QuantFormat::W4Afp8 => {
+            ensure!(
+                view.logical_shape.len() == 2,
+                "{}: W4AFP8 weights must be rank-2",
+                view.name
+            );
+            let scale = tensor_by_name(tensors, &view.scale_names[0])?;
+            ensure!(
+                scale.dtype == Dtype::BF16,
+                "{}: W4AFP8 weight_scale must be BF16, got {:?}",
+                view.scale_names[0],
+                scale.dtype
+            );
+            let n = view.logical_shape[0];
+            let k = view.logical_shape[1];
+            let expected = [k / 512, n * 4];
+            ensure!(
+                scale.shape == expected,
+                "{}: W4AFP8 weight_scale shape {:?} != {:?}",
                 view.scale_names[0],
                 scale.shape,
                 expected
