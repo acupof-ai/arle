@@ -686,49 +686,6 @@ extern "C" CUresult dsv4_pack_local_experts_cuda(
   return (CUresult)cudaGetLastError();
 }
 
-__global__ void dsv4_scatter_packed_expert_kernel(
-    const uint16_t *__restrict__ expert_out,
-    uint16_t *__restrict__ routed_out,
-    const int32_t *__restrict__ packed_token,
-    const float *__restrict__ packed_weight,
-    int start_slot,
-    int count,
-    int hidden_dim) {
-  int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  int total = count * hidden_dim;
-  if (idx >= total) return;
-  int row = idx / hidden_dim;
-  int col = idx - row * hidden_dim;
-  int slot = start_slot + row;
-  int token = packed_token[slot];
-  float weight = packed_weight[slot];
-  int out_idx = token * hidden_dim + col;
-  float prev = dsv4_route_bf16_to_f32(routed_out[out_idx]);
-  float value = dsv4_route_bf16_to_f32(expert_out[idx]);
-  routed_out[out_idx] = dsv4_route_f32_to_bf16_bits(prev + weight * value);
-}
-
-extern "C" CUresult dsv4_scatter_packed_expert_cuda(
-    const uint16_t *expert_out,
-    uint16_t *routed_out,
-    const int32_t *packed_token,
-    const float *packed_weight,
-    int start_slot,
-    int count,
-    int hidden_dim,
-    CUstream stream) {
-  if (start_slot < 0 || count < 0 || hidden_dim <= 0) {
-    return CUDA_ERROR_INVALID_VALUE;
-  }
-  int total = count * hidden_dim;
-  if (total == 0) return CUDA_SUCCESS;
-  int grid = (total + DSV4_ROUTE_BLOCK - 1) / DSV4_ROUTE_BLOCK;
-  dsv4_scatter_packed_expert_kernel<<<grid, DSV4_ROUTE_BLOCK, 0, (cudaStream_t)stream>>>(
-      expert_out, routed_out, packed_token, packed_weight, start_slot, count,
-      hidden_dim);
-  return (CUresult)cudaGetLastError();
-}
-
 __global__ void dsv4_pack_expert_ranks_kernel(
     const uint16_t *__restrict__ hidden,
     const int32_t *__restrict__ indices,
