@@ -1,6 +1,6 @@
 # Observability infrastructure: GPU/host sampling + JSONL storage + dashboard — 2026-08-17
 
-> Status: Shipped (Mac typecheck + infer-server tests pass; CUDA tests pending remote)
+> Status: Shipped (Mac typecheck + infer-server tests pass; V100 single-process verified; multiproc TP pending remote)
 
 ## Context
 
@@ -23,8 +23,8 @@ only (via `INFER_TP_RANK`). On query failure, marks the existing sample as
 `stale` rather than discarding it.
 
 **Host sampler** (`crates/infer-server/src/observe.rs`): sysinfo-based
-background thread sampling CPU%, RAM, and disk% every 10 s. Same static
-`RwLock` + `OnceLock` pattern.
+sampling of CPU%, RAM, and disk% every 10 s, inline in the observe task
+thread. Disk refresh every 30 ticks (5 min).
 
 **JSONL storage**: day-segmented append-only files
 (`observe-YYYY-MM-DD.jsonl`). ~5 MB/day at 10 s cadence. 30-day retention
@@ -37,10 +37,19 @@ process exit.
 
 **API**:
 - `GET /v1/observe/query?range=1h` — time-series samples from disk
-- `GET /v1/observe/latest` — most recent sample
 - `GET /dashboard` — self-contained HTML dashboard (vanilla JS/SVG, no CDN,
   auto-refresh 10 s, 9 charts: GPU util, VRAM, CPU, RAM, disk, token throughput,
   cache hit rate, TTFT, TPOT)
+
+**Multiproc coordinator** (`cf028de9d`): the coordinator process is engine-less
+in TP mode — workers use `CudaWorkerEngine` directly, so `spawn_observe_task`
+was never called and the JSONL store stayed empty. Fixed by adding
+`spawn_observe_task_coordinator`: a background thread with its own
+current-thread tokio runtime that queries rank-0 stats via the existing
+`StatsQuery` relay every 10 s and writes to the same JSONL store. The flock
+singleton dedupes against the single-process task when both run (local relay
+mode). Shared sampling/persistence logic extracted into `sample_host`,
+`write_sample`, `retention_days`.
 
 **Existing endpoints extended**: `/v1/stats` and `/metrics` now include GPU
 samples (utilization, memory, temperature, power per device).
@@ -53,7 +62,7 @@ samples (utilization, memory, temperature, power per device).
 | `crates/infer-cuda/src/gpu_sample.rs` | New: nvidia-smi background sampler |
 | `crates/infer-cuda/src/lib.rs` | Wire `gpu_sample::latest()` into `stats()` |
 | `crates/infer-server/src/observe.rs` | New: host sampler + JSONL storage + query |
-| `crates/infer-server/src/coordinator.rs` | 3 new routes |
+| `crates/infer-server/src/coordinator.rs` | 2 new routes + `spawn_observe_task_coordinator` |
 | `crates/infer-server/src/dashboard.html` | New: 349-line dashboard |
 | `crates/infer-server/src/execution.rs` | `CounterSnapshot.gpu` |
 | `crates/infer-server/src/metrics.rs` | 5 per-GPU Prometheus series |
@@ -71,10 +80,11 @@ subprocess every 2 s on rank 0.
 
 ## Tests
 
-- `infer-server`: 7 tests pass (4 observe unit tests + 3 existing)
-- `infer-cuda`: 3 gpu_sample parse tests (pending remote CUDA build)
-- Mac typecheck: `cargo check -p infer-api --release --no-default-features --features cuda,no-cuda --lib` passes
-- Clippy: `-D warnings` clean on infer-server + infer-api (Mac feature set)
+- `infer-server`: 4 observe unit tests pass
+- Mac typecheck + clippy `-D warnings`: clean
+- V100 single-process: `/v1/observe/query` returns 19 samples (10 s cadence),
+  GPU/CPU/RAM data verified, `/dashboard` serves 11.9 KB HTML
+- Multiproc TP: pending remote verification (8×H20)
 
 ## Rule
 
