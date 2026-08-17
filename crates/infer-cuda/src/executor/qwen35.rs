@@ -754,7 +754,7 @@ impl Qwen35CudaExecutor {
 
         // Whole-slot spill: snapshots stored as 16 MiB chunked blobs — a whole image
         // never fits one fixed page, and the store's size contract is per-page.
-        let tier_budget_bytes = default_t1_budget_bytes(DEFAULT_DRAM_FRACTION);
+        let tier_budget_bytes = default_t1_budget_per_rank();
         let slot_tier = KvTierStore::with_budget(tier_budget_bytes, BLOB_CHUNK_BYTES);
 
         // Single-GPU only: NCCL all-reduce is not graph-capturable on this stack.

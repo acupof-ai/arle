@@ -200,10 +200,7 @@ impl Dsv4CudaExecutor {
             .transpose()?;
         model.boot_mega_moe(num_slots.max(256))?;
         // Chunked blobs: a DSv4 slot image is far larger than one fixed page.
-        let slot_tier = KvTierStore::with_budget(
-            default_t1_budget_bytes(DEFAULT_DRAM_FRACTION),
-            BLOB_CHUNK_BYTES,
-        );
+        let slot_tier = KvTierStore::with_budget(default_t1_budget_per_rank(), BLOB_CHUNK_BYTES);
         let exec = Self {
             model,
             slots,
@@ -218,7 +215,7 @@ impl Dsv4CudaExecutor {
             mtp_accept_ema: 1.0,
             mtp_skip_streak: 0,
             prefix_state: crate::attention::Dsv4PrefixStatePool::new(
-                default_t1_budget_bytes(DEFAULT_DRAM_FRACTION),
+                default_t1_budget_per_rank(),
                 prefix_entry_bytes,
             ),
             pending_prefix_captures: VecDeque::new(),
