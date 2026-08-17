@@ -1,0 +1,21 @@
+# CP baseline battery — model identity and run config.
+# Models are identified by HF repo ID, not local path, so a baseline is
+# reproducible on any host that can fetch them.
+
+[models.trunk]
+hf_id = "bottlecapai/ThinkingCap-Qwen3.6-27B-FP8"
+quantization = "FP8"
+
+[models.dspark_draft]
+hf_id = "pablohassan/Qwen3.6-27B-DSpark-FR"
+# Converted to the deepspec-native layout via:
+#   scripts/convert_dspark_speculators.py <hf-cache-dir> dspark-fr-native
+
+[run]
+tp_size = 8
+cp_sizes = [1, 2]
+kv_cache_dtype = "bf16"
+needle_lengths = [115, 180, 241, 300, 446, 1000, 2000, 4000, 8000]
+needle_runs = 3
+needle_template = "qwen3_nonthink"
+ttft_prompt_tokens = 128889
