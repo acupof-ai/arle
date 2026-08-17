@@ -1592,38 +1592,43 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         };
         // Matching runs over the committed stream (#156); borrowed unless the
         // candidate is a recompute-resumed victim with generated tokens.
-        let reuse_matched_len = if self.config.enable_prefix_cache {
-            let committed = candidate.committed_cow();
-            let matched = self.radix.peek_longest_prefix_match(&committed);
-            let prefix_match = Self::clamp_prefix_to_backend(
-                &mut self.executor,
-                self.radix.block_size(),
-                matched,
-                &committed,
-            );
-            // Backends without page-radix reuse (DSv4) may still hold a
-            // position-0 whole-slot prefix image. The page route reports
-            // `matched_len == 0` for them, so budget the prefill/pages against
-            // the executor's cached prefix length when it is longer. This only
-            // affects budgeting; the actual restore happens at attach below.
-            // Skipped for swap re-admissions: they restore the FULL sequence
-            // via `restore_swapped_slot` (consuming the slot) and never take
-            // the cached-prefix attach path, so the cached length is
-            // irrelevant to their prefill (which is 0).
-            let cached = if candidate.swap_key.is_none() {
-                match self.executor.prefix_reuse() {
-                    Some(reuse) => reuse
-                        .cached_prefix_match_len(&committed)?
-                        .min(committed.len()),
-                    None => 0,
-                }
+        // CP sharding: the ring pass recomputes the whole prompt, so there is
+        // no prefix reuse to budget. The radix match + clamp issued a
+        // tp_sync_min per candidate; divergent admission-loop iteration counts
+        // deadlocked cross-communicator (global TP vs attn_cp).
+        let reuse_matched_len =
+            if self.config.enable_prefix_cache && self.executor.kv_shard_spec().is_none() {
+                let committed = candidate.committed_cow();
+                let matched = self.radix.peek_longest_prefix_match(&committed);
+                let prefix_match = Self::clamp_prefix_to_backend(
+                    &mut self.executor,
+                    self.radix.block_size(),
+                    matched,
+                    &committed,
+                );
+                // Backends without page-radix reuse (DSv4) may still hold a
+                // position-0 whole-slot prefix image. The page route reports
+                // `matched_len == 0` for them, so budget the prefill/pages against
+                // the executor's cached prefix length when it is longer. This only
+                // affects budgeting; the actual restore happens at attach below.
+                // Skipped for swap re-admissions: they restore the FULL sequence
+                // via `restore_swapped_slot` (consuming the slot) and never take
+                // the cached-prefix attach path, so the cached length is
+                // irrelevant to their prefill (which is 0).
+                let cached = if candidate.swap_key.is_none() {
+                    match self.executor.prefix_reuse() {
+                        Some(reuse) => reuse
+                            .cached_prefix_match_len(&committed)?
+                            .min(committed.len()),
+                        None => 0,
+                    }
+                } else {
+                    0
+                };
+                prefix_match.matched_len.max(cached)
             } else {
                 0
             };
-            prefix_match.matched_len.max(cached)
-        } else {
-            0
-        };
         let prefill_tokens = candidate.committed_len().saturating_sub(reuse_matched_len);
         if prefill_tokens > 0 && *active_prefills >= max_prefills {
             return Ok(AdmitOutcome::Throttled);
@@ -1673,20 +1678,23 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             // Whole-slot re-admission: restore the swapped device image
             // and resume decode (falls back to recompute internally).
             self.restore_swapped_slot(slot, &mut request, key)?;
-        } else {
+        } else if self.executor.kv_shard_spec().is_none() {
+            // C.3: under 2D the ring pass recomputes the whole prompt — the
+            // ring path does not gather the paged cached-prefix shard into
+            // the ring block. Skip match+attach so prefill starts at 0.
+            // The empty-match attach issued two tp_sync_min collectives per
+            // request; divergent admission-loop iteration counts deadlocked
+            // cross-communicator. Fresh requests already carry the
+            // prefill_start_pos=0 / Prefilling{0} state the empty-attach sets.
             let committed = request.committed_tokens();
-            // C.3: under 2D the ring pass recomputes the whole prompt — the ring
-            // path does not gather the paged cached-prefix shard into the ring
-            // block (a follow-up). Skip match+attach so prefill starts at 0.
-            let prefix_match =
-                if self.config.enable_prefix_cache && self.executor.kv_shard_spec().is_none() {
-                    // Tier-aware: demoted blocks in the match are promoted
-                    // back into fresh pages here, so attach sees a
-                    // resident-only match.
-                    self.lookup_prefix_for_attach(&committed)?
-                } else {
-                    PrefixMatch::empty()
-                };
+            let prefix_match = if self.config.enable_prefix_cache {
+                // Tier-aware: demoted blocks in the match are promoted
+                // back into fresh pages here, so attach sees a
+                // resident-only match.
+                self.lookup_prefix_for_attach(&committed)?
+            } else {
+                PrefixMatch::empty()
+            };
             self.attach_prefix_to_request(slot, &mut request, &committed, prefix_match)?;
         }
 

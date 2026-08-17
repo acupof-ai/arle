@@ -73,31 +73,6 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             prefix_match.block_ids.truncate(serveable);
             prefix_match.matched_len = serveable.saturating_mul(block_size);
         }
-        // CP replication: the raw matched length diverges across cp ranks —
-        // a rank-local eviction severs the block only on the owning shard
-        // while peers keep walking the stale replica. Align to the world min
-        // (the residency rule: block B is resident iff shard B%cp's page is
-        // live). This is the one choke point every prefix match passes
-        // through — admission budgeting AND attach — so the admission
-        // decision sees aligned lengths too; a divergent budget would
-        // desync the SPMD admission loop. Gated to sharded pools: with
-        // cp=1 the per-rank trees are identical.
-        // SPMD: call the reduce unconditionally under sharding — a rank with
-        // matched_len=0 must still enter the collective, else a peer's reduce
-        // hangs on collective-count divergence. Reducing 0 is harmless.
-        if executor.kv_shard_spec().is_some() {
-            match executor.tp_sync_min(prefix_match.matched_len) {
-                Ok(aligned) if aligned < prefix_match.matched_len => {
-                    let keep = aligned / block_size;
-                    prefix_match.block_ids.truncate(keep);
-                    prefix_match.matched_len = keep.saturating_mul(block_size);
-                }
-                Ok(_) => {}
-                Err(err) => {
-                    log::error!("prefix match cross-rank align failed: {err:#}");
-                }
-            }
-        }
         prefix_match
     }
 
