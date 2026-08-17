@@ -778,10 +778,6 @@ pub fn capture_rollout_logprobs(
 /// `window_size` (reuse `--writeback-window`) bounds each `[1, w, vocab]` tile;
 /// unlike the CE path a full-vocab logit tile is inherent to KL, so prefer a
 /// smaller window here than for masked CE.
-///
-/// `entropy_weight > 0` (AEPO) is not yet wired — per-position entropy weighting
-/// needs the pre-reduction per-position KL, which `kl_distill_loss_chunked`
-/// collapses; it is flagged (loud TODO log), never silently dropped.
 #[allow(clippy::too_many_arguments)]
 pub fn masked_gkd_writeback_step<O: Optimizer, T: TeacherForward + ?Sized>(
     student: &Qwen35Model,
@@ -795,7 +791,6 @@ pub fn masked_gkd_writeback_step<O: Optimizer, T: TeacherForward + ?Sized>(
     vocab: usize,
     window_size: usize,
     temperature: f32,
-    entropy_weight: f32,
     store: &mut TensorStore,
 ) -> Result<f32> {
     if prompt_ids.is_empty() {
@@ -813,16 +808,6 @@ pub fn masked_gkd_writeback_step<O: Optimizer, T: TeacherForward + ?Sized>(
             "GKD writeback teacher vocab_size {} != student vocab {vocab}",
             teacher.vocab_size()
         )));
-    }
-    if entropy_weight > 0.0 {
-        // AEPO entropy weighting stub — flagged, not silently dropped. TODO: expose
-        // the per-position KL before reduction so each position can be scaled by
-        // (1 + w * normalized_student_entropy); kl_distill_loss_chunked currently
-        // returns only the reduced mean.
-        eprintln!(
-            "[gkd-writeback] TODO --gkd-entropy-weight={entropy_weight} is NOT YET \
-             IMPLEMENTED (needs pre-reduction per-position KL); running UNWEIGHTED KL"
-        );
     }
 
     let prompt_len = prompt_ids.len();

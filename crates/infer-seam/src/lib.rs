@@ -775,12 +775,6 @@ impl CooperativeGovernor {
         }
     }
 
-    #[must_use]
-    pub fn with_admission(mut self, admission: AdmissionVerdict) -> Self {
-        self.admission = admission;
-        self
-    }
-
     /// Yield every `n` scheduler ticks. `0` disables periodic yield.
     #[must_use]
     pub fn with_yield_every_ticks(mut self, n: usize) -> Self {

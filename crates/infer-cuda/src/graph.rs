@@ -56,11 +56,6 @@ impl CudaGraphState {
         }
     }
 
-    /// Set whole-step bypass (per-portion states record into the outer capture).
-    pub fn set_bypass(&mut self, bypass: bool) {
-        self.bypass = bypass;
-    }
-
     /// Re-arm `n` eager warm runs without dropping the captured graph. Called
     /// at request boundaries (slot reset): the next step runs eagerly so
     /// host-side per-request work (ring bootstrap, compressed bulk pack) can

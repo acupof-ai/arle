@@ -430,13 +430,6 @@ impl ChatMessage {
     }
 
     #[must_use]
-    pub fn has_media_content(&self) -> bool {
-        self.content
-            .as_ref()
-            .is_some_and(ChatContent::has_media_content)
-    }
-
-    #[must_use]
     pub(crate) fn template_content(&self) -> serde_json::Value {
         self.content.as_ref().map_or(
             serde_json::Value::String(String::new()),
@@ -465,14 +458,6 @@ impl ChatContent {
                         .flatten()
                 })
                 .collect(),
-        }
-    }
-
-    #[must_use]
-    pub fn has_media_content(&self) -> bool {
-        match self {
-            Self::Text(_) => false,
-            Self::Parts(parts) => parts.iter().any(ChatContentPart::is_media),
         }
     }
 
@@ -511,10 +496,6 @@ impl ChatContentPart {
             "input_audio" => "audio",
             other => other,
         }
-    }
-
-    fn is_media(&self) -> bool {
-        matches!(self.normalized_kind(), "image" | "audio" | "video")
     }
 
     fn to_template_value(&self) -> serde_json::Value {

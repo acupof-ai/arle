@@ -111,7 +111,6 @@ pub fn apply_runtime_flags(f: &CudaRuntimeFlags) {
         f.dsv4_flashmla_decode
             .map(|on| on && cuda_kernels::HAS_FLASHMLA),
     );
-    cuda_kernels::tensor::set_marlin_w4_fp8_prefill(f.marlin_w4_fp8_prefill);
     cuda_kernels::tensor::set_mempool_retain(f.mempool_retain);
 }
 

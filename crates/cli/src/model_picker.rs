@@ -1,7 +1,7 @@
 //! Interactive model selection UI.
 //!
 //! Uses `dialoguer::Select` for the main picker and `dialoguer::Input` +
-//! nucleo fuzzy filtering for HuggingFace search.
+//! HuggingFace model search and picker.
 //!
 //! `dialoguer::Select` assumes each item occupies one terminal row. Long model
 //! paths can wrap and desync cursor math, so every displayed item is forced

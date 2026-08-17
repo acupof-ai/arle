@@ -963,12 +963,6 @@ impl RelayCoordinator {
         Ok(PendingRelayCoordinator { port, listener })
     }
 
-    /// Convenience: bind + accept in one call. Only useful when the children are
-    /// already running (e.g. in tests where both sides race at startup).
-    pub fn bind_and_accept(world_size: usize, accept_timeout: Duration) -> Result<Self> {
-        Self::bind()?.accept(world_size, accept_timeout)
-    }
-
     /// Build a `RelayCoordinator` backed by a single in-process local "worker" (rank 0).
     /// Returns the relay + the engine-side channels:
     /// - `engine_recv`: engine reads from this (TickAdmissions / StatsQuery from coordinator)
@@ -1063,52 +1057,11 @@ impl RelayCoordinator {
         }
     }
 
-    pub fn register_completion_sink(
-        &mut self,
-        request_id: u64,
-        sink: tokio::sync::mpsc::UnboundedSender<RelayCompletionDelta>,
-    ) -> Result<()> {
-        let mut sinks = self
-            .completion_sinks
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if sinks.insert(request_id, sink).is_some() {
-            bail!("RelayCoordinator duplicate completion sink for request_id={request_id}");
-        }
-        Ok(())
-    }
-
-    pub fn unregister_completion_sink(&mut self, request_id: u64) {
-        let mut sinks = self
-            .completion_sinks
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        sinks.remove(&request_id);
-    }
-
     /// Broadcast an envelope to every connected worker. On the first write
     /// error, returns immediately — caller decides whether to drop the
     /// coordinator (workers exit) or retry.
     pub fn broadcast(&mut self, envelope: &RelayEnvelope) -> Result<()> {
         for (&rank, channel) in self.workers.iter_mut() {
-            channel.send(envelope).with_context(|| {
-                format!("RelayCoordinator write envelope to worker rank {rank}")
-            })?;
-        }
-        Ok(())
-    }
-
-    /// Send an envelope to a selected global-rank set. A rank absent from the
-    /// worker map (e.g. rank 0 in the legacy in-process layout) is skipped.
-    pub fn send_to_ranks(&mut self, ranks: &[usize], envelope: &RelayEnvelope) -> Result<()> {
-        for &rank in ranks {
-            let Some(channel) = self.workers.get_mut(&rank) else {
-                // Legacy layout: rank 0 is the in-process engine, not a relay peer.
-                if rank == 0 {
-                    continue;
-                }
-                bail!("RelayCoordinator missing worker rank {rank}");
-            };
             channel.send(envelope).with_context(|| {
                 format!("RelayCoordinator write envelope to worker rank {rank}")
             })?;
@@ -1212,10 +1165,6 @@ impl RelayWorker {
     /// Connect to the coordinator's relay port. Retries up to `connect_timeout`
     /// since the coordinator may not have called `accept` yet at the moment the
     /// worker fires off.
-    pub fn connect(coordinator: SocketAddr, connect_timeout: Duration) -> Result<Self> {
-        Self::connect_with_rank(coordinator, connect_timeout, 1, 2)
-    }
-
     pub fn connect_with_rank(
         coordinator: SocketAddr,
         connect_timeout: Duration,

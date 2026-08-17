@@ -8,7 +8,6 @@ use cudarc::driver::{
 use half::bf16;
 use std::any::type_name;
 use std::borrow::Cow;
-use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::marker::PhantomData;
 use std::panic::Location;
@@ -216,20 +215,6 @@ pub fn parse_device_ordinal_from_env() -> Result<u32> {
     parse_device_ordinal(std::env::var("INFER_CUDA_DEVICE").ok().as_deref())
 }
 
-thread_local! {
-    static DEVICE_ORDINAL_OVERRIDE: Cell<Option<u32>> = const { Cell::new(None) };
-}
-
-fn scoped_device_ordinal_override() -> Option<u32> {
-    DEVICE_ORDINAL_OVERRIDE.with(Cell::get)
-}
-
-fn effective_device_ordinal_for_new() -> Result<u32> {
-    scoped_device_ordinal_override()
-        .map(Ok)
-        .unwrap_or_else(parse_device_ordinal_from_env)
-}
-
 /// String-pure parse of an `INFER_CUDA_DEVICE`-style ordinal. `None` => 0.
 /// Split out from [`parse_device_ordinal_from_env`] so unit tests don't need
 /// to mutate the process environment (which races with concurrent tests).
@@ -242,15 +227,8 @@ fn parse_device_ordinal(value: Option<&str>) -> Result<u32> {
     }
 }
 
-/// `--marlin-w4-fp8-prefill` (default off), set once pre-load.
-static MARLIN_W4_FP8_PREFILL: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
 /// `--cuda-mempool-retain` (default on), set once BEFORE context creation.
 static MEMPOOL_RETAIN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
-
-pub fn set_marlin_w4_fp8_prefill(enabled: bool) {
-    MARLIN_W4_FP8_PREFILL.store(enabled, std::sync::atomic::Ordering::Relaxed);
-}
 
 pub fn set_mempool_retain(enabled: bool) {
     MEMPOOL_RETAIN.store(enabled, std::sync::atomic::Ordering::Relaxed);
@@ -259,7 +237,7 @@ impl DeviceContext {
     /// Default constructor: honours `INFER_CUDA_DEVICE` (default 0).
     /// F1+ multi-GPU rank threads bypass this and call `on_device(ordinal)`.
     pub fn new() -> Result<Self> {
-        let ordinal = effective_device_ordinal_for_new()?;
+        let ordinal = parse_device_ordinal_from_env()?;
         Self::on_device(ordinal)
     }
 

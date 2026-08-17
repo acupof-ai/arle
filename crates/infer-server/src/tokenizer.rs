@@ -35,9 +35,6 @@ enum ChatTemplate {
     BuiltinDeepseekV4,
     /// Last-resort Qwen ChatML (warned at load).
     BuiltinChatMl,
-    /// This backend intentionally exposes `/v1/completions` only because the
-    /// checkpoint ships no chat template and no verified builtin renderer.
-    UnsupportedChat { reason: String },
 }
 
 /// Streaming detokenizer. A codepoint's bytes can span a token boundary, so
@@ -121,32 +118,8 @@ impl OpenAiTokenizer {
                     model_dir.display()
                 );
             }
-            ChatTemplate::UnsupportedChat { reason } => {
-                log::warn!(
-                    "chat template disabled for {}: {reason}",
-                    model_dir.display()
-                );
-            }
         }
         Ok(Self { inner, template })
-    }
-
-    /// Load a tokenizer for `/v1/completions` while making
-    /// `/v1/chat/completions` fail closed.
-    pub fn from_model_dir_without_chat(
-        model_dir: impl AsRef<Path>,
-        reason: impl Into<String>,
-    ) -> Result<Self> {
-        let model_dir = model_dir.as_ref();
-        let tokenizer_path = model_dir.join("tokenizer.json");
-        let inner = Tokenizer::from_file(&tokenizer_path)
-            .map_err(|err| anyhow!("load tokenizer {} failed: {err}", tokenizer_path.display()))?;
-        Ok(Self {
-            inner,
-            template: ChatTemplate::UnsupportedChat {
-                reason: reason.into(),
-            },
-        })
     }
 
     /// Encode text into token ids without adding special tokens.
@@ -265,9 +238,6 @@ impl OpenAiTokenizer {
                 reasoning_effort,
             )),
             ChatTemplate::BuiltinChatMl => render_chatml(messages, tools),
-            ChatTemplate::UnsupportedChat { reason } => {
-                anyhow::bail!("chat completions are not supported for this tokenizer: {reason}")
-            }
         }
     }
 }

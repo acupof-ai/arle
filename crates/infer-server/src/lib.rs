@@ -28,10 +28,10 @@
 //! - [`schema`] — the OpenAI wire types and `ApiError` (COLD).
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use anyhow::{Result, anyhow};
 use infer_core::{CompletedRequest, Engine, RequestHandle, SchedulerConfig};
@@ -72,12 +72,11 @@ pub type LocalMultimodalTx = std::sync::mpsc::SyncSender<LocalMultimodalRequest>
 pub(crate) type LocalMultimodalRx = std::sync::mpsc::Receiver<LocalMultimodalRequest>;
 pub use multiproc_relay::{
     PendingRelayCoordinator, RelayChannel, RelayCompletionDelta, RelayCoordinator, RelayEnvelope,
-    RelayWorker, TcpChannel, WireRequest, WireStats, broadcast_tick, set_tick_broadcaster,
-    tick_broadcaster_installed,
+    RelayWorker, TcpChannel, WireRequest, WireStats, set_tick_broadcaster,
 };
 pub use schema::{
-    ChatCompletionRequest, ChatCompletionResponse, ChatContent, ChatContentPart, ChatMessage,
-    CompletionRequest, CompletionResponse, SamplingDefaults, set_sampling_defaults,
+    ChatContent, ChatContentPart, ChatMessage, CompletionRequest, SamplingDefaults,
+    set_sampling_defaults,
 };
 pub use tokenizer::OpenAiTokenizer;
 
@@ -219,34 +218,12 @@ impl RequestTicket {
             )
         })
     }
-
-    /// Block up to `timeout` for this request to complete.
-    ///
-    /// On timeout the ticket is returned in the `Err` so the caller can retry.
-    pub fn collect_timeout(
-        self,
-        timeout: Duration,
-    ) -> std::result::Result<CompletedRequest, CollectTimeout> {
-        match self.completion_rx.recv_timeout(timeout) {
-            Ok(completed) => Ok(completed),
-            Err(RecvTimeoutError::Timeout) => Err(CollectTimeout::Pending(self)),
-            Err(RecvTimeoutError::Disconnected) => Err(CollectTimeout::Closed(self.handle)),
-        }
-    }
 }
 
 impl Drop for RequestTicket {
     fn drop(&mut self) {
         self.live_requests.fetch_sub(1, Ordering::AcqRel);
     }
-}
-
-/// Outcome of a [`RequestTicket::collect_timeout`] that did not deliver a result.
-pub enum CollectTimeout {
-    /// The request is still running; the ticket is returned to retry.
-    Pending(RequestTicket),
-    /// The engine thread closed before delivering the completion.
-    Closed(RequestHandle),
 }
 
 fn submit_trace_enabled() -> bool {
