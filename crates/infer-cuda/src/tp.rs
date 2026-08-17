@@ -734,12 +734,33 @@ impl TpRuntime {
         sendcount: usize,
         recvbuf: *mut std::ffi::c_void,
     ) -> anyhow::Result<()> {
+        ctx.comm_waits_for_compute()?;
+        // SAFETY: this fn's contract.
+        unsafe { self.attn_cp_all_gather_bf16_unfenced(ctx, sendbuf, sendcount, recvbuf)? };
+        ctx.compute_waits_for_comm()?;
+        Ok(())
+    }
+
+    /// [`Self::attn_cp_all_gather_bf16`] without the compute↔comm fence bracket.
+    /// For callers that fence the group's real dependencies once.
+    ///
+    /// # Safety
+    ///
+    /// See [`Self::attn_cp_all_gather_bf16`]; the caller must fence
+    /// `comm_waits_for_compute` before the op and `compute_waits_for_comm`
+    /// before the first compute reading `recvbuf`.
+    pub unsafe fn attn_cp_all_gather_bf16_unfenced(
+        &self,
+        ctx: &cuda_kernels::prelude::DeviceContext,
+        sendbuf: *const std::ffi::c_void,
+        sendcount: usize,
+        recvbuf: *mut std::ffi::c_void,
+    ) -> anyhow::Result<()> {
         match self.attn_cp() {
             TpComm::Single => anyhow::bail!("attn_cp all-gather requires the NCCL cp sub-comm"),
             #[cfg(feature = "nccl")]
             TpComm::Nccl(backend) => {
                 use cuda_kernels::collective::{CollectiveBackend, DType};
-                ctx.comm_waits_for_compute()?;
                 // SAFETY: this fn's contract.
                 unsafe {
                     backend.all_gather(
@@ -750,7 +771,6 @@ impl TpRuntime {
                         ctx.comm_stream.cu_stream().cast::<std::ffi::c_void>(),
                     )?;
                 }
-                ctx.compute_waits_for_comm()?;
                 Ok(())
             }
         }
@@ -774,12 +794,36 @@ impl TpRuntime {
         dtype: cuda_kernels::collective::DType,
         peer: usize,
     ) -> anyhow::Result<()> {
+        ctx.comm_waits_for_compute()?;
+        // SAFETY: this fn's contract.
+        unsafe { self.attn_cp_send_unfenced(ctx, buf, count, dtype, peer)? };
+        ctx.compute_waits_for_comm()?;
+        Ok(())
+    }
+
+    /// [`Self::attn_cp_send`] without the compute↔comm fence bracket. For
+    /// callers that issue several cp ops as one group and fence the group's
+    /// real data dependencies once (GDN relay, ring rotation).
+    ///
+    /// # Safety
+    ///
+    /// See [`Self::attn_cp_send`]; the caller must fence
+    /// `comm_waits_for_compute` before the first op reading a compute-written
+    /// buffer and `compute_waits_for_comm` before the first compute reading a
+    /// comm-written buffer.
+    pub unsafe fn attn_cp_send_unfenced(
+        &self,
+        ctx: &cuda_kernels::prelude::DeviceContext,
+        buf: *const std::ffi::c_void,
+        count: usize,
+        dtype: cuda_kernels::collective::DType,
+        peer: usize,
+    ) -> anyhow::Result<()> {
         match self.attn_cp() {
             TpComm::Single => anyhow::bail!("attn_cp send requires the NCCL cp sub-comm"),
             #[cfg(feature = "nccl")]
             TpComm::Nccl(backend) => {
                 use cuda_kernels::collective::CollectiveBackend;
-                ctx.comm_waits_for_compute()?;
                 // SAFETY: this fn's contract.
                 unsafe {
                     backend.send(
@@ -790,7 +834,6 @@ impl TpRuntime {
                         ctx.comm_stream.cu_stream().cast::<std::ffi::c_void>(),
                     )?;
                 }
-                ctx.compute_waits_for_comm()?;
                 Ok(())
             }
         }
@@ -811,12 +854,32 @@ impl TpRuntime {
         dtype: cuda_kernels::collective::DType,
         peer: usize,
     ) -> anyhow::Result<()> {
+        ctx.comm_waits_for_compute()?;
+        // SAFETY: this fn's contract.
+        unsafe { self.attn_cp_recv_unfenced(ctx, buf, count, dtype, peer)? };
+        ctx.compute_waits_for_comm()?;
+        Ok(())
+    }
+
+    /// [`Self::attn_cp_recv`] without the compute↔comm fence bracket. See
+    /// [`Self::attn_cp_send_unfenced`] for the caller's fence obligations.
+    ///
+    /// # Safety
+    ///
+    /// See [`Self::attn_cp_recv`].
+    pub unsafe fn attn_cp_recv_unfenced(
+        &self,
+        ctx: &cuda_kernels::prelude::DeviceContext,
+        buf: *mut std::ffi::c_void,
+        count: usize,
+        dtype: cuda_kernels::collective::DType,
+        peer: usize,
+    ) -> anyhow::Result<()> {
         match self.attn_cp() {
             TpComm::Single => anyhow::bail!("attn_cp recv requires the NCCL cp sub-comm"),
             #[cfg(feature = "nccl")]
             TpComm::Nccl(backend) => {
                 use cuda_kernels::collective::CollectiveBackend;
-                ctx.comm_waits_for_compute()?;
                 // SAFETY: this fn's contract.
                 unsafe {
                     backend.recv(
@@ -827,7 +890,6 @@ impl TpRuntime {
                         ctx.comm_stream.cu_stream().cast::<std::ffi::c_void>(),
                     )?;
                 }
-                ctx.compute_waits_for_comm()?;
                 Ok(())
             }
         }
@@ -850,12 +912,32 @@ impl TpRuntime {
         dtype: cuda_kernels::collective::DType,
         root: usize,
     ) -> anyhow::Result<()> {
+        ctx.comm_waits_for_compute()?;
+        // SAFETY: this fn's contract.
+        unsafe { self.attn_cp_broadcast_unfenced(ctx, buf, count, dtype, root)? };
+        ctx.compute_waits_for_comm()?;
+        Ok(())
+    }
+
+    /// [`Self::attn_cp_broadcast`] without the compute↔comm fence bracket. See
+    /// [`Self::attn_cp_send_unfenced`] for the caller's fence obligations.
+    ///
+    /// # Safety
+    ///
+    /// See [`Self::attn_cp_broadcast`].
+    pub unsafe fn attn_cp_broadcast_unfenced(
+        &self,
+        ctx: &cuda_kernels::prelude::DeviceContext,
+        buf: *mut std::ffi::c_void,
+        count: usize,
+        dtype: cuda_kernels::collective::DType,
+        root: usize,
+    ) -> anyhow::Result<()> {
         match self.attn_cp() {
             TpComm::Single => anyhow::bail!("attn_cp broadcast requires the NCCL cp sub-comm"),
             #[cfg(feature = "nccl")]
             TpComm::Nccl(backend) => {
                 use cuda_kernels::collective::CollectiveBackend;
-                ctx.comm_waits_for_compute()?;
                 // SAFETY: this fn's contract.
                 unsafe {
                     backend.broadcast(
@@ -866,7 +948,6 @@ impl TpRuntime {
                         ctx.comm_stream.cu_stream().cast::<std::ffi::c_void>(),
                     )?;
                 }
-                ctx.compute_waits_for_comm()?;
                 Ok(())
             }
         }

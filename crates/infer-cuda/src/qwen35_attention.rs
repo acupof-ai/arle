@@ -1813,17 +1813,23 @@ impl Qwen35Model {
                     let (c_ptr, _g1) = slot.conv_states[linear_idx]
                         .data
                         .device_ptr_mut(&self.ctx.stream);
+                    // One fence bracket for the whole recv group: NCCL orders
+                    // the two recvs on comm_stream, so only the group's real
+                    // deps need fencing — wait for the state buffer's prior
+                    // compute writes, then let this layer's advance wait for
+                    // the recv'd state.
+                    self.ctx.comm_waits_for_compute()?;
                     // SAFETY: live per-slot state buffers; the previous cp rank
                     // posts the matching sends in the same (gdr, conv) order.
                     unsafe {
-                        self.tp.attn_cp_recv(
+                        self.tp.attn_cp_recv_unfenced(
                             &self.ctx,
                             g_ptr as *mut std::ffi::c_void,
                             gdr_len,
                             DType::F32,
                             cp_rank - 1,
                         )?;
-                        self.tp.attn_cp_recv(
+                        self.tp.attn_cp_recv_unfenced(
                             &self.ctx,
                             c_ptr as *mut std::ffi::c_void,
                             conv_len,
@@ -1831,6 +1837,7 @@ impl Qwen35Model {
                             cp_rank - 1,
                         )?;
                     }
+                    self.ctx.compute_waits_for_comm()?;
                 }
                 self.advance_linear_conv_gdr(
                     attn,
@@ -1856,17 +1863,21 @@ impl Qwen35Model {
                     let (c_ptr, _g1) = slot.conv_states[linear_idx]
                         .data
                         .device_ptr_mut(&self.ctx.stream);
+                    // One fence bracket for the send+broadcast group: wait for
+                    // this layer's advance to produce the state, then let the
+                    // next layer's compute wait for the broadcast agreement.
+                    self.ctx.comm_waits_for_compute()?;
                     if cp_rank + 1 < cp_size {
                         // SAFETY: same buffers, matching recvs on the next rank.
                         unsafe {
-                            self.tp.attn_cp_send(
+                            self.tp.attn_cp_send_unfenced(
                                 &self.ctx,
                                 g_ptr as *const std::ffi::c_void,
                                 gdr_len,
                                 DType::F32,
                                 cp_rank + 1,
                             )?;
-                            self.tp.attn_cp_send(
+                            self.tp.attn_cp_send_unfenced(
                                 &self.ctx,
                                 c_ptr as *const std::ffi::c_void,
                                 conv_len,
@@ -1880,14 +1891,14 @@ impl Qwen35Model {
                     // chunk / decode.
                     // SAFETY: live state buffers, same count/root on every cp rank.
                     unsafe {
-                        self.tp.attn_cp_broadcast(
+                        self.tp.attn_cp_broadcast_unfenced(
                             &self.ctx,
                             g_ptr as *mut std::ffi::c_void,
                             gdr_len,
                             DType::F32,
                             cp_size - 1,
                         )?;
-                        self.tp.attn_cp_broadcast(
+                        self.tp.attn_cp_broadcast_unfenced(
                             &self.ctx,
                             c_ptr as *mut std::ffi::c_void,
                             conv_len,
@@ -1895,6 +1906,7 @@ impl Qwen35Model {
                             cp_size - 1,
                         )?;
                     }
+                    self.ctx.compute_waits_for_comm()?;
                 }
             }
             LinearCore::Rows(rs) => {
