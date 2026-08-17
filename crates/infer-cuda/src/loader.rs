@@ -528,7 +528,7 @@ impl PageMeta {
             kv_last_page_len: zero.clone(),
             page_table_offsets: zero.clone(),
             start_positions: upload_i32(ctx, &[start_pos as i32])?,
-            positions: upload_i32(ctx, &[(start_pos + rows - 1) as i32])?,
+            positions: upload_i32(ctx, &[(start_pos + rows.saturating_sub(1)) as i32])?,
             q_offsets: vec![0, rows],
             page_offsets: vec![0, 0],
             kv_lens: vec![0],
@@ -724,8 +724,9 @@ impl PageMeta {
                 local_last_fill
             };
         let stream = &ctx.stream;
-        // A shard with no resident pages still needs a 1-entry table: FA3
-        // dereferences page_table[0], and kv_lens=0 bounds the read to zero.
+        // Empty shard: upload a dummy 1-entry table so the meta's table pointer
+        // stays valid; FA3 is bypassed downstream (seqlen_k=0 rejected) and -inf
+        // lse zeroes this shard's cross-cp merge weight.
         let table: &[i32] = if local_num_pages == 0 {
             &[0]
         } else {
