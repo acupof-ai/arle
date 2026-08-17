@@ -146,12 +146,6 @@ impl TurboQuantRotation {
             Self::Full { .. } => panic!("hadamard_signs_ptr called on Full rotation"),
         }
     }
-
-    /// Whether this is Hadamard mode.
-    #[allow(dead_code)]
-    pub fn is_hadamard(&self) -> bool {
-        matches!(self, Self::Hadamard { .. })
-    }
 }
 
 /// Complete TurboQuant state for one KV type (K or V) across all layers.

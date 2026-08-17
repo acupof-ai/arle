@@ -131,30 +131,4 @@ impl KVFormat {
         // record in one shot).
         !matches!(self, Self::BF16 | Self::PackedBytes { .. })
     }
-
-    pub fn is_turboquant(self) -> bool {
-        matches!(self, Self::TurboQuant { .. })
-    }
-
-    #[cfg(feature = "cuda")]
-    pub fn pool_bytes_per_kv_head(self, head_dim: usize) -> usize {
-        match self {
-            Self::BF16 => head_dim * 2,
-            Self::FP8E4M3 => head_dim + 4,
-            Self::INT8 => head_dim + 4,
-            // INT4: 2 nibbles per byte → head_dim/2 packed bytes, plus
-            // f32 V scale (KIVI's K static scale is layer-shared, not
-            // per-token, so it doesn't count toward per-token cost).
-            Self::INT4 => head_dim.div_ceil(2) + 4,
-            Self::TurboQuant { key_bits, .. } => {
-                let packed = crate::turboquant_state::packed_bytes_per_head(head_dim, key_bits);
-                packed + 2
-            }
-            // PackedBytes is the MLA latent record format; per-kv-head pool
-            // sizing does not apply to it (P2 brings the FlashMLA consumer).
-            Self::PackedBytes { .. } => panic!(
-                "KVFormat::PackedBytes sizes via bytes_per_token, not pool_bytes_per_kv_head"
-            ),
-        }
-    }
 }
