@@ -342,6 +342,10 @@ pub(crate) struct PageMeta {
     /// length — required under CUDA graph capture, where the true length is only on
     /// device.
     pub(crate) seqlen_k_capture: Option<usize>,
+    /// 2D decode: 1 if this rank owns the new token's page (writes KV), 0 if it
+    /// skips. Computed once in `sharded_decode_meta` from the block-cyclic
+    /// ownership predicate; 1 on all non-2D paths.
+    pub(crate) write_kv: i32,
 }
 
 impl PageMeta {
@@ -493,6 +497,7 @@ impl PageMeta {
             prefix_token_rows,
             quant_decode_meta,
             seqlen_k_capture: None,
+            write_kv: 1,
         })
     }
 
@@ -539,6 +544,7 @@ impl PageMeta {
             prefix_token_rows: None,
             quant_decode_meta: None,
             seqlen_k_capture: None,
+            write_kv: 0,
         })
     }
 
@@ -577,6 +583,7 @@ impl PageMeta {
             prefix_token_rows: None,
             quant_decode_meta: None,
             seqlen_k_capture: Some(cap * page_size),
+            write_kv: 1,
         })
     }
 
@@ -711,6 +718,7 @@ impl PageMeta {
             prefix_token_rows: None,
             quant_decode_meta: None,
             seqlen_k_capture: None,
+            write_kv: 1,
         })
     }
 

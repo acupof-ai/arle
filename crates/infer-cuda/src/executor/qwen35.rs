@@ -1447,6 +1447,7 @@ impl Qwen35CudaExecutor {
             prefix_token_rows: None,
             quant_decode_meta: None,
             seqlen_k_capture: None,
+            write_kv: i32::from(owns_last),
         })
     }
 
@@ -2464,61 +2465,6 @@ impl Qwen35CudaExecutor {
         )
     }
 
-    /// Run one decode step through the captured whole-step graph. `Ok(None)` means
-    /// eager
-    /// fallback: gate off, out-of-budget, or a capture/replay failure that permanently
-    /// downgrades to eager.
-    fn try_graph_decode(
-        &mut self,
-        row: &DecodeRow,
-        position: u64,
-    ) -> Result<Option<(u32, Option<f32>)>> {
-        if !self.decode_graph_armed {
-            return Ok(None);
-        }
-        // Must run every step: host ensures inside the captured closure only run on
-        // warm/capture steps.
-        if row.kv_seq_len + 1 > self.model.max_seq_len() {
-            return Ok(None);
-        }
-        if self.decode_graph.is_none() {
-            self.decode_graph = Some(Qwen35DecodeGraph::new(
-                self.num_slots,
-                &self.model.ctx.stream,
-            ));
-        }
-        let Self {
-            model,
-            slots,
-            decode_graph,
-            ..
-        } = self;
-        let dg = decode_graph
-            .as_mut()
-            .expect("decode_graph built above when armed");
-        let slot = row.slot;
-        Self::stage_graph_step(model, dg, slot, row.last_token, row.kv_seq_len, "")?;
-        let Qwen35DecodeGraph { ws, graphs, .. } = dg;
-        let state = &mut graphs[slot];
-        let was_captured = state.is_captured();
-        let will_replay = was_captured && !state.is_armed_warm();
-        let slot_state = &mut slots[slot];
-        let run = state
-            .run_or_capture(|| model.forward_decode_step_captured(slot_state, ws, row.kv_seq_len));
-        if let Err(e) = run {
-            // A mid-capture error only recorded kernels, so device state is untouched.
-            warn!(
-                "Qwen3.5 whole-step decode graph failed (slot {slot}), \
-                 downgrading to eager forward: {e}"
-            );
-            self.decode_graph_armed = false;
-            self.decode_graph = None;
-            return Ok(None);
-        }
-        self.finish_graph_step(slot, was_captured, will_replay, "", row, position)
-            .map(Some)
-    }
-
     /// Whole-step decode graph over the PAGED pool: the growing page table is absorbed
     /// by a fixed-capacity per-slot [`crate::loader::PageMeta::persistent_decode`]
     /// refreshed outside the graph, with FA3's scheduling ceiling pinned via
@@ -3018,33 +2964,10 @@ impl Qwen35CudaExecutor {
         }
         // The graph lane runs first when armed; the eager paged forward is the
         // correctness floor and the fallback for every gate miss.
-        if self.full_attn_paged() {
-            if allow_graph
-                && let Some(token) = self.try_graph_decode_paged(row, position, host_kv)?
-            {
-                return Ok(token);
-            }
-            return self.decode_row_paged_default(row, position, host_kv);
+        if allow_graph && let Some(token) = self.try_graph_decode_paged(row, position, host_kv)? {
+            return Ok(token);
         }
-        // Legacy contiguous path (no paged pool — e.g. an OPD weight offload dropped
-        // it).
-        let graph_token = if allow_graph {
-            self.try_graph_decode(row, position)?
-        } else {
-            None
-        };
-        match graph_token {
-            Some(token) => Ok(token),
-            None => self.model.forward_tokens(
-                &mut self.slots[row.slot],
-                &mut self.workspace,
-                &[row.last_token],
-                row.kv_seq_len,
-                &row.params,
-                position,
-                penalty_of(&row.penalty_history, row.penalty_prompt_len),
-            ),
-        }
+        self.decode_row_paged_default(row, position, host_kv)
     }
 
     /// A rows>1 pure-decode sub-batch: ONE batched forward over all rows. With
@@ -3078,102 +3001,25 @@ impl Qwen35CudaExecutor {
             );
         }
 
-        // Under the shared-paged default the contiguous `k_caches`/`v_caches` are never
-        // allocated, so B>1 runs the PAGED batched kernels; recall and TP stay on the
-        // serial per-row path.
-        if self.full_attn_paged() {
-            if crate::runtime_flags::qwen35_batched_decode()
-                && !self.recall_active()
-                && self.model.tp.is_single()
-            {
-                return self.submit_decode_batch_paged(rows, host_kv);
-            }
-            let mut tokens = Vec::with_capacity(rows.len());
-            for row in rows {
-                let (token, logprob) =
-                    self.submit_decode_row(row, /* allow_graph = */ false, host_kv)?;
-                tokens.push(SlotToken {
-                    slot: row.slot,
-                    token,
-                    logprob,
-                    top_logprobs: self.take_top_logprobs(&row.params),
-                    finish: None,
-                });
-            }
-            return Ok(tokens);
+        if crate::runtime_flags::qwen35_batched_decode()
+            && !self.recall_active()
+            && self.model.tp.is_single()
+        {
+            return self.submit_decode_batch_paged(rows, host_kv);
         }
-
-        // Legacy contiguous build (no paged pool — e.g. an OPD weight offload).
-        if !crate::runtime_flags::qwen35_batched_decode() || self.recall_active() {
-            let mut tokens = Vec::with_capacity(rows.len());
-            for row in rows {
-                let (token, logprob) =
-                    self.submit_decode_row(row, /* allow_graph = */ false, host_kv)?;
-                tokens.push(SlotToken {
-                    slot: row.slot,
-                    token,
-                    logprob,
-                    top_logprobs: self.take_top_logprobs(&row.params),
-                    finish: None,
-                });
-            }
-            return Ok(tokens);
-        }
-
-        if self.batch_decode.is_none() {
-            let num_full = self.model.config.num_full_attention_layers();
-            let num_linear = self.model.config.num_hidden_layers - num_full;
-            self.batch_decode = Some(crate::qwen35::Qwen35BatchDecodeState::new(
-                &self.model.ctx,
-                num_full,
-                num_linear,
-                self.num_slots,
-            )?);
-        }
-        let bd = self
-            .batch_decode
-            .as_mut()
-            .expect("batch_decode built above");
-
-        let slot_indices: Vec<usize> = rows.iter().map(|r| r.slot).collect();
-        let tokens_in: Vec<u32> = rows.iter().map(|r| r.last_token).collect();
-        let kv_seq_lens: Vec<usize> = rows.iter().map(|r| r.kv_seq_len).collect();
-        let params: Vec<SamplingParams> = rows.iter().map(|r| r.params.clone()).collect();
-        let positions: Vec<u64> = rows
-            .iter()
-            .map(|r| r.kv_seq_len.saturating_add(1) as u64)
-            .collect();
-        let penalties: Vec<infer_plan::PenaltyHistory<'_>> = rows
-            .iter()
-            .map(|r| penalty_of(&r.penalty_history, r.penalty_prompt_len))
-            .collect();
-        let sampled = self.model.forward_decode_batch(
-            &mut self.slots,
-            bd,
-            &slot_indices,
-            &tokens_in,
-            &kv_seq_lens,
-            &params,
-            &positions,
-            &penalties,
-        )?;
-        ensure!(
-            sampled.len() == rows.len(),
-            "Qwen3.5 batched decode returned {} tokens for {} rows",
-            sampled.len(),
-            rows.len()
-        );
-        Ok(slot_indices
-            .into_iter()
-            .zip(sampled)
-            .map(|(slot, (token, logprob, top_logprobs))| SlotToken {
-                slot,
+        let mut tokens = Vec::with_capacity(rows.len());
+        for row in rows {
+            let (token, logprob) =
+                self.submit_decode_row(row, /* allow_graph = */ false, host_kv)?;
+            tokens.push(SlotToken {
+                slot: row.slot,
                 token,
                 logprob,
-                top_logprobs,
+                top_logprobs: self.take_top_logprobs(&row.params),
                 finish: None,
-            })
-            .collect())
+            });
+        }
+        Ok(tokens)
     }
 
     /// A rows>1 decode sub-batch over the shared-paged lane: ONE B-row page table and a
@@ -3222,11 +3068,10 @@ impl Qwen35CudaExecutor {
             .collect();
 
         if self.batch_decode.is_none() {
-            let num_full = self.model.config.num_full_attention_layers();
-            let num_linear = self.model.config.num_hidden_layers - num_full;
+            let num_linear =
+                self.model.config.num_hidden_layers - self.model.config.num_full_attention_layers();
             self.batch_decode = Some(crate::qwen35::Qwen35BatchDecodeState::new(
                 &self.model.ctx,
-                num_full,
                 num_linear,
                 self.num_slots,
             )?);

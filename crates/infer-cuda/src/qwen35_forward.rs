@@ -1,4 +1,5 @@
 use super::*;
+use anyhow::bail;
 
 /// Joint slot/pool capacity split, mirroring DSv4's `Dsv4KvBudgetPlan`.
 #[derive(Debug, Clone, Copy)]
@@ -374,22 +375,11 @@ impl Qwen35Model {
         })
     }
 
-    pub(crate) fn forward_hidden(
-        &self,
-        slot: &mut Qwen35SlotState,
-        ws: &mut Qwen35Workspace,
-        tokens: &[u32],
-        start_pos: usize,
-    ) -> Result<()> {
-        self.forward_hidden_capture(slot, ws, tokens, start_pos, None, None, None)
-    }
-
-    /// [`Self::forward_hidden`] with an optional per-linear-layer gated-delta
-    /// input capture (spec verify only). When `capture` is `Some`, each linear
-    /// layer copies its post-in_proj `qkv` (PRE-conv1d) + `b`/`a` projections
-    /// for all rows into the capture so a partial-accept replay can re-run only
-    /// conv1d + GDR (see [`Qwen35LinearCapture`]). `None` is byte-for-byte the
-    /// old `forward_hidden` (the capture branch is fully elided).
+    /// Per-linear-layer gated-delta input capture (spec verify only). When
+    /// `capture` is `Some`, each linear layer copies its post-in_proj `qkv`
+    /// (PRE-conv1d) + `b`/`a` projections for all rows into the capture so a
+    /// partial-accept replay can re-run only conv1d + GDR (see
+    /// [`Qwen35LinearCapture`]).
     pub(crate) fn forward_hidden_capture(
         &self,
         slot: &mut Qwen35SlotState,
@@ -457,8 +447,7 @@ impl Qwen35Model {
     /// each row's recurrent/conv/KV device state in place. Does NOT advance
     /// `slot.seq_len` and performs NO H2D/D2H/sync — at one row of one token
     /// this is the CUDA-graph-capturable decode body (every per-step scalar is
-    /// read from the staged device buffers; see
-    /// [`Self::forward_decode_step_captured`] for the capture-safety table).
+    /// read from the staged device buffers).
     ///
     /// `rows` are the ragged per-slot token spans, token-major and in the same
     /// order as the staged ids; the full-attn layers get their identity from
@@ -557,15 +546,9 @@ impl Qwen35Model {
                                     rc.layer0_query.as_mut(),
                                 )
                             } else {
-                                self.full_attention(
-                                    full_attn,
-                                    normed,
-                                    &mut *rows[0].slot,
-                                    full_idx,
-                                    start_pos,
-                                    start_pos_dev,
-                                    full,
-                                    attn_out,
+                                bail!(
+                                    "Qwen3.5 full attention without a paged recall pool is unsupported \
+                                     (legacy contiguous KV lane removed)"
                                 )
                             }
                         },
@@ -674,32 +657,11 @@ impl Qwen35Model {
         Ok(())
     }
 
-    pub(crate) fn forward_tokens(
-        &self,
-        slot: &mut Qwen35SlotState,
-        ws: &mut Qwen35Workspace,
-        tokens: &[u32],
-        start_pos: usize,
-        params: &SamplingParams,
-        position: u64,
-        penalty: infer_plan::PenaltyHistory<'_>,
-    ) -> Result<(u32, Option<f32>)> {
-        crate::profile::profile_op(&self.ctx, "forward_hidden", None, tokens.len(), || {
-            self.forward_hidden(slot, ws, tokens, start_pos)
-        })?;
-        crate::profile::profile_op(&self.ctx, "lm_head", None, tokens.len(), || {
-            self.lm_head_logits(ws, tokens.len())
-        })?;
-        crate::profile::profile_op(&self.ctx, "sample", None, tokens.len(), || {
-            self.sample_workspace_logits(ws, params, position, penalty)
-        })
-    }
-
-    /// [`Self::forward_tokens`] over the opt-in paged recall KV pool
-    /// (`--kv-recall`): the full-attn layers read/write `recall.pool` over
-    /// `recall.meta` instead of the contiguous slot cache. `slot.seq_len` is
-    /// still advanced in lockstep (the executor's decode invariant reads it);
-    /// the pool's own `seq_len` is advanced separately via `alloc_tokens`.
+    /// Forward over the opt-in paged recall KV pool (`--kv-recall`): the
+    /// full-attn layers read/write `recall.pool` over `recall.meta`.
+    /// `slot.seq_len` is still advanced in lockstep (the executor's decode
+    /// invariant reads it); the pool's own `seq_len` is advanced separately
+    /// via `alloc_tokens`.
     pub(crate) fn forward_tokens_recall(
         &self,
         slot: &mut Qwen35SlotState,
