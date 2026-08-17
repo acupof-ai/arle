@@ -3,6 +3,7 @@
 
 use super::layer_block::HcHalf;
 use super::*;
+use cuda_kernels::tensor::CudaPipelineStreamKind;
 
 impl Dsv4Model {
     /// Forward one prefill/decode step over `tokens` starting at `start_pos`,
@@ -499,7 +500,13 @@ impl Dsv4Model {
                                 "moe_allreduce",
                                 Some(layer_idx),
                                 seq_len,
-                                || self.tp.all_reduce_sum(&self.ctx, &mut moe_out),
+                                || {
+                                    self.tp.all_reduce_sum_on(
+                                        &self.ctx,
+                                        &mut moe_out,
+                                        CudaPipelineStreamKind::Compute,
+                                    )
+                                },
                             )?;
                         }
                         if use_comm_overlap {

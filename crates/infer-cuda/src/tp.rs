@@ -1,6 +1,7 @@
 //! Tensor-parallel runtime config + communicator handle. Sharding math lives in
 //! `infer-topo`; `world_size == 1` is the no-op path.
 
+use cuda_kernels::tensor::CudaPipelineStreamKind;
 use infer_topo::TpConfig;
 
 fn lookup_usize(
@@ -429,6 +430,19 @@ impl TpRuntime {
         ctx: &cuda_kernels::prelude::DeviceContext,
         buf: &mut cuda_kernels::prelude::HiddenStates,
     ) -> anyhow::Result<()> {
+        self.all_reduce_sum_on(ctx, buf, CudaPipelineStreamKind::Comm)
+    }
+
+    /// Like [`Self::all_reduce_sum`] but selects the stream the NCCL arm runs
+    /// on. One-shot always uses the compute stream (small-message fast path).
+    /// `Comm` brackets with compute↔comm fences; `Compute` is unfenced for
+    /// callers that overlap the AR with comm-stream work (dsv4 shared expert).
+    pub fn all_reduce_sum_on(
+        &self,
+        ctx: &cuda_kernels::prelude::DeviceContext,
+        buf: &mut cuda_kernels::prelude::HiddenStates,
+        stream: CudaPipelineStreamKind,
+    ) -> anyhow::Result<()> {
         // One-shot runs on the global comm only; sub-comms and oversized
         // (prefill) buffers fall through to NCCL.
         #[cfg(all(feature = "cuda", feature = "nccl"))]
@@ -437,7 +451,7 @@ impl TpRuntime {
         {
             return os.all_reduce_sum_inplace(ctx, buf);
         }
-        self.all_reduce_sum_over(&self.comm, ctx, buf)
+        self.all_reduce_sum_over_stream(&self.comm, ctx, buf, stream)
     }
 
     /// Attention-side partial-sum reduce. Attention (full + linear) weights
@@ -538,6 +552,20 @@ impl TpRuntime {
         ctx: &cuda_kernels::prelude::DeviceContext,
         buf: &mut cuda_kernels::prelude::HiddenStates,
     ) -> anyhow::Result<()> {
+        self.all_reduce_sum_over_stream(comm, ctx, buf, CudaPipelineStreamKind::Comm)
+    }
+
+    #[cfg(feature = "cuda")]
+    #[allow(dead_code)]
+    // Without `nccl` the only arm is `Single => Ok(())`, so the args are unused.
+    #[cfg_attr(not(feature = "nccl"), allow(unused_variables))]
+    fn all_reduce_sum_over_stream(
+        &self,
+        comm: &TpComm,
+        ctx: &cuda_kernels::prelude::DeviceContext,
+        buf: &mut cuda_kernels::prelude::HiddenStates,
+        stream: CudaPipelineStreamKind,
+    ) -> anyhow::Result<()> {
         match comm {
             TpComm::Single => Ok(()),
             #[cfg(feature = "nccl")]
@@ -547,8 +575,15 @@ impl TpRuntime {
 
                 let count = buf.data.len();
                 let (ptr, _guard) = buf.data.device_ptr_mut(&ctx.stream);
+                let cu_stream = match stream {
+                    CudaPipelineStreamKind::Comm => {
+                        ctx.comm_waits_for_compute()?;
+                        ctx.comm_stream.cu_stream()
+                    }
+                    _ => ctx.stream.cu_stream(),
+                };
                 // SAFETY: `ptr` is a valid device allocation of `count` BF16
-                // elements on this context's device; `ctx.stream` is a stream on
+                // elements on this context's device; the selected stream is on
                 // the same device. The `_guard` keeps the slice borrowed (and thus
                 // un-reallocated) for the duration of the FFI call.
                 unsafe {
@@ -557,8 +592,11 @@ impl TpRuntime {
                         count,
                         DType::BF16,
                         ReduceOp::Sum,
-                        ctx.stream.cu_stream().cast::<std::ffi::c_void>(),
+                        cu_stream.cast::<std::ffi::c_void>(),
                     )?;
+                }
+                if matches!(stream, CudaPipelineStreamKind::Comm) {
+                    ctx.compute_waits_for_comm()?;
                 }
                 Ok(())
             }
@@ -627,7 +665,7 @@ impl TpRuntime {
     /// `sendbuf` must point to at least `sendcount` contiguous BF16 elements on
     /// this rank's current CUDA device; `recvbuf` to writable device memory for
     /// `sendcount * world_size` BF16 elements. Both must stay valid until the
-    /// collective enqueued on `ctx.stream` completes, and every rank in the TP
+    /// collective enqueued on the comm stream completes, and every rank in the TP
     /// group must call with the same `sendcount`.
     #[cfg(feature = "cuda")]
     #[cfg_attr(not(feature = "nccl"), allow(unused_variables))]
@@ -652,18 +690,19 @@ impl TpRuntime {
             TpComm::Nccl(backend) => {
                 use cuda_kernels::collective::{CollectiveBackend, DType};
 
+                ctx.comm_waits_for_compute()?;
                 // SAFETY: this fn's contract — `sendbuf` holds `sendcount` bf16 and
-                // `recvbuf` `sendcount * world`, both live on `ctx`'s device and
-                // stream.
+                // `recvbuf` `sendcount * world`, both live on `ctx`'s device.
                 unsafe {
                     backend.all_gather(
                         sendbuf,
                         recvbuf,
                         sendcount,
                         DType::BF16,
-                        ctx.stream.cu_stream().cast::<std::ffi::c_void>(),
+                        ctx.comm_stream.cu_stream().cast::<std::ffi::c_void>(),
                     )?;
                 }
+                ctx.compute_waits_for_comm()?;
                 Ok(())
             }
         }
@@ -676,7 +715,7 @@ impl TpRuntime {
     ///
     /// `sendbuf` must hold `sendcount` BF16 elements and `recvbuf`
     /// `sendcount * attn_cp_size` BF16 elements on this rank's device; both
-    /// stay valid until the collective enqueued on `ctx.stream` completes, and
+    /// stay valid until the collective enqueued on the comm stream completes, and
     /// every cp-group rank calls with the same `sendcount`.
     #[cfg(feature = "cuda")]
     #[cfg_attr(not(feature = "nccl"), allow(unused_variables))]
@@ -692,6 +731,7 @@ impl TpRuntime {
             #[cfg(feature = "nccl")]
             TpComm::Nccl(backend) => {
                 use cuda_kernels::collective::{CollectiveBackend, DType};
+                ctx.comm_waits_for_compute()?;
                 // SAFETY: this fn's contract.
                 unsafe {
                     backend.all_gather(
@@ -699,9 +739,10 @@ impl TpRuntime {
                         recvbuf,
                         sendcount,
                         DType::BF16,
-                        ctx.stream.cu_stream().cast::<std::ffi::c_void>(),
+                        ctx.comm_stream.cu_stream().cast::<std::ffi::c_void>(),
                     )?;
                 }
+                ctx.compute_waits_for_comm()?;
                 Ok(())
             }
         }
@@ -713,7 +754,7 @@ impl TpRuntime {
     /// # Safety
     ///
     /// `buf` must hold `count` elements of `dtype` on this rank's device and
-    /// stay valid until the op enqueued on `ctx.stream` completes; `peer` must
+    /// stay valid until the op enqueued on the comm stream completes; `peer` must
     /// post the matching [`Self::attn_cp_recv`].
     #[cfg(feature = "cuda")]
     #[cfg_attr(not(feature = "nccl"), allow(unused_variables))]
@@ -730,6 +771,7 @@ impl TpRuntime {
             #[cfg(feature = "nccl")]
             TpComm::Nccl(backend) => {
                 use cuda_kernels::collective::CollectiveBackend;
+                ctx.comm_waits_for_compute()?;
                 // SAFETY: this fn's contract.
                 unsafe {
                     backend.send(
@@ -737,9 +779,10 @@ impl TpRuntime {
                         count,
                         dtype,
                         peer,
-                        ctx.stream.cu_stream().cast::<std::ffi::c_void>(),
+                        ctx.comm_stream.cu_stream().cast::<std::ffi::c_void>(),
                     )?;
                 }
+                ctx.compute_waits_for_comm()?;
                 Ok(())
             }
         }
@@ -765,6 +808,7 @@ impl TpRuntime {
             #[cfg(feature = "nccl")]
             TpComm::Nccl(backend) => {
                 use cuda_kernels::collective::CollectiveBackend;
+                ctx.comm_waits_for_compute()?;
                 // SAFETY: this fn's contract.
                 unsafe {
                     backend.recv(
@@ -772,9 +816,10 @@ impl TpRuntime {
                         count,
                         dtype,
                         peer,
-                        ctx.stream.cu_stream().cast::<std::ffi::c_void>(),
+                        ctx.comm_stream.cu_stream().cast::<std::ffi::c_void>(),
                     )?;
                 }
+                ctx.compute_waits_for_comm()?;
                 Ok(())
             }
         }
@@ -802,6 +847,7 @@ impl TpRuntime {
             #[cfg(feature = "nccl")]
             TpComm::Nccl(backend) => {
                 use cuda_kernels::collective::CollectiveBackend;
+                ctx.comm_waits_for_compute()?;
                 // SAFETY: this fn's contract.
                 unsafe {
                     backend.broadcast(
@@ -809,9 +855,10 @@ impl TpRuntime {
                         count,
                         dtype,
                         root,
-                        ctx.stream.cu_stream().cast::<std::ffi::c_void>(),
+                        ctx.comm_stream.cu_stream().cast::<std::ffi::c_void>(),
                     )?;
                 }
+                ctx.compute_waits_for_comm()?;
                 Ok(())
             }
         }
