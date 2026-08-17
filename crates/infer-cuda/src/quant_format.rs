@@ -236,30 +236,47 @@ pub(crate) fn detect_quant_format(
                 && !tensors.contains_key(&format!("{base}.input_global_scale"))
                 && !tensors.contains_key(&format!("{base}.weight_scale_2")) =>
         {
-            let logical_shape = fp4_logical_shape(name, &tensor.shape)?;
             let scale = tensor_by_name(tensors, &format!("{base}.weight_scale"))?;
-            ensure!(
-                scale.shape.len() == 2,
-                "{name}: W4A16 weight_scale must be rank-2, got {:?}",
-                scale.shape
-            );
-            ensure!(
-                scale.shape[1] != 0,
-                "{name}: W4A16 weight_scale second dim is zero, got {:?}",
-                scale.shape
-            );
-            let group_size = logical_shape[1] / scale.shape[1];
-            ensure!(
-                group_size > 0 && logical_shape[1] % group_size == 0,
-                "{name}: W4A16 logical K {} not group-aligned to {group_size}",
-                logical_shape[1]
-            );
-            QuantTensorView {
-                name: name.to_owned(),
-                logical_shape,
-                storage_dtype: tensor.dtype,
-                format: QuantFormat::W4A16 { group_size },
-                scale_names: vec![format!("{base}.weight_scale")],
+            // W4AFP8 (SGLang CUTLASS): interleaved scale [K//512, N*4]. The
+            // quantize script packs signed int4 into U8 bytes; the scale shape
+            // distinguishes it from W4A16 (per-group scale [N, K//group]).
+            if scale.shape.len() == 2
+                && scale.shape[1] == tensor.shape[0] * 4
+                && tensor.shape[1] / 256 == scale.shape[0]
+                && tensor.shape[1].is_multiple_of(256)
+            {
+                QuantTensorView {
+                    name: name.to_owned(),
+                    logical_shape: vec![tensor.shape[0], tensor.shape[1] * 2],
+                    storage_dtype: tensor.dtype,
+                    format: QuantFormat::W4Afp8,
+                    scale_names: vec![format!("{base}.weight_scale")],
+                }
+            } else {
+                let logical_shape = fp4_logical_shape(name, &tensor.shape)?;
+                ensure!(
+                    scale.shape.len() == 2,
+                    "{name}: W4A16 weight_scale must be rank-2, got {:?}",
+                    scale.shape
+                );
+                ensure!(
+                    scale.shape[1] != 0,
+                    "{name}: W4A16 weight_scale second dim is zero, got {:?}",
+                    scale.shape
+                );
+                let group_size = logical_shape[1] / scale.shape[1];
+                ensure!(
+                    group_size > 0 && logical_shape[1] % group_size == 0,
+                    "{name}: W4A16 logical K {} not group-aligned to {group_size}",
+                    logical_shape[1]
+                );
+                QuantTensorView {
+                    name: name.to_owned(),
+                    logical_shape,
+                    storage_dtype: tensor.dtype,
+                    format: QuantFormat::W4A16 { group_size },
+                    scale_names: vec![format!("{base}.weight_scale")],
+                }
             }
         }
         // W4AFP8 (SGLang CUTLASS): packed signed INT4 weight (I8 [N, K//2]),
