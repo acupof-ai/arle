@@ -175,7 +175,9 @@ impl RadixCache {
     /// the cache rank-local. Must be called before the first publish under
     /// 2D, so a block's owning shard is known while the tree grows.
     pub fn set_cp_shard(&mut self, shard: ShardSpec) {
-        self.cp_shard = shard;
+        if self.cp_shard != shard {
+            self.cp_shard = shard;
+        }
     }
 
     #[must_use]
