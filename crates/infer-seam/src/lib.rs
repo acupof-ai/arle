@@ -269,8 +269,6 @@ pub struct GpuDeviceSample {
 pub struct GpuSample {
     pub devices: [GpuDeviceSample; 8],
     pub device_count: u8,
-    pub sampled_at_ms: u64,
-    pub stale: bool,
 }
 
 pub fn now_ms() -> u64 {

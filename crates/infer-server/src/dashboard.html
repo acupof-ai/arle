@@ -316,13 +316,10 @@ const statTiles = STAT_DEFS.map(def => {
 
 async function load() {
   try {
-    const results = await Promise.all([
-      fetch('/v1/observe/query?range=1h').then(r => r.json()),
-      fetch('/v1/observe/latest').then(r => (r.ok ? r.json() : null)),
-    ]);
-    const samples = (results[0] && results[0].samples) || [];
-    const latest = results[1];
+    const res = await fetch('/v1/observe/query?range=1h').then(r => r.json());
+    const samples = (res && res.samples) || [];
     for (const { cfg, card } of cards) renderChart(card, cfg, samples);
+    const latest = samples[samples.length - 1];
     if (latest) {
       for (const t of statTiles) {
         const v = t.def.f(latest);

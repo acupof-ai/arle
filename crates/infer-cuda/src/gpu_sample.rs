@@ -29,14 +29,7 @@ fn spawn() {
             std::thread::sleep(Duration::from_secs(2));
             let sample = match query_nvidia_smi() {
                 Ok(s) => s,
-                Err(_) => {
-                    if let Ok(mut guard) = STORE.write()
-                        && let Some(ref mut s) = *guard
-                    {
-                        s.stale = true;
-                    }
-                    continue;
-                }
+                Err(_) => continue,
             };
             if let Ok(mut guard) = STORE.write() {
                 *guard = Some(sample);
@@ -71,8 +64,6 @@ fn parse_nvidia_smi(stdout: &str) -> GpuSample {
     GpuSample {
         devices,
         device_count: count,
-        sampled_at_ms: infer_seam::now_ms(),
-        stale: false,
     }
 }
 
@@ -106,14 +97,12 @@ mod tests {
         assert_eq!(s.devices[0].power_w, 350);
         assert_eq!(s.devices[1].gpu_index, 1);
         assert_eq!(s.devices[1].util_pct, 80);
-        assert!(!s.stale);
     }
 
     #[test]
     fn parse_empty() {
         let s = parse_nvidia_smi("");
         assert_eq!(s.device_count, 0);
-        assert!(!s.stale);
     }
 
     #[test]

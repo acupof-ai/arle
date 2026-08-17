@@ -4,62 +4,14 @@
 use crate::execution::CounterSnapshot;
 use serde::{Deserialize, Serialize};
 use std::os::unix::io::AsRawFd;
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct HostSample {
     pub cpu_pct: f32,
     pub ram_used_mb: u64,
-    pub ram_total_mb: u64,
     pub disk_used_pct: f32,
-}
-
-static HOST: RwLock<HostSample> = RwLock::new(HostSample {
-    cpu_pct: 0.0,
-    ram_used_mb: 0,
-    ram_total_mb: 0,
-    disk_used_pct: 0.0,
-});
-static HOST_INIT: OnceLock<()> = OnceLock::new();
-static LATEST: RwLock<Option<StoredSample>> = RwLock::new(None);
-
-pub fn host_sample() -> HostSample {
-    HOST_INIT.get_or_init(spawn_host_sampler);
-    HOST.read().map(|h| h.clone()).unwrap_or_default()
-}
-
-fn spawn_host_sampler() {
-    std::thread::spawn(|| {
-        let mut sys = sysinfo::System::new();
-        let mut disks = sysinfo::Disks::new_with_refreshed_list();
-        let mut tick: u32 = 0;
-        loop {
-            sys.refresh_cpu_all();
-            sys.refresh_memory();
-            if tick.is_multiple_of(30) {
-                disks.refresh(true);
-            }
-            let cpu_pct = if sys.cpus().is_empty() {
-                0.0
-            } else {
-                sys.cpus().iter().map(|c| c.cpu_usage()).sum::<f32>() / sys.cpus().len() as f32
-            };
-            let ram_total_mb = sys.total_memory() / (1024 * 1024);
-            let ram_used_mb = ram_total_mb.saturating_sub(sys.available_memory() / (1024 * 1024));
-            let sample = HostSample {
-                cpu_pct,
-                ram_used_mb,
-                ram_total_mb,
-                disk_used_pct: disk_used_pct(&disks),
-            };
-            if let Ok(mut h) = HOST.write() {
-                *h = sample;
-            }
-            tick += 1;
-            std::thread::sleep(Duration::from_secs(10));
-        }
-    });
 }
 
 fn disk_used_pct(disks: &sysinfo::Disks) -> f32 {
@@ -84,7 +36,6 @@ pub struct StoredSample {
     pub kv_free_pages: u32,
     pub cpu_pct: f32,
     pub ram_used_mb: u64,
-    pub ram_total_mb: u64,
     pub disk_used_pct: f32,
     pub gpu: Option<infer_seam::GpuSample>,
     pub generated_tokens: u64,
@@ -105,7 +56,6 @@ impl StoredSample {
             kv_free_pages: snap.kv_free_pages as u32,
             cpu_pct: host.cpu_pct,
             ram_used_mb: host.ram_used_mb,
-            ram_total_mb: host.ram_total_mb,
             disk_used_pct: host.disk_used_pct,
             gpu: snap.gpu,
             generated_tokens: snap.throughput.generated_tokens,
@@ -152,7 +102,6 @@ fn append_sample(dir: &std::path::Path, sample: &StoredSample) -> std::io::Resul
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .truncate(false)
         .open(path)?;
     writeln!(file, "{line}")?;
     Ok(())
@@ -186,20 +135,37 @@ pub fn spawn_observe_task(counters: Arc<Mutex<CounterSnapshot>>) {
             .and_then(|v| v.parse().ok())
             .unwrap_or(30);
         sweep_retention(&dir, retention_days);
+        let mut sys = sysinfo::System::new();
+        let mut disks = sysinfo::Disks::new_with_refreshed_list();
+        let mut tick: u32 = 0;
         loop {
             std::thread::sleep(Duration::from_secs(10));
+            sys.refresh_cpu_all();
+            sys.refresh_memory();
+            if tick.is_multiple_of(30) {
+                disks.refresh(true);
+            }
+            let cpu_pct = if sys.cpus().is_empty() {
+                0.0
+            } else {
+                sys.cpus().iter().map(|c| c.cpu_usage()).sum::<f32>() / sys.cpus().len() as f32
+            };
+            let ram_used_mb = (sys.total_memory() / (1024 * 1024))
+                .saturating_sub(sys.available_memory() / (1024 * 1024));
+            let host = HostSample {
+                cpu_pct,
+                ram_used_mb,
+                disk_used_pct: disk_used_pct(&disks),
+            };
             let snap = match counters.lock() {
                 Ok(s) => s.clone(),
                 Err(_) => continue,
             };
-            let host = host_sample();
             let sample = StoredSample::from_snapshot(&snap, host, infer_seam::now_ms());
             if let Err(e) = append_sample(&dir, &sample) {
                 log::warn!("observe: append failed: {e}");
             }
-            if let Ok(mut latest) = LATEST.write() {
-                *latest = Some(sample);
-            }
+            tick += 1;
         }
     });
 }
@@ -211,7 +177,6 @@ fn acquire_writer_lock(dir: &std::path::Path) -> Option<std::fs::File> {
     let file = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
-        .truncate(false)
         .open(&path)
         .ok()?;
     // SAFETY: flock on a valid open fd; LOCK_NB makes it non-blocking.
@@ -239,10 +204,6 @@ pub fn query(range_ms: u64) -> Vec<StoredSample> {
     samples
 }
 
-pub fn latest() -> Option<StoredSample> {
-    LATEST.read().ok()?.clone()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -267,7 +228,6 @@ mod tests {
             kv_free_pages: 100,
             cpu_pct: 45.5,
             ram_used_mb: 32000,
-            ram_total_mb: 64000,
             disk_used_pct: 60.0,
             gpu: None,
             generated_tokens: 100000,

@@ -401,7 +401,6 @@ fn build_router(state: Arc<DpCoordinator>) -> Router {
         .route("/v1/stats", get(stats))
         .route("/metrics", get(metrics))
         .route("/v1/observe/query", get(observe_query))
-        .route("/v1/observe/latest", get(observe_latest))
         .route("/dashboard", get(dashboard_page))
         .fallback(fallback_404)
         .layer(DefaultBodyLimit::max(256 * 1024 * 1024))
@@ -1938,12 +1937,6 @@ async fn observe_query(Query(params): Query<ObserveQueryParams>) -> Json<serde_j
         .await
         .unwrap_or_default();
     Json(serde_json::json!({ "samples": samples }))
-}
-
-async fn observe_latest() -> Result<Json<crate::observe::StoredSample>, StatusCode> {
-    crate::observe::latest()
-        .map(Json)
-        .ok_or(StatusCode::NOT_FOUND)
 }
 
 async fn dashboard_page() -> ([(header::HeaderName, &'static str); 1], &'static str) {
