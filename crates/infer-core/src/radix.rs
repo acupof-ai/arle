@@ -3,13 +3,30 @@
 //! The block size is aligned to `KvPool::page_size()`: one cached block maps to
 //! one host page id. Partial tail blocks are deliberately not published, which
 //! keeps prefix reuse page-aligned.
+//!
+//! Under CP sequence-sharding (2D), the tree is REPLICATED across cp ranks:
+//! every rank holds the full token tree, but a block's `page_id` is `Some` only
+//! on the owning shard — block `B` lives on shard `B % cp_size`, a pure
+//! function, so no location table is stored. Non-owning ranks hold replica
+//! nodes (`page_id == None`, never in `page_to_node`); a prefix match walks
+//! through them and emits [`REPLICA_PAGE`], and the engine attaches only the
+//! local subset. Block `B` is resident iff shard `B % cp_size`'s page is live;
+//! the engine min-reduces the matched length across ranks, so a missing block
+//! on any shard truncates the match for all.
 
 use std::collections::BTreeMap;
 
-use infer_seam::PrefixBlock;
+use infer_seam::{PrefixBlock, ShardSpec};
 
 /// Host page id used as the prefix-cache block id.
 pub type BlockId = u32;
+
+/// Matched-block marker for a block whose KV page lives on another CP shard.
+///
+/// Never a real pool page id (`total_pages` is far below `u32::MAX`) and
+/// distinct from `infer_seam::EVICTED_PAGE`; every pool/backend touch filters
+/// it out first (see [`PrefixMatch::local_block_ids`]).
+pub const REPLICA_PAGE: BlockId = u32::MAX - 1;
 
 /// Longest cached prefix result.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,6 +49,26 @@ impl PrefixMatch {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.block_ids.is_empty()
+    }
+
+    /// Page ids backed by THIS rank's CP shard, in global block order.
+    ///
+    /// Block positions owned by other shards carry [`REPLICA_PAGE`]; this
+    /// drops them, leaving exactly the pages the host pool can retain or
+    /// attach (block `B` lives on shard `B % size`). An unsharded cache
+    /// (`size <= 1`) returns the full list.
+    #[must_use]
+    pub fn local_block_ids(&self, shard: ShardSpec) -> Vec<BlockId> {
+        if shard.size <= 1 {
+            return self.block_ids.clone();
+        }
+        self.block_ids
+            .iter()
+            .enumerate()
+            .filter(|(block_idx, _)| shard.owns_page(*block_idx))
+            .map(|(_, &page)| page)
+            .filter(|&page| page != REPLICA_PAGE)
+            .collect()
     }
 }
 
@@ -60,6 +97,10 @@ pub struct RadixCache {
     /// `BackendExecutor::drop_kv_tier_entries`, so no path can leak a key.
     dropped_tier_keys: Vec<u64>,
     clock: u64,
+    /// CP shard coordinates for the replicated tree. `size <= 1` (the
+    /// default) keeps the cache rank-local: every block is local, no
+    /// [`REPLICA_PAGE`] markers are emitted, and eviction is unchanged.
+    cp_shard: ShardSpec,
 }
 
 #[derive(Debug, Clone)]
@@ -74,6 +115,12 @@ struct Node {
     parent: Option<usize>,
     children: BTreeMap<Vec<u32>, usize>,
     evicted: bool,
+    /// Resident (page-owning) nodes in this node's subtree, EXCLUDING self.
+    /// Replica and demoted descendants do not count. Maintained on every
+    /// `page_id` transition so `is_evictable_leaf` is O(1): a resident node
+    /// evicts only when no resident descendant survives it — a replica child
+    /// never pins its parent (it holds no local page).
+    resident_below: usize,
 }
 
 impl Node {
@@ -87,24 +134,22 @@ impl Node {
             parent: None,
             children: BTreeMap::new(),
             evicted: false,
+            resident_below: 0,
         }
     }
 
-    fn child(block: Vec<u32>, page_id: BlockId, parent: usize, last_access: u64) -> Self {
+    fn child(block: Vec<u32>, page_id: Option<BlockId>, parent: usize, last_access: u64) -> Self {
         Self {
             block,
-            page_id: Some(page_id),
+            page_id,
             tier_key: None,
             ref_count: 0,
             last_access,
             parent: Some(parent),
             children: BTreeMap::new(),
             evicted: false,
+            resident_below: 0,
         }
-    }
-
-    fn is_demoted(&self) -> bool {
-        !self.evicted && self.page_id.is_none() && self.tier_key.is_some()
     }
 }
 
@@ -120,7 +165,18 @@ impl RadixCache {
             tier_to_node: BTreeMap::new(),
             dropped_tier_keys: Vec::new(),
             clock: 0,
+            cp_shard: ShardSpec::default(),
         }
+    }
+
+    /// Set the CP sequence-shard coordinates for the replicated tree.
+    ///
+    /// Called by the engine once the pool's shard assignment is known
+    /// (idempotent — the same coordinates on every call). `size <= 1` keeps
+    /// the cache rank-local. Must be called before the first publish under
+    /// 2D, so a block's owning shard is known while the tree grows.
+    pub fn set_cp_shard(&mut self, shard: ShardSpec) {
+        self.cp_shard = shard;
     }
 
     #[must_use]
@@ -165,15 +221,26 @@ impl RadixCache {
     }
 
     fn match_inner(&self, tokens: &[u32]) -> PrefixMatch {
-        let block_ids: Vec<u32> = tokens
-            .chunks_exact(self.block_size)
-            .scan(0usize, |node_idx, block| {
-                let &child_idx = self.nodes[*node_idx].children.get(block)?;
-                let page_id = self.nodes[child_idx].page_id?;
-                *node_idx = child_idx;
-                Some(page_id)
-            })
-            .collect();
+        let mut node_idx = 0usize;
+        let mut block_ids = Vec::new();
+        for (block_idx, block) in tokens.chunks_exact(self.block_size).enumerate() {
+            let Some(&child_idx) = self.nodes[node_idx].children.get(block) else {
+                break;
+            };
+            let child = &self.nodes[child_idx];
+            let local = self.cp_shard.owns_page(block_idx);
+            match (local, child.page_id) {
+                // Local block with its page: the normal resident entry.
+                (true, Some(page)) => block_ids.push(page),
+                // Block owned by another shard: its page lives there. Walk on
+                // — the tree is replicated, the content is known.
+                (false, _) => block_ids.push(REPLICA_PAGE),
+                // Local block without a page: demoted or evicted. The
+                // resident match ends here (the tiered match may continue).
+                (true, None) => break,
+            }
+            node_idx = child_idx;
+        }
         PrefixMatch {
             matched_len: block_ids.len() * self.block_size,
             block_ids,
@@ -227,6 +294,7 @@ impl RadixCache {
         node.page_id = None;
         node.tier_key = Some(tier_key);
         self.tier_to_node.insert(tier_key, node_idx);
+        self.adjust_resident_ancestors(node_idx, -1);
         true
     }
 
@@ -243,6 +311,7 @@ impl RadixCache {
         node.tier_key = None;
         node.page_id = Some(page);
         self.page_to_node.insert(page, node_idx);
+        self.adjust_resident_ancestors(node_idx, 1);
         let last_access = self.tick();
         self.nodes[node_idx].last_access = last_access;
         true
@@ -311,13 +380,8 @@ impl RadixCache {
     }
 
     fn subtree_has_resident(&self, idx: usize) -> bool {
-        if self.nodes[idx].page_id.is_some() {
-            return true;
-        }
-        self.nodes[idx]
-            .children
-            .values()
-            .any(|&child| self.subtree_has_resident(child))
+        let node = &self.nodes[idx];
+        node.page_id.is_some() || node.resident_below > 0
     }
 
     /// Detach `idx` from its parent and mark its subtree evicted, draining
@@ -330,9 +394,13 @@ impl RadixCache {
             let block = self.nodes[idx].block.clone();
             self.nodes[parent_idx].children.remove(&block);
         }
+        let mut removed_residents = 0usize;
         let mut stack = vec![idx];
         while let Some(current) = stack.pop() {
             let node = &mut self.nodes[current];
+            if node.page_id.is_some() {
+                removed_residents += 1;
+            }
             node.evicted = true;
             node.page_id = None;
             node.block = Vec::new();
@@ -347,31 +415,43 @@ impl RadixCache {
             // skipping this slot until `insert` fully re-initializes it.
             self.free.push(current);
         }
+        if removed_residents > 0 {
+            self.adjust_resident_ancestors(idx, -(removed_residents as i64));
+        }
     }
 
-    /// Publish full token blocks with their host page ids.
+    /// Publish full token blocks into the replicated tree.
     ///
-    /// Returns page ids that became newly owned by the cache. Existing matching
-    /// blocks are left in place and are not returned, so callers can retain only
-    /// newly published pages.
-    pub fn insert(&mut self, tokens: &[u32], page_ids: &[BlockId]) -> Vec<BlockId> {
+    /// `tokens` is the rank-identical published span (the engine's collective
+    /// exchange aligned it across cp ranks); `page_of` maps a GLOBAL block
+    /// index within the span to this rank's local page, or `None` for blocks
+    /// owned by another shard (replica nodes: content known, no local page).
+    ///
+    /// Returns the local pages that became newly owned by the cache. Existing
+    /// matching blocks are left in place and are not returned, so callers can
+    /// retain only newly published pages. Replica nodes never enter
+    /// `page_to_node` and never pin eviction.
+    pub fn insert_replicated(
+        &mut self,
+        tokens: &[u32],
+        page_of: &dyn Fn(usize) -> Option<BlockId>,
+    ) -> Vec<BlockId> {
         let full_blocks = tokens.len() / self.block_size;
-        let publish_blocks = full_blocks.min(page_ids.len());
         let mut node_idx = 0usize;
         let mut newly_cached = Vec::new();
 
         for (block_idx, block) in tokens
             .chunks_exact(self.block_size)
-            .take(publish_blocks)
+            .take(full_blocks)
             .enumerate()
         {
             let block = block.to_vec();
-            let page_id = page_ids[block_idx];
+            let page = page_of(block_idx);
             let child_idx = if let Some(&child_idx) = self.nodes[node_idx].children.get(&block) {
                 child_idx
             } else {
                 let last_access = self.tick();
-                let node = Node::child(block.clone(), page_id, node_idx, last_access);
+                let node = Node::child(block.clone(), page, node_idx, last_access);
                 let child_idx = if let Some(free_idx) = self.free.pop() {
                     self.nodes[free_idx] = node;
                     free_idx
@@ -382,15 +462,21 @@ impl RadixCache {
                 self.nodes[node_idx]
                     .children
                     .insert(block.clone(), child_idx);
-                if self.page_to_node.insert(page_id, child_idx).is_none() {
+                if let Some(page_id) = page
+                    && self.page_to_node.insert(page_id, child_idx).is_none()
+                {
                     newly_cached.push(page_id);
+                    self.adjust_resident_ancestors(child_idx, 1);
                 }
                 child_idx
             };
 
-            if self.nodes[child_idx].page_id.is_none() {
+            if let Some(page_id) = page
+                && self.nodes[child_idx].page_id.is_none()
+            {
                 // Reviving a page-less node: if it was demoted, the re-prefilled
                 // page supersedes the tier copy — drop the stale tier entry.
+                // (A replica node stays page-less: `page` is None for it.)
                 if let Some(key) = self.nodes[child_idx].tier_key.take() {
                     self.tier_to_node.remove(&key);
                     self.dropped_tier_keys.push(key);
@@ -399,6 +485,7 @@ impl RadixCache {
                 if self.page_to_node.insert(page_id, child_idx).is_none() {
                     newly_cached.push(page_id);
                 }
+                self.adjust_resident_ancestors(child_idx, 1);
             }
             let last_access = self.tick();
             self.nodes[child_idx].last_access = last_access;
@@ -406,6 +493,20 @@ impl RadixCache {
         }
 
         newly_cached
+    }
+
+    /// Adjust `resident_below` on every ancestor of `idx` by `delta`.
+    fn adjust_resident_ancestors(&mut self, mut idx: usize, delta: i64) {
+        while let Some(parent) = self.nodes[idx].parent {
+            let node = &mut self.nodes[parent];
+            node.resident_below = if delta >= 0 {
+                node.resident_below.saturating_add(delta as usize)
+            } else {
+                node.resident_below
+                    .saturating_sub(delta.unsigned_abs() as usize)
+            };
+            idx = parent;
+        }
     }
 
     pub fn retain_blocks(&mut self, pages: &[BlockId]) {
@@ -450,20 +551,14 @@ impl RadixCache {
     }
 
     /// A resident block is on the relaxed evictable frontier when it is idle
-    /// and holds no resident descendants. Demoted children do not pin their
-    /// parent (otherwise a demoted leaf would freeze its whole ancestor chain
-    /// on the device); demoted nodes never have resident descendants —
-    /// inserting through a demoted node revives it first (see `insert`) — so
-    /// one level suffices.
+    /// and holds no resident descendants. Demoted and replica children do not
+    /// pin their parent (they hold no local page — otherwise a demoted leaf
+    /// would freeze its whole ancestor chain, and under CP replication every
+    /// other block is a replica); `resident_below` makes the descendant check
+    /// O(1) and exact across the replicated tree.
     fn is_evictable_leaf(&self, idx: usize) -> bool {
         let node = &self.nodes[idx];
-        !node.evicted
-            && node.page_id.is_some()
-            && node.ref_count == 0
-            && node
-                .children
-                .values()
-                .all(|&child| self.nodes[child].is_demoted())
+        !node.evicted && node.page_id.is_some() && node.ref_count == 0 && node.resident_below == 0
     }
 
     fn is_strict_evictable_leaf(&self, idx: usize) -> bool {
@@ -508,5 +603,138 @@ impl RadixCache {
     fn tick(&mut self) -> u64 {
         self.clock = self.clock.saturating_add(1);
         self.clock
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tokens(n: usize) -> Vec<u32> {
+        (0..n as u32).collect()
+    }
+
+    #[test]
+    fn unsharded_insert_matches_legacy() {
+        let bs = 4;
+        let toks = tokens(bs * 3);
+        let mut cache = RadixCache::new(bs);
+        let pages: Vec<BlockId> = vec![10, 11, 12];
+        let newly = cache.insert_replicated(&toks, &|j| Some(pages[j]));
+        assert_eq!(newly, pages);
+        let m = cache.peek_longest_prefix_match(&toks);
+        assert_eq!(m.matched_len, toks.len());
+        assert_eq!(m.block_ids, pages);
+        assert_eq!(m.local_block_ids(ShardSpec::default()), pages);
+    }
+
+    #[test]
+    fn replicated_tree_matches_full_span_with_replica_markers() {
+        let bs = 4;
+        let toks = tokens(bs * 6);
+        let pages0: Vec<BlockId> = vec![10, 12, 14]; // global blocks 0,2,4
+        let pages1: Vec<BlockId> = vec![11, 13, 15]; // global blocks 1,3,5
+
+        let mut rank0 = RadixCache::new(bs);
+        rank0.set_cp_shard(ShardSpec::new(0, 2));
+        let n0 = rank0.insert_replicated(&toks, &|j| {
+            if j % 2 == 0 {
+                Some(pages0[j / 2])
+            } else {
+                None
+            }
+        });
+        let mut rank1 = RadixCache::new(bs);
+        rank1.set_cp_shard(ShardSpec::new(1, 2));
+        let n1 = rank1.insert_replicated(&toks, &|j| {
+            if j % 2 == 1 {
+                Some(pages1[j / 2])
+            } else {
+                None
+            }
+        });
+        assert_eq!(n0, pages0);
+        assert_eq!(n1, pages1);
+
+        // Both ranks match the FULL span; non-owning blocks are REPLICA_PAGE.
+        let m0 = rank0.peek_longest_prefix_match(&toks);
+        let m1 = rank1.peek_longest_prefix_match(&toks);
+        assert_eq!(m0.matched_len, toks.len());
+        assert_eq!(m1.matched_len, toks.len());
+        assert_eq!(
+            m0.block_ids,
+            vec![10, REPLICA_PAGE, 12, REPLICA_PAGE, 14, REPLICA_PAGE]
+        );
+        assert_eq!(
+            m1.block_ids,
+            vec![REPLICA_PAGE, 11, REPLICA_PAGE, 13, REPLICA_PAGE, 15]
+        );
+        assert_eq!(m0.local_block_ids(ShardSpec::new(0, 2)), pages0);
+        assert_eq!(m1.local_block_ids(ShardSpec::new(1, 2)), pages1);
+        // Replica nodes never enter page_to_node.
+        assert_eq!(rank0.cached_page_count(), 3);
+        assert_eq!(rank1.cached_page_count(), 3);
+    }
+
+    #[test]
+    fn replicated_match_stops_at_local_gap_but_walks_replicas() {
+        let bs = 4;
+        let toks = tokens(bs * 4);
+        let mut rank0 = RadixCache::new(bs);
+        rank0.set_cp_shard(ShardSpec::new(0, 2));
+        // Rank 0 owns blocks 0,2; block 1 is a replica.
+        rank0.insert_replicated(&toks, &|j| {
+            if j % 2 == 0 {
+                Some((100 + j) as BlockId)
+            } else {
+                None
+            }
+        });
+        // Evict the deepest local page (block 2): the match now ends at
+        // block 2's position, having walked the block-1 replica.
+        assert_eq!(rank0.evict_lru(1), vec![102]);
+        let m = rank0.peek_longest_prefix_match(&toks);
+        assert_eq!(m.matched_len, bs * 2);
+        assert_eq!(m.block_ids, vec![100, REPLICA_PAGE]);
+    }
+
+    #[test]
+    fn replica_children_do_not_pin_but_live_local_descendants_do() {
+        let bs = 4;
+        let toks = tokens(bs * 4);
+        let mut cache = RadixCache::new(bs);
+        cache.set_cp_shard(ShardSpec::new(0, 2));
+        cache.insert_replicated(&toks, &|j| {
+            if j % 2 == 0 {
+                Some((100 + j) as BlockId)
+            } else {
+                None
+            }
+        });
+        // Block 0 has a live local descendant (block 2): not evictable.
+        let victims = cache.lru_evictable_pages(usize::MAX);
+        assert_eq!(victims, vec![102]);
+        // Once block 2 is gone, block 0's only descendants are replicas:
+        // it becomes evictable and drains cleanly.
+        assert_eq!(cache.evict_lru(1), vec![102]);
+        assert_eq!(cache.evict_lru(1), vec![100]);
+        assert_eq!(cache.cached_page_count(), 0);
+    }
+
+    #[test]
+    fn demote_promote_keeps_evictability_consistent() {
+        let bs = 4;
+        let toks = tokens(bs * 2);
+        let mut cache = RadixCache::new(bs);
+        cache.insert_replicated(&toks, &|j| Some((10 + j) as BlockId));
+        // Demote the leaf: its parent becomes evictable (demoted child does
+        // not pin), and the demoted block itself leaves the resident set.
+        assert!(cache.demote_block(11, 777));
+        assert_eq!(cache.lru_evictable_pages(usize::MAX), vec![10]);
+        assert_eq!(cache.demoted_block_count(), 1);
+        // Promote back: the parent is pinned again, the leaf is evictable.
+        assert!(cache.promote_block(777, 11));
+        assert_eq!(cache.lru_evictable_pages(usize::MAX), vec![11]);
+        assert_eq!(cache.demoted_block_count(), 0);
     }
 }

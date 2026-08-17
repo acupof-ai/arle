@@ -232,7 +232,8 @@ impl Qwen35CudaExecutor {
             .full_attn_kv
             .as_mut()
             .expect("full_attn_kv present (full_attn_paged)");
-        let need = seq_len.div_ceil(pool.page_size);
+        let global_pages = seq_len.div_ceil(pool.page_size);
+        let need = host_kv.shard_local_page_count(global_pages);
         ensure!(
             host_pages.len() >= need,
             "host pool holds {} pages for slot {slot}, {need} needed to cover {seq_len} tokens",
@@ -469,6 +470,29 @@ impl Qwen35CudaExecutor {
         self.tp_min_usize(local, "admission free pages")
     }
 
+    /// 2D (attn_tp × cp) engages only when both partitions are real (pinned
+    /// decision 4). Under it each rank's pool holds 1/cp of the sequence pages
+    /// (block-cyclic: logical page `i` on shard `i % cp`).
+    pub(crate) fn two_d_engaged(&self) -> bool {
+        self.model.tp.two_d_engaged()
+    }
+
+    /// `BackendExecutor::kv_shard_factor` — cp_size under 2D, else 1.
+    pub(crate) fn kv_shard_factor(&self) -> usize {
+        if self.two_d_engaged() {
+            self.model.tp.attn_cp_size()
+        } else {
+            1
+        }
+    }
+
+    /// This rank's (cp_rank, cp_size) for the host pool's shard filter, or
+    /// `None` when 2D is not engaged.
+    pub(crate) fn kv_shard_spec(&self) -> Option<(usize, usize)> {
+        self.two_d_engaged()
+            .then(|| (self.model.tp.attn_cp_rank(), self.model.tp.attn_cp_size()))
+    }
+
     /// Demote `slot`'s entire device state into `slot_tier` under `key`. The copy is
     /// complete before returning, so the engine may free the slot immediately. Returns
     /// `Ok(false)` when the tier is at budget on ANY rank. Exactly TWO collectives on
@@ -621,8 +645,9 @@ impl Qwen35CudaExecutor {
             max_seq_len,
             mtp_draft_tokens,
         )?;
-        // CP prefill (T2.b) preconditions: a real NCCL cp sub-comm, and the
-        // BF16 pool (the quant-KV write path does not cover remote cp slices).
+        // CP preconditions (T2.b replicated gather and the T3.2b 2D ring/decode
+        // merge): a real NCCL cp sub-comm, and the BF16 pool (the quant-KV write
+        // path does not cover remote cp slices).
         // DSpark is rejected below by its own single-GPU ensure; --kv-recall is
         // rejected at enable time (rank-local eviction scoring would diverge
         // the cp group's collective schedule).
@@ -633,6 +658,14 @@ impl Qwen35CudaExecutor {
             model.tp.attn_tp_size() * model.tp.attn_cp_size() == model.tp.config().world_size
                 || model.tp.config().is_single(),
             "attn_dp>1 is not supported by the qwen35 engine (attention would double-count)"
+        );
+        // 2D mutex: the MTP spec row builds a global-coverage PageMeta and
+        // forwards with cp:None, neither shard-aware — the spec path is not
+        // wired for the sharded pool. Reject at construction, like dspark.
+        ensure!(
+            !model.tp.two_d_engaged() || mtp_draft_tokens.is_none(),
+            "--spec-type mtp is not supported under 2D (attn_tp>=2 && attn_cp>=2): the spec \
+             row's page meta is not shard-aware"
         );
         if model.tp.attn_cp_size() > 1 {
             ensure!(
@@ -710,10 +743,18 @@ impl Qwen35CudaExecutor {
             kv_format,
         )?;
         let num_slots = plan.num_slots;
+        // Under 2D each rank stores 1/cp of the sequence pages (block-cyclic),
+        // so the device pool is sized at plan.pool_pages / cp; the host
+        // admission pool follows via effective_total_pages (1:1 id contract).
+        let pool_pages = if model.tp.two_d_engaged() {
+            plan.pool_pages / model.tp.attn_cp_size()
+        } else {
+            plan.pool_pages
+        };
         cuda_startup_log(
             "executor.qwen35_kv_budget",
             budget_t0,
-            format_args!("effective_slots={num_slots} pool_pages={}", plan.pool_pages),
+            format_args!("effective_slots={num_slots} pool_pages={pool_pages}"),
         );
         let slots_t0 = Instant::now();
         // Empty slots: each slot's ~147 MiB recurrent block is drawn from
@@ -728,8 +769,7 @@ impl Qwen35CudaExecutor {
         // Sized by the joint budget plan above (the ONLY profile — see
         // `ensure_kv_pool`).
         let pool_t0 = Instant::now();
-        let full_attn_kv =
-            Self::alloc_full_attn_kv_pool(&model, num_slots, plan.pool_pages, kv_format)?;
+        let full_attn_kv = Self::alloc_full_attn_kv_pool(&model, num_slots, pool_pages, kv_format)?;
         let kv_pool_sized_pages = full_attn_kv.max_total_pages;
         cuda_startup_log(
             "executor.qwen35_paged_pool_alloc",
@@ -1124,43 +1164,53 @@ impl Qwen35CudaExecutor {
             let pool = self.full_attn_kv.as_ref().expect("full_attn_kv present");
             let len = row.tokens.len();
             let cp_size = self.model.tp.attn_cp_size();
-            // Replicated-KV CP prefill (T2.b): shard this chunk's compute into
-            // contiguous cp slices when the chunk amortizes the per-layer
-            // collectives. DSpark taps need the full chunk on every rank. The
-            // decision is a pure function of the (rank-identical) plan, so the
-            // cp group's collective schedule stays lockstep.
-            if cp_size > 1 && self.dspark.is_none() && len >= cp_size * CP_PREFILL_MIN_ROWS_PER_RANK
-            {
+            // 2D ring prefill (T3.2b Part D): one ring pass over the whole
+            // prompt. Each rank preps its q-slice, rotates KV around the cp
+            // ring, and scatters its owned pages (block-cyclic). DSpark taps
+            // need the full chunk on every rank. The decision is a pure
+            // function of the (rank-identical) plan, so the cp group's
+            // collective schedule stays lockstep.
+            if self.two_d_engaged() && self.dspark.is_none() {
                 let per = len.div_ceil(cp_size);
                 let slices: Vec<(usize, usize)> = (0..cp_size)
                     .map(|p| (p * per, ((p + 1) * per).min(len) - p * per))
                     .collect();
                 let (off, my_len) = slices[self.model.tp.attn_cp_rank()];
-                let meta = crate::loader::PageMeta::for_slot_slice(
+                let meta = crate::loader::PageMeta::for_ring_prefill(
                     &self.model.ctx,
-                    pool,
-                    slot,
                     row.start_pos + off,
                     my_len,
-                    row.start_pos + off + my_len,
                 )?;
-                let chunk_pages = (row.start_pos + len).div_ceil(SUPPORTED_PAGE_SIZE);
-                let pages = pool.page_indices(slot);
-                ensure!(
-                    pages.len() >= chunk_pages,
-                    "CP prefill: slot {slot} has {} pages, chunk needs {chunk_pages}",
-                    pages.len()
-                );
-                let kv_indices: Vec<i32> = pages[..chunk_pages].iter().map(|&p| p as i32).collect();
-                let starts: Vec<i32> = slices
+                // Local shard pages in local-index order (entry j backs global
+                // page cp_rank + j*cp).
+                let kv_indices: Vec<i32> =
+                    pool.page_indices(slot).iter().map(|&p| p as i32).collect();
+                let q_pos: Vec<usize> = (0..my_len).map(|i| row.start_pos + off + i).collect();
+                let k_pos: Vec<Vec<usize>> = slices
                     .iter()
-                    .map(|&(o, _)| (row.start_pos + o) as i32)
+                    .map(|&(o, l)| (0..l).map(|i| row.start_pos + o + i).collect())
                     .collect();
+                let q_pos_f32 = crate::ops::upload_f32(
+                    &self.model.ctx,
+                    &q_pos.iter().map(|&p| p as f32).collect::<Vec<_>>(),
+                )?;
+                let k_pos_f32 = k_pos
+                    .iter()
+                    .map(|kp| {
+                        crate::ops::upload_f32(
+                            &self.model.ctx,
+                            &kp.iter().map(|&p| p as f32).collect::<Vec<_>>(),
+                        )
+                    })
+                    .collect::<Result<Vec<_>>>()?;
                 let cp = crate::qwen35::Qwen35CpPrefill {
                     slices,
                     pad: per,
-                    start_positions: crate::ops::upload_i32(&self.model.ctx, &starts)?,
                     kv_indices: crate::ops::upload_i32(&self.model.ctx, &kv_indices)?,
+                    q_pos,
+                    k_pos,
+                    q_pos_f32,
+                    k_pos_f32,
                 };
                 (meta, Some(cp))
             } else {
@@ -1270,13 +1320,31 @@ impl Qwen35CudaExecutor {
         }
         self.mirror_host_slot(host_kv, slot, row.kv_seq_len + 1)?;
         let meta = {
-            let pool = self.full_attn_kv.as_ref().expect("full_attn_kv present");
-            crate::loader::PageMeta::for_slot(&self.model.ctx, pool, slot, row.kv_seq_len, 1)?
+            let pool = self
+                .full_attn_kv
+                .as_ref()
+                .expect("full_attn_kv present (full_attn_paged)");
+            if self.two_d_engaged() {
+                Self::sharded_decode_meta(
+                    &self.model.ctx,
+                    pool,
+                    slot,
+                    row.kv_seq_len,
+                    self.model.tp.attn_cp_rank(),
+                    self.model.tp.attn_cp_size(),
+                )?
+            } else {
+                crate::loader::PageMeta::for_slot(&self.model.ctx, pool, slot, row.kv_seq_len, 1)?
+            }
         };
         // B2 CP decode (T3.1): head-shard across the cp group once the KV is
         // long enough to amortize the cp all-reduce. DSpark taps need the full
-        // head set on every rank, like prefill CP.
-        let cp_decode = if self.dspark.is_none() && row.kv_seq_len + 1 >= CP_DECODE_MIN_KV_TOKENS {
+        // head set on every rank, like prefill CP. Under 2D the pool is already
+        // cp-sharded and the GDN pair's trade is length-independent (recurrent
+        // state is O(1) per step), so it engages from the first decode token.
+        let cp_decode = if self.dspark.is_none()
+            && (self.two_d_engaged() || row.kv_seq_len + 1 >= CP_DECODE_MIN_KV_TOKENS)
+        {
             self.model.cp_decode_handle()
         } else {
             None
@@ -1306,6 +1374,88 @@ impl Qwen35CudaExecutor {
             penalty_of(&row.penalty_history, row.penalty_prompt_len),
             &mut rc,
         )
+    }
+
+    /// 2D decode page meta: covers only this cp shard's local pages (logical
+    /// page `i` on shard `i % cp`). `kv_lens`/`max_kv_len` are the shard-local
+    /// token count; the new token's page appears only on the owning shard's
+    /// table, so a non-owner's prep write is skipped and its FA3 partial
+    /// covers exactly its resident pages. BF16 only (2D inherits the bf16
+    /// mutex).
+    fn sharded_decode_meta(
+        ctx: &DeviceContext,
+        pool: &PagedKVPool,
+        slot: usize,
+        kv_seq_len: usize,
+        cp_rank: usize,
+        cp_size: usize,
+    ) -> Result<PageMeta> {
+        ensure!(
+            pool.format == KVFormat::BF16,
+            "2D decode requires the BF16 KV pool (got {:?})",
+            pool.format
+        );
+        let total_len = kv_seq_len + 1;
+        let page_size = pool.page_size;
+        ensure!(
+            pool.seq_len(slot) == total_len,
+            "sharded decode meta: pool seq_len {} != total_len {total_len} for slot {slot}",
+            pool.seq_len(slot)
+        );
+        let global_pages = total_len.div_ceil(page_size);
+        let local_pages: Vec<i32> = pool.page_indices(slot).iter().map(|&p| p as i32).collect();
+        let local_num_pages = local_pages.len();
+        // The new token lands in the last global page; only its owner writes it.
+        let shard = infer_seam::ShardSpec::new(cp_rank, cp_size);
+        let owns_last = shard.owns_page(global_pages - 1);
+        let overshoot = global_pages * page_size - total_len;
+        let local_last_fill = if owns_last {
+            // The last page is partial unless total_len is page-aligned.
+            page_size - overshoot
+        } else {
+            page_size
+        };
+        let local_token_count = (local_num_pages)
+            .saturating_sub(1)
+            .saturating_mul(page_size)
+            + if local_num_pages == 0 {
+                0
+            } else {
+                local_last_fill
+            };
+        // A shard with no resident pages (total_len < page_size * cp) still
+        // needs a 1-entry table: FA3 dereferences page_table[0], and kv_lens=0
+        // bounds the read to zero tokens.
+        let (table, stride) = if local_num_pages == 0 {
+            (vec![0i32], 1usize)
+        } else {
+            (local_pages.clone(), local_num_pages)
+        };
+        let zero = crate::ops::upload_i32(ctx, &[0])?;
+        Ok(PageMeta {
+            q_indptr: crate::ops::upload_i32(ctx, &[0, 1])?,
+            kv_indptr: crate::ops::upload_i32(ctx, &[0, local_num_pages as i32])?,
+            kv_indices: crate::ops::upload_i32(ctx, &local_pages)?,
+            kv_last_page_len: crate::ops::upload_i32(ctx, &[local_last_fill as i32])?,
+            page_table_offsets: zero.clone(),
+            start_positions: crate::ops::upload_i32(ctx, &[kv_seq_len as i32])?,
+            positions: crate::ops::upload_i32(ctx, &[kv_seq_len as i32])?,
+            q_offsets: vec![0, 1],
+            page_offsets: vec![0, local_num_pages],
+            kv_lens: vec![local_token_count],
+            kv_lens_dev: crate::ops::upload_i32(ctx, &[local_token_count as i32])?,
+            page_table_rect: crate::ops::upload_i32(ctx, &table)?,
+            page_table_stride: stride,
+            seq_len: 1,
+            total_q: 1,
+            num_pages: local_num_pages,
+            batch: 1,
+            start_pos: kv_seq_len,
+            new_token_rows: None,
+            prefix_token_rows: None,
+            quant_decode_meta: None,
+            seqlen_k_capture: None,
+        })
     }
 
     /// One MTP spec-decode row: the spec step when the slot is seeded, else a warm

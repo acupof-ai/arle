@@ -361,6 +361,14 @@ impl TpRuntime {
         self.attn_tp_size
     }
 
+    /// 2D (attn_tp × cp) engages only when both partitions are real
+    /// (world ≥ 4). The single geometry predicate — prefill ring, decode
+    /// merge, pool sizing, and the spec/recall mutexes all read this.
+    #[must_use]
+    pub fn two_d_engaged(&self) -> bool {
+        self.attn_tp_size >= 2 && self.attn_cp_size >= 2
+    }
+
     #[must_use]
     pub fn is_single(&self) -> bool {
         self.config.is_single()

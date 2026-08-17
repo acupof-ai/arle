@@ -433,6 +433,19 @@ impl CudaExecutor {
         }
     }
 
+    /// This rank's (cp_rank, cp_size) for the host pool's CP sequence-shard
+    /// filter, or `None` when 2D (attn_tp × cp) is not engaged. `None` only for
+    /// the placeholder and non-2D configs; the host `CudaKvPool` calls
+    /// `set_shard` with this at construction.
+    #[must_use]
+    pub fn kv_shard_spec(&self) -> Option<(usize, usize)> {
+        match &self.inner {
+            CudaExecutorInner::Placeholder => None,
+            #[cfg(feature = "cuda")]
+            CudaExecutorInner::Real(real) => real.kv_shard_spec(),
+        }
+    }
+
     /// Device pool page size (tokens/page) for arms whose host admission pool
     /// must mirror device granularity. DSv4's MLA pool pages at 64
     /// (`page_block_size`), not `config.page_size` (16) — the host pool must use
@@ -690,6 +703,14 @@ impl BackendExecutor for CudaExecutor {
             CudaExecutorInner::Placeholder => Ok(local),
             #[cfg(feature = "cuda")]
             CudaExecutorInner::Real(real) => real.tp_sync_min(local),
+        }
+    }
+
+    fn kv_shard_factor(&self) -> usize {
+        match &self.inner {
+            CudaExecutorInner::Placeholder => 1,
+            #[cfg(feature = "cuda")]
+            CudaExecutorInner::Real(real) => real.kv_shard_factor(),
         }
     }
 

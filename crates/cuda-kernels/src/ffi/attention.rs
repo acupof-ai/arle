@@ -285,6 +285,80 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    /// 2D ring-prefill dense prep (Qwen3.6 HD256): q/k-norm + partial RoPE into
+    /// DENSE head-major `[heads, rows, 256]` buffers with NO pool write (the
+    /// ring core's tile-major layout). `q_full` is the gated raw Q projection
+    /// `[rows, q_heads*2*256]`; `k_in`/`v_in` are `[rows, kv_heads*256]`.
+    pub fn ring_prefill_dense_prep_hd256_cuda(
+        q_full: *const Half,
+        k_in: *const Half,
+        v_in: *const Half,
+        q_norm_weight: *const Half,
+        k_norm_weight: *const Half,
+        cos_cache: *const Half,
+        sin_cache: *const Half,
+        q_out: *mut Half,
+        k_out: *mut Half,
+        v_out: *mut Half,
+        num_qo_heads: i32,
+        num_kv_heads: i32,
+        rows: i32,
+        start_pos: i32,
+        rotary_dim: i32,
+        rms_eps: f32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    /// 2D ring-prefill block-cyclic scatter: write the ring block's tokens
+    /// whose global page `g = abs_pos / page_size` is owned by this shard
+    /// (`g % cp_size == cp_rank`) into the sharded HND pool. `k_dense`/`v_dense`
+    /// are the block's prepped K/V `[kv_heads, blk_len, 256]` head-major;
+    /// `local_page_table[j]` backs global page `cp_rank + j*cp_size`.
+    pub fn ring_prefill_scatter_sharded_hd256_cuda(
+        k_dense: *const Half,
+        v_dense: *const Half,
+        local_page_table: *const i32,
+        local_page_count: i32,
+        page_size: i32,
+        kv_heads: i32,
+        blk_start: i32,
+        blk_len: i32,
+        cp_rank: i32,
+        cp_size: i32,
+        stride_page: i32,
+        k_pool: *mut Half,
+        v_pool: *mut Half,
+        stream: CUstream,
+    ) -> CUresult;
+
+    /// 2D ring-prefill finalize: `out = O / L` (flash-2 normalized),
+    /// transposing the accumulator's head-major `[q_heads, rows, 256]` into the
+    /// gate's row-major bf16 `[rows, q_heads*256]`. `acc_l == 0` writes 0.
+    pub fn ring_prefill_finalize_bf16_hd256_cuda(
+        acc_l: *const f32,
+        acc_o: *const f32,
+        out: *mut Half,
+        q_heads: i32,
+        rows: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    /// 2D cross-cp flash-decoding merge (`csrc/attention/cross_cp_merge.cu`):
+    /// combine `cp` sequence-shard partials into the full attention output.
+    /// `lse_gather` is `[cp, rows]` f32, `out_gather` is `[cp, rows, head_dim]`
+    /// bf16 (rank-major: rank r's partial at row `r * rows`); `out` is
+    /// `[rows, head_dim]` bf16. `out = sum_c w_c * out_c / sum_c w_c`,
+    /// `w_c = exp(lse_c - max lse)`, f32 accumulation.
+    pub fn cross_cp_merge_bf16_hd256_cuda(
+        lse_gather: *const f32,
+        out_gather: *const Half,
+        out: *mut Half,
+        cp_size: i32,
+        rows: i32,
+        head_dim: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     /// FA3 pair-route ring merge (`csrc/attention/ring_fa3_merge.cu`): fold one
     /// pair's NORMALIZED FA3 (o, lse) — block stats (m = lse, l = 1) — into the
     /// running (M, L, O) accumulators IN PLACE (caller passes fresh copies).
@@ -485,6 +559,8 @@ unsafe extern "C" {
         batch_size: i32,
         rotary_dim: i32,
         rms_eps: f32,
+        // 0 = skip the K/V pool write (2D non-owner shard); 1 = write.
+        write_kv: i32,
         stream: CUstream,
     ) -> CUresult;
 

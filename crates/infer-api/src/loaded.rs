@@ -2353,6 +2353,11 @@ mod backend {
         if let Some(pages) = executor.effective_fixed_pages_per_slot() {
             kv.set_fixed_pages_per_slot(pages);
         }
+        // 2D (attn_tp × cp): the host pool filters alloc/attach to this rank's
+        // block-cyclic shard (logical page `i` on shard `i % cp`).
+        if let Some((rank, size)) = executor.kv_shard_spec() {
+            kv.set_shard(rank, size);
+        }
         infer_core::Engine::with_config(executor, kv, scheduler)
     }
 

@@ -450,11 +450,9 @@ pub fn ring_block_fwd_merge_fa3(
                 let (lse_ptr, _lg) = lse_pair.device_ptr_mut(stream);
                 let (meta_ptr, _mg) = meta.device_ptr_mut(stream);
                 let args = ffi::ArleFa3FwdHd256Args {
-                    q: (q_ptr + (((bi * h * s) + pair.q.row) * d * 2) as u64) as *const ffi::Half,
-                    k: (k_ptr + (((bi * hk * blk) + pair.k.row) * d * 2) as u64)
-                        as *const ffi::Half,
-                    v: (v_ptr + (((bi * hk * blk) + pair.k.row) * d * 2) as u64)
-                        as *const ffi::Half,
+                    q: (q_ptr + (((bi * h * s) + pair.q.row) * d) as u64) as *const ffi::Half,
+                    k: (k_ptr + (((bi * hk * blk) + pair.k.row) * d) as u64) as *const ffi::Half,
+                    v: (v_ptr + (((bi * hk * blk) + pair.k.row) * d) as u64) as *const ffi::Half,
                     o: op_ptr as *mut ffi::Half,
                     softmax_lse: lse_ptr as *mut f32,
                     out_accum: std::ptr::null_mut(),
@@ -637,8 +635,8 @@ pub fn ring_block_bwd_fa3(
                     None => (std::ptr::null_mut(), std::ptr::null_mut(), None, None),
                 };
                 let (sem_ptr, _semg) = dq_sem.device_ptr_mut(stream);
-                let q_off = (((bi * h * s) + pair.q.row) * d * 2) as u64;
-                let kv_off = (((bi * hk * blk) + pair.k.row) * d * 2) as u64;
+                let q_off = (((bi * h * s) + pair.q.row) * d) as u64;
+                let kv_off = (((bi * hk * blk) + pair.k.row) * d) as u64;
                 let args = ffi::ArleFa3BwdHd256Args {
                     q: (q_ptr + q_off) as *const ffi::Half,
                     k: (k_ptr + kv_off) as *const ffi::Half,

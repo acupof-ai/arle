@@ -22,6 +22,50 @@ use crate::{KvAllocator, KvPrefixStore, KvQuery};
 /// opt-in recall path.
 pub const EVICTED_PAGE: u32 = u32::MAX;
 
+/// CP sequence-shard assignment for a paged KV pool.
+///
+/// Under 2D (attn_tp × cp) parallelism, rank (t, c) holds only the pages
+/// owned by shard c: logical page `i` lives on shard `i % size` (block-cyclic,
+/// stable under sequence growth). `size == 1` means no sharding (the default).
+#[derive(Debug, Clone, Copy)]
+pub struct ShardSpec {
+    pub rank: usize,
+    pub size: usize,
+}
+
+impl Default for ShardSpec {
+    fn default() -> Self {
+        Self { rank: 0, size: 1 }
+    }
+}
+
+impl ShardSpec {
+    #[must_use]
+    pub fn new(rank: usize, size: usize) -> Self {
+        Self { rank, size }
+    }
+
+    /// Number of pages in `[0, global_pages)` owned by this shard.
+    #[must_use]
+    pub fn local_page_count(&self, global_pages: usize) -> usize {
+        if self.size <= 1 {
+            return global_pages;
+        }
+        global_pages.saturating_sub(self.rank).div_ceil(self.size)
+    }
+
+    /// Whether this shard owns global page `page` (block-cyclic: page `i`
+    /// lives on shard `i % size`). The single ownership predicate — every
+    /// host-side shard decision (pool alloc count, decode meta, radix attach
+    /// filter, owner-conditional writes) goes through this or
+    /// [`local_page_count`](Self::local_page_count), never a hand-rolled
+    /// modulo, so the exactly-once ownership invariant has one source.
+    #[must_use]
+    pub fn owns_page(&self, page: usize) -> bool {
+        self.size <= 1 || page % self.size == self.rank
+    }
+}
+
 /// Host-side paged KV bookkeeping for a backend executor.
 ///
 /// Pages are logical `u32` ids; the executor decides how those ids map to
@@ -47,6 +91,7 @@ pub struct HostPagedKvPool {
     /// every decode tick, where a full `page_refs` scan is O(cached pages).
     evictable: usize,
     fixed_pages_per_slot: Option<usize>,
+    shard: ShardSpec,
 }
 
 impl HostPagedKvPool {
@@ -65,7 +110,14 @@ impl HostPagedKvPool {
             slot_attach: HashMap::new(),
             evictable: 0,
             fixed_pages_per_slot: None,
+            shard: ShardSpec::default(),
         }
+    }
+
+    /// Set the CP sequence-shard assignment. Called once at executor setup when
+    /// the 2D mode is engaged (world ≥ 4, attn_tp ≥ 2, cp ≥ 2).
+    pub fn set_shard(&mut self, rank: usize, size: usize) {
+        self.shard = ShardSpec::new(rank, size);
     }
 
     /// Fixed-band allocation for slots whose backend needs a full page table
@@ -189,8 +241,9 @@ impl KvQuery for HostPagedKvPool {
             };
         }
         let have = self.slot_pages.get(slot).map_or(0, Vec::len);
-        let after = self.pages_for_tokens(self.seq_len(slot) + tokens);
-        after.saturating_sub(have)
+        let after_global = self.pages_for_tokens(self.seq_len(slot) + tokens);
+        let after_local = self.shard.local_page_count(after_global);
+        after_local.saturating_sub(have)
     }
 
     fn fixed_pages_per_slot(&self) -> Option<usize> {
@@ -205,8 +258,13 @@ impl KvQuery for HostPagedKvPool {
         let Some(pages) = self.slot_pages.get(slot) else {
             return &[];
         };
-        let end_page = len.div_ceil(self.page_size).min(pages.len());
-        &pages[..end_page]
+        let global_end = len.div_ceil(self.page_size);
+        let local_end = self.shard.local_page_count(global_end);
+        &pages[..local_end.min(pages.len())]
+    }
+
+    fn shard_local_page_count(&self, global_pages: usize) -> usize {
+        self.shard.local_page_count(global_pages)
     }
 }
 
@@ -306,12 +364,13 @@ impl KvAllocator for HostPagedKvPool {
             self.slot_len[slot] = new_len;
             return Ok(());
         }
-        let keep_pages = self.pages_for_tokens(new_len);
+        let keep_global = self.pages_for_tokens(new_len);
+        let keep_local = self.shard.local_page_count(keep_global);
         let pages = self
             .slot_pages
             .get_mut(slot)
             .ok_or_else(|| anyhow::anyhow!("truncate_slot: slot {slot} out of range"))?;
-        let cut = keep_pages.min(pages.len());
+        let cut = keep_local.min(pages.len());
         let removed: Vec<u32> = pages.split_off(cut);
         for page in removed {
             self.detach(page);

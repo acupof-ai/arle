@@ -55,15 +55,35 @@ pub(crate) struct FullAttnScratch {
     pub(crate) cp_in: HiddenSlot,
     /// CP prefill only: pre-o_proj-reduce slice output.
     pub(crate) cp_out: HiddenSlot,
-    /// CP prefill only: `[cp, pad, 2*kv_dim]` raw k/v all-gather (in-place).
-    pub(crate) cp_kv_gather: HiddenSlot,
     /// CP prefill only: `[cp, pad, hidden]` row all-gather (in-place).
     pub(crate) cp_row_gather: HiddenSlot,
-    /// CP prefill only: dummy q in/out for the remote-slice pool-write prep
-    /// launches (the prep fuses q prep with the k/v page write; remote q is
-    /// computed into scrap and discarded).
-    pub(crate) cp_scrap_qf: HiddenSlot,
-    pub(crate) cp_scrap_qp: HiddenSlot,
+    /// 2D ring prefill only: dense head-major buffers and flash-2 accumulators.
+    pub(crate) ring_prefill: RingPrefillScratch,
+}
+
+/// Ring-prefill scratch buffers (T3.2b Part D). Grouped so the attention
+/// forward can borrow them as one disjoint field of [`FullAttnScratch`]
+/// alongside the destructured GEMM/output slots.
+#[derive(Default)]
+pub(crate) struct RingPrefillScratch {
+    /// Dense head-major `[q_heads, rows, d]` prepped q (constant across hops).
+    pub(crate) q: SliceSlot<u16>,
+    /// Rotating K/V block pairs `[kv_heads, pad, d]` (pair 0 holds this rank's
+    /// slice after the dense prep; pair 1 is the recv target; alternate).
+    pub(crate) k0: SliceSlot<u16>,
+    pub(crate) v0: SliceSlot<u16>,
+    pub(crate) k1: SliceSlot<u16>,
+    pub(crate) v1: SliceSlot<u16>,
+    /// Flash-2 (m, l, o) accumulator sets A/B (`[q_heads*rows]` m/l,
+    /// `[q_heads*rows*d]` o, f32). The FA3 route threads internally-allocated
+    /// copies after hop 0 (set A is the init); the scalar route ping-pongs
+    /// A↔B (its merge is functional, in != out).
+    pub(crate) m_a: SliceSlot<f32>,
+    pub(crate) l_a: SliceSlot<f32>,
+    pub(crate) o_a: SliceSlot<f32>,
+    pub(crate) m_b: SliceSlot<f32>,
+    pub(crate) l_b: SliceSlot<f32>,
+    pub(crate) o_b: SliceSlot<f32>,
 }
 
 /// Paged full-attn forwarding context for Qwen3.6 — the DEFAULT path since the
@@ -113,12 +133,20 @@ pub(crate) struct Qwen35CpPrefill {
     pub(crate) slices: Vec<(usize, usize)>,
     /// `ceil(chunk_len / cp)` — fixed per-rank row count for the collectives.
     pub(crate) pad: usize,
-    /// `[cp]` absolute start position per slice (device, for the remote-slice
-    /// pool-write prep launches).
-    pub(crate) start_positions: CudaSlice<i32>,
-    /// Slot page indices covering the WHOLE chunk, logical-page-0 based (the
-    /// prep kernel indexes `kv_indices[(start_pos + i) / page_size]`).
+    /// Slot page indices covering this shard's LOCAL pages, in local-index
+    /// order (entry `j` backs global page `cp_rank + j*cp`). The scatter
+    /// kernel indexes this as `local_page_table[g / cp]`.
     pub(crate) kv_indices: CudaSlice<i32>,
+    /// This rank's absolute q positions `[off, off+rows)` (host, for the FA3
+    /// ring route's position arrays).
+    pub(crate) q_pos: Vec<usize>,
+    /// Per-owner absolute k positions: `k_pos[owner]` is slice `owner`'s
+    /// `[off, off+len)` (host, for the FA3 ring route).
+    pub(crate) k_pos: Vec<Vec<usize>>,
+    /// Device `q_pos` as f32 (the scalar ring merge's position transport).
+    pub(crate) q_pos_f32: CudaSlice<f32>,
+    /// Device `k_pos[owner]` as f32, per owner (the scalar ring merge).
+    pub(crate) k_pos_f32: Vec<CudaSlice<f32>>,
 }
 
 #[derive(Default)]
@@ -242,10 +270,18 @@ impl Qwen35Workspace {
         full.batch_partial_l.release();
         full.cp_in.release();
         full.cp_out.release();
-        full.cp_kv_gather.release();
         full.cp_row_gather.release();
-        full.cp_scrap_qf.release();
-        full.cp_scrap_qp.release();
+        full.ring_prefill.q.release();
+        full.ring_prefill.k0.release();
+        full.ring_prefill.v0.release();
+        full.ring_prefill.k1.release();
+        full.ring_prefill.v1.release();
+        full.ring_prefill.m_a.release();
+        full.ring_prefill.l_a.release();
+        full.ring_prefill.o_a.release();
+        full.ring_prefill.m_b.release();
+        full.ring_prefill.l_b.release();
+        full.ring_prefill.o_b.release();
         linear.cp_in.release();
         linear.cp_out.release();
         linear.cp_row_gather.release();

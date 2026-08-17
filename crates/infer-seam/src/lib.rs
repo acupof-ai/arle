@@ -43,7 +43,7 @@ mod runtime_flags;
 
 pub use allocator::KvAllocator;
 pub use diffusion_executor::BufferedDiffusionExecutor;
-pub use host_paged_kv_pool::{EVICTED_PAGE, HostPagedKvPool};
+pub use host_paged_kv_pool::{EVICTED_PAGE, HostPagedKvPool, ShardSpec};
 pub use kv::KvPool;
 pub use kv_batch::{KvBatchDescriptor, KvBatchRow, KvBatchRowKind};
 pub use kv_budget::KvTierBudget;
@@ -330,6 +330,13 @@ pub trait BackendExecutor {
     /// docs/experience/errors/2026-07-05-multiproc-lockstep-ack-hang-no-timeout.md).
     fn tp_sync_min(&self, local: usize) -> anyhow::Result<usize> {
         Ok(local)
+    }
+
+    /// KV pool sequence-shard factor. Under 2D (attn_tp × cp) parallelism, each
+    /// rank's pool holds 1/cp of the sequence pages, so the engine's page
+    /// budgeting divides by this factor. Default 1 (no sharding).
+    fn kv_shard_factor(&self) -> usize {
+        1
     }
 
     /// Prefix-cache restore/publish coordination below the seam.

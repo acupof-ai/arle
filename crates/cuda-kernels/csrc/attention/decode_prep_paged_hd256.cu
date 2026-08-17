@@ -96,7 +96,8 @@ __global__ void decode_prep_paged_hd256_kernel(
     int page_size,
     int stride_page,                                  // num_kv_heads * page_size * HD256
     int rotary_dim,
-    float rms_eps
+    float rms_eps,
+    int write_kv                                      // 0 = skip the K/V pool write (2D non-owner shard)
 ) {
     int kv_head_idx = blockIdx.x;
     int batch_idx = blockIdx.y;
@@ -148,22 +149,26 @@ __global__ void decode_prep_paged_hd256_kernel(
     float v_val = __bfloat162float(v_batch[kv_offset]);
 
     // ---- Write K and V to paged cache ----
-    int page_start = page_indptr[batch_idx];
-    int num_pages = page_indptr[batch_idx + 1] - page_start;
-    int last_len = last_page_len[batch_idx];
+    // Under 2D sequence-sharding only the shard owning the new token's page
+    // (logical page pos/page_size, i % cp == c) writes; the other shards skip.
+    if (write_kv) {
+        int page_start = page_indptr[batch_idx];
+        int num_pages = page_indptr[batch_idx + 1] - page_start;
+        int last_len = last_page_len[batch_idx];
 
-    int last_page_idx = num_pages - 1;
-    int page_id = page_table[page_start + last_page_idx];
-    int token_in_page = last_len - 1;
+        int last_page_idx = num_pages - 1;
+        int page_id = page_table[page_start + last_page_idx];
+        int token_in_page = last_len - 1;
 
-    // HND layout: [max_pages, num_kv_heads, page_size, HD256]
-    int cache_offset = page_id * stride_page
-                     + kv_head_idx * page_size * HD256
-                     + token_in_page * HD256
-                     + tid;
+        // HND layout: [max_pages, num_kv_heads, page_size, HD256]
+        int cache_offset = page_id * stride_page
+                         + kv_head_idx * page_size * HD256
+                         + token_in_page * HD256
+                         + tid;
 
-    k_pool[cache_offset] = __float2bfloat16(k_roped);
-    v_pool[cache_offset] = __float2bfloat16(v_val);
+        k_pool[cache_offset] = __float2bfloat16(k_roped);
+        v_pool[cache_offset] = __float2bfloat16(v_val);
+    }
 }
 
 // Gate kernel: apply sigmoid gate from q_full to attention output.
@@ -218,6 +223,7 @@ cudaError_t decode_prep_paged_hd256_cuda(
     int batch_size,
     int rotary_dim,
     float rms_eps,
+    int write_kv,
     cudaStream_t stream
 ) {
     if (q_full_batch == nullptr || q_out_batch == nullptr || k_batch == nullptr ||
@@ -245,7 +251,7 @@ cudaError_t decode_prep_paged_hd256_cuda(
         page_table, page_indptr, last_page_len,
         num_qo_heads, num_kv_heads,
         page_size, stride_page,
-        rotary_dim, rms_eps
+        rotary_dim, rms_eps, write_kv
     );
     return cudaGetLastError();
 }

@@ -68,6 +68,12 @@ pub(crate) fn upload_u64(ctx: &DeviceContext, values: &[u64]) -> Result<CudaSlic
         .map_err(|e| anyhow!("H2D u64 upload failed: {e}"))
 }
 
+pub(crate) fn upload_f32(ctx: &DeviceContext, values: &[f32]) -> Result<CudaSlice<f32>> {
+    ctx.stream
+        .clone_htod(values)
+        .map_err(|e| anyhow!("H2D f32 upload failed: {e}"))
+}
+
 pub(crate) fn embedding_batch(
     ctx: &DeviceContext,
     embed: &DeviceMatrix,
