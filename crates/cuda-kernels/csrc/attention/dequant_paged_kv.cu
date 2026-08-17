@@ -1,9 +1,7 @@
 // Dequantize ARLE's 1-byte quantized KV planes (FP8 e4m3 or INT8, KIVI
 // per-(token, kv_head) f32 scales) to bf16.
 //
-// Two entry points:
-//   - dequantize_paged_kv_to_bf16_cuda: linear token-major buffer
-//     [num_tokens, num_kv_heads, head_dim], in and out the same shape;
+// Entry point:
 //   - dequantize_paged_kv_compact_cuda: page-table compaction for the FA3
 //     quant shim — each (batch row b, logical page j) of the rectangular
 //     page table lands in compact slot b*stride+j of the bf16 output pool
@@ -95,56 +93,9 @@ __global__ void dequant_compact_kernel(
     }
 }
 
-// Grid-stride over the flat token-major [num_tokens, H, D] element space.
-__global__ void dequant_linear_kernel(
-        const unsigned char* __restrict__ data,
-        const float* __restrict__ scales,
-        __nv_bfloat16* __restrict__ out,
-        int64_t total,
-        int num_kv_heads,
-        int head_dim,
-        bool is_fp8) {
-    const int64_t stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
-    for (int64_t idx =
-             static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-         idx < total; idx += stride) {
-        const int d = static_cast<int>(idx % head_dim);
-        const int64_t rest = idx / head_dim;
-        const int h = static_cast<int>(rest % num_kv_heads);
-        const int64_t t = rest / num_kv_heads;
-        const float scale = scales[t * num_kv_heads + h];
-        out[idx] =
-            __float2bfloat16(dequant_value(data, idx, is_fp8) * scale);
-    }
-}
-
 }  // namespace
 
 extern "C" {
-
-cudaError_t dequantize_paged_kv_to_bf16_cuda(const void* data,
-                                             const float* scales,
-                                             void* out,
-                                             int num_tokens,
-                                             int num_kv_heads,
-                                             int head_dim,
-                                             int is_fp8,
-                                             cudaStream_t stream) {
-    if (data == nullptr || scales == nullptr || out == nullptr ||
-        num_tokens <= 0 || num_kv_heads <= 0 || head_dim <= 0) {
-        return cudaErrorInvalidValue;
-    }
-    const int64_t total =
-        static_cast<int64_t>(num_tokens) * num_kv_heads * head_dim;
-    constexpr int kThreads = 256;
-    int64_t blocks = (total + kThreads - 1) / kThreads;
-    if (blocks > 4096) blocks = 4096;
-    dequant_linear_kernel<<<static_cast<int>(blocks), kThreads, 0, stream>>>(
-        static_cast<const unsigned char*>(data), scales,
-        static_cast<__nv_bfloat16*>(out), total, num_kv_heads, head_dim,
-        is_fp8 != 0);
-    return cudaGetLastError();
-}
 
 cudaError_t dequantize_paged_kv_compact_cuda(const void* data,
                                              const float* scales,

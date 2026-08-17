@@ -80,43 +80,6 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    pub fn fused_gqa_attention_decode_batched(
-        q_batch: *const Half,
-        k_batch: *const Half,
-        v_batch: *const Half,
-        q_norm_weight: *const Half,
-        k_norm_weight: *const Half,
-        cos_cache: *const Half,
-        sin_cache: *const Half,
-        positions: *const i32,
-        seq_lens: *const i32,
-        k_cache_ptrs: *const *const Half,
-        v_cache_ptrs: *const *const Half,
-        partial_out: *mut f32,
-        partial_m: *mut f32,
-        partial_l: *mut f32,
-        num_qheads: i32,
-        num_kvheads: i32,
-        gqa_ratio: i32,
-        head_dim: i32,
-        rotary_dim: i32,
-        max_seq_len: i32,
-        batch_size: i32,
-        rms_eps: f32,
-        stream: CUstream,
-    ) -> CUresult;
-
-    pub fn attention_decode_reduce_batched(
-        partial_out: *const f32,
-        partial_m: *const f32,
-        partial_l: *const f32,
-        output: *mut Half,
-        num_qheads: i32,
-        head_dim: i32,
-        batch_size: i32,
-        stream: CUstream,
-    ) -> CUresult;
-
     pub fn nonpaged_prefill_attention_cuda(
         q: *const Half,
         k_cache: *const Half,
@@ -741,21 +704,6 @@ unsafe extern "C" {
         stream: CUstream,
         workspace: *mut u8,
         workspace_bytes: usize,
-    ) -> CUresult;
-
-    /// Dequantize a 1-byte quantized (FP8 e4m3 or INT8) token-major buffer
-    /// `[num_tokens, num_kv_heads, head_dim]` with KIVI per-(token, head) f32
-    /// scales `[num_tokens, num_kv_heads]` into a bf16 buffer of the same
-    /// shape. `is_fp8 = 1` selects e4m3, `0` signed int8.
-    pub fn dequantize_paged_kv_to_bf16_cuda(
-        data: *const u8,
-        scales: *const f32,
-        out: *mut Half,
-        num_tokens: i32,
-        num_kv_heads: i32,
-        head_dim: i32,
-        is_fp8: i32,
-        stream: CUstream,
     ) -> CUresult;
 
     /// Page-table compaction dequant for the FA3 quant shim. Each
