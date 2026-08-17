@@ -60,8 +60,20 @@ fn main() {
 
 // Same tiny config + trajectory as nd_parallel_parity, so this shares the exact
 // name-seeded model and token stream the failing gate uses.
+//
+// ARLE_CPH_MOE=1 swaps in a sparse-MLP config (4 experts, top-2) so the gate
+// exercises the MoE x CP composition (issue #236): the dense config says nothing
+// about `forward_sparse_mlp` under a zigzag shard. Weights are replicated in CP,
+// so no TP divisibility constraint applies.
 #[cfg(all(feature = "cuda", feature = "nccl"))]
 fn tiny_cfg() -> Qwen35Config {
+    let moe = std::env::var("ARLE_CPH_MOE").is_ok_and(|v| matches!(v.trim(), "1" | "true" | "on"));
+    // Diagnostic: ARLE_CPH_LAYERS=fa swaps both layers to FullAttention to
+    // isolate whether the linear-attn a2a path contributes to the MoE bf16 floor.
+    let layer_types = match std::env::var("ARLE_CPH_LAYERS").as_deref() {
+        Ok("fa") => vec![LayerType::FullAttention, LayerType::FullAttention],
+        _ => vec![LayerType::LinearAttention, LayerType::FullAttention],
+    };
     Qwen35Config {
         hidden_size: 512,
         intermediate_size: 16,
@@ -87,12 +99,12 @@ fn tiny_cfg() -> Qwen35Config {
         partial_rotary_factor: 1.0,
         rotary_dim: 256,
         rope_cache_len_hint: Some(SEQ.next_power_of_two().max(16)),
-        layer_types: vec![LayerType::LinearAttention, LayerType::FullAttention],
-        num_experts: 0,
-        num_experts_per_tok: 0,
+        layer_types,
+        num_experts: if moe { 4 } else { 0 },
+        num_experts_per_tok: if moe { 2 } else { 0 },
         decoder_sparse_step: 1,
-        moe_intermediate_size: 0,
-        shared_expert_intermediate_size: 0,
+        moe_intermediate_size: if moe { 16 } else { 0 },
+        shared_expert_intermediate_size: if moe { 16 } else { 0 },
         norm_topk_prob: true,
         mlp_only_layers: Vec::new(),
         full_attn_gated: true,
