@@ -412,14 +412,20 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
                     self.kv_system_metrics.fallback_recompute.saturating_add(1);
                 let fresh = request.clone().reset_for_recompute();
                 *request = fresh;
-                let committed = request.committed_tokens();
-                let prefix_match =
-                    if self.config.enable_prefix_cache && self.executor.kv_shard_spec().is_none() {
+                // CP sharding: ring pass recomputes the whole prompt; skip
+                // match+attach. reset_for_recompute already set the
+                // prefill_start_pos=0 / Prefilling{0} state the empty-attach
+                // would set, and the collectives deadlock cross-communicator.
+                if self.executor.kv_shard_spec().is_none() {
+                    let committed = request.committed_tokens();
+                    let prefix_match = if self.config.enable_prefix_cache {
                         self.lookup_prefix_for_attach(&committed)?
                     } else {
                         crate::PrefixMatch::empty()
                     };
-                self.attach_prefix_to_request(slot, request, &committed, prefix_match)
+                    self.attach_prefix_to_request(slot, request, &committed, prefix_match)?;
+                }
+                Ok(())
             }
         }
     }
