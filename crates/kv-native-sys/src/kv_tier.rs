@@ -1830,3 +1830,135 @@ pub fn weights_epoch_tag(model_path: &Path) -> String {
         format!("path-{hash:016x}")
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn store_with_disk(host_pages: usize, page_bytes: usize) -> (KvTierStore, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = KvTierStore::with_budget(host_pages * page_bytes, page_bytes);
+        assert!(store.set_disk(dir.path().to_path_buf(), 1024 * 1024, page_bytes));
+        (store, dir)
+    }
+
+    fn payload(page_bytes: usize, fill: u8) -> Vec<u8> {
+        vec![fill; page_bytes]
+    }
+
+    #[test]
+    fn l2_insert_read_tracks_host_hits() {
+        let mut store = KvTierStore::with_budget(4096, 1024);
+        assert!(store.insert(1, payload(1024, 0xAA)));
+        assert_eq!(store.host_demoted_pages(), 1);
+        assert_eq!(store.read_hits().host_demoted, 0);
+
+        let data = store.read(1).unwrap();
+        assert_eq!(data.len(), 1024);
+        assert_eq!(data[0], 0xAA);
+        assert_eq!(store.read_hits().host_demoted, 1);
+        assert_eq!(store.read_hits().disk, 0);
+
+        // Second read increments again.
+        let _ = store.read(1).unwrap();
+        assert_eq!(store.read_hits().host_demoted, 2);
+    }
+
+    #[test]
+    fn l3_spills_coldest_to_disk_on_host_full() {
+        // Host capacity = 2 pages.
+        let (mut store, _dir) = store_with_disk(2, 1024);
+        assert!(store.insert(1, payload(1024, 0x01)));
+        assert!(store.insert(2, payload(1024, 0x02)));
+        assert_eq!(store.host_demoted_pages(), 2);
+        assert_eq!(store.disk_pages(), 0);
+
+        // Third insert spills key 1 (coldest) to disk.
+        assert!(store.insert(3, payload(1024, 0x03)));
+        assert_eq!(store.host_demoted_pages(), 2);
+        assert_eq!(store.disk_pages(), 1);
+        assert_eq!(store.location(1), Some(infer_seam::KvTierLocation::Disk));
+        assert_eq!(
+            store.location(2),
+            Some(infer_seam::KvTierLocation::HostDemoted)
+        );
+    }
+
+    #[test]
+    fn l3_disk_read_promotes_back_to_host() {
+        let (mut store, _dir) = store_with_disk(1, 1024);
+        assert!(store.insert(1, payload(1024, 0x01)));
+
+        // Second insert spills key 1 to disk (host capacity = 1).
+        assert!(store.insert(2, payload(1024, 0x02)));
+        assert_eq!(store.location(1), Some(infer_seam::KvTierLocation::Disk));
+        assert_eq!(store.read_hits().disk, 0);
+
+        // Read key 1 from disk → promote-on-read re-inserts into host.
+        let data = store.read(1).unwrap();
+        assert_eq!(data[0], 0x01);
+        assert_eq!(store.read_hits().disk, 1);
+        // Key 1 is now back in host (key 2 was evicted to disk).
+        assert_eq!(
+            store.location(1),
+            Some(infer_seam::KvTierLocation::HostDemoted)
+        );
+
+        // Second read is a host hit, not a disk hit.
+        let _ = store.read(1).unwrap();
+        assert_eq!(store.read_hits().disk, 1);
+        assert_eq!(store.read_hits().host_demoted, 1);
+    }
+
+    #[test]
+    fn read_many_tracks_mixed_hits() {
+        let (mut store, _dir) = store_with_disk(2, 1024);
+        assert!(store.insert(1, payload(1024, 0x01)));
+        assert!(store.insert(2, payload(1024, 0x02)));
+        // Spill key 1 to disk.
+        assert!(store.insert(3, payload(1024, 0x03)));
+
+        let values = store.read_many(&[1, 2, 3]).unwrap();
+        assert_eq!(values.len(), 3);
+        assert_eq!(values[0][0], 0x01); // disk hit (promoted to host)
+        assert_eq!(values[1][0], 0x02); // host hit
+        assert_eq!(values[2][0], 0x03); // host hit
+        assert_eq!(store.read_hits().disk, 1);
+        assert_eq!(store.read_hits().host_demoted, 2);
+    }
+
+    #[test]
+    fn location_returns_none_for_missing_key() {
+        let (store, _dir) = store_with_disk(2, 1024);
+        assert_eq!(store.location(999), None);
+    }
+
+    #[test]
+    fn remove_drops_entries_from_both_levels() {
+        let (mut store, _dir) = store_with_disk(2, 1024);
+        assert!(store.insert(1, payload(1024, 0x01)));
+        assert!(store.insert(2, payload(1024, 0x02)));
+        assert!(store.insert(3, payload(1024, 0x03))); // spills key 1
+
+        store.remove(&[1, 2]);
+        assert!(!store.contains(1));
+        assert!(!store.contains(2));
+        assert!(store.contains(3));
+        assert_eq!(store.host_demoted_pages(), 1);
+        assert_eq!(store.disk_pages(), 0);
+    }
+
+    #[test]
+    fn host_only_store_works_without_disk() {
+        let mut store = KvTierStore::with_budget(4096, 1024);
+        assert!(store.insert(1, payload(1024, 0xAA)));
+        assert!(store.insert(2, payload(1024, 0xBB)));
+        assert_eq!(store.host_demoted_pages(), 2);
+        assert_eq!(store.disk_pages(), 0);
+
+        let data = store.read(1).unwrap();
+        assert_eq!(data[0], 0xAA);
+        assert_eq!(store.read_hits().host_demoted, 1);
+        assert_eq!(store.read_hits().disk, 0);
+    }
+}
