@@ -10,8 +10,6 @@ pub mod checkpoint;
 pub mod chunk_accum;
 #[path = "ops/collective.rs"]
 pub mod collective;
-#[path = "ops/collective_ep.rs"]
-pub mod collective_ep;
 #[path = "ops/elementwise.rs"]
 pub mod elementwise;
 #[path = "ops/embed.rs"]

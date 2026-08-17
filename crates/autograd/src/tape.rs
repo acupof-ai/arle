@@ -204,13 +204,6 @@ pub enum SavedContext {
         num_tokens: usize,
         dim: usize,
     },
-    // Expert-parallel row exchange: per-peer row counts; backward swaps them.
-    EpExchangeCtx {
-        input: TensorId,
-        send_counts: Vec<usize>,
-        recv_counts: Vec<usize>,
-        dim: usize,
-    },
     // Ring-attention context-parallel tile: `blocks` are (k, v, k_abs) TensorIds
     // ring-delivered in forward order; `lse`/`out` are the saved per-row logsumexp
     // and normalized output the flash-2 backward replays against. `cp_size`/`cp_rank`
@@ -278,9 +271,6 @@ pub enum BackwardOp {
     AllGatherSeq,
     ReduceScatterSum,
     AllToAll,
-    EpDispatch,
-    EpCombine,
-    EpExchange,
     RingAttention,
     Checkpoint,
     SeqChunkedRecompute,
@@ -328,9 +318,6 @@ impl BackwardOp {
             BackwardOp::AllGatherSeq => "AllGatherSeq",
             BackwardOp::ReduceScatterSum => "ReduceScatterSum",
             BackwardOp::AllToAll => "AllToAll",
-            BackwardOp::EpDispatch => "EpDispatch",
-            BackwardOp::EpCombine => "EpCombine",
-            BackwardOp::EpExchange => "EpExchange",
             BackwardOp::RingAttention => "RingAttention",
             BackwardOp::Checkpoint => "Checkpoint",
             BackwardOp::SeqChunkedRecompute => "SeqChunkedRecompute",
@@ -610,62 +597,6 @@ impl Tape {
         Ok(profile)
     }
 
-    pub fn backward_accumulate_targets(
-        &mut self,
-        loss_id: TensorId,
-        store: &mut TensorStore,
-        target_ids: &[TensorId],
-    ) -> Result<HashMap<TensorId, TensorId>> {
-        let grads = self.backward_impl(loss_id, store, None, false)?;
-        for &target_id in target_ids {
-            if let Some(&grad_id) = grads.get(&target_id) {
-                store.accumulate_grad(target_id, grad_id)?;
-            }
-        }
-        Ok(grads)
-    }
-
-    pub fn backward_from_seed_accumulate_targets(
-        &mut self,
-        output_id: TensorId,
-        seed_grad_id: TensorId,
-        store: &mut TensorStore,
-        target_ids: &[TensorId],
-    ) -> Result<HashMap<TensorId, TensorId>> {
-        let grads =
-            self.backward_impl_seed(output_id, Some(seed_grad_id), store, None, false, None)?;
-        for &target_id in target_ids {
-            if let Some(&grad_id) = grads.get(&target_id) {
-                store.accumulate_grad(target_id, grad_id)?;
-            }
-        }
-        Ok(grads)
-    }
-
-    pub fn backward_from_seed_accumulate_targets_profiled(
-        &mut self,
-        output_id: TensorId,
-        seed_grad_id: TensorId,
-        store: &mut TensorStore,
-        target_ids: &[TensorId],
-    ) -> Result<(HashMap<TensorId, TensorId>, BackwardProfile)> {
-        let mut profile = BackwardProfile::default();
-        let grads = self.backward_impl_seed(
-            output_id,
-            Some(seed_grad_id),
-            store,
-            Some(&mut profile),
-            false,
-            None,
-        )?;
-        for &target_id in target_ids {
-            if let Some(&grad_id) = grads.get(&target_id) {
-                store.accumulate_grad(target_id, grad_id)?;
-            }
-        }
-        Ok((grads, profile))
-    }
-
     pub fn backward_collect(
         &mut self,
         loss_id: TensorId,
@@ -890,15 +821,6 @@ impl Tape {
                     }
                     BackwardOp::AllToAll => {
                         ops::all_to_all_backward(&entry, output_grad_id, store)?
-                    }
-                    BackwardOp::EpDispatch => {
-                        ops::collective_ep::ep_dispatch_backward(&entry, output_grad_id, store)?
-                    }
-                    BackwardOp::EpCombine => {
-                        ops::collective_ep::ep_combine_backward(&entry, output_grad_id, store)?
-                    }
-                    BackwardOp::EpExchange => {
-                        ops::collective_ep::ep_exchange_backward(&entry, output_grad_id, store)?
                     }
                     BackwardOp::RingAttention => ops::ring_attention::cp_ring_attention_backward(
                         &entry,

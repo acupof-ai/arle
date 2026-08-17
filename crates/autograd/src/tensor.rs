@@ -368,10 +368,6 @@ impl TensorStore {
         self.backend.as_ref()
     }
 
-    pub fn set_backend(&mut self, backend: Arc<dyn Backend>) {
-        self.backend = backend;
-    }
-
     fn discard_checkpoint_copy(&mut self, id: TensorId) -> Result<()> {
         let (residency, bytes) = {
             let tensor = self.tensor(id)?;
@@ -1009,12 +1005,6 @@ impl TensorStore {
             .get_mut(id)
             .and_then(Option::as_mut)
             .ok_or(AutogradError::InvalidTensorId(id))
-    }
-
-    pub fn zeros_like(&mut self, id: TensorId) -> Result<TensorId> {
-        let source = self.tensor(id)?;
-        let tensor = Tensor::new(vec![0.0; source.size], source.shape.clone(), false)?;
-        Ok(self.alloc(tensor))
     }
 
     pub fn accumulate_grad(&mut self, param_id: TensorId, grad_id: TensorId) -> Result<()> {

@@ -6,7 +6,6 @@ pub mod ffi;
 #[cfg(feature = "cuda")]
 pub mod kv_quant;
 #[cfg(feature = "cuda")]
-pub mod kv_turboquant;
 pub mod kv_types;
 #[cfg(feature = "cuda")]
 pub mod moe;
@@ -22,6 +21,7 @@ pub mod tensor;
 #[cfg(feature = "cuda")]
 pub mod turboquant_state;
 
+#[cfg(feature = "cuda")]
 pub use kv_types::{KVCacheDtype, KVFormat};
 
 /// So downstream crates (autograd) can name the `RawDevicePtr<bf16>` the DeepGEMM

@@ -1238,36 +1238,6 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         (1, 0)
     }
 
-    /// Variable-split row exchange (MoE-EP dispatch/combine transport): rows of
-    /// `[sum(send_counts), dim]` go out in rank order — `send_counts[j]` rows to
-    /// rank `j` — and `recv_counts[j]` rows arrive from rank `j`, concatenated in
-    /// rank order. Single rank is identity.
-    fn ep_exchange_rows_device(
-        &self,
-        x: &DeviceHandle,
-        dim: usize,
-        send_counts: &[usize],
-        recv_counts: &[usize],
-        axis: CommAxis,
-    ) -> Result<DeviceHandle> {
-        let _ = axis;
-        if send_counts.len() > 1 || recv_counts.len() > 1 {
-            return Err(crate::AutogradError::TapeInvariant(
-                "ep_exchange_rows: multi-rank exchange needs a CUDA+NCCL backend",
-            ));
-        }
-        let rows: usize = send_counts.iter().sum();
-        let host = self.readback(x)?;
-        if host.len() != rows * dim {
-            return Err(crate::AutogradError::DataLengthMismatch {
-                len: host.len(),
-                shape: vec![rows, dim],
-                size: rows * dim,
-            });
-        }
-        self.upload(&host, &[rows, dim])
-    }
-
     /// All-to-all: split `scatter_axis` across ranks, concatenate each rank's
     /// slice along `gather_axis`. Returns `(handle, out_shape)` — the shape
     /// changes (`[seq/N,b,hidden]` → `[seq,b,hidden/N]`), so the caller can't
