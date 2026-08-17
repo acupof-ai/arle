@@ -89,7 +89,7 @@ case "$cmd" in
     git -C "$ROOT" ls-files -d -z > "$stage/deletes"
     COPYFILE_DISABLE=1 tar --no-xattrs -C "$ROOT" --null -T "$stage/files" -czf "$stage/tree.tgz"
     archive_sha="$(shasum -a 256 "$stage/tree.tgz" | cut -d' ' -f1)"
-    pod_head="$("$POD" "git -C '$TREE' rev-parse HEAD" 2>/dev/null | tr -d '[:space:]')"
+    pod_head="$("$POD" "git -C '$TREE' rev-parse HEAD" 2>/dev/null | tr -d '[:space:]' || true)"
     bundle_mode=full
     if [ "${1:-}" != --full ] && [ "$pod_head" = "$head" ]; then
       bundle_mode=none
