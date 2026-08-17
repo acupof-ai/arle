@@ -13,10 +13,9 @@
 //! `bytes_per_token` record per token in the K plane only.
 
 use anyhow::{Result, anyhow, ensure};
-use cudarc::driver::{CudaSlice, DevicePtr, DeviceRepr};
+use cudarc::driver::{CudaSlice, DevicePtr};
 use log::info;
 
-use super::ffi;
 use super::tensor::DeviceContext;
 use crate::kv_quant::decode_attention_int8_workspace_bytes;
 use crate::kv_types::{KVCacheDtype, KVFormat};
