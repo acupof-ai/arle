@@ -370,6 +370,8 @@ fn coordinator_handle(
             .expect("spawn coordinator lockstep thread");
     }
 
+    crate::observe::spawn_observe_task_coordinator(Arc::clone(&relay));
+
     let (multimodal_tx, multimodal_kind) = multimodal.unzip();
 
     let template_defaults_thinking = tokenizer.defaults_thinking_on();
