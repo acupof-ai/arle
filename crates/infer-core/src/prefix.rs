@@ -659,7 +659,15 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
     /// the matched prefix are promoted back into freshly allocated pages so
     /// the existing resident-only attach path applies unchanged; a promote
     /// failure truncates the match there and the tail re-prefills.
-    pub(crate) fn lookup_prefix_for_attach(&mut self, tokens: &[u32]) -> PrefixMatch {
+    ///
+    /// Tier promotion is rank-local, so a single rank's promote failure
+    /// truncates its match while peers keep the full length. The matched
+    /// length goes through `tp_sync_min` before return so every rank attaches
+    /// the same `prefill_start_pos` — a divergent one desyncs the TP
+    /// collectives' shapes. The capacity gate is rank-symmetric (configured
+    /// capacity, not free), so every rank issues exactly one reduce per
+    /// tier-path attach.
+    pub(crate) fn lookup_prefix_for_attach(&mut self, tokens: &[u32]) -> Result<PrefixMatch> {
         if self.kv_tier_capacity() == 0 {
             let matched = self.radix.longest_prefix_match(tokens);
             let raw = matched.block_ids.len();
@@ -675,7 +683,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
                 tokens.len(),
                 clamped.block_ids.len()
             );
-            return clamped;
+            return Ok(clamped);
         }
         let blocks_all = self.radix.tiered_longest_prefix_match(tokens).blocks;
         let resident = blocks_all
@@ -691,14 +699,29 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             blocks.len()
         );
         blocks.truncate(reusable);
-        let block_ids = self.materialize_prefix_blocks(&blocks);
+        let mut block_ids = self.materialize_prefix_blocks(&blocks);
         // record_prefix_tier_hits now lives inside materialize_prefix_blocks
         // so block locations are captured before promotion removes entries.
         self.drain_dropped_tier_keys();
-        PrefixMatch {
-            matched_len: block_ids.len() * self.radix.block_size(),
-            block_ids,
+        let local_len = block_ids.len() * self.radix.block_size();
+        let aligned = self.executor.tp_sync_min(local_len)?;
+        if aligned < local_len {
+            let keep = aligned / self.radix.block_size();
+            let tail = block_ids.split_off(keep);
+            // The tail was promoted and retained in materialize; release it so
+            // it is evictable again (the radix node still points at it until
+            // normal eviction severs it). The slot re-prefills this tail.
+            self.kv.release_pages(&tail);
+            self.executor_release_prefix_pages(&tail);
+            log::info!(
+                "prefix-lookup(tier): cross-rank min truncated match {local_len} -> {aligned} ({} tail pages released)",
+                tail.len()
+            );
         }
+        Ok(PrefixMatch {
+            matched_len: aligned,
+            block_ids,
+        })
     }
 
     /// Materialize a backend-approved leading prefix into resident page ids.
