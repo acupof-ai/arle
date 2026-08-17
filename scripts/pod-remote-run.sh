@@ -240,8 +240,8 @@ PY
               logical_gpus="$(printf '%s,' "${!selected_gpus[@]}")"
               logical_gpus="${logical_gpus%,}"
               logical_gpus="${logical_gpus// /,}"
-              local dp_size="${INFER_DP_SIZE:-1}"
-              local tp_size=$(( ${#selected_gpus[@]} / dp_size ))
+              dp_size="${INFER_DP_SIZE:-1}"
+              tp_size=$(( ${#selected_gpus[@]} / dp_size ))
               CUDA_VISIBLE_DEVICES="$selected_gpu" INFER_CUDA_DEVICES="$logical_gpus" INFER_DP_SIZE="$dp_size" INFER_TP_SIZE="$tp_size" python3 "$TREE/scripts/reap_run.py" "$OP" --argv-file "$DIR/argv.nul" "$binary"; rc=$?
             fi
           fi
