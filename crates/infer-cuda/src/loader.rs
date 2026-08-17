@@ -4290,64 +4290,129 @@ impl SafetensorLoader {
             }
         };
 
-        let mut w13 = Vec::with_capacity(split.experts_per_rank);
-        let mut w2 = Vec::with_capacity(split.experts_per_rank);
-        for e in split.local_expert_start..split.local_expert_end() {
-            let expert = names.expert(e);
-            // w1 (gate) over w3 (up), row-stacked into one fused FP8 cache so the
-            // masked grouped GEMM produces [gate | up] in a single launch.
-            let w1 = load_fp8(&expert.w1)?;
-            let w3 = load_fp8(&expert.w3)?;
-            w13.push(build_w13(&w1, &w3)?);
-            let down = load_fp8(&expert.w2)?;
-            w2.push(build_w2(&down)?);
-        }
-        let first_w13 = w13
-            .first()
-            .ok_or_else(|| anyhow!("DSv4 MoE layer has no local experts"))?;
-        let first_w2 = w2
-            .first()
-            .ok_or_else(|| anyhow!("DSv4 MoE layer has no local down experts"))?;
-        let hidden_dim = first_w13.cols;
-        let intermediate = first_w2.cols;
-        ensure!(
-            first_w13.rows == 2 * intermediate,
-            "DSv4 grouped w13 rows {} != 2*intermediate {}",
-            first_w13.rows,
-            2 * intermediate
-        );
-        ensure!(
-            first_w2.rows == hidden_dim,
-            "DSv4 grouped w2 rows {} != hidden_dim {hidden_dim}",
-            first_w2.rows
-        );
-        let w13_layout = if mega_moe {
-            crate::moe::GroupedWeightLayout::InterleavedL1
-        } else {
-            crate::moe::GroupedWeightLayout::Normal
-        };
-        let w13_grouped = crate::moe::build_grouped_cache(
-            ctx,
-            w13.as_slice(),
-            2 * intermediate,
-            hidden_dim,
-            w13_layout,
-        )?;
-        let w2_grouped = crate::moe::build_grouped_cache(
-            ctx,
-            w2.as_slice(),
-            hidden_dim,
-            intermediate,
-            crate::moe::GroupedWeightLayout::Normal,
-        )?;
-        let num_groups = w13_grouped.groups;
-        ensure!(
-            num_groups == split.experts_per_rank && w2_grouped.groups == num_groups,
-            "DSv4 grouped expert count mismatch: w13={} w2={} expected {}",
-            w13_grouped.groups,
-            w2_grouped.groups,
-            split.experts_per_rank
-        );
+        // Detect W4A16: the first routed expert's w1 carries a W4A16 quant view.
+        let first_expert = names.expert(split.local_expert_start);
+        let is_w4a16 = self
+            .quant_view_for(&first_expert.w1)?
+            .map(|v| matches!(v.format, QuantFormat::W4A16))
+            .unwrap_or(false);
+
+        let (w13_grouped, w2_grouped, w13_w4a16, w2_w4a16, hidden_dim, intermediate, num_groups) =
+            if is_w4a16 {
+                // W4A16 path: per-expert packed INT4 + BF16 group scales.
+                let mut w13 = Vec::with_capacity(split.experts_per_rank);
+                let mut w2 = Vec::with_capacity(split.experts_per_rank);
+                for e in split.local_expert_start..split.local_expert_end() {
+                    let expert = names.expert(e);
+                    let w1 = self.load_matrix_quant_aware(ctx, &expert.w1)?;
+                    let w3 = self.load_matrix_quant_aware(ctx, &expert.w3)?;
+                    w13.push(DeviceMatrix::fuse_rows(ctx, &w1, &w3)?);
+                    w2.push(self.load_matrix_quant_aware(ctx, &expert.w2)?);
+                }
+                let first_w13 = w13
+                    .first()
+                    .ok_or_else(|| anyhow!("DSv4 MoE layer has no local experts"))?;
+                let first_w2 = w2
+                    .first()
+                    .ok_or_else(|| anyhow!("DSv4 MoE layer has no local down experts"))?;
+                let hidden_dim = first_w13.cols;
+                let intermediate = first_w2.cols;
+                ensure!(
+                    first_w13.rows == 2 * intermediate,
+                    "DSv4 W4A16 w13 rows {} != 2*intermediate {}",
+                    first_w13.rows,
+                    2 * intermediate
+                );
+                ensure!(
+                    first_w2.rows == hidden_dim,
+                    "DSv4 W4A16 w2 rows {} != hidden_dim {hidden_dim}",
+                    first_w2.rows
+                );
+                let num_groups = w13.len();
+                ensure!(
+                    num_groups == split.experts_per_rank && w2.len() == num_groups,
+                    "DSv4 W4A16 expert count mismatch: w13={} w2={} expected {}",
+                    num_groups,
+                    w2.len(),
+                    split.experts_per_rank
+                );
+                (
+                    None,
+                    None,
+                    Some(w13),
+                    Some(w2),
+                    hidden_dim,
+                    intermediate,
+                    num_groups,
+                )
+            } else {
+                // FP8 path: per-expert FP8 caches → grouped DeepGEMM caches.
+                let mut w13 = Vec::with_capacity(split.experts_per_rank);
+                let mut w2 = Vec::with_capacity(split.experts_per_rank);
+                for e in split.local_expert_start..split.local_expert_end() {
+                    let expert = names.expert(e);
+                    let w1 = load_fp8(&expert.w1)?;
+                    let w3 = load_fp8(&expert.w3)?;
+                    w13.push(build_w13(&w1, &w3)?);
+                    let down = load_fp8(&expert.w2)?;
+                    w2.push(build_w2(&down)?);
+                }
+                let first_w13 = w13
+                    .first()
+                    .ok_or_else(|| anyhow!("DSv4 MoE layer has no local experts"))?;
+                let first_w2 = w2
+                    .first()
+                    .ok_or_else(|| anyhow!("DSv4 MoE layer has no local down experts"))?;
+                let hidden_dim = first_w13.cols;
+                let intermediate = first_w2.cols;
+                ensure!(
+                    first_w13.rows == 2 * intermediate,
+                    "DSv4 grouped w13 rows {} != 2*intermediate {}",
+                    first_w13.rows,
+                    2 * intermediate
+                );
+                ensure!(
+                    first_w2.rows == hidden_dim,
+                    "DSv4 grouped w2 rows {} != hidden_dim {hidden_dim}",
+                    first_w2.rows
+                );
+                let w13_layout = if mega_moe {
+                    crate::moe::GroupedWeightLayout::InterleavedL1
+                } else {
+                    crate::moe::GroupedWeightLayout::Normal
+                };
+                let w13_grouped = crate::moe::build_grouped_cache(
+                    ctx,
+                    w13.as_slice(),
+                    2 * intermediate,
+                    hidden_dim,
+                    w13_layout,
+                )?;
+                let w2_grouped = crate::moe::build_grouped_cache(
+                    ctx,
+                    w2.as_slice(),
+                    hidden_dim,
+                    intermediate,
+                    crate::moe::GroupedWeightLayout::Normal,
+                )?;
+                let num_groups = w13_grouped.groups;
+                ensure!(
+                    num_groups == split.experts_per_rank && w2_grouped.groups == num_groups,
+                    "DSv4 grouped expert count mismatch: w13={} w2={} expected {}",
+                    w13_grouped.groups,
+                    w2_grouped.groups,
+                    split.experts_per_rank
+                );
+                (
+                    Some(w13_grouped),
+                    Some(w2_grouped),
+                    None,
+                    None,
+                    hidden_dim,
+                    intermediate,
+                    num_groups,
+                )
+            };
 
         let gate = self.load_dsv4_bf16_matrix(ctx, &names.gate_weight)?;
         let (gate_bias, hash_tid2eid_device) = match routing_kind {
@@ -4387,6 +4452,8 @@ impl SafetensorLoader {
         Ok(crate::dsv4::Dsv4MoeLayer {
             w13_grouped,
             w2_grouped,
+            w13_w4a16,
+            w2_w4a16,
             num_groups,
             hidden_dim,
             intermediate,
@@ -4397,6 +4464,7 @@ impl SafetensorLoader {
             shared_w13,
             shared_w2,
             gemv_tables: std::sync::OnceLock::new(),
+            w4a16_gemv_tables: std::sync::OnceLock::new(),
         })
     }
 

@@ -2197,7 +2197,8 @@ mod dsv4_gpu {
             })?;
 
         #[cfg(all(feature = "cuda", feature = "nccl"))]
-        if let Some(mega_moe) = &model.mega_moe {
+        if model.mega_moe.is_some() && layer.w13_w4a16.is_none() {
+            let mega_moe = model.mega_moe.as_ref().unwrap();
             mega_moe.assert_forward_epoch(
                 _mega_epoch.ok_or_else(|| anyhow::anyhow!("DSv4 MegaMoE forward epoch missing"))?,
                 num_tokens,
@@ -2241,12 +2242,12 @@ mod dsv4_gpu {
                         activation_clamp: model.config.swiglu_limit,
                         fast_math: mega_moe.fast_math,
                         enable_pdl: mega_moe.enable_pdl,
-                        l1_weights: cache_ptr(&layer.w13_grouped.weight, ctx),
+                        l1_weights: cache_ptr(&layer.w13_grouped.as_ref().unwrap().weight, ctx),
                         l1_weight_stride: hidden_dim,
-                        l1_weights_sf: cache_ptr(&layer.w13_grouped.scales, ctx),
-                        l2_weights: cache_ptr(&layer.w2_grouped.weight, ctx),
+                        l1_weights_sf: cache_ptr(&layer.w13_grouped.as_ref().unwrap().scales, ctx),
+                        l2_weights: cache_ptr(&layer.w2_grouped.as_ref().unwrap().weight, ctx),
                         l2_weight_stride: layer.intermediate,
-                        l2_weights_sf: cache_ptr(&layer.w2_grouped.scales, ctx),
+                        l2_weights_sf: cache_ptr(&layer.w2_grouped.as_ref().unwrap().scales, ctx),
                         stream: ctx.stream.cu_stream(),
                     })
                 }
@@ -2304,12 +2305,29 @@ mod dsv4_gpu {
         sc2: usize,
     }
 
+    /// Per-expert device pointer tables for the W4A16 grouped-GEMV MoE lane.
+    /// Built lazily on first W4A16 forward; the packed INT4 weight and BF16
+    /// scale pointers index directly into the per-expert `DeviceMatrix`
+    /// allocations (no grouped-cache re-encoding).
+    pub(crate) struct Dsv4W4A16GemvTables {
+        gate_w: CudaSlice<u64>,
+        gate_s: CudaSlice<u64>,
+        up_w: CudaSlice<u64>,
+        up_s: CudaSlice<u64>,
+        w2_w: CudaSlice<u64>,
+        w2_s: CudaSlice<u64>,
+        /// Identity `[0, 1, …, experts_per_rank-1]` — DSv4 offsets/counts and
+        /// pointer tables share the same local-expert index space.
+        expert_indices: CudaSlice<i32>,
+        group_size: usize,
+    }
+
     fn build_gemv_tables(ctx: &DeviceContext, layer: &Dsv4MoeLayer) -> Result<Dsv4GemvTables> {
         let g = layer.num_groups;
         let h = layer.hidden_dim;
         let i_dim = layer.intermediate;
-        let w13 = &layer.w13_grouped;
-        let w2 = &layer.w2_grouped;
+        let w13 = layer.w13_grouped.as_ref().unwrap();
+        let w2 = layer.w2_grouped.as_ref().unwrap();
         ensure!(
             w13.groups == g && w13.rows == 2 * i_dim && w13.cols == h,
             "GEMV tables: w13 cache {}x{} g={} != [2I={}, H={h}]",
@@ -2387,6 +2405,273 @@ mod dsv4_gpu {
             sc13,
             sc2,
         })
+    }
+
+    /// Build per-expert device pointer tables for the W4A16 grouped-GEMV MoE
+    /// lane. Each fused w13 `DeviceMatrix` holds gate (rows 0..I) and up
+    /// (rows I..2I) back-to-back; the up pointers offset into the same buffer.
+    fn build_w4a16_gemv_tables(
+        ctx: &DeviceContext,
+        layer: &Dsv4MoeLayer,
+    ) -> Result<Dsv4W4A16GemvTables> {
+        let w13 = layer
+            .w13_w4a16
+            .as_ref()
+            .ok_or_else(|| anyhow!("W4A16 GEMV tables: layer has no W4A16 experts"))?;
+        let w2 = layer
+            .w2_w4a16
+            .as_ref()
+            .ok_or_else(|| anyhow!("W4A16 GEMV tables: layer has no W4A16 down experts"))?;
+        let g = w13.len();
+        ensure!(
+            w2.len() == g,
+            "W4A16 GEMV tables: w13/w2 expert count mismatch"
+        );
+        let first = w13
+            .first()
+            .ok_or_else(|| anyhow!("W4A16 GEMV tables: no experts"))?;
+        let group_size = first.group_size;
+        let i_dim = first.rows / 2;
+        let h = first.cols;
+        // Byte offsets into the fused w13 packed weight and BF16 scale buffers.
+        let up_weight_off = (i_dim * (h / 2)) as u64;
+        let up_scale_off = (i_dim * (h / group_size) * std::mem::size_of::<bf16>()) as u64;
+
+        let mut gate_w = Vec::with_capacity(g);
+        let mut gate_s = Vec::with_capacity(g);
+        let mut up_w = Vec::with_capacity(g);
+        let mut up_s = Vec::with_capacity(g);
+        let mut w2_w = Vec::with_capacity(g);
+        let mut w2_s = Vec::with_capacity(g);
+        for e in 0..g {
+            let w13e = &w13[e];
+            let w2e = &w2[e];
+            let (w13_ptr, _g13) = w13e
+                .qweight
+                .as_ref()
+                .ok_or_else(|| anyhow!("W4A16 expert {e} missing qweight"))?
+                .device_ptr(&ctx.stream);
+            let (s13_ptr, _gs13) = w13e
+                .qscales
+                .as_ref()
+                .ok_or_else(|| anyhow!("W4A16 expert {e} missing qscales"))?
+                .device_ptr(&ctx.stream);
+            let (w2_ptr, _gw2) = w2e
+                .qweight
+                .as_ref()
+                .ok_or_else(|| anyhow!("W4A16 down expert {e} missing qweight"))?
+                .device_ptr(&ctx.stream);
+            let (s2_ptr, _gs2) = w2e
+                .qscales
+                .as_ref()
+                .ok_or_else(|| anyhow!("W4A16 down expert {e} missing qscales"))?
+                .device_ptr(&ctx.stream);
+            gate_w.push(w13_ptr);
+            up_w.push(w13_ptr + up_weight_off);
+            gate_s.push(s13_ptr);
+            up_s.push(s13_ptr + up_scale_off);
+            w2_w.push(w2_ptr);
+            w2_s.push(s2_ptr);
+        }
+        let h2d = |v: &[u64]| -> Result<CudaSlice<u64>> {
+            ctx.stream
+                .clone_htod(v)
+                .map_err(|e| anyhow!("W4A16 GEMV table H2D failed: {e}"))
+        };
+        let expert_indices: Vec<i32> = (0..g as i32).collect();
+        Ok(Dsv4W4A16GemvTables {
+            gate_w: h2d(&gate_w)?,
+            gate_s: h2d(&gate_s)?,
+            up_w: h2d(&up_w)?,
+            up_s: h2d(&up_s)?,
+            w2_w: h2d(&w2_w)?,
+            w2_s: h2d(&w2_s)?,
+            expert_indices: ctx
+                .stream
+                .clone_htod(&expert_indices)
+                .map_err(|e| anyhow!("W4A16 expert_indices H2D failed: {e}"))?,
+            group_size,
+        })
+    }
+
+    /// W4A16 routed-MoE forward: compact pack, one paired gate/up W4A16 GEMV,
+    /// clamped SwiGLU, one down W4A16 GEMV, then the shared scatter/combine
+    /// tail. All intermediates are stream-ordered allocs (graph-capture safe).
+    #[allow(clippy::too_many_arguments)]
+    fn dsv4_moe_forward_w4a16(
+        model: &Dsv4Model,
+        layer: &Dsv4MoeLayer,
+        tables: &Dsv4W4A16GemvTables,
+        route_indices: &CudaSlice<i32>,
+        route_weights: &CudaSlice<f32>,
+        hidden: &HiddenStates,
+        out: &mut HiddenStates,
+        keepalive: &mut Dsv4ForwardKeepalive,
+    ) -> Result<()> {
+        let ctx = &model.ctx;
+        let cfg = &model.moe_config;
+        let split = &model.split;
+        let num_tokens = hidden.seq_len;
+        let hidden_dim = hidden.hidden_dim;
+        let i_dim = layer.intermediate;
+        let topk = cfg.top_k;
+        let experts_per_rank = split.experts_per_rank;
+        let local_start = split.local_expert_start;
+        let total_routes = num_tokens * topk;
+        let rows = total_routes.max(1);
+
+        let counts = ctx
+            .stream
+            .alloc_zeros::<i32>(experts_per_rank)
+            .map_err(|e| anyhow!("DSv4 W4A16 count alloc failed: {e}"))?;
+        let offsets = ctx
+            .stream
+            .alloc_zeros::<i32>(experts_per_rank)
+            .map_err(|e| anyhow!("DSv4 W4A16 offset alloc failed: {e}"))?;
+        let scan_total = ctx
+            .stream
+            .alloc_zeros::<i32>(1)
+            .map_err(|e| anyhow!("DSv4 W4A16 scan-total alloc failed: {e}"))?;
+        keepalive.keep_i32(&counts);
+        keepalive.keep_i32(&offsets);
+        keepalive.keep_i32(&scan_total);
+
+        unsafe {
+            moe::dsv4_count_local_experts(
+                cache_ptr(route_indices, ctx),
+                cache_ptr(&counts, ctx),
+                num_tokens,
+                topk,
+                local_start,
+                experts_per_rank,
+                ctx.stream.cu_stream(),
+            )?;
+            moe::dsv4_exclusive_scan_i32(
+                cache_ptr(&counts, ctx),
+                cache_ptr(&offsets, ctx),
+                cache_ptr(&scan_total, ctx),
+                experts_per_rank,
+                ctx.stream.cu_stream(),
+            )?;
+        }
+
+        let packed_hidden = HiddenStates::zeros(ctx, hidden_dim, rows)?;
+        let packed_route_slot = alloc_neg1_i32(ctx, rows)?;
+        let packed_weight = ctx
+            .stream
+            .alloc_zeros::<f32>(rows)
+            .map_err(|e| anyhow!("DSv4 W4A16 packed_weight alloc failed: {e}"))?;
+        let cursors = ctx
+            .stream
+            .alloc_zeros::<i32>(experts_per_rank)
+            .map_err(|e| anyhow!("DSv4 W4A16 cursors alloc failed: {e}"))?;
+        keepalive.keep_hidden(&packed_hidden);
+        keepalive.keep_i32(&packed_route_slot);
+        keepalive.keep_f32(&packed_weight);
+        keepalive.keep_i32(&cursors);
+
+        unsafe {
+            moe::dsv4_pack_local_experts_with_slots(
+                cache_ptr(&hidden.data, ctx),
+                cache_ptr(route_indices, ctx),
+                cache_ptr(route_weights, ctx),
+                cache_ptr(&offsets, ctx),
+                cache_ptr(&cursors, ctx),
+                cache_ptr(&packed_hidden.data, ctx),
+                cache_ptr(&packed_route_slot, ctx),
+                cache_ptr(&packed_weight, ctx),
+                num_tokens,
+                hidden_dim,
+                topk,
+                local_start,
+                experts_per_rank,
+                ctx.stream.cu_stream(),
+            )?;
+        }
+
+        let gate_out = HiddenStates::zeros(ctx, i_dim, rows)?;
+        let up_out = HiddenStates::zeros(ctx, i_dim, rows)?;
+        keepalive.keep_hidden(&gate_out);
+        keepalive.keep_hidden(&up_out);
+
+        unsafe {
+            moe::moe_w4a16_grouped_gemv_pair_batch(
+                &tables.gate_w,
+                &tables.gate_s,
+                &tables.up_w,
+                &tables.up_s,
+                cache_ptr(&packed_hidden.data, ctx),
+                cache_ptr(&gate_out.data, ctx),
+                cache_ptr(&up_out.data, ctx),
+                cache_ptr(&offsets, ctx),
+                cache_ptr(&counts, ctx),
+                cache_ptr(&tables.expert_indices, ctx),
+                experts_per_rank,
+                rows,
+                i_dim,
+                hidden_dim,
+                tables.group_size,
+                ctx,
+                ctx.stream.cu_stream(),
+            )?;
+        }
+
+        let act = HiddenStates::zeros(ctx, i_dim, rows)?;
+        keepalive.keep_hidden(&act);
+        unsafe {
+            moe::dsv4_swiglu_clamped_batch(
+                cache_ptr(&gate_out.data, ctx),
+                cache_ptr(&up_out.data, ctx),
+                cache_ptr(&act.data, ctx),
+                rows * i_dim,
+                model.config.swiglu_limit,
+                ctx.stream.cu_stream(),
+            )?;
+        }
+
+        let expert_out = HiddenStates::zeros(ctx, hidden_dim, rows)?;
+        keepalive.keep_hidden(&expert_out);
+        unsafe {
+            moe::moe_w4a16_grouped_gemv_batch(
+                &tables.w2_w,
+                &tables.w2_s,
+                cache_ptr(&act.data, ctx),
+                cache_ptr(&expert_out.data, ctx),
+                cache_ptr(&offsets, ctx),
+                cache_ptr(&counts, ctx),
+                cache_ptr(&tables.expert_indices, ctx),
+                experts_per_rank,
+                rows,
+                hidden_dim,
+                i_dim,
+                tables.group_size,
+                ctx,
+                ctx.stream.cu_stream(),
+            )?;
+        }
+
+        let route_out = HiddenStates::zeros(ctx, hidden_dim, rows)?;
+        keepalive.keep_hidden(&route_out);
+        unsafe {
+            moe::dsv4_scatter_all_route_slots(
+                cache_ptr(&expert_out.data, ctx),
+                cache_ptr(&route_out.data, ctx),
+                cache_ptr(&packed_route_slot, ctx),
+                cache_ptr(&packed_weight, ctx),
+                rows,
+                hidden_dim,
+                ctx.stream.cu_stream(),
+            )?;
+            moe::dsv4_combine_route_slot_outputs(
+                cache_ptr(&route_out.data, ctx),
+                cache_ptr(&out.data, ctx),
+                num_tokens,
+                topk,
+                hidden_dim,
+                ctx.stream.cu_stream(),
+            )?;
+        }
+        Ok(())
     }
 
     /// Decode-band routed-MoE forward via grouped w8a16 GEMM (warp-per-row):
@@ -2568,6 +2853,29 @@ mod dsv4_gpu {
         let experts_per_rank = split.experts_per_rank;
         let local_start = split.local_expert_start;
         let total_routes = num_tokens * topk;
+        // W4A16 lane: compact pack + W4A16 grouped GEMV for all batch sizes.
+        if layer.w13_w4a16.is_some() {
+            let tables = layer.w4a16_gemv_tables.get_or_init(|| {
+                build_w4a16_gemv_tables(ctx, layer)
+                    .map(Some)
+                    .unwrap_or_else(|e| {
+                        log::warn!("DSv4 W4A16 GEMV table build failed: {e}");
+                        None
+                    })
+            });
+            if let Some(tables) = tables.as_ref() {
+                return dsv4_moe_forward_w4a16(
+                    model,
+                    layer,
+                    tables,
+                    route_indices,
+                    route_weights,
+                    hidden,
+                    out,
+                    keepalive,
+                );
+            }
+        }
         // Decode-band FP8 grouped GEMM lane: compact (real routed rows only, no
         // pad), 16-byte vectorized FP8 weight loads.
         if total_routes <= DSV4_DECODE_GEMV_MAX_ROUTES {
@@ -2679,18 +2987,20 @@ mod dsv4_gpu {
             "DSv4 DeepGEMM needs H and I aligned to 128, got H={hidden_dim} I={intermediate}"
         );
         ensure!(
-            layer.w13_grouped.rows == intermediate * 2 && layer.w13_grouped.cols == hidden_dim,
+            layer.w13_grouped.as_ref().unwrap().rows == intermediate * 2
+                && layer.w13_grouped.as_ref().unwrap().cols == hidden_dim,
             "DSv4 grouped w13 cache shape {}x{} != [2*I={}, H={}]",
-            layer.w13_grouped.rows,
-            layer.w13_grouped.cols,
+            layer.w13_grouped.as_ref().unwrap().rows,
+            layer.w13_grouped.as_ref().unwrap().cols,
             intermediate * 2,
             hidden_dim
         );
         ensure!(
-            layer.w2_grouped.rows == hidden_dim && layer.w2_grouped.cols == intermediate,
+            layer.w2_grouped.as_ref().unwrap().rows == hidden_dim
+                && layer.w2_grouped.as_ref().unwrap().cols == intermediate,
             "DSv4 grouped w2 cache shape {}x{} != [H={}, I={}]",
-            layer.w2_grouped.rows,
-            layer.w2_grouped.cols,
+            layer.w2_grouped.as_ref().unwrap().rows,
+            layer.w2_grouped.as_ref().unwrap().cols,
             hidden_dim,
             intermediate
         );
@@ -2751,6 +3061,10 @@ mod dsv4_gpu {
         out: &mut HiddenStates,
         keepalive: &mut Dsv4ForwardKeepalive,
     ) -> Result<()> {
+        ensure!(
+            layer.w13_w4a16.is_none(),
+            "DSv4 DeepEP transport is FP8-only; unset ARLE_DSV4_MOE_TRANSPORT for W4A16 checkpoints"
+        );
         let ctx = &model.ctx;
         let cfg = &model.moe_config;
         let split = &model.split;
@@ -3031,8 +3345,8 @@ mod dsv4_gpu {
         let num_groups = layer.num_groups;
         let hidden_dim = packed_hidden.hidden_dim;
         let intermediate = layer.intermediate;
-        let w13 = &layer.w13_grouped;
-        let w2 = &layer.w2_grouped;
+        let w13 = layer.w13_grouped.as_ref().unwrap();
+        let w2 = layer.w2_grouped.as_ref().unwrap();
         ensure!(
             layer.hidden_dim == hidden_dim,
             "DSv4 grouped expert hidden dim {} != packed hidden dim {hidden_dim}",
@@ -3657,6 +3971,10 @@ mod dsv4_gpu {
         out: &mut HiddenStates,
         keepalive: &mut Dsv4ForwardKeepalive,
     ) -> Result<()> {
+        ensure!(
+            layer.w13_w4a16.is_none(),
+            "DSv4 DeepEP-LL transport is FP8-only; unset ARLE_DSV4_MOE_TRANSPORT for W4A16 checkpoints"
+        );
         let ctx = &model.ctx;
         let cfg = &model.moe_config;
         let swiglu_limit = model.config.swiglu_limit;
@@ -3730,8 +4048,8 @@ mod dsv4_gpu {
 
         let m = scratch.m_padded;
         let sfa_aligned_m = scratch.sfa_aligned_m;
-        let w13 = &layer.w13_grouped;
-        let w2 = &layer.w2_grouped;
+        let w13 = layer.w13_grouped.as_ref().unwrap();
+        let w2 = layer.w2_grouped.as_ref().unwrap();
         ensure!(
             w13.groups == num_local_experts
                 && w2.groups == num_local_experts

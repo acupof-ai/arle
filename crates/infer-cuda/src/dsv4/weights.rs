@@ -156,9 +156,14 @@ pub(crate) struct Dsv4WoAGroupTables {
 /// token id to experts through `hash_tid2eid` and ignore the router gate.
 pub(crate) struct Dsv4MoeLayer {
     /// Contiguous per-rank group-major fused gate+up FP8 cache (w1 over w3,
-    /// row-stacked) and down cache (w2).
-    pub w13_grouped: crate::moe::GroupedCache,
-    pub w2_grouped: crate::moe::GroupedCache,
+    /// row-stacked) and down cache (w2). `None` for W4A16 checkpoints (routed
+    /// experts live in `w13_w4a16`/`w2_w4a16`).
+    pub w13_grouped: Option<crate::moe::GroupedCache>,
+    pub w2_grouped: Option<crate::moe::GroupedCache>,
+    /// W4A16 routed experts: per-expert fused gate+up and down `DeviceMatrix`
+    /// (packed INT4 weight + BF16 group scales). `None` for FP8 checkpoints.
+    pub w13_w4a16: Option<Vec<DeviceMatrix>>,
+    pub w2_w4a16: Option<Vec<DeviceMatrix>>,
     pub num_groups: usize,
     pub hidden_dim: usize,
     pub intermediate: usize,
@@ -177,6 +182,8 @@ pub(crate) struct Dsv4MoeLayer {
     /// MoE forward. `Some(None)` = build failed the lossless UE8M0 check; the
     /// contiguous DeepGEMM lane stays the fallback.
     pub gemv_tables: std::sync::OnceLock<Option<crate::moe::Dsv4GemvTables>>,
+    /// W4A16 grouped-GEMV lane tables, built lazily on first W4A16 MoE forward.
+    pub w4a16_gemv_tables: std::sync::OnceLock<Option<crate::moe::Dsv4W4A16GemvTables>>,
 }
 
 /// GLM dense-MLP layer (the first `first_k_dense_replace` layers): a plain SwiGLU
