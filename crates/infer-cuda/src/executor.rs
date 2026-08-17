@@ -1033,6 +1033,20 @@ use kv_native_sys::{BLOB_CHUNK_BYTES, KvTierStore, default_t1_budget_bytes};
 /// the per-rank share resolved from `--kv-dram`.
 pub(crate) const DEFAULT_DRAM_FRACTION: f64 = 0.5;
 
+/// Per-rank L2 budget at construction: the deployment-total default
+/// (`default_t1_budget_bytes(DEFAULT_DRAM_FRACTION)`) divided by the TP world
+/// size. The engine builder re-budgets pre-serve with the per-rank share
+/// resolved from `--kv-dram`; dividing here keeps the pre-setter window and
+/// direct-construction paths (agent-bench) correct under TP>1. World resolves
+/// from env — the builder's `TpEnvGuard` sets `INFER_TP_SIZE` before
+/// construction — and defaults to 1 when unset or unreadable.
+pub(crate) fn default_t1_budget_per_rank() -> usize {
+    let world = crate::tp::resolve_tp_config_from_env()
+        .map(|c| c.world_size)
+        .unwrap_or(1);
+    default_t1_budget_bytes(DEFAULT_DRAM_FRACTION) / world.max(1)
+}
+
 /// `slot_tier` key namespaces (top byte, see `kv_native_sys::tier_key`), so features
 /// sharing THE store never collide and a future kind (e.g. a suffix cache) is
 /// one new constant.
@@ -1121,4 +1135,30 @@ pub(crate) fn sample_cuda_token_captured(
         infer_plan::sample_token_logprob_penalized(&logits_host, params, position, penalty);
     *capture = infer_plan::sampled_top_logprobs(&logits_host, params, penalty, token);
     Ok((token, logprob))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_t1_budget_per_rank_divides_by_world() {
+        // Env is process-global; infer-cuda has no other env-mutating tests, so
+        // no serialization is needed today. Restore on exit.
+        let saved = std::env::var("INFER_TP_SIZE").ok();
+        unsafe {
+            std::env::set_var("INFER_TP_SIZE", "1");
+        }
+        let w1 = default_t1_budget_per_rank();
+        unsafe {
+            std::env::set_var("INFER_TP_SIZE", "2");
+        }
+        let w2 = default_t1_budget_per_rank();
+        match saved {
+            Some(v) => unsafe { std::env::set_var("INFER_TP_SIZE", v) },
+            None => unsafe { std::env::remove_var("INFER_TP_SIZE") },
+        }
+        assert!(w1 > 0, "world=1 budget must be non-zero");
+        assert_eq!(w2, w1 / 2, "world=2 budget must be half of world=1");
+    }
 }

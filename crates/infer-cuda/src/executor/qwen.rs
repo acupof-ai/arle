@@ -188,7 +188,7 @@ impl QwenCudaExecutor {
         );
 
         let slot_progress = vec![SlotProgress::default(); num_slots];
-        let tier_budget_bytes = default_t1_budget_bytes(DEFAULT_DRAM_FRACTION);
+        let tier_budget_bytes = default_t1_budget_per_rank();
         let tier = KvTierStore::with_budget(tier_budget_bytes, kv.storage_bytes_per_page());
         let recall = (0..num_slots)
             .map(|_| crate::recall::CudaRecallState::default())
