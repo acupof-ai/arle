@@ -89,20 +89,15 @@ def decode_weight_to_f32(tensor: torch.Tensor) -> np.ndarray:
 def read_scale_bytes(f: safe_open, scale_key: str, weight_shape: tuple) -> bytes:
     """Read scale tensor as raw bytes, handling F8_E8M0 and F32."""
     tensor = f.get_tensor(scale_key)
-    rows, cols = weight_shape
-    if tensor.dtype in (torch.uint8, torch.int8):
+    if tensor.dtype in (torch.uint8, torch.int8, torch.float32):
         return tensor.numpy().tobytes()
-    if tensor.dtype == torch.float32:
-        return tensor.numpy().tobytes()
-    # F8_E8M0 might come through as a special dtype — try raw bytes
-    try:
-        return tensor.numpy().tobytes()
-    except Exception:
-        # Last resort: read the safetensors metadata for raw byte offset
-        raise RuntimeError(
-            f"Cannot read scale {scale_key} with dtype {tensor.dtype}; "
-            "need raw byte access"
-        )
+    # torch.float8_e8m0fnu has no .numpy() — reinterpret as uint8 for raw bytes.
+    if tensor.dtype == torch.float8_e8m0fnu:
+        return tensor.view(torch.uint8).numpy().tobytes()
+    raise RuntimeError(
+        f"Cannot read scale {scale_key} with dtype {tensor.dtype}; "
+        "need raw byte access"
+    )
 
 
 def decode_scale(scale_bytes: bytes, scale_dtype: str, rows: int, cols: int) -> np.ndarray:
