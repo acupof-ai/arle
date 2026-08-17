@@ -1250,26 +1250,6 @@ impl Backend for CudaBackend {
         }
     }
 
-    fn ep_exchange_rows_device(
-        &self,
-        x: &DeviceHandle,
-        dim: usize,
-        send_counts: &[usize],
-        recv_counts: &[usize],
-        axis: CommAxis,
-    ) -> Result<DeviceHandle> {
-        #[cfg(feature = "no-cuda")]
-        {
-            let _ = (x, dim, send_counts, recv_counts, axis);
-            todo!("GPU required: cuda ep_exchange_rows_device is unavailable under feature no-cuda")
-        }
-
-        #[cfg(not(feature = "no-cuda"))]
-        {
-            cuda_ep_exchange_rows_device(self, x, dim, send_counts, recv_counts, axis)
-        }
-    }
-
     fn all_to_all_device(
         &self,
         x: &DeviceHandle,
