@@ -400,7 +400,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
                 *request = fresh;
                 let committed = request.committed_tokens();
                 let prefix_match = if self.config.enable_prefix_cache {
-                    self.lookup_prefix_for_attach(&committed)
+                    self.lookup_prefix_for_attach(&committed)?
                 } else {
                     crate::PrefixMatch::empty()
                 };

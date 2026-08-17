@@ -1679,7 +1679,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
                 // Tier-aware: demoted blocks in the match are promoted
                 // back into fresh pages here, so attach sees a
                 // resident-only match.
-                self.lookup_prefix_for_attach(&committed)
+                self.lookup_prefix_for_attach(&committed)?
             } else {
                 PrefixMatch::empty()
             };
