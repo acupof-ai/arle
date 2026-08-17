@@ -72,13 +72,6 @@ pub enum OpenAiChatContent {
     Parts(Vec<Value>),
 }
 
-/// Image input embedded in an OpenAI-style chat content part.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OpenAiImageInput {
-    pub url: String,
-    pub detail: Option<String>,
-}
-
 impl OpenAiChatContent {
     /// Flatten to a plain text string. For the Parts form, concatenates
     /// every `{"type":"text","text":"..."}` part in order; parts whose type
@@ -92,40 +85,6 @@ impl OpenAiChatContent {
                 .filter_map(|p| p.get("text").and_then(Value::as_str))
                 .collect(),
         }
-    }
-
-    /// Extract `image_url` parts without changing text prompt rendering.
-    ///
-    /// Supports both OpenAI's object form
-    /// `{"type":"image_url","image_url":{"url":"..."}}` and the string
-    /// shortcut accepted by several compatible clients.
-    pub fn image_inputs(&self) -> Vec<OpenAiImageInput> {
-        let Self::Parts(parts) = self else {
-            return Vec::new();
-        };
-
-        parts.iter().filter_map(parse_image_input_part).collect()
-    }
-}
-
-fn parse_image_input_part(part: &Value) -> Option<OpenAiImageInput> {
-    if part.get("type").and_then(Value::as_str) != Some("image_url") {
-        return None;
-    }
-    match part.get("image_url")? {
-        Value::String(url) => Some(OpenAiImageInput {
-            url: url.clone(),
-            detail: None,
-        }),
-        Value::Object(image_url) => {
-            let url = image_url.get("url")?.as_str()?.to_owned();
-            let detail = image_url
-                .get("detail")
-                .and_then(Value::as_str)
-                .map(str::to_owned);
-            Some(OpenAiImageInput { url, detail })
-        }
-        _ => None,
     }
 }
 
