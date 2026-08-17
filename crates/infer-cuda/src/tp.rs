@@ -438,7 +438,10 @@ impl TpRuntime {
         ctx: &cuda_kernels::prelude::DeviceContext,
         buf: &mut cuda_kernels::prelude::HiddenStates,
     ) -> anyhow::Result<()> {
-        self.all_reduce_sum_on(ctx, buf, CudaPipelineStreamKind::Comm)
+        // Compute stream: the AR is on the layer's critical path (the next
+        // layer reads its output), so comm-stream overlap cannot hide it and
+        // the fence bracket only adds per-AR event alloc + stream-wait cost.
+        self.all_reduce_sum_on(ctx, buf, CudaPipelineStreamKind::Compute)
     }
 
     /// Like [`Self::all_reduce_sum`] but selects the stream the NCCL arm runs
