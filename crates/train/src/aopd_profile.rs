@@ -93,7 +93,7 @@ pub fn time_try<T, E>(
 }
 
 pub fn print_round(round: usize) {
-    if !enabled() {
+    if std::env::var_os("ARLE_AOPD_PROFILE").is_none() {
         return;
     }
     let Ok(t) = table().lock() else {
