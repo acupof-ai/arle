@@ -113,7 +113,7 @@ pub(super) fn run_opd_from_dirs(args: TrainOpdArgs) -> Result<()> {
         .as_deref()
         .ok_or_else(|| anyhow!("--student-model <dir> is required for non-smoke runs"))?;
     validate_train_opd_gkd_args(args.gkd_lambda, args.sft_anchor)?;
-    reject_unimplemented_gkd_objectives(0.0, args.teacher_topk)?;
+    reject_unimplemented_gkd_objectives(args.teacher_topk)?;
     let sft_anchor = opd_sft_anchor_arg(args.sft_anchor);
     let corpus_sft_only = args.sft_anchor == OpdSftAnchorArg::CorpusTruth && args.gkd_lambda == 1.0;
     if corpus_sft_only && args.logits_window_size == 0 {
@@ -518,7 +518,7 @@ pub(super) fn run_opd_smoke(args: TrainOpdArgs) -> Result<()> {
     };
 
     validate_train_opd_gkd_args(args.gkd_lambda, args.sft_anchor)?;
-    reject_unimplemented_gkd_objectives(0.0, args.teacher_topk)?;
+    reject_unimplemented_gkd_objectives(args.teacher_topk)?;
     if args.sft_anchor != OpdSftAnchorArg::StudentRollout {
         bail!("train opd --smoke does not support --sft-anchor corpus-truth");
     }
@@ -665,7 +665,7 @@ pub(super) fn run_self_opd_from_dir(args: TrainSelfOpdArgs) -> Result<()> {
         .student_model
         .as_deref()
         .ok_or_else(|| anyhow!("--student-model <dir> is required for non-smoke runs"))?;
-    reject_unimplemented_gkd_objectives(0.0, args.teacher_topk)?;
+    reject_unimplemented_gkd_objectives(args.teacher_topk)?;
     let target_set = parse_lora_target_set(&args.lora_target_set)?;
     let lora = LoraConfig {
         rank: args.lora_rank,
@@ -934,7 +934,7 @@ pub(super) fn run_self_opd_smoke(args: TrainSelfOpdArgs) -> Result<()> {
     };
 
     let cfg = embedded_tiny_qwen35_config();
-    reject_unimplemented_gkd_objectives(0.0, args.teacher_topk)?;
+    reject_unimplemented_gkd_objectives(args.teacher_topk)?;
     let target_set = parse_lora_target_set(&args.lora_target_set)?;
     let lora = LoraConfig {
         rank: args.lora_rank.min(4),
