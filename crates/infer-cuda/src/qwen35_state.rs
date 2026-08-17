@@ -2,8 +2,7 @@ use super::*;
 
 /// Host image of one whole slot for G3 capacity spill. Every device buffer the
 /// slot owns is captured here byte-for-byte — a missed buffer is a
-/// silently-wrong restore. `k_caches`/`v_caches` are NOT captured: the paged
-/// default leaves them empty, asserted at capture.
+/// silently-wrong restore.
 pub(crate) struct Qwen35SlotImage {
     pub(crate) full_attn_pages: Vec<u8>,
     pub(crate) full_attn_page_count: usize,
@@ -13,10 +12,6 @@ pub(crate) struct Qwen35SlotImage {
 }
 
 pub(crate) struct Qwen35SlotState {
-    /// EMPTY by default (full-attn KV is paged); populated only by the legacy
-    /// contiguous lane when explicitly requested.
-    pub(crate) k_caches: Vec<DeviceVec>,
-    pub(crate) v_caches: Vec<DeviceVec>,
     pub(crate) gdr_states: Vec<CudaSlice<f32>>,
     pub(crate) conv_states: Vec<DeviceVec>,
     /// B2 CP decode: 1/cp v-head subset recurrent state, allocated lazily on
@@ -309,8 +304,6 @@ impl Qwen35SlotState {
     /// `num_slots`. Idle slots cost zero recurrent HBM.
     pub(crate) fn new_linear_only() -> Self {
         Self {
-            k_caches: Vec::new(),
-            v_caches: Vec::new(),
             gdr_states: Vec::new(),
             conv_states: Vec::new(),
             gdr_states_decode: Vec::new(),
@@ -731,14 +724,6 @@ impl Qwen35SlotState {
         self.seq_len = len;
     }
 
-    /// No-op by default: the paged migration never allocates `k_caches`/
-    /// `v_caches`.
-    #[allow(dead_code)] // legacy contiguous-lane helper
-    pub(crate) fn free_full_attn_caches(&mut self) {
-        self.k_caches = Vec::new();
-        self.v_caches = Vec::new();
-    }
-
     /// The engine frees the slot right after `demote_slot`, so the trailing
     /// sync (inside `copy_pages_to_host` for pages, explicit here for the
     /// recurrent D2H) makes the host image complete before any device buffer
@@ -750,11 +735,6 @@ impl Qwen35SlotState {
         full_attn_kv: &mut PagedKVPool,
         recurrent_pool: &mut Vec<RecurrentBlock>,
     ) -> Result<Qwen35SlotImage> {
-        ensure!(
-            self.k_caches.is_empty() && self.v_caches.is_empty(),
-            "Qwen3.6 whole-slot swap requires the paged full-attn default; \
-             the legacy contiguous K/V caches are not captured (slot {slot})"
-        );
         // The B2 decode pair is a 1/cp head subset and the full pair is stale
         // at the scatter point, so neither fits the full-dim image. The failed
         // demote sends the request to recompute.

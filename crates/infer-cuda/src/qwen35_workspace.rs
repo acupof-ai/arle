@@ -333,16 +333,12 @@ pub(crate) struct Qwen35BatchDecodeState {
     pub(crate) ws: Qwen35Workspace,
     pub(crate) positions: SliceSlot<i32>,
     pub(crate) seq_lens: SliceSlot<i32>,
-    pub(crate) full_k_cache_ptrs: Vec<CudaSlice<u64>>,
-    pub(crate) full_v_cache_ptrs: Vec<CudaSlice<u64>>,
     pub(crate) conv_state_ptrs: Vec<CudaSlice<u64>>,
     pub(crate) gdr_state_ptrs: Vec<CudaSlice<u64>>,
     /// Host staging vecs for the table uploads (monolith pattern: one
     /// `memcpy_htod` per layer per table, no per-row H2D).
     pub(crate) conv_host: Vec<u64>,
     pub(crate) gdr_host: Vec<u64>,
-    pub(crate) full_k_host: Vec<u64>,
-    pub(crate) full_v_host: Vec<u64>,
     pub(crate) staged_slot_indices: Vec<usize>,
     pub(crate) logits_batch: HiddenSlot,
     pub(crate) argmax: SliceSlot<i32>,
@@ -351,7 +347,6 @@ pub(crate) struct Qwen35BatchDecodeState {
 impl Qwen35BatchDecodeState {
     pub(crate) fn new(
         ctx: &DeviceContext,
-        num_full_layers: usize,
         num_linear_layers: usize,
         max_batch: usize,
     ) -> Result<Self> {
@@ -359,20 +354,6 @@ impl Qwen35BatchDecodeState {
             max_batch > 0,
             "Qwen3.5 batched decode requires max_batch > 0"
         );
-        let (full_k_cache_ptrs, full_v_cache_ptrs) =
-            (0..num_full_layers)
-                .map(|i| {
-                    let k = ctx.stream.alloc_zeros::<u64>(max_batch).map_err(|e| {
-                        anyhow!("alloc qwen35 batch full_k_cache_ptrs layer {i}: {e}")
-                    })?;
-                    let v = ctx.stream.alloc_zeros::<u64>(max_batch).map_err(|e| {
-                        anyhow!("alloc qwen35 batch full_v_cache_ptrs layer {i}: {e}")
-                    })?;
-                    Ok((k, v))
-                })
-                .collect::<Result<Vec<_>>>()?
-                .into_iter()
-                .unzip::<_, _, Vec<_>, Vec<_>>();
         let (conv_state_ptrs, gdr_state_ptrs) = (0..num_linear_layers)
             .map(|i| {
                 let c = ctx
@@ -392,103 +373,19 @@ impl Qwen35BatchDecodeState {
             ws: Qwen35Workspace::new(),
             positions: SliceSlot::default(),
             seq_lens: SliceSlot::default(),
-            full_k_cache_ptrs,
-            full_v_cache_ptrs,
             conv_state_ptrs,
             gdr_state_ptrs,
             conv_host: vec![0u64; max_batch],
             gdr_host: vec![0u64; max_batch],
-            full_k_host: vec![0u64; max_batch],
-            full_v_host: vec![0u64; max_batch],
             staged_slot_indices: Vec::new(),
             logits_batch: HiddenSlot::default(),
             argmax: SliceSlot::default(),
         })
     }
 
-    /// Re-upload the per-layer state pointer tables iff the row→slot mapping
-    /// changed (tables are a pure function of `(slot_indices, layer)`; see
-    /// struct docs for why the slot-state addresses themselves are stable).
-    pub(crate) fn stage_pointer_tables(
-        &mut self,
-        ctx: &DeviceContext,
-        slots: &mut [Qwen35SlotState],
-        slot_indices: &[usize],
-    ) -> Result<()> {
-        if self.staged_slot_indices == slot_indices {
-            return Ok(());
-        }
-        let b = slot_indices.len();
-        ensure!(
-            b <= self.conv_host.len(),
-            "Qwen3.5 batched decode batch {} exceeds table capacity {}",
-            b,
-            self.conv_host.len()
-        );
-        for layer_idx in 0..self.full_k_cache_ptrs.len() {
-            for (r, &si) in slot_indices.iter().enumerate() {
-                let slot = &mut slots[si];
-                ensure!(
-                    layer_idx < slot.k_caches.len() && layer_idx < slot.v_caches.len(),
-                    "Qwen3.5 batched decode full-attn layer {layer_idx} outside slot cache \
-                     (k={}, v={})",
-                    slot.k_caches.len(),
-                    slot.v_caches.len()
-                );
-                let (k_ptr, _gk) = slot.k_caches[layer_idx].data.device_ptr_mut(&ctx.stream);
-                let (v_ptr, _gv) = slot.v_caches[layer_idx].data.device_ptr_mut(&ctx.stream);
-                self.full_k_host[r] = k_ptr;
-                self.full_v_host[r] = v_ptr;
-            }
-            ctx.stream
-                .memcpy_htod(
-                    &self.full_k_host[..b],
-                    &mut self.full_k_cache_ptrs[layer_idx],
-                )
-                .map_err(|e| anyhow!("H2D qwen35 full_k_cache_ptrs layer {layer_idx}: {e}"))?;
-            ctx.stream
-                .memcpy_htod(
-                    &self.full_v_host[..b],
-                    &mut self.full_v_cache_ptrs[layer_idx],
-                )
-                .map_err(|e| anyhow!("H2D qwen35 full_v_cache_ptrs layer {layer_idx}: {e}"))?;
-        }
-        for layer_idx in 0..self.conv_state_ptrs.len() {
-            for (r, &si) in slot_indices.iter().enumerate() {
-                let slot = &mut slots[si];
-                ensure!(
-                    layer_idx < slot.conv_states.len() && layer_idx < slot.gdr_states.len(),
-                    "Qwen3.5 batched decode linear layer {layer_idx} outside slot state \
-                     (conv={}, gdr={})",
-                    slot.conv_states.len(),
-                    slot.gdr_states.len()
-                );
-                let (conv_ptr, _gc) = slot.conv_states[layer_idx].data.device_ptr_mut(&ctx.stream);
-                let (gdr_ptr, _gg) = slot.gdr_states[layer_idx].device_ptr_mut(&ctx.stream);
-                self.conv_host[r] = conv_ptr;
-                self.gdr_host[r] = gdr_ptr;
-            }
-            ctx.stream
-                .memcpy_htod(&self.conv_host[..b], &mut self.conv_state_ptrs[layer_idx])
-                .map_err(|e| anyhow!("H2D qwen35 conv_state_ptrs layer {layer_idx}: {e}"))?;
-            ctx.stream
-                .memcpy_htod(&self.gdr_host[..b], &mut self.gdr_state_ptrs[layer_idx])
-                .map_err(|e| anyhow!("H2D qwen35 gdr_state_ptrs layer {layer_idx}: {e}"))?;
-        }
-        self.staged_slot_indices = slot_indices.to_vec();
-        Ok(())
-    }
-
-    /// Recurrent-only pointer staging for the PAGED batched-decode lane: stage
-    /// the conv-ring + GDR-state tables (linear-attn layers) but SKIP the
-    /// contiguous full-attn `k_caches`/`v_caches` tables, which the shared-paged
-    /// default never allocates (touching them would deref an empty slice). Paged
-    /// full attention reads the shared pool via the per-step `PageMeta` instead,
-    /// so the conv/GDR tables are the only per-slot device pointers it needs.
-    /// Same `staged_slot_indices` cache key as the contiguous path; both lanes
-    /// share the invalidation hook. The two stagers never interleave on one
-    /// executor (a build is either paged or contiguous), so the cache key is
-    /// unambiguous.
+    /// Stage the conv-ring + GDR-state pointer tables for batched decode.
+    /// Paged full attention reads the shared pool via the per-step `PageMeta`,
+    /// so these are the only per-slot device pointers it needs.
     pub(crate) fn stage_recurrent_pointer_tables(
         &mut self,
         ctx: &DeviceContext,
