@@ -2,11 +2,8 @@
 //! thread only writes the snapshot it already publishes per tick.
 
 use crate::execution::CounterSnapshot;
-use crate::multiproc_relay::RelayCoordinator;
 use serde::{Deserialize, Serialize};
 use std::os::unix::io::AsRawFd;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -159,48 +156,16 @@ fn write_sample(dir: &std::path::Path, snap: &CounterSnapshot, host: HostSample)
     }
 }
 
-pub fn spawn_observe_task(counters: Arc<Mutex<CounterSnapshot>>) {
-    std::thread::spawn(move || {
-        let dir = observe_dir();
-        let _lock = match acquire_writer_lock(&dir) {
-            Some(f) => f,
-            None => return,
-        };
-        sweep_retention(&dir, retention_days());
-        let mut sys = sysinfo::System::new();
-        let mut disks = sysinfo::Disks::new_with_refreshed_list();
-        let mut tick: u32 = 0;
-        loop {
-            std::thread::sleep(Duration::from_secs(10));
-            let host = sample_host(&mut sys, &mut disks, tick);
-            let snap = match counters.lock() {
-                Ok(s) => s.clone(),
-                Err(_) => continue,
-            };
-            write_sample(&dir, &snap, host);
-            tick += 1;
-        }
-    });
-}
-
-/// Multiproc coordinator observe task: queries rank-0 stats via the relay
-/// every 10 s. The flock singleton dedupes against the single-process task
-/// when both run (local relay mode).
-pub fn spawn_observe_task_coordinator(relay: Arc<std::sync::Mutex<RelayCoordinator>>) {
+/// Spawn the background observe task. `snapshot` returns the current counter
+/// snapshot, or `None` to skip this tick (e.g. mutex poisoned). The flock
+/// singleton ensures only one writer per machine.
+pub fn spawn_observe_task<F>(mut snapshot: F)
+where
+    F: FnMut() -> Option<CounterSnapshot> + Send + 'static,
+{
     std::thread::Builder::new()
-        .name("arle-observe-coordinator".to_string())
+        .name("arle-observe".to_string())
         .spawn(move || {
-            let rt = match tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            {
-                Ok(rt) => rt,
-                Err(e) => {
-                    log::error!("observe: tokio runtime build failed: {e}");
-                    return;
-                }
-            };
-            let stats_id = AtomicU64::new(0);
             let dir = observe_dir();
             let _lock = match acquire_writer_lock(&dir) {
                 Some(f) => f,
@@ -213,34 +178,15 @@ pub fn spawn_observe_task_coordinator(relay: Arc<std::sync::Mutex<RelayCoordinat
             loop {
                 std::thread::sleep(Duration::from_secs(10));
                 let host = sample_host(&mut sys, &mut disks, tick);
-                let snap = rt.block_on(query_snapshot(&relay, &stats_id));
+                let Some(snap) = snapshot() else {
+                    tick += 1;
+                    continue;
+                };
                 write_sample(&dir, &snap, host);
                 tick += 1;
             }
         })
-        .ok();
-}
-
-async fn query_snapshot(
-    relay: &std::sync::Mutex<RelayCoordinator>,
-    stats_id: &AtomicU64,
-) -> CounterSnapshot {
-    let request_id = stats_id.fetch_add(1, Ordering::Relaxed);
-    let rx = {
-        let mut r = relay.lock().unwrap_or_else(PoisonError::into_inner);
-        let rx = r.register_stats_awaiter(request_id);
-        if r.send_stats_query(request_id).is_err() {
-            r.unregister_stats_awaiter(request_id);
-            return CounterSnapshot::default();
-        }
-        rx
-    };
-    tokio::time::timeout(Duration::from_secs(5), rx)
-        .await
-        .ok()
-        .and_then(|r| r.ok())
-        .map(|w| w.into_counter_snapshot())
-        .unwrap_or_default()
+        .expect("spawn observe task");
 }
 
 // flock ensures only one process per machine writes; the kernel releases it on exit.

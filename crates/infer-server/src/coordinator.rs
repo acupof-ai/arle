@@ -14,6 +14,8 @@ use std::sync::mpsc::{Receiver as SyncReceiver, RecvTimeoutError, Sender as Sync
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::CounterSnapshot;
+
 use axum::extract::{DefaultBodyLimit, Query, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
@@ -263,6 +265,30 @@ impl CoordinatorHandle {
     fn alloc_request_id(&self) -> u64 {
         self.next_request_id.fetch_add(1, Ordering::Relaxed)
     }
+
+    /// Query rank-0 stats via the relay and convert to a `CounterSnapshot`.
+    /// Falls back to default on any failure (send error, timeout, recv error).
+    pub(crate) async fn query_stats(&self, timeout: Duration) -> CounterSnapshot {
+        let request_id = self.stats_request_id.fetch_add(1, Ordering::Relaxed);
+        let rx = {
+            let mut r = self
+                .relay
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let rx = r.register_stats_awaiter(request_id);
+            if r.send_stats_query(request_id).is_err() {
+                r.unregister_stats_awaiter(request_id);
+                return CounterSnapshot::default();
+            }
+            rx
+        };
+        tokio::time::timeout(timeout, rx)
+            .await
+            .ok()
+            .and_then(|r| r.ok())
+            .map(|w| w.into_counter_snapshot())
+            .unwrap_or_default()
+    }
 }
 
 /// Data-parallel coordinator: wraps M independent TP groups and routes each
@@ -298,7 +324,9 @@ impl Deref for DpCoordinator {
 /// Build the coordinator router + spawn the lockstep loop thread. `relay` is the
 /// accepted [`RelayCoordinator`] (all N ranks connected via `accept_symmetric`).
 /// The lockstep loop runs for the process lifetime. Pass `multimodal` for VLM
-/// backends; text-only backends pass `None`.
+/// backends; text-only backends pass `None`. `observe` spawns the background
+/// observe task — true for the engine-less multiproc coordinator, false for
+/// local relay (ServeHandle owns sampling).
 #[allow(private_interfaces)]
 pub fn coordinator_router(
     relay: RelayCoordinator,
@@ -307,6 +335,7 @@ pub fn coordinator_router(
     max_thinking_tokens: usize,
     multimodal: Option<(crate::LocalMultimodalTx, MultimodalKind)>,
     shutdown: Option<crate::ServeShutdown>,
+    observe: bool,
 ) -> Router {
     let handle = coordinator_handle(
         relay,
@@ -316,6 +345,9 @@ pub fn coordinator_router(
         multimodal,
         shutdown,
     );
+    if observe {
+        spawn_coordinator_observe(&handle);
+    }
     build_router(Arc::new(DpCoordinator::new(vec![handle])))
 }
 
@@ -344,7 +376,24 @@ pub fn dp_coordinator_router(
             )
         })
         .collect();
+    if let Some(handle) = handles.first() {
+        spawn_coordinator_observe(handle);
+    }
     build_router(Arc::new(DpCoordinator::new(handles)))
+}
+
+fn spawn_coordinator_observe(handle: &Arc<CoordinatorHandle>) {
+    let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    else {
+        log::error!("observe: tokio runtime build failed");
+        return;
+    };
+    let handle = Arc::clone(handle);
+    crate::observe::spawn_observe_task(move || {
+        Some(rt.block_on(handle.query_stats(Duration::from_secs(5))))
+    });
 }
 
 fn coordinator_handle(
@@ -369,8 +418,6 @@ fn coordinator_handle(
             .spawn(move || lockstep_loop(relay, in_flight, sinks, submit_rx, shutdown))
             .expect("spawn coordinator lockstep thread");
     }
-
-    crate::observe::spawn_observe_task_coordinator(Arc::clone(&relay));
 
     let (multimodal_tx, multimodal_kind) = multimodal.unzip();
 
@@ -1853,29 +1900,7 @@ async fn fallback_404(req: axum::extract::Request) -> (StatusCode, Json<serde_js
 async fn metrics(
     State(state): State<Arc<DpCoordinator>>,
 ) -> ([(header::HeaderName, &'static str); 1], String) {
-    let request_id = state.stats_request_id.fetch_add(1, Ordering::Relaxed);
-    let (rx, query_ok) = {
-        let mut relay = state
-            .relay
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let rx = relay.register_stats_awaiter(request_id);
-        let query_ok = relay.send_stats_query(request_id).is_ok();
-        if !query_ok {
-            relay.unregister_stats_awaiter(request_id);
-        }
-        (rx, query_ok)
-    };
-    let counters = if query_ok {
-        tokio::time::timeout(std::time::Duration::from_secs(2), rx)
-            .await
-            .ok()
-            .and_then(|r| r.ok())
-            .map(|w| w.into_counter_snapshot())
-            .unwrap_or_default()
-    } else {
-        crate::execution::CounterSnapshot::default()
-    };
+    let counters = state.query_stats(Duration::from_secs(2)).await;
     (
         [(
             header::CONTENT_TYPE,

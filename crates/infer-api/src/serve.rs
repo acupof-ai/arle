@@ -317,6 +317,7 @@ pub fn serve_coordinator_http(
         max_thinking_tokens,
         None,
         Some(shutdown.clone()),
+        true,
     );
     bind_and_serve(bind, port, router, model_path, shutdown)
 }
