@@ -64,7 +64,6 @@ use crate::workspace::{HiddenSlot, PinnedSlot, SliceSlot, VecSlot};
 pub(crate) mod dspark;
 
 const DEFAULT_ROPE_CACHE_LEN: usize = 32_768;
-const QWEN35_BATCHED_DECODE_KV_SPLITS: usize = 4;
 
 /// Longest query the FA3 paged path takes. FA3 zeroes the page stride when
 /// `seqused_k` is set, so a ragged batch needs one launch per request; that is
