@@ -171,10 +171,13 @@ impl CudaAllocTraceExt for Arc<CudaStream> {
 
 /// CUDA device context holding compute stream and optional copy stream.
 ///
-/// Two-stream architecture for overlapping H2D/D2H transfers with compute:
+/// Three-stream architecture for overlapping H2D/D2H transfers and NCCL with compute:
 /// - `stream` (compute): all GPU kernels, CUDA Graph capture/replay
 /// - `copy_stream`: async H2D/D2H transfers, runs concurrently with compute
-/// - `comm_stream`: communication collectives that can overlap independent compute
+/// - `comm_stream`: NCCL collectives and P2P recvs that can overlap independent compute
+/// - `comm_send_stream`: NCCL P2P sends, separate from recvs so a
+///   recv-before-send pattern on both ranks (ring attention) cannot deadlock
+///   on stream serialization
 ///
 /// Cross-stream sync uses raw CUDA events (not cudarc's automatic tracking,
 /// which breaks CUDA Graph capture).
@@ -186,6 +189,8 @@ pub struct DeviceContext {
     pub copy_stream: Arc<CudaStream>,
     /// Separate stream for NCCL/communication work that can overlap compute.
     pub comm_stream: Arc<CudaStream>,
+    /// Separate stream for NCCL P2P sends (ring attention rotate).
+    pub comm_send_stream: Arc<CudaStream>,
     /// CUDA device ordinal this context is bound to.
     pub ordinal: u32,
 }
@@ -415,6 +420,10 @@ impl DeviceContext {
             .new_stream()
             .map_err(|e| anyhow!("Failed to create CUDA communication stream: {}", e))?;
 
+        let comm_send_stream = ctx
+            .new_stream()
+            .map_err(|e| anyhow!("Failed to create CUDA communication send stream: {}", e))?;
+
         // SAFETY: no pointers cross the FFI; `cublas_init` is idempotent,
         // mutex-guarded per device, and requires the current CUDA context to be
         // set — `CudaContext::new(ordinal)` above did exactly that.
@@ -427,6 +436,7 @@ impl DeviceContext {
             stream,
             copy_stream,
             comm_stream,
+            comm_send_stream,
             ordinal,
         })
     }
@@ -645,6 +655,35 @@ impl DeviceContext {
     pub fn compute_waits_for_comm(&self) -> Result<()> {
         let fence = self.record_pipeline_fence(CudaPipelineStreamKind::Comm)?;
         self.wait_on_pipeline_fence(&fence, CudaPipelineStreamKind::Compute)
+    }
+
+    /// Record an event on the compute stream and make the send stream wait for it.
+    ///
+    /// Use before NCCL P2P sends on `comm_send_stream` that read compute-produced
+    /// buffers (ring attention rotate).
+    pub fn comm_send_waits_for_compute(&self) -> Result<()> {
+        let fence = self.record_pipeline_fence(CudaPipelineStreamKind::Compute)?;
+        self.comm_send_stream.wait(&fence.event).map_err(|e| {
+            anyhow!("CUDA pipeline fence wait failed for CommSend waiting on Compute: {e}")
+        })
+    }
+
+    /// Record an event on the send stream and make the comm (recv) stream wait
+    /// for it.
+    ///
+    /// Use before a P2P recv reuses a buffer that the prior hop's send on
+    /// `comm_send_stream` may still be reading (ring attention ping-pong).
+    pub fn comm_waits_for_comm_send(&self) -> Result<()> {
+        let event = self
+            .ctx
+            .new_event(None)
+            .map_err(|e| anyhow!("CUDA event alloc failed for CommSend: {e}"))?;
+        event
+            .record(&self.comm_send_stream)
+            .map_err(|e| anyhow!("CUDA event record failed on CommSend: {e}"))?;
+        self.comm_stream
+            .wait(&event)
+            .map_err(|e| anyhow!("CUDA event wait failed on Comm: {e}"))
     }
 }
 

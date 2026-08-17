@@ -1288,6 +1288,9 @@ impl Qwen35Model {
                     // The current pair was recv'd at the prior hop's start; wait
                     // for that transfer before this hop's compute reads it.
                     self.ctx.compute_waits_for_comm()?;
+                    // The idle pair was sent at the prior hop's end; wait for
+                    // that send to finish before this hop's recv reuses it.
+                    self.ctx.comm_waits_for_comm_send()?;
                 }
                 let next_owner = (cur_owner + cp_size - 1) % cp_size;
                 // Post the next hop's recv into the idle pair now, so it overlaps
@@ -1343,8 +1346,10 @@ impl Qwen35Model {
                 )?;
                 if hop + 1 < cp_size {
                     // Send the current pair only after compute+scatter finish
-                    // reading it.
-                    self.ctx.comm_waits_for_compute()?;
+                    // reading it. Sends run on comm_send_stream (separate from
+                    // the recv stream) so a recv-before-send pattern on both
+                    // ranks cannot deadlock on stream serialization.
+                    self.ctx.comm_send_waits_for_compute()?;
                     let send_len = cp.slices[cur_owner].1;
                     if cur_pair == 0 {
                         self.ring_prefill_post_send(
@@ -1372,6 +1377,7 @@ impl Qwen35Model {
             for hop in 0..cp_size {
                 if hop > 0 {
                     self.ctx.compute_waits_for_comm()?;
+                    self.ctx.comm_waits_for_comm_send()?;
                 }
                 let next_owner = (cur_owner + cp_size - 1) % cp_size;
                 if hop + 1 < cp_size {
@@ -1457,7 +1463,7 @@ impl Qwen35Model {
                     kv_heads,
                 )?;
                 if hop + 1 < cp_size {
-                    self.ctx.comm_waits_for_compute()?;
+                    self.ctx.comm_send_waits_for_compute()?;
                     let send_len = cp.slices[cur_owner].1;
                     if cur_pair == 0 {
                         self.ring_prefill_post_send(
@@ -1886,7 +1892,9 @@ impl Qwen35Model {
                     // One fence bracket for the send+broadcast group: wait for
                     // this layer's advance to produce the state, then let the
                     // next layer's compute wait for the broadcast agreement.
+                    // Sends run on comm_send_stream; broadcast on comm_stream.
                     self.ctx.comm_waits_for_compute()?;
+                    self.ctx.comm_send_waits_for_compute()?;
                     if cp_rank + 1 < cp_size {
                         // SAFETY: same buffers, matching recvs on the next rank.
                         unsafe {
