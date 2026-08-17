@@ -1869,10 +1869,34 @@ impl Qwen35Model {
                 );
                 let gdr_len = slot.gdr_states[linear_idx].len();
                 let conv_len = slot.conv_states[linear_idx].len;
-                // Chunk-order state chain: slice r starts from slice r-1's
-                // post-slice recurrent + conv-tail state (rank 0 starts from
-                // the slot's own state — chunk continuity).
+                // Sequential state chain: rank 0 advances its slice first,
+                // then sends the POST-advance state to rank 1. Rank 1 recvs,
+                // advances, sends to rank 2, etc. The last rank's post-state
+                // is broadcast so every slot agrees before the next chunk.
+                // The recv MUST land after the sender's advance — receiving
+                // the pre-advance state drops the sender's slice contribution.
                 use cuda_kernels::collective::DType;
+                if cp_rank == 0 {
+                    self.advance_linear_conv_gdr(
+                        attn,
+                        &qkv.data.slice(0..rows * qkv_dim),
+                        &b_proj.data.slice(0..rows * b_dim),
+                        &a_proj.data.slice(0..rows * a_dim),
+                        slot,
+                        linear_idx,
+                        rows,
+                        &mut qkv_conv.data.slice_mut(0..rows * qkv_dim),
+                        &mut gdr_out.data.slice_mut(0..rows * z_dim),
+                        fq_q,
+                        fq_k,
+                        fq_v,
+                        fq_a,
+                        fq_g,
+                        fq_g_cumsum,
+                        fq_beta,
+                        None,
+                    )?;
+                }
                 if cp_rank > 0 {
                     let (g_ptr, _g0) = slot.gdr_states[linear_idx].device_ptr_mut(&self.ctx.stream);
                     let (c_ptr, _g1) = slot.conv_states[linear_idx]
@@ -1880,8 +1904,7 @@ impl Qwen35Model {
                         .device_ptr_mut(&self.ctx.stream);
                     self.ctx.comm_waits_for_compute()?;
                     // SAFETY: live per-slot state buffers; the previous cp rank
-                    // posts the matching sends in the same (gdr, conv) order.
-                    // Ungrouped P2P: host rendezvous blocks briefly, never deadlocks.
+                    // posts the matching sends after its own advance.
                     unsafe {
                         self.tp.attn_cp_recv_unfenced(
                             &self.ctx,
@@ -1899,26 +1922,26 @@ impl Qwen35Model {
                         )?;
                     }
                     self.ctx.compute_waits_for_comm()?;
+                    self.advance_linear_conv_gdr(
+                        attn,
+                        &qkv.data.slice(0..rows * qkv_dim),
+                        &b_proj.data.slice(0..rows * b_dim),
+                        &a_proj.data.slice(0..rows * a_dim),
+                        slot,
+                        linear_idx,
+                        rows,
+                        &mut qkv_conv.data.slice_mut(0..rows * qkv_dim),
+                        &mut gdr_out.data.slice_mut(0..rows * z_dim),
+                        fq_q,
+                        fq_k,
+                        fq_v,
+                        fq_a,
+                        fq_g,
+                        fq_g_cumsum,
+                        fq_beta,
+                        None,
+                    )?;
                 }
-                self.advance_linear_conv_gdr(
-                    attn,
-                    &qkv.data.slice(0..rows * qkv_dim),
-                    &b_proj.data.slice(0..rows * b_dim),
-                    &a_proj.data.slice(0..rows * a_dim),
-                    slot,
-                    linear_idx,
-                    rows,
-                    &mut qkv_conv.data.slice_mut(0..rows * qkv_dim),
-                    &mut gdr_out.data.slice_mut(0..rows * z_dim),
-                    fq_q,
-                    fq_k,
-                    fq_v,
-                    fq_a,
-                    fq_g,
-                    fq_g_cumsum,
-                    fq_beta,
-                    None,
-                )?;
                 {
                     let (g_ptr, _g0) = slot.gdr_states[linear_idx].device_ptr_mut(&self.ctx.stream);
                     let (c_ptr, _g1) = slot.conv_states[linear_idx]
