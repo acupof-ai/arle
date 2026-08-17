@@ -54,7 +54,7 @@ no-cuda = [
 nccl = ["cuda", "cuda-kernels/nccl"]
 # DSv4 expert-parallel DeepEP dispatch/combine (Piece 4). Implies `nccl` (the EP
 # group rides the same NCCL substrate) and pulls the native deepep-sys transport.
-deepep = ["nccl", "dep:deepep-sys", "deepep-sys/deepep"]
+deepep = ["nccl", "dep:deepep-sys"]
 
 # DSv4 TP=8/EP=8 greedy-parity harness + rank-0 NCCL unique_id generator. The
 # parity forward needs `cuda`; the `--gen-nccl-id` mode is additively enabled

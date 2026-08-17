@@ -164,7 +164,6 @@ unsafe extern "C" {
 
     /// Full GDR layer forward in C++ — eliminates ~40 FFI calls per layer.
     #[allow(clippy::too_many_arguments)]
-
     pub fn dflash_draft_new() -> *mut std::ffi::c_void;
     pub fn dflash_draft_free(model: *mut std::ffi::c_void);
     #[allow(clippy::too_many_arguments)]
