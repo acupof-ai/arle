@@ -22,13 +22,6 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::path::PathBuf;
 
-/// Atomic replacement for cache payloads that are safe to rebuild after a
-/// crash. Keeps the temp-write + rename property, but skips data and directory
-/// fsyncs to avoid turning cache spill into a durability workload.
-pub fn write_file_atomic_cache(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    write_file_atomic_impl(path, bytes, false)
-}
-
 /// Atomic replacement for payloads that must survive a crash — the durable
 /// recall manifest. `sync_data` + parent-dir `sync_all` make the rename
 /// durable on power loss. Callers must flush the data the manifest references

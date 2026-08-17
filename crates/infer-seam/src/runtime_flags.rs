@@ -74,8 +74,6 @@ pub struct CudaRuntimeFlags {
     /// FlashQLA chunked GDN prefill (sm_90a baked Qwen3.6 shard only).
     #[serde(default = "d_true")]
     pub qwen35_gdr_chunked: bool,
-    #[serde(default)]
-    pub marlin_w4_fp8_prefill: bool,
     /// Retain the cuMemAllocAsync pool across syncs (caching allocator).
     #[serde(default = "d_true")]
     pub mempool_retain: bool,
@@ -130,7 +128,6 @@ impl Default for CudaRuntimeFlags {
             qwen35_fa3_decode_splits: d_fa3_decode_splits(),
             qwen35_deepgemm_min_routes: d_deepgemm_min_routes(),
             qwen35_gdr_chunked: d_true(),
-            marlin_w4_fp8_prefill: false,
             mempool_retain: d_true(),
             shard_cache_bytes: None,
             numa_pin: d_true(),

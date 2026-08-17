@@ -177,7 +177,7 @@ pub(super) fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
     use train::lora::LoraConfig;
 
     let student_dir = args.student_model.as_path();
-    reject_unimplemented_gkd_objectives(args.gkd_entropy_weight, None)?;
+    reject_unimplemented_gkd_objectives(None)?;
     let target_set = parse_lora_target_set(&args.lora_target_set)?;
     let lora = LoraConfig {
         rank: args.lora_rank,

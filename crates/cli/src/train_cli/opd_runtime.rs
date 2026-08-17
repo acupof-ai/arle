@@ -365,17 +365,7 @@ pub(super) fn rollout_sampling_params(
 /// Reject advertised-but-unimplemented distillation objectives before any
 /// model/store is loaded, so a no-op flag fails fast instead of silently
 /// running a different objective mid-training.
-pub(super) fn reject_unimplemented_gkd_objectives(
-    gkd_entropy_weight: f32,
-    teacher_topk: Option<usize>,
-) -> Result<()> {
-    if gkd_entropy_weight != 0.0 {
-        bail!(
-            "--gkd-entropy-weight {gkd_entropy_weight} is not implemented: the per-position \
-             entropy-weighted objective (AEPO) does not exist yet. Omit the flag (0.0) to run \
-             unweighted KL."
-        );
-    }
+pub(super) fn reject_unimplemented_gkd_objectives(teacher_topk: Option<usize>) -> Result<()> {
     if teacher_topk.is_some() {
         bail!(
             "--teacher-topk requires an engine-side top-k teacher-logprob producer (H20 Piece A) \

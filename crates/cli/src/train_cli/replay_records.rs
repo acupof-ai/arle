@@ -353,8 +353,8 @@ pub(super) fn run_agent_opd_replay(
     if args.gkd {
         eprintln!(
             "[arle train agent-opd] replay GKD mode: teacher={:?} temperature={} \
-             entropy_weight={} ema_alpha={}",
-            args.gkd_teacher, args.gkd_temperature, args.gkd_entropy_weight, args.gkd_ema_alpha
+             ema_alpha={}",
+            args.gkd_teacher, args.gkd_temperature, args.gkd_ema_alpha
         );
     }
     log_opd_vram("replay: after student load", &train_backend);
@@ -396,7 +396,6 @@ pub(super) fn run_agent_opd_replay(
                             vocab,
                             args.writeback_window,
                             args.gkd_temperature,
-                            args.gkd_entropy_weight,
                             &mut store,
                         )
                         .with_context(|| format!("replay GKD writeback ({:?})", record.label))?

@@ -1,11 +1,9 @@
-//! HuggingFace Hub model search with nucleo-powered fuzzy matching.
+//! HuggingFace Hub model search.
 //!
 //! Searches both official and community repos (mlx-community, TheBloke, etc.)
 //! with a 5-second timeout fallback.
 
 use anyhow::Result;
-use nucleo_matcher::pattern::{Atom, AtomKind, CaseMatching, Normalization};
-use nucleo_matcher::{Config, Matcher, Utf32Str};
 use serde::Deserialize;
 
 const HF_API_BASE: &str = "https://huggingface.co/api/models";
@@ -52,46 +50,6 @@ pub(crate) fn search_hf_models(query: &str) -> Result<Vec<HfSearchResult>> {
     let response = client.get(&url).send()?;
     let results: Vec<HfSearchResult> = response.json()?;
     Ok(results)
-}
-
-/// Fuzzy-filter a list of search results using nucleo-matcher.
-///
-/// Returns results sorted by match score (best first). Items that don't
-/// match at all are excluded.
-#[allow(dead_code)]
-pub(crate) fn fuzzy_filter(
-    results: &[HfSearchResult],
-    pattern: &str,
-) -> Vec<(u16, HfSearchResult)> {
-    if pattern.is_empty() {
-        return results
-            .iter()
-            .enumerate()
-            .map(|(i, r)| (i as u16, r.clone()))
-            .collect();
-    }
-
-    let mut matcher = Matcher::new(Config::DEFAULT);
-    let atom = Atom::new(
-        pattern,
-        CaseMatching::Ignore,
-        Normalization::Smart,
-        AtomKind::Fuzzy,
-        false,
-    );
-
-    let mut scored: Vec<(u16, HfSearchResult)> = results
-        .iter()
-        .filter_map(|r| {
-            let mut buf = Vec::new();
-            let haystack = Utf32Str::new(&r.model_id, &mut buf);
-            let score = atom.score(haystack, &mut matcher)?;
-            Some((score, r.clone()))
-        })
-        .collect();
-
-    scored.sort_by_key(|entry| std::cmp::Reverse(entry.0));
-    scored
 }
 
 fn urlenccode(s: &str) -> String {

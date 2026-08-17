@@ -745,12 +745,13 @@ pub(crate) struct ServeArgs {
     pub(crate) spec_type: ServeSpecTypeArg,
 
     /// Multi-GPU collective backend for small decode-path messages (CUDA
-    /// multi-rank only). `nccl` (default): plain NCCL — the 2026-06-10 matched
-    /// A/B measured the one-shot path wall-neutral on single-node H20 (the
-    /// decode wall is rank-skew-bound, not protocol-bound). `auto` boots the
-    /// one-shot custom AR/AG with a self-test and loud degrade — kept for
-    /// multi-node and the fused-AR+norm follow-up.
-    #[arg(long, value_enum, default_value_t = ServeCommBackendArg::Nccl)]
+    /// multi-rank only). `auto` (default): one-shot custom AR/AG for small
+    /// messages with a self-test and loud degrade to NCCL; large messages stay
+    /// on NCCL. The 2026-06-10 matched A/B measured one-shot wall-neutral when
+    /// NCCL ran on the compute stream unfenced; the comm-stream move added
+    /// per-collective fence overhead that one-shot avoids by running on the
+    /// compute stream. `nccl` forces plain NCCL (opt-out).
+    #[arg(long, value_enum, default_value_t = ServeCommBackendArg::Auto)]
     pub(crate) comm_backend: ServeCommBackendArg,
 
     /// External drafter checkpoint dir. Consumed by `--spec-type dspark`
@@ -875,10 +876,6 @@ pub(crate) struct ServeArgs {
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set, value_name = "BOOL")]
     pub(crate) qwen35_gdr_chunked: bool,
 
-    /// Marlin W4 FP8 prefill weights at load.
-    #[arg(long, default_value_t = false, action = clap::ArgAction::Set, value_name = "BOOL")]
-    pub(crate) marlin_w4_fp8_prefill: bool,
-
     /// Retain the cuMemAllocAsync pool across syncs (caching allocator).
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set, value_name = "BOOL")]
     pub(crate) cuda_mempool_retain: bool,
@@ -987,7 +984,6 @@ impl ServeArgs {
             qwen35_fa3_decode_splits: self.qwen35_fa3_decode_splits,
             qwen35_deepgemm_min_routes: self.qwen35_deepgemm_min_routes,
             qwen35_gdr_chunked: self.qwen35_gdr_chunked,
-            marlin_w4_fp8_prefill: self.marlin_w4_fp8_prefill,
             mempool_retain: self.cuda_mempool_retain,
             shard_cache_bytes: self.shard_cache_bytes,
             numa_pin: self.numa_pin,
@@ -2601,12 +2597,6 @@ pub(crate) struct TrainAgentOpdArgs {
     /// GKD softmax temperature for the teacher-KL distill loss.
     #[arg(long, default_value_t = 1.0)]
     pub(crate) gkd_temperature: f32,
-
-    /// AEPO entropy weighting for --gkd: scale each position's KL by
-    /// `(1 + w * normalized_student_entropy)`. 0 = off. NOTE: not yet wired —
-    /// a positive value logs a TODO and runs unweighted KL.
-    #[arg(long, default_value_t = 0.0)]
-    pub(crate) gkd_entropy_weight: f32,
 
     /// EMA decay for `--gkd-teacher ema` (θ_ema ← α·θ_ema + (1−α)·θ_student).
     #[arg(long, default_value_t = 0.999)]

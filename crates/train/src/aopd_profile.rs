@@ -34,12 +34,7 @@ struct Table {
     round_start: Option<Instant>,
 }
 
-static ENABLED: OnceLock<bool> = OnceLock::new();
 static TABLE: OnceLock<Mutex<Table>> = OnceLock::new();
-
-pub fn enabled() -> bool {
-    *ENABLED.get_or_init(|| std::env::var_os("ARLE_AOPD_PROFILE").is_some())
-}
 
 fn table() -> &'static Mutex<Table> {
     TABLE.get_or_init(|| {

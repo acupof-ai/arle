@@ -81,18 +81,6 @@ impl CompletionRequest {
             stop: None,
         }
     }
-
-    #[must_use]
-    pub fn with_sampling(mut self, sampling: SamplingParams) -> Self {
-        self.sampling = sampling;
-        self
-    }
-
-    #[must_use]
-    pub fn with_stop(mut self, stop: Vec<String>) -> Self {
-        self.stop = Some(stop);
-        self
-    }
 }
 
 /// Raw image bytes attached to a backend-native chat message.
@@ -137,12 +125,6 @@ impl MultimodalChatRequest {
             sampling: SamplingParams::default(),
         }
     }
-
-    #[must_use]
-    pub fn with_sampling(mut self, sampling: SamplingParams) -> Self {
-        self.sampling = sampling;
-        self
-    }
 }
 
 /// Why generation stopped (the legacy 2-state public shape;
@@ -154,14 +136,6 @@ pub enum FinishReason {
 }
 
 impl FinishReason {
-    #[must_use]
-    pub fn as_openai_str(self) -> &'static str {
-        match self {
-            Self::Length => "length",
-            Self::Stop => "stop",
-        }
-    }
-
     /// Map a rewrite `infer_plan::FinishReason` into this binary shape
     /// (`Abort` -> `Stop`).
     #[must_use]
@@ -227,12 +201,6 @@ impl ChatPromptMessage {
     }
 
     #[must_use]
-    pub fn with_images(mut self, images: Vec<ChatPromptImage>) -> Self {
-        self.images = images;
-        self
-    }
-
-    #[must_use]
     pub fn system(content: impl Into<String>) -> Self {
         Self::new("system", content)
     }
@@ -244,7 +212,9 @@ impl ChatPromptMessage {
 
     #[must_use]
     pub fn user_with_images(content: impl Into<String>, images: Vec<ChatPromptImage>) -> Self {
-        Self::user(content).with_images(images)
+        let mut msg = Self::user(content);
+        msg.images = images;
+        msg
     }
 
     #[must_use]
@@ -279,12 +249,20 @@ impl CompletionStreamDelta {
 
     #[must_use]
     pub fn error(kind: impl Into<String>, chain: Vec<String>) -> Self {
+        let message = chain
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "inference request failed".to_string());
         Self {
             text_delta: String::new(),
             finish_reason: None,
             usage: None,
             token_ids: Vec::new(),
-            error: Some(CompletionStreamError::from_chain(kind, chain)),
+            error: Some(CompletionStreamError {
+                kind: kind.into(),
+                message,
+                chain,
+            }),
         }
     }
 }
@@ -298,20 +276,6 @@ pub struct CompletionStreamError {
 }
 
 impl CompletionStreamError {
-    /// Build from an error-cause chain (most-recent first).
-    #[must_use]
-    pub fn from_chain(kind: impl Into<String>, chain: Vec<String>) -> Self {
-        let message = chain
-            .first()
-            .cloned()
-            .unwrap_or_else(|| "inference request failed".to_string());
-        Self {
-            kind: kind.into(),
-            message,
-            chain,
-        }
-    }
-
     #[must_use]
     pub fn into_anyhow(self) -> anyhow::Error {
         let chain = if self.chain.is_empty() {
