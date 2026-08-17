@@ -1328,7 +1328,7 @@ impl Qwen35Model {
                     // compute is safe. The recv lands in the idle pair and
                     // overlaps with this hop's compute.
                     self.ctx.comm_waits_for_compute()?;
-                    self.tp.attn_cp_group_start()?;
+                    let nccl_group = self.tp.attn_cp_group()?;
                     let recv_len = cp.slices[next_owner].1;
                     if cur_pair == 0 {
                         self.ring_prefill_post_recv(
@@ -1349,7 +1349,7 @@ impl Qwen35Model {
                             &*k1, &*v1, send_len, kv_heads, head_dim, cp_size,
                         )?;
                     }
-                    self.tp.attn_cp_group_end()?;
+                    nccl_group.finish()?;
                 }
                 let blk_len = cp.k_pos[cur_owner].len();
                 if active && blk_len > 0 {
@@ -1415,7 +1415,7 @@ impl Qwen35Model {
                 let next_owner = (cur_owner + cp_size - 1) % cp_size;
                 if hop + 1 < cp_size {
                     self.ctx.comm_waits_for_compute()?;
-                    self.tp.attn_cp_group_start()?;
+                    let nccl_group = self.tp.attn_cp_group()?;
                     let recv_len = cp.slices[next_owner].1;
                     if cur_pair == 0 {
                         self.ring_prefill_post_recv(
@@ -1436,7 +1436,7 @@ impl Qwen35Model {
                             &*k1, &*v1, send_len, kv_heads, head_dim, cp_size,
                         )?;
                     }
-                    self.tp.attn_cp_group_end()?;
+                    nccl_group.finish()?;
                 }
                 let blk_len = cp.k_pos[cur_owner].len();
                 if active && blk_len > 0 {
@@ -1879,7 +1879,7 @@ impl Qwen35Model {
                         .data
                         .device_ptr_mut(&self.ctx.stream);
                     self.ctx.comm_waits_for_compute()?;
-                    self.tp.attn_cp_group_start()?;
+                    let nccl_group = self.tp.attn_cp_group()?;
                     // SAFETY: live per-slot state buffers; the previous cp rank
                     // posts the matching sends in the same (gdr, conv) order.
                     unsafe {
@@ -1898,7 +1898,7 @@ impl Qwen35Model {
                             cp_rank - 1,
                         )?;
                     }
-                    self.tp.attn_cp_group_end()?;
+                    nccl_group.finish()?;
                     self.ctx.compute_waits_for_comm()?;
                 }
                 self.advance_linear_conv_gdr(
@@ -1930,7 +1930,7 @@ impl Qwen35Model {
                     // submits both directions together — the host never blocks
                     // in ncclSend waiting for a peer recv that hasn't been
                     // posted.
-                    self.tp.attn_cp_group_start()?;
+                    let nccl_group = self.tp.attn_cp_group()?;
                     if cp_rank + 1 < cp_size {
                         // SAFETY: same buffers, matching recvs on the next rank.
                         unsafe {
@@ -1970,7 +1970,7 @@ impl Qwen35Model {
                             cp_size - 1,
                         )?;
                     }
-                    self.tp.attn_cp_group_end()?;
+                    nccl_group.finish()?;
                     self.ctx.compute_waits_for_comm()?;
                 }
             }
