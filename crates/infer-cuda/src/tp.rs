@@ -789,7 +789,7 @@ impl TpRuntime {
                         count,
                         dtype,
                         peer,
-                        ctx.comm_stream.cu_stream().cast::<std::ffi::c_void>(),
+                        ctx.comm_send_stream.cu_stream().cast::<std::ffi::c_void>(),
                     )?;
                 }
                 Ok(())
