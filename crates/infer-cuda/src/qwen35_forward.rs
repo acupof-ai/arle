@@ -457,7 +457,7 @@ impl Qwen35Model {
         &self,
         rows: &mut [LinearRow<'_>],
         ws: &mut Qwen35Workspace,
-        start_pos: usize,
+        _start_pos: usize,
         mut recall: Option<&mut Qwen35RecallForward>,
         mut taps: Option<&mut dspark::Qwen35DsparkTaps>,
     ) -> Result<()> {
@@ -485,7 +485,6 @@ impl Qwen35Model {
         // scratch stay simultaneously borrowable across the layer loop.
         let Qwen35Workspace {
             token_ids,
-            start_pos: start_pos_slot,
             hidden,
             normed,
             hidden_mid,
@@ -502,7 +501,6 @@ impl Qwen35Model {
         // just wrote (no H2D here — a mismatch would mean staging was skipped,
         // which the two call paths above make impossible).
         let token_ids = &*token_ids.get(&self.ctx, seq_len)?;
-        let start_pos_dev = &*start_pos_slot.get(&self.ctx, 1)?;
 
         let hidden = hidden.get(&self.ctx, hidden_size, seq_len)?;
         crate::profile::profile_op(&self.ctx, "embedding", None, seq_len, || {
