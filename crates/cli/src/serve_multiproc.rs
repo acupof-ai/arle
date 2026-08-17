@@ -509,6 +509,7 @@ fn run_lockstep_driver(
                     spec_partial_ctx_chains: spec.partial_ctx_chains,
                     operator_dispatch,
                     op_timing,
+                    gpu: stats.gpu,
                 };
                 if let Err(e) = relay.send(&RelayEnvelope::StatsResponse {
                     request_id,

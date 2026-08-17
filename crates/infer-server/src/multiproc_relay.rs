@@ -356,6 +356,8 @@ pub struct WireStats {
     pub operator_dispatch: infer_seam::OperatorDispatchStats,
     #[serde(default)]
     pub op_timing: infer_seam::OpTimingStats,
+    #[serde(default)]
+    pub gpu: Option<infer_seam::GpuSample>,
 }
 
 impl WireStats {
@@ -450,6 +452,7 @@ impl WireStats {
                 partial_ctx_chains: self.spec_partial_ctx_chains,
             },
             op_timing: self.op_timing,
+            gpu: self.gpu,
         }
     }
 
@@ -542,6 +545,7 @@ impl WireStats {
             spec_partial_ctx_chains: c.spec_decode.partial_ctx_chains,
             operator_dispatch,
             op_timing: c.op_timing.clone(),
+            gpu: c.gpu,
         }
     }
 }

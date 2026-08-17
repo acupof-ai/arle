@@ -76,6 +76,7 @@ mod profile;
 // Session KV-recall (infinite memory): resident mean-key reps + restricted page
 // table on the dense-Qwen3 paged decode path. The `default_recall_config`
 // budget is device-neutral; the rep/score machinery is cuda-gated inside.
+mod gpu_sample;
 mod recall;
 #[cfg(feature = "cuda")]
 mod stage_profile;
@@ -682,6 +683,7 @@ impl BackendExecutor for CudaExecutor {
             artifact: infer_seam::BackendArtifactIdentity {
                 kernel_bundle_id: cuda_kernels::KERNEL_BUILD_ID.to_string(),
             },
+            gpu: gpu_sample::latest(),
         }
     }
 

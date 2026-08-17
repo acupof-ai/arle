@@ -253,6 +253,26 @@ impl Default for StepLimits {
     }
 }
 
+/// Per-GPU utilization sample from the backend's background sampler.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct GpuDeviceSample {
+    pub gpu_index: u8,
+    pub util_pct: u8,
+    pub memory_used_mb: u32,
+    pub memory_total_mb: u32,
+    pub temp_c: u8,
+    pub power_w: u16,
+}
+
+/// Fixed-capacity multi-GPU sample (up to 8 devices).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct GpuSample {
+    pub devices: [GpuDeviceSample; 8],
+    pub device_count: u8,
+    pub sampled_at_ms: u64,
+    pub stale: bool,
+}
+
 /// Backend-reported counters and identity, read at stats-request boundaries.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct BackendStats {
@@ -265,6 +285,9 @@ pub struct BackendStats {
     pub op_timing: OpTimingStats,
     /// Exact backend build-artifact identity, if the build verified one.
     pub artifact: BackendArtifactIdentity,
+    /// GPU utilization/VRAM/temp/power from the backend's background sampler.
+    /// `None` for backends without one (Metal, placeholder, non-zero TP rank).
+    pub gpu: Option<GpuSample>,
 }
 
 /// Host-only engine-core to backend-executor seam: the core submit/poll loop,

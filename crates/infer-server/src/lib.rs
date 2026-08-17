@@ -45,6 +45,7 @@ mod grammar;
 mod metrics;
 pub mod multimodal;
 pub mod multiproc_relay;
+mod observe;
 mod schema;
 mod sse_util;
 mod tokenizer;
@@ -278,6 +279,7 @@ where
         let (control_tx, control_rx) = mpsc::channel::<ControlMessage<E, K>>();
         let counters = Arc::new(Mutex::new(CounterSnapshot::default()));
         let loop_counters = Arc::clone(&counters);
+        observe::spawn_observe_task(Arc::clone(&counters));
         let max_live_requests = executor.step_limits().max_live_requests.max(1);
         let join = thread::Builder::new()
             .name("infer-engine".to_string())
@@ -344,6 +346,7 @@ where
         let (ready_tx, ready_rx) = mpsc::sync_channel::<std::result::Result<usize, String>>(1);
         let counters = Arc::new(Mutex::new(CounterSnapshot::default()));
         let loop_counters = Arc::clone(&counters);
+        observe::spawn_observe_task(Arc::clone(&counters));
         let join = thread::Builder::new()
             .name("infer-engine".to_string())
             .spawn(move || match builder() {
