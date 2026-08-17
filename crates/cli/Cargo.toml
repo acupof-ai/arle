@@ -23,6 +23,9 @@ hip = ["infer-api/hip"]
 vulkan = ["infer-api/vulkan"]
 nccl = ["cuda", "infer-api/nccl", "train/nccl", "autograd/nccl"]
 deepep = ["nccl", "infer-api/deepep"]
+# Grammar-constrained decode (xgrammar real backend). Requires
+# XGRAMMAR_SOURCE_DIR at build time.
+grammar = ["infer-api/grammar"]
 
 [dependencies]
 anyhow = "1.0"

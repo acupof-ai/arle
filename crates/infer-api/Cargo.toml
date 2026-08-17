@@ -83,6 +83,9 @@ cpu = ["dep:infer-metal"]
 # the CUDA backend is pulled in).
 nccl = ["cuda", "infer-cuda?/nccl"]
 deepep = ["nccl", "infer-cuda?/deepep"]
+# Grammar-constrained decode (xgrammar real backend). Requires
+# XGRAMMAR_SOURCE_DIR at build time.
+grammar = ["infer-server/grammar"]
 
 [dev-dependencies]
 infer-core = { path = "../infer-core" }

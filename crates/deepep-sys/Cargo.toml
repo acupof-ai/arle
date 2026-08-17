@@ -11,13 +11,8 @@ crate-type = ["rlib"]
 
 [features]
 default = []
-# When set + ARLE_DEEPEP_DIR env var present at build time, build.rs
-# nvcc-compiles the C++ wrapper + DeepEP kernel sources and links them
-# into the static archive. Without the feature OR without the env var,
-# the crate exports stub functions that return DeepEpError::NotBuilt at
-# call time — lets dependent crates compile cleanly on machines without
-# the DeepEP source tree.
-deepep = []
+# Build decision is made by build.rs via the ARLE_DEEPEP_DIR env var
+# (sets cfg(deepep_stub) when absent). No feature gate needed.
 
 [dependencies]
 anyhow = "1"

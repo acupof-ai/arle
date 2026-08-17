@@ -72,8 +72,6 @@ below predates the rewrite; verify against §0 + dated `wins/` entries.
 
 ## 1. Runtime Backends
 
-> Legacy `infer/` (shipped product). For the new rewrite stack see [§0](#0-rewrite-stack-support-new-crate-graph-not-yet-shipped).
-
 | Backend | Status | Meaning |
 | --- | --- | --- |
 | CUDA | Supported | Primary serving path. Main runtime, scheduler, and benchmark focus. |

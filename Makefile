@@ -1,6 +1,6 @@
 # ARLE — local development shortcuts
 #
-# Targets mirror the CI matrix (.github/workflows/{ci,metal-ci,cuda-ci}.yml).
+# Targets mirror the CI matrix (.github/workflows/{ci,metal-ci}.yml).
 #
 # Usage:
 #   make hygiene                  # public docs/templates/link guardrails
