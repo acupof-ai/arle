@@ -671,32 +671,11 @@ impl PageMeta {
         ctx: &DeviceContext,
         max_local_pages: usize,
     ) -> Result<Self> {
-        let cap = max_local_pages.max(1);
-        Ok(Self {
-            q_indptr: upload_i32(ctx, &[0, 1])?,
-            kv_indptr: upload_i32(ctx, &[0, 0])?,
-            kv_indices: upload_i32(ctx, &vec![0i32; cap])?,
-            kv_lens_dev: upload_i32(ctx, &[0])?,
-            page_table_rect: upload_i32(ctx, &vec![0i32; cap])?,
-            page_table_stride: cap,
-            kv_last_page_len: upload_i32(ctx, &[0])?,
-            page_table_offsets: upload_i32(ctx, &[0])?,
-            start_positions: upload_i32(ctx, &[0])?,
-            positions: upload_i32(ctx, &[0])?,
-            q_offsets: vec![0, 1],
-            page_offsets: vec![0, 0],
-            kv_lens: vec![0],
-            seq_len: 1,
-            total_q: 1,
-            num_pages: 0,
-            batch: 1,
-            start_pos: 0,
-            new_token_rows: None,
-            prefix_token_rows: None,
-            quant_decode_meta: None,
-            seqlen_k_capture: None,
-            write_kv: 1,
-        })
+        // Same shape as persistent_decode; the sharded lane pins no FA3
+        // scheduling ceiling (the 2D merge handles variable local page counts).
+        let mut meta = Self::persistent_decode(ctx, 1, max_local_pages)?;
+        meta.seqlen_k_capture = None;
+        Ok(meta)
     }
 
     /// Rewrite a [`Self::persistent_sharded_decode`] meta for one 2D decode step —

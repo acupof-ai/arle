@@ -69,7 +69,7 @@ impl ShardSpec {
     /// owned. The inverse of the block-cyclic mapping.
     #[must_use]
     pub fn local_index(&self, page: usize) -> Option<usize> {
-        (self.size <= 1 || page % self.size == self.rank).then(|| {
+        self.owns_page(page).then(|| {
             if self.size <= 1 {
                 page
             } else {

@@ -717,38 +717,18 @@ impl TpRuntime {
     }
 
     /// All-gather over the attn_cp sub-comm (CP prefill KV/row exchange).
-    /// In-place is allowed: `sendbuf == recvbuf + attn_cp_rank * sendcount`.
+    /// In-place all-gather over the attn_cp sub-comm without the compute↔comm
+    /// fence bracket. `sendbuf == recvbuf + attn_cp_rank * sendcount` is
+    /// allowed. For callers that fence the group's real dependencies once.
     ///
     /// # Safety
     ///
     /// `sendbuf` must hold `sendcount` BF16 elements and `recvbuf`
     /// `sendcount * attn_cp_size` BF16 elements on this rank's device; both
-    /// stay valid until the collective enqueued on the comm stream completes, and
-    /// every cp-group rank calls with the same `sendcount`.
-    #[cfg(feature = "cuda")]
-    #[cfg_attr(not(feature = "nccl"), allow(unused_variables))]
-    pub unsafe fn attn_cp_all_gather_bf16(
-        &self,
-        ctx: &cuda_kernels::prelude::DeviceContext,
-        sendbuf: *const std::ffi::c_void,
-        sendcount: usize,
-        recvbuf: *mut std::ffi::c_void,
-    ) -> anyhow::Result<()> {
-        ctx.comm_waits_for_compute()?;
-        // SAFETY: this fn's contract.
-        unsafe { self.attn_cp_all_gather_bf16_unfenced(ctx, sendbuf, sendcount, recvbuf)? };
-        ctx.compute_waits_for_comm()?;
-        Ok(())
-    }
-
-    /// [`Self::attn_cp_all_gather_bf16`] without the compute↔comm fence bracket.
-    /// For callers that fence the group's real dependencies once.
-    ///
-    /// # Safety
-    ///
-    /// See [`Self::attn_cp_all_gather_bf16`]; the caller must fence
-    /// `comm_waits_for_compute` before the op and `compute_waits_for_comm`
-    /// before the first compute reading `recvbuf`.
+    /// stay valid until the collective enqueued on the comm stream completes,
+    /// and every cp-group rank calls with the same `sendcount`. The caller
+    /// must fence `comm_waits_for_compute` before the op and
+    /// `compute_waits_for_comm` before the first compute reading `recvbuf`.
     pub unsafe fn attn_cp_all_gather_bf16_unfenced(
         &self,
         ctx: &cuda_kernels::prelude::DeviceContext,
@@ -776,38 +756,16 @@ impl TpRuntime {
         }
     }
 
-    /// Point-to-point send to `peer` (cp-group rank) over the attn_cp sub-comm
-    /// (GDN prefill state relay).
-    ///
-    /// # Safety
-    ///
-    /// `buf` must hold `count` elements of `dtype` on this rank's device and
-    /// stay valid until the op enqueued on the comm stream completes; `peer` must
-    /// post the matching [`Self::attn_cp_recv`].
-    #[cfg(feature = "cuda")]
-    #[cfg_attr(not(feature = "nccl"), allow(unused_variables))]
-    pub unsafe fn attn_cp_send(
-        &self,
-        ctx: &cuda_kernels::prelude::DeviceContext,
-        buf: *const std::ffi::c_void,
-        count: usize,
-        dtype: cuda_kernels::collective::DType,
-        peer: usize,
-    ) -> anyhow::Result<()> {
-        ctx.comm_waits_for_compute()?;
-        // SAFETY: this fn's contract.
-        unsafe { self.attn_cp_send_unfenced(ctx, buf, count, dtype, peer)? };
-        ctx.compute_waits_for_comm()?;
-        Ok(())
-    }
-
-    /// [`Self::attn_cp_send`] without the compute↔comm fence bracket. For
+    /// cp send to `peer` (cp-group rank) over the attn_cp sub-comm (GDN
+    /// prefill state relay), without the compute↔comm fence bracket. For
     /// callers that issue several cp ops as one group and fence the group's
     /// real data dependencies once (GDN relay, ring rotation).
     ///
     /// # Safety
     ///
-    /// See [`Self::attn_cp_send`]; the caller must fence
+    /// `buf` must hold `count` elements of `dtype` on this rank's device and
+    /// stay valid until the op enqueued on the comm stream completes; `peer`
+    /// must post the matching recv. The caller must fence
     /// `comm_waits_for_compute` before the first op reading a compute-written
     /// buffer and `compute_waits_for_comm` before the first compute reading a
     /// comm-written buffer.
@@ -839,34 +797,14 @@ impl TpRuntime {
         }
     }
 
-    /// Matching recv for [`Self::attn_cp_send`].
+    /// cp recv from the attn_cp sub-comm, without the compute↔comm fence
+    /// bracket. See [`Self::attn_cp_send_unfenced`] for the caller's fence
+    /// obligations.
     ///
     /// # Safety
     ///
-    /// See [`Self::attn_cp_send`]; `buf` must be writable for `count` elements.
-    #[cfg(feature = "cuda")]
-    #[cfg_attr(not(feature = "nccl"), allow(unused_variables))]
-    pub unsafe fn attn_cp_recv(
-        &self,
-        ctx: &cuda_kernels::prelude::DeviceContext,
-        buf: *mut std::ffi::c_void,
-        count: usize,
-        dtype: cuda_kernels::collective::DType,
-        peer: usize,
-    ) -> anyhow::Result<()> {
-        ctx.comm_waits_for_compute()?;
-        // SAFETY: this fn's contract.
-        unsafe { self.attn_cp_recv_unfenced(ctx, buf, count, dtype, peer)? };
-        ctx.compute_waits_for_comm()?;
-        Ok(())
-    }
-
-    /// [`Self::attn_cp_recv`] without the compute↔comm fence bracket. See
-    /// [`Self::attn_cp_send_unfenced`] for the caller's fence obligations.
-    ///
-    /// # Safety
-    ///
-    /// See [`Self::attn_cp_recv`].
+    /// `buf` must be writable for `count` elements of `dtype`; the peer must
+    /// post the matching send.
     pub unsafe fn attn_cp_recv_unfenced(
         &self,
         ctx: &cuda_kernels::prelude::DeviceContext,
@@ -896,35 +834,14 @@ impl TpRuntime {
     }
 
     /// In-place broadcast from cp-group rank `root` over the attn_cp sub-comm
-    /// (end-of-chunk GDN state agreement).
+    /// (end-of-chunk GDN state agreement), without the compute↔comm fence
+    /// bracket. See [`Self::attn_cp_send_unfenced`] for the caller's fence
+    /// obligations.
     ///
     /// # Safety
     ///
-    /// See [`Self::attn_cp_send`]; every cp-group rank calls with the same
-    /// `count`/`dtype`/`root`.
-    #[cfg(feature = "cuda")]
-    #[cfg_attr(not(feature = "nccl"), allow(unused_variables))]
-    pub unsafe fn attn_cp_broadcast(
-        &self,
-        ctx: &cuda_kernels::prelude::DeviceContext,
-        buf: *mut std::ffi::c_void,
-        count: usize,
-        dtype: cuda_kernels::collective::DType,
-        root: usize,
-    ) -> anyhow::Result<()> {
-        ctx.comm_waits_for_compute()?;
-        // SAFETY: this fn's contract.
-        unsafe { self.attn_cp_broadcast_unfenced(ctx, buf, count, dtype, root)? };
-        ctx.compute_waits_for_comm()?;
-        Ok(())
-    }
-
-    /// [`Self::attn_cp_broadcast`] without the compute↔comm fence bracket. See
-    /// [`Self::attn_cp_send_unfenced`] for the caller's fence obligations.
-    ///
-    /// # Safety
-    ///
-    /// See [`Self::attn_cp_broadcast`].
+    /// Every cp-group rank calls with the same `count`/`dtype`/`root`; `buf`
+    /// must hold `count` elements and stay valid until the op completes.
     pub unsafe fn attn_cp_broadcast_unfenced(
         &self,
         ctx: &cuda_kernels::prelude::DeviceContext,

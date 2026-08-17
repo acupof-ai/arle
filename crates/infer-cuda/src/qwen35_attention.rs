@@ -480,9 +480,7 @@ impl Qwen35Model {
                 v_batch,
                 attn_out,
             )?;
-        }
-
-        if cp.is_none() {
+        } else {
             let q_prepped = q_prepped.get(&self.ctx, q_dim, rows)?;
 
             // B2: history pages hold every cp rank's KV (prefill keeps the pool
@@ -907,8 +905,13 @@ impl Qwen35Model {
                                         // SAFETY: lse holds cp_size*accum_rows f32; the
                                         // send slot is this rank's rank-major section,
                                         // in-place gather per the collective's contract.
+                                        // One fence bracket for both collects (lse +
+                                        // merge_gather): the D2D stage above runs on
+                                        // compute, the gathers on comm (ordered), and
+                                        // the merge kernel below waits once.
+                                        self.ctx.comm_waits_for_compute()?;
                                         unsafe {
-                                            self.tp.attn_cp_all_gather_bf16(
+                                            self.tp.attn_cp_all_gather_bf16_unfenced(
                                                 &self.ctx,
                                                 (lse_ptr + my_lse_byte_off)
                                                     as *const std::ffi::c_void,
@@ -917,6 +920,7 @@ impl Qwen35Model {
                                             )?;
                                         }
                                         self.cp_all_gather_in_place(merge_gather, sect)?;
+                                        self.ctx.compute_waits_for_comm()?;
                                         let (mg_ptr, _gm) =
                                             merge_gather.data.device_ptr_mut(&self.ctx.stream);
                                         let (ao_ptr, _ga) =
@@ -1145,7 +1149,7 @@ impl Qwen35Model {
         let (g_ptr, _g) = gather.data.device_ptr_mut(&self.ctx.stream);
         // SAFETY: live `cp_size*sect` buffer; equal `sect` on every cp rank.
         unsafe {
-            self.tp.attn_cp_all_gather_bf16(
+            self.tp.attn_cp_all_gather_bf16_unfenced(
                 &self.ctx,
                 (g_ptr + (cp_rank * sect) as u64 * elem) as *const std::ffi::c_void,
                 sect,
@@ -1265,9 +1269,7 @@ impl Qwen35Model {
 
         if fa3 {
             // FA3 route: thread internally-allocated accumulator copies.
-            let mut fa3_m: Option<CudaSlice<f32>> = None;
-            let mut fa3_l: Option<CudaSlice<f32>> = None;
-            let mut fa3_o: Option<CudaSlice<f32>> = None;
+            let mut fa3_acc: Option<(CudaSlice<f32>, CudaSlice<f32>, CudaSlice<f32>)> = None;
             let mut cur_owner = cp_rank;
             let mut cur_pair = 0usize;
             for hop in 0..cp_size {
@@ -1302,11 +1304,8 @@ impl Qwen35Model {
                     if hop == 0 {
                         (&*m_a, &*l_a, &*o_a)
                     } else {
-                        (
-                            fa3_m.as_ref().unwrap(),
-                            fa3_l.as_ref().unwrap(),
-                            fa3_o.as_ref().unwrap(),
-                        )
+                        let acc = fa3_acc.as_ref().unwrap();
+                        (&acc.0, &acc.1, &acc.2)
                     };
                 let (m_out, l_out, o_out) = cuda_kernels::ring_attention::ring_block_fwd_merge_fa3(
                     &self.ctx.stream,
@@ -1320,9 +1319,7 @@ impl Qwen35Model {
                     &cp.k_pos[cur_owner],
                     dims,
                 )?;
-                fa3_m = Some(m_out);
-                fa3_l = Some(l_out);
-                fa3_o = Some(o_out);
+                fa3_acc = Some((m_out, l_out, o_out));
                 self.ring_prefill_scatter(
                     cp,
                     full_idx,
@@ -1351,14 +1348,8 @@ impl Qwen35Model {
                     cur_pair = 1 - cur_pair;
                 }
             }
-            self.ring_prefill_finalize(
-                fa3_l.as_ref().unwrap(),
-                fa3_o.as_ref().unwrap(),
-                attn_out,
-                q_heads,
-                rows,
-                full_idx,
-            )?;
+            let acc = fa3_acc.as_ref().unwrap();
+            self.ring_prefill_finalize(&acc.1, &acc.2, attn_out, q_heads, rows, full_idx)?;
         } else {
             // Scalar route: A/B ping-pong (the merge is functional, in != out).
             let m_b = ring.m_b.get(&self.ctx, acc_rows)?;
@@ -1527,9 +1518,6 @@ impl Qwen35Model {
         Ok(())
     }
 
-    /// Rotate the ring: recv the next block from the previous cp rank, then
-    /// send the current block to the next cp rank (NCCL P2P on comm stream).
-    #[allow(clippy::too_many_arguments)]
     /// Post two unfenced cp recvs (k, v) into the idle pair from the upstream
     /// peer. Issued before this hop's compute so the transfer overlaps; the
     /// caller must run `compute_waits_for_comm` before the next hop's compute
@@ -1679,7 +1667,9 @@ impl Qwen35Model {
                     .slice_mut(cp_rank * sect..cp_rank * sect + my_len * dim),
             )
             .map_err(|e| anyhow!("CP row-gather stage failed: {e}"))?;
+        self.ctx.comm_waits_for_compute()?;
         self.cp_all_gather_in_place(gather, sect)?;
+        self.ctx.compute_waits_for_comm()?;
         for (peer, &(off, len)) in cp.slices.iter().enumerate() {
             self.ctx
                 .stream
