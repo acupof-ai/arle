@@ -663,6 +663,139 @@ impl PageMeta {
         Ok(())
     }
 
+    /// Fixed-capacity page table for the 2D-sharded eager decode lane, mirroring
+    /// [`Self::persistent_decode`] but sized to this rank's LOCAL page shard
+    /// (`max_local_pages = ceil(max_global_pages / cp_size)`). The pool under 2D
+    /// holds only the owned pages, so `page_indices` already returns the shard.
+    pub(crate) fn persistent_sharded_decode(
+        ctx: &DeviceContext,
+        max_local_pages: usize,
+    ) -> Result<Self> {
+        let cap = max_local_pages.max(1);
+        Ok(Self {
+            q_indptr: upload_i32(ctx, &[0, 1])?,
+            kv_indptr: upload_i32(ctx, &[0, 0])?,
+            kv_indices: upload_i32(ctx, &vec![0i32; cap])?,
+            kv_lens_dev: upload_i32(ctx, &[0])?,
+            page_table_rect: upload_i32(ctx, &vec![0i32; cap])?,
+            page_table_stride: cap,
+            kv_last_page_len: upload_i32(ctx, &[0])?,
+            page_table_offsets: upload_i32(ctx, &[0])?,
+            start_positions: upload_i32(ctx, &[0])?,
+            positions: upload_i32(ctx, &[0])?,
+            q_offsets: vec![0, 1],
+            page_offsets: vec![0, 0],
+            kv_lens: vec![0],
+            seq_len: 1,
+            total_q: 1,
+            num_pages: 0,
+            batch: 1,
+            start_pos: 0,
+            new_token_rows: None,
+            prefix_token_rows: None,
+            quant_decode_meta: None,
+            seqlen_k_capture: None,
+            write_kv: 1,
+        })
+    }
+
+    /// Rewrite a [`Self::persistent_sharded_decode`] meta for one 2D decode step —
+    /// contents only, no reallocation. `write_kv` flips per step: only the owner of
+    /// the last global page appends the new token.
+    pub(crate) fn refresh_sharded_decode(
+        &mut self,
+        ctx: &DeviceContext,
+        pool: &PagedKVPool,
+        slot: usize,
+        start_pos: usize,
+        cp_rank: usize,
+        cp_size: usize,
+    ) -> Result<()> {
+        ensure!(
+            pool.format == KVFormat::BF16,
+            "2D decode requires the BF16 KV pool (got {:?})",
+            pool.format
+        );
+        let total_len = start_pos + 1;
+        let page_size = pool.page_size;
+        ensure!(
+            pool.seq_len(slot) == total_len,
+            "sharded decode refresh: pool seq_len {} != total_len {total_len} for slot {slot}",
+            pool.seq_len(slot)
+        );
+        let global_pages = total_len.div_ceil(page_size);
+        let local_pages: Vec<i32> = pool.page_indices(slot).iter().map(|&p| p as i32).collect();
+        let local_num_pages = local_pages.len();
+        let cap = self.page_table_stride;
+        ensure!(
+            local_num_pages <= cap,
+            "slot {slot} sharded decode needs {local_num_pages} pages, persistent capacity is {cap}"
+        );
+        let owns_last = cp_size <= 1 || (global_pages - 1) % cp_size == cp_rank;
+        let overshoot = global_pages * page_size - total_len;
+        let local_last_fill = if owns_last {
+            page_size - overshoot
+        } else {
+            page_size
+        };
+        let local_token_count = local_num_pages.saturating_sub(1).saturating_mul(page_size)
+            + if local_num_pages == 0 {
+                0
+            } else {
+                local_last_fill
+            };
+        let stream = &ctx.stream;
+        // A shard with no resident pages still needs a 1-entry table: FA3
+        // dereferences page_table[0], and kv_lens=0 bounds the read to zero.
+        let table: &[i32] = if local_num_pages == 0 {
+            &[0]
+        } else {
+            &local_pages
+        };
+        stream
+            .memcpy_htod(table, &mut self.kv_indices.slice_mut(0..table.len()))
+            .map_err(|e| anyhow!("refresh sharded kv_indices: {e}"))?;
+        stream
+            .memcpy_htod(table, &mut self.page_table_rect.slice_mut(0..table.len()))
+            .map_err(|e| anyhow!("refresh sharded page_table_rect: {e}"))?;
+        stream
+            .memcpy_htod(
+                &[0, local_num_pages as i32],
+                &mut self.kv_indptr.slice_mut(0..2),
+            )
+            .map_err(|e| anyhow!("refresh sharded kv_indptr: {e}"))?;
+        stream
+            .memcpy_htod(
+                &[local_last_fill as i32],
+                &mut self.kv_last_page_len.slice_mut(0..1),
+            )
+            .map_err(|e| anyhow!("refresh sharded kv_last_page_len: {e}"))?;
+        stream
+            .memcpy_htod(
+                &[start_pos as i32],
+                &mut self.start_positions.slice_mut(0..1),
+            )
+            .map_err(|e| anyhow!("refresh sharded start_positions: {e}"))?;
+        stream
+            .memcpy_htod(
+                &[(total_len - 1) as i32],
+                &mut self.positions.slice_mut(0..1),
+            )
+            .map_err(|e| anyhow!("refresh sharded positions: {e}"))?;
+        stream
+            .memcpy_htod(
+                &[local_token_count as i32],
+                &mut self.kv_lens_dev.slice_mut(0..1),
+            )
+            .map_err(|e| anyhow!("refresh sharded kv_lens_dev: {e}"))?;
+        self.page_offsets = vec![0, local_num_pages];
+        self.kv_lens = vec![local_token_count];
+        self.num_pages = local_num_pages;
+        self.start_pos = start_pos;
+        self.write_kv = i32::from(owns_last);
+        Ok(())
+    }
+
     /// Session KV-recall decode page table: build the metadata over a SELECTED page
     /// subset
     /// (`recall_pages`, ascending, ending with the current local page) instead of the

@@ -127,6 +127,10 @@ pub(crate) struct Qwen35CudaExecutor {
     /// Per-slot fixed-capacity page table for the paged decode-graph lane: device
     /// addresses are capture-stable, contents refresh each step outside the graph.
     paged_decode_meta: Vec<Option<crate::loader::PageMeta>>,
+    /// Per-slot fixed-capacity page table for the 2D-sharded eager decode lane:
+    /// built once per slot, refreshed in place each step (the graph lane is
+    /// single-GPU only, so 2D decode never captures).
+    sharded_decode_meta: Vec<Option<crate::loader::PageMeta>>,
     batch_decode: Option<crate::qwen35::Qwen35BatchDecodeState>,
     /// Recall cycle opt-in (`--kv-recall`): layers a working-set restriction on the
     /// SAME paged `full_attn_kv` pool; off attends the full resident page set.
@@ -804,6 +808,7 @@ impl Qwen35CudaExecutor {
             decode_graph_armed,
             decode_graph: None,
             paged_decode_meta: Vec::new(),
+            sharded_decode_meta: Vec::new(),
             batch_decode: None,
             kv_recall: false,
             recall_cfg: crate::recall::default_recall_config(),
@@ -1310,47 +1315,81 @@ impl Qwen35CudaExecutor {
             );
         }
         self.mirror_host_slot(host_kv, slot, row.kv_seq_len + 1)?;
-        let meta = {
+        // 2D decode never captures (the graph lane is single-GPU), so it uses a
+        // persistent per-slot meta refreshed in place; non-2D builds a fresh meta.
+        let two_d = self.two_d_engaged();
+        if two_d {
+            if self.sharded_decode_meta.is_empty() {
+                self.sharded_decode_meta = (0..self.num_slots).map(|_| None).collect();
+            }
             let pool = self
                 .full_attn_kv
                 .as_ref()
                 .expect("full_attn_kv present (full_attn_paged)");
-            if self.two_d_engaged() {
-                Self::sharded_decode_meta(
+            let cp_rank = self.model.tp.attn_cp_rank();
+            let cp_size = self.model.tp.attn_cp_size();
+            let max_local_pages = self
+                .model
+                .max_seq_len()
+                .div_ceil(pool.page_size)
+                .div_ceil(cp_size);
+            let meta = match &mut self.sharded_decode_meta[slot] {
+                Some(m) => m,
+                none => none.insert(crate::loader::PageMeta::persistent_sharded_decode(
                     &self.model.ctx,
-                    pool,
-                    slot,
-                    row.kv_seq_len,
-                    self.model.tp.attn_cp_rank(),
-                    self.model.tp.attn_cp_size(),
-                )?
-            } else {
-                crate::loader::PageMeta::for_slot(&self.model.ctx, pool, slot, row.kv_seq_len, 1)?
-            }
-        };
+                    max_local_pages,
+                )?),
+            };
+            meta.refresh_sharded_decode(
+                &self.model.ctx,
+                pool,
+                slot,
+                row.kv_seq_len,
+                cp_rank,
+                cp_size,
+            )?;
+        }
         // B2 CP decode (T3.1): head-shard across the cp group once the KV is
         // long enough to amortize the cp all-reduce. DSpark taps need the full
         // head set on every rank, like prefill CP. Under 2D the pool is already
         // cp-sharded and the GDN pair's trade is length-independent (recurrent
         // state is O(1) per step), so it engages from the first decode token.
-        let cp_decode = if self.dspark.is_none()
-            && (self.two_d_engaged() || row.kv_seq_len + 1 >= CP_DECODE_MIN_KV_TOKENS)
-        {
-            self.model.cp_decode_handle()
-        } else {
-            None
-        };
+        let cp_decode =
+            if self.dspark.is_none() && (two_d || row.kv_seq_len + 1 >= CP_DECODE_MIN_KV_TOKENS) {
+                self.model.cp_decode_handle()
+            } else {
+                None
+            };
         let Self {
             model,
             slots,
             workspace,
             full_attn_kv,
+            sharded_decode_meta,
             ..
         } = self;
         let pool = full_attn_kv.as_mut().expect("full_attn_kv present");
+        let owned_meta = if !two_d {
+            Some(crate::loader::PageMeta::for_slot(
+                &model.ctx,
+                pool,
+                slot,
+                row.kv_seq_len,
+                1,
+            )?)
+        } else {
+            None
+        };
+        let meta: &crate::loader::PageMeta = if two_d {
+            sharded_decode_meta[slot]
+                .as_ref()
+                .expect("sharded meta refreshed above")
+        } else {
+            owned_meta.as_ref().expect("non-2D meta built above")
+        };
         let mut rc = crate::qwen35::Qwen35RecallForward {
             pool,
-            meta: &meta,
+            meta,
             layer0_query: None,
             cp: None,
             cp_decode,
@@ -1365,90 +1404,6 @@ impl Qwen35CudaExecutor {
             penalty_of(&row.penalty_history, row.penalty_prompt_len),
             &mut rc,
         )
-    }
-
-    /// 2D decode page meta: covers only this cp shard's local pages (logical
-    /// page `i` on shard `i % cp`). `kv_lens`/`max_kv_len` are the shard-local
-    /// token count; the new token's page appears only on the owning shard's
-    /// table, so a non-owner's prep write is skipped and its FA3 partial
-    /// covers exactly its resident pages. BF16 only (2D inherits the bf16
-    /// mutex).
-    fn sharded_decode_meta(
-        ctx: &DeviceContext,
-        pool: &PagedKVPool,
-        slot: usize,
-        kv_seq_len: usize,
-        cp_rank: usize,
-        cp_size: usize,
-    ) -> Result<PageMeta> {
-        ensure!(
-            pool.format == KVFormat::BF16,
-            "2D decode requires the BF16 KV pool (got {:?})",
-            pool.format
-        );
-        let total_len = kv_seq_len + 1;
-        let page_size = pool.page_size;
-        ensure!(
-            pool.seq_len(slot) == total_len,
-            "sharded decode meta: pool seq_len {} != total_len {total_len} for slot {slot}",
-            pool.seq_len(slot)
-        );
-        let global_pages = total_len.div_ceil(page_size);
-        let local_pages: Vec<i32> = pool.page_indices(slot).iter().map(|&p| p as i32).collect();
-        let local_num_pages = local_pages.len();
-        // The new token lands in the last global page; only its owner writes it.
-        let shard = infer_seam::ShardSpec::new(cp_rank, cp_size);
-        let owns_last = shard.owns_page(global_pages - 1);
-        let overshoot = global_pages * page_size - total_len;
-        let local_last_fill = if owns_last {
-            // The last page is partial unless total_len is page-aligned.
-            page_size - overshoot
-        } else {
-            page_size
-        };
-        let local_token_count = (local_num_pages)
-            .saturating_sub(1)
-            .saturating_mul(page_size)
-            + if local_num_pages == 0 {
-                0
-            } else {
-                local_last_fill
-            };
-        // A shard with no resident pages (total_len < page_size * cp) still
-        // needs a 1-entry table: FA3 dereferences page_table[0], and kv_lens=0
-        // bounds the read to zero tokens.
-        let kv_indices_dev = crate::ops::upload_i32(ctx, &local_pages)?;
-        let (page_table_rect, stride) = if local_num_pages == 0 {
-            (crate::ops::upload_i32(ctx, &[0])?, 1usize)
-        } else {
-            (kv_indices_dev.clone(), local_num_pages)
-        };
-        let zero = crate::ops::upload_i32(ctx, &[0])?;
-        Ok(PageMeta {
-            q_indptr: crate::ops::upload_i32(ctx, &[0, 1])?,
-            kv_indptr: crate::ops::upload_i32(ctx, &[0, local_num_pages as i32])?,
-            kv_indices: kv_indices_dev,
-            kv_last_page_len: crate::ops::upload_i32(ctx, &[local_last_fill as i32])?,
-            page_table_offsets: zero.clone(),
-            start_positions: crate::ops::upload_i32(ctx, &[kv_seq_len as i32])?,
-            positions: crate::ops::upload_i32(ctx, &[kv_seq_len as i32])?,
-            q_offsets: vec![0, 1],
-            page_offsets: vec![0, local_num_pages],
-            kv_lens: vec![local_token_count],
-            kv_lens_dev: crate::ops::upload_i32(ctx, &[local_token_count as i32])?,
-            page_table_rect,
-            page_table_stride: stride,
-            seq_len: 1,
-            total_q: 1,
-            num_pages: local_num_pages,
-            batch: 1,
-            start_pos: kv_seq_len,
-            new_token_rows: None,
-            prefix_token_rows: None,
-            quant_decode_meta: None,
-            seqlen_k_capture: None,
-            write_kv: i32::from(owns_last),
-        })
     }
 
     /// One MTP spec-decode row: the spec step when the slot is seeded, else a warm
