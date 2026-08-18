@@ -791,6 +791,13 @@ pub(super) fn cuda_upload_fp4_e2m1_group(
             "nvfp4 cols must be even (two weights per byte)",
         ));
     }
+    // The dequant kernel indexes scales[row * scale_cols + col / group_size]
+    // without a bound check, so this relation is the kernel's precondition.
+    if scale_cols * group_size != cols {
+        return Err(AutogradError::TapeInvariant(
+            "nvfp4 scale_cols * group_size must equal cols",
+        ));
+    }
     // Packed: two 4-bit weights per byte, so the buffer is half the logical size.
     let packed_len = rows * (cols / 2);
     if weight.len() != packed_len {
@@ -1029,9 +1036,9 @@ pub(super) fn cuda_readback(backend: &CudaBackend, handle: &DeviceHandle) -> Res
                 .stream
                 .synchronize()
                 .map_err(|_| AutogradError::TapeInvariant("cuda synchronize failed"))?;
-            let global_scale = *host_global
-                .first()
-                .ok_or(AutogradError::TapeInvariant("cuda nvfp4 global scale empty"))?;
+            let global_scale = *host_global.first().ok_or(AutogradError::TapeInvariant(
+                "cuda nvfp4 global scale empty",
+            ))?;
             crate::backend::dequantize_fp4_e2m1_group_host(
                 &host_weight,
                 &host_scales,

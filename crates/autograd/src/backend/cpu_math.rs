@@ -79,6 +79,11 @@ pub fn dequantize_fp4_e2m1_group_host(
     }
     let rows = shape[0];
     let cols = shape[1];
+    if scale_cols * group_size != cols {
+        return Err(crate::AutogradError::TapeInvariant(
+            "nvfp4 scale_cols * group_size must equal cols",
+        ));
+    }
     if cols % 2 != 0 {
         return Err(crate::AutogradError::TapeInvariant(
             "nvfp4 cols must be even (two weights per byte)",
@@ -103,8 +108,8 @@ pub fn dequantize_fp4_e2m1_group_host(
     let out = (0..rows)
         .flat_map(|row| {
             (0..cols).map(move |col| {
-                let group = (col / group_size).min(scale_cols - 1);
-                let scale = fp8_e4m3_to_f32(scales[row * scale_cols + group]) * global_scale;
+                let scale =
+                    fp8_e4m3_to_f32(scales[row * scale_cols + col / group_size]) * global_scale;
                 let byte = weight[row * (cols / 2) + col / 2];
                 let nib = if col % 2 == 1 { byte >> 4 } else { byte & 0x0f };
                 FP4_E2M1_LUT[nib as usize] * scale

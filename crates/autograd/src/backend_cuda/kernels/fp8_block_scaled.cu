@@ -62,11 +62,9 @@ extern "C" __global__ void fp4_e2m1_group_to_bf16(
 
     const int row = idx / cols;
     const int col = idx - row * cols;
-    int group = col / group_size;
-    if (group > scale_cols - 1) group = scale_cols - 1;
-
+    // scale_cols == cols / group_size is validated at upload; no clamp needed.
     const float scale =
-        arle_fp8_e4m3_to_f32(scales[row * scale_cols + group]) * global_scale[0];
+        arle_fp8_e4m3_to_f32(scales[row * scale_cols + col / group_size]) * global_scale[0];
     const unsigned char byte = weight[row * (cols / 2) + (col >> 1)];
     const unsigned char nib = (col & 1) ? (byte >> 4) : (byte & 0x0f);
     const float w = ARLE_FP4_E2M1_LUT[nib] * scale;

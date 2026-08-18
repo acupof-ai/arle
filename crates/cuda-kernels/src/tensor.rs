@@ -1642,9 +1642,18 @@ impl DeviceMatrix {
     /// VRAM; the borrower must keep this `DeviceMatrix` resident (no offload,
     /// no LoRA re-merge replacing the buffers) for the borrow's lifetime.
     /// Pristine FP8 pair once merge-requant split it out, else the live slots.
+    ///
+    /// The live-slot fallback is format-gated: an `Fp4E2M1Group` matrix also
+    /// fills `qweight_u8` (packed nibbles, half the byte count) and `scale_f32`
+    /// (a 1-element global scale), and reading those as an FP8 block-scaled pair
+    /// walks off the end of both buffers. `pristine_fp8` needs no check — only
+    /// `requant_merged_matrix` writes it, and only on the FP8 path.
     pub fn merge_base_fp8(&self) -> Option<(&CudaSlice<u8>, &CudaSlice<f32>)> {
         if let Some((qw, sc)) = self.pristine_fp8.as_ref() {
             return Some((qw, sc));
+        }
+        if self.weight_format != WeightFormat::Fp8BlockScaled {
+            return None;
         }
         self.qweight_u8.as_ref().zip(self.scale_f32.as_ref())
     }

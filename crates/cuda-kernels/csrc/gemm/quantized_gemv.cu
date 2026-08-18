@@ -318,10 +318,8 @@ __global__ void dequantize_fp4_e2m1_group_to_bf16_kernel(
     if (idx >= total) return;
     const int row = (int)(idx / K);
     const int col = (int)(idx % K);
-    int group = col / group_size;
-    if (group > scale_cols - 1) group = scale_cols - 1;
     const float scale =
-        dsv4_decode_fp8_e4m3(scales[(long)row * scale_cols + group]) * global_scales[0];
+        dsv4_decode_fp8_e4m3(scales[(long)row * scale_cols + col / group_size]) * global_scales[0];
     const uint8_t byte = weight[(long)row * (K / 2) + col / 2];
     const uint8_t nib = (col & 1) ? (byte >> 4) : (byte & 0x0f);
     output[idx] = __float2bfloat16(dsv4_decode_fp4_e2m1(nib) * scale);
@@ -339,7 +337,7 @@ extern "C" cudaError_t dequantize_fp4_e2m1_group_to_bf16_cuda(
     cudaStream_t stream)
 {
     if (N <= 0 || K <= 0 || group_size <= 0 || scale_cols <= 0 || (K & 1) != 0 ||
-        K % group_size != 0) {
+        K % group_size != 0 || scale_cols != K / group_size) {
         return cudaErrorInvalidValue;
     }
     const long total = (long)N * K;
@@ -425,7 +423,6 @@ __device__ __forceinline__ float fp4_e2m1_row_dot(
     const __nv_bfloat16* __restrict__ x,
     float g_scale,
     int scale_base,
-    int max_group,
     int K,
     int group_size,
     int tid_in_row,
@@ -447,9 +444,8 @@ __device__ __forceinline__ float fp4_e2m1_row_dot(
             for (int w = 0; w < 4; w++) {
                 const uint32_t p = words[w];
                 const int kk = k + w * 8;
-                int g = kk / group_size;
-                if (g > max_group) g = max_group;
-                const float s = dsv4_decode_fp8_e4m3(__ldg(&scales[scale_base + g])) * g_scale;
+                const float s =
+                    dsv4_decode_fp8_e4m3(__ldg(&scales[scale_base + kk / group_size])) * g_scale;
 
                 const uint4 xv = __ldg(reinterpret_cast<const uint4*>(&x[kk]));
                 const __nv_bfloat16* xb = reinterpret_cast<const __nv_bfloat16*>(&xv);
@@ -471,9 +467,8 @@ __device__ __forceinline__ float fp4_e2m1_row_dot(
          pair += threads_per_row) {
         const int k0 = pair << 1;
         const uint8_t packed = __ldg(&weight_row[pair]);
-        int g = k0 / group_size;
-        if (g > max_group) g = max_group;
-        const float s = dsv4_decode_fp8_e4m3(__ldg(&scales[scale_base + g])) * g_scale;
+        const float s =
+            dsv4_decode_fp8_e4m3(__ldg(&scales[scale_base + k0 / group_size])) * g_scale;
         sum += dsv4_decode_fp4_e2m1(packed & 0x0f) * s * __bfloat162float(x[k0]);
         sum += dsv4_decode_fp4_e2m1(packed >> 4) * s * __bfloat162float(x[k0 + 1]);
     }
@@ -871,7 +866,7 @@ __global__ void fp4_e2m1_group_gemv_batch_kernel(
     const __nv_bfloat16* x = input + batch_idx * K;
     const uint8_t* weight_row = weight + (int64_t)row * (K / 2);
     float sum = fp4_e2m1_row_dot(
-        weight_row, scales, x, global_scales[0], row * scale_cols, scale_cols - 1,
+        weight_row, scales, x, global_scales[0], row * scale_cols,
         K, group_size, tid_in_row, threads_per_row);
 
     sum = warp_reduce_sum(sum);
@@ -1041,7 +1036,7 @@ __global__ void fp4_e2m1_grouped_gemv_batch_kernel(
     const __nv_bfloat16* x = input + route * K;
     float sum = fp4_e2m1_row_dot(
         weight + (int64_t)row * (K / 2), scales, x, global_scales[0],
-        row * scale_cols, scale_cols - 1, K, group_size, tid_in_row, threads_per_row);
+        row * scale_cols, K, group_size, tid_in_row, threads_per_row);
 
     sum = warp_reduce_sum(sum);
     __shared__ float smem[GEMV_ROWS * 8];
@@ -1096,14 +1091,13 @@ __global__ void fp4_e2m1_grouped_gemv_pair_batch_kernel(
     const __nv_bfloat16* x = input + route * K;
     const int64_t row_off = (int64_t)row * (K / 2);
     const int scale_base = row * scale_cols;
-    const int max_group = scale_cols - 1;
     // x is re-read for the b half; it is K*2 B against the row's K/2 B of
     // weights and stays hot in L1 across the two calls.
     float sum_a = fp4_e2m1_row_dot(weight_a + row_off, scales_a, x, global_a[0],
-                                   scale_base, max_group, K, group_size,
+                                   scale_base, K, group_size,
                                    tid_in_row, threads_per_row);
     float sum_b = fp4_e2m1_row_dot(weight_b + row_off, scales_b, x, global_b[0],
-                                   scale_base, max_group, K, group_size,
+                                   scale_base, K, group_size,
                                    tid_in_row, threads_per_row);
 
     sum_a = warp_reduce_sum(sum_a);
@@ -2900,7 +2894,7 @@ cudaError_t gemv_fp4_e2m1_group_batch_cuda(
     int B, int N, int K, int group_size, int scale_cols, cudaStream_t stream)
 {
     if (B <= 0 || N <= 0 || K <= 0 || (K & 1) != 0 || group_size <= 0 ||
-        scale_cols <= 0 || (K % group_size) != 0) {
+        scale_cols <= 0 || (K % group_size) != 0 || scale_cols != K / group_size) {
         return cudaErrorInvalidValue;
     }
     dim3 grid((N + GEMV_ROWS - 1) / GEMV_ROWS, B);
@@ -2992,7 +2986,8 @@ cudaError_t moe_fp4_e2m1_grouped_gemv_batch_cuda(
     cudaStream_t stream)
 {
     if (num_experts <= 0 || max_count <= 0 || N <= 0 || K <= 0 ||
-        (K & 1) != 0 || group_size <= 0 || scale_cols <= 0 || (K % group_size) != 0) {
+        (K & 1) != 0 || group_size <= 0 || scale_cols <= 0 || (K % group_size) != 0 ||
+        scale_cols != K / group_size) {
         return cudaSuccess;
     }
     dim3 block(GEMV_THREADS);
@@ -3025,7 +3020,8 @@ cudaError_t moe_fp4_e2m1_grouped_gemv_pair_batch_cuda(
     cudaStream_t stream)
 {
     if (num_experts <= 0 || max_count <= 0 || N <= 0 || K <= 0 ||
-        (K & 1) != 0 || group_size <= 0 || scale_cols <= 0 || (K % group_size) != 0) {
+        (K & 1) != 0 || group_size <= 0 || scale_cols <= 0 || (K % group_size) != 0 ||
+        scale_cols != K / group_size) {
         return cudaSuccess;
     }
     dim3 block(GEMV_THREADS);
