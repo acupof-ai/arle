@@ -1237,19 +1237,6 @@ impl Backend for CudaBackend {
         }
     }
 
-    fn comm_world_rank(&self, axis: CommAxis) -> (usize, usize) {
-        #[cfg(all(feature = "nccl", not(feature = "no-cuda")))]
-        {
-            self.comm(axis)
-                .map_or((1, 0), |nccl| (nccl.world_size(), nccl.rank()))
-        }
-        #[cfg(not(all(feature = "nccl", not(feature = "no-cuda"))))]
-        {
-            let _ = axis;
-            (1, 0)
-        }
-    }
-
     fn all_to_all_device(
         &self,
         x: &DeviceHandle,

@@ -1232,12 +1232,6 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         self.upload(&host, block_shape)
     }
 
-    /// Group `(size, this_rank)` for `axis`; `(1, 0)` without a communicator.
-    fn comm_world_rank(&self, axis: CommAxis) -> (usize, usize) {
-        let _ = axis;
-        (1, 0)
-    }
-
     /// All-to-all: split `scatter_axis` across ranks, concatenate each rank's
     /// slice along `gather_axis`. Returns `(handle, out_shape)` — the shape
     /// changes (`[seq/N,b,hidden]` → `[seq,b,hidden/N]`), so the caller can't

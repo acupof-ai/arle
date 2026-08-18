@@ -12,8 +12,6 @@ pub mod backend_metal;
 pub mod grad_clip;
 #[path = "lr_schedule.rs"]
 pub mod lr_schedule;
-#[path = "module.rs"]
-pub mod module;
 #[path = "ops.rs"]
 pub mod ops;
 #[path = "optim.rs"]
@@ -33,7 +31,7 @@ pub mod tensor;
 #[cfg(feature = "metal")]
 pub use backend::MlxHandle;
 pub use backend::{Backend, CommAxis, CpuBackend, Device, DeviceHandle};
-pub use lr_schedule::{ConstantLr, CosineWithWarmup, LinearWarmup, LrSchedule, parse_lr_schedule};
+pub use lr_schedule::{CosineWithWarmup, LrSchedule};
 pub use optim::{AdamW, Optimizer};
 #[cfg(feature = "safetensors")]
 pub use safetensors_io::SafetensorsRegistry;

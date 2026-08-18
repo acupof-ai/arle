@@ -35,49 +35,6 @@ impl<T: LrSchedule + ?Sized> LrSchedule for Box<T> {
     }
 }
 
-/// Constant LR — useful as a no-op fallback or to disable warmup for short
-/// debug runs.
-#[derive(Debug, Clone, Copy)]
-pub struct ConstantLr(pub f32);
-
-impl LrSchedule for ConstantLr {
-    fn lr(&self, _step: u64) -> f32 {
-        self.0
-    }
-
-    fn describe(&self) -> String {
-        format!("constant(lr={})", self.0)
-    }
-}
-
-/// Linear warmup from 0 to `base_lr` over `warmup_steps`, then flat.
-/// `warmup_steps == 0` degenerates to constant `base_lr`.
-#[derive(Debug, Clone, Copy)]
-pub struct LinearWarmup {
-    pub base_lr: f32,
-    pub warmup_steps: u64,
-}
-
-impl LrSchedule for LinearWarmup {
-    fn lr(&self, step: u64) -> f32 {
-        if self.warmup_steps == 0 {
-            return self.base_lr;
-        }
-        if step >= self.warmup_steps {
-            return self.base_lr;
-        }
-        let frac = step as f32 / self.warmup_steps as f32;
-        self.base_lr * frac
-    }
-
-    fn describe(&self) -> String {
-        format!(
-            "linear-warmup(base_lr={}, warmup_steps={})",
-            self.base_lr, self.warmup_steps
-        )
-    }
-}
-
 /// Linear warmup to `base_lr`, then half-cosine decay down to `min_lr`
 /// across the remaining `total_steps - warmup_steps`. After `total_steps`
 /// the LR is clamped to `min_lr`.
@@ -91,7 +48,6 @@ pub struct CosineWithWarmup {
 
 impl LrSchedule for CosineWithWarmup {
     fn lr(&self, step: u64) -> f32 {
-        // Matches LinearWarmup semantics.
         if self.warmup_steps > 0 && step < self.warmup_steps {
             let frac = step as f32 / self.warmup_steps as f32;
             return self.base_lr * frac;
@@ -118,32 +74,5 @@ impl LrSchedule for CosineWithWarmup {
             "cosine-with-warmup(base_lr={}, min_lr={}, warmup_steps={}, total_steps={})",
             self.base_lr, self.min_lr, self.warmup_steps, self.total_steps
         )
-    }
-}
-
-/// Parse a schedule spec name into a boxed trait object. Training binaries
-/// pass the CLI string through here so the allow-list lives in one spot.
-pub fn parse_lr_schedule(
-    spec: &str,
-    base_lr: f32,
-    warmup: u64,
-    total: u64,
-    min_lr: f32,
-) -> Result<Box<dyn LrSchedule>> {
-    match spec {
-        "constant" => Ok(Box::new(ConstantLr(base_lr))),
-        "linear-warmup" => Ok(Box::new(LinearWarmup {
-            base_lr,
-            warmup_steps: warmup,
-        })),
-        "cosine-with-warmup" => Ok(Box::new(CosineWithWarmup {
-            base_lr,
-            min_lr,
-            warmup_steps: warmup,
-            total_steps: total,
-        })),
-        other => bail!(
-            "unknown lr schedule '{other}'; expected one of: constant, linear-warmup, cosine-with-warmup"
-        ),
     }
 }

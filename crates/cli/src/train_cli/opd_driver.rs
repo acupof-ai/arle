@@ -11,8 +11,8 @@ use super::{
         OpdLrSchedule, OpdStepMetric, PromptSampler, apply_tape_dtype, build_opd_store,
         current_grad_norm, kl_direction_arg, kl_mask_arg, opd_logits_window_size_arg,
         opd_progress_style, opd_sft_anchor_arg, opd_step_profile_enabled, opd_summary,
-        parse_lora_target_set, print_opd_step_profile, reject_unimplemented_gkd_objectives,
-        rollout_sampling_params, trainable_param_ids, validate_train_opd_gkd_args,
+        parse_lora_target_set, print_opd_step_profile, rollout_sampling_params,
+        trainable_param_ids, validate_train_opd_gkd_args,
     },
     opd_teacher::OpdCliTeacher,
 };
@@ -113,7 +113,6 @@ pub(super) fn run_opd_from_dirs(args: TrainOpdArgs) -> Result<()> {
         .as_deref()
         .ok_or_else(|| anyhow!("--student-model <dir> is required for non-smoke runs"))?;
     validate_train_opd_gkd_args(args.gkd_lambda, args.sft_anchor)?;
-    reject_unimplemented_gkd_objectives(args.teacher_topk)?;
     let sft_anchor = opd_sft_anchor_arg(args.sft_anchor);
     let corpus_sft_only = args.sft_anchor == OpdSftAnchorArg::CorpusTruth && args.gkd_lambda == 1.0;
     if corpus_sft_only && args.logits_window_size == 0 {
@@ -386,7 +385,6 @@ pub(super) fn run_opd_from_dirs(args: TrainOpdArgs) -> Result<()> {
             kl_direction,
             kl_temperature: args.kl_temperature,
             kl_beta: args.kl_beta,
-            teacher_topk: args.teacher_topk,
             fused_distill: args.fused_distill && !args.no_fused_distill,
             logits_window_size: opd_logits_window_size_arg(args.logits_window_size),
             kl_mask,
@@ -475,7 +473,6 @@ pub(super) fn run_opd_from_dirs(args: TrainOpdArgs) -> Result<()> {
             "sft_anchor": format!("{:?}", args.sft_anchor),
             "kl_temperature": args.kl_temperature,
             "kl_beta": args.kl_beta,
-            "teacher_topk": args.teacher_topk,
             "fused_distill": args.fused_distill && !args.no_fused_distill,
             "gate_every_n": args.gate_every_n,
             "lora_rank": args.lora_rank,
@@ -518,7 +515,6 @@ pub(super) fn run_opd_smoke(args: TrainOpdArgs) -> Result<()> {
     };
 
     validate_train_opd_gkd_args(args.gkd_lambda, args.sft_anchor)?;
-    reject_unimplemented_gkd_objectives(args.teacher_topk)?;
     if args.sft_anchor != OpdSftAnchorArg::StudentRollout {
         bail!("train opd --smoke does not support --sft-anchor corpus-truth");
     }
@@ -588,7 +584,6 @@ pub(super) fn run_opd_smoke(args: TrainOpdArgs) -> Result<()> {
                 kl_direction,
                 kl_temperature: args.kl_temperature,
                 kl_beta: args.kl_beta,
-                teacher_topk: args.teacher_topk,
                 fused_distill: args.fused_distill && !args.no_fused_distill,
                 logits_window_size: opd_logits_window_size_arg(args.logits_window_size),
                 kl_mask,
@@ -632,7 +627,6 @@ pub(super) fn run_opd_smoke(args: TrainOpdArgs) -> Result<()> {
             "lr": args.lr,
             "kl_temperature": args.kl_temperature,
             "kl_beta": args.kl_beta,
-            "teacher_topk": args.teacher_topk,
             "fused_distill": args.fused_distill && !args.no_fused_distill,
             "losses": losses,
             "step_metrics": step_metrics,
@@ -665,7 +659,6 @@ pub(super) fn run_self_opd_from_dir(args: TrainSelfOpdArgs) -> Result<()> {
         .student_model
         .as_deref()
         .ok_or_else(|| anyhow!("--student-model <dir> is required for non-smoke runs"))?;
-    reject_unimplemented_gkd_objectives(args.teacher_topk)?;
     let target_set = parse_lora_target_set(&args.lora_target_set)?;
     let lora = LoraConfig {
         rank: args.lora_rank,
@@ -782,7 +775,6 @@ pub(super) fn run_self_opd_from_dir(args: TrainSelfOpdArgs) -> Result<()> {
                 kl_direction,
                 kl_temperature: args.kl_temperature,
                 kl_beta: args.kl_beta,
-                teacher_topk: args.teacher_topk,
                 fused_distill: args.fused_distill,
                 logits_window_size: None,
                 kl_mask: OpdKlMask::CompletionOnly,
@@ -885,7 +877,6 @@ pub(super) fn run_self_opd_from_dir(args: TrainSelfOpdArgs) -> Result<()> {
             "gkd_lambda": args.gkd_lambda,
             "kl_temperature": args.kl_temperature,
             "kl_beta": args.kl_beta,
-            "teacher_topk": args.teacher_topk,
             "gate_every_n": args.gate_every_n,
             "gate_regress_tol": args.gate_regress_tol,
             "gate_reverts": reverts,
@@ -934,7 +925,6 @@ pub(super) fn run_self_opd_smoke(args: TrainSelfOpdArgs) -> Result<()> {
     };
 
     let cfg = embedded_tiny_qwen35_config();
-    reject_unimplemented_gkd_objectives(args.teacher_topk)?;
     let target_set = parse_lora_target_set(&args.lora_target_set)?;
     let lora = LoraConfig {
         rank: args.lora_rank.min(4),
@@ -994,7 +984,6 @@ pub(super) fn run_self_opd_smoke(args: TrainSelfOpdArgs) -> Result<()> {
                     kl_direction,
                     kl_temperature: args.kl_temperature,
                     kl_beta: args.kl_beta,
-                    teacher_topk: args.teacher_topk,
                     fused_distill: args.fused_distill,
                     logits_window_size: None,
                     kl_mask: OpdKlMask::CompletionOnly,
@@ -1030,7 +1019,6 @@ pub(super) fn run_self_opd_smoke(args: TrainSelfOpdArgs) -> Result<()> {
             "gkd_lambda": args.gkd_lambda,
             "kl_temperature": args.kl_temperature,
             "kl_beta": args.kl_beta,
-            "teacher_topk": args.teacher_topk,
             "losses": losses,
             "prompt_ids": prompt_ids,
         });
