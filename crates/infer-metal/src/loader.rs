@@ -48,6 +48,16 @@ pub(crate) fn tensor_get(tensors: &TensorMap, name: &str) -> Result<MlxArray> {
         .with_context(|| format!("missing weight '{name}'"))
 }
 
+/// Fetch a quantized projection's optional biases. Affine checkpoints always
+/// carry them; mxfp4 never does.
+fn biases_for(tensors: &TensorMap, base: &str, qc: &QuantConfig) -> Result<Option<MlxArray>> {
+    let biases = tensors.get(&format!("{base}.biases")).cloned();
+    if biases.is_none() && qc.mode == QuantMode::Affine {
+        anyhow::bail!("missing quantized biases '{base}.biases'");
+    }
+    Ok(biases)
+}
+
 pub(crate) fn load_proj_from_tensors(
     tensors: &TensorMap,
     base: &str,
@@ -60,10 +70,7 @@ pub(crate) fn load_proj_from_tensors(
             .get(&format!("{base}.weight"))
             .cloned()
             .with_context(|| format!("missing quantized weight '{base}.weight'"))?;
-        let biases = tensors.get(&format!("{base}.biases")).cloned();
-        if biases.is_none() && qc.mode == QuantMode::Affine {
-            anyhow::bail!("missing quantized biases '{base}.biases'");
-        }
+        let biases = biases_for(tensors, base, qc)?;
         // Honor per-weight quant overrides (mixed bits/group_size, e.g. OptiQ);
         // fall back to the global config for weights without an override.
         let (bits, group_size) = qc
@@ -96,10 +103,7 @@ pub(crate) fn load_embed_tokens_from_tensors(
     if let Some(qc) = quantization.as_ref()
         && let Some(scales) = tensors.get(&format!("{base}.scales")).cloned()
     {
-        let biases = tensors.get(&format!("{base}.biases")).cloned();
-        if biases.is_none() && qc.mode == QuantMode::Affine {
-            anyhow::bail!("missing biases '{base}.biases'");
-        }
+        let biases = biases_for(tensors, base, qc)?;
         let (bits, group_size) = qc
             .per_weight
             .get(base)

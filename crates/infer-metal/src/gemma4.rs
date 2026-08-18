@@ -769,7 +769,7 @@ impl CppGemma4Builder {
                     self.raw,
                     w.as_raw(),
                     scales.as_raw(),
-                    biases.as_ref().map_or(std::ptr::null_mut(), |b| b.as_raw()),
+                    MlxArray::as_raw_opt(biases.as_ref()),
                     *group_size,
                     *bits,
                 ),

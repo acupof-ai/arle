@@ -203,7 +203,15 @@ static inline Dtype to_dtype(int32_t d) {
 // Quantization mode codes shared with the Rust side (infer-metal config.rs).
 // 0 = affine (per-group scale + bias), 1 = mxfp4 (E2M1 + E8M0 per-32 scale).
 static inline const char* quant_mode_str(int32_t mode) {
-    return mode == 1 ? "mxfp4" : "affine";
+    if (mode == 0) return "affine";
+    if (mode == 1) return "mxfp4";
+    throw std::invalid_argument("quant_mode_str: unknown mode code " + std::to_string(mode));
+}
+
+// Nullable array handle -> optional, for FFI boundaries where biases are absent
+// (mxfp4 has none). Mirrors the Rust `MlxArray::as_raw_opt` convention.
+static inline std::optional<array> to_arr_opt(mlx_array* h) {
+    return h ? std::optional(*to_arr(h)) : std::nullopt;
 }
 
 static inline int32_t from_dtype(const Dtype& d) {

@@ -428,6 +428,13 @@ auto& compiled_swiglu() {
     return fn;
 }
 
+// Affine weights carry per-group biases; mxfp4 has none. Mode is the QuantMode
+// code from Rust (see quant_mode_str in mlx_common.h). Inlined at the call site
+// so the matmul argument stays a prvalue (one array-handle copy).
+static std::optional<array> bias_if_affine(const array& biases, int mode) {
+    return mode == 0 ? std::optional(biases) : std::nullopt;
+}
+
 // Compiled fused MLP: gate_up matmul -> split -> swiglu -> down matmul. Encoded ONCE per
 // (gate_dim, gs, bits, mode) — all MLP layers share the config, so one cached graph serves
 // every layer, cutting the per-step re-encode of the matmul-heavy MLP (~51% of the decode
@@ -443,13 +450,11 @@ CompiledFn& compiled_mlp_fn(int gate_dim, int gs, int bits, int mode) {
     auto impl = [gate_dim, gs, bits, mode](const std::vector<array>& in) -> std::vector<array> {
         // in = [x, gate_up_w, gate_up_scales, gate_up_biases, down_w, down_scales, down_biases]
         // biases slots are array(0) placeholders for mxfp4, never read.
-        auto gb = mode == 0 ? std::optional(in[3]) : std::nullopt;
-        auto gu = quantized_matmul(in[0], in[1], in[2], gb, true, gs, bits,
+        auto gu = quantized_matmul(in[0], in[1], in[2], bias_if_affine(in[3], mode), true, gs, bits,
                                    quant_mode_str(mode));
         auto parts = split(gu, Shape{gate_dim}, -1);
         auto h = (parts[0] * sigmoid(parts[0])) * parts[1];  // swiglu, inlined for fusion
-        auto db = mode == 0 ? std::optional(in[6]) : std::nullopt;
-        return {quantized_matmul(h, in[4], in[5], db, true, gs, bits,
+        return {quantized_matmul(h, in[4], in[5], bias_if_affine(in[6], mode), true, gs, bits,
                                  quant_mode_str(mode))};
     };
     // SHAPED (not shapeless): the split needs concrete shapes. Gated to decode (S=1) at the
@@ -473,15 +478,12 @@ CompiledFn& compiled_mlp_separate_fn(
     auto impl = [gs, gate_bits, up_bits, down_bits, mode](
                     const std::vector<array>& in) -> std::vector<array> {
         // in = [x, gate_w, gate_s, gate_b, up_w, up_s, up_b, down_w, down_s, down_b]
-        auto gb = mode == 0 ? std::optional(in[3]) : std::nullopt;
-        auto ub = mode == 0 ? std::optional(in[6]) : std::nullopt;
-        auto db = mode == 0 ? std::optional(in[9]) : std::nullopt;
-        auto g = quantized_matmul(in[0], in[1], in[2], gb, true, gs, gate_bits,
+        auto g = quantized_matmul(in[0], in[1], in[2], bias_if_affine(in[3], mode), true, gs, gate_bits,
                                   quant_mode_str(mode));
-        auto u = quantized_matmul(in[0], in[4], in[5], ub, true, gs, up_bits,
+        auto u = quantized_matmul(in[0], in[4], in[5], bias_if_affine(in[6], mode), true, gs, up_bits,
                                   quant_mode_str(mode));
         auto h = (g * sigmoid(g)) * u;  // swiglu, inlined for fusion
-        return {quantized_matmul(h, in[7], in[8], db, true, gs, down_bits,
+        return {quantized_matmul(h, in[7], in[8], bias_if_affine(in[9], mode), true, gs, down_bits,
                                  quant_mode_str(mode))};
     };
     return cache.emplace(key, mlx::core::compile(impl, false)).first->second;
@@ -587,9 +589,8 @@ struct QWeight {
         if (prefer_verify_m16 && mode == 0) {
             return verify_quantized_matmul_cpp(input, w, scales, biases, group_size, bits);
         }
-        auto b = mode == 0 ? std::optional(biases) : std::nullopt;
         return quantized_matmul(
-            input, w, scales, b, true, group_size, bits, quant_mode_str(mode));
+            input, w, scales, bias_if_affine(biases, mode), true, group_size, bits, quant_mode_str(mode));
     }
 };
 

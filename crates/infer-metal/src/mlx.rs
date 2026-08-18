@@ -146,6 +146,12 @@ impl MlxArray {
         self.0
     }
 
+    /// Raw handle for an optional array, null when absent — the FFI convention
+    /// for nullable weights (e.g. mxfp4 has no biases).
+    pub fn as_raw_opt(opt: Option<&MlxArray>) -> *mut mlx_sys::mlx_array {
+        opt.map_or(std::ptr::null_mut(), |a| a.0)
+    }
+
     /// # Safety
     /// `data` must remain valid for MLX to read for the duration required by
     /// the bridge call.
@@ -415,10 +421,10 @@ pub fn dequantize(
             mlx_sys::mlx_dequantize(
                 weight.0,
                 scales.0,
-                biases.map_or(std::ptr::null_mut(), |b| b.0),
+                MlxArray::as_raw_opt(biases),
                 group_size,
                 bits,
-                mode.ffi(),
+                mode as i32,
             )
         },
         "mlx_dequantize",
@@ -442,11 +448,11 @@ pub fn quantized_matmul(
                 x.0,
                 weight.0,
                 scales.0,
-                biases.map_or(std::ptr::null_mut(), |b| b.0),
+                MlxArray::as_raw_opt(biases),
                 transpose,
                 group_size,
                 bits,
-                mode.ffi(),
+                mode as i32,
             )
         },
         "mlx_quantized_matmul",

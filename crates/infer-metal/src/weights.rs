@@ -228,11 +228,11 @@ pub(crate) fn merge_quantized_projection_rows(
     } else {
         Some(concatenate_axis(&biases, 0))
     };
+    let mut to_eval = vec![&merged_w, &merged_scales];
     if let Some(ref b) = merged_biases {
-        eval(&[&merged_w, &merged_scales, b]);
-    } else {
-        eval(&[&merged_w, &merged_scales]);
+        to_eval.push(b);
     }
+    eval(&to_eval);
 
     Ok(Some(WeightTensor::Quantized {
         w: merged_w,
@@ -240,7 +240,7 @@ pub(crate) fn merge_quantized_projection_rows(
         biases: merged_biases,
         group_size: expected_group_size.unwrap_or_default(),
         bits: expected_bits.unwrap_or_default(),
-        mode: expected_mode.unwrap_or(QuantMode::Affine),
+        mode: expected_mode.unwrap(),
     }))
 }
 
