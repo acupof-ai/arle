@@ -37,6 +37,6 @@ mod route;
 pub use config::{MoeConfig, ScoringFunc, TopkMethod};
 pub use error::{MoeError, Result};
 pub use route::{
-    ExpertWeight, RoutingDecision, group_limited_mask, route, route_and_combine, route_token,
-    scores_from_logits, sigmoid, stable_softmax, stable_softplus,
+    ExpertWeight, RoutingDecision, group_limited_mask, route, route_token, scores_from_logits,
+    sigmoid, stable_softmax, stable_softplus,
 };

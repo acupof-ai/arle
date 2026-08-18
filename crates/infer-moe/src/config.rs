@@ -62,7 +62,7 @@ pub struct MoeConfig {
     /// Routed experts (one router logit each).
     pub num_experts: usize,
     /// Always-on shared experts run for every token (Qwen3.6 = 1). They do not
-    /// route; see [`MoeConfig::has_shared_expert`].
+    /// route.
     pub num_shared_experts: usize,
     /// Experts selected per token (`num_experts_per_tok`).
     pub top_k: usize,
@@ -137,11 +137,6 @@ impl MoeConfig {
             topk_group: None,
             hidden_size,
         }
-    }
-
-    #[must_use]
-    pub fn has_shared_expert(&self) -> bool {
-        self.num_shared_experts > 0
     }
 
     pub fn validate(&self) -> Result<()> {

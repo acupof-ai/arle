@@ -230,36 +230,3 @@ pub enum ParallelLinearKind {
     /// Split input dimension across TP ranks; all-reduce result.
     Row,
 }
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TpLinearConfig {
-    pub kind: ParallelLinearKind,
-    pub shard: ShardingSpec,
-    /// Always true for both kinds, unless this is an intermediate result
-    /// combined in the next layer.
-    pub needs_all_reduce: bool,
-}
-
-impl TpLinearConfig {
-    /// # Panics
-    /// Panics if `out_features < tp.world_size` (via [`column_shard`]).
-    #[must_use]
-    pub fn column(out_features: usize, tp: &TpConfig) -> Self {
-        Self {
-            kind: ParallelLinearKind::Column,
-            shard: column_shard(out_features, tp),
-            needs_all_reduce: true,
-        }
-    }
-
-    /// # Panics
-    /// Panics if `in_features < tp.world_size` (via [`row_shard`]).
-    #[must_use]
-    pub fn row(in_features: usize, tp: &TpConfig) -> Self {
-        Self {
-            kind: ParallelLinearKind::Row,
-            shard: row_shard(in_features, tp),
-            needs_all_reduce: true,
-        }
-    }
-}
