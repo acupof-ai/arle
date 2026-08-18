@@ -139,7 +139,6 @@ impl Qwen35Model {
         let out = checkpoint_sequential(
             hidden,
             self.layers.len(),
-            1,
             self.lora_layer_start,
             store,
             tape,

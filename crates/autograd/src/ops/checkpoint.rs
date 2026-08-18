@@ -86,18 +86,17 @@ where
     Ok(output_id)
 }
 
-/// Run `num_layers` sequential layers, checkpointing them in groups of
-/// `group_size` (vs one checkpoint per layer). Each group's saved inputs are
-/// `[hidden, ...deduped params of the group's layers]`; offload (if enabled on
-/// the tape) then moves K layers' inputs to host in one shot. `detach_at`, if
-/// set, forces a group boundary there and detaches the hidden at that index
-/// (preserving a model's frozen/LoRA boundary) — no group spans it, so it stays
-/// numerically exact. `layer_fn(idx, hidden, store, tape)` runs layer `idx`;
-/// `layer_params(idx)` returns that layer's trainable param ids.
+/// Run `num_layers` sequential layers, checkpointing one layer per group.
+/// Each group's saved inputs are `[hidden, ...deduped params of the group's
+/// layers]`; offload (if enabled on the tape) then moves K layers' inputs to
+/// host in one shot. `detach_at`, if set, forces a group boundary there and
+/// detaches the hidden at that index (preserving a model's frozen/LoRA
+/// boundary) — no group spans it, so it stays numerically exact.
+/// `layer_fn(idx, hidden, store, tape)` runs layer `idx`; `layer_params(idx)`
+/// returns that layer's trainable param ids.
 pub fn checkpoint_sequential<FF, PF>(
     input: TensorId,
     num_layers: usize,
-    group_size: usize,
     detach_at: Option<usize>,
     store: &mut TensorStore,
     tape: &mut Tape,
@@ -116,7 +115,7 @@ where
     let mut hidden = input;
     let mut li = 0;
     while li < num_layers {
-        let mut end = (li + group_size.max(1)).min(num_layers);
+        let mut end = (li + 1).min(num_layers);
         // Don't let a group span the frozen/LoRA boundary.
         if let Some(b) = detach_at
             && li < b
