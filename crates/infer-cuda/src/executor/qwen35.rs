@@ -2341,6 +2341,19 @@ impl Qwen35CudaExecutor {
                 let global_pages = cache_len.div_ceil(pool.page_size);
                 let owns_last = cp_size <= 1 || (global_pages - 1) % cp_size == cp_rank;
                 meta.write_kv = i32::from(owns_last);
+                // for_recall_decode assumes the last page is the global last
+                // page; under CP a non-owner shard's working-set tail is a
+                // full page.
+                let overshoot = global_pages * pool.page_size - cache_len;
+                let local_last_fill = if owns_last {
+                    pool.page_size - overshoot
+                } else {
+                    pool.page_size
+                };
+                self.model.ctx.stream.memcpy_htod(
+                    &[local_last_fill as i32],
+                    &mut meta.kv_last_page_len.slice_mut(0..1),
+                )?;
             }
             meta
         };
