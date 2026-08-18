@@ -384,7 +384,7 @@ extern "C" void w4a8_swiglu_fused(
 // b_scales:       BF16 [E, K//512, N*4]
 // expert_offsets: DEVICE int32 [E] cumulative token counts (read device-side
 //                 by the w4a8_get_group_gemm_starts kernel)
-// problem_sizes:  int32 [E, 3] (M, N, K per expert)
+// problem_sizes:  int32 [E, 3] (N, M, K per expert — SGLang order)
 // total_m:        total token-expert pairs (= num_tokens * topk)
 // topk:           experts per token (for tile shape heuristic)
 // workspace:      pre-allocated buffer (64 MB recommended)
@@ -404,33 +404,27 @@ extern "C" int w4a8_moe_grouped_gemm_sm90(
     void* workspace,
     size_t workspace_bytes,
     void* stream) {
+  // The scale pointer formula (e * n * k / 128) requires 512-aligned K —
+  // the BF16 scale layout is [E, K//512, N*4]. DSv4-Flash always satisfies
+  // this (hidden 7168, intermediate 2048).
+  if (k % 512 != 0) return -7;
+  if (num_experts > 1024) return -8;  // one-block pointer kernel limit
+
   const int m = total_m / topk;  // original token count
   int rc;
 
-  if (k % 512 == 0) {
-    if (m <= 32) {
-      rc = run_grouped_gemm<SM90_CO<128, 16, 512, 1, 1, 1>::Cutlass3xW4A8Gemm>(
-          d_output, a_activations, b_weights, a_scale, b_scales,
-          expert_offsets, problem_sizes, num_experts, n, k,
-          workspace, workspace_bytes, static_cast<cudaStream_t>(stream));
-    } else if (m <= 1024) {
-      rc = run_grouped_gemm<SM90_CO<128, 32, 512, 1, 1, 1>::Cutlass3xW4A8Gemm>(
-          d_output, a_activations, b_weights, a_scale, b_scales,
-          expert_offsets, problem_sizes, num_experts, n, k,
-          workspace, workspace_bytes, static_cast<cudaStream_t>(stream));
-    } else {
-      rc = run_grouped_gemm<SM90_CO<128, 64, 512, 1, 1, 1>::Cutlass3xW4A8Gemm>(
-          d_output, a_activations, b_weights, a_scale, b_scales,
-          expert_offsets, problem_sizes, num_experts, n, k,
-          workspace, workspace_bytes, static_cast<cudaStream_t>(stream));
-    }
-  } else if (m <= 32) {
-    rc = run_grouped_gemm<SM90_PP<128, 32, 128, 1, 1, 1>::Cutlass3xW4A8Gemm>(
+  if (m <= 32) {
+    rc = run_grouped_gemm<SM90_CO<128, 16, 512, 1, 1, 1>::Cutlass3xW4A8Gemm>(
+        d_output, a_activations, b_weights, a_scale, b_scales,
+        expert_offsets, problem_sizes, num_experts, n, k,
+        workspace, workspace_bytes, static_cast<cudaStream_t>(stream));
+  } else if (m <= 1024) {
+    rc = run_grouped_gemm<SM90_CO<128, 32, 512, 1, 1, 1>::Cutlass3xW4A8Gemm>(
         d_output, a_activations, b_weights, a_scale, b_scales,
         expert_offsets, problem_sizes, num_experts, n, k,
         workspace, workspace_bytes, static_cast<cudaStream_t>(stream));
   } else {
-    rc = run_grouped_gemm<SM90_PP<128, 64, 128, 1, 1, 1>::Cutlass3xW4A8Gemm>(
+    rc = run_grouped_gemm<SM90_CO<128, 64, 512, 1, 1, 1>::Cutlass3xW4A8Gemm>(
         d_output, a_activations, b_weights, a_scale, b_scales,
         expert_offsets, problem_sizes, num_experts, n, k,
         workspace, workspace_bytes, static_cast<cudaStream_t>(stream));

@@ -2203,7 +2203,7 @@ pub unsafe fn w4a8_per_tensor_fp8_quant(
     Ok(())
 }
 
-/// Build problem_sizes [E, 3] (M, N, K) from per-expert token counts.
+/// Build problem_sizes [E, 3] (N, M, K — SGLang order) from per-expert token counts.
 pub unsafe fn w4a8_compute_problem_sizes(
     counts: RawDevicePtr<i32>,
     problem_sizes: RawDevicePtr<i32>,
