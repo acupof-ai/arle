@@ -2280,6 +2280,17 @@ fn write_producer_manifest(
         .map(|(key, value)| format!("{key}={value}\n"))
         .collect::<String>();
     std::fs::write(out_dir.join(PREBUILT_MANIFEST), text).expect("write CUDA producer manifest");
+    // ARLE_KERNEL_VENDOR=1: pack tars generated/ into the bundle, and the
+    // qualification path requires the producer manifest inside the candidate
+    // tree — mirror it next to the vendored artifact dirs.
+    if env_truthy("ARLE_KERNEL_VENDOR") {
+        let vendor_tier = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap())
+            .join("generated")
+            .join(PREBUILT_MANIFEST);
+        std::fs::create_dir_all(vendor_tier.parent().unwrap()).expect("create vendor tier");
+        std::fs::copy(out_dir.join(PREBUILT_MANIFEST), &vendor_tier)
+            .expect("mirror producer manifest into vendor tier");
+    }
     emit_kernel_build_identity(out_dir, &manifest);
 }
 

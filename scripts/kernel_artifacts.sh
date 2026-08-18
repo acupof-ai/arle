@@ -75,12 +75,16 @@ KERNEL_INPUT_PATHS=(
     crates/cuda-kernels/kernels.toml
     crates/cuda-kernels/tools/tilelang
     crates/cuda-kernels/csrc
-    crates/cuda-kernels/ffi
     crates/cuda-kernels/src
-    vendor/flash-attention
-    vendor/flashmla
+    crates/cuda-kernels/vendor
     requirements-build.txt
 )
+
+# Pinned CUTLASS 3.x tag for the W4AFP8 kernel — MUST match the provisioning
+# in .github/workflows/{kernels-publish,release}.yml and scripts/pod-build-env.sh.
+# Out-of-band headers cannot be hashed by the skip job (it never downloads
+# them), so the pin rides the identity: a tag bump forces a rebuild.
+W4A8_CUTLASS_PIN="v3.7.0"
 
 kernel_bundle_identity() {
     # Hash tracked working-tree content; generated and untracked files cannot
@@ -92,11 +96,12 @@ kernel_bundle_identity() {
         done | cuda_prebuilt_hash_stream
     )
     cat <<EOF
-schema=5
+schema=6
 lane=$LANE
 arches=$ARCHS
 tilelang_inputs=$tilelang_inputs
 cuda_contract=$CUDA_CONTRACT
+w4a8_cutlass=$W4A8_CUTLASS_PIN
 EOF
 }
 
