@@ -2081,15 +2081,22 @@ fn collect_input_files(path: &Path, files: &mut Vec<PathBuf>) {
     };
     for entry in entries.flatten() {
         let entry_path = entry.path();
-        if entry_path
-            .file_name()
-            .is_some_and(|name| name == "generated")
-        {
+        // Exclude generated/ (vendored artifacts) and Python bytecode caches:
+        // the producer computes this hash AFTER the build (when __pycache__
+        // exists), the consumer BEFORE it — the two must agree. Matches the
+        // exclusion in collect_files (TileLang cache identity).
+        if entry_path.file_name().is_some_and(|name| {
+            name == "generated" || name == "__pycache__" || name.to_string_lossy().starts_with('.')
+        }) {
             continue;
         }
         if entry_path.is_dir() {
             collect_input_files(&entry_path, files);
-        } else if entry_path.is_file() {
+        } else if entry_path.is_file()
+            && entry_path
+                .extension()
+                .is_none_or(|extension| extension != "pyc")
+        {
             files.push(entry_path);
         }
     }
