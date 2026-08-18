@@ -241,9 +241,9 @@ mod cuda_impl {
         /// Widen this rank's block envelopes over the sequence-shard group so
         /// every rank scores the same intervals.
         ///
-        /// Sized from `recall_block_count`, never from `block_reps.len()`: rep
-        /// growth stops early at a sentinel span and that point differs per rank,
-        /// which would mismatch the collective payload and hang the group.
+        /// Sized from `recall_block_count`, never from how many envelopes this
+        /// rank built: growth stops early at a sentinel span and that point
+        /// differs per rank, which would mismatch the payload and hang the group.
         fn widen_envelopes(
             &mut self,
             ctx: &DeviceContext,
