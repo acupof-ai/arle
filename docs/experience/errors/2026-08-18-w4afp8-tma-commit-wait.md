@@ -1,9 +1,11 @@
-# W4AFP8 -729 crash root cause
+# W4AFP8 -729 crash + workspace OOM + NCCL shm SIGKILL
 
-## Symptom
+## Symptom 1: -729 crash on first MoE forward
+
 CUTLASS W4AFP8 grouped GEMM crashes with -729 (cudaErrorLaunchFailure) on first MoE forward.
 
-## Root cause
+### Root cause
+
 The SGLang mixed-input extensions were written for CUTLASS 4.x (commit
 57e3cfb4) but backported to CUTLASS 3.7.0. The backport introduced TMA
 descriptor lifecycle bugs: the 3.7.0 TMA descriptor handling differs from
@@ -15,7 +17,8 @@ hardware uses the initial (1×1) descriptor → out-of-bounds → -729. But it
 was not sufficient: the crash persisted because other 3.7.0 vs 4.x TMA
 handling differences remain in the backported kernel.
 
-## Fix
+### Fix
+
 Switch to the FlashMLA vendored CUTLASS 4.x (`crates/cuda-kernels/vendor/
 flashmla/csrc/cutlass/`, NVIDIA tag 147f5673) and revert the 3.7.0
 compatibility code in the SGLang kernel:
@@ -32,6 +35,40 @@ compatibility code in the SGLang kernel:
 The `ElementScalePacked = Array<BF16, K/128>` modification (SGLang's
 interleaved scale layout) is preserved — it is the key SGLang extension
 that the official 4.x kernel lacks.
+
+Commits: 453bf60fd (CUTLASS 4.x switch), e68512944 (builder stage-count fix)
+
+## Symptom 2: 64MB workspace OOM
+
+`DSv4 W4AFP8 workspace alloc failed: DriverError(CUDA_ERROR_OUT_OF_MEMORY)`
+on first MoE forward, despite 1.8GB free VRAM at TP=2 on H20.
+
+### Root cause
+
+The CUTLASS workspace was hardcoded to 64MB. At TP=2 with 95.7GB/GPU used
+(weights + KV cache), the pool had no retained block large enough, and the
+GPU had insufficient free VRAM for a new 64MB allocation. The oversized
+workspace also caused 36s TTFT on 1K prefill (memory pressure).
+
+### Fix
+
+Right-sized to 32MB (actual need: <16MB CUTLASS ws + 17KB metadata at
+E=128). Commit: fb0b877d2.
+
+## Symptom 3: silent SIGKILL during weight loading
+
+Process vanishes during weight loading — no error, no panic, no dmesg entry,
+no core dump. Reproduced across both builds.
+
+### Root cause
+
+Stale NCCL shared memory files (`/dev/shm/nccl-*`) from crashed runs
+interfere with new serve launches. The NCCL init succeeds (self-test passes)
+but the process is killed silently during subsequent weight loading.
+
+### Fix
+
+`rm -f /dev/shm/nccl-*` before launching a new serve after a crash.
 
 ## Why the 3.7.0-shaped call compiled there and not here
 
