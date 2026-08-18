@@ -2884,6 +2884,8 @@ fn main() {
                     | "arle_flashmla_decode_shim"
                     | "arle_fa3_shim"
                     | "arle_q8kv8_prefill_shim"
+                    | "w4a8_grouped_gemm"
+                    | "nvfp4_to_w4afp8"
             );
         // The sm_120 grouped-FP8 TU that also has an sm_120 gencode target: the
         // only build that forces sm_120a gencode + defines ARLE_SM120_GROUPED_FP8.
@@ -2943,6 +2945,23 @@ fn main() {
                 "-DARLE_SM120_GROUPED_FP8=1".to_string(),
                 format!("-I{}/include", cuda_path),
                 format!("-I{}", flashmla_root.join("csrc/cutlass/include").display()),
+            ]);
+        }
+
+        // W4A8 MoE grouped GEMM (SGLang CUTLASS kernel, Apache-2.0): SM90-only.
+        // The SGLang mixed-input extensions require CUTLASS 3.x internals; the
+        // FlashMLA/DeepGEMM vendored CUTLASS is 4.x and incompatible. Use the
+        // standalone CUTLASS 3.x download (pod-build-env.sh sets the path).
+        if stem == "w4a8_grouped_gemm" {
+            let cutlass_3x = std::env::var("ARLE_W4A8_CUTLASS_INCLUDE")
+                .unwrap_or_else(|_| "/data00/cutlass-3x/include".to_string());
+            nvcc_args.extend([
+                "-std=c++17".to_string(),
+                "--expt-relaxed-constexpr".to_string(),
+                "-Wno-deprecated-declarations".to_string(),
+                format!("-I{}/include", cuda_path),
+                format!("-I{}", cutlass_3x),
+                "-Icsrc/moe/w4a8".to_string(),
             ]);
         }
 

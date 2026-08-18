@@ -2726,6 +2726,10 @@ impl SafetensorLoader {
             QuantFormat::W8A16 { group_size } => {
                 self.load_w8a16_view(ctx, view, &shard, group_size)
             }
+            QuantFormat::W4Afp8 => bail!(
+                "{}: W4AFP8 is loaded by the DSv4 MoE loader, not load_quant_or_dense_view",
+                view.name
+            ),
         }
     }
 
@@ -3962,21 +3966,13 @@ impl SafetensorLoader {
                 )
                 .with_context(|| format!("upload DSv4 FP8 matrix {name}"))
             }
-            Dtype::I8 => {
-                // NVFP4: packed E2M1 float4 (2 per byte), logical K = stored K * 2.
-                let rows = tensor.shape[0];
-                let logical_cols = tensor.shape[1] * 2;
-                DeviceMatrix::from_dsv4_fp4_block_scaled(
-                    ctx,
-                    tensor.bytes(),
-                    &scale_e8m0,
-                    rows,
-                    logical_cols,
-                    scale_rows,
-                    scale_cols,
-                )
-                .with_context(|| format!("upload DSv4 FP4 matrix {name}"))
-            }
+            // FAIL-CLOSED: the FP4/MX lane NaNs from the first compressed-attention
+            // layer
+            // (#137); the FP4 dequant plumbing below stays for a future re-license.
+            Dtype::I8 => bail!(
+                "{name}: FP4/MX DSv4 checkpoints are unsupported — the compressed-attention \
+                 path NaNs (#137). Use the FP8-native export."
+            ),
             other => bail!("{name}: unsupported DSv4 block-scaled dtype {other:?}"),
         }
     }
@@ -4315,12 +4311,25 @@ impl SafetensorLoader {
             }
         };
 
-        // Detect W4A16: the first routed expert's w1 carries the quant view.
+        // Detect W4A16 / W4AFP8: the first routed expert's w1 carries the quant view.
         let first_expert = names.expert(split.local_expert_start);
         let first_view = self.quant_view_for_dsv4(&first_expert.w1)?;
         let is_w4a16 = first_view
             .as_ref()
             .is_some_and(|v| matches!(v.format, QuantFormat::W4A16 { .. }));
+        let is_w4afp8 = first_view
+            .as_ref()
+            .is_some_and(|v| matches!(v.format, QuantFormat::W4Afp8));
+        // NVFP4 (0731 checkpoint): E2M1 packed weight + F8_E8M0 `.scale` block
+        // scales. Converted to W4AFP8 on GPU at load time.
+        let is_nvfp4 = !is_w4a16 && !is_w4afp8 && {
+            let base = first_expert.w1.trim_end_matches(".weight");
+            let scale_name = format!("{base}.scale");
+            self.tensor_headers()
+                .ok()
+                .and_then(|h| h.get(&scale_name).map(|t| t.dtype == Dtype::F8_E8M0))
+                .unwrap_or(false)
+        };
 
         let (w13_grouped, w2_grouped, w13_w4a16, w2_w4a16, hidden_dim, intermediate, num_groups) =
             if is_w4a16 {
@@ -4369,6 +4378,36 @@ impl SafetensorLoader {
                     hidden_dim,
                     intermediate,
                     num_groups,
+                )
+            } else if is_w4afp8 {
+                // W4AFP8: raw bytes loaded below (SGLang CUTLASS layout); the tuple
+                // only carries the dims the layer struct needs.
+                let view = first_view.as_ref().expect("W4AFP8 view");
+                let hidden_dim = view.logical_shape[1];
+                let intermediate = view.logical_shape[0];
+                (
+                    None,
+                    None,
+                    None,
+                    None,
+                    hidden_dim,
+                    intermediate,
+                    split.experts_per_rank,
+                )
+            } else if is_nvfp4 {
+                // NVFP4: E2M1+E8M0 converted to W4AFP8 on GPU below; the tuple
+                // only carries the dims the layer struct needs.
+                let w1 = self.load_raw_tensor(&first_expert.w1)?;
+                let intermediate = w1.shape[0];
+                let hidden_dim = w1.shape[1] * 2;
+                (
+                    None,
+                    None,
+                    None,
+                    None,
+                    hidden_dim,
+                    intermediate,
+                    split.experts_per_rank,
                 )
             } else {
                 // FP8 path: per-expert FP8 caches → grouped DeepGEMM caches.
@@ -4474,11 +4513,180 @@ impl SafetensorLoader {
         let shared_down = load_fp8(&shared.w2)?;
         let shared_w2 = build_w2(&shared_down)?;
 
+        // W4AFP8 routed experts: load raw I8 weight + BF16 scale bytes, fuse
+        // w1+w3 rows, stack experts, upload.
+        let (w13_w4afp8, w2_w4afp8) = if is_w4afp8 {
+            let scale_name = |w: &str| w.trim_end_matches(".weight").to_string() + ".weight_scale";
+            let mut w13_w = Vec::new();
+            let mut w13_s = Vec::new();
+            let mut w2_w = Vec::new();
+            let mut w2_s = Vec::new();
+            for e in split.local_expert_start..split.local_expert_end() {
+                let expert = names.expert(e);
+                let w1 = self.load_raw_tensor(&expert.w1)?;
+                let w3 = self.load_raw_tensor(&expert.w3)?;
+                let w1s = self.load_raw_tensor(&scale_name(&expert.w1))?;
+                let w3s = self.load_raw_tensor(&scale_name(&expert.w3))?;
+                // w13 weight: row-major concat along axis 0 = byte concat.
+                w13_w.extend_from_slice(&w1.bytes);
+                w13_w.extend_from_slice(&w3.bytes);
+                // w13 scales: concat along axis 1 — interleave rows.
+                let row_bytes = w1s.bytes.len() / w1s.shape[0];
+                let rows = w1s.shape[0];
+                w13_s.reserve(rows * 2 * row_bytes);
+                for r in 0..rows {
+                    let start = r * row_bytes;
+                    w13_s.extend_from_slice(&w1s.bytes[start..start + row_bytes]);
+                    w13_s.extend_from_slice(&w3s.bytes[start..start + row_bytes]);
+                }
+                let w2 = self.load_raw_tensor(&expert.w2)?;
+                let w2s = self.load_raw_tensor(&scale_name(&expert.w2))?;
+                w2_w.extend_from_slice(&w2.bytes);
+                w2_s.extend_from_slice(&w2s.bytes);
+            }
+            let w13_dev = ctx
+                .stream
+                .clone_htod(&w13_w)
+                .map_err(|e| anyhow!("DSv4 W4AFP8 w13 weight upload failed: {e}"))?;
+            let w13s_dev = ctx
+                .stream
+                .clone_htod(&w13_s)
+                .map_err(|e| anyhow!("DSv4 W4AFP8 w13 scales upload failed: {e}"))?;
+            let w2_dev = ctx
+                .stream
+                .clone_htod(&w2_w)
+                .map_err(|e| anyhow!("DSv4 W4AFP8 w2 weight upload failed: {e}"))?;
+            let w2s_dev = ctx
+                .stream
+                .clone_htod(&w2_s)
+                .map_err(|e| anyhow!("DSv4 W4AFP8 w2 scales upload failed: {e}"))?;
+            (
+                Some(crate::moe::W4Afp8ExpertWeights {
+                    weight: w13_dev,
+                    scales: w13s_dev,
+                    num_experts: split.experts_per_rank,
+                    n: 2 * intermediate,
+                    k: hidden_dim,
+                }),
+                Some(crate::moe::W4Afp8ExpertWeights {
+                    weight: w2_dev,
+                    scales: w2s_dev,
+                    num_experts: split.experts_per_rank,
+                    n: hidden_dim,
+                    k: intermediate,
+                }),
+            )
+        } else if is_nvfp4 {
+            // NVFP4 → W4AFP8: convert E2M1+E8M0 to INT4+BF16 on GPU per expert,
+            // download, fuse w1+w3 on host, upload.
+            let e8m0_name = |w: &str| w.trim_end_matches(".weight").to_string() + ".scale";
+            let convert = |w_name: &str| -> Result<(Vec<u8>, Vec<u8>, usize)> {
+                let weight = self.load_raw_tensor(w_name)?;
+                let scale = self.load_raw_tensor(&e8m0_name(w_name))?;
+                let n = weight.shape[0];
+                let k = weight.shape[1] * 2;
+                let scale_rows = k / 512;
+                let src_w = ctx
+                    .stream
+                    .clone_htod(&weight.bytes)
+                    .map_err(|e| anyhow!("NVFP4 src weight upload failed: {e}"))?;
+                let src_s = ctx
+                    .stream
+                    .clone_htod(&scale.bytes)
+                    .map_err(|e| anyhow!("NVFP4 src scale upload failed: {e}"))?;
+                let dst_w = ctx
+                    .stream
+                    .alloc_zeros::<u8>(n * (k / 2))
+                    .map_err(|e| anyhow!("NVFP4 dst weight alloc failed: {e}"))?;
+                let dst_s = ctx
+                    .stream
+                    .alloc_zeros::<u8>(scale_rows * n * 4 * 2)
+                    .map_err(|e| anyhow!("NVFP4 dst scale alloc failed: {e}"))?;
+                unsafe {
+                    cuda_kernels::moe::nvfp4_to_w4afp8(
+                        cuda_kernels::tensor::cache_ptr(&src_w, ctx).cast::<i8>(),
+                        cuda_kernels::tensor::cache_ptr(&src_s, ctx),
+                        cuda_kernels::tensor::cache_ptr(&dst_w, ctx).cast::<i8>(),
+                        cuda_kernels::tensor::cache_ptr(&dst_s, ctx),
+                        n,
+                        k,
+                        ctx.stream.cu_stream(),
+                    )?;
+                }
+                let w_host = ctx
+                    .stream
+                    .clone_dtoh(&dst_w)
+                    .map_err(|e| anyhow!("NVFP4 dst weight download failed: {e}"))?;
+                let s_host = ctx
+                    .stream
+                    .clone_dtoh(&dst_s)
+                    .map_err(|e| anyhow!("NVFP4 dst scale download failed: {e}"))?;
+                Ok((w_host, s_host, scale_rows))
+            };
+            let mut w13_w = Vec::new();
+            let mut w13_s = Vec::new();
+            let mut w2_w = Vec::new();
+            let mut w2_s = Vec::new();
+            for e in split.local_expert_start..split.local_expert_end() {
+                let expert = names.expert(e);
+                let (w1_cw, w1_cs, w1_rows) = convert(&expert.w1)?;
+                let (w3_cw, w3_cs, _) = convert(&expert.w3)?;
+                w13_w.extend_from_slice(&w1_cw);
+                w13_w.extend_from_slice(&w3_cw);
+                let row_bytes = w1_cs.len() / w1_rows;
+                w13_s.reserve(w1_rows * 2 * row_bytes);
+                for r in 0..w1_rows {
+                    let start = r * row_bytes;
+                    w13_s.extend_from_slice(&w1_cs[start..start + row_bytes]);
+                    w13_s.extend_from_slice(&w3_cs[start..start + row_bytes]);
+                }
+                let (w2_cw, w2_cs, _) = convert(&expert.w2)?;
+                w2_w.extend_from_slice(&w2_cw);
+                w2_s.extend_from_slice(&w2_cs);
+            }
+            let w13_dev = ctx
+                .stream
+                .clone_htod(&w13_w)
+                .map_err(|e| anyhow!("DSv4 W4AFP8 w13 weight upload failed: {e}"))?;
+            let w13s_dev = ctx
+                .stream
+                .clone_htod(&w13_s)
+                .map_err(|e| anyhow!("DSv4 W4AFP8 w13 scales upload failed: {e}"))?;
+            let w2_dev = ctx
+                .stream
+                .clone_htod(&w2_w)
+                .map_err(|e| anyhow!("DSv4 W4AFP8 w2 weight upload failed: {e}"))?;
+            let w2s_dev = ctx
+                .stream
+                .clone_htod(&w2_s)
+                .map_err(|e| anyhow!("DSv4 W4AFP8 w2 scales upload failed: {e}"))?;
+            (
+                Some(crate::moe::W4Afp8ExpertWeights {
+                    weight: w13_dev,
+                    scales: w13s_dev,
+                    num_experts: split.experts_per_rank,
+                    n: 2 * intermediate,
+                    k: hidden_dim,
+                }),
+                Some(crate::moe::W4Afp8ExpertWeights {
+                    weight: w2_dev,
+                    scales: w2s_dev,
+                    num_experts: split.experts_per_rank,
+                    n: hidden_dim,
+                    k: intermediate,
+                }),
+            )
+        } else {
+            (None, None)
+        };
+
         Ok(crate::dsv4::Dsv4MoeLayer {
             w13_grouped,
             w2_grouped,
             w13_w4a16,
             w2_w4a16,
+            w13_w4afp8,
+            w2_w4afp8,
             num_groups,
             hidden_dim,
             intermediate,
