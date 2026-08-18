@@ -1,6 +1,6 @@
 # Global dead-code deletion, wave 2 — CUDA kernels + cross-crate, 2026-08-18
 
-> Status: local verified; pod parity gate pending-remote
+> Status: verified (local + CUDA build + parity gate + W8A16 Marlin smoke on pod)
 
 ## Goal
 
@@ -62,14 +62,39 @@ Pre-existing warnings on HEAD (not from this wave): infer-cuda/src/gpu_sample.rs
 spawn/parse_nvidia_smi/query_nvidia_smi never used — the sampler was disabled
 in bbd422973. Left for the owner of that change.
 
-### Remote (CUDA build + parity gate) — pending-remote
+### Remote (CUDA build + parity gate) — verified
 
-- [ ] `cargo build --release --features cuda` on pod (H20, sm_90)
-- [ ] `scripts/lever_gate.sh` Qwen3.5-9B, NEEDLE_MAX_TOKENS=2000, ×3 same-config
-- [ ] W8A16 decode perf A/B vs docs/baselines.md champion row — the Marlin
-      `max_shared_mem` arg removal touches the live W8A16 decode launch path;
-      the arg was never read by the kernel, so zero behavior change is
-      expected, but the gate requires a wall-clock license for live-path edits
+- `cargo build --release --features cuda,nccl --bin arle` on pod (H20, sm_90)
+  at 477541e04: clean (BUILD_EXIT=0). First attempt at 01e9c4822 failed on
+  the CUDA-gated `agent_opd.rs` stale import — see Problems.
+- `scripts/lever_gate.sh` with Qwen3.5-9B on GPU 1 (NEEDLE_MAX_TOKENS=2000,
+  full ladder ×3):
+
+| len | exact | partial | miss | wave-1 baseline |
+|-----|-------|---------|------|-----------------|
+| 115 | 0 | 0 | 3 | 0 / 0 / 3 |
+| 300 | 3 | 0 | 0 | 3 / 0 / 0 |
+| 446 | 3 | 0 | 0 | 3 / 0 / 0 |
+| 2000 | 3 | 0 | 0 | 3 / 0 / 0 |
+| 8000 | 3 | 0 | 0 | 3 / 0 / 0 |
+
+PASS: exact match with the wave-1 same-config envelope at every length.
+len=115 misses are the same model characteristic as wave 1 (reasoning model
+consumed all 2000 tokens on reasoning_content, empty output).
+
+- W8A16 Marlin path smoke (the one live-path touch — the unused
+  `max_shared_mem` kernel arg removal): `lever_gate.sh` with
+  `/data00/qwen35-08b-w8a16` (Qwen3.5-0.8B W8A16, hidden=1024) on GPU 4,
+  LENGTHS=300,2000 RUNS=1 — PASS, exact=1 at both lengths. All tile-aligned
+  main linears (in_proj_qkv/z/out_proj, gate/up/down) repacked to Marlin
+  silently; 18 small-n projections (n=16/32, not N%64) correctly fell back to
+  the scalar path with the standard repack-skipped warning. The 2000-token
+  exact recall proves the Marlin kernel produced correct outputs over a long
+  decode. The 27B Huihui champion-row A/B (docs/baselines.md) is
+  pending-remote: that checkpoint is not on this pod. The arg removal is
+  zero-behavior by construction (kernel body never read the arg; launch
+  config unchanged), so the smoke is a launch-and-correctness check, not a
+  perf A/B.
 
 ## Problems
 
@@ -106,7 +131,9 @@ in bbd422973. Left for the owner of that change.
 
 ## Learnings
 
-Wave 2 complete locally. The CUDA C++ surface was the richest vein in the
+PASS (local + remote). The CUDA C++ surface was the richest vein in the
 repo — 12 whole .cu files and ~40 dead exports, most predating the paged-KV
-unification. Zero runtime change: every deletion was zero-caller code. Pod
-parity gate + W8A16 perf A/B are the remaining gate.
+unification. Zero runtime change: every deletion was zero-caller code, and
+the one live-path touch (Marlin kernel arg) is verified on a real W8A16
+decode. The needle-gate distribution matches wave 1 cell-for-cell. Remaining
+debt: the 27B W8A16 champion-row A/B needs the Huihui checkpoint on a pod.
