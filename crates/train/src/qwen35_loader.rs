@@ -1245,6 +1245,10 @@ fn is_fp8_cuda_frozen_base_tensor(train_name: &str, expected_shape: &[usize]) ->
             || train_name.ends_with(".mlp.shared_expert.gate_proj.weight")
             || train_name.ends_with(".mlp.shared_expert.up_proj.weight")
             || train_name.ends_with(".mlp.shared_expert.down_proj.weight")
+            // compressed-tensors quantizes lm_head; the FP8 block-scaled
+            // checkpoints leave it BF16, so this arm only fires on the
+            // per-channel form.
+            || train_name.ends_with("lm_head.weight")
             || is_qwen36_per_expert_projection(train_name))
 }
 
