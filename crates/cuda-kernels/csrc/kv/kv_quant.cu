@@ -18,7 +18,6 @@
 #include <cstdint>
 #include <cfloat>
 
-
 __device__ __forceinline__ float warp_reduce_max_abs(float val) {
     #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1)
@@ -325,28 +324,6 @@ cudaError_t quantize_paged_kv_fp8_cuda(
     quantize_paged_kv_fp8_kernel<<<grid, block, smem_bytes, stream>>>(
         kv_bf16, kv_fp8, scales, new_token_indices,
         num_kv_heads, head_dim, kv_dim);
-    return cudaGetLastError();
-}
-
-// Quantize + scatter contiguous bf16 KV → FP8 paged pool (for migration).
-cudaError_t quantize_scatter_kv_fp8_cuda(
-    const __nv_bfloat16* kv_cont,
-    __nv_fp8_e4m3* kv_fp8,
-    float* scales,
-    const int32_t* page_indices,
-    int max_seq_len, int seq_len,
-    int num_kv_heads, int head_dim, int kv_dim,
-    cudaStream_t stream)
-{
-    if (seq_len <= 0) return cudaSuccess;
-    dim3 grid(num_kv_heads, seq_len);
-    int group_threads = (head_dim + 3) / 4;
-    int block_threads = ((group_threads + 31) / 32) * 32;
-    dim3 block(block_threads);
-    int smem_bytes = ((block_threads + 31) / 32) * sizeof(float);
-    quantize_scatter_kv_fp8_kernel<<<grid, block, smem_bytes, stream>>>(
-        kv_cont, kv_fp8, scales, page_indices,
-        0, max_seq_len, num_kv_heads, head_dim, kv_dim);
     return cudaGetLastError();
 }
 
@@ -740,27 +717,6 @@ __global__ void quantize_paged_kv_single_kernel(
     kv_int8[data_offset] = static_cast<int8_t>(q);
 }
 
-// Dequantize paged INT8 KV to bf16 working buffer for all tokens in the batch.
-cudaError_t dequantize_paged_kv_cuda(
-    const int8_t* kv_int8,
-    const float* scales,
-    __nv_bfloat16* kv_bf16,
-    const int32_t* token_indices,
-    int num_kv_heads,
-    int head_dim,
-    int kv_dim,
-    int total_tokens,
-    cudaStream_t stream)
-{
-    if (total_tokens <= 0) return cudaSuccess;
-    dim3 grid(num_kv_heads, total_tokens);
-    dim3 block(head_dim);
-    dequantize_paged_kv_kernel<<<grid, block, 0, stream>>>(
-        kv_int8, scales, kv_bf16, token_indices,
-        num_kv_heads, head_dim, kv_dim);
-    return cudaGetLastError();
-}
-
 // Quantize 1 new token per request from bf16 working to INT8 paged pool.
 cudaError_t quantize_paged_kv_single_cuda(
     const __nv_bfloat16* kv_bf16,
@@ -1067,19 +1023,6 @@ __global__ void finalize_k_per_channel_scales_int4_kernel(
     k_static_scales[idx] = fmaxf(v / 7.5f, 1.0e-30f);
 }
 
-cudaError_t finalize_k_per_channel_scales_int4_cuda(
-    float* k_static_scales,
-    int num_channels,
-    cudaStream_t stream)
-{
-    if (num_channels <= 0) return cudaSuccess;
-    int block = 256;
-    int grid = (num_channels + block - 1) / block;
-    finalize_k_per_channel_scales_int4_kernel<<<grid, block, 0, stream>>>(
-        k_static_scales, num_channels);
-    return cudaGetLastError();
-}
-
 // K quantize using KIVI per-channel scales. Each thread handles ONE output
 // byte (= 2 packed dims).
 // Two-level K quant: per-channel STATIC scale × per-(token, kv_head) DYNAMIC
@@ -1169,27 +1112,6 @@ __global__ void quantize_paged_kv_int4_per_channel_kernel(
     }
 }
 
-cudaError_t quantize_paged_kv_int4_per_channel_cuda(
-    const __nv_bfloat16* kv_bf16,
-    uint8_t* kv_int4_packed,
-    const float* k_static_scales,
-    float* k_dynamic_scales,
-    const int32_t* new_token_indices,
-    int num_kv_heads, int head_dim, int kv_dim,
-    int batch_size,
-    cudaStream_t stream)
-{
-    if (batch_size <= 0) return cudaSuccess;
-    dim3 grid(num_kv_heads, batch_size);
-    dim3 block(head_dim);    // one thread per dim (two-level needs full-width reduce)
-    int num_warps = (head_dim + 31) / 32;
-    int smem_bytes = num_warps * sizeof(float) + head_dim * sizeof(int8_t);
-    quantize_paged_kv_int4_per_channel_kernel<<<grid, block, smem_bytes, stream>>>(
-        kv_bf16, kv_int4_packed, k_static_scales, k_dynamic_scales, new_token_indices,
-        num_kv_heads, head_dim, kv_dim);
-    return cudaGetLastError();
-}
-
 // V quantize using per-(row, head) absmax (KIVI's asymmetric design). Block
 // has head_dim threads for absmax reduction, then half the threads do the
 // pairwise nibble packing. Staging area in shared memory carries the
@@ -1265,26 +1187,6 @@ __global__ void quantize_paged_kv_single_int4_kernel(
         int dst = pool_idx * kv_dim_packed + kv_head * head_bytes + byte_idx;
         kv_int4_packed[dst] = byte;
     }
-}
-
-cudaError_t quantize_paged_kv_single_int4_cuda(
-    const __nv_bfloat16* kv_bf16,
-    uint8_t* kv_int4_packed,
-    float* scales,
-    const int32_t* new_token_indices,
-    int num_kv_heads, int head_dim, int kv_dim,
-    int batch_size,
-    cudaStream_t stream)
-{
-    if (batch_size <= 0) return cudaSuccess;
-    dim3 grid(num_kv_heads, batch_size);
-    dim3 block(head_dim);
-    int num_warps = (head_dim + 31) / 32;
-    int smem_bytes = num_warps * sizeof(float) + head_dim * sizeof(int8_t);
-    quantize_paged_kv_single_int4_kernel<<<grid, block, smem_bytes, stream>>>(
-        kv_bf16, kv_int4_packed, scales, new_token_indices,
-        num_kv_heads, head_dim, kv_dim);
-    return cudaGetLastError();
 }
 
 }  // extern "C"

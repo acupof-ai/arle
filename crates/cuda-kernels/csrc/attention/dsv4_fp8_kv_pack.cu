@@ -958,32 +958,6 @@ extern "C" cudaError_t arle_dsv4_fp8_kv_fill_one_sw_slot_from_start_pos_cuda(
     return cudaGetLastError();
 }
 
-extern "C" cudaError_t arle_dsv4_fp8_kv_fill_sw_slots_from_start_pos_cuda(
-    int* token_block_id,
-    int* token_in_block_row,
-    const int* start_pos,
-    const int* slot_layer_block_offsets,
-    int n_tokens,
-    int sliding_window,
-    int page_block_size,
-    cudaStream_t stream)
-{
-    if (n_tokens == 0) return cudaSuccess;
-    if (token_block_id == nullptr || token_in_block_row == nullptr ||
-        start_pos == nullptr || slot_layer_block_offsets == nullptr) {
-        return cudaErrorInvalidValue;
-    }
-    if (n_tokens < 0 || sliding_window <= 0 || page_block_size <= 0) {
-        return cudaErrorInvalidValue;
-    }
-    constexpr int kBlock = 128;
-    int grid = (n_tokens + kBlock - 1) / kBlock;
-    dsv4_fp8_kv_fill_sw_slots_from_start_pos_kernel<<<grid, kBlock, 0, stream>>>(
-        token_block_id, token_in_block_row, start_pos, slot_layer_block_offsets,
-        n_tokens, sliding_window, page_block_size);
-    return cudaGetLastError();
-}
-
 extern "C" cudaError_t arle_dsv4_fp8_kv_pack_completed_compressor_row_start_pos_cuda(
     const __nv_bfloat16* compressed,
     uint8_t* packed_kv,

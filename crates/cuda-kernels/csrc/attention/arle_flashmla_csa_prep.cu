@@ -361,30 +361,4 @@ cudaError_t arle_flashmla_chain_verify_build_indices(
     return cudaGetLastError();
 }
 
-cudaError_t arle_flashmla_fill_pad_rows(
-        int32_t* indices,
-        int32_t* topk_length,
-        int s_q_actual,
-        int s_q_padded,
-        int topk_unified,
-        cudaStream_t stream) {
-    if (s_q_padded <= s_q_actual) return cudaSuccess;
-    if (s_q_actual < 0 || topk_unified <= 0) return cudaErrorInvalidValue;
-
-    const int pad_rows = s_q_padded - s_q_actual;
-    {
-        int32_t* row_start = indices + (size_t)s_q_actual * topk_unified;
-        const size_t bytes = (size_t)pad_rows * topk_unified * sizeof(int32_t);
-        cudaError_t err = cudaMemsetAsync(row_start, 0xff, bytes, (cudaStream_t)stream);
-        if (err != cudaSuccess) return err;
-    }
-    {
-        int32_t* len_start = topk_length + s_q_actual;
-        const size_t bytes = (size_t)pad_rows * sizeof(int32_t);
-        cudaError_t err = cudaMemsetAsync(len_start, 0, bytes, (cudaStream_t)stream);
-        if (err != cudaSuccess) return err;
-    }
-    return cudaSuccess;
-}
-
 }  // extern "C"

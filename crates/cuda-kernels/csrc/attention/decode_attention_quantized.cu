@@ -34,7 +34,6 @@ __device__ __forceinline__ float warp_reduce_sum(float val) {
     return val;
 }
 
-
 // Phase 2: Merge partial results across splits.
 //
 // Grid: (total_q_heads,)
@@ -76,7 +75,6 @@ __global__ void decode_attention_merge_kernel(
 
     O[q_idx * HEAD_DIM + d] = __float2bfloat16(final_o);
 }
-
 
 extern "C" {
 
@@ -148,7 +146,6 @@ static int choose_decode_num_splits(
 
     return (desired_splits < max_splits_by_workspace) ? desired_splits : max_splits_by_workspace;
 }
-
 
 // FP8 E4M3 fused-dequant decode attention (same split-KV, no scales).
 // KIVI per-channel K partial kernel: reads K scale from a
@@ -378,7 +375,6 @@ __global__ void decode_attention_fp8_per_channel_k_partial_kernel(
     }
 }
 }  // extern "C++" — KIVI per-channel K template kernel
-
 
 // KIVI per-channel K decode attention: same shape as decode_attention_fp8_cuda
 // but consumes a `[num_kv_heads, head_dim]` static K scale table instead of
@@ -970,71 +966,5 @@ __global__ void decode_attention_int4_per_channel_k_partial_kernel(
     }
 }
 }  // extern "C++" — INT4 KIVI per-channel K template kernel
-
-cudaError_t decode_attention_int4_per_channel_k_cuda(
-    const __nv_bfloat16* Q,
-    const uint8_t* K_data_packed,
-    const uint8_t* V_data_packed,
-    const float* K_static_scales,
-    const float* K_dynamic_scales,
-    const float* V_scales,
-    const int32_t* kv_indices,
-    const int32_t* kv_indptr,
-    __nv_bfloat16* O,
-    int batch_size,
-    int num_qo_heads,
-    int num_kv_heads,
-    int head_dim,
-    int kv_dim,
-    float sm_scale,
-    cudaStream_t stream,
-    void* workspace,
-    size_t workspace_bytes)
-{
-    if (batch_size <= 0) return cudaSuccess;
-    int total_q_heads = batch_size * num_qo_heads;
-    int num_splits = choose_decode_num_splits(
-        batch_size, num_qo_heads, head_dim, total_q_heads, workspace_bytes);
-    size_t needed = decode_attention_int8_workspace_bytes(
-        batch_size, num_qo_heads, head_dim, num_splits);
-    if (workspace == nullptr || workspace_bytes < needed) {
-        return cudaErrorInvalidValue;
-    }
-    float* ws_float = reinterpret_cast<float*>(workspace);
-    size_t total_q = (size_t)total_q_heads;
-    float* p_out = ws_float;
-    float* p_m   = ws_float + num_splits * total_q * head_dim;
-    float* p_l   = p_m + num_splits * total_q;
-
-    {
-        dim3 grid(num_splits, total_q_heads);
-        dim3 block(BLOCK_SIZE);
-        if (head_dim == 128) {
-            decode_attention_int4_per_channel_k_partial_kernel<128><<<grid, block, 0, stream>>>(
-                Q, K_data_packed, V_data_packed, K_static_scales, V_scales,
-                kv_indices, K_dynamic_scales, kv_indptr, p_out, p_m, p_l,
-                batch_size, num_qo_heads, num_kv_heads, kv_dim, sm_scale, num_splits);
-        } else if (head_dim == 256) {
-            decode_attention_int4_per_channel_k_partial_kernel<256><<<grid, block, 0, stream>>>(
-                Q, K_data_packed, V_data_packed, K_static_scales, V_scales,
-                kv_indices, K_dynamic_scales, kv_indptr, p_out, p_m, p_l,
-                batch_size, num_qo_heads, num_kv_heads, kv_dim, sm_scale, num_splits);
-        } else {
-            return cudaErrorInvalidValue;
-        }
-    }
-    {
-        dim3 grid(total_q_heads);
-        dim3 block(head_dim);
-        if (head_dim == 128) {
-            decode_attention_merge_kernel<128><<<grid, block, 0, stream>>>(
-                p_out, p_m, p_l, O, total_q_heads, num_splits);
-        } else if (head_dim == 256) {
-            decode_attention_merge_kernel<256><<<grid, block, 0, stream>>>(
-                p_out, p_m, p_l, O, total_q_heads, num_splits);
-        }
-    }
-    return cudaGetLastError();
-}
 
 }  // extern "C"
