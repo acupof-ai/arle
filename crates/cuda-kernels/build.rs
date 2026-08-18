@@ -2971,18 +2971,16 @@ fn main() {
         }
 
         // W4A8 MoE grouped GEMM (SGLang CUTLASS kernel, Apache-2.0): SM90-only.
-        // The SGLang mixed-input extensions require CUTLASS 3.x internals; the
-        // FlashMLA/DeepGEMM vendored CUTLASS is 4.x and incompatible. Use the
-        // standalone CUTLASS 3.x download (pod-build-env.sh sets the path).
+        // Uses the FlashMLA vendored CUTLASS 4.x — SGLang's mixed-input extensions
+        // were written for CUTLASS 4.x; the 3.7.0 backport introduced a TMA
+        // descriptor lifecycle bug (-729 crash on first MoE forward).
         if stem == "w4a8_grouped_gemm" {
-            let cutlass_3x = std::env::var("ARLE_W4A8_CUTLASS_INCLUDE")
-                .unwrap_or_else(|_| "/data00/cutlass-3x/include".to_string());
             nvcc_args.extend([
                 "-std=c++17".to_string(),
                 "--expt-relaxed-constexpr".to_string(),
                 "-Wno-deprecated-declarations".to_string(),
                 format!("-I{}/include", cuda_path),
-                format!("-I{}", cutlass_3x),
+                format!("-I{}", flashmla_root.join("csrc/cutlass/include").display()),
                 "-Icsrc/moe/w4a8".to_string(),
             ]);
         }

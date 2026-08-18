@@ -38,6 +38,7 @@
 #include "cute/numeric/arithmetic_tuple.hpp"
 #include "cutlass/cuda_host_adapter.hpp"
 #include "cutlass/cutlass.h"
+#include "cutlass/detail/collective/mixed_input_utils.hpp"
 #include "cutlass/gemm/dispatch_policy.hpp"
 #include "cutlass/numeric_types.h"
 #include "cutlass/pipeline/pipeline.hpp"
@@ -50,26 +51,6 @@
 
 namespace cutlass::gemm::collective {
 using namespace cute;
-
-/////////////////////////////////////////////////////////////////////////////////////////////////
-
-// Upstream CUTLASS 3.7.0 has MainloopSm90TmaGmmaRmemAWarpSpecializedMixedInput
-// but not the array-of-pointers (grouped) variant. Define it here so the
-// CollectiveMmaArrayMixedInput specialization below has a dispatch policy.
-template <
-    int Stages_,
-    class ClusterShape_ = Shape<_1, _1, _1>,
-    class KernelSchedule = KernelPtrArrayTmaWarpSpecializedCooperative>
-struct MainloopSm90ArrayTmaGmmaWarpSpecializedMixedInput {
-  constexpr static int Stages = Stages_;
-  using ClusterShape = ClusterShape_;
-  using ArchTag = arch::Sm90;
-  using Schedule = KernelSchedule;
-  static_assert(
-    cute::is_base_of_v<KernelPtrArrayTmaWarpSpecializedCooperative, KernelSchedule> ||
-    cute::is_base_of_v<KernelPtrArrayTmaWarpSpecializedPingpong, KernelSchedule>,
-    "KernelSchedule must be one of the Ptr-Array or Grouped Gemm TMA Warp Specialized Cooperative or Pingpong policies");
-};
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -109,7 +90,7 @@ struct CollectiveMmaArrayMixedInput<
     SmemCopyAtomB_,
     TransformB_> {
  public:
-  enum class ConversionMode { DirectConvert, ConvertAndScale, ConvertAndScaleWithZero };
+  using ConversionMode = cutlass::detail::ConversionMode;
 
   //
   // Type Aliases
@@ -121,9 +102,6 @@ struct CollectiveMmaArrayMixedInput<
  private:
   template <class T>
   friend struct detail::MixedGroupedGemmInputUtils;
-  // MixedGroupedGemmInputUtils accesses THIS class's mixed-input members
-  // (SmemLayoutScale, SwappedElementA, ...), not CollectiveMma's. Passing
-  // CollectiveMma here fails to compile in CUTLASS 3.7.0.
   using Utils = detail::MixedGroupedGemmInputUtils<CollectiveMmaArrayMixedInput>;
 
   //
@@ -1495,11 +1473,9 @@ struct CollectiveMmaArrayMixedInput<
   template <class... TMs>
   CUTLASS_DEVICE void
   tensormaps_cp_fence_release(TensorMapStorage& shared_tensormaps, cute::tuple<TMs...> const& input_tensormaps) {
-    // Commit TMA descriptor dims/strides updates so the hardware sees them
-    // before the fence release. SGLang added these (missing in CUTLASS 3.7.0).
     if (cute::elect_one_sync()) {
-      asm volatile("cp.async.bulk.commit_group;");
-      asm volatile("cp.async.bulk.wait_group.read %0;" : : "n"(0) : "memory");
+      cute::tma_desc_commit_group();
+      cute::tma_desc_wait_group();
     }
     // Entire warp must do this (i.e. it's aligned)
     tma_descriptor_cp_fence_release(get<0>(input_tensormaps), shared_tensormaps.smem_tensormap_A);
