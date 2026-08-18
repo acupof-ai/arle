@@ -25,7 +25,6 @@ authority rather than defining a second equal architecture.
 | `cli` | CLI args, REPL commands, terminal UX | Session state, runtime internals |
 | `agent` | Conversation state, tool recovery, request/response contract for agent turns | Concrete backend/runtime implementations |
 | `tools` | Tool schemas and execution wrappers | Prompt formatting, model inference |
-| `agent-bench` | Agent/runtime benchmark harnesses (e.g. `dsv4_kv_precision_parity`) | Product runtime code |
 | `chat` | Shared protocol formatting/parsing, OpenAI chat surface types | Runtime scheduling and backend logic |
 | `infer-plan` | Backend-neutral data IR: `ForwardPlan`, `ForwardMode`, `SamplingParams`, `StepOutput`, the pure host `sample_token`. No behavior, no device. | Any device or backend type |
 | `infer-seam` | Host-only trait seam: `BackendExecutor` (submit/poll core + opt-in capability default-methods: stop ids, row/request caps, prefix reuse, KV page-tier and slot-tier hooks, OPD weight offload) + `KvPool` (`KvQuery`/`KvAllocator`/`KvPrefixStore`) + `KvBatchDescriptor` + `ResourceGovernor` + the backend-neutral `HostPagedKvPool`. No device types. | Concrete kernels, scheduler, model code |
@@ -259,7 +258,7 @@ production-verified).
 
 DSv4 decode is under active kernel optimization on 8×H20 (adopt-best-first):
 gated, license-or-kill on a same-load resident A/B at the B=1 SLO shape, with
-KV-precision parity (`agent-bench::dsv4_kv_precision_parity`) as the
+KV-precision parity as the
 precondition for any default flip. Landed gated: FlashMLA fused sparse decode,
 FP8 fused `wqkv_a`, contiguous active-row MoE layout.
 Prefill at production shapes is in repair (a MoE padded-layout i32 work-size

@@ -2,8 +2,7 @@
 //! rewrite. Every rank runs the identical single-row DSv4 forward; only rank 0's
 //! `clean_tokens` line is the oracle the launcher compares.
 //!
-//! The forward mirrors the R6 Qwen one-prefill-row harness
-//! (`crates/agent-bench` `cuda_qwen3_greedy_parity`) but for DSv4. It builds
+//! The forward mirrors the R6 Qwen one-prefill-row harness but for DSv4. It builds
 //! `CudaExecutor::from_dsv4_fp8_safetensors(path, 1)` and drives
 //! `BackendExecutor::submit` with a single-row `ForwardPlan`:
 //!   1. one **full-prefix prefill** at `start_pos = 0` over the whole prompt →
