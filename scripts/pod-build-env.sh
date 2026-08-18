@@ -39,6 +39,16 @@ if [ -z "${INFER_TILELANG_PYTHON:-}" ]; then
     fi
   done
 fi
+# CUTLASS 3.x for the W4AFP8 MoE kernel: the SGLang mixed-input extensions
+# require CUTLASS 3.x internals (compute_stage_count_or_override_single_affine_
+# transformed_input) that CUTLASS 4.x removed. Downloaded once to NVMe.
+export ARLE_W4A8_CUTLASS_INCLUDE="${ARLE_W4A8_CUTLASS_INCLUDE:-/data00/cutlass-3x/include}"
+if [ ! -f "$ARLE_W4A8_CUTLASS_INCLUDE/cutlass/cutlass.h" ]; then
+  echo "Downloading CUTLASS v3.7.0 headers for W4AFP8 kernel..."
+  mkdir -p /data00/cutlass-3x
+  curl -fsSL https://github.com/NVIDIA/cutlass/archive/refs/tags/v3.7.0.tar.gz \
+    | tar -xz -C /data00/cutlass-3x --strip-components=1 "cutlass-3.7.0/include"
+fi
 # Persistent kernel-artifact cache (keyed on kernel source × SM × nvcc). build.rs
 # regenerates kernels on demand (generated/ gitignored); this cache restores a prior
 # build's identical artifacts instead of re-running TileLang+nvcc. MUST live on /host

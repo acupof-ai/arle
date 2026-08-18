@@ -2179,6 +2179,145 @@ pub unsafe fn dsv4_fp8_grouped_down_decode(
     Ok(())
 }
 
+// --- W4AFP8 (SGLang CUTLASS) MoE kernels ---
+
+/// Per-tensor BF16→FP8 E4M3 quantization (amax reduction + quantize).
+/// `scale` is a single-device-float scratch; the kernel writes the amax-derived
+/// scale then reads it back in the quantize pass.
+pub unsafe fn w4a8_per_tensor_fp8_quant(
+    input: RawDevicePtr<bf16>,
+    output: RawDevicePtr<u8>,
+    scale: RawDevicePtr<f32>,
+    numel: usize,
+    stream: CUstream,
+) -> Result<()> {
+    unsafe {
+        ffi::w4a8_per_tensor_fp8_quant(
+            input.as_ptr() as *const Half,
+            output.as_mut_ptr(),
+            scale.as_mut_ptr(),
+            i32::try_from(numel)?,
+            stream,
+        );
+    }
+    Ok(())
+}
+
+/// Build problem_sizes [E, 3] (M, N, K) from per-expert token counts.
+pub unsafe fn w4a8_compute_problem_sizes(
+    counts: RawDevicePtr<i32>,
+    problem_sizes: RawDevicePtr<i32>,
+    num_experts: usize,
+    n: usize,
+    k: usize,
+    stream: CUstream,
+) -> Result<()> {
+    unsafe {
+        ffi::w4a8_compute_problem_sizes(
+            counts.as_ptr(),
+            problem_sizes.as_mut_ptr(),
+            i32::try_from(num_experts)?,
+            i32::try_from(n)?,
+            i32::try_from(k)?,
+            stream,
+        );
+    }
+    Ok(())
+}
+
+/// Fused clamped SwiGLU on the CUTLASS gate+up output: [rows, 2*i_dim] → [rows, i_dim].
+pub unsafe fn w4a8_swiglu_fused(
+    gateup: RawDevicePtr<bf16>,
+    out: RawDevicePtr<bf16>,
+    rows: usize,
+    i_dim: usize,
+    limit: f32,
+    stream: CUstream,
+) -> Result<()> {
+    unsafe {
+        ffi::w4a8_swiglu_fused(
+            gateup.as_ptr() as *const Half,
+            out.as_mut_ptr() as *mut Half,
+            i32::try_from(rows)?,
+            i32::try_from(i_dim)?,
+            limit,
+            stream,
+        );
+    }
+    Ok(())
+}
+
+/// W4AFP8 grouped GEMM (SGLang CUTLASS kernel, SM90-only). One call per
+/// projection (gate+up fused, then down). Returns 0 on success.
+/// `expert_offsets` is a HOST slice (the CUTLASS kernel reads it host-side to
+/// build per-expert pointer arrays).
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn w4a8_moe_grouped_gemm(
+    d_output: RawDevicePtr<bf16>,
+    a_activations: RawDevicePtr<u8>,
+    b_weights: RawDevicePtr<u8>,
+    a_scale: RawDevicePtr<f32>,
+    b_scales: RawDevicePtr<u8>,
+    expert_offsets: &[i32],
+    problem_sizes: RawDevicePtr<i32>,
+    num_experts: usize,
+    n: usize,
+    k: usize,
+    total_m: usize,
+    topk: usize,
+    workspace: RawDevicePtr<u8>,
+    workspace_bytes: usize,
+    stream: CUstream,
+) -> Result<i32> {
+    let rc = unsafe {
+        ffi::w4a8_moe_grouped_gemm_sm90(
+            d_output.as_mut_ptr() as *mut Half,
+            a_activations.as_ptr(),
+            b_weights.as_ptr(),
+            a_scale.as_ptr(),
+            b_scales.as_ptr() as *const Half,
+            expert_offsets.as_ptr(),
+            problem_sizes.as_ptr(),
+            i32::try_from(num_experts)?,
+            i32::try_from(n)?,
+            i32::try_from(k)?,
+            i32::try_from(total_m)?,
+            i32::try_from(topk)?,
+            workspace.as_mut_ptr(),
+            workspace_bytes,
+            stream,
+        )
+    };
+    Ok(rc)
+}
+
+/// Convert one expert's NVFP4 (E2M1 packed + E8M0 block scales) to W4AFP8
+/// (signed INT4 + BF16 interleaved scales) on GPU. `k` is the logical K
+/// (2× the packed byte count). Output buffers must be sized:
+/// weight `n * k/2` bytes, scales `(k/512) * n * 4 * 2` bytes (BF16).
+pub unsafe fn nvfp4_to_w4afp8(
+    src_weight: RawDevicePtr<i8>,
+    src_scales: RawDevicePtr<u8>,
+    dst_weight: RawDevicePtr<i8>,
+    dst_scales: RawDevicePtr<u8>,
+    n: usize,
+    k: usize,
+    stream: CUstream,
+) -> Result<()> {
+    unsafe {
+        ffi::nvfp4_to_w4afp8(
+            src_weight.as_ptr(),
+            src_scales.as_ptr(),
+            dst_weight.as_mut_ptr(),
+            dst_scales.as_mut_ptr(),
+            i32::try_from(n)?,
+            i32::try_from(k)?,
+            stream,
+        );
+    }
+    Ok(())
+}
+
 // W4A16 (INT4) MoE grouped GEMV — numerical correctness vs a dequantized
 // BF16 reference. GPU-gated: builds the pointer tables, runs
 // `moe_w4a16_grouped_gemv_batch`, dequantizes the same weights to BF16 and

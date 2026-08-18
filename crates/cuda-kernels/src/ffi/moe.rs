@@ -322,4 +322,65 @@ unsafe extern "C" {
         global_expert_idx: i32,
         stream: CUstream,
     ) -> CUresult;
+
+    /// Per-tensor BF16→FP8 E4M3 quantization (amax + quantize, two kernels).
+    pub fn w4a8_per_tensor_fp8_quant(
+        input: *const Half,
+        output: *mut u8,
+        scale: *mut f32,
+        numel: i32,
+        stream: CUstream,
+    );
+
+    /// Build problem_sizes [E, 3] (M, N, K) from per-expert token counts.
+    pub fn w4a8_compute_problem_sizes(
+        counts: *const i32,
+        problem_sizes: *mut i32,
+        num_experts: i32,
+        n: i32,
+        k: i32,
+        stream: CUstream,
+    );
+
+    /// Fused clamped SwiGLU on the CUTLASS gate+up output: [rows, 2*i_dim] → [rows, i_dim].
+    pub fn w4a8_swiglu_fused(
+        gateup: *const Half,
+        out: *mut Half,
+        rows: i32,
+        i_dim: i32,
+        limit: f32,
+        stream: CUstream,
+    );
+
+    /// W4A8 MoE grouped GEMM (SGLang CUTLASS kernel, SM90-only).
+    /// One call per projection (gate+up fused, then down).
+    /// Returns 0 on success, negative on error.
+    pub fn w4a8_moe_grouped_gemm_sm90(
+        d_output: *mut Half,
+        a_activations: *const u8,
+        b_weights: *const u8,
+        a_scale: *const f32,
+        b_scales: *const Half,
+        expert_offsets: *const i32,
+        problem_sizes: *const i32,
+        num_experts: i32,
+        n: i32,
+        k: i32,
+        total_m: i32,
+        topk: i32,
+        workspace: *mut u8,
+        workspace_bytes: usize,
+        stream: CUstream,
+    ) -> i32;
+
+    /// NVFP4 (E2M1+E8M0) → W4AFP8 (INT4+BF16) load-time conversion, one expert.
+    pub fn nvfp4_to_w4afp8(
+        src_weight: *const i8,
+        src_scales: *const u8,
+        dst_weight: *mut i8,
+        dst_scales: *mut u8,
+        n: i32,
+        k: i32,
+        stream: CUstream,
+    ) -> CUresult;
 }
