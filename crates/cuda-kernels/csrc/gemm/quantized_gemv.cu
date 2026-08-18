@@ -363,18 +363,71 @@ __device__ __forceinline__ float dot16_with_decoded(
         + wf3.w * __bfloat162float(xb1[7]);
 }
 
-__device__ __forceinline__ float fp4_e2m1_group_scale(
+// One row's FP4 x BF16 dot product for this thread's strided slice of K.
+// uint4 loads move 16 B (32 weights) per transaction; the byte-at-a-time form
+// this replaced fetched a 128 B cacheline per 1 B used. Shared by the dense and
+// the two grouped (MoE) FP4 GEMV kernels.
+__device__ __forceinline__ float fp4_e2m1_row_dot(
+    const uint8_t* __restrict__ weight_row,
     const uint8_t* __restrict__ scales,
-    const float* __restrict__ global_scales,
-    int row,
-    int col,
-    int scale_cols,
-    int group_size)
+    const __nv_bfloat16* __restrict__ x,
+    float g_scale,
+    int scale_base,
+    int max_group,
+    int K,
+    int group_size,
+    int tid_in_row,
+    int threads_per_row)
 {
-    const int group_raw = col / group_size;
-    const int group = group_raw < scale_cols ? group_raw : (scale_cols - 1);
-    return dsv4_decode_fp8_e4m3(scales[row * scale_cols + group]) * global_scales[0];
+    const int bytes_per_row = K / 2;
+    float sum = 0.0f;
+
+    const int vec_k_span = 32;
+    const int k_vec_end = (K / vec_k_span) * vec_k_span;
+    const bool vec_ok = (bytes_per_row & 15) == 0;
+    if (vec_ok) {
+        for (int k = tid_in_row * vec_k_span; k < k_vec_end;
+             k += threads_per_row * vec_k_span) {
+            const uint4 packed = __ldg(reinterpret_cast<const uint4*>(weight_row + (k >> 1)));
+            const uint32_t words[4] = {packed.x, packed.y, packed.z, packed.w};
+
+            #pragma unroll
+            for (int w = 0; w < 4; w++) {
+                const uint32_t p = words[w];
+                const int kk = k + w * 8;
+                int g = kk / group_size;
+                if (g > max_group) g = max_group;
+                const float s = dsv4_decode_fp8_e4m3(__ldg(&scales[scale_base + g])) * g_scale;
+
+                const uint4 xv = __ldg(reinterpret_cast<const uint4*>(&x[kk]));
+                const __nv_bfloat16* xb = reinterpret_cast<const __nv_bfloat16*>(&xv);
+
+                #pragma unroll
+                for (int b = 0; b < 4; b++) {
+                    const uint32_t byte = (p >> (b * 8)) & 0xffu;
+                    sum += dsv4_decode_fp4_e2m1(byte & 0x0f) * s
+                        * __bfloat162float(xb[b * 2]);
+                    sum += dsv4_decode_fp4_e2m1(byte >> 4) * s
+                        * __bfloat162float(xb[b * 2 + 1]);
+                }
+            }
+        }
+    }
+
+    const int tail_pair_start = vec_ok ? (k_vec_end >> 1) : 0;
+    for (int pair = tail_pair_start + tid_in_row; pair < bytes_per_row;
+         pair += threads_per_row) {
+        const int k0 = pair << 1;
+        const uint8_t packed = __ldg(&weight_row[pair]);
+        int g = k0 / group_size;
+        if (g > max_group) g = max_group;
+        const float s = dsv4_decode_fp8_e4m3(__ldg(&scales[scale_base + g])) * g_scale;
+        sum += dsv4_decode_fp4_e2m1(packed & 0x0f) * s * __bfloat162float(x[k0]);
+        sum += dsv4_decode_fp4_e2m1(packed >> 4) * s * __bfloat162float(x[k0 + 1]);
+    }
+    return sum;
 }
+
 
 // Single-output batch GEMV (grid.y = B, one column per block): fp8 weights,
 // bf16 acts, `ScaleFn` picks the DSv4 e8m0 or the f32-block scale (#144 merged
@@ -739,6 +792,10 @@ __global__ void dsv4_fp4_gemv_batch_tiled_kernel(
     }
 }
 
+// NVFP4 GEMV. Each thread reads 16 B (uint4) = 32 packed FP4 weights per
+// iteration; the byte-at-a-time form issued 16x the memory transactions for the
+// same bytes and ran at ~1% of HBM bandwidth. K % 32 tails fall to the scalar
+// loop below.
 __global__ void fp4_e2m1_group_gemv_batch_kernel(
     const uint8_t* __restrict__ weight,
     const uint8_t* __restrict__ scales,
@@ -759,22 +816,11 @@ __global__ void fp4_e2m1_group_gemv_batch_kernel(
     int row_in_block = threadIdx.x / threads_per_row;
     if (row >= N || batch_idx >= B) return;
 
-    const int bytes_per_row = K / 2;
     const __nv_bfloat16* x = input + batch_idx * K;
-    float sum = 0.0f;
-    for (int pair = tid_in_row; pair < bytes_per_row; pair += threads_per_row) {
-        const int k0 = pair << 1;
-        const int k1 = k0 + 1;
-        const uint8_t packed = weight[row * bytes_per_row + pair];
-        const uint8_t lo = packed & 0x0f;
-        const uint8_t hi = (packed >> 4) & 0x0f;
-        const float w0 = dsv4_decode_fp4_e2m1(lo)
-            * fp4_e2m1_group_scale(scales, global_scales, row, k0, scale_cols, group_size);
-        const float w1 = dsv4_decode_fp4_e2m1(hi)
-            * fp4_e2m1_group_scale(scales, global_scales, row, k1, scale_cols, group_size);
-        sum += w0 * __bfloat162float(x[k0]);
-        sum += w1 * __bfloat162float(x[k1]);
-    }
+    const uint8_t* weight_row = weight + (int64_t)row * (K / 2);
+    float sum = fp4_e2m1_row_dot(
+        weight_row, scales, x, global_scales[0], row * scale_cols, scale_cols - 1,
+        K, group_size, tid_in_row, threads_per_row);
 
     sum = warp_reduce_sum(sum);
     __shared__ float smem[GEMV_ROWS * 8];
@@ -941,21 +987,9 @@ __global__ void fp4_e2m1_grouped_gemv_batch_kernel(
     const auto* global_scales = reinterpret_cast<const float*>(global_ptrs[expert_idx]);
     const int route = offsets[compact_expert_idx] + batch_idx;
     const __nv_bfloat16* x = input + route * K;
-    const int bytes_per_row = K / 2;
-    float sum = 0.0f;
-    for (int pair = tid_in_row; pair < bytes_per_row; pair += threads_per_row) {
-        const int k0 = pair << 1;
-        const int k1 = k0 + 1;
-        const uint8_t packed = weight[row * bytes_per_row + pair];
-        const uint8_t lo = packed & 0x0f;
-        const uint8_t hi = (packed >> 4) & 0x0f;
-        const float w0 = dsv4_decode_fp4_e2m1(lo)
-            * fp4_e2m1_group_scale(scales, global_scales, row, k0, scale_cols, group_size);
-        const float w1 = dsv4_decode_fp4_e2m1(hi)
-            * fp4_e2m1_group_scale(scales, global_scales, row, k1, scale_cols, group_size);
-        sum += w0 * __bfloat162float(x[k0]);
-        sum += w1 * __bfloat162float(x[k1]);
-    }
+    float sum = fp4_e2m1_row_dot(
+        weight + (int64_t)row * (K / 2), scales, x, global_scales[0],
+        row * scale_cols, scale_cols - 1, K, group_size, tid_in_row, threads_per_row);
 
     sum = warp_reduce_sum(sum);
     __shared__ float smem[GEMV_ROWS * 8];
@@ -1008,29 +1042,17 @@ __global__ void fp4_e2m1_grouped_gemv_pair_batch_kernel(
     const auto* global_b = reinterpret_cast<const float*>(global_b_ptrs[expert_idx]);
     const int route = offsets[compact_expert_idx] + batch_idx;
     const __nv_bfloat16* x = input + route * K;
-    const int bytes_per_row = K / 2;
-    float sum_a = 0.0f;
-    float sum_b = 0.0f;
-    for (int pair = tid_in_row; pair < bytes_per_row; pair += threads_per_row) {
-        const int k0 = pair << 1;
-        const int k1 = k0 + 1;
-        const uint8_t packed_a = weight_a[row * bytes_per_row + pair];
-        const uint8_t packed_b = weight_b[row * bytes_per_row + pair];
-        const uint8_t lo_a = packed_a & 0x0f;
-        const uint8_t hi_a = (packed_a >> 4) & 0x0f;
-        const uint8_t lo_b = packed_b & 0x0f;
-        const uint8_t hi_b = (packed_b >> 4) & 0x0f;
-        const float xv0 = __bfloat162float(x[k0]);
-        const float xv1 = __bfloat162float(x[k1]);
-        const float scale_a0 = fp4_e2m1_group_scale(scales_a, global_a, row, k0, scale_cols, group_size);
-        const float scale_a1 = fp4_e2m1_group_scale(scales_a, global_a, row, k1, scale_cols, group_size);
-        const float scale_b0 = fp4_e2m1_group_scale(scales_b, global_b, row, k0, scale_cols, group_size);
-        const float scale_b1 = fp4_e2m1_group_scale(scales_b, global_b, row, k1, scale_cols, group_size);
-        sum_a += dsv4_decode_fp4_e2m1(lo_a) * scale_a0 * xv0;
-        sum_a += dsv4_decode_fp4_e2m1(hi_a) * scale_a1 * xv1;
-        sum_b += dsv4_decode_fp4_e2m1(lo_b) * scale_b0 * xv0;
-        sum_b += dsv4_decode_fp4_e2m1(hi_b) * scale_b1 * xv1;
-    }
+    const int64_t row_off = (int64_t)row * (K / 2);
+    const int scale_base = row * scale_cols;
+    const int max_group = scale_cols - 1;
+    // x is re-read for the b half; it is K*2 B against the row's K/2 B of
+    // weights and stays hot in L1 across the two calls.
+    float sum_a = fp4_e2m1_row_dot(weight_a + row_off, scales_a, x, global_a[0],
+                                   scale_base, max_group, K, group_size,
+                                   tid_in_row, threads_per_row);
+    float sum_b = fp4_e2m1_row_dot(weight_b + row_off, scales_b, x, global_b[0],
+                                   scale_base, max_group, K, group_size,
+                                   tid_in_row, threads_per_row);
 
     sum_a = warp_reduce_sum(sum_a);
     sum_b = warp_reduce_sum(sum_b);
