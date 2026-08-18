@@ -256,30 +256,6 @@ pub(super) fn validate_gkd_loss_config(config: GkdLossConfig<'_>) -> Result<()> 
                 .to_owned(),
         ));
     }
-    if let Some(teacher_topk) = config.teacher_topk {
-        if teacher_topk == 0 {
-            return Err(OpdError::InvalidInput(
-                "OPD teacher top-k must be > 0 when set. Hint: omit \
-                 --teacher-topk to keep the dense full-vocab teacher path, or \
-                 pass a positive k after Piece A engine-side top-k is available."
-                    .to_owned(),
-            ));
-        }
-        if config.kl_direction != KlDirection::Forward {
-            return Err(OpdError::InvalidInput(
-                "OPD teacher top-k is forward-KL only. Hint: omit \
-                 --teacher-topk for reverse KL, or use --kl-direction forward."
-                    .to_owned(),
-            ));
-        }
-        if config.kl_beta.is_some() {
-            return Err(OpdError::InvalidInput(
-                "OPD teacher top-k does not support generalized JSD beta. Hint: \
-                 omit --kl-beta for sparse forward-KL teacher targets."
-                    .to_owned(),
-            ));
-        }
-    }
     if config.logits_window_size == Some(0) {
         return Err(OpdError::InvalidInput(
             "OPD logits window size must be > 0 when set. Hint: pass \

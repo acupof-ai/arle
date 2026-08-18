@@ -420,13 +420,6 @@ pub fn opd_step_with_teacher<O: Optimizer, T: TeacherForward + ?Sized>(
     );
     validate_step_config(&cfg)?;
     validate_gkd_loss_config(gkd_config)?;
-    if let Some(teacher_topk) = gkd_config.teacher_topk {
-        return Err(OpdError::InvalidInput(format!(
-            "OPD teacher_topk={teacher_topk} requires Piece A engine-side \
-             top-k teacher targets on H20/CUDA. Local Piece C only wires the \
-             config gate; omit --teacher-topk to keep the dense full-vocab path."
-        )));
-    }
     let vocab = student.config().vocab_size;
     if prompt_ids.is_empty() {
         return Err(OpdError::InvalidInput(

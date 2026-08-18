@@ -362,19 +362,6 @@ pub(super) fn rollout_sampling_params(
     }
 }
 
-/// Reject advertised-but-unimplemented distillation objectives before any
-/// model/store is loaded, so a no-op flag fails fast instead of silently
-/// running a different objective mid-training.
-pub(super) fn reject_unimplemented_gkd_objectives(teacher_topk: Option<usize>) -> Result<()> {
-    if teacher_topk.is_some() {
-        bail!(
-            "--teacher-topk requires an engine-side top-k teacher-logprob producer (H20 Piece A) \
-             that is not wired. Omit the flag to run dense KL."
-        );
-    }
-    Ok(())
-}
-
 pub(super) fn validate_train_opd_gkd_args(
     gkd_lambda: f32,
     sft_anchor: OpdSftAnchorArg,

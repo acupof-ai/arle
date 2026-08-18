@@ -197,7 +197,6 @@ pub struct GkdLossConfig<'a> {
     pub kl_direction: KlDirection,
     pub kl_temperature: f32,
     pub kl_beta: Option<f32>,
-    pub teacher_topk: Option<usize>,
     pub fused_distill: bool,
     pub logits_window_size: Option<usize>,
     pub kl_mask: OpdKlMask,
@@ -213,7 +212,6 @@ impl Default for GkdLossConfig<'_> {
             kl_direction: KlDirection::Forward,
             kl_temperature: 1.0,
             kl_beta: None,
-            teacher_topk: None,
             // Dense logits+KL by default: fused lm_head+loss ran lm_head on
             // HOST (~205 s/step for 27B, GPU idle) vs ~3.9 s GPU-bound dense.
             // Opt into fused only for windows too large to materialize

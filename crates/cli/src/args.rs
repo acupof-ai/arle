@@ -1759,10 +1759,6 @@ pub(crate) struct TrainOpdArgs {
     #[arg(long, value_parser = parse_unit_interval)]
     pub(crate) kl_beta: Option<f32>,
 
-    /// Sparse teacher target top-k. Requires H20 Piece A engine-side top-k.
-    #[arg(long, value_parser = parse_positive_usize)]
-    pub(crate) teacher_topk: Option<usize>,
-
     /// Opt in to the fused lm_head+loss path (computes full-vocab logits + KD loss
     /// in one op to save the [window, vocab] tensor). DEFAULT IS DENSE: on H20 the
     /// fused path ran the lm_head on the HOST (~205 s/step for the 27B, GPU idle)
@@ -1948,10 +1944,6 @@ pub(crate) struct TrainSelfOpdArgs {
     /// Generalized JSD beta in [0,1]. Unset keeps --kl-direction.
     #[arg(long, value_parser = parse_unit_interval)]
     pub(crate) kl_beta: Option<f32>,
-
-    /// Sparse teacher target top-k. Requires H20 Piece A engine-side top-k.
-    #[arg(long, value_parser = parse_positive_usize)]
-    pub(crate) teacher_topk: Option<usize>,
 
     /// Opt in to the fused lm_head+loss path (computes full-vocab logits + KD loss
     /// in one op to save the [window, vocab] tensor). DEFAULT IS DENSE: on H20 the
