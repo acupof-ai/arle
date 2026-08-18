@@ -1078,6 +1078,13 @@ impl Qwen35CudaExecutor {
             "--kv-recall is not supported with --spec-type dspark (the verify \
              forward would race the recall eviction cycle)"
         );
+        // 1D CP (attn_cp>1, attn_tp==1): the pool is fully replicated, so
+        // rank-local recall scoring/eviction would diverge the replicas.
+        ensure!(
+            !(enabled && self.model.tp.attn_cp_size() > 1 && !self.two_d_engaged()),
+            "--kv-recall is not supported with attn_cp>1 without 2D parallelism \
+             (replicated pool diverges under rank-local recall)"
+        );
         self.kv_recall = enabled;
         if enabled {
             let shard = infer_seam::ShardSpec::new(
@@ -2329,49 +2336,21 @@ impl Qwen35CudaExecutor {
         };
         let meta = {
             let pool = self.full_attn_kv.as_ref().expect("full_attn_kv");
-            let mut meta = crate::loader::PageMeta::for_recall_decode(
+            let shard = infer_seam::ShardSpec::new(
+                self.model.tp.attn_cp_rank(),
+                self.model.tp.attn_cp_size(),
+            );
+            crate::loader::PageMeta::for_recall_decode(
                 &self.model.ctx,
                 pool,
                 cache_len,
                 &recall_pages,
-            )?;
-            if two_d {
-                let cp_rank = self.model.tp.attn_cp_rank();
-                let cp_size = self.model.tp.attn_cp_size();
-                let global_pages = cache_len.div_ceil(pool.page_size);
-                let owns_last = cp_size <= 1 || (global_pages - 1) % cp_size == cp_rank;
-                meta.write_kv = i32::from(owns_last);
-                // for_recall_decode assumes the last page is the global last
-                // page; under CP a non-owner shard's working-set tail is a
-                // full page.
-                let overshoot = global_pages * pool.page_size - cache_len;
-                let local_last_fill = if owns_last {
-                    pool.page_size - overshoot
-                } else {
-                    pool.page_size
-                };
-                self.model.ctx.stream.memcpy_htod(
-                    &[local_last_fill as i32],
-                    &mut meta.kv_last_page_len.slice_mut(0..1),
-                )?;
-                // FA3 sizes the kernel from seqlen_k (max_kv_len); the recall
-                // table holds only this shard's working-set pages, so the lens
-                // must count those — not the global sequence length.
-                let local_token_count = recall_pages.len().saturating_sub(1) * pool.page_size
-                    + if recall_pages.is_empty() {
-                        0
-                    } else {
-                        local_last_fill
-                    };
-                self.model.ctx.stream.memcpy_htod(
-                    &[local_token_count as i32],
-                    &mut meta.kv_lens_dev.slice_mut(0..1),
-                )?;
-                meta.kv_lens = vec![local_token_count];
-            }
-            meta
+                shard,
+            )?
         };
-        let cp_decode = if two_d && self.dspark.is_none() {
+        // dspark is rejected at set_kv_recall time, so the is_none guard is
+        // redundant here.
+        let cp_decode = if two_d {
             self.model.cp_decode_handle()
         } else {
             None

@@ -150,7 +150,6 @@ mod cuda_impl {
             let k0 = pool.k_data_slice(0);
             let page_elems = num_kv_heads * page_size * head_dim;
             let page_bytes = page_elems * 2;
-            let l_bs_f = cfg.l_bs as f32;
 
             for block in self.block_reps.len()..frozen_blocks {
                 let base = cfg.n_init + block * cfg.l_bs;
@@ -195,13 +194,14 @@ mod cuda_impl {
                     }
                     local_tokens += 1;
                 }
-                let divisor = if self.shard.size > 1 {
-                    local_tokens as f32
-                } else {
-                    l_bs_f
-                };
-                for v in &mut rep {
-                    *v /= divisor;
+                // A block with zero local pages (cp_size >= 4, l_bs < cp * page_size)
+                // has no rep on this shard; push zeros to keep block_reps aligned.
+                // Scoring masks it to -inf below.
+                if local_tokens > 0 {
+                    let divisor = local_tokens as f32;
+                    for v in &mut rep {
+                        *v /= divisor;
+                    }
                 }
                 self.block_reps.push(rep);
             }
@@ -264,16 +264,20 @@ mod cuda_impl {
             let mut scores = vec![0.0_f32; nb];
             for (i, rep) in self.block_reps.iter().enumerate() {
                 let base = cfg.n_init + i * cfg.l_bs;
-                let resident = (base..base + cfg.l_bs)
+                let local_pages = (base..base + cfg.l_bs)
                     .filter_map(|pos| self.shard.local_index(pos / page_size))
-                    .all(|li| table.get(li).copied() != Some(EVICTED_PAGE));
+                    .count();
+                let resident = local_pages > 0
+                    && (base..base + cfg.l_bs)
+                        .filter_map(|pos| self.shard.local_index(pos / page_size))
+                        .all(|li| table.get(li).copied() != Some(EVICTED_PAGE));
                 // Without an L3 tier (dense arm, `allow_prefetch=false`) a block
                 // whose pages were evict-dropped cannot be re-attended mid-decode,
                 // so mask it to `-inf` (only resident blocks compete). With the L3
                 // recall tier (`allow_prefetch=true`) an evicted block IS scorable
                 // via its resident rep and will be prefetched back if it ranks
                 // top-k — the re-recall coverage win.
-                scores[i] = if resident || allow_prefetch {
+                scores[i] = if local_pages > 0 && (resident || allow_prefetch) {
                     let n = rep.len().min(q.len());
                     let mut acc = 0.0_f32;
                     for k in 0..n {

@@ -19,6 +19,7 @@ use cuda_kernels::prelude::{DeviceContext, DeviceMatrix, DeviceVec, PagedKVPool}
 use cuda_kernels::tensor::{HostMatrixSnapshot, WeightFormat};
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 use deepseek_spec::Shard;
+use infer_seam::ShardSpec;
 use infer_topo::{ShardingSpec, TpConfig};
 use qwen3_spec::Qwen3Config;
 use safetensors::{SafeTensors, tensor::Dtype};
@@ -790,6 +791,7 @@ impl PageMeta {
         pool: &PagedKVPool,
         total_len: usize,
         recall_pages: &[u32],
+        shard: ShardSpec,
     ) -> Result<Self> {
         ensure!(
             pool.format == KVFormat::BF16,
@@ -801,18 +803,32 @@ impl PageMeta {
             "recall decode page table needs at least one selected page"
         );
         let num_pages = recall_pages.len();
-        let last_page_len = total_len % pool.page_size;
-        let last_page_len = if last_page_len == 0 {
-            pool.page_size
-        } else {
-            last_page_len
-        };
         let page_ids = recall_pages.iter().map(|&p| p as i32).collect::<Vec<_>>();
+        // Under 2D CP the recall table holds only this shard's working-set
+        // pages; the lens and write flag must count the local shard, not the
+        // global sequence (FA3 sizes from seqlen_k; the combine kernel
+        // reads the local table).
+        let global_pages = total_len.div_ceil(pool.page_size);
+        let owns_last = shard.size <= 1 || shard.owns_page(global_pages - 1);
+        let overshoot = global_pages * pool.page_size - total_len;
+        let local_last_fill = if owns_last {
+            pool.page_size - overshoot
+        } else {
+            pool.page_size
+        };
+        let local_token_count = num_pages.saturating_sub(1) * pool.page_size
+            + if num_pages == 0 { 0 } else { local_last_fill };
+        let (kv_lens, last_page_len, write_kv) = if shard.size > 1 {
+            (local_token_count, local_last_fill, i32::from(owns_last))
+        } else {
+            let g = total_len % pool.page_size;
+            (total_len, if g == 0 { pool.page_size } else { g }, 1)
+        };
         Ok(Self {
             q_indptr: upload_i32(ctx, &[0, 1])?,
             kv_indptr: upload_i32(ctx, &[0, num_pages as i32])?,
             kv_indices: upload_i32(ctx, &page_ids)?,
-            kv_lens_dev: upload_i32(ctx, &[total_len as i32])?,
+            kv_lens_dev: upload_i32(ctx, &[kv_lens as i32])?,
             page_table_rect: upload_i32(ctx, &page_ids)?,
             page_table_stride: num_pages,
             kv_last_page_len: upload_i32(ctx, &[last_page_len as i32])?,
@@ -821,7 +837,7 @@ impl PageMeta {
             positions: upload_i32(ctx, &[(total_len - 1) as i32])?,
             q_offsets: vec![0, 1],
             page_offsets: vec![0, num_pages],
-            kv_lens: vec![total_len],
+            kv_lens: vec![kv_lens],
             seq_len: 1,
             total_q: 1,
             num_pages,
@@ -831,7 +847,7 @@ impl PageMeta {
             prefix_token_rows: None,
             quant_decode_meta: None,
             seqlen_k_capture: None,
-            write_kv: 1,
+            write_kv,
         })
     }
 
