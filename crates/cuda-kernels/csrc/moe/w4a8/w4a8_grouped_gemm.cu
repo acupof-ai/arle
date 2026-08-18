@@ -166,9 +166,11 @@ int run_grouped_gemm(
     }
   }
 
+  // Device layout must match the pointer reinterpretation below:
+  // b_ptrs, a_ptrs, out_ptrs, (skip a_scales), b_scales_ptrs, strides.
   size_t off = 0;
-  cudaMemcpyAsync(meta_d + off, h_a_ptrs, num_exp * 8, cudaMemcpyHostToDevice, stream); off += num_exp * 8;
   cudaMemcpyAsync(meta_d + off, h_b_ptrs, num_exp * 8, cudaMemcpyHostToDevice, stream); off += num_exp * 8;
+  cudaMemcpyAsync(meta_d + off, h_a_ptrs, num_exp * 8, cudaMemcpyHostToDevice, stream); off += num_exp * 8;
   cudaMemcpyAsync(meta_d + off, h_out_ptrs, num_exp * 8, cudaMemcpyHostToDevice, stream); off += num_exp * 8;
   // a_scales is a scalar — no pointer array needed; alpha_ptr points directly to it.
   off += num_exp * 8;  // skip a_scales_ptrs slot (unused)
@@ -185,8 +187,10 @@ int run_grouped_gemm(
   auto* d_s_strides = reinterpret_cast<typename Gemm::StrideS*>(meta_d + 5 * num_exp * 8 + 3 * num_exp * 24);
 
   cutlass::KernelHardwareInfo hw_info;
-  hw_info.device_id = 0;
-  hw_info.sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(0);
+  int dev = 0;
+  cudaGetDevice(&dev);
+  hw_info.device_id = dev;
+  hw_info.sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(dev);
 
   decltype(std::declval<Args>().epilogue.thread) fusion_args{};
   fusion_args.alpha = 0;
