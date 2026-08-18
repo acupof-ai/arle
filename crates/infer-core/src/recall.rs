@@ -80,6 +80,15 @@ pub fn plan_recall(cache_len: usize, block_scores: &[f32], cfg: &RecallConfig) -
         "plan_recall needs a score per middle block ({nb}), got {}",
         block_scores.len()
     );
+    // A dead scorer is indistinguishable from a working one downstream: all-equal
+    // scores fall through the tie-break to blocks 0..top_k and still produce a
+    // plausible plan. Say so rather than silently keeping the prompt's head.
+    if block_scores
+        .get(..nb)
+        .is_some_and(|s| s.iter().all(|v| *v == s[0]))
+    {
+        log::warn!("plan_recall: zero-variance scores over {nb} blocks — the scorer is dead");
+    }
     let mut idx: Vec<usize> = (0..nb).collect();
     idx.sort_by(|&a, &b| {
         let sa = block_scores.get(a).copied().unwrap_or(f32::NEG_INFINITY);

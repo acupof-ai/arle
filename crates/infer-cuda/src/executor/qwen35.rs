@@ -2170,6 +2170,11 @@ impl Qwen35CudaExecutor {
     ) -> Result<(u32, Option<f32>)> {
         let slot = row.slot;
         let cfg = self.recall_cfg;
+        // The cycle runs at the tail of the LAST row only. Evicting on an earlier
+        // chunk leaves EVICTED_PAGE sentinels in the page table that the next
+        // chunk's prefill must still attend through — degenerate logits above the
+        // chunk size. Under 2D the planner already emits one row per prompt.
+        let final_row = row.start_pos + row.tokens.len() >= row.total_tokens;
         self.mirror_host_slot(host_kv, slot, row.start_pos + row.tokens.len())?;
         let (meta, cp) = self.build_prefill_geometry(row)?;
         // `rc` carries back the layer-0 query used for scoring below.
@@ -2185,7 +2190,7 @@ impl Qwen35CudaExecutor {
             let mut rc = crate::qwen35::Qwen35RecallForward {
                 pool,
                 meta: &meta,
-                layer0_query: Some(Vec::new()),
+                layer0_query: final_row.then(Vec::new),
                 cp,
                 cp_decode: None,
             };
@@ -2199,7 +2204,10 @@ impl Qwen35CudaExecutor {
                 penalty_of(&row.penalty_history, row.penalty_prompt_len),
                 &mut rc,
             )?;
-            (token, rc.layer0_query.expect("opted in above"))
+            (token, rc.layer0_query)
+        };
+        let Some(layer0_query) = layer0_query else {
+            return Ok(token); // non-final chunk: plain paged prefill, no cycle
         };
 
         let cache_len = row.start_pos + row.tokens.len();
