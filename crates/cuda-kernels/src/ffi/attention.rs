@@ -95,27 +95,7 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    /// Sliding-window ring variant of [`nonpaged_prefill_attention_cuda`]:
-    /// physical row = `(ring_base + logical) % ring_modulus` (== per-head stride
-    /// == window+block). Pass the K/V base at the head-0 origin (no pre-offset),
-    /// `ring_base` = absolute position of logical key 0 (= lo), `seq_len` = 1.
-    pub fn nonpaged_prefill_attention_ring_cuda(
-        q: *const Half,
-        k_cache: *const Half,
-        v_cache: *const Half,
-        out: *mut Half,
-        num_q_heads: i32,
-        num_kv_heads: i32,
-        head_dim: i32,
-        seq_len: i32,
-        kv_len: i32,
-        ring_base: i32,
-        ring_modulus: i32,
-        sm_scale: f32,
-        stream: CUstream,
-    ) -> CUresult;
-
-    /// Ragged-window ring variant of [`nonpaged_prefill_attention_ring_cuda`]:
+    /// Ragged-window ring variant of [`nonpaged_prefill_attention_cuda`]:
     /// one launch for `seq_len` rows with per-row key ranges. `ring_base_dev[t]`
     /// / `kv_len_dev[t]` (device i32, `seq_len` each) are row t's window
     /// `[base, base+len)`, walked non-causally. Ranges are device-resident, so
@@ -593,30 +573,6 @@ unsafe extern "C" {
         workspace_bytes: usize,
     ) -> CUresult;
 
-    /// INT4 KIVI two-level K decode attention. K dequant uses
-    /// `static[kv_head, dim] * dynamic[row, kv_head]` (per-channel × per-
-    /// (token, kv_head)). V uses per-(row, kv_head) scale.
-    pub fn decode_attention_int4_per_channel_k_cuda(
-        q: *const Half,
-        k_data_packed: *const u8,
-        v_data_packed: *const u8,
-        k_static_scales: *const f32,
-        k_dynamic_scales: *const f32,
-        v_scales: *const f32,
-        kv_indices: *const i32,
-        kv_indptr: *const i32,
-        o: *mut Half,
-        batch_size: i32,
-        num_qo_heads: i32,
-        num_kv_heads: i32,
-        head_dim: i32,
-        kv_dim: i32,
-        sm_scale: f32,
-        stream: CUstream,
-        workspace: *mut u8,
-        workspace_bytes: usize,
-    ) -> CUresult;
-
     /// Variable-length Q + paged FP8 E4M3 KV attention.
     ///
     /// Mirrors the TileLang TC decode shape but reads FP8 KV directly (no bf16
@@ -832,17 +788,6 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    pub fn arle_dsv4_fp8_kv_fill_sw_slots_from_start_pos_cuda(
-        token_block_id: *mut i32,
-        token_in_block_row: *mut i32,
-        start_pos: *const i32,
-        slot_layer_block_offsets: *const i32,
-        n_tokens: i32,
-        sliding_window: i32,
-        page_block_size: i32,
-        stream: CUstream,
-    ) -> CUresult;
-
     pub fn arle_dsv4_fp8_kv_pack_completed_compressor_row_start_pos_cuda(
         compressed: *const Half,
         packed_kv: *mut u8,
@@ -911,40 +856,6 @@ unsafe extern "C" {
 //
 // Phase D-4 step 1 of the FlashMLA decode integration.
 unsafe extern "C" {
-    /// Build the unified decode indices row (`s_q=1`).
-    ///
-    /// - `indices`: out, `int32 [topk_unified]` where
-    ///   `topk_unified = sliding_window + max_compressed_keys` (must be %128 == 0).
-    /// - `selected`: `int32 [max_compressed_keys]` for CSA (mode_int=1),
-    ///   nullptr for HCA (mode_int=2).
-    /// - `sw_blocks`: SW sub-pool block count
-    ///   (`ceil(sliding_window / page_block_size)`).
-    /// - `start_pos`: absolute position of the decode token.
-    /// - `max_compressed_keys`: `index_topk` (CSA) or padded
-    ///   `compressed_count` (HCA).
-    /// - `compress_ratio`: causality-gate ratio for compressed selections.
-    /// - `mode_int`: 1 = CSA, 2 = HCA.
-    /// - `page_block_size`: 64 for DSv4-Flash MODEL1.
-    /// - `page_table`/`num_logical_pages`: OPTIONAL Stage-B logical→physical page
-    ///   table (`null`/0 = Stage-A slot-relative path, unchanged). When set, each
-    ///   emitted index's logical page is routed to physical, yielding POOL-absolute
-    ///   indices (an identity table reproduces the Stage-A index for-for-index).
-    pub fn arle_dsv4_flashmla_decode_build_indices_cuda(
-        indices: *mut i32,
-        selected: *const i32,
-        sw_blocks: i32,
-        sliding_window: i32,
-        start_pos: i32,
-        max_compressed_keys: i32,
-        compress_ratio: i32,
-        mode_int: i32,
-        page_block_size: i32,
-        page_table: *const i32,
-        num_logical_pages: i32,
-        total_blocks: i32,
-        stream: CUstream,
-    ) -> CUresult;
-
     /// Build the unified decode indices row using a device-resident
     /// `start_pos` scalar. This keeps the kernel replay-safe for CUDA graph
     /// decode once ARLE stamps per-step scalars into graph-visible device

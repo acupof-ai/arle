@@ -199,56 +199,6 @@ extern "C" cudaError_t nonpaged_prefill_attention_cuda(
   return cudaGetLastError();
 }
 
-// Sliding-window ring variant: physical key/value row = (ring_base + logical) %
-// ring_modulus (ring_modulus == the per-head stride == window+block). Used by
-// DSpark sliding draft layers whose ctx cache is an absolute-position ring; the
-// caller passes the base K/V pointer at the head-0 origin (no pre-offset),
-// `ring_base` = the absolute position of logical key 0 (= lo), `kv_len` = the
-// non-causal key count. seq_len is 1 (per-row non-causal launch).
-extern "C" cudaError_t nonpaged_prefill_attention_ring_cuda(
-    const uint16_t *q,
-    const uint16_t *k_cache,
-    const uint16_t *v_cache,
-    uint16_t *out,
-    int num_q_heads,
-    int num_kv_heads,
-    int head_dim,
-    int seq_len,
-    int kv_len,
-    int ring_base,
-    int ring_modulus,
-    float sm_scale,
-    cudaStream_t stream) {
-  if (num_q_heads <= 0 || num_kv_heads <= 0 || seq_len < 0 || kv_len < seq_len ||
-      ring_modulus <= 0 || kv_len > ring_modulus || (head_dim != 128 && head_dim != 256) ||
-      num_q_heads % num_kv_heads != 0) {
-    return cudaErrorInvalidValue;
-  }
-  if (seq_len == 0) {
-    return cudaSuccess;
-  }
-  int start_pos = kv_len - seq_len;
-  dim3 grid(num_q_heads, seq_len);
-  nonpaged_prefill_attention_kernel<<<grid, head_dim, 0, stream>>>(
-      reinterpret_cast<const __nv_bfloat16 *>(q),
-      reinterpret_cast<const __nv_bfloat16 *>(k_cache),
-      reinterpret_cast<const __nv_bfloat16 *>(v_cache),
-      reinterpret_cast<__nv_bfloat16 *>(out),
-      num_q_heads,
-      num_kv_heads,
-      head_dim,
-      seq_len,
-      start_pos,
-      /*start_pos_dev=*/nullptr,
-      /*max_seq_len=*/ring_modulus,
-      ring_base,
-      ring_modulus,
-      /*ring_base_dev=*/nullptr,
-      /*kv_len_dev=*/nullptr,
-      sm_scale);
-  return cudaGetLastError();
-}
-
 // Ragged-window ring variant: one launch for `seq_len` query rows whose key
 // ranges differ. `ring_base_dev[t]` / `kv_len_dev[t]` (device i32, `seq_len`
 // each) give row t's window `[base, base+len)`; the walk is non-causal within

@@ -709,7 +709,7 @@ void cublas_init() {
 // Tear down cuBLAS state for ALL devices the process has initialized.
 //
 // CALLER CONTRACT: every thread that may issue GEMM (gemm_cuda /
-// gemm_graphsafe_cuda / autotune_*) MUST be quiesced (joined, or proven
+// autotune_*) MUST be quiesced (joined, or proven
 // idle) before this function is called. The hot path is intentionally
 // lock-free past the TLS cache; we narrow but cannot fully eliminate the
 // race window without an RWLock-on-every-call cost we don't want to pay
@@ -763,7 +763,6 @@ void cublas_destroy() {
   t_cached_generation = 0;
 }
 
-
 cudaError_t gemv_cuda(const __nv_bfloat16 *A, const __nv_bfloat16 *x, __nv_bfloat16 *y, int M, int K,
                cudaStream_t stream) {
   int num_blocks = (M + GEMV_ROWS_PER_BLOCK - 1) / GEMV_ROWS_PER_BLOCK;
@@ -778,44 +777,6 @@ cudaError_t gemv_cuda(const __nv_bfloat16 *A, const __nv_bfloat16 *x, __nv_bfloa
 cudaError_t gemm_cuda(const __nv_bfloat16 *W, const __nv_bfloat16 *X, __nv_bfloat16 *Y,
                int M, int N, int K, cudaStream_t stream) {
   return gemm_cublaslt_impl(W, X, Y, M, N, K, stream, /*graphsafe=*/false);
-}
-
-// GEMM with FP16 weights (already dequantized) and BF16 activations/output.
-// On sm_70 this skips the BF16→FP16 weight cast that `gemm_cuda` does, since
-// the W4A16 dequant already produced FP16 weights.
-cudaError_t gemm_fp16_weight_cuda(const __half *W_f16, const __nv_bfloat16 *X,
-                                  __nv_bfloat16 *Y, int M, int N, int K,
-                                  cudaStream_t stream) {
-  CublasDeviceState *state = current_device_state();
-  if (state == nullptr) return cudaErrorNotReady;
-  cublasHandle_t handle = state->prefill_handle;
-  if (cublasSetStream(handle, stream) != CUBLAS_STATUS_SUCCESS) return cudaErrorUnknown;
-
-  size_t x_elems = static_cast<size_t>(K) * N;
-  size_t y_elems = static_cast<size_t>(M) * N;
-  size_t needed = (x_elems + y_elems) * sizeof(__half);
-  if (ensure_cast_scratch(state, needed) != cudaSuccess) return cudaErrorMemoryAllocation;
-
-  __half *X_f16 = static_cast<__half *>(state->cast_scratch);
-  __half *Y_f16 = X_f16 + x_elems;
-  constexpr int CONV_BLOCK = 256;
-
-  convert_bf16_to_fp16_kernel<<<(x_elems + CONV_BLOCK - 1) / CONV_BLOCK, CONV_BLOCK, 0,
-                                stream>>>(X, X_f16, x_elems);
-  cudaError_t cerr = cudaGetLastError();
-  if (cerr != cudaSuccess) return cerr;
-
-  const float h_alpha = 1.0f, h_beta = 0.0f;
-  cublasStatus_t stat = cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N, M, N, K,
-                                     &h_alpha, W_f16, CUDA_R_16F, K, X_f16,
-                                     CUDA_R_16F, K, &h_beta, Y_f16, CUDA_R_16F,
-                                     M, CUBLAS_COMPUTE_32F,
-                                     CUBLAS_GEMM_DEFAULT_TENSOR_OP);
-  if (stat != CUBLAS_STATUS_SUCCESS) return cudaErrorUnknown;
-
-  convert_fp16_to_bf16_kernel<<<(y_elems + CONV_BLOCK - 1) / CONV_BLOCK, CONV_BLOCK, 0,
-                                stream>>>(Y_f16, Y, y_elems);
-  return cudaGetLastError();
 }
 
 cudaError_t gemm_bf16_f32_cuda(const __nv_bfloat16 *W, const __nv_bfloat16 *X, float *Y,
@@ -863,13 +824,6 @@ cudaError_t gemm_bf16_f32_cuda(const __nv_bfloat16 *W, const __nv_bfloat16 *X, f
   if (op != nullptr) cublasLtMatmulDescDestroy(op);
   return status == CUBLAS_STATUS_SUCCESS && returned > 0 ? cudaGetLastError()
                                                          : cudaErrorUnknown;
-}
-
-// Graph-safe GEMM: same math as gemm_cuda but uses the workspace-free handle.
-// Safe for CUDA Graph capture and decode path.
-cudaError_t gemm_graphsafe_cuda(const __nv_bfloat16 *W, const __nv_bfloat16 *X, __nv_bfloat16 *Y,
-                          int M, int N, int K, cudaStream_t stream) {
-  return gemm_cublaslt_impl(W, X, Y, M, N, K, stream, /*graphsafe=*/true);
 }
 
 // Benchmark all cublasLt heuristic algorithms for (M,N,K) and cache the fastest.
@@ -1001,25 +955,6 @@ cudaError_t autotune_gemm_cuda(int M, int N, int K, cudaStream_t stream) {
   cublasLtMatrixLayoutDestroy(wl);
   cublasLtMatmulDescDestroy(op);
   return cudaSuccess;
-}
-
-// Autotune all GEMM shapes currently in the heuristic cache (for the
-// currently-active CUDA device).
-// Replaces heuristic-selected algorithms with benchmarked optimal ones.
-void autotune_all_cached_gemms_cuda(cudaStream_t stream) {
-  CublasDeviceState *state = current_device_state();
-  if (state == nullptr) {
-    return;
-  }
-  std::vector<GemmKey> keys;
-  keys.reserve(state->algo_cache.size());
-  for (auto &kv : state->algo_cache) {
-    keys.push_back(kv.first);
-  }
-  for (auto &k : keys) {
-    state->algo_cache.erase(k);
-    autotune_gemm_cuda(k.M, k.N, k.K, stream);
-  }
 }
 
 } // extern "C"

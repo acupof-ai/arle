@@ -180,40 +180,6 @@ __global__ void arle_dsv4_flashmla_decode_build_indices_batched_kernel(
 
 extern "C" {
 
-cudaError_t arle_dsv4_flashmla_decode_build_indices_cuda(
-        int32_t* indices,
-        const int32_t* selected,
-        int sw_blocks,
-        int sliding_window,
-        int start_pos,
-        int max_compressed_keys,
-        int compress_ratio,
-        int mode_int,
-        int page_block_size,
-        const int32_t* page_table,
-        int num_logical_pages,
-        int total_blocks,
-        cudaStream_t stream) {
-    if (indices == nullptr) return cudaErrorInvalidValue;
-    if (sliding_window <= 0 || start_pos < 0) return cudaErrorInvalidValue;
-    if (max_compressed_keys < 0 || page_block_size <= 0) return cudaErrorInvalidValue;
-    if (mode_int != 1 && mode_int != 2) return cudaErrorInvalidValue;
-    if (mode_int == 1 && selected == nullptr) return cudaErrorInvalidValue;
-    if (sw_blocks < 0) return cudaErrorInvalidValue;
-    if (page_table != nullptr && num_logical_pages <= 0) return cudaErrorInvalidValue;
-
-    const int topk_unified = sliding_window + max_compressed_keys;
-    if ((topk_unified & 127) != 0) return cudaErrorInvalidValue;  // FlashMLA: topk % 128 == 0
-
-    constexpr int kBlock = 128;
-    const int grid = (topk_unified + kBlock - 1) / kBlock;
-    arle_dsv4_flashmla_decode_build_indices_kernel<<<grid, kBlock, 0, stream>>>(
-        indices, selected, sw_blocks, sliding_window, start_pos,
-        max_compressed_keys, compress_ratio, mode_int, page_block_size,
-        page_table, num_logical_pages, total_blocks, topk_unified);
-    return cudaGetLastError();
-}
-
 cudaError_t arle_dsv4_flashmla_decode_build_indices_start_pos_ptr_cuda(
         int32_t* indices,
         const int32_t* selected,
