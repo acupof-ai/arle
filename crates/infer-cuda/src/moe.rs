@@ -2795,13 +2795,6 @@ mod dsv4_gpu {
             .map_err(|e| anyhow::anyhow!("DSv4 W4AFP8 problem_sizes alloc failed: {e}"))?;
         keepalive.keep_i32(&problem_sizes);
 
-        // Host copy of offsets: the CUTLASS kernel reads expert_offsets host-side
-        // to build per-expert pointer arrays.
-        let offsets_host = ctx
-            .stream
-            .clone_dtoh(&offsets)
-            .map_err(|e| anyhow::anyhow!("DSv4 W4AFP8 offsets D2H failed: {e}"))?;
-
         // --- Gate+up GEMM ---
         let packed_fp8 = ctx
             .stream
@@ -2833,7 +2826,7 @@ mod dsv4_gpu {
                 cache_ptr(&w13.weight, ctx),
                 cache_ptr(&act_scale, ctx),
                 cache_ptr(&w13.scales, ctx),
-                &offsets_host,
+                cache_ptr(&offsets, ctx),
                 cache_ptr(&problem_sizes, ctx),
                 experts_per_rank,
                 2 * i_dim,
@@ -2892,7 +2885,7 @@ mod dsv4_gpu {
                 cache_ptr(&w2.weight, ctx),
                 cache_ptr(&act_scale, ctx),
                 cache_ptr(&w2.scales, ctx),
-                &offsets_host,
+                cache_ptr(&offsets, ctx),
                 cache_ptr(&problem_sizes, ctx),
                 experts_per_rank,
                 hidden_dim,

@@ -2249,8 +2249,8 @@ pub unsafe fn w4a8_swiglu_fused(
 
 /// W4AFP8 grouped GEMM (SGLang CUTLASS kernel, SM90-only). One call per
 /// projection (gate+up fused, then down). Returns 0 on success.
-/// `expert_offsets` is a HOST slice (the CUTLASS kernel reads it host-side to
-/// build per-expert pointer arrays).
+/// `expert_offsets` is a DEVICE pointer (the CUTLASS kernel reads it device-side
+/// via the w4a8_get_group_gemm_starts kernel to build per-expert pointer arrays).
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn w4a8_moe_grouped_gemm(
     d_output: RawDevicePtr<bf16>,
@@ -2258,7 +2258,7 @@ pub unsafe fn w4a8_moe_grouped_gemm(
     b_weights: RawDevicePtr<u8>,
     a_scale: RawDevicePtr<f32>,
     b_scales: RawDevicePtr<u8>,
-    expert_offsets: &[i32],
+    expert_offsets: RawDevicePtr<i32>,
     problem_sizes: RawDevicePtr<i32>,
     num_experts: usize,
     n: usize,
