@@ -765,6 +765,61 @@ pub(super) fn cuda_upload_fp8_block_scaled(
     ))
 }
 
+pub(super) fn cuda_upload_fp4_e2m1_group(
+    backend: &CudaBackend,
+    weight: &[u8],
+    scales: &[u8],
+    global_scale: f32,
+    shape: &[usize],
+    group_size: usize,
+    scale_cols: usize,
+) -> Result<DeviceHandle> {
+    if shape.len() != 2 {
+        return Err(AutogradError::InvalidRank {
+            expected: "2",
+            got: shape.len(),
+        });
+    }
+    let (rows, cols) = (shape[0], shape[1]);
+    if group_size == 0 || scale_cols == 0 {
+        return Err(AutogradError::TapeInvariant(
+            "nvfp4 group_size/scale_cols must be non-zero",
+        ));
+    }
+    if cols % 2 != 0 {
+        return Err(AutogradError::TapeInvariant(
+            "nvfp4 cols must be even (two weights per byte)",
+        ));
+    }
+    // Packed: two 4-bit weights per byte, so the buffer is half the logical size.
+    let packed_len = rows * (cols / 2);
+    if weight.len() != packed_len {
+        return Err(AutogradError::DataLengthMismatch {
+            len: weight.len(),
+            shape: shape.to_vec(),
+            size: packed_len,
+        });
+    }
+    if scales.len() != rows * scale_cols {
+        return Err(AutogradError::DataLengthMismatch {
+            len: scales.len(),
+            shape: vec![rows, scale_cols],
+            size: rows * scale_cols,
+        });
+    }
+    Ok(DeviceHandle::CudaFp4E2M1Group(
+        CudaFp4E2M1GroupStorage::new(
+            backend.upload_fp8_bytes_slice(weight, &[packed_len])?,
+            backend.upload_fp8_bytes_slice(scales, &[scales.len()])?,
+            backend.upload_slice(&[global_scale], &[1])?,
+            rows,
+            cols,
+            group_size,
+            scale_cols,
+        ),
+    ))
+}
+
 pub(super) fn cuda_import_bf16_device_ptr_as_f32(
     backend: &CudaBackend,
     src_device_ptr: u64,

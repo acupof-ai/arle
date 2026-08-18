@@ -711,6 +711,28 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         self.upload(&f32_host, shape)
     }
 
+    /// Upload a frozen NVFP4 weight. Backends without a 4-bit lane dequantize on
+    /// the host and keep f32; the CUDA backend overrides to stay at 4 bits.
+    fn upload_fp4_e2m1_group(
+        &self,
+        weight: &[u8],
+        scales: &[u8],
+        global_scale: f32,
+        shape: &[usize],
+        group_size: usize,
+        scale_cols: usize,
+    ) -> Result<DeviceHandle> {
+        let f32_host = dequantize_fp4_e2m1_group_host(
+            weight,
+            scales,
+            global_scale,
+            shape,
+            group_size,
+            scale_cols,
+        )?;
+        self.upload(&f32_host, shape)
+    }
+
     /// Import bf16 bytes from a foreign device buffer as an f32 handle.
     ///
     /// `src_stream` is the raw `CUstream` (as `u64`) that produced the source
