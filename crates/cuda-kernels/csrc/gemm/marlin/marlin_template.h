@@ -300,8 +300,7 @@ __global__ void Marlin(
     int lda,                                  // A.stride(0), equal to prob_k is A is contiguous
     int* locks,                               // extra global storage for barrier synchronization
     bool use_atomic_add,                      // whether to use atomic add to reduce
-    bool use_fp32_reduce,                     // whether to use fp32 global reduce
-    int max_shared_mem) {
+    bool use_fp32_reduce) {                   // whether to use fp32 global reduce
   // Each threadblock processes one "stripe" of the B matrix with (roughly) the
   // same size, which might involve multiple column "slices" (of width 16 *
   // `thread_n_blocks`). Stripes are defined as shown in the 3x3 matrix 5 SM

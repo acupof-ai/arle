@@ -772,8 +772,7 @@ void marlin_mm(
         lda,
         locks,
         part_use_atomic_add,
-        use_fp32_reduce,
-        max_shared_mem_new);
+        use_fp32_reduce);
 
     A_ptr += prob_m_split * (lda / 8);
     C_ptr += prob_m_split * (prob_n / 8);
