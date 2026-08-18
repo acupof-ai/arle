@@ -2354,6 +2354,20 @@ impl Qwen35CudaExecutor {
                     &[local_last_fill as i32],
                     &mut meta.kv_last_page_len.slice_mut(0..1),
                 )?;
+                // FA3 sizes the kernel from seqlen_k (max_kv_len); the recall
+                // table holds only this shard's working-set pages, so the lens
+                // must count those — not the global sequence length.
+                let local_token_count = recall_pages.len().saturating_sub(1) * pool.page_size
+                    + if recall_pages.is_empty() {
+                        0
+                    } else {
+                        local_last_fill
+                    };
+                self.model.ctx.stream.memcpy_htod(
+                    &[local_token_count as i32],
+                    &mut meta.kv_lens_dev.slice_mut(0..1),
+                )?;
+                meta.kv_lens = vec![local_token_count];
             }
             meta
         };
