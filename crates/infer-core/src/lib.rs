@@ -12,7 +12,7 @@ mod radix;
 mod recall;
 
 pub use radix::{BlockId, PrefixMatch, RadixCache};
-pub use recall::{RecallConfig, RecallPlan, plan_recall};
+pub use recall::{RecallConfig, RecallPlan, plan_recall, recall_block_count};
 
 use anyhow::Result;
 use infer_plan::{FinishReason, ForwardPlan, SamplingParams, SlotToken, StepOutput};

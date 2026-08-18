@@ -906,6 +906,102 @@ impl TpRuntime {
         }
     }
 
+    /// [`Self::all_gather_bytes`] over a sub-communicator (`attn_tp`, `attn_cp`).
+    #[cfg(all(feature = "cuda", feature = "nccl"))]
+    pub fn all_gather_bytes_over(
+        &self,
+        comm: &TpComm,
+        ctx: &cuda_kernels::prelude::DeviceContext,
+        input: &[u8],
+        per_rank_bytes: usize,
+    ) -> anyhow::Result<Vec<u8>> {
+        anyhow::ensure!(
+            input.len() == per_rank_bytes,
+            "all_gather_bytes_over input len {} must equal per-rank bytes {per_rank_bytes}",
+            input.len()
+        );
+        if per_rank_bytes == 0 {
+            return Ok(Vec::new());
+        }
+        match comm {
+            TpComm::Single => Ok(input.to_vec()),
+            TpComm::Nccl(backend) => backend.all_gather_bytes(ctx, input, per_rank_bytes),
+        }
+    }
+
+    /// Element-wise reduce `values` across `comm` with `f`; identity on
+    /// single-rank. Host-side over an all-gather: KV-recall calls it once per
+    /// prefill with a few hundred KB, where a device collective would cost more
+    /// than it saves, and `f` is min/max as often as sum.
+    #[cfg(feature = "cuda")]
+    #[cfg_attr(not(all(feature = "cuda", feature = "nccl")), allow(unused_variables))]
+    pub fn reduce_f32_over(
+        &self,
+        comm: &TpComm,
+        ctx: &cuda_kernels::prelude::DeviceContext,
+        values: &mut [f32],
+        f: impl Fn(f32, f32) -> f32,
+    ) -> anyhow::Result<()> {
+        #[cfg(all(feature = "cuda", feature = "nccl"))]
+        {
+            if matches!(comm, TpComm::Single) || values.is_empty() {
+                return Ok(());
+            }
+            let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_ne_bytes()).collect();
+            let gathered = self.all_gather_bytes_over(comm, ctx, &bytes, bytes.len())?;
+            anyhow::ensure!(
+                gathered.len() % bytes.len() == 0,
+                "reduce_f32_over: gathered {} bytes is not a multiple of the {}-byte payload",
+                gathered.len(),
+                bytes.len()
+            );
+            let mut ranks = gathered.chunks_exact(bytes.len());
+            let Some(first) = ranks.next() else {
+                return Ok(());
+            };
+            let load = |c: &[u8]| f32::from_ne_bytes([c[0], c[1], c[2], c[3]]);
+            for (v, c) in values.iter_mut().zip(first.chunks_exact(4)) {
+                *v = load(c);
+            }
+            for rank in ranks {
+                for (v, c) in values.iter_mut().zip(rank.chunks_exact(4)) {
+                    *v = f(*v, load(c));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Broadcast `root`'s `values` to every rank of `comm`; identity on
+    /// single-rank. Under CP the prompt tail lives on one rank, so only that rank
+    /// can build the recall scoring query.
+    #[cfg(feature = "cuda")]
+    #[cfg_attr(not(all(feature = "cuda", feature = "nccl")), allow(unused_variables))]
+    pub fn broadcast_f32_over(
+        &self,
+        comm: &TpComm,
+        ctx: &cuda_kernels::prelude::DeviceContext,
+        values: &[f32],
+        root: usize,
+    ) -> anyhow::Result<Vec<f32>> {
+        #[cfg(all(feature = "cuda", feature = "nccl"))]
+        if !matches!(comm, TpComm::Single) && !values.is_empty() {
+            let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_ne_bytes()).collect();
+            let gathered = self.all_gather_bytes_over(comm, ctx, &bytes, bytes.len())?;
+            let lo = root * bytes.len();
+            anyhow::ensure!(
+                gathered.len() >= lo + bytes.len(),
+                "broadcast_f32_over: root {root} beyond the gathered {} bytes",
+                gathered.len()
+            );
+            return Ok(gathered[lo..lo + bytes.len()]
+                .chunks_exact(4)
+                .map(|c| f32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
+                .collect());
+        }
+        Ok(values.to_vec())
+    }
+
     #[cfg(all(feature = "cuda", feature = "nccl"))]
     fn symmetric_vote(
         &self,

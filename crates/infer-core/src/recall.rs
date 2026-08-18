@@ -60,6 +60,21 @@ impl RecallPlan {
 /// tail is absorbed into the local window so the plan covers `[0, cache_len)` with
 /// no gap. Returns the contiguous full range when the session fits the budget or
 /// has no evictable middle (so the default path is byte-identical to today).
+/// How many middle blocks [`plan_recall`] will score for `cache_len`.
+///
+/// A function of the config and the length only, so every rank agrees on it. A
+/// cross-shard score reduction must size its payload from this rather than from
+/// however many block reps a rank happens to hold — an early stop on one rank
+/// would otherwise mismatch the collective and hang the group.
+#[must_use]
+pub fn recall_block_count(cache_len: usize, cfg: &RecallConfig) -> usize {
+    if cfg.l_bs == 0 || cache_len <= cfg.n_init + cfg.n_local + cfg.l_bs {
+        return 0;
+    }
+    let nb = (cache_len - cfg.n_init - cfg.n_local) / cfg.l_bs;
+    if cfg.top_k >= nb { 0 } else { nb }
+}
+
 #[must_use]
 pub fn plan_recall(cache_len: usize, block_scores: &[f32], cfg: &RecallConfig) -> RecallPlan {
     if cfg.l_bs == 0 || cache_len <= cfg.n_init + cfg.n_local + cfg.l_bs {
