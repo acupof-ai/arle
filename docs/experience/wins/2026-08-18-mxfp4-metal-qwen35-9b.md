@@ -71,6 +71,20 @@ MXFP4 pays +0.62 PPL (+6.5%) at 2K context. The E8M0 power-of-two scale is
 coarse — small-magnitude weights inside a block share the block max's exponent
 — and the error accumulates with depth into the 8K-token refusal above.
 
+Dequant fidelity vs the BF16 source (249 quantized tensors, per-tensor
+cosine / relative L2):
+
+| arm | cosine p50 | rel-L2 p50 | worst tensors |
+|---|---:|---:|---|
+| affine 4bit | 0.9957 | 9.3% | linear-attn in_proj (L8/28/29), k_proj L31 |
+| MXFP4 | 0.9926 | 12.3% | same tensors |
+
+Both formats quantize the same 249 tensors and fail on the same outlier-heavy
+linear-attention projections. MXFP4's error is ~30% higher than affine's on
+identical inputs — the format's expected coarseness, not a conversion defect.
+A native MXFP4 checkpoint does not exist for comparison:
+`mlx-community/Qwen3.5-9B-mxfp4` is an empty repo (`.gitattributes` only).
+
 ## Problems
 
 - MXFP4 with the default int8 KV cache degrades between 2000 and 4000 tokens;
