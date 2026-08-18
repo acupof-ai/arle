@@ -72,15 +72,6 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    pub fn gemv_cuda(
-        A: *const Half,
-        x: *const Half,
-        y: *mut Half,
-        M: i32,
-        K: i32,
-        stream: CUstream,
-    ) -> CUresult;
-
     pub fn gemm_cuda(
         W: *const Half,
         X: *const Half,
@@ -101,50 +92,11 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    pub fn gemm_graphsafe_cuda(
-        W: *const Half,
-        X: *const Half,
-        Y: *mut Half,
-        M: i32,
-        N: i32,
-        K: i32,
-        stream: CUstream,
-    ) -> CUresult;
-
-    pub fn fused_mlp_cuda(
-        x: *const Half,
-        gate_proj: *const Half,
-        up_proj: *const Half,
-        down_proj: *const Half,
-        act: *mut Half,
-        out: *mut Half,
-        hidden_size: i32,
-        intermediate_size: i32,
-        stream: CUstream,
-    ) -> CUresult;
-
-    pub fn gptq_marlin_repack_cuda(
-        b_q_weight: *const u32,
-        out: *mut u32,
-        size_k: i32,
-        size_n: i32,
-        stream: CUstream,
-    ) -> CUresult;
-
-    pub fn marlin_workspace_size(prob_n: i32, sms: i32) -> usize;
-
     /// PF8.2 — Subtraction-merge zero-point=8 into packed INT4 weight tensor.
     /// Offline weight-prep step for W4+FP8 marlin GEMM; eliminates per-element
     /// zero-point subtract at runtime.
     /// `numel` must be a multiple of 32 (kernel processes 32 INT32 per block).
     /// Returns `cudaErrorInvalidValue` if alignment violated.
-    pub fn marlin_int4_fp8_preprocess_without_zp_cuda(
-        qweight: *const i32,
-        output: *mut i32,
-        numel: i32,
-        stream: CUstream,
-    ) -> CUresult;
-
     pub fn w8a16_gemv_cuda(
         weight: *const i8,
         scales: *const Half,
@@ -205,17 +157,6 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    pub fn w2a16_gemv_cuda(
-        weight: *const u8,
-        scales: *const Half,
-        input: *const Half,
-        output: *mut Half,
-        n: i32,
-        k: i32,
-        group_size: i32,
-        stream: CUstream,
-    ) -> CUresult;
-
     pub fn w8a16_gemv_batch_cuda(
         weight: *const i8,
         scales: *const Half,
@@ -229,18 +170,6 @@ unsafe extern "C" {
     ) -> CUresult;
 
     pub fn w4a16_gemv_batch_cuda(
-        weight: *const u8,
-        scales: *const Half,
-        input: *const Half,
-        output: *mut Half,
-        batch_size: i32,
-        n: i32,
-        k: i32,
-        group_size: i32,
-        stream: CUstream,
-    ) -> CUresult;
-
-    pub fn w2a16_gemv_batch_cuda(
         weight: *const u8,
         scales: *const Half,
         input: *const Half,
@@ -309,14 +238,6 @@ unsafe extern "C" {
 
     // Probe-only weight-read diagnostic (same access pattern as the batch
     // GEMV, x-work removed): mode 0 = raw bytes, mode 1 = +fp8 decode.
-    pub fn gemv_fp8_wread_probe_cuda(
-        weight: *const u8,
-        output: *mut f32,
-        n: i32,
-        k: i32,
-        mode: i32,
-        stream: CUstream,
-    ) -> CUresult;
 
     // Software dequant of an FP8 E4M3 2D-block-scaled weight `[n, k]` (row-major)
     // into a dense BF16 weight `[n, k]` (`output`, `Half` = bf16 raw bits). Block
@@ -366,48 +287,6 @@ unsafe extern "C" {
         weight: *const u8,
         scales: *const Half,
         output: *mut Half,
-        n: i32,
-        k: i32,
-        group_size: i32,
-        stream: CUstream,
-    ) -> CUresult;
-
-    pub fn dequantize_w4a16_to_fp16_cuda(
-        weight: *const u8,
-        scales: *const Half,
-        output: *mut Half,
-        n: i32,
-        k: i32,
-        group_size: i32,
-        stream: CUstream,
-    ) -> CUresult;
-
-    pub fn gemm_fp16_weight_cuda(
-        w_f16: *const Half,
-        x: *const Half,
-        y: *mut Half,
-        m: i32,
-        n: i32,
-        k: i32,
-        stream: CUstream,
-    ) -> CUresult;
-
-    pub fn fp16_gemm_wmma_cuda(
-        w_f16: *const Half,
-        x: *const Half,
-        y: *mut Half,
-        m: i32,
-        n: i32,
-        k: i32,
-        stream: CUstream,
-    ) -> CUresult;
-
-    pub fn w4a16_gemm_wmma_cuda(
-        weight: *const u8,
-        scales: *const Half,
-        input: *const Half,
-        output: *mut Half,
-        m: i32,
         n: i32,
         k: i32,
         group_size: i32,
@@ -937,35 +816,6 @@ unsafe extern "C" {
     ) -> CUresult;
 
     pub fn q6k_dequant_chunk_cuda(
-        weight: *const u8,
-        out_bf16: *mut Half,
-        n: i32,
-        k: i32,
-        k_start: i32,
-        k_len: i32,
-        stream: CUstream,
-    ) -> CUresult;
-
-    pub fn q3k_gemv_cuda(
-        weight: *const u8,
-        input: *const Half,
-        output: *mut Half,
-        n: i32,
-        k: i32,
-        stream: CUstream,
-    ) -> CUresult;
-
-    pub fn q3k_gemv_batch_cuda(
-        weight: *const u8,
-        input: *const Half,
-        output: *mut Half,
-        batch_size: i32,
-        n: i32,
-        k: i32,
-        stream: CUstream,
-    ) -> CUresult;
-
-    pub fn q3k_dequant_chunk_cuda(
         weight: *const u8,
         out_bf16: *mut Half,
         n: i32,
