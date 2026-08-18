@@ -191,12 +191,11 @@ array switch_glu_forward(
 
 } // namespace
 
-// Qwen3.5/3.6 sparse-MoE forward. Returns the MLX array pointer on success
-// (caller owns → must `mlx_array_free`), nullptr on failure (check
-// `mlx_last_error()`).
+// Qwen3.5/3.6 sparse-MoE forward. Returns the output array by value; throws
+// on invalid arguments or shape mismatches.
 //
 // Array ownership: all inputs are borrowed; the helper never frees or clones
-// them. On success it allocates exactly one new `mlx_array`.
+// them.
 //
 // Dense-SwiGLU router vs switch-mlp: the router gate (`router_*`) and the
 // shared-expert gate (`shared_gate_router_*`) are 8-bit quantized linears —
@@ -218,7 +217,7 @@ array switch_glu_forward(
 //
 // The helper does not validate shapes beyond what MLX itself will catch
 // during op evaluation; pre-checks would duplicate mlx's shape checks and
-// cost an extra allocation. Errors surface through `mlx_last_error()`.
+// cost an extra allocation.
 array qwen35_moe_block_forward_cpp(
     const array& x,
     // Router (8-bit quantized linear: H -> E, no bias at runtime)

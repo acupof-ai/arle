@@ -55,8 +55,7 @@ struct mlx_array;  // opaque
 
 // Qwen3.5/3.6 sparse-MoE helper shared between the compiled model path and
 // the Rust fallback. `qwen35_moe_block_forward_cpp()` is the internal
-// array-native helper used by the compiled model path; the `extern "C"`
-// wrapper remains for Rust callers.
+// array-native helper used by the compiled model path.
 array qwen35_moe_block_forward_cpp(
     const array& hidden,
     const array& router_w,

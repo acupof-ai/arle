@@ -1,6 +1,4 @@
 #include "mlx_common.h"
-#include "mlx/backend/metal/device.h"
-#include "mlx/version.h"
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
