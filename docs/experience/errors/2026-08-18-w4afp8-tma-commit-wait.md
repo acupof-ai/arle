@@ -33,6 +33,46 @@ The `ElementScalePacked = Array<BF16, K/128>` modification (SGLang's
 interleaved scale layout) is preserved — it is the key SGLang extension
 that the official 4.x kernel lacks.
 
+## Why the 3.7.0-shaped call compiled there and not here
+
+The builder passed one extra explicit template argument, `StageCountType::bytes`,
+ahead of `SmemAlignment`. The two trailing `int` parameters swapped order
+between versions:
+
+- CUTLASS 3.7.0: `..., class TileShapeMNK, int carveout_bytes, int alignment = 128`
+- CUTLASS 4.3.5: `..., class TileShapeMNK, int alignment = 128, int carveout_bytes_`
+
+In 4.3.5 `carveout_bytes_` is the trailing parameter, deduced from the function
+argument `StageCountAutoCarveout<carveout_bytes_>`. The extra explicit argument
+therefore bound `alignment = StageCountType::bytes` and forced
+`carveout_bytes_ = SmemAlignment` (128), so the parameter type became
+`StageCountAutoCarveout<128>` while the argument was
+`StageCountAutoCarveout<sizeof(CollectiveEpilogue::SharedStorage)>` — not
+convertible, hence "no instance of overloaded function matches". Upstream 4.3.5
+calls the same helpers with 7/7/5 explicit args
+(`cutlass/gemm/collective/builders/sm90_gmma_builder.inl:462-470`), which is what
+the fix restores.
+
+The fourth error ("Could not find a mainloop specialization",
+`collective_mma_array_mixed_input.hpp:43`) is a cascade: `PipelineStages` is an
+error type, so the partial specialization keyed on
+`MainloopSm90ArrayTmaGmmaWarpSpecializedMixedInput<Stages, ...>` cannot match and
+the primary template's `dependent_false` static_assert fires.
+
+## Why this surfaced late
+
+The break sat undetected across several apparently successful builds: `csrc/` is
+compiled by a plain recursive glob with no feature or SM-tier gate, so an
+incremental build that touched nothing under `moe/w4a8/` simply reused the
+cached objects. The logs of those builds mention `w4a8` zero times. Touching an
+unrelated `csrc/` file forced the unit to rebuild and the failure appeared at
+once.
+
+Diagnostic shortcut: the error line numbers identify the tree. Pre-fix the three
+call sites are at 206/215/224; at the fix they are 206/214/222. Seeing 215/224
+means the build read the pre-fix file regardless of what the checkout claims.
+`grep -c 'StageCountType::bytes' <that .inl>` must return 0.
+
 ## Key files
 - `crates/cuda-kernels/csrc/moe/w4a8/cutlass_extensions/gemm/collective/sm90_mma_array_tma_gmma_rs_warpspecialized_mixed_input_.hpp` — the kernel
 - `crates/cuda-kernels/csrc/moe/w4a8/cutlass_extensions/gemm/collective/builders/sm90_gmma_builder_mixed_input.inl` — stage-count template arg fix
