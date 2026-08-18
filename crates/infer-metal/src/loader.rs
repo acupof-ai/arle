@@ -7,7 +7,7 @@ use std::{
 
 use anyhow::{Context, Result};
 
-use crate::config::QuantConfig;
+use crate::config::{QuantConfig, QuantMode};
 use crate::mlx::{MlxArray, dequantize, eval, transpose_all};
 use crate::weights::WeightTensor;
 
@@ -60,10 +60,10 @@ pub(crate) fn load_proj_from_tensors(
             .get(&format!("{base}.weight"))
             .cloned()
             .with_context(|| format!("missing quantized weight '{base}.weight'"))?;
-        let biases = tensors
-            .get(&format!("{base}.biases"))
-            .cloned()
-            .with_context(|| format!("missing quantized biases '{base}.biases'"))?;
+        let biases = tensors.get(&format!("{base}.biases")).cloned();
+        if biases.is_none() && qc.mode == QuantMode::Affine {
+            anyhow::bail!("missing quantized biases '{base}.biases'");
+        }
         // Honor per-weight quant overrides (mixed bits/group_size, e.g. OptiQ);
         // fall back to the global config for weights without an override.
         let (bits, group_size) = qc
@@ -77,6 +77,7 @@ pub(crate) fn load_proj_from_tensors(
             biases,
             group_size,
             bits,
+            mode: qc.mode,
         });
     }
 
@@ -95,17 +96,24 @@ pub(crate) fn load_embed_tokens_from_tensors(
     if let Some(qc) = quantization.as_ref()
         && let Some(scales) = tensors.get(&format!("{base}.scales")).cloned()
     {
-        let biases = tensors
-            .get(&format!("{base}.biases"))
-            .cloned()
-            .with_context(|| format!("missing biases '{base}.biases'"))?;
+        let biases = tensors.get(&format!("{base}.biases")).cloned();
+        if biases.is_none() && qc.mode == QuantMode::Affine {
+            anyhow::bail!("missing biases '{base}.biases'");
+        }
         let (bits, group_size) = qc
             .per_weight
             .get(base)
             .copied()
             .unwrap_or((qc.bits, qc.group_size));
         log::info!("  dequantizing embed_tokens at load time");
-        return Ok(dequantize(&w, &scales, &biases, group_size, bits));
+        return Ok(dequantize(
+            &w,
+            &scales,
+            biases.as_ref(),
+            group_size,
+            bits,
+            qc.mode,
+        ));
     }
     Ok(w)
 }

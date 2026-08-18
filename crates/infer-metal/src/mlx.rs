@@ -404,13 +404,23 @@ pub fn argmax_axis(a: &MlxArray, axis: i32) -> MlxArray {
 pub fn dequantize(
     weight: &MlxArray,
     scales: &MlxArray,
-    biases: &MlxArray,
+    biases: Option<&MlxArray>,
     group_size: i32,
     bits: i32,
+    mode: crate::config::QuantMode,
 ) -> MlxArray {
     mlx_array_from_raw_or_panic(
         // SAFETY: mlx_sys FFI over valid owned handles and live caller buffers; failures are reported via rc/mlx_last_error checked after.
-        unsafe { mlx_sys::mlx_dequantize(weight.0, scales.0, biases.0, group_size, bits) },
+        unsafe {
+            mlx_sys::mlx_dequantize(
+                weight.0,
+                scales.0,
+                biases.map_or(std::ptr::null_mut(), |b| b.0),
+                group_size,
+                bits,
+                mode.ffi(),
+            )
+        },
         "mlx_dequantize",
     )
 }
@@ -419,16 +429,24 @@ pub fn quantized_matmul(
     x: &MlxArray,
     weight: &MlxArray,
     scales: &MlxArray,
-    biases: &MlxArray,
+    biases: Option<&MlxArray>,
     transpose: bool,
     group_size: i32,
     bits: i32,
+    mode: crate::config::QuantMode,
 ) -> MlxArray {
     mlx_array_from_raw_or_panic(
         // SAFETY: mlx_sys FFI over valid owned handles and live caller buffers; failures are reported via rc/mlx_last_error checked after.
         unsafe {
             mlx_sys::mlx_quantized_matmul(
-                x.0, weight.0, scales.0, biases.0, transpose, group_size, bits,
+                x.0,
+                weight.0,
+                scales.0,
+                biases.map_or(std::ptr::null_mut(), |b| b.0),
+                transpose,
+                group_size,
+                bits,
+                mode.ffi(),
             )
         },
         "mlx_quantized_matmul",

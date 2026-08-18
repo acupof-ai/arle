@@ -200,6 +200,12 @@ static inline Dtype to_dtype(int32_t d) {
     }
 }
 
+// Quantization mode codes shared with the Rust side (infer-metal config.rs).
+// 0 = affine (per-group scale + bias), 1 = mxfp4 (E2M1 + E8M0 per-32 scale).
+static inline const char* quant_mode_str(int32_t mode) {
+    return mode == 1 ? "mxfp4" : "affine";
+}
+
 static inline int32_t from_dtype(const Dtype& d) {
     // Use the underlying enum value
     if (d == bool_) return 0;

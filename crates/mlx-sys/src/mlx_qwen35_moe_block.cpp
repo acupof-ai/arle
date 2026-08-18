@@ -78,8 +78,7 @@ array qmm(const array& x, const array& w, const array& scales,
 }
 
 // Fused quantized-SwiGLU: down(silu(gate(x)) * up(x)) with three 4-bit proj.
-// Mirrors `mlx_fused_quantized_gated_mlp` in mlx_bridge.cpp (kept local so
-// this TU doesn't link against that symbol ordering).
+// Kept local so this TU doesn't link against bridge symbol ordering.
 array quantized_swiglu(const array& x,
                        const array& gate_w, const array& gate_s, const array& gate_b,
                        const array& up_w,   const array& up_s,   const array& up_b,

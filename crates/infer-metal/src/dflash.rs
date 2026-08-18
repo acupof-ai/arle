@@ -364,6 +364,8 @@ fn raw_quant(
     quantization.or(quantization_config).map(|q| QuantConfig {
         group_size: q.group_size.unwrap_or(64),
         bits: q.bits.unwrap_or(4),
+        // DFlash draft checkpoints ship affine 4-bit; mxfp4 drafts are out of scope.
+        mode: crate::config::QuantMode::Affine,
         per_weight: std::sync::Arc::new(std::collections::HashMap::new()),
     })
 }
@@ -559,10 +561,11 @@ fn extract_dflash_weight(
             biases,
             group_size,
             bits,
+            ..
         } => (
             w.as_raw(),
             scales.as_raw(),
-            biases.as_raw(),
+            biases.as_ref().map_or(std::ptr::null_mut(), |b| b.as_raw()),
             *group_size,
             *bits,
         ),
@@ -1420,6 +1423,16 @@ fn apply_weight(x: &MlxArray, weight: &WeightTensor) -> MlxArray {
             biases,
             group_size,
             bits,
-        } => mlx::quantized_matmul(x, w, scales, biases, true, *group_size, *bits),
+            mode,
+        } => mlx::quantized_matmul(
+            x,
+            w,
+            scales,
+            biases.as_ref(),
+            true,
+            *group_size,
+            *bits,
+            *mode,
+        ),
     }
 }

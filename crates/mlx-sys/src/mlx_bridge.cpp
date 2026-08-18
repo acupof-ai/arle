@@ -1692,58 +1692,19 @@ mlx_array* mlx_argmax_axis(mlx_array* a, int axis, bool keepdims) {
 
 mlx_array* mlx_quantized_matmul(mlx_array* x, mlx_array* w, mlx_array* scales,
                                 mlx_array* biases, bool transpose,
-                                int32_t group_size, int32_t bits) {
+                                int32_t group_size, int32_t bits, int32_t mode) {
     MLX_TRY_RETURN(from_arr(quantized_matmul(
-        *to_arr(x), *to_arr(w), *to_arr(scales), *to_arr(biases),
-        transpose, group_size, bits)));
-}
-
-int32_t mlx_quantize(
-    mlx_array* w,
-    int32_t group_size,
-    int32_t bits,
-    mlx_array** out_w,
-    mlx_array** out_scales,
-    mlx_array** out_biases) {
-    MLX_TRY_RETURN_VALUE(-1, [&]() {
-        if (out_w == nullptr || out_scales == nullptr || out_biases == nullptr) {
-            throw std::invalid_argument("mlx_quantize received null output pointer");
-        }
-        auto outputs = quantize(*to_arr(w), group_size, bits);
-        if (outputs.size() != 3) {
-            throw std::runtime_error("mlx_quantize expected three affine outputs");
-        }
-        *out_w = from_arr(std::move(outputs[0]));
-        *out_scales = from_arr(std::move(outputs[1]));
-        *out_biases = from_arr(std::move(outputs[2]));
-        return 0;
-    }());
-}
-
-// Fused quantized gated MLP: out = down(silu(gate(x)) * up(x))
-// All three projections are 4-bit quantized. The fusion lets MLX's graph
-// compiler merge intermediate kernels and avoid DRAM round-trips for the
-// [N, intermediate] activation buffer.
-mlx_array* mlx_fused_quantized_gated_mlp(
-    mlx_array* x,
-    mlx_array* gate_w, mlx_array* gate_s, mlx_array* gate_b,
-    mlx_array* up_w,   mlx_array* up_s,   mlx_array* up_b,
-    mlx_array* down_w, mlx_array* down_s, mlx_array* down_b,
-    int32_t group_size, int32_t bits) {
-    MLX_TRY_RETURN([&]() {
-        auto& xr = *to_arr(x);
-        auto gate = quantized_matmul(xr, *to_arr(gate_w), *to_arr(gate_s), *to_arr(gate_b), true, group_size, bits);
-        auto up   = quantized_matmul(xr, *to_arr(up_w),   *to_arr(up_s),   *to_arr(up_b),   true, group_size, bits);
-        // silu(gate) * up — single fused elementwise
-        auto h = multiply(multiply(gate, sigmoid(gate)), up);
-        return from_arr(quantized_matmul(h, *to_arr(down_w), *to_arr(down_s), *to_arr(down_b), true, group_size, bits));
-    }());
+        *to_arr(x), *to_arr(w), *to_arr(scales),
+        biases ? std::optional(*to_arr(biases)) : std::nullopt,
+        transpose, group_size, bits, quant_mode_str(mode))));
 }
 
 mlx_array* mlx_dequantize(mlx_array* w, mlx_array* scales, mlx_array* biases,
-                          int32_t group_size, int32_t bits) {
-    MLX_TRY_RETURN(from_arr(dequantize(*to_arr(w), *to_arr(scales), *to_arr(biases),
-                                       group_size, bits)));
+                          int32_t group_size, int32_t bits, int32_t mode) {
+    MLX_TRY_RETURN(from_arr(dequantize(
+        *to_arr(w), *to_arr(scales),
+        biases ? std::optional(*to_arr(biases)) : std::nullopt,
+        group_size, bits, quant_mode_str(mode))));
 }
 
 mlx_array* mlx_gguf_quantized_matmul(
