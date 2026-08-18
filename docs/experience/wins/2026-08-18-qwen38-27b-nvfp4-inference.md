@@ -94,3 +94,51 @@ PASS. The model loads in 6.5s, generates correct output, and serves at 9.3
 tok/s decode (c=1) on a single H20 with 20.69 GiB peak RSS. The
 `Fp8BlockScaled { block_m: 1, block_k: K }` reuse pattern generalizes to any
 compressed-tensors float-quantized model with per-channel scales.
+
+## MTP spec decode — investigated, not enabled
+
+The model ships 1 BF16 MTP layer (811 MB). Enabled via
+`--spec-type mtp --mtp-draft-tokens 2`.
+
+**Acceptance rate: ~80%** (chains 2–11, per-step rates 0.67–0.82). The MTP
+head produces correct draft tokens.
+
+**Net effect: slower.** 6.2 tok/s with MTP vs 9.3 tok/s without. Root cause:
+the verify forward processes `depth+1 = 3` tokens through the recurrent linear
+attention (gated-delta scan), costing ~3× a single-token decode. At 80%
+acceptance, cost per token = 4.6× decode / 2.6 tokens = 1.77×. MTP depth=2 is
+counterproductive on H20 with this hybrid architecture. MTP depth=1 would
+break even at ~50% acceptance but offers no throughput gain.
+
+## Per-op profiling (ARLE_CUDA_PROFILE=1, 50 decode steps, c=1)
+
+| Op | Total ms | Share | Avg μs | Count |
+|---|---:|---:|---:|---:|
+| forward_hidden (all layers) | 6193.8 | 48.6% | 123876 | 50 |
+| dense_ffn (NVFP4 MLP GEMV) | 5102.6 | 40.1% | 1595 | 3200 |
+| linear_attention | 580.6 | 4.6% | 242 | 2400 |
+| linear/in_proj | 257.8 | 2.0% | 107 | 2400 |
+| full_attention | 178.0 | 1.4% | 223 | 800 |
+| lm_head + lm_head_gemv | 69.3 | 0.5% | 1387 | 50 |
+
+The NVFP4 MLP GEMV dominates: 82.4% of forward time. Per-layer weight read
+~196 MB (FP4 packed + FP8 scales) in 1.59 ms = ~124 GB/s = **3.1% of H20's
+4.0 TB/s bandwidth**. The kernel is latency-bound (serial load→compute→accumulate
+chain, ILP=1), not bandwidth-bound.
+
+SGLang's Marlin W4A16 fallback achieves ~24% bandwidth on Hopper at B=1, but
+requires BF16 weights (4× memory = 88 GB — doesn't fit on single H20 after
+KV cache). The optimization path is ILP and vectorized loads in the FP4 GEMV,
+not dequant-to-BF16.
+
+## SOTA comparison
+
+| Engine | Approach | H20 decode tok/s | Notes |
+|---|---|---:|---|
+| ARLE | FP4 GEMV (scalar, ILP=1) | 9.3 | 3.1% bandwidth |
+| SGLang | Marlin W4A16 (dequant→BF16) | N/A | 24% bandwidth, 88 GB weights |
+| vLLM | Marlin W4A16 fallback | N/A | Occupancy-bound at M=1 |
+
+ARLE's 9.3 tok/s is the only single-GPU NVFP4 result measured. The 3.1%
+bandwidth utilization indicates the FP4 GEMV kernel has 5–8× headroom from
+ILP and vectorized-load optimizations alone.
