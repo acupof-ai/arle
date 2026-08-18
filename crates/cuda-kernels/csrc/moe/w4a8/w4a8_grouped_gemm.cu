@@ -113,17 +113,21 @@ static constexpr size_t metadata_bytes(int num_experts) {
   return static_cast<size_t>(num_experts) * (5 * 8 + 4 * 24);
 }
 
+}  // namespace
+
 // Device-side pointer computation, copied from SGLang's int4_fp8_get_group_gemm_starts.
 // Grid: 1 block, num_experts threads. Scale offsets in BF16 elements (SGLang convention).
+// Must be outside the anonymous namespace above — CUTLASS headers define their own
+// anonymous namespace in the same TU, causing ambiguous reference errors (nvcc).
 __global__ void w4a8_get_group_gemm_starts(
     const int32_t* __restrict__ expert_offsets,
-    const MmaType** a_offsets,
-    const QuantType** b_offsets,
-    ElementD** out_offsets,
+    const cutlass::float_e4m3_t** a_offsets,
+    const cutlass::int4b_t** b_offsets,
+    cutlass::bfloat16_t** out_offsets,
     const cutlass::bfloat16_t** b_scales_offsets,
-    const MmaType* a_base,
-    const QuantType* b_base,
-    ElementD* out_base,
+    const cutlass::float_e4m3_t* a_base,
+    const cutlass::int4b_t* b_base,
+    cutlass::bfloat16_t* out_base,
     const cutlass::bfloat16_t* b_scales_base,
     int64_t n, int64_t k, int num_experts) {
   int e = threadIdx.x;
@@ -134,6 +138,8 @@ __global__ void w4a8_get_group_gemm_starts(
   out_offsets[e] = out_base + static_cast<size_t>(off) * n;
   b_scales_offsets[e] = b_scales_base + static_cast<size_t>(e) * n * k / 128;
 }
+
+namespace {
 
 template <typename Gemm>
 int run_grouped_gemm(
