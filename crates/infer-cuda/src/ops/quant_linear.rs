@@ -472,6 +472,28 @@ fn try_fp8_deepgemm_dense_batch(
     Ok(true)
 }
 
+/// Grow the shared BF16 dequant scratch to `elems`, returning false when the
+/// device is out of memory. A failed reservation is not fatal: the callers all
+/// have a scalar GEMV path that computes the same result without the resident
+/// BF16 copy, which is what a VRAM-committed box (full KV + recurrent pools)
+/// needs to fall back to.
+fn reserve_dequant_scratch(ctx: &DeviceContext, elems: usize) -> bool {
+    QWEN_FP8_DEQUANT_SCRATCH.with(|cell| {
+        let mut scratch = cell.borrow_mut();
+        if scratch.capacity >= elems {
+            return true;
+        }
+        match ctx.stream.alloc_zeros::<bf16>(elems) {
+            Ok(buf) => {
+                scratch.weight_bf16 = Some(buf);
+                scratch.capacity = elems;
+                true
+            }
+            Err(_) => false,
+        }
+    })
+}
+
 /// Pre-Hopper dense FP8 GEMM fallback for the DeepGEMM-shaped path: on sm < 9
 /// (A100/V100), where DeepGEMM's `wgmma` kernel is unavailable, dequantize the
 /// FP8 E4M3 block-scaled weight `[rows, cols]` to a resident BF16 scratch ONCE,
@@ -516,15 +538,12 @@ fn try_fp8_dequant_bf16_gemm_batch(
     let k = weight.cols; // GEMM K dim (contraction)
     let weight_elems = n * k;
 
+    if !reserve_dequant_scratch(ctx, weight_elems) {
+        return Ok(false);
+    }
+
     QWEN_FP8_DEQUANT_SCRATCH.with(|cell| -> Result<()> {
-        let mut scratch = cell.borrow_mut();
-        if scratch.capacity < weight_elems {
-            scratch.weight_bf16 =
-                Some(ctx.stream.alloc_zeros::<bf16>(weight_elems).map_err(|e| {
-                    anyhow!("Qwen FP8 dense dequant BF16 scratch alloc failed: {e}")
-                })?);
-            scratch.capacity = weight_elems;
-        }
+        let scratch = cell.borrow_mut();
         let weight_bf16 = scratch
             .weight_bf16
             .as_ref()
@@ -699,15 +718,12 @@ fn try_w8a16_dequant_bf16_gemm_batch(
 
     // Reuse the FP8 dequant scratch — it is just a format-agnostic BF16 weight
     // buffer sized to the largest weight seen this thread.
+    if !reserve_dequant_scratch(ctx, weight_elems) {
+        return Ok(false);
+    }
+
     QWEN_FP8_DEQUANT_SCRATCH.with(|cell| -> Result<()> {
-        let mut scratch = cell.borrow_mut();
-        if scratch.capacity < weight_elems {
-            scratch.weight_bf16 =
-                Some(ctx.stream.alloc_zeros::<bf16>(weight_elems).map_err(|e| {
-                    anyhow!("Qwen W8A16 dense dequant BF16 scratch alloc failed: {e}")
-                })?);
-            scratch.capacity = weight_elems;
-        }
+        let scratch = cell.borrow_mut();
         let weight_bf16 = scratch
             .weight_bf16
             .as_ref()
