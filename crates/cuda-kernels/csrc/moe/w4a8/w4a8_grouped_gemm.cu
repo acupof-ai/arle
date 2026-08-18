@@ -203,32 +203,6 @@ int run_grouped_gemm(
   auto* d_d_strides = reinterpret_cast<typename Gemm::StrideD*>(d_strides + 2 * num_exp * 3);
   auto* d_s_strides = reinterpret_cast<typename Gemm::StrideS*>(d_strides + 3 * num_exp * 3);
 
-  // DEBUG: dump pointers + strides to host for inspection
-  {
-    printf("[W4AFP8_DEBUG] n=%d k=%d num_exp=%d a_base=%p b_base=%p out_base=%p scales_base=%p\n",
-           n, k, num_exp, a_activations, b_weights, d_output, b_scales);
-    for (int e = 0; e < num_exp && e < 8; ++e) {
-      const int8_t* bp = nullptr; const int8_t* ap = nullptr;
-      int8_t* op = nullptr; const int8_t* sp = nullptr;
-      cudaMemcpy(&ap, d_a_ptrs + e, 8, cudaMemcpyDeviceToHost);
-      cudaMemcpy(&bp, d_b_ptrs + e, 8, cudaMemcpyDeviceToHost);
-      cudaMemcpy(&op, d_out_ptrs + e, 8, cudaMemcpyDeviceToHost);
-      cudaMemcpy(&sp, d_b_scales_ptrs + e, 8, cudaMemcpyDeviceToHost);
-      int32_t off = 0;
-      cudaMemcpy(&off, expert_offsets + e, 4, cudaMemcpyDeviceToHost);
-      printf("[W4AFP8_DEBUG] e=%d off=%d a=%p b=%p out=%p s=%p\n", e, off, ap, bp, op, sp);
-    }
-    int64_t s[12];
-    cudaMemcpy(s, d_strides, sizeof(s), cudaMemcpyDeviceToHost);
-    printf("[W4AFP8_DEBUG] strides: a=%ld,%ld,%ld b=%ld,%ld,%ld d=%ld,%ld,%ld s=%ld,%ld,%ld\n",
-           s[0],s[1],s[2], s[3],s[4],s[5], s[6],s[7],s[8], s[9],s[10],s[11]);
-    int32_t ps[12];
-    cudaMemcpy(ps, problem_sizes, sizeof(ps), cudaMemcpyDeviceToHost);
-    printf("[W4AFP8_DEBUG] problem_sizes: %d,%d,%d %d,%d,%d %d,%d,%d %d,%d,%d\n",
-           ps[0],ps[1],ps[2], ps[3],ps[4],ps[5], ps[6],ps[7],ps[8], ps[9],ps[10],ps[11]);
-    fflush(stdout);
-  }
-
   cutlass::KernelHardwareInfo hw_info;
   int dev = 0;
   cudaGetDevice(&dev);

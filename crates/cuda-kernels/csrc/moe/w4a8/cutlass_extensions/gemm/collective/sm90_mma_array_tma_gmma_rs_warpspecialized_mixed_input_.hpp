@@ -1495,8 +1495,12 @@ struct CollectiveMmaArrayMixedInput<
   template <class... TMs>
   CUTLASS_DEVICE void
   tensormaps_cp_fence_release(TensorMapStorage& shared_tensormaps, cute::tuple<TMs...> const& input_tensormaps) {
-    // CUTLASS 3.7.0: tma_descriptor_cp_fence_release is a single PTX instruction;
-    // tma_desc_commit_group/wait_group (added in 3.8+) are not needed.
+    // Commit TMA descriptor dims/strides updates so the hardware sees them
+    // before the fence release. SGLang added these (missing in CUTLASS 3.7.0).
+    if (cute::elect_one_sync()) {
+      asm volatile("cp.async.bulk.commit_group;");
+      asm volatile("cp.async.bulk.wait_group.read %0;" : : "n"(0) : "memory");
+    }
     // Entire warp must do this (i.e. it's aligned)
     tma_descriptor_cp_fence_release(get<0>(input_tensormaps), shared_tensormaps.smem_tensormap_A);
     tma_descriptor_cp_fence_release(get<1>(input_tensormaps), shared_tensormaps.smem_tensormap_B);
