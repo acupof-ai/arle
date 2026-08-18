@@ -28,12 +28,16 @@ export CMAKE_CUDA_ARCHITECTURES=90
 # then fails loudly; install via `scripts/pod.sh setup-tilelang`. (Single-crate
 # builds like -p autograd don't touch this.)
 if [ -z "${INFER_TILELANG_PYTHON:-}" ]; then
+  # Match the CI trusted producer's pin exactly — a loose >= probe let the pod
+  # build kernels with a different codegen than the published bundle.
+  tilelang_pin="$(grep -oE 'tilelang==[0-9.]+' "${TREE:-/host/arle-build}/requirements-build.txt" 2>/dev/null | cut -d= -f3)"
+  tilelang_pin="${tilelang_pin:-0.1.13}"
   for python in \
     "${TREE:-/host/arle-build}/crates/cuda-kernels/tools/tilelang/.venv/bin/python" \
     /host/arle-build/crates/cuda-kernels/tools/tilelang/.venv/bin/python \
     "$(command -v python3 2>/dev/null)"; do
     [ -x "$python" ] || continue
-    if "$python" -c 'import tilelang; assert tuple(map(int, tilelang.__version__.split(".")[:3])) >= (0, 1, 11)' >/dev/null 2>&1; then
+    if "$python" -c "import importlib.metadata as m; assert m.version('tilelang') == '$tilelang_pin'" >/dev/null 2>&1; then
       export INFER_TILELANG_PYTHON="$python"
       break
     fi
