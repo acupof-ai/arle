@@ -113,6 +113,28 @@ static constexpr size_t metadata_bytes(int num_experts) {
   return static_cast<size_t>(num_experts) * (5 * 8 + 4 * 24);
 }
 
+// Device-side pointer computation, copied from SGLang's int4_fp8_get_group_gemm_starts.
+// Grid: 1 block, num_experts threads. Scale offsets in BF16 elements (SGLang convention).
+__global__ void w4a8_get_group_gemm_starts(
+    const int32_t* __restrict__ expert_offsets,
+    const MmaType** a_offsets,
+    const QuantType** b_offsets,
+    ElementD** out_offsets,
+    const cutlass::bfloat16_t** b_scales_offsets,
+    const MmaType* a_base,
+    const QuantType* b_base,
+    ElementD* out_base,
+    const cutlass::bfloat16_t* b_scales_base,
+    int64_t n, int64_t k, int num_experts) {
+  int e = threadIdx.x;
+  if (e >= num_experts) return;
+  int32_t off = expert_offsets[e];
+  a_offsets[e] = a_base + static_cast<size_t>(off) * k;
+  b_offsets[e] = b_base + static_cast<size_t>(e) * k * n / 2;
+  out_offsets[e] = out_base + static_cast<size_t>(off) * n;
+  b_scales_offsets[e] = b_scales_base + static_cast<size_t>(e) * n * k / 128;
+}
+
 template <typename Gemm>
 int run_grouped_gemm(
     void* d_output,
@@ -136,51 +158,38 @@ int run_grouped_gemm(
 
   const int64_t k_ld = static_cast<int64_t>(k);
   const int64_t n_ld = static_cast<int64_t>(n);
-
-  // Static host arrays: graph capture records the memcpy source pointer, so the
-  // host memory must survive replay. 512 experts max (DSv4-Flash = 256 at TP=1).
-  static constexpr int MAX_EXPERTS = 512;
   const int num_exp = num_experts;
+
+  // Strides: SGLang fills all three components with the leading dimension.
+  static constexpr int MAX_EXPERTS = 512;
   if (num_exp > MAX_EXPERTS) return -6;
-  static const MmaType* h_a_ptrs[MAX_EXPERTS];
-  static const QuantType* h_b_ptrs[MAX_EXPERTS];
-  static ElementD* h_out_ptrs[MAX_EXPERTS];
-  static const typename Gemm::ElementScalePacked* h_b_scales_ptrs[MAX_EXPERTS];
   static int64_t h_strides[MAX_EXPERTS * 3 * 4];
-
   for (int e = 0; e < num_exp; ++e) {
-    int32_t off = expert_offsets[e];
-    h_a_ptrs[e] = static_cast<const MmaType*>(a_activations) + static_cast<size_t>(off) * k;
-    h_b_ptrs[e] = static_cast<const QuantType*>(b_weights) + static_cast<size_t>(e) * n * (k / 2);
-    h_out_ptrs[e] = static_cast<ElementD*>(d_output) + static_cast<size_t>(off) * n;
-    // Scale tensor is [E, K//512, N*4] BF16 = [E, K//512, N] ElementScalePacked.
-    h_b_scales_ptrs[e] = static_cast<const typename Gemm::ElementScalePacked*>(b_scales)
-                         + static_cast<size_t>(e) * (k / 512) * n;
-
-    // SGLang fills all three stride components with the leading dimension.
     for (int j = 0; j < 3; ++j) {
-      h_strides[(0 * num_exp + e) * 3 + j] = k_ld;  // a_strides
-      h_strides[(1 * num_exp + e) * 3 + j] = k_ld;  // b_strides
-      h_strides[(2 * num_exp + e) * 3 + j] = n_ld;  // d_strides
-      h_strides[(3 * num_exp + e) * 3 + j] = n_ld;  // s_strides
+      h_strides[(0 * num_exp + e) * 3 + j] = k_ld;
+      h_strides[(1 * num_exp + e) * 3 + j] = k_ld;
+      h_strides[(2 * num_exp + e) * 3 + j] = n_ld;
+      h_strides[(3 * num_exp + e) * 3 + j] = n_ld;
     }
   }
+  cudaMemcpyAsync(meta_d + 5 * num_exp * 8, h_strides,
+                  num_exp * 24 * 4, cudaMemcpyHostToDevice, stream);
 
-  // Device layout must match the pointer reinterpretation below:
-  // b_ptrs, a_ptrs, out_ptrs, (skip a_scales), b_scales_ptrs, strides.
-  size_t off = 0;
-  cudaMemcpyAsync(meta_d + off, h_b_ptrs, num_exp * 8, cudaMemcpyHostToDevice, stream); off += num_exp * 8;
-  cudaMemcpyAsync(meta_d + off, h_a_ptrs, num_exp * 8, cudaMemcpyHostToDevice, stream); off += num_exp * 8;
-  cudaMemcpyAsync(meta_d + off, h_out_ptrs, num_exp * 8, cudaMemcpyHostToDevice, stream); off += num_exp * 8;
-  // a_scales is a scalar — no pointer array needed; alpha_ptr points directly to it.
-  off += num_exp * 8;  // skip a_scales_ptrs slot (unused)
-  cudaMemcpyAsync(meta_d + off, h_b_scales_ptrs, num_exp * 8, cudaMemcpyHostToDevice, stream); off += num_exp * 8;
-  cudaMemcpyAsync(meta_d + off, h_strides, num_exp * 24 * 4, cudaMemcpyHostToDevice, stream);
-
+  // Device-side pointer computation (matches SGLang's int4_fp8_get_group_gemm_starts).
   auto* d_b_ptrs = reinterpret_cast<const QuantType**>(meta_d);
   auto* d_a_ptrs = reinterpret_cast<const MmaType**>(meta_d + num_exp * 8);
   auto* d_out_ptrs = reinterpret_cast<ElementD**>(meta_d + 2 * num_exp * 8);
   auto* d_b_scales_ptrs = reinterpret_cast<const typename Gemm::ElementScalePacked**>(meta_d + 4 * num_exp * 8);
+
+  w4a8_get_group_gemm_starts<<<1, num_exp, 0, stream>>>(
+      expert_offsets, d_a_ptrs, d_b_ptrs, d_out_ptrs,
+      reinterpret_cast<const cutlass::bfloat16_t**>(d_b_scales_ptrs),
+      static_cast<const MmaType*>(a_activations),
+      static_cast<const QuantType*>(b_weights),
+      static_cast<ElementD*>(d_output),
+      static_cast<const cutlass::bfloat16_t*>(b_scales),
+      n, k, num_exp);
+
   auto* d_a_strides = reinterpret_cast<typename Gemm::StrideA*>(meta_d + 5 * num_exp * 8);
   auto* d_b_strides = reinterpret_cast<typename Gemm::StrideB*>(meta_d + 5 * num_exp * 8 + num_exp * 24);
   auto* d_d_strides = reinterpret_cast<typename Gemm::StrideD*>(meta_d + 5 * num_exp * 8 + 2 * num_exp * 24);
