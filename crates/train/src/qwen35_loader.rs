@@ -1074,26 +1074,41 @@ fn plan_fp8_cuda_frozen_base(
         return Ok(None);
     }
 
-    let scale_name = fp8_scale_tensor_name(hf_name)?;
+    let base = hf_name.strip_suffix(".weight").ok_or_else(|| {
+        LoaderError::Custom(format!("FP8 tensor {hf_name} is missing the .weight suffix"))
+    })?;
+    let block_scaled_name = format!("{base}.weight_scale_inv");
+    let per_channel_name = format!("{base}.weight_scale");
+
+    // compressed-tensors per-channel FP8 is block-scaled with block [1, K] --
+    // the same reuse the serving path makes in infer-cuda/src/quant_format.rs,
+    // so no new format is involved here either.
+    let (scale_name, block_m, block_k) = if hf_name_to_shard.contains_key(&block_scaled_name) {
+        (block_scaled_name, QWEN36_FP8_BLOCK_M, QWEN36_FP8_BLOCK_K)
+    } else if hf_name_to_shard.contains_key(&per_channel_name) {
+        (per_channel_name, 1, expected_shape[1])
+    } else {
+        // Not MissingTensor: the candidate loop reads that variant as "this
+        // weight name does not exist, try the next one", which would swallow
+        // the real cause and report the weight itself as absent.
+        return Err(LoaderError::Custom(format!(
+            "{hf_name} is F8_E4M3 but has neither {block_scaled_name} nor {per_channel_name}"
+        )));
+    };
+
     let scale_shard_idx = *hf_name_to_shard
         .get(&scale_name)
-        .ok_or_else(|| LoaderError::MissingTensor(scale_name.clone()))?;
+        .expect("presence checked above");
     let scale_view = safetensors_views[scale_shard_idx]
         .tensor(&scale_name)
         .map_err(|err| LoaderError::Safetensors(format!("{scale_name}: {err}")))?;
-    validate_fp8_scale_view(
-        &scale_name,
-        &scale_view,
-        expected_shape,
-        QWEN36_FP8_BLOCK_M,
-        QWEN36_FP8_BLOCK_K,
-    )?;
+    validate_fp8_scale_view(&scale_name, &scale_view, expected_shape, block_m, block_k)?;
 
     Ok(Some(PlannedFp8BlockScaled {
         scale_name,
         scale_shard_idx,
-        block_m: QWEN36_FP8_BLOCK_M,
-        block_k: QWEN36_FP8_BLOCK_K,
+        block_m,
+        block_k,
     }))
 }
 
@@ -1128,18 +1143,24 @@ fn plan_fp4_cuda_frozen_base(
     let scale_name = format!("{base}.weight_scale");
     let global_scale_name = format!("{base}.weight_global_scale");
 
-    let scale_shard_idx = *hf_name_to_shard
-        .get(&scale_name)
-        .ok_or_else(|| LoaderError::MissingTensor(scale_name.clone()))?;
-    let global_scale_shard_idx = *hf_name_to_shard
-        .get(&global_scale_name)
-        .ok_or_else(|| LoaderError::MissingTensor(global_scale_name.clone()))?;
+    let scale_shard_idx = *hf_name_to_shard.get(&scale_name).ok_or_else(|| {
+        LoaderError::Custom(format!("{hf_name} is NVFP4 but has no {scale_name}"))
+    })?;
+    let global_scale_shard_idx =
+        *hf_name_to_shard.get(&global_scale_name).ok_or_else(|| {
+            LoaderError::Custom(format!(
+                "{hf_name} is NVFP4 but has no {global_scale_name}"
+            ))
+        })?;
 
     let scale_view = safetensors_views[scale_shard_idx]
         .tensor(&scale_name)
         .map_err(|err| LoaderError::Safetensors(format!("{scale_name}: {err}")))?;
     if scale_view.dtype() != Dtype::F8_E4M3 {
-        return Err(LoaderError::UnsupportedDtype(scale_view.dtype(), scale_name));
+        return Err(LoaderError::UnsupportedDtype(
+            scale_view.dtype(),
+            scale_name,
+        ));
     }
     let scale_shape = scale_view.shape().to_vec();
     if scale_shape.len() != 2 || scale_shape[0] != expected_shape[0] {
@@ -1169,17 +1190,6 @@ fn plan_fp4_cuda_frozen_base(
         group_size,
         scale_cols,
     }))
-}
-
-fn fp8_scale_tensor_name(hf_name: &str) -> Result<String> {
-    let base = hf_name.strip_suffix(".weight").ok_or_else(|| {
-        LoaderError::Custom(format!(
-            "FP8 tensor {hf_name} is missing the .weight suffix. Hint: \
-             Qwen3.6 FP8 block-scaled weights must have a matching \
-             *.weight_scale_inv side tensor."
-        ))
-    })?;
-    Ok(format!("{base}.weight_scale_inv"))
 }
 
 fn validate_fp8_scale_view(
@@ -1327,13 +1337,11 @@ fn load_planned_tensor_into_slot(
         let scales = scale_view.data().to_vec();
         let global_view = safetensors_views[fp4.global_scale_shard_idx]
             .tensor(&fp4.global_scale_name)
-            .map_err(|err| {
-                LoaderError::Safetensors(format!("{}: {err}", fp4.global_scale_name))
-            })?;
+            .map_err(|err| LoaderError::Safetensors(format!("{}: {err}", fp4.global_scale_name)))?;
         let global = dtype_to_f32(&global_view, &fp4.global_scale_name)?;
-        let global_scale = *global.first().ok_or_else(|| {
-            LoaderError::Custom(format!("{} is empty", fp4.global_scale_name))
-        })?;
+        let global_scale = *global
+            .first()
+            .ok_or_else(|| LoaderError::Custom(format!("{} is empty", fp4.global_scale_name)))?;
         let weight = view.data();
         let handle = store
             .backend()
