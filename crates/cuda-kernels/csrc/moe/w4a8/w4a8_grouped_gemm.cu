@@ -108,23 +108,26 @@ using SM90_PP = SM90W4A8Config<M, N, K, A, B, C, Sched::PP>;
 template <int M, int N, int K, int A, int B, int C>
 using SM90_CO = SM90W4A8Config<M, N, K, A, B, C, Sched::CO>;
 
-// Workspace layout: pointer arrays (5×E×8) + stride arrays (4×E×24) + CUTLASS workspace.
+// Workspace layout: pointer arrays (4×E×8) + stride arrays (4×E×24) + CUTLASS workspace.
 static constexpr size_t metadata_bytes(int num_experts) {
-  return static_cast<size_t>(num_experts) * (5 * 8 + 4 * 24);
+  return static_cast<size_t>(num_experts) * (4 * 8 + 4 * 24);
 }
 
 }  // namespace
 
-// Device-side pointer computation, copied from SGLang's int4_fp8_get_group_gemm_starts.
-// Grid: 1 block, num_experts threads. Scale offsets in BF16 elements (SGLang convention).
-// Must be outside the anonymous namespace above — CUTLASS headers define their own
-// anonymous namespace in the same TU, causing ambiguous reference errors (nvcc).
+// Device-side pointer + stride computation, copied from SGLang's
+// int4_fp8_get_group_gemm_starts. Grid: 1 block, num_experts threads.
+// Each thread writes its expert's 4 pointers and 12 stride values directly
+// into the workspace, eliminating the host fill loop + cudaMemcpyAsync.
+// Must be outside the anonymous namespace above — CUTLASS headers define their
+// own anonymous namespace in the same TU, causing ambiguous reference errors (nvcc).
 __global__ void w4a8_get_group_gemm_starts(
     const int32_t* __restrict__ expert_offsets,
     const cutlass::float_e4m3_t** a_offsets,
     const cutlass::int4b_t** b_offsets,
     cutlass::bfloat16_t** out_offsets,
     const cutlass::bfloat16_t** b_scales_offsets,
+    int64_t* stride_base,
     const cutlass::float_e4m3_t* a_base,
     const cutlass::int4b_t* b_base,
     cutlass::bfloat16_t* out_base,
@@ -137,6 +140,17 @@ __global__ void w4a8_get_group_gemm_starts(
   b_offsets[e] = b_base + static_cast<size_t>(e) * k * n / 2;
   out_offsets[e] = out_base + static_cast<size_t>(off) * n;
   b_scales_offsets[e] = b_scales_base + static_cast<size_t>(e) * n * k / 128;
+  // Strides: SGLang fills all three components with the leading dimension.
+  int64_t* a_s = stride_base + static_cast<size_t>(e) * 3;
+  int64_t* b_s = a_s + static_cast<size_t>(num_experts) * 3;
+  int64_t* d_s = b_s + static_cast<size_t>(num_experts) * 3;
+  int64_t* s_s = d_s + static_cast<size_t>(num_experts) * 3;
+  for (int j = 0; j < 3; ++j) {
+    a_s[j] = k;
+    b_s[j] = k;
+    d_s[j] = n;
+    s_s[j] = n;
+  }
 }
 
 namespace {
@@ -162,44 +176,30 @@ int run_grouped_gemm(
   void* cutlass_ws = meta_d + meta_bytes;
   size_t cutlass_ws_bytes = workspace_bytes - meta_bytes;
 
-  const int64_t k_ld = static_cast<int64_t>(k);
-  const int64_t n_ld = static_cast<int64_t>(n);
   const int num_exp = num_experts;
 
-  // Strides: SGLang fills all three components with the leading dimension.
-  static constexpr int MAX_EXPERTS = 512;
-  if (num_exp > MAX_EXPERTS) return -6;
-  static int64_t h_strides[MAX_EXPERTS * 3 * 4];
-  for (int e = 0; e < num_exp; ++e) {
-    for (int j = 0; j < 3; ++j) {
-      h_strides[(0 * num_exp + e) * 3 + j] = k_ld;
-      h_strides[(1 * num_exp + e) * 3 + j] = k_ld;
-      h_strides[(2 * num_exp + e) * 3 + j] = n_ld;
-      h_strides[(3 * num_exp + e) * 3 + j] = n_ld;
-    }
-  }
-  cudaMemcpyAsync(meta_d + 5 * num_exp * 8, h_strides,
-                  num_exp * 24 * 4, cudaMemcpyHostToDevice, stream);
-
-  // Device-side pointer computation (matches SGLang's int4_fp8_get_group_gemm_starts).
+  // Device-side pointer + stride computation (matches SGLang's
+  // int4_fp8_get_group_gemm_starts).
   auto* d_b_ptrs = reinterpret_cast<const QuantType**>(meta_d);
   auto* d_a_ptrs = reinterpret_cast<const MmaType**>(meta_d + num_exp * 8);
   auto* d_out_ptrs = reinterpret_cast<ElementD**>(meta_d + 2 * num_exp * 8);
-  auto* d_b_scales_ptrs = reinterpret_cast<const typename Gemm::ElementScalePacked**>(meta_d + 4 * num_exp * 8);
+  auto* d_b_scales_ptrs = reinterpret_cast<const typename Gemm::ElementScalePacked**>(meta_d + 3 * num_exp * 8);
+  auto* d_strides = reinterpret_cast<int64_t*>(meta_d + 4 * num_exp * 8);
 
   w4a8_get_group_gemm_starts<<<1, num_exp, 0, stream>>>(
       expert_offsets, d_a_ptrs, d_b_ptrs, d_out_ptrs,
       reinterpret_cast<const cutlass::bfloat16_t**>(d_b_scales_ptrs),
+      d_strides,
       static_cast<const MmaType*>(a_activations),
       static_cast<const QuantType*>(b_weights),
       static_cast<ElementD*>(d_output),
       static_cast<const cutlass::bfloat16_t*>(b_scales),
       n, k, num_exp);
 
-  auto* d_a_strides = reinterpret_cast<typename Gemm::StrideA*>(meta_d + 5 * num_exp * 8);
-  auto* d_b_strides = reinterpret_cast<typename Gemm::StrideB*>(meta_d + 5 * num_exp * 8 + num_exp * 24);
-  auto* d_d_strides = reinterpret_cast<typename Gemm::StrideD*>(meta_d + 5 * num_exp * 8 + 2 * num_exp * 24);
-  auto* d_s_strides = reinterpret_cast<typename Gemm::StrideS*>(meta_d + 5 * num_exp * 8 + 3 * num_exp * 24);
+  auto* d_a_strides = reinterpret_cast<typename Gemm::StrideA*>(d_strides);
+  auto* d_b_strides = reinterpret_cast<typename Gemm::StrideB*>(d_strides + num_exp * 3);
+  auto* d_d_strides = reinterpret_cast<typename Gemm::StrideD*>(d_strides + 2 * num_exp * 3);
+  auto* d_s_strides = reinterpret_cast<typename Gemm::StrideS*>(d_strides + 3 * num_exp * 3);
 
   cutlass::KernelHardwareInfo hw_info;
   int dev = 0;
@@ -382,8 +382,8 @@ extern "C" void w4a8_swiglu_fused(
 // b_weights:      INT4 packed [E, N, K/2]
 // a_scale:        pointer to single float (per-tensor activation scale)
 // b_scales:       BF16 [E, K//512, N*4]
-// expert_offsets: HOST int32 [E] cumulative token counts (read host-side for
-//                 per-expert pointer computation; caller must D2H first)
+// expert_offsets: DEVICE int32 [E] cumulative token counts (read device-side
+//                 by the w4a8_get_group_gemm_starts kernel)
 // problem_sizes:  int32 [E, 3] (M, N, K per expert)
 // total_m:        total token-expert pairs (= num_tokens * topk)
 // topk:           experts per token (for tile shape heuristic)
