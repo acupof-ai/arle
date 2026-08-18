@@ -973,7 +973,7 @@ impl QwenCudaExecutor {
                 // to the prior behavior.
                 /* allow_prefetch = */
                 false,
-                // Single-rank arm: nothing to reconcile across shards.
+                // Single-rank: no shard to reconcile against.
                 None,
             )?;
             state.take_evict_pages()

@@ -13,8 +13,8 @@
 //!
 //! Under the write-through model (supersedes the swap
 //! plan), this module owns the **decode attend-resident** verb (the restricted
-//! page table), the **R6 reps** (mean-pooled K kept resident, computed once a
-//! block freezes — exactly the write-through-time rep), AND the **evict-drop
+//! page table), the **R6 reps** (a per-channel key envelope kept resident, computed once a
+//! block freezes), AND the **evict-drop
 //! selection** ([`CudaRecallState::take_evict_pages`]): the cold middle pages
 //! outside the working set whose HBM page is returned to the pool. The other
 //! write-through verbs (mirror at page-fill / prefetch at prefill) live on the
@@ -55,7 +55,7 @@ pub(crate) fn default_recall_config() -> infer_core::RecallConfig {
 }
 
 #[cfg(feature = "cuda")]
-pub(crate) use cuda_impl::{CudaRecallState, RecallShardReduce};
+pub(crate) use cuda_impl::CudaRecallState;
 
 #[cfg(feature = "cuda")]
 mod cuda_impl {
@@ -63,21 +63,21 @@ mod cuda_impl {
     use cuda_kernels::prelude::{DeviceContext, EVICTED_PAGE, PagedKVPool};
     use infer_seam::ShardSpec;
 
-    /// Cross-shard reductions that keep every 2D rank planning identically.
-    /// Without them a rank scores only its own sequence slice and head shard,
-    /// selects a different top-k, and evicts pages its peers kept — no block ends
-    /// up fully resident anywhere.
-    pub(crate) struct RecallShardReduce<'a> {
-        /// Element-wise min over `lo` and max over `hi` across the sequence-shard
-        /// (`attn_cp`) group.
-        pub(crate) widen: &'a dyn Fn(&mut [f32], &mut [f32]) -> Result<()>,
-        /// Sum across the head-shard (`attn_tp`) group.
-        pub(crate) sum_scores: &'a dyn Fn(&mut [f32]) -> Result<()>,
+    /// This shard's `(global page, local page-table index)` pairs covering the
+    /// token range `[start, end)` — the one spelling of that mapping in this file.
+    fn local_pages(
+        start: usize,
+        end: usize,
+        page_size: usize,
+        shard: ShardSpec,
+    ) -> impl Iterator<Item = (usize, usize)> {
+        (start / page_size..end.div_ceil(page_size))
+            .filter_map(move |gp| shard.local_index(gp).map(|li| (gp, li)))
     }
 
     /// Per-slot session KV-recall state for the dense-Qwen3 paged decode path.
     ///
-    /// Holds the resident per-middle-block mean-key reps (so offloaded blocks
+    /// Holds the resident per-middle-block key envelopes (so offloaded blocks
     /// stay scorable) and the page plan for the NEXT decode step (stale-Q:
     /// this step's query selects next step's pages — licensed). Empty/`None`
     /// unless recall is enabled and the session has exceeded the budget.
@@ -85,20 +85,20 @@ mod cuda_impl {
     pub(crate) struct CudaRecallState {
         /// CP shard ownership (rank, size). Default = no sharding (rank 0, size 1).
         shard: ShardSpec,
-        /// Resident per-middle-block key envelopes: layer-0 K reduced over the
-        /// block's `l_bs` tokens to a per-channel `[min | max]` pair, flattened
-        /// `2 * nkv * hd` f32 (min half first). Index = middle block index (token
-        /// base `n_init + i * l_bs`). Keeps offloaded blocks scorable.
+        /// Per-middle-block key envelope, `blocks × nkv*hd` f32 each: layer-0 K
+        /// reduced over the block's `l_bs` tokens to a per-channel min (`lo`) and
+        /// max (`hi`). Block `i` covers token base `n_init + i * l_bs`.
         ///
-        /// An interval, not a mean: K is cached post-RoPE, and averaging over
-        /// `l_bs` consecutive positions rotates each key by a different angle, so
-        /// the high-frequency channels cancel toward zero and the score carries no
-        /// ranking signal (measured 2026-08-18: 0/16 at every context length, flat
-        /// in how much of the middle was retained). The envelope survives rotation
-        /// and makes `max q·k` boundable, which is what top-k needs.
+        /// An interval, not a mean: K is cached post-RoPE, so averaging over
+        /// `l_bs` consecutive positions rotates each key by a different angle and
+        /// the high-frequency channels cancel to zero. The envelope survives that,
+        /// and bounds `max q·k`, which is what top-k needs.
         ///
-        /// Under CP each envelope covers only this shard's local tokens.
-        block_reps: Vec<Vec<f32>>,
+        /// Under CP each envelope covers only this shard's tokens until
+        /// [`Self::widen_envelopes`] reduces it across the group. Flat so that
+        /// reduction hands the collective a slice with no marshalling.
+        lo: Vec<f32>,
+        hi: Vec<f32>,
         /// Selected page IDs for the next decode step (sink ∪ recalled ∪ local),
         /// ascending temporal order. `None` = session fits budget → full
         /// contiguous page table (byte-identical default).
@@ -134,18 +134,28 @@ mod cuda_impl {
         /// Reset on slot reuse (new occupant): drop the prior session's reps and
         /// plan so a fresh request starts from the byte-identical default.
         pub(crate) fn reset(&mut self) {
-            self.block_reps.clear();
+            self.lo.clear();
+            self.hi.clear();
             self.recall_pages = None;
             self.recall_ranges.clear();
             self.evict_pages.clear();
             self.prefetch_pages.clear();
         }
 
-        /// Grow resident mean-key reps for newly-frozen middle blocks.
+        /// Blocks whose envelope is already built.
+        fn blocks(&self, hd_len: usize) -> usize {
+            if hd_len == 0 {
+                0
+            } else {
+                self.lo.len() / hd_len
+            }
+        }
+
+        /// Grow envelopes for newly-frozen middle blocks.
         ///
         /// A block is "frozen" once it has left the local window
-        /// (`base + l_bs <= cache_len - n_local`), so its K is final and the rep
-        /// is computed exactly once. Only newly-completed blocks are read back.
+        /// (`base + l_bs <= cache_len - n_local`), so its K is final and the
+        /// envelope is computed exactly once. Only new blocks are read back.
         fn update_block_reps(
             &mut self,
             ctx: &DeviceContext,
@@ -159,75 +169,71 @@ mod cuda_impl {
             if cfg.l_bs == 0 || cache_len <= cfg.n_init + cfg.n_local {
                 return Ok(());
             }
+            let hd_len = num_kv_heads * head_dim;
             let mid_span = cache_len - cfg.n_init - cfg.n_local;
             let frozen_blocks = mid_span / cfg.l_bs;
-            if frozen_blocks <= self.block_reps.len() {
+            let have = self.blocks(hd_len);
+            if frozen_blocks <= have {
                 return Ok(());
             }
             let page_size = pool.page_size;
             let pages = pool.page_indices(slot);
             // Layer-0 BF16 K plane: [max_pages, num_kv_heads, page_size, head_dim].
             let k0 = pool.k_data_slice(0);
-            let hd_len = num_kv_heads * head_dim;
-            let page_elems = num_kv_heads * page_size * head_dim;
-            let page_bytes = page_elems * 2;
+            let page_bytes = num_kv_heads * page_size * head_dim * 2;
 
-            for block in self.block_reps.len()..frozen_blocks {
+            for block in have..frozen_blocks {
                 let base = cfg.n_init + block * cfg.l_bs;
                 // A just-frozen block is still resident this step (it only left the
-                // local window now), so its rep is computed before any evict-drop.
-                // Guard defensively: if a span page is already an evict sentinel,
-                // stop growing reps here (we cannot reconstruct a freed block's
-                // mean key; it stays prefix-only-recallable per R1). Never advance
-                // `block_reps` past a sentinel block — that would misalign scoring.
-                // Under CP, only this shard's pages are checked/read.
-                let span_resident = (base..base + cfg.l_bs)
-                    .filter_map(|pos| self.shard.local_index(pos / page_size))
-                    .all(|li| pages[li] != EVICTED_PAGE);
-                if !span_resident {
+                // local window now), so its envelope is built before any evict-drop.
+                // Stop at a sentinel span rather than skipping it: a freed block's
+                // keys cannot be reconstructed, and advancing past it would
+                // misalign every later block's index.
+                let span = || local_pages(base, base + cfg.l_bs, page_size, self.shard);
+                if !span().all(|(_, li)| pages[li] != EVICTED_PAGE) {
                     break;
                 }
-                let mut lo = vec![f32::INFINITY; hd_len];
-                let mut hi = vec![f32::NEG_INFINITY; hd_len];
+                // A block with no local page (cp_size >= 4, l_bs < cp * page_size)
+                // keeps the min/max identity, so a cross-shard widen leaves the
+                // covering ranks' values untouched.
+                let at = self.lo.len();
+                self.lo.resize(at + hd_len, f32::INFINITY);
+                self.hi.resize(at + hd_len, f32::NEG_INFINITY);
+                let (lo, hi) = (&mut self.lo[at..], &mut self.hi[at..]);
                 // One readback per PAGE, not per token: `n_init`/`n_local`/`l_bs`
                 // are forced to page multiples, so a block is a whole number of
                 // pages and the per-token form re-read each page `page_size` times.
-                for gp in (base / page_size)..(base + cfg.l_bs).div_ceil(page_size) {
-                    let Some(li) = self.shard.local_index(gp) else {
-                        continue;
-                    };
+                for (gp, li) in span() {
                     let page = pages[li] as usize;
                     let start = page * page_bytes;
                     let bytes = ctx
                         .stream
                         .clone_dtoh(&k0.slice(start..start + page_bytes))
                         .map_err(|e| anyhow::anyhow!("recall K page dtoh failed: {e}"))?;
-                    // [num_kv_heads, page_size, head_dim] → token `row` is
-                    // [num_kv_heads, head_dim] at stride page_size over the
-                    // middle axis.
+                    // [num_kv_heads, page_size, head_dim]: token `row` of head `h`
+                    // is contiguous over head_dim at (h * page_size + row).
                     for row in 0..page_size {
                         let pos = gp * page_size + row;
                         if pos < base || pos >= base + cfg.l_bs {
-                            continue;
+                            continue; // partial page (config not page-aligned)
                         }
                         for h in 0..num_kv_heads {
-                            let head_base = (h * page_size + row) * head_dim;
+                            let src = (h * page_size + row) * head_dim * 2;
                             let out = h * head_dim;
-                            for d in 0..head_dim {
-                                let off = (head_base + d) * 2;
-                                let v = half::bf16::from_le_bytes([bytes[off], bytes[off + 1]])
-                                    .to_f32();
-                                lo[out + d] = lo[out + d].min(v);
-                                hi[out + d] = hi[out + d].max(v);
+                            // Zipped so the bounds checks drop and the min/max
+                            // vectorizes — this runs nkv*hd times per token.
+                            for ((l, m), c) in lo[out..out + head_dim]
+                                .iter_mut()
+                                .zip(hi[out..out + head_dim].iter_mut())
+                                .zip(bytes[src..src + head_dim * 2].chunks_exact(2))
+                            {
+                                let v = half::bf16::from_le_bytes([c[0], c[1]]).to_f32();
+                                *l = l.min(v);
+                                *m = m.max(v);
                             }
                         }
                     }
                 }
-                // A block with no local page (cp_size >= 4, l_bs < cp * page_size)
-                // keeps the min/max identity, so a cross-shard widen leaves the
-                // covering ranks' values untouched. Scoring masks it when there is
-                // no widen to come.
-                self.block_reps.push([lo, hi].concat());
             }
             Ok(())
         }
@@ -240,41 +246,36 @@ mod cuda_impl {
         /// which would mismatch the collective payload and hang the group.
         fn widen_envelopes(
             &mut self,
+            ctx: &DeviceContext,
+            tp: &crate::tp::TpRuntime,
             cache_len: usize,
             cfg: &infer_core::RecallConfig,
             hd_len: usize,
-            reduce: &RecallShardReduce<'_>,
         ) -> Result<()> {
             let nb = infer_core::recall_block_count(cache_len, cfg);
             if nb == 0 || hd_len == 0 {
                 return Ok(());
             }
-            let mut lo = vec![f32::INFINITY; nb * hd_len];
-            let mut hi = vec![f32::NEG_INFINITY; nb * hd_len];
-            for (i, rep) in self.block_reps.iter().take(nb).enumerate() {
-                if rep.len() != 2 * hd_len {
-                    continue; // no rep yet: the min/max identity stands in
-                }
-                let at = i * hd_len;
-                lo[at..at + hd_len].copy_from_slice(&rep[..hd_len]);
-                hi[at..at + hd_len].copy_from_slice(&rep[hd_len..]);
-            }
-            (reduce.widen)(&mut lo, &mut hi)?;
-            self.block_reps.truncate(nb);
-            self.block_reps.resize(nb, Vec::new());
-            for (i, rep) in self.block_reps.iter_mut().enumerate() {
-                let at = i * hd_len;
-                *rep = [&lo[at..at + hd_len], &hi[at..at + hd_len]].concat();
-            }
-            Ok(())
+            // `resize` both grows blocks this rank never built and truncates past
+            // `nb`; the fill values ARE the min/max identity, so a rank that
+            // stopped early contributes nothing to the widened result.
+            self.lo.resize(nb * hd_len, f32::INFINITY);
+            self.hi.resize(nb * hd_len, f32::NEG_INFINITY);
+            tp.reduce_f32_over(tp.attn_cp(), ctx, &mut self.lo, f32::min)?;
+            tp.reduce_f32_over(tp.attn_cp(), ctx, &mut self.hi, f32::max)
         }
 
         /// Recompute the recall page plan for the next decode step.
         ///
-        /// Scores block reps against this step's GQA-mean layer-0 query
-        /// (`q · rep`, one step stale — licensed). `recall_pages` is left `None`
-        /// when the plan is the single contiguous range (session fits budget) so
-        /// the default page table stays byte-identical.
+        /// Scores each block's key envelope against this step's GQA-mean layer-0
+        /// query, one step stale — licensed. `recall_pages` is left `None` when
+        /// the plan is the single contiguous range (session fits budget) so the
+        /// default page table stays byte-identical.
+        ///
+        /// `tp` is `Some` only under 2D, where each rank holds one sequence slice
+        /// and one head shard: the envelopes are widened over `attn_cp` and the
+        /// scores summed over `attn_tp`, or ranks select different blocks and no
+        /// block stays fully resident anywhere.
         ///
         /// `query_layer0`: post-RoPE layer-0 decode query, `[num_q_heads, head_dim]`
         /// row-major f32, GQA-mean pooled here to `[num_kv_heads, head_dim]`.
@@ -298,12 +299,22 @@ mod cuda_impl {
             head_dim: usize,
             query_layer0: &[f32],
             allow_prefetch: bool,
-            reduce: Option<&RecallShardReduce<'_>>,
+            tp: Option<&crate::tp::TpRuntime>,
         ) -> Result<()> {
             self.update_block_reps(ctx, pool, slot, cache_len, cfg, num_kv_heads, head_dim)?;
             let hd_len = num_kv_heads * head_dim;
-            if let Some(r) = reduce {
-                self.widen_envelopes(cache_len, cfg, hd_len, r)?;
+            if infer_core::recall_block_count(cache_len, cfg) == 0 {
+                // Nothing to select: the plan is the full contiguous range, which
+                // needs no query and no collective. Keep `recall_pages` at `None`
+                // so the decode path stays byte-identical.
+                self.recall_pages = None;
+                self.recall_ranges.clear();
+                self.evict_pages.clear();
+                self.prefetch_pages.clear();
+                return Ok(());
+            }
+            if let Some(tp) = tp {
+                self.widen_envelopes(ctx, tp, cache_len, cfg, hd_len)?;
             }
 
             // A short query is never legitimate — it scores every block identically
@@ -332,37 +343,29 @@ mod cuda_impl {
                 }
             }
 
-            let nb = self.block_reps.len();
+            let nb = self.blocks(hd_len);
             let page_size = pool.page_size;
             let table = pool.page_indices(slot);
             let mut scores = vec![0.0_f32; nb];
-            for (i, rep) in self.block_reps.iter().enumerate() {
+            for (i, score) in scores.iter_mut().enumerate() {
                 let base = cfg.n_init + i * cfg.l_bs;
-                let local_pages = (base..base + cfg.l_bs)
-                    .filter_map(|pos| self.shard.local_index(pos / page_size))
-                    .count();
-                let resident = local_pages > 0
-                    && (base..base + cfg.l_bs)
-                        .filter_map(|pos| self.shard.local_index(pos / page_size))
-                        .all(|li| table.get(li).copied() != Some(EVICTED_PAGE));
-                // Without an L3 tier (dense arm, `allow_prefetch=false`) a block
-                // whose pages were evict-dropped cannot be re-attended mid-decode,
-                // so mask it to `-inf` (only resident blocks compete). With the L3
-                // recall tier (`allow_prefetch=true`) an evicted block IS scorable
-                // via its resident rep and will be prefetched back if it ranks
-                // top-k — the re-recall coverage win.
-                // After a widen the envelope covers every shard's tokens, so a
-                // block this rank holds no page of is still scorable — and masking
-                // it would diverge this rank's selection from its peers'.
-                scores[i] = if reduce.is_some() || (local_pages > 0 && (resident || allow_prefetch))
-                {
+                // Without an L3 tier (dense arm) an evict-dropped block cannot be
+                // re-attended, so only resident blocks compete. With the tier it is
+                // scorable and gets prefetched back if it ranks top-k. After a
+                // widen the envelope covers every shard, so masking on THIS rank's
+                // residency would diverge its selection from its peers'.
+                let mut span = local_pages(base, base + cfg.l_bs, page_size, self.shard).peekable();
+                let scorable = tp.is_some()
+                    || (span.peek().is_some()
+                        && (allow_prefetch
+                            || span.all(|(_, li)| table.get(li).copied() != Some(EVICTED_PAGE))));
+                *score = if scorable {
                     // Upper bound on the block's max `q·k`: per channel take the
                     // better end of the key interval. A bound is what makes top-k
                     // admissible — a mean gives none.
-                    let half = rep.len() / 2;
-                    let (lo, hi) = rep.split_at(half);
-                    (0..half.min(q.len()))
-                        .map(|k| (q[k] * lo[k]).max(q[k] * hi[k]))
+                    let at = i * hd_len;
+                    (0..hd_len.min(q.len()))
+                        .map(|k| (q[k] * self.lo[at + k]).max(q[k] * self.hi[at + k]))
                         .sum()
                 } else {
                     f32::NEG_INFINITY
@@ -370,8 +373,8 @@ mod cuda_impl {
             }
             // Each rank scored only its own KV heads; the sum is the full-head
             // score, so every rank now ranks blocks identically.
-            if let Some(r) = reduce {
-                (r.sum_scores)(&mut scores)?;
+            if let Some(tp) = tp {
+                tp.reduce_f32_over(tp.attn_tp(), ctx, &mut scores, |a, b| a + b)?;
             }
 
             let plan = infer_core::plan_recall(cache_len, &scores, cfg);

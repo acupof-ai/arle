@@ -890,20 +890,7 @@ impl TpRuntime {
         input: &[u8],
         per_rank_bytes: usize,
     ) -> anyhow::Result<Vec<u8>> {
-        use anyhow::ensure;
-
-        ensure!(
-            input.len() == per_rank_bytes,
-            "all_gather_bytes input len {} must equal per-rank bytes {per_rank_bytes}",
-            input.len()
-        );
-        if per_rank_bytes == 0 {
-            return Ok(Vec::new());
-        }
-        match &self.comm {
-            TpComm::Single => Ok(input.to_vec()),
-            TpComm::Nccl(backend) => backend.all_gather_bytes(ctx, input, per_rank_bytes),
-        }
+        self.all_gather_bytes_over(&self.comm, ctx, input, per_rank_bytes)
     }
 
     /// [`Self::all_gather_bytes`] over a sub-communicator (`attn_tp`, `attn_cp`).
@@ -949,57 +936,14 @@ impl TpRuntime {
             }
             let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_ne_bytes()).collect();
             let gathered = self.all_gather_bytes_over(comm, ctx, &bytes, bytes.len())?;
-            anyhow::ensure!(
-                gathered.len() % bytes.len() == 0,
-                "reduce_f32_over: gathered {} bytes is not a multiple of the {}-byte payload",
-                gathered.len(),
-                bytes.len()
-            );
-            let mut ranks = gathered.chunks_exact(bytes.len());
-            let Some(first) = ranks.next() else {
-                return Ok(());
-            };
             let load = |c: &[u8]| f32::from_ne_bytes([c[0], c[1], c[2], c[3]]);
-            for (v, c) in values.iter_mut().zip(first.chunks_exact(4)) {
-                *v = load(c);
-            }
-            for rank in ranks {
+            for (r, rank) in gathered.chunks_exact(bytes.len()).enumerate() {
                 for (v, c) in values.iter_mut().zip(rank.chunks_exact(4)) {
-                    *v = f(*v, load(c));
+                    *v = if r == 0 { load(c) } else { f(*v, load(c)) };
                 }
             }
         }
         Ok(())
-    }
-
-    /// Broadcast `root`'s `values` to every rank of `comm`; identity on
-    /// single-rank. Under CP the prompt tail lives on one rank, so only that rank
-    /// can build the recall scoring query.
-    #[cfg(feature = "cuda")]
-    #[cfg_attr(not(all(feature = "cuda", feature = "nccl")), allow(unused_variables))]
-    pub fn broadcast_f32_over(
-        &self,
-        comm: &TpComm,
-        ctx: &cuda_kernels::prelude::DeviceContext,
-        values: &[f32],
-        root: usize,
-    ) -> anyhow::Result<Vec<f32>> {
-        #[cfg(all(feature = "cuda", feature = "nccl"))]
-        if !matches!(comm, TpComm::Single) && !values.is_empty() {
-            let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_ne_bytes()).collect();
-            let gathered = self.all_gather_bytes_over(comm, ctx, &bytes, bytes.len())?;
-            let lo = root * bytes.len();
-            anyhow::ensure!(
-                gathered.len() >= lo + bytes.len(),
-                "broadcast_f32_over: root {root} beyond the gathered {} bytes",
-                gathered.len()
-            );
-            return Ok(gathered[lo..lo + bytes.len()]
-                .chunks_exact(4)
-                .map(|c| f32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
-                .collect());
-        }
-        Ok(values.to_vec())
     }
 
     #[cfg(all(feature = "cuda", feature = "nccl"))]

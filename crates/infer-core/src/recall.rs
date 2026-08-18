@@ -52,18 +52,11 @@ impl RecallPlan {
     }
 }
 
-/// Plan the working set for a session with `cache_len` resident tokens.
-///
-/// `block_scores[i]` is the relevance of middle block `i` (e.g. `query · mean-key`);
-/// higher = more relevant. The middle is `[n_init, n_init + nb·l_bs)` where `nb` is
-/// the number of whole `l_bs` blocks that fit before the local window; any partial
-/// tail is absorbed into the local window so the plan covers `[0, cache_len)` with
-/// no gap. Returns the contiguous full range when the session fits the budget or
-/// has no evictable middle (so the default path is byte-identical to today).
-/// How many middle blocks [`plan_recall`] will score for `cache_len`.
+/// How many middle blocks [`plan_recall`] will score for `cache_len`; `0` when
+/// the session fits the budget and the plan is the full contiguous range.
 ///
 /// A function of the config and the length only, so every rank agrees on it. A
-/// cross-shard score reduction must size its payload from this rather than from
+/// cross-shard reduction must size its payload from this rather than from
 /// however many block reps a rank happens to hold — an early stop on one rank
 /// would otherwise mismatch the collective and hang the group.
 #[must_use]
@@ -75,17 +68,21 @@ pub fn recall_block_count(cache_len: usize, cfg: &RecallConfig) -> usize {
     if cfg.top_k >= nb { 0 } else { nb }
 }
 
+/// Plan the working set for a session with `cache_len` resident tokens.
+///
+/// `block_scores[i]` is the relevance of middle block `i`; higher = more
+/// relevant. The middle is `[n_init, n_init + nb·l_bs)` where `nb` is
+/// [`recall_block_count`]; any partial tail is absorbed into the local window so
+/// the plan covers `[0, cache_len)` with no gap. Returns the contiguous full
+/// range when the session fits the budget or has no evictable middle (so the
+/// default path is byte-identical to today).
 #[must_use]
 pub fn plan_recall(cache_len: usize, block_scores: &[f32], cfg: &RecallConfig) -> RecallPlan {
-    if cfg.l_bs == 0 || cache_len <= cfg.n_init + cfg.n_local + cfg.l_bs {
+    let nb = recall_block_count(cache_len, cfg);
+    if nb == 0 {
         return RecallPlan::all_resident(cache_len);
     }
     let mid_lo = cfg.n_init;
-    let mid_span = cache_len - cfg.n_init - cfg.n_local;
-    let nb = mid_span / cfg.l_bs; // whole middle blocks
-    if nb == 0 || cfg.top_k >= nb {
-        return RecallPlan::all_resident(cache_len);
-    }
     let local_start = mid_lo + nb * cfg.l_bs; // tail (n_local + partial block) is local
 
     // Select the top_k middle blocks by score (stable: higher score, then lower
