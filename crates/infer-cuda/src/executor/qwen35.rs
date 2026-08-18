@@ -2236,6 +2236,25 @@ impl Qwen35CudaExecutor {
         let num_q_heads = self.model.local_q_heads();
         let num_kv_heads = self.model.local_kv_heads();
         let head_dim = self.model.config.head_dim;
+        let two_d = self.two_d_engaged();
+        // Under CP the ring prefill splits the prompt into contiguous slices, so
+        // only the tail-owning rank captured a query. Every rank must plan from
+        // the SAME query, and every rank must contribute the same payload or the
+        // gather mismatches — hence the pad before the broadcast.
+        let layer0_query = if two_d {
+            let mut mine = layer0_query;
+            mine.resize(num_q_heads * head_dim, 0.0);
+            let cp_size = self.model.tp.attn_cp_size();
+            let root = cp_size.min(row.tokens.len()).saturating_sub(1);
+            self.model.tp.broadcast_f32_over(
+                self.model.tp.attn_cp(),
+                &self.model.ctx,
+                &mine,
+                root,
+            )?
+        } else {
+            layer0_query
+        };
         let (evict_pages, prefetch_pages) = {
             let Self {
                 recall,
@@ -2244,9 +2263,21 @@ impl Qwen35CudaExecutor {
                 ..
             } = self;
             let pool = full_attn_kv.as_ref().expect("full_attn_kv");
+            let (ctx, tp) = (&model.ctx, &model.tp);
+            let widen = |lo: &mut [f32], hi: &mut [f32]| -> Result<()> {
+                tp.reduce_f32_over(tp.attn_cp(), ctx, lo, f32::min)?;
+                tp.reduce_f32_over(tp.attn_cp(), ctx, hi, f32::max)
+            };
+            let sum_scores = |s: &mut [f32]| -> Result<()> {
+                tp.reduce_f32_over(tp.attn_tp(), ctx, s, |a, b| a + b)
+            };
+            let reduce = two_d.then(|| crate::recall::RecallShardReduce {
+                widen: &widen,
+                sum_scores: &sum_scores,
+            });
             if let Some(state) = recall.get_mut(slot) {
                 state.recompute_recall_plan(
-                    &model.ctx,
+                    ctx,
                     pool,
                     slot,
                     cache_len,
@@ -2256,6 +2287,7 @@ impl Qwen35CudaExecutor {
                     head_dim,
                     &layer0_query,
                     /* allow_prefetch = */ true,
+                    reduce.as_ref(),
                 )?;
                 (state.take_evict_pages(), state.take_prefetch_pages())
             } else {

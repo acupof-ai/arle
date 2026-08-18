@@ -55,13 +55,25 @@ pub(crate) fn default_recall_config() -> infer_core::RecallConfig {
 }
 
 #[cfg(feature = "cuda")]
-pub(crate) use cuda_impl::CudaRecallState;
+pub(crate) use cuda_impl::{CudaRecallState, RecallShardReduce};
 
 #[cfg(feature = "cuda")]
 mod cuda_impl {
     use anyhow::Result;
     use cuda_kernels::prelude::{DeviceContext, EVICTED_PAGE, PagedKVPool};
     use infer_seam::ShardSpec;
+
+    /// Cross-shard reductions that keep every 2D rank planning identically.
+    /// Without them a rank scores only its own sequence slice and head shard,
+    /// selects a different top-k, and evicts pages its peers kept — no block ends
+    /// up fully resident anywhere.
+    pub(crate) struct RecallShardReduce<'a> {
+        /// Element-wise min over `lo` and max over `hi` across the sequence-shard
+        /// (`attn_cp`) group.
+        pub(crate) widen: &'a dyn Fn(&mut [f32], &mut [f32]) -> Result<()>,
+        /// Sum across the head-shard (`attn_tp`) group.
+        pub(crate) sum_scores: &'a dyn Fn(&mut [f32]) -> Result<()>,
+    }
 
     /// Per-slot session KV-recall state for the dense-Qwen3 paged decode path.
     ///
@@ -177,7 +189,6 @@ mod cuda_impl {
                 }
                 let mut lo = vec![f32::INFINITY; hd_len];
                 let mut hi = vec![f32::NEG_INFINITY; hd_len];
-                let mut seen = false;
                 // One readback per PAGE, not per token: `n_init`/`n_local`/`l_bs`
                 // are forced to page multiples, so a block is a whole number of
                 // pages and the per-token form re-read each page `page_size` times.
@@ -211,16 +222,49 @@ mod cuda_impl {
                             }
                         }
                     }
-                    seen = true;
                 }
-                // A block with zero local pages (cp_size >= 4, l_bs < cp * page_size)
-                // has no rep on this shard; push zeros to keep block_reps aligned.
-                // Scoring masks it to -inf below.
-                self.block_reps.push(if seen {
-                    [lo, hi].concat()
-                } else {
-                    vec![0.0_f32; 2 * hd_len]
-                });
+                // A block with no local page (cp_size >= 4, l_bs < cp * page_size)
+                // keeps the min/max identity, so a cross-shard widen leaves the
+                // covering ranks' values untouched. Scoring masks it when there is
+                // no widen to come.
+                self.block_reps.push([lo, hi].concat());
+            }
+            Ok(())
+        }
+
+        /// Widen this rank's block envelopes over the sequence-shard group so
+        /// every rank scores the same intervals.
+        ///
+        /// Sized from `recall_block_count`, never from `block_reps.len()`: rep
+        /// growth stops early at a sentinel span and that point differs per rank,
+        /// which would mismatch the collective payload and hang the group.
+        fn widen_envelopes(
+            &mut self,
+            cache_len: usize,
+            cfg: &infer_core::RecallConfig,
+            hd_len: usize,
+            reduce: &RecallShardReduce<'_>,
+        ) -> Result<()> {
+            let nb = infer_core::recall_block_count(cache_len, cfg);
+            if nb == 0 || hd_len == 0 {
+                return Ok(());
+            }
+            let mut lo = vec![f32::INFINITY; nb * hd_len];
+            let mut hi = vec![f32::NEG_INFINITY; nb * hd_len];
+            for (i, rep) in self.block_reps.iter().take(nb).enumerate() {
+                if rep.len() != 2 * hd_len {
+                    continue; // no rep yet: the min/max identity stands in
+                }
+                let at = i * hd_len;
+                lo[at..at + hd_len].copy_from_slice(&rep[..hd_len]);
+                hi[at..at + hd_len].copy_from_slice(&rep[hd_len..]);
+            }
+            (reduce.widen)(&mut lo, &mut hi)?;
+            self.block_reps.truncate(nb);
+            self.block_reps.resize(nb, Vec::new());
+            for (i, rep) in self.block_reps.iter_mut().enumerate() {
+                let at = i * hd_len;
+                *rep = [&lo[at..at + hd_len], &hi[at..at + hd_len]].concat();
             }
             Ok(())
         }
@@ -254,8 +298,13 @@ mod cuda_impl {
             head_dim: usize,
             query_layer0: &[f32],
             allow_prefetch: bool,
+            reduce: Option<&RecallShardReduce<'_>>,
         ) -> Result<()> {
             self.update_block_reps(ctx, pool, slot, cache_len, cfg, num_kv_heads, head_dim)?;
+            let hd_len = num_kv_heads * head_dim;
+            if let Some(r) = reduce {
+                self.widen_envelopes(cache_len, cfg, hd_len, r)?;
+            }
 
             // A short query is never legitimate — it scores every block identically
             // and the planner's index tie-break then keeps blocks `0..top_k`, which
@@ -302,7 +351,11 @@ mod cuda_impl {
                 // recall tier (`allow_prefetch=true`) an evicted block IS scorable
                 // via its resident rep and will be prefetched back if it ranks
                 // top-k — the re-recall coverage win.
-                scores[i] = if local_pages > 0 && (resident || allow_prefetch) {
+                // After a widen the envelope covers every shard's tokens, so a
+                // block this rank holds no page of is still scorable — and masking
+                // it would diverge this rank's selection from its peers'.
+                scores[i] = if reduce.is_some() || (local_pages > 0 && (resident || allow_prefetch))
+                {
                     // Upper bound on the block's max `q·k`: per channel take the
                     // better end of the key interval. A bound is what makes top-k
                     // admissible — a mean gives none.
@@ -314,6 +367,11 @@ mod cuda_impl {
                 } else {
                     f32::NEG_INFINITY
                 };
+            }
+            // Each rank scored only its own KV heads; the sum is the full-head
+            // score, so every rank now ranks blocks identically.
+            if let Some(r) = reduce {
+                (r.sum_scores)(&mut scores)?;
             }
 
             let plan = infer_core::plan_recall(cache_len, &scores, cfg);

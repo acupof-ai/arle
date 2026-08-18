@@ -479,6 +479,7 @@ impl Qwen35Model {
                 k_batch,
                 v_batch,
                 attn_out,
+                layer0_query,
             )?;
         } else {
             let q_prepped = q_prepped.get(&self.ctx, q_dim, rows)?;
@@ -1213,6 +1214,7 @@ impl Qwen35Model {
         k_batch: &HiddenStates,
         v_batch: &HiddenStates,
         attn_out: &mut HiddenStates,
+        layer0_query: Option<&mut Vec<f32>>,
     ) -> Result<()> {
         let c = &self.config;
         let head_dim = c.head_dim;
@@ -1276,6 +1278,42 @@ impl Qwen35Model {
                     Ok(())
                 },
             )?;
+        }
+
+        // Recall scoring query, the ring twin of the dense capture in
+        // `full_attention_paged`. cp slices are contiguous, so only the
+        // tail-owning rank holds the prompt's last rows; peers receive it from
+        // the broadcast in `prefill_row_recall`, and a rank that captures nothing
+        // leaves `dst` empty for that broadcast to fill.
+        if let Some(dst) = layer0_query
+            && full_idx == 0
+            && active
+            && rows > 1
+            && cp.slices.iter().rposition(|&(_, l)| l > 0) == Some(cp_rank)
+        {
+            let host: Vec<u16> = self
+                .ctx
+                .stream
+                .clone_dtoh(&*q_ring)
+                .map_err(|e| anyhow!("recall ring q dtoh: {e}"))?;
+            const RECALL_PREFILL_Q_TOKENS: usize = 16;
+            let m = RECALL_PREFILL_Q_TOKENS.min(rows);
+            let mut q = vec![0.0_f32; q_heads * head_dim];
+            // q_ring is head-major `[q_heads, rows, head_dim]`; the dense path's
+            // `q_prepped` is row-major, so the two captures cannot share indexing.
+            for h in 0..q_heads {
+                for t in (rows - m)..rows {
+                    let base = (h * rows + t) * head_dim;
+                    for d in 0..head_dim {
+                        q[h * head_dim + d] += bf16::from_bits(host[base + d]).to_f32();
+                    }
+                }
+            }
+            let inv = 1.0_f32 / m as f32;
+            for v in &mut q {
+                *v *= inv;
+            }
+            *dst = q;
         }
 
         // Accumulator init: m=-inf, l=0, o=0 (flash-2 online softmax).
