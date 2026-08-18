@@ -73,11 +73,19 @@ mod cuda_impl {
     pub(crate) struct CudaRecallState {
         /// CP shard ownership (rank, size). Default = no sharding (rank 0, size 1).
         shard: ShardSpec,
-        /// Resident per-middle-block mean-key reps. Layer-0 K mean-pooled over
-        /// `l_bs` tokens, GQA-shaped to `[num_kv_heads, head_dim]` (flattened
-        /// `nkv * hd` f32) — keeps offloaded blocks scorable (`q · rep`).
-        /// Index = middle block index (token base `n_init + i * l_bs`).
-        /// Under CP, each rep covers only this shard's local tokens (partial mean).
+        /// Resident per-middle-block key envelopes: layer-0 K reduced over the
+        /// block's `l_bs` tokens to a per-channel `[min | max]` pair, flattened
+        /// `2 * nkv * hd` f32 (min half first). Index = middle block index (token
+        /// base `n_init + i * l_bs`). Keeps offloaded blocks scorable.
+        ///
+        /// An interval, not a mean: K is cached post-RoPE, and averaging over
+        /// `l_bs` consecutive positions rotates each key by a different angle, so
+        /// the high-frequency channels cancel toward zero and the score carries no
+        /// ranking signal (measured 2026-08-18: 0/16 at every context length, flat
+        /// in how much of the middle was retained). The envelope survives rotation
+        /// and makes `max q·k` boundable, which is what top-k needs.
+        ///
+        /// Under CP each envelope covers only this shard's local tokens.
         block_reps: Vec<Vec<f32>>,
         /// Selected page IDs for the next decode step (sink ∪ recalled ∪ local),
         /// ascending temporal order. `None` = session fits budget → full
@@ -148,6 +156,7 @@ mod cuda_impl {
             let pages = pool.page_indices(slot);
             // Layer-0 BF16 K plane: [max_pages, num_kv_heads, page_size, head_dim].
             let k0 = pool.k_data_slice(0);
+            let hd_len = num_kv_heads * head_dim;
             let page_elems = num_kv_heads * page_size * head_dim;
             let page_bytes = page_elems * 2;
 
@@ -166,14 +175,17 @@ mod cuda_impl {
                 if !span_resident {
                     break;
                 }
-                let mut rep = vec![0.0_f32; num_kv_heads * head_dim];
-                let mut local_tokens = 0u32;
-                for pos in base..base + cfg.l_bs {
-                    let Some(li) = self.shard.local_index(pos / page_size) else {
+                let mut lo = vec![f32::INFINITY; hd_len];
+                let mut hi = vec![f32::NEG_INFINITY; hd_len];
+                let mut seen = false;
+                // One readback per PAGE, not per token: `n_init`/`n_local`/`l_bs`
+                // are forced to page multiples, so a block is a whole number of
+                // pages and the per-token form re-read each page `page_size` times.
+                for gp in (base / page_size)..(base + cfg.l_bs).div_ceil(page_size) {
+                    let Some(li) = self.shard.local_index(gp) else {
                         continue;
                     };
                     let page = pages[li] as usize;
-                    let row = pos % page_size;
                     let start = page * page_bytes;
                     let bytes = ctx
                         .stream
@@ -182,28 +194,33 @@ mod cuda_impl {
                     // [num_kv_heads, page_size, head_dim] → token `row` is
                     // [num_kv_heads, head_dim] at stride page_size over the
                     // middle axis.
-                    for h in 0..num_kv_heads {
-                        let head_base = (h * page_size + row) * head_dim;
-                        let out = h * head_dim;
-                        for d in 0..head_dim {
-                            let off = (head_base + d) * 2;
-                            let v =
-                                half::bf16::from_le_bytes([bytes[off], bytes[off + 1]]).to_f32();
-                            rep[out + d] += v;
+                    for row in 0..page_size {
+                        let pos = gp * page_size + row;
+                        if pos < base || pos >= base + cfg.l_bs {
+                            continue;
+                        }
+                        for h in 0..num_kv_heads {
+                            let head_base = (h * page_size + row) * head_dim;
+                            let out = h * head_dim;
+                            for d in 0..head_dim {
+                                let off = (head_base + d) * 2;
+                                let v = half::bf16::from_le_bytes([bytes[off], bytes[off + 1]])
+                                    .to_f32();
+                                lo[out + d] = lo[out + d].min(v);
+                                hi[out + d] = hi[out + d].max(v);
+                            }
                         }
                     }
-                    local_tokens += 1;
+                    seen = true;
                 }
                 // A block with zero local pages (cp_size >= 4, l_bs < cp * page_size)
                 // has no rep on this shard; push zeros to keep block_reps aligned.
                 // Scoring masks it to -inf below.
-                if local_tokens > 0 {
-                    let divisor = local_tokens as f32;
-                    for v in &mut rep {
-                        *v /= divisor;
-                    }
-                }
-                self.block_reps.push(rep);
+                self.block_reps.push(if seen {
+                    [lo, hi].concat()
+                } else {
+                    vec![0.0_f32; 2 * hd_len]
+                });
             }
             Ok(())
         }
@@ -240,21 +257,29 @@ mod cuda_impl {
         ) -> Result<()> {
             self.update_block_reps(ctx, pool, slot, cache_len, cfg, num_kv_heads, head_dim)?;
 
+            // A short query is never legitimate — it scores every block identically
+            // and the planner's index tie-break then keeps blocks `0..top_k`, which
+            // looks like a working plan. The 2D ring prefill path fed an empty vec
+            // here for months (2026-08-18).
+            let group = num_q_heads / num_kv_heads.max(1);
+            anyhow::ensure!(
+                group > 0 && query_layer0.len() >= num_q_heads * head_dim,
+                "recall scoring query missing: got {} floats, need {} ({num_q_heads} q heads × {head_dim})",
+                query_layer0.len(),
+                num_q_heads * head_dim
+            );
             // GQA-mean the query: average the `num_q_heads / num_kv_heads` query
             // heads in each KV group into one `[head_dim]` vector per KV head.
-            let group = num_q_heads / num_kv_heads.max(1);
             let mut q = vec![0.0_f32; num_kv_heads * head_dim];
-            if group > 0 && query_layer0.len() >= num_q_heads * head_dim {
-                for kv in 0..num_kv_heads {
-                    for g in 0..group {
-                        let qh = kv * group + g;
-                        for d in 0..head_dim {
-                            q[kv * head_dim + d] += query_layer0[qh * head_dim + d];
-                        }
-                    }
+            for kv in 0..num_kv_heads {
+                for g in 0..group {
+                    let qh = kv * group + g;
                     for d in 0..head_dim {
-                        q[kv * head_dim + d] /= group as f32;
+                        q[kv * head_dim + d] += query_layer0[qh * head_dim + d];
                     }
+                }
+                for d in 0..head_dim {
+                    q[kv * head_dim + d] /= group as f32;
                 }
             }
 
@@ -278,12 +303,14 @@ mod cuda_impl {
                 // via its resident rep and will be prefetched back if it ranks
                 // top-k — the re-recall coverage win.
                 scores[i] = if local_pages > 0 && (resident || allow_prefetch) {
-                    let n = rep.len().min(q.len());
-                    let mut acc = 0.0_f32;
-                    for k in 0..n {
-                        acc += q[k] * rep[k];
-                    }
-                    acc
+                    // Upper bound on the block's max `q·k`: per channel take the
+                    // better end of the key interval. A bound is what makes top-k
+                    // admissible — a mean gives none.
+                    let half = rep.len() / 2;
+                    let (lo, hi) = rep.split_at(half);
+                    (0..half.min(q.len()))
+                        .map(|k| (q[k] * lo[k]).max(q[k] * hi[k]))
+                        .sum()
                 } else {
                     f32::NEG_INFINITY
                 };
