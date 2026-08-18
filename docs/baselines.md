@@ -258,6 +258,44 @@ build: TTFT 24.94/24.95 s vs 24.97/25.05, zero fallback lines in the serve log.
 
 ---
 
+## Qwen3.8-27B-NVFP4 · 1×H20 · single-GPU · eager
+
+### Initial support — runtime `33f4863c7` (2026-08-18)
+
+Mixed-precision: NVFP4 MLP (W4AFP8, group_size=16) + FP8 per-channel attention
+(F8_E4M3 + BF16 [N,1] weight_scale). Same `qwen3_5` hybrid architecture as
+Qwen3.5/3.6 (48 gated-delta linear-attn + 16 full-attn layers). KV cache FP8
+E4M3 (KIVI per-channel-K + per-token-V). 1 BF16 MTP layer (not yet benchmarked).
+
+Identity:
+
+- Runtime commit `33f4863c7`
+- Model `unsloth/Qwen3.8-27B-NVFP4` (22 GB safetensors + 811 MB MTP)
+- GPU: 1×H20 (sm_90, 96 GB), TP=1
+- Server flags: `--kv-cache-dtype fp8`
+- Peak RSS: 20.69 GiB
+- Load time: 6.5s
+
+| c | completed | errors | TTFT p50 | ITL p50 | output tok/s |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 3 | 0 | 811 ms | 102 ms | 9.3 |
+| 4 | 4 | 0 | 2219 ms | 457 ms | 8.3 |
+| 8 | 8 | 0 | 4619 ms | 818 ms | 9.2 |
+
+Correctness: `2+3=5` verified via `arle run` and OpenAI-compatible API.
+Needle gate pending. c=16 cell killed (server shutdown during long requests).
+
+A8 vs AFP8: on H20 (sm_90), FP8 E4M3 and INT8 tensor core throughput are
+identical (989 TFLOPS/TOPS). FP8 has wider dynamic range → better accuracy.
+The model's NVFP4 MLP path uses FP8 activations (W4AFP8); the attention path
+uses BF16 activations (W8A16 via GEMV). W4A8 (INT8 activations) would need a
+new GEMM kernel — not justified when throughput is identical and accuracy
+favors FP8.
+
+[Wins entry](experience/wins/2026-08-18-qwen38-27b-nvfp4-inference.md)
+
+---
+
 ## DSv4-Flash-FP8 · 8×H20 · TP=8/EP=8 · eager
 
 ### SOTA — DSpark, runtime `fad8f4d5b`, runner `c98c4e0b2` (2026-08-14)
