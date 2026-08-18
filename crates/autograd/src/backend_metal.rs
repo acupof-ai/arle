@@ -130,6 +130,10 @@ impl Backend for MetalBackend {
             DeviceHandle::CudaFp8BlockScaled(_) => Err(AutogradError::TapeInvariant(
                 "metal backend cannot read back a cuda fp8 block-scaled device handle",
             )),
+            #[cfg(feature = "cuda")]
+            DeviceHandle::CudaFp4E2M1Group(_) => Err(AutogradError::TapeInvariant(
+                "metal backend cannot read back a cuda nvfp4 device handle",
+            )),
         }
     }
 

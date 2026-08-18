@@ -504,6 +504,15 @@ pub(super) fn cuda_matmul_bt_input_grad_device(
             }
             backend.matmul_device_f32_fp8_block_scaled(d_g, grad_out_shape, storage)?
         }
+        DeviceHandle::CudaFp4E2M1Group(storage) => {
+            if b_shape != [storage.rows(), storage.cols()] {
+                return Err(AutogradError::ShapeMismatch {
+                    expected: vec![storage.rows(), storage.cols()],
+                    got: b_shape.to_vec(),
+                });
+            }
+            backend.matmul_device_f32_fp4_e2m1_group(d_g, grad_out_shape, storage)?
+        }
         DeviceHandle::Cpu(_) => {
             return Err(AutogradError::TapeInvariant(
                 "cuda matmul_bt_input_grad_device requires cuda handles",
@@ -599,6 +608,15 @@ pub(super) fn cuda_matmul_bt_backward_device(
                     ));
                 }
                 backend.matmul_device_f32_fp8_block_scaled(d_g, grad_out_shape, storage)?
+            }
+            DeviceHandle::CudaFp4E2M1Group(storage) => {
+                if b_shape != [storage.rows(), storage.cols()] {
+                    return Err(AutogradError::ShapeMismatch {
+                        expected: vec![storage.rows(), storage.cols()],
+                        got: b_shape.to_vec(),
+                    });
+                }
+                backend.matmul_device_f32_fp4_e2m1_group(d_g, grad_out_shape, storage)?
             }
             DeviceHandle::Cpu(_) => {
                 return Err(AutogradError::TapeInvariant(

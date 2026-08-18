@@ -15,7 +15,8 @@
 use crate::{
     AutogradError,
     backend::{
-        CudaBf16Storage, CudaFp8BlockScaledStorage, CudaStorage, LinearAttentionDeviceParams,
+        CudaBf16Storage, CudaFp4E2M1GroupStorage, CudaFp8BlockScaledStorage, CudaStorage,
+        LinearAttentionDeviceParams,
         cpu_causal_sdpa_recompute_backward, dequantize_fp8_block_scaled_host,
         matmul_bt_output_shape, matmul_output_shape, validate_broadcast,
         validate_decode_gqa_cache_shapes, validate_decode_gqa_shapes, validate_fp8_block_scaled,

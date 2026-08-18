@@ -307,6 +307,117 @@ impl CudaFp8BlockScaledStorage {
     }
 }
 
+/// Frozen NVFP4 base weight held at 4 bits. The 27B base is 15.2 GB here
+/// against 54 GB as BF16, which is the whole point of a 4-bit frozen base;
+/// sm_90 has no FP4 tensor cores, so the forward dequantizes to BF16 scratch
+/// per projection and the GEMM rides cuBLAS. Structurally the FP4 twin of
+/// [`CudaFp8BlockScaledStorage`], with the group scales in FP8 E4M3 (u8) plus
+/// one per-tensor F32 global scale.
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "no-cuda", allow(dead_code))]
+pub struct CudaFp4E2M1GroupStorage {
+    weight: Arc<cudarc::driver::CudaSlice<u8>>,
+    scales: Arc<cudarc::driver::CudaSlice<u8>>,
+    global_scale: Arc<cudarc::driver::CudaSlice<f32>>,
+    rows: usize,
+    cols: usize,
+    group_size: usize,
+    scale_cols: usize,
+    /// Same foreign-view semantics as `CudaFp8BlockScaledStorage::borrowed`.
+    borrowed: bool,
+}
+
+#[cfg(feature = "cuda")]
+impl Drop for CudaFp4E2M1GroupStorage {
+    fn drop(&mut self) {
+        if !self.borrowed {
+            return;
+        }
+        // Foreign-borrowed view: leak one strong count per buffer so drop-glue
+        // lands at >= 1 and the infer engine stays the sole owner. See the
+        // `CudaFp8BlockScaledStorage` Drop for the full rationale.
+        std::mem::forget(self.weight.clone());
+        std::mem::forget(self.scales.clone());
+        std::mem::forget(self.global_scale.clone());
+    }
+}
+
+#[cfg(feature = "cuda")]
+#[cfg_attr(feature = "no-cuda", allow(dead_code))]
+impl CudaFp4E2M1GroupStorage {
+    pub(crate) fn new(
+        weight: cudarc::driver::CudaSlice<u8>,
+        scales: cudarc::driver::CudaSlice<u8>,
+        global_scale: cudarc::driver::CudaSlice<f32>,
+        rows: usize,
+        cols: usize,
+        group_size: usize,
+        scale_cols: usize,
+    ) -> Self {
+        Self {
+            weight: Arc::new(weight),
+            scales: Arc::new(scales),
+            global_scale: Arc::new(global_scale),
+            rows,
+            cols,
+            group_size,
+            scale_cols,
+            borrowed: false,
+        }
+    }
+
+    /// NON-OWNING view over an infer engine's resident NVFP4 base. See
+    /// [`CudaFp8BlockScaledStorage::new_borrowed`].
+    pub(crate) fn new_borrowed(
+        weight: cudarc::driver::CudaSlice<u8>,
+        scales: cudarc::driver::CudaSlice<u8>,
+        global_scale: cudarc::driver::CudaSlice<f32>,
+        rows: usize,
+        cols: usize,
+        group_size: usize,
+        scale_cols: usize,
+    ) -> Self {
+        Self {
+            weight: Arc::new(weight),
+            scales: Arc::new(scales),
+            global_scale: Arc::new(global_scale),
+            rows,
+            cols,
+            group_size,
+            scale_cols,
+            borrowed: true,
+        }
+    }
+
+    pub(crate) fn weight(&self) -> &cudarc::driver::CudaSlice<u8> {
+        self.weight.as_ref()
+    }
+
+    pub(crate) fn scales(&self) -> &cudarc::driver::CudaSlice<u8> {
+        self.scales.as_ref()
+    }
+
+    pub(crate) fn global_scale(&self) -> &cudarc::driver::CudaSlice<f32> {
+        self.global_scale.as_ref()
+    }
+
+    pub(crate) fn rows(&self) -> usize {
+        self.rows
+    }
+
+    pub(crate) fn cols(&self) -> usize {
+        self.cols
+    }
+
+    pub(crate) fn group_size(&self) -> usize {
+        self.group_size
+    }
+
+    pub(crate) fn scale_cols(&self) -> usize {
+        self.scale_cols
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum DeviceHandle {
     Cpu(Vec<f32>),
@@ -318,6 +429,8 @@ pub enum DeviceHandle {
     CudaBf16(CudaBf16Storage),
     #[cfg(feature = "cuda")]
     CudaFp8BlockScaled(CudaFp8BlockScaledStorage),
+    #[cfg(feature = "cuda")]
+    CudaFp4E2M1Group(CudaFp4E2M1GroupStorage),
 }
 
 impl DeviceHandle {
@@ -701,6 +814,10 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
             #[cfg(feature = "cuda")]
             DeviceHandle::CudaFp8BlockScaled(_) => Err(crate::AutogradError::TapeInvariant(
                 "device handle readback not implemented for cuda fp8 block-scaled on this backend",
+            )),
+            #[cfg(feature = "cuda")]
+            DeviceHandle::CudaFp4E2M1Group(_) => Err(crate::AutogradError::TapeInvariant(
+                "device handle readback not implemented for cuda nvfp4 on this backend",
             )),
         }
     }
@@ -2780,6 +2897,10 @@ impl Backend for CpuBackend {
             #[cfg(feature = "cuda")]
             DeviceHandle::CudaFp8BlockScaled(_) => Err(crate::AutogradError::TapeInvariant(
                 "cpu backend cannot read back a cuda fp8 block-scaled device handle",
+            )),
+            #[cfg(feature = "cuda")]
+            DeviceHandle::CudaFp4E2M1Group(_) => Err(crate::AutogradError::TapeInvariant(
+                "cpu backend cannot read back a cuda nvfp4 device handle",
             )),
         }
     }

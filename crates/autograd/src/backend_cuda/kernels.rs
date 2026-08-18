@@ -147,6 +147,7 @@ const FUNCTION_NAMES: &[&str] = &[
     "linear_attention_conv1d_silu_backward_f32",
     "linear_attention_scan_backward_f32",
     "fp8_block_scaled_to_bf16",
+    "fp4_e2m1_group_to_bf16",
 ];
 
 #[derive(Debug)]

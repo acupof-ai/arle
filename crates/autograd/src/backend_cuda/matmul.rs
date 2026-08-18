@@ -389,6 +389,66 @@ impl CudaBackend {
         Ok((out, vec![rows, cols]))
     }
 
+    /// Dequantize a frozen NVFP4 weight to BF16. sm_90 has no FP4 tensor cores,
+    /// so unlike the FP8 twin above there is no native path to try — the GEMM
+    /// always rides cuBLAS BF16. Keeping the base at 4 bits is what buys the
+    /// memory (15.2 GB against 54 GB for a 27B base).
+    #[cfg(not(feature = "no-cuda"))]
+    pub(super) fn fp4_e2m1_group_as_bf16(
+        &self,
+        storage: &CudaFp4E2M1GroupStorage,
+    ) -> Result<(CudaSlice<u16>, Vec<usize>)> {
+        let (rows, cols) = (storage.rows(), storage.cols());
+        let (group_size, scale_cols) = (storage.group_size(), storage.scale_cols());
+        let total = rows * cols;
+        if storage.weight().len() != total / 2 || storage.scales().len() != rows * scale_cols {
+            return Err(AutogradError::TapeInvariant(
+                "cuda backend nvfp4 dequant handle size does not match shape",
+            ));
+        }
+        let mut out = self.stream.alloc_zeros::<u16>(total).map_err(|e| {
+            eprintln!("[autograd] alloc_zeros {total} x u16 failed (nvfp4 dequant): {e}");
+            AutogradError::TapeInvariant("cuda alloc_zeros failed (nvfp4 dequant)")
+        })?;
+        let total_i32 = i32::try_from(total)
+            .map_err(|_| AutogradError::TapeInvariant("nvfp4 dequant total exceeds i32"))?;
+        let cols_i32 = i32::try_from(cols)
+            .map_err(|_| AutogradError::TapeInvariant("nvfp4 dequant cols exceeds i32"))?;
+        let group_size_i32 = i32::try_from(group_size)
+            .map_err(|_| AutogradError::TapeInvariant("nvfp4 dequant group_size exceeds i32"))?;
+        let scale_cols_i32 = i32::try_from(scale_cols)
+            .map_err(|_| AutogradError::TapeInvariant("nvfp4 dequant scale_cols exceeds i32"))?;
+        launch_1d(
+            &self.stream,
+            self.kernels.function("fp4_e2m1_group_to_bf16")?,
+            total,
+            |mut builder| {
+                builder
+                    .arg(storage.weight())
+                    .arg(storage.scales())
+                    .arg(storage.global_scale())
+                    .arg(&mut out)
+                    .arg(&total_i32)
+                    .arg(&cols_i32)
+                    .arg(&group_size_i32)
+                    .arg(&scale_cols_i32);
+                builder
+            },
+        )?;
+        Ok((out, vec![rows, cols]))
+    }
+
+    #[cfg(not(feature = "no-cuda"))]
+    pub(super) fn matmul_bt_device_f32_fp4_e2m1_group(
+        &self,
+        a: &CudaSlice<f32>,
+        a_shape: &[usize],
+        storage: &CudaFp4E2M1GroupStorage,
+    ) -> Result<(CudaSlice<f32>, Vec<usize>)> {
+        let (b_bf16, b_shape) = self.fp4_e2m1_group_as_bf16(storage)?;
+        self.matmul_bt_device_f32_bf16(a, a_shape, &b_bf16, &b_shape)
+    }
+
     #[cfg(not(feature = "no-cuda"))]
     pub(super) fn matmul_bt_device_f32_fp8_block_scaled(
         &self,
@@ -529,6 +589,17 @@ impl CudaBackend {
         let (b_bf16, b_shape) = self.fp8_block_scaled_as_bf16(storage)?;
         self.matmul_device_f32_bf16(a, a_shape, &b_bf16, &b_shape)
     }
+
+    #[cfg(not(feature = "no-cuda"))]
+    pub(super) fn matmul_device_f32_fp4_e2m1_group(
+        &self,
+        a: &CudaSlice<f32>,
+        a_shape: &[usize],
+        storage: &CudaFp4E2M1GroupStorage,
+    ) -> Result<(CudaSlice<f32>, Vec<usize>)> {
+        let (b_bf16, b_shape) = self.fp4_e2m1_group_as_bf16(storage)?;
+        self.matmul_device_f32_bf16(a, a_shape, &b_bf16, &b_shape)
+    }
 }
 
 pub(super) fn cuda_matmul_bt(
@@ -566,6 +637,22 @@ pub(super) fn cuda_matmul_bt(
         }
         let (c, out_shape) =
             backend.matmul_bt_device_f32_fp8_block_scaled(d_a, a_shape, storage)?;
+        return Ok((DeviceHandle::Cuda(CudaStorage::new(c)), out_shape));
+    }
+
+    if let DeviceHandle::CudaFp4E2M1Group(storage) = b {
+        if b_shape != [storage.rows(), storage.cols()] {
+            return Err(AutogradError::ShapeMismatch {
+                expected: vec![storage.rows(), storage.cols()],
+                got: b_shape.to_vec(),
+            });
+        }
+        if d_a.len() != shape_size(a_shape) {
+            return Err(AutogradError::TapeInvariant(
+                "cuda backend nvfp4 matmul_bt handle size does not match shape",
+            ));
+        }
+        let (c, out_shape) = backend.matmul_bt_device_f32_fp4_e2m1_group(d_a, a_shape, storage)?;
         return Ok((DeviceHandle::Cuda(CudaStorage::new(c)), out_shape));
     }
 

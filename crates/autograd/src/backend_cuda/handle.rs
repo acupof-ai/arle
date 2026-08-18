@@ -616,6 +616,13 @@ impl CudaBackend {
                     "cuda backend cannot operate on a fp8 block-scaled handle on this f32-only path"
                 }
             })),
+            DeviceHandle::CudaFp4E2M1Group(_) => Err(AutogradError::TapeInvariant(match op {
+                "matmul" => "cuda backend cannot matmul an nvfp4 handle on this f32-only path",
+                "matmul_bt" => {
+                    "cuda backend cannot use an nvfp4 handle as lhs on this matmul_bt path"
+                }
+                _ => "cuda backend cannot operate on an nvfp4 handle on this f32-only path",
+            })),
             DeviceHandle::Cpu(_) => Err(AutogradError::TapeInvariant(match op {
                 "add" => "cuda backend cannot add a cpu device handle",
                 "matmul" => "cuda backend cannot matmul a cpu device handle",
@@ -713,7 +720,8 @@ impl CudaBackend {
             DeviceHandle::Cpu(_)
             | DeviceHandle::Cuda(_)
             | DeviceHandle::CudaBf16(_)
-            | DeviceHandle::CudaFp8BlockScaled(_) => Ok(()),
+            | DeviceHandle::CudaFp8BlockScaled(_)
+            | DeviceHandle::CudaFp4E2M1Group(_) => Ok(()),
             #[cfg(feature = "metal")]
             DeviceHandle::Metal(_) => Err(AutogradError::TapeInvariant(
                 "cuda backend cannot evaluate a metal device handle",
@@ -939,6 +947,43 @@ pub(super) fn cuda_readback(backend: &CudaBackend, handle: &DeviceHandle) -> Res
                 &[rows, cols],
                 block_m,
                 block_k,
+            )
+        }
+        DeviceHandle::CudaFp4E2M1Group(storage) => {
+            let weight = storage.weight();
+            let scales = storage.scales();
+            let global = storage.global_scale();
+            let mut host_weight = vec![0u8; weight.len()];
+            let mut host_scales = vec![0u8; scales.len()];
+            let mut host_global = vec![0.0f32; global.len()];
+            backend
+                .stream
+                .memcpy_dtoh(weight, &mut host_weight)
+                .map_err(|_| AutogradError::TapeInvariant("cuda nvfp4 dtoh copy failed"))?;
+            backend
+                .stream
+                .memcpy_dtoh(scales, &mut host_scales)
+                .map_err(|_| AutogradError::TapeInvariant("cuda nvfp4 scales dtoh copy failed"))?;
+            backend
+                .stream
+                .memcpy_dtoh(global, &mut host_global)
+                .map_err(|_| {
+                    AutogradError::TapeInvariant("cuda nvfp4 global scale dtoh copy failed")
+                })?;
+            backend
+                .stream
+                .synchronize()
+                .map_err(|_| AutogradError::TapeInvariant("cuda synchronize failed"))?;
+            let global_scale = *host_global
+                .first()
+                .ok_or(AutogradError::TapeInvariant("cuda nvfp4 global scale empty"))?;
+            crate::backend::dequantize_fp4_e2m1_group_host(
+                &host_weight,
+                &host_scales,
+                global_scale,
+                &[storage.rows(), storage.cols()],
+                storage.group_size(),
+                storage.scale_cols(),
             )
         }
         #[cfg(feature = "metal")]
