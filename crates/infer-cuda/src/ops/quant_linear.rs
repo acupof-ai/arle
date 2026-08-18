@@ -500,8 +500,6 @@ fn try_fp8_dequant_bf16_gemm_batch(
 ) -> Result<bool> {
     if weight.weight_format != WeightFormat::Fp8BlockScaled
         || x.seq_len < QWEN_FP8_DEQUANT_GEMM_MIN_M
-        || weight.quant_block_m != 128
-        || weight.quant_block_k != 128
     {
         return Ok(false);
     }

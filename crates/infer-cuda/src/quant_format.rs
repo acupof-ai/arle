@@ -186,6 +186,35 @@ pub(crate) fn detect_quant_format(
                 ],
             }
         }
+        // FP8 per-channel (compressed-tensors float-quantized): F8_E4M3 weight
+        // with a [N,1] weight_scale, no input_scale (dynamic activation quant
+        // at runtime). Mapped to Fp8BlockScaled with block_m=1, block_k=K —
+        // the block-scale GEMV indexes scales[row] directly.
+        Dtype::F8_E4M3
+            if tensors.contains_key(&format!("{base}.weight_scale"))
+                && !tensors.contains_key(&format!("{base}.input_scale"))
+                && !tensors.contains_key(&format!("{base}.weight_scale_inv")) =>
+        {
+            let scale = tensor_by_name(tensors, &format!("{base}.weight_scale"))?;
+            let n = tensor.shape[0];
+            let k = tensor.shape[1];
+            ensure!(
+                scale.shape[0] == n && (scale.shape == vec![n, 1] || scale.shape == vec![n]),
+                "{name}: FP8 per-channel weight_scale must be [{n}, 1] or [{n}], got {:?}",
+                scale.shape
+            );
+            QuantTensorView {
+                name: name.to_owned(),
+                logical_shape: tensor.shape.clone(),
+                storage_dtype: tensor.dtype,
+                format: QuantFormat::Fp8BlockScaled {
+                    block_m: 1,
+                    block_k: k,
+                    scale_apply: ScaleApply::Multiply,
+                },
+                scale_names: vec![format!("{base}.weight_scale")],
+            }
+        }
         Dtype::U8
             if tensors.contains_key(&format!("{base}.weight_scale"))
                 && tensors.contains_key(&format!("{base}.weight_global_scale"))

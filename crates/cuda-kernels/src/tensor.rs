@@ -2121,6 +2121,48 @@ impl DeviceMatrix {
                 m.quant_block_k = a.quant_block_k;
                 m
             }
+            WeightFormat::Fp4E2M1Group => {
+                ensure!(
+                    a.group_size == b.group_size && a.cols == b.cols,
+                    "fuse_rows FP4 group shape mismatch"
+                );
+                let qa = a
+                    .qweight_u8
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("a missing qweight_u8"))?;
+                let qb = b
+                    .qweight_u8
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("b missing qweight_u8"))?;
+                let qsa = a
+                    .qscale_fp8
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("a missing qscale_fp8"))?;
+                let qsb = b
+                    .qscale_fp8
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("b missing qscale_fp8"))?;
+                // Global weight/input scales are per-tensor scalars; both parts
+                // share the same value in practice (same quant config group).
+                let mut m = Self::from_parts_dense(
+                    ctx.stream
+                        .alloc_zeros::<bf16>(1)
+                        .map_err(|e| anyhow!("fuse_rows dummy alloc failed: {e}"))?,
+                    rows,
+                    a.cols,
+                );
+                m.weight_format = WeightFormat::Fp4E2M1Group;
+                m.qweight_u8 = Some(concat(ctx, qa, qb)?);
+                m.qscale_fp8 = Some(concat(ctx, qsa, qsb)?);
+                m.scale_f32 = a.scale_f32.clone();
+                m.scale2_f32 = a.scale2_f32.clone();
+                m.quant_scale_rows = a.quant_scale_rows + b.quant_scale_rows;
+                m.quant_scale_cols = a.quant_scale_cols;
+                m.quant_block_m = a.quant_block_m;
+                m.quant_block_k = a.quant_block_k;
+                m.group_size = a.group_size;
+                m
+            }
             other => bail!("fuse_rows unsupported for weight format {other}"),
         };
         fused.rows = rows;
