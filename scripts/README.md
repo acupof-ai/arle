@@ -61,7 +61,6 @@ directory unless noted.
 | `longctx_numerical_gate.py` | Long-context numerical quality gate. |
 | `kv_recall_quality_eval.py` | KV-recall (importance-based block recall) quality evaluation (Metal). |
 | `dsv4_batched_decode_validate.py` | DSv4 batched decode correctness. |
-| `dsv4_variable_shape_dsa_gate.py` | DSv4 variable-shape DSA correctness gate. |
 | `dsv4_multigpu_parity.sh` | DSv4 multi-GPU parity test. |
 | `assert_kernel_fired.sh` | Assert a specific CUDA kernel was launched. |
 
@@ -70,9 +69,6 @@ directory unless noted.
 | Script | Purpose |
 |---|---|
 | `dsv4_c_sweep.py` | DSv4 concurrency sweep benchmark. |
-| `dsv4_resident_ab.sh` | DSv4 resident-set A/B test. |
-| `dsv4_beat_sglang_bench.sh` | DSv4 vs SGLang comparison benchmark. |
-| `dsv4_fast_build.sh` | Fast DSv4 CUDA build. |
 | `dsv4_toolchain.sh` | DSv4 native DeepEP/DeepGEMM toolchain validator. |
 
 ## Evaluation
@@ -84,7 +80,6 @@ directory unless noted.
 | `arle_swe_pro_eval.py` | SWE-Pro evaluation harness. |
 | `score_rubric_eval.py` | Rubric-based evaluation scoring. |
 | `analyze_multi_seed.py` | Multi-seed eval analysis with mean±σ and Wilson CI. |
-| `hf_greedy_ref.py` | HuggingFace greedy-decode reference runner. |
 | `probe_report.py` | Probe logit-lens report generator. |
 | `reduce_operator_evidence.py` | FP8 operator evidence reduction analysis. |
 
@@ -101,7 +96,6 @@ directory unless noted.
 | `filter_inband.py` | Filter in-band calibrated task pool. |
 | `gen_36_warm_prefix_mix.py` | Generate warm prefix mix for eval. |
 | `gen_agent_opd_tasks.py` | Generate agent OPD training tasks. |
-| `gen_arle_longctx_eval.py` | Generate long-context eval tasks. |
 | `gen_terminal_tasks.py` | Generate Terminal-Bench tasks. |
 | `stage_opd_run_corpus.py` | Stage OPD run corpus. |
 | `stage_swe_pro.py` | Stage SWE-Pro eval. |

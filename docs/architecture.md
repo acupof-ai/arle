@@ -39,7 +39,7 @@ authority rather than defining a second equal architecture.
 | `infer-server` | OpenAI v1 HTTP frontend (`coordinator.rs` — single facade for all backends) + tokenizer; `ServeHandle<E,K>` engine thread; relay protocol for both single-process (`LocalChannel*`) and multi-process (TCP) | Terminal UX, agent-session orchestration |
 | `infer-api` | The single front-door lib: `LoadedInferenceEngine`, `EngineLoadConfig`, `RawLogits`, OPD-teacher surface. Backends plug in behind it. | Terminal UX, REPL logic |
 | `infer-util` | Backend-agnostic `hf_hub` + logging leaf crate | Anything backend- or model-specific |
-| `cuda-kernels` | CUDA kernel layer (`csrc/`, TileLang AOT, Rust FFI, paged-KV / TileLang metadata / graph-pool / tensor / kv_quant / kv_turboquant) | Model code, scheduler logic, tokenizer |
+| `cuda-kernels` | CUDA kernel layer (`csrc/`, TileLang AOT, Rust FFI, paged-KV / TileLang metadata / graph-pool / tensor / kv_quant) | Model code, scheduler logic, tokenizer |
 | `mlx-sys` | MLX C++ bridge for the Metal backend | Anything that is not the Metal bridge |
 | `deepep-sys` | DeepEP/NVSHMEM FFI (`internode_ll` dispatch/combine) for EP collectives | Routing policy, scheduler |
 | `xgrammar-sys` | Grammar-constrained decode FFI (xgrammar) | Sampling policy, scheduler |

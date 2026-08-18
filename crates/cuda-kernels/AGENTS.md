@@ -52,7 +52,6 @@ crates/cuda-kernels/
 │   ├── tensor.rs        — DeviceContext, DeviceVec, DeviceMatrix, HiddenStates, RawDevicePtr
 │   ├── collective.rs    — `CollectiveBackend` trait + `NcclBackend` skeleton (F0 multi-GPU). F7 adds CustomAR / mscclpp / quick_ar / symm_mem behind the same trait. Method set is taken from actual F1+ callers (LayerCommunicator AR, PP send/recv, MoE all-to-all via group_start/end).
 │   ├── kv_quant.rs      — KV quant state/dispatch
-│   ├── kv_turboquant.rs — TurboQuant-specific KV state
 │   ├── kv_types.rs      — KVCacheDtype, KVFormat (always-on enum)
 │   └── turboquant_state.rs — TurboQuant calibration state
 └── tools/tilelang/      — TileLang Python kernels (AOT compiled by build.rs)

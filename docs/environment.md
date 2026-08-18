@@ -41,7 +41,6 @@ workers see them; train flags apply via `train::apply_runtime_flags`):
 | `ARLE_QWEN35_GDR_CHUNKED` | `arle serve --qwen35-gdr-chunked` |
 | `INFER_CUDA_DECODE_GRAPH` | `arle serve --cuda-graph` / `--no-cuda-graph` (env override removed) |
 | `INFER_DECODE_METADATA_FAST_PAGE16` | `arle serve --decode-metadata-fast-page16` |
-| `INFER_MARLIN_W4_FP8_PREFILL` | `arle serve --marlin-w4-fp8-prefill` |
 | `ARLE_CUDA_MEMPOOL_RETAIN` | `arle serve --cuda-mempool-retain` |
 | `ARLE_CUDA_SHARD_CACHE_BYTES` | `arle serve --shard-cache-bytes` |
 | `ARLE_NUMA_PIN` | `arle serve --numa-pin` |
