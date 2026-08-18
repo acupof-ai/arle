@@ -487,12 +487,17 @@ fn hf_lm_head_candidates(schema: HfSchema) -> &'static [&'static str] {
 
 fn hf_candidates_for_train_name(train_name: &str, schema: HfSchema) -> Vec<String> {
     if train_name.ends_with("lm_head.weight") {
-        hf_lm_head_candidates(schema)
+        return hf_lm_head_candidates(schema)
             .iter()
             .map(|s| (*s).to_owned())
-            .collect()
-    } else {
-        vec![train_name_to_hf(train_name, schema)]
+            .collect();
+    }
+    let hf = train_name_to_hf(train_name, schema);
+    // compressed-tensors stores a 4-bit weight under `.weight_packed`; serving
+    // resolves the same two candidates (infer-cuda/src/loader.rs quant_view_for).
+    match hf.strip_suffix(".weight") {
+        Some(base) => vec![hf.clone(), format!("{base}.weight_packed")],
+        None => vec![hf],
     }
 }
 
@@ -797,8 +802,22 @@ struct PlannedTensorLoad {
     expected_shape: Vec<usize>,
     requires_grad: bool,
     shard_idx: usize,
-    bf16_cuda_frozen_base: bool,
-    fp8_cuda_frozen_base: Option<PlannedFp8BlockScaled>,
+    frozen_base: PlannedFrozenBase,
+}
+
+/// How a frozen (requires_grad=false) base weight is materialised on device.
+/// At most one applies, so they are one enum rather than parallel `Option`s.
+enum PlannedFrozenBase {
+    /// Widen to host f32 — the path for trainable tensors and every non-CUDA
+    /// backend.
+    HostF32,
+    /// Bulk-memcpy the BF16 bits (CUDA, frozen, BF16 checkpoint).
+    Bf16,
+    /// FP8 E4M3 with a `[ceil(rows/128), ceil(cols/128)]` `weight_scale_inv`.
+    Fp8(PlannedFp8BlockScaled),
+    /// NVFP4: packed E2M1 `weight_packed` plus an FP8 E4M3 `weight_scale` and a
+    /// scalar `weight_global_scale`.
+    Fp4(PlannedFp4Group),
 }
 
 struct PlannedFp8BlockScaled {
@@ -806,6 +825,15 @@ struct PlannedFp8BlockScaled {
     scale_shard_idx: usize,
     block_m: usize,
     block_k: usize,
+}
+
+struct PlannedFp4Group {
+    scale_name: String,
+    scale_shard_idx: usize,
+    global_scale_name: String,
+    global_scale_shard_idx: usize,
+    group_size: usize,
+    scale_cols: usize,
 }
 
 fn plan_tensor_loads(
@@ -894,7 +922,16 @@ fn plan_tensor_load(
     })?;
     let expected_shape = slot.shape.clone();
     let requires_grad = slot.requires_grad;
+    // An NVFP4 `weight_packed` stores two 4-bit weights per byte, so its stored
+    // shape is [rows, cols/2] against a logical [rows, cols].
+    let packed_fp4 = view.dtype() == Dtype::U8
+        && hf_name.ends_with(".weight_packed")
+        && got_shape.len() == 2
+        && expected_shape.len() == 2
+        && got_shape[0] == expected_shape[0]
+        && got_shape[1] * 2 == expected_shape[1];
     let shape_compatible = expected_shape == got_shape
+        || packed_fp4
         || can_squeeze_linear_conv1d_weight(train_name, &expected_shape, &got_shape);
     if !shape_compatible {
         let hint = shape_mismatch_hint(hf_name, train_name, &expected_shape, &got_shape);
@@ -906,7 +943,7 @@ fn plan_tensor_load(
         });
     }
 
-    let fp8_cuda_frozen_base = plan_fp8_cuda_frozen_base(
+    let frozen_base = if let Some(fp4) = plan_fp4_cuda_frozen_base(
         mode,
         hf_name,
         train_name,
@@ -916,19 +953,36 @@ fn plan_tensor_load(
         hf_name_to_shard,
         safetensors_views,
         store,
-    )?;
-    if fp8_cuda_frozen_base.is_none() {
-        validate_supported_dtype(&view, hf_name)?;
-    }
-
-    let bf16_cuda_frozen_base = should_load_bf16_cuda_frozen_base(
+    )? {
+        PlannedFrozenBase::Fp4(fp4)
+    } else if let Some(fp8) = plan_fp8_cuda_frozen_base(
         mode,
+        hf_name,
         train_name,
         &expected_shape,
         requires_grad,
         view.dtype(),
+        hf_name_to_shard,
+        safetensors_views,
         store,
-    );
+    )? {
+        PlannedFrozenBase::Fp8(fp8)
+    } else {
+        // Only the quantized planners accept a non-float storage dtype.
+        validate_supported_dtype(&view, hf_name)?;
+        if should_load_bf16_cuda_frozen_base(
+            mode,
+            train_name,
+            &expected_shape,
+            requires_grad,
+            view.dtype(),
+            store,
+        ) {
+            PlannedFrozenBase::Bf16
+        } else {
+            PlannedFrozenBase::HostF32
+        }
+    };
 
     Ok(PlannedTensorLoad {
         hf_name: hf_name.to_owned(),
@@ -937,8 +991,7 @@ fn plan_tensor_load(
         expected_shape,
         requires_grad,
         shard_idx,
-        bf16_cuda_frozen_base,
-        fp8_cuda_frozen_base,
+        frozen_base,
     })
 }
 
@@ -1044,6 +1097,80 @@ fn plan_fp8_cuda_frozen_base(
     }))
 }
 
+/// Plan an NVFP4 frozen base. The stored tensor is `<base>.weight_packed` with
+/// shape `[rows, cols/2]`; the caller has already resolved that name, so the
+/// logical shape is recovered here rather than trusted from the view.
+#[allow(clippy::too_many_arguments)]
+fn plan_fp4_cuda_frozen_base(
+    mode: LoadMode,
+    hf_name: &str,
+    train_name: &str,
+    expected_shape: &[usize],
+    requires_grad: bool,
+    dtype: Dtype,
+    hf_name_to_shard: &HashMap<String, usize>,
+    safetensors_views: &[SafeTensors<'_>],
+    store: &TensorStore,
+) -> Result<Option<PlannedFp4Group>> {
+    if !(matches!(mode, LoadMode::LoraStudent { .. } | LoadMode::FrozenEval)
+        && !requires_grad
+        && dtype == Dtype::U8
+        && store.backend().device() == Device::Cuda
+        && is_fp8_cuda_frozen_base_tensor(train_name, expected_shape))
+    {
+        return Ok(None);
+    }
+    let base = hf_name.strip_suffix(".weight_packed").ok_or_else(|| {
+        LoaderError::Custom(format!(
+            "NVFP4 tensor {hf_name} is missing the .weight_packed suffix"
+        ))
+    })?;
+    let scale_name = format!("{base}.weight_scale");
+    let global_scale_name = format!("{base}.weight_global_scale");
+
+    let scale_shard_idx = *hf_name_to_shard
+        .get(&scale_name)
+        .ok_or_else(|| LoaderError::MissingTensor(scale_name.clone()))?;
+    let global_scale_shard_idx = *hf_name_to_shard
+        .get(&global_scale_name)
+        .ok_or_else(|| LoaderError::MissingTensor(global_scale_name.clone()))?;
+
+    let scale_view = safetensors_views[scale_shard_idx]
+        .tensor(&scale_name)
+        .map_err(|err| LoaderError::Safetensors(format!("{scale_name}: {err}")))?;
+    if scale_view.dtype() != Dtype::F8_E4M3 {
+        return Err(LoaderError::UnsupportedDtype(scale_view.dtype(), scale_name));
+    }
+    let scale_shape = scale_view.shape().to_vec();
+    if scale_shape.len() != 2 || scale_shape[0] != expected_shape[0] {
+        return Err(LoaderError::ShapeMismatch {
+            name: scale_name,
+            expected: vec![expected_shape[0], scale_shape.last().copied().unwrap_or(0)],
+            got: scale_shape,
+            hint: ". Hint: an NVFP4 weight_scale is [rows, cols/group_size]".to_owned(),
+        });
+    }
+    let scale_cols = scale_shape[1];
+    // Derive the group size rather than assuming 16, so an MXFP4/group-32
+    // export fails the divisibility check below instead of decoding silently.
+    let cols = expected_shape[1];
+    if scale_cols == 0 || cols % scale_cols != 0 {
+        return Err(LoaderError::Custom(format!(
+            "{scale_name}: cols {cols} not divisible by scale_cols {scale_cols}"
+        )));
+    }
+    let group_size = cols / scale_cols;
+
+    Ok(Some(PlannedFp4Group {
+        scale_name,
+        scale_shard_idx,
+        global_scale_name,
+        global_scale_shard_idx,
+        group_size,
+        scale_cols,
+    }))
+}
+
 fn fp8_scale_tensor_name(hf_name: &str) -> Result<String> {
     let base = hf_name.strip_suffix(".weight").ok_or_else(|| {
         LoaderError::Custom(format!(
@@ -1134,7 +1261,11 @@ fn load_planned_tensor_into_slot(
     let view = safetensors_views[planned.shard_idx]
         .tensor(&planned.hf_name)
         .map_err(|err| LoaderError::Safetensors(format!("{}: {err}", planned.hf_name)))?;
-    if let Some(fp8) = &planned.fp8_cuda_frozen_base {
+    let fp8 = match &planned.frozen_base {
+        PlannedFrozenBase::Fp8(fp8) => Some(fp8),
+        _ => None,
+    };
+    if let Some(fp8) = fp8 {
         // Train-infer weight sharing (`--share-frozen-base`): if a co-resident
         // infer engine exposes the resident FP8 base for this projection and
         // the dims match, import a NON-OWNING device view (zero-copy) instead
@@ -1189,7 +1320,41 @@ fn load_planned_tensor_into_slot(
             .map_err(LoaderError::Autograd)?;
         return Ok(());
     }
-    if planned.bf16_cuda_frozen_base {
+    if let PlannedFrozenBase::Fp4(fp4) = &planned.frozen_base {
+        let scale_view = safetensors_views[fp4.scale_shard_idx]
+            .tensor(&fp4.scale_name)
+            .map_err(|err| LoaderError::Safetensors(format!("{}: {err}", fp4.scale_name)))?;
+        let scales = scale_view.data().to_vec();
+        let global_view = safetensors_views[fp4.global_scale_shard_idx]
+            .tensor(&fp4.global_scale_name)
+            .map_err(|err| {
+                LoaderError::Safetensors(format!("{}: {err}", fp4.global_scale_name))
+            })?;
+        let global = dtype_to_f32(&global_view, &fp4.global_scale_name)?;
+        let global_scale = *global.first().ok_or_else(|| {
+            LoaderError::Custom(format!("{} is empty", fp4.global_scale_name))
+        })?;
+        let weight = view.data();
+        let handle = store
+            .backend()
+            .upload_fp4_e2m1_group(
+                weight.as_ref(),
+                &scales,
+                global_scale,
+                &planned.expected_shape,
+                fp4.group_size,
+                fp4.scale_cols,
+            )
+            .map_err(LoaderError::Autograd)?;
+        store
+            .replace_device_handle(planned.id, handle)
+            .map_err(LoaderError::Autograd)?;
+        store
+            .set_requires_grad(planned.id, false)
+            .map_err(LoaderError::Autograd)?;
+        return Ok(());
+    }
+    if matches!(planned.frozen_base, PlannedFrozenBase::Bf16) {
         let data = dtype_to_bf16_bits(&view, &planned.hf_name)?;
         let handle = store
             .backend()
