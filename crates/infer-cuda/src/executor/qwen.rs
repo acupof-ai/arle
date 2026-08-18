@@ -936,8 +936,13 @@ impl QwenCudaExecutor {
                 self.kv.page_indices(row.slot)[..num_pages].to_vec()
             }
         };
-        let recall_meta =
-            PageMeta::for_recall_decode(&self.model.ctx, &self.kv, cache_len, &recall_pages)?;
+        let recall_meta = PageMeta::for_recall_decode(
+            &self.model.ctx,
+            &self.kv,
+            cache_len,
+            &recall_pages,
+            infer_seam::ShardSpec::default(),
+        )?;
         let (token, layer0_query) = self.model.forward_decode_recall(
             row.last_token,
             &mut self.kv,
