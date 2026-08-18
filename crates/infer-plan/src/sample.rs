@@ -21,19 +21,6 @@ pub fn argmax_logit(logits: &[f32]) -> u32 {
         .unwrap_or(0)
 }
 
-/// Merge per-rank `(max_logit, global_argmax)` pairs from a vocab-sharded
-/// lm_head into the global greedy token.
-///
-/// Ties resolve to the lowest index, like [`argmax_logit`] and the device
-/// kernel. Pure host math, so every TP rank derives the same winner.
-#[must_use]
-pub fn merge_vocab_shard_argmax(pairs: impl IntoIterator<Item = (f32, u32)>) -> Option<u32> {
-    pairs
-        .into_iter()
-        .max_by(|(a_val, a_idx), (b_val, b_idx)| a_val.total_cmp(b_val).then(b_idx.cmp(a_idx)))
-        .map(|(_, idx)| idx)
-}
-
 /// SplitMix64 — a tiny dependency-free mixer.
 fn splitmix64(mut x: u64) -> u64 {
     x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);

@@ -38,9 +38,6 @@ pub struct RecallPlan {
     /// session fits the budget this is the single full range `[(0, cache_len)]`
     /// (identical to today's contiguous read).
     pub ranges: Vec<(usize, usize)>,
-    /// Middle-block indices recalled this step (for the executor + promote
-    /// bookkeeping). Empty when no recall happened (everything resident).
-    pub recalled_blocks: Vec<usize>,
 }
 
 impl RecallPlan {
@@ -51,7 +48,6 @@ impl RecallPlan {
             } else {
                 vec![(0, cache_len)]
             },
-            recalled_blocks: Vec::new(),
         }
     }
 }
@@ -108,7 +104,6 @@ pub fn plan_recall(cache_len: usize, block_scores: &[f32], cfg: &RecallConfig) -
         .collect();
     RecallPlan {
         ranges: merge_adjacent(ranges),
-        recalled_blocks: idx,
     }
 }
 

@@ -456,8 +456,6 @@ mod real {
                 total_tokens: start_pos + tokens.len(),
                 params: greedy(),
             }],
-            microbatch: None,
-            spec: None,
         }
     }
 
@@ -471,8 +469,6 @@ mod real {
                 params: greedy(),
             }],
             prefill_rows: Vec::new(),
-            microbatch: None,
-            spec: None,
         }
     }
 

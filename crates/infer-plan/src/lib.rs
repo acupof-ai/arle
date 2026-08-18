@@ -11,11 +11,10 @@ pub use diffusion::{
     DiffusionBlockModel, DiffusionCanvasPrediction, DiffusionGenerateError,
     DiffusionGenerateOutput, DiffusionGenerateStats, DiffusionGenerationConfig,
     DiffusionModelError, DiffusionStepTrace, MultimodalImage, MultimodalKind,
-    diffusion_prediction_from_logits, entropy_bound_acceptance_mask, generate_diffusion,
-    generate_diffusion_with_cancel,
+    entropy_bound_acceptance_mask, generate_diffusion_with_cancel,
 };
 pub use sample::{
-    PenaltyHistory, argmax_logit, merge_vocab_shard_argmax, sample_token, sample_token_logprob,
+    PenaltyHistory, argmax_logit, sample_token, sample_token_logprob,
     sample_token_logprob_penalized, sample_token_penalized, sampled_top_logprobs,
 };
 
@@ -27,10 +26,6 @@ pub enum ForwardMode {
     /// Decode rows and prefill rows share the same executor step.
     Mixed,
     Idle,
-    /// Target-model verification for speculative decoding.
-    TargetVerify,
-    /// Draft-model extension for speculative decoding.
-    DraftExtend,
 }
 
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
@@ -65,13 +60,6 @@ pub struct PrefillRow {
     pub penalty_prompt_len: usize,
 }
 
-/// Minimal speculative-decode plan placeholder.
-#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
-#[derive(Debug, Clone)]
-pub struct SpecPlan {
-    pub draft_rows: Vec<DecodeRow>,
-}
-
 /// Backend-independent forward plan produced by engine-core.
 ///
 /// This is the engine-core to executor bridge. It only names slots, host token
@@ -83,9 +71,6 @@ pub struct ForwardPlan {
     pub mode: ForwardMode,
     pub decode_rows: Vec<DecodeRow>,
     pub prefill_rows: Vec<PrefillRow>,
-    /// Optional pipeline-parallel microbatch identifier.
-    pub microbatch: Option<u32>,
-    pub spec: Option<SpecPlan>,
 }
 
 impl ForwardPlan {
@@ -95,8 +80,6 @@ impl ForwardPlan {
             mode: ForwardMode::Idle,
             decode_rows: Vec::new(),
             prefill_rows: Vec::new(),
-            microbatch: None,
-            spec: None,
         }
     }
 

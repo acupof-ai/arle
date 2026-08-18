@@ -56,21 +56,6 @@ pub fn resolve_model_path(model_id_or_path: &str) -> Result<PathBuf> {
     download_from_hub(model_id_or_path)
 }
 
-/// Resolve a checkpoint source for callers that need config + weights but not a
-/// tokenizer (e.g. Metal DFlash draft models stored in the local HF cache
-/// without tokenizer files).
-pub fn resolve_weighted_model_path(model_id_or_path: &str) -> Result<PathBuf> {
-    if let Some(local) = resolve_local_weighted_model_path(model_id_or_path) {
-        log::info!("Using local weighted model path: {}", local.display());
-        return Ok(local);
-    }
-
-    log::info!(
-        "Weighted model not found locally — downloading from HuggingFace: {model_id_or_path}"
-    );
-    download_from_hub(model_id_or_path)
-}
-
 pub fn resolve_local_model_path(model_id_or_path: &str) -> Option<PathBuf> {
     let local = Path::new(model_id_or_path);
     if local.exists() {
@@ -150,14 +135,6 @@ pub fn resolve_model_source(explicit_model_path: Option<&str>) -> Result<String>
 /// Subsequent calls with the same model ID are served from cache.
 pub fn download_from_hub(model_id: &str) -> Result<PathBuf> {
     download_repo_assets_from_hub(model_id, true)
-}
-
-/// Download config + tokenizer assets without model weights.
-///
-/// Used by lightweight development backends that need prompt/tokenizer metadata
-/// but do not execute the full neural model.
-pub fn download_runtime_assets_from_hub(model_id: &str) -> Result<PathBuf> {
-    download_repo_assets_from_hub(model_id, false)
 }
 
 fn download_repo_assets_from_hub(model_id: &str, include_weights: bool) -> Result<PathBuf> {

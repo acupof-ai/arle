@@ -163,7 +163,7 @@ impl DiffusionCanvasPrediction {
     }
 }
 
-/// Backend hook consumed by [`generate_diffusion`].
+/// Backend hook consumed by [`generate_diffusion_with_cancel`].
 pub trait DiffusionBlockModel {
     /// Optional backend-owned generation fast path.
     ///
@@ -286,14 +286,6 @@ pub struct DiffusionGenerateOutput {
     pub finish: FinishReason,
     pub stats: DiffusionGenerateStats,
     pub trace: Vec<DiffusionStepTrace>,
-}
-
-pub fn generate_diffusion<M: DiffusionBlockModel>(
-    model: &mut M,
-    prompt_tokens: &[u32],
-    config: &DiffusionGenerationConfig,
-) -> Result<DiffusionGenerateOutput, DiffusionGenerateError> {
-    generate_diffusion_with_cancel(model, prompt_tokens, config, None)
 }
 
 pub fn generate_diffusion_with_cancel<M: DiffusionBlockModel>(
@@ -424,50 +416,6 @@ pub fn generate_diffusion_with_cancel<M: DiffusionBlockModel>(
 
 fn cancelled(cancel: Option<&AtomicBool>) -> bool {
     cancel.is_some_and(|flag| flag.load(Ordering::Acquire))
-}
-
-/// Convert row-major logits into compact canvas predictions.
-///
-/// Intended for tests and first bring-up. Production MLX / CUDA paths should do
-/// this on device and return [`DiffusionCanvasPrediction`].
-pub fn diffusion_prediction_from_logits(
-    logits: &[f32],
-    canvas_len: usize,
-    vocab_size: usize,
-    temperature: f32,
-    seed: u64,
-    step: usize,
-) -> Result<DiffusionCanvasPrediction, DiffusionGenerateError> {
-    if canvas_len == 0 || vocab_size == 0 {
-        return Err(DiffusionGenerateError::InvalidConfig(
-            "canvas_len and vocab_size must be greater than zero",
-        ));
-    }
-    let expected = canvas_len * vocab_size;
-    if logits.len() != expected {
-        return Err(DiffusionGenerateError::InvalidPrediction {
-            field: "logits",
-            expected,
-            got: logits.len(),
-        });
-    }
-
-    let mut sampled_tokens = Vec::with_capacity(canvas_len);
-    let mut argmax_tokens = Vec::with_capacity(canvas_len);
-    let mut entropies = Vec::with_capacity(canvas_len);
-    for row in 0..canvas_len {
-        let row_logits = &logits[row * vocab_size..(row + 1) * vocab_size];
-        let (sampled, argmax, entropy) =
-            predict_row(row_logits, temperature, seed, step, row as u64);
-        sampled_tokens.push(sampled);
-        argmax_tokens.push(argmax);
-        entropies.push(entropy);
-    }
-    Ok(DiffusionCanvasPrediction {
-        sampled_tokens,
-        argmax_tokens,
-        entropies,
-    })
 }
 
 /// DiffusionGemma entropy-bound acceptance mask.

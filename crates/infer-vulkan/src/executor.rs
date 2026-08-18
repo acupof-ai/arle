@@ -358,8 +358,6 @@ mod tests {
                     penalty_prompt_len: 0,
                 }]
             },
-            microbatch: None,
-            spec: None,
         }
     }
 
