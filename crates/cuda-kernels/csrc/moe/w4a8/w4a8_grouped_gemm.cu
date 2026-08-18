@@ -285,15 +285,17 @@ __global__ void w4a8_per_tensor_quantize_kernel(
   }
 }
 
-// Build problem_sizes [E, 3] (M, N, K) from per-expert token counts.
+// Build problem_sizes [E, 3] from per-expert token counts.
+// SGLang convention: (N, M, K) — the CUTLASS mixed-input kernel reads the
+// shape in this order; (M, N, K) swaps the GEMM dims and crashes.
 __global__ void w4a8_compute_problem_sizes_kernel(
     const int32_t* __restrict__ counts,
     int32_t* __restrict__ problem_sizes,
     int num_experts, int n, int k) {
   int e = blockIdx.x * blockDim.x + threadIdx.x;
   if (e < num_experts) {
-    problem_sizes[e * 3 + 0] = counts[e];
-    problem_sizes[e * 3 + 1] = n;
+    problem_sizes[e * 3 + 0] = n;
+    problem_sizes[e * 3 + 1] = counts[e];
     problem_sizes[e * 3 + 2] = k;
   }
 }
