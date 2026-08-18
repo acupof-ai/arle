@@ -10,11 +10,10 @@
 //!   qwen35_compiled_push_layer_full_attn(model, ...) // ×8
 //!   qwen35_compiled_push_layer_gdr(model, ...)       // ×24
 //!   qwen35_compiled_finalize(model)                  // validates/prepares model
-//!   qwen35_compiled_step(model, token, caches_in, caches_out)
+//!   qwen35_compiled_step_session(model, ...)
 //!   qwen35_compiled_free(model)
 
 #include "mlx_common.h"
-#include "mlx/utils.h"
 #include <algorithm>
 #include <charconv>
 #include <chrono>
