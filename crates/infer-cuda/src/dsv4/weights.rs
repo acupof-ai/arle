@@ -164,11 +164,6 @@ pub(crate) struct Dsv4MoeLayer {
     /// (packed INT4 weight + BF16 group scales). `None` for FP8 checkpoints.
     pub w13_w4a16: Option<Vec<DeviceMatrix>>,
     pub w2_w4a16: Option<Vec<DeviceMatrix>>,
-    /// W4AFP8 routed experts (SGLang CUTLASS layout): one contiguous packed-INT4
-    /// weight + interleaved-BF16-scale buffer per projection across all local
-    /// experts. `None` for FP8/W4A16 checkpoints.
-    pub w13_w4afp8: Option<crate::moe::W4Afp8ExpertWeights>,
-    pub w2_w4afp8: Option<crate::moe::W4Afp8ExpertWeights>,
     pub num_groups: usize,
     pub hidden_dim: usize,
     pub intermediate: usize,
