@@ -2823,7 +2823,11 @@ impl Qwen35CudaExecutor {
         if self.recall_active() {
             return self.prefill_row_recall(row, position, host_kv);
         }
-        if self.slots[row.slot].has_recurrent() {
+        // 2D ring prefill attends only to the current segment's rotating KV; it
+        // cannot read prior segments' pool KV. The snapshotted path splits at
+        // L*, leaving the tail segment blind to the prefix — fall through to
+        // the single-pass default under 2D.
+        if self.slots[row.slot].has_recurrent() && !self.two_d_engaged() {
             return self.prefill_row_snapshotted(row, position, host_kv);
         }
         self.prefill_row_paged_default(row, position, host_kv)

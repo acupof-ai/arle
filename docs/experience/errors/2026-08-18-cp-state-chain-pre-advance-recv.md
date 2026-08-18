@@ -72,3 +72,29 @@ Both bugs (len=2000 correctness, len=8000 liveness) are live and
 unresolved. Root cause is elsewhere in the CP path — candidates:
 ring prefill KV rotation, decode cross-CP all-gather, or the
 linear-attention decode state usage.
+
+## Follow-up 2 (2026-08-18, pod first-token isolation)
+
+Pod experiment with `max_tokens=1` at len=2000 isolated the bug to the
+**prefill path**: CP=2 first token `'I'` (wrong) vs CP=1 `'7'` (correct,
+full output `'738291'`). FA3 route active, no scalar fallback.
+
+**Root cause found**: `prefill_row_snapshotted` (the recurrent-state
+snapshot path) splits the prefill at L*=1984 into [0,1984) + [1984,2000).
+The 2D ring prefill attends ONLY to the current segment's rotating KV
+buffers — it cannot read prior segments' pool KV. The tail segment's
+last-token hidden state is blind to the prefix, so the needle at
+position 0 is lost.
+
+At len=300/446 the recurrent state's compressed representation is
+sufficient to generate the correct first token despite the blind tail.
+At len=2000 the recurrent state has washed out the needle, and the dense
+attention cannot reach it.
+
+**Fix**: skip `prefill_row_snapshotted` under 2D (`!self.two_d_engaged()`
+guard in the prefill dispatch). The single-pass `prefill_row_paged_default`
+covers the entire prompt in one ring pass.
+
+**Remaining**: chunked prefill (len > 2048) has the same blind spot —
+each chunk's ring prefill cannot see prior chunks' pool KV. Needs a
+paged-attention + flash-decoding merge over the pool after the ring pass.
