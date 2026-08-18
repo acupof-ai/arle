@@ -61,6 +61,7 @@ pub(crate) use cuda_impl::CudaRecallState;
 mod cuda_impl {
     use anyhow::Result;
     use cuda_kernels::prelude::{DeviceContext, EVICTED_PAGE, PagedKVPool};
+    use infer_seam::ShardSpec;
 
     /// Per-slot session KV-recall state for the dense-Qwen3 paged decode path.
     ///
@@ -70,10 +71,13 @@ mod cuda_impl {
     /// unless recall is enabled and the session has exceeded the budget.
     #[derive(Default)]
     pub(crate) struct CudaRecallState {
+        /// CP shard ownership (rank, size). Default = no sharding (rank 0, size 1).
+        shard: ShardSpec,
         /// Resident per-middle-block mean-key reps. Layer-0 K mean-pooled over
         /// `l_bs` tokens, GQA-shaped to `[num_kv_heads, head_dim]` (flattened
         /// `nkv * hd` f32) — keeps offloaded blocks scorable (`q · rep`).
         /// Index = middle block index (token base `n_init + i * l_bs`).
+        /// Under CP, each rep covers only this shard's local tokens (partial mean).
         block_reps: Vec<Vec<f32>>,
         /// Selected page IDs for the next decode step (sink ∪ recalled ∪ local),
         /// ascending temporal order. `None` = session fits budget → full
@@ -99,6 +103,12 @@ mod cuda_impl {
         /// Selected page list for this step; `None` keeps the default full-cache page table.
         pub(crate) fn recall_pages(&self) -> Option<&[u32]> {
             self.recall_pages.as_deref()
+        }
+
+        /// Set the CP shard ownership. Called once when recall is enabled; the
+        /// shard is fixed for the executor's lifetime.
+        pub(crate) fn set_shard(&mut self, shard: ShardSpec) {
+            self.shard = shard;
         }
 
         /// Reset on slot reuse (new occupant): drop the prior session's reps and
@@ -150,14 +160,20 @@ mod cuda_impl {
                 // stop growing reps here (we cannot reconstruct a freed block's
                 // mean key; it stays prefix-only-recallable per R1). Never advance
                 // `block_reps` past a sentinel block — that would misalign scoring.
-                let span_resident =
-                    (base..base + cfg.l_bs).all(|pos| pages[pos / page_size] != EVICTED_PAGE);
+                // Under CP, only this shard's pages are checked/read.
+                let span_resident = (base..base + cfg.l_bs)
+                    .filter_map(|pos| self.shard.local_index(pos / page_size))
+                    .all(|li| pages[li] != EVICTED_PAGE);
                 if !span_resident {
                     break;
                 }
                 let mut rep = vec![0.0_f32; num_kv_heads * head_dim];
+                let mut local_tokens = 0u32;
                 for pos in base..base + cfg.l_bs {
-                    let page = pages[pos / page_size] as usize;
+                    let Some(li) = self.shard.local_index(pos / page_size) else {
+                        continue;
+                    };
+                    let page = pages[li] as usize;
                     let row = pos % page_size;
                     let start = page * page_bytes;
                     let bytes = ctx
@@ -177,9 +193,15 @@ mod cuda_impl {
                             rep[out + d] += v;
                         }
                     }
+                    local_tokens += 1;
                 }
+                let divisor = if self.shard.size > 1 {
+                    local_tokens as f32
+                } else {
+                    l_bs_f
+                };
                 for v in &mut rep {
-                    *v /= l_bs_f;
+                    *v /= divisor;
                 }
                 self.block_reps.push(rep);
             }
@@ -243,7 +265,8 @@ mod cuda_impl {
             for (i, rep) in self.block_reps.iter().enumerate() {
                 let base = cfg.n_init + i * cfg.l_bs;
                 let resident = (base..base + cfg.l_bs)
-                    .all(|pos| table.get(pos / page_size).copied() != Some(EVICTED_PAGE));
+                    .filter_map(|pos| self.shard.local_index(pos / page_size))
+                    .all(|li| table.get(li).copied() != Some(EVICTED_PAGE));
                 // Without an L3 tier (dense arm, `allow_prefetch=false`) a block
                 // whose pages were evict-dropped cannot be re-attended mid-decode,
                 // so mask it to `-inf` (only resident blocks compete). With the L3
@@ -277,16 +300,25 @@ mod cuda_impl {
                 // (outside the pinned sink + local windows). The executor frees
                 // these physical pages from BOTH pools after this step; their KV is
                 // already mirrored to the tier (write_through), so the drop is free.
-                self.evict_pages =
-                    evict_logical_pages(&plan.ranges, pool.page_indices(slot), page_size, cfg);
+                self.evict_pages = evict_logical_pages(
+                    &plan.ranges,
+                    pool.page_indices(slot),
+                    page_size,
+                    cfg,
+                    self.shard,
+                );
                 if allow_prefetch {
                     // Re-recall: logical pages in the working set that are currently
                     // evicted sentinels. The executor pulls them back H2D from the
                     // tier (reinstating real page ids) BEFORE the next step, then
                     // calls `resolve_recall_pages`. Defer page resolution until
                     // then so a sentinel never reaches the kernel page table.
-                    self.prefetch_pages =
-                        prefetch_logical_pages(&plan.ranges, pool.page_indices(slot), page_size);
+                    self.prefetch_pages = prefetch_logical_pages(
+                        &plan.ranges,
+                        pool.page_indices(slot),
+                        page_size,
+                        self.shard,
+                    );
                     self.recall_ranges = plan.ranges;
                     // `recall_pages` is intentionally left at its previous value;
                     // `resolve_recall_pages` rebuilds it after the executor's
@@ -296,6 +328,7 @@ mod cuda_impl {
                         &plan.ranges,
                         pool.page_indices(slot),
                         page_size,
+                        self.shard,
                     ));
                     self.recall_ranges.clear();
                     self.prefetch_pages.clear();
@@ -331,6 +364,7 @@ mod cuda_impl {
                 &self.recall_ranges,
                 pool.page_indices(slot),
                 pool.page_size,
+                self.shard,
             ));
         }
     }
@@ -338,10 +372,12 @@ mod cuda_impl {
     /// Pages covered by a working-set range that are currently `EVICTED_PAGE`
     /// sentinels (KV lives only in the L3 tier) — the re-recalled-block pages
     /// the executor must reinstate before the next step attends them.
+    /// Returns LOCAL page-table indices.
     fn prefetch_logical_pages(
         ranges: &[(usize, usize)],
         pages: &[u32],
         page_size: usize,
+        shard: ShardSpec,
     ) -> Vec<usize> {
         if page_size == 0 || pages.is_empty() {
             return Vec::new();
@@ -352,10 +388,12 @@ mod cuda_impl {
                 continue;
             }
             let first = s / page_size;
-            let last = ((e - 1) / page_size).min(pages.len() - 1);
-            for (p, &page) in pages.iter().enumerate().take(last + 1).skip(first) {
-                if page == EVICTED_PAGE && out.last() != Some(&p) {
-                    out.push(p);
+            let last = (e - 1) / page_size;
+            for global_page in first..=last {
+                if let Some(li) = shard.local_index(global_page) {
+                    if li < pages.len() && pages[li] == EVICTED_PAGE && out.last() != Some(&li) {
+                        out.push(li);
+                    }
                 }
             }
         }
@@ -365,12 +403,13 @@ mod cuda_impl {
     /// Pages NOT covered by any working-set range, excluding the pinned sink
     /// (first `n_init` tokens) and local (last `n_local` tokens) regions, and
     /// skipping already-evicted sentinels — the cold middle pages whose HBM
-    /// page can be returned to the pool.
+    /// page can be returned to the pool. Returns LOCAL page-table indices.
     fn evict_logical_pages(
         ranges: &[(usize, usize)],
         pages: &[u32],
         page_size: usize,
         cfg: &infer_core::RecallConfig,
+        shard: ShardSpec,
     ) -> Vec<usize> {
         if page_size == 0 || pages.is_empty() {
             return Vec::new();
@@ -381,10 +420,12 @@ mod cuda_impl {
                 continue;
             }
             let first = s / page_size;
-            let last = ((e - 1) / page_size).min(pages.len() - 1);
-            if first <= last {
-                for slot in &mut keep[first..=last] {
-                    *slot = true;
+            let last = (e - 1) / page_size;
+            for global_page in first..=last {
+                if let Some(li) = shard.local_index(global_page) {
+                    if li < keep.len() {
+                        keep[li] = true;
+                    }
                 }
             }
         }
@@ -396,8 +437,12 @@ mod cuda_impl {
         let local_start = total_tokens.saturating_sub(cfg.n_local);
         let first_local_page = local_start / page_size;
         (0..pages.len())
-            .filter(|&p| {
-                p >= sink_pages && p < first_local_page && !keep[p] && pages[p] != EVICTED_PAGE
+            .filter(|&li| {
+                let global_page = shard.global_page(li);
+                global_page >= sink_pages
+                    && global_page < first_local_page
+                    && !keep[li]
+                    && pages[li] != EVICTED_PAGE
             })
             .collect()
     }
@@ -406,10 +451,12 @@ mod cuda_impl {
     /// sink/local windows are multi-page, so each range covers whole pages; the
     /// final range ends at `cache_len`, so the last page is the current
     /// (partially filled) local page — exactly what `kv_last_page_len` describes.
+    /// Under CP, only this shard's pages are included.
     fn token_ranges_to_pages(
         ranges: &[(usize, usize)],
         pages: &[u32],
         page_size: usize,
+        shard: ShardSpec,
     ) -> Vec<u32> {
         let mut out: Vec<u32> = Vec::new();
         for &(s, e) in ranges {
@@ -418,23 +465,25 @@ mod cuda_impl {
             }
             let first_page = s / page_size;
             let last_page = (e - 1) / page_size;
-            for p in first_page..=last_page {
-                if let Some(&page) = pages.get(p) {
-                    // The working set is built only from resident blocks (scoring
-                    // masks evicted ones to -inf), so a sentinel must never reach
-                    // the kernel page table. Guard the invariant and skip if hit.
-                    debug_assert_ne!(
-                        page, EVICTED_PAGE,
-                        "recall working set referenced an evicted page (logical {p})"
-                    );
-                    if page == EVICTED_PAGE {
-                        continue;
-                    }
-                    // Ranges are ascending and page-aligned at the block grain,
-                    // but the sink end and a recalled-block start can land in the
-                    // same page; dedup the boundary so a page is never doubled.
-                    if out.last() != Some(&page) {
-                        out.push(page);
+            for global_page in first_page..=last_page {
+                if let Some(li) = shard.local_index(global_page) {
+                    if let Some(&page) = pages.get(li) {
+                        // The working set is built only from resident blocks (scoring
+                        // masks evicted ones to -inf), so a sentinel must never reach
+                        // the kernel page table. Guard the invariant and skip if hit.
+                        debug_assert_ne!(
+                            page, EVICTED_PAGE,
+                            "recall working set referenced an evicted page (local {li}, global {global_page})"
+                        );
+                        if page == EVICTED_PAGE {
+                            continue;
+                        }
+                        // Ranges are ascending and page-aligned at the block grain,
+                        // but the sink end and a recalled-block start can land in the
+                        // same page; dedup the boundary so a page is never doubled.
+                        if out.last() != Some(&page) {
+                            out.push(page);
+                        }
                     }
                 }
             }

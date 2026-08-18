@@ -77,6 +77,17 @@ impl ShardSpec {
             }
         })
     }
+
+    /// Global page index for a local index on this shard. Inverse of
+    /// [`local_index`](Self::local_index).
+    #[must_use]
+    pub fn global_page(&self, local_idx: usize) -> usize {
+        if self.size <= 1 {
+            local_idx
+        } else {
+            self.rank + local_idx * self.size
+        }
+    }
 }
 
 /// Host-side paged KV bookkeeping for a backend executor.
