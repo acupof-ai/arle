@@ -2772,9 +2772,17 @@ mod dsv4_gpu {
             )?;
         }
 
-        // CUTLASS workspace: metadata (E×136 B) + CUTLASS ws. 64 MB is safe for
-        // E=256 (metadata = 34 KB, CUTLASS ws typically <16 MB).
-        let ws_bytes = 64 * 1024 * 1024;
+        // CUTLASS workspace: metadata (E×136 B) + CUTLASS ws. At TP=2 E=128
+        // (metadata = 17 KB, CUTLASS ws typically <16 MB); 32 MB is safe.
+        let ws_bytes = 32 * 1024 * 1024;
+        if let Ok((free, total)) = cudarc::driver::result::mem_get_info() {
+            log::info!(
+                "DSv4 W4AFP8 workspace alloc: free {}MB / total {}MB, ws_bytes {}MB",
+                free >> 20,
+                total >> 20,
+                ws_bytes >> 20
+            );
+        }
         let workspace = ctx
             .stream
             .alloc_zeros::<u8>(ws_bytes)
