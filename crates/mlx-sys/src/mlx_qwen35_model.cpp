@@ -411,45 +411,6 @@ auto& compiled_precise_sigmoid_mul() {
     return fn;
 }
 
-array reorder_qwen35_v_cols_input(
-    const array& x,
-    int num_key_heads,
-    int num_value_heads_per_key,
-    int head_dim) {
-    if (num_value_heads_per_key <= 1) {
-        return x;
-    }
-    auto original_shape = x.shape();
-    if (original_shape.empty()) {
-        return x;
-    }
-    int cols = original_shape.back();
-    if (cols != num_key_heads * num_value_heads_per_key * head_dim) {
-        throw std::runtime_error("Qwen3.5 GGUF value-head input reorder dimension mismatch");
-    }
-
-    int prefix_ndim = static_cast<int>(original_shape.size()) - 1;
-    Shape expanded;
-    expanded.reserve(original_shape.size() + 2);
-    for (int i = 0; i < prefix_ndim; ++i) {
-        expanded.push_back(original_shape[i]);
-    }
-    expanded.push_back(num_key_heads);
-    expanded.push_back(num_value_heads_per_key);
-    expanded.push_back(head_dim);
-
-    std::vector<int> axes;
-    axes.reserve(expanded.size());
-    for (int i = 0; i < prefix_ndim; ++i) {
-        axes.push_back(i);
-    }
-    axes.push_back(prefix_ndim + 1);
-    axes.push_back(prefix_ndim);
-    axes.push_back(prefix_ndim + 2);
-
-    return reshape(transpose(reshape(x, expanded), axes), original_shape);
-}
-
 } // namespace
 
 
@@ -461,34 +422,17 @@ struct QWeight {
     int bits = 4;
     bool is_dense = false;  // if true, w is already transposed, use matmul directly
     int mode = 0;  // 0=affine (scale+bias), 1=mxfp4 (E2M1 + E8M0 per-32 scale, no bias)
-    int gguf_format = 0;
-    int rows = 0;
-    int cols = 0;
-    bool reorder_input_v_cols = false;
-    int reorder_num_key_heads = 0;
-    int reorder_num_value_heads_per_key = 0;
-    int reorder_head_dim = 0;
 
     array apply(const array& x, bool prefer_verify_m16 = false) const {
-        auto input = reorder_input_v_cols
-            ? reorder_qwen35_v_cols_input(
-                x,
-                reorder_num_key_heads,
-                reorder_num_value_heads_per_key,
-                reorder_head_dim)
-            : x;
-        if (gguf_format != 0) {
-            return gguf_quantized_matmul_cpp(input, w, gguf_format, rows, cols);
-        }
         if (is_dense) {
-            return matmul(input, w);  // w is already transposed at load time
+            return matmul(x, w);  // w is already transposed at load time
         }
         // The custom MMA2 kernel is affine-only; mxfp4 uses the stock kernel.
         if (prefer_verify_m16 && mode == 0) {
-            return verify_quantized_matmul_cpp(input, w, scales, biases, group_size, bits);
+            return verify_quantized_matmul_cpp(x, w, scales, biases, group_size, bits);
         }
         return quantized_matmul(
-            input, w, scales, bias_if_affine(biases, mode), true, group_size, bits, quant_mode_str(mode));
+            x, w, scales, bias_if_affine(biases, mode), true, group_size, bits, quant_mode_str(mode));
     }
 };
 
@@ -569,13 +513,7 @@ struct Qwen35CompiledModel {
         int batch_size = 1;
         bool last_logits_only = false;
         bool is_verify = false;
-        bool has_attn_mask = false;
-        array attn_mask = array(0);
-        bool has_cache_pos_arr = false;
-        const int32_t* cache_pos_arr = nullptr;
         bool kv_cache_int8 = false;
-        bool has_rope_offsets = false;
-        array rope_offsets = array(0);
         bool has_paged_full_kv = false;
         bool paged_full_kv_int8 = false;
         const std::vector<array>* paged_k_full = nullptr;
@@ -585,7 +523,6 @@ struct Qwen35CompiledModel {
         bool keep_intermediates = false;
         bool record_tapes = false;
         const std::vector<int>* capture_layer_ids = nullptr;
-        bool capture_final_hidden = false;
     };
 
     struct ForwardArtifacts {
@@ -599,8 +536,6 @@ struct Qwen35CompiledModel {
     QWeight lm_head;
     // Quantized embed weights for as_linear lm_head (when tied)
     QWeight embed_as_linear;
-    QWeight embed_packed;
-    bool use_packed_embed = false;
     bool use_embed_as_linear = false;
     std::vector<LayerWeights> layers;
     std::vector<QWeight> weight_pool;
@@ -629,27 +564,7 @@ struct Qwen35CompiledModel {
     bool current_last_logits_only = false;
     bool current_is_verify = false;
     mutable array current_gdr_t_arr = array(1);
-    mutable array current_attn_mask = array(0);
-    mutable bool current_has_attn_mask = false;
-    // Batched verify can carry a per-row physical KV write position.
-    //
-    // RoPE offsets already encode each row's logical token positions, but
-    // `cache_pos` is also used to select the KV slice-update window. Route 2
-    // therefore threads a host int32[B] cache_pos slice through the forward
-    // context and uses it only when the batched verify entrypoint requests it.
-    mutable const int32_t* current_cache_pos_arr = nullptr;
-    mutable bool current_has_cache_pos_arr = false;
     mutable bool current_kv_cache_int8 = false;
-    // Per-row RoPE offsets (int32 array of length batch_size).
-    //
-    // Workaround for MLX 0.31.1: `fast::rope(..., int offset)` on a
-    // `[B, H, S=1, D]` input with `B > 1` silently zeroes batch rows > 0.
-    // The array-offset overload (`fast::rope(..., const array& offset)`) works
-    // correctly for B=1 AND B>1, so we always route batched-decode RoPE
-    // through it. The same array slot also carries per-row offsets for
-    // variable-length batches (each row rotated at its own logical position).
-    mutable array current_rope_offsets = array(0);
-    mutable bool current_has_rope_offsets = false;
     mutable bool current_has_paged_full_kv = false;
     mutable bool current_paged_full_kv_int8 = false;
     mutable std::vector<array> current_paged_k_full;
@@ -686,14 +601,9 @@ struct Qwen35CompiledModel {
 
     // When tape_mode is on, gdr_step() records innovation tapes for each GDR layer.
     bool tape_mode = false;
-    bool gdr_metal_kernel_enabled = true;
     // When non-empty, forward() captures hidden states after the listed layers
     // and appends them to the output vector (after logits + caches + gdr states).
     std::vector<int> capture_layer_ids;
-    // Capture the post-final-RMSNorm hidden state emitted to lm_head. This is
-    // separate from DFlash's layer captures; Qwen3.5 MTP uses this width-H state
-    // as its recurrent seed.
-    bool capture_final_hidden = false;
     // Per-GDR-layer tape recordings: (innovation_tape, k, g, qkv).
     // Populated during forward() when tape_mode=true, cleared at start of each step.
     mutable std::vector<GdrTapeEntry> gdr_tapes;
@@ -721,12 +631,6 @@ struct Qwen35CompiledModel {
     }
 
     void clear_optional_batch_inputs() {
-        current_attn_mask = array(0);
-        current_has_attn_mask = false;
-        current_cache_pos_arr = nullptr;
-        current_has_cache_pos_arr = false;
-        current_rope_offsets = array(0);
-        current_has_rope_offsets = false;
         current_has_paged_full_kv = false;
         current_paged_full_kv_int8 = false;
         current_paged_k_full.clear();
@@ -790,7 +694,7 @@ struct Qwen35CompiledModel {
         int nkv,
         int hd
     ) const {
-        if (!ctx.is_verify || ctx.has_attn_mask || ctx.seq_len != 16) {
+        if (!ctx.is_verify || ctx.seq_len != 16) {
             return false;
         }
         // Valid for both mask-free packed verify and the native single-row
@@ -857,18 +761,8 @@ struct Qwen35CompiledModel {
         k = fast::rms_norm(k, lw.k_norm_w, rms_eps);
         k = transpose(k, {0, 2, 1, 3});
 
-        if (ctx.has_rope_offsets) {
-            // Array-offset path. Handles B>1 correctly AND carries per-row
-            // logical positions for variable-length decode (each row's
-            // offset = batch_cache_len - left_padding[row]).
-            q = fast::rope(q, rotary_dim, false, rope_theta, 1.0f, ctx.rope_offsets);
-            k = fast::rope(k, rotary_dim, false, rope_theta, 1.0f, ctx.rope_offsets);
-        } else {
-            // Scalar path. Only safe for B == 1 (prefill or single-request
-            // decode); batched decode callers MUST set rope_offsets.
-            q = fast::rope(q, rotary_dim, false, rope_theta, 1.0f, cache_pos);
-            k = fast::rope(k, rotary_dim, false, rope_theta, 1.0f, cache_pos);
-        }
+        q = fast::rope(q, rotary_dim, false, rope_theta, 1.0f, cache_pos);
+        k = fast::rope(k, rotary_dim, false, rope_theta, 1.0f, cache_pos);
 
         auto v = reshape(v_raw, {B, S, nkv, hd});
         v = transpose(v, {0, 2, 1, 3});
@@ -889,104 +783,33 @@ struct Qwen35CompiledModel {
         }
 
         array k_full(0), v_full(0);
-        if (ctx.has_cache_pos_arr) {
-            // Batched verify can mix rows with different physical KV cursors.
-            // RoPE still comes from ctx.rope_offsets; cache_pos_arr is only for
-            // where each row writes into the packed KV cache.
-            const int32_t* cache_pos_data = ctx.cache_pos_arr;
-
-            std::vector<array> new_k_rows;
-            std::vector<array> new_v_rows;
-            std::vector<array> k_full_rows;
-            std::vector<array> v_full_rows;
-            new_k_rows.reserve(B);
-            new_v_rows.reserve(B);
-            k_full_rows.reserve(B);
-            v_full_rows.reserve(B);
-
-            int key_len = 0;
-            for (int b = 0; b < B; ++b) {
-                int row_cache_pos = cache_pos_data[b];
-                int row_end = row_cache_pos + S;
-                key_len = std::max(key_len, row_end);
-
-                auto k_cache_row = slice(k_cache, {b, 0, 0, 0}, {b + 1, nkv, k_cache.shape(2), hd});
-                auto v_cache_row = slice(v_cache, {b, 0, 0, 0}, {b + 1, nkv, v_cache.shape(2), hd});
-                auto k_row = slice(k, {b, 0, 0, 0}, {b + 1, nkv, S, hd});
-                auto v_row = slice(v, {b, 0, 0, 0}, {b + 1, nkv, S, hd});
-
-                auto new_k_row = slice_update(
-                    k_cache_row,
-                    k_row,
-                    {0, 0, row_cache_pos, 0},
-                    {1, nkv, row_end, hd});
-                auto new_v_row = slice_update(
-                    v_cache_row,
-                    v_row,
-                    {0, 0, row_cache_pos, 0},
-                    {1, nkv, row_end, hd});
-                new_k_rows.push_back(new_k_row);
-                new_v_rows.push_back(new_v_row);
+        int end = cache_pos + S;
+        new_k_cache = slice_update(k_cache, k, {0,0,cache_pos,0}, {B,nkv,end,hd});
+        new_v_cache = slice_update(v_cache, v, {0,0,cache_pos,0}, {B,nkv,end,hd});
+        if (ctx.has_paged_full_kv) {
+            if (S != 1 || B != 1) {
+                throw std::runtime_error("paged full-attn KV read supports only single-token decode");
             }
-
-            if (ctx.has_attn_mask) {
-                key_len = ctx.attn_mask.shape(3);
-            } else {
-                for (int b = 0; b < B; ++b) {
-                    int row_end = cache_pos_data[b] + S;
-                    if (row_end != key_len) {
-                        throw std::runtime_error(
-                            "qwen35 batched verify requires attn_mask when cache_pos_arr differs across rows");
-                    }
-                }
+            if (!ctx.paged_k_full || !ctx.paged_v_full ||
+                full_layer_idx < 0 ||
+                full_layer_idx >= static_cast<int>(ctx.paged_k_full->size()) ||
+                full_layer_idx >= static_cast<int>(ctx.paged_v_full->size())) {
+                throw std::runtime_error("paged full-attn KV read missing layer input");
             }
-
-            for (int b = 0; b < B; ++b) {
-                k_full_rows.push_back(slice(new_k_rows[b], {0, 0, 0, 0}, {1, nkv, key_len, hd}));
-                v_full_rows.push_back(slice(new_v_rows[b], {0, 0, 0, 0}, {1, nkv, key_len, hd}));
-            }
-
-            new_k_cache = concatenate(new_k_rows, 0);
-            new_v_cache = concatenate(new_v_rows, 0);
-            k_full = concatenate(k_full_rows, 0);
-            v_full = concatenate(v_full_rows, 0);
+            const auto& k_prefix = (*ctx.paged_k_full)[full_layer_idx];
+            const auto& v_prefix = (*ctx.paged_v_full)[full_layer_idx];
+            validate_paged_prefix_array(k_prefix, "K", B, nkv, cache_pos, hd);
+            validate_paged_prefix_array(v_prefix, "V", B, nkv, cache_pos, hd);
+            k_full = concatenate(std::vector<array>{k_prefix, k}, 2);
+            v_full = concatenate(std::vector<array>{v_prefix, v}, 2);
         } else {
-            int end = cache_pos + S;
-            new_k_cache = slice_update(k_cache, k, {0,0,cache_pos,0}, {B,nkv,end,hd});
-            new_v_cache = slice_update(v_cache, v, {0,0,cache_pos,0}, {B,nkv,end,hd});
-            if (ctx.has_paged_full_kv) {
-                if (S != 1 || B != 1) {
-                    throw std::runtime_error("paged full-attn KV read supports only single-token decode");
-                }
-                if (!ctx.paged_k_full || !ctx.paged_v_full ||
-                    full_layer_idx < 0 ||
-                    full_layer_idx >= static_cast<int>(ctx.paged_k_full->size()) ||
-                    full_layer_idx >= static_cast<int>(ctx.paged_v_full->size())) {
-                    throw std::runtime_error("paged full-attn KV read missing layer input");
-                }
-                const auto& k_prefix = (*ctx.paged_k_full)[full_layer_idx];
-                const auto& v_prefix = (*ctx.paged_v_full)[full_layer_idx];
-                validate_paged_prefix_array(k_prefix, "K", B, nkv, cache_pos, hd);
-                validate_paged_prefix_array(v_prefix, "V", B, nkv, cache_pos, hd);
-                k_full = concatenate(std::vector<array>{k_prefix, k}, 2);
-                v_full = concatenate(std::vector<array>{v_prefix, v}, 2);
-            } else {
-                k_full = slice(new_k_cache, {0,0,0,0}, {B,nkv,end,hd});
-                v_full = slice(new_v_cache, {0,0,0,0}, {B,nkv,end,hd});
-            }
+            k_full = slice(new_k_cache, {0,0,0,0}, {B,nkv,end,hd});
+            v_full = slice(new_v_cache, {0,0,0,0}, {B,nkv,end,hd});
         }
 
         array attn_out(0);
         if (can_use_verify_sdpa_2pass(ctx, q, k_full, v_full, nh, nkv, hd)) {
             attn_out = batched_sdpa_2pass_cpp(q, k_full, v_full, attn_scale, nh / nkv);
-        } else if (ctx.has_attn_mask) {
-            attn_out = fast::scaled_dot_product_attention(
-                q,
-                k_full,
-                v_full,
-                attn_scale,
-                "",
-                ctx.attn_mask);
         } else {
             std::string mask_mode = (S > 1) ? "causal" : "";
             attn_out = fast::scaled_dot_product_attention(
@@ -1037,9 +860,6 @@ struct Qwen35CompiledModel {
         array& new_k_q_cache, array& new_k_s_cache, array& new_k_b_cache,
         array& new_v_q_cache, array& new_v_s_cache, array& new_v_b_cache
     ) const {
-        if (ctx.has_cache_pos_arr) {
-            throw std::runtime_error("Metal int8 KV session does not support cache_pos_arr");
-        }
         int B = ctx.batch_size;
         int nh = n_heads, nkv = n_kv_heads, hd = head_dim;
         int S = ctx.seq_len;
@@ -1067,13 +887,8 @@ struct Qwen35CompiledModel {
         k = fast::rms_norm(k, lw.k_norm_w, rms_eps);
         k = transpose(k, {0, 2, 1, 3});
 
-        if (ctx.has_rope_offsets) {
-            q = fast::rope(q, rotary_dim, false, rope_theta, 1.0f, ctx.rope_offsets);
-            k = fast::rope(k, rotary_dim, false, rope_theta, 1.0f, ctx.rope_offsets);
-        } else {
-            q = fast::rope(q, rotary_dim, false, rope_theta, 1.0f, cache_pos);
-            k = fast::rope(k, rotary_dim, false, rope_theta, 1.0f, cache_pos);
-        }
+        q = fast::rope(q, rotary_dim, false, rope_theta, 1.0f, cache_pos);
+        k = fast::rope(k, rotary_dim, false, rope_theta, 1.0f, cache_pos);
 
         auto v = reshape(v_raw, {B, S, nkv, hd});
         v = transpose(v, {0, 2, 1, 3});
@@ -1142,14 +957,6 @@ struct Qwen35CompiledModel {
         array attn_out(0);
         if (can_use_verify_sdpa_2pass(ctx, q, k_full, v_full, nh, nkv, hd)) {
             attn_out = batched_sdpa_2pass_cpp(q, k_full, v_full, attn_scale, nh / nkv);
-        } else if (ctx.has_attn_mask) {
-            attn_out = fast::scaled_dot_product_attention(
-                q,
-                k_full,
-                v_full,
-                attn_scale,
-                "",
-                ctx.attn_mask);
         } else {
             std::string mask_mode = (S > 1) ? "causal" : "";
             attn_out = fast::scaled_dot_product_attention(
@@ -1273,7 +1080,7 @@ struct Qwen35CompiledModel {
         }
 
         array y(0);
-        if (gdr_metal_kernel_enabled && use_gdr_metal_kernel()) {
+        if (use_gdr_metal_kernel()) {
             // The raw Metal kernel does direct pointer arithmetic and assumes
             // compact row-major inputs. GGUF Q4 projections and split/reshape
             // results may be lazy views, so materialize the exact kernel
@@ -1424,16 +1231,13 @@ struct Qwen35CompiledModel {
     ) const {
         // Compiled fast path: standard quantized weights at decode (S=1) — the two
         // matmuls + swiglu + down matmul encode once per (gate_dim, bits..., gs).
-        // Falls back to the per-op path for gguf/dense/verify/reordered weights.
+        // Falls back to the per-op path for dense/verify weights.
         // Gated under INFER_METAL_NO_MLP_COMPILE (same flag as compiled_mlp_fn) so
         // it can be A/B'd against the uncompiled path.
         static const bool mlp_compile = std::getenv("INFER_METAL_NO_MLP_COMPILE") == nullptr;
         if (mlp_compile && !prefer_verify_m16
             && x.ndim() == 3 && x.shape(1) == 1  // decode only (fixed shape for the shaped compile)
-            && gate.gguf_format == 0 && up.gguf_format == 0 && down.gguf_format == 0
             && !gate.is_dense && !up.is_dense && !down.is_dense
-            && !gate.reorder_input_v_cols && !up.reorder_input_v_cols
-            && !down.reorder_input_v_cols
             && gate.group_size == up.group_size && gate.group_size == down.group_size
             && gate.mode == up.mode && gate.mode == down.mode) {
             int gate_dim = gate.w.shape(0);  // output rows of the gate projection
@@ -1459,13 +1263,11 @@ struct Qwen35CompiledModel {
     ) const {
         // Compiled fast path: standard quantized weights (the common decode case) — the two
         // matmuls + split + swiglu encode once. Falls back to the per-op path for
-        // gguf/dense/verify/reordered weights, which the compiled graph does not cover.
+        // dense/verify weights, which the compiled graph does not cover.
         static const bool mlp_compile = std::getenv("INFER_METAL_NO_MLP_COMPILE") == nullptr;
         if (mlp_compile && !prefer_verify_m16
             && x.ndim() == 3 && x.shape(1) == 1  // decode only (fixed shape for the shaped compile)
-            && gate_up.gguf_format == 0 && down.gguf_format == 0
             && !gate_up.is_dense && !down.is_dense
-            && !gate_up.reorder_input_v_cols && !down.reorder_input_v_cols
             && gate_up.group_size == down.group_size && gate_up.bits == down.bits
             && gate_up.mode == down.mode) {
             return compiled_mlp_fn(
@@ -1548,9 +1350,7 @@ struct Qwen35CompiledModel {
         int F = n_full_attn, G = n_gdr;
         int kv_per_full = ctx.kv_cache_int8 ? 6 : 2;
         int full_kv_count = kv_per_full * F;
-        auto x = use_packed_embed
-            ? gguf_embedding_cpp(token_id, embed_packed.w, embed_packed.gguf_format, embed_packed.rows, embed_packed.cols)
-            : take(embed_tokens, flatten(token_id), 0);
+        auto x = take(embed_tokens, flatten(token_id), 0);
         x = reshape(x, {B, S, hidden_size});
         // op-profile (INFER_METAL_OP_PROFILE): eval-based per-section breakdown of the decode
         // forward. Serializes the step (sync per section) — RELATIVE breakdown only. Default-off.
@@ -1571,10 +1371,8 @@ struct Qwen35CompiledModel {
         std::vector<array> new_gdr_states(G, array(0));
         std::vector<array> new_conv_states(G, array(0));
         std::vector<array> captured_hidden;
-        if ((ctx.capture_layer_ids && !ctx.capture_layer_ids->empty()) || ctx.capture_final_hidden) {
-            captured_hidden.reserve(
-                (ctx.capture_layer_ids ? ctx.capture_layer_ids->size() : 0)
-                + (ctx.capture_final_hidden ? 1 : 0));
+        if (ctx.capture_layer_ids && !ctx.capture_layer_ids->empty()) {
+            captured_hidden.reserve(ctx.capture_layer_ids->size());
         }
         int full_idx = 0, gdr_idx = 0;
 
@@ -1686,9 +1484,6 @@ struct Qwen35CompiledModel {
 
         // Final norm + lm_head
         auto final_x = fast::rms_norm(x, final_norm_w, rms_eps);
-        if (ctx.capture_final_hidden) {
-            captured_hidden.push_back(final_x);
-        }
         if (ctx.last_logits_only && ctx.seq_len > 1) {
             final_x = slice(
                 final_x,
@@ -1737,13 +1532,7 @@ struct Qwen35CompiledModel {
         ctx.batch_size = current_batch_size;
         ctx.last_logits_only = current_last_logits_only;
         ctx.is_verify = current_is_verify;
-        ctx.has_attn_mask = current_has_attn_mask;
-        ctx.attn_mask = current_attn_mask;
-        ctx.has_cache_pos_arr = current_has_cache_pos_arr;
-        ctx.cache_pos_arr = current_cache_pos_arr;
         ctx.kv_cache_int8 = current_kv_cache_int8;
-        ctx.has_rope_offsets = current_has_rope_offsets;
-        ctx.rope_offsets = current_rope_offsets;
         ctx.has_paged_full_kv = current_has_paged_full_kv;
         ctx.paged_full_kv_int8 = current_paged_full_kv_int8;
         ctx.paged_k_full = current_has_paged_full_kv ? &current_paged_k_full : nullptr;
@@ -1753,7 +1542,6 @@ struct Qwen35CompiledModel {
         ctx.keep_intermediates = keep_step_intermediates(current_seq_len);
         ctx.record_tapes = tape_mode;
         ctx.capture_layer_ids = &capture_layer_ids;
-        ctx.capture_final_hidden = capture_final_hidden;
 
         ForwardArtifacts artifacts;
         if (ctx.keep_intermediates) {
@@ -1903,7 +1691,6 @@ void qwen35_compiled_set_embed_v2(
     MLX_TRY_VOID({
         auto* m = static_cast<Qwen35CompiledModel*>(model);
         m->embed_tokens = embed_tokens == nullptr ? array(0) : *to_arr(embed_tokens);
-        m->use_packed_embed = false;
         m->final_norm_w = *to_arr(final_norm_w);
         m->lm_head = qwen35_weight_by_id(m, lm_head_id);
         m->use_embed_as_linear = false;
@@ -2698,8 +2485,7 @@ void qwen35_set_capture_layers(void* model, const int32_t* layer_ids, int32_t co
 
 int32_t qwen35_get_captured_hidden_count(void* model) {
     auto* m = reinterpret_cast<Qwen35CompiledModel*>(model);
-    int capture_count = static_cast<int>(m->capture_layer_ids.size())
-        + (m->capture_final_hidden ? 1 : 0);
+    int capture_count = static_cast<int>(m->capture_layer_ids.size());
     if (capture_count <= 0) return 0;
     auto& outputs = m->prev_outputs;
     if ((int)outputs.size() < capture_count) return 0;
@@ -2710,8 +2496,7 @@ int32_t qwen35_get_captured_hidden_count(void* model) {
 int32_t qwen35_get_captured_hidden(void* model, int32_t idx, mlx_array** out) {
     try {
         auto* m = reinterpret_cast<Qwen35CompiledModel*>(model);
-        int capture_count = static_cast<int>(m->capture_layer_ids.size())
-            + (m->capture_final_hidden ? 1 : 0);
+        int capture_count = static_cast<int>(m->capture_layer_ids.size());
         auto& outputs = m->prev_outputs;
         if (capture_count <= 0)
             throw std::out_of_range("no captured hidden states are active");
