@@ -35,6 +35,7 @@ that the official 4.x kernel lacks.
 
 ## Key files
 - `crates/cuda-kernels/csrc/moe/w4a8/cutlass_extensions/gemm/collective/sm90_mma_array_tma_gmma_rs_warpspecialized_mixed_input_.hpp` — the kernel
+- `crates/cuda-kernels/csrc/moe/w4a8/cutlass_extensions/gemm/collective/builders/sm90_gmma_builder_mixed_input.inl` — stage-count template arg fix
 - `crates/cuda-kernels/build.rs` — CUTLASS include path (line ~2973)
 - `scripts/pod-build-env.sh` — removed CUTLASS 3.7.0 download
-- Commit: 453bf60fd
+- Commits: 453bf60fd (CUTLASS 4.x switch), e68512944 (builder stage-count fix)
