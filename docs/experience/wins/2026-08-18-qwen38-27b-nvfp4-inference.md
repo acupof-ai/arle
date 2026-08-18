@@ -144,27 +144,63 @@ ARLE's 9.3 tok/s is the only single-GPU NVFP4 result measured. At 1.3% of
 bandwidth the FP4 GEMV is bound by transaction count, which vectorized loads
 address directly.
 
-## FP4 GEMV vectorization — pending-remote
+## FP4 GEMV vectorization + dequant prefill path — measured
 
-Runtime `d6873c5e6`. The three FP4 group GEMV kernels read one packed byte per
-thread per iteration, so a 128 B cacheline was fetched per 1 B used. All three
-now share `fp4_e2m1_row_dot`, which loads 16 B (uint4, 32 weights) per
-transaction and hoists the per-group scale out of the per-element path.
+Runtime `2a3a2164f` (kernel `d6873c5e6`, dequant path `a23539905`), same pod,
+same H20, `--kv-cache-dtype fp8`.
 
-Same commit: `try_fp8_dequant_bf16_gemm_batch` and its W8A16 twin turned a
-failed BF16 scratch allocation into a hard error, which killed the server at
-c=4 during the benchmark above once the KV (30.2 GB) and recurrent (37.6 GB)
-pools had committed the VRAM. Both now fall back to the scalar GEMV.
+The three FP4 group GEMV kernels read one packed byte per thread per iteration,
+so a 128 B cacheline was fetched per 1 B used. All three now share
+`fp4_e2m1_row_dot`, which loads 16 B (uint4, 32 weights) per transaction and
+hoists the per-group scale out of the per-element path. Separately, NVFP4
+prefill gained a dequant-to-BF16 + cuBLAS arm
+(`dequantize_fp4_e2m1_group_to_bf16_cuda`), matching what FP8 / W8A16 / W4A16
+already had.
 
-Predicted from the measured 53 GB/s (1.3% of 4.0 TB/s): weight transactions
-drop 16x, while x-loads and scale loads are unchanged, so the binding
-constraint moves rather than disappearing.
+Also in this range: `try_fp8_dequant_bf16_gemm_batch` and its W8A16 twin turned
+a failed BF16 scratch allocation into a hard error, which killed the server at
+c=4 in the run above once the KV (30.2 GB) and recurrent (37.6 GB) pools had
+committed the VRAM. Both now fall back to the scalar GEMV.
 
-| | decode tok/s (c=1) | dense_ffn avg | bandwidth |
+### GPU-side, c=1 decode, ARLE_CUDA_PROFILE=1 (400 steps vs the baseline's 50)
+
+| | before | after | Δ |
 |---|---:|---:|---:|
-| Before (`33f4863c7`) | 9.3 | 1595 us | 53 GB/s (1.3%) |
-| After (`d6873c5e6`) | pending | pending | pending |
+| `dense_ffn` per step | 102.1 ms | 86.2 ms | **−15.5%** |
+| `forward_hidden` per step | 123.9 ms | 106.7 ms | **−13.9%** |
+| `dense_ffn` bandwidth | 53 GB/s (1.33%) | 63 GB/s (1.58%) | +19% |
+| `dense_ffn` share of forward | 82.4% | 80.8% | — |
 
-Status: pod SSH unavailable at the time of the change. Rerun
-`scripts/bench_throughput.py --concurrency-grid 1,4,8` plus the
-`ARLE_CUDA_PROFILE=1` per-op dump and fill the row above.
+The two deltas track: the GEMV is 81% of the forward, so a 15.5% kernel win
+lands as a 13.9% forward win.
+
+### End to end
+
+| c | before | after |
+|---:|---:|---:|
+| 1 | 9.3 tok/s | 9.3 tok/s |
+| 4 | 8.3 tok/s | 14.1 tok/s |
+| 8 | 9.2 tok/s | 26.5 tok/s |
+
+c=1 is unchanged in the harness number even though the forward is 13.9% faster:
+at one concurrent request the reported figure includes TTFT and scheduling, so
+the GPU win does not surface. c=4 and c=8 move a lot, but they are not a clean
+comparison — those cells previously died on the dequant-scratch OOM, so the
+"before" figures are a crashing server, not a slower one.
+
+Correctness: needle ladder 512 / 4096 × 3 = **6/6 exact, deterministic**
+(`NEEDLE_MAX_TOKENS=512` — the gate's default of 16 is below this reasoning
+model's thinking budget and yields empty completions at any code revision).
+This is the gate that matters here, since the prefill path is the one that
+changed.
+
+Raw artifacts on the pod: `/tmp/nvfp4_v5_bench.json`, `/tmp/decode_only.json`.
+
+### What is still open
+
+At 1.58% of bandwidth the GEMV is still far from memory-bound. The uint4 load
+removed the transaction-count problem but the kernel is now limited by
+something else — per-element LUT decode and the scalar FMA chain are the
+candidates. A prior ILP=4 attempt (four independent accumulators, no change to
+transaction count) measured as a wash, which is what pointed at transactions in
+the first place.
