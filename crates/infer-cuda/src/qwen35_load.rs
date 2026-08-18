@@ -343,7 +343,7 @@ impl Qwen35Model {
         let lm_head = if m.tie_word_embeddings {
             None
         } else {
-            Some(loader.load_matrix(&ctx, m.lm_head_tensor_name())?)
+            Some(loader.load_matrix_quant_aware(&ctx, m.lm_head_tensor_name())?)
         };
         crate::executor::cuda_startup_log(
             "qwen35.embeddings",
