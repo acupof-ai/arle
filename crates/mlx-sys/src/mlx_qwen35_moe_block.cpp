@@ -2,9 +2,8 @@
 //!
 //! Ports `Qwen3NextSparseMoeBlock.__call__` from the mlx-lm reference
 //! (`qwen3_next.py` lines 308–354) into a single C++ helper that composes the
-//! MLX C++ API. The helper is intended to be called from the per-layer dispatch
-//! inside `mlx_qwen35_model.cpp` (Phase 1C wires it up) and from Rust via the
-//! `qwen35_moe_block_forward` FFI.
+//! MLX C++ API. The helper is called from the per-layer dispatch
+//! inside `mlx_qwen35_model.cpp`.
 //!
 //! Reference flow (all MLX ops, stays in the graph):
 //!
@@ -259,7 +258,7 @@ array qwen35_moe_block_forward_cpp(
     bool norm_topk_prob) {
     if (num_experts <= 0 || top_k <= 0 || top_k > num_experts) {
         throw std::invalid_argument(
-            "qwen35_moe_block_forward: invalid num_experts/top_k");
+            "qwen35_moe_block_forward_cpp: invalid num_experts/top_k");
     }
 
     // INFER_MOE_TOP_K=N (1..top_k) — runtime knob to reduce active-expert
@@ -295,7 +294,7 @@ array qwen35_moe_block_forward_cpp(
     const int rank = static_cast<int>(x.ndim());
     if (rank < 2) {
         throw std::invalid_argument(
-            "qwen35_moe_block_forward: hidden must have rank >= 2 (got rank < 2)");
+            "qwen35_moe_block_forward_cpp: hidden must have rank >= 2 (got rank < 2)");
     }
 
     // gates: [..., E]
@@ -361,81 +360,4 @@ array qwen35_moe_block_forward_cpp(
     shared_y = mlx::core::multiply(gate_val, shared_y);
 
     return mlx::core::add(y, shared_y);
-}
-
-extern "C" mlx_array* qwen35_moe_block_forward(
-    mlx_array* hidden,
-    // Router (8-bit quantized linear: H -> E, no bias at runtime)
-    mlx_array* router_w,
-    mlx_array* router_scales,
-    mlx_array* router_biases,
-    int32_t router_bits,
-    int32_t router_group_size,
-    // Switch MLP experts (4-bit quantized, stacked on expert axis)
-    mlx_array* expert_gate_w,
-    mlx_array* expert_gate_scales,
-    mlx_array* expert_gate_biases,
-    mlx_array* expert_up_w,
-    mlx_array* expert_up_scales,
-    mlx_array* expert_up_biases,
-    mlx_array* expert_down_w,
-    mlx_array* expert_down_scales,
-    mlx_array* expert_down_biases,
-    int32_t expert_bits,
-    int32_t expert_group_size,
-    // Dense shared expert (4-bit quantized SwiGLU)
-    mlx_array* shared_gate_w,
-    mlx_array* shared_gate_scales,
-    mlx_array* shared_gate_biases,
-    mlx_array* shared_up_w,
-    mlx_array* shared_up_scales,
-    mlx_array* shared_up_biases,
-    mlx_array* shared_down_w,
-    mlx_array* shared_down_scales,
-    mlx_array* shared_down_biases,
-    // Shared-expert scalar router (8-bit quantized linear: H -> 1)
-    mlx_array* shared_gate_router_w,
-    mlx_array* shared_gate_router_scales,
-    mlx_array* shared_gate_router_biases,
-    int32_t num_experts,
-    int32_t top_k,
-    bool norm_topk_prob) {
-    MLX_TRY_RETURN([&]() {
-        if (hidden == nullptr) {
-            throw std::invalid_argument("qwen35_moe_block_forward: hidden is null");
-        }
-        return from_arr(qwen35_moe_block_forward_cpp(
-            *to_arr(hidden),
-            *to_arr(router_w),
-            *to_arr(router_scales),
-            *to_arr(router_biases),
-            router_bits,
-            router_group_size,
-            *to_arr(expert_gate_w),
-            *to_arr(expert_gate_scales),
-            *to_arr(expert_gate_biases),
-            *to_arr(expert_up_w),
-            *to_arr(expert_up_scales),
-            *to_arr(expert_up_biases),
-            *to_arr(expert_down_w),
-            *to_arr(expert_down_scales),
-            *to_arr(expert_down_biases),
-            expert_bits,
-            expert_group_size,
-            *to_arr(shared_gate_w),
-            *to_arr(shared_gate_scales),
-            *to_arr(shared_gate_biases),
-            *to_arr(shared_up_w),
-            *to_arr(shared_up_scales),
-            *to_arr(shared_up_biases),
-            *to_arr(shared_down_w),
-            *to_arr(shared_down_scales),
-            *to_arr(shared_down_biases),
-            *to_arr(shared_gate_router_w),
-            *to_arr(shared_gate_router_scales),
-            *to_arr(shared_gate_router_biases),
-            num_experts,
-            top_k,
-            norm_topk_prob));
-    }());
 }

@@ -50,9 +50,7 @@ pub use deepseek_ocr::{LoadedMetalDeepseekOcr, MetalDeepseekOcrModel};
 pub use diffusion_gemma::{LoadedMetalDiffusionGemma, MetalDiffusionGemmaModel};
 pub use executor::{MetalExecutor, MetalInflight, MetalKvCacheDtype};
 #[cfg(feature = "metal")]
-pub use executor::{
-    default_t2_budget_bytes, paged_kv_read_fallbacks, paged_kv_read_hits, pipeline_fast_path_hits,
-};
+pub use executor::{default_t2_budget_bytes, paged_kv_read_fallbacks, paged_kv_read_hits};
 #[cfg(feature = "metal")]
 pub use gemma4::{LoadedMetalGemma4, MetalGemma4Model};
 pub use kv_pool::MetalKvPool;

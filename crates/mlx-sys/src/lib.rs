@@ -714,7 +714,6 @@ unsafe extern "C" {
     );
     pub fn qwen35_compiled_set_embed_as_linear_v2(model: *mut std::ffi::c_void, embed_id: i32);
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
     pub fn qwen35_compiled_push_full_attn_v2(
         model: *mut std::ffi::c_void,
         input_ln: *mut mlx_array,
@@ -729,7 +728,6 @@ unsafe extern "C" {
         gate_dim: i32,
         down_id: i32,
     );
-    #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
     pub fn qwen35_compiled_push_gdr_v2(
         model: *mut std::ffi::c_void,
@@ -869,21 +867,10 @@ unsafe extern "C" {
         cache_pos: i32,
         out_logits: *mut *mut mlx_array,
     ) -> i32;
-    #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
-    /// Packed batched prefill — one forward over `B × max_chunk_len` prompt
-    /// tokens against packed KV/GDR. Symmetric to
-    /// `qwen35_compiled_step_batch_packed` (decode `seq_len = 1`) with
-    /// `seq_len = max_chunk_len` and `last_logits_only = true`. Returns
-    /// `[B, 1, vocab]`. Commit-2 invariant: every `prompt_len_arr[b]` must
-    /// equal `max_chunk_len` (varlen rows are a B2.5+ follow-up).
-    #[allow(clippy::too_many_arguments)]
     /// DFlash verify: parallel forward over a draft block, returning all-position
     /// logits [1, block_size, vocab]. Respects model-level tape_mode and capture
     /// layers — one call emits per-step GDR tapes and captured hidden for the
     /// entire block, replacing the previous 16 × seq_len=1 sequential verify loop.
-    #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
     pub fn qwen35_compiled_verify_block_summary(
         model: *mut std::ffi::c_void,

@@ -1,7 +1,8 @@
 //! Metal backend executor + session machinery.
 //!
 //! `new()` keeps a CPU placeholder so the submit/poll seam stays testable without
-//! the `metal` feature; `from_model_path()` builds the real MLX Qwen3.5 executor.
+//! the `metal` feature; `from_model_path_with_kv_cache_dtype_and_resource_plan()`
+//! builds the real MLX Qwen3.5 executor.
 //! `RealMetalExecutor` and all MLX-touching session state are gated behind
 //! `#[cfg(feature = "metal")]`.
 
@@ -96,20 +97,6 @@ fn probe_pipeline_fast_path() {
     use std::sync::Once;
     static ONCE: Once = Once::new();
     ONCE.call_once(|| eprintln!("[infer-metal] pipeline fast path LIVE (overlapped decode)"));
-    PIPELINE_FAST_PATH_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-}
-
-/// Monotonic count of pipeline fast-path firings (process-wide). A test or bench
-/// reads this to prove which decode path each step took. Harmless in production:
-/// a single relaxed counter on an already-rare event.
-#[cfg(feature = "metal")]
-pub(crate) static PIPELINE_FAST_PATH_HITS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-
-#[cfg(feature = "metal")]
-#[must_use]
-pub fn pipeline_fast_path_hits() -> u64 {
-    PIPELINE_FAST_PATH_HITS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Paged-prefix read path for single-token decode. The C++ session still owns
@@ -281,35 +268,6 @@ impl MetalExecutor {
             #[cfg(feature = "metal")]
             real: None,
         }
-    }
-
-    #[cfg(feature = "metal")]
-    pub fn from_model_path(model_path: impl AsRef<Path>) -> anyhow::Result<Self> {
-        Self::from_model_path_with_kv_cache_dtype(model_path, MetalKvCacheDtype::default())
-    }
-
-    #[cfg(feature = "metal")]
-    pub fn from_model_path_with_kv_cache_dtype(
-        model_path: impl AsRef<Path>,
-        kv_cache_dtype: MetalKvCacheDtype,
-    ) -> anyhow::Result<Self> {
-        let model_source = model_path.as_ref().to_string_lossy();
-        let resolved = model_source::resolve_model_path(&model_source)?;
-        let resource_plan = crate::resource::plan_resource_budget(
-            &resolved,
-            crate::resource::MetalResourceRequest {
-                kv_cache_dtype,
-                num_slots: 1,
-                total_pages: 8192,
-                page_size: 16,
-                low_impact: true,
-                memory_budget_bytes: None,
-                system_reserve_bytes: None,
-                allow_swap: false,
-                mem_fraction_static: 0.9,
-            },
-        )?;
-        Self::from_resolved_model_path_with_plan(&resolved, kv_cache_dtype, Some(resource_plan))
     }
 
     #[cfg(feature = "metal")]
