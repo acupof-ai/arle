@@ -52,6 +52,7 @@ including cfg-gated and build.rs-generated callers).
 ```
 cargo check -p infer-api --release --no-default-features --features cuda,no-cuda --lib  → clean (after c9a01d538)
 cargo check -p cuda-kernels -p infer-cuda --no-default-features --features cuda,no-cuda → clean
+cargo check -p cli --no-default-features --features cuda,no-cuda                       → clean (after 477541e04)
 cargo clippy -p <all changed crates> -- -D warnings                                     → zero warnings (changed crates)
 cargo test -p cli --release --no-default-features --features metal,no-cuda              → pass
 cargo test -p arle --profile release-fast --no-default-features --features cpu,no-cuda,cli → pass
@@ -93,6 +94,15 @@ in bbd422973. Left for the owner of that change.
   crates/cuda-kernels with repo-root-relative paths and silently searched only
   cuda-kernels/src/. Re-ran from the repo root; found 5 symbols still had Rust
   FFI decls. Lesson: zero-ref verification is only as wide as the cwd.
+- **CUDA-gated caller invisible on Mac (fixed by user in 477541e04)**: the
+  `reject_unimplemented_gkd_objectives` deletion left a stale import in
+  `cli/train_cli/agent_opd.rs`, which is `#[cfg(feature = "cuda")]`-gated —
+  invisible to the Mac `metal,no-cuda` test lane and to the
+  `cuda,no-cuda` checks that covered only cuda-kernels/infer-cuda/infer-api.
+  The pod `--features cuda,nccl` build failed with E0432; the user dropped the
+  import. Lesson: local verification must include
+  `cargo check -p cli --no-default-features --features cuda,no-cuda` — it runs
+  on Mac and covers the cli CUDA-gated surface.
 
 ## Learnings
 
