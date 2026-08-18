@@ -306,9 +306,9 @@ mod app {
                 max_prompt_tokens: max_seq_len,
                 max_total_tokens: max_seq_len,
                 chunked_prefill_size: Some(max_seq_len),
+                world_size: None,
                 ..EngineLoadConfig::default()
-            world_size: None,
-        },
+            },
         )
         .with_context(|| format!("load infer rollout student from {}", model.display()))?;
         println!("qwen36_fp8_lora_sync_gate_infer_loaded model={label}");
