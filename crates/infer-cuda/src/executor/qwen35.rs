@@ -1078,12 +1078,16 @@ impl Qwen35CudaExecutor {
             "--kv-recall is not supported with --spec-type dspark (the verify \
              forward would race the recall eviction cycle)"
         );
-        ensure!(
-            !(enabled && self.model.tp.attn_cp_size() > 1),
-            "--kv-recall is not supported with attn_cp>1 (rank-local recall scoring \
-             diverges the cp group's collective schedule)"
-        );
         self.kv_recall = enabled;
+        if enabled {
+            let shard = infer_seam::ShardSpec::new(
+                self.model.tp.attn_cp_rank(),
+                self.model.tp.attn_cp_size(),
+            );
+            for state in &mut self.recall {
+                state.set_shard(shard);
+            }
+        }
         if enabled && self.recall_tier.is_none() {
             // One entry == one pool page image (all `num_full` layers, K+V).
             let page_bytes = self
@@ -1151,6 +1155,73 @@ impl Qwen35CudaExecutor {
         self.kv_recall && self.recall_tier.is_some() && self.full_attn_kv.is_some()
     }
 
+    /// Build the prefill page table + CP ring metadata for a prefill row.
+    /// Under 2D, one ring pass over the whole prompt (balanced slices,
+    /// block-cyclic scatter). Shared by `prefill_row_paged_default` and
+    /// `prefill_row_recall`.
+    fn build_prefill_geometry(
+        &self,
+        row: &infer_plan::PrefillRow,
+    ) -> Result<(
+        crate::loader::PageMeta,
+        Option<crate::qwen35::Qwen35CpPrefill>,
+    )> {
+        let slot = row.slot;
+        let pool = self.full_attn_kv.as_ref().expect("full_attn_kv present");
+        let len = row.tokens.len();
+        let cp_size = self.model.tp.attn_cp_size();
+        if self.two_d_engaged() && self.dspark.is_none() {
+            let per = len.div_ceil(cp_size);
+            let base = len / cp_size;
+            let rem = len % cp_size;
+            let slices: Vec<(usize, usize)> = (0..cp_size)
+                .map(|p| {
+                    let l = base + usize::from(p < rem);
+                    (p * base + p.min(rem), l)
+                })
+                .collect();
+            let (off, my_len) = slices[self.model.tp.attn_cp_rank()];
+            let meta = crate::loader::PageMeta::for_ring_prefill(
+                &self.model.ctx,
+                row.start_pos + off,
+                my_len,
+            )?;
+            let kv_indices: Vec<i32> = pool.page_indices(slot).iter().map(|&p| p as i32).collect();
+            let q_pos: Vec<usize> = (0..my_len).map(|i| row.start_pos + off + i).collect();
+            let k_pos: Vec<Vec<usize>> = slices
+                .iter()
+                .map(|&(o, l)| (0..l).map(|i| row.start_pos + o + i).collect())
+                .collect();
+            let q_pos_f32 = crate::ops::upload_f32(
+                &self.model.ctx,
+                &q_pos.iter().map(|&p| p as f32).collect::<Vec<_>>(),
+            )?;
+            let k_pos_f32 = k_pos
+                .iter()
+                .map(|kp| {
+                    crate::ops::upload_f32(
+                        &self.model.ctx,
+                        &kp.iter().map(|&p| p as f32).collect::<Vec<_>>(),
+                    )
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let cp = crate::qwen35::Qwen35CpPrefill {
+                slices,
+                pad: per,
+                kv_indices: crate::ops::upload_i32(&self.model.ctx, &kv_indices)?,
+                q_pos,
+                k_pos,
+                q_pos_f32,
+                k_pos_f32,
+            };
+            Ok((meta, Some(cp)))
+        } else {
+            let meta =
+                crate::loader::PageMeta::for_slot(&self.model.ctx, pool, slot, row.start_pos, len)?;
+            Ok((meta, None))
+        }
+    }
+
     /// One paged prefill row with no recall cycle: full attention over every resident
     /// page, no eviction/scoring/prefetch.
     fn prefill_row_paged_default(
@@ -1175,80 +1246,7 @@ impl Qwen35CudaExecutor {
             );
         }
         self.mirror_host_slot(host_kv, slot, row.start_pos + row.tokens.len())?;
-        let (meta, cp) = {
-            let pool = self.full_attn_kv.as_ref().expect("full_attn_kv present");
-            let len = row.tokens.len();
-            let cp_size = self.model.tp.attn_cp_size();
-            // 2D ring prefill (T3.2b Part D): one ring pass over the whole
-            // prompt. Each rank preps its q-slice, rotates KV around the cp
-            // ring, and scatters its owned pages (block-cyclic). DSpark taps
-            // need the full chunk on every rank. The decision is a pure
-            // function of the (rank-identical) plan, so the cp group's
-            // collective schedule stays lockstep.
-            if self.two_d_engaged() && self.dspark.is_none() {
-                // Balanced distribution: `base` rows each, one extra to the first
-                // `rem` ranks. Unlike ceil-div (which leaves trailing ranks at 0
-                // rows whenever len % cp != 0), every rank holds >= 1 row when
-                // len >= cp; the len < cp case still has 0-row ranks, handled by
-                // the ring path's active guard.
-                let per = len.div_ceil(cp_size);
-                let base = len / cp_size;
-                let rem = len % cp_size;
-                let slices: Vec<(usize, usize)> = (0..cp_size)
-                    .map(|p| {
-                        let l = base + usize::from(p < rem);
-                        (p * base + p.min(rem), l)
-                    })
-                    .collect();
-                let (off, my_len) = slices[self.model.tp.attn_cp_rank()];
-                let meta = crate::loader::PageMeta::for_ring_prefill(
-                    &self.model.ctx,
-                    row.start_pos + off,
-                    my_len,
-                )?;
-                // Local shard pages in local-index order (entry j backs global
-                // page cp_rank + j*cp).
-                let kv_indices: Vec<i32> =
-                    pool.page_indices(slot).iter().map(|&p| p as i32).collect();
-                let q_pos: Vec<usize> = (0..my_len).map(|i| row.start_pos + off + i).collect();
-                let k_pos: Vec<Vec<usize>> = slices
-                    .iter()
-                    .map(|&(o, l)| (0..l).map(|i| row.start_pos + o + i).collect())
-                    .collect();
-                let q_pos_f32 = crate::ops::upload_f32(
-                    &self.model.ctx,
-                    &q_pos.iter().map(|&p| p as f32).collect::<Vec<_>>(),
-                )?;
-                let k_pos_f32 = k_pos
-                    .iter()
-                    .map(|kp| {
-                        crate::ops::upload_f32(
-                            &self.model.ctx,
-                            &kp.iter().map(|&p| p as f32).collect::<Vec<_>>(),
-                        )
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                let cp = crate::qwen35::Qwen35CpPrefill {
-                    slices,
-                    pad: per,
-                    kv_indices: crate::ops::upload_i32(&self.model.ctx, &kv_indices)?,
-                    q_pos,
-                    k_pos,
-                    q_pos_f32,
-                    k_pos_f32,
-                };
-                (meta, Some(cp))
-            } else {
-                let meta = crate::loader::PageMeta::for_slot(
-                    &self.model.ctx,
-                    pool,
-                    slot,
-                    row.start_pos,
-                    len,
-                )?;
-                (meta, None)
-            }
-        };
+        let (meta, cp) = self.build_prefill_geometry(row)?;
         let Self {
             model,
             slots,
@@ -2166,16 +2164,7 @@ impl Qwen35CudaExecutor {
         let slot = row.slot;
         let cfg = self.recall_cfg;
         self.mirror_host_slot(host_kv, slot, row.start_pos + row.tokens.len())?;
-        let meta = {
-            let pool = self.full_attn_kv.as_ref().expect("full_attn_kv present");
-            crate::loader::PageMeta::for_slot(
-                &self.model.ctx,
-                pool,
-                slot,
-                row.start_pos,
-                row.tokens.len(),
-            )?
-        };
+        let (meta, cp) = self.build_prefill_geometry(row)?;
         // `rc` carries back the layer-0 query used for scoring below.
         let (token, layer0_query) = {
             let Self {
@@ -2190,7 +2179,7 @@ impl Qwen35CudaExecutor {
                 pool,
                 meta: &meta,
                 layer0_query: Some(Vec::new()),
-                cp: None,
+                cp,
                 cp_decode: None,
             };
             let token = model.forward_tokens_recall(
@@ -2325,22 +2314,40 @@ impl Qwen35CudaExecutor {
         let slot = row.slot;
         self.mirror_host_slot(host_kv, slot, row.kv_seq_len + 1)?;
         let cache_len = row.kv_seq_len + 1;
+        let two_d = self.two_d_engaged();
         let recall_pages: Vec<u32> = match self.recall.get(slot).and_then(|s| s.recall_pages()) {
             Some(p) => p.to_vec(),
             None => {
                 let pool = self.full_attn_kv.as_ref().expect("full_attn_kv");
-                let num_pages = cache_len.div_ceil(pool.page_size);
-                pool.page_indices(slot)[..num_pages].to_vec()
+                if two_d {
+                    pool.page_indices(slot).to_vec()
+                } else {
+                    let num_pages = cache_len.div_ceil(pool.page_size);
+                    pool.page_indices(slot)[..num_pages].to_vec()
+                }
             }
         };
         let meta = {
             let pool = self.full_attn_kv.as_ref().expect("full_attn_kv");
-            crate::loader::PageMeta::for_recall_decode(
+            let mut meta = crate::loader::PageMeta::for_recall_decode(
                 &self.model.ctx,
                 pool,
                 cache_len,
                 &recall_pages,
-            )?
+            )?;
+            if two_d {
+                let cp_rank = self.model.tp.attn_cp_rank();
+                let cp_size = self.model.tp.attn_cp_size();
+                let global_pages = cache_len.div_ceil(pool.page_size);
+                let owns_last = cp_size <= 1 || (global_pages - 1) % cp_size == cp_rank;
+                meta.write_kv = i32::from(owns_last);
+            }
+            meta
+        };
+        let cp_decode = if two_d && self.dspark.is_none() {
+            self.model.cp_decode_handle()
+        } else {
+            None
         };
         let Self {
             model,
@@ -2355,7 +2362,7 @@ impl Qwen35CudaExecutor {
             meta: &meta,
             layer0_query: None,
             cp: None,
-            cp_decode: None,
+            cp_decode,
         };
         model.forward_tokens_recall(
             &mut slots[slot],
