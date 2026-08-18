@@ -128,5 +128,7 @@ extern "C" cudaError_t nvfp4_to_w4afp8(
       reinterpret_cast<__nv_bfloat16*>(dst_scales),
       N,
       K);
-  return cudaGetLastError();
+  cudaError_t err = cudaGetLastError();
+  if (err != cudaSuccess) return err;
+  return cudaStreamSynchronize(stream);
 }

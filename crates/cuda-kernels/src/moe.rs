@@ -1,6 +1,6 @@
 //! DeepSeek MoE routing helper kernels.
 
-use anyhow::{Result, ensure};
+use anyhow::{Result, bail, ensure};
 use cudarc::driver::sys::CUstream;
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 use half::bf16;
@@ -2304,7 +2304,7 @@ pub unsafe fn nvfp4_to_w4afp8(
     k: usize,
     stream: CUstream,
 ) -> Result<()> {
-    unsafe {
+    let rc = unsafe {
         ffi::nvfp4_to_w4afp8(
             src_weight.as_ptr(),
             src_scales.as_ptr(),
@@ -2313,7 +2313,10 @@ pub unsafe fn nvfp4_to_w4afp8(
             i32::try_from(n)?,
             i32::try_from(k)?,
             stream,
-        );
+        )
+    };
+    if rc != 0 {
+        bail!("nvfp4_to_w4afp8 kernel failed: CUDA error {rc}");
     }
     Ok(())
 }
