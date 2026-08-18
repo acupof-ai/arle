@@ -100,7 +100,7 @@ jobs:
     name: Build T1 kernel candidate
     needs: [validate-mode, skip-published]
     if: ${{ needs.validate-mode.outputs.qualify == 'false' && needs.skip-published.outputs.skip != 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v7
@@ -125,6 +125,17 @@ jobs:
         with:
           python-version: '3.12'
 
+      # TileLang artifact cache (per-kernel source × SM × toolchain identity).
+      # Restores unchanged kernels' codegen output; build.rs validates the
+      # identity before reuse, so a mismatch falls back to regeneration.
+      - name: Cache TileLang artifacts
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/arle-cuda-kernels
+          key: tilelang-artifacts-${{ github.run_id }}
+          restore-keys: |
+            tilelang-artifacts-
+
       - name: Install TileLang stack (vanilla tvm-ffi, no patch needed)
         run: |
           pip install --no-cache-dir -r requirements-build.txt
@@ -142,7 +153,6 @@ jobs:
       - name: Regenerate T1 kernel set (sm_80/86/89/90)
         env:
           ARLE_KERNEL_VENDOR: '1'
-          ARLE_CUDA_KERNEL_CACHE: '0'
         run: cargo build --release --features cuda -p cuda-kernels
 
       - name: Pack unqualified candidate
@@ -170,9 +180,10 @@ jobs:
     name: Zero-Python exact candidate consume
     needs: [validate-mode, skip-published, build]
     if: ${{ needs.validate-mode.outputs.qualify == 'false' && needs.skip-published.outputs.skip != 'true' }}
-    runs-on: ubuntu-latest
-    # The bundle ships TileLang artifacts only; this job still compiles every
-    # csrc TU for 4 SM targets from source, then links the full arle binary.
+    runs-on: ubuntu-24.04
+    # The prebuilt bundle (ARLE_CUDA_KERNELS_PREBUILT_DIR) links libkernels_cuda.a
+    # directly — no csrc recompile. The 90-min ceiling covers a fallback from-source
+    # build if the prebuilt path is ever disabled.
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v7
@@ -205,6 +216,7 @@ jobs:
       - name: Build product cold with TileLang poisoned
         env:
           ARLE_CUDA_KERNEL_CACHE: '0'
+          ARLE_CUDA_KERNELS_PREBUILT_DIR: crates/cuda-kernels/generated
           INFER_TILELANG_PYTHON: /usr/bin/false
           CARGO_TARGET_DIR: product/cuda-kernels
         run: |

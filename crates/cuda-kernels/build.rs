@@ -2282,14 +2282,25 @@ fn write_producer_manifest(
     std::fs::write(out_dir.join(PREBUILT_MANIFEST), text).expect("write CUDA producer manifest");
     // ARLE_KERNEL_VENDOR=1: pack tars generated/ into the bundle, and the
     // qualification path requires the producer manifest inside the candidate
-    // tree — mirror it next to the vendored artifact dirs.
+    // tree — mirror it and the prebuilt static libs next to the vendored
+    // artifact dirs so consumers can link the bundle directly
+    // (ARLE_CUDA_KERNELS_PREBUILT_DIR) instead of recompiling every csrc TU.
     if env_truthy("ARLE_KERNEL_VENDOR") {
-        let vendor_tier = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap())
-            .join("generated")
-            .join(PREBUILT_MANIFEST);
-        std::fs::create_dir_all(vendor_tier.parent().unwrap()).expect("create vendor tier");
-        std::fs::copy(out_dir.join(PREBUILT_MANIFEST), &vendor_tier)
-            .expect("mirror producer manifest into vendor tier");
+        let vendor_tier =
+            PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap()).join("generated");
+        std::fs::create_dir_all(&vendor_tier).expect("create vendor tier");
+        std::fs::copy(
+            out_dir.join(PREBUILT_MANIFEST),
+            vendor_tier.join(PREBUILT_MANIFEST),
+        )
+        .expect("mirror producer manifest into vendor tier");
+        for name in PREBUILT_ARTIFACTS {
+            let src = out_dir.join(name);
+            if src.is_file() {
+                std::fs::copy(&src, vendor_tier.join(name))
+                    .unwrap_or_else(|err| panic!("vendor export {name}: {err}"));
+            }
+        }
     }
     emit_kernel_build_identity(out_dir, &manifest);
 }
