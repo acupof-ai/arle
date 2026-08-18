@@ -142,3 +142,28 @@ not dequant-to-BF16.
 ARLE's 9.3 tok/s is the only single-GPU NVFP4 result measured. The 3.1%
 bandwidth utilization indicates the FP4 GEMV kernel has 5–8× headroom from
 ILP and vectorized-load optimizations alone.
+
+## FP4 GEMV vectorization — pending-remote
+
+Runtime `d6873c5e6`. The three FP4 group GEMV kernels read one packed byte per
+thread per iteration, so a 128 B cacheline was fetched per 1 B used. All three
+now share `fp4_e2m1_row_dot`, which loads 16 B (uint4, 32 weights) per
+transaction and hoists the per-group scale out of the per-element path.
+
+Same commit: `try_fp8_dequant_bf16_gemm_batch` and its W8A16 twin turned a
+failed BF16 scratch allocation into a hard error, which killed the server at
+c=4 during the benchmark above once the KV (30.2 GB) and recurrent (37.6 GB)
+pools had committed the VRAM. Both now fall back to the scalar GEMV.
+
+Predicted from the measured 53 GB/s (1.3% of 4.0 TB/s): weight transactions
+drop 16x, while x-loads and scale loads are unchanged, so the binding
+constraint moves rather than disappearing.
+
+| | decode tok/s (c=1) | dense_ffn avg | bandwidth |
+|---|---:|---:|---:|
+| Before (`33f4863c7`) | 9.3 | 1595 us | 53 GB/s (1.3%) |
+| After (`d6873c5e6`) | pending | pending | pending |
+
+Status: pod SSH unavailable at the time of the change. Rerun
+`scripts/bench_throughput.py --concurrency-grid 1,4,8` plus the
+`ARLE_CUDA_PROFILE=1` per-op dump and fill the row above.
