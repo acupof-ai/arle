@@ -2315,8 +2315,8 @@ pub unsafe fn nvfp4_to_w4afp8(
             stream,
         )
     };
-    if rc != 0 {
-        bail!("nvfp4_to_w4afp8 kernel failed: CUDA error {rc}");
+    if rc != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+        bail!("nvfp4_to_w4afp8 kernel failed: CUDA error {rc:?}");
     }
     Ok(())
 }
