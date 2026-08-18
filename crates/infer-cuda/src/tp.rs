@@ -173,25 +173,6 @@ impl TpRuntime {
         }
     }
 
-    /// Sub-comms default to the no-op; [`Self::from_env_with_nccl`] builds real ones.
-    #[must_use]
-    pub fn with_comm(config: TpConfig, comm: TpComm) -> Self {
-        Self {
-            comm,
-            attn_tp: TpComm::single(),
-            moe_ep: TpComm::single(),
-            attn_cp: TpComm::single(),
-            attn_cp_uses_global: false,
-            attn_cp_rank: 0,
-            attn_cp_size: 1,
-            attn_tp_rank: config.rank,
-            attn_tp_size: config.world_size,
-            #[cfg(all(feature = "cuda", feature = "nccl"))]
-            oneshot: None,
-            config,
-        }
-    }
-
     /// # Errors
     /// Errors if the resolved `(world_size, rank)` pair is invalid.
     pub fn from_env() -> infer_topo::Result<Self> {
@@ -377,20 +358,6 @@ impl TpRuntime {
     #[must_use]
     pub fn is_collective(&self) -> bool {
         self.comm.is_collective()
-    }
-
-    /// Whether the decode small-message path uses the one-shot CustomAllreduce
-    /// instead of NCCL.
-    #[must_use]
-    pub fn oneshot_comm_active(&self) -> bool {
-        #[cfg(all(feature = "cuda", feature = "nccl"))]
-        {
-            self.oneshot.is_some()
-        }
-        #[cfg(not(all(feature = "cuda", feature = "nccl")))]
-        {
-            false
-        }
     }
 
     /// COLLECTIVE: every rank must call at the same construction point. Any
