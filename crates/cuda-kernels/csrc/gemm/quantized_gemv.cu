@@ -298,6 +298,58 @@ extern "C" cudaError_t dequantize_w4a16_to_bf16_cuda(
     return cudaGetLastError();
 }
 
+// NVFP4 dequant: packed FP4 E2M1 weight [N, K/2] (low nibble = even col) x
+// per-row per-group FP8 E4M3 scale [N, K/group_size] x one F32 global scale
+// -> dense BF16 [N, K]. Same role as the W4A16/W8A16 dequants above: sm_90 has
+// no FP4 tensor cores, so any path that needs a real GEMM (prefill, and every
+// training forward/backward) dequantizes once and hands cuBLAS BF16.
+__global__ void dequantize_fp4_e2m1_group_to_bf16_kernel(
+    const uint8_t* __restrict__ weight,
+    const uint8_t* __restrict__ scales,
+    const float* __restrict__ global_scales,
+    __nv_bfloat16* __restrict__ output,
+    int N,
+    int K,
+    int group_size,
+    int scale_cols)
+{
+    const long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    const long total = (long)N * K;
+    if (idx >= total) return;
+    const int row = (int)(idx / K);
+    const int col = (int)(idx % K);
+    int group = col / group_size;
+    if (group > scale_cols - 1) group = scale_cols - 1;
+    const float scale =
+        dsv4_decode_fp8_e4m3(scales[(long)row * scale_cols + group]) * global_scales[0];
+    const uint8_t byte = weight[(long)row * (K / 2) + col / 2];
+    const uint8_t nib = (col & 1) ? (byte >> 4) : (byte & 0x0f);
+    output[idx] = __float2bfloat16(dsv4_decode_fp4_e2m1(nib) * scale);
+}
+
+extern "C" cudaError_t dequantize_fp4_e2m1_group_to_bf16_cuda(
+    const uint8_t* weight,
+    const uint8_t* scales,
+    const float* global_scales,
+    __nv_bfloat16* output,
+    int N,
+    int K,
+    int group_size,
+    int scale_cols,
+    cudaStream_t stream)
+{
+    if (N <= 0 || K <= 0 || group_size <= 0 || scale_cols <= 0 || (K & 1) != 0 ||
+        K % group_size != 0) {
+        return cudaErrorInvalidValue;
+    }
+    const long total = (long)N * K;
+    const int threads = 256;
+    const long blocks = (total + threads - 1) / threads;
+    dequantize_fp4_e2m1_group_to_bf16_kernel<<<(unsigned int)blocks, threads, 0, stream>>>(
+        weight, scales, global_scales, output, N, K, group_size, scale_cols);
+    return cudaGetLastError();
+}
+
 __device__ __forceinline__ float fp8_f32_dot16(
     const uint8_t* __restrict__ weight,
     const __nv_bfloat16* __restrict__ x)

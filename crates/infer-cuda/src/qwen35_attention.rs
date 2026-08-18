@@ -67,6 +67,11 @@ pub(crate) struct LinearDecodeGeom {
     v_off: usize,
 }
 
+/// Prompt-tail window the KV-recall scoring query is meaned over. Both
+/// capture sites (dense and 2D ring) must use the same window or they feed
+/// `plan_recall` differently-scaled queries with no compile error.
+const RECALL_PREFILL_Q_TOKENS: usize = 16;
+
 impl Qwen35Model {
     /// Gated full attention over an explicit contiguous K/V cache (`max_seq_len`
     /// = `k_cache.len / kv_dim`), into `out` (`[hidden, seq]`, beta=0 o_proj
@@ -1085,15 +1090,16 @@ impl Qwen35Model {
                 && full_idx == 0
                 && rows > 1
             {
+                // Row-major `[rows, q_dim]`, so the tail is one contiguous run —
+                // copying the whole buffer would move `rows/m` times the bytes.
+                let m = RECALL_PREFILL_Q_TOKENS.min(rows);
                 let host: Vec<bf16> = self
                     .ctx
                     .stream
-                    .clone_dtoh(&q_prepped.data)
+                    .clone_dtoh(&q_prepped.data.slice((rows - m) * q_dim..rows * q_dim))
                     .map_err(|e| anyhow!("recall layer0 q dtoh: {e}"))?;
-                const RECALL_PREFILL_Q_TOKENS: usize = 16;
-                let m = RECALL_PREFILL_Q_TOKENS.min(rows);
                 let mut q = vec![0.0_f32; q_dim];
-                for t in (rows - m)..rows {
+                for t in 0..m {
                     let base = t * q_dim;
                     for (d, slot) in q.iter_mut().enumerate() {
                         *slot += host[base + d].to_f32();
@@ -1289,23 +1295,25 @@ impl Qwen35Model {
             && full_idx == 0
             && active
             && rows > 1
-            && cp.slices.iter().rposition(|&(_, l)| l > 0) == Some(cp_rank)
+            && cp.slices.iter().rposition(|&(_, l)| l > 1) == Some(cp_rank)
         {
-            let host: Vec<u16> = self
-                .ctx
-                .stream
-                .clone_dtoh(&*q_ring)
-                .map_err(|e| anyhow!("recall ring q dtoh: {e}"))?;
-            const RECALL_PREFILL_Q_TOKENS: usize = 16;
+            // q_ring is head-major `[q_heads, rows, head_dim]` (the dense path's
+            // `q_prepped` is row-major, so the two captures cannot share
+            // indexing). The tail is contiguous per head but not across heads, so
+            // this is one copy per head rather than one copy of the whole buffer.
             let m = RECALL_PREFILL_Q_TOKENS.min(rows);
             let mut q = vec![0.0_f32; q_heads * head_dim];
-            // q_ring is head-major `[q_heads, rows, head_dim]`; the dense path's
-            // `q_prepped` is row-major, so the two captures cannot share indexing.
             for h in 0..q_heads {
-                for t in (rows - m)..rows {
-                    let base = (h * rows + t) * head_dim;
-                    for d in 0..head_dim {
-                        q[h * head_dim + d] += bf16::from_bits(host[base + d]).to_f32();
+                let head = h * rows * head_dim;
+                let host: Vec<u16> = self
+                    .ctx
+                    .stream
+                    .clone_dtoh(&q_ring.slice(head + (rows - m) * head_dim..head + rows * head_dim))
+                    .map_err(|e| anyhow!("recall ring q dtoh: {e}"))?;
+                let out = &mut q[h * head_dim..(h + 1) * head_dim];
+                for t in 0..m {
+                    for (d, slot) in out.iter_mut().enumerate() {
+                        *slot += bf16::from_bits(host[t * head_dim + d]).to_f32();
                     }
                 }
             }

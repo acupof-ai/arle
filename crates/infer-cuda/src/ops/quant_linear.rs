@@ -781,6 +781,109 @@ fn try_w8a16_dequant_bf16_gemm_batch(
     Ok(true)
 }
 
+/// NVFP4 large-M (prefill): dequantize the packed FP4 weight to BF16 once and
+/// run one cuBLAS GEMM, instead of the per-token weight re-read of the batched
+/// GEMV. sm_90 has no FP4 tensor cores, so BF16 is the only real GEMM available.
+/// Small-M decode returns false and keeps the fused GEMV.
+fn try_fp4_dequant_bf16_gemm_batch(
+    ctx: &DeviceContext,
+    weight: &DeviceMatrix,
+    x: &HiddenStates,
+    out: &mut HiddenStates,
+) -> Result<bool> {
+    if !matches!(weight.weight_format, WeightFormat::Fp4E2M1Group)
+        || x.seq_len < QWEN_FP8_DEQUANT_GEMM_MIN_M
+    {
+        return Ok(false);
+    }
+    ensure!(
+        weight.group_size > 0 && weight.cols.is_multiple_of(weight.group_size),
+        "Fp4E2M1Group cols {} not group-aligned to {}",
+        weight.cols,
+        weight.group_size
+    );
+    let qw = weight
+        .qweight_u8
+        .as_ref()
+        .ok_or_else(|| anyhow!("fp4_e2m1_group missing qweight_u8"))?;
+    let scales = weight
+        .qscale_fp8
+        .as_ref()
+        .ok_or_else(|| anyhow!("fp4_e2m1_group missing qscale_fp8"))?;
+    let global = weight
+        .scale_f32
+        .as_ref()
+        .ok_or_else(|| anyhow!("fp4_e2m1_group missing scale_f32 global scale"))?;
+    let n = weight.rows;
+    let k = weight.cols;
+    let weight_elems = n * k;
+
+    if !reserve_dequant_scratch(ctx, weight_elems) {
+        return Ok(false);
+    }
+
+    QWEN_FP8_DEQUANT_SCRATCH.with(|cell| -> Result<()> {
+        let scratch = cell.borrow_mut();
+        let weight_bf16 = scratch
+            .weight_bf16
+            .as_ref()
+            .ok_or_else(|| anyhow!("Qwen FP4 dense dequant BF16 scratch missing"))?;
+        let (qw_ptr, _gqw) = qw.device_ptr(&ctx.stream);
+        let (scales_ptr, _gs) = scales.device_ptr(&ctx.stream);
+        let (global_ptr, _gg) = global.device_ptr(&ctx.stream);
+        let (wbf16_ptr, _gw) = weight_bf16.device_ptr(&ctx.stream);
+        let stream = ctx.stream.cu_stream();
+        qwen_quant_profile(
+            ctx,
+            "qwen/fp4/dense_dequant_bf16",
+            x.seq_len,
+            n,
+            k,
+            // SAFETY: ptrs from live device allocations sized to the dims passed.
+            || unsafe {
+                ffi::dequantize_fp4_e2m1_group_to_bf16_cuda(
+                    qw_ptr as *const u8,
+                    scales_ptr as *const u8,
+                    global_ptr as *const f32,
+                    wbf16_ptr as *mut ffi::Half,
+                    n as i32,
+                    k as i32,
+                    weight.group_size as i32,
+                    weight.quant_scale_cols as i32,
+                    stream,
+                )
+                .result()
+                .map_err(|e| anyhow!("Qwen FP4 dense dequant kernel failed: {e}"))
+            },
+        )?;
+        let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
+        let (out_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
+        qwen_quant_profile(
+            ctx,
+            "qwen/fp4/dense_dequant_gemm",
+            x.seq_len,
+            n,
+            k,
+            // SAFETY: ptrs from live device allocations sized to the dims passed.
+            || unsafe {
+                ffi::gemm_cuda(
+                    wbf16_ptr as *const ffi::Half,
+                    x_ptr as *const ffi::Half,
+                    out_ptr as *mut ffi::Half,
+                    n as i32,
+                    x.seq_len as i32,
+                    k as i32,
+                    stream,
+                )
+                .result()
+                .map_err(|e| anyhow!("Qwen FP4 dense dequant BF16 GEMM failed: {e}"))
+            },
+        )?;
+        Ok(())
+    })?;
+    Ok(true)
+}
+
 fn try_w4a16_dequant_bf16_gemm_batch(
     _ctx: &DeviceContext,
     _weight: &DeviceMatrix,
@@ -825,6 +928,10 @@ pub(super) fn gemm_batch(
     // W8A16 large-M (prefill): dequant INT8→BF16 once + one cuBLAS GEMM, instead
     // of the per-token weight re-read of the batched GEMV below. Small-M decode
     // returns false and keeps the GEMV/batched-GEMM path.
+    if try_fp4_dequant_bf16_gemm_batch(ctx, weight, x, out)? {
+        return Ok(());
+    }
+
     if try_w8a16_dequant_bf16_gemm_batch(ctx, weight, x, out)? {
         W8A16_DEQUANT_GEMM_HITS.fetch_add(1, Ordering::Relaxed);
         return Ok(());
