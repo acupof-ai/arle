@@ -4,8 +4,6 @@ use std::collections::HashSet;
 
 use autograd::{TensorId, TensorStore};
 
-use crate::loss::KlDirection;
-
 use super::{GkdLossConfig, GkdSftAnchor, OpdError, OpdStepConfig, Result};
 
 pub(super) fn validate_token_ids(context: &str, tokens: &[u32], vocab: usize) -> Result<()> {
