@@ -627,9 +627,9 @@ mod app {
                 num_slots: 1,
                 page_size,
                 total_pages: max_seq_len.div_ceil(page_size),
+                world_size: None,
                 ..EngineLoadConfig::default()
-            world_size: None,
-        },
+            },
         )
     }
 
