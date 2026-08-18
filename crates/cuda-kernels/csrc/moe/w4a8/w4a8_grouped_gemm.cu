@@ -204,7 +204,7 @@ int run_grouped_gemm(
   auto* d_s_strides = reinterpret_cast<typename Gemm::StrideS*>(d_strides + 3 * num_exp * 3);
 
   // DEBUG: dump pointers + strides to host for inspection
-  if (getenv("W4AFP8_DEBUG")) {
+  {
     printf("[W4AFP8_DEBUG] n=%d k=%d num_exp=%d a_base=%p b_base=%p out_base=%p scales_base=%p\n",
            n, k, num_exp, a_activations, b_weights, d_output, b_scales);
     for (int e = 0; e < num_exp && e < 8; ++e) {
