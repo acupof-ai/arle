@@ -1,0 +1,102 @@
+# Global dead-code deletion, wave 2 — CUDA kernels + cross-crate, 2026-08-18
+
+> Status: local verified; pod parity gate pending-remote
+
+## Goal
+
+Second wave of the global dead-code deletion: remove non-main-path code
+already validated as dead (zero callers repo-wide), with priority on the
+CUDA C++/FFI surface that wave 1 did not reach. Zero runtime change is the
+correctness criterion.
+
+## Scope
+
+12 commits, **+37 / −5,819 (net −5,782 lines)**. Every deletion verified as
+zero-caller before removal (repo-root grep across rs/cu/cuh/cpp/h/sh/py/toml,
+including cfg-gated and build.rs-generated callers).
+
+| Chunk | Crate | Deleted | Lines |
+|-------|-------|---------|------:|
+| quantized_gemv.cu | cuda-kernels | 20 dead fns: dequantize_w4a16_to_fp16 kernel+export, fp8_wread_probe, q8_embedding batched/decode, w4a16_gemm_batch, w2a16_gemv×3, q3k_gemv/batch/dequant_chunk + exports, q3k/q8 embedding exports; orphan Q3K_* defines | ~554 |
+| kv_quant.cu | cuda-kernels | dequantize_paged_kv_cuda, quantize_scatter_kv_fp8_cuda, finalize_k_per_channel_scales_int4_cuda, quantize_paged_kv_int4_per_channel_cuda, quantize_paged_kv_single_int4_cuda | ~170 |
+| gemv.cu | cuda-kernels | autotune_all_cached_gemms_cuda, gemm_graphsafe_cuda, gemm_fp16_weight_cuda | ~120 |
+| attention .cu dead exports | cuda-kernels | nonpaged_prefill_attention plain ring export (varlen variants live), decode_attention_quantized.cu whole file, arle_flashmla_csa_prep fill_pad_rows, dsv4_flashmla_decode_build_indices plain export (start_pos_ptr + batched live), dsv4_fp8_kv_pack fill_sw_slots | ~400 |
+| 12 deleted .cu files | cuda-kernels | marlin_int4_fp8_preprocess, marlin_repack, fp16_gemm_wmma, turboquant_weight_gemv, kv_cache_to_paged, dtype_convert, bf16_to_fp8, gdr_prefill_solve, gdr_prefill_batch, decode_attention_turboquant, arle_q8kv8_prefill_shim, vendor/q8kv8_prefill/ (8 files) | ~2,400 |
+| FFI decls | cuda-kernels | 4 attention decls + fill_pad_rows decl in ffi/misc.rs; doc-link retargets | ~60 |
+| MoE / topo helpers | infer-moe, infer-topo | route_and_combine (CPU MoE reference), has_shared_expert, TpLinearConfig struct+impl, is_global_tp_ep_only | ~90 |
+| plan/core/util | infer-plan, infer-core, infer-util | SpecPlan, ForwardPlan.spec/.microbatch fields (+8 external initializers), ForwardMode::TargetVerify/DraftExtend, merge_vocab_shard_argmax, diffusion_prediction_from_logits, generate_diffusion wrapper, predict_row/sample_gumbel orphans, RecallPlan::recalled_blocks, Engine::cancel_all_requests (pub→private), resolve_weighted_model_path, download_runtime_assets_from_hub | ~330 |
+| autograd | autograd | module.rs whole file, ConstantLr/LinearWarmup/parse_lr_schedule (CosineWithWarmup + LrSchedule live), fused_linear_distill sparse leftovers, comm_world_rank, checkpoint_sequential group_size param collapsed to inline `li + 1` | ~520 |
+| cli / train | cli, train | --teacher-topk ×2 (parsed-but-rejected stub; engine-side top-k never landed), reject_unimplemented_gkd_objectives, GkdLossConfig.teacher_topk field + validation/step rejection arms, checkpoint_policy group_size arg, unused KlDirection import | ~120 |
+| infer-cuda | infer-cuda | tp.rs with_comm/oneshot_comm_active, dsv4_resident_ab.rs 3 dead env-var sets + env_flag helper (decode-graph lane deleted 9b12060fc), paged_kv_table.rs dsv4_pack_token_byte_base + dsv4_decode_route_index host mirrors | ~110 |
+| Marlin kernel arg | cuda-kernels | unused `int max_shared_mem` arg from MARLIN_KERNEL_PARAMS macro + template + launch site (max_shared_mem_new stays as LaunchKernel dynamic-shm-size arg) | ~15 |
+| stale docs/scripts | docs, scripts | eval_humaneval.py, eval_mbpp.py, scripts/README.md 6 stale rows, environment.md INFER_MARLIN_W4_FP8_PREFILL row, architecture/codebase-map/AGENTS kv_turboquant drift | ~120 |
+
+## What was NOT deleted (live, not dead)
+
+- q4k/q5k/q6k quantized_gemv exports — HIP backend callers
+- shared qxk_embedding kernels, q3k_value/q3k_decode_scales — live dispatch case 3
+- autotune_gemm_cuda — live (only the _all_cached variant was dead)
+- varlen nonpaged_prefill exports, dsv4 build_indices start_pos_ptr + batched variants — live
+- resolve_local_weighted_model_path — live (cli/ocr.rs, infer-metal)
+- CosineWithWarmup + LrSchedule trait — live
+- KVCacheDtype — live internally (paged_kv.rs legacy mapping); only the re-export was removed in wave 1
+- agent-bench whole crate — skipped, user's call
+- mlx-sys C++ dead wrappers, infer-metal pipeline_fast_path_hits — skipped, HOT crates with concurrent edits
+- arle_monitor.py / arle_watchdog.sh / cp2_ttft_oneshot.sh cluster — medium confidence, needs owner confirmation
+- dsv4_route.cu 14 dead exports — skipped, coupled to the user's in-flight ffi/moe.rs W4AFP8 work
+
+## Verification
+
+### Local (Mac)
+
+```
+cargo check -p infer-api --release --no-default-features --features cuda,no-cuda --lib  → clean (after c9a01d538)
+cargo check -p cuda-kernels -p infer-cuda --no-default-features --features cuda,no-cuda → clean
+cargo clippy -p <all changed crates> -- -D warnings                                     → zero warnings (changed crates)
+cargo test -p cli --release --no-default-features --features metal,no-cuda              → pass
+cargo test -p arle --profile release-fast --no-default-features --features cpu,no-cuda,cli → pass
+```
+
+Pre-existing warnings on HEAD (not from this wave): infer-cuda/src/gpu_sample.rs
+spawn/parse_nvidia_smi/query_nvidia_smi never used — the sampler was disabled
+in bbd422973. Left for the owner of that change.
+
+### Remote (CUDA build + parity gate) — pending-remote
+
+- [ ] `cargo build --release --features cuda` on pod (H20, sm_90)
+- [ ] `scripts/lever_gate.sh` Qwen3.5-9B, NEEDLE_MAX_TOKENS=2000, ×3 same-config
+- [ ] W8A16 decode perf A/B vs docs/baselines.md champion row — the Marlin
+      `max_shared_mem` arg removal touches the live W8A16 decode launch path;
+      the arg was never read by the kernel, so zero behavior change is
+      expected, but the gate requires a wall-clock license for live-path edits
+
+## Problems
+
+- **User's committed code broke the cuda,no-cuda lane (fixed in c9a01d538)**:
+  64a922bbf added `if rc != 0 { bail!("... {rc}") }` on the FFI's `CUresult`
+  enum in moe.rs:2318 — CUresult is neither comparable to 0 nor Display.
+  Fixed to `rc != CUresult::CUDA_SUCCESS` + `{rc:?}`, matching the pattern in
+  infer-cuda/src/tp.rs. Flagged to the user since they may be mid-edit on the
+  W4AFP8 path.
+- **External restore wiped tranche B mid-wave**: the user's W4AFP8 workflow
+  restored all of csrc/ + ffi/{attention,misc}.rs to HEAD, deleting
+  uncommitted wave-2 work. Re-applied and committed immediately (63e52f55d).
+  Lesson reinforced: work is durable only once committed.
+- **Brace-matching orphans (×2)**: TpLinearConfig and LinearWarmup cuts
+  matched the struct's column-0 `}` instead of the impl's, leaving orphaned
+  impl blocks. Fixed by cutting the impl separately. Lesson: for struct+impl,
+  cut impl first or verify extent.
+- **ForwardPlan field removal cascaded**: removing spec/.microbatch left 8
+  external struct-literal initializers (E0560) across planner.rs/vulkan/metal/
+  examples. Fixed with sed in the same commit.
+- **Zero-ref grep from the wrong cwd**: an early verification pass ran from
+  crates/cuda-kernels with repo-root-relative paths and silently searched only
+  cuda-kernels/src/. Re-ran from the repo root; found 5 symbols still had Rust
+  FFI decls. Lesson: zero-ref verification is only as wide as the cwd.
+
+## Learnings
+
+Wave 2 complete locally. The CUDA C++ surface was the richest vein in the
+repo — 12 whole .cu files and ~40 dead exports, most predating the paged-KV
+unification. Zero runtime change: every deletion was zero-caller code. Pod
+parity gate + W8A16 perf A/B are the remaining gate.
