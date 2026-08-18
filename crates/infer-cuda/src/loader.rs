@@ -804,26 +804,21 @@ impl PageMeta {
         );
         let num_pages = recall_pages.len();
         let page_ids = recall_pages.iter().map(|&p| p as i32).collect::<Vec<_>>();
-        // Under 2D CP the recall table holds only this shard's working-set
-        // pages; the lens and write flag must count the local shard, not the
-        // global sequence (FA3 sizes from seqlen_k; the combine kernel
-        // reads the local table).
+        // The lens must count the pages actually in this table, not the global
+        // sequence: FA3 sizes its split-KV work from seqlen_k, and the combine
+        // kernel then indexes the table. Passing `total_len` against a recall
+        // subset aborts in `flash_fwd_combine` (CUTLASS Error Internal).
+        // Same arithmetic with or without CP — a 1-wide shard owns every page.
         let global_pages = total_len.div_ceil(pool.page_size);
-        let owns_last = shard.size <= 1 || shard.owns_page(global_pages - 1);
+        let owns_last = shard.owns_page(global_pages - 1);
         let overshoot = global_pages * pool.page_size - total_len;
-        let local_last_fill = if owns_last {
+        let last_page_len = if owns_last {
             pool.page_size - overshoot
         } else {
             pool.page_size
         };
-        let local_token_count = num_pages.saturating_sub(1) * pool.page_size
-            + if num_pages == 0 { 0 } else { local_last_fill };
-        let (kv_lens, last_page_len, write_kv) = if shard.size > 1 {
-            (local_token_count, local_last_fill, i32::from(owns_last))
-        } else {
-            let g = total_len % pool.page_size;
-            (total_len, if g == 0 { pool.page_size } else { g }, 1)
-        };
+        let kv_lens = num_pages.saturating_sub(1) * pool.page_size + last_page_len;
+        let write_kv = i32::from(owns_last);
         Ok(Self {
             q_indptr: upload_i32(ctx, &[0, 1])?,
             kv_indptr: upload_i32(ctx, &[0, num_pages as i32])?,
