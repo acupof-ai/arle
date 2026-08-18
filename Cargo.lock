@@ -23,19 +23,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "agent-bench"
-version = "0.5.6"
-dependencies = [
- "anyhow",
- "infer-core",
- "infer-cuda",
- "infer-metal",
- "infer-plan",
- "infer-seam",
- "libc",
-]
-
-[[package]]
 name = "ahash"
 version = "0.8.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"

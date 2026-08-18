@@ -7,7 +7,7 @@
 //! so the seam is testable.
 
 // `kv_pool` and the `MetalExecutor` placeholder seam stay feature-free so default
-// `infer-server`/agent-bench builds and unit tests compile without `metal`.
+// `infer-server` builds and unit tests compile without `metal`.
 mod executor;
 mod kv_pool;
 // CLI-driven runtime toggles (EngineLoadConfig.metal → statics; no env reads).

@@ -2,7 +2,6 @@
 members = [
     ".",
     "crates/agent",
-    "crates/agent-bench",
     "crates/autograd",
     "crates/chat",
     "crates/cli",

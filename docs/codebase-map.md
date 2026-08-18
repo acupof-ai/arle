@@ -47,7 +47,7 @@ Current workspace members (ownership and boundaries are listed in
  `crates/gemma-spec`, `crates/deepseek-ocr-spec`
 - **training:** `crates/autograd`, `crates/train`, `crates/spec-train`
 - **substrate:** `crates/infer-gguf`, `crates/kv-native-sys`,
- `crates/xgrammar-sys`, `crates/agent-bench`
+ `crates/xgrammar-sys`
 
 ## 2. Main execution paths
 
@@ -362,7 +362,6 @@ These crates sit around the runtime graph:
 - `crates/gemma-spec`: Gemma4 config spec (config load + validation). In-tree consumer today: `infer-vulkan`'s `model_gemma4` order pin. **Unranked** in the model priority queue — ratification pending
 - `crates/autograd`: from-scratch autograd + optimizer + lr-schedule + AdamW codec (OPD substrate)
 - `crates/train`: train-side control plane + OPD stack (post-2026-05-18 pivot)
-- `crates/agent-bench`: agent-workload benchmark harness
 
 Current dependency direction (runtime graph):
 

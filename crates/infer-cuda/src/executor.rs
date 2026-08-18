@@ -1040,7 +1040,7 @@ pub(crate) const DEFAULT_DRAM_FRACTION: f64 = 0.5;
 /// (`default_t1_budget_bytes(DEFAULT_DRAM_FRACTION)`) divided by the TP world
 /// size. The engine builder re-budgets pre-serve with the per-rank share
 /// resolved from `--kv-dram`; dividing here keeps the pre-setter window and
-/// direct-construction paths (agent-bench) correct under TP>1. World resolves
+/// direct-construction paths correct under TP>1. World resolves
 /// from env — the builder's `TpEnvGuard` sets `INFER_TP_SIZE` before
 /// construction — and defaults to 1 when unset or unreadable.
 pub(crate) fn default_t1_budget_per_rank() -> usize {

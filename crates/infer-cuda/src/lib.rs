@@ -369,7 +369,7 @@ impl CudaExecutor {
     /// `max_seq_len` is a runtime knob: the serve path threads it from
     /// `--max-total-tokens`/`EngineConfig::max_total_tokens` — the same global
     /// cap every backend uses, no DSv4-only knob. Standalone microbenchmarks
-    /// with no CLI-args layer (agent-bench, `dsv4_resident_ab`) pass their own
+    /// with no CLI-args layer (`dsv4_resident_ab`) pass their own
     /// literal constant. The executor itself never reads an env var for this.
     /// `mtp_draft_tokens`: `Some(n)` turns on the checkpoint-native MTP
     /// speculative-decode head with draft depth `n` (config-driven, the serve
