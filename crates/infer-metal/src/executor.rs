@@ -2381,8 +2381,6 @@ mod tests {
                 },
             ],
             prefill_rows: Vec::new(),
-            microbatch: None,
-            spec: None,
         };
         let inflight = exec.submit(&plan, &mut pool).unwrap();
         match exec.poll(inflight).unwrap() {
@@ -2411,8 +2409,6 @@ mod tests {
                 penalty_history: None,
                 penalty_prompt_len: 0,
             }],
-            microbatch: None,
-            spec: None,
         };
         let inflight = exec.submit(&plan, &mut pool).unwrap();
         match exec.poll(inflight).unwrap() {

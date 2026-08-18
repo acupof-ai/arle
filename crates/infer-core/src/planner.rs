@@ -124,8 +124,6 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             mode: plan_mode(prefill_rows.is_empty(), decode_rows.is_empty()),
             decode_rows,
             prefill_rows,
-            microbatch: None,
-            spec: None,
         }
     }
 

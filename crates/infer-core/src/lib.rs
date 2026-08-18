@@ -1432,7 +1432,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
     /// handle, same release path). Orphan sweep for a caller that knows all
     /// clients are gone (e.g. the OPD round-loop quiesce after its cc
     /// children exited). Same multiproc invariant as `cancel_request`.
-    pub fn cancel_all_requests(&mut self) -> Vec<RequestHandle> {
+    fn cancel_all_requests(&mut self) -> Vec<RequestHandle> {
         let handles: Vec<RequestHandle> = self
             .waiting
             .iter()
