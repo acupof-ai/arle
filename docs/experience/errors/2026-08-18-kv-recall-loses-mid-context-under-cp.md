@@ -1,5 +1,12 @@
 # --kv-recall is broken three ways on Qwen3.6-27B — 2026-08-18
 
+> **Resolved the same day.** Five defects in total (the three below, plus a
+> selector that carried no ranking signal and recall state surviving a prefix-hit
+> slot reuse). TP=2 CP=2 mid-context needle 0/48 → 48/48; see
+> [`wins/2026-08-18-kv-recall-repaired-cp-and-selector.md`](../wins/2026-08-18-kv-recall-repaired-cp-and-selector.md)
+> for the fixes, the gates, and the residency proof that recall still restricts.
+> This entry is kept for the diagnosis method.
+
 ## Context
 
 Verifying that the L2 (host DRAM) and L3 (SSD) KV tiers work under TP=2 CP=2 with
