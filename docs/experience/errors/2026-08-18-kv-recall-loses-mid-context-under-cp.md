@@ -1,4 +1,4 @@
-# --kv-recall loses mid-context content — TP=2 CP=2, 2026-08-18
+# --kv-recall: mid-context loss under CP, FA3 abort without it — 2026-08-18
 
 ## Context
 
@@ -54,10 +54,50 @@ independently. Ranks can therefore select different top-k blocks, leaving every
 selected block half-resident — rank 0 holding one block's even pages while rank 1
 holds another block's odd pages.
 
-**Not yet separated**: whether depth-50 fails identically at CP=1/TP=1. Without
-that control, the weak layer-0 retriever and the CP partial-mean divergence are
-both live candidates, and the CP rule below is stated as a design fact, not as
-the measured cause.
+The CP=1/TP=1 control cannot answer the content question, because recall aborts
+the server there — see the second bug below. So the weak layer-0 retriever and
+the CP partial-mean divergence both remain live candidates for the content loss,
+and the CP paragraph above is a design fact, not a measured cause.
+
+## Second bug: FA3 combine abort without CP
+
+At TP=1 CP=1, `--kv-recall` aborts the process on the first decode step after a
+19,312-token prefill: `CUTLASS error
+(flash-attention/hopper/flash_fwd_combine_launch_template.h:52): Error
+Internal`. Deterministic at concurrency 2 and 8. The recall-OFF control on the
+same GPU and binary passes depth-50 at both concurrencies, so it is
+recall-specific, not TP=1-specific.
+
+`PageMeta::for_recall_decode` had a branch on `shard.size`:
+
+```rust
+let (kv_lens, last_page_len, write_kv) = if shard.size > 1 {
+    (local_token_count, local_last_fill, i32::from(owns_last))
+} else {
+    let g = total_len % pool.page_size;
+    (total_len, if g == 0 { pool.page_size } else { g }, 1)  // full context
+};
+```
+
+Without CP it passed `total_len` as `seqlen_k` while handing FA3 a page table
+holding only the recall working set (34 pages / 544 tokens against 19,312).
+FA3 sizes its split-KV work from `seqlen_k`, so the combine kernel indexed
+splits with no pages behind them. The CP branch already derived the length from
+the table — which is exactly why CP=2 survives and TP=1 aborts.
+
+Fix (`1bf969aa9`): a 1-wide shard owns every page, so both branches collapse to
+the CP arithmetic. Byte-identical whenever the table is the full contiguous page
+list (`num_pages == global_pages`), i.e. every non-recall decode. **Verification
+build pending-remote** — the pod builder was occupied by concurrent W4AFP8 work.
+
+Result matrix, depth-50 needle, 16K prompt, same `cpkv7` binary throughout:
+
+| config | recall | result |
+|---|---|---|
+| TP=1 CP=1 | off | PASS 4/4 and 16/16 |
+| TP=1 CP=1 | on | abort, `flash_fwd_combine` |
+| TP=2 CP=2 | off | PASS 48/48 |
+| TP=2 CP=2 | on | 0/48 exact, no abort |
 
 ## What did work
 
@@ -89,8 +129,10 @@ correctness test.
 
 ## Follow-up
 
-1. CP=1/TP=1 depth-50 control — separates retriever quality from CP shard
-   divergence. One GPU, ~5 min.
+1. Build `1bf969aa9` on the pod and re-run depth-50 at TP=1 CP=1. With the abort
+   gone, that run separates retriever quality from CP shard divergence: a TP=1
+   pass means the content loss is CP-specific; a TP=1 fail means the selector
+   itself is too weak.
 2. If CP-specific: make block scoring shard-collective (all-reduce the partial
    mean-key reps before `plan_recall`) so every rank selects the same top-k.
 3. If generic: the working set must be re-planned during decode, or selection
