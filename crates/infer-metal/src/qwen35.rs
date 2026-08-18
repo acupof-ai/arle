@@ -470,10 +470,11 @@ fn extract_qw(
             biases,
             group_size,
             bits,
+            ..
         } => Some((
             w.as_raw(),
             scales.as_raw(),
-            biases.as_raw(),
+            biases.as_ref().map_or(std::ptr::null_mut(), |b| b.as_raw()),
             *group_size,
             *bits,
         )),
@@ -598,13 +599,15 @@ impl CppQwen35Model {
                         biases,
                         group_size,
                         bits,
-                    } => mlx_sys::qwen35_compiled_add_affine_weight(
+                        mode,
+                    } => mlx_sys::qwen35_compiled_add_quant_weight(
                         model,
                         w.as_raw(),
                         scales.as_raw(),
-                        biases.as_raw(),
+                        biases.as_ref().map_or(std::ptr::null_mut(), |b| b.as_raw()),
                         *group_size,
                         *bits,
+                        mode.ffi(),
                     ),
                 }
             };

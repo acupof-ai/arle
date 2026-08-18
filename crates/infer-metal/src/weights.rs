@@ -2,6 +2,7 @@
 
 use anyhow::{Context, Result};
 
+use crate::config::QuantMode;
 use crate::loader::TensorMap;
 use crate::mlx::{MlxArray, concatenate_axis, dequantize, eval, transpose_all};
 
@@ -12,9 +13,11 @@ pub(crate) enum WeightTensor {
     Quantized {
         w: MlxArray,
         scales: MlxArray,
-        biases: MlxArray,
+        /// `None` for bias-free modes (mxfp4); always present for affine.
+        biases: Option<MlxArray>,
         group_size: i32,
         bits: i32,
+        mode: QuantMode,
     },
 }
 
@@ -56,8 +59,9 @@ impl WeightTensor {
                 biases,
                 group_size,
                 bits,
+                mode,
             } => {
-                let dense = dequantize(w, scales, biases, *group_size, *bits);
+                let dense = dequantize(w, scales, biases.as_ref(), *group_size, *bits, *mode);
                 transpose_all(&dense)
             }
         }
@@ -93,9 +97,10 @@ pub(crate) fn load_quantized_with_bits(
     Ok(WeightTensor::Quantized {
         w,
         scales,
-        biases,
+        biases: Some(biases),
         group_size,
         bits,
+        mode: QuantMode::Affine,
     })
 }
 
@@ -157,6 +162,7 @@ pub(crate) fn merge_quantized_projection_rows(
     let mut expected_biases_dtype = None;
     let mut expected_group_size = None;
     let mut expected_bits = None;
+    let mut expected_mode = None;
     let mut expected_packed_in = None;
     let mut expected_group_cols = None;
 
@@ -167,6 +173,7 @@ pub(crate) fn merge_quantized_projection_rows(
             biases: bias,
             group_size,
             bits,
+            mode,
         } = weight
         else {
             return Ok(None);
@@ -185,32 +192,47 @@ pub(crate) fn merge_quantized_projection_rows(
 
         if expected_group_size.is_some_and(|expected| *group_size != expected)
             || expected_bits.is_some_and(|expected| *bits != expected)
+            || expected_mode.is_some_and(|expected| *mode != expected)
             || expected_packed_in.is_some_and(|expected| packed_in != expected)
             || expected_group_cols.is_some_and(|expected| group_cols != expected)
             || expected_w_dtype.is_some_and(|expected| w.dtype() != expected)
             || expected_scales_dtype.is_some_and(|expected| scale.dtype() != expected)
-            || expected_biases_dtype.is_some_and(|expected| bias.dtype() != expected)
+            || expected_biases_dtype
+                .is_some_and(|expected| bias.as_ref().is_none_or(|b| b.dtype() != expected))
         {
             return Ok(None);
         }
 
         expected_group_size.get_or_insert(*group_size);
         expected_bits.get_or_insert(*bits);
+        expected_mode.get_or_insert(*mode);
         expected_packed_in.get_or_insert(packed_in);
         expected_group_cols.get_or_insert(group_cols);
         expected_w_dtype.get_or_insert(w.dtype());
         expected_scales_dtype.get_or_insert(scale.dtype());
-        expected_biases_dtype.get_or_insert(bias.dtype());
+        if let Some(b) = bias {
+            expected_biases_dtype.get_or_insert(b.dtype());
+        }
 
         ws.push(w.clone());
         scales.push(scale.clone());
-        biases.push(bias.clone());
+        if let Some(b) = bias {
+            biases.push(b.clone());
+        }
     }
 
     let merged_w = concatenate_axis(&ws, 0);
     let merged_scales = concatenate_axis(&scales, 0);
-    let merged_biases = concatenate_axis(&biases, 0);
-    eval(&[&merged_w, &merged_scales, &merged_biases]);
+    let merged_biases = if biases.is_empty() {
+        None
+    } else {
+        Some(concatenate_axis(&biases, 0))
+    };
+    if let Some(ref b) = merged_biases {
+        eval(&[&merged_w, &merged_scales, b]);
+    } else {
+        eval(&[&merged_w, &merged_scales]);
+    }
 
     Ok(Some(WeightTensor::Quantized {
         w: merged_w,
@@ -218,6 +240,7 @@ pub(crate) fn merge_quantized_projection_rows(
         biases: merged_biases,
         group_size: expected_group_size.unwrap_or_default(),
         bits: expected_bits.unwrap_or_default(),
+        mode: expected_mode.unwrap_or(QuantMode::Affine),
     }))
 }
 

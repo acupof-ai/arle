@@ -429,22 +429,28 @@ auto& compiled_swiglu() {
 }
 
 // Compiled fused MLP: gate_up matmul -> split -> swiglu -> down matmul. Encoded ONCE per
-// (gate_dim, gs, bits) — all MLP layers share the config, so one cached graph serves every
-// layer, cutting the per-step re-encode of the matmul-heavy MLP (~51% of the decode step).
+// (gate_dim, gs, bits, mode) — all MLP layers share the config, so one cached graph serves
+// every layer, cutting the per-step re-encode of the matmul-heavy MLP (~51% of the decode
+// step).
 using CompiledFn = std::function<std::vector<array>(const std::vector<array>&)>;
-CompiledFn& compiled_mlp_fn(int gate_dim, int gs, int bits) {
-    static std::map<std::tuple<int, int, int>, CompiledFn> cache;
-    auto key = std::make_tuple(gate_dim, gs, bits);
+CompiledFn& compiled_mlp_fn(int gate_dim, int gs, int bits, int mode) {
+    static std::map<std::tuple<int, int, int, int>, CompiledFn> cache;
+    auto key = std::make_tuple(gate_dim, gs, bits, mode);
     auto it = cache.find(key);
     if (it != cache.end()) {
         return it->second;
     }
-    auto impl = [gate_dim, gs, bits](const std::vector<array>& in) -> std::vector<array> {
+    auto impl = [gate_dim, gs, bits, mode](const std::vector<array>& in) -> std::vector<array> {
         // in = [x, gate_up_w, gate_up_scales, gate_up_biases, down_w, down_scales, down_biases]
-        auto gu = quantized_matmul(in[0], in[1], in[2], in[3], true, gs, bits);
+        // biases slots are array(0) placeholders for mxfp4, never read.
+        auto gb = mode == 0 ? std::optional(in[3]) : std::nullopt;
+        auto gu = quantized_matmul(in[0], in[1], in[2], gb, true, gs, bits,
+                                   quant_mode_str(mode));
         auto parts = split(gu, Shape{gate_dim}, -1);
         auto h = (parts[0] * sigmoid(parts[0])) * parts[1];  // swiglu, inlined for fusion
-        return {quantized_matmul(h, in[4], in[5], in[6], true, gs, bits)};
+        auto db = mode == 0 ? std::optional(in[6]) : std::nullopt;
+        return {quantized_matmul(h, in[4], in[5], db, true, gs, bits,
+                                 quant_mode_str(mode))};
     };
     // SHAPED (not shapeless): the split needs concrete shapes. Gated to decode (S=1) at the
     // call site, so the shape is fixed [1,1,hidden] → compiled once, reused every step.
@@ -454,23 +460,29 @@ CompiledFn& compiled_mlp_fn(int gate_dim, int gs, int bits) {
 // Compiled fused separate-MLP: gate matmul + up matmul -> swiglu -> down matmul.
 // Used for mixed-bit MLP (OptiQ gate=4-bit/up=8-bit) where gate/up are kept as
 // two separate quantized weights (no merged gate_up). Encoded ONCE per
-// (gate_dim, gate_bits, up_bits, down_bits, gs) — no split needed since gate and
+// (gate_dim, gate_bits, up_bits, down_bits, gs, mode) — no split needed since gate and
 // up are already separate. Mirrors compiled_mlp_fn (shaped, decode S=1 only).
 CompiledFn& compiled_mlp_separate_fn(
-    int gate_dim, int gate_bits, int up_bits, int down_bits, int gs) {
-    static std::map<std::tuple<int, int, int, int, int>, CompiledFn> cache;
-    auto key = std::make_tuple(gate_dim, gate_bits, up_bits, down_bits, gs);
+    int gate_dim, int gate_bits, int up_bits, int down_bits, int gs, int mode) {
+    static std::map<std::tuple<int, int, int, int, int, int>, CompiledFn> cache;
+    auto key = std::make_tuple(gate_dim, gate_bits, up_bits, down_bits, gs, mode);
     auto it = cache.find(key);
     if (it != cache.end()) {
         return it->second;
     }
-    auto impl = [gs, gate_bits, up_bits, down_bits](
+    auto impl = [gs, gate_bits, up_bits, down_bits, mode](
                     const std::vector<array>& in) -> std::vector<array> {
         // in = [x, gate_w, gate_s, gate_b, up_w, up_s, up_b, down_w, down_s, down_b]
-        auto g = quantized_matmul(in[0], in[1], in[2], in[3], true, gs, gate_bits);
-        auto u = quantized_matmul(in[0], in[4], in[5], in[6], true, gs, up_bits);
+        auto gb = mode == 0 ? std::optional(in[3]) : std::nullopt;
+        auto ub = mode == 0 ? std::optional(in[6]) : std::nullopt;
+        auto db = mode == 0 ? std::optional(in[9]) : std::nullopt;
+        auto g = quantized_matmul(in[0], in[1], in[2], gb, true, gs, gate_bits,
+                                  quant_mode_str(mode));
+        auto u = quantized_matmul(in[0], in[4], in[5], ub, true, gs, up_bits,
+                                  quant_mode_str(mode));
         auto h = (g * sigmoid(g)) * u;  // swiglu, inlined for fusion
-        return {quantized_matmul(h, in[7], in[8], in[9], true, gs, down_bits)};
+        return {quantized_matmul(h, in[7], in[8], db, true, gs, down_bits,
+                                 quant_mode_str(mode))};
     };
     return cache.emplace(key, mlx::core::compile(impl, false)).first->second;
 }
@@ -548,6 +560,7 @@ struct QWeight {
     int group_size = 64;
     int bits = 4;
     bool is_dense = false;  // if true, w is already transposed, use matmul directly
+    int mode = 0;  // 0=affine (scale+bias), 1=mxfp4 (E2M1 + E8M0 per-32 scale, no bias)
     int gguf_format = 0;
     int rows = 0;
     int cols = 0;
@@ -570,10 +583,13 @@ struct QWeight {
         if (is_dense) {
             return matmul(input, w);  // w is already transposed at load time
         }
-        if (prefer_verify_m16) {
+        // The custom MMA2 kernel is affine-only; mxfp4 uses the stock kernel.
+        if (prefer_verify_m16 && mode == 0) {
             return verify_quantized_matmul_cpp(input, w, scales, biases, group_size, bits);
         }
-        return quantized_matmul(input, w, scales, biases, true, group_size, bits);
+        auto b = mode == 0 ? std::optional(biases) : std::nullopt;
+        return quantized_matmul(
+            input, w, scales, b, true, group_size, bits, quant_mode_str(mode));
     }
 };
 
@@ -1519,10 +1535,11 @@ struct Qwen35CompiledModel {
             && !gate.is_dense && !up.is_dense && !down.is_dense
             && !gate.reorder_input_v_cols && !up.reorder_input_v_cols
             && !down.reorder_input_v_cols
-            && gate.group_size == up.group_size && gate.group_size == down.group_size) {
+            && gate.group_size == up.group_size && gate.group_size == down.group_size
+            && gate.mode == up.mode && gate.mode == down.mode) {
             int gate_dim = gate.w.shape(0);  // output rows of the gate projection
             return compiled_mlp_separate_fn(
-                gate_dim, gate.bits, up.bits, down.bits, gate.group_size)(
+                gate_dim, gate.bits, up.bits, down.bits, gate.group_size, gate.mode)(
                 {x, gate.w, gate.scales, gate.biases,
                  up.w, up.scales, up.biases,
                  down.w, down.scales, down.biases})[0];
@@ -1550,8 +1567,10 @@ struct Qwen35CompiledModel {
             && gate_up.gguf_format == 0 && down.gguf_format == 0
             && !gate_up.is_dense && !down.is_dense
             && !gate_up.reorder_input_v_cols && !down.reorder_input_v_cols
-            && gate_up.group_size == down.group_size && gate_up.bits == down.bits) {
-            return compiled_mlp_fn(gate_dim, gate_up.group_size, gate_up.bits)(
+            && gate_up.group_size == down.group_size && gate_up.bits == down.bits
+            && gate_up.mode == down.mode) {
+            return compiled_mlp_fn(
+                gate_dim, gate_up.group_size, gate_up.bits, gate_up.mode)(
                 {x, gate_up.w, gate_up.scales, gate_up.biases,
                  down.w, down.scales, down.biases})[0];
         }
@@ -1941,17 +1960,20 @@ int32_t qwen35_compiled_add_dense_weight(void* model, mlx_array* w) {
     }());
 }
 
-int32_t qwen35_compiled_add_affine_weight(
+int32_t qwen35_compiled_add_quant_weight(
     void* model,
     mlx_array* w,
     mlx_array* scales,
     mlx_array* biases,
     int32_t group_size,
-    int32_t bits) {
+    int32_t bits,
+    int32_t mode) {
     MLX_TRY_RETURN_VALUE(-1, [&]() {
         auto* m = static_cast<Qwen35CompiledModel*>(model);
         m->weight_pool.push_back({
-            *to_arr(w), *to_arr(scales), *to_arr(biases), group_size, bits, false});
+            *to_arr(w), *to_arr(scales),
+            biases ? *to_arr(biases) : array(0),
+            group_size, bits, false, mode});
         return static_cast<int32_t>(m->weight_pool.size() - 1);
     }());
 }

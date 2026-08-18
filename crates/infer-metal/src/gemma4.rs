@@ -764,11 +764,12 @@ impl CppGemma4Builder {
                     biases,
                     group_size,
                     bits,
+                    ..
                 } => mlx_sys::diffusion_gemma_add_affine_weight(
                     self.raw,
                     w.as_raw(),
                     scales.as_raw(),
-                    biases.as_raw(),
+                    biases.as_ref().map_or(std::ptr::null_mut(), |b| b.as_raw()),
                     *group_size,
                     *bits,
                 ),

@@ -169,6 +169,8 @@ impl QuantRegistry {
                     .get("bits")
                     .and_then(serde_json::Value::as_i64)
                     .map_or(4, |n| n as i32),
+                // Diffusion Gemma checkpoints ship affine 4-bit.
+                mode: crate::config::QuantMode::Affine,
                 per_weight: std::sync::Arc::new(HashMap::new()),
             }
         };
@@ -696,11 +698,12 @@ impl CppDiffusionGemmaBuilder {
                     biases,
                     group_size,
                     bits,
+                    ..
                 } => mlx_sys::diffusion_gemma_add_affine_weight(
                     self.raw,
                     w.as_raw(),
                     scales.as_raw(),
-                    biases.as_raw(),
+                    biases.as_ref().map_or(std::ptr::null_mut(), |b| b.as_raw()),
                     *group_size,
                     *bits,
                 ),

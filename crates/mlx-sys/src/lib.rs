@@ -151,6 +151,7 @@ unsafe extern "C" {
         transpose: bool,
         group_size: i32,
         bits: i32,
+        mode: i32,
     ) -> *mut mlx_array;
     pub fn mlx_dequantize(
         w: *mut mlx_array,
@@ -158,6 +159,7 @@ unsafe extern "C" {
         biases: *mut mlx_array,
         group_size: i32,
         bits: i32,
+        mode: i32,
     ) -> *mut mlx_array;
 
     pub fn mlx_contiguous(a: *mut mlx_array) -> *mut mlx_array;
@@ -682,13 +684,14 @@ unsafe extern "C" {
     pub fn qwen35_compiled_free(model: *mut std::ffi::c_void);
     pub fn qwen35_compiled_add_dense_weight(model: *mut std::ffi::c_void, w: *mut mlx_array)
     -> i32;
-    pub fn qwen35_compiled_add_affine_weight(
+    pub fn qwen35_compiled_add_quant_weight(
         model: *mut std::ffi::c_void,
         w: *mut mlx_array,
         scales: *mut mlx_array,
         biases: *mut mlx_array,
         group_size: i32,
         bits: i32,
+        mode: i32,
     ) -> i32;
     pub fn qwen35_compiled_set_config(
         model: *mut std::ffi::c_void,
@@ -921,7 +924,7 @@ unsafe extern "C" {
     /// Expert weights are stacked on the expert axis:
     /// `expert_{gate,up}_w : [E, Hmoe, H/pack]`,
     /// `expert_down_w : [E, H, Hmoe/pack]`. Shared-expert weights are plain
-    /// 2-D quantized linears matching `mlx_fused_quantized_gated_mlp`.
+    /// 2-D quantized linears (affine scale+bias; the compiled MLP fuses them).
     ///
     /// Returns a newly-allocated array handle (caller must `mlx_array_free`)
     /// or nullptr on failure (check `mlx_last_error()`).
