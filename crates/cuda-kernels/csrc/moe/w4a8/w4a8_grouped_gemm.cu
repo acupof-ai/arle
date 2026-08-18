@@ -384,34 +384,40 @@ extern "C" int w4a8_moe_grouped_gemm_sm90(
     size_t workspace_bytes,
     void* stream) {
   const int m = total_m / topk;  // original token count
+  int rc;
 
   if (k % 512 == 0) {
     if (m <= 32) {
-      return run_grouped_gemm<SM90_CO<128, 16, 512, 1, 1, 1>::Cutlass3xW4A8Gemm>(
+      rc = run_grouped_gemm<SM90_CO<128, 16, 512, 1, 1, 1>::Cutlass3xW4A8Gemm>(
           d_output, a_activations, b_weights, a_scale, b_scales,
           expert_offsets, problem_sizes, num_experts, n, k,
           workspace, workspace_bytes, static_cast<cudaStream_t>(stream));
     } else if (m <= 1024) {
-      return run_grouped_gemm<SM90_CO<128, 32, 512, 1, 1, 1>::Cutlass3xW4A8Gemm>(
+      rc = run_grouped_gemm<SM90_CO<128, 32, 512, 1, 1, 1>::Cutlass3xW4A8Gemm>(
           d_output, a_activations, b_weights, a_scale, b_scales,
           expert_offsets, problem_sizes, num_experts, n, k,
           workspace, workspace_bytes, static_cast<cudaStream_t>(stream));
     } else {
-      return run_grouped_gemm<SM90_CO<128, 64, 512, 1, 1, 1>::Cutlass3xW4A8Gemm>(
+      rc = run_grouped_gemm<SM90_CO<128, 64, 512, 1, 1, 1>::Cutlass3xW4A8Gemm>(
           d_output, a_activations, b_weights, a_scale, b_scales,
           expert_offsets, problem_sizes, num_experts, n, k,
           workspace, workspace_bytes, static_cast<cudaStream_t>(stream));
     }
-  }
-  // K not divisible by 512 — smaller K tile
-  if (m <= 32) {
-    return run_grouped_gemm<SM90_PP<128, 32, 128, 1, 1, 1>::Cutlass3xW4A8Gemm>(
+  } else if (m <= 32) {
+    rc = run_grouped_gemm<SM90_PP<128, 32, 128, 1, 1, 1>::Cutlass3xW4A8Gemm>(
+        d_output, a_activations, b_weights, a_scale, b_scales,
+        expert_offsets, problem_sizes, num_experts, n, k,
+        workspace, workspace_bytes, static_cast<cudaStream_t>(stream));
+  } else {
+    rc = run_grouped_gemm<SM90_PP<128, 64, 128, 1, 1, 1>::Cutlass3xW4A8Gemm>(
         d_output, a_activations, b_weights, a_scale, b_scales,
         expert_offsets, problem_sizes, num_experts, n, k,
         workspace, workspace_bytes, static_cast<cudaStream_t>(stream));
   }
-  return run_grouped_gemm<SM90_PP<128, 64, 128, 1, 1, 1>::Cutlass3xW4A8Gemm>(
-      d_output, a_activations, b_weights, a_scale, b_scales,
-      expert_offsets, problem_sizes, num_experts, n, k,
-      workspace, workspace_bytes, static_cast<cudaStream_t>(stream));
+  if (rc != 0) return rc;
+  // Catch async kernel errors (illegal access, etc.) before they corrupt
+  // the CUDA context and surface as unrelated cuModuleLoad failures.
+  cudaError_t err = cudaStreamSynchronize(static_cast<cudaStream_t>(stream));
+  if (err != cudaSuccess) return -10 - (int)err;
+  return 0;
 }
