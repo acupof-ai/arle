@@ -2146,6 +2146,26 @@ fn producer_inputs_sha256() -> String {
     hex_digest(digest.finish().as_ref())
 }
 
+/// Resolve the CUTLASS include tree for DeepGEMM. The producer (compile path)
+/// and the consumer (`configured_capabilities`) must agree, or the prebuilt
+/// producer contract mismatches on `deepgemm-native`.
+fn resolve_deepgemm_cutlass_include(deepgemm_root: &Path) -> PathBuf {
+    if let Some(dir) = env_nonempty("ARLE_DEEPGEMM_CUTLASS_INCLUDE") {
+        return PathBuf::from(dir);
+    }
+    let bundled = deepgemm_root.join("third-party/cutlass/include");
+    if bundled.join("cutlass/arch/barrier.h").is_file() {
+        return bundled;
+    }
+    // DeepGEMM's own cutlass submodule is not vendored; fall back to the
+    // FlashMLA vendored cutlass, which carries the same Hopper barrier header.
+    let flashmla_cutlass = Path::new("vendor/flashmla/csrc/cutlass/include");
+    if flashmla_cutlass.join("cutlass/arch/barrier.h").is_file() {
+        return flashmla_cutlass.to_path_buf();
+    }
+    bundled
+}
+
 fn configured_capabilities(sm_targets: &[SmSpec]) -> BTreeSet<String> {
     let legacy_volta = has_legacy_volta(sm_targets);
     let mut capabilities = BTreeSet::new();
@@ -2168,9 +2188,7 @@ fn configured_capabilities(sm_targets: &[SmSpec]) -> BTreeSet<String> {
     let deepgemm_library = env_nonempty("ARLE_DEEPGEMM_LIBRARY_ROOT")
         .map(PathBuf::from)
         .unwrap_or_else(|| deepgemm_root.join("deep_gemm"));
-    let deepgemm_cutlass = env_nonempty("ARLE_DEEPGEMM_CUTLASS_INCLUDE")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| deepgemm_root.join("third-party/cutlass/include"));
+    let deepgemm_cutlass = resolve_deepgemm_cutlass_include(&deepgemm_root);
     if !env_flag("ARLE_CUDA_DISABLE_DEEPGEMM_NATIVE")
         && sm_targets.iter().any(|spec| spec.sm == "90")
         && deepgemm_library.is_dir()
@@ -2795,21 +2813,7 @@ fn main() {
             .join(deepgemm_root)
     };
     let deepgemm_library_root = deepgemm_root.join("deep_gemm");
-    let deepgemm_cutlass_include = std::env::var("ARLE_DEEPGEMM_CUTLASS_INCLUDE")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            let bundled = deepgemm_root.join("third-party/cutlass/include");
-            if bundled.join("cutlass/arch/barrier.h").is_file() {
-                bundled
-            } else {
-                let flashmla_cutlass = flashmla_root.join("csrc/cutlass/include");
-                if flashmla_cutlass.join("cutlass/arch/barrier.h").is_file() {
-                    flashmla_cutlass
-                } else {
-                    bundled
-                }
-            }
-        });
+    let deepgemm_cutlass_include = resolve_deepgemm_cutlass_include(&deepgemm_root);
     let deepgemm_cutlass_include = if deepgemm_cutlass_include.is_absolute() {
         deepgemm_cutlass_include
     } else {
