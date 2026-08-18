@@ -7,6 +7,7 @@ detail in the linked wins/errors entry. Oldest sections are condensed.
 - [docs/support-matrix.md](docs/support-matrix.md)
 
 ## [Unreleased]
+- **FEAT — KV-recall × CP: shard-filtered recall under 2D parallelism; needle 21/21 TP=2 CP=2** (2026-08-18; `d76ac50ff`..`a29d24f5b`, [wins](docs/experience/wins/2026-08-18-kv-recall-cp-shard-filtered.md))
 - **FEAT — MXFP4 W4A16 weights on Metal (opt-in); 9B pilot: affine ladder row retained (8K recall regression reproduced in stock mlx_lm)** (2026-08-18; `359d1b492`, [wins](docs/experience/wins/2026-08-18-mxfp4-metal-qwen35-9b.md))
 - **FEAT — NVFP4 checkpoint loads + FP8 inference: DSv4-Flash-0731 TP=4 on H20** (2026-08-18; [wins](docs/experience/wins/2026-08-18-nvfp4-load-fp8-infer.md))
 - **REFACTOR — global dead-code deletion: −7,155 lines across 65 files, zero live paths touched** (2026-08-18; `1f3b0e62e`..`cd705eff3`, [wins](docs/experience/wins/2026-08-18-dead-code-deletion.md))
