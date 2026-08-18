@@ -95,6 +95,16 @@ attention cannot reach it.
 guard in the prefill dispatch). The single-pass `prefill_row_paged_default`
 covers the entire prompt in one ring pass.
 
-**Remaining**: chunked prefill (len > 2048) has the same blind spot —
-each chunk's ring prefill cannot see prior chunks' pool KV. Needs a
-paged-attention + flash-decoding merge over the pool after the ring pass.
+**Verified on pod (2026-08-18)**: needle ladder 115,300,446,2000,8000,8192,16384 ×3
+= 21/21 exact, zero server stalls. The fix also resolved the len=8000+
+liveness bug: `prefill_row_snapshotted` was the source of the 36 sidecar
+serializations (18 requests × 2) that preceded the lockstep stall — each
+segment's `snapshot_recurrent` D2H blocked the host, and the multi-segment
+forward passes desynced the collective stream. Skipping the snapshotted
+path under 2D eliminates both the blind-tail correctness bug and the
+serialization-driven stall.
+
+No chunked-prefill blind spot exists under 2D: the planner already puts
+the entire prompt in one prefill row when `kv_shard_spec().is_some()`
+(`planner.rs:74-86`), so `prefill_row_paged_default` covers the full
+prompt in a single ring pass at any length.
