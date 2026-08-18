@@ -2788,7 +2788,7 @@ mod dsv4_gpu {
             .map_err(|e| anyhow::anyhow!("DSv4 W4AFP8 act_scale alloc failed: {e}"))?;
         keepalive.keep_f32(&act_scale);
 
-        // problem_sizes [E, 3] (M, N, K per expert) — device-side, CUTLASS reads it.
+        // problem_sizes [E, 3] (N, M, K — SGLang order) — device-side, CUTLASS reads it.
         let problem_sizes = ctx
             .stream
             .alloc_zeros::<i32>(experts_per_rank * 3)
