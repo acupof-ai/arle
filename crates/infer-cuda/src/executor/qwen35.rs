@@ -385,6 +385,15 @@ impl Qwen35CudaExecutor {
         if let Some(df) = self.dspark.as_mut().and_then(|ds| ds.slots[slot].as_mut()) {
             df.reset();
         }
+        // Same new-occupant contract, and the only path that reaches it: a prefix
+        // hit enters the tail prefill with `start_pos = matched_len > 0`, so the
+        // `start_pos == 0` arm in `submit_prefill_row` never fires. The prior
+        // session's block envelopes describe different tokens at the same block
+        // indices, and `update_block_reps` only grows past `len()` — a stale rep is
+        // never recomputed, so scoring ranks another request's keys.
+        if self.recall_active() {
+            self.recall[slot].reset();
+        }
 
         // Probe largest-first; each boundary is page-aligned, so `hash(tokens[..B])`
         // rendezvous with the save keys.
