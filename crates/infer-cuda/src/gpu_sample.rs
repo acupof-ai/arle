@@ -13,8 +13,9 @@ static INIT: OnceLock<()> = OnceLock::new();
 /// Returns the latest GPU sample, or `None` if the sampler is not running
 /// (non-zero TP rank, nvidia-smi absent, or first poll not yet completed).
 pub(crate) fn latest() -> Option<GpuSample> {
-    INIT.get_or_init(spawn);
-    STORE.read().ok().and_then(|g| *g)
+    // Disabled: nvidia-smi every 2s stalls the GPU driver on H20 (~2-5 ms/step
+    // under DSpark batched decode). Re-enable with a non-stalling sampler (NVML).
+    None
 }
 
 fn spawn() {

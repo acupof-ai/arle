@@ -48,6 +48,7 @@ Identity:
 - Kernel bundle `79d522d1bc4f2d4fd6d706c8d7a5ea2040d44b4aeaeac5fcc96472d3040bdd72`
 - GPU `GPU-1769a5e7-852b-74f9-e109-f52dbb2c4859` (H20)
 - Dataset SHA-256 `8867f63eaac2f0537bb2b17847a7d0d3c1bb8d504c1ad191e97d673e9ecc4f34`
+- Per-stage timing breakdown: [perf-stages-27b.md](perf-stages-27b.md)
 
 One fresh serve, ascending concurrency. ITL mean is the per-output-token latency
 for speculative decode; event-level ITL percentiles include burst emission and
