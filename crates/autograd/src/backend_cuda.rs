@@ -407,6 +407,35 @@ impl Backend for CudaBackend {
         }
     }
 
+    fn upload_fp4_e2m1_group(
+        &self,
+        weight: &[u8],
+        scales: &[u8],
+        global_scale: f32,
+        shape: &[usize],
+        group_size: usize,
+        scale_cols: usize,
+    ) -> Result<DeviceHandle> {
+        #[cfg(feature = "no-cuda")]
+        {
+            let _ = (weight, scales, global_scale, shape, group_size, scale_cols);
+            todo!("GPU required: cuda nvfp4 upload is unavailable under feature no-cuda")
+        }
+
+        #[cfg(not(feature = "no-cuda"))]
+        {
+            cuda_upload_fp4_e2m1_group(
+                self,
+                weight,
+                scales,
+                global_scale,
+                shape,
+                group_size,
+                scale_cols,
+            )
+        }
+    }
+
     fn import_bf16_device_ptr_as_f32(
         &self,
         src_device_ptr: u64,
