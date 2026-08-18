@@ -7,7 +7,12 @@ which a single-request ladder cannot see and a degeneracy check cannot see
 either — every row would still emit fluent text, just the wrong secret. One
 distinct needle per row makes that failure a miss.
 
-Usage: needle_concurrent.py [port] [concurrency] [prompt_tokens] [rounds]
+`depth_pct` places the needle that far into the filler instead of at the front.
+A front needle sits inside the KV-recall sink window (`n_init`), which is pinned
+forever — so the default gate passes under `--kv-recall` without ever exercising
+recall's retrieval. Gate recall at depth 50.
+
+Usage: needle_concurrent.py [port] [concurrency] [prompt_tokens] [rounds] [depth_pct]
 """
 import json, sys, threading, urllib.request
 
@@ -15,6 +20,7 @@ PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 18189
 CONC = int(sys.argv[2]) if len(sys.argv) > 2 else 16
 TARGET = int(sys.argv[3]) if len(sys.argv) > 3 else 8000
 ROUNDS = int(sys.argv[4]) if len(sys.argv) > 4 else 3
+DEPTH = int(sys.argv[5]) if len(sys.argv) > 5 else 0
 BASE = "http://127.0.0.1:%d" % PORT
 
 TOPICS = [
@@ -30,13 +36,16 @@ TOPICS = [
 
 
 def prompt_for(row, needle):
-    n = max(1, TARGET // 16)
+    n = max(4, TARGET // 16)
     # Row-unique filler: identical prefixes would let a prefix-cache hit mask a
     # state mix-up, which is the thing being tested.
     sents = ["Row %d note %d: %s" % (row, i + 1, TOPICS[i % len(TOPICS)]) for i in range(n)]
-    return ("Important: the secret access code is %s. Keep it in mind.\n\n" % needle
-            + " ".join(sents)
-            + "\n\nRecall the secret access code stated earlier. The secret access code is")
+    secret = "Important: the secret access code is %s. Keep it in mind." % needle
+    tail = "\n\nRecall the secret access code stated earlier. The secret access code is"
+    if DEPTH <= 0:
+        return secret + "\n\n" + " ".join(sents) + tail
+    sents.insert(max(2, min(n - 2, n * DEPTH // 100)), secret)
+    return "Read the following notes carefully.\n\n" + " ".join(sents) + tail
 
 
 def ask(row, needle, out):
@@ -70,7 +79,8 @@ for rnd in range(ROUNDS):
             miss.append((i, needles[i], got[:40], [j for j in range(CONC)
                                                    if j != i and needles[j] in got]))
     fail += len(miss)
-    print("round=%d conc=%d pt~%d exact=%d miss=%d" % (rnd, CONC, TARGET, CONC - len(miss), len(miss)))
+    print("round=%d conc=%d pt~%d depth=%d%% exact=%d miss=%d"
+          % (rnd, CONC, TARGET, DEPTH, CONC - len(miss), len(miss)))
     for i, want, got, cross in miss:
         tag = " CROSS_ROW=%s" % cross if cross else ""
         print("  row=%d want=%s got='%s'%s" % (i, want, got, tag))
