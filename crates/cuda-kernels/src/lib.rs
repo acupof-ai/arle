@@ -1,3 +1,6 @@
+//! CUDA kernel AOT surface: TileLang-generated attention/GEMM kernels plus the
+//! native csrc ops, linked into one `libkernels_cuda.a` for the prebuilt bundle.
+
 #[cfg(feature = "cuda")]
 pub mod attention;
 pub mod collective;

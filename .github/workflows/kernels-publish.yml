@@ -200,7 +200,9 @@ jobs:
       - name: Build product cold with TileLang poisoned
         env:
           ARLE_CUDA_KERNEL_CACHE: '0'
-          ARLE_CUDA_KERNELS_PREBUILT_DIR: crates/cuda-kernels/generated
+          # Absolute path: cargo runs build.rs with CWD = the crate root, so a
+          # repo-root-relative path would resolve to crates/cuda-kernels/crates/...
+          ARLE_CUDA_KERNELS_PREBUILT_DIR: ${{ github.workspace }}/crates/cuda-kernels/generated
           INFER_TILELANG_PYTHON: /usr/bin/false
           CARGO_TARGET_DIR: product/cuda-kernels
         run: |
