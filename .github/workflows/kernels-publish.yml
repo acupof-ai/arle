@@ -62,10 +62,38 @@ jobs:
             echo 'qualify=false' >> "$GITHUB_OUTPUT"
           fi
 
-  build:
-    name: Build T1 kernel candidate
+  skip-published:
+    name: Skip if bundle already published
     needs: validate-mode
     if: ${{ needs.validate-mode.outputs.qualify == 'false' }}
+    runs-on: ubuntu-latest
+    outputs:
+      skip: ${{ steps.check.outputs.skip }}
+    steps:
+      - uses: actions/checkout@v7
+
+      # Bundles are content-addressed by tracked kernel-input content; an
+      # existing asset is byte-identical to what a rebuild would produce and
+      # was already consume-checked when first published. Most pushes (runtime,
+      # docs, Metal) do not change kernel inputs — skip the ~1h build entirely.
+      - id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TORCH_CUDA_ARCH_LIST: '8.0;8.6;8.9;9.0'
+        run: |
+          id="$(scripts/kernel_artifacts.sh id)"
+          if gh release view kernel-artifacts -R "$GITHUB_REPOSITORY" --json assets \
+              --jq '.assets[].name' 2>/dev/null | grep -Fxq "arle-kernels-t1-$id.tar.gz"; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "candidate bundle $id already published — nothing to build"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    name: Build T1 kernel candidate
+    needs: [validate-mode, skip-published]
+    if: ${{ needs.validate-mode.outputs.qualify == 'false' && needs.skip-published.outputs.skip != 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
@@ -131,8 +159,8 @@ jobs:
 
   consume-check:
     name: Zero-Python exact candidate consume
-    needs: [validate-mode, build]
-    if: ${{ needs.validate-mode.outputs.qualify == 'false' }}
+    needs: [validate-mode, skip-published, build]
+    if: ${{ needs.validate-mode.outputs.qualify == 'false' && needs.skip-published.outputs.skip != 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
