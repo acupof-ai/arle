@@ -144,7 +144,15 @@ impl DeepSeekV4Config {
     pub fn from_json_value(value: &serde_json::Value) -> Result<Self> {
         let mut value = value.clone();
         normalize_rope_parameters_aliases(&mut value);
-        let config: Self = serde_json::from_value(value)?;
+        let mut config: Self = serde_json::from_value(value)?;
+        // 0731 checkpoint ships 46 compress_ratios (43 hidden + MTP + 2 trailing);
+        // truncate to hidden layers, validated below.
+        if config.compress_ratios.len() > config.num_hidden_layers + config.num_nextn_predict_layers
+        {
+            config
+                .compress_ratios
+                .truncate(config.num_hidden_layers + config.num_nextn_predict_layers);
+        }
         config.validate()?;
         Ok(config)
     }

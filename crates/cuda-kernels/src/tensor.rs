@@ -2280,6 +2280,89 @@ impl DeviceMatrix {
         Ok(matrix)
     }
 
+    /// Create from DeepSeek V4 FP4 E2M1 weights (2 packed per I8 byte) plus FP8
+    /// E8M0 block scales. `cols` is the logical (unpacked) K; the stored weight
+    /// buffer holds `rows * cols / 2` bytes.
+    pub fn from_dsv4_fp4_block_scaled(
+        ctx: &DeviceContext,
+        weight_bytes: &[u8],
+        scale_bytes: &[u8],
+        rows: usize,
+        cols: usize,
+        scale_rows: usize,
+        scale_cols: usize,
+    ) -> Result<Self> {
+        WeightFormat::Dsv4Fp4BlockScaled.validate_shape(rows, cols, 0)?;
+        ensure!(
+            weight_bytes.len() == rows * (cols / 2),
+            "DeepSeek V4 FP4 weight bytes {} != expected {} for rows={rows} cols={cols}",
+            weight_bytes.len(),
+            rows * (cols / 2)
+        );
+        ensure!(
+            scale_rows > 0 && scale_cols > 0,
+            "DeepSeek V4 FP4 scale shape must be non-empty"
+        );
+        ensure!(
+            scale_bytes.len() == scale_rows * scale_cols,
+            "DeepSeek V4 FP4 scale bytes {} != expected {}",
+            scale_bytes.len(),
+            scale_rows * scale_cols
+        );
+
+        let qw: CudaSlice<i8> = ctx
+            .stream
+            // SAFETY: same-size reinterpret of `&[u8]` as `&[i8]` (align 1,
+            // every bit pattern valid) for the typed H2D upload.
+            .clone_htod(unsafe {
+                std::slice::from_raw_parts(weight_bytes.as_ptr().cast::<i8>(), weight_bytes.len())
+            })
+            .map_err(|e| anyhow!("H2D DeepSeek V4 FP4 weight failed: {e}"))?;
+        let scales = ctx
+            .stream
+            .clone_htod(scale_bytes)
+            .map_err(|e| anyhow!("H2D DeepSeek V4 FP4 scales failed: {e}"))?;
+        let dummy = ctx
+            .stream
+            .alloc_zeros::<bf16>(1)
+            .map_err(|e| anyhow!("Alloc dummy: {e}"))?;
+
+        let matrix = Self {
+            data: dummy,
+            rows,
+            cols,
+            weight_format: WeightFormat::Dsv4Fp4BlockScaled,
+            qweight: Some(qw),
+            qweight_u8: None,
+            pristine_fp8: None,
+            qscales: None,
+            qscale_fp8: None,
+            scale_f32: None,
+            scale2_f32: None,
+            quant_scale_rows: 0,
+            quant_scale_cols: 0,
+            quant_block_m: 0,
+            quant_block_k: 0,
+            dsv4_scales: Some(scales),
+            dsv4_scale_rows: scale_rows,
+            dsv4_scale_cols: scale_cols,
+            group_size: 0,
+            marlin_packed: None,
+            marlin_scales: None,
+            marlin_channel_scales: None,
+            hybrid_w4a8_qweight: None,
+            hybrid_w4a8_s_channel: None,
+            hybrid_w4a8_s_group: None,
+            hybrid_w4_fp8_qweight: None,
+            tq_packed: None,
+            tq_scales: None,
+            tq_signs: None,
+            tq_centroids: None,
+            tq_bits: 0,
+        };
+        Ok(matrix)
+    }
+
     /// Create from ABI-generic FP8 E4M3 weights plus direct f32 block scales.
     #[allow(clippy::too_many_arguments)]
     pub fn from_fp8_block_scaled(

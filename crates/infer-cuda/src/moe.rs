@@ -2197,7 +2197,7 @@ mod dsv4_gpu {
             })?;
 
         #[cfg(all(feature = "cuda", feature = "nccl"))]
-        if model.mega_moe.is_some() && layer.w13_w4a16.is_none() && layer.w13_w4afp8.is_none() {
+        if model.mega_moe.is_some() && layer.w13_w4a16.is_none() {
             let mega_moe = model.mega_moe.as_ref().unwrap();
             mega_moe.assert_forward_epoch(
                 _mega_epoch.ok_or_else(|| anyhow::anyhow!("DSv4 MegaMoE forward epoch missing"))?,
@@ -2674,263 +2674,6 @@ mod dsv4_gpu {
         Ok(())
     }
 
-    /// W4AFP8 routed-MoE forward: compact pack, per-tensor FP8 activation quant,
-    /// SGLang CUTLASS grouped GEMM for gate+up, fused clamped SwiGLU, per-tensor
-    /// FP8 quant, CUTLASS grouped GEMM for down, then the shared scatter/combine
-    /// tail. All intermediates are stream-ordered allocs (graph-capture safe).
-    #[allow(clippy::too_many_arguments)]
-    fn dsv4_moe_forward_w4afp8(
-        model: &Dsv4Model,
-        layer: &Dsv4MoeLayer,
-        w13: &W4Afp8ExpertWeights,
-        w2: &W4Afp8ExpertWeights,
-        route_indices: &CudaSlice<i32>,
-        route_weights: &CudaSlice<f32>,
-        hidden: &HiddenStates,
-        out: &mut HiddenStates,
-        keepalive: &mut Dsv4ForwardKeepalive,
-    ) -> Result<()> {
-        let ctx = &model.ctx;
-        let cfg = &model.moe_config;
-        let split = &model.split;
-        let num_tokens = hidden.seq_len;
-        let hidden_dim = hidden.hidden_dim;
-        let i_dim = layer.intermediate;
-        let topk = cfg.top_k;
-        let experts_per_rank = split.experts_per_rank;
-        let local_start = split.local_expert_start;
-        let total_routes = num_tokens * topk;
-        let rows = total_routes.max(1);
-
-        // Count + scan + pack (same as W4A16 lane).
-        let counts = ctx
-            .stream
-            .alloc_zeros::<i32>(experts_per_rank)
-            .map_err(|e| anyhow::anyhow!("DSv4 W4AFP8 count alloc failed: {e}"))?;
-        let offsets = ctx
-            .stream
-            .alloc_zeros::<i32>(experts_per_rank)
-            .map_err(|e| anyhow::anyhow!("DSv4 W4AFP8 offset alloc failed: {e}"))?;
-        let scan_total = ctx
-            .stream
-            .alloc_zeros::<i32>(1)
-            .map_err(|e| anyhow::anyhow!("DSv4 W4AFP8 scan-total alloc failed: {e}"))?;
-        keepalive.keep_i32(&counts);
-        keepalive.keep_i32(&offsets);
-        keepalive.keep_i32(&scan_total);
-
-        unsafe {
-            moe::dsv4_count_local_experts(
-                cache_ptr(route_indices, ctx),
-                cache_ptr(&counts, ctx),
-                num_tokens,
-                topk,
-                local_start,
-                experts_per_rank,
-                ctx.stream.cu_stream(),
-            )?;
-            moe::dsv4_exclusive_scan_i32(
-                cache_ptr(&counts, ctx),
-                cache_ptr(&offsets, ctx),
-                cache_ptr(&scan_total, ctx),
-                experts_per_rank,
-                ctx.stream.cu_stream(),
-            )?;
-        }
-
-        let packed_hidden = HiddenStates::zeros(ctx, hidden_dim, rows)?;
-        let packed_route_slot = alloc_neg1_i32(ctx, rows)?;
-        let packed_weight = ctx
-            .stream
-            .alloc_zeros::<f32>(rows)
-            .map_err(|e| anyhow::anyhow!("DSv4 W4AFP8 packed_weight alloc failed: {e}"))?;
-        let cursors = ctx
-            .stream
-            .alloc_zeros::<i32>(experts_per_rank)
-            .map_err(|e| anyhow::anyhow!("DSv4 W4AFP8 cursors alloc failed: {e}"))?;
-        keepalive.keep_hidden(&packed_hidden);
-        keepalive.keep_i32(&packed_route_slot);
-        keepalive.keep_f32(&packed_weight);
-        keepalive.keep_i32(&cursors);
-
-        unsafe {
-            moe::dsv4_pack_local_experts_with_slots(
-                cache_ptr(&hidden.data, ctx),
-                cache_ptr(route_indices, ctx),
-                cache_ptr(route_weights, ctx),
-                cache_ptr(&offsets, ctx),
-                cache_ptr(&cursors, ctx),
-                cache_ptr(&packed_hidden.data, ctx),
-                cache_ptr(&packed_route_slot, ctx),
-                cache_ptr(&packed_weight, ctx),
-                num_tokens,
-                hidden_dim,
-                topk,
-                local_start,
-                experts_per_rank,
-                ctx.stream.cu_stream(),
-            )?;
-        }
-
-        // CUTLASS workspace: metadata (E×136 B) + CUTLASS ws. 64 MB is safe for
-        // E=256 (metadata = 34 KB, CUTLASS ws typically <16 MB).
-        let ws_bytes = 64 * 1024 * 1024;
-        let workspace = ctx
-            .stream
-            .alloc_zeros::<u8>(ws_bytes)
-            .map_err(|e| anyhow::anyhow!("DSv4 W4AFP8 workspace alloc failed: {e}"))?;
-        keepalive.keep_u8(&workspace);
-
-        // Per-tensor FP8 activation scale (single float, written by amax kernel).
-        let act_scale = ctx
-            .stream
-            .alloc_zeros::<f32>(1)
-            .map_err(|e| anyhow::anyhow!("DSv4 W4AFP8 act_scale alloc failed: {e}"))?;
-        keepalive.keep_f32(&act_scale);
-
-        // problem_sizes [E, 3] (M, N, K per expert) — device-side, CUTLASS reads it.
-        let problem_sizes = ctx
-            .stream
-            .alloc_zeros::<i32>(experts_per_rank * 3)
-            .map_err(|e| anyhow::anyhow!("DSv4 W4AFP8 problem_sizes alloc failed: {e}"))?;
-        keepalive.keep_i32(&problem_sizes);
-
-        // Host copy of offsets: the CUTLASS kernel reads expert_offsets host-side
-        // to build per-expert pointer arrays.
-        let offsets_host = ctx
-            .stream
-            .clone_dtoh(&offsets)
-            .map_err(|e| anyhow::anyhow!("DSv4 W4AFP8 offsets D2H failed: {e}"))?;
-
-        // --- Gate+up GEMM ---
-        let packed_fp8 = ctx
-            .stream
-            .alloc_zeros::<u8>(rows * hidden_dim)
-            .map_err(|e| anyhow::anyhow!("DSv4 W4AFP8 packed_fp8 alloc failed: {e}"))?;
-        keepalive.keep_u8(&packed_fp8);
-        let gateup_out = HiddenStates::zeros(ctx, 2 * i_dim, rows)?;
-        keepalive.keep_hidden(&gateup_out);
-
-        unsafe {
-            moe::w4a8_per_tensor_fp8_quant(
-                cache_ptr(&packed_hidden.data, ctx),
-                cache_ptr(&packed_fp8, ctx),
-                cache_ptr(&act_scale, ctx),
-                rows * hidden_dim,
-                ctx.stream.cu_stream(),
-            )?;
-            moe::w4a8_compute_problem_sizes(
-                cache_ptr(&counts, ctx),
-                cache_ptr(&problem_sizes, ctx),
-                experts_per_rank,
-                2 * i_dim,
-                hidden_dim,
-                ctx.stream.cu_stream(),
-            )?;
-            let rc = moe::w4a8_moe_grouped_gemm(
-                cache_ptr(&gateup_out.data, ctx),
-                cache_ptr(&packed_fp8, ctx),
-                cache_ptr(&w13.weight, ctx),
-                cache_ptr(&act_scale, ctx),
-                cache_ptr(&w13.scales, ctx),
-                &offsets_host,
-                cache_ptr(&problem_sizes, ctx),
-                experts_per_rank,
-                2 * i_dim,
-                hidden_dim,
-                rows,
-                topk,
-                cache_ptr(&workspace, ctx),
-                ws_bytes,
-                ctx.stream.cu_stream(),
-            )?;
-            ensure!(rc == 0, "W4AFP8 gate+up CUTLASS GEMM failed: {rc}");
-        }
-
-        // Fused SwiGLU on the CUTLASS [rows, 2*i_dim] output → [rows, i_dim].
-        let act = HiddenStates::zeros(ctx, i_dim, rows)?;
-        keepalive.keep_hidden(&act);
-        unsafe {
-            moe::w4a8_swiglu_fused(
-                cache_ptr(&gateup_out.data, ctx),
-                cache_ptr(&act.data, ctx),
-                rows,
-                i_dim,
-                model.config.swiglu_limit,
-                ctx.stream.cu_stream(),
-            )?;
-        }
-
-        // --- Down GEMM ---
-        let act_fp8 = ctx
-            .stream
-            .alloc_zeros::<u8>(rows * i_dim)
-            .map_err(|e| anyhow::anyhow!("DSv4 W4AFP8 act_fp8 alloc failed: {e}"))?;
-        keepalive.keep_u8(&act_fp8);
-        let expert_out = HiddenStates::zeros(ctx, hidden_dim, rows)?;
-        keepalive.keep_hidden(&expert_out);
-
-        unsafe {
-            moe::w4a8_per_tensor_fp8_quant(
-                cache_ptr(&act.data, ctx),
-                cache_ptr(&act_fp8, ctx),
-                cache_ptr(&act_scale, ctx),
-                rows * i_dim,
-                ctx.stream.cu_stream(),
-            )?;
-            moe::w4a8_compute_problem_sizes(
-                cache_ptr(&counts, ctx),
-                cache_ptr(&problem_sizes, ctx),
-                experts_per_rank,
-                hidden_dim,
-                i_dim,
-                ctx.stream.cu_stream(),
-            )?;
-            let rc = moe::w4a8_moe_grouped_gemm(
-                cache_ptr(&expert_out.data, ctx),
-                cache_ptr(&act_fp8, ctx),
-                cache_ptr(&w2.weight, ctx),
-                cache_ptr(&act_scale, ctx),
-                cache_ptr(&w2.scales, ctx),
-                &offsets_host,
-                cache_ptr(&problem_sizes, ctx),
-                experts_per_rank,
-                hidden_dim,
-                i_dim,
-                rows,
-                topk,
-                cache_ptr(&workspace, ctx),
-                ws_bytes,
-                ctx.stream.cu_stream(),
-            )?;
-            ensure!(rc == 0, "W4AFP8 down CUTLASS GEMM failed: {rc}");
-        }
-
-        // Scatter + combine (same as W4A16 lane).
-        let route_out = HiddenStates::zeros(ctx, hidden_dim, rows)?;
-        keepalive.keep_hidden(&route_out);
-        unsafe {
-            moe::dsv4_scatter_all_route_slots(
-                cache_ptr(&expert_out.data, ctx),
-                cache_ptr(&route_out.data, ctx),
-                cache_ptr(&packed_route_slot, ctx),
-                cache_ptr(&packed_weight, ctx),
-                rows,
-                hidden_dim,
-                ctx.stream.cu_stream(),
-            )?;
-            moe::dsv4_combine_route_slot_outputs(
-                cache_ptr(&route_out.data, ctx),
-                cache_ptr(&out.data, ctx),
-                num_tokens,
-                topk,
-                hidden_dim,
-                ctx.stream.cu_stream(),
-            )?;
-        }
-        Ok(())
-    }
-
     /// Decode-band routed-MoE forward via grouped w8a16 GEMM (warp-per-row):
     /// compact pack, one fused gate/up pass with clamped SwiGLU, one w2 pass,
     /// then the shared scatter/combine tail. Zero pad rows and zero
@@ -3133,20 +2876,6 @@ mod dsv4_gpu {
                 );
             }
         }
-        // W4AFP8 lane: SGLang CUTLASS grouped GEMM for all batch sizes.
-        if let (Some(w13), Some(w2)) = (&layer.w13_w4afp8, &layer.w2_w4afp8) {
-            return dsv4_moe_forward_w4afp8(
-                model,
-                layer,
-                w13,
-                w2,
-                route_indices,
-                route_weights,
-                hidden,
-                out,
-                keepalive,
-            );
-        }
         // Decode-band FP8 grouped GEMM lane: compact (real routed rows only, no
         // pad), 16-byte vectorized FP8 weight loads.
         if total_routes <= DSV4_DECODE_GEMV_MAX_ROUTES {
@@ -3333,8 +3062,8 @@ mod dsv4_gpu {
         keepalive: &mut Dsv4ForwardKeepalive,
     ) -> Result<()> {
         ensure!(
-            layer.w13_w4a16.is_none() && layer.w13_w4afp8.is_none(),
-            "DSv4 DeepEP transport is FP8-only; unset ARLE_DSV4_MOE_TRANSPORT for W4A16/W4AFP8 checkpoints"
+            layer.w13_w4a16.is_none(),
+            "DSv4 DeepEP transport is FP8-only; unset ARLE_DSV4_MOE_TRANSPORT for W4A16 checkpoints"
         );
         let ctx = &model.ctx;
         let cfg = &model.moe_config;
@@ -4093,17 +3822,6 @@ mod dsv4_gpu {
         pub(crate) cols: usize,
     }
 
-    /// W4AFP8 routed expert weights in SGLang CUTLASS layout.
-    /// Weight: int8 [E, N, K/2] packed signed INT4 (two's complement, low nibble = even K).
-    /// Scales: BF16 [E, K//512, N*4] interleaved per 512-K chunk.
-    pub(crate) struct W4Afp8ExpertWeights {
-        pub(crate) weight: cudarc::driver::CudaSlice<u8>,
-        pub(crate) scales: cudarc::driver::CudaSlice<u8>,
-        pub(crate) num_experts: usize,
-        pub(crate) n: usize,
-        pub(crate) k: usize,
-    }
-
     #[derive(Clone, Copy)]
     pub(crate) enum GroupedWeightLayout {
         Normal,
@@ -4254,8 +3972,8 @@ mod dsv4_gpu {
         keepalive: &mut Dsv4ForwardKeepalive,
     ) -> Result<()> {
         ensure!(
-            layer.w13_w4a16.is_none() && layer.w13_w4afp8.is_none(),
-            "DSv4 DeepEP-LL transport is FP8-only; unset ARLE_DSV4_MOE_TRANSPORT for W4A16/W4AFP8 checkpoints"
+            layer.w13_w4a16.is_none(),
+            "DSv4 DeepEP-LL transport is FP8-only; unset ARLE_DSV4_MOE_TRANSPORT for W4A16 checkpoints"
         );
         let ctx = &model.ctx;
         let cfg = &model.moe_config;
@@ -4426,8 +4144,8 @@ mod dsv4_gpu {
 #[allow(unused_imports)] // consumed by the model.rs DSv4 branch
 pub(crate) use dsv4_gpu::{
     Dsv4GemvTables, Dsv4MoeTailScratch, Dsv4SharedDecodeScratch, Dsv4W4A16GemvTables, GroupedCache,
-    GroupedWeightLayout, W4Afp8ExpertWeights, build_grouped_cache, dsv4_moe_forward,
-    dsv4_shared_expert_forward, dsv4_shared_expert_forward_decode_scratch,
+    GroupedWeightLayout, build_grouped_cache, dsv4_moe_forward, dsv4_shared_expert_forward,
+    dsv4_shared_expert_forward_decode_scratch,
 };
 #[cfg(feature = "deepep")]
 pub(crate) use dsv4_gpu::{dsv4_moe_forward_deepep, dsv4_moe_forward_deepep_ll};

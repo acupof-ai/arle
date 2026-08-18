@@ -7,6 +7,7 @@ detail in the linked wins/errors entry. Oldest sections are condensed.
 - [docs/support-matrix.md](docs/support-matrix.md)
 
 ## [Unreleased]
+- **FEAT — NVFP4 checkpoint loads + FP8 inference: DSv4-Flash-0731 TP=4 on H20** (2026-08-18; [wins](docs/experience/wins/2026-08-18-nvfp4-load-fp8-infer.md))
 - **REFACTOR — global dead-code deletion: −7,155 lines across 65 files, zero live paths touched** (2026-08-18; `1f3b0e62e`..`cd705eff3`, [wins](docs/experience/wins/2026-08-18-dead-code-deletion.md))
 - **FEAT — DP coordinator: least-in-flight multi-group routing** (2026-08-17; `806c4268a`, [wins](docs/experience/wins/2026-08-17-dp-coordinator.md))
 - **PERF — TP/CP NCCL collectives onto comm_stream** (2026-08-17; `a59c6c661`, [wins](docs/experience/wins/2026-08-17-collectives-to-comm-stream.md))

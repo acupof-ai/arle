@@ -78,11 +78,6 @@ case "$cmd" in
   setup-tilelang)
     "$POD" "bash '$TREE/scripts/pod-tilelang-env.sh'"
     ;;
-  quantize-w4afp8)
-    input="${1:?usage: pod.sh quantize-w4afp8 <input-dir> <output-dir>}"
-    output="${2:?usage: pod.sh quantize-w4afp8 <input-dir> <output-dir>}"
-    "$POD" "bash -lc 'cd $TREE && crates/cuda-kernels/tools/tilelang/.venv/bin/python scripts/quantize_dsv4_w4afp8.py \"$input\" \"$output\"'"
-    ;;
   sync)
     [ $# -eq 0 ] || { [ "${1:-}" = --full ] || { echo "sync: unknown arg $1" >&2; exit 2; }; }
     stage="$(mktemp -d -t arle-sync-XXXXXX)"
