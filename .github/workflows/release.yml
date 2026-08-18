@@ -122,6 +122,15 @@ jobs:
           key: linux-x86-cargo-${{ hashFiles('**/Cargo.lock', 'crates/cuda-kernels/kernels.toml') }}
           restore-keys: linux-x86-cargo-
 
+      # W4AFP8 MoE kernel needs CUTLASS 3.x internals (the vendored 4.x is
+      # incompatible); mirrors scripts/pod-build-env.sh and kernels-publish.yml.
+      - name: Install CUTLASS 3.7 headers
+        run: |
+          mkdir -p "$RUNNER_TEMP/cutlass-3x"
+          curl -fsSL https://github.com/NVIDIA/cutlass/archive/refs/tags/v3.7.0.tar.gz \
+            | tar -xz -C "$RUNNER_TEMP/cutlass-3x" --strip-components=1 "cutlass-3.7.0/include"
+          echo "ARLE_W4A8_CUTLASS_INCLUDE=$RUNNER_TEMP/cutlass-3x/include" >> "$GITHUB_ENV"
+
       # `infer`/`bench_serving` were standalone bins removed in the rewrite; the
       # CUDA release artifact is the `arle` binary (serving via `arle serve`).
       - name: Build ARLE CLI (CUDA)
@@ -130,7 +139,6 @@ jobs:
           # T1 set: sm_80 (A100) + sm_86 (A10/3090) + sm_89 (L4/4090) + sm_90 (H100).
           # See docs/environment.md for tier policy.
           TORCH_CUDA_ARCH_LIST: '8.0;8.6;8.9;9.0'
-          ARLE_CUDA_ENABLE_FA3: '1'
           # FlashMLA stays ENABLED here: build.rs compiles its sm90 sparse_fp8
           # TUs sm_90a-ONLY (cluster launch_bounds need the arch variant),
           # decoupled from TORCH_CUDA_ARCH_LIST above, so the T1 binary carries

@@ -8,11 +8,9 @@ on:
     paths:
       - crates/cuda-kernels/tools/tilelang/**
       - crates/cuda-kernels/csrc/**
-      - crates/cuda-kernels/ffi/**
       - crates/cuda-kernels/src/**
+      - crates/cuda-kernels/vendor/**
       - crates/infer-cuda/src/**
-      - vendor/flash-attention/**
-      - vendor/flashmla/**
       - crates/cuda-kernels/kernels.toml
       - crates/cuda-kernels/build.rs
       - requirements-build.txt
@@ -30,12 +28,18 @@ on:
         required: false
         type: string
 
+# Build and qualification lanes must not kill each other: a push during a
+# qualification dispatch would otherwise cancel it (and vice versa), and a
+# build cancelled mid-publish leaves a partial asset set on the release.
 concurrency:
-  group: kernels-publish
+  group: kernels-publish-${{ inputs.kernel_candidate_run_id && 'qualify' || 'build' }}
   cancel-in-progress: true
 
 env:
   RUSTC_WRAPPER: ""
+  # One arch string for skip-id, codegen, pack, and publish — the arch list is
+  # part of the bundle identity, so all steps must read the same value.
+  TORCH_CUDA_ARCH_LIST: '8.0;8.6;8.9;9.0'
 
 permissions:
   actions: read
@@ -73,17 +77,19 @@ jobs:
       - uses: actions/checkout@v7
 
       # Bundles are content-addressed by tracked kernel-input content; an
-      # existing asset is byte-identical to what a rebuild would produce and
-      # was already consume-checked when first published. Most pushes (runtime,
-      # docs, Metal) do not change kernel inputs — skip the ~1h build entirely.
+      # existing asset pair is byte-identical to what a rebuild would produce
+      # and was already consume-checked when first published. Most pushes
+      # (runtime, docs, Metal) do not change kernel inputs — skip the ~1h
+      # build entirely. Require BOTH assets: a build cancelled mid-publish can
+      # leave the tar.gz without its checksum.
       - id: check
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TORCH_CUDA_ARCH_LIST: '8.0;8.6;8.9;9.0'
         run: |
           id="$(scripts/kernel_artifacts.sh id)"
-          if gh release view kernel-artifacts -R "$GITHUB_REPOSITORY" --json assets \
-              --jq '.assets[].name' 2>/dev/null | grep -Fxq "arle-kernels-t1-$id.tar.gz"; then
+          assets="$(gh release view kernel-artifacts -R "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' 2>/dev/null)"
+          if grep -Fxq "arle-kernels-t1-$id.tar.gz" <<<"$assets" \
+              && grep -Fxq "arle-kernels-t1-$id.tar.gz.sha256" <<<"$assets"; then
             echo "skip=true" >> "$GITHUB_OUTPUT"
             echo "candidate bundle $id already published — nothing to build"
           else
@@ -114,6 +120,11 @@ jobs:
           cuda: '12.8.0'
           method: network
 
+      - name: Install Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
       - name: Install TileLang stack (vanilla tvm-ffi, no patch needed)
         run: |
           pip install --no-cache-dir -r requirements-build.txt
@@ -130,8 +141,6 @@ jobs:
 
       - name: Regenerate T1 kernel set (sm_80/86/89/90)
         env:
-          TORCH_CUDA_ARCH_LIST: '8.0;8.6;8.9;9.0'
-          ARLE_CUDA_ENABLE_FA3: '1'
           ARLE_KERNEL_VENDOR: '1'
           ARLE_CUDA_KERNEL_CACHE: '0'
         run: cargo build --release --features cuda -p cuda-kernels
@@ -162,7 +171,9 @@ jobs:
     needs: [validate-mode, skip-published, build]
     if: ${{ needs.validate-mode.outputs.qualify == 'false' && needs.skip-published.outputs.skip != 'true' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # The bundle ships TileLang artifacts only; this job still compiles every
+    # csrc TU for 4 SM targets from source, then links the full arle binary.
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v7
 
@@ -193,8 +204,6 @@ jobs:
 
       - name: Build product cold with TileLang poisoned
         env:
-          TORCH_CUDA_ARCH_LIST: '8.0;8.6;8.9;9.0'
-          ARLE_CUDA_ENABLE_FA3: '1'
           ARLE_CUDA_KERNEL_CACHE: '0'
           INFER_TILELANG_PYTHON: /usr/bin/false
           CARGO_TARGET_DIR: product/cuda-kernels
