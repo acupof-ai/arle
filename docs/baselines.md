@@ -285,6 +285,17 @@ Identity:
 Correctness: `2+3=5` verified via `arle run` and OpenAI-compatible API.
 Needle gate pending. c=16 cell killed (server shutdown during long requests).
 
+MTP: 1 BF16 MTP layer (811 MB), `--spec-type mtp --mtp-draft-tokens 2`.
+Acceptance ~80% but net slower (6.2 vs 9.3 tok/s): the verify forward runs
+3 tokens through the recurrent linear attention scan, costing ~3× a
+single-token decode. Cost per token = 1.77× at 80% acceptance. Not enabled
+by default on H20.
+
+Per-op profile (50 decode steps, c=1): NVFP4 MLP GEMV = 40.1% of total
+(82.4% of forward), at 3.1% of H20 bandwidth (latency-bound, ILP=1).
+SGLang Marlin W4A16 reaches 24% but needs 88 GB BF16 weights — doesn't fit
+on single H20. Optimization path: ILP + vectorized loads in the FP4 GEMV.
+
 A8 vs AFP8: on H20 (sm_90), FP8 E4M3 and INT8 tensor core throughput are
 identical (989 TFLOPS/TOPS). FP8 has wider dynamic range → better accuracy.
 The model's NVFP4 MLP path uses FP8 activations (W4AFP8); the attention path
