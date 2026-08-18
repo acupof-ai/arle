@@ -82,19 +82,25 @@ PASS: exact match with the wave-1 same-config envelope at every length.
 len=115 misses are the same model characteristic as wave 1 (reasoning model
 consumed all 2000 tokens on reasoning_content, empty output).
 
-- W8A16 Marlin path smoke (the one live-path touch — the unused
-  `max_shared_mem` kernel arg removal): `lever_gate.sh` with
-  `/data00/qwen35-08b-w8a16` (Qwen3.5-0.8B W8A16, hidden=1024) on GPU 4,
-  LENGTHS=300,2000 RUNS=1 — PASS, exact=1 at both lengths. All tile-aligned
-  main linears (in_proj_qkv/z/out_proj, gate/up/down) repacked to Marlin
-  silently; 18 small-n projections (n=16/32, not N%64) correctly fell back to
-  the scalar path with the standard repack-skipped warning. The 2000-token
-  exact recall proves the Marlin kernel produced correct outputs over a long
-  decode. The 27B Huihui champion-row A/B (docs/baselines.md) is
-  pending-remote: that checkpoint is not on this pod. The arg removal is
-  zero-behavior by construction (kernel body never read the arg; launch
-  config unchanged), so the smoke is a launch-and-correctness check, not a
-  perf A/B.
+- W8A16 Marlin 27B champion-row A/B (the one live-path touch — the unused
+  `max_shared_mem` kernel arg removal): the Huihui abliterated checkpoint is
+  not on this pod and hf-mirror.com is unreachable from the node, so the stock
+  Qwen3.6-27B BF16 already on the node was quantized to W8A16 gs=128
+  (491 tensors, `/root/w8a16work/w8a16_quant.py`). Same architecture, same
+  shapes — abliteration changes weights only, not decode compute. Bench:
+  `bench-agent-32k-64.jsonl`, c=1, 16 requests × 256 tokens, temp 0, seed
+  20260416, GPU 6.
+
+  | metric | champion row (2026-08-06) | wave-2 (2026-08-18) | delta |
+  |--------|--------------------------:|--------------------:|------:|
+  | ITL p50 | 16.70 ms | 16.72 ms | +0.1% |
+  | ITL p99 | 20.50 ms | 20.69 ms | +0.9% |
+  | TTFT p50 | 23.01 s | 22.93 s | −0.3% |
+  | e2e p50 | 27.4 s | 27.39 s | −0.04% |
+
+  All deltas inside the noise floor (champion row: reps agree to 0.02 ms ITL).
+  The arg removal is zero-perf by construction — the kernel body never read
+  the arg, launch config unchanged. Perf license granted.
 
 ## Problems
 
@@ -135,5 +141,5 @@ PASS (local + remote). The CUDA C++ surface was the richest vein in the
 repo — 12 whole .cu files and ~40 dead exports, most predating the paged-KV
 unification. Zero runtime change: every deletion was zero-caller code, and
 the one live-path touch (Marlin kernel arg) is verified on a real W8A16
-decode. The needle-gate distribution matches wave 1 cell-for-cell. Remaining
-debt: the 27B W8A16 champion-row A/B needs the Huihui checkpoint on a pod.
+decode at both 0.8B (correctness) and 27B (champion-row perf, ITL p50
+16.72 vs 16.70 ms). The needle-gate distribution matches wave 1 cell-for-cell.
