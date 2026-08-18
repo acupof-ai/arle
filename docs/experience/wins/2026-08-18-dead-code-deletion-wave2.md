@@ -59,6 +59,16 @@ cargo test -p cli --release --no-default-features --features metal,no-cuda      
 cargo test -p arle --profile release-fast --no-default-features --features cpu,no-cuda,cli → pass
 ```
 
+Wave-3 follow-up (6dcd3931d, transitively-dead state):
+```
+cargo check -p infer-metal --no-default-features --features metal  → clean
+cargo clippy -p infer-metal --features metal -- -D warnings        → zero warnings
+cargo test -p cli --release --features metal,no-cuda               → 4/4 pass
+cargo test -p arle --profile release-fast --features cpu,no-cuda,cli → 5/5 pass
+0.8B one-shot inference (Qwen3.5-0.8B-MLX-4bit)                   → correct output, pipeline fast path LIVE, paged KV read LIVE
+Metal bench 0.8B (512 prompt, 128 decode, K=3)                    → TTFT 174.8ms, TPOT 3.39ms, decode 295.0 tok/s — 3/3 runs identical, zero regression
+```
+
 Pre-existing warnings on HEAD (not from this wave): infer-cuda/src/gpu_sample.rs
 spawn/parse_nvidia_smi/query_nvidia_smi never used — the sampler was disabled
 in bbd422973. Left for the owner of that change.
