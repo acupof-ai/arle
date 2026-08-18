@@ -15,8 +15,8 @@ mod topology;
 
 pub use error::{Result, TopoError};
 pub use sharding::{
-    ParallelLinearKind, ShardingSpec, TpConfig, TpLinearConfig, column_shard, head_shard,
-    kv_load_block_index, row_shard,
+    ParallelLinearKind, ShardingSpec, TpConfig, column_shard, head_shard, kv_load_block_index,
+    row_shard,
 };
 pub use topology::{
     MultiAxisConfig, RankCoord, build_attn_cp_groups, build_attn_dp_groups,

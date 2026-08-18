@@ -174,18 +174,6 @@ impl MultiAxisConfig {
         )
     }
 
-    /// The only multi-rank DSv4 execution shape wired today: global TP and
-    /// global EP, with no attention-DP/CP or MoE-DP subgroups.
-    #[must_use]
-    pub fn is_global_tp_ep_only(&self, tp_size: usize, ep_size: usize) -> bool {
-        self.tp_size == tp_size
-            && self.pp_size == 1
-            && self.ep_size == ep_size
-            && self.attn_dp_size == 1
-            && self.attn_cp_size == 1
-            && self.moe_dp_size == 1
-    }
-
     /// SGLang `parallel_state.py:1781,1827-1829,1897-1899`.
     ///
     /// # Errors
