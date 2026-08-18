@@ -117,6 +117,11 @@ pub(super) fn cuda_embedding_device(
                 "cuda backend cannot embedding a fp8 block-scaled device handle",
             ));
         }
+        DeviceHandle::CudaFp4E2M1Group(_) => {
+            return Err(AutogradError::TapeInvariant(
+                "cuda backend cannot embedding an nvfp4 device handle",
+            ));
+        }
         DeviceHandle::Cpu(_) => {
             return Err(AutogradError::TapeInvariant(
                 "cuda backend cannot embedding a cpu device handle",
@@ -275,6 +280,11 @@ pub(super) fn cuda_embedding_from_f32_ids_device(
         DeviceHandle::CudaFp8BlockScaled(_) => {
             return Err(AutogradError::TapeInvariant(
                 "cuda backend cannot embedding_from_f32_ids a fp8 block-scaled device handle",
+            ));
+        }
+        DeviceHandle::CudaFp4E2M1Group(_) => {
+            return Err(AutogradError::TapeInvariant(
+                "cuda backend cannot embedding_from_f32_ids an nvfp4 device handle",
             ));
         }
         DeviceHandle::Cpu(_) => {

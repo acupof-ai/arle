@@ -50,6 +50,70 @@ pub fn fp8_e4m3_to_f32(bits: u8) -> f32 {
     sign * (1.0 + mant as f32 / 8.0) * 2.0_f32.powi(exp - 7)
 }
 
+/// FP4 E2M1 codebook: 1 sign bit, 2 exponent bits, 1 mantissa bit.
+pub const FP4_E2M1_LUT: [f32; 16] = [
+    0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+];
+
+/// Host twin of the `fp4_e2m1_group_to_bf16` device kernel: packed E2M1
+/// `[rows, cols/2]` (low nibble = even col) x per-row per-group FP8 E4M3 scale
+/// x one F32 global scale.
+pub fn dequantize_fp4_e2m1_group_host(
+    weight: &[u8],
+    scales: &[u8],
+    global_scale: f32,
+    shape: &[usize],
+    group_size: usize,
+    scale_cols: usize,
+) -> Result<Vec<f32>> {
+    if shape.len() != 2 {
+        return Err(crate::AutogradError::InvalidRank {
+            expected: "2",
+            got: shape.len(),
+        });
+    }
+    if group_size == 0 || scale_cols == 0 {
+        return Err(crate::AutogradError::TapeInvariant(
+            "nvfp4 group_size/scale_cols must be non-zero",
+        ));
+    }
+    let rows = shape[0];
+    let cols = shape[1];
+    if cols % 2 != 0 {
+        return Err(crate::AutogradError::TapeInvariant(
+            "nvfp4 cols must be even (two weights per byte)",
+        ));
+    }
+    let expected_weight = rows * (cols / 2);
+    if weight.len() != expected_weight {
+        return Err(crate::AutogradError::DataLengthMismatch {
+            len: weight.len(),
+            shape: shape.to_vec(),
+            size: expected_weight,
+        });
+    }
+    let expected_scales = rows * scale_cols;
+    if scales.len() != expected_scales {
+        return Err(crate::AutogradError::DataLengthMismatch {
+            len: scales.len(),
+            shape: vec![rows, scale_cols],
+            size: expected_scales,
+        });
+    }
+    let out = (0..rows)
+        .flat_map(|row| {
+            (0..cols).map(move |col| {
+                let group = (col / group_size).min(scale_cols - 1);
+                let scale = fp8_e4m3_to_f32(scales[row * scale_cols + group]) * global_scale;
+                let byte = weight[row * (cols / 2) + col / 2];
+                let nib = if col % 2 == 1 { byte >> 4 } else { byte & 0x0f };
+                FP4_E2M1_LUT[nib as usize] * scale
+            })
+        })
+        .collect();
+    Ok(out)
+}
+
 pub fn dequantize_fp8_block_scaled_host(
     weight: &[u8],
     scales: &[f32],
