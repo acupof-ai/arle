@@ -50,3 +50,25 @@ Receiving the pre-advance state is a silent correctness bug — the state
 agrees with the receiver's own (no NaN, no crash), but the sender's slice
 contribution is missing. The bug only surfaces at sequence lengths where
 the recurrent path dominates over dense attention.
+
+## Follow-up (2026-08-18, pod verification)
+
+The fix (365ec0c4f + borrow-checker scoping 78b01b9e0) built and ran on
+pod, but **did not change len=2000 behavior** — the model still refuses
+with "not relevant to the context", identical to the pre-fix run.
+CP=1 control: 21/21 pass. The state chain was not the root cause of the
+needle loss; NCCL P2P recv blocks on the stream until the sender posts
+the send (which is after the sender's advance via `comm_waits_for_compute`),
+so the old code already received the post-advance state.
+
+len=8000+ crashes the server: lockstep coordinator stalls at tick #211
+(min_acked=207, 4 ticks behind), tears down after 120s. Server log shows
+36 `recurrent sidecar serialize: 73.4 MiB` entries (18 requests × 2)
+across all 4 ranks, synchronized, immediately before the stall. The
+serializations themselves are ~37 ms each and not the direct cause;
+the stall is in the decode phase that follows.
+
+Both bugs (len=2000 correctness, len=8000 liveness) are live and
+unresolved. Root cause is elsewhere in the CP path — candidates:
+ring prefill KV rotation, decode cross-CP all-gather, or the
+linear-attention decode state usage.
