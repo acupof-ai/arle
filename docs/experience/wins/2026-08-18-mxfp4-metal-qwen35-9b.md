@@ -60,6 +60,17 @@ Decode A/B (c=1, 512→128):
 
 MXFP4 decodes 5.2% faster; TTFT is a wash.
 
+Perplexity (wikitext-2 test, 297,047 tokens, seq 2048, stock mlx_lm stack):
+
+| arm | PPL |
+|---|---:|
+| affine 4bit | 9.5037 |
+| MXFP4 | 10.1214 |
+
+MXFP4 pays +0.62 PPL (+6.5%) at 2K context. The E8M0 power-of-two scale is
+coarse — small-magnitude weights inside a block share the block max's exponent
+— and the error accumulates with depth into the 8K-token refusal above.
+
 ## Problems
 
 - MXFP4 with the default int8 KV cache degrades between 2000 and 4000 tokens;
