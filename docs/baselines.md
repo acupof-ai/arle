@@ -285,6 +285,16 @@ Identity:
 Correctness: `2+3=5` verified via `arle run` and OpenAI-compatible API.
 Needle gate pending. c=16 cell killed (server shutdown during long requests).
 
+### FP4 GEMV vectorization — runtime `2a3a2164f` (2026-08-18)
+
+Same fingerprint as the row above. GPU-side c=1 decode: `dense_ffn` 102.1 →
+86.2 ms/step (−15.5%), `forward_hidden` 123.9 → 106.7 ms/step (−13.9%),
+bandwidth 53 → 63 GB/s. End to end c=1 is unchanged at 9.3 tok/s (the harness
+figure includes TTFT and scheduling, which hide a 14% forward win at one
+request); c=4 8.3 → 14.1 and c=8 9.2 → 26.5, but those cells previously died on
+a dequant-scratch OOM, so the prior numbers are a crashing server rather than a
+slower one. Needle 512/4096 ×3 = 6/6 exact, deterministic.
+
 MTP: 1 BF16 MTP layer (811 MB), `--spec-type mtp --mtp-draft-tokens 2`.
 Acceptance ~80% but net slower (6.2 vs 9.3 tok/s): the verify forward runs
 3 tokens through the recurrent linear attention scan, costing ~3× a
