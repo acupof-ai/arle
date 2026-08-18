@@ -75,6 +75,29 @@ host-side over an all-gather sized from the new `infer_core::recall_block_count`
 — `block_reps.len()` is not rank-invariant and would hang the collective.
 0/48 → 48/48 at TP=2 CP=2.
 
+## Simplification pass
+
+A behaviour-preserving cleanup followed, re-gated to the same numbers (TP=2
+CP=2: 48/48 depth-50, 16/16 depth-0, 27/27 serial ladder; TP=1: 48/48;
+residency 18 pages). Net −66 lines. The load-bearing parts:
+
+- Block envelopes became two flat `f32` buffers instead of `Vec<Vec<f32>>`, so
+  the cross-shard reduction hands the collective a slice with no marshalling —
+  `widen_envelopes` collapsed to two resizes and two calls, and `resize`'s fill
+  value *is* the min/max identity. ~1500 fewer allocations and ~12 MB less host
+  copying per 16K prefill.
+- `broadcast_f32_over` deleted: exactly one cp rank captures a query and the
+  rest pad to zeros, so a sum over `attn_cp` lands that rank's vector exactly.
+  That also deleted a second derivation of which rank owns the prompt tail,
+  which did not model the capture's own `rows > 1` condition — the two could
+  have disagreed and rooted the broadcast on a rank that captured nothing.
+- The query captures now copy only the rows they average instead of the whole
+  `q` buffer: 131 MB → 262 KB on the ring path at rows=8000, 268 MB → 262 KB on
+  the dense path at 16K.
+- `plan_recall` calls `recall_block_count` rather than restating its arithmetic.
+  That count sizes a cross-rank collective, so a drift between the two copies
+  would hang the group.
+
 ## Rule
 
 Order the fixes by what unblocks measurement, not by what looks most important.
