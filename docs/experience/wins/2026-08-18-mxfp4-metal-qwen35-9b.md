@@ -71,6 +71,19 @@ MXFP4 pays +0.62 PPL (+6.5%) at 2K context. The E8M0 power-of-two scale is
 coarse — small-magnitude weights inside a block share the block max's exponent
 — and the error accumulates with depth into the 8K-token refusal above.
 
+Format-level control: both quants native from mlx-community for Qwen3-1.7B
+(same source model, publisher quantization, 298,931 tokens):
+
+| arm | PPL |
+|---|---:|
+| Qwen3-1.7B affine 4bit | 19.5928 |
+| Qwen3-1.7B MXFP4 | 20.9999 |
+
+The native MXFP4 gap is +7.2% — matching the +6.5% of the self-converted 9B.
+The MXFP4-vs-affine gap is a property of the format at publisher quality, not a
+conversion artifact. (No native MXFP4 checkpoint of Qwen3.5-9B exists: the
+`mlx-community/Qwen3.5-9B-mxfp4` repo is an empty placeholder.)
+
 Dequant fidelity vs the BF16 source (249 quantized tensors, per-tensor
 cosine / relative L2):
 
@@ -81,9 +94,8 @@ cosine / relative L2):
 
 Both formats quantize the same 249 tensors and fail on the same outlier-heavy
 linear-attention projections. MXFP4's error is ~30% higher than affine's on
-identical inputs — the format's expected coarseness, not a conversion defect.
-A native MXFP4 checkpoint does not exist for comparison:
-`mlx-community/Qwen3.5-9B-mxfp4` is an empty repo (`.gitattributes` only).
+identical inputs — the format's expected coarseness, not a conversion defect,
+confirmed independently by the 1.7B native control above.
 
 ## Problems
 
