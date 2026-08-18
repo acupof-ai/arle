@@ -29,8 +29,7 @@ use super::{
         sync_and_restore_engines,
     },
     opd_runtime::{
-        PromptSampler, log_opd_vram, parse_lora_target_set, reject_unimplemented_gkd_objectives,
-        validate_online_rollout_temperature,
+        PromptSampler, log_opd_vram, parse_lora_target_set, validate_online_rollout_temperature,
     },
     replay_records::run_agent_opd_replay,
 };
@@ -177,7 +176,6 @@ pub(super) fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
     use train::lora::LoraConfig;
 
     let student_dir = args.student_model.as_path();
-    reject_unimplemented_gkd_objectives(None)?;
     let target_set = parse_lora_target_set(&args.lora_target_set)?;
     let lora = LoraConfig {
         rank: args.lora_rank,
