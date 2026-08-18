@@ -1695,7 +1695,7 @@ mlx_array* mlx_quantized_matmul(mlx_array* x, mlx_array* w, mlx_array* scales,
                                 int32_t group_size, int32_t bits, int32_t mode) {
     MLX_TRY_RETURN(from_arr(quantized_matmul(
         *to_arr(x), *to_arr(w), *to_arr(scales),
-        biases ? std::optional(*to_arr(biases)) : std::nullopt,
+        to_arr_opt(biases),
         transpose, group_size, bits, quant_mode_str(mode))));
 }
 
@@ -1703,7 +1703,7 @@ mlx_array* mlx_dequantize(mlx_array* w, mlx_array* scales, mlx_array* biases,
                           int32_t group_size, int32_t bits, int32_t mode) {
     MLX_TRY_RETURN(from_arr(dequantize(
         *to_arr(w), *to_arr(scales),
-        biases ? std::optional(*to_arr(biases)) : std::nullopt,
+        to_arr_opt(biases),
         group_size, bits, quant_mode_str(mode))));
 }
 

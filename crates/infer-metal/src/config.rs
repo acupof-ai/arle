@@ -7,21 +7,13 @@ use infer_plan::DiffusionGenerationConfig;
 
 /// MLX quantization mode. `Affine` is the classic MLX 4/8-bit format (per-group
 /// scale + bias). `Mxfp4` is OCP MX FP4: E2M1 weights with one E8M0 scale per
-/// 32-element group and no bias.
+/// 32-element group and no bias. Discriminants are the FFI codes understood by
+/// `quant_mode_str` in mlx_common.h.
+#[repr(i32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum QuantMode {
-    Affine,
-    Mxfp4,
-}
-
-impl QuantMode {
-    /// FFI code understood by `quant_mode_str` in mlx_common.h.
-    pub(crate) fn ffi(self) -> i32 {
-        match self {
-            QuantMode::Affine => 0,
-            QuantMode::Mxfp4 => 1,
-        }
-    }
+    Affine = 0,
+    Mxfp4 = 1,
 }
 
 /// MLX quantization settings.

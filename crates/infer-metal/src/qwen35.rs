@@ -5,7 +5,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 
 use crate::config::{
-    MetalGdrConfig, MetalModelConfig, MetalQwen35ArchConfig, MetalQwen35LayerType,
+    MetalGdrConfig, MetalModelConfig, MetalQwen35ArchConfig, MetalQwen35LayerType, QuantMode,
 };
 use crate::loader::{
     TensorMap, load_embed_tokens_from_tensors, load_proj_from_tensors, load_tensor_map, tensor_get,
@@ -208,6 +208,7 @@ pub(crate) fn load_qwen35_metal_weights(
                     &tensors,
                     &layer_prefix,
                     moe_cfg,
+                    config.quantization.as_ref().map(|qc| qc.mode),
                 )?)
             } else {
                 build_qwen35_dense_mlp(
@@ -340,7 +341,12 @@ fn load_qwen35_moe_layer_weights(
     tensors: &TensorMap,
     layer_prefix: &str,
     moe_cfg: &crate::config::MetalQwen35MoeConfig,
+    mode: Option<QuantMode>,
 ) -> Result<MetalQwen35MoeWeights> {
+    anyhow::ensure!(
+        !matches!(mode, Some(QuantMode::Mxfp4)),
+        "MXFP4 MoE experts are not supported on Metal yet (at '{layer_prefix}')"
+    );
     let mlp_prefix = format!("{layer_prefix}.mlp");
     let num_experts =
         i32::try_from(moe_cfg.num_experts).context("Qwen3.6 num_experts does not fit in i32")?;
@@ -474,7 +480,7 @@ fn extract_qw(
         } => Some((
             w.as_raw(),
             scales.as_raw(),
-            biases.as_ref().map_or(std::ptr::null_mut(), |b| b.as_raw()),
+            MlxArray::as_raw_opt(biases.as_ref()),
             *group_size,
             *bits,
         )),
@@ -604,10 +610,10 @@ impl CppQwen35Model {
                         model,
                         w.as_raw(),
                         scales.as_raw(),
-                        biases.as_ref().map_or(std::ptr::null_mut(), |b| b.as_raw()),
+                        MlxArray::as_raw_opt(biases.as_ref()),
                         *group_size,
                         *bits,
-                        mode.ffi(),
+                        *mode as i32,
                     ),
                 }
             };
