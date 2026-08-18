@@ -292,9 +292,11 @@ single-token decode. Cost per token = 1.77× at 80% acceptance. Not enabled
 by default on H20.
 
 Per-op profile (50 decode steps, c=1): NVFP4 MLP GEMV = 40.1% of total
-(82.4% of forward), at 3.1% of H20 bandwidth (latency-bound, ILP=1).
-SGLang Marlin W4A16 reaches 24% but needs 88 GB BF16 weights — doesn't fit
-on single H20. Optimization path: ILP + vectorized loads in the FP4 GEMV.
+(82.4% of forward). 84.9 MB of packed weights and scales per layer in 1.595 ms
+= 53 GB/s = 1.3% of H20 bandwidth; the kernel loads one packed byte per thread
+per iteration, so it is bound by transaction count. SGLang Marlin W4A16 reaches
+24% but needs 88 GB BF16 weights — doesn't fit on single H20. Optimization
+path: vectorized loads in the FP4 GEMV (runtime `d6873c5e6`, bench pending).
 
 A8 vs AFP8: on H20 (sm_90), FP8 E4M3 and INT8 tensor core throughput are
 identical (989 TFLOPS/TOPS). FP8 has wider dynamic range → better accuracy.

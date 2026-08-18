@@ -121,27 +121,28 @@ break even at ~50% acceptance but offers no throughput gain.
 | full_attention | 178.0 | 1.4% | 223 | 800 |
 | lm_head + lm_head_gemv | 69.3 | 0.5% | 1387 | 50 |
 
-The NVFP4 MLP GEMV dominates: 82.4% of forward time. Per-layer weight read
-~196 MB (FP4 packed + FP8 scales) in 1.59 ms = ~124 GB/s = **3.1% of H20's
-4.0 TB/s bandwidth**. The kernel is latency-bound (serial load→compute→accumulate
-chain, ILP=1), not bandwidth-bound.
+The NVFP4 MLP GEMV dominates: 82.4% of forward time. Per-layer weight read is
+84.9 MB (gate_up 50.3 MB + down 25.2 MB packed FP4, plus 9.4 MB of FP8 group
+scales) in 1.595 ms = 53 GB/s = **1.3% of H20's 4.0 TB/s bandwidth**. The
+kernel loads one packed byte per thread per iteration, so a 128 B cacheline is
+fetched per 1 B used — transaction-bound, not bandwidth-bound.
 
 SGLang's Marlin W4A16 fallback achieves ~24% bandwidth on Hopper at B=1, but
 requires BF16 weights (4× memory = 88 GB — doesn't fit on single H20 after
-KV cache). The optimization path is ILP and vectorized loads in the FP4 GEMV,
-not dequant-to-BF16.
+KV cache). The optimization path is vectorized loads in the FP4 GEMV, not
+dequant-to-BF16.
 
 ## SOTA comparison
 
 | Engine | Approach | H20 decode tok/s | Notes |
 |---|---|---:|---|
-| ARLE | FP4 GEMV (scalar, ILP=1) | 9.3 | 3.1% bandwidth |
+| ARLE | FP4 GEMV (byte loads) | 9.3 | 1.3% bandwidth |
 | SGLang | Marlin W4A16 (dequant→BF16) | N/A | 24% bandwidth, 88 GB weights |
 | vLLM | Marlin W4A16 fallback | N/A | Occupancy-bound at M=1 |
 
-ARLE's 9.3 tok/s is the only single-GPU NVFP4 result measured. The 3.1%
-bandwidth utilization indicates the FP4 GEMV kernel has 5–8× headroom from
-ILP and vectorized-load optimizations alone.
+ARLE's 9.3 tok/s is the only single-GPU NVFP4 result measured. At 1.3% of
+bandwidth the FP4 GEMV is bound by transaction count, which vectorized loads
+address directly.
 
 ## FP4 GEMV vectorization — pending-remote
 
