@@ -170,17 +170,6 @@ mod real {
         let rank = parse_usize_env("INFER_TP_RANK", 0)?;
         let profile_variant = std::env::var("INFER_DSV4_AB_PROFILE_VARIANT").ok();
 
-        // Resident A/B needs the FlashMLA FP8 arena allocated even when the first
-        // variant is scalar. Dispatch is controlled by the process-local override
-        // below; allocation is a separate load-time capability gate.
-        set_env_var("ARLE_DSV4_FLASHMLA_DECODE_ALLOC", "1");
-        if variants.iter().any(|v| v.fused_wqkv) {
-            set_env_var("ARLE_DSV4_FUSED_WQKV_DECODE_ALLOC", "1");
-        }
-        if !env_flag("INFER_DSV4_AB_ALLOW_GRAPH") {
-            set_env_var("ARLE_DSV4_DECODE_GRAPH", "0");
-        }
-
         if let Ok(id_file) = std::env::var("INFER_NCCL_ID_FILE") {
             nccl_file_rendezvous(rank, std::path::Path::new(&id_file))?;
         }
@@ -410,13 +399,6 @@ mod real {
             None if result.name == "scalar" => "SELF".to_string(),
             None => "NOREF".to_string(),
         }
-    }
-
-    fn env_flag(name: &str) -> bool {
-        matches!(
-            std::env::var(name).as_deref(),
-            Ok("1" | "true" | "TRUE" | "yes" | "on" | "ON")
-        )
     }
 
     fn set_env_var(name: &str, value: &str) {
