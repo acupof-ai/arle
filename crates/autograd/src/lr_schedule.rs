@@ -1,13 +1,11 @@
 //! Learning-rate schedules for the autograd optimizer stack.
 //!
 //! Every schedule is a pure function of the global optimizer step, so the
-//! trait objects returned by [`parse_lr_schedule`] can be plugged into any
-//! training binary without persisted state. Values are `f32` to match
-//! [`crate::optim::AdamW`]'s LR precision.
+//! trait objects can be plugged into any training binary without persisted
+//! state. Values are `f32` to match [`crate::optim::AdamW`]'s LR precision.
 
 use std::f32::consts::PI;
 
-use anyhow::{Result, bail};
 use libm::cosf;
 
 /// Schedule contract used by training binaries. Implementations must be

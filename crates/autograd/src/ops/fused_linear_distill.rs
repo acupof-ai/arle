@@ -1055,15 +1055,6 @@ struct FusedLinearDistillShape {
 }
 
 #[derive(Debug, Clone)]
-struct SparseFusedLinearDistillShape {
-    hidden_shape: Vec<usize>,
-    weight_shape: Vec<usize>,
-    hidden_dim: usize,
-    vocab: usize,
-    topk: usize,
-}
-
-#[derive(Debug, Clone)]
 struct GeneralizedJsdShape {
     student_shape: Vec<usize>,
     vocab: usize,
