@@ -2,51 +2,6 @@ use super::{CUresult, CUstream, Half};
 
 #[allow(dead_code)]
 unsafe extern "C" {
-    pub fn kv_cache_to_paged_cuda(
-        k_contiguous: *const Half,
-        v_contiguous: *const Half,
-        k_paged: *mut Half,
-        v_paged: *mut Half,
-        page_indices: *const i32,
-        max_seq_len: i32,
-        seq_len: i32,
-        num_kv_heads: i32,
-        page_size: i32,
-        head_dim: i32,
-        stride_page: i32,
-        stream: CUstream,
-    ) -> CUresult;
-
-    pub fn kv_cache_to_paged_range_cuda(
-        k_contiguous: *const Half,
-        v_contiguous: *const Half,
-        k_paged: *mut Half,
-        v_paged: *mut Half,
-        token_indices: *const i32,
-        start_pos: i32,
-        max_seq_len: i32,
-        token_count: i32,
-        num_kv_heads: i32,
-        head_dim: i32,
-        kv_dim: i32,
-        stream: CUstream,
-    ) -> CUresult;
-
-    pub fn kv_cache_to_paged_range_hnd_cuda(
-        k_contiguous: *const Half,
-        v_contiguous: *const Half,
-        k_paged: *mut Half,
-        v_paged: *mut Half,
-        page_indices: *const i32,
-        start_pos: i32,
-        max_seq_len: i32,
-        token_count: i32,
-        num_kv_heads: i32,
-        page_size: i32,
-        head_dim: i32,
-        stride_page: i32,
-        stream: CUstream,
-    ) -> CUresult;
 
     pub fn quantize_kv_bf16_to_int8_cuda(
         kv_bf16: *const Half,
@@ -72,18 +27,6 @@ unsafe extern "C" {
     ) -> CUresult;
 
     #[allow(dead_code)]
-    pub fn dequantize_paged_kv_cuda(
-        kv_int8: *const i8,
-        scales: *const f32,
-        kv_bf16: *mut Half,
-        token_indices: *const i32,
-        num_kv_heads: i32,
-        head_dim: i32,
-        kv_dim: i32,
-        total_tokens: i32,
-        stream: CUstream,
-    ) -> CUresult;
-
     pub fn dequantize_paged_kv_int8_to_hnd_cuda(
         kv_int8: *const i8,
         scales: *const f32,
@@ -198,55 +141,13 @@ unsafe extern "C" {
 
     /// INT4 KIVI per-channel K finalize: divides absmax by 7 (symmetric
     /// int4 max), same 1e-30 floor as INT8/FP8 siblings.
-    pub fn finalize_k_per_channel_scales_int4_cuda(
-        k_static_scales: *mut f32,
-        num_channels: i32,
-        stream: CUstream,
-    ) -> CUresult;
 
     /// INT4 KIVI two-level K quantize: per-channel STATIC × per-(token, head)
     /// DYNAMIC. 4-bit packed (2 nibbles/byte). `kv_int4_packed` must have
     /// `max_total_tokens * kv_dim / 2` bytes. `k_dynamic_scales` is
     /// `[max_total_tokens, num_kv_heads]` f32, written by this kernel.
-    pub fn quantize_paged_kv_int4_per_channel_cuda(
-        kv_bf16: *const Half,
-        kv_int4_packed: *mut u8,
-        k_static_scales: *const f32,
-        k_dynamic_scales: *mut f32,
-        new_token_indices: *const i32,
-        num_kv_heads: i32,
-        head_dim: i32,
-        kv_dim: i32,
-        batch_size: i32,
-        stream: CUstream,
-    ) -> CUresult;
 
     /// INT4 V quantize (per-(row, head) absmax, /7). 4-bit packed output.
-    pub fn quantize_paged_kv_single_int4_cuda(
-        kv_bf16: *const Half,
-        kv_int4_packed: *mut u8,
-        scales: *mut f32,
-        new_token_indices: *const i32,
-        num_kv_heads: i32,
-        head_dim: i32,
-        kv_dim: i32,
-        batch_size: i32,
-        stream: CUstream,
-    ) -> CUresult;
-
-    pub fn quantize_scatter_kv_fp8_cuda(
-        kv_cont: *const Half,
-        kv_fp8: *mut u8,
-        scales: *mut f32,
-        page_indices: *const i32,
-        max_seq_len: i32,
-        seq_len: i32,
-        num_kv_heads: i32,
-        head_dim: i32,
-        kv_dim: i32,
-        stream: CUstream,
-    ) -> CUresult;
-
     pub fn quantize_scatter_kv_fp8_range_cuda(
         kv_cont: *const Half,
         kv_fp8: *mut u8,
@@ -285,55 +186,4 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    pub fn kv_cache_to_paged_int8_cuda(
-        k_cont: *const i8,
-        v_cont: *const i8,
-        k_scales_cont: *const f32,
-        v_scales_cont: *const f32,
-        k_paged: *mut i8,
-        v_paged: *mut i8,
-        k_scales_paged: *mut f32,
-        v_scales_paged: *mut f32,
-        token_indices: *const i32,
-        max_seq_len: i32,
-        seq_len: i32,
-        num_kv_heads: i32,
-        head_dim: i32,
-        kv_dim: i32,
-        stream: CUstream,
-    ) -> CUresult;
-
-    pub fn kv_cache_to_paged_int8_range_cuda(
-        k_cont: *const i8,
-        v_cont: *const i8,
-        k_scales_cont: *const f32,
-        v_scales_cont: *const f32,
-        k_paged: *mut i8,
-        v_paged: *mut i8,
-        k_scales_paged: *mut f32,
-        v_scales_paged: *mut f32,
-        token_indices: *const i32,
-        start_pos: i32,
-        max_seq_len: i32,
-        token_count: i32,
-        num_kv_heads: i32,
-        head_dim: i32,
-        kv_dim: i32,
-        stream: CUstream,
-    ) -> CUresult;
-
-    pub fn transfer_kv_pages_layer_table_cuda(
-        src_k_layers: *const u64,
-        dst_k_layers: *const u64,
-        src_v_layers: *const u64,
-        dst_v_layers: *const u64,
-        src_pages: *const i32,
-        dst_pages: *const i32,
-        num_pages: i32,
-        start_layer: i32,
-        num_layers: i32,
-        bytes_per_page: i64,
-        num_warps_per_block: i32,
-        stream: CUstream,
-    ) -> CUresult;
 }

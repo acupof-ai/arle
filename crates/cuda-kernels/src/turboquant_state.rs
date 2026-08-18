@@ -130,22 +130,6 @@ impl TurboQuantRotation {
 
         Ok(Self::Hadamard { signs })
     }
-
-    /// Get the full rotation matrix pointer (panics if Hadamard mode).
-    pub fn full_matrix_ptr(&self) -> &CudaSlice<f32> {
-        match self {
-            Self::Full { matrix } => matrix,
-            Self::Hadamard { .. } => panic!("full_matrix_ptr called on Hadamard rotation"),
-        }
-    }
-
-    /// Get the Hadamard signs pointer (panics if Full mode).
-    pub fn hadamard_signs_ptr(&self) -> &CudaSlice<i8> {
-        match self {
-            Self::Hadamard { signs } => signs,
-            Self::Full { .. } => panic!("hadamard_signs_ptr called on Full rotation"),
-        }
-    }
 }
 
 /// Complete TurboQuant state for one KV type (K or V) across all layers.

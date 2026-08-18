@@ -22,7 +22,7 @@ pub mod tensor;
 pub mod turboquant_state;
 
 #[cfg(feature = "cuda")]
-pub use kv_types::{KVCacheDtype, KVFormat};
+pub use kv_types::KVFormat;
 
 /// So downstream crates (autograd) can name the `RawDevicePtr<bf16>` the DeepGEMM
 /// wrappers expect without their own `half` dep.
