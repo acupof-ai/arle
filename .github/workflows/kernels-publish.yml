@@ -101,7 +101,10 @@ jobs:
     needs: [validate-mode, skip-published]
     if: ${{ needs.validate-mode.outputs.qualify == 'false' && needs.skip-published.outputs.skip != 'true' }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    # CUDA toolkit install (Jimver/cuda-toolkit, method: network) is 2-5 min
+    # normally but hit 89 min on a 2026-08-18 NVIDIA CDN slowdown; the cargo
+    # build itself is 52-58 min. 120 min absorbs the install variance.
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v7
 
@@ -173,9 +176,9 @@ jobs:
     if: ${{ needs.validate-mode.outputs.qualify == 'false' && needs.skip-published.outputs.skip != 'true' }}
     runs-on: ubuntu-24.04
     # The prebuilt bundle (ARLE_CUDA_KERNELS_PREBUILT_DIR) links libkernels_cuda.a
-    # directly — no csrc recompile. The 90-min ceiling covers a fallback from-source
-    # build if the prebuilt path is ever disabled.
-    timeout-minutes: 90
+    # directly — no csrc recompile. The 120-min ceiling covers a fallback from-source
+    # build plus a slow CUDA toolkit install if the prebuilt path is ever disabled.
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v7
 
