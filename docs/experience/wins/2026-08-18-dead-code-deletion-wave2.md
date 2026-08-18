@@ -41,7 +41,7 @@ including cfg-gated and build.rs-generated callers).
 - CosineWithWarmup + LrSchedule trait — live
 - KVCacheDtype — live internally (paged_kv.rs legacy mapping); only the re-export was removed in wave 1
 - agent-bench whole crate — deleted 2026-08-18 (user confirmed); 743-line harness crate, zero external dependents
-- mlx-sys C++ dead wrappers, infer-metal pipeline_fast_path_hits — skipped, HOT crates with concurrent edits
+- mlx-sys C++ dead wrappers, infer-metal pipeline_fast_path_hits — deleted 2026-08-18 (user confirmed); 75 C++ symbols + 4 Rust symbols, −2,724 lines, Metal test lane pass
 - arle_monitor.py / arle_watchdog.sh / cp2_ttft_oneshot.sh cluster — deleted 2026-08-18 (user confirmed); zero external callers
 - dsv4_route.cu 14 dead exports — blocked on user's in-flight ffi/moe.rs W4AFP8 work; delete after merge
 
