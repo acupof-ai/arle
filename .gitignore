@@ -25,6 +25,7 @@ models/
 bench-output/
 opd-output/
 runs/
+observe-data/
 
 # web frontend build
 web/node_modules/
