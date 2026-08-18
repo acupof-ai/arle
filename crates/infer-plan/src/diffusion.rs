@@ -497,68 +497,6 @@ fn first_stop_position(tokens: &[u32], stop_token_ids: &[u32]) -> Option<usize> 
         .position(|token| stop_token_ids.iter().any(|stop| stop == token))
 }
 
-fn predict_row(
-    logits: &[f32],
-    temperature: f32,
-    seed: u64,
-    step: usize,
-    row: u64,
-) -> (u32, u32, f32) {
-    let mut argmax = 0usize;
-    let mut argmax_v = f32::NEG_INFINITY;
-    for (idx, &logit) in logits.iter().enumerate() {
-        if logit > argmax_v {
-            argmax = idx;
-            argmax_v = logit;
-        }
-    }
-
-    let temp = temperature.max(0.0);
-    let inv_t = if temp > 0.0 { 1.0 / temp } else { 1.0 };
-    let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    let mut probs: Vec<f32> = logits
-        .iter()
-        .map(|&logit| ((logit - max) * inv_t).exp())
-        .collect();
-    let sum: f32 = probs.iter().sum();
-
-    if !sum.is_finite() || sum <= 0.0 {
-        return (argmax as u32, argmax as u32, 0.0);
-    }
-
-    let mut entropy = 0.0f32;
-    for p in &mut probs {
-        *p /= sum;
-        if *p > 0.0 {
-            entropy -= *p * p.ln();
-        }
-    }
-
-    if temp <= 0.0 {
-        return (argmax as u32, argmax as u32, entropy);
-    }
-
-    let mut sampled = 0usize;
-    let mut sampled_v = f32::NEG_INFINITY;
-    for (idx, &logit) in logits.iter().enumerate() {
-        let gumbel = sample_gumbel(seed, step, row, idx as u64);
-        let noisy = logit * inv_t + gumbel;
-        if noisy > sampled_v {
-            sampled_v = noisy;
-            sampled = idx;
-        }
-    }
-    (sampled as u32, argmax as u32, entropy)
-}
-
-fn sample_gumbel(seed: u64, step: usize, row: u64, vocab_idx: u64) -> f32 {
-    let bits = splitmix64(
-        seed ^ ((step as u64) << 40) ^ (row << 20) ^ vocab_idx.wrapping_mul(0xD1B5_4A32_D192_ED03),
-    );
-    let u = (((bits >> 40) as f32) + 1.0) / ((1u32 << 24) as f32 + 2.0);
-    -(-u.ln()).ln()
-}
-
 fn splitmix64(mut x: u64) -> u64 {
     x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
     let mut z = x;
