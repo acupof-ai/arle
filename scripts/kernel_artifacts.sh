@@ -66,15 +66,28 @@ stage_correctness_evidence() {
     jq -cS . "$CORRECTNESS_EVIDENCE" >"$stage/correctness-evidence.json"
 }
 
+# Source trees whose content can change kernel bytes. infer-cuda/src is the
+# consumer, not an input: codegen never reads it, and the FFI contract is
+# guarded by ffi/ + kernels.toml's abi hash + the symbol allowlist. Including
+# it forced a full ~1h rebuild on every runtime change.
+KERNEL_INPUT_PATHS=(
+    crates/cuda-kernels/build.rs
+    crates/cuda-kernels/kernels.toml
+    crates/cuda-kernels/tools/tilelang
+    crates/cuda-kernels/csrc
+    crates/cuda-kernels/ffi
+    crates/cuda-kernels/src
+    vendor/flash-attention
+    vendor/flashmla
+    requirements-build.txt
+)
+
 kernel_bundle_identity() {
     # Hash tracked working-tree content; generated and untracked files cannot
     # change the identity, while dirty inputs cannot masquerade as HEAD.
     local tilelang_inputs
     tilelang_inputs=$(
-        for path in crates/cuda-kernels/build.rs crates/cuda-kernels/kernels.toml \
-            crates/cuda-kernels/tools/tilelang crates/cuda-kernels/csrc \
-            crates/cuda-kernels/ffi crates/cuda-kernels/src crates/infer-cuda/src \
-            vendor/flash-attention vendor/flashmla requirements-build.txt; do
+        for path in "${KERNEL_INPUT_PATHS[@]}"; do
             printf 'input\t%s\t%s\n' "$path" "$(cuda_prebuilt_tracked_hash "$path")"
         done | cuda_prebuilt_hash_stream
     )
@@ -97,7 +110,7 @@ kernel_bundle_manifest() {
   "lane": "$LANE",
   "arches": "$ARCHS",
   "cuda_contract": "$CUDA_CONTRACT",
-  "tilelang_inputs_sha256": "$(cd "$ROOT" && cuda_prebuilt_files_hash crates/cuda-kernels/build.rs crates/cuda-kernels/kernels.toml crates/cuda-kernels/tools/tilelang crates/cuda-kernels/csrc crates/cuda-kernels/ffi crates/cuda-kernels/src crates/infer-cuda/src vendor/flash-attention vendor/flashmla requirements-build.txt)",
+  "tilelang_inputs_sha256": "$(cd "$ROOT" && cuda_prebuilt_files_hash "${KERNEL_INPUT_PATHS[@]}")",
   "nvcc_sha256": "$(if [[ -n "$nvcc" ]]; then cuda_prebuilt_command_id "$nvcc" --version; else printf missing; fi)",
   "host_compiler_sha256": "$(cuda_prebuilt_command_id "${NVCC_CCBIN:-g++}" --version)",
   "python_sha256": "$(cuda_prebuilt_command_id python3 --version)",
