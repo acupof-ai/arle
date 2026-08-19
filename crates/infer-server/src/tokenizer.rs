@@ -184,6 +184,16 @@ impl OpenAiTokenizer {
         matches!(self.template, ChatTemplate::BuiltinDeepseekV4)
     }
 
+    /// Think-start and think-end token IDs for reasoning models. `None` for
+    /// non-reasoning templates.
+    #[must_use]
+    pub fn think_token_ids(&self) -> Option<(u32, u32)> {
+        match self.template {
+            ChatTemplate::BuiltinDeepseekV4 => Some((128821, 128822)),
+            _ => None,
+        }
+    }
+
     pub fn render_chat(&self, messages: &[ChatMessage]) -> Result<String> {
         self.render_chat_with_kwargs(messages, None)
     }

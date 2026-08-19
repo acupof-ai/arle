@@ -686,10 +686,10 @@ pub(crate) struct ServeArgs {
     #[arg(long, value_parser = parse_positive_usize)]
     pub(crate) max_total_tokens: Option<usize>,
 
-    /// Bound on generated tokens for chat requests that enable thinking
-    /// (`chat_template_kwargs.enable_thinking=true`). `0` (the default) leaves
-    /// thinking unbounded — byte-identical to before this flag. A positive
-    /// value caps such requests so a slow think can't run away / time out.
+    /// Reasoning token budget for thinking requests. `0` (the default) uses
+    /// the model default (32768 for DeepSeek-V4, unlimited otherwise). A
+    /// positive value forces `</think>` after this many reasoning tokens,
+    /// then the model continues with content.
     #[arg(long, default_value_t = 0)]
     pub(crate) max_thinking_tokens: usize,
 

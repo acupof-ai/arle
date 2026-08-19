@@ -243,6 +243,8 @@ pub struct CoordinatorHandle {
     /// thinking-on? True only for DeepSeek-V4-Flash (reasoning-trained). Cached
     /// here so the hot path never locks the tokenizer just to read it.
     template_defaults_thinking: bool,
+    /// Cached think-start/end token IDs for reasoning models.
+    think_token_ids: Option<(u32, u32)>,
     next_request_id: AtomicU64,
     /// Submitted but not yet terminally completed; gates decode-only ticks.
     in_flight: Arc<AtomicUsize>,
@@ -340,6 +342,16 @@ impl Deref for DpCoordinator {
     type Target = CoordinatorHandle;
     fn deref(&self) -> &Self::Target {
         self.select()
+    }
+}
+
+/// Map OpenAI `reasoning_effort` to a thinking token budget.
+fn think_budget_for_effort(effort: &str) -> Option<usize> {
+    match effort {
+        "low" => Some(2048),
+        "medium" => Some(8192),
+        "high" => Some(32768),
+        _ => None,
     }
 }
 
@@ -444,11 +456,13 @@ fn coordinator_handle(
     let (multimodal_tx, multimodal_kind) = multimodal.unzip();
 
     let template_defaults_thinking = tokenizer.defaults_thinking_on();
+    let think_token_ids = tokenizer.think_token_ids();
     Arc::new(CoordinatorHandle {
         model: model.into(),
         tokenizer: Mutex::new(tokenizer),
         max_thinking_tokens,
         template_defaults_thinking,
+        think_token_ids,
         next_request_id: AtomicU64::new(1),
         in_flight,
         submit_tx,
@@ -1229,15 +1243,28 @@ async fn chat_completions(
     } else {
         Some(template_kwargs)
     };
-    let mut max_tokens = sampling.max_new_tokens.unwrap_or_else(|| {
-        if thinking && state.max_thinking_tokens > 0 {
-            state.max_thinking_tokens
+    // Resolve thinking budget: reasoning_effort > server config > DSv4 default.
+    let think_budget = if thinking {
+        reasoning_effort
+            .and_then(think_budget_for_effort)
+            .or_else(|| (state.max_thinking_tokens > 0).then_some(state.max_thinking_tokens))
+            .or_else(|| state.template_defaults_thinking.then_some(32768))
+    } else {
+        None
+    };
+    let max_tokens = sampling.max_new_tokens.unwrap_or_else(|| {
+        if let Some(budget) = think_budget {
+            budget + 4096
+        } else if thinking {
+            4096
         } else {
             16
         }
     });
-    if state.max_thinking_tokens > 0 && thinking {
-        max_tokens = max_tokens.min(state.max_thinking_tokens);
+    if let (Some((start, end)), Some(budget)) = (state.think_token_ids, think_budget) {
+        sampling.think_start_token_id = Some(start);
+        sampling.think_end_token_id = Some(end);
+        sampling.max_thinking_tokens = Some(budget);
     }
 
     // Multimodal dispatch: if the backend is a VLM and the request has images,
@@ -1698,10 +1725,27 @@ async fn anthropic_messages(
             }
         }
     }
-    // max_tokens is validated present; mirror the chat path's thinking clamp.
-    let mut max_tokens = sampling.max_new_tokens.unwrap_or(16);
-    if state.max_thinking_tokens > 0 && thinking {
-        max_tokens = max_tokens.min(state.max_thinking_tokens);
+    // Thinking budget: server config > DSv4 default (high tier).
+    let think_budget = if thinking {
+        (state.max_thinking_tokens > 0)
+            .then_some(state.max_thinking_tokens)
+            .or_else(|| state.template_defaults_thinking.then_some(32768))
+    } else {
+        None
+    };
+    let max_tokens = sampling.max_new_tokens.unwrap_or_else(|| {
+        if let Some(budget) = think_budget {
+            budget + 4096
+        } else if thinking {
+            4096
+        } else {
+            16
+        }
+    });
+    if let (Some((start, end)), Some(budget)) = (state.think_token_ids, think_budget) {
+        sampling.think_start_token_id = Some(start);
+        sampling.think_end_token_id = Some(end);
+        sampling.max_thinking_tokens = Some(budget);
     }
     // Echo the request's model string back (Anthropic contract).
     let model = request.model.clone().unwrap_or_else(|| state.model.clone());

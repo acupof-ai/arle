@@ -142,6 +142,9 @@ pub fn sample_token_logprob_penalized(
     position: u64,
     history: PenaltyHistory<'_>,
 ) -> (u32, Option<f32>) {
+    if let Some(forced) = params.force_next_token {
+        return (forced, None);
+    }
     let rewritten = rewrite_logits(logits, params, history);
     let logits = rewritten.as_deref().unwrap_or(logits);
     if params.is_greedy() || logits.is_empty() {

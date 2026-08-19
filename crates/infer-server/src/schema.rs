@@ -596,6 +596,10 @@ fn sampling_params(
         },
         n: n.unwrap_or(1).max(1),
         top_logprobs,
+        force_next_token: None,
+        think_end_token_id: None,
+        think_start_token_id: None,
+        max_thinking_tokens: None,
     }
 }
 
@@ -1095,6 +1099,7 @@ impl ResponseToolCall {
     }
 }
 
+const THINK_START: &str = "<think>";
 const THINK_END: &str = "</think>";
 
 /// OpenAI `system_fingerprint` — a stable identifier for the model/backend
@@ -1103,23 +1108,25 @@ pub(crate) const SYSTEM_FINGERPRINT: &str = "arle_fp_1";
 
 /// Split a thinking-model's generated text into `(reasoning_content, content)`.
 ///
-/// Two output shapes arrive here:
+/// State machine over `<think>` / `</think>` markers: text inside a thinking
+/// block accumulates into `reasoning_content`, text outside into `content`.
+/// Handles multi-segment thinking (`r1</think>c1<think>r2</think>c2`) and
+/// models that re-open the block after answering.
+///
+/// Two entry shapes:
 /// - **Thinking ON**: the chat template pre-fills `<think>\n` into the *prompt*,
 ///   so the model emits `reasoning</think>answer` (no opening tag).
-/// - **Thinking OFF but model emits `<think>` anyway** (e.g. Qwen3.6, which is
-///   reasoning-trained and re-opens the block even when the template closed it):
+/// - **Thinking OFF but model emits `<think>` anyway** (e.g. Qwen3.6):
 ///   output is `<think>reasoning</think>answer`.
 ///
-/// In both cases the leading thinking block must be stripped from `content`.
-/// `reasoning_content` is only returned when `enable_thinking` is true; when
-/// false the reasoning is silently dropped (the client asked for no thinking).
+/// When the model never closes the think block (hit max_tokens or a repetition
+/// loop), the entire output is returned as `content` — the user gets the
+/// model's best answer instead of an empty response.
 ///
-/// Non-thinking outputs (no leading `<think>`, no `</think>` when thinking is
-/// off) pass through byte-identically — a literal `</think>` in a plain answer
-/// is never truncated.
+/// Non-thinking outputs (no leading `<think>`, thinking off) pass through
+/// byte-identically.
 ///
 /// Empty reasoning collapses to `None` so the field is omitted.
-///
 // ponytail: chat SSE splits incrementally via
 // `sse_util::StreamingReasoningSplitter` — keep the two policies in lockstep.
 // pub(crate): also the canonical pre-split for the tools path
@@ -1127,49 +1134,52 @@ pub(crate) const SYSTEM_FINGERPRINT: &str = "arle_fp_1";
 // misses the prompt-prefilled `reasoning</think>` form.
 pub(crate) fn split_reasoning(text: &str, enable_thinking: bool) -> (Option<String>, String) {
     let trimmed = text.trim_start();
-    // Model emitted a leading <think> — strip the whole thinking block.
-    if trimmed.starts_with("<think>") {
-        return match trimmed.find(THINK_END) {
-            Some(idx) => {
-                let reasoning = trimmed[..idx]
-                    .trim_start()
-                    .trim_start_matches("<think>")
-                    .trim();
-                let content = trimmed[idx + THINK_END.len()..].trim_start();
-                // The model emitted the block itself, so it is reasoning whether
-                // or not the request asked for thinking.
-                let reasoning_content = (!reasoning.is_empty()).then(|| reasoning.to_string());
-                (reasoning_content, content.to_string())
-            }
-            // No closer: if thinking is on, it's truncated reasoning; if off,
-            // pass through (don't drop the user's text).
-            None => {
-                if enable_thinking {
-                    (Some(trimmed.trim().to_string()), String::new())
-                } else {
-                    (None, text.to_string())
+
+    // Non-thinking output without a leading <think>: byte-identical passthrough.
+    if !enable_thinking && !trimmed.starts_with(THINK_START) {
+        return (None, text.to_string());
+    }
+
+    let mut reasoning = String::new();
+    let mut content = String::new();
+    let mut buf = trimmed;
+    let mut in_thinking = true;
+
+    // Strip the model's own <think> opener if present.
+    if let Some(rest) = buf.strip_prefix(THINK_START) {
+        buf = rest;
+    }
+
+    while !buf.is_empty() {
+        if in_thinking {
+            match buf.find(THINK_END) {
+                Some(idx) => {
+                    reasoning.push_str(&buf[..idx]);
+                    buf = &buf[idx + THINK_END.len()..];
+                    in_thinking = false;
+                }
+                None => {
+                    // Model never closed the think block (max_tokens / loop).
+                    return (None, text.to_string());
                 }
             }
-        };
+        } else {
+            match buf.find(THINK_START) {
+                Some(idx) => {
+                    content.push_str(&buf[..idx]);
+                    buf = &buf[idx + THINK_START.len()..];
+                    in_thinking = true;
+                }
+                None => {
+                    content.push_str(buf);
+                    break;
+                }
+            }
+        }
     }
-    // No leading <think>.
-    if enable_thinking {
-        // Prompt prefilled <think>, so output is reasoning</think>answer.
-        let (reasoning, content) = match trimmed.find(THINK_END) {
-            Some(idx) => (
-                trimmed[..idx].trim(),
-                trimmed[idx + THINK_END.len()..].trim_start(),
-            ),
-            None => (trimmed.trim(), ""),
-        };
-        (
-            (!reasoning.is_empty()).then(|| reasoning.to_string()),
-            content.to_string(),
-        )
-    } else {
-        // Non-thinking output — byte-identical passthrough.
-        (None, text.to_string())
-    }
+
+    let reasoning_out = (!reasoning.trim().is_empty()).then(|| reasoning.trim().to_string());
+    (reasoning_out, content.trim().to_string())
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1379,5 +1389,40 @@ mod tests {
             }
             assert!(req.validate().is_err(), "NaN{body} must be rejected");
         }
+    }
+
+    #[test]
+    fn split_reasoning_simple() {
+        let (r, c) = super::split_reasoning("reasoning</think>answer", true);
+        assert_eq!(r.as_deref(), Some("reasoning"));
+        assert_eq!(c, "answer");
+    }
+
+    #[test]
+    fn split_reasoning_multi_segment() {
+        let (r, c) = super::split_reasoning("r1</think>c1<think>r2</think>c2", true);
+        assert_eq!(r.as_deref(), Some("r1r2"));
+        assert_eq!(c, "c1c2");
+    }
+
+    #[test]
+    fn split_reasoning_no_close_returns_content() {
+        let (r, c) = super::split_reasoning("stuck in a loop", true);
+        assert_eq!(r, None);
+        assert_eq!(c, "stuck in a loop");
+    }
+
+    #[test]
+    fn split_reasoning_non_thinking_passthrough() {
+        let (r, c) = super::split_reasoning("Hello world", false);
+        assert_eq!(r, None);
+        assert_eq!(c, "Hello world");
+    }
+
+    #[test]
+    fn split_reasoning_model_emitted_think() {
+        let (r, c) = super::split_reasoning("<think>r</think>a", false);
+        assert_eq!(r.as_deref(), Some("r"));
+        assert_eq!(c, "a");
     }
 }
