@@ -428,6 +428,13 @@ MarlinFuncPtr get_marlin_kernel(
 }
 
 template <typename scalar_t>
+// Resident blocks per SM the search may consider. Above 5 the shared-memory
+// split leaves each block too little to hold a tile at any configuration, so
+// the extra iterations only cost compile-time search.
+#ifndef MARLIN_MAX_BLOCKS_PER_SM
+  #define MARLIN_MAX_BLOCKS_PER_SM 5
+#endif
+
 exec_config_t determine_exec_config(
     const host::ScalarType& q_type,
     int prob_m,
@@ -448,62 +455,84 @@ exec_config_t determine_exec_config(
   int thread_configs_size = thread_m_blocks > 1 ? sizeof(large_batch_thread_configs) / sizeof(thread_config_t)
                                                 : sizeof(small_batch_thread_configs) / sizeof(thread_config_t);
 
-  for (int i = 0; i < thread_configs_size; i++) {
-    thread_config_t th_config = thread_configs[i];
+  // Upstream returned the first valid tile at blocks_per_sm=1 unconditionally,
+  // which leaves the SM at one resident block. At decode shapes the kernel is
+  // instruction-issue bound (ncu: issue 56%, ALU 52.6% of peak, occupancy
+  // 12.5% capped by the opt-in shared-memory request), so a second and third
+  // resident block buy issue slots that a single block cannot fill. Search
+  // blocks_per_sm as well and keep the configuration that covers the output
+  // tiles with the fewest waves; ties go to the larger tile, which amortises
+  // the per-block prologue. Measured on H20 at the 27B dense-MLP shapes:
+  // gate_up -19.6%, down -5.9%, per-layer MLP -14.8%.
+  int best_waves = INT_MAX;
+  int best_tile_k = 0;
+  for (int bps = 1; bps <= MARLIN_MAX_BLOCKS_PER_SM; bps++) {
+    int shared_budget = bps > 1 ? max_shared_mem / bps - 1024 : max_shared_mem;
+    for (int i = 0; i < thread_configs_size; i++) {
+      thread_config_t th_config = thread_configs[i];
 
-    if (!is_valid_config(
-            th_config,
-            thread_m_blocks,
-            prob_m,
-            prob_n,
-            prob_k,
-            num_bits,
-            group_size,
-            has_act_order,
-            is_k_full,
-            has_zp,
-            is_zp_float,
-            max_shared_mem)) {
-      continue;
+      if (!is_valid_config(
+              th_config,
+              thread_m_blocks,
+              prob_m,
+              prob_n,
+              prob_k,
+              num_bits,
+              group_size,
+              has_act_order,
+              is_k_full,
+              has_zp,
+              is_zp_float,
+              shared_budget)) {
+        continue;
+      }
+
+      int cache_size = get_kernel_cache_size(
+          th_config,
+          thread_m_blocks,
+          prob_m,
+          prob_n,
+          prob_k,
+          num_bits,
+          group_size,
+          has_act_order,
+          is_k_full,
+          has_zp,
+          is_zp_float);
+      (void)cache_size;
+
+      int group_blocks = 0;
+      if (!has_act_order) {
+        group_blocks = group_size == -1 ? -1 : group_size / 16;
+      }
+
+      auto kernel = get_marlin_kernel<scalar_t>(
+          q_type,
+          thread_m_blocks,
+          th_config.thread_n / 16,
+          th_config.thread_k / 16,
+          m_block_size_8,
+          has_act_order,
+          has_zp,
+          group_blocks,
+          th_config.num_threads,
+          is_zp_float);
+
+      if (kernel == MarlinDefault) continue;
+
+      // Waves = how many times the whole GPU must be filled to cover the
+      // output tiles. Fewer waves means less tail where most SMs idle.
+      // One block covers thread_n output columns; K is walked inside the
+      // block, so the grid is the N tiling alone.
+      int n_tiles = div_ceil(prob_n, th_config.thread_n);
+      int waves = div_ceil(n_tiles, sms * bps);
+
+      if (waves < best_waves || (waves == best_waves && th_config.thread_k > best_tile_k)) {
+        best_waves = waves;
+        best_tile_k = th_config.thread_k;
+        exec_cfg = exec_config_t{bps, th_config};
+      }
     }
-
-    int cache_size = get_kernel_cache_size(
-        th_config,
-        thread_m_blocks,
-        prob_m,
-        prob_n,
-        prob_k,
-        num_bits,
-        group_size,
-        has_act_order,
-        is_k_full,
-        has_zp,
-        is_zp_float);
-
-    int group_blocks = 0;
-    if (!has_act_order) {
-      group_blocks = group_size == -1 ? -1 : group_size / 16;
-    }
-
-    auto kernel = get_marlin_kernel<scalar_t>(
-        q_type,
-        thread_m_blocks,
-        th_config.thread_n / 16,
-        th_config.thread_k / 16,
-        m_block_size_8,
-        has_act_order,
-        has_zp,
-        group_blocks,
-        th_config.num_threads,
-        is_zp_float);
-
-    if (kernel == MarlinDefault) continue;
-
-    // int m_tiles = div_ceil(prob_m, thread_m_blocks * 16);
-    // int n_tiles = prob_n / th_config.thread_n;
-    // int k_tiles = prob_k / th_config.thread_k;
-
-    return {1, th_config};
   }
 
   return exec_cfg;
