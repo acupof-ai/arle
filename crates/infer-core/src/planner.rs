@@ -238,8 +238,14 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         };
         match demoted {
             Ok(true) => {}
-            Ok(false) => return false,
+            Ok(false) => {
+                self.kv_tier_stats.slot_demote_failures =
+                    self.kv_tier_stats.slot_demote_failures.saturating_add(1);
+                return false;
+            }
             Err(err) => {
+                self.kv_tier_stats.slot_demote_failures =
+                    self.kv_tier_stats.slot_demote_failures.saturating_add(1);
                 log::warn!("whole-slot KV demote failed for slot {slot}: {err:#}");
                 return false;
             }
@@ -302,9 +308,12 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
                     self.kv_tier_stats.demoted_slots =
                         self.kv_tier_stats.demoted_slots.saturating_add(1);
                 }
-                Ok(false) => {}
-                Err(err) => {
-                    log::warn!("whole-slot KV demote failed for slot {slot}: {err:#}");
+                res => {
+                    self.kv_tier_stats.slot_demote_failures =
+                        self.kv_tier_stats.slot_demote_failures.saturating_add(1);
+                    if let Err(err) = res {
+                        log::warn!("whole-slot KV demote failed for slot {slot}: {err:#}");
+                    }
                 }
             }
         } else {

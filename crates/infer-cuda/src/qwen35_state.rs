@@ -8,6 +8,10 @@ pub(crate) struct Qwen35SlotImage {
     pub(crate) full_attn_page_count: usize,
     pub(crate) gdr_host: Vec<Vec<f32>>,
     pub(crate) conv_host: Vec<Vec<bf16>>,
+    /// The recurrent payload is the 1/cp B2 decode pair, not the full pair.
+    /// Park and promote are lockstep across the cp group and each rank owns its
+    /// own tier, so a rank restores exactly the shard it captured.
+    pub(crate) recurrent_decode_pair: bool,
     pub(crate) seq_len: usize,
 }
 
@@ -74,6 +78,7 @@ impl Qwen35SlotImage {
         buf.extend_from_slice(&(self.full_attn_pages.len() as u64).to_le_bytes());
         buf.extend_from_slice(&(self.gdr_host.len() as u64).to_le_bytes());
         buf.extend_from_slice(&(self.conv_host.len() as u64).to_le_bytes());
+        buf.extend_from_slice(&(u64::from(self.recurrent_decode_pair)).to_le_bytes());
         buf.extend_from_slice(&self.full_attn_pages);
         for gdr in &self.gdr_host {
             buf.extend_from_slice(&(gdr.len() as u64).to_le_bytes());
@@ -111,6 +116,7 @@ impl Qwen35SlotImage {
         let full_attn_len = take_u64(&mut pos)? as usize;
         let num_gdr = take_u64(&mut pos)? as usize;
         let num_conv = take_u64(&mut pos)? as usize;
+        let recurrent_decode_pair = take_u64(&mut pos)? != 0;
         let pages_end = pos
             .checked_add(full_attn_len)
             .ok_or_else(|| anyhow!("slot image full-attn length overflow"))?;
@@ -161,6 +167,7 @@ impl Qwen35SlotImage {
             full_attn_page_count,
             gdr_host,
             conv_host,
+            recurrent_decode_pair,
             seq_len,
         })
     }
@@ -735,13 +742,10 @@ impl Qwen35SlotState {
         full_attn_kv: &mut PagedKVPool,
         recurrent_pool: &mut Vec<RecurrentBlock>,
     ) -> Result<Qwen35SlotImage> {
-        // The B2 decode pair is a 1/cp head subset and the full pair is stale
-        // at the scatter point, so neither fits the full-dim image. The failed
-        // demote sends the request to recompute.
-        ensure!(
-            !self.decode_recurrent_live,
-            "Qwen3.6 whole-slot swap: slot {slot} ran B2 CP decode; preempt via recompute"
-        );
+        // Under B2 the live state is the 1/cp decode pair (the full pair is
+        // frozen at the scatter point); capture that pair and flag it so
+        // swap-in restores it back into the decode pair.
+        let decode_live = self.decode_recurrent_live && !self.gdr_states_decode.is_empty();
         ensure!(
             self.seq_len == full_attn_kv.seq_len(slot),
             "Qwen3.6 swap-out slot {slot} seq_len {} != pool seq_len {}",
@@ -753,8 +757,12 @@ impl Qwen35SlotState {
         let pages = full_attn_kv.page_indices(slot).to_vec();
         let full_attn_pages = full_attn_kv.copy_pages_to_host(ctx, &pages)?;
         let full_attn_page_count = pages.len();
-        let gdr_host = self
-            .gdr_states
+        let (gdr_src, conv_src) = if decode_live {
+            (&self.gdr_states_decode, &self.conv_states_decode)
+        } else {
+            (&self.gdr_states, &self.conv_states)
+        };
+        let gdr_host = gdr_src
             .iter()
             .map(|s| {
                 ctx.stream
@@ -762,8 +770,7 @@ impl Qwen35SlotState {
                     .map_err(|e| anyhow!("Qwen3.6 swap gdr-state D2H failed: {e}"))
             })
             .collect::<Result<Vec<_>>>()?;
-        let conv_host = self
-            .conv_states
+        let conv_host = conv_src
             .iter()
             .map(|c| {
                 ctx.stream
@@ -778,6 +785,7 @@ impl Qwen35SlotState {
             full_attn_page_count,
             gdr_host,
             conv_host,
+            recurrent_decode_pair: decode_live,
             seq_len: self.seq_len,
         };
         full_attn_kv.mirror_slot(slot, &[], 0)?;
@@ -827,12 +835,36 @@ impl Qwen35SlotState {
         full_attn_kv.mirror_slot(slot, slot_pages, image.seq_len)?;
         full_attn_kv.copy_pages_from_host(ctx, slot_pages, &image.full_attn_pages)?;
         self.acquire_recurrent(ctx, num_linear, gdr_state_len, conv_len, recurrent_pool)?;
-        for (dst, src) in self.gdr_states.iter_mut().zip(&image.gdr_host) {
+        if image.recurrent_decode_pair {
+            // The victim was mid-B2-decode: land the shard back in the decode
+            // pair and mark every layer scattered, so the resumed decode reads
+            // it instead of re-scattering from the zeroed full pair. The full
+            // pair has no reader under 2D (MTP/spec is refused there).
+            let (dec_gdr, dec_conv) = (
+                image.gdr_host.first().map_or(0, Vec::len),
+                image.conv_host.first().map_or(0, Vec::len),
+            );
+            // A foreign/stale blob (different cp) is not a 1/cp divisor.
+            ensure!(
+                dec_gdr > 0 && gdr_state_len % dec_gdr == 0 && conv_len % dec_conv == 0,
+                "Qwen3.6 swap-in decode-pair dims {dec_gdr}/{dec_conv} do not divide \
+                 full {gdr_state_len}/{conv_len}"
+            );
+            self.ensure_decode_recurrent(ctx, num_linear, dec_gdr, dec_conv)?;
+            self.decode_scattered = vec![true; num_linear];
+            self.decode_recurrent_live = true;
+        }
+        let (gdr_dst, conv_dst) = if image.recurrent_decode_pair {
+            (&mut self.gdr_states_decode, &mut self.conv_states_decode)
+        } else {
+            (&mut self.gdr_states, &mut self.conv_states)
+        };
+        for (dst, src) in gdr_dst.iter_mut().zip(&image.gdr_host) {
             ctx.stream
                 .memcpy_htod(src, dst)
                 .map_err(|e| anyhow!("Qwen3.6 swap gdr-state H2D failed: {e}"))?;
         }
-        for (dst, src) in self.conv_states.iter_mut().zip(&image.conv_host) {
+        for (dst, src) in conv_dst.iter_mut().zip(&image.conv_host) {
             ctx.stream
                 .memcpy_htod(src, &mut dst.data)
                 .map_err(|e| anyhow!("Qwen3.6 swap conv-state H2D failed: {e}"))?;

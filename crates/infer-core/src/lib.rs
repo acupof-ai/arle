@@ -245,6 +245,10 @@ pub struct KvTierStats {
     pub promote_failures: u64,
     pub resident_blocks: usize,
     pub demoted_slots: u64,
+    /// Parks the backend refused or the tier could not take (victim keeps
+    /// running / recomputes). A refusal that only logs is invisible where
+    /// capacity is actually read.
+    pub slot_demote_failures: u64,
     pub promoted_slots: u64,
     pub slot_promote_failures: u64,
 }

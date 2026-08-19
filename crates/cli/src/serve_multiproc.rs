@@ -454,6 +454,7 @@ fn run_lockstep_driver(
                     kv_tier_promote_failures: tier.promote_failures,
                     kv_tier_resident_blocks: tier.resident_blocks,
                     kv_tier_demoted_slots: tier.demoted_slots,
+                    kv_tier_slot_demote_failures: tier.slot_demote_failures,
                     kv_tier_promoted_slots: tier.promoted_slots,
                     kv_tier_slot_promote_failures: tier.slot_promote_failures,
                     kv_system_resident_pages: system.resident_pages,

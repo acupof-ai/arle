@@ -237,6 +237,12 @@ pub(crate) fn render_prometheus(counters: &CounterSnapshot, model: &str) -> Stri
         counters.kv_tier.promoted_slots,
     );
     push(
+        "kv_tier_slot_demote_failures_total",
+        "counter",
+        "Whole-slot parks the backend or tier refused (victim kept running / recomputed).",
+        counters.kv_tier.slot_demote_failures,
+    );
+    push(
         "kv_tier_slot_promote_failures_total",
         "counter",
         "Whole-slot promotions that failed (request recomputed).",
