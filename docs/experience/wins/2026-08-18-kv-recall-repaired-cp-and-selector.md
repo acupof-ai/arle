@@ -98,6 +98,29 @@ residency 18 pages). Net −66 lines. The load-bearing parts:
   That count sizes a cross-rank collective, so a drift between the two copies
   would hang the group.
 
+## Deferred cleanups (2026-08-19, `e5c20c13c`)
+
+Re-gated on pod at every arm above, all unchanged — including residency at 19
+local pages, so none of it turned recall into a no-op.
+
+- The block representation moved to `infer_core::recall` (`fold_key`,
+  `score_block`), and **Metal stopped running the mean scorer**. Both backends
+  now rank blocks identically. A unit test pins the property: on keys that
+  cancel channel-wise, the envelope still bounds the true `max q·k` while the
+  mean scores exactly zero — the failure that cost this whole investigation.
+- `RecallConfig::VALIDATED` replaces two hand-copied constant sets;
+  `is_page_aligned` moves the region invariant onto the config and off the
+  per-prefill-row path.
+- `PrefillRow::end_pos` / `is_final_chunk` replace fifteen open-coded
+  derivations across five crates. The predicate existed as both `==` and `>=`.
+- `loader::local_kv_extent` is now the single place a sharded page table's KV
+  extent is computed; `refresh_sharded_decode` had a hand-rolled `owns_page`
+  against `ShardSpec`'s claim to be the only ownership predicate.
+- `reduce_f32_over` runs an in-place device all-reduce instead of gathering
+  `world_size` copies to the host: ~18 MB of host copying per call removed.
+- `update_block_reps` sorts its readbacks by physical page and coalesces runs —
+  ~1000 latency-bound 32 KB copies per 16K prefill collapse to a handful.
+
 ## Rule
 
 Order the fixes by what unblocks measurement, not by what looks most important.
