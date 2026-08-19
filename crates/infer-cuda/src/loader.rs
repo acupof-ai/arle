@@ -5683,6 +5683,10 @@ fn marlin_repack_dense(
     matrix
         .repack_for_marlin_fp8(ctx)
         .with_context(|| format!("Marlin FP8 per-channel repack {name}"))?;
+    // Marlin owns every M for a weight it accepted (`fp4_route` / `fp8_route`),
+    // so the pre-repack bytes are dead the moment the layout exists. Keeping
+    // them stored the model twice and halved the KV pool.
+    matrix.free_quant_source_after_marlin();
     Ok(matrix)
 }
 

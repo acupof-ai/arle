@@ -392,25 +392,34 @@ not convert because the kernel is issue-bound, not bandwidth-bound: ncu reads 96
 registers/thread, which caps residency at 682 threads/SM (~33% occupancy) on any
 block size, and issue sits at 67% of peak.
 
-Long-agent 32K, `bench-agent-32k-16x8.jsonl`, 32 req/point, max_tokens 214,
-no spec, both arms on the same box:
+Long-agent 32K, `bench-agent-32k-16x8.jsonl` (sha 8867f63e, 1,052,018 prompt /
+6,848 output tokens per point), 32 req/point, max_tokens 214, no spec, both arms
+on the same binary and the same GPU, FP8 re-measured rather than reused:
 
 | arm | c | ITL ms | decode | out tok/s | completed |
 |---|---:|---:|---:|---:|---:|
-| NVFP4 | 1 | 22.88 | **43.7** | 13.59 | **32/32** |
-| NVFP4 | 4 | 49.57 | 20.2 | 70.59 | **32/32** |
-| FP8 | 1 | 26.68 | **37.5** | 18.93 | 32/32 |
-| FP8 | 4 | 47.32 | 21.1 | 75.40 | 32/32 |
+| NVFP4 | 1 | **20.44** | **48.9** | 12.99 | 32/32 |
+| NVFP4 | 4 | **40.04** | **25.0** | **84.25** | 32/32 |
+| NVFP4 | 8 | **70.81** | **14.1** | **98.66** | 32/32 |
+| FP8 | 1 | 24.80 | 40.3 | **19.63** | 32/32 |
+| FP8 | 4 | 47.38 | 21.1 | 74.79 | 32/32 |
+| FP8 | 8 | 78.96 | 12.7 | 92.23 | 32/32 |
 
-NVFP4 leads by 16.5% at c=1 and trails 4.3% at c=4. The gap is far narrower than
-on an 8-token prompt because attention dominates at 33K and is format-independent
-— the short-prompt grid measures the weight-read path almost alone.
+NVFP4 leads on ITL at every point (+21.3% / +18.4% / +11.5%) and on end-to-end
+output from c=4 (+12.7% / +7.0%). c=1 trails by 33.9% end-to-end: this workload
+is 154:1 prefill-to-decode and c=1 has no batching to amortise prefill, where
+Marlin now serves every M and pays the 12-21% it used to avoid by falling back
+to dequant→cuBLAS.
 
-**These rows were taken with `MARLIN_MAX_BLOCKS_PER_SM` pinned to 1, but that is
-not established as necessary.** The run completed 64/64 and hit zero partial
-prefix restores — the condition present at both crashes — so it does not show
-that pinning fixes anything. Pinning costs 29-42% of decode throughput. See
-[errors/2026-08-19-blocks-per-sm-search-two-latent-bugs.md](experience/errors/2026-08-19-blocks-per-sm-search-two-latent-bugs.md).
+The c=4 row was 10.04 out tok/s before `2026-08-20-marlin-source-freed-18gb`
+(8.4x), and 70.59 on the older `MARLIN_MAX_BLOCKS_PER_SM=1` build (+19.4%). The
+VRAM accounting behind it, both arms measured at load:
+
+| | file | resident | KV pool | full recomputes |
+|---|---:|---:|---:|---:|
+| NVFP4 before | 23.42 GB | 42.08 GB | 281,577 tok | 24 |
+| NVFP4 after | 23.42 GB | **23.06 GB** | **790,603 tok** | 2 |
+| FP8 | 30.87 GB | 30.41 GB | 593,995 tok | 0 |
 
 Spec decode, synthetic prompt, c=1:
 

@@ -18,8 +18,8 @@ mod qwen_fp8_dense_policy {
 /// M>=2 uses the WMMA GEMM which avoids the 2× memory blowup of cuBLAS for
 /// small batches (DSpark verify, MoE expert routing).
 ///
-/// Safe for FP4/W8A16 only because a Marlin arm claims M<=[`QWEN_MARLIN_MAX_M`]
-/// first — and only for weights the repack accepted. A W8A16 weight Marlin could
+/// Safe for FP4/W8A16 only because a Marlin arm claims every M first, and only
+/// for weights the repack accepted. A W8A16 weight Marlin could
 /// not repack still reaches its dequant arm at M=2 and pays a full-weight dequant
 /// per decode step; unmeasured, no such checkpoint on hand. Weights with no
 /// Marlin layout must use [`QWEN_DEQUANT_GEMM_PREFILL_MIN_M`] — see its note.
@@ -559,9 +559,8 @@ fn reserve_dequant_scratch(ctx: &DeviceContext, elems: usize) -> bool {
 /// Only engages when:
 ///  - the weight is `Fp8BlockScaled` (any block shape — per-channel `[1, K]`
 ///    included, since DeepGEMM above takes only the canonical 128x128),
-///  - [`fp8_route`] says `DequantGemm` — i.e. above
-///    `QWEN_DEQUANT_GEMM_PREFILL_MIN_M`, or above `QWEN_MARLIN_MAX_M` for a
-///    per-channel weight the Marlin arm above already claims below it.
+///  - [`fp8_route`] says `DequantGemm` — i.e. at or above
+///    `QWEN_DEQUANT_GEMM_PREFILL_MIN_M` on a weight the Marlin repack declined.
 ///
 /// The M floor is load-bearing. The dequant is per call, not cached, so at
 /// decode M this path re-materialises every FP8 weight in the model on every
@@ -733,9 +732,10 @@ fn try_w8a16_marlin_gemm_batch(
 /// cold on H20 at the 27B dense-MLP shapes:
 ///
 /// - `Marlin` (tensor core) beats the dequant path by 96% at M=1 and stays
-///   ahead to M~1024.
-/// - `DequantGemm` (dequant to BF16 once, then cuBLAS) takes over above that:
-///   at M=2048 — the `chunked_prefill_size` default — Marlin is 12-21% slower.
+///   ahead to M~1024 and behind above it; it takes every M anyway, because the
+///   pre-repack bytes a dequant arm would read are freed at load.
+/// - `DequantGemm` (dequant to BF16 once, then cuBLAS) serves the weights the
+///   repack declined.
 /// - `Gemv` (scalar warp-per-row) is the fallback for weights Marlin has no
 ///   kernel for: sm_70, `group_size != 16`, or a shape the repack rejected.
 ///   Those weights never get `marlin_packed`, so the route is forced.
@@ -746,21 +746,23 @@ enum Fp4Route {
     Gemv,
 }
 
-/// Largest M where a Marlin GEMM beats dequant→BF16 cuBLAS; see [`Fp4Route`] /
-/// [`Fp8Route`]. Measured cold on 1xH20 (sm_90) on NVFP4 at the 27B dense MLP
-/// shapes: Marlin is 96% faster at M=1, 57% at 256, 4-10% at 1024, and 12-21%
-/// SLOWER at 2048 — Marlin re-dequantizes per tile while cuBLAS pays the dequant
-/// once and then runs a pure BF16 GEMM. The default prefill chunk is 2048, so
-/// prefill stays on cuBLAS.
+/// Marlin claims every M for a weight it repacked, and the dequant→BF16→cuBLAS
+/// arm is left to the weights it declined.
 ///
-/// Per-channel FP8 reuses the value. The crossover mechanism is the same, but
-/// its M-sweep has not been run — treat 1024 as inherited, not measured, until
-/// the FP8 parity + perf ladder lands.
-const QWEN_MARLIN_MAX_M: usize = 1024;
+/// This costs GEMM time at prefill and buys it back many times over in VRAM.
+/// Marlin is 96% faster than dequant→cuBLAS at M=1, 57% at 256, 4-10% at 1024,
+/// and 12-21% SLOWER at 2048 (measured cold, 1xH20, 27B dense-MLP shapes),
+/// because Marlin re-dequantizes per tile while cuBLAS pays the dequant once.
+/// A 1024 cap honoured that crossover — and made the pre-repack bytes reachable
+/// at prefill, so they had to stay resident, which stored the model twice: 40.1
+/// GB for a 22.8 GB checkpoint. The KV pool paid for it (281,577 tokens against
+/// the FP8 model's 593,995 on the same card), a 32K agent workload ran out of
+/// slots, and cross-slot prefix restores fell back to full recompute — 7x the
+/// wall clock at c=4, against 12-21% on one GEMM.
 
 fn fp4_route(ctx: &DeviceContext, weight: &DeviceMatrix, m: usize) -> Fp4Route {
     let repacked = weight.marlin_packed.is_some() && weight.marlin_scales.is_some();
-    if repacked && marlin_sm_supported(ctx) && m <= QWEN_MARLIN_MAX_M {
+    if repacked && marlin_sm_supported(ctx) {
         return Fp4Route::Marlin;
     }
     if m >= QWEN_FP8_DEQUANT_GEMM_MIN_M {
@@ -780,6 +782,22 @@ fn try_fp4_marlin_gemm_batch(
     {
         return Ok(false);
     }
+    let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
+    let (out_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
+    marlin_fp4_gemm_raw(ctx, weight, x_ptr, out_ptr, x.seq_len)
+}
+
+/// The NVFP4 Marlin launch over raw activation pointers, so both dispatch lanes
+/// reach it: [`gemm_batch`] and the single-row [`gemv`]. Not cosmetic — `gemv`
+/// had no Marlin arm at all, and a repacked weight's pre-repack bytes are freed
+/// at load, so its scalar arm has nothing left to read.
+fn marlin_fp4_gemm_raw(
+    ctx: &DeviceContext,
+    weight: &DeviceMatrix,
+    x_ptr: u64,
+    out_ptr: u64,
+    m: usize,
+) -> Result<bool> {
     let (Some(packed), Some(global)) =
         (weight.marlin_packed.as_ref(), weight.marlin_scales.as_ref())
     else {
@@ -792,8 +810,6 @@ fn try_fp4_marlin_gemm_batch(
     // `repack_for_marlin_fp4`.
     let scales_ptr = packed_ptr + (n * k / 2) as u64;
     let (global_ptr, _gg) = global.device_ptr(&ctx.stream);
-    let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
-    let (out_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
     let stream = ctx.stream.cu_stream();
     MARLIN_SCRATCH.with(|cell| -> Result<()> {
         let mut scratch = cell.borrow_mut();
@@ -802,10 +818,10 @@ fn try_fp4_marlin_gemm_batch(
         let workspace = scratch.workspace.as_ref().unwrap();
         let (c_tmp_ptr, _gc) = c_tmp.device_ptr(&ctx.stream);
         let (ws_ptr, _gw) = workspace.device_ptr(&ctx.stream);
-        qwen_quant_profile(ctx, "qwen/fp4/marlin_gemm", x.seq_len, n, k, || {
+        qwen_quant_profile(ctx, "qwen/fp4/marlin_gemm", m, n, k, || {
             // SAFETY: all ptrs from live device allocations; packed/scales/global
-            // sized by repack_for_marlin_fp4 for these dims, x=[seq_len,k],
-            // out=[seq_len,n], c_tmp/workspace sized to the SM max.
+            // sized by repack_for_marlin_fp4 for these dims, x=[m,k], out=[m,n],
+            // c_tmp/workspace sized to the SM max.
             unsafe {
                 ffi::marlin_fp4_gemm_cuda(
                     x_ptr as *const ffi::Half,
@@ -815,7 +831,7 @@ fn try_fp4_marlin_gemm_batch(
                     out_ptr as *mut ffi::Half,
                     c_tmp_ptr as *mut f32,
                     ws_ptr as *mut i32,
-                    x.seq_len as i32,
+                    m as i32,
                     n as i32,
                     k as i32,
                     weight.group_size as i32,
@@ -834,9 +850,10 @@ fn try_fp4_marlin_gemm_batch(
 /// The one place that decides how an FP8 weight DeepGEMM declined is multiplied.
 /// Mirrors [`Fp4Route`], with one difference that is load-bearing.
 ///
-/// - `Marlin` (tensor core) for per-channel weights the repack accepted, up to
-///   [`QWEN_MARLIN_MAX_M`].
-/// - `DequantGemm` above that — and for weights with NO Marlin layout, but only
+/// - `Marlin` (tensor core) at every M for per-channel weights the repack
+///   accepted; their pre-repack bytes are freed at load, so no other arm may
+///   claim them.
+/// - `DequantGemm` for weights with NO Marlin layout, but only
 ///   from [`QWEN_DEQUANT_GEMM_PREFILL_MIN_M`], not from
 ///   [`QWEN_FP8_DEQUANT_GEMM_MIN_M`] as FP4 uses. An un-repacked FP8 weight is a
 ///   128×128 block weight on a non-Hopper card, and dequantising all of it at
@@ -852,7 +869,7 @@ enum Fp8Route {
 
 fn fp8_route(ctx: &DeviceContext, weight: &DeviceMatrix, m: usize) -> Fp8Route {
     let repacked = weight.marlin_packed.is_some() && weight.marlin_scales.is_some();
-    if repacked && marlin_sm_supported(ctx) && m <= QWEN_MARLIN_MAX_M {
+    if repacked && marlin_sm_supported(ctx) {
         return Fp8Route::Marlin;
     }
     if m >= QWEN_DEQUANT_GEMM_PREFILL_MIN_M {
@@ -878,6 +895,19 @@ fn try_fp8_marlin_gemm_batch(
     {
         return Ok(false);
     }
+    let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
+    let (out_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
+    marlin_fp8_gemm_raw(ctx, weight, x_ptr, out_ptr, x.seq_len)
+}
+
+/// Per-channel FP8 twin of [`marlin_fp4_gemm_raw`]; same reason it is split out.
+fn marlin_fp8_gemm_raw(
+    ctx: &DeviceContext,
+    weight: &DeviceMatrix,
+    x_ptr: u64,
+    out_ptr: u64,
+    m: usize,
+) -> Result<bool> {
     let (Some(packed), Some(scales)) =
         (weight.marlin_packed.as_ref(), weight.marlin_scales.as_ref())
     else {
@@ -887,8 +917,6 @@ fn try_fp8_marlin_gemm_batch(
     let k = weight.cols; // contraction
     let (packed_ptr, _gp) = packed.device_ptr(&ctx.stream);
     let (scales_ptr, _gs) = scales.device_ptr(&ctx.stream);
-    let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
-    let (out_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
     let stream = ctx.stream.cu_stream();
     MARLIN_SCRATCH.with(|cell| -> Result<()> {
         let mut scratch = cell.borrow_mut();
@@ -897,9 +925,9 @@ fn try_fp8_marlin_gemm_batch(
         let workspace = scratch.workspace.as_ref().unwrap();
         let (c_tmp_ptr, _gc) = c_tmp.device_ptr(&ctx.stream);
         let (ws_ptr, _gw) = workspace.device_ptr(&ctx.stream);
-        qwen_quant_profile(ctx, "qwen/fp8/marlin_gemm", x.seq_len, n, k, || {
+        qwen_quant_profile(ctx, "qwen/fp8/marlin_gemm", m, n, k, || {
             // SAFETY: all ptrs from live device allocations; packed/scales sized by
-            // repack_for_marlin_fp8 for these dims, x=[seq_len,k], out=[seq_len,n],
+            // repack_for_marlin_fp8 for these dims, x=[m,k], out=[m,n],
             // c_tmp/workspace sized to the SM max.
             unsafe {
                 ffi::marlin_fp8_gemm_cuda(
@@ -909,7 +937,7 @@ fn try_fp8_marlin_gemm_batch(
                     out_ptr as *mut ffi::Half,
                     c_tmp_ptr as *mut f32,
                     ws_ptr as *mut i32,
-                    x.seq_len as i32,
+                    m as i32,
                     n as i32,
                     k as i32,
                     stream,
@@ -1420,6 +1448,23 @@ pub(super) fn gemv(
     let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
     let (out_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
     let stream = ctx.stream.cu_stream();
+
+    // The same Marlin arms `gemm_batch` runs, at m=1. This lane is not an
+    // optimisation here, it is the only path: a repacked weight's pre-repack
+    // bytes are freed at load, so the scalar arms below have nothing to read.
+    // `output_projection` reaches this with lm_head every single-row step
+    // (`qwen35_forward.rs`), which is exactly a repacked weight.
+    match weight.weight_format {
+        WeightFormat::Fp4E2M1Group if fp4_route(ctx, weight, 1) == Fp4Route::Marlin => {
+            marlin_fp4_gemm_raw(ctx, weight, x_ptr, out_ptr, 1)?;
+            return Ok(());
+        }
+        WeightFormat::Fp8BlockScaled if fp8_route(ctx, weight, 1) == Fp8Route::Marlin => {
+            marlin_fp8_gemm_raw(ctx, weight, x_ptr, out_ptr, 1)?;
+            return Ok(());
+        }
+        _ => {}
+    }
 
     // SAFETY: ptrs from live device allocations sized to the dims passed.
     unsafe {

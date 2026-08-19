@@ -1961,6 +1961,52 @@ impl DeviceMatrix {
         }
     }
 
+    /// Release the pre-repack quantized bytes once a Marlin layout exists.
+    ///
+    /// Marlin holds its own copy of every weight byte it reads, so leaving the
+    /// source resident stores the model twice: measured on Qwen3.8-27B-NVFP4,
+    /// 40.1 GB resident for a 22.8 GB checkpoint, which halved the KV pool
+    /// against the FP8 model on the same card (281,577 vs 593,995 tokens) and
+    /// forced slot reuse on a long-agent workload. Frees only the two large
+    /// buffers; the scalar scales stay for the accessors that report format.
+    ///
+    /// The caller must guarantee no route can still ask for the source — every
+    /// M has to reach a Marlin arm — or the dispatch errors out with
+    /// "missing qweight_u8" rather than reading freed memory.
+    /// True once [`Self::free_quant_source_after_marlin`] has released the
+    /// pre-repack bytes. [`Self::merge_base_fp8`] returns `None` both for a
+    /// matrix that was never block-scaled FP8 and for one whose source is gone,
+    /// and a caller that reads the second as the first merges into a buffer the
+    /// GEMM no longer reads. Ask this before treating `None` as "not quantised".
+    pub fn quant_source_freed(&self) -> bool {
+        self.marlin_packed.is_some()
+            && self.qweight_u8.is_none()
+            && matches!(
+                self.weight_format,
+                WeightFormat::Fp4E2M1Group | WeightFormat::Fp8BlockScaled
+            )
+    }
+
+    pub fn free_quant_source_after_marlin(&mut self) {
+        // Both, because that is exactly what the routes test before sending a
+        // weight to a Marlin arm (`fp4_route` / `fp8_route`). Freeing on
+        // `marlin_packed` alone would strand a weight that has a layout but no
+        // scales on the scalar arm with nothing to read.
+        if self.marlin_packed.is_none() || self.marlin_scales.is_none() {
+            return;
+        }
+        match self.weight_format {
+            WeightFormat::Fp4E2M1Group => {
+                self.qweight_u8 = None;
+                self.qscale_fp8 = None;
+            }
+            WeightFormat::Fp8BlockScaled => {
+                self.qweight_u8 = None;
+            }
+            _ => {}
+        }
+    }
+
     /// Row-concatenate two weight matrices (`[a; b]` along output rows) so one
     /// GEMM serves both projections — the decode launch-count lever. Formats
     /// covered: DenseBf16 (`data`), pre-repack W8A16 (`qweight`+`qscales`;
@@ -2840,8 +2886,8 @@ impl DeviceMatrix {
     /// carries `w * 2^-120` down to 2^-129, inside bf16; the accumulator's 2^-120
     /// and the scale's 2^+120 cancel bit-exactly in f32.
     ///
-    /// The source `qweight_u8` / `scale_f32` stay resident: prefill above the
-    /// dequant threshold still reads them.
+    /// Leaves the source `qweight_u8` / `scale_f32` in place; the loader calls
+    /// [`Self::free_quant_source_after_marlin`] once it knows no route needs them.
     pub fn repack_for_marlin_fp8(&mut self, ctx: &DeviceContext) -> Result<()> {
         if self.weight_format != WeightFormat::Fp8BlockScaled
             || self.qweight_u8.is_none()
