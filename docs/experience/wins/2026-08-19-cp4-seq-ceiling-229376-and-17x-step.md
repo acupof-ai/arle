@@ -1,5 +1,11 @@
 # cp=4 training seq ceiling is 229376, and the 131072 step got 17.5× faster — 2026-08-19
 
+> **The CP path this ran on produces gradients that do not match single-card**
+> — found while refreshing the timing rows the same day, see
+> [errors/2026-08-19-cp-training-gradients-regressed-and-the-gate-is-dead.md](../errors/2026-08-19-cp-training-gradients-regressed-and-the-gate-is-dead.md).
+> The walls and peaks below stand as resource measurements (same tensors, same
+> kernels); the ceiling is not a measurement on a numerically correct path.
+
 ## Context
 
 `docs/baselines.md` carried two 27B rows at seq=131072, both tagged "older
