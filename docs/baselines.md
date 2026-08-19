@@ -356,13 +356,19 @@ Identity: model `unsloth/Qwen3.8-27B-NVFP4` (22 GB + 811 MB MTP) · 1×H20
 Qwen3.6-27B-FP8 on GPU1, identical flags and harness invocation. Synthetic
 prompt (mean 8 tokens), `--seconds-per-concurrency 30 --max-tokens 128`.
 
-| c | NVFP4 ITL ms | NVFP4 decode | NVFP4 agg | (pre-fix agg) | FP8 ITL ms | FP8 agg |
-|---:|---:|---:|---:|---:|---:|---:|
-| 1 | 14.95 | **66.9** | 66.9 | 66.6 | 17.60 | 56.8 |
-| 2 | 19.43 | 51.5 | **102.9** | 19.9 | 20.21 | 99.0 |
-| 4 | 24.25 | 41.2 | 165.0 | 39.2 | 20.58 | 194.4 |
-| 8 | 36.70 | 27.2 | 218.0 | 75.6 | 22.43 | 356.7 |
-| 16 | 67.49 | 14.8 | 237.1 | 140.4 | 25.46 | 628.4 |
+| c | NVFP4 ITL ms | NVFP4 agg | FP8 agg | vs FP8 |
+|---:|---:|---:|---:|---:|
+| 1 | 12.18 | **82.1** | 61.5 | **+33.4%** |
+| 2 | 15.57 | **128.5** | 99.8 | **+28.8%** |
+| 4 | 17.11 | **233.8** | 195.9 | **+19.3%** |
+| 8 | 21.79 | **367.1** | 358.0 | **+2.5%** |
+| 16 | 33.87 | **472.4** | 632.5 | −25.3% |
+
+Both arms on the same binary, FP8 re-measured after the change rather than reused.
+Decode graph on (FP8-KV capture landed at `cb3f8a4a9`), per-channel FP8 on Marlin
+(`6f4b413fe`). NVFP4's step cost over 16x concurrency grows 2.8x against FP8's
+1.45x — down from 4.5x before the Marlin port, and the remaining gap at c=16 is
+where the 34% of FP8 calls still on the scalar GEMV sit.
 
 NVFP4 leads FP8 at c=1 (+17.8%) and c=2 (+3.9%) and trails from c=4. The step
 cost against batch is the open item: NVFP4 4.5x over 16x concurrency against
