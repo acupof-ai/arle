@@ -1,6 +1,6 @@
 # Per-channel FP8 on Marlin — CUDA, 2026-08-19
 
-> Status: Landed, **numerics gate pending-remote** (parity harness building on the H20)
+> Status: Landed, **numerics PASS 31/31**; perf pending (serve build blocked, see below)
 
 ## Why
 
@@ -78,9 +78,41 @@ c≥4 ITL falls substantially and c=1 barely moves. If c≥4 does not move,
 `cuda.qwen.fp8_marlin_tensorcore` in `/v1/stats` will be 0 and the arm never
 engaged — a routing miss, not a kernel limit.
 
+## Numerics: 31/31 PASS
+
+`marlin_fp8_parity` on 1xH20, five shape families (q_proj/in_proj_qkvz 12288x5120,
+k_proj/v_proj 1024x5120, o_proj 5120x6144, linear_attn, lm_head 248320x5120) x
+M in {1, 2, 4, 16, 64, 256}:
+
+```
+[q_proj/in_proj_qkvz m=256 n=12288 k=5120] marlin relL2=1.6602e-3 max/rms=8.7266e-3
+    mean(out/ref)=1.000000 | gemv relL2=1.6602e-3 max/rms=8.7266e-3
+    mean(out/ref)=1.000001 | ratio=1.00 PASS
+```
+
+All three silent failure modes are excluded:
+
+| mode | signature | measured |
+|---|---|---|
+| 2^120 not folded in | `mean(out/ref) = 0` | **1.000000** |
+| wrong scale permutation | `mean ≈ 1` but `max/rms` O(1) | 8e-3, the quantisation floor |
+| wrong repack layout | Marlin error >> GEMV error | **ratio = 1.00** |
+
+`ratio = 1.00` was checked for the dead-arm case — the two lanes are not the same
+code path. `mean(out/ref)` differs in the last digit between them (0.999988 vs
+0.999989), so both kernels ran; the errors coincide because they dequantise the
+same E4M3 weights, making the quantisation error common-mode and leaving only
+accumulation order. That is the expected result, not a stuck harness.
+
 ## Pending
 
-Numerics parity, `/v1/stats` engagement check, needle ladder, then the ITL sweep.
-The harness is `crates/infer-cuda/examples/marlin_fp8_parity.rs`; it anchors on an
-f64 reference rather than lane-vs-lane agreement, and fails when Marlin's error is
-many times the GEMV lane's.
+The perf sweep. The serve binary does not currently build — `infer-core` has three
+`RequestState::new` call sites that predate a signature change adding
+`think_end_token_id` / `think_start_token_id` / `max_thinking_budget`
+(`infer-core/src/lib.rs:1197`, `:1212`). Unrelated in-progress work, not touched
+here. The parity harness lives in `infer-cuda` and builds independently, which is
+why the numerics gate could run first.
+
+Once serve builds: `/v1/stats` engagement check
+(`cuda.qwen.fp8_marlin_tensorcore > 0` and `cuda.fp8.gemv` stops growing), needle
+ladder x3, then the ITL sweep against the prediction above.
