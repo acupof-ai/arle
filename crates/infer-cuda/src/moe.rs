@@ -2503,10 +2503,10 @@ mod dsv4_gpu {
         w2: &W4Afp8ExpertWeights,
     ) -> Result<Dsv4W4A16GemvTables> {
         let s13 = w13.scales_gemv.as_ref().ok_or_else(|| {
-            anyhow!("W4AFP8 GEMV tables: no row-major scales (non-NVFP4 checkpoint)")
+            anyhow::anyhow!("W4AFP8 GEMV tables: no row-major scales (non-NVFP4 checkpoint)")
         })?;
         let s2 = w2.scales_gemv.as_ref().ok_or_else(|| {
-            anyhow!("W4AFP8 GEMV tables: no row-major scales (non-NVFP4 checkpoint)")
+            anyhow::anyhow!("W4AFP8 GEMV tables: no row-major scales (non-NVFP4 checkpoint)")
         })?;
         let g = w13.num_experts;
         let i_dim = w13.n / 2;
@@ -2544,7 +2544,7 @@ mod dsv4_gpu {
         let h2d = |v: &[u64]| -> Result<CudaSlice<u64>> {
             ctx.stream
                 .clone_htod(v)
-                .map_err(|e| anyhow!("W4AFP8 GEMV table H2D failed: {e}"))
+                .map_err(|e| anyhow::anyhow!("W4AFP8 GEMV table H2D failed: {e}"))
         };
         let expert_indices: Vec<i32> = (0..g as i32).collect();
         Ok(Dsv4W4A16GemvTables {
@@ -2557,7 +2557,7 @@ mod dsv4_gpu {
             expert_indices: ctx
                 .stream
                 .clone_htod(&expert_indices)
-                .map_err(|e| anyhow!("W4AFP8 expert_indices H2D failed: {e}"))?,
+                .map_err(|e| anyhow::anyhow!("W4AFP8 expert_indices H2D failed: {e}"))?,
             group_size,
         })
     }
