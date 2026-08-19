@@ -23,6 +23,8 @@
 #include <cuda.h>  // Driver API: CUresult / CUDA_ERROR_* (the shim's return type)
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
+#include <cstdio>
+#include <stdexcept>
 
 #ifdef ARLE_DISABLE_MARLIN_SM70
 
@@ -174,9 +176,17 @@ CUresult marlin_w8a16_gemm_cuda(
         false,     // use_atomic_add
         true,      // use_fp32_reduce
         false);    // is_zp_float
+  } catch (const std::exception& e) {
+    // marlin_mm panics (host::Panic/RuntimeCheck throw a PanicError deriving from
+    // std::runtime_error) on an invalid config, and the message carries every
+    // shape and thread-config field that decided it. A C++ exception must not
+    // cross the extern-C boundary (UB) — so map to a code, but print `what()`
+    // first: without it the caller sees only "invalid argument" and has to guess
+    // which of a dozen RuntimeChecks fired.
+    std::fprintf(stderr, "[marlin] w8a16 m=%d n=%d k=%d gs=%d: %s\n", m, n, k, group_size, e.what());
+    return CUDA_ERROR_INVALID_VALUE;
   } catch (...) {
-    // marlin_mm panics (host::Panic/RuntimeCheck throw) on an invalid config.
-    // A C++ exception must not cross the extern-C boundary (UB) — map to a code.
+    std::fprintf(stderr, "[marlin] w8a16 m=%d n=%d k=%d gs=%d: non-std exception\n", m, n, k, group_size);
     return CUDA_ERROR_INVALID_VALUE;
   }
 
@@ -227,7 +237,11 @@ CUresult marlin_fp4_gemm_cuda(
         false,     // use_atomic_add
         true,      // use_fp32_reduce
         false);    // is_zp_float
+  } catch (const std::exception& e) {
+    std::fprintf(stderr, "[marlin] fp4 m=%d n=%d k=%d gs=%d: %s\n", m, n, k, group_size, e.what());
+    return CUDA_ERROR_INVALID_VALUE;
   } catch (...) {
+    std::fprintf(stderr, "[marlin] fp4 m=%d n=%d k=%d gs=%d: non-std exception\n", m, n, k, group_size);
     return CUDA_ERROR_INVALID_VALUE;
   }
 
@@ -276,7 +290,11 @@ CUresult marlin_w4a16_gemm_cuda(
         false,     // use_atomic_add
         true,      // use_fp32_reduce
         false);    // is_zp_float
+  } catch (const std::exception& e) {
+    std::fprintf(stderr, "[marlin] w4a16 m=%d n=%d k=%d gs=%d: %s\n", m, n, k, group_size, e.what());
+    return CUDA_ERROR_INVALID_VALUE;
   } catch (...) {
+    std::fprintf(stderr, "[marlin] w4a16 m=%d n=%d k=%d gs=%d: non-std exception\n", m, n, k, group_size);
     return CUDA_ERROR_INVALID_VALUE;
   }
 
