@@ -180,6 +180,21 @@ pub struct SamplingParams {
     /// capture needs host logits) and speculative decode for this request.
     #[cfg_attr(feature = "serde", serde(default))]
     pub top_logprobs: Option<usize>,
+    /// When set, the sampler returns this token directly, bypassing all
+    /// sampling. Set by the engine to force think-end after a reasoning
+    /// budget; cleared after one use.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub force_next_token: Option<u32>,
+    /// Token that ends a thinking block. When set with `max_thinking_tokens`,
+    /// the engine tracks reasoning tokens and forces this token after the budget.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub think_end_token_id: Option<u32>,
+    /// Token that starts a thinking block (multi-segment thinking re-entry).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub think_start_token_id: Option<u32>,
+    /// Max reasoning tokens before forced think-end. `None` = no budget.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub max_thinking_tokens: Option<usize>,
 }
 
 impl Default for SamplingParams {
@@ -200,6 +215,10 @@ impl Default for SamplingParams {
             logit_bias: Vec::new(),
             n: 1,
             top_logprobs: None,
+            force_next_token: None,
+            think_end_token_id: None,
+            think_start_token_id: None,
+            max_thinking_tokens: None,
         }
     }
 }
@@ -255,11 +274,18 @@ impl SamplingParams {
             // The capture reads host logits, so the request must take the
             // host sampling path.
             top_logprobs,
+            // Bypasses sampling entirely.
+            force_next_token,
+            // Lifecycle config, not logit rewriting.
+            think_end_token_id: _,
+            think_start_token_id: _,
+            max_thinking_tokens: _,
         } = self;
         *temperature <= 0.0
             && grammar_bitmask.is_none()
             && logit_bias.is_empty()
             && top_logprobs.is_none()
+            && force_next_token.is_none()
             && !self.has_penalty()
     }
 }

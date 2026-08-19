@@ -373,6 +373,17 @@ struct RequestState {
     grammar: Option<GrammarHook>,
     submitted_at: std::time::Instant,
     first_token_at: Option<std::time::Instant>,
+    /// Think-end token for reasoning models. When set, the engine tracks
+    /// thinking state and forces this token after `max_thinking_budget`.
+    think_end_token_id: Option<u32>,
+    /// Think-start token (multi-segment thinking re-entry).
+    think_start_token_id: Option<u32>,
+    /// Max reasoning tokens before forced think-end. `None` = no budget.
+    max_thinking_budget: Option<usize>,
+    /// Whether the current token stream is inside a thinking block.
+    in_thinking: bool,
+    /// Tokens generated in the current thinking block.
+    reasoning_token_count: usize,
 }
 
 impl RequestState {
@@ -383,6 +394,9 @@ impl RequestState {
         max_tokens: usize,
         sampling: SamplingParams,
     ) -> Self {
+        let think_end = sampling.think_end_token_id;
+        let think_start = sampling.think_start_token_id;
+        let think_budget = sampling.max_thinking_tokens;
         Self {
             handle,
             prompt_tokens,
@@ -401,6 +415,12 @@ impl RequestState {
             grammar: None,
             submitted_at: std::time::Instant::now(),
             first_token_at: None,
+            think_end_token_id: think_end,
+            think_start_token_id: think_start,
+            max_thinking_budget: think_budget,
+            // Prompt pre-fills <think>, so generation starts in-thinking.
+            in_thinking: think_end.is_some(),
+            reasoning_token_count: 0,
         }
     }
 
@@ -417,6 +437,29 @@ impl RequestState {
             return;
         };
         self.sampling.grammar_bitmask = (g.0)(Some(token));
+    }
+
+    /// Track thinking state and force think-end after the reasoning budget.
+    /// Called after each generated token is committed.
+    fn update_think_state(&mut self, token: u32) {
+        let Some(think_end) = self.think_end_token_id else {
+            return;
+        };
+        if token == think_end {
+            self.in_thinking = false;
+            self.reasoning_token_count = 0;
+            self.sampling.force_next_token = None;
+        } else if Some(token) == self.think_start_token_id {
+            self.in_thinking = true;
+            self.reasoning_token_count = 0;
+        } else if self.in_thinking {
+            self.reasoning_token_count += 1;
+            if let Some(budget) = self.max_thinking_budget
+                && self.reasoning_token_count >= budget
+            {
+                self.sampling.force_next_token = Some(think_end);
+            }
+        }
     }
 
     fn complete_immediately(mut self, finish: FinishReason) -> Self {
@@ -1244,6 +1287,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
                         request.first_token_at = Some(std::time::Instant::now());
                     }
                     request.advance_grammar(token.token);
+                    request.update_think_state(token.token);
                     if let Some(finish) =
                         finish_reason_for(request, &token, &self.model_stop_token_ids)
                     {
@@ -1301,6 +1345,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
                     request.first_token_at = Some(std::time::Instant::now());
                 }
                 request.advance_grammar(token.token);
+                request.update_think_state(token.token);
                 let finished = finish_reason_for(request, &token, &self.model_stop_token_ids);
                 committed.push((request.handle, token));
                 token_idx += 1;

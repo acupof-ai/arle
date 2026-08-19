@@ -126,8 +126,10 @@ impl ChatDelta {
     }
 }
 
-/// Incremental twin of `schema::split_reasoning` for chat SSE deltas: reasoning
-/// until the first `</think>` (dropped; may span push boundaries), content after.
+/// Incremental twin of `schema::split_reasoning` for chat SSE deltas.
+/// State machine over `<think>` / `</think>` markers: reasoning inside a
+/// thinking block, content outside. Handles multi-segment thinking
+/// (`r1</think>c1<think>r2</think>c2`) by re-entering reasoning on `<think>`.
 /// Disabled is a byte-identical passthrough — no scans, no trims.
 pub(crate) struct StreamingReasoningSplitter {
     enabled: bool,
@@ -173,9 +175,6 @@ impl StreamingReasoningSplitter {
                 .into_iter()
                 .collect();
         }
-        if !self.in_reasoning {
-            return self.content(text).into_iter().collect();
-        }
         let mut buf = std::mem::take(&mut self.pending);
         buf.push_str(text);
         if self.at_start {
@@ -189,33 +188,74 @@ impl StreamingReasoningSplitter {
                 buf = rest.to_string();
             }
         }
-        match buf.find(THINK_END) {
-            Some(idx) => {
-                self.in_reasoning = false;
-                let after = buf.split_off(idx + THINK_END.len());
-                buf.truncate(idx);
-                self.reasoning(&buf)
-                    .into_iter()
-                    .chain(self.content(&after))
-                    .collect()
-            }
-            None => {
-                // Hold back the longest suffix that could grow into the closer.
-                let held = (1..THINK_END.len())
-                    .rev()
-                    .map(|len| &THINK_END[..len])
-                    .find(|prefix| buf.ends_with(prefix))
-                    .map_or(0, str::len);
-                self.pending = buf.split_off(buf.len() - held);
-                self.reasoning(&buf).into_iter().collect()
+        let mut deltas = Vec::new();
+        loop {
+            if self.in_reasoning {
+                match buf.find(THINK_END) {
+                    Some(idx) => {
+                        let after = buf.split_off(idx + THINK_END.len());
+                        buf.truncate(idx);
+                        if let Some(d) = self.reasoning(&buf) {
+                            deltas.push(d);
+                        }
+                        self.in_reasoning = false;
+                        buf = after;
+                    }
+                    None => {
+                        // Hold back the longest suffix that could grow into the closer.
+                        let held = (1..THINK_END.len())
+                            .rev()
+                            .map(|len| &THINK_END[..len])
+                            .find(|prefix| buf.ends_with(prefix))
+                            .map_or(0, str::len);
+                        self.pending = buf.split_off(buf.len() - held);
+                        if let Some(d) = self.reasoning(&buf) {
+                            deltas.push(d);
+                        }
+                        break;
+                    }
+                }
+            } else {
+                match buf.find(THINK_START) {
+                    Some(idx) => {
+                        let after = buf.split_off(idx + THINK_START.len());
+                        buf.truncate(idx);
+                        if let Some(d) = self.content(&buf) {
+                            deltas.push(d);
+                        }
+                        self.in_reasoning = true;
+                        buf = after;
+                    }
+                    None => {
+                        // Hold back the longest suffix that could grow into the opener.
+                        let held = (1..THINK_START.len())
+                            .rev()
+                            .map(|len| &THINK_START[..len])
+                            .find(|prefix| buf.ends_with(prefix))
+                            .map_or(0, str::len);
+                        self.pending = buf.split_off(buf.len() - held);
+                        if let Some(d) = self.content(&buf) {
+                            deltas.push(d);
+                        }
+                        break;
+                    }
+                }
             }
         }
+        deltas
     }
 
-    /// Flush any held-back pending as reasoning (truncated-thinking case).
+    /// Flush any held-back pending, labeled by the current phase.
     pub(crate) fn finish(&mut self) -> Option<ChatDelta> {
         let pending = std::mem::take(&mut self.pending);
-        (!pending.is_empty()).then_some(ChatDelta::Reasoning(pending))
+        if pending.is_empty() {
+            return None;
+        }
+        if self.in_reasoning {
+            Some(ChatDelta::Reasoning(pending))
+        } else {
+            Some(ChatDelta::Content(pending))
+        }
     }
 
     /// One-time `trim_start` on the first non-empty emission of each phase,
