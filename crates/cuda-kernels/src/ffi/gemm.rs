@@ -167,6 +167,23 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    /// W4A16 Marlin GEMM: C[m,n] = A[m,k] @ dequant(Marlin-packed W).
+    /// kU4B8 excess-8 INT4 weights, BF16 per-group scales [k/gs, n] permuted.
+    /// Scratch contract matches `marlin_w8a16_gemm_cuda`.
+    pub fn marlin_w4a16_gemm_cuda(
+        a: *const Half,
+        b_packed: *const u32,
+        scales: *const Half,
+        c: *mut Half,
+        c_tmp: *mut f32,
+        workspace: *mut i32,
+        m: i32,
+        n: i32,
+        k: i32,
+        group_size: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     /// Float count `c_tmp` needs for `(m, sms)` (max at m>=64). Size the reusable
     /// scratch with the largest m the decode/prefill loop will pass.
     pub fn marlin_c_tmp_floats(m: i32, sms: i32) -> i32;

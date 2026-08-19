@@ -234,6 +234,55 @@ CUresult marlin_fp4_gemm_cuda(
   return (cudaGetLastError() == cudaSuccess) ? CUDA_SUCCESS : CUDA_ERROR_LAUNCH_FAILED;
 }
 
+// Y[m,n] = X[m,k] @ dequant(W) — BF16 activations, kU4B8 weights (excess-8
+// INT4: nibble - 8), per-group BF16 scales [k/group_size, n] (Marlin-permuted).
+// Same scratch contract as the W8A16 entry point.
+CUresult marlin_w4a16_gemm_cuda(
+    const __nv_bfloat16* A,       // [m, k] row-major (lda = k)
+    const uint32_t* B_packed,     // Marlin-repacked kU4B8
+    const __nv_bfloat16* scales,  // [k/group_size, n] permuted
+    __nv_bfloat16* C,             // [m, n]
+    float* c_tmp,                 // caller-owned fp32-reduce scratch
+    int* workspace,               // caller-owned zeroed int lock buffer
+    int m, int n, int k, int group_size, cudaStream_t stream) {
+  int dev = 0;
+  if (cudaGetDevice(&dev) != cudaSuccess) return CUDA_ERROR_INVALID_DEVICE;
+  int sms = 0;
+  if (!sm_supports_marlin(dev, &sms)) return CUDA_ERROR_NOT_SUPPORTED;
+  if (m == 0) return CUDA_SUCCESS;
+
+  int num_groups = k / group_size;
+
+  try {
+    device::marlin::marlin_mm<__nv_bfloat16>(
+        A, B_packed, C,
+        c_tmp,
+        const_cast<__nv_bfloat16*>(scales),
+        nullptr,   // s2 (global_scale) — unused for kU4B8
+        nullptr,   // zp — has_zp=false
+        nullptr,   // g_idx
+        nullptr,   // perm
+        nullptr,   // a_tmp — has_act_order=false
+        m, n, k,
+        k,         // lda
+        workspace,
+        host::kU4B8,
+        false,     // has_act_order
+        true,      // is_k_full
+        false,     // has_zp
+        num_groups, group_size, dev, stream,
+        -1, -1,    // thread_k/n auto
+        sms,
+        false,     // use_atomic_add
+        true,      // use_fp32_reduce
+        false);    // is_zp_float
+  } catch (...) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+
+  return (cudaGetLastError() == cudaSuccess) ? CUDA_SUCCESS : CUDA_ERROR_LAUNCH_FAILED;
+}
+
 // c_tmp float count for the fp32-reduce path (SGLang gptq_marlin.py:76-81):
 //   sms * min(ceil(m/16)*16, 64) * max_thread_n(256). The Rust scratch allocates
 // the m-independent MAX (m >= 64 → max_m_block = 64) once.
