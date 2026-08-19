@@ -266,28 +266,50 @@ impl CoordinatorHandle {
         self.next_request_id.fetch_add(1, Ordering::Relaxed)
     }
 
-    /// Query rank-0 stats via the relay and convert to a `CounterSnapshot`.
-    /// Falls back to default on any failure (send error, timeout, recv error).
+    /// Broadcast a stats query to all ranks in this TP group, collect their
+    /// responses, and aggregate to a group-level `CounterSnapshot`. Falls back
+    /// to default on any failure (send error, timeout, recv error).
     pub(crate) async fn query_stats(&self, timeout: Duration) -> CounterSnapshot {
+        let ranks = self.collect_wire_stats(timeout).await;
+        crate::multiproc_relay::aggregate_wire_stats(ranks).into_counter_snapshot()
+    }
+
+    /// Broadcast a stats query and collect per-rank [`WireStats`] responses.
+    /// Returns an empty vec on send failure; partial results on timeout.
+    async fn collect_wire_stats(
+        &self,
+        timeout: Duration,
+    ) -> Vec<crate::multiproc_relay::WireStats> {
         let request_id = self.stats_request_id.fetch_add(1, Ordering::Relaxed);
-        let rx = {
+        let (mut rx, expected) = {
             let mut r = self
                 .relay
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let expected = r.worker_count();
             let rx = r.register_stats_awaiter(request_id);
             if r.send_stats_query(request_id).is_err() {
                 r.unregister_stats_awaiter(request_id);
-                return CounterSnapshot::default();
+                return Vec::new();
             }
-            rx
+            (rx, expected)
         };
-        tokio::time::timeout(timeout, rx)
-            .await
-            .ok()
-            .and_then(|r| r.ok())
-            .map(|w| w.into_counter_snapshot())
-            .unwrap_or_default()
+        let mut ranks = Vec::with_capacity(expected);
+        let deadline = tokio::time::Instant::now() + timeout;
+        while ranks.len() < expected {
+            match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(Some(w)) => ranks.push(w),
+                _ => break,
+            }
+        }
+        {
+            let r = self
+                .relay
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            r.unregister_stats_awaiter(request_id);
+        }
+        ranks
     }
 }
 
@@ -1911,27 +1933,13 @@ async fn metrics(
 }
 
 async fn stats(State(state): State<Arc<DpCoordinator>>) -> Result<Json<StatsResponse>, ApiError> {
-    let request_id = state.stats_request_id.fetch_add(1, Ordering::Relaxed);
-    // Register awaiter BEFORE sending to avoid a race with the reader thread.
-    let (rx, send_result) = {
-        let mut relay = state
-            .relay
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let rx = relay.register_stats_awaiter(request_id);
-        let result = relay
-            .send_stats_query(request_id)
-            .map_err(|e| ApiError::internal(e.to_string()));
-        if result.is_err() {
-            relay.unregister_stats_awaiter(request_id);
-        }
-        (rx, result)
-    };
-    send_result?;
-    let wire = tokio::time::timeout(std::time::Duration::from_secs(5), rx)
-        .await
-        .map_err(|_| ApiError::internal("stats query timed out"))?
-        .map_err(|_| ApiError::internal("stats oneshot closed"))?;
+    let ranks = state
+        .collect_wire_stats(std::time::Duration::from_secs(5))
+        .await;
+    if ranks.is_empty() {
+        return Err(ApiError::internal("stats query failed (no rank responded)"));
+    }
+    let wire = crate::multiproc_relay::aggregate_wire_stats(ranks);
     Ok(Json(StatsResponse::from_wire(wire)))
 }
 
