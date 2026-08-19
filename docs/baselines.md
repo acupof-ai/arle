@@ -406,6 +406,40 @@ idle compute.
 
 ---
 
+## DSv4-Flash-W4AFP8 · 2×H20 · TP=2 · eager
+
+### Initial support — runtime `fb0b877d2` (2026-08-19)
+
+NVFP4 checkpoint (E2M1 float4 + E8M0 block scales) converted to W4AFP8
+(signed INT4 + BF16 interleaved scales) at load time on GPU. 4-bit weights
+keep the 167 GB model on 2×96 GB H20 (FP8 path needs 4×). SGLang CUTLASS
+mixed-input grouped GEMM for routed experts; shared expert stays FP8.
+
+Identity:
+
+- Runtime commit `fb0b877d2` (32MB workspace right-size)
+- Model `/data00/DeepSeek-V4-Flash-0731` (166.9 GB NVFP4)
+- GPU: 2×H20 (sm_90, 96 GB), TP=2
+- Server flags: `--tensor-parallel-size 2 --port 30000`
+- Peak VRAM: 95.7 GB/rank (48 slots × 339 MB KV + weights)
+- Load time: ~90s (NVFP4→W4AFP8 per-expert GPU conversion)
+
+`bench_dsv4_trace_http.py`, 5 cases, greedy:
+
+| Case | TTFT (s) | Decode tok/s | Status |
+|---|---:|---:|---|
+| decode64 | 0.10 | 37.0 | 200 |
+| prefill1k | 0.48 | — | 200 |
+| prefill4k | 1.10 | — | 200 |
+| math | 0.08 | 36.0 | 200 (17×23=391, +19=410 ✓) |
+| write_zh | 0.13 | 36.7 | 200 (coherent ✓) |
+
+Prefill throughput: 2109 tok/s (1K), 3647 tok/s (4K).
+
+[Wins entry](experience/wins/2026-08-18-nvfp4-w4afp8-tp2-serve.md)
+
+---
+
 ## Qwen3.6-27B-W4A16 · 1×V100 (sm_70) · eager
 
 **`aec71ef16` (2026-07-21)** — V100 kernel opts + KV pool floor fix. Synthetic

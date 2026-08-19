@@ -130,6 +130,10 @@ The real workload: 32K-token multi-turn agent prompts, not a synthetic short pro
 
 B=1 decode **53 tok/s** (prefill 23 ms). With the DSpark block drafter: B=1 **72.4 tok/s** (+37%, 58.7% acceptance rate); the batched decode lane gains a further **+48%** at c=8.
 
+### DeepSeek-V4-Flash (2×H20, TP=2, W4AFP8 MoE)
+
+NVFP4 checkpoint (E2M1+E8M0) converted to W4AFP8 (INT4+BF16) at load time — 4-bit weights keep the 167 GB model on 2×96 GB H20 (FP8 needs 4×). B=1 decode **37 tok/s**; prefill 1K **0.48s** (2109 tok/s), 4K **1.1s** (3647 tok/s).
+
 ### Against SGLang
 
 Same weights, same GPU, same quantized kernel — SGLang serves a repack of our own checkpoint. Qwen3.6-27B, one H20, 33K prompt, one request at a time.
