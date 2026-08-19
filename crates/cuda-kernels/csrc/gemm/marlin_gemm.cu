@@ -374,10 +374,22 @@ CUresult marlin_w4a16_gemm_cuda(
 // c_tmp float count for the fp32-reduce path (SGLang gptq_marlin.py:76-81):
 //   sms * min(ceil(m/16)*16, 64) * max_thread_n(256). The Rust scratch allocates
 // the m-independent MAX (m >= 64 → max_m_block = 64) once.
+//
+// Scaled by MARLIN_MAX_BLOCKS_PER_SM for the same reason the lock buffer is: the
+// reduce slot is `locks_off * c_size` and `locks_off` reaches `gridDim.x - 1` =
+// sms * blocks_per_sm - 1` (`marlin_template.h`), so an `sms`-slot buffer is
+// written past its end by every block above the first per SM. Upstream sizes it
+// at one block per SM because upstream launches one.
+//
+// Decode survived it: `thread_m_blocks == 1` makes c_size a quarter of the
+// prefill slot, so the sms-sized buffer happens to cover 4 * sms of them.
+// Prefill takes `thread_m_blocks == 4` and overruns at blocks_per_sm >= 2, which
+// is the CUDA_ERROR_ILLEGAL_ADDRESS on any prompt long enough to leave the
+// decode routes — 531 tokens is enough.
 int marlin_c_tmp_floats(int m, int sms) {
   int max_m_block = ((m + 15) / 16) * 16;
   if (max_m_block > 64) max_m_block = 64;
-  return sms * max_m_block * device::marlin::max_thread_n;
+  return sms * MARLIN_MAX_BLOCKS_PER_SM * max_m_block * device::marlin::max_thread_n;
 }
 
 // Lock-buffer int count. Upstream sizes locks at sms * max_blocks_per_sm
