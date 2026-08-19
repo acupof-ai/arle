@@ -63,12 +63,7 @@ def api_chat(prompt: str, max_tokens: int = 32, timeout: int = 600) -> dict:
 
 
 def api_completions(prompt: str, max_tokens: int = 32, timeout: int = 600) -> dict:
-    if TEMPLATE == "dsv4":
-        wrapped = (
-            "<｜begin▁of▁sentence｜>You are a helpful assistant."
-            "<｜User｜>" + prompt + "<｜Assistant｜></think>"
-        )
-    elif TEMPLATE == "qwen3_nonthink":
+    if TEMPLATE == "qwen3_nonthink":
         wrapped = (
             "<|im_start|>user\n" + prompt + "<|im_end|>\n"
             "<|im_start|>assistant\n<think>\n\n</think>\n\n"
