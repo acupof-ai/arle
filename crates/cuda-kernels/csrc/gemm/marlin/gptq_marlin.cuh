@@ -428,9 +428,17 @@ MarlinFuncPtr get_marlin_kernel(
 }
 
 template <typename scalar_t>
+// Resident blocks per SM the search may consider.
+//
 // Resident blocks per SM the search may consider. Above 5 the shared-memory
-// split leaves each block too little to hold a tile at any configuration, so
-// the extra iterations only cost compile-time search.
+// split leaves each block too little to hold a tile at any configuration.
+//
+// Left at 5. A 33K prefill crash (`CUDA_ERROR_INVALID_VALUE` out of `marlin_mm`)
+// was suspected here and is NOT established: pinning to 1 completed the workload
+// but hit zero of the partial-prefix-restore requests that precede every observed
+// crash, so that arm never engaged. Pinning costs 29-42% of decode throughput,
+// which is not a price to pay on an untested hypothesis. See
+// docs/experience/errors/2026-08-19-blocks-per-sm-search-two-latent-bugs.md.
 #ifndef MARLIN_MAX_BLOCKS_PER_SM
   #define MARLIN_MAX_BLOCKS_PER_SM 5
 #endif
@@ -519,6 +527,14 @@ exec_config_t determine_exec_config(
           is_zp_float);
 
       if (kernel == MarlinDefault) continue;
+
+      if (MARLIN_MAX_BLOCKS_PER_SM == 1) {
+        // Upstream policy: the first valid tile wins. Restored alongside the pin
+        // so this is a true revert — capping the bound alone would still select
+        // by waves, which is a different configuration than every gate before
+        // the search was measured on.
+        return exec_config_t{1, th_config};
+      }
 
       // Waves = how many times the whole GPU must be filled to cover the
       // output tiles. Fewer waves means less tail where most SMs idle.
