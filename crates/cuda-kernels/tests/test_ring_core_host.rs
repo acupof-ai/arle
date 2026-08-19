@@ -13,7 +13,14 @@ const SCALE: f32 = 0.5;
 
 type Blocks<'a> = Vec<(&'a [f32], &'a [f32], &'a [usize])>;
 /// q, k, v, q_pos, k_pos, block splits.
-type Fixture = (Vec<f32>, Vec<f32>, Vec<f32>, Vec<usize>, Vec<usize>, Vec<usize>);
+type Fixture = (
+    Vec<f32>,
+    Vec<f32>,
+    Vec<f32>,
+    Vec<usize>,
+    Vec<usize>,
+    Vec<usize>,
+);
 
 fn lcg(state: &mut u64) -> f32 {
     *state = state

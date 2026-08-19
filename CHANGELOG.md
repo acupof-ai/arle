@@ -7,6 +7,7 @@ detail in the linked wins/errors entry. Oldest sections are condensed.
 - [docs/support-matrix.md](docs/support-matrix.md)
 
 ## [Unreleased]
+- **FIX — CP ring FA3 pair offsets are bytes: one dropped `* 2` gave 6.4× wrong training gradients for two days; cp=2 grad_norm 14.01 → 2.15 against cp=1's 2.20** (2026-08-19; `ad1192864`, [wins](docs/experience/wins/2026-08-19-cp-ring-fa3-byte-offset-fix.md), [errors](docs/experience/errors/2026-08-19-cp-training-gradients-regressed-and-the-gate-is-dead.md))
 - **ERROR — CP training gradients are 6.4× off single-card (grad_norm 14.01 vs 2.20, 27B cp=2 seq=32768); the 0.8B CP correctness arm has been unrunnable since FlashQLA went default-on 2026-08-05** (2026-08-19; [errors](docs/experience/errors/2026-08-19-cp-training-gradients-regressed-and-the-gate-is-dead.md), [rows](docs/baselines.md)) — bisect pending
 - **BASELINE (re-anchor) — cp=4 training seq ceiling measured at 229376; seq=131072 step is 17.5× the 2026-08-03 row (3100 s → 177.5 s)** (2026-08-19; `9c2c84675`, [wins](docs/experience/wins/2026-08-19-cp4-seq-ceiling-229376-and-17x-step.md), [rows](docs/baselines.md))
 - **FIX — one prefill dequant arm firing at `M >= 2` cost NVFP4 5× aggregate throughput at c≥2, inverted both spec-decode paths, and crashed the server at 34K: 11.56 G FP8 params re-materialised to BF16 every step** (2026-08-19; [errors](docs/experience/errors/2026-08-19-fp8-dequant-arm-shadows-decode.md), [rows](docs/baselines.md)) — after-arm re-measure pending on the fixed binary
