@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 176" width="760" height="176">
+  <defs>
+    <linearGradient id="ok" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#EDF2FF"/><stop offset="1" stop-color="#DBE4FF"/></linearGradient>
+    <linearGradient id="bad" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#FFF5F5"/><stop offset="1" stop-color="#FFC9C9"/></linearGradient>
+    <linearGradient id="fix" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#FFF9DB"/><stop offset="1" stop-color="#FFE066"/></linearGradient>
+    <linearGradient id="par" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#E6FCF5"/><stop offset="1" stop-color="#96F2D7"/></linearGradient>
+    <linearGradient id="lo" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#FFF4E6"/><stop offset="1" stop-color="#FFD8A8"/></linearGradient>
+  </defs>
+  <rect x="0" y="0" width="760" height="176" fill="#FFFFFF"/>
+  <rect x="8" y="8" width="744" height="160" rx="10" fill="#FFFFFF" stroke="#E03131" stroke-width="2"/>
+  <text x="28" y="42" font-size="17" font-weight="bold" fill="#C92A2A">⑥ 低精度影子副本</text>
+  <rect x="549" y="24" width="188" height="26" rx="13" fill="#FFF5F5" stroke="#E03131"/>
+  <text x="643" y="42" font-size="12.5" font-weight="bold" fill="#C92A2A" text-anchor="middle">开销随主副本精度变 · 有损</text>
+
+  <rect x="28" y="72" width="164" height="42" rx="6" fill="url(#bad)" stroke="#E03131" stroke-dasharray="4 3"/>
+  <text x="110" y="98" font-size="12.5" fill="#C92A2A" text-anchor="middle">主副本 bf16　丢失</text>
+  <rect x="222" y="72" width="140" height="42" rx="6" fill="url(#lo)" stroke="#F08C00"/>
+  <text x="292" y="98" font-size="12.5" fill="#E8590C" text-anchor="middle">影子 INT4</text>
+  <polyline points="370,93 410,93" fill="none" stroke="#F08C00" stroke-width="2"/>
+  <polygon points="406,87 418,93 406,99" fill="#F08C00"/>
+  <rect x="428" y="72" width="120" height="42" rx="6" fill="#FFFFFF" stroke="#F08C00"/>
+  <text x="488" y="98" font-size="12.5" fill="#E8590C" text-anchor="middle">反量化</text>
+  <polyline points="556,93 588,93" fill="none" stroke="#E03131" stroke-width="2"/>
+  <polygon points="584,87 596,93 584,99" fill="#E03131"/>
+  <rect x="604" y="72" width="128" height="42" rx="6" fill="url(#bad)" stroke="#E03131"/>
+  <text x="668" y="98" font-size="12.5" fill="#C92A2A" text-anchor="middle">带量化误差</text>
+  <polyline points="200,93 214,93" fill="none" stroke="#ADB5BD" stroke-width="1.6"/>
+</svg>

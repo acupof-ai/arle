@@ -1,0 +1,41 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 190" width="760" height="190">
+  <defs>
+    <linearGradient id="ok" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#EDF2FF"/><stop offset="1" stop-color="#DBE4FF"/></linearGradient>
+    <linearGradient id="bad" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#FFF5F5"/><stop offset="1" stop-color="#FFC9C9"/></linearGradient>
+    <linearGradient id="fix" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#FFF9DB"/><stop offset="1" stop-color="#FFE066"/></linearGradient>
+    <linearGradient id="par" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#E6FCF5"/><stop offset="1" stop-color="#96F2D7"/></linearGradient>
+    <linearGradient id="lo" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#FFF4E6"/><stop offset="1" stop-color="#FFD8A8"/></linearGradient>
+  </defs>
+  <rect x="0" y="0" width="760" height="190" fill="#FFFFFF"/>
+  <rect x="8" y="8" width="744" height="174" rx="10" fill="#FFFFFF" stroke="#F08C00" stroke-width="2"/>
+  <text x="28" y="42" font-size="17" font-weight="bold" fill="#E8590C">⑨ 跳过空洞</text>
+  <rect x="556" y="24" width="182" height="26" rx="13" fill="#FFF4E6" stroke="#F08C00"/>
+  <text x="647" y="42" font-size="12.5" font-weight="bold" fill="#E8590C" text-anchor="middle">需 kernel 改造 · 分情况</text>
+  <text x="28" y="70" font-size="12.5" font-weight="bold" fill="#087F5B">滑窗层：丢的块在窗口外</text>
+  <rect x="28" y="82" width="34" height="26" rx="3" fill="#F1F3F5" stroke="#CED4DA" stroke-dasharray="3 3"/>
+  <rect x="66" y="82" width="34" height="26" rx="3" fill="#F1F3F5" stroke="#CED4DA" stroke-dasharray="3 3"/>
+  <rect x="104" y="82" width="34" height="26" rx="3" fill="url(#bad)" stroke="#E03131" stroke-dasharray="3 3"/>
+  <rect x="142" y="82" width="34" height="26" rx="3" fill="#F1F3F5" stroke="#CED4DA" stroke-dasharray="3 3"/>
+  <rect x="180" y="82" width="34" height="26" rx="3" fill="#F1F3F5" stroke="#CED4DA" stroke-dasharray="3 3"/>
+  <rect x="218" y="82" width="34" height="26" rx="3" fill="url(#par)" stroke="#0CA678"/>
+  <rect x="256" y="82" width="34" height="26" rx="3" fill="url(#par)" stroke="#0CA678"/>
+  <rect x="294" y="82" width="34" height="26" rx="3" fill="url(#par)" stroke="#0CA678"/>
+  <polyline points="218,118 332,118" fill="none" stroke="#0CA678" stroke-width="2"/>
+  <text x="240" y="134" font-size="11.5" fill="#0CA678">窗口 W 只覆盖这几块</text>
+  <text x="96" y="134" font-size="11.5" fill="#C92A2A">丢的在这外面</text>
+  <text x="28" y="160" font-size="12.5" font-weight="bold" fill="#087F5B">跳过与补上逐 token 相同</text>
+  <polyline points="368,60 368,168" fill="none" stroke="#DEE2E6" stroke-width="1.5"/>
+  <text x="396" y="70" font-size="12.5" font-weight="bold" fill="#C92A2A">全注意力层：丢的块本来有权重</text>
+  <rect x="396" y="102" width="34" height="16" rx="2" fill="url(#ok)" stroke="#4C6EF5"/>
+  <rect x="436" y="92" width="34" height="26" rx="2" fill="url(#ok)" stroke="#4C6EF5"/>
+  <rect x="476" y="78" width="34" height="40" rx="2" fill="url(#ok)" stroke="#4C6EF5"/>
+  <rect x="516" y="88" width="34" height="30" rx="2" fill="url(#bad)" stroke="#E03131" stroke-dasharray="3 3"/>
+  <rect x="556" y="96" width="34" height="22" rx="2" fill="url(#ok)" stroke="#4C6EF5"/>
+  <rect x="596" y="84" width="34" height="34" rx="2" fill="url(#ok)" stroke="#4C6EF5"/>
+  <rect x="636" y="100" width="34" height="18" rx="2" fill="url(#ok)" stroke="#4C6EF5"/>
+  <rect x="676" y="104" width="34" height="14" rx="2" fill="url(#ok)" stroke="#4C6EF5"/>
+  <polyline points="396,120 716,120" fill="none" stroke="#ADB5BD" stroke-width="1.5"/>
+  <text x="533" y="98" font-size="12" font-weight="bold" fill="#C92A2A" text-anchor="middle">δ</text>
+  <text x="396" y="140" font-size="11.5" fill="#868E96">每块在 softmax 里占的注意力质量</text>
+  <text x="396" y="162" font-size="12.5" font-weight="bold" fill="#C92A2A">误差 ≤ M·δ(2−δ)/(1−δ)，δ 可测</text>
+</svg>

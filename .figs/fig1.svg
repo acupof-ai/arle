@@ -1,0 +1,60 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 310" width="760" height="310">
+  <defs>
+    <linearGradient id="ok" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#EDF2FF"/><stop offset="1" stop-color="#DBE4FF"/></linearGradient>
+    <linearGradient id="bad" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#FFF5F5"/><stop offset="1" stop-color="#FFC9C9"/></linearGradient>
+    <linearGradient id="fix" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#FFF9DB"/><stop offset="1" stop-color="#FFE066"/></linearGradient>
+    <linearGradient id="par" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#E6FCF5"/><stop offset="1" stop-color="#96F2D7"/></linearGradient>
+    <linearGradient id="lo" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#FFF4E6"/><stop offset="1" stop-color="#FFD8A8"/></linearGradient>
+  </defs>
+  <rect x="0" y="0" width="760" height="310" fill="#FFFFFF"/>
+  <rect x="8" y="8" width="744" height="294" rx="10" fill="#FFFFFF" stroke="#F08C00" stroke-width="2"/>
+  <text x="28" y="42" font-size="17" font-weight="bold" fill="#E8590C">三类层在同一条 token 轴上的布局完全不同</text>
+  <rect x="558" y="24" width="180" height="26" rx="13" fill="#FFF4E6" stroke="#F08C00"/>
+  <text x="648" y="42" font-size="12.5" font-weight="bold" fill="#E8590C" text-anchor="middle">决定「只补一块」成不成立</text>
+  <text x="28" y="76" font-size="13" font-weight="bold" fill="#C92A2A">全注意力层</text>
+  <rect x="150" y="62" width="46" height="28" rx="3" fill="url(#ok)" stroke="#4C6EF5"/>
+  <rect x="199" y="62" width="46" height="28" rx="3" fill="url(#ok)" stroke="#4C6EF5"/>
+  <rect x="248" y="62" width="46" height="28" rx="3" fill="url(#ok)" stroke="#4C6EF5"/>
+  <rect x="297" y="62" width="46" height="28" rx="3" fill="url(#ok)" stroke="#4C6EF5"/>
+  <rect x="346" y="62" width="46" height="28" rx="3" fill="url(#ok)" stroke="#4C6EF5"/>
+  <rect x="395" y="62" width="46" height="28" rx="3" fill="url(#ok)" stroke="#4C6EF5"/>
+  <rect x="444" y="62" width="46" height="28" rx="3" fill="url(#bad)" stroke="#E03131" stroke-dasharray="3 3"/>
+  <rect x="493" y="62" width="46" height="28" rx="3" fill="url(#ok)" stroke="#4C6EF5"/>
+  <rect x="542" y="62" width="46" height="28" rx="3" fill="url(#ok)" stroke="#4C6EF5"/>
+  <rect x="591" y="62" width="46" height="28" rx="3" fill="url(#ok)" stroke="#4C6EF5"/>
+  <rect x="640" y="62" width="46" height="28" rx="3" fill="url(#ok)" stroke="#4C6EF5"/>
+  <rect x="689" y="62" width="46" height="28" rx="3" fill="url(#ok)" stroke="#4C6EF5"/>
+  <polyline points="150,100 438,100 438,94" fill="none" stroke="#E03131" stroke-width="1.8"/>
+  <polygon points="446,88 436,96 446,96" fill="#E03131"/>
+  <text x="160" y="116" font-size="11.5" fill="#C92A2A">重算依赖左边全部 KV，页都在，可以补</text>
+  <text x="28" y="152" font-size="13" font-weight="bold" fill="#087F5B">滑窗层</text>
+  <rect x="150" y="138" width="46" height="28" rx="3" fill="#F1F3F5" stroke="#CED4DA" stroke-dasharray="3 3"/>
+  <rect x="199" y="138" width="46" height="28" rx="3" fill="#F1F3F5" stroke="#CED4DA" stroke-dasharray="3 3"/>
+  <rect x="248" y="138" width="46" height="28" rx="3" fill="#F1F3F5" stroke="#CED4DA" stroke-dasharray="3 3"/>
+  <rect x="297" y="138" width="46" height="28" rx="3" fill="#F1F3F5" stroke="#CED4DA" stroke-dasharray="3 3"/>
+  <rect x="346" y="138" width="46" height="28" rx="3" fill="#F1F3F5" stroke="#CED4DA" stroke-dasharray="3 3"/>
+  <rect x="395" y="138" width="46" height="28" rx="3" fill="#F1F3F5" stroke="#CED4DA" stroke-dasharray="3 3"/>
+  <rect x="444" y="138" width="46" height="28" rx="3" fill="#F1F3F5" stroke="#CED4DA" stroke-dasharray="3 3"/>
+  <rect x="493" y="138" width="46" height="28" rx="3" fill="#F1F3F5" stroke="#CED4DA" stroke-dasharray="3 3"/>
+  <rect x="542" y="138" width="46" height="28" rx="3" fill="url(#par)" stroke="#0CA678"/>
+  <rect x="591" y="138" width="46" height="28" rx="3" fill="url(#par)" stroke="#0CA678"/>
+  <rect x="640" y="138" width="46" height="28" rx="3" fill="url(#par)" stroke="#0CA678"/>
+  <rect x="689" y="138" width="46" height="28" rx="3" fill="url(#par)" stroke="#0CA678"/>
+  <text x="467" y="157" font-size="15" fill="#0CA678" text-anchor="middle">✓</text>
+  <polyline points="542,176 735,176" fill="none" stroke="#0CA678" stroke-width="2"/>
+  <text x="558" y="192" font-size="11.5" fill="#0CA678">窗口 W</text>
+  <text x="152" y="192" font-size="11.5" fill="#868E96">窗口外的 K 已被环形缓冲覆写，掩码也不看它</text>
+  <text x="28" y="228" font-size="13" font-weight="bold" fill="#E8590C">线性注意力层</text>
+  <polyline points="150,228 735,228" fill="none" stroke="#CED4DA" stroke-width="2"/>
+  <polygon points="158,220 150,228 158,236 166,228" fill="#FFD8A8" stroke="#F08C00"/>
+  <text x="158" y="252" font-size="10.5" fill="#E8590C" text-anchor="middle">快照</text>
+  <polygon points="403,220 395,228 403,236 411,228" fill="#FFD8A8" stroke="#F08C00"/>
+  <text x="403" y="252" font-size="10.5" fill="#E8590C" text-anchor="middle">快照</text>
+  <text x="467" y="214" font-size="15" fill="#E03131" text-anchor="middle">✕</text>
+  <rect x="665" y="214" width="70" height="28" rx="4" fill="url(#lo)" stroke="#F08C00"/>
+  <text x="700" y="233" font-size="11" fill="#E8590C" text-anchor="middle">循环状态</text>
+  <polyline points="403,268 735,268" fill="none" stroke="#F08C00" stroke-width="2"/>
+  <polygon points="723,262 735,268 723,274" fill="#F08C00"/>
+  <text x="411" y="286" font-size="11.5" font-weight="bold" fill="#E8590C">从最近快照重放，上界 8192 token，与空洞长度无关</text>
+  <text x="493" y="252" font-size="10.5" fill="#868E96">没有逐 token 的 KV</text>
+</svg>

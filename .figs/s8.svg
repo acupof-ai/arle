@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 176" width="760" height="176">
+  <defs>
+    <linearGradient id="ok" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#EDF2FF"/><stop offset="1" stop-color="#DBE4FF"/></linearGradient>
+    <linearGradient id="bad" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#FFF5F5"/><stop offset="1" stop-color="#FFC9C9"/></linearGradient>
+    <linearGradient id="fix" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#FFF9DB"/><stop offset="1" stop-color="#FFE066"/></linearGradient>
+    <linearGradient id="par" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#E6FCF5"/><stop offset="1" stop-color="#96F2D7"/></linearGradient>
+    <linearGradient id="lo" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#FFF4E6"/><stop offset="1" stop-color="#FFD8A8"/></linearGradient>
+  </defs>
+  <rect x="0" y="0" width="760" height="176" fill="#FFFFFF"/>
+  <rect x="8" y="8" width="744" height="160" rx="10" fill="#FFFFFF" stroke="#F08C00" stroke-width="2"/>
+  <text x="28" y="42" font-size="17" font-weight="bold" fill="#E8590C">⑧ 异步修复加降级</text>
+  <rect x="531" y="24" width="207" height="26" rx="13" fill="#FFF4E6" stroke="#F08C00"/>
+  <text x="634" y="42" font-size="12.5" font-weight="bold" fill="#E8590C" text-anchor="middle">需 kernel 改造 · 窗口内有损</text>
+
+  <polyline points="40,104 720,104" fill="none" stroke="#ADB5BD" stroke-width="1.6"/>
+  <circle cx="70" cy="104" r="6" fill="#E03131"/>
+  <text x="46" y="84" font-size="12" fill="#C92A2A">t0 缺页</text>
+  <rect x="96" y="88" width="240" height="32" rx="5" fill="url(#bad)" stroke="#E03131"/>
+  <text x="216" y="109" font-size="12.5" fill="#C92A2A" text-anchor="middle">降级窗口：照常出 token</text>
+  <circle cx="366" cy="104" r="6" fill="#F08C00"/>
+  <text x="330" y="84" font-size="12" fill="#E8590C">t1 补齐热插</text>
+  <rect x="392" y="88" width="320" height="32" rx="5" fill="url(#par)" stroke="#0CA678"/>
+  <text x="552" y="109" font-size="12.5" fill="#087F5B" text-anchor="middle">恢复精确</text>
+  <text x="46" y="146" font-size="12.5" font-weight="bold" fill="#C92A2A">t0 到 t1 之间发出的 token 无法撤回</text>
+</svg>
