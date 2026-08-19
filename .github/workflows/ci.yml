@@ -140,11 +140,13 @@ jobs:
           # one broken test strands every later run cold.
           cache-on-failure: true
 
+      # No --lib: it skipped tests/ entirely, and crates/train/tests stayed
+      # broken through a dead-code deletion nobody's lane compiled.
       - name: cargo test (backend)
         run: >-
           cargo test -p infer-api -p arle -p cli -p autograd -p train
           --profile release-fast --no-default-features
-          --features cpu,no-cuda,cli --lib
+          --features cpu,no-cuda,cli
 
   test-neutral:
     name: Test (device-neutral)
