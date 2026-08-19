@@ -284,8 +284,7 @@ The historical caveats still bound any port:
 - The first end-to-end real-spec bench regressed -62.8% because the
  correctness-first verifier ran the target paged decode once per verifier
  position; a packed K+1 verifier (or MagicDec sparse-KV self-spec) is the
- prerequisite for a throughput lift. See
- `docs/experience/errors/2026-05-01-phase2-real-spec-regression.md`.
+ prerequisite for a throughput lift.
 - For Qwen3.5 / Medusa the gate is recurrent-state rollback: paged KV can be
  truncated, but hybrid linear-attention recurrent state needs a model-owned
  accepted-length commit/rollback.

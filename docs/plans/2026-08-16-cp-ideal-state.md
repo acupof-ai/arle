@@ -321,5 +321,5 @@ T3.2+ gates are set with their own designs.
 | T2 | Engine prefill CP (replicated KV) + GDN state relay | needle ×3 cp=2 vs cp=1; 128K prefill ≥1.6× — **accepted 2026-08-16** (1.75×) |
 | T3.1 | B2: CP decode head-sharding across cp group (load-time weight subset, full-head pool at natural offset) | needle ×3 cp=2 vs cp=1 (wash + B2-engaged); 4K decode wash; 128K decode recover 43→~60 at world=2; 256K decode win — **implemented 2026-08-17 (807e6c0b4), pod gate pending** |
 | T3.2 | KV ownership sharding (3 seam-level assumptions, §3.2) + decode merge on comm_stream (§3.3) | capacity past 512K; 256K quant-KV; dated wins entry |
-| T3.4 | Settle CP×quant-KV, CP×spec, CP×recall (§3.4) | per-debt gates |
-| T4 | Cleanup (scalar kernel), GDN a2a scaling decision, cp=4 256K curve; GDR smem-race fix (1f7948070) measured-after pod re-gate before T3 baselines | dated wins/errors entries |
+| T3.4 | Settle CP×quant-KV, CP×spec (§3.4) | per-debt gates |
+| T4 | Cleanup (scalar kernel), GDN a2a scaling decision, cp=4 256K curve; GDR smem-race fix (1f7948070) re-gated on-pod at world=4 (775f7c7b6, needle 12/12 + 128K 1.75×) | dated wins/errors entries |

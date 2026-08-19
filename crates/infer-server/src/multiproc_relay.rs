@@ -618,8 +618,8 @@ pub enum RelayEnvelope {
     /// arrive, so no request is broadcast before the collective has formed.
     EngineReady { rank: usize },
     /// Worker-to-coordinator output for a remote visible-output owner rank.
-    /// `// STAGE 2:` the visible-output owner routing is not wired yet; today
-    /// every worker is a replicated-token follower with no visible output.
+    /// Rank 0 owns the visible output (tracks + emits completions); followers
+    /// discard their own completions and relay rank 0's.
     Completion {
         request_id: u64,
         delta: RelayCompletionDelta,
