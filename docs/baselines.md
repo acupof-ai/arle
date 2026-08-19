@@ -258,6 +258,39 @@ build: TTFT 24.94/24.95 s vs 24.97/25.05, zero fallback lines in the serve log.
 
 ---
 
+## Qwen3.6-27B-FP8 vs Qwen3.8-27B-NVFP4 · 1×H20 · c=1 no-spec decode
+
+### Reference point for the NVFP4 kernel work (2026-08-19)
+
+The 27B FP8 SOTA row above runs DSpark and a long-agent workload, so it is not
+comparable to a short-prompt no-spec decode. This row establishes that
+comparison directly: same box, nothing else resident, same bench invocation,
+the only variable is the checkpoint's quantization.
+
+```bash
+python3 scripts/bench_throughput.py --concurrency-grid 1   --seconds-per-concurrency 30 --max-tokens 128 --temperature 0 --seed 42
+```
+
+Both served with `--kv-cache-dtype fp8`, no spec decode, `ARLE_CUDA_PROFILE=1`.
+Architecturally identical: hidden 5120, intermediate 17408, 64 layers,
+vocab 248320.
+
+| | dense_ffn | forward_hidden | decode | dense_ffn GB/s |
+|---|---:|---:|---:|---:|
+| Qwen3.6-27B-FP8 | 9.84 ms/step | 29.22 ms/step | 33.2 tok/s | 1740 |
+| Qwen3.8-27B-NVFP4 (`cb109750e`) | 23.30 ms/step | 42.26 ms/step | 23.5 tok/s | 413 |
+
+NVFP4 moves 150.4 MB of dense-MLP weights per layer against FP8's 267.5 MB —
+56% of the bytes — so it should be faster, not 2.4x slower. Both formats run
+the same hand-written warp-per-row scalar GEMV at M=1 (FP8 does NOT use
+DeepGEMM there: `qwen_fp8_dense_projection.rs` has an empty policy table and
+its fallback routes m<2 to Gemv), so the gap is entirely inside two
+structurally identical inner loops.
+
+The format-independent ops agree closely across the two runs
+(linear_attention 9.41 vs 9.50 ms, full_attention 3.27 vs 3.26), which is what
+makes the dense_ffn column a clean single-variable comparison.
+
 ## Qwen3.8-27B-NVFP4 · 1×H20 · single-GPU · eager
 
 ### Initial support — runtime `33f4863c7` (2026-08-18)
