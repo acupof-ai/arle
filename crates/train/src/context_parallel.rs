@@ -16,6 +16,8 @@ fn train_mesh(
     attn_cp: usize,
     world_rank: usize,
 ) -> Option<(MultiAxisConfig, RankCoord)> {
+    // PP/EP/MoE-DP are 1 until those axes land in training; cp/dp are the only
+    // CLI-declared axes (--cp-size/--dp-size via ARLE_TRAIN_* env to workers).
     let cfg = MultiAxisConfig {
         tp_size: attn_dp.max(1) * attn_cp.max(1),
         pp_size: 1,
