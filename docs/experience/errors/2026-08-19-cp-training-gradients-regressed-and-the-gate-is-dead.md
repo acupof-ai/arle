@@ -24,6 +24,19 @@ to 3%. **cp=2 does not: loss +7.3%, grad_norm 6.4×.** The 2026-08-05 row
 states "Both ranks print identical loss and grad_norm (post-all-reduce)" at
 10.871086 / 2.263385, so CP agreed with single-card then and does not now.
 
+**The cp curve, same binary, same seq=32768:**
+
+| cp | loss | grad_norm | grad_norm / √cp |
+|---|---:|---:|---:|
+| 1 | 10.870087 | 2.197122 | 2.20 |
+| 2 | 11.664682 | 1.401418e1 | 9.91 |
+| 4 | 11.698947 | 2.025790e1 | 10.13 |
+
+Two distinct faults, not one. The **forward** error appears at cp>1 and does not
+grow with cp (11.665 → 11.699 while cp=1 is 10.870). The **gradient** error
+follows ≈10.0·√cp for cp≥2 — the two `grad_norm/√cp` values agree to 2% — while
+cp=1 sits at 2.20.
+
 The 0.8B correctness model behaves the same way on the single-card side:
 cp=1 grad_norm 3.466840 today against the 2026-08-05 correctness row's
 3.464900 (5.6e-4).
@@ -44,9 +57,14 @@ Unknown. Ruled out by measurement:
   loss/grad_norm are unchanged at 11.665197 / 14.034.
 - **Not the single-card path.** cp=1 reproduces the old numbers on both models.
 
-166 commits touch `crates/train/src`, `crates/autograd/src`, or
-`crates/cuda-kernels/csrc/attention` between the 2026-08-05 rows and
-`9c2c84675`. A bisect over that range is the next step.
+**The baseline's stated commits are not on main.** `docs/baselines.md` cites
+`15caff0d0` and `fa742a038`; neither is an ancestor of HEAD — both live only on
+`fix/qwen35-final-norm-*` branches. The rebased main-side equivalent is
+`ab0f21007` (same subject, same date, and `git diff 15caff0d0 ab0f21007 --
+crates/{train,autograd,cuda-kernels}/src crates/cuda-kernels/csrc` is empty), so
+the anchor holds and the doc's SHAs are wrong.
+
+**17 commits** touch the CP path in `ab0f21007..9c2c84675`. Bisecting them.
 
 ## Why it went unnoticed
 
