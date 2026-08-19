@@ -356,13 +356,19 @@ Identity: model `unsloth/Qwen3.8-27B-NVFP4` (22 GB + 811 MB MTP) · 1×H20
 Qwen3.6-27B-FP8 on GPU1, identical flags and harness invocation. Synthetic
 prompt (mean 8 tokens), `--seconds-per-concurrency 30 --max-tokens 128`.
 
-| c | NVFP4 ITL ms | NVFP4 decode | NVFP4 agg | FP8 ITL ms | FP8 decode | FP8 agg |
+| c | NVFP4 ITL ms | NVFP4 decode | NVFP4 agg | (pre-fix agg) | FP8 ITL ms | FP8 agg |
 |---:|---:|---:|---:|---:|---:|---:|
-| 1 | 15.01 | **66.6** | 66.6 | 17.60 | **56.8** | 56.8 |
-| 2 | 100.59 | 9.9 | 19.9 | 20.21 | 49.5 | 99.0 |
-| 4 | 102.02 | 9.8 | 39.2 | 20.58 | 48.6 | 194.4 |
-| 8 | 105.85 | 9.4 | 75.6 | 22.43 | 44.6 | 356.7 |
-| 16 | 113.95 | 8.8 | 140.4 | 25.46 | 39.3 | 628.4 |
+| 1 | 14.95 | **66.9** | 66.9 | 66.6 | 17.60 | 56.8 |
+| 2 | 19.43 | 51.5 | **102.9** | 19.9 | 20.21 | 99.0 |
+| 4 | 24.25 | 41.2 | 165.0 | 39.2 | 20.58 | 194.4 |
+| 8 | 36.70 | 27.2 | 218.0 | 75.6 | 22.43 | 356.7 |
+| 16 | 67.49 | 14.8 | 237.1 | 140.4 | 25.46 | 628.4 |
+
+NVFP4 leads FP8 at c=1 (+17.8%) and c=2 (+3.9%) and trails from c=4. The step
+cost against batch is the open item: NVFP4 4.5x over 16x concurrency against
+FP8's 1.45x. FP8 is flat because DeepGEMM is a tensor-core GEMM; NVFP4's
+per-channel FP8 weights sit on a batched GEMV whose register pressure scales
+with the tile (`quantized_gemv.cu`), so Marlin `kFE4M3fn` is the next lever.
 
 Long-agent 32K, `bench-agent-32k-16x8.jsonl`, 32 req/point, max_tokens 214,
 no spec, both arms on the same box:
@@ -390,9 +396,9 @@ re-dequantised all 11.56 G FP8 params per call — 84.35 ms per forward. It cost
 the server at 34K on its un-budgeted 2.54 GB scratch. Root cause and fix:
 [errors/2026-08-19-fp8-dequant-arm-shadows-decode.md](experience/errors/2026-08-19-fp8-dequant-arm-shadows-decode.md).
 
-Every cell above is n=1 and measured on the DEFECTIVE build. They are the
-before-arm; the after-arm is pending the fixed binary. No NVFP4 row is eligible
-for SOTA until c≥2 scales and the 32K run completes.
+The concurrency grid is post-fix; the 32K and spec-decode tables above are
+still the pre-fix (defective) build and are re-measuring. Every cell is n=1. No
+NVFP4 row is eligible for SOTA until the 32K run completes.
 
 Superseded rows (9.3 tok/s initial support `33f4863c7`, FP4 GEMV vectorization
 `2a3a2164f`) live in

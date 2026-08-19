@@ -1,6 +1,6 @@
 # One prefill arm ate concurrency, spec decode, and stability — CUDA, 2026-08-19
 
-> Status: Root-caused, fix landed, re-measure pending
+> Status: Root-caused, fixed, D1 gate verified
 
 ## Context
 
@@ -100,6 +100,44 @@ Upgrade path: instantiate Marlin `kFE4M3fn` for per-channel FP8. The vendored
 template already carries `dequant<nv_bfloat162, kFE4M3fn>` and the scalar type;
 only the instantiation is missing, exactly as with `kFE2M1f`. That deletes the
 scratch, the threshold, and D2's accounting exposure together.
+
+## After the fix — D1 gate
+
+Same harness, same box, NVFP4 on the fixed binary. FP8 is the pre-fix binary on
+the same box (its weights are 128x128 block-scaled, so DeepGEMM claims them
+before any arm this commit touched — the path is provably unchanged).
+
+| c | before agg | after agg | | FP8 agg |
+|---:|---:|---:|---:|---:|
+| 1 | 66.6 | 66.9 | unchanged, M=1 never entered the arm | 56.8 |
+| 2 | 19.9 | **102.9** | 5.2x | 99.0 |
+| 4 | 39.2 | **165.0** | 4.2x | 194.4 |
+| 8 | 75.6 | **218.0** | 2.9x | 356.7 |
+| 16 | 140.4 | **237.1** | 1.7x | 628.4 |
+
+c=1 moving 66.6 -> 66.9 is the control: the fix only changes M >= 2, and M=1
+measured within 0.5%.
+
+**A second scaling defect is now visible underneath.** Per-step cost against
+batch:
+
+| | B=1 | B=2 | B=4 | B=8 | B=16 | cost of 16x concurrency |
+|---|---:|---:|---:|---:|---:|---:|
+| NVFP4 ITL ms | 14.95 | 19.43 | 24.25 | 36.70 | 67.49 | **4.5x** |
+| FP8 ITL ms | 17.60 | 20.21 | 20.58 | 22.43 | 25.46 | **1.45x** |
+
+FP8's step is nearly flat in batch because DeepGEMM runs on tensor cores.
+NVFP4's FP8 weights now land on `gemv_fp8_block_scaled_batch_cuda`, whose own
+comment records the ceiling: `TILE == B` means "register pressure == B", and
+above B=8 it falls back to a fixed-8 tile with `grid.y = ceil(B/8)`, re-reading
+the weight. That is the c>=4 bottleneck, and Marlin is flat in M (68.9 us/call
+at both M=1 and M=3 on 34816x5120).
+
+Instantiating Marlin `kFE4M3fn` for per-channel FP8 is therefore not an
+optimisation on top of this fix — it is the only remaining path at c>=4. The
+vendored template already carries `dequant<nv_bfloat162, kFE4M3fn>`
+(`marlin/dequant.h:321`) and the scalar type (`scalar_type.hpp:308`); only the
+instantiation is missing, exactly as with `kFE2M1f`.
 
 ## Rule
 
