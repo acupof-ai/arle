@@ -117,11 +117,25 @@ jobs:
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Cache CUDA toolkit 12.8
+        id: cuda-cache
+        uses: actions/cache@v6
+        with:
+          path: /usr/local/cuda-12.8
+          key: cuda-toolkit-12.8.0
+
       - name: Install CUDA toolkit 12.8
+        if: steps.cuda-cache.outputs.cache-hit != 'true'
         uses: Jimver/cuda-toolkit@v0.2.35
         with:
           cuda: '12.8.0'
           method: network
+
+      - name: Link CUDA
+        run: |
+          sudo ln -sf /usr/local/cuda-12.8 /usr/local/cuda
+          echo "CUDA_PATH=/usr/local/cuda-12.8" >> "$GITHUB_ENV"
+          echo "CUDA_HOME=/usr/local/cuda-12.8" >> "$GITHUB_ENV"
 
       - name: Install Python 3.12
         uses: actions/setup-python@v5
@@ -200,11 +214,25 @@ jobs:
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Cache CUDA toolkit 12.8
+        id: cuda-cache
+        uses: actions/cache@v6
+        with:
+          path: /usr/local/cuda-12.8
+          key: cuda-toolkit-12.8.0
+
       - name: Install CUDA toolkit 12.8
+        if: steps.cuda-cache.outputs.cache-hit != 'true'
         uses: Jimver/cuda-toolkit@v0.2.35
         with:
           cuda: '12.8.0'
           method: network
+
+      - name: Link CUDA
+        run: |
+          sudo ln -sf /usr/local/cuda-12.8 /usr/local/cuda
+          echo "CUDA_PATH=/usr/local/cuda-12.8" >> "$GITHUB_ENV"
+          echo "CUDA_HOME=/usr/local/cuda-12.8" >> "$GITHUB_ENV"
 
       - name: Download exact candidate artifact
         uses: actions/download-artifact@v8
