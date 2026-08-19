@@ -84,7 +84,7 @@ pub fn dequantize_fp4_e2m1_group_host(
             "nvfp4 scale_cols * group_size must equal cols",
         ));
     }
-    if cols % 2 != 0 {
+    if !cols.is_multiple_of(2) {
         return Err(crate::AutogradError::TapeInvariant(
             "nvfp4 cols must be even (two weights per byte)",
         ));
