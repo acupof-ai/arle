@@ -343,7 +343,7 @@ impl Qwen35Model {
         let lm_head = if m.tie_word_embeddings {
             None
         } else {
-            Some(loader.load_matrix_quant_aware(&ctx, m.lm_head_tensor_name())?)
+            Some(loader.load_dense_matrix_quant_aware(&ctx, m.lm_head_tensor_name())?)
         };
         crate::executor::cuda_startup_log(
             "qwen35.embeddings",
@@ -434,7 +434,7 @@ impl Qwen35Model {
                         dt_bias: loader.load_vec_any(&ctx, &lin.dt_bias)?,
                         a_log: loader.load_f32_vec(&ctx, &lin.a_log)?,
                         norm_weight: loader.load_f32_vec(&ctx, &lin.norm)?,
-                        out_proj: loader.load_matrix_quant_aware(&ctx, &lin.out_proj)?,
+                        out_proj: loader.load_dense_matrix_quant_aware(&ctx, &lin.out_proj)?,
                         decode: None,
                     }))
                 }
@@ -1003,7 +1003,7 @@ fn load_linear_qkv_sharded(
     // quant view; head-block sharding for TP>1 is not yet implemented for
     // packed quant (falls through to the BF16 path, which errors clearly).
     if tp.world_size == 1 && loader.quant_view_for(name)?.is_some() {
-        return loader.load_matrix_quant_aware(ctx, name);
+        return loader.load_dense_matrix_quant_aware(ctx, name);
     }
     let tensor = loader.load_raw_tensor(name)?;
     ensure!(
@@ -1291,7 +1291,7 @@ fn load_qwen35_mtp_head(
     Ok(Qwen35MtpHead {
         pre_fc_norm_embedding: loader.load_vec(ctx, &names.pre_fc_norm_embedding)?,
         pre_fc_norm_hidden: loader.load_vec(ctx, &names.pre_fc_norm_hidden)?,
-        fc: loader.load_matrix_quant_aware(ctx, &names.fc)?,
+        fc: loader.load_dense_matrix_quant_aware(ctx, &names.fc)?,
         layer,
         norm: loader.load_vec(ctx, &names.norm)?,
     })
