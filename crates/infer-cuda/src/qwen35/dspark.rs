@@ -1936,7 +1936,7 @@ impl Qwen35Model {
         rows: &mut [super::LinearRow<'_>],
         ws: &mut Qwen35Workspace,
         chains: &[u32],
-        recall: &mut Qwen35RecallForward<'_>,
+        recall: &mut Qwen35PagedForward<'_>,
         taps: &mut Qwen35DsparkTaps,
     ) -> Result<HiddenStates> {
         let seq_len: usize = rows.iter().map(|r| r.len).sum();

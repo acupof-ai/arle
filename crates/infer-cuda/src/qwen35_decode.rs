@@ -11,7 +11,7 @@ impl Qwen35Model {
         slot: &mut Qwen35SlotState,
         ws: &mut Qwen35Workspace,
         start_pos: usize,
-        recall: &mut Qwen35RecallForward,
+        recall: &mut Qwen35PagedForward,
     ) -> Result<()> {
         let mut rows = [LinearRow {
             slot,
@@ -257,8 +257,7 @@ impl Qwen35Model {
                         b,
                         || {
                             self.full_attention_paged(
-                                full_attn, normed, full_idx, pool, meta, None, None, full,
-                                attn_out, None,
+                                full_attn, normed, full_idx, pool, meta, None, None, full, attn_out,
                             )
                         },
                     )?;

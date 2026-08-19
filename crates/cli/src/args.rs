@@ -645,16 +645,6 @@ pub(crate) struct ServeArgs {
     #[arg(long, value_enum, default_value_t = ServeKvCacheDtypeArg::Auto)]
     pub(crate) kv_cache_dtype: ServeKvCacheDtypeArg,
 
-    /// Opt into write-through tiered KV memory ("infinite memory"): HBM is a
-    /// bounded write-through cache, the host tier (DRAM→NVMe) is the source of
-    /// truth. When a session exceeds the GPU working set, decode attends a
-    /// budget-bounded resident subset (sink + top-k mean-key + local) instead of
-    /// the full cache. Metal, and CUDA dense-Qwen3 (eager decode), with
-    /// `--kv-cache-dtype bf16` only; default off → baseline byte-identical.
-    /// See `docs/plans/2026-06-23-writethrough-tiered-kv-memory.md`.
-    #[arg(long, default_value_t = false)]
-    pub(crate) kv_recall: bool,
-
     /// Whole-process memory budget in bytes for unified-memory backends.
     /// Metal applies this before loading weights and clamps KV capacity to fit.
     #[arg(long, value_parser = parse_positive_usize, value_name = "BYTES")]

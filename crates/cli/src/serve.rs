@@ -507,8 +507,6 @@ fn resolve_engine_config(
         config.chunked_prefill_size = Some(config.chunked_prefill_size.map_or(32, |v| v.min(32)));
     }
 
-    config.kv_recall = serve_args.kv_recall;
-
     if let Some(value) = serve_args.max_running_requests {
         config.max_running_requests = Some(value);
     }

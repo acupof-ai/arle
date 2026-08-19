@@ -89,16 +89,11 @@ pub(crate) struct RingPrefillScratch {
 /// Paged full-attn forwarding context for Qwen3.6 — the DEFAULT path since the
 /// shared-paged migration. Each full-attn layer reads/writes the shared
 /// `PagedKVPool` (`full_attn_kv`) over `meta` (the page table) instead of a
-/// per-slot contiguous cache. The default build hands a `for_slot` page table
-/// over the slot's FULL resident pages (full attention, no eviction); the
-/// `--kv-recall` cycle layers a working-set restriction on top of the SAME
-/// pool. `Some` on `layer0_query` opts into the layer-0 post-RoPE query
-/// readback for the recall score — a mid-forward D2H, so only the recall
-/// prefill asks for it.
-pub(crate) struct Qwen35RecallForward<'a> {
+/// per-slot contiguous cache. The page table (`for_slot`) covers the slot's
+/// FULL resident pages: full attention, every page the sequence owns.
+pub(crate) struct Qwen35PagedForward<'a> {
     pub(crate) pool: &'a mut PagedKVPool,
     pub(crate) meta: &'a crate::loader::PageMeta,
-    pub(crate) layer0_query: Option<Vec<f32>>,
     /// `Some` = replicated-KV CP prefill: `meta` is this rank's q-slice, the
     /// forward's token/residual buffers stay full-chunk, and each attention
     /// layer computes only the slice (T2.b). `None` everywhere else.

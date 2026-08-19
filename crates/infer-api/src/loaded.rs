@@ -71,11 +71,6 @@ pub struct EngineLoadConfig {
     /// this is set; server-style defaults leave it off.
     #[serde(default)]
     pub low_impact: bool,
-    /// Opt into session KV-recall ("infinite memory"). Metal-only, bf16-KV only;
-    /// default off → baseline byte-identical. The Metal builder turns it on via
-    /// `MetalExecutor::set_kv_recall`; other backends ignore it.
-    #[serde(default)]
-    pub kv_recall: bool,
     /// Generation-token bound for chat requests that enable thinking
     /// (`chat_template_kwargs.enable_thinking=true`). `0` = off (unbounded),
     /// keeping the chat path byte-identical to before this knob. The OpenAI
@@ -227,7 +222,6 @@ impl Default for EngineLoadConfig {
             system_reserve_bytes: None,
             allow_swap: false,
             low_impact: false,
-            kv_recall: false,
             max_thinking_tokens: 0,
             mem_fraction_static: default_mem_fraction_static(),
             kv_dram: KvTierBudget::default(),
@@ -1465,7 +1459,6 @@ mod backend {
         let num_slots = config.hot_workspace_slots();
         let page_size = config.page_size;
         let low_impact = config.low_impact;
-        let kv_recall = config.kv_recall;
         let resource_plan = infer_metal::plan_resource_budget(
             &resolved,
             infer_metal::MetalResourceRequest {
@@ -1511,7 +1504,6 @@ mod backend {
                         metal_kv_dtype,
                         resource_plan,
                     )?;
-                executor.set_kv_recall(kv_recall);
                 if let Some((root, budget)) = kv_ssd {
                     anyhow::ensure!(
                         executor.set_kv_tier_disk(root, budget, page_size),
@@ -2215,12 +2207,6 @@ mod backend {
         let mut executor = executor;
         // Fail loud on flag+model combos the executor would otherwise silently
         // ignore, BEFORE any budget setter runs.
-        if config.kv_recall {
-            anyhow::ensure!(
-                matches!(kind, CudaModelKind::Qwen3Dense | CudaModelKind::Qwen35),
-                "--kv-recall is not wired for {kind:?}; it would be silently ignored"
-            );
-        }
         if config.cuda.dsv4_decode_reuse {
             anyhow::ensure!(
                 executor.prefix_reuse().is_some(),
@@ -2239,10 +2225,7 @@ mod backend {
         // hook never reached multiproc workers → workers served with a zero-page
         // tier and every demote fell back to recompute). Must follow the budget
         // setters above: the tier-store arms rebuild their store on re-budget,
-        // which would drop an earlier disk attach. Must PRECEDE `set_kv_recall`:
-        // Qwen3.6 lazily builds its recall tier on first enable, and only a disk
-        // root stashed beforehand lets it take the durable prior-session reload
-        // (`tier.load`) instead of a fresh create.
+        // which would drop an earlier disk attach.
         let kv_disk = config.kv_ssd_spill(world, infer_cuda::default_t2_budget_bytes)?;
         if let Some((root, budget)) = &kv_disk {
             anyhow::ensure!(
@@ -2252,14 +2235,9 @@ mod backend {
                  below one page also lands here — raise --kv-disk-limit)"
             );
         }
-        // Session KV-recall ("infinite memory", `--kv-recall`, default off). Off →
-        // the decode hot path is byte-identical (CUDA is the Stable backend). Set
-        // here (the ONE engine constructor every rank uses) so single-GPU + TP
-        // agree, and after the disk attach so the recall tier sees the stash.
-        executor.set_kv_recall(config.kv_recall)?;
         log::info!(
             "KV tiers: dtype={} | L1 mem_fraction_static={} | L2 {dram_rank_bytes}B/rank \
-             (deployment {:?}, world {world}) | L3 {} | features: prefix{}{}",
+             (deployment {:?}, world {world}) | L3 {} | features: prefix{}",
             kv_dtype.label(),
             config.mem_fraction_static,
             config.kv_dram,
@@ -2272,7 +2250,6 @@ mod backend {
             } else {
                 ""
             },
-            if config.kv_recall { ",recall" } else { "" },
         );
         // The DSv4 constructor may clamp slots below the request (dynamic KV
         // mem budget, NCCL min-reduced ⇒ identical on every rank). Scheduler +
