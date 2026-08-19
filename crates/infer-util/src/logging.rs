@@ -193,8 +193,3 @@ pub fn init_stderr_with_prefix(level: &str, prefix: &str) {
         prefix: Some(prefix.to_string()),
     });
 }
-
-/// Initialize logging with defaults (stderr, colored, `"info"`).
-pub fn init_default() {
-    init(LoggingConfig::default());
-}

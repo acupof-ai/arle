@@ -78,6 +78,8 @@ pub use loaded::cuda_model_takes_multiproc_serve;
 #[cfg(feature = "cuda")]
 pub use loaded::{DSV4_AUTO_CONTEXT_CEILING, cuda_model_is_dsv4};
 pub use loaded::{EngineLoadConfig, KvCacheDtype, KvTierBudget};
+#[cfg(feature = "cuda")]
+pub use serve::serve_coordinator_http_dp;
 pub use serve::{
     DEFAULT_MTP_DRAFT_TOKENS, DEFAULT_MTP_DRAFT_TOPK, ServeHttpOptions, ServeSpecOptions,
     ServeSpecType, default_kv_ssd_root, serve_http, validate_kv_ssd_config,
@@ -90,8 +92,6 @@ pub use serve::{
     feature = "cpu"
 ))]
 pub use serve::{ServeThread, bind_and_serve, serve_router_on_thread};
-#[cfg(feature = "cuda")]
-pub use serve::{serve_coordinator_http, serve_coordinator_http_dp};
 pub use serve_engine::ServeInferenceEngine;
 // DSv4 multiproc-serve control-plane relay, re-exported from `infer-server` so
 // the `cli` coordinator/worker scaffold (`cli::serve_multiproc`) reaches it at
@@ -101,7 +101,7 @@ pub use infer_server::{
     BuildIdentity, PendingRelayCoordinator, RelayChannel, RelayCompletionDelta, RelayCoordinator,
     RelayEnvelope, RelayWorker, SamplingDefaults, ServeShutdown, TcpChannel, WireRequest,
     WireStats, build_identity, coordinator_local_router, set_messages_dump_dir,
-    set_sampling_defaults, set_tick_broadcaster,
+    set_sampling_defaults,
 };
 // Per-step student LoRA re-merge contract (OPD P2), re-exported from `infer-cuda`
 // so consumers see them at the `infer-api` surface (mirrors the legacy

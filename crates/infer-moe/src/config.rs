@@ -16,15 +16,6 @@ pub enum ScoringFunc {
 }
 
 impl ScoringFunc {
-    pub fn from_config_str(s: &str) -> Result<Self> {
-        match s {
-            "softmax" => Ok(Self::Softmax),
-            "sigmoid" => Ok(Self::Sigmoid),
-            "sqrtsoftplus" => Ok(Self::SqrtSoftplus),
-            other => bail!("unsupported DSV4 router scoring_func `{other}`"),
-        }
-    }
-
     /// The CUDA `dsv4_route` `scoring_kind` integer for this scoring func.
     #[must_use]
     pub fn scoring_kind(self) -> i32 {
@@ -46,24 +37,10 @@ pub enum TopkMethod {
     NoAuxTc,
 }
 
-impl TopkMethod {
-    /// DSv4 ships `"noaux_tc"`; any plain greedy method maps to [`TopkMethod::Greedy`].
-    pub fn from_config_str(s: &str) -> Result<Self> {
-        match s {
-            "noaux_tc" => Ok(Self::NoAuxTc),
-            "greedy" | "group_limited_greedy" => Ok(Self::Greedy),
-            other => bail!("unsupported MoE topk_method `{other}`"),
-        }
-    }
-}
-
 #[derive(Clone, Debug, PartialEq)]
 pub struct MoeConfig {
     /// Routed experts (one router logit each).
     pub num_experts: usize,
-    /// Always-on shared experts run for every token (Qwen3.6 = 1). They do not
-    /// route.
-    pub num_shared_experts: usize,
     /// Experts selected per token (`num_experts_per_tok`).
     pub top_k: usize,
     /// Scoring function; the selection bias presence comes from `topk_method`.
@@ -100,7 +77,6 @@ impl MoeConfig {
     ) -> Self {
         Self {
             num_experts,
-            num_shared_experts: 1,
             top_k,
             scoring_func: ScoringFunc::Softmax,
             topk_method: TopkMethod::Greedy,
@@ -114,18 +90,18 @@ impl MoeConfig {
 
     /// DSv4 router: `sqrtsoftplus` scoring, `noaux_tc` top-k (selection bias is
     /// a runtime gate tensor, not a config field), config `routed_scaling_factor`,
-    /// `n_shared_experts` always-on. DSv4-Flash ships no group-limited routing.
+    /// DSv4 router: `sqrtsoftplus` scoring, `noaux_tc` top-k (selection bias is
+    /// a runtime gate tensor, not a config field), config `routed_scaling_factor`.
+    /// DSv4-Flash ships no group-limited routing.
     #[must_use]
     pub fn dsv4(
         num_experts: usize,
-        num_shared_experts: usize,
         top_k: usize,
         routed_scaling_factor: f32,
         hidden_size: usize,
     ) -> Self {
         Self {
             num_experts,
-            num_shared_experts,
             top_k,
             scoring_func: ScoringFunc::SqrtSoftplus,
             topk_method: TopkMethod::NoAuxTc,

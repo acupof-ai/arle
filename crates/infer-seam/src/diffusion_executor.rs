@@ -43,16 +43,6 @@ pub struct BufferedDiffusionExecutor<M> {
 
 impl<M> BufferedDiffusionExecutor<M> {
     #[must_use]
-    pub fn new(model: M, base_config: DiffusionGenerationConfig) -> Self {
-        Self {
-            model,
-            base_config,
-            slots: HashMap::new(),
-            cancel: None,
-        }
-    }
-
-    #[must_use]
     pub fn new_with_cancel(
         model: M,
         base_config: DiffusionGenerationConfig,

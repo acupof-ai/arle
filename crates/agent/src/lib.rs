@@ -405,28 +405,6 @@ impl AgentSession {
         .ok_or_else(|| anyhow!("agent turn cancelled"))
     }
 
-    pub fn run_turn_interruptibly<E: InferenceEngine + ?Sized, X: ToolExecutor, P: ToolPolicy>(
-        &mut self,
-        engine: &mut E,
-        user_input: &str,
-        tools: &[ToolDefinition],
-        tool_executor: &X,
-        tool_policy: &P,
-        settings: AgentSettings,
-        cancel: Arc<AtomicBool>,
-    ) -> Result<Option<AgentTurnResult>> {
-        self.run_turn_interruptibly_with_callbacks(
-            engine,
-            user_input,
-            tools,
-            tool_executor,
-            tool_policy,
-            settings,
-            cancel,
-            AgentTurnCallbacks::default(),
-        )
-    }
-
     pub fn run_turn_interruptibly_with_callbacks<
         E: InferenceEngine + ?Sized,
         X: ToolExecutor,

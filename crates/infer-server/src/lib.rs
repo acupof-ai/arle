@@ -35,8 +35,8 @@ use std::time::Instant;
 
 use anyhow::{Result, anyhow};
 use infer_core::{CompletedRequest, Engine, RequestHandle, SchedulerConfig};
-use infer_plan::{ForwardPlan, SamplingParams, SlotToken, StepOutput};
-use infer_seam::{BackendExecutor, KvPool, PollResult};
+use infer_plan::SamplingParams;
+use infer_seam::{BackendExecutor, KvPool};
 
 mod anthropic;
 mod coordinator;
@@ -72,7 +72,7 @@ pub type LocalMultimodalTx = std::sync::mpsc::SyncSender<LocalMultimodalRequest>
 pub(crate) type LocalMultimodalRx = std::sync::mpsc::Receiver<LocalMultimodalRequest>;
 pub use multiproc_relay::{
     PendingRelayCoordinator, RelayChannel, RelayCompletionDelta, RelayCoordinator, RelayEnvelope,
-    RelayWorker, TcpChannel, WireRequest, WireStats, set_tick_broadcaster,
+    RelayWorker, TcpChannel, WireRequest, WireStats,
 };
 pub use schema::{
     ChatContent, ChatContentPart, ChatMessage, CompletionRequest, SamplingDefaults,
@@ -297,19 +297,6 @@ where
     E: BackendExecutor + 'static,
     K: KvPool + 'static,
 {
-    /// Spawn an engine thread and build the engine inside that thread.
-    ///
-    /// This is for backends whose executor owns thread-affine handles. The
-    /// builder itself must be sendable, but the constructed `E` and `K` never
-    /// cross a thread boundary; they are created and consumed by the engine
-    /// thread in place.
-    pub fn spawn_with_engine_builder<B>(builder: B) -> Result<Self>
-    where
-        B: FnOnce() -> Result<Engine<E, K>> + Send + 'static,
-    {
-        Self::spawn_with_engine_builder_and_shutdown(builder, ServeShutdown::new())
-    }
-
     /// Spawn an engine thread, build the engine inside that thread, and observe
     /// `shutdown` for process-level aborts.
     pub fn spawn_with_engine_builder_and_shutdown<B>(
@@ -601,31 +588,10 @@ where
     /// OPD round-loop quiesce: switch the engine to Quiesced (the serve loop
     /// defers new admission) and cancel every in-flight (waiting + active)
     /// request, atomically on the engine thread. Returns how many were
-    /// cancelled. Pairs with [`Self::resume_admissions`], called after the KV
-    /// pool is re-acquired.
+    /// cancelled. Pairs with [`Self::ensure_kv_pool_and_resume_admissions`],
+    /// called after the KV pool is re-acquired.
     pub fn quiesce_admissions(&self) -> Result<usize> {
         self.run_on_engine(quiesce_engine)?
-    }
-
-    /// Re-arm engine serving after the OPD writeback bracket (KV pool
-    /// re-acquired). Idempotent.
-    pub fn resume_admissions(&self) -> Result<()> {
-        self.run_on_engine(|engine| engine.resume_serving())
-    }
-
-    /// Close the submit channel and join the engine thread.
-    ///
-    /// The engine drains its in-flight and waiting work to completion before the
-    /// thread exits, so any tickets already submitted still resolve. Called
-    /// automatically on drop; exposed so callers can observe a panic in the
-    /// engine thread.
-    pub fn shutdown(mut self) -> thread::Result<()> {
-        self.submit_tx.take();
-        self.control_tx.take();
-        match self.join.take() {
-            Some(join) => join.join(),
-            None => Ok(()),
-        }
     }
 }
 
@@ -647,46 +613,6 @@ impl<E: BackendExecutor, K: KvPool> Drop for ServeHandle<E, K> {
 // (ControlMessage is Box<dyn FnOnce+Send>, always Send), Arc<Mutex<_>>, etc.
 // E/K values live exclusively on the engine thread, never moved through the public API.
 unsafe impl<E: BackendExecutor, K: KvPool> Send for ServeHandle<E, K> {}
-
-/// A tiny in-crate executor that echoes each row's input forward by `+1`.
-///
-/// Mirrors the engine-core test mock's token rule so the serve layer can be
-/// exercised end-to-end without a real backend (no MLX, no CUDA): a decode row
-/// emits `last_token + 1`, and a prefill chunk's committed token (on the final
-/// chunk) is `last_prompt_token + 1`. Completion is therefore length-bound by
-/// `max_tokens`, which makes token-count assertions deterministic.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct EchoExecutor;
-
-impl BackendExecutor for EchoExecutor {
-    type Inflight = StepOutput;
-
-    fn submit(&mut self, plan: &ForwardPlan, _kv: &mut dyn KvPool) -> Result<Self::Inflight> {
-        let tokens = plan
-            .prefill_rows
-            .iter()
-            .map(|row| SlotToken {
-                slot: row.slot,
-                token: row.tokens.last().copied().map_or(1, |last| last + 1),
-                logprob: None,
-                top_logprobs: Vec::new(),
-                finish: None,
-            })
-            .chain(plan.decode_rows.iter().map(|row| SlotToken {
-                slot: row.slot,
-                token: row.last_token + 1,
-                logprob: None,
-                top_logprobs: Vec::new(),
-                finish: None,
-            }))
-            .collect();
-        Ok(StepOutput { tokens })
-    }
-
-    fn poll(&mut self, inflight: Self::Inflight) -> Result<PollResult<Self::Inflight>> {
-        Ok(PollResult::Ready(inflight))
-    }
-}
 
 /// Single-process coordinator HTTP router using a local in-process relay.
 ///

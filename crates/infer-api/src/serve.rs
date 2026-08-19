@@ -56,20 +56,6 @@ pub struct ServeHttpOptions {
     pub spec: ServeSpecOptions,
 }
 
-impl ServeHttpOptions {
-    #[must_use]
-    pub fn new(model_path: impl Into<String>, bind: impl Into<String>, port: u16) -> Self {
-        Self {
-            model_path: model_path.into(),
-            bind: bind.into(),
-            port,
-            enable_cuda_graph: true,
-            engine_config: EngineLoadConfig::default(),
-            spec: ServeSpecOptions::default(),
-        }
-    }
-}
-
 /// The L3 (NVMe) KV spill root a bare `--kv-disk` resolves to:
 /// `ARLE_KV_SSD_PATH`, else the platform cache dir.
 #[must_use]
@@ -159,18 +145,6 @@ pub enum ServeSpecType {
     Dspark,
 }
 
-impl ServeSpecType {
-    #[must_use]
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::None => "none",
-            Self::Auto => "auto",
-            Self::Mtp => "mtp",
-            Self::Dspark => "dspark",
-        }
-    }
-}
-
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ServeSpecOptions {
     pub spec_type: ServeSpecType,
@@ -191,13 +165,6 @@ impl ServeSpecOptions {
     #[must_use]
     pub fn mtp_enabled(&self) -> bool {
         self.mtp_draft_tokens.is_some() || self.mtp_draft_topk.is_some()
-    }
-
-    #[must_use]
-    pub fn requested(&self) -> bool {
-        self.spec_type != ServeSpecType::None
-            || self.mtp_draft_model.is_some()
-            || self.mtp_enabled()
     }
 }
 
@@ -294,36 +261,8 @@ pub fn serve_http(
     )
 }
 
-/// Serve the multiproc SPMD coordinator HTTP front door (parent process, no TP
-/// rank). Serves OpenAI v1 via [`infer_server::coordinator_router`] over the
-/// already-accepted `relay`; blocks on an owned tokio runtime until Ctrl-C, like
-/// [`serve_http`]. CUDA-only; TP=1 never reaches here.
-#[cfg(feature = "cuda")]
-pub fn serve_coordinator_http(
-    model_path: &str,
-    bind: &str,
-    port: u16,
-    max_thinking_tokens: usize,
-    relay: infer_server::RelayCoordinator,
-) -> Result<()> {
-    let tokenizer = infer_server::OpenAiTokenizer::from_model_dir(model_path)
-        .with_context(|| format!("coordinator tokenizer load for {model_path}"))?;
-    let model_id = crate::serve_engine::model_id_from_path(model_path);
-    let shutdown = infer_server::ServeShutdown::new();
-    let router = infer_server::coordinator_router(
-        relay,
-        tokenizer,
-        model_id,
-        max_thinking_tokens,
-        None,
-        Some(shutdown.clone()),
-        true,
-    );
-    bind_and_serve(bind, port, router, model_path, shutdown)
-}
-
-/// Multi-group DP variant of [`serve_coordinator_http`]: one relay per TP group,
-/// routed by a least-in-flight [`infer_server::DpCoordinator`].
+/// Multi-group DP variant: one relay per TP group, routed by a
+/// least-in-flight [`infer_server::DpCoordinator`].
 #[cfg(feature = "cuda")]
 pub fn serve_coordinator_http_dp(
     model_path: &str,

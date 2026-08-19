@@ -314,6 +314,7 @@ impl CudaFp8BlockScaledStorage {
 /// [`CudaFp8BlockScaledStorage`], with the group scales in FP8 E4M3 (u8) plus
 /// one per-tensor F32 global scale.
 #[derive(Debug, Clone)]
+#[cfg(feature = "cuda")]
 #[cfg_attr(feature = "no-cuda", allow(dead_code))]
 pub struct CudaFp4E2M1GroupStorage {
     weight: Arc<cudarc::driver::CudaSlice<u8>>,
