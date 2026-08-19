@@ -647,6 +647,14 @@ FlashQLA port (`4846f8046`) replaces.
 
 ## Correctness rows — 0.8B dense, seq=2048 · `15caff0d0` (2026-08-05)
 
+> **STALE AND UNRUNNABLE.** The cp=2/cp=4 arms error today —
+> `flashqla GDN head geometry H=8/Hg=8 not built` — because FlashQLA went
+> default-on at this very commit and has no kernel for the 0.8B's per-rank CP
+> geometry. cp=1 still reproduces (3.466840 vs 3.464900). With the CP arms
+> unable to produce a number, this table stopped gating CP on 2026-08-05; a
+> 6.4× gradient regression got through
+> ([errors](experience/errors/2026-08-19-cp-training-gradients-regressed-and-the-gate-is-dead.md)).
+
 Mean of 3 serial reps per cell, post-all-reduce (all ranks identical). Within-cell
 spread is 5.2e-5 to 2.1e-4 relative across every cell.
 
@@ -666,6 +674,12 @@ scalar path's grows (+1.085e-3 at cp=2 to +1.655e-3 at cp=4). See
 
 4×H20 (97,508 MiB), GPUs 4-7, FA3 engaged, `--synthetic-writeback-seq N`. All
 four ranks bit-identical loss at every passing rung.
+
+> **Resource measurement only.** The CP path produces gradients 6.4× off
+> single-card as of this commit
+> ([errors](experience/errors/2026-08-19-cp-training-gradients-regressed-and-the-gate-is-dead.md)).
+> Walls and peaks are real — same tensors, same kernels — but the loss column
+> and the ceiling are not measurements on a numerically correct path.
 [Entry](experience/wins/2026-08-19-cp4-seq-ceiling-229376-and-17x-step.md).
 
 | seq | RUN_EXIT | forward | fused CE | backward | writeback | peak/rank | loss |
@@ -690,3 +704,4 @@ by more than an order of magnitude.
 | 27B cp=2 seq=131072 | fits — backward peak 94,175 MiB (96.6%), ~3.3 GB headroom (2026-08-02, older commit) |
 | 27B cp=4 seq=131072 | full step ~3100 s, host RSS 170.4 GiB total / ~44.6 GB per rank (2026-08-03, scalar ring, older commit) |
 | 27B cp=8 | unmeasured — only 4 GPUs were free on 2026-08-19 |
+| any cp>1, gradients | **cp=2 grad_norm 1.401418e1 against cp=1's 2.197122 at 27B seq=32768** — CP agreed with single-card on 2026-08-05 (2.263385) and does not now. Not LoRA rank, not FlashQLA; cause unknown, bisect pending ([errors](experience/errors/2026-08-19-cp-training-gradients-regressed-and-the-gate-is-dead.md)) |
