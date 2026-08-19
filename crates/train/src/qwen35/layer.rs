@@ -1,5 +1,7 @@
 //! One transformer layer's residual block, over whichever token span the phase supplies.
 
+use autograd::ops::elementwise::add_consuming_rhs;
+
 use super::*;
 
 impl Qwen35Layer {
@@ -92,7 +94,7 @@ impl Qwen35Layer {
             }
         };
         checkpoint_replay_mem_stage(tape, store, "post_attention");
-        let x = add(x, attn_out, store, tape)?;
+        let x = add_consuming_rhs(x, attn_out, store, tape)?;
         checkpoint_replay_mem_stage(tape, store, "post_attention_residual");
 
         let h = qwen35_rmsnorm(
@@ -138,7 +140,7 @@ impl Qwen35Layer {
             )?
         };
         checkpoint_replay_mem_stage(tape, store, "post_mlp");
-        let out = add(x, mlp_out, store, tape)?;
+        let out = add_consuming_rhs(x, mlp_out, store, tape)?;
         checkpoint_replay_mem_stage(tape, store, "layer_exit");
         Ok(out)
     }
@@ -219,7 +221,7 @@ impl Qwen35Layer {
                 (attn_out, LayerPrefix::Linear(prefix))
             }
         };
-        let x = add(x, attn_out, store, tape)?;
+        let x = add_consuming_rhs(x, attn_out, store, tape)?;
         let h = qwen35_rmsnorm(
             x,
             self.post_attention_layernorm,
@@ -237,7 +239,7 @@ impl Qwen35Layer {
             store,
             tape,
         )?;
-        let next = add(x, mlp_out, store, tape)?;
+        let next = add_consuming_rhs(x, mlp_out, store, tape)?;
         Ok((next, prefix))
     }
 
@@ -304,7 +306,7 @@ impl Qwen35Layer {
                 ));
             }
         };
-        let x = add(x, attn_out, store, tape)?;
+        let x = add_consuming_rhs(x, attn_out, store, tape)?;
         let h = qwen35_rmsnorm(
             x,
             self.post_attention_layernorm,
@@ -322,7 +324,7 @@ impl Qwen35Layer {
             store,
             tape,
         )?;
-        Ok(add(x, mlp_out, store, tape)?)
+        Ok(add_consuming_rhs(x, mlp_out, store, tape)?)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -403,7 +405,7 @@ impl Qwen35Layer {
         trace_forward_component(trace, layer_index, "attention_total", profile.attention);
 
         let started = Instant::now();
-        let x = add(x, attn_out, store, tape)?;
+        let x = add_consuming_rhs(x, attn_out, store, tape)?;
         profile.attention_residual += started.elapsed();
         trace_forward_component(
             trace,
@@ -443,7 +445,7 @@ impl Qwen35Layer {
         trace_forward_component(trace, layer_index, "mlp", profile.mlp);
 
         let started = Instant::now();
-        let out = add(x, mlp_out, store, tape)?;
+        let out = add_consuming_rhs(x, mlp_out, store, tape)?;
         profile.mlp_residual += started.elapsed();
         trace_forward_component(trace, layer_index, "mlp_residual", profile.mlp_residual);
 
@@ -504,7 +506,7 @@ impl Qwen35Layer {
                 tape,
             )?,
         };
-        let x = add(x, attn_out, store, tape)?;
+        let x = add_consuming_rhs(x, attn_out, store, tape)?;
 
         let h = qwen35_rmsnorm(
             x,
@@ -514,7 +516,7 @@ impl Qwen35Layer {
             tape,
         )?;
         let mlp_out = self.forward_mlp(h, cfg, tp, batch, seq_len, mode, store, tape)?;
-        Ok(add(x, mlp_out, store, tape)?)
+        Ok(add_consuming_rhs(x, mlp_out, store, tape)?)
     }
 
     pub(super) fn forward_with_kv_cache(
@@ -564,7 +566,7 @@ impl Qwen35Layer {
                 ));
             }
         };
-        let x = add(x, attn_out, store, tape)?;
+        let x = add_consuming_rhs(x, attn_out, store, tape)?;
 
         let h = qwen35_rmsnorm(
             x,
@@ -583,7 +585,7 @@ impl Qwen35Layer {
             store,
             tape,
         )?;
-        Ok(add(x, mlp_out, store, tape)?)
+        Ok(add_consuming_rhs(x, mlp_out, store, tape)?)
     }
 
     pub(super) fn forward_with_kv_cache_profiled(
@@ -647,7 +649,7 @@ impl Qwen35Layer {
         profile.attention += started.elapsed();
 
         let started = Instant::now();
-        let x = add(x, attn_out, store, tape)?;
+        let x = add_consuming_rhs(x, attn_out, store, tape)?;
         profile.attention_residual += started.elapsed();
 
         let started = Instant::now();
@@ -674,7 +676,7 @@ impl Qwen35Layer {
         profile.mlp += started.elapsed();
 
         let started = Instant::now();
-        let out = add(x, mlp_out, store, tape)?;
+        let out = add_consuming_rhs(x, mlp_out, store, tape)?;
         profile.mlp_residual += started.elapsed();
 
         Ok((out, profile))

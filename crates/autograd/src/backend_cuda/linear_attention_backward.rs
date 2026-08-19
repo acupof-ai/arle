@@ -265,7 +265,8 @@ pub(super) fn cuda_linear_attention_backward_device_row(
         let a_bf16 = backend.local_f32_as_bf16(a_proj, head_len)?;
         let dt_bf16 = backend.local_f32_as_bf16(dt_bias, p.num_value_heads)?;
 
-        let q_len = p.seq_len * p.num_value_heads * p.key_dim;
+        // FlashQLA keeps q/k on the key-head axis; only dq/dk carry the value-head one.
+        let q_len = p.seq_len * p.num_key_heads * p.key_dim;
         let v_len = p.seq_len * p.num_value_heads * p.value_dim;
         let a_len = p.seq_len * p.num_value_heads * 64;
         let alloc_u16 = |len: usize, what: &'static str| {
@@ -313,8 +314,8 @@ pub(super) fn cuda_linear_attention_backward_device_row(
             let (g_ptr, _g_guard) = g_re.device_ptr_mut(&backend.stream);
             let (beta_ptr, _beta_guard) = beta_re.device_ptr_mut(&backend.stream);
             check_cuda_ffi(
-                // SAFETY: same shapes as the forward's prep — q/k [S,Hg,key_dim] inside the
-                // q_len allocation, v v_len, g/beta head_len.
+                // SAFETY: same shapes as the forward's prep — q/k [S,Hg,key_dim] = q_len,
+                // v v_len, g/beta head_len.
                 unsafe {
                     ffi::gdr_fq_prep_cuda(
                         qkv_conv_ptr as *const ffi::Half,
