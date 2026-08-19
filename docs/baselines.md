@@ -384,10 +384,10 @@ NVFP4 leads by 16.5% at c=1 and trails 4.3% at c=4. The gap is far narrower than
 on an 8-token prompt because attention dominates at 33K and is format-independent
 — the short-prompt grid measures the weight-read path almost alone.
 
-**The NVFP4 rows require `MARLIN_MAX_BLOCKS_PER_SM` pinned to 1.** With the
-blocks-per-SM search at 5 the server dies partway through c=1 on a
-`CUDA_ERROR_INVALID_VALUE` out of `marlin_mm`; pinning costs 29-42% of decode
-throughput and is the only configuration that completes this workload today. See
+**These rows were taken with `MARLIN_MAX_BLOCKS_PER_SM` pinned to 1, but that is
+not established as necessary.** The run completed 64/64 and hit zero partial
+prefix restores — the condition present at both crashes — so it does not show
+that pinning fixes anything. Pinning costs 29-42% of decode throughput. See
 [errors/2026-08-19-blocks-per-sm-search-two-latent-bugs.md](experience/errors/2026-08-19-blocks-per-sm-search-two-latent-bugs.md).
 
 Spec decode, synthetic prompt, c=1:
