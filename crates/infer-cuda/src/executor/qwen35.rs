@@ -92,7 +92,7 @@ pub(crate) struct Qwen35CudaExecutor {
     slots: Vec<crate::qwen35::Qwen35SlotState>,
     /// Whole-slot capacity spill: a parked request's snapshot, restored byte-exact on
     /// resume. Keyed by the engine session key — a namespace disjoint from
-    /// the write-through `tier_block_u64(slot, page)` keys.
+    /// the write-through `(slot, page)` keys.
     slot_tier: KvTierStore,
     /// Free-list of detached recurrent blocks (~147 MiB each), so only ACTIVE slots
     /// hold a block rather than all `num_slots`.
@@ -121,16 +121,13 @@ pub(crate) struct Qwen35CudaExecutor {
     /// Stored so `ensure_kv_pool` rebuilds the pool with the same format after release.
     kv_format: KVFormat,
     /// L3 write-through tier: source of truth for evict-dropped middle blocks, sized to
-    /// ONE pool page image. Keyed by `tier_block_u64(slot, page)`, so slot A never
+    /// ONE pool page image. Keyed by `(slot, page)`, so slot A never
     /// prefetches slot B's KV.
     /// One-step eviction keepalive: a page dropped at step N is parked here until the
     /// start of step N+1, so `alloc_tokens` can never hand the in-flight attention's
     /// page to the new token. Holds (logical, physical).
     /// Per-rank L2 byte budget (`--kv-dram` ÷ world size).
 
-    /// Stamped into the durable recall manifest so a restart drops stale KV after an
-    /// OPD weight update.
-    weights_epoch: String,
     /// NVMe root for durable recall spill (`--kv-disk`).
     disk_root: Option<std::path::PathBuf>,
     /// Budget bytes for durable NVMe recall spill (`--kv-disk-limit`).
@@ -778,7 +775,6 @@ impl Qwen35CudaExecutor {
             && model.tp.is_single()
             && model.decode_graph_unsupported_reason().is_none();
         let model_path_buf = model_path.as_ref().to_path_buf();
-        let weights_epoch = kv_native_sys::weights_epoch_tag(&model_path_buf);
         let executor = Self {
             model,
             slots,
@@ -793,7 +789,6 @@ impl Qwen35CudaExecutor {
             batch_decode: None,
             full_attn_kv: Some(full_attn_kv),
             kv_format,
-            weights_epoch,
             disk_root: None,
             disk_budget: None,
             kv_pool_sized_pages,

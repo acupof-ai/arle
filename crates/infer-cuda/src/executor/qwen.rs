@@ -25,7 +25,6 @@ pub(crate) struct QwenCudaExecutor {
     /// scalar. A new page count recaptures.
     graphs: Option<GraphBucket>,
     tier_budget_bytes: usize,
-    weights_epoch: String,
     disk_root: Option<std::path::PathBuf>,
     disk_budget: Option<usize>,
 }
@@ -101,7 +100,6 @@ impl QwenCudaExecutor {
             "CudaExecutor requires at least one KV page"
         );
 
-        let weights_epoch = kv_native_sys::weights_epoch_tag(model_path.as_ref());
         let model = CudaModel::from_safetensors(model_path.as_ref())?;
         let kv_format = kv_dtype.kv_format();
 
@@ -184,7 +182,6 @@ impl QwenCudaExecutor {
             decode_ctx: None,
             graphs: None,
             tier_budget_bytes,
-            weights_epoch,
             disk_root: None,
             disk_budget: None,
         })
@@ -318,13 +315,13 @@ impl QwenCudaExecutor {
     /// `key`, so a later evict-drop of that page is free (the tier keeps the
     /// source of truth). Reuses the same `KvTierStore` as the prefix tier —
     /// there is ONE session-keyed store (R5), not a parallel one. `key` is a
-    /// `(session, block)` pair flattened to the store's `u64` namespace by
-    /// [`tier_block_u64`].
+    /// `(session, block)` pair flattened to the store's `u64` namespace.
     ///
     /// Synchronous today (the copy is complete on return, matching
     /// `demote_prefix_pages`); R4's side-stream async mirror is the remaining perf
     /// step — see the pending-remote wins entry. Returns `false` (page not
     /// mirrored, MUST NOT be evict-dropped) when the tier is full.
+    #[allow(dead_code)] // WIP: R4 side-stream async mirror not yet wired
     pub(crate) fn write_through(&mut self, key: u64, page: u32) -> Result<bool> {
         if self.tier.is_full() {
             return Ok(false);
@@ -587,7 +584,7 @@ impl QwenCudaExecutor {
     fn submit_decode_batch(
         &mut self,
         decode_rows: &[DecodeRow],
-        host_kv: &mut dyn KvPool,
+        _host_kv: &mut dyn KvPool,
         kv_batch: &KvBatchDescriptor,
     ) -> Result<Vec<SlotToken>> {
         let batch = decode_rows.len();

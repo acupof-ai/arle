@@ -191,6 +191,7 @@ pub(crate) struct Dsv4MoeLayer {
     pub w4a16_gemv_tables: std::sync::OnceLock<Option<crate::moe::Dsv4W4A16GemvTables>>,
     /// W4AFP8 GEMV decode lane tables, built lazily on first decode-band forward.
     /// Reuses the W4A16 GEMV kernel with BF16 activations (skips FP8 quant).
+    #[allow(dead_code)] // W4AFP8 decode lane not yet wired to forward
     pub w4afp8_gemv_tables: std::sync::OnceLock<Option<crate::moe::Dsv4W4A16GemvTables>>,
 }
 

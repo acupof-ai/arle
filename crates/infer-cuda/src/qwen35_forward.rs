@@ -801,10 +801,6 @@ impl Qwen35Model {
         self.local_kv_heads
     }
 
-    pub(crate) fn local_q_heads(&self) -> usize {
-        self.local_q_heads
-    }
-
     /// Run the full forward over `tokens` and return the FULL `[seq_len, vocab]`
     /// logits (every row, not just the last) WITHOUT sampling. Mirrors
     /// [`Self::forward_tokens`]'s layer stack but, instead of slicing the last

@@ -130,7 +130,7 @@ fn alloc_neg1_i32(
 
 #[cfg(feature = "cuda")]
 mod gpu {
-    use anyhow::{Result, anyhow, ensure};
+    use anyhow::{Result, ensure};
     use cuda_kernels::moe;
     use cuda_kernels::prelude::{DeviceContext, DeviceMatrix, HiddenStates, RawDevicePtr};
     use cuda_kernels::tensor::WeightFormat;
@@ -1803,7 +1803,7 @@ mod gpu {
 #[cfg(feature = "cuda")]
 #[allow(dead_code)]
 mod dsv4_gpu {
-    use anyhow::{Result, anyhow, ensure};
+    use anyhow::{Result, ensure};
     use cuda_kernels::moe;
     use cuda_kernels::prelude::{DeviceContext, HiddenStates};
     use cuda_kernels::tensor::{Dsv4Fp8DeepGemmWeightCache, cache_ptr};
