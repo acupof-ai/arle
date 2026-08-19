@@ -2812,11 +2812,17 @@ impl DeviceMatrix {
     /// (compressed-tensors nvfp4-pack-quantized): transpose the packed E2M1
     /// nibbles into GPTQ `[K/8, N]` i32, GPU-repack to Marlin tiles, and
     /// re-encode the FP8 E4M3 group scales into the S0E5M3 form Marlin's FP8
-    /// scale dequant expects. Stores into `marlin_packed` (weights),
-    /// `qscale_fp8` (scales, overwritten) and `marlin_scales` (the single BF16
-    /// global scale). No-op (leaves `marlin_packed` None → scalar GEMV
-    /// fallback) when the shape or group size is outside the kFE2M1f kernel's
+    /// scale dequant expects. `marlin_packed` holds both, concatenated —
+    /// `[K*N/2 weight bytes][N*K/16 scale bytes]`, one allocation because the
+    /// two are always read together — and `marlin_scales` the single BF16
+    /// global scale. No-op (leaves `marlin_packed` None → scalar GEMV fallback)
+    /// when the shape or group size is outside the kFE2M1f kernel's
     /// instantiation. SM-gated by the caller (Ampere+).
+    ///
+    /// The source `qweight_u8` / `qscale_fp8` / `scale_f32` stay resident:
+    /// Marlin loses to dequant→cuBLAS above M≈1024 (measured on H20), so the
+    /// 2048-token prefill chunk keeps reading them. That costs ~1.13x the
+    /// packed-weight VRAM.
     ///
     /// Scale encoding (vLLM `marlin_utils_fp4.nvfp4_marlin_process_scales`):
     /// the kernel's weight dequant leaves a 2^-126 factor and the scale dequant
@@ -2897,10 +2903,12 @@ impl DeviceMatrix {
             .clone_htod(gptq_bytes)
             .map_err(|e| anyhow!("H2D NVFP4 GPTQ: {}", e))?;
 
-        // Marlin output: [K/16, N*2] i32 = K*N/8 i32 = K*N/2 bytes.
+        // Marlin weight: [K/16, N*2] i32 = K*N/8 i32 = K*N/2 bytes, then the
+        // S0E5M3 scale bytes in the tail of the same allocation.
+        let weight_bytes = k * n / 2;
         let mut marlin_gpu: CudaSlice<u8> = ctx
             .stream
-            .alloc_zeros(k * n / 2)
+            .alloc_zeros(weight_bytes + n * (k / 16))
             .map_err(|e| anyhow!("Alloc NVFP4 Marlin: {}", e))?;
         {
             let (gptq_ptr, _g1) = gptq_gpu.device_ptr(&ctx.stream);
@@ -2966,10 +2974,12 @@ impl DeviceMatrix {
             let v = if v < 2.0 { 0.0 } else { v };
             *dst = (f16::from_f32(v).to_bits() >> 7) as u8;
         }
-        let scales_gpu: CudaSlice<u8> = ctx
-            .stream
-            .clone_htod(&sbytes)
-            .map_err(|e| anyhow!("H2D NVFP4 Marlin scales: {}", e))?;
+        {
+            let mut tail = marlin_gpu.slice_mut(weight_bytes..weight_bytes + sbytes.len());
+            ctx.stream
+                .memcpy_htod(sbytes.as_slice(), &mut tail)
+                .map_err(|e| anyhow!("H2D NVFP4 Marlin scales: {}", e))?;
+        }
 
         // Step 3: global scale, pre-multiplied by the 2^119 dequant bias.
         let global = bf16::from_f32(
@@ -2981,13 +2991,7 @@ impl DeviceMatrix {
             .map_err(|e| anyhow!("H2D NVFP4 Marlin global scale: {}", e))?;
 
         self.marlin_packed = Some(marlin_gpu);
-        self.qscale_fp8 = Some(scales_gpu);
         self.marlin_scales = Some(global_gpu);
-        // Marlin consumes only marlin_packed/qscale_fp8/marlin_scales; drop the
-        // source nibbles and global scale to realize the VRAM win.
-        self.qweight_u8 = None;
-        self.scale_f32 = None;
-
         Ok(())
     }
 

@@ -5,7 +5,7 @@
 // cudarc + extern "C", none of that. This header reproduces ONLY the symbols the
 // device kernels and the device::marlin::marlin_mm / repack host bodies actually
 // reference — everything else in utils.cuh is TVM-FFI plumbing we replace with the
-// extern "C" shim in marlin_w8a16.cu.
+// extern "C" shim in marlin_gemm.cu.
 //
 // Provided here:
 //   - type aliases fp16_t / bf16_t / fp16x2_t / bf16x2_t / fp32_t

@@ -19,6 +19,14 @@ mod qwen_fp8_dense_policy {
 /// small batches (DSpark verify, MoE expert routing).
 const QWEN_FP8_DEQUANT_GEMM_MIN_M: usize = 2;
 
+/// Largest M where the NVFP4 Marlin GEMM beats dequant→BF16 cuBLAS. Measured
+/// cold on 1xH20 (sm_90) at the 27B dense MLP shapes: Marlin is 96% faster at
+/// M=1, 57% at 256, 4-10% at 1024, and 12-21% SLOWER at 2048 — Marlin
+/// re-dequantizes per tile while the cuBLAS path pays the dequant once and then
+/// runs a pure BF16 GEMM. The default prefill chunk is 2048, so it stays on the
+/// cuBLAS path.
+const QWEN_FP4_MARLIN_MAX_M: usize = 1024;
+
 #[derive(Default)]
 struct QwenFp8DenseScratch {
     input_fp8: Option<CudaSlice<u8>>,
@@ -693,30 +701,34 @@ fn try_w8a16_marlin_gemm_batch(
 }
 
 /// NVFP4 Marlin tensor-core GEMM (Ampere+): C[m,n] = X[m,k] @ dequant(W). Fires
-/// when the SM gate is on AND the weight was Marlin-repacked at load
-/// (`marlin_packed`/`marlin_scales` present, set by `repack_for_marlin_fp4`).
-/// Supersedes both the scalar FP4 GEMV (decode) and the dequant→cuBLAS fallback
-/// (prefill). Returns false (→ existing fallbacks) when off or not prepacked.
+/// when the SM gate is on, the weight was Marlin-repacked at load
+/// (`marlin_packed`/`marlin_scales` present, set by `repack_for_marlin_fp4`),
+/// and M is inside the window where Marlin beats dequant→cuBLAS. Supersedes the
+/// scalar FP4 GEMV in that window. Returns false (→ existing fallbacks)
+/// otherwise.
 fn try_fp4_marlin_gemm_batch(
     ctx: &DeviceContext,
     weight: &DeviceMatrix,
     x: &HiddenStates,
     out: &mut HiddenStates,
 ) -> Result<bool> {
-    if weight.weight_format != WeightFormat::Fp4E2M1Group || !marlin_sm_supported(ctx) {
+    if weight.weight_format != WeightFormat::Fp4E2M1Group
+        || !marlin_sm_supported(ctx)
+        || x.seq_len > QWEN_FP4_MARLIN_MAX_M
+    {
         return Ok(false);
     }
-    let (Some(packed), Some(scales), Some(global)) = (
-        weight.marlin_packed.as_ref(),
-        weight.qscale_fp8.as_ref(),
-        weight.marlin_scales.as_ref(),
-    ) else {
+    let (Some(packed), Some(global)) =
+        (weight.marlin_packed.as_ref(), weight.marlin_scales.as_ref())
+    else {
         return Ok(false); // not repacked (unaligned shape / gs != 16) → fallback
     };
     let n = weight.rows; // output dim
     let k = weight.cols; // contraction
     let (packed_ptr, _gp) = packed.device_ptr(&ctx.stream);
-    let (scales_ptr, _gs) = scales.device_ptr(&ctx.stream);
+    // The S0E5M3 group scales sit in the tail of the same allocation; see
+    // `repack_for_marlin_fp4`.
+    let scales_ptr = packed_ptr + (n * k / 2) as u64;
     let (global_ptr, _gg) = global.device_ptr(&ctx.stream);
     let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
     let (out_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
@@ -999,15 +1011,15 @@ pub(super) fn gemm_batch(
     }
 
     // NVFP4 tensor-core (Ampere+): Marlin GEMM when the weight was repacked at
-    // load. Same supersession as W8A16 — both the dequant→cuBLAS prefill path and
-    // the scalar FP4 GEMV below. Returns false when not repacked.
+    // load AND M is inside the window where it beats the dequant→cuBLAS path
+    // below. Supersedes the scalar FP4 GEMV there. False when not repacked.
     if try_fp4_marlin_gemm_batch(ctx, weight, x, out)? {
         return Ok(());
     }
 
-    // NVFP4 large-M (prefill) fallback for weights Marlin could not take:
-    // dequant FP4→BF16 once + one cuBLAS GEMM, instead of the per-token weight
-    // re-read of the batched GEMV below.
+    // NVFP4 large-M (prefill): dequant FP4→BF16 once + one cuBLAS GEMM, instead
+    // of the per-token weight re-read of the batched GEMV below. Also the
+    // fallback for weights Marlin could not repack.
     if try_fp4_dequant_bf16_gemm_batch(ctx, weight, x, out)? {
         return Ok(());
     }
@@ -1290,12 +1302,10 @@ pub(super) fn gemv(
                     weight.cols,
                     weight.group_size
                 );
-                let qw = weight.qweight_u8.as_ref().ok_or_else(|| {
-                    anyhow!(
-                        "fp4_e2m1_group missing qweight_u8 — a Marlin-repacked weight \
-                         reached the single-token gemv path; route it through gemm_batch"
-                    )
-                })?;
+                let qw = weight
+                    .qweight_u8
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("fp4_e2m1_group missing qweight_u8"))?;
                 let scales = weight
                     .qscale_fp8
                     .as_ref()
