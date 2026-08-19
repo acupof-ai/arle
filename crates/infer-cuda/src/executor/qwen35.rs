@@ -2102,10 +2102,18 @@ impl Qwen35CudaExecutor {
         position: u64,
         host_kv: &dyn KvPool,
     ) -> Result<Option<(u32, Option<f32>)>> {
-        if !self.decode_graph_armed
-            || !self.paged_kv_bf16()
-            || !self.model.paged_decode_fa3_active()
-        {
+        // BF16 captures the FA3 lane, whose scheduling ceiling `seqlen_k_capture`
+        // pins. FP8/INT8 capture the split-KV lane instead: its grid is
+        // `(num_splits, total_q_heads)` and `choose_decode_num_splits` takes no KV
+        // length, so the grid is fixed at B=1; the true length is read on device
+        // from `kv_indptr`, and the workspace is pool-owned. INT4/TurboQuant have
+        // no such decode kernel and stay eager.
+        let capturable = match self.full_attn_kv.as_ref().map(|p| p.format) {
+            Some(KVFormat::BF16) => self.model.paged_decode_fa3_active(),
+            Some(KVFormat::FP8E4M3 | KVFormat::INT8) => true,
+            _ => false,
+        };
+        if !self.decode_graph_armed || !capturable {
             return Ok(None);
         }
         if row.kv_seq_len + 1 > self.model.max_seq_len() {
@@ -2145,6 +2153,7 @@ impl Qwen35CudaExecutor {
                     &self.model.ctx,
                     pool.page_size,
                     capacity,
+                    pool.format,
                 )?),
             };
             meta.refresh_decode(&self.model.ctx, pool, slot, row.kv_seq_len)?;
