@@ -26,12 +26,13 @@ private duplicate configs.
 
 | Axis | Core landed + CPU-gated | Pending-remote (pod NCCL) |
 |---|---|---|
-| **Mesh** | `train_mesh()` → `MultiAxisConfig`+`RankCoord`; `CpContext`/`TpContext`/`DpContext`/`PpContext` are derived views, one source of truth | — |
+| **Mesh** | `train_mesh()` → `MultiAxisConfig`+`RankCoord`; `CpContext`/`TpContext`/`DpContext` are derived views, one source of truth | — |
 | **CP** | ring attention is the CP full-attn path (`cp_causal_sdpa`, `BackwardOp::RingAttention`) — device fwd-merge + finalize + bwd kernels (`ring_block_attention.cu`), wired in `qwen35.rs`, replacing the option-B all-gather (deleted). Sequence sharded **zigzag** load-balanced (`SeqShard`, front+back chunk pair); the ring masks causally by per-row absolute position so the two chunks attend the right prefix. Linear-attn CP is **all-to-all-to-head** (`linear_attention_core_cp`, fused-qkv per GDN): each rank runs the full-sequence recurrence for 1/N of the value-heads, exact, no cross-rank dependency. `all_to_all` (self-adjoint seq↔head, world==1 identity) + `cat` re-fuse landed + CPU-gated. world==1 ring taped grad matches `causal_sdpa_recompute`; multi-block merge+bwd matches the full-seq reference; head-split linear-attn reconstructs the full-seq recurrence on CPU | multi-rank ring transport (`ring_send_recv_kv` + all-to-all NCCL); >65535 local-seq parity; 256K liveness; zigzag load-balance c-sweep. Device per-row-position ring kernel (zigzag on GPU) is pending-remote — the device path errors loudly on `positions.is_some()`, never silently mis-attends |
-| **TP** | attention-TP live; **MoE-TP** built (column/row-parallel experts+shared). Model-agnostic core is `train::tensor_parallel` (`TpContext` + `divide` + `maybe_all_reduce`, mirror of `CpContext`/`DpContext`); qwen35-specific shard dims are a `Qwen35TpDims` trait impl | MoE finite-diff on ≥2 GPU |
-| **EP** | **live tape op** — `ep_dispatch_op`/`ep_combine_op` (`BackwardOp::EpDispatch`/`EpCombine`), backward = the transpose; dropped token gets zero grad; gated through the real tape | NCCL all-to-all transport; capacity + router aux loss; qwen35 routing hook |
+| **TP** | attention-TP and **MoE-TP** ops built (column/row-parallel experts+shared); model-agnostic core is `train::tensor_parallel` (`TpContext` + `divide` + `maybe_all_reduce`, mirror of `CpContext`/`DpContext`); qwen35 shard dims are a `Qwen35TpDims` impl. Production construct uses `TpContext::single()` — no model runs TP-sharded yet | MoE finite-diff on ≥2 GPU |
+| **EP** | tape op built — `ep_dispatch_op`/`ep_combine_op` (`BackwardOp::EpDispatch`/`EpCombine`), backward = the transpose; dropped token gets zero grad. Zero callers — not wired into any model | NCCL all-to-all transport; capacity + router aux loss; qwen35 routing hook |
 | **DP** | **wired end-to-end** — `DpContext` threaded into `masked_writeback_step`; global count all-reduce for `inv_n`; grad-reduce gate `(cp‖dp)`; `--dp-size` launcher; world==1 byte-identical | multi-rank correctness (≥2 GPU); combined CP×DP (`ncclCommSplit` subgroups) |
-| **PP** | `PpContext` layer-partition (`pipeline_parallel.rs`); 1F1B documented as wrong-fit for single-pass writeback | cross-stage activation send/recv; layer-loop split |
+
+PP was deleted (`pipeline_parallel.rs`, `PpContext` — 1F1B is a wrong fit for single-pass writeback); it is not a live axis.
 
 Local gate (all pass): `cargo test -p train -p autograd --no-default-features
 --features no-cuda` + clippy + Mac CUDA typecheck. The model-level parity gate

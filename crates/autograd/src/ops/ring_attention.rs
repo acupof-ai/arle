@@ -456,7 +456,8 @@ pub(crate) fn cp_ring_attention_backward(
 /// forward hops (a full loop), landing each on the rank whose LOCAL k/v produced
 /// it, where it sums. Rank-symmetric — the ring-home is a function of the hop
 /// count `j`, not of `cp_rank`. Contiguous only (the scalar kernel), so positions
-/// are `pos[0]` bases; zigzag was rejected at forward.
+/// are `pos[0]` bases; zigzag per-row positions have a CPU forward but no device
+/// kernel.
 #[allow(clippy::too_many_arguments)]
 fn cp_ring_attention_backward_device(
     input_ids: &[TensorId],
