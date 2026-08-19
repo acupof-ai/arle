@@ -279,6 +279,7 @@ vocab 248320.
 |---|---:|---:|---:|---:|
 | Qwen3.6-27B-FP8 | 9.84 ms/step | 29.22 ms/step | 33.2 tok/s | 1740 |
 | Qwen3.8-27B-NVFP4 (`cb109750e`) | 23.30 ms/step | 42.26 ms/step | 23.5 tok/s | 413 |
+| Qwen3.8-27B-NVFP4 (`5185ce517`) | 11.46 ms/step | 31.21 ms/step | 31.5 tok/s | 840 |
 
 NVFP4 moves 150.4 MB of dense-MLP weights per layer against FP8's 267.5 MB —
 56% of the bytes — so it should be faster, not 2.4x slower. Both formats run
@@ -286,6 +287,18 @@ the same hand-written warp-per-row scalar GEMV at M=1 (FP8 does NOT use
 DeepGEMM there: `qwen_fp8_dense_projection.rs` has an empty policy table and
 its fallback routes m<2 to Gemv), so the gap is entirely inside two
 structurally identical inner loops.
+
+Progress on the NVFP4 side, all at this fingerprint: the kernel started at
+86.19 ms/step dense_ffn and 9.3 tok/s. Replacing the constant-memory decode
+table with bit manipulation (`cb109750e`) took it to 23.30 / 23.5, and
+replacing that with PRMT byte lookups (`5185ce517`) to 11.46 / 31.5 — 7.5x on
+the kernel and 3.39x on decode. NVFP4 is now within 5% of FP8 on decode and
+16% behind on dense_ffn alone.
+
+ncu attributed each step: the constant-memory table cost a divergent memory
+read per weight, and the bit-manipulation form that replaced it pinned the ALU
+pipe at 92.4% (against FP8's 59.4%, whose hardware cvt issues on the FMA pipe).
+PRMT moves the work back off the ALU: 73.4% ALU, 40.6% FMA.
 
 The format-independent ops agree closely across the two runs
 (linear_attention 9.41 vs 9.50 ms, full_attention 3.27 vs 3.26), which is what
