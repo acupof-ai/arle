@@ -104,8 +104,13 @@ impl Dsv4CudaExecutor {
             if inserted {
                 self.slot_tier.remove_chunked(NS_SLOT, NS_SLOT_CHUNK, key);
             }
+            // Capture was non-destructive, so the victim keeps decoding.
             return Ok(false);
         }
+        let Self {
+            slots, kv_adapter, ..
+        } = &mut *self;
+        slots[slot].release_swapped_out(kv_adapter)?;
         Ok(true)
     }
 

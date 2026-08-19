@@ -580,20 +580,29 @@ impl Dsv4SlotState {
             kv_pages.push(pages);
         }
         ctx.sync()?;
-        for layer_idx in 0..num_layers {
+        Ok(Dsv4SlotImage {
+            seq_len: self.seq_len,
+            layers,
+            kv_pages,
+        })
+    }
+
+    /// Drop the device state the captured image now owns. Call only after the
+    /// tier has accepted the image on EVERY rank — freeing here and then
+    /// failing to store leaves the request decoding against nothing.
+    pub(crate) fn release_swapped_out(
+        &mut self,
+        kv_adapter: &mut crate::attention::Dsv4KvAdapter,
+    ) -> Result<()> {
+        for layer_idx in 0..self.attention.len() {
             if let Some(slot_idx_in_layer) = self.attention[layer_idx].flashmla_slot_idx() {
                 kv_adapter
                     .layer_mut(layer_idx)?
                     .flashmla_free_slot(slot_idx_in_layer)?;
             }
         }
-        let seq_len = self.seq_len;
         self.seq_len = 0;
-        Ok(Dsv4SlotImage {
-            seq_len,
-            layers,
-            kv_pages,
-        })
+        Ok(())
     }
 
     pub(crate) fn swap_in_image(
