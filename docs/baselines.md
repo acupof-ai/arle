@@ -54,13 +54,20 @@ One fresh serve, ascending concurrency. ITL mean is the per-output-token latency
 for speculative decode; event-level ITL percentiles include burst emission and
 must not be converted into per-token throughput.
 
-| c | prefix hits | accept | TTFT p50/p99 | ITL mean/p99 | output tok/s | total tok/s | req/s |
-|---:|---:|---:|---:|---:|---:|---:|---:|
-| 1 | 112/128 | 40.64% | 978.4 / 10308.6 ms | 10.89 / 49.53 ms | 46.94 | 7675.73 | 0.219 |
-| 2 | 128/128 | 27.35% | 581.3 / 930.8 ms | 17.06 / 94.93 ms | 99.48 | 16268.54 | 0.465 |
-| 4 | 128/128 | 27.06% | 584.8 / 1395.3 ms | 29.46 / 505.06 ms | 124.42 | 20347.14 | 0.581 |
-| 8 | 128/128 | 27.63% | 625.1 / 3408.2 ms | 48.86 / 544.12 ms | 152.94 | 25011.24 | 0.715 |
-| 16 | 128/128 | 27.28% | 878.6 / 7646.0 ms | 89.34 / 723.44 ms | 168.30 | 27522.30 | 0.786 |
+| c | prefix hits | accept | TTFT p50/p99 | ITL mean/p99 | decode tok/s | output tok/s | total tok/s | req/s |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 112/128 | 40.64% | 978.4 / 10308.6 ms | 10.89 / 49.53 ms | 91.8 | 46.94 | 7675.73 | 0.219 |
+| 2 | 128/128 | 27.35% | 581.3 / 930.8 ms | 17.06 / 94.93 ms | 58.6 | 99.48 | 16268.54 | 0.465 |
+| 4 | 128/128 | 27.06% | 584.8 / 1395.3 ms | 29.46 / 505.06 ms | 33.9 | 124.42 | 20347.14 | 0.581 |
+| 8 | 128/128 | 27.63% | 625.1 / 3408.2 ms | 48.86 / 544.12 ms | 20.5 | 152.94 | 25011.24 | 0.715 |
+| 16 | 128/128 | 27.28% | 878.6 / 7646.0 ms | 89.34 / 723.44 ms | 11.2 | 168.30 | 27522.30 | 0.786 |
+
+`decode tok/s` = `1000 / ITL mean`, per request. It is the column to compare a
+decode-path change against; `output tok/s` is end-to-end over the sweep point and
+on a 33K prompt is prefill-dominated — at c=1 the two differ by 2.0x. The 35B row
+below carries the same column; this row lacked it, and comparing a short-prompt
+decode measurement against its `output tok/s` is a mistake that has been made
+(see [errors/2026-08-19-fp8-dequant-arm-shadows-decode.md](experience/errors/2026-08-19-fp8-dequant-arm-shadows-decode.md)).
 
 Every point completed 128/128 with zero incomplete, error, empty, or
 correctness-failed responses. Completion tokens are exactly 214.
@@ -289,6 +296,10 @@ profiled one (0.91 vs 0.95) because the overhead is per-op and both models run
 the same op count, so profiling did not distort the comparison — only the
 absolute numbers.
 
+> **This row is c=1 only, and c=1 is the one point where NVFP4 wins.** The
+> matched grid is in the Qwen3.8-27B-NVFP4 section below. Read that before
+> quoting any NVFP4-vs-FP8 ratio.
+
 The per-op tables below use `ARLE_CUDA_PROFILE=1`.
 Architecturally identical: hidden 5120, intermediate 17408, 64 layers,
 vocab 248320.
@@ -324,62 +335,70 @@ makes the dense_ffn column a clean single-variable comparison.
 
 ## Qwen3.8-27B-NVFP4 · 1×H20 · single-GPU · eager
 
-### Initial support — runtime `33f4863c7` (2026-08-18)
+### Current state — runtime `4e6ec4b2a` (2026-08-19). NOT a SOTA row.
 
-Mixed-precision: NVFP4 MLP (W4AFP8, group_size=16) + FP8 per-channel attention
-(F8_E4M3 + BF16 [N,1] weight_scale). Same `qwen3_5` hybrid architecture as
-Qwen3.5/3.6 (48 gated-delta linear-attn + 16 full-attn layers). KV cache FP8
-E4M3 (KIVI per-channel-K + per-token-V). 1 BF16 MTP layer (not yet benchmarked).
+Mixed-precision: NVFP4 MLP (W4AFP8, group_size=16) on 56 of 64 layers + FP8
+per-channel attention (F8_E4M3 + BF16 `[N,1]` weight_scale) everywhere else.
+Same `qwen3_5` hybrid architecture as Qwen3.5/3.6 (48 gated-delta linear-attn +
+16 full-attn). 1 BF16 MTP layer. **145 of ~200 quantised GEMMs per forward are
+FP8, not NVFP4** — the Marlin work landed on the 56-layer NVFP4 minority.
 
-Identity:
+Identity: model `unsloth/Qwen3.8-27B-NVFP4` (22 GB + 811 MB MTP) · 1×H20
+(sm_90, 96 GB), TP=1 · `--kv-cache-dtype fp8` · no spec unless stated ·
+`ARLE_CUDA_PROFILE` off · 20.69 GiB peak RSS, 6.5 s load.
 
-- Runtime commit `33f4863c7`
-- Model `unsloth/Qwen3.8-27B-NVFP4` (22 GB safetensors + 811 MB MTP)
-- GPU: 1×H20 (sm_90, 96 GB), TP=1
-- Server flags: `--kv-cache-dtype fp8`
-- Peak RSS: 20.69 GiB
-- Load time: 6.5s
+**Matched A/B, same binary and same moment**, NVFP4 on GPU0 and
+Qwen3.6-27B-FP8 on GPU1, identical flags and harness invocation. Synthetic
+prompt (mean 8 tokens), `--seconds-per-concurrency 30 --max-tokens 128`.
 
-| c | completed | errors | TTFT p50 | ITL p50 | output tok/s |
-|---:|---:|---:|---:|---:|---:|
-| 1 | 3 | 0 | 811 ms | 102 ms | 9.3 |
-| 4 | 4 | 0 | 2219 ms | 457 ms | 8.3 |
-| 8 | 8 | 0 | 4619 ms | 818 ms | 9.2 |
+| c | NVFP4 ITL ms | NVFP4 decode | NVFP4 agg | FP8 ITL ms | FP8 decode | FP8 agg |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 15.01 | **66.6** | 66.6 | 17.60 | **56.8** | 56.8 |
+| 2 | 100.59 | 9.9 | 19.9 | 20.21 | 49.5 | 99.0 |
+| 4 | 102.02 | 9.8 | 39.2 | 20.58 | 48.6 | 194.4 |
+| 8 | 105.85 | 9.4 | 75.6 | 22.43 | 44.6 | 356.7 |
+| 16 | 113.95 | 8.8 | 140.4 | 25.46 | 39.3 | 628.4 |
 
-Correctness: `2+3=5` verified via `arle run` and OpenAI-compatible API.
-Needle gate pending. c=16 cell killed (server shutdown during long requests).
+Long-agent 32K, `bench-agent-32k-16x8.jsonl`, 32 req/point, max_tokens 214,
+no spec, both arms on the same box:
 
-### FP4 GEMV vectorization — runtime `2a3a2164f` (2026-08-18)
+| arm | c | prompt | TTFT p50 | ITL ms | decode | out tok/s | completed |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| NVFP4 | 1 | 32739 | 19257 ms | 23.76 | **42.1** | 11.80 | 25/32, then crash |
+| NVFP4 | 4 | — | — | — | — | — | 0/32, server dead |
+| FP8 | 1 | 32876 | 5533 ms | 26.68 | **37.5** | 18.93 | 32/32 |
+| FP8 | 4 | 32876 | 1251 ms | 47.32 | 21.1 | 75.40 | 32/32 |
 
-Same fingerprint as the row above. GPU-side c=1 decode: `dense_ffn` 102.1 →
-86.2 ms/step (−15.5%), `forward_hidden` 123.9 → 106.7 ms/step (−13.9%),
-bandwidth 53 → 63 GB/s. End to end c=1 is unchanged at 9.3 tok/s (the harness
-figure includes TTFT and scheduling, which hide a 14% forward win at one
-request); c=4 8.3 → 14.1 and c=8 9.2 → 26.5, but those cells previously died on
-a dequant-scratch OOM, so the prior numbers are a crashing server rather than a
-slower one. Needle 512/4096 ×3 = 6/6 exact, deterministic.
+Spec decode, synthetic prompt, c=1:
 
-MTP: 1 BF16 MTP layer (811 MB), `--spec-type mtp --mtp-draft-tokens 2`.
-Acceptance ~80% but net slower (6.2 vs 9.3 tok/s): the verify forward runs
-3 tokens through the recurrent linear attention scan, costing ~3× a
-single-token decode. Cost per token = 1.77× at 80% acceptance. Not enabled
-by default on H20.
+| arm | ITL ms | decode | vs no-spec |
+|---|---:|---:|---:|
+| no spec | 15.02 | 66.6 | — |
+| MTP d=2 (35.1% accept) | 71.23 | 14.0 | −79% |
+| DSpark block 6 | 58.90 | 17.0 | −74% |
 
-Per-op profile (50 decode steps, c=1): NVFP4 MLP GEMV = 40.1% of total
-(82.4% of forward). 84.9 MB of packed weights and scales per layer in 1.595 ms
-= 53 GB/s = 1.3% of H20 bandwidth; the kernel loads one packed byte per thread
-per iteration, so it is bound by transaction count. SGLang Marlin W4A16 reaches
-24% but needs 88 GB BF16 weights — doesn't fit on single H20. Optimization
-path: vectorized loads in the FP4 GEMV (runtime `d6873c5e6`, bench pending).
+**Reading.** The NVFP4 decode kernel is genuinely 12–17% faster than FP8's at
+c=1, at both 8-token and 33K context. Everything else is worse, and all of it
+is one defect: `try_fp8_dequant_bf16_gemm_batch` fired at `M >= 2` and
+re-dequantised all 11.56 G FP8 params per call — 84.35 ms per forward. It cost
+5× aggregate throughput at c≥2, inverted both spec-decode paths, and crashed
+the server at 34K on its un-budgeted 2.54 GB scratch. Root cause and fix:
+[errors/2026-08-19-fp8-dequant-arm-shadows-decode.md](experience/errors/2026-08-19-fp8-dequant-arm-shadows-decode.md).
 
-A8 vs AFP8: on H20 (sm_90), FP8 E4M3 and INT8 tensor core throughput are
-identical (989 TFLOPS/TOPS). FP8 has wider dynamic range → better accuracy.
-The model's NVFP4 MLP path uses FP8 activations (W4AFP8); the attention path
-uses BF16 activations (W8A16 via GEMV). W4A8 (INT8 activations) would need a
-new GEMM kernel — not justified when throughput is identical and accuracy
-favors FP8.
+Every cell above is n=1 and measured on the DEFECTIVE build. They are the
+before-arm; the after-arm is pending the fixed binary. No NVFP4 row is eligible
+for SOTA until c≥2 scales and the 32K run completes.
 
-[Wins entry](experience/wins/2026-08-18-qwen38-27b-nvfp4-inference.md)
+Superseded rows (9.3 tok/s initial support `33f4863c7`, FP4 GEMV vectorization
+`2a3a2164f`) live in
+[wins/2026-08-18-qwen38-27b-nvfp4-inference.md](experience/wins/2026-08-18-qwen38-27b-nvfp4-inference.md);
+the kernel ladder 52.3 → 57.9 → 60.2 → 63.9 (out tok/s, c=1) is in
+[wins/2026-08-19-nvfp4-marlin-tensorcore.md](experience/wins/2026-08-19-nvfp4-marlin-tensorcore.md).
+
+A8 vs AFP8: on H20 (sm_90) FP8 E4M3 and INT8 tensor-core throughput are
+identical (989 TFLOPS/TOPS) and FP8 has the wider dynamic range, so W4A8 (INT8
+activations) would need a new GEMM kernel for no throughput gain. The shipped
+W4AFP8 path is the right choice.
 
 ---
 

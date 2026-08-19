@@ -22,6 +22,14 @@ c=1 decode, 1xH20, `--kv-cache-dtype fp8`, no spec, profiling OFF:
 
 7.5x on the kernel. NVFP4 remains 9% behind FP8 on decode.
 
+> **SCOPE, added 2026-08-19.** Every row here is c=1 on an 8-token synthetic
+> prompt. It is the correct comparison for the kernel and does not generalise to
+> serving: on the same build at c>=2 NVFP4 lost 5x to FP8, for a reason that has
+> nothing to do with this kernel
+> ([errors/2026-08-19-fp8-dequant-arm-shadows-decode.md](../errors/2026-08-19-fp8-dequant-arm-shadows-decode.md)).
+> The scalar GEMV was later superseded by Marlin; see
+> [2026-08-19-nvfp4-marlin-tensorcore.md](2026-08-19-nvfp4-marlin-tensorcore.md).
+
 The per-op columns are measured under `ARLE_CUDA_PROFILE=1`, which costs 66-73%
 of throughput (a `cudaEventRecord` pair per op, 192 per step). They are valid
 for attribution between ops and invalid as throughput. The decode column is

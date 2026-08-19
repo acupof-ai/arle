@@ -121,10 +121,10 @@ The real workload: 32K-token multi-turn agent prompts, not a synthetic short pro
 
 | Qwen3.6, 1×H20 · decode / total tok/s | c=1 | c=8 | c=16 |
 |---|---:|---:|---:|
-| 35B-A3B MoE | 61.7 / 6,707 | 22.7 / 27,968 | 13.6 / 33,859 |
-| 27B dense + DSpark drafter | **100.7** / 7,837 | 20.9 / 25,074 | 11.1 / 26,790 |
+| 35B-A3B MoE | 149.3 / 11,860 | 27.7 / 32,589 | 15.1 / 36,075 |
+| 27B dense + DSpark drafter | **91.8** / 7,676 | 20.5 / 25,011 | 11.2 / 27,522 |
 
-`decode tok/s` is single-stream latency; `total tok/s` is capacity (prompt + generated over wall clock). The DSpark block drafter is 2.9× over plain decode at c=1 and washes out by c=16 — verify is free only while the GPU has idle compute. Full rows in [docs/baselines.md](docs/baselines.md).
+`decode tok/s` is single-stream latency (`1000 / ITL mean`); `total tok/s` is capacity (prompt + generated over wall clock). They are separate SLOs — on a 32K prompt at c=1 the end-to-end figure is half the decode figure, because prefill dominates the wall clock. Per-request decode falls with concurrency while total rises: verify is free only while the GPU has idle compute. Full rows in [docs/baselines.md](docs/baselines.md).
 
 ### DeepSeek-V4-Flash (8×H20, TP=8/EP=8, FP8 MoE)
 

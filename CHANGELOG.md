@@ -7,6 +7,7 @@ detail in the linked wins/errors entry. Oldest sections are condensed.
 - [docs/support-matrix.md](docs/support-matrix.md)
 
 ## [Unreleased]
+- **FIX — one prefill dequant arm firing at `M >= 2` cost NVFP4 5× aggregate throughput at c≥2, inverted both spec-decode paths, and crashed the server at 34K: 11.56 G FP8 params re-materialised to BF16 every step** (2026-08-19; [errors](docs/experience/errors/2026-08-19-fp8-dequant-arm-shadows-decode.md), [rows](docs/baselines.md)) — after-arm re-measure pending on the fixed binary
 - **FIX — whole-slot park works under CP: 9,970/9,970 refusals → 390/390 round-trips, promote 130 ms @ 10K tokens, needle 48/48** (2026-08-19; `b2cc9b783`..`cb9a53373`, [wins](docs/experience/wins/2026-08-19-cp-slot-park-works-l2-l3-nonzero.md), [errors](docs/experience/errors/2026-08-19-cp-park-refused-so-l2-l3-never-written.md))
 - **REFACTOR — global dead-code deletion wave 4: −426 lines, non-CUDA crates; zero live paths touched** (2026-08-19; `aa10fccca`, [wins](docs/experience/wins/2026-08-19-dead-code-deletion-wave4.md))
 - **FEAT — Qwen3.8-27B-NVFP4 mixed-precision inference: NVFP4 MLP + FP8 per-channel attention on H20** (2026-08-18; `33f4863c7`, [wins](docs/experience/wins/2026-08-18-qwen38-27b-nvfp4-inference.md))
