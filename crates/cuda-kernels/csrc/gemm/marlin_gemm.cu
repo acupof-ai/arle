@@ -60,6 +60,15 @@ CUresult marlin_fp4_gemm_cuda(
   return CUDA_ERROR_NOT_SUPPORTED;
 }
 
+CUresult marlin_fp8_gemm_cuda(
+    const __nv_bfloat16* A, const uint32_t* B_packed, const __nv_bfloat16* scales,
+    __nv_bfloat16* C, float* c_tmp, int* workspace,
+    int m, int n, int k, cudaStream_t stream) {
+  (void)A; (void)B_packed; (void)scales; (void)C; (void)c_tmp; (void)workspace;
+  (void)m; (void)n; (void)k; (void)stream;
+  return CUDA_ERROR_NOT_SUPPORTED;
+}
+
 int marlin_c_tmp_floats(int m, int sms) { (void)m; (void)sms; return 0; }
 int marlin_workspace_ints(int sms) { (void)sms; return 0; }
 
@@ -242,6 +251,67 @@ CUresult marlin_fp4_gemm_cuda(
     return CUDA_ERROR_INVALID_VALUE;
   } catch (...) {
     std::fprintf(stderr, "[marlin] fp4 m=%d n=%d k=%d gs=%d: non-std exception\n", m, n, k, group_size);
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+
+  return (cudaGetLastError() == cudaSuccess) ? CUDA_SUCCESS : CUDA_ERROR_LAUNCH_FAILED;
+}
+
+// Y[m,n] = X[m,k] @ dequant(W) — BF16 activations, kFE4M3fn weights, ONE BF16
+// scale per output column (Marlin's channelwise mode). The scale carries a 2^120
+// factor the kernel does not apply: kFE4M3fn takes the `dequant_skip_flop` arm
+// (marlin_template.h:328, `is_int_type` covers only the kU4/kU8 family), so the
+// exponent-rebias multiply never runs, and there is no `s2` channel to park the
+// correction in — `repack_for_marlin_fp8` folds it into the scale instead.
+//
+// No `group_size` parameter: channelwise is the ONLY mode instantiated for this
+// path, and passing k/group_size the way the other three entry points do would
+// compute group_blocks = k/16, which BIGGROUP_GET_IF does not instantiate for
+// kFE4M3fn (only {-1, 8}, gptq_marlin.cuh:318-337) → MarlinDefault → host::Panic.
+// Scratch ownership is the same contract as the W8A16 entry point above.
+CUresult marlin_fp8_gemm_cuda(
+    const __nv_bfloat16* A,       // [m, k] row-major (lda = k)
+    const uint32_t* B_packed,     // Marlin-repacked kFE4M3fn
+    const __nv_bfloat16* scales,  // [1, n] permuted, 2^120 folded in
+    __nv_bfloat16* C,             // [m, n]
+    float* c_tmp,                 // caller-owned fp32-reduce scratch
+    int* workspace,               // caller-owned zeroed int lock buffer
+    int m, int n, int k, cudaStream_t stream) {
+  int dev = 0;
+  if (cudaGetDevice(&dev) != cudaSuccess) return CUDA_ERROR_INVALID_DEVICE;
+  int sms = 0;
+  if (!sm_supports_marlin(dev, &sms)) return CUDA_ERROR_NOT_SUPPORTED;
+  if (m == 0) return CUDA_SUCCESS;
+
+  try {
+    device::marlin::marlin_mm<__nv_bfloat16>(
+        A, B_packed, C,
+        c_tmp,
+        const_cast<__nv_bfloat16*>(scales),
+        nullptr,   // s2 (global_scale) — kFE4M3fn has no global-scale channel
+        nullptr,   // zp — has_zp=false
+        nullptr,   // g_idx
+        nullptr,   // perm
+        nullptr,   // a_tmp — has_act_order=false
+        m, n, k,
+        k,         // lda
+        workspace,
+        host::kFE4M3fn,
+        false,     // has_act_order
+        true,      // is_k_full
+        false,     // has_zp
+        1, -1,     // num_groups (act_order-only, inert here); group_size = -1
+        dev, stream,
+        -1, -1,    // thread_k/n auto
+        sms,
+        false,     // use_atomic_add
+        true,      // use_fp32_reduce
+        false);    // is_zp_float
+  } catch (const std::exception& e) {
+    std::fprintf(stderr, "[marlin] fp8 m=%d n=%d k=%d: %s\n", m, n, k, e.what());
+    return CUDA_ERROR_INVALID_VALUE;
+  } catch (...) {
+    std::fprintf(stderr, "[marlin] fp8 m=%d n=%d k=%d: non-std exception\n", m, n, k);
     return CUDA_ERROR_INVALID_VALUE;
   }
 

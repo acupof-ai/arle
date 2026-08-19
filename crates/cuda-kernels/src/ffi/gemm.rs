@@ -167,6 +167,25 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    /// Per-channel FP8 Marlin GEMM: C[m,n] = A[m,k] @ dequant(Marlin-packed W).
+    /// kFE4M3fn weights, ONE BF16 scale per output column, permuted with
+    /// `scale_perm_single` and carrying the 2^120 the skip-flop dequant omits
+    /// (see `repack_for_marlin_fp8`). No `group_size`: channelwise (-1) is the
+    /// only mode instantiated for kFE4M3fn, so the shim passes it literally.
+    /// Scratch contract matches `marlin_w8a16_gemm_cuda`.
+    pub fn marlin_fp8_gemm_cuda(
+        a: *const Half,
+        b_packed: *const u32,
+        scales: *const Half,
+        c: *mut Half,
+        c_tmp: *mut f32,
+        workspace: *mut i32,
+        m: i32,
+        n: i32,
+        k: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     /// W4A16 Marlin GEMM: C[m,n] = A[m,k] @ dequant(Marlin-packed W).
     /// kU4B8 excess-8 INT4 weights, BF16 per-group scales [k/gs, n] permuted.
     /// Scratch contract matches `marlin_w8a16_gemm_cuda`.
