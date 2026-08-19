@@ -766,11 +766,6 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         }
     }
 
-    /// Submit a normal-priority request into the waiting queue.
-    pub fn submit_request(&mut self, prompt_tokens: Vec<u32>, max_tokens: usize) -> RequestHandle {
-        self.submit_request_with_options(prompt_tokens, max_tokens, RequestOptions::default())
-    }
-
     /// Submit a request with full ingress options.
     pub fn submit_request_with_options(
         &mut self,

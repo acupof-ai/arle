@@ -19,7 +19,6 @@ pub use sharding::{
     row_shard,
 };
 pub use topology::{
-    MultiAxisConfig, RankCoord, build_attn_cp_groups, build_attn_dp_groups,
-    build_attn_owner_groups, build_attn_tp_groups, build_moe_dp_groups, build_moe_ep_groups,
-    build_moe_tp_groups, build_pp_groups, build_tp_groups,
+    MultiAxisConfig, RankCoord, build_attn_cp_groups, build_attn_tp_groups, build_moe_ep_groups,
+    build_tp_groups,
 };

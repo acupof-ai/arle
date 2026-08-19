@@ -70,19 +70,6 @@ pub struct CompletionRequest {
     pub stop: Option<Vec<String>>,
 }
 
-impl CompletionRequest {
-    /// Build a request with the two always-specified fields; all others default.
-    #[must_use]
-    pub fn new(prompt: impl Into<String>, max_tokens: usize) -> Self {
-        Self {
-            prompt: prompt.into(),
-            max_tokens,
-            sampling: SamplingParams::default(),
-            stop: None,
-        }
-    }
-}
-
 /// Raw image bytes attached to a backend-native chat message.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChatPromptImage {
@@ -114,17 +101,6 @@ pub struct MultimodalChatRequest {
     pub messages: Vec<ChatPromptMessage>,
     pub max_tokens: usize,
     pub sampling: SamplingParams,
-}
-
-impl MultimodalChatRequest {
-    #[must_use]
-    pub fn new(messages: Vec<ChatPromptMessage>, max_tokens: usize) -> Self {
-        Self {
-            messages,
-            max_tokens,
-            sampling: SamplingParams::default(),
-        }
-    }
 }
 
 /// Why generation stopped (the legacy 2-state public shape;
@@ -201,11 +177,6 @@ impl ChatPromptMessage {
     }
 
     #[must_use]
-    pub fn system(content: impl Into<String>) -> Self {
-        Self::new("system", content)
-    }
-
-    #[must_use]
     pub fn user(content: impl Into<String>) -> Self {
         Self::new("user", content)
     }
@@ -215,11 +186,6 @@ impl ChatPromptMessage {
         let mut msg = Self::user(content);
         msg.images = images;
         msg
-    }
-
-    #[must_use]
-    pub fn assistant(content: impl Into<String>) -> Self {
-        Self::new("assistant", content)
     }
 }
 
@@ -235,18 +201,6 @@ pub struct CompletionStreamDelta {
 }
 
 impl CompletionStreamDelta {
-    /// Create a text-only delta (no finish, no usage, no error).
-    #[must_use]
-    pub fn text(s: String) -> Self {
-        Self {
-            text_delta: s,
-            finish_reason: None,
-            usage: None,
-            token_ids: Vec::new(),
-            error: None,
-        }
-    }
-
     #[must_use]
     pub fn error(kind: impl Into<String>, chain: Vec<String>) -> Self {
         let message = chain

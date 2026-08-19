@@ -26,18 +26,6 @@ pub struct RoutingDecision {
     pub experts: Vec<ExpertWeight>,
 }
 
-impl RoutingDecision {
-    #[must_use]
-    pub fn expert_ids(&self) -> Vec<usize> {
-        self.experts.iter().map(|ew| ew.expert).collect()
-    }
-
-    #[must_use]
-    pub fn weights(&self) -> Vec<f32> {
-        self.experts.iter().map(|ew| ew.weight).collect()
-    }
-}
-
 // Scoring primitives — ported from `v4.rs:511-543`.
 
 /// Stable softmax: subtract the max before `exp` (numerical stability).

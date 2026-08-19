@@ -89,14 +89,9 @@ where
     /// Quiesce engine admission (the serve loop defers new admission) and cancel
     /// every in-flight (waiting + active) request, returning how many were
     /// cancelled. The OPD round-loop writeback bracket; pairs with
-    /// [`Self::resume_admissions`].
+    /// [`Self::ensure_kv_pool_and_resume_admissions`].
     pub fn quiesce_admissions(&self) -> Result<usize> {
         self.serve.quiesce_admissions()
-    }
-
-    /// Re-arm admission after the OPD writeback bracket (KV pool re-acquired).
-    pub fn resume_admissions(&self) -> Result<()> {
-        self.serve.resume_admissions()
     }
 
     /// Generate token ids from an already-tokenized prompt through the serving

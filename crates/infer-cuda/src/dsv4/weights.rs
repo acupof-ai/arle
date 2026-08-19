@@ -314,7 +314,6 @@ impl Dsv4Model {
     pub(crate) fn moe_config_from_config(config: &DeepSeekV4Config) -> Result<MoeConfig> {
         let moe = MoeConfig::dsv4(
             config.n_routed_experts,
-            config.n_shared_experts,
             config.num_experts_per_tok,
             config.routed_scaling_factor,
             config.hidden_size,

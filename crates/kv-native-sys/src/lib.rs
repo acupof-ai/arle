@@ -11,8 +11,8 @@ mod kv_tier;
 
 pub use kv_tier::{
     BLOB_CHUNK_BYTES, CHUNK_IDX_BITS, DiskIoMode, KvTierStore, TIER_NS_SHIFT, TierIoStats,
-    chunk_sub, default_t1_budget_bytes, default_t2_budget_bytes, resolve_dram_budget_bytes,
-    tier_key, weights_epoch_tag,
+    default_t1_budget_bytes, default_t2_budget_bytes, resolve_dram_budget_bytes, tier_key,
+    weights_epoch_tag,
 };
 
 use std::fs::OpenOptions;

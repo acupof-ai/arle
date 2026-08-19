@@ -68,17 +68,6 @@ type TickBroadcaster = Box<dyn Fn(u64, Vec<WireRequest>) -> Result<()> + Send + 
 
 static TICK_BROADCASTER: OnceLock<TickBroadcaster> = OnceLock::new();
 
-/// Install the process-global per-tick admission broadcaster (rank-0
-/// coordinator only). Must happen at boot, before `serve_http` builds the
-/// rank-0 engine, so the engine loop observes it from its first tick.
-///
-/// Returns an error if a broadcaster is already installed.
-pub fn set_tick_broadcaster(broadcaster: TickBroadcaster) -> Result<()> {
-    TICK_BROADCASTER
-        .set(broadcaster)
-        .map_err(|_| anyhow::anyhow!("tick broadcaster already installed"))
-}
-
 /// Whether a tick broadcaster is installed (multiproc rank-0 coordinator).
 #[must_use]
 pub fn tick_broadcaster_installed() -> bool {
@@ -579,15 +568,6 @@ pub struct RelayCompletionDelta {
 }
 
 impl RelayCompletionDelta {
-    /// A text-only, non-terminal delta.
-    #[must_use]
-    pub fn text(s: String) -> Self {
-        Self {
-            text_delta: s,
-            ..Self::default()
-        }
-    }
-
     /// Whether this delta closes the request (terminal finish or error).
     #[must_use]
     pub fn is_done(&self) -> bool {
@@ -601,7 +581,7 @@ impl RelayCompletionDelta {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RelayEnvelope {
     /// Worker identity handshake. The coordinator consumes this during
-    /// [`PendingRelayCoordinator::accept`] and indexes streams by rank. It is
+    /// [`PendingRelayCoordinator::accept_symmetric`] and indexes streams by rank. It is
     /// never forwarded to the scheduler loop.
     WorkerHello { rank: usize, world_size: usize },
     /// Lightweight boot-ping / liveness envelope used at coordinator boot to
@@ -785,15 +765,6 @@ impl PendingRelayCoordinator {
     #[must_use]
     pub fn port(&self) -> u16 {
         self.port
-    }
-
-    /// Legacy accept: wait for ranks 1..N-1 (rank 0 is the in-process engine).
-    /// Kept for the relay tests; the SPMD coordinator uses [`Self::accept_symmetric`].
-    pub fn accept(self, world_size: usize, accept_timeout: Duration) -> Result<RelayCoordinator> {
-        if world_size < 2 {
-            bail!("RelayCoordinator needs world_size >= 2 (got {world_size})");
-        }
-        self.accept_n(world_size, world_size - 1, accept_timeout)
     }
 
     fn accept_n(

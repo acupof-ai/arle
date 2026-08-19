@@ -254,15 +254,9 @@ fn subgroup_axis_env_present(lookup: &mut impl FnMut(&str) -> Option<String>) ->
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RankCoord {
-    pub world_rank: usize,
-    pub tp_rank: usize,
-    pub pp_rank: usize,
     pub attn_tp_rank: usize,
     pub attn_dp_rank: usize,
     pub attn_cp_rank: usize,
-    pub moe_tp_rank: usize,
-    pub moe_ep_rank: usize,
-    pub moe_dp_rank: usize,
 }
 
 impl RankCoord {
@@ -278,25 +272,14 @@ impl RankCoord {
             bail!("world_rank ({world_rank}) must be < world_size ({world})");
         }
         let tp_rank = world_rank % cfg.tp_size;
-        let pp_rank = world_rank / cfg.tp_size;
         let attn_tp = cfg.attn_tp_size();
         let attn_tp_rank = tp_rank % attn_tp;
         let attn_cp_rank = (tp_rank / attn_tp) % cfg.attn_cp_size;
         let attn_dp_rank = tp_rank / (attn_tp * cfg.attn_cp_size);
-        let moe_tp = cfg.moe_tp_size();
-        let moe_tp_rank = tp_rank % moe_tp;
-        let moe_ep_rank = (tp_rank / moe_tp) % cfg.ep_size;
-        let moe_dp_rank = tp_rank / (moe_tp * cfg.ep_size);
         Ok(Self {
-            world_rank,
-            tp_rank,
-            pp_rank,
             attn_tp_rank,
             attn_dp_rank,
             attn_cp_rank,
-            moe_tp_rank,
-            moe_ep_rank,
-            moe_dp_rank,
         })
     }
 }
@@ -308,14 +291,6 @@ pub fn build_tp_groups(cfg: MultiAxisConfig) -> Vec<Vec<usize>> {
     (0..n)
         .map(|i| (i * cfg.tp_size..(i + 1) * cfg.tp_size).collect())
         .collect()
-}
-
-/// SGLang `parallel_state.py:1981-1989`.
-#[must_use]
-pub fn build_pp_groups(cfg: MultiAxisConfig) -> Vec<Vec<usize>> {
-    let world = cfg.world_size();
-    let n = world / cfg.pp_size;
-    (0..n).map(|i| (i..world).step_by(n).collect()).collect()
 }
 
 /// SGLang `parallel_state.py:1838-1853`.
@@ -357,74 +332,7 @@ pub fn build_attn_tp_groups(cfg: MultiAxisConfig) -> Vec<Vec<usize>> {
         .collect()
 }
 
-/// SGLang `parallel_state.py:1838-1853` (attn_dp uses same outer layout as
-/// attn_cp; each attn_dp group is a stride across `attn_cp_size * attn_tp_size`).
-#[must_use]
-pub fn build_attn_dp_groups(cfg: MultiAxisConfig) -> Vec<Vec<usize>> {
-    if cfg.attn_dp_size == 1 {
-        return (0..cfg.world_size()).map(|r| vec![r]).collect();
-    }
-    let n = cfg.world_size() / cfg.tp_size;
-    let attn_tp = cfg.attn_tp_size();
-    let stride = attn_tp * cfg.attn_cp_size;
-    (0..n)
-        .flat_map(|g| {
-            (0..cfg.attn_cp_size).flat_map(move |c| {
-                (0..attn_tp).map(move |t| {
-                    let st = g * cfg.tp_size + c * attn_tp + t;
-                    (st..g * cfg.tp_size + cfg.tp_size)
-                        .step_by(stride)
-                        .collect()
-                })
-            })
-        })
-        .collect()
-}
-
-/// SGLang `DataParallelController` request-ownership groups.
-///
-/// Work requests are routed to one attention-DP slice. The slice leader
-/// receives from the controller, then broadcasts within ATTN_TP and ATTN_CP.
-/// This is intentionally different from [`build_attn_dp_groups`]: that function
-/// builds cross-DP communication groups for gather/scatter, while this function
-/// builds per-DP compute-owner groups.
-#[must_use]
-pub fn build_attn_owner_groups(cfg: MultiAxisConfig) -> Vec<Vec<usize>> {
-    let n = cfg.world_size() / cfg.tp_size;
-    let sz = cfg.attn_tp_size() * cfg.attn_cp_size;
-    (0..n)
-        .flat_map(|g| {
-            (0..cfg.attn_dp_size).map(move |d| {
-                let st = g * cfg.tp_size + d * sz;
-                (st..st + sz).collect()
-            })
-        })
-        .collect()
-}
-
 /// SGLang `parallel_state.py:1903-1919`.
-#[must_use]
-pub fn build_moe_dp_groups(cfg: MultiAxisConfig) -> Vec<Vec<usize>> {
-    if cfg.attn_cp_size > cfg.moe_dp_size {
-        return build_attn_cp_groups(cfg);
-    }
-    if cfg.moe_dp_size == cfg.tp_size {
-        return build_tp_groups(cfg);
-    }
-    let n = cfg.world_size() / cfg.tp_size;
-    let moe_tp = cfg.moe_tp_size();
-    let stride = moe_tp * cfg.ep_size;
-    (0..n)
-        .flat_map(|g| {
-            (0..moe_tp * cfg.ep_size).map(move |i| {
-                let st = g * cfg.tp_size + i;
-                (st..(g + 1) * cfg.tp_size + i).step_by(stride).collect()
-            })
-        })
-        .collect()
-}
-
-/// SGLang `parallel_state.py:1929-1943`.
 #[must_use]
 pub fn build_moe_ep_groups(cfg: MultiAxisConfig) -> Vec<Vec<usize>> {
     if cfg.ep_size == cfg.tp_size {
@@ -439,24 +347,6 @@ pub fn build_moe_ep_groups(cfg: MultiAxisConfig) -> Vec<Vec<usize>> {
                     let st = g * cfg.tp_size + d * cfg.ep_size * moe_tp + t;
                     (st..st + cfg.ep_size * moe_tp).step_by(moe_tp).collect()
                 })
-            })
-        })
-        .collect()
-}
-
-/// SGLang `parallel_state.py:1955-1970`.
-#[must_use]
-pub fn build_moe_tp_groups(cfg: MultiAxisConfig) -> Vec<Vec<usize>> {
-    let moe_tp = cfg.moe_tp_size();
-    if moe_tp == cfg.tp_size {
-        return build_tp_groups(cfg);
-    }
-    let n = cfg.world_size() / cfg.tp_size;
-    (0..n)
-        .flat_map(|g| {
-            (0..cfg.ep_size * cfg.moe_dp_size).map(move |i| {
-                let st = g * cfg.tp_size + i * moe_tp;
-                (st..st + moe_tp).collect()
             })
         })
         .collect()
