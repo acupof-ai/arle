@@ -358,23 +358,39 @@ prompt (mean 8 tokens), `--seconds-per-concurrency 30 --max-tokens 128`.
 
 | c | NVFP4 ITL ms | NVFP4 agg | FP8 agg | vs FP8 |
 |---:|---:|---:|---:|---:|
-| 1 | 12.18 | **82.1** | 61.5 | **+33.4%** |
-| 2 | 15.57 | **128.5** | 99.8 | **+28.8%** |
-| 4 | 17.11 | **233.8** | 195.9 | **+19.3%** |
-| 8 | 21.79 | **367.1** | 358.0 | **+2.5%** |
-| 16 | 33.87 | **472.4** | 632.5 | −25.3% |
+| 1 | 12.13 | **82.5** | 61.5 | **+34.1%** |
+| 2 | 14.24 | **140.4** | 99.8 | **+40.7%** |
+| 4 | 14.66 | **272.9** | 195.9 | **+39.3%** |
+| 8 | 16.35 | **489.2** | 358.0 | **+36.6%** |
+| 16 | 22.33 | **716.6** | 632.5 | +13.3% |
 
-Both arms on the same binary, FP8 re-measured after the change rather than reused.
-Decode graph on (FP8-KV capture landed at `cb3f8a4a9`), per-channel FP8 on Marlin
-(`6f4b413fe`). NVFP4's step cost over 16x concurrency grows 2.8x against FP8's
-1.45x — down from 4.5x before the Marlin port, and the remaining gap at c=16 is
-where the 34% of FP8 calls still on the scalar GEMV sit.
+Decode graph on (FP8-KV capture landed at `cb3f8a4a9`), per-channel FP8 on
+Marlin (`6f4b413fe`), every quantised GEMM repacked — `cuda.qwen.fp8_gemv` is
+513 calls of 1.15 M, load-time and warm-up only. The FP8 column is carried from
+the `55210e66a` run, where it was measured on the same binary; the load-site
+wiring cannot reach it, because the Qwen3.6-27B-FP8 checkpoint's 128x128 blocks
+fail `quant_block_m == 1` and that run recorded `fp8_marlin_tensorcore` ABSENT
+on the FP8 server.
 
-NVFP4 leads FP8 at c=1 (+17.8%) and c=2 (+3.9%) and trails from c=4. The step
-cost against batch is the open item: NVFP4 4.5x over 16x concurrency against
-FP8's 1.45x. FP8 is flat because DeepGEMM is a tensor-core GEMM; NVFP4's
-per-channel FP8 weights sit on a batched GEMV whose register pressure scales
-with the tile (`quantized_gemv.cu`), so Marlin `kFE4M3fn` is the next lever.
+c=16 is a cliff, not a decay: c=8 is +36.6%. It is not a routing gap — a per-op
+profile (`ARLE_CUDA_PROFILE=1`, both checkpoints, c=1 vs c=16) puts the whole
+residue in `dense_ffn`, and the rest of the step is either already ahead or
+shared. On the five ops where both checkpoints read identical bytes
+(in_proj / out_proj / qkv / o_proj / lm_head) Marlin is 22-30% faster than the
+FP8 checkpoint's path.
+
+| c=16, ms/step | NVFP4 | FP8 |
+|---|---:|---:|
+| GEMM subtotal | 15.103 | 19.474 |
+| non-GEMM (identical code, both checkpoints) | 7.351 | 6.963 |
+| leaf total | 22.454 | 26.437 |
+
+`dense_ffn` is 9.201 ms against the FP8 checkpoint's 11.635 for the same 17.11 G
+weight values. Marlin's NVFP4 arm is within 12% of its own per-channel FP8 arm
+**per value** (probe, gate_up M=16: 0.093 vs 0.083 ms) — the byte advantage does
+not convert because the kernel is issue-bound, not bandwidth-bound: ncu reads 96
+registers/thread, which caps residency at 682 threads/SM (~33% occupancy) on any
+block size, and issue sits at 67% of peak.
 
 Long-agent 32K, `bench-agent-32k-16x8.jsonl`, 32 req/point, max_tokens 214,
 no spec, both arms on the same box:
