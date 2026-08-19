@@ -28,19 +28,28 @@ DeepSeek-V4-Flash-0731, 4×H20, TP=4, W4AFP8, build `ctx-cap-v2`:
 - Server starts with `max_prompt_tokens=1048576` (was 32768).
 - Budget solver at 1M: free 55GB/GPU, per-slot 7.7GB, affordable=5,
   planned 4 slots, shared comp capacity 3.16M tokens. No crash.
-- Needle-in-a-haystack (completions API, greedy):
+- Needle gate (`scripts/needle_gate.py`, RAW=1, no template, greedy,
+  depth=0.5, 3 runs per length):
 
-| Prompt tokens | Needle found | Answer |
-|--------------:|:------------:|--------|
-| 10,520 | ✓ | ARLE-2026 |
-| 34,220 | ✗ | ARLE-2028 (last digit wrong) |
-| 69,420 | ✓ | ARLE-2026 |
-| 139,820 | ✗ | ARLE-2028 (last digit wrong) |
-| 280,620 | ✗ | ARLE-12799 (lost) |
+| Prompt tokens | exact/3 | Notes |
+|--------------:|:-------:|-------|
+| 9,013 | 3/3 | Deterministic |
+| 29,780 | 3/3 | Old cap boundary |
+| 60,530 | 3/3 | 2× old cap |
+| 122,030 | 3/3 | 4× old cap |
+| 245,030 | 3/3 | 8× old cap |
 
-The server accepts and serves prompts past the old 32K cap. Needle
-accuracy degrades at longer contexts — a model/KV-precision issue, not a
-context-cap issue.
+- Standard bench (`bench_dsv4_trace_http.py`): decode64 47.4 tok/s,
+  write_zh 49.0 tok/s — same as the TP=4 baseline (47.7 / 48.5).
+  No performance regression.
+
+## Follow-up: TEMPLATE=dsv4 shim deleted
+
+The needle gate's `TEMPLATE=dsv4` shim forced non-thinking mode
+(`</think>` after the assistant tag), causing the reasoning-trained
+model to loop ("code code code..."). Deleted in commit `ad2c92034`.
+The server's builtin DeepSeek-V4 template defaults to thinking-ON
+(`tokenizer.rs:170`); its own comment documents the failure mode.
 
 ## Rule
 
