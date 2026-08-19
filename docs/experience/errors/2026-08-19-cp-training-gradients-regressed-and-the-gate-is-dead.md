@@ -1,5 +1,8 @@
 # CP training gradients regressed 6.4× against single-card, and the gate that would catch it cannot run — 2026-08-19
 
+> **RESOLVED 2026-08-19** (`ad1192864`) — one dropped `* 2` in the FA3 pair
+> route's byte offsets. Item 2 below (the dead 0.8B CP gate arm) is still open.
+
 ## Context
 
 Refreshing the stale timing rows in `docs/baselines.md` on `9c2c84675`. The
@@ -47,7 +50,14 @@ supposed to agree — the 2026-08-05 correctness rows assert exactly that
 
 ## Cause
 
-Unknown. Ruled out by measurement:
+**`652f87cb8` (2026-08-17) dropped `* 2` from the five run-offset expressions in
+the FA3 pair route.** They offset raw `CUdeviceptr` byte addresses into bf16
+buffers, so every offset was halved — exact for a shard's first run (row 0 at
+batch 1 makes the whole expression 0) and wrong for every later run of a
+non-contiguous zigzag shard. Fixed in `ad1192864`; see
+[wins/2026-08-19-cp-ring-fa3-byte-offset-fix.md](../wins/2026-08-19-cp-ring-fa3-byte-offset-fix.md).
+
+Ruled out on the way, by measurement:
 
 - **Not LoRA rank/alpha.** r16/α32 and r32/α64 both give loss 11.664682 to
   every digit — `B` is zero-init so the adapter contributes nothing at step 1.
@@ -64,7 +74,10 @@ Unknown. Ruled out by measurement:
 crates/{train,autograd,cuda-kernels}/src crates/cuda-kernels/csrc` is empty), so
 the anchor holds and the doc's SHAs are wrong.
 
-**17 commits** touch the CP path in `ab0f21007..9c2c84675`. Bisecting them.
+The 2026-08-16 T1 entry recorded `cp_hidden_parity` PASS, which cut the window
+from 166 commits to the four code commits after it that touch the ring surface.
+Only `652f87cb8` edited `ring_attention.rs`, and only those five pointer lines.
+No bisect build was needed.
 
 ## Why it went unnoticed
 
@@ -102,8 +115,8 @@ be loud where the gate's results are read, not only in the run log.
 
 ## Follow-up
 
-1. Bisect `15caff0d0`..`9c2c84675` on 27B cp=2 seq=32768 grad_norm; the arm is
-   ~85 s per point.
+1. ~~Bisect~~ **Done** — `ad1192864`. cp=2 now gives loss 10.870859 /
+   grad_norm 2.152082 against cp=1's 10.870087 / 2.197122.
 2. Build the FlashQLA H=8/Hg=8 geometry, or make the 0.8B CP correctness arm
    run on the recurrent path, so the gate produces a number again.
 3. Re-run the cp=4 seq ladder once the gradient regression is fixed — the
