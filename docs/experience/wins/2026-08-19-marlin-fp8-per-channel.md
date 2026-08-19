@@ -1,6 +1,6 @@
 # Per-channel FP8 on Marlin — CUDA, 2026-08-19
 
-> Status: Landed, **numerics PASS 31/31**; perf pending (serve build blocked, see below)
+> Status: Shipped. Numerics 31/31, perf measured against a matched FP8 arm.
 
 ## Why
 
@@ -104,15 +104,53 @@ code path. `mean(out/ref)` differs in the last digit between them (0.999988 vs
 same E4M3 weights, making the quantisation error common-mode and leaving only
 accumulation order. That is the expected result, not a stuck harness.
 
+## Results
+
+1xH20, synthetic prompt, 30 s/point, `--kv-cache-dtype fp8`, no spec, decode graph
+on. Both arms on the SAME binary; the FP8 arm was re-measured after this change
+rather than reused. Aggregate tok/s.
+
+| c | before | after | delta | FP8 | vs FP8 |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 74.2 | **82.1** | +10.6% | 61.5 | **+33.4%** |
+| 2 | 103.3 | **128.5** | +24.4% | 99.8 | **+28.8%** |
+| 4 | 165.3 | **233.8** | +41.5% | 195.9 | **+19.3%** |
+| 8 | 216.8 | **367.1** | +69.3% | 358.0 | **+2.5%** |
+| 16 | 235.9 | **472.4** | **+100.2%** | 632.5 | −25.3% |
+
+The gain grows monotonically with concurrency, which is the mechanism confirming
+itself: Marlin's per-call cost is flat in M, the batched GEMV's is not. ITL at
+c=16 goes 67.82 -> 33.87 ms, and NVFP4's step-cost growth over 16x concurrency
+falls from **4.5x to 2.8x** against FP8's 1.45x. That structural defect is what
+this change was for.
+
+Engagement was checked before the numbers were read — a perf figure without it
+measures nothing:
+
+```
+cuda.fp4.marlin_tensorcore        184016
+cuda.qwen.fp8_marlin_tensorcore   157728   <- the new arm
+cuda.qwen.fp8_gemv                 80507   <- 34% still scalar
+```
+
+The control arm was checked too: the FP8 server reports
+`cuda.qwen.fp8_pack_deepgemm 256` and `cuda.qwen.fp8_gemv 512` with
+`fp8_marlin_tensorcore` **absent**, so this change did not reach into the
+comparison checkpoint. Its 128x128 blocks fail `quant_block_m == 1` as intended.
+
+## Not the ceiling: 34% of FP8 calls are still scalar
+
+`cuda.qwen.fp8_gemv` still takes 80507 of 238235 FP8 calls. Four load sites never
+call any repack — `lm_head`, `linear_attn.out_proj` x48, the TP=1 qkv, and the MTP
+fc — the same four flagged in `5499e20a7` when `down_proj`/`o_proj` were fixed for
+FP4. 48 linear-attn layers is the right order of magnitude for the residue.
+Wiring those is the next step and should land where it is still needed most, at
+c>=8.
+
 ## Pending
 
-The perf sweep. The serve binary does not currently build — `infer-core` has three
-`RequestState::new` call sites that predate a signature change adding
-`think_end_token_id` / `think_start_token_id` / `max_thinking_budget`
-(`infer-core/src/lib.rs:1197`, `:1212`). Unrelated in-progress work, not touched
-here. The parity harness lives in `infer-cuda` and builds independently, which is
-why the numerics gate could run first.
-
-Once serve builds: `/v1/stats` engagement check
-(`cuda.qwen.fp8_marlin_tensorcore > 0` and `cuda.fp8.gemv` stops growing), needle
-ladder x3, then the ITL sweep against the prediction above.
+The needle ladder x3 on this configuration, and the four unwired load sites above.
+The 32K long-agent row also needs re-measuring — the open prefill crash
+(`errors/2026-08-19-blocks-per-sm-search-two-latent-bugs.md`) has not been
+reproduced deterministically yet; `scripts/force_partial_restore.py` exists for
+that and has not been run.
