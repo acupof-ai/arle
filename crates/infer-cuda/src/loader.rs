@@ -584,13 +584,21 @@ impl PageMeta {
     /// graph
     /// keeps reading the same addresses. `seqlen_k_capture` is pinned to the capacity
     /// so the
-    /// FA3 scheduling ceiling is capture-stable. BF16 only.
+    /// FA3 scheduling ceiling is capture-stable.
+    ///
+    /// A quantized pool needs two more buffers, and at B=1 both are fixed-size: one
+    /// pool row for the new token, and the packed `[page_indptr(2) | last_page_len]`
+    /// the split-KV kernel reads. `prefix_token_rows` stays `None` — it is the one
+    /// quant buffer that grows with context, and only the quant PREFILL path reads
+    /// it, never decode.
     pub(crate) fn persistent_decode(
         ctx: &DeviceContext,
         page_size: usize,
         capacity_pages: usize,
+        format: KVFormat,
     ) -> Result<Self> {
         let cap = capacity_pages.max(1);
+        let quant = format != KVFormat::BF16;
         Ok(Self {
             q_indptr: upload_i32(ctx, &[0, 1])?,
             kv_indptr: upload_i32(ctx, &[0, 0])?,
@@ -610,9 +618,9 @@ impl PageMeta {
             num_pages: 0,
             batch: 1,
             start_pos: 0,
-            new_token_rows: None,
+            new_token_rows: quant.then(|| upload_i32(ctx, &[0])).transpose()?,
             prefix_token_rows: None,
-            quant_decode_meta: None,
+            quant_decode_meta: quant.then(|| upload_i32(ctx, &[0, 0, 0])).transpose()?,
             seqlen_k_capture: Some(cap * page_size),
             write_kv: 1,
         })
@@ -629,8 +637,13 @@ impl PageMeta {
         start_pos: usize,
     ) -> Result<()> {
         ensure!(
-            pool.format == KVFormat::BF16,
-            "persistent decode page table is BF16-only, got {:?}",
+            (pool.format == KVFormat::BF16) == self.quant_decode_meta.is_none(),
+            "persistent decode table was built for a {} pool but got {:?}",
+            if self.quant_decode_meta.is_none() {
+                "BF16"
+            } else {
+                "quantized"
+            },
             pool.format
         );
         let total_len = start_pos + 1;
@@ -687,6 +700,29 @@ impl PageMeta {
         stream
             .memcpy_htod(&[total_len as i32], &mut self.kv_lens_dev.slice_mut(0..1))
             .map_err(|e| anyhow!("refresh kv_lens_dev: {e}"))?;
+        if let (Some(new_rows), Some(quant_meta)) = (
+            self.new_token_rows.as_mut(),
+            self.quant_decode_meta.as_mut(),
+        ) {
+            let rows = pool.token_rows_for_range(slot, start_pos, 1);
+            ensure!(
+                rows.len() == 1,
+                "decode token-row lookup returned {} rows for slot {slot}",
+                rows.len()
+            );
+            let packed = pool.build_quantized_decode_indptr(&[slot]);
+            ensure!(
+                packed.len() == 3,
+                "quant decode indptr is {} i32 at B=1, expected 3",
+                packed.len()
+            );
+            stream
+                .memcpy_htod(&[rows[0] as i32], &mut new_rows.slice_mut(0..1))
+                .map_err(|e| anyhow!("refresh new_token_rows: {e}"))?;
+            stream
+                .memcpy_htod(&packed, &mut quant_meta.slice_mut(0..3))
+                .map_err(|e| anyhow!("refresh quant_decode_meta: {e}"))?;
+        }
         self.page_offsets = vec![0, num_pages];
         self.kv_lens = vec![total_len];
         self.num_pages = num_pages;
@@ -704,7 +740,7 @@ impl PageMeta {
     ) -> Result<Self> {
         // Same shape as persistent_decode; the sharded lane pins no FA3
         // scheduling ceiling (the 2D merge handles variable local page counts).
-        let mut meta = Self::persistent_decode(ctx, 1, max_local_pages)?;
+        let mut meta = Self::persistent_decode(ctx, 1, max_local_pages, KVFormat::BF16)?;
         meta.seqlen_k_capture = None;
         Ok(meta)
     }
