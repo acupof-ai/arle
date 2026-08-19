@@ -947,6 +947,10 @@ impl Dsv4Model {
                         &slot_block_offsets,
                         &page_tables,
                     )?;
+                    // TEMPORARY (#228/#229): controlled isolation instrumentation
+                    if std::env::var("ARLE_DSV4_BATCHED_DEBUG").as_deref() == Ok("1") {
+                        flash_batch.debug_dump_sched_state(&self.ctx, n, layer_idx)?;
+                    }
                     let sm_scale = prepared[0].sm_scale;
                     flash_batch.decode_lane_fwd(
                         &self.ctx,
@@ -956,7 +960,12 @@ impl Dsv4Model {
                         layer_idx,
                         n,
                         sm_scale,
-                    )
+                    )?;
+                    // TEMPORARY (#228/#229): controlled isolation instrumentation
+                    if std::env::var("ARLE_DSV4_BATCHED_DEBUG").as_deref() == Ok("1") {
+                        flash_batch.debug_dump_output(&self.ctx, n, layer_idx)?;
+                    }
+                    Ok(())
                 })?;
                 crate::profile::profile_op(
                     ctx,

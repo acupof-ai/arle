@@ -1279,6 +1279,78 @@ impl Dsv4FlashMlaDecodeBatchScratch {
             ctx, n, config, &shape, q_ptr, pool_ptr, sink_ptr, out_ptr, sm_scale,
         )
     }
+
+    // TEMPORARY (#228/#229): remove after root-cause.
+    /// D2H dump num_splits/topk_length + first indices per row for GPU diagnosis.
+    pub(crate) fn debug_dump_sched_state(
+        &self,
+        ctx: &DeviceContext,
+        n: usize,
+        layer_idx: usize,
+    ) -> Result<()> {
+        let layer_topk = self.layer_shapes[layer_idx].topk_unified;
+        let mut splits = vec![0i32; n + 1];
+        ctx.stream
+            .memcpy_dtoh(&self.num_splits, &mut splits)
+            .map_err(|e| anyhow!("debug D2H num_splits failed: {e}"))?;
+        let mut topk = vec![0i32; n];
+        ctx.stream
+            .memcpy_dtoh(&self.topk_length, &mut topk)
+            .map_err(|e| anyhow!("debug D2H topk_length failed: {e}"))?;
+        let copy_len = n * layer_topk;
+        let indices_view = self.indices.slice(0..copy_len);
+        let mut idx_host = vec![0i32; copy_len];
+        ctx.stream
+            .memcpy_dtoh(&indices_view, &mut idx_host)
+            .map_err(|e| anyhow!("debug D2H indices failed: {e}"))?;
+        let dump_len = layer_topk.min(8);
+        eprintln!(
+            "[batch-debug] layer={} n={} topk={:?} splits={:?}",
+            layer_idx,
+            n,
+            &topk[..n],
+            &splits[..=n]
+        );
+        for r in 0..n {
+            let start = r * layer_topk;
+            eprintln!(
+                "[batch-debug] layer={} row={} idx[..{}]={:?}",
+                layer_idx,
+                r,
+                dump_len,
+                &idx_host[start..start + dump_len]
+            );
+        }
+        Ok(())
+    }
+
+    // TEMPORARY (#228/#229): remove after root-cause.
+    /// D2H dump per-row output checksums for GPU diagnosis.
+    pub(crate) fn debug_dump_output(
+        &self,
+        ctx: &DeviceContext,
+        n: usize,
+        layer_idx: usize,
+    ) -> Result<()> {
+        let row_len = self.h_q * self.d_v;
+        let mut host = vec![half::bf16::from_f32(0.0); n * row_len];
+        ctx.stream
+            .memcpy_dtoh(&self.out_batched, &mut host)
+            .map_err(|e| anyhow!("debug D2H out_batched failed: {e}"))?;
+        for r in 0..n {
+            let row = &host[r * row_len..(r + 1) * row_len];
+            let (sum_abs, max_abs, non_zero) =
+                row.iter().fold((0.0f32, 0.0f32, 0usize), |(s, m, nz), &x| {
+                    let v = x.to_f32();
+                    (s + v.abs(), m.max(v.abs()), nz + usize::from(v != 0.0))
+                });
+            eprintln!(
+                "[batch-debug] layer={} row={} sum_abs={:.4} max_abs={:.4} nz={}/{}",
+                layer_idx, r, sum_abs, max_abs, non_zero, row_len
+            );
+        }
+        Ok(())
+    }
 }
 
 pub(super) struct Dsv4FusedWqkvDecodeScratch {
