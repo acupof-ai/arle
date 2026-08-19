@@ -332,12 +332,19 @@ pub(super) fn cuda_linear_attention_forward_device_row(
     let head_len = p.batch * p.seq_len * p.num_value_heads;
     let conv_len = qkv_dim * p.conv_kernel;
     let num_chunks = p.seq_len.div_ceil(64);
-    let q_len = p.seq_len * p.num_value_heads * p.key_dim;
+    // The old seq<=32 clamp guarded a WGMMA deadlock in the chunk kernel 778fef873 replaced.
+    let use_chunkwise = crate::runtime_flags::gdr_chunkwise_prefill();
+    // FlashQLA keeps q/k on the key-head axis; the recurrent prepare broadcasts each
+    // key head across its value group, so that route needs the wide extent.
+    let qk_heads = if use_chunkwise {
+        p.num_key_heads
+    } else {
+        p.num_value_heads
+    };
+    let q_len = p.seq_len * qk_heads * p.key_dim;
     let v_len = p.seq_len * p.num_value_heads * p.value_dim;
     let a_len = p.seq_len * p.num_value_heads * 64;
     let state_len = p.num_value_heads * p.key_dim * p.value_dim;
-    // The old seq<=32 clamp guarded a WGMMA deadlock in the chunk kernel 778fef873 replaced.
-    let use_chunkwise = crate::runtime_flags::gdr_chunkwise_prefill();
     // FlashQLA recomputes the per-chunk states in the backward, so only the
     // carry (chunk 0) survives on the tape.
     let chunk_state_len = if use_chunkwise {
@@ -540,8 +547,8 @@ pub(super) fn cuda_linear_attention_forward_device_row(
             let (g_ptr, _g_guard) = g.device_ptr_mut(&backend.stream);
             let (beta_ptr, _beta_guard) = beta.device_ptr_mut(&backend.stream);
             check_cuda_ffi(
-                // SAFETY: q/k are written [S, Hg, key_dim] here (the FlashQLA layout), a prefix
-                // of the q_len [S, H, key_dim] allocation; v/g/beta match v_len/head_len.
+                // SAFETY: q/k are written [S, Hg, key_dim], exactly q_len on this route;
+                // v/g/beta match v_len/head_len.
                 unsafe {
                     ffi::gdr_fq_prep_cuda(
                         qkv_ptr as *const ffi::Half,

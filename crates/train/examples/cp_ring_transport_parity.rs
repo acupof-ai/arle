@@ -141,6 +141,7 @@ fn rank_main(rank: usize) -> Result<()> {
         CP_SIZE,
         rank,
         Some(&positions),
+        None,
         &mut store,
         &mut tape,
     )

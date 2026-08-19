@@ -2,8 +2,9 @@ use smallvec::smallvec;
 
 use crate::{
     AutogradError, Result,
+    backend::DeviceHandle,
     tape::{BackwardOp, GradPairs, SavedContext, Tape, TapeEntry},
-    tensor::{Dirty, Tensor, TensorId, TensorStore},
+    tensor::{Dirty, TapeDtype, Tensor, TensorId, TensorStore},
 };
 
 pub fn add(a: TensorId, b: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<TensorId> {
@@ -32,6 +33,59 @@ pub fn add(a: TensorId, b: TensorId, store: &mut TensorStore, tape: &mut Tape) -
         .clone();
 
     let out_handle = store.backend().add(&a_handle, &b_handle, &a_shape)?;
+    let output_id = store.alloc_device_tensor(a_shape, out_handle)?;
+
+    TapeEntry {
+        op: BackwardOp::Add,
+        output_id,
+        input_ids: smallvec![a, b],
+        saved: SavedContext::None,
+    }
+    .record(store, tape)?;
+
+    Ok(output_id)
+}
+
+/// `a + b` with `b`'s device buffer as the destination, so the sum costs no new
+/// allocation. `b` is dead after this call — its handle now holds the sum, and
+/// only the returned id may be read. Falls back to the allocating `add` unless
+/// the buffer is provably sole-owned.
+pub fn add_consuming_rhs(
+    a: TensorId,
+    b: TensorId,
+    store: &mut TensorStore,
+    tape: &mut Tape,
+) -> Result<TensorId> {
+    let a_shape = store.tensor(a)?.shape.clone();
+    let b_shape = store.tensor(b)?.shape.clone();
+    if a_shape != b_shape {
+        return Err(AutogradError::ShapeMismatch {
+            expected: a_shape,
+            got: b_shape,
+        });
+    }
+
+    store.ensure_device(b)?;
+    // Probe before any clone bumps the count (same discriminator as `merge_grad`):
+    // `Some(1)` is the only proof no sibling aliases `b`'s buffer. A bf16 tape
+    // makes `add` emit a bf16 sum, which an f32 destination cannot hold.
+    let reuse_b = store.tape_dtype() == TapeDtype::F32
+        && store
+            .tensor(b)?
+            .device_handle
+            .as_ref()
+            .and_then(DeviceHandle::device_buffer_strong_count)
+            == Some(1);
+    let a_handle = store.device_handle(a)?;
+    let b_handle = store.device_handle(b)?;
+
+    let out_handle = if reuse_b {
+        store
+            .backend()
+            .accumulate_into_device(&b_handle, &a_handle, &a_shape)?
+    } else {
+        store.backend().add(&a_handle, &b_handle, &a_shape)?
+    };
     let output_id = store.alloc_device_tensor(a_shape, out_handle)?;
 
     TapeEntry {

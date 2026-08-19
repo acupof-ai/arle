@@ -30,20 +30,36 @@ pub(super) fn la_layer_peak_bytes(cfg: &Qwen35Config, batch: usize, seq_len: usi
         .saturating_add(batch.saturating_mul(seq_len).saturating_mul(4 * residual))
 }
 
-/// Peak device bytes a single FULL-attention layer holds. `repeat_kv`
-/// materializes k/v at the full sequence × local attention heads; everything
-/// downstream is chunk-bounded.
+/// Peak device bytes a single FULL-attention layer holds. CP and single-GPU both
+/// run `forward_full_attention_chunked`, so only k/v, the chunk accumulator and
+/// the residual stream are full-sequence; the whole q side costs one chunk.
+///
+/// Full-sequence terms: the k/v chain (k_proj, v_proj, two `split_heads`, k_norm,
+/// k_rope) at kv width, plus a full-head pair — off-CP that is `repeat_kv`, under
+/// CP it stands in for the ring's rotated blocks (an over-model until cp_size
+/// exceeds `1 + heads/kv_heads`) — plus the `checkpoint_seq_chunked` output and
+/// x/h. Chunk terms: q_proj at gate width, then the two slices, two transposes,
+/// q_norm, rope, attention out, sigmoid, mul and merge at q width, then o_proj.
 pub(super) fn full_attn_layer_peak_bytes(
     cfg: &Qwen35Config,
     tp: TpContext,
     batch: usize,
     seq_len: usize,
 ) -> Result<usize> {
-    let kv = 2 * tp.local_attention_heads(cfg)? * cfg.head_dim;
-    let residual = 2 * cfg.hidden_size;
-    Ok(batch
-        .saturating_mul(seq_len)
-        .saturating_mul(4 * (kv + residual)))
+    let q_dim = tp.local_attention_heads(cfg)? * cfg.head_dim;
+    let kv_dim = tp.local_key_value_heads(cfg)? * cfg.head_dim;
+    let full_seq = 6 * kv_dim + 2 * q_dim + 3 * cfg.hidden_size;
+    let per_chunk = if cfg.full_attn_gated {
+        12 * q_dim + cfg.hidden_size
+    } else {
+        6 * q_dim + cfg.hidden_size
+    };
+    let chunk = crate::runtime_flags::OPD_SEQ_CHUNK.min(seq_len);
+    Ok(batch.saturating_mul(4).saturating_mul(
+        seq_len
+            .saturating_mul(full_seq)
+            .saturating_add(chunk.saturating_mul(per_chunk)),
+    ))
 }
 
 impl Qwen35Model {

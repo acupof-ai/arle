@@ -58,10 +58,23 @@ pub fn cp_causal_sdpa(
     cp_size: usize,
     cp_rank: usize,
     positions: Option<&[usize]>,
+    k_positions: Option<&[usize]>,
     store: &mut TensorStore,
     tape: &mut Tape,
 ) -> Result<TensorId> {
-    cp_causal_sdpa_with_prefix(q, k, v, cp_size, cp_rank, positions, None, 0, store, tape)
+    cp_causal_sdpa_with_prefix(
+        q,
+        k,
+        v,
+        cp_size,
+        cp_rank,
+        positions,
+        k_positions,
+        None,
+        0,
+        store,
+        tape,
+    )
 }
 
 /// CP causal SDPA with an optional frozen-prompt-KV prefix. When `prefix_k`/`prefix_v`
@@ -75,6 +88,7 @@ pub fn cp_causal_sdpa_with_prefix(
     cp_size: usize,
     cp_rank: usize,
     positions: Option<&[usize]>,
+    k_positions: Option<&[usize]>,
     prefix: Option<(TensorId, TensorId)>,
     gen_start: usize,
     store: &mut TensorStore,
@@ -91,7 +105,18 @@ pub fn cp_causal_sdpa_with_prefix(
 
     if store.backend().device() == Device::Cuda && cp_size > 1 {
         return cp_causal_sdpa_device_ring(
-            q, k, v, cp_size, cp_rank, positions, prefix, gen_start, &shape, store, tape,
+            q,
+            k,
+            v,
+            cp_size,
+            cp_rank,
+            positions,
+            k_positions,
+            prefix,
+            gen_start,
+            &shape,
+            store,
+            tape,
         );
     }
 
@@ -117,17 +142,31 @@ pub fn cp_causal_sdpa_with_prefix(
         Some(p) => p.to_vec(),
         None => (0..s).map(|r| cp_rank * s + r).collect(),
     };
+    // k may be the full local shard while q is a tile of it, so its row count and
+    // positions are its own. Silent corruption if this is taken from q.
+    let blk_rows = store.tensor(k)?.shape[2];
+    let k_pos: Vec<usize> = match k_positions {
+        Some(p) => p.to_vec(),
+        None if blk_rows == s => q_pos.clone(),
+        None => (0..blk_rows).map(|r| cp_rank * blk_rows + r).collect(),
+    };
+    if k_pos.len() != blk_rows {
+        return Err(AutogradError::TapeInvariant(
+            "cp_causal_sdpa: k positions do not cover the local k block",
+        ));
+    }
     let qd = store.tensor_host(q)?.data;
     let kd = store.tensor_host(k)?.data;
     let vd = store.tensor_host(v)?.data;
-    let tile = s * d;
-    let mut out = vec![0.0f32; tiles * tile];
+    let q_tile = s * d;
+    let k_tile = blk_rows * d;
+    let mut out = vec![0.0f32; tiles * q_tile];
     let mut lse = vec![0.0f32; tiles * s];
     for t in 0..tiles {
-        let (qt, kt, vt) = (&qd[t * tile..], &kd[t * tile..], &vd[t * tile..]);
-        let blocks = [(&kt[..tile], &vt[..tile], q_pos.as_slice())];
-        let (o, l) = ring_forward_tile(&qt[..tile], &blocks, s, d, scale, &q_pos);
-        out[t * tile..(t + 1) * tile].copy_from_slice(&o);
+        let (qt, kt, vt) = (&qd[t * q_tile..], &kd[t * k_tile..], &vd[t * k_tile..]);
+        let blocks = [(&kt[..k_tile], &vt[..k_tile], k_pos.as_slice())];
+        let (o, l) = ring_forward_tile(&qt[..q_tile], &blocks, s, d, scale, &q_pos);
+        out[t * q_tile..(t + 1) * q_tile].copy_from_slice(&o);
         lse[t * s..(t + 1) * s].copy_from_slice(&l);
     }
 
@@ -172,6 +211,7 @@ fn cp_causal_sdpa_device_ring(
     cp_size: usize,
     cp_rank: usize,
     positions: Option<&[usize]>,
+    k_positions: Option<&[usize]>,
     prefix: Option<(TensorId, TensorId)>,
     gen_start: usize,
     shape: &[usize],
@@ -179,9 +219,11 @@ fn cp_causal_sdpa_device_ring(
     tape: &mut Tape,
 ) -> Result<TensorId> {
     let (b, h, s, d) = (shape[0], shape[1], shape[2], shape[3]);
-    let (kv_shape, kv_heads) = {
+    // q may be a tile of the local shard while k/v stay full-shard, so every
+    // k-side extent comes from k's own shape, never from q's row count.
+    let (kv_shape, kv_heads, blk_rows) = {
         let ks = store.tensor(k)?.shape.clone();
-        (ks.clone(), ks[1])
+        (ks.clone(), ks[1], ks[2])
     };
     let scale = 1.0 / (d as f32).sqrt();
     let num_q_tiles = b * h;
@@ -201,7 +243,7 @@ fn cp_causal_sdpa_device_ring(
         num_kv_heads: kv_heads,
         head_dim: d,
         q_rows: s,
-        blk_len: s,
+        blk_len: blk_rows,
         sm_scale: scale,
     };
 
@@ -271,9 +313,20 @@ fn cp_causal_sdpa_device_ring(
     // zigzag), so no rank computes another's layout.
     let mut k_cur = device_handle(store, k, "ring k")?;
     let mut v_cur = device_handle(store, v, "ring v")?;
-    let mut kpos_cur = store.backend().upload(&q_pos_f32, &[s])?;
-    let mut kpos_vec = q_pos.clone();
-    let block_elems = b * kv_heads * s * d;
+    // This rank's own k rows. Defaults to the q positions, which is exact when q is
+    // the whole local shard — the only shape that existed before q was tiled.
+    let mut kpos_vec: Vec<usize> = match k_positions {
+        Some(p) => p.to_vec(),
+        None => q_pos.clone(),
+    };
+    if kpos_vec.len() != blk_rows {
+        return Err(AutogradError::TapeInvariant(
+            "cp_causal_sdpa: k positions do not cover the local k block",
+        ));
+    }
+    let kpos_f32: Vec<f32> = kpos_vec.iter().map(|&p| p as f32).collect();
+    let mut kpos_cur = store.backend().upload(&kpos_f32, &[blk_rows])?;
+    let block_elems = b * kv_heads * blk_rows * d;
     let mut step_blocks: smallvec::SmallVec<[(TensorId, TensorId, Vec<usize>); 4]> = smallvec![];
     for j in 0..cp_size {
         let (m2, l2, o2) = store.backend().ring_block_fwd_merge(
@@ -291,8 +344,8 @@ fn cp_causal_sdpa_device_ring(
         if j + 1 < cp_size {
             k_cur = store.backend().ring_send_recv_kv(&k_cur, &[block_elems])?;
             v_cur = store.backend().ring_send_recv_kv(&v_cur, &[block_elems])?;
-            kpos_cur = store.backend().ring_send_recv_kv(&kpos_cur, &[s])?;
-            kpos_vec = ring_rotate_positions(store, &kpos_cur, s)?;
+            kpos_cur = store.backend().ring_send_recv_kv(&kpos_cur, &[blk_rows])?;
+            kpos_vec = ring_rotate_positions(store, &kpos_cur, blk_rows)?;
         }
     }
 

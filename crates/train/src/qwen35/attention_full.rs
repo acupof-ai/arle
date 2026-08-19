@@ -82,6 +82,21 @@ impl Qwen35Layer {
         Ok(maybe_all_reduce(out, tp, store, tape)?)
     }
 
+    /// Long-sequence full attention, CP and single-GPU alike: k/v are computed
+    /// full-sequence (kv_dim is small), then the whole q side — q_proj (with its
+    /// LoRA ring), the gate split, q_norm, rope, attention, gate, merge_heads,
+    /// o_proj — runs per sequence chunk via `checkpoint_seq_chunked`. Every step
+    /// of that chain is position-wise in q, so tiling is exact; it bounds the f32
+    /// projection outputs to the chunk row count instead of the full sequence —
+    /// the 131K forward-OOM site.
+    ///
+    /// Qwen3.5 / Qwen3.6 ship a gated Q projection: q_proj rows =
+    /// `num_heads * head_dim * 2`, with the second half acting as a per-head
+    /// sigmoid gate applied to the attention output. Vanilla Qwen3 (0.6B / 1.7B /
+    /// 4B / 8B) is un-gated: q_proj rows = `num_heads * head_dim`. The arch flag
+    /// `cfg.full_attn_gated` selects between the two paths so `qwen35_loader` can
+    /// load both checkpoint families without an arch fork.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn forward_full_attention(
         &self,
         h: TensorId,
@@ -100,120 +115,17 @@ impl Qwen35Layer {
         let local_attention_heads = tp.local_attention_heads(cfg)?;
         let local_key_value_heads = tp.local_key_value_heads(cfg)?;
         let kv_repeat = local_attention_heads / local_key_value_heads;
+        let head_dim = cfg.head_dim;
+        let rms_norm_eps = cfg.rms_norm_eps;
+        let full_attn_gated = cfg.full_attn_gated;
 
-        // Non-CP: k/v full-seq (small), chunk q_proj+SDPA+o_proj to bound the
-        // full-seq f32 GEMM output. CP uses its own q-shard + all-gather-kv.
-        if !cp.is_enabled() {
-            return self.forward_full_attention_chunked(
-                h,
-                attn,
-                cfg,
-                tp,
-                cos,
-                sin,
-                batch,
-                seq_len,
-                local_attention_heads,
-                local_key_value_heads,
-                kv_repeat,
-                crate::runtime_flags::OPD_SEQ_CHUNK,
-                store,
-                tape,
-            );
-        }
-
-        // Qwen3.5 / Qwen3.6 ship a gated Q projection: q_proj rows =
-        // `num_heads * head_dim * 2`, with the second half acting as a
-        // per-head sigmoid gate applied to the attention output. Vanilla
-        // Qwen3 (0.6B / 1.7B / 4B / 8B) is un-gated: q_proj rows =
-        // `num_heads * head_dim`. The arch flag `cfg.full_attn_gated`
-        // selects between the two paths so `qwen35_loader` can load both
-        // checkpoint families without an arch fork.
-        let q_full = attn.q_proj.forward(h, store, tape)?;
-        let (q, gate) = if cfg.full_attn_gated {
-            let q_full = reshape(
-                q_full,
-                &[batch, seq_len, local_attention_heads, cfg.head_dim * 2],
-                store,
-                tape,
-            )?;
-            let q = slice(
-                q_full,
-                &[0, 0, 0, 0],
-                &[batch, seq_len, local_attention_heads, cfg.head_dim],
-                store,
-                tape,
-            )?;
-            let gate = slice(
-                q_full,
-                &[0, 0, 0, cfg.head_dim],
-                &[batch, seq_len, local_attention_heads, cfg.head_dim * 2],
-                store,
-                tape,
-            )?;
-            (
-                transpose(q, 1, 2, store, tape)?,
-                Some(transpose(gate, 1, 2, store, tape)?),
-            )
-        } else {
-            let q = reshape(
-                q_full,
-                &[batch, seq_len, local_attention_heads, cfg.head_dim],
-                store,
-                tape,
-            )?;
-            (transpose(q, 1, 2, store, tape)?, None)
-        };
-
-        let k = attn.k_proj.forward(h, store, tape)?;
-        let v = attn.v_proj.forward(h, store, tape)?;
-        let k = split_heads(
-            k,
-            batch,
-            seq_len,
-            local_key_value_heads,
-            cfg.head_dim,
-            store,
-            tape,
-        )?;
-        let v = split_heads(
-            v,
-            batch,
-            seq_len,
-            local_key_value_heads,
-            cfg.head_dim,
-            store,
-            tape,
-        )?;
-
-        let q = qwen35_rmsnorm(q, attn.q_norm, cfg.rms_norm_eps, store, tape)?;
-        let k = qwen35_rmsnorm(k, attn.k_norm, cfg.rms_norm_eps, store, tape)?;
-        let q = rope(q, cos, sin, store, tape)?;
-        let k = rope(k, cos, sin, store, tape)?;
-
-        let kv_repeat = local_attention_heads / local_key_value_heads;
-        let attn_hidden = if cp.is_enabled() {
-            // Context-parallel ring attention: q/k/v are this rank's LOCAL shard
-            // ([b, heads, seq_len, hd] / [b, kv_heads, seq_len, hd]) at absolute
-            // rows [cp.rank*seq_len, ..). The ring rotates K/V cp.size times through
-            // the flash-2 device kernel, attending the causal prefix on-device —
-            // NEVER materializing the full sequence (peak O(seq_len·hd), not
-            // O(full_seq·hd)), which is the fix for the option-B slice_bwd OOM at
-            // local seq > 65535. GQA repeat happens per-block inside the kernel, so
-            // k/v ship at kv_heads width (kv_repeat× less comm). The launcher pads
-            // global seq to a multiple of cp.size and shards RoPE positions so the
-            // absolute q_abs = cp.rank*seq_len agrees with the baked-in positions.
-            let _ = kv_repeat; // GQA resolved inside the ring kernel, not here
-            debug_assert_eq!(
-                store.get(cos).map(|t| t.shape[t.shape.len() - 2]),
-                Some(seq_len),
-                "CP: cos rows must equal local seq_len (launcher must shard positions)"
-            );
-            // Absolute position of each local row — passed in as data, the SAME slice
-            // that built cos/sin, so the ring masks causally by true position and a
-            // zigzag shard's two chunks (front+back) attend the right prefix. Threaded
-            // (not re-derived) so any sharding scheme lives only in the caller (opd.rs),
-            // not here — no `global = local*size` equal-shard assumption baked in.
+        // Absolute position of each local row — passed in as data, the SAME slice
+        // that built cos/sin, so the ring masks causally by true position and a
+        // zigzag shard's two chunks (front+back) attend the right prefix. Threaded
+        // (not re-derived) so any sharding scheme lives only in the caller (opd.rs),
+        // not here — no `global = local*size` equal-shard assumption baked in.
+        // Owned: the `'static` chunk closure slices it per tile.
+        let cp_positions = if cp.is_enabled() {
             let positions = cp_positions.ok_or(AutogradError::TapeInvariant(
                 "CP full-attention requires cp_positions (the shard's absolute rows)",
             ))?;
@@ -222,68 +134,19 @@ impl Qwen35Layer {
                 seq_len,
                 "CP: cp_positions must give one absolute position per local row"
             );
-            autograd::ops::ring_attention::cp_causal_sdpa(
-                q,
-                k,
-                v,
-                cp.size,
-                cp.rank,
-                Some(positions),
-                store,
-                tape,
-            )?
+            debug_assert_eq!(
+                store.get(cos).map(|t| t.shape[t.shape.len() - 2]),
+                Some(seq_len),
+                "CP: cos rows must equal local seq_len (launcher must shard positions)"
+            );
+            Some(positions.to_vec())
         } else {
-            let k = repeat_kv(k, kv_repeat, store, tape)?;
-            let v = repeat_kv(v, kv_repeat, store, tape)?;
-            causal_sdpa_recompute(q, k, v, store, tape)?
+            None
         };
-        let attn_hidden = if let Some(gate) = gate {
-            let gate = sigmoid(gate, store, tape)?;
-            mul(attn_hidden, gate, store, tape)?
-        } else {
-            attn_hidden
-        };
-        let attn_hidden = merge_heads(
-            attn_hidden,
-            batch,
-            seq_len,
-            local_attention_heads,
-            cfg.head_dim,
-            store,
-            tape,
-        )?;
-        let out = attn.o_proj.forward(attn_hidden, store, tape)?;
-        Ok(maybe_all_reduce(out, tp, store, tape)?)
-    }
 
-    /// Long-sequence single-GPU full attention: k/v are computed full-sequence
-    /// (kv_dim is small), then q_proj + causal SDPA + o_proj are run per
-    /// sequence chunk via `checkpoint_seq_chunked`. This bounds the q/o
-    /// projection f32 outputs (and their LoRA deltas) to the chunk row count
-    /// instead of the full sequence — the 131K forward-OOM site.
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn forward_full_attention_chunked(
-        &self,
-        h: TensorId,
-        attn: &Qwen35FullAttention,
-        cfg: &Qwen35Config,
-        tp: TpContext,
-        cos: TensorId,
-        sin: TensorId,
-        batch: usize,
-        seq_len: usize,
-        local_attention_heads: usize,
-        local_key_value_heads: usize,
-        kv_repeat: usize,
-        chunk: usize,
-        store: &mut TensorStore,
-        tape: &mut Tape,
-    ) -> Result<TensorId> {
-        let head_dim = cfg.head_dim;
-        let rms_norm_eps = cfg.rms_norm_eps;
-        let full_attn_gated = cfg.full_attn_gated;
-
-        // k/v: small enough to keep full-sequence.
+        // k/v: small enough to keep full-sequence, and the CP ring needs the whole
+        // local shard resident while each q tile attends it. Under CP they stay at
+        // kv_heads width — GQA is resolved per block inside the ring kernel.
         let k = attn.k_proj.forward(h, store, tape)?;
         let v = attn.v_proj.forward(h, store, tape)?;
         let k = split_heads(
@@ -306,8 +169,14 @@ impl Qwen35Layer {
         )?;
         let k = qwen35_rmsnorm(k, attn.k_norm, rms_norm_eps, store, tape)?;
         let k = rope(k, cos, sin, store, tape)?;
-        let k = repeat_kv(k, kv_repeat, store, tape)?;
-        let v = repeat_kv(v, kv_repeat, store, tape)?;
+        let (k, v) = if cp.is_enabled() {
+            (k, v)
+        } else {
+            (
+                repeat_kv(k, kv_repeat, store, tape)?,
+                repeat_kv(v, kv_repeat, store, tape)?,
+            )
+        };
 
         // Capture the linears and norm for the replay closure.
         let q_proj = attn.q_proj.clone();
@@ -325,7 +194,7 @@ impl Qwen35Layer {
         let out = autograd::ops::checkpoint_seq_chunked(
             h,
             param_ids,
-            chunk,
+            crate::runtime_flags::OPD_SEQ_CHUNK,
             store,
             tape,
             move |st, tp_tape, start, inp| {
@@ -406,7 +275,22 @@ impl Qwen35Layer {
                 let q = rope(q, cos_chunk, sin_chunk, st, tp_tape)?;
 
                 // Causal SDPA: q at [start, start+chunk) attends k/v at [0, start+chunk).
-                let attn_hidden = causal_sdpa_recompute_with_q_start(q, k, v, start, st, tp_tape)?;
+                // Under CP the tile rings against the FULL local k/v shard plus every
+                // other rank's, masked by the tile's absolute positions.
+                let attn_hidden = match &cp_positions {
+                    Some(positions) => autograd::ops::ring_attention::cp_causal_sdpa(
+                        q,
+                        k,
+                        v,
+                        cp.size,
+                        cp.rank,
+                        Some(&positions[start..start + chunk_len]),
+                        Some(positions),
+                        st,
+                        tp_tape,
+                    )?,
+                    None => causal_sdpa_recompute_with_q_start(q, k, v, start, st, tp_tape)?,
+                };
 
                 let attn_hidden = if let Some(gate) = gate {
                     let gate = sigmoid(gate, st, tp_tape)?;
@@ -588,6 +472,7 @@ impl Qwen35Layer {
             cp.size,
             cp.rank,
             cp_positions,
+            None,
             Some((prefix_kv.k, prefix_kv.v)),
             gen_start,
             store,
