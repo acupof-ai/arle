@@ -235,8 +235,10 @@ impl Dsv4CudaExecutor {
         self.dspark_commit_block(slot_idx, &proposal, &verify.argmax, verify_pos)
     }
 
-    /// Batched DSpark block decode for B>1: drafts per slot, then verifies ALL
-    /// chains in ONE batched target forward, amortizing the heaviest phase.
+    /// Batched DSpark block decode: drafts per slot, then verifies ALL chains
+    /// in ONE batched target forward, amortizing the heaviest phase.
+    /// Currently unreachable under the DSv4 B=1 gate pin; preserved for the
+    /// batched-draft lever (#230).
     pub(super) fn dspark_decode_tokens_batched(
         &mut self,
         rows: &[Dsv4DecodeBatchRow],

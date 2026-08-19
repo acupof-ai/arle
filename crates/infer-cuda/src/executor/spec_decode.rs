@@ -365,9 +365,9 @@ impl Dsv4CudaExecutor {
     /// Returns one committed-token list per input slot, index-aligned with
     /// `slot_ids`.
     ///
-    /// B=1 never calls this path; the executor keeps single-slot spec on
-    /// `spec_step`. B>1 always calls this path so verify does not degrade into
-    /// per-slot tiny GEMMs/GEMVs.
+    /// Currently unreachable: the DSv4 gate pins to B=1 and B=1 takes the early
+    /// return in `forward_decode_batch_inner`. Preserved for the batched-draft
+    /// lever (#230).
     ///
     /// §0.1 mutated state (per slot s, looped — no cross-slot aliasing; each
     /// `Dsv4SlotState` owns its rings):
