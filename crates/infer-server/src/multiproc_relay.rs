@@ -542,6 +542,37 @@ impl WireStats {
     }
 }
 
+/// Aggregate per-rank [`WireStats`] into a group-level snapshot.
+///
+/// Under TP every rank serves the same requests, so counters (throughput,
+/// prefix hits, spec) are identical across ranks — rank 0's values are the
+/// group truth. Gauges that reflect per-rank KV state (free pages, cached
+/// pages, tier residency) can diverge because the prefix cache is per-rank;
+/// the group's usable capacity is the MIN across ranks.
+pub(crate) fn aggregate_wire_stats(mut ranks: Vec<WireStats>) -> WireStats {
+    if ranks.len() <= 1 {
+        return ranks.pop().unwrap_or_default();
+    }
+    let mut agg = ranks.remove(0);
+    for r in &ranks {
+        agg.kv_free_pages = agg.kv_free_pages.min(r.kv_free_pages);
+        agg.prefix_cached_pages = agg.prefix_cached_pages.min(r.prefix_cached_pages);
+        agg.kv_tier_resident_blocks = agg.kv_tier_resident_blocks.min(r.kv_tier_resident_blocks);
+        agg.kv_system_resident_pages = agg.kv_system_resident_pages.min(r.kv_system_resident_pages);
+        agg.kv_system_resident_evictable_pages = agg
+            .kv_system_resident_evictable_pages
+            .min(r.kv_system_resident_evictable_pages);
+        agg.kv_system_host_demoted_pages = agg
+            .kv_system_host_demoted_pages
+            .min(r.kv_system_host_demoted_pages);
+        agg.kv_system_host_demoted_pending_inflight = agg
+            .kv_system_host_demoted_pending_inflight
+            .min(r.kv_system_host_demoted_pending_inflight);
+        agg.kv_system_disk_pages = agg.kv_system_disk_pages.min(r.kv_system_disk_pages);
+    }
+    agg
+}
+
 /// Self-contained worker->coordinator completion delta (Stage 1).
 ///
 /// Mirrors the shape of the public `infer_api::CompletionStreamDelta` minus the
@@ -745,7 +776,7 @@ pub struct RelayCoordinator {
     workers: BTreeMap<usize, Box<dyn RelayChannel>>,
     completion_sinks:
         Arc<Mutex<HashMap<u64, tokio::sync::mpsc::UnboundedSender<RelayCompletionDelta>>>>,
-    stats_sinks: Arc<Mutex<HashMap<u64, tokio::sync::oneshot::Sender<WireStats>>>>,
+    stats_sinks: Arc<Mutex<HashMap<u64, StatsAwaiter>>>,
     completion_shutdown: Arc<AtomicBool>,
     /// Count of ranks that sent [`RelayEnvelope::EngineReady`]; the coordinator
     /// polls it via [`Self::ready_count`] before opening HTTP.
@@ -753,6 +784,13 @@ pub struct RelayCoordinator {
     /// Per-rank tick-ack ledger, fed by the reader threads; the lockstep loop
     /// polls [`Self::min_acked_ticks`] to pace the tick stream to engine speed.
     tick_acks: Arc<TickAckLedger>,
+}
+
+/// Collects per-rank [`WireStats`] responses for one stats query. The reader
+/// threads push each rank's response into `tx`; the coordinator collects
+/// `worker_count` responses then unregisters the awaiter.
+struct StatsAwaiter {
+    tx: tokio::sync::mpsc::UnboundedSender<WireStats>,
 }
 
 /// Pending coordinator state — listener is bound and port is known but workers
@@ -868,10 +906,7 @@ impl PendingRelayCoordinator {
             }
         }
         let completion_sinks = Arc::new(Mutex::new(HashMap::new()));
-        let stats_sinks = Arc::new(Mutex::new(HashMap::<
-            u64,
-            tokio::sync::oneshot::Sender<WireStats>,
-        >::new()));
+        let stats_sinks = Arc::new(Mutex::new(HashMap::<u64, StatsAwaiter>::new()));
         let completion_shutdown = Arc::new(AtomicBool::new(false));
         let ready_count = Arc::new(AtomicUsize::new(0));
         let tick_acks = Arc::new(TickAckLedger::new(workers.keys().copied()));
@@ -1048,12 +1083,12 @@ impl RelayCoordinator {
     pub fn register_stats_awaiter(
         &self,
         request_id: u64,
-    ) -> tokio::sync::oneshot::Receiver<WireStats> {
-        let (tx, rx) = tokio::sync::oneshot::channel();
+    ) -> tokio::sync::mpsc::UnboundedReceiver<WireStats> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         self.stats_sinks
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(request_id, tx);
+            .insert(request_id, StatsAwaiter { tx });
         rx
     }
 
@@ -1066,13 +1101,14 @@ impl RelayCoordinator {
             .remove(&request_id);
     }
 
-    /// Send a stats query to rank-0 (does NOT broadcast to all ranks).
+    /// Broadcast a stats query to ALL connected ranks. Each rank replies with a
+    /// [`RelayEnvelope::StatsResponse`]; the coordinator collects `worker_count`
+    /// responses and aggregates them (see [`aggregate_wire_stats`]).
     pub fn send_stats_query(&mut self, request_id: u64) -> Result<()> {
-        let rank0 = self
-            .workers
-            .get_mut(&0)
-            .ok_or_else(|| anyhow::anyhow!("rank-0 worker not connected"))?;
-        rank0.send(&RelayEnvelope::StatsQuery { request_id })
+        for worker in self.workers.values_mut() {
+            worker.send(&RelayEnvelope::StatsQuery { request_id })?;
+        }
+        Ok(())
     }
 }
 
@@ -1202,7 +1238,7 @@ fn spawn_completion_reader(
     completion_sinks: Arc<
         Mutex<HashMap<u64, tokio::sync::mpsc::UnboundedSender<RelayCompletionDelta>>>,
     >,
-    stats_sinks: Arc<Mutex<HashMap<u64, tokio::sync::oneshot::Sender<WireStats>>>>,
+    stats_sinks: Arc<Mutex<HashMap<u64, StatsAwaiter>>>,
     shutdown: Arc<AtomicBool>,
     ready_count: Arc<AtomicUsize>,
     tick_acks: Arc<TickAckLedger>,
@@ -1214,12 +1250,12 @@ fn spawn_completion_reader(
             loop {
                 match channel.recv() {
                     Ok(Some(RelayEnvelope::StatsResponse { request_id, data })) => {
-                        if let Some(tx) = stats_sinks
+                        if let Some(awaiter) = stats_sinks
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .remove(&request_id)
+                            .get(&request_id)
                         {
-                            let _ = tx.send(*data);
+                            let _ = awaiter.tx.send(*data);
                         }
                     }
                     Ok(Some(RelayEnvelope::Completion { request_id, delta })) => {
@@ -1337,4 +1373,48 @@ fn read_envelope(stream: &mut TcpStream) -> Result<Option<RelayEnvelope>> {
     let envelope: RelayEnvelope =
         serde_json::from_slice(&payload).context("relay deserialize envelope")?;
     Ok(Some(envelope))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn aggregate_uses_rank0_counters_and_min_gauges() {
+        let rank0 = WireStats {
+            throughput_requests_succeeded: 100,
+            prefix_hits: 50,
+            kv_free_pages: 1000,
+            prefix_cached_pages: 200,
+            ..Default::default()
+        };
+        let rank1 = WireStats {
+            throughput_requests_succeeded: 999, // counter: ignored, rank 0 wins
+            prefix_hits: 499,                   // counter: ignored
+            kv_free_pages: 500,                 // gauge: min wins
+            prefix_cached_pages: 150,           // gauge: min wins
+            ..Default::default()
+        };
+        let agg = aggregate_wire_stats(vec![rank0, rank1]);
+        assert_eq!(agg.throughput_requests_succeeded, 100);
+        assert_eq!(agg.prefix_hits, 50);
+        assert_eq!(agg.kv_free_pages, 500);
+        assert_eq!(agg.prefix_cached_pages, 150);
+    }
+
+    #[test]
+    fn aggregate_single_rank_is_identity() {
+        let w = WireStats {
+            kv_free_pages: 42,
+            ..Default::default()
+        };
+        let agg = aggregate_wire_stats(vec![w]);
+        assert_eq!(agg.kv_free_pages, 42);
+    }
+
+    #[test]
+    fn aggregate_empty_is_default() {
+        let agg = aggregate_wire_stats(Vec::new());
+        assert_eq!(agg.kv_free_pages, 0);
+    }
 }
