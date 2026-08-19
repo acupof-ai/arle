@@ -128,7 +128,7 @@ The real workload: 32K-token multi-turn agent prompts, not a synthetic short pro
 
 ### DeepSeek-V4-Flash (8×H20, TP=8/EP=8, FP8 MoE)
 
-B=1 decode **53 tok/s** (prefill 23 ms). With the DSpark block drafter: B=1 **72.4 tok/s** (+37%, 58.7% acceptance rate); the batched decode lane gains a further **+48%** at c=8.
+With the DSpark block drafter: c=1 **65.6 tok/s**, c=8 182.1, c=16 244.8 (output tok/s, 50.4% acceptance at c=1). Speculation only engages at c=1 — by c=8 the drafter contributes under 1% and those points are plain decode. Full rows in [docs/baselines.md](docs/baselines.md).
 
 ### DeepSeek-V4-Flash (2×H20, TP=2, W4AFP8 MoE)
 
