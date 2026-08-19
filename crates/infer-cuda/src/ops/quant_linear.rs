@@ -17,7 +17,24 @@ mod qwen_fp8_dense_policy {
 /// Dequant→BF16→WMMA GEMM floor. M=1 (decode) stays on the batched GEMV;
 /// M>=2 uses the WMMA GEMM which avoids the 2× memory blowup of cuBLAS for
 /// small batches (DSpark verify, MoE expert routing).
+///
+/// Safe for FP4/W8A16 only because a Marlin arm claims M<=[`QWEN_FP4_MARLIN_MAX_M`]
+/// first — and only for weights the repack accepted. A W8A16 weight Marlin could
+/// not repack still reaches its dequant arm at M=2 and pays a full-weight dequant
+/// per decode step; unmeasured, no such checkpoint on hand. A format with no
+/// Marlin arm at all must use [`QWEN_DEQUANT_GEMM_PREFILL_MIN_M`] — see its note.
 const QWEN_FP8_DEQUANT_GEMM_MIN_M: usize = 2;
+
+/// M floor for a dequant→BF16 GEMM on a format with no Marlin arm. A full-weight
+/// dequant per call costs ~5× the weight bytes a batched GEMV reads, so it is a
+/// prefill trade and must never fire on a decode step. This is a routing
+/// invariant, not a tuned crossover: above any decode batch, below
+/// `SchedulerConfig::chunked_prefill_size` (2048).
+///
+/// ponytail: one constant separating decode from prefill. Instantiating Marlin
+/// `kFE4M3fn` for per-channel FP8 removes the need for it — the dequant arm then
+/// only sees M > [`QWEN_FP4_MARLIN_MAX_M`], same as every other format.
+const QWEN_DEQUANT_GEMM_PREFILL_MIN_M: usize = 512;
 
 /// Largest M where the NVFP4 Marlin GEMM beats dequant→BF16 cuBLAS. Measured
 /// cold on 1xH20 (sm_90) at the 27B dense MLP shapes: Marlin is 96% faster at
@@ -542,12 +559,17 @@ fn reserve_dequant_scratch(ctx: &DeviceContext, elems: usize) -> bool {
 /// (~20× slower at M=2048): dequant once, cuBLAS GEMM over all M rows instead.
 ///
 /// Only engages when:
-///  - the weight is `Fp8BlockScaled` with the canonical 128x128 block shape,
-///  - `M >= QWEN_FP8_DEQUANT_GEMM_MIN_M` (small-M decode keeps the scalar GEMV:
-///    a full-weight dequant per call is never worth it at tiny M).
+///  - the weight is `Fp8BlockScaled` (any block shape — per-channel `[1, K]`
+///    included, since DeepGEMM above takes only the canonical 128x128),
+///  - `M >= QWEN_DEQUANT_GEMM_PREFILL_MIN_M`.
 ///
-/// Returns `Ok(false)` when it does not apply (small-M decode), leaving
-/// `gemm_batch` to fall through to the scalar/MMA block-scaled GEMV.
+/// The M floor is load-bearing. The dequant is per call, not cached, so at
+/// decode M this path re-materialises every FP8 weight in the model on every
+/// step: on Qwen3.8-27B-NVFP4 that is 11.56 G params, +85 ms/step, measured as
+/// a 5× aggregate throughput loss at c=16.
+///
+/// Returns `Ok(false)` when it does not apply, leaving `gemm_batch` to fall
+/// through to the scalar/MMA block-scaled GEMV.
 fn try_fp8_dequant_bf16_gemm_batch(
     ctx: &DeviceContext,
     weight: &DeviceMatrix,
@@ -555,7 +577,7 @@ fn try_fp8_dequant_bf16_gemm_batch(
     out: &mut HiddenStates,
 ) -> Result<bool> {
     if weight.weight_format != WeightFormat::Fp8BlockScaled
-        || x.seq_len < QWEN_FP8_DEQUANT_GEMM_MIN_M
+        || x.seq_len < QWEN_DEQUANT_GEMM_PREFILL_MIN_M
     {
         return Ok(false);
     }
@@ -1026,14 +1048,6 @@ pub(super) fn gemm_batch(
         return Ok(());
     }
 
-    // Pre-Hopper (sm < 9) large-M dense FP8: DeepGEMM's wgmma path is gated off
-    // above, so dequant → BF16 cuBLAS GEMM here (small-M decode keeps the scalar
-    // GEMV below). No-op on Hopper (returns false).
-    if try_fp8_dequant_bf16_gemm_batch(ctx, weight, x, out)? {
-        FP8_DEQUANT_GEMM_HITS.fetch_add(1, Ordering::Relaxed);
-        return Ok(());
-    }
-
     // W8A16 tensor-core (Ampere+): Marlin GEMM when the weight was repacked at
     // load. Supersedes both the dequant→cuBLAS prefill fallback and the scalar
     // batched-GEMV below. Returns false on pre-sm_80 / unaligned (not repacked).
@@ -1052,6 +1066,15 @@ pub(super) fn gemm_batch(
     // of the per-token weight re-read of the batched GEMV below. Also the
     // fallback for weights Marlin could not repack.
     if try_fp4_dequant_bf16_gemm_batch(ctx, weight, x, out)? {
+        return Ok(());
+    }
+
+    // FP8 large-M (prefill) for the shapes DeepGEMM declined — per-channel
+    // `[1, K]` scales above all. Ordered with the other dequant arms, after
+    // Marlin: a dequant arm ahead of the tensor-core arms is what made this fire
+    // on decode steps.
+    if try_fp8_dequant_bf16_gemm_batch(ctx, weight, x, out)? {
+        FP8_DEQUANT_GEMM_HITS.fetch_add(1, Ordering::Relaxed);
         return Ok(());
     }
 

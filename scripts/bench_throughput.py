@@ -532,9 +532,19 @@ async def async_main(args: argparse.Namespace) -> int:
                 "results": [asdict(result) for result in results],
             })
             write_outputs(args.output, report)
+            # `out` is end-to-end (prefill included) and `decode` is per-token;
+            # they are different SLOs and diverge by >2x on long prompts. Print
+            # the mean prompt length too: a short-prompt sweep measures the
+            # weight-read path only and must not be read as a serving number.
+            itl_mean = (summary.get("itl") or {}).get("mean_ms")
+            prompt_mean = (
+                summary["prompt_tokens"] / summary["complete"] if summary["complete"] else 0
+            )
             print(
                 f"c={concurrency}: complete={summary['complete']}/{summary['requests']} "
+                f"prompt={prompt_mean:.0f} tok "
                 f"out={summary['output_tokens_per_s']:.1f} tok/s "
+                f"decode={1000.0 / itl_mean if itl_mean else 0:.1f} tok/s "
                 f"total={summary['total_tokens_per_s']:.1f} tok/s "
                 f"req={summary['requests_per_s']:.2f}/s"
             )
