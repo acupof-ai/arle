@@ -73,9 +73,9 @@ mod nvtx;
 mod ops;
 #[cfg(feature = "cuda")]
 mod profile;
-// Session KV-recall (infinite memory): resident mean-key reps + restricted page
-// table on the dense-Qwen3 paged decode path. The `default_recall_config`
-// budget is device-neutral; the rep/score machinery is cuda-gated inside.
+// Session KV-recall (infinite memory): resident key envelopes + restricted page
+// table on the dense-Qwen3 paged decode path. The budget and the envelope
+// arithmetic live in `infer_core::recall`; the device readback is cuda-gated.
 mod recall;
 #[cfg(feature = "cuda")]
 mod stage_profile;

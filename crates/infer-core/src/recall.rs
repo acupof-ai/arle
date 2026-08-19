@@ -6,10 +6,12 @@
 //! by the executor page-gather primitive (`infer-metal` `gather_kv_ranges`, #4).
 //!
 //! This module is pure arithmetic — no device types, no session id — so it is
-//! fully unit-testable. The score computation (`query · mean-key`) is device-side;
-//! the offload/promote of evicted blocks reuses `prefix.rs` + the kv tier. The
-//! budget (sink/local/recall split) is carved out of `resource.rs`'s
-//! `kv_capacity_tokens` by the caller (`SessionMemory`, #2).
+//! fully unit-testable. It owns the block representation ([`fold_key`],
+//! [`score_block`]) as well as the plan, so both backends rank blocks the same
+//! way; only fetching the keys is device-side. The offload/promote of evicted
+//! blocks reuses `prefix.rs` + the kv tier. The budget (sink/local/recall split)
+//! is carved out of `resource.rs`'s `kv_capacity_tokens` by the caller
+//! (`SessionMemory`, #2).
 
 /// Fixed-region budget for a session's GPU working set, in tokens.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,10 +27,65 @@ pub struct RecallConfig {
 }
 
 impl RecallConfig {
+    /// The budget validated by the offline Qwen3.6 quality gate
+    /// (`wins/2026-06-23-kv-recall-arle-core-e2e.md`): working set
+    /// `32 + 256 + 8·32 = 544` tokens, 9.6% of the KV in that run. One copy —
+    /// every backend reads this, so retuning cannot silently diverge them.
+    ///
+    /// Recall only restricts attention once `cache_len` exceeds the budget;
+    /// below it [`plan_recall`] returns the full contiguous range.
+    pub const VALIDATED: Self = Self {
+        n_init: 32,
+        n_local: 256,
+        l_bs: 32,
+        top_k: 8,
+    };
+
     #[must_use]
     pub fn working_set_tokens(&self) -> usize {
         self.n_init + self.n_local + self.top_k * self.l_bs
     }
+
+    /// Every region boundary must land on a page edge, or a block spans a
+    /// partial page and the per-page readback folds foreign tokens into it.
+    #[must_use]
+    pub fn is_page_aligned(&self, page_size: usize) -> bool {
+        page_size > 0
+            && self.n_init.is_multiple_of(page_size)
+            && self.n_local.is_multiple_of(page_size)
+            && self.l_bs.is_multiple_of(page_size)
+    }
+}
+
+/// Widen a block's per-channel key envelope `[lo, hi]` to contain `key`.
+///
+/// An interval, not a mean: K is cached post-RoPE, so averaging over a block's
+/// consecutive positions rotates each key by a different angle and the
+/// high-frequency channels cancel to zero — measured 2026-08-18, a mean-key
+/// scorer retrieved 0/16 at every context length, flat in how much of the middle
+/// it kept. The envelope survives rotation and bounds `max q·k`.
+///
+/// `key` is one head's `head_dim` channels; `lo`/`hi` are that head's slice of
+/// the envelope. Seed them with `f32::INFINITY` / `f32::NEG_INFINITY` — those are
+/// the identities, so an untouched block stays neutral under a cross-shard widen.
+pub fn fold_key(lo: &mut [f32], hi: &mut [f32], key: impl IntoIterator<Item = f32>) {
+    for ((l, h), v) in lo.iter_mut().zip(hi.iter_mut()).zip(key) {
+        *l = l.min(v);
+        *h = h.max(v);
+    }
+}
+
+/// Upper bound on a block's true `max q·k`, from its key envelope.
+///
+/// Per channel take the better end of the interval. Being a bound is what makes
+/// a top-k selection admissible — a mean gives none.
+#[must_use]
+pub fn score_block(q: &[f32], lo: &[f32], hi: &[f32]) -> f32 {
+    q.iter()
+        .zip(lo)
+        .zip(hi)
+        .map(|((&q, &l), &h)| (q * l).max(q * h))
+        .sum()
 }
 
 /// The planned decode working set for one step.
@@ -142,4 +199,49 @@ fn merge_adjacent(ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod envelope_tests {
+    use super::*;
+
+    /// The property the selector rests on: the envelope score is an upper bound
+    /// on the block's true `max q·k`, and a mean is not. Without the bound, a
+    /// top-k selection can drop the block that actually matters.
+    #[test]
+    fn envelope_bounds_max_dot_where_mean_does_not() {
+        let hd = 4;
+        // Two keys that cancel channel-wise, as post-RoPE keys in one block do.
+        let keys = [vec![1.0, -1.0, 0.5, -0.5], vec![-1.0, 1.0, -0.5, 0.5]];
+        let mut lo = vec![f32::INFINITY; hd];
+        let mut hi = vec![f32::NEG_INFINITY; hd];
+        let mut mean = vec![0.0_f32; hd];
+        for k in &keys {
+            fold_key(&mut lo, &mut hi, k.iter().copied());
+            for (m, v) in mean.iter_mut().zip(k) {
+                *m += v / keys.len() as f32;
+            }
+        }
+        let q = vec![1.0, 0.0, 2.0, 0.0];
+        let truth = keys
+            .iter()
+            .map(|k| q.iter().zip(k).map(|(a, b)| a * b).sum::<f32>())
+            .fold(f32::NEG_INFINITY, f32::max);
+        let mean_score: f32 = q.iter().zip(&mean).map(|(a, b)| a * b).sum();
+        assert!(truth > 0.0, "the block IS relevant: {truth}");
+        assert!(score_block(&q, &lo, &hi) >= truth, "envelope must bound it");
+        assert_eq!(mean_score, 0.0, "the mean cancels this block to zero");
+    }
+
+    #[test]
+    fn identity_seed_is_neutral_under_widen() {
+        let (lo_a, hi_a) = (vec![f32::INFINITY; 2], vec![f32::NEG_INFINITY; 2]);
+        let mut lo_b = vec![f32::INFINITY; 2];
+        let mut hi_b = vec![f32::NEG_INFINITY; 2];
+        fold_key(&mut lo_b, &mut hi_b, [3.0_f32, -1.0]);
+        let widened_lo: Vec<f32> = lo_a.iter().zip(&lo_b).map(|(a, b)| a.min(*b)).collect();
+        let widened_hi: Vec<f32> = hi_a.iter().zip(&hi_b).map(|(a, b)| a.max(*b)).collect();
+        assert_eq!(widened_lo, lo_b);
+        assert_eq!(widened_hi, hi_b);
+    }
 }

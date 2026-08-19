@@ -839,7 +839,7 @@ impl Qwen35CudaExecutor {
             sharded_decode_meta: Vec::new(),
             batch_decode: None,
             kv_recall: false,
-            recall_cfg: crate::recall::default_recall_config(),
+            recall_cfg: infer_core::RecallConfig::VALIDATED,
             recall: (0..num_slots)
                 .map(|_| crate::recall::CudaRecallState::default())
                 .collect(),
@@ -1094,6 +1094,19 @@ impl Qwen35CudaExecutor {
             "--kv-recall is not supported with attn_cp>1 without 2D parallelism \
              (replicated pool diverges under rank-local recall)"
         );
+        // Config invariant, not a per-row one: a region boundary off a page edge
+        // makes a block span a partial page and the per-page readback folds
+        // foreign tokens into its envelope.
+        if let Some(pool) = self.full_attn_kv.as_ref() {
+            ensure!(
+                !enabled || self.recall_cfg.is_page_aligned(pool.page_size),
+                "KV-recall config (n_init {}, n_local {}, l_bs {}) must be multiples of page_size {}",
+                self.recall_cfg.n_init,
+                self.recall_cfg.n_local,
+                self.recall_cfg.l_bs,
+                pool.page_size
+            );
+        }
         self.kv_recall = enabled;
         if enabled {
             let shard = infer_seam::ShardSpec::new(
@@ -1261,7 +1274,7 @@ impl Qwen35CudaExecutor {
                 slot
             );
         }
-        self.mirror_host_slot(host_kv, slot, row.start_pos + row.tokens.len())?;
+        self.mirror_host_slot(host_kv, slot, row.end_pos())?;
         let (meta, cp) = self.build_prefill_geometry(row)?;
         let Self {
             model,
@@ -1327,7 +1340,7 @@ impl Qwen35CudaExecutor {
             row.tokens.len(),
             row.start_pos,
         )?;
-        let is_final = row.start_pos + row.tokens.len() == row.total_tokens;
+        let is_final = row.is_final_chunk();
         df.pending = (is_final && df.ctx_end == row.total_tokens).then_some(token);
         Ok((token, logprob))
     }
@@ -1386,8 +1399,7 @@ impl Qwen35CudaExecutor {
                 pool,
                 slot,
                 row.kv_seq_len,
-                cp_rank,
-                cp_size,
+                infer_seam::ShardSpec::new(cp_rank, cp_size),
             )?;
         }
         // B2 CP decode (T3.1): head-shard across the cp group once the KV is
@@ -2179,12 +2191,12 @@ impl Qwen35CudaExecutor {
     ) -> Result<(u32, Option<f32>)> {
         let slot = row.slot;
         let cfg = self.recall_cfg;
-        let cache_len = row.start_pos + row.tokens.len();
+        let cache_len = row.end_pos();
         // The cycle runs at the tail of the LAST row only. Evicting on an earlier
         // chunk leaves EVICTED_PAGE sentinels in the page table that the next
         // chunk's prefill must still attend through — degenerate logits above the
         // chunk size.
-        let final_row = cache_len >= row.total_tokens;
+        let final_row = row.is_final_chunk();
         self.mirror_host_slot(host_kv, slot, cache_len)?;
         let (meta, cp) = self.build_prefill_geometry(row)?;
         // `rc` carries back the layer-0 query used for scoring below.
@@ -2220,18 +2232,6 @@ impl Qwen35CudaExecutor {
             return Ok(token); // non-final chunk: plain paged prefill, no cycle
         };
 
-        let ps = self.full_attn_kv.as_ref().expect("full_attn_kv").page_size;
-        ensure!(
-            cfg.n_init.is_multiple_of(ps)
-                && cfg.n_local.is_multiple_of(ps)
-                && cfg.l_bs.is_multiple_of(ps),
-            "KV-recall config (n_init {}, n_local {}, l_bs {}) must be multiples of page_size {}",
-            cfg.n_init,
-            cfg.n_local,
-            cfg.l_bs,
-            ps
-        );
-
         // `allow_prefetch=true` lets tier-resident blocks re-enter the working set.
         let num_q_heads = self.model.local_q_heads();
         let num_kv_heads = self.model.local_kv_heads();
@@ -2245,9 +2245,12 @@ impl Qwen35CudaExecutor {
         if two_d {
             layer0_query.resize(num_q_heads * head_dim, 0.0);
             let tp = &self.model.tp;
-            tp.reduce_f32_over(tp.attn_cp(), &self.model.ctx, &mut layer0_query, |a, b| {
-                a + b
-            })?;
+            tp.reduce_f32_over(
+                tp.attn_cp(),
+                &self.model.ctx,
+                &mut layer0_query,
+                cuda_kernels::collective::ReduceOp::Sum,
+            )?;
         }
         let (evict_pages, prefetch_pages) = {
             let Self {
@@ -2863,7 +2866,7 @@ impl Qwen35CudaExecutor {
                 pool.mirror_slot(row.slot, &[], 0)?;
             }
         }
-        let position = (row.start_pos + row.tokens.len()) as u64;
+        let position = row.end_pos() as u64;
         if self.recall_active() {
             return self.prefill_row_recall(row, position, host_kv);
         }
@@ -2896,8 +2899,8 @@ impl Qwen35CudaExecutor {
         host_kv: &dyn KvPool,
     ) -> Result<(u32, Option<f32>)> {
         let start = row.start_pos;
-        let end = start + row.tokens.len();
-        let is_final = end == row.total_tokens;
+        let end = row.end_pos();
+        let is_final = row.is_final_chunk();
         let lstar = row.total_tokens.saturating_sub(1) / SUPPORTED_PAGE_SIZE * SUPPORTED_PAGE_SIZE;
         let stride = SIDECAR_SNAPSHOT_STRIDE_PAGES * SUPPORTED_PAGE_SIZE; // const, > 0
 

@@ -608,8 +608,8 @@ impl Dsv4CudaExecutor {
             self.slots[row.slot]
                 .refresh_flashmla_device_page_tables(&self.model.ctx, &self.kv_adapter)?;
         }
-        let position = (row.start_pos + row.tokens.len()) as u64;
-        let final_prefill = row.start_pos + row.tokens.len() >= row.total_tokens;
+        let position = row.end_pos() as u64;
+        let final_prefill = row.is_final_chunk();
         let tokens = self.forward_prefill_tokens(
             row.slot,
             &row.tokens,
@@ -625,12 +625,7 @@ impl Dsv4CudaExecutor {
         self.seed_dspark_prompt(row.slot, row.start_pos)?;
         let slot = row.slot;
         let slot_pages = &kv_batch.flat_slot_page_ids[kv_batch.rows[0].slot_page_range.clone()];
-        self.publish_completed_prefix_pages(
-            slot,
-            slot_pages,
-            row.start_pos,
-            row.start_pos + row.tokens.len(),
-        );
+        self.publish_completed_prefix_pages(slot, slot_pages, row.start_pos, row.end_pos());
         Ok(tokens
             .into_iter()
             .map(|token| Self::slot_token(slot, token))

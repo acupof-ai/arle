@@ -12,7 +12,9 @@ mod radix;
 mod recall;
 
 pub use radix::{BlockId, PrefixMatch, RadixCache};
-pub use recall::{RecallConfig, RecallPlan, plan_recall, recall_block_count};
+pub use recall::{
+    RecallConfig, RecallPlan, fold_key, plan_recall, recall_block_count, score_block,
+};
 
 use anyhow::Result;
 use infer_plan::{FinishReason, ForwardPlan, SamplingParams, SlotToken, StepOutput};
@@ -1232,7 +1234,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
                 continue;
             }
             let target = request.committed_len();
-            let new_start = (row.start_pos + row.tokens.len()).min(target);
+            let new_start = row.end_pos().min(target);
             self.throughput_stats.prefill_tokens = self
                 .throughput_stats
                 .prefill_tokens

@@ -307,7 +307,7 @@ impl MetalExecutor {
                 pending: None,
                 dflash,
                 kv_recall: false,
-                recall_cfg: default_recall_config(),
+                recall_cfg: infer_core::RecallConfig::VALIDATED,
                 recall_int8_warned: false,
             }),
         })
@@ -623,21 +623,6 @@ struct PendingStep {
     sampled: mlx::MlxArray,
 }
 
-/// Validated session KV-recall budget (per the offline Qwen3.6 quality gate +
-/// `wins/2026-06-23-kv-recall-arle-core-e2e.md`): sink 32, local 256, block 32,
-/// top-k 8 → working set 32 + 256 + 8·32 = 544 tokens (9.6% KV in the e2e).
-/// Recall only restricts attention once `cache_len` exceeds this budget; below
-/// it `plan_recall` returns the full contiguous range (no-op).
-#[cfg(feature = "metal")]
-fn default_recall_config() -> infer_core::RecallConfig {
-    infer_core::RecallConfig {
-        n_init: 32,
-        n_local: 256,
-        l_bs: 32,
-        top_k: 8,
-    }
-}
-
 #[cfg(feature = "metal")]
 struct RealMetalExecutor {
     config: config::MetalModelConfig,
@@ -929,7 +914,7 @@ impl RealMetalExecutor {
             None
         };
         mlx::async_eval(&[&logits]);
-        slot.cache_len = row.start_pos + row.tokens.len();
+        slot.cache_len = row.end_pos();
         slot.committed_len = slot.cache_len;
         slot.last_sampled = None;
         if let Some(hidden) = dflash_hidden {
@@ -1779,17 +1764,16 @@ mod tests {
         assert!(gather_kv_ranges(&arr, &[(0, 7)]).is_err());
     }
 
-    // Session KV-recall reps (#2): `update_block_reps` mean-pools layer-0 K over
-    // each frozen middle block into a resident `[nkv, hd]` rep. With n_init=0,
+    // Session KV-recall reps (#2): `update_block_reps` reduces layer-0 K over each
+    // frozen middle block to a per-channel `[min | max]` envelope. With n_init=0,
     // n_local=2, l_bs=2 over a 6-token cache, the middle is [0,4) = 2 frozen
-    // blocks; their reps are the per-block token means. Per-token-constant values
-    // (bf16-exact) make the expected mean exact.
+    // blocks. Per-token-constant values (bf16-exact) make the bounds exact.
     #[cfg(feature = "metal")]
     #[test]
-    fn update_block_reps_mean_pools_frozen_middle_blocks() {
+    fn update_block_reps_envelopes_frozen_middle_blocks() {
         let _guard = mlx_sys::mlx_guard();
-        // [B=1, nkv=1, seq=6, hd=2]; token t holds (t, t) so block [0,2) mean is
-        // (0.5,0.5) and block [2,4) mean is (2.5,2.5).
+        // [B=1, nkv=1, seq=6, hd=2]; token t holds (t, t), so block [0,2) spans
+        // [0,1] per channel and block [2,4) spans [2,3].
         let k: Vec<i32> = vec![0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5];
         let k = mlx::MlxArray::from_slice_i32(&k, &[1, 1, 6, 2]);
         let k = mlx::as_dtype(&k, mlx::Dtype::Bfloat16);
@@ -1804,8 +1788,9 @@ mod tests {
         };
         slot.update_block_reps(&cfg).unwrap();
         assert_eq!(slot.block_reps.len(), 2, "two frozen middle blocks");
-        assert_eq!(slot.block_reps[0], vec![0.5, 0.5], "block [0,2) token mean");
-        assert_eq!(slot.block_reps[1], vec![2.5, 2.5], "block [2,4) token mean");
+        // [lo | hi], min half first.
+        assert_eq!(slot.block_reps[0], vec![0.0, 0.0, 1.0, 1.0], "block [0,2)");
+        assert_eq!(slot.block_reps[1], vec![2.0, 2.0, 3.0, 3.0], "block [2,4)");
         // Idempotent: re-running adds no blocks (only newly-completed recomputed).
         slot.update_block_reps(&cfg).unwrap();
         assert_eq!(slot.block_reps.len(), 2);

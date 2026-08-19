@@ -28,12 +28,14 @@ pub struct MetalSlotState {
     /// instead of the full `[0..cache_len]`. `None` = today's contiguous read.
     /// Set by the Engine from `infer_core::plan_recall` (#5); default off.
     pub(super) recall_ranges: Option<Vec<(usize, usize)>>,
-    /// Resident per-middle-block mean-key reps for KV-recall scoring (#2). Each
-    /// entry is the layer-0 K mean-pooled over its `l_bs` tokens, flattened to
-    /// `nkv * hd` f32 — the resident representative that keeps an offloaded block
-    /// scorable (`q · rep`). Index = middle block index (token base
-    /// `n_init + i * l_bs`). Grown incrementally as whole blocks complete; empty
-    /// unless recall is enabled for this slot.
+    /// Resident per-middle-block key envelope for KV-recall scoring (#2). Each
+    /// entry is layer-0 K reduced over its `l_bs` tokens to a per-channel
+    /// `[min | max]` pair, flattened `2 * nkv * hd` f32 (min half first) — the
+    /// resident representative that keeps an offloaded block scorable. Index =
+    /// middle block index (token base `n_init + i * l_bs`). Grown incrementally
+    /// as whole blocks complete; empty unless recall is enabled for this slot.
+    ///
+    /// See [`infer_core::fold_key`] for why this is an interval and not a mean.
     pub(super) block_reps: Vec<Vec<f32>>,
 }
 
@@ -207,14 +209,13 @@ impl MetalSlotState {
         Ok((k_full, v_full))
     }
 
-    /// Session KV-recall reps (#2): mean-pool layer-0 K over each frozen middle
+    /// Session KV-recall reps (#2): envelope layer-0 K over each frozen middle
     /// block into a resident `[nkv, hd]` representative (flattened `nkv*hd` f32).
     /// A block is "frozen" once it has left the local window
     /// (`base + l_bs <= cache_len - n_local`), so its K is final and the rep is
     /// computed exactly once. This is the resident scoring substrate: even after
-    /// a block's full KV is offloaded its rep stays here, keeping `q · rep`
-    /// scorable. Cheap — only newly-completed blocks are recomputed each step.
-    /// The mean is taken on the host from the (tiny) block K slice.
+    /// a block's full KV is offloaded its envelope stays here, keeping the block
+    /// scorable. Cheap — only newly-completed blocks are read back.
     pub(super) fn update_block_reps(
         &mut self,
         cfg: &infer_core::RecallConfig,
@@ -239,25 +240,25 @@ impl MetalSlotState {
         anyhow::ensure!(shape.len() == 4, "recall reps expect rank-4 K");
         let nkv = shape[1] as usize;
         let hd = shape[3] as usize;
-        let l_bs_f = cfg.l_bs as f32;
         for block in self.block_reps.len()..frozen_blocks {
             let base = cfg.n_init + block * cfg.l_bs;
             let slice = slice_kv_tokens(k0, base, base + cfg.l_bs)?; // [1, nkv, l_bs, hd]
             let f32_slice = mlx::as_dtype(&slice, mlx::Dtype::Float32);
             mlx::eval(&[&f32_slice]);
             let data = f32_slice.as_slice_f32(); // row-major [1, nkv, l_bs, hd]
-            let mut rep = vec![0.0_f32; nkv * hd];
+            let mut rep = vec![f32::INFINITY; nkv * hd];
+            rep.resize(2 * nkv * hd, f32::NEG_INFINITY);
+            let (lo, hi) = rep.split_at_mut(nkv * hd);
             for h in 0..nkv {
+                let out = h * hd;
                 for t in 0..cfg.l_bs {
                     let row = (h * cfg.l_bs + t) * hd;
-                    let out = h * hd;
-                    for d in 0..hd {
-                        rep[out + d] += data[row + d];
-                    }
+                    infer_core::fold_key(
+                        &mut lo[out..out + hd],
+                        &mut hi[out..out + hd],
+                        data[row..row + hd].iter().copied(),
+                    );
                 }
-            }
-            for v in &mut rep {
-                *v /= l_bs_f;
             }
             self.block_reps.push(rep);
         }
@@ -265,7 +266,7 @@ impl MetalSlotState {
     }
 
     /// Session KV-recall plan (#2/#3): score the resident block reps against the
-    /// just-emitted layer-0 decode query (`q · rep`, one step stale — licensed),
+    /// just-emitted layer-0 decode query (one step stale — licensed),
     /// run `infer_core::plan_recall`, and stash the result for the NEXT step.
     /// `recall_ranges` is set to `None` when the plan is the single contiguous
     /// range (session still fits the budget) so the default page-read stays
@@ -286,13 +287,9 @@ impl MetalSlotState {
         let nb = self.block_reps.len();
         let mut scores = vec![0.0_f32; nb];
         for (i, rep) in self.block_reps.iter().enumerate() {
-            // q · rep over the full [nkv, hd] vector (GQA-grouped query mean).
-            let n = rep.len().min(q.len());
-            let mut acc = 0.0_f32;
-            for k in 0..n {
-                acc += q[k] * rep[k];
-            }
-            scores[i] = acc;
+            let (lo, hi) = rep.split_at(rep.len() / 2);
+            let n = lo.len().min(q.len());
+            scores[i] = infer_core::score_block(&q[..n], &lo[..n], &hi[..n]);
         }
         let plan = infer_core::plan_recall(self.cache_len, &scores, cfg);
         // A single contiguous full range == today's default read; keep `None` so

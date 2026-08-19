@@ -34,7 +34,7 @@ pub(crate) struct QwenCudaExecutor {
     /// Recall budget regions (validated defaults): sink 32 + local 256 + top-k 8
     /// blocks of 32. The working set is bounded regardless of history length.
     recall_cfg: infer_core::RecallConfig,
-    /// Per-slot resident mean-key reps + next-step recall page plan. Indexed by
+    /// Per-slot resident key envelopes + next-step recall page plan. Indexed by
     /// slot; only mutated when `kv_recall` is on.
     recall: Vec<crate::recall::CudaRecallState>,
     /// One-time non-BF16-KV-with-recall fallback log latch.
@@ -202,7 +202,7 @@ impl QwenCudaExecutor {
             decode_ctx: None,
             graphs: None,
             kv_recall: false,
-            recall_cfg: crate::recall::default_recall_config(),
+            recall_cfg: infer_core::RecallConfig::VALIDATED,
             recall,
             recall_quant_warned: false,
             tier_budget_bytes,
@@ -448,7 +448,7 @@ impl QwenCudaExecutor {
                 self.num_slots
             );
             ensure!(!row.tokens.is_empty(), "prefill row must carry tokens");
-            let expected_len = row.start_pos + row.tokens.len();
+            let expected_len = row.end_pos();
             ensure!(
                 kv_row.slot == row.slot
                     && kv_row.append_pos == row.start_pos
@@ -613,7 +613,7 @@ impl QwenCudaExecutor {
             self.num_slots
         );
         ensure!(!row.tokens.is_empty(), "prefill row must carry tokens");
-        let expected_len = row.start_pos + row.tokens.len();
+        let expected_len = row.end_pos();
         ensure!(
             kv_row.slot == row.slot
                 && kv_row.append_pos == row.start_pos
