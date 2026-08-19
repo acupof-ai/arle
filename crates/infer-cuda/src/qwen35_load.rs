@@ -367,7 +367,7 @@ impl Qwen35Model {
                                 (full.v_proj.as_str(), None),
                             ],
                         )?,
-                        o_proj: loader.load_matrix_quant_aware(&ctx, &full.o_proj)?,
+                        o_proj: loader.load_dense_matrix_quant_aware(&ctx, &full.o_proj)?,
                         q_norm: loader.load_vec(&ctx, &full.q_norm)?,
                         k_norm: loader.load_vec(&ctx, &full.k_norm)?,
                         decode: None,
@@ -544,7 +544,7 @@ impl Qwen35Model {
                             &names.common.mlp_up_proj,
                         )?,
                         down_proj: loader
-                            .load_matrix_quant_aware(&ctx, &names.common.mlp_down_proj)?,
+                            .load_dense_matrix_quant_aware(&ctx, &names.common.mlp_down_proj)?,
                     }),
                     None,
                 )
@@ -1253,7 +1253,7 @@ fn load_qwen35_mtp_head(
                 (full.v_proj.as_str(), None),
             ],
         )?,
-        o_proj: loader.load_matrix_quant_aware(ctx, &full.o_proj)?,
+        o_proj: loader.load_dense_matrix_quant_aware(ctx, &full.o_proj)?,
         q_norm: loader.load_vec(ctx, &full.q_norm)?,
         k_norm: loader.load_vec(ctx, &full.k_norm)?,
         decode: None,
@@ -1275,7 +1275,8 @@ fn load_qwen35_mtp_head(
                 &names.layer.common.mlp_gate_proj,
                 &names.layer.common.mlp_up_proj,
             )?,
-            down_proj: loader.load_matrix_quant_aware(ctx, &names.layer.common.mlp_down_proj)?,
+            down_proj: loader
+                .load_dense_matrix_quant_aware(ctx, &names.layer.common.mlp_down_proj)?,
         };
         (Some(mlp), None)
     };
