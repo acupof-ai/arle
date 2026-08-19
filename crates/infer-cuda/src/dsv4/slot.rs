@@ -587,9 +587,7 @@ impl Dsv4SlotState {
         })
     }
 
-    /// Drop the device state the captured image now owns. Call only after the
-    /// tier has accepted the image on EVERY rank — freeing here and then
-    /// failing to store leaves the request decoding against nothing.
+    /// Call only after the tier has accepted the image on EVERY rank.
     pub(crate) fn release_swapped_out(
         &mut self,
         kv_adapter: &mut crate::attention::Dsv4KvAdapter,

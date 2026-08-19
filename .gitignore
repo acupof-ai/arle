@@ -17,8 +17,6 @@ release/
 .gstack/
 models/
 .DS_Store
-# AppleDouble sidecars: a macOS tar leaves them in the pod tree, where they
-# enter pod.sh's source digest and no sync can ever match.
 ._*
 .context/
 # Build-time-fetched official kernels stay untracked; the llama.cpp

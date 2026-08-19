@@ -8,9 +8,7 @@ pub(crate) struct Qwen35SlotImage {
     pub(crate) full_attn_page_count: usize,
     pub(crate) gdr_host: Vec<Vec<f32>>,
     pub(crate) conv_host: Vec<Vec<bf16>>,
-    /// The recurrent payload is the 1/cp B2 decode pair, not the full pair.
-    /// Park and promote are lockstep across the cp group and each rank owns its
-    /// own tier, so a rank restores exactly the shard it captured.
+    /// Payload is the 1/cp B2 decode pair; each rank restores its own shard.
     pub(crate) recurrent_decode_pair: bool,
     pub(crate) seq_len: usize,
 }
@@ -731,23 +729,16 @@ impl Qwen35SlotState {
         self.seq_len = len;
     }
 
-    /// Capture only — the slot keeps its device state, so a park the tier then
-    /// refuses can be abandoned without leaving the request decoding against
-    /// nothing. [`Self::release_swapped_out`] drops the state once every rank
-    /// has stored the image.
-    ///
-    /// The trailing sync (inside `copy_pages_to_host` for pages, explicit here
-    /// for the recurrent D2H) makes the host image complete before any device
-    /// buffer is reused.
+    /// Capture only: a park the tier then refuses must not leave the request
+    /// decoding against nothing. [`Self::release_swapped_out`] frees the state
+    /// once every rank has stored the image.
     pub(crate) fn swap_out_image(
         &mut self,
         ctx: &DeviceContext,
         slot: usize,
         full_attn_kv: &mut PagedKVPool,
     ) -> Result<Qwen35SlotImage> {
-        // Under B2 the live state is the 1/cp decode pair (the full pair is
-        // frozen at the scatter point); capture that pair and flag it so
-        // swap-in restores it back into the decode pair.
+        // Under B2 the full pair is frozen at the scatter point.
         let decode_live = self.decode_recurrent_live && !self.gdr_states_decode.is_empty();
         ensure!(
             self.seq_len == full_attn_kv.seq_len(slot),
@@ -794,8 +785,7 @@ impl Qwen35SlotState {
         Ok(image)
     }
 
-    /// Drop the device state the captured image now owns. Call only after the
-    /// tier has accepted the image on EVERY rank.
+    /// Call only after the tier has accepted the image on EVERY rank.
     pub(crate) fn release_swapped_out(
         &mut self,
         slot: usize,
@@ -850,21 +840,18 @@ impl Qwen35SlotState {
         full_attn_kv.copy_pages_from_host(ctx, slot_pages, &image.full_attn_pages)?;
         self.acquire_recurrent(ctx, num_linear, gdr_state_len, conv_len, recurrent_pool)?;
         if image.recurrent_decode_pair {
-            // The victim was mid-B2-decode: land the shard back in the decode
-            // pair and mark every layer scattered, so the resumed decode reads
-            // it instead of re-scattering from the zeroed full pair. The full
-            // pair has no reader under 2D (MTP/spec is refused there).
             let (dec_gdr, dec_conv) = (
                 image.gdr_host.first().map_or(0, Vec::len),
                 image.conv_host.first().map_or(0, Vec::len),
             );
-            // A foreign/stale blob (different cp) is not a 1/cp divisor.
             ensure!(
                 dec_gdr > 0 && gdr_state_len % dec_gdr == 0 && conv_len % dec_conv == 0,
                 "Qwen3.6 swap-in decode-pair dims {dec_gdr}/{dec_conv} do not divide \
                  full {gdr_state_len}/{conv_len}"
             );
             self.ensure_decode_recurrent(ctx, num_linear, dec_gdr, dec_conv)?;
+            // Marked scattered so the resumed decode reads this instead of
+            // re-scattering from the zeroed full pair.
             self.decode_scattered = vec![true; num_linear];
             self.decode_recurrent_live = true;
         }
