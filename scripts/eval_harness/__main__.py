@@ -5,7 +5,7 @@ Usage:
   python3 -m eval_harness prefix_reuse       # run one gate
   python3 -m eval_harness prefix_reuse token_reuse  # multiple
 
-Env: PORT, MODEL, TEMPLATE; token_reuse: PROMPT_TOKENS, GEN_TOKENS, PAGE;
+Env: PORT, MODEL, TEMPLATE; token_reuse/resident_reuse: PROMPT_TOKENS, GEN_TOKENS, PAGE;
 multiturn_concurrent: CONCURRENCY, TURNS, PROMPT_TOKENS, GEN_TOKENS, PAGE
 Exit 0 = all pass, 1 = any fail.
 """
@@ -19,6 +19,7 @@ import os
 from . import GateRunner
 from .multiturn_concurrent import MultiTurnConcurrentGate
 from .prefix_reuse import PrefixReuseGate
+from .resident_reuse import ResidentReuseGate
 from .token_reuse import TokenReuseGate
 
 GATES = {
@@ -27,6 +28,10 @@ GATES = {
         prompt_tokens=int(os.environ.get("PROMPT_TOKENS", "500")),
         gen_tokens=int(os.environ.get("GEN_TOKENS", "128")),
         page=int(os.environ.get("PAGE", "16")),
+    ),
+    "resident_reuse": lambda: ResidentReuseGate(
+        prompt_tokens=int(os.environ.get("PROMPT_TOKENS", "500")),
+        gen_tokens=int(os.environ.get("GEN_TOKENS", "128")),
     ),
     "multiturn_concurrent": lambda: MultiTurnConcurrentGate(
         concurrency=[
