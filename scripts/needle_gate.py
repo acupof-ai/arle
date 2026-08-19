@@ -8,8 +8,8 @@ Usage: python3 needle_gate.py [lengths_csv] [runs] [depth]
 
 Routing (the gate is model-neutral via the checkpoint Jinja chat template, #66):
   default      /v1/chat/completions — correct for any model, no per-model shim
-  RAW=1        raw /v1/completions (+ TEMPLATE=dsv4 for the legacy DSv4 shim,
-               TEMPLATE=qwen3_nonthink for Qwen3.x non-thinking ChatML)
+  RAW=1        raw /v1/completions (+ TEMPLATE=qwen3_nonthink for Qwen3.x
+               non-thinking ChatML)
 
 Env: PORT (default 18189), MODEL (default "x"), KV_DTYPE (label only, e.g.
 bf16/int8/fp8 — printed on every line so a precision-matrix run can be
@@ -55,11 +55,6 @@ def build_prompt(target, depth):
 
 
 def wrap_template(prompt):
-    # Official DSv4 chat shape (model encoding/encoding_dsv4.py): system +
-    # User + Assistant + `</think>` (non-thinking "chat" mode), fullwidth bars.
-    if os.environ.get("TEMPLATE") == "dsv4":
-        return ("<｜begin▁of▁sentence｜>You are a helpful assistant."
-                "<｜User｜>" + prompt + "<｜Assistant｜></think>")
     if os.environ.get("TEMPLATE") == "qwen3_nonthink":
         return ("<|im_start|>user\n" + prompt + "<|im_end|>\n"
                 "<|im_start|>assistant\n<think>\n\n</think>\n\n")
