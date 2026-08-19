@@ -3,7 +3,6 @@
 
 use crate::execution::CounterSnapshot;
 use serde::{Deserialize, Serialize};
-use std::os::unix::io::AsRawFd;
 use std::time::Duration;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -189,19 +188,29 @@ where
         .expect("spawn observe task");
 }
 
-// flock ensures only one process per machine writes; the kernel releases it on exit.
+// Only one process per machine writes; the OS releases the lock on exit.
 fn acquire_writer_lock(dir: &std::path::Path) -> Option<std::fs::File> {
     std::fs::create_dir_all(dir).ok()?;
     let path = dir.join("observe.lock");
-    let file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&path)
-        .ok()?;
-    // SAFETY: flock on a valid open fd; LOCK_NB makes it non-blocking.
-    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    (rc == 0).then_some(file)
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(false);
+    // Exactly one of these blocks survives cfg, so each is the tail expression.
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd as _;
+        let file = opts.open(&path).ok()?;
+        // SAFETY: flock on a valid open fd; LOCK_NB makes it non-blocking.
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        (rc == 0).then_some(file)
+    }
+    // Windows has no flock; share_mode(0) makes the open itself exclusive, so a
+    // second process fails to open rather than failing to lock.
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        opts.share_mode(0);
+        opts.open(&path).ok()
+    }
 }
 
 pub fn query(range_ms: u64) -> Vec<StoredSample> {

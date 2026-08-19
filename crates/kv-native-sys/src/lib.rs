@@ -18,9 +18,42 @@ pub use kv_tier::{
 use std::fs::OpenOptions;
 use std::io;
 use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::path::PathBuf;
+
+/// Create-or-truncate with POSIX 0644. Windows has no mode bits, so the
+/// permission is left to the inherited ACL.
+fn create_mode_644(opts: &mut OpenOptions, path: &Path) -> io::Result<std::fs::File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.mode(0o644).open(path)
+    }
+    #[cfg(not(unix))]
+    {
+        opts.open(path)
+    }
+}
+
+/// fsync the directory so a rename into it survives power loss. Windows has no
+/// directory handle to sync — NTFS journals the rename's metadata itself — so
+/// this is a no-op there.
+fn sync_dir(parent: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY)
+            .open(parent)?
+            .sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = parent;
+        Ok(())
+    }
+}
 
 /// Atomic replacement for payloads that must survive a crash — the durable
 /// recall manifest. `sync_data` + parent-dir `sync_all` make the rename
@@ -47,12 +80,10 @@ fn write_file_atomic_impl(path: &Path, bytes: &[u8], durable: bool) -> io::Resul
 
     let result = (|| -> io::Result<()> {
         {
-            let mut tmp = OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o644)
-                .open(&tmp_path)?;
+            let mut tmp = create_mode_644(
+                OpenOptions::new().write(true).create(true).truncate(true),
+                &tmp_path,
+            )?;
             tmp.write_all(bytes)?;
             if durable {
                 tmp.sync_data()?;
@@ -62,12 +93,7 @@ fn write_file_atomic_impl(path: &Path, bytes: &[u8], durable: bool) -> io::Resul
         if durable {
             // fsync the parent directory so the rename is durable on power loss.
             let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
-            let parent = parent.unwrap_or_else(|| Path::new("."));
-            let dir = OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_DIRECTORY)
-                .open(parent)?;
-            dir.sync_all()?;
+            sync_dir(parent.unwrap_or_else(|| Path::new(".")))?;
         }
         Ok(())
     })();
@@ -112,13 +138,14 @@ impl KvMmapStore {
             std::fs::create_dir_all(parent)?;
         }
 
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o644)
-            .open(path)?;
+        let file = create_mode_644(
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true),
+            path,
+        )?;
         // set_len creates a sparse file: logical size without block allocation.
         file.set_len(total_bytes as u64)?;
 
