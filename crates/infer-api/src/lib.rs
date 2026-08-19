@@ -75,8 +75,6 @@ pub use loaded::LoadedInferenceEngine;
 /// world (DSv4 + Qwen3.5/3.6 MoE). Consumed by `cli::serve_multiproc`.
 #[cfg(feature = "cuda")]
 pub use loaded::cuda_model_takes_multiproc_serve;
-#[cfg(feature = "cuda")]
-pub use loaded::{DSV4_AUTO_CONTEXT_CEILING, cuda_model_is_dsv4};
 pub use loaded::{EngineLoadConfig, KvCacheDtype, KvTierBudget};
 #[cfg(feature = "cuda")]
 pub use serve::serve_coordinator_http_dp;

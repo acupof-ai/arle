@@ -1856,24 +1856,6 @@ mod backend {
         )
     }
 
-    /// DSv4's FlashMLA pool sizing (`kv_layout.rs`) isn't reconciled with the
-    /// KV-budget affordability gate (`dsv4.rs`) for very large `max_seq_len` —
-    /// a single slot's fixed band can outgrow the whole pool's page budget and
-    /// crash the coordinator instead of degrading `num_slots` (pod-verified
-    /// 2026-07-06: DeepSeek-V4-Flash-FP8's native 1,048,576-token context
-    /// crashes on boot with no explicit `--max-total-tokens`). Cap the
-    /// checkpoint-auto-resolved default at this known-safe ceiling; an
-    /// explicit `--max-total-tokens` (e.g. the C4 budget-reject regression
-    /// test's deliberate 2,000,000) still bypasses it untouched.
-    #[cfg(feature = "cuda")]
-    pub const DSV4_AUTO_CONTEXT_CEILING: usize = 32768;
-
-    #[cfg(feature = "cuda")]
-    #[must_use]
-    pub fn cuda_model_is_dsv4(model_path: &str) -> bool {
-        matches!(detect_cuda_model_kind(model_path), Ok(CudaModelKind::Dsv4))
-    }
-
     /// Admission page-pool capacity, derived uniformly for every model — one rule,
     /// each backend declares its KV token-capacity. The scheduler gates admission on
     /// `pages_needed = (prompt_len + max_tokens) / page_size` (a full-attention
@@ -2977,5 +2959,3 @@ pub use backend::cuda_model_takes_multiproc_serve;
     feature = "cpu"
 ))]
 pub(crate) use backend::router_for_backend;
-#[cfg(feature = "cuda")]
-pub use backend::{DSV4_AUTO_CONTEXT_CEILING, cuda_model_is_dsv4};

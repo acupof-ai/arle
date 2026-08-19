@@ -304,23 +304,11 @@ fn resolve_config(args: &Args, serve_args: &ServeArgs) -> Result<ServeConfig, St
         && infer_api::cuda_model_takes_multiproc_serve(&model_path)
         && let Some(max_ctx) = crate::read_model_max_context(&model_path)
     {
-        // DSv4's FlashMLA pool sizing crashes the coordinator instead of
-        // shrinking num_slots when max_seq_len is very large (pod-verified
-        // 2026-07-06: DeepSeek-V4-Flash-FP8's native 1,048,576-token context
-        // OOMs the fixed per-slot band on boot). Cap the auto-resolved
-        // default there; an explicit `--max-total-tokens` still bypasses
-        // this untouched. Qwen35 profiles its pool from measured free VRAM
-        // and has no such ceiling.
-        let resolved = if infer_api::cuda_model_is_dsv4(&model_path) {
-            max_ctx.min(infer_api::DSV4_AUTO_CONTEXT_CEILING)
-        } else {
-            max_ctx
-        };
         log::info!(
-            "DSv4 max context: auto-resolved to {resolved} from {model_path}/config.json (max_position_embeddings={max_ctx})"
+            "max context: auto-resolved to {max_ctx} from {model_path}/config.json (max_position_embeddings)"
         );
-        engine_config.max_prompt_tokens = resolved;
-        engine_config.max_total_tokens = resolved;
+        engine_config.max_prompt_tokens = max_ctx;
+        engine_config.max_total_tokens = max_ctx;
     }
     let spec = resolve_spec_options(backend, serve_args);
     // The L3 spill request rides the engine config so BOTH CUDA paths carry
