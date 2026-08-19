@@ -946,7 +946,7 @@ impl TpRuntime {
             }
             let mut dev = ctx
                 .stream
-                .memcpy_stod(values)
+                .clone_htod(values)
                 .map_err(|e| anyhow::anyhow!("reduce_f32_over h2d: {e}"))?;
             {
                 let count = values.len();
