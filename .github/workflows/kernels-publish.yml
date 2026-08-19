@@ -101,46 +101,18 @@ jobs:
     needs: [validate-mode, skip-published]
     if: ${{ needs.validate-mode.outputs.qualify == 'false' && needs.skip-published.outputs.skip != 'true' }}
     runs-on: ubuntu-24.04
-    # CUDA toolkit install (Jimver/cuda-toolkit, method: network) is 2-5 min
-    # normally but hit 89 min on a 2026-08-18 NVIDIA CDN slowdown; the cargo
-    # build itself is 52-58 min. 120 min absorbs the install variance.
+    container:
+      image: nvidia/cuda:12.8.0-devel-ubuntu24.04
+      options: --rm
     timeout-minutes: 120
     steps:
-      - uses: actions/checkout@v7
+      - name: Install deps
+        run: apt-get update && apt-get install -y --no-install-recommends git python3 python3-pip curl ca-certificates
 
-      # The torch cu129 stack unpacks ~15 GB; stock ubuntu-latest free space is
-      # borderline and the install ENOSPC'd (2026-07-23). Drop preinstalled
-      # toolchains we never use (~25-30 GB reclaimed).
-      - name: Free runner disk
-        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+      - uses: actions/checkout@v7
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache CUDA toolkit 12.8
-        id: cuda-cache
-        uses: actions/cache@v6
-        with:
-          path: /usr/local/cuda-12.8
-          key: cuda-toolkit-12.8.0
-
-      - name: Install CUDA toolkit 12.8
-        if: steps.cuda-cache.outputs.cache-hit != 'true'
-        uses: Jimver/cuda-toolkit@v0.2.35
-        with:
-          cuda: '12.8.0'
-          method: network
-
-      - name: Link CUDA
-        run: |
-          sudo ln -sf /usr/local/cuda-12.8 /usr/local/cuda
-          echo "CUDA_PATH=/usr/local/cuda-12.8" >> "$GITHUB_ENV"
-          echo "CUDA_HOME=/usr/local/cuda-12.8" >> "$GITHUB_ENV"
-
-      - name: Install Python 3.12
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
 
       # TileLang artifact cache (per-kernel source × SM × toolchain identity).
       # Restores unchanged kernels' codegen output; build.rs validates the
@@ -168,8 +140,8 @@ jobs:
 
       - name: Install TileLang stack (vanilla tvm-ffi, no patch needed)
         run: |
-          pip install --no-cache-dir -r requirements-build.txt
-          python -c "import tilelang; print('tilelang OK', tilelang.__version__)"
+          python3 -m pip install --no-cache-dir --break-system-packages -r requirements-build.txt
+          python3 -c "import tilelang; print('tilelang OK', tilelang.__version__)"
 
       - name: Regenerate T1 kernel set (sm_80/86/89/90)
         env:
@@ -204,35 +176,18 @@ jobs:
     needs: [validate-mode, skip-published, build]
     if: ${{ needs.validate-mode.outputs.qualify == 'false' && needs.skip-published.outputs.skip != 'true' }}
     runs-on: ubuntu-24.04
-    # The prebuilt bundle (ARLE_CUDA_KERNELS_PREBUILT_DIR) links libkernels_cuda.a
-    # directly — no csrc recompile. The 120-min ceiling covers a fallback from-source
-    # build plus a slow CUDA toolkit install if the prebuilt path is ever disabled.
+    container:
+      image: nvidia/cuda:12.8.0-devel-ubuntu24.04
+      options: --rm
     timeout-minutes: 120
     steps:
+      - name: Install deps
+        run: apt-get update && apt-get install -y --no-install-recommends git curl ca-certificates
+
       - uses: actions/checkout@v7
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache CUDA toolkit 12.8
-        id: cuda-cache
-        uses: actions/cache@v6
-        with:
-          path: /usr/local/cuda-12.8
-          key: cuda-toolkit-12.8.0
-
-      - name: Install CUDA toolkit 12.8
-        if: steps.cuda-cache.outputs.cache-hit != 'true'
-        uses: Jimver/cuda-toolkit@v0.2.35
-        with:
-          cuda: '12.8.0'
-          method: network
-
-      - name: Link CUDA
-        run: |
-          sudo ln -sf /usr/local/cuda-12.8 /usr/local/cuda
-          echo "CUDA_PATH=/usr/local/cuda-12.8" >> "$GITHUB_ENV"
-          echo "CUDA_HOME=/usr/local/cuda-12.8" >> "$GITHUB_ENV"
 
       - name: Download exact candidate artifact
         uses: actions/download-artifact@v8
