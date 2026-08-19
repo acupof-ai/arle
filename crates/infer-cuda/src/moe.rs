@@ -3330,32 +3330,8 @@ mod dsv4_gpu {
                 );
             }
         }
-        // W4AFP8 lane: fused decode GEMV (BF16 activations, no FP8 quant) or
-        // SGLang CUTLASS grouped GEMM for prefill.
+        // W4AFP8 lane: SGLang CUTLASS grouped GEMM (W4A8 tensor-core MMA).
         if let (Some(w13), Some(w2)) = (&layer.w13_w4afp8, &layer.w2_w4afp8) {
-            if total_routes <= DSV4_DECODE_GEMV_MAX_ROUTES && w13.scales_gemv.is_some() {
-                let tables = layer.w4afp8_gemv_tables.get_or_init(|| {
-                    build_w4afp8_gemv_tables(ctx, w13, w2)
-                        .map(Some)
-                        .unwrap_or_else(|e| {
-                            log::warn!("DSv4 W4AFP8 GEMV table build failed: {e}");
-                            None
-                        })
-                });
-                if let Some(tables) = tables.as_ref() {
-                    return dsv4_moe_forward_w4afp8_decode(
-                        model,
-                        layer,
-                        tables,
-                        route_indices,
-                        route_weights,
-                        hidden,
-                        out,
-                        keepalive,
-                        tail,
-                    );
-                }
-            }
             return dsv4_moe_forward_w4afp8(
                 model,
                 layer,
