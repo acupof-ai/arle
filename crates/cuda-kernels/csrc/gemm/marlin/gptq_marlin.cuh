@@ -688,7 +688,17 @@ void marlin_mm(
     thread_k = thread_tfg.thread_k;
     thread_n = thread_tfg.thread_n;
     int blocks = sms * exec_cfg.blocks_per_sm;
-    if (exec_cfg.blocks_per_sm > 1) max_shared_mem_new = max_shared_mem / exec_cfg.blocks_per_sm - 1024;
+    // Recompute, do not lower-in-place: `max_shared_mem_new` is declared outside
+    // the `while (rest_m)` loop, so a chunk that picks blocks_per_sm > 1 used to
+    // leave its reduced budget in place for every later chunk. A later chunk at
+    // blocks_per_sm == 1 was then validated — and launched — against a budget it
+    // never asked for, which throws out of `is_valid_config` as
+    // CUDA_ERROR_INVALID_VALUE. Latent until the blocks-per-SM search made
+    // blocks_per_sm > 1 reachable; only prefill splits M across chunks, so decode
+    // never saw it.
+    max_shared_mem_new = exec_cfg.blocks_per_sm > 1
+                             ? max_shared_mem / exec_cfg.blocks_per_sm - 1024
+                             : max_shared_mem;
 
     int thread_k_blocks = thread_k / 16;
     int thread_n_blocks = thread_n / 16;

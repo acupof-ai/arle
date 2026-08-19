@@ -293,9 +293,14 @@ int marlin_c_tmp_floats(int m, int sms) {
 }
 
 // Lock-buffer int count. Upstream sizes locks at sms * max_blocks_per_sm
-// (marlin_utils.py:416, default max_blocks_per_sm=1 → sms); 4× is headroom.
+// (marlin_utils.py:416, default max_blocks_per_sm=1 → sms), and this kept 4× as
+// headroom. The blocks-per-SM search made the grid `sms * blocks_per_sm` with
+// blocks_per_sm up to MARLIN_MAX_BLOCKS_PER_SM, and the kernel indexes
+// `locks[blockIdx.x]` (and increments past it), so a fixed `sms * 4` is an
+// out-of-bounds WRITE once the search picks 5. Scale with the search bound and
+// keep the same 4× headroom — 78 SMs × 20 ints is 6 KB, the safety is free.
 // Zero-initialize once on the Rust side.
-int marlin_workspace_ints(int sms) { return sms * 4; }
+int marlin_workspace_ints(int sms) { return sms * MARLIN_MAX_BLOCKS_PER_SM * 4; }
 
 }  // extern "C"
 
