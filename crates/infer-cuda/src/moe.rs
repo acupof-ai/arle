@@ -2774,18 +2774,9 @@ mod dsv4_gpu {
 
         // CUTLASS workspace: metadata (E×136 B) + CUTLASS ws. At TP=2 E=128
         // (metadata = 17 KB, CUTLASS ws typically <16 MB); 32 MB is safe.
+        // CUTLASS only writes the workspace, so no zero-fill.
         let ws_bytes = 32 * 1024 * 1024;
-        if let Ok((free, total)) = cudarc::driver::result::mem_get_info() {
-            log::info!(
-                "DSv4 W4AFP8 workspace alloc: free {}MB / total {}MB, ws_bytes {}MB",
-                free >> 20,
-                total >> 20,
-                ws_bytes >> 20
-            );
-        }
-        let workspace = ctx
-            .stream
-            .alloc_zeros::<u8>(ws_bytes)
+        let workspace = unsafe { ctx.stream.alloc::<u8>(ws_bytes) }
             .map_err(|e| anyhow::anyhow!("DSv4 W4AFP8 workspace alloc failed: {e}"))?;
         keepalive.keep_u8(&workspace);
 
