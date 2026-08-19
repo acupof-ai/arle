@@ -712,6 +712,7 @@ impl StatsResponse {
             || tier.promote_failures > 0
             || tier.resident_blocks > 0
             || tier.demoted_slots > 0
+            || tier.slot_demote_failures > 0
             || tier.promoted_slots > 0
             || tier.slot_promote_failures > 0
             || system.host_demoted_pages > 0
@@ -773,6 +774,7 @@ impl StatsResponse {
                 promote_failures: tier.promote_failures,
                 resident_blocks: tier.resident_blocks,
                 demoted_slots: tier.demoted_slots,
+                slot_demote_failures: tier.slot_demote_failures,
                 promoted_slots: tier.promoted_slots,
                 slot_promote_failures: tier.slot_promote_failures,
             },
@@ -884,6 +886,7 @@ pub struct KvTierStatsResponse {
     pub promote_failures: u64,
     pub resident_blocks: usize,
     pub demoted_slots: u64,
+    pub slot_demote_failures: u64,
     pub promoted_slots: u64,
     pub slot_promote_failures: u64,
 }
