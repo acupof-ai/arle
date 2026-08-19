@@ -40,6 +40,11 @@ static __device__ __forceinline__ float w4d_swiglu_clamped(float gate, float up,
   return (gate / (1.0f + __expf(-gate))) * up;
 }
 
+// Two's complement INT4 → float: 0x0-0x7 → 0..7, 0x8-0xF → -8..-1.
+static __device__ __forceinline__ float w4d_s4(uint32_t nibble) {
+  return (float)((int)nibble - 16 * (int)(nibble >> 3));
+}
+
 // Dequantize 32 packed INT4 values (one uint4 = 16 bytes) and dot with 32
 // BF16 activations. All 32 elements share one per-128-group scale (32 | 128).
 static __device__ __forceinline__ float
@@ -50,14 +55,14 @@ w4d_dot32(float acc, const uint4& packed, float scale,
 #pragma unroll
   for (int w = 0; w < 4; w++) {
     uint32_t p = words[w];
-    sum += ((p & 0x0f) - 8) * __bfloat162float(x[w * 8 + 0])
-         + (((p >> 4) & 0x0f) - 8) * __bfloat162float(x[w * 8 + 1])
-         + (((p >> 8) & 0x0f) - 8) * __bfloat162float(x[w * 8 + 2])
-         + (((p >> 12) & 0x0f) - 8) * __bfloat162float(x[w * 8 + 3])
-         + (((p >> 16) & 0x0f) - 8) * __bfloat162float(x[w * 8 + 4])
-         + (((p >> 20) & 0x0f) - 8) * __bfloat162float(x[w * 8 + 5])
-         + (((p >> 24) & 0x0f) - 8) * __bfloat162float(x[w * 8 + 6])
-         + (((p >> 28) & 0x0f) - 8) * __bfloat162float(x[w * 8 + 7]);
+    sum += w4d_s4(p & 0x0f) * __bfloat162float(x[w * 8 + 0])
+         + w4d_s4((p >> 4) & 0x0f) * __bfloat162float(x[w * 8 + 1])
+         + w4d_s4((p >> 8) & 0x0f) * __bfloat162float(x[w * 8 + 2])
+         + w4d_s4((p >> 12) & 0x0f) * __bfloat162float(x[w * 8 + 3])
+         + w4d_s4((p >> 16) & 0x0f) * __bfloat162float(x[w * 8 + 4])
+         + w4d_s4((p >> 20) & 0x0f) * __bfloat162float(x[w * 8 + 5])
+         + w4d_s4((p >> 24) & 0x0f) * __bfloat162float(x[w * 8 + 6])
+         + w4d_s4((p >> 28) & 0x0f) * __bfloat162float(x[w * 8 + 7]);
   }
   return acc + scale * sum;
 }
