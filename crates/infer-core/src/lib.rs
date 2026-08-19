@@ -373,13 +373,6 @@ struct RequestState {
     grammar: Option<GrammarHook>,
     submitted_at: std::time::Instant,
     first_token_at: Option<std::time::Instant>,
-    /// Think-end token for reasoning models. When set, the engine tracks
-    /// thinking state and forces this token after `max_thinking_budget`.
-    think_end_token_id: Option<u32>,
-    /// Think-start token (multi-segment thinking re-entry).
-    think_start_token_id: Option<u32>,
-    /// Max reasoning tokens before forced think-end. `None` = no budget.
-    max_thinking_budget: Option<usize>,
     /// Whether the current token stream is inside a thinking block.
     in_thinking: bool,
     /// Tokens generated in the current thinking block.
@@ -394,9 +387,7 @@ impl RequestState {
         max_tokens: usize,
         sampling: SamplingParams,
     ) -> Self {
-        let think_end = sampling.think_end_token_id;
-        let think_start = sampling.think_start_token_id;
-        let think_budget = sampling.max_thinking_tokens;
+        let in_thinking = sampling.think_end_token_id.is_some();
         Self {
             handle,
             prompt_tokens,
@@ -415,11 +406,8 @@ impl RequestState {
             grammar: None,
             submitted_at: std::time::Instant::now(),
             first_token_at: None,
-            think_end_token_id: think_end,
-            think_start_token_id: think_start,
-            max_thinking_budget: think_budget,
             // Prompt pre-fills <think>, so generation starts in-thinking.
-            in_thinking: think_end.is_some(),
+            in_thinking,
             reasoning_token_count: 0,
         }
     }
@@ -442,19 +430,19 @@ impl RequestState {
     /// Track thinking state and force think-end after the reasoning budget.
     /// Called after each generated token is committed.
     fn update_think_state(&mut self, token: u32) {
-        let Some(think_end) = self.think_end_token_id else {
+        let Some(think_end) = self.sampling.think_end_token_id else {
             return;
         };
         if token == think_end {
             self.in_thinking = false;
             self.reasoning_token_count = 0;
             self.sampling.force_next_token = None;
-        } else if Some(token) == self.think_start_token_id {
+        } else if Some(token) == self.sampling.think_start_token_id {
             self.in_thinking = true;
             self.reasoning_token_count = 0;
         } else if self.in_thinking {
             self.reasoning_token_count += 1;
-            if let Some(budget) = self.max_thinking_budget
+            if let Some(budget) = self.sampling.max_thinking_tokens
                 && self.reasoning_token_count >= budget
             {
                 self.sampling.force_next_token = Some(think_end);
@@ -2012,4 +2000,77 @@ fn tail_is_degenerate_loop(tokens: &[u32]) -> bool {
     }
     let tail = &tokens[tokens.len() - LOOP_TAIL..];
     (1..=8).any(|p| tail.chunks_exact(p).all(|c| c == &tail[..p]))
+}
+
+#[cfg(test)]
+mod think_state_tests {
+    use super::*;
+
+    fn state_with_budget(budget: usize) -> RequestState {
+        let mut sampling = SamplingParams::default();
+        sampling.think_end_token_id = Some(128822);
+        sampling.think_start_token_id = Some(128821);
+        sampling.max_thinking_tokens = Some(budget);
+        RequestState::new(
+            RequestHandle(0),
+            Vec::new(),
+            RequestPriority::default(),
+            100,
+            sampling,
+        )
+    }
+
+    #[test]
+    fn force_think_end_at_budget() {
+        let mut s = state_with_budget(3);
+        // 3 reasoning tokens → force fires
+        s.update_think_state(10);
+        s.update_think_state(20);
+        assert!(s.sampling.force_next_token.is_none());
+        s.update_think_state(30);
+        assert_eq!(s.sampling.force_next_token, Some(128822));
+    }
+
+    #[test]
+    fn clear_on_think_end() {
+        let mut s = state_with_budget(3);
+        s.update_think_state(10);
+        s.update_think_state(128822);
+        assert!(!s.in_thinking);
+        assert_eq!(s.reasoning_token_count, 0);
+        assert!(s.sampling.force_next_token.is_none());
+        // Content tokens after think-end don't count as reasoning
+        s.update_think_state(99);
+        assert_eq!(s.reasoning_token_count, 0);
+    }
+
+    #[test]
+    fn reentry_resets_count() {
+        let mut s = state_with_budget(3);
+        s.update_think_state(10);
+        s.update_think_state(128822); // close first block
+        s.update_think_state(128821); // re-open
+        assert!(s.in_thinking);
+        assert_eq!(s.reasoning_token_count, 0);
+        // New block gets its own budget
+        s.update_think_state(20);
+        s.update_think_state(30);
+        assert!(s.sampling.force_next_token.is_none());
+        s.update_think_state(40);
+        assert_eq!(s.sampling.force_next_token, Some(128822));
+    }
+
+    #[test]
+    fn no_think_config_is_noop() {
+        let mut s = RequestState::new(
+            RequestHandle(0),
+            Vec::new(),
+            RequestPriority::default(),
+            100,
+            SamplingParams::default(),
+        );
+        s.update_think_state(128822);
+        assert!(!s.in_thinking);
+        assert!(s.sampling.force_next_token.is_none());
+    }
 }

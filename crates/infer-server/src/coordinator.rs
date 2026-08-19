@@ -268,6 +268,35 @@ impl CoordinatorHandle {
         self.next_request_id.fetch_add(1, Ordering::Relaxed)
     }
 
+    /// Resolve the thinking budget and wire think token IDs into `sampling`.
+    /// Precedence: reasoning_effort > client budget_tokens > server config > DSv4 default.
+    /// Returns the budget for the max_tokens default; `None` when not thinking.
+    fn resolve_think_budget(
+        &self,
+        thinking: bool,
+        effort: Option<&str>,
+        client_budget: Option<usize>,
+        sampling: &mut SamplingParams,
+    ) -> Option<usize> {
+        if !thinking {
+            return None;
+        }
+        let budget = effort
+            .and_then(think_budget_for_effort)
+            .or(client_budget)
+            .or_else(|| (self.max_thinking_tokens > 0).then_some(self.max_thinking_tokens))
+            .or_else(|| {
+                self.template_defaults_thinking
+                    .then_some(DEFAULT_THINK_BUDGET)
+            });
+        if let (Some((start, end)), Some(budget)) = (self.think_token_ids, budget) {
+            sampling.think_start_token_id = Some(start);
+            sampling.think_end_token_id = Some(end);
+            sampling.max_thinking_tokens = Some(budget);
+        }
+        budget
+    }
+
     /// Broadcast a stats query to all ranks in this TP group, collect their
     /// responses, and aggregate to a group-level `CounterSnapshot`. Falls back
     /// to default on any failure (send error, timeout, recv error).
@@ -345,12 +374,18 @@ impl Deref for DpCoordinator {
     }
 }
 
+/// Default thinking budget for DeepSeek-V4 (high tier).
+const DEFAULT_THINK_BUDGET: usize = 32768;
+/// Content headroom added to the thinking budget for the max_tokens default.
+const THINK_CONTENT_HEADROOM: usize = 4096;
+
 /// Map OpenAI `reasoning_effort` to a thinking token budget.
 fn think_budget_for_effort(effort: &str) -> Option<usize> {
     match effort {
+        "minimal" => Some(256),
         "low" => Some(2048),
         "medium" => Some(8192),
-        "high" => Some(32768),
+        "high" => Some(DEFAULT_THINK_BUDGET),
         _ => None,
     }
 }
@@ -1243,29 +1278,16 @@ async fn chat_completions(
     } else {
         Some(template_kwargs)
     };
-    // Resolve thinking budget: reasoning_effort > server config > DSv4 default.
-    let think_budget = if thinking {
-        reasoning_effort
-            .and_then(think_budget_for_effort)
-            .or_else(|| (state.max_thinking_tokens > 0).then_some(state.max_thinking_tokens))
-            .or_else(|| state.template_defaults_thinking.then_some(32768))
-    } else {
-        None
-    };
+    let think_budget = state.resolve_think_budget(thinking, reasoning_effort, None, &mut sampling);
     let max_tokens = sampling.max_new_tokens.unwrap_or_else(|| {
         if let Some(budget) = think_budget {
-            budget + 4096
+            budget + THINK_CONTENT_HEADROOM
         } else if thinking {
-            4096
+            THINK_CONTENT_HEADROOM
         } else {
             16
         }
     });
-    if let (Some((start, end)), Some(budget)) = (state.think_token_ids, think_budget) {
-        sampling.think_start_token_id = Some(start);
-        sampling.think_end_token_id = Some(end);
-        sampling.max_thinking_tokens = Some(budget);
-    }
 
     // Multimodal dispatch: if the backend is a VLM and the request has images,
     // route through the in-process multimodal channel instead of the relay.
@@ -1725,28 +1747,17 @@ async fn anthropic_messages(
             }
         }
     }
-    // Thinking budget: server config > DSv4 default (high tier).
-    let think_budget = if thinking {
-        (state.max_thinking_tokens > 0)
-            .then_some(state.max_thinking_tokens)
-            .or_else(|| state.template_defaults_thinking.then_some(32768))
-    } else {
-        None
-    };
+    let client_budget = request.thinking.as_ref().and_then(|t| t.budget_tokens);
+    let think_budget = state.resolve_think_budget(thinking, None, client_budget, &mut sampling);
     let max_tokens = sampling.max_new_tokens.unwrap_or_else(|| {
         if let Some(budget) = think_budget {
-            budget + 4096
+            budget + THINK_CONTENT_HEADROOM
         } else if thinking {
-            4096
+            THINK_CONTENT_HEADROOM
         } else {
             16
         }
     });
-    if let (Some((start, end)), Some(budget)) = (state.think_token_ids, think_budget) {
-        sampling.think_start_token_id = Some(start);
-        sampling.think_end_token_id = Some(end);
-        sampling.max_thinking_tokens = Some(budget);
-    }
     // Echo the request's model string back (Anthropic contract).
     let model = request.model.clone().unwrap_or_else(|| state.model.clone());
     let prompt_token_count = prompt_tokens.len();
