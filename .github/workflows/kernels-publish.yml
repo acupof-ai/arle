@@ -29,11 +29,12 @@ on:
         type: string
 
 # Build and qualification lanes must not kill each other: a push during a
-# qualification dispatch would otherwise cancel it (and vice versa), and a
-# build cancelled mid-publish leaves a partial asset set on the release.
+# qualification dispatch would otherwise cancel it (and vice versa). Build
+# runs queue (not cancel) so the sccache cache is saved — a cancelled build
+# skips the cache post-step, leaving every run cold at ~54 min.
 concurrency:
   group: kernels-publish-${{ inputs.kernel_candidate_run_id && 'qualify' || 'build' }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 env:
   RUSTC_WRAPPER: ""
