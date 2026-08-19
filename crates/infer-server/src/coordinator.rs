@@ -390,6 +390,32 @@ fn think_budget_for_effort(effort: &str) -> Option<usize> {
     }
 }
 
+/// Count reasoning tokens in a generated token stream. The chat template
+/// pre-fills `<think>` into the prompt, so thinking starts immediately
+/// (`start_in_thinking = true` when thinking is on). Think start/end tokens
+/// themselves are not counted — matches the engine's `update_think_state`.
+fn count_reasoning_tokens(
+    tokens: &[u32],
+    think_ids: Option<(u32, u32)>,
+    start_in_thinking: bool,
+) -> usize {
+    let Some((start, end)) = think_ids else {
+        return 0;
+    };
+    let mut count = 0;
+    let mut in_thinking = start_in_thinking;
+    for &token in tokens {
+        if token == start {
+            in_thinking = true;
+        } else if token == end {
+            in_thinking = false;
+        } else if in_thinking {
+            count += 1;
+        }
+    }
+    count
+}
+
 /// Build the coordinator router + spawn the lockstep loop thread. `relay` is the
 /// accepted [`RelayCoordinator`] (all N ranks connected via `accept_symmetric`).
 /// The lockstep loop runs for the process lifetime. Pass `multimodal` for VLM
@@ -1341,11 +1367,14 @@ async fn chat_completions(
             let decoded = decode(&state, &delta.token_ids)?;
             let (content, tool_calls, split_thinking) =
                 finalize_chat_content(decoded, tools_active, thinking);
+            let reasoning_tokens =
+                count_reasoning_tokens(&delta.token_ids, state.think_token_ids, thinking);
             return Ok(Json(ChatCompletionResponse::from_parts(
                 state.model.clone(),
                 content,
                 prompt_token_count,
                 delta.token_ids.len(),
+                reasoning_tokens,
                 delta.finish_reason.as_ref(),
                 split_thinking,
                 tool_calls,
@@ -1391,6 +1420,8 @@ async fn chat_completions(
             // `guard` dropped when this task exits, decrementing in_flight + unregistering sink.
             let _guard = guard;
             let mut completion_count = 0usize;
+            let mut reasoning_count = 0usize;
+            let mut in_thinking = thinking;
             // Converged reasoning-then-tools pipeline (shared with /v1/messages).
             let mut pipeline = StreamPipeline::new(thinking, tools_active);
             let mut completed_calls: Vec<chat::ToolCall> = Vec::new();
@@ -1420,6 +1451,17 @@ async fn chat_completions(
                 }
                 if !delta.token_ids.is_empty() {
                     completion_count += delta.token_ids.len();
+                    if let Some((start, end)) = state_clone.think_token_ids {
+                        for &token in &delta.token_ids {
+                            if token == start {
+                                in_thinking = true;
+                            } else if token == end {
+                                in_thinking = false;
+                            } else if in_thinking {
+                                reasoning_count += 1;
+                            }
+                        }
+                    }
                     let text = {
                         let tok = state_clone
                             .tokenizer
@@ -1524,7 +1566,7 @@ async fn chat_completions(
                     );
                     let usage_chunk = include_usage.then(|| {
                         let usage = if thinking {
-                            Usage::with_reasoning(prompt_len, completion_count, 0)
+                            Usage::with_reasoning(prompt_len, completion_count, reasoning_count)
                         } else {
                             Usage::new(prompt_len, completion_count)
                         };
@@ -1556,6 +1598,8 @@ async fn chat_completions(
     if n > 1 {
         let mut choices = Vec::with_capacity(n);
         let want_lps = request.logprobs.unwrap_or(false);
+        let mut total_completion_tokens = 0usize;
+        let mut total_reasoning_tokens = 0usize;
         for i in 0..n {
             let mut params = sampling.clone();
             params.seed = Some(sampling.seed.unwrap_or(0).wrapping_add(i as u64));
@@ -1567,6 +1611,9 @@ async fn chat_completions(
                 request.response_format.clone(),
             )
             .await?;
+            total_completion_tokens += outcome.generated_tokens.len();
+            total_reasoning_tokens +=
+                count_reasoning_tokens(&outcome.generated_tokens, state.think_token_ids, thinking);
             let decoded = decode(&state, &outcome.generated_tokens)?;
             let decoded = request.stop.as_deref().map_or_else(
                 || decoded.clone(),
@@ -1602,14 +1649,22 @@ async fn chat_completions(
                 finish_reason,
             });
         }
-        let total_completion = choices.iter().map(|c| c.message.content.len()).sum();
+        let usage = if thinking {
+            Usage::with_reasoning(
+                prompt_tokens.len(),
+                total_completion_tokens,
+                total_reasoning_tokens,
+            )
+        } else {
+            Usage::new(prompt_tokens.len(), total_completion_tokens)
+        };
         return Ok(Json(ChatCompletionResponse {
             id: format!("chatcmpl-{}", uuid::Uuid::new_v4().simple()),
             object: "chat.completion",
             created: unix_time_secs(),
             model: state.model.clone(),
             choices,
-            usage: Usage::new(prompt_tokens.len(), total_completion),
+            usage,
             system_fingerprint: SYSTEM_FINGERPRINT,
         })
         .into_response());
@@ -1640,11 +1695,14 @@ async fn chat_completions(
     } else {
         None
     };
+    let reasoning_tokens =
+        count_reasoning_tokens(&outcome.generated_tokens, state.think_token_ids, thinking);
     Ok(Json(ChatCompletionResponse::from_parts(
         state.model.clone(),
         content,
         outcome.prompt_tokens,
         outcome.generated_tokens.len(),
+        reasoning_tokens,
         outcome.finish.as_ref(),
         split_thinking,
         tool_calls,
@@ -1915,11 +1973,14 @@ async fn anthropic_messages(
         .enumerate()
         .map(|(index, call)| ResponseToolCall::from_parsed(call, index))
         .collect();
+    let reasoning_tokens =
+        count_reasoning_tokens(&outcome.generated_tokens, state.think_token_ids, thinking);
     let chat = ChatCompletionResponse::from_parts(
         model,
         content,
         outcome.prompt_tokens,
         outcome.generated_tokens.len(),
+        reasoning_tokens,
         outcome.finish.as_ref(),
         thinking,
         tool_calls,
