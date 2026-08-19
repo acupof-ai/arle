@@ -1,0 +1,10 @@
+  <rect x="28" y="64" width="340" height="126" rx="8" fill="#F4FCF8" stroke="#0CA678"/>
+  <text x="48" y="90" font-size="13.5" font-weight="bold" fill="#087F5B">丢在滑窗层的窗口外</text>
+  <text x="48" y="116" font-size="12.5" fill="#495057">窗口掩码本来就不让它参与计算，</text>
+  <text x="48" y="138" font-size="12.5" fill="#495057">跳过和补上的结果逐 token 相同。</text>
+  <text x="48" y="170" font-size="13" font-weight="bold" fill="#087F5B">硬保证 · 精确</text>
+  <rect x="392" y="64" width="340" height="126" rx="8" fill="#FFF8F8" stroke="#E03131"/>
+  <text x="412" y="90" font-size="13.5" font-weight="bold" fill="#C92A2A">丢在全注意力层</text>
+  <text x="412" y="116" font-size="12.5" fill="#495057">没有掩码兜底。缺的这块正好相关时必错，</text>
+  <text x="412" y="138" font-size="12.5" fill="#495057">而是否相关，不重算就无法预知。</text>
+  <text x="412" y="170" font-size="13" font-weight="bold" fill="#C92A2A">只有统计保证 · 误差随 workload 变</text>

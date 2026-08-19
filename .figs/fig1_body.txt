@@ -1,0 +1,14 @@
+  <text x="28" y="78" font-size="13" font-weight="bold" fill="#C92A2A">全注意力层</text>
+  <text x="150" y="78" font-size="12" fill="#868E96">Qwen3.6-27B 里 5:1 中的那个 1</text>
+  <rect x="28" y="88" width="704" height="46" rx="6" fill="#FFF8F8" stroke="#E03131"/>
+  <text x="46" y="108" font-size="12.5" fill="#495057">每个 token 的 K/V 都在页里，可以按位置独立重算。依赖它左边的整个前缀，必须串行修。</text>
+  <text x="46" y="126" font-size="12.5" font-weight="bold" fill="#C92A2A">缺块必须补 —— 这一类才是「补一块」成立的地方</text>
+  <text x="28" y="160" font-size="13" font-weight="bold" fill="#087F5B">滑窗层</text>
+  <rect x="28" y="170" width="704" height="46" rx="6" fill="#F4FCF8" stroke="#0CA678"/>
+  <text x="46" y="190" font-size="12.5" fill="#495057">窗口外的 K 已被环形缓冲覆写，系统里没有第二份，但掩码本来也不看它。</text>
+  <text x="46" y="208" font-size="12.5" font-weight="bold" fill="#087F5B">窗口外缺块无影响；窗口内缺块只依赖左边 W 个 token，多个空洞可并行修</text>
+  <text x="28" y="242" font-size="13" font-weight="bold" fill="#E8590C">线性注意力层（Gated DeltaNet，Qwen3.5/3.6 里占多数）</text>
+  <rect x="28" y="252" width="704" height="64" rx="6" fill="#FFF8F0" stroke="#F08C00"/>
+  <text x="46" y="272" font-size="12.5" fill="#495057">只保存最前沿的一份循环状态，没有逐 token 的 KV，不可逆，无法从任意位置起算。</text>
+  <text x="46" y="290" font-size="12.5" fill="#495057">只能回退到不晚于空洞的最近一个状态快照，重放到当前位置。</text>
+  <text x="46" y="308" font-size="12.5" font-weight="bold" fill="#E8590C">代价上界 = 快照步长 512 页 × 16 = 8192 token，与空洞长度 h 无关</text>

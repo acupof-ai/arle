@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 176" width="760" height="176">
+  <defs>
+    <linearGradient id="ok" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#EDF2FF"/><stop offset="1" stop-color="#DBE4FF"/></linearGradient>
+    <linearGradient id="bad" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#FFF5F5"/><stop offset="1" stop-color="#FFC9C9"/></linearGradient>
+    <linearGradient id="fix" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#FFF9DB"/><stop offset="1" stop-color="#FFE066"/></linearGradient>
+    <linearGradient id="par" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#E6FCF5"/><stop offset="1" stop-color="#96F2D7"/></linearGradient>
+    <linearGradient id="lo" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#FFF4E6"/><stop offset="1" stop-color="#FFD8A8"/></linearGradient>
+  </defs>
+  <rect x="0" y="0" width="760" height="176" fill="#FFFFFF"/>
+  <rect x="8" y="8" width="744" height="160" rx="10" fill="#FFFFFF" stroke="#0CA678" stroke-width="2"/>
+  <text x="28" y="42" font-size="17" font-weight="bold" fill="#087F5B">① 空洞局部重算</text>
+  <rect x="573" y="24" width="165" height="26" rx="13" fill="#E6FCF5" stroke="#0CA678"/>
+  <text x="655" y="42" font-size="12.5" font-weight="bold" fill="#087F5B" text-anchor="middle">开销 0 · 仅全注意力页</text>
+  <rect x="28" y="72" width="52" height="30" rx="4" fill="url(#ok)" stroke="#4C6EF5"/>
+  <rect x="86" y="72" width="52" height="30" rx="4" fill="url(#ok)" stroke="#4C6EF5"/>
+  <rect x="144" y="72" width="52" height="30" rx="4" fill="url(#ok)" stroke="#4C6EF5"/>
+  <rect x="202" y="72" width="52" height="30" rx="4" fill="url(#ok)" stroke="#4C6EF5"/>
+  <rect x="260" y="72" width="52" height="30" rx="4" fill="url(#ok)" stroke="#4C6EF5"/>
+  <rect x="318" y="72" width="52" height="30" rx="4" fill="url(#ok)" stroke="#4C6EF5"/>
+  <rect x="376" y="72" width="52" height="30" rx="4" fill="url(#fix)" stroke="#F08C00"/>
+  <rect x="434" y="72" width="52" height="30" rx="4" fill="url(#ok)" stroke="#4C6EF5"/>
+  <rect x="492" y="72" width="52" height="30" rx="4" fill="url(#ok)" stroke="#4C6EF5"/>
+  <rect x="550" y="72" width="52" height="30" rx="4" fill="url(#ok)" stroke="#4C6EF5"/>
+  <rect x="608" y="72" width="52" height="30" rx="4" fill="url(#ok)" stroke="#4C6EF5"/>
+  <rect x="666" y="72" width="52" height="30" rx="4" fill="url(#ok)" stroke="#4C6EF5"/>
+  <polyline points="40,124 356,124 380,110" fill="none" stroke="#F08C00" stroke-width="2"/>
+  <polygon points="376,102 390,109 376,116" fill="#F08C00"/>
+  <text x="40" y="146" font-size="12.5" fill="#495057">读左侧已在显存的 KV</text>
+  <text x="410" y="146" font-size="12.5" font-weight="bold" fill="#E8590C">只前向 h 个 token</text>
+</svg>

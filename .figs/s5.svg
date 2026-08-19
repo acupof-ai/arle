@@ -1,0 +1,48 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 196" width="760" height="196">
+  <defs>
+    <linearGradient id="ok" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#EDF2FF"/><stop offset="1" stop-color="#DBE4FF"/></linearGradient>
+    <linearGradient id="bad" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#FFF5F5"/><stop offset="1" stop-color="#FFC9C9"/></linearGradient>
+    <linearGradient id="fix" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#FFF9DB"/><stop offset="1" stop-color="#FFE066"/></linearGradient>
+    <linearGradient id="par" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#E6FCF5"/><stop offset="1" stop-color="#96F2D7"/></linearGradient>
+    <linearGradient id="lo" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#FFF4E6"/><stop offset="1" stop-color="#FFD8A8"/></linearGradient>
+  </defs>
+  <rect x="0" y="0" width="760" height="196" fill="#FFFFFF"/>
+  <rect x="8" y="8" width="744" height="180" rx="10" fill="#FFFFFF" stroke="#E03131" stroke-width="2"/>
+  <text x="28" y="42" font-size="17" font-weight="bold" fill="#C92A2A">⑤ 对等实例恢复</text>
+  <rect x="574" y="24" width="163" height="26" rx="13" fill="#FFF5F5" stroke="#E03131"/>
+  <text x="656" y="42" font-size="12.5" font-weight="bold" fill="#C92A2A" text-anchor="middle">缺命名方案 · 开销未知</text>
+  <rect x="28" y="62" width="228" height="56" rx="6" fill="#E3FAFC" stroke="#1098AD"/>
+  <text x="40" y="80" font-size="12" fill="#0B7285">实例 B</text>
+  <rect x="40" y="90" width="22" height="18" rx="2" fill="url(#ok)" stroke="#4C6EF5"/>
+  <rect x="66" y="90" width="22" height="18" rx="2" fill="url(#ok)" stroke="#4C6EF5"/>
+  <rect x="92" y="90" width="22" height="18" rx="2" fill="url(#ok)" stroke="#4C6EF5"/>
+  <rect x="118" y="90" width="22" height="18" rx="2" fill="url(#ok)" stroke="#4C6EF5"/>
+  <rect x="144" y="90" width="22" height="18" rx="2" fill="url(#ok)" stroke="#4C6EF5"/>
+  <rect x="170" y="90" width="22" height="18" rx="2" fill="url(#ok)" stroke="#4C6EF5"/>
+  <rect x="196" y="90" width="22" height="18" rx="2" fill="url(#ok)" stroke="#4C6EF5"/>
+  <rect x="222" y="90" width="22" height="18" rx="2" fill="url(#ok)" stroke="#4C6EF5"/>
+  <rect x="272" y="62" width="228" height="56" rx="6" fill="#E3FAFC" stroke="#1098AD"/>
+  <text x="284" y="80" font-size="12" fill="#0B7285">实例 C</text>
+  <rect x="284" y="90" width="22" height="18" rx="2" fill="url(#ok)" stroke="#4C6EF5"/>
+  <rect x="310" y="90" width="22" height="18" rx="2" fill="url(#ok)" stroke="#4C6EF5"/>
+  <rect x="336" y="90" width="22" height="18" rx="2" fill="url(#ok)" stroke="#4C6EF5"/>
+  <rect x="362" y="90" width="22" height="18" rx="2" fill="url(#ok)" stroke="#4C6EF5"/>
+  <rect x="388" y="90" width="22" height="18" rx="2" fill="url(#ok)" stroke="#4C6EF5"/>
+  <rect x="414" y="90" width="22" height="18" rx="2" fill="url(#ok)" stroke="#4C6EF5"/>
+  <rect x="440" y="90" width="22" height="18" rx="2" fill="url(#ok)" stroke="#4C6EF5"/>
+  <rect x="466" y="90" width="22" height="18" rx="2" fill="url(#ok)" stroke="#4C6EF5"/>
+  <rect x="516" y="62" width="228" height="56" rx="6" fill="#FFF5F5" stroke="#E03131" stroke-dasharray="4 3"/>
+  <text x="528" y="80" font-size="12" fill="#C92A2A">实例 A</text>
+  <rect x="528" y="90" width="22" height="18" rx="2" fill="url(#ok)" stroke="#4C6EF5"/>
+  <rect x="554" y="90" width="22" height="18" rx="2" fill="url(#ok)" stroke="#4C6EF5"/>
+  <rect x="580" y="90" width="22" height="18" rx="2" fill="url(#ok)" stroke="#4C6EF5"/>
+  <rect x="606" y="90" width="22" height="18" rx="2" fill="url(#ok)" stroke="#4C6EF5"/>
+  <rect x="632" y="90" width="22" height="18" rx="2" fill="url(#bad)" stroke="#E03131" stroke-dasharray="3 2"/>
+  <rect x="658" y="90" width="22" height="18" rx="2" fill="url(#ok)" stroke="#4C6EF5"/>
+  <rect x="684" y="90" width="22" height="18" rx="2" fill="url(#ok)" stroke="#4C6EF5"/>
+  <rect x="710" y="90" width="22" height="18" rx="2" fill="url(#ok)" stroke="#4C6EF5"/>
+  <polyline points="528,128 638,128" fill="none" stroke="#E03131" stroke-width="2"/>
+  <polygon points="626,122 640,128 626,134" fill="#E03131"/>
+  <text x="528" y="148" font-size="11.5" fill="#C92A2A">名字依赖左边全部 token</text>
+  <text x="28" y="172" font-size="12.5" font-weight="bold" fill="#C92A2A">中段 block 没有跨实例可独立计算的名字，补一个全局索引解决不了这件事</text>
+</svg>
