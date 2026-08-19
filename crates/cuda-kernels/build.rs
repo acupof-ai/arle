@@ -2890,7 +2890,7 @@ fn main() {
         if legacy_volta_build
             && matches!(
                 stem,
-                "marlin_kernel" | "marlin_repack" | "marlin_w4a8_kernel" | "marlin_w8a16"
+                "marlin_kernel" | "marlin_repack" | "marlin_w4a8_kernel" | "marlin_gemm"
             )
         {
             nvcc_args.push("-DARLE_DISABLE_MARLIN_SM70=1".to_string());

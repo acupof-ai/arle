@@ -1495,6 +1495,18 @@ impl SafetensorLoader {
         }
     }
 
+    /// Same load, for a matrix a dense projection will consume. Routed MoE
+    /// experts must NOT use this — their grouped-GEMM path reads the packed
+    /// nibbles that the Marlin repack replaces.
+    pub(crate) fn load_dense_matrix_quant_aware(
+        &self,
+        ctx: &DeviceContext,
+        name: &str,
+    ) -> Result<DeviceMatrix> {
+        let matrix = self.load_matrix_quant_aware(ctx, name)?;
+        marlin_repack_dense_fp4(ctx, name, matrix)
+    }
+
     /// Load two same-K projections as ONE row-fused matrix (`[a; b]` along output rows)
     /// so a
     /// single GEMM serves both. W8A16 pairs fuse before the Marlin repack; every other
@@ -1639,7 +1651,8 @@ impl SafetensorLoader {
                 .repack_for_marlin_w8a16(ctx)
                 .with_context(|| format!("Marlin W8A16 repack fused {}", names.join("+")))?;
         }
-        Ok(fused)
+        // NVFP4 fuses on device like every other format, then repacks once here.
+        marlin_repack_dense_fp4(ctx, parts[0].0, fused)
     }
 
     /// Quant-aware twin of [`Self::load_matrix_sharded`].
@@ -1668,7 +1681,8 @@ impl SafetensorLoader {
                 QuantMatrixShard::Cols(infer_topo::row_shard(cols, tp))
             }
         };
-        self.load_quant_or_dense_view(ctx, &view, shard)
+        let matrix = self.load_quant_or_dense_view(ctx, &view, shard)?;
+        marlin_repack_dense_fp4(ctx, name, matrix)
     }
 
     /// Quant-aware twin of [`Self::load_qkv_head_sharded`]. `block_index` has the
@@ -1700,7 +1714,7 @@ impl SafetensorLoader {
             view.name,
             offset + local_rows,
         );
-        self.load_quant_or_dense_view(
+        let matrix = self.load_quant_or_dense_view(
             ctx,
             &view,
             QuantMatrixShard::Rows(ShardingSpec {
@@ -1708,7 +1722,8 @@ impl SafetensorLoader {
                 size: local_rows,
                 total: total_rows,
             }),
-        )
+        )?;
+        marlin_repack_dense_fp4(ctx, name, matrix)
     }
 
     /// Quant-aware twin of the BF16 fused-qkv head shard: shard the F8_E4M3 weight AND
@@ -2056,9 +2071,9 @@ impl SafetensorLoader {
         let router_gate = self.load_matrix(ctx, &names.router_gate)?;
         let (shared_gate, shared_up, shared_down) = if tp.is_single() {
             (
-                self.load_matrix_quant_aware(ctx, &names.shared_expert_gate_proj)?,
-                self.load_matrix_quant_aware(ctx, &names.shared_expert_up_proj)?,
-                self.load_matrix_quant_aware(ctx, &names.shared_expert_down_proj)?,
+                self.load_dense_matrix_quant_aware(ctx, &names.shared_expert_gate_proj)?,
+                self.load_dense_matrix_quant_aware(ctx, &names.shared_expert_up_proj)?,
+                self.load_dense_matrix_quant_aware(ctx, &names.shared_expert_down_proj)?,
             )
         } else {
             (
@@ -5698,6 +5713,20 @@ fn validate_expert_projection_dispatch_signature(
         }
     }
     Ok(format.is_quantized().then_some(first_sig))
+}
+
+/// Give a dense projection the NVFP4 Marlin tensor-core layout at load time.
+/// No-op for every other weight format, and for NVFP4 shapes or group sizes the
+/// kFE2M1f kernel is not instantiated for (those keep the scalar GEMV).
+fn marlin_repack_dense_fp4(
+    ctx: &DeviceContext,
+    name: &str,
+    mut matrix: DeviceMatrix,
+) -> Result<DeviceMatrix> {
+    matrix
+        .repack_for_marlin_fp4(ctx)
+        .with_context(|| format!("Marlin NVFP4 repack {name}"))?;
+    Ok(matrix)
 }
 
 fn routed_expert_weight_format(

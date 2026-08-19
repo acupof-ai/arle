@@ -1,12 +1,16 @@
-// W8A16 Marlin GEMM + repack — extern "C" shim over the vendored SGLang kernels.
+// Marlin GEMM + repack — extern "C" shim over the vendored SGLang kernels.
 //
 // Replaces SGLang's two TVM-FFI host wrappers (gptq_marlin_gemm / gptq_marlin_repack,
 // both truncated out of the vendored .cuh) with raw-pointer + cudaStream_t entry
 // points matching ARLE's crates/cuda-kernels/src/ffi/gemm.rs convention.
 //
-// Scope: symmetric per-group INT8 weights (scale = amax/127, no zero-point) →
-// Marlin q_type = kU8B128 (uint8 with +128 bias), has_zp=false, has_act_order=false,
-// BF16 activations/scales. group_size=128 (group_blocks=8) natively supported.
+// Two weight types share this TU (get_marlin_kernel instantiates both regardless,
+// so a second file would only double the ~5 min nvcc cost):
+//   - W8A16: symmetric per-group INT8 (scale = amax/127, no zero-point) →
+//     kU8B128 (uint8 with +128 bias), BF16 group scales, group_size 32/64/128.
+//   - NVFP4: E2M1 nibbles + FP8 E4M3 group scales (group_size 16) + one F32
+//     per-tensor scale → kFE2M1f, group_blocks=1, 8-bit scales, `s2` global scale.
+// Both run has_zp=false, has_act_order=false, BF16 activations.
 //
 // The vendored device kernels are Ampere-MMA (`mma.sync.m16n8k16`, `cp.async`), gated
 // `#if __CUDA_ARCH__ < 800` to empty stubs — one binary runs sm_80..sm_120. We add a
@@ -30,6 +34,12 @@ cudaError_t marlin_gptq_repack_w8a16_cuda(
   return cudaErrorNotSupported;
 }
 
+cudaError_t marlin_gptq_repack_fp4_cuda(
+    const uint32_t* b_q_weight, uint32_t* out, int size_k, int size_n, cudaStream_t stream) {
+  (void)b_q_weight; (void)out; (void)size_k; (void)size_n; (void)stream;
+  return cudaErrorNotSupported;
+}
+
 CUresult marlin_w8a16_gemm_cuda(
     const __nv_bfloat16* A, const uint32_t* B_packed, const __nv_bfloat16* scales,
     __nv_bfloat16* C, float* c_tmp, int* workspace,
@@ -39,8 +49,17 @@ CUresult marlin_w8a16_gemm_cuda(
   return CUDA_ERROR_NOT_SUPPORTED;
 }
 
-int marlin_w8a16_c_tmp_floats(int m, int sms) { (void)m; (void)sms; return 0; }
-int marlin_w8a16_workspace_ints(int sms) { (void)sms; return 0; }
+CUresult marlin_fp4_gemm_cuda(
+    const __nv_bfloat16* A, const uint32_t* B_packed, const uint8_t* scales,
+    const uint16_t* global_scale, __nv_bfloat16* C, float* c_tmp, int* workspace,
+    int m, int n, int k, int group_size, cudaStream_t stream) {
+  (void)A; (void)B_packed; (void)scales; (void)global_scale; (void)C; (void)c_tmp;
+  (void)workspace; (void)m; (void)n; (void)k; (void)group_size; (void)stream;
+  return CUDA_ERROR_NOT_SUPPORTED;
+}
+
+int marlin_c_tmp_floats(int m, int sms) { (void)m; (void)sms; return 0; }
+int marlin_workspace_ints(int sms) { (void)sms; return 0; }
 
 }  // extern "C"
 
@@ -63,14 +82,12 @@ inline bool sm_supports_marlin(int dev, int* sms_out) {
   return true;
 }
 
-}  // namespace
-
-extern "C" {
-
-// GPTQ-packed uint8b128 [size_k/4, size_n] int32 → Marlin tile layout.
-// weight: uint8 = int8 + 128 packed 4-per-int32 (see repack_for_marlin_w8a16 in
-// tensor.rs). out: [size_k/16, size_n*16/4] int32.
-cudaError_t marlin_gptq_repack_w8a16_cuda(
+// GPTQ-packed [size_k/(32/num_bits), size_n] int32 → Marlin tile layout.
+// The repack kernel grid-strides over k-tiles: gridDim.x == SM count, and each
+// block sweeps all n-tiles for its k-tile range (see block_k_tiles at
+// gptq_marlin_repack.cuh:53). Matches upstream (blocks = multiProcessorCount).
+template <int num_bits>
+cudaError_t marlin_gptq_repack(
     const uint32_t* b_q_weight, uint32_t* out, int size_k, int size_n, cudaStream_t stream) {
   int dev = 0;
   if (cudaGetDevice(&dev) != cudaSuccess) return cudaErrorInvalidDevice;
@@ -81,20 +98,33 @@ cudaError_t marlin_gptq_repack_w8a16_cuda(
   cudaError_t e = cudaDeviceGetAttribute(&max_shared_mem, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
   if (e != cudaSuccess) return e;
 
-  constexpr int num_bits = 8;
-  // The repack kernel grid-strides over k-tiles: gridDim.x == SM count, and each
-  // block sweeps all n-tiles for its k-tile range (see block_k_tiles at
-  // gptq_marlin_repack.cuh:53). Matches upstream (blocks = multiProcessorCount).
-  int blocks = sms;
-
   auto kernel = device::marlin::gptq_marlin_repack_kernel<device::marlin::repack_threads, num_bits, false>;
   e = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, max_shared_mem);
   if (e != cudaSuccess) return e;
 
   const uint32_t* perm_ptr = nullptr;  // has_perm=false
-  kernel<<<blocks, device::marlin::repack_threads, max_shared_mem, stream>>>(
+  kernel<<<sms, device::marlin::repack_threads, max_shared_mem, stream>>>(
       b_q_weight, perm_ptr, out, size_k, size_n);
   return cudaGetLastError();
+}
+
+}  // namespace
+
+extern "C" {
+
+// weight: uint8 = int8 + 128 packed 4-per-int32 (see repack_for_marlin_w8a16 in
+// tensor.rs). in: [size_k/4, size_n] int32. out: [size_k/16, size_n*16/4] int32.
+cudaError_t marlin_gptq_repack_w8a16_cuda(
+    const uint32_t* b_q_weight, uint32_t* out, int size_k, int size_n, cudaStream_t stream) {
+  return marlin_gptq_repack<8>(b_q_weight, out, size_k, size_n, stream);
+}
+
+// NVFP4 E2M1 nibbles, k-major inside each int32 (the checkpoint's `weight_packed`
+// row transposed to [size_k/8, size_n] int32 — see repack_for_marlin_fp4).
+// out: [size_k/16, size_n*16/8] int32.
+cudaError_t marlin_gptq_repack_fp4_cuda(
+    const uint32_t* b_q_weight, uint32_t* out, int size_k, int size_n, cudaStream_t stream) {
+  return marlin_gptq_repack<4>(b_q_weight, out, size_k, size_n, stream);
 }
 
 // Y[m,n] = X[m,k] @ dequant(W)  — BF16 activations, kU8B128 weights, per-group
@@ -103,7 +133,7 @@ cudaError_t marlin_gptq_repack_w8a16_cuda(
 // CALLER-OWNED and reused across calls — the Qwen decode loop is CUDA-graph
 // captured, so the shim must NOT cudaMalloc/cudaFree per call (that breaks
 // capture). Both sizes depend only on sms (device-constant); the Rust side
-// allocates once. c_tmp needs >= marlin_w8a16_c_tmp_floats(m, sms) floats;
+// allocates once. c_tmp needs >= marlin_c_tmp_floats(m, sms) floats;
 // workspace >= sms ints, zero-initialized once (Marlin leaves locks at 0).
 CUresult marlin_w8a16_gemm_cuda(
     const __nv_bfloat16* A,       // [m, k] row-major (lda = k)
@@ -153,10 +183,61 @@ CUresult marlin_w8a16_gemm_cuda(
   return (cudaGetLastError() == cudaSuccess) ? CUDA_SUCCESS : CUDA_ERROR_LAUNCH_FAILED;
 }
 
+// Y[m,n] = X[m,k] @ dequant(W) — NVFP4. `scales` are the S0E5M3 bytes the FP8
+// scale dequant expects (NOT raw E4M3: see repack_for_marlin_fp4); `global_scale`
+// is one BF16 carrying the per-tensor scale times 2^119 / the S0E5M3 rescale.
+// Scratch ownership is the same contract as the W8A16 entry point above.
+CUresult marlin_fp4_gemm_cuda(
+    const __nv_bfloat16* A,        // [m, k] row-major (lda = k)
+    const uint32_t* B_packed,      // Marlin-repacked kFE2M1f
+    const uint8_t* scales,         // [k/16, n] S0E5M3, Marlin-permuted
+    const uint16_t* global_scale,  // 1 × BF16
+    __nv_bfloat16* C,              // [m, n]
+    float* c_tmp,                  // caller-owned fp32-reduce scratch
+    int* workspace,                // caller-owned zeroed int lock buffer
+    int m, int n, int k, int group_size, cudaStream_t stream) {
+  int dev = 0;
+  if (cudaGetDevice(&dev) != cudaSuccess) return CUDA_ERROR_INVALID_DEVICE;
+  int sms = 0;
+  if (!sm_supports_marlin(dev, &sms)) return CUDA_ERROR_NOT_SUPPORTED;
+  if (m == 0) return CUDA_SUCCESS;
+
+  int num_groups = k / group_size;
+
+  try {
+    device::marlin::marlin_mm<__nv_bfloat16>(
+        A, B_packed, C,
+        c_tmp,
+        const_cast<uint8_t*>(scales),
+        const_cast<uint16_t*>(global_scale),
+        nullptr,   // zp — has_zp=false
+        nullptr,   // g_idx
+        nullptr,   // perm
+        nullptr,   // a_tmp — has_act_order=false
+        m, n, k,
+        k,         // lda
+        workspace,
+        host::kFE2M1f,
+        false,     // has_act_order
+        true,      // is_k_full
+        false,     // has_zp
+        num_groups, group_size, dev, stream,
+        -1, -1,    // thread_k/n auto
+        sms,
+        false,     // use_atomic_add
+        true,      // use_fp32_reduce
+        false);    // is_zp_float
+  } catch (...) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+
+  return (cudaGetLastError() == cudaSuccess) ? CUDA_SUCCESS : CUDA_ERROR_LAUNCH_FAILED;
+}
+
 // c_tmp float count for the fp32-reduce path (SGLang gptq_marlin.py:76-81):
 //   sms * min(ceil(m/16)*16, 64) * max_thread_n(256). The Rust scratch allocates
 // the m-independent MAX (m >= 64 → max_m_block = 64) once.
-int marlin_w8a16_c_tmp_floats(int m, int sms) {
+int marlin_c_tmp_floats(int m, int sms) {
   int max_m_block = ((m + 15) / 16) * 16;
   if (max_m_block > 64) max_m_block = 64;
   return sms * max_m_block * device::marlin::max_thread_n;
@@ -165,7 +246,7 @@ int marlin_w8a16_c_tmp_floats(int m, int sms) {
 // Lock-buffer int count. Upstream sizes locks at sms * max_blocks_per_sm
 // (marlin_utils.py:416, default max_blocks_per_sm=1 → sms); 4× is headroom.
 // Zero-initialize once on the Rust side.
-int marlin_w8a16_workspace_ints(int sms) { return sms * 4; }
+int marlin_workspace_ints(int sms) { return sms * 4; }
 
 }  // extern "C"
 

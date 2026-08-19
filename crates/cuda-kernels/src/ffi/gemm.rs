@@ -483,6 +483,41 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    pub fn dsv4_w4afp8_grouped_swiglu_decode_cuda(
+        weight_gate_ptrs: *const u64,
+        scale_gate_ptrs: *const u64,
+        weight_up_ptrs: *const u64,
+        scale_up_ptrs: *const u64,
+        input: *const Half,
+        act: *mut Half,
+        offsets: *const i32,
+        counts: *const i32,
+        expert_indices: *const i32,
+        num_experts: i32,
+        max_count: i32,
+        n: i32,
+        k: i32,
+        scale_cols: i32,
+        limit: f32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn dsv4_w4afp8_grouped_down_decode_cuda(
+        weight_ptrs: *const u64,
+        scale_ptrs: *const u64,
+        input: *const Half,
+        output: *mut Half,
+        offsets: *const i32,
+        counts: *const i32,
+        expert_indices: *const i32,
+        num_experts: i32,
+        max_count: i32,
+        n: i32,
+        k: i32,
+        scale_cols: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     // ── Qwen3.5-MoE / Qwen3.6 single-GPU BF16 grouped expert GEMM ──────────
     // Mirrors the DSv4 FP8 grouped GEMM structure (M-grouping by expert,
     // CUDA-core warp-reduce, sm_70-safe) but with plain BF16 weights — no

@@ -5,7 +5,7 @@ use cudarc::driver::{
     CudaContext, CudaEvent, CudaSlice, CudaStream, DevicePtr, DevicePtrMut, DeviceRepr,
     DriverError, PinnedHostSlice, ValidAsZeroBits,
 };
-use half::bf16;
+use half::{bf16, f16};
 use std::any::type_name;
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -2808,6 +2808,189 @@ impl DeviceMatrix {
         Ok(())
     }
 
+    /// Build the Marlin tensor-core layout for an NVFP4 weight
+    /// (compressed-tensors nvfp4-pack-quantized): transpose the packed E2M1
+    /// nibbles into GPTQ `[K/8, N]` i32, GPU-repack to Marlin tiles, and
+    /// re-encode the FP8 E4M3 group scales into the S0E5M3 form Marlin's FP8
+    /// scale dequant expects. Stores into `marlin_packed` (weights),
+    /// `qscale_fp8` (scales, overwritten) and `marlin_scales` (the single BF16
+    /// global scale). No-op (leaves `marlin_packed` None → scalar GEMV
+    /// fallback) when the shape or group size is outside the kFE2M1f kernel's
+    /// instantiation. SM-gated by the caller (Ampere+).
+    ///
+    /// Scale encoding (vLLM `marlin_utils_fp4.nvfp4_marlin_process_scales`):
+    /// the kernel's weight dequant leaves a 2^-126 factor and the scale dequant
+    /// reads an 8-bit `[E5|M3]` field, so the byte is the high half of
+    /// `f16(scale * 2^7) << 1` and the leftover 2^119 is folded into the global
+    /// scale. `scale_factor` is a power of two that lifts every scale above the
+    /// E5-MSB-set floor; the global scale is divided by it.
+    pub fn repack_for_marlin_fp4(&mut self, ctx: &DeviceContext) -> Result<()> {
+        if self.weight_format != WeightFormat::Fp4E2M1Group
+            || self.qweight_u8.is_none()
+            || self.qscale_fp8.is_none()
+            || self.scale_f32.is_none()
+        {
+            return Ok(());
+        }
+        if ctx.compute_capability().0 < 8 {
+            return Ok(());
+        }
+        let n = self.rows; // output dim
+        let k = self.cols; // input dim
+        // kFE2M1f is instantiated only at group_blocks == 1 (group_size 16);
+        // the tile grid needs N % 64 and K % 64.
+        if self.group_size != 16
+            || !k.is_multiple_of(64)
+            || !n.is_multiple_of(64)
+            || self.quant_scale_rows != n
+            || self.quant_scale_cols != k / 16
+        {
+            log::warn!(
+                "Marlin NVFP4 repack skipped: [{n}x{k}] gs={} scales=[{}x{}] (need K%64, N%64, gs=16); scalar path",
+                self.group_size,
+                self.quant_scale_rows,
+                self.quant_scale_cols
+            );
+            return Ok(());
+        }
+        let global_host: Vec<f32> = ctx
+            .stream
+            .clone_dtoh(self.scale_f32.as_ref().unwrap())
+            .map_err(|e| anyhow!("D2H NVFP4 global scale: {}", e))?;
+        if global_host.len() != 1 {
+            log::warn!(
+                "Marlin NVFP4 repack skipped: {} global scales, expected 1; scalar path",
+                global_host.len()
+            );
+            return Ok(());
+        }
+
+        // Step 1: packed [N, K/2] u8 → GPTQ [K/8, N] i32. Each row's u32 view is
+        // already k-major inside the word (nibble k at bit (k%8)*4), so this is a
+        // plain transpose of that view — no bit shuffling.
+        let qw = self.qweight_u8.as_ref().unwrap();
+        let packed_host: Vec<u8> = ctx
+            .stream
+            .clone_dtoh(qw)
+            .map_err(|e| anyhow!("D2H NVFP4 qweight: {}", e))?;
+        ensure!(
+            packed_host.len() == n * (k / 2),
+            "NVFP4 qweight {} bytes, expected {}",
+            packed_host.len(),
+            n * (k / 2)
+        );
+        let words_per_row = k / 8;
+        let mut gptq = vec![0u32; words_per_row * n];
+        for row_n in 0..n {
+            let base = row_n * (k / 2);
+            for j in 0..words_per_row {
+                let b = &packed_host[base + j * 4..base + j * 4 + 4];
+                gptq[j * n + row_n] = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+            }
+        }
+        // SAFETY: views the live `Vec<u32>` as its byte representation (u8 align 1,
+        // len*4 bytes); `gptq` outlives the borrow.
+        let gptq_bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(gptq.as_ptr().cast::<u8>(), gptq.len() * 4) };
+        let gptq_gpu: CudaSlice<u8> = ctx
+            .stream
+            .clone_htod(gptq_bytes)
+            .map_err(|e| anyhow!("H2D NVFP4 GPTQ: {}", e))?;
+
+        // Marlin output: [K/16, N*2] i32 = K*N/8 i32 = K*N/2 bytes.
+        let mut marlin_gpu: CudaSlice<u8> = ctx
+            .stream
+            .alloc_zeros(k * n / 2)
+            .map_err(|e| anyhow!("Alloc NVFP4 Marlin: {}", e))?;
+        {
+            let (gptq_ptr, _g1) = gptq_gpu.device_ptr(&ctx.stream);
+            let (marlin_ptr, _g2) = marlin_gpu.device_ptr_mut(&ctx.stream);
+            // SAFETY: both from live CudaSlices pinned by the guards; sizes checked
+            // tile-aligned above, stream-ordered.
+            unsafe {
+                ffi::marlin_gptq_repack_fp4_cuda(
+                    gptq_ptr as *const u32,
+                    marlin_ptr as *mut u32,
+                    k as i32,
+                    n as i32,
+                    ctx.stream.cu_stream(),
+                )
+                .result()
+                .map_err(|e| anyhow!("NVFP4 Marlin repack failed: {:?}", e))?;
+            }
+        }
+
+        // Step 2: scales [N, K/16] E4M3 → transpose [K/16, N] → Marlin permute
+        // (8×8 transpose inside each 64-run) → the FP8-dequant pair order
+        // [0,2,1,3] inside each 4-run → S0E5M3 bytes.
+        let scales_host: Vec<u8> = ctx
+            .stream
+            .clone_dtoh(self.qscale_fp8.as_ref().unwrap())
+            .map_err(|e| anyhow!("D2H NVFP4 scales: {}", e))?;
+        let num_groups = k / 16;
+        ensure!(
+            scales_host.len() == n * num_groups,
+            "NVFP4 scales {} bytes, expected {}",
+            scales_host.len(),
+            n * num_groups
+        );
+        let mut sflat = vec![0f32; num_groups * n];
+        for row_n in 0..n {
+            for g in 0..num_groups {
+                sflat[g * n + row_n] = e4m3_to_f32(scales_host[row_n * num_groups + g]);
+            }
+        }
+        let mut sperm = vec![0f32; num_groups * n];
+        for block in 0..(num_groups * n / 64) {
+            let base = block * 64;
+            for out in 0..64 {
+                sperm[base + out] = sflat[base + (out % 8) * 8 + (out / 8)];
+            }
+        }
+        for quad in sperm.chunks_exact_mut(4) {
+            quad.swap(1, 2);
+        }
+        // The S0E5M3 field only spans exponents whose MSB is set, i.e. scale*2^7
+        // >= 2; lift everything by the largest power of two that keeps the max
+        // inside E4M3 range and divide it back out of the global scale.
+        let smax = sperm.iter().fold(0f32, |a, &b| a.max(b)) * 128.0;
+        let ceiling = 448.0f32 * 128.0;
+        let scale_factor = if smax > 0.0 && smax < ceiling {
+            (ceiling / smax).log2().floor().exp2()
+        } else {
+            1.0
+        };
+        let mut sbytes = vec![0u8; num_groups * n];
+        for (dst, &src) in sbytes.iter_mut().zip(sperm.iter()) {
+            let v = src * scale_factor * 128.0;
+            let v = if v < 2.0 { 0.0 } else { v };
+            *dst = (f16::from_f32(v).to_bits() >> 7) as u8;
+        }
+        let scales_gpu: CudaSlice<u8> = ctx
+            .stream
+            .clone_htod(&sbytes)
+            .map_err(|e| anyhow!("H2D NVFP4 Marlin scales: {}", e))?;
+
+        // Step 3: global scale, pre-multiplied by the 2^119 dequant bias.
+        let global = bf16::from_f32(
+            (f64::from(global_host[0]) * 2f64.powi(119) / f64::from(scale_factor)) as f32,
+        );
+        let global_gpu: CudaSlice<u16> = ctx
+            .stream
+            .clone_htod(&[global.to_bits()])
+            .map_err(|e| anyhow!("H2D NVFP4 Marlin global scale: {}", e))?;
+
+        self.marlin_packed = Some(marlin_gpu);
+        self.qscale_fp8 = Some(scales_gpu);
+        self.marlin_scales = Some(global_gpu);
+        // Marlin consumes only marlin_packed/qscale_fp8/marlin_scales; drop the
+        // source nibbles and global scale to realize the VRAM win.
+        self.qweight_u8 = None;
+        self.scale_f32 = None;
+
+        Ok(())
+    }
+
     pub fn from_safetensors(
         ctx: &DeviceContext,
         data: &[u8],
@@ -3244,4 +3427,19 @@ mod tests {
             );
         }
     }
+}
+
+/// FP8 E4M3FN → f32 (host twin of `dsv4_decode_fp8_e4m3`; 0x7f/0xff is the
+/// format's NaN and is clamped to +/-448, matching the device decoder).
+fn e4m3_to_f32(bits: u8) -> f32 {
+    let sign = if bits & 0x80 == 0 { 1.0 } else { -1.0 };
+    let exp = i32::from((bits >> 3) & 0x0f);
+    let mant = f32::from(bits & 0x07);
+    if bits & 0x7f == 0x7f {
+        return sign * 448.0;
+    }
+    if exp == 0 {
+        return sign * (mant / 8.0) * 2.0_f32.powi(-6);
+    }
+    sign * (1.0 + mant / 8.0) * 2.0_f32.powi(exp - 7)
 }
