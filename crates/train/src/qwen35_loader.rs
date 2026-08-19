@@ -1174,7 +1174,7 @@ fn plan_fp4_cuda_frozen_base(
     // Derive the group size rather than assuming 16, so an MXFP4/group-32
     // export fails the divisibility check below instead of decoding silently.
     let cols = expected_shape[1];
-    if scale_cols == 0 || cols % scale_cols != 0 {
+    if scale_cols == 0 || !cols.is_multiple_of(scale_cols) {
         return Err(LoaderError::Custom(format!(
             "{scale_name}: cols {cols} not divisible by scale_cols {scale_cols}"
         )));
