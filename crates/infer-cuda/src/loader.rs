@@ -1484,7 +1484,7 @@ impl SafetensorLoader {
         name: &str,
     ) -> Result<DeviceMatrix> {
         let matrix = self.load_matrix_quant_aware(ctx, name)?;
-        marlin_repack_dense_fp4(ctx, name, matrix)
+        marlin_repack_dense(ctx, name, matrix)
     }
 
     /// Load two same-K projections as ONE row-fused matrix (`[a; b]` along output rows)
@@ -1632,7 +1632,7 @@ impl SafetensorLoader {
                 .with_context(|| format!("Marlin W8A16 repack fused {}", names.join("+")))?;
         }
         // NVFP4 fuses on device like every other format, then repacks once here.
-        marlin_repack_dense_fp4(ctx, parts[0].0, fused)
+        marlin_repack_dense(ctx, parts[0].0, fused)
     }
 
     /// Quant-aware twin of [`Self::load_matrix_sharded`].
@@ -1662,7 +1662,7 @@ impl SafetensorLoader {
             }
         };
         let matrix = self.load_quant_or_dense_view(ctx, &view, shard)?;
-        marlin_repack_dense_fp4(ctx, name, matrix)
+        marlin_repack_dense(ctx, name, matrix)
     }
 
     /// Quant-aware twin of [`Self::load_qkv_head_sharded`]. `block_index` has the
@@ -1703,7 +1703,7 @@ impl SafetensorLoader {
                 total: total_rows,
             }),
         )?;
-        marlin_repack_dense_fp4(ctx, name, matrix)
+        marlin_repack_dense(ctx, name, matrix)
     }
 
     /// Quant-aware twin of the BF16 fused-qkv head shard: shard the F8_E4M3 weight AND
@@ -5664,10 +5664,15 @@ fn validate_expert_projection_dispatch_signature(
     Ok(format.is_quantized().then_some(first_sig))
 }
 
-/// Give a dense projection the NVFP4 Marlin tensor-core layout at load time.
-/// No-op for every other weight format, and for NVFP4 shapes or group sizes the
-/// kFE2M1f kernel is not instantiated for (those keep the scalar GEMV).
-fn marlin_repack_dense_fp4(
+/// Give a dense projection its Marlin tensor-core layout at load time. Both
+/// repacks are format-gated no-ops, so one call covers NVFP4 (kFE2M1f) and
+/// per-channel FP8 (kFE4M3fn) — the mixed Qwen3.8-27B-NVFP4 checkpoint carries
+/// both. Every other format, and any shape or group size the vendored kernel is
+/// not instantiated for, keeps the scalar GEMV.
+///
+/// Routed MoE experts must NOT come here: their grouped-GEMM path reads the
+/// packed nibbles the repack replaces.
+fn marlin_repack_dense(
     ctx: &DeviceContext,
     name: &str,
     mut matrix: DeviceMatrix,
@@ -5675,6 +5680,9 @@ fn marlin_repack_dense_fp4(
     matrix
         .repack_for_marlin_fp4(ctx)
         .with_context(|| format!("Marlin NVFP4 repack {name}"))?;
+    matrix
+        .repack_for_marlin_fp8(ctx)
+        .with_context(|| format!("Marlin FP8 per-channel repack {name}"))?;
     Ok(matrix)
 }
 

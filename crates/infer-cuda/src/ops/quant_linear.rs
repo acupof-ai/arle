@@ -18,30 +18,26 @@ mod qwen_fp8_dense_policy {
 /// M>=2 uses the WMMA GEMM which avoids the 2× memory blowup of cuBLAS for
 /// small batches (DSpark verify, MoE expert routing).
 ///
-/// Safe for FP4/W8A16 only because a Marlin arm claims M<=[`QWEN_FP4_MARLIN_MAX_M`]
+/// Safe for FP4/W8A16 only because a Marlin arm claims M<=[`QWEN_MARLIN_MAX_M`]
 /// first — and only for weights the repack accepted. A W8A16 weight Marlin could
 /// not repack still reaches its dequant arm at M=2 and pays a full-weight dequant
-/// per decode step; unmeasured, no such checkpoint on hand. A format with no
-/// Marlin arm at all must use [`QWEN_DEQUANT_GEMM_PREFILL_MIN_M`] — see its note.
+/// per decode step; unmeasured, no such checkpoint on hand. Weights with no
+/// Marlin layout must use [`QWEN_DEQUANT_GEMM_PREFILL_MIN_M`] — see its note.
 const QWEN_FP8_DEQUANT_GEMM_MIN_M: usize = 2;
 
-/// M floor for a dequant→BF16 GEMM on a format with no Marlin arm. A full-weight
-/// dequant per call costs ~5× the weight bytes a batched GEMV reads, so it is a
-/// prefill trade and must never fire on a decode step. This is a routing
-/// invariant, not a tuned crossover: above any decode batch, below
+/// M floor for a dequant→BF16 GEMM on a weight with no Marlin layout. A
+/// full-weight dequant per call costs ~5× the weight bytes a batched GEMV reads,
+/// so it is a prefill trade and must never fire on a decode step. This is a
+/// routing invariant, not a tuned crossover: above any decode batch, below
 /// `SchedulerConfig::chunked_prefill_size` (2048).
 ///
-/// ponytail: one constant separating decode from prefill. Instantiating Marlin
-/// `kFE4M3fn` for per-channel FP8 removes the need for it — the dequant arm then
-/// only sees M > [`QWEN_FP4_MARLIN_MAX_M`], same as every other format.
+/// Marlin `kFE4M3fn` did NOT retire this. It claims per-channel FP8 only. A
+/// 128×128 block-scaled FP8 weight fails the `quant_block_m != 1` guard in
+/// `repack_for_marlin_fp8`, so it has no Marlin layout — and DeepGEMM refuses it
+/// off Hopper (`qwen_fp8_dense_sm_supports_deepgemm` requires `major == 9`).
+/// On sm_80 / sm_100 / sm_120 those weights reach the dequant arm at every M,
+/// which is exactly the decode-shadowing defect this floor exists to stop.
 const QWEN_DEQUANT_GEMM_PREFILL_MIN_M: usize = 512;
-
-/// Largest M where the NVFP4 Marlin GEMM beats dequant→BF16 cuBLAS. Measured
-/// cold on 1xH20 (sm_90) at the 27B dense MLP shapes: Marlin is 96% faster at
-/// M=1, 57% at 256, 4-10% at 1024, and 12-21% SLOWER at 2048 — Marlin
-/// re-dequantizes per tile while the cuBLAS path pays the dequant once and then
-/// runs a pure BF16 GEMM. The default prefill chunk is 2048, so it stays on the
-/// cuBLAS path.
 
 #[derive(Default)]
 struct QwenFp8DenseScratch {
@@ -127,6 +123,7 @@ static W8A16_DEQUANT_GEMM_HITS: AtomicU64 = AtomicU64::new(0);
 static W4A16_DEQUANT_GEMM_HITS: AtomicU64 = AtomicU64::new(0);
 static MARLIN_W8A16_HITS: AtomicU64 = AtomicU64::new(0);
 static MARLIN_FP4_HITS: AtomicU64 = AtomicU64::new(0);
+static MARLIN_FP8_HITS: AtomicU64 = AtomicU64::new(0);
 static FP8_GEMV_HITS: AtomicU64 = AtomicU64::new(0);
 static W8A16_GEMV_HITS: AtomicU64 = AtomicU64::new(0);
 static W4A16_GEMV_HITS: AtomicU64 = AtomicU64::new(0);
@@ -138,6 +135,7 @@ static FP8_IMPLEMENTATION_IDS: &[(&AtomicU64, &str)] = &[
     (&W4A16_DEQUANT_GEMM_HITS, "cuda.w4a16.dequant_bf16_gemm"),
     (&MARLIN_W8A16_HITS, "cuda.w8a16.marlin_tensorcore"),
     (&MARLIN_FP4_HITS, "cuda.fp4.marlin_tensorcore"),
+    (&MARLIN_FP8_HITS, "cuda.qwen.fp8_marlin_tensorcore"),
     (&FP8_GEMV_HITS, "cuda.qwen.fp8_gemv"),
     (&W8A16_GEMV_HITS, "cuda.w8a16.gemv"),
     (&W4A16_GEMV_HITS, "cuda.w4a16.gemv"),
@@ -561,7 +559,9 @@ fn reserve_dequant_scratch(ctx: &DeviceContext, elems: usize) -> bool {
 /// Only engages when:
 ///  - the weight is `Fp8BlockScaled` (any block shape — per-channel `[1, K]`
 ///    included, since DeepGEMM above takes only the canonical 128x128),
-///  - `M >= QWEN_DEQUANT_GEMM_PREFILL_MIN_M`.
+///  - [`fp8_route`] says `DequantGemm` — i.e. above
+///    `QWEN_DEQUANT_GEMM_PREFILL_MIN_M`, or above `QWEN_MARLIN_MAX_M` for a
+///    per-channel weight the Marlin arm above already claims below it.
 ///
 /// The M floor is load-bearing. The dequant is per call, not cached, so at
 /// decode M this path re-materialises every FP8 weight in the model on every
@@ -577,7 +577,7 @@ fn try_fp8_dequant_bf16_gemm_batch(
     out: &mut HiddenStates,
 ) -> Result<bool> {
     if weight.weight_format != WeightFormat::Fp8BlockScaled
-        || x.seq_len < QWEN_DEQUANT_GEMM_PREFILL_MIN_M
+        || fp8_route(ctx, weight, x.seq_len) != Fp8Route::DequantGemm
     {
         return Ok(false);
     }
@@ -746,12 +746,21 @@ enum Fp4Route {
     Gemv,
 }
 
-/// Above this M the tensor-core kernel loses to dequant+cuBLAS; see [`Fp4Route`].
-const QWEN_FP4_MARLIN_MAX_M: usize = 1024;
+/// Largest M where a Marlin GEMM beats dequant→BF16 cuBLAS; see [`Fp4Route`] /
+/// [`Fp8Route`]. Measured cold on 1xH20 (sm_90) on NVFP4 at the 27B dense MLP
+/// shapes: Marlin is 96% faster at M=1, 57% at 256, 4-10% at 1024, and 12-21%
+/// SLOWER at 2048 — Marlin re-dequantizes per tile while cuBLAS pays the dequant
+/// once and then runs a pure BF16 GEMM. The default prefill chunk is 2048, so
+/// prefill stays on cuBLAS.
+///
+/// Per-channel FP8 reuses the value. The crossover mechanism is the same, but
+/// its M-sweep has not been run — treat 1024 as inherited, not measured, until
+/// the FP8 parity + perf ladder lands.
+const QWEN_MARLIN_MAX_M: usize = 1024;
 
 fn fp4_route(ctx: &DeviceContext, weight: &DeviceMatrix, m: usize) -> Fp4Route {
     let repacked = weight.marlin_packed.is_some() && weight.marlin_scales.is_some();
-    if repacked && marlin_sm_supported(ctx) && m <= QWEN_FP4_MARLIN_MAX_M {
+    if repacked && marlin_sm_supported(ctx) && m <= QWEN_MARLIN_MAX_M {
         return Fp4Route::Marlin;
     }
     if m >= QWEN_FP8_DEQUANT_GEMM_MIN_M {
@@ -819,6 +828,99 @@ fn try_fp4_marlin_gemm_batch(
         Ok(())
     })?;
     MARLIN_FP4_HITS.fetch_add(1, Ordering::Relaxed);
+    Ok(true)
+}
+
+/// The one place that decides how an FP8 weight DeepGEMM declined is multiplied.
+/// Mirrors [`Fp4Route`], with one difference that is load-bearing.
+///
+/// - `Marlin` (tensor core) for per-channel weights the repack accepted, up to
+///   [`QWEN_MARLIN_MAX_M`].
+/// - `DequantGemm` above that — and for weights with NO Marlin layout, but only
+///   from [`QWEN_DEQUANT_GEMM_PREFILL_MIN_M`], not from
+///   [`QWEN_FP8_DEQUANT_GEMM_MIN_M`] as FP4 uses. An un-repacked FP8 weight is a
+///   128×128 block weight on a non-Hopper card, and dequantising all of it at
+///   M=2 is the defect in
+///   `docs/experience/errors/2026-08-19-fp8-dequant-arm-shadows-decode.md`.
+/// - `Gemv` (batched scalar warp-per-row) below that.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Fp8Route {
+    Marlin,
+    DequantGemm,
+    Gemv,
+}
+
+fn fp8_route(ctx: &DeviceContext, weight: &DeviceMatrix, m: usize) -> Fp8Route {
+    let repacked = weight.marlin_packed.is_some() && weight.marlin_scales.is_some();
+    if repacked && marlin_sm_supported(ctx) && m <= QWEN_MARLIN_MAX_M {
+        return Fp8Route::Marlin;
+    }
+    if m >= QWEN_DEQUANT_GEMM_PREFILL_MIN_M {
+        return Fp8Route::DequantGemm;
+    }
+    Fp8Route::Gemv
+}
+
+/// Per-channel FP8 Marlin tensor-core GEMM (Ampere+): C[m,n] = X[m,k] @
+/// dequant(W). Fires when the SM gate is on, the weight was Marlin-repacked at
+/// load (`repack_for_marlin_fp8`, per-channel only), and M is inside the window
+/// where Marlin beats dequant→cuBLAS. Supersedes the batched FP8 GEMV there —
+/// that kernel's tile is the batch, so it re-reads the weight above B=8, which
+/// is the whole NVFP4-vs-FP8 concurrency gap.
+fn try_fp8_marlin_gemm_batch(
+    ctx: &DeviceContext,
+    weight: &DeviceMatrix,
+    x: &HiddenStates,
+    out: &mut HiddenStates,
+) -> Result<bool> {
+    if weight.weight_format != WeightFormat::Fp8BlockScaled
+        || fp8_route(ctx, weight, x.seq_len) != Fp8Route::Marlin
+    {
+        return Ok(false);
+    }
+    let (Some(packed), Some(scales)) =
+        (weight.marlin_packed.as_ref(), weight.marlin_scales.as_ref())
+    else {
+        unreachable!("fp8_route returns Marlin only when both are Some")
+    };
+    let n = weight.rows; // output dim
+    let k = weight.cols; // contraction
+    let (packed_ptr, _gp) = packed.device_ptr(&ctx.stream);
+    let (scales_ptr, _gs) = scales.device_ptr(&ctx.stream);
+    let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
+    let (out_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
+    let stream = ctx.stream.cu_stream();
+    MARLIN_SCRATCH.with(|cell| -> Result<()> {
+        let mut scratch = cell.borrow_mut();
+        marlin_scratch_init(ctx, &mut scratch)?;
+        let c_tmp = scratch.c_tmp.as_ref().unwrap();
+        let workspace = scratch.workspace.as_ref().unwrap();
+        let (c_tmp_ptr, _gc) = c_tmp.device_ptr(&ctx.stream);
+        let (ws_ptr, _gw) = workspace.device_ptr(&ctx.stream);
+        qwen_quant_profile(ctx, "qwen/fp8/marlin_gemm", x.seq_len, n, k, || {
+            // SAFETY: all ptrs from live device allocations; packed/scales sized by
+            // repack_for_marlin_fp8 for these dims, x=[seq_len,k], out=[seq_len,n],
+            // c_tmp/workspace sized to the SM max.
+            unsafe {
+                ffi::marlin_fp8_gemm_cuda(
+                    x_ptr as *const ffi::Half,
+                    packed_ptr as *const u32,
+                    scales_ptr as *const ffi::Half,
+                    out_ptr as *mut ffi::Half,
+                    c_tmp_ptr as *mut f32,
+                    ws_ptr as *mut i32,
+                    x.seq_len as i32,
+                    n as i32,
+                    k as i32,
+                    stream,
+                )
+                .result()
+                .map_err(|e| anyhow!("FP8 per-channel Marlin GEMM failed: {e}"))
+            }
+        })?;
+        Ok(())
+    })?;
+    MARLIN_FP8_HITS.fetch_add(1, Ordering::Relaxed);
     Ok(true)
 }
 
@@ -1059,6 +1161,12 @@ pub(super) fn gemm_batch(
     // load AND M is inside the window where it beats the dequant→cuBLAS path
     // below. Supersedes the scalar FP4 GEMV there. False when not repacked.
     if try_fp4_marlin_gemm_batch(ctx, weight, x, out)? {
+        return Ok(());
+    }
+
+    // Per-channel FP8 tensor-core (Ampere+): same contract, kFE4M3fn. This is the
+    // 145-of-200 majority of the mixed NVFP4 checkpoint's quantised GEMMs.
+    if try_fp8_marlin_gemm_batch(ctx, weight, x, out)? {
         return Ok(());
     }
 

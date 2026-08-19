@@ -2808,6 +2808,192 @@ impl DeviceMatrix {
         Ok(())
     }
 
+    /// Build the Marlin tensor-core layout for a PER-CHANNEL FP8 weight
+    /// (compressed-tensors float-quantized: `F8_E4M3` + one BF16 scale per output
+    /// row). Marlin's channelwise mode is `group_size = -1` -> `group_blocks = -1`,
+    /// already instantiated for `kFE4M3fn` by `BIGGROUP_GET_IF`, so this needs no
+    /// new kernel. No-op (leaves `marlin_packed` None -> GEMV fallback) outside the
+    /// tile alignment. SM-gated by the caller (Ampere+).
+    ///
+    /// Two details this format does not share with W8A16:
+    ///
+    /// **No `+128`.** `kU8B128` stores `int8 + 128` and its dequant subtracts the
+    /// bias; the `kFE4M3fn` dequant reads the raw E4M3 byte (sign bit kept, the
+    /// 4-bit exponent field shifted into BF16's 8-bit one), so the byte is packed
+    /// unchanged.
+    ///
+    /// **The scale absorbs 2^120.** `dequant_skip_flop` is `!is_int_type`, and
+    /// `is_int_type` covers only the kU4/kU8 family, so `kFE4M3fn` takes the
+    /// skip-flop arm and the kernel never applies its exponent-rebias multiply.
+    /// Shifting an E4M3 exponent (bias 7) into a BF16 field (bias 127) without
+    /// rebiasing scales every weight by `2^-120`, and unlike NVFP4 there is no `s2`
+    /// global-scale channel to park the correction in — only `kFE2M1f` reads
+    /// `scale2_ptr`. So the per-channel scale carries it. The fold overflows only
+    /// at `scale >= 255.5`; this checkpoint's channel scales are ~1e-3..1e-1,
+    /// landing at 2^110..2^117, and 2^120 is an exact power of two so the fold
+    /// shifts the exponent without touching the mantissa.
+    ///
+    /// Unlike NVFP4, nothing underflows. For `size_bits() == 8 && group_blocks ==
+    /// -1` the scale multiplies the FP32 accumulator after the K loop
+    /// (`marlin_template.h:1548`), not the BF16 weight fragment before the MMA
+    /// (`:1136`, the kFE2M1f site that returned `nonzero 0/256`). The fragment
+    /// carries `w * 2^-120` down to 2^-129, inside bf16; the accumulator's 2^-120
+    /// and the scale's 2^+120 cancel bit-exactly in f32.
+    ///
+    /// The source `qweight_u8` / `scale_f32` stay resident: prefill above the
+    /// dequant threshold still reads them.
+    pub fn repack_for_marlin_fp8(&mut self, ctx: &DeviceContext) -> Result<()> {
+        if self.weight_format != WeightFormat::Fp8BlockScaled
+            || self.qweight_u8.is_none()
+            || self.scale_f32.is_none()
+        {
+            return Ok(());
+        }
+        if ctx.compute_capability().0 < 8 {
+            return Ok(());
+        }
+        let n = self.rows; // output dim
+        let k = self.cols; // input dim
+        // Per-channel only: one scale per output row, spanning all of K.
+        // `block_m == 1` is the discriminator — a 128x128 block-scaled weight
+        // belongs to DeepGEMM and fails it. `block_k >= k` rather than `== k` so a
+        // TP shard, whose `cols` is a slice of the K the scale was defined over,
+        // still qualifies.
+        // K%64, not the repack's K%16: `min_thread_k = 64` and every thread config
+        // has thread_k in {64,128} (marlin.cuh:18, gptq_marlin.cuh:115-129), so a K
+        // the GEMM's `is_valid_config` rejects would repack cleanly here and then
+        // throw on every call. N%64 matches min_thread_n and the repack's tile_n.
+        if self.quant_block_m != 1
+            || self.quant_block_k < k
+            || !k.is_multiple_of(64)
+            || !n.is_multiple_of(64)
+        {
+            return Ok(());
+        }
+
+        // Step 1: raw E4M3 [N, K] row-major -> GPTQ [K/4, N] i32, element (n,k) at
+        // bit (k%4)*8 of word (k/4)*N + n. No bias: see the note above. Each (n,k)
+        // owns exactly one byte, so this is a byte-granular transpose, written
+        // straight into the little-endian byte position the u32 packing implies.
+        // Blocked: the destination stride is 4*N bytes, and this runs over every
+        // per-channel FP8 weight in the model at load.
+        let qw = self.qweight_u8.as_ref().unwrap();
+        let weight_host: Vec<u8> = ctx
+            .stream
+            .clone_dtoh(qw)
+            .map_err(|e| anyhow!("D2H FP8 qweight: {}", e))?;
+        ensure!(
+            weight_host.len() == n * k,
+            "FP8 per-channel weight is {} bytes, expected {n}*{k}",
+            weight_host.len()
+        );
+        const TILE: usize = 64;
+        let mut gptq_bytes = vec![0u8; n * k];
+        for n0 in (0..n).step_by(TILE) {
+            for k0 in (0..k).step_by(TILE) {
+                let k_end = (k0 + TILE).min(k);
+                for row_n in n0..(n0 + TILE).min(n) {
+                    for (i, &byte) in weight_host[row_n * k + k0..row_n * k + k_end]
+                        .iter()
+                        .enumerate()
+                    {
+                        let col_k = k0 + i;
+                        gptq_bytes[((col_k / 4) * n + row_n) * 4 + (col_k % 4)] = byte;
+                    }
+                }
+            }
+        }
+        let gptq_gpu: CudaSlice<u8> = ctx
+            .stream
+            .clone_htod(&gptq_bytes)
+            .map_err(|e| anyhow!("H2D FP8 GPTQ: {}", e))?;
+
+        // Step 2: GPTQ -> Marlin tiles. The repack is a pure 8-bit lane shuffle, so
+        // the kU8B128 kernel serves kFE4M3fn unchanged.
+        let mut marlin_gpu: CudaSlice<u8> = ctx
+            .stream
+            .alloc_zeros(k * n)
+            .map_err(|e| anyhow!("Alloc FP8 Marlin: {}", e))?;
+        {
+            let (gptq_ptr, _g1) = gptq_gpu.device_ptr(&ctx.stream);
+            let (marlin_ptr, _g2) = marlin_gpu.device_ptr_mut(&ctx.stream);
+            // SAFETY: both from live CudaSlices pinned by the guards; K*N bytes in
+            // and out, tile alignment checked above, stream-ordered.
+            unsafe {
+                ffi::marlin_gptq_repack_w8a16_cuda(
+                    gptq_ptr as *const u32,
+                    marlin_ptr as *mut u32,
+                    k as i32,
+                    n as i32,
+                    ctx.stream.cu_stream(),
+                )
+                .result()
+                .map_err(|e| anyhow!("FP8 Marlin repack failed: {:?}", e))?;
+            }
+        }
+
+        // Step 3: scales [N] f32 -> [1, N] bf16, folding 2^120, then vLLM's
+        // `scale_perm_single` (channelwise) — NOT the length-64 `scale_perm` the
+        // grouped path uses.
+        let scales_host: Vec<f32> = ctx
+            .stream
+            .clone_dtoh(self.scale_f32.as_ref().unwrap())
+            .map_err(|e| anyhow!("D2H FP8 scales: {}", e))?;
+        ensure!(
+            scales_host.len() == n,
+            "per-channel FP8 needs {n} scales, got {}",
+            scales_host.len()
+        );
+        // 2^120 as a bit pattern, not a decimal literal: the whole no-precision-loss
+        // argument is that the fold is a pure exponent shift.
+        const SKIP_FLOP_FACTOR: f32 = f32::from_bits(0x7B80_0000);
+        // The fold is bit-exact only if the source scale is already bf16-exact,
+        // which this checkpoint's weight_scale is. An f32-scale checkpoint takes a
+        // coherent per-output-channel 2^-9 bias instead — say so rather than assume.
+        if let Some(s) = scales_host
+            .iter()
+            .find(|&&s| bf16::from_f32(s).to_f32() != s)
+        {
+            log::warn!(
+                "Marlin FP8 scales are not bf16-exact (e.g. {s}); the fold costs up to 2^-9 per channel"
+            );
+        }
+        // bf16 rounds to +inf at scale >= 255.5. Testing the f32 product would let
+        // (3.3895e38, 3.4028e38] through and store an infinite channel scale. A
+        // scale with no Marlin encoding means skip the weight, not fail the load.
+        if scales_host
+            .iter()
+            .any(|&s| !bf16::from_f32(s * SKIP_FLOP_FACTOR).is_finite())
+        {
+            log::warn!(
+                "Marlin FP8 repack skipped: [{n}x{k}] channel scale overflows bf16 once 2^120 is folded in (limit 255.5); scalar path"
+            );
+            return Ok(());
+        }
+        let mut perm_single = [0usize; 32];
+        for i in 0..4 {
+            for (jj, off) in [0usize, 1, 8, 9, 16, 17, 24, 25].into_iter().enumerate() {
+                perm_single[i * 8 + jj] = 2 * i + off;
+            }
+        }
+        let mut scales_perm = vec![0u16; n];
+        for block in 0..(n / 32) {
+            let base = block * 32;
+            for out in 0..32 {
+                let v = scales_host[base + perm_single[out]] * SKIP_FLOP_FACTOR;
+                scales_perm[base + out] = bf16::from_f32(v).to_bits();
+            }
+        }
+        let scales_gpu: CudaSlice<u16> = ctx
+            .stream
+            .clone_htod(&scales_perm)
+            .map_err(|e| anyhow!("H2D FP8 Marlin scales: {}", e))?;
+
+        self.marlin_packed = Some(marlin_gpu);
+        self.marlin_scales = Some(scales_gpu);
+        Ok(())
+    }
+
     /// Build the Marlin tensor-core layout for an NVFP4 weight
     /// (compressed-tensors nvfp4-pack-quantized): transpose the packed E2M1
     /// nibbles into GPTQ `[K/8, N]` i32, GPU-repack to Marlin tiles, and
