@@ -171,7 +171,27 @@ winner falls out of the shape; nothing is pinned.
 NVFP4 leads FP8 by 4.5% on identical architectures while reading 56% of the
 weight bytes. Needle 512/4096 x3 = 6/6 exact.
 
+> **SCOPE, added 2026-08-19.** This row is c=1 on an 8-token synthetic prompt
+> against FP8 with speculation OFF. It does not generalise: at c>=2 the same
+> build loses 5x to FP8 (matched A/B, same binary and moment), and the shipped
+> FP8 configuration runs DSpark. Cause and fix:
+> [errors/2026-08-19-fp8-dequant-arm-shadows-decode.md](../errors/2026-08-19-fp8-dequant-arm-shadows-decode.md).
+
 ## Speculative decode: both paths are a large net loss here
+
+> **CORRECTED 2026-08-19.** The attribution below — "the verify forward runs
+> depth+1 tokens through the recurrent linear attention on 48 of 64 layers" — is
+> wrong. Marlin's per-call cost is flat in M (34816x5120: 68.9 us at both M=1 and
+> M=3) and the gated-delta route change accounts for +2.1 ms, 1.5% of the delta.
+> The real cause is `try_fp8_dequant_bf16_gemm_batch` firing at `M >= 2`: a spec
+> verify submits M=3 (MTP d=2) or M=7 (DSpark block 6), and each one
+> re-dequantises all 11.56 G FP8 params in the checkpoint to BF16 — 84.35 ms per
+> forward, 84% of the M=3 quantised-GEMM budget. Measured acceptance was 35.1%,
+> so acceptance was never the problem; even at 100% MTP would lose 1.65x.
+> The same defect costs 5x aggregate throughput at c>=2 and crashed the server at
+> 34K. Root cause and fix:
+> [`errors/2026-08-19-fp8-dequant-arm-shadows-decode.md`](../errors/2026-08-19-fp8-dequant-arm-shadows-decode.md).
+> The numbers in this section stand as measurements of the defective build.
 
 | configuration | decode |
 |---|---:|

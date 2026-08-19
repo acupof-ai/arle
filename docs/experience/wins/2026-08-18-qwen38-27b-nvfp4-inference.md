@@ -1,6 +1,21 @@
 # Qwen3.8-27B-NVFP4 inference support — CUDA, 2026-08-18
 
-> Status: Shipped
+> Status: Shipped — figures SUPERSEDED
+
+> **Superseded 2026-08-19.** Every tok/s here predates the FP4 kernel ladder:
+> c=1 decode went 9.3 -> 52.3 (PRMT GEMV) -> 57.9 (Marlin) -> 60.2 (blocks-per-SM
+> search) -> 66.6 (down/o repack), and NVFP4 now leads Qwen3.6-27B-FP8 by 12-17%
+> at c=1. Current rows: [baselines.md](../../baselines.md).
+>
+> The MTP conclusion below — "the verify forward runs 3 tokens through the
+> recurrent linear attention scan, costing ~3x a single-token decode" — is
+> **wrong**. The cost was `try_fp8_dequant_bf16_gemm_batch` firing at `M >= 2`
+> and re-dequantising all 11.56 G FP8 params on every verify:
+> [errors/2026-08-19-fp8-dequant-arm-shadows-decode.md](../errors/2026-08-19-fp8-dequant-arm-shadows-decode.md).
+> The "dequant-scratch OOM" that killed the c=16 cell is the same arm.
+>
+> The SOTA-comparison table below is also stale: it was written when ARLE
+> measured 9.3 tok/s.
 
 ## Goal
 
