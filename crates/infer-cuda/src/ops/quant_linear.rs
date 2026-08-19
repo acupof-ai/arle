@@ -25,7 +25,6 @@ const QWEN_FP8_DEQUANT_GEMM_MIN_M: usize = 2;
 /// re-dequantizes per tile while the cuBLAS path pays the dequant once and then
 /// runs a pure BF16 GEMM. The default prefill chunk is 2048, so it stays on the
 /// cuBLAS path.
-const QWEN_FP4_MARLIN_MAX_M: usize = 1024;
 
 #[derive(Default)]
 struct QwenFp8DenseScratch {
@@ -706,6 +705,39 @@ fn try_w8a16_marlin_gemm_batch(
 /// and M is inside the window where Marlin beats dequant→cuBLAS. Supersedes the
 /// scalar FP4 GEMV in that window. Returns false (→ existing fallbacks)
 /// otherwise.
+/// The one place that decides how an NVFP4 weight is multiplied.
+///
+/// Three kernels exist because each wins a disjoint region, all three measured
+/// cold on H20 at the 27B dense-MLP shapes:
+///
+/// - `Marlin` (tensor core) beats the dequant path by 96% at M=1 and stays
+///   ahead to M~1024.
+/// - `DequantGemm` (dequant to BF16 once, then cuBLAS) takes over above that:
+///   at M=2048 — the `chunked_prefill_size` default — Marlin is 12-21% slower.
+/// - `Gemv` (scalar warp-per-row) is the fallback for weights Marlin has no
+///   kernel for: sm_70, `group_size != 16`, or a shape the repack rejected.
+///   Those weights never get `marlin_packed`, so the route is forced.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Fp4Route {
+    Marlin,
+    DequantGemm,
+    Gemv,
+}
+
+/// Above this M the tensor-core kernel loses to dequant+cuBLAS; see [`Fp4Route`].
+const QWEN_FP4_MARLIN_MAX_M: usize = 1024;
+
+fn fp4_route(ctx: &DeviceContext, weight: &DeviceMatrix, m: usize) -> Fp4Route {
+    let repacked = weight.marlin_packed.is_some() && weight.marlin_scales.is_some();
+    if repacked && marlin_sm_supported(ctx) && m <= QWEN_FP4_MARLIN_MAX_M {
+        return Fp4Route::Marlin;
+    }
+    if m >= QWEN_FP8_DEQUANT_GEMM_MIN_M {
+        return Fp4Route::DequantGemm;
+    }
+    Fp4Route::Gemv
+}
+
 fn try_fp4_marlin_gemm_batch(
     ctx: &DeviceContext,
     weight: &DeviceMatrix,
@@ -713,15 +745,14 @@ fn try_fp4_marlin_gemm_batch(
     out: &mut HiddenStates,
 ) -> Result<bool> {
     if weight.weight_format != WeightFormat::Fp4E2M1Group
-        || !marlin_sm_supported(ctx)
-        || x.seq_len > QWEN_FP4_MARLIN_MAX_M
+        || fp4_route(ctx, weight, x.seq_len) != Fp4Route::Marlin
     {
         return Ok(false);
     }
     let (Some(packed), Some(global)) =
         (weight.marlin_packed.as_ref(), weight.marlin_scales.as_ref())
     else {
-        return Ok(false); // not repacked (unaligned shape / gs != 16) → fallback
+        unreachable!("fp4_route returns Marlin only when both are Some")
     };
     let n = weight.rows; // output dim
     let k = weight.cols; // contraction
@@ -877,7 +908,7 @@ fn try_fp4_dequant_bf16_gemm_batch(
     out: &mut HiddenStates,
 ) -> Result<bool> {
     if !matches!(weight.weight_format, WeightFormat::Fp4E2M1Group)
-        || x.seq_len < QWEN_FP8_DEQUANT_GEMM_MIN_M
+        || fp4_route(ctx, weight, x.seq_len) != Fp4Route::DequantGemm
     {
         return Ok(false);
     }
@@ -1128,6 +1159,9 @@ pub(super) fn gemm_batch(
                 )?;
                 FP8_GEMV_HITS.fetch_add(1, Ordering::Relaxed);
             }
+            // `Fp4Route::Gemv`: reached only when the two arms above declined,
+            // i.e. the weight has no Marlin layout (sm_70, group_size != 16, or
+            // a shape the repack rejected) and M is below the dequant threshold.
             WeightFormat::Fp4E2M1Group => {
                 ensure!(
                     weight.quant_scale_rows == weight.rows,
