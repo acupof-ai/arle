@@ -129,7 +129,17 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             tokens,
         );
 
-        let local_restored = self.attach_prefix_restore(slot, &prefix_match, tokens, attach_cap)?;
+        let mut local_restored =
+            self.attach_prefix_restore(slot, &prefix_match, tokens, attach_cap)?;
+
+        // Backends whose KV is not page-addressable restore nothing above and
+        // instead hold a position-0 image of one sequence (the Vulkan lane's
+        // flat, absolute-position device cache). Only consulted when the page
+        // route came back empty, so that route stays byte-for-byte unchanged;
+        // every backend without such a store returns 0 and this is a no-op.
+        if local_restored == 0 {
+            local_restored = self.restore_cached_prefix_image(slot, tokens, attach_cap)?;
+        }
 
         // Cross-rank min-reduce of the restored length. A rank-local attach or
         // sidecar failure degrades that rank to full recompute (0); without
@@ -302,6 +312,62 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
 
         Ok(restored_len)
     }
+
+    /// Restore a backend-held position-0 prefix image onto `slot`, returning the
+    /// ABSOLUTE restored length (0 = no image, or not usable for this prompt).
+    ///
+    /// These tokens never went through the radix, so there are no cached pages
+    /// to attach — the slot just needs its OWN pages grown to the restored
+    /// length, or the planner budgets prefill and decode against a slot the
+    /// backend already considers full. Every failure degrades to `Ok(0)` (full
+    /// recompute) rather than propagating: this runs on the admission path,
+    /// where an error is fatal to the whole TP group (#164).
+    fn restore_cached_prefix_image(
+        &mut self,
+        slot: usize,
+        tokens: &[u32],
+        attach_cap: usize,
+    ) -> Result<usize> {
+        if !self.config.enable_prefix_cache || !self.kv.is_active() {
+            return Ok(0);
+        }
+        let matched = match self.executor.prefix_reuse() {
+            Some(reuse) => reuse.cached_prefix_match_len(tokens)?.min(attach_cap),
+            None => return Ok(0),
+        };
+        if matched == 0 {
+            return Ok(0);
+        }
+        if let Err(err) = self.alloc_to_len_with_prefix_reclaim(slot, matched) {
+            log::warn!(
+                "cached-prefix alloc failed for slot {slot}: {err:#}; full recompute fallback"
+            );
+            self.kv_system_metrics.fallback_recompute =
+                self.kv_system_metrics.fallback_recompute.saturating_add(1);
+            return Ok(0);
+        }
+        let slot_pages = self.kv.page_indices(slot);
+        let restore = match self.executor.prefix_reuse() {
+            Some(reuse) => reuse.restore_cached_prefix(slot, tokens, matched, slot_pages),
+            None => return Ok(0),
+        };
+        if let Err(err) = restore {
+            log::warn!(
+                "cached-prefix restore failed for slot {slot}: {err:#}; full recompute fallback"
+            );
+            self.kv_system_metrics.fallback_recompute =
+                self.kv_system_metrics.fallback_recompute.saturating_add(1);
+            self.free_slot_pages(slot);
+            return Ok(0);
+        }
+        log::info!(
+            "prefix-cached: slot={slot} restored={matched} committed={}",
+            tokens.len()
+        );
+        Ok(matched)
+    }
+
+    // record_prefix_tier_hits moved into materialize_prefix_blocks.
 
     /// Grow `slot` to at least `target`. A speculative executor already grew it
     /// to draft its chain, so this no-ops instead of double-appending.
