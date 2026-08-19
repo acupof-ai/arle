@@ -60,14 +60,6 @@ pub(crate) const SIDECAR_SNAPSHOT_STRIDE_PAGES: usize = 512;
 /// for write-through keys and pack `session` (low 31 bits) and `block` (low 32
 /// bits) below it. Two distinct sessions therefore never alias (tenant
 /// isolation, the "session A never prefetches into session B" gate), and no
-/// write-through key can equal a prefix-tier key (which the engine assigns from 0
-/// upward, never setting the high bit before wrapping past 2^63).
-#[cfg(feature = "cuda")]
-#[must_use]
-pub(crate) fn tier_block_u64(session: u64, block: u64) -> u64 {
-    const WRITETHROUGH_BIT: u64 = 1 << 63;
-    WRITETHROUGH_BIT | ((session & 0x7FFF_FFFF) << 32) | (block & 0xFFFF_FFFF)
-}
 /// Seq-len budget the captured decode graph's fixed `kv_indices` is sized to;
 /// pages beyond it fall back to eager rather than replay a stale graph.
 pub(crate) const DECODE_GRAPH_MAX_SEQ_LEN: usize = 32_768;
