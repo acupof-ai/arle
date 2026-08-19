@@ -11,6 +11,10 @@ const ROWS: usize = 7;
 const DIM: usize = 4;
 const SCALE: f32 = 0.5;
 
+type Blocks<'a> = Vec<(&'a [f32], &'a [f32], &'a [usize])>;
+/// q, k, v, q_pos, k_pos, block splits.
+type Fixture = (Vec<f32>, Vec<f32>, Vec<f32>, Vec<usize>, Vec<usize>, Vec<usize>);
+
 fn lcg(state: &mut u64) -> f32 {
     *state = state
         .wrapping_mul(6364136223846793005)
@@ -69,14 +73,7 @@ fn reference(
 /// Ragged blocks + a zigzag position layout: rows own a front run and a back run,
 /// keys are split 3/2/4 across the ring, and one block is entirely in the future
 /// for the early rows.
-fn fixture() -> (
-    Vec<f32>,
-    Vec<f32>,
-    Vec<f32>,
-    Vec<usize>,
-    Vec<usize>,
-    Vec<usize>,
-) {
+fn fixture() -> Fixture {
     let q = fill(ROWS * DIM, 0x51ed_2701);
     let k = fill(9 * DIM, 0x9e37_79b9);
     let v = fill(9 * DIM, 0x1234_5678);
@@ -86,12 +83,7 @@ fn fixture() -> (
     (q, k, v, q_pos, k_pos, splits)
 }
 
-fn as_blocks<'a>(
-    k: &'a [f32],
-    v: &'a [f32],
-    k_pos: &'a [usize],
-    splits: &[usize],
-) -> Vec<(&'a [f32], &'a [f32], &'a [usize])> {
+fn as_blocks<'a>(k: &'a [f32], v: &'a [f32], k_pos: &'a [usize], splits: &[usize]) -> Blocks<'a> {
     let mut blocks = Vec::new();
     let mut off = 0;
     for &n in splits {
