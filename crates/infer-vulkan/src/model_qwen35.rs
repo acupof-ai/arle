@@ -227,6 +227,10 @@ pub struct VulkanQwen35Model {
     weights: crate::loader::upload::ResidentWeights<'static>,
     /// Per-slot recurrent + KV state for the (single-slot) numeric forward.
     state: crate::forward::Qwen35ForwardState,
+    /// The `(slot, epoch)` the state above was materialized for. The pool bumps
+    /// a slot's epoch when it frees it, so a mismatch means the scheduler handed
+    /// this lane a different sequence and the carried state is stale.
+    resident_seq: Option<(usize, u64)>,
     /// Persistent decode resources (perf-parity Steps 3+4): the GEMV activation
     /// arena, the compile-once `KernelCache`, and the record-many/submit-once
     /// `CommandRecorder`. Built once in [`Self::load`] and threaded into every
@@ -258,6 +262,7 @@ impl VulkanQwen35Model {
             ctx,
             weights,
             state,
+            resident_seq: None,
             decode,
         })
     }
@@ -312,17 +317,23 @@ impl VulkanQwen35Model {
     /// attention / gated-delta math runs on the host in f32. See
     /// [`crate::forward`] for the contract. This single-slot lane runs the
     /// uncached full-prefix path: `start_pos` must equal the materialized
-    /// sequence length (advanced here), so feed a sequence's tokens in order
-    /// (call [`Self::reset_state`] between sequences). `slot` / `epoch` are
-    /// accepted for executor-signature parity but unused by this single-slot
-    /// state.
+    /// sequence length (advanced here), so feed a sequence's tokens in order.
+    /// `(slot, epoch)` identifies which sequence the carried state belongs to;
+    /// a change resets it, since one lane serves every request in turn.
     pub fn forward_token(
         &mut self,
-        _slot: usize,
-        _epoch: u64,
+        slot: usize,
+        epoch: u64,
         token: u32,
         start_pos: usize,
     ) -> anyhow::Result<Vec<f32>> {
+        // Without this a second request reuses slot 0 with start_pos 0 while the
+        // state still carries the first request's seq_len, and the length check
+        // in `forward::forward_token` takes the whole server down.
+        if self.resident_seq != Some((slot, epoch)) {
+            self.reset_state();
+            self.resident_seq = Some((slot, epoch));
+        }
         crate::forward::forward_token(
             self.ctx,
             &self.config,
