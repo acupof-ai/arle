@@ -96,6 +96,19 @@ pub struct Qwen35TensorRole {
     pub layer: Option<usize>,
 }
 
+/// A tensor belonging to a trailing MTP block — any `blk.<N>` at or past the
+/// decode graph's last layer. Qwen3.8-27B's blk.64 is a *complete* transformer
+/// block (attn_q, ffn_down, …) that additionally carries the four `nextn.*`
+/// weights, so matching the `nextn.` suffix alone leaves the rest behind.
+/// Speculative decode is not wired on Vulkan, so the whole block is dropped
+/// rather than spending device bytes nothing dispatches against.
+pub fn is_mtp_tensor(name: &str, num_layers: usize) -> bool {
+    name.strip_prefix("blk.")
+        .and_then(|rest| rest.split_once('.'))
+        .and_then(|(index, _)| index.parse::<usize>().ok())
+        .is_some_and(|layer| layer >= num_layers)
+}
+
 /// Map a GGUF tensor name to its role + layer. Fails loud on an unknown name so
 /// a schema surprise (new tensor, renamed weight) is caught at load, not
 /// silently dropped.
@@ -221,6 +234,9 @@ pub fn plan_model(gguf: &GgufFile, num_layers: usize) -> Result<ResidencyPlan> {
         ..Default::default()
     };
     for info in gguf.tensors() {
+        if is_mtp_tensor(&info.name, num_layers) {
+            continue;
+        }
         let role = classify_qwen35_tensor(&info.name)?;
         let residency = plan_residency(role.kind, info.ggml_type);
         let bytes = device_bytes(residency, info)?;
