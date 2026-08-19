@@ -91,6 +91,59 @@ into the Marlin layout at load time. `try_fp4_marlin_gemm_batch` returns
 `Ok(false)` for anything unrepacked (unaligned shape, group_size != 16), so the
 scalar GEMV remains the fallback rather than a hard failure.
 
+## Marlin only wins below M ~= 1024
+
+Measured against the shipped dequant(FP4->BF16) + cuBLAS prefill path, cold:
+
+| M | gate_up | down |
+|---:|---:|---:|
+| 1 | -96.1% | -95.8% |
+| 256 | -57.1% | -58.3% |
+| 1024 | -4.0% | -9.9% |
+| 1536 | **+10.5%** | **+4.0%** |
+| 2048 | **+21.5%** | **+12.4%** |
+
+`SchedulerConfig::chunked_prefill_size` defaults to 2048
+(`infer-core/src/lib.rs:106`), which is exactly where Marlin loses. Routing all
+M through Marlin trades a decode win for a 12-21% TTFT regression on the dense
+MLP, so `try_fp4_marlin_gemm_batch` gates on `x.seq_len <=
+QWEN_FP4_MARLIN_MAX_M` (1024) and prefill keeps the dequant+cuBLAS path.
+
+This also means `repack_for_marlin_fp4` must keep `qweight_u8` / `qscale_fp8` /
+`scale_f32` resident rather than consuming them — prefill still reads the packed
+nibbles. The Marlin-layout scales live in the tail of the `marlin_packed`
+allocation, costing ~1.13x the packed-weight VRAM.
+
+## Why a naive wiring returns all zeros
+
+Marlin's weight dequant runs with `dequant_skip_flop=true`, leaving a `2^-126`
+factor, and its FP8 scale dequant leaves `2^-120`. Their product underflows bf16
+to exactly zero — measured as `nonzero 0/256` before the fix. Upstream avoids
+this by not storing raw E4M3: `nvfp4_marlin_process_scales` re-encodes each
+scale to an S0E5M3 field (the high byte of `f16(scale * 2^7) << 1`) so the scale
+dequant returns `scale * 2^7`, and folds the remaining `2^119` into the global
+scale. Confirmed on-device with a probe kernel (E2M1 1.0 -> 1.175e-38 = 2^-126;
+E4M3 1.0 -> 7.523e-37 = 2^-120) and against vLLM's `marlin_utils_fp4.py`.
+
+## Cold microbench, per shape
+
+Harness derived from the existing `fp4mlp/coldbench.cu` with Marlin as one more
+variant, so buffers, the 8-copy L2-defeating rotation and the f32 anchor are
+identical:
+
+| shape | scalar | Marlin | |
+|---|---:|---:|---:|
+| gate_up N=34816 K=5120 | 100.02 us | 76.59 us | -23.4% |
+| down N=5120 K=17408 | 49.69 us | 40.70 us | -18.1% |
+| per-layer dense MLP | 149.71 us | **117.29 us** | **-21.7%** |
+
+Bandwidth 1004 -> 1288 GB/s (25% -> 32% of peak), reproduced across three runs.
+
+Numerics against an f64 reference at m=1: Marlin's `max|err|/rms` is 1.005e-2 at
+gate_up against the scalar kernel's 1.382e-2, and 1.055e-2 at down for both.
+Mean `out/ref` 0.99999. Marlin is equal or better than the scalar path it
+replaces.
+
 ## What is left
 
 57.9 against a target of 30% over FP8 (74.9 tok/s) leaves 1.29x. The bottleneck
