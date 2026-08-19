@@ -45,9 +45,12 @@ mod real {
     const SHAPES: &[(&str, usize, usize)] =
         &[("mlp gate_up", 34816, 5120), ("mlp down", 5120, 17408)];
 
-    const MS: &[usize] = &[1, 8, 16, 32];
+    /// Decode batch, then the prefill chunk sizes: `chunked_prefill_size` is
+    /// 2048 and a 32K prompt walks it 16 times, so M=2048 is where a long-agent
+    /// workload spends its time.
+    const MS: &[usize] = &[1, 16, 512, 2048];
     const GROUP: usize = 16;
-    const ITERS: usize = 50;
+    const ITERS: usize = 20;
 
     /// Deterministic bytes; a seeded LCG so two runs of the probe compare.
     struct Lcg(u64);
