@@ -271,7 +271,25 @@ the only variable is the checkpoint's quantization.
 python3 scripts/bench_throughput.py --concurrency-grid 1   --seconds-per-concurrency 30 --max-tokens 128 --temperature 0 --seed 42
 ```
 
-Both served with `--kv-cache-dtype fp8`, no spec decode, `ARLE_CUDA_PROFILE=1`.
+Both served with `--kv-cache-dtype fp8`, no spec decode.
+
+**`ARLE_CUDA_PROFILE=1` costs 66-73% of decode throughput** — it brackets every
+op with a `cudaEventRecord` pair, 192 per step at 64 layers. Every per-op table
+below is therefore measured under profiling and is useful only for attribution
+between ops, never as a throughput figure. The headline tok/s rows are measured
+with profiling OFF:
+
+| | decode, profiled | decode, clean |
+|---|---:|---:|
+| Qwen3.6-27B-FP8 | 33.2 tok/s | **57.6 tok/s** |
+| Qwen3.8-27B-NVFP4 (`5185ce517`) | 31.5 tok/s | **52.3 tok/s** |
+
+NVFP4 is 9% behind FP8 on the clean measurement. The ratio is close to the
+profiled one (0.91 vs 0.95) because the overhead is per-op and both models run
+the same op count, so profiling did not distort the comparison — only the
+absolute numbers.
+
+The per-op tables below use `ARLE_CUDA_PROFILE=1`.
 Architecturally identical: hidden 5120, intermediate 17408, 64 layers,
 vocab 248320.
 
