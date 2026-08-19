@@ -731,16 +731,19 @@ impl Qwen35SlotState {
         self.seq_len = len;
     }
 
-    /// The engine frees the slot right after `demote_slot`, so the trailing
-    /// sync (inside `copy_pages_to_host` for pages, explicit here for the
-    /// recurrent D2H) makes the host image complete before any device buffer
-    /// is reused.
+    /// Capture only — the slot keeps its device state, so a park the tier then
+    /// refuses can be abandoned without leaving the request decoding against
+    /// nothing. [`Self::release_swapped_out`] drops the state once every rank
+    /// has stored the image.
+    ///
+    /// The trailing sync (inside `copy_pages_to_host` for pages, explicit here
+    /// for the recurrent D2H) makes the host image complete before any device
+    /// buffer is reused.
     pub(crate) fn swap_out_image(
         &mut self,
         ctx: &DeviceContext,
         slot: usize,
         full_attn_kv: &mut PagedKVPool,
-        recurrent_pool: &mut Vec<RecurrentBlock>,
     ) -> Result<Qwen35SlotImage> {
         // Under B2 the live state is the 1/cp decode pair (the full pair is
         // frozen at the scatter point); capture that pair and flag it so
@@ -788,10 +791,21 @@ impl Qwen35SlotState {
             recurrent_decode_pair: decode_live,
             seq_len: self.seq_len,
         };
+        Ok(image)
+    }
+
+    /// Drop the device state the captured image now owns. Call only after the
+    /// tier has accepted the image on EVERY rank.
+    pub(crate) fn release_swapped_out(
+        &mut self,
+        slot: usize,
+        full_attn_kv: &mut PagedKVPool,
+        recurrent_pool: &mut Vec<RecurrentBlock>,
+    ) -> Result<()> {
         full_attn_kv.mirror_slot(slot, &[], 0)?;
         self.release_recurrent(recurrent_pool);
         self.seq_len = 0;
-        Ok(image)
+        Ok(())
     }
 
     /// The engine resumes decode immediately after `promote_slot`, so the

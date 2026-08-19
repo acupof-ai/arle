@@ -478,13 +478,12 @@ impl Qwen35CudaExecutor {
                 model,
                 slots,
                 full_attn_kv,
-                recurrent_pool,
                 ..
             } = &mut *self;
             let pool = full_attn_kv
                 .as_mut()
                 .expect("full_attn_kv present (whole-slot demote)");
-            slots[slot].swap_out_image(&model.ctx, slot, pool, recurrent_pool)
+            slots[slot].swap_out_image(&model.ctx, slot, pool)
         };
         let capture_ok = usize::from(image.is_ok());
         if self.tp_min_usize(capture_ok, "slot demote capture")? == 0 {
@@ -505,8 +504,19 @@ impl Qwen35CudaExecutor {
             if inserted {
                 self.slot_tier.remove_chunked(NS_SLOT, NS_SLOT_CHUNK, key);
             }
+            // Capture was non-destructive, so the victim keeps decoding.
             return Ok(false);
         }
+        let Self {
+            slots,
+            full_attn_kv,
+            recurrent_pool,
+            ..
+        } = &mut *self;
+        let pool = full_attn_kv
+            .as_mut()
+            .expect("full_attn_kv present (whole-slot demote)");
+        slots[slot].release_swapped_out(slot, pool, recurrent_pool)?;
         Ok(true)
     }
 
