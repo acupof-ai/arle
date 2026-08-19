@@ -189,6 +189,9 @@ pub(crate) struct Dsv4MoeLayer {
     pub gemv_tables: std::sync::OnceLock<Option<crate::moe::Dsv4GemvTables>>,
     /// W4A16 grouped-GEMV lane tables, built lazily on first W4A16 MoE forward.
     pub w4a16_gemv_tables: std::sync::OnceLock<Option<crate::moe::Dsv4W4A16GemvTables>>,
+    /// W4AFP8 GEMV decode lane tables, built lazily on first decode-band forward.
+    /// Reuses the W4A16 GEMV kernel with BF16 activations (skips FP8 quant).
+    pub w4afp8_gemv_tables: std::sync::OnceLock<Option<crate::moe::Dsv4W4A16GemvTables>>,
 }
 
 /// GLM dense-MLP layer (the first `first_k_dense_replace` layers): a plain SwiGLU

@@ -130,7 +130,7 @@ fn alloc_neg1_i32(
 
 #[cfg(feature = "cuda")]
 mod gpu {
-    use anyhow::{Result, ensure};
+    use anyhow::{Result, anyhow, ensure};
     use cuda_kernels::moe;
     use cuda_kernels::prelude::{DeviceContext, DeviceMatrix, HiddenStates, RawDevicePtr};
     use cuda_kernels::tensor::WeightFormat;
@@ -1803,7 +1803,7 @@ mod gpu {
 #[cfg(feature = "cuda")]
 #[allow(dead_code)]
 mod dsv4_gpu {
-    use anyhow::{Result, ensure};
+    use anyhow::{Result, anyhow, ensure};
     use cuda_kernels::moe;
     use cuda_kernels::prelude::{DeviceContext, HiddenStates};
     use cuda_kernels::tensor::{Dsv4Fp8DeepGemmWeightCache, cache_ptr};
@@ -2494,6 +2494,74 @@ mod dsv4_gpu {
         })
     }
 
+    /// Build W4A16-style GEMV pointer tables from W4AFP8 contiguous weights.
+    /// The row-major BF16 scales (`scales_gemv`) must be present (NVFP4
+    /// checkpoints convert them at load time).
+    fn build_w4afp8_gemv_tables(
+        ctx: &DeviceContext,
+        w13: &W4Afp8ExpertWeights,
+        w2: &W4Afp8ExpertWeights,
+    ) -> Result<Dsv4W4A16GemvTables> {
+        let s13 = w13.scales_gemv.as_ref().ok_or_else(|| {
+            anyhow!("W4AFP8 GEMV tables: no row-major scales (non-NVFP4 checkpoint)")
+        })?;
+        let s2 = w2.scales_gemv.as_ref().ok_or_else(|| {
+            anyhow!("W4AFP8 GEMV tables: no row-major scales (non-NVFP4 checkpoint)")
+        })?;
+        let g = w13.num_experts;
+        let i_dim = w13.n / 2;
+        let h = w13.k;
+        let group_size = 128;
+
+        let w13_base = cache_ptr(&w13.weight, ctx).as_ptr() as u64;
+        let s13_base = cache_ptr(s13, ctx).as_ptr() as u64;
+        let w2_base = cache_ptr(&w2.weight, ctx).as_ptr() as u64;
+        let s2_base = cache_ptr(s2, ctx).as_ptr() as u64;
+
+        let wstride13 = (2 * i_dim * (h / 2)) as u64;
+        let up_w_off = (i_dim * (h / 2)) as u64;
+        let sstride13 = (2 * i_dim * (h / group_size) * 2) as u64;
+        let up_s_off = (i_dim * (h / group_size) * 2) as u64;
+        let wstride2 = (h * (i_dim / 2)) as u64;
+        let sstride2 = (h * (i_dim / group_size) * 2) as u64;
+
+        let mut gate_w = Vec::with_capacity(g);
+        let mut gate_s = Vec::with_capacity(g);
+        let mut up_w = Vec::with_capacity(g);
+        let mut up_s = Vec::with_capacity(g);
+        let mut w2_w = Vec::with_capacity(g);
+        let mut w2_s = Vec::with_capacity(g);
+        for e in 0..g {
+            let wb = w13_base + e as u64 * wstride13;
+            gate_w.push(wb);
+            up_w.push(wb + up_w_off);
+            let sb = s13_base + e as u64 * sstride13;
+            gate_s.push(sb);
+            up_s.push(sb + up_s_off);
+            w2_w.push(w2_base + e as u64 * wstride2);
+            w2_s.push(s2_base + e as u64 * sstride2);
+        }
+        let h2d = |v: &[u64]| -> Result<CudaSlice<u64>> {
+            ctx.stream
+                .clone_htod(v)
+                .map_err(|e| anyhow!("W4AFP8 GEMV table H2D failed: {e}"))
+        };
+        let expert_indices: Vec<i32> = (0..g as i32).collect();
+        Ok(Dsv4W4A16GemvTables {
+            gate_w: h2d(&gate_w)?,
+            gate_s: h2d(&gate_s)?,
+            up_w: h2d(&up_w)?,
+            up_s: h2d(&up_s)?,
+            w2_w: h2d(&w2_w)?,
+            w2_s: h2d(&w2_s)?,
+            expert_indices: ctx
+                .stream
+                .clone_htod(&expert_indices)
+                .map_err(|e| anyhow!("W4AFP8 expert_indices H2D failed: {e}"))?,
+            group_size,
+        })
+    }
+
     /// W4A16 routed-MoE forward: compact pack, one paired gate/up W4A16 GEMV,
     /// clamped SwiGLU, one down W4A16 GEMV, then the shared scatter/combine
     /// tail. All intermediates are stream-ordered allocs (graph-capture safe).
@@ -3125,8 +3193,31 @@ mod dsv4_gpu {
                 );
             }
         }
-        // W4AFP8 lane: SGLang CUTLASS grouped GEMM for all batch sizes.
+        // W4AFP8 lane: GEMV decode (BF16 activations, skips FP8 quant + CUTLASS)
+        // or SGLang CUTLASS grouped GEMM for prefill.
         if let (Some(w13), Some(w2)) = (&layer.w13_w4afp8, &layer.w2_w4afp8) {
+            if total_routes <= DSV4_DECODE_GEMV_MAX_ROUTES && w13.scales_gemv.is_some() {
+                let tables = layer.w4afp8_gemv_tables.get_or_init(|| {
+                    build_w4afp8_gemv_tables(ctx, w13, w2)
+                        .map(Some)
+                        .unwrap_or_else(|e| {
+                            log::warn!("DSv4 W4AFP8 GEMV table build failed: {e}");
+                            None
+                        })
+                });
+                if let Some(tables) = tables.as_ref() {
+                    return dsv4_moe_forward_w4a16(
+                        model,
+                        layer,
+                        tables,
+                        route_indices,
+                        route_weights,
+                        hidden,
+                        out,
+                        keepalive,
+                    );
+                }
+            }
             return dsv4_moe_forward_w4afp8(
                 model,
                 layer,
@@ -4091,6 +4182,9 @@ mod dsv4_gpu {
     pub(crate) struct W4Afp8ExpertWeights {
         pub(crate) weight: cudarc::driver::CudaSlice<u8>,
         pub(crate) scales: cudarc::driver::CudaSlice<u8>,
+        /// Row-major [E*N, K/128] BF16 scales for the GEMV decode lane.
+        /// `None` when the checkpoint was not NVFP4 (no conversion needed).
+        pub(crate) scales_gemv: Option<cudarc::driver::CudaSlice<u8>>,
         pub(crate) num_experts: usize,
         pub(crate) n: usize,
         pub(crate) k: usize,

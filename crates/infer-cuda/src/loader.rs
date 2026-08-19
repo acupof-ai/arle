@@ -4579,6 +4579,7 @@ impl SafetensorLoader {
                 Some(crate::moe::W4Afp8ExpertWeights {
                     weight: w13_dev,
                     scales: w13s_dev,
+                    scales_gemv: None,
                     num_experts: split.experts_per_rank,
                     n: 2 * intermediate,
                     k: hidden_dim,
@@ -4586,6 +4587,7 @@ impl SafetensorLoader {
                 Some(crate::moe::W4Afp8ExpertWeights {
                     weight: w2_dev,
                     scales: w2s_dev,
+                    scales_gemv: None,
                     num_experts: split.experts_per_rank,
                     n: hidden_dim,
                     k: intermediate,
@@ -4594,7 +4596,21 @@ impl SafetensorLoader {
         } else if is_nvfp4 {
             // NVFP4 → W4AFP8: convert E2M1+E8M0 to INT4+BF16 on GPU per expert,
             // download, fuse w1+w3 on host, upload.
+            // Also build row-major [N, K/128] BF16 scales for the GEMV decode lane.
             let e8m0_name = |w: &str| w.trim_end_matches(".weight").to_string() + ".scale";
+            let to_rowmajor = |interleaved: &[u8], n: usize, k: usize| -> Vec<u8> {
+                let ng = k / 128;
+                let es = 2;
+                let mut out = vec![0u8; n * ng * es];
+                for row in 0..n {
+                    for g in 0..ng {
+                        let src = ((g / 4) * n * 4 + row * 4 + (g % 4)) * es;
+                        let dst = (row * ng + g) * es;
+                        out[dst..dst + es].copy_from_slice(&interleaved[src..src + es]);
+                    }
+                }
+                out
+            };
             let convert = |w_name: &str| -> Result<(Vec<u8>, Vec<u8>, usize)> {
                 let weight = self.load_raw_tensor(w_name)?;
                 let scale = self.load_raw_tensor(&e8m0_name(w_name))?;
@@ -4640,8 +4656,10 @@ impl SafetensorLoader {
             };
             let mut w13_w = Vec::new();
             let mut w13_s = Vec::new();
+            let mut w13_s_gemv = Vec::new();
             let mut w2_w = Vec::new();
             let mut w2_s = Vec::new();
+            let mut w2_s_gemv = Vec::new();
             for e in split.local_expert_start..split.local_expert_end() {
                 let expert = names.expert(e);
                 let (w1_cw, w1_cs, w1_rows) = convert(&expert.w1)?;
@@ -4655,9 +4673,12 @@ impl SafetensorLoader {
                     w13_s.extend_from_slice(&w1_cs[start..start + row_bytes]);
                     w13_s.extend_from_slice(&w3_cs[start..start + row_bytes]);
                 }
+                w13_s_gemv.extend_from_slice(&to_rowmajor(&w1_cs, intermediate, hidden_dim));
+                w13_s_gemv.extend_from_slice(&to_rowmajor(&w3_cs, intermediate, hidden_dim));
                 let (w2_cw, w2_cs, _) = convert(&expert.w2)?;
                 w2_w.extend_from_slice(&w2_cw);
                 w2_s.extend_from_slice(&w2_cs);
+                w2_s_gemv.extend_from_slice(&to_rowmajor(&w2_cs, hidden_dim, intermediate));
             }
             let w13_dev = ctx
                 .stream
@@ -4667,6 +4688,10 @@ impl SafetensorLoader {
                 .stream
                 .clone_htod(&w13_s)
                 .map_err(|e| anyhow!("DSv4 W4AFP8 w13 scales upload failed: {e}"))?;
+            let w13s_gemv_dev = ctx
+                .stream
+                .clone_htod(&w13_s_gemv)
+                .map_err(|e| anyhow!("DSv4 W4AFP8 w13 gemv scales upload failed: {e}"))?;
             let w2_dev = ctx
                 .stream
                 .clone_htod(&w2_w)
@@ -4675,10 +4700,15 @@ impl SafetensorLoader {
                 .stream
                 .clone_htod(&w2_s)
                 .map_err(|e| anyhow!("DSv4 W4AFP8 w2 scales upload failed: {e}"))?;
+            let w2s_gemv_dev = ctx
+                .stream
+                .clone_htod(&w2_s_gemv)
+                .map_err(|e| anyhow!("DSv4 W4AFP8 w2 gemv scales upload failed: {e}"))?;
             (
                 Some(crate::moe::W4Afp8ExpertWeights {
                     weight: w13_dev,
                     scales: w13s_dev,
+                    scales_gemv: Some(w13s_gemv_dev),
                     num_experts: split.experts_per_rank,
                     n: 2 * intermediate,
                     k: hidden_dim,
@@ -4686,6 +4716,7 @@ impl SafetensorLoader {
                 Some(crate::moe::W4Afp8ExpertWeights {
                     weight: w2_dev,
                     scales: w2s_dev,
+                    scales_gemv: Some(w2s_gemv_dev),
                     num_experts: split.experts_per_rank,
                     n: hidden_dim,
                     k: intermediate,
@@ -4713,6 +4744,7 @@ impl SafetensorLoader {
             shared_w2,
             gemv_tables: std::sync::OnceLock::new(),
             w4a16_gemv_tables: std::sync::OnceLock::new(),
+            w4afp8_gemv_tables: std::sync::OnceLock::new(),
         })
     }
 
