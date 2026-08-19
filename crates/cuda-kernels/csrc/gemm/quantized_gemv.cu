@@ -417,6 +417,41 @@ __device__ __forceinline__ float dot16_with_decoded(
 // uint4 loads move 16 B (32 weights) per transaction; the byte-at-a-time form
 // this replaced fetched a 128 B cacheline per 1 B used. Shared by the dense and
 // the two grouped (MoE) FP4 GEMV kernels.
+// Decode two packed E2M1 nibbles into a bf16x2 pair with shifts and masks
+// only -- no memory, no branches, no warp divergence.
+//
+// e2m1 is sign(1) exponent(2) mantissa(1). For e>0 the value is
+// (-1)^s * 2^(e-1) * (1 + m/2), which in bf16 is exponent field (e-1)+127 and
+// mantissa m<<6. For e==0 the encoding is subnormal and m selects 0 or 0.5,
+// i.e. exponent field 126 with a zero mantissa. Verified equal to the
+// 16-entry table this replaced for all 16 codes, and the packed form for all
+// 256 byte values.
+//
+// The table was `__constant__ float[16]` indexed by the nibble: one memory
+// read per weight at a data-dependent address, which serialises across a warp
+// when the nibbles differ.
+__device__ __forceinline__ uint32_t fp4_e2m1_nibble_to_bf16_bits(uint32_t n) {
+    const uint32_t sign = (n & 0x8u) << 12;
+    const uint32_t e = (n >> 1) & 0x3u;
+    const uint32_t m = n & 0x1u;
+    const uint32_t nz = (n & 0x7u) != 0u;
+    const uint32_t mant = e ? (m << 6) : 0u;
+    const uint32_t mag = nz ? (((126u + e) << 7) | mant) : 0u;
+    return sign | mag;
+}
+
+__device__ __forceinline__ __nv_bfloat162 fp4_e2m1_pair_to_bf16x2(uint32_t lo, uint32_t hi) {
+    const uint32_t bits = fp4_e2m1_nibble_to_bf16_bits(lo & 0xfu)
+        | (fp4_e2m1_nibble_to_bf16_bits(hi & 0xfu) << 16);
+    return *reinterpret_cast<const __nv_bfloat162*>(&bits);
+}
+
+// One row's FP4 x BF16 dot product for this thread's strided slice of K.
+// uint4 loads move 16 B (32 weights) per transaction; the byte-at-a-time form
+// this replaced fetched a 128 B cacheline per 1 B used. Shared by the dense and
+// the two grouped (MoE) FP4 GEMV kernels.
+// One row's FP4 x BF16 dot product for this thread's strided slice of K.
+// Shared by the dense and the two grouped (MoE) FP4 GEMV kernels.
 __device__ __forceinline__ float fp4_e2m1_row_dot(
     const uint8_t* __restrict__ weight_row,
     const uint8_t* __restrict__ scales,
@@ -435,29 +470,46 @@ __device__ __forceinline__ float fp4_e2m1_row_dot(
     const int k_vec_end = (K / vec_k_span) * vec_k_span;
     const bool vec_ok = (bytes_per_row & 15) == 0;
     if (vec_ok) {
+        // group_size is a power of two for every NVFP4 export; shifting avoids
+        // the runtime signed-idiv sequence nvcc emits for a variable divisor.
+        const int group_shift = __ffs(group_size) - 1;
+        const int groups_per_chunk = vec_k_span >> group_shift;
         for (int k = tid_in_row * vec_k_span; k < k_vec_end;
              k += threads_per_row * vec_k_span) {
             const uint4 packed = __ldg(reinterpret_cast<const uint4*>(weight_row + (k >> 1)));
             const uint32_t words[4] = {packed.x, packed.y, packed.z, packed.w};
 
+            // A 32-weight chunk spans groups_per_chunk groups (2 at the usual
+            // group_size=16), so the scale is loaded once per group, not once
+            // per 8-weight word as it was.
+            const int group_base = k >> group_shift;
+            float chunk_scale[2];
+            #pragma unroll
+            for (int g = 0; g < 2; g++) {
+                const int gi = g < groups_per_chunk ? g : groups_per_chunk - 1;
+                chunk_scale[g] =
+                    dsv4_decode_fp8_e4m3(__ldg(&scales[scale_base + group_base + gi])) * g_scale;
+            }
+
             #pragma unroll
             for (int w = 0; w < 4; w++) {
                 const uint32_t p = words[w];
                 const int kk = k + w * 8;
-                const float s =
-                    dsv4_decode_fp8_e4m3(__ldg(&scales[scale_base + kk / group_size])) * g_scale;
+                const int gsel = (groups_per_chunk > 1) ? ((w * 8) >> group_shift) : 0;
+                const float s = chunk_scale[gsel < 2 ? gsel : 1];
 
                 const uint4 xv = __ldg(reinterpret_cast<const uint4*>(&x[kk]));
-                const __nv_bfloat16* xb = reinterpret_cast<const __nv_bfloat16*>(&xv);
+                const __nv_bfloat162* xp = reinterpret_cast<const __nv_bfloat162*>(&xv);
 
+                float acc = 0.0f;
                 #pragma unroll
                 for (int b = 0; b < 4; b++) {
                     const uint32_t byte = (p >> (b * 8)) & 0xffu;
-                    sum += dsv4_decode_fp4_e2m1(byte & 0x0f) * s
-                        * __bfloat162float(xb[b * 2]);
-                    sum += dsv4_decode_fp4_e2m1(byte >> 4) * s
-                        * __bfloat162float(xb[b * 2 + 1]);
+                    const __nv_bfloat162 wv = fp4_e2m1_pair_to_bf16x2(byte, byte >> 4);
+                    const float2 prod = __bfloat1622float2(__hmul2(wv, xp[b]));
+                    acc += prod.x + prod.y;
                 }
+                sum += acc * s;
             }
         }
     }
@@ -469,8 +521,10 @@ __device__ __forceinline__ float fp4_e2m1_row_dot(
         const uint8_t packed = __ldg(&weight_row[pair]);
         const float s =
             dsv4_decode_fp8_e4m3(__ldg(&scales[scale_base + k0 / group_size])) * g_scale;
-        sum += dsv4_decode_fp4_e2m1(packed & 0x0f) * s * __bfloat162float(x[k0]);
-        sum += dsv4_decode_fp4_e2m1(packed >> 4) * s * __bfloat162float(x[k0 + 1]);
+        const __nv_bfloat162 wv = fp4_e2m1_pair_to_bf16x2(packed, packed >> 4);
+        const float2 wf = __bfloat1622float2(wv);
+        sum += wf.x * s * __bfloat162float(x[k0]);
+        sum += wf.y * s * __bfloat162float(x[k0 + 1]);
     }
     return sum;
 }
