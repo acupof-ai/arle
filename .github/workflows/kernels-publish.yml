@@ -139,6 +139,19 @@ jobs:
           restore-keys: |
             tilelang-artifacts-
 
+      # Local disk cache, not the GHA backend — that flooded the 10 GB quota
+      # with 2581 per-object entries (ci.yml, 2026-07-02).
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@v0.0.11
+
+      - name: Cache sccache (nvcc)
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/sccache
+          key: sccache-cuda-${{ github.run_id }}
+          restore-keys: |
+            sccache-cuda-
+
       - name: Install TileLang stack (vanilla tvm-ffi, no patch needed)
         run: |
           pip install --no-cache-dir -r requirements-build.txt
@@ -147,6 +160,8 @@ jobs:
       - name: Regenerate T1 kernel set (sm_80/86/89/90)
         env:
           ARLE_KERNEL_VENDOR: '1'
+          ARLE_NVCC_WRAPPER: 'sccache'
+          SCCACHE_CACHE_SIZE: '5G'
         run: cargo build --release --features cuda -p cuda-kernels
 
       - name: Pack unqualified candidate
