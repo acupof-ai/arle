@@ -58,14 +58,39 @@ thread_local! {
 /// the same pre-alloc discipline). `workspace` is zeroed once at allocation
 /// (Marlin leaves the locks at 0 after each GEMM, so reuse is safe).
 #[derive(Default)]
-struct MarlinW8a16Scratch {
+struct MarlinScratch {
     c_tmp: Option<CudaSlice<f32>>,
     workspace: Option<CudaSlice<i32>>,
 }
 
 thread_local! {
-    static MARLIN_W8A16_SCRATCH: RefCell<MarlinW8a16Scratch> =
-        RefCell::new(MarlinW8a16Scratch::default());
+    static MARLIN_SCRATCH: RefCell<MarlinScratch> = RefCell::new(MarlinScratch::default());
+}
+
+/// Allocate the Marlin scratch once at the SM-derived MAX (c_tmp caps at m=64;
+/// workspace is m-independent). Never grows → graph-capture safe. The workspace
+/// is zeroed at alloc; Marlin resets its locks to 0 after each GEMM, so reuse is
+/// safe. Shared by the W8A16 and NVFP4 entry points.
+fn marlin_scratch_init(ctx: &DeviceContext, scratch: &mut MarlinScratch) -> Result<()> {
+    if scratch.c_tmp.is_some() {
+        return Ok(());
+    }
+    let sms = ctx.sm_count() as i32;
+    // SAFETY: pure size queries (arithmetic on sms), no device work.
+    let c_tmp_floats = unsafe { ffi::marlin_c_tmp_floats(64, sms) } as usize;
+    // SAFETY: pure size query, no device work.
+    let ws_ints = unsafe { ffi::marlin_workspace_ints(sms) } as usize;
+    scratch.c_tmp = Some(
+        ctx.stream
+            .alloc_zeros::<f32>(c_tmp_floats)
+            .map_err(|e| anyhow!("Marlin c_tmp alloc failed: {e}"))?,
+    );
+    scratch.workspace = Some(
+        ctx.stream
+            .alloc_zeros::<i32>(ws_ints)
+            .map_err(|e| anyhow!("Marlin workspace alloc failed: {e}"))?,
+    );
+    Ok(())
 }
 
 // Qwen quant dispatch counters. Per-impl split so the stats surface can tell
@@ -77,6 +102,7 @@ static FP8_DEQUANT_GEMM_HITS: AtomicU64 = AtomicU64::new(0);
 static W8A16_DEQUANT_GEMM_HITS: AtomicU64 = AtomicU64::new(0);
 static W4A16_DEQUANT_GEMM_HITS: AtomicU64 = AtomicU64::new(0);
 static MARLIN_W8A16_HITS: AtomicU64 = AtomicU64::new(0);
+static MARLIN_FP4_HITS: AtomicU64 = AtomicU64::new(0);
 static FP8_GEMV_HITS: AtomicU64 = AtomicU64::new(0);
 static W8A16_GEMV_HITS: AtomicU64 = AtomicU64::new(0);
 static W4A16_GEMV_HITS: AtomicU64 = AtomicU64::new(0);
@@ -87,6 +113,7 @@ static FP8_IMPLEMENTATION_IDS: &[(&AtomicU64, &str)] = &[
     (&W8A16_DEQUANT_GEMM_HITS, "cuda.w8a16.dequant_bf16_gemm"),
     (&W4A16_DEQUANT_GEMM_HITS, "cuda.w4a16.dequant_bf16_gemm"),
     (&MARLIN_W8A16_HITS, "cuda.w8a16.marlin_tensorcore"),
+    (&MARLIN_FP4_HITS, "cuda.fp4.marlin_tensorcore"),
     (&FP8_GEMV_HITS, "cuda.qwen.fp8_gemv"),
     (&W8A16_GEMV_HITS, "cuda.w8a16.gemv"),
     (&W4A16_GEMV_HITS, "cuda.w4a16.gemv"),
@@ -214,19 +241,19 @@ fn qwen_fp8_dense_sm_supports_deepgemm(ctx: &DeviceContext) -> bool {
     })
 }
 
-/// W8A16 Marlin tensor-core GEMM is Ampere+ (`mma.sync.m16n8k16` + `cp.async`,
-/// gated `#if __CUDA_ARCH__ < 800` to no-op stubs in the vendored kernels). One
-/// binary runs sm_80..sm_120. Below sm_80 the shim returns NOT_SUPPORTED; cache
-/// the gate ONCE so decode dispatch avoids a per-step `cuDeviceGetAttribute`.
-/// When off, W8A16 keeps the dequant→BF16 GEMM (large M) / scalar GEMV (small M).
-fn w8a16_sm_supports_marlin(ctx: &DeviceContext) -> bool {
+/// Marlin tensor-core GEMM is Ampere+ (`mma.sync.m16n8k16` + `cp.async`, gated
+/// `#if __CUDA_ARCH__ < 800` to no-op stubs in the vendored kernels). One binary
+/// runs sm_80..sm_120. Below sm_80 the shim returns NOT_SUPPORTED; cache the gate
+/// ONCE so decode dispatch avoids a per-step `cuDeviceGetAttribute`. When off,
+/// W8A16/NVFP4 keep the dequant→BF16 GEMM (large M) / scalar GEMV (small M).
+fn marlin_sm_supported(ctx: &DeviceContext) -> bool {
     static SUPPORTS: OnceLock<bool> = OnceLock::new();
     *SUPPORTS.get_or_init(|| {
         let (major, _minor) = ctx.compute_capability();
         let supports = major >= 8;
         if !supports {
             log::info!(
-                "W8A16 Marlin SM-gated OFF on sm_{major}x (Ampere sm_80+ required for \
+                "Marlin SM-gated OFF on sm_{major}x (Ampere sm_80+ required for \
                  mma.sync tensor cores); using dequant→BF16 GEMM / scalar GEMV fallback"
             );
         }
@@ -615,7 +642,7 @@ fn try_w8a16_marlin_gemm_batch(
     x: &HiddenStates,
     out: &mut HiddenStates,
 ) -> Result<bool> {
-    if weight.weight_format != WeightFormat::W8A16 || !w8a16_sm_supports_marlin(ctx) {
+    if weight.weight_format != WeightFormat::W8A16 || !marlin_sm_supported(ctx) {
         return Ok(false);
     }
     let (Some(packed), Some(scales)) =
@@ -630,28 +657,9 @@ fn try_w8a16_marlin_gemm_batch(
     let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
     let (out_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
     let stream = ctx.stream.cu_stream();
-    MARLIN_W8A16_SCRATCH.with(|cell| -> Result<()> {
+    MARLIN_SCRATCH.with(|cell| -> Result<()> {
         let mut scratch = cell.borrow_mut();
-        // Allocate once at the SM-derived MAX (c_tmp caps at m=64; workspace is
-        // m-independent). Never grows → graph-capture safe. Zero the workspace at
-        // alloc; Marlin resets its locks to 0 after each GEMM, so reuse is safe.
-        if scratch.c_tmp.is_none() {
-            let sms = ctx.sm_count() as i32;
-            // SAFETY: pure size queries (arithmetic on sms), no device work.
-            let c_tmp_floats = unsafe { ffi::marlin_w8a16_c_tmp_floats(64, sms) } as usize;
-            // SAFETY: pure size query, no device work.
-            let ws_ints = unsafe { ffi::marlin_w8a16_workspace_ints(sms) } as usize;
-            scratch.c_tmp = Some(
-                ctx.stream
-                    .alloc_zeros::<f32>(c_tmp_floats)
-                    .map_err(|e| anyhow!("Marlin W8A16 c_tmp alloc failed: {e}"))?,
-            );
-            scratch.workspace = Some(
-                ctx.stream
-                    .alloc_zeros::<i32>(ws_ints)
-                    .map_err(|e| anyhow!("Marlin W8A16 workspace alloc failed: {e}"))?,
-            );
-        }
+        marlin_scratch_init(ctx, &mut scratch)?;
         let c_tmp = scratch.c_tmp.as_ref().unwrap();
         let workspace = scratch.workspace.as_ref().unwrap();
         let (c_tmp_ptr, _gc) = c_tmp.device_ptr(&ctx.stream);
@@ -681,6 +689,71 @@ fn try_w8a16_marlin_gemm_batch(
         Ok(())
     })?;
     MARLIN_W8A16_HITS.fetch_add(1, Ordering::Relaxed);
+    Ok(true)
+}
+
+/// NVFP4 Marlin tensor-core GEMM (Ampere+): C[m,n] = X[m,k] @ dequant(W). Fires
+/// when the SM gate is on AND the weight was Marlin-repacked at load
+/// (`marlin_packed`/`marlin_scales` present, set by `repack_for_marlin_fp4`).
+/// Supersedes both the scalar FP4 GEMV (decode) and the dequant→cuBLAS fallback
+/// (prefill). Returns false (→ existing fallbacks) when off or not prepacked.
+fn try_fp4_marlin_gemm_batch(
+    ctx: &DeviceContext,
+    weight: &DeviceMatrix,
+    x: &HiddenStates,
+    out: &mut HiddenStates,
+) -> Result<bool> {
+    if weight.weight_format != WeightFormat::Fp4E2M1Group || !marlin_sm_supported(ctx) {
+        return Ok(false);
+    }
+    let (Some(packed), Some(scales), Some(global)) = (
+        weight.marlin_packed.as_ref(),
+        weight.qscale_fp8.as_ref(),
+        weight.marlin_scales.as_ref(),
+    ) else {
+        return Ok(false); // not repacked (unaligned shape / gs != 16) → fallback
+    };
+    let n = weight.rows; // output dim
+    let k = weight.cols; // contraction
+    let (packed_ptr, _gp) = packed.device_ptr(&ctx.stream);
+    let (scales_ptr, _gs) = scales.device_ptr(&ctx.stream);
+    let (global_ptr, _gg) = global.device_ptr(&ctx.stream);
+    let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
+    let (out_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
+    let stream = ctx.stream.cu_stream();
+    MARLIN_SCRATCH.with(|cell| -> Result<()> {
+        let mut scratch = cell.borrow_mut();
+        marlin_scratch_init(ctx, &mut scratch)?;
+        let c_tmp = scratch.c_tmp.as_ref().unwrap();
+        let workspace = scratch.workspace.as_ref().unwrap();
+        let (c_tmp_ptr, _gc) = c_tmp.device_ptr(&ctx.stream);
+        let (ws_ptr, _gw) = workspace.device_ptr(&ctx.stream);
+        qwen_quant_profile(ctx, "qwen/fp4/marlin_gemm", x.seq_len, n, k, || {
+            // SAFETY: all ptrs from live device allocations; packed/scales/global
+            // sized by repack_for_marlin_fp4 for these dims, x=[seq_len,k],
+            // out=[seq_len,n], c_tmp/workspace sized to the SM max.
+            unsafe {
+                ffi::marlin_fp4_gemm_cuda(
+                    x_ptr as *const ffi::Half,
+                    packed_ptr as *const u32,
+                    scales_ptr as *const u8,
+                    global_ptr as *const u16,
+                    out_ptr as *mut ffi::Half,
+                    c_tmp_ptr as *mut f32,
+                    ws_ptr as *mut i32,
+                    x.seq_len as i32,
+                    n as i32,
+                    k as i32,
+                    weight.group_size as i32,
+                    stream,
+                )
+                .result()
+                .map_err(|e| anyhow!("NVFP4 Marlin GEMM failed: {e}"))
+            }
+        })?;
+        Ok(())
+    })?;
+    MARLIN_FP4_HITS.fetch_add(1, Ordering::Relaxed);
     Ok(true)
 }
 
@@ -925,9 +998,16 @@ pub(super) fn gemm_batch(
         return Ok(());
     }
 
-    // W8A16 large-M (prefill): dequant INT8→BF16 once + one cuBLAS GEMM, instead
-    // of the per-token weight re-read of the batched GEMV below. Small-M decode
-    // returns false and keeps the GEMV/batched-GEMM path.
+    // NVFP4 tensor-core (Ampere+): Marlin GEMM when the weight was repacked at
+    // load. Same supersession as W8A16 — both the dequant→cuBLAS prefill path and
+    // the scalar FP4 GEMV below. Returns false when not repacked.
+    if try_fp4_marlin_gemm_batch(ctx, weight, x, out)? {
+        return Ok(());
+    }
+
+    // NVFP4 large-M (prefill) fallback for weights Marlin could not take:
+    // dequant FP4→BF16 once + one cuBLAS GEMM, instead of the per-token weight
+    // re-read of the batched GEMV below.
     if try_fp4_dequant_bf16_gemm_batch(ctx, weight, x, out)? {
         return Ok(());
     }
@@ -1210,10 +1290,12 @@ pub(super) fn gemv(
                     weight.cols,
                     weight.group_size
                 );
-                let qw = weight
-                    .qweight_u8
-                    .as_ref()
-                    .ok_or_else(|| anyhow!("fp4_e2m1_group missing qweight_u8"))?;
+                let qw = weight.qweight_u8.as_ref().ok_or_else(|| {
+                    anyhow!(
+                        "fp4_e2m1_group missing qweight_u8 — a Marlin-repacked weight \
+                         reached the single-token gemv path; route it through gemm_batch"
+                    )
+                })?;
                 let scales = weight
                     .qscale_fp8
                     .as_ref()

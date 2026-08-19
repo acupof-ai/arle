@@ -3146,6 +3146,143 @@ mod dsv4_gpu {
         Ok(())
     }
 
+    /// W4AFP8 decode-band MoE forward: fused gate+up+SwiGLU + down GEMV, same
+    /// compact tail structure as [`dsv4_moe_forward_decode_fp8`]. BF16 activations
+    /// directly — no FP8 quantization, no CUTLASS workspace.
+    #[allow(clippy::too_many_arguments)]
+    fn dsv4_moe_forward_w4afp8_decode(
+        model: &Dsv4Model,
+        layer: &Dsv4MoeLayer,
+        tables: &Dsv4W4A16GemvTables,
+        route_indices: &CudaSlice<i32>,
+        route_weights: &CudaSlice<f32>,
+        hidden: &HiddenStates,
+        out: &mut HiddenStates,
+        _keepalive: &mut Dsv4ForwardKeepalive,
+        tail: Option<&mut Dsv4MoeTailScratch>,
+    ) -> Result<()> {
+        let ctx = &model.ctx;
+        let cfg = &model.moe_config;
+        let split = &model.split;
+        let num_tokens = hidden.seq_len;
+        let hidden_dim = hidden.hidden_dim;
+        let i_dim = layer.intermediate;
+        let topk = cfg.top_k;
+        let experts_per_rank = split.experts_per_rank;
+        let local_start = split.local_expert_start;
+        let total_routes = num_tokens * topk;
+        let rows = total_routes.max(1);
+
+        let mut owned_tail;
+        let scratch: &mut Dsv4MoeTailScratch = match tail {
+            Some(s) => {
+                s.reinit(ctx, rows)?;
+                s
+            }
+            None => {
+                owned_tail = Dsv4MoeTailScratch::new(ctx, hidden_dim, i_dim, experts_per_rank)?;
+                &mut owned_tail
+            }
+        };
+        let counts = &scratch.counts;
+        let offsets = &scratch.offsets;
+        let cursors = &scratch.cursors;
+        let packed_hidden = &scratch.packed_hidden;
+        let packed_route_slot = &scratch.packed_route_slot;
+        let packed_weight = &scratch.packed_weight;
+        let act = &scratch.act;
+        let expert_out = &scratch.expert_out;
+        let route_out = &scratch.route_out;
+
+        unsafe {
+            moe::dsv4_count_local_experts(
+                cache_ptr(route_indices, ctx),
+                cache_ptr(counts, ctx),
+                num_tokens,
+                topk,
+                local_start,
+                experts_per_rank,
+                ctx.stream.cu_stream(),
+            )?;
+            moe::dsv4_exclusive_scan_i32(
+                cache_ptr(counts, ctx),
+                cache_ptr(offsets, ctx),
+                cache_ptr(&scratch.scan_total, ctx),
+                experts_per_rank,
+                ctx.stream.cu_stream(),
+            )?;
+            moe::dsv4_pack_local_experts_with_slots(
+                cache_ptr(&hidden.data, ctx),
+                cache_ptr(route_indices, ctx),
+                cache_ptr(route_weights, ctx),
+                cache_ptr(offsets, ctx),
+                cache_ptr(cursors, ctx),
+                cache_ptr(&packed_hidden.data, ctx),
+                cache_ptr(packed_route_slot, ctx),
+                cache_ptr(packed_weight, ctx),
+                num_tokens,
+                hidden_dim,
+                topk,
+                local_start,
+                experts_per_rank,
+                ctx.stream.cu_stream(),
+            )?;
+            let sc13 = hidden_dim / 128;
+            let sc2 = i_dim / 128;
+            moe::dsv4_w4afp8_grouped_swiglu_decode(
+                cache_ptr(&tables.gate_w, ctx),
+                cache_ptr(&tables.gate_s, ctx),
+                cache_ptr(&tables.up_w, ctx),
+                cache_ptr(&tables.up_s, ctx),
+                cache_ptr(&packed_hidden.data, ctx),
+                cache_ptr(&act.data, ctx),
+                cache_ptr(offsets, ctx),
+                cache_ptr(counts, ctx),
+                cache_ptr(&tables.expert_indices, ctx),
+                experts_per_rank,
+                rows,
+                i_dim,
+                hidden_dim,
+                sc13,
+                model.config.swiglu_limit,
+                ctx.stream.cu_stream(),
+            )?;
+            moe::dsv4_w4afp8_grouped_down_decode(
+                cache_ptr(&tables.w2_w, ctx),
+                cache_ptr(&tables.w2_s, ctx),
+                cache_ptr(&act.data, ctx),
+                cache_ptr(&expert_out.data, ctx),
+                cache_ptr(offsets, ctx),
+                cache_ptr(counts, ctx),
+                cache_ptr(&tables.expert_indices, ctx),
+                experts_per_rank,
+                rows,
+                hidden_dim,
+                i_dim,
+                sc2,
+                ctx.stream.cu_stream(),
+            )?;
+            moe::dsv4_scatter_all_route_slots(
+                cache_ptr(&expert_out.data, ctx),
+                cache_ptr(&route_out.data, ctx),
+                cache_ptr(packed_route_slot, ctx),
+                cache_ptr(packed_weight, ctx),
+                rows,
+                hidden_dim,
+                ctx.stream.cu_stream(),
+            )?;
+            moe::dsv4_combine_route_slot_outputs(
+                cache_ptr(&route_out.data, ctx),
+                cache_ptr(&out.data, ctx),
+                num_tokens,
+                topk,
+                hidden_dim,
+                ctx.stream.cu_stream(),
+            )?;
+        }
+        Ok(())
+    }
+
     /// Masked-path MoE tail shared by the eager forward and the decode graph.
     /// Fully device-driven: intermediates are stream-ordered allocs (legal inside
     /// graph capture) and the -1 route-slot sentinel is a device memset.
@@ -3193,8 +3330,8 @@ mod dsv4_gpu {
                 );
             }
         }
-        // W4AFP8 lane: GEMV decode (BF16 activations, skips FP8 quant + CUTLASS)
-        // or SGLang CUTLASS grouped GEMM for prefill.
+        // W4AFP8 lane: fused decode GEMV (BF16 activations, no FP8 quant) or
+        // SGLang CUTLASS grouped GEMM for prefill.
         if let (Some(w13), Some(w2)) = (&layer.w13_w4afp8, &layer.w2_w4afp8) {
             if total_routes <= DSV4_DECODE_GEMV_MAX_ROUTES && w13.scales_gemv.is_some() {
                 let tables = layer.w4afp8_gemv_tables.get_or_init(|| {
@@ -3206,7 +3343,7 @@ mod dsv4_gpu {
                         })
                 });
                 if let Some(tables) = tables.as_ref() {
-                    return dsv4_moe_forward_w4a16(
+                    return dsv4_moe_forward_w4afp8_decode(
                         model,
                         layer,
                         tables,
@@ -3215,6 +3352,7 @@ mod dsv4_gpu {
                         hidden,
                         out,
                         keepalive,
+                        tail,
                     );
                 }
             }
