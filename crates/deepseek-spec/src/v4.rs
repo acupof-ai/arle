@@ -331,27 +331,6 @@ impl DeepSeekV4Config {
         })
     }
 
-    pub fn attention_operator_summary(&self) -> DeepSeekV4AttentionOperatorSummary {
-        let mut summary = DeepSeekV4AttentionOperatorSummary::default();
-        for layer_idx in 0..self.num_hidden_layers {
-            let plan = self
-                .attention_layer_plan(layer_idx)
-                .expect("compress_ratios length validated");
-            match plan.mode {
-                DeepSeekV4AttentionMode::SlidingWindow => summary.sliding_window_layers += 1,
-                DeepSeekV4AttentionMode::CompressedSparse => summary.csa_layers += 1,
-                DeepSeekV4AttentionMode::HybridCompressed => summary.hca_layers += 1,
-                DeepSeekV4AttentionMode::SparseIndexed => summary.sparse_indexed_layers += 1,
-            }
-            if plan.hash_routing {
-                summary.hash_routed_moe_layers += 1;
-            } else {
-                summary.bias_routed_moe_layers += 1;
-            }
-        }
-        summary
-    }
-
     pub fn compressor_shape(&self, compress_ratio: usize) -> Option<DeepSeekV4CompressorShape> {
         (compress_ratio > 0).then(|| {
             let overlap = compress_ratio < 16;
@@ -386,17 +365,6 @@ impl DeepSeekV4Config {
                     .expect("CSA compress_ratio must have compressor shape")
             }),
         })
-    }
-
-    pub fn output_projection_shape(&self) -> DeepSeekV4OutputProjectionShape {
-        let heads_per_group = self.num_attention_heads / self.o_groups;
-        DeepSeekV4OutputProjectionShape {
-            heads_per_group,
-            wo_a_rows: self.o_groups * self.o_lora_rank,
-            wo_a_cols: heads_per_group * self.head_dim,
-            wo_b_rows: self.hidden_size,
-            wo_b_cols: self.o_groups * self.o_lora_rank,
-        }
     }
 
     pub fn moe_routing_kind(&self, layer_idx: usize) -> DeepSeekV4MoeRoutingKind {
@@ -578,16 +546,6 @@ pub struct DeepSeekV4AttentionLayerPlan {
     pub index_topk: Option<usize>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DeepSeekV4AttentionOperatorSummary {
-    pub sliding_window_layers: usize,
-    pub csa_layers: usize,
-    pub hca_layers: usize,
-    pub sparse_indexed_layers: usize,
-    pub hash_routed_moe_layers: usize,
-    pub bias_routed_moe_layers: usize,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeepSeekV4CompressorShape {
     pub compress_ratio: usize,
@@ -612,15 +570,6 @@ pub struct DeepSeekV4IndexerShape {
     pub key_head_dim: usize,
     pub topk: usize,
     pub compressor: Option<DeepSeekV4CompressorShape>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DeepSeekV4OutputProjectionShape {
-    pub heads_per_group: usize,
-    pub wo_a_rows: usize,
-    pub wo_a_cols: usize,
-    pub wo_b_rows: usize,
-    pub wo_b_cols: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
