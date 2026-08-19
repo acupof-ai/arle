@@ -916,10 +916,14 @@ impl TpRuntime {
         }
     }
 
-    /// Element-wise reduce `values` across `comm` with `f`; identity on
-    /// single-rank. Host-side over an all-gather: KV-recall calls it once per
-    /// prefill with a few hundred KB, where a device collective would cost more
-    /// than it saves, and `f` is min/max as often as sum.
+    /// Element-wise reduce `values` in place across `comm`; identity on
+    /// single-rank.
+    ///
+    /// One H2D, an in-place device all-reduce, one D2H. The all-gather form this
+    /// replaced moved `world_size ×` the payload back to the host and reduced it
+    /// there — for KV-recall's ~2 MB envelope that was ~18 MB of copying per
+    /// call, and a ring all-reduce also puts `2(W−1)/W · N` on the wire against
+    /// all-gather's `(W−1)·N`.
     #[cfg(feature = "cuda")]
     #[cfg_attr(not(all(feature = "cuda", feature = "nccl")), allow(unused_variables))]
     pub fn reduce_f32_over(
@@ -927,21 +931,42 @@ impl TpRuntime {
         comm: &TpComm,
         ctx: &cuda_kernels::prelude::DeviceContext,
         values: &mut [f32],
-        f: impl Fn(f32, f32) -> f32,
+        op: cuda_kernels::collective::ReduceOp,
     ) -> anyhow::Result<()> {
         #[cfg(all(feature = "cuda", feature = "nccl"))]
         {
-            if matches!(comm, TpComm::Single) || values.is_empty() {
+            use cuda_kernels::collective::{CollectiveBackend, DType};
+            use cudarc::driver::DevicePtrMut;
+
+            let TpComm::Nccl(backend) = comm else {
+                return Ok(());
+            };
+            if values.is_empty() {
                 return Ok(());
             }
-            let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_ne_bytes()).collect();
-            let gathered = self.all_gather_bytes_over(comm, ctx, &bytes, bytes.len())?;
-            let load = |c: &[u8]| f32::from_ne_bytes([c[0], c[1], c[2], c[3]]);
-            for (r, rank) in gathered.chunks_exact(bytes.len()).enumerate() {
-                for (v, c) in values.iter_mut().zip(rank.chunks_exact(4)) {
-                    *v = if r == 0 { load(c) } else { f(*v, load(c)) };
+            let mut dev = ctx
+                .stream
+                .memcpy_stod(values)
+                .map_err(|e| anyhow::anyhow!("reduce_f32_over h2d: {e}"))?;
+            {
+                let count = values.len();
+                let (ptr, _guard) = dev.device_ptr_mut(&ctx.stream);
+                // SAFETY: `ptr` is a valid device allocation of `count` f32 on
+                // this context's device, and the stream belongs to it. `_guard`
+                // keeps the slice borrowed across the FFI call.
+                unsafe {
+                    backend.all_reduce(
+                        ptr as *mut std::ffi::c_void,
+                        count,
+                        DType::F32,
+                        op,
+                        ctx.stream.cu_stream().cast::<std::ffi::c_void>(),
+                    )?;
                 }
             }
+            ctx.stream
+                .memcpy_dtoh(&dev, values)
+                .map_err(|e| anyhow::anyhow!("reduce_f32_over d2h: {e}"))?;
         }
         Ok(())
     }

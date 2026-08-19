@@ -37,23 +37,6 @@
 //! ([`infer_core::plan_recall`]) is device-neutral, but the rep/score machinery
 //! reads back device K/Q. Default off → the decode hot path never touches this.
 
-/// Validated session KV-recall budget (per the offline Qwen3.6 quality gate +
-/// `wins/2026-06-23-kv-recall-arle-core-e2e.md`): sink 32, local 256, block 32,
-/// top-k 8 → working set 32 + 256 + 8·32 = 544 tokens (9.6% KV in the e2e). The
-/// same defaults the Metal executor uses (`default_recall_config`). Recall only
-/// restricts attention once `cache_len` exceeds this budget; below it
-/// `plan_recall` returns the full contiguous range (no-op).
-#[cfg(feature = "cuda")]
-#[must_use]
-pub(crate) fn default_recall_config() -> infer_core::RecallConfig {
-    infer_core::RecallConfig {
-        n_init: 32,
-        n_local: 256,
-        l_bs: 32,
-        top_k: 8,
-    }
-}
-
 #[cfg(feature = "cuda")]
 pub(crate) use cuda_impl::CudaRecallState;
 
@@ -182,34 +165,56 @@ mod cuda_impl {
             let k0 = pool.k_data_slice(0);
             let page_bytes = num_kv_heads * page_size * head_dim * 2;
 
+            // Plan the reads before touching the device. A just-frozen block is
+            // still resident this step (it only left the local window now), so its
+            // envelope is built before any evict-drop; stop at a sentinel span
+            // rather than skipping it, since a freed block's keys cannot be
+            // reconstructed and advancing past it would misalign every later
+            // block's index.
+            let mut reads: Vec<(u32, usize, usize)> = Vec::new(); // (physical, block, global page)
+            let mut built = have;
             for block in have..frozen_blocks {
                 let base = cfg.n_init + block * cfg.l_bs;
-                // A just-frozen block is still resident this step (it only left the
-                // local window now), so its envelope is built before any evict-drop.
-                // Stop at a sentinel span rather than skipping it: a freed block's
-                // keys cannot be reconstructed, and advancing past it would
-                // misalign every later block's index.
-                let span = || local_pages(base, base + cfg.l_bs, page_size, self.shard);
-                if !span().all(|(_, li)| pages[li] != EVICTED_PAGE) {
+                let span: Vec<(usize, usize)> =
+                    local_pages(base, base + cfg.l_bs, page_size, self.shard).collect();
+                if span.iter().any(|&(_, li)| pages[li] == EVICTED_PAGE) {
                     break;
                 }
-                // A block with no local page (cp_size >= 4, l_bs < cp * page_size)
-                // keeps the min/max identity, so a cross-shard widen leaves the
-                // covering ranks' values untouched.
-                let at = self.lo.len();
-                self.lo.resize(at + hd_len, f32::INFINITY);
-                self.hi.resize(at + hd_len, f32::NEG_INFINITY);
-                let (lo, hi) = (&mut self.lo[at..], &mut self.hi[at..]);
-                // One readback per PAGE, not per token: `n_init`/`n_local`/`l_bs`
-                // are forced to page multiples, so a block is a whole number of
-                // pages and the per-token form re-read each page `page_size` times.
-                for (gp, li) in span() {
-                    let page = pages[li] as usize;
-                    let start = page * page_bytes;
-                    let bytes = ctx
-                        .stream
-                        .clone_dtoh(&k0.slice(start..start + page_bytes))
-                        .map_err(|e| anyhow::anyhow!("recall K page dtoh failed: {e}"))?;
+                reads.extend(span.into_iter().map(|(gp, li)| (pages[li], block, gp)));
+                built += 1;
+            }
+            if built == have {
+                return Ok(());
+            }
+            // A block with no local page (cp_size >= 4, l_bs < cp * page_size)
+            // keeps the min/max identity, so a cross-shard widen leaves the
+            // covering ranks' values untouched.
+            let origin = self.lo.len();
+            let grown = origin + (built - have) * hd_len;
+            self.lo.resize(grown, f32::INFINITY);
+            self.hi.resize(grown, f32::NEG_INFINITY);
+
+            // Physical pages come off the pool's free list ascending, so sorting
+            // by id collapses the span into a few contiguous runs — one readback
+            // per run instead of one per page (~1000 latency-bound 32 KB copies
+            // for a 16K prompt). min/max is order-free, so resequencing is safe.
+            reads.sort_unstable();
+            let mut i = 0;
+            while i < reads.len() {
+                let mut j = i + 1;
+                while j < reads.len() && reads[j].0 == reads[j - 1].0 + 1 {
+                    j += 1;
+                }
+                let run = reads[i].0 as usize * page_bytes;
+                let bytes = ctx
+                    .stream
+                    .clone_dtoh(&k0.slice(run..run + (j - i) * page_bytes))
+                    .map_err(|e| anyhow::anyhow!("recall K page dtoh failed: {e}"))?;
+                for (n, &(_, block, gp)) in reads[i..j].iter().enumerate() {
+                    let base = cfg.n_init + block * cfg.l_bs;
+                    let at = origin + (block - have) * hd_len;
+                    let (lo, hi) = (&mut self.lo[at..], &mut self.hi[at..]);
+                    let page = &bytes[n * page_bytes..(n + 1) * page_bytes];
                     // [num_kv_heads, page_size, head_dim]: token `row` of head `h`
                     // is contiguous over head_dim at (h * page_size + row).
                     for row in 0..page_size {
@@ -220,20 +225,17 @@ mod cuda_impl {
                         for h in 0..num_kv_heads {
                             let src = (h * page_size + row) * head_dim * 2;
                             let out = h * head_dim;
-                            // Zipped so the bounds checks drop and the min/max
-                            // vectorizes — this runs nkv*hd times per token.
-                            for ((l, m), c) in lo[out..out + head_dim]
-                                .iter_mut()
-                                .zip(hi[out..out + head_dim].iter_mut())
-                                .zip(bytes[src..src + head_dim * 2].chunks_exact(2))
-                            {
-                                let v = half::bf16::from_le_bytes([c[0], c[1]]).to_f32();
-                                *l = l.min(v);
-                                *m = m.max(v);
-                            }
+                            infer_core::fold_key(
+                                &mut lo[out..out + head_dim],
+                                &mut hi[out..out + head_dim],
+                                page[src..src + head_dim * 2]
+                                    .chunks_exact(2)
+                                    .map(|c| half::bf16::from_le_bytes([c[0], c[1]]).to_f32()),
+                            );
                         }
                     }
                 }
+                i = j;
             }
             Ok(())
         }
@@ -261,8 +263,9 @@ mod cuda_impl {
             // stopped early contributes nothing to the widened result.
             self.lo.resize(nb * hd_len, f32::INFINITY);
             self.hi.resize(nb * hd_len, f32::NEG_INFINITY);
-            tp.reduce_f32_over(tp.attn_cp(), ctx, &mut self.lo, f32::min)?;
-            tp.reduce_f32_over(tp.attn_cp(), ctx, &mut self.hi, f32::max)
+            use cuda_kernels::collective::ReduceOp;
+            tp.reduce_f32_over(tp.attn_cp(), ctx, &mut self.lo, ReduceOp::Min)?;
+            tp.reduce_f32_over(tp.attn_cp(), ctx, &mut self.hi, ReduceOp::Max)
         }
 
         /// Recompute the recall page plan for the next decode step.
@@ -359,14 +362,13 @@ mod cuda_impl {
                     || (span.peek().is_some()
                         && (allow_prefetch
                             || span.all(|(_, li)| table.get(li).copied() != Some(EVICTED_PAGE))));
+                let at = i * hd_len;
                 *score = if scorable {
-                    // Upper bound on the block's max `q·k`: per channel take the
-                    // better end of the key interval. A bound is what makes top-k
-                    // admissible — a mean gives none.
-                    let at = i * hd_len;
-                    (0..hd_len.min(q.len()))
-                        .map(|k| (q[k] * self.lo[at + k]).max(q[k] * self.hi[at + k]))
-                        .sum()
+                    infer_core::score_block(
+                        &q,
+                        &self.lo[at..at + hd_len],
+                        &self.hi[at..at + hd_len],
+                    )
                 } else {
                     f32::NEG_INFINITY
                 };
@@ -374,7 +376,12 @@ mod cuda_impl {
             // Each rank scored only its own KV heads; the sum is the full-head
             // score, so every rank now ranks blocks identically.
             if let Some(tp) = tp {
-                tp.reduce_f32_over(tp.attn_tp(), ctx, &mut scores, |a, b| a + b)?;
+                tp.reduce_f32_over(
+                    tp.attn_tp(),
+                    ctx,
+                    &mut scores,
+                    cuda_kernels::collective::ReduceOp::Sum,
+                )?;
             }
 
             let plan = infer_core::plan_recall(cache_len, &scores, cfg);

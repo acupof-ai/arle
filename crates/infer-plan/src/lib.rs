@@ -60,6 +60,24 @@ pub struct PrefillRow {
     pub penalty_prompt_len: usize,
 }
 
+impl PrefillRow {
+    /// Logical position one past this chunk's last token.
+    #[must_use]
+    pub fn end_pos(&self) -> usize {
+        self.start_pos + self.tokens.len()
+    }
+
+    /// Whether this chunk completes the request's prompt.
+    ///
+    /// One predicate for every backend: the open-coded form was written both as
+    /// `==` and as `>=`, so a chunk that overshot `total_tokens` counted as final
+    /// on some paths and not on others.
+    #[must_use]
+    pub fn is_final_chunk(&self) -> bool {
+        self.end_pos() >= self.total_tokens
+    }
+}
+
 /// Backend-independent forward plan produced by engine-core.
 ///
 /// This is the engine-core to executor bridge. It only names slots, host token

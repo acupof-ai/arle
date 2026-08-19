@@ -204,7 +204,7 @@ impl BackendExecutor for VulkanExecutor {
 
         if let Some(row) = plan.prefill_rows.first() {
             let epoch = kv.slot_epoch(row.slot);
-            let position = (row.start_pos + row.tokens.len()) as u64;
+            let position = row.end_pos() as u64;
             let token = self.forward_tokens(
                 row.slot,
                 epoch,

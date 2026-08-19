@@ -453,7 +453,7 @@ impl CudaModel {
     /// recalled page subset) instead of the slot's full page list — so decode
     /// attends only the working set (sink ∪ recalled ∪ local). Additionally
     /// captures the post-RoPE layer-0 query (read back from `q_batch` after the
-    /// first attention) so the executor can score `q · rep` and plan the NEXT
+    /// first attention) so the executor can score the block envelopes and plan the NEXT
     /// step's recall (stale-Q, licensed). Eager-only: recall needs this host
     /// read-back + restricted table between steps, which the captured graph (with
     /// its baked `num_pages`) cannot host.
@@ -538,7 +538,7 @@ impl CudaModel {
                 )?;
                 if layer_idx == 0 {
                     // Capture the post-RoPE layer-0 query (q_batch is RoPE'd in place
-                    // by `paged_attention`'s prep) for the next-step `q · rep` score.
+                    // by `paged_attention`'s prep) for the next-step block score.
                     let host: Vec<half::bf16> =
                         self.ctx.stream.clone_dtoh(&q_batch.data).map_err(|e| {
                             anyhow::anyhow!("recall layer-0 query dtoh failed: {e}")

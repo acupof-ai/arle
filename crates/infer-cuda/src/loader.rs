@@ -349,6 +349,36 @@ pub(crate) struct PageMeta {
     pub(crate) write_kv: i32,
 }
 
+/// The KV extent a sharded decode page table actually addresses.
+///
+/// Returns `(kv_lens, last_page_len, write_kv)`. FA3 sizes its split-KV work
+/// from `seqlen_k` and the combine kernel then indexes the table, so the length
+/// must count the pages IN the table — passing the global `total_len` against a
+/// shard or a recall subset aborts in `flash_fwd_combine`. A 1-wide shard owns
+/// every page, so the same arithmetic serves with and without CP.
+fn local_kv_extent(
+    shard: ShardSpec,
+    total_len: usize,
+    page_size: usize,
+    local_num_pages: usize,
+) -> (usize, usize, i32) {
+    let global_pages = total_len.div_ceil(page_size);
+    let owns_last = global_pages > 0 && shard.owns_page(global_pages - 1);
+    let overshoot = global_pages * page_size - total_len;
+    let last_page_len = if owns_last {
+        page_size - overshoot
+    } else {
+        page_size
+    };
+    let kv_lens = local_num_pages.saturating_sub(1) * page_size
+        + if local_num_pages == 0 {
+            0
+        } else {
+            last_page_len
+        };
+    (kv_lens, last_page_len, i32::from(owns_last))
+}
+
 impl PageMeta {
     /// Under CUDA graph capture the host `kv_lens` can be stale, so `seqlen_k_capture`
     /// wins.
@@ -688,8 +718,7 @@ impl PageMeta {
         pool: &PagedKVPool,
         slot: usize,
         start_pos: usize,
-        cp_rank: usize,
-        cp_size: usize,
+        shard: ShardSpec,
     ) -> Result<()> {
         ensure!(
             pool.format == KVFormat::BF16,
@@ -703,7 +732,6 @@ impl PageMeta {
             "sharded decode refresh: pool seq_len {} != total_len {total_len} for slot {slot}",
             pool.seq_len(slot)
         );
-        let global_pages = total_len.div_ceil(page_size);
         let local_pages: Vec<i32> = pool.page_indices(slot).iter().map(|&p| p as i32).collect();
         let local_num_pages = local_pages.len();
         let cap = self.page_table_stride;
@@ -711,19 +739,8 @@ impl PageMeta {
             local_num_pages <= cap,
             "slot {slot} sharded decode needs {local_num_pages} pages, persistent capacity is {cap}"
         );
-        let owns_last = cp_size <= 1 || (global_pages - 1) % cp_size == cp_rank;
-        let overshoot = global_pages * page_size - total_len;
-        let local_last_fill = if owns_last {
-            page_size - overshoot
-        } else {
-            page_size
-        };
-        let local_token_count = local_num_pages.saturating_sub(1).saturating_mul(page_size)
-            + if local_num_pages == 0 {
-                0
-            } else {
-                local_last_fill
-            };
+        let (local_token_count, local_last_fill, write_kv) =
+            local_kv_extent(shard, total_len, page_size, local_num_pages);
         let stream = &ctx.stream;
         // Empty shard: upload a dummy 1-entry table so the meta's table pointer
         // stays valid; FA3 is bypassed downstream (seqlen_k=0 rejected) and -inf
@@ -773,7 +790,7 @@ impl PageMeta {
         self.kv_lens = vec![local_token_count];
         self.num_pages = local_num_pages;
         self.start_pos = start_pos;
-        self.write_kv = i32::from(owns_last);
+        self.write_kv = write_kv;
         Ok(())
     }
 
@@ -804,21 +821,8 @@ impl PageMeta {
         );
         let num_pages = recall_pages.len();
         let page_ids = recall_pages.iter().map(|&p| p as i32).collect::<Vec<_>>();
-        // The lens must count the pages actually in this table, not the global
-        // sequence: FA3 sizes its split-KV work from seqlen_k, and the combine
-        // kernel then indexes the table. Passing `total_len` against a recall
-        // subset aborts in `flash_fwd_combine` (CUTLASS Error Internal).
-        // Same arithmetic with or without CP — a 1-wide shard owns every page.
-        let global_pages = total_len.div_ceil(pool.page_size);
-        let owns_last = shard.owns_page(global_pages - 1);
-        let overshoot = global_pages * pool.page_size - total_len;
-        let last_page_len = if owns_last {
-            pool.page_size - overshoot
-        } else {
-            pool.page_size
-        };
-        let kv_lens = num_pages.saturating_sub(1) * pool.page_size + last_page_len;
-        let write_kv = i32::from(owns_last);
+        let (kv_lens, last_page_len, write_kv) =
+            local_kv_extent(shard, total_len, pool.page_size, num_pages);
         Ok(Self {
             q_indptr: upload_i32(ctx, &[0, 1])?,
             kv_indptr: upload_i32(ctx, &[0, num_pages as i32])?,
