@@ -373,12 +373,22 @@ with the tile (`quantized_gemv.cu`), so Marlin `kFE4M3fn` is the next lever.
 Long-agent 32K, `bench-agent-32k-16x8.jsonl`, 32 req/point, max_tokens 214,
 no spec, both arms on the same box:
 
-| arm | c | prompt | TTFT p50 | ITL ms | decode | out tok/s | completed |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| NVFP4 | 1 | 32739 | 19257 ms | 23.76 | **42.1** | 11.80 | 25/32, then crash |
-| NVFP4 | 4 | — | — | — | — | — | 0/32, server dead |
-| FP8 | 1 | 32876 | 5533 ms | 26.68 | **37.5** | 18.93 | 32/32 |
-| FP8 | 4 | 32876 | 1251 ms | 47.32 | 21.1 | 75.40 | 32/32 |
+| arm | c | ITL ms | decode | out tok/s | completed |
+|---|---:|---:|---:|---:|---:|
+| NVFP4 | 1 | 22.88 | **43.7** | 13.59 | **32/32** |
+| NVFP4 | 4 | 49.57 | 20.2 | 70.59 | **32/32** |
+| FP8 | 1 | 26.68 | **37.5** | 18.93 | 32/32 |
+| FP8 | 4 | 47.32 | 21.1 | 75.40 | 32/32 |
+
+NVFP4 leads by 16.5% at c=1 and trails 4.3% at c=4. The gap is far narrower than
+on an 8-token prompt because attention dominates at 33K and is format-independent
+— the short-prompt grid measures the weight-read path almost alone.
+
+**The NVFP4 rows require `MARLIN_MAX_BLOCKS_PER_SM` pinned to 1.** With the
+blocks-per-SM search at 5 the server dies partway through c=1 on a
+`CUDA_ERROR_INVALID_VALUE` out of `marlin_mm`; pinning costs 29-42% of decode
+throughput and is the only configuration that completes this workload today. See
+[errors/2026-08-19-blocks-per-sm-search-two-latent-bugs.md](experience/errors/2026-08-19-blocks-per-sm-search-two-latent-bugs.md).
 
 Spec decode, synthetic prompt, c=1:
 
@@ -652,10 +662,31 @@ ring-step count — it collapses into the noise floor at cp=4, while the pre-fli
 scalar path's grows (+1.085e-3 at cp=2 to +1.655e-3 at cp=4). See
 [the gate entry](experience/wins/2026-08-05-fa3-cp-gate-compounding-not-sign.md).
 
+## SOTA — 27B, cp=4 seq ladder · `9c2c84675` (2026-08-19)
+
+4×H20 (97,508 MiB), GPUs 4-7, FA3 engaged, `--synthetic-writeback-seq N`. All
+four ranks bit-identical loss at every passing rung.
+[Entry](experience/wins/2026-08-19-cp4-seq-ceiling-229376-and-17x-step.md).
+
+| seq | RUN_EXIT | forward | fused CE | backward | writeback | peak/rank | loss |
+|---|---|---:|---:|---:|---:|---:|---|
+| 131072 | 0 | 56.8 s | 1.69 s | 119.05 s | 177.5 s | 74,095 MiB | 7.631271 |
+| 163840 | 0 | 73.5 s | 2.01 s | 155.08 s | 230.7 s | 78,959 MiB | 7.189730 |
+| 196608 | 0 | 89.8 s | 2.03 s | 192.09 s | 283.6 s | 86,991 MiB | 6.924870 |
+| **229376** | 0 | 107.9 s | 2.76 s | 231.38 s | **342.2 s** | 92,655 MiB (95.0%) | 6.742337 |
+
+**The cp=4 ceiling is 229376.** 131072 here is 17.5× the 2026-08-03 row below
+(3100 s → 177.5 s); that row and the cp=2 one under-report the current substrate
+by more than an order of magnitude.
+
 ## Known walls
 
 | shape | outcome |
 |---|---|
 | 27B cp=1 seq=81920 | forward completes (3972.216 s), **backward OOMs** on `cuda alloc_zeros failed`. Host RSS 104.5 GB. The failing tensor is not named by the log. |
+| 27B cp=4 seq=245760 | forward + CE complete, **backward OOMs** on `cuda alloc_zeros failed (la dqkv)` (2026-08-19, `9c2c84675`) |
+| 27B cp=4 seq=262144 | forward 126.5 s + CE 3.14 s complete, **backward OOMs** on `cuda alloc_zeros failed (slice_bwd)` — the linear-attn zigzag reorder's `slice` backward allocates a full-input zero buffer (2026-08-19, `9c2c84675`) |
+| any cp, rank-local error | the erroring rank unwinds into `ncclCommDestroy` and blocks behind the peers' in-flight collective, so **the error text never prints**. Presents as N−1 GPUs at 100% util and one at 0%, indefinitely. Kill the spinners to release the unwind and read the real line. |
 | 27B cp=2 seq=131072 | fits — backward peak 94,175 MiB (96.6%), ~3.3 GB headroom (2026-08-02, older commit) |
 | 27B cp=4 seq=131072 | full step ~3100 s, host RSS 170.4 GiB total / ~44.6 GB per rank (2026-08-03, scalar ring, older commit) |
+| 27B cp=8 | unmeasured — only 4 GPUs were free on 2026-08-19 |
