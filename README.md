@@ -134,6 +134,10 @@ B=1 decode **53 tok/s** (prefill 23 ms). With the DSpark block drafter: B=1 **72
 
 NVFP4 checkpoint (E2M1+E8M0) converted to W4AFP8 (INT4+BF16) at load time — 4-bit weights keep the 167 GB model on 2×96 GB H20 (FP8 needs 4×). B=1 decode **37 tok/s**; prefill 1K **0.48s** (2109 tok/s), 4K **1.1s** (3647 tok/s).
 
+### DeepSeek-V4-Flash (4×H20, TP=4, W4AFP8 MoE)
+
+Same conversion, 4-way tensor parallelism. B=1 decode **47.7 tok/s** (1.29× over TP=2); per-GPU efficiency 11.9 tok/s/GPU vs FP8 TP=8's 6.6 tok/s/GPU.
+
 ### Against SGLang
 
 Same weights, same GPU, same quantized kernel — SGLang serves a repack of our own checkpoint. Qwen3.6-27B, one H20, 33K prompt, one request at a time.
