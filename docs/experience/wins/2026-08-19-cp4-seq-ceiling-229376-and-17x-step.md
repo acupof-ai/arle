@@ -1,10 +1,12 @@
 # cp=4 training seq ceiling is 229376, and the 131072 step got 17.5× faster — 2026-08-19
 
-> **The CP path this ran on produces gradients that do not match single-card**
-> — found while refreshing the timing rows the same day, see
-> [errors/2026-08-19-cp-training-gradients-regressed-and-the-gate-is-dead.md](../errors/2026-08-19-cp-training-gradients-regressed-and-the-gate-is-dead.md).
-> The walls and peaks below stand as resource measurements (same tensors, same
-> kernels); the ceiling is not a measurement on a numerically correct path.
+> **Measured on a path with a since-fixed gradient bug**
+> ([`ad1192864`](2026-08-19-cp-ring-fa3-byte-offset-fix.md)). Re-run on the fixed
+> binary: the ceiling is unchanged at 229376, walls held to within 1% and peaks
+> to 2%, and the loss column moved a lot — 131072/196608/229376 now read
+> 3.034899 / 2.072005 / 1.780185 against 7.631271 / 6.924870 / 6.742337 here.
+> `docs/baselines.md` carries the corrected table; the tables below are the
+> pre-fix run they replace.
 
 ## Context
 

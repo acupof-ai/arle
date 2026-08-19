@@ -679,35 +679,34 @@ scalar path's grows (+1.085e-3 at cp=2 to +1.655e-3 at cp=4). See
 ## SOTA — 27B, cp=4 seq ladder · `9c2c84675` (2026-08-19)
 
 4×H20 (97,508 MiB), GPUs 4-7, FA3 engaged, `--synthetic-writeback-seq N`. All
-four ranks bit-identical loss at every passing rung.
-
-> **Resource measurement only.** The CP path produces gradients 6.4× off
-> single-card as of this commit
-> ([errors](experience/errors/2026-08-19-cp-training-gradients-regressed-and-the-gate-is-dead.md)).
-> Walls and peaks are real — same tensors, same kernels — but the loss column
-> and the ceiling are not measurements on a numerically correct path.
+four ranks bit-identical loss at every passing rung. Re-measured on `ad1192864`
+after the CP ring byte-offset fix
+([wins](experience/wins/2026-08-19-cp-ring-fa3-byte-offset-fix.md)); the broken
+path's walls held to within 1% and its peaks to 2%, its loss column did not.
 [Entry](experience/wins/2026-08-19-cp4-seq-ceiling-229376-and-17x-step.md).
 
 | seq | RUN_EXIT | forward | fused CE | backward | writeback | peak/rank | loss |
 |---|---|---:|---:|---:|---:|---:|---|
-| 131072 | 0 | 56.8 s | 1.69 s | 119.05 s | 177.5 s | 74,095 MiB | 7.631271 |
-| 163840 | 0 | 73.5 s | 2.01 s | 155.08 s | 230.7 s | 78,959 MiB | 7.189730 |
-| 196608 | 0 | 89.8 s | 2.03 s | 192.09 s | 283.6 s | 86,991 MiB | 6.924870 |
-| **229376** | 0 | 107.9 s | 2.76 s | 231.38 s | **342.2 s** | 92,655 MiB (95.0%) | 6.742337 |
+| 131072 | 0 | 58.4 s | 1.70 s | 119.48 s | 179.7 s | 72,751 MiB | 3.034899 |
+| 196608 | 0 | 90.2 s | 2.43 s | 193.79 s | 286.5 s | 85,871 MiB | 2.072005 |
+| **229376** | 0 | 109.9 s | 2.80 s | 232.74 s | **345.6 s** | 94,351 MiB (96.8%) | 1.780185 |
 
-**The cp=4 ceiling is 229376.** 131072 here is 17.5× the 2026-08-03 row below
-(3100 s → 177.5 s); that row and the cp=2 one under-report the current substrate
-by more than an order of magnitude.
+**The cp=4 ceiling is 229376**, unchanged by the fix — 245760 still dies in
+backward. 131072 here is 17.3× the 2026-08-03 row below (3100 s → 179.7 s); that
+row and the cp=2 one under-report the current substrate by more than an order of
+magnitude. Loss falls monotonically with sequence length, as it should; the
+pre-fix column (7.63 / 6.92 / 6.74) was inflated by corrupted hidden states.
+163840 was measured pre-fix only (230.7 s, 78,959 MiB).
 
 ## Known walls
 
 | shape | outcome |
 |---|---|
 | 27B cp=1 seq=81920 | forward completes (3972.216 s), **backward OOMs** on `cuda alloc_zeros failed`. Host RSS 104.5 GB. The failing tensor is not named by the log. |
-| 27B cp=4 seq=245760 | forward + CE complete, **backward OOMs** on `cuda alloc_zeros failed (la dqkv)` (2026-08-19, `9c2c84675`) |
+| 27B cp=4 seq=245760 | forward + CE complete, **backward OOMs** on `cuda alloc_zeros failed (la dqkv)` (2026-08-19, `9c2c84675`). Still fails on `ad1192864` with the same deadlock signature; that re-run was killed before the error string flushed, so the allocation is not re-confirmed post-fix |
 | 27B cp=4 seq=262144 | forward 126.5 s + CE 3.14 s complete, **backward OOMs** on `cuda alloc_zeros failed (slice_bwd)` — the linear-attn zigzag reorder's `slice` backward allocates a full-input zero buffer (2026-08-19, `9c2c84675`) |
 | any cp, rank-local error | the erroring rank unwinds into `ncclCommDestroy` and blocks behind the peers' in-flight collective, so **the error text never prints**. Presents as N−1 GPUs at 100% util and one at 0%, indefinitely. Kill the spinners to release the unwind and read the real line. |
 | 27B cp=2 seq=131072 | fits — backward peak 94,175 MiB (96.6%), ~3.3 GB headroom (2026-08-02, older commit) |
 | 27B cp=4 seq=131072 | full step ~3100 s, host RSS 170.4 GiB total / ~44.6 GB per rank (2026-08-03, scalar ring, older commit) |
 | 27B cp=8 | unmeasured — only 4 GPUs were free on 2026-08-19 |
-| any cp>1, gradients | **cp=2 grad_norm 1.401418e1 against cp=1's 2.197122 at 27B seq=32768** — CP agreed with single-card on 2026-08-05 (2.263385) and does not now. Not LoRA rank, not FlashQLA; cause unknown, bisect pending ([errors](experience/errors/2026-08-19-cp-training-gradients-regressed-and-the-gate-is-dead.md)) |
+| 0.8B CP correctness arm | **cannot run** — `flashqla GDN head geometry H=8/Hg=8 not built`. FlashQLA went default-on 2026-08-05 with no kernel for that model's per-rank CP geometry, so the cp≥2 arms error instead of producing a number. This is why the FA3 byte-offset bug survived two days ([errors](experience/errors/2026-08-19-cp-training-gradients-regressed-and-the-gate-is-dead.md)) |
