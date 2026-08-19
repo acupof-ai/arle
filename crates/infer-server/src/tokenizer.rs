@@ -123,12 +123,25 @@ impl OpenAiTokenizer {
     }
 
     /// Encode text into token ids without adding special tokens.
+    ///
+    /// DSv4's BOS (`<｜begin▁of▁sentence｜>`, id 0) is in the vocab but missing
+    /// from `added_tokens`, so the BPE pre-tokenizer splits it into mojibake
+    /// subwords. Strip the BOS prefix and prepend id 0 directly.
     pub fn encode(&self, text: &str) -> Result<Vec<u32>> {
+        let bos = "<｜begin▁of▁sentence｜>";
+        let (body, prepend_bos) = match text.strip_prefix(bos) {
+            Some(rest) => (rest, true),
+            None => (text, false),
+        };
         let encoding = self
             .inner
-            .encode(text, false)
+            .encode(body, false)
             .map_err(|err| anyhow!("tokenize prompt failed: {err}"))?;
-        Ok(encoding.get_ids().to_vec())
+        let mut ids = encoding.get_ids().to_vec();
+        if prepend_bos {
+            ids.insert(0, 0);
+        }
+        Ok(ids)
     }
 
     /// Vocabulary indexed by token id, for grammar-compiler construction.
