@@ -1075,7 +1075,9 @@ fn plan_fp8_cuda_frozen_base(
     }
 
     let base = hf_name.strip_suffix(".weight").ok_or_else(|| {
-        LoaderError::Custom(format!("FP8 tensor {hf_name} is missing the .weight suffix"))
+        LoaderError::Custom(format!(
+            "FP8 tensor {hf_name} is missing the .weight suffix"
+        ))
     })?;
     let block_scaled_name = format!("{base}.weight_scale_inv");
     let per_channel_name = format!("{base}.weight_scale");
@@ -1146,12 +1148,9 @@ fn plan_fp4_cuda_frozen_base(
     let scale_shard_idx = *hf_name_to_shard.get(&scale_name).ok_or_else(|| {
         LoaderError::Custom(format!("{hf_name} is NVFP4 but has no {scale_name}"))
     })?;
-    let global_scale_shard_idx =
-        *hf_name_to_shard.get(&global_scale_name).ok_or_else(|| {
-            LoaderError::Custom(format!(
-                "{hf_name} is NVFP4 but has no {global_scale_name}"
-            ))
-        })?;
+    let global_scale_shard_idx = *hf_name_to_shard.get(&global_scale_name).ok_or_else(|| {
+        LoaderError::Custom(format!("{hf_name} is NVFP4 but has no {global_scale_name}"))
+    })?;
 
     let scale_view = safetensors_views[scale_shard_idx]
         .tensor(&scale_name)
