@@ -432,9 +432,8 @@ extern "C" int w4a8_moe_grouped_gemm_sm90(
         workspace, workspace_bytes, static_cast<cudaStream_t>(stream));
   }
   if (rc != 0) return rc;
-  // Catch async kernel errors (illegal access, etc.) before they corrupt
-  // the CUDA context and surface as unrelated cuModuleLoad failures.
-  cudaError_t err = cudaStreamSynchronize(static_cast<cudaStream_t>(stream));
-  if (err != cudaSuccess) return -10 - (int)err;
+  // No cudaStreamSynchronize here: the stream orders kernels, and a sync per
+  // GEMM (86/step at 43 layers) serializes the CPU-GPU pipeline. Async errors
+  // surface at the next sync point (output readback or step boundary).
   return 0;
 }
