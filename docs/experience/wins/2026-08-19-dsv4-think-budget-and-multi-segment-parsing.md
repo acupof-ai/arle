@@ -1,6 +1,6 @@
 # DSv4 multi-segment think parsing + forced think-end budget — CUDA, 2026-08-19
 
-> Status: pending-remote (Mac can't build CUDA; verify on pod)
+> Status: verified on pod (H20 ×4, TP=4, 2026-08-19)
 
 ## Context
 
@@ -48,24 +48,38 @@ with all output trapped in `reasoning_content`).
 
 Commit: `c8c344051`
 
-## Expected result on pod
+## Verified on pod (H20 ×4, TP=4, 2026-08-19)
 
-- Needle retrieval in thinking mode: model finds needle, generates
-  `</think>` (naturally or forced), returns answer as content.
-- Repetition loops: forced `</think>` after 32768 reasoning tokens,
-  model transitions to content instead of looping forever.
-- Multi-segment thinking: second `<think>...</think>` block correctly
-  parsed as reasoning, not leaked into content.
+Build: `think-budget-v6` (head `ad8189dc2`), serve `--max-thinking-tokens 128`.
 
-## Verify on pod
+### Forced think-end fires at exact budget
 
-1. Build: `pod.sh build think-budget`
-2. Serve TP=2 with `--max-thinking-tokens 4096`
-3. Needle gate thinking mode: model should return answer (not empty)
-4. Check logs for forced think-end: `force_next_token` should trigger
-   after 4096 reasoning tokens if the model loops
-5. Multi-segment: prompt that triggers re-thinking should have both
-   segments in `reasoning_content`
+Prompt: "Explain in detail how transformer attention works…" (streaming).
+Result: **128 reasoning deltas exactly**, then engine forced `</think>`,
+model continued with 10 311 chars of coherent content (2 608 deltas).
+The last reasoning delta ended mid-word — the cut is unambiguous.
+
+### Natural think-end still works
+
+Prompt: "What is 17×23?" — model emitted `</think>` naturally at ~85
+reasoning tokens, well under the 128 budget. Budget is a ceiling, not a
+target.
+
+### DSv4 eos_token_id ≠ 128822
+
+The model continued generating content after the forced `</think>`,
+confirming `eos_token_id` is not the think-end token. If it were, the
+forced token would terminate the request instead of transitioning to
+content.
+
+### reasoning_tokens usage reporting (fixed in `b3a1f675a`)
+
+`usage.completion_tokens_details.reasoning_tokens` was hardcoded to 0
+in three places (`from_parts`, streaming chat, n>1 path). The n>1 path
+also used content char length instead of token count for
+`completion_tokens`. Fixed by counting reasoning tokens at the token
+level in the coordinator, using the same think-state logic as the
+engine's `update_think_state`.
 
 ## Rule
 

@@ -1003,6 +1003,7 @@ impl ChatCompletionResponse {
         content: String,
         prompt_tokens: usize,
         completion_tokens: usize,
+        reasoning_tokens: usize,
         finish: Option<&FinishReason>,
         enable_thinking: bool,
         tool_calls: Vec<ResponseToolCall>,
@@ -1016,7 +1017,7 @@ impl ChatCompletionResponse {
             "tool_calls".to_string()
         };
         let usage = if enable_thinking {
-            Usage::with_reasoning(prompt_tokens, completion_tokens, 0)
+            Usage::with_reasoning(prompt_tokens, completion_tokens, reasoning_tokens)
         } else {
             Usage::new(prompt_tokens, completion_tokens)
         };
