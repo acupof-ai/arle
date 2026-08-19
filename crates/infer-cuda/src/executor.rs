@@ -750,30 +750,6 @@ impl RealCudaExecutor {
         }
     }
 
-    /// Opt into session KV-recall (`--kv-recall`, default off). Wired for the
-    /// dense-Qwen3 paged decode arm (the only CUDA arm with a paged page table +
-    /// page-granular tier); the Qwen3.5/3.6 hybrid and DSv4 arms own per-slot KV
-    /// state internally and ignore the request (logged at the call site). Off →
-    /// the decode hot path is byte-identical.
-    pub(crate) fn set_kv_recall(&mut self, enabled: bool) -> Result<()> {
-        match self {
-            Self::Qwen(q) => {
-                q.set_kv_recall(enabled);
-                Ok(())
-            }
-            Self::Qwen35(q) => q.set_kv_recall(enabled),
-            Self::Dsv4(_) => {
-                if enabled {
-                    warn!(
-                        "--kv-recall requested but DSv4 owns per-slot MLA KV; \
-                         session KV-recall is wired for dense Qwen3 + Qwen3.6 only (ignored)"
-                    );
-                }
-                Ok(())
-            }
-        }
-    }
-
     /// Attach the opt-in disk spill level (pre-serve only). Returns whether
     /// any arm consumed it, so callers can fail closed instead of silently
     /// dropping an explicit `--kv-disk` request.

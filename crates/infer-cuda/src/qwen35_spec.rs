@@ -225,7 +225,7 @@ impl Qwen35Model {
         start_pos: usize,
         depth: usize,
         params: &SamplingParams,
-        recall: Option<&mut Qwen35RecallForward>,
+        recall: Option<&mut Qwen35PagedForward>,
     ) -> Result<(Vec<CommittedToken>, u32, DeviceVec)> {
         ensure!(depth >= 1, "spec_step requires depth >= 1, got {depth}");
         // The MTP head KV (spec.head_k/head_v) was sized (spec_draft_tokens+1)

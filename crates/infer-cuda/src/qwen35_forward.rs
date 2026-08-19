@@ -387,7 +387,7 @@ impl Qwen35Model {
         tokens: &[u32],
         start_pos: usize,
         capture: Option<&mut Qwen35LinearCapture>,
-        recall: Option<&mut Qwen35RecallForward>,
+        recall: Option<&mut Qwen35PagedForward>,
         taps: Option<&mut dspark::Qwen35DsparkTaps>,
     ) -> Result<()> {
         ensure!(
@@ -458,7 +458,7 @@ impl Qwen35Model {
         rows: &mut [LinearRow<'_>],
         ws: &mut Qwen35Workspace,
         _start_pos: usize,
-        mut recall: Option<&mut Qwen35RecallForward>,
+        mut recall: Option<&mut Qwen35PagedForward>,
         mut taps: Option<&mut dspark::Qwen35DsparkTaps>,
     ) -> Result<()> {
         // Single chokepoint for every recurrent-reading forward (prefill /
@@ -541,7 +541,6 @@ impl Qwen35Model {
                                     rc.cp_decode.as_ref(),
                                     full,
                                     attn_out,
-                                    rc.layer0_query.as_mut(),
                                 )
                             } else {
                                 bail!(
@@ -669,7 +668,7 @@ impl Qwen35Model {
         params: &SamplingParams,
         position: u64,
         penalty: infer_plan::PenaltyHistory<'_>,
-        recall: &mut Qwen35RecallForward,
+        recall: &mut Qwen35PagedForward,
     ) -> Result<(u32, Option<f32>)> {
         self.forward_tokens_recall_tapped(
             slot, ws, tokens, start_pos, params, position, penalty, recall, None,
@@ -689,7 +688,7 @@ impl Qwen35Model {
         params: &SamplingParams,
         position: u64,
         penalty: infer_plan::PenaltyHistory<'_>,
-        recall: &mut Qwen35RecallForward,
+        recall: &mut Qwen35PagedForward,
         taps: Option<&mut dspark::Qwen35DsparkTaps>,
     ) -> Result<(u32, Option<f32>)> {
         ensure!(
@@ -823,7 +822,7 @@ impl Qwen35Model {
         ws: &mut Qwen35Workspace,
         tokens: &[u32],
         start_pos: usize,
-        recall: Option<&mut Qwen35RecallForward>,
+        recall: Option<&mut Qwen35PagedForward>,
     ) -> Result<(DeviceVec, [usize; 2])> {
         self.forward_hidden_capture(slot, ws, tokens, start_pos, None, recall, None)?;
         let seq_len = tokens.len();
@@ -877,7 +876,7 @@ impl Qwen35Model {
         ws: &mut Qwen35Workspace,
         tokens: &[u32],
         start_pos: usize,
-        recall: Option<&mut Qwen35RecallForward>,
+        recall: Option<&mut Qwen35PagedForward>,
     ) -> Result<(DeviceVec, [usize; 2], DeviceVec)> {
         self.forward_hidden_capture(slot, ws, tokens, start_pos, None, recall, None)?;
         let seq_len = tokens.len();
@@ -927,7 +926,7 @@ impl Qwen35Model {
         tokens: &[u32],
         start_pos: usize,
         capture: Option<&mut Qwen35LinearCapture>,
-        recall: Option<&mut Qwen35RecallForward>,
+        recall: Option<&mut Qwen35PagedForward>,
     ) -> Result<(DeviceVec, [usize; 2], DeviceVec)> {
         self.forward_hidden_capture(slot, ws, tokens, start_pos, capture, recall, None)?;
         let seq_len = tokens.len();
@@ -983,7 +982,7 @@ impl Qwen35Model {
         taps: &mut dspark::Qwen35DsparkTaps,
         target_layer_ids: &[i64],
         tokens: &[u32],
-        recall: Option<&mut Qwen35RecallForward>,
+        recall: Option<&mut Qwen35PagedForward>,
     ) -> Result<(Vec<f32>, Vec<f32>)> {
         ensure!(!tokens.is_empty(), "training forward needs tokens");
         ensure!(

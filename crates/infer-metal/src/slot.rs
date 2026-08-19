@@ -23,20 +23,6 @@ pub struct MetalSlotState {
     pub(super) last_sampled: Option<mlx::MlxArray>,
     pub(super) dflash_target_hidden: Option<mlx::MlxArray>,
     pub(super) dflash_draft_state: Option<dflash::DFlashDraftState>,
-    /// Session KV-recall plan for the next decode: when `Some`, the step attends
-    /// only these token ranges (sink ∪ recalled blocks ∪ local) via the page-gather
-    /// instead of the full `[0..cache_len]`. `None` = today's contiguous read.
-    /// Set by the Engine from `infer_core::plan_recall` (#5); default off.
-    pub(super) recall_ranges: Option<Vec<(usize, usize)>>,
-    /// Resident per-middle-block key envelope for KV-recall scoring (#2). Each
-    /// entry is layer-0 K reduced over its `l_bs` tokens to a per-channel
-    /// `[min | max]` pair, flattened `2 * nkv * hd` f32 (min half first) — the
-    /// resident representative that keeps an offloaded block scorable. Index =
-    /// middle block index (token base `n_init + i * l_bs`). Grown incrementally
-    /// as whole blocks complete; empty unless recall is enabled for this slot.
-    ///
-    /// See [`infer_core::fold_key`] for why this is an interval and not a mean.
-    pub(super) block_reps: Vec<Vec<f32>>,
 }
 
 #[cfg(feature = "metal")]
@@ -83,8 +69,6 @@ impl MetalSlotState {
             last_sampled: None,
             dflash_target_hidden: None,
             dflash_draft_state: None,
-            recall_ranges: None,
-            block_reps: Vec::new(),
         }
     }
 
@@ -106,8 +90,6 @@ impl MetalSlotState {
             last_sampled: None,
             dflash_target_hidden: None,
             dflash_draft_state: None,
-            recall_ranges: None,
-            block_reps: Vec::new(),
         }
     }
 
@@ -163,148 +145,6 @@ impl MetalSlotState {
             v_full.push(slice_kv_tokens(&pair[1], 0, cache_len)?);
         }
         Ok((k_full, v_full))
-    }
-
-    /// Page-gather read for session KV-recall (Phase-1 #4 primitive). Builds the
-    /// decode K/V from a SELECTED set of contiguous token ranges
-    /// (sink ∪ recalled blocks ∪ local window) instead of the full `[0..cache_len]`,
-    /// by slicing each range and concatenating along the token axis — reuses
-    /// `slice_kv_tokens` + `concatenate_or_single`, no new MLX op. Which ranges to
-    /// recall is the device-neutral policy (infer-core SessionMemory); this is only
-    /// the executor primitive that attends them. `ranges` must be within `cache_len`.
-    pub(super) fn bf16_recall_read_inputs(
-        &self,
-        ranges: &[(usize, usize)],
-    ) -> anyhow::Result<(Vec<mlx::MlxArray>, Vec<mlx::MlxArray>)> {
-        anyhow::ensure!(
-            !ranges.is_empty(),
-            "recall KV read requires at least one token range"
-        );
-        for &(s, e) in ranges {
-            anyhow::ensure!(
-                s <= e && e <= self.cache_len,
-                "recall token range [{s}, {e}) exceeds slot cache_len {}",
-                self.cache_len
-            );
-        }
-        anyhow::ensure!(
-            self.kv_flat.len().is_multiple_of(2),
-            "bf16 slot cache must contain K/V pairs, got {} arrays",
-            self.kv_flat.len()
-        );
-
-        let mut k_full = Vec::with_capacity(self.kv_flat.len() / 2);
-        let mut v_full = Vec::with_capacity(self.kv_flat.len() / 2);
-        for (layer_idx, pair) in self.kv_flat.chunks_exact(2).enumerate() {
-            for (axis, array) in pair.iter().enumerate() {
-                anyhow::ensure!(
-                    array.dtype() == mlx::Dtype::Bfloat16,
-                    "recall KV read expected bf16 layer {layer_idx} axis {axis}, got {:?}",
-                    array.dtype()
-                );
-            }
-            k_full.push(gather_kv_ranges(&pair[0], ranges)?);
-            v_full.push(gather_kv_ranges(&pair[1], ranges)?);
-        }
-        Ok((k_full, v_full))
-    }
-
-    /// Session KV-recall reps (#2): envelope layer-0 K over each frozen middle
-    /// block into a resident `[nkv, hd]` representative (flattened `nkv*hd` f32).
-    /// A block is "frozen" once it has left the local window
-    /// (`base + l_bs <= cache_len - n_local`), so its K is final and the rep is
-    /// computed exactly once. This is the resident scoring substrate: even after
-    /// a block's full KV is offloaded its envelope stays here, keeping the block
-    /// scorable. Cheap — only newly-completed blocks are read back.
-    pub(super) fn update_block_reps(
-        &mut self,
-        cfg: &infer_core::RecallConfig,
-    ) -> anyhow::Result<()> {
-        if cfg.l_bs == 0 || self.cache_len <= cfg.n_init + cfg.n_local {
-            return Ok(());
-        }
-        let mid_span = self.cache_len - cfg.n_init - cfg.n_local;
-        let frozen_blocks = mid_span / cfg.l_bs;
-        if frozen_blocks <= self.block_reps.len() {
-            return Ok(());
-        }
-        let Some(k0) = self.kv_flat.first() else {
-            return Ok(());
-        };
-        anyhow::ensure!(
-            k0.dtype() == mlx::Dtype::Bfloat16,
-            "recall reps expect bf16 layer-0 K, got {:?}",
-            k0.dtype()
-        );
-        let shape = k0.shape();
-        anyhow::ensure!(shape.len() == 4, "recall reps expect rank-4 K");
-        let nkv = shape[1] as usize;
-        let hd = shape[3] as usize;
-        for block in self.block_reps.len()..frozen_blocks {
-            let base = cfg.n_init + block * cfg.l_bs;
-            let slice = slice_kv_tokens(k0, base, base + cfg.l_bs)?; // [1, nkv, l_bs, hd]
-            let f32_slice = mlx::as_dtype(&slice, mlx::Dtype::Float32);
-            mlx::eval(&[&f32_slice]);
-            let data = f32_slice.as_slice_f32(); // row-major [1, nkv, l_bs, hd]
-            let mut rep = vec![f32::INFINITY; nkv * hd];
-            rep.resize(2 * nkv * hd, f32::NEG_INFINITY);
-            let (lo, hi) = rep.split_at_mut(nkv * hd);
-            for h in 0..nkv {
-                let out = h * hd;
-                for t in 0..cfg.l_bs {
-                    let row = (h * cfg.l_bs + t) * hd;
-                    infer_core::fold_key(
-                        &mut lo[out..out + hd],
-                        &mut hi[out..out + hd],
-                        data[row..row + hd].iter().copied(),
-                    );
-                }
-            }
-            self.block_reps.push(rep);
-        }
-        Ok(())
-    }
-
-    /// Session KV-recall plan (#2/#3): score the resident block reps against the
-    /// just-emitted layer-0 decode query (one step stale — licensed),
-    /// run `infer_core::plan_recall`, and stash the result for the NEXT step.
-    /// `recall_ranges` is set to `None` when the plan is the single contiguous
-    /// range (session still fits the budget) so the default page-read stays
-    /// byte-identical. Requires bf16 KV (the only recall-built path); the query
-    /// is the C++ emit (`take_recall_query`).
-    pub(super) fn recompute_recall_plan(
-        &mut self,
-        model: &qwen35::CppQwen35Model,
-        cfg: &infer_core::RecallConfig,
-    ) -> anyhow::Result<()> {
-        self.update_block_reps(cfg)?;
-        let Some(query) = model.take_recall_query()? else {
-            // No query stashed yet (first step on the session) → leave ranges.
-            return Ok(());
-        };
-        mlx::eval(&[&query]);
-        let q = query.as_slice_f32(); // [nkv, hd] row-major
-        let nb = self.block_reps.len();
-        let mut scores = vec![0.0_f32; nb];
-        for (i, rep) in self.block_reps.iter().enumerate() {
-            let (lo, hi) = rep.split_at(rep.len() / 2);
-            let n = lo.len().min(q.len());
-            scores[i] = infer_core::score_block(&q[..n], &lo[..n], &hi[..n]);
-        }
-        let plan = infer_core::plan_recall(self.cache_len, &scores, cfg);
-        // A single contiguous full range == today's default read; keep `None` so
-        // the decode hot path stays byte-identical when the session fits.
-        let is_full = plan.ranges.len() == 1 && plan.ranges[0] == (0, self.cache_len);
-        self.recall_ranges = (!is_full).then_some(plan.ranges);
-        // TODO(kv-recall L3): this is the RESIDENT variant — full KV stays in
-        // `slot.kv_flat` (HBM) and recall restricts *attention* to the selected
-        // ranges (the page-gather), saving decode compute. The plan-doc L3 tier
-        // offload (demote the non-selected middle blocks' full KV to
-        // kv-native-sys / `radix::demote_block`, keeping only the resident rep;
-        // promote the selected blocks back) is not wired into the Metal slot KV
-        // yet — that frees the HBM working set for unbounded history. Reps +
-        // scoring + recall_ranges are fully live, so recall itself works now.
-        Ok(())
     }
 
     pub(super) fn int8_prefix_read_inputs(

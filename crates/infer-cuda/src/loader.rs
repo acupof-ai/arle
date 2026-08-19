@@ -794,62 +794,6 @@ impl PageMeta {
         Ok(())
     }
 
-    /// Session KV-recall decode page table: build the metadata over a SELECTED page
-    /// subset
-    /// (`recall_pages`, ascending, ending with the current local page) instead of the
-    /// slot's
-    /// full page list. Correct because RoPE is baked into the cached K at write time
-    /// and the
-    /// query's RoPE position is independent of which KV pages are attended.
-    /// Decode-only,
-    /// BF16 only.
-    pub(crate) fn for_recall_decode(
-        ctx: &DeviceContext,
-        pool: &PagedKVPool,
-        total_len: usize,
-        recall_pages: &[u32],
-        shard: ShardSpec,
-    ) -> Result<Self> {
-        ensure!(
-            pool.format == KVFormat::BF16,
-            "session KV-recall decode page table is BF16-only, got {:?}",
-            pool.format
-        );
-        ensure!(
-            !recall_pages.is_empty(),
-            "recall decode page table needs at least one selected page"
-        );
-        let num_pages = recall_pages.len();
-        let page_ids = recall_pages.iter().map(|&p| p as i32).collect::<Vec<_>>();
-        let (kv_lens, last_page_len, write_kv) =
-            local_kv_extent(shard, total_len, pool.page_size, num_pages);
-        Ok(Self {
-            q_indptr: upload_i32(ctx, &[0, 1])?,
-            kv_indptr: upload_i32(ctx, &[0, num_pages as i32])?,
-            kv_indices: upload_i32(ctx, &page_ids)?,
-            kv_lens_dev: upload_i32(ctx, &[kv_lens as i32])?,
-            page_table_rect: upload_i32(ctx, &page_ids)?,
-            page_table_stride: num_pages,
-            kv_last_page_len: upload_i32(ctx, &[last_page_len as i32])?,
-            page_table_offsets: upload_i32(ctx, &[0])?,
-            start_positions: upload_i32(ctx, &[(total_len - 1) as i32])?,
-            positions: upload_i32(ctx, &[(total_len - 1) as i32])?,
-            q_offsets: vec![0, 1],
-            page_offsets: vec![0, num_pages],
-            kv_lens: vec![kv_lens],
-            seq_len: 1,
-            total_q: 1,
-            num_pages,
-            batch: 1,
-            start_pos: total_len - 1,
-            new_token_rows: None,
-            prefix_token_rows: None,
-            quant_decode_meta: None,
-            seqlen_k_capture: None,
-            write_kv,
-        })
-    }
-
     /// Batched decode page table. `total_len` INCLUDES this step's just-appended token.
     pub(crate) fn for_decode_batch(
         ctx: &DeviceContext,

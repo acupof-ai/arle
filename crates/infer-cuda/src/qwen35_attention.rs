@@ -67,11 +67,6 @@ pub(crate) struct LinearDecodeGeom {
     v_off: usize,
 }
 
-/// Prompt-tail window the KV-recall scoring query is meaned over. Both
-/// capture sites (dense and 2D ring) must use the same window or they feed
-/// `plan_recall` differently-scaled queries with no compile error.
-const RECALL_PREFILL_Q_TOKENS: usize = 16;
-
 impl Qwen35Model {
     /// Gated full attention over an explicit contiguous K/V cache (`max_seq_len`
     /// = `k_cache.len / kv_dim`), into `out` (`[hidden, seq]`, beta=0 o_proj
@@ -352,11 +347,7 @@ impl Qwen35Model {
     }
 
     /// Paged full attention over `meta`'s ragged page table. RoPE is baked into
-    /// the cached K at write time, so a recall-restricted page subset attends
-    /// exactly those pages.
-    ///
-    /// `layer0_query` is the recall sink: on a multi-row prefill the post-RoPE
-    /// layer-0 Q is read back head-major `[num_q_heads * head_dim]`.
+    /// the cached K at write time, so the page subset attends exactly those pages.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn full_attention_paged(
         &self,
@@ -369,7 +360,6 @@ impl Qwen35Model {
         cp_decode: Option<&Qwen35CpDecode>,
         fw: &mut FullAttnScratch,
         out: &mut HiddenStates,
-        layer0_query: Option<&mut Vec<f32>>,
     ) -> Result<()> {
         let c = &self.config;
         // One q row per batch element is the decode kernel's contract.
@@ -484,7 +474,6 @@ impl Qwen35Model {
                 k_batch,
                 v_batch,
                 attn_out,
-                layer0_query,
             )?;
         } else {
             let q_prepped = q_prepped.get(&self.ctx, q_dim, rows)?;
@@ -1082,35 +1071,6 @@ impl Qwen35Model {
                     )?;
                 }
             }
-
-            // The recall cycle runs once per prefill, so the D2H stays off every
-            // other paged forward. The query is the mean of the last `m` prompt
-            // tokens' post-RoPE queries.
-            if let Some(dst) = layer0_query
-                && full_idx == 0
-                && rows > 1
-            {
-                // Row-major `[rows, q_dim]`, so the tail is one contiguous run —
-                // copying the whole buffer would move `rows/m` times the bytes.
-                let m = RECALL_PREFILL_Q_TOKENS.min(rows);
-                let host: Vec<bf16> = self
-                    .ctx
-                    .stream
-                    .clone_dtoh(&q_prepped.data.slice((rows - m) * q_dim..rows * q_dim))
-                    .map_err(|e| anyhow!("recall layer0 q dtoh: {e}"))?;
-                let mut q = vec![0.0_f32; q_dim];
-                for t in 0..m {
-                    let base = t * q_dim;
-                    for (d, slot) in q.iter_mut().enumerate() {
-                        *slot += host[base + d].to_f32();
-                    }
-                }
-                let inv = 1.0_f32 / m as f32;
-                for v in &mut q {
-                    *v *= inv;
-                }
-                *dst = q;
-            }
         }
 
         {
@@ -1220,7 +1180,6 @@ impl Qwen35Model {
         k_batch: &HiddenStates,
         v_batch: &HiddenStates,
         attn_out: &mut HiddenStates,
-        layer0_query: Option<&mut Vec<f32>>,
     ) -> Result<()> {
         let c = &self.config;
         let head_dim = c.head_dim;
@@ -1284,44 +1243,6 @@ impl Qwen35Model {
                     Ok(())
                 },
             )?;
-        }
-
-        // Recall scoring query, the ring twin of the dense capture in
-        // `full_attention_paged`. cp slices are contiguous, so only the
-        // tail-owning rank holds the prompt's last rows; peers receive it from
-        // the broadcast in `prefill_row_recall`, and a rank that captures nothing
-        // leaves `dst` empty for that broadcast to fill.
-        if let Some(dst) = layer0_query
-            && full_idx == 0
-            && active
-            && rows > 1
-            && cp.slices.iter().rposition(|&(_, l)| l > 1) == Some(cp_rank)
-        {
-            // q_ring is head-major `[q_heads, rows, head_dim]` (the dense path's
-            // `q_prepped` is row-major, so the two captures cannot share
-            // indexing). The tail is contiguous per head but not across heads, so
-            // this is one copy per head rather than one copy of the whole buffer.
-            let m = RECALL_PREFILL_Q_TOKENS.min(rows);
-            let mut q = vec![0.0_f32; q_heads * head_dim];
-            for h in 0..q_heads {
-                let head = h * rows * head_dim;
-                let host: Vec<u16> = self
-                    .ctx
-                    .stream
-                    .clone_dtoh(&q_ring.slice(head + (rows - m) * head_dim..head + rows * head_dim))
-                    .map_err(|e| anyhow!("recall ring q dtoh: {e}"))?;
-                let out = &mut q[h * head_dim..(h + 1) * head_dim];
-                for t in 0..m {
-                    for (d, slot) in out.iter_mut().enumerate() {
-                        *slot += bf16::from_bits(host[t * head_dim + d]).to_f32();
-                    }
-                }
-            }
-            let inv = 1.0_f32 / m as f32;
-            for v in &mut q {
-                *v *= inv;
-            }
-            *dst = q;
         }
 
         // Accumulator init: m=-inf, l=0, o=0 (flash-2 online softmax).

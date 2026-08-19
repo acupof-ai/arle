@@ -32,38 +32,20 @@ struct DsparkChain {
     partial_ctx: bool,
 }
 
-fn merge_tier_io_stats(
-    slot: &kv_native_sys::TierIoStats,
-    recall: &kv_native_sys::TierIoStats,
-) -> infer_seam::KvTierIoStats {
-    let mode = if [slot.mode, recall.mode].contains(&kv_native_sys::DiskIoMode::Direct) {
-        infer_seam::KvTierIoMode::Direct
-    } else if [slot.mode, recall.mode].contains(&kv_native_sys::DiskIoMode::Mmap) {
-        infer_seam::KvTierIoMode::Mmap
-    } else {
-        infer_seam::KvTierIoMode::Disabled
-    };
+fn tier_io_stats(s: &kv_native_sys::TierIoStats) -> infer_seam::KvTierIoStats {
     infer_seam::KvTierIoStats {
-        mode,
-        useful_read_bytes: slot
-            .useful_read_bytes
-            .saturating_add(recall.useful_read_bytes),
-        useful_write_bytes: slot
-            .useful_write_bytes
-            .saturating_add(recall.useful_write_bytes),
-        submitted_read_bytes: slot
-            .submitted_read_bytes
-            .saturating_add(recall.submitted_read_bytes),
-        submitted_write_bytes: slot
-            .submitted_write_bytes
-            .saturating_add(recall.submitted_write_bytes),
-        metadata_write_bytes: slot
-            .metadata_write_bytes
-            .saturating_add(recall.metadata_write_bytes),
-        failures: slot.failures.saturating_add(recall.failures),
-        completion_wait_ns: slot
-            .completion_wait_ns
-            .saturating_add(recall.completion_wait_ns),
+        mode: match s.mode {
+            kv_native_sys::DiskIoMode::Direct => infer_seam::KvTierIoMode::Direct,
+            kv_native_sys::DiskIoMode::Mmap => infer_seam::KvTierIoMode::Mmap,
+            _ => infer_seam::KvTierIoMode::Disabled,
+        },
+        useful_read_bytes: s.useful_read_bytes,
+        useful_write_bytes: s.useful_write_bytes,
+        submitted_read_bytes: s.submitted_read_bytes,
+        submitted_write_bytes: s.submitted_write_bytes,
+        metadata_write_bytes: s.metadata_write_bytes,
+        failures: s.failures,
+        completion_wait_ns: s.completion_wait_ns,
     }
 }
 
@@ -110,7 +92,7 @@ pub(crate) struct Qwen35CudaExecutor {
     slots: Vec<crate::qwen35::Qwen35SlotState>,
     /// Whole-slot capacity spill: a parked request's snapshot, restored byte-exact on
     /// resume. Keyed by the engine session key — a namespace disjoint from
-    /// `recall_tier`'s `tier_block_u64(slot, page)` keys.
+    /// the write-through `tier_block_u64(slot, page)` keys.
     slot_tier: KvTierStore,
     /// Free-list of detached recurrent blocks (~147 MiB each), so only ACTIVE slots
     /// hold a block rather than all `num_slots`.
@@ -132,11 +114,6 @@ pub(crate) struct Qwen35CudaExecutor {
     /// single-GPU only, so 2D decode never captures).
     sharded_decode_meta: Vec<Option<crate::loader::PageMeta>>,
     batch_decode: Option<crate::qwen35::Qwen35BatchDecodeState>,
-    /// Recall cycle opt-in (`--kv-recall`): layers a working-set restriction on the
-    /// SAME paged `full_attn_kv` pool; off attends the full resident page set.
-    kv_recall: bool,
-    recall_cfg: infer_core::RecallConfig,
-    recall: Vec<crate::recall::CudaRecallState>,
     /// Shared paged full-attn KV pool, profile-sized from measured free VRAM. Both the
     /// default forward and the recall cycle use it; `Option` only so OPD offload can
     /// drop it.
@@ -146,13 +123,10 @@ pub(crate) struct Qwen35CudaExecutor {
     /// L3 write-through tier: source of truth for evict-dropped middle blocks, sized to
     /// ONE pool page image. Keyed by `tier_block_u64(slot, page)`, so slot A never
     /// prefetches slot B's KV.
-    recall_tier: Option<KvTierStore>,
     /// One-step eviction keepalive: a page dropped at step N is parked here until the
     /// start of step N+1, so `alloc_tokens` can never hand the in-flight attention's
     /// page to the new token. Holds (logical, physical).
-    recall_keepalive: Vec<Vec<(usize, u32)>>,
     /// Per-rank L2 byte budget (`--kv-dram` ÷ world size).
-    recall_budget_bytes: usize,
 
     /// Stamped into the durable recall manifest so a restart drops stale KV after an
     /// OPD weight update.
@@ -344,11 +318,7 @@ impl Qwen35CudaExecutor {
         if slot >= self.num_slots {
             return Ok(());
         }
-        let parked = std::mem::take(&mut self.recall_keepalive[slot]);
         if let Some(pool) = self.full_attn_kv.as_mut() {
-            for (_logical, physical) in parked {
-                pool.release_evicted_page(physical);
-            }
             pool.mirror_slot(slot, &[], 0)?;
         }
         Ok(())
@@ -391,10 +361,6 @@ impl Qwen35CudaExecutor {
         // session's block envelopes describe different tokens at the same block
         // indices, and `update_block_reps` only grows past `len()` — a stale rep is
         // never recomputed, so scoring ranks another request's keys.
-        if self.recall_active() {
-            self.recall[slot].reset();
-        }
-
         // Probe largest-first; each boundary is page-aligned, so `hash(tokens[..B])`
         // rendezvous with the save keys.
         let stride = SIDECAR_SNAPSHOT_STRIDE_PAGES * SUPPORTED_PAGE_SIZE; // const, > 0
@@ -461,28 +427,15 @@ impl Qwen35CudaExecutor {
     }
 
     pub(crate) fn kv_tier_io_stats(&self) -> infer_seam::KvTierIoStats {
-        let slot = self.slot_tier.io_stats();
-        let recall = self
-            .recall_tier
-            .as_ref()
-            .map_or_else(kv_native_sys::TierIoStats::default, KvTierStore::io_stats);
-        merge_tier_io_stats(&slot, &recall)
+        tier_io_stats(&self.slot_tier.io_stats())
     }
 
     pub(crate) fn kv_tier_read_hits(&self) -> infer_seam::KvTierReadHits {
-        let mut hits = self.slot_tier.read_hits();
-        if let Some(recall) = self.recall_tier.as_ref() {
-            let r = recall.read_hits();
-            hits.host_demoted += r.host_demoted;
-            hits.disk += r.disk;
-        }
-        hits
+        self.slot_tier.read_hits()
     }
 
     pub(crate) fn kv_tier_location(&self, key: u64) -> Option<infer_seam::KvTierLocation> {
-        self.slot_tier
-            .location(key)
-            .or_else(|| self.recall_tier.as_ref().and_then(|r| r.location(key)))
+        self.slot_tier.location(key)
     }
 
     fn tp_min_usize(&self, value: usize, what: &str) -> Result<usize> {
@@ -838,16 +791,8 @@ impl Qwen35CudaExecutor {
             paged_decode_meta: Vec::new(),
             sharded_decode_meta: Vec::new(),
             batch_decode: None,
-            kv_recall: false,
-            recall_cfg: infer_core::RecallConfig::VALIDATED,
-            recall: (0..num_slots)
-                .map(|_| crate::recall::CudaRecallState::default())
-                .collect(),
             full_attn_kv: Some(full_attn_kv),
             kv_format,
-            recall_tier: None,
-            recall_keepalive: (0..num_slots).map(|_| Vec::new()).collect(),
-            recall_budget_bytes: tier_budget_bytes,
             weights_epoch,
             disk_root: None,
             disk_budget: None,
@@ -1041,14 +986,12 @@ impl Qwen35CudaExecutor {
     /// Per-rank L2 byte cap (`--kv-dram` ÷ world size). Pre-serve only (drops any
     /// existing entries).
     pub(crate) fn set_kv_tier_budget_bytes(&mut self, bytes: usize) {
-        self.recall_budget_bytes = bytes;
         self.slot_tier = KvTierStore::with_budget(bytes, BLOB_CHUNK_BYTES);
     }
 
-    /// Attach NVMe spill (`--kv-disk`): ephemeral under `slot_tier`, durable for the
-    /// recall tier (attached now if built, else stashed for `set_kv_recall`). Pre-serve
-    /// only. The budget is a per-store cap, not a reservation — both stores are sparse
-    /// mmaps, so disk is consumed only by actual spill.
+    /// Attach NVMe spill (`--kv-disk`). Pre-serve only. The budget is a per-store
+    /// cap, not a reservation — the store is a sparse mmap, so disk is consumed
+    /// only by actual spill.
     pub(crate) fn set_kv_tier_disk(
         &mut self,
         root: std::path::PathBuf,
@@ -1056,109 +999,8 @@ impl Qwen35CudaExecutor {
     ) -> bool {
         self.disk_root = Some(root.clone());
         self.disk_budget = Some(budget_bytes);
-        let recall_attached = match self.recall_tier.as_mut() {
-            Some(tier) => {
-                let page_bytes = tier.page_bytes();
-                tier.load(
-                    root.clone(),
-                    budget_bytes,
-                    page_bytes,
-                    self.weights_epoch.clone(),
-                    self.kv_format
-                        .stable_tag()
-                        .expect("persisted KV format must have a stable tag"),
-                    self.model.tp.config().world_size,
-                    self.model.tp.config().rank,
-                )
-            }
-            None => false,
-        };
         self.slot_tier
             .set_disk(root, budget_bytes, BLOB_CHUNK_BYTES)
-            || recall_attached
-    }
-
-    /// Opt into the recall eviction/scoring cycle (`--kv-recall`): a working-set
-    /// restriction on the SAME always-resident paged pool, with its L3 tier built
-    /// lazily on the first enable.
-    pub(crate) fn set_kv_recall(&mut self, enabled: bool) -> Result<()> {
-        ensure!(
-            !(enabled && self.dspark.is_some()),
-            "--kv-recall is not supported with --spec-type dspark (the verify \
-             forward would race the recall eviction cycle)"
-        );
-        // 1D CP (attn_cp>1, attn_tp==1): the pool is fully replicated, so
-        // rank-local recall scoring/eviction would diverge the replicas.
-        ensure!(
-            !(enabled && self.model.tp.attn_cp_size() > 1 && !self.two_d_engaged()),
-            "--kv-recall is not supported with attn_cp>1 without 2D parallelism \
-             (replicated pool diverges under rank-local recall)"
-        );
-        // Config invariant, not a per-row one: a region boundary off a page edge
-        // makes a block span a partial page and the per-page readback folds
-        // foreign tokens into its envelope.
-        if let Some(pool) = self.full_attn_kv.as_ref() {
-            ensure!(
-                !enabled || self.recall_cfg.is_page_aligned(pool.page_size),
-                "KV-recall config (n_init {}, n_local {}, l_bs {}) must be multiples of page_size {}",
-                self.recall_cfg.n_init,
-                self.recall_cfg.n_local,
-                self.recall_cfg.l_bs,
-                pool.page_size
-            );
-        }
-        self.kv_recall = enabled;
-        if enabled {
-            let shard = infer_seam::ShardSpec::new(
-                self.model.tp.attn_cp_rank(),
-                self.model.tp.attn_cp_size(),
-            );
-            for state in &mut self.recall {
-                state.set_shard(shard);
-            }
-        }
-        if enabled && self.recall_tier.is_none() {
-            // One entry == one pool page image (all `num_full` layers, K+V).
-            let page_bytes = self
-                .full_attn_kv
-                .as_ref()
-                .map(|p| p.storage_bytes_per_page())
-                .ok_or_else(|| {
-                    anyhow::anyhow!("--kv-recall: full-attn paged pool not allocated")
-                })?;
-            let mut tier = KvTierStore::with_budget(self.recall_budget_bytes, page_bytes);
-            // Falls through to set_disk_durable on first run or epoch mismatch.
-            if let (Some(root), Some(budget)) = (self.disk_root.as_ref(), self.disk_budget) {
-                let format_tag = self
-                    .kv_format
-                    .stable_tag()
-                    .expect("persisted KV format must have a stable tag");
-                let rank = self.model.tp.config().rank;
-                let world_size = self.model.tp.config().world_size;
-                let loaded = tier.load(
-                    root.clone(),
-                    budget,
-                    page_bytes,
-                    self.weights_epoch.clone(),
-                    format_tag,
-                    world_size,
-                    rank,
-                );
-                if !loaded {
-                    tier.set_disk_durable(
-                        root.clone(),
-                        budget,
-                        page_bytes,
-                        self.weights_epoch.clone(),
-                        format_tag,
-                        world_size,
-                        rank,
-                    );
-                }
-            }
-            self.recall_tier = Some(tier);
-        }
-        Ok(())
     }
 
     /// `Option` is `None` only after an OPD weight offload dropped the pool.
@@ -1178,10 +1020,6 @@ impl Qwen35CudaExecutor {
     /// `None` only if the pool was dropped (OPD offload).
     pub(crate) fn full_attn_pool_pages(&self) -> Option<usize> {
         self.full_attn_kv.as_ref().map(|p| p.max_total_pages)
-    }
-
-    fn recall_active(&self) -> bool {
-        self.kv_recall && self.recall_tier.is_some() && self.full_attn_kv.is_some()
     }
 
     /// Build the prefill page table + CP ring metadata for a prefill row.
@@ -1285,10 +1123,9 @@ impl Qwen35CudaExecutor {
             ..
         } = self;
         let pool = full_attn_kv.as_mut().expect("full_attn_kv present");
-        let mut rc = crate::qwen35::Qwen35RecallForward {
+        let mut rc = crate::qwen35::Qwen35PagedForward {
             pool,
             meta: &meta,
-            layer0_query: None,
             cp,
             cp_decode: None,
         };
@@ -1440,10 +1277,9 @@ impl Qwen35CudaExecutor {
         } else {
             owned_meta.as_ref().expect("non-2D meta built above")
         };
-        let mut rc = crate::qwen35::Qwen35RecallForward {
+        let mut rc = crate::qwen35::Qwen35PagedForward {
             pool,
             meta,
-            layer0_query: None,
             cp: None,
             cp_decode,
         };
@@ -1530,10 +1366,9 @@ impl Qwen35CudaExecutor {
                 ..
             } = self;
             let pool = full_attn_kv.as_mut().expect("paged (gated)");
-            let mut rc = crate::qwen35::Qwen35RecallForward {
+            let mut rc = crate::qwen35::Qwen35PagedForward {
                 pool,
                 meta: &meta,
-                layer0_query: None,
                 cp: None,
                 cp_decode: None,
             };
@@ -1671,10 +1506,9 @@ impl Qwen35CudaExecutor {
             let st = mtp_exec.slots[slot].as_mut().expect("seeded (gated)");
             let mut rc = full_attn_kv
                 .as_mut()
-                .map(|pool| crate::qwen35::Qwen35RecallForward {
+                .map(|pool| crate::qwen35::Qwen35PagedForward {
                     pool,
                     meta: meta.as_ref().expect("paged (gated)"),
-                    layer0_query: None,
                     cp: None,
                     cp_decode: None,
                 });
@@ -1760,10 +1594,9 @@ impl Qwen35CudaExecutor {
             ..
         } = self;
         let pool = full_attn_kv.as_mut().expect("paged (checked)");
-        let mut rc = crate::qwen35::Qwen35RecallForward {
+        let mut rc = crate::qwen35::Qwen35PagedForward {
             pool,
             meta: &meta,
-            layer0_query: None,
             cp: None,
             cp_decode: None,
         };
@@ -2147,10 +1980,9 @@ impl Qwen35CudaExecutor {
             .map(|c| (c.slot, c.start, c.chain.len()))
             .collect();
         let meta = crate::loader::PageMeta::for_rows(&model.ctx, pool, &rows)?;
-        let mut rc = crate::qwen35::Qwen35RecallForward {
+        let mut rc = crate::qwen35::Qwen35PagedForward {
             pool,
             meta: &meta,
-            layer0_query: None,
             cp: None,
             cp_decode: None,
         };
@@ -2177,243 +2009,6 @@ impl Qwen35CudaExecutor {
             })
             .collect();
         model.dspark_verify_logits(&mut fwd, workspace, chains, &mut rc, &mut ds.taps)
-    }
-
-    /// One prefill row over the recall pool (`--kv-recall`) — the ONLY place the whole
-    /// recall cycle runs: decode never recalls, prefetch happens only here. After
-    /// return,
-    /// `recall[slot].recall_pages()` is the immutable working set for decode.
-    fn prefill_row_recall(
-        &mut self,
-        row: &infer_plan::PrefillRow,
-        position: u64,
-        host_kv: &mut dyn KvPool,
-    ) -> Result<(u32, Option<f32>)> {
-        let slot = row.slot;
-        let cfg = self.recall_cfg;
-        let cache_len = row.end_pos();
-        // The cycle runs at the tail of the LAST row only. Evicting on an earlier
-        // chunk leaves EVICTED_PAGE sentinels in the page table that the next
-        // chunk's prefill must still attend through — degenerate logits above the
-        // chunk size.
-        let final_row = row.is_final_chunk();
-        self.mirror_host_slot(host_kv, slot, cache_len)?;
-        let (meta, cp) = self.build_prefill_geometry(row)?;
-        // `rc` carries back the layer-0 query used for scoring below.
-        let (token, layer0_query) = {
-            let Self {
-                model,
-                slots,
-                workspace,
-                full_attn_kv,
-                ..
-            } = self;
-            let pool = full_attn_kv.as_mut().expect("full_attn_kv present");
-            let mut rc = crate::qwen35::Qwen35RecallForward {
-                pool,
-                meta: &meta,
-                layer0_query: final_row.then(Vec::new),
-                cp,
-                cp_decode: None,
-            };
-            let token = model.forward_tokens_recall(
-                &mut slots[slot],
-                workspace,
-                &row.tokens,
-                row.start_pos,
-                &row.params,
-                position,
-                penalty_of(&row.penalty_history, row.penalty_prompt_len),
-                &mut rc,
-            )?;
-            (token, rc.layer0_query)
-        };
-        let Some(layer0_query) = layer0_query else {
-            return Ok(token); // non-final chunk: plain paged prefill, no cycle
-        };
-
-        // `allow_prefetch=true` lets tier-resident blocks re-enter the working set.
-        let num_q_heads = self.model.local_q_heads();
-        let num_kv_heads = self.model.local_kv_heads();
-        let head_dim = self.model.config.head_dim;
-        let two_d = self.two_d_engaged();
-        // Under CP the ring prefill splits the prompt into contiguous slices, so
-        // only the tail-owning rank captures a query and every peer contributes
-        // zeros — summing lands that rank's vector on all of them exactly, with no
-        // second derivation of which rank owns the tail.
-        let mut layer0_query = layer0_query;
-        if two_d {
-            layer0_query.resize(num_q_heads * head_dim, 0.0);
-            let tp = &self.model.tp;
-            tp.reduce_f32_over(
-                tp.attn_cp(),
-                &self.model.ctx,
-                &mut layer0_query,
-                cuda_kernels::collective::ReduceOp::Sum,
-            )?;
-        }
-        let (evict_pages, prefetch_pages) = {
-            let Self {
-                recall,
-                full_attn_kv,
-                model,
-                ..
-            } = self;
-            let pool = full_attn_kv.as_ref().expect("full_attn_kv");
-            if let Some(state) = recall.get_mut(slot) {
-                state.recompute_recall_plan(
-                    &model.ctx,
-                    pool,
-                    slot,
-                    cache_len,
-                    &cfg,
-                    num_q_heads,
-                    num_kv_heads,
-                    head_dim,
-                    &layer0_query,
-                    /* allow_prefetch = */ true,
-                    two_d.then_some(&model.tp),
-                )?;
-                (state.take_evict_pages(), state.take_prefetch_pages())
-            } else {
-                (Vec::new(), Vec::new())
-            }
-        };
-
-        // Decode never prefetches — one batched sync point, here.
-        for logical in prefetch_pages {
-            let key = tier_block_u64(slot as u64, logical as u64);
-            let Some(tier) = self.recall_tier.as_mut() else {
-                break;
-            };
-            let payload = match tier.read(key) {
-                Ok(p) => p.into_owned(),
-                Err(_) => continue,
-            };
-            // Host owns the free stack: reinstate there, mirror down, refill.
-            let Some(new_page) = host_kv.reinstate_slot_page(slot, logical) else {
-                continue;
-            };
-            let seq_len = host_kv.seq_len(slot);
-            self.mirror_host_slot(host_kv, slot, seq_len)?;
-            if let Some(pool) = self.full_attn_kv.as_mut() {
-                pool.copy_pages_from_host(&self.model.ctx, &[new_page], &payload)?;
-            }
-        }
-
-        if let Some(state) = self.recall.get_mut(slot)
-            && let Some(pool) = self.full_attn_kv.as_ref()
-        {
-            state.resolve_recall_pages(pool, slot);
-        }
-
-        // Prefill drained the compute stream, so freeing physical pages here cannot
-        // race
-        // an in-flight attention.
-        for logical in evict_pages {
-            let physical = {
-                let pool = self.full_attn_kv.as_ref().expect("full_attn_kv");
-                pool.page_indices(slot)
-                    .get(logical)
-                    .copied()
-                    .filter(|&p| p != cuda_kernels::prelude::EVICTED_PAGE)
-            };
-            let Some(physical) = physical else {
-                continue;
-            };
-            let key = tier_block_u64(slot as u64, logical as u64);
-            let mirrored = {
-                let payload = {
-                    let pool = self.full_attn_kv.as_ref().expect("full_attn_kv");
-                    pool.copy_pages_to_host(&self.model.ctx, &[physical])?
-                };
-                match self.recall_tier.as_mut() {
-                    Some(tier) if !tier.is_full() => tier.insert(key, payload),
-                    _ => false,
-                }
-            };
-            if !mirrored {
-                continue; // tier full → keep page resident (no KV loss)
-            }
-            // Host first — it owns the free stack.
-            host_kv.evict_slot_page(slot, logical);
-            if let Some(pool) = self.full_attn_kv.as_mut() {
-                pool.evict_slot_page(slot, logical);
-            }
-        }
-        Ok(token)
-    }
-
-    /// One decode row over the recall pool: ZERO tier I/O, working set fixed at
-    /// prefill.
-    fn decode_row_recall(
-        &mut self,
-        row: &DecodeRow,
-        position: u64,
-        host_kv: &mut dyn KvPool,
-    ) -> Result<(u32, Option<f32>)> {
-        let slot = row.slot;
-        self.mirror_host_slot(host_kv, slot, row.kv_seq_len + 1)?;
-        let cache_len = row.kv_seq_len + 1;
-        let two_d = self.two_d_engaged();
-        let recall_pages: Vec<u32> = match self.recall.get(slot).and_then(|s| s.recall_pages()) {
-            Some(p) => p.to_vec(),
-            None => {
-                let pool = self.full_attn_kv.as_ref().expect("full_attn_kv");
-                if two_d {
-                    pool.page_indices(slot).to_vec()
-                } else {
-                    let num_pages = cache_len.div_ceil(pool.page_size);
-                    pool.page_indices(slot)[..num_pages].to_vec()
-                }
-            }
-        };
-        let meta = {
-            let pool = self.full_attn_kv.as_ref().expect("full_attn_kv");
-            let shard = infer_seam::ShardSpec::new(
-                self.model.tp.attn_cp_rank(),
-                self.model.tp.attn_cp_size(),
-            );
-            crate::loader::PageMeta::for_recall_decode(
-                &self.model.ctx,
-                pool,
-                cache_len,
-                &recall_pages,
-                shard,
-            )?
-        };
-        // dspark is rejected at set_kv_recall time, so the is_none guard is
-        // redundant here.
-        let cp_decode = if two_d {
-            self.model.cp_decode_handle()
-        } else {
-            None
-        };
-        let Self {
-            model,
-            slots,
-            workspace,
-            full_attn_kv,
-            ..
-        } = self;
-        let pool = full_attn_kv.as_mut().expect("full_attn_kv");
-        let mut rc = crate::qwen35::Qwen35RecallForward {
-            pool,
-            meta: &meta,
-            layer0_query: None,
-            cp: None,
-            cp_decode,
-        };
-        model.forward_tokens_recall(
-            &mut slots[slot],
-            workspace,
-            &[row.last_token],
-            row.kv_seq_len,
-            &row.params,
-            position,
-            penalty_of(&row.penalty_history, row.penalty_prompt_len),
-            &mut rc,
-        )
     }
 
     /// Stage per-step device scalars into the graph workspace and drop the
@@ -2572,10 +2167,9 @@ impl Qwen35CudaExecutor {
         let meta = paged_decode_meta[slot]
             .as_ref()
             .expect("persistent meta built above");
-        let mut rc = crate::qwen35::Qwen35RecallForward {
+        let mut rc = crate::qwen35::Qwen35PagedForward {
             pool,
             meta,
-            layer0_query: None,
             cp: None,
             cp_decode: None,
         };
@@ -2845,31 +2439,13 @@ impl Qwen35CudaExecutor {
                     crate::graph::CudaGraphState::new(self.model.ctx.stream.clone());
                 dg.baked[row.slot] = None;
             }
-            // Free the prior occupant's pages so a fresh prefill starts at logical page
-            // 0.
-            if self.recall_active() {
-                self.recall[row.slot].reset();
-                // Release keepalive-parked pages BEFORE freeing the slot: they are
-                // sentinels in the table, so `free_slot` alone would not recycle them.
-                let parked = std::mem::take(&mut self.recall_keepalive[row.slot]);
-                if let Some(pool) = self.full_attn_kv.as_mut() {
-                    for (_logical, physical) in parked {
-                        pool.release_evicted_page(physical);
-                    }
-                    pool.mirror_slot(row.slot, &[], 0)?;
-                }
-                // Stale L3 entries are left to the store's LRU: `reset()` cleared all
-                // reps, so a fresh occupant can never read a prior occupant's block
-                // before overwriting that key.
-            } else if let Some(pool) = self.full_attn_kv.as_mut() {
-                // Drop the mirror; the host pool owns these pages.
+            // Free the prior occupant's pages so a fresh prefill starts at logical
+            // page 0. Drop the mirror; the host pool owns these pages.
+            if let Some(pool) = self.full_attn_kv.as_mut() {
                 pool.mirror_slot(row.slot, &[], 0)?;
             }
         }
         let position = row.end_pos() as u64;
-        if self.recall_active() {
-            return self.prefill_row_recall(row, position, host_kv);
-        }
         // 2D ring prefill attends only to the current segment's rotating KV; it
         // cannot read prior segments' pool KV. The snapshotted path splits at
         // L*, leaving the tail segment blind to the prefix — fall through to
@@ -2992,9 +2568,6 @@ impl Qwen35CudaExecutor {
         let position = row.kv_seq_len.saturating_add(1) as u64;
         // Recall decode reads the fixed working set chosen at prefill; the seq_len
         // invariant above holds because the recall forward advances it in lockstep.
-        if self.recall_active() {
-            return self.decode_row_recall(row, position, host_kv);
-        }
         // The graph lane runs first when armed; the eager paged forward is the
         // correctness floor and the fallback for every gate miss.
         if allow_graph && let Some(token) = self.try_graph_decode_paged(row, position, host_kv)? {
@@ -3034,10 +2607,7 @@ impl Qwen35CudaExecutor {
             );
         }
 
-        if crate::runtime_flags::qwen35_batched_decode()
-            && !self.recall_active()
-            && self.model.tp.is_single()
-        {
+        if crate::runtime_flags::qwen35_batched_decode() && self.model.tp.is_single() {
             return self.submit_decode_batch_paged(rows, host_kv);
         }
         let mut tokens = Vec::with_capacity(rows.len());
@@ -3225,10 +2795,9 @@ impl Qwen35CudaExecutor {
         let result =
             crate::loader::PageMeta::for_slot(&model.ctx, pool, kv_slot, 0, input_ids.len())
                 .and_then(|meta| {
-                    let mut rc = crate::qwen35::Qwen35RecallForward {
+                    let mut rc = crate::qwen35::Qwen35PagedForward {
                         pool,
                         meta: &meta,
-                        layer0_query: None,
                         cp: None,
                         cp_decode: None,
                     };
@@ -3299,10 +2868,9 @@ impl Qwen35CudaExecutor {
         let result =
             crate::loader::PageMeta::for_slot(&model.ctx, pool, kv_slot, 0, input_ids.len())
                 .and_then(|meta| {
-                    let mut rc = crate::qwen35::Qwen35RecallForward {
+                    let mut rc = crate::qwen35::Qwen35PagedForward {
                         pool,
                         meta: &meta,
-                        layer0_query: None,
                         cp: None,
                         cp_decode: None,
                     };
@@ -3383,25 +2951,5 @@ mod tier_io_tests {
         assert!(speculative_chain_fits(12, 3, 16));
         assert!(!speculative_chain_fits(13, 3, 16));
         assert!(!speculative_chain_fits(usize::MAX, 1, usize::MAX));
-    }
-
-    #[test]
-    fn merge_prefers_direct_and_saturates_counters() {
-        let slot = kv_native_sys::TierIoStats {
-            mode: kv_native_sys::DiskIoMode::Mmap,
-            useful_read_bytes: u64::MAX,
-            failures: 2,
-            ..Default::default()
-        };
-        let recall = kv_native_sys::TierIoStats {
-            mode: kv_native_sys::DiskIoMode::Direct,
-            useful_read_bytes: 1,
-            failures: 3,
-            ..Default::default()
-        };
-        let merged = merge_tier_io_stats(&slot, &recall);
-        assert_eq!(merged.mode, infer_seam::KvTierIoMode::Direct);
-        assert_eq!(merged.useful_read_bytes, u64::MAX);
-        assert_eq!(merged.failures, 5);
     }
 }

@@ -589,15 +589,6 @@ struct Qwen35CompiledModel {
     // Cleared at start of each step, populated during forward().
     mutable std::vector<array> intermediates;
 
-    // Opt-in (Rust sets `recall_emit_query`). When on, `full_attn_step`
-    // stashes the layer-0 decode query — mean-pooled over the query heads
-    // of each KV group, shape [nkv, hd] for B=1 — so Rust can score the
-    // resident mean-key block reps (`q · rep`) one step stale and plan the
-    // next step's recall ranges. Tiny ([nkv, hd] floats); left untouched on
-    // the default path so the baseline forward is byte-identical.
-    bool recall_emit_query = false;
-    mutable array last_decode_query = array(0);
-    mutable bool has_last_decode_query = false;
 
     // When tape_mode is on, gdr_step() records innovation tapes for each GDR layer.
     bool tape_mode = false;
@@ -766,21 +757,6 @@ struct Qwen35CompiledModel {
 
         auto v = reshape(v_raw, {B, S, nkv, hd});
         v = transpose(v, {0, 2, 1, 3});
-
-        // Session KV-recall query emit (opt-in, layer-0 decode only). Stash this
-        // step's per-KV-head query — mean-pooled over the nh/nkv query heads in
-        // each group — so Rust can score the resident mean-key block reps next
-        // step (one-step stale, licensed). q here is [B, nh, S, hd] post-RoPE;
-        // B=S=1 at decode. Mean over the query heads of each KV group →
-        // [nkv, hd], the same head/space the cached mean-key reps live in. The
-        // array is held unevaluated; the getter evals + copies it (tiny).
-        if (recall_emit_query && full_layer_idx == 0 && S == 1 && B == 1) {
-            int group = nh / nkv;
-            auto q_grouped = reshape(q, {nkv, group, hd});  // B=S=1 collapse
-            auto q_mean = mean(q_grouped, /*axis=*/1, /*keepdims=*/false);  // [nkv, hd]
-            last_decode_query = astype(q_mean, float32);
-            has_last_decode_query = true;
-        }
 
         array k_full(0), v_full(0);
         int end = cache_pos + S;
@@ -1595,41 +1571,6 @@ void* qwen35_compiled_new() {
 
 void qwen35_compiled_free(void* model) {
     MLX_TRY_VOID(delete static_cast<Qwen35CompiledModel*>(model));
-}
-
-// Session KV-recall: enable/disable the layer-0 decode query emit. Off by
-// default → the forward path is byte-identical to the non-recall baseline.
-void qwen35_compiled_set_recall_emit_query(void* model, int32_t enabled) {
-    MLX_TRY_VOID({
-        auto* m = static_cast<Qwen35CompiledModel*>(model);
-        m->recall_emit_query = enabled != 0;
-        if (!m->recall_emit_query) {
-            m->has_last_decode_query = false;
-        }
-    });
-}
-
-// Session KV-recall: hand the most recent layer-0 decode query [nkv, hd] (B=1,
-// float32) to Rust as a fresh evaluated array. Returns -1 (and leaves *out null)
-// when no query has been stashed since the last enable. Mirrors the paged-step
-// `from_arr` ownership transfer: the caller owns and frees the returned array.
-int32_t qwen35_compiled_take_recall_query(void* model, mlx_array** out_query) {
-    auto* m = static_cast<Qwen35CompiledModel*>(model);
-    try {
-        mlx_clear_error();
-        if (!m->has_last_decode_query) {
-            *out_query = nullptr;
-            return -1;
-        }
-        array q = astype(m->last_decode_query, float32);
-        eval(q);
-        *out_query = from_arr(std::move(q));
-        return 0;
-    } catch (const std::exception& e) {
-        mlx_set_error(e.what());
-        *out_query = nullptr;
-        return -1;
-    }
 }
 
 int32_t qwen35_compiled_add_dense_weight(void* model, mlx_array* w) {

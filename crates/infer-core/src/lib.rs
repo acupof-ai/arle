@@ -9,12 +9,8 @@ use std::sync::OnceLock;
 mod planner;
 mod prefix;
 mod radix;
-mod recall;
 
 pub use radix::{BlockId, PrefixMatch, RadixCache};
-pub use recall::{
-    RecallConfig, RecallPlan, fold_key, plan_recall, recall_block_count, score_block,
-};
 
 use anyhow::Result;
 use infer_plan::{FinishReason, ForwardPlan, SamplingParams, SlotToken, StepOutput};
