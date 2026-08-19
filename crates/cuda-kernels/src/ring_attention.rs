@@ -286,6 +286,12 @@ pub fn classify_pair(q: PosRun, k: PosRun) -> Result<PairClass> {
     }
 }
 
+/// Bytes per `ffi::Half`. The FA3 pair route offsets RAW DEVICE ADDRESSES,
+/// so every run offset scales by this; dropping it silently halves the offset,
+/// which is exact for a shard's first run (row 0) and wrong for every later one.
+#[cfg(feature = "cuda")]
+const HALF: usize = std::mem::size_of::<ffi::Half>();
+
 // --- CP ring FA3 pair route (hd256 / sm_90) ---
 // Decomposes the (q_pos, k_pos) block into rectangular FA3 calls per the run
 // classification above: each visible (q_run, k_run) pair is one non-varlen
@@ -449,10 +455,13 @@ pub fn ring_block_fwd_merge_fa3(
                 let (op_ptr, _og) = o_pair.device_ptr_mut(stream);
                 let (lse_ptr, _lg) = lse_pair.device_ptr_mut(stream);
                 let (meta_ptr, _mg) = meta.device_ptr_mut(stream);
+                // Raw device addresses: the run offset is BYTES, not elements.
+                let q_off = (((bi * h * s) + pair.q.row) * d * HALF) as u64;
+                let kv_off = (((bi * hk * blk) + pair.k.row) * d * HALF) as u64;
                 let args = ffi::ArleFa3FwdHd256Args {
-                    q: (q_ptr + (((bi * h * s) + pair.q.row) * d) as u64) as *const ffi::Half,
-                    k: (k_ptr + (((bi * hk * blk) + pair.k.row) * d) as u64) as *const ffi::Half,
-                    v: (v_ptr + (((bi * hk * blk) + pair.k.row) * d) as u64) as *const ffi::Half,
+                    q: (q_ptr + q_off) as *const ffi::Half,
+                    k: (k_ptr + kv_off) as *const ffi::Half,
+                    v: (v_ptr + kv_off) as *const ffi::Half,
                     o: op_ptr as *mut ffi::Half,
                     softmax_lse: lse_ptr as *mut f32,
                     out_accum: std::ptr::null_mut(),
@@ -635,8 +644,8 @@ pub fn ring_block_bwd_fa3(
                     None => (std::ptr::null_mut(), std::ptr::null_mut(), None, None),
                 };
                 let (sem_ptr, _semg) = dq_sem.device_ptr_mut(stream);
-                let q_off = (((bi * h * s) + pair.q.row) * d) as u64;
-                let kv_off = (((bi * hk * blk) + pair.k.row) * d) as u64;
+                let q_off = (((bi * h * s) + pair.q.row) * d * HALF) as u64;
+                let kv_off = (((bi * hk * blk) + pair.k.row) * d * HALF) as u64;
                 let args = ffi::ArleFa3BwdHd256Args {
                     q: (q_ptr + q_off) as *const ffi::Half,
                     k: (k_ptr + kv_off) as *const ffi::Half,
