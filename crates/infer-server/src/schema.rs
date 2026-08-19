@@ -1178,7 +1178,8 @@ pub(crate) fn split_reasoning(text: &str, enable_thinking: bool) -> (Option<Stri
         }
     }
 
-    let reasoning_out = (!reasoning.trim().is_empty()).then(|| reasoning.trim().to_string());
+    let reasoning = reasoning.trim();
+    let reasoning_out = (!reasoning.is_empty()).then(|| reasoning.to_string());
     (reasoning_out, content.trim().to_string())
 }
 

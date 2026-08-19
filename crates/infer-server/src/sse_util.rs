@@ -202,13 +202,7 @@ impl StreamingReasoningSplitter {
                         buf = after;
                     }
                     None => {
-                        // Hold back the longest suffix that could grow into the closer.
-                        let held = (1..THINK_END.len())
-                            .rev()
-                            .map(|len| &THINK_END[..len])
-                            .find(|prefix| buf.ends_with(prefix))
-                            .map_or(0, str::len);
-                        self.pending = buf.split_off(buf.len() - held);
+                        self.hold_partial(&mut buf, THINK_END);
                         if let Some(d) = self.reasoning(&buf) {
                             deltas.push(d);
                         }
@@ -227,13 +221,7 @@ impl StreamingReasoningSplitter {
                         buf = after;
                     }
                     None => {
-                        // Hold back the longest suffix that could grow into the opener.
-                        let held = (1..THINK_START.len())
-                            .rev()
-                            .map(|len| &THINK_START[..len])
-                            .find(|prefix| buf.ends_with(prefix))
-                            .map_or(0, str::len);
-                        self.pending = buf.split_off(buf.len() - held);
+                        self.hold_partial(&mut buf, THINK_START);
                         if let Some(d) = self.content(&buf) {
                             deltas.push(d);
                         }
@@ -243,6 +231,16 @@ impl StreamingReasoningSplitter {
             }
         }
         deltas
+    }
+
+    /// Hold back the longest suffix of `buf` that could grow into `marker`.
+    fn hold_partial(&mut self, buf: &mut String, marker: &str) {
+        let held = (1..marker.len())
+            .rev()
+            .map(|len| &marker[..len])
+            .find(|prefix| buf.ends_with(prefix))
+            .map_or(0, str::len);
+        self.pending = buf.split_off(buf.len() - held);
     }
 
     /// Flush any held-back pending, labeled by the current phase.
