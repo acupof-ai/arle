@@ -774,7 +774,6 @@ impl Qwen35CudaExecutor {
         let decode_graph_armed = crate::runtime_flags::qwen35_decode_graph()
             && model.tp.is_single()
             && model.decode_graph_unsupported_reason().is_none();
-        let model_path_buf = model_path.as_ref().to_path_buf();
         let executor = Self {
             model,
             slots,
