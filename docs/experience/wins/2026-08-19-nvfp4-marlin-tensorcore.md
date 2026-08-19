@@ -144,6 +144,56 @@ gate_up against the scalar kernel's 1.382e-2, and 1.055e-2 at down for both.
 Mean `out/ref` 0.99999. Marlin is equal or better than the scalar path it
 replaces.
 
+## Config search: blocks-per-SM was pinned to 1
+
+`determine_exec_config` walked a tile table and filtered it through
+`is_valid_config`, then returned the first survivor as `{1, th_config}`.
+blocks_per_sm was never anything but 1, and the commented-out
+`m_tiles/n_tiles/k_tiles` lines show upstream left the selection unfinished.
+
+ncu at the decode shapes showed why that costs: issue slots 56%, ALU 52.6% of
+peak (Hopper's narrowest pipe, 2 warp-inst/cycle against the FMA pipe's 4, and
+where the FP4 unpack lands), achieved occupancy 12.5% capped by `Block Limit
+Shared Mem = 1` — Marlin opts into the full 232 KB while the tile needs ~45 KB.
+One block cannot fill the issue slots it holds shared memory for.
+
+The search now covers blocks_per_sm too, with the per-block budget
+`max_shared_mem / bps - 1024` (the split `marlin_mm` already applies at launch),
+ranked by waves = `div_ceil(n_tiles, sms * bps)`, ties to the larger tile. The
+winner falls out of the shape; nothing is pinned.
+
+| | decode |
+|---|---:|
+| NVFP4 Marlin | 57.7 tok/s |
+| NVFP4 Marlin + config search | **60.2 tok/s** |
+| Qwen3.6-27B-FP8 | 57.6 tok/s |
+
+NVFP4 leads FP8 by 4.5% on identical architectures while reading 56% of the
+weight bytes. Needle 512/4096 x3 = 6/6 exact.
+
+## Speculative decode: both paths are a large net loss here
+
+| configuration | decode |
+|---|---:|
+| no spec | **60.2 tok/s** |
+| `--spec-type dspark --mtp-draft-model Qwen3.6-27B-DFlash --dspark-block-size 6` | 16.8 (-72%) |
+| `--spec-type mtp --mtp-draft-tokens 2` | 13.9 (-77%) |
+
+MTP had already measured negative before this work (6.2 against 9.3 tok/s,
+-33%). It is now *worse* in relative terms, and the reason is instructive: the
+kernel work sped up single-token decode 6.5x, but the verify forward runs
+depth+1 tokens through the recurrent linear attention (gated-delta scan) on 48
+of 64 layers — untouched by any of it. The denominator shrank and the numerator
+did not.
+
+That also confirms the shape of what was optimized: dense MLP is now fast enough
+that linear attention dominates the forward, which is a different problem from
+the one this entry solves.
+
+DSpark loads and runs correctly (5-layer DFlash drafter, block 6, taps
+[1,16,31,46,61]) and is less bad than MTP, but the same verify cost applies.
+Neither is worth enabling at c=1 on this model.
+
 ## What is left
 
 57.9 against a target of 30% over FP8 (74.9 tok/s) leaves 1.29x. The bottleneck
