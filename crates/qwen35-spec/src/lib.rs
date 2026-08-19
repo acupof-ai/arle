@@ -676,20 +676,6 @@ fn default_full_attn_gated() -> bool {
 }
 
 impl Qwen35Config {
-    /// Train-side current truth: the active train stack only supports dense
-    /// MLP layers with full-attention blocks. Infer-side parsing remains
-    /// broader, but train entrypoints use this helper to fail early when a
-    /// hybrid or MoE config is passed in.
-    pub fn is_train_dense_full_attention_only(&self) -> bool {
-        self.num_hidden_layers > 0
-            && self.layer_types.len() == self.num_hidden_layers
-            && !self.is_moe()
-            && self
-                .layer_types
-                .iter()
-                .all(|&layer| layer == LayerType::FullAttention)
-    }
-
     /// Shared train-side contract for scratch pretrain. Dense full-attn and
     /// dense hybrid linear-attn are both allowed; MoE remains rejected.
     pub fn validate_train_scratch_contract(&self) -> Result<()> {
@@ -998,10 +984,6 @@ impl Qwen35Config {
             ));
         }
         Ok(())
-    }
-
-    pub fn is_stop_token(&self, token_id: u32) -> bool {
-        self.stop_token_ids.contains(&token_id)
     }
 
     pub fn load_stop_token_ids(model_dir: impl AsRef<Path>, fallback_eos: u32) -> Result<Vec<u32>> {

@@ -302,14 +302,6 @@ impl Gemma4TextConfig {
             .rposition(|kind| *kind == target)
     }
 
-    pub fn layer_intermediate_size(&self, layer_idx: usize) -> usize {
-        if self.use_double_wide_mlp && self.is_kv_shared_layer(layer_idx) {
-            self.intermediate_size.saturating_mul(2)
-        } else {
-            self.intermediate_size
-        }
-    }
-
     pub fn uses_moe_block(&self) -> bool {
         self.enable_moe_block
             || (self.num_experts.unwrap_or(0) > 0

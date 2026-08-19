@@ -199,11 +199,6 @@ impl GlmMoeDsaConfig {
             .unwrap_or_else(default_rope_theta)
     }
 
-    /// GLM uses plain `o_proj` (no output low-rank).
-    pub fn has_output_low_rank(&self) -> bool {
-        false
-    }
-
     /// Map this `glm_moe_dsa` config onto the shared [`crate::v4::DeepSeekV4Config`]
     /// runtime authority at the DeepSeek-V3.2 (V32) MLA shape (`head_dim =
     /// kv_lora_rank + qk_rope_head_dim = 576`). The result drives the shared
