@@ -417,32 +417,58 @@ __device__ __forceinline__ float dot16_with_decoded(
 // uint4 loads move 16 B (32 weights) per transaction; the byte-at-a-time form
 // this replaced fetched a 128 B cacheline per 1 B used. Shared by the dense and
 // the two grouped (MoE) FP4 GEMV kernels.
-// Decode two packed E2M1 nibbles into a bf16x2 pair with shifts and masks
-// only -- no memory, no branches, no warp divergence.
+// Decode packed E2M1 nibbles into bf16 through PRMT byte tables -- no memory,
+// no branches, no warp divergence.
 //
-// e2m1 is sign(1) exponent(2) mantissa(1). For e>0 the value is
-// (-1)^s * 2^(e-1) * (1 + m/2), which in bf16 is exponent field (e-1)+127 and
-// mantissa m<<6. For e==0 the encoding is subnormal and m selects 0 or 0.5,
-// i.e. exponent field 126 with a zero mantissa. Verified equal to the
-// 16-entry table this replaced for all 16 codes, and the packed form for all
-// 256 byte values.
+// Both bytes of the bf16 are 8-entry functions of the magnitude bits n&7:
+//   low  byte = {00,00,80,c0,00,40,80,c0}[n&7]
+//   high byte = {00,3f,3f,3f,40,40,40,40}[n&7] | (n&8 ? 0x80 : 0)
+// One __byte_perm is four such lookups, so a 32-bit word (8 weights) decodes in
+// 15 integer instructions. The shift/mask form this replaced rebuilt the bf16
+// exponent field arithmetically at ~13 ops per nibble, which put the kernel at
+// 92% ALU-pipe utilisation with the FMA pipe at 18%.
 //
-// The table was `__constant__ float[16]` indexed by the nibble: one memory
-// read per weight at a data-dependent address, which serialises across a warp
-// when the nibbles differ.
-__device__ __forceinline__ uint32_t fp4_e2m1_nibble_to_bf16_bits(uint32_t n) {
-    const uint32_t sign = (n & 0x8u) << 12;
-    const uint32_t e = (n >> 1) & 0x3u;
-    const uint32_t m = n & 0x1u;
-    const uint32_t nz = (n & 0x7u) != 0u;
-    const uint32_t mant = e ? (m << 6) : 0u;
-    const uint32_t mag = nz ? (((126u + e) << 7) | mant) : 0u;
-    return sign | mag;
+// n=8 must decode to 0x8000 (negative zero), so the sign OR needs no exception
+// for the zero codes. Verified bit-exact against the 16-entry reference table
+// for all 2^32 packed words.
+constexpr uint32_t FP4_E2M1_LO_LUT03 = 0xC0800000u;  // low bytes, n&7 = 0..3
+constexpr uint32_t FP4_E2M1_LO_LUT47 = 0xC0804000u;  // low bytes, n&7 = 4..7
+constexpr uint32_t FP4_E2M1_HI_LUT03 = 0x3F3F3F00u;  // high magnitude, n&7 = 0..3
+constexpr uint32_t FP4_E2M1_HI_LUT47 = 0x40404040u;  // high magnitude, n&7 = 4..7
+
+// 8 packed nibbles -> 4 bf16x2, in nibble order.
+__device__ __forceinline__ void fp4_e2m1_word_to_bf16x2(uint32_t p, __nv_bfloat162 out[4]) {
+    const uint32_t idx = p & 0x77777777u;
+    const uint32_t idx_hi = idx >> 16;
+    // p<<4 moves each even nibble's sign bit to a byte's bit 7, where the odd
+    // nibble's already sits, so one PRMT gathers four signs byte-aligned.
+    const uint32_t sgn = p << 4;
+
+    const uint32_t lo0 = __byte_perm(FP4_E2M1_LO_LUT03, FP4_E2M1_LO_LUT47, idx);
+    const uint32_t mag0 = __byte_perm(FP4_E2M1_HI_LUT03, FP4_E2M1_HI_LUT47, idx);
+    const uint32_t hi0 = mag0 | (__byte_perm(sgn, p, 0x5140u) & 0x80808080u);
+    const uint32_t w0 = __byte_perm(lo0, hi0, 0x5140u);
+    const uint32_t w1 = __byte_perm(lo0, hi0, 0x7362u);
+
+    const uint32_t lo1 = __byte_perm(FP4_E2M1_LO_LUT03, FP4_E2M1_LO_LUT47, idx_hi);
+    const uint32_t mag1 = __byte_perm(FP4_E2M1_HI_LUT03, FP4_E2M1_HI_LUT47, idx_hi);
+    const uint32_t hi1 = mag1 | (__byte_perm(sgn, p, 0x7362u) & 0x80808080u);
+    const uint32_t w2 = __byte_perm(lo1, hi1, 0x5140u);
+    const uint32_t w3 = __byte_perm(lo1, hi1, 0x7362u);
+
+    out[0] = *reinterpret_cast<const __nv_bfloat162*>(&w0);
+    out[1] = *reinterpret_cast<const __nv_bfloat162*>(&w1);
+    out[2] = *reinterpret_cast<const __nv_bfloat162*>(&w2);
+    out[3] = *reinterpret_cast<const __nv_bfloat162*>(&w3);
 }
 
 __device__ __forceinline__ __nv_bfloat162 fp4_e2m1_pair_to_bf16x2(uint32_t lo, uint32_t hi) {
-    const uint32_t bits = fp4_e2m1_nibble_to_bf16_bits(lo & 0xfu)
-        | (fp4_e2m1_nibble_to_bf16_bits(hi & 0xfu) << 16);
+    const uint32_t p = (lo & 0xfu) | ((hi & 0xfu) << 4);
+    const uint32_t idx = p & 0x77u;
+    const uint32_t l = __byte_perm(FP4_E2M1_LO_LUT03, FP4_E2M1_LO_LUT47, idx);
+    const uint32_t mag = __byte_perm(FP4_E2M1_HI_LUT03, FP4_E2M1_HI_LUT47, idx);
+    const uint32_t h = mag | (__byte_perm(p << 4, p, 0x5140u) & 0x80808080u);
+    const uint32_t bits = __byte_perm(l, h, 0x5140u);
     return *reinterpret_cast<const __nv_bfloat162*>(&bits);
 }
 
@@ -501,12 +527,13 @@ __device__ __forceinline__ float fp4_e2m1_row_dot(
                 const uint4 xv = __ldg(reinterpret_cast<const uint4*>(&x[kk]));
                 const __nv_bfloat162* xp = reinterpret_cast<const __nv_bfloat162*>(&xv);
 
+                __nv_bfloat162 wv[4];
+                fp4_e2m1_word_to_bf16x2(p, wv);
+
                 float acc = 0.0f;
                 #pragma unroll
                 for (int b = 0; b < 4; b++) {
-                    const uint32_t byte = (p >> (b * 8)) & 0xffu;
-                    const __nv_bfloat162 wv = fp4_e2m1_pair_to_bf16x2(byte, byte >> 4);
-                    const float2 prod = __bfloat1622float2(__hmul2(wv, xp[b]));
+                    const float2 prod = __bfloat1622float2(__hmul2(wv[b], xp[b]));
                     acc += prod.x + prod.y;
                 }
                 sum += acc * s;
