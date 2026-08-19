@@ -54,15 +54,15 @@ This is the blocker for using L2/L3 as a capacity extension under CP. The
 capacity mechanism exists and fires — it is refused every time. Single-GPU and
 plain TP are unaffected (no B2 decode, so `decode_recurrent_live` stays false).
 
-Two smaller observations from the same run, unexplained and worth their own
-look:
+One smaller observation from the same run:
 
-- The prefix cache was inert: `prefix_cache_lookups_total` 0 over 24 requests
-  with a shared per-session prefix, and no `prefix-lookup` line in the log.
-  With it inert, the radix route into the tier
-  (`demote_published_pages`) cannot fire either.
-- Turn-2+ TTFT still collapsed (1.71 s → 0.07 s median) despite zero prefix-cache
-  activity. Cause unknown.
+- Turn-2+ TTFT still collapsed (1.71 s → 0.07 s median) despite zero
+  prefix-cache activity. Cause unknown.
+
+The inert prefix cache in that run was not a defect: it is disabled by design
+under 2D (`lib.rs:1593`, `lib.rs:1674`, `planner.rs:417`) because the ring pass
+recomputes the whole prompt and the match+attach collectives deadlock
+cross-communicator. `prefix_cache_lookups_total` 0 is the intended reading.
 
 ## Rule
 
@@ -73,10 +73,10 @@ success counters can sit at exactly 0 through a full pressure run needs a
 failure counter next to them — a refusal that only logs is invisible at the
 metric surface where capacity decisions are actually read.
 
-## Follow-up
+## Status
 
-1. Make the whole-slot image CP-aware, or swap out the KV pages while sending
-   only the recurrent state to recompute. The KV is the large part and it is
-   already swappable; the recurrent pair is small.
-2. Count park refusals as a metric, not just a WARN.
-3. Explain the inert prefix cache in this configuration.
+Fixed 2026-08-19 — see
+[`wins/2026-08-19-cp-slot-park-works-l2-l3-nonzero.md`](../wins/2026-08-19-cp-slot-park-works-l2-l3-nonzero.md).
+Each rank round-trips its own 1/cp shard (`b2cc9b783`); capture no longer
+destroys the slot before the tier accepts it (`8e325e8dc`); refusals are
+counted as `kv_tier_slot_demote_failures_total`.
