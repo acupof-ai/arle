@@ -121,6 +121,38 @@ local pages, so none of it turned recall into a no-op.
 - `update_block_reps` sorts its readbacks by physical page and coalesces runs —
   ~1000 latency-bound 32 KB copies per 16K prefill collapse to a handful.
 
+## Perf (2026-08-19) — the repair is correct and the policy still does not pay
+
+The gates above are all correctness. The wall-clock measurement that was owed:
+TP=2 CP=2, Qwen3.6-27B, same binary, back-to-back on the same four GPUs. TTFT is
+the `max_tokens=1` wall; decode tok/s is `(N-1)/(wall_N - wall_1)`, which
+cancels prefill; conc-16 is aggregate generated tokens over wall.
+
+| ctx | TTFT on/off (s) | decode tok/s on/off | conc-16 tok/s on/off |
+|---|---|---|---|
+| 1,787 | 0.62 / 0.56 | 94.6 / 113.5 | 69.3 / 73.1 |
+| 7,412 | 2.50 / 2.36 | 144.7 / 150.6 | 23.0 / 24.1 |
+| 14,913 | 5.07 / 4.76 | 107.6 / 148.2 | 11.9 / 12.6 |
+| 30,913 | 10.59 / 10.07 | 112.8 / 145.3 | 5.8 / 6.2 |
+
+**Uniformly slower.** TTFT +5–11% is expected — the scoring cycle is pure added
+work at the prefill tail. Decode −4…−27% is not what the design predicts: the
+page table shrinks from ~2000 pages to 19, so attention should get cheaper.
+Re-running the ON arm at `mem_fraction_static 0.25` (L1 4112 pages instead of
+52885) did not recover it either — decode 86.4 / 122.1 / 117.8 / 123.4 tok/s at
+the same four lengths.
+
+Read plainly: shrinking the attended set buys nothing while HBM is not the
+binding constraint, and the cost is paid regardless. The remaining decode gap is
+un-attributed — the recall decode path is a separate route from the default one,
+and no profile was taken.
+
+**Consequence.** `--kv-recall`'s working-set restriction is no longer the
+direction; L2/L3 are wanted as a *lossless* capacity extension instead (full
+attention, only residency moves). The five correctness fixes stand on their own
+— they are what makes the tiering plumbing trustworthy — and the plumbing is
+what the new target reuses.
+
 ## Rule
 
 Order the fixes by what unblocks measurement, not by what looks most important.
