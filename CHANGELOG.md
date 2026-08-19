@@ -7,6 +7,8 @@ detail in the linked wins/errors entry. Oldest sections are condensed.
 - [docs/support-matrix.md](docs/support-matrix.md)
 
 ## [Unreleased]
+- **PERF — NVFP4 c=16 decode +51.7% (472.4 → 716.6 tok/s): the last four load sites had no Marlin repack, so 34% of FP8 GEMM calls stayed on the scalar GEMV** (2026-08-19; `1da4e0422`, [wins](docs/experience/wins/2026-08-19-nvfp4-marlin-remaining-load-sites.md), [rows](docs/baselines.md))
+- **VERDICT (reject) — Marlin decode occupancy: three tunings, all reverted. Warp occupancy 20.7% → 30.7% while throughput fell; the shared-memory over-request is real and removing it is a wash, and buying occupancy with registers spills** (2026-08-19; `7fc5e00c8`, [errors](docs/experience/errors/2026-08-19-marlin-decode-is-not-occupancy-limited.md))
 - **FIX — CP ring FA3 pair offsets are bytes: one dropped `* 2` gave 6.4× wrong training gradients for two days; cp=2 grad_norm 14.01 → 2.15 against cp=1's 2.20** (2026-08-19; `ad1192864`, [wins](docs/experience/wins/2026-08-19-cp-ring-fa3-byte-offset-fix.md), [errors](docs/experience/errors/2026-08-19-cp-training-gradients-regressed-and-the-gate-is-dead.md))
 - **ERROR — CP training gradients are 6.4× off single-card (grad_norm 14.01 vs 2.20, 27B cp=2 seq=32768); the 0.8B CP correctness arm has been unrunnable since FlashQLA went default-on 2026-08-05** (2026-08-19; [errors](docs/experience/errors/2026-08-19-cp-training-gradients-regressed-and-the-gate-is-dead.md), [rows](docs/baselines.md)) — bisect pending
 - **BASELINE (re-anchor) — cp=4 training seq ceiling measured at 229376; seq=131072 step is 17.5× the 2026-08-03 row (3100 s → 177.5 s)** (2026-08-19; `9c2c84675`, [wins](docs/experience/wins/2026-08-19-cp4-seq-ceiling-229376-and-17x-step.md), [rows](docs/baselines.md))
