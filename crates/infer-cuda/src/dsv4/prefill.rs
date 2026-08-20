@@ -184,6 +184,7 @@ impl Dsv4Model {
             }
             _ => None,
         };
+        let probe_positions: Vec<usize> = (0..seq_len).map(|i| start_pos + i).collect();
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             // SAFETY: fused hc_pre+rms_norm / plain rms_norm writes the full
             // [seq_len, hidden_size] buffer.
@@ -613,6 +614,7 @@ impl Dsv4Model {
             )?;
             keepalive.keep_hidden(&ffn_stream);
             stream = ffn_stream;
+            self.probe_capture(&stream, layer_idx, &probe_positions)?;
             // DSpark T3: capture the wide HC stream at this layer's OUTPUT for the
             // row being predicted. D2D copy only (graph-safe, no readback).
             if dspark
@@ -644,6 +646,7 @@ impl Dsv4Model {
             }
         }
 
+        self.probe_flush()?;
         if let Some(bufs) = dspark_prompt_bufs.take() {
             slot.dspark_prompt_taps = Some(Dsv4DsparkPromptTaps {
                 bufs,

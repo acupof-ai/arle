@@ -6,7 +6,7 @@ use super::*;
 impl Dsv4Model {
     /// Head recipe for stream rows `rows`: per-row HC fold (GLM `hc_mult == 1`
     /// identity) + final RMSNorm, written to `out` rows `0..rows.len()`.
-    pub(super) fn head_normed_rows(
+    pub(in crate::dsv4) fn head_normed_rows(
         &self,
         stream: &HiddenStates,
         rows: std::ops::Range<usize>,
@@ -187,7 +187,7 @@ impl Dsv4Model {
 
     /// Batched lm_head: `[m, hidden] → [m, vocab]`, one GEMM for every weight
     /// format (`dsv4_linear`).
-    pub(super) fn lm_head_project_batch(
+    pub(in crate::dsv4) fn lm_head_project_batch(
         &self,
         x: &HiddenStates,
         out: &mut HiddenStates,

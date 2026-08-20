@@ -486,6 +486,7 @@ impl Dsv4Model {
         };
         ctx.sync()?;
 
+        let probe = super::probe::Dsv4ProbeCapture::from_env(&ctx, &config, &lm_head, layers.len());
         Ok(Self {
             ctx,
             config,
@@ -500,6 +501,7 @@ impl Dsv4Model {
             mtp,
             spec_decode_on,
             tp,
+            probe: std::cell::RefCell::new(probe),
             #[cfg(all(feature = "cuda", feature = "nccl"))]
             mega_moe: None,
             #[cfg(feature = "deepep")]
