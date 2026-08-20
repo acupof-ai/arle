@@ -241,7 +241,11 @@ fn read_safetensors_tensor_names(path: &Path) -> Result<Vec<String>> {
 /// loop, so we run the production config (`num_nextn_predict_layers=1`) directly
 /// rather than forcing a hand-trimmed base-only config view. Called by
 /// [`crate::loader`] before any device I/O.
-pub(crate) fn ensure_loadable(config: &DeepSeekV4Config, spec_decode_on: bool) -> Result<()> {
+pub(crate) fn ensure_loadable(
+    config: &DeepSeekV4Config,
+    spec_decode_on: bool,
+    dspark_on: bool,
+) -> Result<()> {
     ensure!(
         config.num_key_value_heads == 1,
         "DSv4 MLA expects num_key_value_heads=1, got {}",
@@ -355,7 +359,7 @@ impl Dsv4Model {
         if let Some(draft_dir) = dspark_draft_model {
             merge_dspark_metadata(&mut config, draft_dir)?;
         }
-        ensure_loadable(&config, spec_decode_on)?;
+        ensure_loadable(&config, spec_decode_on, dspark_on)?;
 
         let moe_config = Self::moe_config_from_config(&config)?;
         let tp_cfg = *tp.config();
