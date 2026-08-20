@@ -14,18 +14,10 @@
 #include <cstdio>
 #include "../common.cuh"
 
-#define WARP_SIZE 32
 #define GEMV_THREADS 256
 #define GEMV_ROWS 4
 #define DSV4_BATCH_TILE 32
 #define QWEN_GEMV_BATCH_TILE 8
-
-__device__ __forceinline__ float warp_reduce_sum(float val) {
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1)
-        val += __shfl_xor_sync(0xffffffff, val, offset);
-    return val;
-}
 
 // Single-row W8/W4/W2 A16 GEMV is the B=1 special case of the batched twin
 // (w{8,4,2}a16_gemv_batch_kernel below): at batch_idx=0 the batch kernel's
