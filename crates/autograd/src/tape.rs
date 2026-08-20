@@ -473,31 +473,6 @@ impl fmt::Debug for Tape {
     }
 }
 
-/// Driver + pool occupancy at a point inside the backward. The forward-side
-/// `[ckpt-group-vram]` trace stops at the last group, so a backward that OOMs
-/// leaves no reading of its own transient.
-fn trace_backward_vram(label: &str, store: &TensorStore) {
-    if !crate::ops::checkpoint::trace_checkpoint_group_vram() {
-        return;
-    }
-    let Some((free, total)) = store.backend().device_mem_info() else {
-        return;
-    };
-    let pool = store.backend().mem_pool_stats();
-    let fmt = |value: Option<u64>| {
-        value.map_or_else(|| "n/a".to_string(), |bytes| format!("{}MiB", bytes >> 20))
-    };
-    eprintln!(
-        "[ckpt-bwd-vram] {label} used={}MiB free={}MiB pool_reserved={} pool_used_current={} \
-         live_tensors={}",
-        (total - free) >> 20,
-        free >> 20,
-        fmt(pool.map(|(reserved, _)| reserved)),
-        fmt(pool.map(|(_, used)| used)),
-        store.live_tensor_count(),
-    );
-}
-
 impl Tape {
     pub fn new() -> Self {
         Self {
@@ -1096,7 +1071,6 @@ impl Tape {
         ))?;
         let param_ids = &entry.input_ids[1..];
 
-        trace_backward_vram("seq_chunked_enter", store);
         let input_was_parked = store.checkpoint_parked(input_id)?;
         let need_input_grad = store.tensor(input_id)?.requires_grad;
         let mut d_input = need_input_grad
@@ -1107,7 +1081,6 @@ impl Tape {
         let mut start = 0;
         while start < seq {
             let end = (start + chunk).min(seq);
-            trace_backward_vram(&format!("chunk_enter {start}/{seq}"), store);
             let live_before = store.live_ids().into_iter().collect::<HashSet<_>>();
 
             // Detached chunk leaves: slice off a disabled scratch tape so the
@@ -1161,7 +1134,6 @@ impl Tape {
                 .collect();
             store.free_new_except(&live_before, &keep)?;
             self.trim_after_checkpoint_replay(store)?;
-            trace_backward_vram(&format!("chunk_done {end}/{seq}"), store);
             start = end;
         }
         // A never-parked input must not pay a fresh full-seq DtoH + sync here.
