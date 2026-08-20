@@ -26,6 +26,7 @@ The doc tree is reference docs + `plans/` + `research/` + experience wins/errors
 | Package boundaries | [architecture.md](architecture.md) |
 | DSv4/GLM path map | [architecture-dsv4.md](architecture-dsv4.md) |
 | Qwen3.6-27B performance chain | [perf-qwen36-27b.md](perf-qwen36-27b.md) |
+| CUDA operator organization | [plans/2026-08-20-cuda-operator-organization.md](plans/2026-08-20-cuda-operator-organization.md) |
 | Bench + trace process | [bench-and-trace-spec.md](bench-and-trace-spec.md) |
 | Rolling baselines | [baselines.md](baselines.md) |
 | Env / flags | [environment.md](environment.md) |
