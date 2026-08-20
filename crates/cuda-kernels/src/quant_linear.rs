@@ -1,4 +1,4 @@
-//! Dense quantized-linear launch helpers (FP8 family).
+//! Dense quantized-linear launch helpers (FP8 and NVFP4 families).
 
 use anyhow::{Result, anyhow, ensure};
 use cudarc::driver::{DevicePtr, DevicePtrMut};
@@ -298,6 +298,121 @@ pub unsafe fn marlin_fp8_to_e4m3(
         )
         .result()
         .map_err(|e| anyhow!("marlin_fp8_to_e4m3_cuda failed at [n,k]=[{n},{k}]: {e}"))
+    }
+}
+
+/// NVFP4 Marlin GEMM: C[m,n] = X[m,k] @ dequant(Marlin-packed W). The S0E5M3
+/// group scales sit in the tail of `packed`, after the `n*k/2` tile bytes
+/// (`repack_for_marlin_fp4`); `global` is the single BF16 that carries the
+/// per-tensor scale times the dequant bias. Scratch contract matches
+/// `marlin_fp8_gemm`.
+#[allow(clippy::too_many_arguments)]
+pub fn marlin_fp4_gemm(
+    ctx: &DeviceContext,
+    input: &impl DevicePtr<bf16>,
+    packed: &impl DevicePtr<u8>,
+    global: &impl DevicePtr<u16>,
+    output: &mut impl DevicePtrMut<bf16>,
+    c_tmp: &impl DevicePtr<f32>,
+    workspace: &impl DevicePtr<i32>,
+    m: usize,
+    n: usize,
+    k: usize,
+    group_size: usize,
+) -> Result<()> {
+    let nk = extent(n, k, "marlin_fp4_gemm weight")?;
+    ensure!(
+        group_size > 0
+            && packed.len() >= nk / 2 + nk / group_size
+            && input.len() >= extent(m, k, "marlin_fp4_gemm input")?
+            && output.len() >= extent(m, n, "marlin_fp4_gemm output")?,
+        "marlin_fp4_gemm buffers do not cover [m,n,k,gs]=[{m},{n},{k},{group_size}]: packed={} input={} output={}",
+        packed.len(),
+        input.len(),
+        output.len()
+    );
+    let (x_ptr, _gx) = input.device_ptr(&ctx.stream);
+    let (packed_ptr, _gp) = packed.device_ptr(&ctx.stream);
+    // The S0E5M3 group scales sit in the tail of the same allocation; see
+    // `repack_for_marlin_fp4`.
+    let scales_ptr = packed_ptr + (nk / 2) as u64;
+    let (global_ptr, _gg) = global.device_ptr(&ctx.stream);
+    let (out_ptr, _go) = output.device_ptr_mut(&ctx.stream);
+    let (c_tmp_ptr, _gc) = c_tmp.device_ptr(&ctx.stream);
+    let (ws_ptr, _gw) = workspace.device_ptr(&ctx.stream);
+    // SAFETY: lengths checked above; packed/global are the layout
+    // `repack_for_marlin_fp4` produced for these dims.
+    unsafe {
+        ffi::marlin_fp4_gemm_cuda(
+            x_ptr as *const Half,
+            packed_ptr as *const u32,
+            scales_ptr as *const u8,
+            global_ptr as *const u16,
+            out_ptr as *mut Half,
+            c_tmp_ptr as *mut f32,
+            ws_ptr as *mut i32,
+            i32::try_from(m)?,
+            i32::try_from(n)?,
+            i32::try_from(k)?,
+            i32::try_from(group_size)?,
+            ctx.stream.cu_stream(),
+        )
+        .result()
+        .map_err(|e| anyhow!("marlin_fp4_gemm_cuda failed at [m,n,k]=[{m},{n},{k}]: {e}"))
+    }
+}
+
+/// Widen Marlin NVFP4 tiles + their S0E5M3 scale tail to the dense E4M3 `[n, k]`
+/// bytes DeepGEMM's dense NT entry takes as B, with the per-128x128-block power
+/// of two divided out (`block_pow2` — DeepGEMM takes it back as `sfb`).
+/// `inv_lift` undoes the per-tensor power of two the repack multiplied into the
+/// stored scale byte.
+///
+/// # Safety
+/// `output` must cover `n * k` E4M3 bytes on `ctx`'s stream and stay live
+/// through the launch (it is the caller's reusable scratch).
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn dequantize_fp4_marlin_to_fp8(
+    ctx: &DeviceContext,
+    packed: &impl DevicePtr<u8>,
+    global: &impl DevicePtr<f32>,
+    block_pow2: &impl DevicePtr<f32>,
+    inv_lift: f32,
+    output: RawDevicePtr<u8>,
+    n: usize,
+    k: usize,
+    group_size: usize,
+) -> Result<()> {
+    let nk = extent(n, k, "dequantize_fp4_marlin_to_fp8 weight")?;
+    ensure!(
+        group_size > 0
+            && packed.len() >= nk / 2 + nk / group_size
+            && global.len() >= 1
+            && block_pow2.len() >= (n.div_ceil(128) + 1) * k.div_ceil(128),
+        "dequantize_fp4_marlin_to_fp8 buffers do not cover [n,k,gs]=[{n},{k},{group_size}]: packed={} global={} block_pow2={}",
+        packed.len(),
+        global.len(),
+        block_pow2.len()
+    );
+    let (packed_ptr, _gp) = packed.device_ptr(&ctx.stream);
+    let (global_ptr, _gg) = global.device_ptr(&ctx.stream);
+    let (pow2_ptr, _gb) = block_pow2.device_ptr(&ctx.stream);
+    // SAFETY: source lengths checked above; the output scratch is the caller's
+    // contract.
+    unsafe {
+        ffi::dequantize_fp4_marlin_to_fp8_cuda(
+            packed_ptr as *const u8,
+            global_ptr as *const f32,
+            pow2_ptr as *const f32,
+            inv_lift,
+            output.as_mut_ptr(),
+            i32::try_from(n)?,
+            i32::try_from(k)?,
+            i32::try_from(group_size)?,
+            ctx.stream.cu_stream(),
+        )
+        .result()
+        .map_err(|e| anyhow!("dequantize_fp4_marlin_to_fp8_cuda failed at [n,k]=[{n},{k}]: {e}"))
     }
 }
 
