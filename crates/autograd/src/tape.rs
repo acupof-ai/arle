@@ -1135,9 +1135,11 @@ impl Tape {
                 .chain(d_param.iter().filter_map(ChunkSum::id))
                 .collect();
             store.free_new_except(&live_before, &keep)?;
-            self.trim_after_checkpoint_replay(store)?;
             start = end;
         }
+        // Once per region, not per chunk: each trim is a cudaFree/cudaMalloc
+        // round-trip and per-chunk trimming starves the backward at long seq.
+        self.trim_after_checkpoint_replay(store)?;
         // A never-parked input must not pay a fresh full-seq DtoH + sync here.
         if self.offload_checkpoints && input_was_parked {
             store.offload_checkpoint_to_host(input_id)?;
