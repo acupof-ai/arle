@@ -450,6 +450,15 @@ pub fn ring_block_attention_bwd_raw(
     )
 }
 
+/// Whether the real sm_90 FA3 shim is linked into this binary (the stub's
+/// marker is 0). Pure host query; per-device capability is the caller's check.
+#[cfg(feature = "cuda")]
+pub fn fa3_kernel_marker() -> bool {
+    // SAFETY: pure host query exported by both the real shim and the stub.
+    let marker = unsafe { ffi::arle_fa3_real_kernel_marker_cuda() };
+    marker == 1
+}
+
 #[cfg(feature = "cuda")]
 pub fn ring_fa3_route(
     stream: &CudaStream,
@@ -461,8 +470,7 @@ pub fn ring_fa3_route(
         && q_pos.len() == dims.q_rows
         && k_pos.len() == dims.blk_len
         && ring_fa3_is_sm90(stream);
-    // SAFETY: pure host query exported by both the real shim and the stub.
-    let real = unsafe { ffi::arle_fa3_real_kernel_marker_cuda() } == 1;
+    let real = fa3_kernel_marker();
     if shape_ok && !real {
         // A stub build falls back silently at ~1/3 the speed, and such a run has
         // already been mistaken for an FA3 measurement.

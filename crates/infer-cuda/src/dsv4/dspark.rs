@@ -21,6 +21,7 @@
 
 use super::layer_block::HcHalf;
 use super::*;
+use cuda_kernels::attention as flash_kv;
 
 /// Per-slot draft context cache. Per stage, ONE `latent_kv` buffer (K==V) laid
 /// out `[position][head_dim]`, LINEAR from `ctx_base` (`row = abs − ctx_base`).
@@ -246,29 +247,26 @@ impl Dsv4Model {
             let (qo_ptr, _gqo) = q_prepped.data.device_ptr_mut(&ctx.stream);
             let (lat_ptr, _gl) = df.latent_kv[stage_idx].data.device_ptr_mut(&ctx.stream);
             let (sp_ptr, _gs) = pos_dev.device_ptr(&ctx.stream);
-            // SAFETY: q/latent buffers sized above; k_out targets the contiguous
+            // q/latent buffers sized above; k_out targets the contiguous
             // latent_kv block slice (row block_start-ctx_base .. +block < cap).
-            unsafe {
-                ffi::dsv4_prepare_qk_fused_batch_start_pos_cuda(
-                    q_ptr as *const ffi::Half,
-                    k_ptr as *const ffi::Half,
-                    qo_ptr as *mut ffi::Half,
-                    (lat_ptr + latent_off) as *mut ffi::Half,
-                    block as i32,
-                    local_heads as i32,
-                    head_dim as i32,
-                    rope_dim as i32,
-                    sp_ptr as *const i32,
-                    eps,
-                    config.rope_theta,
-                    0,
-                    rope.factor,
-                    rope.beta_fast,
-                    rope.beta_slow,
-                    ctx.stream.cu_stream(),
-                )
-                .result()?;
-            }
+            flash_kv::dsv4_prepare_qk_fused_batch_start_pos_raw(
+                &ctx.stream,
+                q_ptr,
+                k_ptr,
+                qo_ptr,
+                lat_ptr + latent_off,
+                block as i32,
+                local_heads as i32,
+                head_dim as i32,
+                rope_dim as i32,
+                sp_ptr,
+                eps,
+                config.rope_theta,
+                0,
+                rope.factor,
+                rope.beta_fast,
+                rope.beta_slow,
+            )?;
         }
 
         // Dense non-causal MLA-latent attention over [context ++ block]: every
@@ -285,28 +283,25 @@ impl Dsv4Model {
             // params mirror the forward q/latent prep above (block_abs frame,
             // cr==0 → original_seq_len 0, no YaRN) so the value-tail inverse-RoPE
             // exactly un-rotates the forward-rotated latent tail.
-            unsafe {
-                ffi::dsv4_dspark_draft_attention_cuda(
-                    q_ptr as *const ffi::Half,
-                    lat_ptr as *const ffi::Half,
-                    o_ptr as *mut ffi::Half,
-                    kv_len as i32,
-                    block as i32,
-                    local_heads as i32,
-                    head_dim as i32,
-                    nope_dim as i32,
-                    rope_dim as i32,
-                    block_abs as i32,
-                    sm_scale,
-                    config.rope_theta,
-                    0,
-                    rope.factor,
-                    rope.beta_fast,
-                    rope.beta_slow,
-                    ctx.stream.cu_stream(),
-                )
-                .result()?;
-            }
+            flash_kv::dsv4_dspark_draft_attention_raw(
+                &ctx.stream,
+                q_ptr,
+                lat_ptr,
+                o_ptr,
+                kv_len as i32,
+                block as i32,
+                local_heads as i32,
+                head_dim as i32,
+                nope_dim as i32,
+                rope_dim as i32,
+                block_abs as i32,
+                sm_scale,
+                config.rope_theta,
+                0,
+                rope.factor,
+                rope.beta_fast,
+                rope.beta_slow,
+            )?;
         }
 
         // SAFETY: uninit device scratch; fully written by mla_oproj.
@@ -748,29 +743,26 @@ impl Dsv4Model {
         let (qo_ptr, _gqo) = q_dummy.data.device_ptr_mut(&ctx.stream);
         let (lat_ptr, _gl) = df.latent_kv[stage_idx].data.device_ptr_mut(&ctx.stream);
         let (sp_ptr, _gs) = pos_dev.device_ptr(&ctx.stream);
-        // SAFETY: k_out targets latent_kv[start-ctx_base .. +rows] (< cap); q_out
+        // k_out targets latent_kv[start-ctx_base .. +rows] (< cap); q_out
         // reuses the discarded dummy buffer (in-place RoPE on garbage q).
-        unsafe {
-            ffi::dsv4_prepare_qk_fused_batch_start_pos_cuda(
-                qo_ptr as *const ffi::Half,
-                k_ptr as *const ffi::Half,
-                qo_ptr as *mut ffi::Half,
-                (lat_ptr + latent_off) as *mut ffi::Half,
-                rows as i32,
-                local_heads as i32,
-                head_dim as i32,
-                rope_dim as i32,
-                sp_ptr as *const i32,
-                eps,
-                self.config.rope_theta,
-                0,
-                rope.factor,
-                rope.beta_fast,
-                rope.beta_slow,
-                ctx.stream.cu_stream(),
-            )
-            .result()?;
-        }
+        flash_kv::dsv4_prepare_qk_fused_batch_start_pos_raw(
+            &ctx.stream,
+            qo_ptr,
+            k_ptr,
+            qo_ptr,
+            lat_ptr + latent_off,
+            rows as i32,
+            local_heads as i32,
+            head_dim as i32,
+            rope_dim as i32,
+            sp_ptr,
+            eps,
+            self.config.rope_theta,
+            0,
+            rope.factor,
+            rope.beta_fast,
+            rope.beta_slow,
+        )?;
         Ok(())
     }
 }

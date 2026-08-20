@@ -5,7 +5,7 @@
 
 use anyhow::{Result, anyhow, ensure};
 use cuda_kernels::prelude::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStates};
-use cuda_kernels::{ffi, tensor_ops};
+use cuda_kernels::tensor_ops;
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 use half::bf16;
 use std::sync::OnceLock;
@@ -168,19 +168,15 @@ pub(crate) fn gemm_batch(
     let (w_ptr, _gw) = weight.data.device_ptr(&ctx.stream);
     let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
     let (out_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
-    // SAFETY: ptrs from live device allocations sized to the dims passed.
-    unsafe {
-        ffi::gemm_cuda(
-            w_ptr as *const ffi::Half,
-            x_ptr as *const ffi::Half,
-            out_ptr as *mut ffi::Half,
-            weight.rows as i32,
-            x.seq_len as i32,
-            weight.cols as i32,
-            ctx.stream.cu_stream(),
-        )
-        .result()?;
-    }
+    tensor_ops::gemm_bf16_raw(
+        &ctx.stream,
+        w_ptr,
+        x_ptr,
+        out_ptr,
+        weight.rows as i32,
+        x.seq_len as i32,
+        weight.cols as i32,
+    )?;
     Ok(())
 }
 
@@ -239,19 +235,15 @@ pub(crate) fn gemv(
     let (out_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
     // Routed as an N=1 cuBLASLt GEMM: ~2× the hand-written kernel's lm_head
     // bandwidth, and capture-safe (fixed workspace, warm-cached algo).
-    // SAFETY: ptrs from live device allocations sized to the dims passed.
-    unsafe {
-        ffi::gemm_cuda(
-            w_ptr as *const ffi::Half,
-            x_ptr as *const ffi::Half,
-            out_ptr as *mut ffi::Half,
-            weight.rows as i32,
-            1,
-            weight.cols as i32,
-            ctx.stream.cu_stream(),
-        )
-        .result()?;
-    }
+    tensor_ops::gemm_bf16_raw(
+        &ctx.stream,
+        w_ptr,
+        x_ptr,
+        out_ptr,
+        weight.rows as i32,
+        1,
+        weight.cols as i32,
+    )?;
     Ok(())
 }
 
@@ -414,19 +406,15 @@ where
     let (w_ptr, _gw) = a_t.device_ptr(&ctx.stream);
     let (x_ptr, _gx) = b.device_ptr(&ctx.stream);
     let (out_ptr, _go) = out.device_ptr_mut(&ctx.stream);
-    // SAFETY: ptrs from live device allocations sized to the dims passed.
-    unsafe {
-        ffi::gemm_cuda(
-            w_ptr as *const ffi::Half,
-            x_ptr as *const ffi::Half,
-            out_ptr as *mut ffi::Half,
-            cols as i32,
-            rows as i32,
-            rank as i32,
-            ctx.stream.cu_stream(),
-        )
-        .result()?;
-    }
+    tensor_ops::gemm_bf16_raw(
+        &ctx.stream,
+        w_ptr,
+        x_ptr,
+        out_ptr,
+        cols as i32,
+        rows as i32,
+        rank as i32,
+    )?;
     Ok(())
 }
 

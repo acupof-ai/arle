@@ -9,7 +9,8 @@ use cuda_kernels::prelude::{
     DeviceContext, DeviceMatrix, DeviceVec, HiddenStates, HiddenStatesView, PagedKVPool,
 };
 use cuda_kernels::quant_linear as cuda_ql;
-use cuda_kernels::tensor::{WeightFormat, cache_ptr};
+use cuda_kernels::tensor::{RawDevicePtr, WeightFormat, cache_ptr};
+use cuda_kernels::tensor_ops;
 use cuda_kernels::{BandPage, KVFormat, TokenKVPool};
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 use deepseek_spec::{DeepSeekV4AttentionMode, DeepSeekV4Config};
@@ -1059,34 +1060,32 @@ where
     let (out_ptr, _out_guard) = out.device_ptr_mut(&ctx.stream);
     // SAFETY: ptrs from live device allocations sized to the dims passed.
     unsafe {
-        ffi::dsv4_deepgemm_pack_quantize_bf16_to_fp8_cuda(
-            input_ptr as *const ffi::Half,
-            fp8_ptr as *mut u8,
-            scale_ptr as *mut f32,
-            active_experts_ptr as *const i32,
-            active_offsets_ptr as *const i32,
-            active_counts_ptr as *const i32,
+        cuda_moe::dsv4_deepgemm_pack_quantize_bf16_to_fp8(
+            RawDevicePtr::from_raw(input_ptr),
+            RawDevicePtr::from_raw(fp8_ptr),
+            RawDevicePtr::from_raw(scale_ptr),
+            RawDevicePtr::from_raw(active_experts_ptr),
+            RawDevicePtr::from_raw(active_offsets_ptr),
+            RawDevicePtr::from_raw(active_counts_ptr),
             1,
-            i32::try_from(scratch.max_m)?,
-            i32::try_from(k)?,
-            i32::try_from(scratch.scale_stride_m)?,
+            scratch.max_m,
+            k,
+            scratch.scale_stride_m,
             stream,
         )
-        .result()
         .map_err(|e| anyhow!("DSv4 decode proj activation quantize failed: {e}"))?;
-        ffi::dsv4_deepgemm_fp8_gemm_nt_cuda(
-            fp8_ptr as *const u8,
-            scale_ptr as *const f32,
-            weight_ptr as *const u8,
-            weight_scale_ptr as *const f32,
-            out_ptr as *mut ffi::Half,
-            i32::try_from(m)?,
-            i32::try_from(cache.rows)?,
-            i32::try_from(cache.cols)?,
-            i32::try_from(scratch.scale_stride_m)?,
+        cuda_moe::dsv4_deepgemm_fp8_gemm_nt(
+            RawDevicePtr::from_raw(fp8_ptr),
+            RawDevicePtr::from_raw(scale_ptr),
+            RawDevicePtr::from_raw(weight_ptr),
+            RawDevicePtr::from_raw(weight_scale_ptr),
+            RawDevicePtr::from_raw(out_ptr),
+            m,
+            cache.rows,
+            cache.cols,
+            scratch.scale_stride_m,
             stream,
         )
-        .result()
         .map_err(|e| anyhow!("DSv4 decode proj DeepGEMM dense failed: {e}"))?;
     }
     Ok(())
@@ -1254,34 +1253,32 @@ fn prefill_proj_deepgemm_group_scratch(
     let (out_ptr, _out_guard) = scratch.oproj_group_out.device_ptr_mut(&ctx.stream);
     // SAFETY: ptrs from live device allocations sized to the dims passed.
     unsafe {
-        ffi::dsv4_deepgemm_pack_quantize_bf16_to_fp8_cuda(
-            input_ptr as *const ffi::Half,
-            fp8_ptr as *mut u8,
-            scale_ptr as *mut f32,
-            active_experts_ptr as *const i32,
-            active_offsets_ptr as *const i32,
-            active_counts_ptr as *const i32,
+        cuda_moe::dsv4_deepgemm_pack_quantize_bf16_to_fp8(
+            RawDevicePtr::from_raw(input_ptr),
+            RawDevicePtr::from_raw(fp8_ptr),
+            RawDevicePtr::from_raw(scale_ptr),
+            RawDevicePtr::from_raw(active_experts_ptr),
+            RawDevicePtr::from_raw(active_offsets_ptr),
+            RawDevicePtr::from_raw(active_counts_ptr),
             1,
-            i32::try_from(m)?,
-            i32::try_from(k)?,
-            i32::try_from(scale_stride_m)?,
+            m,
+            k,
+            scale_stride_m,
             stream,
         )
-        .result()
         .map_err(|e| anyhow!("DSv4 grouped wo_a activation quantize failed: {e}"))?;
-        ffi::dsv4_deepgemm_fp8_gemm_nt_cuda(
-            fp8_ptr as *const u8,
-            scale_ptr as *const f32,
-            weight_ptr as *const u8,
-            weight_scale_ptr as *const f32,
-            out_ptr as *mut ffi::Half,
-            i32::try_from(m)?,
-            i32::try_from(n)?,
-            i32::try_from(k)?,
-            i32::try_from(scale_stride_m)?,
+        cuda_moe::dsv4_deepgemm_fp8_gemm_nt(
+            RawDevicePtr::from_raw(fp8_ptr),
+            RawDevicePtr::from_raw(scale_ptr),
+            RawDevicePtr::from_raw(weight_ptr),
+            RawDevicePtr::from_raw(weight_scale_ptr),
+            RawDevicePtr::from_raw(out_ptr),
+            m,
+            n,
+            k,
+            scale_stride_m,
             stream,
         )
-        .result()
         .map_err(|e| anyhow!("DSv4 grouped wo_a DeepGEMM dense failed: {e}"))?;
     }
     Ok(())
@@ -4160,7 +4157,6 @@ fn glm_absorb_q(
         w_kc.weight_format
     );
     let mut q_absorbed = HiddenStates::zeros(ctx, local_heads * head_dim, token_count)?;
-    let stream = ctx.stream.cu_stream();
     {
         let (w_ptr, _gw) = w_kc.data.device_ptr(&ctx.stream);
         let (q_ptr, _gq) = q_raw.data.device_ptr(&ctx.stream);
@@ -4172,20 +4168,17 @@ fn glm_absorb_q(
             let w_h = unsafe { (w_ptr as *const ffi::Half).add(h * kv_lora * qk_nope) };
             // SAFETY: h < local_heads keeps this per-head offset in bounds.
             let out_h = unsafe { (out_ptr as *mut ffi::Half).add(h * head_dim) };
-            // SAFETY: per-head bf16 GEMM weight[kv_lora, qk_nope] · q_nope[qk_nope, 1].
-            unsafe {
-                ffi::gemm_cuda(
-                    w_h,
-                    q_nope_h,
-                    out_h,
-                    kv_lora as i32,
-                    token_count as i32,
-                    qk_nope as i32,
-                    stream,
-                )
-                .result()
-                .map_err(|e| anyhow!("GLM glm_absorb_q head {h} gemm failed: {e}"))?;
-            }
+            // Per-head bf16 GEMM weight[kv_lora, qk_nope] · q_nope[qk_nope, 1].
+            tensor_ops::gemm_bf16_raw(
+                &ctx.stream,
+                w_h as u64,
+                q_nope_h as u64,
+                out_h as u64,
+                kv_lora as i32,
+                token_count as i32,
+                qk_nope as i32,
+            )
+            .map_err(|e| anyhow!("GLM glm_absorb_q head {h} gemm failed: {e}"))?;
         }
     }
     for h in 0..local_heads {
@@ -4250,7 +4243,6 @@ fn glm_absorb_v(
         w_vc.weight_format
     );
     let mut v_out = HiddenStates::zeros(ctx, local_heads * v_head, token_count)?;
-    let stream = ctx.stream.cu_stream();
     {
         let (w_ptr, _gw) = w_vc.data.device_ptr(&ctx.stream);
         let (a_ptr, _ga) = local_attn.data.device_ptr(&ctx.stream);
@@ -4262,21 +4254,17 @@ fn glm_absorb_v(
             let w_h = unsafe { (w_ptr as *const ffi::Half).add(h * v_head * kv_lora) };
             // SAFETY: h < local_heads keeps this per-head offset in bounds.
             let out_h = unsafe { (out_ptr as *mut ffi::Half).add(h * v_head) };
-            // SAFETY: per-head bf16 GEMM weight[v_head, kv_lora] · attn_out[kv_lora,
-            // 1].
-            unsafe {
-                ffi::gemm_cuda(
-                    w_h,
-                    a_h,
-                    out_h,
-                    v_head as i32,
-                    token_count as i32,
-                    kv_lora as i32,
-                    stream,
-                )
-                .result()
-                .map_err(|e| anyhow!("GLM glm_absorb_v head {h} gemm failed: {e}"))?;
-            }
+            // Per-head bf16 GEMM weight[v_head, kv_lora] · attn_out[kv_lora, 1].
+            tensor_ops::gemm_bf16_raw(
+                &ctx.stream,
+                w_h as u64,
+                a_h as u64,
+                out_h as u64,
+                v_head as i32,
+                token_count as i32,
+                kv_lora as i32,
+            )
+            .map_err(|e| anyhow!("GLM glm_absorb_v head {h} gemm failed: {e}"))?;
         }
     }
     keepalive.keep_hidden(&v_out);
@@ -5539,7 +5527,6 @@ fn dsv4_wo_a_grouped_linear(
         let (in_ptr, _ig) = in_g.data.device_ptr_mut(&ctx.stream);
         let (out_ptr, _og) = out_g.data.device_ptr_mut(&ctx.stream);
         let (dst_ptr, _dg) = latent.data.device_ptr_mut(&ctx.stream);
-        let stream = ctx.stream.cu_stream();
         for group in 0..shape.groups {
             {
                 flash_kv::dsv4_oproj_group_gather_raw(
@@ -5557,20 +5544,16 @@ fn dsv4_wo_a_grouped_linear(
             // `[g*rows, (g+1)*rows)` of the `[groups*rows, cols]` dense `wo_a`,
             // i.e. offset `g*rows*cols` bf16 elements from the base pointer.
             let w_g = unsafe { (wo_a_base as *const ffi::Half).add(group * rows * cols) };
-            // SAFETY: ptrs from live device allocations sized to the dims passed.
-            unsafe {
-                ffi::gemm_cuda(
-                    w_g,
-                    in_ptr as *const ffi::Half,
-                    out_ptr as *mut ffi::Half,
-                    i32::try_from(rows)?,
-                    i32::try_from(seq)?,
-                    i32::try_from(cols)?,
-                    stream,
-                )
-                .result()
-                .map_err(|e| anyhow!("DSv4 dense grouped O-LoRA gemm failed: {e}"))?;
-            }
+            tensor_ops::gemm_bf16_raw(
+                &ctx.stream,
+                w_g as u64,
+                in_ptr,
+                out_ptr,
+                i32::try_from(rows)?,
+                i32::try_from(seq)?,
+                i32::try_from(cols)?,
+            )
+            .map_err(|e| anyhow!("DSv4 dense grouped O-LoRA gemm failed: {e}"))?;
             {
                 flash_kv::dsv4_oproj_group_scatter_raw(
                     &ctx.stream,
@@ -6352,29 +6335,25 @@ fn compressor_fp32_probe(
             let (x, _xg) = hidden.data.device_ptr(&ctx.stream);
             let (kv, _kg) = kv_raw.device_ptr_mut(&ctx.stream);
             let (score, _sg) = score_raw.device_ptr_mut(&ctx.stream);
-            // SAFETY: dense BF16 matrices and outputs match the checked M/N/K shapes.
-            unsafe {
-                ffi::gemm_bf16_f32_cuda(
-                    wkv as *const ffi::Half,
-                    x as *const ffi::Half,
-                    kv as *mut f32,
-                    width as i32,
-                    token_count as i32,
-                    hidden.hidden_dim as i32,
-                    ctx.stream.cu_stream(),
-                )
-                .result()?;
-                ffi::gemm_bf16_f32_cuda(
-                    wgate as *const ffi::Half,
-                    x as *const ffi::Half,
-                    score as *mut f32,
-                    width as i32,
-                    token_count as i32,
-                    hidden.hidden_dim as i32,
-                    ctx.stream.cu_stream(),
-                )
-                .result()?;
-            }
+            // Dense BF16 matrices and outputs match the checked M/N/K shapes.
+            tensor_ops::gemm_bf16_f32_raw(
+                &ctx.stream,
+                wkv,
+                x,
+                kv,
+                width as i32,
+                token_count as i32,
+                hidden.hidden_dim as i32,
+            )?;
+            tensor_ops::gemm_bf16_f32_raw(
+                &ctx.stream,
+                wgate,
+                x,
+                score,
+                width as i32,
+                token_count as i32,
+                hidden.hidden_dim as i32,
+            )?;
         }
         let rope_dim = config.qk_rope_head_dim;
         let start_pos_i32 = i32::try_from(start_pos).map_err(|_| {
@@ -8056,28 +8035,27 @@ fn csa_select_official(
                 let (logits_ptr, _og) = shared.logits.device_ptr_mut(&ctx.stream);
                 // SAFETY: ptrs from live device allocations sized to the dims passed.
                 unsafe {
-                    ffi::dsv4_deepgemm_fp8_paged_mqa_logits_fused_cache_cuda(
-                        q_ptr as *const u8,
-                        cache_ptr_u8 as *const u8,
-                        weights_ptr as *const f32,
-                        lens_ptr as *const i32,
-                        page_ptr as *const i32,
-                        sched_ptr as *const i32,
-                        logits_ptr as *mut f32,
-                        i32::try_from(tlen)?,
+                    cuda_moe::dsv4_deepgemm_fp8_paged_mqa_logits_fused_cache(
+                        RawDevicePtr::from_raw(q_ptr),
+                        RawDevicePtr::from_raw(cache_ptr_u8),
+                        RawDevicePtr::from_raw(weights_ptr),
+                        RawDevicePtr::from_raw(lens_ptr),
+                        RawDevicePtr::from_raw(page_ptr),
+                        RawDevicePtr::from_raw(sched_ptr),
+                        RawDevicePtr::from_raw(logits_ptr),
+                        tlen,
                         1,
-                        i32::try_from(local_index_heads)?,
-                        i32::try_from(config.index_head_dim)?,
-                        i32::try_from(shared.num_pages)?,
+                        local_index_heads,
+                        config.index_head_dim,
+                        shared.num_pages,
                         64,
-                        i32::try_from(shared.num_pages * 64)?,
-                        i32::try_from(shared.logits_stride)?,
-                        i32::try_from(shared.num_pages)?,
-                        i32::try_from(64 * (config.index_head_dim + std::mem::size_of::<f32>()))?,
-                        i32::try_from(shared.num_sms)?,
+                        shared.num_pages * 64,
+                        shared.logits_stride,
+                        shared.num_pages,
+                        64 * (config.index_head_dim + std::mem::size_of::<f32>()),
+                        shared.num_sms,
                         ctx.stream.cu_stream(),
                     )
-                    .result()
                     .map_err(|e| anyhow!("DSv4 official DSA paged logits failed: {e}"))?;
                 }
             }
@@ -8306,28 +8284,27 @@ pub(crate) fn csa_select_official_batched(
             .ok_or_else(|| anyhow!("DSv4 batched DSA num_kv_blocks overflow"))?;
         // SAFETY: ptrs from live device allocations sized to the dims passed.
         unsafe {
-            ffi::dsv4_deepgemm_fp8_paged_mqa_logits_fused_cache_cuda(
-                q_ptr as *const u8,
-                cache_ptr_u8 as *const u8,
-                weights_ptr as *const f32,
-                lens_ptr as *const i32,
-                block_ptr as *const i32,
-                sched_ptr as *const i32,
-                logits_ptr as *mut f32,
-                i32::try_from(n)?,
+            cuda_moe::dsv4_deepgemm_fp8_paged_mqa_logits_fused_cache(
+                RawDevicePtr::from_raw(q_ptr),
+                RawDevicePtr::from_raw(cache_ptr_u8),
+                RawDevicePtr::from_raw(weights_ptr),
+                RawDevicePtr::from_raw(lens_ptr),
+                RawDevicePtr::from_raw(block_ptr),
+                RawDevicePtr::from_raw(sched_ptr),
+                RawDevicePtr::from_raw(logits_ptr),
+                n,
                 1,
-                i32::try_from(local_index_heads)?,
-                i32::try_from(config.index_head_dim)?,
-                i32::try_from(num_kv_blocks)?,
+                local_index_heads,
+                config.index_head_dim,
+                num_kv_blocks,
                 64,
-                i32::try_from(num_pages * 64)?,
-                i32::try_from(shared.logits_stride)?,
-                i32::try_from(num_pages)?,
-                i32::try_from(64 * (config.index_head_dim + std::mem::size_of::<f32>()))?,
-                i32::try_from(shared.num_sms)?,
+                num_pages * 64,
+                shared.logits_stride,
+                num_pages,
+                64 * (config.index_head_dim + std::mem::size_of::<f32>()),
+                shared.num_sms,
                 ctx.stream.cu_stream(),
             )
-            .result()
             .map_err(|e| anyhow!("DSv4 batched DSA paged logits failed: {e}"))?;
         }
     }

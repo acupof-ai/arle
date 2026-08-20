@@ -1,7 +1,7 @@
 //! Embedding / norm / elementwise launch helpers.
 
 use anyhow::{Result, anyhow, ensure};
-use cudarc::driver::{DevicePtr, DevicePtrMut};
+use cudarc::driver::{CudaStream, DevicePtr, DevicePtrMut};
 use half::bf16;
 
 use crate::ffi::{self, Half};
@@ -925,5 +925,63 @@ pub fn split_qkv(
         .map_err(|e| {
             anyhow!("split_qkv_cuda failed at [batch,q,kv]=[{batch_size},{q_dim},{kv_dim}]: {e}")
         })
+    }
+}
+
+/// Dense BF16 GEMM over raw device addresses: `Y[n,m] = X[n,k] @ W[m,k]^T`
+/// (`gemm_cuda`'s M is the weight-row dim). Raw-pointer variant for callers
+/// that offset into a larger allocation (per-head / per-group blocks); typed
+/// callers use [`crate::quant_linear::gemm_bf16`].
+pub fn gemm_bf16_raw(
+    stream: &CudaStream,
+    w_ptr: u64,
+    x_ptr: u64,
+    y_ptr: u64,
+    m: i32,
+    n: i32,
+    k: i32,
+) -> Result<()> {
+    // SAFETY: the caller holds the originating allocations live on `stream` and
+    // asserts they cover [m,k] / [n,k] / [n,m] bf16 at the given offsets.
+    unsafe {
+        ffi::gemm_cuda(
+            w_ptr as *const Half,
+            x_ptr as *const Half,
+            y_ptr as *mut Half,
+            m,
+            n,
+            k,
+            stream.cu_stream(),
+        )
+        .result()
+        .map_err(|e| anyhow!("gemm_cuda failed at [m,n,k]=[{m},{n},{k}]: {e}"))
+    }
+}
+
+/// [`gemm_bf16_raw`] with an FP32 output row (`gemm_bf16_f32_cuda`): BF16
+/// inputs, `Y[n,m]` f32.
+pub fn gemm_bf16_f32_raw(
+    stream: &CudaStream,
+    w_ptr: u64,
+    x_ptr: u64,
+    y_ptr: u64,
+    m: i32,
+    n: i32,
+    k: i32,
+) -> Result<()> {
+    // SAFETY: the caller holds the originating allocations live on `stream` and
+    // asserts they cover [m,k] / [n,k] bf16 and [n,m] f32 at the given offsets.
+    unsafe {
+        ffi::gemm_bf16_f32_cuda(
+            w_ptr as *const Half,
+            x_ptr as *const Half,
+            y_ptr as *mut f32,
+            m,
+            n,
+            k,
+            stream.cu_stream(),
+        )
+        .result()
+        .map_err(|e| anyhow!("gemm_bf16_f32_cuda failed at [m,n,k]=[{m},{n},{k}]: {e}"))
     }
 }

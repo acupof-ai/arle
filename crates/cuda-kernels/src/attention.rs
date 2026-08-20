@@ -2420,6 +2420,57 @@ pub fn dsv4_prepare_qk_fused_batch_start_pos_raw(
     }
 }
 
+/// Dense non-causal DSpark draft attention over the head-shared MLA latent:
+/// `q` `[block_size, local_heads, head_dim]`, `latent_kv` `[kv_len, head_dim]`
+/// (K==V, broadcast over heads), `out` `[block_size, local_heads, head_dim]`.
+/// The value tail (`rope_dim`) is inverse-RoPE'd at `base_start_pos + token`
+/// with the same RoPE params the caller's forward q/latent prep used.
+#[allow(clippy::too_many_arguments)]
+pub fn dsv4_dspark_draft_attention_raw(
+    stream: &CudaStream,
+    q_ptr: u64,
+    latent_kv_ptr: u64,
+    out_ptr: u64,
+    kv_len: i32,
+    block_size: i32,
+    local_heads: i32,
+    head_dim: i32,
+    nope_dim: i32,
+    rope_dim: i32,
+    base_start_pos: i32,
+    sm_scale: f32,
+    rope_base: f32,
+    original_seq_len: i32,
+    factor: f32,
+    beta_fast: f32,
+    beta_slow: f32,
+) -> Result<()> {
+    // SAFETY: the caller holds q/latent/out live on `stream` at the shapes above.
+    unsafe {
+        ffi::dsv4_dspark_draft_attention_cuda(
+            q_ptr as *const ffi::Half,
+            latent_kv_ptr as *const ffi::Half,
+            out_ptr as *mut ffi::Half,
+            kv_len,
+            block_size,
+            local_heads,
+            head_dim,
+            nope_dim,
+            rope_dim,
+            base_start_pos,
+            sm_scale,
+            rope_base,
+            original_seq_len,
+            factor,
+            beta_fast,
+            beta_slow,
+            stream.cu_stream(),
+        )
+        .result()
+        .map_err(|e| anyhow!("dsv4_dspark_draft_attention_cuda failed at kv_len={kv_len}: {e}"))
+    }
+}
+
 /// In-place attention-output inverse-RoPE for the FlashMLA paths (host
 /// `start_pos`). NEVER on the legacy hybrid path (double-apply).
 #[allow(clippy::too_many_arguments)]
