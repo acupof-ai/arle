@@ -1020,6 +1020,7 @@ impl Tape {
                     store.offload_checkpoint_to_host(hidden_id)?;
                 }
                 self.trim_after_checkpoint_replay(store)?;
+                self.trim_if_hoarding(store)?;
                 if std::env::var("ARLE_OPD_VRAM_TRACE").is_ok_and(|v| v != "0")
                     && let Some((free, total)) = store.backend().device_mem_info()
                 {
@@ -1154,6 +1155,7 @@ impl Tape {
         // Once per region, not per chunk: each trim is a cudaFree/cudaMalloc
         // round-trip and per-chunk trimming starves the backward at long seq.
         self.trim_after_checkpoint_replay(store)?;
+        self.trim_if_hoarding(store)?;
         // A never-parked input must not pay a fresh full-seq DtoH + sync here.
         if self.offload_checkpoints && input_was_parked {
             store.offload_checkpoint_to_host(input_id)?;
@@ -1178,6 +1180,21 @@ impl Tape {
     /// without offload (nothing freed to reclaim).
     fn trim_after_checkpoint_replay(&self, store: &TensorStore) -> Result<()> {
         if self.offload_checkpoints {
+            store.backend().trim_memory_pool()?;
+        }
+        Ok(())
+    }
+
+    /// Trim when the pool hoards more than 8 GB it cannot re-cut for new
+    /// sizes: chunked backward churn rebuilds a ~35 GB unreusable hoard by
+    /// mid-backward (observed at global 131,072: driver 95 GB vs pool_used
+    /// 60 GB at a layer exit, next alloc OOM). Scope-granular, so the
+    /// per-chunk trim starvation cannot recur.
+    fn trim_if_hoarding(&self, store: &TensorStore) -> Result<()> {
+        const HOARD_TRIM_BYTES: u64 = 8 << 30;
+        if let Some((reserved, used)) = store.backend().mem_pool_stats()
+            && reserved.saturating_sub(used) > HOARD_TRIM_BYTES
+        {
             store.backend().trim_memory_pool()?;
         }
         Ok(())
