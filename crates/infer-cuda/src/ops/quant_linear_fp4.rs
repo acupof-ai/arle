@@ -1,8 +1,8 @@
 use anyhow::{Result, anyhow, bail};
-use cuda_kernels::ffi;
 use cuda_kernels::prelude::{DeviceContext, DeviceMatrix};
+use cuda_kernels::quant_linear as cuda_ql;
 use cuda_kernels::tensor::{RawDevicePtr, WeightFormat, cache_ptr};
-use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
+use cudarc::driver::CudaSlice;
 use half::bf16;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -123,23 +123,19 @@ fn try_fp4_deepgemm_gemm(
     // the widen on the same stream.
     let Some(b) = with_e4m3_weight_scratch(ctx, n * k, |dst| -> Result<RawDevicePtr<u8>> {
         let dst_ptr = cache_ptr(dst, ctx);
-        qwen_quant_profile(ctx, "qwen/fp4/dense_widen_fp8", m, n, k, || {
-            // SAFETY: ptrs from live device allocations sized to the dims passed.
-            unsafe {
-                ffi::dequantize_fp4_marlin_to_fp8_cuda(
-                    cache_ptr(packed, ctx).as_ptr(),
-                    cache_ptr(global, ctx).as_ptr(),
-                    cache_ptr(sfb, ctx).as_ptr(),
-                    weight.fp4_marlin_scale_lift_inv,
-                    dst_ptr.as_mut_ptr(),
-                    n as i32,
-                    k as i32,
-                    weight.group_size as i32,
-                    ctx.stream.cu_stream(),
-                )
-                .result()
-                .map_err(|e| anyhow!("NVFP4 widen-to-E4M3 kernel failed: {e}"))
-            }
+        // SAFETY: the E4M3 scratch covers n*k and lives across the launch.
+        qwen_quant_profile(ctx, "qwen/fp4/dense_widen_fp8", m, n, k, || unsafe {
+            cuda_ql::dequantize_fp4_marlin_to_fp8(
+                ctx,
+                packed,
+                global,
+                sfb,
+                weight.fp4_marlin_scale_lift_inv,
+                dst_ptr,
+                n,
+                k,
+                weight.group_size,
+            )
         })?;
         Ok(dst_ptr)
     })?
@@ -167,41 +163,23 @@ fn marlin_fp4_gemm_raw(
     };
     let n = weight.rows; // output dim
     let k = weight.cols; // contraction
-    let (packed_ptr, _gp) = packed.device_ptr(&ctx.stream);
-    // The S0E5M3 group scales sit in the tail of the same allocation; see
-    // `repack_for_marlin_fp4`.
-    let scales_ptr = packed_ptr + (n * k / 2) as u64;
-    let (global_ptr, _gg) = global.device_ptr(&ctx.stream);
-    let (x_ptr, _gx) = input.device_ptr(&ctx.stream);
-    let (out_ptr, _go) = output.device_ptr_mut(&ctx.stream);
-    let stream = ctx.stream.cu_stream();
     with_marlin_scratch(ctx, |scratch| {
         let c_tmp = scratch.c_tmp.as_ref().unwrap();
         let workspace = scratch.workspace.as_ref().unwrap();
-        let (c_tmp_ptr, _gc) = c_tmp.device_ptr(&ctx.stream);
-        let (ws_ptr, _gw) = workspace.device_ptr(&ctx.stream);
         qwen_quant_profile(ctx, "qwen/fp4/marlin_gemm", m, n, k, || {
-            // SAFETY: all ptrs from live device allocations; packed/scales/global
-            // sized by repack_for_marlin_fp4 for these dims, x=[m,k], out=[m,n],
-            // c_tmp/workspace sized to the SM max.
-            unsafe {
-                ffi::marlin_fp4_gemm_cuda(
-                    x_ptr as *const ffi::Half,
-                    packed_ptr as *const u32,
-                    scales_ptr as *const u8,
-                    global_ptr as *const u16,
-                    out_ptr as *mut ffi::Half,
-                    c_tmp_ptr as *mut f32,
-                    ws_ptr as *mut i32,
-                    m as i32,
-                    n as i32,
-                    k as i32,
-                    weight.group_size as i32,
-                    stream,
-                )
-                .result()
-                .map_err(|e| anyhow!("NVFP4 Marlin GEMM failed: {e}"))
-            }
+            cuda_ql::marlin_fp4_gemm(
+                ctx,
+                input,
+                packed,
+                global,
+                output,
+                c_tmp,
+                workspace,
+                m,
+                n,
+                k,
+                weight.group_size,
+            )
         })?;
         Ok(())
     })?;
