@@ -24,6 +24,8 @@ pub mod ring_attention;
 #[cfg(feature = "cuda")]
 pub mod tensor;
 #[cfg(feature = "cuda")]
+pub mod tensor_ops;
+#[cfg(feature = "cuda")]
 pub mod turboquant_state;
 
 #[cfg(feature = "cuda")]

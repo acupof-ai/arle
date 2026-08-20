@@ -2153,30 +2153,19 @@ impl Qwen35Model {
 
         let normed_out = normed_out.get(&self.ctx, z_dim, rows)?;
         {
-            let (x_ptr, _g0) = gdr_out.data.device_ptr(&self.ctx.stream);
-            let (w_ptr, _g1) = attn.norm_weight.device_ptr(&self.ctx.stream);
-            let (gate_ptr, _g2) = z.data.device_ptr(&self.ctx.stream);
-            let (o_ptr, _g3) = normed_out.data.device_ptr_mut(&self.ctx.stream);
-            // SAFETY: gdr_out/norm/z/out valid on ctx.stream; per-head layout from
-            // config.
             // One block per `[val_dim]` slice, so the grid must cover all
             // rows*Vh (token, head) slices; `weight` is a per-[Vd] broadcast.
             crate::profile::profile_op(&self.ctx, "linear/norm", Some(linear_idx), rows, || {
-                // SAFETY: ptrs from live device allocations sized to the dims passed.
-                unsafe {
-                    ffi::rms_norm_gated_cuda(
-                        x_ptr as *const ffi::Half,
-                        w_ptr as *const f32,
-                        gate_ptr as *const ffi::Half,
-                        o_ptr as *mut ffi::Half,
-                        (z_dim / c.linear_value_head_dim * rows) as i32,
-                        c.linear_value_head_dim as i32,
-                        c.rms_norm_eps,
-                        self.ctx.stream.cu_stream(),
-                    )
-                    .result()?;
-                }
-                Ok(())
+                cuda_kernels::tensor_ops::rms_norm_gated(
+                    &self.ctx,
+                    &gdr_out.data,
+                    &attn.norm_weight,
+                    &z.data,
+                    &mut normed_out.data,
+                    z_dim / c.linear_value_head_dim * rows,
+                    c.linear_value_head_dim,
+                    c.rms_norm_eps,
+                )
             })?;
         }
 

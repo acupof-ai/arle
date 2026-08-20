@@ -907,20 +907,14 @@ impl Qwen35Model {
         {
             let matrix = self.lora_matrix_mut(layer_idx, projection)?;
             let mut out_view = matrix.data.slice_mut(window);
-            let (delta_ptr, _gd) = delta_view.device_ptr(&ctx.stream);
-            let (out_ptr, _go) = out_view.device_ptr_mut(&ctx.stream);
-            // SAFETY: ptrs from live device allocations sized to `needed`.
-            unsafe {
-                ffi::add_scaled_row_cuda(
-                    delta_ptr as *const ffi::Half,
-                    out_ptr as *mut ffi::Half,
-                    needed as i32,
-                    0,
-                    scale,
-                    ctx.stream.cu_stream(),
-                )
-            }
-            .result()
+            cuda_kernels::tensor_ops::add_scaled_row(
+                &ctx,
+                &delta_view,
+                &mut out_view,
+                needed,
+                0,
+                scale,
+            )
             .map_err(|e| anyhow!("layer {layer_idx} {label}: LoRA scaled add failed: {e}"))?;
         }
 
