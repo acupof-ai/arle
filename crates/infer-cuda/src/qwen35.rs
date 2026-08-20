@@ -92,8 +92,7 @@ fn qwen35_fa3_enabled(ctx: &DeviceContext) -> bool {
     if !crate::runtime_flags::qwen35_fa3() {
         return false;
     }
-    // SAFETY: pure host query exported by both the real shim and the stub.
-    let real = unsafe { ffi::arle_fa3_real_kernel_marker_cuda() } == 1;
+    let real = cuda_kernels::ring_attention::fa3_kernel_marker();
     if !real {
         static LOGGED: OnceLock<()> = OnceLock::new();
         LOGGED.get_or_init(|| {

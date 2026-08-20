@@ -4,7 +4,6 @@
 //! `ExpertSplit::single` is the dev/typecheck fallback.
 
 use anyhow::{Result, anyhow, ensure};
-use cuda_kernels::ffi;
 use cuda_kernels::prelude::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStates};
 use cuda_kernels::tensor::Dsv4Fp8DeepGemmWeightCache;
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};

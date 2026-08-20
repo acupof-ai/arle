@@ -3496,6 +3496,16 @@ pub struct RawDevicePtr<T> {
 unsafe impl<T> Send for RawDevicePtr<T> {}
 
 impl<T> RawDevicePtr<T> {
+    /// Wrap an already-extracted device address (a `device_ptr()` value whose
+    /// guard the caller still holds). The caller asserts the originating
+    /// allocation holds `T` and outlives all uses of this pointer.
+    pub fn from_raw(ptr: u64) -> RawDevicePtr<T> {
+        RawDevicePtr {
+            ptr,
+            _marker: PhantomData,
+        }
+    }
+
     /// Get as const pointer for kernel read parameters.
     pub fn as_ptr(self) -> *const T {
         self.ptr as *const T
