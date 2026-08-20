@@ -1,6 +1,12 @@
 # Marlin stored the model twice: 18.7 GB back, 8.4x on the 32K chain — CUDA, 2026-08-20
 
-> Status: Shipped
+> Status: Shipped, then superseded the same day. `free_quant_source_after_marlin`
+> and `QWEN_MARLIN_MAX_M` named below no longer exist: the frees moved inline into
+> the two repacks, and prefill moved off Marlin entirely. The 23.06 GB resident
+> here is now 22.36 GB with the prefill arms on — see
+> [2026-08-20-nvfp4-widen-to-e4m3-deepgemm-prefill.md](2026-08-20-nvfp4-widen-to-e4m3-deepgemm-prefill.md).
+> The mechanism this entry established — a repack that keeps its source stores
+> the model twice — held, and was violated again within hours.
 
 ## Context
 

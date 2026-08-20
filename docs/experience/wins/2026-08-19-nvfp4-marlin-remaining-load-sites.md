@@ -1,6 +1,9 @@
 # NVFP4: the last four load sites onto Marlin — +51.7% at c=16, CUDA, 2026-08-19
 
-> Status: Shipped
+> Status: Shipped. The c=16 ceiling this entry records (+13.3%) is still the
+> decode ceiling; the prefill half was later moved off Marlin
+> ([2026-08-20-nvfp4-widen-to-e4m3-deepgemm-prefill.md](2026-08-20-nvfp4-widen-to-e4m3-deepgemm-prefill.md)),
+> which does not reach these decode shapes.
 
 ## Context
 

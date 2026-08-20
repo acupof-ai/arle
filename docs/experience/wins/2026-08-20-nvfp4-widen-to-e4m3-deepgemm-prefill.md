@@ -1,8 +1,7 @@
 # NVFP4 prefill on the FP8 tensor cores: widen the nibbles to E4M3 — CUDA, 2026-08-20
 
-> Status: Landed as `a5df06c7c` and re-verified on the merged HEAD `834a87aed`.
-> Mechanism, VRAM, engagement and correctness measured. **The 32K chain A/B is
-> still owed** — two attempts were lost to a contended box (see Result).
+> Status: Shipped. `a5df06c7c` (prefill arms) + `30171f8be` (derive from Marlin,
+> the VRAM fix) + `9f1987f25` (delete the arms that were not the serving path).
 
 ## Context
 
@@ -127,27 +126,67 @@ len=32768  exact=3 miss=0 DET
 
 ## Result
 
-**Owed: the matched 32K chain A/B.** Two attempts produced no numbers, both from
-box contention rather than from the change:
+1xH20, TP=1, FP8 KV, `--max-running-requests 16`, no spec. Both arms on the same
+binary, NVFP4 on GPU 0 and Qwen3.6-27B-FP8 on GPU 1, points taken back to back.
+`bench-agent-32k-16x8.jsonl` (sha 8867f63e), 32 req/point, `--max-tokens 214`.
+32/32 complete and `SERVER_ERRORS=0` at every cell.
 
-1. The first run's serve took an external SIGTERM ~134 s after becoming ready.
-   Traced before being attributed: no ERROR and no fatal path in the engine log,
-   and the PID was absent from the cgroup OOM record, so the signal was external
-   (`serve.rs:467` has three sources and the internal one was excluded).
-2. The second run lost `target/release/arle` mid-flight to a concurrent
-   `cargo build` — the first arm kept running from its loaded image while the
-   second died with `nohup: failed to run command`. The binary hash printed at
-   the top of the bench script is what caught it.
+| c | NVFP4 ITL ms | FP8 ITL ms | ITL | NVFP4 out tok/s | FP8 out tok/s | end-to-end |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | **20.45** | 24.81 | **+21.3%** | 19.49 | 19.65 | −0.8% |
+| 4 | **40.04** | 47.31 | **+18.2%** | **84.13** | 75.53 | **+11.4%** |
+| 8 | **71.16** | 79.47 | **+11.7%** | **98.00** | 91.62 | **+7.0%** |
+| 16 | **130.68** | 135.84 | **+3.9%** | 106.24 | 106.53 | −0.3% |
 
-Everything else here was re-measured on the merged HEAD and reproduced exactly:
-free VRAM 58,523 MB, `max_total_tokens` 1,302,407, the four counters above, and
-the needle ladder. That the numbers are bit-identical across two binaries is the
-evidence that `834a87aed` (which touches the same `gemv` dispatch) does not
-disturb this path.
+The c=1 end-to-end leg is what this change was for: it was **−33.9%** before the
+prefill arms and −5.9% with them but with both sources retained; the VRAM fix
+took it to parity. ITL leads at every concurrency and decays monotonically
+21.3 → 18.2 → 11.7 → 3.9, which is the `dense_ffn` residue
+[the occupancy entry](../errors/2026-08-19-marlin-decode-is-not-occupancy-limited.md)
+measured, unchanged by this work — the DeepGEMM arms sit above an M floor no
+decode batch reaches.
 
-Until the chain runs, the prefill claim rests on the kernel probe (265 against
-84 TFLOPS effective) and not on an end-to-end measurement. Do not quote an
-end-to-end delta from this entry.
+**VRAM, the actual point:**
+
+```
+resident        39,348 MB -> 22,356 MB   (-16,992, exactly the retention removed)
+vs FP8          +9,984 MB -> -7,008 MB   (a 4-bit model finally smaller than the 8-bit one)
+KV pool         1,302,407 -> 1,779,114   (FP8: 1,582,506)
+```
+
+**Engagement, read from the same process** — resident falling to 22,356 MB is
+also what a silent arm failure looks like, so the counters are not optional:
+
+```
+cuda.fp4.widen_fp8_deepgemm          224   = 2 prefill chunks x 56 NVFP4 MLP layers x 2 GEMMs
+cuda.qwen.fp8_per_channel_deepgemm   288
+cuda.fp4.marlin_tensorcore           336   decode still Marlin
+cuda.qwen.fp8_marlin_tensorcore      437
+cuda.qwen.fp8_gemv                   ABSENT
+```
+
+**Quality**, GSM8K-shaped, 200 items, three arms on one binary — `ev_off` is the
+same NVFP4 checkpoint with `--chunked-prefill-size 128`, which puts every GEMM
+below the floor and turns both DeepGEMM arms off, so it is a same-binary control:
+
+| arm | exact | |
+|---|---:|---|
+| NVFP4, arms on | 188/200 (94.0%) | |
+| NVFP4, arms off | 189/200 (94.5%) | control |
+| Qwen3.6-27B-FP8 | 169/200 (84.5%) | |
+
+On/off agree on 196/200 answers. The numerics do move — the fold and the E4M3
+activations are real — but not enough to change an answer: one item in 200.
+**The absolute scores are not a GSM8K result**: the pod has no network, so the
+items come from the repo's own `examples/opd/gsm8k-train.jsonl`, the TRAIN split.
+Only the arm-to-arm difference on identical inputs carries.
+
+Two runs before this one produced no numbers and were discarded rather than
+reported: one serve took an external SIGTERM (traced — no ERROR, no fatal path,
+PID absent from the cgroup OOM record), and one lost `target/release/arle`
+mid-flight to a concurrent `cargo build`. A third c=16 row is discarded because
+the FP8 control arm moved 30.42 → 106.53 out tok/s with unchanged code and
+identical resident bytes; a control that moves invalidates the run it is in.
 
 ## Rule
 
