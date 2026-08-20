@@ -4346,15 +4346,26 @@ impl SafetensorLoader {
         let is_w4afp8 = first_view
             .as_ref()
             .is_some_and(|v| matches!(v.format, QuantFormat::W4Afp8));
-        // NVFP4 (0731 checkpoint): E2M1 packed weight + F8_E8M0 `.scale` block
-        // scales. Converted to W4AFP8 on GPU at load time.
+        // NVFP4 (0731 checkpoint): E2M1 packed weight (I8/U8) + F8_E8M0 `.scale`
+        // block scales. Converted to W4AFP8 on GPU at load time. FP8 E4M3 + E8M0
+        // block scales is the standard DSv4 FP8 format — the scale dtype alone
+        // cannot distinguish them; the weight dtype must be packed.
         let is_nvfp4 = !is_w4a16 && !is_w4afp8 && {
             let base = first_expert.w1.trim_end_matches(".weight");
             let scale_name = format!("{base}.scale");
-            self.tensor_headers()
-                .ok()
+            let headers = self.tensor_headers().ok();
+            let scale_is_e8m0 = headers
+                .as_ref()
                 .and_then(|h| h.get(&scale_name).map(|t| t.dtype == Dtype::F8_E8M0))
-                .unwrap_or(false)
+                .unwrap_or(false);
+            let weight_is_packed = headers
+                .as_ref()
+                .and_then(|h| {
+                    h.get(&first_expert.w1)
+                        .map(|t| matches!(t.dtype, Dtype::I8 | Dtype::U8))
+                })
+                .unwrap_or(false);
+            scale_is_e8m0 && weight_is_packed
         };
 
         let (w13_grouped, w2_grouped, w13_w4a16, w2_w4a16, hidden_dim, intermediate, num_groups) =
