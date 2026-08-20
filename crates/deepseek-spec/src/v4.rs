@@ -1169,7 +1169,8 @@ impl DeepSeekV4MtpTensorNames {
             norm: format!("{prefix}.norm.weight"),
             hc_attn: DeepSeekV4HyperConnectionTensorNames::new(&format!("{prefix}.hc_attn")),
             hc_ffn: DeepSeekV4HyperConnectionTensorNames::new(&format!("{prefix}.hc_ffn")),
-            hc_head: DeepSeekV4HyperConnectionTensorNames::new(&format!("{prefix}.hc_head")),
+            // hc_head is a global tensor in the base checkpoint (no mtp prefix).
+            hc_head: DeepSeekV4HyperConnectionTensorNames::new("hc_head"),
             // MTP is DSv4-only (GLM ships num_nextn_predict_layers=0): DSv4 dialect,
             // no indexer (compress_ratio=0), no dense MLP.
             attn: DeepSeekV4AttentionTensorNames::new(
