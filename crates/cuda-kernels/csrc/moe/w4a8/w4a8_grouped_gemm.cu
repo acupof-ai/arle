@@ -247,16 +247,12 @@ int run_grouped_gemm(
 
 // --- Per-tensor FP8 activation quantization for the W4AFP8 MoE path ---
 
-// Multi-block amax: grid-stride reduction, block-level atomicMax to shared,
-// block 0 writes the final value. Correct for prefill-scale tensors (25M+ elems).
+// Multi-block amax: each block reduces to a local max, then global atomicMax
+// on the output pointer. Host must zero `amax_out` before launch.
 __global__ void w4a8_per_tensor_amax_kernel(
     const __nv_bfloat16* __restrict__ input,
     float* __restrict__ amax_out,
     int numel) {
-  __shared__ float s_max;
-  if (threadIdx.x == 0) s_max = 0.0f;
-  __syncthreads();
-
   float local_max = 0.0f;
   for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < numel;
        i += gridDim.x * blockDim.x) {
@@ -275,25 +271,20 @@ __global__ void w4a8_per_tensor_amax_kernel(
     local_max = (lane < (blockDim.x + 31) / 32) ? s_warp[lane] : 0.0f;
     for (int offset = 16; offset > 0; offset >>= 1)
       local_max = fmaxf(local_max, __shfl_down_sync(0xffffffff, local_max, offset));
-    // atomicMax on int representation: correct for non-negative floats (amax).
+    // Global atomicMax on int representation: correct for non-negative floats.
     if (lane == 0)
-      atomicMax(reinterpret_cast<int*>(&s_max), __float_as_int(local_max));
+      atomicMax(reinterpret_cast<int*>(amax_out), __float_as_int(local_max));
   }
-  __syncthreads();
-  // Write scale = amax / 448 (FP8 E4M3 max): the CUTLASS epilogue dequantizes
-  // activations as `quantized * scale`, so scale must be the dequant factor.
-  if (blockIdx.x == 0 && threadIdx.x == 0)
-    *amax_out = (s_max > 0.0f) ? s_max / 448.0f : 1.0f;
 }
 
-// Quantize BF16 → FP8 E4M3 using a precomputed per-tensor scale.
+// Quantize BF16 → FP8 E4M3 using a precomputed per-tensor raw amax.
 __global__ void w4a8_per_tensor_quantize_kernel(
     const __nv_bfloat16* __restrict__ input,
     __nv_fp8_storage_t* __restrict__ output,
     const float* __restrict__ scale,
     int numel) {
-  float s = *scale;  // scale = amax / 448 (dequant factor); quant uses its reciprocal
-  float inv = (s > 0.0f) ? 1.0f / s : 1.0f;
+  float s = *scale;  // raw amax; quant scale = 448 / amax
+  float inv = (s > 0.0f) ? 448.0f / s : 1.0f;
   for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < numel;
        i += gridDim.x * blockDim.x) {
     float v = __bfloat162float(input[i]) * inv;
@@ -324,6 +315,7 @@ extern "C" void w4a8_per_tensor_fp8_quant(
     int numel,
     void* stream) {
   cudaStream_t s = static_cast<cudaStream_t>(stream);
+  cudaMemsetAsync(scale, 0, sizeof(float), s);
   // Multi-block amax: 1024 threads/block, enough blocks to saturate the GPU.
   int amax_blocks = (numel + 1023) / 1024;
   if (amax_blocks > 128) amax_blocks = 128;

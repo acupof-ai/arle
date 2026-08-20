@@ -116,7 +116,7 @@ extern "C" cudaError_t nvfp4_to_w4afp8(
     int N,
     int K,
     cudaStream_t stream) {
-  if (N <= 0 || K <= 0 || K % 128 != 0) {
+  if (N <= 0 || K <= 0 || K % 512 != 0) {
     return cudaErrorInvalidValue;
   }
   dim3 grid(N, K / 128);

@@ -2293,8 +2293,8 @@ pub unsafe fn w4a8_moe_grouped_gemm(
 
 /// Convert one expert's NVFP4 (E2M1 packed + E8M0 block scales) to W4AFP8
 /// (signed INT4 + BF16 interleaved scales) on GPU. `k` is the logical K
-/// (2× the packed byte count). Output buffers must be sized:
-/// weight `n * k/2` bytes, scales `(k/512) * n * 4 * 2` bytes (BF16).
+/// (2× the packed byte count) and must be a multiple of 512. Output buffers
+/// must be sized: weight `n * k/2` bytes, scales `(k/512) * n * 4 * 2` bytes.
 pub unsafe fn nvfp4_to_w4afp8(
     src_weight: RawDevicePtr<i8>,
     src_scales: RawDevicePtr<u8>,
