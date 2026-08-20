@@ -196,6 +196,23 @@ type Fp8BlockScaledView<'a> = (
 #[cfg(not(feature = "no-cuda"))]
 const CUBLASLT_BF16_GEMMEX_MIN_N: usize = 32;
 
+/// Complete artifact identity of one autograd NVRTC compile unit — the
+/// training analogue of the serving side's `KERNEL_BUILD_ID`. Two runs with
+/// equal identity load numerically identical cubins.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NvrtcIdentity {
+    /// FNV-1a 64 hex hash of the dtype prelude + concatenated kernel sources.
+    pub source_hash: String,
+    /// Exact NVRTC option list.
+    pub compile_flags: String,
+    pub sm_arch: &'static str,
+    pub tape_dtype: TapeDtype,
+    /// (major, minor) from `nvrtcVersion`.
+    pub nvrtc_version: (i32, i32),
+    /// From `cuDriverGetVersion`, e.g. 12080.
+    pub cuda_driver_version: i32,
+}
+
 pub struct CudaBackend {
     tape_dtype: AtomicU8,
     #[cfg(not(feature = "no-cuda"))]
@@ -235,6 +252,13 @@ impl Backend for CudaBackend {
 
     fn set_tape_dtype(&self, dtype: TapeDtype) {
         self.tape_dtype.store(dtype as u8, Ordering::Relaxed);
+        // Declared warmup: compile the dtype's NVRTC module now instead of on
+        // the first hot-path kernel lookup. Best-effort — a failure here
+        // resurfaces as a hard error at first use.
+        #[cfg(not(feature = "no-cuda"))]
+        if let Err(err) = self.kernels.warm_dtype(dtype) {
+            log::warn!("autograd cuda dtype-module warmup failed: {err}");
+        }
     }
 
     fn tape_dtype(&self) -> TapeDtype {

@@ -142,6 +142,23 @@ impl CudaBackend {
         todo!("GPU required: CudaBackend::mem_get_info is unavailable under feature no-cuda")
     }
 
+    /// Complete NVRTC artifact identity for the current tape dtype's compile
+    /// unit: source hash, compile flags, SM arch, tape dtype, NVRTC and CUDA
+    /// driver versions.
+    ///
+    /// # Errors
+    /// Returns an error if the device attribute or version queries fail.
+    #[cfg(not(feature = "no-cuda"))]
+    pub fn nvrtc_identity(&self) -> Result<NvrtcIdentity> {
+        self.kernels.nvrtc_identity(self.tape_dtype())
+    }
+
+    /// No-GPU stub — kernel identity is unavailable without a CUDA device.
+    #[cfg(feature = "no-cuda")]
+    pub fn nvrtc_identity(&self) -> Result<NvrtcIdentity> {
+        todo!("GPU required: CudaBackend::nvrtc_identity is unavailable under feature no-cuda")
+    }
+
     /// Whether an NCCL communicator is attached (multi-rank collectives work).
     #[cfg(all(feature = "nccl", not(feature = "no-cuda")))]
     pub fn has_collective(&self) -> bool {
