@@ -802,6 +802,7 @@ mod app {
                 &gen_ids,
                 &prompt_positions,
                 &gen_positions,
+                train::context_parallel::CpContext::single(),
             )
             .context("frozen gen-segment analytic forward")?;
         let weighted = mul(hidden, probe, store, &mut tape)?;
@@ -840,6 +841,7 @@ mod app {
                     &gen_ids,
                     &prompt_positions,
                     &gen_positions,
+                    train::context_parallel::CpContext::single(),
                 )
                 .context("frozen gen-segment fd forward")?;
             let weighted = mul(hidden, probe, store, &mut tape)?;
