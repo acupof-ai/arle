@@ -99,8 +99,8 @@ pub struct TpRuntime {
 
 #[cfg(all(feature = "cuda", feature = "nccl"))]
 pub(crate) struct SymmetricIpcBuffer {
-    peer_mappings: Vec<cuda_ipc::PeerMapping>,
-    local: Option<cuda_ipc::SharedRegion>,
+    peer_mappings: Vec<cuda_kernels::comm::PeerMapping>,
+    local: Option<cuda_kernels::comm::SharedRegion>,
     peer_ptrs: Vec<u64>,
     bytes: usize,
     context: Option<std::sync::Arc<cudarc::driver::CudaContext>>,
@@ -109,7 +109,9 @@ pub(crate) struct SymmetricIpcBuffer {
 #[cfg(all(feature = "cuda", feature = "nccl"))]
 impl SymmetricIpcBuffer {
     pub(crate) fn local_base(&self) -> u64 {
-        self.local.as_ref().map_or(0, cuda_ipc::SharedRegion::ptr)
+        self.local
+            .as_ref()
+            .map_or(0, cuda_kernels::comm::SharedRegion::ptr)
     }
 
     pub(crate) fn peer_ptrs(&self) -> &[u64] {
@@ -1011,7 +1013,7 @@ impl TpRuntime {
             self.config.rank,
             self.config.world_size
         );
-        cuda_ipc::bind(ctx)?;
+        cuda_kernels::comm::bind(ctx)?;
 
         let bytes_u64 = u64::try_from(bytes)?;
         let gathered_bytes = self.all_gather_bytes(ctx, &bytes_u64.to_ne_bytes(), 8)?;
@@ -1031,16 +1033,17 @@ impl TpRuntime {
         );
         ensure!(bytes > 0, "symmetric IPC bytes must be positive");
 
-        let allocated = (|| -> anyhow::Result<(cuda_ipc::SharedRegion, [u8; IPC_HANDLE_BYTES])> {
-            let mut handle = [0u8; IPC_HANDLE_BYTES];
-            let local = cuda_ipc::SharedRegion::alloc(
-                ctx,
-                bytes,
-                &mut handle,
-                "MegaMoE symmetric region alloc",
-            )?;
-            Ok((local, handle))
-        })();
+        let allocated =
+            (|| -> anyhow::Result<(cuda_kernels::comm::SharedRegion, [u8; IPC_HANDLE_BYTES])> {
+                let mut handle = [0u8; IPC_HANDLE_BYTES];
+                let local = cuda_kernels::comm::SharedRegion::alloc(
+                    ctx,
+                    bytes,
+                    &mut handle,
+                    "MegaMoE symmetric region alloc",
+                )?;
+                Ok((local, handle))
+            })();
         let all_allocated = match self.symmetric_vote(ctx, allocated.is_ok()) {
             Ok(all_allocated) => all_allocated,
             Err(err) => {
@@ -1078,7 +1081,7 @@ impl TpRuntime {
             world * IPC_HANDLE_BYTES
         );
 
-        cuda_ipc::bind(ctx)?;
+        cuda_kernels::comm::bind(ctx)?;
         let mut open_error = None;
         for (peer_rank, peer_handle) in gathered_handles.chunks_exact(IPC_HANDLE_BYTES).enumerate()
         {
@@ -1086,7 +1089,13 @@ impl TpRuntime {
                 buffer.peer_ptrs.push(buffer.local_base());
                 continue;
             }
-            match cuda_ipc::PeerMapping::open(ctx, peer_handle, "MegaMoE symmetric peer open") {
+            let peer_handle: &[u8; IPC_HANDLE_BYTES] =
+                peer_handle.try_into().expect("64-byte handle");
+            match cuda_kernels::comm::PeerMapping::open(
+                ctx,
+                peer_handle,
+                "MegaMoE symmetric peer open",
+            ) {
                 Ok(mapping) => {
                     buffer.peer_ptrs.push(mapping.ptr());
                     buffer.peer_mappings.push(mapping);
@@ -1133,127 +1142,6 @@ impl TpRuntime {
     }
 }
 
-#[cfg(all(feature = "cuda", feature = "nccl"))]
-mod cuda_ipc {
-    use anyhow::{Result, anyhow, ensure};
-    use cuda_kernels::ffi::comm as car;
-
-    pub(super) fn bind(ctx: &cuda_kernels::prelude::DeviceContext) -> Result<()> {
-        ctx.ctx
-            .bind_to_thread()
-            .map_err(|err| anyhow!("bind symmetric IPC CUDA context failed: {err}"))
-    }
-
-    pub(super) fn check(res: cudarc::driver::sys::CUresult, what: &str) -> Result<()> {
-        ensure!(
-            res == cudarc::driver::sys::CUresult::CUDA_SUCCESS,
-            "{what} failed: {res:?}"
-        );
-        Ok(())
-    }
-
-    pub(super) struct SharedRegion {
-        ptr: u64,
-        label: &'static str,
-    }
-
-    impl SharedRegion {
-        pub(super) fn alloc(
-            ctx: &cuda_kernels::prelude::DeviceContext,
-            bytes: usize,
-            handle: &mut [u8; 64],
-            label: &'static str,
-        ) -> Result<Self> {
-            bind(ctx)?;
-            let mut ptr = 0u64;
-            check(
-                // SAFETY: `ptr` and the 64-byte `handle` are live out-params and `bind`
-                // above made `ctx` the current context.
-                unsafe { car::arle_car_alloc_shared(bytes, &mut ptr, handle.as_mut_ptr()) },
-                label,
-            )?;
-            Ok(Self { ptr, label })
-        }
-
-        pub(super) fn ptr(&self) -> u64 {
-            self.ptr
-        }
-
-        pub(super) fn disarm(&mut self) {
-            self.ptr = 0;
-        }
-    }
-
-    impl Drop for SharedRegion {
-        fn drop(&mut self) {
-            if self.ptr == 0 {
-                return;
-            }
-            // SAFETY: non-zero `ptr` is this region's own `alloc_shared` result and
-            // `disarm` clears it once ownership moved, so this frees at most once.
-            let res = unsafe { car::arle_car_free_shared(self.ptr) };
-            if res != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
-                log::warn!(
-                    "[cuda-ipc] cleanup {} ptr=0x{:x} failed: {res:?}",
-                    self.label,
-                    self.ptr
-                );
-            }
-        }
-    }
-
-    pub(super) struct PeerMapping {
-        ptr: u64,
-        label: &'static str,
-    }
-
-    impl PeerMapping {
-        pub(super) fn open(
-            ctx: &cuda_kernels::prelude::DeviceContext,
-            handle: &[u8],
-            label: &'static str,
-        ) -> Result<Self> {
-            bind(ctx)?;
-            let mut ptr = 0u64;
-            check(
-                // SAFETY: `ptr` is a live out-param and `bind` above made `ctx`
-                // current;
-                // the callee reads 64 bytes from `handle`, whose length is unchecked
-                // here.
-                unsafe { car::arle_car_open_peer(handle.as_ptr(), &mut ptr) },
-                label,
-            )?;
-            Ok(Self { ptr, label })
-        }
-
-        pub(super) fn ptr(&self) -> u64 {
-            self.ptr
-        }
-
-        pub(super) fn disarm(&mut self) {
-            self.ptr = 0;
-        }
-    }
-
-    impl Drop for PeerMapping {
-        fn drop(&mut self) {
-            if self.ptr == 0 {
-                return;
-            }
-            // SAFETY: non-zero `ptr` is this mapping's own `open_peer` result and
-            // `disarm` clears it once ownership moved, so this closes at most once.
-            let res = unsafe { car::arle_car_close_peer(self.ptr) };
-            if res != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
-                log::warn!(
-                    "[cuda-ipc] cleanup {} ptr=0x{:x} failed: {res:?}",
-                    self.label,
-                    self.ptr
-                );
-            }
-        }
-    }
-}
-
 /// One-shot small-message collectives (custom allreduce + all-gather over
 /// IPC-shared buffers, one persistent registered scratch per rank): decode-chain
 /// messages (2×AR 14 KB + Q-AG 18 KB per layer) measured 2.6–3.6× faster than
@@ -1263,12 +1151,10 @@ mod cuda_ipc {
 /// alloc/IPC/create degrades EVERY rank instead of desyncing boot collectives.
 #[cfg(all(feature = "cuda", feature = "nccl"))]
 mod oneshot {
-    use super::cuda_ipc::{PeerMapping, SharedRegion, check};
-    use anyhow::{Result, anyhow, ensure};
+    use anyhow::{Context, Result, anyhow, ensure};
     use cuda_kernels::collective::NcclBackend;
-    use cuda_kernels::ffi::comm as car;
+    use cuda_kernels::comm::{AllReduceAlgo, CustomAllReduce, PeerMapping, SharedRegion};
     use cuda_kernels::prelude::DeviceContext;
-    use std::ffi::c_void;
 
     /// Covers every decode shape (B=1..32 AR ≤ 448 KB, Q-AG ≤ 18 KB/rank);
     /// prefill-sized buffers fall through to NCCL at the call sites.
@@ -1278,7 +1164,7 @@ mod oneshot {
     const SIGNAL_BYTES: usize = 8192 + SCRATCH_BYTES;
 
     pub(super) struct OneShotComm {
-        handle: *mut std::os::raw::c_void,
+        car: CustomAllReduce,
         scratch_ptr: u64,
     }
 
@@ -1289,45 +1175,6 @@ mod oneshot {
     // SAFETY: `&self` use is confined to the engine thread that owns the executor,
     // and the handle's device state is only touched through that thread's stream.
     unsafe impl Sync for OneShotComm {}
-
-    impl Drop for OneShotComm {
-        fn drop(&mut self) {
-            // SAFETY: `handle` came from `arle_car_create` and is owned solely here —
-            // `BootHandle::into_comm` nulls the boot copy, so this destroys once.
-            unsafe { car::arle_car_destroy_prod(self.handle) };
-        }
-    }
-
-    struct BootHandle {
-        handle: *mut c_void,
-        scratch_ptr: u64,
-    }
-
-    impl BootHandle {
-        fn self_test(&self, ctx: &DeviceContext, backend: &NcclBackend, rank: usize) -> Result<()> {
-            OneShotComm::self_test_handle(self.handle, self.scratch_ptr, ctx, backend, rank)
-        }
-
-        fn into_comm(mut self) -> OneShotComm {
-            let comm = OneShotComm {
-                handle: self.handle,
-                scratch_ptr: self.scratch_ptr,
-            };
-            self.handle = std::ptr::null_mut();
-            comm
-        }
-    }
-
-    impl Drop for BootHandle {
-        fn drop(&mut self) {
-            if !self.handle.is_null() {
-                // SAFETY: non-null means boot failed before `into_comm` moved
-                // ownership,
-                // so this `arle_car_create` handle is still ours to destroy.
-                unsafe { car::arle_car_destroy_prod(self.handle) };
-            }
-        }
-    }
 
     /// All-ranks ok-vote; the 4-byte payload is required because
     /// `all_gather_bytes` stages through an i32 device buffer.
@@ -1385,7 +1232,7 @@ mod oneshot {
             ensure!(all.len() == world * 128, "one-shot handle exchange size");
 
             let scratch_ptr = in_region.ptr();
-            let built = (|| -> Result<BootHandle> {
+            let built = (|| -> Result<OneShotComm> {
                 let mut sigs = [0u64; 8];
                 let mut ins = [0u64; 8];
                 let mut peer_sigs = Vec::with_capacity(world.saturating_sub(1));
@@ -1399,22 +1246,21 @@ mod oneshot {
                     let rec = &all[r * 128..(r + 1) * 128];
                     let sig = PeerMapping::open(
                         ctx,
-                        &rec[..64],
+                        rec[..64].try_into().expect("64-byte handle"),
                         "one-shot peer signal open (no-P2P probe)",
                     )?;
                     sigs[r] = sig.ptr();
                     peer_sigs.push(sig);
-                    let input = PeerMapping::open(ctx, &rec[64..], "one-shot peer scratch open")?;
+                    let input = PeerMapping::open(
+                        ctx,
+                        rec[64..].try_into().expect("64-byte handle"),
+                        "one-shot peer scratch open",
+                    )?;
                     ins[r] = input.ptr();
                     peer_ins.push(input);
                 }
-                // SAFETY: `sigs`/`ins` are live `world`-length arrays of device
-                // pointers —
-                // this rank's own regions plus one opened peer mapping per other rank.
-                let handle = unsafe {
-                    car::arle_car_create(rank as i32, world as i32, sigs.as_ptr(), ins.as_ptr())
-                };
-                ensure!(!handle.is_null(), "one-shot CustomAllreduce create");
+                let car = CustomAllReduce::create(rank, world, &sigs, &ins)
+                    .context("one-shot CustomAllreduce create")?;
                 sig_region.disarm();
                 in_region.disarm();
                 for peer in &mut peer_sigs {
@@ -1423,10 +1269,7 @@ mod oneshot {
                 for peer in &mut peer_ins {
                     peer.disarm();
                 }
-                Ok(BootHandle {
-                    handle,
-                    scratch_ptr,
-                })
+                Ok(OneShotComm { car, scratch_ptr })
             })();
             if let Err(err) = &built {
                 log::warn!("[comm-oneshot] rank {rank}: {err:#} (degrading)");
@@ -1434,87 +1277,68 @@ mod oneshot {
             if !vote(ctx, backend, built.is_ok())? {
                 return Ok(None);
             }
-            let Ok(boot) = built else {
+            let Ok(comm) = built else {
                 return Ok(None);
             };
 
             // Self-test catches memory-ordering issues on this driver/HW combo
             // before any production traffic.
-            let tested = boot.self_test(ctx, backend, rank);
+            let tested = comm.self_test(ctx, backend, rank);
             if let Err(err) = &tested {
                 log::warn!("[comm-oneshot] rank {rank} self-test failed: {err:#}");
             }
             if !vote(ctx, backend, tested.is_ok())? {
                 return Ok(None);
             }
-            Ok(Some(boot.into_comm()))
+            Ok(Some(comm))
         }
 
-        fn self_test_handle(
-            handle: *mut c_void,
-            scratch_ptr: u64,
-            ctx: &DeviceContext,
-            backend: &NcclBackend,
-            rank: usize,
-        ) -> Result<()> {
+        fn self_test(&self, ctx: &DeviceContext, backend: &NcclBackend, rank: usize) -> Result<()> {
             use cuda_kernels::collective::{CollectiveBackend, DType, ReduceOp};
             use cudarc::driver::DevicePtrMut;
 
             const ELEMS: usize = 7168;
             let stream = &ctx.stream;
-            check(
-                // SAFETY: `scratch_ptr` is the registered SCRATCH_BYTES region and
-                // ELEMS bf16 (14 KB) fits it; `stream` is this rank's own.
-                unsafe {
-                    car::arle_car_fill_bf16(
-                        stream.cu_stream(),
-                        scratch_ptr,
-                        ELEMS as i32,
-                        rank as i32,
-                    )
-                },
-                "self-test fill",
-            )?;
+            // SAFETY: `scratch_ptr` is the registered SCRATCH_BYTES region and
+            // ELEMS bf16 (14 KB) fits it; `stream` is this rank's own.
+            unsafe {
+                cuda_kernels::comm::fill_bf16(
+                    stream.cu_stream(),
+                    self.scratch_ptr,
+                    ELEMS,
+                    rank as i32,
+                )
+                .context("self-test fill")?;
+            }
             let mut got = stream
                 .alloc_zeros::<u16>(ELEMS)
                 .map_err(|e| anyhow!("self-test out alloc: {e}"))?;
             {
                 let (got_ptr, _g) = got.device_ptr_mut(stream);
-                check(
-                    // SAFETY: `got_ptr` is live for `_g` and holds ELEMS u16; `handle`
-                    // is
-                    // the booted one-shot comm on this rank's `stream`.
-                    unsafe {
-                        car::arle_car_allreduce_bf16_into(
-                            handle,
+                // SAFETY: `got_ptr` is live for `_g` and holds ELEMS u16; the comm is
+                // booted on this rank's `stream`.
+                unsafe {
+                    self.car
+                        .allreduce_bf16_into(
                             stream.cu_stream(),
                             got_ptr,
-                            ELEMS as i32,
-                            1,
+                            ELEMS,
+                            AllReduceAlgo::OneShot,
                         )
-                    },
-                    "self-test one-shot AR",
-                )?;
+                        .context("self-test one-shot AR")?;
+                }
             }
             let mut reference = stream
                 .alloc_zeros::<u16>(ELEMS)
                 .map_err(|e| anyhow!("self-test ref alloc: {e}"))?;
             {
                 let (ref_ptr, _g) = reference.device_ptr_mut(stream);
-                check(
-                    // SAFETY: `ref_ptr` is live for `_g` and holds ELEMS u16 — same
-                    // seed
-                    // and count as the one-shot fill above.
-                    unsafe {
-                        car::arle_car_fill_bf16(
-                            stream.cu_stream(),
-                            ref_ptr,
-                            ELEMS as i32,
-                            rank as i32,
-                        )
-                    },
-                    "self-test ref fill",
-                )?;
+                // SAFETY: `ref_ptr` is live for `_g` and holds ELEMS u16 — same seed
+                // and count as the one-shot fill above.
+                unsafe {
+                    cuda_kernels::comm::fill_bf16(stream.cu_stream(), ref_ptr, ELEMS, rank as i32)
+                        .context("self-test ref fill")?;
+                }
                 // SAFETY: `ref_ptr` is live for `_g` and holds ELEMS bf16 on this
                 // rank's
                 // device; every rank runs this self-test in the same order.
@@ -1582,16 +1406,9 @@ mod oneshot {
                     ctx.stream.cu_stream(),
                 )
                 .map_err(|e| anyhow!("one-shot AR stage copy: {e}"))?;
-                check(
-                    car::arle_car_allreduce_bf16_into(
-                        self.handle,
-                        ctx.stream.cu_stream(),
-                        ptr,
-                        elems as i32,
-                        0,
-                    ),
-                    "one-shot AR",
-                )?;
+                self.car
+                    .allreduce_bf16_into(ctx.stream.cu_stream(), ptr, elems, AllReduceAlgo::Auto)
+                    .context("one-shot AR")?;
             }
             Ok(())
         }
@@ -1620,15 +1437,9 @@ mod oneshot {
                     ctx.stream.cu_stream(),
                 )
                 .map_err(|e| anyhow!("one-shot AG stage copy: {e}"))?;
-                check(
-                    car::arle_car_allgather_bf16_into(
-                        self.handle,
-                        ctx.stream.cu_stream(),
-                        recvbuf as u64,
-                        sendcount as i32,
-                    ),
-                    "one-shot AG",
-                )?;
+                self.car
+                    .allgather_bf16_into(ctx.stream.cu_stream(), recvbuf as u64, sendcount)
+                    .context("one-shot AG")?;
             }
             Ok(())
         }

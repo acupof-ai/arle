@@ -5,6 +5,8 @@
 pub mod attention;
 pub mod collective;
 #[cfg(feature = "cuda")]
+pub mod comm;
+#[cfg(feature = "cuda")]
 pub mod ffi;
 #[cfg(feature = "cuda")]
 pub mod kv_quant;
