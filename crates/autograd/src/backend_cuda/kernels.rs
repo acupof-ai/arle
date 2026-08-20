@@ -1,3 +1,4 @@
+use super::NvrtcIdentity;
 use crate::{AutogradError, Result, TapeDtype};
 use cudarc::driver::{
     CudaContext, CudaFunction, CudaModule, CudaStream, LaunchArgs, LaunchConfig, sys,
@@ -9,64 +10,176 @@ use std::sync::Arc;
 #[cfg(not(feature = "no-cuda"))]
 use std::sync::Mutex;
 
+/// Kernel-source family per the T7 classification in
+/// docs/plans/2026-08-20-cuda-operator-inventory.md §"Autograd classification".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KernelFamily {
+    /// Forward tape math (NVRTC-only).
+    Forward,
+    /// Backward tape math and gradient accumulation (NVRTC-only).
+    Backward,
+    /// Fused SDPA fwd+bwd plus the KV-cache/slice layout kernels feeding it.
+    Attention,
+    /// Rollout decode helpers and quantized-weight dequant for rollout.
+    Rollout,
+    /// Optimizer step.
+    Optimizer,
+    /// bf16<->f32 bit casts bridging tape and serving tensors.
+    Bridge,
+    /// Pending numerical-contract proof against the serving launcher.
+    Uncertain,
+}
+
+/// file -> family catalog for the 29 NVRTC sources. Order is load-bearing:
+/// it fixes both the concatenated compile unit and the identity hash.
 #[cfg(not(feature = "no-cuda"))]
-const ELEMENTWISE_CU: &str = include_str!("kernels/elementwise.cu");
-#[cfg(not(feature = "no-cuda"))]
-const SOFTMAX_CU: &str = include_str!("kernels/softmax.cu");
-#[cfg(not(feature = "no-cuda"))]
-const SILU_CU: &str = include_str!("kernels/silu.cu");
-#[cfg(not(feature = "no-cuda"))]
-const RMS_NORM_CU: &str = include_str!("kernels/rms_norm.cu");
-#[cfg(not(feature = "no-cuda"))]
-const EMBEDDING_CU: &str = include_str!("kernels/embedding.cu");
-#[cfg(not(feature = "no-cuda"))]
-const REDUCE_CU: &str = include_str!("kernels/reduce.cu");
-#[cfg(not(feature = "no-cuda"))]
-const ROPE_CU: &str = include_str!("kernels/rope.cu");
-#[cfg(not(feature = "no-cuda"))]
-const GATHER_CU: &str = include_str!("kernels/gather.cu");
-#[cfg(not(feature = "no-cuda"))]
-const SCATTER_ADD_CU: &str = include_str!("kernels/scatter_add.cu");
-#[cfg(not(feature = "no-cuda"))]
-const ADD_BROADCAST_CU: &str = include_str!("kernels/add_broadcast.cu");
-#[cfg(not(feature = "no-cuda"))]
-const LAYOUT_CU: &str = include_str!("kernels/layout.cu");
-#[cfg(not(feature = "no-cuda"))]
-const ADAMW_CU: &str = include_str!("kernels/adamw.cu");
-#[cfg(not(feature = "no-cuda"))]
-const LOG_SOFTMAX_BACKWARD_CU: &str = include_str!("kernels/log_softmax_backward.cu");
-#[cfg(not(feature = "no-cuda"))]
-const GATHER_BACKWARD_CU: &str = include_str!("kernels/gather_backward.cu");
-#[cfg(not(feature = "no-cuda"))]
-const ADD_INTO_CU: &str = include_str!("kernels/add_into.cu");
-#[cfg(not(feature = "no-cuda"))]
-const MEAN_BACKWARD_CU: &str = include_str!("kernels/mean_backward.cu");
-#[cfg(not(feature = "no-cuda"))]
-const MUL_SCALAR_BACKWARD_CU: &str = include_str!("kernels/mul_scalar_backward.cu");
-#[cfg(not(feature = "no-cuda"))]
-const EMBEDDING_BACKWARD_CU: &str = include_str!("kernels/embedding_backward.cu");
-#[cfg(not(feature = "no-cuda"))]
-const ADD_BROADCAST_BACKWARD_CU: &str = include_str!("kernels/add_broadcast_backward.cu");
-#[cfg(not(feature = "no-cuda"))]
-const ACTIVATION_BACKWARD_CU: &str = include_str!("kernels/activation_backward.cu");
-#[cfg(not(feature = "no-cuda"))]
-const MUL_BACKWARD_CU: &str = include_str!("kernels/mul_backward.cu");
-#[cfg(not(feature = "no-cuda"))]
-const RMS_NORM_BACKWARD_CU: &str = include_str!("kernels/rms_norm_backward.cu");
-#[cfg(not(feature = "no-cuda"))]
-const ROPE_BACKWARD_CU: &str = include_str!("kernels/rope_backward.cu");
-#[cfg(not(feature = "no-cuda"))]
-const ROLLOUT_CU: &str = include_str!("kernels/rollout.cu");
-#[cfg(not(feature = "no-cuda"))]
-const ATTENTION_CU: &str = include_str!("kernels/attention.cu");
-#[cfg(not(feature = "no-cuda"))]
-const ATTENTION_DECODE_ONLINE_CU: &str = include_str!("kernels/attention_decode_online.cu");
-#[cfg(not(feature = "no-cuda"))]
-const BRIDGE_CU: &str = include_str!("kernels/bridge.cu");
-#[cfg(not(feature = "no-cuda"))]
-const LINEAR_ATTENTION_CU: &str = include_str!("kernels/linear_attention.cu");
-#[cfg(not(feature = "no-cuda"))]
-const FP8_BLOCK_SCALED_CU: &str = include_str!("kernels/fp8_block_scaled.cu");
+const KERNEL_SOURCES: &[(&str, KernelFamily, &str)] = &[
+    (
+        "elementwise.cu",
+        KernelFamily::Forward,
+        include_str!("kernels/elementwise.cu"),
+    ),
+    (
+        "softmax.cu",
+        KernelFamily::Forward,
+        include_str!("kernels/softmax.cu"),
+    ),
+    (
+        "silu.cu",
+        KernelFamily::Forward,
+        include_str!("kernels/silu.cu"),
+    ),
+    (
+        "rms_norm.cu",
+        KernelFamily::Forward,
+        include_str!("kernels/rms_norm.cu"),
+    ),
+    (
+        "embedding.cu",
+        KernelFamily::Forward,
+        include_str!("kernels/embedding.cu"),
+    ),
+    (
+        "reduce.cu",
+        KernelFamily::Forward,
+        include_str!("kernels/reduce.cu"),
+    ),
+    (
+        "rope.cu",
+        KernelFamily::Forward,
+        include_str!("kernels/rope.cu"),
+    ),
+    (
+        "gather.cu",
+        KernelFamily::Forward,
+        include_str!("kernels/gather.cu"),
+    ),
+    (
+        "scatter_add.cu",
+        KernelFamily::Backward,
+        include_str!("kernels/scatter_add.cu"),
+    ),
+    (
+        "add_broadcast.cu",
+        KernelFamily::Forward,
+        include_str!("kernels/add_broadcast.cu"),
+    ),
+    (
+        "layout.cu",
+        KernelFamily::Attention,
+        include_str!("kernels/layout.cu"),
+    ),
+    (
+        "adamw.cu",
+        KernelFamily::Optimizer,
+        include_str!("kernels/adamw.cu"),
+    ),
+    (
+        "log_softmax_backward.cu",
+        KernelFamily::Backward,
+        include_str!("kernels/log_softmax_backward.cu"),
+    ),
+    (
+        "gather_backward.cu",
+        KernelFamily::Backward,
+        include_str!("kernels/gather_backward.cu"),
+    ),
+    (
+        "add_into.cu",
+        KernelFamily::Backward,
+        include_str!("kernels/add_into.cu"),
+    ),
+    (
+        "mean_backward.cu",
+        KernelFamily::Backward,
+        include_str!("kernels/mean_backward.cu"),
+    ),
+    (
+        "mul_scalar_backward.cu",
+        KernelFamily::Backward,
+        include_str!("kernels/mul_scalar_backward.cu"),
+    ),
+    (
+        "embedding_backward.cu",
+        KernelFamily::Backward,
+        include_str!("kernels/embedding_backward.cu"),
+    ),
+    (
+        "add_broadcast_backward.cu",
+        KernelFamily::Backward,
+        include_str!("kernels/add_broadcast_backward.cu"),
+    ),
+    (
+        "activation_backward.cu",
+        KernelFamily::Backward,
+        include_str!("kernels/activation_backward.cu"),
+    ),
+    (
+        "mul_backward.cu",
+        KernelFamily::Backward,
+        include_str!("kernels/mul_backward.cu"),
+    ),
+    (
+        "rms_norm_backward.cu",
+        KernelFamily::Backward,
+        include_str!("kernels/rms_norm_backward.cu"),
+    ),
+    (
+        "rope_backward.cu",
+        KernelFamily::Backward,
+        include_str!("kernels/rope_backward.cu"),
+    ),
+    (
+        "rollout.cu",
+        KernelFamily::Rollout,
+        include_str!("kernels/rollout.cu"),
+    ),
+    (
+        "attention.cu",
+        KernelFamily::Attention,
+        include_str!("kernels/attention.cu"),
+    ),
+    (
+        "attention_decode_online.cu",
+        KernelFamily::Uncertain,
+        include_str!("kernels/attention_decode_online.cu"),
+    ),
+    (
+        "bridge.cu",
+        KernelFamily::Bridge,
+        include_str!("kernels/bridge.cu"),
+    ),
+    (
+        "linear_attention.cu",
+        KernelFamily::Uncertain,
+        include_str!("kernels/linear_attention.cu"),
+    ),
+    (
+        "fp8_block_scaled.cu",
+        KernelFamily::Rollout,
+        include_str!("kernels/fp8_block_scaled.cu"),
+    ),
+];
 
 #[cfg(not(feature = "no-cuda"))]
 const FUNCTION_NAMES: &[&str] = &[
@@ -229,22 +342,7 @@ impl KernelCache {
                 }
                 #[cfg(not(feature = "no-cuda"))]
                 {
-                    let mut guard = self.bf16.lock().map_err(|_| {
-                        AutogradError::TapeInvariant("autograd cuda bf16 kernel cache poisoned")
-                    })?;
-                    if guard.is_none() {
-                        let (image, arch) =
-                            compile_cubin_for_current_device(&self.ctx, TapeDtype::Bf16)?;
-                        let module = self.ctx.load_module(image).map_err(|err| {
-                            cuda_kernel_error(format!(
-                                "cuda load_module failed for autograd bf16 kernels arch={arch}: {err:?}"
-                            ))
-                        })?;
-                        *guard = Some(DtypeModule {
-                            module,
-                            functions: HashMap::new(),
-                        });
-                    }
+                    let mut guard = self.ensure_bf16_module()?;
                     let entry = guard.as_mut().ok_or(AutogradError::TapeInvariant(
                         "autograd cuda bf16 module missing after compile",
                     ))?;
@@ -261,6 +359,90 @@ impl KernelCache {
             }
         }
     }
+
+    /// Compile-and-load the bf16 module under the cache lock, once.
+    #[cfg(not(feature = "no-cuda"))]
+    fn ensure_bf16_module(&self) -> Result<std::sync::MutexGuard<'_, Option<DtypeModule>>> {
+        let mut guard = self.bf16.lock().map_err(|_| {
+            AutogradError::TapeInvariant("autograd cuda bf16 kernel cache poisoned")
+        })?;
+        if guard.is_none() {
+            let (image, arch) = compile_cubin_for_current_device(&self.ctx, TapeDtype::Bf16)?;
+            let module = self.ctx.load_module(image).map_err(|err| {
+                cuda_kernel_error(format!(
+                    "cuda load_module failed for autograd bf16 kernels arch={arch}: {err:?}"
+                ))
+            })?;
+            *guard = Some(DtypeModule {
+                module,
+                functions: HashMap::new(),
+            });
+        }
+        Ok(guard)
+    }
+
+    /// Warm the NVRTC module for `dtype` ahead of the hot path. F32 always
+    /// compiles at construction; Bf16 compiles here when the tape dtype is
+    /// declared, instead of on the first hot-path `function_for` call.
+    pub(super) fn warm_dtype(&self, dtype: TapeDtype) -> Result<()> {
+        match dtype {
+            TapeDtype::F32 => Ok(()),
+            TapeDtype::Bf16 => {
+                #[cfg(feature = "no-cuda")]
+                {
+                    todo!(
+                        "GPU required: cuda kernel compilation is unavailable under feature no-cuda"
+                    )
+                }
+                #[cfg(not(feature = "no-cuda"))]
+                {
+                    self.ensure_bf16_module().map(|_| ())
+                }
+            }
+        }
+    }
+
+    /// Complete NVRTC artifact identity for the `dtype` compile unit.
+    pub(super) fn nvrtc_identity(&self, dtype: TapeDtype) -> Result<NvrtcIdentity> {
+        #[cfg(feature = "no-cuda")]
+        {
+            let _ = dtype;
+            todo!("GPU required: cuda kernel identity is unavailable under feature no-cuda")
+        }
+
+        #[cfg(not(feature = "no-cuda"))]
+        {
+            let arch = current_sm_arch(&self.ctx)?;
+            let (mut major, mut minor) = (0i32, 0i32);
+            // SAFETY: both out-pointers are valid for the duration of the call.
+            unsafe { nvrtc_sys::nvrtcVersion(&mut major, &mut minor) }
+                .result()
+                .map_err(|err| cuda_kernel_error(format!("nvrtcVersion failed: {err:?}")))?;
+            let mut driver = 0i32;
+            // SAFETY: the out-pointer is valid for the duration of the call.
+            unsafe { sys::cuDriverGetVersion(&mut driver) }
+                .result()
+                .map_err(|err| cuda_kernel_error(format!("cuDriverGetVersion failed: {err:?}")))?;
+            Ok(NvrtcIdentity {
+                source_hash: format!("{:016x}", fnv1a64(concat_sources(dtype).as_bytes())),
+                compile_flags: format!("--gpu-architecture={arch}"),
+                sm_arch: arch,
+                tape_dtype: dtype,
+                nvrtc_version: (major, minor),
+                cuda_driver_version: driver,
+            })
+        }
+    }
+}
+
+#[cfg(not(feature = "no-cuda"))]
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for &byte in bytes {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100_0000_01b3);
+    }
+    hash
 }
 
 #[cfg(not(feature = "no-cuda"))]
@@ -501,39 +683,11 @@ where
 
 #[cfg(not(feature = "no-cuda"))]
 fn concat_sources(dtype: TapeDtype) -> String {
-    let mut src = [
-        dtype.nvrtc_prelude(),
-        ELEMENTWISE_CU,
-        SOFTMAX_CU,
-        SILU_CU,
-        RMS_NORM_CU,
-        EMBEDDING_CU,
-        REDUCE_CU,
-        ROPE_CU,
-        GATHER_CU,
-        SCATTER_ADD_CU,
-        ADD_BROADCAST_CU,
-        LAYOUT_CU,
-        ADAMW_CU,
-        LOG_SOFTMAX_BACKWARD_CU,
-        GATHER_BACKWARD_CU,
-        ADD_INTO_CU,
-        MEAN_BACKWARD_CU,
-        MUL_SCALAR_BACKWARD_CU,
-        EMBEDDING_BACKWARD_CU,
-        ADD_BROADCAST_BACKWARD_CU,
-        ACTIVATION_BACKWARD_CU,
-        MUL_BACKWARD_CU,
-        RMS_NORM_BACKWARD_CU,
-        ROPE_BACKWARD_CU,
-        ROLLOUT_CU,
-        ATTENTION_CU,
-        ATTENTION_DECODE_ONLINE_CU,
-        BRIDGE_CU,
-        LINEAR_ATTENTION_CU,
-        FP8_BLOCK_SCALED_CU,
-    ]
-    .join("\n");
+    let mut src = dtype.nvrtc_prelude().to_string();
+    for (_, _, source) in KERNEL_SOURCES {
+        src.push('\n');
+        src.push_str(source);
+    }
     src.push('\n');
     src
 }
