@@ -2,6 +2,9 @@
 
 > Status: Proposed
 >
+> Parent plan:
+> [CUDA operator organization across kernels and models](2026-08-20-cuda-operator-organization.md).
+>
 > Scope: Qwen dense quantized linear dispatch in `infer-cuda`. This plan does
 > not change kernel math, serving APIs, model formats, or the backend seam.
 
