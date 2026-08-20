@@ -37,16 +37,15 @@ pub(super) enum DecodeRoute {
 /// plain batched path that scales. `gate` is `--spec-max-batch` (default 1).
 /// Pure so the routing is unit-tested without a GPU.
 ///
-/// `any_penalty` vetoes speculation: the draft and verify lanes commit tokens
-/// from device argmax / a rejection draw over raw target logits, neither of
-/// which sees the host-side repetition/frequency/presence penalties.
+/// `vetoed` covers request features the selected speculative implementation
+/// cannot apply to every accepted token in a chain.
 pub(super) fn route_decode(
     spec_kind: SpecKind,
     n_rows: usize,
     gate: usize,
-    any_penalty: bool,
+    vetoed: bool,
 ) -> DecodeRoute {
-    if any_penalty || n_rows > gate {
+    if vetoed || n_rows > gate {
         return DecodeRoute::Plain;
     }
     match spec_kind {

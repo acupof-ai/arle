@@ -20,6 +20,17 @@ fn speculative_chain_fits(start: usize, depth: usize, max_seq_len: usize) -> boo
         .is_some_and(|last_position| last_position < max_seq_len)
 }
 
+/// Qwen MTP/DSpark can reproduce raw greedy or temperature/top-k/top-p/min-p
+/// sampling. Every other token rewrite needs the plain one-token sampler.
+fn qwen_spec_decode_compatible(params: &SamplingParams) -> bool {
+    params.grammar_bitmask.is_none()
+        && params.logit_bias.is_empty()
+        && params.top_logprobs.is_none()
+        && params.force_next_token.is_none()
+        && params.max_thinking_tokens.is_none()
+        && !params.has_penalty()
+}
+
 /// One chain in a batched DSpark verify; `row0` indexes the shared logits and tap
 /// features.
 struct DsparkChain {
@@ -2348,15 +2359,18 @@ impl Qwen35CudaExecutor {
         // c=8 and −26.4% at c=16.
         // ponytail: batched DSpark is gated to BF16 KV; upgrade path is a quant-KV
         // parity entry (needle gate ×3 same-config vs the BF16 baseline).
+        let spec_compatible = decode_rows
+            .iter()
+            .all(|r| qwen_spec_decode_compatible(&r.params));
         let batched = kind == SpecKind::Dspark
             && self.paged_kv_bf16()
+            && spec_compatible
             && decode_rows.iter().all(|r| r.params.is_greedy());
-        let any_penalty = decode_rows.iter().any(|r| r.params.has_penalty());
         let gate = match batched {
             true => crate::runtime_flags::spec_max_batch(),
             false => 1,
         };
-        match super::spec_decode::route_decode(kind, decode_rows.len(), gate, any_penalty) {
+        match super::spec_decode::route_decode(kind, decode_rows.len(), gate, !spec_compatible) {
             DecodeRoute::Dspark => self.dspark_decode_batch(decode_rows, host_kv),
             DecodeRoute::Mtp => {
                 let mut tokens = Vec::with_capacity(decode_rows.len());
@@ -2958,10 +2972,32 @@ impl Qwen35CudaExecutor {
 #[cfg(test)]
 mod tier_io_tests {
     use super::*;
+
     #[test]
     fn speculative_chain_boundary_falls_back_before_verify_exceeds_max_seq_len() {
         assert!(speculative_chain_fits(12, 3, 16));
         assert!(!speculative_chain_fits(13, 3, 16));
         assert!(!speculative_chain_fits(usize::MAX, 1, usize::MAX));
+    }
+
+    #[test]
+    fn qwen_spec_vetoes_token_rewrites_and_thinking_budget() {
+        let mut params = SamplingParams::default();
+        assert!(qwen_spec_decode_compatible(&params));
+
+        params.force_next_token = Some(42);
+        assert!(!qwen_spec_decode_compatible(&params));
+        params.force_next_token = None;
+        params.max_thinking_tokens = Some(8);
+        assert!(!qwen_spec_decode_compatible(&params));
+        params.max_thinking_tokens = None;
+        params.logit_bias.push((42, 1.0));
+        assert!(!qwen_spec_decode_compatible(&params));
+        params.logit_bias.clear();
+        params.grammar_bitmask = Some(vec![u32::MAX].into());
+        assert!(!qwen_spec_decode_compatible(&params));
+        params.grammar_bitmask = None;
+        params.repetition_penalty = 1.1;
+        assert!(!qwen_spec_decode_compatible(&params));
     }
 }

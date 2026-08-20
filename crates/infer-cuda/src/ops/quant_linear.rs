@@ -895,6 +895,18 @@ fn try_w8a16_marlin_gemm_batch(
     x: &HiddenStates,
     out: &mut HiddenStates,
 ) -> Result<bool> {
+    let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
+    let (out_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
+    marlin_w8a16_gemm_raw(ctx, weight, x_ptr, out_ptr, x.seq_len)
+}
+
+fn marlin_w8a16_gemm_raw(
+    ctx: &DeviceContext,
+    weight: &DeviceMatrix,
+    x_ptr: u64,
+    out_ptr: u64,
+    m: usize,
+) -> Result<bool> {
     if weight.weight_format != WeightFormat::W8A16 || !marlin_sm_supported(ctx) {
         return Ok(false);
     }
@@ -907,8 +919,6 @@ fn try_w8a16_marlin_gemm_batch(
     let k = weight.cols; // contraction
     let (packed_ptr, _gp) = packed.device_ptr(&ctx.stream);
     let (scales_ptr, _gs) = scales.device_ptr(&ctx.stream);
-    let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
-    let (out_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
     let stream = ctx.stream.cu_stream();
     MARLIN_SCRATCH.with(|cell| -> Result<()> {
         let mut scratch = cell.borrow_mut();
@@ -917,9 +927,9 @@ fn try_w8a16_marlin_gemm_batch(
         let workspace = scratch.workspace.as_ref().unwrap();
         let (c_tmp_ptr, _gc) = c_tmp.device_ptr(&ctx.stream);
         let (ws_ptr, _gw) = workspace.device_ptr(&ctx.stream);
-        qwen_quant_profile(ctx, "qwen/w8a16/marlin_gemm", x.seq_len, n, k, || {
+        qwen_quant_profile(ctx, "qwen/w8a16/marlin_gemm", m, n, k, || {
             // SAFETY: all ptrs from live device allocations; packed/scales sized by
-            // repack_for_marlin_w8a16 for these dims, x=[seq_len,k], out=[seq_len,n],
+            // repack_for_marlin_w8a16 for these dims, x=[m,k], out=[m,n],
             // c_tmp/workspace sized to the SM max above.
             unsafe {
                 ffi::marlin_w8a16_gemm_cuda(
@@ -929,7 +939,7 @@ fn try_w8a16_marlin_gemm_batch(
                     out_ptr as *mut ffi::Half,
                     c_tmp_ptr as *mut f32,
                     ws_ptr as *mut i32,
-                    x.seq_len as i32,
+                    m as i32,
                     n as i32,
                     k as i32,
                     weight.group_size as i32,
@@ -1847,6 +1857,11 @@ pub(super) fn gemv(
     // — and silent for a per-channel FP8 weight whose source DeepGEMM kept
     // alive, so prove engagement from `cuda.qwen.fp8_marlin_tensorcore`.
     match weight.weight_format {
+        WeightFormat::W8A16 => {
+            if marlin_w8a16_gemm_raw(ctx, weight, x_ptr, out_ptr, 1)? {
+                return Ok(());
+            }
+        }
         WeightFormat::Fp4E2M1Group if fp4_route(ctx, weight, 1) == Fp4Route::Marlin => {
             marlin_fp4_gemm_raw(ctx, weight, x_ptr, out_ptr, 1)?;
             return Ok(());
