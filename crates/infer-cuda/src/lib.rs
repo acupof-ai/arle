@@ -146,7 +146,7 @@ pub fn set_qwen35_moe_experts_bf16_resident(enabled: bool) {
 /// Declare the row counts this engine's forwards can present: the most a decode
 /// step can carry (the executor's slot budget) and the most a prefill chunk can.
 /// Call BEFORE the executor loads its weights — the dense FP8 routing floor and
-/// the load-time weight retention that pairs with it both read this, and an
+/// the load-time DeepGEMM preparation that pairs with it both read this, and an
 /// undeclared envelope keeps every dense GEMM on its M-independent arm.
 #[cfg(feature = "cuda")]
 pub fn apply_dense_gemm_row_envelope(decode_rows: usize, prefill_rows: usize) {

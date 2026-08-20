@@ -2980,27 +2980,6 @@ impl DeviceMatrix {
         Ok(())
     }
 
-    /// Build the Marlin tensor-core layout for an NVFP4 weight
-    /// (compressed-tensors nvfp4-pack-quantized): transpose the packed E2M1
-    /// nibbles into GPTQ `[K/8, N]` i32, GPU-repack to Marlin tiles, and
-    /// re-encode the FP8 E4M3 group scales into the S0E5M3 form Marlin's FP8
-    /// scale dequant expects. `marlin_packed` holds both, concatenated —
-    /// `[K*N/2 weight bytes][N*K/16 scale bytes]`, one allocation because the
-    /// two are always read together — and `marlin_scales` the single BF16
-    /// global scale. No-op (leaves `marlin_packed` None → scalar GEMV fallback)
-    /// when the shape or group size is outside the kFE2M1f kernel's
-    /// instantiation. SM-gated by the caller (Ampere+).
-    ///
-    /// Releases `qweight_u8` / `qscale_fp8` on success — every arm that reads
-    /// an NVFP4 weight with a Marlin layout reads it from here, the DeepGEMM
-    /// prefill arm included (`dequantize_fp4_marlin_to_fp8_cuda`). Keeping them
-    /// stored the model twice: 39.3 GB resident for a 23.9 GB checkpoint.
-    /// `scale_f32` is small and stays.
-    ///
-    /// Scale encoding (vLLM `marlin_utils_fp4.nvfp4_marlin_process_scales`):
-    /// the kernel's weight dequant leaves a 2^-126 factor and the scale dequant
-    /// reads an 8-bit `[E5|M3]` field, so the byte is the high half of
-    /// `f16(scale * 2^7) << 1` and the leftover 2^119 is folded into the global
     /// scale. `scale_factor` is a power of two that lifts every scale above the
     /// E5-MSB-set floor; the global scale is divided by it.
     /// Build the per-128x128-block power of two the NVFP4 DeepGEMM prefill arm
@@ -3066,6 +3045,26 @@ impl DeviceMatrix {
         Ok(())
     }
 
+    /// Build the Marlin tensor-core layout for an NVFP4 weight
+    /// (compressed-tensors nvfp4-pack-quantized): transpose the packed E2M1
+    /// nibbles into GPTQ `[K/8, N]` i32, GPU-repack to Marlin tiles, and
+    /// re-encode the FP8 E4M3 group scales into the S0E5M3 form Marlin's FP8
+    /// scale dequant expects. `marlin_packed` holds both, concatenated —
+    /// `[K*N/2 weight bytes][N*K/16 scale bytes]`, one allocation because the
+    /// two are always read together — and `marlin_scales` the single BF16
+    /// when the shape or group size is outside the kFE2M1f kernel's
+    /// instantiation. SM-gated by the caller (Ampere+).
+    ///
+    /// Releases `qweight_u8` / `qscale_fp8` on success — every arm that reads
+    /// an NVFP4 weight with a Marlin layout reads it from here, the DeepGEMM
+    /// prefill arm included (`dequantize_fp4_marlin_to_fp8_cuda`). Keeping them
+    /// stored the model twice: 39.3 GB resident for a 23.9 GB checkpoint.
+    /// `scale_f32` is small and stays.
+    ///
+    /// Scale encoding (vLLM `marlin_utils_fp4.nvfp4_marlin_process_scales`):
+    /// the kernel's weight dequant leaves a 2^-126 factor and the scale dequant
+    /// reads an 8-bit `[E5|M3]` field, so the byte is the high half of
+    /// `f16(scale * 2^7) << 1` and the leftover 2^119 is folded into the global
     pub fn repack_for_marlin_fp4(&mut self, ctx: &DeviceContext) -> Result<()> {
         if self.weight_format != WeightFormat::Fp4E2M1Group
             || self.qweight_u8.is_none()

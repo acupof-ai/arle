@@ -625,6 +625,95 @@ pub(super) fn warm_fp8_deepgemm_dense(
     Ok(true)
 }
 
+/// Quantise the activation to E4M3 and run DeepGEMM's dense NT GEMM. Shared by
+/// both prefill arms — they differ only in where `b` and `sfb` come from, and
+/// the packing contract (`scale_stride_m`, the active_* triple) has to move in
+/// lockstep with the kernel, so it lives in one place.
+fn deepgemm_dense_nt(
+    ctx: &DeviceContext,
+    x: &HiddenStates,
+    out: &mut HiddenStates,
+    b: RawDevicePtr<u8>,
+    sfb: RawDevicePtr<f32>,
+    n: usize,
+    k: usize,
+    tag: &'static str,
+) -> Result<()> {
+    let m = x.seq_len;
+    let scale_stride_m = m.div_ceil(4) * 4;
+    let scale_cols = k.div_ceil(128);
+    QWEN_FP8_DENSE_SCRATCH.with(|cell| -> Result<()> {
+        let mut scratch = cell.borrow_mut();
+        scratch.ensure(ctx, m * k, scale_stride_m * scale_cols)?;
+        {
+            let active_counts = scratch
+                .active_counts
+                .as_mut()
+                .ok_or_else(|| anyhow!("{tag} DeepGEMM active_counts missing"))?;
+            ctx.stream
+                .memcpy_htod(&[i32::try_from(m)?], active_counts)
+                .map_err(|e| anyhow!("{tag} DeepGEMM active_counts H2D failed: {e}"))?;
+        }
+        let input_fp8 = scratch
+            .input_fp8
+            .as_ref()
+            .ok_or_else(|| anyhow!("{tag} DeepGEMM input scratch missing"))?;
+        let input_scales = scratch
+            .input_scales
+            .as_ref()
+            .ok_or_else(|| anyhow!("{tag} DeepGEMM scale scratch missing"))?;
+        let active_experts = scratch
+            .active_experts
+            .as_ref()
+            .ok_or_else(|| anyhow!("{tag} DeepGEMM active_experts missing"))?;
+        let active_offsets = scratch
+            .active_offsets
+            .as_ref()
+            .ok_or_else(|| anyhow!("{tag} DeepGEMM active_offsets missing"))?;
+        let active_counts = scratch
+            .active_counts
+            .as_ref()
+            .ok_or_else(|| anyhow!("{tag} DeepGEMM active_counts missing"))?;
+        // SAFETY: ptrs from live device allocations sized to the dims passed.
+        qwen_quant_profile(
+            ctx,
+            "qwen/deepgemm/dense_pack_quantize",
+            m,
+            n,
+            k,
+            || unsafe {
+                cuda_moe::dsv4_deepgemm_pack_quantize_bf16_to_fp8(
+                    cache_ptr(&x.data, ctx),
+                    cache_ptr(input_fp8, ctx),
+                    cache_ptr(input_scales, ctx),
+                    cache_ptr(active_experts, ctx),
+                    cache_ptr(active_offsets, ctx),
+                    cache_ptr(active_counts, ctx),
+                    1,
+                    m,
+                    k,
+                    scale_stride_m,
+                    ctx.stream.cu_stream(),
+                )
+            },
+        )?;
+        // SAFETY: ptrs from live device allocations sized to the dims passed.
+        qwen_quant_profile(ctx, "qwen/deepgemm/dense_gemm", m, n, k, || unsafe {
+            cuda_moe::dsv4_deepgemm_fp8_gemm_nt(
+                cache_ptr(input_fp8, ctx),
+                cache_ptr(input_scales, ctx),
+                b,
+                sfb,
+                cache_ptr(&out.data, ctx),
+                m,
+                n,
+                k,
+                scale_stride_m,
+                ctx.stream.cu_stream(),
+            )
+        })
+    })
+}
 fn try_fp8_deepgemm_dense_batch(
     ctx: &DeviceContext,
     weight: &DeviceMatrix,
@@ -683,83 +772,23 @@ fn try_fp8_deepgemm_dense_batch(
             })?
         }
     };
-    let scale_stride_m = m.div_ceil(4) * 4;
-    let scale_cols = k.div_ceil(128);
-    QWEN_FP8_DENSE_SCRATCH.with(|cell| -> Result<()> {
-        let mut scratch = cell.borrow_mut();
-        scratch.ensure(ctx, m * k, scale_stride_m * scale_cols)?;
-        if layout == Fp8DeepGemmLayout::PerChannel {
-            scratch.ensure_sfb_ones(ctx, n, k)?;
+    let sfb = match layout {
+        Fp8DeepGemmLayout::Blocked => cache_ptr(scales, ctx),
+        // Per-channel scales are not DeepGEMM's [ceil(n/128), ceil(k/128)] grid,
+        // so it contracts against ones and the channel scale lands in the epilogue.
+        Fp8DeepGemmLayout::PerChannel => {
+            QWEN_FP8_DENSE_SCRATCH.with(|cell| -> Result<RawDevicePtr<f32>> {
+                let mut scratch = cell.borrow_mut();
+                scratch.ensure_sfb_ones(ctx, n, k)?;
+                let ones = scratch
+                    .sfb_ones
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("Qwen FP8 dense DeepGEMM sfb ones scratch missing"))?;
+                Ok(cache_ptr(ones, ctx))
+            })?
         }
-        {
-            let active_counts = scratch
-                .active_counts
-                .as_mut()
-                .ok_or_else(|| anyhow!("Qwen FP8 dense DeepGEMM active_counts missing"))?;
-            ctx.stream
-                .memcpy_htod(&[i32::try_from(m)?], active_counts)
-                .map_err(|e| anyhow!("Qwen FP8 dense DeepGEMM active_counts H2D failed: {e}"))?;
-        }
-        let input_fp8 = scratch
-            .input_fp8
-            .as_ref()
-            .ok_or_else(|| anyhow!("Qwen FP8 dense DeepGEMM input scratch missing"))?;
-        let input_scales = scratch
-            .input_scales
-            .as_ref()
-            .ok_or_else(|| anyhow!("Qwen FP8 dense DeepGEMM scale scratch missing"))?;
-        let active_experts = scratch
-            .active_experts
-            .as_ref()
-            .ok_or_else(|| anyhow!("Qwen FP8 dense DeepGEMM active_experts missing"))?;
-        let active_offsets = scratch
-            .active_offsets
-            .as_ref()
-            .ok_or_else(|| anyhow!("Qwen FP8 dense DeepGEMM active_offsets missing"))?;
-        let active_counts = scratch
-            .active_counts
-            .as_ref()
-            .ok_or_else(|| anyhow!("Qwen FP8 dense DeepGEMM active_counts missing"))?;
-        let sfb = match layout {
-            Fp8DeepGemmLayout::Blocked => scales,
-            Fp8DeepGemmLayout::PerChannel => scratch
-                .sfb_ones
-                .as_ref()
-                .ok_or_else(|| anyhow!("Qwen FP8 dense DeepGEMM sfb ones scratch missing"))?,
-        };
-
-        // SAFETY: ptrs from live device allocations sized to the dims passed.
-        qwen_quant_profile(ctx, "qwen/fp8/dense_pack_quantize", m, n, k, || unsafe {
-            cuda_moe::dsv4_deepgemm_pack_quantize_bf16_to_fp8(
-                cache_ptr(&x.data, ctx),
-                cache_ptr(input_fp8, ctx),
-                cache_ptr(input_scales, ctx),
-                cache_ptr(active_experts, ctx),
-                cache_ptr(active_offsets, ctx),
-                cache_ptr(active_counts, ctx),
-                1,
-                m,
-                k,
-                scale_stride_m,
-                ctx.stream.cu_stream(),
-            )
-        })?;
-        // SAFETY: ptrs from live device allocations sized to the dims passed.
-        qwen_quant_profile(ctx, "qwen/fp8/dense_deepgemm", m, n, k, || unsafe {
-            cuda_moe::dsv4_deepgemm_fp8_gemm_nt(
-                cache_ptr(input_fp8, ctx),
-                cache_ptr(input_scales, ctx),
-                b,
-                cache_ptr(sfb, ctx),
-                cache_ptr(&out.data, ctx),
-                m,
-                n,
-                k,
-                scale_stride_m,
-                ctx.stream.cu_stream(),
-            )
-        })
-    })?;
+    };
+    deepgemm_dense_nt(ctx, x, out, b, sfb, n, k, "Qwen FP8 dense")?;
     if layout == Fp8DeepGemmLayout::PerChannel {
         let (out_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
         let (scales_ptr, _gs) = scales.device_ptr(&ctx.stream);
@@ -782,11 +811,6 @@ fn try_fp8_deepgemm_dense_batch(
     Ok(Some(layout))
 }
 
-/// Grow the shared BF16 dequant scratch to `elems`, returning false when the
-/// device is out of memory. A failed reservation is not fatal: the callers all
-/// have a scalar GEMV path that computes the same result without the resident
-/// BF16 copy, which is what a VRAM-committed box (full KV + recurrent pools)
-/// needs to fall back to.
 /// Grow the shared E4M3 weight scratch to `bytes`, returning false when the
 /// allocation fails — the caller then leaves the weight to Marlin.
 fn reserve_fp8_weight_scratch(ctx: &DeviceContext, bytes: usize) -> bool {
@@ -806,6 +830,11 @@ fn reserve_fp8_weight_scratch(ctx: &DeviceContext, bytes: usize) -> bool {
     })
 }
 
+/// Grow the shared BF16 dequant scratch to `elems`, returning false when the
+/// device is out of memory. A failed reservation is not fatal: the callers all
+/// have a scalar GEMV path that computes the same result without the resident
+/// BF16 copy, which is what a VRAM-committed box (full KV + recurrent pools)
+/// needs to fall back to.
 fn reserve_dequant_scratch(ctx: &DeviceContext, elems: usize) -> bool {
     QWEN_FP8_DEQUANT_SCRATCH.with(|cell| {
         let mut scratch = cell.borrow_mut();
@@ -1080,28 +1109,24 @@ fn try_fp4_deepgemm_gemm_batch(
     if !reserve_fp8_weight_scratch(ctx, n * k) {
         return Ok(false);
     }
-    let scale_stride_m = m.div_ceil(4) * 4;
-    let scale_cols = k.div_ceil(128);
-
-    QWEN_FP8_DEQUANT_SCRATCH.with(|cell| -> Result<()> {
-        let dequant = cell.borrow();
-        let weight_fp8 = dequant
+    // Widen Marlin's nibbles to E4M3 in scratch. The pointer outlives the borrow,
+    // and the GEMM is ordered after it on the same stream.
+    let b = QWEN_FP8_DEQUANT_SCRATCH.with(|cell| -> Result<RawDevicePtr<u8>> {
+        let scratch = cell.borrow();
+        let dst = scratch
             .weight_fp8
             .as_ref()
             .ok_or_else(|| anyhow!("NVFP4 DeepGEMM E4M3 weight scratch missing"))?;
-        let (packed_ptr, _gq) = packed.device_ptr(&ctx.stream);
-        let (global_ptr, _gl) = global.device_ptr(&ctx.stream);
-        let (sfb_ptr, _gf) = sfb.device_ptr(&ctx.stream);
-        let (wfp8_ptr, _gw) = weight_fp8.device_ptr(&ctx.stream);
+        let dst_ptr = cache_ptr(dst, ctx);
         qwen_quant_profile(ctx, "qwen/fp4/dense_widen_fp8", m, n, k, || {
             // SAFETY: ptrs from live device allocations sized to the dims passed.
             unsafe {
                 ffi::dequantize_fp4_marlin_to_fp8_cuda(
-                    packed_ptr as *const u8,
-                    global_ptr as *const f32,
-                    sfb_ptr as *const f32,
+                    cache_ptr(packed, ctx).as_ptr(),
+                    cache_ptr(global, ctx).as_ptr(),
+                    cache_ptr(sfb, ctx).as_ptr(),
                     1.0 / weight.fp4_marlin_scale_lift,
-                    wfp8_ptr as *mut u8,
+                    dst_ptr.as_mut_ptr(),
                     n as i32,
                     k as i32,
                     weight.group_size as i32,
@@ -1111,72 +1136,9 @@ fn try_fp4_deepgemm_gemm_batch(
                 .map_err(|e| anyhow!("NVFP4 widen-to-E4M3 kernel failed: {e}"))
             }
         })?;
-
-        QWEN_FP8_DENSE_SCRATCH.with(|dense_cell| -> Result<()> {
-            let mut dense = dense_cell.borrow_mut();
-            dense.ensure(ctx, m * k, scale_stride_m * scale_cols)?;
-            {
-                let active_counts = dense
-                    .active_counts
-                    .as_mut()
-                    .ok_or_else(|| anyhow!("NVFP4 DeepGEMM active_counts missing"))?;
-                ctx.stream
-                    .memcpy_htod(&[i32::try_from(m)?], active_counts)
-                    .map_err(|e| anyhow!("NVFP4 DeepGEMM active_counts H2D failed: {e}"))?;
-            }
-            let input_fp8 = dense
-                .input_fp8
-                .as_ref()
-                .ok_or_else(|| anyhow!("NVFP4 DeepGEMM input scratch missing"))?;
-            let input_scales = dense
-                .input_scales
-                .as_ref()
-                .ok_or_else(|| anyhow!("NVFP4 DeepGEMM scale scratch missing"))?;
-            let active_experts = dense
-                .active_experts
-                .as_ref()
-                .ok_or_else(|| anyhow!("NVFP4 DeepGEMM active_experts missing"))?;
-            let active_offsets = dense
-                .active_offsets
-                .as_ref()
-                .ok_or_else(|| anyhow!("NVFP4 DeepGEMM active_offsets missing"))?;
-            let active_counts = dense
-                .active_counts
-                .as_ref()
-                .ok_or_else(|| anyhow!("NVFP4 DeepGEMM active_counts missing"))?;
-            // SAFETY: ptrs from live device allocations sized to the dims passed.
-            qwen_quant_profile(ctx, "qwen/fp4/dense_pack_quantize", m, n, k, || unsafe {
-                cuda_moe::dsv4_deepgemm_pack_quantize_bf16_to_fp8(
-                    cache_ptr(&x.data, ctx),
-                    cache_ptr(input_fp8, ctx),
-                    cache_ptr(input_scales, ctx),
-                    cache_ptr(active_experts, ctx),
-                    cache_ptr(active_offsets, ctx),
-                    cache_ptr(active_counts, ctx),
-                    1,
-                    m,
-                    k,
-                    scale_stride_m,
-                    ctx.stream.cu_stream(),
-                )
-            })?;
-            // SAFETY: ptrs from live device allocations sized to the dims passed.
-            qwen_quant_profile(ctx, "qwen/fp4/dense_deepgemm", m, n, k, || unsafe {
-                cuda_moe::dsv4_deepgemm_fp8_gemm_nt(
-                    cache_ptr(input_fp8, ctx),
-                    cache_ptr(input_scales, ctx),
-                    cache_ptr(weight_fp8, ctx),
-                    cache_ptr(sfb, ctx),
-                    cache_ptr(&out.data, ctx),
-                    m,
-                    n,
-                    k,
-                    scale_stride_m,
-                    ctx.stream.cu_stream(),
-                )
-            })
-        })
+        Ok(dst_ptr)
     })?;
+    deepgemm_dense_nt(ctx, x, out, b, cache_ptr(sfb, ctx), n, k, "NVFP4")?;
     Ok(true)
 }
 
@@ -1208,7 +1170,7 @@ fn marlin_fp4_gemm_raw(
     let (Some(packed), Some(global)) =
         (weight.marlin_packed.as_ref(), weight.marlin_scales.as_ref())
     else {
-        unreachable!("fp4_route returns Marlin only when both are Some")
+        unreachable!("fp4_marlin_ready returns true only when both are Some")
     };
     let n = weight.rows; // output dim
     let k = weight.cols; // contraction
@@ -1492,15 +1454,15 @@ pub(super) fn gemm_batch(
 
     // NVFP4 at prefill M: widen the nibbles to E4M3 and contract on the FP8
     // tensor cores. Ahead of Marlin because Marlin claims every M — the two
-    // are separated by the M floor inside this arm, not by `fp4_route`.
+    // are separated by the M floor inside this arm, not by `fp4_marlin_ready`.
     if try_fp4_deepgemm_gemm_batch(ctx, weight, x, out)? {
         FP4_DEEPGEMM_HITS.fetch_add(1, Ordering::Relaxed);
         return Ok(());
     }
 
-    // NVFP4 tensor-core (Ampere+): Marlin GEMM when the weight was repacked at
-    // load AND M is inside the window where it beats the dequant→cuBLAS path
-    // below. Supersedes the scalar FP4 GEMV there. False when not repacked.
+    // NVFP4 tensor-core: Marlin takes every M the DeepGEMM arm above declined,
+    // which is every M below its prefill floor. NVFP4 has no other path — a
+    // weight that cannot take the Marlin layout fails at load.
     if try_fp4_marlin_gemm_batch(ctx, weight, x, out)? {
         return Ok(());
     }
@@ -1754,55 +1716,6 @@ pub(super) fn gemv(
                 )
                 .result()?;
                 FP8_GEMV_HITS.fetch_add(1, Ordering::Relaxed);
-            }
-            WeightFormat::Fp4E2M1Group => {
-                ensure!(
-                    weight.quant_scale_rows == weight.rows,
-                    "fp4_e2m1_group scale rows {} != weight rows {}",
-                    weight.quant_scale_rows,
-                    weight.rows
-                );
-                ensure!(
-                    weight.group_size > 0
-                        && weight.quant_scale_cols == weight.cols / weight.group_size,
-                    "fp4_e2m1_group scale cols {} incompatible with cols {} group_size {}",
-                    weight.quant_scale_cols,
-                    weight.cols,
-                    weight.group_size
-                );
-                let qw = weight
-                    .qweight_u8
-                    .as_ref()
-                    .ok_or_else(|| anyhow!("fp4_e2m1_group missing qweight_u8"))?;
-                let scales = weight
-                    .qscale_fp8
-                    .as_ref()
-                    .ok_or_else(|| anyhow!("fp4_e2m1_group missing qscale_fp8"))?;
-                let global = weight
-                    .scale_f32
-                    .as_ref()
-                    .ok_or_else(|| anyhow!("fp4_e2m1_group missing scale_f32 global scale"))?;
-                ensure!(
-                    global.len() == 1,
-                    "fp4_e2m1_group dispatch currently supports one global scale, got {}",
-                    global.len()
-                );
-                let (qw_ptr, _gqw) = qw.device_ptr(&ctx.stream);
-                let (scales_ptr, _gs) = scales.device_ptr(&ctx.stream);
-                let (global_ptr, _gg) = global.device_ptr(&ctx.stream);
-                ffi::gemv_fp4_e2m1_group_cuda(
-                    qw_ptr as *const u8,
-                    scales_ptr as *const u8,
-                    global_ptr as *const f32,
-                    x_ptr as *const ffi::Half,
-                    out_ptr as *mut ffi::Half,
-                    weight.rows as i32,
-                    weight.cols as i32,
-                    weight.group_size as i32,
-                    weight.quant_scale_cols as i32,
-                    stream,
-                )
-                .result()?;
             }
             // DSv4 block-scaled resident weights at M=1 (the DSpark draft head's
             // projections run seq_len=1). The base decode routes these through the

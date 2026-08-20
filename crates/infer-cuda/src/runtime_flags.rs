@@ -187,7 +187,7 @@ pub(crate) fn dense_gemm_row_envelope() -> Option<(usize, usize)> {
     }
 }
 /// Set by `infer_cuda::apply_dense_gemm_row_envelope` from the one CUDA engine
-/// constructor, before the weights load: the load-time retention decisions read
+/// constructor, before the weights load: the load-time DeepGEMM preparation reads
 /// it, so a later call cannot move them. Widens rather than replaces — an OPD
 /// process builds a teacher and a student against these same statics, and a
 /// floor derived from the narrower of the two would sit inside the other's
