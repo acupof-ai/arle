@@ -1,7 +1,6 @@
 # Qwen speculative thinking budget and W8A16 lm_head routing — 2026-08-20
 
-> Status: **Thinking budget confirmed on GPU. W8A16 lm_head routing still
-> unvalidated — no checkpoint on the box can reach it (see Result).**
+> Status: **Both confirmed on GPU.**
 
 ## Context
 
@@ -51,26 +50,33 @@ evidence.
 all three, and generation continues correctly past the forced `</think>` —
 `17 * 23 = 391`, then a step-by-step answer and a proof. `SERVER_ERRORS=0`.
 
-**2. W8A16 lm_head — NOT validated, and not validatable on this box.** Both
-W8A16 checkpoints under `/data00` (`qwen35-08b-w8a16`, `qwen35-08b-w8a16b`) set
-`tie_word_embeddings: true`, and the tied `embed_tokens.weight` is BF16
-`[248320, 1024]`. The `lm_head` a serve builds from them is therefore never
-`WeightFormat::W8A16`, so the new single-row arm cannot be reached.
+**2. W8A16 lm_head — confirmed.** Same binary, one prompt, the only difference
+being whether `lm_head` is a tied BF16 tensor or a quantised untied one:
 
-What the smoke run does show: the model loads and generates correctly (`The
-capital of France is` -> ` Paris.`), `SERVER_ERRORS=0`, and the batched
-projections still take Marlin — `cuda.w8a16.marlin_tensorcore` 288. That covers
-the refactor, not the fix.
+| checkpoint | `w8a16.marlin_tensorcore` | `w8a16.gemv` |
+|---|---:|---:|
+| `qwen35-08b-w8a16` (tied, BF16 lm_head) | 288 | 36 |
+| `qwen35-08b-w8a16-lmhead` (untied, W8A16) | **291** | 36 |
 
-`cuda.w8a16.gemv` 36 confirms the arm is being *called* at m=1 and returning
-false: those 36 single-row calls are weights `repack_for_marlin_w8a16` declined,
-which is the fall-through case, not the case this change exists for. Note also
-that `MARLIN_W8A16_HITS` increments inside `marlin_w8a16_gemm_raw`, so the batch
-and single-row lanes share one counter and a future run cannot separate them
-from `/v1/stats` alone.
+The +3 is `lm_head`'s three single-row calls taking Marlin. Without this fix they
+fall to the scalar arm, and the W8A16 repack has already freed `qweight` and
+`qscales`, so the result is a missing-source error rather than a slow path. Both
+arms answer `Paris`. `gemv` is unchanged at 36, so the new arm caught `lm_head`
+rather than stealing another format's calls.
 
-Parameters item 2 stays open. Closing it needs a Qwen3.5/3.6 checkpoint with
-`lm_head.weight` quantized at group size 128 and untied.
+**Why this looked unvalidatable.** The first pass reported no checkpoint on the
+box could reach the arm, which was true but not the reason. `scripts/quantize.py`
+lists `lm_head.weight` in `W8A16_SKIP_ENDINGS` (:246), so the repo's own
+quantiser does not produce this input by design — the path had never had one.
+That skip's comment says the loader reads those tensors BF16-only and quantising
+them crashes serve; it is stale. `load_output_head_quant_aware`
+(`loader.rs:1497`) is quant-aware and goes through `load_matrix_quant_aware` +
+`marlin_repack_dense`. The loader and the dispatch had already converged; only
+the quantiser was still on the old coverage.
+
+`scripts/make_w8a16_lmhead_checkpoint.py` builds the input: untie the embedding
+and quantise it into an `lm_head` with the quantiser's own per-row
+per-128-group symmetric INT8 (max abs error 9.07e-4 on `[248320, 1024]`).
 
 ## Environment
 
