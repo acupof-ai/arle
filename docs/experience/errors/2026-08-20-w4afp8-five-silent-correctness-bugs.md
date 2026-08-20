@@ -1,6 +1,6 @@
 # W4AFP8 MoE path: five silent-correctness bugs shipped, caught by review — CUDA, 2026-08-20
 
-> Status: Fix committed (`7cde1ce84` + shape validation), math gate 3/3 PASS. Long-prefill + concurrent verification pending-remote.
+> Status: Fix committed (`7cde1ce84`), partially lost when replaced by `6f1b416e4` (kept 3 of 5 fixes), re-applied in `ee8640904`. Math gate 4/4 PASS on the re-applied binary. Long-prefill + concurrent verification pending-remote.
 
 ## Context
 
