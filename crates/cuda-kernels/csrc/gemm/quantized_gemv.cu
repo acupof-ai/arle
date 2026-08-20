@@ -53,8 +53,21 @@ __device__ __forceinline__ float dsv4_decode_fp8_e4m3(uint8_t bits) {
     return static_cast<float>(value);
 }
 
+// Pure ALU, no table. The LUT is __constant__ and the nibble index is divergent,
+// so a warp reading 16 distinct values serialises into replays — the widen kernel
+// does 16 of these per work item and measured 0.756 ms/call against a 0.093 ms
+// roofline, 15x its FP8 twin which has no table.
+//
+// Bit-identical to DSV4_FP4_E2M1_LUT on all 16 inputs, checked exhaustively. The
+// magnitude field is [exp:2][mant:1] with bias 1: exp == 0 is E2M1's subnormal
+// step (0 and 0.5), everything above is (1 + mant/2) * 2^(exp-1).
 __device__ __forceinline__ float dsv4_decode_fp4_e2m1(uint8_t bits) {
-    return DSV4_FP4_E2M1_LUT[bits & 0x0f];
+    const uint32_t m = bits & 0x7u;
+    const uint32_t e = m >> 1;
+    const uint32_t sign = (uint32_t)(bits & 0x8u) << 28;
+    const uint32_t mag = (e == 0u) ? ((m & 1u) ? 0x3F000000u : 0u)
+                                   : (((126u + e) << 23) | ((m & 1u) << 22));
+    return __uint_as_float(sign | mag);
 }
 
 __device__ __forceinline__ float dsv4_block_scale(
@@ -342,10 +355,11 @@ __device__ __forceinline__ float marlin_s0e5m3_to_f32(uint8_t bits) {
 // group `g`: transpose to [K/16, N], an 8x8 transpose inside each 64-run, then
 // [0,2,1,3] inside each 4-run. N % 64 keeps every 64-run inside one group row.
 __device__ __forceinline__ int marlin_fp4_scale_tail(int n, int g, int N) {
-    const int R[4] = {0, 2, 1, 3};
     const int nn = n & 63;
     const int x = (nn & 7) * 8 + (nn >> 3);
-    const int f = (x & ~3) + R[x & 3];
+    // {0,2,1,3}[i] is i's low two bits swapped. As a local array with a dynamic
+    // index nvcc puts it in local memory, which is a load per call.
+    const int f = (x & ~3) | ((x & 1) << 1) | ((x & 3) >> 1);
     return (g * (N >> 6) + (n >> 6)) * 64 + f;
 }
 
