@@ -1622,21 +1622,8 @@ impl SafetensorLoader {
                 .stream
                 .alloc_zeros::<f32>(attn_sink.len)
                 .map_err(|e| anyhow!("DSv4 attn_sink f32 mirror alloc failed: {e}"))?;
-            let (src_ptr, _sg) = attn_sink.data.device_ptr(&ctx.stream);
-            let (dst_ptr, _dg) = dst.device_ptr_mut(&ctx.stream);
-            // SAFETY: ptrs from live device allocations sized to the dims passed.
-            unsafe {
-                ffi::arle_bf16_to_f32_cuda(
-                    src_ptr as *const ffi::Half,
-                    dst_ptr as *mut f32,
-                    attn_sink.len as i32,
-                    ctx.stream.cu_stream(),
-                )
-                .result()
+            cuda_kernels::tensor_ops::bf16_to_f32(ctx, &attn_sink.data, &mut dst, attn_sink.len)
                 .map_err(|e| anyhow!("DSv4 attn_sink bf16->f32 mirror failed: {e}"))?;
-            }
-            drop(_dg);
-            drop(_sg);
             (Some(attn_sink), Some(dst))
         };
         // GLM (`plain_o_proj`) ships FP8 + F32 `weight_scale_inv`: dequant the Q/KV

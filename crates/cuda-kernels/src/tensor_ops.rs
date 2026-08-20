@@ -433,6 +433,452 @@ pub fn split2(
     }
 }
 
+/// Expand token embeddings `[num_tokens, hidden_size]` into the initial wide
+/// DSv4 hyper-connection stream `[num_tokens, hidden_size * hc_mult]` (each
+/// lane seeded from the embedding).
+pub fn dsv4_mhc_expand(
+    ctx: &DeviceContext,
+    embeddings: &impl DevicePtr<bf16>,
+    out: &mut impl DevicePtrMut<bf16>,
+    num_tokens: usize,
+    hidden_size: usize,
+    hc_mult: usize,
+) -> Result<()> {
+    let row = extent(hidden_size, hc_mult, "dsv4_mhc_expand row")?;
+    ensure!(
+        embeddings.len() >= extent(num_tokens, hidden_size, "dsv4_mhc_expand embeddings")?
+            && out.len() >= extent(num_tokens, row, "dsv4_mhc_expand out")?,
+        "dsv4_mhc_expand buffers do not cover [tokens,hidden,hc]=[{num_tokens},{hidden_size},{hc_mult}]: embeddings={} out={}",
+        embeddings.len(),
+        out.len()
+    );
+    let (emb_ptr, _ge) = embeddings.device_ptr(&ctx.stream);
+    let (out_ptr, _go) = out.device_ptr_mut(&ctx.stream);
+    // SAFETY: lengths checked above; both buffers belong to `ctx.stream`.
+    unsafe {
+        ffi::dsv4_mhc_expand_cuda(
+            emb_ptr as *const Half,
+            out_ptr as *mut Half,
+            i32::try_from(num_tokens)?,
+            i32::try_from(hidden_size)?,
+            i32::try_from(hc_mult)?,
+            ctx.stream.cu_stream(),
+        )
+        .result()
+        .map_err(|e| {
+            anyhow!(
+                "dsv4_mhc_expand_cuda failed at [tokens,hidden,hc]=[{num_tokens},{hidden_size},{hc_mult}]: {e}"
+            )
+        })
+    }
+}
+
+/// Sinkhorn-normalized DSv4 hyper-connection mixer: per token, project the
+/// wide residual stream + its `mixes` row through `base`/`scale` into the
+/// per-lane `pre`/`post`/`comb` f32 mixing weights (`scale` carries the three
+/// per-family scalars).
+#[allow(clippy::too_many_arguments)]
+pub fn dsv4_mhc_params(
+    ctx: &DeviceContext,
+    residual: &impl DevicePtr<bf16>,
+    mixes: &impl DevicePtr<bf16>,
+    base: &impl DevicePtr<bf16>,
+    scale: &impl DevicePtr<bf16>,
+    pre: &mut impl DevicePtrMut<f32>,
+    post: &mut impl DevicePtrMut<f32>,
+    comb: &mut impl DevicePtrMut<f32>,
+    num_tokens: usize,
+    residual_hidden_dim: usize,
+    mix_dim: usize,
+    hc_mult: usize,
+    eps: f32,
+    sinkhorn_iters: usize,
+) -> Result<()> {
+    let lanes = extent(num_tokens, hc_mult, "dsv4_mhc_params lanes")?;
+    ensure!(
+        residual.len() >= extent(num_tokens, residual_hidden_dim, "dsv4_mhc_params residual")?
+            && mixes.len() >= extent(num_tokens, mix_dim, "dsv4_mhc_params mixes")?
+            && base.len() >= mix_dim
+            && scale.len() >= 3
+            && pre.len() >= lanes
+            && post.len() >= lanes
+            && comb.len() >= extent(lanes, hc_mult, "dsv4_mhc_params comb")?,
+        "dsv4_mhc_params buffers do not cover [tokens,stream,mix,hc]=[{num_tokens},{residual_hidden_dim},{mix_dim},{hc_mult}]: residual={} mixes={} base={} scale={} pre={} post={} comb={}",
+        residual.len(),
+        mixes.len(),
+        base.len(),
+        scale.len(),
+        pre.len(),
+        post.len(),
+        comb.len()
+    );
+    let (res_ptr, _gr) = residual.device_ptr(&ctx.stream);
+    let (mix_ptr, _gm) = mixes.device_ptr(&ctx.stream);
+    let (base_ptr, _gb) = base.device_ptr(&ctx.stream);
+    let (scale_ptr, _gs) = scale.device_ptr(&ctx.stream);
+    let (pre_ptr, _gp) = pre.device_ptr_mut(&ctx.stream);
+    let (post_ptr, _gpo) = post.device_ptr_mut(&ctx.stream);
+    let (comb_ptr, _gc) = comb.device_ptr_mut(&ctx.stream);
+    // SAFETY: lengths checked above; all buffers belong to `ctx.stream`.
+    unsafe {
+        ffi::dsv4_mhc_params_cuda(
+            res_ptr as *const Half,
+            mix_ptr as *const Half,
+            base_ptr as *const Half,
+            scale_ptr as *const Half,
+            pre_ptr as *mut f32,
+            post_ptr as *mut f32,
+            comb_ptr as *mut f32,
+            i32::try_from(num_tokens)?,
+            i32::try_from(residual_hidden_dim)?,
+            i32::try_from(mix_dim)?,
+            i32::try_from(hc_mult)?,
+            eps,
+            i32::try_from(sinkhorn_iters)?,
+            ctx.stream.cu_stream(),
+        )
+        .result()
+        .map_err(|e| {
+            anyhow!(
+                "dsv4_mhc_params_cuda failed at [tokens,stream,mix,hc]=[{num_tokens},{residual_hidden_dim},{mix_dim},{hc_mult}]: {e}"
+            )
+        })
+    }
+}
+
+/// Collapse the wide DSv4 stream to one `hidden_size` row per token using the
+/// pre-mix lane weights.
+pub fn dsv4_mhc_pre(
+    ctx: &DeviceContext,
+    residual: &impl DevicePtr<bf16>,
+    pre: &impl DevicePtr<f32>,
+    out: &mut impl DevicePtrMut<bf16>,
+    num_tokens: usize,
+    hidden_size: usize,
+    hc_mult: usize,
+) -> Result<()> {
+    let row = extent(hidden_size, hc_mult, "dsv4_mhc_pre row")?;
+    ensure!(
+        residual.len() >= extent(num_tokens, row, "dsv4_mhc_pre residual")?
+            && pre.len() >= extent(num_tokens, hc_mult, "dsv4_mhc_pre pre")?
+            && out.len() >= extent(num_tokens, hidden_size, "dsv4_mhc_pre out")?,
+        "dsv4_mhc_pre buffers do not cover [tokens,hidden,hc]=[{num_tokens},{hidden_size},{hc_mult}]: residual={} pre={} out={}",
+        residual.len(),
+        pre.len(),
+        out.len()
+    );
+    let (res_ptr, _gr) = residual.device_ptr(&ctx.stream);
+    let (pre_ptr, _gp) = pre.device_ptr(&ctx.stream);
+    let (out_ptr, _go) = out.device_ptr_mut(&ctx.stream);
+    // SAFETY: lengths checked above; all buffers belong to `ctx.stream`.
+    unsafe {
+        ffi::dsv4_mhc_pre_cuda(
+            res_ptr as *const Half,
+            pre_ptr as *const f32,
+            out_ptr as *mut Half,
+            i32::try_from(num_tokens)?,
+            i32::try_from(hidden_size)?,
+            i32::try_from(hc_mult)?,
+            ctx.stream.cu_stream(),
+        )
+        .result()
+        .map_err(|e| {
+            anyhow!(
+                "dsv4_mhc_pre_cuda failed at [tokens,hidden,hc]=[{num_tokens},{hidden_size},{hc_mult}]: {e}"
+            )
+        })
+    }
+}
+
+/// Fused [`dsv4_mhc_pre`] + RMSNorm: mix the stream into one lane and
+/// normalize in a single launch.
+#[allow(clippy::too_many_arguments)]
+pub fn dsv4_mhc_pre_rms_norm(
+    ctx: &DeviceContext,
+    residual: &impl DevicePtr<bf16>,
+    pre: &impl DevicePtr<f32>,
+    weight: &impl DevicePtr<bf16>,
+    out: &mut impl DevicePtrMut<bf16>,
+    num_tokens: usize,
+    hidden_size: usize,
+    hc_mult: usize,
+    eps: f32,
+) -> Result<()> {
+    let row = extent(hidden_size, hc_mult, "dsv4_mhc_pre_rms_norm row")?;
+    ensure!(
+        residual.len() >= extent(num_tokens, row, "dsv4_mhc_pre_rms_norm residual")?
+            && pre.len() >= extent(num_tokens, hc_mult, "dsv4_mhc_pre_rms_norm pre")?
+            && weight.len() >= hidden_size
+            && out.len() >= extent(num_tokens, hidden_size, "dsv4_mhc_pre_rms_norm out")?,
+        "dsv4_mhc_pre_rms_norm buffers do not cover [tokens,hidden,hc]=[{num_tokens},{hidden_size},{hc_mult}]: residual={} pre={} weight={} out={}",
+        residual.len(),
+        pre.len(),
+        weight.len(),
+        out.len()
+    );
+    let (res_ptr, _gr) = residual.device_ptr(&ctx.stream);
+    let (pre_ptr, _gp) = pre.device_ptr(&ctx.stream);
+    let (w_ptr, _gw) = weight.device_ptr(&ctx.stream);
+    let (out_ptr, _go) = out.device_ptr_mut(&ctx.stream);
+    // SAFETY: lengths checked above; all buffers belong to `ctx.stream`.
+    unsafe {
+        ffi::dsv4_mhc_pre_rms_norm_cuda(
+            res_ptr as *const Half,
+            pre_ptr as *const f32,
+            w_ptr as *const Half,
+            out_ptr as *mut Half,
+            i32::try_from(num_tokens)?,
+            i32::try_from(hidden_size)?,
+            i32::try_from(hc_mult)?,
+            eps,
+            ctx.stream.cu_stream(),
+        )
+        .result()
+        .map_err(|e| {
+            anyhow!(
+                "dsv4_mhc_pre_rms_norm_cuda failed at [tokens,hidden,hc]=[{num_tokens},{hidden_size},{hc_mult}]: {e}"
+            )
+        })
+    }
+}
+
+/// Scatter a sub-block output back across the DSv4 stream lanes and re-mix the
+/// residual with the post/comb weights.
+#[allow(clippy::too_many_arguments)]
+pub fn dsv4_mhc_post(
+    ctx: &DeviceContext,
+    new_x: &impl DevicePtr<bf16>,
+    residual: &impl DevicePtr<bf16>,
+    post: &impl DevicePtr<f32>,
+    comb: &impl DevicePtr<f32>,
+    out: &mut impl DevicePtrMut<bf16>,
+    num_tokens: usize,
+    hidden_size: usize,
+    hc_mult: usize,
+) -> Result<()> {
+    let row = extent(hidden_size, hc_mult, "dsv4_mhc_post row")?;
+    let lanes = extent(num_tokens, hc_mult, "dsv4_mhc_post lanes")?;
+    ensure!(
+        new_x.len() >= extent(num_tokens, hidden_size, "dsv4_mhc_post new_x")?
+            && residual.len() >= extent(num_tokens, row, "dsv4_mhc_post residual")?
+            && post.len() >= lanes
+            && comb.len() >= extent(lanes, hc_mult, "dsv4_mhc_post comb")?
+            && out.len() >= extent(num_tokens, row, "dsv4_mhc_post out")?,
+        "dsv4_mhc_post buffers do not cover [tokens,hidden,hc]=[{num_tokens},{hidden_size},{hc_mult}]: new_x={} residual={} post={} comb={} out={}",
+        new_x.len(),
+        residual.len(),
+        post.len(),
+        comb.len(),
+        out.len()
+    );
+    let (new_ptr, _gn) = new_x.device_ptr(&ctx.stream);
+    let (res_ptr, _gr) = residual.device_ptr(&ctx.stream);
+    let (post_ptr, _gp) = post.device_ptr(&ctx.stream);
+    let (comb_ptr, _gc) = comb.device_ptr(&ctx.stream);
+    let (out_ptr, _go) = out.device_ptr_mut(&ctx.stream);
+    // SAFETY: lengths checked above; all buffers belong to `ctx.stream`.
+    unsafe {
+        ffi::dsv4_mhc_post_cuda(
+            new_ptr as *const Half,
+            res_ptr as *const Half,
+            post_ptr as *const f32,
+            comb_ptr as *const f32,
+            out_ptr as *mut Half,
+            i32::try_from(num_tokens)?,
+            i32::try_from(hidden_size)?,
+            i32::try_from(hc_mult)?,
+            ctx.stream.cu_stream(),
+        )
+        .result()
+        .map_err(|e| {
+            anyhow!(
+                "dsv4_mhc_post_cuda failed at [tokens,hidden,hc]=[{num_tokens},{hidden_size},{hc_mult}]: {e}"
+            )
+        })
+    }
+}
+
+/// Fold one wide stream row into a single `hidden_size` vector via the head
+/// hyper-connection mixer (single-token variant of pre-mixing).
+#[allow(clippy::too_many_arguments)]
+pub fn dsv4_mhc_head_pre(
+    ctx: &DeviceContext,
+    residual_row: &impl DevicePtr<bf16>,
+    mixes: &impl DevicePtr<bf16>,
+    base: &impl DevicePtr<bf16>,
+    scale: &impl DevicePtr<bf16>,
+    out: &mut impl DevicePtrMut<bf16>,
+    residual_hidden_dim: usize,
+    hidden_size: usize,
+    hc_mult: usize,
+    eps: f32,
+) -> Result<()> {
+    ensure!(
+        residual_row.len() >= residual_hidden_dim
+            && mixes.len() >= hc_mult
+            && base.len() >= hc_mult
+            && scale.len() >= 1
+            && out.len() >= hidden_size,
+        "dsv4_mhc_head_pre buffers do not cover [stream,hidden,hc]=[{residual_hidden_dim},{hidden_size},{hc_mult}]: residual_row={} mixes={} base={} scale={} out={}",
+        residual_row.len(),
+        mixes.len(),
+        base.len(),
+        scale.len(),
+        out.len()
+    );
+    let (row_ptr, _gr) = residual_row.device_ptr(&ctx.stream);
+    let (mix_ptr, _gm) = mixes.device_ptr(&ctx.stream);
+    let (base_ptr, _gb) = base.device_ptr(&ctx.stream);
+    let (scale_ptr, _gs) = scale.device_ptr(&ctx.stream);
+    let (out_ptr, _go) = out.device_ptr_mut(&ctx.stream);
+    // SAFETY: lengths checked above; all buffers belong to `ctx.stream`.
+    unsafe {
+        ffi::dsv4_mhc_head_pre_cuda(
+            row_ptr as *const Half,
+            mix_ptr as *const Half,
+            base_ptr as *const Half,
+            scale_ptr as *const Half,
+            out_ptr as *mut Half,
+            i32::try_from(residual_hidden_dim)?,
+            i32::try_from(hidden_size)?,
+            i32::try_from(hc_mult)?,
+            eps,
+            ctx.stream.cu_stream(),
+        )
+        .result()
+        .map_err(|e| {
+            anyhow!(
+                "dsv4_mhc_head_pre_cuda failed at [stream,hidden,hc]=[{residual_hidden_dim},{hidden_size},{hc_mult}]: {e}"
+            )
+        })
+    }
+}
+
+/// Per-token lane mean of a wide DSv4 stream, written into a strided column
+/// window of `out`: for each token, average the `hc_mult` lanes of `lanes`
+/// (read from element `lanes_offset`) into `out[token * out_stride +
+/// out_col_offset ..][..hidden_size]`.
+#[allow(clippy::too_many_arguments)]
+pub fn dsv4_mhc_lane_mean(
+    ctx: &DeviceContext,
+    lanes: &impl DevicePtr<bf16>,
+    lanes_offset: usize,
+    out: &mut impl DevicePtrMut<bf16>,
+    num_tokens: usize,
+    hidden_size: usize,
+    hc_mult: usize,
+    out_stride: usize,
+    out_col_offset: usize,
+) -> Result<()> {
+    let row = extent(hidden_size, hc_mult, "dsv4_mhc_lane_mean row")?;
+    let span = extent(num_tokens, row, "dsv4_mhc_lane_mean lanes")?;
+    ensure!(
+        lanes.len() >= lanes_offset.saturating_add(span)
+            && out_col_offset.saturating_add(hidden_size) <= out_stride
+            && out.len() >= extent(num_tokens, out_stride, "dsv4_mhc_lane_mean out")?,
+        "dsv4_mhc_lane_mean buffers do not cover [tokens,hidden,hc]=[{num_tokens},{hidden_size},{hc_mult}]+offset {lanes_offset} stride {out_stride} col {out_col_offset}: lanes={} out={}",
+        lanes.len(),
+        out.len()
+    );
+    let (lanes_ptr, _gl) = lanes.device_ptr(&ctx.stream);
+    let (out_ptr, _go) = out.device_ptr_mut(&ctx.stream);
+    // SAFETY: lanes_offset + tokens*hidden*hc bounded within lanes above; the
+    // strided out window is bounded by out_stride.
+    unsafe {
+        ffi::dsv4_mhc_lane_mean_cuda(
+            (lanes_ptr as *const Half).add(lanes_offset),
+            out_ptr as *mut Half,
+            i32::try_from(num_tokens)?,
+            i32::try_from(hidden_size)?,
+            i32::try_from(hc_mult)?,
+            i32::try_from(out_stride)?,
+            i32::try_from(out_col_offset)?,
+            ctx.stream.cu_stream(),
+        )
+        .result()
+        .map_err(|e| {
+            anyhow!(
+                "dsv4_mhc_lane_mean_cuda failed at [tokens,hidden,hc]=[{num_tokens},{hidden_size},{hc_mult}]: {e}"
+            )
+        })
+    }
+}
+
+/// DSv4 MTP stream seed for one token row: out_stream[lane, :] =
+/// e_proj[:] + h_proj[lane, :] for each of the `hc_mult` lanes, reading and
+/// writing at the given element offsets (row slices of batched buffers).
+#[allow(clippy::too_many_arguments)]
+pub fn dsv4_mtp_add_eproj_hproj(
+    ctx: &DeviceContext,
+    e_proj: &impl DevicePtr<bf16>,
+    e_offset: usize,
+    h_proj: &impl DevicePtr<bf16>,
+    h_offset: usize,
+    out_stream: &mut impl DevicePtrMut<bf16>,
+    out_offset: usize,
+    hidden_size: usize,
+    hc_mult: usize,
+) -> Result<()> {
+    let row = extent(hidden_size, hc_mult, "dsv4_mtp_add_eproj_hproj row")?;
+    ensure!(
+        e_proj.len() >= e_offset.saturating_add(hidden_size)
+            && h_proj.len() >= h_offset.saturating_add(row)
+            && out_stream.len() >= out_offset.saturating_add(row),
+        "dsv4_mtp_add_eproj_hproj buffers do not cover [hidden,hc]=[{hidden_size},{hc_mult}] at offsets [{e_offset},{h_offset},{out_offset}]: e_proj={} h_proj={} out={}",
+        e_proj.len(),
+        h_proj.len(),
+        out_stream.len()
+    );
+    let (e_ptr, _ge) = e_proj.device_ptr(&ctx.stream);
+    let (h_ptr, _gh) = h_proj.device_ptr(&ctx.stream);
+    let (out_ptr, _go) = out_stream.device_ptr_mut(&ctx.stream);
+    // SAFETY: every offset + its row span is bounded within its buffer above.
+    unsafe {
+        ffi::dsv4_mtp_add_eproj_hproj_cuda(
+            (e_ptr as *const Half).add(e_offset),
+            (h_ptr as *const Half).add(h_offset),
+            (out_ptr as *mut Half).add(out_offset),
+            i32::try_from(hidden_size)?,
+            i32::try_from(hc_mult)?,
+            ctx.stream.cu_stream(),
+        )
+        .result()
+        .map_err(|e| {
+            anyhow!(
+                "dsv4_mtp_add_eproj_hproj_cuda failed at [hidden,hc]=[{hidden_size},{hc_mult}]: {e}"
+            )
+        })
+    }
+}
+
+/// Elementwise bf16 → f32 convert: dst[n] = f32(src[n]).
+pub fn bf16_to_f32(
+    ctx: &DeviceContext,
+    src: &impl DevicePtr<bf16>,
+    dst: &mut impl DevicePtrMut<f32>,
+    n: usize,
+) -> Result<()> {
+    ensure!(
+        src.len() >= n && dst.len() >= n,
+        "bf16_to_f32 buffers do not cover n={n}: src={} dst={}",
+        src.len(),
+        dst.len()
+    );
+    let (src_ptr, _gs) = src.device_ptr(&ctx.stream);
+    let (dst_ptr, _gd) = dst.device_ptr_mut(&ctx.stream);
+    // SAFETY: lengths checked above; both buffers belong to `ctx.stream`.
+    unsafe {
+        ffi::arle_bf16_to_f32_cuda(
+            src_ptr as *const Half,
+            dst_ptr as *mut f32,
+            i32::try_from(n)?,
+            ctx.stream.cu_stream(),
+        )
+        .result()
+        .map_err(|e| anyhow!("arle_bf16_to_f32_cuda failed at n={n}: {e}"))
+    }
+}
+
 /// Split a row-fused `[batch, q_dim + 2*kv_dim]` qkv buffer into q/k/v buffers.
 #[allow(clippy::too_many_arguments)]
 pub fn split_qkv(

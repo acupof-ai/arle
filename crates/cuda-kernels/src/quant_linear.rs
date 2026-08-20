@@ -1,7 +1,8 @@
 //! Dense quantized-linear launch helpers (FP8, NVFP4, and INT families).
 
 use anyhow::{Result, anyhow, ensure};
-use cudarc::driver::{DevicePtr, DevicePtrMut};
+use cudarc::driver::sys::{CUresult, CUstream};
+use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 use half::bf16;
 
 use crate::ffi::{self, Half};
@@ -694,6 +695,347 @@ pub unsafe fn dequantize_w8a16_to_bf16(
         .result()
         .map_err(|e| anyhow!("dequantize_w8a16_to_bf16_cuda failed at [n,k]=[{n},{k}]: {e}"))
     }
+}
+
+/// Marlin `c_tmp` scratch size in f32 elements for a max row count `m` on
+/// `sms` SMs. Pure host-side arithmetic, no device work.
+pub fn marlin_c_tmp_floats(m: usize, sms: usize) -> Result<usize> {
+    // SAFETY: pure size query (arithmetic on m/sms), no device work.
+    Ok(unsafe { ffi::marlin_c_tmp_floats(i32::try_from(m)?, i32::try_from(sms)?) } as usize)
+}
+
+/// Marlin lock workspace size in i32 elements for `sms` SMs. Pure host-side
+/// arithmetic, no device work.
+pub fn marlin_workspace_ints(sms: usize) -> Result<usize> {
+    // SAFETY: pure size query (arithmetic on sms), no device work.
+    Ok(unsafe { ffi::marlin_workspace_ints(i32::try_from(sms)?) } as usize)
+}
+
+/// Quantize a dense BF16 weight `[n, k]` into FP8 E4M3 bytes + per-block f32
+/// scales (amax/448). The scale grid is `[ceil(n/block_m), ceil(k/block_k)]`.
+#[allow(clippy::too_many_arguments)]
+pub fn quantize_bf16_to_fp8_block_scaled(
+    ctx: &DeviceContext,
+    input: &impl DevicePtr<bf16>,
+    weight: &mut impl DevicePtrMut<u8>,
+    scales: &mut impl DevicePtrMut<f32>,
+    n: usize,
+    k: usize,
+    block_m: usize,
+    block_k: usize,
+) -> Result<()> {
+    let nk = extent(n, k, "quantize_bf16_to_fp8_block_scaled weight")?;
+    ensure!(
+        block_m > 0
+            && block_k > 0
+            && input.len() >= nk
+            && weight.len() >= nk
+            && scales.len()
+                >= extent(
+                    n.div_ceil(block_m),
+                    k.div_ceil(block_k),
+                    "quantize_bf16_to_fp8_block_scaled scales"
+                )?,
+        "quantize_bf16_to_fp8_block_scaled buffers do not cover [n,k,bm,bk]=[{n},{k},{block_m},{block_k}]: input={} weight={} scales={}",
+        input.len(),
+        weight.len(),
+        scales.len()
+    );
+    let (in_ptr, _gi) = input.device_ptr(&ctx.stream);
+    let (qw_ptr, _gq) = weight.device_ptr_mut(&ctx.stream);
+    let (sc_ptr, _gs) = scales.device_ptr_mut(&ctx.stream);
+    // SAFETY: lengths checked above; all buffers belong to `ctx.stream`.
+    unsafe {
+        ffi::quantize_bf16_to_fp8_block_scaled_cuda(
+            in_ptr as *const Half,
+            qw_ptr as *mut u8,
+            sc_ptr as *mut f32,
+            i32::try_from(n)?,
+            i32::try_from(k)?,
+            i32::try_from(block_m)?,
+            i32::try_from(block_k)?,
+            ctx.stream.cu_stream(),
+        )
+        .result()
+        .map_err(|e| {
+            anyhow!("quantize_bf16_to_fp8_block_scaled_cuda failed at [n,k]=[{n},{k}]: {e}")
+        })
+    }
+}
+
+/// One DSv4 block-scaled batch-GEMV symbol (`dsv4_fp{8,4}_gemv_batch_cuda`
+/// share this signature).
+type Dsv4GemvBatchFn = unsafe extern "C" fn(
+    *const u8,
+    *const u8,
+    *const Half,
+    *mut Half,
+    i32,
+    i32,
+    i32,
+    i32,
+    i32,
+    CUstream,
+) -> CUresult;
+
+#[allow(clippy::too_many_arguments)]
+fn dsv4_gemv_batch(
+    ctx: &DeviceContext,
+    symbol: &'static str,
+    kernel: Dsv4GemvBatchFn,
+    weight_len_elems: usize,
+    weight: &impl DevicePtr<i8>,
+    scales: &impl DevicePtr<u8>,
+    input: &impl DevicePtr<bf16>,
+    output: &mut impl DevicePtrMut<bf16>,
+    m: usize,
+    n: usize,
+    k: usize,
+    scale_rows: usize,
+    scale_cols: usize,
+) -> Result<()> {
+    ensure!(
+        weight.len() >= weight_len_elems
+            && scales.len() >= extent(scale_rows, scale_cols, "dsv4_gemv_batch scales")?
+            && input.len() >= extent(m, k, "dsv4_gemv_batch input")?
+            && output.len() >= extent(m, n, "dsv4_gemv_batch output")?,
+        "{symbol} buffers do not cover [m,n,k]=[{m},{n},{k}]: weight={} scales={} input={} output={}",
+        weight.len(),
+        scales.len(),
+        input.len(),
+        output.len()
+    );
+    let (qw_ptr, _gqw) = weight.device_ptr(&ctx.stream);
+    let (scales_ptr, _gs) = scales.device_ptr(&ctx.stream);
+    let (x_ptr, _gx) = input.device_ptr(&ctx.stream);
+    let (out_ptr, _go) = output.device_ptr_mut(&ctx.stream);
+    // SAFETY: lengths checked above; all buffers belong to `ctx.stream`.
+    unsafe {
+        kernel(
+            qw_ptr as *const u8,
+            scales_ptr as *const u8,
+            x_ptr as *const Half,
+            out_ptr as *mut Half,
+            i32::try_from(m)?,
+            i32::try_from(n)?,
+            i32::try_from(k)?,
+            i32::try_from(scale_rows)?,
+            i32::try_from(scale_cols)?,
+            ctx.stream.cu_stream(),
+        )
+        .result()
+        .map_err(|e| anyhow!("{symbol} failed at [m,n,k]=[{m},{n},{k}]: {e}"))
+    }
+}
+
+/// Batched DSv4 FP8 block-scaled GEMV: out[m,n] = X[m,k] @ dequant(W[n,k])^T.
+/// `scales` is the DSv4 E8M0 byte grid `[scale_rows, scale_cols]`.
+#[allow(clippy::too_many_arguments)]
+pub fn dsv4_fp8_gemv_batch(
+    ctx: &DeviceContext,
+    weight: &impl DevicePtr<i8>,
+    scales: &impl DevicePtr<u8>,
+    input: &impl DevicePtr<bf16>,
+    output: &mut impl DevicePtrMut<bf16>,
+    m: usize,
+    n: usize,
+    k: usize,
+    scale_rows: usize,
+    scale_cols: usize,
+) -> Result<()> {
+    let nk = extent(n, k, "dsv4_fp8_gemv_batch weight")?;
+    dsv4_gemv_batch(
+        ctx,
+        "dsv4_fp8_gemv_batch_cuda",
+        ffi::dsv4_fp8_gemv_batch_cuda,
+        nk,
+        weight,
+        scales,
+        input,
+        output,
+        m,
+        n,
+        k,
+        scale_rows,
+        scale_cols,
+    )
+}
+
+/// Batched DSv4 FP4 block-scaled GEMV (weight holds two E2M1 nibbles per
+/// byte, `n*k/2`). Scale layout matches [`dsv4_fp8_gemv_batch`].
+#[allow(clippy::too_many_arguments)]
+pub fn dsv4_fp4_gemv_batch(
+    ctx: &DeviceContext,
+    weight: &impl DevicePtr<i8>,
+    scales: &impl DevicePtr<u8>,
+    input: &impl DevicePtr<bf16>,
+    output: &mut impl DevicePtrMut<bf16>,
+    m: usize,
+    n: usize,
+    k: usize,
+    scale_rows: usize,
+    scale_cols: usize,
+) -> Result<()> {
+    let nk = extent(n, k, "dsv4_fp4_gemv_batch weight")?;
+    dsv4_gemv_batch(
+        ctx,
+        "dsv4_fp4_gemv_batch_cuda",
+        ffi::dsv4_fp4_gemv_batch_cuda,
+        nk / 2,
+        weight,
+        scales,
+        input,
+        output,
+        m,
+        n,
+        k,
+        scale_rows,
+        scale_cols,
+    )
+}
+
+/// One DSv4 routed batch-GEMV symbol (`dsv4_fp{8,4}_route_gemv_batch_cuda`
+/// share this signature).
+type Dsv4RouteGemvBatchFn = unsafe extern "C" fn(
+    *const u64,
+    *const u64,
+    *const Half,
+    *mut Half,
+    *const i32,
+    i32,
+    i32,
+    i32,
+    i32,
+    i32,
+    i32,
+    i32,
+    i32,
+    CUstream,
+) -> CUresult;
+
+/// Shared launch arguments of the two DSv4 routed batch-GEMV variants: each
+/// route multiplies one `[n, k]` expert (from the per-expert device pointer
+/// tables) against its input row. `route_meta: None` selects expert
+/// `route % experts_per_rank` over token-major identity routing, which is the
+/// layout the extent checks below assume.
+pub struct Dsv4RouteGemvArgs<'a> {
+    pub route_meta: Option<&'a CudaSlice<i32>>,
+    pub local_expert_start: usize,
+    pub experts_per_rank: usize,
+    pub num_routes: usize,
+    pub n: usize,
+    pub k: usize,
+    pub scale_rows: usize,
+    pub scale_cols: usize,
+    pub apply_route_weight: bool,
+}
+
+fn dsv4_route_gemv_batch(
+    ctx: &DeviceContext,
+    symbol: &'static str,
+    kernel: Dsv4RouteGemvBatchFn,
+    weight_ptrs: &impl DevicePtr<u64>,
+    scale_ptrs: &impl DevicePtr<u64>,
+    input: &impl DevicePtr<bf16>,
+    output: &mut impl DevicePtrMut<bf16>,
+    args: Dsv4RouteGemvArgs<'_>,
+) -> Result<()> {
+    let Dsv4RouteGemvArgs {
+        route_meta,
+        local_expert_start,
+        experts_per_rank,
+        num_routes,
+        n,
+        k,
+        scale_rows,
+        scale_cols,
+        apply_route_weight,
+    } = args;
+    ensure!(
+        weight_ptrs.len() >= experts_per_rank
+            && scale_ptrs.len() >= experts_per_rank
+            && route_meta.is_none_or(|meta| meta.len() >= num_routes)
+            && input.len() >= extent(num_routes, k, "dsv4_route_gemv_batch input")?
+            && output.len() >= extent(num_routes, n, "dsv4_route_gemv_batch output")?,
+        "{symbol} buffers do not cover [routes,n,k,experts]=[{num_routes},{n},{k},{experts_per_rank}]: weight_ptrs={} scale_ptrs={} input={} output={}",
+        weight_ptrs.len(),
+        scale_ptrs.len(),
+        input.len(),
+        output.len()
+    );
+    let (wp_ptr, _gw) = weight_ptrs.device_ptr(&ctx.stream);
+    let (sp_ptr, _gs) = scale_ptrs.device_ptr(&ctx.stream);
+    let (x_ptr, _gx) = input.device_ptr(&ctx.stream);
+    let (out_ptr, _go) = output.device_ptr_mut(&ctx.stream);
+    let meta_guard = route_meta.map(|meta| meta.device_ptr(&ctx.stream));
+    let meta_ptr = meta_guard
+        .as_ref()
+        .map_or(std::ptr::null(), |(ptr, _g)| *ptr as *const i32);
+    // SAFETY: lengths checked above; the pointer tables hold `experts_per_rank`
+    // live per-expert weight/scale device addresses (the caller's load-time
+    // contract).
+    unsafe {
+        kernel(
+            wp_ptr as *const u64,
+            sp_ptr as *const u64,
+            x_ptr as *const Half,
+            out_ptr as *mut Half,
+            meta_ptr,
+            i32::try_from(local_expert_start)?,
+            i32::try_from(experts_per_rank)?,
+            i32::try_from(num_routes)?,
+            i32::try_from(n)?,
+            i32::try_from(k)?,
+            i32::try_from(scale_rows)?,
+            i32::try_from(scale_cols)?,
+            i32::from(apply_route_weight),
+            ctx.stream.cu_stream(),
+        )
+        .result()
+        .map_err(|e| anyhow!("{symbol} failed at [routes,n,k]=[{num_routes},{n},{k}]: {e}"))
+    }
+}
+
+/// Routed DSv4 FP8 block-scaled batch GEMV over per-expert pointer tables.
+pub fn dsv4_fp8_route_gemv_batch(
+    ctx: &DeviceContext,
+    weight_ptrs: &impl DevicePtr<u64>,
+    scale_ptrs: &impl DevicePtr<u64>,
+    input: &impl DevicePtr<bf16>,
+    output: &mut impl DevicePtrMut<bf16>,
+    args: Dsv4RouteGemvArgs<'_>,
+) -> Result<()> {
+    dsv4_route_gemv_batch(
+        ctx,
+        "dsv4_fp8_route_gemv_batch_cuda",
+        ffi::dsv4_fp8_route_gemv_batch_cuda,
+        weight_ptrs,
+        scale_ptrs,
+        input,
+        output,
+        args,
+    )
+}
+
+/// Routed DSv4 FP4 block-scaled batch GEMV over per-expert pointer tables.
+pub fn dsv4_fp4_route_gemv_batch(
+    ctx: &DeviceContext,
+    weight_ptrs: &impl DevicePtr<u64>,
+    scale_ptrs: &impl DevicePtr<u64>,
+    input: &impl DevicePtr<bf16>,
+    output: &mut impl DevicePtrMut<bf16>,
+    args: Dsv4RouteGemvArgs<'_>,
+) -> Result<()> {
+    dsv4_route_gemv_batch(
+        ctx,
+        "dsv4_fp4_route_gemv_batch_cuda",
+        ffi::dsv4_fp4_route_gemv_batch_cuda,
+        weight_ptrs,
+        scale_ptrs,
+        input,
+        output,
+        args,
+    )
 }
 
 /// In-place per-column scale over a bf16 `[rows, cols]` buffer:

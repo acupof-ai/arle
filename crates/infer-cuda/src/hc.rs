@@ -10,9 +10,9 @@
 //! `hc_post_to_stream` / `head_hidden_from_stream`, reorganized into one module.
 
 use anyhow::{Result, anyhow, ensure};
-use cuda_kernels::ffi;
 use cuda_kernels::prelude::{DeviceContext, DeviceVec, HiddenStates};
-use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
+use cuda_kernels::tensor_ops;
+use cudarc::driver::CudaSlice;
 use deepseek_spec::DeepSeekV4Config;
 
 use crate::dsv4::Dsv4HyperConnection;
@@ -50,21 +50,14 @@ pub(crate) fn initial_stream_from_embeddings(
         hidden_size * hc_mult,
         embeddings.seq_len
     );
-    let (emb_ptr, _ge) = embeddings.data.device_ptr(&ctx.stream);
-    let (out_ptr, _go) = stream.data.device_ptr_mut(&ctx.stream);
-    // SAFETY: both buffers valid on ctx.stream; shapes checked above.
-    unsafe {
-        ffi::dsv4_mhc_expand_cuda(
-            emb_ptr as *const ffi::Half,
-            out_ptr as *mut ffi::Half,
-            embeddings.seq_len as i32,
-            hidden_size as i32,
-            hc_mult as i32,
-            ctx.stream.cu_stream(),
-        )
-        .result()?;
-    }
-    Ok(())
+    tensor_ops::dsv4_mhc_expand(
+        ctx,
+        &embeddings.data,
+        &mut stream.data,
+        embeddings.seq_len,
+        hidden_size,
+        hc_mult,
+    )
 }
 
 /// Project the wide stream through `hc.mix_fn`, then run the sinkhorn mixer
@@ -115,35 +108,22 @@ pub(crate) fn gen_mhc_params(
             .map_err(|e| anyhow!("DSv4 HC comb alloc failed: {e}"))?
     };
 
-    {
-        let (stream_ptr, _gs) = stream.data.device_ptr(&ctx.stream);
-        let (mixes_ptr, _gm) = mixes.data.device_ptr(&ctx.stream);
-        let (base_ptr, _gb) = hc.base.data.device_ptr(&ctx.stream);
-        let (scale_ptr, _gsc) = hc.scale.data.device_ptr(&ctx.stream);
-        let (pre_ptr, _gp) = pre.device_ptr_mut(&ctx.stream);
-        let (post_ptr, _gpo) = post.device_ptr_mut(&ctx.stream);
-        let (comb_ptr, _gc) = comb.device_ptr_mut(&ctx.stream);
-        // SAFETY: all buffers valid on ctx.stream; mix shape + lengths checked above.
-        unsafe {
-            ffi::dsv4_mhc_params_cuda(
-                stream_ptr as *const ffi::Half,
-                mixes_ptr as *const ffi::Half,
-                base_ptr as *const ffi::Half,
-                scale_ptr as *const ffi::Half,
-                pre_ptr as *mut f32,
-                post_ptr as *mut f32,
-                comb_ptr as *mut f32,
-                stream.seq_len as i32,
-                stream.hidden_dim as i32,
-                mixes.hidden_dim as i32,
-                hc_mult as i32,
-                config.hc_eps,
-                config.hc_sinkhorn_iters as i32,
-                ctx.stream.cu_stream(),
-            )
-            .result()?;
-        }
-    }
+    tensor_ops::dsv4_mhc_params(
+        ctx,
+        &stream.data,
+        &mixes.data,
+        &hc.base.data,
+        &hc.scale.data,
+        &mut pre,
+        &mut post,
+        &mut comb,
+        stream.seq_len,
+        stream.hidden_dim,
+        mixes.hidden_dim,
+        hc_mult,
+        config.hc_eps,
+        config.hc_sinkhorn_iters,
+    )?;
     Ok(MhcParams { pre, post, comb })
 }
 
@@ -177,23 +157,15 @@ pub(crate) fn hc_pre(
         out.seq_len,
         stream.seq_len
     );
-    let (stream_ptr, _gs) = stream.data.device_ptr(&ctx.stream);
-    let (pre_ptr, _gp) = pre.device_ptr(&ctx.stream);
-    let (out_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
-    // SAFETY: buffers valid on ctx.stream; shapes checked above.
-    unsafe {
-        ffi::dsv4_mhc_pre_cuda(
-            stream_ptr as *const ffi::Half,
-            pre_ptr as *const f32,
-            out_ptr as *mut ffi::Half,
-            stream.seq_len as i32,
-            hidden_size as i32,
-            hc_mult as i32,
-            ctx.stream.cu_stream(),
-        )
-        .result()?;
-    }
-    Ok(())
+    tensor_ops::dsv4_mhc_pre(
+        ctx,
+        &stream.data,
+        pre,
+        &mut out.data,
+        stream.seq_len,
+        hidden_size,
+        hc_mult,
+    )
 }
 
 /// Fused [`hc_pre`] + rms-norm: mix the stream into one lane and normalize in
@@ -232,26 +204,17 @@ pub(crate) fn mhc_pre_rms_norm(
         out.seq_len,
         stream.seq_len
     );
-    let (stream_ptr, _gs) = stream.data.device_ptr(&ctx.stream);
-    let (pre_ptr, _gp) = pre.device_ptr(&ctx.stream);
-    let (w_ptr, _gw) = norm_weight.data.device_ptr(&ctx.stream);
-    let (out_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
-    // SAFETY: buffers valid on ctx.stream; shapes checked above.
-    unsafe {
-        ffi::dsv4_mhc_pre_rms_norm_cuda(
-            stream_ptr as *const ffi::Half,
-            pre_ptr as *const f32,
-            w_ptr as *const ffi::Half,
-            out_ptr as *mut ffi::Half,
-            stream.seq_len as i32,
-            hidden_size as i32,
-            hc_mult as i32,
-            eps,
-            ctx.stream.cu_stream(),
-        )
-        .result()?;
-    }
-    Ok(())
+    tensor_ops::dsv4_mhc_pre_rms_norm(
+        ctx,
+        &stream.data,
+        pre,
+        &norm_weight.data,
+        &mut out.data,
+        stream.seq_len,
+        hidden_size,
+        hc_mult,
+        eps,
+    )
 }
 
 /// Scatter the sub-block output back across the lanes and re-mix the residual
@@ -292,27 +255,17 @@ pub(crate) fn hc_post(
         "DSv4 HC post out dim {} != hidden_size {hidden_size} * hc_mult {hc_mult}",
         out.hidden_dim
     );
-    let (new_ptr, _gn) = new_x.data.device_ptr(&ctx.stream);
-    let (res_ptr, _gr) = residual.data.device_ptr(&ctx.stream);
-    let (post_ptr, _gp) = post.device_ptr(&ctx.stream);
-    let (comb_ptr, _gc) = comb.device_ptr(&ctx.stream);
-    let (out_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
-    // SAFETY: buffers valid on ctx.stream; shapes checked above.
-    unsafe {
-        ffi::dsv4_mhc_post_cuda(
-            new_ptr as *const ffi::Half,
-            res_ptr as *const ffi::Half,
-            post_ptr as *const f32,
-            comb_ptr as *const f32,
-            out_ptr as *mut ffi::Half,
-            residual.seq_len as i32,
-            hidden_size as i32,
-            hc_mult as i32,
-            ctx.stream.cu_stream(),
-        )
-        .result()?;
-    }
-    Ok(())
+    tensor_ops::dsv4_mhc_post(
+        ctx,
+        &new_x.data,
+        &residual.data,
+        post,
+        comb,
+        &mut out.data,
+        residual.seq_len,
+        hidden_size,
+        hc_mult,
+    )
 }
 
 /// Fold the `token_idx` row of the wide stream into one `hidden_size` vector via
@@ -433,26 +386,16 @@ pub(crate) fn head_hidden_from_stream_into(
     crate::ops::copy_row_to_hidden(ctx, stream, token_idx, stream_row)?;
     crate::attention::dsv4_linear(ctx, &head_hc.mix_fn, stream_row, mixes)?;
 
-    let (row_ptr, _gr) = stream_row.data.device_ptr(&ctx.stream);
-    let (mixes_ptr, _gm) = mixes.data.device_ptr(&ctx.stream);
-    let (base_ptr, _gb) = head_hc.base.data.device_ptr(&ctx.stream);
-    let (scale_ptr, _gsc) = head_hc.scale.data.device_ptr(&ctx.stream);
-    let (out_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
-    // SAFETY: buffers valid on ctx.stream; shapes checked above.
-    unsafe {
-        ffi::dsv4_mhc_head_pre_cuda(
-            row_ptr as *const ffi::Half,
-            mixes_ptr as *const ffi::Half,
-            base_ptr as *const ffi::Half,
-            scale_ptr as *const ffi::Half,
-            out_ptr as *mut ffi::Half,
-            stream.hidden_dim as i32,
-            hidden_size as i32,
-            hc_mult as i32,
-            config.hc_eps,
-            ctx.stream.cu_stream(),
-        )
-        .result()?;
-    }
-    Ok(())
+    tensor_ops::dsv4_mhc_head_pre(
+        ctx,
+        &stream_row.data,
+        &mixes.data,
+        &head_hc.base.data,
+        &head_hc.scale.data,
+        &mut out.data,
+        stream.hidden_dim,
+        hidden_size,
+        hc_mult,
+        config.hc_eps,
+    )
 }

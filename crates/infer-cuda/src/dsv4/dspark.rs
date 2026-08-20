@@ -646,27 +646,20 @@ impl Dsv4Model {
         // SAFETY: each launch fully writes one non-overlapping [rows, hidden]
         // tap slice; all n_taps slices cover the buffer before it is read.
         let mut fuse_in = unsafe { HiddenStates::uninit(ctx, n_taps * hidden, cols)? };
-        {
-            let (fuse_ptr, _gf) = fuse_in.data.device_ptr_mut(&ctx.stream);
-            let tap_off = (skip * stream_dim) as u64 * std::mem::size_of::<half::bf16>() as u64;
-            for (t, tap) in taps.iter().enumerate() {
-                let (tap_ptr, _gt) = tap.data.device_ptr(&ctx.stream);
-                // SAFETY: tap is [rows, hc_mult, hidden]; skip drops the leading
-                // rows that fall out of the sliding window; cols rows remain.
-                unsafe {
-                    ffi::dsv4_mhc_lane_mean_cuda(
-                        (tap_ptr + tap_off) as *const ffi::Half,
-                        fuse_ptr as *mut ffi::Half,
-                        cols as i32,
-                        hidden as i32,
-                        hc_mult as i32,
-                        (n_taps * hidden) as i32,
-                        (t * hidden) as i32,
-                        ctx.stream.cu_stream(),
-                    )
-                    .result()?;
-                }
-            }
+        // Tap is [rows, hc_mult, hidden]; skip drops the leading rows that
+        // fall out of the sliding window; cols rows remain.
+        for (t, tap) in taps.iter().enumerate() {
+            cuda_kernels::tensor_ops::dsv4_mhc_lane_mean(
+                ctx,
+                &tap.data,
+                skip * stream_dim,
+                &mut fuse_in.data,
+                cols,
+                hidden,
+                hc_mult,
+                n_taps * hidden,
+                t * hidden,
+            )?;
         }
         // SAFETY: dsv4_linear writes the full [hidden, cols] buffer.
         let mut context_raw = unsafe { HiddenStates::uninit(ctx, hidden, cols)? };

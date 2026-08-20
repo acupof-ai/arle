@@ -8,6 +8,7 @@ use cuda_kernels::moe as cuda_moe;
 use cuda_kernels::prelude::{
     DeviceContext, DeviceMatrix, DeviceVec, HiddenStates, HiddenStatesView, PagedKVPool,
 };
+use cuda_kernels::quant_linear as cuda_ql;
 use cuda_kernels::tensor::{WeightFormat, cache_ptr};
 use cuda_kernels::{BandPage, KVFormat, TokenKVPool};
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
@@ -971,42 +972,32 @@ pub(crate) fn mla_linear(
         .dsv4_scales
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("DSv4 MLA matrix missing block scales (dsv4_scales)"))?;
-    let (qw_ptr, _gqw) = qw.device_ptr(&ctx.stream);
-    let (scales_ptr, _gs) = scales.device_ptr(&ctx.stream);
-    let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
-    let (out_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
-    let stream = ctx.stream.cu_stream();
-    // SAFETY: all buffers are valid on ctx.stream; shapes are checked above and
-    // the scale-row/col extents come from the matrix the loader built.
-    unsafe {
-        let res = match weight.weight_format {
-            WeightFormat::Dsv4Fp8BlockScaled => ffi::dsv4_fp8_gemv_batch_cuda(
-                qw_ptr as *const u8,
-                scales_ptr as *const u8,
-                x_ptr as *const ffi::Half,
-                out_ptr as *mut ffi::Half,
-                x.seq_len as i32,
-                weight.rows as i32,
-                weight.cols as i32,
-                weight.dsv4_scale_rows as i32,
-                weight.dsv4_scale_cols as i32,
-                stream,
-            ),
-            WeightFormat::Dsv4Fp4BlockScaled => ffi::dsv4_fp4_gemv_batch_cuda(
-                qw_ptr as *const u8,
-                scales_ptr as *const u8,
-                x_ptr as *const ffi::Half,
-                out_ptr as *mut ffi::Half,
-                x.seq_len as i32,
-                weight.rows as i32,
-                weight.cols as i32,
-                weight.dsv4_scale_rows as i32,
-                weight.dsv4_scale_cols as i32,
-                stream,
-            ),
-            other => bail!("mla_linear: expected DSv4 FP8/FP4 block-scaled weight, got {other:?}"),
-        };
-        res.result()?;
+    match weight.weight_format {
+        WeightFormat::Dsv4Fp8BlockScaled => cuda_ql::dsv4_fp8_gemv_batch(
+            ctx,
+            qw,
+            scales,
+            &x.data,
+            &mut out.data,
+            x.seq_len,
+            weight.rows,
+            weight.cols,
+            weight.dsv4_scale_rows,
+            weight.dsv4_scale_cols,
+        )?,
+        WeightFormat::Dsv4Fp4BlockScaled => cuda_ql::dsv4_fp4_gemv_batch(
+            ctx,
+            qw,
+            scales,
+            &x.data,
+            &mut out.data,
+            x.seq_len,
+            weight.rows,
+            weight.cols,
+            weight.dsv4_scale_rows,
+            weight.dsv4_scale_cols,
+        )?,
+        other => bail!("mla_linear: expected DSv4 FP8/FP4 block-scaled weight, got {other:?}"),
     }
     Ok(())
 }
@@ -5595,102 +5586,45 @@ fn dsv4_wo_a_grouped_linear(
         }
         return Ok(());
     }
+    let wo_a_groups = attention.wo_a_groups.as_ref().expect("DSv4 wo_a_groups");
     ensure!(
-        attention
-            .wo_a_groups
-            .as_ref()
-            .expect("DSv4 wo_a_groups")
-            .scale_rows_per_group
-            > 0
-            && attention
-                .wo_a_groups
-                .as_ref()
-                .expect("DSv4 wo_a_groups")
-                .scale_cols
-                > 0,
+        wo_a_groups.scale_rows_per_group > 0 && wo_a_groups.scale_cols > 0,
         "DSv4 O-LoRA grouped scale shape must be non-empty"
     );
-    let (weight_ptrs, _wg) = attention
-        .wo_a_groups
-        .as_ref()
-        .expect("DSv4 wo_a_groups")
-        .weight_ptrs
-        .device_ptr(&ctx.stream);
-    let (scale_ptrs, _sg) = attention
-        .wo_a_groups
-        .as_ref()
-        .expect("DSv4 wo_a_groups")
-        .scale_ptrs
-        .device_ptr(&ctx.stream);
-    let (input_ptr, _ig) = local_attn.data.device_ptr(&ctx.stream);
-    let (output_ptr, _og) = latent.data.device_ptr_mut(&ctx.stream);
-    let stream = ctx.stream.cu_stream();
-    // SAFETY: pointer tables were built from this rank's contiguous `wo_a`
-    // groups at load time. `route_meta=null` selects group `route % groups`;
-    // route order is `[token0/group0, token0/group1, ..., token1/group0, ...]`,
-    // which is exactly the `HiddenStates` token-major layout when each group is
+    // Pointer tables were built from this rank's contiguous `wo_a` groups at
+    // load time. `route_meta: None` selects group `route % groups`; route order
+    // is `[token0/group0, token0/group1, ..., token1/group0, ...]`, which is
+    // exactly the `HiddenStates` token-major layout when each group is
     // `cols_per_group` wide.
-    unsafe {
-        match attention.wo_a().weight_format {
-            WeightFormat::Dsv4Fp8BlockScaled => ffi::dsv4_fp8_route_gemv_batch_cuda(
-                weight_ptrs as *const u64,
-                scale_ptrs as *const u64,
-                input_ptr as *const ffi::Half,
-                output_ptr as *mut ffi::Half,
-                std::ptr::null(),
-                0,
-                i32::try_from(shape.groups)?,
-                i32::try_from(shape.routes)?,
-                i32::try_from(shape.rows_per_group)?,
-                i32::try_from(shape.cols_per_group)?,
-                i32::try_from(
-                    attention
-                        .wo_a_groups
-                        .as_ref()
-                        .expect("DSv4 wo_a_groups")
-                        .scale_rows_per_group,
-                )?,
-                i32::try_from(
-                    attention
-                        .wo_a_groups
-                        .as_ref()
-                        .expect("DSv4 wo_a_groups")
-                        .scale_cols,
-                )?,
-                0,
-                stream,
-            ),
-            WeightFormat::Dsv4Fp4BlockScaled => ffi::dsv4_fp4_route_gemv_batch_cuda(
-                weight_ptrs as *const u64,
-                scale_ptrs as *const u64,
-                input_ptr as *const ffi::Half,
-                output_ptr as *mut ffi::Half,
-                std::ptr::null(),
-                0,
-                i32::try_from(shape.groups)?,
-                i32::try_from(shape.routes)?,
-                i32::try_from(shape.rows_per_group)?,
-                i32::try_from(shape.cols_per_group)?,
-                i32::try_from(
-                    attention
-                        .wo_a_groups
-                        .as_ref()
-                        .expect("DSv4 wo_a_groups")
-                        .scale_rows_per_group,
-                )?,
-                i32::try_from(
-                    attention
-                        .wo_a_groups
-                        .as_ref()
-                        .expect("DSv4 wo_a_groups")
-                        .scale_cols,
-                )?,
-                0,
-                stream,
-            ),
-            other => bail!("DSv4 O-LoRA grouped wo_a expected FP8/FP4 block-scaled, got {other:?}"),
-        }
-        .result()?;
+    let args = cuda_ql::Dsv4RouteGemvArgs {
+        route_meta: None,
+        local_expert_start: 0,
+        experts_per_rank: shape.groups,
+        num_routes: shape.routes,
+        n: shape.rows_per_group,
+        k: shape.cols_per_group,
+        scale_rows: wo_a_groups.scale_rows_per_group,
+        scale_cols: wo_a_groups.scale_cols,
+        apply_route_weight: false,
+    };
+    match attention.wo_a().weight_format {
+        WeightFormat::Dsv4Fp8BlockScaled => cuda_ql::dsv4_fp8_route_gemv_batch(
+            ctx,
+            &wo_a_groups.weight_ptrs,
+            &wo_a_groups.scale_ptrs,
+            &local_attn.data,
+            &mut latent.data,
+            args,
+        )?,
+        WeightFormat::Dsv4Fp4BlockScaled => cuda_ql::dsv4_fp4_route_gemv_batch(
+            ctx,
+            &wo_a_groups.weight_ptrs,
+            &wo_a_groups.scale_ptrs,
+            &local_attn.data,
+            &mut latent.data,
+            args,
+        )?,
+        other => bail!("DSv4 O-LoRA grouped wo_a expected FP8/FP4 block-scaled, got {other:?}"),
     }
     Ok(())
 }

@@ -1,8 +1,8 @@
 use anyhow::{Result, anyhow, bail};
-use cuda_kernels::ffi;
 use cuda_kernels::prelude::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStates};
+use cuda_kernels::quant_linear as cuda_ql;
 use cuda_kernels::tensor::WeightFormat;
-use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut, sys::CUevent_flags};
+use cudarc::driver::{CudaSlice, sys::CUevent_flags};
 use half::bf16;
 use std::cell::RefCell;
 use std::sync::OnceLock;
@@ -109,11 +109,9 @@ fn marlin_scratch_init(ctx: &DeviceContext, scratch: &mut MarlinScratch) -> Resu
     if scratch.c_tmp.is_some() {
         return Ok(());
     }
-    let sms = ctx.sm_count() as i32;
-    // SAFETY: pure size queries (arithmetic on sms), no device work.
-    let c_tmp_floats = unsafe { ffi::marlin_c_tmp_floats(64, sms) } as usize;
-    // SAFETY: pure size query, no device work.
-    let ws_ints = unsafe { ffi::marlin_workspace_ints(sms) } as usize;
+    let sms = ctx.sm_count();
+    let c_tmp_floats = cuda_ql::marlin_c_tmp_floats(64, sms)?;
+    let ws_ints = cuda_ql::marlin_workspace_ints(sms)?;
     scratch.c_tmp = Some(
         ctx.stream
             .alloc_zeros::<f32>(c_tmp_floats)
@@ -325,42 +323,33 @@ pub(super) fn run(
                 .dsv4_scales
                 .as_ref()
                 .ok_or_else(|| anyhow!("{} missing dsv4_scales", weight.weight_format))?;
-            let (qw_ptr, _gqw) = qw.device_ptr(&ctx.stream);
-            let (scales_ptr, _gs) = scales.device_ptr(&ctx.stream);
-            let (x_ptr, _gx) = input.device_ptr(&ctx.stream);
-            let (out_ptr, _go) = output.device_ptr_mut(&ctx.stream);
-            let stream = ctx.stream.cu_stream();
-            // SAFETY: ptrs from live device allocations sized to the dims passed.
-            let res = unsafe {
-                match weight.weight_format {
-                    WeightFormat::Dsv4Fp8BlockScaled => ffi::dsv4_fp8_gemv_batch_cuda(
-                        qw_ptr as *const u8,
-                        scales_ptr as *const u8,
-                        x_ptr as *const ffi::Half,
-                        out_ptr as *mut ffi::Half,
-                        m as i32,
-                        weight.rows as i32,
-                        weight.cols as i32,
-                        weight.dsv4_scale_rows as i32,
-                        weight.dsv4_scale_cols as i32,
-                        stream,
-                    ),
-                    WeightFormat::Dsv4Fp4BlockScaled => ffi::dsv4_fp4_gemv_batch_cuda(
-                        qw_ptr as *const u8,
-                        scales_ptr as *const u8,
-                        x_ptr as *const ffi::Half,
-                        out_ptr as *mut ffi::Half,
-                        m as i32,
-                        weight.rows as i32,
-                        weight.cols as i32,
-                        weight.dsv4_scale_rows as i32,
-                        weight.dsv4_scale_cols as i32,
-                        stream,
-                    ),
-                    _ => unreachable!(),
-                }
-            };
-            res.result()?;
+            match weight.weight_format {
+                WeightFormat::Dsv4Fp8BlockScaled => cuda_ql::dsv4_fp8_gemv_batch(
+                    ctx,
+                    qw,
+                    scales,
+                    input,
+                    output,
+                    m,
+                    weight.rows,
+                    weight.cols,
+                    weight.dsv4_scale_rows,
+                    weight.dsv4_scale_cols,
+                )?,
+                WeightFormat::Dsv4Fp4BlockScaled => cuda_ql::dsv4_fp4_gemv_batch(
+                    ctx,
+                    qw,
+                    scales,
+                    input,
+                    output,
+                    m,
+                    weight.rows,
+                    weight.cols,
+                    weight.dsv4_scale_rows,
+                    weight.dsv4_scale_cols,
+                )?,
+                _ => unreachable!(),
+            }
             Ok(())
         }
         other => bail!("quant_linear unsupported resident quant weight format {other}"),

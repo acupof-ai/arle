@@ -2240,7 +2240,7 @@ fn dequantize_fp8_expert_to_bf16_in_place(
         "BF16-resident expert dequant needs FP8 block-scaled metadata; got {:?}",
         matrix.weight_format
     );
-    let mut dense = ctx
+    let dense = ctx
         .stream
         .alloc_zeros::<half::bf16>(matrix.rows * matrix.cols)
         .map_err(|e| anyhow!("expert BF16 dequant alloc failed: {e}"))?;
@@ -2259,25 +2259,25 @@ fn dequantize_fp8_expert_to_bf16_in_place(
             qweight.len(),
             matrix.rows * matrix.cols
         );
-        let (qw_ptr, _gq) = qweight.device_ptr(&ctx.stream);
-        let (scale_ptr, _gs) = scales.device_ptr(&ctx.stream);
-        let (dense_ptr, _gd) = dense.device_ptr_mut(&ctx.stream);
-        // SAFETY: ptrs from live device allocations sized to the dims passed.
+        let shape = cuda_kernels::quant_linear::Fp8ScaleShape {
+            scale_rows: matrix.quant_scale_rows as i32,
+            scale_cols: matrix.quant_scale_cols as i32,
+            block_m: matrix.quant_block_m as i32,
+            block_k: matrix.quant_block_k as i32,
+        };
+        // SAFETY: `dense` covers rows*cols and lives across the launch (the
+        // sync below outlives it).
         unsafe {
-            cuda_kernels::ffi::dequantize_fp8_block_scaled_to_bf16_cuda(
-                qw_ptr as *const u8,
-                scale_ptr as *const f32,
-                dense_ptr as *mut cuda_kernels::ffi::Half,
-                matrix.rows as i32,
-                matrix.cols as i32,
-                matrix.quant_scale_rows as i32,
-                matrix.quant_scale_cols as i32,
-                matrix.quant_block_m as i32,
-                matrix.quant_block_k as i32,
-                ctx.stream.cu_stream(),
+            cuda_kernels::quant_linear::dequantize_fp8_block_scaled_to_bf16(
+                ctx,
+                qweight,
+                scales,
+                cuda_kernels::tensor::cache_ptr(&dense, ctx),
+                matrix.rows,
+                matrix.cols,
+                shape,
             )
         }
-        .result()
         .map_err(|e| anyhow!("FP8->BF16 expert dequant failed: {e}"))?;
     }
     // Event tracking is disabled: sync before dropping the FP8 source so the
