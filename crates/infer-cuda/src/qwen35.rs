@@ -418,12 +418,14 @@ mod tests {
                 vec![bf16::from_f32(0.25)],
                 vec![],
             ],
+            recurrent_decode_pair: true,
             seq_len: 1234,
         };
         let bytes = img.to_bytes();
         let back = Qwen35SlotImage::from_bytes(&bytes).expect("round-trip");
         assert_eq!(back.full_attn_pages, img.full_attn_pages);
         assert_eq!(back.full_attn_page_count, img.full_attn_page_count);
+        assert_eq!(back.recurrent_decode_pair, img.recurrent_decode_pair);
         assert_eq!(back.seq_len, img.seq_len);
         // f32 / bf16 compared on bit patterns so a -0.0 or NaN can't false-pass.
         assert_eq!(back.gdr_host.len(), img.gdr_host.len());
