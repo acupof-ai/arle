@@ -47,6 +47,18 @@ mod real {
         ("attn_sq", 5120, 5120),
     ];
     const M_SWEEP: &[usize] = &[1, 2, 4, 8, 16, 32];
+    /// Three fixed seeds per shape; the gate is shapes × seeds × M.
+    const SEEDS: &[u64] = &[
+        0x9e37_79b9_7f4a_7c15,
+        0x517c_c1cc_9e37_79b9,
+        0x2545_f491_4f6c_dd1d,
+    ];
+    /// Boundary shapes the repack must decline: N not %64 with K aligned. The
+    /// source has to stay resident and the dequant→BF16 fallback carry alone.
+    const DECLINED_SHAPES: &[(&str, usize, usize)] = &[("declined n%64", 96, 5120)];
+    /// Absolute ceiling for a lane anchored on the f32 reference without a
+    /// comparison lane (repack-declined shapes). Expected floor ≈1.1e-3.
+    const FALLBACK_MAX_REL_L2: f64 = 8e-3;
     // Marlin lane must not exceed the fallback lane's f32-anchored error by more
     // than this factor — both share the INT8 group-quant floor, so a correct
     // Marlin lane tracks the fallback closely. A blown ratio = wrong repack/perm.
@@ -103,10 +115,11 @@ mod real {
         let ctx = DeviceContext::new()?;
         let cc = ctx.compute_capability();
         eprintln!(
-            "[marlin-parity] device={} cc={}.{}",
+            "[marlin-parity] device={} cc={}.{} build={}",
             ctx.ordinal(),
             cc.0,
-            cc.1
+            cc.1,
+            cuda_kernels::KERNEL_BUILD_ID
         );
         ensure!(
             cc.0 >= 8,
@@ -116,10 +129,17 @@ mod real {
         );
 
         let mut any_fail = false;
-        for &(label, n, k) in SHAPES {
-            for &m in M_SWEEP {
-                let fail = probe_one(&ctx, label, m, n, k)?;
-                any_fail |= fail;
+        for &seed in SEEDS {
+            for &(label, n, k) in SHAPES {
+                for &m in M_SWEEP {
+                    let fail = probe_one(&ctx, label, m, n, k, seed)?;
+                    any_fail |= fail;
+                }
+            }
+            for &(label, n, k) in DECLINED_SHAPES {
+                for &m in M_SWEEP {
+                    any_fail |= probe_declined(&ctx, label, m, n, k, seed)?;
+                }
             }
         }
         ensure!(
@@ -130,13 +150,28 @@ mod real {
         Ok(())
     }
 
-    fn probe_one(ctx: &DeviceContext, label: &str, m: usize, n: usize, k: usize) -> Result<bool> {
-        let ng = k / GROUP;
-        let mut seed = 0xcbf2_9ce4_8422_2325u64;
+    /// FNV-mix the fixed seed with the shape identity.
+    fn shape_seed(seed: u64, label: &str, n: usize, k: usize) -> u64 {
+        let mut mix = seed;
         for b in label.as_bytes() {
-            seed ^= *b as u64;
-            seed = seed.wrapping_mul(0x0000_0100_0000_01b3);
+            mix ^= *b as u64;
+            mix = mix.wrapping_mul(0x0000_0100_0000_01b3);
         }
+        mix ^= (n as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        mix ^= (k as u64).wrapping_mul(0x517c_c1cc_9e37_79b9);
+        mix
+    }
+
+    fn probe_one(
+        ctx: &DeviceContext,
+        label: &str,
+        m: usize,
+        n: usize,
+        k: usize,
+        seed: u64,
+    ) -> Result<bool> {
+        let ng = k / GROUP;
+        let mut seed = shape_seed(seed, label, n, k);
         seed ^= (m as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
         let mut rng = Rng::new(seed);
 
@@ -259,8 +294,101 @@ mod real {
         let ratio = marlin_err / deq_err.max(1e-9);
         let pass = ratio <= MARLIN_VS_FALLBACK_MAX_RATIO && marlin_err.is_finite();
         eprintln!(
-            "[{label} m={m:>2} n={n} k={k}] marlin_relL2={marlin_err:.4e} \
+            "[{label} m={m:>2} n={n} k={k} seed={seed:#x}] marlin_relL2={marlin_err:.4e} \
              fallback_relL2={deq_err:.4e} ratio={ratio:.2} {}",
+            if pass { "PASS" } else { "FAIL" }
+        );
+        Ok(!pass)
+    }
+
+    /// A shape the repack must decline: the source stays resident and the
+    /// dequant→BF16 fallback carries every M against the f32 reference alone.
+    fn probe_declined(
+        ctx: &DeviceContext,
+        label: &str,
+        m: usize,
+        n: usize,
+        k: usize,
+        seed: u64,
+    ) -> Result<bool> {
+        let ng = k / GROUP;
+        let mut seed = shape_seed(seed, label, n, k);
+        seed ^= (m as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        let mut rng = Rng::new(seed);
+
+        let x_host: Vec<f32> = (0..m * k).map(|_| rng.normal()).collect();
+        let w_host: Vec<f32> = (0..n * k).map(|_| rng.normal() * 0.1).collect();
+        let (q, s) = per_group_int8(&w_host, n, k);
+
+        let mut ref_out = vec![0f64; m * n];
+        for row_n in 0..n {
+            for g in 0..ng {
+                let scale = f32::from(s[row_n * ng + g]) as f64;
+                for i in 0..GROUP {
+                    let kk = g * GROUP + i;
+                    let w = q[row_n * k + kk] as f64 * scale;
+                    for row_m in 0..m {
+                        ref_out[row_m * n + row_n] += x_host[row_m * k + kk] as f64 * w;
+                    }
+                }
+            }
+        }
+
+        let mut weight = DeviceMatrix::from_quantized_int8(ctx, &q, &s, n, k, GROUP)?;
+        weight.repack_for_marlin_w8a16(ctx)?;
+        if weight.marlin_packed.is_some() {
+            eprintln!(
+                "[{label} n={n} k={k} seed={seed:#x}] expected repack decline, \
+                 got a Marlin layout — shape is no longer a boundary"
+            );
+            return Ok(true);
+        }
+        ensure!(
+            weight.qweight.is_some() && weight.qscales.is_some(),
+            "[{label}] repack declined but released the source — no route can serve this shape"
+        );
+
+        let x_bf16: Vec<bf16> = x_host.iter().map(|v| bf16::from_f32(*v)).collect();
+        let x = ctx.stream.clone_htod(&x_bf16)?;
+        let mut deq_out = ctx.stream.alloc_zeros::<bf16>(m * n)?;
+        {
+            let wbf16 = ctx.stream.alloc_zeros::<bf16>(n * k)?;
+            let (qwp, _g0) = weight.qweight.as_ref().unwrap().device_ptr(&ctx.stream);
+            let (qsp, _g1) = weight.qscales.as_ref().unwrap().device_ptr(&ctx.stream);
+            let (wp, _g2) = wbf16.device_ptr(&ctx.stream);
+            let (xp, _g3) = x.device_ptr(&ctx.stream);
+            let (op, _g4) = deq_out.device_ptr_mut(&ctx.stream);
+            // SAFETY: same dequant→gemm lane as probe_one.
+            unsafe {
+                ffi::dequantize_w8a16_to_bf16_cuda(
+                    qwp as *const i8,
+                    qsp as *const ffi::Half,
+                    wp as *mut ffi::Half,
+                    n as i32,
+                    k as i32,
+                    GROUP as i32,
+                    ctx.stream.cu_stream(),
+                )
+                .result()?;
+                ffi::gemm_cuda(
+                    wp as *const ffi::Half,
+                    xp as *const ffi::Half,
+                    op as *mut ffi::Half,
+                    n as i32,
+                    m as i32,
+                    k as i32,
+                    ctx.stream.cu_stream(),
+                )
+                .result()?;
+            }
+        }
+        ctx.sync()?;
+
+        let deq = ctx.stream.clone_dtoh(&deq_out)?;
+        let deq_err = rel_l2(&deq, &ref_out);
+        let pass = deq_err.is_finite() && deq_err <= FALLBACK_MAX_REL_L2;
+        eprintln!(
+            "[{label} m={m:>2} n={n} k={k} seed={seed:#x}] declined fallback_relL2={deq_err:.4e} {}",
             if pass { "PASS" } else { "FAIL" }
         );
         Ok(!pass)

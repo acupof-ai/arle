@@ -15,16 +15,29 @@
 //! Under ncu: `ncu --set full -k regex:Marlin -c 8 target/release/examples/marlin_fp4_probe`
 
 fn main() -> anyhow::Result<()> {
-    if std::env::args().nth(1).as_deref() == Some("--kernel-build-id") {
-        println!("{}", cuda_kernels::KERNEL_BUILD_ID);
-        return Ok(());
+    let mut args = std::env::args().skip(1);
+    let mut seed = 0x5eed_1234u64;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--kernel-build-id" => {
+                println!("{}", cuda_kernels::KERNEL_BUILD_ID);
+                return Ok(());
+            }
+            "--seed" => {
+                seed = args
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("--seed needs a value"))?
+                    .parse()?;
+            }
+            other => anyhow::bail!("unknown arg: {other}"),
+        }
     }
-    real::run()
+    real::run(seed)
 }
 
 #[cfg(not(feature = "cuda"))]
 mod real {
-    pub(super) fn run() -> anyhow::Result<()> {
+    pub(super) fn run(_seed: u64) -> anyhow::Result<()> {
         eprintln!("marlin_fp4_probe is a CUDA harness; rebuild with --features cuda.");
         Ok(())
     }
@@ -61,8 +74,8 @@ mod real {
         }
     }
 
-    fn fp4_matrix(ctx: &DeviceContext, n: usize, k: usize) -> Result<DeviceMatrix> {
-        let mut rng = Lcg(0x5eed_1234);
+    fn fp4_matrix(ctx: &DeviceContext, n: usize, k: usize, seed: u64) -> Result<DeviceMatrix> {
+        let mut rng = Lcg(seed);
         let packed: Vec<u8> = (0..n * k / 2).map(|_| rng.next_u8()).collect();
         // E4M3 group scales: keep the exponent mid-range so no group underflows
         // to zero and none reaches the 0xFF NaN encoding.
@@ -79,8 +92,8 @@ mod real {
         Ok(m)
     }
 
-    fn fp8_matrix(ctx: &DeviceContext, n: usize, k: usize) -> Result<DeviceMatrix> {
-        let mut rng = Lcg(0x5eed_1234);
+    fn fp8_matrix(ctx: &DeviceContext, n: usize, k: usize, seed: u64) -> Result<DeviceMatrix> {
+        let mut rng = Lcg(seed.wrapping_add(1));
         // Same 0xFF-free band as the FP4 group scales above.
         let weight: Vec<u8> = (0..n * k).map(|_| 0x38 | (rng.next_u8() & 0x07)).collect();
         let scale: Vec<f32> = (0..n).map(|_| 1.0 / 448.0).collect();
@@ -114,7 +127,7 @@ mod real {
         Ok(start.elapsed_ms(&stop)? as f64 / ITERS as f64)
     }
 
-    pub(super) fn run() -> Result<()> {
+    pub(super) fn run(seed: u64) -> Result<()> {
         let ctx = DeviceContext::new()?;
         let sms = ctx.sm_count() as i32;
         // SAFETY: pure size queries (arithmetic on sms), no device work.
@@ -130,15 +143,19 @@ mod real {
         let (ws_ptr, _gw) = workspace.device_ptr(&ctx.stream);
         let stream = ctx.stream.cu_stream();
 
-        println!("Marlin byte rate, {sms} SMs, {ITERS} iters/point\n");
+        println!(
+            "Marlin byte rate, {sms} SMs, {ITERS} iters/point, seed={seed:#x}, build={}\n",
+            cuda_kernels::KERNEL_BUILD_ID
+        );
         println!(
             "{:<14}{:>7}{:>4}{:>10}{:>10}{:>10}{:>10}{:>10}",
             "shape", "N", "M", "fp4 ms", "fp4 TB/s", "fp8 ms", "fp8 TB/s", "fp4/fp8"
         );
 
+        let mut any_fail = false;
         for &(label, n, k) in SHAPES {
-            let w4 = fp4_matrix(&ctx, n, k)?;
-            let w8 = fp8_matrix(&ctx, n, k)?;
+            let w4 = fp4_matrix(&ctx, n, k, seed)?;
+            let w8 = fp8_matrix(&ctx, n, k, seed)?;
             // FP4 group scales sit in the tail of the packed allocation
             // (`repack_for_marlin_fp4`); FP8 keeps its BF16 scales separate.
             let (p4, _g1) = w4.marlin_packed.as_ref().unwrap().device_ptr(&ctx.stream);
@@ -205,6 +222,33 @@ mod real {
                 );
             }
         }
+
+        // Repack-decline boundary: N not %64 must leave the source resident.
+        let (dn, dk) = (96usize, 5120usize);
+        let mut rng = Lcg(seed.wrapping_add(2));
+        let packed: Vec<u8> = (0..dn * dk / 2).map(|_| rng.next_u8()).collect();
+        let scales: Vec<u8> = (0..dn * dk / GROUP)
+            .map(|_| 0x38 | (rng.next_u8() & 0x07))
+            .collect();
+        let mut dm = DeviceMatrix::from_fp4_e2m1_group(
+            &ctx,
+            &packed,
+            &scales,
+            &[1.0f32],
+            None,
+            dn,
+            dk,
+            GROUP,
+        )?;
+        dm.repack_for_marlin_fp4(&ctx)?;
+        let declined = dm.marlin_packed.is_none() && dm.qweight_u8.is_some();
+        any_fail |= !declined;
+        println!(
+            "declined n%64 {dn}x{dk}: {}",
+            if declined { "OK" } else { "FAIL" }
+        );
+
+        ensure!(!any_fail, "marlin_fp4_probe FAILED — see violations above");
         Ok(())
     }
 }

@@ -80,6 +80,17 @@ mod real {
     ];
     const M_SWEEP: &[usize] = &[1, 2, 4, 16, 64, 256];
 
+    /// Three fixed seeds per shape; the gate is shapes × seeds × M.
+    const SEEDS: &[u64] = &[
+        0x9e37_79b9_7f4a_7c15,
+        0x517c_c1cc_9e37_79b9,
+        0x2545_f491_4f6c_dd1d,
+    ];
+
+    /// Boundary shapes the repack must decline: N not %64 with K aligned. The
+    /// source has to stay resident and the GEMV lane carry the shape alone.
+    const DECLINED_SHAPES: &[(&str, usize, usize)] = &[("declined n%64", 96, 5120)];
+
     /// The host reference costs `M_max * K` f64 FMAs per output column, so it is
     /// computed over a sampled column set instead of all N: two contiguous slabs
     /// of this width, at the start and the end of the output dim. 512 columns is
@@ -306,11 +317,12 @@ mod real {
         let ctx = DeviceContext::new()?;
         let cc = ctx.compute_capability();
         eprintln!(
-            "[marlin-fp8-parity] device={} cc={}.{} sms={}",
+            "[marlin-fp8-parity] device={} cc={}.{} sms={} build={}",
             ctx.ordinal(),
             cc.0,
             cc.1,
-            ctx.sm_count()
+            ctx.sm_count(),
+            cuda_kernels::KERNEL_BUILD_ID
         );
         ensure!(cc.0 >= 8, "Marlin needs sm_80+; got sm_{}{}", cc.0, cc.1);
         let m_max = *M_SWEEP
@@ -319,12 +331,30 @@ mod real {
             .expect("M_SWEEP must name at least one M");
 
         let mut any_fail = false;
-        for &(label, n, k) in SHAPES {
-            any_fail |= probe_shape(&ctx, label, n, k, m_max)?;
+        for &seed in SEEDS {
+            for &(label, n, k) in SHAPES {
+                any_fail |= probe_shape(&ctx, label, n, k, m_max, seed)?;
+            }
+            for &(label, n, k) in DECLINED_SHAPES {
+                any_fail |= probe_declined(&ctx, label, n, k, m_max, seed)?;
+            }
         }
         ensure!(!any_fail, "marlin_fp8_parity FAILED — see violations above");
         eprintln!("[marlin-fp8-parity] ALL PASS");
         Ok(())
+    }
+
+    /// FNV-mix the fixed seed with the shape identity so every (seed, shape)
+    /// pair gets a distinct deterministic matrix.
+    fn shape_seed(seed: u64, label: &str, n: usize, k: usize) -> u64 {
+        let mut mix = seed;
+        for byte in label.as_bytes() {
+            mix ^= u64::from(*byte);
+            mix = mix.wrapping_mul(0x0000_0100_0000_01b3); // FNV prime
+        }
+        mix ^= (n as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        mix ^= (k as u64).wrapping_mul(0x517c_c1cc_9e37_79b9);
+        mix
     }
 
     fn probe_shape(
@@ -333,17 +363,9 @@ mod real {
         n: usize,
         k: usize,
         m_max: usize,
+        seed: u64,
     ) -> Result<bool> {
-        // Deterministic seed from the label bytes + shape (not the &str fat
-        // pointer, which is ASLR-non-deterministic).
-        let mut seed = 0xcbf2_9ce4_8422_2325u64; // FNV offset basis
-        for byte in label.as_bytes() {
-            seed ^= u64::from(*byte);
-            seed = seed.wrapping_mul(0x0000_0100_0000_01b3); // FNV prime
-        }
-        seed ^= (n as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
-        seed ^= (k as u64).wrapping_mul(0x517c_c1cc_9e37_79b9);
-        let mut rng = Rng::new(seed);
+        let mut rng = Rng::new(shape_seed(seed, label, n, k));
 
         let (qbytes, scales) = quantize_per_channel_e4m3(&mut rng, n, k);
         let x_bf16: Vec<bf16> = (0..m_max * k)
@@ -481,13 +503,99 @@ mod real {
                 && ratio <= MARLIN_VS_GEMV_MAX_RATIO;
             any_fail |= !pass;
             eprintln!(
-                "[{label} m={m:>3} n={n} k={k}] \
+                "[{label} m={m:>3} n={n} k={k} seed={seed:#x}] \
                  marlin relL2={:.4e} max/rms={:.4e} mean(out/ref)={:.6} | \
                  gemv relL2={:.4e} max/rms={:.4e} mean(out/ref)={:.6} | \
                  ratio={ratio:.2} {}",
                 ms.rel_l2,
                 ms.max_over_rms,
                 ms.mean_ratio,
+                gs.rel_l2,
+                gs.max_over_rms,
+                gs.mean_ratio,
+                if pass { "PASS" } else { "FAIL" }
+            );
+        }
+        Ok(any_fail)
+    }
+
+    /// A shape the repack must decline: assert the source stays resident and
+    /// the GEMV lane carries every M against the f64 reference alone.
+    fn probe_declined(
+        ctx: &DeviceContext,
+        label: &str,
+        n: usize,
+        k: usize,
+        m_max: usize,
+        seed: u64,
+    ) -> Result<bool> {
+        let mut rng = Rng::new(shape_seed(seed, label, n, k));
+        let (qbytes, scales) = quantize_per_channel_e4m3(&mut rng, n, k);
+        let x_bf16: Vec<bf16> = (0..m_max * k)
+            .map(|_| bf16::from_f32(rng.normal()))
+            .collect();
+
+        let cols = reference_columns(n);
+        let reference = {
+            let mut xt = vec![0f64; k * m_max];
+            for row in 0..m_max {
+                for kk in 0..k {
+                    xt[kk * m_max + row] = f64::from(f32::from(x_bf16[row * k + kk]));
+                }
+            }
+            host_reference(&qbytes, &scales, k, &cols, &xt, m_max)
+        };
+
+        let mut weight = DeviceMatrix::from_fp8_block_scaled(ctx, &qbytes, &scales, n, k, 1, k)?;
+        weight.repack_for_marlin_fp8(ctx)?;
+        if weight.marlin_packed.is_some() || weight.marlin_scales.is_some() {
+            eprintln!(
+                "[{label} n={n} k={k} seed={seed:#x}] expected repack decline, \
+                 got a Marlin layout — shape is no longer a boundary"
+            );
+            return Ok(true);
+        }
+        ensure!(
+            weight.qweight_u8.is_some() && weight.scale_f32.is_some(),
+            "[{label}] repack declined but released the source — no route can serve this shape"
+        );
+
+        let x = ctx.stream.clone_htod(&x_bf16)?;
+        let mut any_fail = false;
+        for &m in M_SWEEP {
+            let mut gemv_out = ctx.stream.alloc_zeros::<bf16>(m * n)?;
+            {
+                let (qwp, _g0) = weight.qweight_u8.as_ref().unwrap().device_ptr(&ctx.stream);
+                let (sfp, _g1) = weight.scale_f32.as_ref().unwrap().device_ptr(&ctx.stream);
+                let (xp, _g2) = x.device_ptr(&ctx.stream);
+                let (op, _g3) = gemv_out.device_ptr_mut(&ctx.stream);
+                // SAFETY: same layout as the GEMV lane in probe_shape.
+                unsafe {
+                    ffi::gemv_fp8_block_scaled_batch_cuda(
+                        qwp as *const u8,
+                        sfp as *const f32,
+                        xp as *const ffi::Half,
+                        op as *mut ffi::Half,
+                        m as i32,
+                        n as i32,
+                        k as i32,
+                        n as i32, // scale_rows
+                        1,        // scale_cols
+                        1,        // block_m
+                        k as i32, // block_k
+                        ctx.stream.cu_stream(),
+                    )
+                    .result()?;
+                }
+            }
+            ctx.sync()?;
+            let gemv = ctx.stream.clone_dtoh(&gemv_out)?;
+            let gs = lane_stats(&gemv, n, m, &cols, &reference, m_max);
+            let pass = gs.rel_l2.is_finite() && gs.rel_l2 <= MAX_REL_L2;
+            any_fail |= !pass;
+            eprintln!(
+                "[{label} m={m:>3} n={n} k={k} seed={seed:#x}] \
+                 declined gemv relL2={:.4e} max/rms={:.4e} mean(out/ref)={:.6} {}",
                 gs.rel_l2,
                 gs.max_over_rms,
                 gs.mean_ratio,
