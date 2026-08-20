@@ -468,7 +468,6 @@ pub mod app {
                     kl_direction: train::loss::KlDirection::Forward,
                     kl_temperature: 1.0,
                     kl_beta: None,
-                    teacher_topk: None,
                     fused_distill: true,
                     logits_window_size: Some(args.logits_window_size),
                     kl_mask: OpdKlMask::CompletionOnly,

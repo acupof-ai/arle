@@ -1342,9 +1342,21 @@ fn load_planned_tensor_into_slot(
             .tensor(&fp4.global_scale_name)
             .map_err(|err| LoaderError::Safetensors(format!("{}: {err}", fp4.global_scale_name)))?;
         let global = dtype_to_f32(&global_view, &fp4.global_scale_name)?;
-        let global_scale = *global
+        let checkpoint_global = *global
             .first()
             .ok_or_else(|| LoaderError::Custom(format!("{} is empty", fp4.global_scale_name)))?;
+        if checkpoint_global == 0.0 {
+            return Err(LoaderError::Custom(format!(
+                "{} is zero",
+                fp4.global_scale_name
+            )));
+        }
+        // `weight_global_scale` is a divisor, so the stored scalar is its
+        // reciprocal — the serve loader reciprocates the same way
+        // (`ScaleApply::Divide`, infer-cuda/src/loader.rs:3736). Multiplying the
+        // raw value instead leaves the frozen base off by global_scale^2 against
+        // the weights the same checkpoint serves.
+        let global_scale = 1.0 / checkpoint_global;
         let weight = view.data();
         let handle = store
             .backend()
