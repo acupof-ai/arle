@@ -222,17 +222,64 @@ impl Qwen35Layer {
                 seq_len,
                 "CP: cp_positions must give one absolute position per local row"
             );
-            autograd::ops::ring_attention::cp_causal_sdpa(
-                q,
-                k,
-                v,
-                cp.size,
-                cp.rank,
-                Some(positions),
-                None,
+            // The ring, its gate, the head merge and out_proj get their own
+            // checkpoint boundary: without it their intermediates stay resident
+            // through the projection backwards, and the layer's replay peak is
+            // the SUM over its stages rather than the MAX. Inert in the forward
+            // — `checkpoint` passes straight through while the outer group has
+            // the tape disabled — so this only splits the replay.
+            let positions = positions.to_vec();
+            let (cp_size, cp_rank) = (cp.size, cp.rank);
+            let o_proj = attn.o_proj.clone();
+            let head_dim = cfg.head_dim;
+            let mut inputs = vec![q, k, v];
+            let gate_slot = gate.map(|gate| {
+                inputs.push(gate);
+                inputs.len() - 1
+            });
+            collect_linear_ids(&o_proj, &mut inputs);
+            let out = autograd::ops::checkpoint(
+                inputs,
                 store,
                 tape,
-            )?
+                move |st, inner, inp| {
+                    let ([q, k, v], gate) = (
+                        <[TensorId; 3]>::try_from(&inp[..3]).map_err(|_| {
+                            AutogradError::TapeInvariant(
+                                "full-attention core checkpoint expects q/k/v",
+                            )
+                        })?,
+                        gate_slot.map(|slot| inp[slot]),
+                    );
+                    let hidden = autograd::ops::ring_attention::cp_causal_sdpa(
+                        q,
+                        k,
+                        v,
+                        cp_size,
+                        cp_rank,
+                        Some(&positions),
+                        None,
+                        st,
+                        inner,
+                    )?;
+                    let hidden = match gate {
+                        Some(gate) => {
+                            let gate = sigmoid(gate, st, inner)?;
+                            mul(hidden, gate, st, inner)?
+                        }
+                        None => hidden,
+                    };
+                    let hidden = transpose(hidden, 1, 2, st, inner)?;
+                    let hidden = reshape(
+                        hidden,
+                        &[batch, seq_len, local_attention_heads * head_dim],
+                        st,
+                        inner,
+                    )?;
+                    o_proj.forward(hidden, st, inner)
+                },
+            )?;
+            return Ok(maybe_all_reduce(out, tp, store, tape)?);
         } else {
             let k = repeat_kv(k, kv_repeat, store, tape)?;
             let v = repeat_kv(v, kv_repeat, store, tape)?;
