@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use infer_seam::MetalRuntimeFlags;
 
 static PIPELINE: AtomicBool = AtomicBool::new(true);
-static WARMUP: AtomicBool = AtomicBool::new(true);
+static WARMUP: AtomicBool = AtomicBool::new(false);
 static PAGED_KV_READ: AtomicBool = AtomicBool::new(true);
 static HOST_SAMPLING: AtomicBool = AtomicBool::new(false);
 /// Speculative-decode resolver inputs (draft model / depth / accept width).
