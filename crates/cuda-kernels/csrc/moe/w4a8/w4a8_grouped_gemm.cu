@@ -277,14 +277,21 @@ __global__ void w4a8_per_tensor_amax_kernel(
   }
 }
 
-// Quantize BF16 → FP8 E4M3 using a precomputed per-tensor raw amax.
+// Single-thread finalize: raw amax → dequant factor (amax / 448). The CUTLASS
+// epilogue reads this as alpha_ptr, so it must be the dequant scale, not raw amax.
+__global__ void w4a8_amax_finalize_kernel(float* __restrict__ scale) {
+  float s = *scale;
+  *scale = (s > 0.0f) ? s / 448.0f : 1.0f;
+}
+
+// Quantize BF16 → FP8 E4M3 using a precomputed per-tensor scale (amax/448).
 __global__ void w4a8_per_tensor_quantize_kernel(
     const __nv_bfloat16* __restrict__ input,
     __nv_fp8_storage_t* __restrict__ output,
     const float* __restrict__ scale,
     int numel) {
-  float s = *scale;  // raw amax; quant scale = 448 / amax
-  float inv = (s > 0.0f) ? 448.0f / s : 1.0f;
+  float s = *scale;  // amax / 448 (dequant factor); quant uses reciprocal
+  float inv = (s > 0.0f) ? 1.0f / s : 1.0f;
   for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < numel;
        i += gridDim.x * blockDim.x) {
     float v = __bfloat162float(input[i]) * inv;
@@ -321,6 +328,7 @@ extern "C" void w4a8_per_tensor_fp8_quant(
   if (amax_blocks > 128) amax_blocks = 128;
   w4a8_per_tensor_amax_kernel<<<amax_blocks, 1024, 0, s>>>(
       static_cast<const __nv_bfloat16*>(input), scale, numel);
+  w4a8_amax_finalize_kernel<<<1, 1, 0, s>>>(scale);
   int blocks = (numel + 255) / 256;
   if (blocks > 256) blocks = 256;
   w4a8_per_tensor_quantize_kernel<<<blocks, 256, 0, s>>>(
@@ -363,7 +371,6 @@ extern "C" void w4a8_swiglu_fused(
     void* stream) {
   int n = rows * i_dim;
   int blocks = (n + 255) / 256;
-  if (blocks > 256) blocks = 256;
   w4a8_swiglu_fused_kernel<<<blocks, 256, 0, static_cast<cudaStream_t>(stream)>>>(
       static_cast<const __nv_bfloat16*>(gateup),
       static_cast<__nv_bfloat16*>(out),
