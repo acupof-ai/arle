@@ -313,31 +313,27 @@ pub(super) fn cuda_linear_attention_backward_device_row(
             let (v_ptr, _v_guard) = v.device_ptr_mut(&backend.stream);
             let (g_ptr, _g_guard) = g_re.device_ptr_mut(&backend.stream);
             let (beta_ptr, _beta_guard) = beta_re.device_ptr_mut(&backend.stream);
-            check_cuda_ffi(
-                // SAFETY: same shapes as the forward's prep — q/k [S,Hg,key_dim] = q_len,
-                // v v_len, g/beta head_len.
-                unsafe {
-                    ffi::gdr_fq_prep_cuda(
-                        qkv_conv_ptr as *const ffi::Half,
-                        b_ptr as *const ffi::Half,
-                        a_ptr as *const ffi::Half,
-                        dt_ptr as *const ffi::Half,
-                        a_log_ptr as *const f32,
-                        q_ptr as *mut ffi::Half,
-                        k_ptr as *mut ffi::Half,
-                        v_ptr as *mut ffi::Half,
-                        g_ptr as *mut f32,
-                        beta_ptr as *mut f32,
-                        num_key_heads_i32,
-                        num_value_heads_i32,
-                        key_dim_i32,
-                        value_dim_i32,
-                        seq_len_i32,
-                        backend.stream.cu_stream(),
-                    )
-                },
-                "gdr_fq_prep_cuda",
-            )?;
+            // Same shapes as the forward's prep — q/k [S,Hg,key_dim] = q_len,
+            // v v_len, g/beta head_len.
+            cuda_kernels::recurrent::gdr_fq_prep_raw(
+                &backend.stream,
+                qkv_conv_ptr,
+                b_ptr,
+                a_ptr,
+                dt_ptr,
+                a_log_ptr,
+                q_ptr,
+                k_ptr,
+                v_ptr,
+                g_ptr,
+                beta_ptr,
+                p.num_key_heads,
+                p.num_value_heads,
+                p.key_dim,
+                p.value_dim,
+                p.seq_len,
+            )
+            .map_err(|e| leak_err(format!("gdr_fq_prep_cuda: {e}")))?;
         }
         {
             let (g_ptr, _g_guard) = g_re.device_ptr(&backend.stream);

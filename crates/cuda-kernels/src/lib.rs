@@ -20,6 +20,8 @@ pub mod paged_kv;
 pub mod prelude;
 #[cfg(feature = "cuda")]
 pub mod quant_linear;
+#[cfg(feature = "cuda")]
+pub mod recurrent;
 // Host math compiles everywhere (autograd's CPU gates use it); device glue is
 // feature-gated inside.
 pub mod ring_attention;
