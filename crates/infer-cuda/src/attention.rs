@@ -3170,25 +3170,16 @@ fn mla_rms_norm_into(
         x.hidden_dim,
         x.seq_len
     );
-    {
-        let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
-        let (w_ptr, _gw) = weight.data.device_ptr(&ctx.stream);
-        let (out_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
-        // SAFETY: buffers valid on ctx.stream; out matches x shape.
-        unsafe {
-            ffi::rms_norm_batched_cuda(
-                x_ptr as *const ffi::Half,
-                w_ptr as *const ffi::Half,
-                out_ptr as *mut ffi::Half,
-                x.hidden_dim as i32,
-                x.seq_len as i32,
-                eps,
-                ctx.stream.cu_stream(),
-            )
-            .result()?;
-        }
-    }
-    Ok(())
+    cuda_kernels::tensor_ops::rms_norm_batched(
+        ctx,
+        &x.data,
+        0,
+        &weight.data,
+        &mut out.data,
+        x.hidden_dim,
+        x.seq_len,
+        eps,
+    )
 }
 
 fn mla_rms_norm_decode_slice_into(
@@ -3222,27 +3213,16 @@ fn mla_rms_norm_decode_slice_into(
         out.seq_len,
         width
     );
-    {
-        let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
-        let (w_ptr, _gw) = weight.data.device_ptr(&ctx.stream);
-        let (out_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
-        // SAFETY: ensure! above bounds offset+width within x.
-        let x_ptr = unsafe { (x_ptr as *const ffi::Half).add(offset) };
-        // SAFETY: ptrs from live device allocations sized to the dims passed.
-        unsafe {
-            ffi::rms_norm_batched_cuda(
-                x_ptr,
-                w_ptr as *const ffi::Half,
-                out_ptr as *mut ffi::Half,
-                width as i32,
-                1,
-                eps,
-                ctx.stream.cu_stream(),
-            )
-            .result()?;
-        }
-    }
-    Ok(())
+    cuda_kernels::tensor_ops::rms_norm_batched(
+        ctx,
+        &x.data,
+        offset,
+        &weight.data,
+        &mut out.data,
+        width,
+        1,
+        eps,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]

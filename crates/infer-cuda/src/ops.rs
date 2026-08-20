@@ -4,8 +4,8 @@
 //! GEMM/GEMV, add, SwiGLU, row copy, argmax, host uploads, RoPE precompute.
 
 use anyhow::{Result, anyhow, ensure};
-use cuda_kernels::ffi;
 use cuda_kernels::prelude::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStates};
+use cuda_kernels::{ffi, tensor_ops};
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 use half::bf16;
 use std::sync::OnceLock;
@@ -90,22 +90,14 @@ pub(crate) fn embedding_batch(
     token_ids: &CudaSlice<i32>,
     out: &mut HiddenStates,
 ) -> Result<()> {
-    let (embed_ptr, _ge) = embed.data.device_ptr(&ctx.stream);
-    let (token_ptr, _gt) = token_ids.device_ptr(&ctx.stream);
-    let (out_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
-    // SAFETY: ptrs from live device allocations sized to the dims passed.
-    unsafe {
-        ffi::embedding_batched_cuda(
-            embed_ptr as *const ffi::Half,
-            token_ptr as *const i32,
-            out_ptr as *mut ffi::Half,
-            embed.cols as i32,
-            out.seq_len as i32,
-            ctx.stream.cu_stream(),
-        )
-        .result()?;
-    }
-    Ok(())
+    tensor_ops::embedding_batched(
+        ctx,
+        &embed.data,
+        token_ids,
+        &mut out.data,
+        embed.cols,
+        out.seq_len,
+    )
 }
 
 pub(crate) fn rms_norm_batch(
@@ -115,23 +107,16 @@ pub(crate) fn rms_norm_batch(
     eps: f32,
     out: &mut HiddenStates,
 ) -> Result<()> {
-    let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
-    let (w_ptr, _gw) = weight.data.device_ptr(&ctx.stream);
-    let (out_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
-    // SAFETY: ptrs from live device allocations sized to the dims passed.
-    unsafe {
-        ffi::rms_norm_batched_cuda(
-            x_ptr as *const ffi::Half,
-            w_ptr as *const ffi::Half,
-            out_ptr as *mut ffi::Half,
-            x.hidden_dim as i32,
-            x.seq_len as i32,
-            eps,
-            ctx.stream.cu_stream(),
-        )
-        .result()?;
-    }
-    Ok(())
+    tensor_ops::rms_norm_batched(
+        ctx,
+        &x.data,
+        0,
+        &weight.data,
+        &mut out.data,
+        x.hidden_dim,
+        x.seq_len,
+        eps,
+    )
 }
 
 pub(crate) fn rms_norm_vec(
@@ -141,22 +126,7 @@ pub(crate) fn rms_norm_vec(
     eps: f32,
     out: &mut DeviceVec,
 ) -> Result<()> {
-    let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
-    let (w_ptr, _gw) = weight.data.device_ptr(&ctx.stream);
-    let (out_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
-    // SAFETY: ptrs from live device allocations sized to the dims passed.
-    unsafe {
-        ffi::rms_norm_cuda(
-            x_ptr as *const ffi::Half,
-            w_ptr as *const ffi::Half,
-            out_ptr as *mut ffi::Half,
-            x.len as i32,
-            eps,
-            ctx.stream.cu_stream(),
-        )
-        .result()?;
-    }
-    Ok(())
+    tensor_ops::rms_norm(ctx, &x.data, &weight.data, &mut out.data, x.len, eps)
 }
 
 pub(crate) fn gemm_batch(
@@ -289,21 +259,7 @@ pub(crate) fn add_batch(
         "add_batch shape mismatch"
     );
     let n = a.hidden_dim * a.seq_len;
-    let (a_ptr, _ga) = a.data.device_ptr(&ctx.stream);
-    let (b_ptr, _gb) = b.data.device_ptr(&ctx.stream);
-    let (out_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
-    // SAFETY: ptrs from live device allocations sized to the dims passed.
-    unsafe {
-        ffi::add_cuda(
-            a_ptr as *const ffi::Half,
-            b_ptr as *const ffi::Half,
-            out_ptr as *mut ffi::Half,
-            n as i32,
-            ctx.stream.cu_stream(),
-        )
-        .result()?;
-    }
-    Ok(())
+    tensor_ops::add(ctx, &a.data, &b.data, &mut out.data, n)
 }
 
 pub(crate) fn silu_mul(
@@ -320,21 +276,7 @@ pub(crate) fn silu_mul(
         "silu_mul shape mismatch"
     );
     let n = gate.hidden_dim * gate.seq_len;
-    let (gate_ptr, _gg) = gate.data.device_ptr(&ctx.stream);
-    let (up_ptr, _gu) = up.data.device_ptr(&ctx.stream);
-    let (out_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
-    // SAFETY: ptrs from live device allocations sized to the dims passed.
-    unsafe {
-        ffi::silu_mul_cuda(
-            gate_ptr as *const ffi::Half,
-            up_ptr as *const ffi::Half,
-            out_ptr as *mut ffi::Half,
-            n as i32,
-            ctx.stream.cu_stream(),
-        )
-        .result()?;
-    }
-    Ok(())
+    tensor_ops::silu_mul(ctx, &gate.data, &up.data, &mut out.data, n)
 }
 
 /// Split a row-fused `[seq, first + second]` buffer into two buffers (leading
@@ -357,23 +299,15 @@ pub(crate) fn split2(
         second.hidden_dim,
         second.seq_len
     );
-    let (fused_ptr, _gf) = fused.data.device_ptr(&ctx.stream);
-    let (first_ptr, _g1) = first.data.device_ptr_mut(&ctx.stream);
-    let (second_ptr, _g2) = second.data.device_ptr_mut(&ctx.stream);
-    // SAFETY: ptrs from live device allocations sized to the dims passed.
-    unsafe {
-        ffi::split2_cuda(
-            fused_ptr as *const ffi::Half,
-            first_ptr as *mut ffi::Half,
-            second_ptr as *mut ffi::Half,
-            fused.seq_len as i32,
-            first.hidden_dim as i32,
-            second.hidden_dim as i32,
-            ctx.stream.cu_stream(),
-        )
-        .result()?;
-    }
-    Ok(())
+    tensor_ops::split2(
+        ctx,
+        &fused.data,
+        &mut first.data,
+        &mut second.data,
+        fused.seq_len,
+        first.hidden_dim,
+        second.hidden_dim,
+    )
 }
 
 /// Split a row-fused `[seq, q + 2*kv]` qkv buffer into `q`/`k`/`v` buffers.
@@ -400,25 +334,16 @@ pub(crate) fn split_qkv(
         v.hidden_dim,
         v.seq_len
     );
-    let (qkv_ptr, _gf) = qkv.data.device_ptr(&ctx.stream);
-    let (q_ptr, _g1) = q.data.device_ptr_mut(&ctx.stream);
-    let (k_ptr, _g2) = k.data.device_ptr_mut(&ctx.stream);
-    let (v_ptr, _g3) = v.data.device_ptr_mut(&ctx.stream);
-    // SAFETY: ptrs from live device allocations sized to the dims passed.
-    unsafe {
-        ffi::split_qkv_cuda(
-            qkv_ptr as *const ffi::Half,
-            q_ptr as *mut ffi::Half,
-            k_ptr as *mut ffi::Half,
-            v_ptr as *mut ffi::Half,
-            qkv.seq_len as i32,
-            q.hidden_dim as i32,
-            k.hidden_dim as i32,
-            ctx.stream.cu_stream(),
-        )
-        .result()?;
-    }
-    Ok(())
+    tensor_ops::split_qkv(
+        ctx,
+        &qkv.data,
+        &mut q.data,
+        &mut k.data,
+        &mut v.data,
+        qkv.seq_len,
+        q.hidden_dim,
+        k.hidden_dim,
+    )
 }
 
 /// SwiGLU over a row-fused `[seq, 2*inter]` gate_up buffer (gate = first half
@@ -438,20 +363,13 @@ pub(crate) fn silu_mul_fused(
         out.hidden_dim,
         out.seq_len
     );
-    let (gu_ptr, _gg) = gate_up.data.device_ptr(&ctx.stream);
-    let (out_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
-    // SAFETY: ptrs from live device allocations sized to the dims passed.
-    unsafe {
-        ffi::silu_mul_fused_cuda(
-            gu_ptr as *const ffi::Half,
-            out_ptr as *mut ffi::Half,
-            gate_up.seq_len as i32,
-            out.hidden_dim as i32,
-            ctx.stream.cu_stream(),
-        )
-        .result()?;
-    }
-    Ok(())
+    tensor_ops::silu_mul_fused(
+        ctx,
+        &gate_up.data,
+        &mut out.data,
+        gate_up.seq_len,
+        out.hidden_dim,
+    )
 }
 
 /// On-device LoRA delta GEMM: `out = B · A` where `B` is `[rows, rank]` and
@@ -528,21 +446,7 @@ where
     ctx.stream
         .memcpy_dtod(base, out)
         .map_err(|e| anyhow!("lora_scaled_add_into: base D2D copy failed: {e}"))?;
-    let (delta_ptr, _gd) = delta.device_ptr(&ctx.stream);
-    let (out_ptr, _go) = out.device_ptr_mut(&ctx.stream);
-    // SAFETY: ptrs from live device allocations sized to the dims passed.
-    unsafe {
-        ffi::add_scaled_row_cuda(
-            delta_ptr as *const ffi::Half,
-            out_ptr as *mut ffi::Half,
-            n as i32,
-            0,
-            scale,
-            ctx.stream.cu_stream(),
-        )
-        .result()?;
-    }
-    Ok(())
+    tensor_ops::add_scaled_row(ctx, delta, out, n, 0, scale)
 }
 
 pub(crate) fn copy_row_to_vec(

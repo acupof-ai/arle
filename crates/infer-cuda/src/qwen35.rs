@@ -349,23 +349,15 @@ pub(crate) fn rms_norm_offset(
     eps: f32,
     out: &mut HiddenStates,
 ) -> Result<()> {
-    let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
-    let (w_ptr, _gw) = weight.data.device_ptr(&ctx.stream);
-    let (out_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
-    // SAFETY: x/weight/out valid on ctx.stream; out matches x shape.
-    unsafe {
-        ffi::rms_norm_batched_offset_cuda(
-            x_ptr as *const ffi::Half,
-            w_ptr as *const ffi::Half,
-            out_ptr as *mut ffi::Half,
-            x.hidden_dim as i32,
-            x.seq_len as i32,
-            eps,
-            ctx.stream.cu_stream(),
-        )
-        .result()?;
-    }
-    Ok(())
+    cuda_kernels::tensor_ops::rms_norm_batched_offset(
+        ctx,
+        &x.data,
+        &weight.data,
+        &mut out.data,
+        x.hidden_dim,
+        x.seq_len,
+        eps,
+    )
 }
 
 /// Offset RMSNorm (1+weight) over a single vector (the final norm before lm_head).
@@ -376,22 +368,7 @@ pub(crate) fn rms_norm_offset_vec(
     eps: f32,
     out: &mut DeviceVec,
 ) -> Result<()> {
-    let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
-    let (w_ptr, _gw) = weight.data.device_ptr(&ctx.stream);
-    let (out_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
-    // SAFETY: x/weight/out valid on ctx.stream; out matches x len.
-    unsafe {
-        ffi::rms_norm_offset_cuda(
-            x_ptr as *const ffi::Half,
-            w_ptr as *const ffi::Half,
-            out_ptr as *mut ffi::Half,
-            x.len as i32,
-            eps,
-            ctx.stream.cu_stream(),
-        )
-        .result()?;
-    }
-    Ok(())
+    cuda_kernels::tensor_ops::rms_norm_offset(ctx, &x.data, &weight.data, &mut out.data, x.len, eps)
 }
 
 #[cfg(test)]
