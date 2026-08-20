@@ -313,6 +313,143 @@ fn check_cuda_ffi(status: cudarc::driver::sys::CUresult, label: &'static str) ->
     status.result().context(label)
 }
 
+// --- Scalar one-block launchers (non-sm90 / non-hd256 fallback) ---
+// Raw u64 device addresses over the same [tiles, rows(, d)] layouts the FA3
+// route uses; f32 accumulators/grads, bf16 q/k/v. Callers keep every owning
+// buffer alive and stream-ordered on `stream`.
+
+/// Scalar per-block forward merge: fuse one q-tile × one KV block into the
+/// functional (M, L, O) accumulator (`*_in` read, `*_out` written).
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+pub fn ring_block_attention_fwd_merge_raw(
+    stream: &CudaStream,
+    q_ptr: u64,
+    k_blk_ptr: u64,
+    v_blk_ptr: u64,
+    acc_m_in_ptr: u64,
+    acc_l_in_ptr: u64,
+    acc_o_in_ptr: u64,
+    acc_m_out_ptr: u64,
+    acc_l_out_ptr: u64,
+    acc_o_out_ptr: u64,
+    q_pos_ptr: u64,
+    k_pos_ptr: u64,
+    dims: RingBlockDims,
+) -> Result<()> {
+    check_cuda_ffi(
+        // SAFETY: q/k/v are live bf16 buffers; acc_*_in / *_out are f32 of
+        // rows / rows*hd; q_pos/k_pos f32 of q_rows / blk_len; dims mirror the
+        // shapes.
+        unsafe {
+            ffi::ring_block_attention_fwd_merge_cuda(
+                q_ptr as *const ffi::Half,
+                k_blk_ptr as *const ffi::Half,
+                v_blk_ptr as *const ffi::Half,
+                acc_m_in_ptr as *const f32,
+                acc_l_in_ptr as *const f32,
+                acc_o_in_ptr as *const f32,
+                acc_m_out_ptr as *mut f32,
+                acc_l_out_ptr as *mut f32,
+                acc_o_out_ptr as *mut f32,
+                q_pos_ptr as *const f32,
+                k_pos_ptr as *const f32,
+                ring_i32(dims.num_q_tiles, "ring num_q_tiles i32")?,
+                ring_i32(dims.num_q_heads, "ring num_q_heads i32")?,
+                ring_i32(dims.num_kv_heads, "ring num_kv_heads i32")?,
+                ring_i32(dims.head_dim, "ring head_dim i32")?,
+                ring_i32(dims.q_rows, "ring q_rows i32")?,
+                ring_i32(dims.blk_len, "ring blk_len i32")?,
+                dims.sm_scale,
+                stream.cu_stream(),
+            )
+        },
+        "ring_block_attention_fwd_merge_cuda",
+    )
+}
+
+/// Scalar finalize after all blocks: `out = O / L`, `lse = M + ln(L)` (f32).
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+pub fn ring_block_attention_finalize_raw(
+    stream: &CudaStream,
+    acc_m_ptr: u64,
+    acc_l_ptr: u64,
+    acc_o_ptr: u64,
+    out_ptr: u64,
+    lse_ptr: u64,
+    total_rows: usize,
+    head_dim: usize,
+) -> Result<()> {
+    check_cuda_ffi(
+        // SAFETY: acc_* are f32 of rows / rows*hd; out is rows*hd f32; lse is
+        // rows f32.
+        unsafe {
+            ffi::ring_block_attention_finalize_cuda(
+                acc_m_ptr as *const f32,
+                acc_l_ptr as *const f32,
+                acc_o_ptr as *const f32,
+                out_ptr as *mut f32,
+                lse_ptr as *mut f32,
+                ring_i32(total_rows, "ring total_rows i32")?,
+                ring_i32(head_dim, "ring head_dim i32")?,
+                stream.cu_stream(),
+            )
+        },
+        "ring_block_attention_finalize_cuda",
+    )
+}
+
+/// Scalar per-block backward (flash-2 adjoint): `grad_q` accumulated in place,
+/// `grad_k_blk`/`grad_v_blk` via atomicAdd. f32 grad buffers.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+pub fn ring_block_attention_bwd_raw(
+    stream: &CudaStream,
+    q_ptr: u64,
+    k_blk_ptr: u64,
+    v_blk_ptr: u64,
+    out_ptr: u64,
+    lse_ptr: u64,
+    d_out_ptr: u64,
+    grad_q_ptr: u64,
+    grad_k_blk_ptr: u64,
+    grad_v_blk_ptr: u64,
+    q_pos_ptr: u64,
+    k_pos_ptr: u64,
+    dims: RingBlockDims,
+) -> Result<()> {
+    check_cuda_ffi(
+        // SAFETY: bf16 q/k/v/d_out + f32 out/lse/grad buffers of matching
+        // length; gk/gv sized to one block's [Tkv, blk_len, hd]; q_pos/k_pos
+        // f32 of q_rows/blk_len; dims mirror the shapes.
+        unsafe {
+            ffi::ring_block_attention_bwd_cuda(
+                q_ptr as *const ffi::Half,
+                k_blk_ptr as *const ffi::Half,
+                v_blk_ptr as *const ffi::Half,
+                out_ptr as *const f32,
+                lse_ptr as *const f32,
+                d_out_ptr as *const ffi::Half,
+                grad_q_ptr as *mut f32,
+                grad_k_blk_ptr as *mut f32,
+                grad_v_blk_ptr as *mut f32,
+                q_pos_ptr as *const f32,
+                k_pos_ptr as *const f32,
+                ring_i32(dims.num_q_tiles, "ring bwd num_q_tiles i32")?,
+                ring_i32(dims.num_q_heads, "ring bwd num_q_heads i32")?,
+                ring_i32(dims.num_kv_heads, "ring bwd num_kv_heads i32")?,
+                ring_i32(dims.head_dim, "ring bwd head_dim i32")?,
+                ring_i32(dims.q_rows, "ring bwd q_rows i32")?,
+                ring_i32(dims.blk_len, "ring bwd blk_len i32")?,
+                dims.sm_scale,
+                stream.cu_stream(),
+            )
+        },
+        "ring_block_attention_bwd_cuda",
+    )
+}
+
 #[cfg(feature = "cuda")]
 pub fn ring_fa3_route(
     stream: &CudaStream,

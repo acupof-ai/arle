@@ -695,31 +695,28 @@ fn prefill_attention(
         let k_pool_ptr = pool.k_ptr(layer_idx, &ctx.stream);
         let v_pool_ptr = pool.v_ptr(layer_idx, &ctx.stream);
 
-        // SAFETY: ptrs from live device allocations sized to the dims passed.
-        unsafe {
-            ffi::prefill_attention_paged_prep_cuda(
-                q_ptr as *mut ffi::Half,
-                k_ptr as *mut ffi::Half,
-                v_ptr as *const ffi::Half,
-                qn_ptr as *const ffi::Half,
-                kn_ptr as *const ffi::Half,
-                cos_ptr as *const ffi::Half,
-                sin_ptr as *const ffi::Half,
-                indices_ptr as *const i32,
-                offsets_ptr as *const i32,
-                pool.page_size as i32,
-                k_pool_ptr as *mut ffi::Half,
-                v_pool_ptr as *mut ffi::Half,
-                num_q_heads as i32,
-                num_kv_heads as i32,
-                head_dim as i32,
-                meta.seq_len as i32,
-                start_ptr as *const i32,
-                rms_eps,
-                ctx.stream.cu_stream(),
-            )
-            .result()?;
-        }
+        // Ptrs from live device allocations sized to the dims passed.
+        flash_kv::prefill_attention_paged_prep_raw(
+            &ctx.stream,
+            q_ptr,
+            k_ptr,
+            v_ptr,
+            qn_ptr,
+            kn_ptr,
+            cos_ptr,
+            sin_ptr,
+            indices_ptr,
+            offsets_ptr,
+            pool.page_size,
+            k_pool_ptr,
+            v_pool_ptr,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            meta.seq_len,
+            start_ptr,
+            rms_eps,
+        )?;
     }
     run_tilelang_paged(
         ctx,
@@ -784,32 +781,29 @@ fn decode_attention(
         let v_pool_ptr = pool.v_ptr(layer_idx, &ctx.stream);
         let stride_page = pool.kv_dim * pool.page_size;
 
-        // SAFETY: ptrs from live device allocations sized to the dims passed.
-        unsafe {
-            ffi::decode_prep_paged_cuda(
-                q_ptr as *mut ffi::Half,
-                k_ptr as *const ffi::Half,
-                v_ptr as *const ffi::Half,
-                qn_ptr as *const ffi::Half,
-                kn_ptr as *const ffi::Half,
-                cos_ptr as *const ffi::Half,
-                sin_ptr as *const ffi::Half,
-                pos_ptr as *const i32,
-                k_pool_ptr as *mut ffi::Half,
-                v_pool_ptr as *mut ffi::Half,
-                indices_ptr as *const i32,
-                indptr_ptr as *const i32,
-                last_ptr as *const i32,
-                num_q_heads as i32,
-                num_kv_heads as i32,
-                pool.page_size as i32,
-                stride_page as i32,
-                meta.batch as i32,
-                rms_eps,
-                ctx.stream.cu_stream(),
-            )
-            .result()?;
-        }
+        // Ptrs from live device allocations sized to the dims passed.
+        flash_kv::decode_prep_paged_raw(
+            &ctx.stream,
+            q_ptr,
+            k_ptr,
+            v_ptr,
+            qn_ptr,
+            kn_ptr,
+            cos_ptr,
+            sin_ptr,
+            pos_ptr,
+            k_pool_ptr,
+            v_pool_ptr,
+            indices_ptr,
+            indptr_ptr,
+            last_ptr,
+            num_q_heads,
+            num_kv_heads,
+            pool.page_size,
+            stride_page,
+            meta.batch,
+            rms_eps,
+        )?;
     }
     if quant {
         // Calibrate-if-unlatched covers the 1-token-prompt edge: a seq_len==1 first
