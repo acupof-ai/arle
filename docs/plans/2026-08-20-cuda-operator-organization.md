@@ -1,6 +1,9 @@
 # CUDA operator organization across kernels and models
 
-> Status: Proposed
+> Status: In execution (2026-08-20). Landed: T0, T1, T2 (verdict ACCEPT), T2L,
+> T3 (s1–s5), T4, T6 (s1–s2), T7, T8 registry prep; remote receipt green
+> ([wins](../experience/wins/2026-08-20-cuda-operator-organization-t-series.md)).
+> Open: T5 (peer holds `infer-cuda/src/moe.rs`), T8 closure.
 >
 > Scope: all production CUDA operator paths for Qwen3, Qwen3.5/3.6/3.8,
 > DeepSeek V4, GLM-5.2, and OPD autograd.
