@@ -11,7 +11,7 @@ use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver as SyncReceiver, RecvTimeoutError, Sender as SyncSender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use crate::CounterSnapshot;
@@ -355,11 +355,21 @@ impl CoordinatorHandle {
 /// at the call site, fixing the group for that call).
 pub struct DpCoordinator {
     groups: Vec<Arc<CoordinatorHandle>>,
+    cached_stats: Arc<RwLock<Option<CounterSnapshot>>>,
 }
 
 impl DpCoordinator {
     pub fn new(groups: Vec<Arc<CoordinatorHandle>>) -> Self {
-        Self { groups }
+        Self {
+            groups,
+            cached_stats: Arc::new(RwLock::new(None)),
+        }
+    }
+
+    /// Latest stats snapshot from the background observer poll.
+    /// `None` until the first poll completes (or when observe is disabled).
+    pub(crate) fn cached_stats(&self) -> Option<CounterSnapshot> {
+        self.cached_stats.read().ok()?.clone()
     }
 
     fn select(&self) -> &Arc<CoordinatorHandle> {
@@ -522,8 +532,13 @@ fn spawn_coordinator_observe(dp: Arc<DpCoordinator>) {
         log::error!("observe: tokio runtime build failed");
         return;
     };
+    let cached = Arc::clone(&dp.cached_stats);
     crate::observe::spawn_observe_task(move || {
-        Some(rt.block_on(dp.query_stats_all(Duration::from_secs(5))))
+        let snap = rt.block_on(dp.query_stats_all(Duration::from_secs(5)));
+        if let Ok(mut guard) = cached.write() {
+            *guard = Some(snap.clone());
+        }
+        Some(snap)
     });
 }
 
@@ -2074,7 +2089,10 @@ async fn fallback_404(req: axum::extract::Request) -> (StatusCode, Json<serde_js
 async fn metrics(
     State(state): State<Arc<DpCoordinator>>,
 ) -> ([(header::HeaderName, &'static str); 1], String) {
-    let counters = state.query_stats_all(Duration::from_secs(30)).await;
+    let counters = match state.cached_stats() {
+        Some(snap) => snap,
+        None => state.query_stats_all(Duration::from_secs(5)).await,
+    };
     (
         [(
             header::CONTENT_TYPE,
