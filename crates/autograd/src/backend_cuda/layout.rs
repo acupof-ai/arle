@@ -130,12 +130,12 @@ pub(super) fn cuda_transpose_axes_swap_device(
 
     let d_x = backend.cuda_slice(x, "transpose_axes_swap")?;
     let bytes = total.saturating_mul(std::mem::size_of::<f32>());
-    let mut d_out = alloc_zeros_retry::<f32>(backend, total)
-            .map_err(|_| AutogradError::CudaAllocFailed {
-                op: "transpose",
-                shape: new_shape.clone(),
-                bytes,
-            })?;
+    let mut d_out =
+        alloc_zeros_retry::<f32>(backend, total).map_err(|_| AutogradError::CudaAllocFailed {
+            op: "transpose",
+            shape: new_shape.clone(),
+            bytes,
+        })?;
     launch_1d(
         &backend.stream,
         backend.kernels.function("transpose_axes_swap_f32")?,
