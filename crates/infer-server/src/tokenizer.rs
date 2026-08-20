@@ -125,10 +125,20 @@ impl OpenAiTokenizer {
                 );
             }
         }
-        let inner = build_tokenizer(&value)?;
-        if let Some((vocab, merges, config)) = extract_cache_parts(&value) {
+        let is_bpe = value
+            .get("model")
+            .and_then(|m| m.get("type"))
+            .and_then(|t| t.as_str())
+            == Some("BPE");
+        let inner = if is_bpe {
+            let (vocab, merges, config) =
+                extract_cache_parts(value).context("BPE model missing vocab/merges")?;
             save_cache(model_dir, &template, &vocab, &merges, &config);
-        }
+            build_tokenizer_from_parts(vocab, merges, &config)?
+        } else {
+            serde_json::from_value(value)
+                .map_err(|err| anyhow!("deserialize tokenizer failed: {err}"))?
+        };
         Ok(Self { inner, template })
     }
 
@@ -288,10 +298,12 @@ impl OpenAiTokenizer {
 // parse and the serde flatten round-trip, paying only the HashMap build.
 const CACHE_FILENAME: &str = "tokenizer.arle.bin";
 const CACHE_MAGIC: &[u8; 4] = b"ARLT";
-const CACHE_VERSION: u32 = 3;
+const CACHE_VERSION: u32 = 4;
 
-type Vocab = Vec<(String, u32)>;
-type Merges = Vec<(String, String)>;
+// Upstream tokenizers crate exports — Vocab is AHashMap<String, u32>, Merges
+// is Vec<(String, String)>; bincode round-trips both.
+use tokenizers::models::bpe::{Merges, Vocab};
+
 type CachedParts = (ChatTemplate, Vocab, Merges, String);
 
 fn try_load_cache(model_dir: &Path) -> Option<OpenAiTokenizer> {
@@ -307,24 +319,28 @@ fn try_load_cache(model_dir: &Path) -> Option<OpenAiTokenizer> {
     if version != CACHE_VERSION {
         return None;
     }
-    let cached: CachedParts = bincode::deserialize(&bytes[8..]).ok()?;
-    let (template, vocab, merges, config) = cached;
-    let inner = build_tokenizer_from_parts(&vocab, &merges, &config).ok()?;
+    let (template, vocab, merges, config_str): CachedParts =
+        bincode::deserialize(&bytes[8..]).ok()?;
+    let config: serde_json::Value = serde_json::from_str(&config_str).ok()?;
+    let inner = build_tokenizer_from_parts(vocab, merges, &config).ok()?;
     Some(OpenAiTokenizer { inner, template })
 }
 
 fn save_cache(
     model_dir: &Path,
     template: &ChatTemplate,
-    vocab: &[(String, u32)],
-    merges: &[(String, String)],
-    config: &str,
+    vocab: &Vocab,
+    merges: &Merges,
+    config: &serde_json::Value,
 ) {
     let path = model_dir.join(CACHE_FILENAME);
+    let Ok(config_str) = serde_json::to_string(config) else {
+        return;
+    };
     let mut bytes = Vec::new();
     bytes.extend_from_slice(CACHE_MAGIC);
     bytes.extend_from_slice(&CACHE_VERSION.to_le_bytes());
-    if let Ok(payload) = bincode::serialize(&(template, vocab, merges, config)) {
+    if let Ok(payload) = bincode::serialize(&(template, vocab, merges, &config_str)) {
         bytes.extend_from_slice(&payload);
         if let Err(err) = std::fs::write(&path, &bytes) {
             log::warn!("tokenizer cache write failed: {err}");
@@ -332,47 +348,23 @@ fn save_cache(
     }
 }
 
-/// Extract vocab, merges, and config JSON from a parsed tokenizer.json Value.
-/// Returns None for non-BPE models (cache unsupported — falls back to serde).
-fn extract_cache_parts(value: &serde_json::Value) -> Option<(Vocab, Merges, String)> {
-    let model = value.get("model")?;
-    if model.get("type").and_then(|v| v.as_str()) != Some("BPE") {
-        return None;
-    }
-    let vocab: Vocab = model
-        .get("vocab")?
-        .as_object()?
-        .iter()
-        .map(|(k, v)| (k.clone(), v.as_u64().unwrap_or(0) as u32))
-        .collect();
-    let merges: Merges = model
-        .get("merges")?
-        .as_array()?
-        .iter()
-        .filter_map(|m| {
-            let pair = m.as_array()?;
-            Some((
-                pair.first()?.as_str()?.to_owned(),
-                pair.get(1)?.as_str()?.to_owned(),
-            ))
-        })
-        .collect();
-    let mut config = value.clone();
-    if let Some(obj) = config.get_mut("model").and_then(|m| m.as_object_mut()) {
-        obj.remove("vocab");
-        obj.remove("merges");
-    }
-    let config = serde_json::to_string(&config).ok()?;
-    Some((vocab, merges, config))
+/// Pull `model.vocab` and `model.merges` out of a parsed tokenizer.json Value
+/// in place (no clone of the 248k-entry structures), returning them alongside
+/// the stripped Value. Caller has already confirmed the model type is BPE.
+fn extract_cache_parts(mut value: serde_json::Value) -> Option<(Vocab, Merges, serde_json::Value)> {
+    let model = value.get_mut("model")?.as_object_mut()?;
+    let vocab: Vocab = serde_json::from_value(model.remove("vocab")?).ok()?;
+    let merges: Merges = serde_json::from_value(model.remove("merges")?).ok()?;
+    Some((vocab, merges, value))
 }
 
-/// Build a Tokenizer from raw vocab, merges, and config JSON (tokenizer.json
-/// without model.vocab/model.merges). Uses BPE::builder() directly, bypassing
-/// the tokenizers crate's serde flatten round-trip.
+/// Build a Tokenizer from raw vocab, merges, and the config Value
+/// (tokenizer.json without model.vocab/model.merges). Uses BPE::builder()
+/// directly, bypassing the tokenizers crate's serde flatten round-trip.
 fn build_tokenizer_from_parts(
-    vocab: &[(String, u32)],
-    merges: &[(String, String)],
-    config: &str,
+    vocab: Vocab,
+    merges: Merges,
+    config: &serde_json::Value,
 ) -> Result<Tokenizer> {
     use tokenizers::AddedToken;
     use tokenizers::decoders::DecoderWrapper;
@@ -381,11 +373,9 @@ fn build_tokenizer_from_parts(
     use tokenizers::pre_tokenizers::PreTokenizerWrapper;
     use tokenizers::processors::PostProcessorWrapper;
 
-    let config: serde_json::Value = serde_json::from_str(config)?;
     let model_cfg = config.get("model").context("missing model")?;
 
-    let vocab_map: ahash::AHashMap<String, u32> = vocab.iter().cloned().collect();
-    let mut builder = BPE::builder().vocab_and_merges(vocab_map, merges.to_vec());
+    let mut builder = BPE::builder().vocab_and_merges(vocab, merges);
     if let Some(s) = model_cfg.get("unk_token").and_then(|v| v.as_str()) {
         builder = builder.unk_token(s.to_owned());
     }
@@ -406,6 +396,9 @@ fn build_tokenizer_from_parts(
     }
     if let Some(b) = model_cfg.get("ignore_merges").and_then(|v| v.as_bool()) {
         builder = builder.ignore_merges(b);
+    }
+    if let Some(f) = model_cfg.get("dropout").and_then(|v| v.as_f64()) {
+        builder = builder.dropout(f as f32);
     }
     let model = builder
         .build()
@@ -450,26 +443,11 @@ fn build_tokenizer_from_parts(
     Ok(tokenizer)
 }
 
-/// Build a Tokenizer from a parsed tokenizer.json Value. For BPE models,
-/// uses the direct builder path; for other models, falls back to serde.
-fn build_tokenizer(value: &serde_json::Value) -> Result<Tokenizer> {
-    if let Some((vocab, merges, config)) = extract_cache_parts(value) {
-        build_tokenizer_from_parts(&vocab, &merges, &config)
-    } else {
-        serde_json::from_value(value.clone())
-            .map_err(|err| anyhow!("deserialize tokenizer failed: {err}"))
-    }
-}
-
 fn cache_is_fresh(model_dir: &Path, cache_path: &Path) -> bool {
-    let cache_mtime = std::fs::metadata(cache_path)
-        .ok()
-        .and_then(|m| m.modified().ok());
-    let cache_mtime = match cache_mtime {
-        Some(t) => t,
-        None => return false,
+    let Ok(cache_mtime) = std::fs::metadata(cache_path).and_then(|m| m.modified()) else {
+        return false;
     };
-    let source_mtime = [
+    [
         "tokenizer.json",
         "tokenizer_config.json",
         "config.json",
@@ -477,11 +455,8 @@ fn cache_is_fresh(model_dir: &Path, cache_path: &Path) -> bool {
     ]
     .iter()
     .filter_map(|f| std::fs::metadata(model_dir.join(f)).ok()?.modified().ok())
-    .max();
-    match source_mtime {
-        Some(t) => t <= cache_mtime,
-        None => false,
-    }
+    .max()
+    .is_some_and(|mtime| mtime <= cache_mtime)
 }
 
 /// `true` if any system message follows a non-system message — i.e. the system
