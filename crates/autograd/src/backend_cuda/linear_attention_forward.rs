@@ -209,13 +209,15 @@ pub(super) fn cuda_linear_attention_boundary_device_row(
     let chunk_rows = p.seq_len.min(64);
     let mut qkv_chunk = alloc_zeros_retry::<u16>(backend, chunk_rows * qkv_dim)
         .map_err(|_| cuda_alloc_failed("la boundary qkv", vec![chunk_rows, qkv_dim]))?;
-    let mut raw_chunk = alloc_zeros_retry::<u16>(backend, chunk_rows * p.num_value_heads * p.value_dim)
-        .map_err(|_| {
-            cuda_alloc_failed(
-                "la boundary raw",
-                vec![chunk_rows, p.num_value_heads, p.value_dim],
-            )
-        })?;
+    let mut raw_chunk =
+        alloc_zeros_retry::<u16>(backend, chunk_rows * p.num_value_heads * p.value_dim).map_err(
+            |_| {
+                cuda_alloc_failed(
+                    "la boundary raw",
+                    vec![chunk_rows, p.num_value_heads, p.value_dim],
+                )
+            },
+        )?;
     let mut state = alloc_zeros_retry::<f32>(backend, state_len)
         .map_err(|_| cuda_alloc_failed("la boundary state", vec![state_len]))?;
     if let Some(initial) = carry_state {

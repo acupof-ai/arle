@@ -492,8 +492,8 @@ impl CudaBackend {
         let scale_cols = k.div_ceil(128);
         let input_fp8 = alloc_zeros_retry::<u8>(self, m * k)
             .map_err(|_| cuda_alloc_failed("fp8 deepgemm input", vec![m, k]))?;
-        let input_scales = alloc_zeros_retry::<f32>(self, scale_stride_m * scale_cols)
-            .map_err(|_| {
+        let input_scales =
+            alloc_zeros_retry::<f32>(self, scale_stride_m * scale_cols).map_err(|_| {
                 cuda_alloc_failed("fp8 deepgemm scales", vec![scale_stride_m, scale_cols])
             })?;
         let out_bf16 = alloc_zeros_retry::<u16>(self, m * n)

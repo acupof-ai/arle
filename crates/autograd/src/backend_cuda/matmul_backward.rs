@@ -122,10 +122,9 @@ pub(super) fn cuda_matmul_backward(
             let d_g = backend.upload_slice(grad_out, grad_out_shape)?;
 
             let grad_a_host = if need_grad_a {
-                let mut c = alloc_zeros_retry::<f32>(backend, batch * m * k)
-                    .map_err(|_| {
-                        cuda_alloc_failed("matmul_backward batched grad_a", vec![batch, m, k])
-                    })?;
+                let mut c = alloc_zeros_retry::<f32>(backend, batch * m * k).map_err(|_| {
+                    cuda_alloc_failed("matmul_backward batched grad_a", vec![batch, m, k])
+                })?;
                 let gemm = GemmConfig::<f32> {
                     transa: cublasOperation_t::CUBLAS_OP_T,
                     transb: cublasOperation_t::CUBLAS_OP_N,
@@ -162,10 +161,9 @@ pub(super) fn cuda_matmul_backward(
             };
 
             let grad_b_host = if need_grad_b {
-                let mut c = alloc_zeros_retry::<f32>(backend, batch * k * n)
-                    .map_err(|_| {
-                        cuda_alloc_failed("matmul_backward batched grad_b", vec![batch, k, n])
-                    })?;
+                let mut c = alloc_zeros_retry::<f32>(backend, batch * k * n).map_err(|_| {
+                    cuda_alloc_failed("matmul_backward batched grad_b", vec![batch, k, n])
+                })?;
                 let gemm = GemmConfig::<f32> {
                     transa: cublasOperation_t::CUBLAS_OP_N,
                     transb: cublasOperation_t::CUBLAS_OP_T,
@@ -335,13 +333,9 @@ pub(super) fn cuda_matmul_backward_device(
             }
 
             let grad_a_handle = if need_grad_a {
-                let mut c = alloc_zeros_retry::<f32>(backend, batch * m * k)
-                    .map_err(|_| {
-                        cuda_alloc_failed(
-                            "matmul_backward_device batched grad_a",
-                            vec![batch, m, k],
-                        )
-                    })?;
+                let mut c = alloc_zeros_retry::<f32>(backend, batch * m * k).map_err(|_| {
+                    cuda_alloc_failed("matmul_backward_device batched grad_a", vec![batch, m, k])
+                })?;
                 let gemm = GemmConfig::<f32> {
                     transa: cublasOperation_t::CUBLAS_OP_T,
                     transb: cublasOperation_t::CUBLAS_OP_N,
@@ -378,13 +372,9 @@ pub(super) fn cuda_matmul_backward_device(
             };
 
             let grad_b_handle = if need_grad_b {
-                let mut c = alloc_zeros_retry::<f32>(backend, batch * k * n)
-                    .map_err(|_| {
-                        cuda_alloc_failed(
-                            "matmul_backward_device batched grad_b",
-                            vec![batch, k, n],
-                        )
-                    })?;
+                let mut c = alloc_zeros_retry::<f32>(backend, batch * k * n).map_err(|_| {
+                    cuda_alloc_failed("matmul_backward_device batched grad_b", vec![batch, k, n])
+                })?;
                 let gemm = GemmConfig::<f32> {
                     transa: cublasOperation_t::CUBLAS_OP_N,
                     transb: cublasOperation_t::CUBLAS_OP_T,
