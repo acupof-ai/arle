@@ -368,17 +368,14 @@ mod real {
         // FP8 weight — the same one `quant_format.rs` produces for a
         // compressed-tensors `F8_E4M3` + `[N,1]` weight_scale checkpoint.
         let mut weight = DeviceMatrix::from_fp8_block_scaled(ctx, &qbytes, &scales, n, k, 1, k)?;
+        // The repack releases the source, so lane 2 gets its own unrepacked copy.
+        let gemv_weight = DeviceMatrix::from_fp8_block_scaled(ctx, &qbytes, &scales, n, k, 1, k)?;
         drop(qbytes);
         weight.repack_for_marlin_fp8(ctx)?;
         ensure!(
             weight.marlin_packed.is_some() && weight.marlin_scales.is_some(),
             "[{label} n={n} k={k}] repack_for_marlin_fp8 declined the shape — \
              the Marlin lane is not under test"
-        );
-        ensure!(
-            weight.qweight_u8.is_some() && weight.scale_f32.is_some(),
-            "[{label} n={n} k={k}] repack consumed the source FP8 weight; \
-             the GEMV lane and the prefill dequant arm both still need it"
         );
 
         let x = ctx.stream.clone_htod(&x_bf16)?;
@@ -439,8 +436,16 @@ mod real {
             // Lane 2: the scalar batched GEMV this replaces, reading the same
             // E4M3 bytes and the un-folded f32 per-channel scales.
             {
-                let (qwp, _g0) = weight.qweight_u8.as_ref().unwrap().device_ptr(&ctx.stream);
-                let (sfp, _g1) = weight.scale_f32.as_ref().unwrap().device_ptr(&ctx.stream);
+                let (qwp, _g0) = gemv_weight
+                    .qweight_u8
+                    .as_ref()
+                    .unwrap()
+                    .device_ptr(&ctx.stream);
+                let (sfp, _g1) = gemv_weight
+                    .scale_f32
+                    .as_ref()
+                    .unwrap()
+                    .device_ptr(&ctx.stream);
                 let (xp, _g2) = x.device_ptr(&ctx.stream);
                 let (op, _g3) = gemv_out.device_ptr_mut(&ctx.stream);
                 // SAFETY: weight is [n, k] E4M3 and scales is [n] f32; block_m=1 /

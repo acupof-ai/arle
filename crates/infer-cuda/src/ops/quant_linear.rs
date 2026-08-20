@@ -2,7 +2,7 @@ use anyhow::{Result, anyhow, bail, ensure};
 use cuda_kernels::ffi;
 use cuda_kernels::moe as cuda_moe;
 use cuda_kernels::prelude::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStates};
-use cuda_kernels::tensor::{WeightFormat, cache_ptr};
+use cuda_kernels::tensor::{RawDevicePtr, WeightFormat, cache_ptr};
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut, sys::CUevent_flags};
 use half::bf16;
 use std::cell::RefCell;
@@ -85,8 +85,7 @@ const QWEN_FP4_DEEPGEMM_MIN_M: usize = 512;
 /// ceiling), not above the 256 that happens to be the default. `None` when the
 /// envelope is undeclared, and when the engine's own prefill chunk is shorter
 /// than the floor (`--low-impact` pins it to 32, and `--chunked-prefill-size`
-/// takes 128) — there the arm can never fire, so the loader must not pay its
-/// retained E4M3 bytes out of the KV pool either.
+/// takes 128) — there the arm can never fire and Marlin owns every M.
 fn dense_deepgemm_prefill_floor(base: usize) -> Option<usize> {
     let (decode_rows, prefill_rows) = crate::runtime_flags::dense_gemm_row_envelope()?;
     let floor = base.max(decode_rows + 1);
@@ -115,7 +114,10 @@ struct QwenFp8DenseScratch {
 struct QwenFp8DequantScratch {
     weight_bf16: Option<CudaSlice<bf16>>,
     capacity: usize,
-    /// NVFP4 widened to E4M3 for the DeepGEMM prefill arm.
+    /// The DeepGEMM prefill arms' B operand, built from the Marlin layout per
+    /// call: NVFP4 widened to E4M3, or per-channel FP8 un-permuted. One buffer
+    /// serves both — they run one weight at a time, and `[n, k]` E4M3 is the
+    /// same shape either way.
     weight_fp8: Option<CudaSlice<u8>>,
     fp8_capacity: usize,
 }
@@ -497,14 +499,10 @@ fn fp8_per_channel_deepgemm_shape(weight: &DeviceMatrix) -> bool {
 }
 
 /// True when the per-channel FP8 DeepGEMM arm can fire for this weight at some
-/// M this engine will actually present, so its plain `[n, k]` E4M3 bytes have to
-/// survive the Marlin repack. The loader asks this before releasing them.
-///
-/// Retention costs a second full copy of the weight (~1 B/param, ~10.6 GB over
-/// this checkpoint's per-channel shapes) out of the KV pool, so it must answer
-/// the same question the route answers, not a weaker one: a shape DeepGEMM
-/// accepts on a card whose configured prefill chunk never reaches the floor is
-/// pure VRAM loss.
+/// M this engine will actually present. The loader asks this once, at load, and
+/// records the answer in `fp8_deepgemm_prefill`; nothing here can be re-derived
+/// at GEMM time, because the answer also depends on which caller loaded the
+/// weight.
 pub(super) fn fp8_deepgemm_per_channel_available(
     ctx: &DeviceContext,
     weight: &DeviceMatrix,
@@ -524,7 +522,6 @@ fn fp8_deepgemm_dense_layout(
     seq_len: usize,
 ) -> Option<Fp8DeepGemmLayout> {
     if weight.weight_format != WeightFormat::Fp8BlockScaled
-        || weight.qweight_u8.is_none()
         || weight.scale_f32.is_none()
         || !weight.rows.is_multiple_of(8)
         || !weight.cols.is_multiple_of(128)
@@ -534,14 +531,25 @@ fn fp8_deepgemm_dense_layout(
         return None;
     }
     if weight.quant_block_m == 128 && weight.quant_block_k == 128 {
-        return (qwen_fp8_dense_route(ctx, seq_len, weight.rows, weight.cols)
-            == qwen_fp8_dense_policy::Route::PackDeepGemm)
+        // 128x128 block-scaled weights never repack, so this arm still reads the
+        // resident E4M3 bytes directly.
+        return (weight.qweight_u8.is_some()
+            && qwen_fp8_dense_route(ctx, seq_len, weight.rows, weight.cols)
+                == qwen_fp8_dense_policy::Route::PackDeepGemm)
             .then_some(Fp8DeepGemmLayout::Blocked);
     }
     // Not `qwen_fp8_dense_route`: its policy is `m >= 2`, which would hand
     // DeepGEMM every batched decode step. See the floor's own derivation.
     let floor = dense_deepgemm_prefill_floor(QWEN_FP8_DEEPGEMM_PER_CHANNEL_MIN_M)?;
-    (fp8_per_channel_deepgemm_shape(weight) && seq_len >= floor)
+    // `fp8_deepgemm_prefill`, not the shape alone: the output head repacks like
+    // every other dense projection but must stay on Marlin at every M.
+    // B comes from the Marlin tiles when a repack ran and released the source,
+    // and from the source itself when the repack declined the shape — the two
+    // are independent, so a declined repack must not cost the arm.
+    (weight.fp8_deepgemm_prefill
+        && (weight.marlin_packed.is_some() || weight.qweight_u8.is_some())
+        && fp8_per_channel_deepgemm_shape(weight)
+        && seq_len >= floor)
         .then_some(Fp8DeepGemmLayout::PerChannel)
 }
 
@@ -553,10 +561,20 @@ pub(super) fn warm_fp8_deepgemm_dense(
     let Some(layout) = fp8_deepgemm_dense_layout(ctx, weight, seq_len) else {
         return Ok(false);
     };
-    let qw = weight
-        .qweight_u8
-        .as_ref()
-        .ok_or_else(|| anyhow!("fp8_block_scaled missing qweight_u8"))?;
+    // Warm builds the JIT kernel and discards the output, so B only has to be
+    // `n * k` live bytes — the per-channel arm's Marlin tiles are exactly that,
+    // and so is the E4M3 source a declined repack left resident.
+    let b = match layout {
+        Fp8DeepGemmLayout::Blocked => weight
+            .qweight_u8
+            .as_ref()
+            .ok_or_else(|| anyhow!("fp8_block_scaled missing qweight_u8"))?,
+        Fp8DeepGemmLayout::PerChannel => weight
+            .marlin_packed
+            .as_ref()
+            .or(weight.qweight_u8.as_ref())
+            .ok_or_else(|| anyhow!("fp8_block_scaled missing marlin_packed and qweight_u8"))?,
+    };
     let scales = weight
         .scale_f32
         .as_ref()
@@ -594,7 +612,7 @@ pub(super) fn warm_fp8_deepgemm_dense(
         cuda_moe::dsv4_deepgemm_fp8_gemm_nt(
             cache_ptr(&input_fp8, ctx),
             cache_ptr(&input_scales, ctx),
-            cache_ptr(qw, ctx),
+            cache_ptr(b, ctx),
             cache_ptr(sfb, ctx),
             cache_ptr(&out, ctx),
             m,
@@ -616,10 +634,6 @@ fn try_fp8_deepgemm_dense_batch(
     let Some(layout) = fp8_deepgemm_dense_layout(ctx, weight, x.seq_len) else {
         return Ok(None);
     };
-    let qw = weight
-        .qweight_u8
-        .as_ref()
-        .ok_or_else(|| anyhow!("fp8_block_scaled missing qweight_u8"))?;
     let scales = weight
         .scale_f32
         .as_ref()
@@ -627,6 +641,48 @@ fn try_fp8_deepgemm_dense_batch(
     let m = x.seq_len;
     let n = weight.rows;
     let k = weight.cols;
+    // A block-scaled weight never repacks and still holds its E4M3 bytes, and so
+    // does a per-channel one whose repack declined the shape; both feed DeepGEMM
+    // directly. A per-channel weight that DID repack kept only its Marlin tiles,
+    // so B is un-permuted back out of them into the shared scratch —
+    // byte-identical to the source it replaced.
+    let b = match (layout, weight.marlin_packed.as_ref()) {
+        (Fp8DeepGemmLayout::Blocked, _) | (Fp8DeepGemmLayout::PerChannel, None) => cache_ptr(
+            weight
+                .qweight_u8
+                .as_ref()
+                .ok_or_else(|| anyhow!("fp8_block_scaled missing qweight_u8"))?,
+            ctx,
+        ),
+        (Fp8DeepGemmLayout::PerChannel, Some(packed)) => {
+            if !reserve_fp8_weight_scratch(ctx, n * k) {
+                return Ok(None);
+            }
+            QWEN_FP8_DEQUANT_SCRATCH.with(|cell| -> Result<RawDevicePtr<u8>> {
+                let scratch = cell.borrow();
+                let dst = scratch
+                    .weight_fp8
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("FP8 Marlin E4M3 weight scratch missing"))?;
+                let dst_ptr = cache_ptr(dst, ctx);
+                qwen_quant_profile(ctx, "qwen/fp8/dense_materialize", m, n, k, || {
+                    // SAFETY: ptrs from live device allocations sized to the dims passed.
+                    unsafe {
+                        ffi::marlin_fp8_to_e4m3_cuda(
+                            cache_ptr(packed, ctx).as_ptr(),
+                            dst_ptr.as_mut_ptr(),
+                            n as i32,
+                            k as i32,
+                            ctx.stream.cu_stream(),
+                        )
+                        .result()
+                        .map_err(|e| anyhow!("FP8 Marlin materialise kernel failed: {e}"))
+                    }
+                })?;
+                Ok(dst_ptr)
+            })?
+        }
+    };
     let scale_stride_m = m.div_ceil(4) * 4;
     let scale_cols = k.div_ceil(128);
     QWEN_FP8_DENSE_SCRATCH.with(|cell| -> Result<()> {
@@ -693,7 +749,7 @@ fn try_fp8_deepgemm_dense_batch(
             cuda_moe::dsv4_deepgemm_fp8_gemm_nt(
                 cache_ptr(input_fp8, ctx),
                 cache_ptr(input_scales, ctx),
-                cache_ptr(qw, ctx),
+                b,
                 cache_ptr(sfb, ctx),
                 cache_ptr(&out.data, ctx),
                 m,
@@ -1006,14 +1062,13 @@ fn fp4_route(ctx: &DeviceContext, weight: &DeviceMatrix, m: usize) -> Fp4Route {
     Fp4Route::Gemv
 }
 
-/// Whether the NVFP4 DeepGEMM prefill arm can serve this weight at some M, so
-/// its raw nibbles have to survive the Marlin repack. The loader asks this
-/// before releasing them, and before paying for the `sfb` the arm needs.
+/// Whether the NVFP4 DeepGEMM prefill arm can serve this weight at some M. The
+/// loader asks before paying for the `sfb` the arm needs; the arm itself asks
+/// again per call.
 pub(super) fn fp4_deepgemm_available(ctx: &DeviceContext, weight: &DeviceMatrix) -> bool {
     weight.weight_format == WeightFormat::Fp4E2M1Group
-        && weight.group_size > 0
-        && 128usize.is_multiple_of(weight.group_size)
-        && weight.rows.is_multiple_of(8)
+        && weight.group_size == 16
+        && weight.rows.is_multiple_of(64)
         && weight.cols.is_multiple_of(128)
         && qwen_fp8_dense_sm_supports_deepgemm(ctx)
         && qwen_fp8_deepgemm_dense_enabled()
@@ -1021,6 +1076,12 @@ pub(super) fn fp4_deepgemm_available(ctx: &DeviceContext, weight: &DeviceMatrix)
 }
 
 /// Widen NVFP4 to E4M3 into scratch, then contract it on the FP8 tensor cores.
+///
+/// The widen reads the Marlin layout, not the checkpoint nibbles — same byte
+/// volume, and the checkpoint copy is freed at load. It therefore inherits the
+/// repack's one lossy step: a group scale far enough below the tensor max
+/// flushes to zero (`repack_for_marlin_fp4`), which makes prefill agree with
+/// the Marlin decode arm rather than with the checkpoint.
 ///
 /// The weight's `fp4_deepgemm_sfb` carries the per-128x128-block power of two
 /// the widening divided out, so DeepGEMM multiplies it back into the fp32
@@ -1043,14 +1104,10 @@ fn try_fp4_deepgemm_gemm_batch(
     if x.seq_len < floor || !fp4_deepgemm_available(ctx, weight) {
         return Ok(false);
     }
-    let qw = weight
-        .qweight_u8
+    let packed = weight
+        .marlin_packed
         .as_ref()
-        .ok_or_else(|| anyhow!("fp4_e2m1_group missing qweight_u8"))?;
-    let group_scales = weight
-        .qscale_fp8
-        .as_ref()
-        .ok_or_else(|| anyhow!("fp4_e2m1_group missing qscale_fp8"))?;
+        .ok_or_else(|| anyhow!("fp4_e2m1_group missing marlin_packed"))?;
     let global = weight
         .scale_f32
         .as_ref()
@@ -1071,24 +1128,22 @@ fn try_fp4_deepgemm_gemm_batch(
             .weight_fp8
             .as_ref()
             .ok_or_else(|| anyhow!("NVFP4 DeepGEMM E4M3 weight scratch missing"))?;
-        let (qw_ptr, _gq) = qw.device_ptr(&ctx.stream);
-        let (gs_ptr, _gg) = group_scales.device_ptr(&ctx.stream);
+        let (packed_ptr, _gq) = packed.device_ptr(&ctx.stream);
         let (global_ptr, _gl) = global.device_ptr(&ctx.stream);
         let (sfb_ptr, _gf) = sfb.device_ptr(&ctx.stream);
         let (wfp8_ptr, _gw) = weight_fp8.device_ptr(&ctx.stream);
         qwen_quant_profile(ctx, "qwen/fp4/dense_widen_fp8", m, n, k, || {
             // SAFETY: ptrs from live device allocations sized to the dims passed.
             unsafe {
-                ffi::dequantize_fp4_e2m1_group_to_fp8_cuda(
-                    qw_ptr as *const u8,
-                    gs_ptr as *const u8,
+                ffi::dequantize_fp4_marlin_to_fp8_cuda(
+                    packed_ptr as *const u8,
                     global_ptr as *const f32,
                     sfb_ptr as *const f32,
+                    1.0 / weight.fp4_marlin_scale_lift,
                     wfp8_ptr as *mut u8,
                     n as i32,
                     k as i32,
                     weight.group_size as i32,
-                    weight.quant_scale_cols as i32,
                     ctx.stream.cu_stream(),
                 )
                 .result()

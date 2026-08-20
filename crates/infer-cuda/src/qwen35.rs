@@ -48,7 +48,7 @@ use infer_topo::TpConfig;
 use qwen35_spec::{Qwen35AttentionTensorNames, Qwen35Config};
 use safetensors::tensor::Dtype;
 
-use crate::loader::SafetensorLoader;
+use crate::loader::{SafetensorLoader, marlin_repack_dense};
 use crate::moe::{
     DEEPGEMM_CONTIG_ALIGN, MoeForwardScratch, QWEN35_DEEPGEMM_MIN_ROUTES, deepgemm_contig_rows_cap,
     moe_forward_into,
