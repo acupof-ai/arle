@@ -100,6 +100,12 @@ print(client.chat.completions.create(
 
 **DeepSeek-V4-Flash,8×H20(TP=8 / EP=8,FP8 MoE)。** B=1 decode **53 tok/s**(prefill 23 ms);开 DSpark 块草稿器后 B=1 **72.4 tok/s**(+37%,接受率 58.7%);并发批量 decode lane 在 c=8 再 **+48%**。
 
+**Qwen3.8-27B-NVFP4,单卡 H20 —— 真正更小的 4-bit。** 混合精度:NVFP4 MLP(group 16)+ 其余全是 per-channel FP8,只有 54% 的参数是 4-bit,所以文件 23.4 GB 对 FP8 模型的 30.9 GB,少 24% 而不是一半。
+
+sm_90 没有 FP4 张量核,所以真正的 GEMM 必须先把 nibble 展宽,唯一的问题是展宽成什么。Marlin 展成 BF16 跑 84 TFLOPS;展成 E4M3 交给 DeepGEMM 跑 274,是这块卡 FP8 峰值的 93%。解码仍归 Marlin —— 那里读一半字节才是赢面。DeepGEMM 要的操作数每次调用从 Marlin 的常驻布局派生到 scratch,**没有任何权重存两份**(第一版两种布局都留,常驻比它要打败的 FP8 模型还多 10 GB)。
+
+对 Qwen3.6-27B-FP8,32K 智能体提示词,同一二进制两条臂背靠背:decode(ITL)**+21.3% / +20.7% / +13.2% / +5.5%**,端到端 **+5.0% / +15.3% / +9.1% / +1.8%**(c=1/4/8/16)。常驻 **22.4 GB** 对 29.4,KV 池 1,779,114 token 对 1,582,506。预填充这条路不改变准确率:开臂 188/200 对关臂 189/200,196/200 答案完全相同。见 [docs/baselines.md](docs/baselines.md)。
+
 **对比 SGLang。** 同一份权重、同一块卡、同一个量化 kernel —— SGLang 跑的是我们 checkpoint 的重打包版。Qwen3.6-27B,单卡 H20,33K prompt,单请求:decode 每 token **16.69 ms vs 17.16**,快 2.8%;33K prefill **25.0 s vs 21.0**,慢 19% —— 这是当前在做的事。数据见 [docs/baselines.md](docs/baselines.md)。
 
 <p align="center">
