@@ -178,7 +178,7 @@ where
     Ok(hidden)
 }
 
-fn trace_checkpoint_group_vram() -> bool {
+pub(crate) fn trace_checkpoint_group_vram() -> bool {
     std::env::var("ARLE_OPD_VRAM_TRACE").is_ok_and(|v| v != "0" && v != "false")
 }
 
