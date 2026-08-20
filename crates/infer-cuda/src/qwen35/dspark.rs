@@ -1083,31 +1083,32 @@ impl Qwen35Model {
         if sampling && head.markov.is_none() {
             let n = block - first_row;
             crate::profile::profile_op(ctx, "sample", None, n, || {
-                let elem = std::mem::size_of::<bf16>() as u64;
                 let logits = df.logits.get(ctx, vocab, block)?;
-                let (l_ptr, _gl) = logits.data.device_ptr(&ctx.stream);
                 let q_all = df.q_probs.get(ctx, n * vocab)?;
-                let (q_ptr, _gq) = q_all.device_ptr_mut(&ctx.stream);
-                let (t_ptr, _gt) = scratch.sample_tok.get(ctx, n)?.device_ptr_mut(&ctx.stream);
+                let tok_dev = scratch.sample_tok.get(ctx, n)?;
+                let filter = cuda_kernels::sampling::DsparkFilter {
+                    inv_temperature: 1.0 / params.temperature,
+                    top_k: params.top_k,
+                    top_p: params.top_p,
+                    min_p: params.min_p,
+                };
                 for i in 0..n {
                     let u = unit_uniform(params.seed, SALT_DRAW, (start + first_row + i) as u64);
-                    // SAFETY: logits row `first_row + i` of `block`; q row `i`
-                    // of `n`; one i32 out slot per row.
-                    unsafe {
-                        ffi::dspark_draft_sample_cuda(
-                            (l_ptr + ((first_row + i) * vocab) as u64 * elem) as *const ffi::Half,
-                            (q_ptr + (i * vocab * 4) as u64) as *mut f32,
-                            (t_ptr + (i * 4) as u64) as *mut i32,
-                            vocab as i32,
-                            1.0 / params.temperature,
-                            params.top_k,
-                            params.top_p,
-                            params.min_p,
-                            u,
-                            ctx.stream.cu_stream(),
-                        )
-                        .result()?;
-                    }
+                    // Logits row `first_row + i` of `block`; q row `i` of `n`;
+                    // one i32 out slot per row.
+                    let row = first_row + i;
+                    let logits_row = logits.data.slice(row * vocab..(row + 1) * vocab);
+                    let mut q_row = q_all.slice_mut(i * vocab..(i + 1) * vocab);
+                    let mut tok = tok_dev.slice_mut(i..i + 1);
+                    cuda_kernels::sampling::dspark_draft_sample(
+                        ctx,
+                        &logits_row,
+                        &mut q_row,
+                        &mut tok,
+                        vocab,
+                        filter,
+                        u,
+                    )?;
                 }
                 ctx.sync()?;
                 Ok(())
@@ -1168,29 +1169,25 @@ impl Qwen35Model {
                 let u = unit_uniform(params.seed, SALT_DRAW, (start + row) as u64);
                 let q_all = df.q_probs.get(ctx, block * vocab)?;
                 let tok_out = scratch.sample_tok.get(ctx, 1)?;
-                {
-                    let elem = std::mem::size_of::<bf16>() as u64;
-                    let (l_ptr, _gl) = src.data.device_ptr(&ctx.stream);
-                    let (q_ptr, _gq) = q_all.device_ptr_mut(&ctx.stream);
-                    let (t_ptr, _gt) = tok_out.device_ptr_mut(&ctx.stream);
-                    // SAFETY: `src` row holds `vocab` bf16 (src_row bounded by
-                    // its seq_len); q row index == drafts.len() < block.
-                    unsafe {
-                        ffi::dspark_draft_sample_cuda(
-                            (l_ptr + (src_row * vocab) as u64 * elem) as *const ffi::Half,
-                            (q_ptr + (drafts.len() * vocab * 4) as u64) as *mut f32,
-                            t_ptr as *mut i32,
-                            vocab as i32,
-                            1.0 / params.temperature,
-                            params.top_k,
-                            params.top_p,
-                            params.min_p,
-                            u,
-                            ctx.stream.cu_stream(),
-                        )
-                        .result()?;
-                    }
-                }
+                // `src` row holds `vocab` bf16 (src_row bounded by its
+                // seq_len); q row index == drafts.len() < block.
+                let logits_row = src.data.slice(src_row * vocab..(src_row + 1) * vocab);
+                let q_row_idx = drafts.len();
+                let mut q_row = q_all.slice_mut(q_row_idx * vocab..(q_row_idx + 1) * vocab);
+                cuda_kernels::sampling::dspark_draft_sample(
+                    ctx,
+                    &logits_row,
+                    &mut q_row,
+                    tok_out,
+                    vocab,
+                    cuda_kernels::sampling::DsparkFilter {
+                        inv_temperature: 1.0 / params.temperature,
+                        top_k: params.top_k,
+                        top_p: params.top_p,
+                        min_p: params.min_p,
+                    },
+                    u,
+                )?;
                 ctx.sync()?;
                 let src = tok_out.clone();
                 let host = scratch.tok_host.get(ctx, 1)?;
@@ -1701,21 +1698,7 @@ impl Qwen35Model {
             "dspark argmax scratch {} != {rows} rows",
             ids_dev.len()
         );
-        {
-            let (l_ptr, _gl) = logits.data.device_ptr(&ctx.stream);
-            let (o_ptr, _go) = ids_dev.device_ptr_mut(&ctx.stream);
-            // SAFETY: logits [rows, vocab] bf16; ids [rows] sized above.
-            unsafe {
-                ffi::argmax_batch_cuda(
-                    l_ptr as *const ffi::Half,
-                    o_ptr as *mut i32,
-                    rows as i32,
-                    vocab as i32,
-                    ctx.stream.cu_stream(),
-                )
-                .result()?;
-            }
-        }
+        cuda_kernels::sampling::argmax_batch(ctx, &logits.data, ids_dev, rows, vocab)?;
         let hbuf = host.get(ctx, rows)?;
         ctx.stream
             .memcpy_dtoh(&*ids_dev, hbuf)
@@ -1862,45 +1845,36 @@ impl Qwen35Model {
                     .memcpy_htod(&u_res, &mut ur_dev.slice_mut(0..=depth))
             })
             .map_err(|e| anyhow!("H2D dspark chain inputs failed: {e}"))?;
-        {
-            let (l_ptr, _gl) = logits.data.device_ptr(&ctx.stream);
-            let (p_ptr, _gp) = p_all.device_ptr_mut(&ctx.stream);
-            let (q_ptr, _gq) = q_all.device_ptr(&ctx.stream);
-            let (d_ptr, _gd) = draft_dev.device_ptr(&ctx.stream);
-            let (ua_ptr, _gua) = ua_dev.device_ptr(&ctx.stream);
-            let (ur_ptr, _gur) = ur_dev.device_ptr(&ctx.stream);
-            let (o_ptr, _go) = out_dev.device_ptr_mut(&ctx.stream);
-            // SAFETY: logits rows [row0, row0+chain.len()) are this chain's;
-            // p/q scratches hold (block+1)/block vocab-rows and depth <= block
-            // (ensured above); draft/u prefixes uploaded just above.
-            unsafe {
-                ffi::dspark_filter_probs_cuda(
-                    (l_ptr + (row0 * vocab * std::mem::size_of::<bf16>()) as u64)
-                        as *const ffi::Half,
-                    p_ptr as *mut f32,
-                    chain.len() as i32,
-                    vocab as i32,
-                    1.0 / params.temperature,
-                    params.top_k,
-                    params.top_p,
-                    params.min_p,
-                    ctx.stream.cu_stream(),
-                )
-                .result()?;
-                ffi::dspark_chain_accept_cuda(
-                    q_ptr as *const f32,
-                    p_ptr as *const f32,
-                    d_ptr as *const i32,
-                    ua_ptr as *const f32,
-                    ur_ptr as *const f32,
-                    o_ptr as *mut i32,
-                    depth as i32,
-                    vocab as i32,
-                    ctx.stream.cu_stream(),
-                )
-                .result()?;
-            }
-        }
+        // Logits rows [row0, row0+chain.len()) are this chain's; p/q scratches
+        // hold (block+1)/block vocab-rows and depth <= block (ensured above);
+        // draft/u prefixes uploaded just above.
+        let chain_logits = logits
+            .data
+            .slice(row0 * vocab..(row0 + chain.len()) * vocab);
+        cuda_kernels::sampling::dspark_filter_probs(
+            ctx,
+            &chain_logits,
+            p_all,
+            chain.len(),
+            vocab,
+            cuda_kernels::sampling::DsparkFilter {
+                inv_temperature: 1.0 / params.temperature,
+                top_k: params.top_k,
+                top_p: params.top_p,
+                min_p: params.min_p,
+            },
+        )?;
+        cuda_kernels::sampling::dspark_chain_accept(
+            ctx,
+            &*q_all,
+            &*p_all,
+            &*draft_dev,
+            &*ua_dev,
+            &*ur_dev,
+            out_dev,
+            depth,
+            vocab,
+        )?;
         ctx.sync()?;
         let out = ctx
             .stream

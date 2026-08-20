@@ -160,28 +160,22 @@ impl Qwen35Model {
                 let cap = self.spec_draft_tokens.max(1);
                 let q_all = spec.q_probs.get(&self.ctx, cap * vocab)?;
                 let tok_out = spec.sample_tok.get(&self.ctx, 1)?;
-                {
-                    let (l_ptr, _gl) = logits_vec.data.device_ptr(&self.ctx.stream);
-                    let (q_ptr, _gq) = q_all.device_ptr_mut(&self.ctx.stream);
-                    let (t_ptr, _gt) = tok_out.device_ptr_mut(&self.ctx.stream);
-                    // SAFETY: logits_vec holds `vocab` bf16; q row `level` < cap
-                    // (spec_step's depth guard bounds every level).
-                    unsafe {
-                        ffi::dspark_draft_sample_cuda(
-                            l_ptr as *const ffi::Half,
-                            (q_ptr + (level * vocab * 4) as u64) as *mut f32,
-                            t_ptr as *mut i32,
-                            vocab as i32,
-                            1.0 / params.temperature,
-                            params.top_k,
-                            params.top_p,
-                            params.min_p,
-                            u,
-                            self.ctx.stream.cu_stream(),
-                        )
-                        .result()?;
-                    }
-                }
+                // q row `level` < cap (spec_step's depth guard bounds every level).
+                let mut q_row = q_all.slice_mut(level * vocab..(level + 1) * vocab);
+                cuda_kernels::sampling::dspark_draft_sample(
+                    &self.ctx,
+                    &logits_vec.data,
+                    &mut q_row,
+                    tok_out,
+                    vocab,
+                    cuda_kernels::sampling::DsparkFilter {
+                        inv_temperature: 1.0 / params.temperature,
+                        top_k: params.top_k,
+                        top_p: params.top_p,
+                        min_p: params.min_p,
+                    },
+                    u,
+                )?;
                 self.ctx.sync()?;
                 Ok(self
                     .ctx
@@ -371,45 +365,33 @@ impl Qwen35Model {
                     .memcpy_htod(&u_res, &mut ur_dev.slice_mut(0..=depth))
             })
             .map_err(|e| anyhow!("H2D mtp chain inputs failed: {e}"))?;
-        {
-            let (l_ptr, _gl) = logits.data.device_ptr(&ctx.stream);
-            let (p_ptr, _gp) = p_all.device_ptr_mut(&ctx.stream);
-            let (q_ptr, _gq) = q_all.device_ptr(&ctx.stream);
-            let (d_ptr, _gd) = draft_dev.device_ptr(&ctx.stream);
-            let (ua_ptr, _gua) = ua_dev.device_ptr(&ctx.stream);
-            let (ur_ptr, _gur) = ur_dev.device_ptr(&ctx.stream);
-            let (o_ptr, _go) = out_dev.device_ptr_mut(&ctx.stream);
-            // SAFETY: logits holds chain.len()*vocab bf16; p/q scratches hold
-            // (cap+1)/cap vocab-rows and depth <= cap (ensured above); the q
-            // rows were written by this step's draft; draft/u prefixes uploaded
-            // just above.
-            unsafe {
-                ffi::dspark_filter_probs_cuda(
-                    l_ptr as *const ffi::Half,
-                    p_ptr as *mut f32,
-                    chain.len() as i32,
-                    vocab as i32,
-                    1.0 / params.temperature,
-                    params.top_k,
-                    params.top_p,
-                    params.min_p,
-                    ctx.stream.cu_stream(),
-                )
-                .result()?;
-                ffi::dspark_chain_accept_cuda(
-                    q_ptr as *const f32,
-                    p_ptr as *const f32,
-                    d_ptr as *const i32,
-                    ua_ptr as *const f32,
-                    ur_ptr as *const f32,
-                    o_ptr as *mut i32,
-                    depth as i32,
-                    vocab as i32,
-                    ctx.stream.cu_stream(),
-                )
-                .result()?;
-            }
-        }
+        // p/q scratches hold (cap+1)/cap vocab-rows and depth <= cap (ensured
+        // above); the q rows were written by this step's draft; draft/u
+        // prefixes uploaded just above.
+        cuda_kernels::sampling::dspark_filter_probs(
+            ctx,
+            &logits.data,
+            p_all,
+            chain.len(),
+            vocab,
+            cuda_kernels::sampling::DsparkFilter {
+                inv_temperature: 1.0 / params.temperature,
+                top_k: params.top_k,
+                top_p: params.top_p,
+                min_p: params.min_p,
+            },
+        )?;
+        cuda_kernels::sampling::dspark_chain_accept(
+            ctx,
+            &*q_all,
+            &*p_all,
+            &*draft_dev,
+            &*ua_dev,
+            &*ur_dev,
+            out_dev,
+            depth,
+            vocab,
+        )?;
         ctx.sync()?;
         let out = ctx
             .stream

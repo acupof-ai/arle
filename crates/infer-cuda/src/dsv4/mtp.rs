@@ -354,21 +354,7 @@ impl Dsv4Model {
             .stream
             .alloc_zeros::<i32>(m)
             .map_err(|e| anyhow!("DSv4 MTP argmax ids alloc failed: {e}"))?;
-        {
-            let (logits_ptr, _lg) = logits.data.device_ptr(&ctx.stream);
-            let (ids_ptr, _ig) = ids_dev.device_ptr_mut(&ctx.stream);
-            // SAFETY: logits [m, vocab] and ids [m] sized above.
-            unsafe {
-                ffi::argmax_batch_cuda(
-                    logits_ptr as *const ffi::Half,
-                    ids_ptr as *mut i32,
-                    m as i32,
-                    vocab as i32,
-                    ctx.stream.cu_stream(),
-                )
-                .result()?;
-            }
-        }
+        cuda_kernels::sampling::argmax_batch(ctx, &logits.data, &mut ids_dev, m, vocab)?;
         let ids: Vec<i32> = ctx
             .stream
             .clone_dtoh(&ids_dev)
@@ -404,21 +390,7 @@ impl Dsv4Model {
             .map_err(|e| anyhow!("DSv4 MTP top-k ids alloc failed: {e}"))?;
         let mut out = vec![Vec::with_capacity(k); m];
         for round in 0..k {
-            {
-                let (logits_ptr, _lg) = logits.data.device_ptr(&ctx.stream);
-                let (ids_ptr, _ig) = ids_dev.device_ptr_mut(&ctx.stream);
-                // SAFETY: ptrs from live device allocations sized to the dims passed.
-                unsafe {
-                    ffi::argmax_batch_cuda(
-                        logits_ptr as *const ffi::Half,
-                        ids_ptr as *mut i32,
-                        m as i32,
-                        vocab as i32,
-                        ctx.stream.cu_stream(),
-                    )
-                    .result()?;
-                }
-            }
+            cuda_kernels::sampling::argmax_batch(ctx, &logits.data, &mut ids_dev, m, vocab)?;
             let ids: Vec<i32> = ctx
                 .stream
                 .clone_dtoh(&ids_dev)
