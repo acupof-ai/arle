@@ -1394,6 +1394,7 @@ impl Dsv4Model {
             )?;
             keepalive.keep_hidden(&ffn_stream);
             stream = ffn_stream;
+            self.probe_capture(&stream, layer_idx, start_positions)?;
             // DSpark T3: capture each row's wide HC stream at this layer's OUTPUT
             // into its slot's tap buffer, gated so the default path is unchanged.
             if dspark
@@ -1410,6 +1411,7 @@ impl Dsv4Model {
             }
         }
 
+        self.probe_flush()?;
         for r in 0..n {
             slots[slot_ids[r]].seq_len += 1;
         }

@@ -34,6 +34,8 @@ mod mega_moe;
 mod mtp;
 #[path = "dsv4/prefill.rs"]
 mod prefill;
+#[path = "dsv4/probe.rs"]
+mod probe;
 #[path = "dsv4/slot.rs"]
 mod slot;
 #[path = "dsv4/slot_image.rs"]
@@ -49,6 +51,7 @@ pub(crate) use load::load_dspark_draft;
 #[cfg(all(feature = "cuda", feature = "nccl"))]
 pub(crate) use mega_moe::Dsv4MegaMoeTransport;
 pub(crate) use mtp::*;
+use probe::Dsv4ProbeCapture;
 pub(crate) use slot::*;
 pub(crate) use slot_image::*;
 pub(crate) use spec_verify::*;
@@ -74,6 +77,8 @@ pub(crate) struct Dsv4Model {
     /// snapshots agree on one decision.
     pub spec_decode_on: bool,
     pub tp: crate::tp::TpRuntime,
+    /// Optional logit-lens probe (ARLE_PROBE_JSONL). RefCell for &self capture.
+    pub probe: std::cell::RefCell<Option<Dsv4ProbeCapture>>,
     #[cfg(all(feature = "cuda", feature = "nccl"))]
     pub(crate) mega_moe: Option<Dsv4MegaMoeTransport>,
     #[cfg(feature = "deepep")]
