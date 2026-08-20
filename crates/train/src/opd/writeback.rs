@@ -562,6 +562,12 @@ pub fn masked_writeback_step<O: Optimizer>(
         "[masked-writeback] phase=fused_ce seconds={ce_secs:.3} targets={}",
         position_indices.len()
     );
+    // The forward leaves the pool hoarding ~29 GB it cannot re-cut for
+    // backward's fresh grad sizes (observed: 1.28 GB alloc OOM at 131,072 with
+    // free=9 MiB while hoarded=29 GB). Release it so backward allocates clean.
+    if let Err(err) = store.backend().trim_memory_pool() {
+        eprintln!("trim_memory_pool before backward failed (non-fatal): {err}");
+    }
     log_writeback_vram(store, "masked-writeback", "pre backward");
     let t_bwd = Instant::now();
     backward_with_optional_profile(loss, loss_value, store, &mut tape)?;
