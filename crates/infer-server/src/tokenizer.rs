@@ -190,7 +190,11 @@ impl OpenAiTokenizer {
     pub fn think_token_ids(&self) -> Option<(u32, u32)> {
         match self.template {
             ChatTemplate::BuiltinDeepseekV4 => Some((128821, 128822)),
-            _ => None,
+            _ => {
+                let start = self.inner.token_to_id("<think>")?;
+                let end = self.inner.token_to_id("</think>")?;
+                Some((start, end))
+            }
         }
     }
 
