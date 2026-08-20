@@ -33,7 +33,7 @@ const LOW_IMPACT_AVAILABLE_RESERVE_BYTES: usize = 8 * GIB;
 const DEFAULT_CACHE_LIMIT_BYTES: usize = GIB;
 const LOW_IMPACT_CACHE_LIMIT_BYTES: usize = 512 * MIB;
 const SWAP_USED_WARN_BYTES: usize = 512 * MIB;
-const PAGING_SAMPLE_MILLIS: u64 = 1_000;
+const PAGING_SAMPLE_MILLIS: u64 = 200;
 const ACTIVE_PAGEOUT_GUARD_BYTES: usize = 64 * MIB;
 const ACTIVE_SWAPOUT_GUARD_BYTES: usize = 16 * MIB;
 
@@ -231,7 +231,14 @@ pub fn plan_resource_budget(
     let available_memory_bytes = system_status.available_memory_bytes;
     let recommended_max_working_set_bytes = system_status.recommended_max_working_set_bytes;
     let swap_used_bytes = system_status.swap_used_bytes;
-    let paging = sample_paging_activity();
+    // Skip the paging sample when memory is abundant — active paging is implausible.
+    let paging = if available_memory_bytes
+        .is_some_and(|avail| avail > weight_bytes.saturating_add(8 * GIB))
+    {
+        None
+    } else {
+        sample_paging_activity()
+    };
     let system_status = MetalSystemStatus {
         pageouts_delta_bytes: paging.and_then(|p| p.pageouts_delta_bytes),
         swapouts_delta_bytes: paging.and_then(|p| p.swapouts_delta_bytes),
@@ -387,7 +394,14 @@ pub fn plan_weight_only_resource_budget(
     let available_memory_bytes = system_status.available_memory_bytes;
     let recommended_max_working_set_bytes = system_status.recommended_max_working_set_bytes;
     let swap_used_bytes = system_status.swap_used_bytes;
-    let paging = sample_paging_activity();
+    // Skip the paging sample when memory is abundant — active paging is implausible.
+    let paging = if available_memory_bytes
+        .is_some_and(|avail| avail > weight_bytes.saturating_add(8 * GIB))
+    {
+        None
+    } else {
+        sample_paging_activity()
+    };
     let system_status = MetalSystemStatus {
         pageouts_delta_bytes: paging.and_then(|p| p.pageouts_delta_bytes),
         swapouts_delta_bytes: paging.and_then(|p| p.swapouts_delta_bytes),
