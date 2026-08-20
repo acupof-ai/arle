@@ -558,7 +558,11 @@ pub fn masked_writeback_step<O: Optimizer>(
     };
     validate_loss_value(loss_value)?;
     let ce_secs = t_ce.elapsed().as_secs_f64();
-    eprintln!("[masked-writeback] phase=fused_ce seconds={ce_secs:.3}");
+    eprintln!(
+        "[masked-writeback] phase=fused_ce seconds={ce_secs:.3} targets={}",
+        position_indices.len()
+    );
+    log_writeback_vram(store, "masked-writeback", "pre backward");
     let t_bwd = Instant::now();
     backward_with_optional_profile(loss, loss_value, store, &mut tape)?;
     let bwd_secs = t_bwd.elapsed().as_secs_f64();
