@@ -69,8 +69,6 @@ pub(super) fn cuda_linear_attention_backward_device(
                     z: &slice(args.z)?,
                     b_proj: &slice(args.b_proj)?,
                     a_proj: &slice(args.a_proj)?,
-                    preact: &slice(args.preact)?,
-                    qkv_conv: &slice(args.qkv_conv)?,
                     g: g.as_ref(),
                     beta: beta.as_ref(),
                     chunk_state: &slice(args.chunk_state)?,
