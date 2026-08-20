@@ -293,6 +293,19 @@ mod real {
             props.limits.min_storage_buffer_offset_alignment
         }
 
+        /// `maxComputeSharedMemorySize` (bytes) — the ceiling on a compute
+        /// pipeline's `shared` declarations. The tiled `mul_mmq` prefill GEMM
+        /// sizes its shared A/B caches from spec constants, so the tile must be
+        /// chosen against this limit (see `MmqSpec::choose`); an oversized tile
+        /// fails at pipeline creation, not at dispatch.
+        pub fn max_compute_shared_memory_size(&self) -> u32 {
+            let props = unsafe {
+                self.instance
+                    .get_physical_device_properties(self.physical_device)
+            };
+            props.limits.max_compute_shared_memory_size
+        }
+
         /// `(timestampPeriod ns/tick, timestampValidBits)` for GPU timestamp
         /// profiling. `valid_bits == 0` means the compute queue does not support
         /// timestamps (profiling must be disabled).
@@ -1746,6 +1759,10 @@ mod stub {
         }
 
         pub fn min_storage_buffer_offset_alignment(&self) -> u64 {
+            0
+        }
+
+        pub fn max_compute_shared_memory_size(&self) -> u32 {
             0
         }
     }

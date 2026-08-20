@@ -87,6 +87,15 @@ pub enum Kernel {
     GemvIdQ5K,
     GemvIdQ6K,
     GemvIdQ8_0,
+    /// Batched prefill GEMM (`mul_mmq`): `D[n, m] = A[m, k] · Bᵀ[n, k]` with a
+    /// quantized `A` and `block_q8_1_x4` `B` — the SAME activation format the
+    /// decode GEMVs consume, so one `QuantizeQ8_1` dispatch feeds both. Tile
+    /// geometry is NOT baked into the variant: pass an [`MmqSpec`], which the
+    /// pipeline cache keys on (see [`mmq_params`] / [`mmq_dispatch`]).
+    MmqQ4K,
+    MmqQ5K,
+    MmqQ6K,
+    MmqQ8_0,
     QuantizeQ8_1,
     RmsNorm,
     RopeNeox,
@@ -175,6 +184,10 @@ impl Kernel {
         Self::GemvIdQ5K,
         Self::GemvIdQ6K,
         Self::GemvIdQ8_0,
+        Self::MmqQ4K,
+        Self::MmqQ5K,
+        Self::MmqQ6K,
+        Self::MmqQ8_0,
         Self::QuantizeQ8_1,
         Self::RmsNorm,
         Self::RopeNeox,
@@ -218,6 +231,10 @@ impl Kernel {
             Kernel::GemvIdQ5K => "mul_mat_vec_id_q5_k",
             Kernel::GemvIdQ6K => "mul_mat_vec_id_q6_k",
             Kernel::GemvIdQ8_0 => "mul_mat_vec_id_q8_0",
+            Kernel::MmqQ4K => "mul_mmq_q4_k",
+            Kernel::MmqQ5K => "mul_mmq_q5_k",
+            Kernel::MmqQ6K => "mul_mmq_q6_k",
+            Kernel::MmqQ8_0 => "mul_mmq_q8_0",
             Kernel::QuantizeQ8_1 => "q8_1_quantize",
             Kernel::RmsNorm => "rms_norm",
             Kernel::RopeNeox => "rope_neox",
@@ -290,6 +307,27 @@ impl Kernel {
             | Kernel::Qwen36RouterTopk
             | Kernel::Qwen36RouterGemv
             | Kernel::Qwen36MoeWeightedAccum => &[],
+            // `mul_mmq`'s tile geometry is chosen per call from the matmul shape
+            // (see [`MmqSpec::choose`]); there is no single default, and running
+            // it with the shader's built-in defaults would silently pick a tile
+            // whose shared-memory footprint the caller never checked.
+            Kernel::MmqQ4K | Kernel::MmqQ5K | Kernel::MmqQ6K | Kernel::MmqQ8_0 => &[],
+        }
+    }
+
+    /// Bytes one `block_a_cache` entry occupies in shared memory for this
+    /// `mul_mmq` variant (`mul_mmq_shmem_types.glsl`, std430). Q4_K packs two
+    /// 4-bit quants per byte (`QUANT_R_MMQ = 2`) so it needs half the `qs`
+    /// words of Q5_K/Q6_K/Q8_0. Returns `None` for non-`mul_mmq` kernels.
+    pub const fn mmq_a_cache_bytes(self) -> Option<u32> {
+        match self {
+            // { uint32_t qs[4]; f16vec2 dm; }
+            Kernel::MmqQ4K => Some(4 * 4 + 4),
+            // { int32_t qs[8]; f16vec2 dm | d_scales; }
+            Kernel::MmqQ5K | Kernel::MmqQ6K => Some(8 * 4 + 4),
+            // { int32_t qs[8]; float16_t dm; } — padded to the 4-byte struct align.
+            Kernel::MmqQ8_0 => Some(8 * 4 + 4),
+            _ => None,
         }
     }
 
@@ -358,6 +396,195 @@ impl FlashAttentionSpec {
 
     pub const fn specialization_u32(&self) -> &[(u32, u32)] {
         &self.specialization_u32
+    }
+}
+
+/// `mul_mmq` shared-memory `block_b_cache` size (`{ int32_t qs[8]; f16vec2 ds; }`).
+/// Independent of the weight quant — B is always `block_q8_1_x4`.
+const MMQ_B_CACHE_BYTES: u32 = 8 * 4 + 4;
+
+/// `mul_mmq.comp`'s `BK_STEP` for the non-`MUL_MAT_ID` build: four 32-value
+/// K-slices are staged per shared-memory round trip.
+const MMQ_BK_STEP: u32 = 4;
+
+/// Warptile geometry for one `mul_mmq` pipeline — spec constants
+/// `0 BLOCK_SIZE, 1 BM, 2 BN, 4 WM, 5 WN, 6 WMITER, 7 TM, 8 TN, 9 TK, 10 WARP`.
+/// (`constant_id = 3` (BK) is commented out in the shader, which `#define`s
+/// `BK 32` instead, so it is deliberately absent from the map.)
+///
+/// The values are llama.cpp's `s_warptile_mmq_int{,_k}` families
+/// (`ggml-vulkan.cpp:3081`) at `subgroup_size = 32`. The per-chip overrides
+/// below them are all gated on `driver_id != eAmdProprietary`, so the AMD
+/// Windows lane this crate targets uses the base tiles unchanged. K-quants get
+/// `WMITER = 1` and legacy quants `WMITER = 2`, matching the `_k` split.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MmqSpec {
+    specialization_u32: [(u32, u32); 10],
+    bm: u32,
+    bn: u32,
+}
+
+impl MmqSpec {
+    const fn new(
+        block_size: u32,
+        bm: u32,
+        bn: u32,
+        wm: u32,
+        wn: u32,
+        wmiter: u32,
+        tm: u32,
+        tn: u32,
+        warp: u32,
+    ) -> Self {
+        Self {
+            specialization_u32: [
+                (0, block_size),
+                (1, bm),
+                (2, bn),
+                (4, wm),
+                (5, wn),
+                (6, wmiter),
+                (7, tm),
+                (8, tn),
+                (9, 1), // TK: coopmat-only, unused by the scalar body
+                (10, warp),
+            ],
+            bm,
+            bn,
+        }
+    }
+
+    pub const fn k_quant_large() -> Self {
+        Self::new(128, 128, 128, 64, 64, 1, 4, 4, 32)
+    }
+
+    pub const fn k_quant_medium() -> Self {
+        Self::new(128, 64, 64, 32, 32, 1, 2, 2, 32)
+    }
+
+    pub const fn k_quant_small() -> Self {
+        Self::new(32, 32, 32, 32, 32, 1, 2, 1, 32)
+    }
+
+    pub const fn legacy_large() -> Self {
+        Self::new(128, 128, 128, 64, 64, 2, 4, 4, 32)
+    }
+
+    pub const fn legacy_medium() -> Self {
+        Self::new(128, 64, 64, 32, 32, 2, 2, 2, 32)
+    }
+
+    pub const fn legacy_small() -> Self {
+        Self::new(32, 32, 32, 32, 32, 2, 2, 1, 32)
+    }
+
+    pub const fn bm(&self) -> u32 {
+        self.bm
+    }
+
+    pub const fn bn(&self) -> u32 {
+        self.bn
+    }
+
+    pub const fn specialization_u32(&self) -> &[(u32, u32)] {
+        &self.specialization_u32
+    }
+
+    /// Shared-memory bytes this tile needs for `kernel`:
+    /// `BK_STEP * (BM * sizeof(block_a_cache) + BN * sizeof(block_b_cache))`.
+    /// Must be compared against `maxComputeSharedMemorySize` (32 KB on the
+    /// 8060S) before the pipeline is built — a tile that overflows fails at
+    /// pipeline creation, not at dispatch.
+    pub const fn shared_bytes(&self, kernel: Kernel) -> Option<u32> {
+        let Some(a_bytes) = kernel.mmq_a_cache_bytes() else {
+            return None;
+        };
+        Some(MMQ_BK_STEP * (self.bm * a_bytes + self.bn * MMQ_B_CACHE_BYTES))
+    }
+
+    /// Pick the largest tile that both suits the `[m, n]` output shape and fits
+    /// `max_shared_bytes`. Mirrors `ggml_vk_guess_matmul_pipeline`
+    /// (`ggml-vulkan.cpp:6801`): small when either dimension is ≤ 32, medium
+    /// when either is ≤ 64, large otherwise — then falls back a size at a time
+    /// when the shared-memory budget says no. Only the Q4_K large tile fits
+    /// 32 KB (its `block_a_cache` is half the width of the other three), so in
+    /// practice Q5_K/Q6_K/Q8_0 land on medium.
+    pub fn choose(kernel: Kernel, m: u32, n: u32, max_shared_bytes: u32) -> Option<Self> {
+        let k_quant = matches!(kernel, Kernel::MmqQ4K | Kernel::MmqQ5K | Kernel::MmqQ6K);
+        let (large, medium, small) = if k_quant {
+            (
+                Self::k_quant_large(),
+                Self::k_quant_medium(),
+                Self::k_quant_small(),
+            )
+        } else {
+            (
+                Self::legacy_large(),
+                Self::legacy_medium(),
+                Self::legacy_small(),
+            )
+        };
+        let preferred = if m <= 32 || n <= 32 {
+            small
+        } else if m <= 64 || n <= 64 {
+            medium
+        } else {
+            large
+        };
+        [preferred, medium, small].into_iter().find(
+            |tile| matches!(tile.shared_bytes(kernel), Some(bytes) if bytes <= max_shared_bytes),
+        )
+    }
+}
+
+/// Push-constant block for `mul_mmq.comp` (non-`MUL_MAT_ID`): 16 `uint`s, in
+/// declared order `M, N, K, stride_a, stride_b, stride_d, batch_stride_a,
+/// batch_stride_b, batch_stride_d, base_work_group_z, num_batches, k_split,
+/// ne02, ne12, broadcast2, broadcast3`.
+///
+/// Mapped from `ggml_vk_matmul` (`ggml-vulkan.cpp:6855`) for ONE unbatched,
+/// unsplit matmul:
+/// - `A` is the `[m, k]` quantized weight, row-major, `stride_a = k` elements.
+///   `k` must be a multiple of the weight's `QUANT_K` (256 for the K-quants,
+///   32 for Q8_0) — the shader indexes A in 32-value sub-blocks.
+/// - `B` is `[n, k]` `block_q8_1_x4` activations, `stride_b = k` elements. Row
+///   starts must land on an x4 group boundary, so `k` must be a multiple of 128.
+/// - `D` is `[n, m]` f32 with `stride_d = m`: the shader writes
+///   `data_d[col * stride_d + row]`, i.e. one contiguous `m`-wide row per
+///   B row. For prefill that is exactly "one output vector per token".
+/// - `k_split = k` and `num_batches = 1` collapse the split-K grid to `ik = 0`,
+///   so `gl_WorkGroupID.x` is purely the M tile.
+///
+/// Binding order: `[0 = A quantized weight, 1 = B q8_1_x4, 2 = D f32]`.
+pub fn mmq_params(m: u32, n: u32, k: u32) -> KernelParams {
+    KernelParams::from_words(vec![
+        m,     // M: output rows (weight rows)
+        n,     // N: output cols (tokens in the chunk)
+        k,     // K: reduction width in elements
+        k,     // stride_a: weight row stride (elements)
+        k,     // stride_b: activation row stride (elements)
+        m,     // stride_d: dst row stride (elements) = M
+        m * k, // batch_stride_a: unused at batch 0, set to the natural stride
+        n * k, // batch_stride_b: same
+        m * n, // batch_stride_d: same
+        0,     // base_work_group_z: single batch
+        1,     // num_batches
+        k,     // k_split: no split-K
+        1,     // ne02
+        1,     // ne12
+        1,     // broadcast2
+        1,     // broadcast3
+    ])
+}
+
+/// Dispatch grid for [`mmq_params`]: `x` = M tiles, `y` = N tiles, `z` = 1
+/// (single batch). `mul_mmq.comp` recovers `ir = x % blocks_m` and, with
+/// `k_split = K`, `ik = x / blocks_m = 0`.
+pub fn mmq_dispatch(m: u32, n: u32, spec: &MmqSpec) -> Dispatch {
+    Dispatch {
+        x: m.div_ceil(spec.bm()).max(1),
+        y: n.div_ceil(spec.bn()).max(1),
+        z: 1,
     }
 }
 
@@ -1470,6 +1697,27 @@ mod real {
             spec.specialization_u32(),
         )
     }
+
+    /// Batched prefill GEMM. `kernel` must be one of `Kernel::Mmq*`; buffers are
+    /// `[A quantized weight, B q8_1_x4 activations, D f32 dst]`, push is
+    /// [`mmq_params`], dispatch is [`mmq_dispatch`].
+    pub fn mmq_with_params_and_spec(
+        kernel: Kernel,
+        ctx: &vulkan_sys::VulkanContext,
+        buffers: &[&vulkan_sys::DeviceBuffer<'_>],
+        dispatch: Dispatch,
+        params: &super::KernelParams,
+        spec: &super::MmqSpec,
+    ) -> Result<()> {
+        launch_with_params_and_specialization(
+            kernel,
+            ctx,
+            buffers,
+            dispatch,
+            params,
+            spec.specialization_u32(),
+        )
+    }
 }
 
 #[cfg(feature = "vulkan")]
@@ -1509,6 +1757,17 @@ mod stub {
     ) -> Result<()> {
         Err(KernelError::NotCompiled)
     }
+
+    pub fn mmq_with_params_and_spec(
+        _kernel: Kernel,
+        _ctx: &vulkan_sys::VulkanContext,
+        _buffers: &[&vulkan_sys::DeviceBuffer<'_>],
+        _dispatch: super::Dispatch,
+        _params: &super::KernelParams,
+        _spec: &super::MmqSpec,
+    ) -> Result<()> {
+        Err(KernelError::NotCompiled)
+    }
 }
 
 #[cfg(not(feature = "vulkan"))]
@@ -1517,6 +1776,6 @@ launcher_fns!(stub::launch, stub::launch_with_params);
 fused_launcher_fns!(stub::launch_with_params);
 
 #[cfg(feature = "vulkan")]
-pub use real::flash_attn_with_params_and_spec;
+pub use real::{flash_attn_with_params_and_spec, mmq_with_params_and_spec};
 #[cfg(not(feature = "vulkan"))]
-pub use stub::flash_attn_with_params_and_spec;
+pub use stub::{flash_attn_with_params_and_spec, mmq_with_params_and_spec};
