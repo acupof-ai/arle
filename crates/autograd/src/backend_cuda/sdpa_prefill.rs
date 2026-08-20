@@ -49,40 +49,29 @@ pub(super) fn cuda_causal_sdpa_prefill_device(
         .alloc_zeros::<u16>(out_len)
         .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (sdpa prefill out)"))?;
 
-    let as_i32 = |value: usize, label: &'static str| {
-        i32::try_from(value).map_err(|_| AutogradError::TapeInvariant(label))
-    };
-    let heads_i32 = as_i32(heads, "sdpa prefill heads exceeds i32")?;
-    let kv_heads_i32 = as_i32(kv_heads, "sdpa prefill kv_heads exceeds i32")?;
-    let dim_i32 = as_i32(dim, "sdpa prefill head_dim exceeds i32")?;
-    let seq_i32 = as_i32(seq, "sdpa prefill seq exceeds i32")?;
-    let kv_i32 = as_i32(kv_len, "sdpa prefill kv_len exceeds i32")?;
     {
         let (q_ptr, _q_guard) = q_bf16.device_ptr(&backend.stream);
         let (k_ptr, _k_guard) = k_bf16.device_ptr(&backend.stream);
         let (v_ptr, _v_guard) = v_bf16.device_ptr(&backend.stream);
         let (out_ptr, _out_guard) = out_bf16.device_ptr_mut(&backend.stream);
-        check_cuda_ffi(
-            // SAFETY: q/k/v are live guarded bf16 copies of tape tensors whose shapes passed the
-            // envelope check; out is allocated seq*heads*dim; the dims passed mirror those shapes.
-            unsafe {
-                ffi::nonpaged_prefill_attention_cuda(
-                    q_ptr as *const ffi::Half,
-                    k_ptr as *const ffi::Half,
-                    v_ptr as *const ffi::Half,
-                    out_ptr as *mut ffi::Half,
-                    heads_i32,
-                    kv_heads_i32,
-                    dim_i32,
-                    seq_i32,
-                    kv_i32,
-                    kv_i32,
-                    (dim as f32).sqrt().recip(),
-                    backend.stream.cu_stream(),
-                )
-            },
-            "nonpaged_prefill_attention_cuda",
-        )?;
+        // q/k/v are live guarded bf16 copies of tape tensors whose shapes passed
+        // the envelope check; out is allocated seq*heads*dim; the dims passed
+        // mirror those shapes (`max_seq_len = kv_len` for the contiguous view).
+        cuda_kernels::attention::nonpaged_prefill_attention_raw(
+            &backend.stream,
+            q_ptr,
+            k_ptr,
+            v_ptr,
+            out_ptr,
+            heads,
+            kv_heads,
+            dim,
+            seq,
+            kv_len,
+            kv_len,
+            (dim as f32).sqrt().recip(),
+        )
+        .map_err(|e| leak_err(format!("nonpaged_prefill_attention_cuda: {e}")))?;
     }
 
     // Trace-gated sync: pin an async kernel fault here, not at the next alloc.
