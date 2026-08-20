@@ -2180,6 +2180,28 @@ impl Backend for CudaBackend {
         }
     }
 
+    fn permute_seq_blocks_device(
+        &self,
+        x: &DeviceHandle,
+        batch: usize,
+        num_blocks: usize,
+        block_elems: usize,
+        perm: &[usize],
+    ) -> Result<DeviceHandle> {
+        #[cfg(feature = "no-cuda")]
+        {
+            let _ = (x, batch, num_blocks, block_elems, perm);
+            todo!(
+                "GPU required: cuda permute_seq_blocks_device is unavailable under feature no-cuda"
+            )
+        }
+
+        #[cfg(not(feature = "no-cuda"))]
+        {
+            cuda_permute_seq_blocks_device(self, x, batch, num_blocks, block_elems, perm)
+        }
+    }
+
     fn write_slice_device(
         &self,
         dest: &DeviceHandle,

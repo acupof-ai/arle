@@ -55,7 +55,8 @@ pub(crate) use embed::embedding_backward;
 pub(crate) use fused_linear_distill::{fused_linear_distill_backward, generalized_jsd_backward};
 pub(crate) use gather::gather_last_dim_backward;
 pub(crate) use layout::{
-    broadcast_expand_backward, cat_backward, reshape_backward, slice_backward, transpose_backward,
+    broadcast_expand_backward, cat_backward, permute_seq_blocks, permute_seq_blocks_backward,
+    reshape_backward, slice_backward, transpose_backward,
 };
 pub(crate) use linear_attention::linear_attention_backward;
 pub(crate) use matmul::{matmul_backward, matmul_bt_backward};
