@@ -225,15 +225,18 @@ mod real {
             }
         }
 
-        // Repack-decline boundary: N not %64 must leave the source resident.
+        // NVFP4 has one serving path (Marlin); a shape the tile grid cannot
+        // take must fail at load with the reason, not demote to an arm that
+        // does not exist. Assert the bail on N%64.
         let (dn, dk) = (96usize, 5120usize);
-        let dm = fp4_matrix(&ctx, dn, dk, seed.wrapping_add(2))?;
-        let declined =
-            dm.marlin_packed.is_none() && dm.qweight_u8.is_some() && dm.qscale_fp8.is_some();
-        any_fail |= !declined;
+        let bailed = match fp4_matrix(&ctx, dn, dk, seed.wrapping_add(2)) {
+            Ok(_) => false,
+            Err(e) => e.to_string().contains("cannot take the Marlin layout"),
+        };
+        any_fail |= !bailed;
         println!(
-            "declined n%64 {dn}x{dk}: {}",
-            if declined { "OK" } else { "FAIL" }
+            "n%64 {dn}x{dk} load bail: {}",
+            if bailed { "OK" } else { "FAIL" }
         );
 
         ensure!(!any_fail, "marlin_fp4_probe FAILED — see violations above");
