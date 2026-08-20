@@ -272,8 +272,36 @@ pub enum PairClass {
     Skip,
 }
 
-/// Classify a (q_run, k_run) pair, erroring on any partial overlap — with
-/// equal-length chunk-aligned zigzag shards it cannot happen.
+/// Split runs at the given absolute positions, so a q tile that sits inside a
+/// longer k run classifies as prefix-Full + equal-length Causal (+ Skip tail)
+/// instead of erroring. Cuts outside a run leave it untouched.
+pub fn split_runs_at(runs: Vec<PosRun>, cuts: &[usize]) -> Vec<PosRun> {
+    let mut out = Vec::with_capacity(runs.len());
+    for run in runs {
+        let mut cur = run;
+        for &c in cuts {
+            if c > cur.abs && c < cur.abs + cur.len {
+                let head = c - cur.abs;
+                out.push(PosRun {
+                    row: cur.row,
+                    len: head,
+                    abs: cur.abs,
+                });
+                cur = PosRun {
+                    row: cur.row + head,
+                    len: cur.len - head,
+                    abs: c,
+                };
+            }
+        }
+        out.push(cur);
+    }
+    out
+}
+
+/// Classify a (q_run, k_run) pair, erroring on any partial overlap — after
+/// `split_runs_at` on the k side it cannot happen for a chunk-aligned shard,
+/// tiled q included.
 pub fn classify_pair(q: PosRun, k: PosRun) -> Result<PairClass> {
     if k.abs + k.len <= q.abs {
         Ok(PairClass::Full)
@@ -508,9 +536,13 @@ struct RingFa3Pair {
 /// shard errors loudly before any state is touched.
 #[cfg(feature = "cuda")]
 fn ring_fa3_pairs(q_pos: &[usize], k_pos: &[usize]) -> Result<Vec<RingFa3Pair>> {
-    let k_runs = contiguous_pos_runs(k_pos);
+    let q_runs = contiguous_pos_runs(q_pos);
+    let mut cuts: Vec<usize> = q_runs.iter().flat_map(|q| [q.abs, q.abs + q.len]).collect();
+    cuts.sort_unstable();
+    cuts.dedup();
+    let k_runs = split_runs_at(contiguous_pos_runs(k_pos), &cuts);
     let mut pairs = Vec::new();
-    for q_run in contiguous_pos_runs(q_pos) {
+    for q_run in q_runs {
         for &k_run in &k_runs {
             match classify_pair(q_run, k_run)? {
                 PairClass::Full => pairs.push(RingFa3Pair {
