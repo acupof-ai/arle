@@ -29,9 +29,7 @@ pub(super) fn cuda_softmax_like(
     let cols = i32::try_from(last_dim)
         .map_err(|_| AutogradError::TapeInvariant("cuda softmax cols exceeds i32"))?;
     let d_in = backend.upload_slice(x, shape)?;
-    let mut d_out = backend
-        .stream
-        .alloc_zeros::<f32>(expected)
+    let mut d_out = alloc_zeros_retry::<f32>(backend, expected)
         .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed"))?;
 
     const BLOCK: u32 = 256;
@@ -99,9 +97,7 @@ pub(super) fn cuda_softmax_like_device(
                 size: expected,
             });
         }
-        let mut d_out = backend
-            .stream
-            .alloc_zeros::<u16>(expected)
+        let mut d_out = alloc_zeros_retry::<u16>(backend, expected)
             .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed"))?;
         let func = backend.kernels.function_for(kernel_name, TapeDtype::Bf16)?;
         launch_rows(
@@ -126,9 +122,7 @@ pub(super) fn cuda_softmax_like_device(
         });
     }
 
-    let mut d_out = backend
-        .stream
-        .alloc_zeros::<f32>(expected)
+    let mut d_out = alloc_zeros_retry::<f32>(backend, expected)
         .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed"))?;
 
     launch_rows(
@@ -186,7 +180,7 @@ pub(super) fn cuda_log_softmax_last_axis_backward(
                 size: expected,
             });
         }
-        let mut d_grad = backend.stream.alloc_zeros::<u16>(expected).map_err(|_| {
+        let mut d_grad = alloc_zeros_retry::<u16>(backend, expected).map_err(|_| {
             AutogradError::TapeInvariant("cuda alloc_zeros failed (log_softmax_bwd)")
         })?;
         const BLOCK: u32 = 256;
@@ -225,7 +219,7 @@ pub(super) fn cuda_log_softmax_last_axis_backward(
         });
     }
 
-    let mut d_grad = backend.stream.alloc_zeros::<f32>(expected).map_err(|e| {
+    let mut d_grad = alloc_zeros_retry::<f32>(backend, expected).map_err(|e| {
         eprintln!("[autograd] alloc_zeros {expected} x f32 failed (log_softmax_bwd): {e}");
         AutogradError::TapeInvariant("cuda alloc_zeros failed (log_softmax_bwd)")
     })?;
@@ -281,9 +275,7 @@ pub(super) fn cuda_softmax_last_axis_backward(
                 size: expected,
             });
         }
-        let mut d_grad = backend
-            .stream
-            .alloc_zeros::<u16>(expected)
+        let mut d_grad = alloc_zeros_retry::<u16>(backend, expected)
             .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (softmax_bwd)"))?;
         const BLOCK: u32 = 256;
         const SHARED: u32 = BLOCK * std::mem::size_of::<f32>() as u32;
@@ -321,9 +313,7 @@ pub(super) fn cuda_softmax_last_axis_backward(
         });
     }
 
-    let mut d_grad = backend
-        .stream
-        .alloc_zeros::<f32>(expected)
+    let mut d_grad = alloc_zeros_retry::<f32>(backend, expected)
         .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (softmax_bwd)"))?;
 
     const BLOCK: u32 = 256;
@@ -376,9 +366,7 @@ pub(super) fn cuda_argmax_last_dim(
             size: total,
         });
     }
-    let mut d_out = backend
-        .stream
-        .alloc_zeros::<f32>(rows)
+    let mut d_out = alloc_zeros_retry::<f32>(backend, rows)
         .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (argmax)"))?;
     let rows_i = i32::try_from(rows)
         .map_err(|_| AutogradError::TapeInvariant("cuda argmax rows exceeds i32"))?;
@@ -419,9 +407,7 @@ pub(super) fn cuda_sum_all_device(
     // size == 0 → empty sum is 0.0; size == 1 → already a scalar, copy as-is
     // through one trivial reduce so the returned buffer is freshly owned.
     if size == 0 {
-        let d_out = backend
-            .stream
-            .alloc_zeros::<f32>(1)
+        let d_out = alloc_zeros_retry::<f32>(backend, 1)
             .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (sum_all empty)"))?;
         return Ok(DeviceHandle::Cuda(CudaStorage::new(d_out)));
     }
@@ -435,9 +421,7 @@ pub(super) fn cuda_sum_all_device(
     let mut blocks = n.div_ceil(BLOCK as usize);
     let n_i32 = i32::try_from(n)
         .map_err(|_| AutogradError::TapeInvariant("cuda sum_all size exceeds i32"))?;
-    let mut current = backend
-        .stream
-        .alloc_zeros::<f32>(blocks)
+    let mut current = alloc_zeros_retry::<f32>(backend, blocks)
         .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (sum_all)"))?;
     launch_rows(
         &backend.stream,
@@ -457,9 +441,7 @@ pub(super) fn cuda_sum_all_device(
         blocks = n.div_ceil(BLOCK as usize);
         let pass_n = i32::try_from(n)
             .map_err(|_| AutogradError::TapeInvariant("cuda sum_all partials exceed i32"))?;
-        let mut next = backend
-            .stream
-            .alloc_zeros::<f32>(blocks)
+        let mut next = alloc_zeros_retry::<f32>(backend, blocks)
             .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (sum_all pass)"))?;
         launch_rows(
             &backend.stream,
@@ -506,9 +488,7 @@ pub(super) fn cuda_reduce_last_axis(
     let cols = i32::try_from(last_dim)
         .map_err(|_| AutogradError::TapeInvariant("cuda reduce cols exceeds i32"))?;
     let d_in = backend.upload_slice(x, shape)?;
-    let mut d_out = backend
-        .stream
-        .alloc_zeros::<f32>(rows)
+    let mut d_out = alloc_zeros_retry::<f32>(backend, rows)
         .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed"))?;
 
     const BLOCK: u32 = 256;

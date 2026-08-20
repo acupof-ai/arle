@@ -49,9 +49,7 @@ pub(super) fn cuda_matmul_backward(
                 // grad_a[M,K] = grad_out[M,N] @ B^T[N,K]
                 // cuBLAS: first_arg=B(OP_T), second_arg=dC(OP_N); m=K,n=M,k=N.
                 // lda = N (B cm[N,K]), ldb = N (dC cm[N,M]), ldc = K.
-                let mut c = backend
-                    .stream
-                    .alloc_zeros::<f32>(m * k)
+                let mut c = alloc_zeros_retry::<f32>(backend, m * k)
                     .map_err(|_| cuda_alloc_failed("matmul_backward grad_a", vec![m, k]))?;
                 let cfg = GemmConfig::<f32> {
                     transa: cublasOperation_t::CUBLAS_OP_T,
@@ -80,9 +78,7 @@ pub(super) fn cuda_matmul_backward(
                 // grad_b[K,N] = A^T[K,M] @ grad_out[M,N]
                 // cuBLAS: first_arg=dC(OP_N), second_arg=A(OP_T); m=N,n=K,k=M.
                 // lda = N (dC cm[N,M]), ldb = K (A cm[K,M]), ldc = N.
-                let mut c = backend
-                    .stream
-                    .alloc_zeros::<f32>(k * n)
+                let mut c = alloc_zeros_retry::<f32>(backend, k * n)
                     .map_err(|_| cuda_alloc_failed("matmul_backward grad_b", vec![k, n]))?;
                 let cfg = GemmConfig::<f32> {
                     transa: cublasOperation_t::CUBLAS_OP_N,
@@ -126,9 +122,7 @@ pub(super) fn cuda_matmul_backward(
             let d_g = backend.upload_slice(grad_out, grad_out_shape)?;
 
             let grad_a_host = if need_grad_a {
-                let mut c = backend
-                    .stream
-                    .alloc_zeros::<f32>(batch * m * k)
+                let mut c = alloc_zeros_retry::<f32>(backend, batch * m * k)
                     .map_err(|_| {
                         cuda_alloc_failed("matmul_backward batched grad_a", vec![batch, m, k])
                     })?;
@@ -168,9 +162,7 @@ pub(super) fn cuda_matmul_backward(
             };
 
             let grad_b_host = if need_grad_b {
-                let mut c = backend
-                    .stream
-                    .alloc_zeros::<f32>(batch * k * n)
+                let mut c = alloc_zeros_retry::<f32>(backend, batch * k * n)
                     .map_err(|_| {
                         cuda_alloc_failed("matmul_backward batched grad_b", vec![batch, k, n])
                     })?;
@@ -272,9 +264,7 @@ pub(super) fn cuda_matmul_backward_device(
 
             let grad_a_handle = if need_grad_a {
                 // grad_a[M,K] = grad_out[M,N] @ B^T[N,K]
-                let mut c = backend
-                    .stream
-                    .alloc_zeros::<f32>(m * k)
+                let mut c = alloc_zeros_retry::<f32>(backend, m * k)
                     .map_err(|_| cuda_alloc_failed("matmul_backward_device grad_a", vec![m, k]))?;
                 let cfg = GemmConfig::<f32> {
                     transa: cublasOperation_t::CUBLAS_OP_T,
@@ -303,9 +293,7 @@ pub(super) fn cuda_matmul_backward_device(
 
             let grad_b_handle = if need_grad_b {
                 // grad_b[K,N] = A^T[K,M] @ grad_out[M,N]
-                let mut c = backend
-                    .stream
-                    .alloc_zeros::<f32>(k * n)
+                let mut c = alloc_zeros_retry::<f32>(backend, k * n)
                     .map_err(|_| cuda_alloc_failed("matmul_backward_device grad_b", vec![k, n]))?;
                 let cfg = GemmConfig::<f32> {
                     transa: cublasOperation_t::CUBLAS_OP_N,
@@ -347,9 +335,7 @@ pub(super) fn cuda_matmul_backward_device(
             }
 
             let grad_a_handle = if need_grad_a {
-                let mut c = backend
-                    .stream
-                    .alloc_zeros::<f32>(batch * m * k)
+                let mut c = alloc_zeros_retry::<f32>(backend, batch * m * k)
                     .map_err(|_| {
                         cuda_alloc_failed(
                             "matmul_backward_device batched grad_a",
@@ -392,9 +378,7 @@ pub(super) fn cuda_matmul_backward_device(
             };
 
             let grad_b_handle = if need_grad_b {
-                let mut c = backend
-                    .stream
-                    .alloc_zeros::<f32>(batch * k * n)
+                let mut c = alloc_zeros_retry::<f32>(backend, batch * k * n)
                     .map_err(|_| {
                         cuda_alloc_failed(
                             "matmul_backward_device batched grad_b",
@@ -651,9 +635,7 @@ pub(super) fn cuda_matmul_bt_backward_device(
         // grad_b[N,K] = grad_out^T[N,M] @ A[M,K]. The output's row-major
         // buffer is cuBLAS's column-major [K,N], so compute A^T[K,M] @
         // grad_out[M,N] directly into that column-major view.
-        let mut c = backend
-            .stream
-            .alloc_zeros::<f32>(n * k)
+        let mut c = alloc_zeros_retry::<f32>(backend, n * k)
             .map_err(|_| cuda_alloc_failed("matmul_bt_backward_device grad_b", vec![n, k]))?;
         let cfg = GemmConfig::<f32> {
             transa: cublasOperation_t::CUBLAS_OP_N,

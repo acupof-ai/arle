@@ -70,17 +70,11 @@ pub(super) fn cuda_ring_block_fwd_merge(
     let qpos_slice = backend.cuda_slice(q_pos, "ring q_pos")?;
     let kpos_slice = backend.cuda_slice(k_pos, "ring k_pos")?;
     let rows = dims.num_q_tiles * dims.q_rows;
-    let mut m_out = backend
-        .stream
-        .alloc_zeros::<f32>(rows)
+    let mut m_out = alloc_zeros_retry::<f32>(backend, rows)
         .map_err(|_| cuda_alloc_failed("ring m_out", vec![rows]))?;
-    let mut l_out = backend
-        .stream
-        .alloc_zeros::<f32>(rows)
+    let mut l_out = alloc_zeros_retry::<f32>(backend, rows)
         .map_err(|_| cuda_alloc_failed("ring l_out", vec![rows]))?;
-    let mut o_out = backend
-        .stream
-        .alloc_zeros::<f32>(rows * dims.head_dim)
+    let mut o_out = alloc_zeros_retry::<f32>(backend, rows * dims.head_dim)
         .map_err(|_| cuda_alloc_failed("ring o_out", vec![rows * dims.head_dim]))?;
     {
         let (q_ptr, _qg) = q_bf16.device_ptr(&backend.stream);
@@ -134,13 +128,9 @@ pub(super) fn cuda_ring_block_finalize(
     let l_slice = backend.cuda_slice(acc_l, "ring fin l")?;
     let o_slice = backend.cuda_slice(acc_o, "ring fin o")?;
     let out_len = total_rows * head_dim;
-    let mut out_f32 = backend
-        .stream
-        .alloc_zeros::<f32>(out_len)
+    let mut out_f32 = alloc_zeros_retry::<f32>(backend, out_len)
         .map_err(|_| cuda_alloc_failed("ring finalize out", vec![out_len]))?;
-    let mut lse = backend
-        .stream
-        .alloc_zeros::<f32>(total_rows)
+    let mut lse = alloc_zeros_retry::<f32>(backend, total_rows)
         .map_err(|_| cuda_alloc_failed("ring finalize lse", vec![total_rows]))?;
     {
         let (m_ptr, _mg) = m_slice.device_ptr(&backend.stream);
@@ -209,13 +199,9 @@ pub(super) fn cuda_ring_block_bwd(
     let blk_elems = dims.num_q_tiles / (dims.num_q_heads / dims.num_kv_heads).max(1)
         * dims.blk_len
         * dims.head_dim;
-    let mut gk = backend
-        .stream
-        .alloc_zeros::<f32>(blk_elems)
+    let mut gk = alloc_zeros_retry::<f32>(backend, blk_elems)
         .map_err(|_| cuda_alloc_failed("ring grad_k", vec![blk_elems]))?;
-    let mut gv = backend
-        .stream
-        .alloc_zeros::<f32>(blk_elems)
+    let mut gv = alloc_zeros_retry::<f32>(backend, blk_elems)
         .map_err(|_| cuda_alloc_failed("ring grad_v", vec![blk_elems]))?;
     if ring_fa3_route(&backend.stream, dims, q_pos_host, k_pos_host) {
         // FA3 bwd wants o/d_out bf16; o is saved f32 — one quantize copy per call.

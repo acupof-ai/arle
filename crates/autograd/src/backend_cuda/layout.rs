@@ -20,9 +20,7 @@ pub(super) fn cuda_write_scalar_at(
             size: len,
         });
     }
-    let mut d_out = backend
-        .stream
-        .alloc_zeros::<f32>(len)
+    let mut d_out = alloc_zeros_retry::<f32>(backend, len)
         .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (write scalar)"))?;
     let len_i = i32::try_from(len)
         .map_err(|_| AutogradError::TapeInvariant("cuda write scalar len exceeds i32"))?;
@@ -240,9 +238,7 @@ pub(super) fn cuda_slice_device(
 
     if x_bf16 {
         let d_x = backend.cuda_bf16_slice(x, "slice")?;
-        let mut d_out = backend
-            .stream
-            .alloc_zeros::<u16>(total)
+        let mut d_out = alloc_zeros_retry::<u16>(backend, total)
             .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (slice)"))?;
         let func = backend.kernels.function_for("slice_f32", TapeDtype::Bf16)?;
         launch_1d(&backend.stream, &func, total, |mut builder| {
@@ -260,9 +256,7 @@ pub(super) fn cuda_slice_device(
     }
 
     let d_x = backend.cuda_slice(x, "slice")?;
-    let mut d_out = backend
-        .stream
-        .alloc_zeros::<f32>(total)
+    let mut d_out = alloc_zeros_retry::<f32>(backend, total)
         .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (slice)"))?;
     launch_1d(
         &backend.stream,
@@ -338,9 +332,7 @@ pub(super) fn cuda_concat_axis2_device(
                 size: a_total,
             });
         }
-        let mut d_out = backend
-            .stream
-            .alloc_zeros::<u16>(total)
+        let mut d_out = alloc_zeros_retry::<u16>(backend, total)
             .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (concat_axis2)"))?;
         let func = backend
             .kernels
@@ -382,9 +374,7 @@ pub(super) fn cuda_concat_axis2_device(
             size: b_total,
         });
     }
-    let mut d_out = backend
-        .stream
-        .alloc_zeros::<f32>(total)
+    let mut d_out = alloc_zeros_retry::<f32>(backend, total)
         .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (concat_axis2)"))?;
     launch_1d(
         &backend.stream,

@@ -42,9 +42,7 @@ pub(super) fn cuda_gather_last_dim_device(
         .stream
         .clone_htod(ids)
         .map_err(|_| AutogradError::TapeInvariant("cuda htod copy failed"))?;
-    let mut d_out = backend
-        .stream
-        .alloc_zeros::<f32>(prefix)
+    let mut d_out = alloc_zeros_retry::<f32>(backend, prefix)
         .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed"))?;
 
     let n_i32 = i32::try_from(prefix)
@@ -114,9 +112,7 @@ pub(super) fn cuda_gather_last_dim_backward(
         .map_err(|_| AutogradError::TapeInvariant("cuda htod copy failed (gather_bwd ids)"))?;
     // alloc_zeros gives us the zero-fill for free — kernel only writes the
     // single (row, ids[row]) slot per prefix row.
-    let mut d_grad = backend
-        .stream
-        .alloc_zeros::<f32>(total)
+    let mut d_grad = alloc_zeros_retry::<f32>(backend, total)
         .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (gather_bwd grad)"))?;
 
     let prefix_i32 = i32::try_from(prefix)
@@ -178,9 +174,7 @@ pub(super) fn cuda_gather_last_dim(
         .stream
         .clone_htod(ids)
         .map_err(|_| AutogradError::TapeInvariant("cuda htod copy failed"))?;
-    let mut d_out = backend
-        .stream
-        .alloc_zeros::<f32>(prefix)
+    let mut d_out = alloc_zeros_retry::<f32>(backend, prefix)
         .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed"))?;
 
     let n_i32 = i32::try_from(prefix)
@@ -229,9 +223,7 @@ pub(super) fn cuda_scatter_add_rows(
     }
     let out_len = vocab * feature_dim;
     // Zero-initialize the accumulator on-device — the kernel only adds.
-    let mut d_out = backend
-        .stream
-        .alloc_zeros::<f32>(out_len)
+    let mut d_out = alloc_zeros_retry::<f32>(backend, out_len)
         .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed"))?;
     if prefix_rows == 0 || feature_dim == 0 {
         return cuda_download(backend, &d_out, out_len);

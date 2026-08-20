@@ -52,9 +52,7 @@ pub(super) fn cuda_rope(
         .stream
         .clone_htod(sin)
         .map_err(|_| AutogradError::TapeInvariant("cuda htod copy failed"))?;
-    let mut d_out = backend
-        .stream
-        .alloc_zeros::<f32>(total)
+    let mut d_out = alloc_zeros_retry::<f32>(backend, total)
         .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed"))?;
 
     let batch_i = i32::try_from(batch)
@@ -161,9 +159,7 @@ pub(super) fn cuda_rope_device(
                 got: vec![d_x.len()],
             });
         }
-        let mut d_out = backend
-            .stream
-            .alloc_zeros::<u16>(total)
+        let mut d_out = alloc_zeros_retry::<u16>(backend, total)
             .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (rope)"))?;
         let func = backend.kernels.function_for("rope_f32", TapeDtype::Bf16)?;
         launch_rows(&backend.stream, &func, rows, block, 0, |mut builder| {
@@ -188,9 +184,7 @@ pub(super) fn cuda_rope_device(
             got: vec![d_x.len()],
         });
     }
-    let mut d_out = backend
-        .stream
-        .alloc_zeros::<f32>(total)
+    let mut d_out = alloc_zeros_retry::<f32>(backend, total)
         .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (rope)"))?;
     launch_rows(
         &backend.stream,
@@ -288,9 +282,7 @@ pub(super) fn cuda_rope_backward_device(
                 got: vec![d_up.len()],
             });
         }
-        let mut d_grad = backend
-            .stream
-            .alloc_zeros::<u16>(total)
+        let mut d_grad = alloc_zeros_retry::<u16>(backend, total)
             .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (rope_backward)"))?;
         let func = backend
             .kernels
@@ -317,9 +309,7 @@ pub(super) fn cuda_rope_backward_device(
             got: vec![d_up.len()],
         });
     }
-    let mut d_grad = backend
-        .stream
-        .alloc_zeros::<f32>(total)
+    let mut d_grad = alloc_zeros_retry::<f32>(backend, total)
         .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (rope_backward)"))?;
     launch_rows(
         &backend.stream,

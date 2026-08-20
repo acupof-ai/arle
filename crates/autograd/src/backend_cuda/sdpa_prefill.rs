@@ -44,9 +44,7 @@ pub(super) fn cuda_causal_sdpa_prefill_device(
     let k_bf16 = backend.local_f32_as_bf16(k_slice, k_slice.len())?;
     let v_bf16 = backend.local_f32_as_bf16(v_slice, v_slice.len())?;
     let out_len = seq * heads * dim;
-    let mut out_bf16 = backend
-        .stream
-        .alloc_zeros::<u16>(out_len)
+    let mut out_bf16 = alloc_zeros_retry::<u16>(backend, out_len)
         .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (sdpa prefill out)"))?;
 
     {
@@ -167,17 +165,11 @@ pub(super) fn cuda_causal_sdpa_recompute_backward_device(
     let out_len_q = if args.need_grad_q { total } else { 1 };
     let out_len_k = if args.need_grad_k { total } else { 1 };
     let out_len_v = if args.need_grad_v { total } else { 1 };
-    let mut grad_q = backend
-        .stream
-        .alloc_zeros::<f32>(out_len_q)
+    let mut grad_q = alloc_zeros_retry::<f32>(backend, out_len_q)
         .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (sdpa grad_q)"))?;
-    let mut grad_k = backend
-        .stream
-        .alloc_zeros::<f32>(out_len_k)
+    let mut grad_k = alloc_zeros_retry::<f32>(backend, out_len_k)
         .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (sdpa grad_k)"))?;
-    let mut grad_v = backend
-        .stream
-        .alloc_zeros::<f32>(out_len_v)
+    let mut grad_v = alloc_zeros_retry::<f32>(backend, out_len_v)
         .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (sdpa grad_v)"))?;
 
     let rows = batch

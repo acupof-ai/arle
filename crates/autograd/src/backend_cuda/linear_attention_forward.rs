@@ -207,22 +207,16 @@ pub(super) fn cuda_linear_attention_boundary_device_row(
     let a_bf16 = backend.local_f32_as_bf16(a_proj, head_len)?;
     let dt_bf16 = backend.local_f32_as_bf16(dt_bias, p.num_value_heads)?;
     let chunk_rows = p.seq_len.min(64);
-    let mut qkv_chunk = backend
-        .stream
-        .alloc_zeros::<u16>(chunk_rows * qkv_dim)
+    let mut qkv_chunk = alloc_zeros_retry::<u16>(backend, chunk_rows * qkv_dim)
         .map_err(|_| cuda_alloc_failed("la boundary qkv", vec![chunk_rows, qkv_dim]))?;
-    let mut raw_chunk = backend
-        .stream
-        .alloc_zeros::<u16>(chunk_rows * p.num_value_heads * p.value_dim)
+    let mut raw_chunk = alloc_zeros_retry::<u16>(backend, chunk_rows * p.num_value_heads * p.value_dim)
         .map_err(|_| {
             cuda_alloc_failed(
                 "la boundary raw",
                 vec![chunk_rows, p.num_value_heads, p.value_dim],
             )
         })?;
-    let mut state = backend
-        .stream
-        .alloc_zeros::<f32>(state_len)
+    let mut state = alloc_zeros_retry::<f32>(backend, state_len)
         .map_err(|_| cuda_alloc_failed("la boundary state", vec![state_len]))?;
     if let Some(initial) = carry_state {
         backend
@@ -395,49 +389,27 @@ pub(super) fn cuda_linear_attention_forward_device_row(
     let a_bf16 = backend.local_f32_as_bf16(a_proj, head_len)?;
     let dt_bf16 = backend.local_f32_as_bf16(dt_bias, p.num_value_heads)?;
 
-    let mut preact = backend
-        .stream
-        .alloc_zeros::<f32>(qkv_len)
+    let mut preact = alloc_zeros_retry::<f32>(backend, qkv_len)
         .map_err(|e| cuda_alloc_failed_rich(backend, "la preact", qkv_len * 4, &e))?;
-    let mut qkv_conv = backend
-        .stream
-        .alloc_zeros::<u16>(qkv_len)
+    let mut qkv_conv = alloc_zeros_retry::<u16>(backend, qkv_len)
         .map_err(|e| cuda_alloc_failed_rich(backend, "la qkv_conv", qkv_len * 2, &e))?;
-    let mut q = backend
-        .stream
-        .alloc_zeros::<u16>(q_len)
+    let mut q = alloc_zeros_retry::<u16>(backend, q_len)
         .map_err(|e| cuda_alloc_failed_rich(backend, "la q", q_len * 2, &e))?;
-    let mut k = backend
-        .stream
-        .alloc_zeros::<u16>(q_len)
+    let mut k = alloc_zeros_retry::<u16>(backend, q_len)
         .map_err(|e| cuda_alloc_failed_rich(backend, "la k", q_len * 2, &e))?;
-    let mut v = backend
-        .stream
-        .alloc_zeros::<u16>(v_len)
+    let mut v = alloc_zeros_retry::<u16>(backend, v_len)
         .map_err(|e| cuda_alloc_failed_rich(backend, "la v", v_len * 2, &e))?;
-    let mut g = backend
-        .stream
-        .alloc_zeros::<f32>(head_len)
+    let mut g = alloc_zeros_retry::<f32>(backend, head_len)
         .map_err(|e| cuda_alloc_failed_rich(backend, "la g", head_len * 4, &e))?;
-    let mut g_cumsum = backend
-        .stream
-        .alloc_zeros::<f32>(head_len)
+    let mut g_cumsum = alloc_zeros_retry::<f32>(backend, head_len)
         .map_err(|e| cuda_alloc_failed_rich(backend, "la g_cumsum", head_len * 4, &e))?;
-    let mut beta = backend
-        .stream
-        .alloc_zeros::<f32>(head_len)
+    let mut beta = alloc_zeros_retry::<f32>(backend, head_len)
         .map_err(|e| cuda_alloc_failed_rich(backend, "la beta", head_len * 4, &e))?;
-    let mut a_inv = backend
-        .stream
-        .alloc_zeros::<u16>(a_len)
+    let mut a_inv = alloc_zeros_retry::<u16>(backend, a_len)
         .map_err(|e| cuda_alloc_failed_rich(backend, "la a_inv", a_len * 2, &e))?;
-    let mut chunk_state = backend
-        .stream
-        .alloc_zeros::<f32>(chunk_state_len)
+    let mut chunk_state = alloc_zeros_retry::<f32>(backend, chunk_state_len)
         .map_err(|e| cuda_alloc_failed_rich(backend, "la chunk_state", chunk_state_len * 4, &e))?;
-    let mut final_state = backend
-        .stream
-        .alloc_zeros::<f32>(state_len)
+    let mut final_state = alloc_zeros_retry::<f32>(backend, state_len)
         .map_err(|e| cuda_alloc_failed_rich(backend, "la final_state", state_len * 4, &e))?;
     // Seed carry so chunk_state[0] = carry. FlashQLA reads it as h0 directly; the
     // recurrent branch runs final_state → chunk_state[0].
@@ -452,13 +424,9 @@ pub(super) fn cuda_linear_attention_forward_device_row(
             .memcpy_dtod(state, dst)
             .map_err(|_| AutogradError::TapeInvariant("cuda D2D copy failed (la carry seed)"))?;
     }
-    let mut raw_output = backend
-        .stream
-        .alloc_zeros::<u16>(v_len)
+    let mut raw_output = alloc_zeros_retry::<u16>(backend, v_len)
         .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (la raw_output)"))?;
-    let mut output = backend
-        .stream
-        .alloc_zeros::<f32>(z_len)
+    let mut output = alloc_zeros_retry::<f32>(backend, z_len)
         .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (la output)"))?;
 
     let seq_len_i32 = i32::try_from(p.seq_len)

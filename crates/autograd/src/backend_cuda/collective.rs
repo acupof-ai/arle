@@ -17,9 +17,7 @@ pub(super) fn cuda_all_reduce_sum_device(
             size: len,
         });
     }
-    let mut out = backend
-        .stream
-        .alloc_zeros::<f32>(len)
+    let mut out = alloc_zeros_retry::<f32>(backend, len)
         .map_err(|_| AutogradError::TapeInvariant("cuda all_reduce alloc failed"))?;
     backend
         .stream
@@ -81,9 +79,7 @@ pub(super) fn cuda_all_gather_seq_device(
     #[cfg(all(feature = "nccl", not(feature = "no-cuda")))]
     {
         let full_len = local_len * world;
-        let mut out = backend
-            .stream
-            .alloc_zeros::<f32>(full_len)
+        let mut out = alloc_zeros_retry::<f32>(backend, full_len)
             .map_err(|_| AutogradError::TapeInvariant("cuda all_gather_seq full alloc failed"))?;
         let nccl = backend.comm(axis).expect("world>1 implies nccl present");
         // Scope the device-ptr guards so their SyncOnDrop borrow of `out`
@@ -147,9 +143,7 @@ pub(super) fn cuda_reduce_scatter_sum_device(
                 size: local_len * world,
             });
         }
-        let mut out = backend
-            .stream
-            .alloc_zeros::<f32>(local_len)
+        let mut out = alloc_zeros_retry::<f32>(backend, local_len)
             .map_err(|_| AutogradError::TapeInvariant("cuda reduce_scatter_sum alloc failed"))?;
         let nccl = backend.comm(axis).expect("world>1 implies nccl present");
         // Scope the device-ptr guards so their SyncOnDrop borrow of `out`
@@ -214,9 +208,7 @@ pub(super) fn cuda_ring_send_recv_kv(
         let rank = nccl.rank();
         let next = (rank + 1) % world;
         let prev = (rank + world - 1) % world;
-        let mut out = backend
-            .stream
-            .alloc_zeros::<f32>(len)
+        let mut out = alloc_zeros_retry::<f32>(backend, len)
             .map_err(|_| AutogradError::TapeInvariant("cuda ring_send_recv_kv alloc failed"))?;
         {
             let (src_ptr, _src_guard) = src.device_ptr(&backend.stream);
@@ -312,7 +304,7 @@ pub(super) fn cuda_all_to_all_device(
         for (j, slot) in recv.iter_mut().enumerate() {
             if j != rank {
                 *slot =
-                    Some(backend.stream.alloc_zeros::<f32>(chunk_len).map_err(|_| {
+                    Some(alloc_zeros_retry::<f32>(backend, chunk_len).map_err(|_| {
                         AutogradError::TapeInvariant("all_to_all recv alloc failed")
                     })?);
             }

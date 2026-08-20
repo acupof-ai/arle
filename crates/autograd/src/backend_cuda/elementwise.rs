@@ -22,7 +22,7 @@ pub(super) fn cuda_mul_scalar_backward_device(
         });
     }
 
-    let mut d_out = backend.stream.alloc_zeros::<f32>(size).map_err(|_| {
+    let mut d_out = alloc_zeros_retry::<f32>(backend, size).map_err(|_| {
         AutogradError::TapeInvariant("cuda alloc_zeros failed (mul_scalar_backward_device)")
     })?;
     let n = i32::try_from(size)
@@ -71,7 +71,7 @@ pub(super) fn cuda_mean_backward_device(
     } else {
         1.0 / elem_count as f32
     };
-    let mut d_out = backend.stream.alloc_zeros::<f32>(elem_count).map_err(|_| {
+    let mut d_out = alloc_zeros_retry::<f32>(backend, elem_count).map_err(|_| {
         AutogradError::TapeInvariant("cuda alloc_zeros failed (mean_backward_device)")
     })?;
     let n = i32::try_from(elem_count)
@@ -151,9 +151,7 @@ pub(super) fn cuda_add_into_device(
                 size,
             });
         }
-        let mut d_out = backend
-            .stream
-            .alloc_zeros::<u16>(size)
+        let mut d_out = alloc_zeros_retry::<u16>(backend, size)
             .map_err(|e| cuda_alloc_failed_rich(backend, "add_into_device", size * 2, &e))?;
         let n = size as u64;
         let func = backend
@@ -176,9 +174,7 @@ pub(super) fn cuda_add_into_device(
         });
     }
 
-    let mut d_out = backend
-        .stream
-        .alloc_zeros::<f32>(size)
+    let mut d_out = alloc_zeros_retry::<f32>(backend, size)
         .map_err(|e| cuda_alloc_failed_rich(backend, "add_into_device", size * 4, &e))?;
     let n = size as u64;
     launch_1d(
@@ -258,9 +254,7 @@ pub(super) fn cuda_unary_1d(
         .stream
         .clone_htod(a)
         .map_err(|_| AutogradError::TapeInvariant("cuda htod copy failed"))?;
-    let mut d_out = backend
-        .stream
-        .alloc_zeros::<f32>(n_usize)
+    let mut d_out = alloc_zeros_retry::<f32>(backend, n_usize)
         .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed"))?;
     let n = n_usize as u64;
     launch_1d(
@@ -287,9 +281,7 @@ pub(super) fn cuda_scalar_1d(
         .stream
         .clone_htod(a)
         .map_err(|_| AutogradError::TapeInvariant("cuda htod copy failed"))?;
-    let mut d_out = backend
-        .stream
-        .alloc_zeros::<f32>(n_usize)
+    let mut d_out = alloc_zeros_retry::<f32>(backend, n_usize)
         .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed"))?;
     let n = n_usize as u64;
     launch_1d(
@@ -326,9 +318,7 @@ pub(super) fn cuda_binary_1d(
         .stream
         .clone_htod(b)
         .map_err(|_| AutogradError::TapeInvariant("cuda htod copy failed"))?;
-    let mut d_out = backend
-        .stream
-        .alloc_zeros::<f32>(n_usize)
+    let mut d_out = alloc_zeros_retry::<f32>(backend, n_usize)
         .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed"))?;
     let n = n_usize as u64;
     launch_1d(
@@ -362,9 +352,7 @@ pub(super) fn cuda_unary_1d_device(
                 size,
             });
         }
-        let mut d_out = backend
-            .stream
-            .alloc_zeros::<u16>(size)
+        let mut d_out = alloc_zeros_retry::<u16>(backend, size)
             .map_err(|e| cuda_alloc_failed_rich(backend, op_label, size * 2, &e))?;
         let n = size as u64;
         let func = backend.kernels.function_for(kernel_name, TapeDtype::Bf16)?;
@@ -382,9 +370,7 @@ pub(super) fn cuda_unary_1d_device(
             size,
         });
     }
-    let mut d_out = backend
-        .stream
-        .alloc_zeros::<f32>(size)
+    let mut d_out = alloc_zeros_retry::<f32>(backend, size)
         .map_err(|e| cuda_alloc_failed_rich(backend, op_label, size * 4, &e))?;
     let n = size as u64;
     launch_1d(
@@ -419,9 +405,7 @@ pub(super) fn cuda_scalar_1d_device(
                 size,
             });
         }
-        let mut d_out = backend
-            .stream
-            .alloc_zeros::<u16>(size)
+        let mut d_out = alloc_zeros_retry::<u16>(backend, size)
             .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed"))?;
         let n = size as u64;
         let func = backend.kernels.function_for(kernel_name, TapeDtype::Bf16)?;
@@ -439,9 +423,7 @@ pub(super) fn cuda_scalar_1d_device(
             size,
         });
     }
-    let mut d_out = backend
-        .stream
-        .alloc_zeros::<f32>(size)
+    let mut d_out = alloc_zeros_retry::<f32>(backend, size)
         .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed"))?;
     let n = size as u64;
     launch_1d(
@@ -478,9 +460,7 @@ pub(super) fn cuda_binary_1d_device(
                 size,
             });
         }
-        let mut d_out = backend
-            .stream
-            .alloc_zeros::<u16>(size)
+        let mut d_out = alloc_zeros_retry::<u16>(backend, size)
             .map_err(|e| cuda_alloc_failed_rich(backend, op_label, size * 2, &e))?;
         let n = size as u64;
         let func = backend.kernels.function_for(kernel_name, TapeDtype::Bf16)?;
@@ -501,9 +481,7 @@ pub(super) fn cuda_binary_1d_device(
             size,
         });
     }
-    let mut d_out = backend
-        .stream
-        .alloc_zeros::<f32>(size)
+    let mut d_out = alloc_zeros_retry::<f32>(backend, size)
         .map_err(|e| cuda_alloc_failed_rich(backend, op_label, size * 4, &e))?;
     let n = size as u64;
     launch_1d(
@@ -542,9 +520,7 @@ pub(super) fn cuda_elementwise_backward_with_saved(
                 size,
             });
         }
-        let mut d_out = backend
-            .stream
-            .alloc_zeros::<u16>(size)
+        let mut d_out = alloc_zeros_retry::<u16>(backend, size)
             .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed"))?;
         let n = size as u64;
         let func = backend.kernels.function_for(kernel_name, TapeDtype::Bf16)?;
@@ -563,9 +539,7 @@ pub(super) fn cuda_elementwise_backward_with_saved(
             size,
         });
     }
-    let mut d_out = backend
-        .stream
-        .alloc_zeros::<f32>(size)
+    let mut d_out = alloc_zeros_retry::<f32>(backend, size)
         .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed"))?;
     let n = size as u64;
     launch_1d(
@@ -695,7 +669,7 @@ pub(super) fn cuda_mul_backward_device(
     let n = size as u64;
 
     let grad_a = if need_grad_a {
-        let mut d_out = backend.stream.alloc_zeros::<f32>(size).map_err(|_| {
+        let mut d_out = alloc_zeros_retry::<f32>(backend, size).map_err(|_| {
             AutogradError::TapeInvariant("cuda alloc_zeros failed (mul_backward grad_a)")
         })?;
         launch_1d(
@@ -712,7 +686,7 @@ pub(super) fn cuda_mul_backward_device(
         None
     };
     let grad_b = if need_grad_b {
-        let mut d_out = backend.stream.alloc_zeros::<f32>(size).map_err(|_| {
+        let mut d_out = alloc_zeros_retry::<f32>(backend, size).map_err(|_| {
             AutogradError::TapeInvariant("cuda alloc_zeros failed (mul_backward grad_b)")
         })?;
         launch_1d(

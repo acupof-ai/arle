@@ -170,9 +170,7 @@ pub(super) fn cuda_sum_squares(
 
     const BLOCK: u32 = 256;
     let blocks = size.div_ceil(BLOCK as usize);
-    let mut d_partial = backend
-        .stream
-        .alloc_zeros::<f64>(blocks)
+    let mut d_partial = alloc_zeros_retry::<f64>(backend, blocks)
         .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (sum_squares)"))?;
     let n_i32 = i32::try_from(size)
         .map_err(|_| AutogradError::TapeInvariant("cuda sum_squares size exceeds i32"))?;
@@ -276,9 +274,7 @@ pub(super) fn cuda_clip_grad_norm_device(
         .stream
         .clone_htod(&chunk_offsets)
         .map_err(|_| AutogradError::TapeInvariant("cuda htod copy failed (grad_clip offsets)"))?;
-    let mut d_partial = backend
-        .stream
-        .alloc_zeros::<f64>(total_chunks)
+    let mut d_partial = alloc_zeros_retry::<f64>(backend, total_chunks)
         .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (grad_clip partial)"))?;
     let num_grads_i32 = i32::try_from(grads.len())
         .map_err(|_| AutogradError::TapeInvariant("cuda grad_clip grad count exceeds i32"))?;
