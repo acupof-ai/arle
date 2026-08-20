@@ -440,27 +440,6 @@ mod real {
         let first_div = |a: &[u32], b: &[u32]| -> Option<usize> {
             a.iter().zip(b.iter()).position(|(x, y)| x != y)
         };
-        let ref_tokens = run_slot_sequence(exec, &mut kv, 0, prompt, validate_new)
-            .context("DSv4 batch decode single-row reference failed")?;
-        // NOISE FLOOR: re-run the SAME c=1 reference. If DSv4's MoE atomic-scatter /
-        // all-reduce float order is non-deterministic, even c=1 self-diverges run to
-        // run — which proves byte-parity-vs-reference is an invalid gate (the batched
-        // per-row drift is the same phenomenon, not a logic bug).
-        let ref_tokens2 = run_slot_sequence(exec, &mut kv, 0, prompt, validate_new)
-            .context("DSv4 batch decode single-row reference rerun failed")?;
-        let ref_self_div = first_div(&ref_tokens, &ref_tokens2);
-
-        if rank == 0 {
-            println!(
-                "batch_decode_reference batch=1 max_new={} clean_tokens={ref_tokens:?} load_ms={load_ms:.3}",
-                validate_new
-            );
-            println!(
-                "batch_decode_reference_rerun clean_tokens={ref_tokens2:?} ref_self_parity={} ref_self_first_div={ref_self_div:?}",
-                ref_self_div.is_none()
-            );
-        }
-
         // Byte-parity is enforced only when explicitly requested. Default is
         // report-only: batched decode is CORRECT when each row is a coherent
         // continuation, not when it is bit-identical to a c=1 run (legitimate
@@ -471,56 +450,88 @@ mod real {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
-        for &batch in batch_sizes {
-            let (rows, decode_ms) = run_batch_sequence(exec, &mut kv, batch, prompt, validate_new)
-                .with_context(|| {
-                    format!("DSv4 batch decode validation failed for batch={batch}")
-                })?;
-            let parity = rows.iter().all(|tokens| tokens == &ref_tokens);
-            let decode_steps = validate_new.saturating_sub(1);
-            let total_tokens = decode_steps * batch;
-            let tok_s = if decode_ms > 0.0 {
-                (total_tokens as f64) / (decode_ms / 1000.0)
-            } else {
-                0.0
-            };
-            let ms_per_step = if decode_steps > 0 {
-                decode_ms / decode_steps as f64
-            } else {
-                0.0
-            };
+        // Clamped: a 0 would run no trial and exit 0, reporting a pass nothing checked.
+        let trials: usize = std::env::var("INFER_DSV4_BATCH_VALIDATE_TRIALS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1)
+            .max(1);
+        for trial in 0..trials {
             if rank == 0 {
-                println!("batch_decode_validate batch={batch} byte_parity={parity}");
-                println!(
-                    "  batch_decode_perf batch={batch} decode_steps={decode_steps} decode_ms={decode_ms:.3} ms_per_step={ms_per_step:.3} tok_s={tok_s:.3}"
-                );
-                for (idx, tokens) in rows.iter().enumerate() {
-                    let div = first_div(&ref_tokens, tokens);
-                    println!("  row{idx}_first_div_vs_ref={div:?} clean_tokens={tokens:?}");
-                }
+                println!("batch_decode_trial trial={trial}");
             }
-            // CORRECTNESS GATE (determined-answer / needle): with a prompt whose
-            // answer is determined, every batched row must retrieve the SAME answer
-            // the verified-correct c=1 reference does, over the first
-            // INFER_DSV4_BATCH_MATCH_PREFIX tokens. Tail divergence past that is
-            // legitimate batched-reduction numerics (see the wins derivation entry),
-            // NOT a bug — so this, not byte-parity, is the real gate.
-            if match_prefix > 0 {
-                for (idx, tokens) in rows.iter().enumerate() {
-                    let k = match_prefix.min(ref_tokens.len()).min(tokens.len());
+            let ref_tokens = run_slot_sequence(exec, &mut kv, 0, prompt, validate_new)
+                .context("DSv4 batch decode single-row reference failed")?;
+            // NOISE FLOOR: re-run the SAME c=1 reference. If DSv4's MoE atomic-scatter /
+            // all-reduce float order is non-deterministic, even c=1 self-diverges run to
+            // run — which proves byte-parity-vs-reference is an invalid gate (the batched
+            // per-row drift is the same phenomenon, not a logic bug).
+            let ref_tokens2 = run_slot_sequence(exec, &mut kv, 0, prompt, validate_new)
+                .context("DSv4 batch decode single-row reference rerun failed")?;
+            let ref_self_div = first_div(&ref_tokens, &ref_tokens2);
+
+            if rank == 0 {
+                println!(
+                    "batch_decode_reference batch=1 max_new={} clean_tokens={ref_tokens:?} load_ms={load_ms:.3}",
+                    validate_new
+                );
+                println!(
+                    "batch_decode_reference_rerun clean_tokens={ref_tokens2:?} ref_self_parity={} ref_self_first_div={ref_self_div:?}",
+                    ref_self_div.is_none()
+                );
+            }
+
+            for &batch in batch_sizes {
+                let (rows, decode_ms) =
+                    run_batch_sequence(exec, &mut kv, batch, prompt, validate_new).with_context(
+                        || format!("DSv4 batch decode validation failed for batch={batch}"),
+                    )?;
+                let parity = rows.iter().all(|tokens| tokens == &ref_tokens);
+                let decode_steps = validate_new.saturating_sub(1);
+                let total_tokens = decode_steps * batch;
+                let tok_s = if decode_ms > 0.0 {
+                    (total_tokens as f64) / (decode_ms / 1000.0)
+                } else {
+                    0.0
+                };
+                let ms_per_step = if decode_steps > 0 {
+                    decode_ms / decode_steps as f64
+                } else {
+                    0.0
+                };
+                if rank == 0 {
+                    println!("batch_decode_validate batch={batch} byte_parity={parity}");
+                    println!(
+                        "  batch_decode_perf batch={batch} decode_steps={decode_steps} decode_ms={decode_ms:.3} ms_per_step={ms_per_step:.3} tok_s={tok_s:.3}"
+                    );
+                    for (idx, tokens) in rows.iter().enumerate() {
+                        let div = first_div(&ref_tokens, tokens);
+                        println!("  row{idx}_first_div_vs_ref={div:?} clean_tokens={tokens:?}");
+                    }
+                }
+                // CORRECTNESS GATE (determined-answer / needle): with a prompt whose
+                // answer is determined, every batched row must retrieve the SAME answer
+                // the verified-correct c=1 reference does, over the first
+                // INFER_DSV4_BATCH_MATCH_PREFIX tokens. Tail divergence past that is
+                // legitimate batched-reduction numerics (see the wins derivation entry),
+                // NOT a bug — so this, not byte-parity, is the real gate.
+                if match_prefix > 0 {
+                    for (idx, tokens) in rows.iter().enumerate() {
+                        let k = match_prefix.min(ref_tokens.len()).min(tokens.len());
+                        anyhow::ensure!(
+                            tokens[..k] == ref_tokens[..k],
+                            "DSv4 batched row {idx} (batch={batch}) diverged inside the determined answer (first {k}): {:?} vs ref {:?}",
+                            &tokens[..k],
+                            &ref_tokens[..k]
+                        );
+                    }
+                }
+                if strict {
                     anyhow::ensure!(
-                        tokens[..k] == ref_tokens[..k],
-                        "DSv4 batched row {idx} (batch={batch}) diverged inside the determined answer (first {k}): {:?} vs ref {:?}",
-                        &tokens[..k],
-                        &ref_tokens[..k]
+                        parity,
+                        "DSv4 batch decode byte parity failed for batch={batch}"
                     );
                 }
-            }
-            if strict {
-                anyhow::ensure!(
-                    parity,
-                    "DSv4 batch decode byte parity failed for batch={batch}"
-                );
             }
         }
         Ok(())

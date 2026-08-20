@@ -1,5 +1,13 @@
 # DSv4 concurrent-decode digit corruption — FlashMLA-lane AND KV-reuse hypotheses KILLED
 
+> **RESOLVED (2026-08-20): cannot reproduce.** 40 trials of `dsv4_parity`
+> batch-decode validation (20 needle-prompt + 20 repeated-pattern, batch=8,
+> TP=4, `DeepSeek-V4-Flash-0731`) produced 0 failures — at the documented
+> ~17-28% failure rate, P(0 in 40) ≈ 0.06%. The model experts are NVFP4
+> (`expert_dtype: "fp4"`); the FP8 MoE kernel suspected below was replaced by
+> the W4AFP8/NVFP4 path (`b87584fa6`, `1065bc4c3`, `60c1a7f65`). Issue #229
+> closed. The full investigation record below is retained for reference.
+
 ## Context
 
 Discovered incidentally while pod-verifying two unrelated DSv4 decode levers
