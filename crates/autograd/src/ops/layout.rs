@@ -185,6 +185,109 @@ fn transpose_host_eager(
     Ok(output_id)
 }
 
+/// Reorder whole seq blocks: output block `i` is input block `perm[i]`.
+///
+/// The zigzag CP shards arrive from the all-to-all interleaved by rank while the
+/// sequential scan needs true global order. Expressed as slice+cat this cost one
+/// tensor per block in the forward and a full-input zero buffer per block in the
+/// backward; as one op it is a block copy each way.
+pub fn permute_seq_blocks(
+    x: TensorId,
+    perm: &[usize],
+    store: &mut TensorStore,
+    tape: &mut Tape,
+) -> Result<TensorId> {
+    let shape = store.tensor(x)?.shape.clone();
+    if shape.len() != 3 {
+        return Err(AutogradError::InvalidRank {
+            expected: "3",
+            got: shape.len(),
+        });
+    }
+    let (batch, full_seq, dim) = (shape[0], shape[1], shape[2]);
+    let num_blocks = perm.len();
+    if num_blocks == 0 || !full_seq.is_multiple_of(num_blocks) {
+        return Err(AutogradError::TapeInvariant(
+            "permute_seq_blocks: sequence is not a whole number of blocks",
+        ));
+    }
+    let block_rows = full_seq / num_blocks;
+    let out_id = permute_blocks_into(x, perm, batch, num_blocks, block_rows * dim, &shape, store)?;
+    TapeEntry {
+        op: BackwardOp::PermuteSeqBlocks,
+        output_id: out_id,
+        input_ids: smallvec![x],
+        saved: SavedContext::PermuteSeqBlocksCtx {
+            perm: perm.to_vec(),
+            block_rows,
+        },
+    }
+    .record(store, tape)?;
+    Ok(out_id)
+}
+
+fn permute_blocks_into(
+    x: TensorId,
+    perm: &[usize],
+    batch: usize,
+    num_blocks: usize,
+    block_elems: usize,
+    shape: &[usize],
+    store: &mut TensorStore,
+) -> Result<TensorId> {
+    store.ensure_device(x)?;
+    let handle = store
+        .tensor(x)?
+        .device_handle
+        .clone()
+        .ok_or(AutogradError::TapeInvariant(
+            "permute_seq_blocks: input has no device handle",
+        ))?;
+    let out =
+        store
+            .backend()
+            .permute_seq_blocks_device(&handle, batch, num_blocks, block_elems, perm)?;
+    store.alloc_device_tensor(shape.to_vec(), out)
+}
+
+/// Forward sent block `perm[i]` to slot `i`, so the grad of block `j` sits at the
+/// slot `perm` mapped it to — the inverse permutation, same block copy.
+pub fn permute_seq_blocks_backward(
+    entry: &TapeEntry,
+    output_grad_id: TensorId,
+    store: &mut TensorStore,
+) -> Result<GradPairs> {
+    let x = *entry.input_ids.first().ok_or(AutogradError::TapeInvariant(
+        "permute_seq_blocks backward missing input",
+    ))?;
+    if !store.tensor(x)?.requires_grad {
+        return Ok(GradPairs::new());
+    }
+    let SavedContext::PermuteSeqBlocksCtx { perm, block_rows } = &entry.saved else {
+        return Err(AutogradError::TapeInvariant(
+            "permute_seq_blocks backward missing ctx",
+        ));
+    };
+    let (perm, block_rows) = (perm.clone(), *block_rows);
+    let shape = store.tensor(output_grad_id)?.shape.clone();
+    let (batch, dim) = (shape[0], shape[2]);
+    let mut inv = vec![0usize; perm.len()];
+    for (i, &from) in perm.iter().enumerate() {
+        inv[from] = i;
+    }
+    let grad = permute_blocks_into(
+        output_grad_id,
+        &inv,
+        batch,
+        perm.len(),
+        block_rows * dim,
+        &shape,
+        store,
+    )?;
+    let mut pairs = GradPairs::new();
+    pairs.push((x, grad));
+    Ok(pairs)
+}
 pub fn slice(
     x: TensorId,
     starts: &[usize],

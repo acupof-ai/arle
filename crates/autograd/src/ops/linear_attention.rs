@@ -437,10 +437,10 @@ pub fn linear_attention_core_cp(
 
     // a2a leaves the seq blocks interleaved; the recurrence needs true global order.
     let (fwd, phys) = zigzag_block_perms(n);
-    let qkv = reorder_seq_blocks(qkv, &fwd, store, tape)?;
-    let z = reorder_seq_blocks(z, &fwd, store, tape)?;
-    let b_proj = reorder_seq_blocks(b_proj, &fwd, store, tape)?;
-    let a_proj = reorder_seq_blocks(a_proj, &fwd, store, tape)?;
+    let qkv = crate::ops::permute_seq_blocks(qkv, &fwd, store, tape)?;
+    let z = crate::ops::permute_seq_blocks(z, &fwd, store, tape)?;
+    let b_proj = crate::ops::permute_seq_blocks(b_proj, &fwd, store, tape)?;
+    let a_proj = crate::ops::permute_seq_blocks(a_proj, &fwd, store, tape)?;
 
     // Frozen weights sliced to this rank's head range. conv1d packs [q|k|v] on the
     // channel axis (same region surgery); dt_bias/a_log are per-value-head; norm is
@@ -494,7 +494,7 @@ pub fn linear_attention_core_cp(
         tape,
     )?;
     // Global order -> a2a physical layout, then restore the [b, local_seq, v_dim] shard.
-    let out = reorder_seq_blocks(out, &phys, store, tape)?;
+    let out = crate::ops::permute_seq_blocks(out, &phys, store, tape)?;
     crate::ops::all_to_all(out, 2, 1, store, tape)
 }
 
@@ -513,30 +513,6 @@ fn zigzag_block_perms(n: usize) -> (Vec<usize>, Vec<usize>) {
         phys[p] = g;
     }
     (fwd, phys)
-}
-
-/// Permute `x`'s seq axis by blocks: output block `i` = input block `perm[i]`.
-/// Pure slice+cat, so backward reassembles the gradient blocks for free.
-fn reorder_seq_blocks(
-    x: TensorId,
-    perm: &[usize],
-    store: &mut TensorStore,
-    tape: &mut Tape,
-) -> Result<TensorId> {
-    let shape = store.tensor(x)?.shape.clone();
-    let (full_seq, block) = (shape[1], shape[1] / perm.len());
-    let mut blocks = Vec::with_capacity(perm.len());
-    for &src in perm {
-        blocks.push(crate::ops::slice(
-            x,
-            &[0, src * block, 0],
-            &[shape[0], (src + 1) * block, shape[2]],
-            store,
-            tape,
-        )?);
-    }
-    debug_assert_eq!(full_seq, perm.len() * block);
-    crate::ops::cat(&blocks, 1, store, tape)
 }
 
 /// Slice the packed `[qkv_dim, conv_kernel]` conv weight to this cp rank's head

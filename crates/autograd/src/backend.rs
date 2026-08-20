@@ -2318,6 +2318,37 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         self.upload(&grad, input_shape)
     }
 
+    /// Reorder whole seq blocks: destination block `i` takes source block
+    /// `perm[i]`. Blocks are contiguous element ranges, so a backend can move
+    /// them without materializing one tensor per block.
+    fn permute_seq_blocks_device(
+        &self,
+        x: &DeviceHandle,
+        batch: usize,
+        num_blocks: usize,
+        block_elems: usize,
+        perm: &[usize],
+    ) -> Result<DeviceHandle> {
+        let src = self.readback(x)?;
+        let total = batch * num_blocks * block_elems;
+        if src.len() != total || perm.len() != num_blocks {
+            return Err(crate::AutogradError::DataLengthMismatch {
+                len: src.len(),
+                shape: vec![batch, num_blocks, block_elems],
+                size: total,
+            });
+        }
+        let mut out = vec![0.0f32; total];
+        for b in 0..batch {
+            for (i, &from) in perm.iter().enumerate() {
+                let d = (b * num_blocks + i) * block_elems;
+                let s = (b * num_blocks + from) * block_elems;
+                out[d..d + block_elems].copy_from_slice(&src[s..s + block_elems]);
+            }
+        }
+        self.upload(&out, &[total])
+    }
+
     fn write_slice_device(
         &self,
         dest: &DeviceHandle,

@@ -118,6 +118,11 @@ pub enum SavedContext {
     CatHeadsCtx {
         head_counts: Vec<usize>,
     },
+    PermuteSeqBlocksCtx {
+        /// Destination block `i` took source block `perm[i]`.
+        perm: Vec<usize>,
+        block_rows: usize,
+    },
     CatSeqCtx {
         seq_counts: Vec<usize>,
     },
@@ -257,6 +262,7 @@ pub enum BackwardOp {
     Reshape,
     BroadcastExpand,
     Slice,
+    PermuteSeqBlocks,
     CatHeads,
     CatSeq,
     Cat,
@@ -304,6 +310,7 @@ impl BackwardOp {
             BackwardOp::Reshape => "Reshape",
             BackwardOp::BroadcastExpand => "BroadcastExpand",
             BackwardOp::Slice => "Slice",
+            BackwardOp::PermuteSeqBlocks => "PermuteSeqBlocks",
             BackwardOp::CatHeads => "CatHeads",
             BackwardOp::CatSeq => "CatSeq",
             BackwardOp::Cat => "Cat",
@@ -786,6 +793,9 @@ impl Tape {
                         ops::broadcast_expand_backward(&entry, output_grad_id, store)?
                     }
                     BackwardOp::Slice => ops::slice_backward(&entry, output_grad_id, store)?,
+                    BackwardOp::PermuteSeqBlocks => {
+                        ops::permute_seq_blocks_backward(&entry, output_grad_id, store)?
+                    }
                     BackwardOp::CatHeads => ops::cat_heads_backward(&entry, output_grad_id, store)?,
                     BackwardOp::CatSeq => ops::cat_seq_backward(&entry, output_grad_id, store)?,
                     BackwardOp::Cat => ops::cat_backward(&entry, output_grad_id, store)?,
