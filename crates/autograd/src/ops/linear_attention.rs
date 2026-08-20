@@ -497,7 +497,7 @@ pub fn linear_attention_core_cp(
         num_value_heads: vh_l,
         ..params
     };
-    let out = linear_attention_core(
+    let out = linear_attention_core_head_chunked(
         qkv,
         z,
         b_proj,
@@ -513,6 +513,132 @@ pub fn linear_attention_core_cp(
     // Global order -> a2a physical layout, then restore the [b, local_seq, v_dim] shard.
     let out = crate::ops::permute_seq_blocks(out, &phys, store, tape)?;
     crate::ops::all_to_all(out, 2, 1, store, tape)
+}
+
+/// Run the full-seq recurrence over sequential value-head groups, each its own
+/// checkpoint sub-scope, so the core's backward transient scales by 1/G. Exact:
+/// the recurrence never crosses value heads — the same independence the CP head
+/// split rests on (proven by the head-split parity test). Falls back to one
+/// call when the head counts do not divide.
+#[allow(clippy::too_many_arguments)]
+pub fn linear_attention_core_head_chunked(
+    qkv: TensorId,
+    z: TensorId,
+    b_proj: TensorId,
+    a_proj: TensorId,
+    conv1d_weight: TensorId,
+    dt_bias: TensorId,
+    a_log: TensorId,
+    norm_weight: TensorId,
+    params: LinearAttentionParams,
+    store: &mut TensorStore,
+    tape: &mut Tape,
+) -> Result<TensorId> {
+    let groups = [4usize, 3, 2]
+        .into_iter()
+        .find(|g| {
+            params.num_key_heads.is_multiple_of(*g) && params.num_value_heads.is_multiple_of(*g)
+        })
+        .unwrap_or(1);
+    if groups == 1 {
+        return linear_attention_core(
+            qkv,
+            z,
+            b_proj,
+            a_proj,
+            conv1d_weight,
+            dt_bias,
+            a_log,
+            norm_weight,
+            params,
+            store,
+            tape,
+        );
+    }
+    let (b, s) = (params.batch, params.seq_len);
+    let (kh, vh, kd, vd) = (
+        params.num_key_heads,
+        params.num_value_heads,
+        params.key_dim,
+        params.value_dim,
+    );
+    let (khg, vhg) = (kh / groups, vh / groups);
+    let (q_dim, k_dim) = (kh * kd, kh * kd);
+    let mut outs = Vec::with_capacity(groups);
+    for g in 0..groups {
+        let q_g = crate::ops::slice(
+            qkv,
+            &[0, 0, g * khg * kd],
+            &[b, s, (g + 1) * khg * kd],
+            store,
+            tape,
+        )?;
+        let k_g = crate::ops::slice(
+            qkv,
+            &[0, 0, q_dim + g * khg * kd],
+            &[b, s, q_dim + (g + 1) * khg * kd],
+            store,
+            tape,
+        )?;
+        let v_g = crate::ops::slice(
+            qkv,
+            &[0, 0, q_dim + k_dim + g * vhg * vd],
+            &[b, s, q_dim + k_dim + (g + 1) * vhg * vd],
+            store,
+            tape,
+        )?;
+        let qkv_g = crate::ops::cat(&[q_g, k_g, v_g], 2, store, tape)?;
+        for dead in [q_g, k_g, v_g] {
+            store.drop_device_residency(dead)?;
+        }
+        let z_g = crate::ops::slice(
+            z,
+            &[0, 0, g * vhg * vd],
+            &[b, s, (g + 1) * vhg * vd],
+            store,
+            tape,
+        )?;
+        let b_g = crate::ops::slice(
+            b_proj,
+            &[0, 0, g * vhg],
+            &[b, s, (g + 1) * vhg],
+            store,
+            tape,
+        )?;
+        let a_g = crate::ops::slice(
+            a_proj,
+            &[0, 0, g * vhg],
+            &[b, s, (g + 1) * vhg],
+            store,
+            tape,
+        )?;
+        let conv_g =
+            slice_conv_weight_to_head(conv1d_weight, kh, vh, kd, vd, g, groups, store, tape)?;
+        let dt_g = crate::ops::slice(dt_bias, &[g * vhg], &[(g + 1) * vhg], store, tape)?;
+        let alog_g = crate::ops::slice(a_log, &[g * vhg], &[(g + 1) * vhg], store, tape)?;
+        let gp = LinearAttentionParams {
+            num_key_heads: khg,
+            num_value_heads: vhg,
+            ..params
+        };
+        let out = crate::ops::checkpoint(
+            vec![qkv_g, z_g, b_g, a_g, conv_g, dt_g, alog_g, norm_weight],
+            store,
+            tape,
+            move |st, tp, inp| {
+                let [qkv, z, b_proj, a_proj, conv, dt, alog, norm] = inp else {
+                    return Err(AutogradError::TapeInvariant(
+                        "head-group core checkpoint expects 8 saved inputs",
+                    ));
+                };
+                linear_attention_core(
+                    *qkv, *z, *b_proj, *a_proj, *conv, *dt, *alog, *norm, gp, st, tp,
+                )
+            },
+        )?;
+        outs.push(out);
+    }
+    crate::ops::cat(&outs, 2, store, tape)
 }
 
 /// `(fwd, phys)` for the `2N`-block seq permutation. Zigzag gives rank `r` global

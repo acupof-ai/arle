@@ -454,8 +454,9 @@ pub fn matmul_bt_with_site(
 
 pub use linear_attention::{
     LinearAttentionParams, linear_attention_boundary, linear_attention_core_cp,
-    linear_attention_core_with_carry, linear_attention_core_with_carry_taped,
-    linear_attention_ctx_bytes, linear_attention_row_transient_bytes,
+    linear_attention_core_head_chunked, linear_attention_core_with_carry,
+    linear_attention_core_with_carry_taped, linear_attention_ctx_bytes,
+    linear_attention_row_transient_bytes,
 };
 
 pub fn linear_attention_core(
