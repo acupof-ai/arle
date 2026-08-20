@@ -241,6 +241,10 @@ where
             acc.write_rows(start, y, store)?;
             let keep = HashSet::from([acc.id()]);
             store.free_new_except(&live_before, &keep)?;
+            // Freed chunk transients are only reusable once their stream work
+            // has run; without this the pool grows by every chunk's working
+            // set (reserved +33 GB for +7 GB live at 131,072).
+            store.backend().stream_synchronize()?;
         }
         let out = out.ok_or(AutogradError::TapeInvariant(
             "seq-chunked block on empty seq",
