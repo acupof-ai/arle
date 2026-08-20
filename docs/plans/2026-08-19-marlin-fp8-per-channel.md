@@ -1,6 +1,9 @@
 # Marlin for per-channel FP8 — the only lever left on the NVFP4 concurrency gap
 
-> Status: Analysed, entry point written, repack + parity not started
+> Status: **Done and superseded.** The repack shipped (`6f4b413fe`), and per-channel
+> FP8 prefill then moved off Marlin to DeepGEMM entirely
+> ([wins/2026-08-20-nvfp4-widen-to-e4m3-deepgemm-prefill.md](../experience/wins/2026-08-20-nvfp4-widen-to-e4m3-deepgemm-prefill.md)).
+> `Fp4Route` named below no longer exists — NVFP4 has one serving path.
 
 ## Why
 
