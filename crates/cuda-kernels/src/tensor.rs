@@ -449,6 +449,7 @@ impl DeviceContext {
             // and stays there.
             let mut ready = None;
             for (i, e) in pool.iter().enumerate() {
+                // SAFETY: the pooled event handle is valid for this context.
                 match unsafe { cudarc::driver::result::event::query(e.cu_event()) } {
                     Ok(()) => {
                         ready = Some(i);
