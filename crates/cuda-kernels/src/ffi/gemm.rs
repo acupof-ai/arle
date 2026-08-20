@@ -370,34 +370,50 @@ unsafe extern "C" {
     ) -> CUresult;
 
     /// Build the per-128x128-block power of two that
-    /// [`dequantize_fp4_e2m1_group_to_fp8_cuda`] divides out and DeepGEMM takes
+    /// [`dequantize_fp4_marlin_to_fp8_cuda`] divides out and DeepGEMM takes
     /// back as `sfb`. Writes `[ceil(n/128) + 1, ceil(k/128)]` f32 — the extra
     /// row is the one DeepGEMM reads past the last n-block.
-    pub fn fp4_group_scale_block_pow2_cuda(
-        scales: *const u8,
+    ///
+    /// `inv_lift` is `1 / (scale_factor * 128)`, undoing the per-tensor power of
+    /// two `repack_for_marlin_fp4` multiplied into the stored S0E5M3 byte.
+    pub fn fp4_marlin_scale_block_pow2_cuda(
+        marlin_packed: *const u8,
         global_scales: *const f32,
+        inv_lift: f32,
         block_pow2: *mut f32,
         n: i32,
         k: i32,
         group_size: i32,
-        scale_cols: i32,
         stream: CUstream,
     ) -> CUresult;
 
-    /// NVFP4 -> dense E4M3 `[n, k]`, group scale folded and the block power of
-    /// two divided out. The FP8 twin of
+    /// Marlin NVFP4 tiles + their S0E5M3 scale tail -> dense E4M3 `[n, k]`, with
+    /// the block power of two divided out. The FP8 twin of
     /// [`dequantize_fp4_e2m1_group_to_bf16_cuda`]: sm_90 has no FP4 tensor core,
     /// and widening to E4M3 rather than BF16 doubles the GEMM's ceiling.
-    pub fn dequantize_fp4_e2m1_group_to_fp8_cuda(
-        weight: *const u8,
-        scales: *const u8,
+    ///
+    /// Sourced from the repack rather than the checkpoint nibbles so the
+    /// checkpoint's copy can be freed at load; same byte volume either way.
+    pub fn dequantize_fp4_marlin_to_fp8_cuda(
+        marlin_packed: *const u8,
         global_scales: *const f32,
         block_pow2: *const f32,
+        inv_lift: f32,
         output: *mut u8,
         n: i32,
         k: i32,
         group_size: i32,
-        scale_cols: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    /// Marlin per-channel FP8 tiles -> the plain `[n, k]` E4M3 bytes DeepGEMM's
+    /// dense NT entry takes as B. The repack applies no value transform, so the
+    /// output is byte-identical to the checkpoint weight it replaces.
+    pub fn marlin_fp8_to_e4m3_cuda(
+        marlin_packed: *const u8,
+        output: *mut u8,
+        n: i32,
+        k: i32,
         stream: CUstream,
     ) -> CUresult;
 

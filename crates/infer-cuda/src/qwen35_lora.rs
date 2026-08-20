@@ -168,11 +168,22 @@ impl Qwen35Model {
             m: &DeviceMatrix,
             row_offset: usize,
             sub_rows: usize,
-        ) {
+        ) -> Result<()> {
+            // `fp8_block_scaled_ptrs` returns None both for a weight that was
+            // never FP8 (in_proj_a/b are tiny BF16 — skip those) and for one
+            // whose FP8 source the Marlin repack released. Skipping the second
+            // silently drops it from the shared table, and the importer answers
+            // the gap with a private full-size copy instead of an error.
+            ensure!(
+                !m.quant_source_freed(),
+                "layer {layer_idx} {suffix}: base weight was Marlin-repacked and its FP8 source \
+                 released at load, so there is nothing to share. Load without the Marlin repack \
+                 for a frozen-base-sharing engine."
+            );
             let Some((weight_ptr, scale_ptr, rows, cols, block_m, block_k)) =
                 m.fp8_block_scaled_ptrs(ctx)
             else {
-                return;
+                return Ok(());
             };
             debug_assert!(row_offset.is_multiple_of(block_m));
             debug_assert!(row_offset + sub_rows <= rows);
@@ -187,6 +198,7 @@ impl Qwen35Model {
                 block_m,
                 block_k,
             });
+            Ok(())
         }
         let mut out = Vec::new();
         for (layer_idx, layer) in self.layers.iter().enumerate() {
@@ -205,7 +217,7 @@ impl Qwen35Model {
                     m,
                     off,
                     n,
-                );
+                )?;
             }
             if let Some(_mlp) = &layer.mlp {
                 for &proj in &[MlpGate, MlpUp, MlpDown] {
@@ -219,7 +231,7 @@ impl Qwen35Model {
                         m,
                         off,
                         n,
-                    );
+                    )?;
                 }
             }
             if let Some(moe) = &layer.moe {
@@ -233,7 +245,7 @@ impl Qwen35Model {
                         m,
                         0,
                         m.rows,
-                    );
+                    )?;
                 }
                 if !moe.gate.is_empty() {
                     for e in 0..moe.gate.len() {
@@ -251,7 +263,7 @@ impl Qwen35Model {
                                 m,
                                 0,
                                 m.rows,
-                            );
+                            )?;
                         }
                     }
                 } else {

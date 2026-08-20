@@ -366,6 +366,39 @@ extern "C" cudaError_t dequantize_fp4_e2m1_group_to_bf16_cuda(
 // checkpoint already runs with, and it is why this path is gated on the needle
 // ladder rather than argued from the scale algebra.
 
+// ---------------------------------------------------------------------------
+// Marlin-sourced weight materialisation, shared by both DeepGEMM prefill arms.
+//
+// The arms used to contract the pre-repack checkpoint bytes, so those had to
+// stay resident beside the Marlin layout — the same weight stored twice, 10.0
+// GB on Qwen3.8-27B-NVFP4. The repack (gptq_marlin_repack.cuh) is a pure
+// permutation, so reading it back is exact and the source can be freed at load.
+//
+// One Marlin word interleaves several k with two n, so a direct element gather
+// fragments one side of the traffic. Both kernels instead stage a 64n x 128k
+// super-tile (8 Marlin k-tiles) in shared memory and run full 128-B
+// transactions on both sides; the k-tile stride is padded by one word to keep
+// the 8 tiles a thread block reads on distinct banks.
+// ---------------------------------------------------------------------------
+#define MARLIN_MAT_THREADS 256
+#define MARLIN_MAT_KTILES 8
+
+// Marlin's S0E5M3 scale byte is the high half of `f16(v) << 1` (sign always 0).
+__device__ __forceinline__ float marlin_s0e5m3_to_f32(uint8_t bits) {
+    return __half2float(__ushort_as_half((unsigned short)bits << 7));
+}
+
+// Where `repack_for_marlin_fp4` step 2 put the group scale of output row `n`,
+// group `g`: transpose to [K/16, N], an 8x8 transpose inside each 64-run, then
+// [0,2,1,3] inside each 4-run. N % 64 keeps every 64-run inside one group row.
+__device__ __forceinline__ int marlin_fp4_scale_tail(int n, int g, int N) {
+    const int R[4] = {0, 2, 1, 3};
+    const int nn = n & 63;
+    const int x = (nn & 7) * 8 + (nn >> 3);
+    const int f = (x & ~3) + R[x & 3];
+    return (g * (N >> 6) + (n >> 6)) * 64 + f;
+}
+
 // FP4 E2M1's largest magnitude, and E4M3's largest finite value: the block
 // power of two has to map one onto the other.
 #define DSV4_FP4_E2M1_MAX 6.0f
@@ -373,26 +406,26 @@ extern "C" cudaError_t dequantize_fp4_e2m1_group_to_bf16_cuda(
 #define FP4_BLOCK_SCALE_THREADS 256
 
 // One block per 128x128 weight tile: reduce |group_scale| * global over the
-// tile's 128 rows x (128/group_size) scale columns, then round the ratio that
-// would saturate E4M3 up to a power of two. Blocks past the last row of scales
+// tile's 128 rows x (128/16) scale columns, then round the ratio that would
+// saturate E4M3 up to a power of two. Blocks past the last row of scales
 // write 1.0f — DeepGEMM reads one sfb row past the last n-block when
 // BLOCK_K % BLOCK_N != 0, and a finite 1.0f there keeps the masked lanes clean.
-__global__ void fp4_group_scale_block_pow2_kernel(
-    const uint8_t* __restrict__ scales,
+__global__ void fp4_marlin_scale_block_pow2_kernel(
+    const uint8_t* __restrict__ tail,
     const float* __restrict__ global_scales,
+    float inv_lift,
     float* __restrict__ block_pow2,
     int N,
     int scale_cols,
-    int k_blocks,
-    int groups_per_block)
+    int k_blocks)
 {
     __shared__ float red[FP4_BLOCK_SCALE_THREADS];
     const int kb = blockIdx.x;
     const int nb = blockIdx.y;
     const int row0 = nb * 128;
-    const int col0 = kb * groups_per_block;
+    const int col0 = kb * 8;
     const int row_end = min(row0 + 128, N);
-    const int col_end = min(col0 + groups_per_block, scale_cols);
+    const int col_end = min(col0 + 8, scale_cols);
 
     float mx = 0.0f;
     const int span = (col_end > col0) ? (col_end - col0) : 0;
@@ -401,7 +434,7 @@ __global__ void fp4_group_scale_block_pow2_kernel(
         for (long i = threadIdx.x; i < count; i += FP4_BLOCK_SCALE_THREADS) {
             const int r = row0 + (int)(i / span);
             const int c = col0 + (int)(i % span);
-            mx = fmaxf(mx, fabsf(dsv4_decode_fp8_e4m3(scales[(long)r * scale_cols + c])));
+            mx = fmaxf(mx, marlin_s0e5m3_to_f32(tail[marlin_fp4_scale_tail(r, c, N)]));
         }
     }
     red[threadIdx.x] = mx;
@@ -412,7 +445,9 @@ __global__ void fp4_group_scale_block_pow2_kernel(
     }
     if (threadIdx.x != 0) return;
 
-    const float peak = red[0] * DSV4_FP4_E2M1_MAX * fabsf(global_scales[0]);
+    // `inv_lift` undoes the per-tensor power of two the repack multiplied into
+    // the stored scale; exact, so the peak is the one the raw scales gave.
+    const float peak = red[0] * inv_lift * DSV4_FP4_E2M1_MAX * fabsf(global_scales[0]);
     float p = 1.0f;
     if (peak > 0.0f && isfinite(peak)) {
         p = exp2f(ceilf(log2f(peak / DSV4_FP8_E4M3_MAX)));
@@ -422,84 +457,154 @@ __global__ void fp4_group_scale_block_pow2_kernel(
     block_pow2[(long)nb * k_blocks + kb] = p;
 }
 
-extern "C" cudaError_t fp4_group_scale_block_pow2_cuda(
-    const uint8_t* scales,
+extern "C" cudaError_t fp4_marlin_scale_block_pow2_cuda(
+    const uint8_t* marlin_packed,
     const float* global_scales,
+    float inv_lift,
     float* block_pow2,
     int N,
     int K,
     int group_size,
-    int scale_cols,
     cudaStream_t stream)
 {
-    if (N <= 0 || K <= 0 || group_size <= 0 || scale_cols != K / group_size ||
-        K % group_size != 0 || 128 % group_size != 0) {
+    if (N <= 0 || K <= 0 || group_size != 16 || (N & 63) != 0 || (K & 127) != 0) {
         return cudaErrorInvalidValue;
     }
     const int n_blocks = (N + 127) / 128;
-    const int k_blocks = (K + 127) / 128;
+    const int k_blocks = K / 128;
     // The pad row DeepGEMM may read; see the kernel comment.
     const cudaError_t fill = cudaMemsetAsync(
         block_pow2, 0, (size_t)(n_blocks + 1) * k_blocks * sizeof(float), stream);
     if (fill != cudaSuccess) return fill;
-    fp4_group_scale_block_pow2_kernel<<<dim3(k_blocks, n_blocks + 1), FP4_BLOCK_SCALE_THREADS, 0,
+    fp4_marlin_scale_block_pow2_kernel<<<dim3(k_blocks, n_blocks + 1), FP4_BLOCK_SCALE_THREADS, 0,
                                         stream>>>(
-        scales, global_scales, block_pow2, N, scale_cols, k_blocks, 128 / group_size);
+        marlin_packed + (size_t)N * K / 2, global_scales, inv_lift, block_pow2, N, K / 16,
+        k_blocks);
     return cudaGetLastError();
 }
 
-// Packed FP4 E2M1 [N, K/2] x per-group E4M3 scale [N, K/group_size] x one F32
-// global scale, divided by the tile power of two above -> dense E4M3 [N, K].
-__global__ void dequantize_fp4_e2m1_group_to_fp8_kernel(
-    const uint8_t* __restrict__ weight,
-    const uint8_t* __restrict__ scales,
+// Marlin FP4 tiles + their S0E5M3 scale tail x one F32 global scale, divided by
+// the tile power of two above -> dense E4M3 [N, K].
+__global__ void dequantize_fp4_marlin_to_fp8_kernel(
+    const uint32_t* __restrict__ marlin,
+    const uint8_t* __restrict__ tail,
     const float* __restrict__ global_scales,
     const float* __restrict__ block_pow2,
-    __nv_fp8_storage_t* __restrict__ output,
+    float inv_lift,
+    uint8_t* __restrict__ output,
     int N,
     int K,
-    int group_size,
-    int scale_cols,
     int k_blocks)
 {
-    const long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
-    const long total = (long)N * K;
-    if (idx >= total) return;
-    const int row = (int)(idx / K);
-    const int col = (int)(idx % K);
-    const float group =
-        dsv4_decode_fp8_e4m3(scales[(long)row * scale_cols + col / group_size]);
-    // Exact: block_pow2 is a power of two.
-    const float inv_block = 1.0f / block_pow2[(long)(row >> 7) * k_blocks + (col >> 7)];
-    const uint8_t byte = weight[(long)row * (K / 2) + col / 2];
-    const uint8_t nib = (col & 1) ? (byte >> 4) : (byte & 0x0f);
-    const float v = dsv4_decode_fp4_e2m1(nib) * group * global_scales[0] * inv_block;
-    output[idx] = __nv_cvt_float_to_fp8(v, __NV_SATFINITE, __NV_E4M3);
+    __shared__ uint32_t sh[MARLIN_MAT_KTILES * 129];
+    const int n_tiles = N >> 6;
+    const int k_super = blockIdx.x;
+    const int n_tile = blockIdx.y;
+    const int tid = threadIdx.x;
+
+    const int tile0 = (k_super * MARLIN_MAT_KTILES * n_tiles + n_tile) * 128;
+    for (int i = tid; i < MARLIN_MAT_KTILES * 128; i += MARLIN_MAT_THREADS) {
+        sh[(i >> 7) * 129 + (i & 127)] = marlin[tile0 + (i >> 7) * n_tiles * 128 + (i & 127)];
+    }
+    __syncthreads();
+
+    const float gscale = global_scales[0] * inv_lift;
+    // A 64n x 128k super-tile sits inside one 128x128 sfb block, and block_pow2
+    // is a power of two, so this is one exact reciprocal for the whole block.
+    const float inv_block = 1.0f / block_pow2[(long)(n_tile >> 1) * k_blocks + k_super];
+
+    for (int c = tid; c < 64 * MARLIN_MAT_KTILES; c += MARLIN_MAT_THREADS) {
+        const int nn = c >> 3;
+        const int kt = c & (MARLIN_MAT_KTILES - 1);
+        const int n = (n_tile << 6) + nn;
+        const int g = k_super * MARLIN_MAT_KTILES + kt;
+        const int hi = (nn & 15) >> 3;
+        const uint32_t* w = &sh[kt * 129 + (nn & 7) * 16 + (nn >> 4)];
+        const float scale =
+            marlin_s0e5m3_to_f32(tail[marlin_fp4_scale_tail(n, g, N)]) * gscale * inv_block;
+        uint32_t packed[4] = {0, 0, 0, 0};
+        #pragma unroll
+        for (int kk = 0; kk < 16; ++kk) {
+            const int slot = ((kk & 1) << 2) | (hi << 1) | (kk >> 3);
+            const uint32_t word = w[((kk & 7) >> 1) * 4];
+            const float v = dsv4_decode_fp4_e2m1((uint8_t)((word >> (slot * 4)) & 0xf)) * scale;
+            const uint32_t byte = __nv_cvt_float_to_fp8(v, __NV_SATFINITE, __NV_E4M3);
+            packed[kk >> 2] |= byte << ((kk & 3) * 8);
+        }
+        *reinterpret_cast<uint4*>(&output[(long)n * K + (g << 4)]) =
+            make_uint4(packed[0], packed[1], packed[2], packed[3]);
+    }
 }
 
-extern "C" cudaError_t dequantize_fp4_e2m1_group_to_fp8_cuda(
-    const uint8_t* weight,
-    const uint8_t* scales,
+extern "C" cudaError_t dequantize_fp4_marlin_to_fp8_cuda(
+    const uint8_t* marlin_packed,
     const float* global_scales,
     const float* block_pow2,
+    float inv_lift,
     uint8_t* output,
     int N,
     int K,
     int group_size,
-    int scale_cols,
     cudaStream_t stream)
 {
-    if (N <= 0 || K <= 0 || group_size <= 0 || scale_cols <= 0 || (K & 1) != 0 ||
-        K % group_size != 0 || scale_cols != K / group_size || 128 % group_size != 0) {
+    if (N <= 0 || K <= 0 || group_size != 16 || (N & 63) != 0 || (K & 127) != 0) {
         return cudaErrorInvalidValue;
     }
-    const long total = (long)N * K;
-    const int threads = 256;
-    const long blocks = (total + threads - 1) / threads;
-    dequantize_fp4_e2m1_group_to_fp8_kernel<<<(unsigned int)blocks, threads, 0, stream>>>(
-        weight, scales, global_scales, block_pow2,
-        reinterpret_cast<__nv_fp8_storage_t*>(output), N, K, group_size, scale_cols,
-        (K + 127) / 128);
+    dequantize_fp4_marlin_to_fp8_kernel<<<dim3(K / 128, N / 64), MARLIN_MAT_THREADS, 0, stream>>>(
+        reinterpret_cast<const uint32_t*>(marlin_packed), marlin_packed + (size_t)N * K / 2,
+        global_scales, block_pow2, inv_lift, output, N, K, K / 128);
+    return cudaGetLastError();
+}
+
+// Marlin FP8 tiles -> the plain [N, K] E4M3 bytes DeepGEMM's dense NT entry
+// takes as B. The repack applies no value transform, so this reproduces the
+// checkpoint's own bytes; one word holds k {2j, 2j+8, 2j+1, 2j+9} of a single
+// row in bytes {0,1,2,3}, which is why four strided loads make one 16-B store.
+__global__ void marlin_fp8_to_e4m3_kernel(
+    const uint32_t* __restrict__ marlin,
+    uint8_t* __restrict__ output,
+    int N,
+    int K)
+{
+    __shared__ uint32_t sh[MARLIN_MAT_KTILES * 257];
+    const int n_tiles = N >> 6;
+    const int k_super = blockIdx.x;
+    const int n_tile = blockIdx.y;
+    const int tid = threadIdx.x;
+
+    const int tile0 = (k_super * MARLIN_MAT_KTILES * n_tiles + n_tile) * 256;
+    for (int i = tid; i < MARLIN_MAT_KTILES * 256; i += MARLIN_MAT_THREADS) {
+        sh[(i >> 8) * 257 + (i & 255)] = marlin[tile0 + (i >> 8) * n_tiles * 256 + (i & 255)];
+    }
+    __syncthreads();
+
+    for (int c = tid; c < 64 * MARLIN_MAT_KTILES; c += MARLIN_MAT_THREADS) {
+        const int nn = c >> 3;
+        const int kt = c & (MARLIN_MAT_KTILES - 1);
+        const uint32_t* w = &sh[kt * 257 + (nn & 7) * 32 + (nn >> 4) * 2 + ((nn & 15) >> 3)];
+        uint4 v;
+        v.x = __byte_perm(w[0], w[8], 0x6420);
+        v.y = __byte_perm(w[16], w[24], 0x6420);
+        v.z = __byte_perm(w[0], w[8], 0x7531);
+        v.w = __byte_perm(w[16], w[24], 0x7531);
+        const long row = (long)((n_tile << 6) + nn);
+        *reinterpret_cast<uint4*>(
+            &output[row * K + ((k_super * MARLIN_MAT_KTILES + kt) << 4)]) = v;
+    }
+}
+
+extern "C" cudaError_t marlin_fp8_to_e4m3_cuda(
+    const uint8_t* marlin_packed,
+    uint8_t* output,
+    int N,
+    int K,
+    cudaStream_t stream)
+{
+    if (N <= 0 || K <= 0 || (N & 63) != 0 || (K & 127) != 0) {
+        return cudaErrorInvalidValue;
+    }
+    marlin_fp8_to_e4m3_kernel<<<dim3(K / 128, N / 64), MARLIN_MAT_THREADS, 0, stream>>>(
+        reinterpret_cast<const uint32_t*>(marlin_packed), output, N, K);
     return cudaGetLastError();
 }
 

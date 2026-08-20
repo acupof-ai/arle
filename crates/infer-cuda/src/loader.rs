@@ -1683,6 +1683,10 @@ impl SafetensorLoader {
 
     /// Quant-aware twin of [`Self::load_qkv_head_sharded`]. `block_index` has the
     /// same Q-vs-replicated-KV meaning (see that method's docs).
+    ///
+    /// Returns the shard un-repacked: both callers row-fuse it with a same-K
+    /// sibling, and [`DeviceMatrix::fuse_rows`] reads the pre-repack buffers a
+    /// repack releases. They call [`marlin_repack_dense`] on the fused matrix.
     pub(crate) fn load_qkv_head_sharded_quant_aware(
         &self,
         ctx: &DeviceContext,
@@ -1710,7 +1714,7 @@ impl SafetensorLoader {
             view.name,
             offset + local_rows,
         );
-        let matrix = self.load_quant_or_dense_view(
+        self.load_quant_or_dense_view(
             ctx,
             &view,
             QuantMatrixShard::Rows(ShardingSpec {
@@ -1718,8 +1722,7 @@ impl SafetensorLoader {
                 size: local_rows,
                 total: total_rows,
             }),
-        )?;
-        marlin_repack_dense(ctx, name, matrix, true)
+        )
     }
 
     /// Quant-aware twin of the BF16 fused-qkv head shard: shard the F8_E4M3 weight AND
@@ -5726,7 +5729,16 @@ fn validate_expert_projection_dispatch_signature(
 ///
 /// Routed MoE experts must NOT come here: their grouped-GEMM path reads the
 /// packed nibbles the repack replaces.
-fn marlin_repack_dense(
+///
+/// A row-fused matrix repacks once, after the fuse: [`DeviceMatrix::fuse_rows`]
+/// reads the pre-repack buffers, which the repack releases.
+///
+/// `prefill_batched` is the caller's answer to "may a prefill chunk reach this
+/// weight's DeepGEMM arm at all". It gates both formats' prefill arms, not just
+/// NVFP4's `sfb` — the two arms compute at different precisions from the Marlin
+/// arm beside them, so a weight that must not change precision with M says
+/// false and stays on Marlin at every M.
+pub(crate) fn marlin_repack_dense(
     ctx: &DeviceContext,
     name: &str,
     mut matrix: DeviceMatrix,
@@ -5738,21 +5750,17 @@ fn marlin_repack_dense(
     matrix
         .repack_for_marlin_fp8(ctx)
         .with_context(|| format!("Marlin FP8 per-channel repack {name}"))?;
-    // Marlin owns every M for an NVFP4 weight it accepted (`fp4_route`), so
-    // those pre-repack bytes are dead the moment the layout exists — keeping
-    // them stored the model twice and halved the KV pool. Per-channel FP8 is
-    // the exception: DeepGEMM contracts the plain E4M3 bytes at prefill M, but
-    // only for a weight some forward actually multiplies by a prefill chunk.
-    // NVFP4's own prefill arm widens the raw nibbles to E4M3 per call, so it
-    // pins the source the same way, and needs the block `sfb` built while the
-    // group scales are still resident.
+    // Both repacks release the pre-repack bytes themselves: every arm that
+    // reads a repacked weight reads the Marlin layout, DeepGEMM's prefill arms
+    // included. The `sfb` is built from the S0E5M3 scale tail, so it comes
+    // after the repack, not before.
     if prefill_batched && fp4_deepgemm_available(ctx, &matrix) {
         matrix
             .prepare_fp4_deepgemm_sfb(ctx)
             .with_context(|| format!("NVFP4 DeepGEMM sfb {name}"))?;
     }
-    let fp8_deepgemm = prefill_batched && fp8_deepgemm_per_channel_available(ctx, &matrix);
-    matrix.free_quant_source_after_marlin(fp8_deepgemm);
+    matrix.fp8_deepgemm_prefill =
+        prefill_batched && fp8_deepgemm_per_channel_available(ctx, &matrix);
     Ok(matrix)
 }
 

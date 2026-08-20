@@ -160,7 +160,7 @@ below is the one-glance view — for any change, edit
 | Weights — GGUF Q3/Q4/Q5/Q6_K | production (CUDA & Metal) | Packed superblock kernels; `.gguf` auto-detect. Metal-native-q4 opt-in via `AGENT_INFER_METAL_GGUF_NATIVE_Q4=all`. |
 | Weights — TurboQuant | experimental | Tensor-local gate only (`errors/2026-05-21-arle-turboquant-9b-fwht-fixed-logits-kill`). |
 | Weights — DSv4 FP8/FP4 block-scaled | in progress | `Dsv4Fp8BlockScaled` / `Dsv4Fp4BlockScaled`; pending CUDA V4 attention/MoE/MTP kernels. |
-| Weights — NVFP4 (Fp4E2M1Group) | production (CUDA) | compressed-tensors `U8` packed FP4 + FP8 per-group scales + F32 global/input scales; auto-detect. Marlin `kFE2M1f` tensor core at every M once repacked, and the pre-repack bytes are released at load (`free_quant_source_after_marlin`) — keeping them stored the model twice and cost 18.7 GB. Weights the repack declines keep the scalar GEMV and the dequant→BF16→cuBLAS prefill arm. |
+| Weights — NVFP4 (Fp4E2M1Group) | production (CUDA) | compressed-tensors `U8` packed FP4 + FP8 per-group scales + F32 global/input scales; auto-detect. Marlin `kFE2M1f` tensor core at every M once repacked, and `repack_for_marlin_fp4` releases the pre-repack bytes itself — keeping them stored the model twice and cost 18.7 GB. Weights the repack declines keep the scalar GEMV and the dequant→BF16→cuBLAS prefill arm. |
 | Weights — FP8 per-channel (Fp8BlockScaled{1,K}) | production (CUDA) | compressed-tensors `F8_E4M3` + BF16 [N,1] weight_scale; auto-detect as block-scaled with block_m=1. Block-scaled GEMV for decode, dequant→BF16→cuBLAS for prefill. |
 
 Backend reach:

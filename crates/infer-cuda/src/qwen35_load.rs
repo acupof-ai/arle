@@ -469,8 +469,11 @@ impl Qwen35Model {
                                 m.linear_value_head_dim,
                                 attn_cfg.rank,
                             )?;
-                            DeviceMatrix::fuse_rows(&ctx, &qkv, &z)
-                                .map_err(|e| anyhow!("fuse TP in_proj_qkv + in_proj_z: {e}"))?
+                            // Fuse first, repack once: fuse_rows reads the
+                            // pre-repack buffers the Marlin repack releases.
+                            let fused = DeviceMatrix::fuse_rows(&ctx, &qkv, &z)
+                                .map_err(|e| anyhow!("fuse TP in_proj_qkv + in_proj_z: {e}"))?;
+                            marlin_repack_dense(&ctx, &lin.in_proj_qkv, fused, true)?
                         },
                         // b/a are ONE SCALAR PER V HEAD (gated_delta_rule.cu reads
                         // `b_proj[token*Vh + v_head]`) → per-head row count 1;
@@ -991,6 +994,9 @@ fn linear_qkv_head_blocks(m: &Qwen35Config) -> [crate::shard_slice::HeadBlock; 3
     [k_block, k_block, v_block]
 }
 
+/// Returns the shard un-repacked — both callers row-fuse it with `in_proj_z`
+/// and repack the fused matrix, because `fuse_rows` reads the buffers a repack
+/// releases.
 fn load_linear_qkv_sharded(
     loader: &SafetensorLoader,
     ctx: &DeviceContext,
@@ -1012,7 +1018,7 @@ fn load_linear_qkv_sharded(
     // quant view; head-block sharding for TP>1 is not yet implemented for
     // packed quant (falls through to the BF16 path, which errors clearly).
     if tp.world_size == 1 && loader.quant_view_for(name)?.is_some() {
-        return loader.load_dense_matrix_quant_aware(ctx, name);
+        return loader.load_matrix_quant_aware(ctx, name);
     }
     let tensor = loader.load_raw_tensor(name)?;
     ensure!(
@@ -1108,8 +1114,11 @@ fn load_linear_attn_decode(
         m.linear_value_head_dim,
         decode_cfg.rank,
     )?;
+    // Fuse first, repack once: fuse_rows reads the pre-repack buffers the
+    // Marlin repack releases.
     let in_proj_qkvz = DeviceMatrix::fuse_rows(ctx, &qkv, &z)
         .map_err(|e| anyhow!("fuse CP-decode in_proj_qkv + in_proj_z: {e}"))?;
+    let in_proj_qkvz = marlin_repack_dense(ctx, &lin.in_proj_qkv, in_proj_qkvz, true)?;
     let b = loader.load_qkv_head_sharded(ctx, &lin.in_proj_b, decode_lv, 1, decode_cfg.rank)?;
     let a = loader.load_qkv_head_sharded(ctx, &lin.in_proj_a, decode_lv, 1, decode_cfg.rank)?;
     let in_proj_ba = DeviceMatrix::fuse_rows(ctx, &b, &a)?;
