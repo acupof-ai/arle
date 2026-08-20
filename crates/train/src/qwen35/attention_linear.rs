@@ -14,10 +14,12 @@ impl Qwen35Layer {
         store: &mut TensorStore,
         tape: &mut Tape,
     ) -> Result<TensorId> {
-        let qkv = attn.in_proj_qkv.forward(h, store, tape)?;
-        let z = attn.in_proj_z.forward(h, store, tape)?;
-        let b_proj = attn.in_proj_b.forward(h, store, tape)?;
-        let a_proj = attn.in_proj_a.forward(h, store, tape)?;
+        // Projections are position-wise — chunking keeps only the full-seq
+        // output resident instead of every matmul/LoRA intermediate.
+        let qkv = chunked_proj(&attn.in_proj_qkv, h, store, tape)?;
+        let z = chunked_proj(&attn.in_proj_z, h, store, tape)?;
+        let b_proj = chunked_proj(&attn.in_proj_b, h, store, tape)?;
+        let a_proj = chunked_proj(&attn.in_proj_a, h, store, tape)?;
         // CP shards sequence; linear_attention_core_cp all-to-alls it into the head
         // axis and runs the full-seq recurrence on this rank's head slice. cp.size==1
         // is the single-card core verbatim.
@@ -66,7 +68,7 @@ impl Qwen35Layer {
                 )
             },
         )?;
-        Ok(attn.out_proj.forward(linear, store, tape)?)
+        chunked_proj(&attn.out_proj, linear, store, tape)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -227,4 +229,26 @@ impl Qwen35Layer {
         );
         Ok(out)
     }
+}
+
+/// Position-wise projection through `checkpoint_seq_chunked`: backward replays
+/// each chunk, so LoRA/base intermediates never sit resident at full seq.
+fn chunked_proj(
+    proj: &LinearWithLora,
+    x: TensorId,
+    store: &mut TensorStore,
+    tape: &mut Tape,
+) -> Result<TensorId> {
+    let mut param_ids = Vec::new();
+    collect_linear_ids(proj, &mut param_ids);
+    param_ids.retain(|&id| store.get(id).is_some_and(|t| t.requires_grad));
+    let proj = proj.clone();
+    Ok(autograd::ops::checkpoint_seq_chunked(
+        x,
+        param_ids,
+        crate::runtime_flags::OPD_SEQ_CHUNK,
+        store,
+        tape,
+        move |st, tp, _start, inp| proj.forward(inp[0], st, tp),
+    )?)
 }

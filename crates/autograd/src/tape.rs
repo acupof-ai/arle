@@ -198,6 +198,7 @@ pub enum SavedContext {
         batch: usize,
         seq: usize,
         dim: usize,
+        out_dim: usize,
         chunk: usize,
     },
     // Expert-parallel dispatch/combine plan: `src[slot]` is the source token row
@@ -1052,6 +1053,7 @@ impl Tape {
             batch,
             seq,
             dim,
+            out_dim,
             chunk,
         } = entry.saved
         else {
@@ -1099,7 +1101,7 @@ impl Tape {
             let grad_c = ops::slice(
                 output_grad_id,
                 &[0, start, 0],
-                &[batch, end, dim],
+                &[batch, end, out_dim],
                 store,
                 &mut scratch,
             )?;
