@@ -1,7 +1,8 @@
 # NVFP4 prefill on the FP8 tensor cores: widen the nibbles to E4M3 — CUDA, 2026-08-20
 
-> Status: PENDING — mechanism, VRAM and correctness measured; the 32K chain A/B
-> is the open item.
+> Status: Landed as `a5df06c7c` and re-verified on the merged HEAD `834a87aed`.
+> Mechanism, VRAM, engagement and correctness measured. **The 32K chain A/B is
+> still owed** — two attempts were lost to a contended box (see Result).
 
 ## Context
 
@@ -126,7 +127,27 @@ len=32768  exact=3 miss=0 DET
 
 ## Result
 
-PENDING — matched 32K chain A/B, both arms on this binary at 16 slots.
+**Owed: the matched 32K chain A/B.** Two attempts produced no numbers, both from
+box contention rather than from the change:
+
+1. The first run's serve took an external SIGTERM ~134 s after becoming ready.
+   Traced before being attributed: no ERROR and no fatal path in the engine log,
+   and the PID was absent from the cgroup OOM record, so the signal was external
+   (`serve.rs:467` has three sources and the internal one was excluded).
+2. The second run lost `target/release/arle` mid-flight to a concurrent
+   `cargo build` — the first arm kept running from its loaded image while the
+   second died with `nohup: failed to run command`. The binary hash printed at
+   the top of the bench script is what caught it.
+
+Everything else here was re-measured on the merged HEAD and reproduced exactly:
+free VRAM 58,523 MB, `max_total_tokens` 1,302,407, the four counters above, and
+the needle ladder. That the numbers are bit-identical across two binaries is the
+evidence that `834a87aed` (which touches the same `gemv` dispatch) does not
+disturb this path.
+
+Until the chain runs, the prefill claim rests on the kernel probe (265 against
+84 TFLOPS effective) and not on an end-to-end measurement. Do not quote an
+end-to-end delta from this entry.
 
 ## Rule
 
