@@ -184,7 +184,11 @@ impl Dsv4Model {
             }
             _ => None,
         };
-        let probe_positions: Vec<usize> = (0..seq_len).map(|i| start_pos + i).collect();
+        let probe_positions: Vec<usize> = if self.probe.borrow().is_some() {
+            (0..seq_len).map(|i| start_pos + i).collect()
+        } else {
+            Vec::new()
+        };
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             // SAFETY: fused hc_pre+rms_norm / plain rms_norm writes the full
             // [seq_len, hidden_size] buffer.
