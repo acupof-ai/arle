@@ -14,11 +14,23 @@
 //
 // One thread per element (256-wide workgroup); the host dispatches
 // `ceil(n / 256)` workgroups.
+//
+// STRIDED GATE (batched prefill): the gate operand is the odd half of an
+// interleaved `[query|gate]` block, so for a whole prefill chunk it is NOT
+// contiguous with the value operand — `val` is a packed `[T][heads][head_dim]`
+// attention output while the gate lives at `[T][heads][2*head_dim] + head_dim`.
+// `inner` / `gate_stride` / `gate_off` map value element `i` to gate element
+// `(i / inner) * gate_stride + gate_off + (i % inner)`, so the whole chunk gates
+// in ONE dispatch. Decode passes `inner = gate_stride = n, gate_off = 0` (the
+// caller already binds the head's gate sub-range), which reduces to `gate[i]`.
 
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
 layout(push_constant) uniform Params {
     uint n;
+    uint inner;       // value elements per gathered gate row
+    uint gate_stride; // gate elements between consecutive rows
+    uint gate_off;    // gate element offset within a row
 } p;
 
 layout(binding = 0) readonly buffer A {
@@ -38,6 +50,8 @@ void main() {
     if (idx >= p.n) {
         return;
     }
-    const float s = 1.0 / (1.0 + exp(-gate[idx]));
+    const uint row = idx / p.inner;
+    const uint g = row * p.gate_stride + p.gate_off + (idx - row * p.inner);
+    const float s = 1.0 / (1.0 + exp(-gate[g]));
     out_data[idx] = s * val[idx];
 }

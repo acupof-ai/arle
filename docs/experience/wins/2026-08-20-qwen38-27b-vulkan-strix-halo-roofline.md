@@ -99,6 +99,13 @@ Practical cost: every request re-prefills from scratch. A 2000-token multi-turn
 conversation pays 2000 × ~107 ms ≈ 3.5 min of TTFT on each turn.
 
 - Prefill is token-serial, so TTFT scales at the decode rate (~107 ms/token).
+  **Both prefill claims above were superseded on 2026-08-20.** Prefix/KV reuse
+  landed in
+  [vulkan-resident-sequence-prefix-reuse](2026-08-20-vulkan-resident-sequence-prefix-reuse.md)
+  (turn-2 156.5 s → 3.2 s), and prefill is no longer token-serial: a batched
+  chunk GEMM plus a KHR cooperative-matrix kernel took it 3.45 → 37.0 tok/s, so
+  TTFT now runs ~9× ahead of the decode rate — see
+  [vulkan-coopmat-prefill-warptile](2026-08-20-vulkan-coopmat-prefill-warptile.md).
 - `KV_CACHE_MAX_SEQ` is hardcoded 8192 in `forward.rs:162`; the model declares
   262144.
 - The same dropped-`epoch` bug likely sits in `model_qwen36.rs:262`,

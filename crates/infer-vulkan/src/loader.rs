@@ -565,6 +565,86 @@ pub mod upload {
         Ok(ResidentWeights { tensors, embedding })
     }
 
+    /// Minimal synthetic-GGUF writer for the device test below.
+    ///
+    /// This used to live in `infer_gguf::gguf::test_writer`, `pub` purely so
+    /// cross-crate test builds could reach it. `a7c9ee395` ("remove inline unit
+    /// tests") deleted it together with its in-crate callers and missed this
+    /// one, leaving `infer-vulkan`'s whole test target uncompilable. Since this
+    /// is now the only consumer, it lives here under `#[cfg(test)]` instead of
+    /// going back to being a `pub` item in a shipping crate.
+    #[cfg(test)]
+    mod test_writer {
+        /// GGUF's default `general.alignment`; tensor data is padded to it.
+        const ALIGNMENT: usize = 32;
+
+        pub enum V {
+            Str(&'static str),
+        }
+
+        pub struct T {
+            pub name: String,
+            pub dims: Vec<u64>,
+            pub type_id: u32,
+            pub data: Vec<u8>,
+        }
+
+        fn put_str(buf: &mut Vec<u8>, s: &str) {
+            buf.extend_from_slice(&(s.len() as u64).to_le_bytes());
+            buf.extend_from_slice(s.as_bytes());
+        }
+
+        /// GGUF v3: magic, version, tensor count, kv count, the kv block, the
+        /// tensor-info block (each info's `offset` is relative to the start of
+        /// the aligned data section), then the padded data section.
+        pub fn write(kvs: &[(&str, V)], tensors: &[T]) -> Vec<u8> {
+            let mut buf = Vec::new();
+            buf.extend_from_slice(b"GGUF");
+            buf.extend_from_slice(&3u32.to_le_bytes());
+            buf.extend_from_slice(&(tensors.len() as u64).to_le_bytes());
+            buf.extend_from_slice(&(kvs.len() as u64).to_le_bytes());
+            for (key, value) in kvs {
+                put_str(&mut buf, key);
+                match value {
+                    V::Str(v) => {
+                        buf.extend_from_slice(&8u32.to_le_bytes());
+                        put_str(&mut buf, v);
+                    }
+                }
+            }
+            let mut offset = 0usize;
+            for t in tensors {
+                put_str(&mut buf, &t.name);
+                buf.extend_from_slice(&(t.dims.len() as u32).to_le_bytes());
+                for d in &t.dims {
+                    buf.extend_from_slice(&d.to_le_bytes());
+                }
+                buf.extend_from_slice(&t.type_id.to_le_bytes());
+                buf.extend_from_slice(&(offset as u64).to_le_bytes());
+                offset += t.data.len().div_ceil(ALIGNMENT) * ALIGNMENT;
+            }
+            while !buf.len().is_multiple_of(ALIGNMENT) {
+                buf.push(0);
+            }
+            for t in tensors {
+                buf.extend_from_slice(&t.data);
+                while !buf.len().is_multiple_of(ALIGNMENT) {
+                    buf.push(0);
+                }
+            }
+            buf
+        }
+
+        pub fn write_to_temp(kvs: &[(&str, V)], tensors: &[T], tag: &str) -> std::path::PathBuf {
+            let path = std::env::temp_dir().join(format!(
+                "arle-infer-vulkan-{tag}-{}.gguf",
+                std::process::id()
+            ));
+            std::fs::write(&path, write(kvs, tensors)).unwrap();
+            path
+        }
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -597,9 +677,9 @@ pub mod upload {
         #[cfg(feature = "vulkan")]
         #[test]
         fn upload_plan_lands_bytes_on_device() {
+            use super::test_writer::{T, V, write_to_temp};
             use crate::loader::plan_model;
             use infer_gguf::gguf::GgufFile;
-            use infer_gguf::gguf::test_writer::{T, V, write_to_temp};
             use vulkan_sys::VulkanContext;
 
             let ctx = match VulkanContext::create() {
@@ -692,13 +772,17 @@ pub mod upload {
             }
 
             // KeepQuant Q4_K round-trips byte-for-byte (raw quant bytes uploaded).
+            //
+            // Read back STAGED: resident weights live in DEVICE_LOCAL-only
+            // memory, so `copy_to_host` — which maps the buffer itself — fails
+            // with `ERROR_MEMORY_MAP_FAILED` on them.
             let q4 = resident.get("blk.0.ffn_gate_exps.weight").unwrap();
             assert!(matches!(
                 q4.residency,
                 Residency::KeepQuant(infer_gguf::gguf::GgmlType::Q4K)
             ));
             let mut back = vec![0u8; q4.buffer.len()];
-            q4.buffer.copy_to_host(&mut back).expect("D2H Q4_K");
+            q4.buffer.copy_to_host_staged(&mut back).expect("D2H Q4_K");
             assert_eq!(back, q4_k, "Q4_K device round-trip mismatch");
 
             // Q8_0 now stays PACKED (KeepQuant), not dequantized to F16: the raw
@@ -715,7 +799,9 @@ pub mod upload {
                 "Q8_0 kept packed at 34 B (not 64 B F16)"
             );
             let mut q8_back = vec![0u8; q8.buffer.len()];
-            q8.buffer.copy_to_host(&mut q8_back).expect("D2H Q8_0");
+            q8.buffer
+                .copy_to_host_staged(&mut q8_back)
+                .expect("D2H Q8_0");
             assert_eq!(q8_back, q8_0, "Q8_0 device round-trip mismatch");
 
             // Embedding row 0 gathers `hidden` f32 values.

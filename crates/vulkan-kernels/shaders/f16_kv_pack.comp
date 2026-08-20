@@ -15,7 +15,16 @@
 // byte offset, so writing index `i` lands the row at the cached position. The
 // host computes the offset (same math as the prior host pack) and binds the
 // destination there. One f16 row = `head_dim` values; the host dispatches
-// `ceil(n / 256)` workgroups.
+// `ceil(n * rows / 256)` workgroups.
+//
+// STRIDED MULTI-ROW (batched prefill): a prefill chunk's post-rope K lives as
+// `[token][kv_head][head_dim]`, so ONE kv head's `T` rows are strided by
+// `n_kv_heads * head_dim` in the source while they are CONTIGUOUS in the cache
+// plane (`[pos, head_dim]`). `rows` / `src_stride` / `dst_stride` let a single
+// dispatch pack all `T` rows of a head instead of `T` single-row dispatches
+// (at T=64 / 8 kv heads / 16 full layers that would be 16k dispatches a chunk).
+// Decode passes `rows = 1, src_stride = dst_stride = n`, which reduces to the
+// previous single-row contract exactly.
 //
 // Round-to-nearest-even f32->f16 is the hardware `float16_t(float)` cast, which
 // matches the host `f32_to_f16_bits` (RNE) the cache contract was validated
@@ -27,7 +36,10 @@
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
 layout(push_constant) uniform Params {
-    uint n;
+    uint n;          // values per row (head_dim)
+    uint rows;       // rows packed by this dispatch (1 on decode, T on prefill)
+    uint src_stride; // f32 elements between consecutive source rows
+    uint dst_stride; // f16 elements between consecutive destination rows
 } p;
 
 layout(binding = 0) readonly buffer A {
@@ -40,8 +52,10 @@ layout(binding = 1) writeonly buffer D {
 
 void main() {
     const uint idx = gl_GlobalInvocationID.x;
-    if (idx >= p.n) {
+    if (idx >= p.n * p.rows) {
         return;
     }
-    dst[idx] = float16_t(src[idx]);
+    const uint row = idx / p.n;
+    const uint col = idx - row * p.n;
+    dst[row * p.dst_stride + col] = float16_t(src[row * p.src_stride + col]);
 }
