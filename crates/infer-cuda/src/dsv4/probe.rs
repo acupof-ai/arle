@@ -192,8 +192,9 @@ impl Dsv4Model {
     pub(super) fn probe_flush(&self) -> Result<()> {
         let probe = self.probe.borrow_mut().take();
         if let Some(mut probe) = probe {
-            probe.flush(self)?;
+            let result = probe.flush(self);
             *self.probe.borrow_mut() = Some(probe);
+            result?;
         }
         Ok(())
     }
