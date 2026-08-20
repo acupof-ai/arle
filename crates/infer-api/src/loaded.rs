@@ -2100,6 +2100,15 @@ mod backend {
             }
         };
         let num_slots = config.hot_workspace_slots();
+        // Before any weight loads: `num_slots` is the decode row ceiling, the
+        // min-chain the most rows one prefill chunk of this config can carry.
+        infer_cuda::apply_dense_gemm_row_envelope(
+            num_slots,
+            scheduler
+                .chunked_prefill_size
+                .min(scheduler.max_num_batched_tokens)
+                .min(scheduler.max_prefill_tokens),
+        );
         let page_size = config.page_size;
         let mtp_requested = config.mtp_enabled();
         if mtp_requested && config.dspark_draft_model.is_some() {

@@ -212,6 +212,21 @@ pub(crate) fn warm_fp8_deepgemm_dense(
     quant_linear::warm_fp8_deepgemm_dense(ctx, weight, seq_len)
 }
 
+/// Whether the per-channel FP8 DeepGEMM prefill arm can serve this weight at
+/// some M — the loader's test for keeping its E4M3 source resident.
+/// Whether the NVFP4 DeepGEMM prefill arm can serve this weight at some M — the
+/// loader's test for keeping its FP4 source resident and building its `sfb`.
+pub(crate) fn fp4_deepgemm_available(ctx: &DeviceContext, weight: &DeviceMatrix) -> bool {
+    quant_linear::fp4_deepgemm_available(ctx, weight)
+}
+
+pub(crate) fn fp8_deepgemm_per_channel_available(
+    ctx: &DeviceContext,
+    weight: &DeviceMatrix,
+) -> bool {
+    quant_linear::fp8_deepgemm_per_channel_available(ctx, weight)
+}
+
 pub(crate) fn gemv(
     ctx: &DeviceContext,
     weight: &DeviceMatrix,

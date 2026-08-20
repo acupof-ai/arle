@@ -25,7 +25,9 @@ use qwen3_spec::Qwen3Config;
 use safetensors::{SafeTensors, tensor::Dtype};
 
 use crate::model::{Attention, CudaModel, Mlp, TransformerBlock};
-use crate::ops::{precompute_rope, upload_i32};
+use crate::ops::{
+    fp4_deepgemm_available, fp8_deepgemm_per_channel_available, precompute_rope, upload_i32,
+};
 use crate::quant_format::{
     QuantFormat, QuantManifest, QuantTensorView, ScaleApply, TensorHeader, detect_quant_format,
     read_quant_manifest, reject_dsv4_e8m0_scale_abi,
@@ -1484,7 +1486,21 @@ impl SafetensorLoader {
         name: &str,
     ) -> Result<DeviceMatrix> {
         let matrix = self.load_matrix_quant_aware(ctx, name)?;
-        marlin_repack_dense(ctx, name, matrix)
+        marlin_repack_dense(ctx, name, matrix, true)
+    }
+
+    /// Same load, for the output head. Every serving lane slices a single row
+    /// before this GEMM, so the prefill-only DeepGEMM arm would never fire; the
+    /// one caller that does present it a whole prompt is the OPD raw-logits
+    /// forward, where crossing from one arm to the other partway up the prompt
+    /// length would make the distillation target a function of prompt length.
+    pub(crate) fn load_output_head_quant_aware(
+        &self,
+        ctx: &DeviceContext,
+        name: &str,
+    ) -> Result<DeviceMatrix> {
+        let matrix = self.load_matrix_quant_aware(ctx, name)?;
+        marlin_repack_dense(ctx, name, matrix, false)
     }
 
     /// Load two same-K projections as ONE row-fused matrix (`[a; b]` along output rows)
@@ -1632,7 +1648,7 @@ impl SafetensorLoader {
                 .with_context(|| format!("Marlin W8A16 repack fused {}", names.join("+")))?;
         }
         // NVFP4 fuses on device like every other format, then repacks once here.
-        marlin_repack_dense(ctx, parts[0].0, fused)
+        marlin_repack_dense(ctx, parts[0].0, fused, true)
     }
 
     /// Quant-aware twin of [`Self::load_matrix_sharded`].
@@ -1662,7 +1678,7 @@ impl SafetensorLoader {
             }
         };
         let matrix = self.load_quant_or_dense_view(ctx, &view, shard)?;
-        marlin_repack_dense(ctx, name, matrix)
+        marlin_repack_dense(ctx, name, matrix, true)
     }
 
     /// Quant-aware twin of [`Self::load_qkv_head_sharded`]. `block_index` has the
@@ -1703,7 +1719,7 @@ impl SafetensorLoader {
                 total: total_rows,
             }),
         )?;
-        marlin_repack_dense(ctx, name, matrix)
+        marlin_repack_dense(ctx, name, matrix, true)
     }
 
     /// Quant-aware twin of the BF16 fused-qkv head shard: shard the F8_E4M3 weight AND
@@ -5703,6 +5719,7 @@ fn marlin_repack_dense(
     ctx: &DeviceContext,
     name: &str,
     mut matrix: DeviceMatrix,
+    prefill_batched: bool,
 ) -> Result<DeviceMatrix> {
     matrix
         .repack_for_marlin_fp4(ctx)
@@ -5710,10 +5727,21 @@ fn marlin_repack_dense(
     matrix
         .repack_for_marlin_fp8(ctx)
         .with_context(|| format!("Marlin FP8 per-channel repack {name}"))?;
-    // Marlin owns every M for a weight it accepted (`fp4_route` / `fp8_route`),
-    // so the pre-repack bytes are dead the moment the layout exists. Keeping
-    // them stored the model twice and halved the KV pool.
-    matrix.free_quant_source_after_marlin();
+    // Marlin owns every M for an NVFP4 weight it accepted (`fp4_route`), so
+    // those pre-repack bytes are dead the moment the layout exists — keeping
+    // them stored the model twice and halved the KV pool. Per-channel FP8 is
+    // the exception: DeepGEMM contracts the plain E4M3 bytes at prefill M, but
+    // only for a weight some forward actually multiplies by a prefill chunk.
+    // NVFP4's own prefill arm widens the raw nibbles to E4M3 per call, so it
+    // pins the source the same way, and needs the block `sfb` built while the
+    // group scales are still resident.
+    if prefill_batched && fp4_deepgemm_available(ctx, &matrix) {
+        matrix
+            .prepare_fp4_deepgemm_sfb(ctx)
+            .with_context(|| format!("NVFP4 DeepGEMM sfb {name}"))?;
+    }
+    let fp8_deepgemm = prefill_batched && fp8_deepgemm_per_channel_available(ctx, &matrix);
+    matrix.free_quant_source_after_marlin(fp8_deepgemm);
     Ok(matrix)
 }
 
