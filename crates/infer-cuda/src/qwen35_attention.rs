@@ -1,5 +1,7 @@
 use super::*;
 
+use cuda_kernels::attention as cuda_attn;
+
 pub(crate) enum Qwen35Attn {
     // Size-skewed variants; boxing keeps the enum small (clippy::large_enum_variant).
     Full(Box<FullAttn>),
@@ -139,33 +141,28 @@ impl Qwen35Model {
             let (vc_ptr, _g9) = v_cache.data.device_ptr_mut(&self.ctx.stream);
             let (sp_ptr, _g10) = start_pos_dev.device_ptr(&self.ctx.stream);
             crate::profile::profile_op(&self.ctx, "full/prep", Some(full_idx), seq_len, || {
-                // SAFETY: all buffers valid on ctx.stream; cache sized
-                // max_seq_len*kv_dim.
-                unsafe {
-                    ffi::prefill_attention_hd256_prep_cuda(
-                        qf_ptr as *const ffi::Half,
-                        k_ptr as *const ffi::Half,
-                        v_ptr as *const ffi::Half,
-                        qn_ptr as *const ffi::Half,
-                        kn_ptr as *const ffi::Half,
-                        cos_ptr as *const ffi::Half,
-                        sin_ptr as *const ffi::Half,
-                        qp_ptr as *mut ffi::Half,
-                        kc_ptr as *mut ffi::Half,
-                        vc_ptr as *mut ffi::Half,
-                        self.local_q_heads as i32,
-                        self.local_kv_heads as i32,
-                        c.head_dim as i32,
-                        seq_len as i32,
-                        sp_ptr as *const i32,
-                        c.rotary_dim as i32,
-                        c.rms_norm_eps,
-                        max_seq_len as i32,
-                        self.ctx.stream.cu_stream(),
-                    )
-                    .result()?;
-                }
-                Ok(())
+                // All buffers valid on ctx.stream; cache sized max_seq_len*kv_dim.
+                cuda_attn::prefill_attention_hd256_prep_raw(
+                    &self.ctx.stream,
+                    qf_ptr,
+                    k_ptr,
+                    v_ptr,
+                    qn_ptr,
+                    kn_ptr,
+                    cos_ptr,
+                    sin_ptr,
+                    qp_ptr,
+                    kc_ptr,
+                    vc_ptr,
+                    self.local_q_heads,
+                    self.local_kv_heads,
+                    c.head_dim,
+                    seq_len,
+                    sp_ptr,
+                    c.rotary_dim,
+                    c.rms_norm_eps,
+                    max_seq_len,
+                )
             })?;
         }
 
@@ -186,47 +183,43 @@ impl Qwen35Model {
                 Some(full_idx),
                 seq_len,
                 || {
-                    // SAFETY: ptrs from live device allocations sized to the dims
-                    // passed.
-                    unsafe {
+                    {
                         if seq_len == 1
                             && qwen35_fa2_sm70_enabled(&self.ctx)
                             && !crate::runtime_flags::qwen35_decode_graph()
                         {
                             // The host kv_len arg is not graph-replay safe, so
                             // captured decode falls through to devpos below.
-                            ffi::arle_fa2_sm70_attention_cuda(
-                                q_ptr as *const ffi::Half,
-                                kc_ptr as *const ffi::Half,
-                                vc_ptr as *const ffi::Half,
-                                o_ptr as *mut ffi::Half,
-                                self.local_q_heads as i32,
-                                self.local_kv_heads as i32,
-                                c.head_dim as i32,
-                                seq_len as i32,
-                                kv_len as i32,
-                                max_seq_len as i32,
+                            cuda_attn::fa2_sm70_attention_raw(
+                                &self.ctx.stream,
+                                q_ptr,
+                                kc_ptr,
+                                vc_ptr,
+                                o_ptr,
+                                self.local_q_heads,
+                                self.local_kv_heads,
+                                c.head_dim,
+                                seq_len,
+                                kv_len,
+                                max_seq_len,
                                 sm_scale,
-                                self.ctx.stream.cu_stream(),
-                            )
-                            .result()?;
+                            )?;
                         } else if seq_len == 1 {
                             let (sp_ptr, _g4) = start_pos_dev.device_ptr(&self.ctx.stream);
-                            ffi::nonpaged_prefill_attention_devpos_cuda(
-                                q_ptr as *const ffi::Half,
-                                kc_ptr as *const ffi::Half,
-                                vc_ptr as *const ffi::Half,
-                                o_ptr as *mut ffi::Half,
-                                self.local_q_heads as i32,
-                                self.local_kv_heads as i32,
-                                c.head_dim as i32,
-                                seq_len as i32,
-                                sp_ptr as *const i32,
-                                max_seq_len as i32,
+                            cuda_attn::nonpaged_prefill_attention_devpos_raw(
+                                &self.ctx.stream,
+                                q_ptr,
+                                kc_ptr,
+                                vc_ptr,
+                                o_ptr,
+                                self.local_q_heads,
+                                self.local_kv_heads,
+                                c.head_dim,
+                                seq_len,
+                                sp_ptr,
+                                max_seq_len,
                                 sm_scale,
-                                self.ctx.stream.cu_stream(),
-                            )
-                            .result()?;
+                            )?;
                         } else if c.head_dim == 256 && qwen35_fa3_enabled(&self.ctx) {
                             // q/out token-major [S, h, 256], cache head-major
                             // [h_k, max_seq, 256]. An exact `kv_len` as seqlen_k
@@ -274,41 +267,38 @@ impl Qwen35Model {
                                 k_page_stride: 0,
                                 v_page_stride: 0,
                             };
-                            ffi::arle_fa3_fwd_hd256_bf16_cuda(&args, self.ctx.stream.cu_stream())
-                                .result()?;
+                            cuda_attn::fa3_fwd_hd256_bf16(&self.ctx.stream, &args)?;
                         } else if qwen35_fa2_sm70_enabled(&self.ctx) {
                             // sm_70 lane: FA3 needs sm_80+.
-                            ffi::arle_fa2_sm70_attention_cuda(
-                                q_ptr as *const ffi::Half,
-                                kc_ptr as *const ffi::Half,
-                                vc_ptr as *const ffi::Half,
-                                o_ptr as *mut ffi::Half,
-                                self.local_q_heads as i32,
-                                self.local_kv_heads as i32,
-                                c.head_dim as i32,
-                                seq_len as i32,
-                                kv_len as i32,
-                                max_seq_len as i32,
+                            cuda_attn::fa2_sm70_attention_raw(
+                                &self.ctx.stream,
+                                q_ptr,
+                                kc_ptr,
+                                vc_ptr,
+                                o_ptr,
+                                self.local_q_heads,
+                                self.local_kv_heads,
+                                c.head_dim,
+                                seq_len,
+                                kv_len,
+                                max_seq_len,
                                 sm_scale,
-                                self.ctx.stream.cu_stream(),
-                            )
-                            .result()?;
+                            )?;
                         } else {
-                            ffi::nonpaged_prefill_attention_cuda(
-                                q_ptr as *const ffi::Half,
-                                kc_ptr as *const ffi::Half,
-                                vc_ptr as *const ffi::Half,
-                                o_ptr as *mut ffi::Half,
-                                self.local_q_heads as i32,
-                                self.local_kv_heads as i32,
-                                c.head_dim as i32,
-                                seq_len as i32,
-                                kv_len as i32,
-                                max_seq_len as i32,
+                            cuda_attn::nonpaged_prefill_attention_raw(
+                                &self.ctx.stream,
+                                q_ptr,
+                                kc_ptr,
+                                vc_ptr,
+                                o_ptr,
+                                self.local_q_heads,
+                                self.local_kv_heads,
+                                c.head_dim,
+                                seq_len,
+                                kv_len,
+                                max_seq_len,
                                 sm_scale,
-                                self.ctx.stream.cu_stream(),
-                            )
-                            .result()?;
+                            )?;
                         }
                     }
                     Ok(())
@@ -320,20 +310,16 @@ impl Qwen35Model {
             let (qf_ptr, _g0) = q_full.data.device_ptr(&self.ctx.stream);
             let (o_ptr, _g1) = attn_out.data.device_ptr_mut(&self.ctx.stream);
             crate::profile::profile_op(&self.ctx, "full/gate", Some(full_idx), seq_len, || {
-                // SAFETY: q_full/attn_out valid on ctx.stream; gate layout per
+                // q_full/attn_out valid on ctx.stream; gate layout per
                 // full-attn prep.
-                unsafe {
-                    ffi::attention_gate_batch_hd256_cuda(
-                        qf_ptr as *const ffi::Half,
-                        o_ptr as *mut ffi::Half,
-                        self.local_q_heads as i32,
-                        c.head_dim as i32,
-                        seq_len as i32,
-                        self.ctx.stream.cu_stream(),
-                    )
-                    .result()?;
-                }
-                Ok(())
+                cuda_attn::attention_gate_batch_hd256_raw(
+                    &self.ctx.stream,
+                    qf_ptr,
+                    o_ptr,
+                    self.local_q_heads,
+                    c.head_dim,
+                    seq_len,
+                )
             })?;
         }
 
@@ -519,81 +505,71 @@ impl Qwen35Model {
                         Some(full_idx),
                         rows,
                         || {
-                            // SAFETY: all buffers valid on ctx.stream; pool tail page
+                            // All buffers valid on ctx.stream; pool tail page
                             // allocated; per-row offsets come from the meta's own
                             // prefix sums, so each launch stays inside its row.
-                            unsafe {
-                                if decode {
-                                    // B2: k_pool_ptr/v_pool_ptr are offset to this
-                                    // rank's head block, so the subset K/V lands at
-                                    // its natural offset in the full-head pool.
-                                    // 2D: only the shard owning the new token's
-                                    // page writes; the others skip. The predicate
-                                    // is computed once in sharded_decode_meta
-                                    // (block-cyclic owns_page) and carried on the
-                                    // meta — 1 on all non-2D paths.
-                                    let write_kv = meta.write_kv;
-                                    ffi::decode_prep_paged_hd256_cuda(
-                                        qf_ptr as *const ffi::Half,
-                                        qp_ptr as *mut ffi::Half,
-                                        k_ptr as *const ffi::Half,
-                                        v_ptr as *const ffi::Half,
-                                        qn_ptr as *const ffi::Half,
-                                        kn_ptr as *const ffi::Half,
-                                        cos_ptr as *const ffi::Half,
-                                        sin_ptr as *const ffi::Half,
-                                        positions_ptr as *const i32,
-                                        k_pool_ptr as *mut ffi::Half,
-                                        v_pool_ptr as *mut ffi::Half,
-                                        kv_indices_ptr as *const i32,
-                                        kv_indptr_ptr as *const i32,
-                                        last_page_len_ptr as *const i32,
-                                        q_heads as i32,
-                                        kv_heads as i32,
-                                        pool.page_size as i32,
-                                        stride_page as i32,
-                                        meta.batch as i32,
-                                        c.rotary_dim as i32,
+                            if decode {
+                                // B2: k_pool_ptr/v_pool_ptr are offset to this
+                                // rank's head block, so the subset K/V lands at
+                                // its natural offset in the full-head pool.
+                                // 2D: only the shard owning the new token's
+                                // page writes; the others skip. The predicate
+                                // is computed once in sharded_decode_meta
+                                // (block-cyclic owns_page) and carried on the
+                                // meta — 1 on all non-2D paths.
+                                cuda_attn::decode_prep_paged_hd256_raw(
+                                    &self.ctx.stream,
+                                    qf_ptr,
+                                    qp_ptr,
+                                    k_ptr,
+                                    v_ptr,
+                                    qn_ptr,
+                                    kn_ptr,
+                                    cos_ptr,
+                                    sin_ptr,
+                                    positions_ptr,
+                                    k_pool_ptr,
+                                    v_pool_ptr,
+                                    kv_indices_ptr,
+                                    kv_indptr_ptr,
+                                    last_page_len_ptr,
+                                    q_heads,
+                                    kv_heads,
+                                    pool.page_size,
+                                    stride_page,
+                                    meta.batch,
+                                    c.rotary_dim,
+                                    c.rms_norm_eps,
+                                    meta.write_kv,
+                                )?;
+                            } else {
+                                // The prep reads ONE scalar start_pos off a
+                                // table based at element 0 — launch per row.
+                                let elem = std::mem::size_of::<ffi::Half>() as u64;
+                                for b in 0..meta.batch {
+                                    let (col, pages) = (meta.q_offsets[b], meta.page_offsets[b]);
+                                    let len = meta.q_offsets[b + 1] - col;
+                                    cuda_attn::prefill_attention_paged_prep_hd256_raw(
+                                        &self.ctx.stream,
+                                        qf_ptr + (col * q_proj_dim) as u64 * elem,
+                                        qp_ptr + (col * q_dim) as u64 * elem,
+                                        k_ptr + (col * kv_dim) as u64 * elem,
+                                        v_ptr + (col * kv_dim) as u64 * elem,
+                                        qn_ptr,
+                                        kn_ptr,
+                                        cos_ptr,
+                                        sin_ptr,
+                                        kv_indices_ptr + (pages * 4) as u64,
+                                        pool.page_size,
+                                        k_pool_ptr,
+                                        v_pool_ptr,
+                                        self.local_q_heads,
+                                        self.local_kv_heads,
+                                        len,
+                                        start_pos_ptr + (b * 4) as u64,
+                                        c.rotary_dim,
                                         c.rms_norm_eps,
-                                        write_kv,
-                                        self.ctx.stream.cu_stream(),
-                                    )
-                                    .result()?;
-                                } else {
-                                    // The prep reads ONE scalar start_pos off a
-                                    // table based at element 0 — launch per row.
-                                    let elem = std::mem::size_of::<ffi::Half>() as u64;
-                                    for b in 0..meta.batch {
-                                        let (col, pages) =
-                                            (meta.q_offsets[b], meta.page_offsets[b]);
-                                        let len = meta.q_offsets[b + 1] - col;
-                                        ffi::prefill_attention_paged_prep_hd256_cuda(
-                                            (qf_ptr + (col * q_proj_dim) as u64 * elem)
-                                                as *const ffi::Half,
-                                            (qp_ptr + (col * q_dim) as u64 * elem)
-                                                as *mut ffi::Half,
-                                            (k_ptr + (col * kv_dim) as u64 * elem)
-                                                as *const ffi::Half,
-                                            (v_ptr + (col * kv_dim) as u64 * elem)
-                                                as *const ffi::Half,
-                                            qn_ptr as *const ffi::Half,
-                                            kn_ptr as *const ffi::Half,
-                                            cos_ptr as *const ffi::Half,
-                                            sin_ptr as *const ffi::Half,
-                                            (kv_indices_ptr + (pages * 4) as u64) as *const i32,
-                                            pool.page_size as i32,
-                                            k_pool_ptr as *mut ffi::Half,
-                                            v_pool_ptr as *mut ffi::Half,
-                                            self.local_q_heads as i32,
-                                            self.local_kv_heads as i32,
-                                            len as i32,
-                                            (start_pos_ptr + (b * 4) as u64) as *const i32,
-                                            c.rotary_dim as i32,
-                                            c.rms_norm_eps,
-                                            self.ctx.stream.cu_stream(),
-                                        )
-                                        .result()?;
-                                    }
+                                    )?;
                                 }
                             }
                             Ok(())
@@ -862,19 +838,11 @@ impl Qwen35Model {
                                             anyhow!("2D empty-shard out zero failed: {e}")
                                         })?;
                                     } else if pool.format == KVFormat::BF16 {
-                                        // SAFETY: q/o are the live prepped/out buffers; k/v
-                                        // are
+                                        // q/o are the live prepped/out buffers; k/v are
                                         // the layer's pool base; the page table is the
-                                        // meta's
-                                        // rectangular mirror, `batch * page_table_stride`
-                                        // long.
-                                        unsafe {
-                                            ffi::arle_fa3_fwd_hd256_bf16_cuda(
-                                                &args,
-                                                self.ctx.stream.cu_stream(),
-                                            )
-                                            .result()?;
-                                        }
+                                        // meta's rectangular mirror,
+                                        // `batch * page_table_stride` long.
+                                        cuda_attn::fa3_fwd_hd256_bf16(&self.ctx.stream, &args)?;
                                     } else {
                                         let quant_args = ffi::ArleFa3FwdHd256QuantArgs {
                                             base: args,
@@ -892,17 +860,14 @@ impl Qwen35Model {
                                                 0
                                             },
                                         };
-                                        // SAFETY: same live buffers as the bf16 arm; the
+                                        // Same live buffers as the bf16 arm; the
                                         // 1-byte pools and per-(token, head) scales are the
                                         // layer's quantized planes, fresh from the quantize
                                         // pass above.
-                                        unsafe {
-                                            ffi::arle_fa3_fwd_hd256_quant_cuda(
-                                                &quant_args,
-                                                self.ctx.stream.cu_stream(),
-                                            )
-                                            .result()?;
-                                        }
+                                        cuda_attn::fa3_fwd_hd256_quant(
+                                            &self.ctx.stream,
+                                            &quant_args,
+                                        )?;
                                     }
                                     if two_d {
                                         // Cross-cp flash-decoding merge: pack this
@@ -956,23 +921,20 @@ impl Qwen35Model {
                                             merge_gather.data.device_ptr(&self.ctx.stream);
                                         let (ao_ptr, _ga) =
                                             attn_out.data.device_ptr_mut(&self.ctx.stream);
-                                        // SAFETY: buffers live on ctx.stream; the
+                                        // Buffers live on ctx.stream; the
                                         // gather's compute-waits-comm fence orders
                                         // it before this launch.
-                                        unsafe {
-                                            ffi::cross_cp_merge_bf16_hd256_cuda(
-                                                mg_ptr as *const ffi::Half,
-                                                (section_bf16 / 2) as i32,
-                                                lse_bf16 as i32,
-                                                section_bf16 as i32,
-                                                ao_ptr as *mut ffi::Half,
-                                                cp_size as i32,
-                                                accum_rows as i32,
-                                                c.head_dim as i32,
-                                                self.ctx.stream.cu_stream(),
-                                            )
-                                            .result()?;
-                                        }
+                                        cuda_attn::cross_cp_merge_bf16_hd256_raw(
+                                            &self.ctx.stream,
+                                            mg_ptr,
+                                            section_bf16 / 2,
+                                            lse_bf16,
+                                            section_bf16,
+                                            ao_ptr,
+                                            cp_size,
+                                            accum_rows,
+                                            c.head_dim,
+                                        )?;
                                     }
                                     return Ok(());
                                 }
@@ -1079,18 +1041,13 @@ impl Qwen35Model {
             // SAFETY: q_full/attn_out valid on ctx.stream; gate iterates
             // rows * num_q_heads.
             crate::profile::profile_op(&self.ctx, "full_paged/gate", Some(full_idx), rows, || {
-                // SAFETY: ptrs from live device allocations sized to the dims passed.
-                unsafe {
-                    ffi::attention_gate_paged_hd256_cuda(
-                        qf_ptr as *const ffi::Half,
-                        o_ptr as *mut ffi::Half,
-                        q_heads as i32,
-                        rows as i32,
-                        self.ctx.stream.cu_stream(),
-                    )
-                    .result()?;
-                }
-                Ok(())
+                cuda_attn::attention_gate_paged_hd256_raw(
+                    &self.ctx.stream,
+                    qf_ptr,
+                    o_ptr,
+                    q_heads,
+                    rows,
+                )
             })?;
         }
 

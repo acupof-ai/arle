@@ -9,8 +9,8 @@
 //! FFI through the established `DeviceContext`-driven idiom that the rest
 //! of the kernel crate uses.
 
-use anyhow::Result;
-use cudarc::driver::{CudaSlice, DevicePtr};
+use anyhow::{Result, anyhow};
+use cudarc::driver::{CudaSlice, CudaStream, DevicePtr};
 
 use crate::ffi;
 use crate::tensor::{DeviceContext, DeviceVec};
@@ -501,6 +501,432 @@ pub fn dsv4_flashmla_decode_build_indices_batched_raw(
         .result()?;
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Qwen3.5/3.6 non-paged prefill attention family: typed launchers over the
+// HD256 prep/gate/attention FFI. Raw u64 device addresses — consumers apply
+// pointer offsets (pool head shifts, per-row columns) before the call and keep
+// every owning buffer alive and stream-ordered on `stream`.
+// ---------------------------------------------------------------------------
+
+fn attn_i32(v: usize, what: &'static str) -> Result<i32> {
+    i32::try_from(v).map_err(|_| anyhow!("{what} {v} exceeds i32"))
+}
+
+/// Non-paged causal attention (bf16, online softmax, GQA native). `q`/`out`
+/// token-major `[seq, q_heads, d]`; `k_cache`/`v_cache` head-major
+/// `[kv_heads, max_seq_len, d]`.
+#[allow(clippy::too_many_arguments)]
+pub fn nonpaged_prefill_attention_raw(
+    stream: &CudaStream,
+    q_ptr: u64,
+    k_cache_ptr: u64,
+    v_cache_ptr: u64,
+    out_ptr: u64,
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    seq_len: usize,
+    kv_len: usize,
+    max_seq_len: usize,
+    sm_scale: f32,
+) -> Result<()> {
+    // SAFETY: caller passes live device addresses sized to the dims below,
+    // stream-ordered on `stream`.
+    unsafe {
+        ffi::nonpaged_prefill_attention_cuda(
+            q_ptr as *const ffi::Half,
+            k_cache_ptr as *const ffi::Half,
+            v_cache_ptr as *const ffi::Half,
+            out_ptr as *mut ffi::Half,
+            attn_i32(num_q_heads, "nonpaged q_heads")?,
+            attn_i32(num_kv_heads, "nonpaged kv_heads")?,
+            attn_i32(head_dim, "nonpaged head_dim")?,
+            attn_i32(seq_len, "nonpaged seq_len")?,
+            attn_i32(kv_len, "nonpaged kv_len")?,
+            attn_i32(max_seq_len, "nonpaged max_seq_len")?,
+            sm_scale,
+            stream.cu_stream(),
+        )
+        .result()
+        .map_err(|e| {
+            anyhow!("nonpaged_prefill_attention_cuda failed at seq={seq_len} kv={kv_len}: {e}")
+        })
+    }
+}
+
+/// Device-position variant of [`nonpaged_prefill_attention_raw`]:
+/// `start_pos_dev_ptr` is one device i32 read in-kernel (graph-replay safe).
+#[allow(clippy::too_many_arguments)]
+pub fn nonpaged_prefill_attention_devpos_raw(
+    stream: &CudaStream,
+    q_ptr: u64,
+    k_cache_ptr: u64,
+    v_cache_ptr: u64,
+    out_ptr: u64,
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    seq_len: usize,
+    start_pos_dev_ptr: u64,
+    max_seq_len: usize,
+    sm_scale: f32,
+) -> Result<()> {
+    // SAFETY: same contract as `nonpaged_prefill_attention_raw`;
+    // `start_pos_dev_ptr` is a live device i32 scalar.
+    unsafe {
+        ffi::nonpaged_prefill_attention_devpos_cuda(
+            q_ptr as *const ffi::Half,
+            k_cache_ptr as *const ffi::Half,
+            v_cache_ptr as *const ffi::Half,
+            out_ptr as *mut ffi::Half,
+            attn_i32(num_q_heads, "devpos q_heads")?,
+            attn_i32(num_kv_heads, "devpos kv_heads")?,
+            attn_i32(head_dim, "devpos head_dim")?,
+            attn_i32(seq_len, "devpos seq_len")?,
+            start_pos_dev_ptr as *const i32,
+            attn_i32(max_seq_len, "devpos max_seq_len")?,
+            sm_scale,
+            stream.cu_stream(),
+        )
+        .result()
+        .map_err(|e| anyhow!("nonpaged_prefill_attention_devpos_cuda failed at seq={seq_len}: {e}"))
+    }
+}
+
+/// Hand-written FA2-style forward for sm_70 (V100): drop-in replacement for
+/// [`nonpaged_prefill_attention_raw`] where FA3 (sm_80+) is unavailable.
+#[allow(clippy::too_many_arguments)]
+pub fn fa2_sm70_attention_raw(
+    stream: &CudaStream,
+    q_ptr: u64,
+    k_cache_ptr: u64,
+    v_cache_ptr: u64,
+    out_ptr: u64,
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    seq_len: usize,
+    kv_len: usize,
+    max_seq_len: usize,
+    sm_scale: f32,
+) -> Result<()> {
+    // SAFETY: same layout contract as `nonpaged_prefill_attention_raw`.
+    unsafe {
+        ffi::arle_fa2_sm70_attention_cuda(
+            q_ptr as *const ffi::Half,
+            k_cache_ptr as *const ffi::Half,
+            v_cache_ptr as *const ffi::Half,
+            out_ptr as *mut ffi::Half,
+            attn_i32(num_q_heads, "fa2 q_heads")?,
+            attn_i32(num_kv_heads, "fa2 kv_heads")?,
+            attn_i32(head_dim, "fa2 head_dim")?,
+            attn_i32(seq_len, "fa2 seq_len")?,
+            attn_i32(kv_len, "fa2 kv_len")?,
+            attn_i32(max_seq_len, "fa2 max_seq_len")?,
+            sm_scale,
+            stream.cu_stream(),
+        )
+        .result()
+        .map_err(|e| {
+            anyhow!("arle_fa2_sm70_attention_cuda failed at seq={seq_len} kv={kv_len}: {e}")
+        })
+    }
+}
+
+/// Qwen3.6 HD256 non-paged prefill prep: q/k-norm + partial RoPE, q into
+/// `q_out`, K/V appended to the contiguous head-major caches at
+/// `*start_pos_dev_ptr`.
+#[allow(clippy::too_many_arguments)]
+pub fn prefill_attention_hd256_prep_raw(
+    stream: &CudaStream,
+    q_full_ptr: u64,
+    k_ptr: u64,
+    v_ptr: u64,
+    q_norm_ptr: u64,
+    k_norm_ptr: u64,
+    cos_ptr: u64,
+    sin_ptr: u64,
+    q_out_ptr: u64,
+    k_cache_ptr: u64,
+    v_cache_ptr: u64,
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    seq_len: usize,
+    start_pos_dev_ptr: u64,
+    rotary_dim: usize,
+    rms_eps: f32,
+    max_seq_len: usize,
+) -> Result<()> {
+    // SAFETY: caller passes live device addresses for the prep layout; the
+    // caches are sized `max_seq_len * kv_dim`.
+    unsafe {
+        ffi::prefill_attention_hd256_prep_cuda(
+            q_full_ptr as *const ffi::Half,
+            k_ptr as *const ffi::Half,
+            v_ptr as *const ffi::Half,
+            q_norm_ptr as *const ffi::Half,
+            k_norm_ptr as *const ffi::Half,
+            cos_ptr as *const ffi::Half,
+            sin_ptr as *const ffi::Half,
+            q_out_ptr as *mut ffi::Half,
+            k_cache_ptr as *mut ffi::Half,
+            v_cache_ptr as *mut ffi::Half,
+            attn_i32(num_q_heads, "hd256 prep q_heads")?,
+            attn_i32(num_kv_heads, "hd256 prep kv_heads")?,
+            attn_i32(head_dim, "hd256 prep head_dim")?,
+            attn_i32(seq_len, "hd256 prep seq_len")?,
+            start_pos_dev_ptr as *const i32,
+            attn_i32(rotary_dim, "hd256 prep rotary_dim")?,
+            rms_eps,
+            attn_i32(max_seq_len, "hd256 prep max_seq_len")?,
+            stream.cu_stream(),
+        )
+        .result()
+        .map_err(|e| anyhow!("prefill_attention_hd256_prep_cuda failed at seq={seq_len}: {e}"))
+    }
+}
+
+/// Qwen3.6 HD256 paged prefill prep for ONE request: `page_table_ptr` is the
+/// request's slice of `kv_indices`, `start_pos_dev_ptr` its scalar entry in
+/// the batch start-position table.
+#[allow(clippy::too_many_arguments)]
+pub fn prefill_attention_paged_prep_hd256_raw(
+    stream: &CudaStream,
+    q_full_ptr: u64,
+    q_out_ptr: u64,
+    k_ptr: u64,
+    v_ptr: u64,
+    q_norm_ptr: u64,
+    k_norm_ptr: u64,
+    cos_ptr: u64,
+    sin_ptr: u64,
+    page_table_ptr: u64,
+    page_size: usize,
+    k_pool_ptr: u64,
+    v_pool_ptr: u64,
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    seq_len: usize,
+    start_pos_dev_ptr: u64,
+    rotary_dim: usize,
+    rms_eps: f32,
+) -> Result<()> {
+    // SAFETY: caller passes live device addresses (row-offset q/k/v columns,
+    // per-request page-table slice, pool bases); per-row offsets come from the
+    // meta's own prefix sums, so each launch stays inside its row.
+    unsafe {
+        ffi::prefill_attention_paged_prep_hd256_cuda(
+            q_full_ptr as *const ffi::Half,
+            q_out_ptr as *mut ffi::Half,
+            k_ptr as *const ffi::Half,
+            v_ptr as *const ffi::Half,
+            q_norm_ptr as *const ffi::Half,
+            k_norm_ptr as *const ffi::Half,
+            cos_ptr as *const ffi::Half,
+            sin_ptr as *const ffi::Half,
+            page_table_ptr as *const i32,
+            attn_i32(page_size, "paged prep page_size")?,
+            k_pool_ptr as *mut ffi::Half,
+            v_pool_ptr as *mut ffi::Half,
+            attn_i32(num_q_heads, "paged prep q_heads")?,
+            attn_i32(num_kv_heads, "paged prep kv_heads")?,
+            attn_i32(seq_len, "paged prep seq_len")?,
+            start_pos_dev_ptr as *const i32,
+            attn_i32(rotary_dim, "paged prep rotary_dim")?,
+            rms_eps,
+            stream.cu_stream(),
+        )
+        .result()
+        .map_err(|e| {
+            anyhow!("prefill_attention_paged_prep_hd256_cuda failed at seq={seq_len}: {e}")
+        })
+    }
+}
+
+/// Qwen3.6 HD256 paged decode prep, one q row per batch element.
+/// `write_kv`: 0 = skip the K/V pool write (2D non-owner shard); 1 = write.
+#[allow(clippy::too_many_arguments)]
+pub fn decode_prep_paged_hd256_raw(
+    stream: &CudaStream,
+    q_full_ptr: u64,
+    q_out_ptr: u64,
+    k_ptr: u64,
+    v_ptr: u64,
+    q_norm_ptr: u64,
+    k_norm_ptr: u64,
+    cos_ptr: u64,
+    sin_ptr: u64,
+    positions_ptr: u64,
+    k_pool_ptr: u64,
+    v_pool_ptr: u64,
+    page_table_ptr: u64,
+    page_indptr_ptr: u64,
+    last_page_len_ptr: u64,
+    num_qo_heads: usize,
+    num_kv_heads: usize,
+    page_size: usize,
+    stride_page: usize,
+    batch_size: usize,
+    rotary_dim: usize,
+    rms_eps: f32,
+    write_kv: i32,
+) -> Result<()> {
+    // SAFETY: caller passes live device addresses for the decode-prep layout;
+    // the pool base may be head-offset (B2 subset), tail pages allocated.
+    unsafe {
+        ffi::decode_prep_paged_hd256_cuda(
+            q_full_ptr as *const ffi::Half,
+            q_out_ptr as *mut ffi::Half,
+            k_ptr as *const ffi::Half,
+            v_ptr as *const ffi::Half,
+            q_norm_ptr as *const ffi::Half,
+            k_norm_ptr as *const ffi::Half,
+            cos_ptr as *const ffi::Half,
+            sin_ptr as *const ffi::Half,
+            positions_ptr as *const i32,
+            k_pool_ptr as *mut ffi::Half,
+            v_pool_ptr as *mut ffi::Half,
+            page_table_ptr as *const i32,
+            page_indptr_ptr as *const i32,
+            last_page_len_ptr as *const i32,
+            attn_i32(num_qo_heads, "decode prep qo_heads")?,
+            attn_i32(num_kv_heads, "decode prep kv_heads")?,
+            attn_i32(page_size, "decode prep page_size")?,
+            attn_i32(stride_page, "decode prep stride_page")?,
+            attn_i32(batch_size, "decode prep batch")?,
+            attn_i32(rotary_dim, "decode prep rotary_dim")?,
+            rms_eps,
+            write_kv,
+            stream.cu_stream(),
+        )
+        .result()
+        .map_err(|e| anyhow!("decode_prep_paged_hd256_cuda failed at batch={batch_size}: {e}"))
+    }
+}
+
+/// Non-paged HD256 sigmoid gate: `attn_out *= sigmoid(gate)` with the gate
+/// rows read from the full q projection.
+pub fn attention_gate_batch_hd256_raw(
+    stream: &CudaStream,
+    q_full_ptr: u64,
+    attn_out_ptr: u64,
+    num_q_heads: usize,
+    head_dim: usize,
+    seq_len: usize,
+) -> Result<()> {
+    // SAFETY: q_full/attn_out are live device buffers in the full-attn prep
+    // layout.
+    unsafe {
+        ffi::attention_gate_batch_hd256_cuda(
+            q_full_ptr as *const ffi::Half,
+            attn_out_ptr as *mut ffi::Half,
+            attn_i32(num_q_heads, "gate q_heads")?,
+            attn_i32(head_dim, "gate head_dim")?,
+            attn_i32(seq_len, "gate seq_len")?,
+            stream.cu_stream(),
+        )
+        .result()
+        .map_err(|e| anyhow!("attention_gate_batch_hd256_cuda failed at seq={seq_len}: {e}"))
+    }
+}
+
+/// Paged variant of [`attention_gate_batch_hd256_raw`]: iterates
+/// `rows * num_q_heads` over the ragged batch.
+pub fn attention_gate_paged_hd256_raw(
+    stream: &CudaStream,
+    q_full_ptr: u64,
+    attn_out_ptr: u64,
+    num_q_heads: usize,
+    rows: usize,
+) -> Result<()> {
+    // SAFETY: q_full/attn_out are live device buffers in the full-attn prep
+    // layout.
+    unsafe {
+        ffi::attention_gate_paged_hd256_cuda(
+            q_full_ptr as *const ffi::Half,
+            attn_out_ptr as *mut ffi::Half,
+            attn_i32(num_q_heads, "paged gate q_heads")?,
+            attn_i32(rows, "paged gate rows")?,
+            stream.cu_stream(),
+        )
+        .result()
+        .map_err(|e| anyhow!("attention_gate_paged_hd256_cuda failed at rows={rows}: {e}"))
+    }
+}
+
+/// 2D cross-cp flash-decoding merge: combine `cp_size` rank-major (lse, out)
+/// sections into the full attention output (see the FFI decl for the packed
+/// section layout).
+#[allow(clippy::too_many_arguments)]
+pub fn cross_cp_merge_bf16_hd256_raw(
+    stream: &CudaStream,
+    packed_ptr: u64,
+    lse_stride_f32: usize,
+    out_off_bf16: usize,
+    out_stride_bf16: usize,
+    out_ptr: u64,
+    cp_size: usize,
+    rows: usize,
+    head_dim: usize,
+) -> Result<()> {
+    // SAFETY: `packed_ptr` is the gathered `[cp, section]` buffer, `out_ptr`
+    // the live output; the caller fences the gather before this launch.
+    unsafe {
+        ffi::cross_cp_merge_bf16_hd256_cuda(
+            packed_ptr as *const ffi::Half,
+            attn_i32(lse_stride_f32, "cp merge lse_stride")?,
+            attn_i32(out_off_bf16, "cp merge out_off")?,
+            attn_i32(out_stride_bf16, "cp merge out_stride")?,
+            out_ptr as *mut ffi::Half,
+            attn_i32(cp_size, "cp merge cp_size")?,
+            attn_i32(rows, "cp merge rows")?,
+            attn_i32(head_dim, "cp merge head_dim")?,
+            stream.cu_stream(),
+        )
+        .result()
+        .map_err(|e| anyhow!("cross_cp_merge_bf16_hd256_cuda failed at rows={rows}: {e}"))
+    }
+}
+
+/// FA3 hd256 bf16 forward. The args struct is the ABI — the caller builds it
+/// per the field docs on [`ffi::ArleFa3FwdHd256Args`] and keeps every pointed-to
+/// buffer alive and stream-ordered through submission.
+pub fn fa3_fwd_hd256_bf16(stream: &CudaStream, args: &ffi::ArleFa3FwdHd256Args) -> Result<()> {
+    // SAFETY: caller upholds the args-struct pointer contract.
+    unsafe {
+        ffi::arle_fa3_fwd_hd256_bf16_cuda(args, stream.cu_stream())
+            .result()
+            .map_err(|e| {
+                anyhow!(
+                    "arle_fa3_fwd_hd256_bf16_cuda failed at batch={} total_q={}: {e}",
+                    args.batch,
+                    args.total_q
+                )
+            })
+    }
+}
+
+/// FA3 hd256 quantized-KV forward (Path A dequant shim); same contract as
+/// [`fa3_fwd_hd256_bf16`] over [`ffi::ArleFa3FwdHd256QuantArgs`].
+pub fn fa3_fwd_hd256_quant(
+    stream: &CudaStream,
+    args: &ffi::ArleFa3FwdHd256QuantArgs,
+) -> Result<()> {
+    // SAFETY: caller upholds the args-struct pointer contract.
+    unsafe {
+        ffi::arle_fa3_fwd_hd256_quant_cuda(args, stream.cu_stream())
+            .result()
+            .map_err(|e| {
+                anyhow!(
+                    "arle_fa3_fwd_hd256_quant_cuda failed at batch={} total_q={}: {e}",
+                    args.base.batch,
+                    args.base.total_q
+                )
+            })
+    }
 }
 
 #[cfg(test)]
