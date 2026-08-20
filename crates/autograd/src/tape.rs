@@ -158,8 +158,6 @@ pub enum SavedContext {
         dt_bias: TensorId,
         a_log: TensorId,
         norm_weight: TensorId,
-        preact: Option<TensorId>,
-        qkv_conv: Option<TensorId>,
         g: Option<TensorId>,
         beta: Option<TensorId>,
         /// FlashQLA route: chunk 0 only (the state carry). Otherwise every chunk.
