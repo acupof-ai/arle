@@ -67,3 +67,18 @@ __device__ __forceinline__ float apply_rope_partial_hd256(
   }
   return smem[tid];
 }
+
+// FP4 E2M1 -> float. Pure ALU: a __constant__ 16-entry table indexed by a nibble
+// is divergent across a warp and serialises into replays, which measured 4x on
+// the NVFP4 widen kernel. The magnitude field is [exp:2][mant:1] with bias 1, so
+// exp == 0 is the subnormal step (0 and 0.5) and everything above is
+// (1 + mant/2) * 2^(exp-1). Bit-identical to the tables it replaces on all 16
+// inputs, sign included, so -0.0 stays -0.0.
+__device__ __forceinline__ float arle_decode_fp4_e2m1(uint8_t bits) {
+  const uint32_t m = bits & 0x7u;
+  const uint32_t e = m >> 1;
+  const uint32_t sign = (uint32_t)(bits & 0x8u) << 28;
+  const uint32_t mag =
+      (e == 0u) ? ((m & 1u) ? 0x3F000000u : 0u) : (((126u + e) << 23) | ((m & 1u) << 22));
+  return __uint_as_float(sign | mag);
+}

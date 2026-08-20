@@ -1482,7 +1482,10 @@ pub struct DeviceMatrix {
     /// multiplied into each stored S0E5M3 group scale. Nothing else records it —
     /// the Marlin global scale divides it out again — and every reader of the
     /// scale tail has to undo it. 1.0 for every other format.
-    pub fp4_marlin_scale_lift: f32,
+    /// Reciprocal of the lift `repack_for_marlin_fp4` folds into the S0E5M3
+    /// scale tail. Stored inverted because every reader multiplies by it, and a
+    /// power of two inverts exactly.
+    pub fp4_marlin_scale_lift_inv: f32,
     /// Whether the loader cleared this weight for the per-channel FP8 DeepGEMM
     /// prefill arm. The FP4 twin is `fp4_deepgemm_sfb`'s presence; per-channel
     /// FP8 needs no per-weight buffer, so the decision has to be carried
@@ -1825,7 +1828,7 @@ impl DeviceMatrix {
             marlin_packed: None,
             marlin_scales: None,
             fp4_deepgemm_sfb: None,
-            fp4_marlin_scale_lift: 1.0,
+            fp4_marlin_scale_lift_inv: 1.0,
             fp8_deepgemm_prefill: false,
             tq_packed: None,
             tq_scales: None,
@@ -1885,7 +1888,7 @@ impl DeviceMatrix {
             marlin_packed: None,
             marlin_scales: None,
             fp4_deepgemm_sfb: None,
-            fp4_marlin_scale_lift: 1.0,
+            fp4_marlin_scale_lift_inv: 1.0,
             fp8_deepgemm_prefill: false,
             tq_packed: None,
             tq_scales: None,
@@ -1921,7 +1924,7 @@ impl DeviceMatrix {
             marlin_packed: None,
             marlin_scales: None,
             fp4_deepgemm_sfb: None,
-            fp4_marlin_scale_lift: 1.0,
+            fp4_marlin_scale_lift_inv: 1.0,
             fp8_deepgemm_prefill: false,
             tq_packed: None,
             tq_scales: None,
@@ -2232,7 +2235,7 @@ impl DeviceMatrix {
             marlin_packed: None,
             marlin_scales: None,
             fp4_deepgemm_sfb: None,
-            fp4_marlin_scale_lift: 1.0,
+            fp4_marlin_scale_lift_inv: 1.0,
             fp8_deepgemm_prefill: false,
             tq_packed: None,
             tq_scales: None,
@@ -2310,7 +2313,7 @@ impl DeviceMatrix {
             marlin_packed: None,
             marlin_scales: None,
             fp4_deepgemm_sfb: None,
-            fp4_marlin_scale_lift: 1.0,
+            fp4_marlin_scale_lift_inv: 1.0,
             fp8_deepgemm_prefill: false,
             tq_packed: None,
             tq_scales: None,
@@ -2391,7 +2394,7 @@ impl DeviceMatrix {
             marlin_packed: None,
             marlin_scales: None,
             fp4_deepgemm_sfb: None,
-            fp4_marlin_scale_lift: 1.0,
+            fp4_marlin_scale_lift_inv: 1.0,
             fp8_deepgemm_prefill: false,
             tq_packed: None,
             tq_scales: None,
@@ -2467,7 +2470,7 @@ impl DeviceMatrix {
             marlin_packed: None,
             marlin_scales: None,
             fp4_deepgemm_sfb: None,
-            fp4_marlin_scale_lift: 1.0,
+            fp4_marlin_scale_lift_inv: 1.0,
             fp8_deepgemm_prefill: false,
             tq_packed: None,
             tq_scales: None,
@@ -2542,7 +2545,7 @@ impl DeviceMatrix {
             marlin_packed: None,
             marlin_scales: None,
             fp4_deepgemm_sfb: None,
-            fp4_marlin_scale_lift: 1.0,
+            fp4_marlin_scale_lift_inv: 1.0,
             fp8_deepgemm_prefill: false,
             tq_packed: None,
             tq_scales: None,
@@ -2631,7 +2634,7 @@ impl DeviceMatrix {
             marlin_packed: None,
             marlin_scales: None,
             fp4_deepgemm_sfb: None,
-            fp4_marlin_scale_lift: 1.0,
+            fp4_marlin_scale_lift_inv: 1.0,
             fp8_deepgemm_prefill: false,
             tq_packed: None,
             tq_scales: None,
@@ -3030,7 +3033,7 @@ impl DeviceMatrix {
                 crate::ffi::fp4_marlin_scale_block_pow2_cuda(
                     packed_ptr as *const u8,
                     global_ptr as *const f32,
-                    1.0 / self.fp4_marlin_scale_lift,
+                    self.fp4_marlin_scale_lift_inv,
                     sfb_ptr as *mut f32,
                     n as i32,
                     k as i32,
@@ -3244,7 +3247,7 @@ impl DeviceMatrix {
 
         self.marlin_packed = Some(marlin_gpu);
         self.marlin_scales = Some(global_gpu);
-        self.fp4_marlin_scale_lift = scale_factor * 128.0;
+        self.fp4_marlin_scale_lift_inv = 1.0 / (scale_factor * 128.0);
         // Marlin holds every nibble and every group scale now, and both the
         // Marlin GEMM and the DeepGEMM prefill arm read them from here.
         self.qweight_u8 = None;
@@ -3293,7 +3296,7 @@ impl DeviceMatrix {
             marlin_packed: None,
             marlin_scales: None,
             fp4_deepgemm_sfb: None,
-            fp4_marlin_scale_lift: 1.0,
+            fp4_marlin_scale_lift_inv: 1.0,
             fp8_deepgemm_prefill: false,
             tq_packed: None,
             tq_scales: None,
@@ -3351,7 +3354,7 @@ impl DeviceMatrix {
             marlin_packed: None,
             marlin_scales: None,
             fp4_deepgemm_sfb: None,
-            fp4_marlin_scale_lift: 1.0,
+            fp4_marlin_scale_lift_inv: 1.0,
             fp8_deepgemm_prefill: false,
             tq_packed: None,
             tq_scales: None,

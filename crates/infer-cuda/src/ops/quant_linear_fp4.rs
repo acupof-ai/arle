@@ -93,7 +93,7 @@ fn try_fp4_deepgemm_gemm(
                     cache_ptr(packed, ctx).as_ptr(),
                     cache_ptr(global, ctx).as_ptr(),
                     cache_ptr(sfb, ctx).as_ptr(),
-                    1.0 / weight.fp4_marlin_scale_lift,
+                    weight.fp4_marlin_scale_lift_inv,
                     dst_ptr.as_mut_ptr(),
                     n as i32,
                     k as i32,

@@ -9,6 +9,7 @@
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
 #include <stdint.h>
+#include "../common.cuh"
 
 namespace {
 
@@ -20,11 +21,6 @@ constexpr float DSV4_FP8_E4M3_MAX = 448.0f;
 enum Dsv4SourceFormat : int {
   kDsv4SourceFp8 = 0,
   kDsv4SourceFp4 = 1,
-};
-
-__device__ __constant__ float DSV4_FP4_E2M1_CACHE_LUT[16] = {
-    0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
-    -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f,
 };
 
 __device__ __forceinline__ float dsv4_cache_warp_reduce_max(float val) {
@@ -51,7 +47,7 @@ __device__ __forceinline__ float dsv4_cache_decode_fp8_e4m3(uint8_t bits) {
 }
 
 __device__ __forceinline__ float dsv4_cache_decode_fp4_e2m1(uint8_t bits) {
-  return DSV4_FP4_E2M1_CACHE_LUT[bits & 0x0f];
+  return arle_decode_fp4_e2m1(bits);
 }
 
 __device__ __forceinline__ float dsv4_cache_block_scale(
