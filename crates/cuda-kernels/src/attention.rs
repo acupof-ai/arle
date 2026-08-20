@@ -807,6 +807,382 @@ pub fn decode_prep_paged_hd256_raw(
     }
 }
 
+/// Qwen3 dense paged prefill prep: q/k-norm + RoPE in place on `q`/`k`, K/V
+/// scattered into the paged pools through the per-request page-table offsets.
+#[allow(clippy::too_many_arguments)]
+pub fn prefill_attention_paged_prep_raw(
+    stream: &CudaStream,
+    q_ptr: u64,
+    k_ptr: u64,
+    v_ptr: u64,
+    q_norm_ptr: u64,
+    k_norm_ptr: u64,
+    cos_ptr: u64,
+    sin_ptr: u64,
+    page_table_ptr: u64,
+    page_table_offset_ptr: u64,
+    page_size: usize,
+    k_pool_ptr: u64,
+    v_pool_ptr: u64,
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    seq_len: usize,
+    start_pos_dev_ptr: u64,
+    rms_eps: f32,
+) -> Result<()> {
+    // SAFETY: caller passes live device addresses (batch rows, per-request
+    // page-table slice + offsets, pool bases), stream-ordered on `stream`.
+    unsafe {
+        ffi::prefill_attention_paged_prep_cuda(
+            q_ptr as *mut ffi::Half,
+            k_ptr as *mut ffi::Half,
+            v_ptr as *const ffi::Half,
+            q_norm_ptr as *const ffi::Half,
+            k_norm_ptr as *const ffi::Half,
+            cos_ptr as *const ffi::Half,
+            sin_ptr as *const ffi::Half,
+            page_table_ptr as *const i32,
+            page_table_offset_ptr as *const i32,
+            attn_i32(page_size, "qwen paged prep page_size")?,
+            k_pool_ptr as *mut ffi::Half,
+            v_pool_ptr as *mut ffi::Half,
+            attn_i32(num_q_heads, "qwen paged prep q_heads")?,
+            attn_i32(num_kv_heads, "qwen paged prep kv_heads")?,
+            attn_i32(head_dim, "qwen paged prep head_dim")?,
+            attn_i32(seq_len, "qwen paged prep seq_len")?,
+            start_pos_dev_ptr as *const i32,
+            rms_eps,
+            stream.cu_stream(),
+        )
+        .result()
+        .map_err(|e| anyhow!("prefill_attention_paged_prep_cuda failed at seq={seq_len}: {e}"))
+    }
+}
+
+/// Qwen3 dense paged decode prep, one q row per batch element: q/k-norm +
+/// RoPE in place on `q`, K/V appended to the paged pools at each row's last
+/// page.
+#[allow(clippy::too_many_arguments)]
+pub fn decode_prep_paged_raw(
+    stream: &CudaStream,
+    q_ptr: u64,
+    k_ptr: u64,
+    v_ptr: u64,
+    q_norm_ptr: u64,
+    k_norm_ptr: u64,
+    cos_ptr: u64,
+    sin_ptr: u64,
+    positions_ptr: u64,
+    k_pool_ptr: u64,
+    v_pool_ptr: u64,
+    page_table_ptr: u64,
+    page_indptr_ptr: u64,
+    last_page_len_ptr: u64,
+    num_qo_heads: usize,
+    num_kv_heads: usize,
+    page_size: usize,
+    stride_page: usize,
+    batch_size: usize,
+    rms_eps: f32,
+) -> Result<()> {
+    // SAFETY: caller passes live device addresses for the decode-prep layout;
+    // tail pages allocated, stream-ordered on `stream`.
+    unsafe {
+        ffi::decode_prep_paged_cuda(
+            q_ptr as *mut ffi::Half,
+            k_ptr as *const ffi::Half,
+            v_ptr as *const ffi::Half,
+            q_norm_ptr as *const ffi::Half,
+            k_norm_ptr as *const ffi::Half,
+            cos_ptr as *const ffi::Half,
+            sin_ptr as *const ffi::Half,
+            positions_ptr as *const i32,
+            k_pool_ptr as *mut ffi::Half,
+            v_pool_ptr as *mut ffi::Half,
+            page_table_ptr as *const i32,
+            page_indptr_ptr as *const i32,
+            last_page_len_ptr as *const i32,
+            attn_i32(num_qo_heads, "qwen decode prep qo_heads")?,
+            attn_i32(num_kv_heads, "qwen decode prep kv_heads")?,
+            attn_i32(page_size, "qwen decode prep page_size")?,
+            attn_i32(stride_page, "qwen decode prep stride_page")?,
+            attn_i32(batch_size, "qwen decode prep batch")?,
+            rms_eps,
+            stream.cu_stream(),
+        )
+        .result()
+        .map_err(|e| anyhow!("decode_prep_paged_cuda failed at batch={batch_size}: {e}"))
+    }
+}
+
+/// Sliding-window ring variant of [`prefill_attention_hd256_prep_raw`]: the
+/// K/V cache write row wraps as `pos % ring_modulus`. One launch must write
+/// `<= ring_modulus` rows (caller-checked — the kernel cannot).
+#[allow(clippy::too_many_arguments)]
+pub fn prefill_attention_hd256_prep_ring_raw(
+    stream: &CudaStream,
+    q_full_ptr: u64,
+    k_ptr: u64,
+    v_ptr: u64,
+    q_norm_ptr: u64,
+    k_norm_ptr: u64,
+    cos_ptr: u64,
+    sin_ptr: u64,
+    q_out_ptr: u64,
+    k_cache_ptr: u64,
+    v_cache_ptr: u64,
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    seq_len: usize,
+    start_pos_dev_ptr: u64,
+    rotary_dim: usize,
+    rms_eps: f32,
+    ring_modulus: usize,
+) -> Result<()> {
+    // SAFETY: caller passes live device addresses; ring caches sized
+    // `ring_modulus * kv_dim`, `start_pos_dev_ptr` an ABSOLUTE device i32.
+    unsafe {
+        ffi::prefill_attention_hd256_prep_ring_cuda(
+            q_full_ptr as *const ffi::Half,
+            k_ptr as *const ffi::Half,
+            v_ptr as *const ffi::Half,
+            q_norm_ptr as *const ffi::Half,
+            k_norm_ptr as *const ffi::Half,
+            cos_ptr as *const ffi::Half,
+            sin_ptr as *const ffi::Half,
+            q_out_ptr as *mut ffi::Half,
+            k_cache_ptr as *mut ffi::Half,
+            v_cache_ptr as *mut ffi::Half,
+            attn_i32(num_q_heads, "ring prep q_heads")?,
+            attn_i32(num_kv_heads, "ring prep kv_heads")?,
+            attn_i32(head_dim, "ring prep head_dim")?,
+            attn_i32(seq_len, "ring prep seq_len")?,
+            start_pos_dev_ptr as *const i32,
+            attn_i32(rotary_dim, "ring prep rotary_dim")?,
+            rms_eps,
+            attn_i32(ring_modulus, "ring prep ring_modulus")?,
+            stream.cu_stream(),
+        )
+        .result()
+        .map_err(|e| anyhow!("prefill_attention_hd256_prep_ring_cuda failed at seq={seq_len}: {e}"))
+    }
+}
+
+/// Ragged-window ring attention: one launch for `seq_len` rows with per-row
+/// device-resident key windows `[ring_base_dev[t], +kv_len_dev[t])`, walked
+/// non-causally. Caller guarantees `kv_len_dev[t] <= ring_modulus`.
+#[allow(clippy::too_many_arguments)]
+pub fn nonpaged_prefill_attention_ring_varlen_raw(
+    stream: &CudaStream,
+    q_ptr: u64,
+    k_cache_ptr: u64,
+    v_cache_ptr: u64,
+    out_ptr: u64,
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    seq_len: usize,
+    ring_base_dev_ptr: u64,
+    kv_len_dev_ptr: u64,
+    ring_modulus: usize,
+    sm_scale: f32,
+) -> Result<()> {
+    // SAFETY: caller passes live device addresses; the window tables hold
+    // `seq_len` i32 each, stream-ordered on `stream`.
+    unsafe {
+        ffi::nonpaged_prefill_attention_ring_varlen_cuda(
+            q_ptr as *const ffi::Half,
+            k_cache_ptr as *const ffi::Half,
+            v_cache_ptr as *const ffi::Half,
+            out_ptr as *mut ffi::Half,
+            attn_i32(num_q_heads, "ring varlen q_heads")?,
+            attn_i32(num_kv_heads, "ring varlen kv_heads")?,
+            attn_i32(head_dim, "ring varlen head_dim")?,
+            attn_i32(seq_len, "ring varlen seq_len")?,
+            ring_base_dev_ptr as *const i32,
+            kv_len_dev_ptr as *const i32,
+            attn_i32(ring_modulus, "ring varlen ring_modulus")?,
+            sm_scale,
+            stream.cu_stream(),
+        )
+        .result()
+        .map_err(|e| {
+            anyhow!("nonpaged_prefill_attention_ring_varlen_cuda failed at seq={seq_len}: {e}")
+        })
+    }
+}
+
+/// Slot-batched [`nonpaged_prefill_attention_ring_varlen_raw`]: `k_slots_ptr` /
+/// `v_slots_ptr` are device arrays of `slots` ring-cache base pointers, and the
+/// window tables are slot-major (`slots * seq_len` i32 each).
+#[allow(clippy::too_many_arguments)]
+pub fn nonpaged_prefill_attention_ring_varlen_batched_raw(
+    stream: &CudaStream,
+    q_ptr: u64,
+    k_slots_ptr: u64,
+    v_slots_ptr: u64,
+    out_ptr: u64,
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    seq_len: usize,
+    slots: usize,
+    ring_base_dev_ptr: u64,
+    kv_len_dev_ptr: u64,
+    ring_modulus: usize,
+    sm_scale: f32,
+) -> Result<()> {
+    // SAFETY: caller passes live device addresses; the slot arrays hold `slots`
+    // live ring-cache bases, window tables slot-major, stream-ordered.
+    unsafe {
+        ffi::nonpaged_prefill_attention_ring_varlen_batched_cuda(
+            q_ptr as *const ffi::Half,
+            k_slots_ptr as *const *const std::ffi::c_void,
+            v_slots_ptr as *const *const std::ffi::c_void,
+            out_ptr as *mut ffi::Half,
+            attn_i32(num_q_heads, "ring varlen batched q_heads")?,
+            attn_i32(num_kv_heads, "ring varlen batched kv_heads")?,
+            attn_i32(head_dim, "ring varlen batched head_dim")?,
+            attn_i32(seq_len, "ring varlen batched seq_len")?,
+            attn_i32(slots, "ring varlen batched slots")?,
+            ring_base_dev_ptr as *const i32,
+            kv_len_dev_ptr as *const i32,
+            attn_i32(ring_modulus, "ring varlen batched ring_modulus")?,
+            sm_scale,
+            stream.cu_stream(),
+        )
+        .result()
+        .map_err(|e| {
+            anyhow!(
+                "nonpaged_prefill_attention_ring_varlen_batched_cuda failed at slots={slots}: {e}"
+            )
+        })
+    }
+}
+
+/// 2D ring-prefill dense prep (Qwen3.6 HD256): q/k-norm + partial RoPE into
+/// dense head-major buffers with NO pool write (the scatter owns the pool
+/// write).
+#[allow(clippy::too_many_arguments)]
+pub fn ring_prefill_dense_prep_hd256_raw(
+    stream: &CudaStream,
+    q_full_ptr: u64,
+    k_in_ptr: u64,
+    v_in_ptr: u64,
+    q_norm_ptr: u64,
+    k_norm_ptr: u64,
+    cos_ptr: u64,
+    sin_ptr: u64,
+    q_out_ptr: u64,
+    k_out_ptr: u64,
+    v_out_ptr: u64,
+    num_qo_heads: usize,
+    num_kv_heads: usize,
+    rows: usize,
+    start_pos: usize,
+    rotary_dim: usize,
+    rms_eps: f32,
+) -> Result<()> {
+    // SAFETY: caller passes live device addresses sized to the dims below,
+    // stream-ordered on `stream`.
+    unsafe {
+        ffi::ring_prefill_dense_prep_hd256_cuda(
+            q_full_ptr as *const ffi::Half,
+            k_in_ptr as *const ffi::Half,
+            v_in_ptr as *const ffi::Half,
+            q_norm_ptr as *const ffi::Half,
+            k_norm_ptr as *const ffi::Half,
+            cos_ptr as *const ffi::Half,
+            sin_ptr as *const ffi::Half,
+            q_out_ptr as *mut ffi::Half,
+            k_out_ptr as *mut ffi::Half,
+            v_out_ptr as *mut ffi::Half,
+            attn_i32(num_qo_heads, "ring dense prep qo_heads")?,
+            attn_i32(num_kv_heads, "ring dense prep kv_heads")?,
+            attn_i32(rows, "ring dense prep rows")?,
+            attn_i32(start_pos, "ring dense prep start_pos")?,
+            attn_i32(rotary_dim, "ring dense prep rotary_dim")?,
+            rms_eps,
+            stream.cu_stream(),
+        )
+        .result()
+        .map_err(|e| anyhow!("ring_prefill_dense_prep_hd256_cuda failed at rows={rows}: {e}"))
+    }
+}
+
+/// 2D ring-prefill block-cyclic scatter: write the ring block's tokens whose
+/// global page is owned by this shard into the sharded HND pool.
+#[allow(clippy::too_many_arguments)]
+pub fn ring_prefill_scatter_sharded_hd256_raw(
+    stream: &CudaStream,
+    k_dense_ptr: u64,
+    v_dense_ptr: u64,
+    local_page_table_ptr: u64,
+    local_page_count: usize,
+    page_size: usize,
+    kv_heads: usize,
+    blk_start: usize,
+    blk_len: usize,
+    cp_rank: usize,
+    cp_size: usize,
+    stride_page: usize,
+    k_pool_ptr: u64,
+    v_pool_ptr: u64,
+) -> Result<()> {
+    // SAFETY: dense buffers hold the block's prepped K/V (head-major, stride =
+    // blk_len); the page table is this shard's local table; stream-ordered.
+    unsafe {
+        ffi::ring_prefill_scatter_sharded_hd256_cuda(
+            k_dense_ptr as *const ffi::Half,
+            v_dense_ptr as *const ffi::Half,
+            local_page_table_ptr as *const i32,
+            attn_i32(local_page_count, "ring scatter page_count")?,
+            attn_i32(page_size, "ring scatter page_size")?,
+            attn_i32(kv_heads, "ring scatter kv_heads")?,
+            attn_i32(blk_start, "ring scatter blk_start")?,
+            attn_i32(blk_len, "ring scatter blk_len")?,
+            attn_i32(cp_rank, "ring scatter cp_rank")?,
+            attn_i32(cp_size, "ring scatter cp_size")?,
+            attn_i32(stride_page, "ring scatter stride_page")?,
+            k_pool_ptr as *mut ffi::Half,
+            v_pool_ptr as *mut ffi::Half,
+            stream.cu_stream(),
+        )
+        .result()
+        .map_err(|e| {
+            anyhow!("ring_prefill_scatter_sharded_hd256_cuda failed at blk_len={blk_len}: {e}")
+        })
+    }
+}
+
+/// 2D ring-prefill finalize: `out = O / L` (flash-2 normalized), transposing
+/// the accumulator's head-major layout into row-major bf16.
+pub fn ring_prefill_finalize_bf16_hd256_raw(
+    stream: &CudaStream,
+    acc_l_ptr: u64,
+    acc_o_ptr: u64,
+    out_ptr: u64,
+    q_heads: usize,
+    rows: usize,
+) -> Result<()> {
+    // SAFETY: acc buffers are `[q_heads*rows]` / `[q_heads*rows*d]` f32; out is
+    // `[rows, q_heads*d]` bf16, stream-ordered on `stream`.
+    unsafe {
+        ffi::ring_prefill_finalize_bf16_hd256_cuda(
+            acc_l_ptr as *const f32,
+            acc_o_ptr as *const f32,
+            out_ptr as *mut ffi::Half,
+            attn_i32(q_heads, "ring finalize q_heads")?,
+            attn_i32(rows, "ring finalize rows")?,
+            stream.cu_stream(),
+        )
+        .result()
+        .map_err(|e| anyhow!("ring_prefill_finalize_bf16_hd256_cuda failed at rows={rows}: {e}"))
+    }
+}
+
 /// Non-paged HD256 sigmoid gate: `attn_out *= sigmoid(gate)` with the gate
 /// rows read from the full q projection.
 pub fn attention_gate_batch_hd256_raw(

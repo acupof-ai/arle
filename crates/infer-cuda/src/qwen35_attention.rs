@@ -1174,30 +1174,26 @@ impl Qwen35Model {
                 Some(full_idx),
                 rows,
                 || {
-                    // SAFETY: buffers live on ctx.stream, sized to the dims passed.
-                    unsafe {
-                        ffi::ring_prefill_dense_prep_hd256_cuda(
-                            qf_ptr as *const ffi::Half,
-                            k_ptr as *const ffi::Half,
-                            v_ptr as *const ffi::Half,
-                            qn_ptr as *const ffi::Half,
-                            kn_ptr as *const ffi::Half,
-                            cos_ptr as *const ffi::Half,
-                            sin_ptr as *const ffi::Half,
-                            qo_ptr as *mut ffi::Half,
-                            ko_ptr as *mut ffi::Half,
-                            vo_ptr as *mut ffi::Half,
-                            q_heads as i32,
-                            kv_heads as i32,
-                            rows as i32,
-                            cp.q_pos[0] as i32,
-                            c.rotary_dim as i32,
-                            c.rms_norm_eps,
-                            self.ctx.stream.cu_stream(),
-                        )
-                        .result()?;
-                    }
-                    Ok(())
+                    // Buffers live on ctx.stream, sized to the dims passed.
+                    cuda_attn::ring_prefill_dense_prep_hd256_raw(
+                        &self.ctx.stream,
+                        qf_ptr,
+                        k_ptr,
+                        v_ptr,
+                        qn_ptr,
+                        kn_ptr,
+                        cos_ptr,
+                        sin_ptr,
+                        qo_ptr,
+                        ko_ptr,
+                        vo_ptr,
+                        q_heads,
+                        kv_heads,
+                        rows,
+                        cp.q_pos[0],
+                        c.rotary_dim,
+                        c.rms_norm_eps,
+                    )
                 },
             )?;
         }
@@ -1393,32 +1389,25 @@ impl Qwen35Model {
                             Some(full_idx),
                             rows,
                             || {
-                                // SAFETY: buffers live on ctx.stream, sized to the dims passed.
-                                unsafe {
-                                    ffi::ring_block_attention_fwd_merge_cuda(
-                                        q_ptr as *const ffi::Half,
-                                        k_ptr as *const ffi::Half,
-                                        v_ptr as *const ffi::Half,
-                                        mi_ptr as *const f32,
-                                        li_ptr as *const f32,
-                                        oi_ptr as *const f32,
-                                        mo_ptr as *mut f32,
-                                        lo_ptr as *mut f32,
-                                        oo_ptr as *mut f32,
-                                        qpos_ptr as *const f32,
-                                        kpos_ptr as *const f32,
-                                        q_heads as i32,
-                                        q_heads as i32,
-                                        kv_heads as i32,
-                                        head_dim as i32,
-                                        rows as i32,
-                                        blk_len as i32,
-                                        sm_scale,
-                                        self.ctx.stream.cu_stream(),
-                                    )
-                                    .result()?;
-                                }
-                                Ok(())
+                                // Buffers live on ctx.stream, sized to the dims passed.
+                                cuda_kernels::ring_attention::ring_block_attention_fwd_merge_raw(
+                                    &self.ctx.stream,
+                                    q_ptr,
+                                    k_ptr,
+                                    v_ptr,
+                                    mi_ptr,
+                                    li_ptr,
+                                    oi_ptr,
+                                    mo_ptr,
+                                    lo_ptr,
+                                    oo_ptr,
+                                    qpos_ptr,
+                                    kpos_ptr,
+                                    cuda_kernels::ring_attention::RingBlockDims {
+                                        blk_len,
+                                        ..dims0
+                                    },
+                                )
                             },
                         )?;
                     }
@@ -1467,35 +1456,31 @@ impl Qwen35Model {
     ) -> Result<()> {
         let cp_size = self.tp.attn_cp_size();
         let cp_rank = self.tp.attn_cp_rank();
-        let blk_start = cp.k_pos[owner][0] as i32;
+        let blk_start = cp.k_pos[owner][0];
         let blk_len = cp.k_pos[owner].len();
         let (k_ptr, _g0) = k_dense.device_ptr(&self.ctx.stream);
         let (v_ptr, _g1) = v_dense.device_ptr(&self.ctx.stream);
         let (pt_ptr, _g2) = cp.kv_indices.device_ptr(&self.ctx.stream);
         let k_pool = pool.k_ptr(full_idx, &self.ctx.stream);
         let v_pool = pool.v_ptr(full_idx, &self.ctx.stream);
-        // SAFETY: dense buffers hold the block's prepped K/V (head-major,
+        // Dense buffers hold the block's prepped K/V (head-major,
         // stride = blk_len); kv_indices is this shard's local page table.
-        unsafe {
-            ffi::ring_prefill_scatter_sharded_hd256_cuda(
-                k_ptr as *const ffi::Half,
-                v_ptr as *const ffi::Half,
-                pt_ptr as *const i32,
-                cp.kv_indices.len() as i32,
-                pool.page_size as i32,
-                kv_heads as i32,
-                blk_start,
-                blk_len as i32,
-                cp_rank as i32,
-                cp_size as i32,
-                stride_page as i32,
-                k_pool as *mut ffi::Half,
-                v_pool as *mut ffi::Half,
-                self.ctx.stream.cu_stream(),
-            )
-            .result()?;
-        }
-        Ok(())
+        cuda_attn::ring_prefill_scatter_sharded_hd256_raw(
+            &self.ctx.stream,
+            k_ptr,
+            v_ptr,
+            pt_ptr,
+            cp.kv_indices.len(),
+            pool.page_size,
+            kv_heads,
+            blk_start,
+            blk_len,
+            cp_rank,
+            cp_size,
+            stride_page,
+            k_pool,
+            v_pool,
+        )
     }
 
     /// Post two unfenced cp recvs (k, v) into the idle pair from the upstream
@@ -1594,20 +1579,16 @@ impl Qwen35Model {
             Some(full_idx),
             rows,
             || {
-                // SAFETY: acc buffers are [q_heads*rows] / [q_heads*rows*d];
+                // Acc buffers are [q_heads*rows] / [q_heads*rows*d];
                 // attn_out is [rows, q_heads*d] bf16.
-                unsafe {
-                    ffi::ring_prefill_finalize_bf16_hd256_cuda(
-                        l_ptr as *const f32,
-                        o_ptr as *const f32,
-                        out_ptr as *mut ffi::Half,
-                        q_heads as i32,
-                        rows as i32,
-                        self.ctx.stream.cu_stream(),
-                    )
-                    .result()?;
-                }
-                Ok(())
+                cuda_attn::ring_prefill_finalize_bf16_hd256_raw(
+                    &self.ctx.stream,
+                    l_ptr,
+                    o_ptr,
+                    out_ptr,
+                    q_heads,
+                    rows,
+                )
             },
         )?;
         Ok(())

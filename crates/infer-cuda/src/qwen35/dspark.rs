@@ -10,6 +10,7 @@
 use super::*;
 
 use crate::ops::rms_norm_batch;
+use cuda_kernels::attention as cuda_attn;
 use qwen35_spec::{DsparkConfig, DsparkSps, dspark_tensor_names, dspark_verify_lens};
 
 struct DsparkLayer {
@@ -814,40 +815,36 @@ impl Qwen35Model {
                 let (qo_ptr, _g6) = q_out.data.device_ptr_mut(&ctx.stream);
                 let (kc_ptr, _g7) = df.k_ctx[li].data.device_ptr_mut(&ctx.stream);
                 let (vc_ptr, _g8) = df.v_ctx[li].data.device_ptr_mut(&ctx.stream);
-                let nkv = head.cfg.num_key_value_heads as i32;
-                let hd = head.cfg.head_dim as i32;
+                let nkv = head.cfg.num_key_value_heads;
+                let hd = head.cfg.head_dim;
                 // One launch must not wrap the ring, else two tokens alias one row.
                 ensure!(
                     rows <= cap_li,
                     "dspark sliding append rows {rows} > ring cap {cap_li}; lower chunked_prefill_size"
                 );
-                // SAFETY: ring cache sized cap_li*kv_dim; rows <= cap_li (no
+                // Ring cache sized cap_li*kv_dim; rows <= cap_li (no
                 // aliasing); abs positions < rope_cap index the cos/sin tables.
-                unsafe {
-                    ffi::prefill_attention_hd256_prep_ring_cuda(
-                        qd_ptr as *const ffi::Half,
-                        k_ptr as *const ffi::Half,
-                        v_ptr as *const ffi::Half,
-                        kn_ptr as *const ffi::Half,
-                        kn_ptr as *const ffi::Half,
-                        cos_ptr as *const ffi::Half,
-                        sin_ptr as *const ffi::Half,
-                        qo_ptr as *mut ffi::Half,
-                        kc_ptr as *mut ffi::Half,
-                        vc_ptr as *mut ffi::Half,
-                        nkv,
-                        nkv,
-                        hd,
-                        rows as i32,
-                        sp_abs as *const i32,
-                        hd,
-                        head.cfg.rms_norm_eps,
-                        cap_li as i32,
-                        ctx.stream.cu_stream(),
-                    )
-                    .result()?;
-                }
-                Ok(())
+                cuda_attn::prefill_attention_hd256_prep_ring_raw(
+                    &ctx.stream,
+                    qd_ptr,
+                    k_ptr,
+                    v_ptr,
+                    kn_ptr,
+                    kn_ptr,
+                    cos_ptr,
+                    sin_ptr,
+                    qo_ptr,
+                    kc_ptr,
+                    vc_ptr,
+                    nkv,
+                    nkv,
+                    hd,
+                    rows,
+                    sp_abs,
+                    hd,
+                    head.cfg.rms_norm_eps,
+                    cap_li,
+                )
             })?;
         }
         df.ctx_end = start + rows;
@@ -933,36 +930,33 @@ impl Qwen35Model {
                     let (qp_ptr, _g7) = q_prepped.data.device_ptr_mut(&ctx.stream);
                     let (kc_ptr, _g8) = df.k_ctx[li].data.device_ptr_mut(&ctx.stream);
                     let (vc_ptr, _g9) = df.v_ctx[li].data.device_ptr_mut(&ctx.stream);
-                    let nq = cfg.num_attention_heads as i32;
-                    let nkv = cfg.num_key_value_heads as i32;
-                    let hd = cfg.head_dim as i32;
+                    let nq = cfg.num_attention_heads;
+                    let nkv = cfg.num_key_value_heads;
+                    let hd = cfg.head_dim;
                     let (sp_ptr, _g10) = start_abs.device_ptr(&ctx.stream);
-                    // SAFETY: ring cache cap_li*kv_dim; abs pos < rope_cap;
+                    // Ring cache cap_li*kv_dim; abs pos < rope_cap;
                     // block (≤ cap_li) noise rows write distinct ring rows.
-                    unsafe {
-                        ffi::prefill_attention_hd256_prep_ring_cuda(
-                            qf_ptr as *const ffi::Half,
-                            k_ptr as *const ffi::Half,
-                            v_ptr as *const ffi::Half,
-                            qn_ptr as *const ffi::Half,
-                            kn_ptr as *const ffi::Half,
-                            cos_ptr as *const ffi::Half,
-                            sin_ptr as *const ffi::Half,
-                            qp_ptr as *mut ffi::Half,
-                            kc_ptr as *mut ffi::Half,
-                            vc_ptr as *mut ffi::Half,
-                            nq,
-                            nkv,
-                            hd,
-                            block as i32,
-                            sp_ptr as *const i32,
-                            hd,
-                            eps,
-                            cap_li as i32,
-                            ctx.stream.cu_stream(),
-                        )
-                        .result()?;
-                    }
+                    cuda_attn::prefill_attention_hd256_prep_ring_raw(
+                        &ctx.stream,
+                        qf_ptr,
+                        k_ptr,
+                        v_ptr,
+                        qn_ptr,
+                        kn_ptr,
+                        cos_ptr,
+                        sin_ptr,
+                        qp_ptr,
+                        kc_ptr,
+                        vc_ptr,
+                        nq,
+                        nkv,
+                        hd,
+                        block,
+                        sp_ptr,
+                        hd,
+                        eps,
+                        cap_li,
+                    )?;
                 }
 
                 // Non-causal: every noise row attends its whole window of the
@@ -975,29 +969,26 @@ impl Qwen35Model {
                     let (vc_ptr, _g2) = df.v_ctx[li].data.device_ptr(&ctx.stream);
                     let (o_ptr, _g3) = attn_heads.data.device_ptr_mut(&ctx.stream);
                     let (w_ptr, _g4) = win_dev.device_ptr(&ctx.stream);
-                    let nq = cfg.num_attention_heads as i32;
-                    let nkv = cfg.num_key_value_heads as i32;
-                    let hd = cfg.head_dim as i32;
-                    // SAFETY: `win` holds 2*block i32 (bases then lengths, each
+                    let nq = cfg.num_attention_heads;
+                    let nkv = cfg.num_key_value_heads;
+                    let hd = cfg.head_dim;
+                    // `win` holds 2*block i32 (bases then lengths, each
                     // length ≤ cap_li as asserted above).
-                    unsafe {
-                        ffi::nonpaged_prefill_attention_ring_varlen_cuda(
-                            q_ptr as *const ffi::Half,
-                            kc_ptr as *const ffi::Half,
-                            vc_ptr as *const ffi::Half,
-                            o_ptr as *mut ffi::Half,
-                            nq,
-                            nkv,
-                            hd,
-                            block as i32,
-                            w_ptr as *const i32,
-                            (w_ptr as *const i32).add(block),
-                            cap_li as i32,
-                            sm_scale,
-                            ctx.stream.cu_stream(),
-                        )
-                        .result()?;
-                    }
+                    cuda_attn::nonpaged_prefill_attention_ring_varlen_raw(
+                        &ctx.stream,
+                        q_ptr,
+                        kc_ptr,
+                        vc_ptr,
+                        o_ptr,
+                        nq,
+                        nkv,
+                        hd,
+                        block,
+                        w_ptr,
+                        w_ptr + (block * std::mem::size_of::<i32>()) as u64,
+                        cap_li,
+                        sm_scale,
+                    )?;
                 }
 
                 let attn_out_h = scratch.attn_out_h.get(ctx, hidden, block)?;
@@ -1318,9 +1309,9 @@ impl Qwen35Model {
                     let (ao_ptr, _g8) = attn_heads.data.device_ptr_mut(&ctx.stream);
                     let (w_ptr, _g9) = win_dev.device_ptr(&ctx.stream);
                     let (sp_ptr, _g10) = pos_dev.device_ptr(&ctx.stream);
-                    let nq = cfg.num_attention_heads as i32;
-                    let nkv = cfg.num_key_value_heads as i32;
-                    let hd = cfg.head_dim as i32;
+                    let nq = cfg.num_attention_heads;
+                    let nkv = cfg.num_key_value_heads;
+                    let hd = cfg.head_dim;
                     let sm_scale = 1.0 / (cfg.head_dim as f32).sqrt();
                     // `[k bases][v bases]`, one entry per slot, so the attention
                     // below runs once at gridZ = slots instead of once per slot.
@@ -1332,59 +1323,53 @@ impl Qwen35Model {
                         let (vc_ptr, gv) = df.v_ctx[li].data.device_ptr_mut(&ctx.stream);
                         kv_bases[s] = kc_ptr;
                         kv_bases[b + s] = vc_ptr;
-                        // SAFETY: offset by this slot's `block` rows inside a
+                        // Offset by this slot's `block` rows inside a
                         // `rows`-row buffer; ring bounds guarded above.
-                        unsafe {
-                            ffi::prefill_attention_hd256_prep_ring_cuda(
-                                (qf_ptr + off * 2 * q_dim as u64 * elem) as *const ffi::Half,
-                                (k_ptr + off * kv_dim as u64 * elem) as *const ffi::Half,
-                                (v_ptr + off * kv_dim as u64 * elem) as *const ffi::Half,
-                                qn_ptr as *const ffi::Half,
-                                kn_ptr as *const ffi::Half,
-                                cos_ptr as *const ffi::Half,
-                                sin_ptr as *const ffi::Half,
-                                (qp_ptr + off * q_dim as u64 * elem) as *mut ffi::Half,
-                                kc_ptr as *mut ffi::Half,
-                                vc_ptr as *mut ffi::Half,
-                                nq,
-                                nkv,
-                                hd,
-                                block as i32,
-                                (sp_ptr + s as u64 * 4) as *const i32,
-                                hd,
-                                eps,
-                                cap_li as i32,
-                                ctx.stream.cu_stream(),
-                            )
-                            .result()?;
-                        }
+                        cuda_attn::prefill_attention_hd256_prep_ring_raw(
+                            &ctx.stream,
+                            qf_ptr + off * 2 * q_dim as u64 * elem,
+                            k_ptr + off * kv_dim as u64 * elem,
+                            v_ptr + off * kv_dim as u64 * elem,
+                            qn_ptr,
+                            kn_ptr,
+                            cos_ptr,
+                            sin_ptr,
+                            qp_ptr + off * q_dim as u64 * elem,
+                            kc_ptr,
+                            vc_ptr,
+                            nq,
+                            nkv,
+                            hd,
+                            block,
+                            sp_ptr + s as u64 * 4,
+                            hd,
+                            eps,
+                            cap_li,
+                        )?;
                         ring_guards.push(gk);
                         ring_guards.push(gv);
                     }
                     let slots_dev = scratch.attn_kv_slots.upload(ctx, &kv_bases)?;
                     let (sl_ptr, _gs) = slots_dev.device_ptr(&ctx.stream);
-                    // SAFETY: `kv_bases` holds this layer's `b` k rings then `b` v
+                    // `kv_bases` holds this layer's `b` k rings then `b` v
                     // rings, each staged above; the window table is `rows` bases
                     // then `rows` lengths, slot-major as the kernel indexes it.
-                    unsafe {
-                        ffi::nonpaged_prefill_attention_ring_varlen_batched_cuda(
-                            qp_ptr as *const ffi::Half,
-                            sl_ptr as *const *const std::ffi::c_void,
-                            (sl_ptr as *const *const std::ffi::c_void).add(b),
-                            ao_ptr as *mut ffi::Half,
-                            nq,
-                            nkv,
-                            hd,
-                            block as i32,
-                            b as i32,
-                            w_ptr as *const i32,
-                            (w_ptr as *const i32).add(rows),
-                            cap_li as i32,
-                            sm_scale,
-                            ctx.stream.cu_stream(),
-                        )
-                        .result()?;
-                    }
+                    cuda_attn::nonpaged_prefill_attention_ring_varlen_batched_raw(
+                        &ctx.stream,
+                        qp_ptr,
+                        sl_ptr,
+                        sl_ptr + (b * std::mem::size_of::<u64>()) as u64,
+                        ao_ptr,
+                        nq,
+                        nkv,
+                        hd,
+                        block,
+                        b,
+                        w_ptr,
+                        w_ptr + (rows * std::mem::size_of::<i32>()) as u64,
+                        cap_li,
+                        sm_scale,
+                    )?;
                 }
 
                 let attn_out_h = scratch.attn_out_h.get(ctx, hidden, rows)?;

@@ -8,12 +8,11 @@ use super::*;
 // route and its launches live tape-free in `cuda_kernels::ring_attention`; the
 // scalar one-block kernels below remain the non-sm90 / non-hd256 fallback.
 #[cfg(not(feature = "no-cuda"))]
-use cuda_kernels::ring_attention::{ring_block_bwd_fa3, ring_block_fwd_merge_fa3, ring_fa3_route};
-
-#[cfg(not(feature = "no-cuda"))]
-pub(super) fn ring_i32(v: usize, label: &'static str) -> Result<i32> {
-    i32::try_from(v).map_err(|_| AutogradError::TapeInvariant(label))
-}
+use cuda_kernels::ring_attention::{
+    ring_block_attention_bwd_raw, ring_block_attention_finalize_raw,
+    ring_block_attention_fwd_merge_raw, ring_block_bwd_fa3, ring_block_fwd_merge_fa3,
+    ring_fa3_route,
+};
 
 /// Map a ring-core anyhow error (alloc shapes, launch labels) into the tape's
 /// static error, keeping the detail in the log.
@@ -95,35 +94,25 @@ pub(super) fn cuda_ring_block_fwd_merge(
         let (oo_ptr, _oog) = o_out.device_ptr_mut(&backend.stream);
         let (qpos_ptr, _qpg) = qpos_slice.device_ptr(&backend.stream);
         let (kpos_ptr, _kpg) = kpos_slice.device_ptr(&backend.stream);
-        check_cuda_ffi(
-            // SAFETY: q/k/v are live bf16 copies; acc_*_in are f32 handles of the right
-            // length; *_out are freshly allocated rows / rows*hd; q_pos/k_pos are f32
-            // handles of q_rows / blk_len; dims mirror the shapes.
-            unsafe {
-                ffi::ring_block_attention_fwd_merge_cuda(
-                    q_ptr as *const ffi::Half,
-                    k_ptr as *const ffi::Half,
-                    v_ptr as *const ffi::Half,
-                    mi_ptr as *const f32,
-                    li_ptr as *const f32,
-                    oi_ptr as *const f32,
-                    mo_ptr as *mut f32,
-                    lo_ptr as *mut f32,
-                    oo_ptr as *mut f32,
-                    qpos_ptr as *const f32,
-                    kpos_ptr as *const f32,
-                    ring_i32(dims.num_q_tiles, "ring num_q_tiles i32")?,
-                    ring_i32(dims.num_q_heads, "ring num_q_heads i32")?,
-                    ring_i32(dims.num_kv_heads, "ring num_kv_heads i32")?,
-                    ring_i32(dims.head_dim, "ring head_dim i32")?,
-                    ring_i32(dims.q_rows, "ring q_rows i32")?,
-                    ring_i32(dims.blk_len, "ring blk_len i32")?,
-                    dims.sm_scale,
-                    backend.stream.cu_stream(),
-                )
-            },
-            "ring_block_attention_fwd_merge_cuda",
-        )?;
+        // q/k/v are live bf16 copies; acc_*_in are f32 handles of the right
+        // length; *_out are freshly allocated rows / rows*hd; q_pos/k_pos are f32
+        // handles of q_rows / blk_len; dims mirror the shapes.
+        ring_block_attention_fwd_merge_raw(
+            &backend.stream,
+            q_ptr,
+            k_ptr,
+            v_ptr,
+            mi_ptr,
+            li_ptr,
+            oi_ptr,
+            mo_ptr,
+            lo_ptr,
+            oo_ptr,
+            qpos_ptr,
+            kpos_ptr,
+            dims,
+        )
+        .map_err(|e| ring_core_err(e, "ring_block_attention_fwd_merge_cuda"))?;
     }
     Ok((
         DeviceHandle::Cuda(CudaStorage::new(m_out)),
@@ -159,23 +148,19 @@ pub(super) fn cuda_ring_block_finalize(
         let (o_ptr, _og) = o_slice.device_ptr(&backend.stream);
         let (out_ptr, _outg) = out_f32.device_ptr_mut(&backend.stream);
         let (lse_ptr, _lseg) = lse.device_ptr_mut(&backend.stream);
-        check_cuda_ffi(
-            // SAFETY: acc_* are f32 handles length rows / rows*hd; out is rows*hd f32;
-            // lse is rows f32; dims mirror the shapes.
-            unsafe {
-                ffi::ring_block_attention_finalize_cuda(
-                    m_ptr as *const f32,
-                    l_ptr as *const f32,
-                    o_ptr as *const f32,
-                    out_ptr as *mut f32,
-                    lse_ptr as *mut f32,
-                    ring_i32(total_rows, "ring total_rows i32")?,
-                    ring_i32(head_dim, "ring head_dim i32")?,
-                    backend.stream.cu_stream(),
-                )
-            },
-            "ring_block_attention_finalize_cuda",
-        )?;
+        // acc_* are f32 handles length rows / rows*hd; out is rows*hd f32;
+        // lse is rows f32; dims mirror the shapes.
+        ring_block_attention_finalize_raw(
+            &backend.stream,
+            m_ptr,
+            l_ptr,
+            o_ptr,
+            out_ptr,
+            lse_ptr,
+            total_rows,
+            head_dim,
+        )
+        .map_err(|e| ring_core_err(e, "ring_block_attention_finalize_cuda"))?;
     }
     Ok((
         DeviceHandle::Cuda(CudaStorage::new(out_f32)),
@@ -271,35 +256,25 @@ pub(super) fn cuda_ring_block_bwd(
         let (gv_ptr, _gvg) = gv.device_ptr_mut(&backend.stream);
         let (qpos_ptr, _qpg) = qpos_slice.device_ptr(&backend.stream);
         let (kpos_ptr, _kpg) = kpos_slice.device_ptr(&backend.stream);
-        check_cuda_ffi(
-            // SAFETY: bf16 copies + f32 out/lse/grad handles of matching length; gk/gv
-            // sized to one block's [Tkv, blk_len, hd]; q_pos/k_pos f32 of q_rows/blk_len;
-            // dims mirror the shapes.
-            unsafe {
-                ffi::ring_block_attention_bwd_cuda(
-                    q_ptr as *const ffi::Half,
-                    k_ptr as *const ffi::Half,
-                    v_ptr as *const ffi::Half,
-                    out_ptr as *const f32,
-                    lse_ptr as *const f32,
-                    do_ptr as *const ffi::Half,
-                    gq_ptr as *mut f32,
-                    gk_ptr as *mut f32,
-                    gv_ptr as *mut f32,
-                    qpos_ptr as *const f32,
-                    kpos_ptr as *const f32,
-                    ring_i32(dims.num_q_tiles, "ring bwd num_q_tiles i32")?,
-                    ring_i32(dims.num_q_heads, "ring bwd num_q_heads i32")?,
-                    ring_i32(dims.num_kv_heads, "ring bwd num_kv_heads i32")?,
-                    ring_i32(dims.head_dim, "ring bwd head_dim i32")?,
-                    ring_i32(dims.q_rows, "ring bwd q_rows i32")?,
-                    ring_i32(dims.blk_len, "ring bwd blk_len i32")?,
-                    dims.sm_scale,
-                    backend.stream.cu_stream(),
-                )
-            },
-            "ring_block_attention_bwd_cuda",
-        )?;
+        // bf16 copies + f32 out/lse/grad handles of matching length; gk/gv
+        // sized to one block's [Tkv, blk_len, hd]; q_pos/k_pos f32 of q_rows/blk_len;
+        // dims mirror the shapes.
+        ring_block_attention_bwd_raw(
+            &backend.stream,
+            q_ptr,
+            k_ptr,
+            v_ptr,
+            out_ptr,
+            lse_ptr,
+            do_ptr,
+            gq_ptr,
+            gk_ptr,
+            gv_ptr,
+            qpos_ptr,
+            kpos_ptr,
+            dims,
+        )
+        .map_err(|e| ring_core_err(e, "ring_block_attention_bwd_cuda"))?;
     }
     Ok((
         DeviceHandle::Cuda(CudaStorage::new(gq_out)),
