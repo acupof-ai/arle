@@ -36,6 +36,11 @@ T8 prep `4f1051ddf` · clippy `9802112e2`.
   A/B (c=1/4/8/16 in noise) covers the dispatch consolidation.
 - Eval harness on the HEAD binary: VERDICT PASS 3/3 (prefix_reuse,
   token_reuse, multiturn_concurrent).
+- Multi-model receipt (2026-08-21, same binary pair, GPU-isolated serial runs):
+  ThinkingCap-Qwen3.6-27B-FP8 and Qwen3.6-27B-FP8 each show identical route
+  counters, identical greedy text, and needle 12/12 exact DET at
+  512/4096/16384/32768 on both binaries. DSv4-Flash-FP8 requires TP4; only
+  three GPUs were free — pending GPU availability.
 
 ## Rule
 
