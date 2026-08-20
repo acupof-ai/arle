@@ -1,6 +1,6 @@
 # Quant-linear dispatch consolidation — remote gates
 
-> Status: remote gates in progress (H20, 2026-08-20).
+> Status: ACCEPT — all remote gates pass (H20, 2026-08-20).
 
 ## Context
 
@@ -51,15 +51,16 @@ Remote gates (H20, baseline `10df1d079` vs `b7432e52a`, Qwen3.8-27B-NVFP4):
   | 16 | 99.37 | 99.21 | -0.2% | 105.97 | 109.51 | +3.3% | 3/3 |
 
   TTFT deltas +4.1% / +4.8% / -9.2% — all inside the ≤10% noise band. No
-  regression. c=1: baseline arm 0/3 (`CUDA_ERROR_OUT_OF_MEMORY` at the second
-  32K prefill; tranche-1 arm 3/3 at 20.45 ms ITL); the archived baseline was
-  deleted by an unrelated cleanup mid-gate, so the cell is being re-run from a
-  rebuilt `10df1d079` binary. OOM cause unknown pending the re-run.
+  regression. c=1: the first baseline arm hit `CUDA_ERROR_OUT_OF_MEMORY` on a
+  GPU carrying a ~22 GB foreign resident; the clean-GPU re-run (rebuilt
+  `10df1d079`, 3 trials) completed 32/32 each with zero OOM at 41.5/41.6 tok/s
+  warm, decode 48.3 tok/s (≈20.7 ms ITL) vs the tranche-1 arm's 42.0 tok/s /
+  20.45 ms ITL — within noise. The OOM was environmental.
+- Eval harness — PASS. `python -m eval_harness` on the tranche-1 binary:
+  VERDICT PASS 3/3 (prefix_reuse, token_reuse, multiturn_concurrent).
 
-Eval harness (prefix_reuse / token_reuse / multiturn_concurrent) on the
-tranche-1 binary: pending, queued behind the c=1 re-run.
-
-Tranche 2A records the verdict and CHANGELOG line.
+Verdict (Tranche 2A): ACCEPT. All five gate classes pass on hardware; the
+structural change carries no performance or correctness claim beyond parity.
 
 ## Rule
 
