@@ -865,7 +865,12 @@ mlx_array* mlx_tape_replay(
         require_rank(state_arr, 4, "state_in");
         require_dtype(tape_arr, bfloat16, "tape");
         require_dtype(k_arr, bfloat16, "k");
-        require_dtype(g_arr, bfloat16, "g");
+        // g may be bf16 (legacy tapes) or f32 (compiled_compute_g_beta output);
+        // the kernel uses g in float arithmetic and the signature is
+        // auto-generated from the array dtype, so both work natively.
+        if (g_arr.dtype() != bfloat16 && g_arr.dtype() != float32) {
+            throw std::invalid_argument("mlx_tape_replay requires g to be bfloat16 or float32");
+        }
         require_dtype(state_arr, float32, "state_in");
 
         int B = tape_arr.shape(0);
