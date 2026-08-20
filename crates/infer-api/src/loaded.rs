@@ -1451,7 +1451,11 @@ mod backend {
         infer_metal::apply_runtime_flags(&config.metal);
         let metal_kv_dtype = infer_metal::MetalKvCacheDtype::resolve(config.kv_cache_dtype)?;
         let resolved = infer_metal::resolve_model_path(model_path)?;
-        let tokenizer = OpenAiTokenizer::from_model_dir(&resolved)?;
+        // Tokenizer loading (~190ms) is independent of resource planning and
+        // engine startup — run it in parallel.
+        let tokenizer_path = resolved.clone();
+        let tokenizer_handle =
+            std::thread::spawn(move || OpenAiTokenizer::from_model_dir(&tokenizer_path));
         let model_id = crate::serve_engine::model_id_from_path(model_path);
 
         let model_source = resolved.to_string_lossy().to_string();
@@ -1531,6 +1535,9 @@ mod backend {
             },
             shutdown,
         )?;
+        let tokenizer = tokenizer_handle
+            .join()
+            .expect("tokenizer thread panicked")?;
         Ok((serve, tokenizer, model_id))
     }
 
