@@ -36,3 +36,33 @@ numeric_abs_tolerance = 1.0
 numeric_rel_tolerance = 0.02
 fallback_min_m = 2
 fallback_status = "legacy-default-unqualified"
+
+[[semantic]]
+id = "qwen.rms_norm"
+kind = "primitive"
+inputs = ["hidden", "gamma"]
+outputs = ["normed"]
+reference = "cuda.qwen.rms_norm_batched"
+correctness_gate = "numeric+e2e"
+
+[[implementation]]
+id = "cuda.qwen.rms_norm_batched"
+semantic = "qwen.rms_norm"
+provider = "arle"
+source = "crates/cuda-kernels/src/tensor_ops.rs"
+legality = "always"
+fallback = ""
+
+[[implementation]]
+id = "cuda.qwen.rms_norm_vec"
+semantic = "qwen.rms_norm"
+provider = "arle"
+source = "crates/cuda-kernels/src/tensor_ops.rs"
+legality = "seq_len==1"
+fallback = "cuda.qwen.rms_norm_batched"
+
+[policy."qwen.rms_norm"]
+numeric_tolerance_mode = "abs+rel*abs(reference)"
+numeric_abs_tolerance = 0.01
+numeric_rel_tolerance = 0.02
+fallback_status = "legacy-default-unqualified"
