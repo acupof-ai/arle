@@ -740,7 +740,6 @@ mod app {
                     kl_direction: KlDirection::Forward,
                     kl_temperature: 1.0,
                     kl_beta: None,
-                    teacher_topk: None,
                     fused_distill: true,
                     logits_window_size: args.logits_window_size,
                     kl_mask: args.opd_kl_mask,
