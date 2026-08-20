@@ -1046,7 +1046,7 @@ struct Qwen35CompiledModel {
         }
 
         array g(0), beta(0);
-        if (S > 1 && use_qwen35_cpp_prefill_gbeta_helper()) {
+        if (use_qwen35_cpp_prefill_gbeta_helper()) {
             auto gb = compiled_compute_g_beta()({lw.a_log, a_raw, lw.dt_bias, b_raw});
             g = gb[0];
             beta = gb[1];
@@ -1064,8 +1064,8 @@ struct Qwen35CompiledModel {
             auto q_kernel = contiguous(astype(reshape(q, {B, S, hk, dk}), bfloat16));
             auto k_kernel = contiguous(astype(reshape(k, {B, S, hk, dk}), bfloat16));
             auto v_kernel = contiguous(astype(reshape(v_raw, {B, S, hv, dv}), bfloat16));
-            auto g_kernel = contiguous(astype(reshape(g, {B, S, hv}), bfloat16));
-            auto beta_kernel = contiguous(astype(reshape(beta, {B, S, hv}), bfloat16));
+            auto g_kernel = contiguous(reshape(g, {B, S, hv}));
+            auto beta_kernel = contiguous(reshape(beta, {B, S, hv}));
             int threadgroup_y = qwen35_cpp_gdr_threadgroup_y(S);
             std::vector<array> inputs = {
                 q_kernel, k_kernel, v_kernel, g_kernel, beta_kernel, gdr_state_in, gdr_t_arr
@@ -1097,13 +1097,12 @@ struct Qwen35CompiledModel {
                     {});
                 y = std::move(result[0]);
                 gdr_state_out = std::move(result[1]);
-                // Record tape for rollback. tape_replay requires bf16 for
-                // g/k/tape, but compute_g_impl produces f32 because neg_exp_a
-                // is f32. Cast here so the tape kernel's dtype gate holds.
+                // Record tape for rollback. tape_replay accepts bf16 or f32 g;
+                // k and tape must be bf16 (kernel dtype gate).
                 artifacts->gdr_tapes.push_back({
                     std::move(result[2]),            // innovation_tape (bf16 from kernel)
                     k_kernel,                        // k
-                    g_kernel,                        // g (was f32)
+                    g_kernel,                        // g (f32 from compiled_compute_g_beta)
                     contiguous(qkv),                 // qkv for conv rebuild
                 });
             } else {
