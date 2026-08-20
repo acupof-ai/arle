@@ -216,6 +216,27 @@ pub(super) fn shape_size(shape: &[usize]) -> usize {
     }
 }
 
+/// One sync+trim+retry on cuMemAllocAsync failure: mid-backward the pool holds
+/// pages that pending frees and a trim can return, which a fresh size class
+/// needs (observed: 1.6 GB transpose OOM at 131,072 with a reclaimable hoard).
+#[cfg(not(feature = "no-cuda"))]
+pub(super) fn alloc_zeros_retry<T>(
+    backend: &CudaBackend,
+    n: usize,
+) -> std::result::Result<cudarc::driver::CudaSlice<T>, cudarc::driver::DriverError>
+where
+    T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits,
+{
+    match backend.stream.alloc_zeros::<T>(n) {
+        Ok(v) => Ok(v),
+        Err(first) => {
+            let _ = backend.stream.synchronize();
+            let _ = crate::backend::Backend::trim_memory_pool(backend);
+            backend.stream.alloc_zeros::<T>(n).map_err(|_| first)
+        }
+    }
+}
+
 #[cfg(not(feature = "no-cuda"))]
 pub(super) fn cuda_alloc_failed(op: &'static str, shape: Vec<usize>) -> AutogradError {
     let bytes = shape_size(&shape).saturating_mul(std::mem::size_of::<f32>());

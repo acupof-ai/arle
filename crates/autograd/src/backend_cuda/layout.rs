@@ -102,7 +102,7 @@ pub(super) fn cuda_transpose_axes_swap_device(
     if x_bf16 {
         let d_x = backend.cuda_bf16_slice(x, "transpose_axes_swap")?;
         let bytes = total.saturating_mul(std::mem::size_of::<u16>());
-        let mut d_out = backend.stream.alloc_zeros::<u16>(total).map_err(|_| {
+        let mut d_out = alloc_zeros_retry::<u16>(backend, total).map_err(|_| {
             AutogradError::CudaAllocFailed {
                 op: "transpose",
                 shape: new_shape.clone(),
@@ -132,10 +132,7 @@ pub(super) fn cuda_transpose_axes_swap_device(
 
     let d_x = backend.cuda_slice(x, "transpose_axes_swap")?;
     let bytes = total.saturating_mul(std::mem::size_of::<f32>());
-    let mut d_out =
-        backend
-            .stream
-            .alloc_zeros::<f32>(total)
+    let mut d_out = alloc_zeros_retry::<f32>(backend, total)
             .map_err(|_| AutogradError::CudaAllocFailed {
                 op: "transpose",
                 shape: new_shape.clone(),
