@@ -340,7 +340,7 @@ makes the dense_ffn column a clean single-variable comparison.
 
 ## Qwen3.8-27B-NVFP4 · 1×H20 · single-GPU · eager — NVFP4 ANCHOR
 
-### SOTA — runtime `30171f8be` (2026-08-20)
+### SOTA — runtime `ec5edf987` (2026-08-20)
 
 Mixed-precision: NVFP4 MLP (group_size=16, E2M1 + E4M3 group scales) on 56 of 64
 layers + FP8 per-channel attention (F8_E4M3 + BF16 `[N,1]` weight_scale)
@@ -368,15 +368,21 @@ taken back to back. 32/32 complete and `SERVER_ERRORS=0` at every cell.
 
 | c | NVFP4 ITL ms | FP8 ITL ms | ITL | NVFP4 out tok/s | FP8 out tok/s | end-to-end |
 |---:|---:|---:|---:|---:|---:|---:|
-| 1 | **20.45** | 24.81 | **+21.3%** | 19.49 | 19.65 | −0.8% |
-| 4 | **40.04** | 47.31 | **+18.2%** | **84.13** | 75.53 | **+11.4%** |
-| 8 | **71.16** | 79.47 | **+11.7%** | **98.00** | 91.62 | **+7.0%** |
-| 16 | **130.68** | 135.84 | **+3.9%** | 106.24 | 106.53 | −0.3% |
+| 1 | **20.46** | 24.81 | **+21.3%** | **20.60** | 19.61 | **+5.0%** |
+| 4 | **39.40** | 47.57 | **+20.7%** | **86.24** | 74.79 | **+15.3%** |
+| 8 | **69.81** | 79.00 | **+13.2%** | **100.80** | 92.42 | **+9.1%** |
+| 16 | **130.11** | 137.23 | **+5.5%** | **107.06** | 105.14 | **+1.8%** |
 
-NVFP4 leads on ITL at every concurrency and the lead decays monotonically with
-it — 21.3 → 18.2 → 11.7 → 3.9. End-to-end it leads at c=4 and c=8 and is at
-parity at c=1 and c=16, because this workload is 154:1 prefill-to-decode and
-prefill is where the two formats are closest.
+NVFP4 leads on both metrics at every concurrency. The ITL lead decays
+monotonically — 21.3 → 20.7 → 13.2 → 5.5 — which is the `dense_ffn` decode
+residue [the occupancy entry](experience/errors/2026-08-19-marlin-decode-is-not-occupancy-limited.md)
+measured and three tunings failed to move.
+
+End-to-end went `−0.8 / +11.4 / +7.0 / −0.3` before the two prefill-kernel
+changes below. ITL is unchanged across them (20.45 → 20.46 at c=1) because the
+materialisers only run at M ≥ 512 and no decode batch reaches that; the whole
+gain lands in prefill, which is what an end-to-end-up / ITL-flat split should
+look like on a 154:1 prefill-to-decode workload.
 
 **A c=16 row measured 2026-08-20 on a contended box is discarded, not superseded:
 the FP8 control arm — unchanged code, unchanged config, identical resident bytes
@@ -456,9 +462,24 @@ already carries.
 | DeepGEMM, FP8 | 2.664 | **274** | 93% of FP8's 296 |
 
 sm_90 has no FP4 tensor core, so a real GEMM must widen the nibbles first and the
-only question is what to widen *to*. Widening to E4M3 instead of BF16 costs one
-dequant pass (278 MB against a 2.664 ms GEMM, ~3.4% at M=2048, 13% at M=512) and
-doubles the ceiling.
+only question is what to widen *to*. Widening to E4M3 instead of BF16 doubles the
+ceiling.
+
+Per-op, `ARLE_QWEN35_QUANT_PROFILE`, three 14K-token prefills, ms/call:
+
+| op | first shipped | tables out | vectorised |
+|---|---:|---:|---:|
+| `qwen/deepgemm/dense_gemm` | 1.4465 | 1.4426 | 1.4427 |
+| `qwen/fp4/dense_widen_fp8` | 0.7559 | **0.1871** | 0.1871 |
+| `qwen/fp8/dense_channel_scale` | 0.1169 | 0.1153 | **0.0313** |
+| `qwen/deepgemm/dense_pack_quantize` | 0.0424 | 0.0409 | 0.0410 |
+| `qwen/fp8/dense_materialize` | 0.0508 | 0.0505 | 0.0505 |
+
+Non-GEMM overhead 838 ms → 303 ms, 24.5% → 10.5% of the profiled total. The
+widen was **52% of the GEMM it feeds**, not the 3.4% a roofline predicted —
+0.756 ms against a 0.093 ms bound, because it was issue-bound on two
+divergently-indexed tables, not bandwidth-bound. The path is now GEMM-dominated
+at 89.5% and `dense_gemm` is DeepGEMM at 93% of this card's FP8 peak.
 
 **The earlier "A8 vs AFP8 throughput is identical, so W4A8 needs a new kernel for
 no gain" note is withdrawn.** It compared INT8 against FP8 activations and missed
