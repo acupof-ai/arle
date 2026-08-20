@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 
 use crate::config::QuantMode;
 use crate::loader::TensorMap;
-use crate::mlx::{MlxArray, concatenate_axis, dequantize, eval, transpose_all};
+use crate::mlx::{MlxArray, concatenate_axis, dequantize, transpose_all};
 
 #[derive(Clone)]
 pub(crate) enum WeightTensor {
@@ -228,12 +228,8 @@ pub(crate) fn merge_quantized_projection_rows(
     } else {
         Some(concatenate_axis(&biases, 0))
     };
-    let mut to_eval = vec![&merged_w, &merged_scales];
-    if let Some(ref b) = merged_biases {
-        to_eval.push(b);
-    }
-    eval(&to_eval);
-
+    // Lazy: the warmup forward evaluates all merges in one graph pass.
+    // Per-merge eval here would be ~80 GPU sync points for a 32-layer model.
     Ok(Some(WeightTensor::Quantized {
         w: merged_w,
         scales: merged_scales,
@@ -259,6 +255,5 @@ pub(crate) fn concat_weight_rows(lhs: &WeightTensor, rhs: &WeightTensor) -> Resu
     let lhs_dense = lhs.to_dense_in_out();
     let rhs_dense = rhs.to_dense_in_out();
     let merged = concatenate_axis(&[lhs_dense, rhs_dense], 1);
-    eval(&[&merged]);
     Ok(WeightTensor::Dense(merged))
 }
