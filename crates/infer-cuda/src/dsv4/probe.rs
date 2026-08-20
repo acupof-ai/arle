@@ -95,10 +95,10 @@ impl Dsv4ProbeCapture {
             .memcpy_dtod(&src, &mut dst)
             .map_err(|e| anyhow!("probe capture D2D failed: {e}"))?;
 
-        if self.captured_rows == 0 {
-            self.captured_rows = rows;
-            self.positions = positions[positions.len() - rows..].to_vec();
-        }
+        // Always overwrite: a prior forward may have failed mid-loop before
+        // probe_flush ran, leaving stale rows/positions from that forward.
+        self.captured_rows = rows;
+        self.positions = positions[positions.len() - rows..].to_vec();
         Ok(())
     }
 
