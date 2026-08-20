@@ -105,26 +105,18 @@ impl Dsv4Model {
 
         // SAFETY: uninit device scratch; fully written before first read.
         let mut stream = unsafe { HiddenStates::uninit(ctx, stream_dim, m)? };
-        {
-            let (e_ptr, _ge) = e_proj.data.device_ptr(&ctx.stream);
-            let (h_ptr, _gh) = h_proj.data.device_ptr(&ctx.stream);
-            let (out_ptr, _go) = stream.data.device_ptr_mut(&ctx.stream);
-            let row_h = (hidden_size * 2) as u64;
-            let row_s = (stream_dim * 2) as u64;
-            for r in 0..m as u64 {
-                // SAFETY: per-row slices of buffers sized above.
-                unsafe {
-                    ffi::dsv4_mtp_add_eproj_hproj_cuda(
-                        (e_ptr + r * row_h) as *const ffi::Half,
-                        (h_ptr + r * row_s) as *const ffi::Half,
-                        (out_ptr + r * row_s) as *mut ffi::Half,
-                        hidden_size as i32,
-                        hc_mult as i32,
-                        ctx.stream.cu_stream(),
-                    )
-                    .result()?;
-                }
-            }
+        for r in 0..m {
+            cuda_kernels::tensor_ops::dsv4_mtp_add_eproj_hproj(
+                ctx,
+                &e_proj.data,
+                r * hidden_size,
+                &h_proj.data,
+                r * stream_dim,
+                &mut stream.data,
+                r * stream_dim,
+                hidden_size,
+                hc_mult,
+            )?;
         }
         keepalive.keep_hidden(&e_proj);
         keepalive.keep_hidden(&h_proj);

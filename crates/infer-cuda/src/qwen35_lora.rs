@@ -11,6 +11,19 @@
 
 use super::*;
 use StudentLoraProjection::*;
+use cuda_kernels::quant_linear as cuda_ql;
+use cuda_kernels::tensor::cache_ptr;
+
+/// Block-scale grid metadata of an FP8 LoRA target, as the dequant/requant
+/// launchers consume it.
+fn lora_fp8_scale_shape(matrix: &DeviceMatrix) -> cuda_ql::Fp8ScaleShape {
+    cuda_ql::Fp8ScaleShape {
+        scale_rows: matrix.quant_scale_rows as i32,
+        scale_cols: matrix.quant_scale_cols as i32,
+        block_m: matrix.quant_block_m as i32,
+        block_k: matrix.quant_block_k as i32,
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct StudentLoraMatrices {
@@ -531,31 +544,21 @@ impl Qwen35Model {
             matrix.scale_f32 = Some(merged_scales);
         }
         {
-            let (in_ptr, _gi) = matrix.data.device_ptr(&ctx.stream);
-            let (qw_ptr, _gq) = matrix
-                .qweight_u8
-                .as_mut()
-                .expect("split out above")
-                .device_ptr_mut(&ctx.stream);
-            let (sc_ptr, _gs) = matrix
-                .scale_f32
-                .as_mut()
-                .expect("split out above")
-                .device_ptr_mut(&ctx.stream);
-            // SAFETY: ptrs from live device allocations sized to the dims passed.
-            unsafe {
-                ffi::quantize_bf16_to_fp8_block_scaled_cuda(
-                    in_ptr as *const ffi::Half,
-                    qw_ptr as *mut u8,
-                    sc_ptr as *mut f32,
-                    matrix.rows as i32,
-                    matrix.cols as i32,
-                    matrix.quant_block_m as i32,
-                    matrix.quant_block_k as i32,
-                    ctx.stream.cu_stream(),
-                )
-            }
-            .result()
+            let (data, qweight, scales) = (
+                &matrix.data,
+                matrix.qweight_u8.as_mut().expect("split out above"),
+                matrix.scale_f32.as_mut().expect("split out above"),
+            );
+            cuda_ql::quantize_bf16_to_fp8_block_scaled(
+                &ctx,
+                data,
+                qweight,
+                scales,
+                matrix.rows,
+                matrix.cols,
+                matrix.quant_block_m,
+                matrix.quant_block_k,
+            )
             .map_err(|e| anyhow!("layer {layer_idx} {label}: merge-requant failed: {e}"))?;
         }
         matrix.weight_format = WeightFormat::Fp8BlockScaled;
@@ -611,7 +614,7 @@ impl Qwen35Model {
              was repacked into at load, so decode would keep serving the un-merged base. Load a \
              LoRA-merging engine on a build/card where the repack does not run."
         );
-        let mut dense = ctx
+        let dense = ctx
             .stream
             .alloc_zeros::<bf16>(matrix.rows * matrix.cols)
             .map_err(|e| anyhow!("layer {layer_idx} {label}: BF16 promotion alloc failed: {e}"))?;
@@ -625,25 +628,18 @@ impl Qwen35Model {
                 qweight.len(),
                 matrix.rows * matrix.cols
             );
-            let (qw_ptr, _gq) = qweight.device_ptr(&ctx.stream);
-            let (scale_ptr, _gs) = scales.device_ptr(&ctx.stream);
-            let (dense_ptr, _gd) = dense.device_ptr_mut(&ctx.stream);
-            // SAFETY: ptrs from live device allocations sized to the dims passed.
+            // SAFETY: `dense` covers rows*cols and lives across the launch.
             unsafe {
-                ffi::dequantize_fp8_block_scaled_to_bf16_cuda(
-                    qw_ptr as *const u8,
-                    scale_ptr as *const f32,
-                    dense_ptr as *mut ffi::Half,
-                    matrix.rows as i32,
-                    matrix.cols as i32,
-                    matrix.quant_scale_rows as i32,
-                    matrix.quant_scale_cols as i32,
-                    matrix.quant_block_m as i32,
-                    matrix.quant_block_k as i32,
-                    ctx.stream.cu_stream(),
+                cuda_ql::dequantize_fp8_block_scaled_to_bf16(
+                    &ctx,
+                    qweight,
+                    scales,
+                    cache_ptr(&dense, &ctx),
+                    matrix.rows,
+                    matrix.cols,
+                    lora_fp8_scale_shape(matrix),
                 )
             }
-            .result()
             .map_err(|e| {
                 anyhow!("layer {layer_idx} {label}: FP8→BF16 promotion dequant failed: {e}")
             })?;
@@ -835,33 +831,25 @@ impl Qwen35Model {
             );
             let cache_key = Self::lora_base_cache_key(layer_idx, projection);
             if let Some((qweight, scales)) = matrix.merge_base_fp8() {
-                let mut base_scratch = DeviceVec::zeros(&ctx, matrix.rows * matrix.cols)?;
-                {
-                    let (qw_ptr, _gq) = qweight.device_ptr(&ctx.stream);
-                    let (scale_ptr, _gs) = scales.device_ptr(&ctx.stream);
-                    let (dst_ptr, _gd) = base_scratch.data.device_ptr_mut(&ctx.stream);
-                    // SAFETY: ptrs from live device allocations sized to the dims passed.
-                    unsafe {
-                        ffi::dequantize_fp8_block_scaled_to_bf16_cuda(
-                            qw_ptr as *const u8,
-                            scale_ptr as *const f32,
-                            dst_ptr as *mut ffi::Half,
-                            matrix.rows as i32,
-                            matrix.cols as i32,
-                            matrix.quant_scale_rows as i32,
-                            matrix.quant_scale_cols as i32,
-                            matrix.quant_block_m as i32,
-                            matrix.quant_block_k as i32,
-                            ctx.stream.cu_stream(),
-                        )
-                    }
-                    .result()
-                    .map_err(|e| {
-                        anyhow!(
-                            "layer {layer_idx} {label}: FP8→BF16 base dequant for merge failed: {e}"
-                        )
-                    })?;
+                let base_scratch = DeviceVec::zeros(&ctx, matrix.rows * matrix.cols)?;
+                // SAFETY: `base_scratch` covers rows*cols and lives across
+                // the launch.
+                unsafe {
+                    cuda_ql::dequantize_fp8_block_scaled_to_bf16(
+                        &ctx,
+                        qweight,
+                        scales,
+                        cache_ptr(&base_scratch.data, &ctx),
+                        matrix.rows,
+                        matrix.cols,
+                        lora_fp8_scale_shape(matrix),
+                    )
                 }
+                .map_err(|e| {
+                    anyhow!(
+                        "layer {layer_idx} {label}: FP8→BF16 base dequant for merge failed: {e}"
+                    )
+                })?;
                 let src = base_scratch.data.slice(window.clone());
                 let matrix = self.lora_matrix_mut(layer_idx, projection)?;
                 let mut dst = matrix.data.slice_mut(window.clone());
@@ -945,33 +933,22 @@ impl Qwen35Model {
         let cols = matrix.cols;
         let window = row_offset * cols..(row_offset + rows) * cols;
         if let Some((qweight, scales)) = matrix.merge_base_fp8() {
-            let mut scratch = DeviceVec::zeros(&ctx, matrix.rows * matrix.cols)?;
-            {
-                let (qw_ptr, _gq) = qweight.device_ptr(&ctx.stream);
-                let (scale_ptr, _gs) = scales.device_ptr(&ctx.stream);
-                let (dst_ptr, _gd) = scratch.data.device_ptr_mut(&ctx.stream);
-                // SAFETY: ptrs from live device allocations sized to the dims passed.
-                unsafe {
-                    ffi::dequantize_fp8_block_scaled_to_bf16_cuda(
-                        qw_ptr as *const u8,
-                        scale_ptr as *const f32,
-                        dst_ptr as *mut ffi::Half,
-                        matrix.rows as i32,
-                        matrix.cols as i32,
-                        matrix.quant_scale_rows as i32,
-                        matrix.quant_scale_cols as i32,
-                        matrix.quant_block_m as i32,
-                        matrix.quant_block_k as i32,
-                        ctx.stream.cu_stream(),
-                    )
-                }
-                .result()
-                .map_err(|e| {
-                    anyhow!(
-                        "layer {layer_idx} {label}: FP8→BF16 base dequant for restore failed: {e}"
-                    )
-                })?;
+            let scratch = DeviceVec::zeros(&ctx, matrix.rows * matrix.cols)?;
+            // SAFETY: `scratch` covers rows*cols and lives across the launch.
+            unsafe {
+                cuda_ql::dequantize_fp8_block_scaled_to_bf16(
+                    &ctx,
+                    qweight,
+                    scales,
+                    cache_ptr(&scratch.data, &ctx),
+                    matrix.rows,
+                    matrix.cols,
+                    lora_fp8_scale_shape(matrix),
+                )
             }
+            .map_err(|e| {
+                anyhow!("layer {layer_idx} {label}: FP8→BF16 base dequant for restore failed: {e}")
+            })?;
             let src = scratch.data.slice(window.clone());
             let matrix = self.lora_matrix_mut(layer_idx, projection)?;
             let mut dst = matrix.data.slice_mut(window);
