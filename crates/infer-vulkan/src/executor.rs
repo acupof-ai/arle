@@ -13,6 +13,19 @@ use crate::kv_pool::VulkanKvPool;
 
 pub const DEFAULT_PAGE_SIZE: usize = 64;
 
+/// `ARLE_VULKAN_BATCHED_PREFILL=0` forces the per-token prefill loop.
+///
+/// The batched path is a different arithmetic shape (`mul_mmq` over a chunk vs a
+/// chain of GEMVs), so it is not bit-identical to the serial one — the parity
+/// gate compares them, and needs a way to run the old path in the same binary.
+#[cfg(feature = "vulkan")]
+fn batched_prefill_enabled() -> bool {
+    !matches!(
+        std::env::var("ARLE_VULKAN_BATCHED_PREFILL").as_deref(),
+        Ok("0") | Ok("false") | Ok("off")
+    )
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VulkanModelKind {
     Qwen3Dense,
@@ -97,6 +110,56 @@ impl VulkanLoadedModel {
             Self::Gemma4(model) => model.forward_token(slot, epoch, token, start_pos),
         }
     }
+
+    /// Materialize `tokens` in one GEMM-shaped batched pass, returning the LAST
+    /// token's logits — or `None` when this model has no batched path, in which
+    /// case the caller falls back to the per-token loop.
+    ///
+    /// Only the Qwen3.5 hybrid has one so far. Prefill is where the per-token
+    /// loop hurts most: every layer's weights are re-read from LPDDR5X once per
+    /// TOKEN, so a GEMV chain runs at memory bandwidth no matter how many tokens
+    /// are queued. Batching turns each projection into a `mul_mmq` over the whole
+    /// chunk, amortizing the weight read across `T` rows.
+    fn forward_tokens_batched(
+        &mut self,
+        slot: usize,
+        epoch: u64,
+        tokens: &[u32],
+        start_pos: usize,
+    ) -> Result<Option<Vec<f32>>> {
+        match self {
+            Self::Qwen35(model) => model.forward_tokens(slot, epoch, tokens, start_pos),
+            _ => Ok(None),
+        }
+    }
+
+    /// Leading prefix of `tokens` this model already holds materialized. Only
+    /// the Qwen3.5 hybrid tracks its resident sequence; the rest recompute.
+    fn cached_prefix_len(&self, tokens: &[u32]) -> usize {
+        match self {
+            Self::Qwen35(model) => model.cached_prefix_len(tokens),
+            _ => 0,
+        }
+    }
+
+    fn adopt_cached_prefix(
+        &mut self,
+        slot: usize,
+        tokens: &[u32],
+        matched_len: usize,
+    ) -> Result<()> {
+        match self {
+            Self::Qwen35(model) => model.adopt_cached_prefix(slot, tokens, matched_len),
+            _ => bail!("this Vulkan model has no position-0 prefix store"),
+        }
+    }
+
+    fn materialize_finish(&mut self, slot: usize, tokens: &[u32]) -> Result<()> {
+        match self {
+            Self::Qwen35(model) => model.materialize_finish(slot, tokens),
+            _ => Ok(()),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -171,9 +234,28 @@ impl VulkanExecutor {
         );
         #[cfg(feature = "vulkan")]
         if let Some(model) = self.model.as_mut() {
+            // Multi-token steps take the batched path when the model has one.
+            // A 1-token step IS decode, which the per-token path already
+            // records optimally, so don't pay the chunk staging for it.
+            if tokens.len() > 1
+                && batched_prefill_enabled()
+                && let Some(logits) =
+                    model.forward_tokens_batched(slot, epoch, tokens, start_pos)?
+            {
+                return Ok(infer_plan::sample_token(&logits, params, position));
+            }
             let mut logits = Vec::new();
+            let t0 = std::time::Instant::now();
             for (i, &token) in tokens.iter().enumerate() {
                 logits = model.forward_token(slot, epoch, token, start_pos + i)?;
+            }
+            if tokens.len() > 1 {
+                let secs = t0.elapsed().as_secs_f64();
+                log::info!(
+                    "vulkan per-token prefill: {} tok @ {start_pos} in {secs:.3}s ({:.1} tok/s)",
+                    tokens.len(),
+                    tokens.len() as f64 / secs.max(f64::MIN_POSITIVE),
+                );
             }
             return Ok(infer_plan::sample_token(&logits, params, position));
         }
@@ -256,6 +338,113 @@ impl BackendExecutor for VulkanExecutor {
 
     fn model_stop_token_ids(&self) -> Vec<u32> {
         self.stop_tokens.clone()
+    }
+
+    fn prefix_reuse(&mut self) -> Option<&mut dyn infer_seam::PrefixReuse> {
+        Some(self)
+    }
+}
+
+/// Prefix reuse for the single-slot Vulkan lane.
+///
+/// The page-radix route is **fail-closed on purpose**: this lane's device KV is
+/// one flat `[layer, kv_head, pos, head_dim]` buffer indexed by ABSOLUTE
+/// position ([`crate::forward::DeviceKvCache`]), so a host page id names no
+/// device bytes and re-attaching pages at a new position would serve another
+/// sequence's KV. `reusable_prefix_blocks` returning 0 states that, and matches
+/// what the engine already assumed when this executor reported no
+/// `prefix_reuse` capability at all.
+///
+/// What IS reusable is the sequence the lane is holding right now, at the
+/// positions it already occupies — the position-0 seam
+/// ([`infer_seam::PrefixReuse::cached_prefix_match_len`]). That covers the case
+/// that actually costs users minutes: turn N+1 of a conversation, whose prompt
+/// is turn N's prompt plus what turn N generated.
+impl infer_seam::PrefixReuse for VulkanExecutor {
+    /// Zero: see the type doc — host pages do not name device KV here.
+    fn reusable_prefix_blocks(&self, _blocks: &[infer_seam::PrefixBlock]) -> usize {
+        0
+    }
+
+    fn reusable_prefix_blocks_for_prompt(
+        &self,
+        blocks: &[infer_seam::PrefixBlock],
+        _tokens: &[u32],
+    ) -> usize {
+        self.reusable_prefix_blocks(blocks)
+    }
+
+    /// Nothing below the seam is keyed to page ids, so eviction needs no mirror
+    /// drop.
+    fn release_prefix_pages(&mut self, _pages: &[u32]) {}
+
+    fn release_provisional_prefix_pages(&mut self, _pages: &[u32]) {}
+
+    fn cached_prefix_match_len(&self, tokens: &[u32]) -> Result<usize> {
+        #[cfg(feature = "vulkan")]
+        if let Some(model) = self.model.as_ref() {
+            return Ok(model.cached_prefix_len(tokens));
+        }
+        let _ = tokens;
+        Ok(0)
+    }
+
+    fn restore_cached_prefix(
+        &mut self,
+        slot: usize,
+        tokens: &[u32],
+        matched_len: usize,
+        _slot_pages: &[u32],
+    ) -> Result<()> {
+        #[cfg(feature = "vulkan")]
+        if let Some(model) = self.model.as_mut() {
+            return model.adopt_cached_prefix(slot, tokens, matched_len);
+        }
+        let _ = (slot, tokens, matched_len);
+        bail!("Vulkan executor has no model loaded")
+    }
+
+    /// Unreachable while `reusable_prefix_blocks` is 0 (the engine only calls
+    /// this after a page-radix attach). `matched_len` is the answer that means
+    /// "restored exactly the page-aligned prefix", i.e. no change.
+    fn restore_prefix_sidecar(
+        &mut self,
+        _slot: usize,
+        _tokens: &[u32],
+        matched_len: usize,
+        _prefix_pages: &[u32],
+    ) -> Result<usize> {
+        Ok(matched_len)
+    }
+
+    /// Feed the one token this request sampled but never fed, so the resident
+    /// sequence covers the finished turn exactly and the next turn resumes past
+    /// the whole generated region rather than one token short of it.
+    fn capture_finish_frontier(
+        &mut self,
+        slot: usize,
+        tokens: &[u32],
+        _slot_pages: &[u32],
+    ) -> Result<()> {
+        #[cfg(feature = "vulkan")]
+        if let Some(model) = self.model.as_mut() {
+            return model.materialize_finish(slot, tokens);
+        }
+        let _ = (slot, tokens);
+        Ok(())
+    }
+
+    /// No radix publish to ride: the resident sequence IS the store.
+    fn save_prefix_sidecar(
+        &mut self,
+        _slot: usize,
+        _tokens: &[u32],
+        _matched_len: usize,
+        _prefix_pages: &[u32],
+        _slot_pages: &[u32],
+        _newly_cached: &[u32],
+    ) -> Result<()> {
+        Ok(())
     }
 }
 

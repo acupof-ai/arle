@@ -9,6 +9,10 @@
 mod cache;
 
 pub use cache::{KernelCache, launch_cached, record_dispatch};
+/// Re-exported so callers can size a [`MmSpec`] without depending on
+/// `vulkan-sys` directly. Resolves to the stub definition when the `vulkan`
+/// feature is off, so the typecheck-only lane builds unchanged.
+pub use vulkan_sys::CoopmatShape;
 
 pub const QK_K: usize = 256;
 pub const QK8_0: usize = 32;
@@ -87,6 +91,29 @@ pub enum Kernel {
     GemvIdQ5K,
     GemvIdQ6K,
     GemvIdQ8_0,
+    /// Batched prefill GEMM (`mul_mmq`): `D[n, m] = A[m, k] · Bᵀ[n, k]` with a
+    /// quantized `A` and `block_q8_1_x4` `B` — the SAME activation format the
+    /// decode GEMVs consume, so one `QuantizeQ8_1` dispatch feeds both. Tile
+    /// geometry is NOT baked into the variant: pass an [`MmqSpec`], which the
+    /// pipeline cache keys on (see [`mmq_params`] / [`mmq_dispatch`]).
+    MmqQ4K,
+    MmqQ5K,
+    MmqQ6K,
+    MmqQ8_0,
+    /// The same batched prefill GEMM on the MATRIX CORES (`mul_mm.comp` built
+    /// with `COOPMAT`): `D[n, m] = A[m, k] · Bᵀ[n, k]`, quantized `A`
+    /// dequantized into shared memory, `B` a plain **f16** `[n, k]` row-major
+    /// block, `D` f32. Note the operand change versus [`Kernel::MmqQ4K`] — the
+    /// activation side is an [`f16_kv_pack_params`] convert, NOT a
+    /// [`q8_1_quantize_params`]; feeding it q8_1_x4 produces silent garbage.
+    ///
+    /// Only usable when [`vulkan_sys::VulkanContext::coopmat`] is `Some`; tile
+    /// geometry comes from [`MmSpec::choose`], which keys on the device's
+    /// advertised shape. `mul_mmq` remains the fallback everywhere else.
+    MmCmQ4K,
+    MmCmQ5K,
+    MmCmQ6K,
+    MmCmQ8_0,
     QuantizeQ8_1,
     RmsNorm,
     RopeNeox,
@@ -175,6 +202,14 @@ impl Kernel {
         Self::GemvIdQ5K,
         Self::GemvIdQ6K,
         Self::GemvIdQ8_0,
+        Self::MmqQ4K,
+        Self::MmqQ5K,
+        Self::MmqQ6K,
+        Self::MmqQ8_0,
+        Self::MmCmQ4K,
+        Self::MmCmQ5K,
+        Self::MmCmQ6K,
+        Self::MmCmQ8_0,
         Self::QuantizeQ8_1,
         Self::RmsNorm,
         Self::RopeNeox,
@@ -218,6 +253,14 @@ impl Kernel {
             Kernel::GemvIdQ5K => "mul_mat_vec_id_q5_k",
             Kernel::GemvIdQ6K => "mul_mat_vec_id_q6_k",
             Kernel::GemvIdQ8_0 => "mul_mat_vec_id_q8_0",
+            Kernel::MmqQ4K => "mul_mmq_q4_k",
+            Kernel::MmqQ5K => "mul_mmq_q5_k",
+            Kernel::MmqQ6K => "mul_mmq_q6_k",
+            Kernel::MmqQ8_0 => "mul_mmq_q8_0",
+            Kernel::MmCmQ4K => "mul_mm_cm_q4_k",
+            Kernel::MmCmQ5K => "mul_mm_cm_q5_k",
+            Kernel::MmCmQ6K => "mul_mm_cm_q6_k",
+            Kernel::MmCmQ8_0 => "mul_mm_cm_q8_0",
             Kernel::QuantizeQ8_1 => "q8_1_quantize",
             Kernel::RmsNorm => "rms_norm",
             Kernel::RopeNeox => "rope_neox",
@@ -290,6 +333,42 @@ impl Kernel {
             | Kernel::Qwen36RouterTopk
             | Kernel::Qwen36RouterGemv
             | Kernel::Qwen36MoeWeightedAccum => &[],
+            // `mul_mmq`'s tile geometry is chosen per call from the matmul shape
+            // (see [`MmqSpec::choose`]); there is no single default, and running
+            // it with the shader's built-in defaults would silently pick a tile
+            // whose shared-memory footprint the caller never checked.
+            Kernel::MmqQ4K | Kernel::MmqQ5K | Kernel::MmqQ6K | Kernel::MmqQ8_0 => &[],
+            // Same reasoning for the coopmat GEMM, plus its tile additionally
+            // depends on the device's advertised matrix shape ([`MmSpec`]).
+            Kernel::MmCmQ4K | Kernel::MmCmQ5K | Kernel::MmCmQ6K | Kernel::MmCmQ8_0 => &[],
+        }
+    }
+
+    /// The `mul_mm.comp` COOPMAT sibling of a `mul_mmq` variant, i.e. the same
+    /// weight quant run on the matrix cores. `None` for every other kernel.
+    pub const fn coopmat_variant(self) -> Option<Kernel> {
+        match self {
+            Kernel::MmqQ4K => Some(Kernel::MmCmQ4K),
+            Kernel::MmqQ5K => Some(Kernel::MmCmQ5K),
+            Kernel::MmqQ6K => Some(Kernel::MmCmQ6K),
+            Kernel::MmqQ8_0 => Some(Kernel::MmCmQ8_0),
+            _ => None,
+        }
+    }
+
+    /// Bytes one `block_a_cache` entry occupies in shared memory for this
+    /// `mul_mmq` variant (`mul_mmq_shmem_types.glsl`, std430). Q4_K packs two
+    /// 4-bit quants per byte (`QUANT_R_MMQ = 2`) so it needs half the `qs`
+    /// words of Q5_K/Q6_K/Q8_0. Returns `None` for non-`mul_mmq` kernels.
+    pub const fn mmq_a_cache_bytes(self) -> Option<u32> {
+        match self {
+            // { uint32_t qs[4]; f16vec2 dm; }
+            Kernel::MmqQ4K => Some(4 * 4 + 4),
+            // { int32_t qs[8]; f16vec2 dm | d_scales; }
+            Kernel::MmqQ5K | Kernel::MmqQ6K => Some(8 * 4 + 4),
+            // { int32_t qs[8]; float16_t dm; } — padded to the 4-byte struct align.
+            Kernel::MmqQ8_0 => Some(8 * 4 + 4),
+            _ => None,
         }
     }
 
@@ -306,10 +385,32 @@ impl Kernel {
     /// This mirrors llama.cpp's `subgroup_size_int = device->subgroup_size` for
     /// the q8_1 decode pipelines on AMD non-GCN.
     ///
+    /// The COOPMAT `mul_mm` pipelines take the width their OWN tile was built
+    /// for — spec constant [`MM_CM_WARP_SPEC_ID`], which is why this takes the
+    /// specialization list rather than a device property. `WARP` partitions the
+    /// workgroup into `BLOCK_SIZE / WARP` subgroups addressed by
+    /// `gl_SubgroupID`, and the cooperative-matrix tile itself is
+    /// `gl_ScopeSubgroup`, so a pinned size that disagrees with `WARP` either
+    /// idles subgroups or double-books them. Reading it back out of the spec
+    /// list makes the two impossible to desynchronize, and lets a tuning sweep
+    /// try 32- and 64-wide tiles on the same device (the 8060S allows both:
+    /// `subgroupSize` control range is 32..64).
+    ///
     /// Every other kernel is subgroup-size-agnostic (`None` = driver default).
-    pub const fn required_subgroup_size(self) -> Option<u32> {
+    /// That includes `mul_mmq`, whose `WARP = 32` warptile constant tempts a
+    /// `Some(32)` pin — measured on the 8060S it changes nothing (5.0 vs 5.5
+    /// GB/s, inside run-to-run throttle noise), so the driver default stands.
+    /// (`mul_mmq`'s body is scalar integer-dot; unlike COOPMAT it never touches
+    /// `gl_SubgroupID`, so `WARP` there is only a tiling constant.)
+    pub fn required_subgroup_size(self, specialization_u32: &[(u32, u32)]) -> Option<u32> {
         match self {
             Kernel::FlashAttn => Some(32),
+            Kernel::MmCmQ4K | Kernel::MmCmQ5K | Kernel::MmCmQ6K | Kernel::MmCmQ8_0 => {
+                specialization_u32
+                    .iter()
+                    .find(|&&(id, _)| id == MM_CM_WARP_SPEC_ID)
+                    .map(|&(_, warp)| warp)
+            }
             Kernel::GemvQ4K
             | Kernel::GemvQ5K
             | Kernel::GemvQ6K
@@ -334,6 +435,23 @@ impl FlashAttentionSpec {
     }
 
     pub const fn f32_f16_dims(hsk: u32, hsv: u32) -> Self {
+        Self::with_flags(hsk, hsv, 0)
+    }
+
+    /// [`Self::f32_f16_dims`] with `Flags = 2` (`MASK_ENABLE`), which makes the
+    /// kernel read binding 3 as an `f16` additive mask of shape `[N][KV]`
+    /// (`0` = attend, `-inf` = blocked) — required for a batched prefill tile,
+    /// where the `N > 1` query rows each see a different causal prefix.
+    ///
+    /// `USE_MASK_OPT` (bit 1) stays OFF, so binding 6 remains an unread dummy
+    /// and the shader loads every mask block rather than consulting a precomputed
+    /// all-zero / all-neg-inf summary. It still skips a block whose loaded mask is
+    /// entirely `-inf`, so a causal chunk pays only for the blocks it needs.
+    pub const fn f32_f16_masked(hsk: u32, hsv: u32) -> Self {
+        Self::with_flags(hsk, hsv, 2)
+    }
+
+    const fn with_flags(hsk: u32, hsv: u32, flags: u32) -> Self {
         Self {
             specialization_u32: [
                 (0, 128),
@@ -346,7 +464,7 @@ impl FlashAttentionSpec {
                 (7, 1),
                 (8, 32),
                 (9, 0),
-                (10, 0),
+                (10, flags),
                 (11, 0),
                 (12, 1),
                 (13, 1),
@@ -358,6 +476,462 @@ impl FlashAttentionSpec {
 
     pub const fn specialization_u32(&self) -> &[(u32, u32)] {
         &self.specialization_u32
+    }
+}
+
+/// `mul_mmq` shared-memory `block_b_cache` size (`{ int32_t qs[8]; f16vec2 ds; }`).
+/// Independent of the weight quant — B is always `block_q8_1_x4`.
+const MMQ_B_CACHE_BYTES: u32 = 8 * 4 + 4;
+
+/// `mul_mmq.comp`'s `BK_STEP` for the non-`MUL_MAT_ID` build: four 32-value
+/// K-slices are staged per shared-memory round trip.
+const MMQ_BK_STEP: u32 = 4;
+
+/// Warptile geometry for one `mul_mmq` pipeline — spec constants
+/// `0 BLOCK_SIZE, 1 BM, 2 BN, 4 WM, 5 WN, 6 WMITER, 7 TM, 8 TN, 9 TK, 10 WARP`.
+/// (`constant_id = 3` (BK) is commented out in the shader, which `#define`s
+/// `BK 32` instead, so it is deliberately absent from the map.)
+///
+/// The values are llama.cpp's `s_warptile_mmq_int{,_k}` families
+/// (`ggml-vulkan.cpp:3081`) at `subgroup_size = 32`. The per-chip overrides
+/// below them are all gated on `driver_id != eAmdProprietary`, so the AMD
+/// Windows lane this crate targets uses the base tiles unchanged. K-quants get
+/// `WMITER = 1` and legacy quants `WMITER = 2`, matching the `_k` split.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MmqSpec {
+    specialization_u32: [(u32, u32); 10],
+    bm: u32,
+    bn: u32,
+}
+
+impl MmqSpec {
+    const fn new(
+        block_size: u32,
+        bm: u32,
+        bn: u32,
+        wm: u32,
+        wn: u32,
+        wmiter: u32,
+        tm: u32,
+        tn: u32,
+        warp: u32,
+    ) -> Self {
+        Self {
+            specialization_u32: [
+                (0, block_size),
+                (1, bm),
+                (2, bn),
+                (4, wm),
+                (5, wn),
+                (6, wmiter),
+                (7, tm),
+                (8, tn),
+                (9, 1), // TK: coopmat-only, unused by the scalar body
+                (10, warp),
+            ],
+            bm,
+            bn,
+        }
+    }
+
+    pub const fn k_quant_large() -> Self {
+        Self::new(128, 128, 128, 64, 64, 1, 4, 4, 32)
+    }
+
+    pub const fn k_quant_medium() -> Self {
+        Self::new(128, 64, 64, 32, 32, 1, 2, 2, 32)
+    }
+
+    pub const fn k_quant_small() -> Self {
+        Self::new(32, 32, 32, 32, 32, 1, 2, 1, 32)
+    }
+
+    pub const fn legacy_large() -> Self {
+        Self::new(128, 128, 128, 64, 64, 2, 4, 4, 32)
+    }
+
+    pub const fn legacy_medium() -> Self {
+        Self::new(128, 64, 64, 32, 32, 2, 2, 2, 32)
+    }
+
+    pub const fn legacy_small() -> Self {
+        Self::new(32, 32, 32, 32, 32, 2, 2, 1, 32)
+    }
+
+    pub const fn bm(&self) -> u32 {
+        self.bm
+    }
+
+    pub const fn bn(&self) -> u32 {
+        self.bn
+    }
+
+    pub const fn specialization_u32(&self) -> &[(u32, u32)] {
+        &self.specialization_u32
+    }
+
+    /// Shared-memory bytes this tile needs for `kernel`:
+    /// `BK_STEP * (BM * sizeof(block_a_cache) + BN * sizeof(block_b_cache))`.
+    /// Must be compared against `maxComputeSharedMemorySize` (32 KB on the
+    /// 8060S) before the pipeline is built — a tile that overflows fails at
+    /// pipeline creation, not at dispatch.
+    pub const fn shared_bytes(&self, kernel: Kernel) -> Option<u32> {
+        let Some(a_bytes) = kernel.mmq_a_cache_bytes() else {
+            return None;
+        };
+        Some(MMQ_BK_STEP * (self.bm * a_bytes + self.bn * MMQ_B_CACHE_BYTES))
+    }
+
+    /// Pick the largest tile that both suits the `[m, n]` output shape and fits
+    /// `max_shared_bytes`. Mirrors `ggml_vk_guess_matmul_pipeline`
+    /// (`ggml-vulkan.cpp:6801`): small when either dimension is ≤ 32, medium
+    /// when either is ≤ 64, large otherwise — then falls back a size at a time
+    /// when the shared-memory budget says no. Only the Q4_K large tile fits
+    /// 32 KB (its `block_a_cache` is half the width of the other three), so in
+    /// practice Q5_K/Q6_K/Q8_0 land on medium.
+    pub fn choose(kernel: Kernel, m: u32, n: u32, max_shared_bytes: u32) -> Option<Self> {
+        let k_quant = matches!(kernel, Kernel::MmqQ4K | Kernel::MmqQ5K | Kernel::MmqQ6K);
+        let (large, medium, small) = if k_quant {
+            (
+                Self::k_quant_large(),
+                Self::k_quant_medium(),
+                Self::k_quant_small(),
+            )
+        } else {
+            (
+                Self::legacy_large(),
+                Self::legacy_medium(),
+                Self::legacy_small(),
+            )
+        };
+        let preferred = if m <= 32 || n <= 32 {
+            small
+        } else if m <= 64 || n <= 64 {
+            medium
+        } else {
+            large
+        };
+        [preferred, medium, small].into_iter().find(
+            |tile| matches!(tile.shared_bytes(kernel), Some(bytes) if bytes <= max_shared_bytes),
+        )
+    }
+}
+
+/// `mul_mm.comp`'s COOPMAT `SHMEM_STRIDE` in `FLOAT_TYPEV2` units:
+/// `BK / 2 + 4` (the scalar build uses `+ 1`; coopmat pads harder to keep
+/// `coopMatLoad` off shared-memory bank conflicts).
+const MM_CM_SHMEM_STRIDE_PAD: u32 = 4;
+
+/// Every COOPMAT tile below stages `BK = 32` reduction elements per round.
+/// `mul_mm.comp` exposes BK as `constant_id = 3` with a default of **16** and
+/// only a comment ("Assumed to be 32 if working with a quant") to say so — the
+/// quant `load_a_to_shmem` bodies hardcode 32-value sub-blocks, so leaving the
+/// default in place is silently wrong. [`MmSpec`] always sets it.
+const MM_CM_BK: u32 = 32;
+
+/// `mul_mm.comp`'s `layout (constant_id = 10) const uint WARP`. Named because
+/// [`Kernel::required_subgroup_size`] reads it back out of a built
+/// specialization list to pin the pipeline to the tile's own warp width.
+pub const MM_CM_WARP_SPEC_ID: u32 = 10;
+
+/// Per-subgroup warp-tile edge (`WM` = `WN`) shared by every [`MmSpec`] below.
+/// At the device's 16x16x16 matrix shape this is `(32/16) * (32/16) = 4` live
+/// `coopmat` accumulators — the measured occupancy sweet spot; see the
+/// [`MmSpec`] type doc for why it is a constant rather than a tuning knob.
+const MM_CM_W: u32 = 32;
+
+/// Ceiling on a derived `BLOCK_SIZE`, standing in for the unexposed
+/// `maxComputeWorkGroupInvocations`. Every real Vulkan 1.1 device reports 1024
+/// (the spec floor is 128, but no compute-capable GPU ships that low); the
+/// widest tile here needs 512. Hardcoded rather than plumbed through
+/// `vulkan-sys` because it only ever rejects a hand-written sweep candidate —
+/// none of the shipped tiles come close.
+const MM_CM_MAX_BLOCK_SIZE: u32 = 1024;
+
+/// Warptile geometry for one COOPMAT `mul_mm` pipeline — spec constants
+/// `0 BLOCK_SIZE, 1 BM, 2 BN, 3 BK, 4 WM, 5 WN, 6 WMITER, 7 TM, 8 TN, 9 TK,
+/// 10 WARP`. `TM/TN/TK` are NOT free here: they are the device's advertised
+/// cooperative-matrix `M/N/K`, because the shader declares
+/// `coopmat<..., TM, TK, gl_MatrixUseA>` directly.
+///
+/// ## Why these are NOT llama.cpp's `{s,m,l}_warptile_mmq`
+///
+/// The obvious move is to copy `ggml-vulkan.cpp:3076`'s tiles verbatim. That
+/// was tried and **measured**: `l_warptile_mmq` (`BM=BN=128`, `WM=subgroup*2`,
+/// `WN=64`) is the single *worst* tile of eleven candidates on the 8060S —
+/// **0.57x geomean vs `mul_mmq`**, and as bad as 0.20x at `n = 32`. Since the
+/// old `choose` picked it for every `n > 64`, i.e. every prefill chunk, the
+/// whole coopmat route ran at 0.75x the scalar integer-dot kernel it was meant
+/// to replace.
+///
+/// The mechanism is per-subgroup accumulator count, not warp width.
+/// `mul_mm.comp:179` declares `sums[(WM/TM) * (WN/TN)]` live across the entire
+/// K loop, each `coopmat` costing `TM*TN/WARP` VGPRs per lane. `l_warptile_mmq`
+/// at `warp = 64` gives `8 * 4 = 32` accumulators ≈ **128 VGPRs/lane** before
+/// operands — deep into occupancy collapse on RDNA 3.5. Capping `WM = WN = 32`
+/// (4 accumulators, 16 VGPRs) and buying back the tile area with *more
+/// subgroups per workgroup* instead wins by 2-3x. Every tile below therefore
+/// holds `WM = WN = 32` and varies only `BM`/`BN`. Sweep geomeans vs `mul_mmq`,
+/// `crates/vulkan-kernels/tests/device_mm_coopmat_bench.rs`:
+///
+/// ```text
+///            tile     n=32     n=64    n=128    n=192    n=256    all n
+///  l 128x128 w128x64  0.32x    0.25x    0.89x    0.97x    0.89x    0.57x   <- llama.cpp
+///     128x32  w32x32  1.80x    0.85x    2.14x    2.42x    1.90x    1.72x   <- narrow
+///      64x64  w32x32  1.31x    1.17x    2.93x    2.82x    2.40x    1.98x   <- medium
+///     128x64  w32x32  1.53x    1.16x    2.55x    3.12x    2.60x    2.06x   <- wide
+///      32x32  w32x32  1.34x    0.84x    1.71x    1.78x    1.47x    1.38x   <- tiny
+/// ```
+///
+/// ## Dead ends, recorded so they are not re-walked
+///
+/// Two earlier diagnoses of the same 0.75x regression were wrong and both cost
+/// a full build+measure cycle:
+/// - *"the f16 B-operand pack kernel dominates"* — ruled out by the per-op GPU
+///   profile: 19.63 ms of 12448 ms.
+/// - *"`WARP` is hardcoded to 32 on a wave64 device"* — plausible (llama.cpp
+///   does derive every tile from `max(subgroup_size, 8)`), fully implemented,
+///   and a **measured non-effect**: 0.75x before, 0.75x after.
+///
+/// `WARP` is still parameterized — it must equal the pipeline's
+/// `requiredSubgroupSize` ([`Kernel::required_subgroup_size`], which reads it
+/// back out of the spec list) — it just was not the bug.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MmSpec {
+    specialization_u32: [(u32, u32); 11],
+    bm: u32,
+    bn: u32,
+}
+
+impl MmSpec {
+    /// `BLOCK_SIZE` is derived, not chosen: the shader hands warp tile
+    /// `gl_SubgroupID` to each subgroup and never loops, so the workgroup must
+    /// hold exactly `(BM/WM) * (BN/WN)` subgroups. Passing it separately only
+    /// creates a way to get it wrong.
+    ///
+    /// Callers must pre-check `wm`/`wn` divide `bm`/`bn` (see
+    /// [`MmSpec::is_valid`]); a non-dividing pair yields a truncated — and thus
+    /// invalid — `BLOCK_SIZE` rather than a wrong answer.
+    const fn new(bm: u32, bn: u32, wm: u32, wn: u32, warp: u32, shape: CoopmatShape) -> Self {
+        Self {
+            specialization_u32: [
+                (0, (bm / wm) * (bn / wn) * warp),
+                (1, bm),
+                (2, bn),
+                (3, MM_CM_BK),
+                (4, wm),
+                (5, wn),
+                // WMITER is dead in the COOPMAT body (it only feeds the scalar
+                // `WNITER`/`WSUBN` derivation, which the driver folds away);
+                // llama.cpp passes 2 here regardless, so match it.
+                (6, 2),
+                (7, shape.m),
+                (8, shape.n),
+                (9, shape.k),
+                (10, warp),
+            ],
+            bm,
+            bn,
+        }
+    }
+
+    /// `n > 64`: 8 subgroups over a 128x64 block. The prefill workhorse —
+    /// 2.55x/3.12x/2.60x at n = 128/192/256.
+    pub const fn wide(warp: u32, shape: CoopmatShape) -> Self {
+        Self::new(128, 64, MM_CM_W, MM_CM_W, warp, shape)
+    }
+
+    /// `n <= 64`: 4 subgroups over a square 64x64 block. The only tile that
+    /// beats `mul_mmq` at the awkward n = 64 width (1.17x).
+    pub const fn medium(warp: u32, shape: CoopmatShape) -> Self {
+        Self::new(64, 64, MM_CM_W, MM_CM_W, warp, shape)
+    }
+
+    /// `n <= 32`: 4 subgroups stacked down M, since there is only one N tile to
+    /// win. 1.80x at n = 32, where every wider tile wastes half its columns.
+    pub const fn narrow(warp: u32, shape: CoopmatShape) -> Self {
+        Self::new(128, 32, MM_CM_W, MM_CM_W, warp, shape)
+    }
+
+    /// Single-subgroup 32x32 block, 6 KiB of shared memory. Not the fastest at
+    /// any width (1.38x geomean) — it exists as the last fallback for a device
+    /// too shared-memory-poor for the tiles above.
+    pub const fn tiny(warp: u32, shape: CoopmatShape) -> Self {
+        Self::new(32, 32, MM_CM_W, MM_CM_W, warp, shape)
+    }
+
+    pub const fn bm(&self) -> u32 {
+        self.bm
+    }
+
+    pub const fn bn(&self) -> u32 {
+        self.bn
+    }
+
+    pub const fn specialization_u32(&self) -> &[(u32, u32)] {
+        &self.specialization_u32
+    }
+
+    /// Shared-memory bytes: the two `FLOAT_TYPEV2` (f16vec2, 4 B) staging
+    /// buffers `buf_a[BM * SHMEM_STRIDE]` / `buf_b[BN * SHMEM_STRIDE]`, plus the
+    /// `coopmat_stage[TM * TN * NUM_WARPS]` f32 spill used by the unaligned
+    /// store paths. Unlike `mul_mmq` this does NOT depend on the weight quant —
+    /// A is dequantized to f16 on the way in.
+    pub const fn shared_bytes(&self) -> u32 {
+        let stride = MM_CM_BK / 2 + MM_CM_SHMEM_STRIDE_PAD;
+        let staging = (self.bm + self.bn) * stride * 4;
+        let num_warps = self.specialization_u32[0].1 / self.specialization_u32[10].1;
+        let stage = self.specialization_u32[7].1 * self.specialization_u32[8].1 * num_warps * 4;
+        staging + stage
+    }
+
+    /// An arbitrary warptile, for benches and tuning sweeps. `None` unless the
+    /// geometry is self-consistent under [`MmSpec::is_valid`] — so a sweep can
+    /// enumerate candidates freely and let this filter the unrunnable ones,
+    /// rather than each caller re-deriving the divisibility rules.
+    #[allow(clippy::too_many_arguments)]
+    pub fn tile(
+        bm: u32,
+        bn: u32,
+        wm: u32,
+        wn: u32,
+        warp: u32,
+        shape: CoopmatShape,
+        max_shared_bytes: u32,
+    ) -> Option<Self> {
+        // `new` divides by `wm`/`wn`/`warp` to derive BLOCK_SIZE, so the zero
+        // check cannot wait for `is_valid`.
+        if wm == 0 || wn == 0 || warp == 0 {
+            return None;
+        }
+        let spec = Self::new(bm, bn, wm, wn, warp, shape);
+        spec.is_valid(shape, warp, max_shared_bytes).then_some(spec)
+    }
+
+    /// Can this tile actually run on `shape` at `warp` within
+    /// `max_shared_bytes`?
+    ///
+    /// `WM`/`WN` must be whole multiples of the matrix `M`/`N` (the shader
+    /// iterates `cms_per_row = WM / TM` sub-matrices with no remainder
+    /// handling), and `BK` a multiple of `K`. The 8060S advertises 16x16x16,
+    /// which divides every tile below; a device advertising, say, 8x8x32 fails
+    /// here and falls back to `mul_mmq` rather than computing a wrong answer
+    /// from a truncated tile count.
+    ///
+    /// `BM`/`BN` must likewise be whole multiples of `WM`/`WN`, or the
+    /// `BLOCK_SIZE` [`MmSpec::new`] derived from them was truncated and the
+    /// workgroup would be short the subgroups needed to cover the block.
+    pub fn is_valid(&self, shape: CoopmatShape, warp: u32, max_shared_bytes: u32) -> bool {
+        if shape.m == 0 || shape.n == 0 || shape.k == 0 || !MM_CM_BK.is_multiple_of(shape.k) {
+            return false;
+        }
+        if warp == 0 || !warp.is_power_of_two() {
+            return false;
+        }
+        let block_size = self.specialization_u32[0].1;
+        let wm = self.specialization_u32[4].1;
+        let wn = self.specialization_u32[5].1;
+        wm.is_multiple_of(shape.m)
+            && wn.is_multiple_of(shape.n)
+            && self.bm.is_multiple_of(wm)
+            && self.bn.is_multiple_of(wn)
+            && block_size <= MM_CM_MAX_BLOCK_SIZE
+            && self.shared_bytes() <= max_shared_bytes
+    }
+
+    /// Pick the tile that suits the `[m, n]` output shape and fits
+    /// `max_shared_bytes`, or `None` when this device's cooperative-matrix
+    /// shape cannot tile it — in which case the caller must stay on `mul_mmq`.
+    ///
+    /// Selection keys on `n` — the batch/token width — alone. `m` is the
+    /// weight's output-feature count, in the thousands for every matmul on the
+    /// prefill path, so it never constrains the tile; the old `m <= 32 || n <=
+    /// 32` form let a wide-`n` chunk fall to the narrow tile whenever `m`
+    /// happened to be small, which no measurement supports. `m` is therefore
+    /// not a parameter — over-covering it costs at most one partial tile, which
+    /// [`mm_dispatch`] already rounds up for.
+    ///
+    /// `warp` MUST be the value the pipeline will actually run at, i.e.
+    /// `VulkanContext::subgroup_size().0`; see the type doc.
+    pub fn choose(shape: CoopmatShape, warp: u32, n: u32, max_shared_bytes: u32) -> Option<Self> {
+        let preferred = if n <= 32 {
+            Self::narrow(warp, shape)
+        } else if n <= 64 {
+            Self::medium(warp, shape)
+        } else {
+            Self::wide(warp, shape)
+        };
+        // Fallbacks in descending shared-memory order, so a device tighter than
+        // the 32 KiB this box reports still lands on *some* runnable tile.
+        [
+            preferred,
+            Self::medium(warp, shape),
+            Self::tiny(warp, shape),
+        ]
+        .into_iter()
+        .find(|tile| tile.is_valid(shape, warp, max_shared_bytes))
+    }
+}
+
+/// Dispatch grid for a COOPMAT [`MmSpec`]. Identical in form to
+/// [`mmq_dispatch`] — same push-constant contract, same `ir = x % blocks_m`
+/// recovery — but keyed on the coopmat tile's `BM`/`BN`.
+pub fn mm_dispatch(m: u32, n: u32, spec: &MmSpec) -> Dispatch {
+    Dispatch {
+        x: m.div_ceil(spec.bm()).max(1),
+        y: n.div_ceil(spec.bn()).max(1),
+        z: 1,
+    }
+}
+
+/// Push-constant block for `mul_mmq.comp` (non-`MUL_MAT_ID`): 16 `uint`s, in
+/// declared order `M, N, K, stride_a, stride_b, stride_d, batch_stride_a,
+/// batch_stride_b, batch_stride_d, base_work_group_z, num_batches, k_split,
+/// ne02, ne12, broadcast2, broadcast3`.
+///
+/// Mapped from `ggml_vk_matmul` (`ggml-vulkan.cpp:6855`) for ONE unbatched,
+/// unsplit matmul:
+/// - `A` is the `[m, k]` quantized weight, row-major, `stride_a = k` elements.
+///   `k` must be a multiple of the weight's `QUANT_K` (256 for the K-quants,
+///   32 for Q8_0) — the shader indexes A in 32-value sub-blocks.
+/// - `B` is `[n, k]` `block_q8_1_x4` activations, `stride_b = k` elements. Row
+///   starts must land on an x4 group boundary, so `k` must be a multiple of 128.
+/// - `D` is `[n, m]` f32 with `stride_d = m`: the shader writes
+///   `data_d[col * stride_d + row]`, i.e. one contiguous `m`-wide row per
+///   B row. For prefill that is exactly "one output vector per token".
+/// - `k_split = k` and `num_batches = 1` collapse the split-K grid to `ik = 0`,
+///   so `gl_WorkGroupID.x` is purely the M tile.
+///
+/// Binding order: `[0 = A quantized weight, 1 = B q8_1_x4, 2 = D f32]`.
+pub fn mmq_params(m: u32, n: u32, k: u32) -> KernelParams {
+    KernelParams::from_words(vec![
+        m,     // M: output rows (weight rows)
+        n,     // N: output cols (tokens in the chunk)
+        k,     // K: reduction width in elements
+        k,     // stride_a: weight row stride (elements)
+        k,     // stride_b: activation row stride (elements)
+        m,     // stride_d: dst row stride (elements) = M
+        m * k, // batch_stride_a: unused at batch 0, set to the natural stride
+        n * k, // batch_stride_b: same
+        m * n, // batch_stride_d: same
+        0,     // base_work_group_z: single batch
+        1,     // num_batches
+        k,     // k_split: no split-K
+        1,     // ne02
+        1,     // ne12
+        1,     // broadcast2
+        1,     // broadcast3
+    ])
+}
+
+/// Dispatch grid for [`mmq_params`]: `x` = M tiles, `y` = N tiles, `z` = 1
+/// (single batch). `mul_mmq.comp` recovers `ir = x % blocks_m` and, with
+/// `k_split = K`, `ik = x / blocks_m = 0`.
+pub fn mmq_dispatch(m: u32, n: u32, spec: &MmqSpec) -> Dispatch {
+    Dispatch {
+        x: m.div_ceil(spec.bm()).max(1),
+        y: n.div_ceil(spec.bn()).max(1),
+        z: 1,
     }
 }
 
@@ -671,6 +1245,70 @@ pub fn rope_neox_dispatch(rotary_dim: u32, nrows: u32) -> Dispatch {
     }
 }
 
+/// Batched [`rope_neox_params`]: rotates a whole prefill chunk laid out as
+/// `[token][head][head_dim]` in ONE dispatch, with a per-token position.
+///
+/// `rope_head.glsl` decomposes `row` as `i3 = row/(ne01*ne02)`,
+/// `i2 = (row - i3*ne01*ne02)/ne01`, `i1 = row - i3*ne01*ne02 - i2*ne01`, reads
+/// `theta_base = rope_data_pos[i2] * theta_scale^(i0/2)`, and addresses
+/// `i3*nb03 + i2*nb02 + i1*nb01 + i0/2`. Setting `ne01 = heads`, `ne02 = tokens`,
+/// `nb01 = nb11 = head_dim`, `nb02 = nb12 = heads*head_dim` therefore makes `i1`
+/// the head and `i2` the token — i.e. row-major `[token][head][head_dim]` with
+/// `pos[t]` applied to token `t`. Binding 1 must hold a `tokens`-element `int32`
+/// position buffer (`start_pos .. start_pos+tokens`), not the single-element
+/// buffer the decode path binds.
+///
+/// The decode contract is the `tokens = 1` reduction of this (`ne02 = 1` makes
+/// every row read `pos[0]`), so the two share the shader and the pipeline.
+pub fn rope_neox_params_batched(
+    head_dim: u32,
+    rotary_dim: u32,
+    heads: u32,
+    tokens: u32,
+    rope_theta: f32,
+) -> KernelParams {
+    let n_dims = rotary_dim;
+    let theta_scale = rope_theta.powf(-2.0 / n_dims as f32);
+    let plane = heads * head_dim;
+    KernelParams::from_words(vec![
+        2,                     // rope_mode = GGML_ROPE_TYPE_NEOX
+        tokens * heads,        // nrows (row guard)
+        n_dims,                // n_dims = rotary_dim
+        1.0f32.to_bits(),      // freq_scale
+        rope_theta.to_bits(),  // freq_base
+        0.0f32.to_bits(),      // ext_factor = 0 (no YaRN)
+        1.0f32.to_bits(),      // attn_factor = 1 (no mscale)
+        0.0f32.to_bits(),      // corr_dims[0]
+        0.0f32.to_bits(),      // corr_dims[1]
+        theta_scale.to_bits(), // theta_scale = rope_theta^(-2/n_dims)
+        0,                     // has_ff = 0 (freq table unread)
+        0,                     // sections[0]
+        0,                     // sections[1]
+        0,                     // sections[2]
+        0,                     // sections[3]
+        0,                     // is_imrope = 0
+        0,                     // is_back = 0
+        0,                     // set_rows_stride = 0 (indices unread)
+        n_dims,                // ne00 = n_dims (i0 >= ne00 early-out)
+        heads,                 // ne01 = heads   => i1 = head
+        tokens,                // ne02 = tokens  => i2 = token => pos[token]
+        head_dim,              // nb01 = head stride (elements)
+        plane,                 // nb02 = token stride (elements)
+        0,                     // nb03
+        head_dim,              // nb11 = head stride (output)
+        plane,                 // nb12 = token stride (output)
+        0,                     // nb13
+        0,                     // a_offset
+        0,                     // d_offset
+    ])
+}
+
+/// Grid for [`rope_neox_params_batched`]: x covers `tokens*heads` rows, y covers
+/// the `rotary_dim/2` rotation pairs at `local_size_y = 256`.
+pub fn rope_neox_dispatch_batched(rotary_dim: u32, heads: u32, tokens: u32) -> Dispatch {
+    rope_neox_dispatch(rotary_dim, tokens * heads)
+}
+
 // Elementwise / norm push-constant contracts. These move
 // the per-layer RMSNorm / SwiGLU / residual-Add off the host (where each forced
 // a device→host→device hop around a GEMV) onto the already-compiled device
@@ -690,33 +1328,60 @@ pub fn rope_neox_dispatch(rotary_dim: u32, nrows: u32) -> Dispatch {
 /// the natural row width (so all per-row offsets resolve to 0 and the weight is
 /// indexed plainly by column since `ncols <= ne10`).
 pub fn rms_norm_params(ncols: u32, eps: f32) -> KernelParams {
+    rms_norm_params_rows(ncols, 1, ncols, eps)
+}
+
+/// Multi-row [`rms_norm_params`]: normalizes `nrows` independent rows of
+/// `ncols` elements in ONE dispatch, reading row `r` at `r*src_row_stride` and
+/// writing it PACKED at `r*ncols`, with the SAME weight vector applied to every
+/// row.
+///
+/// `rms_norm.comp` takes `nrows` from `gl_NumWorkGroups.x` and `row` from
+/// `gl_WorkGroupID.x`, so the grid ([`rms_norm_dispatch_rows`]) is what selects
+/// the row count; `nb01 = src_row_stride` is what lets the source rows be
+/// strided. `d_offset = ((samp*nchannels + channel)*nrows + row)*ncols` with a
+/// 1-deep y/z grid is exactly `row*ncols`, i.e. the destination is always packed.
+/// `ne11 = 1` makes `src1_idx`'s `fastmod(row, ne11)` zero, broadcasting the
+/// weight across rows; `ne10 = ncols` selects the plain `data_b[col]` branch.
+///
+/// This collapses the per-head q/k-norm and per-value-head `ssm_norm` loops of a
+/// prefill chunk into one dispatch each: the batched projections lay a chunk out
+/// as `[token][head][head_dim]`, which is `T*heads` rows of `head_dim`. When the
+/// source is the interleaved `[query|gate]` q-projection, `src_row_stride =
+/// 2*head_dim` also extracts the query half for free.
+///
+/// In-place (`src == dst`) stays safe only when `src_row_stride == ncols`: each
+/// thread reads and writes only its own column, after the reduction barrier.
+pub fn rms_norm_params_rows(ncols: u32, nrows: u32, src_row_stride: u32, eps: f32) -> KernelParams {
     let n = ncols;
+    let src_plane = nrows * src_row_stride;
+    let dst_plane = nrows * n;
     KernelParams::from_words(vec![
-        n, // ne (total elements)
+        dst_plane, // ne (total elements)
         n,
-        1,
+        nrows,
         1,
         1, // ne00..ne03
         1,
-        n,
-        n,
-        n, // nb00..nb03 (nb00=1 element stride; row strides = n)
+        src_row_stride,
+        src_plane,
+        src_plane, // nb00..nb03 (nb00=1 element stride)
         n,
         1,
         1,
-        1, // ne10..ne13 (weight: ncols <= ne10 => plain column index)
+        1, // ne10..ne13 (weight: ne11=1 => broadcast; ncols<=ne10 => plain col)
         1,
         n,
         n,
         n, // nb10..nb13
         n,
-        1,
+        nrows,
         1,
         1, // ne20..ne23
         1,
         n,
-        n,
-        n,             // nb20..nb23
+        dst_plane,
+        dst_plane,     // nb20..nb23
         0,             // misalign_offsets
         eps.to_bits(), // param1 (f32 eps)
         0,             // param2 (f32, unused)
@@ -728,6 +1393,12 @@ pub fn rms_norm_params(ncols: u32, eps: f32) -> KernelParams {
 /// single workgroup regardless of `ncols` (the 512-thread block strides the row).
 pub fn rms_norm_dispatch() -> Dispatch {
     Dispatch::x(1)
+}
+
+/// Multi-row grid for [`rms_norm_params_rows`]: `nrows = gl_NumWorkGroups.x`, so
+/// one workgroup per row (and y = z = 1 keeps `d_offset` packed at `row*ncols`).
+pub fn rms_norm_dispatch_rows(nrows: u32) -> Dispatch {
+    Dispatch::x(nrows.max(1))
 }
 
 /// `swiglu.comp` (+ `glu_head.glsl` / `glu_main.glsl`) in SPLIT mode (`mode=2`):
@@ -820,7 +1491,24 @@ pub fn scaled_add_dispatch(n: u32) -> Dispatch {
 /// decode `ring3`. The single push field is `[n (u32)]`. Applies the
 /// full-attention per-head sigmoid gate device-resident.
 pub fn sigmoid_mul_params(n: u32) -> KernelParams {
-    KernelParams::from_words(vec![n])
+    sigmoid_mul_params_strided(n, n.max(1), n.max(1), 0)
+}
+
+/// Strided-gate [`sigmoid_mul_params`]: value element `i` is gated by
+/// `gate[(i / inner) * gate_stride + gate_off + (i % inner)]`.
+///
+/// The batched-prefill full-attention block gates a packed
+/// `[tokens][heads][head_dim]` flash output against the odd half of the
+/// interleaved `[tokens][heads][2*head_dim]` q-projection, i.e.
+/// `inner = head_dim, gate_stride = 2*head_dim, gate_off = head_dim` — one
+/// dispatch for the whole chunk instead of one per (token, head).
+pub fn sigmoid_mul_params_strided(
+    n: u32,
+    inner: u32,
+    gate_stride: u32,
+    gate_off: u32,
+) -> KernelParams {
+    KernelParams::from_words(vec![n, inner.max(1), gate_stride, gate_off])
 }
 
 /// `sigmoid_mul.comp` grid: one thread per element, `local_size_x = 256`, so
@@ -832,17 +1520,41 @@ pub fn sigmoid_mul_dispatch(n: u32) -> Dispatch {
 /// `f16_kv_pack.comp` (ARLE-local): pack `n` f32 values into f16
 /// (`dst[i] = float16_t(src[i])`). Bindings `0=A` (f32 src, read), `1=D` (f16
 /// dst, write) — a 2-binding layout, so it shares the decode `ring2` with the
-/// q8_1 quantize. The single push field is `[n (u32)]`. Writes one full-attention
-/// head row (`head_dim` f16) into the device KV cache plane bound at the
-/// `(layer, kv_head, pos)` byte offset, removing the host K/V readback+convert.
+/// q8_1 quantize. Writes one full-attention head row (`head_dim` f16) into the
+/// device KV cache plane bound at the `(layer, kv_head, pos)` byte offset,
+/// removing the host K/V readback+convert.
 pub fn f16_kv_pack_params(n: u32) -> KernelParams {
-    KernelParams::from_words(vec![n])
+    f16_kv_pack_params_rows(n, 1, n, n)
+}
+
+/// Strided multi-row [`f16_kv_pack_params`]: packs `rows` rows of `n` values,
+/// reading row `r` at `r*src_stride` (f32 elements) and writing it at
+/// `r*dst_stride` (f16 elements).
+///
+/// A prefill chunk's post-rope K/V is `[token][kv_head][head_dim]`, so one kv
+/// head's `T` rows are strided by `n_kv_heads*head_dim` in the arena while they
+/// land CONTIGUOUSLY (`dst_stride = head_dim`) in the cache plane at
+/// `[pos .. pos+T]`. One dispatch per (layer, kv_head) instead of one per
+/// (layer, kv_head, token).
+pub fn f16_kv_pack_params_rows(
+    n: u32,
+    rows: u32,
+    src_stride: u32,
+    dst_stride: u32,
+) -> KernelParams {
+    KernelParams::from_words(vec![n, rows, src_stride, dst_stride])
 }
 
 /// `f16_kv_pack.comp` grid: one thread per element, `local_size_x = 256`, so
 /// `ceil(n / 256)` workgroups cover the head row.
 pub fn f16_kv_pack_dispatch(n: u32) -> Dispatch {
-    Dispatch::x(n.div_ceil(256).max(1))
+    f16_kv_pack_dispatch_rows(n, 1)
+}
+
+/// Multi-row grid for [`f16_kv_pack_params_rows`]: the guard is
+/// `idx >= n*rows`, so `ceil(n*rows / 256)` workgroups cover the block.
+pub fn f16_kv_pack_dispatch_rows(n: u32, rows: u32) -> Dispatch {
+    Dispatch::x((n * rows).div_ceil(256).max(1))
 }
 
 // Qwen3.5 gated-delta linear-attention push-constant contracts (linear-attention
@@ -1046,6 +1758,87 @@ pub fn flash_attn_params(hsk: u32, hsv: u32, kv_len: u32, scale: f32) -> KernelP
 /// batch decode token, all three are 0, so `(1, 1, 1)`.
 pub fn flash_attn_dispatch() -> Dispatch {
     Dispatch { x: 1, y: 1, z: 1 }
+}
+
+/// Batched, masked [`flash_attn_params`]: ALL query heads of a whole prefill
+/// chunk in ONE dispatch, against the layer's full KV cache region.
+///
+/// Must be paired with [`FlashAttentionSpec::f32_f16_masked`] (Br is still 1, so
+/// the query-tile grid dimension is `n` itself).
+///
+/// - Q is `[token][q_head][hsk]` f32. The shader reads
+///   `data_qv4[q_offset/4 + (i*Br+r)*q_stride/4 + d]` with
+///   `q_offset = iq2*nb02/4` and `q_stride = nb01` (gqa_ratio == 1), i.e. element
+///   `iq2*(nb02/4) + i*nb01 + dim`. So `nb01 = nq*hsk` (token stride, ELEMENTS)
+///   and `nb02 = 4*hsk` (head stride, BYTES).
+/// - K/V are the layer's cache region bound at kv head 0. `k_offset =
+///   ik2*nb12/2` (f16 elements) with `ik2 = iq2 / (neq2/nek2)`, so `neq2 = nq`,
+///   `nek2 = nev2 = nkv` makes `ik2` the GQA-mapped kv head and
+///   `nb12 = nb22 = plane_bytes` walks to it. Row strides `nb11 = hsk`,
+///   `nb21 = hsv` (elements) index `[pos][head_dim]` inside a plane.
+/// - The mask is one `[n][kv_len]` f16 block shared by every head
+///   (`nem1 = n, nem2 = nem3 = 1` ⇒ `m_offset = 0`, `m_stride = KV`), with
+///   `mask[r][c] = 0` iff `c <= start_pos + r`. `nem1 % Br == 0` disables the
+///   shader's `nem1_bounds_check`.
+/// - Output is `data_ov4[(iq2*hsv + (i*Br+row)*ne1*hsv)/4 + ...]`, so `ne1 = nq`
+///   lays it out as `[token][q_head][hsv]` — exactly the o-projection's mmq input.
+#[allow(clippy::too_many_arguments)]
+pub fn flash_attn_params_batched(
+    hsk: u32,
+    hsv: u32,
+    n: u32,
+    kv_len: u32,
+    nq: u32,
+    nkv: u32,
+    k_plane_bytes: u32,
+    v_plane_bytes: u32,
+    scale: f32,
+) -> KernelParams {
+    KernelParams::from_words(vec![
+        n,                // N (query rows in this chunk)
+        kv_len,           // KV (cached length incl. this chunk)
+        nq,               // ne1 (query heads -> O token stride)
+        nq,               // ne2
+        1,                // ne3
+        nq,               // neq2 (query heads)
+        1,                // neq3
+        nkv,              // nek2 (kv heads => rk2 = nq/nkv is the GQA ratio)
+        1,                // nek3
+        nkv,              // nev2
+        1,                // nev3
+        n,                // nem1 (mask rows)
+        1,                // nem2 (=> m_offset = 0, mask shared by all heads)
+        1,                // nem3
+        nq * hsk,         // nb01 = Q token stride (elements)
+        4 * hsk,          // nb02 = Q head stride (BYTES)
+        0,                // nb03
+        hsk,              // nb11 = K row stride (elements)
+        k_plane_bytes,    // nb12 = K kv-head plane stride (BYTES)
+        0,                // nb13
+        hsv,              // nb21 = V row stride (elements)
+        v_plane_bytes,    // nb22 = V kv-head plane stride (BYTES)
+        0,                // nb23
+        scale.to_bits(),  // scale = 1/sqrt(head_dim)
+        0.0f32.to_bits(), // max_bias = 0 (no ALiBi)
+        0.0f32.to_bits(), // logit_softcap = 0
+        0,                // mask_n_head_log2 (no sink, no ALiBi split)
+        0.0f32.to_bits(), // m0
+        0.0f32.to_bits(), // m1
+        1,                // gqa_ratio = 1 (one query head per workgroup)
+        kv_len,           // split_kv = KV (end_j covers all positions)
+        1,                // k_num = 1 (no split-k reduce)
+    ])
+}
+
+/// Grid for [`flash_attn_params_batched`]: `i = gl_WorkGroupID.x` is the query
+/// tile (`Tr = ceil(N/Br)` and `Br = 1`, so one workgroup per token) and
+/// `iq2 = gl_WorkGroupID.y` is the query head.
+pub fn flash_attn_dispatch_batched(n: u32, nq: u32) -> Dispatch {
+    Dispatch {
+        x: n.max(1),
+        y: nq.max(1),
+        z: 1,
+    }
 }
 
 macro_rules! launcher_fns {
@@ -1470,6 +2263,54 @@ mod real {
             spec.specialization_u32(),
         )
     }
+
+    /// Batched prefill GEMM. `kernel` must be one of `Kernel::Mmq*`; buffers are
+    /// `[A quantized weight, B q8_1_x4 activations, D f32 dst]`, push is
+    /// [`mmq_params`], dispatch is [`mmq_dispatch`].
+    pub fn mmq_with_params_and_spec(
+        kernel: Kernel,
+        ctx: &vulkan_sys::VulkanContext,
+        buffers: &[&vulkan_sys::DeviceBuffer<'_>],
+        dispatch: Dispatch,
+        params: &super::KernelParams,
+        spec: &super::MmqSpec,
+    ) -> Result<()> {
+        launch_with_params_and_specialization(
+            kernel,
+            ctx,
+            buffers,
+            dispatch,
+            params,
+            spec.specialization_u32(),
+        )
+    }
+
+    /// Cooperative-matrix batched GEMM. `kernel` must be one of
+    /// `Kernel::MmCm*`; buffers are `[A quantized weight, B **f16**
+    /// activations, D f32 dst]`, push is [`mmq_params`] (byte-identical
+    /// block), dispatch is [`mm_dispatch`].
+    ///
+    /// The `B` operand is the one real difference from
+    /// [`mmq_with_params_and_spec`]: this shader reads plain row-major f16,
+    /// not `block_q8_1_x4`. Handing it q8_1 bytes is not an error the driver
+    /// can catch — it just computes the wrong answer.
+    pub fn mm_with_params_and_spec(
+        kernel: Kernel,
+        ctx: &vulkan_sys::VulkanContext,
+        buffers: &[&vulkan_sys::DeviceBuffer<'_>],
+        dispatch: Dispatch,
+        params: &super::KernelParams,
+        spec: &super::MmSpec,
+    ) -> Result<()> {
+        launch_with_params_and_specialization(
+            kernel,
+            ctx,
+            buffers,
+            dispatch,
+            params,
+            spec.specialization_u32(),
+        )
+    }
 }
 
 #[cfg(feature = "vulkan")]
@@ -1509,6 +2350,28 @@ mod stub {
     ) -> Result<()> {
         Err(KernelError::NotCompiled)
     }
+
+    pub fn mmq_with_params_and_spec(
+        _kernel: Kernel,
+        _ctx: &vulkan_sys::VulkanContext,
+        _buffers: &[&vulkan_sys::DeviceBuffer<'_>],
+        _dispatch: super::Dispatch,
+        _params: &super::KernelParams,
+        _spec: &super::MmqSpec,
+    ) -> Result<()> {
+        Err(KernelError::NotCompiled)
+    }
+
+    pub fn mm_with_params_and_spec(
+        _kernel: Kernel,
+        _ctx: &vulkan_sys::VulkanContext,
+        _buffers: &[&vulkan_sys::DeviceBuffer<'_>],
+        _dispatch: super::Dispatch,
+        _params: &super::KernelParams,
+        _spec: &super::MmSpec,
+    ) -> Result<()> {
+        Err(KernelError::NotCompiled)
+    }
 }
 
 #[cfg(not(feature = "vulkan"))]
@@ -1517,6 +2380,10 @@ launcher_fns!(stub::launch, stub::launch_with_params);
 fused_launcher_fns!(stub::launch_with_params);
 
 #[cfg(feature = "vulkan")]
-pub use real::flash_attn_with_params_and_spec;
+pub use real::{
+    flash_attn_with_params_and_spec, mm_with_params_and_spec, mmq_with_params_and_spec,
+};
 #[cfg(not(feature = "vulkan"))]
-pub use stub::flash_attn_with_params_and_spec;
+pub use stub::{
+    flash_attn_with_params_and_spec, mm_with_params_and_spec, mmq_with_params_and_spec,
+};

@@ -13,6 +13,62 @@ struct ShaderSpec {
     defines: &'static [(&'static str, &'static str)],
 }
 
+/// Shared `mul_mmq.comp` define set; only `DATA_A_*` differs per quant type.
+/// Kept as macros rather than a helper fn because `ShaderSpec::defines` is a
+/// `&'static [_]` in a `const` array.
+macro_rules! mmq_defines {
+    ($data_a:literal) => {
+        &[
+            ("FLOAT16", "1"),
+            ("FLOAT_TYPE", "float16_t"),
+            ("FLOAT_TYPEV2", "f16vec2"),
+            ("FLOAT_TYPEV4", "f16vec4"),
+            ("ACC_TYPE", "float"),
+            ("ACC_TYPEV2", "vec2"),
+            ($data_a, "1"),
+            ("D_TYPE", "float"),
+        ]
+    };
+}
+
+const MMQ_DEFINES_Q4_K: &[(&str, &str)] = mmq_defines!("DATA_A_Q4_K");
+const MMQ_DEFINES_Q5_K: &[(&str, &str)] = mmq_defines!("DATA_A_Q5_K");
+const MMQ_DEFINES_Q6_K: &[(&str, &str)] = mmq_defines!("DATA_A_Q6_K");
+const MMQ_DEFINES_Q8_0: &[(&str, &str)] = mmq_defines!("DATA_A_Q8_0");
+
+/// Shared `mul_mm.comp` COOPMAT define set. Mirrors llama.cpp's
+/// `matmul_shaders(fp16=true, coopmat=true, f16acc=false)` for the *unaligned*
+/// `<quant>_f16` variant (`vulkan-shaders-gen.cpp:584`), which is the one whose
+/// B operand is a plain `float16_t` row-major `[N][K]` — no `ALIGNED`/vec4
+/// packing, so N (the token count) is unconstrained.
+///
+/// `LOAD_VEC_A` is `load_vec_quant`, and it is NOT cosmetic: `load_a_to_shmem`
+/// computes `buf_idx = col * SHMEM_STRIDE + row * LOAD_VEC_A / 2`, so a wrong
+/// value silently aliases shared-memory rows. Q4_K/Q5_K/Q8_0 dequantize 4
+/// values per invocation (`LOAD_VEC_A = 4`), Q6_K only 2.
+macro_rules! mm_coopmat_defines {
+    ($data_a:literal, $load_vec_a:literal) => {
+        &[
+            ("FLOAT16", "1"),
+            ("FLOAT_TYPE", "float16_t"),
+            ("FLOAT_TYPEV2", "f16vec2"),
+            ("FLOAT_TYPEV4", "f16vec4"),
+            ("ACC_TYPE", "float"),
+            ("ACC_TYPEV2", "vec2"),
+            ("COOPMAT", "1"),
+            ($data_a, "1"),
+            ("LOAD_VEC_A", $load_vec_a),
+            ("B_TYPE", "float16_t"),
+            ("D_TYPE", "float"),
+        ]
+    };
+}
+
+const MM_CM_DEFINES_Q4_K: &[(&str, &str)] = mm_coopmat_defines!("DATA_A_Q4_K", "4");
+const MM_CM_DEFINES_Q5_K: &[(&str, &str)] = mm_coopmat_defines!("DATA_A_Q5_K", "4");
+const MM_CM_DEFINES_Q6_K: &[(&str, &str)] = mm_coopmat_defines!("DATA_A_Q6_K", "2");
+const MM_CM_DEFINES_Q8_0: &[(&str, &str)] = mm_coopmat_defines!("DATA_A_Q8_0", "4");
+
 const VENDORED: &[ShaderSpec] = &[
     ShaderSpec {
         name: "mul_mat_vec_iq2_xxs",
@@ -152,6 +208,62 @@ const VENDORED: &[ShaderSpec] = &[
             ("MUL_MAT_ID", "1"),
             ("USE_SUBGROUP_ADD", "1"),
         ],
+    },
+    // Batched prefill GEMM (`mul_mmq`) — the integer-dot-product tiled matmul
+    // that consumes the SAME `block_q8_1_x4` activations the decode GEMVs
+    // already produce (`block_q8_1_x4` and `block_q8_1_x4_packed128` are
+    // byte-identical 144-byte blocks), so one `q8_1_quantize` dispatch feeds
+    // both lanes. `FLOAT16` picks the f16 shmem cache (halves the `block_a_cache`
+    // / `block_b_cache` scale footprint) while `ACC_TYPE=float` keeps the f32
+    // accumulator — the non-`f16acc` variant llama.cpp registers for AMD.
+    ShaderSpec {
+        name: "mul_mmq_q4_k",
+        source: "vendor/llama.cpp/vulkan-shaders/mul_mmq.comp",
+        defines: MMQ_DEFINES_Q4_K,
+    },
+    ShaderSpec {
+        name: "mul_mmq_q5_k",
+        source: "vendor/llama.cpp/vulkan-shaders/mul_mmq.comp",
+        defines: MMQ_DEFINES_Q5_K,
+    },
+    ShaderSpec {
+        name: "mul_mmq_q6_k",
+        source: "vendor/llama.cpp/vulkan-shaders/mul_mmq.comp",
+        defines: MMQ_DEFINES_Q6_K,
+    },
+    ShaderSpec {
+        name: "mul_mmq_q8_0",
+        source: "vendor/llama.cpp/vulkan-shaders/mul_mmq.comp",
+        defines: MMQ_DEFINES_Q8_0,
+    },
+    // Batched prefill GEMM on the MATRIX CORES (`mul_mm.comp` + `COOPMAT`). The
+    // 8060S advertises `VK_KHR_cooperative_matrix` with an f16xf16->f32 subgroup
+    // tile, and on a dense 27B that path is worth 3.32x over the integer-dot
+    // `mul_mmq` fallback (llama.cpp on this box: 61.96 t/s vs 18.64 t/s with
+    // `GGML_VK_DISABLE_COOPMAT=1`). Unlike `mul_mmq` the B operand is f16, not
+    // q8_1_x4 — the shader dequantizes A into shared memory and issues
+    // `coopMatMulAdd`, so the activation side is an `f16_kv_pack` away, not a
+    // `q8_1_quantize`. Registered unconditionally; `VulkanContext::coopmat()`
+    // decides at runtime whether these pipelines are ever built.
+    ShaderSpec {
+        name: "mul_mm_cm_q4_k",
+        source: "vendor/llama.cpp/vulkan-shaders/mul_mm.comp",
+        defines: MM_CM_DEFINES_Q4_K,
+    },
+    ShaderSpec {
+        name: "mul_mm_cm_q5_k",
+        source: "vendor/llama.cpp/vulkan-shaders/mul_mm.comp",
+        defines: MM_CM_DEFINES_Q5_K,
+    },
+    ShaderSpec {
+        name: "mul_mm_cm_q6_k",
+        source: "vendor/llama.cpp/vulkan-shaders/mul_mm.comp",
+        defines: MM_CM_DEFINES_Q6_K,
+    },
+    ShaderSpec {
+        name: "mul_mm_cm_q8_0",
+        source: "vendor/llama.cpp/vulkan-shaders/mul_mm.comp",
+        defines: MM_CM_DEFINES_Q8_0,
     },
     ShaderSpec {
         name: "rms_norm",
@@ -395,6 +507,9 @@ fn main() {
         "flash_attn_dequant.glsl",
         "flash_attn_mmq_funcs.glsl",
         "mul_mmq_shmem_types.glsl",
+        "mul_mmq_funcs.glsl",
+        "mul_mm_funcs.glsl",
+        "mul_mm_id_funcs.glsl",
         "rope_head.glsl",
         "rope_funcs.glsl",
         "glu_head.glsl",

@@ -122,6 +122,62 @@ mod real {
         unsafe { Entry::load() }.map_err(|e| runtime_error("loading Vulkan loader", e))
     }
 
+    /// The `f16 x f16 -> f32` cooperative-matrix tile the device advertises.
+    ///
+    /// `VK_KHR_cooperative_matrix` exposes a *set* of supported shapes; only the
+    /// ones with `AType == BType == float16`, `scope == Subgroup` and an f32
+    /// accumulator are usable by the tiled prefill GEMM (matching what
+    /// `ggml-vulkan` selects). On RDNA3/3.5 that is 16x16x16.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct CoopmatShape {
+        pub m: u32,
+        pub n: u32,
+        pub k: u32,
+    }
+
+    /// Pick the usable `f16 x f16 -> f32` subgroup-scoped tile, or `None` when
+    /// the device has no matrix cores (or exposes only f16-accumulate shapes,
+    /// which we reject for the same accuracy reason `ggml-vulkan` does).
+    ///
+    /// Called before `vkCreateDevice`: the query is a *physical device*
+    /// function, so the loader resolves it through `vkGetInstanceProcAddr`
+    /// without the extension being enabled anywhere yet.
+    fn query_coopmat(
+        entry: &Entry,
+        instance: &ash::Instance,
+        physical_device: vk::PhysicalDevice,
+    ) -> Option<CoopmatShape> {
+        if !has_device_extension(instance, physical_device, vk::KHR_COOPERATIVE_MATRIX_NAME)
+            .unwrap_or(false)
+        {
+            return None;
+        }
+        let mut coopmat = vk::PhysicalDeviceCooperativeMatrixFeaturesKHR::default();
+        let mut features2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut coopmat);
+        unsafe { instance.get_physical_device_features2(physical_device, &mut features2) };
+        if !vk_bool(coopmat.cooperative_matrix) {
+            return None;
+        }
+        let ext = ash::khr::cooperative_matrix::Instance::new(entry, instance);
+        let props =
+            unsafe { ext.get_physical_device_cooperative_matrix_properties(physical_device) }
+                .ok()?;
+        props
+            .iter()
+            .find(|p| {
+                p.a_type == vk::ComponentTypeKHR::FLOAT16
+                    && p.b_type == vk::ComponentTypeKHR::FLOAT16
+                    && p.c_type == vk::ComponentTypeKHR::FLOAT32
+                    && p.result_type == vk::ComponentTypeKHR::FLOAT32
+                    && p.scope == vk::ScopeKHR::SUBGROUP
+            })
+            .map(|p| CoopmatShape {
+                m: p.m_size,
+                n: p.n_size,
+                k: p.k_size,
+            })
+    }
+
     fn pick_compute_queue(
         instance: &ash::Instance,
     ) -> Result<(vk::PhysicalDevice, u32, vk::PhysicalDeviceProperties)> {
@@ -174,6 +230,10 @@ mod real {
         /// pipelines that share a backend, collapsing redundant compile work.
         /// Created once at context init; destroyed before the device in `Drop`.
         pipeline_cache: vk::PipelineCache,
+        /// `Some` when `VK_KHR_cooperative_matrix` was found *and* enabled on
+        /// the device, carrying the f16xf16->f32 tile the prefill GEMM should
+        /// compile for. `None` means no matrix cores: `mul_mmq` stays the route.
+        coopmat: Option<CoopmatShape>,
     }
 
     impl VulkanContext {
@@ -192,10 +252,14 @@ mod real {
             let queue_info = [vk::DeviceQueueCreateInfo::default()
                 .queue_family_index(queue_family_index)
                 .queue_priorities(&priorities)];
-            let extensions = [
+            let coopmat = query_coopmat(&entry, &instance, physical_device);
+            let mut extensions = vec![
                 vk::KHR_SHADER_INTEGER_DOT_PRODUCT_NAME.as_ptr(),
                 vk::EXT_SUBGROUP_SIZE_CONTROL_NAME.as_ptr(),
             ];
+            if coopmat.is_some() {
+                extensions.push(vk::KHR_COOPERATIVE_MATRIX_NAME.as_ptr());
+            }
             let base_features = vk::PhysicalDeviceFeatures::default().shader_int16(true);
             let mut storage16 =
                 vk::PhysicalDevice16BitStorageFeatures::default().storage_buffer16_bit_access(true);
@@ -212,12 +276,17 @@ mod real {
             let mut size_control = vk::PhysicalDeviceSubgroupSizeControlFeatures::default()
                 .subgroup_size_control(true)
                 .compute_full_subgroups(true);
+            let mut coopmat_features =
+                vk::PhysicalDeviceCooperativeMatrixFeaturesKHR::default().cooperative_matrix(true);
             let mut features2 = vk::PhysicalDeviceFeatures2::default()
                 .features(base_features)
                 .push_next(&mut integer_dot)
                 .push_next(&mut vulkan12)
                 .push_next(&mut storage16)
                 .push_next(&mut size_control);
+            if coopmat.is_some() {
+                features2 = features2.push_next(&mut coopmat_features);
+            }
             let create = vk::DeviceCreateInfo::default()
                 .queue_create_infos(&queue_info)
                 .enabled_extension_names(&extensions)
@@ -251,7 +320,15 @@ mod real {
                 queue,
                 device_name: device_name_from_properties(&props),
                 pipeline_cache,
+                coopmat,
             })
+        }
+
+        /// The cooperative-matrix tile enabled on this device, or `None` when
+        /// the device has no usable matrix cores. Callers must treat `None` as
+        /// "compile the `mul_mmq` fallback", never as an error.
+        pub fn coopmat(&self) -> Option<CoopmatShape> {
+            self.coopmat
         }
 
         pub fn device_name(&self) -> &str {
@@ -291,6 +368,19 @@ mod real {
                     .get_physical_device_properties(self.physical_device)
             };
             props.limits.min_storage_buffer_offset_alignment
+        }
+
+        /// `maxComputeSharedMemorySize` (bytes) — the ceiling on a compute
+        /// pipeline's `shared` declarations. The tiled `mul_mmq` prefill GEMM
+        /// sizes its shared A/B caches from spec constants, so the tile must be
+        /// chosen against this limit (see `MmqSpec::choose`); an oversized tile
+        /// fails at pipeline creation, not at dispatch.
+        pub fn max_compute_shared_memory_size(&self) -> u32 {
+            let props = unsafe {
+                self.instance
+                    .get_physical_device_properties(self.physical_device)
+            };
+            props.limits.max_compute_shared_memory_size
         }
 
         /// `(timestampPeriod ns/tick, timestampValidBits)` for GPU timestamp
@@ -673,6 +763,52 @@ mod real {
                 Ok(())
             })?;
             Ok(dst)
+        }
+
+        /// Read this buffer back through a temporary host-visible staging
+        /// buffer — the inverse of [`Self::alloc_device_local_from_host`].
+        ///
+        /// [`Self::copy_to_host`] maps the buffer's own memory, so it fails with
+        /// `ERROR_MEMORY_MAP_FAILED` on anything allocated DEVICE_LOCAL-only,
+        /// which is every resident weight. This is the read-back path for those.
+        ///
+        /// Verification-only: it allocates, submits, and blocks. Never put it on
+        /// a per-token path — see the write-combined read-back trap that made the
+        /// MoE router 20x slower than it looked.
+        pub fn copy_to_host_staged(&self, dst: &mut [u8]) -> Result<()> {
+            if dst.is_empty() {
+                return Ok(());
+            }
+            if dst.len() > self.len {
+                return Err(VulkanError::Runtime(format!(
+                    "staged D2H of {} B from a {} B buffer",
+                    dst.len(),
+                    self.len
+                )));
+            }
+            let staging = Self::alloc_with_usage(
+                self.ctx,
+                dst.len(),
+                vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST,
+                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+            )?;
+            let pool = CommandPool::create(self.ctx)?;
+            pool.one_shot_submit(|cmd| {
+                let region = vk::BufferCopy::default().size(dst.len() as vk::DeviceSize);
+                // SAFETY: `cmd` is the live, recording command buffer supplied by
+                // `one_shot_submit`. Both buffers outlive the submit (`self` by
+                // `&self`, `staging` by this scope) and carry the required usage
+                // flags — `self` TRANSFER_SRC from `alloc_device_local_from_host`,
+                // `staging` TRANSFER_DST above. `region` copies `dst.len()` bytes,
+                // checked against `self.len` and equal to `staging`'s size.
+                unsafe {
+                    self.ctx
+                        .device
+                        .cmd_copy_buffer(cmd, self.buffer, staging.buffer, &[region]);
+                }
+                Ok(())
+            })?;
+            staging.copy_to_host(dst)
         }
     }
 
@@ -1476,6 +1612,19 @@ mod real {
             self.next = 0;
         }
 
+        /// Slots left before the cursor wraps and starts OVERWRITING sets that
+        /// the currently-recorded command buffer may still reference.
+        ///
+        /// `next_updated` wraps silently — it cannot fail, it just corrupts the
+        /// bindings of an already-recorded dispatch. A caller that records more
+        /// than `ring_size` dispatches in one batch (batched prefill, which
+        /// scales dispatch count with the chunk width) must consult this and
+        /// submit + [`reset`](Self::reset) before it runs out.
+        #[must_use]
+        pub fn remaining(&self) -> usize {
+            self.sets.len().saturating_sub(self.next)
+        }
+
         /// Bind `buffers` (each `(buffer, offset_bytes, range_bytes)`) into the
         /// next ring slot via one `vkUpdateDescriptorSets` and return its raw
         /// `VkDescriptorSet`. No pool / set creation. The caller must record the
@@ -1707,8 +1856,9 @@ mod real {
 
 #[cfg(feature = "vulkan")]
 pub use real::{
-    CommandPool, CommandRecorder, ComputePipeline, DescriptorSet, DescriptorSetLayout,
-    DescriptorSetRing, DeviceBuffer, ShaderModule, VulkanContext, device_count, device_name, init,
+    CommandPool, CommandRecorder, ComputePipeline, CoopmatShape, DescriptorSet,
+    DescriptorSetLayout, DescriptorSetRing, DeviceBuffer, ShaderModule, VulkanContext,
+    device_count, device_name, init,
 };
 
 #[cfg(not(feature = "vulkan"))]
@@ -1728,6 +1878,13 @@ mod stub {
         Err(VULKAN_NOT_COMPILED)
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct CoopmatShape {
+        pub m: u32,
+        pub n: u32,
+        pub k: u32,
+    }
+
     pub struct VulkanContext {
         _private: (),
     }
@@ -1741,11 +1898,19 @@ mod stub {
             ""
         }
 
+        pub fn coopmat(&self) -> Option<CoopmatShape> {
+            None
+        }
+
         pub fn queue_family_index(&self) -> u32 {
             0
         }
 
         pub fn min_storage_buffer_offset_alignment(&self) -> u64 {
+            0
+        }
+
+        pub fn max_compute_shared_memory_size(&self) -> u32 {
             0
         }
     }
@@ -1784,6 +1949,10 @@ mod stub {
         }
 
         pub fn copy_to_host_at(&self, _offset: u64, _dst: &mut [u8]) -> Result<()> {
+            Err(VULKAN_NOT_COMPILED)
+        }
+
+        pub fn copy_to_host_staged(&self, _dst: &mut [u8]) -> Result<()> {
             Err(VULKAN_NOT_COMPILED)
         }
     }
@@ -1890,6 +2059,11 @@ mod stub {
         }
 
         pub fn reset(&mut self) {}
+
+        #[must_use]
+        pub fn remaining(&self) -> usize {
+            0
+        }
     }
 
     pub struct ComputePipeline<'a> {
@@ -1939,8 +2113,9 @@ mod stub {
 
 #[cfg(not(feature = "vulkan"))]
 pub use stub::{
-    CommandPool, CommandRecorder, ComputePipeline, DescriptorSet, DescriptorSetLayout,
-    DescriptorSetRing, DeviceBuffer, ShaderModule, VulkanContext, device_count, device_name, init,
+    CommandPool, CommandRecorder, ComputePipeline, CoopmatShape, DescriptorSet,
+    DescriptorSetLayout, DescriptorSetRing, DeviceBuffer, ShaderModule, VulkanContext,
+    device_count, device_name, init,
 };
 
 #[cfg(test)]
@@ -1988,6 +2163,15 @@ mod tests {
             ctx.device_name(),
             ctx.queue_family_index()
         );
+        // Diagnostic, not an assertion: a device without matrix cores is a
+        // supported configuration (the prefill GEMM falls back to `mul_mmq`).
+        match ctx.coopmat() {
+            Some(s) => eprintln!(
+                "vulkan-sys smoke: coopmat f16xf16->f32 = {}x{}x{}",
+                s.m, s.n, s.k
+            ),
+            None => eprintln!("vulkan-sys smoke: coopmat = unsupported"),
+        }
 
         let src: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
         let mut buf = match DeviceBuffer::alloc(&ctx, src.len()) {

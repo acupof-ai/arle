@@ -57,6 +57,31 @@ struct ServeConfig {
 /// only applies when the engine is a direct child (a shell wrapper breaks it),
 /// while `kill(pid, 0)` works for any ancestor but can be fooled by a recycled
 /// pid.
+/// Windows never reparents an orphan, so the parent pid alone can't say whether
+/// we were detached — only liveness is observable. `sysinfo` supplies it without
+/// a new dependency.
+#[cfg(not(unix))]
+fn watch_parent(pid: i32) {
+    use sysinfo::{Pid, ProcessesToUpdate, System};
+    let parent = Pid::from_u32(pid as u32);
+    std::thread::spawn(move || {
+        let mut sys = System::new();
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            sys.refresh_processes(ProcessesToUpdate::Some(&[parent]), true);
+            if sys.process(parent).is_none() {
+                eprintln!("[ARLE serve] parent {pid} exited; shutting down");
+                // No `_exit` equivalent without pulling in windows-sys for
+                // TerminateProcess; the atexit deadlock the Unix arm dodges has
+                // not been observed here, so take the portable exit.
+                #[allow(clippy::exit)]
+                std::process::exit(0);
+            }
+        }
+    });
+}
+
+#[cfg(unix)]
 fn watch_parent(pid: i32) {
     // SAFETY: getppid/kill with signal 0 only read process state.
     let direct_child = unsafe { libc::getppid() } == pid;
