@@ -149,6 +149,8 @@ fi
 SERVE_PID=$!
 cleanup() {
     kill "$SERVE_PID" 2>/dev/null
+    sleep 1
+    kill -9 "$SERVE_PID" 2>/dev/null
     wait "$SERVE_PID" 2>/dev/null
     old_ifs="$IFS"; IFS=','
     for gpu in $DSV4_CLAIMS; do
