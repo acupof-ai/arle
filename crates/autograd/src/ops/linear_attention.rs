@@ -427,20 +427,37 @@ pub fn linear_attention_core_cp(
         store,
         tape,
     )?;
+    // slice / all_to_all / cat / permute all save shape metadata only, so each
+    // stage's input is value-dead the moment the next one returns. A checkpoint
+    // group frees nothing until the whole layer is done, so without these drops
+    // the entire transport chain stays resident through the layer — measured as
+    // a ~33 GiB transient spike inside one group's forward at local 81,920.
+    let (q_shard, k_shard, v_shard) = (q, k, v);
     let q = crate::ops::all_to_all(q, 1, 2, store, tape)?;
     let k = crate::ops::all_to_all(k, 1, 2, store, tape)?;
     let v = crate::ops::all_to_all(v, 1, 2, store, tape)?;
-    let qkv = crate::ops::cat(&[q, k, v], 2, store, tape)?;
+    for dead in [q_shard, k_shard, v_shard] {
+        store.drop_device_residency(dead)?;
+    }
+    let qkv_gathered = crate::ops::cat(&[q, k, v], 2, store, tape)?;
+    for dead in [q, k, v] {
+        store.drop_device_residency(dead)?;
+    }
+    let qkv = qkv_gathered;
     let z = crate::ops::all_to_all(z, 1, 2, store, tape)?;
     let b_proj = crate::ops::all_to_all(b_proj, 1, 2, store, tape)?;
     let a_proj = crate::ops::all_to_all(a_proj, 1, 2, store, tape)?;
 
     // a2a leaves the seq blocks interleaved; the recurrence needs true global order.
     let (fwd, phys) = zigzag_block_perms(n);
+    let (qkv_pre, z_pre, b_pre, a_pre) = (qkv, z, b_proj, a_proj);
     let qkv = crate::ops::permute_seq_blocks(qkv, &fwd, store, tape)?;
     let z = crate::ops::permute_seq_blocks(z, &fwd, store, tape)?;
     let b_proj = crate::ops::permute_seq_blocks(b_proj, &fwd, store, tape)?;
     let a_proj = crate::ops::permute_seq_blocks(a_proj, &fwd, store, tape)?;
+    for dead in [qkv_pre, z_pre, b_pre, a_pre] {
+        store.drop_device_residency(dead)?;
+    }
 
     // Frozen weights sliced to this rank's head range. conv1d packs [q|k|v] on the
     // channel axis (same region surgery); dt_bias/a_log are per-value-head; norm is

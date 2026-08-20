@@ -666,6 +666,15 @@ impl TensorStore {
         };
         let handle = {
             let tensor = self.tensor(id)?;
+            // `upload` ignores the shape, so empty host data would hand back a
+            // zero-length handle carrying a full-size shape and the next kernel
+            // would read past it. A residency-dropped tensor that gets re-fetched
+            // lands here — fail loudly instead.
+            if tensor.data.is_empty() && crate::backend::shape_size(&shape) != 0 {
+                return Err(AutogradError::TapeInvariant(
+                    "ensure_device on a tensor with no device handle and no host data",
+                ));
+            }
             self.backend().upload(&tensor.data, &shape)?
         };
         let recycled = if checkpoint_residency == CheckpointResidency::Host {
