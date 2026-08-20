@@ -2184,6 +2184,11 @@ pub unsafe fn dsv4_fp8_grouped_down_decode(
 /// Per-tensor BF16→FP8 E4M3 quantization (amax reduction + quantize).
 /// `scale` is a single-device-float scratch; the kernel writes the amax-derived
 /// scale then reads it back in the quantize pass.
+///
+/// # Safety
+///
+/// Caller guarantees every device pointer is valid for the documented
+/// extent on the launch stream and stays alive through submission.
 pub unsafe fn w4a8_per_tensor_fp8_quant(
     input: RawDevicePtr<bf16>,
     output: RawDevicePtr<u8>,
@@ -2191,6 +2196,7 @@ pub unsafe fn w4a8_per_tensor_fp8_quant(
     numel: usize,
     stream: CUstream,
 ) -> Result<()> {
+    // SAFETY: contract upheld by the caller per the launcher doc.
     unsafe {
         ffi::w4a8_per_tensor_fp8_quant(
             input.as_ptr() as *const Half,
@@ -2204,6 +2210,11 @@ pub unsafe fn w4a8_per_tensor_fp8_quant(
 }
 
 /// Build problem_sizes [E, 3] (N, M, K — SGLang order) from per-expert token counts.
+///
+/// # Safety
+///
+/// Caller guarantees every device pointer is valid for the documented
+/// extent on the launch stream and stays alive through submission.
 pub unsafe fn w4a8_compute_problem_sizes(
     counts: RawDevicePtr<i32>,
     problem_sizes: RawDevicePtr<i32>,
@@ -2212,6 +2223,7 @@ pub unsafe fn w4a8_compute_problem_sizes(
     k: usize,
     stream: CUstream,
 ) -> Result<()> {
+    // SAFETY: contract upheld by the caller per the launcher doc.
     unsafe {
         ffi::w4a8_compute_problem_sizes(
             counts.as_ptr(),
@@ -2226,6 +2238,11 @@ pub unsafe fn w4a8_compute_problem_sizes(
 }
 
 /// Fused clamped SwiGLU on the CUTLASS gate+up output: [rows, 2*i_dim] → [rows, i_dim].
+///
+/// # Safety
+///
+/// Caller guarantees every device pointer is valid for the documented
+/// extent on the launch stream and stays alive through submission.
 pub unsafe fn w4a8_swiglu_fused(
     gateup: RawDevicePtr<bf16>,
     out: RawDevicePtr<bf16>,
@@ -2234,6 +2251,7 @@ pub unsafe fn w4a8_swiglu_fused(
     limit: f32,
     stream: CUstream,
 ) -> Result<()> {
+    // SAFETY: contract upheld by the caller per the launcher doc.
     unsafe {
         ffi::w4a8_swiglu_fused(
             gateup.as_ptr() as *const Half,
@@ -2251,6 +2269,11 @@ pub unsafe fn w4a8_swiglu_fused(
 /// projection (gate+up fused, then down). Returns 0 on success.
 /// `expert_offsets` is a DEVICE pointer (the CUTLASS kernel reads it device-side
 /// via the w4a8_get_group_gemm_starts kernel to build per-expert pointer arrays).
+///
+/// # Safety
+///
+/// Caller guarantees every device pointer is valid for the documented
+/// extent on the launch stream and stays alive through submission.
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn w4a8_moe_grouped_gemm(
     d_output: RawDevicePtr<bf16>,
@@ -2269,6 +2292,7 @@ pub unsafe fn w4a8_moe_grouped_gemm(
     workspace_bytes: usize,
     stream: CUstream,
 ) -> Result<i32> {
+    // SAFETY: contract upheld by the caller per the launcher doc.
     let rc = unsafe {
         ffi::w4a8_moe_grouped_gemm_sm90(
             d_output.as_mut_ptr() as *mut Half,
@@ -2295,6 +2319,11 @@ pub unsafe fn w4a8_moe_grouped_gemm(
 /// (signed INT4 + BF16 interleaved scales) on GPU. `k` is the logical K
 /// (2× the packed byte count) and must be a multiple of 512. Output buffers
 /// must be sized: weight `n * k/2` bytes, scales `(k/512) * n * 4 * 2` bytes.
+///
+/// # Safety
+///
+/// Caller guarantees every device pointer is valid for the documented
+/// extent on the launch stream and stays alive through submission.
 pub unsafe fn nvfp4_to_w4afp8(
     src_weight: RawDevicePtr<i8>,
     src_scales: RawDevicePtr<u8>,
@@ -2304,6 +2333,7 @@ pub unsafe fn nvfp4_to_w4afp8(
     k: usize,
     stream: CUstream,
 ) -> Result<()> {
+    // SAFETY: contract upheld by the caller per the launcher doc.
     let rc = unsafe {
         ffi::nvfp4_to_w4afp8(
             src_weight.as_ptr(),
