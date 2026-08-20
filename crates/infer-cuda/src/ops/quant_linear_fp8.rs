@@ -612,7 +612,12 @@ fn reserve_fp8_weight_scratch(ctx: &DeviceContext, bytes: usize) -> bool {
         if scratch.fp8_capacity >= bytes {
             return true;
         }
-        match ctx.stream.alloc_zeros::<u8>(bytes) {
+        // `alloc`, not `alloc_zeros`: both materialisers write every one of the
+        // `n * k` bytes the GEMM then reads, and the buffer is grow-only, so a
+        // smaller weight never reads past what it wrote. Zeroing 170 MiB in the
+        // request path is ~57 us the first token pays for nothing.
+        // SAFETY: fully overwritten before any read, on the same stream.
+        match unsafe { ctx.stream.alloc::<u8>(bytes) } {
             Ok(buf) => {
                 scratch.weight_fp8 = Some(buf);
                 scratch.fp8_capacity = bytes;

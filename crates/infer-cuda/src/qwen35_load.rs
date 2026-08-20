@@ -24,7 +24,17 @@ impl Qwen35Model {
                 weight.weight_format,
                 weight.quant_block_m,
             );
-            if seen.insert(key) && warm_fp8_deepgemm_dense(&self.ctx, weight, warm_m)? {
+            if !seen.insert(key) {
+                return Ok(());
+            }
+            // NVFP4 has its own arm and its own kernel; without this it relies on
+            // an FP8 weight of the same (m, n, k) having warmed a cubin it can
+            // reuse, which is a property of this checkpoint, not of the format.
+            if warm_fp4_deepgemm_dense(&self.ctx, weight, warm_m)? {
+                warmed += 1;
+                return Ok(());
+            }
+            if warm_fp8_deepgemm_dense(&self.ctx, weight, warm_m)? {
                 // Also JIT-warm the spec-verify row count so the first DSpark
                 // block step doesn't compile DeepGEMM M=16 kernels in-request.
                 warm_fp8_deepgemm_dense(&self.ctx, weight, 16)?;

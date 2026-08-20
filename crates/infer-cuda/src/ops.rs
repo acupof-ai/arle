@@ -61,6 +61,16 @@ pub(crate) fn upload_i32(ctx: &DeviceContext, values: &[i32]) -> Result<CudaSlic
 }
 
 /// Upload a host `&[u64]` to device (e.g. an array of device pointers for a
+
+/// Compile the NVFP4 prefill arm's DeepGEMM kernel at load and reserve its E4M3
+/// scratch, instead of letting the first prefill chunk do both in-request.
+pub(crate) fn warm_fp4_deepgemm_dense(
+    ctx: &DeviceContext,
+    weight: &DeviceMatrix,
+    seq_len: usize,
+) -> Result<bool> {
+    quant_linear::warm_fp4_deepgemm_dense(ctx, weight, seq_len)
+}
 /// pointer-array batched kernel). Mirrors [`upload_i32`].
 pub(crate) fn upload_u64(ctx: &DeviceContext, values: &[u64]) -> Result<CudaSlice<u64>> {
     ctx.stream
