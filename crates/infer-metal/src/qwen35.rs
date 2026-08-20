@@ -276,13 +276,19 @@ fn build_qwen35_linear_attention(
     let qkv_dim = qkv_proj.output_dim()?;
     let z_dim = z_proj.output_dim()?;
     let beta_dim = beta_proj.output_dim()?;
-    let in_proj_qkvz = match merge_quantized_projection_rows(&[&qkv_proj, &z_proj])? {
-        Some(merged) => Some(merged),
-        None => concat_weight_rows(&qkv_proj, &z_proj).ok(),
-    };
-    let in_proj_ba = match merge_quantized_projection_rows(&[&beta_proj, &alpha_proj])? {
-        Some(merged) => Some(merged),
-        None => concat_weight_rows(&beta_proj, &alpha_proj).ok(),
+    // Merged projections are dead under the default separate path (env=0 is the only reader).
+    let (in_proj_qkvz, in_proj_ba) = if use_qwen35_cpp_separate_proj() {
+        (None, None)
+    } else {
+        let qkvz = match merge_quantized_projection_rows(&[&qkv_proj, &z_proj])? {
+            Some(merged) => Some(merged),
+            None => concat_weight_rows(&qkv_proj, &z_proj).ok(),
+        };
+        let ba = match merge_quantized_projection_rows(&[&beta_proj, &alpha_proj])? {
+            Some(merged) => Some(merged),
+            None => concat_weight_rows(&beta_proj, &alpha_proj).ok(),
+        };
+        (qkvz, ba)
     };
     Ok(MetalQwen35Attention::Linear(MetalLinearAttnWeights {
         in_proj_qkvz,
