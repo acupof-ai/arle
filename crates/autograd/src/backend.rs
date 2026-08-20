@@ -570,8 +570,6 @@ pub struct LinearAttentionDeviceBackwardArgs<'a> {
     pub dt_bias: &'a DeviceHandle,
     pub a_log: &'a DeviceHandle,
     pub norm_weight: &'a DeviceHandle,
-    pub preact: &'a DeviceHandle,
-    pub qkv_conv: &'a DeviceHandle,
     /// None on the FlashQLA route, which re-derives both from `qkv_conv`.
     pub g: Option<&'a DeviceHandle>,
     pub beta: Option<&'a DeviceHandle>,

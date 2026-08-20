@@ -154,8 +154,45 @@ pub(super) fn cuda_linear_attention_backward_device_row(
     let a_log = backend.cuda_slice(args.a_log, "linear_attention_backward a_log")?;
     let norm_weight =
         backend.cuda_slice(args.norm_weight, "linear_attention_backward norm_weight")?;
-    let preact = backend.cuda_slice(args.preact, "linear_attention_backward preact")?;
-    let qkv_conv = backend.cuda_bf16_slice(args.qkv_conv, "linear_attention_backward qkv_conv")?;
+    // Rebuilt here rather than taped: the pair is 6,720 MiB at local seq 131,072
+    // and one depthwise conv reproduces it exactly from qkv + weights.
+    let mut preact_scratch = backend
+        .stream
+        .alloc_zeros::<f32>(qkv_len)
+        .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (la preact)"))?;
+    let mut qkv_conv_scratch = backend
+        .stream
+        .alloc_zeros::<u16>(qkv_len)
+        .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (la qkv_conv)"))?;
+    {
+        let recompute_tail = args
+            .initial_conv_window
+            .map(|h| backend.cuda_slice(h, "linear_attention_backward conv_tail"))
+            .transpose()?;
+        super::linear_attention_forward::launch_conv1d_silu(
+            backend,
+            &mut preact_scratch,
+            &mut qkv_conv_scratch,
+            qkv,
+            conv1d_weight,
+            recompute_tail,
+            p.conv_kernel.saturating_sub(1),
+            super::linear_attention_forward::ConvSiluDims {
+                qkv_len,
+                qkv_dim: i32::try_from(qkv_dim).map_err(|_| {
+                    AutogradError::TapeInvariant("linear_attention qkv_dim exceeds i32")
+                })?,
+                seq_len: i32::try_from(p.seq_len).map_err(|_| {
+                    AutogradError::TapeInvariant("linear_attention seq_len exceeds i32")
+                })?,
+                conv_kernel: i32::try_from(p.conv_kernel).map_err(|_| {
+                    AutogradError::TapeInvariant("linear_attention conv_kernel exceeds i32")
+                })?,
+            },
+        )?;
+    }
+    let preact = &preact_scratch;
+    let qkv_conv = &qkv_conv_scratch;
     let beta = args
         .beta
         .map(|h| backend.cuda_slice(h, "linear_attention_backward beta"))
@@ -176,8 +213,6 @@ pub(super) fn cuda_linear_attention_backward_device_row(
         ("dt_bias", Some(dt_bias.len()), p.num_value_heads),
         ("a_log", Some(a_log.len()), p.num_value_heads),
         ("norm_weight", Some(norm_weight.len()), p.value_dim),
-        ("preact", Some(preact.len()), qkv_len),
-        ("qkv_conv", Some(qkv_conv.len()), qkv_len),
         ("beta", beta.map(|s| s.len()), head_len),
         ("g", g.map(|s| s.len()), head_len),
         ("chunk_state", Some(chunk_state.len()), chunk_state_len),

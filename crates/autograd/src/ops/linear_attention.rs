@@ -322,8 +322,6 @@ pub fn linear_attention_core(
             dt_bias,
             a_log,
             norm_weight,
-            preact: None,
-            qkv_conv: None,
             g: None,
             beta: None,
             chunk_state: None,
@@ -978,8 +976,6 @@ pub fn linear_attention_core_with_carry_taped(
             dt_bias,
             a_log,
             norm_weight,
-            preact: None,
-            qkv_conv: None,
             g: None,
             beta: None,
             chunk_state: None,
@@ -1089,8 +1085,6 @@ fn try_linear_attention_forward_device(
         return Ok(None);
     };
 
-    let q_dim = params.num_key_heads * params.key_dim;
-    let qkv_dim = q_dim * 2 + params.num_value_heads * params.value_dim;
     let num_chunks = params.seq_len.div_ceil(64);
     let output_shape = vec![
         params.batch,
@@ -1101,10 +1095,6 @@ fn try_linear_attention_forward_device(
     let output_id = store.alloc_device_tensor(output_shape, result.output)?;
 
     if requires_grad {
-        let preact_id = store
-            .alloc_device_tensor(vec![params.batch, params.seq_len, qkv_dim], result.preact)?;
-        let qkv_conv_id = store
-            .alloc_device_tensor(vec![params.batch, params.seq_len, qkv_dim], result.qkv_conv)?;
         // FlashQLA re-derives g/beta in the backward, so they never reach the tape.
         let (g_id, beta_id) = if result.flashqla {
             (None, None)
@@ -1160,8 +1150,6 @@ fn try_linear_attention_forward_device(
                 dt_bias,
                 a_log,
                 norm_weight,
-                preact: Some(preact_id),
-                qkv_conv: Some(qkv_conv_id),
                 g: g_id,
                 beta: beta_id,
                 chunk_state: Some(chunk_state_id),
@@ -1196,8 +1184,6 @@ fn try_linear_attention_backward_device(
     dt_bias: TensorId,
     a_log: TensorId,
     norm_weight: TensorId,
-    preact: Option<TensorId>,
-    qkv_conv: Option<TensorId>,
     g: Option<TensorId>,
     beta: Option<TensorId>,
     chunk_state: Option<TensorId>,
@@ -1209,12 +1195,6 @@ fn try_linear_attention_backward_device(
     if store.backend().device() != Device::Cuda {
         return Ok(None);
     }
-    let Some(preact) = preact else {
-        return Ok(None);
-    };
-    let Some(qkv_conv) = qkv_conv else {
-        return Ok(None);
-    };
     let Some(chunk_state) = chunk_state else {
         return Ok(None);
     };
@@ -1233,8 +1213,6 @@ fn try_linear_attention_backward_device(
         dt_bias,
         a_log,
         norm_weight,
-        preact,
-        qkv_conv,
         chunk_state,
     ]
     .into_iter()
@@ -1264,8 +1242,6 @@ fn try_linear_attention_backward_device(
     let dt_handle = handle(store, dt_bias)?;
     let a_log_handle = handle(store, a_log)?;
     let norm_handle = handle(store, norm_weight)?;
-    let preact_handle = handle(store, preact)?;
-    let qkv_conv_handle = handle(store, qkv_conv)?;
     let g_handle = g.map(|id| handle(store, id)).transpose()?;
     let beta_handle = beta.map(|id| handle(store, id)).transpose()?;
     let chunk_state_handle = handle(store, chunk_state)?;
@@ -1300,8 +1276,6 @@ fn try_linear_attention_backward_device(
                 dt_bias: &dt_handle,
                 a_log: &a_log_handle,
                 norm_weight: &norm_handle,
-                preact: &preact_handle,
-                qkv_conv: &qkv_conv_handle,
                 g: g_handle.as_ref(),
                 beta: beta_handle.as_ref(),
                 chunk_state: &chunk_state_handle,
@@ -1396,8 +1370,6 @@ pub(crate) fn linear_attention_backward(
         dt_bias,
         a_log,
         norm_weight,
-        preact,
-        qkv_conv,
         g,
         beta,
         chunk_state,
@@ -1457,8 +1429,6 @@ pub(crate) fn linear_attention_backward(
             dt_bias,
             a_log,
             norm_weight,
-            preact,
-            qkv_conv,
             g,
             beta,
             chunk_state,

@@ -491,47 +491,21 @@ pub(super) fn cuda_linear_attention_forward_device_row(
     let value_dim_i32 = i32::try_from(p.value_dim)
         .map_err(|_| AutogradError::TapeInvariant("linear_attention value_dim exceeds i32"))?;
 
-    {
-        let stage_started = linear_attention_debug_stage_start();
-        let (preact_ptr, _preact_guard) = preact.device_ptr_mut(&backend.stream);
-        let (qkv_conv_ptr, _qkv_conv_guard) = qkv_conv.device_ptr_mut(&backend.stream);
-        let (qkv_ptr, _qkv_guard) = qkv.device_ptr(&backend.stream);
-        let (conv_ptr, _conv_guard) = conv1d_weight.device_ptr(&backend.stream);
-        // conv_tail = carried boundary window (nullptr → default zero-tap path, byte-identical).
-        let conv_tail = carry_conv.map(|s| s.device_ptr(&backend.stream));
-        let conv_tail_ptr = conv_tail.as_ref().map_or(0u64, |(ptr, _)| *ptr);
-        let conv_tail_len_i32 = carry_conv
-            .map(|_| i32::try_from(conv_tail_len))
-            .transpose()
-            .map_err(|_| {
-                AutogradError::TapeInvariant("linear_attention conv_tail_len exceeds i32")
-            })?
-            .unwrap_or(0);
-        let total_u64 = u64::try_from(qkv_len)
-            .map_err(|_| AutogradError::TapeInvariant("linear_attention qkv_len exceeds u64"))?;
-        launch_1d(
-            &backend.stream,
-            backend
-                .kernels
-                .function("linear_attention_conv1d_silu_forward_f32_to_bf16")?,
+    launch_conv1d_silu(
+        backend,
+        &mut preact,
+        &mut qkv_conv,
+        &qkv,
+        &conv1d_weight,
+        carry_conv,
+        conv_tail_len,
+        ConvSiluDims {
             qkv_len,
-            |mut builder| {
-                builder
-                    .arg(&preact_ptr)
-                    .arg(&qkv_conv_ptr)
-                    .arg(&qkv_ptr)
-                    .arg(&conv_ptr)
-                    .arg(&total_u64)
-                    .arg(&qkv_dim_i32)
-                    .arg(&seq_len_i32)
-                    .arg(&conv_kernel_i32)
-                    .arg(&conv_tail_ptr)
-                    .arg(&conv_tail_len_i32);
-                builder
-            },
-        )?;
-        linear_attention_debug_stage_done(backend, "conv1d_silu", stage_started)?;
-    }
+            qkv_dim: qkv_dim_i32,
+            seq_len: seq_len_i32,
+            conv_kernel: conv_kernel_i32,
+        },
+    )?;
     if use_chunkwise {
         let fq = flashqla_gdr_symbols(p.num_value_heads, p.num_key_heads)?;
         {
@@ -782,4 +756,66 @@ pub(super) fn cuda_linear_attention_forward_device_row(
         raw_output: DeviceHandle::CudaBf16(CudaBf16Storage::new(raw_output)),
         flashqla: use_chunkwise,
     })
+}
+
+pub(super) struct ConvSiluDims {
+    pub qkv_len: usize,
+    pub qkv_dim: i32,
+    pub seq_len: i32,
+    pub conv_kernel: i32,
+}
+
+/// Causal depthwise conv + SiLU, writing the f32 pre-activation and its bf16
+/// SiLU together. The backward calls this to regenerate both instead of reading
+/// them off the tape: at local seq 131,072 the pair is 6,720 MiB held from the
+/// forward, against one depthwise-conv launch to rebuild.
+pub(super) fn launch_conv1d_silu(
+    backend: &CudaBackend,
+    preact: &mut CudaSlice<f32>,
+    qkv_conv: &mut CudaSlice<u16>,
+    qkv: &CudaSlice<f32>,
+    conv1d_weight: &CudaSlice<f32>,
+    carry_conv: Option<&CudaSlice<f32>>,
+    conv_tail_len: usize,
+    dims: ConvSiluDims,
+) -> Result<()> {
+    let stage_started = linear_attention_debug_stage_start();
+    let (preact_ptr, _preact_guard) = preact.device_ptr_mut(&backend.stream);
+    let (qkv_conv_ptr, _qkv_conv_guard) = qkv_conv.device_ptr_mut(&backend.stream);
+    let (qkv_ptr, _qkv_guard) = qkv.device_ptr(&backend.stream);
+    let (conv_ptr, _conv_guard) = conv1d_weight.device_ptr(&backend.stream);
+    // conv_tail = carried boundary window (nullptr → default zero-tap path, byte-identical).
+    let conv_tail = carry_conv.map(|s| s.device_ptr(&backend.stream));
+    let conv_tail_ptr = conv_tail.as_ref().map_or(0u64, |(ptr, _)| *ptr);
+    let conv_tail_len_i32 = carry_conv
+        .map(|_| i32::try_from(conv_tail_len))
+        .transpose()
+        .map_err(|_| AutogradError::TapeInvariant("linear_attention conv_tail_len exceeds i32"))?
+        .unwrap_or(0);
+    let total_u64 = u64::try_from(dims.qkv_len)
+        .map_err(|_| AutogradError::TapeInvariant("linear_attention qkv_len exceeds u64"))?;
+    let (qkv_dim_i32, seq_len_i32, conv_kernel_i32) =
+        (dims.qkv_dim, dims.seq_len, dims.conv_kernel);
+    launch_1d(
+        &backend.stream,
+        backend
+            .kernels
+            .function("linear_attention_conv1d_silu_forward_f32_to_bf16")?,
+        dims.qkv_len,
+        |mut builder| {
+            builder
+                .arg(&preact_ptr)
+                .arg(&qkv_conv_ptr)
+                .arg(&qkv_ptr)
+                .arg(&conv_ptr)
+                .arg(&total_u64)
+                .arg(&qkv_dim_i32)
+                .arg(&seq_len_i32)
+                .arg(&conv_kernel_i32)
+                .arg(&conv_tail_ptr)
+                .arg(&conv_tail_len_i32);
+            builder
+        },
+    )?;
+    linear_attention_debug_stage_done(backend, "conv1d_silu", stage_started)
 }
