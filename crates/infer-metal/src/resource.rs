@@ -284,9 +284,7 @@ pub fn plan_resource_budget(
         &system_status_line,
     )?;
 
-    let wired_limit_bytes = weight_bytes
-        .checked_add(WIRED_HEADROOM_BYTES)
-        .ok_or_else(|| anyhow::anyhow!("Metal wired-limit estimate overflowed"))?;
+    let wired_limit_bytes = resolve_wired_limit_bytes(weight_bytes, available_memory_bytes)?;
     let static_state_bytes = gdr_state_bytes_per_slot(&model_config)
         .checked_mul(request.num_slots.max(1))
         .ok_or_else(|| anyhow::anyhow!("Metal GDR state estimate overflowed"))?;
@@ -307,14 +305,6 @@ pub fn plan_resource_budget(
         weight_bytes / GIB,
         runtime_headroom_bytes / GIB,
         static_state_bytes / MIB,
-    );
-    anyhow::ensure!(
-        memory_limit_bytes > wired_limit_bytes,
-        "Metal resource guard rejected startup: {system_status_line}; memory budget {} GiB is below wired requirement {} GiB \
-         (weights + {} GiB).",
-        memory_limit_bytes / GIB,
-        wired_limit_bytes / GIB,
-        WIRED_HEADROOM_BYTES / GIB,
     );
 
     // ONE shared num_slots-independent token pool (mirrors CUDA): per-token cost
@@ -449,9 +439,7 @@ pub fn plan_weight_only_resource_budget(
         &system_status_line,
     )?;
 
-    let wired_limit_bytes = weight_bytes
-        .checked_add(WIRED_HEADROOM_BYTES)
-        .ok_or_else(|| anyhow::anyhow!("Metal wired-limit estimate overflowed"))?;
+    let wired_limit_bytes = resolve_wired_limit_bytes(weight_bytes, available_memory_bytes)?;
     let fixed_bytes = weight_bytes
         .checked_add(runtime_headroom_bytes)
         .ok_or_else(|| anyhow::anyhow!("Metal fixed memory estimate overflowed"))?;
@@ -464,14 +452,6 @@ pub fn plan_weight_only_resource_budget(
         fixed_bytes / GIB,
         weight_bytes / GIB,
         runtime_headroom_bytes / GIB,
-    );
-    anyhow::ensure!(
-        memory_limit_bytes > wired_limit_bytes,
-        "Metal resource guard rejected startup: {system_status_line}; memory budget {} GiB is below wired requirement {} GiB \
-         (weights + {} GiB).",
-        memory_limit_bytes / GIB,
-        wired_limit_bytes / GIB,
-        WIRED_HEADROOM_BYTES / GIB,
     );
 
     Ok(MetalResourcePlan {
@@ -593,6 +573,31 @@ fn resolve_memory_limit(
             "Metal resource guard could not determine a memory budget; {system_status_line}"
         )
     })
+}
+
+fn resolve_wired_limit_bytes(
+    weight_bytes: usize,
+    available_memory_bytes: Option<usize>,
+) -> anyhow::Result<usize> {
+    let wired = weight_bytes
+        .checked_add(WIRED_HEADROOM_BYTES)
+        .ok_or_else(|| anyhow::anyhow!("Metal wired-limit estimate overflowed"))?;
+    let Some(available) = available_memory_bytes else {
+        return Ok(wired);
+    };
+    // A wired limit above what the GPU can pin deadlocks the MLX scheduler
+    // on first eval — clamp to available memory. Partial pinning (wired <
+    // weights) is safe; MLX leaves the remainder unpinned.
+    let clamped = wired.min(available);
+    if clamped < wired {
+        log::warn!(
+            "Metal resource guard: wired limit clamped {} -> {} GiB (available {} GiB); weights will be partially pinned",
+            wired / GIB,
+            clamped / GIB,
+            available / GIB,
+        );
+    }
+    Ok(clamped)
 }
 
 fn format_gib(bytes: Option<usize>) -> String {
