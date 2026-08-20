@@ -67,6 +67,13 @@ The failing tensor carries the hidden dim (5,120), not the packed qkv dim
 Local 131,072 needs roughly `floor` 40,239 + `layer` 43,408 + drift, against
 97,508 MiB. The gap is 5–10 GB, not a factor.
 
+The other lever the bf16 audit named — recomputing the conv pair instead of
+taping it — was implemented, measured at 0 MiB, and reverted; see
+[`errors/2026-08-20-tensor-bytes-are-not-residency.md`](../errors/2026-08-20-tensor-bytes-are-not-residency.md).
+The remaining gap is a transient the peak model does not see: `actual` reads
+77,026 MiB at local 81,920 while the run dies on a 1.6 GB allocation, so roughly
+20 GB lives between checkpoint boundaries and is unaccounted.
+
 ## Rule
 
 A gradient buffer can be written in place only when the tape proves no one else
