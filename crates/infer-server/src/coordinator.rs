@@ -335,12 +335,15 @@ impl CoordinatorHandle {
             r.unregister_stats_awaiter(request_id);
         }
         if ranks.len() < expected {
+            // Counters are monotonic — a partial snapshot underestimates but
+            // never overestimates. Gauges (kv_free_pages, active_requests)
+            // may overestimate, but returning all-zero is worse: it hides
+            // real traffic and makes /metrics useless under load.
             log::warn!(
-                "stats query: {}/{} ranks responded before timeout; discarding partial snapshot",
+                "stats query: {}/{} ranks responded before timeout; using partial snapshot",
                 ranks.len(),
                 expected
             );
-            return Vec::new();
         }
         ranks
     }
@@ -2073,7 +2076,7 @@ async fn fallback_404(req: axum::extract::Request) -> (StatusCode, Json<serde_js
 async fn metrics(
     State(state): State<Arc<DpCoordinator>>,
 ) -> ([(header::HeaderName, &'static str); 1], String) {
-    let counters = state.query_stats_all(Duration::from_secs(2)).await;
+    let counters = state.query_stats_all(Duration::from_secs(30)).await;
     (
         [(
             header::CONTENT_TYPE,
