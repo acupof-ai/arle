@@ -102,7 +102,14 @@ pub(super) fn cuda_sum_backward_device(
         });
     }
     let elem_count = shape_size(output_shape);
-    let mut d_out = backend.stream.alloc_zeros::<f32>(elem_count).map_err(|_| {
+    let mut d_out = backend.stream.alloc_zeros::<f32>(elem_count).map_err(|e| {
+        let (free, total) = backend.mem_get_info().unwrap_or((0, 0));
+        eprintln!(
+            "[autograd] alloc_zeros {elem_count} x f32 failed (sum_backward_device, \
+             shape {output_shape:?}): {e}; free={}MiB total={}MiB",
+            free >> 20,
+            total >> 20
+        );
         AutogradError::TapeInvariant("cuda alloc_zeros failed (sum_backward_device)")
     })?;
     let n = i32::try_from(elem_count)
