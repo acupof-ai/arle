@@ -1305,6 +1305,1437 @@ pub fn fa3_fwd_hd256_quant(
     }
 }
 
+// ---------------------------------------------------------------------------
+// DSv4 MLA/DSA/compressor attention family: typed launchers over the FlashMLA
+// shim, DSA indexer, compressor/window-cache, QK prep, output inverse-RoPE, TP
+// repack/slice, and top-k transform FFI (T3-s3). Pointer args are raw u64
+// device addresses (0 = null where the ABI allows it); scalar args mirror the
+// FFI types so consumers pass identical values. Callers keep every owning
+// buffer alive and stream-ordered on `stream`.
+// ---------------------------------------------------------------------------
+
+/// FlashMLA SM90 sparse bf16 prefill forward (vendored shim; d_qk ∈ {512,576},
+/// d_v = 512).
+#[allow(clippy::too_many_arguments)]
+pub fn flashmla_sm90_sparse_prefill_fwd_raw(
+    stream: &CudaStream,
+    q_ptr: u64,
+    kv_ptr: u64,
+    indices_ptr: u64,
+    attn_sink_ptr: u64,
+    topk_length_ptr: u64,
+    out_ptr: u64,
+    max_logits_ptr: u64,
+    lse_ptr: u64,
+    s_q: i32,
+    s_kv: i32,
+    h_q: i32,
+    h_kv: i32,
+    d_qk: i32,
+    d_v: i32,
+    topk: i32,
+    sm_scale: f32,
+    stride_q_s_q: i32,
+    stride_q_h_q: i32,
+    stride_kv_s_kv: i32,
+    stride_kv_h_kv: i32,
+    stride_indices_s_q: i32,
+    stride_indices_h_kv: i32,
+    num_sm: i32,
+) -> Result<()> {
+    // SAFETY: caller passes live device addresses sized to the dims/strides
+    // below, stream-ordered on `stream`.
+    unsafe {
+        ffi::arle_flashmla_sm90_sparse_prefill_fwd(
+            q_ptr as *const ffi::Half,
+            kv_ptr as *const ffi::Half,
+            indices_ptr as *const i32,
+            attn_sink_ptr as *const f32,
+            topk_length_ptr as *const i32,
+            out_ptr as *mut ffi::Half,
+            max_logits_ptr as *mut f32,
+            lse_ptr as *mut f32,
+            s_q,
+            s_kv,
+            h_q,
+            h_kv,
+            d_qk,
+            d_v,
+            topk,
+            sm_scale,
+            stride_q_s_q,
+            stride_q_h_q,
+            stride_kv_s_kv,
+            stride_kv_h_kv,
+            stride_indices_s_q,
+            stride_indices_h_kv,
+            num_sm,
+            stream.cu_stream(),
+        )
+        .result()
+        .map_err(|e| anyhow!("arle_flashmla_sm90_sparse_prefill_fwd failed at s_q={s_q}: {e}"))
+    }
+}
+
+/// FlashMLA SM90 sparse FP8 decode forward (splitkv + combine; KV is the
+/// FP8-packed pool per the model-specific byte layout).
+#[allow(clippy::too_many_arguments)]
+pub fn flashmla_sm90_sparse_decode_fwd_raw(
+    stream: &CudaStream,
+    q_ptr: u64,
+    kv_ptr: u64,
+    indices_ptr: u64,
+    topk_length_ptr: u64,
+    attn_sink_ptr: u64,
+    out_ptr: u64,
+    lse_ptr: u64,
+    lse_accum_ptr: u64,
+    o_accum_ptr: u64,
+    tile_scheduler_metadata_ptr: u64,
+    num_splits_ptr: u64,
+    b: i32,
+    s_q: i32,
+    h_q: i32,
+    h_kv: i32,
+    d_qk: i32,
+    d_v: i32,
+    num_blocks: i32,
+    page_block_size: i32,
+    topk: i32,
+    num_sm_parts: i32,
+    model_type_int: i32,
+    sm_scale: f32,
+    stride_q_b: i32,
+    stride_q_s_q: i32,
+    stride_q_h_q: i32,
+    stride_kv_block_bytes: i32,
+    stride_kv_row_bytes: i32,
+    stride_indices_b: i32,
+    stride_indices_s_q: i32,
+    stride_lse_b: i32,
+    stride_lse_s_q: i32,
+    stride_o_b: i32,
+    stride_o_s_q: i32,
+    stride_o_h_q: i32,
+    stride_lse_accum_split: i32,
+    stride_lse_accum_s_q: i32,
+    stride_o_accum_split: i32,
+    stride_o_accum_s_q: i32,
+    stride_o_accum_h_q: i32,
+) -> Result<()> {
+    // SAFETY: caller passes live device addresses sized to the dims/strides
+    // below (KV FP8-packed per `model_type_int`), stream-ordered on `stream`.
+    unsafe {
+        ffi::arle_flashmla_sm90_sparse_decode_fwd(
+            q_ptr as *const ffi::Half,
+            kv_ptr as *const ffi::Half,
+            indices_ptr as *const i32,
+            topk_length_ptr as *const i32,
+            attn_sink_ptr as *const f32,
+            out_ptr as *mut ffi::Half,
+            lse_ptr as *mut f32,
+            lse_accum_ptr as *mut f32,
+            o_accum_ptr as *mut f32,
+            tile_scheduler_metadata_ptr as *const i32,
+            num_splits_ptr as *const i32,
+            b,
+            s_q,
+            h_q,
+            h_kv,
+            d_qk,
+            d_v,
+            num_blocks,
+            page_block_size,
+            topk,
+            num_sm_parts,
+            model_type_int,
+            sm_scale,
+            stride_q_b,
+            stride_q_s_q,
+            stride_q_h_q,
+            stride_kv_block_bytes,
+            stride_kv_row_bytes,
+            stride_indices_b,
+            stride_indices_s_q,
+            stride_lse_b,
+            stride_lse_s_q,
+            stride_o_b,
+            stride_o_s_q,
+            stride_o_h_q,
+            stride_lse_accum_split,
+            stride_lse_accum_s_q,
+            stride_o_accum_split,
+            stride_o_accum_s_q,
+            stride_o_accum_h_q,
+            stream.cu_stream(),
+        )
+        .result()
+        .map_err(|e| anyhow!("arle_flashmla_sm90_sparse_decode_fwd failed at b={b}: {e}"))
+    }
+}
+
+/// Host-side decode scheduler tuning meta for a (`h_q`, `s_q`,
+/// `model_type_int`) tuple. Returns `(num_sm_parts,
+/// fixed_overhead_num_blocks, block_size_topk)`.
+pub fn flashmla_sm90_sparse_decode_get_meta(
+    h_q: i32,
+    s_q: i32,
+    model_type_int: i32,
+) -> Result<(i32, i32, i32)> {
+    let mut num_sm_parts = 0_i32;
+    let mut fixed_overhead_num_blocks = 0_i32;
+    let mut block_size_topk = 0_i32;
+    // SAFETY: host-only computation writing the three out scalars.
+    unsafe {
+        ffi::arle_flashmla_sm90_sparse_decode_get_meta(
+            h_q,
+            s_q,
+            model_type_int,
+            &mut num_sm_parts,
+            &mut fixed_overhead_num_blocks,
+            &mut block_size_topk,
+        )
+        .result()
+        .map_err(|e| {
+            anyhow!("arle_flashmla_sm90_sparse_decode_get_meta failed at h_q={h_q}: {e}")
+        })?;
+    }
+    Ok((num_sm_parts, fixed_overhead_num_blocks, block_size_topk))
+}
+
+/// Populate the decode `tile_scheduler_metadata` + `num_splits` device arrays
+/// from per-batch effective topk lengths. `extra_topk_length_ptr` may be 0.
+#[allow(clippy::too_many_arguments)]
+pub fn flashmla_sm90_sparse_decode_sched_meta_raw(
+    stream: &CudaStream,
+    b: i32,
+    s_q: i32,
+    block_size_topk: i32,
+    fixed_overhead_num_blocks: i32,
+    topk: i32,
+    extra_topk: i32,
+    topk_length_ptr: u64,
+    extra_topk_length_ptr: u64,
+    tile_scheduler_metadata_ptr: u64,
+    num_splits_ptr: u64,
+    num_sm_parts: i32,
+) -> Result<()> {
+    // SAFETY: caller passes live device arrays sized per the FFI doc
+    // (`num_sm_parts * DecodingSchedMetaSize/4` and `b + 1` i32);
+    // `extra_topk_length_ptr` is null exactly when 0. Stream-ordered.
+    unsafe {
+        ffi::arle_flashmla_sm90_sparse_decode_sched_meta(
+            b,
+            s_q,
+            block_size_topk,
+            fixed_overhead_num_blocks,
+            topk,
+            extra_topk,
+            topk_length_ptr as *const i32,
+            extra_topk_length_ptr as *const i32,
+            tile_scheduler_metadata_ptr as *mut i32,
+            num_splits_ptr as *mut i32,
+            num_sm_parts,
+            stream.cu_stream(),
+        )
+        .result()
+        .map_err(|e| anyhow!("arle_flashmla_sm90_sparse_decode_sched_meta failed at b={b}: {e}"))
+    }
+}
+
+/// Chain-verify sparse indices for FlashMLA prefill (top-1 chain verifier).
+/// `selected_ptr` may be 0 (no CSA topk arm).
+#[allow(clippy::too_many_arguments)]
+pub fn flashmla_chain_verify_build_indices_raw(
+    stream: &CudaStream,
+    indices_ptr: u64,
+    topk_length_ptr: u64,
+    positions_ptr: u64,
+    ancestors_ptr: u64,
+    max_anc: i32,
+    selected_ptr: u64,
+    s_q: i32,
+    start_pos: i32,
+    sw_window: i32,
+    index_topk: i32,
+    max_compressed: i32,
+    topk_unified: i32,
+    compressed_count: i32,
+    compress_ratio: i32,
+) -> Result<()> {
+    // SAFETY: caller passes live device addresses sized to the dims below;
+    // `selected_ptr` is null exactly when 0. Stream-ordered on `stream`.
+    unsafe {
+        ffi::arle_flashmla_chain_verify_build_indices(
+            indices_ptr as *mut i32,
+            topk_length_ptr as *mut i32,
+            positions_ptr as *const i32,
+            ancestors_ptr as *const i32,
+            max_anc,
+            selected_ptr as *const i32,
+            s_q,
+            start_pos,
+            sw_window,
+            index_topk,
+            max_compressed,
+            topk_unified,
+            compressed_count,
+            compress_ratio,
+            stream.cu_stream(),
+        )
+        .result()
+        .map_err(|e| anyhow!("arle_flashmla_chain_verify_build_indices failed at s_q={s_q}: {e}"))
+    }
+}
+
+/// CSA per-token unified indices + topk_length (layout of
+/// [`flashmla_csa_pack_kv_raw`]). `selected_ptr` may be 0 (SWA reuse: fills -1).
+#[allow(clippy::too_many_arguments)]
+pub fn flashmla_csa_build_indices_raw(
+    stream: &CudaStream,
+    indices_ptr: u64,
+    topk_length_ptr: u64,
+    selected_ptr: u64,
+    s_q: i32,
+    start_pos: i32,
+    sw_window: i32,
+    index_topk: i32,
+    compressed_count: i32,
+    compress_ratio: i32,
+) -> Result<()> {
+    // SAFETY: caller passes live device addresses sized to the dims below;
+    // `selected_ptr` is null exactly when 0. Stream-ordered on `stream`.
+    unsafe {
+        ffi::arle_flashmla_csa_build_indices(
+            indices_ptr as *mut i32,
+            topk_length_ptr as *mut i32,
+            selected_ptr as *const i32,
+            s_q,
+            start_pos,
+            sw_window,
+            index_topk,
+            compressed_count,
+            compress_ratio,
+            stream.cu_stream(),
+        )
+        .result()
+        .map_err(|e| anyhow!("arle_flashmla_csa_build_indices failed at s_q={s_q}: {e}"))
+    }
+}
+
+/// HCA per-token unified indices (no selector; all compressed pages causally
+/// gated by `compress_ratio`).
+#[allow(clippy::too_many_arguments)]
+pub fn flashmla_hca_build_indices_raw(
+    stream: &CudaStream,
+    indices_ptr: u64,
+    topk_length_ptr: u64,
+    s_q: i32,
+    start_pos: i32,
+    sw_window: i32,
+    max_compressed_keys: i32,
+    compressed_count: i32,
+    compress_ratio: i32,
+) -> Result<()> {
+    // SAFETY: caller passes live device addresses sized per the FFI doc
+    // (`s_q * (sw_window + max_compressed_keys)` i32). Stream-ordered.
+    unsafe {
+        ffi::arle_flashmla_hca_build_indices(
+            indices_ptr as *mut i32,
+            topk_length_ptr as *mut i32,
+            s_q,
+            start_pos,
+            sw_window,
+            max_compressed_keys,
+            compressed_count,
+            compress_ratio,
+            stream.cu_stream(),
+        )
+        .result()
+        .map_err(|e| anyhow!("arle_flashmla_hca_build_indices failed at s_q={s_q}: {e}"))
+    }
+}
+
+/// Pack SW window cache + current-chunk K + compressed pool into one
+/// contiguous KV pool for FlashMLA SM90 sparse prefill. `compressed_ptr` may
+/// be 0 (no compressed rows).
+#[allow(clippy::too_many_arguments)]
+pub fn flashmla_csa_pack_kv_raw(
+    stream: &CudaStream,
+    kv_unified_ptr: u64,
+    window_cache_ptr: u64,
+    k_prepared_ptr: u64,
+    compressed_ptr: u64,
+    start_pos: i32,
+    sw_window: i32,
+    n_tokens: i32,
+    compressed_count: i32,
+    d_qk: i32,
+) -> Result<()> {
+    // SAFETY: caller passes live device addresses sized to the dims below;
+    // `compressed_ptr` is null exactly when 0. Stream-ordered on `stream`.
+    unsafe {
+        ffi::arle_flashmla_csa_pack_kv(
+            kv_unified_ptr as *mut ffi::Half,
+            window_cache_ptr as *const ffi::Half,
+            k_prepared_ptr as *const ffi::Half,
+            compressed_ptr as *const ffi::Half,
+            start_pos,
+            sw_window,
+            n_tokens,
+            compressed_count,
+            d_qk,
+            stream.cu_stream(),
+        )
+        .result()
+        .map_err(|e| anyhow!("arle_flashmla_csa_pack_kv failed at n_tokens={n_tokens}: {e}"))
+    }
+}
+
+/// DSA fused Q-indexer RoPE + Hadamard + FP8 quant over `batch_size` rows.
+#[allow(clippy::too_many_arguments)]
+pub fn dsv4_dsa_fused_q_indexer_rope_hadamard_quant_raw(
+    stream: &CudaStream,
+    q_input_ptr: u64,
+    q_fp8_ptr: u64,
+    weight_ptr: u64,
+    weights_out_ptr: u64,
+    weight_scale: f32,
+    freqs_cis_ptr: u64,
+    positions_ptr: u64,
+    batch_size: i32,
+    num_heads: i32,
+) -> Result<()> {
+    // SAFETY: caller passes live device addresses sized to the dims below,
+    // stream-ordered on `stream`.
+    unsafe {
+        ffi::dsv4_dsa_fused_q_indexer_rope_hadamard_quant_cuda(
+            q_input_ptr as *const ffi::Half,
+            q_fp8_ptr as *mut u8,
+            weight_ptr as *const ffi::Half,
+            weights_out_ptr as *mut f32,
+            weight_scale,
+            freqs_cis_ptr as *const f32,
+            positions_ptr as *const i32,
+            batch_size,
+            num_heads,
+            stream.cu_stream(),
+        )
+        .result()
+        .map_err(|e| {
+            anyhow!(
+                "dsv4_dsa_fused_q_indexer_rope_hadamard_quant_cuda failed at batch={batch_size}: {e}"
+            )
+        })
+    }
+}
+
+/// DSA Hadamard-128 rotate over `rows` bf16 index-key rows.
+pub fn dsv4_dsa_hadamard128_bf16_raw(
+    stream: &CudaStream,
+    input_ptr: u64,
+    output_ptr: u64,
+    rows: i32,
+) -> Result<()> {
+    // SAFETY: caller passes live device addresses holding `rows` index-key
+    // rows, stream-ordered on `stream`.
+    unsafe {
+        ffi::dsv4_dsa_hadamard128_bf16_cuda(
+            input_ptr as *const ffi::Half,
+            output_ptr as *mut ffi::Half,
+            rows,
+            stream.cu_stream(),
+        )
+        .result()
+        .map_err(|e| anyhow!("dsv4_dsa_hadamard128_bf16_cuda failed at rows={rows}: {e}"))
+    }
+}
+
+/// DSA fused FP8 quant + store of rotated index keys into the paged key cache.
+pub fn dsv4_dsa_fused_store_index_k_cache_raw(
+    stream: &CudaStream,
+    key_ptr: u64,
+    index_k_with_scale_ptr: u64,
+    out_cache_loc_ptr: u64,
+    num_tokens: i32,
+    page_size: i32,
+) -> Result<()> {
+    // SAFETY: caller passes live device addresses (rotated keys, cache band,
+    // `num_tokens` i64 cache locs), stream-ordered on `stream`.
+    unsafe {
+        ffi::dsv4_dsa_fused_store_index_k_cache_cuda(
+            key_ptr as *const ffi::Half,
+            index_k_with_scale_ptr as *mut u8,
+            out_cache_loc_ptr as *const i64,
+            num_tokens,
+            page_size,
+            stream.cu_stream(),
+        )
+        .result()
+        .map_err(|e| {
+            anyhow!("dsv4_dsa_fused_store_index_k_cache_cuda failed at tokens={num_tokens}: {e}")
+        })
+    }
+}
+
+/// Batched (grid.y=slot) DSA Hadamard rotate: ONE launch over `n` slots' rows.
+#[allow(clippy::too_many_arguments)]
+pub fn dsv4_dsa_hadamard128_batched_raw(
+    stream: &CudaStream,
+    keys_src_arr_ptr: u64,
+    src_ring_row_arr_ptr: u64,
+    rotated_dst_arr_ptr: u64,
+    dst_row_arr_ptr: u64,
+    newly_packed_arr_ptr: u64,
+    n: i32,
+    max_rows: i32,
+) -> Result<()> {
+    // SAFETY: caller passes live `[n]` device pointer/offset arrays whose
+    // embedded per-slot pointers are live, stream-ordered on `stream`.
+    unsafe {
+        ffi::dsv4_dsa_hadamard128_batched_cuda(
+            keys_src_arr_ptr as *const *const ffi::Half,
+            src_ring_row_arr_ptr as *const i32,
+            rotated_dst_arr_ptr as *const *mut ffi::Half,
+            dst_row_arr_ptr as *const i32,
+            newly_packed_arr_ptr as *const i32,
+            n,
+            max_rows,
+            stream.cu_stream(),
+        )
+        .result()
+        .map_err(|e| anyhow!("dsv4_dsa_hadamard128_batched_cuda failed at n={n}: {e}"))
+    }
+}
+
+/// Batched (grid.y=slot) DSA FP8 fused-store: ONE launch over `n` slots.
+#[allow(clippy::too_many_arguments)]
+pub fn dsv4_dsa_fused_store_index_k_cache_batched_raw(
+    stream: &CudaStream,
+    key_arr_ptr: u64,
+    cache_arr_ptr: u64,
+    out_cache_loc_arr_ptr: u64,
+    newly_packed_arr_ptr: u64,
+    n: i32,
+    max_tokens: i32,
+    page_size: i32,
+) -> Result<()> {
+    // SAFETY: caller passes live `[n]` device pointer arrays whose embedded
+    // per-slot pointers are live, stream-ordered on `stream`.
+    unsafe {
+        ffi::dsv4_dsa_fused_store_index_k_cache_batched_cuda(
+            key_arr_ptr as *const *const ffi::Half,
+            cache_arr_ptr as *const *mut u8,
+            out_cache_loc_arr_ptr as *const *const i64,
+            newly_packed_arr_ptr as *const i32,
+            n,
+            max_tokens,
+            page_size,
+            stream.cu_stream(),
+        )
+        .result()
+        .map_err(|e| {
+            anyhow!("dsv4_dsa_fused_store_index_k_cache_batched_cuda failed at n={n}: {e}")
+        })
+    }
+}
+
+/// Fill per-tile DSA `context_lens` / `positions` on device from a
+/// device-resident `start_pos` scalar (graph-replay safe).
+#[allow(clippy::too_many_arguments)]
+pub fn dsv4_dsa_fill_context_lens_positions_start_pos_raw(
+    stream: &CudaStream,
+    context_lens_ptr: u64,
+    positions_ptr: u64,
+    start_pos_ptr: u64,
+    token_offset: i32,
+    batch_size: i32,
+    key_count: i32,
+    ratio: i32,
+) -> Result<()> {
+    // SAFETY: caller passes live device addresses (`batch_size` i32 each plus
+    // a device i32 scalar), stream-ordered on `stream`.
+    unsafe {
+        ffi::dsv4_dsa_fill_context_lens_positions_start_pos_cuda(
+            context_lens_ptr as *mut i32,
+            positions_ptr as *mut i32,
+            start_pos_ptr as *const i32,
+            token_offset,
+            batch_size,
+            key_count,
+            ratio,
+            stream.cu_stream(),
+        )
+        .result()
+        .map_err(|e| {
+            anyhow!(
+                "dsv4_dsa_fill_context_lens_positions_start_pos_cuda failed at batch={batch_size}: {e}"
+            )
+        })
+    }
+}
+
+/// Compressor sub-block update over `num_tokens` (host `start_pos` variant).
+#[allow(clippy::too_many_arguments)]
+pub fn dsv4_compressor_update_raw(
+    stream: &CudaStream,
+    kv_raw_ptr: u64,
+    score_raw_ptr: u64,
+    ape_ptr: u64,
+    norm_ptr: u64,
+    pending_kv_ptr: u64,
+    pending_score_ptr: u64,
+    prev_overlap_kv_ptr: u64,
+    prev_overlap_score_ptr: u64,
+    compressed_ptr: u64,
+    num_tokens: i32,
+    start_pos: i32,
+    pending_len: i32,
+    compressed_base: i32,
+    head_dim: i32,
+    ratio: i32,
+    width: i32,
+    overlap: i32,
+    has_prev_overlap: i32,
+    overlap_page_stride: i32,
+    eps: f32,
+    rope_dim: i32,
+    rope_base: f32,
+    original_seq_len: i32,
+    factor: f32,
+    beta_fast: f32,
+    beta_slow: f32,
+) -> Result<()> {
+    // SAFETY: caller passes live device addresses matching the checked ratio /
+    // width / token count, stream-ordered on `stream`.
+    unsafe {
+        ffi::dsv4_compressor_update_cuda(
+            kv_raw_ptr as *const ffi::Half,
+            score_raw_ptr as *const ffi::Half,
+            ape_ptr as *const ffi::Half,
+            norm_ptr as *const ffi::Half,
+            pending_kv_ptr as *mut ffi::Half,
+            pending_score_ptr as *mut ffi::Half,
+            prev_overlap_kv_ptr as *mut ffi::Half,
+            prev_overlap_score_ptr as *mut ffi::Half,
+            compressed_ptr as *mut ffi::Half,
+            num_tokens,
+            start_pos,
+            pending_len,
+            compressed_base,
+            head_dim,
+            ratio,
+            width,
+            overlap,
+            has_prev_overlap,
+            overlap_page_stride,
+            eps,
+            rope_dim,
+            rope_base,
+            original_seq_len,
+            factor,
+            beta_fast,
+            beta_slow,
+            stream.cu_stream(),
+        )
+        .result()
+        .map_err(|e| anyhow!("dsv4_compressor_update_cuda failed at tokens={num_tokens}: {e}"))
+    }
+}
+
+/// Device-position compressor update (graph-replay safe).
+#[allow(clippy::too_many_arguments)]
+pub fn dsv4_compressor_update_start_pos_ptr_raw(
+    stream: &CudaStream,
+    kv_raw_ptr: u64,
+    score_raw_ptr: u64,
+    ape_ptr: u64,
+    norm_ptr: u64,
+    pending_kv_ptr: u64,
+    pending_score_ptr: u64,
+    prev_overlap_kv_ptr: u64,
+    prev_overlap_score_ptr: u64,
+    compressed_ptr: u64,
+    num_tokens: i32,
+    start_pos_ptr: u64,
+    head_dim: i32,
+    ratio: i32,
+    width: i32,
+    overlap: i32,
+    overlap_page_stride: i32,
+    eps: f32,
+    rope_dim: i32,
+    rope_base: f32,
+    original_seq_len: i32,
+    factor: f32,
+    beta_fast: f32,
+    beta_slow: f32,
+) -> Result<()> {
+    // SAFETY: same contract as [`dsv4_compressor_update_raw`];
+    // `start_pos_ptr` is a live device i32 scalar.
+    unsafe {
+        ffi::dsv4_compressor_update_start_pos_ptr_cuda(
+            kv_raw_ptr as *const ffi::Half,
+            score_raw_ptr as *const ffi::Half,
+            ape_ptr as *const ffi::Half,
+            norm_ptr as *const ffi::Half,
+            pending_kv_ptr as *mut ffi::Half,
+            pending_score_ptr as *mut ffi::Half,
+            prev_overlap_kv_ptr as *mut ffi::Half,
+            prev_overlap_score_ptr as *mut ffi::Half,
+            compressed_ptr as *mut ffi::Half,
+            num_tokens,
+            start_pos_ptr as *const i32,
+            head_dim,
+            ratio,
+            width,
+            overlap,
+            overlap_page_stride,
+            eps,
+            rope_dim,
+            rope_base,
+            original_seq_len,
+            factor,
+            beta_fast,
+            beta_slow,
+            stream.cu_stream(),
+        )
+        .result()
+        .map_err(|e| {
+            anyhow!("dsv4_compressor_update_start_pos_ptr_cuda failed at tokens={num_tokens}: {e}")
+        })
+    }
+}
+
+/// Batched decode compressor update: ONE launch over `n` rows' per-slot ring
+/// state (host-gathered device pointer arrays).
+#[allow(clippy::too_many_arguments)]
+pub fn dsv4_compressor_update_batched_start_pos_ptr_raw(
+    stream: &CudaStream,
+    kv_raw_ptr: u64,
+    score_raw_ptr: u64,
+    ape_ptr: u64,
+    norm_ptr: u64,
+    pending_kv_arr_ptr: u64,
+    pending_score_arr_ptr: u64,
+    prev_overlap_kv_arr_ptr: u64,
+    prev_overlap_score_arr_ptr: u64,
+    compressed_arr_ptr: u64,
+    n: i32,
+    num_tokens: i32,
+    start_pos_arr_ptr: u64,
+    head_dim: i32,
+    ratio: i32,
+    width: i32,
+    overlap: i32,
+    overlap_page_stride: i32,
+    eps: f32,
+    rope_dim: i32,
+    rope_base: f32,
+    original_seq_len: i32,
+    factor: f32,
+    beta_fast: f32,
+    beta_slow: f32,
+) -> Result<()> {
+    // SAFETY: caller passes live `[n]` device pointer arrays whose embedded
+    // per-row pointers are live; kv/score are the batched prepass outputs.
+    // Stream-ordered on `stream`.
+    unsafe {
+        ffi::dsv4_compressor_update_batched_start_pos_ptr_cuda(
+            kv_raw_ptr as *const ffi::Half,
+            score_raw_ptr as *const ffi::Half,
+            ape_ptr as *const ffi::Half,
+            norm_ptr as *const ffi::Half,
+            pending_kv_arr_ptr as *const *mut ffi::Half,
+            pending_score_arr_ptr as *const *mut ffi::Half,
+            prev_overlap_kv_arr_ptr as *const *mut ffi::Half,
+            prev_overlap_score_arr_ptr as *const *mut ffi::Half,
+            compressed_arr_ptr as *const *mut ffi::Half,
+            n,
+            num_tokens,
+            start_pos_arr_ptr as *const i32,
+            head_dim,
+            ratio,
+            width,
+            overlap,
+            overlap_page_stride,
+            eps,
+            rope_dim,
+            rope_base,
+            original_seq_len,
+            factor,
+            beta_fast,
+            beta_slow,
+            stream.cu_stream(),
+        )
+        .result()
+        .map_err(|e| {
+            anyhow!("dsv4_compressor_update_batched_start_pos_ptr_cuda failed at n={n}: {e}")
+        })
+    }
+}
+
+/// FP32-accumulating compressor prefill probe (writes both f32 carry and bf16
+/// mirror buffers).
+#[allow(clippy::too_many_arguments)]
+pub fn dsv4_compressor_fp32_prefill_probe_raw(
+    stream: &CudaStream,
+    kv_raw_ptr: u64,
+    score_raw_ptr: u64,
+    ape_ptr: u64,
+    norm_ptr: u64,
+    pending_kv_ptr: u64,
+    pending_score_ptr: u64,
+    prev_overlap_kv_ptr: u64,
+    prev_overlap_score_ptr: u64,
+    prev_overlap_kv_bf16_ptr: u64,
+    prev_overlap_score_bf16_ptr: u64,
+    pending_kv_bf16_ptr: u64,
+    pending_score_bf16_ptr: u64,
+    compressed_ptr: u64,
+    num_tokens: i32,
+    start_pos: i32,
+    pending_len: i32,
+    compressed_base: i32,
+    head_dim: i32,
+    ratio: i32,
+    width: i32,
+    overlap: i32,
+    has_prev_overlap: i32,
+    overlap_page_stride: i32,
+    eps: f32,
+    rope_dim: i32,
+    rope_base: f32,
+    original_seq_len: i32,
+    factor: f32,
+    beta_fast: f32,
+    beta_slow: f32,
+) -> Result<()> {
+    // SAFETY: caller passes live device addresses matching the checked ratio /
+    // width / token count (f32 raws + f32/bf16 carry pairs), stream-ordered.
+    unsafe {
+        ffi::dsv4_compressor_fp32_prefill_probe_cuda(
+            kv_raw_ptr as *const f32,
+            score_raw_ptr as *const f32,
+            ape_ptr as *const f32,
+            norm_ptr as *const ffi::Half,
+            pending_kv_ptr as *mut f32,
+            pending_score_ptr as *mut f32,
+            prev_overlap_kv_ptr as *mut f32,
+            prev_overlap_score_ptr as *mut f32,
+            prev_overlap_kv_bf16_ptr as *mut ffi::Half,
+            prev_overlap_score_bf16_ptr as *mut ffi::Half,
+            pending_kv_bf16_ptr as *mut ffi::Half,
+            pending_score_bf16_ptr as *mut ffi::Half,
+            compressed_ptr as *mut ffi::Half,
+            num_tokens,
+            start_pos,
+            pending_len,
+            compressed_base,
+            head_dim,
+            ratio,
+            width,
+            overlap,
+            has_prev_overlap,
+            overlap_page_stride,
+            eps,
+            rope_dim,
+            rope_base,
+            original_seq_len,
+            factor,
+            beta_fast,
+            beta_slow,
+            stream.cu_stream(),
+        )
+        .result()
+        .map_err(|e| {
+            anyhow!("dsv4_compressor_fp32_prefill_probe_cuda failed at tokens={num_tokens}: {e}")
+        })
+    }
+}
+
+/// bf16 → f32 upcast of a compressor state's four carry buffers before an
+/// FP32 probe whose bf16 carry advanced.
+#[allow(clippy::too_many_arguments)]
+pub fn dsv4_compressor_fp32_carry_reseed_raw(
+    stream: &CudaStream,
+    pending_kv_bf16_ptr: u64,
+    pending_score_bf16_ptr: u64,
+    prev_kv_bf16_ptr: u64,
+    prev_score_bf16_ptr: u64,
+    pending_kv_ptr: u64,
+    pending_score_ptr: u64,
+    prev_kv_ptr: u64,
+    prev_score_ptr: u64,
+    pending_elems: i32,
+    prev_elems: i32,
+) -> Result<()> {
+    // SAFETY: caller passes bf16/f32 carry buffers allocated with identical
+    // element counts, stream-ordered on `stream`.
+    unsafe {
+        ffi::dsv4_compressor_fp32_carry_reseed_cuda(
+            pending_kv_bf16_ptr as *const ffi::Half,
+            pending_score_bf16_ptr as *const ffi::Half,
+            prev_kv_bf16_ptr as *const ffi::Half,
+            prev_score_bf16_ptr as *const ffi::Half,
+            pending_kv_ptr as *mut f32,
+            pending_score_ptr as *mut f32,
+            prev_kv_ptr as *mut f32,
+            prev_score_ptr as *mut f32,
+            pending_elems,
+            prev_elems,
+            stream.cu_stream(),
+        )
+        .result()
+        .map_err(|e| anyhow!("dsv4_compressor_fp32_carry_reseed_cuda failed: {e}"))
+    }
+}
+
+/// Write `num_tokens` new keys into the bf16 SW ring cache (host `start_pos`).
+pub fn dsv4_update_window_cache_raw(
+    stream: &CudaStream,
+    k_new_ptr: u64,
+    window_cache_ptr: u64,
+    num_tokens: i32,
+    start_pos: i32,
+    sliding_window: i32,
+    head_dim: i32,
+) -> Result<()> {
+    // SAFETY: caller passes live device addresses (`num_tokens` key rows, ring
+    // sized `sliding_window * head_dim`), stream-ordered on `stream`.
+    unsafe {
+        ffi::dsv4_update_window_cache_cuda(
+            k_new_ptr as *const ffi::Half,
+            window_cache_ptr as *mut ffi::Half,
+            num_tokens,
+            start_pos,
+            sliding_window,
+            head_dim,
+            stream.cu_stream(),
+        )
+        .result()
+        .map_err(|e| anyhow!("dsv4_update_window_cache_cuda failed at tokens={num_tokens}: {e}"))
+    }
+}
+
+/// Device-position SW ring write (graph-replay safe).
+pub fn dsv4_update_window_cache_start_pos_ptr_raw(
+    stream: &CudaStream,
+    k_new_ptr: u64,
+    window_cache_ptr: u64,
+    num_tokens: i32,
+    start_pos_ptr: u64,
+    sliding_window: i32,
+    head_dim: i32,
+) -> Result<()> {
+    // SAFETY: same contract as [`dsv4_update_window_cache_raw`];
+    // `start_pos_ptr` is a live device i32 scalar.
+    unsafe {
+        ffi::dsv4_update_window_cache_start_pos_ptr_cuda(
+            k_new_ptr as *const ffi::Half,
+            window_cache_ptr as *mut ffi::Half,
+            num_tokens,
+            start_pos_ptr as *const i32,
+            sliding_window,
+            head_dim,
+            stream.cu_stream(),
+        )
+        .result()
+        .map_err(|e| {
+            anyhow!(
+                "dsv4_update_window_cache_start_pos_ptr_cuda failed at tokens={num_tokens}: {e}"
+            )
+        })
+    }
+}
+
+/// Pointer-array batched SW ring write: ONE launch over `n` non-contiguous
+/// rows.
+pub fn dsv4_update_window_cache_batched_ptr_raw(
+    stream: &CudaStream,
+    k_arr_ptr: u64,
+    cache_arr_ptr: u64,
+    n: i32,
+    start_pos_ptr: u64,
+    sliding_window: i32,
+    head_dim: i32,
+) -> Result<()> {
+    // SAFETY: caller passes live `[n]` device pointer arrays whose embedded
+    // per-row pointers are live; `start_pos_ptr` is `[n]` i32. Stream-ordered.
+    unsafe {
+        ffi::dsv4_update_window_cache_batched_ptr_cuda(
+            k_arr_ptr as *const *const ffi::Half,
+            cache_arr_ptr as *const *mut ffi::Half,
+            n,
+            start_pos_ptr as *const i32,
+            sliding_window,
+            head_dim,
+            stream.cu_stream(),
+        )
+        .result()
+        .map_err(|e| anyhow!("dsv4_update_window_cache_batched_ptr_cuda failed at n={n}: {e}"))
+    }
+}
+
+/// DSv4 QK prep: q/k RMSNorm + YaRN partial RoPE (host `start_pos`).
+#[allow(clippy::too_many_arguments)]
+pub fn dsv4_prepare_qk_raw(
+    stream: &CudaStream,
+    q_raw_ptr: u64,
+    k_raw_ptr: u64,
+    q_out_ptr: u64,
+    k_out_ptr: u64,
+    num_tokens: i32,
+    local_heads: i32,
+    head_dim: i32,
+    rope_dim: i32,
+    start_pos: i32,
+    rms_eps: f32,
+    rope_base: f32,
+    original_seq_len: i32,
+    factor: f32,
+    beta_fast: f32,
+    beta_slow: f32,
+) -> Result<()> {
+    // SAFETY: caller passes live device addresses sized to the dims below,
+    // stream-ordered on `stream`.
+    unsafe {
+        ffi::dsv4_prepare_qk_cuda(
+            q_raw_ptr as *const ffi::Half,
+            k_raw_ptr as *const ffi::Half,
+            q_out_ptr as *mut ffi::Half,
+            k_out_ptr as *mut ffi::Half,
+            num_tokens,
+            local_heads,
+            head_dim,
+            rope_dim,
+            start_pos,
+            rms_eps,
+            rope_base,
+            original_seq_len,
+            factor,
+            beta_fast,
+            beta_slow,
+            stream.cu_stream(),
+        )
+        .result()
+        .map_err(|e| anyhow!("dsv4_prepare_qk_cuda failed at tokens={num_tokens}: {e}"))
+    }
+}
+
+/// Device-position [`dsv4_prepare_qk_raw`] (graph-replay safe).
+#[allow(clippy::too_many_arguments)]
+pub fn dsv4_prepare_qk_start_pos_ptr_raw(
+    stream: &CudaStream,
+    q_raw_ptr: u64,
+    k_raw_ptr: u64,
+    q_out_ptr: u64,
+    k_out_ptr: u64,
+    num_tokens: i32,
+    local_heads: i32,
+    head_dim: i32,
+    rope_dim: i32,
+    start_pos_ptr: u64,
+    rms_eps: f32,
+    rope_base: f32,
+    original_seq_len: i32,
+    factor: f32,
+    beta_fast: f32,
+    beta_slow: f32,
+) -> Result<()> {
+    // SAFETY: same contract as [`dsv4_prepare_qk_raw`]; `start_pos_ptr` is a
+    // live device i32 scalar.
+    unsafe {
+        ffi::dsv4_prepare_qk_start_pos_ptr_cuda(
+            q_raw_ptr as *const ffi::Half,
+            k_raw_ptr as *const ffi::Half,
+            q_out_ptr as *mut ffi::Half,
+            k_out_ptr as *mut ffi::Half,
+            num_tokens,
+            local_heads,
+            head_dim,
+            rope_dim,
+            start_pos_ptr as *const i32,
+            rms_eps,
+            rope_base,
+            original_seq_len,
+            factor,
+            beta_fast,
+            beta_slow,
+            stream.cu_stream(),
+        )
+        .result()
+        .map_err(|e| {
+            anyhow!("dsv4_prepare_qk_start_pos_ptr_cuda failed at tokens={num_tokens}: {e}")
+        })
+    }
+}
+
+/// Per-token device-position QK prep: `start_pos_ptr` is a `[num_tokens]`
+/// device i32 array of absolute positions.
+#[allow(clippy::too_many_arguments)]
+pub fn dsv4_prepare_qk_fused_batch_start_pos_raw(
+    stream: &CudaStream,
+    q_raw_ptr: u64,
+    k_raw_ptr: u64,
+    q_out_ptr: u64,
+    k_out_ptr: u64,
+    num_tokens: i32,
+    local_heads: i32,
+    head_dim: i32,
+    rope_dim: i32,
+    start_pos_ptr: u64,
+    rms_eps: f32,
+    rope_base: f32,
+    original_seq_len: i32,
+    factor: f32,
+    beta_fast: f32,
+    beta_slow: f32,
+) -> Result<()> {
+    // SAFETY: same contract as [`dsv4_prepare_qk_raw`]; `start_pos_ptr` is a
+    // live `[num_tokens]` device i32 array.
+    unsafe {
+        ffi::dsv4_prepare_qk_fused_batch_start_pos_cuda(
+            q_raw_ptr as *const ffi::Half,
+            k_raw_ptr as *const ffi::Half,
+            q_out_ptr as *mut ffi::Half,
+            k_out_ptr as *mut ffi::Half,
+            num_tokens,
+            local_heads,
+            head_dim,
+            rope_dim,
+            start_pos_ptr as *const i32,
+            rms_eps,
+            rope_base,
+            original_seq_len,
+            factor,
+            beta_fast,
+            beta_slow,
+            stream.cu_stream(),
+        )
+        .result()
+        .map_err(|e| {
+            anyhow!("dsv4_prepare_qk_fused_batch_start_pos_cuda failed at tokens={num_tokens}: {e}")
+        })
+    }
+}
+
+/// In-place attention-output inverse-RoPE for the FlashMLA paths (host
+/// `start_pos`). NEVER on the legacy hybrid path (double-apply).
+#[allow(clippy::too_many_arguments)]
+pub fn dsv4_output_inverse_rope_raw(
+    stream: &CudaStream,
+    out_ptr: u64,
+    token_count: i32,
+    local_heads: i32,
+    head_dim: i32,
+    rope_dim: i32,
+    start_pos: i32,
+    rope_base: f32,
+    original_seq_len: i32,
+    factor: f32,
+    beta_fast: f32,
+    beta_slow: f32,
+) -> Result<()> {
+    // SAFETY: `out_ptr` is a live `[token_count, local_heads, head_dim]` bf16
+    // buffer, stream-ordered on `stream`.
+    unsafe {
+        ffi::arle_dsv4_output_inverse_rope_cuda(
+            out_ptr as *mut ffi::Half,
+            token_count,
+            local_heads,
+            head_dim,
+            rope_dim,
+            start_pos,
+            rope_base,
+            original_seq_len,
+            factor,
+            beta_fast,
+            beta_slow,
+            stream.cu_stream(),
+        )
+        .result()
+        .map_err(|e| {
+            anyhow!("arle_dsv4_output_inverse_rope_cuda failed at tokens={token_count}: {e}")
+        })
+    }
+}
+
+/// Device-position [`dsv4_output_inverse_rope_raw`] (graph-replay safe).
+#[allow(clippy::too_many_arguments)]
+pub fn dsv4_output_inverse_rope_start_pos_ptr_raw(
+    stream: &CudaStream,
+    out_ptr: u64,
+    token_count: i32,
+    local_heads: i32,
+    head_dim: i32,
+    rope_dim: i32,
+    start_pos_ptr: u64,
+    rope_base: f32,
+    original_seq_len: i32,
+    factor: f32,
+    beta_fast: f32,
+    beta_slow: f32,
+) -> Result<()> {
+    // SAFETY: same contract as [`dsv4_output_inverse_rope_raw`];
+    // `start_pos_ptr` is a live device i32 scalar.
+    unsafe {
+        ffi::arle_dsv4_output_inverse_rope_start_pos_ptr_cuda(
+            out_ptr as *mut ffi::Half,
+            token_count,
+            local_heads,
+            head_dim,
+            rope_dim,
+            start_pos_ptr as *const i32,
+            rope_base,
+            original_seq_len,
+            factor,
+            beta_fast,
+            beta_slow,
+            stream.cu_stream(),
+        )
+        .result()
+        .map_err(|e| {
+            anyhow!(
+                "arle_dsv4_output_inverse_rope_start_pos_ptr_cuda failed at tokens={token_count}: {e}"
+            )
+        })
+    }
+}
+
+/// Per-token device-position inverse-RoPE: `start_pos_ptr` is a
+/// `[token_count]` device i32 array of absolute positions.
+#[allow(clippy::too_many_arguments)]
+pub fn dsv4_output_inverse_rope_batch_start_pos_raw(
+    stream: &CudaStream,
+    out_ptr: u64,
+    token_count: i32,
+    local_heads: i32,
+    head_dim: i32,
+    rope_dim: i32,
+    start_pos_ptr: u64,
+    rope_base: f32,
+    original_seq_len: i32,
+    factor: f32,
+    beta_fast: f32,
+    beta_slow: f32,
+) -> Result<()> {
+    // SAFETY: same contract as [`dsv4_output_inverse_rope_raw`];
+    // `start_pos_ptr` is a live `[token_count]` device i32 array.
+    unsafe {
+        ffi::arle_dsv4_output_inverse_rope_batch_start_pos_cuda(
+            out_ptr as *mut ffi::Half,
+            token_count,
+            local_heads,
+            head_dim,
+            rope_dim,
+            start_pos_ptr as *const i32,
+            rope_base,
+            original_seq_len,
+            factor,
+            beta_fast,
+            beta_slow,
+            stream.cu_stream(),
+        )
+        .result()
+        .map_err(|e| {
+            anyhow!(
+                "arle_dsv4_output_inverse_rope_batch_start_pos_cuda failed at tokens={token_count}: {e}"
+            )
+        })
+    }
+}
+
+/// Pointer-array batched inverse-RoPE: ONE launch over `n` non-contiguous
+/// output rows.
+#[allow(clippy::too_many_arguments)]
+pub fn dsv4_output_inverse_rope_batched_ptr_raw(
+    stream: &CudaStream,
+    out_arr_ptr: u64,
+    n: i32,
+    local_heads: i32,
+    head_dim: i32,
+    rope_dim: i32,
+    start_pos_ptr: u64,
+    rope_base: f32,
+    original_seq_len: i32,
+    factor: f32,
+    beta_fast: f32,
+    beta_slow: f32,
+) -> Result<()> {
+    // SAFETY: caller passes a live `[n]` device pointer array whose embedded
+    // per-row pointers are live; `start_pos_ptr` is `[n]` i32. Stream-ordered.
+    unsafe {
+        ffi::arle_dsv4_output_inverse_rope_batched_ptr_cuda(
+            out_arr_ptr as *const *mut ffi::Half,
+            n,
+            local_heads,
+            head_dim,
+            rope_dim,
+            start_pos_ptr as *const i32,
+            rope_base,
+            original_seq_len,
+            factor,
+            beta_fast,
+            beta_slow,
+            stream.cu_stream(),
+        )
+        .result()
+        .map_err(|e| anyhow!("arle_dsv4_output_inverse_rope_batched_ptr_cuda failed at n={n}: {e}"))
+    }
+}
+
+/// Repack AllGather rank-major recv buffer into FlashMLA's h_q-major Q layout.
+pub fn dsv4_tp_q_repack_raw(
+    stream: &CudaStream,
+    gathered_ptr: u64,
+    packed_ptr: u64,
+    tp_world: i32,
+    s_q: i32,
+    h_local: i32,
+    d: i32,
+) -> Result<()> {
+    // SAFETY: caller passes live device addresses sized to the dims below,
+    // stream-ordered on `stream`.
+    unsafe {
+        ffi::dsv4_tp_q_repack_cuda(
+            gathered_ptr as *const ffi::Half,
+            packed_ptr as *mut ffi::Half,
+            tp_world,
+            s_q,
+            h_local,
+            d,
+            stream.cu_stream(),
+        )
+        .result()
+        .map_err(|e| anyhow!("dsv4_tp_q_repack_cuda failed at s_q={s_q}: {e}"))
+    }
+}
+
+/// Slice a local column block out of a `[s_q, global_width]` row-major buffer.
+pub fn dsv4_tp_out_slice_raw(
+    stream: &CudaStream,
+    full_out_ptr: u64,
+    local_ptr: u64,
+    s_q: i32,
+    global_width: i32,
+    local_width: i32,
+    head_offset: i32,
+) -> Result<()> {
+    // SAFETY: caller passes live device addresses sized to the dims below,
+    // stream-ordered on `stream`.
+    unsafe {
+        ffi::dsv4_tp_out_slice_cuda(
+            full_out_ptr as *const ffi::Half,
+            local_ptr as *mut ffi::Half,
+            s_q,
+            global_width,
+            local_width,
+            head_offset,
+            stream.cu_stream(),
+        )
+        .result()
+        .map_err(|e| anyhow!("dsv4_tp_out_slice_cuda failed at s_q={s_q}: {e}"))
+    }
+}
+
+/// Gather O-LoRA group `group`'s strided column slice into a contiguous
+/// `[cols_per_group, num_tokens]` buffer.
+pub fn dsv4_oproj_group_gather_raw(
+    stream: &CudaStream,
+    src_ptr: u64,
+    dst_ptr: u64,
+    num_tokens: i32,
+    groups: i32,
+    cols_per_group: i32,
+    group: i32,
+) -> Result<()> {
+    // SAFETY: caller passes live device addresses sized to the dims below,
+    // stream-ordered on `stream`.
+    unsafe {
+        ffi::dsv4_oproj_group_gather_cuda(
+            src_ptr as *const ffi::Half,
+            dst_ptr as *mut ffi::Half,
+            num_tokens,
+            groups,
+            cols_per_group,
+            group,
+            stream.cu_stream(),
+        )
+        .result()
+        .map_err(|e| anyhow!("dsv4_oproj_group_gather_cuda failed at group={group}: {e}"))
+    }
+}
+
+/// Scatter O-LoRA group `group`'s contiguous output back into the strided
+/// latent layout.
+pub fn dsv4_oproj_group_scatter_raw(
+    stream: &CudaStream,
+    src_ptr: u64,
+    dst_ptr: u64,
+    num_tokens: i32,
+    groups: i32,
+    rows_per_group: i32,
+    group: i32,
+) -> Result<()> {
+    // SAFETY: caller passes live device addresses sized to the dims below,
+    // stream-ordered on `stream`.
+    unsafe {
+        ffi::dsv4_oproj_group_scatter_cuda(
+            src_ptr as *const ffi::Half,
+            dst_ptr as *mut ffi::Half,
+            num_tokens,
+            groups,
+            rows_per_group,
+            group,
+            stream.cu_stream(),
+        )
+        .result()
+        .map_err(|e| anyhow!("dsv4_oproj_group_scatter_cuda failed at group={group}: {e}"))
+    }
+}
+
+/// DSA top-k transform: read indexer logits, emit page-routed `page_indices`
+/// plus raw top-k `raw_indices`.
+#[allow(clippy::too_many_arguments)]
+pub fn dsv4_deepseek_v4_topk_transform_raw(
+    stream: &CudaStream,
+    scores_ptr: u64,
+    seq_lens_ptr: u64,
+    page_table_ptr: u64,
+    page_indices_ptr: u64,
+    raw_indices_ptr: u64,
+    score_stride: i64,
+    page_table_stride: i64,
+    output_stride: i64,
+    batch_size: i32,
+    topk: i32,
+    page_size: i32,
+) -> Result<()> {
+    // SAFETY: caller passes live device addresses sized to the strides/dims
+    // below, stream-ordered on `stream`.
+    unsafe {
+        ffi::dsv4_deepseek_v4_topk_transform_cuda(
+            scores_ptr as *const f32,
+            seq_lens_ptr as *const i32,
+            page_table_ptr as *const i32,
+            page_indices_ptr as *mut i32,
+            raw_indices_ptr as *mut i32,
+            score_stride,
+            page_table_stride,
+            output_stride,
+            batch_size,
+            topk,
+            page_size,
+            stream.cu_stream(),
+        )
+        .result()
+        .map_err(|e| {
+            anyhow!("dsv4_deepseek_v4_topk_transform_cuda failed at batch={batch_size}: {e}")
+        })
+    }
+}
+
 #[cfg(test)]
 mod fa2_sm70_tests {
     use crate::ffi::attention::arle_fa2_sm70_attention_cuda;
