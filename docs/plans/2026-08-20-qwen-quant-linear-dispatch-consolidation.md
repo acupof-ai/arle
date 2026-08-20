@@ -145,7 +145,7 @@ problem. The phased route-owner design is the minimum complete solution.
 | --- | --- | --- | --- |
 | `W8A16` | `qweight + qscales` | `marlin_packed + marlin_scales` | At least one complete pair; half-pairs rejected |
 | `W4A16` | `qweight + qscales` | None in this plan | Source pair required |
-| `Fp4E2M1Group` | `qweight_u8 + qscale_fp8 + scale_f32` | `marlin_packed + marlin_scales + sfb` | sfb is built from the `marlin_packed` S0E5M3 scale tail after repack; source required only for repack-declined shapes |
+| `Fp4E2M1Group` | `qweight_u8 + qscale_fp8 + scale_f32` | `marlin_packed + marlin_scales + sfb` | sfb is built from the `marlin_packed` S0E5M3 scale tail after repack; the repack never declines — a shape it cannot take is a load failure, so no source arm exists |
 | `Fp8BlockScaled` | `qweight_u8 + scale_f32` | `marlin_packed + marlin_scales` for per-channel weights | DeepGEMM B is materialized from `marlin_packed` into scratch, bit-identical to the source; source required only for repack-declined shapes |
 | `Fp8PerShard` | `qweight_u8 + scale_f32` | None | Source pair required |
 | `Dsv4Fp8BlockScaled` | `qweight + dsv4_scales` | Existing DeepGEMM cache outside this dispatcher | Source pair required for this fallback |
@@ -158,7 +158,9 @@ fallback, or retain extra VRAM defensively.
 
 After 30171f8be both FP4 and FP8 repacks free their source inline, so source
 retention means repack-declined or never-repacked only. A retained layout
-without source is the normal post-repack state, not an invalid one.
+without source is the normal post-repack state, not an invalid one. FP4 is
+stricter: its repack never declines — a shape it cannot take is a load failure
+(`tensor.rs::repack_for_marlin_fp4` bails), so an FP4 source arm never exists.
 
 ### Hot-path invariants
 
@@ -262,10 +264,6 @@ Fp4E2M1Group
   |   (reads marlin_packed, not the source; prefill-only arm)
   +-- retained Marlin layout?                -> Marlin
   |
-  +-- source + large M?                      -> dequant + BF16 GEMM   (repack-declined only)
-  |
-  +-- source?                                -> scalar/batched GEMV   (repack-declined only)
-  |
   `-- error: no consumable FP4 representation
 ```
 
@@ -273,7 +271,10 @@ sfb post-dates the source: it is built after repack from the `marlin_packed`
 scale tail (30171f8be), so "sfb present, source freed" is the normal state.
 Do not reintroduce a source/sfb coupling. The widen arm inherits the repack's
 one lossy step (group-scale flush to zero), which is why it is gated on the
-needle ladder rather than on the scale algebra.
+needle ladder rather than on the scale algebra. The repack bails on shapes the
+tile grid cannot take (group_size≠16, K%64, N%64, scale dims, global scale
+count — `tensor.rs::repack_for_marlin_fp4`); unlike FP8/W8A16 there is no
+repack-declined source arm, so the route ends at Marlin or an error.
 
 #### W8A16 and W4A16
 
@@ -286,10 +287,12 @@ Delete `try_w4a16_dequant_bf16_gemm_batch`; it always returns `false` and
 creates a route that does not exist. Keep W8A16 dequant only if the current
 implementation can still engage for an unrepacked source; otherwise prove it
 dead and delete it in the same tranche. The same reachability proof applies to
-the FP8 and FP4 source arms (dequant-BF16 and scalar/batched GEMV): after
+the FP8 source arms (dequant-BF16 and scalar/batched GEMV): after
 30171f8be they serve only repack-declined shapes. Enumerate the shapes that
 decline repack (SM, alignment, scale overflow, group size); if no production
 shape reaches a source arm, prove it dead and delete it in the same tranche.
+FP4 has no source arms to prove — the repack bails where FP8 declines, so an
+FP4 source route is unreachable by construction.
 
 ### Singular and batched GEMV ABIs
 
@@ -346,7 +349,8 @@ same state machine.
 | DeepGEMM scratch declines after source release | Validator requires another consumable representation | Forced-decline route test | Marlin fallback or explicit error |
 | `M=1` takes a different policy from batched `M=1` | Both wrappers call the same internal dispatcher | Counter/route equality test | Same implementation ID |
 | Pre-sm80 device chooses Marlin | SM gate remains part of route and repack | Pure SM route cases | Source fallback |
-| TP shard becomes unaligned | Repack declines without releasing source | Misaligned N/K cases | Source fallback with warning |
+| TP shard becomes unaligned (FP8/W8A16) | Repack declines without releasing source | Misaligned N/K cases | Source fallback with warning |
+| TP shard becomes unaligned (FP4) | Repack bails at load | `marlin_fp4_probe` n%64 bail assertion | Tensor-named load error |
 | FP4 `sfb` present with source freed | Normal post-repack state (30171f8be) | Validator accepts; rejects `sfb` without `marlin_packed` | Valid load |
 | LoRA updates a source beside an active Marlin copy | Preserve current hard error for source-freed or dual-layout base | Existing LoRA merge tests plus runtime smoke | Clear merge error; no stale layout |
 | Reload restores source but not retained layout | Audit snapshot rebuild and validate after restore | Offload/reload round-trip | Restored route matches pre-offload route |
@@ -378,8 +382,7 @@ ops::gemm_batch / ops::gemv
       +-- [required] FP4
       |   +-- widen-E4M3 DeepGEMM
       |   +-- Marlin with released source
-      |   +-- dequant-BF16 fallback
-      |   `-- scalar/batched GEMV fallback
+      |   `-- load bail on untileable shape (n%64)
       +-- [required] W8A16
       |   +-- Marlin with released source, including M=1 lm_head
       |   `-- source fallback when repack declines
