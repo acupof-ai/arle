@@ -654,6 +654,13 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
     /// `None` for host/CPU backends with no device memory. Lets OPD log
     /// per-phase resident bytes without a `&CudaBackend` downcast or shelling
     /// out to `nvidia-smi`.
+    /// Whether the backend's linear-attention kernels are built for this
+    /// (value_heads, key_heads) geometry. CUDA AOT-instantiates per geometry;
+    /// host/Metal paths are generic.
+    fn linear_attention_head_geometry_supported(&self, _h: usize, _hg: usize) -> bool {
+        true
+    }
+
     fn device_mem_info(&self) -> Option<(usize, usize)> {
         None
     }

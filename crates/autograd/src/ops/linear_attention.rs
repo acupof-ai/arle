@@ -537,7 +537,12 @@ pub fn linear_attention_core_head_chunked(
     let groups = [4usize, 3, 2]
         .into_iter()
         .find(|g| {
-            params.num_key_heads.is_multiple_of(*g) && params.num_value_heads.is_multiple_of(*g)
+            params.num_key_heads.is_multiple_of(*g)
+                && params.num_value_heads.is_multiple_of(*g)
+                && store.backend().linear_attention_head_geometry_supported(
+                    params.num_value_heads / g,
+                    params.num_key_heads / g,
+                )
         })
         .unwrap_or(1);
     if groups == 1 {
