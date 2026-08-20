@@ -357,18 +357,6 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    pub fn dequantize_fp4_e2m1_group_to_bf16_cuda(
-        weight: *const u8,
-        scales: *const u8,
-        global_scales: *const f32,
-        output: *mut Half,
-        n: i32,
-        k: i32,
-        group_size: i32,
-        scale_cols: i32,
-        stream: CUstream,
-    ) -> CUresult;
-
     /// Build the per-128x128-block power of two that
     /// [`dequantize_fp4_marlin_to_fp8_cuda`] divides out and DeepGEMM takes
     /// back as `sfb`. Writes `[ceil(n/128) + 1, ceil(k/128)]` f32 — the extra
@@ -389,7 +377,7 @@ unsafe extern "C" {
 
     /// Marlin NVFP4 tiles + their S0E5M3 scale tail -> dense E4M3 `[n, k]`, with
     /// the block power of two divided out. The FP8 twin of
-    /// [`dequantize_fp4_e2m1_group_to_bf16_cuda`]: sm_90 has no FP4 tensor core,
+    /// the BF16 widening Marlin does internally: sm_90 has no FP4 tensor core,
     /// and widening to E4M3 rather than BF16 doubles the GEMM's ceiling.
     ///
     /// Sourced from the repack rather than the checkpoint nibbles so the
