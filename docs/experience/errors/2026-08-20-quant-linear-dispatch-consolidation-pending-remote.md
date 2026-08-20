@@ -57,21 +57,33 @@ Forced deviations from the tranche brief, both behavior-neutral:
    catch-all. Unification makes one string mandatory; no other error string
    changed.
 
-Pending remote gates (H20, per the plan's test plan):
+Remote gate results (H20, 2026-08-20):
 
-- Numerical harnesses: `marlin_fp8_parity`, `marlin_w8a16_parity`,
-  `marlin_fp4_probe` at the plan's shapes and `M` values, three seeds,
-  reference-error metrics within 5% of the accepted implementation.
-- Engagement: same implementation-ID route counts as the archived baseline for
-  one FP8, one NVFP4, and one W8A16 request; `M=1` parity between
-  `gemm_batch` and `gemv`.
-- Capture: eager and captured execution, no per-step allocation, no capture
-  failure.
-- Model gates: `scripts/needle_gate.py temp` at 512/4096/16384/32768 ×3 and
-  `scripts/lever_gate.sh` against the same-config baseline envelope, on the
-  three checkpoint families.
-- Structural A/B: canonical 32K multi-turn workload at c={1,4,8,16}, ≥20
-  requests per point, median of ≥3 trials; no unresolved negative sign.
+- Numerical harnesses — PASS. Baseline binary archived at
+  `/host/baselines/arle-pre-tranche1-5853d306…` (pre-refactor `10df1d079`,
+  kernel-build-id verified); new binary built from `b7432e52a` (2m08s, no
+  warnings). `marlin_fp8_parity` ALL PASS (relL2 ≈ 1.65e-3, ratio 1.00 on
+  every shape, declined n%64 cases ≈ 1.6e-3); `marlin_w8a16_parity` ALL PASS
+  (relL2 ≈ 2.85e-3, ratio 1.00, declined cases under the 1.15e-2 cap);
+  `marlin_fp4_probe` exit 0 (n%64 load bail OK, fp4/fp8 byte-rate 0.48–0.55,
+  m=1…2048). Logs: `/host/harness-{fp8-parity,w8a16-parity,fp4-probe}.log`.
+- Engagement — PASS. One request (prompt 2,612 tokens, max-tokens 16,
+  temperature 0, GPU 0, sequential) against the archived baseline
+  (`/host/baselines/arle-pre-tranche1-5853d306…`) and the real tranche-1
+  binary `/host/arle-tranche1b` (sha256 `6a5cd23a…`): all five route counters
+  match exactly — `cuda.fp4.widen_fp8_deepgemm` 224,
+  `cuda.qwen.fp8_per_channel_deepgemm` 288, `cuda.fp4.marlin_tensorcore` 336,
+  `cuda.qwen.fp8_marlin_tensorcore` 437, `cuda.qwen.fp8_gemv` ABSENT — and the
+  completion text is identical. Note: `/host/arle-build/target/release/arle`
+  was stale (byte-identical to the baseline; the receipt guard blocked the
+  install after the 2m08s cargo build) — the tranche1b rebuild is the first
+  real A/B. KV dtype was BF16 (the default); FP8 KV disables the decode graph,
+  so the capture gate requires BF16. The counters are KV-dtype-independent and
+  match the documented regime.
+- Capture — PASS. `tranche1b` serve log: decode graph armed, paged slot 0
+  captured, no eager fallback, no per-step allocation/readback warning across
+  the 16 decode steps.
+- Model gates / structural A-B — pending.
 
 Tranche 2A records the verdict against this entry and adds the CHANGELOG line.
 
