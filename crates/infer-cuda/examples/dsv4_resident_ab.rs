@@ -437,6 +437,8 @@ mod real {
                 start_pos,
                 total_tokens: start_pos + tokens.len(),
                 params: greedy(),
+                penalty_history: None,
+                penalty_prompt_len: 0,
             }],
         }
     }
@@ -449,6 +451,8 @@ mod real {
                 last_token,
                 kv_seq_len,
                 params: greedy(),
+                penalty_history: None,
+                penalty_prompt_len: 0,
             }],
             prefill_rows: Vec::new(),
         }
