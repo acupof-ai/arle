@@ -48,6 +48,19 @@ Kernels eliminated: 48 sigmoid + 96 astype = 144 per decode step.
 Theoretical ceiling: 27.1 tok/s (273 GB/s ÷ 10.09 GB weight bytes).
 ARLE now at 76% of theoretical (was 71%).
 
+## MLX compile attempt — no improvement
+
+Tried compiling the GDR preprocessing (SiLU + QK norm + g/beta) and
+postprocessing (rms_norm + SiLU-mul) into single `mlx::core::compile()`
+functions. Zero measurable change (20.6 → 20.5 tok/s, within noise).
+
+Cause: MLX compile cannot fuse rms_norm reductions with elementwise ops
+into one kernel. The compiled function launches the same number of kernels
+as the separate compiled helpers — the reduction is a barrier. Reverted;
+the separate `compiled_silu` / `compiled_qk_norm_scale` /
+`compiled_compute_g_beta` helpers are already at the minimum kernel count
+for this op graph.
+
 ## Environment
 
 - Host: M4 Pro 48GB, macOS
