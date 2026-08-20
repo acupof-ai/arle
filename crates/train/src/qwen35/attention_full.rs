@@ -122,49 +122,17 @@ impl Qwen35Layer {
             );
         }
 
+        // CP: k/v stay full-shard at kv_heads width (cheap); q_proj -> RoPE ->
+        // ring SDPA (q tile) -> gate -> o_proj run per sequence chunk, so no
+        // q-sized intermediate is resident at full local seq (was +25.9 GB per
+        // full-attn layer replay at global 131,072). dK/dV accumulate across q
+        // tiles in the chunked backward; the ring supports tiled q natively
+        // (positions = tile rows, k_positions = full local shard).
+        //
         // Qwen3.5 / Qwen3.6 ship a gated Q projection: q_proj rows =
         // `num_heads * head_dim * 2`, with the second half acting as a
-        // per-head sigmoid gate applied to the attention output. Vanilla
-        // Qwen3 (0.6B / 1.7B / 4B / 8B) is un-gated: q_proj rows =
-        // `num_heads * head_dim`. The arch flag `cfg.full_attn_gated`
-        // selects between the two paths so `qwen35_loader` can load both
-        // checkpoint families without an arch fork.
-        let q_full = attn.q_proj.forward(h, store, tape)?;
-        let (q, gate) = if cfg.full_attn_gated {
-            let q_full = reshape(
-                q_full,
-                &[batch, seq_len, local_attention_heads, cfg.head_dim * 2],
-                store,
-                tape,
-            )?;
-            let q = slice(
-                q_full,
-                &[0, 0, 0, 0],
-                &[batch, seq_len, local_attention_heads, cfg.head_dim],
-                store,
-                tape,
-            )?;
-            let gate = slice(
-                q_full,
-                &[0, 0, 0, cfg.head_dim],
-                &[batch, seq_len, local_attention_heads, cfg.head_dim * 2],
-                store,
-                tape,
-            )?;
-            (
-                transpose(q, 1, 2, store, tape)?,
-                Some(transpose(gate, 1, 2, store, tape)?),
-            )
-        } else {
-            let q = reshape(
-                q_full,
-                &[batch, seq_len, local_attention_heads, cfg.head_dim],
-                store,
-                tape,
-            )?;
-            (transpose(q, 1, 2, store, tape)?, None)
-        };
-
+        // per-head sigmoid gate applied to the attention output. The arch flag
+        // `cfg.full_attn_gated` selects between the two paths.
         let k = attn.k_proj.forward(h, store, tape)?;
         let v = attn.v_proj.forward(h, store, tape)?;
         let k = split_heads(
@@ -185,122 +153,96 @@ impl Qwen35Layer {
             store,
             tape,
         )?;
-
-        let q = qwen35_rmsnorm(q, attn.q_norm, cfg.rms_norm_eps, store, tape)?;
         let k = qwen35_rmsnorm(k, attn.k_norm, cfg.rms_norm_eps, store, tape)?;
-        let q = rope(q, cos, sin, store, tape)?;
         let k = rope(k, cos, sin, store, tape)?;
 
-        let kv_repeat = local_attention_heads / local_key_value_heads;
-        let attn_hidden = if cp.is_enabled() {
-            // Context-parallel ring attention: q/k/v are this rank's LOCAL shard
-            // ([b, heads, seq_len, hd] / [b, kv_heads, seq_len, hd]) at absolute
-            // rows [cp.rank*seq_len, ..). The ring rotates K/V cp.size times through
-            // the flash-2 device kernel, attending the causal prefix on-device —
-            // NEVER materializing the full sequence (peak O(seq_len·hd), not
-            // O(full_seq·hd)), which is the fix for the option-B slice_bwd OOM at
-            // local seq > 65535. GQA repeat happens per-block inside the kernel, so
-            // k/v ship at kv_heads width (kv_repeat× less comm). The launcher pads
-            // global seq to a multiple of cp.size and shards RoPE positions so the
-            // absolute q_abs = cp.rank*seq_len agrees with the baked-in positions.
-            let _ = kv_repeat; // GQA resolved inside the ring kernel, not here
-            debug_assert_eq!(
-                store.get(cos).map(|t| t.shape[t.shape.len() - 2]),
-                Some(seq_len),
-                "CP: cos rows must equal local seq_len (launcher must shard positions)"
-            );
-            // Absolute position of each local row — passed in as data, the SAME slice
-            // that built cos/sin, so the ring masks causally by true position and a
-            // zigzag shard's two chunks (front+back) attend the right prefix. Threaded
-            // (not re-derived) so any sharding scheme lives only in the caller (opd.rs),
-            // not here — no `global = local*size` equal-shard assumption baked in.
-            let positions = cp_positions.ok_or(AutogradError::TapeInvariant(
-                "CP full-attention requires cp_positions (the shard's absolute rows)",
-            ))?;
-            debug_assert_eq!(
-                positions.len(),
-                seq_len,
-                "CP: cp_positions must give one absolute position per local row"
-            );
-            // The ring, its gate, the head merge and out_proj get their own
-            // checkpoint boundary: without it their intermediates stay resident
-            // through the projection backwards, and the layer's replay peak is
-            // the SUM over its stages rather than the MAX. Inert in the forward
-            // — `checkpoint` passes straight through while the outer group has
-            // the tape disabled — so this only splits the replay.
-            let positions = positions.to_vec();
-            let (cp_size, cp_rank) = (cp.size, cp.rank);
-            let o_proj = attn.o_proj.clone();
-            let head_dim = cfg.head_dim;
-            let mut inputs = vec![q, k, v];
-            let gate_slot = gate.map(|gate| {
-                inputs.push(gate);
-                inputs.len() - 1
-            });
-            collect_linear_ids(&o_proj, &mut inputs);
-            let out = autograd::ops::checkpoint(
-                inputs,
-                store,
-                tape,
-                move |st, inner, inp| {
-                    let ([q, k, v], gate) = (
-                        <[TensorId; 3]>::try_from(&inp[..3]).map_err(|_| {
-                            AutogradError::TapeInvariant(
-                                "full-attention core checkpoint expects q/k/v",
-                            )
-                        })?,
-                        gate_slot.map(|slot| inp[slot]),
-                    );
-                    let hidden = autograd::ops::ring_attention::cp_causal_sdpa(
-                        q,
-                        k,
-                        v,
-                        cp_size,
-                        cp_rank,
-                        Some(&positions),
-                        None,
-                        st,
-                        inner,
-                    )?;
-                    let hidden = match gate {
-                        Some(gate) => {
-                            let gate = sigmoid(gate, st, inner)?;
-                            mul(hidden, gate, st, inner)?
-                        }
-                        None => hidden,
-                    };
-                    let hidden = transpose(hidden, 1, 2, st, inner)?;
-                    let hidden = reshape(
-                        hidden,
-                        &[batch, seq_len, local_attention_heads * head_dim],
-                        st,
-                        inner,
-                    )?;
-                    o_proj.forward(hidden, st, inner)
-                },
-            )?;
-            return Ok(maybe_all_reduce(out, tp, store, tape)?);
-        } else {
-            let k = repeat_kv(k, kv_repeat, store, tape)?;
-            let v = repeat_kv(v, kv_repeat, store, tape)?;
-            causal_sdpa_recompute(q, k, v, store, tape)?
-        };
-        let attn_hidden = if let Some(gate) = gate {
-            let gate = sigmoid(gate, store, tape)?;
-            mul(attn_hidden, gate, store, tape)?
-        } else {
-            attn_hidden
-        };
-        let attn_hidden = merge_heads(
-            attn_hidden,
-            batch,
+        let positions = cp_positions.ok_or(AutogradError::TapeInvariant(
+            "CP full-attention requires cp_positions (the shard's absolute rows)",
+        ))?;
+        debug_assert_eq!(
+            positions.len(),
             seq_len,
-            local_attention_heads,
-            cfg.head_dim,
+            "CP: cp_positions must give one absolute position per local row"
+        );
+        let positions = positions.to_vec();
+        let (cp_size, cp_rank) = (cp.size, cp.rank);
+        let q_proj = attn.q_proj.clone();
+        let o_proj = attn.o_proj.clone();
+        let q_norm = attn.q_norm;
+        let (head_dim, eps, gated) = (cfg.head_dim, cfg.rms_norm_eps, cfg.full_attn_gated);
+        let heads = local_attention_heads;
+        let mut extra = vec![k, v, cos, sin];
+        collect_linear_ids(&attn.q_proj, &mut extra);
+        collect_linear_ids(&attn.o_proj, &mut extra);
+        extra.push(q_norm);
+        let out = autograd::ops::checkpoint_seq_chunked(
+            h,
+            extra,
+            crate::runtime_flags::OPD_SEQ_CHUNK,
             store,
             tape,
+            move |st, tp, start, inp| {
+                let (h_c, k, v, cos, sin) = (inp[0], inp[1], inp[2], inp[3], inp[4]);
+                let rows = st
+                    .get(h_c)
+                    .ok_or(AutogradError::InvalidTensorId(h_c))?
+                    .shape[1];
+                let width = if gated { head_dim * 2 } else { head_dim };
+                let q_full = q_proj.forward(h_c, st, tp)?;
+                let q_full = reshape(q_full, &[batch, rows, heads, width], st, tp)?;
+                let (q, gate) = if gated {
+                    let q = slice(
+                        q_full,
+                        &[0, 0, 0, 0],
+                        &[batch, rows, heads, head_dim],
+                        st,
+                        tp,
+                    )?;
+                    let gate = slice(
+                        q_full,
+                        &[0, 0, 0, head_dim],
+                        &[batch, rows, heads, head_dim * 2],
+                        st,
+                        tp,
+                    )?;
+                    (q, Some(gate))
+                } else {
+                    (q_full, None)
+                };
+                let q = transpose(q, 1, 2, st, tp)?;
+                let q = qwen35_rmsnorm(q, q_norm, eps, st, tp).map_err(qwen35_to_autograd)?;
+                let half = st
+                    .get(cos)
+                    .ok_or(AutogradError::InvalidTensorId(cos))?
+                    .shape[1];
+                let cos_c = slice(cos, &[start, 0], &[start + rows, half], st, tp)?;
+                let sin_c = slice(sin, &[start, 0], &[start + rows, half], st, tp)?;
+                let q = rope(q, cos_c, sin_c, st, tp)?;
+                let q_pos = &positions[start..start + rows];
+                let hidden = autograd::ops::ring_attention::cp_causal_sdpa(
+                    q,
+                    k,
+                    v,
+                    cp_size,
+                    cp_rank,
+                    Some(q_pos),
+                    Some(&positions),
+                    st,
+                    tp,
+                )?;
+                let hidden = match gate {
+                    Some(gate) => {
+                        let gate = transpose(gate, 1, 2, st, tp)?;
+                        let gate = sigmoid(gate, st, tp)?;
+                        mul(hidden, gate, st, tp)?
+                    }
+                    None => hidden,
+                };
+                let hidden = transpose(hidden, 1, 2, st, tp)?;
+                let hidden = reshape(hidden, &[batch, rows, heads * head_dim], st, tp)?;
+                o_proj.forward(hidden, st, tp)
+            },
         )?;
-        let out = attn.o_proj.forward(attn_hidden, store, tape)?;
         Ok(maybe_all_reduce(out, tp, store, tape)?)
     }
 
