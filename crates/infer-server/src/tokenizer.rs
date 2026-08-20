@@ -354,7 +354,27 @@ fn save_cache(
 fn extract_cache_parts(mut value: serde_json::Value) -> Option<(Vocab, Merges, serde_json::Value)> {
     let model = value.get_mut("model")?.as_object_mut()?;
     let vocab: Vocab = serde_json::from_value(model.remove("vocab")?).ok()?;
-    let merges: Merges = serde_json::from_value(model.remove("merges")?).ok()?;
+    // DSv4 stores merges as space-separated strings ("Ġ t"); the HF standard
+    // is ["Ġ","t"] arrays. Handle both.
+    let merges: Merges = model
+        .remove("merges")?
+        .as_array()?
+        .iter()
+        .filter_map(|m| match m {
+            serde_json::Value::Array(pair) => {
+                let mut it = pair.iter();
+                Some((
+                    it.next()?.as_str()?.to_owned(),
+                    it.next()?.as_str()?.to_owned(),
+                ))
+            }
+            serde_json::Value::String(s) => {
+                let (a, b) = s.split_once(' ')?;
+                Some((a.to_owned(), b.to_owned()))
+            }
+            _ => None,
+        })
+        .collect();
     Some((vocab, merges, value))
 }
 
