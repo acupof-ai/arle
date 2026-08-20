@@ -338,23 +338,56 @@ The format-independent ops agree closely across the two runs
 (linear_attention 9.41 vs 9.50 ms, full_attention 3.27 vs 3.26), which is what
 makes the dense_ffn column a clean single-variable comparison.
 
-## Qwen3.8-27B-NVFP4 · 1×H20 · single-GPU · eager
+## Qwen3.8-27B-NVFP4 · 1×H20 · single-GPU · eager — NVFP4 ANCHOR
 
-### Current state — runtime `4e6ec4b2a` (2026-08-19). NOT a SOTA row.
+### SOTA — runtime `30171f8be` (2026-08-20)
 
-Mixed-precision: NVFP4 MLP (W4AFP8, group_size=16) on 56 of 64 layers + FP8
-per-channel attention (F8_E4M3 + BF16 `[N,1]` weight_scale) everywhere else.
-Same `qwen3_5` hybrid architecture as Qwen3.5/3.6 (48 gated-delta linear-attn +
-16 full-attn). 1 BF16 MTP layer. **145 of ~200 quantised GEMMs per forward are
-FP8, not NVFP4** — the Marlin work landed on the 56-layer NVFP4 minority.
+Mixed-precision: NVFP4 MLP (group_size=16, E2M1 + E4M3 group scales) on 56 of 64
+layers + FP8 per-channel attention (F8_E4M3 + BF16 `[N,1]` weight_scale)
+everywhere else, 1 BF16 MTP layer. Same `qwen3_5` hybrid architecture as
+Qwen3.5/3.6 (48 gated-delta linear-attn + 16 full-attn). **Only 54% of params are
+4-bit** — 7.49 GB U8 against 11.56 GB F8_E4M3 — so the checkpoint is 23.42 GB
+against the FP8 model's 30.87 GB, 24% fewer bytes rather than half.
 
-Identity: model `unsloth/Qwen3.8-27B-NVFP4` (22 GB + 811 MB MTP) · 1×H20
-(sm_90, 96 GB), TP=1 · `--kv-cache-dtype fp8` · no spec unless stated ·
-`ARLE_CUDA_PROFILE` off · 20.69 GiB peak RSS, 6.5 s load.
+Identity: `unsloth/Qwen3.8-27B-NVFP4` · 1×H20 (sm_90, 96 GB), TP=1 ·
+`--kv-cache-dtype fp8 --max-running-requests 16` · no spec · decode graph on ·
+`ARLE_CUDA_PROFILE` off.
 
-**Matched A/B, same binary and same moment**, NVFP4 on GPU0 and
-Qwen3.6-27B-FP8 on GPU1, identical flags and harness invocation. Synthetic
-prompt (mean 8 tokens), `--seconds-per-concurrency 30 --max-tokens 128`.
+**Slot count matters and is easy to get wrong.** The executor pre-allocates one
+~146 MB recurrent block per slot eagerly, and `hot_workspace_slots()` is
+`max_running_requests.unwrap_or(num_slots)` with `num_slots` defaulting to 256.
+Omitting `--max-running-requests` therefore reserves 37,584 MB for a workload
+that admits 16 — these rows pass it, matching the FP8 anchor above.
+
+#### Long-agent 32K — the anchor row
+
+`bench-agent-32k-16x8.jsonl` (sha 8867f63e, 1,052,018 prompt / 6,848 output
+tokens per point), 32 req/point, `--max-tokens 214 --temperature 0 --seed 42`.
+Both arms on the same binary, NVFP4 on GPU 0 and Qwen3.6-27B-FP8 on GPU 1, points
+taken back to back. 32/32 complete and `SERVER_ERRORS=0` at every cell.
+
+| c | NVFP4 ITL ms | FP8 ITL ms | ITL | NVFP4 out tok/s | FP8 out tok/s | end-to-end |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | **20.45** | 24.81 | **+21.3%** | 19.49 | 19.65 | −0.8% |
+| 4 | **40.04** | 47.31 | **+18.2%** | **84.13** | 75.53 | **+11.4%** |
+| 8 | **71.16** | 79.47 | **+11.7%** | **98.00** | 91.62 | **+7.0%** |
+| 16 | **130.68** | 135.84 | **+3.9%** | 106.24 | 106.53 | −0.3% |
+
+NVFP4 leads on ITL at every concurrency and the lead decays monotonically with
+it — 21.3 → 18.2 → 11.7 → 3.9. End-to-end it leads at c=4 and c=8 and is at
+parity at c=1 and c=16, because this workload is 154:1 prefill-to-decode and
+prefill is where the two formats are closest.
+
+**A c=16 row measured 2026-08-20 on a contended box is discarded, not superseded:
+the FP8 control arm — unchanged code, unchanged config, identical resident bytes
+and KV pool — moved 30.42 → 106.53 out tok/s between runs.** A control that moves
+invalidates the run it is in; the sign of the NVFP4 delta flipped with it.
+
+#### 8-token decode grid
+
+`--seconds-per-concurrency 30 --max-tokens 128`, synthetic prompt (mean 8
+tokens). Measured at `1da4e0422`; the prefill work since does not reach these
+shapes (the DeepGEMM arms sit above an M floor no decode batch reaches).
 
 | c | NVFP4 ITL ms | NVFP4 agg | FP8 agg | vs FP8 |
 |---:|---:|---:|---:|---:|
@@ -364,93 +397,79 @@ prompt (mean 8 tokens), `--seconds-per-concurrency 30 --max-tokens 128`.
 | 8 | 16.32 | **490.2** | 358.7 | **+36.7%** |
 | 16 | 22.29 | **717.9** | 631.2 | +13.7% |
 
-Decode graph on (FP8-KV capture landed at `cb3f8a4a9`), per-channel FP8 on
-Marlin (`6f4b413fe`), every quantised GEMM repacked — `cuda.qwen.fp8_gemv` is
-513 calls of 1.15 M, load-time and warm-up only. The FP8 column is carried from
-the `55210e66a` run, where it was measured on the same binary; the load-site
-wiring cannot reach it, because the Qwen3.6-27B-FP8 checkpoint's 128x128 blocks
-fail `quant_block_m == 1` and that run recorded `fp8_marlin_tensorcore` ABSENT
-on the FP8 server.
+c=16 is a cliff here, not a decay. A per-op profile (`ARLE_CUDA_PROFILE=1`, both
+checkpoints, c=1 vs c=16) puts the whole residue in `dense_ffn`: 9.201 ms against
+the FP8 checkpoint's 11.635 for the same 17.11 G weight values, while on the five
+ops where both read identical bytes (in_proj / out_proj / qkv / o_proj / lm_head)
+Marlin is 22-30% faster. Marlin's NVFP4 arm is within 12% of its own per-channel
+FP8 arm **per value** (probe, gate_up M=16: 0.093 vs 0.083 ms) — the byte
+advantage does not convert because the kernel is issue-bound, not
+bandwidth-bound. Three tuning attempts against that are recorded and rejected in
+[errors/2026-08-19-marlin-decode-is-not-occupancy-limited.md](experience/errors/2026-08-19-marlin-decode-is-not-occupancy-limited.md).
 
-c=16 is a cliff, not a decay: c=8 is +36.6%. It is not a routing gap — a per-op
-profile (`ARLE_CUDA_PROFILE=1`, both checkpoints, c=1 vs c=16) puts the whole
-residue in `dense_ffn`, and the rest of the step is either already ahead or
-shared. On the five ops where both checkpoints read identical bytes
-(in_proj / out_proj / qkv / o_proj / lm_head) Marlin is 22-30% faster than the
-FP8 checkpoint's path.
+#### VRAM
 
-| c=16, ms/step | NVFP4 | FP8 |
-|---|---:|---:|
-| GEMM subtotal | 15.103 | 19.474 |
-| non-GEMM (identical code, both checkpoints) | 7.351 | 6.963 |
-| leaf total | 22.454 | 26.437 |
-
-`dense_ffn` is 9.201 ms against the FP8 checkpoint's 11.635 for the same 17.11 G
-weight values. Marlin's NVFP4 arm is within 12% of its own per-channel FP8 arm
-**per value** (probe, gate_up M=16: 0.093 vs 0.083 ms) — the byte advantage does
-not convert because the kernel is issue-bound, not bandwidth-bound: ncu reads 96
-registers/thread, which caps residency at 682 threads/SM (~33% occupancy) on any
-block size, and issue sits at 67% of peak.
-
-Long-agent 32K, `bench-agent-32k-16x8.jsonl` (sha 8867f63e, 1,052,018 prompt /
-6,848 output tokens per point), 32 req/point, max_tokens 214, no spec, both arms
-on the same binary and the same GPU, FP8 re-measured rather than reused:
-
-| arm | c | ITL ms | decode | out tok/s | completed |
-|---|---:|---:|---:|---:|---:|
-| NVFP4 | 1 | **20.44** | **48.9** | 12.99 | 32/32 |
-| NVFP4 | 4 | **40.04** | **25.0** | **84.25** | 32/32 |
-| NVFP4 | 8 | **70.81** | **14.1** | **98.66** | 32/32 |
-| FP8 | 1 | 24.80 | 40.3 | **19.63** | 32/32 |
-| FP8 | 4 | 47.38 | 21.1 | 74.79 | 32/32 |
-| FP8 | 8 | 78.96 | 12.7 | 92.23 | 32/32 |
-
-NVFP4 leads on ITL at every point (+21.3% / +18.4% / +11.5%) and on end-to-end
-output from c=4 (+12.7% / +7.0%). c=1 trails by 33.9% end-to-end: this workload
-is 154:1 prefill-to-decode and c=1 has no batching to amortise prefill, where
-Marlin now serves every M and pays the 12-21% it used to avoid by falling back
-to dequant→cuBLAS.
-
-The c=4 row was 10.04 out tok/s before `2026-08-20-marlin-source-freed-18gb`
-(8.4x), and 70.59 on the older `MARLIN_MAX_BLOCKS_PER_SM=1` build (+19.4%). The
-VRAM accounting behind it, both arms measured at load:
+`KV budget: free …MB` from the serve log; `resident = 97,871 − free`. Both arms
+same flags, same binary, same moment.
 
 | | file | resident | KV pool | full recomputes |
 |---|---:|---:|---:|---:|
-| NVFP4 before | 23.42 GB | 42.08 GB | 281,577 tok | 24 |
-| NVFP4 after | 23.42 GB | **23.06 GB** | **790,603 tok** | 2 |
-| FP8 | 30.87 GB | 30.41 GB | 593,995 tok | 0 |
+| Qwen3.8-27B-NVFP4 | 23.42 GB | **22.36 GB** | **1,779,114 tok** | 0 |
+| Qwen3.6-27B-FP8 | 30.87 GB | 29.36 GB | 1,582,506 tok | 0 |
 
-Spec decode, synthetic prompt, c=1:
+The 4-bit model is 7.0 GB smaller resident and holds 12% more KV. It has not
+always been: the states this passed through, and why a repack that keeps its
+source stores the model twice, are in
+[wins/2026-08-20-nvfp4-widen-to-e4m3-deepgemm-prefill.md](experience/wins/2026-08-20-nvfp4-widen-to-e4m3-deepgemm-prefill.md).
 
-| arm | ITL ms | decode | vs no-spec |
+#### Engagement — a VRAM number without these is not evidence
+
+Resident falling to 22.36 GB is what you also see if the prefill arms silently
+stop firing. Both must be read from the same process:
+
+```
+cuda.fp4.widen_fp8_deepgemm          224   = 2 prefill chunks x 56 NVFP4 MLP layers x 2 GEMMs
+cuda.qwen.fp8_per_channel_deepgemm   288
+cuda.fp4.marlin_tensorcore           336   decode stays on Marlin
+cuda.qwen.fp8_marlin_tensorcore      437
+cuda.qwen.fp8_gemv                   ABSENT
+```
+
+#### Correctness
+
+Needle ladder, `RAW=1 TEMPLATE=qwen3_nonthink`, 3 runs each: 512 / 4096 / 16384 /
+32768 all `exact=3 miss=0 DET`. The prefill path is **not** bit-parity with
+Marlin — the E2M1 x E4M3 product needs 4 mantissa bits where E4M3 stores 3, and
+`dsv4_deepgemm_fp8_gemm_nt` has no BF16-activation entry so activations are
+quantised to E4M3 per 128-K block. Sized as RMS output error at K=5120 the fold
+costs 1.94-2.38%, against 2.65% for the activation rounding the FP8 baseline
+already carries.
+
+#### Prefill kernel reference
+
+`crates/infer-cuda/examples/marlin_fp4_probe.rs`, gate_up [34816, 5120], M=2048:
+
+| path | ms | TFLOPS | share of that format's H20 peak |
 |---|---:|---:|---:|
-| no spec | 15.02 | 66.6 | — |
-| MTP d=2 (35.1% accept) | 71.23 | 14.0 | −79% |
-| DSpark block 6 | 58.90 | 17.0 | −74% |
+| Marlin, NVFP4 (widen to BF16) | 8.678 | 84 | 57% of BF16's 148 |
+| Marlin, per-channel FP8 | 8.457 | 86 | 58% |
+| DeepGEMM, FP8 | 2.664 | **274** | 93% of FP8's 296 |
 
-**Reading.** The NVFP4 decode kernel is genuinely 12–17% faster than FP8's at
-c=1, at both 8-token and 33K context. Everything else is worse, and all of it
-is one defect: `try_fp8_dequant_bf16_gemm_batch` fired at `M >= 2` and
-re-dequantised all 11.56 G FP8 params per call — 84.35 ms per forward. It cost
-5× aggregate throughput at c≥2, inverted both spec-decode paths, and crashed
-the server at 34K on its un-budgeted 2.54 GB scratch. Root cause and fix:
-[errors/2026-08-19-fp8-dequant-arm-shadows-decode.md](experience/errors/2026-08-19-fp8-dequant-arm-shadows-decode.md).
+sm_90 has no FP4 tensor core, so a real GEMM must widen the nibbles first and the
+only question is what to widen *to*. Widening to E4M3 instead of BF16 costs one
+dequant pass (278 MB against a 2.664 ms GEMM, ~3.4% at M=2048, 13% at M=512) and
+doubles the ceiling.
 
-The concurrency grid is post-fix; the 32K and spec-decode tables above are
-still the pre-fix (defective) build and are re-measuring. Every cell is n=1. No
-NVFP4 row is eligible for SOTA until the 32K run completes.
+**The earlier "A8 vs AFP8 throughput is identical, so W4A8 needs a new kernel for
+no gain" note is withdrawn.** It compared INT8 against FP8 activations and missed
+the real gap, which was the BF16 *weight* widening Marlin does — worth 3.15x at
+prefill and fixed without a new GEMM kernel.
 
 Superseded rows (9.3 tok/s initial support `33f4863c7`, FP4 GEMV vectorization
 `2a3a2164f`) live in
 [wins/2026-08-18-qwen38-27b-nvfp4-inference.md](experience/wins/2026-08-18-qwen38-27b-nvfp4-inference.md);
 the kernel ladder 52.3 → 57.9 → 60.2 → 63.9 (out tok/s, c=1) is in
 [wins/2026-08-19-nvfp4-marlin-tensorcore.md](experience/wins/2026-08-19-nvfp4-marlin-tensorcore.md).
-
-A8 vs AFP8: on H20 (sm_90) FP8 E4M3 and INT8 tensor-core throughput are
-identical (989 TFLOPS/TOPS) and FP8 has the wider dynamic range, so W4A8 (INT8
-activations) would need a new GEMM kernel for no throughput gain. The shipped
-W4AFP8 path is the right choice.
 
 ---
 

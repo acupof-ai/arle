@@ -834,12 +834,6 @@ impl Qwen35Model {
                 row_offset + rows
             );
             let cache_key = Self::lora_base_cache_key(layer_idx, projection);
-            ensure!(
-                !matrix.quant_source_freed(),
-                "layer {layer_idx} {label}: base weight was Marlin-repacked and its FP8 source \
-                 released at load, so there is nothing to merge into. Load without the Marlin \
-                 repack for a LoRA-merging engine."
-            );
             if let Some((qweight, scales)) = matrix.merge_base_fp8() {
                 let mut base_scratch = DeviceVec::zeros(&ctx, matrix.rows * matrix.cols)?;
                 {
@@ -956,11 +950,6 @@ impl Qwen35Model {
         );
         let cols = matrix.cols;
         let window = row_offset * cols..(row_offset + rows) * cols;
-        ensure!(
-            !matrix.quant_source_freed(),
-            "layer {layer_idx} {label}: base weight's FP8 source was released after the Marlin \
-             repack; the restore has no bytes to rebuild from."
-        );
         if let Some((qweight, scales)) = matrix.merge_base_fp8() {
             let mut scratch = DeviceVec::zeros(&ctx, matrix.rows * matrix.cols)?;
             {
