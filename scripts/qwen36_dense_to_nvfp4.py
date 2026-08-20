@@ -99,6 +99,34 @@ def is_dense_2d(tensor: torch.Tensor) -> bool:
     return tensor.ndim == 2 and tensor.dtype in (torch.float16, torch.bfloat16, torch.float32)
 
 
+def dequant_fp8_block_scaled(weight: torch.Tensor, scale_inv: torch.Tensor) -> torch.Tensor:
+    """FP8 E4M3 weight + per-block inverse scales -> float32 dense."""
+    rows, cols = weight.shape
+    srows, scols = scale_inv.shape
+    block_r = -(-rows // srows)
+    block_c = -(-cols // scols)
+    scales = scale_inv.to(torch.float32)
+    scales = scales.repeat_interleave(block_r, dim=0)[:rows]
+    scales = scales.repeat_interleave(block_c, dim=1)[:, :cols]
+    return weight.to(torch.float32) * scales
+
+
+def dequant_shard_fp8(tensors: dict[str, torch.Tensor]) -> None:
+    """Dequantize FP8 block-scaled weights that will be converted to NVFP4.
+    Tensors outside the conversion policy keep their FP8 weight + scale_inv
+    (the runtime loads those through its FP8 path)."""
+    for name in list(tensors):
+        if not name.endswith(".weight") or tensors[name].dtype != torch.float8_e4m3fn:
+            continue
+        scale_name = name + "_scale_inv"
+        if scale_name not in tensors:
+            continue
+        dense = dequant_fp8_block_scaled(tensors[name], tensors[scale_name])
+        if should_quantize_2d_weight(name, dense):
+            tensors[name] = dense
+            del tensors[scale_name]
+
+
 def should_quantize_2d_weight(name: str, tensor: torch.Tensor) -> bool:
     if not name.endswith(".weight") or not is_dense_2d(tensor):
         return False
@@ -283,6 +311,7 @@ def convert(args: argparse.Namespace) -> None:
 
     for shard_idx, shard_name in enumerate(shards, start=1):
         tensors = load_file(src / shard_name, device="cpu")
+        dequant_shard_fp8(tensors)
         out: dict[str, torch.Tensor] = {}
         out_name = f"model-{shard_idx:0{width}d}-of-{len(shards):0{width}d}.safetensors"
         for name, tensor in tensors.items():
