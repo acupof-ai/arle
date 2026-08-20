@@ -7,6 +7,11 @@
 >
 > Scope: Qwen dense quantized linear dispatch in `infer-cuda`. This plan does
 > not change kernel math, serving APIs, model formats, or the backend seam.
+>
+> Amended 2026-08-20: storage rules updated for 30171f8be (DeepGEMM prefill
+> operand derived from the Marlin layout; repacks free source inline) and the
+> launcher-home decision (typed launchers live in `cuda-kernels`, not
+> `infer-cuda`).
 
 ## Decision
 
@@ -21,7 +26,7 @@ kernel planner. Duplicated local control flow is the complete problem.
 
 ## Problem
 
-`crates/infer-cuda/src/ops/quant_linear.rs` is 2,065 lines and currently owns
+`crates/infer-cuda/src/ops/quant_linear.rs` is 2,120 lines and currently owns
 four concerns at once:
 
 1. route policy;
@@ -58,16 +63,18 @@ that contract from field presence.
 
 | Existing mechanism | Location | Decision |
 | --- | --- | --- |
-| Public shape validation | `crates/infer-cuda/src/ops.rs:152-249` | Reuse unchanged |
-| Explicit checkpoint format | `crates/cuda-kernels/src/tensor.rs:764-812` | Reuse as the top-level dispatch key |
-| FP4 route policy | `crates/infer-cuda/src/ops/quant_linear.rs:978-1007` | Move with the FP4 family |
-| FP8 route policy | `crates/infer-cuda/src/ops/quant_linear.rs:1244-1273` | Move with the FP8 family |
-| Shared raw-pointer Marlin launchers | `crates/infer-cuda/src/ops/quant_linear.rs:903-1346` | Keep one launcher per ABI |
-| Qwen operator hit counters | `crates/infer-cuda/src/ops/quant_linear.rs:176-242` | Preserve identifiers and semantics |
+| Public shape validation | `crates/infer-cuda/src/ops.rs:152-267` | Reuse unchanged |
+| Explicit checkpoint format | `crates/cuda-kernels/src/tensor.rs:764` | Reuse as the top-level dispatch key |
+| FP4 route policy | `crates/infer-cuda/src/ops/quant_linear.rs:1054` | Move with the FP4 family |
+| FP8 route policy | `crates/infer-cuda/src/ops/quant_linear.rs:1319` | Move with the FP8 family |
+| Raw-pointer Marlin/DeepGEMM launch calls | `crates/infer-cuda/src/ops/quant_linear.rs:671,1138` | One typed launcher per ABI in `cuda-kernels` (Tranche 1B) |
+| Qwen operator hit counters | `crates/infer-cuda/src/ops/quant_linear.rs:181-194` | Preserve identifiers and semantics |
 | FP8 and W8A16 numerical harnesses | `crates/infer-cuda/examples/marlin_{fp8,w8a16}_parity.rs` | Extend the existing harnesses |
 | NVFP4 probe | `crates/infer-cuda/examples/marlin_fp4_probe.rs` | Reuse for FP4 route checks |
-| Load-time Marlin preparation | `crates/infer-cuda/src/loader.rs:5718-5745` | Add post-preparation validation here |
+| Load-time Marlin preparation | `crates/infer-cuda/src/loader.rs:5741` | Add post-preparation validation here |
 | Source-release marker | `DeviceMatrix::quant_source_freed()` | Preserve LoRA and offload behavior |
+| Marlin-sourced DeepGEMM arms | 30171f8be; `quant_linear.rs:671,1138`, `tensor.rs` repacks | Retained layout is the only resident copy; source arms serve repack-declined shapes only |
+| Typed-launcher reference layer | `crates/cuda-kernels/src/moe.rs` (wrappers), `crates/infer-cuda/src/moe.rs` (consumer, zero raw FFI) | Copy this pattern into `crates/cuda-kernels/src/quant_linear.rs` |
 
 ## Goals
 
@@ -103,8 +110,9 @@ that contract from field presence.
 
 ## Scope control
 
-The complete plan reaches eight runtime or harness files across multiple
-tranches. No commit touches more than five files. The work stays sequential
+The complete plan reaches nine runtime or harness files across multiple
+tranches (the four `ops/quant_linear*.rs` modules, `cuda-kernels/src/quant_linear.rs`,
+`loader.rs`, and the three harnesses). No commit touches more than five files. The work stays sequential
 because the same route contract connects every tranche.
 
 The smaller alternative is to add another shared raw Marlin helper and leave
@@ -123,8 +131,9 @@ problem. The phased route-owner design is the minimum complete solution.
    terminal fallback.
 3. A route may return `Declined` only when a later route can consume the same
    resident representation.
-4. Once a source buffer is released, every supported `M` must select a retained
-   layout.
+4. For the repacking formats, source release is the normal post-repack state;
+   every supported `M` must then select a retained layout. Source-based arms
+   serve only repack-declined or never-repacked shapes.
 5. A CUDA call increments its counter only after successful launch submission.
 6. Route selection performs no allocation and launches no work.
 7. Dynamic resource failure, such as unavailable scratch capacity, retains the
@@ -136,8 +145,8 @@ problem. The phased route-owner design is the minimum complete solution.
 | --- | --- | --- | --- |
 | `W8A16` | `qweight + qscales` | `marlin_packed + marlin_scales` | At least one complete pair; half-pairs rejected |
 | `W4A16` | `qweight + qscales` | None in this plan | Source pair required |
-| `Fp4E2M1Group` | `qweight_u8 + qscale_fp8 + scale_f32` | `marlin_packed + marlin_scales` | `fp4_deepgemm_sfb` requires the complete source triplet |
-| `Fp8BlockScaled` | `qweight_u8 + scale_f32` | `marlin_packed + marlin_scales` for per-channel weights | DeepGEMM availability requires source retention |
+| `Fp4E2M1Group` | `qweight_u8 + qscale_fp8 + scale_f32` | `marlin_packed + marlin_scales + sfb` | sfb is built from the `marlin_packed` S0E5M3 scale tail after repack; source required only for repack-declined shapes |
+| `Fp8BlockScaled` | `qweight_u8 + scale_f32` | `marlin_packed + marlin_scales` for per-channel weights | DeepGEMM B is materialized from `marlin_packed` into scratch, bit-identical to the source; source required only for repack-declined shapes |
 | `Fp8PerShard` | `qweight_u8 + scale_f32` | None | Source pair required |
 | `Dsv4Fp8BlockScaled` | `qweight + dsv4_scales` | Existing DeepGEMM cache outside this dispatcher | Source pair required for this fallback |
 | `Dsv4Fp4BlockScaled` | `qweight + dsv4_scales` | Existing DeepGEMM cache outside this dispatcher | Source pair required for this fallback |
@@ -146,6 +155,10 @@ problem. The phased route-owner design is the minimum complete solution.
 
 The validator reports a load error. It does not repair state, synthesize a
 fallback, or retain extra VRAM defensively.
+
+After 30171f8be both FP4 and FP8 repacks free their source inline, so source
+retention means repack-declined or never-repacked only. A retained layout
+without source is the normal post-repack state, not an invalid one.
 
 ### Hot-path invariants
 
@@ -181,7 +194,8 @@ ops::gemm_batch()                     ops::gemv()
           +-------------+--------------+
                         |
                         v
-             one launch helper per CUDA ABI
+             cuda-kernels typed launchers
+             (one per CUDA ABI, quant_linear.rs)
 ```
 
 The internal call shape is deliberately small:
@@ -207,12 +221,15 @@ Use flat sibling modules, matching the repository convention:
 | File | Owns |
 | --- | --- |
 | `ops/quant_linear.rs` | Entry dispatch, shared Marlin scratch, profiling helper, stats aggregation, uncommon legacy formats |
-| `ops/quant_linear_fp8.rs` | FP8 policy, DeepGEMM, Marlin, dequant-BF16, scalar/batched GEMV, FP8 counters |
-| `ops/quant_linear_fp4.rs` | NVFP4 policy, widen-to-E4M3 DeepGEMM, Marlin, dequant-BF16, scalar/batched GEMV, FP4 counters |
-| `ops/quant_linear_int.rs` | W8A16, W4A16, MarlinW4A8, W2A16, and TurboQuant routes and counters |
+| `ops/quant_linear_fp8.rs` | FP8 route policy, scratch reservation, FP8 counters |
+| `ops/quant_linear_fp4.rs` | NVFP4 route policy, scratch reservation, FP4 counters |
+| `ops/quant_linear_int.rs` | W8A16, W4A16, MarlinW4A8, W2A16, and TurboQuant route policy and counters |
+| `cuda-kernels/src/quant_linear.rs` | Typed launcher per quant-linear ABI (Marlin, DeepGEMM materialization, dequant, scalar/batched GEMV), following the `cuda-kernels/src/moe.rs` pattern |
 
-Do not create `mod.rs`. `quant_linear.rs` declares the three siblings with
-explicit `#[path = "quant_linear_*.rs"]` attributes.
+Route policy lives in `infer-cuda`; launch mechanics live in `cuda-kernels`.
+This is the parent plan's launcher home, applied to this family. Do not create
+`mod.rs`. `quant_linear.rs` declares the three siblings with explicit
+`#[path = "quant_linear_*.rs"]` attributes.
 
 ### Route ownership
 
@@ -225,9 +242,9 @@ Fp8BlockScaled / Fp8PerShard
   |
   +-- retained per-channel Marlin layout?         -> launch for every M
   |
-  +-- source present and M above dequant floor?   -> dequant + BF16 GEMM
+  +-- source present and M above dequant floor?   -> dequant + BF16 GEMM   (repack-declined only)
   |
-  +-- source present?                             -> scalar/batched GEMV
+  +-- source present?                             -> scalar/batched GEMV   (repack-declined only)
   |
   `-- error: no consumable FP8 representation
 ```
@@ -241,19 +258,22 @@ for this dynamic fallback.
 ```text
 Fp4E2M1Group
   |
-  +-- source + sfb + measured prefill floor? -> widen E4M3 + DeepGEMM
-  |
+  +-- sfb + measured prefill floor + shape/SM? -> widen E4M3 + DeepGEMM
+  |   (reads marlin_packed, not the source; prefill-only arm)
   +-- retained Marlin layout?                -> Marlin
   |
-  +-- source + large M?                      -> dequant + BF16 GEMM
+  +-- source + large M?                      -> dequant + BF16 GEMM   (repack-declined only)
   |
-  +-- source?                                -> scalar/batched GEMV
+  +-- source?                                -> scalar/batched GEMV   (repack-declined only)
   |
   `-- error: no consumable FP4 representation
 ```
 
-The `sfb` presence both enables DeepGEMM and pins the source. Preserve that
-coupling until a separate design replaces it explicitly.
+sfb post-dates the source: it is built after repack from the `marlin_packed`
+scale tail (30171f8be), so "sfb present, source freed" is the normal state.
+Do not reintroduce a source/sfb coupling. The widen arm inherits the repack's
+one lossy step (group-scale flush to zero), which is why it is gated on the
+needle ladder rather than on the scale algebra.
 
 #### W8A16 and W4A16
 
@@ -265,7 +285,11 @@ W4A16: source GEMV -> error
 Delete `try_w4a16_dequant_bf16_gemm_batch`; it always returns `false` and
 creates a route that does not exist. Keep W8A16 dequant only if the current
 implementation can still engage for an unrepacked source; otherwise prove it
-dead and delete it in the same tranche.
+dead and delete it in the same tranche. The same reachability proof applies to
+the FP8 and FP4 source arms (dequant-BF16 and scalar/batched GEMV): after
+30171f8be they serve only repack-declined shapes. Enumerate the shapes that
+decline repack (SM, alignment, scale overflow, group size); if no production
+shape reaches a source arm, prove it dead and delete it in the same tranche.
 
 ### Singular and batched GEMV ABIs
 
@@ -295,9 +319,8 @@ Validation order:
 checkpoint load
   -> format/shape validation
   -> optional fuse
-  -> optional Marlin repack
-  -> optional DeepGEMM metadata preparation
-  -> conditional source release
+  -> optional Marlin repack            (frees source inline, 30171f8be)
+  -> optional sfb build                (from the marlin_packed scale tail)
   -> validate final consumable representations
   -> publish DeviceMatrix to model weights
 ```
@@ -324,7 +347,7 @@ same state machine.
 | `M=1` takes a different policy from batched `M=1` | Both wrappers call the same internal dispatcher | Counter/route equality test | Same implementation ID |
 | Pre-sm80 device chooses Marlin | SM gate remains part of route and repack | Pure SM route cases | Source fallback |
 | TP shard becomes unaligned | Repack declines without releasing source | Misaligned N/K cases | Source fallback with warning |
-| FP4 `sfb` exists after source release | Validator rejects it | Invalid-state test | Load error |
+| FP4 `sfb` present with source freed | Normal post-repack state (30171f8be) | Validator accepts; rejects `sfb` without `marlin_packed` | Valid load |
 | LoRA updates a source beside an active Marlin copy | Preserve current hard error for source-freed or dual-layout base | Existing LoRA merge tests plus runtime smoke | Clear merge error; no stale layout |
 | Reload restores source but not retained layout | Audit snapshot rebuild and validate after restore | Offload/reload round-trip | Restored route matches pre-offload route |
 | Counter moves before failed CUDA submission | Increment after `.result()?` | Injected/invalid launch harness where available | Failed launch does not count |
@@ -499,6 +522,10 @@ No code changes.
    request.
 3. Archive the binary and raw outputs used by the later A/B.
 
+HEAD includes 30171f8be (Marlin-sourced DeepGEMM). Its re-measure is still
+pending; record the baseline after that verdict lands. If the verdict
+regresses and 30171f8be is reverted, re-record the baseline on the new HEAD.
+
 Exit: baseline can be reproduced and its binary is still available.
 
 ### Tranche 0A: Reproducible numerical inputs
@@ -543,11 +570,30 @@ Work:
 - preserve counters and profiling labels;
 - delete the repeated full-format fallback match and the permanently disabled
   W4 dequant arm;
+- prove reachability of the FP8/FP4 source arms and delete the dead ones;
 - add the one table-driven route test.
 
-Exit: local checks pass; no old and new dispatch paths coexist; remote
+Launch helpers stay raw-pointer and local in this tranche; Tranche 1B moves
+them. Exit: local checks pass; no old and new dispatch paths coexist; remote
 numerical, engagement, capture, and model gates pass; structural A/B has no
 unresolved regression.
+
+### Tranche 1B: Typed launchers in cuda-kernels
+
+One commit per format family, in the order FP8, FP4, INT. Each commit:
+
+1. adds or extends `crates/cuda-kernels/src/quant_linear.rs` with typed
+   launchers (typed buffers/views, checked conversions, pointer guards kept
+   through submission, one FFI symbol per launcher, per the
+   `cuda-kernels/src/moe.rs:55-86` pattern);
+2. swaps that family's `infer-cuda` module to the typed launchers;
+3. deletes the family's raw-pointer helpers in the same commit.
+
+Files per commit stay within the commit rules (one launcher file, one consumer
+module, `lib.rs` module declaration, one report). The launch-argument receipt
+must be identical: same symbol, same grid/block/shared arguments, same scratch
+addresses for capture. Exit: `infer-cuda` quant-linear modules contain no raw
+FFI calls; captured/eager parity and route counters are unchanged.
 
 ### Tranche 2: Reject invalid retained layouts at load
 
@@ -613,7 +659,7 @@ behavioral equivalence harder to review.
 | --- | --- |
 | Scope | Reduced to Qwen dense quant-linear routing; global storage rewrite and MoE remain outside scope |
 | Architecture | Two confirmed issues: parallel entry routing and implicit retained-layout state |
-| Code quality | Three confirmed issues: 2,065-line mixed-responsibility file, duplicated format matches, permanently disabled W4 dequant branch |
+| Code quality | Three confirmed issues: 2,120-line mixed-responsibility file, duplicated format matches, permanently disabled W4 dequant branch |
 | Tests | One table-driven host test plus three existing CUDA harnesses and model-level gates cover the planned branches |
 | Performance | Structural work has a no-regression contract; threshold and ABI tuning are separate measured treatments |
 | Failure handling | Every listed silent failure receives load validation, a route test, or both |
@@ -629,8 +675,9 @@ the route consolidation.
 - `gemm_batch` and `gemv` call one internal quantized dispatcher.
 - There is one top-level execution match on `WeightFormat`.
 - Every weight family owns one ordered route and its complete terminal error.
-- Every CUDA ABI has one launch helper; singular/batched variants are grouped in
-  that helper.
+- Every CUDA ABI has one typed launcher in `cuda-kernels/src/quant_linear.rs`;
+  singular/batched variants are grouped in that launcher, and `infer-cuda`
+  quant-linear modules contain no raw FFI calls.
 - No route reads a buffer that load or reload may release.
 - Invalid retained-layout combinations fail at load with tensor context.
 - Existing operator IDs and route counts remain stable for the structural
