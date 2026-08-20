@@ -539,9 +539,12 @@ fn cp_ring_attention_backward_device(
     let (b, h, d) = (shape[0], shape[1], shape[3]);
     let kv_shape = store.tensor(k_local)?.shape.clone();
     let kv_heads = kv_shape[1];
+    // q may be a tile of the local shard; every k-side extent comes from k's
+    // own shape, never from q's row count (mirrors the forward).
+    let blk_rows = kv_shape[2];
     let scale = 1.0 / (dim as f32).sqrt();
     let num_q_tiles = b * h;
-    let block_elems = b * kv_heads * rows * d;
+    let block_elems = b * kv_heads * blk_rows * d;
 
     let q_h = device_handle(store, q, "ring q")?;
     let out_h = device_handle(store, out, "ring out")?;
@@ -604,7 +607,7 @@ fn cp_ring_attention_backward_device(
     for (k_id, v_id, k_pos) in blocks.iter() {
         let (k_id, v_id) = (*k_id, *v_id);
         let k_pos_f32: Vec<f32> = k_pos.iter().map(|&p| p as f32).collect();
-        let k_pos_h = store.backend().upload(&k_pos_f32, &[rows])?;
+        let k_pos_h = store.backend().upload(&k_pos_f32, &[k_pos.len()])?;
         let k_h = device_handle(store, k_id, "ring k")?;
         let v_h = device_handle(store, v_id, "ring v")?;
         let dims = RingBlockDims {
@@ -613,7 +616,7 @@ fn cp_ring_attention_backward_device(
             num_kv_heads: kv_heads,
             head_dim: d,
             q_rows: rows,
-            blk_len: rows,
+            blk_len: blk_rows,
             sm_scale: scale,
         };
         let (gq2, gk_b, gv_b) = store.backend().ring_block_bwd(
