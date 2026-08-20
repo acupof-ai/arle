@@ -297,16 +297,10 @@ impl CoordinatorHandle {
         budget
     }
 
-    /// Broadcast a stats query to all ranks in this TP group, collect their
-    /// responses, and aggregate to a group-level `CounterSnapshot`. Falls back
-    /// to default on any failure (send error, timeout, recv error).
-    pub(crate) async fn query_stats(&self, timeout: Duration) -> CounterSnapshot {
-        let ranks = self.collect_wire_stats(timeout).await;
-        crate::multiproc_relay::aggregate_wire_stats(ranks).into_counter_snapshot()
-    }
-
     /// Broadcast a stats query and collect per-rank [`WireStats`] responses.
-    /// Returns an empty vec on send failure; partial results on timeout.
+    /// Returns an empty vec on send failure or partial response (timeout before
+    /// every rank answered): a partial snapshot could overestimate the group's
+    /// KV capacity, so it is discarded rather than aggregated.
     async fn collect_wire_stats(
         &self,
         timeout: Duration,
@@ -340,6 +334,14 @@ impl CoordinatorHandle {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             r.unregister_stats_awaiter(request_id);
         }
+        if ranks.len() < expected {
+            log::warn!(
+                "stats query: {}/{} ranks responded before timeout; discarding partial snapshot",
+                ranks.len(),
+                expected
+            );
+            return Vec::new();
+        }
         ranks
     }
 }
@@ -364,6 +366,40 @@ impl DpCoordinator {
             .iter()
             .min_by_key(|g| g.in_flight.load(Ordering::Acquire))
             .unwrap_or(&self.groups[0])
+    }
+
+    /// Aggregate stats from every TP group into a deployment-level
+    /// [`CounterSnapshot`]. Groups serve disjoint requests, so counters and
+    /// gauges sum across groups.
+    pub(crate) async fn query_stats_all(&self, timeout: Duration) -> CounterSnapshot {
+        let groups = self.collect_wire_stats_all(timeout).await;
+        crate::multiproc_relay::aggregate_wire_stats_dp(groups).into_counter_snapshot()
+    }
+
+    /// Per-group aggregated [`WireStats`] from every TP group, queried
+    /// concurrently. A group whose ranks did not all respond is excluded.
+    async fn collect_wire_stats_all(
+        &self,
+        timeout: Duration,
+    ) -> Vec<crate::multiproc_relay::WireStats> {
+        let mut set = tokio::task::JoinSet::new();
+        for group in &self.groups {
+            let group = Arc::clone(group);
+            set.spawn(async move { group.collect_wire_stats(timeout).await });
+        }
+        let mut groups = Vec::with_capacity(self.groups.len());
+        while let Some(joined) = set.join_next().await {
+            match joined {
+                Ok(ranks) if !ranks.is_empty() => {
+                    groups.push(crate::multiproc_relay::aggregate_wire_stats(ranks));
+                }
+                Ok(_) => log::warn!(
+                    "stats query: a TP group returned no ranks; excluding it from deployment stats"
+                ),
+                Err(e) => log::warn!("stats query: TP group stats task failed: {e}"),
+            }
+        }
+        groups
     }
 }
 
@@ -440,10 +476,11 @@ pub fn coordinator_router(
         multimodal,
         shutdown,
     );
+    let dp = Arc::new(DpCoordinator::new(vec![handle]));
     if observe {
-        spawn_coordinator_observe(&handle);
+        spawn_coordinator_observe(Arc::clone(&dp));
     }
-    build_router(Arc::new(DpCoordinator::new(vec![handle])))
+    build_router(dp)
 }
 
 /// Multi-group DP coordinator router: one [`CoordinatorHandle`] per relay (each
@@ -471,13 +508,12 @@ pub fn dp_coordinator_router(
             )
         })
         .collect();
-    if let Some(handle) = handles.first() {
-        spawn_coordinator_observe(handle);
-    }
-    build_router(Arc::new(DpCoordinator::new(handles)))
+    let dp = Arc::new(DpCoordinator::new(handles));
+    spawn_coordinator_observe(Arc::clone(&dp));
+    build_router(dp)
 }
 
-fn spawn_coordinator_observe(handle: &Arc<CoordinatorHandle>) {
+fn spawn_coordinator_observe(dp: Arc<DpCoordinator>) {
     let Ok(rt) = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -485,9 +521,8 @@ fn spawn_coordinator_observe(handle: &Arc<CoordinatorHandle>) {
         log::error!("observe: tokio runtime build failed");
         return;
     };
-    let handle = Arc::clone(handle);
     crate::observe::spawn_observe_task(move || {
-        Some(rt.block_on(handle.query_stats(Duration::from_secs(5))))
+        Some(rt.block_on(dp.query_stats_all(Duration::from_secs(5))))
     });
 }
 
@@ -2038,7 +2073,7 @@ async fn fallback_404(req: axum::extract::Request) -> (StatusCode, Json<serde_js
 async fn metrics(
     State(state): State<Arc<DpCoordinator>>,
 ) -> ([(header::HeaderName, &'static str); 1], String) {
-    let counters = state.query_stats(Duration::from_secs(2)).await;
+    let counters = state.query_stats_all(Duration::from_secs(2)).await;
     (
         [(
             header::CONTENT_TYPE,
@@ -2049,13 +2084,15 @@ async fn metrics(
 }
 
 async fn stats(State(state): State<Arc<DpCoordinator>>) -> Result<Json<StatsResponse>, ApiError> {
-    let ranks = state
-        .collect_wire_stats(std::time::Duration::from_secs(5))
+    let groups = state
+        .collect_wire_stats_all(std::time::Duration::from_secs(5))
         .await;
-    if ranks.is_empty() {
-        return Err(ApiError::internal("stats query failed (no rank responded)"));
+    if groups.is_empty() {
+        return Err(ApiError::internal(
+            "stats query failed (no TP group responded)",
+        ));
     }
-    let wire = crate::multiproc_relay::aggregate_wire_stats(ranks);
+    let wire = crate::multiproc_relay::aggregate_wire_stats_dp(groups);
     Ok(Json(StatsResponse::from_wire(wire)))
 }
 
