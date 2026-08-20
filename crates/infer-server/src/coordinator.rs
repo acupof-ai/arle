@@ -298,9 +298,9 @@ impl CoordinatorHandle {
     }
 
     /// Broadcast a stats query and collect per-rank [`WireStats`] responses.
-    /// Returns an empty vec on send failure or partial response (timeout before
-    /// every rank answered): a partial snapshot could overestimate the group's
-    /// KV capacity, so it is discarded rather than aggregated.
+    /// Returns an empty vec on send failure; on timeout, returns whatever
+    /// ranks responded (partial snapshot — counters underestimate, gauges
+    /// may overestimate).
     async fn collect_wire_stats(
         &self,
         timeout: Duration,
@@ -335,10 +335,8 @@ impl CoordinatorHandle {
             r.unregister_stats_awaiter(request_id);
         }
         if ranks.len() < expected {
-            // Counters are monotonic — a partial snapshot underestimates but
-            // never overestimates. Gauges (kv_free_pages, active_requests)
-            // may overestimate, but returning all-zero is worse: it hides
-            // real traffic and makes /metrics useless under load.
+            // Partial: counters underestimate safely; gauges may overestimate,
+            // but all-zero would hide real traffic.
             log::warn!(
                 "stats query: {}/{} ranks responded before timeout; using partial snapshot",
                 ranks.len(),
@@ -380,7 +378,7 @@ impl DpCoordinator {
     }
 
     /// Per-group aggregated [`WireStats`] from every TP group, queried
-    /// concurrently. A group whose ranks did not all respond is excluded.
+    /// concurrently. A group where no rank responded is excluded.
     async fn collect_wire_stats_all(
         &self,
         timeout: Duration,

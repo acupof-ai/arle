@@ -11,7 +11,7 @@
 
 use std::path::Path;
 
-use anyhow::{Context, Result, anyhow, ensure};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use tokenizers::Tokenizer;
 use tokenizers::decoders::DecoderWrapper;
 use tokenizers::pre_tokenizers::byte_level::ByteLevel;
@@ -351,31 +351,49 @@ fn save_cache(
 /// Pull `model.vocab` and `model.merges` out of a parsed tokenizer.json Value
 /// in place (no clone of the 248k-entry structures), returning them alongside
 /// the stripped Value. Caller has already confirmed the model type is BPE.
-fn extract_cache_parts(mut value: serde_json::Value) -> Option<(Vocab, Merges, serde_json::Value)> {
-    let model = value.get_mut("model")?.as_object_mut()?;
-    let vocab: Vocab = serde_json::from_value(model.remove("vocab")?).ok()?;
+fn extract_cache_parts(mut value: serde_json::Value) -> Result<(Vocab, Merges, serde_json::Value)> {
+    let model = value
+        .get_mut("model")
+        .context("missing model")?
+        .as_object_mut()
+        .context("model not an object")?;
+    let vocab: Vocab = serde_json::from_value(model.remove("vocab").context("missing vocab")?)
+        .map_err(|e| anyhow!("vocab deserialize failed: {e}"))?;
     // DSv4 stores merges as space-separated strings ("Ġ t"); the HF standard
-    // is ["Ġ","t"] arrays. Handle both.
-    let merges: Merges = model
-        .remove("merges")?
-        .as_array()?
-        .iter()
-        .filter_map(|m| match m {
+    // is ["Ġ","t"] arrays. Handle both; error on malformed entries (upstream
+    // contract — silent divergence is worse than load failure).
+    let arr = match model.remove("merges").context("missing merges")? {
+        serde_json::Value::Array(a) => a,
+        other => bail!("merges not an array: {other}"),
+    };
+    let mut merges = Vec::with_capacity(arr.len());
+    for m in arr {
+        let (a, b) = match m {
             serde_json::Value::Array(pair) => {
-                let mut it = pair.iter();
-                Some((
-                    it.next()?.as_str()?.to_owned(),
-                    it.next()?.as_str()?.to_owned(),
-                ))
+                let a = pair
+                    .first()
+                    .and_then(|v| v.as_str())
+                    .context("merge pair: first element not a string")?;
+                let b = pair
+                    .get(1)
+                    .and_then(|v| v.as_str())
+                    .context("merge pair: second element not a string")?;
+                (a.to_owned(), b.to_owned())
             }
             serde_json::Value::String(s) => {
-                let (a, b) = s.split_once(' ')?;
-                Some((a.to_owned(), b.to_owned()))
+                let (a, b) = s
+                    .split_once(' ')
+                    .with_context(|| format!("merge string has no space: {s}"))?;
+                if b.contains(' ') {
+                    bail!("merge string has >2 parts: {s}");
+                }
+                (a.to_owned(), b.to_owned())
             }
-            _ => None,
-        })
-        .collect();
-    Some((vocab, merges, value))
+            other => bail!("unexpected merge entry type: {other}"),
+        };
+        merges.push((a, b));
+    }
+    Ok((vocab, merges, value))
 }
 
 /// Build a Tokenizer from raw vocab, merges, and the config Value
