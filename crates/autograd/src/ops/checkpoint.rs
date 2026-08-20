@@ -215,18 +215,36 @@ where
     let live_before = store.live_ids().into_iter().collect::<HashSet<_>>();
     tape.enabled = false;
     let forward = (|| {
-        let mut out = SeqAccum::new(vec![batch, seq, dim], 1, store)?;
-        // Not left to `record` below: that only fires on an enabled outer tape.
-        store.set_requires_grad(out.id(), requires_grad)?;
+        // Output width comes from the first chunk — the block may project dim.
+        let mut out: Option<SeqAccum> = None;
         for start in (0..seq).step_by(chunk) {
             let end = (start + chunk).min(seq);
             let x = crate::ops::slice(input, &[0, start, 0], &[batch, end, dim], store, tape)?;
             let mut chunk_inputs = vec![x];
             chunk_inputs.extend_from_slice(&input_ids[1..]);
             let y = replay(store, tape, start, &chunk_inputs)?;
-            out.write_rows(start, y, store)?;
-            store.free_new_except(&live_before, &HashSet::from([out.id()]))?;
+            if out.is_none() {
+                let out_dim =
+                    *store
+                        .tensor(y)?
+                        .shape
+                        .last()
+                        .ok_or(AutogradError::TapeInvariant(
+                            "seq-chunked block returned rank-0 output",
+                        ))?;
+                let acc = SeqAccum::new(vec![batch, seq, out_dim], 1, store)?;
+                // Not left to `record` below: that only fires on an enabled outer tape.
+                store.set_requires_grad(acc.id(), requires_grad)?;
+                out = Some(acc);
+            }
+            let acc = out.as_mut().expect("set above");
+            acc.write_rows(start, y, store)?;
+            let keep = HashSet::from([acc.id()]);
+            store.free_new_except(&live_before, &keep)?;
         }
+        let out = out.ok_or(AutogradError::TapeInvariant(
+            "seq-chunked block on empty seq",
+        ))?;
         Ok(out.finish())
     })();
     tape.enabled = outer_enabled;
@@ -237,6 +255,7 @@ where
             return Err(err);
         }
     };
+    let out_dim = *store.tensor(output_id)?.shape.last().unwrap_or(&dim);
     let mut keep = HashSet::from([output_id]);
     keep.extend(input_ids.iter().copied());
     store.free_new_except(&live_before, &keep)?;
@@ -253,6 +272,7 @@ where
                 batch,
                 seq,
                 dim,
+                out_dim,
                 chunk: effective_chunk,
             },
         }
