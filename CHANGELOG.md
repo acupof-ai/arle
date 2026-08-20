@@ -8,6 +8,17 @@ detail in the linked wins/errors entry. Oldest sections are condensed.
 
 ## [Unreleased]
 
+- **cp=2 131,072 — verdict: below the card by ~2–5 GB; the a2a linear-attention
+  core is the ceiling.** Layer replays chunked end-to-end (linear projections,
+  CP full attention over q tiles with ring FA3 tiled-q support, core over head
+  groups): linear-layer replay 20.3 → 6.9 GB, full-attn 25.9 → ~4 GB, live peak
+  75 GB of 97.5. Remaining deficit is allocator hoard around the core's
+  O(global-seq) transient. Five stacked faults fixed on the way (NCCL teardown
+  hang, pre-backward hoard, per-chunk trim, ring backward k-extents, flashqla
+  geometry). Next step is a sequence-parallel core with cross-rank state carry.
+  NVFP4 frozen base numerically validated (Δloss 0.012%), sharing unwired.
+  [entry](docs/experience/errors/2026-08-21-cp2-131072-stacked-faults-and-the-a2a-core-ceiling.md)
+
 ## [0.5.7] - 2026-08-21
 
 Seven days, 547 commits. Three threads: NVFP4 becomes a serving format worth
