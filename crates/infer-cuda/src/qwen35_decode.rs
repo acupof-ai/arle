@@ -118,20 +118,17 @@ impl Qwen35Model {
                 .map_err(|e| anyhow!("H2D batched copy sizes: {e}"))?;
             (d.device_ptr(&ctx.stream).0, max)
         };
-        // SAFETY: the table holds `n` dst then `n` src live addresses, each
+        // The table holds `n` dst then `n` src live addresses, each
         // buffer at least its `bytes` entry and cudaMalloc-aligned.
-        unsafe {
-            ffi::batched_copy_uniform_cuda(
-                base as *const *mut std::ffi::c_void,
-                (base + (n as u64) * 8) as *const *const std::ffi::c_void,
-                len_ptr as *const i32,
-                bytes[0],
-                max_words,
-                n as i32,
-                ctx.stream.cu_stream(),
-            )
-            .result()?;
-        }
+        cuda_kernels::recurrent::batched_copy_uniform_raw(
+            &ctx.stream,
+            base,
+            base + (n as u64) * 8,
+            len_ptr,
+            bytes[0],
+            max_words,
+            n,
+        )?;
         Ok(())
     }
 

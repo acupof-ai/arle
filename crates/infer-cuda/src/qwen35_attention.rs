@@ -2038,23 +2038,19 @@ impl Qwen35Model {
                     Some(linear_idx),
                     rows,
                     || {
-                        // SAFETY: x/weight/out are live `[B, C]`/`[C*K]` buffers on
+                        // x/weight/out are live `[B, C]`/`[C*K]` buffers on
                         // ctx.stream; the table's first B entries point at live
                         // `[C, K-1]` conv rings.
-                        unsafe {
-                            ffi::conv1d_decode_batch_cuda(
-                                x_ptr as *const ffi::Half,
-                                w_ptr as *const ffi::Half,
-                                conv_tbl as *mut *mut ffi::Half,
-                                cv_ptr as *mut ffi::Half,
-                                qkv_dim as i32,
-                                c.linear_conv_kernel_dim as i32,
-                                rows as i32,
-                                self.ctx.stream.cu_stream(),
-                            )
-                            .result()?;
-                        }
-                        Ok(())
+                        cuda_kernels::recurrent::conv1d_decode_batch_raw(
+                            &self.ctx.stream,
+                            x_ptr,
+                            w_ptr,
+                            conv_tbl,
+                            cv_ptr,
+                            qkv_dim,
+                            c.linear_conv_kernel_dim,
+                            rows,
+                        )
                     },
                 )?;
                 crate::profile::profile_op(
@@ -2063,27 +2059,23 @@ impl Qwen35Model {
                     Some(linear_idx),
                     rows,
                     || {
-                        // SAFETY: all buffers live on ctx.stream; the table's first
+                        // All buffers live on ctx.stream; the table's first
                         // B entries point at live `[Vh, Kd, Vd]` f32 states.
-                        unsafe {
-                            ffi::gdr_decode_batch_cuda(
-                                cv_ptr as *const ffi::Half,
-                                b_ptr as *const ffi::Half,
-                                a_ptr as *const ffi::Half,
-                                dt_ptr as *const ffi::Half,
-                                alog_ptr as *const f32,
-                                gdr_tbl as *mut *mut f32,
-                                o_ptr as *mut ffi::Half,
-                                self.local_linear_k_heads as i32,
-                                self.local_linear_v_heads as i32,
-                                c.linear_key_head_dim as i32,
-                                c.linear_value_head_dim as i32,
-                                rows as i32,
-                                self.ctx.stream.cu_stream(),
-                            )
-                            .result()?;
-                        }
-                        Ok(())
+                        cuda_kernels::recurrent::gdr_decode_batch_raw(
+                            &self.ctx.stream,
+                            cv_ptr,
+                            b_ptr,
+                            a_ptr,
+                            dt_ptr,
+                            alog_ptr,
+                            gdr_tbl,
+                            o_ptr,
+                            self.local_linear_k_heads,
+                            self.local_linear_v_heads,
+                            c.linear_key_head_dim,
+                            c.linear_value_head_dim,
+                            rows,
+                        )
                     },
                 )?;
             }
@@ -2231,24 +2223,20 @@ impl Qwen35Model {
         let (o_ptr, _g7) = gdr_out.data.device_ptr_mut(&ctx.stream);
         let table = |k: u64| base + k * b as u64 * 8;
         crate::profile::profile_op(ctx, "linear/conv1d", Some(linear_idx), b * len, || {
-            // SAFETY: each table holds `b` live pointers staged above; the
-            // shared scratch is `[b * len, dim]`.
-            unsafe {
-                ffi::conv1d_prefill_varlen_cuda(
-                    table(0) as *const *const ffi::Half,
-                    w_ptr as *const ffi::Half,
-                    table(1) as *const *mut ffi::Half,
-                    len_ptr as *const i32,
-                    cv_ptr as *mut ffi::Half,
-                    qkv_dim as i32,
-                    len as i32,
-                    c.linear_conv_kernel_dim as i32,
-                    b as i32,
-                    ctx.stream.cu_stream(),
-                )
-                .result()?;
-            }
-            Ok(())
+            // Each table holds `b` live pointers staged above; the shared
+            // scratch is `[b * len, dim]`.
+            cuda_kernels::recurrent::conv1d_prefill_varlen_raw(
+                &ctx.stream,
+                table(0),
+                w_ptr,
+                table(1),
+                len_ptr,
+                cv_ptr,
+                qkv_dim,
+                len,
+                c.linear_conv_kernel_dim,
+                b,
+            )
         })?;
         crate::profile::profile_op(
             ctx,
@@ -2256,28 +2244,24 @@ impl Qwen35Model {
             Some(linear_idx),
             b * len,
             || {
-                // SAFETY: same tables; qkv_conv/gdr_out are `[b * len, dim]`.
-                unsafe {
-                    ffi::gated_delta_rule_prefill_recurrent_varlen_cuda(
-                        cv_ptr as *const ffi::Half,
-                        table(2) as *const *const ffi::Half,
-                        table(3) as *const *const ffi::Half,
-                        dt_ptr as *const ffi::Half,
-                        alog_ptr as *const f32,
-                        table(4) as *const *mut f32,
-                        len_ptr as *const i32,
-                        o_ptr as *mut ffi::Half,
-                        self.local_linear_k_heads as i32,
-                        self.local_linear_v_heads as i32,
-                        c.linear_key_head_dim as i32,
-                        c.linear_value_head_dim as i32,
-                        len as i32,
-                        b as i32,
-                        ctx.stream.cu_stream(),
-                    )
-                    .result()?;
-                }
-                Ok(())
+                // Same tables; qkv_conv/gdr_out are `[b * len, dim]`.
+                cuda_kernels::recurrent::gdr_prefill_recurrent_varlen_raw(
+                    &ctx.stream,
+                    cv_ptr,
+                    table(2),
+                    table(3),
+                    dt_ptr,
+                    alog_ptr,
+                    table(4),
+                    len_ptr,
+                    o_ptr,
+                    self.local_linear_k_heads,
+                    self.local_linear_v_heads,
+                    c.linear_key_head_dim,
+                    c.linear_value_head_dim,
+                    len,
+                    b,
+                )
             },
         )?;
         Ok(())
@@ -2361,22 +2345,18 @@ impl Qwen35Model {
                     Some(linear_idx),
                     seq_len,
                     || {
-                        // SAFETY: ptrs from live device allocations sized to the dims
+                        // Ptrs from live device allocations sized to the dims
                         // passed.
-                        unsafe {
-                            ffi::conv1d_prefill_cuda(
-                                x_ptr as *const ffi::Half,
-                                w_ptr as *const ffi::Half,
-                                s_ptr as *mut ffi::Half,
-                                o_ptr as *mut ffi::Half,
-                                qkv_dim as i32,
-                                seq_len as i32,
-                                c.linear_conv_kernel_dim as i32,
-                                self.ctx.stream.cu_stream(),
-                            )
-                            .result()?;
-                        }
-                        Ok(())
+                        cuda_kernels::recurrent::conv1d_prefill_raw(
+                            &self.ctx.stream,
+                            x_ptr,
+                            w_ptr,
+                            s_ptr,
+                            o_ptr,
+                            qkv_dim,
+                            seq_len,
+                            c.linear_conv_kernel_dim,
+                        )
                     },
                 )?;
             }
@@ -2454,28 +2434,27 @@ impl Qwen35Model {
                 Some(linear_idx),
                 seq_len,
                 || {
+                    cuda_kernels::recurrent::gdr_fq_prep_raw(
+                        &self.ctx.stream,
+                        qkv_ptr,
+                        b_ptr,
+                        a_ptr,
+                        dt_ptr,
+                        alog_ptr,
+                        q_ptr,
+                        k_ptr,
+                        v_ptr,
+                        g_ptr,
+                        beta_ptr,
+                        k_heads,
+                        v_heads,
+                        c.linear_key_head_dim,
+                        c.linear_value_head_dim,
+                        seq_len,
+                    )?;
                     // SAFETY: ptrs from live device allocations sized to the dims
                     // passed.
                     unsafe {
-                        ffi::gdr_fq_prep_cuda(
-                            qkv_ptr as *const ffi::Half,
-                            b_ptr as *const ffi::Half,
-                            a_ptr as *const ffi::Half,
-                            dt_ptr as *const ffi::Half,
-                            alog_ptr as *const f32,
-                            q_ptr as *mut ffi::Half,
-                            k_ptr as *mut ffi::Half,
-                            v_ptr as *mut ffi::Half,
-                            g_ptr as *mut f32,
-                            beta_ptr as *mut f32,
-                            k_heads as i32,
-                            v_heads as i32,
-                            c.linear_key_head_dim as i32,
-                            c.linear_value_head_dim as i32,
-                            seq_len as i32,
-                            self.ctx.stream.cu_stream(),
-                        )
-                        .result()?;
                         fq_cumsum(
                             g_ptr as *const f32,
                             gc_ptr as *mut f32,
@@ -2532,45 +2511,40 @@ impl Qwen35Model {
                     Some(linear_idx),
                     seq_len,
                     || {
-                        // SAFETY: all buffers valid on ctx.stream; head dims from
+                        // All buffers valid on ctx.stream; head dims from
                         // config.
-                        unsafe {
-                            if seq_len == 1 {
-                                ffi::gated_delta_rule_decode_cuda(
-                                    qkv_ptr as *const ffi::Half,
-                                    b_ptr as *const ffi::Half,
-                                    a_ptr as *const ffi::Half,
-                                    dt_ptr as *const ffi::Half,
-                                    alog_ptr as *const f32,
-                                    s_ptr as *mut f32,
-                                    o_ptr as *mut ffi::Half,
-                                    k_heads as i32,
-                                    v_heads as i32,
-                                    c.linear_key_head_dim as i32,
-                                    c.linear_value_head_dim as i32,
-                                    self.ctx.stream.cu_stream(),
-                                )
-                                .result()?;
-                            } else {
-                                ffi::gated_delta_rule_prefill_recurrent_cuda(
-                                    qkv_ptr as *const ffi::Half,
-                                    b_ptr as *const ffi::Half,
-                                    a_ptr as *const ffi::Half,
-                                    dt_ptr as *const ffi::Half,
-                                    alog_ptr as *const f32,
-                                    s_ptr as *mut f32,
-                                    o_ptr as *mut ffi::Half,
-                                    k_heads as i32,
-                                    v_heads as i32,
-                                    c.linear_key_head_dim as i32,
-                                    c.linear_value_head_dim as i32,
-                                    seq_len as i32,
-                                    self.ctx.stream.cu_stream(),
-                                )
-                                .result()?;
-                            }
+                        if seq_len == 1 {
+                            cuda_kernels::recurrent::gdr_decode_raw(
+                                &self.ctx.stream,
+                                qkv_ptr,
+                                b_ptr,
+                                a_ptr,
+                                dt_ptr,
+                                alog_ptr,
+                                s_ptr,
+                                o_ptr,
+                                k_heads,
+                                v_heads,
+                                c.linear_key_head_dim,
+                                c.linear_value_head_dim,
+                            )
+                        } else {
+                            cuda_kernels::recurrent::gdr_prefill_recurrent_raw(
+                                &self.ctx.stream,
+                                qkv_ptr,
+                                b_ptr,
+                                a_ptr,
+                                dt_ptr,
+                                alog_ptr,
+                                s_ptr,
+                                o_ptr,
+                                k_heads,
+                                v_heads,
+                                c.linear_key_head_dim,
+                                c.linear_value_head_dim,
+                                seq_len,
+                            )
                         }
-                        Ok(())
                     },
                 )?;
             }
@@ -2731,41 +2705,37 @@ impl Qwen35Model {
             let a_tbl = lay.table(TBL_A, li);
             let conv_tbl = lay.table(TBL_CONV, li);
             let gdr_tbl = lay.table(TBL_GDR, li);
-            // SAFETY: each table holds `b` pointers staged above; the shared
+            // Each table holds `b` pointers staged above; the shared
             // scratch is `[b * max_len, dim]`.
-            unsafe {
-                ffi::conv1d_prefill_varlen_cuda(
-                    qkv_tbl as *const *const ffi::Half,
-                    w_ptr as *const ffi::Half,
-                    conv_tbl as *const *mut ffi::Half,
-                    len_ptr as *const i32,
-                    cv_ptr as *mut ffi::Half,
-                    qkv_dim as i32,
-                    max_len as i32,
-                    c.linear_conv_kernel_dim as i32,
-                    b as i32,
-                    ctx.stream.cu_stream(),
-                )
-                .result()?;
-                ffi::gated_delta_rule_prefill_recurrent_varlen_cuda(
-                    cv_ptr as *const ffi::Half,
-                    b_tbl as *const *const ffi::Half,
-                    a_tbl as *const *const ffi::Half,
-                    dt_ptr as *const ffi::Half,
-                    alog_ptr as *const f32,
-                    gdr_tbl as *const *mut f32,
-                    len_ptr as *const i32,
-                    go_ptr as *mut ffi::Half,
-                    self.local_linear_k_heads as i32,
-                    self.local_linear_v_heads as i32,
-                    c.linear_key_head_dim as i32,
-                    c.linear_value_head_dim as i32,
-                    max_len as i32,
-                    b as i32,
-                    ctx.stream.cu_stream(),
-                )
-                .result()?;
-            }
+            cuda_kernels::recurrent::conv1d_prefill_varlen_raw(
+                &ctx.stream,
+                qkv_tbl,
+                w_ptr,
+                conv_tbl,
+                len_ptr,
+                cv_ptr,
+                qkv_dim,
+                max_len,
+                c.linear_conv_kernel_dim,
+                b,
+            )?;
+            cuda_kernels::recurrent::gdr_prefill_recurrent_varlen_raw(
+                &ctx.stream,
+                cv_ptr,
+                b_tbl,
+                a_tbl,
+                dt_ptr,
+                alog_ptr,
+                gdr_tbl,
+                len_ptr,
+                go_ptr,
+                self.local_linear_k_heads,
+                self.local_linear_v_heads,
+                c.linear_key_head_dim,
+                c.linear_value_head_dim,
+                max_len,
+                b,
+            )?;
             li += 1;
         }
         ensure!(

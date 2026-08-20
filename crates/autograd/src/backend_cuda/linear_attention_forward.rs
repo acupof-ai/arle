@@ -235,14 +235,6 @@ pub(super) fn cuda_linear_attention_boundary_device_row(
         .map_err(|_| AutogradError::TapeInvariant("linear_attention qkv_dim exceeds i32"))?;
     let conv_kernel_i32 = i32::try_from(p.conv_kernel)
         .map_err(|_| AutogradError::TapeInvariant("linear_attention conv_kernel exceeds i32"))?;
-    let num_key_heads_i32 = i32::try_from(p.num_key_heads)
-        .map_err(|_| AutogradError::TapeInvariant("linear_attention key heads exceeds i32"))?;
-    let num_value_heads_i32 = i32::try_from(p.num_value_heads)
-        .map_err(|_| AutogradError::TapeInvariant("linear_attention value heads exceeds i32"))?;
-    let key_dim_i32 = i32::try_from(p.key_dim)
-        .map_err(|_| AutogradError::TapeInvariant("linear_attention key_dim exceeds i32"))?;
-    let value_dim_i32 = i32::try_from(p.value_dim)
-        .map_err(|_| AutogradError::TapeInvariant("linear_attention value_dim exceeds i32"))?;
     let conv_tail = carry_conv.map(|x| x.device_ptr(&backend.stream));
     let conv_tail_ptr = conv_tail.as_ref().map_or(0u64, |(ptr, _)| *ptr);
     let conv_tail_len_i32 = if carry_conv.is_some() {
@@ -284,8 +276,6 @@ pub(super) fn cuda_linear_attention_boundary_device_row(
                 },
             )?;
         }
-        let rows_i32 = i32::try_from(rows)
-            .map_err(|_| AutogradError::TapeInvariant("linear_attention rows exceeds i32"))?;
         let (qkv_ptr, _qkv_guard) = qkv_chunk.device_ptr(&backend.stream);
         let (b_ptr, _b_guard) = b_bf16.device_ptr(&backend.stream);
         let (a_ptr, _a_guard) = a_bf16.device_ptr(&backend.stream);
@@ -293,27 +283,24 @@ pub(super) fn cuda_linear_attention_boundary_device_row(
         let (a_log_ptr, _a_log_guard) = a_log.device_ptr(&backend.stream);
         let (state_ptr, _state_guard) = state.device_ptr_mut(&backend.stream);
         let (raw_ptr, _raw_guard) = raw_chunk.device_ptr_mut(&backend.stream);
-        check_cuda_ffi(
-            // SAFETY: all pointers cover the dimensions passed below.
-            unsafe {
-                ffi::gated_delta_rule_prefill_recurrent_cuda(
-                    qkv_ptr as *const ffi::Half,
-                    (b_ptr as *const ffi::Half).add(head_start),
-                    (a_ptr as *const ffi::Half).add(head_start),
-                    dt_ptr as *const ffi::Half,
-                    a_log_ptr as *const f32,
-                    state_ptr as *mut f32,
-                    raw_ptr as *mut ffi::Half,
-                    num_key_heads_i32,
-                    num_value_heads_i32,
-                    key_dim_i32,
-                    value_dim_i32,
-                    rows_i32,
-                    backend.stream.cu_stream(),
-                )
-            },
-            "gated_delta_rule_prefill_recurrent_cuda",
-        )?;
+        let head_off = (head_start * std::mem::size_of::<ffi::Half>()) as u64;
+        // All pointers cover the dimensions passed below.
+        cuda_kernels::recurrent::gdr_prefill_recurrent_raw(
+            &backend.stream,
+            qkv_ptr,
+            b_ptr + head_off,
+            a_ptr + head_off,
+            dt_ptr,
+            a_log_ptr,
+            state_ptr,
+            raw_ptr,
+            p.num_key_heads,
+            p.num_value_heads,
+            p.key_dim,
+            p.value_dim,
+            rows,
+        )
+        .map_err(|e| leak_err(format!("gated_delta_rule_prefill_recurrent_cuda: {e}")))?;
     }
     Ok(DeviceHandle::Cuda(CudaStorage::new(state)))
 }
@@ -480,14 +467,8 @@ pub(super) fn cuda_linear_attention_forward_device_row(
         .map_err(|_| AutogradError::TapeInvariant("linear_attention qkv_dim exceeds i32"))?;
     let conv_kernel_i32 = i32::try_from(p.conv_kernel)
         .map_err(|_| AutogradError::TapeInvariant("linear_attention conv_kernel exceeds i32"))?;
-    let num_key_heads_i32 = i32::try_from(p.num_key_heads)
-        .map_err(|_| AutogradError::TapeInvariant("linear_attention key heads exceeds i32"))?;
-    let num_value_heads_i32 = i32::try_from(p.num_value_heads)
-        .map_err(|_| AutogradError::TapeInvariant("linear_attention value heads exceeds i32"))?;
     let rows_i32 = i32::try_from(p.seq_len * p.num_value_heads)
         .map_err(|_| AutogradError::TapeInvariant("linear_attention rows exceeds i32"))?;
-    let key_dim_i32 = i32::try_from(p.key_dim)
-        .map_err(|_| AutogradError::TapeInvariant("linear_attention key_dim exceeds i32"))?;
     let value_dim_i32 = i32::try_from(p.value_dim)
         .map_err(|_| AutogradError::TapeInvariant("linear_attention value_dim exceeds i32"))?;
 
@@ -546,31 +527,27 @@ pub(super) fn cuda_linear_attention_forward_device_row(
             let (v_ptr, _v_guard) = v.device_ptr_mut(&backend.stream);
             let (g_ptr, _g_guard) = g.device_ptr_mut(&backend.stream);
             let (beta_ptr, _beta_guard) = beta.device_ptr_mut(&backend.stream);
-            check_cuda_ffi(
-                // SAFETY: q/k are written [S, Hg, key_dim], exactly q_len on this route;
-                // v/g/beta match v_len/head_len.
-                unsafe {
-                    ffi::gdr_fq_prep_cuda(
-                        qkv_ptr as *const ffi::Half,
-                        b_ptr as *const ffi::Half,
-                        a_ptr as *const ffi::Half,
-                        dt_ptr as *const ffi::Half,
-                        a_log_ptr as *const f32,
-                        q_ptr as *mut ffi::Half,
-                        k_ptr as *mut ffi::Half,
-                        v_ptr as *mut ffi::Half,
-                        g_ptr as *mut f32,
-                        beta_ptr as *mut f32,
-                        num_key_heads_i32,
-                        num_value_heads_i32,
-                        key_dim_i32,
-                        value_dim_i32,
-                        seq_len_i32,
-                        backend.stream.cu_stream(),
-                    )
-                },
-                "gdr_fq_prep_cuda",
-            )?;
+            // q/k are written [S, Hg, key_dim], exactly q_len on this route;
+            // v/g/beta match v_len/head_len.
+            cuda_kernels::recurrent::gdr_fq_prep_raw(
+                &backend.stream,
+                qkv_ptr,
+                b_ptr,
+                a_ptr,
+                dt_ptr,
+                a_log_ptr,
+                q_ptr,
+                k_ptr,
+                v_ptr,
+                g_ptr,
+                beta_ptr,
+                p.num_key_heads,
+                p.num_value_heads,
+                p.key_dim,
+                p.value_dim,
+                p.seq_len,
+            )
+            .map_err(|e| leak_err(format!("gdr_fq_prep_cuda: {e}")))?;
             linear_attention_debug_stage_done(backend, "gdr_fq_prep", stage_started)?;
         }
         {
@@ -657,30 +634,26 @@ pub(super) fn cuda_linear_attention_forward_device_row(
             let (v_ptr, _v_guard) = v.device_ptr_mut(&backend.stream);
             let (g_ptr, _g_guard) = g.device_ptr_mut(&backend.stream);
             let (beta_ptr, _beta_guard) = beta.device_ptr_mut(&backend.stream);
-            check_cuda_ffi(
-                // SAFETY: reads qkv_conv/b/a/dt/a_log, writes q/k/v/g/beta — all live guarded
-                // slices sized above (qkv_len / head_len / num_value_heads / q_len / v_len).
-                unsafe {
-                    ffi::gated_delta_rule_prefill_chunk_prepare_cuda(
-                        qkv_ptr as *const ffi::Half,
-                        b_ptr as *const ffi::Half,
-                        a_ptr as *const ffi::Half,
-                        dt_ptr as *const ffi::Half,
-                        a_log_ptr as *const f32,
-                        q_ptr as *mut ffi::Half,
-                        k_ptr as *mut ffi::Half,
-                        v_ptr as *mut ffi::Half,
-                        g_ptr as *mut f32,
-                        beta_ptr as *mut f32,
-                        num_key_heads_i32,
-                        num_value_heads_i32,
-                        qkv_dim_i32,
-                        seq_len_i32,
-                        backend.stream.cu_stream(),
-                    )
-                },
-                "gated_delta_rule_prefill_chunk_prepare_cuda",
-            )?;
+            // Reads qkv_conv/b/a/dt/a_log, writes q/k/v/g/beta — all live guarded
+            // slices sized above (qkv_len / head_len / num_value_heads / q_len / v_len).
+            cuda_kernels::recurrent::gdr_prefill_chunk_prepare_raw(
+                &backend.stream,
+                qkv_ptr,
+                b_ptr,
+                a_ptr,
+                dt_ptr,
+                a_log_ptr,
+                q_ptr,
+                k_ptr,
+                v_ptr,
+                g_ptr,
+                beta_ptr,
+                p.num_key_heads,
+                p.num_value_heads,
+                qkv_dim,
+                p.seq_len,
+            )
+            .map_err(|e| leak_err(format!("gated_delta_rule_prefill_chunk_prepare_cuda: {e}")))?;
             linear_attention_debug_stage_done(backend, "gdr_prepare", stage_started)?;
         }
         let stage_started = linear_attention_debug_stage_start();
@@ -697,9 +670,6 @@ pub(super) fn cuda_linear_attention_forward_device_row(
         for chunk_idx in 0..num_chunks {
             let base = chunk_idx * 64;
             let chunk_len = (p.seq_len - base).min(64);
-            let chunk_len_i32 = i32::try_from(chunk_len).map_err(|_| {
-                AutogradError::TapeInvariant("linear_attention chunk_len exceeds i32")
-            })?;
             // SAFETY: chunk_state has num_chunks*state_len f32s; chunk_idx < num_chunks.
             let dst_addr = unsafe { (chunk_ptr as *mut f32).add(chunk_idx * state_len) } as u64;
             let src_addr = state_ptr;
@@ -712,29 +682,26 @@ pub(super) fn cuda_linear_attention_forward_device_row(
                     builder
                 },
             )?;
-            check_cuda_ffi(
-                // SAFETY: base = chunk_idx*64 with chunk_len = min(seq_len-base, 64), so the
-                // offset qkv_conv/b/a/raw_output views and final_state (state_len) stay inside
-                // their live guarded slices.
-                unsafe {
-                    ffi::gated_delta_rule_prefill_recurrent_cuda(
-                        (qkv_ptr as *const ffi::Half).add(base * qkv_dim),
-                        (b_ptr as *const ffi::Half).add(base * p.num_value_heads),
-                        (a_ptr as *const ffi::Half).add(base * p.num_value_heads),
-                        dt_ptr as *const ffi::Half,
-                        a_log_ptr as *const f32,
-                        state_ptr as *mut f32,
-                        (raw_ptr as *mut ffi::Half).add(base * p.num_value_heads * p.value_dim),
-                        num_key_heads_i32,
-                        num_value_heads_i32,
-                        key_dim_i32,
-                        value_dim_i32,
-                        chunk_len_i32,
-                        backend.stream.cu_stream(),
-                    )
-                },
-                "gated_delta_rule_prefill_recurrent_cuda",
-            )?;
+            // base = chunk_idx*64 with chunk_len = min(seq_len-base, 64), so the
+            // offset qkv_conv/b/a/raw_output views and final_state (state_len) stay inside
+            // their live guarded slices.
+            let half = std::mem::size_of::<ffi::Half>();
+            cuda_kernels::recurrent::gdr_prefill_recurrent_raw(
+                &backend.stream,
+                qkv_ptr + (base * qkv_dim * half) as u64,
+                b_ptr + (base * p.num_value_heads * half) as u64,
+                a_ptr + (base * p.num_value_heads * half) as u64,
+                dt_ptr,
+                a_log_ptr,
+                state_ptr,
+                raw_ptr + (base * p.num_value_heads * p.value_dim * half) as u64,
+                p.num_key_heads,
+                p.num_value_heads,
+                p.key_dim,
+                p.value_dim,
+                chunk_len,
+            )
+            .map_err(|e| leak_err(format!("gated_delta_rule_prefill_recurrent_cuda: {e}")))?;
         }
         linear_attention_debug_stage_done(backend, "gdr_recurrent", stage_started)?;
     }
