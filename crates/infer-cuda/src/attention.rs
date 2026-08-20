@@ -240,12 +240,13 @@ pub(crate) fn commit_layer_fold(
         let (q_out_ptr, _qo) = q_discard.data.device_ptr_mut(&ctx.stream);
         let (k_out_ptr, _ko) = k_prepared.data.device_ptr_mut(&ctx.stream);
         // SAFETY: buffers sized above; q arm runs on zeros and is discarded.
-        unsafe {
-            ffi::dsv4_prepare_qk_cuda(
-                q_raw_ptr as *const ffi::Half,
-                k_raw_ptr as *const ffi::Half,
-                q_out_ptr as *mut ffi::Half,
-                k_out_ptr as *mut ffi::Half,
+        {
+            flash_kv::dsv4_prepare_qk_raw(
+                &ctx.stream,
+                q_raw_ptr,
+                k_raw_ptr,
+                q_out_ptr,
+                k_out_ptr,
                 m as i32,
                 local_heads as i32,
                 head_dim as i32,
@@ -257,9 +258,7 @@ pub(crate) fn commit_layer_fold(
                 rope.factor,
                 rope.beta_fast,
                 rope.beta_slow,
-                ctx.stream.cu_stream(),
-            )
-            .result()?;
+            )?;
         }
     }
     keepalive.keep_hidden(&q_dummy);
@@ -1406,28 +1405,26 @@ fn run_fused_wqkv_prefill(
         .map_err(|e| anyhow!("DSv4 fused wqkv prefill DeepGEMM dense failed: {e}"))?;
         let (qkv_ptr, _qkv_guard) = scratch.qkv_raw.data.device_ptr(&ctx.stream);
         let (cq_ptr, _cq_guard) = c_q.data.device_ptr_mut(&ctx.stream);
-        ffi::dsv4_tp_out_slice_cuda(
-            qkv_ptr as *const ffi::Half,
-            cq_ptr as *mut ffi::Half,
+        flash_kv::dsv4_tp_out_slice_raw(
+            &ctx.stream,
+            qkv_ptr,
+            cq_ptr,
             m as i32,
             n as i32,
             scratch.q_lora_rank as i32,
             0,
-            stream,
         )
-        .result()
         .map_err(|e| anyhow!("DSv4 fused wqkv prefill c_q slice failed: {e}"))?;
         let (kv_ptr, _kv_guard) = kv_raw.data.device_ptr_mut(&ctx.stream);
-        ffi::dsv4_tp_out_slice_cuda(
-            qkv_ptr as *const ffi::Half,
-            kv_ptr as *mut ffi::Half,
+        flash_kv::dsv4_tp_out_slice_raw(
+            &ctx.stream,
+            qkv_ptr,
+            kv_ptr,
             m as i32,
             n as i32,
             scratch.head_dim as i32,
             scratch.q_lora_rank as i32,
-            stream,
         )
-        .result()
         .map_err(|e| anyhow!("DSv4 fused wqkv prefill kv slice failed: {e}"))?;
     }
     Ok(())
@@ -1806,8 +1803,7 @@ fn update_bf16_sw_window(
     }
     let (k_ptr, _kg) = k_prepared.data.device_ptr(&ctx.stream);
     let (window_ptr, _wg) = sw_window_cache.device_ptr_mut(&ctx.stream);
-    // SAFETY: ptrs from live device allocations sized to the dims passed.
-    unsafe {
+    {
         if let Some(start_pos_device) = pos.device {
             // start_pos lives on device - the host can't tail-slice. Decode/MTP rows
             // are far
@@ -1820,31 +1816,29 @@ fn update_bf16_sw_window(
                 config.sliding_window
             );
             let (start_ptr, _sg) = start_pos_device.device_ptr(&ctx.stream);
-            ffi::dsv4_update_window_cache_start_pos_ptr_cuda(
-                k_ptr as *const ffi::Half,
-                window_ptr as *mut ffi::Half,
+            flash_kv::dsv4_update_window_cache_start_pos_ptr_raw(
+                &ctx.stream,
+                k_ptr,
+                window_ptr,
                 k_prepared.seq_len as i32,
-                start_ptr as *const i32,
+                start_ptr,
                 config.sliding_window as i32,
                 config.head_dim as i32,
-                ctx.stream.cu_stream(),
-            )
-            .result()?;
+            )?;
         } else {
             let skip = k_prepared.seq_len.saturating_sub(config.sliding_window);
             let start_pos = pos.start + skip;
             let rows = k_prepared.seq_len - skip;
             let k_ptr = k_ptr + (skip * config.head_dim * 2) as u64;
-            ffi::dsv4_update_window_cache_cuda(
-                k_ptr as *const ffi::Half,
-                window_ptr as *mut ffi::Half,
+            flash_kv::dsv4_update_window_cache_raw(
+                &ctx.stream,
+                k_ptr,
+                window_ptr,
                 rows as i32,
                 start_pos as i32,
                 config.sliding_window as i32,
                 config.head_dim as i32,
-                ctx.stream.cu_stream(),
-            )
-            .result()?;
+            )?;
         }
     }
     Ok(())
@@ -2004,21 +1998,19 @@ fn flashmla_prefill_attention(
                 }
                 None => (std::ptr::null(), None),
             };
-            // SAFETY: ptrs from live device allocations sized to the dims passed.
-            unsafe {
-                ffi::arle_flashmla_csa_pack_kv(
-                    kv_ptr as *mut ffi::Half,
-                    window_ptr as *const ffi::Half,
-                    k_ptr as *const ffi::Half,
-                    comp_ptr,
+            {
+                flash_kv::flashmla_csa_pack_kv_raw(
+                    &ctx.stream,
+                    kv_ptr,
+                    window_ptr,
+                    k_ptr,
+                    comp_ptr as u64,
                     start_pos as i32,
                     config.sliding_window as i32,
                     token_count as i32,
                     compressed_count as i32,
                     config.head_dim as i32,
-                    ctx.stream.cu_stream(),
                 )
-                .result()
                 .map_err(|e| anyhow!("DSv4 FlashMLA prefill KV pack failed: {e}"))?;
             }
             Ok(())
@@ -2060,16 +2052,15 @@ fn flashmla_prefill_attention(
                     } else {
                         0
                     };
-                    // SAFETY: ptrs from live device allocations sized to the dims
-                    // passed.
-                    unsafe {
-                        ffi::arle_flashmla_chain_verify_build_indices(
-                            indices_ptr as *mut i32,
-                            topk_ptr as *mut i32,
-                            pos_ptr as *const i32,
-                            anc_ptr as *const i32,
+                    {
+                        flash_kv::flashmla_chain_verify_build_indices_raw(
+                            &ctx.stream,
+                            indices_ptr,
+                            topk_ptr,
+                            pos_ptr,
+                            anc_ptr,
                             meta.max_anc as i32,
-                            sel_ptr,
+                            sel_ptr as u64,
                             token_count as i32,
                             start_pos as i32,
                             config.sliding_window as i32,
@@ -2082,51 +2073,45 @@ fn flashmla_prefill_attention(
                             topk_unified as i32,
                             compressed_count as i32,
                             compress_ratio as i32,
-                            ctx.stream.cu_stream(),
                         )
-                        .result()
                         .map_err(|e| anyhow!("DSv4 FlashMLA chain verify indices failed: {e}"))?;
                     }
                 } else {
-                    // SAFETY: ptrs from live device allocations sized to the dims
-                    // passed.
-                    unsafe {
+                    {
                         match mode {
                             DeepSeekV4AttentionMode::CompressedSparse => {
                                 let selected = selected.ok_or_else(|| {
                                     anyhow!("DSv4 FlashMLA CSA prefill missing selected topk")
                                 })?;
                                 let (selected_ptr, _sg) = selected.device_ptr(&ctx.stream);
-                                ffi::arle_flashmla_csa_build_indices(
-                                    indices_ptr as *mut i32,
-                                    topk_ptr as *mut i32,
-                                    selected_ptr as *const i32,
+                                flash_kv::flashmla_csa_build_indices_raw(
+                                    &ctx.stream,
+                                    indices_ptr,
+                                    topk_ptr,
+                                    selected_ptr,
                                     token_count as i32,
                                     start_pos as i32,
                                     config.sliding_window as i32,
                                     config.index_topk as i32,
                                     compressed_count as i32,
                                     compress_ratio as i32,
-                                    ctx.stream.cu_stream(),
                                 )
-                                .result()
                                 .map_err(|e| {
                                     anyhow!("DSv4 FlashMLA CSA prefill indices failed: {e}")
                                 })?;
                             }
                             DeepSeekV4AttentionMode::HybridCompressed => {
-                                ffi::arle_flashmla_hca_build_indices(
-                                    indices_ptr as *mut i32,
-                                    topk_ptr as *mut i32,
+                                flash_kv::flashmla_hca_build_indices_raw(
+                                    &ctx.stream,
+                                    indices_ptr,
+                                    topk_ptr,
                                     token_count as i32,
                                     start_pos as i32,
                                     config.sliding_window as i32,
                                     max_compressed_keys as i32,
                                     compressed_count as i32,
                                     compress_ratio as i32,
-                                    ctx.stream.cu_stream(),
                                 )
-                                .result()
                                 .map_err(|e| {
                                     anyhow!("DSv4 FlashMLA HCA prefill indices failed: {e}")
                                 })?;
@@ -2136,19 +2121,18 @@ fn flashmla_prefill_attention(
                                 // builder with selected=null
                                 // (fills -1) and index_topk=0, so indices hold SW
                                 // blocks only.
-                                ffi::arle_flashmla_csa_build_indices(
-                                    indices_ptr as *mut i32,
-                                    topk_ptr as *mut i32,
-                                    std::ptr::null(),
+                                flash_kv::flashmla_csa_build_indices_raw(
+                                    &ctx.stream,
+                                    indices_ptr,
+                                    topk_ptr,
+                                    0,
                                     token_count as i32,
                                     start_pos as i32,
                                     config.sliding_window as i32,
                                     max_compressed_keys as i32,
                                     compressed_count as i32,
                                     compress_ratio as i32,
-                                    ctx.stream.cu_stream(),
                                 )
-                                .result()
                                 .map_err(|e| {
                                     anyhow!("DSv4 FlashMLA SWA prefill indices failed: {e}")
                                 })?;
@@ -2165,19 +2149,18 @@ fn flashmla_prefill_attention(
                                 let (selected_ptr, _sg) = selected.device_ptr(&ctx.stream);
                                 // ponytail: pod-verify SparseIndexed prefill index
                                 // build uses ratio=1 (full latent)
-                                ffi::arle_flashmla_csa_build_indices(
-                                    indices_ptr as *mut i32,
-                                    topk_ptr as *mut i32,
-                                    selected_ptr as *const i32,
+                                flash_kv::flashmla_csa_build_indices_raw(
+                                    &ctx.stream,
+                                    indices_ptr,
+                                    topk_ptr,
+                                    selected_ptr,
                                     token_count as i32,
                                     start_pos as i32,
                                     config.sliding_window as i32,
                                     config.index_topk as i32,
                                     compressed_count as i32,
                                     1,
-                                    ctx.stream.cu_stream(),
                                 )
-                                .result()
                                 .map_err(|e| {
                                     anyhow!(
                                         "DSv4 FlashMLA SparseIndexed prefill indices failed: {e}"
@@ -2256,19 +2239,16 @@ fn flashmla_prefill_attention(
                     None,
                     token_count,
                     || {
-                        // SAFETY: ptrs from live device allocations sized to the dims
-                        // passed.
-                        unsafe {
-                            ffi::dsv4_tp_q_repack_cuda(
-                                gather_ptr as *const ffi::Half,
-                                packed_ptr as *mut ffi::Half,
+                        {
+                            flash_kv::dsv4_tp_q_repack_raw(
+                                &ctx.stream,
+                                gather_ptr,
+                                packed_ptr,
                                 tp_world as i32,
                                 token_count as i32,
                                 local_heads as i32,
                                 config.head_dim as i32,
-                                ctx.stream.cu_stream(),
                             )
-                            .result()
                             .map_err(|e| {
                                 anyhow!("DSv4 FlashMLA prefill TP Q repack failed: {e}")
                             })?;
@@ -2334,17 +2314,17 @@ fn flashmla_prefill_attention(
 
     {
         crate::profile::profile_op(ctx, "flashmla_prefill_fwd", None, token_count, || {
-            // SAFETY: ptrs from live device allocations sized to the dims passed.
-            unsafe {
-                ffi::arle_flashmla_sm90_sparse_prefill_fwd(
-                    q_for_flashmla,
-                    kv_ptr as *const ffi::Half,
-                    indices_ptr as *const i32,
-                    sink_ptr,
-                    topk_ptr as *const i32,
-                    flash_out_ptr,
-                    max_ptr as *mut f32,
-                    lse_ptr as *mut f32,
+            {
+                flash_kv::flashmla_sm90_sparse_prefill_fwd_raw(
+                    &ctx.stream,
+                    q_for_flashmla as u64,
+                    kv_ptr,
+                    indices_ptr,
+                    sink_ptr as u64,
+                    topk_ptr,
+                    flash_out_ptr as u64,
+                    max_ptr,
+                    lse_ptr,
                     token_count as i32,
                     kv_rows as i32,
                     global_heads as i32,
@@ -2360,9 +2340,7 @@ fn flashmla_prefill_attention(
                     topk_unified as i32,
                     0,
                     0,
-                    ctx.stream.cu_stream(),
                 )
-                .result()
                 .map_err(|e| anyhow!("DSv4 FlashMLA sparse prefill failed: {e}"))?;
             }
             Ok(())
@@ -2381,19 +2359,16 @@ fn flashmla_prefill_attention(
                 None,
                 token_count,
                 || {
-                    // SAFETY: ptrs from live device allocations sized to the dims
-                    // passed.
-                    unsafe {
-                        ffi::dsv4_tp_out_slice_cuda(
-                            full_out_ptr as *const ffi::Half,
-                            out_ptr as *mut ffi::Half,
+                    {
+                        flash_kv::dsv4_tp_out_slice_raw(
+                            &ctx.stream,
+                            full_out_ptr,
+                            out_ptr,
                             token_count as i32,
                             global_width as i32,
                             local_width as i32,
                             (tp_rank * local_width) as i32,
-                            ctx.stream.cu_stream(),
                         )
-                        .result()
                         .map_err(|e| anyhow!("DSv4 FlashMLA prefill TP out slice failed: {e}"))?;
                     }
                     Ok(())
@@ -2410,31 +2385,30 @@ fn flashmla_prefill_attention(
             None,
             token_count,
             || {
-                // SAFETY: ptrs from live device allocations sized to the dims passed.
-                unsafe {
+                {
                     if let Some(meta) = chain_verify {
                         let (pos_ptr, _pg) = meta.positions.device_ptr(&ctx.stream);
-                        ffi::arle_dsv4_output_inverse_rope_batch_start_pos_cuda(
-                            out_ptr as *mut ffi::Half,
+                        flash_kv::dsv4_output_inverse_rope_batch_start_pos_raw(
+                            &ctx.stream,
+                            out_ptr,
                             token_count as i32,
                             local_heads as i32,
                             config.head_dim as i32,
                             config.qk_rope_head_dim as i32,
-                            pos_ptr as *const i32,
+                            pos_ptr,
                             rope.base,
                             rope.original_seq_len,
                             rope.factor,
                             rope.beta_fast,
                             rope.beta_slow,
-                            ctx.stream.cu_stream(),
                         )
-                        .result()
                         .map_err(|e| {
                             anyhow!("DSv4 FlashMLA chain verify output inverse-rope failed: {e}")
                         })?;
                     } else {
-                        ffi::arle_dsv4_output_inverse_rope_cuda(
-                            out_ptr as *mut ffi::Half,
+                        flash_kv::dsv4_output_inverse_rope_raw(
+                            &ctx.stream,
+                            out_ptr,
                             token_count as i32,
                             local_heads as i32,
                             config.head_dim as i32,
@@ -2445,9 +2419,7 @@ fn flashmla_prefill_attention(
                             rope.factor,
                             rope.beta_fast,
                             rope.beta_slow,
-                            ctx.stream.cu_stream(),
                         )
-                        .result()
                         .map_err(|e| {
                             anyhow!("DSv4 FlashMLA prefill output inverse-rope failed: {e}")
                         })?;
@@ -2674,18 +2646,16 @@ fn flashmla_decode_attention(
         let (packed_ptr, packed_guard) = scratch.tp_packed_q.device_ptr_mut(&ctx.stream);
         {
             crate::profile::profile_op(ctx, "flashmla_q_repack", None, 1, || {
-                // SAFETY: ptrs from live device allocations sized to the dims passed.
-                unsafe {
-                    ffi::dsv4_tp_q_repack_cuda(
-                        gather_ptr as *const ffi::Half,
-                        packed_ptr as *mut ffi::Half,
+                {
+                    flash_kv::dsv4_tp_q_repack_raw(
+                        &ctx.stream,
+                        gather_ptr,
+                        packed_ptr,
                         tp_world as i32,
                         1,
                         local_heads as i32,
                         config.head_dim as i32,
-                        ctx.stream.cu_stream(),
                     )
-                    .result()
                     .map_err(|e| anyhow!("DSv4 FlashMLA TP Q repack failed: {e}"))?;
                 }
                 Ok(())
@@ -2754,20 +2724,20 @@ fn flashmla_decode_attention(
     let stride_lse = global_heads as i32;
     {
         crate::profile::profile_op(ctx, "flashmla_fwd", None, 1, || {
-            // SAFETY: ptrs from live device allocations sized to the dims passed.
-            unsafe {
-                ffi::arle_flashmla_sm90_sparse_decode_fwd(
-                    q_for_flashmla,
-                    pool_ptr as *const ffi::Half,
-                    indices_ptr as *const i32,
-                    topk_ptr as *const i32,
-                    sink_ptr,
-                    flash_out_ptr,
-                    lse_out_ptr as *mut f32,
-                    lse_accum_ptr as *mut f32,
-                    o_accum_ptr as *mut f32,
-                    sched_ptr as *const i32,
-                    splits_ptr as *const i32,
+            {
+                flash_kv::flashmla_sm90_sparse_decode_fwd_raw(
+                    &ctx.stream,
+                    q_for_flashmla as u64,
+                    pool_ptr,
+                    indices_ptr,
+                    topk_ptr,
+                    sink_ptr as u64,
+                    flash_out_ptr as u64,
+                    lse_out_ptr,
+                    lse_accum_ptr,
+                    o_accum_ptr,
+                    sched_ptr,
+                    splits_ptr,
                     1,
                     1,
                     global_heads as i32,
@@ -2797,9 +2767,7 @@ fn flashmla_decode_attention(
                     stride_o,
                     stride_o,
                     d_v,
-                    ctx.stream.cu_stream(),
                 )
-                .result()
                 .map_err(|e| anyhow!("DSv4 FlashMLA sparse decode failed: {e}"))?;
             }
             Ok(())
@@ -2812,18 +2780,16 @@ fn flashmla_decode_attention(
         let (full_out_ptr, full_out_guard) = scratch.tp_full_out.device_ptr(&ctx.stream);
         {
             crate::profile::profile_op(ctx, "flashmla_out_slice", None, 1, || {
-                // SAFETY: ptrs from live device allocations sized to the dims passed.
-                unsafe {
-                    ffi::dsv4_tp_out_slice_cuda(
-                        full_out_ptr as *const ffi::Half,
-                        out_ptr as *mut ffi::Half,
+                {
+                    flash_kv::dsv4_tp_out_slice_raw(
+                        &ctx.stream,
+                        full_out_ptr,
+                        out_ptr,
                         1,
                         (global_heads * out_head_dim) as i32,
                         (local_heads * out_head_dim) as i32,
                         (tp_rank * local_heads * out_head_dim) as i32,
-                        ctx.stream.cu_stream(),
                     )
-                    .result()
                     .map_err(|e| anyhow!("DSv4 FlashMLA TP out slice failed: {e}"))?;
                 }
                 Ok(())
@@ -2838,23 +2804,21 @@ fn flashmla_decode_attention(
     // ponytail: pod-verify V32 skips output inverse-RoPE (512 latent is pure NoPE)
     if !is_v32 {
         crate::profile::profile_op(ctx, "flashmla_inverse_rope", None, 1, || {
-            // SAFETY: ptrs from live device allocations sized to the dims passed.
-            unsafe {
-                ffi::arle_dsv4_output_inverse_rope_start_pos_ptr_cuda(
-                    out_ptr as *mut ffi::Half,
+            {
+                flash_kv::dsv4_output_inverse_rope_start_pos_ptr_raw(
+                    &ctx.stream,
+                    out_ptr,
                     1,
                     local_heads as i32,
                     config.head_dim as i32,
                     config.qk_rope_head_dim as i32,
-                    start_ptr as *const i32,
+                    start_ptr,
                     rope.base,
                     rope.original_seq_len,
                     rope.factor,
                     rope.beta_fast,
                     rope.beta_slow,
-                    ctx.stream.cu_stream(),
                 )
-                .result()
                 .map_err(|e| anyhow!("DSv4 FlashMLA output inverse-rope failed: {e}"))?;
             }
             Ok(())
@@ -3026,22 +2990,21 @@ pub(crate) fn flashmla_decode_finish_row(
         crate::profile::profile_op(ctx, "flashmla_inverse_rope_batched", None, 1, || {
             // SAFETY: identical args to the single-row inverse-rope; out is one
             // local-head row (token_count=1), start_pos_device is this row's pos.
-            unsafe {
-                ffi::arle_dsv4_output_inverse_rope_start_pos_ptr_cuda(
-                    out_ptr as *mut ffi::Half,
+            {
+                flash_kv::dsv4_output_inverse_rope_start_pos_ptr_raw(
+                    &ctx.stream,
+                    out_ptr,
                     1,
                     local_heads as i32,
                     config.head_dim as i32,
                     config.qk_rope_head_dim as i32,
-                    start_ptr as *const i32,
+                    start_ptr,
                     rope.base,
                     rope.original_seq_len,
                     rope.factor,
                     rope.beta_fast,
                     rope.beta_slow,
-                    ctx.stream.cu_stream(),
                 )
-                .result()
                 .map_err(|e| anyhow!("DSv4 batched FlashMLA output inverse-rope failed: {e}"))?;
             }
             Ok(())
@@ -3073,22 +3036,21 @@ pub(crate) fn flashmla_decode_inverse_rope_batched(
         let (start_ptr, sg) = start_pos.device_ptr(&ctx.stream);
         // SAFETY: out_ptrs holds N valid `[local_width,1]` device pointers; start_pos
         // is `[N]`; the kernel grids N*local_heads blocks and indexes both per row.
-        unsafe {
-            ffi::arle_dsv4_output_inverse_rope_batched_ptr_cuda(
-                out_ptr as *const *mut ffi::Half,
+        {
+            flash_kv::dsv4_output_inverse_rope_batched_ptr_raw(
+                &ctx.stream,
+                out_ptr,
                 n as i32,
                 local_heads as i32,
                 config.head_dim as i32,
                 config.qk_rope_head_dim as i32,
-                start_ptr as *const i32,
+                start_ptr,
                 rope.base,
                 rope.original_seq_len,
                 rope.factor,
                 rope.beta_fast,
                 rope.beta_slow,
-                ctx.stream.cu_stream(),
             )
-            .result()
             .map_err(|e| anyhow!("DSv4 batched FlashMLA output inverse-rope (ptr) failed: {e}"))?;
         }
         drop(og);
@@ -3116,17 +3078,16 @@ pub(crate) fn flashmla_decode_sw_window_batched(
         let (start_ptr, sg) = start_pos.device_ptr(&ctx.stream);
         // SAFETY: k_ptrs/cache_ptrs hold N valid device pointers; start_pos is `[N]`;
         // the kernel grids N*head_dim threads and indexes per row.
-        unsafe {
-            ffi::dsv4_update_window_cache_batched_ptr_cuda(
-                k_ptr as *const *const ffi::Half,
-                cache_ptr as *const *mut ffi::Half,
+        {
+            flash_kv::dsv4_update_window_cache_batched_ptr_raw(
+                &ctx.stream,
+                k_ptr,
+                cache_ptr,
                 n as i32,
-                start_ptr as *const i32,
+                start_ptr,
                 config.sliding_window as i32,
                 config.head_dim as i32,
-                ctx.stream.cu_stream(),
             )
-            .result()
             .map_err(|e| anyhow!("DSv4 batched FlashMLA SW window write (ptr) failed: {e}"))?;
         }
         drop(kg);
@@ -3930,27 +3891,25 @@ pub(crate) fn mla_attention_decode(
         let (k_out_ptr, _ko) = scratch.k_prepared.data.device_ptr_mut(&ctx.stream);
         let start_pos_device = pos.device.expect("checked above");
         let (start_ptr, _sg) = start_pos_device.device_ptr(&ctx.stream);
-        // SAFETY: ptrs from live device allocations sized to the dims passed.
-        unsafe {
-            ffi::dsv4_prepare_qk_start_pos_ptr_cuda(
-                q_raw_ptr as *const ffi::Half,
-                k_raw_ptr as *const ffi::Half,
-                q_out_ptr as *mut ffi::Half,
-                k_out_ptr as *mut ffi::Half,
+        {
+            flash_kv::dsv4_prepare_qk_start_pos_ptr_raw(
+                &ctx.stream,
+                q_raw_ptr,
+                k_raw_ptr,
+                q_out_ptr,
+                k_out_ptr,
                 1,
                 local_heads as i32,
                 head_dim as i32,
                 config.qk_rope_head_dim as i32,
-                start_ptr as *const i32,
+                start_ptr,
                 config.rms_norm_eps,
                 rope.base,
                 rope.original_seq_len,
                 rope.factor,
                 rope.beta_fast,
                 rope.beta_slow,
-                ctx.stream.cu_stream(),
-            )
-            .result()?;
+            )?;
         }
     }
 
@@ -4582,55 +4541,54 @@ pub(crate) fn mla_attention_prepare(
         let (q_out_ptr, _qo) = q_prepared.data.device_ptr_mut(&ctx.stream);
         let (k_out_ptr, _ko) = k_prepared.data.device_ptr_mut(&ctx.stream);
         // SAFETY: all buffers valid on ctx.stream; head/dim args checked above.
-        unsafe {
+        {
             if let Some(meta) = chain_verify {
                 let (start_ptr, _sg) = meta.positions.device_ptr(&ctx.stream);
-                ffi::dsv4_prepare_qk_fused_batch_start_pos_cuda(
-                    q_raw_ptr as *const ffi::Half,
-                    k_raw_ptr as *const ffi::Half,
-                    q_out_ptr as *mut ffi::Half,
-                    k_out_ptr as *mut ffi::Half,
+                flash_kv::dsv4_prepare_qk_fused_batch_start_pos_raw(
+                    &ctx.stream,
+                    q_raw_ptr,
+                    k_raw_ptr,
+                    q_out_ptr,
+                    k_out_ptr,
                     token_count as i32,
                     local_heads as i32,
                     head_dim as i32,
                     config.qk_rope_head_dim as i32,
-                    start_ptr as *const i32,
+                    start_ptr,
                     config.rms_norm_eps,
                     rope.base,
                     rope.original_seq_len,
                     rope.factor,
                     rope.beta_fast,
                     rope.beta_slow,
-                    ctx.stream.cu_stream(),
-                )
-                .result()?;
+                )?;
             } else if let Some(start_pos_device) = pos.device {
                 let (start_ptr, _sg) = start_pos_device.device_ptr(&ctx.stream);
-                ffi::dsv4_prepare_qk_start_pos_ptr_cuda(
-                    q_raw_ptr as *const ffi::Half,
-                    k_raw_ptr as *const ffi::Half,
-                    q_out_ptr as *mut ffi::Half,
-                    k_out_ptr as *mut ffi::Half,
+                flash_kv::dsv4_prepare_qk_start_pos_ptr_raw(
+                    &ctx.stream,
+                    q_raw_ptr,
+                    k_raw_ptr,
+                    q_out_ptr,
+                    k_out_ptr,
                     token_count as i32,
                     local_heads as i32,
                     head_dim as i32,
                     config.qk_rope_head_dim as i32,
-                    start_ptr as *const i32,
+                    start_ptr,
                     config.rms_norm_eps,
                     rope.base,
                     rope.original_seq_len,
                     rope.factor,
                     rope.beta_fast,
                     rope.beta_slow,
-                    ctx.stream.cu_stream(),
-                )
-                .result()?;
+                )?;
             } else {
-                ffi::dsv4_prepare_qk_cuda(
-                    q_raw_ptr as *const ffi::Half,
-                    k_raw_ptr as *const ffi::Half,
-                    q_out_ptr as *mut ffi::Half,
-                    k_out_ptr as *mut ffi::Half,
+                flash_kv::dsv4_prepare_qk_raw(
+                    &ctx.stream,
+                    q_raw_ptr,
+                    k_raw_ptr,
+                    q_out_ptr,
+                    k_out_ptr,
                     token_count as i32,
                     local_heads as i32,
                     head_dim as i32,
@@ -4642,9 +4600,7 @@ pub(crate) fn mla_attention_prepare(
                     rope.factor,
                     rope.beta_fast,
                     rope.beta_slow,
-                    ctx.stream.cu_stream(),
-                )
-                .result()?;
+                )?;
             }
         }
     }
@@ -5003,26 +4959,25 @@ pub(crate) fn mla_attention_prepare_proj_batch(
         let (pos_ptr, _pg) = positions.device_ptr(&ctx.stream);
         // SAFETY: all buffers valid on ctx.stream; positions is [N] i32; shapes
         // checked above.
-        unsafe {
-            ffi::dsv4_prepare_qk_fused_batch_start_pos_cuda(
-                q_raw_ptr as *const ffi::Half,
-                k_raw_ptr as *const ffi::Half,
-                q_out_ptr as *mut ffi::Half,
-                k_out_ptr as *mut ffi::Half,
+        {
+            flash_kv::dsv4_prepare_qk_fused_batch_start_pos_raw(
+                &ctx.stream,
+                q_raw_ptr,
+                k_raw_ptr,
+                q_out_ptr,
+                k_out_ptr,
                 n as i32,
                 local_heads as i32,
                 head_dim as i32,
                 config.qk_rope_head_dim as i32,
-                pos_ptr as *const i32,
+                pos_ptr,
                 config.rms_norm_eps,
                 rope.base,
                 rope.original_seq_len,
                 rope.factor,
                 rope.beta_fast,
                 rope.beta_slow,
-                ctx.stream.cu_stream(),
-            )
-            .result()?;
+            )?;
         }
     }
     keepalive.keep_hidden(&q_prepared);
@@ -5595,18 +5550,16 @@ fn dsv4_wo_a_grouped_linear(
         let (dst_ptr, _dg) = latent.data.device_ptr_mut(&ctx.stream);
         let stream = ctx.stream.cu_stream();
         for group in 0..shape.groups {
-            // SAFETY: ptrs from live device allocations sized to the dims passed.
-            unsafe {
-                ffi::dsv4_oproj_group_gather_cuda(
-                    src_ptr as *const ffi::Half,
-                    in_ptr as *mut ffi::Half,
+            {
+                flash_kv::dsv4_oproj_group_gather_raw(
+                    &ctx.stream,
+                    src_ptr,
+                    in_ptr,
                     i32::try_from(seq)?,
                     i32::try_from(shape.groups)?,
                     i32::try_from(cols)?,
                     i32::try_from(group)?,
-                    stream,
                 )
-                .result()
                 .map_err(|e| anyhow!("DSv4 dense grouped O-LoRA gather failed: {e}"))?;
             }
             // SAFETY: group `g`'s weight block is contiguous rows
@@ -5627,18 +5580,16 @@ fn dsv4_wo_a_grouped_linear(
                 .result()
                 .map_err(|e| anyhow!("DSv4 dense grouped O-LoRA gemm failed: {e}"))?;
             }
-            // SAFETY: ptrs from live device allocations sized to the dims passed.
-            unsafe {
-                ffi::dsv4_oproj_group_scatter_cuda(
-                    out_ptr as *const ffi::Half,
-                    dst_ptr as *mut ffi::Half,
+            {
+                flash_kv::dsv4_oproj_group_scatter_raw(
+                    &ctx.stream,
+                    out_ptr,
+                    dst_ptr,
                     i32::try_from(seq)?,
                     i32::try_from(shape.groups)?,
                     i32::try_from(rows)?,
                     i32::try_from(group)?,
-                    stream,
                 )
-                .result()
                 .map_err(|e| anyhow!("DSv4 dense grouped O-LoRA scatter failed: {e}"))?;
             }
         }
@@ -5767,18 +5718,16 @@ fn dsv4_oproj_group_gather(
     );
     let (src_ptr, _src_guard) = src.data.device_ptr(&ctx.stream);
     let (dst_ptr, _dst_guard) = scratch.oproj_group_in.device_ptr_mut(&ctx.stream);
-    // SAFETY: ptrs from live device allocations sized to the dims passed.
-    unsafe {
-        ffi::dsv4_oproj_group_gather_cuda(
-            src_ptr as *const ffi::Half,
-            dst_ptr as *mut ffi::Half,
+    {
+        flash_kv::dsv4_oproj_group_gather_raw(
+            &ctx.stream,
+            src_ptr,
+            dst_ptr,
             i32::try_from(src.seq_len)?,
             i32::try_from(shape.groups)?,
             i32::try_from(shape.cols_per_group)?,
             i32::try_from(group)?,
-            ctx.stream.cu_stream(),
         )
-        .result()
         .map_err(|e| anyhow!("DSv4 grouped O-LoRA gather failed: {e}"))?;
     }
     Ok(())
@@ -5807,18 +5756,16 @@ fn dsv4_oproj_group_scatter(
     );
     let (src_ptr, _src_guard) = scratch.oproj_group_out.device_ptr(&ctx.stream);
     let (dst_ptr, _dst_guard) = dst.data.device_ptr_mut(&ctx.stream);
-    // SAFETY: ptrs from live device allocations sized to the dims passed.
-    unsafe {
-        ffi::dsv4_oproj_group_scatter_cuda(
-            src_ptr as *const ffi::Half,
-            dst_ptr as *mut ffi::Half,
+    {
+        flash_kv::dsv4_oproj_group_scatter_raw(
+            &ctx.stream,
+            src_ptr,
+            dst_ptr,
             i32::try_from(dst.seq_len)?,
             i32::try_from(shape.groups)?,
             i32::try_from(shape.rows_per_group)?,
             i32::try_from(group)?,
-            ctx.stream.cu_stream(),
         )
-        .result()
         .map_err(|e| anyhow!("DSv4 grouped O-LoRA scatter failed: {e}"))?;
     }
     Ok(())
@@ -5862,18 +5809,16 @@ fn dsv4_wo_a_grouped_deepgemm_decode(
         {
             let (src_ptr, _src_guard) = local_attn.data.device_ptr(&ctx.stream);
             let (in_ptr, _in_guard) = in_g.data.device_ptr_mut(&ctx.stream);
-            // SAFETY: ptrs from live device allocations sized to the dims passed.
-            unsafe {
-                ffi::dsv4_oproj_group_gather_cuda(
-                    src_ptr as *const ffi::Half,
-                    in_ptr as *mut ffi::Half,
+            {
+                flash_kv::dsv4_oproj_group_gather_raw(
+                    &ctx.stream,
+                    src_ptr,
+                    in_ptr,
                     i32::try_from(n)?,
                     i32::try_from(shape.groups)?,
                     i32::try_from(cols)?,
                     i32::try_from(group)?,
-                    ctx.stream.cu_stream(),
                 )
-                .result()
                 .map_err(|e| anyhow!("DSv4 grouped O-LoRA decode gather failed: {e}"))?;
             }
         }
@@ -5892,18 +5837,16 @@ fn dsv4_wo_a_grouped_deepgemm_decode(
         {
             let (out_ptr, _out_guard) = out_g.data.device_ptr(&ctx.stream);
             let (dst_ptr, _dst_guard) = latent.data.device_ptr_mut(&ctx.stream);
-            // SAFETY: ptrs from live device allocations sized to the dims passed.
-            unsafe {
-                ffi::dsv4_oproj_group_scatter_cuda(
-                    out_ptr as *const ffi::Half,
-                    dst_ptr as *mut ffi::Half,
+            {
+                flash_kv::dsv4_oproj_group_scatter_raw(
+                    &ctx.stream,
+                    out_ptr,
+                    dst_ptr,
                     i32::try_from(n)?,
                     i32::try_from(shape.groups)?,
                     i32::try_from(rows)?,
                     i32::try_from(group)?,
-                    ctx.stream.cu_stream(),
                 )
-                .result()
                 .map_err(|e| anyhow!("DSv4 grouped O-LoRA decode scatter failed: {e}"))?;
             }
         }
@@ -6446,21 +6389,20 @@ fn compressor_fp32_probe(
             let (prsc, _f3) = state.fp32_prev_score.device_ptr_mut(&ctx.stream);
             // SAFETY: bf16/f32 carry buffers are allocated with identical element
             // counts (`Dsv4CompressorState::new`).
-            unsafe {
-                ffi::dsv4_compressor_fp32_carry_reseed_cuda(
-                    pkv_b as *const ffi::Half,
-                    psc_b as *const ffi::Half,
-                    prkv_b as *const ffi::Half,
-                    prsc_b as *const ffi::Half,
-                    pkv as *mut f32,
-                    psc as *mut f32,
-                    prkv as *mut f32,
-                    prsc as *mut f32,
+            {
+                flash_kv::dsv4_compressor_fp32_carry_reseed_raw(
+                    &ctx.stream,
+                    pkv_b,
+                    psc_b,
+                    prkv_b,
+                    prsc_b,
+                    pkv,
+                    psc,
+                    prkv,
+                    prsc,
                     pending_elems,
                     prev_elems,
-                    ctx.stream.cu_stream(),
-                )
-                .result()?;
+                )?;
             }
             state.fp32_carry_stale = false;
         }
@@ -6529,21 +6471,22 @@ fn compressor_fp32_probe(
             let (psc_bf16, _p7) = state.pending_score.device_ptr_mut(&ctx.stream);
             let (compressed, _cg) = state.compressed.data.device_ptr_mut(&ctx.stream);
             // SAFETY: all buffers match the checked ratio, width, and token count.
-            unsafe {
-                ffi::dsv4_compressor_fp32_prefill_probe_cuda(
-                    kv as *const f32,
-                    score as *const f32,
-                    ape as *const f32,
-                    norm as *const ffi::Half,
-                    pkv as *mut f32,
-                    psc as *mut f32,
-                    prkv as *mut f32,
-                    prsc as *mut f32,
-                    prkv_bf16 as *mut ffi::Half,
-                    prsc_bf16 as *mut ffi::Half,
-                    pkv_bf16 as *mut ffi::Half,
-                    psc_bf16 as *mut ffi::Half,
-                    compressed as *mut ffi::Half,
+            {
+                flash_kv::dsv4_compressor_fp32_prefill_probe_raw(
+                    &ctx.stream,
+                    kv,
+                    score,
+                    ape,
+                    norm,
+                    pkv,
+                    psc,
+                    prkv,
+                    prsc,
+                    prkv_bf16,
+                    prsc_bf16,
+                    pkv_bf16,
+                    psc_bf16,
+                    compressed,
                     token_count as i32,
                     start_pos_i32,
                     pending_len_i32,
@@ -6561,9 +6504,7 @@ fn compressor_fp32_probe(
                     rope.factor,
                     rope.beta_fast,
                     rope.beta_slow,
-                    ctx.stream.cu_stream(),
-                )
-                .result()?;
+                )?;
             }
         }
         state.compressed.seq_len = compressed_rows;
@@ -6753,22 +6694,22 @@ fn compressor_forward(
         // SAFETY: all buffers valid on ctx.stream; state carries the pending and
         // overlap rows from previous contiguous appends.
         if !dsv4_verify_frozen() {
-            // SAFETY: ptrs from live device allocations sized to the dims passed.
-            unsafe {
+            {
                 if let Some(start_pos_device) = pos.device {
                     let (start_ptr, _spg) = start_pos_device.device_ptr(&ctx.stream);
-                    ffi::dsv4_compressor_update_start_pos_ptr_cuda(
-                        kv_ptr as *const ffi::Half,
-                        score_ptr as *const ffi::Half,
-                        ape_ptr as *const ffi::Half,
-                        norm_ptr as *const ffi::Half,
-                        pkv_ptr as *mut ffi::Half,
-                        psc_ptr as *mut ffi::Half,
-                        prkv_ptr as *mut ffi::Half,
-                        prsc_ptr as *mut ffi::Half,
-                        comp_ptr as *mut ffi::Half,
+                    flash_kv::dsv4_compressor_update_start_pos_ptr_raw(
+                        &ctx.stream,
+                        kv_ptr,
+                        score_ptr,
+                        ape_ptr,
+                        norm_ptr,
+                        pkv_ptr,
+                        psc_ptr,
+                        prkv_ptr,
+                        prsc_ptr,
+                        comp_ptr,
                         token_count as i32,
-                        start_ptr as *const i32,
+                        start_ptr,
                         head_dim as i32,
                         ratio as i32,
                         width as i32,
@@ -6781,20 +6722,19 @@ fn compressor_forward(
                         rope.factor,
                         rope.beta_fast,
                         rope.beta_slow,
-                        ctx.stream.cu_stream(),
-                    )
-                    .result()?;
+                    )?;
                 } else {
-                    ffi::dsv4_compressor_update_cuda(
-                        kv_ptr as *const ffi::Half,
-                        score_ptr as *const ffi::Half,
-                        ape_ptr as *const ffi::Half,
-                        norm_ptr as *const ffi::Half,
-                        pkv_ptr as *mut ffi::Half,
-                        psc_ptr as *mut ffi::Half,
-                        prkv_ptr as *mut ffi::Half,
-                        prsc_ptr as *mut ffi::Half,
-                        comp_ptr as *mut ffi::Half,
+                    flash_kv::dsv4_compressor_update_raw(
+                        &ctx.stream,
+                        kv_ptr,
+                        score_ptr,
+                        ape_ptr,
+                        norm_ptr,
+                        pkv_ptr,
+                        psc_ptr,
+                        prkv_ptr,
+                        prsc_ptr,
+                        comp_ptr,
                         token_count as i32,
                         start_pos_i32,
                         pending_len_i32,
@@ -6812,9 +6752,7 @@ fn compressor_forward(
                         rope.factor,
                         rope.beta_fast,
                         rope.beta_slow,
-                        ctx.stream.cu_stream(),
-                    )
-                    .result()?;
+                    )?;
                 }
             }
         }
@@ -7266,32 +7204,29 @@ pub(crate) fn dsv4_dsa_cache_write_batched(
         // src/dst offsets + counts mirror the per-row block (a) exactly. The
         // hadamard writes rotated_keys at (dst_row+r); the fused-store reads the
         // PRE-OFFSET `rotated_src` base (= rotated + dst_row*ihd) at row r-from-0.
-        unsafe {
-            ffi::dsv4_dsa_hadamard128_batched_cuda(
-                keys_src_a as *const *const ffi::Half,
-                src_ring_row_a as *const i32,
-                rotated_dst_a as *const *mut ffi::Half,
-                dst_row_a as *const i32,
-                newly_packed_a as *const i32,
+        {
+            flash_kv::dsv4_dsa_hadamard128_batched_raw(
+                &ctx.stream,
+                keys_src_a,
+                src_ring_row_a,
+                rotated_dst_a,
+                dst_row_a,
+                newly_packed_a,
                 n as i32,
                 max_rows,
-                ctx.stream.cu_stream(),
-            )
-            .result()?;
+            )?;
         }
-        // SAFETY: ptrs from live device allocations sized to the dims passed.
-        unsafe {
-            ffi::dsv4_dsa_fused_store_index_k_cache_batched_cuda(
-                rotated_src_a as *const *const ffi::Half,
-                cache_band_a as *const *mut u8,
-                cache_locs_a as *const *const i64,
-                newly_packed_a as *const i32,
+        {
+            flash_kv::dsv4_dsa_fused_store_index_k_cache_batched_raw(
+                &ctx.stream,
+                rotated_src_a,
+                cache_band_a,
+                cache_locs_a,
+                newly_packed_a,
                 n as i32,
                 max_rows,
                 64,
-                ctx.stream.cu_stream(),
-            )
-            .result()?;
+            )?;
         }
         drop(g0);
         drop(g1);
@@ -7391,20 +7326,21 @@ pub(crate) fn dsv4_compressor_update_batched(
         let (start_ptr, spg) = start_pos.device_ptr(&ctx.stream);
         // SAFETY: all buffers valid on ctx.stream; the pointer arrays hold n valid
         // per-row device pointers; kv/score are [width,n]; dims match the per-row path.
-        unsafe {
-            ffi::dsv4_compressor_update_batched_start_pos_ptr_cuda(
-                kv_ptr as *const ffi::Half,
-                score_ptr as *const ffi::Half,
-                ape_ptr as *const ffi::Half,
-                norm_ptr as *const ffi::Half,
-                pkv_a as *const *mut ffi::Half,
-                psc_a as *const *mut ffi::Half,
-                prkv_a as *const *mut ffi::Half,
-                prsc_a as *const *mut ffi::Half,
-                comp_a as *const *mut ffi::Half,
+        {
+            flash_kv::dsv4_compressor_update_batched_start_pos_ptr_raw(
+                &ctx.stream,
+                kv_ptr,
+                score_ptr,
+                ape_ptr,
+                norm_ptr,
+                pkv_a,
+                psc_a,
+                prkv_a,
+                prsc_a,
+                comp_a,
                 n as i32,
                 1, // num_tokens per row (decode)
-                start_ptr as *const i32,
+                start_ptr,
                 head_dim as i32,
                 ratio as i32,
                 width as i32,
@@ -7417,9 +7353,7 @@ pub(crate) fn dsv4_compressor_update_batched(
                 rope.factor,
                 rope.beta_fast,
                 rope.beta_slow,
-                ctx.stream.cu_stream(),
-            )
-            .result()?;
+            )?;
         }
         drop(kg);
         drop(scg);
@@ -7962,15 +7896,13 @@ fn csa_select_official(
                 .slice_mut(dst_offset..dst_offset + newly_packed * ihd);
             let (src_ptr, _sg) = src.device_ptr(&ctx.stream);
             let (rot_ptr, _rg) = rotated.device_ptr_mut(&ctx.stream);
-            // SAFETY: ptrs from live device allocations sized to the dims passed.
-            unsafe {
-                ffi::dsv4_dsa_hadamard128_bf16_cuda(
-                    src_ptr as *const ffi::Half,
-                    rot_ptr as *mut ffi::Half,
+            {
+                flash_kv::dsv4_dsa_hadamard128_bf16_raw(
+                    &ctx.stream,
+                    src_ptr,
+                    rot_ptr,
                     i32::try_from(newly_packed)?,
-                    ctx.stream.cu_stream(),
-                )
-                .result()?;
+                )?;
             }
         }
         let locs = shared
@@ -7996,17 +7928,15 @@ fn csa_select_official(
             let mut cache_view = cache_pool.slice_mut(cache_range);
             let (cache_ptr_u8, _cg) = cache_view.device_ptr_mut(&ctx.stream);
             let (locs_ptr, _lg) = locs.device_ptr(&ctx.stream);
-            // SAFETY: ptrs from live device allocations sized to the dims passed.
-            unsafe {
-                ffi::dsv4_dsa_fused_store_index_k_cache_cuda(
-                    rot_store_ptr as *const ffi::Half,
-                    cache_ptr_u8 as *mut u8,
-                    locs_ptr as *const i64,
+            {
+                flash_kv::dsv4_dsa_fused_store_index_k_cache_raw(
+                    &ctx.stream,
+                    rot_store_ptr,
+                    cache_ptr_u8,
+                    locs_ptr,
                     i32::try_from(newly_packed)?,
                     64,
-                    ctx.stream.cu_stream(),
-                )
-                .result()?;
+                )?;
             }
         }
         official.packed_rows = indexer_rows_after;
@@ -8093,20 +8023,17 @@ fn csa_select_official(
                     let (lens_ptr, _lg) = context_lens.device_ptr_mut(&ctx.stream);
                     let (positions_ptr, _pg) = positions.device_ptr_mut(&ctx.stream);
                     let (start_ptr, _sg) = start_pos_device.device_ptr(&ctx.stream);
-                    // SAFETY: ptrs from live device allocations sized to the dims
-                    // passed.
-                    unsafe {
-                        ffi::dsv4_dsa_fill_context_lens_positions_start_pos_cuda(
-                            lens_ptr as *mut i32,
-                            positions_ptr as *mut i32,
-                            start_ptr as *const i32,
+                    {
+                        flash_kv::dsv4_dsa_fill_context_lens_positions_start_pos_raw(
+                            &ctx.stream,
+                            lens_ptr,
+                            positions_ptr,
+                            start_ptr,
                             i32::try_from(t0)?,
                             i32::try_from(tlen)?,
                             i32::try_from(key_count)?,
                             i32::try_from(ratio)?,
-                            ctx.stream.cu_stream(),
                         )
-                        .result()
                         .map_err(|e| anyhow!("DSv4 official DSA GPU metadata fill failed: {e}"))?;
                     }
                 } else {
@@ -8139,21 +8066,19 @@ fn csa_select_official(
                 let (freqs_ptr, _fg) = shared.freqs_cis.device_ptr(&ctx.stream);
                 let positions = shared.positions.slice(0..tlen);
                 let (positions_ptr, _pg) = positions.device_ptr(&ctx.stream);
-                // SAFETY: ptrs from live device allocations sized to the dims passed.
-                unsafe {
-                    ffi::dsv4_dsa_fused_q_indexer_rope_hadamard_quant_cuda(
-                        q_ptr as *const ffi::Half,
-                        q_fp8_ptr as *mut u8,
-                        w_ptr as *const ffi::Half,
-                        weights_out_ptr as *mut f32,
+                {
+                    flash_kv::dsv4_dsa_fused_q_indexer_rope_hadamard_quant_raw(
+                        &ctx.stream,
+                        q_ptr,
+                        q_fp8_ptr,
+                        w_ptr,
+                        weights_out_ptr,
                         score_scale,
-                        freqs_ptr as *const f32,
-                        positions_ptr as *const i32,
+                        freqs_ptr,
+                        positions_ptr,
                         i32::try_from(tlen)?,
                         i32::try_from(local_index_heads)?,
-                        ctx.stream.cu_stream(),
-                    )
-                    .result()?;
+                    )?;
                 }
             }
 
@@ -8238,23 +8163,21 @@ fn csa_select_official(
                     .raw_indices
                     .slice_mut(t0 * config.index_topk..(t0 + tlen) * config.index_topk);
                 let (raw_ptr, _rig) = raw.device_ptr_mut(&ctx.stream);
-                // SAFETY: ptrs from live device allocations sized to the dims passed.
-                unsafe {
-                    ffi::dsv4_deepseek_v4_topk_transform_cuda(
-                        logits_ptr as *const f32,
-                        lens_ptr as *const i32,
-                        page_ptr as *const i32,
-                        sel_ptr as *mut i32,
-                        raw_ptr as *mut i32,
+                {
+                    flash_kv::dsv4_deepseek_v4_topk_transform_raw(
+                        &ctx.stream,
+                        logits_ptr,
+                        lens_ptr,
+                        page_ptr,
+                        sel_ptr,
+                        raw_ptr,
                         i64::try_from(shared.logits_stride)?,
                         i64::try_from(shared.num_pages)?,
                         i64::try_from(config.index_topk)?,
                         i32::try_from(tlen)?,
                         i32::try_from(config.index_topk)?,
                         64,
-                        ctx.stream.cu_stream(),
-                    )
-                    .result()?;
+                    )?;
                 }
             }
 
@@ -8393,21 +8316,19 @@ pub(crate) fn csa_select_official_batched(
         let (freqs_ptr, _fg) = shared.freqs_cis.device_ptr(&ctx.stream);
         let positions = shared.positions_batch.slice(0..n);
         let (positions_ptr, _pg) = positions.device_ptr(&ctx.stream);
-        // SAFETY: ptrs from live device allocations sized to the dims passed.
-        unsafe {
-            ffi::dsv4_dsa_fused_q_indexer_rope_hadamard_quant_cuda(
-                q_ptr as *const ffi::Half,
-                q_fp8_ptr as *mut u8,
-                w_ptr as *const ffi::Half,
-                weights_out_ptr as *mut f32,
+        {
+            flash_kv::dsv4_dsa_fused_q_indexer_rope_hadamard_quant_raw(
+                &ctx.stream,
+                q_ptr,
+                q_fp8_ptr,
+                w_ptr,
+                weights_out_ptr,
                 score_scale,
-                freqs_ptr as *const f32,
-                positions_ptr as *const i32,
+                freqs_ptr,
+                positions_ptr,
                 i32::try_from(n)?,
                 i32::try_from(local_index_heads)?,
-                ctx.stream.cu_stream(),
-            )
-            .result()?;
+            )?;
         }
     }
 
@@ -8491,23 +8412,21 @@ pub(crate) fn csa_select_official_batched(
         let (sel_ptr, _seg) = sel.device_ptr_mut(&ctx.stream);
         let mut raw = shared.raw_indices_batch.slice_mut(0..n * config.index_topk);
         let (raw_ptr, _rig) = raw.device_ptr_mut(&ctx.stream);
-        // SAFETY: ptrs from live device allocations sized to the dims passed.
-        unsafe {
-            ffi::dsv4_deepseek_v4_topk_transform_cuda(
-                logits_ptr as *const f32,
-                lens_ptr as *const i32,
-                page_ptr as *const i32,
-                sel_ptr as *mut i32,
-                raw_ptr as *mut i32,
+        {
+            flash_kv::dsv4_deepseek_v4_topk_transform_raw(
+                &ctx.stream,
+                logits_ptr,
+                lens_ptr,
+                page_ptr,
+                sel_ptr,
+                raw_ptr,
                 i64::try_from(shared.logits_stride)?,
                 i64::try_from(num_pages)?,
                 i64::try_from(config.index_topk)?,
                 i32::try_from(n)?,
                 i32::try_from(config.index_topk)?,
                 64,
-                ctx.stream.cu_stream(),
-            )
-            .result()?;
+            )?;
         }
     }
 

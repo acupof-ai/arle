@@ -153,22 +153,13 @@ impl Dsv4FlashMlaDecodeState {
             .checked_mul(pool.flashmla_page_bytes)
             .ok_or_else(|| anyhow!("DSv4 FlashMLA slot band byte length overflow"))?;
 
-        let mut num_sm_parts = 0_i32;
-        let mut fixed_overhead_num_blocks = 0_i32;
-        let mut block_size_topk = 0_i32;
-        // SAFETY: ptrs from live device allocations sized to the dims passed.
-        unsafe {
-            ffi::arle_flashmla_sm90_sparse_decode_get_meta(
+        let (num_sm_parts, fixed_overhead_num_blocks, block_size_topk) =
+            flash_kv::flashmla_sm90_sparse_decode_get_meta(
                 shape.h_q as i32,
                 DSV4_FLASHMLA_S_Q as i32,
                 DSV4_FLASHMLA_MODEL1,
-                &mut num_sm_parts,
-                &mut fixed_overhead_num_blocks,
-                &mut block_size_topk,
             )
-            .result()
             .map_err(|e| anyhow!("DSv4 FlashMLA decode meta failed: {e}"))?;
-        }
         let num_sm_parts_max = (num_sm_parts as usize).max(256);
 
         let mut state = Self {
@@ -207,23 +198,21 @@ impl Dsv4FlashMlaDecodeState {
         let (topk_ptr, _tg) = self.topk_length.device_ptr(&ctx.stream);
         let (sched_ptr, _sg) = self.sched_meta.device_ptr_mut(&ctx.stream);
         let (splits_ptr, _pg) = self.num_splits.device_ptr_mut(&ctx.stream);
-        // SAFETY: ptrs from live device allocations sized to the dims passed.
-        unsafe {
-            ffi::arle_flashmla_sm90_sparse_decode_sched_meta(
+        {
+            flash_kv::flashmla_sm90_sparse_decode_sched_meta_raw(
+                &ctx.stream,
                 1,
                 1,
                 self.block_size_topk,
                 self.fixed_overhead_num_blocks,
                 topk,
                 0,
-                topk_ptr as *const i32,
-                std::ptr::null(),
-                sched_ptr as *mut i32,
-                splits_ptr as *mut i32,
+                topk_ptr,
+                0,
+                sched_ptr,
+                splits_ptr,
                 self.num_sm_parts,
-                ctx.stream.cu_stream(),
             )
-            .result()
             .map_err(|e| anyhow!("DSv4 FlashMLA sched_meta failed: {e}"))?;
         }
         Ok(())
@@ -382,22 +371,13 @@ impl Dsv4FlashMlaDecodeScratch {
             .max()
             .unwrap_or(0);
         // num_sm_parts depends only on (h_q, s_q=1, model) — uniform across layers.
-        let mut num_sm_parts = 0_i32;
-        let mut fixed_overhead_num_blocks = 0_i32;
-        let mut block_size_topk = 0_i32;
-        // SAFETY: ptrs from live device allocations sized to the dims passed.
-        unsafe {
-            ffi::arle_flashmla_sm90_sparse_decode_get_meta(
+        let (num_sm_parts, _fixed_overhead_num_blocks, _block_size_topk) =
+            flash_kv::flashmla_sm90_sparse_decode_get_meta(
                 h_q as i32,
                 DSV4_FLASHMLA_S_Q as i32,
                 DSV4_FLASHMLA_MODEL1,
-                &mut num_sm_parts,
-                &mut fixed_overhead_num_blocks,
-                &mut block_size_topk,
             )
-            .result()
             .map_err(|e| anyhow!("DSv4 single-row FlashMLA scratch meta failed: {e}"))?;
-        }
         let num_sm_parts_max = (num_sm_parts as usize).max(256);
         let accum_rows = num_sm_parts_max + 1;
         Ok(Self {
@@ -530,22 +510,13 @@ impl Dsv4FlashMlaDecodeBatchScratch {
             .max()
             .unwrap_or(0);
         // Scheduler tuning meta depends only on (h_q, s_q=1, model).
-        let mut num_sm_parts = 0_i32;
-        let mut fixed_overhead_num_blocks = 0_i32;
-        let mut block_size_topk = 0_i32;
-        // SAFETY: ptrs from live device allocations sized to the dims passed.
-        unsafe {
-            ffi::arle_flashmla_sm90_sparse_decode_get_meta(
+        let (num_sm_parts, fixed_overhead_num_blocks, block_size_topk) =
+            flash_kv::flashmla_sm90_sparse_decode_get_meta(
                 h_q as i32,
                 DSV4_FLASHMLA_S_Q as i32,
                 model_type_int,
-                &mut num_sm_parts,
-                &mut fixed_overhead_num_blocks,
-                &mut block_size_topk,
             )
-            .result()
             .map_err(|e| anyhow!("DSv4 batched FlashMLA decode meta failed: {e}"))?;
-        }
         let num_sm_parts_max = (num_sm_parts as usize).max(256);
         // The shim's accum split dimension is `num_sm_parts + b`, not
         // `b * num_sm_parts` (arle_flashmla_decode_shim.cu:202-203).
@@ -873,23 +844,21 @@ impl Dsv4FlashMlaDecodeBatchScratch {
         let (topk_ptr, topk_guard) = self.topk_length.device_ptr(&ctx.stream);
         let (sched_ptr, sched_guard) = self.sched_meta.device_ptr_mut(&ctx.stream);
         let (splits_ptr, splits_guard) = self.num_splits.device_ptr_mut(&ctx.stream);
-        // SAFETY: ptrs from live device allocations sized to the dims passed.
-        unsafe {
-            ffi::arle_flashmla_sm90_sparse_decode_sched_meta(
+        {
+            flash_kv::flashmla_sm90_sparse_decode_sched_meta_raw(
+                &ctx.stream,
                 n as i32,
                 1,
                 self.block_size_topk,
                 self.fixed_overhead_num_blocks,
                 topk,
                 0,
-                topk_ptr as *const i32,
-                std::ptr::null(),
-                sched_ptr as *mut i32,
-                splits_ptr as *mut i32,
+                topk_ptr,
+                0,
+                sched_ptr,
+                splits_ptr,
                 self.num_sm_parts,
-                ctx.stream.cu_stream(),
             )
-            .result()
             .map_err(|e| anyhow!("DSv4 batched FlashMLA sched_meta failed: {e}"))?;
         }
         drop(topk_guard);
@@ -911,10 +880,10 @@ impl Dsv4FlashMlaDecodeBatchScratch {
         n: usize,
         config: &DeepSeekV4Config,
         shape: &Dsv4FlashMlaDecodeShape,
-        q_ptr: *const ffi::Half,
-        pool_ptr: *const ffi::Half,
-        sink_ptr: *const f32,
-        out_ptr: *mut ffi::Half,
+        q_ptr: u64,
+        pool_ptr: u64,
+        sink_ptr: u64,
+        out_ptr: u64,
         sm_scale: f32,
     ) -> Result<()> {
         ensure!(
@@ -941,20 +910,20 @@ impl Dsv4FlashMlaDecodeBatchScratch {
         let (lse_out_ptr, lse_guard) = self.lse_out.device_ptr_mut(&ctx.stream);
         let (lse_accum_ptr, lse_accum_guard) = self.lse_accum.device_ptr_mut(&ctx.stream);
         let (o_accum_ptr, o_accum_guard) = self.o_accum.device_ptr_mut(&ctx.stream);
-        // SAFETY: ptrs from live device allocations sized to the dims passed.
-        unsafe {
-            ffi::arle_flashmla_sm90_sparse_decode_fwd(
+        {
+            flash_kv::flashmla_sm90_sparse_decode_fwd_raw(
+                &ctx.stream,
                 q_ptr,
                 pool_ptr,
-                indices_ptr as *const i32,
-                topk_ptr as *const i32,
+                indices_ptr,
+                topk_ptr,
                 sink_ptr,
                 out_ptr,
-                lse_out_ptr as *mut f32,
-                lse_accum_ptr as *mut f32,
-                o_accum_ptr as *mut f32,
-                sched_ptr as *const i32,
-                splits_ptr as *const i32,
+                lse_out_ptr,
+                lse_accum_ptr,
+                o_accum_ptr,
+                sched_ptr,
+                splits_ptr,
                 n as i32,
                 1,
                 global_heads as i32,
@@ -986,9 +955,7 @@ impl Dsv4FlashMlaDecodeBatchScratch {
                 stride_o,   // stride_o_accum_split  = s_q*h_q*d_v
                 stride_o,   // stride_o_accum_s_q    = h_q*d_v
                 d_v,        // stride_o_accum_h_q = d_v
-                ctx.stream.cu_stream(),
             )
-            .result()
             .map_err(|e| anyhow!("DSv4 batched FlashMLA sparse decode failed: {e}"))?;
         }
         drop(indices_guard);
@@ -1066,17 +1033,16 @@ impl Dsv4FlashMlaDecodeBatchScratch {
                 crate::profile::profile_op(ctx, "flashmla_q_repack_batched", None, 1, || {
                     // SAFETY: repack tp_world×[local_heads,head_dim] gathered Q into
                     // one global-head row (s_q=1); both buffers valid on ctx.stream.
-                    unsafe {
-                        ffi::dsv4_tp_q_repack_cuda(
-                            gather_ptr as *const ffi::Half,
-                            dst_ptr as *mut ffi::Half,
+                    {
+                        flash_kv::dsv4_tp_q_repack_raw(
+                            &ctx.stream,
+                            gather_ptr,
+                            dst_ptr,
                             tp_world as i32,
                             1,
                             local_heads as i32,
                             config.head_dim as i32,
-                            ctx.stream.cu_stream(),
                         )
-                        .result()
                         .map_err(|e| anyhow!("DSv4 batched FlashMLA TP Q repack failed: {e}"))?;
                     }
                     Ok(())
@@ -1133,17 +1099,16 @@ impl Dsv4FlashMlaDecodeBatchScratch {
                 crate::profile::profile_op(ctx, "flashmla_out_slice_batched", None, 1, || {
                     // SAFETY: src is one global-head output row (h_q*d_v); dst this
                     // rank's local block. Same args as the single-row out-slice.
-                    unsafe {
-                        ffi::dsv4_tp_out_slice_cuda(
-                            src_ptr as *const ffi::Half,
-                            dst_ptr as *mut ffi::Half,
+                    {
+                        flash_kv::dsv4_tp_out_slice_raw(
+                            &ctx.stream,
+                            src_ptr,
+                            dst_ptr,
                             1,
                             self.h_q_d_v() as i32,
                             local_width as i32,
                             (tp_rank * local_width) as i32,
-                            ctx.stream.cu_stream(),
                         )
-                        .result()
                         .map_err(|e| anyhow!("DSv4 batched FlashMLA TP out slice failed: {e}"))?;
                     }
                     Ok(())
@@ -1195,17 +1160,16 @@ impl Dsv4FlashMlaDecodeBatchScratch {
                     // is
                     // n local rows (stride local_width); same per-row args as
                     // `slice_out_row`, with s_q=n so the kernel loops rows internally.
-                    unsafe {
-                        ffi::dsv4_tp_out_slice_cuda(
-                            src_ptr as *const ffi::Half,
-                            dst_ptr as *mut ffi::Half,
+                    {
+                        flash_kv::dsv4_tp_out_slice_raw(
+                            &ctx.stream,
+                            src_ptr,
+                            dst_ptr,
                             n as i32,
                             self.h_q_d_v() as i32,
                             local_width as i32,
                             (tp_rank * local_width) as i32,
-                            ctx.stream.cu_stream(),
                         )
-                        .result()
                         .map_err(|e| anyhow!("DSv4 batched FlashMLA TP out slice failed: {e}"))?;
                     }
                     Ok(())
@@ -1260,18 +1224,14 @@ impl Dsv4FlashMlaDecodeBatchScratch {
             .as_ref()
             .expect("DSv4 attn_sink_f32")
             .device_ptr(&ctx.stream);
-        let sink_ptr = sink_ptr as *const f32;
         drop(sink_guard);
         let (q_ptr, q_guard) = self.q_batched.device_ptr(&ctx.stream);
-        let q_ptr = q_ptr as *const ffi::Half;
         drop(q_guard);
         let (out_ptr, out_guard) = self.out_batched.device_ptr_mut(&ctx.stream);
-        let out_ptr = out_ptr as *mut ffi::Half;
         drop(out_guard);
         let pool_ptr = {
             let pool_buf = pool.flashmla_pool_data()?;
             let (pool_ptr, pool_guard) = pool_buf.device_ptr(&ctx.stream);
-            let pool_ptr = pool_ptr as *const ffi::Half;
             drop(pool_guard);
             pool_ptr
         };
