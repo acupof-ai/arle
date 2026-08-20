@@ -1,9 +1,9 @@
 use anyhow::{Result, anyhow, ensure};
-use cuda_kernels::ffi;
 use cuda_kernels::moe as cuda_moe;
 use cuda_kernels::prelude::{DeviceContext, DeviceMatrix};
+use cuda_kernels::quant_linear as cuda_ql;
 use cuda_kernels::tensor::{RawDevicePtr, WeightFormat, cache_ptr};
-use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
+use cudarc::driver::CudaSlice;
 use half::bf16;
 use std::cell::RefCell;
 use std::sync::OnceLock;
@@ -214,7 +214,7 @@ fn qwen_fp8_dense_route(
         .unwrap_or_else(|| qwen_fp8_dense_policy::fallback(m))
 }
 
-fn fp8_f32_scale_shape(weight: &DeviceMatrix) -> Result<(i32, i32, i32, i32)> {
+fn fp8_f32_scale_shape(weight: &DeviceMatrix) -> Result<cuda_ql::Fp8ScaleShape> {
     match weight.weight_format {
         WeightFormat::Fp8BlockScaled => {
             ensure!(
@@ -228,12 +228,12 @@ fn fp8_f32_scale_shape(weight: &DeviceMatrix) -> Result<(i32, i32, i32, i32)> {
                 weight.quant_block_m,
                 weight.quant_block_k
             );
-            Ok((
-                weight.quant_scale_rows as i32,
-                weight.quant_scale_cols as i32,
-                weight.quant_block_m as i32,
-                weight.quant_block_k as i32,
-            ))
+            Ok(cuda_ql::Fp8ScaleShape {
+                scale_rows: weight.quant_scale_rows as i32,
+                scale_cols: weight.quant_scale_cols as i32,
+                block_m: weight.quant_block_m as i32,
+                block_k: weight.quant_block_k as i32,
+            })
         }
         WeightFormat::Fp8PerShard => {
             ensure!(
@@ -242,7 +242,12 @@ fn fp8_f32_scale_shape(weight: &DeviceMatrix) -> Result<(i32, i32, i32, i32)> {
                 weight.quant_scale_rows,
                 weight.quant_scale_cols
             );
-            Ok((1, 1, weight.rows as i32, weight.cols as i32))
+            Ok(cuda_ql::Fp8ScaleShape {
+                scale_rows: 1,
+                scale_cols: 1,
+                block_m: weight.rows as i32,
+                block_k: weight.cols as i32,
+            })
         }
         other => Err(anyhow!(
             "expected FP8 f32-scale resident quant format, got {other}"
@@ -544,18 +549,8 @@ fn try_fp8_deepgemm_dense(
                 with_e4m3_weight_scratch(ctx, n * k, |dst| -> Result<RawDevicePtr<u8>> {
                     let dst_ptr = cache_ptr(dst, ctx);
                     qwen_quant_profile(ctx, "qwen/fp8/dense_materialize", m, n, k, || {
-                        // SAFETY: ptrs from live device allocations sized to the dims passed.
-                        unsafe {
-                            ffi::marlin_fp8_to_e4m3_cuda(
-                                cache_ptr(packed, ctx).as_ptr(),
-                                dst_ptr.as_mut_ptr(),
-                                n as i32,
-                                k as i32,
-                                ctx.stream.cu_stream(),
-                            )
-                            .result()
-                            .map_err(|e| anyhow!("FP8 Marlin materialise kernel failed: {e}"))
-                        }
+                        // SAFETY: dst is the reserved E4M3 scratch covering n*k bytes.
+                        unsafe { cuda_ql::marlin_fp8_to_e4m3(ctx, packed, dst_ptr, n, k) }
                     })?;
                     Ok(dst_ptr)
                 })?
@@ -583,22 +578,10 @@ fn try_fp8_deepgemm_dense(
     };
     deepgemm_dense_nt(ctx, input, output, b, sfb, m, n, k, "Qwen FP8 dense")?;
     if layout == Fp8DeepGemmLayout::PerChannel {
-        let (out_ptr, _go) = output.device_ptr_mut(&ctx.stream);
-        let (scales_ptr, _gs) = scales.device_ptr(&ctx.stream);
+        // Output is the [m, n] bf16 the GEMM just wrote; scales is the weight's
+        // [n] channel vector (quant_block_m == 1).
         qwen_quant_profile(ctx, "qwen/fp8/dense_channel_scale", m, n, k, || {
-            // SAFETY: out is the [m, n] bf16 the GEMM just wrote; scales is the
-            // weight's [n] channel vector (quant_block_m == 1).
-            unsafe {
-                ffi::scale_columns_bf16_cuda(
-                    out_ptr as *mut ffi::Half,
-                    scales_ptr as *const f32,
-                    m as i32,
-                    n as i32,
-                    ctx.stream.cu_stream(),
-                )
-                .result()
-                .map_err(|e| anyhow!("FP8 per-channel DeepGEMM column scale failed: {e}"))
-            }
+            cuda_ql::scale_columns_bf16(ctx, output, scales, m, n)
         })?;
     }
     Ok(Some(layout))
@@ -730,63 +713,21 @@ fn try_fp8_dequant_bf16_gemm(
         .scale_f32
         .as_ref()
         .ok_or_else(|| anyhow!("fp8_block_scaled missing scale_f32"))?;
-    let (scale_rows, scale_cols, block_m, block_k) = fp8_f32_scale_shape(weight)?;
+    let scale = fp8_f32_scale_shape(weight)?;
     let n = weight.rows; // GEMM M dim (weight rows)
     let k = weight.cols; // GEMM K dim (contraction)
     let weight_elems = n * k;
 
     let Some(()) = with_dequant_weight_scratch(ctx, weight_elems, |weight_bf16| -> Result<()> {
-        let (qw_ptr, _gqw) = qw.device_ptr(&ctx.stream);
-        let (scales_ptr, _gs) = scales.device_ptr(&ctx.stream);
-        let (wbf16_ptr, _gw) = weight_bf16.device_ptr(&ctx.stream);
-        let stream = ctx.stream.cu_stream();
-        qwen_quant_profile(
-            ctx,
-            "qwen/fp8/dense_dequant_bf16",
-            m,
-            n,
-            k,
-            // SAFETY: ptrs from live device allocations sized to the dims passed.
-            || unsafe {
-                ffi::dequantize_fp8_block_scaled_to_bf16_cuda(
-                    qw_ptr as *const u8,
-                    scales_ptr as *const f32,
-                    wbf16_ptr as *mut ffi::Half,
-                    n as i32,
-                    k as i32,
-                    scale_rows,
-                    scale_cols,
-                    block_m,
-                    block_k,
-                    stream,
-                )
-                .result()
-                .map_err(|e| anyhow!("Qwen FP8 dense dequant kernel failed: {e}"))
-            },
-        )?;
-        let (x_ptr, _gx) = input.device_ptr(&ctx.stream);
-        let (out_ptr, _go) = output.device_ptr_mut(&ctx.stream);
-        qwen_quant_profile(
-            ctx,
-            "qwen/fp8/dense_dequant_gemm",
-            m,
-            n,
-            k,
-            // SAFETY: ptrs from live device allocations sized to the dims passed.
-            || unsafe {
-                ffi::gemm_cuda(
-                    wbf16_ptr as *const ffi::Half,
-                    x_ptr as *const ffi::Half,
-                    out_ptr as *mut ffi::Half,
-                    n as i32,
-                    m as i32,
-                    k as i32,
-                    stream,
-                )
-                .result()
-                .map_err(|e| anyhow!("Qwen FP8 dense dequant BF16 GEMM failed: {e}"))
-            },
-        )?;
+        let wbf16 = cache_ptr(weight_bf16, ctx);
+        // SAFETY: the scratch covers `weight_elems` and lives across both launches.
+        qwen_quant_profile(ctx, "qwen/fp8/dense_dequant_bf16", m, n, k, || unsafe {
+            cuda_ql::dequantize_fp8_block_scaled_to_bf16(ctx, qw, scales, wbf16, n, k, scale)
+        })?;
+        // SAFETY: same scratch, fully written by the dequant above.
+        qwen_quant_profile(ctx, "qwen/fp8/dense_dequant_gemm", m, n, k, || unsafe {
+            cuda_ql::gemm_bf16(ctx, wbf16, input, output, m, n, k)
+        })?;
         Ok(())
     })?
     else {
@@ -866,36 +807,13 @@ fn marlin_fp8_gemm_raw(
     };
     let n = weight.rows; // output dim
     let k = weight.cols; // contraction
-    let (packed_ptr, _gp) = packed.device_ptr(&ctx.stream);
-    let (scales_ptr, _gs) = scales.device_ptr(&ctx.stream);
-    let (x_ptr, _gx) = input.device_ptr(&ctx.stream);
-    let (out_ptr, _go) = output.device_ptr_mut(&ctx.stream);
-    let stream = ctx.stream.cu_stream();
     with_marlin_scratch(ctx, |scratch| {
         let c_tmp = scratch.c_tmp.as_ref().unwrap();
         let workspace = scratch.workspace.as_ref().unwrap();
-        let (c_tmp_ptr, _gc) = c_tmp.device_ptr(&ctx.stream);
-        let (ws_ptr, _gw) = workspace.device_ptr(&ctx.stream);
         qwen_quant_profile(ctx, "qwen/fp8/marlin_gemm", m, n, k, || {
-            // SAFETY: all ptrs from live device allocations; packed/scales sized by
-            // repack_for_marlin_fp8 for these dims, x=[m,k], out=[m,n],
-            // c_tmp/workspace sized to the SM max.
-            unsafe {
-                ffi::marlin_fp8_gemm_cuda(
-                    x_ptr as *const ffi::Half,
-                    packed_ptr as *const u32,
-                    scales_ptr as *const ffi::Half,
-                    out_ptr as *mut ffi::Half,
-                    c_tmp_ptr as *mut f32,
-                    ws_ptr as *mut i32,
-                    m as i32,
-                    n as i32,
-                    k as i32,
-                    stream,
-                )
-                .result()
-                .map_err(|e| anyhow!("FP8 per-channel Marlin GEMM failed: {e}"))
-            }
+            cuda_ql::marlin_fp8_gemm(
+                ctx, input, packed, scales, output, c_tmp, workspace, m, n, k,
+            )
         })?;
         Ok(())
     })?;
@@ -920,30 +838,18 @@ fn fp8_block_scaled_gemv(
         .scale_f32
         .as_ref()
         .ok_or_else(|| anyhow!("{} missing scale_f32", weight.weight_format))?;
-    let (scale_rows, scale_cols, block_m, block_k) = fp8_f32_scale_shape(weight)?;
-    let (qw_ptr, _gqw) = qw.device_ptr(&ctx.stream);
-    let (scales_ptr, _gs) = scales.device_ptr(&ctx.stream);
-    let (x_ptr, _gx) = input.device_ptr(&ctx.stream);
-    let (out_ptr, _go) = output.device_ptr_mut(&ctx.stream);
-    let stream = ctx.stream.cu_stream();
+    let scale = fp8_f32_scale_shape(weight)?;
     if m == 1 {
-        // SAFETY: ptrs from live device allocations sized to the dims passed.
-        unsafe {
-            ffi::gemv_fp8_block_scaled_cuda(
-                qw_ptr as *const u8,
-                scales_ptr as *const f32,
-                x_ptr as *const ffi::Half,
-                out_ptr as *mut ffi::Half,
-                weight.rows as i32,
-                weight.cols as i32,
-                scale_rows,
-                scale_cols,
-                block_m,
-                block_k,
-                stream,
-            )
-            .result()?
-        };
+        cuda_ql::gemv_fp8_block_scaled(
+            ctx,
+            qw,
+            scales,
+            input,
+            output,
+            weight.rows,
+            weight.cols,
+            scale,
+        )?;
     } else {
         // The coalesced scalar warp-per-row GEMV is the production path:
         // 3.6x faster than the tensor-core MMA tile at B=1 decode on H20
@@ -957,23 +863,17 @@ fn fp8_block_scaled_gemv(
             weight.rows,
             weight.cols,
             || {
-                Ok(unsafe {
-                    ffi::gemv_fp8_block_scaled_batch_cuda(
-                        qw_ptr as *const u8,
-                        scales_ptr as *const f32,
-                        x_ptr as *const ffi::Half,
-                        out_ptr as *mut ffi::Half,
-                        m as i32,
-                        weight.rows as i32,
-                        weight.cols as i32,
-                        scale_rows,
-                        scale_cols,
-                        block_m,
-                        block_k,
-                        stream,
-                    )
-                    .result()?
-                })
+                cuda_ql::gemv_fp8_block_scaled_batch(
+                    ctx,
+                    qw,
+                    scales,
+                    input,
+                    output,
+                    m,
+                    weight.rows,
+                    weight.cols,
+                    scale,
+                )
             },
         )?;
     }
