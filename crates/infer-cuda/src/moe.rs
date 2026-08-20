@@ -2320,6 +2320,9 @@ mod dsv4_gpu {
         /// pointer tables share the same local-expert index space.
         expert_indices: CudaSlice<i32>,
         group_size: usize,
+        /// Owned transposed scale buffers (W4AFP8 decode lane only — the W4A16
+        /// lane points into per-expert `DeviceMatrix.qscales` and leaves this empty).
+        scale_storage: Vec<CudaSlice<u8>>,
     }
 
     fn build_gemv_tables(ctx: &DeviceContext, layer: &Dsv4MoeLayer) -> Result<Dsv4GemvTables> {
@@ -2491,6 +2494,113 @@ mod dsv4_gpu {
                 .clone_htod(&expert_indices)
                 .map_err(|e| anyhow::anyhow!("W4A16 expert_indices H2D failed: {e}"))?,
             group_size,
+            scale_storage: vec![],
+        })
+    }
+
+    /// Build W4AFP8 GEMV decode tables: transpose the interleaved CUTLASS scale
+    /// layout [K//512, N*4] to the W4A16 GEMV kernel's row-major [N, K//128],
+    /// then point into the fused weight + transposed scale buffers.
+    fn build_w4afp8_gemv_tables(
+        ctx: &DeviceContext,
+        layer: &Dsv4MoeLayer,
+    ) -> Result<Dsv4W4A16GemvTables> {
+        let w13 = layer
+            .w13_w4afp8
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("W4AFP8 GEMV tables: layer has no W4AFP8 experts"))?;
+        let w2 = layer.w2_w4afp8.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("W4AFP8 GEMV tables: layer has no W4AFP8 down experts")
+        })?;
+        let group_size = 128usize;
+        let h = layer.hidden_dim;
+        let i_dim = layer.intermediate;
+
+        // Transpose one projection's scales: [E, K//512, N*4] BF16 → [E, N, K//128] BF16.
+        let transpose_scales = |w: &W4Afp8ExpertWeights| -> Result<CudaSlice<u8>> {
+            let n = w.n;
+            let k = w.k;
+            let groups_per_chunk = 512 / group_size; // 4
+            let num_groups = k / group_size;
+            let chunks = k / 512;
+            let src = ctx
+                .stream
+                .clone_dtoh(&w.scales)
+                .map_err(|e| anyhow::anyhow!("W4AFP8 scale download failed: {e}"))?;
+            let per_expert = chunks * (n * 4) * 2; // BF16 bytes
+            let mut dst = vec![0u8; w.num_experts * n * num_groups * 2];
+            for e in 0..w.num_experts {
+                let src_base = e * per_expert;
+                let dst_base = e * n * num_groups * 2;
+                for g in 0..num_groups {
+                    let chunk = g / groups_per_chunk;
+                    let sub = g % groups_per_chunk;
+                    for row in 0..n {
+                        let src_off = src_base + (chunk * (n * 4) + row * 4 + sub) * 2;
+                        let dst_off = dst_base + (row * num_groups + g) * 2;
+                        dst[dst_off] = src[src_off];
+                        dst[dst_off + 1] = src[src_off + 1];
+                    }
+                }
+            }
+            ctx.stream
+                .clone_htod(&dst)
+                .map_err(|e| anyhow::anyhow!("W4AFP8 transposed scale upload failed: {e}"))
+        };
+
+        let w13_gemv_scales = transpose_scales(w13)?;
+        let w2_gemv_scales = transpose_scales(w2)?;
+
+        let w13_weight_ptr = cache_ptr(&w13.weight, ctx).as_ptr() as u64;
+        let w13_scale_ptr = cache_ptr(&w13_gemv_scales, ctx).as_ptr() as u64;
+        let w2_weight_ptr = cache_ptr(&w2.weight, ctx).as_ptr() as u64;
+        let w2_scale_ptr = cache_ptr(&w2_gemv_scales, ctx).as_ptr() as u64;
+
+        // w13: n = 2*i_dim (w1 over w3), k = h.
+        let w13_w_per_expert = (2 * i_dim * (h / 2)) as u64;
+        let w13_s_per_expert = (2 * i_dim * (h / group_size) * 2) as u64; // BF16
+        let up_weight_off = (i_dim * (h / 2)) as u64;
+        let up_scale_off = (i_dim * (h / group_size) * 2) as u64;
+        // w2: n = h, k = i_dim.
+        let w2_w_per_expert = (h * (i_dim / 2)) as u64;
+        let w2_s_per_expert = (h * (i_dim / group_size) * 2) as u64;
+
+        let e = w13.num_experts;
+        let mut gate_w = Vec::with_capacity(e);
+        let mut gate_s = Vec::with_capacity(e);
+        let mut up_w = Vec::with_capacity(e);
+        let mut up_s = Vec::with_capacity(e);
+        let mut w2_w = Vec::with_capacity(e);
+        let mut w2_s = Vec::with_capacity(e);
+        for idx in 0..e {
+            let wb = w13_weight_ptr + idx as u64 * w13_w_per_expert;
+            let sb = w13_scale_ptr + idx as u64 * w13_s_per_expert;
+            gate_w.push(wb);
+            up_w.push(wb + up_weight_off);
+            gate_s.push(sb);
+            up_s.push(sb + up_scale_off);
+            w2_w.push(w2_weight_ptr + idx as u64 * w2_w_per_expert);
+            w2_s.push(w2_scale_ptr + idx as u64 * w2_s_per_expert);
+        }
+        let h2d = |v: &[u64]| -> Result<CudaSlice<u64>> {
+            ctx.stream
+                .clone_htod(v)
+                .map_err(|e| anyhow::anyhow!("W4AFP8 GEMV table H2D failed: {e}"))
+        };
+        let expert_indices: Vec<i32> = (0..e as i32).collect();
+        Ok(Dsv4W4A16GemvTables {
+            gate_w: h2d(&gate_w)?,
+            gate_s: h2d(&gate_s)?,
+            up_w: h2d(&up_w)?,
+            up_s: h2d(&up_s)?,
+            w2_w: h2d(&w2_w)?,
+            w2_s: h2d(&w2_s)?,
+            expert_indices: ctx
+                .stream
+                .clone_htod(&expert_indices)
+                .map_err(|e| anyhow::anyhow!("W4AFP8 expert_indices H2D failed: {e}"))?,
+            group_size,
+            scale_storage: vec![w13_gemv_scales, w2_gemv_scales],
         })
     }
 
@@ -3125,8 +3235,31 @@ mod dsv4_gpu {
                 );
             }
         }
-        // W4AFP8 lane: SGLang CUTLASS grouped GEMM (W4A8 tensor-core MMA).
+        // W4AFP8 lane: decode-band GEMV (reuses W4A16 kernel, BF16 activations)
+        // or SGLang CUTLASS grouped GEMM for prefill / large batch.
         if let (Some(w13), Some(w2)) = (&layer.w13_w4afp8, &layer.w2_w4afp8) {
+            if total_routes <= DSV4_DECODE_GEMV_MAX_ROUTES {
+                let tables = layer.w4afp8_gemv_tables.get_or_init(|| {
+                    build_w4afp8_gemv_tables(ctx, layer)
+                        .map(Some)
+                        .unwrap_or_else(|e| {
+                            log::warn!("DSv4 W4AFP8 GEMV decode lane table build failed: {e}");
+                            None
+                        })
+                });
+                if let Some(tables) = tables.as_ref() {
+                    return dsv4_moe_forward_w4a16(
+                        model,
+                        layer,
+                        tables,
+                        route_indices,
+                        route_weights,
+                        hidden,
+                        out,
+                        keepalive,
+                    );
+                }
+            }
             return dsv4_moe_forward_w4afp8(
                 model,
                 layer,
