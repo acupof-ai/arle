@@ -30,30 +30,6 @@ quantized `lm_head`.
   including any configured thinking budget, through one-token plain decode.
 - W8A16 batch and single-row dispatch now share one raw-pointer Marlin launcher.
 
-## Goal
-
-Correctness: enforce the configured Qwen thinking-token ceiling under MTP and
-DSpark, and serve a W8A16-quantized `lm_head` without a missing-source error.
-
-## Hypothesis
-
-Plain decode applies `force_next_token` before sampling. Reusing the existing
-W8A16 Marlin kernel at `M=1` reads the only weight representation retained after
-repack. No kernel math changes.
-
-## Parameters
-
-Pending remote on one H20, CUDA release build, TP=1, BF16 KV:
-
-1. Qwen3.6 with `--spec-type mtp --mtp-draft-tokens 3`, greedy sampling,
-   `enable_thinking=true`, `max_thinking_tokens=8`, one request, 64 output-token
-   cap. Repeat with DSpark.
-2. A Qwen3.5/3.6 W8A16 checkpoint with `lm_head.weight` quantized at group size
-   128; one non-degenerate prompt, 32 output tokens.
-3. `scripts/lever_gate.sh` and `scripts/needle_gate.py temp`, ladder
-   512/4096/16384/32768, three repetitions, same flags against the current
-   baseline envelope.
-
 ## Result
 
 `834a87aed` on 1xH20, CUDA release, TP=1, FP8 KV, `--spec-type mtp
@@ -98,6 +74,10 @@ Parameters item 2 stays open. Closing it needs a Qwen3.5/3.6 checkpoint with
 
 ## Environment
 
+There is no Mac typecheck lane for this: the local `cuda,no-cuda` test binary
+cannot link because the CUDA C symbols are intentionally absent, so the pod
+build is the typecheck.
+
 - Commit `834a87aed`, on top of `a5df06c7c`. Binary sha256 (first 16)
   `bcea08abfe9a87c2`; an earlier run of the same HEAD hashed
   `2e99884cdba05a60` — Rust release links are not bit-reproducible here, so the
@@ -108,26 +88,6 @@ Parameters item 2 stays open. Closing it needs a Qwen3.5/3.6 checkpoint with
   `cuda.qwen.fp8_pack_deepgemm` 512 and `cuda.qwen.fp8_gemv` 512, with
   `fp8_marlin_tensorcore` absent. Pre-existing for that checkpoint, unchanged by
   this commit.
-
-## Results
-
-Pending. Required pass conditions: the ninth generated thinking token is
-`</think>` in both speculative configurations; W8A16 `lm_head` records a
-`cuda.w8a16.marlin_tensorcore` hit; zero request errors, empty outputs, loops,
-or new needle misses. This correctness change carries no performance claim.
-
-## Problems
-
-The local macOS `cuda,no-cuda` test binary cannot link because CUDA C symbols
-are intentionally absent. `CUDARC_CUDA_VERSION=12080 cargo check -p infer-cuda
---release --no-default-features --features cuda,no-cuda --tests` passes; GPU
-execution remains pending.
-
-## Learnings
-
-**pending-remote.** A chained decoder may run only when it implements every
-token rewrite for every accepted position. Repacked formats need one shared
-launcher for batched and single-row entry points.
 
 ## Rule
 
