@@ -1191,7 +1191,7 @@ impl Tape {
     /// 60 GB at a layer exit, next alloc OOM). Scope-granular, so the
     /// per-chunk trim starvation cannot recur.
     fn trim_if_hoarding(&self, store: &TensorStore) -> Result<()> {
-        const HOARD_TRIM_BYTES: u64 = 8 << 30;
+        const HOARD_TRIM_BYTES: u64 = 2 << 30;
         if let Some((reserved, used)) = store.backend().mem_pool_stats()
             && reserved.saturating_sub(used) > HOARD_TRIM_BYTES
         {
