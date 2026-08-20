@@ -39,14 +39,23 @@ Snapshot from the 2026-08-20 checkout:
 
 | Surface | Size | Current responsibility overlap |
 | --- | ---: | --- |
-| `crates/infer-cuda/src/` | 61,587 Rust lines | Model orchestration, route policy, scratch, and raw FFI calls |
+| `crates/infer-cuda/src/` | 63,437 Rust lines | Model orchestration, route policy, scratch, and raw FFI calls |
 | `attention.rs` | 8,543 lines | Qwen paged attention, DSv4 MLA, preparation, routing, and launches |
 | `loader.rs` | 6,709 lines | Format detection, upload, assembly, repack, source retention, TP, and MoE |
-| `moe.rs` | 4,429 lines | Qwen and DSv4 routing, scratch, transport, and launches |
-| `ops/quant_linear.rs` | 2,065 lines | Two entry routes and several weight-family policies |
-| `crates/cuda-kernels/src/ffi/` | 5,868 lines | Grouped ABI declarations with direct external consumers |
-| `crates/cuda-kernels/csrc/` | 71 CUDA source/header files | Existing device-math family layout |
+| `moe.rs` | 4,429 lines | Qwen and DSv4 routing, scratch, transport |
+| `ops/quant_linear.rs` | 2,120 lines | Two entry routes and several weight-family policies |
+| `crates/cuda-kernels/src/ffi/` | 5,868 lines, 358 extern symbols (330 hand-written, 28 TileLang-generated) | Grouped ABI declarations with direct external consumers |
+| `crates/cuda-kernels/src/*.rs` typed wrappers | 11,255 lines | Existing typed-launcher layer; 113 of 358 FFI symbols already wrapped |
+| `crates/cuda-kernels/csrc/` | 72 `.cu`/`.cuh` files | Existing device-math family layout |
 | `crates/autograd/src/backend_cuda/kernels/` | 29 CUDA files | Autograd-owned NVRTC forward, backward, optimizer, rollout, and bridge kernels |
+
+The raw-FFI census behind this plan: ~243 call sites in 28 files consume 149
+distinct symbols outside `cuda-kernels`; ~142 symbols have no typed wrapper.
+Model modules (`attention.rs`, `qwen35*`, `dsv4/*`, `tp.rs`, `hc.rs`,
+`loader.rs`) hold 163 of them; `ops/` holds 40. `infer-cuda/src/moe.rs` is the
+reference consumer of the target pattern: zero raw FFI calls, all launches
+through `cuda_kernels::moe` typed wrappers. Its remaining disorder is model-
+policy mixing (Qwen and DSv4 in one file), not ABI access.
 
 The correct unit of reuse is the launch mechanism. Model semantics remain
 different:
@@ -131,6 +140,7 @@ declaration. Several models may reuse the same launcher.
 | `crates/cuda-kernels/csrc/<family>` | Keep the current device-source family layout |
 | `crates/cuda-kernels/src/ffi/<family>.rs` | Keep private ABI declarations and generated AOT resolution |
 | `DeviceContext` and typed device buffers | Reuse stream, device, pointer, and storage lifetimes |
+| Typed launcher modules (`cuda-kernels/src/{moe,paged_kv,kv_quant,tensor,ring_attention,attention,collective}.rs`) | 11,255-line proven launcher layer; `infer-cuda/src/moe.rs` is the reference consumer | Extend to unwrapped families; T1 generalizes this pattern |
 | `OperatorDispatchStats` | Extend request-boundary engagement reporting |
 | `crates/cuda-kernels/kernels.toml` | Keep as TileLang AOT build truth |
 | `operators/registry.toml` | Expand as semantic operator and implementation truth after ownership stabilizes |
@@ -317,6 +327,8 @@ crates/infer-cuda/src/
   loader.rs                   common detection/upload entry
   qwen35_load.rs              Qwen35 assembly
   dsv4/load.rs                DSv4/GLM assembly
+  graph.rs                    capture/re-bake machinery; owner of baked-pointer repair when workspace moves
+  decode_graph.rs             decode capture keys and workspace-epoch invalidation
 
 crates/autograd/src/backend_cuda/
   kernels.rs                  NVRTC module lifecycle and family catalogs
@@ -332,33 +344,48 @@ split is useful. A migration deletes the old entry in the same tranche.
 Each runtime tranche changes one semantic family, touches at most five files,
 and has its own correctness and performance receipt.
 
+T3, T5, and T7 are programs of named sub-tranches, not single tranches. Each
+sub-migration (one attention family, one MoE route class, one autograd
+catalog) gets its own exit condition and receipt. A family extraction may use
+a pure mechanical-move commit — the five-file cap is relaxed for moves, line
+count is not capped — followed by a behavioral commit. Shared private helpers
+move with their largest consumer or into a family-shared module, named in the
+sub-tranche plan.
+
 | Phase | Work | Exit condition |
 | --- | --- | --- |
 | T0 Inventory | Map every production launch to semantic ID, provider, consumer, model, phase, SM, workspace, capture support, and gate | Every launch has one family and owner; registry gaps are explicit |
-| T1 Launcher boundary | Prove typed launchers with embedding, norm, and elementwise | Direct ABI calls removed for migrated operations; launch receipt is identical |
+| T1 Launcher boundary | Extend the proven typed-launcher pattern (`cuda-kernels/src/moe.rs` wrappers, `infer-cuda/src/moe.rs` consumer) to embedding, norm, and elementwise; land the second registry+generated-policy binding here | Direct ABI calls removed for migrated operations; launch receipt is identical; registry schema proven on two families |
 | T2 Qwen quant-linear | Execute the child plan across M=1 and batched entry points | One route owner per Qwen weight family; retained storage validates at load |
+| T2L Loader decomposition | Split `loader.rs` into common detection/upload entry + `qwen35_load.rs` + `dsv4/load.rs`; make load/warmup pipeline metadata explicit | Common loader owns only detection/upload; model assembly in named owners; per-family final storage validation runs at publish |
 | T3 Attention and KV | Migrate non-paged, Qwen paged, Qwen35 full/recurrent preparation, DSv4 MLA family, and quantized KV in that order | Root attention module contains facade/shared types; family modules own routes |
 | T4 Recurrent | Consolidate GDR, conv1d, and FlashQLA launch mechanics | Serving state and training backward policies remain separate; ABI launchers are singular |
 | T5 MoE and transport | Migrate common routing, Qwen local, DSv4 local, W4AFP8/NVFP4, DeepEP normal, then DeepEP low-latency | Long-prefill and concurrent gates pass for each route |
 | T6 Sampling and collectives | Migrate typed launch mechanics | Compatibility, sequence state, placement, and overlap stay model-owned |
 | T7 Autograd | Classify all 29 NVRTC sources; share proven launchers; organize retained compile/launch catalogs | Every exported symbol has one Rust owner and complete artifact identity |
-| T8 Evidence closure | Expand registry and bind legality, evidence, model gates, and artifact identity | Runtime engagement, registry, evidence, and binary agree for all supported routes |
+| T8 Evidence closure | Bind legality, evidence, model gates, and artifact identity for all routes; registry schema and codegen already proven on two families in T1 | Runtime engagement, registry, evidence, and binary agree for all supported routes |
 
 Dependencies:
 
 ```text
-T0 -> T1 -> T2
+T0 -> T1 -> T2 -> T2L
           -> T3 -> T4
           -> T5
           -> T6
 
 matching serving launcher -> T7
-T2..T7 complete           -> T8
+T2..T7, T2L complete      -> T8
 ```
 
 T0 and T1 are sequential. After T1, independent families may use separate
-lanes when they do not edit the same root facade. T7 follows the matching
-serving launcher. T8 closes after all runtime owners stabilize.
+lanes when they do not edit the same root facade; T2L may run parallel with
+T3/T5/T6 (different root files). T7 follows the matching serving launcher. T8
+closes after all runtime owners stabilize.
+
+The registry schema and generated-policy codegen are generalized on the T1
+family — the second binding after `qwen.fp8_dense_projection`. Each tranche
+T2..T7 adds one registry binding for its family, so T8 is mechanical closure,
+not construction.
 
 ## Verification
 
@@ -422,6 +449,17 @@ Runtime route changes run `scripts/lever_gate.sh` and
 `scripts/needle_gate.py temp` at 512/4096/16384/32768, three repetitions, on
 the exact candidate binary.
 
+Structural tranches use drift-band acceptance: at least three matched trials
+per arm, median plus range, and an unresolved negative median blocks. The
+strict allocation/sync/launch-count invariants apply to the launch-receipt
+comparison, not to re-derived per-step measurements.
+
+All CUDA gates are remote (H20); a Mac workstation runs `cargo check` only. A
+tranche may claim local exit with typecheck plus a `pending-remote` report
+stub per the bench spec; the remote verdict closes it. GLM-5.2 gates remain
+pending-remote until the support matrix flips and do not block DSv4 tranche
+exits on their own.
+
 ### Performance receipt
 
 For every structural tranche, compare archived baseline and candidate:
@@ -474,9 +512,11 @@ to a separate behavioral tranche.
 | DeepGEMM misses a production tail shape | Clean-cache production-shape warmup test |
 | W4AFP8 smoke misses routed-row overflow | Long-prefill MoE gate beyond block caps |
 
-Rollback uses one family commit and an archived baseline binary/kernel manifest.
-A failed tranche is reverted, rebuilt, and rechecked against the restored
-artifact identity. Permanent dual paths and compatibility adapters are removed
+Rollback targets the current tranche: revert all of its commits and rebuild
+against the archived baseline binary/kernel manifest. A latent failure in a
+landed tranche is handled by reverting the dependent chain or fixing forward;
+tranches are sequentially dependent, so reverting an earlier tranche alone
+does not compile. Permanent dual paths and compatibility adapters are removed
 after the verdict.
 
 ## Commit rules
@@ -512,7 +552,9 @@ operator and model gates.
 
 1. Every production CUDA launch has one semantic family, launch owner, ABI
    declaration, and implementation ID.
-2. Model modules own layer/state orchestration and contain no raw CUDA ABI calls.
+2. Model modules own layer/state orchestration and contain no raw CUDA ABI
+   calls (excluding `#[cfg(test)]` call sites and registered fn-pointer
+   tables).
 3. Shared launch mechanics exist once in `cuda-kernels` or the owning family.
 4. Model legality, state, fallback, thresholds, and capture rules remain
    explicit.
