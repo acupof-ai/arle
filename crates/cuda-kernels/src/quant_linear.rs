@@ -1,4 +1,4 @@
-//! Dense quantized-linear launch helpers (FP8 and NVFP4 families).
+//! Dense quantized-linear launch helpers (FP8, NVFP4, and INT families).
 
 use anyhow::{Result, anyhow, ensure};
 use cudarc::driver::{DevicePtr, DevicePtrMut};
@@ -413,6 +413,286 @@ pub unsafe fn dequantize_fp4_marlin_to_fp8(
         )
         .result()
         .map_err(|e| anyhow!("dequantize_fp4_marlin_to_fp8_cuda failed at [n,k]=[{n},{k}]: {e}"))
+    }
+}
+
+/// W8A16 Marlin GEMM: C[m,n] = X[m,k] @ dequant(Marlin-packed W). Scratch
+/// contract matches `marlin_fp8_gemm`.
+#[allow(clippy::too_many_arguments)]
+pub fn marlin_w8a16_gemm(
+    ctx: &DeviceContext,
+    input: &impl DevicePtr<bf16>,
+    packed: &impl DevicePtr<u8>,
+    scales: &impl DevicePtr<u16>,
+    output: &mut impl DevicePtrMut<bf16>,
+    c_tmp: &impl DevicePtr<f32>,
+    workspace: &impl DevicePtr<i32>,
+    m: usize,
+    n: usize,
+    k: usize,
+    group_size: usize,
+) -> Result<()> {
+    ensure!(
+        input.len() >= extent(m, k, "marlin_w8a16_gemm input")?
+            && output.len() >= extent(m, n, "marlin_w8a16_gemm output")?,
+        "marlin_w8a16_gemm buffers do not cover [m,n,k]=[{m},{n},{k}]: input={} output={}",
+        input.len(),
+        output.len()
+    );
+    let (x_ptr, _gx) = input.device_ptr(&ctx.stream);
+    let (packed_ptr, _gp) = packed.device_ptr(&ctx.stream);
+    let (scales_ptr, _gs) = scales.device_ptr(&ctx.stream);
+    let (out_ptr, _go) = output.device_ptr_mut(&ctx.stream);
+    let (c_tmp_ptr, _gc) = c_tmp.device_ptr(&ctx.stream);
+    let (ws_ptr, _gw) = workspace.device_ptr(&ctx.stream);
+    // SAFETY: lengths checked above; the packed bytes are the u32 Marlin tiles
+    // `repack_for_marlin_w8a16` produced for these dims.
+    unsafe {
+        ffi::marlin_w8a16_gemm_cuda(
+            x_ptr as *const Half,
+            packed_ptr as *const u32,
+            scales_ptr as *const Half,
+            out_ptr as *mut Half,
+            c_tmp_ptr as *mut f32,
+            ws_ptr as *mut i32,
+            i32::try_from(m)?,
+            i32::try_from(n)?,
+            i32::try_from(k)?,
+            i32::try_from(group_size)?,
+            ctx.stream.cu_stream(),
+        )
+        .result()
+        .map_err(|e| anyhow!("marlin_w8a16_gemm_cuda failed at [m,n,k]=[{m},{n},{k}]: {e}"))
+    }
+}
+
+/// W8A16 group-scale grid length: `scales[row * (k/group_size) + col_group]`.
+fn int_group_scale_len(n: usize, k: usize, group_size: usize, what: &'static str) -> Result<usize> {
+    ensure!(
+        group_size > 0 && k.is_multiple_of(group_size),
+        "{what} cols {k} not group-aligned to {group_size}"
+    );
+    extent(n, k / group_size, what)
+}
+
+/// Scalar W8A16 GEMV, single row: out[n] = dequant(W[n,k]) @ x[k].
+pub fn w8a16_gemv(
+    ctx: &DeviceContext,
+    weight: &impl DevicePtr<i8>,
+    scales: &impl DevicePtr<bf16>,
+    input: &impl DevicePtr<bf16>,
+    output: &mut impl DevicePtrMut<bf16>,
+    n: usize,
+    k: usize,
+    group_size: usize,
+) -> Result<()> {
+    ensure!(
+        weight.len() >= extent(n, k, "w8a16_gemv weight")?
+            && scales.len() >= int_group_scale_len(n, k, group_size, "w8a16_gemv")?
+            && input.len() >= k
+            && output.len() >= n,
+        "w8a16_gemv buffers do not cover [n,k,gs]=[{n},{k},{group_size}]: weight={} scales={} input={} output={}",
+        weight.len(),
+        scales.len(),
+        input.len(),
+        output.len()
+    );
+    let (qw_ptr, _gqw) = weight.device_ptr(&ctx.stream);
+    let (scales_ptr, _gs) = scales.device_ptr(&ctx.stream);
+    let (x_ptr, _gx) = input.device_ptr(&ctx.stream);
+    let (out_ptr, _go) = output.device_ptr_mut(&ctx.stream);
+    // SAFETY: lengths checked above; all buffers belong to `ctx.stream`.
+    unsafe {
+        ffi::w8a16_gemv_cuda(
+            qw_ptr as *const i8,
+            scales_ptr as *const Half,
+            x_ptr as *const Half,
+            out_ptr as *mut Half,
+            i32::try_from(n)?,
+            i32::try_from(k)?,
+            i32::try_from(group_size)?,
+            ctx.stream.cu_stream(),
+        )
+        .result()
+        .map_err(|e| anyhow!("w8a16_gemv_cuda failed at [n,k]=[{n},{k}]: {e}"))
+    }
+}
+
+/// Batched W8A16 GEMV: out[m,n] = X[m,k] @ dequant(W[n,k])^T.
+#[allow(clippy::too_many_arguments)]
+pub fn w8a16_gemv_batch(
+    ctx: &DeviceContext,
+    weight: &impl DevicePtr<i8>,
+    scales: &impl DevicePtr<bf16>,
+    input: &impl DevicePtr<bf16>,
+    output: &mut impl DevicePtrMut<bf16>,
+    m: usize,
+    n: usize,
+    k: usize,
+    group_size: usize,
+) -> Result<()> {
+    ensure!(
+        weight.len() >= extent(n, k, "w8a16_gemv_batch weight")?
+            && scales.len() >= int_group_scale_len(n, k, group_size, "w8a16_gemv_batch")?
+            && input.len() >= extent(m, k, "w8a16_gemv_batch input")?
+            && output.len() >= extent(m, n, "w8a16_gemv_batch output")?,
+        "w8a16_gemv_batch buffers do not cover [m,n,k,gs]=[{m},{n},{k},{group_size}]: weight={} scales={} input={} output={}",
+        weight.len(),
+        scales.len(),
+        input.len(),
+        output.len()
+    );
+    let (qw_ptr, _gqw) = weight.device_ptr(&ctx.stream);
+    let (scales_ptr, _gs) = scales.device_ptr(&ctx.stream);
+    let (x_ptr, _gx) = input.device_ptr(&ctx.stream);
+    let (out_ptr, _go) = output.device_ptr_mut(&ctx.stream);
+    // SAFETY: lengths checked above; all buffers belong to `ctx.stream`.
+    unsafe {
+        ffi::w8a16_gemv_batch_cuda(
+            qw_ptr as *const i8,
+            scales_ptr as *const Half,
+            x_ptr as *const Half,
+            out_ptr as *mut Half,
+            i32::try_from(m)?,
+            i32::try_from(n)?,
+            i32::try_from(k)?,
+            i32::try_from(group_size)?,
+            ctx.stream.cu_stream(),
+        )
+        .result()
+        .map_err(|e| anyhow!("w8a16_gemv_batch_cuda failed at [m,n,k]=[{m},{n},{k}]: {e}"))
+    }
+}
+
+/// Scalar W4A16 GEMV, single row: out[n] = dequant(W[n,k]) @ x[k]. The weight
+/// holds two INT4 nibbles per byte (`n * k / 2`).
+pub fn w4a16_gemv(
+    ctx: &DeviceContext,
+    weight: &impl DevicePtr<i8>,
+    scales: &impl DevicePtr<bf16>,
+    input: &impl DevicePtr<bf16>,
+    output: &mut impl DevicePtrMut<bf16>,
+    n: usize,
+    k: usize,
+    group_size: usize,
+) -> Result<()> {
+    ensure!(
+        weight.len() >= extent(n, k, "w4a16_gemv weight")? / 2
+            && scales.len() >= int_group_scale_len(n, k, group_size, "w4a16_gemv")?
+            && input.len() >= k
+            && output.len() >= n,
+        "w4a16_gemv buffers do not cover [n,k,gs]=[{n},{k},{group_size}]: weight={} scales={} input={} output={}",
+        weight.len(),
+        scales.len(),
+        input.len(),
+        output.len()
+    );
+    let (qw_ptr, _gqw) = weight.device_ptr(&ctx.stream);
+    let (scales_ptr, _gs) = scales.device_ptr(&ctx.stream);
+    let (x_ptr, _gx) = input.device_ptr(&ctx.stream);
+    let (out_ptr, _go) = output.device_ptr_mut(&ctx.stream);
+    // SAFETY: lengths checked above; all buffers belong to `ctx.stream`.
+    unsafe {
+        ffi::w4a16_gemv_cuda(
+            qw_ptr as *const u8,
+            scales_ptr as *const Half,
+            x_ptr as *const Half,
+            out_ptr as *mut Half,
+            i32::try_from(n)?,
+            i32::try_from(k)?,
+            i32::try_from(group_size)?,
+            ctx.stream.cu_stream(),
+        )
+        .result()
+        .map_err(|e| anyhow!("w4a16_gemv_cuda failed at [n,k]=[{n},{k}]: {e}"))
+    }
+}
+
+/// Batched W4A16 GEMV: out[m,n] = X[m,k] @ dequant(W[n,k])^T. Weight packing
+/// matches `w4a16_gemv`.
+#[allow(clippy::too_many_arguments)]
+pub fn w4a16_gemv_batch(
+    ctx: &DeviceContext,
+    weight: &impl DevicePtr<i8>,
+    scales: &impl DevicePtr<bf16>,
+    input: &impl DevicePtr<bf16>,
+    output: &mut impl DevicePtrMut<bf16>,
+    m: usize,
+    n: usize,
+    k: usize,
+    group_size: usize,
+) -> Result<()> {
+    ensure!(
+        weight.len() >= extent(n, k, "w4a16_gemv_batch weight")? / 2
+            && scales.len() >= int_group_scale_len(n, k, group_size, "w4a16_gemv_batch")?
+            && input.len() >= extent(m, k, "w4a16_gemv_batch input")?
+            && output.len() >= extent(m, n, "w4a16_gemv_batch output")?,
+        "w4a16_gemv_batch buffers do not cover [m,n,k,gs]=[{m},{n},{k},{group_size}]: weight={} scales={} input={} output={}",
+        weight.len(),
+        scales.len(),
+        input.len(),
+        output.len()
+    );
+    let (qw_ptr, _gqw) = weight.device_ptr(&ctx.stream);
+    let (scales_ptr, _gs) = scales.device_ptr(&ctx.stream);
+    let (x_ptr, _gx) = input.device_ptr(&ctx.stream);
+    let (out_ptr, _go) = output.device_ptr_mut(&ctx.stream);
+    // SAFETY: lengths checked above; all buffers belong to `ctx.stream`.
+    unsafe {
+        ffi::w4a16_gemv_batch_cuda(
+            qw_ptr as *const u8,
+            scales_ptr as *const Half,
+            x_ptr as *const Half,
+            out_ptr as *mut Half,
+            i32::try_from(m)?,
+            i32::try_from(n)?,
+            i32::try_from(k)?,
+            i32::try_from(group_size)?,
+            ctx.stream.cu_stream(),
+        )
+        .result()
+        .map_err(|e| anyhow!("w4a16_gemv_batch_cuda failed at [m,n,k]=[{m},{n},{k}]: {e}"))
+    }
+}
+
+/// Dequant an INT8 group-scaled W8A16 weight `[n, k]` into a resident BF16
+/// buffer.
+///
+/// # Safety
+/// `output` must cover `n * k` bf16 elements on `ctx`'s stream and stay live
+/// through the launch (it is the caller's reusable scratch).
+pub unsafe fn dequantize_w8a16_to_bf16(
+    ctx: &DeviceContext,
+    weight: &impl DevicePtr<i8>,
+    scales: &impl DevicePtr<bf16>,
+    output: RawDevicePtr<bf16>,
+    n: usize,
+    k: usize,
+    group_size: usize,
+) -> Result<()> {
+    ensure!(
+        weight.len() >= extent(n, k, "dequantize_w8a16_to_bf16 weight")?
+            && scales.len() >= int_group_scale_len(n, k, group_size, "dequantize_w8a16_to_bf16")?,
+        "dequantize_w8a16_to_bf16 buffers do not cover [n,k,gs]=[{n},{k},{group_size}]: weight={} scales={}",
+        weight.len(),
+        scales.len()
+    );
+    let (qw_ptr, _gqw) = weight.device_ptr(&ctx.stream);
+    let (scales_ptr, _gs) = scales.device_ptr(&ctx.stream);
+    // SAFETY: source lengths checked above; the output scratch is the caller's
+    // contract.
+    unsafe {
+        ffi::dequantize_w8a16_to_bf16_cuda(
+            qw_ptr as *const i8,
+            scales_ptr as *const Half,
+            output.as_mut_ptr().cast(),
+            i32::try_from(n)?,
+            i32::try_from(k)?,
+            i32::try_from(group_size)?,
+            ctx.stream.cu_stream(),
+        )
+        .result()
+        .map_err(|e| anyhow!("dequantize_w8a16_to_bf16_cuda failed at [n,k]=[{n},{k}]: {e}"))
     }
 }
 

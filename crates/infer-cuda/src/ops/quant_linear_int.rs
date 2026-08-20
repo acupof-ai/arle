@@ -1,8 +1,8 @@
 use anyhow::{Result, anyhow, ensure};
-use cuda_kernels::ffi;
 use cuda_kernels::prelude::{DeviceContext, DeviceMatrix};
-use cuda_kernels::tensor::WeightFormat;
-use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
+use cuda_kernels::quant_linear as cuda_ql;
+use cuda_kernels::tensor::{WeightFormat, cache_ptr};
+use cudarc::driver::CudaSlice;
 use half::bf16;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -38,37 +38,23 @@ fn marlin_w8a16_gemm_raw(
     };
     let n = weight.rows; // output dim
     let k = weight.cols; // contraction
-    let (packed_ptr, _gp) = packed.device_ptr(&ctx.stream);
-    let (scales_ptr, _gs) = scales.device_ptr(&ctx.stream);
-    let (x_ptr, _gx) = input.device_ptr(&ctx.stream);
-    let (out_ptr, _go) = output.device_ptr_mut(&ctx.stream);
-    let stream = ctx.stream.cu_stream();
     with_marlin_scratch(ctx, |scratch| {
         let c_tmp = scratch.c_tmp.as_ref().unwrap();
         let workspace = scratch.workspace.as_ref().unwrap();
-        let (c_tmp_ptr, _gc) = c_tmp.device_ptr(&ctx.stream);
-        let (ws_ptr, _gw) = workspace.device_ptr(&ctx.stream);
         qwen_quant_profile(ctx, "qwen/w8a16/marlin_gemm", m, n, k, || {
-            // SAFETY: all ptrs from live device allocations; packed/scales sized by
-            // repack_for_marlin_w8a16 for these dims, x=[m,k], out=[m,n],
-            // c_tmp/workspace sized to the SM max above.
-            unsafe {
-                ffi::marlin_w8a16_gemm_cuda(
-                    x_ptr as *const ffi::Half,
-                    packed_ptr as *const u32,
-                    scales_ptr as *const ffi::Half,
-                    out_ptr as *mut ffi::Half,
-                    c_tmp_ptr as *mut f32,
-                    ws_ptr as *mut i32,
-                    m as i32,
-                    n as i32,
-                    k as i32,
-                    weight.group_size as i32,
-                    stream,
-                )
-                .result()
-                .map_err(|e| anyhow!("W8A16 Marlin GEMM failed: {e}"))
-            }
+            cuda_ql::marlin_w8a16_gemm(
+                ctx,
+                input,
+                packed,
+                scales,
+                output,
+                c_tmp,
+                workspace,
+                m,
+                n,
+                k,
+                weight.group_size,
+            )
         })?;
         Ok(())
     })?;
@@ -109,54 +95,15 @@ fn try_w8a16_dequant_bf16_gemm(
     // Reuse the FP8 dequant scratch — it is just a format-agnostic BF16 weight
     // buffer sized to the largest weight seen this thread.
     let Some(()) = with_dequant_weight_scratch(ctx, weight_elems, |weight_bf16| -> Result<()> {
-        let (qw_ptr, _gqw) = qw.device_ptr(&ctx.stream);
-        let (scales_ptr, _gs) = scales.device_ptr(&ctx.stream);
-        let (wbf16_ptr, _gw) = weight_bf16.device_ptr(&ctx.stream);
-        let stream = ctx.stream.cu_stream();
-        qwen_quant_profile(
-            ctx,
-            "qwen/w8a16/dense_dequant_bf16",
-            m,
-            n,
-            k,
-            // SAFETY: ptrs from live device allocations sized to the dims passed.
-            || unsafe {
-                ffi::dequantize_w8a16_to_bf16_cuda(
-                    qw_ptr as *const i8,
-                    scales_ptr as *const ffi::Half,
-                    wbf16_ptr as *mut ffi::Half,
-                    n as i32,
-                    k as i32,
-                    weight.group_size as i32,
-                    stream,
-                )
-                .result()
-                .map_err(|e| anyhow!("Qwen W8A16 dense dequant kernel failed: {e}"))
-            },
-        )?;
-        let (x_ptr, _gx) = input.device_ptr(&ctx.stream);
-        let (out_ptr, _go) = output.device_ptr_mut(&ctx.stream);
-        qwen_quant_profile(
-            ctx,
-            "qwen/w8a16/dense_dequant_gemm",
-            m,
-            n,
-            k,
-            // SAFETY: ptrs from live device allocations sized to the dims passed.
-            || unsafe {
-                ffi::gemm_cuda(
-                    wbf16_ptr as *const ffi::Half,
-                    x_ptr as *const ffi::Half,
-                    out_ptr as *mut ffi::Half,
-                    n as i32,
-                    m as i32,
-                    k as i32,
-                    stream,
-                )
-                .result()
-                .map_err(|e| anyhow!("Qwen W8A16 dense dequant BF16 GEMM failed: {e}"))
-            },
-        )?;
+        let wbf16 = cache_ptr(weight_bf16, ctx);
+        // SAFETY: the scratch covers `weight_elems` and lives across both launches.
+        qwen_quant_profile(ctx, "qwen/w8a16/dense_dequant_bf16", m, n, k, || unsafe {
+            cuda_ql::dequantize_w8a16_to_bf16(ctx, qw, scales, wbf16, n, k, weight.group_size)
+        })?;
+        // SAFETY: same scratch, fully written by the dequant above.
+        qwen_quant_profile(ctx, "qwen/w8a16/dense_dequant_gemm", m, n, k, || unsafe {
+            cuda_ql::gemm_bf16(ctx, wbf16, input, output, m, n, k)
+        })?;
         Ok(())
     })?
     else {
@@ -182,45 +129,29 @@ fn w8a16_gemv(
         .qscales
         .as_ref()
         .ok_or_else(|| anyhow!("W8A16 missing qscales"))?;
-    ensure!(
-        weight.group_size > 0 && weight.cols.is_multiple_of(weight.group_size),
-        "W8A16 cols {} not group-aligned to {}",
-        weight.cols,
-        weight.group_size
-    );
-    let (qw_ptr, _gqw) = qw.device_ptr(&ctx.stream);
-    let (scales_ptr, _gs) = scales.device_ptr(&ctx.stream);
-    let (x_ptr, _gx) = input.device_ptr(&ctx.stream);
-    let (out_ptr, _go) = output.device_ptr_mut(&ctx.stream);
-    let stream = ctx.stream.cu_stream();
-    // SAFETY: ptrs from live device allocations sized to the dims passed.
-    unsafe {
-        if m == 1 {
-            ffi::w8a16_gemv_cuda(
-                qw_ptr as *const i8,
-                scales_ptr as *const ffi::Half,
-                x_ptr as *const ffi::Half,
-                out_ptr as *mut ffi::Half,
-                weight.rows as i32,
-                weight.cols as i32,
-                weight.group_size as i32,
-                stream,
-            )
-            .result()?;
-        } else {
-            ffi::w8a16_gemv_batch_cuda(
-                qw_ptr as *const i8,
-                scales_ptr as *const ffi::Half,
-                x_ptr as *const ffi::Half,
-                out_ptr as *mut ffi::Half,
-                m as i32,
-                weight.rows as i32,
-                weight.cols as i32,
-                weight.group_size as i32,
-                stream,
-            )
-            .result()?;
-        }
+    if m == 1 {
+        cuda_ql::w8a16_gemv(
+            ctx,
+            qw,
+            scales,
+            input,
+            output,
+            weight.rows,
+            weight.cols,
+            weight.group_size,
+        )?;
+    } else {
+        cuda_ql::w8a16_gemv_batch(
+            ctx,
+            qw,
+            scales,
+            input,
+            output,
+            m,
+            weight.rows,
+            weight.cols,
+            weight.group_size,
+        )?;
     }
     Ok(())
 }
@@ -241,45 +172,29 @@ fn w4a16_gemv(
         .qscales
         .as_ref()
         .ok_or_else(|| anyhow!("W4A16 missing qscales"))?;
-    ensure!(
-        weight.group_size > 0 && weight.cols.is_multiple_of(weight.group_size),
-        "W4A16 cols {} not group-aligned to {}",
-        weight.cols,
-        weight.group_size
-    );
-    let (qw_ptr, _gqw) = qw.device_ptr(&ctx.stream);
-    let (scales_ptr, _gs) = scales.device_ptr(&ctx.stream);
-    let (x_ptr, _gx) = input.device_ptr(&ctx.stream);
-    let (out_ptr, _go) = output.device_ptr_mut(&ctx.stream);
-    let stream = ctx.stream.cu_stream();
-    // SAFETY: ptrs from live device allocations sized to the dims passed.
-    unsafe {
-        if m == 1 {
-            ffi::w4a16_gemv_cuda(
-                qw_ptr as *const u8,
-                scales_ptr as *const ffi::Half,
-                x_ptr as *const ffi::Half,
-                out_ptr as *mut ffi::Half,
-                weight.rows as i32,
-                weight.cols as i32,
-                weight.group_size as i32,
-                stream,
-            )
-            .result()?;
-        } else {
-            ffi::w4a16_gemv_batch_cuda(
-                qw_ptr as *const u8,
-                scales_ptr as *const ffi::Half,
-                x_ptr as *const ffi::Half,
-                out_ptr as *mut ffi::Half,
-                m as i32,
-                weight.rows as i32,
-                weight.cols as i32,
-                weight.group_size as i32,
-                stream,
-            )
-            .result()?;
-        }
+    if m == 1 {
+        cuda_ql::w4a16_gemv(
+            ctx,
+            qw,
+            scales,
+            input,
+            output,
+            weight.rows,
+            weight.cols,
+            weight.group_size,
+        )?;
+    } else {
+        cuda_ql::w4a16_gemv_batch(
+            ctx,
+            qw,
+            scales,
+            input,
+            output,
+            m,
+            weight.rows,
+            weight.cols,
+            weight.group_size,
+        )?;
     }
     Ok(())
 }
