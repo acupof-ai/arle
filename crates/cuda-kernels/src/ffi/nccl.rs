@@ -100,6 +100,7 @@ unsafe extern "C" {
         rank: i32,
     ) -> ncclResult_t;
     pub fn ncclCommDestroy(comm: ncclComm_t) -> ncclResult_t;
+    pub fn ncclCommAbort(comm: ncclComm_t) -> ncclResult_t;
     /// Split the parent comm into sub-comms. COLLECTIVE over `comm`: every
     /// parent rank must call it together. Ranks sharing a `color` join the same
     /// `newcomm`, ordered by `key`. `config` is passed as null (`*mut c_void`)

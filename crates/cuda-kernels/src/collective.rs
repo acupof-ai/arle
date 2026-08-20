@@ -180,7 +180,7 @@ mod nccl_backend {
         /// the parent comm: every parent rank must call `split` together, in the
         /// same order. Ranks sharing `color` join the same sub-comm, ordered by
         /// `key`. Returns a fresh `NcclBackend` owning the sub-comm: its `Drop`
-        /// independently calls `ncclCommDestroy` on the sub-comm, so there is no
+        /// independently aborts the sub-comm on drop, so there is no
         /// aliasing with — and no double-free of — the parent's comm.
         ///
         /// `world_size`/`rank` of the returned backend are the sub-comm's local
@@ -558,10 +558,12 @@ mod nccl_backend {
 
     impl Drop for NcclBackend {
         fn drop(&mut self) {
+            // Abort, not destroy: destroy blocks on pending collectives, so a rank
+            // unwinding from an error hangs here forever and its error never prints.
             // SAFETY: `comm` is owned solely by this backend (`split` returns a distinct
-            // sub-comm), so this is its one and only destroy.
+            // sub-comm), so this is its one and only teardown.
             unsafe {
-                let _ = nccl::ncclCommDestroy(self.comm);
+                let _ = nccl::ncclCommAbort(self.comm);
             }
         }
     }
