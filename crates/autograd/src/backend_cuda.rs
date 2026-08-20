@@ -542,7 +542,7 @@ impl Backend for CudaBackend {
         #[cfg(not(feature = "no-cuda"))]
         {
             let size = shape_size(shape);
-            let slice = self.stream.alloc_zeros::<f32>(size).map_err(|e| {
+            let slice = alloc_zeros_retry::<f32>(self, size).map_err(|e| {
                 cuda_alloc_failed_rich(self, "zeros", size * std::mem::size_of::<f32>(), &e)
             })?;
             Ok(DeviceHandle::Cuda(CudaStorage::new(slice)))

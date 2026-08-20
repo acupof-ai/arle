@@ -141,9 +141,7 @@ pub(super) fn cuda_causal_sdpa_decode_gqa(
 
     let out_shape = vec![q_shape[0], q_shape[1], 1, q_shape[3]];
     let out_total = shape_size(&out_shape);
-    let mut d_out = backend
-        .stream
-        .alloc_zeros::<f32>(out_total)
+    let mut d_out = alloc_zeros_retry::<f32>(backend, out_total)
         .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (decode sdpa)"))?;
 
     let batch_i = i32::try_from(q_shape[0])
@@ -232,9 +230,7 @@ pub(super) fn cuda_causal_sdpa_decode_gqa_cache(
 
     let out_shape = vec![q_shape[0], q_shape[1], 1, q_shape[3]];
     let out_total = shape_size(&out_shape);
-    let mut d_out = backend
-        .stream
-        .alloc_zeros::<f32>(out_total)
+    let mut d_out = alloc_zeros_retry::<f32>(backend, out_total)
         .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (cache decode sdpa)"))?;
 
     let batch_i = i32::try_from(q_shape[0])
@@ -387,9 +383,7 @@ pub(super) fn cuda_qwen_decode_prepare_q(
     let batch = q_full_shape[0];
     let out_shape = vec![batch, query_heads, 1, head_dim];
     let out_total = shape_size(&out_shape);
-    let mut d_q = backend
-        .stream
-        .alloc_zeros::<f32>(out_total)
+    let mut d_q = alloc_zeros_retry::<f32>(backend, out_total)
         .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (qwen prep q)"))?;
 
     let batch_i = i32::try_from(batch)
@@ -405,7 +399,7 @@ pub(super) fn cuda_qwen_decode_prepare_q(
     const SHARED: u32 = BLOCK * std::mem::size_of::<f32>() as u32;
 
     let gate_handle = if gated {
-        let mut d_gate = backend.stream.alloc_zeros::<f32>(out_total).map_err(|_| {
+        let mut d_gate = alloc_zeros_retry::<f32>(backend, out_total).map_err(|_| {
             AutogradError::TapeInvariant("cuda alloc_zeros failed (qwen prep gate)")
         })?;
         launch_rows(
@@ -532,13 +526,9 @@ pub(super) fn cuda_qwen_decode_prepare_kv(
     let batch = k_full_shape[0];
     let out_shape = vec![batch, kv_heads, 1, head_dim];
     let out_total = shape_size(&out_shape);
-    let mut d_k = backend
-        .stream
-        .alloc_zeros::<f32>(out_total)
+    let mut d_k = alloc_zeros_retry::<f32>(backend, out_total)
         .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (qwen prep k)"))?;
-    let mut d_v = backend
-        .stream
-        .alloc_zeros::<f32>(out_total)
+    let mut d_v = alloc_zeros_retry::<f32>(backend, out_total)
         .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (qwen prep v)"))?;
 
     let batch_i = i32::try_from(batch)

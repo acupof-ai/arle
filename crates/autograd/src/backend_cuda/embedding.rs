@@ -24,9 +24,7 @@ pub(super) fn cuda_embedding(
         .stream
         .clone_htod(ids)
         .map_err(|_| AutogradError::TapeInvariant("cuda htod copy failed"))?;
-    let mut d_out = backend
-        .stream
-        .alloc_zeros::<f32>(out_len)
+    let mut d_out = alloc_zeros_retry::<f32>(backend, out_len)
         .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed"))?;
 
     let n_i32 = i32::try_from(n_ids)
@@ -136,9 +134,7 @@ pub(super) fn cuda_embedding_device(
     };
 
     if backend.tape_bf16() {
-        let mut d_out = backend
-            .stream
-            .alloc_zeros::<u16>(out_len)
+        let mut d_out = alloc_zeros_retry::<u16>(backend, out_len)
             .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (embedding)"))?;
         let func = backend.kernels.function_for(kernel_name, TapeDtype::Bf16)?;
         launch_rows(&backend.stream, &func, n_ids, BLOCK, 0, |mut builder| {
@@ -157,9 +153,7 @@ pub(super) fn cuda_embedding_device(
         return Ok(DeviceHandle::CudaBf16(CudaBf16Storage::new(d_out)));
     }
 
-    let mut d_out = backend
-        .stream
-        .alloc_zeros::<f32>(out_len)
+    let mut d_out = alloc_zeros_retry::<f32>(backend, out_len)
         .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (embedding)"))?;
     launch_rows(
         &backend.stream,
@@ -209,9 +203,7 @@ pub(super) fn cuda_embedding_from_f32_ids_device(
         });
     }
     let out_len = n_ids * dim;
-    let mut d_out = backend
-        .stream
-        .alloc_zeros::<f32>(out_len)
+    let mut d_out = alloc_zeros_retry::<f32>(backend, out_len)
         .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (embedding f32 ids)"))?;
 
     let n_i32 = i32::try_from(n_ids)
@@ -337,7 +329,7 @@ pub(super) fn cuda_embedding_backward_device(
 
     let out_len = vocab_size * hidden_dim;
     // alloc_zeros gives the required zero-init contract — the kernel only adds.
-    let mut d_grad = backend.stream.alloc_zeros::<f32>(out_len).map_err(|_| {
+    let mut d_grad = alloc_zeros_retry::<f32>(backend, out_len).map_err(|_| {
         AutogradError::TapeInvariant("cuda alloc_zeros failed (embedding_backward_device)")
     })?;
 

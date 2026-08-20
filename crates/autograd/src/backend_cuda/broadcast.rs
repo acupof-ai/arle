@@ -67,9 +67,7 @@ pub(super) fn cuda_add_broadcast(
         .stream
         .clone_htod(&b_strides)
         .map_err(|_| AutogradError::TapeInvariant("cuda htod copy failed"))?;
-    let mut d_out = backend
-        .stream
-        .alloc_zeros::<f32>(total)
+    let mut d_out = alloc_zeros_retry::<f32>(backend, total)
         .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed"))?;
 
     let out_rank_i32 = i32::try_from(out_rank)
@@ -149,9 +147,7 @@ pub(super) fn cuda_add_broadcast_device(
                 size: total,
             });
         }
-        let mut d_out = backend
-            .stream
-            .alloc_zeros::<u16>(total)
+        let mut d_out = alloc_zeros_retry::<u16>(backend, total)
             .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed"))?;
         let func = backend
             .kernels
@@ -186,9 +182,7 @@ pub(super) fn cuda_add_broadcast_device(
             size: b_size,
         });
     }
-    let mut d_out = backend
-        .stream
-        .alloc_zeros::<f32>(total)
+    let mut d_out = alloc_zeros_retry::<f32>(backend, total)
         .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed"))?;
 
     launch_1d(
@@ -433,7 +427,7 @@ pub(super) fn cuda_add_broadcast_backward_device(
     if up_bf16 {
         let d_up_op = backend.bf16_operand(upstream, "add_broadcast_backward_device")?;
         let d_up = d_up_op.get();
-        let mut d_grad = backend.stream.alloc_zeros::<u16>(b_total).map_err(|_| {
+        let mut d_grad = alloc_zeros_retry::<u16>(backend, b_total).map_err(|_| {
             AutogradError::TapeInvariant("cuda alloc_zeros failed (add_broadcast_backward_device)")
         })?;
         let func = backend
@@ -462,7 +456,7 @@ pub(super) fn cuda_add_broadcast_backward_device(
     }
 
     let d_up = backend.cuda_slice(upstream, "add_broadcast_backward_device")?;
-    let mut d_grad = backend.stream.alloc_zeros::<f32>(b_total).map_err(|_| {
+    let mut d_grad = alloc_zeros_retry::<f32>(backend, b_total).map_err(|_| {
         AutogradError::TapeInvariant("cuda alloc_zeros failed (add_broadcast_backward_device)")
     })?;
     launch_rows(

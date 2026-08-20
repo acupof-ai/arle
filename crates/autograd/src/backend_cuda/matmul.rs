@@ -29,9 +29,7 @@ impl CudaBackend {
             return Ok(None);
         }
         let padded_len = Self::checked_bf16_len(padded_rows, cols, op)?;
-        let mut padded = self
-            .stream
-            .alloc_zeros::<u16>(padded_len)
+        let mut padded = alloc_zeros_retry::<u16>(self, padded_len)
             .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (bf16 pad)"))?;
         self.stream
             .memcpy_dtod(src, &mut padded)
@@ -59,9 +57,7 @@ impl CudaBackend {
                 let m = a_shape[0];
                 let k = a_shape[1];
                 let n = b_shape[1];
-                let mut c = self
-                    .stream
-                    .alloc_zeros::<f32>(m * n)
+                let mut c = alloc_zeros_retry::<f32>(self, m * n)
                     .map_err(|_| cuda_alloc_failed("matmul", vec![m, n]))?;
 
                 let cfg = GemmConfig::<f32> {
@@ -90,9 +86,7 @@ impl CudaBackend {
                 let m = a_shape[1];
                 let k = a_shape[2];
                 let n = b_shape[2];
-                let mut c = self
-                    .stream
-                    .alloc_zeros::<f32>(batch * m * n)
+                let mut c = alloc_zeros_retry::<f32>(self, batch * m * n)
                     .map_err(|_| cuda_alloc_failed("matmul_batched", vec![batch, m, n]))?;
 
                 let gemm = GemmConfig::<f32> {
@@ -159,9 +153,7 @@ impl CudaBackend {
         let n = b_shape[0];
         let a_bf16 = self.local_f32_as_bf16(a, a.len())?;
         if m == 0 || n == 0 || k == 0 {
-            let c = self
-                .stream
-                .alloc_zeros::<f32>(m * n)
+            let c = alloc_zeros_retry::<f32>(self, m * n)
                 .map_err(|_| cuda_alloc_failed("matmul_bt_bf16_empty", vec![m, n]))?;
             return Ok((c, out_shape));
         }
@@ -185,9 +177,7 @@ impl CudaBackend {
         let a_for_gemm = padded_a.as_ref().unwrap_or(&a_bf16);
         let c_len =
             Self::checked_bf16_len(padded_m, n, "bf16 matmul_bt padded output length overflow")?;
-        let mut c_out = self
-            .stream
-            .alloc_zeros::<f32>(c_len)
+        let mut c_out = alloc_zeros_retry::<f32>(self, c_len)
             .map_err(|_| cuda_alloc_failed("matmul_bt_bf16", vec![padded_m, n]))?;
         {
             let (b_ptr, _b_guard) = b.device_ptr(&self.stream);
@@ -264,9 +254,7 @@ impl CudaBackend {
         let k = b_shape[1];
         let a_bf16 = self.local_f32_as_bf16(a, a.len())?;
         if m == 0 || n == 0 || k == 0 {
-            let c = self
-                .stream
-                .alloc_zeros::<f32>(m * k)
+            let c = alloc_zeros_retry::<f32>(self, m * k)
                 .map_err(|_| cuda_alloc_failed("matmul_bf16_empty", vec![m, k]))?;
             return Ok((c, out_shape));
         }
@@ -290,9 +278,7 @@ impl CudaBackend {
         let a_for_gemm = padded_a.as_ref().unwrap_or(&a_bf16);
         let c_len =
             Self::checked_bf16_len(padded_m, k, "bf16 matmul padded output length overflow")?;
-        let mut c_out = self
-            .stream
-            .alloc_zeros::<f32>(c_len)
+        let mut c_out = alloc_zeros_retry::<f32>(self, c_len)
             .map_err(|_| cuda_alloc_failed("matmul_bf16", vec![padded_m, k]))?;
         {
             let (b_ptr, _b_guard) = b.device_ptr(&self.stream);
@@ -352,7 +338,7 @@ impl CudaBackend {
                 "cuda backend fp8 dequant handle size does not match shape",
             ));
         }
-        let mut out = self.stream.alloc_zeros::<u16>(total).map_err(|e| {
+        let mut out = alloc_zeros_retry::<u16>(self, total).map_err(|e| {
             // Surface the real driver error: alloc failure here is either true
             // OOM or a prior async fault turning sticky — indistinguishable
             // without the code (smoke 2026-07-03 hit both attribution paths).
@@ -406,7 +392,7 @@ impl CudaBackend {
                 "cuda backend nvfp4 dequant handle size does not match shape",
             ));
         }
-        let mut out = self.stream.alloc_zeros::<u16>(total).map_err(|e| {
+        let mut out = alloc_zeros_retry::<u16>(self, total).map_err(|e| {
             eprintln!("[autograd] alloc_zeros {total} x u16 failed (nvfp4 dequant): {e}");
             AutogradError::TapeInvariant("cuda alloc_zeros failed (nvfp4 dequant)")
         })?;
@@ -504,19 +490,13 @@ impl CudaBackend {
         let a_bf16 = self.local_f32_as_bf16(a, a.len())?; // reuses the bf16-GEMM cast
         let scale_stride_m = m.div_ceil(4) * 4; // TMA 4-row alignment of the activation scales
         let scale_cols = k.div_ceil(128);
-        let input_fp8 = self
-            .stream
-            .alloc_zeros::<u8>(m * k)
+        let input_fp8 = alloc_zeros_retry::<u8>(self, m * k)
             .map_err(|_| cuda_alloc_failed("fp8 deepgemm input", vec![m, k]))?;
-        let input_scales = self
-            .stream
-            .alloc_zeros::<f32>(scale_stride_m * scale_cols)
+        let input_scales = alloc_zeros_retry::<f32>(self, scale_stride_m * scale_cols)
             .map_err(|_| {
                 cuda_alloc_failed("fp8 deepgemm scales", vec![scale_stride_m, scale_cols])
             })?;
-        let out_bf16 = self
-            .stream
-            .alloc_zeros::<u16>(m * n)
+        let out_bf16 = alloc_zeros_retry::<u16>(self, m * n)
             .map_err(|_| cuda_alloc_failed("fp8 deepgemm out", vec![m, n]))?;
         // Single-group quantize metadata: one dense "expert" covering all m rows.
         let active_experts = self
@@ -665,9 +645,7 @@ pub(super) fn cuda_matmul_bt(
     let m = a_shape[0];
     let k = a_shape[1];
     let n = b_shape[0];
-    let mut c = backend
-        .stream
-        .alloc_zeros::<f32>(m * n)
+    let mut c = alloc_zeros_retry::<f32>(backend, m * n)
         .map_err(|_| cuda_alloc_failed("matmul_bt", vec![m, n]))?;
 
     let cfg = GemmConfig::<f32> {

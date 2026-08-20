@@ -39,9 +39,7 @@ pub(super) fn cuda_rms_norm(
         .stream
         .clone_htod(weight)
         .map_err(|_| AutogradError::TapeInvariant("cuda htod copy failed"))?;
-    let mut d_out = backend
-        .stream
-        .alloc_zeros::<f32>(expected)
+    let mut d_out = alloc_zeros_retry::<f32>(backend, expected)
         .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed"))?;
 
     const BLOCK: u32 = 256;
@@ -109,9 +107,7 @@ pub(super) fn cuda_rms_norm_device(
                 size: expected,
             });
         }
-        let mut d_out = backend
-            .stream
-            .alloc_zeros::<u16>(expected)
+        let mut d_out = alloc_zeros_retry::<u16>(backend, expected)
             .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed"))?;
         let func = backend
             .kernels
@@ -142,9 +138,7 @@ pub(super) fn cuda_rms_norm_device(
             size: expected,
         });
     }
-    let mut d_out = backend
-        .stream
-        .alloc_zeros::<f32>(expected)
+    let mut d_out = alloc_zeros_retry::<f32>(backend, expected)
         .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed"))?;
 
     launch_rows(
@@ -243,7 +237,7 @@ pub(super) fn cuda_rms_norm_backward_device(
             )?;
         }
         let grad_x = if need_grad_x {
-            let mut d_grad = backend.stream.alloc_zeros::<u16>(total).map_err(|_| {
+            let mut d_grad = alloc_zeros_retry::<u16>(backend, total).map_err(|_| {
                 AutogradError::TapeInvariant("cuda alloc_zeros failed (rms_norm_backward grad_x)")
             })?;
             if rows > 0 {
@@ -273,7 +267,7 @@ pub(super) fn cuda_rms_norm_backward_device(
             None
         };
         let grad_w = if need_grad_w {
-            let mut d_grad = backend.stream.alloc_zeros::<f32>(hidden).map_err(|_| {
+            let mut d_grad = alloc_zeros_retry::<f32>(backend, hidden).map_err(|_| {
                 AutogradError::TapeInvariant("cuda alloc_zeros failed (rms_norm_backward grad_w)")
             })?;
             if rows > 0 && hidden > 0 {
@@ -346,7 +340,7 @@ pub(super) fn cuda_rms_norm_backward_device(
     }
 
     let grad_x = if need_grad_x {
-        let mut d_grad = backend.stream.alloc_zeros::<f32>(total).map_err(|_| {
+        let mut d_grad = alloc_zeros_retry::<f32>(backend, total).map_err(|_| {
             AutogradError::TapeInvariant("cuda alloc_zeros failed (rms_norm_backward grad_x)")
         })?;
         if rows > 0 {
@@ -379,7 +373,7 @@ pub(super) fn cuda_rms_norm_backward_device(
     };
 
     let grad_w = if need_grad_w {
-        let mut d_grad = backend.stream.alloc_zeros::<f32>(hidden).map_err(|_| {
+        let mut d_grad = alloc_zeros_retry::<f32>(backend, hidden).map_err(|_| {
             AutogradError::TapeInvariant("cuda alloc_zeros failed (rms_norm_backward grad_w)")
         })?;
         if rows > 0 && hidden > 0 {
