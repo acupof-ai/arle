@@ -21,20 +21,50 @@ impl Qwen35Layer {
         // CP shards sequence; linear_attention_core_cp all-to-alls it into the head
         // axis and runs the full-seq recurrence on this rank's head slice. cp.size==1
         // is the single-card core verbatim.
-        let linear = autograd::ops::linear_attention_core_cp(
-            qkv,
-            z,
-            b_proj,
-            a_proj,
-            attn.conv1d_weight,
-            attn.dt_bias,
-            attn.a_log,
-            attn.norm,
-            la_params(cfg, batch, seq_len),
-            cp.size,
-            cp.rank,
+        //
+        // Its own checkpoint sub-group. A layer-sized group frees nothing until the
+        // whole layer's backward is done, so the core's transport chain and scan
+        // scratch stay resident through the projection and out_proj backwards —
+        // the layer peak is the SUM over its stages. A nested boundary makes it the
+        // MAX. Inert in the forward: `checkpoint` passes straight through while the
+        // outer group has the tape disabled, so this only splits the replay.
+        let params = la_params(cfg, batch, seq_len);
+        let (cp_size, cp_rank) = (cp.size, cp.rank);
+        let linear = autograd::ops::checkpoint(
+            vec![
+                qkv,
+                z,
+                b_proj,
+                a_proj,
+                attn.conv1d_weight,
+                attn.dt_bias,
+                attn.a_log,
+                attn.norm,
+            ],
             store,
             tape,
+            move |st, tp, inp| {
+                let [qkv, z, b_proj, a_proj, conv1d_weight, dt_bias, a_log, norm] = inp else {
+                    return Err(autograd::AutogradError::TapeInvariant(
+                        "linear-attention core checkpoint expects 8 saved inputs",
+                    ));
+                };
+                autograd::ops::linear_attention_core_cp(
+                    *qkv,
+                    *z,
+                    *b_proj,
+                    *a_proj,
+                    *conv1d_weight,
+                    *dt_bias,
+                    *a_log,
+                    *norm,
+                    params,
+                    cp_size,
+                    cp_rank,
+                    st,
+                    tp,
+                )
+            },
         )?;
         Ok(attn.out_proj.forward(linear, store, tape)?)
     }
