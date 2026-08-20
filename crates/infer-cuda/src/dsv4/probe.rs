@@ -119,10 +119,8 @@ impl Dsv4ProbeCapture {
 
         let lens_layers = self.lens_layers.clone();
         for &layer_idx in &lens_layers {
-            if layer_idx != last_layer {
-                self.compute_layer_logits(model, layer_idx, rows)?;
-                self.d2h(model, rows)?;
-            }
+            self.compute_layer_logits(model, layer_idx, rows)?;
+            self.d2h(model, rows)?;
             for (r, &pos) in self.positions.iter().take(rows).enumerate() {
                 let base = r * vocab;
                 let slice = &self.host_logits[base..base + vocab];
