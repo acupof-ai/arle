@@ -17,11 +17,12 @@ if [[ "$MODE" == "dspark" ]]; then
   )
 fi
 
-CUDA_VISIBLE_DEVICES="0,1,2,3" INFER_TP_SIZE=4 INFER_CUDA_DEVICES=0,1,2,3 \
+CUDA_VISIBLE_DEVICES="0,1,2,3" \
   ARLE_DSV4_MOE_BACKEND=allreduce \
   DG_JIT_CACHE_DIR=/host/deepgemm-warm \
   ./target/release/arle serve --backend cuda \
     --model-path /host/DeepSeek-V4-Flash-FP8 \
+    --tensor-parallel-size 4 \
     "${DSV4_FLAGS[@]}" \
     --max-running-requests 32 \
     --port 8000
