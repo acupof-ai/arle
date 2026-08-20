@@ -321,7 +321,7 @@ mod workspace;
 pub(crate) use workspace::*;
 
 #[path = "qwen35_load.rs"]
-mod load;
+pub(crate) mod load;
 
 #[path = "qwen35_forward.rs"]
 mod forward;

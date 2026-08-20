@@ -5,7 +5,9 @@
 //! `ops`/`attention` kernel wrappers. Weight loading is in `loader`, the step
 //! driver + sampling in `executor`.
 
-use anyhow::{Result, ensure};
+use std::path::Path;
+
+use anyhow::{Context, Result, anyhow, ensure};
 use cuda_kernels::prelude::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStates, PagedKVPool};
 use infer_plan::SamplingParams;
 use qwen3_spec::Qwen3Config;
@@ -13,11 +15,14 @@ use qwen3_spec::Qwen3Config;
 use crate::attention::paged_attention;
 use crate::decode_graph::DecodeGraphContext;
 use crate::executor::sample_cuda_token;
-use crate::loader::{MoeLayerWeights, PageMeta};
+use crate::loader::{
+    DEFAULT_ROPE_CACHE_LEN, MoeLayerWeights, PageMeta, SafetensorLoader, build_tp_runtime,
+    validate_clean_bf16_config,
+};
 use crate::moe::moe_forward;
 use crate::ops::{
-    add_batch, copy_row_to_vec, embedding_batch, gemm_batch, gemv, rms_norm_batch, rms_norm_vec,
-    silu_mul, upload_i32,
+    add_batch, copy_row_to_vec, embedding_batch, gemm_batch, gemv, precompute_rope, rms_norm_batch,
+    rms_norm_vec, silu_mul, upload_i32,
 };
 
 pub(crate) struct CudaModel {
@@ -585,5 +590,170 @@ impl CudaModel {
             gemv(&self.ctx, self.output_projection(), last_normed, logits)
         })?;
         Ok(())
+    }
+}
+
+impl CudaModel {
+    pub(crate) fn from_safetensors(model_path: &Path) -> Result<Self> {
+        let tp = build_tp_runtime(false)?;
+        Self::from_safetensors_with_tp(model_path, tp)
+    }
+
+    pub(crate) fn from_safetensors_with_tp(
+        model_path: &Path,
+        tp: crate::tp::TpRuntime,
+    ) -> Result<Self> {
+        // CP prefill (T2.b) is a qwen35 path; this loader shards by raw tp
+        // rank and its attention reduces run on the global comm.
+        ensure!(
+            tp.attn_cp_size() == 1,
+            "attn_cp>1 is not supported by the dense Qwen executor (qwen35-only)"
+        );
+        let config = Qwen3Config::from_json_file(model_path.join("config.json"))
+            .with_context(|| format!("load Qwen3 config from {}", model_path.display()))?;
+        validate_clean_bf16_config(&config)?;
+
+        let tp_cfg = *tp.config();
+        // kv8 kernels and the all-reduce require a uniform per-rank attention shape.
+        let (local_q_heads, local_kv_heads) = if tp_cfg.is_single() {
+            (config.num_attention_heads, config.num_key_value_heads)
+        } else {
+            infer_topo::head_shard(
+                config.num_attention_heads,
+                config.num_key_value_heads,
+                &tp_cfg,
+            )
+            .map_err(|e| anyhow!("TP head shard failed: {e}"))?
+        };
+
+        let ctx = DeviceContext::new()?;
+        let loader = SafetensorLoader::new(model_path)?;
+
+        // lm_head / embed_tokens stay replicated — sharding them would need an
+        // all-gather
+        // of logits.
+        let embed_tokens = loader.load_matrix(&ctx, config.embed_tokens_tensor_name())?;
+        let lm_head = if config.tie_word_embeddings {
+            None
+        } else {
+            Some(loader.load_matrix(&ctx, config.lm_head_tensor_name())?)
+        };
+
+        let head_dim = config.head_dim;
+        let mut layers = Vec::with_capacity(config.num_hidden_layers);
+        for layer_idx in 0..config.num_hidden_layers {
+            let names = config.layer_tensor_names(layer_idx);
+            let (q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj) =
+                if tp_cfg.is_single() {
+                    (
+                        loader.load_matrix(&ctx, &names.q_proj)?,
+                        loader.load_matrix(&ctx, &names.k_proj)?,
+                        loader.load_matrix(&ctx, &names.v_proj)?,
+                        loader.load_matrix(&ctx, &names.o_proj)?,
+                        loader.load_matrix(&ctx, &names.mlp_gate_proj)?,
+                        loader.load_matrix(&ctx, &names.mlp_up_proj)?,
+                        loader.load_matrix(&ctx, &names.mlp_down_proj)?,
+                    )
+                } else {
+                    // Whole-head boundaries keep o_proj's input shard and head count in
+                    // agreement; K/V index by replica-aware KV block, not by rank.
+                    let kv_block =
+                        infer_topo::kv_load_block_index(config.num_key_value_heads, &tp_cfg)?;
+                    (
+                        loader.load_qkv_head_sharded(
+                            &ctx,
+                            &names.q_proj,
+                            local_q_heads,
+                            head_dim,
+                            tp_cfg.rank,
+                        )?,
+                        loader.load_qkv_head_sharded(
+                            &ctx,
+                            &names.k_proj,
+                            local_kv_heads,
+                            head_dim,
+                            kv_block,
+                        )?,
+                        loader.load_qkv_head_sharded(
+                            &ctx,
+                            &names.v_proj,
+                            local_kv_heads,
+                            head_dim,
+                            kv_block,
+                        )?,
+                        loader.load_matrix_sharded(
+                            &ctx,
+                            &names.o_proj,
+                            infer_topo::ParallelLinearKind::Row,
+                            &tp_cfg,
+                        )?,
+                        loader.load_matrix_sharded(
+                            &ctx,
+                            &names.mlp_gate_proj,
+                            infer_topo::ParallelLinearKind::Column,
+                            &tp_cfg,
+                        )?,
+                        loader.load_matrix_sharded(
+                            &ctx,
+                            &names.mlp_up_proj,
+                            infer_topo::ParallelLinearKind::Column,
+                            &tp_cfg,
+                        )?,
+                        loader.load_matrix_sharded(
+                            &ctx,
+                            &names.mlp_down_proj,
+                            infer_topo::ParallelLinearKind::Row,
+                            &tp_cfg,
+                        )?,
+                    )
+                };
+            layers.push(TransformerBlock {
+                input_layernorm: loader.load_vec(&ctx, &names.input_layernorm)?,
+                attention: Attention {
+                    q_proj,
+                    k_proj,
+                    v_proj,
+                    o_proj,
+                    q_norm: loader.load_vec(&ctx, &names.q_norm)?,
+                    k_norm: loader.load_vec(&ctx, &names.k_norm)?,
+                },
+                post_attention_layernorm: loader.load_vec(&ctx, &names.post_attention_layernorm)?,
+                mlp: Some(Mlp {
+                    gate_proj,
+                    up_proj,
+                    down_proj,
+                }),
+                moe: None,
+            });
+        }
+        let norm = loader.load_vec(&ctx, config.norm_tensor_name())?;
+
+        let rope_len = config
+            .rope_cache_len_hint()
+            .unwrap_or(DEFAULT_ROPE_CACHE_LEN)
+            .max(DEFAULT_ROPE_CACHE_LEN);
+        let (cos_cache, sin_cache) = precompute_rope(
+            &ctx,
+            config.head_dim,
+            rope_len,
+            config.rope_theta,
+            config.rope_scaling.as_ref(),
+        )?;
+        ctx.sync()?;
+
+        Ok(Self {
+            ctx,
+            config,
+            embed_tokens,
+            lm_head,
+            layers,
+            norm,
+            cos_cache,
+            sin_cache,
+            tp,
+            local_q_heads,
+            local_kv_heads,
+            moe_config: None,
+        })
     }
 }
