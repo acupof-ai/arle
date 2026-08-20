@@ -66,3 +66,346 @@ numeric_tolerance_mode = "abs+rel*abs(reference)"
 numeric_abs_tolerance = 0.01
 numeric_rel_tolerance = 0.02
 fallback_status = "legacy-default-unqualified"
+
+[[semantic]]
+id = "qwen.w8a16_projection"
+kind = "composite"
+inputs = ["activation", "int8_weight", "group_scales"]
+outputs = ["projection"]
+reference = "cuda.qwen.w8a16_gemv"
+correctness_gate = "numeric+e2e"
+
+[[implementation]]
+id = "cuda.qwen.w8a16_marlin_gemm"
+semantic = "qwen.w8a16_projection"
+provider = "marlin"
+source = "crates/infer-cuda/src/ops/quant_linear_int.rs"
+legality = "sm>=8 && marlin_repacked_pair"
+fallback = "cuda.qwen.w8a16_gemv"
+
+[[implementation]]
+id = "cuda.qwen.w8a16_dequant_bf16_gemm"
+semantic = "qwen.w8a16_projection"
+provider = "cublas"
+source = "crates/infer-cuda/src/ops/quant_linear_int.rs"
+legality = "source_pair && group_aligned && m>=QWEN_FP8_DEQUANT_GEMM_MIN_M && !marlin_route"
+fallback = "cuda.qwen.w8a16_gemv"
+
+[[implementation]]
+id = "cuda.qwen.w8a16_gemv"
+semantic = "qwen.w8a16_projection"
+provider = "arle"
+source = "crates/infer-cuda/src/ops/quant_linear_int.rs"
+legality = "source_pair (freed after Marlin repack; m==1 singular ABI, else batched)"
+fallback = ""
+
+[policy."qwen.w8a16_projection"]
+fallback_status = "legacy-default-unqualified"
+
+[[semantic]]
+id = "qwen.w4a16_projection"
+kind = "composite"
+inputs = ["activation", "int4_weight", "group_scales"]
+outputs = ["projection"]
+reference = "cuda.qwen.w4a16_gemv"
+correctness_gate = "numeric+e2e"
+
+[[implementation]]
+id = "cuda.qwen.w4a16_gemv"
+semantic = "qwen.w4a16_projection"
+provider = "arle"
+source = "crates/infer-cuda/src/ops/quant_linear_int.rs"
+legality = "always (only route; source_pair + group alignment validated at load)"
+fallback = ""
+
+[policy."qwen.w4a16_projection"]
+fallback_status = "legacy-default-unqualified"
+
+[[semantic]]
+id = "qwen.fp4_projection"
+kind = "composite"
+inputs = ["activation", "fp4_marlin_weight", "group_scales", "global_scale"]
+outputs = ["projection"]
+reference = "cuda.qwen.fp4_marlin_gemm"
+correctness_gate = "numeric+e2e"
+
+[[implementation]]
+id = "cuda.qwen.fp4_deepgemm_prefill"
+semantic = "qwen.fp4_projection"
+provider = "deepgemm"
+source = "crates/infer-cuda/src/ops/quant_linear_fp4.rs"
+legality = "sm90 && group_size==16 && rows%64==0 && cols%128==0 && sfb+global_scale && m>=max(QWEN_FP4_DEEPGEMM_MIN_M, deepgemm_floor)"
+fallback = "cuda.qwen.fp4_marlin_gemm"
+
+[[implementation]]
+id = "cuda.qwen.fp4_marlin_gemm"
+semantic = "qwen.fp4_projection"
+provider = "marlin"
+source = "crates/infer-cuda/src/ops/quant_linear_fp4.rs"
+legality = "sm>=8 && marlin pair (mandatory: NVFP4 load fails without it; no source arm)"
+fallback = ""
+
+[policy."qwen.fp4_projection"]
+fallback_status = "legacy-default-unqualified"
+
+[[semantic]]
+id = "qwen35.full_attention"
+kind = "composite"
+inputs = ["q", "k_cache", "v_cache", "start_pos"]
+outputs = ["attn_out"]
+reference = "cuda.qwen35.attn_nonpaged_prefill"
+correctness_gate = "numeric+e2e"
+
+[[implementation]]
+id = "cuda.qwen35.attn_fa2_sm70"
+semantic = "qwen35.full_attention"
+provider = "arle"
+source = "crates/infer-cuda/src/qwen35_attention.rs"
+legality = "sm<8; decode arm additionally requires !qwen35_decode_graph (host kv_len not replay-safe)"
+fallback = "cuda.qwen35.attn_nonpaged_prefill"
+
+[[implementation]]
+id = "cuda.qwen35.attn_nonpaged_decode_devpos"
+semantic = "qwen35.full_attention"
+provider = "arle"
+source = "crates/infer-cuda/src/qwen35_attention.rs"
+legality = "seq_len==1 (device start_pos; the graph-capture decode lane)"
+fallback = ""
+
+[[implementation]]
+id = "cuda.qwen35.attn_fa3_hd256"
+semantic = "qwen35.full_attention"
+provider = "fa3"
+source = "crates/infer-cuda/src/qwen35_attention.rs"
+legality = "seq_len>1 && head_dim==256 && sm==9.0 && --qwen35-fa3 && real-kernel marker (stub build declines)"
+fallback = "cuda.qwen35.attn_nonpaged_prefill"
+
+[[implementation]]
+id = "cuda.qwen35.attn_nonpaged_prefill"
+semantic = "qwen35.full_attention"
+provider = "arle"
+source = "crates/infer-cuda/src/qwen35_attention.rs"
+legality = "always"
+fallback = ""
+
+[policy."qwen35.full_attention"]
+fallback_status = "legacy-default-unqualified"
+
+[[semantic]]
+id = "qwen35.full_attention_paged"
+kind = "composite"
+inputs = ["q", "kv_pool", "page_table", "q_indptr", "kv_lens"]
+outputs = ["attn_out"]
+reference = "cuda.qwen35.paged_attn_v1"
+correctness_gate = "numeric+e2e"
+
+[[implementation]]
+id = "cuda.qwen35.paged_quantized_fa3"
+semantic = "qwen35.full_attention_paged"
+provider = "arle"
+source = "crates/infer-cuda/src/qwen35_attention.rs"
+legality = "decode && pool in {FP8E4M3,INT8} && head_dim==256 && (seq_len<=FA3_MAX_QLEN || batch==1) && split-KV workspace fits"
+fallback = "cuda.qwen35.paged_fa3_bf16"
+
+[[implementation]]
+id = "cuda.qwen35.paged_fa3_bf16"
+semantic = "qwen35.full_attention_paged"
+provider = "fa3"
+source = "crates/infer-cuda/src/qwen35_attention.rs"
+legality = "sm==9.0 && --qwen35-fa3 && head_dim==256 && (seq_len<=FA3_MAX_QLEN || batch==1) && pool in {BF16,FP8E4M3,INT8}; the only graph-capture paged lane"
+fallback = "cuda.qwen35.paged_attn_v1"
+
+[[implementation]]
+id = "cuda.qwen35.paged_attn_v1"
+semantic = "qwen35.full_attention_paged"
+provider = "tilelang"
+source = "crates/infer-cuda/src/qwen35_attention.rs"
+legality = "pool BF16 && resolved (head_dim, q_heads, kv_heads, phase) instantiation; !graph_capture (num_pages baked as host arg)"
+fallback = ""
+
+[[implementation]]
+id = "cuda.qwen35.paged_varlen_quantized"
+semantic = "qwen35.full_attention_paged"
+provider = "arle"
+source = "crates/infer-cuda/src/qwen35_attention.rs"
+legality = "pool in {FP8E4M3,INT8}; terminal quantized arm; !graph_capture"
+fallback = ""
+
+[policy."qwen35.full_attention_paged"]
+fallback_status = "legacy-default-unqualified"
+
+[[semantic]]
+id = "dsv4.mla_attention"
+kind = "composite"
+inputs = ["q_prepared", "k_prepared", "latent_kv_pool", "selected_indices"]
+outputs = ["latent_attn_out"]
+reference = "cuda.dsv4.flashmla_sparse_decode"
+correctness_gate = "numeric+e2e"
+
+[[implementation]]
+id = "cuda.dsv4.flashmla_sparse_prefill"
+semantic = "dsv4.mla_attention"
+provider = "flashmla"
+source = "crates/infer-cuda/src/attention.rs"
+legality = "token_count>1 && HAS_FLASHMLA (sm90 build) && geometry MODEL1(512,64)|V32(576,64,kv512) && global_heads in {64,128} && topk%128==0; no fallback arm — errors when unavailable"
+fallback = ""
+
+[[implementation]]
+id = "cuda.dsv4.flashmla_sparse_decode"
+semantic = "dsv4.mla_attention"
+provider = "flashmla"
+source = "crates/infer-cuda/src/attention.rs"
+legality = "token_count==1 && HAS_FLASHMLA && --dsv4-flashmla-decode (default on) && device start_pos; no fallback arm — errors when disabled"
+fallback = ""
+
+[policy."dsv4.mla_attention"]
+fallback_status = "legacy-default-unqualified"
+
+[[semantic]]
+id = "qwen35.linear_attention"
+kind = "composite"
+inputs = ["qkv", "b", "a", "conv_state", "gdr_state"]
+outputs = ["gdr_out"]
+reference = "cuda.qwen35.gdr_recurrent_scan"
+correctness_gate = "numeric+e2e"
+
+[[implementation]]
+id = "cuda.qwen35.conv1d_front"
+semantic = "qwen35.linear_attention"
+provider = "arle"
+source = "crates/infer-cuda/src/qwen35_attention.rs"
+legality = "always (depthwise conv stage ahead of GDR; decode-batch / prefill / prefill-varlen ABI by shape)"
+fallback = ""
+
+[[implementation]]
+id = "cuda.qwen35.gdr_decode"
+semantic = "qwen35.linear_attention"
+provider = "arle"
+source = "crates/infer-cuda/src/qwen35_attention.rs"
+legality = "seq_len==1 (singular ABI) or packed decode batch (batched ABI)"
+fallback = ""
+
+[[implementation]]
+id = "cuda.qwen35.gdr_recurrent_scan"
+semantic = "qwen35.linear_attention"
+provider = "arle"
+source = "crates/infer-cuda/src/qwen35_attention.rs"
+legality = "seq_len>1 (host-scalar and varlen ABIs)"
+fallback = ""
+
+[[implementation]]
+id = "cuda.qwen35.gdr_fq_chunked"
+semantic = "qwen35.linear_attention"
+provider = "tilelang"
+source = "crates/infer-cuda/src/qwen35_attention.rs"
+legality = "seq_len>1 && --qwen35-gdr-chunked && sm==9.0 && flashqla in KERNEL_CAPABILITIES && key/value head_dim==128 && (k_heads,v_heads) in {(16,32),(16,48)}"
+fallback = "cuda.qwen35.gdr_recurrent_scan"
+
+[policy."qwen35.linear_attention"]
+fallback_status = "legacy-default-unqualified"
+
+[[semantic]]
+id = "qwen.sampling"
+kind = "composite"
+inputs = ["logits", "draft_tokens", "uniforms"]
+outputs = ["token_ids", "accepted_len"]
+reference = "cuda.qwen.argmax"
+correctness_gate = "numeric+e2e"
+
+[[implementation]]
+id = "cuda.qwen.argmax"
+semantic = "qwen.sampling"
+provider = "arle"
+source = "crates/cuda-kernels/src/sampling.rs"
+legality = "rows==1 (greedy decode)"
+fallback = ""
+
+[[implementation]]
+id = "cuda.qwen.argmax_batch"
+semantic = "qwen.sampling"
+provider = "arle"
+source = "crates/cuda-kernels/src/sampling.rs"
+legality = "rows>1 (batched decode, DSpark exit ids, DSv4 MTP verify)"
+fallback = ""
+
+[[implementation]]
+id = "cuda.qwen.dspark_filter_probs"
+semantic = "qwen.sampling"
+provider = "arle"
+source = "crates/cuda-kernels/src/sampling.rs"
+legality = "spec decode with sampling params (temperature/top-k/top-p/min-p filter over [rows,vocab])"
+fallback = ""
+
+[[implementation]]
+id = "cuda.qwen.dspark_draft_sample"
+semantic = "qwen.sampling"
+provider = "arle"
+source = "crates/cuda-kernels/src/sampling.rs"
+legality = "spec decode draft stage"
+fallback = ""
+
+[[implementation]]
+id = "cuda.qwen.dspark_chain_accept"
+semantic = "qwen.sampling"
+provider = "arle"
+source = "crates/cuda-kernels/src/sampling.rs"
+legality = "spec decode verify: chain rejection over pre-filtered q/p with host uniforms, depth<=cap"
+fallback = ""
+
+[policy."qwen.sampling"]
+fallback_status = "legacy-default-unqualified"
+
+[[semantic]]
+id = "arle.custom_allreduce"
+kind = "composite"
+inputs = ["hidden_bf16"]
+outputs = ["hidden_bf16"]
+reference = "cuda.arle.allreduce_nccl"
+correctness_gate = "numeric+e2e"
+
+[[implementation]]
+id = "cuda.arle.allreduce_oneshot"
+semantic = "arle.custom_allreduce"
+provider = "sgl"
+source = "crates/infer-cuda/src/tp.rs"
+legality = "feature nccl && world in {2,4,6,8} && comm-backend != nccl && boot alloc/P2P-map/self-test all-rank vote ok && bytes<=512KB scratch; Auto picks one-shot below ~256KB@world8"
+fallback = "cuda.arle.allreduce_nccl"
+
+[[implementation]]
+id = "cuda.arle.allreduce_twoshot"
+semantic = "arle.custom_allreduce"
+provider = "sgl"
+source = "crates/infer-cuda/src/tp.rs"
+legality = "same boot gates as oneshot; Auto picks two-shot above ~256KB@world8 within the 512KB scratch"
+fallback = "cuda.arle.allreduce_nccl"
+
+[[implementation]]
+id = "cuda.arle.allreduce_nccl"
+semantic = "arle.custom_allreduce"
+provider = "nccl"
+source = "crates/infer-cuda/src/tp.rs"
+legality = "always (single rank, --comm-backend nccl, degraded boot, or prefill-sized buffers)"
+fallback = ""
+
+[policy."arle.custom_allreduce"]
+fallback_status = "legacy-default-unqualified"
+
+[[semantic]]
+id = "opd.nvrtc_kernels"
+kind = "composite"
+inputs = ["tape_tensors"]
+outputs = ["tape_tensors"]
+reference = "cuda.opd.nvrtc_catalog"
+correctness_gate = "numeric+e2e"
+
+[[implementation]]
+id = "cuda.opd.nvrtc_catalog"
+semantic = "opd.nvrtc_kernels"
+provider = "nvrtc"
+source = "crates/autograd/src/backend_cuda/kernels.rs"
+legality = "tape-dtype module compiled at set_tape_dtype warmup (KERNEL_SOURCES catalog, single compile unit); compile failure is a hard error at first use"
+identity = "NvrtcIdentity { source_hash: fnv1a64(dtype prelude + concatenated sources), compile_flags: --gpu-architecture=<sm>, sm_arch, tape_dtype, nvrtc_version, cuda_driver_version }"
+fallback = ""
+
+[policy."opd.nvrtc_kernels"]
+fallback_status = "legacy-default-unqualified"
