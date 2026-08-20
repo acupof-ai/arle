@@ -14,13 +14,9 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <stdint.h>
+#include "../../common.cuh"
 
 namespace {
-
-__device__ __constant__ float NVFP4_E2M1_LUT[16] = {
-    0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
-    -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f,
-};
 
 __device__ __forceinline__ float decode_e8m0(uint8_t bits) {
   uint32_t raw = static_cast<uint32_t>(bits) << 23;
@@ -54,7 +50,7 @@ __global__ void nvfp4_to_w4afp8_kernel(
   const int src_byte_offset = n * stored_k + g * 64;
   const uint8_t packed = reinterpret_cast<const uint8_t*>(src_weight)[src_byte_offset + tid / 2];
   const uint8_t nibble = (tid & 1) ? ((packed >> 4) & 0x0f) : (packed & 0x0f);
-  const float w = NVFP4_E2M1_LUT[nibble];
+  const float w = arle_decode_fp4_e2m1(nibble);
 
   // E8M0 scale: one per 32 logical elements → index g*4 + tid/32.
   const float scale = decode_e8m0(src_scales[n * scale_cols + g * 4 + tid / 32]);

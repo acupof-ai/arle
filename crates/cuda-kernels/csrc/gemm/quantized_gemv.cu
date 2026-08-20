@@ -12,17 +12,13 @@
 #include <cuda_runtime.h>
 #include <cstdint>
 #include <cstdio>
+#include "../common.cuh"
 
 #define WARP_SIZE 32
 #define GEMV_THREADS 256
 #define GEMV_ROWS 4
 #define DSV4_BATCH_TILE 32
 #define QWEN_GEMV_BATCH_TILE 8
-
-__device__ __constant__ float DSV4_FP4_E2M1_LUT[16] = {
-    0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
-    -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f,
-};
 
 __device__ __forceinline__ float warp_reduce_sum(float val) {
     #pragma unroll
@@ -53,21 +49,8 @@ __device__ __forceinline__ float dsv4_decode_fp8_e4m3(uint8_t bits) {
     return static_cast<float>(value);
 }
 
-// Pure ALU, no table. The LUT is __constant__ and the nibble index is divergent,
-// so a warp reading 16 distinct values serialises into replays — the widen kernel
-// does 16 of these per work item and measured 0.756 ms/call against a 0.093 ms
-// roofline, 15x its FP8 twin which has no table.
-//
-// Bit-identical to DSV4_FP4_E2M1_LUT on all 16 inputs, checked exhaustively. The
-// magnitude field is [exp:2][mant:1] with bias 1: exp == 0 is E2M1's subnormal
-// step (0 and 0.5), everything above is (1 + mant/2) * 2^(exp-1).
 __device__ __forceinline__ float dsv4_decode_fp4_e2m1(uint8_t bits) {
-    const uint32_t m = bits & 0x7u;
-    const uint32_t e = m >> 1;
-    const uint32_t sign = (uint32_t)(bits & 0x8u) << 28;
-    const uint32_t mag = (e == 0u) ? ((m & 1u) ? 0x3F000000u : 0u)
-                                   : (((126u + e) << 23) | ((m & 1u) << 22));
-    return __uint_as_float(sign | mag);
+    return arle_decode_fp4_e2m1(bits);
 }
 
 __device__ __forceinline__ float dsv4_block_scale(
@@ -436,10 +419,6 @@ extern "C" cudaError_t fp4_marlin_scale_block_pow2_cuda(
     }
     const int n_blocks = (N + 127) / 128;
     const int k_blocks = K / 128;
-    // The pad row DeepGEMM may read; see the kernel comment.
-    const cudaError_t fill = cudaMemsetAsync(
-        block_pow2, 0, (size_t)(n_blocks + 1) * k_blocks * sizeof(float), stream);
-    if (fill != cudaSuccess) return fill;
     fp4_marlin_scale_block_pow2_kernel<<<dim3(k_blocks, n_blocks + 1), FP4_BLOCK_SCALE_THREADS, 0,
                                         stream>>>(
         marlin_packed + (size_t)N * K / 2, global_scales, inv_lift, block_pow2, N, K / 16,

@@ -56,6 +56,10 @@ pub(super) struct QwenFp8DenseScratch {
     active_counts: Option<CudaSlice<i32>>,
     sfb_ones: Option<CudaSlice<f32>>,
     sfb_ones_capacity: usize,
+    /// Row count already resident in `active_counts`. Every dense GEMM in one
+    /// forward passes the same M, so the 4-byte pageable H2D below fires once
+    /// per chunk instead of ~4x per layer.
+    active_count_resident: Option<i32>,
 }
 
 /// Reusable per-thread BF16 weight scratch for the pre-Hopper dense FP8
@@ -431,14 +435,16 @@ pub(super) fn deepgemm_dense_nt(
     QWEN_FP8_DENSE_SCRATCH.with(|cell| -> Result<()> {
         let mut scratch = cell.borrow_mut();
         scratch.ensure(ctx, m * k, scale_stride_m * scale_cols)?;
-        {
+        let rows = i32::try_from(m)?;
+        if scratch.active_count_resident != Some(rows) {
             let active_counts = scratch
                 .active_counts
                 .as_mut()
                 .ok_or_else(|| anyhow!("{tag} DeepGEMM active_counts missing"))?;
             ctx.stream
-                .memcpy_htod(&[i32::try_from(m)?], active_counts)
+                .memcpy_htod(&[rows], active_counts)
                 .map_err(|e| anyhow!("{tag} DeepGEMM active_counts H2D failed: {e}"))?;
+            scratch.active_count_resident = Some(rows);
         }
         let input_fp8 = scratch
             .input_fp8
