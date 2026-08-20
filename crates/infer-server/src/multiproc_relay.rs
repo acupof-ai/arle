@@ -573,6 +573,135 @@ pub(crate) fn aggregate_wire_stats(mut ranks: Vec<WireStats>) -> WireStats {
     agg
 }
 
+/// Aggregate group-level [`WireStats`] into a deployment-level snapshot.
+///
+/// DP groups serve disjoint requests, so counters and gauges both sum across
+/// groups (contrast with [`aggregate_wire_stats`], whose TP ranks share one
+/// request stream and take the min of per-rank gauges). Identity fields are
+/// identical across groups; the first non-empty value wins.
+pub(crate) fn aggregate_wire_stats_dp(groups: Vec<WireStats>) -> WireStats {
+    let mut agg = WireStats::default();
+    for g in groups {
+        merge_wire_stats_dp(&mut agg, g);
+    }
+    agg.op_timing
+        .ops
+        .sort_by_key(|e| std::cmp::Reverse(e.total_micros));
+    agg
+}
+
+fn merge_wire_stats_dp(acc: &mut WireStats, other: WireStats) {
+    if acc.build_identity.product_binary_sha256.is_empty() {
+        acc.build_identity = other.build_identity;
+    }
+    acc.active_requests += other.active_requests;
+    acc.queue_depth += other.queue_depth;
+    acc.kv_free_pages += other.kv_free_pages;
+    acc.throughput_steps += other.throughput_steps;
+    acc.throughput_prefill_tokens += other.throughput_prefill_tokens;
+    acc.throughput_generated_tokens += other.throughput_generated_tokens;
+    acc.throughput_requests_completed += other.throughput_requests_completed;
+    acc.throughput_requests_succeeded += other.throughput_requests_succeeded;
+    acc.throughput_requests_failed += other.throughput_requests_failed;
+    acc.throughput_ttft_micros_total += other.throughput_ttft_micros_total;
+    acc.throughput_ttft_count += other.throughput_ttft_count;
+    acc.throughput_tpot_micros_total += other.throughput_tpot_micros_total;
+    acc.throughput_tpot_count += other.throughput_tpot_count;
+    acc.throughput_e2e_micros_total += other.throughput_e2e_micros_total;
+    acc.throughput_e2e_count += other.throughput_e2e_count;
+    acc.throughput_forward_busy_micros += other.throughput_forward_busy_micros;
+    acc.throughput_prefill_forward_steps += other.throughput_prefill_forward_steps;
+    acc.throughput_prefill_forward_busy_micros += other.throughput_prefill_forward_busy_micros;
+    acc.throughput_decode_forward_steps += other.throughput_decode_forward_steps;
+    acc.throughput_decode_forward_busy_micros += other.throughput_decode_forward_busy_micros;
+    acc.throughput_mixed_forward_steps += other.throughput_mixed_forward_steps;
+    acc.throughput_mixed_forward_busy_micros += other.throughput_mixed_forward_busy_micros;
+    acc.throughput_decode_phase_steps += other.throughput_decode_phase_steps;
+    acc.throughput_decode_phase_poll_micros += other.throughput_decode_phase_poll_micros;
+    acc.throughput_decode_phase_apply_output_micros +=
+        other.throughput_decode_phase_apply_output_micros;
+    acc.throughput_decode_phase_poll_background_micros +=
+        other.throughput_decode_phase_poll_background_micros;
+    acc.throughput_decode_phase_admit_micros += other.throughput_decode_phase_admit_micros;
+    acc.throughput_decode_phase_plan_micros += other.throughput_decode_phase_plan_micros;
+    acc.throughput_decode_phase_submit_micros += other.throughput_decode_phase_submit_micros;
+    acc.prefix_lookups += other.prefix_lookups;
+    acc.prefix_hits += other.prefix_hits;
+    acc.prefix_hit_tokens += other.prefix_hit_tokens;
+    acc.prefix_hit_pages += other.prefix_hit_pages;
+    acc.prefix_published_pages += other.prefix_published_pages;
+    acc.prefix_cached_pages += other.prefix_cached_pages;
+    acc.kv_tier_demoted_pages += other.kv_tier_demoted_pages;
+    acc.kv_tier_promoted_pages += other.kv_tier_promoted_pages;
+    acc.kv_tier_promote_failures += other.kv_tier_promote_failures;
+    acc.kv_tier_resident_blocks += other.kv_tier_resident_blocks;
+    acc.kv_tier_demoted_slots += other.kv_tier_demoted_slots;
+    acc.kv_tier_slot_demote_failures += other.kv_tier_slot_demote_failures;
+    acc.kv_tier_promoted_slots += other.kv_tier_promoted_slots;
+    acc.kv_tier_slot_promote_failures += other.kv_tier_slot_promote_failures;
+    acc.kv_system_resident_pages += other.kv_system_resident_pages;
+    acc.kv_system_resident_evictable_pages += other.kv_system_resident_evictable_pages;
+    acc.kv_system_host_demoted_pages += other.kv_system_host_demoted_pages;
+    acc.kv_system_host_demoted_pending_inflight += other.kv_system_host_demoted_pending_inflight;
+    acc.kv_system_disk_pages += other.kv_system_disk_pages;
+    acc.kv_system_reuse_hit_resident += other.kv_system_reuse_hit_resident;
+    acc.kv_system_reuse_hit_host_demoted += other.kv_system_reuse_hit_host_demoted;
+    acc.kv_system_reuse_hit_disk += other.kv_system_reuse_hit_disk;
+    acc.kv_system_reuse_miss += other.kv_system_reuse_miss;
+    acc.kv_system_demote_mset_count += other.kv_system_demote_mset_count;
+    acc.kv_system_demote_mset_copy_bytes += other.kv_system_demote_mset_copy_bytes;
+    acc.kv_system_demote_mset_copy_ms += other.kv_system_demote_mset_copy_ms;
+    acc.kv_system_promote_mget_count += other.kv_system_promote_mget_count;
+    acc.kv_system_promote_mget_copy_bytes += other.kv_system_promote_mget_copy_bytes;
+    acc.kv_system_promote_mget_copy_ms += other.kv_system_promote_mget_copy_ms;
+    acc.kv_system_fetch_wait_ms += other.kv_system_fetch_wait_ms;
+    acc.kv_system_fallback_recompute += other.kv_system_fallback_recompute;
+    acc.kv_system_prefix_match_full_blocks += other.kv_system_prefix_match_full_blocks;
+    acc.kv_system_prefix_match_clamped_blocks += other.kv_system_prefix_match_clamped_blocks;
+    if acc.kv_system_tier_io_mode == infer_seam::KvTierIoMode::Disabled {
+        acc.kv_system_tier_io_mode = other.kv_system_tier_io_mode;
+    }
+    acc.kv_system_tier_io_useful_read_bytes += other.kv_system_tier_io_useful_read_bytes;
+    acc.kv_system_tier_io_useful_write_bytes += other.kv_system_tier_io_useful_write_bytes;
+    acc.kv_system_tier_io_submitted_read_bytes += other.kv_system_tier_io_submitted_read_bytes;
+    acc.kv_system_tier_io_submitted_write_bytes += other.kv_system_tier_io_submitted_write_bytes;
+    acc.kv_system_tier_io_metadata_write_bytes += other.kv_system_tier_io_metadata_write_bytes;
+    acc.kv_system_tier_io_failures += other.kv_system_tier_io_failures;
+    acc.kv_system_tier_io_completion_wait_ns += other.kv_system_tier_io_completion_wait_ns;
+    acc.spec_chains += other.spec_chains;
+    acc.spec_drafted += other.spec_drafted;
+    acc.spec_accepted += other.spec_accepted;
+    acc.spec_rejected += other.spec_rejected;
+    acc.spec_partial_ctx_chains += other.spec_partial_ctx_chains;
+    if acc.operator_dispatch.policy_hash.is_empty() {
+        acc.operator_dispatch.policy_hash = other.operator_dispatch.policy_hash;
+    }
+    acc.operator_dispatch.fallback_count += other.operator_dispatch.fallback_count;
+    for hit in other.operator_dispatch.implementation_hits {
+        if let Some(existing) = acc
+            .operator_dispatch
+            .implementation_hits
+            .iter_mut()
+            .find(|h| h.implementation_id == hit.implementation_id)
+        {
+            existing.hits += hit.hits;
+        } else {
+            acc.operator_dispatch.implementation_hits.push(hit);
+        }
+    }
+    for entry in other.op_timing.ops {
+        if let Some(existing) = acc.op_timing.ops.iter_mut().find(|e| e.name == entry.name) {
+            existing.total_micros += entry.total_micros;
+            existing.count += entry.count;
+        } else {
+            acc.op_timing.ops.push(entry);
+        }
+    }
+    if acc.gpu.is_none() {
+        acc.gpu = other.gpu;
+    }
+}
+
 /// Self-contained worker->coordinator completion delta (Stage 1).
 ///
 /// Mirrors the shape of the public `infer_api::CompletionStreamDelta` minus the
@@ -1416,5 +1545,85 @@ mod tests {
     fn aggregate_empty_is_default() {
         let agg = aggregate_wire_stats(Vec::new());
         assert_eq!(agg.kv_free_pages, 0);
+    }
+
+    #[test]
+    fn aggregate_dp_sums_counters_and_gauges() {
+        let g0 = WireStats {
+            build_identity: crate::BuildIdentity {
+                product_binary_sha256: "abc".to_string(),
+                kernel_bundle_id: "kb".to_string(),
+            },
+            active_requests: 3,
+            kv_free_pages: 1000,
+            throughput_generated_tokens: 500,
+            prefix_hits: 50,
+            kv_system_disk_pages: 10,
+            spec_accepted: 5,
+            gpu: Some(infer_seam::GpuSample::default()),
+            ..Default::default()
+        };
+        let g1 = WireStats {
+            active_requests: 2,
+            kv_free_pages: 700,
+            throughput_generated_tokens: 300,
+            prefix_hits: 30,
+            kv_system_disk_pages: 4,
+            spec_accepted: 3,
+            ..Default::default()
+        };
+        let agg = aggregate_wire_stats_dp(vec![g0, g1]);
+        assert_eq!(agg.active_requests, 5);
+        assert_eq!(agg.kv_free_pages, 1700);
+        assert_eq!(agg.throughput_generated_tokens, 800);
+        assert_eq!(agg.prefix_hits, 80);
+        assert_eq!(agg.kv_system_disk_pages, 14);
+        assert_eq!(agg.spec_accepted, 8);
+        assert_eq!(agg.build_identity.product_binary_sha256, "abc");
+        assert!(agg.gpu.is_some());
+    }
+
+    #[test]
+    fn aggregate_dp_merges_operator_dispatch_by_id() {
+        let g0 = WireStats {
+            operator_dispatch: infer_seam::OperatorDispatchStats {
+                policy_hash: "p".to_string(),
+                implementation_hits: vec![
+                    infer_seam::OperatorImplementationHits {
+                        implementation_id: "a".to_string(),
+                        hits: 10,
+                    },
+                    infer_seam::OperatorImplementationHits {
+                        implementation_id: "b".to_string(),
+                        hits: 7,
+                    },
+                ],
+                fallback_count: 1,
+            },
+            ..Default::default()
+        };
+        let g1 = WireStats {
+            operator_dispatch: infer_seam::OperatorDispatchStats {
+                policy_hash: "p".to_string(),
+                implementation_hits: vec![infer_seam::OperatorImplementationHits {
+                    implementation_id: "a".to_string(),
+                    hits: 5,
+                }],
+                fallback_count: 2,
+            },
+            ..Default::default()
+        };
+        let agg = aggregate_wire_stats_dp(vec![g0, g1]);
+        assert_eq!(agg.operator_dispatch.policy_hash, "p");
+        assert_eq!(agg.operator_dispatch.fallback_count, 3);
+        let hits = |id: &str| {
+            agg.operator_dispatch
+                .implementation_hits
+                .iter()
+                .find(|h| h.implementation_id == id)
+                .map(|h| h.hits)
+        };
+        assert_eq!(hits("a"), Some(15));
+        assert_eq!(hits("b"), Some(7));
     }
 }
