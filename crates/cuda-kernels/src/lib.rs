@@ -22,6 +22,8 @@ pub mod quant_linear;
 // feature-gated inside.
 pub mod ring_attention;
 #[cfg(feature = "cuda")]
+pub mod sampling;
+#[cfg(feature = "cuda")]
 pub mod tensor;
 #[cfg(feature = "cuda")]
 pub mod tensor_ops;

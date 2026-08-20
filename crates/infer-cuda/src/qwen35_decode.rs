@@ -353,20 +353,7 @@ impl Qwen35Model {
 
         let argmax_buf = argmax.get(&self.ctx, b)?;
         crate::profile::profile_op(&self.ctx, "sample", None, b, || {
-            let (l_ptr, _gl) = logits_buf.data.device_ptr(&self.ctx.stream);
-            let (a_ptr, _ga) = argmax_buf.device_ptr_mut(&self.ctx.stream);
-            // SAFETY: logits `[B, vocab]` bf16, argmax `[B]` i32, both on ctx.stream.
-            unsafe {
-                ffi::argmax_batch_cuda(
-                    l_ptr as *const ffi::Half,
-                    a_ptr as *mut i32,
-                    b as i32,
-                    vocab as i32,
-                    self.ctx.stream.cu_stream(),
-                )
-                .result()?;
-            }
-            Ok(())
+            cuda_kernels::sampling::argmax_batch(&self.ctx, &logits_buf.data, argmax_buf, b, vocab)
         })?;
         self.ctx.sync()?;
         let greedy_ids = self

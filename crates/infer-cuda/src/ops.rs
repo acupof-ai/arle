@@ -514,20 +514,7 @@ pub(crate) fn argmax_into(
         "argmax scratch must be one i32, got {}",
         out.len()
     );
-    {
-        let (logits_ptr, _gl) = logits.data.device_ptr(&ctx.stream);
-        let (out_ptr, _go) = out.device_ptr_mut(&ctx.stream);
-        // SAFETY: ptrs from live device allocations sized to the dims passed.
-        unsafe {
-            ffi::argmax_cuda(
-                logits_ptr as *const ffi::Half,
-                out_ptr as *mut i32,
-                logits.len as i32,
-                ctx.stream.cu_stream(),
-            )
-            .result()?;
-        }
-    }
+    cuda_kernels::sampling::argmax(ctx, &logits.data, out, logits.len)?;
     ctx.sync()?;
     let token = ctx
         .stream
@@ -559,22 +546,9 @@ pub(crate) fn argmax_row_into(
         "argmax_row_into row {row} (vocab {vocab}) exceeds logits len {}",
         logits.len
     );
-    {
-        let (logits_ptr, _gl) = logits.data.device_ptr(&ctx.stream);
-        let row_ptr = logits_ptr + (row * vocab * std::mem::size_of::<ffi::Half>()) as u64;
-        let (out_ptr, _go) = out.device_ptr_mut(&ctx.stream);
-        // SAFETY: row_ptr is within `logits` (bounds-checked above); argmax_cuda
-        // reads `vocab` bf16 elements from it and writes one i32.
-        unsafe {
-            ffi::argmax_cuda(
-                row_ptr as *const ffi::Half,
-                out_ptr as *mut i32,
-                vocab as i32,
-                ctx.stream.cu_stream(),
-            )
-            .result()?;
-        }
-    }
+    // Row slice bounds-checked above; only the 1-int result crosses to the host.
+    let row_view = logits.data.slice(row * vocab..(row + 1) * vocab);
+    cuda_kernels::sampling::argmax(ctx, &row_view, out, vocab)?;
     ctx.sync()?;
     let token = ctx
         .stream
