@@ -213,6 +213,57 @@ pub(super) struct IntQuery {
     pub(super) is_w8a16: bool,
 }
 
+/// The INT storage states the load validator inspects. The W8A16 repack frees
+/// its source pair, so post-repack the Marlin pair must be complete — the
+/// historical W8A16 lm_head defect was exactly a freed source with no consumer
+/// on one lane.
+#[derive(Clone, Copy)]
+pub(super) struct IntStorage {
+    pub(super) marlin_packed: bool,
+    pub(super) marlin_scales: bool,
+    pub(super) source_weight: bool,
+    pub(super) source_scales: bool,
+    pub(super) is_w8a16: bool,
+    pub(super) group_aligned: bool,
+}
+
+impl IntStorage {
+    pub(super) fn of(weight: &DeviceMatrix) -> Self {
+        Self {
+            marlin_packed: weight.marlin_packed.is_some(),
+            marlin_scales: weight.marlin_scales.is_some(),
+            source_weight: weight.qweight.is_some(),
+            source_scales: weight.qscales.is_some(),
+            is_w8a16: weight.weight_format == WeightFormat::W8A16,
+            group_aligned: weight.group_size > 0 && weight.cols.is_multiple_of(weight.group_size),
+        }
+    }
+}
+
+/// `None` when every M [`int_route`] can produce has a resident consumer.
+pub(super) fn int_missing_representation(s: IntStorage, sm_marlin: bool) -> Option<&'static str> {
+    if s.marlin_packed != s.marlin_scales {
+        return Some("the other half of the Marlin pair (marlin_packed XOR marlin_scales)");
+    }
+    if s.source_weight != s.source_scales {
+        return Some("the other half of the source pair (qweight XOR qscales)");
+    }
+    let source = s.source_weight && s.source_scales;
+    if !s.is_w8a16 {
+        // W4A16: the group-wise GEMV source pair is its only route.
+        if !source {
+            return Some("the qweight + qscales source pair (W4A16's only route)");
+        }
+        return (!s.group_aligned).then_some("a group size > 0 dividing cols (W4A16 GEMV)");
+    }
+    if source && !s.group_aligned {
+        return Some("a group size > 0 dividing cols (W8A16 GEMV/dequant)");
+    }
+    let marlin = s.marlin_packed && s.marlin_scales && sm_marlin;
+    (!marlin && !source)
+        .then_some("a retained Marlin pair (sm_80+) or the qweight + qscales source pair")
+}
+
 pub(super) fn int_route(q: IntQuery, m: usize, sm_marlin: bool) -> IntRoute {
     if q.is_w8a16 && q.repacked && sm_marlin {
         return IntRoute::Marlin;

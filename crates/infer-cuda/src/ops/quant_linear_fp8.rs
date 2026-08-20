@@ -770,6 +770,51 @@ pub(super) struct Fp8Query {
     pub(super) deepgemm_prefill: bool,
 }
 
+/// The FP8 storage states the load validator inspects. Built from the matrix
+/// after final repack and source release; the pure predicate below keeps the
+/// route test host-only.
+#[derive(Clone, Copy)]
+pub(super) struct Fp8Storage {
+    pub(super) marlin_packed: bool,
+    pub(super) marlin_scales: bool,
+    pub(super) source_weight: bool,
+    pub(super) source_scale: bool,
+    pub(super) per_shard: bool,
+}
+
+impl Fp8Storage {
+    pub(super) fn of(weight: &DeviceMatrix) -> Self {
+        Self {
+            marlin_packed: weight.marlin_packed.is_some(),
+            marlin_scales: weight.marlin_scales.is_some(),
+            source_weight: weight.qweight_u8.is_some(),
+            source_scale: weight.scale_f32.is_some(),
+            per_shard: weight.weight_format == WeightFormat::Fp8PerShard,
+        }
+    }
+}
+
+/// `None` when every M [`fp8_route`] can produce has a resident consumer;
+/// otherwise the representation the state is missing. The DeepGEMM arms decline
+/// dynamically, so they never count as the sole consumer.
+pub(super) fn fp8_missing_representation(s: Fp8Storage, sm_marlin: bool) -> Option<&'static str> {
+    if s.marlin_packed != s.marlin_scales {
+        return Some("the other half of the Marlin pair (marlin_packed XOR marlin_scales)");
+    }
+    if s.per_shard {
+        // Fp8PerShard never repacks; the GEMV source pair is its only route.
+        return (!(s.source_weight && s.source_scale))
+            .then_some("the qweight_u8 + scale_f32 source pair (fp8_per_shard's only route)");
+    }
+    if s.source_weight && !s.source_scale {
+        return Some("scale_f32 for the resident qweight_u8");
+    }
+    let marlin = s.marlin_packed && s.marlin_scales && sm_marlin;
+    let source = s.source_weight && s.source_scale;
+    (!marlin && !source)
+        .then_some("a retained Marlin pair or the qweight_u8 + scale_f32 source pair")
+}
+
 pub(super) fn fp8_route(q: Fp8Query, m: usize, sm_marlin: bool, deepgemm_on: bool) -> Fp8Route {
     if q.repacked && sm_marlin {
         return Fp8Route::Marlin;

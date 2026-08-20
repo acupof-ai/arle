@@ -200,6 +200,43 @@ pub(super) struct Fp4Query {
     pub(super) prefill_shape: bool,
 }
 
+/// The NVFP4 storage states the load validator inspects. `repack_for_marlin_fp4`
+/// silently no-ops when the source triplet is incomplete, so a malformed FP4
+/// matrix can otherwise reach serving with no representation at all.
+#[derive(Clone, Copy)]
+pub(super) struct Fp4Storage {
+    pub(super) marlin_packed: bool,
+    pub(super) marlin_scales: bool,
+    pub(super) sfb: bool,
+    pub(super) global_scale: bool,
+}
+
+impl Fp4Storage {
+    pub(super) fn of(weight: &DeviceMatrix) -> Self {
+        Self {
+            marlin_packed: weight.marlin_packed.is_some(),
+            marlin_scales: weight.marlin_scales.is_some(),
+            sfb: weight.fp4_deepgemm_sfb.is_some(),
+            global_scale: weight.scale_f32.is_some(),
+        }
+    }
+}
+
+/// `None` when every M has a resident consumer. NVFP4 has no source arm — the
+/// repack bails on shapes it cannot take — so the Marlin pair is mandatory, and
+/// an `sfb` without the global scale would error inside the prefill arm.
+pub(super) fn fp4_missing_representation(s: Fp4Storage, sm_marlin: bool) -> Option<&'static str> {
+    if !(s.marlin_packed && s.marlin_scales && sm_marlin) {
+        return Some(
+            "the marlin_packed + marlin_scales retained layout (NVFP4's only serving path, sm_80+)",
+        );
+    }
+    if s.sfb && !s.global_scale {
+        return Some("the scale_f32 global scale the fp4_deepgemm_sfb prefill arm reads");
+    }
+    None
+}
+
 /// The static part of the FP4 order. The DeepGEMM arm keeps the dynamic floor
 /// (`dense_deepgemm_prefill_floor`) and its own shape/SM gates; this fn only
 /// says which arm owns the M.
