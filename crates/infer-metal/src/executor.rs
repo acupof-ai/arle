@@ -289,7 +289,10 @@ impl MetalExecutor {
     ) -> anyhow::Result<Self> {
         let _guard = mlx_sys::mlx_guard();
         crate::resource::apply_startup_mlx_limits(resolved, resource_plan.as_ref(), None, true);
-        let config = config::load_metal_config(resolved)?;
+        let config = match resource_plan.as_ref().and_then(|p| p.config.clone()) {
+            Some(c) => c,
+            None => config::load_metal_config(resolved)?,
+        };
         if kv_cache_dtype == MetalKvCacheDtype::Int8 {
             validate_int8_kv_config(&config)?;
         }

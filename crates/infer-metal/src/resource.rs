@@ -122,7 +122,7 @@ impl PagingActivity {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct MetalResourcePlan {
     pub total_memory_bytes: Option<usize>,
     pub available_memory_bytes: Option<usize>,
@@ -144,6 +144,8 @@ pub struct MetalResourcePlan {
     pub planned_total_pages: usize,
     pub capacity_tokens: usize,
     pub clamped: bool,
+    /// Parsed model config, reused by the executor to avoid a second parse.
+    pub(crate) config: Option<crate::config::MetalModelConfig>,
 }
 
 impl MetalResourcePlan {
@@ -373,6 +375,7 @@ pub fn plan_resource_budget(
         planned_total_pages,
         capacity_tokens: capacity_tokens.min(requested_capacity_tokens),
         clamped,
+        config: Some(model_config),
     })
 }
 
@@ -492,6 +495,7 @@ pub fn plan_weight_only_resource_budget(
         planned_total_pages: 0,
         capacity_tokens: usize::MAX,
         clamped: false,
+        config: None,
     })
 }
 
