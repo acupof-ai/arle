@@ -147,6 +147,67 @@ impl VulkanQwen35Model {
         Ok(logits)
     }
 
+    /// Batched prefill: materialize `tokens` starting at `start_pos` in one
+    /// GEMM-shaped pass and return the logits of the LAST token only.
+    ///
+    /// Same contract and same bookkeeping as calling [`Self::forward_token`] once
+    /// per token — `resident_tokens` / `resident_slot` advance identically, so
+    /// prefix reuse ([`Self::cached_prefix_match_len`]) is unaffected. The
+    /// difference is arithmetic intensity: each weight is read once per CHUNK
+    /// instead of once per token, turning the memory-bound GEMV loop into a
+    /// compute-bound `mul_mmq`.
+    ///
+    /// Returns `Ok(None)` when the batched path does not cover this model (MoE
+    /// layers, or a linear layer whose `ssm_alpha`/`ssm_beta` is not resident
+    /// quantized) — the caller must then fall back to the per-token loop. That
+    /// check happens BEFORE anything is recorded: a mid-chunk bail would be
+    /// unrecoverable, since the KV cache and the gated-delta state advance in
+    /// place.
+    pub fn forward_tokens(
+        &mut self,
+        slot: usize,
+        _epoch: u64,
+        tokens: &[u32],
+        start_pos: usize,
+    ) -> anyhow::Result<Option<Vec<f32>>> {
+        if tokens.is_empty() {
+            return Ok(None);
+        }
+        if let Some(reason) =
+            crate::prefill::prefill_unsupported_reason(&self.config, &self.weights)
+        {
+            // Once per process: the caller's fallback is silent, and "batched
+            // declined" looks exactly like "batched ran and was slow" in a
+            // wall-clock A/B.
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                log::warn!("vulkan batched prefill unavailable, using per-token loop: {reason}");
+            });
+            return Ok(None);
+        }
+        if start_pos == 0 {
+            self.reset_state();
+            self.resident_slot = Some(slot);
+        } else if self.resident_slot != Some(slot) {
+            anyhow::bail!(
+                "Vulkan lane holds slot {:?}'s sequence; slot {slot} asked to \
+                 resume at {start_pos}",
+                self.resident_slot
+            );
+        }
+        let logits = crate::prefill::forward_prefill(
+            self.ctx,
+            &self.config,
+            &self.weights,
+            &mut self.decode,
+            &mut self.state,
+            tokens,
+            start_pos,
+        )?;
+        self.resident_tokens.extend_from_slice(tokens);
+        Ok(Some(logits))
+    }
+
     /// Length of the longest leading prefix of `tokens` this lane can resume
     /// from without recomputing it — the position-0 reuse seam
     /// ([`infer_seam::PrefixReuse::cached_prefix_match_len`]).

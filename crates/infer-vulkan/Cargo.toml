@@ -10,6 +10,7 @@ anyhow = "1.0"
 infer-gguf = { path = "../infer-gguf" }
 infer-plan = { path = "../infer-plan" }
 infer-seam = { path = "../infer-seam" }
+log = "0.4"
 qwen3-spec = { path = "../qwen3-spec" }
 qwen35-spec = { path = "../qwen35-spec" }
 vulkan-kernels = { path = "../vulkan-kernels", default-features = false, optional = true }

@@ -150,7 +150,7 @@ fn build_pipeline<'a>(
         &[&layout],
         push_bytes,
         specialization_u32,
-        kernel.required_subgroup_size(),
+        kernel.required_subgroup_size(specialization_u32),
     )
     .map_err(|e| KernelError::Runtime(e.to_string()))?;
     Ok((pipeline, layout))

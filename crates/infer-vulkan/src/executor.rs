@@ -13,6 +13,19 @@ use crate::kv_pool::VulkanKvPool;
 
 pub const DEFAULT_PAGE_SIZE: usize = 64;
 
+/// `ARLE_VULKAN_BATCHED_PREFILL=0` forces the per-token prefill loop.
+///
+/// The batched path is a different arithmetic shape (`mul_mmq` over a chunk vs a
+/// chain of GEMVs), so it is not bit-identical to the serial one — the parity
+/// gate compares them, and needs a way to run the old path in the same binary.
+#[cfg(feature = "vulkan")]
+fn batched_prefill_enabled() -> bool {
+    !matches!(
+        std::env::var("ARLE_VULKAN_BATCHED_PREFILL").as_deref(),
+        Ok("0") | Ok("false") | Ok("off")
+    )
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VulkanModelKind {
     Qwen3Dense,
@@ -87,6 +100,28 @@ impl VulkanLoadedModel {
             Self::Qwen3(model) => model.forward_token(slot, epoch, token, start_pos),
             Self::Qwen35(model) => model.forward_token(slot, epoch, token, start_pos),
             Self::Qwen36(model) => model.forward_token(slot, epoch, token, start_pos),
+        }
+    }
+
+    /// Materialize `tokens` in one GEMM-shaped batched pass, returning the LAST
+    /// token's logits — or `None` when this model has no batched path, in which
+    /// case the caller falls back to the per-token loop.
+    ///
+    /// Only the Qwen3.5 hybrid has one so far. Prefill is where the per-token
+    /// loop hurts most: every layer's weights are re-read from LPDDR5X once per
+    /// TOKEN, so a GEMV chain runs at memory bandwidth no matter how many tokens
+    /// are queued. Batching turns each projection into a `mul_mmq` over the whole
+    /// chunk, amortizing the weight read across `T` rows.
+    fn forward_tokens_batched(
+        &mut self,
+        slot: usize,
+        epoch: u64,
+        tokens: &[u32],
+        start_pos: usize,
+    ) -> Result<Option<Vec<f32>>> {
+        match self {
+            Self::Qwen35(model) => model.forward_tokens(slot, epoch, tokens, start_pos),
+            _ => Ok(None),
         }
     }
 
@@ -189,9 +224,28 @@ impl VulkanExecutor {
         );
         #[cfg(feature = "vulkan")]
         if let Some(model) = self.model.as_mut() {
+            // Multi-token steps take the batched path when the model has one.
+            // A 1-token step IS decode, which the per-token path already
+            // records optimally, so don't pay the chunk staging for it.
+            if tokens.len() > 1
+                && batched_prefill_enabled()
+                && let Some(logits) =
+                    model.forward_tokens_batched(slot, epoch, tokens, start_pos)?
+            {
+                return Ok(infer_plan::sample_token(&logits, params, position));
+            }
             let mut logits = Vec::new();
+            let t0 = std::time::Instant::now();
             for (i, &token) in tokens.iter().enumerate() {
                 logits = model.forward_token(slot, epoch, token, start_pos + i)?;
+            }
+            if tokens.len() > 1 {
+                let secs = t0.elapsed().as_secs_f64();
+                log::info!(
+                    "vulkan per-token prefill: {} tok @ {start_pos} in {secs:.3}s ({:.1} tok/s)",
+                    tokens.len(),
+                    tokens.len() as f64 / secs.max(f64::MIN_POSITIVE),
+                );
             }
             return Ok(infer_plan::sample_token(&logits, params, position));
         }

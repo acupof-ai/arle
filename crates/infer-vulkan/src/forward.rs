@@ -133,13 +133,13 @@ impl Qwen35ForwardState {
 
 /// Bytes for the q8_1_x4 quantized form of an `ncols`-element activation vector
 /// (the shader groups 128 values into one x4 super-block of 4×36 B).
-fn q8_1_x4_bytes(ncols: usize) -> usize {
+pub(crate) fn q8_1_x4_bytes(ncols: usize) -> usize {
     let num_x4 = ncols.div_ceil(Q8_1_X4_VALUES_PER_GROUP as usize);
     num_x4 * 4 * BLOCK_Q8_1_BYTES
 }
 
 /// Round `n` up to the next multiple of `align` (a power-of-two device limit).
-fn align_up(n: usize, align: usize) -> usize {
+pub(crate) fn align_up(n: usize, align: usize) -> usize {
     if align == 0 {
         return n;
     }
@@ -169,12 +169,12 @@ pub const KV_CACHE_MAX_SEQ: usize = 8192;
 /// dispatch needs only the head's base offset. RoPE is applied to K at write
 /// time (matching the host cache contract); V is stored raw.
 pub struct DeviceKvCache<'a> {
-    buffer: DeviceBuffer<'a>,
+    pub(crate) buffer: DeviceBuffer<'a>,
     /// Byte offset of the V block (K block starts at 0).
     v_base: u64,
     head_dim: usize,
     /// Bytes per `(layer, kv_head)` `[max_seq, head_dim]` f16 plane.
-    plane_bytes: u64,
+    pub(crate) plane_bytes: u64,
     /// Bytes per `(layer)` slab (`n_kv_heads` planes).
     layer_bytes: u64,
 }
@@ -205,12 +205,12 @@ impl<'a> DeviceKvCache<'a> {
     }
 
     /// Byte offset of the K plane base for `(full_idx, kv_head)`.
-    fn k_plane_off(&self, full_idx: usize, kv_head: usize) -> u64 {
+    pub(crate) fn k_plane_off(&self, full_idx: usize, kv_head: usize) -> u64 {
         full_idx as u64 * self.layer_bytes + kv_head as u64 * self.plane_bytes
     }
 
     /// Byte offset of the V plane base for `(full_idx, kv_head)`.
-    fn v_plane_off(&self, full_idx: usize, kv_head: usize) -> u64 {
+    pub(crate) fn v_plane_off(&self, full_idx: usize, kv_head: usize) -> u64 {
         self.v_base + self.k_plane_off(full_idx, kv_head)
     }
 
@@ -225,7 +225,13 @@ impl<'a> DeviceKvCache<'a> {
     /// a host readback — the same `[K block | V block]` × `[layer, kv_head, pos,
     /// head_dim]` address math the host pack used, exposed so the on-device pack
     /// lands the row at the identical cache position.
-    fn row_dst(&self, full_idx: usize, kv_head: usize, pos: usize, is_v: bool) -> (u64, u64) {
+    pub(crate) fn row_dst(
+        &self,
+        full_idx: usize,
+        kv_head: usize,
+        pos: usize,
+        is_v: bool,
+    ) -> (u64, u64) {
         let plane = if is_v {
             self.v_plane_off(full_idx, kv_head)
         } else {
@@ -243,9 +249,9 @@ impl<'a> DeviceKvCache<'a> {
 
 /// One `(offset, len)` named slot inside the arena's backing buffer.
 #[derive(Clone, Copy)]
-struct Slot {
-    offset: u64,
-    len: usize,
+pub(crate) struct Slot {
+    pub(crate) offset: u64,
+    pub(crate) len: usize,
 }
 
 /// A single `DeviceLocal|HostVisible|HostCoherent` (UMA) buffer holding all the
@@ -547,6 +553,9 @@ pub struct DecodeResources<'a> {
     pub arena: DeviceArena<'a>,
     pub cache: KernelCache<'a>,
     pub recorder: CommandRecorder<'a>,
+    /// Batched-prefill scratch (a whole token chunk per slot). Separate from the
+    /// one-token `arena` so the decode path is untouched.
+    pub(crate) prefill: crate::prefill::PrefillArena<'a>,
     /// Persistent storage-buffer descriptor-set layouts, one per binding count
     /// used on the decode path (2 = q8_1 quantize, 3 = rms_norm / swiglu / add,
     /// 5 = GEMV). Built once; the rings allocate their sets against them. Kept
@@ -557,38 +566,38 @@ pub struct DecodeResources<'a> {
     /// [`DescriptorSetRing::next_updated`] only runs `vkUpdateDescriptorSets` on a
     /// pre-allocated set — no per-dispatch `VkDescriptorPool` create/destroy
     /// (perf-parity Step 5a). Reset per token via [`Self::reset_rings`].
-    ring2: DescriptorSetRing<'a>,
-    ring3: DescriptorSetRing<'a>,
+    pub(crate) ring2: DescriptorSetRing<'a>,
+    pub(crate) ring3: DescriptorSetRing<'a>,
     /// 4-binding ring for the depthwise conv1d ([XSeq, ConvWeight, ConvState,
     /// OutSeq]). One dispatch per linear layer.
-    ring4: DescriptorSetRing<'a>,
-    ring5: DescriptorSetRing<'a>,
+    pub(crate) ring4: DescriptorSetRing<'a>,
+    pub(crate) ring5: DescriptorSetRing<'a>,
     /// 6-binding ring for the fused MoE `mul_mat_vec_id` ([A,B,D,F0,F1,IDS]).
-    ring6: DescriptorSetRing<'a>,
+    pub(crate) ring6: DescriptorSetRing<'a>,
     /// 7-binding ring for flash-attn ([Q,K,V,M,S,O,MO]) AND the gated-delta net
     /// ([Qkv,BProj,AProj,DtBias,ALog,State,Output]). Both record one dispatch per
     /// submit on the linear path; the full-attn records one per query head, so it
     /// is sized to `num_attention_heads`.
-    ring7: DescriptorSetRing<'a>,
+    pub(crate) ring7: DescriptorSetRing<'a>,
     /// Per-slot full-attention KV cache (device-resident f16). RoPE is applied to
     /// K at write time; V is stored raw. flash-attn reads each head's plane.
-    kv_cache: DeviceKvCache<'a>,
+    pub(crate) kv_cache: DeviceKvCache<'a>,
     /// Persistent device-resident gated-delta linear-attention state, one block
     /// per LINEAR layer (the conv ring + the recurrent S matrix). Resident across
     /// tokens, read+written each token by the conv / gated-delta dispatches;
     /// zeroed for a fresh generation via [`Self::reset_linear_state`]. Sized
     /// `[n_linear * qkv_dim * (kernel-1)]` and `[n_linear * nv * kd * vd]` f32.
-    lin_conv_state: DeviceBuffer<'a>,
-    lin_gdr_state: DeviceBuffer<'a>,
+    pub(crate) lin_conv_state: DeviceBuffer<'a>,
+    pub(crate) lin_gdr_state: DeviceBuffer<'a>,
     /// Per-linear-layer byte strides into the two state buffers above.
-    lin_conv_stride: u64,
-    lin_gdr_stride: u64,
+    pub(crate) lin_conv_stride: u64,
+    pub(crate) lin_gdr_stride: u64,
     /// Lightweight per-call accumulators (nanoseconds) so a decode loop can
     /// attribute time between the GPU GEMV submits and the surrounding host
     /// prep/readback. Drained + printed via [`Self::take_profile`].
     gemv_submit_ns: u128,
     gemv_other_ns: u128,
-    gemv_count: u64,
+    pub(crate) gemv_count: u64,
 }
 
 impl<'a> DecodeResources<'a> {
@@ -694,10 +703,19 @@ impl<'a> DecodeResources<'a> {
         zero_device_buffer(&mut lin_conv_state, conv_total as usize)?;
         zero_device_buffer(&mut lin_gdr_state, gdr_total as usize)?;
 
+        // Batched-prefill scratch: one whole token chunk per activation slot.
+        // Separate from `arena` because `widest_gemv` folds in `vocab_size`
+        // (151936), and scaling THAT by the chunk width would allocate GBs for a
+        // quantize slot the batched path never uses — the LM head runs on the
+        // last token only, through the decode arena.
+        let prefill =
+            crate::prefill::PrefillArena::new(ctx, config, crate::prefill::prefill_chunk_tokens())?;
+
         Ok(Self {
             arena,
             cache,
             recorder,
+            prefill,
             _layouts: vec![l2, l3, l4, l5, l6, l7],
             ring2,
             ring3,
@@ -1053,7 +1071,7 @@ fn forward_layers_resident<'a>(
 /// `[vocab]` rows read back. The end-of-token boundary is the only host
 /// dependency, so collapsing the standalone norm submit + the GEMV submit into
 /// one saves a submit/token (perf-parity Step 4).
-fn final_norm_lm_head<'a>(
+pub(crate) fn final_norm_lm_head<'a>(
     ctx: &'a VulkanContext,
     weights: &ResidentWeights<'_>,
     res: &mut DecodeResources<'a>,
@@ -1386,7 +1404,7 @@ pub fn set_submit_cap(cap: usize) {
     }
 }
 
-fn submit_dispatch_cap() -> usize {
+pub(crate) fn submit_dispatch_cap() -> usize {
     SUBMIT_DISPATCH_CAP.load(std::sync::atomic::Ordering::Relaxed)
 }
 
@@ -1727,7 +1745,7 @@ fn record_linear_attention<'a>(
 /// residency), checking it holds at least `len` f32. The conv1d weight, `ssm_a`,
 /// and `ssm_dt.bias` are stored on-device as plain f32 in the exact layout the
 /// `qwen35_*` shaders bind, so they bind directly with no host round-trip.
-fn ssm_weight_buffer<'b>(
+pub(crate) fn ssm_weight_buffer<'b>(
     weights: &'b ResidentWeights<'_>,
     layer: usize,
     suffix: &str,
@@ -1925,7 +1943,7 @@ fn record_gemv_only<'a>(
 /// `dims = [ne0=in, ne1=out]` and the bytes are row-major `[out, in]`, which is
 /// exactly the GEMV's `[nrows, ncols]` contract. The loader records these at
 /// upload time ([`DeviceTensor::gemv_dims`]).
-fn weight_dims(weight: &DeviceTensor<'_>, name: &str) -> Result<(usize, usize)> {
+pub(crate) fn weight_dims(weight: &DeviceTensor<'_>, name: &str) -> Result<(usize, usize)> {
     weight
         .gemv_dims
         .ok_or_else(|| anyhow!("{name}: resident tensor has no GEMV dims recorded"))
@@ -2476,7 +2494,7 @@ fn record_f16_kv_pack<'a>(
 /// Fetch a per-layer F32-resident norm weight tensor (`attn_q_norm` /
 /// `attn_k_norm`), erroring if missing or not F32-resident. The device rms_norm
 /// binds its `.buffer` directly (head_dim-wide, broadcast across heads).
-fn packed_or_f32_norm<'w>(
+pub(crate) fn packed_or_f32_norm<'w>(
     weights: &'w ResidentWeights<'_>,
     layer: usize,
     suffix: &str,
@@ -2496,7 +2514,7 @@ fn packed_or_f32_norm<'w>(
 
 /// Fetch a per-layer packed-quant weight tensor, erroring if it is missing or
 /// F32-resident (the dense FFN weights are always packed quant).
-fn packed_layer_weight<'w>(
+pub(crate) fn packed_layer_weight<'w>(
     weights: &'w ResidentWeights<'_>,
     layer: usize,
     suffix: &str,

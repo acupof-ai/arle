@@ -1712,6 +1712,7 @@ dependencies = [
  "infer-gguf",
  "infer-plan",
  "infer-seam",
+ "log",
  "qwen3-spec",
  "qwen35-spec",
  "vulkan-kernels",
