@@ -467,10 +467,11 @@ pub(super) fn cuda_permute_seq_blocks_device(
         }};
     }
     match x {
-        DeviceHandle::CudaBf16(src) => {
-            permute!(u16, src.data, |d| DeviceHandle::CudaBf16(
-                CudaBf16Storage::new(d)
-            ))
+        DeviceHandle::CudaBf16(storage) => {
+            let src = backend.cuda_bf16_storage_slice(storage)?;
+            permute!(u16, src, |d| DeviceHandle::CudaBf16(CudaBf16Storage::new(
+                d
+            )))
         }
         _ => {
             let src = backend.cuda_slice(x, "permute_seq_blocks")?;
