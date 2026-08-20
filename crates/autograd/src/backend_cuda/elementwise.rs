@@ -102,7 +102,7 @@ pub(super) fn cuda_sum_backward_device(
         });
     }
     let elem_count = shape_size(output_shape);
-    let mut d_out = backend.stream.alloc_zeros::<f32>(elem_count).map_err(|e| {
+    let mut d_out = alloc_zeros_retry::<f32>(backend, elem_count).map_err(|e| {
         let (free, total) = backend.mem_get_info().unwrap_or((0, 0));
         eprintln!(
             "[autograd] alloc_zeros {elem_count} x f32 failed (sum_backward_device, \

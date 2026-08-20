@@ -194,21 +194,13 @@ pub(super) fn cuda_linear_attention_backward_device_row(
         }
     }
 
-    let mut dqkv_conv = backend
-        .stream
-        .alloc_zeros::<f32>(qkv_len)
+    let mut dqkv_conv = alloc_zeros_retry::<f32>(backend, qkv_len)
         .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (la dqkv_conv)"))?;
-    let mut dz = backend
-        .stream
-        .alloc_zeros::<f32>(z_len)
+    let mut dz = alloc_zeros_retry::<f32>(backend, z_len)
         .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (la dz)"))?;
-    let mut db = backend
-        .stream
-        .alloc_zeros::<f32>(head_len)
+    let mut db = alloc_zeros_retry::<f32>(backend, head_len)
         .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (la db)"))?;
-    let mut da = backend
-        .stream
-        .alloc_zeros::<f32>(head_len)
+    let mut da = alloc_zeros_retry::<f32>(backend, head_len)
         .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (la da)"))?;
     let mut ddt = backend
         .stream
@@ -276,9 +268,7 @@ pub(super) fn cuda_linear_attention_backward_device_row(
                 .map_err(|_| AutogradError::TapeInvariant(what))
         };
         let alloc_f32 = |len: usize, what: &'static str| {
-            backend
-                .stream
-                .alloc_zeros::<f32>(len)
+            alloc_zeros_retry::<f32>(backend, len)
                 .map_err(|_| AutogradError::TapeInvariant(what))
         };
         let mut q = alloc_u16(q_len, "cuda alloc_zeros failed (fq q)")?;
@@ -527,9 +517,7 @@ pub(super) fn cuda_linear_attention_backward_device_row(
         }
     } else if use_mono {
         let (beta, g) = taped_g_beta(beta, g)?;
-        let mut grad_state_scratch = backend
-            .stream
-            .alloc_zeros::<f32>(state_len)
+        let mut grad_state_scratch = alloc_zeros_retry::<f32>(backend, state_len)
             .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (la grad_state)"))?;
         let mut state_recompute_scratch =
             backend.stream.alloc_zeros::<f32>(state_len).map_err(|_| {
@@ -625,9 +613,7 @@ pub(super) fn cuda_linear_attention_backward_device_row(
         let wave_i32 = i32::try_from(wave)
             .map_err(|_| AutogradError::TapeInvariant("linear_attention wave exceeds i32"))?;
         let grid = wave * rows;
-        let mut g_in_scratch = backend
-            .stream
-            .alloc_zeros::<f32>(carry_len)
+        let mut g_in_scratch = alloc_zeros_retry::<f32>(backend, carry_len)
             .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (la g_in)"))?;
 
         if num_chunks > 1 {
@@ -799,13 +785,9 @@ pub(super) fn cuda_linear_attention_backward_device_row(
         )?;
     }
 
-    let mut dqkv = backend
-        .stream
-        .alloc_zeros::<f32>(qkv_len)
+    let mut dqkv = alloc_zeros_retry::<f32>(backend, qkv_len)
         .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (la dqkv)"))?;
-    let mut dconv = backend
-        .stream
-        .alloc_zeros::<f32>(conv_len)
+    let mut dconv = alloc_zeros_retry::<f32>(backend, conv_len)
         .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (la dconv)"))?;
     {
         let (dqkv_ptr, _dqkv_guard) = dqkv.device_ptr_mut(&backend.stream);
