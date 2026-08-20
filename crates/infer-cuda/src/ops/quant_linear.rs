@@ -257,6 +257,49 @@ pub(crate) fn qwen_fp8_dense_operator_stats() -> infer_seam::OperatorDispatchSta
     }
 }
 
+/// Load-time storage gate: after final repack and source release, every M this
+/// dispatcher can be handed (gemv M=1, gemm_batch M>1) must have a resident
+/// consumer in the weight's route owner. The route predicates are M-independent
+/// once a representation is complete, so one check covers both lanes. Fails the
+/// load with the tensor context — never defers a missing buffer to serve time
+/// (the W8A16 lm_head defect class).
+pub(crate) fn validate_storage(
+    ctx: &DeviceContext,
+    name: &str,
+    weight: &DeviceMatrix,
+) -> Result<()> {
+    let sm_marlin = marlin_sm_supported(ctx);
+    let missing = match weight.weight_format {
+        WeightFormat::Fp8BlockScaled | WeightFormat::Fp8PerShard => {
+            fp8::fp8_missing_representation(fp8::Fp8Storage::of(weight), sm_marlin)
+        }
+        WeightFormat::Fp4E2M1Group => {
+            fp4::fp4_missing_representation(fp4::Fp4Storage::of(weight), sm_marlin)
+        }
+        WeightFormat::W8A16 | WeightFormat::W4A16 => {
+            int::int_missing_representation(int::IntStorage::of(weight), sm_marlin)
+        }
+        WeightFormat::Dsv4Fp8BlockScaled | WeightFormat::Dsv4Fp4BlockScaled => {
+            (weight.qweight.is_none() || weight.dsv4_scales.is_none())
+                .then_some("the qweight + dsv4_scales source pair")
+        }
+        // DenseBf16 and formats this dispatcher does not serve keep their
+        // existing validation.
+        _ => None,
+    };
+    if let Some(missing) = missing {
+        bail!(
+            "{name}: {} [{}x{}] gs={} has no consumable quant-linear storage for every M; \
+             missing {missing}",
+            weight.weight_format,
+            weight.rows,
+            weight.cols,
+            weight.group_size,
+        );
+    }
+    Ok(())
+}
+
 /// The one quantized dispatch entry: one match on the stored format, one route
 /// owner per family. `m` is the row count — `x.seq_len` for `gemm_batch`, 1 for
 /// `gemv` — so both lanes run the identical order with identical gates.
@@ -350,9 +393,9 @@ pub(super) fn gemv(
 
 #[cfg(test)]
 mod tests {
-    use super::fp4::{self, Fp4Query, Fp4Route};
-    use super::fp8::{self, Fp8Query, Fp8Route};
-    use super::int::{self, IntQuery, IntRoute};
+    use super::fp4::{self, Fp4Query, Fp4Route, Fp4Storage};
+    use super::fp8::{self, Fp8Query, Fp8Route, Fp8Storage};
+    use super::int::{self, IntQuery, IntRoute, IntStorage};
 
     #[test]
     fn fp8_routes() {
@@ -446,6 +489,129 @@ mod tests {
         };
         assert_eq!(fp4::fp4_route(prefill, 512), Fp4Route::DeepGemm);
         assert_eq!(fp4::fp4_route(prefill, 511), Fp4Route::Marlin);
+    }
+
+    /// The load-time storage validator, over the states the loader can produce
+    /// (and the invalid ones it must reject). `true` = valid (no missing
+    /// representation).
+    #[test]
+    fn storage_states() {
+        let f8 = |marlin: bool, src_w: bool, src_s: bool, per_shard: bool| Fp8Storage {
+            marlin_packed: marlin,
+            marlin_scales: marlin,
+            source_weight: src_w,
+            source_scale: src_s,
+            per_shard,
+        };
+        let fp8_cases: &[(Fp8Storage, bool, bool)] = &[
+            // Post-repack per-channel: Marlin pair, source freed, scale kept.
+            (f8(true, false, true, false), true, true),
+            // Repack-declined 128x128 block weight: source pair only.
+            (f8(false, true, true, false), true, true),
+            // The W8A16-lm_head defect class: everything released, no consumer.
+            (f8(false, false, false, false), true, false),
+            // Marlin pair resident but device below sm_80: no route can read it.
+            (f8(true, false, false, false), false, false),
+            // qweight_u8 without its scale: GEMV/dequant both need scale_f32.
+            (f8(false, true, false, false), true, false),
+            // Per-shard has one route, its source pair.
+            (f8(false, true, true, true), true, true),
+            (f8(false, false, true, true), true, false),
+        ];
+        for &(s, sm, valid) in fp8_cases {
+            assert_eq!(fp8::fp8_missing_representation(s, sm).is_none(), valid);
+        }
+        // Half Marlin pair is always rejected.
+        assert!(
+            fp8::fp8_missing_representation(
+                Fp8Storage {
+                    marlin_packed: true,
+                    marlin_scales: false,
+                    source_weight: true,
+                    source_scale: true,
+                    per_shard: false,
+                },
+                true,
+            )
+            .is_some()
+        );
+
+        let f4 = |marlin: bool, sfb: bool, global: bool| Fp4Storage {
+            marlin_packed: marlin,
+            marlin_scales: marlin,
+            sfb,
+            global_scale: global,
+        };
+        let fp4_cases: &[(Fp4Storage, bool, bool)] = &[
+            // Normal post-repack: Marlin only (decode) or Marlin + sfb (prefill arm).
+            (f4(true, false, false), true, true),
+            (f4(true, true, true), true, true),
+            // sfb without the global scale errors inside the widen arm.
+            (f4(true, true, false), true, false),
+            // The repack's silent format-gate no-op: nothing resident.
+            (f4(false, false, false), true, false),
+            // Marlin pair on a pre-sm80 device: unreadable.
+            (f4(true, false, false), false, false),
+        ];
+        for &(s, sm, valid) in fp4_cases {
+            assert_eq!(fp4::fp4_missing_representation(s, sm).is_none(), valid);
+        }
+
+        let i8s = |marlin: bool, source: bool, w8: bool, grouped: bool| IntStorage {
+            marlin_packed: marlin,
+            marlin_scales: marlin,
+            source_weight: source,
+            source_scales: source,
+            is_w8a16: w8,
+            group_aligned: grouped,
+        };
+        let int_cases: &[(IntStorage, bool, bool)] = &[
+            // Post-repack W8A16: Marlin pair only (source freed by the repack).
+            (i8s(true, false, true, false), true, true),
+            // Repack-declined W8A16: group-aligned source pair.
+            (i8s(false, true, true, true), true, true),
+            // Source retained but group size does not divide cols.
+            (i8s(false, true, true, false), true, false),
+            // The lm_head defect: repack freed the source, Marlin unreadable.
+            (i8s(true, false, true, false), false, false),
+            // Nothing resident.
+            (i8s(false, false, true, false), true, false),
+            // W4A16: source pair is the only route.
+            (i8s(false, true, false, true), true, true),
+            (i8s(false, false, false, true), true, false),
+        ];
+        for &(s, sm, valid) in int_cases {
+            assert_eq!(int::int_missing_representation(s, sm).is_none(), valid);
+        }
+        // Half pairs are rejected regardless of everything else.
+        assert!(
+            int::int_missing_representation(
+                IntStorage {
+                    marlin_packed: true,
+                    marlin_scales: false,
+                    source_weight: true,
+                    source_scales: true,
+                    is_w8a16: true,
+                    group_aligned: true,
+                },
+                true,
+            )
+            .is_some()
+        );
+        assert!(
+            int::int_missing_representation(
+                IntStorage {
+                    marlin_packed: true,
+                    marlin_scales: true,
+                    source_weight: true,
+                    source_scales: false,
+                    is_w8a16: true,
+                    group_aligned: true,
+                },
+                true,
+            )
+            .is_some()
+        );
     }
 
     #[test]

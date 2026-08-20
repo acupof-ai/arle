@@ -27,6 +27,7 @@ use safetensors::{SafeTensors, tensor::Dtype};
 use crate::model::{Attention, CudaModel, Mlp, TransformerBlock};
 use crate::ops::{
     fp4_deepgemm_available, fp8_deepgemm_per_channel_available, precompute_rope, upload_i32,
+    validate_quant_linear_storage,
 };
 use crate::quant_format::{
     QuantFormat, QuantManifest, QuantTensorView, ScaleApply, TensorHeader, detect_quant_format,
@@ -5761,6 +5762,10 @@ pub(crate) fn marlin_repack_dense(
     }
     matrix.fp8_deepgemm_prefill =
         prefill_batched && fp8_deepgemm_per_channel_available(ctx, &matrix);
+    // Final-state gate: every M (gemv and gemm_batch alike) must have a resident
+    // consumer now that the repacks have released their sources. Fail the load
+    // here, never a serve-time missing-buffer error.
+    validate_quant_linear_storage(ctx, name, &matrix)?;
     Ok(matrix)
 }
 
