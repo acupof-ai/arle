@@ -501,7 +501,7 @@ pub(super) fn cuda_slice_backward_device(
             .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (slice_bwd)"))?;
         DeviceHandle::Cuda(CudaStorage::new(d_grad))
     };
-    cuda_write_slice_device(backend, &dest, upstream, input_shape, starts, ends)
+    cuda_scatter_slice_device(backend, &dest, upstream, input_shape, starts, ends, false)
 }
 
 #[cfg(not(feature = "no-cuda"))]
@@ -513,6 +513,40 @@ pub(super) fn cuda_write_slice_device(
     starts: &[usize],
     ends: &[usize],
 ) -> Result<DeviceHandle> {
+    cuda_scatter_slice_device(backend, dest, upstream, input_shape, starts, ends, false)
+}
+
+/// Add a slice's gradient into `dest`'s region instead of overwriting it. The
+/// destination may already carry another consumer's contribution, so a store
+/// would drop it — disjoint slice regions are not enough to make one safe.
+#[cfg(not(feature = "no-cuda"))]
+pub(super) fn cuda_accumulate_slice_device(
+    backend: &CudaBackend,
+    dest: &DeviceHandle,
+    upstream: &DeviceHandle,
+    input_shape: &[usize],
+    starts: &[usize],
+    ends: &[usize],
+) -> Result<DeviceHandle> {
+    cuda_scatter_slice_device(backend, dest, upstream, input_shape, starts, ends, true)
+}
+
+#[cfg(not(feature = "no-cuda"))]
+#[allow(clippy::too_many_arguments)]
+fn cuda_scatter_slice_device(
+    backend: &CudaBackend,
+    dest: &DeviceHandle,
+    upstream: &DeviceHandle,
+    input_shape: &[usize],
+    starts: &[usize],
+    ends: &[usize],
+    accumulate: bool,
+) -> Result<DeviceHandle> {
+    let kernel = if accumulate {
+        "slice_backward_accum_f32"
+    } else {
+        "slice_backward_f32"
+    };
     let upstream_shape = validate_slice_shape(input_shape, starts, ends)?;
     let upstream_size = shape_size(&upstream_shape);
     let input_size = shape_size(input_shape);
@@ -549,9 +583,7 @@ pub(super) fn cuda_write_slice_device(
             });
         }
         let (dest_ptr, _dest_guard) = d_dest.device_ptr(&backend.stream);
-        let func = backend
-            .kernels
-            .function_for("slice_backward_f32", TapeDtype::Bf16)?;
+        let func = backend.kernels.function_for(kernel, TapeDtype::Bf16)?;
         launch_1d(&backend.stream, &func, upstream_size, |mut builder| {
             builder
                 .arg(&dest_ptr)
@@ -579,7 +611,7 @@ pub(super) fn cuda_write_slice_device(
     let (dest_ptr, _dest_guard) = d_dest.device_ptr(&backend.stream);
     launch_1d(
         &backend.stream,
-        backend.kernels.function("slice_backward_f32")?,
+        backend.kernels.function(kernel)?,
         upstream_size,
         |mut builder| {
             builder

@@ -2202,6 +2202,26 @@ impl Backend for CudaBackend {
         }
     }
 
+    fn accumulate_slice_device(
+        &self,
+        dest: &DeviceHandle,
+        upstream: &DeviceHandle,
+        input_shape: &[usize],
+        starts: &[usize],
+        ends: &[usize],
+    ) -> Result<DeviceHandle> {
+        #[cfg(feature = "no-cuda")]
+        {
+            let _ = (dest, upstream, input_shape, starts, ends);
+            todo!("GPU required: cuda accumulate_slice_device is unavailable under feature no-cuda")
+        }
+
+        #[cfg(not(feature = "no-cuda"))]
+        {
+            cuda_accumulate_slice_device(self, dest, upstream, input_shape, starts, ends)
+        }
+    }
+
     fn write_slice_device(
         &self,
         dest: &DeviceHandle,

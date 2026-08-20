@@ -416,6 +416,67 @@ fn slice_host_eager(
 /// Concatenate N tensors of equal rank along `axis`. All inputs must match on
 /// every axis except `axis`. General over rank and axis (unlike the rank-4-only
 /// `cat_seq`/`cat_heads`): the CP linear-attn transport concats rank-3 activations
+/// Add a slice's upstream gradient into an existing gradient buffer for its
+/// input, instead of zero-filling a fresh full-size one for the merge to sum.
+///
+/// The packed qkv tensor is sliced three ways per gated-delta layer, so the
+/// default path allocates three full-input buffers where one accumulated into
+/// three times would do. Accumulates rather than stores: the destination may
+/// already hold a contribution from another consumer of the same tensor, and
+/// disjoint slice regions would not make a store safe.
+///
+/// Returns `false` when the destination cannot be proven safe to write, and the
+/// caller falls back.
+pub(crate) fn slice_backward_into(
+    entry: &TapeEntry,
+    output_grad_id: TensorId,
+    dest_grad_id: TensorId,
+    store: &mut TensorStore,
+) -> Result<bool> {
+    let SavedContext::SliceCtx {
+        input_shape,
+        starts,
+        ends,
+    } = entry.saved.clone()
+    else {
+        return Ok(false);
+    };
+    if store.tensor(dest_grad_id)?.shape != input_shape {
+        return Ok(false);
+    }
+    let both_on_device = {
+        let up = store.tensor(output_grad_id)?;
+        let dst = store.tensor(dest_grad_id)?;
+        up.dirty != Dirty::Host
+            && up.device_handle.is_some()
+            && dst.dirty != Dirty::Host
+            && dst.device_handle.is_some()
+    };
+    if !both_on_device {
+        return Ok(false);
+    }
+    // Same discriminator `merge_grad` uses: gradients fan out by Arc clone, so
+    // accumulating into a shared buffer would corrupt a live sibling. Probe
+    // before the clone below, which would bump the count.
+    let uniquely_owned = store
+        .tensor(dest_grad_id)?
+        .device_handle
+        .as_ref()
+        .and_then(DeviceHandle::device_buffer_strong_count)
+        == Some(1);
+    if !uniquely_owned {
+        return Ok(false);
+    }
+    let dest = store.device_handle(dest_grad_id)?;
+    let upstream = store.device_handle(output_grad_id)?;
+    let accumulated =
+        store
+            .backend()
+            .accumulate_slice_device(&dest, &upstream, &input_shape, &starts, &ends)?;
+    store.replace_device_handle(dest_grad_id, accumulated)?;
+    Ok(true)
+}
+
 /// on the feature axis and the rank-2 packed conv weight on axis 0. Host path —
 /// this is layout glue, and the CP shuffle it feeds is pod-only regardless.
 pub fn cat(
