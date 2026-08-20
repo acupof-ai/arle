@@ -792,7 +792,33 @@ impl Tape {
                     BackwardOp::BroadcastExpand => {
                         ops::broadcast_expand_backward(&entry, output_grad_id, store)?
                     }
-                    BackwardOp::Slice => ops::slice_backward(&entry, output_grad_id, store)?,
+                    BackwardOp::Slice => {
+                        // Three disjoint slices of one packed tensor per
+                        // gated-delta layer each zero-fill a full-input buffer
+                        // that the merge then sums. Accumulate into the gradient
+                        // already held for this input instead. Only for an
+                        // intermediate another entry produced: this bypasses
+                        // `merge_grad`, and with it the `accumulate_grad` a
+                        // parameter's gradient needs.
+                        let dest = entry
+                            .input_ids
+                            .first()
+                            .filter(|x| entry_by_output.contains_key(*x))
+                            .and_then(|x| grads.get(x).copied());
+                        match dest {
+                            Some(dest)
+                                if ops::slice_backward_into(
+                                    &entry,
+                                    output_grad_id,
+                                    dest,
+                                    store,
+                                )? =>
+                            {
+                                GradPairs::new()
+                            }
+                            _ => ops::slice_backward(&entry, output_grad_id, store)?,
+                        }
+                    }
                     BackwardOp::PermuteSeqBlocks => {
                         ops::permute_seq_blocks_backward(&entry, output_grad_id, store)?
                     }

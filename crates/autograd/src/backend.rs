@@ -2349,6 +2349,42 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         self.upload(&out, &[total])
     }
 
+    /// Add `upstream` into `dest`'s slice region. Unlike `write_slice_device`,
+    /// which stores, this keeps whatever the destination already held — the
+    /// gradient of a tensor with more than one consumer.
+    fn accumulate_slice_device(
+        &self,
+        dest: &DeviceHandle,
+        upstream: &DeviceHandle,
+        input_shape: &[usize],
+        starts: &[usize],
+        ends: &[usize],
+    ) -> Result<DeviceHandle> {
+        let mut dest_host = self.readback(dest)?;
+        let upstream_host = self.readback(upstream)?;
+        let expected_shape = validate_slice_shape(input_shape, starts, ends)?;
+        if dest_host.len() != shape_size(input_shape)
+            || upstream_host.len() != shape_size(&expected_shape)
+        {
+            return Err(crate::AutogradError::DataLengthMismatch {
+                len: dest_host.len().min(upstream_host.len()),
+                shape: input_shape.to_vec(),
+                size: shape_size(input_shape),
+            });
+        }
+        let strides = broadcast_strides(input_shape);
+        for (out_index, &value) in upstream_host.iter().enumerate() {
+            let coords = linear_to_coords(out_index, &expected_shape);
+            let input_index: usize = coords
+                .iter()
+                .enumerate()
+                .map(|(axis, &coord)| (coord + starts[axis]) * strides[axis])
+                .sum();
+            dest_host[input_index] += value;
+        }
+        self.upload(&dest_host, input_shape)
+    }
+
     fn write_slice_device(
         &self,
         dest: &DeviceHandle,

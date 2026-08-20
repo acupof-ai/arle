@@ -147,3 +147,36 @@ extern "C" __global__ void slice_backward_f32(
     }
     grad[input_offset] = upstream[idx];
 }
+
+// Same scatter, accumulating. `slice_backward_f32` writes into a buffer it just
+// zeroed; adding a slice's gradient into a buffer that already carries another
+// consumer's contribution needs `+=`, and disjointness is not enough to make the
+// store safe — the destination can hold a gradient from a path that is not a
+// slice at all.
+extern "C" __global__ void slice_backward_accum_f32(
+    T* __restrict__ grad,
+    const T* __restrict__ upstream,
+    const int* __restrict__ input_shape,
+    const int* __restrict__ starts,
+    const int* __restrict__ upstream_shape,
+    int rank,
+    unsigned long long total
+) {
+    unsigned long long idx =
+        (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+
+    unsigned long long linear = idx;
+    unsigned long long input_offset = 0;
+    for (int d = rank - 1; d >= 0; --d) {
+        int coord = linear % upstream_shape[d];
+        linear /= upstream_shape[d];
+
+        unsigned long long stride = 1;
+        for (int s = rank - 1; s > d; --s) {
+            stride *= input_shape[s];
+        }
+        input_offset += (starts[d] + coord) * stride;
+    }
+    grad[input_offset] = (T)((float)grad[input_offset] + (float)upstream[idx]);
+}

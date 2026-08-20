@@ -101,6 +101,7 @@ const FUNCTION_NAMES: &[&str] = &[
     "concat_axis2_f32",
     "kv_cache_write_axis2_f32",
     "slice_backward_f32",
+    "slice_backward_accum_f32",
     "adamw_step_f32",
     "log_softmax_last_axis_backward_f32",
     "gather_last_dim_backward_f32",
