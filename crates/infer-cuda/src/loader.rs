@@ -4590,9 +4590,15 @@ impl SafetensorLoader {
             // NVFP4 → W4AFP8: convert E2M1+E8M0 to INT4+BF16 on GPU per expert,
             // download, fuse w1+w3 on host, upload.
             let e8m0_name = |w: &str| w.trim_end_matches(".weight").to_string() + ".scale";
-            let convert = |w_name: &str| -> Result<(Vec<u8>, Vec<u8>, usize)> {
+            let convert = |w_name: &str| -> Result<(Vec<u8>, Vec<u8>, usize, usize, usize)> {
                 let weight = self.load_raw_tensor(w_name)?;
                 let scale = self.load_raw_tensor(&e8m0_name(w_name))?;
+                if weight.shape.len() != 2 {
+                    bail!(
+                        "{w_name}: expected 2D weight, got {} dims",
+                        weight.shape.len()
+                    );
+                }
                 let n = weight.shape[0];
                 let k = weight.shape[1] * 2;
                 let scale_rows = k / 512;
@@ -4631,16 +4637,30 @@ impl SafetensorLoader {
                     .stream
                     .clone_dtoh(&dst_s)
                     .map_err(|e| anyhow!("NVFP4 dst scale download failed: {e}"))?;
-                Ok((w_host, s_host, scale_rows))
+                Ok((w_host, s_host, scale_rows, n, k))
             };
             let mut w13_w = Vec::new();
             let mut w13_s = Vec::new();
             let mut w2_w = Vec::new();
             let mut w2_s = Vec::new();
+            // All experts must share the same w1/w3 and w2 shapes — the fused
+            // w13 buffer is read with a uniform stride by the grouped GEMM.
+            let mut expect_w1: Option<(usize, usize)> = None;
+            let mut expect_w2: Option<(usize, usize)> = None;
             for e in split.local_expert_start..split.local_expert_end() {
                 let expert = names.expert(e);
-                let (w1_cw, w1_cs, w1_rows) = convert(&expert.w1)?;
-                let (w3_cw, w3_cs, _) = convert(&expert.w3)?;
+                let (w1_cw, w1_cs, w1_rows, w1_n, w1_k) = convert(&expert.w1)?;
+                let (w3_cw, w3_cs, _, w3_n, w3_k) = convert(&expert.w3)?;
+                if (w1_n, w1_k) != (w3_n, w3_k) {
+                    bail!("expert {e}: w1 [{w1_n},{w1_k}] != w3 [{w3_n},{w3_k}]");
+                }
+                if let Some((en, ek)) = expect_w1 {
+                    if (w1_n, w1_k) != (en, ek) {
+                        bail!("expert {e}: w1 [{w1_n},{w1_k}] != expert 0 [{en},{ek}]");
+                    }
+                } else {
+                    expect_w1 = Some((w1_n, w1_k));
+                }
                 w13_w.extend_from_slice(&w1_cw);
                 w13_w.extend_from_slice(&w3_cw);
                 let row_bytes = w1_cs.len() / w1_rows;
@@ -4650,7 +4670,14 @@ impl SafetensorLoader {
                     w13_s.extend_from_slice(&w1_cs[start..start + row_bytes]);
                     w13_s.extend_from_slice(&w3_cs[start..start + row_bytes]);
                 }
-                let (w2_cw, w2_cs, _) = convert(&expert.w2)?;
+                let (w2_cw, w2_cs, _, w2_n, w2_k) = convert(&expert.w2)?;
+                if let Some((en, ek)) = expect_w2 {
+                    if (w2_n, w2_k) != (en, ek) {
+                        bail!("expert {e}: w2 [{w2_n},{w2_k}] != expert 0 [{en},{ek}]");
+                    }
+                } else {
+                    expect_w2 = Some((w2_n, w2_k));
+                }
                 w2_w.extend_from_slice(&w2_cw);
                 w2_s.extend_from_slice(&w2_cs);
             }
