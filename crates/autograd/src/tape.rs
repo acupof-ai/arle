@@ -1150,7 +1150,7 @@ impl Tape {
                 .chain(d_param.iter().filter_map(ChunkSum::id))
                 .collect();
             store.free_new_except(&live_before, &keep)?;
-            store.backend().stream_synchronize()?;
+            self.trim_if_hoarding(store)?;
             start = end;
         }
         // Once per region, not per chunk: each trim is a cudaFree/cudaMalloc
@@ -1192,13 +1192,7 @@ impl Tape {
     /// 60 GB at a layer exit, next alloc OOM). Scope-granular, so the
     /// per-chunk trim starvation cannot recur.
     fn trim_if_hoarding(&self, store: &TensorStore) -> Result<()> {
-        const HOARD_TRIM_BYTES: u64 = 2 << 30;
-        if let Some((reserved, used)) = store.backend().mem_pool_stats()
-            && reserved.saturating_sub(used) > HOARD_TRIM_BYTES
-        {
-            store.backend().trim_memory_pool()?;
-        }
-        Ok(())
+        crate::ops::checkpoint::trim_if_hoarding(store)
     }
 }
 
