@@ -933,8 +933,10 @@ pub(crate) struct ServeArgs {
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set, value_name = "BOOL")]
     pub(crate) metal_pipeline: bool,
 
-    /// Load-time JIT warmup forward.
-    #[arg(long, default_value_t = true, action = clap::ArgAction::Set, value_name = "BOOL")]
+    /// Load-time JIT warmup forward. Off by default — the first request pays
+    /// the JIT + embed dequant cost, which is faster overall for cold-start
+    /// scenarios. Serving deployments should opt in.
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set, value_name = "BOOL")]
     pub(crate) metal_warmup: bool,
 
     /// Paged-prefix SDPA read path for single-token decode.
