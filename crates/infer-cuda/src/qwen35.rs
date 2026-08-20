@@ -56,7 +56,8 @@ use crate::moe::{
 use crate::moe_config::ExpertSplit;
 use crate::ops::{
     add_batch, argmax_into, argmax_row_into, copy_row_to_vec, embedding_batch, gemm_batch, gemv,
-    silu_mul_fused, split_qkv, split2, upload_i32, warm_fp8_deepgemm_dense,
+    silu_mul_fused, split_qkv, split2, upload_i32, warm_fp4_deepgemm_dense,
+    warm_fp8_deepgemm_dense,
 };
 use crate::workspace::{HiddenSlot, PinnedSlot, SliceSlot, VecSlot};
 

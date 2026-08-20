@@ -55,6 +55,43 @@ pub(crate) fn fp4_deepgemm_available(ctx: &DeviceContext, weight: &DeviceMatrix)
 /// mantissa bit E4M3 cannot hold (`prepare_fp4_deepgemm_sfb`) and the E4M3
 /// activation rounding this entry point forces, neither of which is free. That
 /// is why the arm is gated on the needle ladder and not on the scale algebra.
+
+/// Compile the NVFP4 prefill arm's DeepGEMM kernel at load, and reserve the
+/// E4M3 weight scratch while doing it.
+///
+/// Without this the arm relies on a coincidence: this checkpoint's NVFP4 and
+/// per-channel FP8 MLP weights share `[34816, 5120]` and `[5120, 17408]`, so the
+/// FP8 warm happens to build a cubin the FP4 arm can reuse. A checkpoint whose
+/// shapes do not collide would JIT inside the first request instead.
+pub(crate) fn warm_fp4_deepgemm_dense(
+    ctx: &DeviceContext,
+    weight: &DeviceMatrix,
+    seq_len: usize,
+) -> Result<bool> {
+    if weight.weight_format != WeightFormat::Fp4E2M1Group
+        || weight.fp4_deepgemm_sfb.is_none()
+        || !fp4_deepgemm_available(ctx, weight)
+    {
+        return Ok(false);
+    }
+    let Some(floor) = dense_deepgemm_prefill_floor(QWEN_FP4_DEEPGEMM_MIN_M) else {
+        return Ok(false);
+    };
+    let m = seq_len.max(floor);
+    let n = weight.rows;
+    let k = weight.cols;
+    let input = ctx
+        .stream
+        .alloc_zeros::<bf16>(m * k)
+        .map_err(|e| anyhow!("NVFP4 DeepGEMM warm input alloc failed: {e}"))?;
+    let mut out = ctx
+        .stream
+        .alloc_zeros::<bf16>(m * n)
+        .map_err(|e| anyhow!("NVFP4 DeepGEMM warm output alloc failed: {e}"))?;
+    // The real arm, on throwaway buffers: same widen, same launch config, so it
+    // builds the kernel the first request will replay.
+    try_fp4_deepgemm_gemm(ctx, weight, &input, &mut out, m)
+}
 fn try_fp4_deepgemm_gemm(
     ctx: &DeviceContext,
     weight: &DeviceMatrix,

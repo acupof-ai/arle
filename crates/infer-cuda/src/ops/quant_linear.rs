@@ -16,7 +16,7 @@ mod fp8;
 #[path = "quant_linear_int.rs"]
 mod int;
 
-pub(crate) use fp4::fp4_deepgemm_available;
+pub(crate) use fp4::{fp4_deepgemm_available, warm_fp4_deepgemm_dense};
 pub(crate) use fp8::{fp8_deepgemm_per_channel_available, warm_fp8_deepgemm_dense};
 
 // Only POLICY_ID is read here (stats hash); the route policy lives in fp8.
