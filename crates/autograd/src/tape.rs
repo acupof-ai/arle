@@ -1020,6 +1020,20 @@ impl Tape {
                     store.offload_checkpoint_to_host(hidden_id)?;
                 }
                 self.trim_after_checkpoint_replay(store)?;
+                if std::env::var("ARLE_OPD_VRAM_TRACE").is_ok_and(|v| v != "0")
+                    && let Some((free, total)) = store.backend().device_mem_info()
+                {
+                    let pool = store.backend().mem_pool_stats();
+                    eprintln!(
+                        "[ckpt-bwd-vram] scope_exit used={}MiB free={}MiB pool_reserved={:?} \
+                         pool_used={:?} live_tensors={}",
+                        (total - free) >> 20,
+                        free >> 20,
+                        pool.map(|(r, _)| r >> 20),
+                        pool.map(|(_, u)| u >> 20),
+                        store.live_tensor_count(),
+                    );
+                }
                 self.checkpoint_op_mem_record("scope_exit", None, None, store);
                 if let (Some(outer), Some(mut inner)) = (profile, inner_profile) {
                     // The inner wall already sits inside the Checkpoint envelope.
