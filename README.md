@@ -138,6 +138,32 @@ NVFP4 checkpoint (E2M1+E8M0) converted to W4AFP8 (INT4+BF16) at load time — 4-
 
 Same conversion, 4-way tensor parallelism. B=1 decode **47.7 tok/s** (1.29× over TP=2); per-GPU efficiency 11.9 tok/s/GPU vs FP8 TP=8's 6.6 tok/s/GPU.
 
+### Qwen3.8-27B-NVFP4 (one H20) — 4-bit that is actually smaller
+
+A mixed-precision checkpoint: NVFP4 MLP (group 16) plus per-channel FP8
+everywhere else. Only 54% of the parameters are 4-bit, so the file is 23.4 GB
+against the FP8 model's 30.9 GB — 24% fewer bytes, not half.
+
+sm_90 has no FP4 tensor core, so any real GEMM has to widen the nibbles first and
+the only question is what to widen *to*. Marlin widens to BF16 and runs at 84
+TFLOPS; widening to E4M3 and handing the bytes to DeepGEMM runs at 274, 93% of
+this card's FP8 peak. Marlin keeps decode, where reading half the bytes wins.
+
+The operand DeepGEMM wants is derived from Marlin's resident layout into scratch
+per call, so **no weight is resident twice** — the first version of this kept both
+layouts and cost 10 GB more than the FP8 model it exists to beat.
+
+| vs Qwen3.6-27B-FP8, 32K agent prompts | c=1 | c=4 | c=8 | c=16 |
+|---|---:|---:|---:|---:|
+| Decode (ITL) | **+21.3%** | **+20.7%** | **+13.2%** | **+5.5%** |
+| End-to-end | **+5.0%** | **+15.3%** | **+9.1%** | **+1.8%** |
+
+Resident **22.4 GB** against FP8's 29.4, KV pool 1,779,114 tokens against
+1,582,506. Same binary, both arms, back to back. GSM8K-shaped accuracy is
+unchanged by the prefill path: 188/200 with the arms on against 189/200 with them
+off, 196/200 identical answers. Full rows and the per-op ladder in
+[docs/baselines.md](docs/baselines.md).
+
 ### Against SGLang
 
 Same weights, same GPU, same quantized kernel — SGLang serves a repack of our own checkpoint. Qwen3.6-27B, one H20, 33K prompt, one request at a time.
