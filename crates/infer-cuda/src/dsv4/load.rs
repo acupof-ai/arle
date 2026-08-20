@@ -445,7 +445,7 @@ impl Dsv4Model {
         } else {
             loader.load_dsv4_hyper_connection(&ctx, &names.head_hc())?
         };
-        let mtp = if spec_decode_on && config.num_nextn_predict_layers > 0 {
+        let mtp = if !dspark_on && spec_decode_on && config.num_nextn_predict_layers > 0 {
             ensure!(
                 config.num_nextn_predict_layers == 1,
                 "DSv4 Phase-1 MTP loader supports exactly one nextn layer, got {}",
