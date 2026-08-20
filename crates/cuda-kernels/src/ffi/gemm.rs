@@ -369,6 +369,38 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    /// Build the per-128x128-block power of two that
+    /// [`dequantize_fp4_e2m1_group_to_fp8_cuda`] divides out and DeepGEMM takes
+    /// back as `sfb`. Writes `[ceil(n/128) + 1, ceil(k/128)]` f32 — the extra
+    /// row is the one DeepGEMM reads past the last n-block.
+    pub fn fp4_group_scale_block_pow2_cuda(
+        scales: *const u8,
+        global_scales: *const f32,
+        block_pow2: *mut f32,
+        n: i32,
+        k: i32,
+        group_size: i32,
+        scale_cols: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    /// NVFP4 -> dense E4M3 `[n, k]`, group scale folded and the block power of
+    /// two divided out. The FP8 twin of
+    /// [`dequantize_fp4_e2m1_group_to_bf16_cuda`]: sm_90 has no FP4 tensor core,
+    /// and widening to E4M3 rather than BF16 doubles the GEMM's ceiling.
+    pub fn dequantize_fp4_e2m1_group_to_fp8_cuda(
+        weight: *const u8,
+        scales: *const u8,
+        global_scales: *const f32,
+        block_pow2: *const f32,
+        output: *mut u8,
+        n: i32,
+        k: i32,
+        group_size: i32,
+        scale_cols: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn gemv_fp4_e2m1_group_cuda(
         weight: *const u8,
         scales: *const u8,
@@ -814,6 +846,17 @@ unsafe extern "C" {
         n: i32,
         k: i32,
         sfa_aligned_m: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    /// In-place rank-1 column scale over a bf16 `[rows, cols]` buffer:
+    /// `data[r, c] *= scales[c]`. Applies a per-channel FP8 weight scale to a
+    /// DeepGEMM output — its epilogue emits bf16 and has no value hook.
+    pub fn scale_columns_bf16_cuda(
+        data: *mut Half,
+        scales: *const f32,
+        rows: i32,
+        cols: i32,
         stream: CUstream,
     ) -> CUresult;
 

@@ -12,10 +12,19 @@ impl Qwen35Model {
         }
         let mut seen = HashSet::new();
         let mut warmed = 0usize;
+        // The quant layout is part of the key, not just the dims: this
+        // checkpoint's NVFP4 and per-channel FP8 MLP weights share
+        // [34816, 5120] and [5120, 17408], and on dims alone the NVFP4 one
+        // claims the shape, declines the warm, and leaves the FP8 one to
+        // compile in-request.
         let mut warm = |weight: &DeviceMatrix| -> Result<()> {
-            if seen.insert((weight.rows, weight.cols))
-                && warm_fp8_deepgemm_dense(&self.ctx, weight, warm_m)?
-            {
+            let key = (
+                weight.rows,
+                weight.cols,
+                weight.weight_format,
+                weight.quant_block_m,
+            );
+            if seen.insert(key) && warm_fp8_deepgemm_dense(&self.ctx, weight, warm_m)? {
                 // Also JIT-warm the spec-verify row count so the first DSpark
                 // block step doesn't compile DeepGEMM M=16 kernels in-request.
                 warm_fp8_deepgemm_dense(&self.ctx, weight, 16)?;
@@ -343,7 +352,7 @@ impl Qwen35Model {
         let lm_head = if m.tie_word_embeddings {
             None
         } else {
-            Some(loader.load_dense_matrix_quant_aware(&ctx, m.lm_head_tensor_name())?)
+            Some(loader.load_output_head_quant_aware(&ctx, m.lm_head_tensor_name())?)
         };
         crate::executor::cuda_startup_log(
             "qwen35.embeddings",

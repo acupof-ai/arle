@@ -62,6 +62,10 @@ static DSV4_DSA_INDEXER_SMS: AtomicUsize = AtomicUsize::new(78);
 // before the rollout student loads, and the engine's own `apply_runtime_flags`
 // during load must not reset it. Off = serving default (grouped-FP8 experts).
 static QWEN35_MOE_EXPERTS_BF16_RESIDENT: AtomicBool = AtomicBool::new(false);
+// The M envelope of the engine being built: the most rows a decode step can
+// present, and the most a prefill chunk can. `0` = undeclared.
+static DENSE_GEMM_DECODE_ROWS: AtomicUsize = AtomicUsize::new(0);
+static DENSE_GEMM_PREFILL_ROWS: AtomicUsize = AtomicUsize::new(0);
 static DSV4_DECODE_REUSE: AtomicBool = AtomicBool::new(true); // default ON (2026-07-11 pod license)
 static MTP_ADAPTIVE: AtomicBool = AtomicBool::new(false);
 static MTP_MIN_ACCEPT_BITS: AtomicU32 = AtomicU32::new(0x3F0C_CCCD); // 0.55f32
@@ -169,6 +173,28 @@ pub(crate) fn qwen35_moe_experts_bf16_resident() -> bool {
 /// rollout student loads (target set includes experts).
 pub(crate) fn set_qwen35_moe_experts_bf16_resident(enabled: bool) {
     QWEN35_MOE_EXPERTS_BF16_RESIDENT.store(enabled, Relaxed);
+}
+/// `(max decode rows, max prefill rows)`, or `None` while undeclared. A dense
+/// GEMM arm that is only correct on one side of the prefill/decode split has no
+/// other way to tell them apart — `gemm_batch` sees a row count, not a phase.
+pub(crate) fn dense_gemm_row_envelope() -> Option<(usize, usize)> {
+    match (
+        DENSE_GEMM_DECODE_ROWS.load(Relaxed),
+        DENSE_GEMM_PREFILL_ROWS.load(Relaxed),
+    ) {
+        (0, _) | (_, 0) => None,
+        envelope => Some(envelope),
+    }
+}
+/// Set by `infer_cuda::apply_dense_gemm_row_envelope` from the one CUDA engine
+/// constructor, before the weights load: the load-time retention decisions read
+/// it, so a later call cannot move them. Widens rather than replaces — an OPD
+/// process builds a teacher and a student against these same statics, and a
+/// floor derived from the narrower of the two would sit inside the other's
+/// decode batch.
+pub(crate) fn set_dense_gemm_row_envelope(decode_rows: usize, prefill_rows: usize) {
+    DENSE_GEMM_DECODE_ROWS.fetch_max(decode_rows, Relaxed);
+    DENSE_GEMM_PREFILL_ROWS.fetch_max(prefill_rows, Relaxed);
 }
 pub(crate) fn dsv4_decode_reuse_enabled() -> bool {
     DSV4_DECODE_REUSE.load(Relaxed)

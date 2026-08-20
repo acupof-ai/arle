@@ -348,6 +348,161 @@ extern "C" cudaError_t dequantize_fp4_e2m1_group_to_bf16_cuda(
     return cudaGetLastError();
 }
 
+// NVFP4 -> E4M3, for the FP8 tensor-core prefill path.
+//
+// sm_90 has no FP4 tensor core, so a real GEMM has to widen the nibbles first.
+// The twin above widens to BF16 and hands cuBLAS a 148 TFLOPS ceiling (84
+// measured through Marlin); widening to E4M3 instead lets DeepGEMM contract
+// them at 274, and costs one dequant pass (~3.4% of the GEMM it feeds).
+//
+// The group scale cannot ride along inside the E4M3 value. This checkpoint's
+// `weight_scale` uses the full E4M3 range (measured max 448) and an E2M1 value
+// reaches 6, so the product reaches 2688 against E4M3's 448 ceiling. A per-
+// 128x128-block power of two is divided out here and handed back to DeepGEMM as
+// its `sfb`, which applies it to the fp32 accumulator. A power of two keeps the
+// division exact, so the only loss is the E2M1 x E4M3 product needing 4 mantissa
+// bits where E4M3 stores 3 — about a quarter of the nonzero weights round, at
+// half an ulp. That is the same order as the E4M3 activation rounding the FP8
+// checkpoint already runs with, and it is why this path is gated on the needle
+// ladder rather than argued from the scale algebra.
+
+// FP4 E2M1's largest magnitude, and E4M3's largest finite value: the block
+// power of two has to map one onto the other.
+#define DSV4_FP4_E2M1_MAX 6.0f
+#define DSV4_FP8_E4M3_MAX 448.0f
+#define FP4_BLOCK_SCALE_THREADS 256
+
+// One block per 128x128 weight tile: reduce |group_scale| * global over the
+// tile's 128 rows x (128/group_size) scale columns, then round the ratio that
+// would saturate E4M3 up to a power of two. Blocks past the last row of scales
+// write 1.0f — DeepGEMM reads one sfb row past the last n-block when
+// BLOCK_K % BLOCK_N != 0, and a finite 1.0f there keeps the masked lanes clean.
+__global__ void fp4_group_scale_block_pow2_kernel(
+    const uint8_t* __restrict__ scales,
+    const float* __restrict__ global_scales,
+    float* __restrict__ block_pow2,
+    int N,
+    int scale_cols,
+    int k_blocks,
+    int groups_per_block)
+{
+    __shared__ float red[FP4_BLOCK_SCALE_THREADS];
+    const int kb = blockIdx.x;
+    const int nb = blockIdx.y;
+    const int row0 = nb * 128;
+    const int col0 = kb * groups_per_block;
+    const int row_end = min(row0 + 128, N);
+    const int col_end = min(col0 + groups_per_block, scale_cols);
+
+    float mx = 0.0f;
+    const int span = (col_end > col0) ? (col_end - col0) : 0;
+    if (span > 0) {
+        const long count = (long)(row_end - row0) * span;
+        for (long i = threadIdx.x; i < count; i += FP4_BLOCK_SCALE_THREADS) {
+            const int r = row0 + (int)(i / span);
+            const int c = col0 + (int)(i % span);
+            mx = fmaxf(mx, fabsf(dsv4_decode_fp8_e4m3(scales[(long)r * scale_cols + c])));
+        }
+    }
+    red[threadIdx.x] = mx;
+    __syncthreads();
+    for (int s = FP4_BLOCK_SCALE_THREADS / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) red[threadIdx.x] = fmaxf(red[threadIdx.x], red[threadIdx.x + s]);
+        __syncthreads();
+    }
+    if (threadIdx.x != 0) return;
+
+    const float peak = red[0] * DSV4_FP4_E2M1_MAX * fabsf(global_scales[0]);
+    float p = 1.0f;
+    if (peak > 0.0f && isfinite(peak)) {
+        p = exp2f(ceilf(log2f(peak / DSV4_FP8_E4M3_MAX)));
+        // exp2f of a large magnitude, or an all-zero tile, must not poison sfb.
+        if (!isfinite(p) || p <= 0.0f) p = 1.0f;
+    }
+    block_pow2[(long)nb * k_blocks + kb] = p;
+}
+
+extern "C" cudaError_t fp4_group_scale_block_pow2_cuda(
+    const uint8_t* scales,
+    const float* global_scales,
+    float* block_pow2,
+    int N,
+    int K,
+    int group_size,
+    int scale_cols,
+    cudaStream_t stream)
+{
+    if (N <= 0 || K <= 0 || group_size <= 0 || scale_cols != K / group_size ||
+        K % group_size != 0 || 128 % group_size != 0) {
+        return cudaErrorInvalidValue;
+    }
+    const int n_blocks = (N + 127) / 128;
+    const int k_blocks = (K + 127) / 128;
+    // The pad row DeepGEMM may read; see the kernel comment.
+    const cudaError_t fill = cudaMemsetAsync(
+        block_pow2, 0, (size_t)(n_blocks + 1) * k_blocks * sizeof(float), stream);
+    if (fill != cudaSuccess) return fill;
+    fp4_group_scale_block_pow2_kernel<<<dim3(k_blocks, n_blocks + 1), FP4_BLOCK_SCALE_THREADS, 0,
+                                        stream>>>(
+        scales, global_scales, block_pow2, N, scale_cols, k_blocks, 128 / group_size);
+    return cudaGetLastError();
+}
+
+// Packed FP4 E2M1 [N, K/2] x per-group E4M3 scale [N, K/group_size] x one F32
+// global scale, divided by the tile power of two above -> dense E4M3 [N, K].
+__global__ void dequantize_fp4_e2m1_group_to_fp8_kernel(
+    const uint8_t* __restrict__ weight,
+    const uint8_t* __restrict__ scales,
+    const float* __restrict__ global_scales,
+    const float* __restrict__ block_pow2,
+    __nv_fp8_storage_t* __restrict__ output,
+    int N,
+    int K,
+    int group_size,
+    int scale_cols,
+    int k_blocks)
+{
+    const long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    const long total = (long)N * K;
+    if (idx >= total) return;
+    const int row = (int)(idx / K);
+    const int col = (int)(idx % K);
+    const float group =
+        dsv4_decode_fp8_e4m3(scales[(long)row * scale_cols + col / group_size]);
+    // Exact: block_pow2 is a power of two.
+    const float inv_block = 1.0f / block_pow2[(long)(row >> 7) * k_blocks + (col >> 7)];
+    const uint8_t byte = weight[(long)row * (K / 2) + col / 2];
+    const uint8_t nib = (col & 1) ? (byte >> 4) : (byte & 0x0f);
+    const float v = dsv4_decode_fp4_e2m1(nib) * group * global_scales[0] * inv_block;
+    output[idx] = __nv_cvt_float_to_fp8(v, __NV_SATFINITE, __NV_E4M3);
+}
+
+extern "C" cudaError_t dequantize_fp4_e2m1_group_to_fp8_cuda(
+    const uint8_t* weight,
+    const uint8_t* scales,
+    const float* global_scales,
+    const float* block_pow2,
+    uint8_t* output,
+    int N,
+    int K,
+    int group_size,
+    int scale_cols,
+    cudaStream_t stream)
+{
+    if (N <= 0 || K <= 0 || group_size <= 0 || scale_cols <= 0 || (K & 1) != 0 ||
+        K % group_size != 0 || scale_cols != K / group_size || 128 % group_size != 0) {
+        return cudaErrorInvalidValue;
+    }
+    const long total = (long)N * K;
+    const int threads = 256;
+    const long blocks = (total + threads - 1) / threads;
+    dequantize_fp4_e2m1_group_to_fp8_kernel<<<(unsigned int)blocks, threads, 0, stream>>>(
+        weight, scales, global_scales, block_pow2,
+        reinterpret_cast<__nv_fp8_storage_t*>(output), N, K, group_size, scale_cols,
+        (K + 127) / 128);
+    return cudaGetLastError();
+}
+
 __device__ __forceinline__ float fp8_f32_dot16(
     const uint8_t* __restrict__ weight,
     const __nv_bfloat16* __restrict__ x)

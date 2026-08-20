@@ -587,6 +587,18 @@ impl Qwen35Model {
                 && matrix.quant_scale_cols > 0,
             "layer {layer_idx} {label}: FP8 LoRA target missing block-scale metadata"
         );
+        // The merge rewrites `qweight_u8`/`scale_f32` and nothing else, so a
+        // target that also carries a Marlin layout would keep serving the
+        // un-merged bytes on every arm that reads it. Refuse instead: this used
+        // to be unreachable because the repack released the source, and holding
+        // the source for the DeepGEMM prefill arm must not turn a loud refusal
+        // into a silent disagreement between prefill and decode.
+        ensure!(
+            matrix.marlin_packed.is_none(),
+            "layer {layer_idx} {label}: LoRA merge cannot rewrite the Marlin layout this weight \
+             was repacked into at load, so decode would keep serving the un-merged base. Load a \
+             LoRA-merging engine on a build/card where the repack does not run."
+        );
         let mut dense = ctx
             .stream
             .alloc_zeros::<bf16>(matrix.rows * matrix.cols)

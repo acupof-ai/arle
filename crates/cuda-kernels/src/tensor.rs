@@ -760,7 +760,7 @@ impl std::fmt::Debug for DeviceVec {
 /// This is the Rust-side kernel ABI selector: checkpoint format detection and
 /// loader packing set this once, then inference dispatch matches this enum
 /// instead of re-interpreting packed buffers through bit-width sentinels.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub enum WeightFormat {
     /// Dense row-major BF16 weights.
     #[default]
@@ -1476,6 +1476,11 @@ pub struct DeviceMatrix {
     pub marlin_scales: Option<CudaSlice<u16>>,
     /// FP32 per-output-channel scales for the W4A8 Marlin path.
     pub marlin_channel_scales: Option<CudaSlice<f32>>,
+    /// Per-128x128-block power of two for the NVFP4 DeepGEMM prefill arm,
+    /// `[ceil(rows/128) + 1, ceil(cols/128)]` f32. Its presence is also what
+    /// keeps the FP4 source resident: that arm contracts the raw nibbles, so
+    /// [`Self::free_quant_source_after_marlin`] may not release them.
+    pub fp4_deepgemm_sfb: Option<CudaSlice<f32>>,
     /// Hybrid W4 sidecar: W4A8 packed weights for prefill dispatch.
     pub hybrid_w4a8_qweight: Option<CudaSlice<u8>>,
     /// Hybrid W4 sidecar: W4A8 FP32 per-output-channel scales.
@@ -1527,6 +1532,7 @@ pub struct HostMatrixSnapshot {
     marlin_packed: OptHostBuf<u8>,
     marlin_scales: OptHostBuf<u16>,
     marlin_channel_scales: OptHostBuf<f32>,
+    fp4_deepgemm_sfb: OptHostBuf<f32>,
     hybrid_w4a8_qweight: OptHostBuf<u8>,
     hybrid_w4a8_s_channel: OptHostBuf<f32>,
     hybrid_w4a8_s_group: OptHostBuf<u16>,
@@ -1535,6 +1541,9 @@ pub struct HostMatrixSnapshot {
     tq_scales: OptHostBuf<u16>,
     tq_signs: OptHostBuf<i8>,
     tq_centroids: OptHostBuf<f32>,
+    /// The Marlin buffers were dropped rather than copied; the reload rebuilds
+    /// them with [`DeviceMatrix::repack_for_marlin_fp8`].
+    marlin_fp8_rebuilt: bool,
     /// Total device bytes this snapshot freed when captured (for accounting).
     freed_bytes: usize,
 }
@@ -1564,6 +1573,12 @@ fn snapshot_opt_slice<T: DeviceRepr + Clone>(
         }
         None => Ok(None),
     }
+}
+
+/// Device bytes an optional buffer holds, for the offload accounting when it is
+/// freed without a host copy.
+fn opt_slice_bytes<T>(src: &Option<CudaSlice<T>>) -> usize {
+    src.as_ref().map_or(0, CudaSlice::num_bytes)
 }
 
 /// Re-upload an optional host buffer to device.
@@ -1710,6 +1725,23 @@ impl DeviceMatrix {
             Some((qw, sc)) => (Some(qw), Some(sc)),
             None => (None, None),
         };
+        // A per-channel FP8 weight that kept its E4M3 source for the DeepGEMM
+        // prefill arm holds the same bytes twice; copying both to host doubles
+        // the snapshot and the PCIe traffic in each direction.
+        let marlin_fp8_rebuilt = self.weight_format == WeightFormat::Fp8BlockScaled
+            && self.quant_block_m == 1
+            && self.marlin_packed.is_some()
+            && self.qweight_u8.is_some()
+            && self.scale_f32.is_some();
+        let (marlin_packed, marlin_scales) = if marlin_fp8_rebuilt {
+            freed += opt_slice_bytes(&self.marlin_packed) + opt_slice_bytes(&self.marlin_scales);
+            (None, None)
+        } else {
+            (
+                snapshot_opt_slice(ctx, &self.marlin_packed, &mut freed)?,
+                snapshot_opt_slice(ctx, &self.marlin_scales, &mut freed)?,
+            )
+        };
         let snapshot = HostMatrixSnapshot {
             data,
             qweight: snapshot_opt_slice(ctx, &self.qweight, &mut freed)?,
@@ -1721,13 +1753,14 @@ impl DeviceMatrix {
             scale_f32: snapshot_opt_slice(ctx, &self.scale_f32, &mut freed)?,
             scale2_f32: snapshot_opt_slice(ctx, &self.scale2_f32, &mut freed)?,
             dsv4_scales: snapshot_opt_slice(ctx, &self.dsv4_scales, &mut freed)?,
-            marlin_packed: snapshot_opt_slice(ctx, &self.marlin_packed, &mut freed)?,
-            marlin_scales: snapshot_opt_slice(ctx, &self.marlin_scales, &mut freed)?,
+            marlin_packed,
+            marlin_scales,
             marlin_channel_scales: snapshot_opt_slice(
                 ctx,
                 &self.marlin_channel_scales,
                 &mut freed,
             )?,
+            fp4_deepgemm_sfb: snapshot_opt_slice(ctx, &self.fp4_deepgemm_sfb, &mut freed)?,
             hybrid_w4a8_qweight: snapshot_opt_slice(ctx, &self.hybrid_w4a8_qweight, &mut freed)?,
             hybrid_w4a8_s_channel: snapshot_opt_slice(
                 ctx,
@@ -1744,6 +1777,7 @@ impl DeviceMatrix {
             tq_scales: snapshot_opt_slice(ctx, &self.tq_scales, &mut freed)?,
             tq_signs: snapshot_opt_slice(ctx, &self.tq_signs, &mut freed)?,
             tq_centroids: snapshot_opt_slice(ctx, &self.tq_centroids, &mut freed)?,
+            marlin_fp8_rebuilt,
             freed_bytes: 0,
         };
         ctx.sync()?;
@@ -1765,6 +1799,7 @@ impl DeviceMatrix {
         self.marlin_packed = None;
         self.marlin_scales = None;
         self.marlin_channel_scales = None;
+        self.fp4_deepgemm_sfb = None;
         self.hybrid_w4a8_qweight = None;
         self.hybrid_w4a8_s_channel = None;
         self.hybrid_w4a8_s_group = None;
@@ -1807,6 +1842,7 @@ impl DeviceMatrix {
         self.marlin_packed = restore_opt_slice(ctx, &snapshot.marlin_packed)?;
         self.marlin_scales = restore_opt_slice(ctx, &snapshot.marlin_scales)?;
         self.marlin_channel_scales = restore_opt_slice(ctx, &snapshot.marlin_channel_scales)?;
+        self.fp4_deepgemm_sfb = restore_opt_slice(ctx, &snapshot.fp4_deepgemm_sfb)?;
         self.hybrid_w4a8_qweight = restore_opt_slice(ctx, &snapshot.hybrid_w4a8_qweight)?;
         self.hybrid_w4a8_s_channel = restore_opt_slice(ctx, &snapshot.hybrid_w4a8_s_channel)?;
         self.hybrid_w4a8_s_group = restore_opt_slice(ctx, &snapshot.hybrid_w4a8_s_group)?;
@@ -1816,6 +1852,18 @@ impl DeviceMatrix {
         self.tq_signs = restore_opt_slice(ctx, &snapshot.tq_signs)?;
         self.tq_centroids = restore_opt_slice(ctx, &snapshot.tq_centroids)?;
         ctx.sync()?;
+        if snapshot.marlin_fp8_rebuilt {
+            // Costs this weight's load-time repack again, against a host
+            // snapshot and a PCIe leg that would otherwise both be twice as big.
+            self.repack_for_marlin_fp8(ctx)?;
+            ensure!(
+                self.marlin_packed.is_some() && self.marlin_scales.is_some(),
+                "reload: FP8 per-channel Marlin repack produced no layout for a matrix that \
+                 carried one at offload ({}x{})",
+                self.rows,
+                self.cols
+            );
+        }
         Ok(())
     }
 
@@ -1849,6 +1897,7 @@ impl DeviceMatrix {
             marlin_packed: None,
             marlin_scales: None,
             marlin_channel_scales: None,
+            fp4_deepgemm_sfb: None,
             hybrid_w4a8_qweight: None,
             hybrid_w4a8_s_channel: None,
             hybrid_w4a8_s_group: None,
@@ -1911,6 +1960,7 @@ impl DeviceMatrix {
             marlin_packed: None,
             marlin_scales: None,
             marlin_channel_scales: None,
+            fp4_deepgemm_sfb: None,
             hybrid_w4a8_qweight: None,
             hybrid_w4a8_s_channel: None,
             hybrid_w4a8_s_group: None,
@@ -1949,6 +1999,7 @@ impl DeviceMatrix {
             marlin_packed: None,
             marlin_scales: None,
             marlin_channel_scales: None,
+            fp4_deepgemm_sfb: None,
             hybrid_w4a8_qweight: None,
             hybrid_w4a8_s_channel: None,
             hybrid_w4a8_s_group: None,
@@ -1961,23 +2012,16 @@ impl DeviceMatrix {
         }
     }
 
-    /// Release the pre-repack quantized bytes once a Marlin layout exists.
-    ///
-    /// Marlin holds its own copy of every weight byte it reads, so leaving the
-    /// source resident stores the model twice: measured on Qwen3.8-27B-NVFP4,
-    /// 40.1 GB resident for a 22.8 GB checkpoint, which halved the KV pool
-    /// against the FP8 model on the same card (281,577 vs 593,995 tokens) and
-    /// forced slot reuse on a long-agent workload. Frees only the two large
-    /// buffers; the scalar scales stay for the accessors that report format.
-    ///
-    /// The caller must guarantee no route can still ask for the source — every
-    /// M has to reach a Marlin arm — or the dispatch errors out with
-    /// "missing qweight_u8" rather than reading freed memory.
     /// True once [`Self::free_quant_source_after_marlin`] has released the
     /// pre-repack bytes. [`Self::merge_base_fp8`] returns `None` both for a
     /// matrix that was never block-scaled FP8 and for one whose source is gone,
     /// and a caller that reads the second as the first merges into a buffer the
     /// GEMM no longer reads. Ask this before treating `None` as "not quantised".
+    ///
+    /// It reports only whether the bytes are gone, never whether they are safe
+    /// to write: a per-channel FP8 weight the DeepGEMM prefill arm can serve
+    /// keeps its source, so this reads false and `merge_base_fp8` hands back a
+    /// live pair — one the Marlin layout beside it does not track.
     pub fn quant_source_freed(&self) -> bool {
         self.marlin_packed.is_some()
             && self.qweight_u8.is_none()
@@ -1987,7 +2031,31 @@ impl DeviceMatrix {
             )
     }
 
-    pub fn free_quant_source_after_marlin(&mut self) {
+    /// Release the pre-repack quantized bytes once a Marlin layout exists,
+    /// unless another arm still contracts them.
+    ///
+    /// Marlin holds its own copy of every weight byte it reads, so leaving the
+    /// source resident stores the model twice: measured on Qwen3.8-27B-NVFP4,
+    /// 40.1 GB resident for a 22.8 GB checkpoint, which halved the KV pool
+    /// against the FP8 model on the same card (281,577 vs 593,995 tokens) and
+    /// forced slot reuse on a long-agent workload. Frees only the two large
+    /// buffers; the scalar scales stay for the accessors that report format.
+    ///
+    /// The two formats differ because NVFP4 has exactly one arm and per-channel
+    /// FP8 has two. Nothing but Marlin can read NVFP4's packed nibbles, so its
+    /// source is dead the moment the layout exists. Per-channel FP8 also has
+    /// DeepGEMM's native FP8 MMA at prefill M, and that kernel contracts the
+    /// plain `[N, K]` E4M3 bytes — Marlin's tile layout is a permutation of them
+    /// and cannot stand in. `fp8_deepgemm_available` is the caller's answer to
+    /// "can that arm ever fire for this weight, on this engine" — shape and card,
+    /// but also whether any forward reaches the arm's M floor and whether this
+    /// weight is one a prefill chunk is ever multiplied by. False keeps the
+    /// unconditional free.
+    ///
+    /// Where the source IS released, no route may still ask for it — every M has
+    /// to reach a Marlin arm — or the dispatch errors out with
+    /// "missing qweight_u8" rather than reading freed memory.
+    pub fn free_quant_source_after_marlin(&mut self, fp8_deepgemm_available: bool) {
         // Both, because that is exactly what the routes test before sending a
         // weight to a Marlin arm (`fp4_route` / `fp8_route`). Freeing on
         // `marlin_packed` alone would strand a weight that has a layout but no
@@ -1996,11 +2064,15 @@ impl DeviceMatrix {
             return;
         }
         match self.weight_format {
-            WeightFormat::Fp4E2M1Group => {
+            // `fp4_deepgemm_sfb` is set only when the NVFP4 DeepGEMM prefill arm
+            // can serve this weight, and that arm widens the raw nibbles to
+            // E4M3 per call — Marlin's tile layout is a permutation of them and
+            // cannot stand in.
+            WeightFormat::Fp4E2M1Group if self.fp4_deepgemm_sfb.is_none() => {
                 self.qweight_u8 = None;
                 self.qscale_fp8 = None;
             }
-            WeightFormat::Fp8BlockScaled => {
+            WeightFormat::Fp8BlockScaled if !fp8_deepgemm_available => {
                 self.qweight_u8 = None;
             }
             _ => {}
@@ -2284,6 +2356,7 @@ impl DeviceMatrix {
             marlin_packed: None,
             marlin_scales: None,
             marlin_channel_scales: None,
+            fp4_deepgemm_sfb: None,
             hybrid_w4a8_qweight: None,
             hybrid_w4a8_s_channel: None,
             hybrid_w4a8_s_group: None,
@@ -2364,6 +2437,7 @@ impl DeviceMatrix {
             marlin_packed: None,
             marlin_scales: None,
             marlin_channel_scales: None,
+            fp4_deepgemm_sfb: None,
             hybrid_w4a8_qweight: None,
             hybrid_w4a8_s_channel: None,
             hybrid_w4a8_s_group: None,
@@ -2447,6 +2521,7 @@ impl DeviceMatrix {
             marlin_packed: None,
             marlin_scales: None,
             marlin_channel_scales: None,
+            fp4_deepgemm_sfb: None,
             hybrid_w4a8_qweight: None,
             hybrid_w4a8_s_channel: None,
             hybrid_w4a8_s_group: None,
@@ -2525,6 +2600,7 @@ impl DeviceMatrix {
             marlin_packed: None,
             marlin_scales: None,
             marlin_channel_scales: None,
+            fp4_deepgemm_sfb: None,
             hybrid_w4a8_qweight: None,
             hybrid_w4a8_s_channel: None,
             hybrid_w4a8_s_group: None,
@@ -2602,6 +2678,7 @@ impl DeviceMatrix {
             marlin_packed: None,
             marlin_scales: None,
             marlin_channel_scales: None,
+            fp4_deepgemm_sfb: None,
             hybrid_w4a8_qweight: None,
             hybrid_w4a8_s_channel: None,
             hybrid_w4a8_s_group: None,
@@ -2693,6 +2770,7 @@ impl DeviceMatrix {
             marlin_packed: None,
             marlin_scales: None,
             marlin_channel_scales: None,
+            fp4_deepgemm_sfb: None,
             hybrid_w4a8_qweight: None,
             hybrid_w4a8_s_channel: None,
             hybrid_w4a8_s_group: None,
@@ -2887,7 +2965,8 @@ impl DeviceMatrix {
     /// and the scale's 2^+120 cancel bit-exactly in f32.
     ///
     /// Leaves the source `qweight_u8` / `scale_f32` in place; the loader calls
-    /// [`Self::free_quant_source_after_marlin`] once it knows no route needs them.
+    /// [`Self::free_quant_source_after_marlin`] once it knows whether the
+    /// DeepGEMM prefill arm still needs them.
     pub fn repack_for_marlin_fp8(&mut self, ctx: &DeviceContext) -> Result<()> {
         if self.weight_format != WeightFormat::Fp8BlockScaled
             || self.qweight_u8.is_none()
@@ -3062,6 +3141,77 @@ impl DeviceMatrix {
     /// `f16(scale * 2^7) << 1` and the leftover 2^119 is folded into the global
     /// scale. `scale_factor` is a power of two that lifts every scale above the
     /// E5-MSB-set floor; the global scale is divided by it.
+    /// Build the per-128x128-block power of two the NVFP4 DeepGEMM prefill arm
+    /// divides out of the weight and hands DeepGEMM back as `sfb`.
+    ///
+    /// The group scale cannot ride inside the E4M3 weight value: this
+    /// checkpoint's `weight_scale` reaches E4M3's full 448 and an E2M1 value
+    /// reaches 6, so the product reaches 2688 against a 448 ceiling. Dividing
+    /// out a per-block power of two puts every block's peak in (224, 448] and
+    /// costs nothing — a power of two is exact both ways, and DeepGEMM's `sfb`
+    /// multiplies it back into the fp32 accumulator.
+    ///
+    /// The floor is measured, not assumed: over this checkpoint's 168 NVFP4
+    /// scale tensors the widest 128x128 block spans 6.81 binades, which leaves
+    /// the smallest folded value at 0.332 against E4M3's 0.0156 normal minimum.
+    ///
+    /// Caller decides whether the arm is reachable at all (SM tier, DeepGEMM
+    /// built and enabled); this only checks that the shape and metadata fit.
+    /// Setting the buffer also pins the FP4 source — see
+    /// [`Self::free_quant_source_after_marlin`].
+    pub fn prepare_fp4_deepgemm_sfb(&mut self, ctx: &DeviceContext) -> Result<()> {
+        if self.weight_format != WeightFormat::Fp4E2M1Group
+            || self.qweight_u8.is_none()
+            || self.qscale_fp8.is_none()
+            || self.scale_f32.is_none()
+        {
+            return Ok(());
+        }
+        let n = self.rows;
+        let k = self.cols;
+        // DeepGEMM's dense NT entry wants `k % 128` and `n % 8`; the block
+        // reduction additionally needs the 128-column tile to be a whole number
+        // of groups.
+        if self.group_size == 0
+            || !128usize.is_multiple_of(self.group_size)
+            || !k.is_multiple_of(128)
+            || !n.is_multiple_of(8)
+            || self.quant_scale_rows != n
+            || self.quant_scale_cols != k / self.group_size
+        {
+            return Ok(());
+        }
+        let scales = self.qscale_fp8.as_ref().expect("checked above");
+        let global = self.scale_f32.as_ref().expect("checked above");
+        let len = (n.div_ceil(128) + 1) * k.div_ceil(128);
+        let sfb = ctx
+            .stream
+            .alloc_zeros::<f32>(len)
+            .map_err(|e| anyhow!("NVFP4 DeepGEMM sfb alloc failed: {e}"))?;
+        {
+            let (scales_ptr, _gs) = scales.device_ptr(&ctx.stream);
+            let (global_ptr, _gg) = global.device_ptr(&ctx.stream);
+            let (sfb_ptr, _gf) = sfb.device_ptr(&ctx.stream);
+            // SAFETY: ptrs from live device allocations sized to the dims passed.
+            unsafe {
+                crate::ffi::fp4_group_scale_block_pow2_cuda(
+                    scales_ptr as *const u8,
+                    global_ptr as *const f32,
+                    sfb_ptr as *mut f32,
+                    n as i32,
+                    k as i32,
+                    self.group_size as i32,
+                    self.quant_scale_cols as i32,
+                    ctx.stream.cu_stream(),
+                )
+                .result()
+                .map_err(|e| anyhow!("NVFP4 DeepGEMM sfb kernel failed: {e}"))?;
+            }
+        }
+        self.fp4_deepgemm_sfb = Some(sfb);
+        Ok(())
+    }
+
     pub fn repack_for_marlin_fp4(&mut self, ctx: &DeviceContext) -> Result<()> {
         if self.weight_format != WeightFormat::Fp4E2M1Group
             || self.qweight_u8.is_none()
@@ -3268,6 +3418,7 @@ impl DeviceMatrix {
             marlin_packed: None,
             marlin_scales: None,
             marlin_channel_scales: None,
+            fp4_deepgemm_sfb: None,
             hybrid_w4a8_qweight: None,
             hybrid_w4a8_s_channel: None,
             hybrid_w4a8_s_group: None,
@@ -3328,6 +3479,7 @@ impl DeviceMatrix {
             marlin_packed: None,
             marlin_scales: None,
             marlin_channel_scales: None,
+            fp4_deepgemm_sfb: None,
             hybrid_w4a8_qweight: None,
             hybrid_w4a8_s_channel: None,
             hybrid_w4a8_s_group: None,
