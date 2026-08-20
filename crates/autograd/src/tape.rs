@@ -1150,7 +1150,6 @@ impl Tape {
                 .chain(d_param.iter().filter_map(ChunkSum::id))
                 .collect();
             store.free_new_except(&live_before, &keep)?;
-            self.trim_if_hoarding(store)?;
             start = end;
         }
         // Once per region, not per chunk: each trim is a cudaFree/cudaMalloc
