@@ -723,6 +723,22 @@ magnitude. Loss falls monotonically with sequence length, as it should; the
 pre-fix column (7.63 / 6.92 / 6.74) was inflated by corrupted hidden states.
 163840 was measured pre-fix only (230.7 s, 78,959 MiB).
 
+## SOTA — 27B, cp=2 seq ceiling · `62b4927b8` (2026-08-20)
+
+2×H20, `--synthetic-writeback-seq N`, LoRA r16 α32 attention-qv. cp=2 means
+local seq = N/2 and the ceiling is per-rank.
+[Entry](experience/wins/2026-08-20-cp2-ceiling-114688-to-131072.md).
+
+| global seq | local | outcome | `ckpt-peak actual` |
+|---|---:|---|---:|
+| 114,688 | 57,344 | pass | — |
+| **131,072** | 65,536 | **pass**, 331 s | 75,875 MiB |
+| 163,840 | 81,920 | forward + CE pass, **backward OOM** on `zeros [1,81920,5120]` 1.6 GB | 77,026 MiB |
+
+**The cp=2 ceiling is 131,072**, up from 114,688. Matched at local 81,920 the
+pool high-water is 84,789 → 77,026 MiB and the peak model's drift +17,420 →
++9,657.
+
 ## Known walls
 
 | shape | outcome |
