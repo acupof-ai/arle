@@ -52,7 +52,7 @@ mod real {
     use cuda_kernels::ffi;
     use cuda_kernels::prelude::DeviceContext;
     use cuda_kernels::tensor::DeviceMatrix;
-    use cudarc::driver::{DevicePtr, DevicePtrMut};
+    use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
     use half::bf16;
 
     /// (label, N = output dim / weight rows, K = contraction / weight cols).
@@ -357,6 +357,66 @@ mod real {
         mix
     }
 
+    /// Sampled columns plus the f64 reference over the `[m_max, k]`
+    /// activations. The device reads these same BF16 values, so activation
+    /// rounding is not part of the comparison.
+    fn build_reference(
+        qbytes: &[u8],
+        scales: &[f32],
+        n: usize,
+        k: usize,
+        m_max: usize,
+        x_bf16: &[bf16],
+    ) -> (Vec<usize>, Vec<f64>) {
+        let cols = reference_columns(n);
+        // [k][m_max] f64 transpose; the reference walks it contiguously.
+        let mut xt = vec![0f64; k * m_max];
+        for row in 0..m_max {
+            for kk in 0..k {
+                xt[kk * m_max + row] = f64::from(f32::from(x_bf16[row * k + kk]));
+            }
+        }
+        let reference = host_reference(qbytes, scales, k, &cols, &xt, m_max);
+        (cols, reference)
+    }
+
+    /// The scalar batched GEMV lane over a source-retaining `DeviceMatrix`.
+    fn launch_gemv_lane(
+        ctx: &DeviceContext,
+        weight: &DeviceMatrix,
+        x: &CudaSlice<bf16>,
+        out: &mut CudaSlice<bf16>,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<()> {
+        let (qwp, _g0) = weight.qweight_u8.as_ref().unwrap().device_ptr(&ctx.stream);
+        let (sfp, _g1) = weight.scale_f32.as_ref().unwrap().device_ptr(&ctx.stream);
+        let (xp, _g2) = x.device_ptr(&ctx.stream);
+        let (op, _g3) = out.device_ptr_mut(&ctx.stream);
+        // SAFETY: weight is [n, k] E4M3 and scales is [n] f32; block_m=1 /
+        // block_k=k makes the kernel's index `scales[row]`, matching the
+        // per-channel layout. x is the [m, k] prefix, out is exactly m*n.
+        unsafe {
+            ffi::gemv_fp8_block_scaled_batch_cuda(
+                qwp as *const u8,
+                sfp as *const f32,
+                xp as *const ffi::Half,
+                op as *mut ffi::Half,
+                m as i32,
+                n as i32,
+                k as i32,
+                n as i32, // scale_rows
+                1,        // scale_cols
+                1,        // block_m
+                k as i32, // block_k
+                ctx.stream.cu_stream(),
+            )
+            .result()?;
+        }
+        Ok(())
+    }
+
     fn probe_shape(
         ctx: &DeviceContext,
         label: &str,
@@ -372,19 +432,7 @@ mod real {
             .map(|_| bf16::from_f32(rng.normal()))
             .collect();
 
-        let cols = reference_columns(n);
-        let reference = {
-            // [k][m_max] f64 transpose of the activations; the reference walks it
-            // contiguously. Exact — the device reads these same BF16 values, so
-            // activation rounding is not part of the comparison.
-            let mut xt = vec![0f64; k * m_max];
-            for row in 0..m_max {
-                for kk in 0..k {
-                    xt[kk * m_max + row] = f64::from(f32::from(x_bf16[row * k + kk]));
-                }
-            }
-            host_reference(&qbytes, &scales, k, &cols, &xt, m_max)
-        };
+        let (cols, reference) = build_reference(&qbytes, &scales, n, k, m_max, &x_bf16);
 
         // block_m = 1, block_k = K is the per-channel encoding of a block-scaled
         // FP8 weight — the same one `quant_format.rs` produces for a
@@ -457,40 +505,7 @@ mod real {
             }
             // Lane 2: the scalar batched GEMV this replaces, reading the same
             // E4M3 bytes and the un-folded f32 per-channel scales.
-            {
-                let (qwp, _g0) = gemv_weight
-                    .qweight_u8
-                    .as_ref()
-                    .unwrap()
-                    .device_ptr(&ctx.stream);
-                let (sfp, _g1) = gemv_weight
-                    .scale_f32
-                    .as_ref()
-                    .unwrap()
-                    .device_ptr(&ctx.stream);
-                let (xp, _g2) = x.device_ptr(&ctx.stream);
-                let (op, _g3) = gemv_out.device_ptr_mut(&ctx.stream);
-                // SAFETY: weight is [n, k] E4M3 and scales is [n] f32; block_m=1 /
-                // block_k=k makes the kernel's index `scales[row]`, matching the
-                // per-channel layout. x is the [m, k] prefix, out is exactly m*n.
-                unsafe {
-                    ffi::gemv_fp8_block_scaled_batch_cuda(
-                        qwp as *const u8,
-                        sfp as *const f32,
-                        xp as *const ffi::Half,
-                        op as *mut ffi::Half,
-                        m as i32,
-                        n as i32,
-                        k as i32,
-                        n as i32, // scale_rows
-                        1,        // scale_cols
-                        1,        // block_m
-                        k as i32, // block_k
-                        ctx.stream.cu_stream(),
-                    )
-                    .result()?;
-                }
-            }
+            launch_gemv_lane(ctx, &gemv_weight, &x, &mut gemv_out, m, n, k)?;
             ctx.sync()?;
 
             let marlin = ctx.stream.clone_dtoh(&marlin_out)?;
@@ -535,16 +550,7 @@ mod real {
             .map(|_| bf16::from_f32(rng.normal()))
             .collect();
 
-        let cols = reference_columns(n);
-        let reference = {
-            let mut xt = vec![0f64; k * m_max];
-            for row in 0..m_max {
-                for kk in 0..k {
-                    xt[kk * m_max + row] = f64::from(f32::from(x_bf16[row * k + kk]));
-                }
-            }
-            host_reference(&qbytes, &scales, k, &cols, &xt, m_max)
-        };
+        let (cols, reference) = build_reference(&qbytes, &scales, n, k, m_max, &x_bf16);
 
         let mut weight = DeviceMatrix::from_fp8_block_scaled(ctx, &qbytes, &scales, n, k, 1, k)?;
         weight.repack_for_marlin_fp8(ctx)?;
@@ -564,30 +570,7 @@ mod real {
         let mut any_fail = false;
         for &m in M_SWEEP {
             let mut gemv_out = ctx.stream.alloc_zeros::<bf16>(m * n)?;
-            {
-                let (qwp, _g0) = weight.qweight_u8.as_ref().unwrap().device_ptr(&ctx.stream);
-                let (sfp, _g1) = weight.scale_f32.as_ref().unwrap().device_ptr(&ctx.stream);
-                let (xp, _g2) = x.device_ptr(&ctx.stream);
-                let (op, _g3) = gemv_out.device_ptr_mut(&ctx.stream);
-                // SAFETY: same layout as the GEMV lane in probe_shape.
-                unsafe {
-                    ffi::gemv_fp8_block_scaled_batch_cuda(
-                        qwp as *const u8,
-                        sfp as *const f32,
-                        xp as *const ffi::Half,
-                        op as *mut ffi::Half,
-                        m as i32,
-                        n as i32,
-                        k as i32,
-                        n as i32, // scale_rows
-                        1,        // scale_cols
-                        1,        // block_m
-                        k as i32, // block_k
-                        ctx.stream.cu_stream(),
-                    )
-                    .result()?;
-                }
-            }
+            launch_gemv_lane(ctx, &weight, &x, &mut gemv_out, m, n, k)?;
             ctx.sync()?;
             let gemv = ctx.stream.clone_dtoh(&gemv_out)?;
             let gs = lane_stats(&gemv, n, m, &cols, &reference, m_max);

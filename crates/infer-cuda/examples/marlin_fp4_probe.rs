@@ -85,14 +85,12 @@ mod real {
         let mut m =
             DeviceMatrix::from_fp4_e2m1_group(ctx, &packed, &scales, &[1.0f32], None, n, k, GROUP)?;
         m.repack_for_marlin_fp4(ctx)?;
-        ensure!(
-            m.marlin_packed.is_some() && m.marlin_scales.is_some(),
-            "NVFP4 repack declined {n}x{k}"
-        );
         Ok(m)
     }
 
     fn fp8_matrix(ctx: &DeviceContext, n: usize, k: usize, seed: u64) -> Result<DeviceMatrix> {
+        // seed+1: distinct byte stream from the FP4 matrix built from `seed` in
+        // the same run; the decline boundary below uses seed+2.
         let mut rng = Lcg(seed.wrapping_add(1));
         // Same 0xFF-free band as the FP4 group scales above.
         let weight: Vec<u8> = (0..n * k).map(|_| 0x38 | (rng.next_u8() & 0x07)).collect();
@@ -155,6 +153,10 @@ mod real {
         let mut any_fail = false;
         for &(label, n, k) in SHAPES {
             let w4 = fp4_matrix(&ctx, n, k, seed)?;
+            ensure!(
+                w4.marlin_packed.is_some() && w4.marlin_scales.is_some(),
+                "NVFP4 repack declined {label} {n}x{k}"
+            );
             let w8 = fp8_matrix(&ctx, n, k, seed)?;
             // FP4 group scales sit in the tail of the packed allocation
             // (`repack_for_marlin_fp4`); FP8 keeps its BF16 scales separate.
@@ -225,23 +227,9 @@ mod real {
 
         // Repack-decline boundary: N not %64 must leave the source resident.
         let (dn, dk) = (96usize, 5120usize);
-        let mut rng = Lcg(seed.wrapping_add(2));
-        let packed: Vec<u8> = (0..dn * dk / 2).map(|_| rng.next_u8()).collect();
-        let scales: Vec<u8> = (0..dn * dk / GROUP)
-            .map(|_| 0x38 | (rng.next_u8() & 0x07))
-            .collect();
-        let mut dm = DeviceMatrix::from_fp4_e2m1_group(
-            &ctx,
-            &packed,
-            &scales,
-            &[1.0f32],
-            None,
-            dn,
-            dk,
-            GROUP,
-        )?;
-        dm.repack_for_marlin_fp4(&ctx)?;
-        let declined = dm.marlin_packed.is_none() && dm.qweight_u8.is_some();
+        let dm = fp4_matrix(&ctx, dn, dk, seed.wrapping_add(2))?;
+        let declined =
+            dm.marlin_packed.is_none() && dm.qweight_u8.is_some() && dm.qscale_fp8.is_some();
         any_fail |= !declined;
         println!(
             "declined n%64 {dn}x{dk}: {}",
