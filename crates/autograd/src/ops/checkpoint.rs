@@ -189,6 +189,10 @@ pub(crate) fn trim_if_hoarding(store: &TensorStore) -> Result<()> {
     Ok(())
 }
 
+fn trace_chunk_pool() -> bool {
+    std::env::var("ARLE_OPD_CHUNK_POOL_TRACE").is_ok_and(|v| v != "0")
+}
+
 fn trace_checkpoint_group_vram() -> bool {
     std::env::var("ARLE_OPD_VRAM_TRACE").is_ok_and(|v| v != "0" && v != "false")
 }
@@ -252,12 +256,18 @@ where
             acc.write_rows(start, y, store)?;
             let keep = HashSet::from([acc.id()]);
             store.free_new_except(&live_before, &keep)?;
-            // The pool does not re-cut freed chunk blocks for the next chunk
-            // (reserved +33 GB for +7 GB live at 131,072, sync or not); trim
-            // whenever the hoard passes the threshold so reserved stays at one
-            // chunk's working set.
-            trim_if_hoarding(store)?;
+            if trace_chunk_pool()
+                && let Some((reserved, used)) = store.backend().mem_pool_stats()
+            {
+                eprintln!(
+                    "[chunk-pool] fwd start={start} reserved={}MiB used={}MiB live={}",
+                    reserved >> 20,
+                    used >> 20,
+                    store.live_tensor_count()
+                );
+            }
         }
+        trim_if_hoarding(store)?;
         let out = out.ok_or(AutogradError::TapeInvariant(
             "seq-chunked block on empty seq",
         ))?;
