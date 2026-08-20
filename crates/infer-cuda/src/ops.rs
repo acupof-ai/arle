@@ -207,6 +207,16 @@ pub(crate) fn fp8_deepgemm_per_channel_available(
     quant_linear::fp8_deepgemm_per_channel_available(ctx, weight)
 }
 
+/// Load-time gate: every M the quant dispatcher can be handed must have a
+/// resident consumer, or the load fails with the tensor context.
+pub(crate) fn validate_quant_linear_storage(
+    ctx: &DeviceContext,
+    name: &str,
+    weight: &DeviceMatrix,
+) -> Result<()> {
+    quant_linear::validate_storage(ctx, name, weight)
+}
+
 pub(crate) fn gemv(
     ctx: &DeviceContext,
     weight: &DeviceMatrix,
