@@ -34,6 +34,8 @@ T8 prep `4f1051ddf` · clippy `9802112e2`.
   512/4096/16384/32768 on both. Wall-clock A/B not rerun for the wrapper
   series: zero kernel-work change, counter identity is the receipt; the T2
   A/B (c=1/4/8/16 in noise) covers the dispatch consolidation.
+- Eval harness on the HEAD binary: VERDICT PASS 3/3 (prefix_reuse,
+  token_reuse, multiturn_concurrent).
 
 ## Rule
 
