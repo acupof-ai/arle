@@ -83,7 +83,18 @@ Remote gate results (H20, 2026-08-20):
 - Capture — PASS. `tranche1b` serve log: decode graph armed, paged slot 0
   captured, no eager fallback, no per-step allocation/readback warning across
   the 16 decode steps.
-- Model gates / structural A-B — pending.
+- Model gates — PASS (NVFP4 + FP8). Needle ladder
+  (`RAW=1 TEMPLATE=qwen3_nonthink`, ×3 per length): both families
+  exact=3 miss=0 DET at 512/4096/16384/32768 — 12/12 each, matching the
+  documented envelope. Lever gate `correctness PASS: summaries=4`, LEVER_RC=0.
+  Temp arm (temp=1.0, 200 tokens, seed 7) PASS for both. W8A16 stays open: no
+  pod checkpoint has an untied *quantized* lm_head (the 27B W8A16's lm_head is
+  BF16; the 0.8B variants are tied). Deviations: lever_gate.sh's EXIT trap
+  hangs on arle serve's SIGTERM ignorance, so the gate ran in
+  LEVER_GATE_VALIDATE_LOG mode with the committed validator and a hand-rolled
+  serve boot (same validator, same envelope); baseline logs were synthesized
+  from docs/baselines.md (no same-box captured baseline exists on the pod).
+- Structural A-B — pending.
 
 Tranche 2A records the verdict against this entry and adds the CHANGELOG line.
 
