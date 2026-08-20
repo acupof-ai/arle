@@ -133,14 +133,19 @@ binary, NVFP4 on GPU 0 and Qwen3.6-27B-FP8 on GPU 1, points taken back to back.
 
 | c | NVFP4 ITL ms | FP8 ITL ms | ITL | NVFP4 out tok/s | FP8 out tok/s | end-to-end |
 |---:|---:|---:|---:|---:|---:|---:|
-| 1 | **20.45** | 24.81 | **+21.3%** | 19.49 | 19.65 | −0.8% |
-| 4 | **40.04** | 47.31 | **+18.2%** | **84.13** | 75.53 | **+11.4%** |
-| 8 | **71.16** | 79.47 | **+11.7%** | **98.00** | 91.62 | **+7.0%** |
-| 16 | **130.68** | 135.84 | **+3.9%** | 106.24 | 106.53 | −0.3% |
+| 1 | **20.46** | 24.81 | **+21.3%** | **20.60** | 19.61 | **+5.0%** |
+| 4 | **39.40** | 47.57 | **+20.7%** | **86.24** | 74.79 | **+15.3%** |
+| 8 | **69.81** | 79.00 | **+13.2%** | **100.80** | 92.42 | **+9.1%** |
+| 16 | **130.11** | 137.23 | **+5.5%** | **107.06** | 105.14 | **+1.8%** |
 
-The c=1 end-to-end leg is what this change was for: it was **−33.9%** before the
-prefill arms and −5.9% with them but with both sources retained; the VRAM fix
-took it to parity. ITL leads at every concurrency and decays monotonically
+Measured on `ec5edf987`, after the two kernel changes below. The same A/B on
+`30171f8be` — the arms in place but the kernels unoptimised — read
+`−0.8 / +11.4 / +7.0 / −0.3` end-to-end at the same ITL, which is where the
+kernel work shows up: prefill only.
+
+The c=1 end-to-end leg is what this change was for: **−33.9%** before the prefill
+arms, −5.9% with them but both sources retained, parity after the VRAM fix, and
+**+5.0%** once the two prefill kernels stopped being issue-bound. ITL leads at every concurrency and decays monotonically
 21.3 → 18.2 → 11.7 → 3.9, which is the `dense_ffn` residue
 [the occupancy entry](../errors/2026-08-19-marlin-decode-is-not-occupancy-limited.md)
 measured, unchanged by this work — the DeepGEMM arms sit above an M floor no
@@ -187,6 +192,64 @@ PID absent from the cgroup OOM record), and one lost `target/release/arle`
 mid-flight to a concurrent `cargo build`. A third c=16 row is discarded because
 the FP8 control arm moved 30.42 → 106.53 out tok/s with unchanged code and
 identical resident bytes; a control that moves invalidates the run it is in.
+
+## The per-call cost was 8x my estimate, and only the profile said so
+
+The design above was justified with a roofline: 278 MB of traffic against a
+2.664 ms GEMM, "~3.4%". `ARLE_QWEN35_QUANT_PROFILE`, three 14K-token prefills,
+aggregated over prefill calls:
+
+| op | as shipped | tables out | vectorised | |
+|---|---:|---:|---:|---|
+| `qwen/deepgemm/dense_gemm` | 1.4465 | 1.4426 | 1.4427 | control |
+| `qwen/fp4/dense_widen_fp8` | **0.7559** | **0.1871** | 0.1871 | −75.3% |
+| `qwen/fp8/dense_channel_scale` | 0.1169 | 0.1153 | **0.0313** | −73.2% |
+| `qwen/deepgemm/dense_pack_quantize` | 0.0424 | 0.0409 | 0.0410 | control |
+| `qwen/fp8/dense_materialize` | 0.0508 | 0.0505 | 0.0505 | control |
+
+ms/call. The widen was **52% of the GEMM it feeds**, not 3.4% — 0.756 ms against
+a 0.093 ms roofline, an effective 370 GB/s. Non-GEMM overhead across the
+quantised path went 838 ms → 303 ms, 24.5% → 10.5% of the profiled total.
+
+What made it visible was not the roofline but the FP8 materialiser sitting next
+to it at 0.0505 ms/call for comparable traffic — a 15x gap between two kernels
+doing the same kind of work. Two divergently-indexed tables explained it: the
+`__constant__` E2M1 LUT (16 reads per work item, replayed per distinct value)
+and a `const int R[4]` with a dynamic index, which nvcc puts in local memory.
+Both became arithmetic.
+
+**The first ALU form of the decoder was wrong** and an exhaustive 16-input
+comparison caught it before it compiled: E2M1's `exp == 0` is the subnormal step
+(0 and 0.5), and treating it as normal returns 0.75 where the encoding means 0.5.
+That is slightly-wrong weights, not a crash — the needle ladder would not
+reliably catch it, and the eval would read as noise. For a change that replaces a
+numeric function, the check has to be exhaustive and has to run before the code
+reaches the GPU.
+
+## Where the remaining cost is, measured
+
+`ncu` on the two materialisers, 12 launches each:
+
+| | ms/launch | bank conflicts | SM throughput |
+|---|---:|---:|---:|
+| `dequantize_fp4_marlin_to_fp8` | 0.199 | 13,236,164 | **87.2%** of peak |
+| `marlin_fp8_to_e4m3` | 0.041 | 16,571,970 | 45.8% |
+
+The shared-memory bank conflicts a review predicted would dominate are real and
+**not** the limiter: the FP4 kernel is at 87% of SM peak, so it is issue-bound,
+and the FP8 kernel — which has 2.6x more conflicts per sector and the headroom to
+use a fix — is only 1.8% of the profiled total. Padding to skew the banks would
+take FP4's shared memory from 4.1 KB to 10.3 KB and its occupancy limit from 19
+blocks/SM to ~7. Rejected on the numbers, not on caution.
+
+Folding the column scale into whatever already reads the output was rejected the
+same way: counted from the checkpoint, `linear_attn` produces 52.1% of the bytes
+that scale touches and its consumer is the gated-delta recurrence, not an
+elementwise op. SwiGLU and the residual add cover 20.1%, which is 0.2% of the
+step.
+
+The path is now GEMM-dominated at 89.5%, and `dense_gemm` is DeepGEMM at 93% of
+this card's FP8 peak. Further kernel work here is single digits.
 
 ## Rule
 
