@@ -7,6 +7,26 @@ detail in the linked wins/errors entry. Oldest sections are condensed.
 - [docs/support-matrix.md](docs/support-matrix.md)
 
 ## [Unreleased]
+
+## [0.5.7] - 2026-08-21
+
+Seven days, 547 commits. Three threads: NVFP4 becomes a serving format worth
+using, context-parallel training gets its ceiling back, and the CUDA operator
+layer gets an organization.
+
+**NVFP4 is now the smaller model, not just the smaller file.** A 23.4 GB 4-bit
+checkpoint went from 39.3 GB resident — 10 GB *more* than the FP8 model it
+competes with — to 22.4 GB, 7 GB *less*, by deriving DeepGEMM's prefill operand
+from Marlin's resident layout instead of keeping both. Prefill moved off Marlin's
+BF16 widening onto the FP8 tensor cores (84 → 274 TFLOPS), and two kernels on
+that path were 4.0x and 3.7x off. Against Qwen3.6-27B-FP8 on the 32K agent
+workload it now leads on both metrics at every concurrency.
+
+**CP training** recovered its 2-GPU sequence ceiling (114,688 → 131,072) and had
+a 6.4x gradient error root-caused to one dropped `* 2` in a byte offset.
+
+**~90 typed CUDA launchers** replaced hand-rolled FFI across seven phase exits.
+
 - **REFACTOR (phase exits T0–T4, T6, T7, T8-prep) — CUDA operator organization: ~90 typed launchers, infer-cuda raw FFI 217 sites → 0 (GDR fn-pointer table and peer-held moe.rs excepted), loader split 6,722 → 2,859+3,273+2,302, load-time quant storage validation, 12-operator registry, autograd NVRTC catalog+identity; remote receipt on H20: route counters and greedy text identical, needle 12/12 both binaries. T5 deferred (peer holds moe.rs)** (2026-08-20; `268c9d2fa`..`0367544ed`, [wins](docs/experience/wins/2026-08-20-cuda-operator-organization-t-series.md))
 - **VERDICT (accept) — Qwen quant-linear dispatch consolidation (T2 tranche 1): one dispatcher, one route owner per weight family; all five remote gate classes pass on H20 — numerical parity, 5/5 route counters + identical completion, decode-graph capture, needle 12/12 ×2 families + lever PASS, 32K A/B within noise at c=1/4/8/16 (first c=1 baseline OOM was a foreign 22 GB resident; clean-GPU re-run 3/3, zero OOM), eval_harness 3/3** (2026-08-20; `b7432e52a`, [errors](docs/experience/errors/2026-08-20-quant-linear-dispatch-consolidation-pending-remote.md))
 - **PERF — two prefill kernels on the NVFP4 path, 4.0x and 3.7x: non-GEMM overhead 838 → 303 ms (24.5% → 10.5% of the quantised path), and the 32K chain turns positive on both metrics at every concurrency — end-to-end +5.0% / +15.3% / +9.1% / +1.8% at c=1/4/8/16** (2026-08-20; `905fc4fc2`, `ec5edf987`, `248639843`, `0879aa55b`, [wins](docs/experience/wins/2026-08-20-nvfp4-widen-to-e4m3-deepgemm-prefill.md), [rows](docs/baselines.md))
