@@ -36,7 +36,7 @@ mod real {
     use cuda_kernels::ffi;
     use cuda_kernels::prelude::DeviceContext;
     use cuda_kernels::tensor::DeviceMatrix;
-    use cudarc::driver::{DevicePtr, DevicePtrMut};
+    use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
     use half::bf16;
 
     const GROUP: usize = 128;
@@ -56,9 +56,6 @@ mod real {
     /// Boundary shapes the repack must decline: N not %64 with K aligned. The
     /// source has to stay resident and the dequant→BF16 fallback carry alone.
     const DECLINED_SHAPES: &[(&str, usize, usize)] = &[("declined n%64", 96, 5120)];
-    /// Absolute ceiling for a lane anchored on the f32 reference without a
-    /// comparison lane (repack-declined shapes). Expected floor ≈1.1e-3.
-    const FALLBACK_MAX_REL_L2: f64 = 8e-3;
     // Marlin lane must not exceed the fallback lane's f32-anchored error by more
     // than this factor — both share the INT8 group-quant floor, so a correct
     // Marlin lane tracks the fallback closely. A blown ratio = wrong repack/perm.
@@ -130,16 +127,18 @@ mod real {
 
         let mut any_fail = false;
         for &seed in SEEDS {
+            // The declined-shape band self-calibrates off the accepted shapes'
+            // own fallback floor: same lane, same seed, no magic constant.
+            let mut accepted_max_deq = 0f64;
             for &(label, n, k) in SHAPES {
                 for &m in M_SWEEP {
-                    let fail = probe_one(&ctx, label, m, n, k, seed)?;
+                    let (fail, deq_err) = probe_one(&ctx, label, m, n, k, seed)?;
                     any_fail |= fail;
+                    accepted_max_deq = accepted_max_deq.max(deq_err);
                 }
             }
             for &(label, n, k) in DECLINED_SHAPES {
-                for &m in M_SWEEP {
-                    any_fail |= probe_declined(&ctx, label, m, n, k, seed)?;
-                }
+                any_fail |= probe_declined(&ctx, label, n, k, seed, accepted_max_deq)?;
             }
         }
         ensure!(
@@ -162,25 +161,11 @@ mod real {
         mix
     }
 
-    fn probe_one(
-        ctx: &DeviceContext,
-        label: &str,
-        m: usize,
-        n: usize,
-        k: usize,
-        seed: u64,
-    ) -> Result<bool> {
+    /// f32 reference: dequant weight (bf16 scale, faithful to device) then
+    /// matmul in f64. out[row_m, row_n] = sum_k x[row_m,k] * (q * scale).
+    fn host_reference(q: &[i8], s: &[bf16], x_host: &[f32], n: usize, k: usize) -> Vec<f64> {
         let ng = k / GROUP;
-        let mut seed = shape_seed(seed, label, n, k);
-        seed ^= (m as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
-        let mut rng = Rng::new(seed);
-
-        let x_host: Vec<f32> = (0..m * k).map(|_| rng.normal()).collect();
-        let w_host: Vec<f32> = (0..n * k).map(|_| rng.normal() * 0.1).collect();
-        let (q, s) = per_group_int8(&w_host, n, k);
-
-        // f32 reference: dequant weight (bf16 scale, faithful to device) then matmul
-        // in f64. out[row_m, row_n] = sum_k x[row_m,k] * (q * scale).
+        let m = x_host.len() / k;
         let mut ref_out = vec![0f64; m * n];
         for row_n in 0..n {
             for g in 0..ng {
@@ -194,6 +179,69 @@ mod real {
                 }
             }
         }
+        ref_out
+    }
+
+    /// Dequantize the INT8 weight to BF16 then cuBLAS GEMM: out[m,n] = x[m,k] · w[n,k]ᵀ.
+    fn launch_dequant_lane(
+        ctx: &DeviceContext,
+        qw: &CudaSlice<i8>,
+        qs: &CudaSlice<bf16>,
+        x: &CudaSlice<bf16>,
+        out: &mut CudaSlice<bf16>,
+        n: usize,
+        m: usize,
+        k: usize,
+    ) -> Result<()> {
+        let wbf16 = ctx.stream.alloc_zeros::<bf16>(n * k)?;
+        let (qwp, _g0) = qw.device_ptr(&ctx.stream);
+        let (qsp, _g1) = qs.device_ptr(&ctx.stream);
+        let (wp, _g2) = wbf16.device_ptr(&ctx.stream);
+        let (xp, _g3) = x.device_ptr(&ctx.stream);
+        let (op, _g4) = out.device_ptr_mut(&ctx.stream);
+        // SAFETY: dequant fills [n,k] bf16, then gemm(w[n,k], x[m,k]) -> out[m,n].
+        unsafe {
+            ffi::dequantize_w8a16_to_bf16_cuda(
+                qwp as *const i8,
+                qsp as *const ffi::Half,
+                wp as *mut ffi::Half,
+                n as i32,
+                k as i32,
+                GROUP as i32,
+                ctx.stream.cu_stream(),
+            )
+            .result()?;
+            ffi::gemm_cuda(
+                wp as *const ffi::Half,
+                xp as *const ffi::Half,
+                op as *mut ffi::Half,
+                n as i32,
+                m as i32,
+                k as i32,
+                ctx.stream.cu_stream(),
+            )
+            .result()?;
+        }
+        Ok(())
+    }
+
+    fn probe_one(
+        ctx: &DeviceContext,
+        label: &str,
+        m: usize,
+        n: usize,
+        k: usize,
+        seed: u64,
+    ) -> Result<(bool, f64)> {
+        let mut seed = shape_seed(seed, label, n, k);
+        seed ^= (m as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        let mut rng = Rng::new(seed);
+
+        let x_host: Vec<f32> = (0..m * k).map(|_| rng.normal()).collect();
+        let w_host: Vec<f32> = (0..n * k).map(|_| rng.normal() * 0.1).collect();
+        let (q, s) = per_group_int8(&w_host, n, k);
+
+        let ref_out = host_reference(&q, &s, &x_host, n, k);
 
         // Device W8A16 matrix (+ Marlin repack). from_quantized_int8 takes the
         // typed i8 weight + bf16 scale slices directly.
@@ -254,37 +302,7 @@ mod real {
             }
         }
         // Lane 2: dequant→cuBLAS-BF16 (in-tree reference).
-        {
-            let wbf16 = ctx.stream.alloc_zeros::<bf16>(n * k)?;
-            let (qwp, _g0) = deq_qw.device_ptr(&ctx.stream);
-            let (qsp, _g1) = deq_qs.device_ptr(&ctx.stream);
-            let (wp, _g2) = wbf16.device_ptr(&ctx.stream);
-            let (xp, _g3) = x.device_ptr(&ctx.stream);
-            let (op, _g4) = deq_out.device_ptr_mut(&ctx.stream);
-            // SAFETY: dequant fills [n,k] bf16, then gemm(w[n,k], x[m,k]) -> out[m,n].
-            unsafe {
-                ffi::dequantize_w8a16_to_bf16_cuda(
-                    qwp as *const i8,
-                    qsp as *const ffi::Half,
-                    wp as *mut ffi::Half,
-                    n as i32,
-                    k as i32,
-                    GROUP as i32,
-                    ctx.stream.cu_stream(),
-                )
-                .result()?;
-                ffi::gemm_cuda(
-                    wp as *const ffi::Half,
-                    xp as *const ffi::Half,
-                    op as *mut ffi::Half,
-                    n as i32,
-                    m as i32,
-                    k as i32,
-                    ctx.stream.cu_stream(),
-                )
-                .result()?;
-            }
-        }
+        launch_dequant_lane(ctx, &deq_qw, &deq_qs, &x, &mut deq_out, n, m, k)?;
         ctx.sync()?;
 
         let marlin = ctx.stream.clone_dtoh(&marlin_out)?;
@@ -298,41 +316,24 @@ mod real {
              fallback_relL2={deq_err:.4e} ratio={ratio:.2} {}",
             if pass { "PASS" } else { "FAIL" }
         );
-        Ok(!pass)
+        Ok((!pass, deq_err))
     }
 
     /// A shape the repack must decline: the source stays resident and the
     /// dequant→BF16 fallback carries every M against the f32 reference alone.
+    /// The error band is the accepted shapes' own fallback floor, not a
+    /// magic constant: same lane, same band.
     fn probe_declined(
         ctx: &DeviceContext,
         label: &str,
-        m: usize,
         n: usize,
         k: usize,
         seed: u64,
+        accepted_max_deq: f64,
     ) -> Result<bool> {
-        let ng = k / GROUP;
-        let mut seed = shape_seed(seed, label, n, k);
-        seed ^= (m as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
-        let mut rng = Rng::new(seed);
-
-        let x_host: Vec<f32> = (0..m * k).map(|_| rng.normal()).collect();
+        let mut rng = Rng::new(shape_seed(seed, label, n, k));
         let w_host: Vec<f32> = (0..n * k).map(|_| rng.normal() * 0.1).collect();
         let (q, s) = per_group_int8(&w_host, n, k);
-
-        let mut ref_out = vec![0f64; m * n];
-        for row_n in 0..n {
-            for g in 0..ng {
-                let scale = f32::from(s[row_n * ng + g]) as f64;
-                for i in 0..GROUP {
-                    let kk = g * GROUP + i;
-                    let w = q[row_n * k + kk] as f64 * scale;
-                    for row_m in 0..m {
-                        ref_out[row_m * n + row_n] += x_host[row_m * k + kk] as f64 * w;
-                    }
-                }
-            }
-        }
 
         let mut weight = DeviceMatrix::from_quantized_int8(ctx, &q, &s, n, k, GROUP)?;
         weight.repack_for_marlin_w8a16(ctx)?;
@@ -348,50 +349,41 @@ mod real {
             "[{label}] repack declined but released the source — no route can serve this shape"
         );
 
-        let x_bf16: Vec<bf16> = x_host.iter().map(|v| bf16::from_f32(*v)).collect();
-        let x = ctx.stream.clone_htod(&x_bf16)?;
-        let mut deq_out = ctx.stream.alloc_zeros::<bf16>(m * n)?;
-        {
-            let wbf16 = ctx.stream.alloc_zeros::<bf16>(n * k)?;
-            let (qwp, _g0) = weight.qweight.as_ref().unwrap().device_ptr(&ctx.stream);
-            let (qsp, _g1) = weight.qscales.as_ref().unwrap().device_ptr(&ctx.stream);
-            let (wp, _g2) = wbf16.device_ptr(&ctx.stream);
-            let (xp, _g3) = x.device_ptr(&ctx.stream);
-            let (op, _g4) = deq_out.device_ptr_mut(&ctx.stream);
-            // SAFETY: same dequant→gemm lane as probe_one.
-            unsafe {
-                ffi::dequantize_w8a16_to_bf16_cuda(
-                    qwp as *const i8,
-                    qsp as *const ffi::Half,
-                    wp as *mut ffi::Half,
-                    n as i32,
-                    k as i32,
-                    GROUP as i32,
-                    ctx.stream.cu_stream(),
-                )
-                .result()?;
-                ffi::gemm_cuda(
-                    wp as *const ffi::Half,
-                    xp as *const ffi::Half,
-                    op as *mut ffi::Half,
-                    n as i32,
-                    m as i32,
-                    k as i32,
-                    ctx.stream.cu_stream(),
-                )
-                .result()?;
-            }
-        }
-        ctx.sync()?;
+        let mut any_fail = false;
+        for &m in M_SWEEP {
+            let mut seed_m = shape_seed(seed, label, n, k);
+            seed_m ^= (m as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+            let mut rng_m = Rng::new(seed_m);
+            let x_host: Vec<f32> = (0..m * k).map(|_| rng_m.normal()).collect();
+            let ref_out = host_reference(&q, &s, &x_host, n, k);
 
-        let deq = ctx.stream.clone_dtoh(&deq_out)?;
-        let deq_err = rel_l2(&deq, &ref_out);
-        let pass = deq_err.is_finite() && deq_err <= FALLBACK_MAX_REL_L2;
-        eprintln!(
-            "[{label} m={m:>2} n={n} k={k} seed={seed:#x}] declined fallback_relL2={deq_err:.4e} {}",
-            if pass { "PASS" } else { "FAIL" }
-        );
-        Ok(!pass)
+            let x_bf16: Vec<bf16> = x_host.iter().map(|v| bf16::from_f32(*v)).collect();
+            let x = ctx.stream.clone_htod(&x_bf16)?;
+            let mut deq_out = ctx.stream.alloc_zeros::<bf16>(m * n)?;
+            launch_dequant_lane(
+                ctx,
+                weight.qweight.as_ref().unwrap(),
+                weight.qscales.as_ref().unwrap(),
+                &x,
+                &mut deq_out,
+                n,
+                m,
+                k,
+            )?;
+            ctx.sync()?;
+
+            let deq = ctx.stream.clone_dtoh(&deq_out)?;
+            let deq_err = rel_l2(&deq, &ref_out);
+            let cap = accepted_max_deq * MARLIN_VS_FALLBACK_MAX_RATIO;
+            let pass = deq_err.is_finite() && deq_err <= cap;
+            any_fail |= !pass;
+            eprintln!(
+                "[{label} m={m:>2} n={n} k={k} seed={seed:#x}] declined fallback_relL2={deq_err:.4e} \
+                 (cap {cap:.4e}) {}",
+                if pass { "PASS" } else { "FAIL" }
+            );
+        }
+        Ok(any_fail)
     }
 
     fn rel_l2(got: &[bf16], reference: &[f64]) -> f64 {
