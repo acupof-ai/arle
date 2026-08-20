@@ -1474,8 +1474,6 @@ pub struct DeviceMatrix {
     pub marlin_packed: Option<CudaSlice<u8>>,
     /// FP16 scales in Marlin layout [K/group_size, N] (transposed from qscales).
     pub marlin_scales: Option<CudaSlice<u16>>,
-    /// FP32 per-output-channel scales for the W4A8 Marlin path.
-    pub marlin_channel_scales: Option<CudaSlice<f32>>,
     /// Per-128x128-block power of two for the NVFP4 DeepGEMM prefill arm,
     /// `[ceil(rows/128) + 1, ceil(cols/128)]` f32. Its presence is what routes
     /// a weight to that arm at prefill M.
@@ -1491,15 +1489,6 @@ pub struct DeviceMatrix {
     /// explicitly. False keeps every M on Marlin — the output head sets it that
     /// way so its logits do not change precision with prompt length.
     pub fp8_deepgemm_prefill: bool,
-    /// Hybrid W4 sidecar: W4A8 packed weights for prefill dispatch.
-    pub hybrid_w4a8_qweight: Option<CudaSlice<u8>>,
-    /// Hybrid W4 sidecar: W4A8 FP32 per-output-channel scales.
-    pub hybrid_w4a8_s_channel: Option<CudaSlice<f32>>,
-    /// Hybrid W4 sidecar: W4A8 FP16 per-group scales.
-    pub hybrid_w4a8_s_group: Option<CudaSlice<u16>>,
-    /// Hybrid W4 sidecar: PF8.2 zero-point preprocessed packed weights for
-    /// W4+FP8 prefill GEMM.
-    pub hybrid_w4_fp8_qweight: Option<CudaSlice<u8>>,
     // -- TurboQuant packed weight storage (Phase 2: fused dequant at runtime) --
     /// TQ packed indices [rows, packed_cols] u8.
     /// 3-bit uses 4-bit nibble packing (2 per byte), 2-bit uses 4 per byte.
@@ -1541,12 +1530,7 @@ pub struct HostMatrixSnapshot {
     dsv4_scales: OptHostBuf<u8>,
     marlin_packed: OptHostBuf<u8>,
     marlin_scales: OptHostBuf<u16>,
-    marlin_channel_scales: OptHostBuf<f32>,
     fp4_deepgemm_sfb: OptHostBuf<f32>,
-    hybrid_w4a8_qweight: OptHostBuf<u8>,
-    hybrid_w4a8_s_channel: OptHostBuf<f32>,
-    hybrid_w4a8_s_group: OptHostBuf<u16>,
-    hybrid_w4_fp8_qweight: OptHostBuf<u8>,
     tq_packed: OptHostBuf<u8>,
     tq_scales: OptHostBuf<u16>,
     tq_signs: OptHostBuf<i8>,
@@ -1739,24 +1723,7 @@ impl DeviceMatrix {
             dsv4_scales: snapshot_opt_slice(ctx, &self.dsv4_scales, &mut freed)?,
             marlin_packed: snapshot_opt_slice(ctx, &self.marlin_packed, &mut freed)?,
             marlin_scales: snapshot_opt_slice(ctx, &self.marlin_scales, &mut freed)?,
-            marlin_channel_scales: snapshot_opt_slice(
-                ctx,
-                &self.marlin_channel_scales,
-                &mut freed,
-            )?,
             fp4_deepgemm_sfb: snapshot_opt_slice(ctx, &self.fp4_deepgemm_sfb, &mut freed)?,
-            hybrid_w4a8_qweight: snapshot_opt_slice(ctx, &self.hybrid_w4a8_qweight, &mut freed)?,
-            hybrid_w4a8_s_channel: snapshot_opt_slice(
-                ctx,
-                &self.hybrid_w4a8_s_channel,
-                &mut freed,
-            )?,
-            hybrid_w4a8_s_group: snapshot_opt_slice(ctx, &self.hybrid_w4a8_s_group, &mut freed)?,
-            hybrid_w4_fp8_qweight: snapshot_opt_slice(
-                ctx,
-                &self.hybrid_w4_fp8_qweight,
-                &mut freed,
-            )?,
             tq_packed: snapshot_opt_slice(ctx, &self.tq_packed, &mut freed)?,
             tq_scales: snapshot_opt_slice(ctx, &self.tq_scales, &mut freed)?,
             tq_signs: snapshot_opt_slice(ctx, &self.tq_signs, &mut freed)?,
@@ -1781,12 +1748,7 @@ impl DeviceMatrix {
         self.dsv4_scales = None;
         self.marlin_packed = None;
         self.marlin_scales = None;
-        self.marlin_channel_scales = None;
         self.fp4_deepgemm_sfb = None;
-        self.hybrid_w4a8_qweight = None;
-        self.hybrid_w4a8_s_channel = None;
-        self.hybrid_w4a8_s_group = None;
-        self.hybrid_w4_fp8_qweight = None;
         self.tq_packed = None;
         self.tq_scales = None;
         self.tq_signs = None;
@@ -1824,12 +1786,7 @@ impl DeviceMatrix {
         self.dsv4_scales = restore_opt_slice(ctx, &snapshot.dsv4_scales)?;
         self.marlin_packed = restore_opt_slice(ctx, &snapshot.marlin_packed)?;
         self.marlin_scales = restore_opt_slice(ctx, &snapshot.marlin_scales)?;
-        self.marlin_channel_scales = restore_opt_slice(ctx, &snapshot.marlin_channel_scales)?;
         self.fp4_deepgemm_sfb = restore_opt_slice(ctx, &snapshot.fp4_deepgemm_sfb)?;
-        self.hybrid_w4a8_qweight = restore_opt_slice(ctx, &snapshot.hybrid_w4a8_qweight)?;
-        self.hybrid_w4a8_s_channel = restore_opt_slice(ctx, &snapshot.hybrid_w4a8_s_channel)?;
-        self.hybrid_w4a8_s_group = restore_opt_slice(ctx, &snapshot.hybrid_w4a8_s_group)?;
-        self.hybrid_w4_fp8_qweight = restore_opt_slice(ctx, &snapshot.hybrid_w4_fp8_qweight)?;
         self.tq_packed = restore_opt_slice(ctx, &snapshot.tq_packed)?;
         self.tq_scales = restore_opt_slice(ctx, &snapshot.tq_scales)?;
         self.tq_signs = restore_opt_slice(ctx, &snapshot.tq_signs)?;
@@ -1867,14 +1824,9 @@ impl DeviceMatrix {
             group_size: 0,
             marlin_packed: None,
             marlin_scales: None,
-            marlin_channel_scales: None,
             fp4_deepgemm_sfb: None,
             fp4_marlin_scale_lift: 1.0,
             fp8_deepgemm_prefill: false,
-            hybrid_w4a8_qweight: None,
-            hybrid_w4a8_s_channel: None,
-            hybrid_w4a8_s_group: None,
-            hybrid_w4_fp8_qweight: None,
             tq_packed: None,
             tq_scales: None,
             tq_signs: None,
@@ -1932,14 +1884,9 @@ impl DeviceMatrix {
             group_size,
             marlin_packed: None,
             marlin_scales: None,
-            marlin_channel_scales: None,
             fp4_deepgemm_sfb: None,
             fp4_marlin_scale_lift: 1.0,
             fp8_deepgemm_prefill: false,
-            hybrid_w4a8_qweight: None,
-            hybrid_w4a8_s_channel: None,
-            hybrid_w4a8_s_group: None,
-            hybrid_w4_fp8_qweight: None,
             tq_packed: None,
             tq_scales: None,
             tq_signs: None,
@@ -1973,14 +1920,9 @@ impl DeviceMatrix {
             group_size: 0,
             marlin_packed: None,
             marlin_scales: None,
-            marlin_channel_scales: None,
             fp4_deepgemm_sfb: None,
             fp4_marlin_scale_lift: 1.0,
             fp8_deepgemm_prefill: false,
-            hybrid_w4a8_qweight: None,
-            hybrid_w4a8_s_channel: None,
-            hybrid_w4a8_s_group: None,
-            hybrid_w4_fp8_qweight: None,
             tq_packed: None,
             tq_scales: None,
             tq_signs: None,
@@ -2289,14 +2231,9 @@ impl DeviceMatrix {
             group_size,
             marlin_packed: None,
             marlin_scales: None,
-            marlin_channel_scales: None,
             fp4_deepgemm_sfb: None,
             fp4_marlin_scale_lift: 1.0,
             fp8_deepgemm_prefill: false,
-            hybrid_w4a8_qweight: None,
-            hybrid_w4a8_s_channel: None,
-            hybrid_w4a8_s_group: None,
-            hybrid_w4_fp8_qweight: None,
             tq_packed: None,
             tq_scales: None,
             tq_signs: None,
@@ -2372,14 +2309,9 @@ impl DeviceMatrix {
             group_size: 0,
             marlin_packed: None,
             marlin_scales: None,
-            marlin_channel_scales: None,
             fp4_deepgemm_sfb: None,
             fp4_marlin_scale_lift: 1.0,
             fp8_deepgemm_prefill: false,
-            hybrid_w4a8_qweight: None,
-            hybrid_w4a8_s_channel: None,
-            hybrid_w4a8_s_group: None,
-            hybrid_w4_fp8_qweight: None,
             tq_packed: None,
             tq_scales: None,
             tq_signs: None,
@@ -2458,14 +2390,9 @@ impl DeviceMatrix {
             group_size: 0,
             marlin_packed: None,
             marlin_scales: None,
-            marlin_channel_scales: None,
             fp4_deepgemm_sfb: None,
             fp4_marlin_scale_lift: 1.0,
             fp8_deepgemm_prefill: false,
-            hybrid_w4a8_qweight: None,
-            hybrid_w4a8_s_channel: None,
-            hybrid_w4a8_s_group: None,
-            hybrid_w4_fp8_qweight: None,
             tq_packed: None,
             tq_scales: None,
             tq_signs: None,
@@ -2539,14 +2466,9 @@ impl DeviceMatrix {
             group_size: 0,
             marlin_packed: None,
             marlin_scales: None,
-            marlin_channel_scales: None,
             fp4_deepgemm_sfb: None,
             fp4_marlin_scale_lift: 1.0,
             fp8_deepgemm_prefill: false,
-            hybrid_w4a8_qweight: None,
-            hybrid_w4a8_s_channel: None,
-            hybrid_w4a8_s_group: None,
-            hybrid_w4_fp8_qweight: None,
             tq_packed: None,
             tq_scales: None,
             tq_signs: None,
@@ -2619,14 +2541,9 @@ impl DeviceMatrix {
             group_size: 0,
             marlin_packed: None,
             marlin_scales: None,
-            marlin_channel_scales: None,
             fp4_deepgemm_sfb: None,
             fp4_marlin_scale_lift: 1.0,
             fp8_deepgemm_prefill: false,
-            hybrid_w4a8_qweight: None,
-            hybrid_w4a8_s_channel: None,
-            hybrid_w4a8_s_group: None,
-            hybrid_w4_fp8_qweight: None,
             tq_packed: None,
             tq_scales: None,
             tq_signs: None,
@@ -2713,14 +2630,9 @@ impl DeviceMatrix {
             group_size,
             marlin_packed: None,
             marlin_scales: None,
-            marlin_channel_scales: None,
             fp4_deepgemm_sfb: None,
             fp4_marlin_scale_lift: 1.0,
             fp8_deepgemm_prefill: false,
-            hybrid_w4a8_qweight: None,
-            hybrid_w4a8_s_channel: None,
-            hybrid_w4a8_s_group: None,
-            hybrid_w4_fp8_qweight: None,
             tq_packed: None,
             tq_scales: None,
             tq_signs: None,
@@ -3162,38 +3074,41 @@ impl DeviceMatrix {
         {
             return Ok(());
         }
-        if ctx.compute_capability().0 < 8 {
-            return Ok(());
-        }
+        let (major, minor) = ctx.compute_capability();
+        // NVFP4 has one serving path and it is Marlin's, so a shape or a tier it
+        // cannot take is a load failure with the reason, not a silent demotion to
+        // a scalar arm no gate has ever executed.
+        ensure!(
+            major >= 8,
+            "NVFP4 requires sm_80 or newer for the Marlin tensor-core path; this device is \
+             sm_{major}{minor}. Serve an FP8 or W4A16 checkpoint instead."
+        );
         let n = self.rows; // output dim
         let k = self.cols; // input dim
         // kFE2M1f is instantiated only at group_blocks == 1 (group_size 16);
         // the tile grid needs N % 64 and K % 64.
-        if self.group_size != 16
-            || !k.is_multiple_of(64)
-            || !n.is_multiple_of(64)
-            || self.quant_scale_rows != n
-            || self.quant_scale_cols != k / 16
-        {
-            log::warn!(
-                "Marlin NVFP4 repack skipped: [{n}x{k}] gs={} scales=[{}x{}] (need K%64, N%64, gs=16); scalar path",
-                self.group_size,
-                self.quant_scale_rows,
-                self.quant_scale_cols
-            );
-            return Ok(());
-        }
+        ensure!(
+            self.group_size == 16
+                && k.is_multiple_of(64)
+                && n.is_multiple_of(64)
+                && self.quant_scale_rows == n
+                && self.quant_scale_cols == k / 16,
+            "NVFP4 weight [{n}x{k}] gs={} scales=[{}x{}] cannot take the Marlin layout \
+             (kFE2M1f needs group_size 16, and the tile grid needs K%64 and N%64). NVFP4 has no \
+             other serving path.",
+            self.group_size,
+            self.quant_scale_rows,
+            self.quant_scale_cols
+        );
         let global_host: Vec<f32> = ctx
             .stream
             .clone_dtoh(self.scale_f32.as_ref().unwrap())
             .map_err(|e| anyhow!("D2H NVFP4 global scale: {}", e))?;
-        if global_host.len() != 1 {
-            log::warn!(
-                "Marlin NVFP4 repack skipped: {} global scales, expected 1; scalar path",
-                global_host.len()
-            );
-            return Ok(());
-        }
+        ensure!(
+            global_host.len() == 1,
+            "NVFP4 weight [{n}x{k}] carries {} global scales, expected 1",
+            global_host.len()
+        );
 
         // Step 1: packed [N, K/2] u8 → GPTQ [K/8, N] i32. Each row's u32 view is
         // already k-major inside the word (nibble k at bit (k%8)*4), so this is a
@@ -3378,14 +3293,9 @@ impl DeviceMatrix {
             group_size: 0,
             marlin_packed: None,
             marlin_scales: None,
-            marlin_channel_scales: None,
             fp4_deepgemm_sfb: None,
             fp4_marlin_scale_lift: 1.0,
             fp8_deepgemm_prefill: false,
-            hybrid_w4a8_qweight: None,
-            hybrid_w4a8_s_channel: None,
-            hybrid_w4a8_s_group: None,
-            hybrid_w4_fp8_qweight: None,
             tq_packed: None,
             tq_scales: None,
             tq_signs: None,
@@ -3441,14 +3351,9 @@ impl DeviceMatrix {
             group_size: 0,
             marlin_packed: None,
             marlin_scales: None,
-            marlin_channel_scales: None,
             fp4_deepgemm_sfb: None,
             fp4_marlin_scale_lift: 1.0,
             fp8_deepgemm_prefill: false,
-            hybrid_w4a8_qweight: None,
-            hybrid_w4a8_s_channel: None,
-            hybrid_w4a8_s_group: None,
-            hybrid_w4_fp8_qweight: None,
             tq_packed: None,
             tq_scales: None,
             tq_signs: None,
