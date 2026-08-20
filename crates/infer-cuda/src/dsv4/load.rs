@@ -253,11 +253,19 @@ pub(crate) fn ensure_loadable(config: &DeepSeekV4Config, spec_decode_on: bool) -
         // the same boolean, so the log must not claim "deferred" when
         // `--spec-type mtp` / `--mtp-draft-tokens` already made spec decode on.
         if spec_decode_on {
-            eprintln!(
-                "[dsv4] num_nextn_predict_layers={} present; spec decode on, \
-                 loading base layers plus mtp.0 draft head.",
-                config.num_nextn_predict_layers
-            );
+            if dspark_on {
+                eprintln!(
+                    "[dsv4] num_nextn_predict_layers={} present; spec decode on (DSpark), \
+                     loading base layers plus DSpark draft (native MTP skipped).",
+                    config.num_nextn_predict_layers
+                );
+            } else {
+                eprintln!(
+                    "[dsv4] num_nextn_predict_layers={} present; spec decode on, \
+                     loading base layers plus mtp.0 draft head.",
+                    config.num_nextn_predict_layers
+                );
+            }
         } else {
             eprintln!(
                 "[dsv4] num_nextn_predict_layers={} present; loading the {} base layers \
