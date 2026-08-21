@@ -1390,6 +1390,23 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         self.upload(&host, block_shape)
     }
 
+    /// Point-to-point send of `len` f32 to `peer` on the CP communicator
+    /// (sequence-parallel state carry). Caller pairs it with `cp_recv_device`.
+    fn cp_send_device(&self, handle: &DeviceHandle, len: usize, peer: usize) -> Result<()> {
+        let _ = (handle, len, peer);
+        Err(crate::AutogradError::TapeInvariant(
+            "cp_send_device: no CP communicator on this backend",
+        ))
+    }
+
+    /// Point-to-point receive of `len` f32 from `peer` on the CP communicator.
+    fn cp_recv_device(&self, len: usize, peer: usize) -> Result<DeviceHandle> {
+        let _ = (len, peer);
+        Err(crate::AutogradError::TapeInvariant(
+            "cp_recv_device: no CP communicator on this backend",
+        ))
+    }
+
     /// All-to-all: split `scatter_axis` across ranks, concatenate each rank's
     /// slice along `gather_axis`. Returns `(handle, out_shape)` — the shape
     /// changes (`[seq/N,b,hidden]` → `[seq,b,hidden/N]`), so the caller can't

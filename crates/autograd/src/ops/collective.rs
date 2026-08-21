@@ -345,3 +345,29 @@ pub(crate) fn all_to_all_backward(
     let grad_id = store.alloc_device_tensor(in_shape, grad_handle)?;
     Ok(smallvec![(x, grad_id)])
 }
+
+/// Receive an f32 tensor of `shape` from `peer` on the CP communicator; the
+/// backward sends the gradient back to `peer` (the sequence-parallel carry
+/// return path). The received tensor requires grad so the consumer's backward
+/// reaches this entry.
+pub fn cp_recv(
+    shape: &[usize],
+    peer: usize,
+    store: &mut TensorStore,
+    tape: &mut Tape,
+) -> Result<TensorId> {
+    let len: usize = shape.iter().product();
+    let handle = store.backend().cp_recv_device(len, peer)?;
+    let output_id = store.alloc_device_tensor(shape.to_vec(), handle)?;
+    if tape.enabled {
+        store.set_requires_grad(output_id, true)?;
+        TapeEntry {
+            op: BackwardOp::CpRecv,
+            output_id,
+            input_ids: smallvec![],
+            saved: SavedContext::CpRecvCtx { peer, len },
+        }
+        .record(store, tape)?;
+    }
+    Ok(output_id)
+}

@@ -232,6 +232,71 @@ pub(super) fn cuda_ring_send_recv_kv(
     unreachable!("world>1 without nccl feature")
 }
 
+/// Blocking point-to-point send on the CP communicator (a lone `ncclSend` is
+/// safe: the peer's matching `ncclRecv` is the only other party).
+#[cfg(not(feature = "no-cuda"))]
+pub(super) fn cuda_cp_send(
+    backend: &CudaBackend,
+    handle: &DeviceHandle,
+    len: usize,
+    peer: usize,
+) -> Result<()> {
+    let src = backend.cuda_slice(handle, "cp_send")?;
+    if src.len() < len {
+        return Err(AutogradError::DataLengthMismatch {
+            len: src.len(),
+            shape: vec![len],
+            size: len,
+        });
+    }
+    #[cfg(feature = "nccl")]
+    {
+        let nccl = backend.comm(CommAxis::Seq).ok_or(AutogradError::TapeInvariant(
+            "cp_send: no CP communicator",
+        ))?;
+        let (src_ptr, _src_guard) = src.device_ptr(&backend.stream);
+        let stream = backend.stream.cu_stream().cast();
+        // SAFETY: guarded pointer live for the call; peer runs the matching recv.
+        unsafe {
+            nccl.send(src_ptr as *const _, len, DType::F32, peer, stream)
+                .map_err(|_| AutogradError::TapeInvariant("cp_send failed"))?;
+        }
+        Ok(())
+    }
+    #[cfg(not(feature = "nccl"))]
+    {
+        let _ = peer;
+        Err(AutogradError::TapeInvariant("cp_send: built without nccl"))
+    }
+}
+
+#[cfg(not(feature = "no-cuda"))]
+pub(super) fn cuda_cp_recv(backend: &CudaBackend, len: usize, peer: usize) -> Result<DeviceHandle> {
+    #[cfg(feature = "nccl")]
+    {
+        let nccl = backend.comm(CommAxis::Seq).ok_or(AutogradError::TapeInvariant(
+            "cp_recv: no CP communicator",
+        ))?;
+        let mut out = alloc_zeros_retry::<f32>(backend, len)
+            .map_err(|_| AutogradError::TapeInvariant("cuda cp_recv alloc failed"))?;
+        {
+            let (dst_ptr, _dst_guard) = out.device_ptr_mut(&backend.stream);
+            let stream = backend.stream.cu_stream().cast();
+            // SAFETY: guarded pointer live for the call; peer runs the matching send.
+            unsafe {
+                nccl.recv(dst_ptr as *mut _, len, DType::F32, peer, stream)
+                    .map_err(|_| AutogradError::TapeInvariant("cp_recv failed"))?;
+            }
+        }
+        Ok(DeviceHandle::Cuda(CudaStorage::new(out)))
+    }
+    #[cfg(not(feature = "nccl"))]
+    {
+        let _ = (backend, len, peer);
+        Err(AutogradError::TapeInvariant("cp_recv: built without nccl"))
+    }
+}
+
 pub(super) fn cuda_all_to_all_device(
     backend: &CudaBackend,
     x: &DeviceHandle,

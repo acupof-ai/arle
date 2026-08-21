@@ -55,7 +55,7 @@ pub(crate) use embed::embedding_backward;
 pub(crate) use fused_linear_distill::{fused_linear_distill_backward, generalized_jsd_backward};
 pub(crate) use gather::gather_last_dim_backward;
 pub(crate) use layout::{
-    broadcast_expand_backward, cat_backward, permute_seq_blocks, permute_seq_blocks_backward,
+    broadcast_expand_backward, cat_backward, permute_seq_blocks_backward,
     reshape_backward, slice_backward, slice_backward_into, transpose_backward,
 };
 pub(crate) use linear_attention::linear_attention_backward;
@@ -109,6 +109,15 @@ pub fn all_to_all(
     tape: &mut Tape,
 ) -> Result<TensorId> {
     collective::all_to_all(x, scatter_axis, gather_axis, store, tape)
+}
+
+pub fn cp_recv(
+    shape: &[usize],
+    peer: usize,
+    store: &mut TensorStore,
+    tape: &mut Tape,
+) -> Result<TensorId> {
+    collective::cp_recv(shape, peer, store, tape)
 }
 
 pub fn gelu(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<TensorId> {
@@ -454,7 +463,7 @@ pub fn matmul_bt_with_site(
 
 pub use linear_attention::{
     LinearAttentionParams, linear_attention_boundary, linear_attention_core_carry,
-    linear_attention_core_cp, linear_attention_core_head_chunked,
+    linear_attention_core_cp,
     linear_attention_core_with_carry,
     linear_attention_core_with_carry_taped, linear_attention_ctx_bytes,
     linear_attention_row_transient_bytes,

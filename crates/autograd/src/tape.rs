@@ -173,6 +173,9 @@ pub enum SavedContext {
         /// forward exactly. `None` for the default full-sequence path.
         initial_state: Option<TensorId>,
         initial_conv_window: Option<TensorId>,
+        /// Sequence-parallel successor rank: the forward sent (final_state,
+        /// conv window) there; the backward receives (d_window, d_state) back.
+        carry_peer: Option<usize>,
         batch: usize,
         seq_len: usize,
         num_key_heads: usize,
@@ -196,6 +199,12 @@ pub enum SavedContext {
     /// `LinearAttentionFinalState`: the core entry's output id.
     CarryLink {
         core_output: TensorId,
+    },
+    /// `CpRecv`: the sender rank and element count; the backward sends the
+    /// gradient back.
+    CpRecvCtx {
+        peer: usize,
+        len: usize,
     },
     SeqChunkedRecomputeCtx {
         function_id: usize,
@@ -281,6 +290,8 @@ pub enum BackwardOp {
     /// final state. The backward parks the incoming grad for the core entry
     /// (`carry_state_grads`), which reads it as `d_final_state`.
     LinearAttentionFinalState,
+    /// Point-to-point receive on the CP communicator; backward sends the grad back.
+    CpRecv,
     CausalSdpaRecompute,
     AllReduceSum,
     AllGatherSeq,
@@ -330,6 +341,7 @@ impl BackwardOp {
             BackwardOp::GeneralizedJsd => "GeneralizedJsd",
             BackwardOp::LinearAttention => "LinearAttention",
             BackwardOp::LinearAttentionFinalState => "LinearAttentionFinalState",
+            BackwardOp::CpRecv => "CpRecv",
             BackwardOp::CausalSdpaRecompute => "CausalSdpaRecompute",
             BackwardOp::AllReduceSum => "AllReduceSum",
             BackwardOp::AllGatherSeq => "AllGatherSeq",
@@ -857,6 +869,17 @@ impl Tape {
                     BackwardOp::LinearAttention => {
                         let d_final_state = self.carry_state_grads.remove(&entry.output_id);
                         ops::linear_attention_backward(&entry, output_grad_id, d_final_state, store)?
+                    }
+                    BackwardOp::CpRecv => {
+                        let SavedContext::CpRecvCtx { peer, len } = entry.saved else {
+                            return Err(AutogradError::TapeInvariant(
+                                "cp_recv backward missing context",
+                            ));
+                        };
+                        store.ensure_device(output_grad_id)?;
+                        let grad = store.device_handle(output_grad_id)?;
+                        store.backend().cp_send_device(&grad, len, peer)?;
+                        GradPairs::new()
                     }
                     BackwardOp::LinearAttentionFinalState => {
                         let SavedContext::CarryLink { core_output } = entry.saved else {
