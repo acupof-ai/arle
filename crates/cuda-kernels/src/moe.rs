@@ -2351,6 +2351,13 @@ pub unsafe fn nvfp4_to_w4afp8(
     Ok(())
 }
 
+/// XOR every byte with 0x88 in-place: converts signed INT4 two's complement
+/// nibbles to the unsigned + zero-point=8 format the W4A16 GEMV kernel expects.
+pub fn w4_sign_to_zeropoint(data: RawDevicePtr<u8>, n: usize, stream: CUstream) -> Result<()> {
+    unsafe { ffi::w4_sign_to_zeropoint_cuda(data.as_mut_ptr(), n, stream) }.result()?;
+    Ok(())
+}
+
 // W4A16 (INT4) MoE grouped GEMV — numerical correctness vs a dequantized
 // BF16 reference. GPU-gated: builds the pointer tables, runs
 // `moe_w4a16_grouped_gemv_batch`, dequantizes the same weights to BF16 and

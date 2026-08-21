@@ -1036,6 +1036,8 @@ unsafe extern "C" {
         bits: i32,
         stream: CUstream,
     );
+
+    pub fn w4_sign_to_zeropoint_cuda(data: *mut u8, n: usize, stream: CUstream) -> CUresult;
 }
 
 #[cfg(test)]
