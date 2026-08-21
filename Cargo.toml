@@ -67,7 +67,6 @@ unsafe_op_in_unsafe_fn = "deny"
 [workspace.dependencies]
 blake3 = { version = "1", default-features = false, features = ["std"] }
 ahash = "0.8"
-bincode = { version = "2", features = ["serde"] }
 libm = { version = "0.2" }
 memmap2 = { version = "0.9" }
 postcard = { version = "1", default-features = false, features = ["use-std"] }
