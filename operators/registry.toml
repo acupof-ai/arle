@@ -409,3 +409,126 @@ fallback = ""
 
 [policy."opd.nvrtc_kernels"]
 fallback_status = "legacy-default-unqualified"
+
+[[semantic]]
+id = "qwen35.moe_experts"
+kind = "composite"
+inputs = ["hidden", "router_logits", "expert_weights"]
+outputs = ["moe_out"]
+reference = "cuda.qwen35.moe_grouped_gemm_batch"
+correctness_gate = "numeric+e2e"
+
+[[implementation]]
+id = "cuda.qwen35.moe_deepgemm_grouped"
+semantic = "qwen35.moe_experts"
+provider = "deepgemm"
+source = "crates/infer-cuda/src/moe/qwen.rs"
+legality = "expert_format in {Fp8BlockScaled, Fp8PerShard} && --qwen35-deepgemm (default on) && num_tokens*topk >= --qwen35-deepgemm-min-routes (1024)"
+fallback = "cuda.qwen35.moe_grouped_gemm_batch"
+
+[[implementation]]
+id = "cuda.qwen35.moe_decode_kernel"
+semantic = "qwen35.moe_experts"
+provider = "arle"
+source = "crates/infer-cuda/src/moe/qwen.rs"
+legality = "expert_format in {DenseBf16, Fp8BlockScaled} && num_tokens*topk <= 256 && --qwen35-moe-decode-kernel (default on); CUDA-graph capturable"
+fallback = "cuda.qwen35.moe_grouped_gemm_batch"
+
+[[implementation]]
+id = "cuda.qwen35.moe_grouped_gemm_batch"
+semantic = "qwen35.moe_experts"
+provider = "arle+cublas"
+source = "crates/infer-cuda/src/moe/qwen.rs"
+legality = "always; per-format grouped pair/batch GEMM over DenseBf16 | Fp8 | Fp4E2M1Group | W4A16"
+fallback = ""
+
+[policy."qwen35.moe_experts"]
+router = "device top-k (--qwen35-gpu-router, default on); host infer_moe::route when off"
+fallback_status = "legacy-default-unqualified"
+
+[[semantic]]
+id = "dsv4.moe_experts"
+kind = "composite"
+inputs = ["hidden", "router_logits", "selection_bias", "expert_weights"]
+outputs = ["moe_out"]
+reference = "cuda.dsv4.moe_fp8_grouped_contig"
+correctness_gate = "numeric+e2e"
+
+[[implementation]]
+id = "cuda.dsv4.moe_w4a16_gemv"
+semantic = "dsv4.moe_experts"
+provider = "arle"
+source = "crates/infer-cuda/src/moe/dsv4.rs"
+legality = "checkpoint W4A16 experts (layer.w13_w4a16) && GEMV table build succeeded; all batch sizes"
+fallback = "cuda.dsv4.moe_fp8_grouped_contig"
+
+[[implementation]]
+id = "cuda.dsv4.moe_w4afp8_gemv"
+semantic = "dsv4.moe_experts"
+provider = "arle"
+source = "crates/infer-cuda/src/moe/dsv4.rs"
+legality = "checkpoint W4AFP8 or NVFP4 experts (converted to W4AFP8 at load) && num_tokens*topk <= 128"
+fallback = "cuda.dsv4.moe_w4afp8_grouped"
+
+[[implementation]]
+id = "cuda.dsv4.moe_w4afp8_grouped"
+semantic = "dsv4.moe_experts"
+provider = "cutlass"
+source = "crates/infer-cuda/src/moe/dsv4.rs"
+legality = "checkpoint W4AFP8 or NVFP4 experts && num_tokens*topk > 128"
+fallback = ""
+
+[[implementation]]
+id = "cuda.dsv4.moe_fp8_decode_gemv"
+semantic = "dsv4.moe_experts"
+provider = "arle"
+source = "crates/infer-cuda/src/moe/dsv4.rs"
+legality = "FP8 experts && num_tokens*topk <= 128 && GEMV table build succeeded"
+fallback = "cuda.dsv4.moe_fp8_grouped_contig"
+
+[[implementation]]
+id = "cuda.dsv4.moe_fp8_grouped_contig"
+semantic = "dsv4.moe_experts"
+provider = "deepgemm"
+source = "crates/infer-cuda/src/moe/dsv4.rs"
+legality = "FP8 experts; contiguous grouped GEMM with 64-row align <=128 routes, 128-row align above; masked tail for the remainder"
+fallback = ""
+
+[policy."dsv4.moe_experts"]
+router = "device dsv4_route with selection bias (unconditional)"
+fallback_status = "legacy-default-unqualified"
+
+[[semantic]]
+id = "dsv4.moe_transport"
+kind = "transport"
+inputs = ["hidden_owned_slice", "routing"]
+outputs = ["moe_out_owned_slice"]
+reference = "cuda.dsv4.moe_local_ep"
+correctness_gate = "e2e"
+
+[[implementation]]
+id = "cuda.dsv4.moe_deepep_low_latency"
+semantic = "dsv4.moe_transport"
+provider = "deepep"
+source = "crates/infer-cuda/src/moe/dsv4_deepep.rs"
+legality = "feature deepep && nvshmem && MoeTransportRoute::DeepEpLowLatency && slot LL scratch allocated"
+fallback = "cuda.dsv4.moe_deepep_normal"
+
+[[implementation]]
+id = "cuda.dsv4.moe_deepep_normal"
+semantic = "dsv4.moe_transport"
+provider = "deepep"
+source = "crates/infer-cuda/src/moe/dsv4_deepep.rs"
+legality = "feature deepep && MoeTransportRoute::DeepEp (intranode/internode)"
+fallback = "cuda.dsv4.moe_local_ep"
+
+[[implementation]]
+id = "cuda.dsv4.moe_local_ep"
+semantic = "dsv4.moe_transport"
+provider = "arle+nccl"
+source = "crates/infer-cuda/src/moe/dsv4.rs"
+legality = "always; per-rank local experts + shard_rows_and_allreduce over the TP comm"
+fallback = ""
+
+[policy."dsv4.moe_transport"]
+fallback_status = "legacy-default-unqualified"

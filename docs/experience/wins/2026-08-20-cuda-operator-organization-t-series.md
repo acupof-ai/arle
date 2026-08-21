@@ -3,8 +3,9 @@
 ## Context
 
 Parent plan `docs/plans/2026-08-20-cuda-operator-organization.md`. One session
-executed T0–T4, T6, T7, and the T8 registry prep; T5 (MoE) deferred while a
-peer holds uncommitted W4A8 work in `infer-cuda/src/moe.rs`.
+executed T0–T4, T6, T7, and the T8 registry prep; T5 (MoE split, `a8f6d8419`)
+and the T8 MoE registry binding landed 2026-08-21 once the peer released
+`infer-cuda/src/moe.rs`.
 
 Commits: T0 `268c9d2fa` · 1B `0cca4fb1e`/`1810d8eec`/`54ad45f21` ·
 T1 `3d111aebc`+`7ed95f7ec` · T2 verdict `06ce9c85c` (ACCEPT) ·
@@ -24,7 +25,11 @@ T8 prep `4f1051ddf` · clippy `9802112e2`.
 - Load-time quant storage validation (`validate_quant_linear_storage`) closes
   the historical freed-source/no-route defect class; 19 table-driven
   invalid-state cases.
-- Registry: 12 semantic operators, 35+ implementations, legality read from the
+- `infer-cuda/src/moe.rs` 4,604 → facade 154 + `moe/qwen.rs` 1,672 +
+  `moe/dsv4.rs` 2,364 + `moe/dsv4_deepep.rs` 434 (pure move; `crate::moe::*`
+  paths unchanged; `cargo check --features cuda,nccl,deepep` on H20).
+- Registry: 15 semantic operators, 45 implementations (MoE: qwen35/dsv4
+  experts + dsv4 transport, legality read from the route owners), legality read from the
   real route owners; autograd NVRTC family catalog + identity tuple; bf16
   module warmup moved to `set_tape_dtype`.
 - Remote receipt (H20, `arle-tranche1-eval` b7432e52a vs `arle-tseries`
