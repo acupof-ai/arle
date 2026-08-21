@@ -347,7 +347,7 @@ pub fn linear_attention_core(
 
 /// Rows per sequence-parallel core chunk (a multiple of the FlashQLA 64-row
 /// tile); bounds the per-chunk replay transient.
-pub const CORE_CHUNK: usize = 16384;
+pub const CORE_CHUNK: usize = 8192;
 
 /// Context-parallel gated-delta attention, sequence-parallel: every rank runs
 /// the recurrence on its OWN rows (all heads) and the state crosses ranks in
