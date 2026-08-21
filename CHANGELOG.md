@@ -8,6 +8,13 @@ detail in the linked wins/errors entry. Oldest sections are condensed.
 
 ## [Unreleased]
 
+- **Quantized paged attention dequantizes K/V once per GQA group — accepted.**
+  One CTA serves the q-heads sharing a kv-head (group size scales with batch).
+  Qwen3.8-27B-NVFP4, fp8 KV, 32 K prompts: c=16 out tok/s 110 → 135–138
+  (+23–25 %), c=32 113 → 141–146 (+24–29 %), c=1 wash; needle 12/12 DET, eval
+  179/200 (unchanged).
+  ([entry](docs/experience/wins/2026-08-21-paged-attention-quantized-gqa-shared-dequant.md))
+
 - **`--spec-type auto` now resolves on the multiproc path.** The 0.5.8 default
   was lowered only in `serve_http`, which the multiproc coordinator never runs,
   so multi-GPU DSv4 workers loaded without the MTP head. Same-day cleanup also
