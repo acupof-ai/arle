@@ -56,6 +56,17 @@ linearly: 2.75x at M=32, 5.05x at M=64.
 So the lever on the 68.3% is not a faster kernel at M=1. It is **more rows per
 call**, and rows 2 through 8 are free.
 
+Per row, the difference is an order of magnitude: 0.0629 ms for one row against
+0.0880 ms for sixteen, which is **0.0055 ms/row — 11.4x better**.
+
+That also explains the issue-bound reading without appealing to the dequant.
+Marlin's E2M1 unpack is already four integer instructions for four values, table
+free and branch free (`marlin/dequant.h:391`), so it is not what fills the issue
+slots. The `mma.sync.aligned.m16n8k16` is: at `thread_m_blocks == 1` it computes
+16 rows whatever M is, so at M=1 **93.75% of the tensor-core issue is discarded**.
+87% of SM peak and 39.8% of HBM are the same fact seen twice — the machine is
+busy computing rows nobody asked for.
+
 That makes speculative decode a measured mechanism rather than a feature to
 re-try: a verify step of `b` requests by `d` draft tokens presents `M = b*(d+1)`
 to the same GEMM. At c=1 with `d=3`, M goes 1 to 4 at **zero** extra GEMM time,
