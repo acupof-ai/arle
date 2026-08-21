@@ -3560,4 +3560,18 @@ cudaError_t q6k_embedding_decode_cuda(
     return qxk_embedding_decode_cuda(weight, token_id, out, hidden_dim, 6, Q6K_SB_BYTES, stream);
 }
 
+// XOR every byte with 0x88: converts signed INT4 two's complement nibbles
+// to the unsigned + zero-point=8 format the W4A16 GEMV kernel expects.
+__global__ void w4_sign_to_zeropoint_kernel(uint8_t* data, size_t n) {
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) data[idx] ^= 0x88;
+}
+
+cudaError_t w4_sign_to_zeropoint_cuda(uint8_t* data, size_t n, cudaStream_t stream) {
+    int threads = 256;
+    int blocks = (n + threads - 1) / threads;
+    w4_sign_to_zeropoint_kernel<<<blocks, threads, 0, stream>>>(data, n);
+    return cudaGetLastError();
+}
+
 }  // extern "C"

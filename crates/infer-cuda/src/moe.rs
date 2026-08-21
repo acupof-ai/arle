@@ -2323,6 +2323,9 @@ mod dsv4_gpu {
         /// Owned transposed scale buffers (W4AFP8 decode lane only — the W4A16
         /// lane points into per-expert `DeviceMatrix.qscales` and leaves this empty).
         scale_storage: Vec<CudaSlice<u8>>,
+        /// Owned zero-point-converted weight buffers (W4AFP8 decode lane only —
+        /// the W4A16 lane points into per-expert `DeviceMatrix` and leaves this empty).
+        weight_storage: Vec<CudaSlice<u8>>,
     }
 
     fn build_gemv_tables(ctx: &DeviceContext, layer: &Dsv4MoeLayer) -> Result<Dsv4GemvTables> {
@@ -2495,12 +2498,17 @@ mod dsv4_gpu {
                 .map_err(|e| anyhow::anyhow!("W4A16 expert_indices H2D failed: {e}"))?,
             group_size,
             scale_storage: vec![],
+            weight_storage: vec![],
         })
     }
 
     /// Build W4AFP8 GEMV decode tables: transpose the interleaved CUTLASS scale
-    /// layout [K//512, N*4] to the W4A16 GEMV kernel's row-major [N, K//128],
-    /// then point into the fused weight + transposed scale buffers.
+    /// layout to the W4A16 GEMV kernel's row-major [N, K//128], then point into
+    /// the fused weight + transposed scale buffers.
+    ///
+    /// w13 scales are stored w1/w3 row-interleaved by the loader (not the plain
+    /// [K//512, N*4] CUTLASS layout), so they need de-interleave + transpose.
+    /// w2 scales are in the plain [K//512, N*4] layout and only need transpose.
     fn build_w4afp8_gemv_tables(
         ctx: &DeviceContext,
         layer: &Dsv4MoeLayer,
@@ -2516,44 +2524,102 @@ mod dsv4_gpu {
         let h = layer.hidden_dim;
         let i_dim = layer.intermediate;
 
-        // Transpose one projection's scales: [E, K//512, N*4] BF16 → [E, N, K//128] BF16.
-        let transpose_scales = |w: &W4Afp8ExpertWeights| -> Result<CudaSlice<u8>> {
-            let n = w.n;
-            let k = w.k;
-            let groups_per_chunk = 512 / group_size; // 4
+        // Transpose [K//512, N*4] CUTLASS interleaved → [N, K//128] row-major.
+        let transpose_plain = |src: &[u8], n: usize, k: usize| -> Vec<u8> {
             let num_groups = k / group_size;
-            let chunks = k / 512;
-            let src = ctx
-                .stream
-                .clone_dtoh(&w.scales)
-                .map_err(|e| anyhow::anyhow!("W4AFP8 scale download failed: {e}"))?;
-            let per_expert = chunks * (n * 4) * 2; // BF16 bytes
-            let mut dst = vec![0u8; w.num_experts * n * num_groups * 2];
-            for e in 0..w.num_experts {
-                let src_base = e * per_expert;
-                let dst_base = e * n * num_groups * 2;
-                for g in 0..num_groups {
-                    let chunk = g / groups_per_chunk;
-                    let sub = g % groups_per_chunk;
-                    for row in 0..n {
-                        let src_off = src_base + (chunk * (n * 4) + row * 4 + sub) * 2;
-                        let dst_off = dst_base + (row * num_groups + g) * 2;
-                        dst[dst_off] = src[src_off];
-                        dst[dst_off + 1] = src[src_off + 1];
-                    }
+            let mut dst = vec![0u8; n * num_groups * 2];
+            for g in 0..num_groups {
+                let chunk = g / 4;
+                let sub = g % 4;
+                for row in 0..n {
+                    let src_off = (chunk * (n * 4) + row * 4 + sub) * 2;
+                    let dst_off = (row * num_groups + g) * 2;
+                    dst[dst_off] = src[src_off];
+                    dst[dst_off + 1] = src[src_off + 1];
                 }
             }
-            ctx.stream
-                .clone_htod(&dst)
-                .map_err(|e| anyhow::anyhow!("W4AFP8 transposed scale upload failed: {e}"))
+            dst
         };
 
-        let w13_gemv_scales = transpose_scales(w13)?;
-        let w2_gemv_scales = transpose_scales(w2)?;
+        // w13: de-interleave w1/w3 slices, transpose each, re-concatenate.
+        let w13_src = ctx
+            .stream
+            .clone_dtoh(&w13.scales)
+            .map_err(|e| anyhow::anyhow!("W4AFP8 w13 scale download failed: {e}"))?;
+        let n13 = w13.n; // 2 * i_dim
+        let k13 = w13.k; // h
+        let row_bytes = (k13 / group_size) * 2; // bytes per [N, K//128] row
+        let per_expert_13 = n13 * row_bytes;
+        let mut w13_gemv = Vec::with_capacity(w13.num_experts * per_expert_13);
+        for e in 0..w13.num_experts {
+            let base = e * per_expert_13;
+            // De-interleave: even slices = w1, odd slices = w3.
+            let half = n13 / 2; // i_dim
+            let mut w1_buf = vec![0u8; half * row_bytes];
+            let mut w3_buf = vec![0u8; half * row_bytes];
+            for c in 0..half {
+                let src_w1 = base + (2 * c) * row_bytes;
+                let src_w3 = base + (2 * c + 1) * row_bytes;
+                w1_buf[c * row_bytes..(c + 1) * row_bytes]
+                    .copy_from_slice(&w13_src[src_w1..src_w1 + row_bytes]);
+                w3_buf[c * row_bytes..(c + 1) * row_bytes]
+                    .copy_from_slice(&w13_src[src_w3..src_w3 + row_bytes]);
+            }
+            // Each de-interleaved half is [K//512, half*4] CUTLASS layout.
+            let w1_t = transpose_plain(&w1_buf, half, k13);
+            let w3_t = transpose_plain(&w3_buf, half, k13);
+            w13_gemv.extend_from_slice(&w1_t);
+            w13_gemv.extend_from_slice(&w3_t);
+        }
+        let w13_gemv_scales = ctx
+            .stream
+            .clone_htod(&w13_gemv)
+            .map_err(|e| anyhow::anyhow!("W4AFP8 w13 transposed scale upload failed: {e}"))?;
 
-        let w13_weight_ptr = cache_ptr(&w13.weight, ctx).as_ptr() as u64;
+        // w2: plain [K//512, N*4] → [N, K//128].
+        let w2_src = ctx
+            .stream
+            .clone_dtoh(&w2.scales)
+            .map_err(|e| anyhow::anyhow!("W4AFP8 w2 scale download failed: {e}"))?;
+        let per_expert_w2 = (w2.k / 512) * (w2.n * 4) * 2;
+        let mut w2_gemv = Vec::with_capacity(w2.num_experts * w2.n * (w2.k / group_size) * 2);
+        for e in 0..w2.num_experts {
+            let base = e * per_expert_w2;
+            w2_gemv.extend_from_slice(&transpose_plain(
+                &w2_src[base..base + per_expert_w2],
+                w2.n,
+                w2.k,
+            ));
+        }
+        let w2_gemv_scales = ctx
+            .stream
+            .clone_htod(&w2_gemv)
+            .map_err(|e| anyhow::anyhow!("W4AFP8 w2 transposed scale upload failed: {e}"))?;
+
+        // Convert signed INT4 two's complement → unsigned + zero-point=8
+        // (XOR 0x88 per byte) so the W4A16 GEMV kernel's dequant matches.
+        let convert_weights = |src: &CudaSlice<u8>| -> Result<CudaSlice<u8>> {
+            let mut dst = ctx
+                .stream
+                .alloc_zeros::<u8>(src.len())
+                .map_err(|e| anyhow::anyhow!("W4AFP8 GEMV weight alloc failed: {e}"))?;
+            ctx.stream
+                .memcpy_dtod(src, &mut dst)
+                .map_err(|e| anyhow::anyhow!("W4AFP8 GEMV weight copy failed: {e}"))?;
+            cuda_kernels::moe::w4_sign_to_zeropoint(
+                cuda_kernels::tensor::cache_ptr(&dst, ctx),
+                dst.len(),
+                ctx.stream.cu_stream(),
+            )
+            .map_err(|e| anyhow::anyhow!("W4AFP8 GEMV weight XOR failed: {e}"))?;
+            Ok(dst)
+        };
+        let w13_gemv_weight = convert_weights(&w13.weight)?;
+        let w2_gemv_weight = convert_weights(&w2.weight)?;
+
+        let w13_weight_ptr = cache_ptr(&w13_gemv_weight, ctx).as_ptr() as u64;
         let w13_scale_ptr = cache_ptr(&w13_gemv_scales, ctx).as_ptr() as u64;
-        let w2_weight_ptr = cache_ptr(&w2.weight, ctx).as_ptr() as u64;
+        let w2_weight_ptr = cache_ptr(&w2_gemv_weight, ctx).as_ptr() as u64;
         let w2_scale_ptr = cache_ptr(&w2_gemv_scales, ctx).as_ptr() as u64;
 
         // w13: n = 2*i_dim (w1 over w3), k = h.
@@ -2601,6 +2667,7 @@ mod dsv4_gpu {
                 .map_err(|e| anyhow::anyhow!("W4AFP8 expert_indices H2D failed: {e}"))?,
             group_size,
             scale_storage: vec![w13_gemv_scales, w2_gemv_scales],
+            weight_storage: vec![w13_gemv_weight, w2_gemv_weight],
         })
     }
 
