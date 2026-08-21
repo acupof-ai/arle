@@ -691,13 +691,13 @@ fn build_w4a16_gemv_tables(
     })
 }
 
-/// Build W4AFP8 GEMV decode tables: transpose the interleaved CUTLASS scale
-/// layout to the W4A16 GEMV kernel's row-major [N, K//128], then point into
+/// Build W4AFP8 GEMV decode tables: transpose the CUTLASS scale layout
+/// to the W4A16 GEMV kernel's row-major [N, K//128], then point into
 /// the fused weight + transposed scale buffers.
 ///
-/// w13 scales are stored w1/w3 row-interleaved by the loader (not the plain
-/// [K//512, N*4] CUTLASS layout), so they need de-interleave + transpose.
-/// w2 scales are in the plain [K//512, N*4] layout and only need transpose.
+/// w13 scales are [K//512, n13*4] with w1/w3 concatenated along N —
+/// the plain CUTLASS layout, transpose directly. w2 scales are the same
+/// layout with N=hidden_dim.
 fn build_w4afp8_gemv_tables(
     ctx: &DeviceContext,
     layer: &Dsv4MoeLayer,
@@ -731,7 +731,7 @@ fn build_w4afp8_gemv_tables(
         dst
     };
 
-    // w13: de-interleave w1/w3 slices, transpose each, re-concatenate.
+    // w13: [K//512, n13*4] CUTLASS → [n13, K//128] row-major.
     let w13_src = ctx
         .stream
         .clone_dtoh(&w13.scales)
@@ -743,23 +743,11 @@ fn build_w4afp8_gemv_tables(
     let mut w13_gemv = Vec::with_capacity(w13.num_experts * per_expert_13);
     for e in 0..w13.num_experts {
         let base = e * per_expert_13;
-        // De-interleave: even slices = w1, odd slices = w3.
-        let half = n13 / 2; // i_dim
-        let mut w1_buf = vec![0u8; half * row_bytes];
-        let mut w3_buf = vec![0u8; half * row_bytes];
-        for c in 0..half {
-            let src_w1 = base + (2 * c) * row_bytes;
-            let src_w3 = base + (2 * c + 1) * row_bytes;
-            w1_buf[c * row_bytes..(c + 1) * row_bytes]
-                .copy_from_slice(&w13_src[src_w1..src_w1 + row_bytes]);
-            w3_buf[c * row_bytes..(c + 1) * row_bytes]
-                .copy_from_slice(&w13_src[src_w3..src_w3 + row_bytes]);
-        }
-        // Each de-interleaved half is [K//512, half*4] CUTLASS layout.
-        let w1_t = transpose_plain(&w1_buf, half, k13);
-        let w3_t = transpose_plain(&w3_buf, half, k13);
-        w13_gemv.extend_from_slice(&w1_t);
-        w13_gemv.extend_from_slice(&w3_t);
+        w13_gemv.extend_from_slice(&transpose_plain(
+            &w13_src[base..base + per_expert_13],
+            n13,
+            k13,
+        ));
     }
     let w13_gemv_scales = ctx
         .stream
