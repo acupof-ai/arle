@@ -2486,6 +2486,7 @@ mod w4a16_tests {
                 N,
                 K,
                 GROUP_SIZE,
+                0,
                 &ctx,
                 stream,
             )
