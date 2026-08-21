@@ -8,6 +8,24 @@ detail in the linked wins/errors entry. Oldest sections are condensed.
 
 ## [Unreleased]
 
+- **NVFP4 decode — verdict: the sm_90 mixed-input collective is a second arm
+  above M=32, not a replacement for Marlin.** Driven with one group as a dense
+  GEMM it is 0.65x Marlin at M=1 and 0.90x at M=16, then 1.08x at M=32, 1.46x at
+  M=48 and 1.90x at M=64. Not tile waste: at M=1 Marlin achieves 1,594 GB/s
+  against the collective's 952 GB/s while reading more bytes, so wgmma and TMA do
+  not help at one row. The same sweep relocated the lever — **Marlin costs the
+  same at M=8 as at M=1** (0.0629 ms for 1, 4 and 8 rows), so the attack on its
+  68.3% of decode is row count, which concurrency and speculative decode
+  (`M = b*(d+1)`) both supply. Two latent crashes fixed on the way: the grouped
+  GEMM aborted for any odd expert count on TMA descriptor alignment, then on the
+  CUTLASS workspace start; even counts are unchanged.
+  [entry](docs/experience/errors/2026-08-21-sm90-collective-loses-below-m32.md)
+- **`gdr_decode_batch_kernel` — measured: latency-bound, not at a ceiling.** 13.0%
+  of decode GPU time at 17.5-19.4% of compute peak and 20.2-22.5% of memory, IPC
+  0.66, achieved occupancy 30.9% against an uncapped theoretical 100%. 61.6% of
+  the stall is Long Scoreboard.
+  [entry](docs/experience/wins/2026-08-21-gdr-decode-batch-is-latency-bound.md)
+
 - **cp=2 131,072 — verdict: below the card by ~2–5 GB; the a2a linear-attention
   core is the ceiling.** Layer replays chunked end-to-end (linear projections,
   CP full attention over q tiles with ring FA3 tiled-q support, core over head
