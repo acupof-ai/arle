@@ -41,21 +41,6 @@ pub(crate) fn fp4_deepgemm_available(ctx: &DeviceContext, weight: &DeviceMatrix)
         && dense_deepgemm_prefill_floor(QWEN_FP4_DEEPGEMM_MIN_M).is_some()
 }
 
-/// Widen NVFP4 to E4M3 into scratch, then contract it on the FP8 tensor cores.
-///
-/// The widen reads the Marlin layout, not the checkpoint nibbles — same byte
-/// volume, and the checkpoint copy is freed at load. It therefore inherits the
-/// repack's one lossy step: a group scale far enough below the tensor max
-/// flushes to zero (`repack_for_marlin_fp4`), which makes prefill agree with
-/// the Marlin decode arm rather than with the checkpoint.
-///
-/// The weight's `fp4_deepgemm_sfb` carries the per-128x128-block power of two
-/// the widening divided out, so DeepGEMM multiplies it back into the fp32
-/// accumulator and the result is the same product Marlin forms — up to the one
-/// mantissa bit E4M3 cannot hold (`prepare_fp4_deepgemm_sfb`) and the E4M3
-/// activation rounding this entry point forces, neither of which is free. That
-/// is why the arm is gated on the needle ladder and not on the scale algebra.
-
 /// Compile the NVFP4 prefill arm's DeepGEMM kernel at load, and reserve the
 /// E4M3 weight scratch while doing it.
 ///
@@ -92,6 +77,21 @@ pub(crate) fn warm_fp4_deepgemm_dense(
     // builds the kernel the first request will replay.
     try_fp4_deepgemm_gemm(ctx, weight, &input, &mut out, m)
 }
+
+/// Widen NVFP4 to E4M3 into scratch, then contract it on the FP8 tensor cores.
+///
+/// The widen reads the Marlin layout, not the checkpoint nibbles — same byte
+/// volume, and the checkpoint copy is freed at load. It therefore inherits the
+/// repack's one lossy step: a group scale far enough below the tensor max
+/// flushes to zero (`repack_for_marlin_fp4`), which makes prefill agree with
+/// the Marlin decode arm rather than with the checkpoint.
+///
+/// The weight's `fp4_deepgemm_sfb` carries the per-128x128-block power of two
+/// the widening divided out, so DeepGEMM multiplies it back into the fp32
+/// accumulator and the result is the same product Marlin forms — up to the one
+/// mantissa bit E4M3 cannot hold (`prepare_fp4_deepgemm_sfb`) and the E4M3
+/// activation rounding this entry point forces, neither of which is free. That
+/// is why the arm is gated on the needle ladder and not on the scale algebra.
 fn try_fp4_deepgemm_gemm(
     ctx: &DeviceContext,
     weight: &DeviceMatrix,
