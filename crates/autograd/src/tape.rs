@@ -1065,6 +1065,15 @@ impl Tape {
             self.checkpoint_op_mem_record("scope_enter", None, None, store);
         }
 
+        if std::env::var("ARLE_OPD_VRAM_TRACE").is_ok_and(|v| v != "0")
+            && let Some((free, total)) = store.backend().device_mem_info()
+        {
+            eprintln!(
+                "[ckpt-bwd-vram] scope_enter fn={function_id} used={}MiB free={}MiB",
+                (total - free) >> 20,
+                free >> 20
+            );
+        }
         let live_before = store.live_ids().into_iter().collect::<HashSet<_>>();
         let mut inner_profile = profile.as_ref().map(|_| BackwardProfile::default());
         let result = (|| {
@@ -1115,8 +1124,8 @@ impl Tape {
                 {
                     let pool = store.backend().mem_pool_stats();
                     eprintln!(
-                        "[ckpt-bwd-vram] scope_exit used={}MiB free={}MiB pool_reserved={:?} \
-                         pool_used={:?} live_tensors={}",
+                        "[ckpt-bwd-vram] scope_exit fn={function_id} used={}MiB free={}MiB \
+                         pool_reserved={:?} pool_used={:?} live_tensors={}",
                         (total - free) >> 20,
                         free >> 20,
                         pool.map(|(r, _)| r >> 20),
