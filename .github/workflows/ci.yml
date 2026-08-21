@@ -101,13 +101,16 @@ jobs:
       # and only surfaces at build time.
       # `no-cuda` makes cuda-kernels' build.rs skip nvcc/TileLang compilation;
       # CUDARC_CUDA_VERSION pins cudarc's probe so no toolkit is needed.
-      - name: cargo check (cuda + no-cuda typecheck, no GPU toolchain)
+      # clippy, not check: a `cargo check` here let 27 clippy errors accumulate
+      # in infer-cuda (2026-08-21), and `nccl,deepep` are on so the DeepEP /
+      # multi-rank surfaces are linted too — they had never been compiled by CI.
+      - name: cargo clippy (cuda + no-cuda typecheck, no GPU toolchain)
         env:
           CUDARC_CUDA_VERSION: "12080"
         run: |
-          cargo check -p infer-api --release --no-default-features --features cuda,no-cuda --lib
-          cargo check -p arle --release --no-default-features --features cuda,no-cuda,cli --bin arle
-          cargo check -p cli --release --no-default-features --features cuda,no-cuda,nccl
+          cargo clippy -p infer-api --release --no-default-features --features cuda,no-cuda,nccl,deepep --lib -- -D warnings
+          cargo clippy -p arle --release --no-default-features --features cuda,no-cuda,cli,nccl,deepep --bin arle -- -D warnings
+          cargo clippy -p cli --release --no-default-features --features cuda,no-cuda,nccl,deepep -- -D warnings
 
   # Two lanes by feature set (cargo rebuilds on feature change, so crates
   # sharing a set share one build). `--lib` on the backend lane is a no-op for
