@@ -526,6 +526,7 @@ unsafe extern "C" {
         n: i32,
         k: i32,
         group_size: i32,
+        xor_mask: u32,
         stream: CUstream,
     ) -> CUresult;
 
@@ -545,6 +546,7 @@ unsafe extern "C" {
         n: i32,
         k: i32,
         group_size: i32,
+        xor_mask: u32,
         stream: CUstream,
     ) -> CUresult;
 
@@ -1037,9 +1039,7 @@ unsafe extern "C" {
         stream: CUstream,
     );
 
-    pub fn w4_sign_to_zeropoint_cuda(data: *mut u8, n: usize, stream: CUstream) -> CUresult;
 }
-
 #[cfg(test)]
 #[path = "gemm_tests.rs"]
 mod tests;
