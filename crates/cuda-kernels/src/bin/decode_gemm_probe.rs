@@ -131,6 +131,22 @@ impl CutlassArm {
         let (offsets, _g5) = self.expert_offsets.device_ptr(s);
         let (sizes, _g6) = self.problem_sizes.device_ptr(s);
         let (ws, _g7) = self.workspace.device_ptr_mut(s);
+        if std::env::var_os("PROBE_DUMP_PTRS").is_some() {
+            for (name, p) in [
+                ("out", out),
+                ("act", act),
+                ("weights", w),
+                ("a_scale", a_scale),
+                ("b_scales", b_scales),
+                ("offsets", offsets),
+                ("sizes", sizes),
+                ("workspace", ws),
+            ] {
+                println!("  {name:<10} 0x{p:x}  %16={}", p % 16);
+            }
+            use std::io::Write;
+            std::io::stdout().flush().ok();
+        }
         // SAFETY: every pointer comes from a live CudaSlice pinned by its guard,
         // sized above to the layout the C ABI documents; one group, topk 1.
         let rc = unsafe {
@@ -160,14 +176,23 @@ impl CutlassArm {
 }
 
 fn main() -> Result<()> {
-
     let ctx = DeviceContext::new()?;
     let (major, minor) = ctx.compute_capability();
     println!("device sm_{major}{minor}, {} SMs\n", ctx.sm_count());
 
-    // The two Qwen3.8-27B MLP shapes, as [n, k].
-    let shapes = [(34816usize, 5120usize, "gate_up"), (5120, 17408, "down")];
-    let rows = [1usize, 4, 8, 16];
+    // The two Qwen3.8-27B MLP shapes, as [n, k]. `argv` overrides with
+    // `n k m` so a failing configuration can be bisected without a rebuild.
+    let argv: Vec<usize> = std::env::args()
+        .skip(1)
+        .filter_map(|a| a.parse().ok())
+        .collect();
+    let (shapes, rows): (Vec<(usize, usize, &str)>, Vec<usize>) = match argv.as_slice() {
+        [n, k, m] => (vec![(*n, *k, "argv")], vec![*m]),
+        _ => (
+            vec![(34816usize, 5120usize, "gate_up"), (5120, 17408, "down")],
+            vec![1usize, 4, 8, 16],
+        ),
+    };
     let gs = 16;
 
     println!(
