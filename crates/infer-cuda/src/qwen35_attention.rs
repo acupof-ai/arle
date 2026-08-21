@@ -617,8 +617,7 @@ impl Qwen35Model {
             }
 
             {
-                let (bsz, total_q, max_q) =
-                    (meta.batch as i32, meta.total_q as i32, meta.seq_len as i32);
+                let (bsz, total_q, max_q) = (meta.batch, meta.total_q, meta.seq_len);
                 let (q_indptr_ptr, _g1) = meta.q_indptr.device_ptr(&self.ctx.stream);
                 let (kv_indptr_ptr, _g2) = meta.kv_indptr.device_ptr(&self.ctx.stream);
                 let (kv_indices_ptr, _g3) = meta.kv_indices.device_ptr(&self.ctx.stream);
@@ -956,47 +955,28 @@ impl Qwen35Model {
                                         q_prepped.data.device_ptr_mut(&self.ctx.stream);
                                     let (ao_ptr, _g5) =
                                         attn_out.data.device_ptr_mut(&self.ctx.stream);
-                                    // SAFETY: kernel signature from paged_attn_v1 ABI
-                                    // (18-arg BF16).
-                                    let kernel = ffi::resolve_paged_attn_v1(
-                                        c.head_dim as u32,
-                                        q_heads as u32,
-                                        kv_heads as u32,
+                                    cuda_attn::paged_attention_v1_raw(
+                                        &self.ctx.stream,
                                         phase,
-                                    )
-                                    .ok_or_else(|| {
-                                        anyhow!(
-                                            "no HD256 paged {} kernel for q{}_kv{}",
-                                            if decode { "decode" } else { "prefill" },
-                                            q_heads,
-                                            kv_heads
-                                        )
-                                    })?;
-                                    // SAFETY: ptrs from live device allocations sized to
-                                    // the dims passed.
-                                    unsafe {
-                                        kernel(
-                                            qp_ptr as *mut ffi::Half,
-                                            q_indptr_ptr as *const i32,
-                                            k_pool_ptr as *mut ffi::Half,
-                                            v_pool_ptr as *mut ffi::Half,
-                                            kv_indptr_ptr as *const i32,
-                                            kv_indices_ptr as *const i32,
-                                            last_page_len_ptr as *const i32,
-                                            ao_ptr as *mut ffi::Half,
-                                            bsz,
-                                            total_q,
-                                            max_q,
-                                            pool.max_total_pages as i32,
-                                            meta.num_pages as i32,
-                                            q_heads as i32,
-                                            kv_heads as i32,
-                                            pool.page_size as i32,
-                                            sm_scale,
-                                            self.ctx.stream.cu_stream(),
-                                        )
-                                        .result()?;
-                                    }
+                                        qp_ptr,
+                                        q_indptr_ptr,
+                                        k_pool_ptr,
+                                        v_pool_ptr,
+                                        kv_indptr_ptr,
+                                        kv_indices_ptr,
+                                        last_page_len_ptr,
+                                        ao_ptr,
+                                        bsz,
+                                        total_q,
+                                        max_q,
+                                        pool.max_total_pages,
+                                        meta.num_pages,
+                                        q_heads,
+                                        kv_heads,
+                                        c.head_dim,
+                                        pool.page_size,
+                                        sm_scale,
+                                    )?;
                                 }
                                 KVFormat::FP8E4M3 | KVFormat::INT8 => {
                                     // Per-(token, kv_head) symmetric quant; both

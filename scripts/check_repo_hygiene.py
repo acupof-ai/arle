@@ -338,6 +338,29 @@ def check_repo_wide_disallowed_markers() -> list[str]:
     return errors
 
 
+# Production consumers call CUDA kernels through the typed launchers in
+# crates/cuda-kernels/src/<family>.rs; a direct `ffi::<symbol>(` call outside
+# that crate bypasses the shape/pointer guards and the registry. Examples and
+# benches are exempt (they are probes, not serving paths).
+LAUNCHER_BOUNDARY_PATHS = ("crates/infer-cuda/src", "crates/infer-api/src", "crates/cli/src", "crates/train/src")
+
+
+def check_launcher_boundary() -> list[str]:
+    try:
+        result = subprocess.run(
+            ["git", "grep", "-I", "-n", "-E", r"ffi::[a-z][a-z0-9_]*\(", "--", *LAUNCHER_BOUNDARY_PATHS],
+            cwd=ROOT,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+    except FileNotFoundError:
+        return []
+    hits = [line for line in result.stdout.splitlines() if "/ffi/" not in line and "/ffi.rs:" not in line]
+    return [f"raw CUDA FFI call outside cuda-kernels (use a typed launcher): {hit}" for hit in hits]
+
+
 def check_experience_doc_inventory() -> list[str]:
     errors = []
     for rel_path, max_entries in MAX_EXPERIENCE_ENTRIES.items():
@@ -363,6 +386,7 @@ def main() -> int:
     errors.extend(check_experience_doc_inventory())
     errors.extend(check_repo_wide_disallowed_markers())
     errors.extend(check_workspace_truth_surface())
+    errors.extend(check_launcher_boundary())
 
     if errors:
         print("[repo-hygiene] FAIL")
@@ -373,8 +397,8 @@ def main() -> int:
     print("[repo-hygiene] OK")
     print(
         "[repo-hygiene] public docs, templates, local links, tracked junk, "
-        "repo-wide marker bans, experience entry caps, and workspace "
-        "truth-surface checks all passed"
+        "repo-wide marker bans, experience entry caps, workspace "
+        "truth-surface, and CUDA launcher-boundary checks all passed"
     )
     return 0
 
