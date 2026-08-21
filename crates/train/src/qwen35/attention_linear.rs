@@ -20,9 +20,9 @@ impl Qwen35Layer {
         let z = chunked_proj(&attn.in_proj_z, h, store, tape)?;
         let b_proj = chunked_proj(&attn.in_proj_b, h, store, tape)?;
         let a_proj = chunked_proj(&attn.in_proj_a, h, store, tape)?;
-        // CP shards sequence; linear_attention_core_cp all-to-alls it into the head
-        // axis and runs the full-seq recurrence on this rank's head slice. cp.size==1
-        // is the single-card core verbatim.
+        // CP shards sequence; linear_attention_core_cp runs the recurrence on this
+        // rank's rows and carries the state across ranks in global order (taped, so
+        // the state gradient crosses back). cp.size==1 is the single-card core.
         //
         // Its own checkpoint sub-group. A layer-sized group frees nothing until the
         // whole layer's backward is done, so the core's transport chain and scan

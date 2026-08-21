@@ -251,6 +251,7 @@ pub fn linear_attention_core(
         requires_grad,
         None,
         None,
+        None,
         store,
         tape,
     )? {
@@ -330,6 +331,7 @@ pub fn linear_attention_core(
             raw_output: None,
             initial_state: None,
             initial_conv_window: None,
+            carry_peer: None,
             batch: params.batch,
             seq_len: params.seq_len,
             num_key_heads: params.num_key_heads,
@@ -345,23 +347,18 @@ pub fn linear_attention_core(
     Ok(output_id)
 }
 
-/// Context-parallel gated-delta attention: all-to-all the sequence shard into the
-/// head axis, run the full-sequence recurrence on this rank's head slice, all-to-all
-/// back. Model-agnostic — parameterized by `LinearAttentionParams`, so any
-/// gated-delta / Mamba-hybrid model reuses it (the sibling of `cp_causal_sdpa` for
-/// full attention). `cp_size == 1` is `linear_attention_core` verbatim (byte-
-/// identical single card). This mirrors Megatron's gated-delta-net CP: the fused
-/// qkv rides one all-to-all per region and the packed conv weight is section-sliced
-/// per rank — `linear_attention_core`'s interface is untouched.
-///
-/// Correctness rests on head independence: the recurrence never crosses value-heads
-/// (state, conv taps, `a_log[h]`, `dt_bias[h]`, `beta[h]`, per-head rmsnorm are all
-/// head-local), so running it on a 1/N head slice and concatenating == running on
-/// all heads. That math is proven GPU-free by the head-split parity test; the a2a
-/// transport (world>1) is pod-only (`all_to_all` world>1 is pending-remote NCCL).
-///
-/// `params.seq_len` is this rank's shard; the full sequence is `seq_len * cp_size`.
-/// Requires `num_{value,key}_heads % cp_size == 0`.
+/// Context-parallel gated-delta attention, sequence-parallel: every rank runs
+/// the recurrence on its OWN rows (all heads) and the state crosses ranks in
+/// global order. The launcher's zigzag shard gives rank `r` global chunks `r`
+/// and `2N-1-r` as two equal local blocks, so the walk visits chunks 0..2N in
+/// order; a block's predecessor is either the previous local block or a peer
+/// rank, whose (final_state, conv window) arrive through the taped
+/// `cp_recv`/`carry_peer` pair that returns their gradients the same way.
+/// Per-rank transient is O(local seq) — this is what lets the global sequence
+/// grow past what one rank's memory could hold under the former all-to-all
+/// form, at the price of serializing the recurrence across ranks.
+/// `params.seq_len` is this rank's shard. `cp_size == 1` is
+/// `linear_attention_core` verbatim.
 #[allow(clippy::too_many_arguments)]
 pub fn linear_attention_core_cp(
     qkv: TensorId,
@@ -394,317 +391,91 @@ pub fn linear_attention_core_cp(
         );
     }
     let n = cp_size;
-    if !params.num_value_heads.is_multiple_of(n) || !params.num_key_heads.is_multiple_of(n) {
+    let local_seq = params.seq_len;
+    if !local_seq.is_multiple_of(2) {
         return Err(AutogradError::TapeInvariant(
-            "linear_attention_core_cp: num_value_heads and num_key_heads must divide cp_size",
+            "linear_attention_core_cp: zigzag shard needs an even local seq",
         ));
     }
+    let half = local_seq / 2;
     let batch = params.batch;
-    let local_seq = params.seq_len;
-    let full_seq = local_seq * n;
-    let (q_dim, k_dim, v_dim) = (
-        params.num_key_heads * params.key_dim,
+    let (q_dim, v_dim) = (
         params.num_key_heads * params.key_dim,
         params.num_value_heads * params.value_dim,
     );
-
-    // qkv packs [q|k|v] with different head widths, so a contiguous dim/N slice
-    // would cut a region. Split to q/k/v, all-to-all each to its head slice (heads
-    // are outer within a region, so dim/N == this rank's head range), re-fuse.
-    // z/b/a are single regions — one all-to-all each.
-    let q = crate::ops::slice(qkv, &[0, 0, 0], &[batch, local_seq, q_dim], store, tape)?;
-    let k = crate::ops::slice(
-        qkv,
-        &[0, 0, q_dim],
-        &[batch, local_seq, q_dim + k_dim],
-        store,
-        tape,
-    )?;
-    let v = crate::ops::slice(
-        qkv,
-        &[0, 0, q_dim + k_dim],
-        &[batch, local_seq, q_dim + k_dim + v_dim],
-        store,
-        tape,
-    )?;
-    // slice / all_to_all / cat / permute all save shape metadata only, so each
-    // stage's input is value-dead the moment the next one returns. A checkpoint
-    // group frees nothing until the whole layer is done, so without these drops
-    // the entire transport chain stays resident through the layer — measured as
-    // a ~33 GiB transient spike inside one group's forward at local 81,920.
-    let (q_shard, k_shard, v_shard) = (q, k, v);
-    let q = crate::ops::all_to_all(q, 1, 2, store, tape)?;
-    let k = crate::ops::all_to_all(k, 1, 2, store, tape)?;
-    let v = crate::ops::all_to_all(v, 1, 2, store, tape)?;
-    for dead in [q_shard, k_shard, v_shard] {
-        store.drop_device_residency(dead)?;
-    }
-    let qkv_gathered = crate::ops::cat(&[q, k, v], 2, store, tape)?;
-    for dead in [q, k, v] {
-        store.drop_device_residency(dead)?;
-    }
-    let qkv = qkv_gathered;
-    let z = crate::ops::all_to_all(z, 1, 2, store, tape)?;
-    let b_proj = crate::ops::all_to_all(b_proj, 1, 2, store, tape)?;
-    let a_proj = crate::ops::all_to_all(a_proj, 1, 2, store, tape)?;
-
-    // a2a leaves the seq blocks interleaved; the recurrence needs true global order.
-    let (fwd, phys) = zigzag_block_perms(n);
-    let (qkv_pre, z_pre, b_pre, a_pre) = (qkv, z, b_proj, a_proj);
-    let qkv = crate::ops::permute_seq_blocks(qkv, &fwd, store, tape)?;
-    let z = crate::ops::permute_seq_blocks(z, &fwd, store, tape)?;
-    let b_proj = crate::ops::permute_seq_blocks(b_proj, &fwd, store, tape)?;
-    let a_proj = crate::ops::permute_seq_blocks(a_proj, &fwd, store, tape)?;
-    for dead in [qkv_pre, z_pre, b_pre, a_pre] {
-        store.drop_device_residency(dead)?;
-    }
-
-    // Frozen weights sliced to this rank's head range. conv1d packs [q|k|v] on the
-    // channel axis (same region surgery); dt_bias/a_log are per-value-head; norm is
-    // per-value_dim (shared across heads → unsliced). Read-only slices — base
-    // tensors, not LoRA, so no gradient reassembly.
-    let (kh_l, vh_l) = (params.num_key_heads / n, params.num_value_heads / n);
-    let conv1d_weight = slice_conv_weight_to_head(
-        conv1d_weight,
-        params.num_key_heads,
+    let qkv_dim = 2 * q_dim + v_dim;
+    let window = params.conv_kernel - 1;
+    let state_shape = [
+        batch,
         params.num_value_heads,
         params.key_dim,
         params.value_dim,
-        cp_rank,
-        n,
-        store,
-        tape,
-    )?;
-    let dt_bias = crate::ops::slice(
-        dt_bias,
-        &[cp_rank * vh_l],
-        &[(cp_rank + 1) * vh_l],
-        store,
-        tape,
-    )?;
-    let a_log = crate::ops::slice(
-        a_log,
-        &[cp_rank * vh_l],
-        &[(cp_rank + 1) * vh_l],
-        store,
-        tape,
-    )?;
-
-    let local_params = LinearAttentionParams {
-        batch,
-        seq_len: full_seq,
-        num_key_heads: kh_l,
-        num_value_heads: vh_l,
+    ];
+    let window_shape = [batch, window, qkv_dim];
+    let owner = |chunk: usize| if chunk < n { chunk } else { 2 * n - 1 - chunk };
+    let block_params = LinearAttentionParams {
+        seq_len: half,
         ..params
     };
-    let out = linear_attention_core_head_chunked(
-        qkv,
-        z,
-        b_proj,
-        a_proj,
-        conv1d_weight,
-        dt_bias,
-        a_log,
-        norm_weight,
-        local_params,
-        store,
-        tape,
-    )?;
-    // Global order -> a2a physical layout, then restore the [b, local_seq, v_dim] shard.
-    let out = crate::ops::permute_seq_blocks(out, &phys, store, tape)?;
-    crate::ops::all_to_all(out, 2, 1, store, tape)
-}
 
-/// Run the full-seq recurrence over sequential value-head groups, each its own
-/// checkpoint sub-scope, so the core's backward transient scales by 1/G. Exact:
-/// the recurrence never crosses value heads — the same independence the CP head
-/// split rests on (proven by the head-split parity test). Falls back to one
-/// call when the head counts do not divide.
-#[allow(clippy::too_many_arguments)]
-pub fn linear_attention_core_head_chunked(
-    qkv: TensorId,
-    z: TensorId,
-    b_proj: TensorId,
-    a_proj: TensorId,
-    conv1d_weight: TensorId,
-    dt_bias: TensorId,
-    a_log: TensorId,
-    norm_weight: TensorId,
-    params: LinearAttentionParams,
-    store: &mut TensorStore,
-    tape: &mut Tape,
-) -> Result<TensorId> {
-    let groups = [4usize, 3, 2]
-        .into_iter()
-        .find(|g| {
-            params.num_key_heads.is_multiple_of(*g)
-                && params.num_value_heads.is_multiple_of(*g)
-                && store.backend().linear_attention_head_geometry_supported(
-                    params.num_value_heads / g,
-                    params.num_key_heads / g,
-                )
-        })
-        .unwrap_or(1);
-    if groups == 1 {
-        return linear_attention_core(
-            qkv,
-            z,
-            b_proj,
-            a_proj,
+    let mut carry: Option<(TensorId, TensorId)> = None;
+    let mut outs: [Option<TensorId>; 2] = [None, None];
+    for chunk in 0..2 * n {
+        if owner(chunk) != cp_rank {
+            continue;
+        }
+        let block = usize::from(chunk >= n);
+        let (r0, r1) = (block * half, (block + 1) * half);
+        let rows = |x: TensorId, width: usize, st: &mut TensorStore, tp: &mut Tape| {
+            crate::ops::slice(x, &[0, r0, 0], &[batch, r1, width], st, tp)
+        };
+        let qkv_c = rows(qkv, qkv_dim, store, tape)?;
+        let z_c = rows(z, v_dim, store, tape)?;
+        let b_c = rows(b_proj, params.num_value_heads, store, tape)?;
+        let a_c = rows(a_proj, params.num_value_heads, store, tape)?;
+
+        let (initial_state, initial_window) = if chunk == 0 {
+            (None, None)
+        } else if owner(chunk - 1) == cp_rank {
+            let (s, w) = carry.take().ok_or(AutogradError::TapeInvariant(
+                "linear_attention_core_cp: missing local carry",
+            ))?;
+            (Some(s), Some(w))
+        } else {
+            let from = owner(chunk - 1);
+            (
+                Some(crate::ops::cp_recv(&state_shape, from, store, tape)?),
+                Some(crate::ops::cp_recv(&window_shape, from, store, tape)?),
+            )
+        };
+        let send_to = (chunk + 1 < 2 * n)
+            .then(|| owner(chunk + 1))
+            .filter(|&next| next != cp_rank);
+        let (out_c, final_state, conv_window) = linear_attention_core_carry(
+            qkv_c,
+            z_c,
+            b_c,
+            a_c,
             conv1d_weight,
             dt_bias,
             a_log,
             norm_weight,
-            params,
+            block_params,
+            initial_state,
+            initial_window,
+            send_to,
             store,
             tape,
-        );
+        )?;
+        outs[block] = Some(out_c);
+        carry = Some((final_state, conv_window));
     }
-    let (b, s) = (params.batch, params.seq_len);
-    let (kh, vh, kd, vd) = (
-        params.num_key_heads,
-        params.num_value_heads,
-        params.key_dim,
-        params.value_dim,
-    );
-    let (khg, vhg) = (kh / groups, vh / groups);
-    let (q_dim, k_dim) = (kh * kd, kh * kd);
-    let mut outs = Vec::with_capacity(groups);
-    for g in 0..groups {
-        let q_g = crate::ops::slice(
-            qkv,
-            &[0, 0, g * khg * kd],
-            &[b, s, (g + 1) * khg * kd],
-            store,
-            tape,
-        )?;
-        let k_g = crate::ops::slice(
-            qkv,
-            &[0, 0, q_dim + g * khg * kd],
-            &[b, s, q_dim + (g + 1) * khg * kd],
-            store,
-            tape,
-        )?;
-        let v_g = crate::ops::slice(
-            qkv,
-            &[0, 0, q_dim + k_dim + g * vhg * vd],
-            &[b, s, q_dim + k_dim + (g + 1) * vhg * vd],
-            store,
-            tape,
-        )?;
-        let qkv_g = crate::ops::cat(&[q_g, k_g, v_g], 2, store, tape)?;
-        for dead in [q_g, k_g, v_g] {
-            store.drop_device_residency(dead)?;
-        }
-        let z_g = crate::ops::slice(
-            z,
-            &[0, 0, g * vhg * vd],
-            &[b, s, (g + 1) * vhg * vd],
-            store,
-            tape,
-        )?;
-        let b_g = crate::ops::slice(
-            b_proj,
-            &[0, 0, g * vhg],
-            &[b, s, (g + 1) * vhg],
-            store,
-            tape,
-        )?;
-        let a_g = crate::ops::slice(
-            a_proj,
-            &[0, 0, g * vhg],
-            &[b, s, (g + 1) * vhg],
-            store,
-            tape,
-        )?;
-        let conv_g =
-            slice_conv_weight_to_head(conv1d_weight, kh, vh, kd, vd, g, groups, store, tape)?;
-        let dt_g = crate::ops::slice(dt_bias, &[g * vhg], &[(g + 1) * vhg], store, tape)?;
-        let alog_g = crate::ops::slice(a_log, &[g * vhg], &[(g + 1) * vhg], store, tape)?;
-        let gp = LinearAttentionParams {
-            num_key_heads: khg,
-            num_value_heads: vhg,
-            ..params
-        };
-        let out = crate::ops::checkpoint(
-            vec![qkv_g, z_g, b_g, a_g, conv_g, dt_g, alog_g, norm_weight],
-            store,
-            tape,
-            move |st, tp, inp| {
-                let [qkv, z, b_proj, a_proj, conv, dt, alog, norm] = inp else {
-                    return Err(AutogradError::TapeInvariant(
-                        "head-group core checkpoint expects 8 saved inputs",
-                    ));
-                };
-                linear_attention_core(
-                    *qkv, *z, *b_proj, *a_proj, *conv, *dt, *alog, *norm, gp, st, tp,
-                )
-            },
-        )?;
-        outs.push(out);
-    }
-    crate::ops::cat(&outs, 2, store, tape)
-}
-
-/// `(fwd, phys)` for the `2N`-block seq permutation. Zigzag gives rank `r` global
-/// chunks `r`,`2N-1-r`; a2a lays ranks in order, so physical block `2r`=chunk `r`,
-/// `2r+1`=chunk `2N-1-r`. `fwd` un-interleaves to global order, `phys` inverts it.
-fn zigzag_block_perms(n: usize) -> (Vec<usize>, Vec<usize>) {
-    let two_n = 2 * n;
-    let mut fwd = vec![0usize; two_n];
-    for r in 0..n {
-        fwd[r] = 2 * r;
-        fwd[two_n - 1 - r] = 2 * r + 1;
-    }
-    let mut phys = vec![0usize; two_n];
-    for (g, &p) in fwd.iter().enumerate() {
-        phys[p] = g;
-    }
-    (fwd, phys)
-}
-
-/// Slice the packed `[qkv_dim, conv_kernel]` conv weight to this cp rank's head
-/// range. conv_dim packs q|k|v channel regions; the rank owns a contiguous head
-/// slice within each, gathered and re-fused so the local weight matches the a2a'd
-/// activation layout.
-#[allow(clippy::too_many_arguments)]
-fn slice_conv_weight_to_head(
-    conv1d_weight: TensorId,
-    num_key_heads: usize,
-    num_value_heads: usize,
-    key_dim: usize,
-    value_dim: usize,
-    cp_rank: usize,
-    cp_size: usize,
-    store: &mut TensorStore,
-    tape: &mut Tape,
-) -> Result<TensorId> {
-    let (q_dim, k_dim) = (num_key_heads * key_dim, num_key_heads * key_dim);
-    let (qk_local, v_local) = (
-        num_key_heads / cp_size * key_dim,
-        num_value_heads / cp_size * value_dim,
-    );
-    let conv_kernel = store.tensor(conv1d_weight)?.shape[1];
-    // Region base offsets and this rank's local widths: [q | k | v].
-    let regions = [
-        (0usize, qk_local),
-        (q_dim, qk_local),
-        (q_dim + k_dim, v_local),
-    ];
-    let sliced: Vec<TensorId> = regions
-        .iter()
-        .map(|&(base, width)| {
-            let start = base + cp_rank * width;
-            crate::ops::slice(
-                conv1d_weight,
-                &[start, 0],
-                &[start + width, conv_kernel],
-                store,
-                tape,
-            )
-        })
-        .collect::<Result<_>>()?;
-    crate::ops::cat(&sliced, 0, store, tape)
+    let (Some(first), Some(second)) = (outs[0], outs[1]) else {
+        return Err(AutogradError::TapeInvariant(
+            "linear_attention_core_cp: rank did not own both zigzag blocks",
+        ));
+    };
+    crate::ops::cat(&[first, second], 1, store, tape)
 }
 
 /// Host reference with recurrent and convolution carry.
@@ -954,6 +725,7 @@ pub fn linear_attention_core_carry(
     params: LinearAttentionParams,
     initial_state: Option<TensorId>,
     initial_conv_window: Option<TensorId>,
+    send_final_state_to: Option<usize>,
     store: &mut TensorStore,
     tape: &mut Tape,
 ) -> Result<(TensorId, TensorId, TensorId)> {
@@ -995,6 +767,7 @@ pub fn linear_attention_core_carry(
         requires_grad,
         initial_state,
         initial_conv_window,
+        send_final_state_to,
         store,
         tape,
     )?
@@ -1077,6 +850,7 @@ pub fn linear_attention_core_with_carry_taped(
         requires_grad,
         initial_state,
         initial_conv_window,
+        None,
         store,
         tape,
     )? {
@@ -1197,6 +971,7 @@ pub fn linear_attention_core_with_carry_taped(
             raw_output: None,
             initial_state,
             initial_conv_window,
+            carry_peer: None,
             batch: params.batch,
             seq_len: params.seq_len,
             num_key_heads: params.num_key_heads,
@@ -1258,6 +1033,7 @@ fn try_linear_attention_forward_device(
     requires_grad: bool,
     initial_state: Option<TensorId>,
     initial_conv_window: Option<TensorId>,
+    carry_peer: Option<usize>,
     store: &mut TensorStore,
     tape: &mut Tape,
 ) -> Result<Option<(TensorId, TensorId)>> {
@@ -1310,6 +1086,28 @@ fn try_linear_attention_forward_device(
     ];
     let head_shape = vec![params.batch, params.seq_len, params.num_value_heads];
     let output_id = store.alloc_device_tensor(output_shape, result.output)?;
+    let state_len = params.batch * params.num_value_heads * params.key_dim * params.value_dim;
+    let window = params.conv_kernel - 1;
+    if let Some(peer) = carry_peer {
+        // Hand (final_state, conv window) to the successor rank, in that order;
+        // the backward receives (d_window, d_state) in the mirrored order.
+        store.backend().cp_send_device(&result.final_state, state_len, peer)?;
+        let mut scratch = Tape::new();
+        scratch.set_enabled(false);
+        let tail = crate::ops::slice(
+            qkv,
+            &[0, params.seq_len - window, 0],
+            &[params.batch, params.seq_len, qkv_dim],
+            store,
+            &mut scratch,
+        )?;
+        store.ensure_device(tail)?;
+        let tail_handle = store.device_handle(tail)?;
+        store
+            .backend()
+            .cp_send_device(&tail_handle, params.batch * window * qkv_dim, peer)?;
+        store.free(tail)?;
+    }
     let final_state_id = store.alloc_device_tensor(
         vec![
             params.batch,
@@ -1393,6 +1191,7 @@ fn try_linear_attention_forward_device(
                 // recompute, and dh0 / the conv-tail grad return to these ids.
                 initial_state,
                 initial_conv_window,
+                carry_peer,
                 batch: params.batch,
                 seq_len: params.seq_len,
                 num_key_heads: params.num_key_heads,
@@ -1438,6 +1237,7 @@ fn try_linear_attention_backward_device(
     initial_state: Option<TensorId>,
     initial_conv_window: Option<TensorId>,
     d_final_state: Option<TensorId>,
+    carry_peer: Option<usize>,
     params: LinearAttentionParams,
     store: &mut TensorStore,
 ) -> Result<Option<GradPairs>> {
@@ -1447,10 +1247,32 @@ fn try_linear_attention_backward_device(
     let Some(preact) = preact else {
         return Ok(None);
     };
-    let d_final_state_handle = d_final_state
+    let q_dim = params.num_key_heads * params.key_dim;
+    let qkv_dim = q_dim * 2 + params.num_value_heads * params.value_dim;
+    let state_len = params.batch * params.num_value_heads * params.key_dim * params.value_dim;
+    let window = params.conv_kernel - 1;
+    let mut d_final_state_handle = d_final_state
         .map(|id| {
             store.ensure_device(id)?;
             store.device_handle(id)
+        })
+        .transpose()?;
+    // Successor rank's gradients at our carry, mirrored order: window, then state.
+    let d_window_remote = carry_peer
+        .map(|peer| {
+            let d_window = store
+                .backend()
+                .cp_recv_device(params.batch * window * qkv_dim, peer)?;
+            let d_state = store.backend().cp_recv_device(state_len, peer)?;
+            d_final_state_handle = Some(match d_final_state_handle.take() {
+                Some(parked) => store.backend().accumulate_into_device(
+                    &parked,
+                    &d_state,
+                    &[state_len],
+                )?,
+                None => d_state,
+            });
+            Ok::<_, AutogradError>(d_window)
         })
         .transpose()?;
     let Some(qkv_conv) = qkv_conv else {
@@ -1569,16 +1391,22 @@ fn try_linear_attention_backward_device(
         carry_grads.push((window_id, store.alloc_device_tensor(shape, d_window)?));
     }
 
-    let q_dim = params.num_key_heads * params.key_dim;
-    let qkv_dim = q_dim * 2 + params.num_value_heads * params.value_dim;
+    let dqkv = match d_window_remote {
+        // The window we handed on was rows seq_len-window.. of qkv.
+        Some(d_window) => store.backend().accumulate_slice_device(
+            &device_grads.dqkv,
+            &d_window,
+            &[params.batch, params.seq_len, qkv_dim],
+            &[0, params.seq_len - window, 0],
+            &[params.batch, params.seq_len, qkv_dim],
+        )?,
+        None => device_grads.dqkv.clone(),
+    };
     let mut grads = GradPairs::new();
     if store.tensor(qkv)?.requires_grad {
         grads.push((
             qkv,
-            store.alloc_device_tensor(
-                vec![params.batch, params.seq_len, qkv_dim],
-                device_grads.dqkv,
-            )?,
+            store.alloc_device_tensor(vec![params.batch, params.seq_len, qkv_dim], dqkv)?,
         ));
     }
     if store.tensor(z)?.requires_grad {
@@ -1663,6 +1491,7 @@ pub(crate) fn linear_attention_backward(
         raw_output,
         initial_state,
         initial_conv_window,
+        carry_peer,
         batch,
         seq_len,
         num_key_heads,
@@ -1723,6 +1552,7 @@ pub(crate) fn linear_attention_backward(
         initial_state,
         initial_conv_window,
         d_final_state,
+        carry_peer,
         params,
         store,
     )? {

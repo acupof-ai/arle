@@ -1301,6 +1301,30 @@ impl Backend for CudaBackend {
         }
     }
 
+    fn cp_send_device(&self, handle: &DeviceHandle, len: usize, peer: usize) -> Result<()> {
+        #[cfg(feature = "no-cuda")]
+        {
+            let _ = (handle, len, peer);
+            todo!("GPU required: cuda cp_send_device is unavailable under feature no-cuda")
+        }
+        #[cfg(not(feature = "no-cuda"))]
+        {
+            cuda_cp_send(self, handle, len, peer)
+        }
+    }
+
+    fn cp_recv_device(&self, len: usize, peer: usize) -> Result<DeviceHandle> {
+        #[cfg(feature = "no-cuda")]
+        {
+            let _ = (len, peer);
+            todo!("GPU required: cuda cp_recv_device is unavailable under feature no-cuda")
+        }
+        #[cfg(not(feature = "no-cuda"))]
+        {
+            cuda_cp_recv(self, len, peer)
+        }
+    }
+
     fn all_to_all_device(
         &self,
         x: &DeviceHandle,
