@@ -3,7 +3,8 @@
 > Status: Hypothesis refuted at decode M, and the measurement relocated the
 > lever. Backlog item 1 of
 > [the NVFP4 decode plan](../../plans/2026-08-21-nvfp4-decode-lever-backlog.md).
-> Probe: `crates/cuda-kernels/src/bin/decode_gemm_probe.rs`.
+> Instrument: a throwaway dev probe (removed once the verdict landed; the
+> sweep table below is the record).
 
 ## Context
 
