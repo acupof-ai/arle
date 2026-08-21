@@ -293,15 +293,15 @@ impl OpenAiTokenizer {
 // is the cold-start bottleneck. The tokenizers crate's serde implementation
 // uses #[serde(flatten)] rest: serde_json::Value, which is incompatible with
 // compact binary formats (bincode/postcard/cbor/msgpack direct round-trip).
-// Instead, cache the raw parts (vocab, merges, config JSON) via bincode and
+// Instead, cache the raw parts (vocab, merges, config JSON) via postcard and
 // reconstruct the Tokenizer via BPE::builder() — this skips the JSON syntax
 // parse and the serde flatten round-trip, paying only the HashMap build.
 const CACHE_FILENAME: &str = "tokenizer.arle.bin";
 const CACHE_MAGIC: &[u8; 4] = b"ARLT";
-const CACHE_VERSION: u32 = 5;
+const CACHE_VERSION: u32 = 6;
 
 // Upstream tokenizers crate exports — Vocab is AHashMap<String, u32>, Merges
-// is Vec<(String, String)>; bincode round-trips both.
+// is Vec<(String, String)>; postcard round-trips both.
 use tokenizers::models::bpe::{Merges, Vocab};
 
 type CachedParts = (ChatTemplate, Vocab, Merges, String);
@@ -319,13 +319,8 @@ fn try_load_cache(model_dir: &Path) -> Option<OpenAiTokenizer> {
     if version != CACHE_VERSION {
         return None;
     }
-    let (template, vocab, merges, config_str) =
-        bincode::serde::decode_from_slice::<CachedParts, _>(
-            &bytes[8..],
-            bincode::config::standard(),
-        )
-        .ok()?
-        .0;
+    let (template, vocab, merges, config_str): CachedParts =
+        postcard::from_bytes(&bytes[8..]).ok()?;
     let config: serde_json::Value = serde_json::from_str(&config_str).ok()?;
     let inner = build_tokenizer_from_parts(vocab, merges, &config).ok()?;
     Some(OpenAiTokenizer { inner, template })
@@ -345,10 +340,7 @@ fn save_cache(
     let mut bytes = Vec::new();
     bytes.extend_from_slice(CACHE_MAGIC);
     bytes.extend_from_slice(&CACHE_VERSION.to_le_bytes());
-    if let Ok(payload) = bincode::serde::encode_to_vec(
-        (template, vocab, merges, &config_str),
-        bincode::config::standard(),
-    ) {
+    if let Ok(payload) = postcard::to_allocvec(&(template, vocab, merges, &config_str)) {
         bytes.extend_from_slice(&payload);
         if let Err(err) = std::fs::write(&path, &bytes) {
             log::warn!("tokenizer cache write failed: {err}");
@@ -773,7 +765,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cache_parts_bincode_round_trip() {
+    fn cache_parts_postcard_round_trip() {
         let parts: CachedParts = (
             ChatTemplate::Jinja {
                 source: "{% for m in messages %}{{ m.content }}{% endfor %}".into(),
@@ -784,10 +776,8 @@ mod tests {
             vec![("a".to_string(), "b".to_string())],
             r#"{"model":{"type":"BPE"}}"#.to_string(),
         );
-        let bytes = bincode::serde::encode_to_vec(&parts, bincode::config::standard()).unwrap();
-        let (decoded, consumed): (CachedParts, _) =
-            bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
-        assert_eq!(consumed, bytes.len());
+        let bytes = postcard::to_allocvec(&parts).unwrap();
+        let decoded: CachedParts = postcard::from_bytes(&bytes).unwrap();
         assert_eq!(decoded, parts);
     }
 }

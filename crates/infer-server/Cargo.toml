@@ -15,7 +15,7 @@ anyhow = "1.0"
 axum = "0.8"
 base64 = "0.22"
 chat = { path = "../chat" }
-bincode = { workspace = true }
+postcard = { workspace = true }
 image = { version = "0.25", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
 infer-core = { path = "../infer-core" }
 infer-plan = { path = "../infer-plan", features = ["serde"] }
