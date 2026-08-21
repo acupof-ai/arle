@@ -259,6 +259,20 @@ impl Backend for CudaBackend {
         if let Err(err) = self.kernels.warm_dtype(dtype) {
             log::warn!("autograd cuda dtype-module warmup failed: {err}");
         }
+        // One line per run so a log can be matched to the exact NVRTC artifact.
+        #[cfg(not(feature = "no-cuda"))]
+        match self.kernels.nvrtc_identity(dtype) {
+            Ok(id) => log::info!(
+                "autograd cuda kernels: src={} arch={} dtype={:?} nvrtc={}.{} driver={}",
+                id.source_hash,
+                id.sm_arch,
+                id.tape_dtype,
+                id.nvrtc_version.0,
+                id.nvrtc_version.1,
+                id.cuda_driver_version
+            ),
+            Err(err) => log::warn!("autograd cuda kernel identity unavailable: {err}"),
+        }
     }
 
     fn tape_dtype(&self) -> TapeDtype {
