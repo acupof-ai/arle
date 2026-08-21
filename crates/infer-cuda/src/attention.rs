@@ -892,44 +892,33 @@ fn run_tilelang_paged(
     } else {
         ffi::AttnPhase::Prefill
     };
-    let kernel = ffi::resolve_paged_attn_v1(
-        head_dim as u32,
-        num_q_heads as u32,
-        num_kv_heads as u32,
-        phase,
-    )
-    .ok_or_else(|| {
-        anyhow::anyhow!("unsupported HD128 q/kv head config q{num_q_heads}_kv{num_kv_heads}")
-    })?;
     let (bsz, total_q, max_q) = if decode {
-        (meta.batch as i32, meta.batch as i32, 1)
+        (meta.batch, meta.batch, 1)
     } else {
-        (1, meta.seq_len as i32, meta.seq_len as i32)
+        (1, meta.seq_len, meta.seq_len)
     };
-    // SAFETY: ptrs from live device allocations sized to the dims passed.
-    unsafe {
-        kernel(
-            q_ptr as *mut ffi::Half,
-            qo_ptr as *const i32,
-            k_pool_ptr as *mut ffi::Half,
-            v_pool_ptr as *mut ffi::Half,
-            kv_indptr_ptr as *const i32,
-            kv_indices_ptr as *const i32,
-            last_ptr as *const i32,
-            out_ptr as *mut ffi::Half,
-            bsz,
-            total_q,
-            max_q,
-            pool.max_total_pages as i32,
-            meta.num_pages as i32,
-            num_q_heads as i32,
-            num_kv_heads as i32,
-            pool.page_size as i32,
-            sm_scale,
-            ctx.stream.cu_stream(),
-        )
-        .result()?;
-    }
+    flash_kv::paged_attention_v1_raw(
+        &ctx.stream,
+        phase,
+        q_ptr,
+        qo_ptr,
+        k_pool_ptr,
+        v_pool_ptr,
+        kv_indptr_ptr,
+        kv_indices_ptr,
+        last_ptr,
+        out_ptr,
+        bsz,
+        total_q,
+        max_q,
+        pool.max_total_pages,
+        meta.num_pages,
+        num_q_heads,
+        num_kv_heads,
+        head_dim,
+        pool.page_size,
+        sm_scale,
+    )?;
     Ok(())
 }
 

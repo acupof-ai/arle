@@ -860,6 +860,71 @@ pub fn prefill_attention_paged_prep_raw(
     }
 }
 
+/// Paged attention v1 (HD128/HD256 BF16 pool), resolved per
+/// `(head_dim, q_heads, kv_heads, phase)` from the generated kernel table;
+/// an unregistered head geometry is an error, never a silent fallback.
+#[allow(clippy::too_many_arguments)]
+pub fn paged_attention_v1_raw(
+    stream: &CudaStream,
+    phase: ffi::AttnPhase,
+    q_ptr: u64,
+    q_indptr_ptr: u64,
+    k_pool_ptr: u64,
+    v_pool_ptr: u64,
+    kv_indptr_ptr: u64,
+    kv_indices_ptr: u64,
+    last_page_len_ptr: u64,
+    out_ptr: u64,
+    batch: usize,
+    total_q: usize,
+    max_q: usize,
+    max_total_pages: usize,
+    num_pages: usize,
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    page_size: usize,
+    sm_scale: f32,
+) -> Result<()> {
+    let kernel = ffi::resolve_paged_attn_v1(
+        head_dim as u32,
+        num_q_heads as u32,
+        num_kv_heads as u32,
+        phase,
+    )
+    .ok_or_else(|| {
+        anyhow!(
+            "no paged_attn_v1 {phase:?} kernel for hd{head_dim} q{num_q_heads}_kv{num_kv_heads}"
+        )
+    })?;
+    // SAFETY: caller passes live device addresses (q rows, page tables, pool
+    // bases, output) sized to the dims passed, stream-ordered on `stream`.
+    unsafe {
+        kernel(
+            q_ptr as *mut ffi::Half,
+            q_indptr_ptr as *const i32,
+            k_pool_ptr as *mut ffi::Half,
+            v_pool_ptr as *mut ffi::Half,
+            kv_indptr_ptr as *const i32,
+            kv_indices_ptr as *const i32,
+            last_page_len_ptr as *const i32,
+            out_ptr as *mut ffi::Half,
+            attn_i32(batch, "paged attn batch")?,
+            attn_i32(total_q, "paged attn total_q")?,
+            attn_i32(max_q, "paged attn max_q")?,
+            attn_i32(max_total_pages, "paged attn max_total_pages")?,
+            attn_i32(num_pages, "paged attn num_pages")?,
+            attn_i32(num_q_heads, "paged attn q_heads")?,
+            attn_i32(num_kv_heads, "paged attn kv_heads")?,
+            attn_i32(page_size, "paged attn page_size")?,
+            sm_scale,
+            stream.cu_stream(),
+        )
+        .result()
+        .map_err(|e| anyhow!("paged_attn_v1 {phase:?} failed at total_q={total_q}: {e}"))
+    }
+}
+
 /// Qwen3 dense paged decode prep, one q row per batch element: q/k-norm +
 /// RoPE in place on `q`, K/V appended to the paged pools at each row's last
 /// page.
