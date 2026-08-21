@@ -208,14 +208,14 @@ __global__ void paged_attention_quantized_fa3_partial_kernel(
         smem_m[warp_id] = m_local;
         smem_l[warp_id] = l_local;
     }
-    // Lane `l`'s element `i` is staged at `[i * 32 + l]` so a warp's 32 lanes hit
-    // 32 distinct banks. The slot still carries the value for `d = l * EPT + i`
-    // — smem is only a transfer buffer between the four warps, so write/read
-    // consistency is all that is required. The straight `[l * EPT + i]` index
-    // put lanes 0, 4, 8 ... on one bank: `ncu` measured 47.1% conflicts.
+    // `[l * EPT + i]` keeps a lane's EPT floats contiguous, which nvcc merges
+    // into STS.128. It carries an 8-way bank conflict, but the conflict-free
+    // `[i * 32 + l]` index scatters the lane's floats 32 apart and loses the
+    // merge: SASS traded 32 STS.128 for 96 scalar LDS. The merge is worth more
+    // — this staging is 430k wavefronts against a 9.6M-cycle kernel.
     #pragma unroll
     for (int i = 0; i < EPT; i++) {
-        smem_o[warp_id * HEAD_DIM + i * PAF3_WARP_SIZE + lane_id] = o_reg[i];
+        smem_o[warp_id * HEAD_DIM + lane_id * EPT + i] = o_reg[i];
     }
     __syncthreads();
 
@@ -225,7 +225,7 @@ __global__ void paged_attention_quantized_fa3_partial_kernel(
         float final_o[EPT];
         #pragma unroll
         for (int i = 0; i < EPT; i++) {
-            final_o[i] = smem_o[i * PAF3_WARP_SIZE + lane_id];
+            final_o[i] = smem_o[lane_id * EPT + i];
         }
 
         #pragma unroll
@@ -240,7 +240,7 @@ __global__ void paged_attention_quantized_fa3_partial_kernel(
 
             #pragma unroll
             for (int i = 0; i < EPT; i++) {
-                const float o_w = smem_o[w * HEAD_DIM + i * PAF3_WARP_SIZE + lane_id];
+                const float o_w = smem_o[w * HEAD_DIM + lane_id * EPT + i];
                 final_o[i] = final_o[i] * scale_prev + o_w * scale_w;
             }
             final_l = final_l * scale_prev + l_w * scale_w;
