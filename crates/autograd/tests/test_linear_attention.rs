@@ -1980,3 +1980,124 @@ fn linear_attention_cp_head_split_reconstructs_full() {
     };
     assert_head_split_exact(gqa, 2, "cp=2 gqa 2:1");
 }
+
+// Sequence-parallel core: two chunks chained through the taped state + conv-window
+// carry must match the unchunked device core, gradients included (dh0 / d_window
+// flow back through `LinearAttentionFinalState` and the window slice).
+#[cfg(all(feature = "cuda", not(feature = "no-cuda")))]
+#[test]
+fn cuda_linear_attention_seq_carry_grads_match_unchunked() -> Result<()> {
+    use autograd::TensorId;
+    use autograd::ops::{cat, linear_attention_core_carry, slice};
+    let params = qwen36_27b_chunked_params(256);
+    let fixture = LinearAttentionFixture::new(params);
+    let qkv_shape = [params.batch, params.seq_len, qkv_dim(params)];
+    let z_shape = [params.batch, params.seq_len, z_dim(params)];
+    let head_shape = [params.batch, params.seq_len, params.num_value_heads];
+    let mut run = |chunked: bool| -> Result<Vec<Vec<f32>>> {
+        let mut store = TensorStore::with_backend(Arc::new(CudaBackend::new(0)?));
+        let mut tape = Tape::new();
+        let qkv = store.from_slice(&fixture.qkv, &qkv_shape)?;
+        let z = store.from_slice(&fixture.z, &z_shape)?;
+        let b_proj = store.from_slice(&fixture.b_proj, &head_shape)?;
+        let a_proj = store.from_slice(&fixture.a_proj, &head_shape)?;
+        let conv1d_weight = store.from_slice(
+            &fixture.conv1d_weight,
+            &[qkv_dim(params), params.conv_kernel],
+        )?;
+        let dt_bias = store.from_slice(&fixture.dt_bias, &[params.num_value_heads])?;
+        let a_log = store.from_slice(&fixture.a_log, &[params.num_value_heads])?;
+        let norm_weight = store.from_slice(&fixture.norm_weight, &[params.value_dim])?;
+        let coeff = store.from_slice(&fixture.coeff, &z_shape)?;
+        let leaves = [
+            qkv,
+            z,
+            b_proj,
+            a_proj,
+            conv1d_weight,
+            dt_bias,
+            a_log,
+            norm_weight,
+        ];
+        for id in leaves {
+            store.get_mut(id).expect("leaf").requires_grad = true;
+        }
+        let output = if chunked {
+            let half = params.seq_len / 2;
+            let chunk = LinearAttentionParams {
+                seq_len: half,
+                ..params
+            };
+            let mut carry = None;
+            let mut outs = Vec::new();
+            for c in 0..2 {
+                let (r0, r1) = (c * half, (c + 1) * half);
+                let mut rows = |x: TensorId, w: usize, st: &mut TensorStore, tp: &mut Tape| {
+                    slice(x, &[0, r0, 0], &[params.batch, r1, w], st, tp)
+                };
+                let qkv_c = rows(qkv, qkv_dim(params), &mut store, &mut tape)?;
+                let z_c = rows(z, z_dim(params), &mut store, &mut tape)?;
+                let b_c = rows(b_proj, params.num_value_heads, &mut store, &mut tape)?;
+                let a_c = rows(a_proj, params.num_value_heads, &mut store, &mut tape)?;
+                let (state, window) = carry.map_or((None, None), |(s, w)| (Some(s), Some(w)));
+                let (out, final_state, conv_window) = linear_attention_core_carry(
+                    qkv_c,
+                    z_c,
+                    b_c,
+                    a_c,
+                    conv1d_weight,
+                    dt_bias,
+                    a_log,
+                    norm_weight,
+                    chunk,
+                    state,
+                    window,
+                    None,
+                    &mut store,
+                    &mut tape,
+                )?;
+                carry = Some((final_state, conv_window));
+                outs.push(out);
+            }
+            cat(&outs, 1, &mut store, &mut tape)?
+        } else {
+            linear_attention_core(
+                qkv,
+                z,
+                b_proj,
+                a_proj,
+                conv1d_weight,
+                dt_bias,
+                a_log,
+                norm_weight,
+                params,
+                &mut store,
+                &mut tape,
+            )?
+        };
+        let weighted = mul(output, coeff, &mut store, &mut tape)?;
+        let loss = sum(weighted, &mut store, &mut tape)?;
+        let grads = tape.backward(loss, &mut store)?;
+        let mut out = vec![store.to_host(loss)?];
+        for id in leaves {
+            out.push(store.to_host(*grads.get(&id).expect("leaf grad"))?);
+        }
+        Ok(out)
+    };
+    let full = run(false)?;
+    let chunked = run(true)?;
+    let names = [
+        "loss", "qkv", "z", "b_proj", "a_proj", "conv1d", "dt_bias", "a_log", "norm",
+    ];
+    for ((name, lhs), rhs) in names.iter().zip(&full).zip(&chunked) {
+        let (idx, err) = max_err_with_index(lhs, rhs);
+        let scale = lhs.iter().fold(0f32, |m, v| m.max(v.abs())).max(1e-6);
+        assert!(
+            err / scale < 2.0e-2,
+            "{name}: max abs err {err:.3e} at {idx} (scale {scale:.3e}) full={} chunked={}",
+            lhs[idx],
+            rhs[idx]
+        );
+    }
+    Ok(())
+}
