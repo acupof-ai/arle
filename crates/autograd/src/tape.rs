@@ -175,7 +175,6 @@ pub enum SavedContext {
         initial_conv_window: Option<TensorId>,
         /// Sequence-parallel successor rank: the forward sent (final_state,
         /// conv window) there; the backward receives (d_window, d_state) back.
-        carry_peer: Option<usize>,
         batch: usize,
         seq_len: usize,
         num_key_heads: usize,
@@ -205,6 +204,11 @@ pub enum SavedContext {
     CpRecvCtx {
         peer: usize,
         len: usize,
+    },
+    CpSendAttachCtx {
+        peer: usize,
+        state_len: usize,
+        window_len: usize,
     },
     SeqChunkedRecomputeCtx {
         function_id: usize,
@@ -292,6 +296,7 @@ pub enum BackwardOp {
     LinearAttentionFinalState,
     /// Point-to-point receive on the CP communicator; backward sends the grad back.
     CpRecv,
+    CpSendAttach,
     CausalSdpaRecompute,
     AllReduceSum,
     AllGatherSeq,
@@ -342,6 +347,7 @@ impl BackwardOp {
             BackwardOp::LinearAttention => "LinearAttention",
             BackwardOp::LinearAttentionFinalState => "LinearAttentionFinalState",
             BackwardOp::CpRecv => "CpRecv",
+            BackwardOp::CpSendAttach => "CpSendAttach",
             BackwardOp::CausalSdpaRecompute => "CausalSdpaRecompute",
             BackwardOp::AllReduceSum => "AllReduceSum",
             BackwardOp::AllGatherSeq => "AllGatherSeq",
@@ -761,7 +767,6 @@ impl Tape {
             }
 
             let vram_profile = backward_vram_profile_enabled();
-            let carry_trace = std::env::var_os("ARLE_OPD_CARRY_TRACE").is_some();
             for &entry_index in post_order.iter().rev() {
                 let entry = self.entries[entry_index].clone();
                 let output_grad_id = match grads.get(&entry.output_id).copied() {
@@ -772,21 +777,6 @@ impl Tape {
                 let inner_op_seq = (entry.op != BackwardOp::Checkpoint)
                     .then(|| self.checkpoint_op_mem_begin(&entry, store))
                     .flatten();
-                if carry_trace
-                    && matches!(
-                        entry.op,
-                        BackwardOp::LinearAttention
-                            | BackwardOp::LinearAttentionFinalState
-                            | BackwardOp::CpRecv
-                    )
-                {
-                    eprintln!(
-                        "[carry-trace] bwd op={} output={:?} inputs={:?}",
-                        entry.op.name(),
-                        entry.output_id,
-                        entry.input_ids
-                    );
-                }
                 if profile.is_some() {
                     sync_profile_boundary(store)?;
                 }
@@ -903,6 +893,9 @@ impl Tape {
                         }
                         pairs
                     }
+                    BackwardOp::CpSendAttach => {
+                        ops::cp_send_attach_backward(&entry, output_grad_id, store)?
+                    }
                     BackwardOp::CpRecv => {
                         let SavedContext::CpRecvCtx { peer, len } = entry.saved else {
                             return Err(AutogradError::TapeInvariant(
@@ -984,10 +977,6 @@ impl Tape {
                 let output_grad_reused = input_grads
                     .iter()
                     .any(|(_, grad_id)| *grad_id == output_grad_id);
-                if carry_trace && entry.op == BackwardOp::LinearAttention {
-                    let ids: Vec<TensorId> = input_grads.iter().map(|(id, _)| *id).collect();
-                    eprintln!("[carry-trace] la-bwd pushed grads for {ids:?}");
-                }
                 for (input_id, grad_id) in input_grads {
                     merge_grad(
                         &mut grads,

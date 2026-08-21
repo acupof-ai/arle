@@ -47,7 +47,7 @@ pub(crate) use activation::{exp_backward, gelu_backward, sigmoid_backward, silu_
 pub(crate) use attention::{cat_heads_backward, cat_seq_backward, causal_sdpa_recompute_backward};
 pub(crate) use broadcast::add_broadcast_backward;
 pub(crate) use collective::{
-    all_gather_seq_backward, all_reduce_sum_backward, all_to_all_backward,
+    all_gather_seq_backward, all_reduce_sum_backward, all_to_all_backward, cp_send_attach_backward,
     reduce_scatter_sum_backward,
 };
 pub(crate) use elementwise::{abs_backward, add_backward, mul_backward, mul_scalar_backward};
@@ -118,6 +118,17 @@ pub fn cp_recv(
     tape: &mut Tape,
 ) -> Result<TensorId> {
     collective::cp_recv(shape, peer, store, tape)
+}
+
+pub fn cp_send_attach(
+    out: TensorId,
+    state: TensorId,
+    window: TensorId,
+    peer: usize,
+    store: &mut TensorStore,
+    tape: &mut Tape,
+) -> Result<TensorId> {
+    collective::cp_send_attach(out, state, window, peer, store, tape)
 }
 
 pub fn gelu(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<TensorId> {

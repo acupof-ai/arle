@@ -2040,7 +2040,7 @@ fn cuda_linear_attention_seq_carry_grads_match_unchunked() -> Result<()> {
                 let b_c = rows(b_proj, params.num_value_heads, &mut store, &mut tape)?;
                 let a_c = rows(a_proj, params.num_value_heads, &mut store, &mut tape)?;
                 let (state, window) = carry.map_or((None, None), |(s, w)| (Some(s), Some(w)));
-                let (out, final_state, conv_window) = linear_attention_core_carry(
+                let (out, final_state) = linear_attention_core_carry(
                     qkv_c,
                     z_c,
                     b_c,
@@ -2052,7 +2052,13 @@ fn cuda_linear_attention_seq_carry_grads_match_unchunked() -> Result<()> {
                     chunk,
                     state,
                     window,
-                    None,
+                    &mut store,
+                    &mut tape,
+                )?;
+                let conv_window = slice(
+                    qkv_c,
+                    &[0, half - (params.conv_kernel - 1), 0],
+                    &[params.batch, half, qkv_dim(params)],
                     &mut store,
                     &mut tape,
                 )?;
