@@ -8,6 +8,13 @@ detail in the linked wins/errors entry. Oldest sections are condensed.
 
 ## [Unreleased]
 
+- **`--spec-type auto` now resolves on the multiproc path.** The 0.5.8 default
+  was lowered only in `serve_http`, which the multiproc coordinator never runs,
+  so multi-GPU DSv4 workers loaded without the MTP head. Same-day cleanup also
+  made `--mtp-draft-tokens` a loud error when `auto` finds no head, and deleted
+  the closed-axis decode GEMM probe.
+  ([entry](docs/experience/errors/2026-08-21-spec-auto-missing-on-multiproc.md))
+
 ## [0.5.8] - 2026-08-21
 
 Two 4-bit checkpoint families now serve on CUDA, and the decode profile that

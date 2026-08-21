@@ -407,6 +407,17 @@ pub(crate) fn classify_cuda_model(v: &serde_json::Value) -> CudaModelKind {
     }
 }
 
+/// Read and parse `<model_path>/config.json`. Callers probing for optional keys
+/// treat `Err` as absent; callers that classify the checkpoint (the CUDA
+/// model-kind path) keep the error context.
+pub(crate) fn read_config_json(model_path: &str) -> anyhow::Result<serde_json::Value> {
+    use anyhow::Context;
+    let cfg_path = std::path::Path::new(model_path).join("config.json");
+    let raw = std::fs::read_to_string(&cfg_path)
+        .with_context(|| format!("read {}", cfg_path.display()))?;
+    serde_json::from_str(&raw).context("parse config.json")
+}
+
 // OPD API-teacher raw-logits HTTP surface (CUDA-only; merged into router_cuda).
 #[cfg(feature = "cuda")]
 #[path = "loaded/raw_logits_route.rs"]
@@ -1839,12 +1850,9 @@ mod backend {
 
     #[cfg(feature = "cuda")]
     fn detect_cuda_model_kind(model_path: &str) -> Result<super::CudaModelKind> {
-        use anyhow::Context;
-        let cfg_path = std::path::Path::new(model_path).join("config.json");
-        let raw = std::fs::read_to_string(&cfg_path)
-            .with_context(|| format!("read {}", cfg_path.display()))?;
-        let v: serde_json::Value = serde_json::from_str(&raw).context("parse config.json")?;
-        Ok(super::classify_cuda_model(&v))
+        Ok(super::classify_cuda_model(&super::read_config_json(
+            model_path,
+        )?))
     }
 
     /// Whether `model_path`'s checkpoint takes the multiproc TP serve path when

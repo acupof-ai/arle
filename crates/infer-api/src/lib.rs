@@ -80,7 +80,8 @@ pub use loaded::{EngineLoadConfig, KvCacheDtype, KvTierBudget};
 pub use serve::serve_coordinator_http_dp;
 pub use serve::{
     DEFAULT_MTP_DRAFT_TOKENS, DEFAULT_MTP_DRAFT_TOPK, ServeHttpOptions, ServeSpecOptions,
-    ServeSpecType, default_kv_ssd_root, serve_http, validate_kv_ssd_config,
+    ServeSpecType, checkpoint_has_mtp_head, default_kv_ssd_root, serve_http,
+    validate_kv_ssd_config,
 };
 #[cfg(any(
     feature = "metal",

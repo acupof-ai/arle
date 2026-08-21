@@ -160,32 +160,28 @@ pub struct ServeSpecOptions {
 
 pub const DEFAULT_MTP_DRAFT_TOKENS: usize = 2;
 
-/// Whether the checkpoint ships a multi-token-prediction head, which is what
-/// `--spec-type auto` routes on. Both families declare it in `config.json` and
-/// neither parses it into its typed config, so read the key directly: Qwen3.5
-/// nests under `text_config`, DeepSeek-V4 and GLM use the DeepSeek name (GLM
-/// ships 0). A checkpoint that declares no head stays on the plain decode path.
-#[must_use]
+/// Whether the checkpoint ships a multi-token-prediction head, what
+/// `--spec-type auto` routes on. Read directly from `config.json`: this runs
+/// before the backend router exists, so it cannot consult the typed configs
+/// (the CUDA DSv4 loader already parses `num_nextn_predict_layers`; no typed
+/// config parses Qwen's `mtp_num_hidden_layers`). Qwen3.5 nests under
+/// `text_config`. Any read/parse failure means no head.
 pub fn checkpoint_has_mtp_head(model_path: &str) -> bool {
-    let Ok(raw) = std::fs::read_to_string(std::path::Path::new(model_path).join("config.json"))
-    else {
-        return false;
-    };
-    let Ok(cfg) = serde_json::from_str::<serde_json::Value>(&raw) else {
-        return false;
-    };
-    ["mtp_num_hidden_layers", "num_nextn_predict_layers"]
-        .iter()
-        .any(|key| {
-            [
-                cfg.get(key),
-                cfg.get("text_config").and_then(|t| t.get(key)),
-            ]
-            .into_iter()
-            .flatten()
-            .any(|v| v.as_u64().is_some_and(|n| n > 0))
-        })
+    crate::loaded::read_config_json(model_path).is_ok_and(|cfg| {
+        ["mtp_num_hidden_layers", "num_nextn_predict_layers"]
+            .iter()
+            .any(|key| {
+                [
+                    cfg.get(key),
+                    cfg.get("text_config").and_then(|t| t.get(key)),
+                ]
+                .into_iter()
+                .flatten()
+                .any(|v| v.as_u64().is_some_and(|n| n > 0))
+            })
+    })
 }
+
 pub const DEFAULT_MTP_DRAFT_TOPK: usize = 1;
 
 impl ServeSpecOptions {
@@ -214,11 +210,11 @@ pub fn serve_http(
 ) -> Result<()> {
     validate_kv_ssd_config(&opts.engine_config)?;
 
-    // Lower the requested spec surface into the engine config. The blanket
-    // fail-close is now narrowed: an external draft model and `auto` are still
-    // unimplemented and error, but `--spec-type mtp` drives the CUDA DSv4
-    // checkpoint-native MTP head via `mtp_draft_tokens`. The per-backend
-    // fail-close (MTP is CUDA-only) lives in `router_for_backend`'s `load_*`.
+    // Lower the requested spec surface into the engine config: `auto` resolves
+    // against the checkpoint below, `mtp` drives the CUDA DSv4
+    // checkpoint-native MTP head via `mtp_draft_tokens`, `dspark` requires the
+    // external draft dir. The per-backend fail-close (MTP is CUDA-only) lives
+    // in `router_for_backend`'s `load_*`.
     let mut engine_config = opts.engine_config;
     let spec_type = match opts.spec.spec_type {
         ServeSpecType::None if opts.spec.mtp_enabled() => ServeSpecType::Mtp,
@@ -236,6 +232,12 @@ pub fn serve_http(
             if head {
                 ServeSpecType::Mtp
             } else {
+                if opts.spec.mtp_enabled() {
+                    anyhow::bail!(
+                        "--mtp-draft-tokens/--mtp-draft-topk set, but --spec-type auto resolved \
+                         to no speculation: the checkpoint declares no MTP head"
+                    );
+                }
                 ServeSpecType::None
             }
         }
