@@ -96,6 +96,7 @@ EOF
 mkdir -p "$tmp/root/scripts"
 cp "$ROOT/scripts/lever_gate.sh" "$tmp/root/scripts/lever_gate.sh"
 cp "$ROOT/scripts/pick-gpu.sh" "$tmp/root/scripts/pick-gpu.sh"
+cp "$ROOT/scripts/needle_summary.py" "$tmp/root/scripts/needle_summary.py"
 cp "$tmp/needle.py" "$tmp/root/scripts/needle_gate.py"
 
 run_gate() {

@@ -261,7 +261,6 @@ pub(crate) fn dsv4_moe_forward_deepep(
         topk,
         num_sms,
     )?;
-    let _ = total_routes;
     Ok(())
 }
 

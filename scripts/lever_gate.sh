@@ -45,39 +45,26 @@ export RUST_LOG="${RUST_LOG:-info}"
 validate_summary() {
     local log=$1
     local baseline=${2:-}
-    python3 - "$log" "$RUNS" "$LENGTHS" "$baseline" "${LEVER_GATE_REQUIRE_EXACT:-0}" <<'PY'
-import re, sys
+    python3 - "$log" "$RUNS" "$LENGTHS" "$baseline" "${LEVER_GATE_REQUIRE_EXACT:-0}" "$ROOT/scripts" <<'PY'
+import sys
 
-path, runs, lengths, baseline, require_exact = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4], sys.argv[5] == "1"
+path, runs, lengths, baseline, require_exact, scripts = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4], sys.argv[5] == "1", sys.argv[6]
+sys.path.insert(0, scripts)
+from needle_summary import parse_summaries
+
 expected_lengths = [int(x) for x in lengths.split(",") if x]
-summary = re.compile(
-    r"^SUMMARY len=(\d+) .* exact=(\d+) partial=(\d+) miss=(\d+) (?:DET|NONDET)(?: kv=.*)?$"
-)
 
 def load(path):
-    counts = {}
     with open(path, encoding="utf-8") as f:
-        for line in f:
-            if " ERROR " in line:
-                raise SystemExit(f"[gate] request error: {line.strip()}")
-            if not line.startswith("SUMMARY "):
-                continue
-            match = summary.match(line.strip())
-            if match is None:
-                raise SystemExit(f"[gate] malformed summary: {line.strip()}")
-            length, exact, partial, miss = map(int, match.groups())
-            if exact + partial + miss != runs:
-                raise SystemExit(
-                    f"[gate] incomplete summary: {exact}+{partial}+{miss} != runs={runs}"
-                )
-            if length in counts:
-                raise SystemExit(f"[gate] duplicate summary length {length}")
-            counts[length] = (exact, partial, miss)
+        try:
+            counts = parse_summaries(f.read(), runs)
+        except ValueError as err:
+            raise SystemExit(f"[gate] {err}")
     if sorted(counts) != sorted(expected_lengths):
         raise SystemExit(
             f"[gate] summary lengths {sorted(counts)} != expected {sorted(expected_lengths)}"
         )
-    return counts
+    return {length: (r["exact"], r["partial"], r["miss"]) for length, r in counts.items()}
 
 counts = load(path)
 if require_exact:
