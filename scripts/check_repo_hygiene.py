@@ -361,6 +361,34 @@ def check_launcher_boundary() -> list[str]:
     return [f"raw CUDA FFI call outside cuda-kernels (use a typed launcher): {hit}" for hit in hits]
 
 
+# Every implementation id the runtime can report through /v1/stats
+# (`implementation_hits`) must be a registry row, so a counter name and the
+# registry never drift apart: the registry is what the receipts are read against.
+REGISTRY_PATH = Path("operators/registry.toml")
+RUNTIME_COUNTER_PATHS = ("crates/infer-cuda/src",)
+
+
+def check_registry_covers_runtime_counters() -> list[str]:
+    registry = load_text(ROOT / REGISTRY_PATH)
+    registry_ids = set(re.findall(r'^id = "([^"]+)"', registry, re.MULTILINE))
+    try:
+        result = subprocess.run(
+            ["git", "grep", "-I", "-h", "-o", "-E", r'"cuda\.[a-z0-9_]+(\.[a-z0-9_]+)+"', "--", *RUNTIME_COUNTER_PATHS],
+            cwd=ROOT,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+    except FileNotFoundError:
+        return []
+    runtime_ids = {hit.strip('"') for hit in result.stdout.split()}
+    return [
+        f"runtime implementation id {rid!r} has no row in {REGISTRY_PATH}"
+        for rid in sorted(runtime_ids - registry_ids)
+    ]
+
+
 def check_experience_doc_inventory() -> list[str]:
     errors = []
     for rel_path, max_entries in MAX_EXPERIENCE_ENTRIES.items():
@@ -387,6 +415,7 @@ def main() -> int:
     errors.extend(check_repo_wide_disallowed_markers())
     errors.extend(check_workspace_truth_surface())
     errors.extend(check_launcher_boundary())
+    errors.extend(check_registry_covers_runtime_counters())
 
     if errors:
         print("[repo-hygiene] FAIL")
@@ -398,7 +427,7 @@ def main() -> int:
     print(
         "[repo-hygiene] public docs, templates, local links, tracked junk, "
         "repo-wide marker bans, experience entry caps, workspace "
-        "truth-surface, and CUDA launcher-boundary checks all passed"
+        "truth-surface, CUDA launcher-boundary, and registry-coverage checks all passed"
     )
     return 0
 
