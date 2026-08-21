@@ -1385,6 +1385,18 @@ fn try_linear_attention_backward_device(
         return Ok(None);
     };
     let mut carry_grads = GradPairs::new();
+    if std::env::var_os("ARLE_OPD_CARRY_TRACE").is_some() {
+        let rg = |id: Option<TensorId>| id.map(|id| store.tensor(id).map(|t| t.requires_grad));
+        eprintln!(
+            "[carry-trace] la-bwd carries: state={:?} rg={:?} dh0={} window={:?} rg={:?} dwin={}",
+            initial_state,
+            rg(initial_state),
+            device_grads.d_initial_state.is_some(),
+            initial_conv_window,
+            rg(initial_conv_window),
+            device_grads.d_initial_conv_window.is_some()
+        );
+    }
     if let (Some(state_id), Some(dh0)) = (initial_state, device_grads.d_initial_state.clone())
         && store.tensor(state_id)?.requires_grad
     {
