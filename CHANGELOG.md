@@ -59,6 +59,19 @@ ranked their optimisation work turned out to have been taken at the wrong batch.
   bench.
   ([entry](docs/experience/wins/2026-08-21-paged-attention-vector-load.md))
 
+### Eval
+
+- **NVFP4 matches same-base FP8, and the kernel work costs nothing.** 200 items,
+  greedy, FP8 KV, one GPU back to back: NVFP4 with this release **179/200
+  (89.5%)**, NVFP4 control 180/200 (90.0%), `Qwen/Qwen3.8-27B-FP8` **177/200
+  (88.5%)**. At n=200 the binomial spread is ~4.2 items, so all three are
+  indistinguishable — the paged-attention change is quality-neutral, and the
+  4-bit checkpoint matches the 8-bit one on the same base. This closes the
+  measurement debt of comparing Qwen3.8-NVFP4 against Qwen3.6-FP8, two different
+  models. **Not a GSM8K result**: the items come from the repo's own
+  `examples/opd/gsm8k-train.jsonl`, the TRAIN split; only the arm-to-arm
+  difference on identical inputs carries.
+
 ### Verdicts
 
 
@@ -335,6 +348,19 @@ a 6.4x gradient error root-caused to one dropped `* 2` in a byte offset.
 - **DSpark block-draft speculative decoding** (`--spec-type dspark`); unified kernel set; content-addressed prebuilt kernel bundle; strategy-driven agent-OPD harness.
 ### Changed
 - **2026-07-11 — DSv4 decode-region KV reuse default ON** (`6230d9d3d`)
+### Eval
+
+- **NVFP4 matches same-base FP8, and the kernel work costs nothing.** 200 items,
+  greedy, FP8 KV, one GPU back to back: NVFP4 with this release **179/200
+  (89.5%)**, NVFP4 control 180/200 (90.0%), `Qwen/Qwen3.8-27B-FP8` **177/200
+  (88.5%)**. At n=200 the binomial spread is ~4.2 items, so all three are
+  indistinguishable — the paged-attention change is quality-neutral, and the
+  4-bit checkpoint matches the 8-bit one on the same base. This closes the
+  measurement debt of comparing Qwen3.8-NVFP4 against Qwen3.6-FP8, two different
+  models. **Not a GSM8K result**: the items come from the repo's own
+  `examples/opd/gsm8k-train.jsonl`, the TRAIN split; only the arm-to-arm
+  difference on identical inputs carries.
+
 ### Verdicts
 - **2026-07-11 — DSpark draft-KV: cap full-layer at per-request ceiling** (Qwen3.6-27B, CUDA, `1ee72d809`)
 - **2026-07-11 — DSpark/DFlash block-draft spec-decode: P1 LICENSED** (Qwen3.6-27B, CUDA)
