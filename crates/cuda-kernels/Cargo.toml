@@ -31,3 +31,11 @@ toml = "0.8"
 
 [lints]
 workspace = true
+
+# Dev probe: decode-shape W4 GEMM comparison (Marlin vs the sm_90 mixed-input
+# collective). Needs the CUDA toolchain, so it is opt-in rather than a default
+# target.
+[[bin]]
+name = "decode_gemm_probe"
+path = "src/bin/decode_gemm_probe.rs"
+required-features = ["cuda"]
