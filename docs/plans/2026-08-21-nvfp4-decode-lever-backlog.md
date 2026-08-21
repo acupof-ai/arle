@@ -30,62 +30,114 @@ DeepGEMM at 93% of this card's FP8 peak. Everything else is ≤5%.
 Both dominant kernels are already near their hardware ceiling. **The levers that
 remain reduce call count or reduce bytes — not kernel time.**
 
+## The headroom, in one number
+
+Decode reads **20.03 GB of weights per token** (every tensor except the MTP
+layer and `embed_tokens`, scale tensors included — counted off the safetensors
+headers). H20's HBM3 is 4.0 TB/s, so one token cannot cost less than **5.01 ms**.
+Measured c=1 ITL is **20.46 ms**.
+
+**Decode runs at 24.5% of its bandwidth roofline. 4.1x is on the table.**
+
+And `ncu` says why it is not taken: Marlin is at 87% of SM peak — *issue*-bound,
+not bandwidth-bound. It is spending its instruction slots, not its bytes. That
+single fact orders everything below: the levers that reduce **instructions per
+weight byte** come first, and the levers that reduce **bytes** only pay once the
+kernel is actually bandwidth-limited.
+
 ## Ranked
 
-### 1. Re-measure speculative decode — OPEN, highest expected value
+### 1. An sm_90-native mixed-input GEMM to replace Marlin — OPEN, the only 2x-class lever
 
-The only lever that touches Marlin's 68.3%: acceptance turns one verify into
-several committed tokens, so Marlin runs fewer times per output token. At the
-35.1% acceptance already measured, call count drops ~26%.
+**Marlin is an sm_80 kernel running unmodified on Hopper.** Its inner loop is
+`mma.sync.aligned.m16n8k16` with `cp_async` staging
+(`csrc/gemm/marlin/marlin_template.h:86,92,688,784`), and its only architecture
+guard is `__CUDA_ARCH__ < 800`. There is no `wgmma` and no TMA anywhere in it.
 
-It is currently recorded as a **large net loss** — MTP d=2 at −77%, DSpark
-block 6 at −72%
-([wins/2026-08-19-nvfp4-marlin-tensorcore.md](../experience/wins/2026-08-19-nvfp4-marlin-tensorcore.md)).
-That entry corrects its own attribution: the cause was
-`try_fp8_dequant_bf16_gemm_batch` firing at `M >= 2` and re-dequantising all
-11.56 G FP8 params per verify (84.35 ms per forward, 84% of the M=3 budget), and
-it says in as many words that the numbers stand as *measurements of the defective
-build*.
+That is exactly the wrong shape for an issue-bound kernel on sm_90:
 
-**That defect was fixed, and the whole prefill path has since been rewritten.**
-Nobody has re-run it. Acceptance was never the problem — at 35.1% even a perfect
-implementation was losing, which is the signature of a per-call cost, not a
-hit-rate.
+| | Marlin (sm_80 path) | sm_90 native |
+|---|---|---|
+| MMA | `mma.sync` m16n8k16, one per warp | `wgmma` m64nNk16, one per **warpgroup** |
+| weight staging | `cp.async`, per-thread address math | TMA, one descriptor per tile |
+| pipeline | synchronous warps | producer/consumer warp specialisation |
 
-Cost: no code. Three serve configurations on one binary.
-Settles it: no-spec / MTP d=2 / MTP d=4 on the 32K chain, same dataset, ITL and
-end-to-end.
+Each row removes issue slots per unit of math — the quantity `ncu` says is
+binding. Nothing about occupancy, tiles or bank conflicts does, which is why
+[the three occupancy tunings](../experience/errors/2026-08-19-marlin-decode-is-not-occupancy-limited.md)
+all failed.
 
-### 2. Checkpoint quantisation composition — OPEN
+**The machinery is already in this tree.** The DSv4 W4A8 MoE path vendors
+CUTLASS's sm_90 mixed-input warp-specialised collective —
+`csrc/moe/w4a8/cutlass_extensions/gemm/collective/sm90_mma_array_tma_gmma_rs_warpspecialized_mixed_input_.hpp`
+plus its builder and four supporting headers. It is a *grouped* GEMM built for
+MoE; the dense decode shape needs the same collective with a different tile and
+scheduler.
 
-Only **54% of parameters are 4-bit** (7.49 GB U8 against 11.56 GB F8_E4M3);
-attention, `lm_head` and layers 56-63 are per-channel FP8. This is the only lever
-that attacks prefill and decode at once, because it changes how many bytes Marlin
-and DeepGEMM read rather than how fast they read them.
+**Upstream reference: vLLM's Machete**, which exists for precisely this reason —
+a CUTLASS 3.x mixed-input W4 GEMM written because Marlin's Ampere-era `mma.sync`
+core leaves Hopper's wgmma/TMA path unused. Port before invent.
 
-Rough shape: an all-4-bit checkpoint would be ~15 GB resident against today's
-22.4 GB.
+**The tradeoff, named.** `wgmma` has a hard M=64 minimum per warpgroup. At
+decode M=1-16 that wastes 75-98% of the MMA lanes. *That is the hypothesis under
+test*: wasted math is free if HBM is the real limit, and the 24.5%-of-roofline
+number says it is. If a small-M `wgmma` config lands below Marlin, the
+conclusion is that decode is issue-bound for a reason other than the MMA core,
+and the axis dies with a measurement.
 
-Risk, and it is real: re-quantising already-quantised FP8 to FP4 compounds error,
-and the original BF16 weights are not on the box. Must be proven on a few layers
-with the eval before any full conversion.
+**Do not start by writing a kernel.** The pre-test is a standalone benchmark of
+the existing DSv4 W4A8 collective against `marlin_fp4_gemm` at the dense decode
+shapes (M in 1,4,8,16; N=34816/5120; K=5120/17408). One binary, no runtime
+changes, and it settles the axis before any dispatch work.
 
-### 3. `gdr_decode_batch_kernel` — OPEN, unexamined
+### 2. `gdr_decode_batch_kernel` — OPEN, unexamined
 
 13.0% of decode GPU time, 398.7 ms over 9,792 launches, 40.7 µs each. No `ncu`
 has ever been run on it. Unknown whether it is near a ceiling or has the kind of
 headroom the NVFP4 widen kernel turned out to have (4.0x, from two
 divergently-indexed tables).
 
-Cost: one `ncu` run. Settles whether it is a lever at all.
+Cost: one `ncu` run — the cheapest information in this document. Settles whether
+it is a lever at all.
 
-### 4. Same-base FP4 vs FP8 — OPEN (measurement, not an optimisation)
+### 3. Wave quantisation on the Marlin launch grid — OPEN, bounded
 
-Every comparison in `baselines.md` and both READMEs is Qwen3.8-27B-NVFP4 against
-Qwen3.6-27B-**FP8** — two different models. `Qwen/Qwen3.8-27B-FP8` is now at
-`/data00/Qwen3.8-27B-FP8` (29 GB, from ModelScope; the pod has no HF but
-ModelScope is reachable). Re-running the chain and the eval against it is the
-first honest answer to "what does FP4 buy on this model".
+Decode is a tall-skinny GEMM (M=1-16 against N=34816). If `N / tile_n` leaves a
+partial wave across the SMs, the tail costs a full wave and the fix is one
+constant. `ncu --metrics launch__waves_per_multiprocessor` on the four instances
+answers it. Independent of #1 and cheap enough to run in the same session.
+
+Distinct from the occupancy tunings already killed: those raised *blocks per SM*;
+this is about whether the *total block count* divides the machine.
+
+### 4. Re-quantise the per-channel FP8 weights to NVFP4 — OPEN, but only after #1
+
+38.2% of the parameters (10.62 B) are stored per-channel FP8 at one byte each.
+NVFP4 would halve them, cutting the per-token read ~5 GB — a 25% lower
+bandwidth floor.
+
+**It buys nothing today.** At 24.5% of roofline the kernel is not waiting on
+bytes, so removing bytes moves nothing; this is a post-#1 lever by construction.
+It also costs a checkpoint rebuild and puts 4-bit error on the attention
+weights, which are the sensitive ones. Listed so it is not mistaken for a
+current option.
+
+## Measurement debt — not optimisations, but the numbers rest on them
+
+- **Same-base FP4 vs FP8.** Every comparison in `baselines.md` and both READMEs
+  is Qwen3.8-27B-NVFP4 against Qwen3.6-27B-**FP8** — two different models.
+  `Qwen/Qwen3.8-27B-FP8` is now at `/data00/Qwen3.8-27B-FP8` (29 GB, from
+  ModelScope; the pod has no HF, ModelScope is reachable). Re-running the chain
+  and the eval against it is the first honest answer to "what does FP4 buy on
+  this model".
+- **Speculative decode is recorded as a large net loss** (MTP d=2 at -77%,
+  DSpark block 6 at -72%,
+  [wins/2026-08-19](../experience/wins/2026-08-19-nvfp4-marlin-tensorcore.md)) —
+  measured on a build whose `try_fp8_dequant_bf16_gemm_batch` re-dequantised
+  11.56 G FP8 params per verify. That defect is fixed and the prefill path has
+  since been rewritten; the recorded numbers no longer describe this binary.
+- **Checkpoint composition**, counted 2026-08-21: NVFP4 14.97 B (53.9%),
+  per-channel FP8 10.62 B (38.2%), BF16 2.18 B (7.9%), total 27.78 B.
 
 ## Closed — rejected on measurement
 
