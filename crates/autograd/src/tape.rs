@@ -966,6 +966,10 @@ impl Tape {
                 let output_grad_reused = input_grads
                     .iter()
                     .any(|(_, grad_id)| *grad_id == output_grad_id);
+                if carry_trace && entry.op == BackwardOp::LinearAttention {
+                    let ids: Vec<TensorId> = input_grads.iter().map(|(id, _)| *id).collect();
+                    eprintln!("[carry-trace] la-bwd pushed grads for {ids:?}");
+                }
                 for (input_id, grad_id) in input_grads {
                     merge_grad(
                         &mut grads,
