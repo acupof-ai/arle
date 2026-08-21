@@ -6,8 +6,9 @@
 // the table names, which is 5x the KV traffic of this path (1 byte/elem in +
 // 2 bytes/elem out + 2 bytes/elem FA3 read vs 1 byte/elem in here).
 //
-// FA3-inspired persistent split-KV: one CTA per (batch row, query head,
-// split), grid [num_q_heads * num_splits, batch]; each CTA walks its KV token
+// FA3-inspired persistent split-KV: one CTA per (batch row, group of
+// `heads_per_cta` q-heads sharing a kv-head, split), grid
+// [num_q_heads / heads_per_cta * num_splits, batch]; each CTA walks its KV token
 // range through the rectangular page table (the same metadata the FA3 lane
 // consumes) and writes a partial (o, m, l); a merge kernel combines the
 // splits. Decode-shaped: exactly one query token per batch row (the caller
@@ -87,8 +88,13 @@ __device__ __forceinline__ float paf3_warp_reduce_sum(float val) {
 // Partial (o, m, l) for one (batch row, q-head, split). The four warps stride
 // over the split's token range, then merge in shared memory — the same
 // reduction as decode_attention_varlen_quantized.cu.
-template <int HEAD_DIM, bool INT8_KV>
-__global__ void paged_attention_quantized_fa3_partial_kernel(
+// One CTA covers `H` consecutive q-heads that share a kv-head: the KV row is
+// loaded and dequantised once and reused for all H dot products (the kernel
+// was issue-bound on per-q-head dequant, not on bytes — ncu 2026-08-21). Q
+// lives in shared memory so the H x EPT accumulator fits the register budget.
+template <int HEAD_DIM, bool INT8_KV, int H>
+__global__ void __launch_bounds__(PAF3_BLOCK_SIZE, 4)
+paged_attention_quantized_fa3_partial_kernel(
     const __nv_bfloat16* __restrict__ Q,
     const void* __restrict__ K_pool,
     const void* __restrict__ V_pool,
@@ -110,10 +116,11 @@ __global__ void paged_attention_quantized_fa3_partial_kernel(
 {
     constexpr int EPT = HEAD_DIM / PAF3_WARP_SIZE;
 
-    const int q_head = blockIdx.x / num_splits;
+    const int group = blockIdx.x / num_splits;
     const int split = blockIdx.x % num_splits;
     const int b = blockIdx.y;
-    if (q_head >= num_q_heads) return;
+    const int q_head0 = group * H;
+    if (q_head0 >= num_q_heads) return;
 
     const int warp_id = threadIdx.x / PAF3_WARP_SIZE;
     const int lane_id = threadIdx.x % PAF3_WARP_SIZE;
@@ -121,19 +128,19 @@ __global__ void paged_attention_quantized_fa3_partial_kernel(
     const int kv_len = seqused_k[b];
     const int q_token = cu_seqlens_q[b];
     const int gqa_ratio = num_q_heads / num_kv_heads;
-    const int kv_head = q_head / gqa_ratio;
+    const int kv_head = q_head0 / gqa_ratio;
     const int kv_dim = num_kv_heads * HEAD_DIM;
 
     const int qh_stride = total_q * num_q_heads;
-    const int out_idx = split * qh_stride + q_token * num_q_heads + q_head;
+    const int out_idx0 = split * qh_stride + q_token * num_q_heads + q_head0;
 
     auto write_empty_partial = [&]() {
-        if (threadIdx.x == 0) {
-            partial_m[out_idx] = -FLT_MAX;
-            partial_l[out_idx] = 0.0f;
+        if (threadIdx.x < H) {
+            partial_m[out_idx0 + threadIdx.x] = -FLT_MAX;
+            partial_l[out_idx0 + threadIdx.x] = 0.0f;
         }
-        if (threadIdx.x < HEAD_DIM) {
-            partial_out[(size_t)out_idx * HEAD_DIM + threadIdx.x] = 0.0f;
+        for (int e = threadIdx.x; e < H * HEAD_DIM; e += PAF3_BLOCK_SIZE) {
+            partial_out[(size_t)out_idx0 * HEAD_DIM + e] = 0.0f;
         }
     };
 
@@ -150,21 +157,29 @@ __global__ void paged_attention_quantized_fa3_partial_kernel(
         return;
     }
 
-    float q_reg[EPT];
+    __shared__ __align__(16) float smem_q[H * HEAD_DIM];
+    __shared__ float smem_m[PAF3_NUM_WARPS * H];
+    __shared__ float smem_l[PAF3_NUM_WARPS * H];
+    __shared__ __align__(16) float smem_o[PAF3_NUM_WARPS * H * HEAD_DIM];
+
     {
-        const int q_base = q_token * num_q_heads * HEAD_DIM + q_head * HEAD_DIM;
-        #pragma unroll
-        for (int i = 0; i < EPT; i++) {
-            const int d = lane_id * EPT + i;
-            q_reg[i] = __bfloat162float(Q[q_base + d]) * sm_scale;
+        const int q_base = q_token * num_q_heads * HEAD_DIM + q_head0 * HEAD_DIM;
+        for (int e = threadIdx.x; e < H * HEAD_DIM; e += PAF3_BLOCK_SIZE) {
+            smem_q[e] = __bfloat162float(Q[q_base + e]) * sm_scale;
         }
     }
+    __syncthreads();
 
-    float o_reg[EPT];
+    float o_reg[H][EPT];
+    float m_local[H];
+    float l_local[H];
     #pragma unroll
-    for (int i = 0; i < EPT; i++) o_reg[i] = 0.0f;
-    float m_local = -FLT_MAX;
-    float l_local = 0.0f;
+    for (int h = 0; h < H; h++) {
+        #pragma unroll
+        for (int i = 0; i < EPT; i++) o_reg[h][i] = 0.0f;
+        m_local[h] = -FLT_MAX;
+        l_local[h] = 0.0f;
+    }
 
     for (int t = tok_start + warp_id; t < tok_end; t += PAF3_NUM_WARPS) {
         const int phys = page_table[b * page_table_stride + t / page_size];
@@ -176,77 +191,91 @@ __global__ void paged_attention_quantized_fa3_partial_kernel(
 
         Paf3LaneBytes<EPT> k_bytes;
         k_bytes.load(reinterpret_cast<const uint8_t*>(K_pool) + row_off + lane_id * EPT);
-        float qk = 0.0f;
+        float kf[EPT];
         #pragma unroll
-        for (int i = 0; i < EPT; i++) {
-            qk += q_reg[i] * k_bytes.raw(i, INT8_KV);
-        }
-        qk = paf3_warp_reduce_sum(qk) * K_scales[scale_idx];
+        for (int i = 0; i < EPT; i++) kf[i] = k_bytes.raw(i, INT8_KV);
+        const float k_scale = K_scales[scale_idx];
 
-        const float m_new = fmaxf(m_local, qk);
-        const float exp_diff = __expf(m_local - m_new);
-        const float exp_qk = __expf(qk - m_new);
-        const float l_new = l_local * exp_diff + exp_qk;
+        float qk[H];
+        #pragma unroll
+        for (int h = 0; h < H; h++) {
+            float acc = 0.0f;
+            #pragma unroll
+            for (int i = 0; i < EPT; i++) {
+                acc += smem_q[h * HEAD_DIM + lane_id * EPT + i] * kf[i];
+            }
+            qk[h] = acc;
+        }
+        #pragma unroll
+        for (int h = 0; h < H; h++) {
+            qk[h] = paf3_warp_reduce_sum(qk[h]) * k_scale;
+        }
 
         Paf3LaneBytes<EPT> v_bytes;
         v_bytes.load(reinterpret_cast<const uint8_t*>(V_pool) + row_off + lane_id * EPT);
-        // One multiply folds `exp_qk` and the V scale together for the whole row.
-        const float exp_v = exp_qk * V_scales[scale_idx];
+        float vf[EPT];
+        #pragma unroll
+        for (int i = 0; i < EPT; i++) vf[i] = v_bytes.raw(i, INT8_KV);
+        const float v_scale = V_scales[scale_idx];
+
+        #pragma unroll
+        for (int h = 0; h < H; h++) {
+            const float m_new = fmaxf(m_local[h], qk[h]);
+            const float exp_diff = __expf(m_local[h] - m_new);
+            const float exp_qk = __expf(qk[h] - m_new);
+            l_local[h] = l_local[h] * exp_diff + exp_qk;
+            m_local[h] = m_new;
+            const float exp_v = exp_qk * v_scale;
+            #pragma unroll
+            for (int i = 0; i < EPT; i++) {
+                o_reg[h][i] = o_reg[h][i] * exp_diff + exp_v * vf[i];
+            }
+        }
+    }
+
+    #pragma unroll
+    for (int h = 0; h < H; h++) {
+        if (lane_id == 0) {
+            smem_m[warp_id * H + h] = m_local[h];
+            smem_l[warp_id * H + h] = l_local[h];
+        }
+        // `[lane * EPT + i]` keeps a lane's floats contiguous so nvcc merges
+        // the stores into STS.128; the bank conflict costs less than losing it.
         #pragma unroll
         for (int i = 0; i < EPT; i++) {
-            o_reg[i] = o_reg[i] * exp_diff + exp_v * v_bytes.raw(i, INT8_KV);
+            smem_o[(warp_id * H + h) * HEAD_DIM + lane_id * EPT + i] = o_reg[h][i];
         }
-        m_local = m_new;
-        l_local = l_new;
-    }
-
-    __shared__ float smem_m[PAF3_NUM_WARPS];
-    __shared__ float smem_l[PAF3_NUM_WARPS];
-    __shared__ float smem_o[PAF3_NUM_WARPS * HEAD_DIM];
-
-    if (lane_id == 0) {
-        smem_m[warp_id] = m_local;
-        smem_l[warp_id] = l_local;
-    }
-    // `[l * EPT + i]` keeps a lane's EPT floats contiguous, which nvcc merges
-    // into STS.128. It carries an 8-way bank conflict, but the conflict-free
-    // `[i * 32 + l]` index scatters the lane's floats 32 apart and loses the
-    // merge: SASS traded 32 STS.128 for 96 scalar LDS. The merge is worth more
-    // — this staging is 430k wavefronts against a 9.6M-cycle kernel.
-    #pragma unroll
-    for (int i = 0; i < EPT; i++) {
-        smem_o[warp_id * HEAD_DIM + lane_id * EPT + i] = o_reg[i];
     }
     __syncthreads();
 
-    if (warp_id == 0) {
-        float final_m = smem_m[0];
-        float final_l = smem_l[0];
+    // Warp w merges head w, w+4, ... across the four token-strided warps.
+    for (int h = warp_id; h < H; h += PAF3_NUM_WARPS) {
+        float final_m = smem_m[h];
+        float final_l = smem_l[h];
         float final_o[EPT];
         #pragma unroll
         for (int i = 0; i < EPT; i++) {
-            final_o[i] = smem_o[lane_id * EPT + i];
+            final_o[i] = smem_o[h * HEAD_DIM + lane_id * EPT + i];
         }
-
         #pragma unroll
         for (int w = 1; w < PAF3_NUM_WARPS; w++) {
-            const float m_w = smem_m[w];
-            const float l_w = smem_l[w];
+            const float m_w = smem_m[w * H + h];
+            const float l_w = smem_l[w * H + h];
             if (l_w == 0.0f) continue;
 
             const float m_new = fmaxf(final_m, m_w);
             const float scale_prev = __expf(final_m - m_new);
             const float scale_w = __expf(m_w - m_new);
-
             #pragma unroll
             for (int i = 0; i < EPT; i++) {
-                const float o_w = smem_o[w * HEAD_DIM + lane_id * EPT + i];
+                const float o_w = smem_o[(w * H + h) * HEAD_DIM + lane_id * EPT + i];
                 final_o[i] = final_o[i] * scale_prev + o_w * scale_w;
             }
             final_l = final_l * scale_prev + l_w * scale_w;
             final_m = m_new;
         }
 
+        const int out_idx = out_idx0 + h;
         if (lane_id == 0) {
             partial_m[out_idx] = final_m;
             partial_l[out_idx] = final_l;
@@ -254,8 +283,7 @@ __global__ void paged_attention_quantized_fa3_partial_kernel(
         const float inv_l = (final_l > 0.0f) ? (1.0f / final_l) : 0.0f;
         #pragma unroll
         for (int i = 0; i < EPT; i++) {
-            const int d = lane_id * EPT + i;
-            partial_out[(size_t)out_idx * HEAD_DIM + d] = final_o[i] * inv_l;
+            partial_out[(size_t)out_idx * HEAD_DIM + lane_id * EPT + i] = final_o[i] * inv_l;
         }
     }
 }
@@ -342,6 +370,7 @@ cudaError_t paged_attention_quantized_fa3_cuda(
     float sm_scale,
     bool is_fp8,
     int num_splits,
+    int heads_per_cta,
     cudaStream_t stream,
     void* workspace,
     size_t workspace_bytes)
@@ -350,6 +379,12 @@ cudaError_t paged_attention_quantized_fa3_cuda(
         page_size <= 0 || page_table_stride <= 0 || num_splits <= 0 ||
         num_splits > kMaxSplits || num_q_heads % num_kv_heads != 0 ||
         (head_dim != 128 && head_dim != 256)) {
+        return cudaErrorInvalidValue;
+    }
+    // `heads_per_cta` must tile the GQA group so every head in a CTA shares
+    // one kv-head; the instantiated set is what the caller may pick from.
+    const int gqa_ratio = num_q_heads / num_kv_heads;
+    if (heads_per_cta <= 0 || gqa_ratio % heads_per_cta != 0) {
         return cudaErrorInvalidValue;
     }
     if (q_packed == nullptr || k_pool == nullptr || v_pool == nullptr ||
@@ -368,26 +403,35 @@ cudaError_t paged_attention_quantized_fa3_cuda(
     float* partial_m = partial_out + (size_t)num_splits * qh * head_dim;
     float* partial_l = partial_m + (size_t)num_splits * qh;
 
-    const dim3 grid(num_q_heads * num_splits, batch);
+    const dim3 grid((num_q_heads / heads_per_cta) * num_splits, batch);
     const dim3 block(PAF3_BLOCK_SIZE);
 
     cudaError_t err = cudaSuccess;
-#define LAUNCH_PARTIAL(HD, INT8)                                             \
-    paged_attention_quantized_fa3_partial_kernel<HD, INT8>                   \
+#define LAUNCH_PARTIAL_H(HD, INT8, HPC)                                      \
+    paged_attention_quantized_fa3_partial_kernel<HD, INT8, HPC>              \
         <<<grid, block, 0, stream>>>(                                        \
             q_packed, k_pool, v_pool, k_scales, v_scales, page_table,        \
             cu_seqlens_q, seqused_k, partial_out, partial_m, partial_l,      \
             num_q_heads, num_kv_heads, page_size, page_table_stride,         \
             total_q, sm_scale, num_splits)
+#define LAUNCH_PARTIAL(HD, INT8)                                             \
+    switch (heads_per_cta) {                                                 \
+        case 1: LAUNCH_PARTIAL_H(HD, INT8, 1); break;                        \
+        case 2: LAUNCH_PARTIAL_H(HD, INT8, 2); break;                        \
+        case 3: LAUNCH_PARTIAL_H(HD, INT8, 3); break;                        \
+        case 4: LAUNCH_PARTIAL_H(HD, INT8, 4); break;                        \
+        case 6: LAUNCH_PARTIAL_H(HD, INT8, 6); break;                        \
+        case 8: LAUNCH_PARTIAL_H(HD, INT8, 8); break;                        \
+        default: return cudaErrorInvalidValue;                               \
+    }
 
     if (head_dim == 128) {
-        if (is_fp8) LAUNCH_PARTIAL(128, false);
-        else LAUNCH_PARTIAL(128, true);
+        if (is_fp8) { LAUNCH_PARTIAL(128, false) } else { LAUNCH_PARTIAL(128, true) }
     } else {
-        if (is_fp8) LAUNCH_PARTIAL(256, false);
-        else LAUNCH_PARTIAL(256, true);
+        if (is_fp8) { LAUNCH_PARTIAL(256, false) } else { LAUNCH_PARTIAL(256, true) }
     }
 #undef LAUNCH_PARTIAL
+#undef LAUNCH_PARTIAL_H
     err = cudaGetLastError();
     if (err != cudaSuccess) return err;
 

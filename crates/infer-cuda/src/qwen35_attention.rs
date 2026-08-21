@@ -657,8 +657,7 @@ impl Qwen35Model {
                                         .into_iter()
                                         .find(|&h| {
                                             (q_heads / kv_heads.max(1)) % h == 0
-                                                && meta.batch.max(1) * (q_heads / h) * 16
-                                                    >= 2 * sm
+                                                && meta.batch.max(1) * (q_heads / h) * 16 >= 2 * sm
                                         })
                                         .unwrap_or(1);
                                     let splits = (sm
