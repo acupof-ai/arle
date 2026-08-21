@@ -815,6 +815,9 @@ impl Qwen35Model {
                                         // -inf lse + zero out; the cross-cp merge then
                                         // weights this rank at zero.
                                         let neg_inf = vec![f32::NEG_INFINITY; accum_rows];
+                                        // SAFETY: `softmax_lse_ptr` is a live `accum_rows`-f32
+                                        // region on `self.ctx.stream`; `neg_inf` is pageable, so
+                                        // the driver stages it before returning and it may drop.
                                         unsafe {
                                             cudarc::driver::result::memcpy_htod_async(
                                                 softmax_lse_ptr,
@@ -826,6 +829,8 @@ impl Qwen35Model {
                                             anyhow!("2D empty-shard lse fill failed: {e}")
                                         })?;
                                         let sect = accum_rows * c.head_dim;
+                                        // SAFETY: `ao_ptr` is a live bf16 output of `sect`
+                                        // elements (`sect * 2` bytes) on `self.ctx.stream`.
                                         unsafe {
                                             cudarc::driver::result::memset_d8_async(
                                                 ao_ptr,

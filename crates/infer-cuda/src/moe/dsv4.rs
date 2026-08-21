@@ -390,8 +390,10 @@ pub(crate) fn dsv4_moe_forward(
         })?;
 
     #[cfg(all(feature = "cuda", feature = "nccl"))]
-    if model.mega_moe.is_some() && layer.w13_w4a16.is_none() && layer.w13_w4afp8.is_none() {
-        let mega_moe = model.mega_moe.as_ref().unwrap();
+    if let Some(mega_moe) = model.mega_moe.as_ref()
+        && layer.w13_w4a16.is_none()
+        && layer.w13_w4afp8.is_none()
+    {
         mega_moe.assert_forward_epoch(
             _mega_epoch.ok_or_else(|| anyhow::anyhow!("DSv4 MegaMoE forward epoch missing"))?,
             num_tokens,
@@ -880,6 +882,9 @@ fn dsv4_moe_forward_w4a16(
     keepalive.keep_i32(&offsets);
     keepalive.keep_i32(&scan_total);
 
+    // SAFETY: `route_indices` holds `num_tokens * topk` global expert ids;
+    // `counts`/`offsets` hold `experts_per_rank` i32 and `scan_total` one, all
+    // keepalive-held and enqueued on `ctx.stream`.
     unsafe {
         moe::dsv4_count_local_experts(
             cache_ptr(route_indices, ctx),
@@ -914,6 +919,9 @@ fn dsv4_moe_forward_w4a16(
     keepalive.keep_f32(&packed_weight);
     keepalive.keep_i32(&cursors);
 
+    // SAFETY: `hidden`/`route_indices`/`route_weights` hold `num_tokens` rows × `topk`
+    // routes; packed_* hold `rows = max(total_routes, 1)`, `cursors`/`offsets`
+    // `experts_per_rank`; all keepalive-held on `ctx.stream`.
     unsafe {
         moe::dsv4_pack_local_experts_with_slots(
             cache_ptr(&hidden.data, ctx),
@@ -938,6 +946,9 @@ fn dsv4_moe_forward_w4a16(
     keepalive.keep_hidden(&gate_out);
     keepalive.keep_hidden(&up_out);
 
+    // SAFETY: `tables` are the layer-resident W4A16 expert tables for
+    // `experts_per_rank` experts; `packed_hidden` is [rows, hidden_dim] and
+    // `gate_out`/`up_out` [rows, i_dim], keepalive-held on `ctx.stream`.
     unsafe {
         moe::moe_w4a16_grouped_gemv_pair_batch(
             &tables.gate_w,
@@ -963,6 +974,7 @@ fn dsv4_moe_forward_w4a16(
 
     let act = HiddenStates::zeros(ctx, i_dim, rows)?;
     keepalive.keep_hidden(&act);
+    // SAFETY: `gate_out`, `up_out` and `act` each hold `rows * i_dim` bf16 on `ctx.stream`.
     unsafe {
         moe::dsv4_swiglu_clamped_batch(
             cache_ptr(&gate_out.data, ctx),
@@ -976,6 +988,8 @@ fn dsv4_moe_forward_w4a16(
 
     let expert_out = HiddenStates::zeros(ctx, hidden_dim, rows)?;
     keepalive.keep_hidden(&expert_out);
+    // SAFETY: `tables.w2_*` are the layer-resident W4A16 down tables; `act` is
+    // [rows, i_dim] and `expert_out` [rows, hidden_dim], keepalive-held on `ctx.stream`.
     unsafe {
         moe::moe_w4a16_grouped_gemv_batch(
             &tables.w2_w,
@@ -998,6 +1012,9 @@ fn dsv4_moe_forward_w4a16(
 
     let route_out = HiddenStates::zeros(ctx, hidden_dim, rows)?;
     keepalive.keep_hidden(&route_out);
+    // SAFETY: `expert_out`/`route_out` are [rows, hidden_dim], `out` is
+    // [num_tokens, hidden_dim]; `packed_route_slot` is -1 on padding rows, which
+    // the scatter skips; all on `ctx.stream`.
     unsafe {
         moe::dsv4_scatter_all_route_slots(
             cache_ptr(&expert_out.data, ctx),
@@ -1065,6 +1082,9 @@ fn dsv4_moe_forward_w4afp8(
     keepalive.keep_i32(&offsets);
     keepalive.keep_i32(&scan_total);
 
+    // SAFETY: `route_indices` holds `num_tokens * topk` global expert ids;
+    // `counts`/`offsets` hold `experts_per_rank` i32 and `scan_total` one, all
+    // keepalive-held and enqueued on `ctx.stream`.
     unsafe {
         moe::dsv4_count_local_experts(
             cache_ptr(route_indices, ctx),
@@ -1099,6 +1119,9 @@ fn dsv4_moe_forward_w4afp8(
     keepalive.keep_f32(&packed_weight);
     keepalive.keep_i32(&cursors);
 
+    // SAFETY: `hidden`/`route_indices`/`route_weights` hold `num_tokens` rows × `topk`
+    // routes; packed_* hold `rows = max(total_routes, 1)`, `cursors`/`offsets`
+    // `experts_per_rank`; all keepalive-held on `ctx.stream`.
     unsafe {
         moe::dsv4_pack_local_experts_with_slots(
             cache_ptr(&hidden.data, ctx),
@@ -1122,6 +1145,8 @@ fn dsv4_moe_forward_w4afp8(
     // (metadata = 17 KB, CUTLASS ws typically <16 MB); 32 MB is safe.
     // CUTLASS only writes the workspace, so no zero-fill.
     let ws_bytes = 32 * 1024 * 1024;
+    // SAFETY: CUTLASS only writes the workspace before reading it, so it needs no
+    // zero-fill; the allocation is keepalive-held for the forward.
     let workspace = unsafe { ctx.stream.alloc::<u8>(ws_bytes) }
         .map_err(|e| anyhow::anyhow!("DSv4 W4AFP8 workspace alloc failed: {e}"))?;
     keepalive.keep_u8(&workspace);
@@ -1149,6 +1174,9 @@ fn dsv4_moe_forward_w4afp8(
     let gateup_out = HiddenStates::zeros(ctx, 2 * i_dim, rows)?;
     keepalive.keep_hidden(&gateup_out);
 
+    // SAFETY: `packed_hidden`/`packed_fp8` hold `rows * hidden_dim`, `gateup_out`
+    // [rows, 2*i_dim]; `w13` weights/scales are layer-resident for `experts_per_rank`
+    // experts and `workspace` is `ws_bytes`; all keepalive-held on `ctx.stream`.
     unsafe {
         moe::w4a8_per_tensor_fp8_quant(
             cache_ptr(&packed_hidden.data, ctx),
@@ -1188,6 +1216,7 @@ fn dsv4_moe_forward_w4afp8(
     // Fused SwiGLU on the CUTLASS [rows, 2*i_dim] output → [rows, i_dim].
     let act = HiddenStates::zeros(ctx, i_dim, rows)?;
     keepalive.keep_hidden(&act);
+    // SAFETY: `gateup_out` holds `rows * 2 * i_dim` bf16 and `act` `rows * i_dim`, on `ctx.stream`.
     unsafe {
         moe::w4a8_swiglu_fused(
             cache_ptr(&gateup_out.data, ctx),
@@ -1208,6 +1237,9 @@ fn dsv4_moe_forward_w4afp8(
     let expert_out = HiddenStates::zeros(ctx, hidden_dim, rows)?;
     keepalive.keep_hidden(&expert_out);
 
+    // SAFETY: `act`/`act_fp8` hold `rows * i_dim`, `expert_out` [rows, hidden_dim];
+    // `w2` weights/scales are layer-resident for `experts_per_rank` experts and
+    // `workspace` is `ws_bytes`; all keepalive-held on `ctx.stream`.
     unsafe {
         moe::w4a8_per_tensor_fp8_quant(
             cache_ptr(&act.data, ctx),
@@ -1247,6 +1279,9 @@ fn dsv4_moe_forward_w4afp8(
     // Scatter + combine (same as W4A16 lane).
     let route_out = HiddenStates::zeros(ctx, hidden_dim, rows)?;
     keepalive.keep_hidden(&route_out);
+    // SAFETY: `expert_out`/`route_out` are [rows, hidden_dim], `out` is
+    // [num_tokens, hidden_dim]; `packed_route_slot` is -1 on padding rows, which
+    // the scatter skips; all on `ctx.stream`.
     unsafe {
         moe::dsv4_scatter_all_route_slots(
             cache_ptr(&expert_out.data, ctx),

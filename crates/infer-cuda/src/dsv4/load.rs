@@ -570,6 +570,9 @@ fn encode_f8_e4m3fn_sat(val: f32) -> u8 {
     sign | (fp8_biased_exp << 3) | (fp8_mant_raw as u8)
 }
 
+/// NVFP4→W4AFP8 per-tensor conversion result: (packed int4 weights, bf16 scales, n, k, scale_rows).
+type W4Afp8Converted = (Vec<u8>, Vec<u8>, usize, usize, usize);
+
 #[allow(dead_code)]
 impl SafetensorLoader {
     /// Load a DSv4 1D norm/bias vector — BF16 or F32 in the checkpoint, normalized to
@@ -1343,7 +1346,7 @@ impl SafetensorLoader {
             // NVFP4 → W4AFP8: convert E2M1+E8M0 to INT4+BF16 on GPU per expert,
             // download, fuse w1+w3 on host, upload.
             let e8m0_name = |w: &str| w.trim_end_matches(".weight").to_string() + ".scale";
-            let convert = |w_name: &str| -> Result<(Vec<u8>, Vec<u8>, usize, usize, usize)> {
+            let convert = |w_name: &str| -> Result<W4Afp8Converted> {
                 let weight = self.load_raw_tensor(w_name)?;
                 let scale = self.load_raw_tensor(&e8m0_name(w_name))?;
                 if weight.shape.len() != 2 {
@@ -1371,6 +1374,8 @@ impl SafetensorLoader {
                     .stream
                     .alloc_zeros::<u8>(scale_rows * n * 4 * 2)
                     .map_err(|e| anyhow!("NVFP4 dst scale alloc failed: {e}"))?;
+                // SAFETY: all four buffers are live device allocations on `ctx.stream`,
+                // sized from the tensor shape (`n*k/2` packed weights, `scale_rows*n*8` scales).
                 unsafe {
                     cuda_kernels::moe::nvfp4_to_w4afp8(
                         cuda_kernels::tensor::cache_ptr(&src_w, ctx).cast::<i8>(),

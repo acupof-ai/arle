@@ -845,7 +845,9 @@ impl Qwen35SlotState {
                 image.conv_host.first().map_or(0, Vec::len),
             );
             ensure!(
-                dec_gdr > 0 && gdr_state_len % dec_gdr == 0 && conv_len % dec_conv == 0,
+                dec_gdr > 0
+                    && gdr_state_len.is_multiple_of(dec_gdr)
+                    && conv_len.is_multiple_of(dec_conv),
                 "Qwen3.6 swap-in decode-pair dims {dec_gdr}/{dec_conv} do not divide \
                  full {gdr_state_len}/{conv_len}"
             );
