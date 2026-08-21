@@ -313,7 +313,32 @@ fn resolve_config(args: &Args, serve_args: &ServeArgs) -> Result<ServeConfig, St
         engine_config.max_prompt_tokens = max_ctx;
         engine_config.max_total_tokens = max_ctx;
     }
-    let spec = resolve_spec_options(backend, serve_args);
+    let mut spec = resolve_spec_options(backend, serve_args);
+    // Resolve `auto` here, not just in `serve_http`: the multiproc coordinator
+    // serializes only engine_config into ARLE_WORKER_ENGINE_CONFIG and never
+    // runs serve_http's lowering, so an unresolved Auto would reach worker
+    // ranks as `mtp_draft_tokens=None` and silently skip the MTP head.
+    // resolve_spec_options maps Auto to None off CUDA, so Auto here means CUDA.
+    if spec.spec_type == ServeSpecType::Auto {
+        let head = infer_api::checkpoint_has_mtp_head(&model_path);
+        log::info!(
+            "--spec-type auto: checkpoint {} an MTP head -> {}",
+            if head { "declares" } else { "declares no" },
+            if head { "mtp" } else { "no speculation" }
+        );
+        spec.spec_type = if head {
+            ServeSpecType::Mtp
+        } else {
+            if spec.mtp_enabled() {
+                return Err(
+                    "--mtp-draft-tokens/--mtp-draft-topk set, but --spec-type auto resolved to \
+                     no speculation: the checkpoint declares no MTP head"
+                        .to_owned(),
+                );
+            }
+            ServeSpecType::None
+        };
+    }
     // The L3 spill request rides the engine config so BOTH CUDA paths carry
     // it: the multiproc coordinator serializes ONLY engine_config into
     // ARLE_WORKER_ENGINE_CONFIG, so serve-layer-only options never reach
