@@ -251,7 +251,6 @@ pub fn linear_attention_core(
         requires_grad,
         None,
         None,
-        None,
         store,
         tape,
     )? {
@@ -331,7 +330,6 @@ pub fn linear_attention_core(
             raw_output: None,
             initial_state: None,
             initial_conv_window: None,
-            carry_peer: None,
             batch: params.batch,
             seq_len: params.seq_len,
             num_key_heads: params.num_key_heads,
@@ -347,13 +345,17 @@ pub fn linear_attention_core(
     Ok(output_id)
 }
 
+/// Rows per sequence-parallel core chunk (a multiple of the FlashQLA 64-row
+/// tile); bounds the per-chunk replay transient.
+pub const CORE_CHUNK: usize = 16384;
+
 /// Context-parallel gated-delta attention, sequence-parallel: every rank runs
 /// the recurrence on its OWN rows (all heads) and the state crosses ranks in
 /// global order. The launcher's zigzag shard gives rank `r` global chunks `r`
 /// and `2N-1-r` as two equal local blocks, so the walk visits chunks 0..2N in
 /// order; a block's predecessor is either the previous local block or a peer
 /// rank, whose (final_state, conv window) arrive through the taped
-/// `cp_recv`/`carry_peer` pair that returns their gradients the same way.
+/// `cp_recv`/`cp_send_attach` pair that returns their gradients the same way.
 /// Per-rank transient is O(local seq) — this is what lets the global sequence
 /// grow past what one rank's memory could hold under the former all-to-all
 /// form, at the price of serializing the recurrence across ranks.
@@ -413,69 +415,119 @@ pub fn linear_attention_core_cp(
     ];
     let window_shape = [batch, window, qkv_dim];
     let owner = |chunk: usize| if chunk < n { chunk } else { 2 * n - 1 - chunk };
-    let block_params = LinearAttentionParams {
-        seq_len: half,
+    // Sub-chunk each zigzag block so a chunk's replay transient is bounded by
+    // CORE_CHUNK rows, independent of the global sequence.
+    let rows_per = if half <= CORE_CHUNK || !half.is_multiple_of(CORE_CHUNK) {
+        half
+    } else {
+        CORE_CHUNK
+    };
+    let per_block = half / rows_per;
+    let chunk_params = LinearAttentionParams {
+        seq_len: rows_per,
         ..params
     };
+    let packed_rows = rows_per + params.key_dim;
 
     let mut carry: Option<(TensorId, TensorId)> = None;
-    let mut outs: [Option<TensorId>; 2] = [None, None];
+    let mut outs: Vec<TensorId> = Vec::with_capacity(2 * per_block);
     for chunk in 0..2 * n {
         if owner(chunk) != cp_rank {
             continue;
         }
         let block = usize::from(chunk >= n);
-        let (r0, r1) = (block * half, (block + 1) * half);
-        let rows = |x: TensorId, width: usize, st: &mut TensorStore, tp: &mut Tape| {
-            crate::ops::slice(x, &[0, r0, 0], &[batch, r1, width], st, tp)
-        };
-        let qkv_c = rows(qkv, qkv_dim, store, tape)?;
-        let z_c = rows(z, v_dim, store, tape)?;
-        let b_c = rows(b_proj, params.num_value_heads, store, tape)?;
-        let a_c = rows(a_proj, params.num_value_heads, store, tape)?;
+        for sub in 0..per_block {
+            let r0 = block * half + sub * rows_per;
+            let r1 = r0 + rows_per;
+            let rows = |x: TensorId, width: usize, st: &mut TensorStore, tp: &mut Tape| {
+                crate::ops::slice(x, &[0, r0, 0], &[batch, r1, width], st, tp)
+            };
+            let qkv_c = rows(qkv, qkv_dim, store, tape)?;
+            let z_c = rows(z, v_dim, store, tape)?;
+            let b_c = rows(b_proj, params.num_value_heads, store, tape)?;
+            let a_c = rows(a_proj, params.num_value_heads, store, tape)?;
 
-        let (initial_state, initial_window) = if chunk == 0 {
-            (None, None)
-        } else if owner(chunk - 1) == cp_rank {
-            let (s, w) = carry.take().ok_or(AutogradError::TapeInvariant(
-                "linear_attention_core_cp: missing local carry",
-            ))?;
-            (Some(s), Some(w))
-        } else {
-            let from = owner(chunk - 1);
-            (
-                Some(crate::ops::cp_recv(&state_shape, from, store, tape)?),
-                Some(crate::ops::cp_recv(&window_shape, from, store, tape)?),
-            )
-        };
-        let send_to = (chunk + 1 < 2 * n)
-            .then(|| owner(chunk + 1))
-            .filter(|&next| next != cp_rank);
-        let (out_c, final_state, conv_window) = linear_attention_core_carry(
-            qkv_c,
-            z_c,
-            b_c,
-            a_c,
-            conv1d_weight,
-            dt_bias,
-            a_log,
-            norm_weight,
-            block_params,
-            initial_state,
-            initial_window,
-            send_to,
-            store,
-            tape,
-        )?;
-        outs[block] = Some(out_c);
-        carry = Some((final_state, conv_window));
+            let (initial_state, initial_window) = if chunk == 0 && sub == 0 {
+                (None, None)
+            } else if sub > 0 || owner(chunk - 1) == cp_rank {
+                let (s, w) = carry.take().ok_or(AutogradError::TapeInvariant(
+                    "linear_attention_core_cp: missing local carry",
+                ))?;
+                (Some(s), Some(w))
+            } else {
+                let from = owner(chunk - 1);
+                (
+                    Some(crate::ops::cp_recv(&state_shape, from, store, tape)?),
+                    Some(crate::ops::cp_recv(&window_shape, from, store, tape)?),
+                )
+            };
+            let mut inputs = vec![
+                qkv_c,
+                z_c,
+                b_c,
+                a_c,
+                conv1d_weight,
+                dt_bias,
+                a_log,
+                norm_weight,
+            ];
+            inputs.extend(initial_state);
+            inputs.extend(initial_window);
+            // One checkpoint per chunk: the recurrence's saved activations exist
+            // only while that chunk's backward runs. final_state rides along as
+            // key_dim extra rows of the output (state elems == key_dim * v_dim).
+            let packed = crate::ops::checkpoint(inputs, store, tape, move |st, tp, inp| {
+                let (out, final_state) = linear_attention_core_carry(
+                    inp[0],
+                    inp[1],
+                    inp[2],
+                    inp[3],
+                    inp[4],
+                    inp[5],
+                    inp[6],
+                    inp[7],
+                    chunk_params,
+                    inp.get(8).copied(),
+                    inp.get(9).copied(),
+                    st,
+                    tp,
+                )?;
+                let state_rows =
+                    crate::ops::reshape(final_state, &[batch, params.key_dim, v_dim], st, tp)?;
+                crate::ops::cat(&[out, state_rows], 1, st, tp)
+            })?;
+            let out_c =
+                crate::ops::slice(packed, &[0, 0, 0], &[batch, rows_per, v_dim], store, tape)?;
+            let state_rows = crate::ops::slice(
+                packed,
+                &[0, rows_per, 0],
+                &[batch, packed_rows, v_dim],
+                store,
+                tape,
+            )?;
+            let final_state = crate::ops::reshape(state_rows, &state_shape, store, tape)?;
+            let conv_window = crate::ops::slice(
+                qkv_c,
+                &[0, rows_per - window, 0],
+                &[batch, rows_per, qkv_dim],
+                store,
+                tape,
+            )?;
+            let last_sub = sub + 1 == per_block;
+            let send_to = (last_sub && chunk + 1 < 2 * n)
+                .then(|| owner(chunk + 1))
+                .filter(|&next| next != cp_rank);
+            let out_c = match send_to {
+                Some(peer) => {
+                    crate::ops::cp_send_attach(out_c, final_state, conv_window, peer, store, tape)?
+                }
+                None => out_c,
+            };
+            outs.push(out_c);
+            carry = Some((final_state, conv_window));
+        }
     }
-    let (Some(first), Some(second)) = (outs[0], outs[1]) else {
-        return Err(AutogradError::TapeInvariant(
-            "linear_attention_core_cp: rank did not own both zigzag blocks",
-        ));
-    };
-    crate::ops::cat(&[first, second], 1, store, tape)
+    crate::ops::cat(&outs, 1, store, tape)
 }
 
 /// Host reference with recurrent and convolution carry.
@@ -707,11 +759,11 @@ pub fn linear_attention_boundary(
     Ok((state, conv))
 }
 
-/// Taped generated segment seeded by frozen carry.
 /// Device recurrence with a differentiable state carry: seeds from
 /// `initial_state` / `initial_conv_window` (grads flow back into them) and
-/// returns `(out, final_state, conv_window)` for the next segment — the
-/// sequence-parallel building block. CUDA only.
+/// returns `(out, final_state)` for the next segment — the sequence-parallel
+/// building block. The next segment's conv window is the caller's slice of
+/// `qkv`'s last `conv_kernel-1` rows. CUDA only.
 #[allow(clippy::too_many_arguments)]
 pub fn linear_attention_core_carry(
     qkv: TensorId,
@@ -725,10 +777,9 @@ pub fn linear_attention_core_carry(
     params: LinearAttentionParams,
     initial_state: Option<TensorId>,
     initial_conv_window: Option<TensorId>,
-    send_final_state_to: Option<usize>,
     store: &mut TensorStore,
     tape: &mut Tape,
-) -> Result<(TensorId, TensorId, TensorId)> {
+) -> Result<(TensorId, TensorId)> {
     validate_shapes(
         qkv,
         z,
@@ -754,7 +805,7 @@ pub fn linear_attention_core_carry(
     ids.extend(initial_state);
     ids.extend(initial_conv_window);
     let requires_grad = tape.enabled && store.any_requires_grad(&ids);
-    let Some((output_id, final_state_id)) = try_linear_attention_forward_device(
+    try_linear_attention_forward_device(
         qkv,
         z,
         b_proj,
@@ -767,28 +818,12 @@ pub fn linear_attention_core_carry(
         requires_grad,
         initial_state,
         initial_conv_window,
-        send_final_state_to,
         store,
         tape,
     )?
-    else {
-        return Err(AutogradError::TapeInvariant(
-            "linear_attention_core_carry requires the CUDA device path",
-        ));
-    };
-    // The next segment's conv window is the last conv_kernel-1 rows of this
-    // segment's conv input — a plain slice, so its gradient needs no kernel.
-    let window = params.conv_kernel - 1;
-    let qkv_dim =
-        2 * params.num_key_heads * params.key_dim + params.num_value_heads * params.value_dim;
-    let conv_window_id = crate::ops::slice(
-        qkv,
-        &[0, params.seq_len - window, 0],
-        &[params.batch, params.seq_len, qkv_dim],
-        store,
-        tape,
-    )?;
-    Ok((output_id, final_state_id, conv_window_id))
+    .ok_or(AutogradError::TapeInvariant(
+        "linear_attention_core_carry requires the CUDA device path",
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -851,7 +886,6 @@ pub fn linear_attention_core_with_carry_taped(
         requires_grad,
         initial_state,
         initial_conv_window,
-        None,
         store,
         tape,
     )? {
@@ -972,7 +1006,6 @@ pub fn linear_attention_core_with_carry_taped(
             raw_output: None,
             initial_state,
             initial_conv_window,
-            carry_peer: None,
             batch: params.batch,
             seq_len: params.seq_len,
             num_key_heads: params.num_key_heads,
@@ -1034,7 +1067,6 @@ fn try_linear_attention_forward_device(
     requires_grad: bool,
     initial_state: Option<TensorId>,
     initial_conv_window: Option<TensorId>,
-    carry_peer: Option<usize>,
     store: &mut TensorStore,
     tape: &mut Tape,
 ) -> Result<Option<(TensorId, TensorId)>> {
@@ -1087,33 +1119,6 @@ fn try_linear_attention_forward_device(
     ];
     let head_shape = vec![params.batch, params.seq_len, params.num_value_heads];
     let output_id = store.alloc_device_tensor(output_shape, result.output)?;
-    let state_len = params.batch * params.num_value_heads * params.key_dim * params.value_dim;
-    let window = params.conv_kernel - 1;
-    if let Some(peer) = carry_peer {
-        // Hand (final_state, conv window) to the successor rank, in that order;
-        // the backward receives (d_window, d_state) in the mirrored order.
-        if std::env::var_os("ARLE_OPD_CARRY_TRACE").is_some() {
-            eprintln!("[carry-trace] fwd send state+window -> {peer} (output {output_id:?})");
-        }
-        store
-            .backend()
-            .cp_send_device(&result.final_state, state_len, peer)?;
-        let mut scratch = Tape::new();
-        scratch.set_enabled(false);
-        let tail = crate::ops::slice(
-            qkv,
-            &[0, params.seq_len - window, 0],
-            &[params.batch, params.seq_len, qkv_dim],
-            store,
-            &mut scratch,
-        )?;
-        store.ensure_device(tail)?;
-        let tail_handle = store.device_handle(tail)?;
-        store
-            .backend()
-            .cp_send_device(&tail_handle, params.batch * window * qkv_dim, peer)?;
-        store.free(tail)?;
-    }
     let final_state_id = store.alloc_device_tensor(
         vec![
             params.batch,
@@ -1197,7 +1202,6 @@ fn try_linear_attention_forward_device(
                 // recompute, and dh0 / the conv-tail grad return to these ids.
                 initial_state,
                 initial_conv_window,
-                carry_peer,
                 batch: params.batch,
                 seq_len: params.seq_len,
                 num_key_heads: params.num_key_heads,
@@ -1243,7 +1247,6 @@ fn try_linear_attention_backward_device(
     initial_state: Option<TensorId>,
     initial_conv_window: Option<TensorId>,
     d_final_state: Option<TensorId>,
-    carry_peer: Option<usize>,
     params: LinearAttentionParams,
     store: &mut TensorStore,
 ) -> Result<Option<GradPairs>> {
@@ -1255,33 +1258,10 @@ fn try_linear_attention_backward_device(
     };
     let q_dim = params.num_key_heads * params.key_dim;
     let qkv_dim = q_dim * 2 + params.num_value_heads * params.value_dim;
-    let state_len = params.batch * params.num_value_heads * params.key_dim * params.value_dim;
-    let window = params.conv_kernel - 1;
-    let mut d_final_state_handle = d_final_state
+    let d_final_state_handle = d_final_state
         .map(|id| {
             store.ensure_device(id)?;
             store.device_handle(id)
-        })
-        .transpose()?;
-    // Successor rank's gradients at our carry, mirrored order: window, then state.
-    let d_window_remote = carry_peer
-        .map(|peer| {
-            if std::env::var_os("ARLE_OPD_CARRY_TRACE").is_some() {
-                eprintln!("[carry-trace] bwd recv d_window+d_state <- {peer}");
-            }
-            let d_window = store
-                .backend()
-                .cp_recv_device(params.batch * window * qkv_dim, peer)?;
-            let d_state = store.backend().cp_recv_device(state_len, peer)?;
-            d_final_state_handle = Some(match d_final_state_handle.take() {
-                Some(parked) => {
-                    store
-                        .backend()
-                        .accumulate_into_device(&parked, &d_state, &[state_len])?
-                }
-                None => d_state,
-            });
-            Ok::<_, AutogradError>(d_window)
         })
         .transpose()?;
     let Some(qkv_conv) = qkv_conv else {
@@ -1385,18 +1365,6 @@ fn try_linear_attention_backward_device(
         return Ok(None);
     };
     let mut carry_grads = GradPairs::new();
-    if std::env::var_os("ARLE_OPD_CARRY_TRACE").is_some() {
-        let rg = |id: Option<TensorId>| id.map(|id| store.tensor(id).map(|t| t.requires_grad));
-        eprintln!(
-            "[carry-trace] la-bwd carries: state={:?} rg={:?} dh0={} window={:?} rg={:?} dwin={}",
-            initial_state,
-            rg(initial_state),
-            device_grads.d_initial_state.is_some(),
-            initial_conv_window,
-            rg(initial_conv_window),
-            device_grads.d_initial_conv_window.is_some()
-        );
-    }
     if let (Some(state_id), Some(dh0)) = (initial_state, device_grads.d_initial_state.clone())
         && store.tensor(state_id)?.requires_grad
     {
@@ -1412,17 +1380,7 @@ fn try_linear_attention_backward_device(
         carry_grads.push((window_id, store.alloc_device_tensor(shape, d_window)?));
     }
 
-    let dqkv = match d_window_remote {
-        // The window we handed on was rows seq_len-window.. of qkv.
-        Some(d_window) => store.backend().accumulate_slice_device(
-            &device_grads.dqkv,
-            &d_window,
-            &[params.batch, params.seq_len, qkv_dim],
-            &[0, params.seq_len - window, 0],
-            &[params.batch, params.seq_len, qkv_dim],
-        )?,
-        None => device_grads.dqkv.clone(),
-    };
+    let dqkv = device_grads.dqkv.clone();
     let mut grads = GradPairs::new();
     if store.tensor(qkv)?.requires_grad {
         grads.push((
@@ -1512,7 +1470,6 @@ pub(crate) fn linear_attention_backward(
         raw_output,
         initial_state,
         initial_conv_window,
-        carry_peer,
         batch,
         seq_len,
         num_key_heads,
@@ -1573,7 +1530,6 @@ pub(crate) fn linear_attention_backward(
         initial_state,
         initial_conv_window,
         d_final_state,
-        carry_peer,
         params,
         store,
     )? {

@@ -357,9 +357,6 @@ pub fn cp_recv(
     tape: &mut Tape,
 ) -> Result<TensorId> {
     let len: usize = shape.iter().product();
-    if std::env::var_os("ARLE_OPD_CARRY_TRACE").is_some() {
-        eprintln!("[carry-trace] fwd recv {len} <- {peer}");
-    }
     let handle = store.backend().cp_recv_device(len, peer)?;
     let output_id = store.alloc_device_tensor(shape.to_vec(), handle)?;
     if tape.enabled {
@@ -373,4 +370,74 @@ pub fn cp_recv(
         });
     }
     Ok(output_id)
+}
+
+/// Hand `(state, window)` to `peer` (matching its `cp_recv` pair, in that
+/// order) and return `out` unchanged. Riding on `out` keeps the entry reachable
+/// from the loss; the backward passes d_out through and receives `peer`'s
+/// `(d_window, d_state)` — the mirror of its `CpRecv` backward order.
+pub fn cp_send_attach(
+    out: TensorId,
+    state: TensorId,
+    window: TensorId,
+    peer: usize,
+    store: &mut TensorStore,
+    tape: &mut Tape,
+) -> Result<TensorId> {
+    let state_len = store.tensor(state)?.shape.iter().product();
+    let window_len = store.tensor(window)?.shape.iter().product();
+    for id in [state, window] {
+        store.ensure_device(id)?;
+    }
+    let state_handle = store.device_handle(state)?;
+    store
+        .backend()
+        .cp_send_device(&state_handle, state_len, peer)?;
+    let window_handle = store.device_handle(window)?;
+    store
+        .backend()
+        .cp_send_device(&window_handle, window_len, peer)?;
+    let output_id = store.clone_tensor(out)?;
+    TapeEntry {
+        op: BackwardOp::CpSendAttach,
+        output_id,
+        input_ids: smallvec![out, state, window],
+        saved: SavedContext::CpSendAttachCtx {
+            peer,
+            state_len,
+            window_len,
+        },
+    }
+    .record(store, tape)?;
+    Ok(output_id)
+}
+
+pub(crate) fn cp_send_attach_backward(
+    entry: &TapeEntry,
+    output_grad_id: TensorId,
+    store: &mut TensorStore,
+) -> Result<GradPairs> {
+    let SavedContext::CpSendAttachCtx {
+        peer,
+        state_len,
+        window_len,
+    } = entry.saved
+    else {
+        return Err(AutogradError::TapeInvariant(
+            "cp_send_attach backward missing context",
+        ));
+    };
+    let (out, state, window) = (entry.input_ids[0], entry.input_ids[1], entry.input_ids[2]);
+    let d_window = store.backend().cp_recv_device(window_len, peer)?;
+    let d_state = store.backend().cp_recv_device(state_len, peer)?;
+    let mut grads: GradPairs = smallvec![(out, output_grad_id)];
+    if store.tensor(state)?.requires_grad {
+        let shape = store.tensor(state)?.shape.clone();
+        grads.push((state, store.alloc_device_tensor(shape, d_state)?));
+    }
+    if store.tensor(window)?.requires_grad {
+        let shape = store.tensor(window)?.shape.clone();
+        grads.push((window, store.alloc_device_tensor(shape, d_window)?));
+    }
+    Ok(grads)
 }
