@@ -46,7 +46,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Install cargo-deny (prebuilt)
-        uses: taiki-e/install-action@v2.85.4
+        uses: taiki-e/install-action@v2.86.3
         with:
           tool: cargo-deny
 
