@@ -300,13 +300,12 @@ impl TpRuntime {
     }
 
     #[must_use]
-    #[allow(dead_code)] // T2.3 will consume this
     pub fn attn_tp(&self) -> &TpComm {
         &self.attn_tp
     }
 
     #[must_use]
-    #[allow(dead_code)] // T2.3 will consume this
+    #[allow(dead_code)] // consumed once MoE EP dispatch moves onto the split comm
     pub fn moe_ep(&self) -> &TpComm {
         &self.moe_ep
     }
