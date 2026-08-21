@@ -1867,7 +1867,8 @@ extern "C" __global__ void linear_attention_conv1d_silu_backward_f32(
     int seq_len,
     int kernel_size,
     const float* __restrict__ conv_tail,
-    int tail_len
+    int tail_len,
+    float* __restrict__ grad_tail
 ) {
     unsigned long long idx =
         static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -1880,11 +1881,14 @@ extern "C" __global__ void linear_attention_conv1d_silu_backward_f32(
     for (int tap = 0; tap < kernel_size; ++tap) {
         int src_t = t + tap + 1 - kernel_size;
         if (src_t < 0) {
-            // Carried history did contribute to the forward → its weight-grad is real. Carry is
-            // frozen (requires_grad=false), so no grad_input flows back into it.
+            // Carried history contributed to the forward: its weight-grad is real, and
+            // grad_tail (when requested) returns the grad to the carried rows.
             if (conv_tail != nullptr) {
-                atomicAdd(&grad_weight[c * kernel_size + tap],
-                          dpre * conv_tail[(src_t + tail_len) * channels + c]);
+                int tail_idx = (src_t + tail_len) * channels + c;
+                atomicAdd(&grad_weight[c * kernel_size + tap], dpre * conv_tail[tail_idx]);
+                if (grad_tail != nullptr) {
+                    atomicAdd(&grad_tail[tail_idx], dpre * weight[c * kernel_size + tap]);
+                }
             }
             continue;
         }

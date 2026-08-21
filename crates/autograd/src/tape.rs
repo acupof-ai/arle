@@ -193,6 +193,10 @@ pub enum SavedContext {
     CheckpointCtx {
         function_id: usize,
     },
+    /// `LinearAttentionFinalState`: the core entry's output id.
+    CarryLink {
+        core_output: TensorId,
+    },
     SeqChunkedRecomputeCtx {
         function_id: usize,
         batch: usize,
@@ -273,6 +277,10 @@ pub enum BackwardOp {
     FusedLinearDistill,
     GeneralizedJsd,
     LinearAttention,
+    /// Companion of a `LinearAttention` entry: its output is the recurrence's
+    /// final state. The backward parks the incoming grad for the core entry
+    /// (`carry_state_grads`), which reads it as `d_final_state`.
+    LinearAttentionFinalState,
     CausalSdpaRecompute,
     AllReduceSum,
     AllGatherSeq,
@@ -321,6 +329,7 @@ impl BackwardOp {
             BackwardOp::FusedLinearDistill => "FusedLinearDistill",
             BackwardOp::GeneralizedJsd => "GeneralizedJsd",
             BackwardOp::LinearAttention => "LinearAttention",
+            BackwardOp::LinearAttentionFinalState => "LinearAttentionFinalState",
             BackwardOp::CausalSdpaRecompute => "CausalSdpaRecompute",
             BackwardOp::AllReduceSum => "AllReduceSum",
             BackwardOp::AllGatherSeq => "AllGatherSeq",
@@ -461,6 +470,9 @@ pub struct Tape {
     pub(crate) offload_checkpoints: bool,
     skip_next_checkpoint_input_offload: bool,
     checkpoint_op_mem_scope: Option<Arc<Mutex<CheckpointOpMemScope>>>,
+    /// d/d(final_state) parked by `LinearAttentionFinalState`, keyed by the
+    /// core entry's output id, consumed by that entry's backward.
+    carry_state_grads: HashMap<TensorId, TensorId>,
     checkpoint_op_mem_disarmed: bool,
 }
 
@@ -484,6 +496,7 @@ impl Tape {
             skip_next_checkpoint_input_offload: false,
             checkpoint_op_mem_scope: None,
             checkpoint_op_mem_disarmed: false,
+            carry_state_grads: HashMap::new(),
         }
     }
 
@@ -842,7 +855,17 @@ impl Tape {
                         ops::generalized_jsd_backward(&entry, output_grad_id, store)?
                     }
                     BackwardOp::LinearAttention => {
-                        ops::linear_attention_backward(&entry, output_grad_id, store)?
+                        let d_final_state = self.carry_state_grads.remove(&entry.output_id);
+                        ops::linear_attention_backward(&entry, output_grad_id, d_final_state, store)?
+                    }
+                    BackwardOp::LinearAttentionFinalState => {
+                        let SavedContext::CarryLink { core_output } = entry.saved else {
+                            return Err(AutogradError::TapeInvariant(
+                                "final-state backward missing carry link",
+                            ));
+                        };
+                        self.carry_state_grads.insert(core_output, output_grad_id);
+                        GradPairs::new()
                     }
                     BackwardOp::CausalSdpaRecompute => {
                         ops::causal_sdpa_recompute_backward(&entry, output_grad_id, store)?
