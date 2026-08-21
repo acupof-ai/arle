@@ -79,21 +79,50 @@ TP=2 ceiling.
 
 ## Problems
 
-Two bugs found and fixed during development:
-1. w13 scales are stored w1/w3 row-interleaved by the loader (not the plain
-   CUTLASS layout), requiring de-interleave before transpose.
-2. W4A16 GEMV kernel expects unsigned nibbles with zero-point=8; W4AFP8 stores
-   signed INT4 two's complement. Fixed with the `xor_mask` kernel parameter
-   (zero VRAM overhead).
+Three bugs found and fixed:
+
+1. **xor_mask** — W4A16 GEMV kernel expects unsigned nibbles with zero-point=8;
+   W4AFP8 stores signed INT4 two's complement. Fixed with the `xor_mask` kernel
+   parameter (`0x08080808` for W4AFP8, `0` for W4A16), zero VRAM overhead.
+2. **w13 scale de-interleave (P1, codex review)** — the loader stores w13
+   scales as plain CUTLASS `[K//512, n13*4]` (w1/w3 concatenated along N).
+   The table builder incorrectly de-interleaved with stride `K/128*2 = 112 B`
+   instead of the actual `N*4*2 = 16384 B`, systematically mixing gate/up
+   scales. Fixed by removing the de-interleave entirely — direct transpose
+   from the plain layout.
+3. **Verify path used GEMV for M>1** — DSpark verify (M=5, 30 routes) hit the
+   GEMV lane, which loads weights per-token without cross-token reuse.
+   Restricted GEMV to `num_tokens == 1`; M>1 takes the SGLang CUTLASS grouped
+   GEMM.
 
 An earlier weight-copy conversion approach (3 GB/GPU) OOMed at TP=2 with
 max-running-requests=16. The xor_mask approach has zero VRAM overhead.
+
+## DSpark spec decode (post-fix)
+
+DSpark draft (FP8 attn + FP4 experts, block=5, layers 40-42) on top of the
+fixed GEMV lane. TP=4, long prompt (119k), prefix-cache hit, pure decode.
+
+| Metric | Pre-fix | Post-fix |
+|--------|--------:|---------:|
+| Acceptance rate | ~49% (short) / 58-65% (long) | **64.8%** |
+| Tokens per chain | ~2.85 | **4.83** |
+| Decode tok/s (DSpark) | ~41 (0% speedup) | **51.2** |
+| Baseline (no DSpark) | 41.1 | 41.1 |
+| **Speedup** | **~1.0x** | **~1.25x** |
+
+The scale fix raised acceptance (fewer chains per token); the verify-path fix
+lowered per-chain cost. Together they convert DSpark from 0% to 1.25x.
 
 ## Learnings
 
 PASS. The W4A16 GEMV kernel is reusable for W4AFP8 decode with two format
 conversions: the nibble sign flip in-kernel via `xor_mask` (zero extra VRAM),
-and the scale de-interleave+transpose once at table-build time. The 1.69x c=1
-decode speedup is the main win for interactive serving. TP=4 scales to c=16
-with 161.7 tok/s aggregate. Next wall: DSpark spec decode on top of the GEMV
-lane.
+and the scale transpose once at table-build time. The 1.69x c=1 decode
+speedup is the main win for interactive serving. TP=4 scales to c=16 with
+161.7 tok/s aggregate. DSpark spec decode on top delivers an additional 1.25x
+at c=1 (64.8% acceptance, 4.83 tok/chain).
+
+Codex review caught the w13 scale de-interleave bug (P1) — the GEMV path had
+been shipping wrong gate/up scales since implementation. Kernel alignment
+reviews pay off.
