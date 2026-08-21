@@ -251,9 +251,9 @@ pub(super) fn cuda_cp_send(
     }
     #[cfg(feature = "nccl")]
     {
-        let nccl = backend.comm(CommAxis::Seq).ok_or(AutogradError::TapeInvariant(
-            "cp_send: no CP communicator",
-        ))?;
+        let nccl = backend
+            .comm(CommAxis::Seq)
+            .ok_or(AutogradError::TapeInvariant("cp_send: no CP communicator"))?;
         let (src_ptr, _src_guard) = src.device_ptr(&backend.stream);
         let stream = backend.stream.cu_stream().cast();
         // SAFETY: guarded pointer live for the call; peer runs the matching recv.
@@ -274,9 +274,9 @@ pub(super) fn cuda_cp_send(
 pub(super) fn cuda_cp_recv(backend: &CudaBackend, len: usize, peer: usize) -> Result<DeviceHandle> {
     #[cfg(feature = "nccl")]
     {
-        let nccl = backend.comm(CommAxis::Seq).ok_or(AutogradError::TapeInvariant(
-            "cp_recv: no CP communicator",
-        ))?;
+        let nccl = backend
+            .comm(CommAxis::Seq)
+            .ok_or(AutogradError::TapeInvariant("cp_recv: no CP communicator"))?;
         let mut out = alloc_zeros_retry::<f32>(backend, len)
             .map_err(|_| AutogradError::TapeInvariant("cuda cp_recv alloc failed"))?;
         {
