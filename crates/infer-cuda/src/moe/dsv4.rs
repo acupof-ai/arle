@@ -1508,9 +1508,11 @@ fn dsv4_moe_forward_masked_tail(
         }
     }
     // W4AFP8 lane: decode-band GEMV (reuses W4A16 kernel, BF16 activations)
-    // or SGLang CUTLASS grouped GEMM for prefill / large batch.
+    // for M=1 only — the GEMV kernel loads weights per-token without
+    // cross-token reuse, so M>1 (DSpark verify, batched decode) takes the
+    // SGLang CUTLASS grouped GEMM instead.
     if let (Some(w13), Some(w2)) = (&layer.w13_w4afp8, &layer.w2_w4afp8) {
-        if total_routes <= DSV4_DECODE_GEMV_MAX_ROUTES {
+        if num_tokens == 1 && total_routes <= DSV4_DECODE_GEMV_MAX_ROUTES {
             let tables = layer.w4afp8_gemv_tables.get_or_init(|| {
                 build_w4afp8_gemv_tables(ctx, layer)
                     .expect("DSv4 W4AFP8 GEMV decode lane table build failed")
