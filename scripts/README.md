@@ -22,6 +22,8 @@ directory unless noted.
 | `bench_sglang_longctx.sh` | SGLang long-context baseline runner. |
 | `run_dsv4_bench.sh` | DSv4 benchmark orchestration. |
 | `run_fp8_probe.sh` | Run the FP8 component probe; when a producer manifest is supplied, require its build ID to match the binary-embedded `KERNEL_BUILD_ID`. |
+| `operator_e2e_artifact.py` | Wrap a `needle_gate.py` log into the `arle.operator-e2e/v1` artifact `run_fp8_probe.sh` consumes (identity = kernel bundle id). |
+| `reduce_operator_evidence.py` | Reduce qualified probe runs into the generated dispatch policy (`--check` validates without writing). |
 
 ## Model Conversion
 

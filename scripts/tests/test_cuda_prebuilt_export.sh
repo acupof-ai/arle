@@ -137,4 +137,35 @@ if ARLE_SMALLM_PROBE_BIN="$PROBE" ARLE_SMALLM_KERNEL_MANIFEST="$PROBE_DIR/arle-c
     exit 1
 fi
 
+# E2E half of the qualification contract: an artifact built by
+# operator_e2e_artifact.py for the same kernel bundle is accepted with
+# E2E_STATUS=passed; a different bundle is rejected.
+python3 "$ROOT/scripts/operator_e2e_artifact.py" --self-test >/dev/null
+python3 - "$PROBE_DIR/arle-cuda-kernels.manifest" <<'PY3'
+from pathlib import Path
+import sys
+path = Path(sys.argv[1])
+path.write_text(path.read_text().replace("bundle:0", "bundle:", 1))
+PY3
+NEEDLE_LOG="$TMP/needle.log"
+printf 'SUMMARY len=512 depth=0.00 exact=3 partial=0 miss=0 DET kv=\nSUMMARY len=4096 depth=0.00 exact=3 partial=0 miss=0 DET kv=\n' >"$NEEDLE_LOG"
+python3 "$ROOT/scripts/operator_e2e_artifact.py" --needle-log "$NEEDLE_LOG" --runs 3 \
+    --serve-binary "$PROBE" --bundle-id "$BUNDLE_ID" --model-revision test@rev \
+    --output "$TMP/e2e.json" >/dev/null
+ARLE_SMALLM_PROBE_BIN="$PROBE" ARLE_SMALLM_KERNEL_MANIFEST="$PROBE_DIR/arle-cuda-kernels.manifest" \
+    ARLE_SMALLM_MODEL_KIND=actual ARLE_SMALLM_MODEL_REVISION=test@rev \
+    ARLE_SMALLM_E2E_STATUS=passed ARLE_SMALLM_E2E_ARTIFACT="$TMP/e2e.json" \
+    "$ROOT/scripts/run_fp8_probe.sh" "$TMP/probe.json" >/dev/null 2>&1 ||
+    { echo "probe rejected a matching-bundle E2E artifact" >&2; exit 1; }
+python3 "$ROOT/scripts/operator_e2e_artifact.py" --needle-log "$NEEDLE_LOG" --runs 3 \
+    --serve-binary "$PROBE" --bundle-id "bundle:$(printf other | cuda_prebuilt_hash_stream)" \
+    --model-revision test@rev --output "$TMP/e2e-other.json" >/dev/null
+if ARLE_SMALLM_PROBE_BIN="$PROBE" ARLE_SMALLM_KERNEL_MANIFEST="$PROBE_DIR/arle-cuda-kernels.manifest" \
+    ARLE_SMALLM_MODEL_KIND=actual ARLE_SMALLM_MODEL_REVISION=test@rev \
+    ARLE_SMALLM_E2E_STATUS=passed ARLE_SMALLM_E2E_ARTIFACT="$TMP/e2e-other.json" \
+    "$ROOT/scripts/run_fp8_probe.sh" "$TMP/probe.json" >/dev/null 2>&1; then
+    echo "probe accepted an E2E artifact from another kernel bundle" >&2
+    exit 1
+fi
+
 echo "cuda prebuilt export self-test passed"
