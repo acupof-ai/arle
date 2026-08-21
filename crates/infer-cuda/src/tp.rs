@@ -1461,10 +1461,10 @@ impl<'a> AttnCpGroupGuard<'a> {
 
 impl Drop for AttnCpGroupGuard<'_> {
     fn drop(&mut self) {
-        if !self.finished {
-            if let Err(e) = self.tp.attn_cp_group_end() {
-                log::error!("attn_cp group closed on drop after error: {e}");
-            }
+        if !self.finished
+            && let Err(e) = self.tp.attn_cp_group_end()
+        {
+            log::error!("attn_cp group closed on drop after error: {e}");
         }
     }
 }

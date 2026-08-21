@@ -219,7 +219,7 @@ pub(super) fn run_opd_from_dirs(args: TrainOpdArgs) -> Result<()> {
     #[cfg(feature = "cuda")]
     let engine_seq = {
         let seq = args.prompt_max_tokens + args.rollout_len + 32;
-        (seq * 8 / 7 + 15) / 16 * 16
+        (seq * 8 / 7).div_ceil(16) * 16
     };
     #[cfg(feature = "cuda")]
     let infer_student = if corpus_sft_only {
@@ -698,7 +698,7 @@ pub(super) fn run_self_opd_from_dir(args: TrainSelfOpdArgs) -> Result<()> {
     #[cfg(feature = "cuda")]
     let seq = prompt_ids.len() + args.rollout_len + 32;
     #[cfg(feature = "cuda")]
-    let engine_seq = (seq * 8 / 7 + 15) / 16 * 16;
+    let engine_seq = (seq * 8 / 7).div_ceil(16) * 16;
     #[cfg(feature = "cuda")]
     let infer_student = load_opd_infer_student(
         student_dir,

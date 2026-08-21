@@ -74,6 +74,8 @@ pub(crate) fn dsv4_moe_forward_deepep(
         .alloc_zeros::<i64>(total_routes)
         .map_err(|e| anyhow::anyhow!("DSv4 DeepEP route-index i64 alloc failed: {e}"))?;
     keepalive.keep_i64(&topk_idx_i64);
+    // SAFETY: `routing.indices` (i32) and `topk_idx_i64` both hold `total_routes`
+    // elements on `ctx.stream`; `topk_idx_i64` is kept alive for the forward.
     unsafe {
         moe::dsv4_cast_i32_to_i64(
             cache_ptr(&routing.indices, ctx),
@@ -115,6 +117,8 @@ pub(crate) fn dsv4_moe_forward_deepep(
     let local_routed = HiddenStates::zeros(ctx, hidden_dim, scratch.capacity_recv)?;
     if recv_slots > 0 {
         // The local count/pack kernels take i32, DeepEP returns i64.
+        // SAFETY: both recv_topk_idx buffers are keepalive-held scratch of at
+        // least `capacity_recv * topk >= recv_slots` elements on `ctx.stream`.
         unsafe {
             moe::dsv4_cast_i64_to_i32(
                 cache_ptr(&scratch.recv_topk_idx, ctx),
@@ -145,6 +149,9 @@ pub(crate) fn dsv4_moe_forward_deepep(
         } else {
             DEEPGEMM_CONTIG_ALIGN
         };
+        // SAFETY: `recv_topk_idx_i32` holds `num_recv * topk` rank-local ids;
+        // `counts`/`offsets` hold `experts_per_rank` i32 and `scan_total` one,
+        // all keepalive-held and enqueued on `ctx.stream`.
         unsafe {
             moe::dsv4_count_local_experts(
                 cache_ptr(&scratch.recv_topk_idx_i32, ctx),
@@ -181,6 +188,10 @@ pub(crate) fn dsv4_moe_forward_deepep(
         keepalive.keep_i32(&packed_route_slot);
         keepalive.keep_f32(&packed_weight);
         keepalive.keep_i32(&cursors);
+        // SAFETY: `recv_x`/`recv_topk_*` hold `num_recv` rows × `topk` routes;
+        // the packed_* buffers hold `packed_rows` (the aligned cap of recv_slots)
+        // and `cursors`/`offsets` hold `experts_per_rank`; all keepalive-held on
+        // `ctx.stream`.
         unsafe {
             moe::dsv4_pack_local_experts_with_slots(
                 cache_ptr(&scratch.recv_x.data, ctx),
@@ -213,6 +224,10 @@ pub(crate) fn dsv4_moe_forward_deepep(
         keepalive.keep_hidden(&expert_out);
         let route_out = HiddenStates::zeros(ctx, hidden_dim, recv_slots.max(1))?;
         keepalive.keep_hidden(&route_out);
+        // SAFETY: `expert_out` has `packed_rows` rows, `route_out` has
+        // `recv_slots` rows and `local_routed` `capacity_recv >= num_recv` rows,
+        // all `hidden_dim` wide, keepalive-held and ordered on `ctx.stream`;
+        // `packed_route_slot` is -1 for padding rows, which the scatter skips.
         unsafe {
             // With aligned packing, valid routes span positions 0..packed_rows
             // (not just 0..recv_slots): must iterate the full packed range.

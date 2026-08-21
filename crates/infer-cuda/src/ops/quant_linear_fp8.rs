@@ -471,13 +471,14 @@ pub(super) fn deepgemm_dense_nt(
             .active_counts
             .as_ref()
             .ok_or_else(|| anyhow!("{tag} DeepGEMM active_counts missing"))?;
-        // SAFETY: ptrs from live device allocations sized to the dims passed.
         qwen_quant_profile(
             ctx,
             "qwen/deepgemm/dense_pack_quantize",
             m,
             n,
             k,
+            // SAFETY: `input`/`input_fp8`/`input_scales` and the active_* buffers are
+            // live scratch allocations on `ctx.stream` sized to the (m, k) dims passed.
             || unsafe {
                 cuda_moe::dsv4_deepgemm_pack_quantize_bf16_to_fp8(
                     cache_ptr(input, ctx),
