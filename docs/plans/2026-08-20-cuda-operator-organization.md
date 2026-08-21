@@ -1,9 +1,10 @@
 # CUDA operator organization across kernels and models
 
-> Status: In execution (2026-08-20). Landed: T0, T1, T2 (verdict ACCEPT), T2L,
-> T3 (s1–s5), T4, T6 (s1–s2), T7, T8 registry prep; remote receipt green
+> Status: Completed (2026-08-21). T0–T8 landed; remote receipt green on
+> Qwen3.8-27B-NVFP4, ThinkingCap-Qwen3.6-27B-FP8, Qwen3.6-27B-FP8
 > ([wins](../experience/wins/2026-08-20-cuda-operator-organization-t-series.md)).
-> Open: T5 (peer holds `infer-cuda/src/moe.rs`), T8 closure.
+> DSv4-Flash receipt pending a 4-GPU window (TP4; the `cuda`-only candidate
+> binaries also need a `nccl` rebuild, done: `/root/arle-runs/arle-*-nccl`).
 >
 > Scope: all production CUDA operator paths for Qwen3, Qwen3.5/3.6/3.8,
 > DeepSeek V4, GLM-5.2, and OPD autograd.
