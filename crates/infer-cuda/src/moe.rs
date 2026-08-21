@@ -3308,24 +3308,18 @@ mod dsv4_gpu {
             if total_routes <= DSV4_DECODE_GEMV_MAX_ROUTES {
                 let tables = layer.w4afp8_gemv_tables.get_or_init(|| {
                     build_w4afp8_gemv_tables(ctx, layer)
-                        .map(Some)
-                        .unwrap_or_else(|e| {
-                            log::warn!("DSv4 W4AFP8 GEMV decode lane table build failed: {e}");
-                            None
-                        })
+                        .expect("DSv4 W4AFP8 GEMV decode lane table build failed")
                 });
-                if let Some(tables) = tables.as_ref() {
-                    return dsv4_moe_forward_w4a16(
-                        model,
-                        layer,
-                        tables,
-                        route_indices,
-                        route_weights,
-                        hidden,
-                        out,
-                        keepalive,
-                    );
-                }
+                return dsv4_moe_forward_w4a16(
+                    model,
+                    layer,
+                    tables,
+                    route_indices,
+                    route_weights,
+                    hidden,
+                    out,
+                    keepalive,
+                );
             }
             return dsv4_moe_forward_w4afp8(
                 model,
