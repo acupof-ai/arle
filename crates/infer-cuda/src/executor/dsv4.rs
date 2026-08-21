@@ -379,8 +379,8 @@ impl Dsv4CudaExecutor {
         } else {
             SpecKind::None
         };
-        // DSv4 drafts per slot: the sequential draft tax at c>1 exceeds the
-        // batched-verify savings (−32% at c=8, −47.7% at c=16). Pin to c=1.
+        // DSv4 still drafts per slot, so it pins the gate at c=1: −47.7% at c=16
+        // with the gate open. Only Qwen3.5 honours a wider `--spec-max-batch`.
         let route = route_decode(
             spec_kind,
             batch.rows.len(),
