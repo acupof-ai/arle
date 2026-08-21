@@ -127,15 +127,21 @@ __global__ void gdr_decode_batch_kernel(
     float* my_state = state_ptrs[b] + v_head * key_dim * val_dim;
 
     int j_start = j_slice * GDR_B_J_PER_SLICE;
-    int j_end = j_start + GDR_B_J_PER_SLICE;
 
-    // Pass 1: Decay + partial kv_mem
+    // The thread's 32-row state slice lives in registers across both passes:
+    // one load and one store per element instead of two of each, and all 32
+    // loads issue independently (the kernel is long-scoreboard bound, not
+    // bandwidth bound — ncu 2026-08-21).
+    float s_reg[GDR_B_J_PER_SLICE];
     float partial_kv = 0.0f;
-    for (int j = j_start; j < j_end; j++) {
-        float s = my_state[j * val_dim + val_idx];
-        s *= exp_g;
-        my_state[j * val_dim + val_idx] = s;
-        partial_kv += s * smem_k[j];
+#pragma unroll
+    for (int jj = 0; jj < GDR_B_J_PER_SLICE; jj++) {
+        s_reg[jj] = my_state[(j_start + jj) * val_dim + val_idx];
+    }
+#pragma unroll
+    for (int jj = 0; jj < GDR_B_J_PER_SLICE; jj++) {
+        s_reg[jj] *= exp_g;
+        partial_kv += s_reg[jj] * smem_k[j_start + jj];
     }
 
     smem_kv_partial[j_slice][val_idx] = partial_kv;
@@ -146,13 +152,12 @@ __global__ void gdr_decode_batch_kernel(
 
     float my_delta = (smem_v[val_idx] - kv_mem) * beta;
 
-    // Pass 2: Rank-1 update + partial output
     float partial_out = 0.0f;
-    for (int j = j_start; j < j_end; j++) {
-        float s = my_state[j * val_dim + val_idx];
-        s += my_delta * smem_k[j];
-        my_state[j * val_dim + val_idx] = s;
-        partial_out += s * smem_q[j];
+#pragma unroll
+    for (int jj = 0; jj < GDR_B_J_PER_SLICE; jj++) {
+        float s = s_reg[jj] + my_delta * smem_k[j_start + jj];
+        my_state[(j_start + jj) * val_dim + val_idx] = s;
+        partial_out += s * smem_q[j_start + jj];
     }
 
     smem_out_partial[j_slice][val_idx] = partial_out;
