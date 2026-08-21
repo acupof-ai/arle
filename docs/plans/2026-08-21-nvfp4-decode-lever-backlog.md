@@ -73,7 +73,13 @@ verify; that defect is fixed and the prefill path has since been rewritten.
 Settles it: no-spec / MTP d=2 / MTP d=4 on the 32K chain, one binary, ITL and
 end-to-end.
 
-### 2. `gdr_decode_batch_kernel` — MEASURED, latency-bound
+### 2. `gdr_decode_batch_kernel` — CLOSED, register-staged state landed
+
+State slice kept in registers across both passes: bit-exact, 2.24× at B=1,
+1.28× at B=16, 1.20× at B=32 at the kernel; end-to-end a wash (≈2 % of a
+c=1 token)
+([wins/2026-08-21](../experience/wins/2026-08-21-gdr-decode-batch-register-staged-state.md)).
+The original finding:
 
 13.0% of decode GPU time, and `ncu` says it is nowhere near a ceiling: 17.5-19.4%
 of compute peak, 20.2-22.5% of memory, DRAM at 2%, IPC 0.66, achieved occupancy
