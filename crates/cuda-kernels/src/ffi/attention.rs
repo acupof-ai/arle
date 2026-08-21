@@ -630,8 +630,10 @@ unsafe extern "C" {
     ///
     /// Reads the FP8 e4m3 / INT8 pools and per-(token, kv_head) f32 scales
     /// directly from the paged pool (no dequant temp). FA3-style persistent
-    /// split-KV: one CTA per (batch row, q-head, split), grid
-    /// `[num_q_heads * num_splits, batch]`, plus a merge kernel. Decode-shaped
+    /// split-KV: one CTA per (batch row, group of `heads_per_cta` q-heads
+    /// sharing a kv-head, split), grid
+    /// `[num_q_heads / heads_per_cta * num_splits, batch]`, plus a merge kernel.
+    /// `heads_per_cta` must divide the GQA ratio and be one of 1/2/3/4/6/8. Decode-shaped
     /// (one q token per row; `cu_seqlens_q` names each row's q token).
     /// `page_table` is the rectangular `[batch, page_table_stride]` table;
     /// `seqused_k` is the per-row KV extent in tokens — the same device
@@ -657,6 +659,7 @@ unsafe extern "C" {
         sm_scale: f32,
         is_fp8: bool,
         num_splits: i32,
+        heads_per_cta: i32,
         stream: CUstream,
         workspace: *mut u8,
         workspace_bytes: usize,

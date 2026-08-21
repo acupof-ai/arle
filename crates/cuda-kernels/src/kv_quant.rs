@@ -834,6 +834,7 @@ pub fn paged_attention_quantized_fa3(
     sm_scale: f32,
     kv_format: KVFormat,
     num_splits: usize,
+    heads_per_cta: usize,
     workspace: &CudaSlice<u8>,
     workspace_bytes: usize,
 ) -> Result<()> {
@@ -872,6 +873,7 @@ pub fn paged_attention_quantized_fa3(
             sm_scale,
             is_fp8,
             num_splits as i32,
+            heads_per_cta as i32,
             ctx.stream.cu_stream(),
             ws_ptr as *mut u8,
             workspace_bytes,

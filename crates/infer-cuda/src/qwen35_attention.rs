@@ -646,13 +646,25 @@ impl Qwen35Model {
                                 if decode
                                     && matches!(pool.format, KVFormat::FP8E4M3 | KVFormat::INT8)
                                 {
-                                    // Capped at 16: the pool's split-KV workspace is
-                                    // sized for 16 splits at the GQA ratio 8.
-                                    let splits = self
-                                        .ctx
-                                        .sm_count()
+                                    // One CTA dequantizes K/V once for `heads_per_cta`
+                                    // q-heads of a kv-head; the group shrinks at small
+                                    // batch so the grid still covers ~2 CTAs per SM
+                                    // (H=6 at B=1 is 0.88x, at B>=4 1.44-1.59x).
+                                    // Splits capped at 16: the pool's split-KV
+                                    // workspace is sized for 16 splits at GQA ratio 8.
+                                    let sm = self.ctx.sm_count();
+                                    let heads_per_cta = [8usize, 6, 4, 3, 2, 1]
+                                        .into_iter()
+                                        .find(|&h| {
+                                            (q_heads / kv_heads.max(1)) % h == 0
+                                                && meta.batch.max(1) * (q_heads / h) * 16
+                                                    >= 2 * sm
+                                        })
+                                        .unwrap_or(1);
+                                    let splits = (sm
                                         .div_ceil(meta.batch.max(1) * kv_heads.max(1))
                                         .max(FA3_DECODE_SPLITS_FLOOR)
+                                        * heads_per_cta)
                                         .clamp(2, 16);
                                     let needed =
                                         kv_quant::paged_attention_quantized_fa3_workspace_bytes(
@@ -690,6 +702,7 @@ impl Qwen35Model {
                                             sm_scale,
                                             pool.format,
                                             splits,
+                                            heads_per_cta,
                                             ws,
                                             pool.quantized_attn_workspace_bytes,
                                         )?;
