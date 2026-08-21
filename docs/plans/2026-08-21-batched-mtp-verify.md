@@ -79,27 +79,51 @@ Two files.
    rows per level. This is the only genuinely new piece; the MTP head is a single
    transformer layer, so N rows is a plain batched decode.
 
+## Expected payoff, re-derived against the decode profile
+
+The first estimate was built on "Marlin is 68.3% of decode". At serving
+concurrency it is 13.9% and attention is 80.6%
+([errors/2026-08-21](../experience/errors/2026-08-21-decode-profile-taken-at-the-wrong-batch.md)),
+which changes the arithmetic in this lever's favour.
+
+**A verify does not multiply the KV read.** `forward_tokens_verify`
+(`qwen35_forward.rs:928`) runs with `seq_len = tokens.len()`, i.e. a
+prefill-shaped forward: the chain's `depth + 1` query rows attend over one KV
+pass. The c=1 measurement confirms it — 2.97 rows cost +10% of step time
+(20.50 → 22.57 ms), where tripling the 24% attention share would have cost +48%.
+
+So a batched d=2 verify leaves the 80% roughly where it is and pays only on the
+weight GEMM, which is superlinear past M=16 but small:
+
+| | c=16 | c=32 |
+|---|---:|---:|
+| attention (unchanged, KV read once) | 78.6 ms | 153.9 ms |
+| Marlin at M=b vs M=3b | 13.6 → **37.7** | 23.8 → **59** |
+| `gdr_decode` (per query row) | 3.4 → 10 | 6.1 → 18 |
+| other | 1.4 | 1.8 |
+| **step** | 99.1 → **~128** | 188.2 → **~231** |
+| tokens per step at 1.89 accept | 16 → 30.2 | 32 → 60.5 |
+| **ms per committed token** | 6.20 → **4.23** | 5.88 → **3.85** |
+| | **−32%** | **−35%** |
+
+Marlin's M=48 and M=96 costs are the measured sweep, not an extrapolation:
+0.0880 ms at M=16, 0.2442 at M=48, 0.3177 at M=64.
+
 ## What would kill it
 
 The c=1 win is 1.72x on the decode phase, but this workload is 154:1 prefill to
 decode, so it dilutes to +21.6% end-to-end. At higher concurrency the arithmetic
 runs the other way and the decode profile decides it:
 
-- KV read per decode step is **32 KB per token of context** (16 full-attention
-  layers of 64, `num_key_value_heads=4`, `head_dim=256`, FP8). At 32K that is
-  1.07 GB per sequence per step, so **34.4 GB at c=32 against 20.0 GB of
-  weights**.
-- A verify does **not** multiply the KV read — the chain attends over the same
-  context with `d` more query rows. So if the step is KV-bound at serving
-  concurrency, batched spec is close to free there too and the win is larger
-  than the Marlin arithmetic suggests.
-- If instead the step is still weight-GEMM-bound, Marlin is superlinear past
-  M=16 (0.0880 ms at M=16, 0.1731 at M=32, 0.3177 at M=64), and d=2 at c=16
-  presents M=48 — into the expensive region. Then the gate should open only up
-  to a measured row ceiling, not to `spec_max_batch`.
-
-Either way the gate wants a row-count ceiling rather than a request-count one,
-since `M = b*(d+1)` is what the kernel sees.
+- The table assumes the batched verify packs N sequences as a varlen batch with
+  each sequence's KV read once. If it instead presents `N * (depth + 1)` rows to
+  the decode attention path, attention triples and the lever dies outright. This
+  is the first thing the implementation must prove, with a kernel-time capture
+  and not with a step-time delta.
+- `gdr_decode_batch_kernel` is per query row and does triple. It is 3.5% today,
+  so it costs about 7 ms at c=16 — already in the table.
+- The gate wants a row-count ceiling, not a request-count one: `M = b*(d+1)` is
+  what Marlin sees, and it is superlinear past M=16.
 
 ## Verification
 
