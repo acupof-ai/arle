@@ -6,6 +6,19 @@
 > DSv4-Flash receipt pending a 4-GPU window (TP4; the `cuda`-only candidate
 > binaries also need a `nccl` rebuild, done: `/root/arle-runs/arle-*-nccl`).
 >
+> Evidence qualification (2026-08-21): the contract was unsatisfiable until
+> now — `run_fp8_probe.sh` emitted `verified_binary` (reducer accepts only
+> `verified_manifest`), the e2e artifact was keyed to the probe binary digest
+> (the gate runs under `arle serve`), and nothing produced the artifact.
+> Fixed: identity is the kernel bundle id; `scripts/operator_e2e_artifact.py`
+> produces the artifact. Runbook for the next GPU window, per operator with a
+> probe (today only `qwen.fp8_dense_projection`):
+> build arle + probe from a clean commit with the exported kernel manifest →
+> needle ladder on the canonical model → `operator_e2e_artifact.py` →
+> `run_fp8_probe.sh` → `reduce_operator_evidence.py` → regenerated policy is a
+> runtime change (exact cells) and takes the normal A/B + needle receipt before
+> `fallback_status` moves off `legacy-default-unqualified`.
+>
 > Scope: all production CUDA operator paths for Qwen3, Qwen3.5/3.6/3.8,
 > DeepSeek V4, GLM-5.2, and OPD autograd.
 >

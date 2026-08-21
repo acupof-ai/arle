@@ -7,7 +7,9 @@
 #   ARLE_SMALLM_E2E_STATUS=passed|failed|not_run
 #
 # passed/failed E2E requires ARLE_SMALLM_E2E_ARTIFACT pointing to an
-# arle.operator-e2e/v1 JSON artifact for this exact binary and kernel bundle.
+# arle.operator-e2e/v1 JSON artifact (scripts/operator_e2e_artifact.py) for the
+# same kernel bundle as the probe binary; the serve binary that ran the gate
+# differs from the probe binary by construction and is recorded, not matched.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -46,7 +48,7 @@ if [[ -n "$MANIFEST" ]]; then
     # First line only: `--kernel-build-id` also prints `capabilities:` (06a27527e).
     EMBEDDED_BUNDLE_ID="$("$PROBE_BIN" --kernel-build-id | head -n1)" || die "probe binary cannot report its kernel build ID"
     [[ "$EMBEDDED_BUNDLE_ID" == "$BUNDLE_ID" ]] || die "kernel manifest ID does not match the probe binary"
-    BUNDLE_ID_SOURCE="verified_binary"
+    BUNDLE_ID_SOURCE="verified_manifest"
     BUNDLE_MANIFEST_SHA256="$(cuda_prebuilt_hash_file "$MANIFEST")"
 else
     BUNDLE_ID=""
@@ -69,17 +71,17 @@ case "$E2E_STATUS" in
         [[ -f "$E2E_ARTIFACT" ]] || die "E2E artifact missing: $E2E_ARTIFACT"
         E2E_PASS=0
         [[ "$E2E_STATUS" == "passed" ]] && E2E_PASS=1
-        E2E_MODEL_REVISION="$(python3 - "$E2E_ARTIFACT" "$E2E_PASS" "$BINARY_ID" "$BUNDLE_ID" <<'PY'
+        E2E_MODEL_REVISION="$(python3 - "$E2E_ARTIFACT" "$E2E_PASS" "$BUNDLE_ID" <<'PY'
 import json, sys
-path, expected_pass, binary_id, bundle_id = sys.argv[1:]
+path, expected_pass, bundle_id = sys.argv[1:]
 with open(path, encoding="utf-8") as handle:
     artifact = json.load(handle)
 if artifact.get("schema_version") != "arle.operator-e2e/v1":
     raise SystemExit("E2E artifact has wrong schema")
 if artifact.get("passed") is not (expected_pass == "1"):
     raise SystemExit("E2E artifact verdict differs from requested status")
-if artifact.get("binary_id") != binary_id or artifact.get("bundle_id") != bundle_id:
-    raise SystemExit("E2E artifact identity differs from probe binary/bundle")
+if not bundle_id or artifact.get("bundle_id") != bundle_id:
+    raise SystemExit("E2E artifact kernel bundle differs from the probe binary's")
 model = artifact.get("model_revision", {})
 if model.get("kind") != "actual" or not model.get("id"):
     raise SystemExit("E2E artifact must name an actual model revision")
