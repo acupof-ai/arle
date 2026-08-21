@@ -110,9 +110,18 @@ using SM90_PP = SM90W4A8Config<M, N, K, A, B, C, Sched::PP>;
 template <int M, int N, int K, int A, int B, int C>
 using SM90_CO = SM90W4A8Config<M, N, K, A, B, C, Sched::CO>;
 
-// Workspace layout: pointer arrays (4×E×8) + stride arrays (4×E×24) + CUTLASS workspace.
+// Each pointer array must begin 16B aligned. CUTLASS builds the prototype TMA
+// descriptor from the array's own address (not from a pointer it reads out of
+// it), and `make_tma_copy_desc` asserts that address is 16B aligned — so an odd
+// expert count, which lands the A array on an 8B boundary, aborts the process.
+static constexpr size_t ptr_array_stride(int num_experts) {
+  return (static_cast<size_t>(num_experts) * 8 + 15) & ~static_cast<size_t>(15);
+}
+
+// Workspace layout: 4 pointer arrays (each padded to 16B) + stride arrays
+// (4×E×24) + CUTLASS workspace.
 static constexpr size_t metadata_bytes(int num_experts) {
-  return static_cast<size_t>(num_experts) * (4 * 8 + 4 * 24);
+  return 4 * ptr_array_stride(num_experts) + static_cast<size_t>(num_experts) * 4 * 24;
 }
 
 }  // namespace
@@ -182,11 +191,12 @@ int run_grouped_gemm(
 
   // Device-side pointer + stride computation (matches SGLang's
   // int4_fp8_get_group_gemm_starts).
+  const size_t ptr_stride = ptr_array_stride(num_exp);
   auto* d_b_ptrs = reinterpret_cast<const QuantType**>(meta_d);
-  auto* d_a_ptrs = reinterpret_cast<const MmaType**>(meta_d + num_exp * 8);
-  auto* d_out_ptrs = reinterpret_cast<ElementD**>(meta_d + 2 * num_exp * 8);
-  auto* d_b_scales_ptrs = reinterpret_cast<const typename Gemm::ElementScalePacked**>(meta_d + 3 * num_exp * 8);
-  auto* d_strides = reinterpret_cast<int64_t*>(meta_d + 4 * num_exp * 8);
+  auto* d_a_ptrs = reinterpret_cast<const MmaType**>(meta_d + ptr_stride);
+  auto* d_out_ptrs = reinterpret_cast<ElementD**>(meta_d + 2 * ptr_stride);
+  auto* d_b_scales_ptrs = reinterpret_cast<const typename Gemm::ElementScalePacked**>(meta_d + 3 * ptr_stride);
+  auto* d_strides = reinterpret_cast<int64_t*>(meta_d + 4 * ptr_stride);
 
   w4a8_get_group_gemm_starts<<<1, num_exp, 0, stream>>>(
       expert_offsets, d_a_ptrs, d_b_ptrs, d_out_ptrs,
