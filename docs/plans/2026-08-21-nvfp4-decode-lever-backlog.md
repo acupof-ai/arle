@@ -39,68 +39,69 @@ Measured c=1 ITL is **20.46 ms**.
 
 **Decode runs at 24.5% of its bandwidth roofline. 4.1x is on the table.**
 
-And `ncu` says why it is not taken: Marlin is at 87% of SM peak — *issue*-bound,
-not bandwidth-bound. It is spending its instruction slots, not its bytes. That
-single fact orders everything below: the levers that reduce **instructions per
-weight byte** come first, and the levers that reduce **bytes** only pay once the
-kernel is actually bandwidth-limited.
+`ncu` says why it is not taken: Marlin is at 87% of SM peak — *issue*-bound,
+not bandwidth-bound. Measured directly at the kernel, it reads 100.27 MB in
+0.0629 ms at M=1, which is **1,594 GB/s, 39.8% of the card**. It is spending its
+instruction slots, not its bytes.
+
+The first attempt to fix that by issuing fewer, wider instructions failed: the
+vendored CUTLASS sm_90 `wgmma`/TMA collective reaches only 952 GB/s at M=1 and
+is 0.65x Marlin
+([errors/2026-08-21](../experience/errors/2026-08-21-sm90-collective-loses-below-m32.md)).
+What the same sweep did find is that **Marlin costs the same at M=8 as at M=1**,
+which moves the lever from kernel speed to row count and reorders everything
+below.
 
 ## Ranked
 
-### 1. An sm_90-native mixed-input GEMM to replace Marlin — OPEN, the only 2x-class lever
+### 1. More rows per Marlin call — OPEN, now the measured top lever
 
-**Marlin is an sm_80 kernel running unmodified on Hopper.** Its inner loop is
-`mma.sync.aligned.m16n8k16` with `cp_async` staging
-(`csrc/gemm/marlin/marlin_template.h:86,92,688,784`), and its only architecture
-guard is `__CUDA_ARCH__ < 800`. There is no `wgmma` and no TMA anywhere in it.
+**Marlin costs the same at M=8 as at M=1**: 0.0629 ms for 1, 4 and 8 rows of
+`gate_up [34816, 5120]`, identical to four digits. It first moves at M=16
+(1.40x) and grows roughly linearly after
+([errors/2026-08-21](../experience/errors/2026-08-21-sm90-collective-loses-below-m32.md)).
 
-That is exactly the wrong shape for an issue-bound kernel on sm_90:
+So the lever on the 68.3% is not a faster kernel at one row. Rows 2 through 8
+are free, and the question is what fills them.
 
-| | Marlin (sm_80 path) | sm_90 native |
-|---|---|---|
-| MMA | `mma.sync` m16n8k16, one per warp | `wgmma` m64nNk16, one per **warpgroup** |
-| weight staging | `cp.async`, per-thread address math | TMA, one descriptor per tile |
-| pipeline | synchronous warps | producer/consumer warp specialisation |
+Speculative decode is the mechanism: a verify step of `b` requests by `d` draft
+tokens presents `M = b*(d+1)` to the same GEMM. At c=1 with `d=3`, M goes 1 to 4
+at zero extra GEMM time. The recorded MTP loss (-77%) was measured on a build
+whose `try_fp8_dequant_bf16_gemm_batch` re-dequantised 11.56 G FP8 params per
+verify; that defect is fixed and the prefill path has since been rewritten.
 
-Each row removes issue slots per unit of math — the quantity `ncu` says is
-binding. Nothing about occupancy, tiles or bank conflicts does, which is why
-[the three occupancy tunings](../experience/errors/2026-08-19-marlin-decode-is-not-occupancy-limited.md)
-all failed.
+Settles it: no-spec / MTP d=2 / MTP d=4 on the 32K chain, one binary, ITL and
+end-to-end.
 
-**The machinery is already in this tree.** The DSv4 W4A8 MoE path vendors
-CUTLASS's sm_90 mixed-input warp-specialised collective —
-`csrc/moe/w4a8/cutlass_extensions/gemm/collective/sm90_mma_array_tma_gmma_rs_warpspecialized_mixed_input_.hpp`
-plus its builder and four supporting headers. It is a *grouped* GEMM built for
-MoE; the dense decode shape needs the same collective with a different tile and
-scheduler.
+### 2. `gdr_decode_batch_kernel` — MEASURED, latency-bound
 
-**Upstream reference: vLLM's Machete**, which exists for precisely this reason —
-a CUTLASS 3.x mixed-input W4 GEMM written because Marlin's Ampere-era `mma.sync`
-core leaves Hopper's wgmma/TMA path unused. Port before invent.
+13.0% of decode GPU time, and `ncu` says it is nowhere near a ceiling: 17.5-19.4%
+of compute peak, 20.2-22.5% of memory, DRAM at 2%, IPC 0.66, achieved occupancy
+30.9% against a theoretical 100% that nothing caps. **61.6% of the stall is Long
+Scoreboard** — waiting on global loads — with 83.3% of cycles having no eligible
+warp. Bank conflicts are noise.
+([wins/2026-08-21](../experience/wins/2026-08-21-gdr-decode-batch-is-latency-bound.md))
 
-**The tradeoff, named.** `wgmma` has a hard M=64 minimum per warpgroup. At
-decode M=1-16 that wastes 75-98% of the MMA lanes. *That is the hypothesis under
-test*: wasted math is free if HBM is the real limit, and the 24.5%-of-roofline
-number says it is. If a small-M `wgmma` config lands below Marlin, the
-conclusion is that decode is issue-bound for a reason other than the MMA core,
-and the axis dies with a measurement.
+ncu replay kept only B=2 resident, so its "grid too small" rule is about the
+profiler. The per-warp findings transfer; a B=16 capture is needed before any
+edit.
 
-**Do not start by writing a kernel.** The pre-test is a standalone benchmark of
-the existing DSv4 W4A8 collective against `marlin_fp4_gemm` at the dense decode
-shapes (M in 1,4,8,16; N=34816/5120; K=5120/17408). One binary, no runtime
-changes, and it settles the axis before any dispatch work.
+### 3. Swap kernels above M=32 — OPEN, gated on #1 landing
 
-### 2. `gdr_decode_batch_kernel` — OPEN, unexamined
+The vendored CUTLASS sm_90 mixed-input collective **loses to Marlin below M=32
+and wins above it**: 0.65x at M=1, 0.90x at M=16, then 1.08x at M=32, 1.46x at
+M=48, **1.90x at M=64**. Marlin at M=1 achieves 1,594 GB/s against the
+collective's 952 GB/s, so `wgmma` and TMA do not help at one row — the axis is
+not a replacement for Marlin, it is a second arm above a row floor.
 
-13.0% of decode GPU time, 398.7 ms over 9,792 launches, 40.7 µs each. No `ncu`
-has ever been run on it. Unknown whether it is near a ceiling or has the kind of
-headroom the NVFP4 widen kernel turned out to have (4.0x, from two
-divergently-indexed tables).
+Serving decode runs M=1..16 today, so there is nothing to switch to yet. Spec
+decode is what pushes M there: `b=16, d=3` presents M=64, exactly where the
+collective is 1.90x. **Wire this only after #1 lands and the row count moves.**
 
-Cost: one `ncu` run — the cheapest information in this document. Settles whether
-it is a lever at all.
+Caveat kept open: the measured arm is the array/grouped variant, which pays
+per-group pointer indirection a dense Machete-style kernel would not.
 
-### 3. Wave quantisation on the Marlin launch grid — OPEN, bounded
+### 4. Wave quantisation on the Marlin launch grid — OPEN, bounded
 
 Decode is a tall-skinny GEMM (M=1-16 against N=34816). If `N / tile_n` leaves a
 partial wave across the SMs, the tail costs a full wave and the fix is one
@@ -110,7 +111,7 @@ answers it. Independent of #1 and cheap enough to run in the same session.
 Distinct from the occupancy tunings already killed: those raised *blocks per SM*;
 this is about whether the *total block count* divides the machine.
 
-### 4. Re-quantise the per-channel FP8 weights to NVFP4 — OPEN, but only after #1
+### 5. Re-quantise the per-channel FP8 weights to NVFP4 — OPEN, but only after #1
 
 38.2% of the parameters (10.62 B) are stored per-channel FP8 at one byte each.
 NVFP4 would halve them, cutting the per-token read ~5 GB — a 25% lower
