@@ -884,12 +884,16 @@ impl Tape {
                     }
                     BackwardOp::LinearAttention => {
                         let d_final_state = self.carry_state_grads.remove(&entry.output_id);
-                        ops::linear_attention_backward(
+                        let pairs = ops::linear_attention_backward(
                             &entry,
                             output_grad_id,
                             d_final_state,
                             store,
-                        )?
+                        )?;
+                        if let Some(parked) = d_final_state {
+                            store.free(parked)?;
+                        }
+                        pairs
                     }
                     BackwardOp::CpRecv => {
                         let SavedContext::CpRecvCtx { peer, len } = entry.saved else {
@@ -908,7 +912,13 @@ impl Tape {
                                 "final-state backward missing carry link",
                             ));
                         };
-                        self.carry_state_grads.insert(core_output, output_grad_id);
+                        // The loop frees output_grad_id after this arm; park an alias
+                        // of the same storage for the core entry to consume.
+                        store.ensure_device(output_grad_id)?;
+                        let shape = store.tensor(output_grad_id)?.shape.clone();
+                        let handle = store.device_handle(output_grad_id)?;
+                        let parked = store.alloc_device_tensor(shape, handle)?;
+                        self.carry_state_grads.insert(core_output, parked);
                         GradPairs::new()
                     }
                     BackwardOp::CausalSdpaRecompute => {
