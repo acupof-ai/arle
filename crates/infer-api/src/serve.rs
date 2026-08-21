@@ -177,10 +177,13 @@ pub fn checkpoint_has_mtp_head(model_path: &str) -> bool {
     ["mtp_num_hidden_layers", "num_nextn_predict_layers"]
         .iter()
         .any(|key| {
-            [cfg.get(key), cfg.get("text_config").and_then(|t| t.get(key))]
-                .into_iter()
-                .flatten()
-                .any(|v| v.as_u64().is_some_and(|n| n > 0))
+            [
+                cfg.get(key),
+                cfg.get("text_config").and_then(|t| t.get(key)),
+            ]
+            .into_iter()
+            .flatten()
+            .any(|v| v.as_u64().is_some_and(|n| n > 0))
         })
 }
 pub const DEFAULT_MTP_DRAFT_TOPK: usize = 1;
@@ -230,7 +233,11 @@ pub fn serve_http(
                 if head { "declares" } else { "declares no" },
                 if head { "mtp" } else { "no speculation" }
             );
-            if head { ServeSpecType::Mtp } else { ServeSpecType::None }
+            if head {
+                ServeSpecType::Mtp
+            } else {
+                ServeSpecType::None
+            }
         }
         other => other,
     };
@@ -517,7 +524,10 @@ mod spec_auto_tests {
     #[test]
     fn detects_every_shape_that_ships_a_head() {
         for (label, config) in [
-            ("qwen3.5 nested", r#"{"text_config":{"mtp_num_hidden_layers":1}}"#),
+            (
+                "qwen3.5 nested",
+                r#"{"text_config":{"mtp_num_hidden_layers":1}}"#,
+            ),
             ("qwen top level", r#"{"mtp_num_hidden_layers":1}"#),
             ("deepseek-v4", r#"{"num_nextn_predict_layers":1}"#),
         ] {
@@ -529,7 +539,10 @@ mod spec_auto_tests {
         }
         for (label, config) in [
             ("glm ships zero", r#"{"num_nextn_predict_layers":0}"#),
-            ("qwen zero nested", r#"{"text_config":{"mtp_num_hidden_layers":0}}"#),
+            (
+                "qwen zero nested",
+                r#"{"text_config":{"mtp_num_hidden_layers":0}}"#,
+            ),
             ("no key at all", r#"{"num_hidden_layers":64}"#),
         ] {
             let d = dir_with(config);
