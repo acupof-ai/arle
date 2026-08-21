@@ -779,7 +779,8 @@ pub fn linear_attention_core_carry(
     // The next segment's conv window is the last conv_kernel-1 rows of this
     // segment's conv input — a plain slice, so its gradient needs no kernel.
     let window = params.conv_kernel - 1;
-    let qkv_dim = 2 * params.num_key_heads * params.key_dim + params.num_value_heads * params.value_dim;
+    let qkv_dim =
+        2 * params.num_key_heads * params.key_dim + params.num_value_heads * params.value_dim;
     let conv_window_id = crate::ops::slice(
         qkv,
         &[0, params.seq_len - window, 0],
@@ -1091,7 +1092,12 @@ fn try_linear_attention_forward_device(
     if let Some(peer) = carry_peer {
         // Hand (final_state, conv window) to the successor rank, in that order;
         // the backward receives (d_window, d_state) in the mirrored order.
-        store.backend().cp_send_device(&result.final_state, state_len, peer)?;
+        if std::env::var_os("ARLE_OPD_CARRY_TRACE").is_some() {
+            eprintln!("[carry-trace] fwd send state+window -> {peer} (output {output_id:?})");
+        }
+        store
+            .backend()
+            .cp_send_device(&result.final_state, state_len, peer)?;
         let mut scratch = Tape::new();
         scratch.set_enabled(false);
         let tail = crate::ops::slice(
@@ -1260,16 +1266,19 @@ fn try_linear_attention_backward_device(
     // Successor rank's gradients at our carry, mirrored order: window, then state.
     let d_window_remote = carry_peer
         .map(|peer| {
+            if std::env::var_os("ARLE_OPD_CARRY_TRACE").is_some() {
+                eprintln!("[carry-trace] bwd recv d_window+d_state <- {peer}");
+            }
             let d_window = store
                 .backend()
                 .cp_recv_device(params.batch * window * qkv_dim, peer)?;
             let d_state = store.backend().cp_recv_device(state_len, peer)?;
             d_final_state_handle = Some(match d_final_state_handle.take() {
-                Some(parked) => store.backend().accumulate_into_device(
-                    &parked,
-                    &d_state,
-                    &[state_len],
-                )?,
+                Some(parked) => {
+                    store
+                        .backend()
+                        .accumulate_into_device(&parked, &d_state, &[state_len])?
+                }
                 None => d_state,
             });
             Ok::<_, AutogradError>(d_window)

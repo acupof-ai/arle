@@ -761,6 +761,7 @@ impl Tape {
             }
 
             let vram_profile = backward_vram_profile_enabled();
+            let carry_trace = std::env::var_os("ARLE_OPD_CARRY_TRACE").is_some();
             for &entry_index in post_order.iter().rev() {
                 let entry = self.entries[entry_index].clone();
                 let output_grad_id = match grads.get(&entry.output_id).copied() {
@@ -771,6 +772,21 @@ impl Tape {
                 let inner_op_seq = (entry.op != BackwardOp::Checkpoint)
                     .then(|| self.checkpoint_op_mem_begin(&entry, store))
                     .flatten();
+                if carry_trace
+                    && matches!(
+                        entry.op,
+                        BackwardOp::LinearAttention
+                            | BackwardOp::LinearAttentionFinalState
+                            | BackwardOp::CpRecv
+                    )
+                {
+                    eprintln!(
+                        "[carry-trace] bwd op={} output={:?} inputs={:?}",
+                        entry.op.name(),
+                        entry.output_id,
+                        entry.input_ids
+                    );
+                }
                 if profile.is_some() {
                     sync_profile_boundary(store)?;
                 }
@@ -868,7 +884,12 @@ impl Tape {
                     }
                     BackwardOp::LinearAttention => {
                         let d_final_state = self.carry_state_grads.remove(&entry.output_id);
-                        ops::linear_attention_backward(&entry, output_grad_id, d_final_state, store)?
+                        ops::linear_attention_backward(
+                            &entry,
+                            output_grad_id,
+                            d_final_state,
+                            store,
+                        )?
                     }
                     BackwardOp::CpRecv => {
                         let SavedContext::CpRecvCtx { peer, len } = entry.saved else {

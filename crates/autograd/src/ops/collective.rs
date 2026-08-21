@@ -357,6 +357,9 @@ pub fn cp_recv(
     tape: &mut Tape,
 ) -> Result<TensorId> {
     let len: usize = shape.iter().product();
+    if std::env::var_os("ARLE_OPD_CARRY_TRACE").is_some() {
+        eprintln!("[carry-trace] fwd recv {len} <- {peer}");
+    }
     let handle = store.backend().cp_recv_device(len, peer)?;
     let output_id = store.alloc_device_tensor(shape.to_vec(), handle)?;
     if tape.enabled {
