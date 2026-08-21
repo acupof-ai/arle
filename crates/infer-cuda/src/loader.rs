@@ -953,6 +953,8 @@ impl SafetensorLoader {
                         match MmapShard::map(&shards[i]) {
                             Ok(shard) => {
                                 let slice = shard.as_slice();
+                                // SAFETY: `slice` is the live mapping of this shard for
+                                // the duration of the call; madvise only hints the kernel.
                                 #[cfg(target_os = "linux")]
                                 unsafe {
                                     libc::madvise(
