@@ -1671,6 +1671,7 @@ mod gpu {
                         n,
                         k,
                         first.group_size,
+                        0,
                         ctx,
                         ctx.stream.cu_stream(),
                     )
@@ -1789,6 +1790,7 @@ mod gpu {
                         n,
                         k,
                         first.group_size,
+                        0,
                         ctx,
                         ctx.stream.cu_stream(),
                     )
