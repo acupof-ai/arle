@@ -37,6 +37,38 @@ namespace {
 constexpr int kMaxSplits = 16;
 }
 
+// A lane's `EPT` KV bytes are contiguous, so they are one aligned vector load
+// rather than EPT scalar byte loads. `ncu` measured the scalar form at 85%
+// excessive sectors: the L1 absorbed them (87% hit, DRAM at 5.9% of peak) but
+// the L1TEX pipeline still paid for every one, which is what pinned memory
+// throughput at 66.7%.
+template <int EPT>
+struct Paf3LaneBytes {
+    static_assert(EPT == 4 || EPT == 8, "head_dim must be 128 or 256");
+    union {
+        uint32_t w1;
+        uint2 w2;
+        uint8_t b[EPT];
+    };
+    __device__ __forceinline__ void load(const uint8_t* src) {
+        // `src` is `row_off + lane_id * EPT` and `row_off` is a multiple of
+        // HEAD_DIM, so the address is EPT-aligned.
+        if constexpr (EPT == 8) {
+            w2 = *reinterpret_cast<const uint2*>(src);
+        } else {
+            w1 = *reinterpret_cast<const uint32_t*>(src);
+        }
+    }
+    __device__ __forceinline__ float dequant(int i, bool int8_kv, float scale) const {
+        if (int8_kv) {
+            return static_cast<float>(static_cast<int8_t>(b[i])) * scale;
+        }
+        __nv_fp8_e4m3 v;
+        v.__x = b[i];
+        return static_cast<float>(v) * scale;
+    }
+};
+
 __device__ __forceinline__ float paf3_warp_reduce_sum(float val) {
     #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1) {
@@ -135,18 +167,13 @@ __global__ void paged_attention_quantized_fa3_partial_kernel(
                              + (size_t)kv_head * HEAD_DIM;
         const int scale_idx = (phys * page_size + off) * num_kv_heads + kv_head;
 
+        Paf3LaneBytes<EPT> k_bytes;
+        k_bytes.load(reinterpret_cast<const uint8_t*>(K_pool) + row_off + lane_id * EPT);
+        const float k_scale = K_scales[scale_idx];
         float qk = 0.0f;
         #pragma unroll
         for (int i = 0; i < EPT; i++) {
-            const int d = lane_id * EPT + i;
-            const float k_val = INT8_KV
-                ? static_cast<float>(
-                      reinterpret_cast<const int8_t*>(K_pool)[row_off + d])
-                      * K_scales[scale_idx]
-                : static_cast<float>(
-                      reinterpret_cast<const __nv_fp8_e4m3*>(K_pool)[row_off + d])
-                      * K_scales[scale_idx];
-            qk += q_reg[i] * k_val;
+            qk += q_reg[i] * k_bytes.dequant(i, INT8_KV, k_scale);
         }
         qk = paf3_warp_reduce_sum(qk);
 
@@ -155,17 +182,12 @@ __global__ void paged_attention_quantized_fa3_partial_kernel(
         const float exp_qk = __expf(qk - m_new);
         const float l_new = l_local * exp_diff + exp_qk;
 
+        Paf3LaneBytes<EPT> v_bytes;
+        v_bytes.load(reinterpret_cast<const uint8_t*>(V_pool) + row_off + lane_id * EPT);
+        const float v_scale = V_scales[scale_idx];
         #pragma unroll
         for (int i = 0; i < EPT; i++) {
-            const int d = lane_id * EPT + i;
-            const float v_val = INT8_KV
-                ? static_cast<float>(
-                      reinterpret_cast<const int8_t*>(V_pool)[row_off + d])
-                      * V_scales[scale_idx]
-                : static_cast<float>(
-                      reinterpret_cast<const __nv_fp8_e4m3*>(V_pool)[row_off + d])
-                      * V_scales[scale_idx];
-            o_reg[i] = o_reg[i] * exp_diff + exp_qk * v_val;
+            o_reg[i] = o_reg[i] * exp_diff + exp_qk * v_bytes.dequant(i, INT8_KV, v_scale);
         }
         m_local = m_new;
         l_local = l_new;
@@ -179,9 +201,14 @@ __global__ void paged_attention_quantized_fa3_partial_kernel(
         smem_m[warp_id] = m_local;
         smem_l[warp_id] = l_local;
     }
+    // Lane `l`'s element `i` is staged at `[i * 32 + l]` so a warp's 32 lanes hit
+    // 32 distinct banks. The slot still carries the value for `d = l * EPT + i`
+    // — smem is only a transfer buffer between the four warps, so write/read
+    // consistency is all that is required. The straight `[l * EPT + i]` index
+    // put lanes 0, 4, 8 ... on one bank: `ncu` measured 47.1% conflicts.
     #pragma unroll
     for (int i = 0; i < EPT; i++) {
-        smem_o[warp_id * HEAD_DIM + lane_id * EPT + i] = o_reg[i];
+        smem_o[warp_id * HEAD_DIM + i * PAF3_WARP_SIZE + lane_id] = o_reg[i];
     }
     __syncthreads();
 
@@ -191,7 +218,7 @@ __global__ void paged_attention_quantized_fa3_partial_kernel(
         float final_o[EPT];
         #pragma unroll
         for (int i = 0; i < EPT; i++) {
-            final_o[i] = smem_o[lane_id * EPT + i];
+            final_o[i] = smem_o[i * PAF3_WARP_SIZE + lane_id];
         }
 
         #pragma unroll
@@ -206,7 +233,7 @@ __global__ void paged_attention_quantized_fa3_partial_kernel(
 
             #pragma unroll
             for (int i = 0; i < EPT; i++) {
-                const float o_w = smem_o[w * HEAD_DIM + lane_id * EPT + i];
+                const float o_w = smem_o[w * HEAD_DIM + i * PAF3_WARP_SIZE + lane_id];
                 final_o[i] = final_o[i] * scale_prev + o_w * scale_w;
             }
             final_l = final_l * scale_prev + l_w * scale_w;
