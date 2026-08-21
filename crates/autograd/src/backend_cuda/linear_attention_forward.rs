@@ -104,6 +104,7 @@ pub(super) fn cuda_linear_attention_forward_device(
         a_inv: concat(|r| &r.a_inv)?,
         chunk_state: concat(|r| &r.chunk_state)?,
         raw_output: concat(|r| &r.raw_output)?,
+        final_state: concat(|r| &r.final_state)?,
         flashqla: rows[0].flashqla,
     }))
 }
@@ -718,5 +719,6 @@ pub(super) fn cuda_linear_attention_forward_device_row(
         chunk_state: DeviceHandle::Cuda(CudaStorage::new(chunk_state)),
         raw_output: DeviceHandle::CudaBf16(CudaBf16Storage::new(raw_output)),
         flashqla: use_chunkwise,
+        final_state: DeviceHandle::Cuda(CudaStorage::new(final_state)),
     })
 }

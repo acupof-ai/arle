@@ -556,6 +556,9 @@ pub struct LinearAttentionDeviceForwardResult {
     /// The forward took the FlashQLA chunkwise route, so the backward must too.
     /// Recorded on the tape: the runtime flag can flip between calls.
     pub flashqla: bool,
+    /// Recurrent state after the last row, `[num_value_heads, key_dim, value_dim]`
+    /// f32 — the carry a sequence-parallel successor seeds from.
+    pub final_state: DeviceHandle,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -583,6 +586,9 @@ pub struct LinearAttentionDeviceBackwardArgs<'a> {
     // OPD conv carry (None = default). Feeds the conv1d backward boundary taps'
     // grad_weight; the recurrent state carry lives in chunk_state[0], not here.
     pub initial_conv_window: Option<&'a DeviceHandle>,
+    /// Gradient arriving at `final_state` from a successor that seeded from it
+    /// (sequence-parallel carry). None = zero.
+    pub d_final_state: Option<&'a DeviceHandle>,
 }
 
 #[derive(Debug, Clone)]
@@ -595,6 +601,11 @@ pub struct LinearAttentionDeviceBackwardResult {
     pub ddt: DeviceHandle,
     pub da_log: DeviceHandle,
     pub dnorm: DeviceHandle,
+    /// d/d(initial_state); Some on the FlashQLA route.
+    pub d_initial_state: Option<DeviceHandle>,
+    /// d/d(initial_conv_window) `[conv_kernel-1, qkv_dim]` f32; Some when a
+    /// window was carried in.
+    pub d_initial_conv_window: Option<DeviceHandle>,
 }
 
 /// Communicator group: `Seq` = CP subgroup, `Expert` = EP group (both == `World`
@@ -1377,6 +1388,23 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
             });
         }
         self.upload(&host, block_shape)
+    }
+
+    /// Point-to-point send of `len` f32 to `peer` on the CP communicator
+    /// (sequence-parallel state carry). Caller pairs it with `cp_recv_device`.
+    fn cp_send_device(&self, handle: &DeviceHandle, len: usize, peer: usize) -> Result<()> {
+        let _ = (handle, len, peer);
+        Err(crate::AutogradError::TapeInvariant(
+            "cp_send_device: no CP communicator on this backend",
+        ))
+    }
+
+    /// Point-to-point receive of `len` f32 from `peer` on the CP communicator.
+    fn cp_recv_device(&self, len: usize, peer: usize) -> Result<DeviceHandle> {
+        let _ = (len, peer);
+        Err(crate::AutogradError::TapeInvariant(
+            "cp_recv_device: no CP communicator on this backend",
+        ))
     }
 
     /// All-to-all: split `scatter_axis` across ranks, concatenate each rank's

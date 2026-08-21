@@ -173,6 +173,9 @@ pub enum SavedContext {
         /// forward exactly. `None` for the default full-sequence path.
         initial_state: Option<TensorId>,
         initial_conv_window: Option<TensorId>,
+        /// Sequence-parallel successor rank: the forward sent (final_state,
+        /// conv window) there; the backward receives (d_window, d_state) back.
+        carry_peer: Option<usize>,
         batch: usize,
         seq_len: usize,
         num_key_heads: usize,
@@ -192,6 +195,16 @@ pub enum SavedContext {
     },
     CheckpointCtx {
         function_id: usize,
+    },
+    /// `LinearAttentionFinalState`: the core entry's output id.
+    CarryLink {
+        core_output: TensorId,
+    },
+    /// `CpRecv`: the sender rank and element count; the backward sends the
+    /// gradient back.
+    CpRecvCtx {
+        peer: usize,
+        len: usize,
     },
     SeqChunkedRecomputeCtx {
         function_id: usize,
@@ -273,6 +286,12 @@ pub enum BackwardOp {
     FusedLinearDistill,
     GeneralizedJsd,
     LinearAttention,
+    /// Companion of a `LinearAttention` entry: its output is the recurrence's
+    /// final state. The backward parks the incoming grad for the core entry
+    /// (`carry_state_grads`), which reads it as `d_final_state`.
+    LinearAttentionFinalState,
+    /// Point-to-point receive on the CP communicator; backward sends the grad back.
+    CpRecv,
     CausalSdpaRecompute,
     AllReduceSum,
     AllGatherSeq,
@@ -321,6 +340,8 @@ impl BackwardOp {
             BackwardOp::FusedLinearDistill => "FusedLinearDistill",
             BackwardOp::GeneralizedJsd => "GeneralizedJsd",
             BackwardOp::LinearAttention => "LinearAttention",
+            BackwardOp::LinearAttentionFinalState => "LinearAttentionFinalState",
+            BackwardOp::CpRecv => "CpRecv",
             BackwardOp::CausalSdpaRecompute => "CausalSdpaRecompute",
             BackwardOp::AllReduceSum => "AllReduceSum",
             BackwardOp::AllGatherSeq => "AllGatherSeq",
@@ -461,6 +482,9 @@ pub struct Tape {
     pub(crate) offload_checkpoints: bool,
     skip_next_checkpoint_input_offload: bool,
     checkpoint_op_mem_scope: Option<Arc<Mutex<CheckpointOpMemScope>>>,
+    /// d/d(final_state) parked by `LinearAttentionFinalState`, keyed by the
+    /// core entry's output id, consumed by that entry's backward.
+    carry_state_grads: HashMap<TensorId, TensorId>,
     checkpoint_op_mem_disarmed: bool,
 }
 
@@ -484,6 +508,7 @@ impl Tape {
             skip_next_checkpoint_input_offload: false,
             checkpoint_op_mem_scope: None,
             checkpoint_op_mem_disarmed: false,
+            carry_state_grads: HashMap::new(),
         }
     }
 
@@ -736,6 +761,7 @@ impl Tape {
             }
 
             let vram_profile = backward_vram_profile_enabled();
+            let carry_trace = std::env::var_os("ARLE_OPD_CARRY_TRACE").is_some();
             for &entry_index in post_order.iter().rev() {
                 let entry = self.entries[entry_index].clone();
                 let output_grad_id = match grads.get(&entry.output_id).copied() {
@@ -746,6 +772,21 @@ impl Tape {
                 let inner_op_seq = (entry.op != BackwardOp::Checkpoint)
                     .then(|| self.checkpoint_op_mem_begin(&entry, store))
                     .flatten();
+                if carry_trace
+                    && matches!(
+                        entry.op,
+                        BackwardOp::LinearAttention
+                            | BackwardOp::LinearAttentionFinalState
+                            | BackwardOp::CpRecv
+                    )
+                {
+                    eprintln!(
+                        "[carry-trace] bwd op={} output={:?} inputs={:?}",
+                        entry.op.name(),
+                        entry.output_id,
+                        entry.input_ids
+                    );
+                }
                 if profile.is_some() {
                     sync_profile_boundary(store)?;
                 }
@@ -842,7 +883,33 @@ impl Tape {
                         ops::generalized_jsd_backward(&entry, output_grad_id, store)?
                     }
                     BackwardOp::LinearAttention => {
-                        ops::linear_attention_backward(&entry, output_grad_id, store)?
+                        let d_final_state = self.carry_state_grads.remove(&entry.output_id);
+                        ops::linear_attention_backward(
+                            &entry,
+                            output_grad_id,
+                            d_final_state,
+                            store,
+                        )?
+                    }
+                    BackwardOp::CpRecv => {
+                        let SavedContext::CpRecvCtx { peer, len } = entry.saved else {
+                            return Err(AutogradError::TapeInvariant(
+                                "cp_recv backward missing context",
+                            ));
+                        };
+                        store.ensure_device(output_grad_id)?;
+                        let grad = store.device_handle(output_grad_id)?;
+                        store.backend().cp_send_device(&grad, len, peer)?;
+                        GradPairs::new()
+                    }
+                    BackwardOp::LinearAttentionFinalState => {
+                        let SavedContext::CarryLink { core_output } = entry.saved else {
+                            return Err(AutogradError::TapeInvariant(
+                                "final-state backward missing carry link",
+                            ));
+                        };
+                        self.carry_state_grads.insert(core_output, output_grad_id);
+                        GradPairs::new()
                     }
                     BackwardOp::CausalSdpaRecompute => {
                         ops::causal_sdpa_recompute_backward(&entry, output_grad_id, store)?
@@ -899,6 +966,10 @@ impl Tape {
                 let output_grad_reused = input_grads
                     .iter()
                     .any(|(_, grad_id)| *grad_id == output_grad_id);
+                if carry_trace && entry.op == BackwardOp::LinearAttention {
+                    let ids: Vec<TensorId> = input_grads.iter().map(|(id, _)| *id).collect();
+                    eprintln!("[carry-trace] la-bwd pushed grads for {ids:?}");
+                }
                 for (input_id, grad_id) in input_grads {
                     merge_grad(
                         &mut grads,

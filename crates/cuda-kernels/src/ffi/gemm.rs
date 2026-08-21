@@ -526,6 +526,7 @@ unsafe extern "C" {
         n: i32,
         k: i32,
         group_size: i32,
+        xor_mask: u32,
         stream: CUstream,
     ) -> CUresult;
 
@@ -545,6 +546,7 @@ unsafe extern "C" {
         n: i32,
         k: i32,
         group_size: i32,
+        xor_mask: u32,
         stream: CUstream,
     ) -> CUresult;
 
@@ -1036,8 +1038,8 @@ unsafe extern "C" {
         bits: i32,
         stream: CUstream,
     );
-}
 
+}
 #[cfg(test)]
 #[path = "gemm_tests.rs"]
 mod tests;

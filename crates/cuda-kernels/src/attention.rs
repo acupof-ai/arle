@@ -1308,7 +1308,7 @@ pub fn fa3_fwd_hd256_quant(
 // ---------------------------------------------------------------------------
 // DSv4 MLA/DSA/compressor attention family: typed launchers over the FlashMLA
 // shim, DSA indexer, compressor/window-cache, QK prep, output inverse-RoPE, TP
-// repack/slice, and top-k transform FFI (T3-s3). Pointer args are raw u64
+// repack/slice, and top-k transform FFI. Pointer args are raw u64
 // device addresses (0 = null where the ABI allows it); scalar args mirror the
 // FFI types so consumers pass identical values. Callers keep every owning
 // buffer alive and stream-ordered on `stream`.

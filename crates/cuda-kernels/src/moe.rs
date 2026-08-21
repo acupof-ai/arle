@@ -816,6 +816,7 @@ pub unsafe fn moe_w4a16_grouped_gemv_batch(
     n: usize,
     k: usize,
     group_size: usize,
+    xor_mask: u32,
     ctx: &DeviceContext,
     stream: CUstream,
 ) -> Result<()> {
@@ -837,6 +838,7 @@ pub unsafe fn moe_w4a16_grouped_gemv_batch(
             i32::try_from(n)?,
             i32::try_from(k)?,
             i32::try_from(group_size)?,
+            xor_mask,
             stream,
         )
         .result()?;
@@ -868,6 +870,7 @@ pub unsafe fn moe_w4a16_grouped_gemv_pair_batch(
     n: usize,
     k: usize,
     group_size: usize,
+    xor_mask: u32,
     ctx: &DeviceContext,
     stream: CUstream,
 ) -> Result<()> {
@@ -894,6 +897,7 @@ pub unsafe fn moe_w4a16_grouped_gemv_pair_batch(
             i32::try_from(n)?,
             i32::try_from(k)?,
             i32::try_from(group_size)?,
+            xor_mask,
             stream,
         )
         .result()?;
