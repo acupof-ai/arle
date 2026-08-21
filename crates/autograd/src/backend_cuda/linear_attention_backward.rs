@@ -1,7 +1,6 @@
 use super::*;
 
 #[cfg(not(feature = "no-cuda"))]
-
 /// (H, Hg) is an AOT instantiation parameter; under context parallelism each
 /// rank owns H/cp value heads and Hg/cp key heads, so the built set is one
 /// geometry per (model, cp_size). The table is generated from kernels.toml.
@@ -26,7 +25,6 @@ pub(super) fn flashqla_gdr_symbols(h: usize, hg: usize) -> Result<&'static ffi::
 /// A/B escape hatch: force the legacy monolithic chunked-scan backward (one
 /// block per batch x value_head) instead of the staged chunk-parallel path.
 #[cfg(not(feature = "no-cuda"))]
-
 /// Max concurrent chunk lanes in the stage-3 grad kernel. Bounds the per-block
 /// history slab at `wave x rows x 64 x state_elems` f32 (1.6 GiB at 48 heads,
 /// 128x128 state) independent of seq_len; 8 lanes x 48 rows = 384 blocks fills
