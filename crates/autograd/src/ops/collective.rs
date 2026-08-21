@@ -363,14 +363,14 @@ pub fn cp_recv(
     let handle = store.backend().cp_recv_device(len, peer)?;
     let output_id = store.alloc_device_tensor(shape.to_vec(), handle)?;
     if tape.enabled {
+        // No inputs, so `record` would derive requires_grad=false and drop it.
         store.set_requires_grad(output_id, true)?;
-        TapeEntry {
+        tape.entries.push(TapeEntry {
             op: BackwardOp::CpRecv,
             output_id,
             input_ids: smallvec![],
             saved: SavedContext::CpRecvCtx { peer, len },
-        }
-        .record(store, tape)?;
+        });
     }
     Ok(output_id)
 }
