@@ -45,27 +45,34 @@ constexpr int kMaxSplits = 16;
 template <int EPT>
 struct Paf3LaneBytes {
     static_assert(EPT == 4 || EPT == 8, "head_dim must be 128 or 256");
-    union {
-        uint32_t w1;
-        uint2 w2;
-        uint8_t b[EPT];
-    };
+    // Words, not a byte array behind a union: nvcc cannot keep a union in
+    // registers here and round-trips it through memory, which SASS showed as
+    // 48 LDG.E.U8 becoming a store plus 96 LDS. Shifting the byte out of a
+    // register word keeps the whole row resident.
+    uint32_t w[EPT / 4];
+
     __device__ __forceinline__ void load(const uint8_t* src) {
         // `src` is `row_off + lane_id * EPT` and `row_off` is a multiple of
         // HEAD_DIM, so the address is EPT-aligned.
         if constexpr (EPT == 8) {
-            w2 = *reinterpret_cast<const uint2*>(src);
+            const uint2 v = *reinterpret_cast<const uint2*>(src);
+            w[0] = v.x;
+            w[1] = v.y;
         } else {
-            w1 = *reinterpret_cast<const uint32_t*>(src);
+            w[0] = *reinterpret_cast<const uint32_t*>(src);
         }
     }
-    __device__ __forceinline__ float dequant(int i, bool int8_kv, float scale) const {
+
+    // Unscaled: the KV scale is constant over `d`, so it multiplies once
+    // outside the per-element loop rather than EPT times inside it.
+    __device__ __forceinline__ float raw(int i, bool int8_kv) const {
+        const uint32_t byte = (w[i >> 2] >> ((i & 3) * 8)) & 0xFFu;
         if (int8_kv) {
-            return static_cast<float>(static_cast<int8_t>(b[i])) * scale;
+            return static_cast<float>(static_cast<int8_t>(static_cast<uint8_t>(byte)));
         }
         __nv_fp8_e4m3 v;
-        v.__x = b[i];
-        return static_cast<float>(v) * scale;
+        v.__x = static_cast<unsigned char>(byte);
+        return static_cast<float>(v);
     }
 };
 
@@ -169,13 +176,12 @@ __global__ void paged_attention_quantized_fa3_partial_kernel(
 
         Paf3LaneBytes<EPT> k_bytes;
         k_bytes.load(reinterpret_cast<const uint8_t*>(K_pool) + row_off + lane_id * EPT);
-        const float k_scale = K_scales[scale_idx];
         float qk = 0.0f;
         #pragma unroll
         for (int i = 0; i < EPT; i++) {
-            qk += q_reg[i] * k_bytes.dequant(i, INT8_KV, k_scale);
+            qk += q_reg[i] * k_bytes.raw(i, INT8_KV);
         }
-        qk = paf3_warp_reduce_sum(qk);
+        qk = paf3_warp_reduce_sum(qk) * K_scales[scale_idx];
 
         const float m_new = fmaxf(m_local, qk);
         const float exp_diff = __expf(m_local - m_new);
@@ -184,10 +190,11 @@ __global__ void paged_attention_quantized_fa3_partial_kernel(
 
         Paf3LaneBytes<EPT> v_bytes;
         v_bytes.load(reinterpret_cast<const uint8_t*>(V_pool) + row_off + lane_id * EPT);
-        const float v_scale = V_scales[scale_idx];
+        // One multiply folds `exp_qk` and the V scale together for the whole row.
+        const float exp_v = exp_qk * V_scales[scale_idx];
         #pragma unroll
         for (int i = 0; i < EPT; i++) {
-            o_reg[i] = o_reg[i] * exp_diff + exp_qk * v_bytes.dequant(i, INT8_KV, v_scale);
+            o_reg[i] = o_reg[i] * exp_diff + exp_v * v_bytes.raw(i, INT8_KV);
         }
         m_local = m_new;
         l_local = l_new;
