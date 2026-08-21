@@ -70,8 +70,11 @@ keep their own defaults.
 cross-backend modules — everything above the seam (`infer-core` / `-server` /
 `-api`) stays device-neutral; backend types live only in `infer-cuda` /
 `infer-metal`. CUDA stubs on other targets: `todo!("GPU required: ...")`. Mac
-pre-push typecheck without nvcc:
-`cargo check -p infer-api --release --no-default-features --features cuda,no-cuda --lib`.
+pre-push lint without nvcc (CI Lint mirror; `CUDARC_CUDA_VERSION` skips the
+toolkit probe):
+`CUDARC_CUDA_VERSION=12080 cargo clippy -p infer-api --release --no-default-features --features cuda,no-cuda,nccl,deepep --lib -- -D warnings`.
+Run it before pushing any `infer-cuda` / `cuda-kernels` / cuda-gated `cli`
+edit; `metal,no-cuda` and plain `cargo check` never see those lints.
 
 **Every runtime change produces a bench entry.** A dated entry under
 `docs/experience/wins/` (or `errors/` on regression) — no entry, not shipped. In
