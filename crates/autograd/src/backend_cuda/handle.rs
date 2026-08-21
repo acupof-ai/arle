@@ -457,9 +457,9 @@ impl CudaBackend {
                 AutogradError::TapeInvariant("cuda alloc_zeros failed (bf16 bridge)")
             })?;
             let (dst_ptr, _dst_guard) = staging.device_ptr_mut(&self.stream);
-            // SAFETY: dst spans byte_count bytes (`_dst_guard` held); the caller
-            // guarantees src_device_ptr covers byte_count bytes until the sync.
             check_cuda_ffi(
+                // SAFETY: dst spans byte_count bytes (`_dst_guard` held); the caller
+                // guarantees src_device_ptr covers byte_count bytes until the sync.
                 unsafe {
                     cuMemcpyDtoD_v2(
                         dst_ptr as CUdeviceptr,
@@ -495,15 +495,15 @@ impl CudaBackend {
             .stream
             .record_event(None)
             .map_err(|_| AutogradError::TapeInvariant("bf16 bridge alloc event create failed"))?;
-        // SAFETY: event and src_stream are valid in this (primary) context.
         check_cuda_ffi(
+            // SAFETY: event and src_stream are valid in this (primary) context.
             unsafe { cuStreamWaitEvent(src_stream as CUstream, alloc_event.cu_event(), 0) },
             "bf16 bridge src stream wait alloc",
         )?;
-        // SAFETY: dst spans byte_count bytes (`_dst_guard` held); the caller
-        // guarantees src_device_ptr covers byte_count bytes and src_stream is a
-        // valid stream in this context whose queued work produced the source.
         check_cuda_ffi(
+            // SAFETY: dst spans byte_count bytes (`_dst_guard` held); the caller
+            // guarantees src_device_ptr covers byte_count bytes and src_stream is a
+            // valid stream in this context whose queued work produced the source.
             unsafe {
                 cuMemcpyDtoDAsync_v2(
                     dst_ptr as CUdeviceptr,
@@ -522,8 +522,8 @@ impl CudaBackend {
             .context()
             .new_event(None)
             .map_err(|_| AutogradError::TapeInvariant("bf16 bridge event create failed"))?;
-        // SAFETY: event and src_stream are valid in this (primary) context.
         check_cuda_ffi(
+            // SAFETY: event and src_stream are valid in this (primary) context.
             unsafe { cuEventRecord(event.cu_event(), src_stream as CUstream) },
             "bf16 bridge event record",
         )?;

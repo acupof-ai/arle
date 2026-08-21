@@ -367,29 +367,6 @@ impl CudaFp4E2M1GroupStorage {
         }
     }
 
-    /// NON-OWNING view over an infer engine's resident NVFP4 base. See
-    /// [`CudaFp8BlockScaledStorage::new_borrowed`].
-    pub(crate) fn new_borrowed(
-        weight: cudarc::driver::CudaSlice<u8>,
-        scales: cudarc::driver::CudaSlice<u8>,
-        global_scale: cudarc::driver::CudaSlice<f32>,
-        rows: usize,
-        cols: usize,
-        group_size: usize,
-        scale_cols: usize,
-    ) -> Self {
-        Self {
-            weight: Arc::new(weight),
-            scales: Arc::new(scales),
-            global_scale: Arc::new(global_scale),
-            rows,
-            cols,
-            group_size,
-            scale_cols,
-            borrowed: true,
-        }
-    }
-
     pub(crate) fn weight(&self) -> &cudarc::driver::CudaSlice<u8> {
         self.weight.as_ref()
     }
