@@ -90,10 +90,13 @@ Three bugs found and fixed:
    instead of the actual `N*4*2 = 16384 B`, systematically mixing gate/up
    scales. Fixed by removing the de-interleave entirely — direct transpose
    from the plain layout.
-3. **Verify path used GEMV for M>1** — DSpark verify (M=5, 30 routes) hit the
-   GEMV lane, which loads weights per-token without cross-token reuse.
-   Restricted GEMV to `num_tokens == 1`; M>1 takes the SGLang CUTLASS grouped
-   GEMM.
+3. **Verify path GEMV vs CUTLASS (A/B confirmed)** — DSpark verify (M=5, 30
+   routes) initially hit the GEMV lane; restricted to `num_tokens == 1`. A
+   follow-up tried extending GEMV to M>1 (the kernel reuses weights across
+   routes for the same expert, up to 16). A/B on the same long prompt showed
+   GEMV 8.8% slower (42.4 vs 46.5 tok/s, 87 vs 75 ms/chain) — the GEMV kernel
+   is tuned for M=1 decode (6 routes) and does not scale to 30 routes.
+   Reverted; CUTLASS grouped GEMM stays for M>1.
 
 An earlier weight-copy conversion approach (3 GB/GPU) OOMed at TP=2 with
 max-running-requests=16. The xor_mask approach has zero VRAM overhead.
@@ -113,6 +116,21 @@ fixed GEMV lane. TP=4, long prompt (119k), prefix-cache hit, pure decode.
 
 The scale fix raised acceptance (fewer chains per token); the verify-path fix
 lowered per-chain cost. Together they convert DSpark from 0% to 1.25x.
+
+### c>1 regression (pin to c=1)
+
+DSpark drafts per slot (sequential), so the draft tax scales with batch while
+the verify savings do not. Measured on TP=4:
+
+| Concurrency | DSpark tok/s | No-DSpark tok/s | Δ |
+|---:|---:|---:|---:|
+| 8 | 86.4 | 127.2 | −32% |
+| 16 | — | — | −47.7% |
+
+The executor pins DSpark to c=1 (`spec_max_batch().min(1)`). The sequential
+draft tax (8×~10 ms at c=8) plus the MoE verify cost (240 routes, ~200 unique
+experts) exceed the batched-decode savings. Dense models (Qwen3) batch the
+draft and do not hit this wall.
 
 ## Learnings
 
