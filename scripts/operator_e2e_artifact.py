@@ -23,44 +23,32 @@ import subprocess
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from needle_summary import all_exact_deterministic, parse_summaries  # noqa: E402
+
 SCHEMA = "arle.operator-e2e/v1"
-SUMMARY = re.compile(
-    r"^SUMMARY len=(?P<len>\d+) depth=(?P<depth>[\d.]+) exact=(?P<exact>\d+) "
-    r"partial=(?P<partial>\d+) miss=(?P<miss>\d+) (?P<det>DET|NONDET)"
-)
 
 
-def sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1 << 20), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def parse_needle(log: str, runs: int) -> tuple[bool, list[dict]]:
-    """Pass = every SUMMARY line has exact == runs and is DET; no ERROR lines."""
-    rows = []
-    for line in log.splitlines():
-        match = SUMMARY.match(line.strip())
-        if match:
-            rows.append({k: (v if k == "det" else float(v) if k == "depth" else int(v)) for k, v in match.groupdict().items()})
-    errored = any(" ERROR " in line for line in log.splitlines())
-    passed = bool(rows) and not errored and all(r["exact"] == runs and r["det"] == "DET" for r in rows)
-    return passed, rows
+def parse_needle(log: str, runs: int) -> tuple[bool, dict[int, dict]]:
+    """Pass = every length exact == runs and deterministic; any parse error fails."""
+    try:
+        counts = parse_summaries(log, runs)
+    except ValueError:
+        return False, {}
+    return all_exact_deterministic(counts, runs), counts
 
 
 def build(args: argparse.Namespace, log: str, bundle_id: str) -> dict:
-    passed, rows = parse_needle(log, args.runs)
+    passed, counts = parse_needle(log, args.runs)
     return {
         "schema_version": SCHEMA,
         "gate": "needle_gate",
         "passed": passed,
         "bundle_id": bundle_id,
-        "binary_id": "sha256:" + sha256_file(args.serve_binary),
+        "binary_id": "sha256:" + hashlib.sha256(args.serve_binary.read_bytes()).hexdigest(),
         "model_revision": {"kind": "actual", "id": args.model_revision},
         "runs_per_length": args.runs,
-        "summary": rows,
+        "summary": {str(length): row for length, row in sorted(counts.items())},
         "log_sha256": hashlib.sha256(log.encode()).hexdigest(),
     }
 

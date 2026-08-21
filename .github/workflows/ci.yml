@@ -101,9 +101,8 @@ jobs:
       # and only surfaces at build time.
       # `no-cuda` makes cuda-kernels' build.rs skip nvcc/TileLang compilation;
       # CUDARC_CUDA_VERSION pins cudarc's probe so no toolkit is needed.
-      # clippy, not check: a `cargo check` here let 27 clippy errors accumulate
-      # in infer-cuda (2026-08-21), and `nccl,deepep` are on so the DeepEP /
-      # multi-rank surfaces are linted too — they had never been compiled by CI.
+      # clippy, not check: `cargo check` lets clippy errors accumulate in
+      # cuda-gated code; `nccl,deepep` lint the multi-rank and DeepEP surfaces.
       - name: cargo clippy (cuda + no-cuda typecheck, no GPU toolchain)
         env:
           CUDARC_CUDA_VERSION: "12080"

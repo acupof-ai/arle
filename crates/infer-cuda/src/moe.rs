@@ -90,17 +90,6 @@ pub(crate) const QWEN35_DEEPGEMM_MIN_ROUTES: usize = 1024;
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 pub(crate) const QWEN35_MOE_DECODE_MAX_ROUTES: usize = 256;
 
-/// `--qwen35-deepgemm` (default on): DeepGEMM SM90 BF16 m-grouped GEMMs for the
-/// expert GEMMs — decode neutral (40.86 vs 40.46 tok/s), prefill needle 3k wall
-/// 9.10 -> 2.32 s (-74.5%). Also read at LOAD time: the loader builds the
-/// contiguous grouped-B caches only when enabled, so flipping it requires a
-/// process restart.
-#[cfg(feature = "cuda")]
-/// `--qwen35-moe-decode-kernel` (default on): the decode-band weight-read-bound
-/// grouped kernels; `false` runs the hand batch kernels at every routed-row count
-/// below the DeepGEMM floor. Read per call — inside a captured decode graph the
-/// value read at capture time is what replays.
-#[cfg(feature = "cuda")]
 /// Allocate an i32 buffer pre-filled with `-1` ON DEVICE (memset 0xFF) — the
 /// "route slot not packed on this rank" sentinel.
 ///

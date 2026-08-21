@@ -124,9 +124,17 @@ pub(crate) fn qwen35_decode_graph() -> bool {
 pub(crate) fn qwen35_batched_decode() -> bool {
     QWEN35_BATCHED_DECODE.load(Relaxed)
 }
+/// `--qwen35-deepgemm` (default on): DeepGEMM SM90 BF16 m-grouped GEMMs for the
+/// expert GEMMs — decode neutral, prefill needle 3k wall 9.10 -> 2.32 s. Also
+/// read at LOAD time (the loader builds the contiguous grouped-B caches only
+/// when enabled), so flipping it requires a process restart.
 pub(crate) fn qwen35_deepgemm() -> bool {
     QWEN35_DEEPGEMM.load(Relaxed)
 }
+/// `--qwen35-moe-decode-kernel` (default on): the decode-band weight-read-bound
+/// grouped kernels; `false` runs the hand batch kernels below the DeepGEMM floor.
+/// Read per call — inside a captured decode graph the value read at capture
+/// time is what replays.
 pub(crate) fn qwen35_moe_decode_kernel() -> bool {
     QWEN35_MOE_DECODE_KERNEL.load(Relaxed)
 }

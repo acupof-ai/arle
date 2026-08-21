@@ -281,15 +281,11 @@ def list_experience_entries(path: Path) -> list[str]:
     ]
 
 
-def check_repo_wide_disallowed_markers() -> list[str]:
-    own_path = repo_path(Path(__file__).resolve())
+def git_grep(args: list[str]) -> list[str] | None:
+    """Lines from `git grep <args>`; [] when nothing matches, None when git is unusable."""
     try:
-        command = ["git", "grep", "-I", "-n"]
-        for marker in REPO_WIDE_DISALLOWED_MARKERS:
-            command.extend(["-e", marker])
-        command.extend(["--", "."])
         result = subprocess.run(
-            command,
+            ["git", "grep", *args],
             cwd=ROOT,
             text=True,
             stdout=subprocess.PIPE,
@@ -297,14 +293,20 @@ def check_repo_wide_disallowed_markers() -> list[str]:
             check=False,
         )
     except FileNotFoundError:
-        output = None
-    else:
-        if result.returncode == 0:
-            output = result.stdout
-        elif result.returncode == 1:
-            output = ""
-        else:
-            output = None
+        return None
+    if result.returncode == 0:
+        return result.stdout.splitlines()
+    return [] if result.returncode == 1 else None
+
+
+def check_repo_wide_disallowed_markers() -> list[str]:
+    own_path = repo_path(Path(__file__).resolve())
+    command = ["-I", "-n"]
+    for marker in REPO_WIDE_DISALLOWED_MARKERS:
+        command.extend(["-e", marker])
+    command.extend(["--", "."])
+    lines = git_grep(command)
+    output = None if lines is None else "\n".join(lines)
 
     if output is not None:
         errors = set()
@@ -346,18 +348,10 @@ LAUNCHER_BOUNDARY_PATHS = ("crates/infer-cuda/src", "crates/infer-api/src", "cra
 
 
 def check_launcher_boundary() -> list[str]:
-    try:
-        result = subprocess.run(
-            ["git", "grep", "-I", "-n", "-E", r"ffi::[a-z][a-z0-9_]*\(", "--", *LAUNCHER_BOUNDARY_PATHS],
-            cwd=ROOT,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            check=False,
-        )
-    except FileNotFoundError:
-        return []
-    hits = [line for line in result.stdout.splitlines() if "/ffi/" not in line and "/ffi.rs:" not in line]
+    # Textual by necessity: autograd and the probe examples consume
+    # `cuda_kernels::ffi` directly, so the module cannot be pub(crate) yet.
+    lines = git_grep(["-I", "-n", "-E", r"ffi::[a-z][a-z0-9_]*\(", "--", *LAUNCHER_BOUNDARY_PATHS]) or []
+    hits = [line for line in lines if "/ffi/" not in line and "/ffi.rs:" not in line]
     return [f"raw CUDA FFI call outside cuda-kernels (use a typed launcher): {hit}" for hit in hits]
 
 
@@ -371,18 +365,8 @@ RUNTIME_COUNTER_PATHS = ("crates/infer-cuda/src",)
 def check_registry_covers_runtime_counters() -> list[str]:
     registry = load_text(ROOT / REGISTRY_PATH)
     registry_ids = set(re.findall(r'^id = "([^"]+)"', registry, re.MULTILINE))
-    try:
-        result = subprocess.run(
-            ["git", "grep", "-I", "-h", "-o", "-E", r'"cuda\.[a-z0-9_]+(\.[a-z0-9_]+)+"', "--", *RUNTIME_COUNTER_PATHS],
-            cwd=ROOT,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            check=False,
-        )
-    except FileNotFoundError:
-        return []
-    runtime_ids = {hit.strip('"') for hit in result.stdout.split()}
+    lines = git_grep(["-I", "-h", "-o", "-E", r'"cuda\.[a-z0-9_]+(\.[a-z0-9_]+)+"', "--", *RUNTIME_COUNTER_PATHS]) or []
+    runtime_ids = {line.strip().strip('"') for line in lines if line.strip()}
     return [
         f"runtime implementation id {rid!r} has no row in {REGISTRY_PATH}"
         for rid in sorted(runtime_ids - registry_ids)
