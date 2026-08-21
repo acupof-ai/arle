@@ -238,6 +238,7 @@ pub(super) fn cuda_linear_attention_backward_device_row(
         && (crate::runtime_flags::la_backward_mono()
             || staged_bytes > backend.mem_get_info().map_or(0, |(free, _)| free) / 2);
 
+    let mut d_initial_state: Option<cudarc::driver::CudaSlice<f32>> = None;
     if args.raw_output.is_some() {
         let fq = flashqla_gdr_symbols(p.num_value_heads, p.num_key_heads)?;
         let raw_output = args
@@ -278,8 +279,16 @@ pub(super) fn cuda_linear_attention_backward_device_row(
         let mut dv = alloc_u16(v_len, "cuda alloc_zeros failed (fq dv)")?;
         let mut dg_cumsum = alloc_f32(head_len, "cuda alloc_zeros failed (fq dg)")?;
         let mut dbeta = alloc_f32(head_len, "cuda alloc_zeros failed (fq dbeta)")?;
-        // No consumer chains a final-state gradient in yet: dht stays zero, dh0 is dropped.
-        let dht = alloc_f32(state_len, "cuda alloc_zeros failed (fq dht)")?;
+        // dht = the successor's gradient at our final state (sequence-parallel
+        // carry), zero when nothing seeded from it; dh0 returns to the predecessor.
+        let mut dht = alloc_f32(state_len, "cuda alloc_zeros failed (fq dht)")?;
+        if let Some(d_final) = args.d_final_state {
+            let src = backend.cuda_slice(d_final, "linear_attention_backward d_final_state")?;
+            backend
+                .stream
+                .memcpy_dtod(src, &mut dht)
+                .map_err(|_| AutogradError::TapeInvariant("cuda memcpy failed (fq dht)"))?;
+        }
         let mut dh0 = alloc_f32(state_len, "cuda alloc_zeros failed (fq dh0)")?;
 
         {
@@ -505,6 +514,7 @@ pub(super) fn cuda_linear_attention_backward_device_row(
                 },
             )?;
         }
+        d_initial_state = Some(dh0);
     } else if use_mono {
         let (beta, g) = taped_g_beta(beta, g)?;
         let mut grad_state_scratch = alloc_zeros_retry::<f32>(backend, state_len)
@@ -768,6 +778,7 @@ pub(super) fn cuda_linear_attention_backward_device_row(
         .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (la dqkv)"))?;
     let mut dconv = alloc_zeros_retry::<f32>(backend, conv_len)
         .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (la dconv)"))?;
+    let mut d_initial_conv_window: Option<DeviceHandle> = None;
     {
         let (dqkv_ptr, _dqkv_guard) = dqkv.device_ptr_mut(&backend.stream);
         let (dconv_ptr, _dconv_guard) = dconv.device_ptr_mut(&backend.stream);
@@ -790,6 +801,17 @@ pub(super) fn cuda_linear_attention_backward_device_row(
                 AutogradError::TapeInvariant("linear_attention conv_tail_len exceeds i32")
             })?
             .unwrap_or(0);
+        let mut grad_tail = conv_tail
+            .map(|_| {
+                alloc_zeros_retry::<f32>(backend, (p.conv_kernel - 1) * qkv_dim).map_err(|_| {
+                    AutogradError::TapeInvariant("cuda alloc_zeros failed (la grad_tail)")
+                })
+            })
+            .transpose()?;
+        let grad_tail_dev = grad_tail
+            .as_mut()
+            .map(|s| s.device_ptr_mut(&backend.stream));
+        let grad_tail_ptr = grad_tail_dev.as_ref().map_or(0u64, |(ptr, _)| *ptr);
         launch_1d(
             &backend.stream,
             backend
@@ -809,10 +831,13 @@ pub(super) fn cuda_linear_attention_backward_device_row(
                     .arg(&seq_len_i32)
                     .arg(&conv_kernel_i32)
                     .arg(&conv_tail_ptr)
-                    .arg(&conv_tail_len_i32);
+                    .arg(&conv_tail_len_i32)
+                    .arg(&grad_tail_ptr);
                 builder
             },
         )?;
+        drop(grad_tail_dev);
+        d_initial_conv_window = grad_tail.map(|g| DeviceHandle::Cuda(CudaStorage::new(g)));
     }
 
     Ok(LinearAttentionDeviceBackwardResult {
@@ -824,6 +849,8 @@ pub(super) fn cuda_linear_attention_backward_device_row(
         ddt: DeviceHandle::Cuda(CudaStorage::new(ddt)),
         da_log: DeviceHandle::Cuda(CudaStorage::new(da_log)),
         dnorm: DeviceHandle::Cuda(CudaStorage::new(dnorm)),
+        d_initial_state: d_initial_state.map(|d| DeviceHandle::Cuda(CudaStorage::new(d))),
+        d_initial_conv_window,
     })
 }
 

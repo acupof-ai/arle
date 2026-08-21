@@ -238,7 +238,7 @@ pub fn linear_attention_core(
             .map(|tensor| acc || tensor.requires_grad)
     })?;
 
-    if let Some(output_id) = try_linear_attention_forward_device(
+    if let Some((output_id, _final_state)) = try_linear_attention_forward_device(
         qkv,
         z,
         b_proj,
@@ -937,6 +937,86 @@ pub fn linear_attention_boundary(
 }
 
 /// Taped generated segment seeded by frozen carry.
+/// Device recurrence with a differentiable state carry: seeds from
+/// `initial_state` / `initial_conv_window` (grads flow back into them) and
+/// returns `(out, final_state, conv_window)` for the next segment — the
+/// sequence-parallel building block. CUDA only.
+#[allow(clippy::too_many_arguments)]
+pub fn linear_attention_core_carry(
+    qkv: TensorId,
+    z: TensorId,
+    b_proj: TensorId,
+    a_proj: TensorId,
+    conv1d_weight: TensorId,
+    dt_bias: TensorId,
+    a_log: TensorId,
+    norm_weight: TensorId,
+    params: LinearAttentionParams,
+    initial_state: Option<TensorId>,
+    initial_conv_window: Option<TensorId>,
+    store: &mut TensorStore,
+    tape: &mut Tape,
+) -> Result<(TensorId, TensorId, TensorId)> {
+    validate_shapes(
+        qkv,
+        z,
+        b_proj,
+        a_proj,
+        conv1d_weight,
+        dt_bias,
+        a_log,
+        norm_weight,
+        params,
+        store,
+    )?;
+    let mut ids = vec![
+        qkv,
+        z,
+        b_proj,
+        a_proj,
+        conv1d_weight,
+        dt_bias,
+        a_log,
+        norm_weight,
+    ];
+    ids.extend(initial_state);
+    ids.extend(initial_conv_window);
+    let requires_grad = tape.enabled && store.any_requires_grad(&ids);
+    let Some((output_id, final_state_id)) = try_linear_attention_forward_device(
+        qkv,
+        z,
+        b_proj,
+        a_proj,
+        conv1d_weight,
+        dt_bias,
+        a_log,
+        norm_weight,
+        params,
+        requires_grad,
+        initial_state,
+        initial_conv_window,
+        store,
+        tape,
+    )?
+    else {
+        return Err(AutogradError::TapeInvariant(
+            "linear_attention_core_carry requires the CUDA device path",
+        ));
+    };
+    // The next segment's conv window is the last conv_kernel-1 rows of this
+    // segment's conv input — a plain slice, so its gradient needs no kernel.
+    let window = params.conv_kernel - 1;
+    let qkv_dim = 2 * params.num_key_heads * params.key_dim + params.num_value_heads * params.value_dim;
+    let conv_window_id = crate::ops::slice(
+        qkv,
+        &[0, params.seq_len - window, 0],
+        &[params.batch, params.seq_len, qkv_dim],
+        store,
+        tape,
+    )?;
+    Ok((output_id, final_state_id, conv_window_id))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn linear_attention_core_with_carry_taped(
     qkv: TensorId,
@@ -984,7 +1064,7 @@ pub fn linear_attention_core_with_carry_taped(
     })?;
 
     // Carry is constant; device backward reuses chunk_state[0].
-    if let Some(output_id) = try_linear_attention_forward_device(
+    if let Some((output_id, _final_state)) = try_linear_attention_forward_device(
         qkv,
         z,
         b_proj,
@@ -1180,7 +1260,7 @@ fn try_linear_attention_forward_device(
     initial_conv_window: Option<TensorId>,
     store: &mut TensorStore,
     tape: &mut Tape,
-) -> Result<Option<TensorId>> {
+) -> Result<Option<(TensorId, TensorId)>> {
     if store.backend().device() != Device::Cuda {
         return Ok(None);
     }
@@ -1230,6 +1310,15 @@ fn try_linear_attention_forward_device(
     ];
     let head_shape = vec![params.batch, params.seq_len, params.num_value_heads];
     let output_id = store.alloc_device_tensor(output_shape, result.output)?;
+    let final_state_id = store.alloc_device_tensor(
+        vec![
+            params.batch,
+            params.num_value_heads,
+            params.key_dim,
+            params.value_dim,
+        ],
+        result.final_state,
+    )?;
 
     if requires_grad {
         let preact_id = store
@@ -1269,19 +1358,22 @@ fn try_linear_attention_forward_device(
                 )
             })
             .transpose()?;
+        let mut input_ids = smallvec![
+            qkv,
+            z,
+            b_proj,
+            a_proj,
+            conv1d_weight,
+            dt_bias,
+            a_log,
+            norm_weight
+        ];
+        input_ids.extend(initial_state);
+        input_ids.extend(initial_conv_window);
         TapeEntry {
             op: BackwardOp::LinearAttention,
             output_id,
-            input_ids: smallvec![
-                qkv,
-                z,
-                b_proj,
-                a_proj,
-                conv1d_weight,
-                dt_bias,
-                a_log,
-                norm_weight
-            ],
+            input_ids,
             saved: SavedContext::LinearAttentionCtx {
                 qkv,
                 z,
@@ -1297,9 +1389,9 @@ fn try_linear_attention_forward_device(
                 beta: beta_id,
                 chunk_state: Some(chunk_state_id),
                 raw_output: raw_output_id,
-                // State carry lives in chunk_state[0] → None (Some would misfire
-                // needs_host_recompute). Conv carry is a real backward input → keep it.
-                initial_state: None,
+                // Both carries are backward inputs: chunk_state[0] seeds the device
+                // recompute, and dh0 / the conv-tail grad return to these ids.
+                initial_state,
                 initial_conv_window,
                 batch: params.batch,
                 seq_len: params.seq_len,
@@ -1312,8 +1404,18 @@ fn try_linear_attention_forward_device(
             },
         }
         .record(store, tape)?;
+        store.set_requires_grad(final_state_id, true)?;
+        TapeEntry {
+            op: BackwardOp::LinearAttentionFinalState,
+            output_id: final_state_id,
+            input_ids: smallvec![output_id],
+            saved: SavedContext::CarryLink {
+                core_output: output_id,
+            },
+        }
+        .record(store, tape)?;
     }
-    Ok(Some(output_id))
+    Ok(Some((output_id, final_state_id)))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1333,7 +1435,9 @@ fn try_linear_attention_backward_device(
     beta: Option<TensorId>,
     chunk_state: Option<TensorId>,
     raw_output: Option<TensorId>,
+    initial_state: Option<TensorId>,
     initial_conv_window: Option<TensorId>,
+    d_final_state: Option<TensorId>,
     params: LinearAttentionParams,
     store: &mut TensorStore,
 ) -> Result<Option<GradPairs>> {
@@ -1343,6 +1447,12 @@ fn try_linear_attention_backward_device(
     let Some(preact) = preact else {
         return Ok(None);
     };
+    let d_final_state_handle = d_final_state
+        .map(|id| {
+            store.ensure_device(id)?;
+            store.device_handle(id)
+        })
+        .transpose()?;
     let Some(qkv_conv) = qkv_conv else {
         return Ok(None);
     };
@@ -1438,10 +1548,26 @@ fn try_linear_attention_backward_device(
                 chunk_state: &chunk_state_handle,
                 raw_output: raw_output_handle.as_ref(),
                 initial_conv_window: conv_tail_handle.as_ref(),
+                d_final_state: d_final_state_handle.as_ref(),
             })?
     else {
         return Ok(None);
     };
+    let mut carry_grads = GradPairs::new();
+    if let (Some(state_id), Some(dh0)) = (initial_state, device_grads.d_initial_state.clone())
+        && store.tensor(state_id)?.requires_grad
+    {
+        let shape = store.tensor(state_id)?.shape.clone();
+        carry_grads.push((state_id, store.alloc_device_tensor(shape, dh0)?));
+    }
+    if let (Some(window_id), Some(d_window)) = (
+        initial_conv_window,
+        device_grads.d_initial_conv_window.clone(),
+    ) && store.tensor(window_id)?.requires_grad
+    {
+        let shape = store.tensor(window_id)?.shape.clone();
+        carry_grads.push((window_id, store.alloc_device_tensor(shape, d_window)?));
+    }
 
     let q_dim = params.num_key_heads * params.key_dim;
     let qkv_dim = q_dim * 2 + params.num_value_heads * params.value_dim;
@@ -1510,12 +1636,14 @@ fn try_linear_attention_backward_device(
             store.alloc_device_tensor(vec![params.value_dim], device_grads.dnorm)?,
         ));
     }
+    grads.extend(carry_grads);
     Ok(Some(grads))
 }
 
 pub(crate) fn linear_attention_backward(
     entry: &TapeEntry,
     output_grad_id: TensorId,
+    d_final_state: Option<TensorId>,
     store: &mut TensorStore,
 ) -> Result<GradPairs> {
     let SavedContext::LinearAttentionCtx {
@@ -1573,33 +1701,37 @@ pub(crate) fn linear_attention_backward(
         store,
     )?;
 
-    // Only the recurrent-state carry forces the host recompute (it must rebuild the
-    // full-sequence state); the conv-window carry is just a device backward input,
-    // fed through below. The default path (both None) still takes the device backward.
-    let needs_host_recompute = initial_state.is_some();
-    if !needs_host_recompute
-        && let Some(grads) = try_linear_attention_backward_device(
-            output_grad_id,
-            qkv,
-            z,
-            b_proj,
-            a_proj,
-            conv1d_weight,
-            dt_bias,
-            a_log,
-            norm_weight,
-            preact,
-            qkv_conv,
-            g,
-            beta,
-            chunk_state,
-            raw_output,
-            initial_conv_window,
-            params,
-            store,
-        )?
-    {
+    // The device backward seeds the recompute from chunk_state[0] (= the state
+    // carry) and returns dh0 / the conv-tail grad to the carry ids; the host
+    // recompute below is the fallback for shapes the device path declines.
+    if let Some(grads) = try_linear_attention_backward_device(
+        output_grad_id,
+        qkv,
+        z,
+        b_proj,
+        a_proj,
+        conv1d_weight,
+        dt_bias,
+        a_log,
+        norm_weight,
+        preact,
+        qkv_conv,
+        g,
+        beta,
+        chunk_state,
+        raw_output,
+        initial_state,
+        initial_conv_window,
+        d_final_state,
+        params,
+        store,
+    )? {
         return Ok(grads);
+    }
+    if d_final_state.is_some() {
+        return Err(AutogradError::TapeInvariant(
+            "linear attention: a final-state gradient needs the device backward",
+        ));
     }
 
     let mut profile =

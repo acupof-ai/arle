@@ -556,6 +556,9 @@ pub struct LinearAttentionDeviceForwardResult {
     /// The forward took the FlashQLA chunkwise route, so the backward must too.
     /// Recorded on the tape: the runtime flag can flip between calls.
     pub flashqla: bool,
+    /// Recurrent state after the last row, `[num_value_heads, key_dim, value_dim]`
+    /// f32 — the carry a sequence-parallel successor seeds from.
+    pub final_state: DeviceHandle,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -583,6 +586,9 @@ pub struct LinearAttentionDeviceBackwardArgs<'a> {
     // OPD conv carry (None = default). Feeds the conv1d backward boundary taps'
     // grad_weight; the recurrent state carry lives in chunk_state[0], not here.
     pub initial_conv_window: Option<&'a DeviceHandle>,
+    /// Gradient arriving at `final_state` from a successor that seeded from it
+    /// (sequence-parallel carry). None = zero.
+    pub d_final_state: Option<&'a DeviceHandle>,
 }
 
 #[derive(Debug, Clone)]
@@ -595,6 +601,11 @@ pub struct LinearAttentionDeviceBackwardResult {
     pub ddt: DeviceHandle,
     pub da_log: DeviceHandle,
     pub dnorm: DeviceHandle,
+    /// d/d(initial_state); Some on the FlashQLA route.
+    pub d_initial_state: Option<DeviceHandle>,
+    /// d/d(initial_conv_window) `[conv_kernel-1, qkv_dim]` f32; Some when a
+    /// window was carried in.
+    pub d_initial_conv_window: Option<DeviceHandle>,
 }
 
 /// Communicator group: `Seq` = CP subgroup, `Expert` = EP group (both == `World`
