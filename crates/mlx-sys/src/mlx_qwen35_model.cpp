@@ -71,6 +71,11 @@ bool use_qwen35_cpp_qk_norm_helper() {
     return env && std::string(env) != "0";
 }
 
+bool use_qwen35_cpp_fused_postprocess() {
+    const char* env = std::getenv("AGENT_INFER_QWEN35_CPP_FUSED_POSTPROCESS");
+    return !(env && std::string(env) == "0");
+}
+
 array suppress_last_axis_token(const array& logits, int32_t suppress_token_id) {
     if (suppress_token_id < 0 || logits.ndim() == 0) {
         return logits;
@@ -397,6 +402,47 @@ std::vector<array> precise_silu_mul_impl(const std::vector<array>& inputs) {
 auto& compiled_precise_silu_mul() {
     static auto fn = mlx::core::compile(precise_silu_mul_impl, true /*shapeless*/);
     return fn;
+}
+
+// Fused GDR postprocessing: rms_norm(y, norm_w) + silu(z) * normed_y in one kernel.
+// MLX compile cannot fuse rms_norm's reduction with elementwise ops; this kernel
+// does the reduction via simd_sum within the simdgroup.
+// Grid: (32, Hv, B*S) — one simdgroup per (token, v_head).
+auto& gdr_postprocess_fused_kernel() {
+    static auto kernel = fast::metal_kernel(
+        "gdr_postprocess_fused",
+        {"y", "z", "norm_w"},
+        {"out"},
+        R"(
+        auto n = thread_position_in_grid.z;
+        auto hv_idx = thread_position_in_grid.y;
+        auto tid = thread_position_in_threadgroup.x;
+        constexpr int n_per_t = Dv / 32;
+
+        auto base = n * Hv * Dv + hv_idx * Dv;
+
+        float yv[n_per_t];
+        float ysq = 0.0f;
+        for (int i = 0; i < n_per_t; i++) {
+            int d = tid * n_per_t + i;
+            yv[i] = static_cast<float>(y[base + d]);
+            ysq += yv[i] * yv[i];
+        }
+        ysq = simd_sum(ysq);
+        float inv_rms = 1.0f / sqrt(ysq / Dv + 1e-6f);
+
+        for (int i = 0; i < n_per_t; i++) {
+            int d = tid * n_per_t + i;
+            float zv = static_cast<float>(z[base + d]);
+            float normed = yv[i] * inv_rms * static_cast<float>(norm_w[d]);
+            float sig = 1.0f / (1.0f + exp(-zv));
+            out[base + d] = static_cast<InT>(zv * sig * normed);
+        }
+        )",
+        "",
+        true,
+        false);
+    return kernel;
 }
 
 // Compiled precise sigmoid-mul: sigmoid(gate.f32) * x.f32 -> x.dtype
@@ -1171,10 +1217,30 @@ struct Qwen35CompiledModel {
         }
 
         // Output norm + gate (S-aware)
-        auto y_heads = reshape(y, {B * S * hv, dv});
-        auto normed = fast::rms_norm(y_heads, lw.norm_w, lw.rms_eps);
-        auto z_gated = reshape(z_raw, {B * S * hv, dv});
-        auto out = compiled_precise_silu_mul()({z_gated, normed})[0];
+        array out(0);
+        if (use_qwen35_cpp_fused_postprocess()) {
+            auto z_3d = reshape(z_raw, {B, S, hv, dv});
+            auto fused = gdr_postprocess_fused_kernel()(
+                {y, z_3d, lw.norm_w},
+                {{B, S, hv, dv}},
+                {bfloat16},
+                std::make_tuple(32, hv, B * S),
+                std::make_tuple(32, 1, 1),
+                {
+                    {"Dv", fast::TemplateArg(dv)},
+                    {"Hv", fast::TemplateArg(hv)},
+                    {"InT", fast::TemplateArg(bfloat16)},
+                },
+                std::nullopt,
+                false,
+                {});
+            out = std::move(fused[0]);
+        } else {
+            auto y_heads = reshape(y, {B * S * hv, dv});
+            auto normed = fast::rms_norm(y_heads, lw.norm_w, lw.rms_eps);
+            auto z_gated = reshape(z_raw, {B * S * hv, dv});
+            out = compiled_precise_silu_mul()({z_gated, normed})[0];
+        }
         auto result = lw.out_proj.apply(reshape(out, {B, S, hv*dv}), prefer_verify_m16);
 
         // Keep ALL available intermediates alive for GPU buffer reuse.
@@ -1189,8 +1255,7 @@ struct Qwen35CompiledModel {
             im.push_back(q); im.push_back(k);
             im.push_back(beta); im.push_back(g);
             im.push_back(y);
-            im.push_back(y_heads); im.push_back(normed);
-            im.push_back(z_gated); im.push_back(out);
+            im.push_back(out);
         }
         return result;
     }
