@@ -101,15 +101,17 @@ collective is 1.90x. **Wire this only after #1 lands and the row count moves.**
 Caveat kept open: the measured arm is the array/grouped variant, which pays
 per-group pointer indirection a dense Machete-style kernel would not.
 
-### 4. Wave quantisation on the Marlin launch grid — OPEN, bounded
+### 4. Wave quantisation on the Marlin launch grid — CLOSED, already solved upstream
 
-Decode is a tall-skinny GEMM (M=1-16 against N=34816). If `N / tile_n` leaves a
-partial wave across the SMs, the tail costs a full wave and the fix is one
-constant. `ncu --metrics launch__waves_per_multiprocessor` on the four instances
-answers it. Independent of #1 and cheap enough to run in the same session.
+Marlin's config search already minimises it. `gptq_marlin.cuh:544` computes
+`waves = div_ceil(n_tiles, sms * blocks_per_sm)` and the surrounding search picks
+the `(thread_n, thread_k, blocks_per_sm)` triple with the fewest waves, breaking
+ties on the larger K tile; the launch is then `blocks = sms * blocks_per_sm`
+(`:706`). Both serving shapes already reach a single wave on 78 SMs — at
+`thread_n=256`, `gate_up` N=34816 gives 136 tiles which one wave covers at
+`blocks_per_sm=2`, and `down` N=5120 gives 20 tiles, under one wave outright.
 
-Distinct from the occupancy tunings already killed: those raised *blocks per SM*;
-this is about whether the *total block count* divides the machine.
+Nothing to tune. Closed without spending GPU time.
 
 ### 5. Re-quantise the per-channel FP8 weights to NVFP4 — OPEN, but only after #1
 
