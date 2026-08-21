@@ -104,6 +104,7 @@ pub(super) fn cuda_linear_attention_forward_device(
         a_inv: concat(|r| &r.a_inv)?,
         chunk_state: concat(|r| &r.chunk_state)?,
         raw_output: concat(|r| &r.raw_output)?,
+        final_state: concat(|r| &r.final_state)?,
         flashqla: rows[0].flashqla,
     }))
 }

@@ -58,6 +58,7 @@ pub(super) fn cuda_linear_attention_backward_device(
             let slice = |src| cuda_row_slice(backend, src, row, p.batch);
             let initial_conv_window = args.initial_conv_window.map(slice).transpose()?;
             let raw_output = args.raw_output.map(slice).transpose()?;
+            let d_final_state = args.d_final_state.map(slice).transpose()?;
             let g = args.g.map(slice).transpose()?;
             let beta = args.beta.map(slice).transpose()?;
             cuda_linear_attention_backward_device_row(
@@ -80,6 +81,7 @@ pub(super) fn cuda_linear_attention_backward_device(
                     a_log: args.a_log,
                     norm_weight: args.norm_weight,
                     initial_conv_window: initial_conv_window.as_ref(),
+                    d_final_state: d_final_state.as_ref(),
                 },
             )
         })
@@ -95,6 +97,12 @@ pub(super) fn cuda_linear_attention_backward_device(
                 backend.add(&acc, field(row), &[len])
             })
     };
+    let concat_opt = |field: fn(&LinearAttentionDeviceBackwardResult) -> Option<&DeviceHandle>| {
+        let parts: Vec<&DeviceHandle> = rows.iter().filter_map(field).collect();
+        (parts.len() == rows.len())
+            .then(|| cuda_concat_rows(backend, &parts))
+            .transpose()
+    };
     Ok(Some(LinearAttentionDeviceBackwardResult {
         dqkv: concat(|r| &r.dqkv)?,
         dz: concat(|r| &r.dz)?,
@@ -104,6 +112,8 @@ pub(super) fn cuda_linear_attention_backward_device(
         ddt: sum(|r| &r.ddt, p.num_value_heads)?,
         da_log: sum(|r| &r.da_log, p.num_value_heads)?,
         dnorm: sum(|r| &r.dnorm, p.value_dim)?,
+        d_initial_state: concat_opt(|r| r.d_initial_state.as_ref())?,
+        d_initial_conv_window: concat_opt(|r| r.d_initial_conv_window.as_ref())?,
     }))
 }
 
@@ -778,8 +788,7 @@ pub(super) fn cuda_linear_attention_backward_device_row(
         .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (la dqkv)"))?;
     let mut dconv = alloc_zeros_retry::<f32>(backend, conv_len)
         .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (la dconv)"))?;
-    let mut d_initial_conv_window: Option<DeviceHandle> = None;
-    {
+    let d_initial_conv_window = {
         let (dqkv_ptr, _dqkv_guard) = dqkv.device_ptr_mut(&backend.stream);
         let (dconv_ptr, _dconv_guard) = dconv.device_ptr_mut(&backend.stream);
         let (dqkv_conv_ptr, _dqkv_conv_guard) = dqkv_conv.device_ptr(&backend.stream);
@@ -837,8 +846,8 @@ pub(super) fn cuda_linear_attention_backward_device_row(
             },
         )?;
         drop(grad_tail_dev);
-        d_initial_conv_window = grad_tail.map(|g| DeviceHandle::Cuda(CudaStorage::new(g)));
-    }
+        grad_tail.map(|g| DeviceHandle::Cuda(CudaStorage::new(g)))
+    };
 
     Ok(LinearAttentionDeviceBackwardResult {
         dqkv: DeviceHandle::Cuda(CudaStorage::new(dqkv)),
