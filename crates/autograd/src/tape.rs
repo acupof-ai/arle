@@ -842,10 +842,18 @@ impl Tape {
                         // intermediate another entry produced: this bypasses
                         // `merge_grad`, and with it the `accumulate_grad` a
                         // parameter's gradient needs.
+                        // Also for a replay's checkpoint inputs (collect-only mode,
+                        // no store accumulation): the SP core slices qkv/z/b/a per
+                        // chunk, and each zero-filled full-size buffer is 2.7 GB
+                        // at local 65,536.
                         let dest = entry
                             .input_ids
                             .first()
-                            .filter(|x| entry_by_output.contains_key(*x))
+                            .filter(|x| {
+                                entry_by_output.contains_key(*x)
+                                    || (!accumulate_into_store
+                                        && return_filter.is_some_and(|t| t.contains(*x)))
+                            })
                             .and_then(|x| grads.get(x).copied());
                         match dest {
                             Some(dest)
