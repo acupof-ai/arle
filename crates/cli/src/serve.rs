@@ -246,10 +246,13 @@ fn resolve_config(args: &Args, serve_args: &ServeArgs) -> Result<ServeConfig, St
     // serve stack. DSv4's depth-K MTP head lowers through `mtp_draft_tokens`;
     // Metal's monolith-era external draft route has not been re-ported, so the
     // CLI fails closed before startup rather than letting infer-api fail later.
-    if serve_args.spec_type == ServeSpecTypeArg::Auto {
-        return Err("--spec-type auto is not implemented; use mtp or dspark".to_string());
-    }
-    if serve_args.spec_type != ServeSpecTypeArg::None && backend != ServeBackend::Cuda {
+    // `auto` is the default, so it must stay silent off CUDA — only an explicit
+    // route is an error there. `resolve_spec_options` lowers auto to none.
+    if !matches!(
+        serve_args.spec_type,
+        ServeSpecTypeArg::None | ServeSpecTypeArg::Auto
+    ) && backend != ServeBackend::Cuda
+    {
         return Err("--spec-type is currently only supported by the CUDA backend".to_string());
     }
     if serve_args.spec_type == ServeSpecTypeArg::Dspark && serve_args.mtp_draft_model.is_none() {
@@ -366,6 +369,9 @@ fn resolve_spec_options(backend: ServeBackend, serve_args: &ServeArgs) -> ServeS
     }
     let mut spec_type = match serve_args.spec_type {
         ServeSpecTypeArg::None => ServeSpecType::None,
+        // Checkpoint-native MTP is CUDA-only; the default must not speculate
+        // its way into a backend that cannot load the head.
+        ServeSpecTypeArg::Auto if backend != ServeBackend::Cuda => ServeSpecType::None,
         ServeSpecTypeArg::Auto => ServeSpecType::Auto,
         ServeSpecTypeArg::Mtp => ServeSpecType::Mtp,
         ServeSpecTypeArg::Dspark => ServeSpecType::Dspark,

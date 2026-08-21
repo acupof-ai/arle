@@ -729,9 +729,10 @@ pub(crate) struct ServeArgs {
     #[arg(long, default_value_t = 32.0)]
     pub(crate) lora_alpha: f32,
 
-    /// Speculative decode route (CUDA): checkpoint-native `mtp` (DSv4) or the
-    /// external `dspark` block drafter (Qwen3.6, dir via `--mtp-draft-model`).
-    #[arg(long, value_enum, default_value_t = ServeSpecTypeArg::None)]
+    /// Speculative decode route (CUDA): `auto` (default) speculates whenever the
+    /// checkpoint declares an MTP head; `mtp` forces the checkpoint-native head;
+    /// `dspark` is the external block drafter (dir via `--mtp-draft-model`).
+    #[arg(long, value_enum, default_value_t = ServeSpecTypeArg::Auto)]
     pub(crate) spec_type: ServeSpecTypeArg,
 
     /// Multi-GPU collective backend for small decode-path messages (CUDA
