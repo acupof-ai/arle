@@ -119,9 +119,12 @@ static constexpr size_t ptr_array_stride(int num_experts) {
 }
 
 // Workspace layout: 4 pointer arrays (each padded to 16B) + stride arrays
-// (4×E×24) + CUTLASS workspace.
+// (4×E×24) + CUTLASS workspace. Rounded to 256B so the CUTLASS workspace that
+// follows starts on an alignment its own kernels accept.
 static constexpr size_t metadata_bytes(int num_experts) {
-  return 4 * ptr_array_stride(num_experts) + static_cast<size_t>(num_experts) * 4 * 24;
+  const size_t used =
+      4 * ptr_array_stride(num_experts) + static_cast<size_t>(num_experts) * 4 * 24;
+  return (used + 255) & ~static_cast<size_t>(255);
 }
 
 }  // namespace
