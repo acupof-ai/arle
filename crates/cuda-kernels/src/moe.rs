@@ -816,6 +816,7 @@ pub unsafe fn moe_w4a16_grouped_gemv_batch(
     n: usize,
     k: usize,
     group_size: usize,
+    xor_mask: u32,
     ctx: &DeviceContext,
     stream: CUstream,
 ) -> Result<()> {
@@ -837,6 +838,7 @@ pub unsafe fn moe_w4a16_grouped_gemv_batch(
             i32::try_from(n)?,
             i32::try_from(k)?,
             i32::try_from(group_size)?,
+            xor_mask,
             stream,
         )
         .result()?;
@@ -868,6 +870,7 @@ pub unsafe fn moe_w4a16_grouped_gemv_pair_batch(
     n: usize,
     k: usize,
     group_size: usize,
+    xor_mask: u32,
     ctx: &DeviceContext,
     stream: CUstream,
 ) -> Result<()> {
@@ -894,6 +897,7 @@ pub unsafe fn moe_w4a16_grouped_gemv_pair_batch(
             i32::try_from(n)?,
             i32::try_from(k)?,
             i32::try_from(group_size)?,
+            xor_mask,
             stream,
         )
         .result()?;
@@ -2348,13 +2352,6 @@ pub unsafe fn nvfp4_to_w4afp8(
     if rc != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
         bail!("nvfp4_to_w4afp8 kernel failed: CUDA error {rc:?}");
     }
-    Ok(())
-}
-
-/// XOR every byte with 0x88 in-place: converts signed INT4 two's complement
-/// nibbles to the unsigned + zero-point=8 format the W4A16 GEMV kernel expects.
-pub fn w4_sign_to_zeropoint(data: RawDevicePtr<u8>, n: usize, stream: CUstream) -> Result<()> {
-    unsafe { ffi::w4_sign_to_zeropoint_cuda(data.as_mut_ptr(), n, stream) }.result()?;
     Ok(())
 }
 

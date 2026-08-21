@@ -2323,9 +2323,6 @@ mod dsv4_gpu {
         /// Owned transposed scale buffers (W4AFP8 decode lane only — the W4A16
         /// lane points into per-expert `DeviceMatrix.qscales` and leaves this empty).
         scale_storage: Vec<CudaSlice<u8>>,
-        /// Owned zero-point-converted weight buffers (W4AFP8 decode lane only —
-        /// the W4A16 lane points into per-expert `DeviceMatrix` and leaves this empty).
-        weight_storage: Vec<CudaSlice<u8>>,
     }
 
     fn build_gemv_tables(ctx: &DeviceContext, layer: &Dsv4MoeLayer) -> Result<Dsv4GemvTables> {
@@ -2498,7 +2495,6 @@ mod dsv4_gpu {
                 .map_err(|e| anyhow::anyhow!("W4A16 expert_indices H2D failed: {e}"))?,
             group_size,
             scale_storage: vec![],
-            weight_storage: vec![],
         })
     }
 
@@ -2596,30 +2592,9 @@ mod dsv4_gpu {
             .clone_htod(&w2_gemv)
             .map_err(|e| anyhow::anyhow!("W4AFP8 w2 transposed scale upload failed: {e}"))?;
 
-        // Convert signed INT4 two's complement → unsigned + zero-point=8
-        // (XOR 0x88 per byte) so the W4A16 GEMV kernel's dequant matches.
-        let convert_weights = |src: &CudaSlice<u8>| -> Result<CudaSlice<u8>> {
-            let mut dst = ctx
-                .stream
-                .alloc_zeros::<u8>(src.len())
-                .map_err(|e| anyhow::anyhow!("W4AFP8 GEMV weight alloc failed: {e}"))?;
-            ctx.stream
-                .memcpy_dtod(src, &mut dst)
-                .map_err(|e| anyhow::anyhow!("W4AFP8 GEMV weight copy failed: {e}"))?;
-            cuda_kernels::moe::w4_sign_to_zeropoint(
-                cuda_kernels::tensor::cache_ptr(&dst, ctx),
-                dst.len(),
-                ctx.stream.cu_stream(),
-            )
-            .map_err(|e| anyhow::anyhow!("W4AFP8 GEMV weight XOR failed: {e}"))?;
-            Ok(dst)
-        };
-        let w13_gemv_weight = convert_weights(&w13.weight)?;
-        let w2_gemv_weight = convert_weights(&w2.weight)?;
-
-        let w13_weight_ptr = cache_ptr(&w13_gemv_weight, ctx).as_ptr() as u64;
+        let w13_weight_ptr = cache_ptr(&w13.weight, ctx).as_ptr() as u64;
         let w13_scale_ptr = cache_ptr(&w13_gemv_scales, ctx).as_ptr() as u64;
-        let w2_weight_ptr = cache_ptr(&w2_gemv_weight, ctx).as_ptr() as u64;
+        let w2_weight_ptr = cache_ptr(&w2.weight, ctx).as_ptr() as u64;
         let w2_scale_ptr = cache_ptr(&w2_gemv_scales, ctx).as_ptr() as u64;
 
         // w13: n = 2*i_dim (w1 over w3), k = h.
@@ -2667,7 +2642,6 @@ mod dsv4_gpu {
                 .map_err(|e| anyhow::anyhow!("W4AFP8 expert_indices H2D failed: {e}"))?,
             group_size,
             scale_storage: vec![w13_gemv_scales, w2_gemv_scales],
-            weight_storage: vec![w13_gemv_weight, w2_gemv_weight],
         })
     }
 
@@ -2679,6 +2653,7 @@ mod dsv4_gpu {
         model: &Dsv4Model,
         layer: &Dsv4MoeLayer,
         tables: &Dsv4W4A16GemvTables,
+        xor_mask: u32,
         route_indices: &CudaSlice<i32>,
         route_weights: &CudaSlice<f32>,
         hidden: &HiddenStates,
@@ -2788,6 +2763,7 @@ mod dsv4_gpu {
                 i_dim,
                 hidden_dim,
                 tables.group_size,
+                xor_mask,
                 ctx,
                 ctx.stream.cu_stream(),
             )?;
@@ -2822,6 +2798,7 @@ mod dsv4_gpu {
                 hidden_dim,
                 i_dim,
                 tables.group_size,
+                xor_mask,
                 ctx,
                 ctx.stream.cu_stream(),
             )?;
@@ -3294,6 +3271,7 @@ mod dsv4_gpu {
                     model,
                     layer,
                     tables,
+                    0,
                     route_indices,
                     route_weights,
                     hidden,
@@ -3314,6 +3292,7 @@ mod dsv4_gpu {
                     model,
                     layer,
                     tables,
+                    0x08080808,
                     route_indices,
                     route_weights,
                     hidden,

@@ -1822,7 +1822,8 @@ __global__ void w4a16_grouped_gemv_batch_kernel(
     int max_count,
     int N,
     int K,
-    int group_size)
+    int group_size,
+    uint32_t xor_mask)
 {
     int threads_per_row = GEMV_THREADS / GEMV_ROWS;
     int row = blockIdx.x * GEMV_ROWS + threadIdx.x / threads_per_row;
@@ -1864,8 +1865,8 @@ __global__ void w4a16_grouped_gemv_batch_kernel(
             uint32_t p = words[w];
             int kk = k + w * 8;
 
-            uint32_t lo_all = p & MASK4;
-            uint32_t hi_all = (p >> 4) & MASK4;
+            uint32_t lo_all = (p & MASK4) ^ xor_mask;
+            uint32_t hi_all = ((p >> 4) & MASK4) ^ xor_mask;
 
             uint32_t lo01 = (0x6400u | (lo_all & 0xffu)) |
                             ((0x6400u | ((lo_all >> 8) & 0xffu)) << 16);
@@ -1979,7 +1980,8 @@ __global__ void w4a16_grouped_gemv_pair_batch_kernel(
     int max_count,
     int N,
     int K,
-    int group_size)
+    int group_size,
+    uint32_t xor_mask)
 {
     int threads_per_row = GEMV_THREADS / GEMV_ROWS;
     int row = blockIdx.x * GEMV_ROWS + threadIdx.x / threads_per_row;
@@ -2033,8 +2035,8 @@ __global__ void w4a16_grouped_gemv_pair_batch_kernel(
             int kk = k + w * 8;
 
             // Dequant A
-            uint32_t lo_a = pa & MASK4;
-            uint32_t hi_a = (pa >> 4) & MASK4;
+            uint32_t lo_a = (pa & MASK4) ^ xor_mask;
+            uint32_t hi_a = ((pa >> 4) & MASK4) ^ xor_mask;
             uint32_t lo01_a = (0x6400u | (lo_a & 0xffu)) | ((0x6400u | ((lo_a >> 8) & 0xffu)) << 16);
             uint32_t lo23_a = (0x6400u | ((lo_a >> 16) & 0xffu)) | ((0x6400u | ((lo_a >> 24) & 0xffu)) << 16);
             uint32_t hi01_a = (0x6400u | (hi_a & 0xffu)) | ((0x6400u | ((hi_a >> 8) & 0xffu)) << 16);
@@ -2049,8 +2051,8 @@ __global__ void w4a16_grouped_gemv_pair_batch_kernel(
             half2 wsy2_a = __hmul2(__halves2half2(w2a.y, w3a.y), scale_a_h2);
 
             // Dequant B
-            uint32_t lo_b = pb & MASK4;
-            uint32_t hi_b = (pb >> 4) & MASK4;
+            uint32_t lo_b = (pb & MASK4) ^ xor_mask;
+            uint32_t hi_b = ((pb >> 4) & MASK4) ^ xor_mask;
             uint32_t lo01_b = (0x6400u | (lo_b & 0xffu)) | ((0x6400u | ((lo_b >> 8) & 0xffu)) << 16);
             uint32_t lo23_b = (0x6400u | ((lo_b >> 16) & 0xffu)) | ((0x6400u | ((lo_b >> 24) & 0xffu)) << 16);
             uint32_t hi01_b = (0x6400u | (hi_b & 0xffu)) | ((0x6400u | ((hi_b >> 8) & 0xffu)) << 16);
@@ -2995,6 +2997,7 @@ cudaError_t moe_w4a16_grouped_gemv_batch_cuda(
     int N,
     int K,
     int group_size,
+    uint32_t xor_mask,
     cudaStream_t stream)
 {
     if (num_experts <= 0 || max_count <= 0 || N <= 0 || K <= 0 ||
@@ -3007,7 +3010,7 @@ cudaError_t moe_w4a16_grouped_gemv_batch_cuda(
               num_experts);
     w4a16_grouped_gemv_batch_kernel<<<grid, block, 0, stream>>>(
         weight_ptrs, scale_ptrs, input, output, offsets, counts, expert_indices,
-        max_count, N, K, group_size);
+        max_count, N, K, group_size, xor_mask);
     return cudaGetLastError();
 }
 
@@ -3027,6 +3030,7 @@ cudaError_t moe_w4a16_grouped_gemv_pair_batch_cuda(
     int N,
     int K,
     int group_size,
+    uint32_t xor_mask,
     cudaStream_t stream)
 {
     if (num_experts <= 0 || max_count <= 0 || N <= 0 || K <= 0 ||
@@ -3040,7 +3044,7 @@ cudaError_t moe_w4a16_grouped_gemv_pair_batch_cuda(
     w4a16_grouped_gemv_pair_batch_kernel<<<grid, block, 0, stream>>>(
         weight_a_ptrs, scale_a_ptrs, weight_b_ptrs, scale_b_ptrs, input,
         output_a, output_b, offsets, counts, expert_indices, max_count, N, K,
-        group_size);
+        group_size, xor_mask);
     return cudaGetLastError();
 }
 
@@ -3558,20 +3562,6 @@ cudaError_t q6k_embedding_decode_cuda(
     int hidden_dim, cudaStream_t stream)
 {
     return qxk_embedding_decode_cuda(weight, token_id, out, hidden_dim, 6, Q6K_SB_BYTES, stream);
-}
-
-// XOR every byte with 0x88: converts signed INT4 two's complement nibbles
-// to the unsigned + zero-point=8 format the W4A16 GEMV kernel expects.
-__global__ void w4_sign_to_zeropoint_kernel(uint8_t* data, size_t n) {
-    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < n) data[idx] ^= 0x88;
-}
-
-cudaError_t w4_sign_to_zeropoint_cuda(uint8_t* data, size_t n, cudaStream_t stream) {
-    int threads = 256;
-    int blocks = (n + threads - 1) / threads;
-    w4_sign_to_zeropoint_kernel<<<blocks, threads, 0, stream>>>(data, n);
-    return cudaGetLastError();
 }
 
 }  // extern "C"
