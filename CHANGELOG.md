@@ -8,6 +8,60 @@ detail in the linked wins/errors entry. Oldest sections are condensed.
 
 ## [Unreleased]
 
+## [0.5.8] - 2026-08-21
+
+Two 4-bit checkpoint families now serve on CUDA, and the decode profile that
+ranked their optimisation work turned out to have been taken at the wrong batch.
+
+### NVFP4 serving — both families
+
+- **DeepSeek-V4-Flash NVFP4 → W4AFP8, converted at load.** Routed MoE experts
+  ship as E2M1 packed in I8 with F8_E8M0 per-1x32-block scales; the SGLang W4A8
+  CUTLASS kernel wants signed INT4 with BF16 per-1x128-block scales. The
+  conversion runs on GPU per expert, byte-neutral, and never retains the source,
+  which is what keeps TP=2 inside 96 GB/GPU.
+  ([TP=2](docs/experience/wins/2026-08-18-nvfp4-w4afp8-tp2-serve.md) ·
+  [TP=4 decode](docs/experience/wins/2026-08-19-w4afp8-tp4-decode.md) ·
+  [GEMV decode lane](docs/experience/wins/2026-08-21-w4afp8-gemv-decode-lane.md))
+- **Qwen3.8-27B NVFP4, one resident layout.** Marlin `kFE2M1f` at decode; above
+  the DeepGEMM prefill floor the same Marlin layout is widened to E4M3 in
+  scratch for DeepGEMM's native FP8 MMA, 84 → 274 TFLOPS. Against
+  Qwen3.6-27B-FP8 on one H20: 32K long-agent ITL +21.3% / +20.7% / +13.2% /
+  +5.5% at c=1/4/8/16, resident 22.36 GB against 29.36, KV pool 1,779,114
+  against 1,582,506.
+  ([entry](docs/experience/wins/2026-08-20-nvfp4-widen-to-e4m3-deepgemm-prefill.md))
+
+### Default flip
+
+- **`--spec-type auto` is the default, and it is implemented.** It speculates
+  whenever the checkpoint declares an MTP head (`mtp_num_hidden_layers`, which
+  Qwen3.5 nests under `text_config`, or `num_nextn_predict_layers`; GLM ships 0).
+  c=1 goes 20.50 → 11.94 ms per committed token and +21.6% end-to-end tok/s at
+  d=2; d=4 is not better. Above c=1 it is inert. Needle ladder exact x3 DET at
+  four lengths, with engagement proven by a counter rather than by identical
+  text — speculation is output-preserving under greedy, so the ladder alone
+  cannot tell "ran and was correct" from "never ran".
+  ([entry](docs/experience/wins/2026-08-21-spec-type-auto-default.md))
+
+### Decode
+
+- **The decode profile was taken at the wrong batch, and it inverts.** Every
+  lever had been ranked off Marlin 68.3% / attention 1.6%. At serving
+  concurrency it is **attention 80.6% at c=16 and 82.7% at c=32**, Marlin 13.9%
+  / 12.7% — attention scales with batch x context while the weight read does
+  not, so their shares cross.
+  ([entry](docs/experience/errors/2026-08-21-decode-profile-taken-at-the-wrong-batch.md))
+- **Paged-attention KV row in one vector load.** A lane's 8 KV bytes are
+  contiguous, so 48 `LDG.E.U8` become 4 `LDG.E.64`, and the KV scale leaves the
+  per-element loop (`FMUL` 300 → 260). **+4.25% output tok/s at c=32, sigma
+  0.2%.** `cuobjdump` was the gate: it proved the compiler was not already
+  vectorising, then caught two regressions in the fix before either reached a
+  bench.
+  ([entry](docs/experience/wins/2026-08-21-paged-attention-vector-load.md))
+
+### Verdicts
+
+
 - **NVFP4 decode — verdict: the sm_90 mixed-input collective is a second arm
   above M=32, not a replacement for Marlin.** Driven with one group as a dense
   GEMM it is 0.65x Marlin at M=1 and 0.90x at M=16, then 1.08x at M=32, 1.46x at
