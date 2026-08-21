@@ -1496,9 +1496,9 @@ fn dsv4_moe_forward_masked_tail(
         }
     }
     // W4AFP8 lane: decode-band GEMV (reuses W4A16 kernel, BF16 activations)
-    // for M=1 only — the GEMV kernel loads weights per-token without
-    // cross-token reuse, so M>1 (DSpark verify, batched decode) takes the
-    // SGLang CUTLASS grouped GEMM instead.
+    // for M=1 only. A/B confirmed GEMV is 8.8% slower than CUTLASS at M=5
+    // (30 routes) — the kernel is tuned for 6-route decode and does not scale.
+    // M>1 (DSpark verify, batched decode) takes the SGLang CUTLASS grouped GEMM.
     if let (Some(w13), Some(w2)) = (&layer.w13_w4afp8, &layer.w2_w4afp8) {
         if num_tokens == 1 && total_routes <= DSV4_DECODE_GEMV_MAX_ROUTES {
             let tables = layer.w4afp8_gemv_tables.get_or_init(|| {
