@@ -125,7 +125,7 @@ pub(crate) struct Dsv4ForwardKeepalive {
 }
 
 impl Dsv4ForwardKeepalive {
-    pub(super) fn new(active: bool) -> Self {
+    pub(crate) fn new(active: bool) -> Self {
         Self {
             active,
             bf16: Vec::with_capacity(512),

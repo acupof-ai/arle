@@ -524,6 +524,9 @@ impl Dsv4Model {
             mega_moe: None,
             #[cfg(feature = "deepep")]
             deepep,
+            graph_mode: std::sync::atomic::AtomicBool::new(false),
+            graph_token_ids: std::sync::Mutex::new(None),
+            graph_bufs: std::sync::Mutex::new(Vec::new()),
         })
     }
 }

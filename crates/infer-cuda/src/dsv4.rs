@@ -77,6 +77,11 @@ pub(crate) struct Dsv4Model {
     pub(crate) mega_moe: Option<Dsv4MegaMoeTransport>,
     #[cfg(feature = "deepep")]
     pub deepep: Option<crate::deepep::DeepEpTransport>,
+    /// c=1 decode graph: when true, `forward_tokens_stream_impl` skips per-step
+    /// H2D copies and reuses persistent device buffers at fixed addresses.
+    pub graph_mode: std::sync::atomic::AtomicBool,
+    graph_token_ids: std::sync::Mutex<Option<CudaSlice<i32>>>,
+    graph_bufs: std::sync::Mutex<Vec<Option<HiddenStates>>>,
 }
 
 impl std::fmt::Debug for Dsv4Model {
@@ -90,5 +95,73 @@ impl std::fmt::Debug for Dsv4Model {
             .field("kv_bytes_per_token", &self.kv_arena.bytes_per_token)
             .field("mtp_loaded", &self.mtp.is_some())
             .finish()
+    }
+}
+
+/// Persistent-buffer indexing for the c=1 decode graph.
+/// Index 0 = stream output; per-layer base = 1 + layer_idx * 7.
+/// Per-layer offsets: 0=normed_attn 1=attn_out 2=attn_stream 3=normed_ffn
+/// 4=moe_with_shared 5=moe_out 6=ffn_stream.
+const fn graph_buf_idx_stream() -> usize {
+    0
+}
+const fn graph_buf_idx_layer(layer_idx: usize, offset: usize) -> usize {
+    1 + layer_idx * 7 + offset
+}
+
+impl Dsv4Model {
+    /// Upload token IDs to the persistent graph buffer (called before capture/replay).
+    pub(crate) fn graph_upload_token_ids(&self, tokens: &[u32]) -> Result<()> {
+        let host: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
+        let mut buf = self.graph_token_ids.lock().unwrap();
+        if buf.is_none() {
+            *buf = Some(crate::ops::upload_i32(&self.ctx, &host)?);
+        } else {
+            self.ctx
+                .stream
+                .memcpy_htod(&host, buf.as_mut().unwrap())
+                .map_err(|e| anyhow!("DSv4 graph token_ids H2D failed: {e}"))?;
+        }
+        Ok(())
+    }
+
+    /// Allocate (first call) or clone (subsequent calls) a persistent HiddenStates
+    /// at the given buffer index. Clones share the same device memory (CudaSlice
+    /// is ref-counted), so graph replay reads/writes the same addresses.
+    fn graph_alloc_hidden(&self, idx: usize, dim: usize, seq_len: usize) -> Result<HiddenStates> {
+        let mut bufs = self.graph_bufs.lock().unwrap();
+        if bufs.len() <= idx {
+            bufs.resize_with(idx + 1, || None);
+        }
+        if bufs[idx].is_none() {
+            // SAFETY: fully written by the forward kernels before first read.
+            bufs[idx] = Some(unsafe { HiddenStates::uninit(&self.ctx, dim, seq_len)? });
+        }
+        let b = bufs[idx].as_ref().unwrap();
+        Ok(HiddenStates {
+            data: b.data.clone(),
+            hidden_dim: b.hidden_dim,
+            seq_len: b.seq_len,
+        })
+    }
+
+    /// Clone of the persistent stream output buffer (index 0).
+    /// Only valid after the first graph-mode forward allocated it.
+    pub(crate) fn graph_stream_clone(&self) -> Result<HiddenStates> {
+        let bufs = self.graph_bufs.lock().unwrap();
+        let b = bufs
+            .first()
+            .and_then(|b| b.as_ref())
+            .ok_or_else(|| anyhow!("DSv4 graph stream buffer not allocated"))?;
+        Ok(HiddenStates {
+            data: b.data.clone(),
+            hidden_dim: b.hidden_dim,
+            seq_len: b.seq_len,
+        })
+    }
+
+    /// True when the c=1 decode graph should use persistent buffers.
+    pub(crate) fn graph_mode(&self) -> bool {
+        self.graph_mode.load(std::sync::atomic::Ordering::Relaxed)
     }
 }

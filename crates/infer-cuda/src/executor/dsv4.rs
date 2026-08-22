@@ -50,6 +50,15 @@ pub(crate) struct Dsv4CudaExecutor {
     /// on promote (without it, KV overflow falls back to recompute). NVMe spill
     /// is opt-in via `set_kv_tier_disk`.
     pub(super) slot_tier: KvTierStore,
+    /// c=1 decode graph: `Some` after the first successful capture; `None` if
+    /// the capture failed or the model doesn't qualify.
+    decode_graph: Option<Dsv4DecodeGraph>,
+}
+
+/// CUDA graph state for the c=1 decode path. The graph captures the transformer
+/// layers; the LM head + sampling run eagerly after replay.
+struct Dsv4DecodeGraph {
+    state: crate::graph::CudaGraphState,
 }
 
 pub(crate) struct Dsv4DsparkExec {
@@ -218,6 +227,107 @@ impl Dsv4CudaExecutor {
         }
     }
 
+    /// Try the c=1 decode graph. Returns `Ok(Some(tokens))` on success,
+    /// `Ok(None)` if the graph is unavailable (conditions not met, capture
+    /// failed, or replay not yet reached).
+    fn try_graph_decode_c1(
+        &mut self,
+        slot_idx: usize,
+        last_token: u32,
+        start_pos: usize,
+        params: &SamplingParams,
+        position: u64,
+        penalty: infer_plan::PenaltyHistory<'_>,
+    ) -> Result<Option<Vec<u32>>> {
+        if !params.is_raw_argmax() || params.has_penalty() {
+            return Ok(None);
+        }
+        if self.spec_requested() || self.dspark.is_some() {
+            return Ok(None);
+        }
+
+        if self.decode_graph.is_none() {
+            self.decode_graph = Some(Dsv4DecodeGraph {
+                state: crate::graph::CudaGraphState::new(self.model.ctx.stream.clone()),
+            });
+        }
+        let graph = self.decode_graph.as_mut().unwrap();
+
+        let model = &self.model;
+        let slot = &mut self.slots[slot_idx];
+        let kv_adapter = &mut self.kv_adapter;
+
+        // Pre-graph: upload token_ids + start_pos to persistent buffers.
+        model.graph_upload_token_ids(&[last_token])?;
+        let start_pos_i32 = i32::try_from(start_pos)
+            .map_err(|_| anyhow::anyhow!("DSv4 start_pos {start_pos} overflows i32"))?;
+        model
+            .ctx
+            .stream
+            .memcpy_htod(&[start_pos_i32], &mut slot.start_pos_device)
+            .map_err(|e| anyhow::anyhow!("DSv4 graph start_pos H2D failed: {e}"))?;
+
+        model
+            .graph_mode
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        // Graph: capture/replay transformer layers. The closure stores the
+        // output stream so the LM head can read it after replay.
+        let result = std::cell::RefCell::new(None);
+        let capture_result = graph.state.run_or_capture(|| {
+            let (stream, keepalive) = model.forward_tokens_stream_impl(
+                slot,
+                kv_adapter,
+                &[last_token],
+                start_pos,
+                false,
+                None,
+            )?;
+            *result.borrow_mut() = Some(stream);
+            drop(keepalive);
+            Ok(())
+        });
+
+        model
+            .graph_mode
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+
+        if let Err(e) = capture_result {
+            log::warn!("DSv4 c=1 decode graph failed, falling back to eager: {e}");
+            self.decode_graph = None;
+            return Ok(None);
+        }
+
+        // During warm-up/capture the closure ran and produced the stream.
+        // During replay the closure did NOT run; clone the persistent buffer.
+        let was_replay = result.borrow().is_none();
+        let stream = if let Some(s) = result.into_inner() {
+            s
+        } else {
+            model.graph_stream_clone()?
+        };
+
+        // LM head + sampling (outside the graph).
+        let mut keepalive = crate::dsv4::Dsv4ForwardKeepalive::new(false);
+        let token = model.forward_stream_last_token(
+            &stream,
+            1,
+            params,
+            position,
+            penalty,
+            None,
+            &mut keepalive,
+        )?;
+        drop(keepalive);
+
+        // On replay the closure (which advances seq_len) did not run.
+        if was_replay {
+            slot.seq_len += 1;
+        }
+
+        Ok(Some(vec![token]))
+    }
+
     fn forward_decode_tokens(
         &mut self,
         slot_idx: usize,
@@ -228,6 +338,11 @@ impl Dsv4CudaExecutor {
         penalty: infer_plan::PenaltyHistory<'_>,
     ) -> Result<Vec<u32>> {
         if !self.spec_requested() {
+            if let Some(tokens) = self
+                .try_graph_decode_c1(slot_idx, last_token, start_pos, params, position, penalty)?
+            {
+                return Ok(tokens);
+            }
             let token = self.model.forward_tokens(
                 &mut self.slots[slot_idx],
                 &mut self.kv_adapter,

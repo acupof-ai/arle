@@ -77,7 +77,7 @@ impl Dsv4Model {
         Ok(token)
     }
 
-    pub(super) fn forward_tokens_stream_impl(
+    pub(crate) fn forward_tokens_stream_impl(
         &self,
         slot: &mut Dsv4SlotState,
         kv_adapter: &mut crate::attention::Dsv4KvAdapter,
@@ -142,23 +142,40 @@ impl Dsv4Model {
                 anyhow!("DSv4 deepep: stream error at forward entry (before embed): {e}")
             })?;
         }
+        let graph_mode = self.graph_mode() && seq_len == 1;
         let start_pos_device = if seq_len == 1 {
-            let start_pos_i32 = i32::try_from(start_pos)
-                .map_err(|_| anyhow!("DSv4 start_pos {start_pos} overflows i32"))?;
-            self.ctx
-                .stream
-                .memcpy_htod(&[start_pos_i32], &mut slot.start_pos_device)
-                .map_err(|e| anyhow!("DSv4 start_pos H2D failed: {e}"))?;
+            if !graph_mode {
+                let start_pos_i32 = i32::try_from(start_pos)
+                    .map_err(|_| anyhow!("DSv4 start_pos {start_pos} overflows i32"))?;
+                self.ctx
+                    .stream
+                    .memcpy_htod(&[start_pos_i32], &mut slot.start_pos_device)
+                    .map_err(|e| anyhow!("DSv4 start_pos H2D failed: {e}"))?;
+            }
             Some(&slot.start_pos_device)
         } else {
             None
         };
 
         let token_ids_host: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
-        let token_ids = crate::ops::upload_i32(&self.ctx, &token_ids_host)?;
+        let token_ids = if graph_mode {
+            self.graph_token_ids
+                .lock()
+                .unwrap()
+                .as_ref()
+                .expect("graph_token_ids uploaded before graph closure")
+                .clone()
+        } else {
+            crate::ops::upload_i32(&self.ctx, &token_ids_host)?
+        };
         keepalive.keep_i32(&token_ids);
         // SAFETY: embed_stream writes the full stream buffer.
-        let mut stream = unsafe { HiddenStates::uninit(&self.ctx, stream_dim, seq_len)? };
+        let mut stream = if graph_mode {
+            self.graph_alloc_hidden(super::graph_buf_idx_stream(), stream_dim, seq_len)?
+        } else {
+            // SAFETY: fully written before first read.
+            unsafe { HiddenStates::uninit(&self.ctx, stream_dim, seq_len)? }
+        };
         self.embed_stream(&token_ids, seq_len, &mut stream, &mut keepalive)?;
         let sparse_verify_meta = match verify {
             Some(sched) => {
@@ -185,7 +202,16 @@ impl Dsv4Model {
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             // SAFETY: fused hc_pre+rms_norm / plain rms_norm writes the full
             // [seq_len, hidden_size] buffer.
-            let mut normed = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
+            let mut normed = if graph_mode {
+                self.graph_alloc_hidden(
+                    super::graph_buf_idx_layer(layer_idx, 0),
+                    hidden_size,
+                    seq_len,
+                )?
+            } else {
+                // SAFETY: fully written before first read.
+                unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? }
+            };
             let attn_mhc = self.hc_pre_norm(
                 layer,
                 HcHalf::Attn,
@@ -210,7 +236,16 @@ impl Dsv4Model {
                     .map_err(|e| anyhow!("DSv4 commit-fold normed persist failed: {e}"))?;
             }
             // SAFETY: mla_attention writes the full [seq_len, hidden_size] buffer.
-            let mut attn_out = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
+            let mut attn_out = if graph_mode {
+                self.graph_alloc_hidden(
+                    super::graph_buf_idx_layer(layer_idx, 1),
+                    hidden_size,
+                    seq_len,
+                )?
+            } else {
+                // SAFETY: fully written before first read.
+                unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? }
+            };
             if let Some(meta) = sparse_verify_meta.as_ref() {
                 // Scheduled verify: one sparse FlashMLA attention over the whole
                 // row chunk. Ancestors carry row `r`'s chain dependency, so no row
@@ -319,7 +354,16 @@ impl Dsv4Model {
                 || self.tp.all_reduce_sum(&self.ctx, &mut attn_out),
             )?;
             // SAFETY: hc_post / add_batch writes the full stream buffer.
-            let mut attn_stream = unsafe { HiddenStates::uninit(&self.ctx, stream_dim, seq_len)? };
+            let mut attn_stream = if graph_mode {
+                self.graph_alloc_hidden(
+                    super::graph_buf_idx_layer(layer_idx, 2),
+                    stream_dim,
+                    seq_len,
+                )?
+            } else {
+                // SAFETY: fully written before first read.
+                unsafe { HiddenStates::uninit(&self.ctx, stream_dim, seq_len)? }
+            };
             self.hc_post_fold(
                 attn_mhc.as_ref(),
                 HcHalf::Attn,
@@ -334,7 +378,16 @@ impl Dsv4Model {
 
             // SAFETY: fused hc_pre+rms_norm / plain rms_norm writes the full
             // [seq_len, hidden_size] buffer.
-            let mut normed = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
+            let mut normed = if graph_mode {
+                self.graph_alloc_hidden(
+                    super::graph_buf_idx_layer(layer_idx, 3),
+                    hidden_size,
+                    seq_len,
+                )?
+            } else {
+                // SAFETY: fully written before first read.
+                unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? }
+            };
             let ffn_mhc = self.hc_pre_norm(
                 layer,
                 HcHalf::Ffn,
@@ -347,9 +400,17 @@ impl Dsv4Model {
             keepalive.keep_hidden(&normed);
             // GLM dense layer (`per_layer_dense_mlp[i]`): a plain SwiGLU FFN
             // replaces the routed-expert + shared-expert MoE entirely.
-            let mut moe_with_shared =
+            let mut moe_with_shared = if graph_mode {
+                self.graph_alloc_hidden(
+                    super::graph_buf_idx_layer(layer_idx, 4),
+                    hidden_size,
+                    seq_len,
+                )?
+            } else {
                 // SAFETY: uninit device scratch; fully written before first read.
-                unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
+                // SAFETY: fully written before first read.
+                unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? }
+            };
             if let Some(dense) = layer.dense_mlp.as_ref() {
                 crate::profile::profile_op(ctx, "mlp", Some(layer_idx), seq_len, || {
                     dsv4_dense_mlp_forward(
@@ -372,7 +433,16 @@ impl Dsv4Model {
                     None
                 };
                 // SAFETY: the MoE forward writes the full routed output buffer.
-                let mut moe_out = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
+                let mut moe_out = if graph_mode {
+                    self.graph_alloc_hidden(
+                        super::graph_buf_idx_layer(layer_idx, 5),
+                        hidden_size,
+                        seq_len,
+                    )?
+                } else {
+                    // SAFETY: fully written before first read.
+                    unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? }
+                };
                 // DeepEP combine already reduces the EP-sharded routed output; the
                 // non-deepep path needs the explicit TP all-reduce below.
                 let (shared_out, mut shared_scratch) = kv_adapter.shared_expert_decode_mut();
@@ -562,6 +632,7 @@ impl Dsv4Model {
                             // SAFETY: dsv4_shared_expert_forward writes the full shared
                             // output.
                             let mut shared =
+                                // SAFETY: fully written before first read.
                                 unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
                             crate::moe::dsv4_shared_expert_forward(
                                 &self.ctx,
@@ -598,7 +669,16 @@ impl Dsv4Model {
                 )?;
             }
             // SAFETY: hc_post / add_batch writes the full stream buffer.
-            let mut ffn_stream = unsafe { HiddenStates::uninit(&self.ctx, stream_dim, seq_len)? };
+            let mut ffn_stream = if graph_mode {
+                self.graph_alloc_hidden(
+                    super::graph_buf_idx_layer(layer_idx, 6),
+                    stream_dim,
+                    seq_len,
+                )?
+            } else {
+                // SAFETY: fully written before first read.
+                unsafe { HiddenStates::uninit(&self.ctx, stream_dim, seq_len)? }
+            };
             self.hc_post_fold(
                 ffn_mhc.as_ref(),
                 HcHalf::Ffn,

@@ -100,7 +100,7 @@ impl Dsv4Model {
         Ok(())
     }
 
-    pub(super) fn forward_stream_last_token(
+    pub(crate) fn forward_stream_last_token(
         &self,
         stream: &HiddenStates,
         seq_len: usize,

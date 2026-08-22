@@ -12,7 +12,7 @@ pub(crate) struct Dsv4SlotState {
     /// Scheduled MTP verify forward workspace: row-major layer temporaries kept
     /// resident so the tiny `depth + 1` row forward avoids the prefill allocator.
     pub(super) spec_verify: Option<Dsv4SpecVerifyScratch>,
-    pub(super) start_pos_device: CudaSlice<i32>,
+    pub(crate) start_pos_device: CudaSlice<i32>,
     /// Pre-allocated NVSHMEM low-latency MoE scratch, overwritten in place each
     /// `dsv4_moe_forward_deepep_ll` call. One per slot suffices — layers run
     /// sequentially. `Some` only when the `deepep_ll` transport is booted.
@@ -25,7 +25,7 @@ pub(crate) struct Dsv4SlotState {
     /// once by the DSpark prefix seed. Prefill-scoped and bounded by the chunked-
     /// prefill chunk size — deliberately EXCLUDED from the per-slot VRAM ledger.
     pub(super) dspark_prompt_taps: Option<Dsv4DsparkPromptTaps>,
-    pub(super) seq_len: usize,
+    pub(crate) seq_len: usize,
     pub(super) max_seq_len: usize,
 }
 
