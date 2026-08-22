@@ -1,5 +1,4 @@
-//! deepep-sys — torch-free Rust binding for DeepEP intranode kernels
-//! (Phase B-2 of the multiproc-serve pivot).
+//! deepep-sys — torch-free Rust binding for DeepEP intranode kernels.
 //!
 //! Two build modes:
 //! - **Native** (set `ARLE_DEEPEP_DIR=<deepseek-ai/DeepEP source tree>`
@@ -113,7 +112,6 @@ pub struct LowLatencyDispatchParams {
     pub compute_stream: usize,
 }
 
-/// Parameters for a single NVSHMEM low-latency combine.
 pub struct LowLatencyCombineParams {
     pub num_combined_tokens: u32,
     pub hidden: u32,
@@ -152,29 +150,26 @@ pub fn ll_get_uniqueid() -> Result<[u8; LL_UNIQUEID_BYTES]> {
     Ok(uid)
 }
 
-/// Stub build: NVSHMEM LL unavailable.
 #[cfg(deepep_stub)]
 pub fn ll_get_uniqueid() -> Result<[u8; LL_UNIQUEID_BYTES]> {
     bail!(DeepEpError::NotBuilt)
 }
 
-/// Whether this binary was built with the DeepEP native path enabled.
-/// `false` means every method on `Buffer` returns `DeepEpError::NotBuilt`.
+/// `false` means every `Buffer` method returns `DeepEpError::NotBuilt`.
 pub fn is_native() -> bool {
     !cfg!(deepep_stub)
 }
 
 /// Whether the DeepEP NVSHMEM low-latency (internode_ll) path is
-/// compiled + linked into this binary. `true` proves libarle_deepep.a
-/// pulled the internode_ll + NVSHMEM device objects at final link
-/// (build+link de-risk only — no `nvshmem_init` runtime bootstrap yet).
+/// compiled + linked into this binary. `true` only proves libarle_deepep.a
+/// pulled the internode_ll + NVSHMEM device objects at final link — no
+/// `nvshmem_init` runtime bootstrap yet.
 #[cfg(not(deepep_stub))]
 pub fn nvshmem_built() -> bool {
     // SAFETY: trivial extern "C" probe, no args, returns int.
     unsafe { native::arle_deepep_nvshmem_built() != 0 }
 }
 
-/// Stub build: NVSHMEM LL is never compiled in.
 #[cfg(deepep_stub)]
 pub fn nvshmem_built() -> bool {
     false
@@ -354,9 +349,8 @@ mod native {
         pub(super) fn arle_deepep_buffer_destroy(handle: *mut ArleDeepEpBuffer);
         pub(super) fn arle_deepep_last_error() -> *const c_char;
         /// Force-link probe: returns 1 when the internode_ll + NVSHMEM
-        /// objects are compiled into libarle_deepep.a (T4-LL de-risk).
+        /// objects are compiled into libarle_deepep.a.
         pub(super) fn arle_deepep_nvshmem_built() -> c_int;
-        // --- NVSHMEM low-latency (internode_ll) surface ---
         pub(super) fn arle_deepep_ll_get_uniqueid(out_uniqueid: *mut u8) -> c_int;
         pub(super) fn arle_deepep_buffer_ll_create(
             rank: u32,
@@ -575,7 +569,6 @@ impl Buffer {
         Ok(Self { handle })
     }
 
-    /// `true` if this buffer was created in NVSHMEM low-latency mode.
     pub fn is_low_latency(&self) -> bool {
         // SAFETY: read-only query on the owned handle.
         unsafe { native::arle_deepep_buffer_is_low_latency(self.handle) != 0 }
