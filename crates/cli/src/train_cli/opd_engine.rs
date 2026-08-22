@@ -288,9 +288,6 @@ pub(super) fn load_agent_opd_serve_student(
         dump_dir.display()
     );
 
-    // Train-infer FP8 weight sharing (`--share-frozen-base`): borrow the rollout
-    // engine's resident FP8 base pointers and pass them into the autograd student
-    // load so its frozen FP8 base projections import a NON-OWNING view.
     let shared_base_entries: Vec<SharedFrozenBaseEntry> = if !args.no_share_frozen_base {
         shared_frozen_base_entries(&student_engine, "agent-opd")?
     } else {

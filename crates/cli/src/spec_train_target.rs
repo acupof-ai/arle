@@ -290,7 +290,6 @@ fn load_samples(
     ))
 }
 
-/// Positions sampled across the sequence for the target-logits oracle.
 const PROBE_POSITIONS: usize = 16;
 const PROBE_TOPK: usize = 64;
 // The engine's head is FP8/Marlin and the reconstruction is f32 over bf16
@@ -351,7 +350,6 @@ fn probe(
     bail!("PROBE FAIL: {}", failures.join("; "));
 }
 
-/// Per-tap norm, range, non-finite fraction, and the pairwise cosine matrix.
 fn probe_taps(
     taps: &[f32],
     seq: usize,
@@ -426,9 +424,8 @@ fn probe_taps(
     }
 }
 
-/// The trainer's `matmul_bt(last_hidden, lm_head)` against the engine's own
-/// lm-head output at the same positions. Ranking agreement only, since the two
-/// heads run at different precisions by design.
+/// Ranking agreement only — the two heads run at different precisions by
+/// design.
 fn probe_logits(
     sample: &spec_train::trainer::Sample,
     last_hidden: &[f32],
@@ -535,7 +532,6 @@ fn argmax(row: &[f32]) -> usize {
         .map_or(0, |(i, _)| i)
 }
 
-/// `|top-k(a) ∩ top-k(b)| / k`.
 fn topk_overlap(a: &[f32], b: &[f32], k: usize) -> f64 {
     let k = k.clamp(1, a.len());
     let top = |row: &[f32]| -> std::collections::HashSet<usize> {
@@ -546,7 +542,6 @@ fn topk_overlap(a: &[f32], b: &[f32], k: usize) -> f64 {
     top(a).intersection(&top(b)).count() as f64 / k as f64
 }
 
-/// `log_softmax(row)[i]`, max-subtracted.
 fn log_softmax_at(row: &[f32], i: usize) -> f64 {
     let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let sum: f64 = row.iter().map(|&x| f64::from(x - max).exp()).sum();

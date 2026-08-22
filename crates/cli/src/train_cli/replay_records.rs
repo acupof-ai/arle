@@ -16,12 +16,10 @@ use {
     std::path::Path,
 };
 
-/// `arle train cc-convert` — backend-independent (no CUDA): dumps → verl-style
-/// token records via `train::cc_convert`.
+/// Backend-independent (no CUDA): dumps → verl-style token records.
 pub(super) fn run_cc_convert_impl(args: TrainCcConvertArgs) -> Result<()> {
     use train::cc_convert::CcWindow;
 
-    // Windows from --windows (JSONL) plus repeated --window START:END[:LABEL].
     let mut windows: Vec<CcWindow> = Vec::new();
     if let Some(path) = args.windows.as_deref() {
         let raw = fs::read_to_string(path)

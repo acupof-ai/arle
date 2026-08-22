@@ -1,10 +1,3 @@
-//! Tokens-per-second summary for streaming turns.
-//!
-//! Maintains a rolling token count + start-time and prints one final status
-//! line to stderr at end-of-turn. The line surfaces three numbers per turn:
-//! input throughput (prompt tokens / TTFT), TTFT itself, and output
-//! throughput (completion tokens / elapsed).
-
 use std::io::{self, Write};
 use std::time::{Duration, Instant};
 
@@ -29,7 +22,6 @@ impl TpsMeter {
         }
     }
 
-    /// Increment the token counter (one call per received delta text chunk).
     pub(crate) fn record_chunk(&mut self, chars: usize) {
         // We don't have token boundaries from the stream; count chunks as a
         // rough proxy. This is fine for a UX indicator — the final summary
@@ -42,8 +34,7 @@ impl TpsMeter {
         }
     }
 
-    /// Erase the live line in place so the next stdout write starts
-    /// clean. Called from the caller right before printing a token chunk.
+    /// Erase the live line in place so the next stdout write starts clean.
     pub(crate) fn hide_before_chunk(&mut self) {
         if !self.live_visible {
             return;
@@ -54,13 +45,9 @@ impl TpsMeter {
         self.live_visible = false;
     }
 
-    /// Print the final summary to stderr on its own line.
-    ///
-    /// Prefers `external_ttft` when supplied — that's the agent's
-    /// engine-token TTFT, which catches turns that opened with a
-    /// `<tool_call>` block (zero visible text, but the model still
-    /// generated tokens). Falls back to the meter's own visible-text
-    /// first-chunk capture when the caller passes `None`.
+    /// Prefers `external_ttft` (the engine-token TTFT, which catches turns that
+    /// opened with a `<tool_call>` block — zero visible text but tokens were
+    /// generated); falls back to the meter's visible-text first-chunk capture.
     pub(crate) fn print_final(
         &mut self,
         prompt_tokens: u64,
@@ -88,8 +75,6 @@ fn tps(tokens: u64, elapsed: Duration) -> f64 {
     }
 }
 
-/// Format a duration tightly: sub-second values render as `420ms`, otherwise
-/// as `1.4s`. Picks the unit a reader would pick by hand.
 fn fmt_short(d: Duration) -> String {
     let secs = d.as_secs_f64();
     if secs >= 1.0 {
@@ -99,10 +84,8 @@ fn fmt_short(d: Duration) -> String {
     }
 }
 
-/// Final summary line. Layout:
-///   `▎ in 1234 tok · ttft 0.42s · 2941 tok/s   out 621 tok / 13.1s · 47.4 tok/s`
 /// When prompt-side data is unavailable (no TTFT or zero prompt tokens) the
-/// `in` segment collapses, leaving just the legacy `out` half.
+/// `in` segment collapses, leaving just the `out` half.
 pub(crate) fn format_final(
     prompt_tokens: u64,
     ttft: Option<Duration>,

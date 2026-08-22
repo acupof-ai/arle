@@ -63,8 +63,6 @@ fn dp_size_from_env() -> usize {
         .unwrap_or(1)
 }
 
-/// The comma-separated CUDA device ordinals from `INFER_CUDA_DEVICES`, or
-/// `0..world_size` when unset. Used to assign one GPU per worker rank.
 fn cuda_ordinals(world_size: usize) -> Vec<usize> {
     std::env::var("INFER_CUDA_DEVICES")
         .ok()
@@ -83,20 +81,15 @@ pub(crate) struct CoordinatorGuard {
     _children: WorkerChildren,
 }
 
-/// What [`bind_relay_and_spawn_workers`] hands back: the accepted relay (drives
-/// the coordinator HTTP loop) + the child guard (keeps workers alive).
 pub(crate) struct MultiprocCoordinator {
     pub(crate) relay: RelayCoordinator,
     pub(crate) guard: CoordinatorGuard,
 }
 
-/// COORDINATOR: bind the relay, publish its port, spawn ALL N workers (rank
-/// 0..N-1; rank 0 owns the visible output), accept their connects, and boot-ping.
-/// Returns the accepted relay + child guard for the coordinator HTTP loop; on
-/// `world_size <= 1` returns an empty vec (single GPU, byte-identical serve). The
-/// parent owns no TP rank and joins no collective, so it is never the missing
-/// rank. With `INFER_DP_SIZE > 1`, spawns M independent TP groups on disjoint
-/// GPUs and returns one [`MultiprocCoordinator`] per group.
+/// COORDINATOR: bind the relay, spawn all N workers, accept their connects,
+/// boot-ping, and engine-ready-barrier. The parent owns no TP rank and joins no
+/// collective, so it is never the missing rank. `INFER_DP_SIZE > 1` spawns M
+/// independent TP groups on disjoint GPUs.
 pub(crate) fn bind_relay_and_spawn_workers(
     model_path: &str,
     engine_config: &EngineLoadConfig,
@@ -161,10 +154,8 @@ pub(crate) fn bind_relay_and_spawn_workers(
             pending.port()
         );
 
-        // Spawn ALL N worker processes (rank 0..world_size); rank 0 is a child too.
         let mut children = spawn_workers(model_path, world_size, g, dp_size)?;
 
-        // Accept ALL N worker relay connects (rank 0 included).
         let mut relay = pending
             .accept_symmetric(world_size, RELAY_TIMEOUT)
             .context("multiproc relay accept")?;
@@ -251,10 +242,6 @@ pub(crate) fn worker_entry() -> Option<ExitCode> {
     }
 }
 
-/// Worker-mode body (rank R, 0..N-1). Pre-connects the relay, builds the rank-R
-/// engine (NCCL bootstrap as rank R happens inside construction from env), runs
-/// the relay-receiver loop, then blocks on the parent pipe until the coordinator
-/// dies.
 fn run_worker_mode(rank: usize) -> Result<()> {
     let world_size: usize = std::env::var("WORLD_SIZE")
         .context("worker missing WORLD_SIZE env (set by coordinator)")?
@@ -322,7 +309,7 @@ fn run_worker_mode(rank: usize) -> Result<()> {
         log::info!("[arle-worker rank={rank}] engine-ready ack sent");
     }
 
-    // 3. Lockstep driver: one engine step per relayed `TickAdmissions`.
+    // 3. Lockstep driver.
     if let Some(relay) = relay.as_mut() {
         run_lockstep_driver(rank, relay, engine)?;
     }
@@ -540,7 +527,6 @@ fn run_lockstep_driver(
     }
 }
 
-/// Block on the parent-fd pipe until EOF (coordinator closed it / died).
 fn block_on_parent_pipe(rank: usize) {
     use std::io::Read;
     use std::os::fd::FromRawFd;

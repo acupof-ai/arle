@@ -830,7 +830,6 @@ pub(crate) struct ServeArgs {
     #[arg(long, value_name = "K")]
     pub(crate) mtp_draft_topk: Option<usize>,
 
-    // ── CUDA runtime toggles (EngineLoadConfig.cuda; defaults = shipped behavior) ──
     /// Whole-step Qwen3.5/3.6 decode graph (paged lane licensed 2026-08-03:
     /// −7.9% ITL, byte-identical greedy, MMLU 84/100 vs 80-81 baseline).
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set, value_name = "BOOL")]
@@ -925,7 +924,6 @@ pub(crate) struct ServeArgs {
     #[arg(long, value_name = "N")]
     pub(crate) deepep_max_dispatch_tokens_per_rank: Option<u32>,
 
-    // ── Metal runtime toggles (EngineLoadConfig.metal) ──
     /// Overlapped c=1 greedy decode pipeline.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set, value_name = "BOOL")]
     pub(crate) metal_pipeline: bool,

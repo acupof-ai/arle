@@ -41,9 +41,6 @@ impl ServeBackend {
     }
 }
 
-/// Resolved, validated serve configuration ready to hand to
-/// [`infer_api::serve_http`]. Holds the in-process options plus the diagnostics
-/// the CLI prints before binding.
 #[derive(Debug)]
 struct ServeConfig {
     backend: ServeBackend,
@@ -453,7 +450,6 @@ fn resolve_backend(arg: ServeBackendArg) -> Result<ServeBackend, String> {
     };
 
     match requested {
-        // `auto` always serves the compiled backend.
         None => Ok(compiled),
         // An explicit backend must match the one compiled in: serving is
         // in-process, so a mismatch cannot be satisfied.

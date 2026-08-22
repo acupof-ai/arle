@@ -208,13 +208,6 @@ fn run_impl(args: Args, run_args: Option<RunArgs>) -> Result<()> {
         // Logger already installed at the top of `run()` (quiet "warn" default;
         // RUST_LOG overrides). No re-init here.
 
-        // Eli front-end hand-off. On an interactive no-args (or bare `run`)
-        // start, `arle` can serve the picked model locally and hand the
-        // session to the sibling Eli agent framework instead of the built-in
-        // REPL. Decision precedence: `--agent` flag > saved
-        // `~/.config/arle/agent.toml` > built-in REPL. One-shot runs
-        // (`run --prompt`/`--stdin`) and non-interactive/piped invocations
-        // always use the in-process REPL — Eli is for interactive sessions.
         let one_shot = run_args
             .as_ref()
             .is_some_and(|r| r.prompt.is_some() || r.stdin || !r.image.is_empty());
@@ -228,14 +221,9 @@ fn run_impl(args: Args, run_args: Option<RunArgs>) -> Result<()> {
             return run_eli_frontend(&args, action);
         }
 
-        // Interactive startup: hardware detection + model picker + download.
-        // Falls back to resolve_model_source() when non-interactive.
         let model_source = match startup::resolve_model_interactive(&args) {
             Ok(src) => src,
             Err(err) => {
-                // Main resolve path failed — if this is an interactive
-                // terminal, offer the HF-cache discovery wizard before
-                // giving up.
                 let can_wizard = !args.non_interactive
                     && std::io::stdin().is_terminal()
                     && std::io::stderr().is_terminal();
@@ -289,8 +277,6 @@ fn run_impl(args: Args, run_args: Option<RunArgs>) -> Result<()> {
         let load_secs = load_start.elapsed().as_secs_f64();
         banner::print_model_loaded(engine.model_id(), &backend_name, load_secs);
 
-        // First-run welcome banner (interactive only). On subsequent runs
-        // this degrades to a 1-line model reminder.
         if !args.non_interactive
             && std::io::stdin().is_terminal()
             && std::io::stderr().is_terminal()
@@ -300,9 +286,8 @@ fn run_impl(args: Args, run_args: Option<RunArgs>) -> Result<()> {
 
         let max_tokens = resolve_max_tokens(&model_source, args.max_tokens);
 
-        // Open the trajectory writer, if requested. Failures here ARE
-        // surfaced to the user — we want them to know the path was
-        // unwritable before the agent loop quietly drops every record.
+        // Failures here ARE surfaced to the user — we want them to know the
+        // path was unwritable before the agent loop quietly drops every record.
         let trace_writer = match args.trace.as_ref() {
             Some(path) => match trace::TraceWriter::open(path, args.trace_prompts.keep_prompts()) {
                 Ok(writer) => {
@@ -370,7 +355,6 @@ fn run_impl(args: Args, run_args: Option<RunArgs>) -> Result<()> {
     }
 }
 
-/// What the Eli front-end hand-off should do this run.
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 enum EliLaunch {
     /// A saved Eli default exists: serve this model and launch Eli directly,
@@ -398,7 +382,6 @@ enum EliLaunch {
 fn decide_eli_launch(args: &Args) -> Option<EliLaunch> {
     use args::AgentFrontendArg;
 
-    // Explicit opt-out: built-in REPL.
     if matches!(args.agent, Some(AgentFrontendArg::Arle)) {
         return None;
     }
@@ -426,35 +409,26 @@ fn decide_eli_launch(args: &Args) -> Option<EliLaunch> {
         return None;
     }
 
-    // No flag: a saved Eli default launches directly with the saved model;
-    // `--gateway` (if passed) still overrides the saved mode for this run.
     if saved.selects_eli() {
         let model = saved.model.clone().unwrap_or_default();
         let mode = flag_mode.unwrap_or_else(|| saved.launch_mode());
         return Some(EliLaunch::Saved { model, mode });
     }
 
-    // No flag, no saved Eli default: Eli is the default front-end. Pick a
-    // model, launch Eli, and persist Eli as the default for next time.
     Some(EliLaunch::Pick {
         mode: flag_mode.unwrap_or(eli::EliMode::Chat),
     })
 }
 
-/// Resolve the model (saved or picked), launch Eli against a local serve, and
-/// persist the choice on the `Pick` path so subsequent runs default to Eli.
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 fn run_eli_frontend(args: &Args, action: EliLaunch) -> Result<()> {
-    // Eli serves through `arle serve --backend <b>`; mirror the picker's
-    // backend selection. The serve `auto` backend resolves to the single
-    // compiled backend, which matches this interactive build.
+    // `auto` resolves to the single compiled backend, which matches this
+    // interactive build.
     let backend = "auto";
 
     let (model, mode, persist) = match action {
         EliLaunch::Saved { model, mode } => (model, mode, false),
         EliLaunch::Pick { mode } => {
-            // Reuse the polished interactive picker/download to resolve a model
-            // source (local dir path or HF id).
             let model = match startup::resolve_model_interactive(args) {
                 Ok(src) => src,
                 Err(err) => match startup::run_hub_wizard()? {
@@ -520,24 +494,17 @@ fn resolve_max_tokens(model_path: &str, requested: usize) -> usize {
     }
 }
 
-/// Best-effort peek at the model's first declared `architectures` entry from
-/// its `config.json`. Accepts either a local directory path or a HuggingFace
-/// repo id (`org/repo`); for the latter we resolve through the HF hub cache
-/// (`~/.cache/huggingface/hub/models--<org>--<repo>/snapshots/<hash>/`) and
-/// try every snapshot dir until one yields an answer. Returns `None` on any
+/// Accepts a local directory or an HF repo id (`org/repo`); for the latter
+/// tries every cached snapshot until one yields an answer. `None` on any
 /// failure — the caller falls back to the generic error path.
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 fn peek_model_architecture(model_source: &str) -> Option<String> {
-    // 1. Local-path case: try `<source>/config.json` first.
     if let Some(arch) = read_arch_from_dir(std::path::Path::new(model_source)) {
         return Some(arch);
     }
 
-    // 2. HuggingFace repo-id case: walk the hub cache for matching snapshots.
     let (org, repo) = model_source.split_once('/')?;
     let cache_root = hub_discovery::hub_cache_root()?;
-    // HF caches repo IDs as `models--org--repo`; hyphens inside the repo name
-    // are preserved as-is.
     let repo_dir = cache_root.join(format!("models--{org}--{repo}"));
     let snapshots = std::fs::read_dir(repo_dir.join("snapshots")).ok()?;
     for entry in snapshots.flatten() {
@@ -606,10 +573,8 @@ fn read_model_generation_max_tokens(model_path: &str) -> Option<usize> {
         .filter(|&n| n > 0)
 }
 
-/// Best-effort lookup of the model's context length. Tries, in order,
-/// `max_position_embeddings` (HF transformers convention) and
-/// `context_length` (GGUF / llama.cpp convention) from `<model_path>/config.json`.
-/// Returns `None` for any failure (missing path, bad JSON, missing field).
+/// Tries `max_position_embeddings` (HF transformers convention) then
+/// `context_length` (GGUF / llama.cpp convention); `None` on any failure.
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 pub(crate) fn read_model_max_context(model_path: &str) -> Option<usize> {
     let cfg = read_model_config(model_path)?;

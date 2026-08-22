@@ -5,9 +5,8 @@ use crate::args::TrainPplArgs;
 #[cfg(feature = "cuda")]
 use {super::resolve_local_tokenizer_path, std::fs, train::tokenizer::ChatTokenizer};
 
-/// `arle train ppl` — perplexity over a text corpus via teacher-forced logits,
-/// to calibrate FP8 / quant checkpoint quality. CUDA-only (the forward path is
-/// `LoadedInferenceEngine::forward_token_logits`, which the OPD lane also uses).
+/// Perplexity over a teacher-forced corpus, to calibrate FP8 / quant checkpoint
+/// quality.
 #[cfg(feature = "cuda")]
 pub(super) fn run_ppl(args: TrainPplArgs) -> Result<()> {
     use infer_api::{EngineLoadConfig, LoadedInferenceEngine};
@@ -18,7 +17,6 @@ pub(super) fn run_ppl(args: TrainPplArgs) -> Result<()> {
         .to_str()
         .ok_or_else(|| anyhow!("model path is not valid UTF-8"))?;
 
-    // Tokenize the corpus into one stream with the model's own tokenizer.
     let tokenizer_path = resolve_local_tokenizer_path(&args.model_path)?;
     let tokenizer = ChatTokenizer::from_file(&tokenizer_path)
         .with_context(|| format!("load tokenizer {}", tokenizer_path.display()))?;
@@ -98,8 +96,7 @@ pub(super) fn run_ppl(_args: TrainPplArgs) -> Result<()> {
     bail!("arle train ppl requires the CUDA backend (forward_token_logits is CUDA-only)")
 }
 
-/// Numerically stable next-token NLL: `-log_softmax(row)[target]`, subtracting
-/// the row max before exp.
+/// Numerically stable: subtract the row max before exp.
 fn row_nll(row: &[f32], target: usize) -> Result<f64> {
     let target_logit = *row
         .get(target)
@@ -111,11 +108,8 @@ fn row_nll(row: &[f32], target: usize) -> Result<f64> {
     Ok(sum_exp.ln() + max - target_logit)
 }
 
-/// Forward-only held-out NLL: mean next-token cross-entropy of predicting
-/// `eval_ids[t+1]` from `eval_ids[..=t]` over a FIXED reference sequence.
-/// Tape-off (scratch tape dropped after the forward); non-circular — the
-/// reference text is fixed, independent of the moving EMA teacher — so it is a
-/// valid SOPD no-regression signal (KL-vs-EMA would be circular).
+/// Fixed-reference held-out NLL; non-circular vs the moving EMA teacher, so it
+/// is a valid SOPD no-regression signal (KL-vs-EMA would be circular).
 pub(super) fn heldout_nll(
     student: &train::qwen35::Qwen35Model,
     eval_ids: &[u32],

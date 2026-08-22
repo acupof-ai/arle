@@ -1,23 +1,13 @@
-//! Progress-aware model download from ModelScope (魔搭).
+//! PRC-friendly weight fetch — HF is sometimes throttled or blocked from PRC
+//! networks; ModelScope hosts the same Qwen/etc. checkpoints first-party.
 //!
-//! Mirrors [`crate::download`]'s public shape but talks to ModelScope's REST
-//! API instead of HuggingFace Hub. This exists because the ARLE OPD substrate
-//! needs PRC-friendly weight fetch — HF is sometimes throttled or blocked from
-//! PRC networks
-//! while ModelScope hosts the same Qwen/etc. checkpoints first-party.
+//! Not an `hf-hub` endpoint swap: ModelScope's REST surface uses neither the
+//! `{endpoint}/{repo_id}/resolve/...` URL nor the `{endpoint}/api/...` listing
+//! shape, so a template swap can't reach the file index.
 //!
-//! Why a sibling module and not an `hf-hub` endpoint swap? `hf-hub` formats
-//! URLs as `{endpoint}/{repo_id}/resolve/{revision}/{file}` and the listing
-//! call hits `{endpoint}/api/{repo.api_url()}`. ModelScope's REST surface
-//! uses neither shape — listing is `/api/v1/models/{org}/{name}/repo/files`
-//! and download is `/models/{org}/{name}/resolve/{revision}/{file}` — so a
-//! template swap can't reach the file index. A small sibling is the cleaner
-//! path; the HF code path stays untouched.
-//!
-//! Cache layout follows the ModelScope Python SDK convention:
-//! `~/.cache/modelscope/hub/models/{org}/{name}/` (flat, no snapshot hashes).
-//! That avoids any collision with HF's
-//! `~/.cache/huggingface/hub/models--{org}--{name}/snapshots/<hash>/` tree.
+//! Cache layout follows the ModelScope Python SDK convention
+//! (`~/.cache/modelscope/hub/models/{org}/{name}/`, flat) to avoid colliding
+//! with HF's `~/.cache/huggingface/hub/models--{org}--{name}/snapshots/<hash>/`.
 
 use std::fs;
 use std::io::{Read, Write};
@@ -47,10 +37,7 @@ const USER_AGENT: &str = concat!(
     " modelscope-downloader Mozilla/5.0 (compatible)"
 );
 
-/// Public entry point — mirrors `download::download_model_with_progress`.
-///
-/// Returns the local cache directory containing the downloaded files. The
-/// directory is created lazily and is guaranteed to exist on `Ok(_)`.
+/// The cache dir is created lazily and guaranteed to exist on `Ok(_)`.
 pub(crate) fn download_model_from_modelscope_with_progress(model_id: &str) -> Result<PathBuf> {
     let (org, name) = parse_model_id(model_id)?;
     let cache_dir = cache_dir_for(org, name)?;
@@ -92,8 +79,6 @@ pub(crate) fn download_model_from_modelscope_with_progress(model_id: &str) -> Re
 
     let mp = MultiProgress::new();
 
-    // Ordered fetch: mandatory → optional → weights → everything-else
-    // safetensors/bin shards that didn't match a fixed name.
     let mut planned: Vec<&FileEntry> = Vec::new();
     let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
 
@@ -165,9 +150,8 @@ fn fetch_with_bar(
             .with_context(|| format!("failed to create parent dir {}", parent.display()))?;
     }
 
-    // Poor-man's cache hit: if the file is already present with the expected
-    // size, skip it. ModelScope reports zero size for some directory entries;
-    // require size > 0 before claiming a hit.
+    // ModelScope reports zero size for some directory entries; require size > 0
+    // before claiming a cache hit.
     if entry.size > 0
         && dest.is_file()
         && fs::metadata(&dest).map(|m| m.len()).unwrap_or(0) == entry.size

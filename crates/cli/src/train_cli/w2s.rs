@@ -65,7 +65,7 @@ pub(super) fn run_w2s(args: TrainW2sArgs) -> Result<()> {
     #[cfg(feature = "cuda")]
     let vocab_size = base.config().vocab_size;
 
-    // Student (shadow adapter) — the model being trained.
+    // Student (shadow adapter).
     eprintln!("[arle train w2s] creating student (shadow adapter)");
     let student = Qwen35Model::new_lora_from_base(&base, lora, target_set, &mut store)
         .context("create student shadow adapter")?;
@@ -194,9 +194,6 @@ pub(super) fn run_w2s(args: TrainW2sArgs) -> Result<()> {
         grad_clip: args.grad_clip,
     };
 
-    // Build the list of training prompts. If `--train-data` is set, load the
-    // JSONL and tokenize each row; otherwise fall back to the single
-    // `--prompt-ids` sequence (or the default BOS smoke-test prompt).
     let prompts: Vec<Vec<u32>> = match &args.train_data {
         Some(path) => {
             use std::io::{BufRead, BufReader};
@@ -326,7 +323,6 @@ pub(super) fn run_w2s(args: TrainW2sArgs) -> Result<()> {
     Ok(())
 }
 
-/// Tokenize a text string using the model's tokenizer.json.
 fn tokenize_text(text: &str, model_dir: &std::path::Path) -> Result<Vec<u32>> {
     use tokenizers::Tokenizer;
     let tok_path = model_dir.join("tokenizer.json");

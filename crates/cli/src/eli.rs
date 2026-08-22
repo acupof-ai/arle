@@ -3,33 +3,11 @@
 //! (`../eli`, a sibling Rust binary) pointed at that local OpenAI-compatible
 //! endpoint.
 //!
-//! ## Routing (the load-bearing facts, proven empirically 2026-06-22)
-//!
-//! Eli's provider layer (`nexil`) has a dedicated keyless **`local`** provider
-//! that collapses the `arle` / `ollama` / `vllm` / `lmstudio` /
-//! `llama.cpp` aliases onto one OpenAI-Chat-Completions endpoint
-//! (`crates/nexil/src/core/provider_registry.rs`). To route Eli at a local
-//! `arle serve` we set, env-only (NEVER touching `~/.eli/config.toml`):
-//!
-//! | env | value |
-//! |-----|-------|
-//! | `ELI_API_BASE`   | `http://127.0.0.1:<port>/v1` |
-//! | `ELI_API_KEY`    | `local` (any non-empty; both KEY+BASE set → single override for all providers) |
-//! | `ELI_MODEL`      | `local:<served-id>` |
-//! | `ELI_API_FORMAT` | `completion` (chat-completions; `messages` is Anthropic-only) |
-//! | `ELI_FALLBACK_MODELS` | *empty* — **disables** Eli's auto cross-provider rollover |
-//!
-//! `ELI_FALLBACK_MODELS=""` is load-bearing: without it, an Eli call that fails
-//! against the local endpoint silently rolls over to the user's deepseek /
-//! anthropic profiles (confirmed: a dead local port drifted to
+//! Routing is env-only (NEVER touch `~/.eli/config.toml`); see [`eli_env`].
+//! `ELI_FALLBACK_MODELS=""` is load-bearing: without it, an Eli call that
+//! fails against the local endpoint silently rolls over to the user's
+//! deepseek / anthropic profiles (confirmed: a dead local port drifted to
 //! `deepseek:deepseek-v4-pro`). The empty list pins Eli to the local model.
-//!
-//! ## Lifecycle
-//!
-//! [`launch_eli`] starts `arle serve` (in-process server) as a **child**, polls
-//! `/v1/models` until ready, reads the served id, then runs `eli chat` (or
-//! `eli gateway`) with the env above and inherited stdio. A [`ServeGuard`]
-//! kills the serve child on Eli exit OR SIGINT, so no orphaned server survives.
 
 use std::io::{BufReader, Read, Write};
 use std::net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream};
@@ -42,41 +20,30 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow, bail};
 use console::style;
 
-/// Base port for the free-port scan. Stays clear of the `arle serve` default
-/// (8000) so a manually-launched serve does not collide with our auto pick.
+/// Stays clear of the `arle serve` default (8000) so a manually-launched
+/// serve does not collide with our auto pick.
 const PORT_SCAN_BASE: u16 = 8000;
-/// How many consecutive ports to probe before giving up.
 const PORT_SCAN_SPAN: u16 = 200;
-/// Max time to wait for the spawned serve to answer `/v1/models`.
 const SERVE_READY_TIMEOUT: Duration = Duration::from_secs(180);
 
 /// ARLE's own agent preference, persisted at
-/// `${XDG_CONFIG_HOME:-$HOME/.config}/arle/agent.toml`.
-///
-/// Distinct from `~/.eli/config.toml` (Eli's own config, which we never
-/// touch). This file only records *which* agent `arle` should launch and the
-/// model + mode to launch it with, so a second no-args run goes straight to
-/// the agent ("下次默认启动 eli").
+/// `${XDG_CONFIG_HOME:-$HOME/.config}/arle/agent.toml` — distinct from
+/// `~/.eli/config.toml` (Eli's own config, which we never touch).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct AgentConfig {
     /// `"eli"` when Eli is the default agent. Other values (or absent) mean
     /// fall back to the built-in REPL.
     pub(crate) agent: Option<String>,
-    /// Model source (local dir path or HF id) to serve.
     pub(crate) model: Option<String>,
-    /// Launch mode: `"chat"` (interactive REPL) or `"gateway"` (serve mode).
     pub(crate) mode: Option<String>,
 }
 
 impl AgentConfig {
-    /// `true` when this config selects Eli as the default agent AND carries a
-    /// model to serve — i.e. a subsequent run can launch directly.
     pub(crate) fn selects_eli(&self) -> bool {
         self.agent.as_deref() == Some("eli")
             && self.model.as_deref().is_some_and(|m| !m.trim().is_empty())
     }
 
-    /// Resolve the launch mode, defaulting to `Chat`.
     pub(crate) fn launch_mode(&self) -> EliMode {
         match self.mode.as_deref() {
             Some("gateway") => EliMode::Gateway,
@@ -84,14 +51,11 @@ impl AgentConfig {
         }
     }
 
-    /// Serialize to the minimal flat TOML this module reads back. Only the
-    /// three string keys are emitted; absent keys are omitted.
     pub(crate) fn to_toml(&self) -> String {
         let mut out = String::new();
         let mut push = |k: &str, v: &Option<String>| {
             if let Some(val) = v {
-                // Values here are agent names / model ids / mode words — no
-                // embedded quotes or newlines in practice. Escape defensively.
+                // No embedded quotes/newlines in practice; escape defensively.
                 let escaped = val.replace('\\', "\\\\").replace('"', "\\\"");
                 out.push_str(&format!("{k} = \"{escaped}\"\n"));
             }
@@ -102,7 +66,6 @@ impl AgentConfig {
         out
     }
 
-    /// Parse the minimal flat TOML produced by [`to_toml`](Self::to_toml).
     /// Tolerant of comments (`#`), blank lines, and unknown keys.
     pub(crate) fn from_toml(text: &str) -> Self {
         let mut cfg = AgentConfig::default();
@@ -126,9 +89,7 @@ impl AgentConfig {
         cfg
     }
 
-    /// Load from the default config path. Returns the default (all-`None`)
-    /// config when the file is absent or unreadable — a missing config is not
-    /// an error, it just means "no default agent yet".
+    /// A missing config is not an error — it just means "no default agent yet".
     pub(crate) fn load() -> Self {
         match agent_config_path().and_then(|p| std::fs::read_to_string(p).ok()) {
             Some(text) => Self::from_toml(&text),
@@ -136,7 +97,6 @@ impl AgentConfig {
         }
     }
 
-    /// Persist to the default config path, creating parent dirs as needed.
     pub(crate) fn save(&self) -> Result<()> {
         let path = agent_config_path()
             .ok_or_else(|| anyhow!("cannot resolve arle config dir ($HOME / $XDG_CONFIG_HOME)"))?;
@@ -150,7 +110,6 @@ impl AgentConfig {
     }
 }
 
-/// Strip surrounding double quotes and unescape `\"` / `\\` from a TOML scalar.
 fn unquote_toml(s: &str) -> String {
     let inner = s
         .strip_prefix('"')
@@ -159,8 +118,7 @@ fn unquote_toml(s: &str) -> String {
     inner.replace("\\\"", "\"").replace("\\\\", "\\")
 }
 
-/// `${XDG_CONFIG_HOME:-$HOME/.config}/arle/agent.toml`. Mirrors
-/// `welcome::config_home()` so the agent.toml lives beside the `seen` marker.
+/// Mirrors `welcome::config_home()` so agent.toml lives beside the `seen` marker.
 fn agent_config_path() -> Option<PathBuf> {
     let base = match std::env::var_os("XDG_CONFIG_HOME") {
         Some(x) if !x.is_empty() => PathBuf::from(x),
@@ -169,12 +127,9 @@ fn agent_config_path() -> Option<PathBuf> {
     Some(base.join("arle").join("agent.toml"))
 }
 
-/// How to run Eli once the local model is serving.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EliMode {
-    /// Interactive REPL (`eli chat`). Stdio inherited.
     Chat,
-    /// Gateway / serve mode (`eli gateway`) — message-listener daemon.
     Gateway,
 }
 
@@ -186,7 +141,6 @@ impl EliMode {
         }
     }
 
-    /// The string persisted into `agent.toml`'s `mode` key.
     pub(crate) fn config_value(self) -> &'static str {
         match self {
             EliMode::Chat => "chat",
@@ -195,9 +149,6 @@ impl EliMode {
     }
 }
 
-/// Scan `[base, base+span)` for a TCP port that is currently free to bind on
-/// `127.0.0.1`. Returns the first free port, so "端口被占用" is handled by
-/// simply skipping to the next candidate.
 pub(crate) fn find_free_port(base: u16, span: u16) -> Result<u16> {
     for offset in 0..span {
         let Some(port) = base.checked_add(offset) else {
@@ -213,23 +164,15 @@ pub(crate) fn find_free_port(base: u16, span: u16) -> Result<u16> {
     )
 }
 
-/// `true` when a fresh `TcpListener` can bind `127.0.0.1:port`. The listener is
-/// dropped immediately, freeing the port for the child `arle serve` to claim.
-/// There is an inherent TOCTOU window between this probe and the child's bind,
-/// but the scan base is chosen to avoid the common defaults, so a collision is
-/// rare and surfaces as a clean child-exit error rather than a silent hang.
+/// The listener is dropped immediately, freeing the port for the child's bind.
+/// The probe→bind TOCTOU window is acceptable: the scan base avoids common
+/// defaults, so a collision is rare and surfaces as a clean child-exit error
+/// rather than a silent hang.
 fn port_is_free(port: u16) -> bool {
     TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)).is_ok()
 }
 
-/// Locate the `eli` executable. Resolution order:
-/// 1. `$ELI_BIN` (explicit override),
-/// 2. `eli` on `$PATH`,
-/// 3. the sibling build at `../eli/target/release/eli` relative to the arle
-///    binary's grandparent workspace, and a couple of common dev layouts.
-///
-/// Returns a friendly buildable-hint error when none resolve, so a missing Eli
-/// does not hard-fail the whole `arle` process.
+/// Resolution order: `$ELI_BIN`, then `eli` on `$PATH`, then sibling dev builds.
 pub(crate) fn find_eli_binary() -> Result<PathBuf> {
     if let Some(explicit) = std::env::var_os("ELI_BIN") {
         let p = PathBuf::from(explicit);
@@ -254,7 +197,6 @@ pub(crate) fn find_eli_binary() -> Result<PathBuf> {
     )
 }
 
-/// Probe `$PATH` for an executable named `name`.
 fn which_on_path(name: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path) {
@@ -266,9 +208,6 @@ fn which_on_path(name: &str) -> Option<PathBuf> {
     None
 }
 
-/// Candidate sibling locations for a locally-built Eli, relative to the running
-/// `arle` binary. The arle binary normally lives at
-/// `<ws>/target/release/arle`, so the sibling eli is `<ws>/../eli/target/...`.
 fn sibling_eli_candidates() -> Vec<PathBuf> {
     // exe = <ws>/target/<profile>/arle → climb to <ws> then to <ws>/..
     let mut out = std::env::current_exe()
@@ -286,8 +225,6 @@ fn sibling_eli_candidates() -> Vec<PathBuf> {
     out
 }
 
-/// Owns the spawned `arle serve` child and guarantees it is killed on drop
-/// (Eli exit) or on SIGINT (the installed Ctrl-C handler flips `interrupted`).
 struct ServeGuard {
     child: Child,
     port: u16,
@@ -307,9 +244,8 @@ impl Drop for ServeGuard {
     }
 }
 
-/// Spawn `arle serve --backend <backend> --model-path <model> --port <port>`
-/// as a background child, using the **current** executable so the child is the
-/// exact same binary (in-process serve; there is no standalone serve binary).
+/// Uses the current executable so the child is the exact same binary (there is
+/// no standalone serve binary).
 fn spawn_serve(model: &str, port: u16, backend: &str) -> Result<Child> {
     let exe = std::env::current_exe().context("resolving current arle executable")?;
     let child = Command::new(exe)
@@ -332,19 +268,14 @@ fn spawn_serve(model: &str, port: u16, backend: &str) -> Result<Child> {
     Ok(child)
 }
 
-/// Poll `http://127.0.0.1:<port>/v1/models` until it returns a non-empty model
-/// id, the child exits, the interrupt flag flips, or the timeout elapses.
-///
-/// Returns the served model id on success. If the child exits first (e.g. the
-/// memory guard rejected the load) we surface a clear, actionable error instead
-/// of spinning until timeout.
+/// Returns the served model id. A child exit before ready surfaces as a clear
+/// load error instead of a spin until timeout.
 fn wait_for_serve(guard: &mut ServeGuard, interrupted: &AtomicBool) -> Result<String> {
     let deadline = Instant::now() + SERVE_READY_TIMEOUT;
     loop {
         if interrupted.load(Ordering::SeqCst) {
             bail!("interrupted while waiting for the local model to load");
         }
-        // Child died before becoming ready → load failed.
         match guard.child.try_wait() {
             Ok(Some(status)) => {
                 bail!(
@@ -373,10 +304,8 @@ fn wait_for_serve(guard: &mut ServeGuard, interrupted: &AtomicBool) -> Result<St
     }
 }
 
-/// Minimal blocking GET of `/v1/models`, extracting the first `"id"` value.
-/// Returns `None` on any connection / parse miss (server not up yet). Kept
-/// dependency-free (raw `TcpStream`) so the readiness poll has no async runtime
-/// and no extra HTTP client allocation per attempt.
+/// Dependency-free (raw `TcpStream`): the readiness poll must not pull in an
+/// async runtime or allocate an HTTP client per attempt.
 fn query_served_model(port: u16) -> Option<String> {
     let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, port);
     let mut stream = TcpStream::connect_timeout(&addr.into(), Duration::from_millis(500)).ok()?;
@@ -392,9 +321,8 @@ fn query_served_model(port: u16) -> Option<String> {
     parse_first_model_id(&body)
 }
 
-/// Pull the first `"id":"..."` out of an OpenAI `/v1/models` JSON body. A tiny
-/// hand parser avoids a serde_json round-trip on the raw HTTP response (which
-/// includes headers before the JSON). Returns `None` when no id is present.
+/// Hand parser: the raw response includes HTTP headers before the JSON, and a
+/// serde_json round-trip per poll attempt is not worth it.
 fn parse_first_model_id(http_response: &str) -> Option<String> {
     // Skip HTTP headers: JSON starts at the first '{'.
     let json_start = http_response.find('{')?;
@@ -423,13 +351,6 @@ pub(crate) fn eli_env(port: u16, served_id: &str) -> Vec<(String, String)> {
     ]
 }
 
-/// Serve `model` locally on a free port and hand the session to Eli.
-///
-/// Steps: locate eli → pick free port → spawn `arle serve` child → wait for
-/// `/v1/models` → run `eli <chat|gateway>` with [`eli_env`] (stdio inherited
-/// for chat) → kill the serve child on Eli exit or SIGINT.
-///
-/// `model` is a local dir path or HF id (whatever the picker resolved).
 pub(crate) fn launch_eli(model: &str, mode: EliMode, backend: &str) -> Result<()> {
     // Resolve eli up front so a missing binary fails *before* we spawn a serve.
     let eli_bin = find_eli_binary()?;
@@ -461,10 +382,7 @@ pub(crate) fn launch_eli(model: &str, mode: EliMode, backend: &str) -> Result<()
 
     let served_id = match wait_for_serve(&mut guard, &interrupted) {
         Ok(id) => id,
-        Err(e) => {
-            // guard drops at function return → serve child killed.
-            return Err(e);
-        }
+        Err(e) => return Err(e),
     };
 
     eprintln!(

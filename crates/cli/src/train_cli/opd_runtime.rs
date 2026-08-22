@@ -409,11 +409,8 @@ pub(super) fn validate_online_rollout_temperature(
     Ok(())
 }
 
-/// Log device VRAM `(used / free / total MiB)` at an agent-OPD milestone when
-/// `ARLE_OPD_VRAM_TRACE` is set (default off — zero overhead on the hot path).
-/// Attributes the resident-floor + writeback transient breakdown without
-/// `nvidia-smi`. Uses the train backend's bound CUDA context (the single-GPU
-/// agent-OPD device), so `device_mem_info` reflects the whole-process resident.
+/// Default off (zero overhead on the hot path); attributes the resident-floor +
+/// writeback transient breakdown without `nvidia-smi`.
 #[cfg(feature = "cuda")]
 pub(super) fn log_opd_vram(label: &str, backend: &std::sync::Arc<dyn autograd::Backend>) {
     if std::env::var("ARLE_OPD_VRAM_TRACE").is_err() {
@@ -434,7 +431,6 @@ pub(super) fn log_opd_vram(label: &str, backend: &std::sync::Arc<dyn autograd::B
     }
 }
 
-/// The subset of a model's parameter ids the optimizer will actually update.
 pub(super) fn trainable_param_ids(all_params: &[TensorId], store: &TensorStore) -> Vec<TensorId> {
     all_params
         .iter()

@@ -1,12 +1,7 @@
-//! Startup banner — minimal hacker aesthetic.
-//!
-//! Dim labels, bold values, subtle color accents. No box-drawing.
-
 use console::style;
 
 use crate::hardware::{GpuInfo, SystemInfo};
 
-/// Print the startup banner with detected system info.
 pub(crate) fn print_startup_banner(info: &SystemInfo) {
     let version = env!("CARGO_PKG_VERSION");
 
@@ -14,7 +9,6 @@ pub(crate) fn print_startup_banner(info: &SystemInfo) {
     eprintln!("  {}", style(format!("ARLE v{version}")).bold().cyan());
     eprintln!();
 
-    // CPU
     eprintln!(
         "  {}  {} {}",
         style("cpu").dim(),
@@ -22,7 +16,6 @@ pub(crate) fn print_startup_banner(info: &SystemInfo) {
         style(format!("· {} cores", info.cpu_cores)).dim()
     );
 
-    // RAM
     eprintln!(
         "  {}  {} {}",
         style("ram").dim(),
@@ -30,7 +23,6 @@ pub(crate) fn print_startup_banner(info: &SystemInfo) {
         style(format!("({:.1} GB free)", info.available_ram_gb)).dim()
     );
 
-    // GPU
     match &info.gpu {
         GpuInfo::Cuda { name, vram_gb } => {
             eprintln!(
@@ -62,7 +54,6 @@ pub(crate) fn print_startup_banner(info: &SystemInfo) {
         }
     }
 
-    // Backend
     eprintln!(
         "  {}  {}",
         style("backend").dim(),
@@ -71,7 +62,6 @@ pub(crate) fn print_startup_banner(info: &SystemInfo) {
     eprintln!();
 }
 
-/// Print a compact model-loaded confirmation line.
 pub(crate) fn print_model_loaded(model_id: &str, backend: &str, load_secs: f64) {
     eprintln!(
         "  {} {} {} {}",

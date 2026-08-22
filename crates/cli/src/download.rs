@@ -1,8 +1,3 @@
-//! Progress-aware model download from HuggingFace Hub.
-//!
-//! Wraps `hf-hub`'s sync API with `indicatif` multi-progress bars for a
-//! polished download experience.
-
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -11,9 +6,6 @@ use hf_hub::api::Progress;
 use hf_hub::{Repo, RepoType, api::sync::ApiRepo};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 
-/// Download a model from HuggingFace Hub with per-file progress bars.
-///
-/// Returns the local cache directory containing all downloaded files.
 pub(crate) fn download_model_with_progress(model_id: &str) -> Result<PathBuf> {
     let api = infer_util::hf_hub::build_api().context("failed to initialise HuggingFace API")?;
     let repo = api.repo(Repo::new(model_id.to_string(), RepoType::Model));

@@ -22,7 +22,6 @@ pub(super) enum PendingGroup {
     },
 }
 
-/// The immutable inputs every group launch in a round shares.
 #[cfg(feature = "cuda")]
 pub(super) struct GroupLauncher<'a> {
     pub(super) tasks: &'a [(Arc<SweTask>, PathBuf)],

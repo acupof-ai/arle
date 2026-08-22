@@ -1,24 +1,13 @@
-//! Curated model catalog with hardware requirements and metadata.
-//!
-//! Provides instant (no-network) model recommendations based on detected
-//! hardware. Extended by live HuggingFace search for discovery beyond the
-//! curated set.
-
 use crate::hardware::{CompiledBackend, SystemInfo};
 
-/// A curated model entry with download size and hardware requirements.
 #[derive(Debug, Clone)]
 pub(crate) struct CatalogEntry {
     pub(crate) hf_id: &'static str,
     pub(crate) display_name: &'static str,
     pub(crate) quantization: Option<&'static str>,
-    /// Approximate download size in GB.
     pub(crate) size_gb: f64,
-    /// Minimum memory (RAM/VRAM) needed to load the model.
     pub(crate) min_memory_gb: f64,
-    /// Which backends can run this model.
     pub(crate) backends: &'static [CompiledBackend],
-    /// Whether ARLE has a working implementation for this arch.
     pub(crate) implemented: bool,
     /// Set on the flagship picks ARLE leads with — a one-line reason shown in
     /// the picker (e.g. "best quality · spec decode"). `None` for the rest.
@@ -26,7 +15,6 @@ pub(crate) struct CatalogEntry {
 }
 
 impl CatalogEntry {
-    /// Whether this entry is runnable on the given system.
     pub(crate) fn fits(&self, info: &SystemInfo) -> bool {
         self.implemented
             && self.backends.contains(&info.compiled_backend)
@@ -36,15 +24,13 @@ impl CatalogEntry {
 
 use CompiledBackend::{Cpu, Cuda, Metal};
 
-/// Canonical DeepSeek-OCR model (MXFP8 MLX). Used by `arle ocr` and the agent
-/// `ocr` tool as the default, auto-downloaded VLM. Metal-only.
 // Consumed only by the backend-gated `ocr` module — gate to match so a
 // no-backend build doesn't flag it dead.
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 pub(crate) const DEEPSEEK_OCR_MODEL_ID: &str = "sahilchachra/unlimited-ocr-mxfp8-mlx";
 
-/// Curated catalog of selectable models. Display order is decided by
-/// `recommend_models` (flagship picks first), not by position here.
+/// Display order is decided by `recommend_models` (flagship picks first), not
+/// by position here.
 pub(crate) const CATALOG: &[CatalogEntry] = &[
     CatalogEntry {
         hf_id: "mlx-community/Qwen3-0.6B-4bit",
@@ -162,9 +148,6 @@ pub(crate) const CATALOG: &[CatalogEntry] = &[
     },
 ];
 
-/// Return catalog entries that can run on this system, best first: the
-/// flagship `recommended` picks lead (so Enter lands on a great model),
-/// then the rest by capacity (larger / higher quality first).
 pub(crate) fn recommend_models(info: &SystemInfo) -> Vec<&'static CatalogEntry> {
     let mut fits: Vec<&CatalogEntry> = CATALOG.iter().filter(|e| e.fits(info)).collect();
     fits.sort_by(|a, b| {
@@ -182,10 +165,7 @@ pub(crate) fn recommend_models(info: &SystemInfo) -> Vec<&'static CatalogEntry> 
     fits
 }
 
-/// Look up a catalog entry by its exact HuggingFace id. Lets the picker
-/// surface a flagship `recommended` note on a model the user already has
-/// on disk. Only reachable when a backend is compiled — `model_picker`, its
-/// sole non-test caller, carries the same gate.
+/// Backend-gated to match `model_picker`, its sole non-test caller.
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 pub(crate) fn find_by_hf_id(hf_id: &str) -> Option<&'static CatalogEntry> {
     CATALOG.iter().find(|e| e.hf_id == hf_id)
