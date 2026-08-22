@@ -24,7 +24,7 @@ profile is not usable here, see *Instrument notes*):
 avg), so decode is **GPU-bound, not launch-bound** — 549 ms of `cudaLaunchKernel`
 hides inside the wait and is not a lever.
 
-**Prefill — per-op** (`ARLE_QWEN35_QUANT_PROFILE`): `dense_gemm` 89.5%, and it is
+**Prefill — per-op** (`ARLE_QWEN35_PROFILE`): `dense_gemm` 89.5%, and it is
 DeepGEMM at 93% of this card's FP8 peak. Everything else is ≤5%.
 
 Both dominant kernels are already near their hardware ceiling. **The levers that

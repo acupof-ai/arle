@@ -1015,7 +1015,7 @@ whole-step captured CUDA graph while ARLE launched ~1094 kernels eagerly.
 (−20.5%).** `gemv → cuBLASLt` −1.28, qkv/qkvz fusion −0.59, whole-step decode
 graph under paged KV −1.84 (per-slot persistent `PageMeta` refreshed outside
 the graph, FA3 `seqlen_k` pinned to capacity, TileLang fallback refuses
-capture). `--qwen35-decode-graph` is default-on for serve with an MMLU 84/100
+capture). The whole-step decode graph is default-on for serve with an MMLU 84/100
 license.
 
 Remaining against SGLang's 17.07: ~4.3 ms = host tail (8 refresh H2Ds +
@@ -1300,7 +1300,6 @@ Ceilings belong to levers, not to categories.
 | CUDA graph on the spec path | decode | c=16 window | all sub-ms gaps 0.87 s, 4.4% of window |
 | prefill–prefill fusion | prefill | c=1 | ~3% (15 redundant weight reads) |
 | `--chunked-prefill-size` | prefill | c=1, 33K | ±0.07 s TTFT |
-| `--max-num-batched-tokens` | prefill | c=1…16 | budget never binds; 16384 stays |
 | pinned readback staging | decode | c=1…16 | wash on both phases, kept |
 
 **What the batch column exposes.** Nine of the levers above were measured at
