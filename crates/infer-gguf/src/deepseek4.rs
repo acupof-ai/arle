@@ -195,7 +195,6 @@ pub fn dsv4_config_from_gguf(g: &GgufFile) -> Result<DeepSeekV4Config> {
     Ok(config)
 }
 
-/// What a DSv4 GGUF tensor is, independent of layer index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Dsv4TensorKind {
     TokenEmbedding,

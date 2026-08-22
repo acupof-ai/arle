@@ -28,8 +28,8 @@ use tokenizers::{
 
 use crate::gguf::{GgufFile, GgufValue};
 
-/// A tokenizer built from a GGUF's embedded vocab, plus the special-token ids
-/// the GGUF declares (for prompt assembly / stop conditions).
+/// Tokenizer built from a GGUF's embedded vocab, plus the special-token ids
+/// the GGUF declares (prompt assembly / stop conditions).
 pub struct GgufTokenizer {
     inner: Tokenizer,
     pub bos_token_id: Option<u32>,
@@ -38,8 +38,8 @@ pub struct GgufTokenizer {
 }
 
 impl GgufTokenizer {
-    /// Construct from GGUF metadata. Supports `tokenizer.ggml.model == "gpt2"`
-    /// (GPT-2 byte-level BPE; covers Qwen / Qwen3.5 / Qwen3.6 vocabs).
+    /// Supports `tokenizer.ggml.model == "gpt2"` (GPT-2 byte-level BPE;
+    /// covers Qwen / Qwen3.5 / Qwen3.6 vocabs).
     pub fn from_gguf(g: &GgufFile) -> Result<Self> {
         let model = g
             .get_str("tokenizer.ggml.model")
@@ -88,10 +88,9 @@ impl GgufTokenizer {
             .map_err(|e| anyhow!("build BPE from GGUF vocab: {e}"))?;
 
         let mut tokenizer = Tokenizer::new(bpe);
-        // GPT-2 byte-level, Qwen-style: no extra prefix space, trim offsets
-        // (the `trim_offsets = true` arg below; decode reverses the byte-level
-        // mapping). `add_bos_token` is false for this vocab, so we never prepend
-        // BOS automatically.
+        // GPT-2 byte-level, Qwen-style: no prefix space, trim offsets;
+        // `add_bos_token` is false for this vocab, so BOS is never prepended
+        // automatically.
         tokenizer.with_pre_tokenizer(Some(ByteLevelPre::new(
             /* add_prefix_space */ false, /* trim_offsets */ true, true,
         )));
@@ -118,9 +117,8 @@ impl GgufTokenizer {
         })
     }
 
-    /// Encode text to token ids. `add_special` lets the registered special
-    /// tokens be matched (it does not auto-insert BOS — this vocab sets
-    /// `add_bos_token=false`).
+    /// `add_special` matches registered special tokens; it does not auto-insert
+    /// BOS (this vocab sets `add_bos_token=false`).
     pub fn encode(&self, text: &str, add_special: bool) -> Result<Vec<u32>> {
         let enc = self
             .inner
@@ -129,7 +127,6 @@ impl GgufTokenizer {
         Ok(enc.get_ids().to_vec())
     }
 
-    /// Decode token ids back to text, optionally skipping special tokens.
     pub fn decode(&self, ids: &[u32], skip_special: bool) -> Result<String> {
         self.inner
             .decode(ids, skip_special)
