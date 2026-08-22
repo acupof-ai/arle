@@ -37,7 +37,7 @@ impl Qwen35Model {
         let gen_len = gen_ids.len();
         let batch = 1usize;
 
-        // Chunked: the prompt is processed in OPD_SEQ_CHUNK-row pieces so the
+        // Chunked: the prompt is processed in opd_seq_chunk-row pieces so the
         // per-layer hidden/MLP transients stay O(chunk × hidden), not O(prompt × hidden).
         let prefix_cache = if gen_start > 0 {
             let prompt_token_indices = prompt_ids.iter().map(|&id| id as usize).collect::<Vec<_>>();
@@ -49,7 +49,7 @@ impl Qwen35Model {
             let mut prefix_tape = Tape::new();
             prefix_tape.set_enabled(false);
 
-            let chunk = crate::runtime_flags::OPD_SEQ_CHUNK;
+            let chunk = crate::runtime_flags::opd_seq_chunk();
             let num_chunks = gen_start.div_ceil(chunk);
             let mut layer_prefix: Vec<Option<LayerPrefix>> = vec![None; self.layers.len()];
 

@@ -13,6 +13,7 @@ pub struct TrainRuntimeFlags {
     pub rollout_retain_interval: usize,
     pub rollout_progress_interval: usize,
     pub max_update_seq: usize,
+    pub opd_seq_chunk: usize,
     pub autograd: autograd::AutogradRuntimeFlags,
 }
 
@@ -26,6 +27,7 @@ impl Default for TrainRuntimeFlags {
             rollout_retain_interval: 2,
             rollout_progress_interval: 16,
             max_update_seq: 23_000,
+            opd_seq_chunk: 4096,
             autograd: autograd::AutogradRuntimeFlags::default(),
         }
     }
@@ -38,6 +40,7 @@ static WRITEBACK_FROZEN_PROMPT_KV: AtomicBool = AtomicBool::new(false);
 static ROLLOUT_RETAIN_INTERVAL: AtomicUsize = AtomicUsize::new(2);
 static ROLLOUT_PROGRESS_INTERVAL: AtomicUsize = AtomicUsize::new(16);
 static MAX_UPDATE_SEQ: AtomicUsize = AtomicUsize::new(23_000);
+static OPD_SEQ_CHUNK: AtomicUsize = AtomicUsize::new(4096);
 
 pub fn apply_runtime_flags(f: &TrainRuntimeFlags) {
     WRITEBACK_OFFLOAD.store(f.writeback_offload, Relaxed);
@@ -49,6 +52,7 @@ pub fn apply_runtime_flags(f: &TrainRuntimeFlags) {
     ROLLOUT_RETAIN_INTERVAL.store(f.rollout_retain_interval.max(1), Relaxed);
     ROLLOUT_PROGRESS_INTERVAL.store(f.rollout_progress_interval.max(1), Relaxed);
     MAX_UPDATE_SEQ.store(f.max_update_seq, Relaxed);
+    OPD_SEQ_CHUNK.store(f.opd_seq_chunk.max(1), Relaxed);
     autograd::apply_runtime_flags(&f.autograd);
 }
 
@@ -57,7 +61,9 @@ pub(crate) fn max_update_seq() -> usize {
 }
 
 /// MLP + full-attention recompute chunk. Always on — exact under position-wise/q-tiling.
-pub const OPD_SEQ_CHUNK: usize = 4096;
+pub fn opd_seq_chunk() -> usize {
+    OPD_SEQ_CHUNK.load(Relaxed)
+}
 
 pub(crate) fn writeback_offload() -> bool {
     WRITEBACK_OFFLOAD.load(Relaxed)
