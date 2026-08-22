@@ -241,6 +241,10 @@ impl Dsv4CudaExecutor {
         if self.spec_requested() || self.dspark.is_some() {
             return Ok(None);
         }
+        #[cfg(feature = "deepep")]
+        if self.model.deepep.is_some() {
+            return Ok(None);
+        }
 
         if self.decode_graph.is_none() {
             self.decode_graph = Some(Dsv4DecodeGraph {
