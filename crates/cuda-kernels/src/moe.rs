@@ -861,7 +861,7 @@ pub unsafe fn moe_w4a16_grouped_gemv_pair_batch(
     scale_b_ptrs: &CudaSlice<u64>,
     input: RawDevicePtr<bf16>,
     output_a: RawDevicePtr<bf16>,
-    output_b: RawDevicePtr<bf16>,
+    output_b: Option<RawDevicePtr<bf16>>,
     offsets: RawDevicePtr<i32>,
     counts: RawDevicePtr<i32>,
     expert_indices: RawDevicePtr<i32>,
@@ -871,6 +871,8 @@ pub unsafe fn moe_w4a16_grouped_gemv_pair_batch(
     k: usize,
     group_size: usize,
     xor_mask: u32,
+    fuse_swiglu: bool,
+    swiglu_limit: f32,
     ctx: &DeviceContext,
     stream: CUstream,
 ) -> Result<()> {
@@ -888,7 +890,9 @@ pub unsafe fn moe_w4a16_grouped_gemv_pair_batch(
             sb as *const u64,
             input.as_ptr() as *const Half,
             output_a.as_mut_ptr() as *mut Half,
-            output_b.as_mut_ptr() as *mut Half,
+            output_b
+                .map(|p| p.as_mut_ptr() as *mut Half)
+                .unwrap_or(std::ptr::null_mut()),
             offsets.as_ptr(),
             counts.as_ptr(),
             expert_indices.as_ptr(),
@@ -898,6 +902,8 @@ pub unsafe fn moe_w4a16_grouped_gemv_pair_batch(
             i32::try_from(k)?,
             i32::try_from(group_size)?,
             xor_mask,
+            u32::from(fuse_swiglu),
+            swiglu_limit,
             stream,
         )
         .result()?;
@@ -2057,36 +2063,6 @@ pub fn dsv4_deepgemm_native_preflight() -> Result<String> {
 }
 
 /// Dense clamped SwiGLU over a `[seq_len, intermediate]` batch:
-/// `out = silu(min(gate, limit)) * clamp(up, -limit, limit)`. Used by the DSv4
-/// shared expert (not the routed grouped path). Wraps
-/// [`ffi::dsv4_swiglu_clamped_cuda`].
-///
-/// # Safety
-/// `gate` / `up` / `out` must be valid on `stream` for `n` elements.
-pub unsafe fn dsv4_swiglu_clamped_batch(
-    gate: RawDevicePtr<bf16>,
-    up: RawDevicePtr<bf16>,
-    out: RawDevicePtr<bf16>,
-    n: usize,
-    limit: f32,
-    stream: CUstream,
-) -> Result<()> {
-    // SAFETY: forwarded — the caller upholds this fn's `# Safety` contract
-    // (all raw pointers valid on `stream` for the shape); i32 casts are checked.
-    unsafe {
-        ffi::dsv4_swiglu_clamped_cuda(
-            gate.as_ptr() as *const Half,
-            up.as_ptr() as *const Half,
-            out.as_mut_ptr() as *mut Half,
-            i32::try_from(n)?,
-            limit,
-            stream,
-        )
-        .result()?;
-    }
-    Ok(())
-}
-
 /// DSv4 FP8 decode-band fused gate+up+SwiGLU grouped GEMM (w8a16, f32 block
 /// scales). Compact (work scales with real routed rows), 16-byte vectorized
 /// FP8 weight loads, per-route correct (one warp per output row, no tile

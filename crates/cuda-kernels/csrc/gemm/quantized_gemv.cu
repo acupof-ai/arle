@@ -1966,6 +1966,16 @@ __global__ void w4a16_grouped_gemv_batch_kernel(
 
 // Marlin-style grouped pair GEMV for MoE gate+up: two weight matrices share
 // the same input. Weight shared across all tokens routed to the same expert.
+// DSv4 clamped SwiGLU (matches dsv4_swiglu_clamped_one / fp8d_swiglu_clamped):
+//   gate = min(gate, limit); up = clamp(up, -limit, limit);
+//   out  = (gate / (1 + exp(-gate))) * up
+static __device__ __forceinline__ float w4a16_swiglu_clamped(float gate, float up,
+                                                              float limit) {
+    gate = fminf(gate, limit);
+    up = fminf(fmaxf(up, -limit), limit);
+    return (gate / (1.0f + __expf(-gate))) * up;
+}
+
 __global__ void w4a16_grouped_gemv_pair_batch_kernel(
     const uint64_t* __restrict__ weight_a_ptrs,
     const uint64_t* __restrict__ scale_a_ptrs,
@@ -1981,7 +1991,9 @@ __global__ void w4a16_grouped_gemv_pair_batch_kernel(
     int N,
     int K,
     int group_size,
-    uint32_t xor_mask)
+    uint32_t xor_mask,
+    bool fuse_swiglu,
+    float swiglu_limit)
 {
     int threads_per_row = GEMV_THREADS / GEMV_ROWS;
     int row = blockIdx.x * GEMV_ROWS + threadIdx.x / threads_per_row;
@@ -2109,8 +2121,13 @@ __global__ void w4a16_grouped_gemv_pair_batch_kernel(
             sb = warp_reduce_sum(sb);
             if (lane_id == 0) {
                 int route = offsets[compact_expert_idx] + batch_base + b;
-                output_a[route * N + row] = __float2bfloat16(sa);
-                output_b[route * N + row] = __float2bfloat16(sb);
+                if (fuse_swiglu) {
+                    output_a[route * N + row] =
+                        __float2bfloat16(w4a16_swiglu_clamped(sa, sb, swiglu_limit));
+                } else {
+                    output_a[route * N + row] = __float2bfloat16(sa);
+                    output_b[route * N + row] = __float2bfloat16(sb);
+                }
             }
         }
     } else {
@@ -2143,8 +2160,13 @@ __global__ void w4a16_grouped_gemv_pair_batch_kernel(
                 }
                 if (lane_id == 0) {
                     int route = offsets[compact_expert_idx] + batch_base + b;
-                    output_a[route * N + row] = __float2bfloat16(ta);
-                    output_b[route * N + row] = __float2bfloat16(tb);
+                    if (fuse_swiglu) {
+                        output_a[route * N + row] =
+                            __float2bfloat16(w4a16_swiglu_clamped(ta, tb, swiglu_limit));
+                    } else {
+                        output_a[route * N + row] = __float2bfloat16(ta);
+                        output_b[route * N + row] = __float2bfloat16(tb);
+                    }
                 }
             }
         }
@@ -3031,6 +3053,8 @@ cudaError_t moe_w4a16_grouped_gemv_pair_batch_cuda(
     int K,
     int group_size,
     uint32_t xor_mask,
+    bool fuse_swiglu,
+    float swiglu_limit,
     cudaStream_t stream)
 {
     if (num_experts <= 0 || max_count <= 0 || N <= 0 || K <= 0 ||
@@ -3044,7 +3068,7 @@ cudaError_t moe_w4a16_grouped_gemv_pair_batch_cuda(
     w4a16_grouped_gemv_pair_batch_kernel<<<grid, block, 0, stream>>>(
         weight_a_ptrs, scale_a_ptrs, weight_b_ptrs, scale_b_ptrs, input,
         output_a, output_b, offsets, counts, expert_indices, max_count, N, K,
-        group_size, xor_mask);
+        group_size, xor_mask, fuse_swiglu, swiglu_limit);
     return cudaGetLastError();
 }
 
