@@ -1088,6 +1088,10 @@ pub(crate) struct OpdRuntimeArgs {
     #[arg(long, default_value_t = 23_000, value_name = "TOKENS")]
     pub(crate) max_update_seq: usize,
 
+    /// Sequence rows per position-wise recompute chunk in the OPD backward.
+    #[arg(long, default_value_t = 4096, value_name = "ROWS")]
+    pub(crate) opd_seq_chunk: usize,
+
     /// Rollout tensor retain interval (steps).
     #[arg(long, default_value_t = 2, value_name = "N")]
     pub(crate) rollout_retain_interval: usize,
@@ -1208,6 +1212,7 @@ impl OpdRuntimeArgs {
             rollout_retain_interval: self.rollout_retain_interval,
             rollout_progress_interval: self.rollout_progress_interval,
             max_update_seq: self.max_update_seq,
+            opd_seq_chunk: self.opd_seq_chunk,
             autograd: autograd::AutogradRuntimeFlags {
                 checkpoint_offload_min_bytes: self.checkpoint_offload_min_bytes,
                 checkpoint_reload_device: self.checkpoint_reload_device,

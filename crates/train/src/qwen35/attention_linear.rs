@@ -244,7 +244,7 @@ fn chunked_proj(
     Ok(autograd::ops::checkpoint_seq_chunked(
         x,
         param_ids,
-        crate::runtime_flags::OPD_SEQ_CHUNK,
+        crate::runtime_flags::opd_seq_chunk(),
         store,
         tape,
         move |st, tp, _start, inp| proj.forward(inp[0], st, tp),
