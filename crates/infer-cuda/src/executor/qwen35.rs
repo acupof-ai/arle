@@ -641,9 +641,7 @@ impl Qwen35CudaExecutor {
         // CP preconditions (T2.b replicated gather and the T3.2b 2D ring/decode
         // merge): a real NCCL cp sub-comm, and the BF16 pool (the quant-KV write
         // path does not cover remote cp slices).
-        // DSpark is rejected below by its own single-GPU ensure; --kv-recall is
-        // rejected at enable time (rank-local eviction scoring would diverge
-        // the cp group's collective schedule).
+        // DSpark is rejected below by its own single-GPU ensure.
         // attn_dp>1 would replicate attn_tp-sharded weights across dp peers
         // while the cp=1 reduce stays global — double-counted attention. No
         // engine dp routing exists; reject until it does.

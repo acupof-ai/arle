@@ -1341,9 +1341,9 @@ impl TokenKVPool {
     /// pinned by a radix/detached refcount, or out of range.
     ///
     /// The dropped page's KV is the tier's responsibility (it was mirrored by the
-    /// write-through verb before this call), so nothing is written back. This is
-    /// NEVER called on the default decode path — only the opt-in `--kv-recall`
-    /// executor calls it for non-pinned middle pages.
+    /// write-through verb before this call), so nothing is written back. No
+    /// in-tree caller today (the `--kv-recall` driver was deleted, 3f826c204);
+    /// kept for the remote-L3 hole-tolerance path.
     pub fn evict_slot_page(&mut self, slot: usize, logical_page: usize) -> Option<u32> {
         let page = *self.page_indices.get(slot)?.get(logical_page)?;
         if page == EVICTED_PAGE {

@@ -654,8 +654,9 @@ impl Qwen35Model {
         Ok(())
     }
 
-    /// Forward over the opt-in paged recall KV pool (`--kv-recall`): the
-    /// full-attn layers read/write `recall.pool` over `recall.meta`.
+    /// Paged forward over the recall KV pool (historical name — the general
+    /// paged-forward carrier): the full-attn layers read/write `recall.pool`
+    /// over `recall.meta`.
     /// `slot.seq_len` is still advanced in lockstep (the executor's decode
     /// invariant reads it); the pool's own `seq_len` is advanced separately
     /// via `alloc_tokens`.

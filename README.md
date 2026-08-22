@@ -194,8 +194,6 @@ Agent and RL workloads re-process the same prompt + history + tool output every 
 
 **Quantized KV on CUDA.** INT8/FP8/INT4 paged-KV behind `--kv-cache-dtype`. Correctness-gated, opt-in (default BF16).
 
-**KV-recall for long context (Metal).** Past the sliding window, decode attends only `sink + recent + top-k recalled` older blocks — 9.6% of KV, identical quality to full attention. Behind `--kv-recall`.
-
 **One runtime, three surfaces.** Serving, the local agent, and OPD training run the same Rust + model code. The OPD teacher *is* the production server.
 
 **DSpark trains while serving.** `--spec-type dspark --dspark-train` runs the DSpark block-drafter for faster decode *and* trains its Markov head in-process: the hot path captures (draft, target, accepted) tuples, a background thread runs acceptance-weighted policy gradient + probability matching, and updated weights hot-swap back into the running engine — no restart, no separate training job. Seeds from the loaded checkpoint so acceptance never regresses at startup.
