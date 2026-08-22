@@ -93,9 +93,7 @@ unsafe extern "C" {
     pub fn mlx_erf(a: *mut mlx_array) -> *mut mlx_array;
 
     pub fn mlx_reshape(a: *mut mlx_array, shape: *const i32, ndim: usize) -> *mut mlx_array;
-    /// Reverse all axes.
     pub fn mlx_transpose(a: *mut mlx_array) -> *mut mlx_array;
-    /// Transpose with explicit axis permutation.
     pub fn mlx_transpose_axes(a: *mut mlx_array, axes: *const i32, n: usize) -> *mut mlx_array;
     pub fn mlx_astype(a: *mut mlx_array, dtype: i32) -> *mut mlx_array;
     pub fn mlx_broadcast_to(a: *mut mlx_array, shape: *const i32, ndim: usize) -> *mut mlx_array;
@@ -124,10 +122,8 @@ unsafe extern "C" {
     ) -> *mut mlx_array;
 
     /// Scatter-add into a zero-initialized `[vocab, feature_dim]` output.
-    /// For each i in 0..prefix_rows, adds `updates_data[i*feature_dim..][..feature_dim]`
-    /// into row `indices_data[i]`. Indices must already be in-bounds (the
-    /// caller is responsible for OOB/negative filtering — the C++ helper
-    /// does NOT sanitize).
+    /// Indices must already be in-bounds — the caller filters OOB/negative;
+    /// the C++ helper does NOT sanitize.
     pub fn mlx_scatter_add_rows_f32(
         updates_data: *const f32,
         indices_data: *const i32,
@@ -164,7 +160,6 @@ unsafe extern "C" {
 
     pub fn mlx_contiguous(a: *mut mlx_array) -> *mut mlx_array;
 
-    /// Full GDR layer forward in C++ — eliminates ~40 FFI calls per layer.
     #[allow(clippy::too_many_arguments)]
     pub fn dflash_draft_new() -> *mut std::ffi::c_void;
     pub fn dflash_draft_free(model: *mut std::ffi::c_void);
@@ -488,11 +483,9 @@ unsafe extern "C" {
         out_finish: *mut i32,
     ) -> i32;
 
-    //
-    // VLM with a DeepEncoder (SAM-base + CLIP-large + 16x conv compressor +
-    // linear projector) and a DeepSeek-MoE decoder. Decoder weights are MXFP8
-    // (scales uint8, no biases); vision weights are dense BF16. Weight ids index
-    // into one registry; `add_*` returns the id, layer-push references them.
+    // Decoder weights are MXFP8 (scales uint8, no biases); vision weights are
+    // dense BF16. Weight ids index into one registry; `add_*` returns the id,
+    // layer-push references them.
 
     pub fn deepseek_ocr_new() -> *mut std::ffi::c_void;
     pub fn deepseek_ocr_free(model: *mut std::ffi::c_void);
@@ -538,11 +531,9 @@ unsafe extern "C" {
         k_id: i32,
         v_id: i32,
         o_id: i32,
-        // dense MLP (used when num_experts <= 0)
         dense_gate_id: i32,
         dense_up_id: i32,
         dense_down_id: i32,
-        // MoE (used when num_experts > 0)
         router_id: i32,
         switch_gate_id: i32,
         switch_up_id: i32,
@@ -558,21 +549,18 @@ unsafe extern "C" {
     pub fn deepseek_ocr_set_vision_config(
         model: *mut std::ffi::c_void,
         image_token_id: i32,
-        // CLIP
         clip_hidden_size: i32,
         clip_intermediate_size: i32,
         clip_num_layers: i32,
         clip_num_heads: i32,
         clip_patch_size: i32,
         clip_layer_norm_eps: f32,
-        // SAM
         sam_width: i32,
         sam_layers: i32,
         sam_heads: i32,
         sam_patch_size: i32,
         sam_window_size: i32,
         sam_image_size: i32,
-        // projector
         projector_input_dim: i32,
         projector_n_embed: i32,
     ) -> i32;
@@ -593,7 +581,7 @@ unsafe extern "C" {
         net2_w_id: i32,
         net3_w_id: i32,
     ) -> i32;
-    /// One SAM ViT block. `window_size=0` marks a global-attention block.
+    /// `window_size=0` marks a global-attention block.
     #[allow(clippy::too_many_arguments)]
     pub fn deepseek_ocr_push_sam_block(
         model: *mut std::ffi::c_void,
@@ -613,7 +601,6 @@ unsafe extern "C" {
         lin2_w_id: i32,
         lin2_b_id: i32,
     ) -> i32;
-    /// CLIP embeddings + pre-layernorm stem.
     pub fn deepseek_ocr_set_clip_stem(
         model: *mut std::ffi::c_void,
         class_embedding_id: i32,
@@ -621,7 +608,6 @@ unsafe extern "C" {
         pre_layernorm_w_id: i32,
         pre_layernorm_b_id: i32,
     ) -> i32;
-    /// One CLIP encoder layer (fused qkv, layernorm w+b, MLP fc1/fc2).
     #[allow(clippy::too_many_arguments)]
     pub fn deepseek_ocr_push_clip_layer(
         model: *mut std::ffi::c_void,
@@ -638,7 +624,7 @@ unsafe extern "C" {
         fc2_w_id: i32,
         fc2_b_id: i32,
     ) -> i32;
-    /// Projector (MXFP8 linear w+scales+bias) + image_newline + view_separator.
+    /// Projector is MXFP8 (w+scales+bias).
     pub fn deepseek_ocr_set_projector(
         model: *mut std::ffi::c_void,
         projector_w_id: i32,
@@ -859,7 +845,7 @@ unsafe extern "C" {
     /// DFlash verify: parallel forward over a draft block, returning all-position
     /// logits [1, block_size, vocab]. Respects model-level tape_mode and capture
     /// layers — one call emits per-step GDR tapes and captured hidden for the
-    /// entire block, replacing the previous 16 × seq_len=1 sequential verify loop.
+    /// entire block.
     #[allow(clippy::too_many_arguments)]
     pub fn qwen35_compiled_verify_block_summary(
         model: *mut std::ffi::c_void,
@@ -880,30 +866,7 @@ unsafe extern "C" {
         out_gdr_states: *mut *mut mlx_array,
     ) -> i32;
     #[allow(clippy::too_many_arguments)]
-
-    /// Full decode loop in C++ — all intermediates stay alive within the loop.
     #[allow(clippy::too_many_arguments)]
-
-    /// Qwen3.5/3.6 SparseMoeBlock forward (Metal only).
-    ///
-    /// Composes MLX ops to reproduce `Qwen3NextSparseMoeBlock.__call__` in one
-    /// C++ call: 8-bit-quantized router → top-k (argpartition + slice) →
-    /// take_along_axis scores → optional norm_topk_prob → SwitchGLU over the
-    /// switch-mlp experts (4-bit quantized, stacked) → weighted sum over top_k
-    /// → dense shared expert (4-bit quantized SwiGLU) gated by an 8-bit scalar
-    /// router → sum.
-    ///
-    /// All `*_w/*_scales/*_biases` triples are mlx quantized-linear triples in
-    /// affine mode (`group_size` = 64 for Qwen3.6-A3B, `bits` = 4 for experts
-    /// and 8 for both routers per mlx-community config).
-    ///
-    /// Expert weights are stacked on the expert axis:
-    /// `expert_{gate,up}_w : [E, Hmoe, H/pack]`,
-    /// `expert_down_w : [E, H, Hmoe/pack]`. Shared-expert weights are plain
-    /// 2-D quantized linears (affine scale+bias; the compiled MLP fuses them).
-    ///
-    /// Returns a newly-allocated array handle (caller must `mlx_array_free`)
-    /// or nullptr on failure (check `mlx_last_error()`).
     #[allow(clippy::too_many_arguments)]
 
     /// RMS normalization. Pass null for weight to use no learnable weight.
@@ -956,19 +919,14 @@ unsafe extern "C" {
         count: i32,
     );
 
-    /// Current active MLX allocator memory in bytes.
     pub fn mlx_get_active_memory() -> usize;
-    /// Peak MLX allocator memory in bytes.
     pub fn mlx_get_peak_memory() -> usize;
-    /// Cached MLX allocator memory in bytes.
     pub fn mlx_get_cache_memory() -> usize;
-    /// Set the MLX allocator memory limit in bytes. Returns the previous limit.
+    /// Returns the previous limit.
     pub fn mlx_set_memory_limit(limit: usize) -> usize;
-    /// Set the MLX allocator cache limit in bytes. Returns the previous limit.
+    /// Returns the previous limit.
     pub fn mlx_set_cache_limit(limit: usize) -> usize;
-    /// Set the MLX allocator wired limit in bytes. Returns the previous limit.
+    /// Returns the previous limit.
     pub fn mlx_set_wired_limit(limit: usize) -> usize;
-    /// Release cached Metal buffers and other allocator caches.
-    /// Equivalent to `mx.metal.clear_cache()` in Python.
     pub fn mlx_metal_clear_cache();
 }
