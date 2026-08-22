@@ -28,19 +28,13 @@ pub struct DeviceMatrix {
     pub scale_f32: Option<CudaSlice<f32>>,
     /// ABI-generic secondary f32 scale buffer (activation metadata in v1).
     pub scale2_f32: Option<CudaSlice<f32>>,
-    /// Number of rows in the ABI-generic scale matrix.
     pub quant_scale_rows: usize,
-    /// Number of columns in the ABI-generic scale matrix.
     pub quant_scale_cols: usize,
-    /// Weight block rows for block-scaled formats.
     pub quant_block_m: usize,
-    /// Weight block columns/group size for block-scaled/group formats.
     pub quant_block_k: usize,
     /// DeepSeek V4 block scales encoded as raw FP8 E8M0 bytes.
     pub dsv4_scales: Option<CudaSlice<u8>>,
-    /// Number of rows in the DeepSeek V4 block-scale matrix.
     pub dsv4_scale_rows: usize,
-    /// Number of columns in the DeepSeek V4 block-scale matrix.
     pub dsv4_scale_cols: usize,
     /// Quantization group size (0 = not quantized).
     pub group_size: usize,
@@ -66,7 +60,6 @@ pub struct DeviceMatrix {
     /// explicitly. False keeps every M on Marlin — the output head sets it that
     /// way so its logits do not change precision with prompt length.
     pub fp8_deepgemm_prefill: bool,
-    // -- TurboQuant packed weight storage (Phase 2: fused dequant at runtime) --
     /// TQ packed indices [rows, packed_cols] u8.
     /// 3-bit uses 4-bit nibble packing (2 per byte), 2-bit uses 4 per byte.
     pub tq_packed: Option<CudaSlice<u8>>,
@@ -124,7 +117,6 @@ impl HostMatrixSnapshot {
     }
 }
 
-/// Copy an optional device buffer to host and report bytes copied.
 fn snapshot_opt_slice<T: DeviceRepr + Clone>(
     ctx: &DeviceContext,
     src: &Option<CudaSlice<T>>,
@@ -143,7 +135,6 @@ fn snapshot_opt_slice<T: DeviceRepr + Clone>(
     }
 }
 
-/// Re-upload an optional host buffer to device.
 fn restore_opt_slice<T: DeviceRepr>(
     ctx: &DeviceContext,
     host: &Option<Vec<T>>,
@@ -179,7 +170,6 @@ pub fn offload_raw_slice<T: DeviceRepr + Clone + ValidAsZeroBits>(
     Ok((host, freed))
 }
 
-/// Restore a raw `CudaSlice<T>` from a host snapshot, re-allocating VRAM.
 pub fn reload_raw_slice<T: DeviceRepr>(
     ctx: &DeviceContext,
     slice: &mut CudaSlice<T>,
@@ -337,7 +327,6 @@ impl DeviceMatrix {
         })
     }
 
-    /// Restore device buffers from a host snapshot, re-allocating VRAM.
     pub fn reload_from_host(
         &mut self,
         ctx: &DeviceContext,
@@ -372,7 +361,6 @@ impl DeviceMatrix {
         Ok(())
     }
 
-    /// Create from host data (row-major, bf16)
     pub fn from_host(ctx: &DeviceContext, data: &[bf16], rows: usize, cols: usize) -> Result<Self> {
         assert_eq!(data.len(), rows * cols);
         let gpu_data = ctx
@@ -412,7 +400,6 @@ impl DeviceMatrix {
         })
     }
 
-    /// Create from INT8 quantized weight + bf16 scales.
     pub fn from_quantized_int8(
         ctx: &DeviceContext,
         qweight_data: &[i8],
@@ -749,7 +736,6 @@ impl DeviceMatrix {
         Ok(fused)
     }
 
-    /// Create from INT4 packed quantized weight + bf16 scales.
     /// Unpacks INT4 → INT8 at load time for the W8 kernel.
     /// TODO: integrate Marlin kernel for native W4 prefill, AWQ-style GEMV for decode.
     pub fn from_quantized_int4(
@@ -819,7 +805,6 @@ impl DeviceMatrix {
         })
     }
 
-    /// Create from DeepSeek V4 FP8 E4M3 weights plus FP8 E8M0 block scales.
     pub fn from_dsv4_fp8_block_scaled(
         ctx: &DeviceContext,
         weight_bytes: &[u8],
@@ -898,9 +883,7 @@ impl DeviceMatrix {
         Ok(matrix)
     }
 
-    /// Create from DeepSeek V4 FP4 E2M1 weights (2 packed per I8 byte) plus FP8
-    /// E8M0 block scales. `cols` is the logical (unpacked) K; the stored weight
-    /// buffer holds `rows * cols / 2` bytes.
+    /// `cols` is the logical (unpacked) K; the stored buffer holds `rows * cols / 2` bytes (2 FP4 nibbles per byte).
     pub fn from_dsv4_fp4_block_scaled(
         ctx: &DeviceContext,
         weight_bytes: &[u8],
@@ -979,7 +962,6 @@ impl DeviceMatrix {
         Ok(matrix)
     }
 
-    /// Create from ABI-generic FP8 E4M3 weights plus direct f32 block scales.
     #[allow(clippy::too_many_arguments)]
     pub fn from_fp8_block_scaled(
         ctx: &DeviceContext,
@@ -1054,7 +1036,6 @@ impl DeviceMatrix {
         })
     }
 
-    /// Create from ABI-generic FP8 E4M3 weights plus direct f32 per-shard scales.
     pub fn from_fp8_per_shard(
         ctx: &DeviceContext,
         weight_bytes: &[u8],
@@ -1129,7 +1110,6 @@ impl DeviceMatrix {
         })
     }
 
-    /// Create from packed FP4 E2M1 weights plus FP8 group scales and direct f32 globals.
     #[allow(clippy::too_many_arguments)]
     pub fn from_fp4_e2m1_group(
         ctx: &DeviceContext,
@@ -1218,7 +1198,6 @@ impl DeviceMatrix {
         })
     }
 
-    /// Whether this matrix uses quantized weights.
     pub fn is_quantized(&self) -> bool {
         self.weight_format.is_quantized()
             && (self.qweight.is_some()
@@ -1275,7 +1254,6 @@ impl DeviceMatrix {
             return Ok(());
         }
 
-        // Step 1: signed INT8 [N, K] row-major → uint8b128 GPTQ [K/4, N] i32.
         // element (n,k): u8 = int8+128, packed 4-per-word at bits (k%4)*8.
         let qw = self.qweight.as_ref().unwrap();
         let weight_host: Vec<i8> = ctx
@@ -1307,7 +1285,6 @@ impl DeviceMatrix {
             .alloc_zeros(k * n)
             .map_err(|e| anyhow!("Alloc W8A16 Marlin: {}", e))?;
 
-        // Step 2: GPTQ → Marlin tile layout on GPU.
         {
             let (gptq_ptr, _g1) = gptq_gpu.device_ptr(&ctx.stream);
             let (marlin_ptr, _g2) = marlin_gpu.device_ptr_mut(&ctx.stream);
@@ -1326,7 +1303,6 @@ impl DeviceMatrix {
             }
         }
 
-        // Step 3: scales [N, K/gs] bf16 → transpose to [K/gs, N] → Marlin permute.
         // scale_perm is an 8×8 transpose within each 64-column block:
         //   perm[out] = (out%8)*8 + (out/8)   (vLLM get_scale_perms, len 64).
         // Kept BF16 (the bf16 GEMM reinterprets scales as scalar_t2).
@@ -1557,8 +1533,6 @@ impl DeviceMatrix {
         Ok(())
     }
 
-    /// scale. `scale_factor` is a power of two that lifts every scale above the
-    /// E5-MSB-set floor; the global scale is divided by it.
     /// Build the per-128x128-block power of two the NVFP4 DeepGEMM prefill arm
     /// divides out of the weight and hands DeepGEMM back as `sfb`.
     ///
@@ -1880,8 +1854,6 @@ impl DeviceMatrix {
         })
     }
 
-    /// Extract a contiguous range of rows `[row_start..row_end)` as a new `DeviceMatrix`.
-    /// The result is an independent copy on the GPU.
     pub fn slice_rows(
         ctx: &DeviceContext,
         src: &DeviceMatrix,

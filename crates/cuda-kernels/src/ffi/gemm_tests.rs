@@ -852,8 +852,6 @@ fn dequantize_w4a16_to_bf16_matches_reference() {
     assert_bf16_close(&got, &expected, 0.05);
 }
 
-// ─── KV cache quantization round-trip tests ───
-
 /// INT8 KV round-trip: bf16 → INT8 (per-token per-head absmax/127) → bf16.
 ///
 /// Layout: HND `[num_kv_heads, max_seq_len, head_dim]`.

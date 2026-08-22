@@ -7,10 +7,6 @@ use half::bf16;
 use crate::ffi::{self, Half};
 use crate::tensor::DeviceContext;
 
-// Safe wrappers over the embedding/norm/elementwise FFI, per the `moe.rs` /
-// `quant_linear.rs` pattern: typed buffers, checked i32 casts, pointer guards
-// held through submission, one FFI symbol per launcher.
-
 fn extent(a: usize, b: usize, what: &'static str) -> Result<usize> {
     a.checked_mul(b)
         .ok_or_else(|| anyhow!("{what} shape overflow: {a}x{b}"))
@@ -388,7 +384,6 @@ pub fn silu_mul_fused(
     }
 }
 
-/// Split a row-fused `[batch, first_dim + second_dim]` buffer into two buffers.
 pub fn split2(
     ctx: &DeviceContext,
     fused: &impl DevicePtr<bf16>,

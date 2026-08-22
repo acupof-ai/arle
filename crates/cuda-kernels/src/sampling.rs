@@ -7,11 +7,6 @@ use half::bf16;
 use crate::ffi::{self, Half};
 use crate::tensor::DeviceContext;
 
-// Safe wrappers over the sampling FFI, per the `moe.rs` / `quant_linear.rs`
-// pattern: typed buffers, checked i32 casts, pointer guards held through
-// submission, one FFI symbol per launcher. Row selection stays with the
-// caller: pass a sliced view for a row-offset launch.
-
 fn extent(a: usize, b: usize, what: &'static str) -> Result<usize> {
     a.checked_mul(b)
         .ok_or_else(|| anyhow!("{what} shape overflow: {a}x{b}"))

@@ -138,7 +138,6 @@ unsafe extern "C" {
 
 }
 
-// ============================================================================
 // FlashQLA chunked GDR fwd+bwd — TileLang AOT, Hopper-only, DK=DV=128/chunk=64,
 // one symbol set per (H, Hg) instantiation (kernels.toml): unsuffixed =
 // H=32/Hg=16, `_h48` = H=48/Hg=16, `_h<H>g<Hg>` = the context-parallel shards.
@@ -162,7 +161,6 @@ unsafe extern "C" {
 //              -> dq/dk/dv [S,H,128] bf16, dg/dbeta [S,H] f32, dh0
 //              dq/dk carry the VALUE-head axis: with Hg<H the caller sums the
 //              head group. dg is w.r.t. g_cumsum, not the per-token g.
-// ============================================================================
 
 pub type FqCumsumFn = unsafe extern "C" fn(*const f32, *mut f32, i32, CUstream) -> CUresult;
 pub type FqKktFn =

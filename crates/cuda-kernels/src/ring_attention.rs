@@ -232,8 +232,6 @@ pub fn ring_backward_tile(
     (grad_q, per_block)
 }
 
-// --- FA3 pair decomposition ---
-//
 // The FA3 route splits a (q_pos, k_pos) block into rectangular FA3 calls: each
 // position map is 1 (contiguous) or 2 (zigzag) maximal contiguous runs, and
 // with equal-length chunk-aligned shards every (q_run, k_run) pair is either
@@ -249,7 +247,6 @@ pub struct PosRun {
     pub abs: usize,
 }
 
-/// Split a position map into its maximal contiguous (+1-step) runs.
 pub fn contiguous_pos_runs(pos: &[usize]) -> Vec<PosRun> {
     let mut runs: Vec<PosRun> = Vec::new();
     for (row, &abs) in pos.iter().enumerate() {
@@ -261,7 +258,6 @@ pub fn contiguous_pos_runs(pos: &[usize]) -> Vec<PosRun> {
     runs
 }
 
-/// How one (q_run, k_run) pair attends under the absolute causal mask.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PairClass {
     /// Every key precedes every query row: full attention.
@@ -320,7 +316,6 @@ pub fn classify_pair(q: PosRun, k: PosRun) -> Result<PairClass> {
 #[cfg(feature = "cuda")]
 const HALF: usize = std::mem::size_of::<ffi::Half>();
 
-// --- CP ring FA3 pair route (hd256 / sm_90) ---
 // Decomposes the (q_pos, k_pos) block into rectangular FA3 calls per the run
 // classification above: each visible (q_run, k_run) pair is one non-varlen
 // batch=1 FA3 launch over strided head-major views of the tile-major
@@ -341,7 +336,6 @@ fn check_cuda_ffi(status: cudarc::driver::sys::CUresult, label: &'static str) ->
     status.result().context(label)
 }
 
-// --- Scalar one-block launchers (non-sm90 / non-hd256 fallback) ---
 // Raw u64 device addresses over the same [tiles, rows(, d)] layouts the FA3
 // route uses; f32 accumulators/grads, bf16 q/k/v. Callers keep every owning
 // buffer alive and stream-ordered on `stream`.

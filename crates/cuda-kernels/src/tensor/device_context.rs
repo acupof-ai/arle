@@ -118,11 +118,8 @@ impl CudaAllocTraceExt for Arc<CudaStream> {
 pub struct DeviceContext {
     pub ctx: Arc<CudaContext>,
     pub stream: Arc<CudaStream>,
-    /// Separate stream for async H2D/D2H memory copies.
     pub copy_stream: Arc<CudaStream>,
-    /// Separate stream for NCCL/communication work that can overlap compute.
     pub comm_stream: Arc<CudaStream>,
-    /// CUDA device ordinal this context is bound to.
     pub ordinal: u32,
     /// Reusable CUDA events for pipeline fences. A fence returns its event here
     /// on drop; the next fence re-uses it only after `cuEventQuery` confirms
@@ -177,7 +174,6 @@ impl CudaPipelineFence {
         self.producer
     }
 
-    /// Poll the event without blocking the host.
     pub fn query(&self) -> Result<CudaPipelineFenceStatus> {
         let event = self.event.as_ref().expect("fence event taken");
         event
@@ -328,7 +324,6 @@ impl DeviceContext {
         self.ordinal
     }
 
-    /// Query the number of streaming multiprocessors on the GPU this context is bound to.
     pub fn sm_count(&self) -> usize {
         use cudarc::driver::sys::*;
         let mut count: i32 = 0;
@@ -344,7 +339,6 @@ impl DeviceContext {
         count.max(1) as usize
     }
 
-    /// Query the CUDA compute capability for the GPU this context is bound to.
     pub fn compute_capability(&self) -> (i32, i32) {
         use cudarc::driver::sys::*;
         let mut major: i32 = 0;
@@ -373,7 +367,6 @@ impl DeviceContext {
         self.compute_capability().0 == 12
     }
 
-    /// Query (free, total) device memory in bytes for the bound device.
     ///
     /// Wraps `cuMemGetInfo`. Used by the OPD engine time-share path to verify
     /// that weight offload actually releases resident VRAM.
@@ -406,21 +399,18 @@ impl DeviceContext {
         Ok(())
     }
 
-    /// Synchronize compute stream.
     pub fn sync(&self) -> Result<()> {
         self.stream
             .synchronize()
             .map_err(|e| anyhow!("Sync failed: {}", e))
     }
 
-    /// Synchronize copy stream.
     pub fn sync_copy(&self) -> Result<()> {
         self.copy_stream
             .synchronize()
             .map_err(|e| anyhow!("Copy stream sync failed: {}", e))
     }
 
-    /// Return the raw stream that backs a pipeline lane.
     #[must_use]
     pub fn pipeline_stream(&self, kind: CudaPipelineStreamKind) -> &Arc<CudaStream> {
         match kind {
@@ -430,7 +420,6 @@ impl DeviceContext {
         }
     }
 
-    /// Record a fence on the selected producer stream.
     pub fn record_pipeline_fence(
         &self,
         producer: CudaPipelineStreamKind,
@@ -477,7 +466,6 @@ impl DeviceContext {
         })
     }
 
-    /// Make `consumer` wait for `fence` without blocking the host.
     pub fn wait_on_pipeline_fence(
         &self,
         fence: &CudaPipelineFence,

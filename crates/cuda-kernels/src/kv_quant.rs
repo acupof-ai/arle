@@ -99,8 +99,6 @@ pub fn dequantize_kv(
     Ok(())
 }
 
-// ─── FP8 E4M3 paged pool ops ───
-
 /// Quantize 1 new token per request: bf16 working → FP8 E4M3 or INT8 paged pool.
 /// FP8 uses self-contained E4M3 (scale = absmax/448); INT8 uses symmetric
 /// per-(token, kv_head) scaling (scale = absmax/127).
@@ -162,9 +160,6 @@ pub fn quantize_paged_kv_per_token(
     Ok(())
 }
 
-// ─── Fused-dequant decode attention (INT8+scale) ───
-
-// ─── Native paged attention for quantized KV ───
 //
 // FA3-style split-KV over the 1-byte pools directly — no dequant temp. The
 // kernel is decode-shaped (one q token per batch row) and consumes the same

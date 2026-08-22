@@ -747,13 +747,11 @@ unsafe extern "C" {
         stream: super::CUstream,
     ) -> super::CUresult;
 
-    // ------------------------------------------------------------------
     // V2 FlashMLA support: bf16→f32 convert, TP repack/slice, CSA prep.
     // See:
     //   crates/cuda-kernels/csrc/misc/arle_dtype_convert.cu
     //   crates/cuda-kernels/csrc/misc/dsv4_tp_attention_repack.cu
     //   crates/cuda-kernels/csrc/misc/arle_flashmla_csa_prep.cu
-    // ------------------------------------------------------------------
 
     /// bf16 → f32 device-side convert. One-shot at model load (e.g. DSv4
     /// attn_sink f32 mirror for FlashMLA's float[h_q] contract).
