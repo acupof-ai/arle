@@ -1,16 +1,12 @@
 //! Public `InferenceEngine` adapter over the rewrite stack.
 //!
-//! Exposes the same public contract as the legacy `infer::server_engine` (the
-//! [`InferenceEngine`] trait, [`LoadedInferenceEngine`] enum, request/output/
-//! stream/telemetry types) over the rewrite stack, so consumers can later swap
-//! `infer` -> `infer-api` with zero code changes. Backend selection is by
-//! compiled feature (`metal`/`cuda`/`hip`/`vulkan`/`cpu`). Every request flows
-//! `tokenize -> ServeHandle::submit -> collect -> detokenize` via
-//! [`ServeInferenceEngine`].
+//! Backend selection is by compiled feature (`metal`/`cuda`/`hip`/`vulkan`/
+//! `cpu`). Every request flows `tokenize -> ServeHandle::submit -> collect ->
+//! detokenize` via [`ServeInferenceEngine`].
 //!
-//! # Gaps vs. the legacy contract (follow-ups)
+//! # Gaps (follow-ups)
 //!
-//! Public types carry the fields so the swap stays zero-change; the data is
+//! Public types carry the fields so consumers compile unchanged; the data is
 //! unavailable until the rewrite stack grows the hook.
 //!
 //! - **Streaming** — `ServeHandle` is blocking-`collect` only.
@@ -22,8 +18,7 @@
 //!   errors: the real CUDA forward + builder are lead-owned.
 //! - **Train-only CUDA methods + LoRA types** — `forward_token_logits`,
 //!   `remerge_student_lora`, weight offload/reload, and the `StudentLora*` types
-//!   need direct model access the host-only `ServeHandle` doesn't expose; `train`
-//!   stays on legacy `infer` until the CUDA path grows an OPD control surface.
+//!   need direct model access the host-only `ServeHandle` doesn't expose.
 
 mod loaded;
 mod serve;
@@ -103,8 +98,7 @@ pub use infer_server::{
     set_sampling_defaults,
 };
 // Per-step student LoRA re-merge contract (OPD P2), re-exported from `infer-cuda`
-// so consumers see them at the `infer-api` surface (mirrors the legacy
-// `infer::server_engine::StudentLora*` path the `train` crate couples to).
+// so consumers see them at the `infer-api` surface.
 #[cfg(feature = "cuda")]
 pub use infer_cuda::{
     SharedFp8BaseProjection, StudentLoraLayer, StudentLoraMatrices, StudentLoraProjection,
