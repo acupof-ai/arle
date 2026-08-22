@@ -8,6 +8,14 @@ detail in the linked wins/errors entry. Oldest sections are condensed.
 
 ## [Unreleased]
 
+- **Global sequence 262,144 trains on 2 GPUs — accepted.** Sequence-parallel
+  linear-attention core with cross-rank state carry (the all-to-all form's
+  transient was O(global seq)), layer param grads parked on host, and the CP
+  core collapsed into one tape entry. cp=2: 131,072 loss 3.034898 peak 64.6 GB,
+  262,144 loss 1.561557 peak 85.7 GB; cp=4 262,144 loss 1.560897 peak 65.1 GB.
+  Parity rungs bit-identical (4,096 9.857565 / 16,384 11.229959).
+  ([entry](docs/experience/wins/2026-08-22-sp-linear-attention-core-262144-cp4.md))
+
 - **MTP on the 32 K chain — measured, no flip.** Same binary, c=1/4/8/16 decode
   tok/s: no-spec 73.0/42.1/25.9/14.8, MTP d=2 84.3/42.0/24.8/14.0, d=4
   83.0/42.1/26.3/15.1; TTFT identical. +15 % at c=1 only (already the `auto`
