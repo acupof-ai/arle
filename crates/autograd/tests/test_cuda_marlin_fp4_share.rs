@@ -5,8 +5,8 @@
 
 use autograd::Backend;
 use autograd::backend_cuda::CudaBackend;
-use cudarc::driver::DevicePtr;
 use cuda_kernels::tensor::{DeviceContext, DeviceMatrix};
+use cudarc::driver::DevicePtr;
 
 /// NVFP4 E2M1 code -> value, matching the kernel's LUT.
 const E2M1: [f32; 16] = [
