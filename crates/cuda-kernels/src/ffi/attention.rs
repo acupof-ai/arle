@@ -521,28 +521,6 @@ unsafe extern "C" {
         workspace_bytes: usize,
     ) -> CUresult;
 
-    /// Page-table compaction dequant for the FA3 quant shim. Each
-    /// `(batch row b, logical page j)` of the rectangular page table
-    /// `[batch, page_table_stride]` lands in compact slot `b * stride + j`
-    /// of the bf16 output pool (same HND per-page layout as the source), and
-    /// `compact_table` is written as the identity over those slots. Fixed
-    /// launch shape per `(batch, stride)`, no host reads — replay-safe under
-    /// CUDA graph capture. `head_dim` must be a multiple of 16.
-    pub fn dequantize_paged_kv_compact_cuda(
-        data: *const u8,
-        scales: *const f32,
-        out: *mut Half,
-        page_table: *const i32,
-        compact_table: *mut i32,
-        batch: i32,
-        page_table_stride: i32,
-        num_kv_heads: i32,
-        head_dim: i32,
-        page_size: i32,
-        is_fp8: i32,
-        stream: CUstream,
-    ) -> CUresult;
-
 }
 
 // TileLang AOT paged-attention FFI — generated from `crates/cuda-kernels/kernels.toml`.
@@ -847,8 +825,9 @@ pub struct ArleFa3FwdHd256Args {
 /// Quantized-KV variant of [`ArleFa3FwdHd256Args`] (Path A): the shim
 /// dequantizes the 1-byte paged K/V pools into a per-call bf16 temp — only
 /// the pages `base.page_table` names, compacted to slots `b * stride + j` —
-/// and runs the bf16 FA3 fwd on it. The temp allocations are stream-ordered
-/// and the dequant reads only device tables, so the call stays CUDA-graph
+/// and runs the fp8 FA3 fwd on it (e4m3 operands, one descale per (row,
+/// kv_head); bf16 output). The temp allocations are stream-ordered
+/// and the kernels read only device tables, so the call stays CUDA-graph
 /// capture-safe. `base.k` / `base.v` / `base.num_pages` are overwritten by
 /// the shim; the compact pool keeps the HND per-page layout, so the caller's
 /// `k_page_stride` / `v_page_stride` describe it too.
