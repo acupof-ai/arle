@@ -2614,29 +2614,14 @@ impl Qwen35CudaExecutor {
             );
         }
 
-        if self.model.tp.is_single() {
-            return self.submit_decode_batch_paged(rows, host_kv);
-        }
-        let mut tokens = Vec::with_capacity(rows.len());
-        for row in rows {
-            let (token, logprob) =
-                self.submit_decode_row(row, /* allow_graph = */ false, host_kv)?;
-            tokens.push(SlotToken {
-                slot: row.slot,
-                token,
-                logprob,
-                top_logprobs: self.take_top_logprobs(&row.params),
-                finish: None,
-            });
-        }
-        Ok(tokens)
+        self.submit_decode_batch_paged(rows, host_kv)
     }
 
     /// A rows>1 decode sub-batch over the shared-paged lane: ONE B-row page table and a
     /// single batched-paged forward. Each row attends only its own slot's pages via its
     /// `kv_indptr` slice, so a B-row batch is equivalent to B sequential single-row
-    /// paged
-    /// decodes. Single-GPU, no recall (gated by the caller).
+    /// paged decodes. TP-safe: the batched forward all-reduces attn (inside the
+    /// attention kernels) and FFN per layer.
     fn submit_decode_batch_paged(
         &mut self,
         rows: &[DecodeRow],
