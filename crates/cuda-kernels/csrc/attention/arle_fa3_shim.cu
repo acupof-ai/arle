@@ -348,16 +348,23 @@ cudaError_t arle_fa3_fwd_hd256_bf16_cuda(const ArleFa3FwdHd256Args* a,
     return fa3_fwd_hd256_run(a, nullptr, stream);
 }
 
-// Quantized-KV variant: requantize the 1-byte paged K/V pools the page table
-// names into a per-call e4m3 temp (compacted: slot b*stride+j holds row b's
-// logical page j) with one descale per (row, kv_head), quantize Q to e4m3 the
-// same way, and run the fp8 fwd. The fp8 tensor-core rate is what pays at
-// long context; the per-row descale is the resolution FA3 can express. The
-// temp allocations are stream-ordered and the kernels read only device
-// tables, so the call stays CUDA-graph capture-safe. The caller passes the
-// SAME args as the bf16 entry (q/k/v/num_pages are overwritten); the compact
-// pool keeps the HND per-page layout, so the caller's page strides describe
-// it too.
+// Quantized-KV variant: convert the 1-byte paged K/V pools the page table
+// names into a per-call temp (compacted: slot b*stride+j holds row b's
+// logical page j) and run FA3 on it. Two operand forms, routed on the KV
+// length: below kFa3Fp8MinSeqlenK a bf16 temp + the bf16 kernel; at or above
+// it an e4m3 temp with one descale per (row, kv_head), Q quantised the same
+// way, and the fp8 kernel. Measured crossover on H20, Qwen3.8-27B, TTFT of
+// one request: 33K +10 %, 66K −1 %, 132K −11 %, 220K −16 % for fp8 — the fp8
+// tensor-core rate only pays once the O(L²) term dominates, and the fp8
+// paged kernel is slower on short q tiles. The temp allocations are
+// stream-ordered and the kernels read only device tables, so both forms stay
+// CUDA-graph capture-safe. The caller passes the SAME args as the bf16 entry
+// (q/k/v/num_pages are overwritten); the compact pool keeps the HND per-page
+// layout, so the caller's page strides describe it too.
+namespace {
+constexpr int kFa3Fp8MinSeqlenK = 65536;
+}
+
 typedef struct {
     ArleFa3FwdHd256Args base;
     const void* k_data;     // 1-byte quantized pool (e4m3 or int8)
@@ -366,6 +373,11 @@ typedef struct {
     const float* v_scales;
     int is_fp8;             // 1 = e4m3, 0 = int8
 } ArleFa3FwdHd256QuantArgs;
+
+cudaError_t dequantize_paged_kv_compact_cuda(
+    const void* data, const float* scales, void* out, const int* page_table,
+    int* compact_table, int batch, int page_table_stride, int num_kv_heads,
+    int head_dim, int page_size, int is_fp8, cudaStream_t stream);
 
 cudaError_t requantize_paged_kv_compact_e4m3_cuda(
     const void* data, const float* scales, void* out, float* descale,
@@ -380,17 +392,56 @@ cudaError_t quantize_q_e4m3_cuda(const void* q_bf16, void* q_e4m3,
                                  int num_kv_heads, int head_dim,
                                  cudaStream_t stream);
 
-cudaError_t arle_fa3_fwd_hd256_quant_cuda(const ArleFa3FwdHd256QuantArgs* qa,
-                                          cudaStream_t stream) {
-    if (qa == nullptr) return cudaErrorInvalidValue;
+static cudaError_t fa3_quant_bf16_form(const ArleFa3FwdHd256QuantArgs* qa,
+                                       cudaStream_t stream) {
     const ArleFa3FwdHd256Args* b = &qa->base;
-    // Paged-only: the temp pool is compacted from the page table.
-    if (b->page_table == nullptr || b->page_table_batch_stride <= 0 ||
-        b->batch <= 0 || b->num_heads_k <= 0 || b->head_dim <= 0 ||
-        b->page_size <= 0 || qa->k_data == nullptr || qa->v_data == nullptr ||
-        qa->k_scales == nullptr || qa->v_scales == nullptr) {
-        return cudaErrorInvalidValue;
+    const int64_t page_elems =
+        int64_t(b->page_size) * b->num_heads_k * b->head_dim;
+    const int compact_pages = b->batch * int(b->page_table_batch_stride);
+    const size_t pool_bytes = size_t(compact_pages) * page_elems *
+                              sizeof(cutlass::bfloat16_t);
+    const size_t table_bytes = size_t(compact_pages) * sizeof(int);
+
+    void* k_tmp = nullptr;
+    void* v_tmp = nullptr;
+    int* compact_table = nullptr;
+    cudaError_t st = cudaMallocAsync(&k_tmp, pool_bytes, stream);
+    if (st != cudaSuccess) return st;
+    st = cudaMallocAsync(&v_tmp, pool_bytes, stream);
+    if (st != cudaSuccess) goto fail;
+    st = cudaMallocAsync(&compact_table, table_bytes, stream);
+    if (st != cudaSuccess) goto fail;
+
+    st = dequantize_paged_kv_compact_cuda(
+        qa->k_data, qa->k_scales, k_tmp, b->page_table, compact_table,
+        b->batch, int(b->page_table_batch_stride), b->num_heads_k,
+        b->head_dim, b->page_size, qa->is_fp8, stream);
+    if (st != cudaSuccess) goto fail;
+    st = dequantize_paged_kv_compact_cuda(
+        qa->v_data, qa->v_scales, v_tmp, b->page_table, compact_table,
+        b->batch, int(b->page_table_batch_stride), b->num_heads_k,
+        b->head_dim, b->page_size, qa->is_fp8, stream);
+    if (st != cudaSuccess) goto fail;
+
+    {
+        ArleFa3FwdHd256Args local = *b;
+        local.k = k_tmp;
+        local.v = v_tmp;
+        local.page_table = compact_table;
+        local.num_pages = compact_pages;
+        st = fa3_fwd_hd256_run(&local, nullptr, stream);
     }
+
+fail:
+    cudaFreeAsync(k_tmp, stream);
+    cudaFreeAsync(v_tmp, stream);
+    cudaFreeAsync(compact_table, stream);
+    return st;
+}
+
+static cudaError_t fa3_quant_fp8_form(const ArleFa3FwdHd256QuantArgs* qa,
+                                      cudaStream_t stream) {
+    const ArleFa3FwdHd256Args* b = &qa->base;
     const int64_t page_elems =
         int64_t(b->page_size) * b->num_heads_k * b->head_dim;
     const int compact_pages = b->batch * int(b->page_table_batch_stride);
@@ -458,6 +509,21 @@ fail:
     cudaFreeAsync(compact_table, stream);
     cudaFreeAsync(descale, stream);
     return st;
+}
+
+cudaError_t arle_fa3_fwd_hd256_quant_cuda(const ArleFa3FwdHd256QuantArgs* qa,
+                                          cudaStream_t stream) {
+    if (qa == nullptr) return cudaErrorInvalidValue;
+    const ArleFa3FwdHd256Args* b = &qa->base;
+    // Paged-only: the temp pool is compacted from the page table.
+    if (b->page_table == nullptr || b->page_table_batch_stride <= 0 ||
+        b->batch <= 0 || b->num_heads_k <= 0 || b->head_dim <= 0 ||
+        b->page_size <= 0 || qa->k_data == nullptr || qa->v_data == nullptr ||
+        qa->k_scales == nullptr || qa->v_scales == nullptr) {
+        return cudaErrorInvalidValue;
+    }
+    return b->seqlen_k >= kFa3Fp8MinSeqlenK ? fa3_quant_fp8_form(qa, stream)
+                                            : fa3_quant_bf16_form(qa, stream);
 }
 
 // Backward (hdim256/bf16/sm_90a). Param-fill mirrors mha_bwd
