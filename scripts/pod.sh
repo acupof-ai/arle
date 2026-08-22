@@ -67,7 +67,7 @@ case "$cmd" in
     echo "pushed pod helpers -> $NODE_TREE/scripts/"
     ;;
   setup)
-    "$POD" "flock /tmp/arle-toolchain.lock bash -lc 'if ls ~/.rustup/toolchains/1.95.0-*/lib/rustlib/*/lib/libstd-*.rlib >/dev/null 2>&1; then echo toolchain-1.95.0-OK; else rustup toolchain install 1.95.0 --profile minimal -c rustfmt -c clippy; fi'"
+    "$POD" "flock /tmp/arle-toolchain.lock bash -lc 'if ls ~/.rustup/toolchains/1.98.0-*/lib/rustlib/*/lib/libstd-*.rlib >/dev/null 2>&1; then echo toolchain-1.98.0-OK; else rustup toolchain install 1.98.0 --profile minimal -c rustfmt -c clippy; fi'"
     ;;
   setup-sccache)
     "$POD" "if command -v sccache >/dev/null 2>&1; then sccache --version; else V=v0.8.2; export all_proxy=socks5h://127.0.0.1:1080; curl -fsSL --proxy socks5h://127.0.0.1:1080 -o /tmp/sccache.tgz https://github.com/mozilla/sccache/releases/download/\$V/sccache-\$V-x86_64-unknown-linux-musl.tar.gz && tar -C /tmp -xzf /tmp/sccache.tgz && install -m755 /tmp/sccache-\$V-x86_64-unknown-linux-musl/sccache /root/.cargo/bin/sccache && sccache --version; fi"

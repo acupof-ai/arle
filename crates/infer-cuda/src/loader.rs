@@ -1063,13 +1063,17 @@ impl SafetensorLoader {
         let host: Vec<f32> = match tensor.dtype {
             Dtype::F32 => tensor
                 .bytes()
-                .chunks_exact(4)
-                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| f32::from_le_bytes(*c))
                 .collect(),
             Dtype::BF16 => tensor
                 .bytes()
-                .chunks_exact(2)
-                .map(|c| half::bf16::from_le_bytes([c[0], c[1]]).to_f32())
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|c| half::bf16::from_le_bytes(*c).to_f32())
                 .collect(),
             other => bail!("{name}: expected F32/BF16 1D tensor, got {other:?}"),
         };
@@ -2109,9 +2113,11 @@ impl SafetensorLoader {
         let scales_bf16: Cow<[u8]> = if scales.dtype == Dtype::F16 {
             Cow::Owned(
                 scales_bytes
-                    .chunks_exact(2)
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
                     .flat_map(|c| {
-                        let f16 = half::f16::from_le_bytes([c[0], c[1]]);
+                        let f16 = half::f16::from_le_bytes(*c);
                         half::bf16::from_f32(f16.to_f32()).to_le_bytes()
                     })
                     .collect(),
@@ -2646,8 +2652,10 @@ pub(crate) fn tensor_bytes_to_f32(
                 bytes.len()
             );
             bytes
-                .chunks_exact(4)
-                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| f32::from_le_bytes(*c))
                 .collect::<Vec<_>>()
         }
         Dtype::BF16 => {
@@ -2657,8 +2665,10 @@ pub(crate) fn tensor_bytes_to_f32(
                 bytes.len()
             );
             bytes
-                .chunks_exact(2)
-                .map(|c| half::bf16::from_le_bytes([c[0], c[1]]).to_f32())
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|c| half::bf16::from_le_bytes(*c).to_f32())
                 .collect::<Vec<_>>()
         }
         other => bail!("{name}: expected BF16/F32 scale tensor, got {other:?}"),
@@ -2722,11 +2732,10 @@ impl SafetensorLoader {
                 );
                 Ok(Cow::Owned(
                     bytes
-                        .chunks_exact(4)
-                        .flat_map(|c| {
-                            half::bf16::from_f32(f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                                .to_le_bytes()
-                        })
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .flat_map(|c| half::bf16::from_f32(f32::from_le_bytes(*c)).to_le_bytes())
                         .collect(),
                 ))
             }

@@ -458,8 +458,10 @@ mod device {
                         );
                         let data = gguf.tensor_data(&info.name)?;
                         let table: Vec<i64> = data
-                            .chunks_exact(8)
-                            .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
+                            .as_chunks::<8>()
+                            .0
+                            .iter()
+                            .map(|c| i64::from_le_bytes(*c))
                             .collect();
                         tid2eid_by_layer.insert(layer, table);
                     }
@@ -919,8 +921,10 @@ mod device {
                 .copy_to_host(&mut host)
                 .map_err(|e| anyhow!("logits D2H: {e}"))?;
             let logits: Vec<f32> = host
-                .chunks_exact(4)
-                .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| f32::from_le_bytes(*c))
                 .collect();
 
             self.slots[slot].as_mut().expect("ensured").seq_len += 1;
@@ -1266,8 +1270,10 @@ mod device {
                 .copy_to_host(&mut raw)
                 .map_err(|e| anyhow!("router D2H: {e}"))?;
             let logits: Vec<f32> = raw
-                .chunks_exact(2)
-                .map(|c| f32::from_bits(u32::from(u16::from_le_bytes([c[0], c[1]])) << 16))
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|c| f32::from_bits(u32::from(u16::from_le_bytes(*c)) << 16))
                 .collect();
             let routes = super::route_layer_token(
                 &cfg,

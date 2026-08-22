@@ -208,7 +208,7 @@ case "${1:-}" in
         echo "source changed since receipt"
       else
         # shellcheck disable=SC2016
-        flock /tmp/arle-toolchain.lock bash -c 'toolchain_dir="${ARLE_RUST_TOOLCHAIN_DIR:-/root/.rustup/toolchains/1.95.0-x86_64-unknown-linux-gnu}"; [ -x "$toolchain_dir/bin/rustc" ] && ls "$toolchain_dir"/lib/rustlib/*/lib/libstd-*.rlib >/dev/null 2>&1 || rustup toolchain install 1.95.0 --profile minimal -c rustfmt -c clippy'
+        flock /tmp/arle-toolchain.lock bash -c 'toolchain_dir="${ARLE_RUST_TOOLCHAIN_DIR:-/root/.rustup/toolchains/1.98.0-x86_64-unknown-linux-gnu}"; [ -x "$toolchain_dir/bin/rustc" ] && ls "$toolchain_dir"/lib/rustlib/*/lib/libstd-*.rlib >/dev/null 2>&1 || rustup toolchain install 1.98.0 --profile minimal -c rustfmt -c clippy'
         events="$DIR/cargo.jsonl"
         export ARLE_CARGO_WORKSPACE_ROOT="$TREE"
         python3 - "$DIR/argv.nul" "$events" <<'PY'

@@ -769,13 +769,17 @@ impl Shards {
                 safetensors::Dtype::BF16 => autograd::safetensors_io::bf16_bytes_to_f32(t.data()),
                 safetensors::Dtype::F16 => t
                     .data()
-                    .chunks_exact(2)
-                    .map(|b| half::f16::from_le_bytes([b[0], b[1]]).to_f32())
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|b| half::f16::from_le_bytes(*b).to_f32())
                     .collect(),
                 safetensors::Dtype::F32 => t
                     .data()
-                    .chunks_exact(4)
-                    .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|b| f32::from_le_bytes(*b))
                     .collect(),
                 d => bail!("{name}: unsupported dtype {d:?}"),
             };

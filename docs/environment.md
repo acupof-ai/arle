@@ -34,7 +34,7 @@ workers see them; train flags apply via `train::apply_runtime_flags`):
 | --- | --- |
 | `ARLE_QWEN35_GDR_CHUNKED` | `arle serve --qwen35-gdr-chunked` |
 | `INFER_CUDA_DECODE_GRAPH` | removed with the dense Qwen3 CUDA path |
-| `INFER_DECODE_METADATA_FAST_PAGE16` | `arle serve --decode-metadata-fast-page16` |
+| `INFER_DECODE_METADATA_FAST_PAGE16` | removed with the tilelang metadata module |
 | `ARLE_CUDA_MEMPOOL_RETAIN` | `arle serve --cuda-mempool-retain` |
 | `ARLE_CUDA_SHARD_CACHE_BYTES` | `arle serve --shard-cache-bytes` |
 | `ARLE_NUMA_PIN` | `arle serve --numa-pin` |

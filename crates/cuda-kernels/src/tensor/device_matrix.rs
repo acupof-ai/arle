@@ -1783,7 +1783,7 @@ impl DeviceMatrix {
                 sperm[base + out] = sflat[base + (out % 8) * 8 + (out / 8)];
             }
         }
-        for quad in sperm.chunks_exact_mut(4) {
+        for quad in sperm.as_chunks_mut::<4>().0 {
             quad.swap(1, 2);
         }
         // The S0E5M3 field only spans exponents whose MSB is set, i.e. scale*2^7

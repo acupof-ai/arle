@@ -260,13 +260,17 @@ fn tensor_view_to_f32(view: &safetensors::tensor::TensorView<'_>) -> Result<Vec<
     let data = view.data();
     match view.dtype() {
         Dtype::F32 => Ok(data
-            .chunks_exact(4)
-            .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|chunk| f32::from_le_bytes(*chunk))
             .collect()),
         Dtype::BF16 => Ok(bf16_bytes_to_f32(data)),
         Dtype::F16 => Ok(data
-            .chunks_exact(2)
-            .map(|chunk| half::f16::from_le_bytes([chunk[0], chunk[1]]).to_f32())
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|chunk| half::f16::from_le_bytes(*chunk).to_f32())
             .collect()),
         dtype => Err(tape_invariant(format!("unsupported dtype: {dtype}"))),
     }

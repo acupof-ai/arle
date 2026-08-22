@@ -332,8 +332,10 @@ mod nccl_backend {
             }
 
             let send_words: Vec<i32> = input
-                .chunks_exact(4)
-                .map(|chunk| i32::from_ne_bytes(chunk.try_into().expect("4-byte chunk")))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|chunk| i32::from_ne_bytes(*chunk))
                 .collect();
             let per_rank_words = send_words.len();
             let send = ctx.stream.clone_htod(&send_words)?;

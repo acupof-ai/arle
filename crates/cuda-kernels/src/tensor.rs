@@ -33,8 +33,10 @@ pub(super) fn bf16_safetensor_host_slice(data: &[u8]) -> Result<Cow<'_, [bf16]>>
         return Ok(Cow::Borrowed(aligned));
     }
     Ok(Cow::Owned(
-        data.chunks_exact(2)
-            .map(|c| bf16::from_le_bytes([c[0], c[1]]))
+        data.as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| bf16::from_le_bytes(*c))
             .collect(),
     ))
 }
