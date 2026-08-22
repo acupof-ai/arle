@@ -449,6 +449,13 @@ impl DeviceContext {
         self.ctx
             .bind_to_thread()
             .map_err(|e| anyhow!("Bind CUDA context before pipeline fence record failed: {e}"))?;
+        // cuEventQuery is illegal (and invalidates the capture) while the
+        // stream is capturing; allocate fresh and skip the pool probe.
+        let stream = self.pipeline_stream(producer);
+        // SAFETY: the pipeline stream handle is valid for this context.
+        let capturing = unsafe { cudarc::driver::result::stream::is_capturing(stream.cu_stream()) }
+            .map(|s| s != cudarc::driver::sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE)
+            .unwrap_or(false);
         let event = {
             let mut pool = self.event_pool.lock().unwrap();
             // Find a completed event to re-use. cuEventQuery on an in-flight
@@ -456,21 +463,20 @@ impl DeviceContext {
             // pool allocates fresh; the pool grows to the max in-flight count
             // and stays there.
             let mut ready = None;
-            for (i, e) in pool.iter().enumerate() {
-                // SAFETY: the pooled event handle is valid for this context.
-                match unsafe { cudarc::driver::result::event::query(e.cu_event()) } {
-                    Ok(()) => {
-                        ready = Some(i);
-                        break;
-                    }
-                    Err(err) if err.0 == cudarc::driver::sys::CUresult::CUDA_ERROR_NOT_READY => {
-                        continue;
-                    }
-                    Err(err) => {
-                        return Err(anyhow!(
-                            "CUDA event query in pool failed: {err} (producer={producer:?})\n{}",
-                            std::backtrace::Backtrace::force_capture()
-                        ))
+            if !capturing {
+                for (i, e) in pool.iter().enumerate() {
+                    // SAFETY: the pooled event handle is valid for this context.
+                    match unsafe { cudarc::driver::result::event::query(e.cu_event()) } {
+                        Ok(()) => {
+                            ready = Some(i);
+                            break;
+                        }
+                        Err(err)
+                            if err.0 == cudarc::driver::sys::CUresult::CUDA_ERROR_NOT_READY =>
+                        {
+                            continue;
+                        }
+                        Err(err) => return Err(anyhow!("CUDA event query in pool failed: {err}")),
                     }
                 }
             }
@@ -483,7 +489,7 @@ impl DeviceContext {
             }
         };
         event
-            .record(self.pipeline_stream(producer))
+            .record(stream)
             .map_err(|e| anyhow!("Record CUDA pipeline fence on {producer:?} failed: {e}"))?;
         Ok(CudaPipelineFence {
             device_ordinal: self.ordinal,
