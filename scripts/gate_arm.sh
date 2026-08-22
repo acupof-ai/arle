@@ -20,6 +20,9 @@ export NEEDLE_MAX_TOKENS=32
 export RUST_LOG=info
 export OUT="needle_gate_${LABEL}.log"
 [ -z "$BASELINE" ] || export BASELINE_LOG="$BASELINE"
+# Empty BASELINE is the seed arm: its log becomes the baseline later arms
+# compare against, so the no-baseline guard must allow it.
+[ -z "$BASELINE" ] && export LEVER_GATE_ALLOW_NO_BASELINE=1
 echo "=== arm $LABEL cp=$CP lengths=$LENGTHS port=$PORT start $(date -u +%FT%TZ) ==="
 bash /host/arle-build/scripts/lever_gate.sh "$LABEL"
 rc=$?

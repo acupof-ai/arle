@@ -71,10 +71,10 @@ fn main() {
     let stamp = toolchain_stamp();
     let stamp_file = out_dir.join("toolchain.stamp");
     let prev_stamp = fs::read_to_string(&stamp_file).unwrap_or_default();
-    if !prev_stamp.is_empty() && prev_stamp != stamp {
-        let _ = fs::remove_dir_all(out_dir.join("build"));
-    }
     if prev_stamp != stamp {
+        if !prev_stamp.is_empty() {
+            let _ = fs::remove_dir_all(out_dir.join("build"));
+        }
         let _ = fs::write(&stamp_file, &stamp);
     }
     let mut cmake_cfg = cmake::Config::new(&mlx_vendor_dir);
@@ -230,16 +230,25 @@ fn main() {
     println!("cargo:rerun-if-env-changed=DEVELOPER_DIR");
     // mtime of the Metal compiler changes on a CommandLineTools/Xcode update,
     // which is what makes build.rs re-run to compare the toolchain stamp.
-    if let Ok(output) = Command::new("xcrun").args(["-f", "metal"]).output()
-        && output.status.success()
-    {
-        let path = String::from_utf8_lossy(&output.stdout);
-        let path = path.trim();
-        if !path.is_empty() {
-            println!("cargo:rerun-if-changed={path}");
-        }
+    if let Some(path) = command_stdout("xcrun", &["-f", "metal"]) {
+        println!("cargo:rerun-if-changed={path}");
     }
-    println!("cargo:rerun-if-changed=/System/Library/Frameworks/Metal.framework/Metal");
+    // Stamp components need matching triggers, or a clang/macOS update that
+    // leaves the metal binary untouched never re-runs build.rs to compare.
+    if let Some(path) = command_stdout("xcrun", &["-f", "clang"]) {
+        println!("cargo:rerun-if-changed={path}");
+    }
+    println!("cargo:rerun-if-changed=/System/Library/CoreServices/SystemVersion.plist");
+}
+
+fn command_stdout(cmd: &str, args: &[&str]) -> Option<String> {
+    let output = Command::new(cmd).args(args).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout = stdout.trim();
+    (!stdout.is_empty()).then(|| stdout.to_string())
 }
 
 /// Toolchain identity for the stale-metallib guard: the Metal compiler path,
@@ -252,10 +261,8 @@ fn toolchain_stamp() -> String {
         ("clang", &["--version"][..]),
         ("sw_vers", &["-productVersion"][..]),
     ] {
-        if let Ok(output) = Command::new(cmd).args(args).output()
-            && output.status.success()
-        {
-            stamp.push_str(&String::from_utf8_lossy(&output.stdout));
+        if let Some(stdout) = command_stdout(cmd, args) {
+            stamp.push_str(&stdout);
         }
     }
     stamp

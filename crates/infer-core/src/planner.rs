@@ -475,7 +475,6 @@ mod tests {
     use infer_plan::SamplingParams;
     use infer_seam::{
         BackendExecutor, HostPagedKvPool, KvAllocator, KvPool, KvQuery, KvSlotTier, PollResult,
-        StepLimits,
     };
 
     #[derive(Default)]
@@ -521,10 +520,6 @@ mod tests {
             _inflight: Self::Inflight,
         ) -> anyhow::Result<PollResult<Self::Inflight>> {
             unreachable!("planner tests never submit work")
-        }
-
-        fn step_limits(&self) -> StepLimits {
-            StepLimits::default()
         }
 
         fn kv_slot_tier(&mut self) -> Option<&mut dyn KvSlotTier> {

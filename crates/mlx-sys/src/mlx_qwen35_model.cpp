@@ -41,51 +41,40 @@ int parse_env_int(const char* name, int fallback) {
     return value;
 }
 
+bool parse_env_bool(const char* name, bool fallback) {
+    const char* env = std::getenv(name);
+    return env ? std::string(env) != "0" : fallback;
+}
+
 bool use_gdr_metal_kernel() {
-    static const bool enabled = [] {
-        const char* env = std::getenv("AGENT_INFER_GDR_METAL_KERNEL");
-        return !(env && std::string(env) == "0");
-    }();
+    static const bool enabled = parse_env_bool("AGENT_INFER_GDR_METAL_KERNEL", true);
     return enabled;
 }
 
 bool keep_prefill_intermediates() {
-    static const bool enabled = [] {
-        const char* env = std::getenv("AGENT_INFER_QWEN35_CPP_KEEP_PREFILL_INTERMEDIATES");
-        return env && std::string(env) != "0";
-    }();
+    static const bool enabled =
+        parse_env_bool("AGENT_INFER_QWEN35_CPP_KEEP_PREFILL_INTERMEDIATES", false);
     return enabled;
 }
 
 bool use_qwen35_cpp_prefill_last_logits_only() {
-    static const bool enabled = [] {
-        const char* env = std::getenv("AGENT_INFER_QWEN35_CPP_PREFILL_LAST_LOGITS_ONLY");
-        return !(env && std::string(env) == "0");
-    }();
+    static const bool enabled =
+        parse_env_bool("AGENT_INFER_QWEN35_CPP_PREFILL_LAST_LOGITS_ONLY", true);
     return enabled;
 }
 
 bool use_qwen35_cpp_separate_mlp() {
-    static const bool enabled = [] {
-        const char* env = std::getenv("AGENT_INFER_QWEN35_CPP_SEPARATE_MLP");
-        return env && std::string(env) != "0";
-    }();
+    static const bool enabled = parse_env_bool("AGENT_INFER_QWEN35_CPP_SEPARATE_MLP", false);
     return enabled;
 }
 
 bool use_qwen35_cpp_prefill_gbeta_helper() {
-    static const bool enabled = [] {
-        const char* env = std::getenv("AGENT_INFER_QWEN35_CPP_PREFILL_GBETA_HELPER");
-        return !(env && std::string(env) == "0");
-    }();
+    static const bool enabled = parse_env_bool("AGENT_INFER_QWEN35_CPP_PREFILL_GBETA_HELPER", true);
     return enabled;
 }
 
 bool use_qwen35_cpp_qk_norm_helper() {
-    static const bool enabled = [] {
-        const char* env = std::getenv("AGENT_INFER_QWEN35_CPP_QK_NORM_HELPER");
-        return env && std::string(env) != "0";
-    }();
+    static const bool enabled = parse_env_bool("AGENT_INFER_QWEN35_CPP_QK_NORM_HELPER", false);
     return enabled;
 }
 
@@ -111,11 +100,12 @@ array suppress_last_axis_token(const array& logits, int32_t suppress_token_id) {
 }
 
 int qwen35_cpp_gdr_threadgroup_y(int seq_len) {
-    int fallback = parse_env_int("AGENT_INFER_QWEN35_CPP_GDR_TG_Y", 4);
-    if (seq_len > 1) {
-        return parse_env_int("AGENT_INFER_QWEN35_CPP_PREFILL_GDR_TG_Y", fallback);
-    }
-    return parse_env_int("AGENT_INFER_QWEN35_CPP_DECODE_GDR_TG_Y", fallback);
+    static const int tg_y = parse_env_int("AGENT_INFER_QWEN35_CPP_GDR_TG_Y", 4);
+    static const int prefill_tg_y =
+        parse_env_int("AGENT_INFER_QWEN35_CPP_PREFILL_GDR_TG_Y", tg_y);
+    static const int decode_tg_y =
+        parse_env_int("AGENT_INFER_QWEN35_CPP_DECODE_GDR_TG_Y", tg_y);
+    return seq_len > 1 ? prefill_tg_y : decode_tg_y;
 }
 
 auto& gated_delta_kernel() {
