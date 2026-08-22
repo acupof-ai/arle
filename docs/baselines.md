@@ -199,7 +199,7 @@ deterministic at every length.
   carries ~4.7 s teardown, inflating TPOT ~1.85×). Cold = session turn 0,
   warm = turns 1–7.
 
-**`--qwen35-decode-graph` is DEFAULT-ON and working** (2026-08-03, `cb6b3389d`):
+**The whole-step decode graph is DEFAULT-ON and working** (2026-08-03, `cb6b3389d`):
 the paged-KV early return that made it a no-op was removed, and the graph now
 captures the serving default. 35B c=1 TPOT 16.22 → 6.70 ms (−58.7%); see the
 35B SOTA row below. The earlier no-op diagnosis is at
@@ -491,7 +491,7 @@ sm_90 has no FP4 tensor core, so a real GEMM must widen the nibbles first and th
 only question is what to widen *to*. Widening to E4M3 instead of BF16 doubles the
 ceiling.
 
-Per-op, `ARLE_QWEN35_QUANT_PROFILE`, three 14K-token prefills, ms/call:
+Per-op, `ARLE_QWEN35_PROFILE`, three 14K-token prefills, ms/call:
 
 | op | first shipped | tables out | vectorised |
 |---|---:|---:|---:|

@@ -8,6 +8,7 @@ detail in the linked wins/errors entry. Oldest sections are condensed.
 
 ## [Unreleased]
 
+- **Flag deletion wave 2 — accepted: `--qwen35-fa3`/`--qwen35-deepgemm`/`--qwen35-moe-decode-kernel` deleted (off-arms 2.76×/15.4×/10.8× worse), Metal warmup seam default fixed to match shipped false, 12 stale doc refs cleaned** (`5b880f2f8`). See `docs/experience/wins/2026-08-22-flag-deletion-wave2.md`.
 - **FIX: decode graph was hardcoded OFF by the flag-deletion wave (`1864ddac5`) — serve mapping now hardcodes on (the off-arm costs −58.7 % TPOT); caught by the SOTA-defaults audit.** See `docs/experience/errors/2026-08-22-decode-graph-hardcoded-off-in-flag-deletion.md`.
 - Gate the shared NVFP4 base against `marlin_fp4_gemm` rather than the group layout: the repack flushes lifted values under 2.0 to zero, so the two layouts only agree on inputs that avoid that step. Kernel verified correct under the new oracle; see `docs/experience/errors/2026-08-22-marlin-fp4-parity-wrong-oracle.md`.
 - **`--dsv4-moe-transport` promoted from `ARLE_DSV4_MOE_TRANSPORT` env** (`cfcc5d4d9`) — the `--deepep-*` flags were inert without it; flag wins, env stays as fallback. Closes the codex P2.

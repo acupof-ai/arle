@@ -32,14 +32,8 @@ workers see them; train flags apply via `train::apply_runtime_flags`):
 
 | Removed env var | Flag |
 | --- | --- |
-| `ARLE_QWEN35_DECODE_GRAPH` | `arle serve --qwen35-decode-graph` |
-| `ARLE_QWEN35_BATCHED_DECODE` | `arle serve --qwen35-batched-decode` |
-| `ARLE_QWEN35_DEEPGEMM` | `arle serve --qwen35-deepgemm` |
-| `ARLE_QWEN35_MOE_DECODE_KERNEL` | `arle serve --qwen35-moe-decode-kernel` |
-| `ARLE_QWEN35_GPU_ROUTER` | `arle serve --qwen35-gpu-router` |
-| `ARLE_QWEN35_FA3` / `_FA3_DECODE_SPLITS` | `arle serve --qwen35-fa3` / `--qwen35-fa3-decode-splits` |
 | `ARLE_QWEN35_GDR_CHUNKED` | `arle serve --qwen35-gdr-chunked` |
-| `INFER_CUDA_DECODE_GRAPH` | removed with the dense Qwen3 CUDA path; Qwen3.5/3.6 use `--qwen35-decode-graph`, DSv4 `ARLE_DSV4_*` |
+| `INFER_CUDA_DECODE_GRAPH` | removed with the dense Qwen3 CUDA path |
 | `INFER_DECODE_METADATA_FAST_PAGE16` | `arle serve --decode-metadata-fast-page16` |
 | `ARLE_CUDA_MEMPOOL_RETAIN` | `arle serve --cuda-mempool-retain` |
 | `ARLE_CUDA_SHARD_CACHE_BYTES` | `arle serve --shard-cache-bytes` |
@@ -50,7 +44,7 @@ workers see them; train flags apply via `train::apply_runtime_flags`):
 | `ARLE_DSV4_MTP_ADAPTIVE` / `ARLE_DSV4_MTP_MIN_ACCEPT` | `arle serve --mtp-adaptive` / `--mtp-min-accept` |
 | `ARLE_DSV4_DEEPEP_NUM_SMS` | `arle serve --deepep-num-sms` |
 | `ARLE_DSV4_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK` | `arle serve --deepep-max-dispatch-tokens-per-rank` (SGLANG env still honored when unset) |
-| `INFER_METAL_PIPELINE` / `_WARMUP` / `_PAGED_KV_READ` / `_HOST_SAMPLING` | `arle serve --metal-pipeline` / `--metal-warmup` / `--metal-paged-kv-read` / `--metal-host-sampling` |
+| `INFER_METAL_WARMUP` / `_HOST_SAMPLING` | `arle serve --metal-warmup` / `--metal-host-sampling` |
 | `INFER_METAL_NO_SPECULATIVE` / `_DFLASH_DRAFT_MODEL` / `_DFLASH_TOKENS` / `_DFLASH_ACCEPT_TOPK` | `arle serve --no-speculative` / `--draft-model` / `--speculative-tokens` / `--spec-accept-topk` (env transport removed; flags ride `EngineLoadConfig.metal`) |
 | `DFLASH_DRAFT_MASK` | removed (rewrite path is mask=none only) |
 | `ARLE_DIFFUSION_MAX_DENOISING_STEPS` | `arle serve --diffusion-max-denoising-steps` |
@@ -294,7 +288,7 @@ a model path explicitly wires the corresponding collectives.
 |---|---|---|---|
 | `INFER_CUDA_DEVICE` | yes, by `DeviceContext::new()` | one CUDA ordinal, default `0` | Binds the single process to one GPU. Parse failure is a hard error. |
 | `INFER_CUDA_DEVICES` | yes, by distributed CUDA worker bootstrap | comma-separated ordinals such as `0,1,2,3`; unique, non-empty | Maps local rank threads to CUDA devices for distributed serving. |
-| `INFER_TP_SIZE` | yes for DSv4 / staged for other CUDA models | integer `>= 1`; default `1` | Tensor-parallel axis size. DSv4 also accepts `ARLE_TP_SIZE`; unset DSv4 HTTP runs use the worker world size. |
+| `INFER_TP_SIZE` | yes for DSv4 / staged for other CUDA models | integer `>= 1`; default `1` | Tensor-parallel axis size. Unset DSv4 HTTP runs use the worker world size. |
 | `INFER_PP_SIZE` | yes for DSv4 diagnostics / staged for execution | integer `>= 1`; default `1` | Parsed into the DSv4 multi-axis contract. Non-`1` is fail-closed until PP execution is wired. |
 | `INFER_EP_SIZE` | yes for DSv4 / staged for other CUDA models | integer `>= 1`; default `1` | Expert-parallel axis size. DSv4 also accepts `ARLE_EP_SIZE`; unset DSv4 HTTP runs use the worker world size. |
 | `INFER_ATTN_DP_SIZE` | yes for DSv4 diagnostics / staged for execution | integer `>= 1`; default `1` | Parsed into the DSv4 SGLang-path contract. Non-`1` is fail-closed until attention-DP communicators and token ownership are wired. |
