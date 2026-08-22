@@ -8,6 +8,7 @@ detail in the linked wins/errors entry. Oldest sections are condensed.
 
 ## [Unreleased]
 
+- **FIX: decode graph was hardcoded OFF by the flag-deletion wave (`1864ddac5`) — serve mapping now hardcodes on (the off-arm costs −58.7 % TPOT); caught by the SOTA-defaults audit.** See `docs/experience/errors/2026-08-22-decode-graph-hardcoded-off-in-flag-deletion.md`.
 - Gate the shared NVFP4 base against `marlin_fp4_gemm` rather than the group layout: the repack flushes lifted values under 2.0 to zero, so the two layouts only agree on inputs that avoid that step. Kernel verified correct under the new oracle; see `docs/experience/errors/2026-08-22-marlin-fp4-parity-wrong-oracle.md`.
 - **`--dsv4-moe-transport` promoted from `ARLE_DSV4_MOE_TRANSPORT` env** (`cfcc5d4d9`) — the `--deepep-*` flags were inert without it; flag wins, env stays as fallback. Closes the codex P2.
 - **Flag deletion wave — accepted: 10 proven A/B flags deleted (qwen35-decode-graph/-batched-decode/-gpu-router/-fa3-decode-splits, max-num-batched-tokens, dsv4-decode-reuse, metal-pipeline/-paged-kv-read, pool-model, extra_args), `--comm-backend` default reverted Auto→Nccl (unlicensed flip in `84c60dee5`; one-shot 51–53 vs NCCL 70–80), 5 env aliases merged, runtime-flags statics fixed** (`1864ddac5`). See `docs/experience/wins/2026-08-22-flag-deletion-wave.md`.
