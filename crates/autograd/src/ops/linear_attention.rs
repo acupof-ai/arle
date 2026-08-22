@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     sync::{
         LazyLock, Mutex,
         atomic::{AtomicU64, Ordering},
@@ -16,6 +16,7 @@ use crate::{
         LinearAttentionDeviceForwardArgs, LinearAttentionDeviceParams,
         LinearAttentionScanBackwardArgs, LinearAttentionScanBackwardParams,
     },
+    ops::chunk_accum::{ChunkSum, SeqAccum},
     tape::{BackwardOp, GradPairs, SavedContext, Tape, TapeEntry},
     tensor::{Tensor, TensorId, TensorStore},
 };
@@ -355,7 +356,7 @@ pub const CORE_CHUNK: usize = 8192;
 /// and `2N-1-r` as two equal local blocks, so the walk visits chunks 0..2N in
 /// order; a block's predecessor is either the previous local block or a peer
 /// rank, whose (final_state, conv window) arrive through the taped
-/// `cp_recv`/`cp_send_attach` pair that returns their gradients the same way.
+/// chunked CP op, which returns their gradients the same way.
 /// Per-rank transient is O(local seq) — this is what lets the global sequence
 /// grow past what one rank's memory could hold under the former all-to-all
 /// form, at the price of serializing the recurrence across ranks.
@@ -392,142 +393,424 @@ pub fn linear_attention_core_cp(
             tape,
         );
     }
-    let n = cp_size;
-    let local_seq = params.seq_len;
-    if !local_seq.is_multiple_of(2) {
+    let geo = CpChunkGeometry::new(params, cp_size, cp_rank)?;
+    let inputs = [
+        qkv,
+        z,
+        b_proj,
+        a_proj,
+        conv1d_weight,
+        dt_bias,
+        a_log,
+        norm_weight,
+    ];
+    let requires_grad = store.any_requires_grad(&inputs);
+    let outer_enabled = tape.enabled;
+    let live_before = store.live_ids().into_iter().collect::<HashSet<_>>();
+    tape.enabled = false;
+    let forward = cp_chunked_forward(&inputs, &geo, outer_enabled && requires_grad, store, tape);
+    tape.enabled = outer_enabled;
+    let (output_id, chunk_inits) = match forward {
+        Ok(v) => v,
+        Err(err) => {
+            let _ = store.free_new_except(&live_before, &HashSet::new());
+            return Err(err);
+        }
+    };
+    let mut keep = HashSet::from([output_id]);
+    keep.extend(chunk_inits.iter().flatten().flatten().copied());
+    store.free_new_except(&live_before, &keep)?;
+    store.set_requires_grad(output_id, requires_grad)?;
+    if outer_enabled && requires_grad {
+        TapeEntry {
+            op: BackwardOp::LinearAttentionCpChunked,
+            output_id,
+            input_ids: inputs.iter().copied().collect(),
+            saved: SavedContext::LinearAttentionCpChunkedCtx {
+                params,
+                cp_size,
+                cp_rank,
+                chunk_inits,
+            },
+        }
+        .record(store, tape)?;
+    }
+    Ok(output_id)
+}
+
+/// Zigzag block → CORE_CHUNK sub-chunks on this rank, in global order.
+struct CpChunkGeometry {
+    n: usize,
+    rank: usize,
+    rows_per: usize,
+    per_block: usize,
+    half: usize,
+    batch: usize,
+    qkv_dim: usize,
+    v_dim: usize,
+    window: usize,
+    state_shape: [usize; 4],
+    chunk_params: LinearAttentionParams,
+}
+
+/// One sub-chunk: rows `[r0, r1)` of this rank's shard; `recv_from` / `send_to`
+/// name the peer holding the neighbouring global chunk, `None` for a local carry.
+struct CpChunk {
+    r0: usize,
+    r1: usize,
+    first: bool,
+    recv_from: Option<usize>,
+    send_to: Option<usize>,
+}
+
+impl CpChunkGeometry {
+    fn new(params: LinearAttentionParams, n: usize, rank: usize) -> Result<Self> {
+        let local_seq = params.seq_len;
+        if !local_seq.is_multiple_of(2) {
+            return Err(AutogradError::TapeInvariant(
+                "linear_attention_core_cp: zigzag shard needs an even local seq",
+            ));
+        }
+        let half = local_seq / 2;
+        let (q_dim, v_dim) = (
+            params.num_key_heads * params.key_dim,
+            params.num_value_heads * params.value_dim,
+        );
+        // Sub-chunk each zigzag block so a chunk's replay transient is bounded by
+        // CORE_CHUNK rows, independent of the global sequence.
+        let rows_per = if half <= CORE_CHUNK || !half.is_multiple_of(CORE_CHUNK) {
+            half
+        } else {
+            CORE_CHUNK
+        };
+        Ok(Self {
+            n,
+            rank,
+            rows_per,
+            per_block: half / rows_per,
+            half,
+            batch: params.batch,
+            qkv_dim: 2 * q_dim + v_dim,
+            v_dim,
+            window: params.conv_kernel - 1,
+            state_shape: [
+                params.batch,
+                params.num_value_heads,
+                params.key_dim,
+                params.value_dim,
+            ],
+            chunk_params: LinearAttentionParams {
+                seq_len: rows_per,
+                ..params
+            },
+        })
+    }
+
+    fn owner(&self, chunk: usize) -> usize {
+        if chunk < self.n {
+            chunk
+        } else {
+            2 * self.n - 1 - chunk
+        }
+    }
+
+    fn chunks(&self) -> Vec<CpChunk> {
+        let mut out = Vec::with_capacity(2 * self.per_block);
+        for chunk in 0..2 * self.n {
+            if self.owner(chunk) != self.rank {
+                continue;
+            }
+            let block = usize::from(chunk >= self.n);
+            for sub in 0..self.per_block {
+                let r0 = block * self.half + sub * self.rows_per;
+                let first = chunk == 0 && sub == 0;
+                let recv_from = (sub == 0 && chunk > 0)
+                    .then(|| self.owner(chunk - 1))
+                    .filter(|&p| p != self.rank);
+                let send_to = (sub + 1 == self.per_block && chunk + 1 < 2 * self.n)
+                    .then(|| self.owner(chunk + 1))
+                    .filter(|&p| p != self.rank);
+                out.push(CpChunk {
+                    r0,
+                    r1: r0 + self.rows_per,
+                    first,
+                    recv_from,
+                    send_to,
+                });
+            }
+        }
+        out
+    }
+
+    fn window_shape(&self) -> [usize; 3] {
+        [self.batch, self.window, self.qkv_dim]
+    }
+
+    fn rows(
+        &self,
+        x: TensorId,
+        c: &CpChunk,
+        store: &mut TensorStore,
+        tape: &mut Tape,
+    ) -> Result<TensorId> {
+        let width = *store.tensor(x)?.shape.last().unwrap_or(&0);
+        crate::ops::slice(x, &[0, c.r0, 0], &[self.batch, c.r1, width], store, tape)
+    }
+}
+
+fn cp_recv_raw(shape: &[usize], peer: usize, store: &mut TensorStore) -> Result<TensorId> {
+    let handle = store
+        .backend()
+        .cp_recv_device(shape.iter().product(), peer)?;
+    store.alloc_device_tensor(shape.to_vec(), handle)
+}
+
+fn cp_send_raw(id: TensorId, peer: usize, store: &mut TensorStore) -> Result<()> {
+    store.ensure_device(id)?;
+    let len = store.tensor(id)?.shape.iter().product();
+    let handle = store.device_handle(id)?;
+    store.backend().cp_send_device(&handle, len, peer)
+}
+
+/// Untaped chunk loop: rows land in one accumulator, the carry crosses ranks by
+/// raw p2p. With `keep_inits` each chunk's initial (state, window) is kept so the
+/// backward replays chunks without re-receiving.
+fn cp_chunked_forward(
+    inputs: &[TensorId; 8],
+    geo: &CpChunkGeometry,
+    keep_inits: bool,
+    store: &mut TensorStore,
+    tape: &mut Tape,
+) -> Result<(TensorId, Vec<[Option<TensorId>; 2]>)> {
+    let [
+        qkv,
+        z,
+        b_proj,
+        a_proj,
+        conv1d_weight,
+        dt_bias,
+        a_log,
+        norm_weight,
+    ] = *inputs;
+    let live_before = store.live_ids().into_iter().collect::<HashSet<_>>();
+    let mut out = SeqAccum::new(vec![geo.batch, 2 * geo.half, geo.v_dim], 1, store)?;
+    let mut inits: Vec<[Option<TensorId>; 2]> = Vec::new();
+    let mut carry: Option<[TensorId; 2]> = None;
+    for c in geo.chunks() {
+        let init = if c.first {
+            [None, None]
+        } else if let Some(from) = c.recv_from {
+            [
+                Some(cp_recv_raw(&geo.state_shape, from, store)?),
+                Some(cp_recv_raw(&geo.window_shape(), from, store)?),
+            ]
+        } else {
+            let [s, w] = carry.take().ok_or(AutogradError::TapeInvariant(
+                "linear_attention_core_cp: missing local carry",
+            ))?;
+            [Some(s), Some(w)]
+        };
+        let qkv_c = geo.rows(qkv, &c, store, tape)?;
+        let (o, final_state) = linear_attention_core_carry(
+            qkv_c,
+            geo.rows(z, &c, store, tape)?,
+            geo.rows(b_proj, &c, store, tape)?,
+            geo.rows(a_proj, &c, store, tape)?,
+            conv1d_weight,
+            dt_bias,
+            a_log,
+            norm_weight,
+            geo.chunk_params,
+            init[0],
+            init[1],
+            store,
+            tape,
+        )?;
+        out.write_rows(c.r0, o, store)?;
+        let conv_window = crate::ops::slice(
+            qkv_c,
+            &[0, geo.rows_per - geo.window, 0],
+            &[geo.batch, geo.rows_per, geo.qkv_dim],
+            store,
+            tape,
+        )?;
+        if let Some(peer) = c.send_to {
+            cp_send_raw(final_state, peer, store)?;
+            cp_send_raw(conv_window, peer, store)?;
+        }
+        carry = Some([final_state, conv_window]);
+        if keep_inits {
+            inits.push(init);
+        }
+        let mut keep = HashSet::from([out.id()]);
+        keep.extend(inits.iter().flatten().flatten().copied());
+        keep.extend(carry.iter().flatten().copied());
+        store.free_new_except(&live_before, &keep)?;
+    }
+    Ok((out.finish(), inits))
+}
+
+/// Reverse-chunk replay. d_state flows chunk to chunk; across ranks it is sent
+/// to the previous chunk's owner after that chunk's backward and received from
+/// the next chunk's owner before it — the forward chain in reverse, so every
+/// p2p pair matches in order.
+pub(crate) fn linear_attention_cp_chunked_backward(
+    entry: &TapeEntry,
+    output_grad_id: TensorId,
+    store: &mut TensorStore,
+) -> Result<GradPairs> {
+    let SavedContext::LinearAttentionCpChunkedCtx {
+        params,
+        cp_size,
+        cp_rank,
+        chunk_inits,
+    } = &entry.saved
+    else {
         return Err(AutogradError::TapeInvariant(
-            "linear_attention_core_cp: zigzag shard needs an even local seq",
+            "linear_attention_cp_chunked backward missing saved context",
+        ));
+    };
+    let geo = CpChunkGeometry::new(*params, *cp_size, *cp_rank)?;
+    let inputs: [TensorId; 8] = entry.input_ids.as_slice().try_into().map_err(|_| {
+        AutogradError::TapeInvariant("linear_attention_cp_chunked backward expects 8 inputs")
+    })?;
+    let chunks = geo.chunks();
+    if chunk_inits.len() != chunks.len() {
+        return Err(AutogradError::TapeInvariant(
+            "linear_attention_cp_chunked backward: chunk count drifted",
         ));
     }
-    let half = local_seq / 2;
-    let batch = params.batch;
-    let (q_dim, v_dim) = (
-        params.num_key_heads * params.key_dim,
-        params.num_value_heads * params.value_dim,
-    );
-    let qkv_dim = 2 * q_dim + v_dim;
-    let window = params.conv_kernel - 1;
-    let state_shape = [
-        batch,
-        params.num_value_heads,
-        params.key_dim,
-        params.value_dim,
-    ];
-    let window_shape = [batch, window, qkv_dim];
-    let owner = |chunk: usize| if chunk < n { chunk } else { 2 * n - 1 - chunk };
-    // Sub-chunk each zigzag block so a chunk's replay transient is bounded by
-    // CORE_CHUNK rows, independent of the global sequence.
-    let rows_per = if half <= CORE_CHUNK || !half.is_multiple_of(CORE_CHUNK) {
-        half
-    } else {
-        CORE_CHUNK
-    };
-    let per_block = half / rows_per;
-    let chunk_params = LinearAttentionParams {
-        seq_len: rows_per,
-        ..params
-    };
-    let packed_rows = rows_per + params.key_dim;
+    let needs: Vec<bool> = inputs
+        .iter()
+        .map(|&id| store.get(id).is_some_and(|t| t.requires_grad))
+        .collect();
+    // Row-sharded activations accumulate by rows; the shared params by sum.
+    let mut d_rows: Vec<Option<SeqAccum>> = Vec::with_capacity(4);
+    for (i, &id) in inputs[..4].iter().enumerate() {
+        d_rows.push(
+            needs[i]
+                .then(|| {
+                    let shape = store.tensor(id)?.shape.clone();
+                    SeqAccum::new(shape, 1, store)
+                })
+                .transpose()?,
+        );
+    }
+    let mut d_params: Vec<ChunkSum> = (0..4).map(|_| ChunkSum::new()).collect();
+    let mut d_carry: Option<[TensorId; 2]> = None;
 
-    let mut carry: Option<(TensorId, TensorId)> = None;
-    let mut outs: Vec<TensorId> = Vec::with_capacity(2 * per_block);
-    for chunk in 0..2 * n {
-        if owner(chunk) != cp_rank {
-            continue;
-        }
-        let block = usize::from(chunk >= n);
-        for sub in 0..per_block {
-            let r0 = block * half + sub * rows_per;
-            let r1 = r0 + rows_per;
-            let rows = |x: TensorId, width: usize, st: &mut TensorStore, tp: &mut Tape| {
-                crate::ops::slice(x, &[0, r0, 0], &[batch, r1, width], st, tp)
-            };
-            let qkv_c = rows(qkv, qkv_dim, store, tape)?;
-            let z_c = rows(z, v_dim, store, tape)?;
-            let b_c = rows(b_proj, params.num_value_heads, store, tape)?;
-            let a_c = rows(a_proj, params.num_value_heads, store, tape)?;
-
-            let (initial_state, initial_window) = if chunk == 0 && sub == 0 {
-                (None, None)
-            } else if sub > 0 || owner(chunk - 1) == cp_rank {
-                let (s, w) = carry.take().ok_or(AutogradError::TapeInvariant(
-                    "linear_attention_core_cp: missing local carry",
-                ))?;
-                (Some(s), Some(w))
+    for (c, init) in chunks.iter().zip(chunk_inits).rev() {
+        let d_next: Option<[TensorId; 2]> = if let Some(peer) = c.send_to {
+            Some([
+                cp_recv_raw(&geo.state_shape, peer, store)?,
+                cp_recv_raw(&geo.window_shape(), peer, store)?,
+            ])
+        } else {
+            d_carry.take()
+        };
+        let live_before = store.live_ids().into_iter().collect::<HashSet<_>>();
+        let mut scratch = Tape::new();
+        scratch.set_enabled(false);
+        let mut chunk_inputs = Vec::with_capacity(10);
+        for (i, &id) in inputs.iter().enumerate() {
+            let leaf = if i < 4 {
+                store.ensure_checkpoint_device(id)?;
+                let x = geo.rows(id, c, store, &mut scratch)?;
+                store.set_requires_grad(x, needs[i])?;
+                x
             } else {
-                let from = owner(chunk - 1);
-                (
-                    Some(crate::ops::cp_recv(&state_shape, from, store, tape)?),
-                    Some(crate::ops::cp_recv(&window_shape, from, store, tape)?),
-                )
+                id
             };
-            let mut inputs = vec![
-                qkv_c,
-                z_c,
-                b_c,
-                a_c,
-                conv1d_weight,
-                dt_bias,
-                a_log,
-                norm_weight,
-            ];
-            inputs.extend(initial_state);
-            inputs.extend(initial_window);
-            // One checkpoint per chunk: the recurrence's saved activations exist
-            // only while that chunk's backward runs. final_state rides along as
-            // key_dim extra rows of the output (state elems == key_dim * v_dim).
-            let packed = crate::ops::checkpoint(inputs, store, tape, move |st, tp, inp| {
-                let (out, final_state) = linear_attention_core_carry(
-                    inp[0],
-                    inp[1],
-                    inp[2],
-                    inp[3],
-                    inp[4],
-                    inp[5],
-                    inp[6],
-                    inp[7],
-                    chunk_params,
-                    inp.get(8).copied(),
-                    inp.get(9).copied(),
-                    st,
-                    tp,
-                )?;
-                let state_rows =
-                    crate::ops::reshape(final_state, &[batch, params.key_dim, v_dim], st, tp)?;
-                crate::ops::cat(&[out, state_rows], 1, st, tp)
-            })?;
-            let out_c =
-                crate::ops::slice(packed, &[0, 0, 0], &[batch, rows_per, v_dim], store, tape)?;
-            let state_rows = crate::ops::slice(
-                packed,
-                &[0, rows_per, 0],
-                &[batch, packed_rows, v_dim],
-                store,
-                tape,
-            )?;
-            let final_state = crate::ops::reshape(state_rows, &state_shape, store, tape)?;
+            chunk_inputs.push(leaf);
+        }
+        for id in init.iter().flatten() {
+            store.set_requires_grad(*id, true)?;
+            chunk_inputs.push(*id);
+        }
+        let grad_c = geo.rows(output_grad_id, c, store, &mut scratch)?;
+
+        let mut chunk_tape = Tape::new();
+        let tp = &mut chunk_tape;
+        let (o, final_state) = linear_attention_core_carry(
+            chunk_inputs[0],
+            chunk_inputs[1],
+            chunk_inputs[2],
+            chunk_inputs[3],
+            chunk_inputs[4],
+            chunk_inputs[5],
+            chunk_inputs[6],
+            chunk_inputs[7],
+            geo.chunk_params,
+            init[0],
+            init[1],
+            store,
+            tp,
+        )?;
+        let mut loss = crate::ops::sum(crate::ops::mul(o, grad_c, store, tp)?, store, tp)?;
+        if let Some([d_state, d_window]) = d_next {
             let conv_window = crate::ops::slice(
-                qkv_c,
-                &[0, rows_per - window, 0],
-                &[batch, rows_per, qkv_dim],
+                chunk_inputs[0],
+                &[0, geo.rows_per - geo.window, 0],
+                &[geo.batch, geo.rows_per, geo.qkv_dim],
                 store,
-                tape,
+                tp,
             )?;
-            let last_sub = sub + 1 == per_block;
-            let send_to = (last_sub && chunk + 1 < 2 * n)
-                .then(|| owner(chunk + 1))
-                .filter(|&next| next != cp_rank);
-            let out_c = match send_to {
-                Some(peer) => {
-                    crate::ops::cp_send_attach(out_c, final_state, conv_window, peer, store, tape)?
+            for (x, g) in [(final_state, d_state), (conv_window, d_window)] {
+                let term = crate::ops::sum(crate::ops::mul(x, g, store, tp)?, store, tp)?;
+                loss = crate::ops::add(loss, term, store, tp)?;
+            }
+        }
+        let grads = chunk_tape.backward_collect_targets_only(loss, store, &chunk_inputs, None)?;
+
+        for (i, acc) in d_rows.iter_mut().enumerate() {
+            if let (Some(acc), Some(&g)) = (acc.as_mut(), grads.get(&chunk_inputs[i])) {
+                acc.write_rows(c.r0, g, store)?;
+            }
+        }
+        for (slot, &pid) in inputs[4..].iter().enumerate() {
+            if let Some(&g) = grads.get(&pid) {
+                d_params[slot].add(g, store)?;
+            }
+        }
+        let d_init = match init {
+            [Some(s), Some(w)] => match (grads.get(s), grads.get(w)) {
+                (Some(&ds), Some(&dw)) => Some([ds, dw]),
+                _ => {
+                    return Err(AutogradError::TapeInvariant(
+                        "linear_attention_cp_chunked backward: carry grads missing",
+                    ));
                 }
-                None => out_c,
-            };
-            outs.push(out_c);
-            carry = Some((final_state, conv_window));
+            },
+            _ => None,
+        };
+        if let (Some(peer), Some([ds, dw])) = (c.recv_from, d_init) {
+            cp_send_raw(ds, peer, store)?;
+            cp_send_raw(dw, peer, store)?;
+            d_carry = None;
+        } else {
+            d_carry = d_init;
+        }
+        let mut keep: HashSet<TensorId> = d_rows.iter().flatten().map(SeqAccum::id).collect();
+        keep.extend(d_params.iter().filter_map(ChunkSum::id));
+        keep.extend(d_carry.iter().flatten().copied());
+        store.free_new_except(&live_before, &keep)?;
+    }
+    for id in chunk_inits.iter().flatten().flatten() {
+        store.free(*id)?;
+    }
+
+    let mut pairs = GradPairs::new();
+    for (i, acc) in d_rows.into_iter().enumerate() {
+        if let Some(acc) = acc {
+            pairs.push((inputs[i], acc.finish()));
         }
     }
-    crate::ops::cat(&outs, 1, store, tape)
+    for (slot, acc) in d_params.into_iter().enumerate() {
+        if let Some(g) = acc.finish(store)? {
+            pairs.push((inputs[4 + slot], g));
+        }
+    }
+    Ok(pairs)
 }
 
 /// Host reference with recurrent and convolution carry.
