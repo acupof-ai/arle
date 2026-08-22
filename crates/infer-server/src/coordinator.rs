@@ -1096,7 +1096,7 @@ async fn completions(
             }
         }
     }
-    let max_tokens = sampling.max_new_tokens.unwrap_or(16);
+    let max_tokens = sampling.max_new_tokens.unwrap_or(THINK_CONTENT_HEADROOM);
     // Token-id prompt → feed verbatim (exact-token multi-turn); text → tokenize.
     let prompt_tokens = match &request.prompt {
         crate::schema::PromptInput::Tokens(ids) => ids.clone(),
@@ -1357,13 +1357,9 @@ async fn chat_completions(
     };
     let think_budget = state.resolve_think_budget(thinking, reasoning_effort, None, &mut sampling);
     let max_tokens = sampling.max_new_tokens.unwrap_or_else(|| {
-        if let Some(budget) = think_budget {
+        think_budget.map_or(THINK_CONTENT_HEADROOM, |budget| {
             budget + THINK_CONTENT_HEADROOM
-        } else if thinking {
-            THINK_CONTENT_HEADROOM
-        } else {
-            16
-        }
+        })
     });
 
     // Multimodal dispatch: if the backend is a VLM and the request has images,
@@ -1859,13 +1855,9 @@ async fn anthropic_messages(
     let client_budget = request.thinking.as_ref().and_then(|t| t.budget_tokens);
     let think_budget = state.resolve_think_budget(thinking, None, client_budget, &mut sampling);
     let max_tokens = sampling.max_new_tokens.unwrap_or_else(|| {
-        if let Some(budget) = think_budget {
+        think_budget.map_or(THINK_CONTENT_HEADROOM, |budget| {
             budget + THINK_CONTENT_HEADROOM
-        } else if thinking {
-            THINK_CONTENT_HEADROOM
-        } else {
-            16
-        }
+        })
     });
     // Echo the request's model string back (Anthropic contract).
     let model = request.model.clone().unwrap_or_else(|| state.model.clone());
