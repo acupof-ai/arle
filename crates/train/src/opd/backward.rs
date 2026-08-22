@@ -1,5 +1,3 @@
-//! Backward routes over the scored rollout: chunked full-prefix KL and the windowed GKD loop.
-
 use std::{collections::HashSet, time::Instant};
 
 use autograd::{

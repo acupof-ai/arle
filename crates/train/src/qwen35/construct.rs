@@ -1,5 +1,3 @@
-//! Build a Qwen35Model's layer stack into a TensorStore: one builder plus the init-mode/LoRA/TP entry points.
-
 use super::*;
 
 impl Qwen35Model {

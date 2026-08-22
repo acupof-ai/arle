@@ -1,5 +1,3 @@
-//! Masked-target writeback steps (CE, batched CE, PG, GKD) over a scored trajectory.
-
 use std::{collections::HashSet, time::Instant};
 
 use autograd::{
@@ -80,9 +78,8 @@ pub fn full_batch_ce_writeback_step<O: Optimizer>(
     let mut tape = Tape::new();
     tape.set_offload_checkpoints(crate::runtime_flags::writeback_offload_for_seq(b * max_len));
 
-    // Flat [B * max_len] input, each row = prompt ++ completion ++ pad(0). Causal
-    // attention + right-padding means padding never affects earlier positions, and
-    // the per-row CE only targets completion positions, so padding is inert.
+    // Right-padding is inert: causal attention means padding never affects
+    // earlier positions, and the per-row CE only targets completion positions.
     let flat: Vec<usize> = batch
         .iter()
         .flat_map(|(prompt, completion)| {
@@ -375,9 +372,8 @@ pub fn masked_writeback_step<O: Optimizer>(
             )));
         }
     }
-    // Map each masked target to its local hidden row. fwd_shard covers the
-    // forwarded segment (gen_start..seq_len); p >= gen_start for every target,
-    // so p - gen_start is a valid fwd-local index.
+    // p >= gen_start for every target, so p - gen_start is a valid fwd-local
+    // index into the forwarded segment's shard.
     let (position_indices, target_tokens): (Vec<i32>, Vec<i32>) = loss_targets
         .iter()
         .filter_map(|&(p, target)| {

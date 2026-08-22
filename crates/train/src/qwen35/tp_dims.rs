@@ -1,11 +1,7 @@
-//! This TP rank's slice of every Qwen3.5/3.6 config dimension, plus the divisibility checks.
-
 use super::*;
 
-/// Qwen3.5/3.6-specific TP dimension math: apply the mesh-level `TpContext`
-/// (from `crate::tensor_parallel`) to this model's head/intermediate dimensions.
-/// The coordinate view + `divide`/`maybe_all_reduce` are model-agnostic and live
-/// in `tensor_parallel`; only these `Qwen35Config`-reading shard sizes are here.
+/// Applies the model-agnostic `TpContext` (`crate::tensor_parallel`) to this
+/// model's dimensions; only `Qwen35Config`-reading shard sizes live here.
 pub(super) trait Qwen35TpDims {
     fn validate(self, cfg: &Qwen35Config) -> Result<()>;
     fn local_attention_heads(self, cfg: &Qwen35Config) -> Result<usize>;

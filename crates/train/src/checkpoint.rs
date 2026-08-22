@@ -1,5 +1,3 @@
-//! Trainer checkpoint helpers.
-
 use std::io;
 use std::path::Path;
 

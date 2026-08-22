@@ -1,11 +1,11 @@
 //! Rubric-OPD orchestration (cuda-gated): the DeepSeek-V4-Flash *text* judge
-//! (I2-wire) and the RFT loop. The pure judge primitives (rubric/verdict/select)
-//! live in [`crate::rubric`] and unit-test on CPU.
+//! and the RFT loop. The pure judge primitives (rubric/verdict/select) live in
+//! [`crate::rubric`] and unit-test on CPU.
 //!
-//! The judge takes the
-//! rollout as **text** and the engine tokenizes it with its OWN (Flash's)
-//! tokenizer, so the student's Qwen vocab never enters the judge path — the
-//! cross-tokenizer sidestep that makes a DeepSeek teacher usable for a Qwen student.
+//! The judge takes the rollout as **text** and tokenizes it with its OWN
+//! (Flash's) tokenizer, so the student's Qwen vocab never enters the judge
+//! path — the cross-tokenizer sidestep that makes a DeepSeek teacher usable
+//! for a Qwen student.
 
 #[cfg(feature = "cuda")]
 use std::sync::{Arc, Mutex};

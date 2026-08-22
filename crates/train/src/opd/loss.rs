@@ -1,5 +1,3 @@
-//! OPD objective terms: KL distill dispatch, the SFT anchors, and their blend.
-
 use autograd::{
     AutogradError, Tape, TensorId, TensorStore,
     ops::{add, mul_scalar, slice},

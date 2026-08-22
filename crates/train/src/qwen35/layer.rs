@@ -1,5 +1,3 @@
-//! One transformer layer's residual block, over whichever token span the phase supplies.
-
 use autograd::ops::elementwise::add_consuming_rhs;
 
 use super::*;
@@ -173,11 +171,9 @@ impl Qwen35Layer {
         let h = qwen35_rmsnorm(x, self.input_layernorm, cfg.rms_norm_eps, store, tape)?;
         let (attn_out, prefix) = match &self.self_attn {
             Qwen35Attention::Full(attn) => {
-                // K/V for this chunk (RMSNorm + RoPE + repeat_kv, requires_grad=false).
                 let chunk_kv = self.forward_full_attention_capture_prefix_kv(
                     h, attn, cfg, tp, cos, sin, batch, seq_len, store, tape,
                 )?;
-                // Full K/V = accumulated prefix + this chunk.
                 let full_kv = if let Some(prefix) = prefix_kv {
                     PrefixKv {
                         k: cat_seq(prefix.k, chunk_kv.k, store, tape)?,
@@ -186,7 +182,6 @@ impl Qwen35Layer {
                 } else {
                     chunk_kv
                 };
-                // Attention: Q from this chunk, K/V = full (prefix + chunk).
                 // q_start = chunk_start so causal masking is by absolute position.
                 let attn_out = self.forward_full_attention_with_kv(
                     h,

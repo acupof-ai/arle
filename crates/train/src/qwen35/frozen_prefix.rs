@@ -1,24 +1,11 @@
-//! OPD frozen-prompt-KV: off-tape chunked prompt capture, then the taped gen-segment stack.
-
 use super::*;
 
 impl Qwen35Model {
     /// OPD frozen-prompt-KV writeback forward: forward+backward ONLY the
     /// generated segment (`gen_ids` = rows `gen_start..seq_len`), seeding each
-    /// layer's attention from the prompt prefix (`prompt_ids` = rows
-    /// `0..gen_start`) captured off-tape. Returns `[1, gen_len, hidden]`.
-    ///
-    /// Two phases:
-    ///  1. OFF-TAPE prompt pass (no checkpoint, no offload): embed the prompt,
-    ///     run the layers with the tape disabled; at each layer capture the
-    ///     prefix K/V (full) or boundary state+conv (linear) AND propagate the
-    ///     prompt hidden so the next layer's capture sees the correct input. The
-    ///     prompt hidden is discarded after.
-    ///  2. TAPED gen pass: embed ONLY `gen_ids` fresh → `[1, gen_len, hidden]`
-    ///     (RMSNorm + MLP are position-local, so feeding `embed(gen_ids)` is
-    ///     exact — only attention reads the prefix). Run the layers via
-    ///     `checkpoint_sequential` (or a per-layer loop when checkpointing is
-    ///     off), each consuming its captured prefix, then final_norm.
+    /// layer's attention from the prompt prefix captured off-tape. Feeding
+    /// `embed(gen_ids)` fresh is exact — RMSNorm + MLP are position-local, only
+    /// attention reads the prefix. Returns `[1, gen_len, hidden]`.
     pub fn forward_hidden_states_gen_segment(
         &self,
         store: &mut TensorStore,
@@ -50,11 +37,8 @@ impl Qwen35Model {
         let gen_len = gen_ids.len();
         let batch = 1usize;
 
-        // ---- PHASE 1: off-tape prompt prefix capture ----
         // Chunked: the prompt is processed in OPD_SEQ_CHUNK-row pieces so the
-        // per-layer hidden/MLP transients stay O(chunk × hidden) instead of
-        // O(prompt × hidden). Each layer's K/V is accumulated across chunks
-        // (prefix + chunk) and used as the attention K/V for the next chunk.
+        // per-layer hidden/MLP transients stay O(chunk × hidden), not O(prompt × hidden).
         let prefix_cache = if gen_start > 0 {
             let prompt_token_indices = prompt_ids.iter().map(|&id| id as usize).collect::<Vec<_>>();
             let prompt_pos = prompt_positions
@@ -67,7 +51,6 @@ impl Qwen35Model {
 
             let chunk = crate::runtime_flags::OPD_SEQ_CHUNK;
             let num_chunks = gen_start.div_ceil(chunk);
-            // Accumulated prefix per layer (None before the first chunk touches it).
             let mut layer_prefix: Vec<Option<LayerPrefix>> = vec![None; self.layers.len()];
 
             for c in 0..num_chunks {
@@ -116,14 +99,11 @@ impl Qwen35Model {
                 .collect();
             WritebackPrefixCache { layers }
         } else {
-            // gen_start == 0: no prefix; an empty cache forces the gen pass to seed
-            // from zeros (equivalent to the full sequence with no prompt).
             return Err(Qwen35Error::InvalidConfig(
                 "frozen-prompt-KV forward requires a non-empty prompt prefix",
             ));
         };
 
-        // ---- PHASE 2: taped gen-segment forward ----
         let gen_token_indices = gen_ids.iter().map(|&id| id as usize).collect::<Vec<_>>();
         let gen_pos = gen_positions
             .iter()

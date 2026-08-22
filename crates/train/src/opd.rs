@@ -1,24 +1,7 @@
-//! On-Policy Distillation step function.
-//!
-//! Per the 2026-05-18 OPD-only pivot, ARLE's one in-tree training surface
-//! is OPD: a frozen teacher `Qwen35Model` and a trainable student
-//! `Qwen35Model` (optionally LoRA-adapted) share a single `TensorStore`;
-//! the student samples a rollout greedily, the teacher re-scores the
-//! same rollout, and the forward-KL distill loss drives backward through
-//! the student parameters.
-//!
-//! Smoke pattern (`crates/train/tests/test_opd_step.rs`):
-//! - Two `Qwen35Model::new` calls into the same store, the teacher copy
-//!   pinned via `clone_frozen` so its parameter ids report
-//!   `requires_grad = false`.
-//! - `opd_step` is invoked per training step; on return, the tape and
-//!   ephemeral tensors are pruned by the function itself.
-//!
-//! Production wiring (`crates/cli/src/train_cli.rs::run_opd`):
-//! - Teacher loaded from a separate HF/ModelScope checkpoint via
-//!   `crates/train/src/qwen35_checkpoint.rs`.
-//! - Student initialised from a smaller checkpoint with LoRA adapter
-//!   layered on via `Qwen35Model::new_with_lora`.
+//! On-Policy Distillation step function: a frozen teacher and a trainable
+//! student (optionally LoRA-adapted) share one `TensorStore`; the student
+//! samples a rollout, the teacher re-scores it, and forward-KL distill drives
+//! backward through the student parameters.
 
 use std::{
     sync::{
@@ -239,7 +222,6 @@ pub(crate) fn step_trace_enabled() -> bool {
     }
 }
 
-/// Phase-boundary free-VRAM ledger line (step-trace gated).
 fn log_free_vram(store: &TensorStore, label: &str) {
     if step_trace_enabled()
         && let Some((free, total)) = store.backend().device_mem_info()

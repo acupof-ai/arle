@@ -1,5 +1,3 @@
-//! Prompt loading utilities for OPD examples.
-
 use std::{
     fs::File,
     io::{BufRead, BufReader},

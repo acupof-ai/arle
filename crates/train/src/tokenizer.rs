@@ -1,8 +1,3 @@
-//! Thin wrapper around HF `tokenizers` for the training side.
-//!
-//! Training needs both encode + decode + chat-template assembly against
-//! existing vocabs (the supported Qwen families share the `<|im_start|>` template).
-
 use std::{fmt::Display, path::Path};
 
 use tokenizers::Tokenizer;

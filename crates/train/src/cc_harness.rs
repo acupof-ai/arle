@@ -3,8 +3,7 @@
 //! thread per sample (cc → score, so a sample scores the moment its cc exits);
 //! the NEXT group's boots run on background threads, overlapping the current
 //! group's rollout/train (CPU-only, staleness-free). Prompt + cc invocation
-//! ported verbatim from `scripts/cc_swe_baseline.py` (plan
-//! docs/plans/2026-07-16-agent-rl-unified-infra.md §P2).
+//! ported verbatim from `scripts/cc_swe_baseline.py`.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

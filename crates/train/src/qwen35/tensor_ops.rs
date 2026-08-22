@@ -1,5 +1,3 @@
-//! Shape and norm primitives shared by every Qwen3.5/3.6 forward path.
-
 use super::*;
 
 pub(super) fn qwen35_rmsnorm(

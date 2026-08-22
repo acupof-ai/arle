@@ -1,5 +1,3 @@
-//! Full (GQA) attention in every phase: seq-chunked, CP ring, prefix-KV capture, and gen segment.
-
 use super::*;
 
 impl Qwen35Layer {
@@ -299,14 +297,13 @@ impl Qwen35Layer {
         let k = repeat_kv(k, kv_repeat, store, tape)?;
         let v = repeat_kv(v, kv_repeat, store, tape)?;
 
-        // Capture the linears and norm for the replay closure.
         let q_proj = attn.q_proj.clone();
         let o_proj = attn.o_proj.clone();
         let q_norm = attn.q_norm;
 
-        // Saved inputs: k, v (full-seq intermediates), cos/sin, and the
-        // trainable q_proj/o_proj/q_norm weights. `checkpoint_seq_chunked`
-        // accumulates their gradients across chunks during backward.
+        // Saved inputs include the full-seq k/v intermediates;
+        // `checkpoint_seq_chunked` accumulates their gradients across chunks
+        // during backward.
         let mut param_ids = vec![k, v, cos, sin];
         collect_linear_ids(&q_proj, &mut param_ids);
         collect_linear_ids(&o_proj, &mut param_ids);
@@ -332,7 +329,6 @@ impl Qwen35Layer {
                     .clone();
                 let chunk_len = chunk_shape[1];
 
-                // q projection (with LoRA) for this chunk.
                 let q_full = q_proj.forward(h_chunk, st, tp_tape)?;
 
                 let (q, gate) = if full_attn_gated {
@@ -370,7 +366,6 @@ impl Qwen35Layer {
                     (transpose(q, 1, 2, st, tp_tape)?, None)
                 };
 
-                // q norm + rope (cos/sin sliced to this chunk's positions).
                 let q = qwen35_rmsnorm(q, q_norm, rms_norm_eps, st, tp_tape)
                     .map_err(qwen35_to_autograd)?;
                 let cos_shape = st
@@ -422,11 +417,10 @@ impl Qwen35Layer {
         Ok(maybe_all_reduce(out, tp, store, tape)?)
     }
 
-    /// OPD frozen-prompt-KV phase 1: compute the prompt prefix's repeat_kv'd K/V
-    /// at absolute positions `0..gen_start` (k_proj/v_proj → split_heads →
-    /// k_norm → rope(cos/sin sliced to the prefix) → repeat_kv), returning them
-    /// as `requires_grad=false` constants. Off-tape (caller passes a disabled
-    /// tape). Only K/V — the prompt's Q is never queried by the gen segment.
+    /// OPD frozen-prompt-KV phase 1: the prompt prefix's repeat_kv'd K/V at
+    /// absolute positions `0..gen_start`, as `requires_grad=false` constants.
+    /// Off-tape (caller passes a disabled tape). Only K/V — the prompt's Q is
+    /// never queried by the gen segment.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn forward_full_attention_capture_prefix_kv(
         &self,
@@ -478,12 +472,9 @@ impl Qwen35Layer {
     }
 
     /// OPD frozen-prompt-KV phase 2: TAPED full attention over the gen rows only
-    /// (`h_gen` is `[batch, gen_len, hidden]`). Projects Q/K/V for the gen rows,
-    /// q_norm/k_norm, rope at gen positions (cos_gen/sin_gen already sliced to
-    /// `gen_start..seq_len`), repeat_kv, then concatenates the frozen prefix K/V
-    /// along the seq axis (grad flows into k_gen/v_gen only) and runs cached SDPA
-    /// with `q_start = gen_start`. The gate/merge/o_proj/all_reduce tail is
-    /// identical to `forward_full_attention`.
+    /// (`h_gen` is `[batch, gen_len, hidden]`). Concatenates the frozen prefix
+    /// K/V along the seq axis — grad flows into k_gen/v_gen only — and runs
+    /// cached SDPA with `q_start = gen_start`.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn forward_full_attention_gen_segment(
         &self,

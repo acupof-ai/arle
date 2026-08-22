@@ -1,12 +1,8 @@
-//! Infer-runtime student rollout (OPD Phase P1 bring-up).
-//!
-//! Mirrors [`crate::teacher_infer::InferTeacher`]: holds an in-process
-//! `LoadedInferenceEngine` and drives rollouts through the serving scheduler's
-//! token-id generation path. The student differs from the teacher only in that
-//! its LoRA weights update every training step via `sync_lora_from_store`.
-//!
-//! `generate_rollout` submits one request to infer-core so the backend owns a
-//! KV slot and decodes incrementally.
+//! Infer-runtime student rollout: an in-process `LoadedInferenceEngine` driven
+//! through the serving scheduler's token-id generation path, mirroring
+//! [`crate::teacher_infer::InferTeacher`]. The student differs from the teacher
+//! only in that its LoRA weights update every training step via
+//! `sync_lora_from_store`.
 
 #[cfg(feature = "cuda")]
 use std::collections::BTreeMap;

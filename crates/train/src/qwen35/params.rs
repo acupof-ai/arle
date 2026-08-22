@@ -1,5 +1,3 @@
-//! The parameter registry: create, register, name, collect, share, and freeze the model's TensorIds.
-
 use super::*;
 
 impl Qwen35Model {

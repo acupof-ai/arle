@@ -1,5 +1,3 @@
-//! Gated-delta linear attention in all three phases.
-
 use super::*;
 
 impl Qwen35Layer {

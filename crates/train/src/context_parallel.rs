@@ -1,13 +1,10 @@
 //! Context-parallel (CP) sequence sharding for OPD 256K writeback.
 //!
-//! CP splits the sequence dimension across N ranks so per-card activation memory
-//! is O(seq/N). Weights are REPLICATED (not sharded), so weight gradients are
-//! all-reduced (DP-style) after backward. This module owns the pure host-side
-//! shard arithmetic; the collectives live in `autograd::ops` and the launcher in
-//! the CLI. `CpContext::single()` is the byte-identical single-card path.
-//!
-//! `CpContext` is a view over the one device mesh (`infer_topo::MultiAxisConfig`
-//! / `RankCoord`) — the same mesh serving reads — not a second source of truth.
+//! CP splits the sequence dimension across N ranks (per-card activation
+//! O(seq/N)); weights are replicated, so weight gradients are all-reduced
+//! DP-style after backward. `CpContext` is a view over the one device mesh
+//! (`infer_topo::MultiAxisConfig` / `RankCoord`), not a second source of truth.
+//! `CpContext::single()` is the byte-identical single-card path.
 
 use infer_topo::{MultiAxisConfig, RankCoord};
 
@@ -50,8 +47,7 @@ fn mesh_env() -> (usize, usize, usize) {
     )
 }
 
-/// A rank's position in the context-parallel group — the `attn_cp` axis of the
-/// mesh. Mirrors `TpContext`, but the axis is SEQUENCE.
+/// The `attn_cp` (sequence) axis of the mesh; mirrors `TpContext`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CpContext {
     pub rank: usize,

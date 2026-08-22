@@ -1,19 +1,13 @@
-//! EMA self-teacher core for ARLE's Self-OPD (SOPD, #91).
-//!
-//! [`EmaSelfTeacher`] owns a second [`Qwen35Model`] that shares the student's
-//! base parameters (via [`Qwen35Model::new_lora_from_base`]) but carries its
-//! OWN LoRA adapter — the exponential-moving-average (EMA) of the student
-//! adapter. The student trains; after each step the EMA adapter is nudged
-//! `θ_ema ← α·θ_ema + (1−α)·θ_student` (host-side, elementwise). The EMA model
-//! is consumed as a [`TeacherForward`] (`base + EMA-adapter`, tape off, in the
-//! train store) — it does NOT define a new `TeacherForward` impl; it REUSES
+//! EMA self-teacher for ARLE's Self-OPD (SOPD, #91): a second [`Qwen35Model`]
+//! that shares the student's base parameters but carries its own LoRA adapter
+//! (the EMA of the student adapter), consumed as a teacher via
 //! [`InProcessTeacher`].
 //!
 //! Snapshot/restore (R2): on a gate-fail the student adapter, the EMA adapter,
 //! AND the AdamW moments must roll back together as ONE unit. Restoring only
-//! the student adapter (a naive cut) would leave the EMA trained against the
-//! rejected student state and the optimizer moments stale — the same
-//! partial-rollback failure mode as the DSv4-EAGLE truncate that restored only
+//! the student adapter would leave the EMA trained against the rejected
+//! student state and the optimizer moments stale — the same partial-rollback
+//! failure mode as the DSv4-EAGLE truncate that restored only
 //! `compressed.seq_len` and corrupted the draft at the boundary.
 
 use std::collections::{HashMap, HashSet};
@@ -27,8 +21,8 @@ use crate::{
     teacher_infer::InProcessTeacher,
 };
 
-/// Strip `.lora_a`/`.lora_b` suffixes, match siblings by base prefix, sort by
-/// base name so the same adapter lands at the same index across student and EMA.
+/// Sort by base name so the same adapter lands at the same index across
+/// student and EMA.
 fn pair_adapters(map: &HashMap<&'static str, TensorId>) -> Result<Vec<(TensorId, TensorId)>> {
     let mut a_by_base: HashMap<&str, TensorId> = HashMap::new();
     let mut b_by_base: HashMap<&str, TensorId> = HashMap::new();

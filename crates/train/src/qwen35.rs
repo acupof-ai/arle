@@ -147,15 +147,12 @@ struct PrefixState {
     conv_window: TensorId,
 }
 
-/// Per-layer captured prompt prefix for the frozen-prompt-KV writeback split.
 #[derive(Debug, Clone, Copy)]
 enum LayerPrefix {
     Full(PrefixKv),
     Linear(PrefixState),
 }
 
-/// One captured prefix per model layer (phase-1 prompt pass output), consumed by
-/// the phase-2 taped gen-segment forward.
 #[derive(Debug, Clone)]
 struct WritebackPrefixCache {
     layers: Vec<LayerPrefix>,

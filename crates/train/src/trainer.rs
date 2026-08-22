@@ -1,5 +1,3 @@
-//! Free post-backward cleanup helpers shared by the OPD training loops.
-
 pub use crate::grad_clip::clip_grad_norm;
 pub use crate::loss::cross_entropy_loss;
 
@@ -7,13 +5,9 @@ use std::collections::HashSet;
 
 use autograd::{Tape, TensorId, TensorStore};
 
-/// Post-backward cleanup: prune the store down to `keep_extra ∪ params ∪ grads`.
-///
-/// Exposed `pub` so OPD eval closures that produce multi-forward activations
-/// can prune the store between windows. Note: this unconditionally re-enables
-/// the tape, which is correct for the post-backward path but NOT for an eval
-/// loop that wants the tape disabled across windows — the caller must
-/// re-disable with `tape.set_enabled(false)` after each invocation in that case.
+/// Unconditionally re-enables the tape — correct post-backward, but an eval
+/// loop that wants the tape disabled across windows must re-disable with
+/// `tape.set_enabled(false)` after each call.
 pub fn cleanup_after_backward(
     store: &mut TensorStore,
     tape: &mut Tape,

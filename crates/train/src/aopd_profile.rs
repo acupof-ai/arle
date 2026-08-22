@@ -1,19 +1,17 @@
 //! Per-round stage wall-clock profiler for the agent-OPD loop.
 //!
-//! Recording is always-on (a mutex touch per stage — round-grain call sites)
-//! and feeds the metrics.jsonl `round.phase_secs` field via [`phase_secs`];
-//! only the human table stays opt-in via the `ARLE_AOPD_PROFILE` env var.
+//! Recording is always-on (a mutex touch per round-grain call site) and feeds
+//! the metrics.jsonl `round.phase_secs` field via [`phase_secs`]; only the human
+//! table stays opt-in via the `ARLE_AOPD_PROFILE` env var.
 //!
-//! All timings are HOST wall-clock. The GPU stages (rollout decode, masked-CE
-//! writeback, LoRA sync, eval) block on the device — each materializes a host
-//! value (sampled token, loss, D2H adapter read) that forces a stream sync — so
-//! their wall IS GPU-inclusive; instrumenting CUDA events inside the frozen
-//! executor would only re-measure the same interval. The `kind` column tags
-//! each stage `GPU` / `WALL` / `DISK` so the reader sees where the time lives.
+//! All timings are host wall-clock. The GPU stages block on a device-materialized
+//! host value (sampled token, loss, D2H adapter read) that forces a stream sync,
+//! so their wall IS GPU-inclusive — CUDA events inside the frozen executor would
+//! only re-measure the same interval. The `kind` column tags each stage
+//! `GPU` / `WALL` / `DISK`.
 //!
-//! The round summary sums every recorded stage against the round wall anchored
-//! by [`begin_round`], and prints the residual as an `(untimed/overhead)` row so
-//! the table accounts for ~100% of the round.
+//! The summary prints the residual against the round wall as an
+//! `(untimed/overhead)` row so the table accounts for ~100% of the round.
 
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;

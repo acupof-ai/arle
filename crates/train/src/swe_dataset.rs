@@ -1,9 +1,3 @@
-//! SWE-bench-Pro task loading for agent-based OPD.
-//!
-//! Loads SWE-bench-Pro records from a JSONL file and normalizes their
-//! JSON-shape quirks; the cc harness ([`crate::cc_harness`]) builds the
-//! rollout prompt from these fields.
-
 use std::{
     fs::File,
     io::{BufRead, BufReader},
