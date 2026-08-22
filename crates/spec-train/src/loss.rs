@@ -5,7 +5,7 @@
 use anyhow::{Result, ensure};
 use autograd::{Tape, TensorId, TensorStore, ops};
 
-/// Objective mix. Defaults are the reference's (`config/dspark/*.py`).
+/// Defaults are the reference's (`config/dspark/*.py`).
 #[derive(Debug, Clone, Copy)]
 pub struct Weights {
     pub ce: f32,
@@ -40,7 +40,6 @@ pub struct Batch<'a> {
     pub block_size: usize,
 }
 
-/// Host-side value of each term, for logging.
 #[derive(Debug, Clone, Default)]
 pub struct Terms {
     pub ce: f32,

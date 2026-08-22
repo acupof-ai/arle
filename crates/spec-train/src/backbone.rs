@@ -86,7 +86,6 @@ pub struct Output {
 }
 
 impl Draft {
-    /// Every trainable parameter, for the optimizer.
     #[must_use]
     pub fn parameters(&self) -> Vec<TensorId> {
         let mut p = vec![self.fc, self.hidden_norm, self.norm];
@@ -299,8 +298,6 @@ fn head_norm(
     Ok(ops::transpose(x, 1, 2, store, tape)?)
 }
 
-/// One projection applied to the context and the draft rows, concatenated into
-/// the key/value sequence.
 fn cat_ctx_draft(
     ctx: TensorId,
     draft: TensorId,

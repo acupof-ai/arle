@@ -46,7 +46,6 @@ pub struct Conversation {
     pub conversations: Vec<Message>,
 }
 
-/// What a sample must fit for the trainer to consume it.
 #[derive(Debug, Clone, Copy)]
 pub struct Limits {
     /// The trunk's `vocab_size` — the width of the logit row every target id
@@ -57,7 +56,6 @@ pub struct Limits {
     pub max_len: usize,
 }
 
-/// Read a conversations JSONL and tokenize it with the model's own tokenizer.
 pub fn load_samples(data: &Path, tokenizer: &Path, limits: Limits) -> Result<Vec<Sample>> {
     ensure!(
         limits.max_len > 1,
@@ -123,7 +121,6 @@ pub fn load_samples(data: &Path, tokenizer: &Path, limits: Limits) -> Result<Vec
     Ok(samples)
 }
 
-/// What became of one conversation.
 pub enum Outcome {
     /// `truncated` marks a row shortened to `max_len` with its supervision intact.
     Kept { sample: Sample, truncated: bool },

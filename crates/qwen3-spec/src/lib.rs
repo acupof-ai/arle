@@ -16,7 +16,6 @@ pub enum Qwen3ConfigError {
 
 pub type Result<T> = std::result::Result<T, Qwen3ConfigError>;
 
-/// How a tensor's weight should be split across a tensor-parallel group.
 /// Mirrors SGLang `python/sglang/srt/layers/linear.py` parallel-linear classes.
 ///
 /// `dim` follows the HF safetensors layout for nn.Linear: row 0 is the output
@@ -25,23 +24,28 @@ pub type Result<T> = std::result::Result<T, Qwen3ConfigError>;
 /// and `Row { dim: 1 }` matches `RowParallelLinear` (split input).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Shard {
-    /// Replicated on every rank (norms, biases that aren't per-head, etc).
     Replicated,
-    /// Column-parallel: split along output dim. SGLang `linear.py:289`.
-    Column { dim: usize },
-    /// Row-parallel: split along input dim. SGLang `linear.py:1335`.
-    Row { dim: usize },
-    /// Merged column-parallel: SGLang `linear.py:485`. Used by `gate_up_proj`
-    /// and other fused projections; per-projection sizes come from config at
-    /// runtime (not encoded here, since they're model-dependent).
-    MergedColumn { dim: usize },
-    /// Fused QKV: SGLang `linear.py:889 QKVParallelLinear`. The KV-head
-    /// replication rule (SGLang `models/qwen3.py:84-95`) is applied at
-    /// runtime, not encoded here.
-    QkvFused { dim: usize },
-    /// Vocab-parallel: SGLang `vocab_parallel_embedding.py:161`.
+    Column {
+        dim: usize,
+    },
+    Row {
+        dim: usize,
+    },
+    /// Merged column-parallel: used by `gate_up_proj` and other fused
+    /// projections; per-projection sizes come from config at runtime (not
+    /// encoded here, since they're model-dependent).
+    MergedColumn {
+        dim: usize,
+    },
+    /// Fused QKV. The KV-head replication rule (SGLang `models/qwen3.py:84-95`)
+    /// is applied at runtime, not encoded here.
+    QkvFused {
+        dim: usize,
+    },
     /// Used for `embed_tokens` and (untied) `lm_head`.
-    VocabParallel { dim: usize },
+    VocabParallel {
+        dim: usize,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,10 +67,9 @@ pub struct Qwen3LayerTensorNames {
 }
 
 impl Qwen3LayerTensorNames {
-    /// Returns `Some(Shard)` for tensors this spec knows about; `None` for
-    /// any name not part of a transformer layer (caller falls back to
-    /// `Shard::Replicated`). Per-layer tensors only — global tensors live
-    /// on `Qwen3Config::shard_for_global_tensor`.
+    /// Returns `None` for any name not part of a transformer layer; callers
+    /// fall back to `Shard::Replicated`. Global tensors live on
+    /// `Qwen3Config::shard_for_global_tensor`.
     pub fn shard_for(&self, name: &str) -> Option<Shard> {
         if name == self.q_proj || name == self.k_proj || name == self.v_proj {
             return Some(Shard::Column { dim: 0 });
@@ -91,14 +94,12 @@ impl Qwen3LayerTensorNames {
     }
 }
 
-/// Long-context RoPE scaling config (HF transformers / SGLang
-/// `rope_scaling` schema). `None` ⇒ vanilla RoPE with `rope_theta` base.
-/// Applied during `precompute_rope` to extend native context window.
+/// Long-context RoPE scaling config (HF `rope_scaling` schema). `None` ⇒
+/// vanilla RoPE with `rope_theta` base.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RopeScalingConfig {
-    /// YARN scaling (Peng et al. 2023). Used by Qwen3.6 long-ctx,
-    /// DeepSeek V3, Llama 3.1.
+    /// YARN scaling (Peng et al. 2023).
     Yarn {
         factor: f32,
         original_max_position_embeddings: usize,
@@ -127,13 +128,6 @@ fn default_yarn_mscale() -> f32 {
     1.0
 }
 
-/// Compute the per-dimension RoPE inverse frequencies, optionally scaled
-/// by a long-context `RopeScalingConfig` variant.
-///
-/// Returns a vector of `head_dim / 2` floats, one per RoPE pair. Vanilla
-/// (scaling = None) reproduces the standard
-/// `inv_freq[i] = 1.0 / base.powf(2*i / head_dim)` formula used by all
-/// Qwen3-family models pre-2026-05.
 pub fn compute_scaled_inv_freq(
     head_dim: usize,
     base: f32,
@@ -146,13 +140,9 @@ pub fn compute_scaled_inv_freq(
     match scaling {
         None => vanilla,
         Some(RopeScalingConfig::Linear { factor }) => {
-            // Position interpolation: divide freq by factor so that position p maps to
-            // effective position p / factor in the original train range.
             vanilla.into_iter().map(|f| f / factor).collect()
         }
         Some(RopeScalingConfig::NtkAware { factor }) => {
-            // NTK-aware: scale base by factor^(dim/(dim-2)). Recompute inv_freq with the
-            // larger base so high frequencies extrapolate while low frequencies shift gently.
             let exponent = (head_dim as f32) / (head_dim as f32 - 2.0);
             let scaled_base = base * factor.powf(exponent);
             (0..half_dim)
@@ -177,13 +167,10 @@ pub fn compute_scaled_inv_freq(
                 .map(|freq| {
                     let wavelen = std::f32::consts::TAU / freq;
                     if wavelen < high_freq_wavelen {
-                        // High frequency: pure extrapolation (preserve original freq).
                         freq
                     } else if wavelen > low_freq_wavelen {
-                        // Low frequency: pure interpolation (divide by factor).
                         freq / factor
                     } else {
-                        // Mid-range: smooth blend of extrap and interp.
                         let smooth = (max_pos / wavelen - beta_slow) / (beta_fast - beta_slow);
                         smooth * freq + (1.0 - smooth) * (freq / factor)
                     }
@@ -193,10 +180,8 @@ pub fn compute_scaled_inv_freq(
     }
 }
 
-/// Compute the YARN attention-score scaling factor (applied to logits
-/// before softmax to compensate for the broader effective key range when
-/// extending context). Per Peng et al. 2023 §3.4: `1 + 0.1 * mscale * ln(factor)`.
-/// Returns `1.0` for None / Linear / NtkAware (no attention scaling).
+/// YARN attention-score scaling, applied to logits before softmax
+/// (Peng et al. 2023 §3.4). Returns `1.0` for None / Linear / NtkAware.
 pub fn compute_attention_factor(scaling: Option<&RopeScalingConfig>) -> f32 {
     match scaling {
         Some(RopeScalingConfig::Yarn {
@@ -209,9 +194,8 @@ pub fn compute_attention_factor(scaling: Option<&RopeScalingConfig>) -> f32 {
     }
 }
 
-/// Default RoPE base for the Qwen3 family when neither a top-level
-/// `rope_theta` nor a nested `rope_parameters.rope_theta` is present.
-/// Every shipped Qwen3 config uses 1e6.
+/// Fallback when neither a top-level `rope_theta` nor a nested
+/// `rope_parameters.rope_theta` is present; every shipped Qwen3 config uses 1e6.
 pub const DEFAULT_ROPE_THETA: f32 = 1_000_000.0;
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -247,12 +231,10 @@ struct RopeParameters {
     rope_theta: Option<f32>,
 }
 
-/// Wire-format mirror of [`Qwen3Config`] used only during deserialization.
-/// `rope_theta` is optional and a sibling `rope_parameters` block is
-/// captured so configs that nest the base under `rope_parameters` (newer
-/// HF exports) parse without a "missing field rope_theta" error. The
-/// normalize step in [`Qwen3Config::from_json_value`] resolves the final
-/// `rope_theta`.
+/// Wire-format mirror of [`Qwen3Config`] used only during deserialization:
+/// `rope_theta` is optional and a sibling `rope_parameters` block is captured
+/// so configs that nest the base under `rope_parameters` (newer HF exports)
+/// parse without a "missing field rope_theta" error.
 #[derive(Debug, Deserialize)]
 struct Qwen3ConfigRaw {
     hidden_size: usize,
@@ -277,7 +259,6 @@ struct Qwen3ConfigRaw {
     eos_token_id: Option<EosTokenIds>,
 }
 
-/// `eos_token_id` wire forms: `1`, `[1, 2]`, or absent.
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 enum EosTokenIds {
@@ -296,9 +277,8 @@ impl EosTokenIds {
 
 impl From<Qwen3ConfigRaw> for Qwen3Config {
     fn from(raw: Qwen3ConfigRaw) -> Self {
-        // Resolution order, HF-consistent: an explicit top-level `rope_theta`
-        // wins (preserves the existing Qwen3-0.6B path exactly), else fall
-        // back to `rope_parameters.rope_theta`, else the family default 1e6.
+        // Top-level `rope_theta` wins to preserve the Qwen3-0.6B path exactly;
+        // else `rope_parameters.rope_theta`, else the family default 1e6.
         let rope_theta = raw
             .rope_theta
             .or_else(|| raw.rope_parameters.and_then(|p| p.rope_theta))
@@ -385,8 +365,8 @@ impl Qwen3Config {
         }
     }
 
-    /// Sharding for non-layer ("global") tensors. Returns `None` for any name
-    /// not recognised; callers fall back to `Shard::Replicated`.
+    /// Returns `None` for any name not recognised; callers fall back to
+    /// `Shard::Replicated`.
     pub fn shard_for_global_tensor(&self, name: &str) -> Option<Shard> {
         match name {
             "model.embed_tokens.weight" => Some(Shard::VocabParallel { dim: 0 }),
