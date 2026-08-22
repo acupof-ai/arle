@@ -1,5 +1,3 @@
-//! DeepSeek-V4-Flash FP8 model: weight structs, MLA KV arena, EP-aware loader.
-//!
 //! Multi-GPU only (256 FP8 experts + MLA sharding don't fit one GPU);
 //! `ExpertSplit::single` is the dev/typecheck fallback.
 
@@ -56,7 +54,6 @@ pub(crate) use slot_image::*;
 pub(crate) use spec_verify::*;
 pub(crate) use weights::*;
 
-/// Loaded DSv4-Flash model for one TP/EP rank.
 pub(crate) struct Dsv4Model {
     pub ctx: DeviceContext,
     pub config: DeepSeekV4Config,
@@ -67,8 +64,6 @@ pub(crate) struct Dsv4Model {
     pub lm_head: DeviceMatrix,
     pub layers: Vec<Dsv4Layer>,
     pub norm: DeviceVec,
-    /// Head hyper-connection: folds the wide residual stream back to one hidden
-    /// row before the final RMSNorm + lm_head projection.
     pub head_hc: Dsv4HyperConnection,
     pub mtp: Option<Dsv4MtpLayer>,
     /// Resolved at construction from `--spec-type mtp` / `dspark`. Per-slot

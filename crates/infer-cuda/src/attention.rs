@@ -1,5 +1,3 @@
-//! Attention kernel-call paths: DSv4 MLA / FlashMLA / DSA over the shared FP8 KV pool.
-
 use anyhow::{Result, anyhow, bail, ensure};
 use cuda_kernels::attention as flash_kv;
 use cuda_kernels::ffi;
@@ -278,8 +276,6 @@ pub(crate) fn commit_layer_fold(
 
     // GLM pure-SparseIndexed (sliding_window==0) has no SW ring, and the `%
     // config.sliding_window` below would divide by zero - skip the fold.
-    // ponytail: pod-verify GLM pure-SparseIndexed (sliding_window=0) skips SW-ring
-    // entirely; attention is indexer-selected full-latent only
     if config.sliding_window > 0
         && let Some(flash) = &mut state.flashmla
     {
@@ -1013,8 +1009,6 @@ fn flashmla_pack_one_sw_token(
     // Only the pack fn differs: V32 writes the inline 656 B/tok layout
     // [512 NoPE fp8][4 F32 scales @512][128 rope bf16] (4x 128-elem NoPE blocks,
     // F32 scale = amax/448) per the vendored decode.
-    // ponytail: pod-verify V32 pack offsets (nope@0 stride576, rope@512 stride576) +
-    // 656 B/tok pool addressing
     let rope_ptr = nope_ptr + (config.head_dim - config.qk_rope_head_dim) as u64 * 2;
     if config.head_dim == 576 {
         // V32/GLM has no device-page-table pack kernel; its band stays contiguous, so
@@ -1177,8 +1171,6 @@ fn update_bf16_sw_window(
 ) -> Result<()> {
     // GLM pure-SparseIndexed has no window (sliding_window==0) and the window-cache
     // update kernel would divide by zero.
-    // ponytail: pod-verify GLM pure-SparseIndexed (sliding_window=0) skips SW-ring
-    // entirely; attention is indexer-selected full-latent only
     if config.sliding_window == 0 {
         return Ok(());
     }
@@ -1528,8 +1520,6 @@ fn flashmla_prefill_attention(
                                     )
                                 })?;
                                 let (selected_ptr, _sg) = selected.device_ptr(&ctx.stream);
-                                // ponytail: pod-verify SparseIndexed prefill index
-                                // build uses ratio=1 (full latent)
                                 flash_kv::flashmla_csa_build_indices_raw(
                                     &ctx.stream,
                                     indices_ptr,
@@ -1901,8 +1891,6 @@ fn flashmla_decode_attention(
     // GLM pure-SparseIndexed (sliding_window==0) has no SW ring to bootstrap; the
     // per-token KV pack still runs, populating this token's latent into the sparse
     // pool the indexer selects from.
-    // ponytail: pod-verify GLM pure-SparseIndexed (sliding_window=0) skips SW-ring
-    // entirely; attention is indexer-selected full-latent only
     if config.sliding_window > 0 {
         crate::profile::profile_op(ctx, "flashmla_pack_sw_ring", None, 1, || {
             flashmla_pack_sw_ring(ctx, flash, scratch, pool, sw_window_cache, config)
@@ -2095,8 +2083,6 @@ fn flashmla_decode_attention(
     // q is [b, s_q, h_q, d_qk] with d_qk = head_dim (512 MODEL1 / 576 V32); out and
     // o_accum are [..., h_q, d_v] with d_v = kv_lora latent = 512 ALWAYS (the shim
     // hard-asserts d_v==512).
-    // ponytail: pod-verify V32 FlashMLA decode stride/dim arg mapping (d_qk=576
-    // latent=512)
     let d_qk = config.head_dim as i32;
     let d_v = if is_v32 { 512 } else { config.head_dim as i32 };
     let stride_q = (global_heads * config.head_dim) as i32;
@@ -2182,7 +2168,6 @@ fn flashmla_decode_attention(
     // MODEL1's absorbed output [heads, 512] carries a rope tail to un-rotate. V32's
     // output is the pure kv_lora latent (NoPE only - the 64 rope dims live in q/k for
     // scoring), so there is no tail; its value side is reconstructed by w_vc (D3d).
-    // ponytail: pod-verify V32 skips output inverse-RoPE (512 latent is pure NoPE)
     if !is_v32 {
         crate::profile::profile_op(ctx, "flashmla_inverse_rope", None, 1, || {
             {
@@ -3497,9 +3482,6 @@ pub(crate) fn mla_attention_decode(
 /// GEMM and the q_rope copy are exact. PREFILL (token_count>1): token-major layout
 /// strides a head's rows across tokens (`stride = qk_head_dim`), which needs a
 /// batched-head kernel ARLE does not expose - bails loudly.
-/// ponytail: pod-verify GLM prefill Q absorption — wire a batched-head bf16 GEMM
-/// (or per-token-per-head gather) for token_count>1; decode (==1) is exact.
-/// ponytail: pod-verify w_kc per-head contraction q_latent = w_kc · q_nope (decode)
 fn glm_absorb_q(
     ctx: &DeviceContext,
     config: &DeepSeekV4Config,
@@ -3595,9 +3577,6 @@ fn glm_absorb_q(
 /// (h+1)*v_head)`; the result feeds the plain `o_proj` (D4). DECODE
 /// (token_count==1) is exact (contiguous per-head rows); PREFILL (token_count>1)
 /// needs a batched-head kernel - bails.
-/// ponytail: pod-verify GLM prefill V absorption (token_count>1 batched-head GEMM)
-/// ponytail: pod-verify w_vc per-head contraction v = w_vc · attn_out feeds plain
-/// o_proj
 fn glm_absorb_v(
     ctx: &DeviceContext,
     config: &DeepSeekV4Config,
@@ -3729,8 +3708,6 @@ pub(crate) fn mla_attention_prepare(
     // `out`); the O-LoRA there owns the projection.
     // GLM pure-SparseIndexed has sliding_window==0; DSv4 modes require a non-zero
     // window.
-    // ponytail: pod-verify GLM pure-SparseIndexed (sliding_window=0) skips SW-ring
-    // entirely; attention is indexer-selected full-latent only
     ensure!(
         config.sliding_window > 0 || mode == DeepSeekV4AttentionMode::SparseIndexed,
         "DSv4 MLA requires a non-zero sliding_window"
@@ -5219,7 +5196,6 @@ pub(crate) fn mla_oproj(
     // GLM plain output projection: a single GEMM v[heads*v_head_dim] -> hidden, no
     // wo_a/wo_b low-rank and no group tables. `local_attn` for GLM is the post-w_vc v;
     // DSv4 (o_proj None) falls through to the wo_a/wo_b path.
-    // ponytail: pod-verify plain o_proj input is post-w_vc v (heads*v_head_dim)
     if let Some(o_proj) = attention.o_proj.as_ref() {
         let _ = &mut prefill_shared;
         let _ = keepalive;
@@ -5578,16 +5554,12 @@ fn sparse_indexed_index_key_forward(
         // GLM ships a `k_norm.bias`. This path applies the bias-free `mla_rms_norm`
         // instead - an approximation to replace once a GPU forward confirms GLM's exact
         // norm.
-        // ponytail: pod-verify GLM index k_norm = LayerNorm(eps=1e-6) with k_norm
-        // weight+bias — current path is bias-free RMSNorm
         mla_rms_norm(ctx, &wk_out, k_norm, config.rms_norm_eps)?
     } else {
         // GLM's real `wk` is `[index_head_dim, hidden]` (single MQA key), so this
         // branch is
         // not expected - fail loud rather than fabricate a per-head->single-key
         // reduction.
-        // ponytail: pod-verify GLM wk index-key width if this ever fires (expected
-        // wk.rows == index_head_dim)
         bail!(
             "DSv4 SparseIndexed index-key build: wk.rows {} != index_head_dim {} — GLM's \
              lightning-indexer key is a single MQA head of width index_head_dim; a wider wk \

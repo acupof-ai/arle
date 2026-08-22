@@ -1,5 +1,3 @@
-//! Shared host-side page-table math for paged-KV adapters.
-//!
 //! Pure host math, CPU-testable without nvcc (same discipline as
 //! `decode_graph_key.rs`). Two consumers share these helpers:
 //!
@@ -23,8 +21,6 @@
 
 use anyhow::{Result, anyhow, ensure};
 
-/// Physical pool page backing `logical_page` of one slot's page table.
-///
 /// Table-routing invariant: callers hand the kernel this PHYSICAL page id (and
 /// the pool BASE pointer), never a `slot_idx`-derived band offset, so the call
 /// site stays valid when the table fragments (true paging).
@@ -37,9 +33,6 @@ pub(crate) fn physical_page(table: &[u32], logical_page: usize) -> Result<u32> {
     })
 }
 
-/// Physical token rows for `num_tokens` new tokens starting at slot-logical
-/// position `start_pos`, for the quant store kernels' `new_token_indices`.
-///
 /// The `quantize_paged_kv_*_per_channel` kernels assume an IDENTITY page map
 /// (`page_idx = token_row / page_size`), so a non-identity Qwen page table must
 /// be flattened to PHYSICAL rows here: for each logical position `p`,
@@ -70,9 +63,6 @@ pub(crate) fn physical_token_rows(
     Ok(rows)
 }
 
-/// Byte range of the contiguous physical run covered by one slot's page
-/// table.
-///
 /// Semantic honesty (codex review on 9d63682d): this proves CONTIGUITY —
 /// which is what licenses band-base addressing — not identity placement.
 /// The Stage A byte-identical-to-band claim is proven separately at pool

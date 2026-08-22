@@ -1,5 +1,3 @@
-//! Cold path: safetensors loading, paging metadata, and config validation.
-
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs;

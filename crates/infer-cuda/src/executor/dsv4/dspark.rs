@@ -1,18 +1,14 @@
-//! One DSpark block decode step: draft, TP-lockstep the block shape, verify,
-//! commit the accepted prefix.
-
 use super::*;
 
 impl Dsv4CudaExecutor {
-    /// Rebase `slot`'s DSpark draft latent cache to absolute trunk position
-    /// `pos` (fresh prefill → 0, restored prefix → the restored frontier).
+    /// `pos` is the absolute trunk position to rebase to (fresh prefill → 0,
+    /// restored prefix → the restored frontier).
     pub(super) fn reset_dspark_slot(&mut self, slot: usize, pos: usize) {
         if let Some(ds) = self.dspark.as_mut() {
             ds.slots[slot].df.rebase(pos);
         }
     }
 
-    /// Hot-swap the DSpark Markov head weights from a host f32 snapshot.
     /// `w1` is `[vocab * rank]`, `w2` is `[rank * vocab]`.
     pub(crate) fn update_dspark_markov_weights(&mut self, w1: &[f32], w2: &[f32]) -> Result<()> {
         let dspark = self
@@ -57,8 +53,6 @@ impl Dsv4CudaExecutor {
         Ok(())
     }
 
-    /// Append the prefill forward's stashed multi-row taps to the DSpark draft
-    /// context at absolute trunk positions `start_abs..`.
     pub(super) fn seed_dspark_prompt(&mut self, slot: usize, start_abs: usize) -> Result<()> {
         let Self {
             model,
@@ -119,8 +113,8 @@ impl Dsv4CudaExecutor {
         Ok((r0[0] as usize, r0[1] as u32))
     }
 
-    /// One DSpark block decode step (greedy). Every committed token is a target
-    /// greedy argmax (anchor + verified accepted drafts + bonus).
+    /// Every committed token is a target greedy argmax (anchor + verified
+    /// accepted drafts + bonus).
     pub(super) fn dspark_decode_tokens(
         &mut self,
         slot_idx: usize,
@@ -235,8 +229,6 @@ impl Dsv4CudaExecutor {
         self.dspark_commit_block(slot_idx, &proposal, &verify.argmax, verify_pos)
     }
 
-    /// Batched DSpark block decode: drafts per slot, then verifies ALL chains
-    /// in ONE batched target forward, amortizing the heaviest phase.
     /// Currently unreachable under the DSv4 B=1 gate pin; preserved for the
     /// batched-draft lever (#230).
     pub(super) fn dspark_decode_tokens_batched(
@@ -417,9 +409,8 @@ impl Dsv4CudaExecutor {
         Ok(out)
     }
 
-    /// Accept the verified chain prefix and commit it: `argmax[i]` is the target
-    /// greedy token AFTER `chain[i]`. Returns the committed tokens (anchor +
-    /// accepted drafts + bonus).
+    /// `argmax[i]` is the target greedy token AFTER `chain[i]`. Returns the
+    /// committed tokens (anchor + accepted drafts + bonus).
     fn dspark_commit_block(
         &mut self,
         slot_idx: usize,

@@ -160,7 +160,6 @@ impl Qwen35SpecSlotState {
         slot.snapshot_linear_into(ctx, &mut self.gdr_snap, &mut self.conv_snap)
     }
 
-    /// Restore trunk linear state after a rejected verify.
     pub(crate) fn restore_trunk(
         &self,
         ctx: &DeviceContext,
@@ -209,7 +208,6 @@ impl Qwen35SpecSlotState {
         Ok(())
     }
 
-    /// The warm step seeds the spec state with the greedy pending token.
     pub(crate) fn argmax_scratch_mut(&mut self) -> &mut CudaSlice<i32> {
         &mut self.argmax_scratch
     }

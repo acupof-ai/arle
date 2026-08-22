@@ -1,6 +1,3 @@
-//! Qwen3.5 / Qwen3.6 HYBRID model: gated-delta linear attention + periodic
-//! full attention, BF16 MoE / dense MLP.
-//!
 //! Qwen3.5/3.6 production checkpoints interleave two attention kinds per layer
 //! (`config.layer_types`):
 //!   - `LinearAttention` (the majority): a gated-delta-rule recurrent linear
@@ -153,7 +150,6 @@ pub(crate) struct Qwen35MtpHead {
     fc: DeviceMatrix,
     /// The head's single transformer block (Full attention + dense MLP).
     layer: Qwen35Layer,
-    /// Final RMSNorm before the shared lm_head.
     norm: DeviceVec,
 }
 
@@ -359,7 +355,6 @@ pub(crate) fn rms_norm_offset(
     )
 }
 
-/// Offset RMSNorm (1+weight) over a single vector (the final norm before lm_head).
 pub(crate) fn rms_norm_offset_vec(
     ctx: &DeviceContext,
     x: &DeviceVec,

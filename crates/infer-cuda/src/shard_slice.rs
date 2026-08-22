@@ -1,5 +1,3 @@
-//! Per-rank weight-shard byte slicing (pure-CPU, GPU-testable).
-//!
 //! Slices a host 2D safetensors weight (`[rows, cols]`, row-major) to one rank's
 //! [`infer_topo::ShardingSpec`] before upload. HF `nn.Linear` layout: dim 0 =
 //! `out_features`, dim 1 = `in_features`.
@@ -10,20 +8,13 @@
 use anyhow::{Result, ensure};
 use infer_topo::ShardingSpec;
 
-/// A host-side 2D weight slice: the sliced bytes plus the new `[rows, cols]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShardedBytes {
-    /// The sliced weight bytes (row-major, same element size as the source).
     pub bytes: Vec<u8>,
-    /// Number of rows (`out_features`) after slicing.
     pub rows: usize,
-    /// Number of columns (`in_features`) after slicing.
     pub cols: usize,
 }
 
-/// Slice the output dim (rows) of a `[rows, cols]` row-major weight for a
-/// column-parallel layer.
-///
 /// `spec` shards the row count; the result is the contiguous block of whole rows
 /// `spec.offset..spec.offset+spec.size`.
 ///
@@ -58,9 +49,6 @@ pub fn shard_column_parallel(
     })
 }
 
-/// Slice the input dim (columns) of a `[rows, cols]` row-major weight for a
-/// row-parallel layer.
-///
 /// `spec` shards the column count; the result gathers columns
 /// `spec.offset..spec.offset+spec.size` from every one of the `rows` rows.
 ///
@@ -123,10 +111,6 @@ impl HeadBlock {
     }
 }
 
-/// Slice a fused multi-block column-parallel weight (`[Σ block rows, cols]`
-/// row-major) for one TP rank: every block is head-sharded independently and
-/// this rank's per-block slices are re-stacked in block order.
-///
 /// Rank `r` takes heads `[r·heads/world, (r+1)·heads/world)` of EVERY block,
 /// preserving each block's head grouping (e.g. gated-delta k↔v head pairing).
 /// Single-GPU (`world_size == 1`) is the identity slice.
@@ -170,9 +154,6 @@ pub fn shard_head_blocks_column_parallel(
     })
 }
 
-/// Borrow expert `expert_idx`'s `[out_rows, cols]` row-major sub-block out of
-/// a stacked `[num_experts, stacked_rows, cols]` expert tensor.
-///
 /// Row-major layout means each expert's matrix — and any whole-row range
 /// inside it — is one contiguous byte block, so the returned slice borrows
 /// the source with no copy. `row_offset`/`out_rows` select rows inside the

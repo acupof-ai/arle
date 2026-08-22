@@ -1,5 +1,4 @@
-//! Tensor-parallel runtime config + communicator handle. Sharding math lives in
-//! `infer-topo`; `world_size == 1` is the no-op path.
+//! Sharding math lives in `infer-topo`; `world_size == 1` is the no-op path.
 
 #[cfg(feature = "cuda")]
 use cuda_kernels::tensor::CudaPipelineStreamKind;

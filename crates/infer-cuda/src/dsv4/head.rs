@@ -1,11 +1,6 @@
-//! The head tail: stream-row HC fold, final RMSNorm, lm_head projection,
-//! sampling.
-
 use super::*;
 
 impl Dsv4Model {
-    /// Head recipe for stream rows `rows`: per-row HC fold (GLM `hc_mult == 1`
-    /// identity) + final RMSNorm, written to `out` rows `0..rows.len()`.
     pub(super) fn head_normed_rows(
         &self,
         stream: &HiddenStates,
@@ -27,9 +22,6 @@ impl Dsv4Model {
         let mut last_normed = DeviceVec::zeros(&self.ctx, hidden_size)?;
         for (i, row) in rows.enumerate() {
             if self.config.is_glm() {
-                // GLM: head hidden = stream row (stream_dim==hidden, no head HC mixer).
-                // ponytail: pod-verify GLM hc_mult==1 head hidden = stream row
-                // (identity)
                 crate::ops::copy_row_to_vec(&self.ctx, stream, row, &mut last_hidden)?;
             } else {
                 crate::hc::head_hidden_from_stream(
@@ -51,7 +43,6 @@ impl Dsv4Model {
         Ok(())
     }
 
-    /// Fold every row's stream into a full target logits matrix.
     pub(super) fn verify_logits_from_stream(
         &self,
         stream: &HiddenStates,
@@ -126,8 +117,6 @@ impl Dsv4Model {
 
         let mut last_hidden = DeviceVec::zeros(ctx, hidden_size)?;
         if self.config.is_glm() {
-            // GLM: head hidden = stream row (stream_dim==hidden, no head HC mixer).
-            // ponytail: pod-verify GLM hc_mult==1 head hidden = stream row (identity)
             crate::profile::profile_op(ctx, "head_hc", None, seq_len, || {
                 crate::ops::copy_row_to_vec(ctx, stream, seq_len - 1, &mut last_hidden)
             })?;
@@ -173,8 +162,8 @@ impl Dsv4Model {
         Ok(token)
     }
 
-    /// Sample the next token from the decode-tail logits, or the cross-rank merge
-    /// when the vocab-sharded lm_head is active (`logits` = this rank's padded slice).
+    /// `logits` is this rank's padded slice when the vocab-sharded lm_head is
+    /// active.
     pub(super) fn sample_logits(
         &self,
         logits: &DeviceVec,
@@ -185,8 +174,6 @@ impl Dsv4Model {
         crate::executor::sample_cuda_token(&self.ctx, logits, params, position, penalty)
     }
 
-    /// Batched lm_head: `[m, hidden] → [m, vocab]`, one GEMM for every weight
-    /// format (`dsv4_linear`).
     pub(super) fn lm_head_project_batch(
         &self,
         x: &HiddenStates,
@@ -210,8 +197,6 @@ impl Dsv4Model {
         crate::attention::dsv4_linear(&self.ctx, &self.lm_head, x, out)
     }
 
-    /// Project the final hidden vector through the LM head. The head can be bf16
-    /// or DSv4 FP8/FP4 block-scaled, so dispatch the matching kernel.
     pub(super) fn lm_head_project(&self, x: &DeviceVec, logits: &mut DeviceVec) -> Result<()> {
         use cuda_kernels::tensor::WeightFormat;
         ensure!(

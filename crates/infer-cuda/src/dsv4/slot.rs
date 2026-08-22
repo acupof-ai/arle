@@ -1,6 +1,3 @@
-//! Per-slot KV/attention state lifecycle: allocate, reset, page capture and
-//! restore, truncate, spec-ring snapshot, host swap.
-
 use super::*;
 
 pub(crate) struct Dsv4SlotState {
@@ -21,9 +18,8 @@ pub(crate) struct Dsv4SlotState {
     /// sequentially. `Some` only when the `deepep_ll` transport is booted.
     #[cfg(feature = "deepep")]
     pub(super) deepep_ll_scratch: Option<crate::deepep::DeepEpLlScratch>,
-    /// DSpark T3 tap buffers: the wide HC residual stream captured at each
-    /// `config.dspark_target_layer_ids` layer OUTPUT, index-aligned with the id
-    /// list. Empty unless DSpark.
+    /// Wide HC residual stream captured at each `config.dspark_target_layer_ids`
+    /// layer OUTPUT, index-aligned with the id list. Empty unless DSpark.
     pub(super) dspark_taps: Vec<DeviceVec>,
     /// Transient multi-row prompt taps captured during a PREFILL forward, consumed
     /// once by the DSpark prefix seed. Prefill-scoped and bounded by the chunked-
@@ -166,8 +162,6 @@ impl Dsv4SlotState {
         self.device_bytes_breakdown().iter().map(|(_, b)| *b).sum()
     }
 
-    /// Per-component byte breakdown for the VRAM ledger log; the per-layer
-    /// `attention` Vec collapses to one summed entry.
     #[allow(dead_code)]
     pub(crate) fn device_bytes_breakdown(&self) -> Vec<(&'static str, usize)> {
         let attention_bytes: usize = self.attention.iter().map(|s| s.device_bytes()).sum();
@@ -201,22 +195,16 @@ impl Dsv4SlotState {
         ]
     }
 
-    /// DSpark T3 wide-stream taps, index-aligned with
-    /// `config.dspark_target_layer_ids`. Empty off the DSpark path.
     #[allow(dead_code)]
     pub(crate) fn dspark_taps(&self) -> &[DeviceVec] {
         &self.dspark_taps
     }
 
-    /// Take the transient prompt-chunk taps captured by the last prefill forward
-    /// (`None` off the DSpark path or when it was single-row). Consumed once.
     #[allow(dead_code)]
     pub(crate) fn take_dspark_prompt_taps(&mut self) -> Option<Dsv4DsparkPromptTaps> {
         self.dspark_prompt_taps.take()
     }
 
-    /// Sub-struct byte totals summed across ALL attention layers, so the VRAM
-    /// ledger can attribute the per-slot `attention(per-layer)` bulk by family.
     #[allow(dead_code)]
     pub(crate) fn attention_breakdown_total(&self) -> Vec<(&'static str, usize)> {
         let mut totals: std::collections::BTreeMap<&'static str, usize> =
@@ -229,8 +217,6 @@ impl Dsv4SlotState {
         totals.into_iter().collect()
     }
 
-    /// Snapshot the speculative-verify boundary ring slot across all attention
-    /// layers before the depth-K verify forward. No-op when spec decode is off.
     pub(crate) fn capture_spec_rings(
         &mut self,
         ctx: &DeviceContext,
@@ -652,8 +638,6 @@ impl Dsv4Model {
         slot.truncate(&self.layers, kv_adapter, new_len)
     }
 
-    /// Snapshot the speculative-verify boundary ring slot before depth-K verify.
-    /// No-op when spec decode is off.
     pub(crate) fn capture_spec_rings(
         &self,
         slot: &mut Dsv4SlotState,

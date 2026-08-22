@@ -1,6 +1,3 @@
-//! MegaMoE collective transport: boot, static-spec assertion, per-forward epoch
-//! handshake.
-
 use super::*;
 
 #[cfg(all(feature = "cuda", feature = "nccl"))]

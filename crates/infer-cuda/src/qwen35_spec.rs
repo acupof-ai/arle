@@ -421,7 +421,6 @@ impl Qwen35Model {
     }
 }
 
-/// log p_filtered of each committed chain token from the materialized `p` rows.
 /// Caller must have synced the accept verdict D2H so the rows are final.
 /// The floor clamp guards f32 underflow at `ln`.
 pub(crate) fn chain_commit_logprobs(

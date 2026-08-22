@@ -1,9 +1,3 @@
-//! Real CUDA executor: the engine-facing step driver and sampling tail.
-//!
-//! Wraps the loaded model + device [`PagedKVPool`], validates the
-//! single-row plan, mirrors host→device page allocation, runs the forward, and
-//! samples the next token (`sample_cuda_token`: greedy argmax / host sampling).
-
 use std::collections::VecDeque;
 use std::path::Path;
 use std::time::Instant;
@@ -102,7 +96,6 @@ impl CudaKvCacheDtype {
         }
     }
 
-    /// Resolve a backend-neutral requested dtype against the CUDA support matrix.
     /// `Auto`/`Bf16` → BF16; `Int8`/`Fp8` → the paged quant modes (#68 T3);
     /// `Tq4` fails loud with an explicit-deferral message rather than silently
     /// falling back to BF16.
@@ -131,7 +124,6 @@ impl CudaKvCacheDtype {
     }
 }
 
-/// The real cuda-kernels executor. Qwen3.5/3.6 and DSv4 keep model-specific
 /// per-slot state inside their executor arms.
 pub(crate) enum RealCudaExecutor {
     Qwen35(Box<Qwen35CudaExecutor>),
@@ -186,7 +178,6 @@ impl RealCudaExecutor {
         )))
     }
 
-    /// Build the DSv4-Flash executor (MLA + HC + FP8 MoE, multi-GPU TP/EP).
     /// `mtp_draft_tokens`: `Some(n)` = config-driven MTP spec decode on (draft
     /// depth `n`); `mtp_draft_topk`: `Some(k)` = per-level MTP draft candidate
     /// width (`1` = chain-only candidates).
@@ -280,7 +271,6 @@ impl RealCudaExecutor {
         }
     }
 
-    /// Cumulative spec-decode counters: DSpark on Qwen3.5/3.6, MTP on DSv4.
     /// Host-side integers maintained in the accept-commit paths — no device sync.
     pub(crate) fn spec_decode_stats(&self) -> infer_seam::SpecDecodeStats {
         match self {
@@ -793,7 +783,6 @@ impl RealCudaExecutor {
         }
     }
 
-    /// Hot-swap the DSpark Markov head weights.
     pub(crate) fn update_dspark_markov_weights(&mut self, w1: &[f32], w2: &[f32]) -> Result<()> {
         match self {
             Self::Qwen35(q) => q.update_dspark_markov_weights(w1, w2),

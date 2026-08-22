@@ -1,8 +1,6 @@
-//! Slot snapshot serialization: the byte format for host swap-out/swap-in.
-
 use super::*;
 
-/// Host image of one whole DSv4 slot for capacity spill. Captures the per-layer
+/// Host image of one whole DSv4 slot for capacity spill: the per-layer
 /// attention carry (SW ring, compressor/indexer, FlashMLA metadata, DSA) plus
 /// the slot's FP8 KV band pages from each layer's shared pool.
 pub(crate) struct Dsv4SlotImage {

@@ -1,14 +1,8 @@
-//! Single-sequence contiguous forward: prefill and committing decode over one
-//! slot.
-
 use super::layer_block::HcHalf;
 use super::*;
 use cuda_kernels::tensor::CudaPipelineStreamKind;
 
 impl Dsv4Model {
-    /// Forward one prefill/decode step over `tokens` starting at `start_pos`,
-    /// returning the next greedy/sampled token.
-    ///
     /// The residual is the `hidden_size * hc_mult`-wide hyper-connection STREAM,
     /// not a plain hidden vector; the head HC folds it to one hidden row before
     /// the final RMSNorm + lm_head + sample.
@@ -125,7 +119,6 @@ impl Dsv4Model {
         let seq_len = tokens.len();
         let mega_epoch = self.begin_mega_moe_forward(seq_len)?;
         let use_deepep_transport = crate::runtime_flags::dsv4_moe_transport()?.is_deepep();
-        // DSpark T3: capture the wide stream at each target layer output.
         let dspark = self.config.is_dspark();
         let mut keepalive = Dsv4ForwardKeepalive::new(false);
         let ctx = &self.ctx;
@@ -339,7 +332,6 @@ impl Dsv4Model {
             keepalive.keep_hidden(&attn_stream);
             stream = attn_stream;
 
-            // MoE half.
             // SAFETY: fused hc_pre+rms_norm / plain rms_norm writes the full
             // [seq_len, hidden_size] buffer.
             let mut normed = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
@@ -619,8 +611,7 @@ impl Dsv4Model {
             keepalive.keep_hidden(&ffn_stream);
             stream = ffn_stream;
             self.probe_capture(&stream, layer_idx, &probe_positions)?;
-            // DSpark T3: capture the wide HC stream at this layer's OUTPUT for the
-            // row being predicted. D2D copy only (graph-safe, no readback).
+            // D2D copy only (graph-safe, no readback).
             if dspark
                 && let Some(tap_idx) = self
                     .config
@@ -640,7 +631,6 @@ impl Dsv4Model {
                 } else {
                     self.capture_mtp_stream_hidden(&stream, seq_len - 1, 1, tap, &mut keepalive)?;
                 }
-                // Prefill: also capture the FULL stream (all rows) for the seed.
                 if let Some(bufs) = dspark_prompt_bufs.as_mut() {
                     ctx.stream
                         .memcpy_dtod(&stream.data, &mut bufs[tap_idx].data)

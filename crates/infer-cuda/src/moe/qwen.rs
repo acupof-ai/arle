@@ -1,6 +1,3 @@
-//! Qwen3.5/3.6 SparseMoeBlock policy: device routing, grouped BF16/FP8 expert
-//! GEMMs, decode capture rules, and shared-expert gating (all experts local).
-
 use anyhow::{Result, ensure};
 use cuda_kernels::moe;
 use cuda_kernels::prelude::{DeviceContext, DeviceMatrix, HiddenStates, RawDevicePtr};
@@ -193,11 +190,8 @@ pub(crate) fn qwen35_decode_moe_graph_capturable(cfg: &MoeConfig) -> bool {
         && cfg.top_k < QWEN35_DEEPGEMM_MIN_ROUTES
 }
 
-/// BF16 MoE forward for one sparse layer. `normed` is the post-LN hidden
-/// `[num_tokens, hidden]`; the block output (routed + sigmoid-gated shared
-/// expert) fully overwrites `out` (`[hidden, num_tokens]`).
-///
-/// Routing runs over ALL `cfg.num_experts`, but only routes landing on
+/// The block output (routed + sigmoid-gated shared expert) fully overwrites
+/// `out`. Routing runs over ALL `cfg.num_experts`, but only routes landing on
 /// `split`'s local experts contribute — under `ep_size > 1` `out` is a
 /// PARTIAL sum the caller must `all_reduce_sum` before the residual add.
 pub(crate) fn moe_forward_into(
@@ -719,9 +713,6 @@ fn add_shared_expert_gated(
     Ok(())
 }
 
-/// Expert path on the DeepGEMM m-grouped GEMMs: pack → gate/up GEMM →
-/// silu_mul → down GEMM → scatter/combine into `out`.
-///
 /// * **Masked** (`R <= 128`, decode): fixed per-group bands `[G, 128, *]`
 ///   with `masked_m = counts`. 128 is exactly the dispatch threshold because
 ///   the only host-provable capacity bound is `max_g count_g <= R`; shapes

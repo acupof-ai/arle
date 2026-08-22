@@ -226,7 +226,6 @@ pub(crate) fn mtp_min_accept() -> f32 {
 pub(crate) fn spec_max_batch() -> usize {
     SPEC_MAX_BATCH.load(Relaxed)
 }
-/// `--dspark-confidence-threshold`, feeding `DsparkSps::confidence_threshold`.
 pub(crate) fn dspark_confidence_threshold() -> Option<f32> {
     let t = f32::from_bits(DSPARK_CONFIDENCE_THRESHOLD_BITS.load(Relaxed));
     (!t.is_nan()).then_some(t)

@@ -156,7 +156,6 @@ fn pin_all_threads(set: &libc::cpu_set_t) -> (usize, usize) {
     (pinned, total)
 }
 
-/// Parse a sysfs cpulist like `0-23,96-119` into core ids.
 #[cfg(target_os = "linux")]
 fn parse_cpulist(s: &str) -> anyhow::Result<Vec<usize>> {
     use anyhow::Context;

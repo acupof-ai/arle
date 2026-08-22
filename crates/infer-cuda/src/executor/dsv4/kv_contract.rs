@@ -1,7 +1,3 @@
-//! The plan-to-KV agreement check: assert the scheduler's rows and the pool's
-//! descriptor/view describe the same slots, positions and tokens before any
-//! device byte moves.
-
 use super::*;
 
 #[derive(Clone)]
@@ -80,7 +76,6 @@ impl Dsv4DecodeBatch {
     }
 }
 
-/// What a plan row says the KV descriptor/view must show for it.
 pub(super) struct KvRowExpect<'a> {
     kind: KvBatchRowKind,
     pub(super) slot: usize,

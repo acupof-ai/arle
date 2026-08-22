@@ -1,6 +1,3 @@
-//! The verify-path selftest gate: prove `forward_tokens_verify` agrees with
-//! `forward_tokens` and is insensitive to a forced-wrong draft.
-
 use super::*;
 
 impl Dsv4CudaExecutor {

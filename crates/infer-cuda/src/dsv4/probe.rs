@@ -1,6 +1,3 @@
-//! Non-invasive logit-lens probe: per-layer stream capture during forward,
-//! post-forward logit lens (norm + lm_head + log_softmax) on GPU.
-//!
 //! Gated by ARLE_PROBE_JSONL; zero cost when off.
 //! ARLE_PROBE_LENS_LAYERS: comma-separated layer indices (default: all).
 
@@ -112,7 +109,6 @@ impl Dsv4ProbeCapture {
         let vocab = model.lm_head.rows;
         let last_layer = *self.lens_layers.last().unwrap();
 
-        // Reference tokens from the last captured layer.
         self.layer_logits_to_host(model, last_layer, rows)?;
         let reference: Vec<u32> = (0..rows)
             .map(|r| infer_plan::argmax_logit(&self.host_logits[r * vocab..(r + 1) * vocab]))
@@ -138,8 +134,6 @@ impl Dsv4ProbeCapture {
         Ok(())
     }
 
-    /// Norm + lm_head + D2H for one captured layer, writing f32 logits into
-    /// `host_logits[..rows * vocab]`.
     fn layer_logits_to_host(
         &mut self,
         model: &Dsv4Model,

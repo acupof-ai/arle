@@ -1,11 +1,7 @@
-//! Single-sequence speculative verify: the row schedule, its validation, and the
-//! verify entry points.
-
 use super::layer_block::HcHalf;
 use super::*;
 
-/// Max depth for the per-slot spec-ring snapshot. `topk` widens candidate
-/// matching only; verifier rows remain chain-shaped.
+/// `topk` widens candidate matching only; verifier rows remain chain-shaped.
 pub(crate) const MAX_SPEC_DRAFT_DEPTH: usize = 8;
 /// Bounded chain verifier rows per slot. MTP uses `depth + 1`; `topk` adds none.
 pub(crate) const MAX_SPEC_VERIFY_ROWS: usize = 64;
@@ -57,8 +53,6 @@ impl SpecVerifySchedule {
     }
 }
 
-/// Target verify output for an MTP verify chunk: the full `[rows, vocab]` logits
-/// matrix plus the greedy top-1 view and per-row MTP stream hiddens.
 pub(crate) struct SpecVerifyResult {
     pub(crate) logits: HiddenStates,
     pub(crate) argmax: Vec<u32>,
@@ -66,10 +60,7 @@ pub(crate) struct SpecVerifyResult {
 }
 
 impl Dsv4Model {
-    /// Build a [`SpecVerifyResult`] from a forward's output stream: capture the
-    /// per-row MTP stream hiddens, project the logits, and take the greedy
-    /// argmax. Shared by the commit-verify and the frozen scheduled-verify
-    /// lanes.
+    /// Shared by the commit-verify and the frozen scheduled-verify lanes.
     fn spec_verify_result_from_stream(
         &self,
         stream: &HiddenStates,
@@ -92,8 +83,8 @@ impl Dsv4Model {
         })
     }
 
-    /// Commit/selftest forward for a contiguous token prefix. Not the frozen MTP
-    /// verifier: it writes the slot KV state like a normal forward.
+    /// Not the frozen MTP verifier: it writes the slot KV state like a normal
+    /// forward.
     pub(crate) fn forward_tokens_verify(
         &self,
         slot: &mut Dsv4SlotState,
@@ -122,9 +113,8 @@ impl Dsv4Model {
         Ok(result)
     }
 
-    /// Verify `tokens` in ONE scheduled sparse forward under `sched`'s per-row
-    /// positions. MTP schedules are chain-shaped (`depth + 1` rows), so this
-    /// requires at least two rows.
+    /// MTP schedules are chain-shaped (`depth + 1` rows), so this requires at
+    /// least two rows.
     pub(crate) fn forward_tokens_verify_scheduled(
         &self,
         slot: &mut Dsv4SlotState,

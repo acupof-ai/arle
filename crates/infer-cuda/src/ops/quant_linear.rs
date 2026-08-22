@@ -101,10 +101,7 @@ thread_local! {
     static MARLIN_SCRATCH: RefCell<MarlinScratch> = RefCell::new(MarlinScratch::default());
 }
 
-/// Allocate the Marlin scratch once at the SM-derived MAX (c_tmp caps at m=64;
-/// workspace is m-independent). Never grows → graph-capture safe. The workspace
-/// is zeroed at alloc; Marlin resets its locks to 0 after each GEMM, so reuse is
-/// safe. Shared by the W8A16, FP8, and NVFP4 Marlin arms.
+/// Shared by the W8A16, FP8, and NVFP4 Marlin arms.
 fn marlin_scratch_init(ctx: &DeviceContext, scratch: &mut MarlinScratch) -> Result<()> {
     if scratch.c_tmp.is_some() {
         return Ok(());
@@ -125,8 +122,7 @@ fn marlin_scratch_init(ctx: &DeviceContext, scratch: &mut MarlinScratch) -> Resu
     Ok(())
 }
 
-/// Run `f` against this thread's Marlin scratch, allocating it once on first
-/// use. The three quant families share it — one weight at a time per thread.
+/// The three quant families share it — one weight at a time per thread.
 pub(super) fn with_marlin_scratch<T>(
     ctx: &DeviceContext,
     f: impl FnOnce(&mut MarlinScratch) -> Result<T>,

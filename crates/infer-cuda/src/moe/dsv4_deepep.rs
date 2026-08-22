@@ -1,6 +1,3 @@
-//! DSv4 MoE over DeepEP transport: normal (intranode/internode) and NVSHMEM
-//! low-latency dispatch/combine around the same grouped-GEMM expert body.
-
 use anyhow::{Result, ensure};
 use cuda_kernels::moe;
 use cuda_kernels::prelude::HiddenStates;
@@ -264,10 +261,8 @@ pub(crate) fn dsv4_moe_forward_deepep(
     Ok(())
 }
 
-/// NVSHMEM low-latency DSv4 MoE forward for THIS rank's owned token slice:
-/// route → LL dispatch (FP8 pack) → masked grouped GEMM w13 → masked
-/// SwiGLU+requant → masked grouped GEMM w2 → LL combine. The caller owns the
-/// token slicing and the final all-gather; `out` is `[hidden, owned_n]`.
+/// The caller owns the token slicing and the final all-gather; `out` is
+/// `[hidden, owned_n]`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn dsv4_moe_forward_deepep_ll(
     model: &Dsv4Model,

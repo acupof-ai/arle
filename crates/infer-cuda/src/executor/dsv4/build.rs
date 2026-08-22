@@ -1,6 +1,3 @@
-//! Construct the executor and its DSpark per-slot runtime inside a measured
-//! VRAM budget, emitting the `[vram-ledger]` reconciliation.
-
 use super::*;
 
 impl Dsv4CudaExecutor {
@@ -184,7 +181,6 @@ impl Dsv4CudaExecutor {
             &layer_specs,
             model.kv_arena.page_block_size,
         );
-        // Weights were loaded before KV budgeting; only per-slot runtime here.
         let dspark = dspark_draft
             .map(|draft| {
                 Self::load_dspark_exec(
@@ -230,7 +226,6 @@ impl Dsv4CudaExecutor {
         Ok(exec)
     }
 
-    /// Provision per-slot caches for the preloaded DSpark drafter.
     fn load_dspark_exec(
         model: &crate::dsv4::Dsv4Model,
         kv_adapter: &crate::attention::Dsv4KvAdapter,

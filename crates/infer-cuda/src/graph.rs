@@ -1,5 +1,3 @@
-//! CUDA Graph capture/replay for the decode path.
-//!
 //! First decode call captures the kernel sequence into a graph, later calls
 //! replay it. The `AUTO_FREE_ON_LAUNCH` instantiate flag frees async-pool
 //! allocations made during capture on launch.
@@ -13,8 +11,6 @@ use cudarc::driver::sys::CUgraphInstantiate_flags_enum::CUDA_GRAPH_INSTANTIATE_F
 use cudarc::driver::sys::CUstreamCaptureMode_enum::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL;
 use log::debug;
 
-/// CUDA Graph state for one fixed shape on the decode path.
-///
 /// The first [`Self::run_or_capture`] call captures the kernel closure into a
 /// graph and launches it; every later call launches the captured graph only.
 pub struct CudaGraphState {
@@ -78,8 +74,6 @@ impl CudaGraphState {
         self.warm_remaining > 0
     }
 
-    /// Launch the captured graph, or capture it from `kernels` on the first call.
-    ///
     /// `kernels` must be a pure GPU kernel sequence — no host/device sync, no
     /// host allocation — because the work is recorded into a replay-able graph.
     ///
@@ -186,13 +180,11 @@ impl CudaGraphState {
 /// One captured decode graph keyed by its decode batch size. Wraps a
 /// [`CudaGraphState`] so a later stage can carry per-bucket buffers alongside it.
 pub struct CapturedDecodeGraph {
-    /// Decode batch size (number of rows) this graph was captured for.
     pub batch_size: usize,
     pub state: CudaGraphState,
 }
 
 impl CapturedDecodeGraph {
-    /// Create an (uncaptured) decode graph for `batch_size` on `stream`.
     #[must_use]
     pub fn new(batch_size: usize, stream: Arc<CudaStream>) -> Self {
         Self {
