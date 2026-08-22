@@ -2333,12 +2333,6 @@ impl Qwen35CudaExecutor {
         }
     }
 
-    fn paged_kv_bf16(&self) -> bool {
-        self.full_attn_kv
-            .as_ref()
-            .is_some_and(|p| p.format == KVFormat::BF16)
-    }
-
     /// The single `dspark → mtp → plain` dispatch ladder. At or below
     /// `--spec-max-batch`
     /// a spec scheme drafts per row; above it spec is a compute-bound loss, so decode
@@ -2352,15 +2346,13 @@ impl Qwen35CudaExecutor {
         use super::spec_decode::{DecodeRoute, SpecKind};
         let kind = self.spec_kind();
         // Only a batched greedy DSpark draft pays above c=1: sampling loses −15.5% at
-        // c=8 and −26.4% at c=16. Quantized KV keeps the per-row route: its verify
-        // runs through the FA3 dequant shim while plain decode has the tensor-core
-        // pool kernel, and on 32K prompts that verify costs −10 % at c=8 and −16 %
-        // at c=16 (errors/2026-08-22-batched-dspark-quant-kv-verify-loses).
+        // c=8 and −26.4% at c=16. Verify rows over a quantized pool take the same
+        // tensor-core kernel as plain decode (qlen <= 8), so the KV format no
+        // longer gates the batched route.
         let spec_compatible = decode_rows
             .iter()
             .all(|r| qwen_spec_decode_compatible(&r.params));
         let batched = kind == SpecKind::Dspark
-            && self.paged_kv_bf16()
             && spec_compatible
             && decode_rows.iter().all(|r| r.params.is_greedy());
         let gate = match batched {
