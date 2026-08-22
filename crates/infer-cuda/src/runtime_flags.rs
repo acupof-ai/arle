@@ -24,11 +24,15 @@ impl Dsv4MoeTransport {
 }
 
 static DSV4_MOE_TRANSPORT: OnceLock<Result<Dsv4MoeTransport, String>> = OnceLock::new();
+static DSV4_MOE_TRANSPORT_CLI: OnceLock<Option<String>> = OnceLock::new();
 
 pub(crate) fn dsv4_moe_transport() -> Result<Dsv4MoeTransport> {
     match DSV4_MOE_TRANSPORT.get_or_init(|| {
-        let value =
-            std::env::var("ARLE_DSV4_MOE_TRANSPORT").unwrap_or_else(|_| "allreduce".to_string());
+        let value = DSV4_MOE_TRANSPORT_CLI
+            .get()
+            .and_then(|v| v.clone())
+            .or_else(|| std::env::var("ARLE_DSV4_MOE_TRANSPORT").ok())
+            .unwrap_or_else(|| "allreduce".to_string());
         match value.as_str() {
             "allreduce" | "all_reduce" | "native" | "scalar" | "static" | "deepgemm" | "" => {
                 Ok(Dsv4MoeTransport::AllReduce)
@@ -39,8 +43,9 @@ pub(crate) fn dsv4_moe_transport() -> Result<Dsv4MoeTransport> {
             }
             "mega_moe" => Ok(Dsv4MoeTransport::MegaMoe),
             other => Err(format!(
-                "unsupported ARLE_DSV4_MOE_TRANSPORT `{other}` \
-                 (expected allreduce, deepep, deepep_ll, or mega_moe)"
+                "unsupported DSv4 MoE transport `{other}` \
+                 (--dsv4-moe-transport or ARLE_DSV4_MOE_TRANSPORT; \
+                 expected allreduce, deepep, deepep_ll, or mega_moe)"
             )),
         }
     }) {
@@ -99,6 +104,7 @@ pub fn apply_runtime_flags(f: &CudaRuntimeFlags) {
         Relaxed,
     );
     DEEPEP_NUM_SMS.store(f.deepep_num_sms, Relaxed);
+    DSV4_MOE_TRANSPORT_CLI.get_or_init(|| f.dsv4_moe_transport.clone());
     DEEPEP_MAX_DISPATCH_TOKENS_PER_RANK
         .store(f.deepep_max_dispatch_tokens_per_rank.unwrap_or(0), Relaxed);
     // `Some(true)` stays compile-gated: forcing FlashMLA on a stub build must

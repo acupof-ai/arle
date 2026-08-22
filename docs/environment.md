@@ -63,9 +63,7 @@ workers see them; train flags apply via `train::apply_runtime_flags`):
 | `ARLE_OPD_MOE_LORA_BWD_EXPERT_TILE` / `_LORA_LINEAR_BWD_TILE_ROWS` | `arle train <opd> --moe-lora-bwd-expert-tile` / `--lora-linear-bwd-tile-rows` |
 | `ARLE_OPD_WRITEBACK_FROZEN_PROMPT_KV` | `arle train <opd> --writeback-frozen-prompt-kv` |
 | `ARLE_GDR_CHUNKWISE_PREFILL` / `ARLE_LA_BACKWARD_MONO` / `ARLE_AUTOGRAD_DECODE_ATTN_LEGACY` | `arle train <opd> --gdr-chunkwise-prefill` / `--la-backward-mono` / `--autograd-decode-attn-legacy` |
-
-Deferred (read site inside frozen DSv4 files this pass):
-`ARLE_DSV4_MOE_TRANSPORT`/`ARLE_DSV4_MOE_BACKEND`.
+| `ARLE_DSV4_MOE_TRANSPORT` | `arle serve --dsv4-moe-transport` (flag wins; env is the fallback) |
 
 ---
 
@@ -362,7 +360,7 @@ as diagnostics and validation gates, not stable tuning API.
 
 | Variable | Values | Default | Current behavior |
 |---|---|---|---|
-| `ARLE_DSV4_MOE_BACKEND` (alias `ARLE_DSV4_MOE_TRANSPORT`) | `allreduce` (default), `deepep`, `deepep_ll` | `allreduce` | Selects the DSv4 MoE transport (`infer-cuda/src/dsv4.rs::dsv4_use_deepep_transport`). `allreduce` = local routed experts + EP all-reduce (the licensed default). `deepep` / `deepep_ll` = NVSHMEM token-owned DeepEP paths; B=1 deepep_ll is fixed (`b5f00399`) but the batched lane license is open (#61) — not default-worthy yet. |
+| `ARLE_DSV4_MOE_TRANSPORT` (or `--dsv4-moe-transport`) | `allreduce` (default), `deepep`, `deepep_ll`, `mega_moe` | `allreduce` | Selects the DSv4 MoE transport (`infer-cuda/src/runtime_flags.rs::dsv4_moe_transport`). `allreduce` = local routed experts + EP all-reduce (the licensed default). `deepep` / `deepep_ll` = NVSHMEM token-owned DeepEP paths; B=1 deepep_ll is fixed (`b5f00399`) but the batched lane license is open (#61) — not default-worthy yet. |
 | `ARLE_DSV4_INCREMENTAL_KV` | `1` / unset | unset | Enables the incremental DSv4 KV state path used by the 8-rank HTTP bring-up. |
 | `ARLE_DSV4_OPERATOR_TRACE` | `1` / unset | unset | Enables the same CUDA-synchronizing DSv4 operator aggregate in `request_trace` JSON without emitting every per-layer event log line. The field is `dsv4_operator_trace_process_delta` and is valid for single-inflight profiling only. |
 | `ARLE_DSV4_OPERATOR_TRACE_EVENTS` | `1` / unset | unset | With `ARLE_DSV4_OPERATOR_TRACE=1`, also emits the legacy `dsv4_trace layer=... phase=...` event log lines. |
