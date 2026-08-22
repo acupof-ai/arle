@@ -6,10 +6,9 @@ use crate::backend::{Backend, DeviceHandle};
 use crate::tensor::Dirty;
 use crate::{Result, TensorId, tensor::TensorStore};
 
-/// Per-parameter moment storage. Host is the long-standing path; Device is
-/// the M5.3b.10 opt-in path that keeps `m` / `v` resident on the backend
-/// across steps so the optimizer's update can stay in the MLX lazy graph
-/// and the param never takes a re-upload round-trip.
+/// Per-parameter moment storage. The device path keeps `m`/`v` resident on
+/// the backend across steps so the update stays in the MLX lazy graph and
+/// the param never takes a re-upload round-trip.
 #[derive(Debug)]
 enum MomentStorage {
     Host(Vec<f32>),
@@ -23,24 +22,12 @@ struct ParamMoments {
     shape: Vec<usize>,
 }
 
-/// AdamW optimizer. Two code paths live side-by-side:
-///
-/// - **Host path** (default, [`AdamW::new`]): moments live as `Vec<f32>`,
-///   gradients read back host-side, param mutated through `get_mut`
-///   (which auto-triggers `ensure_host`). This is the pre-M5.3b.10
-///   behavior — correct everywhere, optimal on CPU.
-/// - **Device path** ([`AdamW::new_with_device`]): moments live as
-///   `DeviceHandle`s, the configured backend's `adamw_step` performs the
-///   update on-device, and the param is re-installed via
-///   `TensorStore::replace_device_handle` (never round-tripping through
-///   host). On Metal this folds the entire EMA + bias-correction + update
-///   into one MLX lazy graph with a single terminal `mlx_eval` per step,
-///   eliminating the ~200-param-per-step re-upload churn that the
-///   host-path's `Dirty::Host` flag caused on Qwen3.5-class models.
-///
-/// The on-disk state codec (`AdamWState` in `adamw_state.rs`) is unchanged
-/// by the device path — device-resident moments are readback'd to host via
-/// the stored backend during export, and uploaded during import.
+/// AdamW optimizer with two moment-storage paths: host `Vec<f32>` (default,
+/// [`AdamW::new`]) and device-resident handles ([`AdamW::new_with_device`]).
+/// The device path folds the update into one MLX lazy graph with a single
+/// terminal eval per step, eliminating the per-param re-upload churn the
+/// host path's `Dirty::Host` flag causes on Metal. The on-disk codec
+/// (`AdamWState`) is unchanged — device moments readback to host on export.
 pub struct AdamW {
     lr: f32,
     betas: (f32, f32),
@@ -48,9 +35,8 @@ pub struct AdamW {
     wd: f32,
     step: i32,
     state: HashMap<TensorId, ParamMoments>,
-    /// Present when constructed via `new_with_device`. The backend owns the
-    /// MLX device bridge (on Metal) used by `adamw_step` and for
-    /// device↔host moment migration.
+    /// Present when constructed via `new_with_device`; owns the device
+    /// bridge for `adamw_step` and device↔host moment migration.
     backend: Option<Arc<dyn Backend + Send + Sync>>,
 }
 
@@ -69,8 +55,7 @@ impl std::fmt::Debug for AdamW {
 }
 
 impl AdamW {
-    /// Host-path constructor. Moments stay as `Vec<f32>`; gradient + param
-    /// updates use the host loop. Every existing caller goes through this.
+    /// Host-path constructor; moments stay as `Vec<f32>`.
     pub fn new(lr: f32, betas: (f32, f32), eps: f32, wd: f32) -> Self {
         Self {
             lr,
@@ -83,14 +68,10 @@ impl AdamW {
         }
     }
 
-    /// Device-path constructor. Moments live on the backend; `step()`
-    /// dispatches through `Backend::adamw_step` and installs updated
-    /// params via `TensorStore::replace_device_handle`. Use when the
-    /// store's backend is Metal (or any backend whose `adamw_step` is
-    /// overridden to stay device-resident) — CPU/default-trait-impl
-    /// backends will silently do the readback→host→upload fallback,
-    /// which is strictly slower than the host path, so don't wire this
-    /// up unless the backend actually overrides `adamw_step`.
+    /// Device-path constructor. Use only when the store's backend overrides
+    /// `adamw_step` to stay device-resident — CPU/default-trait backends
+    /// silently fall back to readback→host→upload, strictly slower than the
+    /// host path.
     pub fn new_with_device(
         lr: f32,
         betas: (f32, f32),
@@ -212,13 +193,10 @@ impl AdamW {
             .expect("step_device called without a backend")
             .clone();
 
-        // M5.3b.11: collect every param's (new_param, new_m, new_v) handle
-        // clones during the loop and fire a single terminal
-        // `backend.eval(...)` after — one eval per optimizer step regardless
-        // of parameter count. The MLX chains for independent params share no
-        // sub-node, so batching is safe. `DeviceHandle::Metal(MlxHandle)`
-        // clones are cheap Arc ref-counts, so holding 3 × num_params handles
-        // through the loop costs ~negligible memory.
+        // Collect every param's handle clones during the loop and fire a
+        // single terminal `backend.eval(...)` after — one eval per step
+        // regardless of param count. Per-param chains share no sub-node, so
+        // batching is safe; Metal handle clones are cheap Arc ref-counts.
         let mut pending_eval: Vec<DeviceHandle> = Vec::with_capacity(params.len() * 3);
 
         for &param_id in params {
@@ -232,14 +210,10 @@ impl AdamW {
                 (grad_id, param_snapshot.shape.clone())
             };
 
-            // Wave 2.0: peek at the grad's residency *before* any
-            // `to_host` would touch it. If the gradient is already
-            // device-resident (Wave 2a's embedding/add_broadcast
-            // backwards, P3's mean/mul_scalar, etc.) we route through
-            // `adamw_step_device` and skip the DtoH that turned Wave 2a
-            // into a +1.8% wash (3 423 extra DtoH calls, 41.5 GB extra
-            // bytes per step). The host fallback below stays for params
-            // whose backward producer still emits host grads.
+            // Peek at grad residency before any `to_host`: a device-resident
+            // grad routes through `adamw_step_device`, skipping the DtoH that
+            // measured a +1.8% wash (3423 extra DtoH calls, 41.5 GB/step).
+            // The host fallback stays for grads still produced on host.
             let grad_device_handle = {
                 let grad_tensor = store
                     .tensor(grad_id)
@@ -251,9 +225,8 @@ impl AdamW {
                 }
             };
 
-            // Param: ensure it's on the device (upload if currently Host
-            // or if this is the first step). Then clone the handle so the
-            // backend call borrows it without holding `store` hostage.
+            // Clone the handle so the backend call borrows it without
+            // holding `store` hostage.
             store
                 .ensure_device(param_id)
                 .expect("ensure_device for adamw param");
@@ -264,8 +237,6 @@ impl AdamW {
                 .and_then(|t| t.device_handle.clone())
                 .expect("param device_handle after ensure_device");
 
-            // Initialize moments on first touch: upload zeros through
-            // the backend. Subsequent steps reuse the device handles.
             let entry = self.state.entry(param_id).or_insert_with(|| ParamMoments {
                 m: MomentStorage::Device(
                     backend
@@ -280,8 +251,7 @@ impl AdamW {
                 shape: param_shape.clone(),
             });
 
-            // If a prior host path left host moments behind, migrate them
-            // up to the device now so the update formula sees device state.
+            // A prior host path may have left host moments; migrate them.
             if let MomentStorage::Host(host_m) = &entry.m {
                 let handle = backend
                     .upload(host_m, &entry.shape)
@@ -318,9 +288,7 @@ impl AdamW {
                     )
                     .expect("backend adamw_step_device")
             } else {
-                // Host fallback: grad is still authoritative on host
-                // (e.g. matmul_backward in legacy host path). Mirrors the
-                // pre-Wave-2.0 `to_host` → `adamw_step(&[f32], ...)` path.
+                // Host fallback: grad still authoritative on host.
                 let grad = store
                     .to_host(grad_id)
                     .expect("gradient tensor should be readable from the store");
@@ -342,12 +310,11 @@ impl AdamW {
                     .expect("backend adamw_step")
             };
 
-            // Record cheap Arc-clones for the terminal batched eval below.
             pending_eval.push(new_param.clone());
             pending_eval.push(new_m.clone());
             pending_eval.push(new_v.clone());
 
-            // Install the new param handle WITHOUT going through get_mut
+            // Install the new param handle WITHOUT going through `get_mut`
             // (which would ensure_host → mark Dirty::Host → force re-upload).
             store
                 .replace_device_handle(param_id, new_param)
@@ -357,12 +324,10 @@ impl AdamW {
             entry.v = MomentStorage::Device(new_v);
         }
 
-        // M5.3b.11: one terminal eval for the whole optimizer step. The
-        // Metal backend's `adamw_step` returned every triple unevaluated,
-        // so without this line the MLX graph would accumulate until the
-        // next forward pass's `ensure_host` forces a catch-up eval —
-        // correctness-equivalent but gives up the batching benefit for
-        // the eval counter. The CPU default `Backend::eval` is a no-op.
+        // One terminal eval for the whole step: `adamw_step` returned every
+        // triple unevaluated, so without this the graph accumulates until
+        // the next forward's `ensure_host` forces a catch-up eval. The CPU
+        // default `Backend::eval` is a no-op.
         if !pending_eval.is_empty() {
             let refs: Vec<&DeviceHandle> = pending_eval.iter().collect();
             backend.eval(&refs).expect("batched adamw terminal eval");
@@ -413,13 +378,11 @@ impl AdamW {
         removed
     }
 
-    // Accessors used by the opaque state codec in `adamw_state.rs`.
-    // They deliberately avoid exposing the private `ParamMoments` struct.
-    // Device-resident moments readback through the stored backend.
+    // Accessors for the opaque state codec in `adamw_state.rs`; they
+    // deliberately avoid exposing the private `ParamMoments` struct.
 
-    /// Materialize `(m, v)` as owned host vectors for the caller, regardless
-    /// of whether the moments are currently host- or device-resident.
-    /// Device readback uses the optimizer's stored backend.
+    /// Materialize `(m, v)` as owned host vectors, reading device-resident
+    /// moments back through the stored backend.
     pub(crate) fn moments_host(&self, id: TensorId) -> Option<(Vec<f32>, Vec<f32>)> {
         let moments = self.state.get(&id)?;
         let m = match &moments.m {
@@ -459,9 +422,6 @@ impl AdamW {
         self.step = step;
     }
 
-    /// Install imported moments into the optimizer. On the device path the
-    /// moments upload through the stored backend so the next `step()` stays
-    /// on-device; on the host path they land as `Vec<f32>`.
     pub(crate) fn set_state(&mut self, id: TensorId, m: Vec<f32>, v: Vec<f32>, shape: Vec<usize>) {
         debug_assert_eq!(m.len(), v.len(), "m and v must share length");
         let (m_store, v_store) = if let Some(backend) = self.backend.as_ref() {
@@ -489,10 +449,9 @@ impl AdamW {
     }
 }
 
-// Equivalent of the previous derive(Clone) — kept for API compat but skips
-// device handles (they'd need a backend clone + FFI). The host path round-
-// trips perfectly; device-path clones drop to zero-initialized moments so
-// callers that relied on the derive were never touching device state anyway.
+// Hand-rolled Clone (API compat with the former derive): host moments clone;
+// device moments drop to zero-initialized host vectors — callers that relied
+// on the derive never touched device state.
 impl Clone for AdamW {
     fn clone(&self) -> Self {
         let cloned_state: HashMap<TensorId, ParamMoments> = self
@@ -539,24 +498,15 @@ impl Clone for AdamW {
     }
 }
 
-/// Trait-level view of an optimizer. Today AdamW is the only implementor; the
-/// trait exists so the in-progress training runtime can dispatch
-/// polymorphically over future Lion/Muon/SGD impls without forking every
-/// binary. The state-codec surface (`state_schema` + `export_state` +
-/// `import_state`) is AdamW-shaped on purpose — the [`AdamWState`] value is
-/// the on-disk format, and alternative optimizers will extend the doc schema
-/// (e.g. `"lion-v1"`) when they arrive.
+/// Trait-level optimizer view; AdamW is the only implementor. The state
+/// codec surface is AdamW-shaped — [`AdamWState`] is the on-disk format,
+/// and future optimizers bump the schema tag when they arrive.
 ///
-/// Note on argument order: the trait takes `store` before `params`, which
-/// matches the plan's signature and the conventional "context-first" Rust
-/// style. The concrete `AdamW::step` kept the original `(params, store)`
-/// order for source compatibility with the 4 training binaries; the trait
-/// impl below swaps the two. A trait dispatch always returns `Ok(())` — the
-/// concrete method panics on internal invariant violations (missing
-/// parameter, unreadable grad), and those panics are not reachable from the
-/// well-formed call sites we ship today. If a future optimizer wants real
-/// `Err` paths, it can wire them in without the concrete `AdamW` signature
-/// changing.
+/// Argument order: the trait takes `store` before `params` (context-first);
+/// the concrete `AdamW::step` keeps `(params, store)` for source compat
+/// with the training binaries, and the impl swaps them. Trait `step`
+/// always returns `Ok(())` — the concrete method panics on invariant
+/// violations unreachable from shipped call sites.
 pub trait Optimizer: Send {
     fn step(&mut self, store: &mut TensorStore, params: &[TensorId]) -> Result<()>;
     fn zero_grad(&mut self, store: &mut TensorStore, params: &[TensorId]);
@@ -567,9 +517,7 @@ pub trait Optimizer: Send {
     /// checkpoint codec to validate on import.
     fn state_schema(&self) -> &'static str;
 
-    /// Export moments + scalars keyed by caller-supplied name. Today the doc
-    /// type is AdamW-specific — future optimizers that need a different
-    /// layout will bump the schema tag and/or introduce a new doc variant.
+    /// Export moments + scalars keyed by caller-supplied name.
     fn export_state(&self, names: &[(TensorId, String)]) -> AdamWState;
 
     /// Restore moments; shape mismatch is a hard error; unknown names are
@@ -583,10 +531,6 @@ pub trait Optimizer: Send {
 
 impl Optimizer for AdamW {
     fn step(&mut self, store: &mut TensorStore, params: &[TensorId]) -> Result<()> {
-        // Concrete signature is (&params, &mut store); adapt and wrap. The
-        // concrete method panics on invariant violations, which the trait
-        // contract lets propagate — callers of the trait see the same
-        // behavior as callers of the concrete impl.
         AdamW::step(self, params, store);
         Ok(())
     }

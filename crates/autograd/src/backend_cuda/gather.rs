@@ -1,10 +1,7 @@
 use super::*;
 
-// Device-resident sibling of `cuda_gather_last_dim`: reuses the same
-// `gather_last_dim_f32` NVRTC kernel against a borrowed device slice and
-// returns the per-prefix output on-device. Only the int32 `ids` array
-// crosses PCIe; the `[B*S*V]` source stays on-device. No `synchronize()` —
-// caller owns the terminal eval.
+// Sibling of `cuda_gather_last_dim` over a borrowed device slice; no
+// `synchronize()` — the caller owns the terminal eval.
 #[cfg(not(feature = "no-cuda"))]
 pub(super) fn cuda_gather_last_dim_device(
     backend: &CudaBackend,
@@ -68,11 +65,8 @@ pub(super) fn cuda_gather_last_dim_device(
     Ok(DeviceHandle::Cuda(CudaStorage::new(d_out)))
 }
 
-// Device-resident backward for gather_last_dim. Allocates a
-// zero-filled `[product(src_shape)]` grad on-device and scatters the
-// per-prefix upstream scalar into `(row, ids[row])`. Only the int32
-// `indices` array crosses PCIe; the `[prefix_rows]` upstream slice stays
-// on-device. No `synchronize()` — terminal eval is the caller's.
+// Device-resident backward for gather_last_dim; no `synchronize()` —
+// terminal eval is the caller's.
 #[cfg(not(feature = "no-cuda"))]
 pub(super) fn cuda_gather_last_dim_backward(
     backend: &CudaBackend,
@@ -110,7 +104,7 @@ pub(super) fn cuda_gather_last_dim_backward(
         .stream
         .clone_htod(indices)
         .map_err(|_| AutogradError::TapeInvariant("cuda htod copy failed (gather_bwd ids)"))?;
-    // alloc_zeros gives us the zero-fill for free — kernel only writes the
+    // alloc_zeros gives the zero-fill for free — the kernel only writes the
     // single (row, ids[row]) slot per prefix row.
     let mut d_grad = alloc_zeros_retry::<f32>(backend, total)
         .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (gather_bwd grad)"))?;
@@ -222,7 +216,7 @@ pub(super) fn cuda_scatter_add_rows(
         });
     }
     let out_len = vocab * feature_dim;
-    // Zero-initialize the accumulator on-device — the kernel only adds.
+    // Zero-initialize: the kernel only adds into the accumulator.
     let mut d_out = alloc_zeros_retry::<f32>(backend, out_len)
         .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed"))?;
     if prefix_rows == 0 || feature_dim == 0 {

@@ -354,12 +354,9 @@ pub const CORE_CHUNK: usize = 8192;
 /// the recurrence on its OWN rows (all heads) and the state crosses ranks in
 /// global order. The launcher's zigzag shard gives rank `r` global chunks `r`
 /// and `2N-1-r` as two equal local blocks, so the walk visits chunks 0..2N in
-/// order; a block's predecessor is either the previous local block or a peer
-/// rank, whose (final_state, conv window) arrive through the taped
-/// chunked CP op, which returns their gradients the same way.
-/// Per-rank transient is O(local seq) — this is what lets the global sequence
-/// grow past what one rank's memory could hold under the former all-to-all
-/// form, at the price of serializing the recurrence across ranks.
+/// order. Per-rank transient is O(local seq) — this is what lets the global
+/// sequence grow past what one rank's memory could hold under the former
+/// all-to-all form, at the price of serializing the recurrence across ranks.
 /// `params.seq_len` is this rank's shard. `cp_size == 1` is
 /// `linear_attention_core` verbatim.
 #[allow(clippy::too_many_arguments)]
@@ -1332,7 +1329,6 @@ fn taped_input_elems(p: LinearAttentionParams) -> usize {
     qkv_elems(p) + p.num_value_heads * p.value_dim + 2 * p.num_value_heads
 }
 
-/// Bytes retained by `try_linear_attention_forward_device`.
 pub fn linear_attention_ctx_bytes(params: LinearAttentionParams) -> usize {
     let (hv, kd, vd) = (params.num_value_heads, params.key_dim, params.value_dim);
     let seq = params.seq_len;
@@ -2111,9 +2107,9 @@ pub(crate) fn linear_attention_backward(
 
                     let prev_state = if seq_idx == 0 {
                         // Pre-decay state entering position 0. On the carry path this is
-                        // the seeded per-head `initial_state` (matching the forward seed at
-                        // ~1787), so `dexp_g` includes `Σ initial_state · dL/dS'_0`; without
-                        // it the a_log/dt_bias decay-gate grads are biased. Non-carry: zeros.
+                        // the seeded per-head `initial_state`, so `dexp_g` includes
+                        // `Σ initial_state · dL/dS'_0`; without it the a_log/dt_bias
+                        // decay-gate grads are biased. Non-carry: zeros.
                         match carry.initial_state {
                             Some(initial_state) => {
                                 let base = state_base(
@@ -2671,7 +2667,7 @@ fn conv1d_backward(
     }
 
     // Carried causal-conv window `[batch, conv_kernel-1, qkv_dim]`, seeded by the
-    // forward at negative `src_rel` (matching `conv_window_input` at ~1762).
+    // forward at negative `src_rel` (see `conv_window_input`).
     let conv_window = params.conv_kernel.saturating_sub(1);
     let mut grad_input = vec![0.0_f32; input.len()];
     let mut grad_weight = vec![0.0_f32; conv1d_weight.len()];

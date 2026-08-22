@@ -45,8 +45,8 @@ impl SafetensorsRegistry {
     }
 
     /// Like [`load_into`], but fails if any tensor currently registered in
-    /// `self` is missing from the file. Use on resume paths where a partial
-    /// or mismatched checkpoint must not silently hybridize with base-model
+    /// `self` is missing from the file — resume paths where a partial or
+    /// mismatched checkpoint must not silently hybridize with base-model
     /// weights.
     pub fn load_into_strict(&mut self, store: &mut TensorStore, path: &Path) -> Result<()> {
         self.load_into_impl(store, path, true)
@@ -70,9 +70,9 @@ impl SafetensorsRegistry {
         let tensors = SafeTensors::deserialize(&mmap[..])
             .map_err(|err| tape_invariant(format!("failed to deserialize safetensors: {err}")))?;
 
-        // In strict mode we remember which currently-registered names have
-        // been covered by the file, and error on any that are missing after
-        // the loop. Unknown names still auto-register (same as non-strict).
+        // Strict mode: remember which registered names the file covered;
+        // error on any missing after the loop. Unknown names still
+        // auto-register (same as non-strict).
         let mut seen = if strict {
             Some(std::collections::HashSet::<String>::new())
         } else {
@@ -151,10 +151,9 @@ impl SafetensorsRegistry {
         Ok(())
     }
 
-    // infer/'s DeviceMatrix::from_safetensors reinterprets the file bytes as
-    // `&[bf16]` and rejects anything else. The f32 path above stays bit-exact
-    // for training-side roundtrip tests; this bf16 path is the one whose
-    // output infer can actually consume end-to-end.
+    // infer's `DeviceMatrix::from_safetensors` reinterprets the file bytes as
+    // `&[bf16]` and rejects anything else. The f32 path stays bit-exact for
+    // training-side roundtrip tests; this bf16 path is the one infer consumes.
     pub fn save_from_bf16(&self, store: &mut TensorStore, path: &Path) -> Result<()> {
         let data = self
             .map
@@ -233,8 +232,8 @@ impl safetensors::View for TensorFileBf16View {
 ///
 /// The obvious `chunks_exact(2).map(u16::from_le_bytes)` is one scalar
 /// unaligned read per element; `train::qwen35_loader` measured that shape into
-/// a watchdog kill on `embed_tokens`/`lm_head`, which are 1.27 B elements each
-/// on the 27B checkpoints. Bulk-copy first, then widen with a shift.
+/// a watchdog kill on `embed_tokens`/`lm_head` (1.27 B elements each on the
+/// 27B checkpoints). Bulk-copy first, then widen with a shift.
 #[must_use]
 pub fn bf16_bytes_to_f32(bytes: &[u8]) -> Vec<f32> {
     let mut bits = vec![0u16; bytes.len() / 2];

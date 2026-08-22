@@ -1,15 +1,8 @@
 use super::*;
 
-// Compute both matmul gradients via two cuBLAS SGEMM calls with an OP_T on
-// whichever operand must be transposed; avoids the host-side physical
-// transpose the old CPU fallback did and keeps the math on-device.
-//
-// Row-major conventions in the header comment (swap-and-OP_N forward trick)
-// carry through: we reuse the same "pass B first, then A" ordering. For
-// `grad_a = dC @ B^T` we pass `(B, dC, transa=OP_T, transb=OP_N)`; for
-// `grad_b = A^T @ dC` we pass `(dC, A, transa=OP_N, transb=OP_T)`. See the
-// file-level comment + derivation in the companion commit for the full
-// dimension/ld walk-through. PENDING REMOTE CUDA VERIFICATION.
+// Two cuBLAS SGEMMs with OP_T on the transposed operand, avoiding the
+// host-side physical transpose. Operand order is the cuBLAS column-major
+// swap — see per-branch comments. PENDING REMOTE CUDA VERIFICATION.
 #[cfg(not(feature = "no-cuda"))]
 pub(super) fn cuda_matmul_backward(
     backend: &CudaBackend,
@@ -40,13 +33,11 @@ pub(super) fn cuda_matmul_backward(
             let k = a_shape[1];
             let n = b_shape[1];
 
-            // Upload inputs once each and reuse for both SGEMMs.
             let d_a = backend.upload_slice(a, a_shape)?;
             let d_b = backend.upload_slice(b, b_shape)?;
             let d_g = backend.upload_slice(grad_out, grad_out_shape)?;
 
             let grad_a_host = if need_grad_a {
-                // grad_a[M,K] = grad_out[M,N] @ B^T[N,K]
                 // cuBLAS: first_arg=B(OP_T), second_arg=dC(OP_N); m=K,n=M,k=N.
                 // lda = N (B cm[N,K]), ldb = N (dC cm[N,M]), ldc = K.
                 let mut c = alloc_zeros_retry::<f32>(backend, m * k)
@@ -75,7 +66,6 @@ pub(super) fn cuda_matmul_backward(
             };
 
             let grad_b_host = if need_grad_b {
-                // grad_b[K,N] = A^T[K,M] @ grad_out[M,N]
                 // cuBLAS: first_arg=dC(OP_N), second_arg=A(OP_T); m=N,n=K,k=M.
                 // lda = N (dC cm[N,M]), ldb = K (A cm[K,M]), ldc = N.
                 let mut c = alloc_zeros_retry::<f32>(backend, k * n)
@@ -208,12 +198,8 @@ pub(super) fn cuda_matmul_backward(
     }
 }
 
-// Device-resident sibling of `cuda_matmul_backward`. Same cuBLAS dispatch
-// (two SGEMMs with OP_T on the transposed operand) but consumes existing
-// `CudaSlice<f32>` handles via `cuda_slice` and emits the gradients as
-// fresh `CudaSlice<f32>` buffers wrapped in `DeviceHandle::Cuda`. No
-// `synchronize()` — the caller's terminal `eval` does the single host
-// fence per training step (contract).
+// No `synchronize()` — the caller's terminal `eval` does the single host
+// fence per training step.
 #[cfg(not(feature = "no-cuda"))]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn cuda_matmul_backward_device(
@@ -261,7 +247,6 @@ pub(super) fn cuda_matmul_backward_device(
             let n = b_shape[1];
 
             let grad_a_handle = if need_grad_a {
-                // grad_a[M,K] = grad_out[M,N] @ B^T[N,K]
                 let mut c = alloc_zeros_retry::<f32>(backend, m * k)
                     .map_err(|_| cuda_alloc_failed("matmul_backward_device grad_a", vec![m, k]))?;
                 let cfg = GemmConfig::<f32> {
@@ -290,7 +275,6 @@ pub(super) fn cuda_matmul_backward_device(
             };
 
             let grad_b_handle = if need_grad_b {
-                // grad_b[K,N] = A^T[K,M] @ grad_out[M,N]
                 let mut c = alloc_zeros_retry::<f32>(backend, k * n)
                     .map_err(|_| cuda_alloc_failed("matmul_backward_device grad_b", vec![k, n]))?;
                 let cfg = GemmConfig::<f32> {
@@ -508,7 +492,6 @@ pub(super) fn cuda_matmul_bt_input_grad_device(
     Ok(DeviceHandle::Cuda(CudaStorage::new(grad_a)))
 }
 
-// Device-resident sibling of `cpu_matmul_bt_backward`.
 #[cfg(not(feature = "no-cuda"))]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn cuda_matmul_bt_backward_device(

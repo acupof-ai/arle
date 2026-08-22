@@ -1,5 +1,5 @@
-// Index side-channel: indices stored as Vec<usize> in SavedContext, not in TensorStore.
-// Avoids infrastructure sprawl (Option A).
+// Indices live as Vec<usize> in SavedContext, not in TensorStore — avoids
+// integer-tensor infrastructure sprawl.
 
 use smallvec::smallvec;
 
@@ -16,14 +16,13 @@ pub fn embedding(
     store: &mut TensorStore,
     tape: &mut Tape,
 ) -> Result<TensorId> {
-    // Dispatch on device-handle presence (same shape as the rope
-    // gate — `device_handle.is_some() && dirty != Host`). Embedding is
-    // the very first op in a forward pass; taking the lazy branch here
-    // lets downstream lazy ops (rmsnorm, matmul, silu, rope, exp,
-    // softmax) compose end-to-end with no intermediate eval. The table
-    // is typically Dirty::Host on first call but can become Dirty::Both
-    // after an AdamW step that uploads updated weights — both cases
-    // route to the lazy path.
+    // Dispatch on device-handle presence (same gate as rope:
+    // `device_handle.is_some() && dirty != Host`). Embedding is the first
+    // op in a forward pass; the lazy branch here lets downstream lazy ops
+    // (rmsnorm, matmul, silu, rope, exp, softmax) compose end-to-end with
+    // no intermediate eval. The table is typically Dirty::Host on first
+    // call but becomes Dirty::Both after an AdamW step uploads updated
+    // weights — both route to the lazy path.
     let has_device_handle = {
         let t = store.tensor(table)?;
         (t.device_handle.is_some() && t.dirty != Dirty::Host)
@@ -54,8 +53,8 @@ fn embedding_device_lazy(
     let vocab = table_shape[0];
     let hidden = table_shape[1];
     let seq_len = indices.len();
-    // Bounds-check once here; the lazy helper re-checks but the early
-    // error carries the original `usize` index the caller passed.
+    // Bounds-check here (the lazy helper re-checks) so the early error
+    // carries the original `usize` index the caller passed.
     for &index in indices {
         if index >= vocab {
             return Err(AutogradError::IndexOutOfBounds {
@@ -127,8 +126,8 @@ fn embedding_host_eager(
         .embedding_forward(&table_tensor.data, vocab, hidden, &ids_i32)?;
     debug_assert_eq!(output.len(), seq_len * hidden);
 
-    // Raw indices do not carry an explicit [B, S] shape, so M1 treats them as a
-    // single batch row `[1, S]` instead of introducing a separate integer tensor store.
+    // Raw indices carry no explicit [B, S] shape, so they are treated as a
+    // single batch row `[1, S]` rather than introducing an integer tensor store.
     let output_shape = vec![1, seq_len, hidden];
     let output_id = store.alloc(Tensor::new(output, output_shape, false)?);
     TapeEntry {
@@ -178,11 +177,10 @@ pub(crate) fn embedding_backward(
         });
     }
 
-    // Route Dirty::Device upstream through
-    // `embedding_backward_device` so the `[1, S, H]` upstream tensor and the
-    // resulting `[V, H]` table grad stay on-device. atomicAdd inside the
-    // kernel handles duplicate token ids (e.g. `the` appearing N times in a
-    // batch) correctly. Host fallback below preserved for CPU/Metal paths.
+    // Route Dirty::Device upstream through `embedding_backward_device` so
+    // the `[1, S, H]` upstream and the `[V, H]` table grad stay on-device.
+    // atomicAdd inside the kernel handles duplicate token ids correctly;
+    // the host fallback below serves CPU/Metal.
     let device_path_ok = {
         let upstream = store.tensor(output_grad_id)?;
         upstream.dirty != Dirty::Host && upstream.device_handle.is_some()

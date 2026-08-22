@@ -10,19 +10,14 @@ use std::sync::Arc;
 #[cfg(not(feature = "no-cuda"))]
 use std::sync::Mutex;
 
-/// Kernel-source family per the T7 classification in
-/// docs/plans/2026-08-20-cuda-operator-inventory.md §"Autograd classification".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KernelFamily {
-    /// Forward tape math (NVRTC-only).
     Forward,
-    /// Backward tape math and gradient accumulation (NVRTC-only).
     Backward,
     /// Fused SDPA fwd+bwd plus the KV-cache/slice layout kernels feeding it.
     Attention,
     /// Rollout decode helpers and quantized-weight dequant for rollout.
     Rollout,
-    /// Optimizer step.
     Optimizer,
     /// bf16<->f32 bit casts bridging tape and serving tensors.
     Bridge,
@@ -30,8 +25,8 @@ pub enum KernelFamily {
     Uncertain,
 }
 
-/// file -> family catalog for the 29 NVRTC sources. Order is load-bearing:
-/// it fixes both the concatenated compile unit and the identity hash.
+/// Order is load-bearing: it fixes both the concatenated compile unit and the
+/// identity hash.
 #[cfg(not(feature = "no-cuda"))]
 const KERNEL_SOURCES: &[(&str, KernelFamily, &str)] = &[
     (
@@ -360,7 +355,6 @@ impl KernelCache {
         }
     }
 
-    /// Compile-and-load the bf16 module under the cache lock, once.
     #[cfg(not(feature = "no-cuda"))]
     fn ensure_bf16_module(&self) -> Result<std::sync::MutexGuard<'_, Option<DtypeModule>>> {
         let mut guard = self.bf16.lock().map_err(|_| {
@@ -381,9 +375,8 @@ impl KernelCache {
         Ok(guard)
     }
 
-    /// Warm the NVRTC module for `dtype` ahead of the hot path. F32 always
-    /// compiles at construction; Bf16 compiles here when the tape dtype is
-    /// declared, instead of on the first hot-path `function_for` call.
+    /// F32 always compiles at construction; Bf16 compiles here when the tape
+    /// dtype is declared, instead of on the first hot-path `function_for` call.
     pub(super) fn warm_dtype(&self, dtype: TapeDtype) -> Result<()> {
         match dtype {
             TapeDtype::F32 => Ok(()),
@@ -402,7 +395,6 @@ impl KernelCache {
         }
     }
 
-    /// Complete NVRTC artifact identity for the `dtype` compile unit.
     pub(super) fn nvrtc_identity(&self, dtype: TapeDtype) -> Result<NvrtcIdentity> {
         #[cfg(feature = "no-cuda")]
         {

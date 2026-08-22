@@ -1,9 +1,7 @@
 use super::*;
 
-// Device-resident backward for `mul_scalar(x, k)`. Reads
-// `upstream[i] * k` via `mul_scalar_backward_f32` (functionally identical
-// to the forward `mul_scalar_f32`, but kept as a separately-registered
-// kernel so the audit trail in nsys traces matches the autograd op name).
+// Separate kernel registration (functionally identical to the forward
+// `mul_scalar_f32`) so the nsys audit trail matches the autograd op name.
 // Returned handle is unevaluated — terminal `eval` is the caller's.
 #[cfg(not(feature = "no-cuda"))]
 pub(super) fn cuda_mul_scalar_backward_device(
@@ -39,10 +37,7 @@ pub(super) fn cuda_mul_scalar_backward_device(
     Ok(DeviceHandle::Cuda(CudaStorage::new(d_out)))
 }
 
-// Device-resident backward for `mean(x)`. The upstream is a rank-0
-// device scalar; the kernel reads it once per thread (block-broadcast
-// from L1 after the first warp) and writes `upstream * (1/N)` across
-// `elem_count` slots. Returned handle is unevaluated.
+// Upstream is a rank-0 device scalar. Returned handle is unevaluated.
 #[cfg(not(feature = "no-cuda"))]
 pub(super) fn cuda_mean_backward_device(
     backend: &CudaBackend,
@@ -127,9 +122,7 @@ pub(super) fn cuda_sum_backward_device(
     Ok(DeviceHandle::Cuda(CudaStorage::new(d_out)))
 }
 
-// Device-resident gradient accumulation. Allocates a fresh output buffer
-// and writes `dest[i] + src[i]` via the `add_into_f32` NVRTC kernel. The
-// returned handle is unevaluated — terminal `eval` is the caller's.
+// Returned handle is unevaluated — terminal `eval` is the caller's.
 #[cfg(not(feature = "no-cuda"))]
 pub(super) fn cuda_add_into_device(
     backend: &CudaBackend,

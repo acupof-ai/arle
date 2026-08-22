@@ -15,10 +15,10 @@ pub fn add_broadcast(
 ) -> Result<TensorId> {
     // If EITHER operand is lazily device-resident, go lazy and upload the
     // other. The alternative (host_eager with `ensure_host` on the
-    // device-resident side) would force an eval on the upstream lazy
-    // graph (e.g. a matmul output) — exactly the readback we are trying
-    // to eliminate. Uploading a small host side (bias, mask) is cheap;
-    // forcing a readback of a large activation is not.
+    // device-resident side) would force an eval on the upstream lazy graph
+    // (e.g. a matmul output) — exactly the readback we are eliminating.
+    // Uploading a small host side (bias, mask) is cheap; forcing a readback
+    // of a large activation is not.
     let a_use_lazy = {
         let t = store.tensor(a)?;
         t.device_handle.is_some() && t.dirty != Dirty::Host
@@ -80,11 +80,9 @@ fn add_broadcast_host_eager(
     store: &mut TensorStore,
     tape: &mut Tape,
 ) -> Result<TensorId> {
-    // Mixed-residency fallback: at least one input is on the host side,
-    // or one is device-resident while the other is host-only (e.g. the
-    // Linear-bias case where `a` is a matmul output on the device and
-    // `b` is a freshly-initialized host bias). Sync both to host before
-    // we clone + call the host-side `add_broadcast_forward`.
+    // Mixed-residency fallback: at least one input is host-only (e.g. the
+    // Linear-bias case where `a` is a matmul output on device and `b` is a
+    // freshly-initialized host bias). Sync both to host first.
     store.ensure_host(a)?;
     store.ensure_host(b)?;
     let a_tensor = store.tensor_host(a)?;
@@ -141,11 +139,11 @@ pub(crate) fn add_broadcast_backward(
     let a_requires_grad = store.tensor(a)?.requires_grad;
     let b_requires_grad = store.tensor(b)?.requires_grad;
 
-    // Route Dirty::Device upstream through
-    // `add_broadcast_backward_device` so the `[B, S, H]` upstream tensor
-    // and the `[H]`-shaped b-grad stay on-device. grad_a is the upstream
-    // tensor itself (no reduce); just share its handle when device-resident
-    // — that avoids both a memcpy and an extra device alloc.
+    // Route Dirty::Device upstream through `add_broadcast_backward_device`
+    // so the `[B, S, H]` upstream and the `[H]`-shaped b-grad stay
+    // on-device. grad_a is the upstream tensor itself (no reduce); share
+    // its handle when device-resident — avoids both a memcpy and an extra
+    // device alloc.
     let device_path_ok = {
         let upstream = store.tensor(output_grad_id)?;
         upstream.dirty != Dirty::Host && upstream.device_handle.is_some()
@@ -160,8 +158,8 @@ pub(crate) fn add_broadcast_backward(
             .clone();
         if a_requires_grad {
             // grad_a = upstream (identity through broadcast-add). Share the
-            // same device handle — the tape will accumulate into `a`'s grad
-            // via the device-resident `add_into_device` path.
+            // handle — the tape accumulates into `a`'s grad via the
+            // device-resident `add_into_device` path.
             let grad_a_id = store.alloc_device_tensor(a_shape.clone(), upstream_handle.clone())?;
             grads.push((a, grad_a_id));
         }

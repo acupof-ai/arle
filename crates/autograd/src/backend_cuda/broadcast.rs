@@ -34,8 +34,6 @@ pub(super) fn cuda_add_broadcast(
         });
     }
 
-    // Build right-aligned b-strides of length `out_rank`: 0 on broadcast axes
-    // (axis missing from b_shape or b_shape dim == 1), contiguous otherwise.
     let out_rank = a_shape.len();
     let rank_offset = out_rank - b_shape.len();
     let mut b_strides = vec![0_i32; out_rank];
@@ -304,10 +302,6 @@ pub(super) fn cuda_broadcast_expand_device(
     Ok(DeviceHandle::Cuda(CudaStorage::new(d_out)))
 }
 
-// Device-resident add_broadcast backward. Reduces the
-// upstream tensor along broadcast axes into a `[b_shape]` grad. One block
-// per output element; threads cooperatively reduce over the cartesian
-// product of contracted axes via shared memory.
 #[cfg(not(feature = "no-cuda"))]
 pub(super) fn cuda_add_broadcast_backward_device(
     backend: &CudaBackend,
@@ -372,9 +366,6 @@ pub(super) fn cuda_add_broadcast_backward_device(
         };
     }
 
-    // Build right-aligned b-strides (length=out_rank, 0 on contracted axes;
-    // contiguous row-major stride within b on matching axes). Mirrors the
-    // forward `cuda_add_broadcast` helper.
     let rank_offset = out_rank - b_shape.len();
     let mut b_strides = vec![0_i32; out_rank];
     let mut stride_b: i32 = 1;
@@ -387,7 +378,6 @@ pub(super) fn cuda_add_broadcast_backward_device(
         }
         stride_b = stride_b.saturating_mul(dim as i32);
     }
-    // Row-major contiguous strides in upstream (a-shape layout).
     let mut out_strides = vec![0_i32; out_rank];
     let mut stride_a: i32 = 1;
     for i in (0..out_rank).rev() {

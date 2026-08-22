@@ -32,8 +32,8 @@ pub(super) fn cuda_rope(
             got: vec![x.len()],
         });
     }
-    // Partial rotary (cos rows = rotary_dim/2 ≤ head_dim/2): rotate the leading
-    // segment, pass the tail through — mirrors `cpu_rope_forward`.
+    // Partial rotary (cos rows = rotary_dim/2 ≤ head_dim/2): rotate the
+    // leading segment, pass the tail through — mirrors `cpu_rope_forward`.
     let rot_half = cos.len().checked_div(seq).unwrap_or(0);
     if cos.len() != sin.len() || rot_half == 0 || rot_half > half_dim || cos.len() != seq * rot_half
     {
@@ -209,12 +209,11 @@ pub(super) fn cuda_rope_device(
     Ok(DeviceHandle::Cuda(CudaStorage::new(d_out)))
 }
 
-// Device-resident backward for `rope`. Same launch shape as
-// `cuda_rope` (one block per (batch, head, token); block=min(half_dim,256)).
-// Only difference vs the forward kernel is the inlined `sin -> -sin` sign
-// flip — `cpu_rope_backward` does the equivalent via a host
+// Device-resident backward for `rope`. Same launch shape as `cuda_rope`.
+// The only difference vs the forward kernel is the inlined `sin -> -sin`
+// sign flip — `cpu_rope_backward` does the equivalent via a host
 // `neg_forward(sin) → cpu_rope_forward` chain. cos/sin upload fresh every
-// call (tiny: `[seq, head_dim/2]` per call).
+// call (tiny: `[seq, head_dim/2]`).
 #[cfg(not(feature = "no-cuda"))]
 pub(super) fn cuda_rope_backward_device(
     backend: &CudaBackend,

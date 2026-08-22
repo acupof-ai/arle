@@ -145,8 +145,8 @@ pub(crate) fn matmul_backward(
     // upstream gradient never round-trip through host — the LM-head GEMM's
     // `grad_out: &[f32]` is otherwise the single largest (1 GB) readback per
     // step. Heal host-resident operands first (mirrors matmul_bt_backward) so
-    // one upstream host grad (e.g. from a host concat backward) doesn't demote
-    // this GEMM — and everything downstream — to the host contract.
+    // one upstream host grad doesn't demote this GEMM — and everything
+    // downstream — to the host contract.
     if store.backend().device() != Device::Cpu {
         store.ensure_device(a)?;
         store.ensure_device(b)?;
@@ -203,9 +203,9 @@ pub(crate) fn matmul_backward(
         return Ok(grads);
     }
 
-    // Host-eager fallback. Any operand without a device handle (or already
-    // marked `Dirty::Host`) drops the whole call back onto the legacy
-    // `matmul_backward(&[f32], …)` contract, matching pre-P2 behaviour.
+    // Host-eager fallback: any operand without a device handle (or already
+    // `Dirty::Host`) drops the whole call onto the legacy
+    // `matmul_backward(&[f32], …)` contract.
     let a_tensor = store.tensor_host(a)?;
     let b_tensor = store.tensor_host(b)?;
     let upstream = store.tensor_host(output_grad_id)?;

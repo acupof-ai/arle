@@ -100,12 +100,8 @@ pub fn add_consuming_rhs(
 }
 
 pub fn mul(a: TensorId, b: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<TensorId> {
-    // Dispatch is OR-lazy — if EITHER operand is device-resident,
-    // upload the other and stay on the MLX graph. Same rationale as
-    // `add_broadcast`: the hot path is `attn * gate` and `silu(gate) * up`
-    // in Qwen3.5, where both operands are Dirty::Device chained from prior
-    // matmul/sigmoid/silu nodes. Forcing a readback on either side would
-    // flush the whole upstream graph.
+    // OR-lazy dispatch: either operand device-resident → stay on device;
+    // a readback on either side flushes the whole upstream graph.
     let a_use_lazy = {
         let t = store.tensor(a)?;
         t.device_handle.is_some() && t.dirty != Dirty::Host
@@ -171,9 +167,8 @@ fn mul_host_eager(
     store: &mut TensorStore,
     tape: &mut Tape,
 ) -> Result<TensorId> {
-    // Mirror `add_broadcast_host_eager`: even on CPU backend, operands may
-    // be Dirty::Device-on-CPU-handle, so ensure_host synchronizes before
-    // `.clone()` (which asserts `dirty != Device`).
+    // Even on CPU backend, operands may be Dirty::Device-on-CPU-handle, so
+    // ensure_host synchronizes before `.clone()` (which asserts `dirty != Device`).
     store.ensure_host(a)?;
     store.ensure_host(b)?;
     let (a_data, a_shape) = {
@@ -450,11 +445,8 @@ pub(crate) fn mul_backward(
         return Ok(GradPairs::new());
     }
 
-    // Route through `mul_backward_device` whenever upstream and
-    // both saved operands are device-resident. The host path does
-    // `to_host(upstream) + tensor_host(a) + tensor_host(b)`, forcing
-    // three readbacks per layer (Qwen3.5 hot paths `attn * gate` and
-    // `silu(gate) * up` × 28 layers).
+    // Route through `mul_backward_device` when all three are device-resident
+    // — the host path forces three readbacks per layer.
     let upstream_shape = store.tensor(output_grad_id)?.shape.clone();
     let device_path_ok = {
         let upstream = store.tensor(output_grad_id)?;
@@ -546,13 +538,9 @@ pub(crate) fn mul_scalar_backward(
         return Ok(GradPairs::new());
     }
 
-    // Route Dirty::Device upstream through `mul_scalar_backward_device`
-    // so the gradient stays on-device. The host path does
-    // `to_host(upstream) → mul_scalar_forward → alloc Tensor::new`, which
-    // (combined with `mean_backward`'s host fallback) is the *first*
-    // host op in the CE-loss backward chain. Keeping this on-device unblocks
-    // every downstream `device_path_ok` gate (matmul / softmax / gather /
-    // accumulate_grad).
+    // Route Dirty::Device upstream through `mul_scalar_backward_device` —
+    // the host fallback is the first host op in the CE-loss backward chain
+    // and would demote every downstream `device_path_ok` gate.
     let upstream_shape = store.tensor(output_grad_id)?.shape.clone();
     let input_shape = store.tensor(a)?.shape.clone();
     let device_path_ok = {

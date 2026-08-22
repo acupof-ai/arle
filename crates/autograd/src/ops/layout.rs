@@ -13,12 +13,8 @@ pub fn reshape(
     store: &mut TensorStore,
     tape: &mut Tape,
 ) -> Result<TensorId> {
-    // Dispatch on device-handle presence (same gate as rope /
-    // embedding / gather / AdamW). Reshape is free on MLX — `mlx_reshape`
-    // is metadata-only — so taking the lazy branch when x is device-
-    // resident keeps the whole forward chain on-device. Qwen3.5 hits this
-    // ~6× per attention layer (q/k/v projection + attn-out reshape) × 28
-    // layers = ~168 evals/step.
+    // `mlx_reshape` is metadata-only, so the lazy branch keeps the whole
+    // forward chain on-device.
     let has_device_handle = {
         let t = store.tensor(x)?;
         t.device_handle.is_some() && t.dirty != Dirty::Host
@@ -104,10 +100,7 @@ pub fn transpose(
     store: &mut TensorStore,
     tape: &mut Tape,
 ) -> Result<TensorId> {
-    // Same gate as `reshape`. `mlx_transpose_axes` is a lazy
-    // view op — MLX fuses it into downstream GEMMs, so we pay nothing
-    // for staying on device. Qwen3.5 q/k/v projections transpose once
-    // each × 3 × 28 layers = 84 evals/step.
+    // `mlx_transpose_axes` is a lazy view MLX fuses into downstream GEMMs.
     let has_device_handle = {
         let t = store.tensor(x)?;
         t.device_handle.is_some() && t.dirty != Dirty::Host
@@ -295,11 +288,7 @@ pub fn slice(
     store: &mut TensorStore,
     tape: &mut Tape,
 ) -> Result<TensorId> {
-    // Dispatch on device-handle presence (same gate as reshape /
-    // transpose / rope / embedding). `mlx_slice` is lazy on Metal — fuses
-    // with downstream matmul. Qwen3.5 hits this 2× per attention layer
-    // (q/gate split from the fused q_full projection) × 28 layers = 56
-    // evals/step.
+    // `mlx_slice` is lazy on Metal — fuses with downstream matmul.
     let has_device_handle = {
         let t = store.tensor(x)?;
         t.device_handle.is_some() && t.dirty != Dirty::Host
@@ -413,9 +402,6 @@ fn slice_host_eager(
     Ok(output_id)
 }
 
-/// Concatenate N tensors of equal rank along `axis`. All inputs must match on
-/// every axis except `axis`. General over rank and axis (unlike the rank-4-only
-/// `cat_seq`/`cat_heads`): the CP linear-attn transport concats rank-3 activations
 /// Add a slice's upstream gradient into an existing gradient buffer for its
 /// input, instead of zero-filling a fresh full-size one for the merge to sum.
 ///
@@ -477,6 +463,9 @@ pub(crate) fn slice_backward_into(
     Ok(true)
 }
 
+/// Concatenate N tensors of equal rank along `axis`. All inputs must match on
+/// every axis except `axis`. General over rank and axis (unlike the rank-4-only
+/// `cat_seq`/`cat_heads`): the CP linear-attn transport concats rank-3 activations
 /// on the feature axis and the rank-2 packed conv weight on axis 0. Host path —
 /// this is layout glue, and the CP shuffle it feeds is pod-only regardless.
 pub fn cat(
@@ -586,8 +575,8 @@ pub(crate) fn cat_backward(
     };
     let axis_total: usize = input_shapes.iter().map(|s| s[axis]).sum();
 
-    // Each input's grad is the upstream sliced to its axis range — on-device when
-    // the upstream is device-resident, else host (same round-trip concern as forward).
+    // Each input's grad is the upstream sliced to its axis range — on-device
+    // when the upstream is device-resident, else host.
     let device_path_ok = {
         let upstream = store.tensor(output_grad_id)?;
         upstream.dirty != Dirty::Host && upstream.device_handle.is_some()
@@ -923,8 +912,7 @@ fn transpose_data(
 
 /// Broadcast-copy `src` up to `target_shape` (right-aligned; each src axis is 1
 /// or equal). Replaces the `add_broadcast(zeros, src)` idiom in `repeat_kv`: no
-/// full-size zeros carrier on the tape. Gradient = sum-reduce over the expanded
-/// axes, bit-identical to the old add-broadcast path.
+/// full-size zeros carrier on the tape.
 pub fn broadcast_expand(
     src: TensorId,
     target_shape: &[usize],

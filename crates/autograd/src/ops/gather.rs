@@ -1,5 +1,5 @@
-// Index side-channel: indices stored as Vec<usize> in SavedContext, not in TensorStore.
-// Avoids infrastructure sprawl (Option A).
+// Indices live as Vec<usize> in SavedContext, not in TensorStore — avoids
+// integer-tensor infrastructure sprawl.
 
 use smallvec::smallvec;
 
@@ -15,12 +15,10 @@ pub fn gather_last_dim(
     store: &mut TensorStore,
     tape: &mut Tape,
 ) -> Result<TensorId> {
-    // Dispatch on device-handle presence (same gate as rope /
-    // rmsnorm / embedding — `device_handle.is_some() && dirty != Host`).
-    // `gather_last_dim` is the final op in the CE-loss path: logits come
-    // straight out of the output matmul, so staying on-device through the
-    // per-row gather keeps the entire forward lazy. Dirty::Host inputs
-    // take the eager host path.
+    // Dispatch on device-handle presence (same gate as rope / rmsnorm /
+    // embedding). `gather_last_dim` is the final op in the CE-loss path:
+    // logits come straight out of the output matmul, so staying on-device
+    // keeps the entire forward lazy. Dirty::Host inputs take the eager path.
     let has_device_handle = {
         let t = store.tensor(src)?;
         t.device_handle.is_some() && t.dirty != Dirty::Host
@@ -60,8 +58,8 @@ fn gather_last_dim_device_lazy(
             got: indices.len(),
         });
     }
-    // Bounds-check once here; the lazy helper re-checks but the early
-    // error carries the original `usize` index the caller passed.
+    // Bounds-check here (the lazy helper re-checks) so the early error
+    // carries the original `usize` index the caller passed.
     for &index in indices {
         if index >= vocab {
             return Err(AutogradError::IndexOutOfBounds {
@@ -187,12 +185,10 @@ pub(crate) fn gather_last_dim_backward(
         });
     }
 
-    // Fast-path the backward when the upstream gradient is still
-    // device-resident. This keeps the
+    // Fast-path when the upstream grad is still device-resident: keeps the
     // `[B, S, V]` grad on-device for `log_softmax_last_axis_backward`'s
-    // upstream — the two backwards form the chain that nsys flagged as
-    // the host-readback bottleneck. Only the int32 `indices` array
-    // crosses PCIe (KB-scale, not the GB-scale data tensor).
+    // upstream — the chain nsys flagged as the host-readback bottleneck.
+    // Only the int32 `indices` cross PCIe (KB-scale, not the GB-scale tensor).
     let upstream_on_device = store.tensor(output_grad_id)?.dirty == Dirty::Device
         && store.tensor(output_grad_id)?.device_handle.is_some();
     if upstream_on_device {
@@ -211,10 +207,9 @@ pub(crate) fn gather_last_dim_backward(
         return Ok(smallvec![(src, grad_id)]);
     }
 
-    // Host-eager fallback: identical to the pre-Wave-1 path. Flatten the
-    // target to `[prefix_rows * vocab]` and dispatch a single scatter-add
-    // with remapped flat ids `i * vocab + original_indices[i]` — one
-    // trait call, one host or single-GPU launch.
+    // Host-eager fallback: flatten the target to `[prefix_rows * vocab]`
+    // and scatter-add with remapped flat ids `i * vocab + original_indices[i]`
+    // — one trait call, one launch.
     let upstream = store.tensor_host(output_grad_id)?;
     let vocab = *src_shape.last().ok_or(AutogradError::TapeInvariant(
         "gather missing source last dim",

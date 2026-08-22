@@ -160,15 +160,7 @@ pub(super) fn cuda_rms_norm_device(
     Ok(DeviceHandle::Cuda(CudaStorage::new(d_out)))
 }
 
-// Device-resident backward for `rms_norm`. Three kernels:
-//   1. `rms_norm_inv_rms_f32` — one block per row, reduces sum_sq and
-//      emits `inv_rms[rows]` to a device scratch buffer.
-//   2. `rms_norm_backward_x_f32` — one block per row, consumes the saved
-//      `inv_rms` and reduces `dot` (one shared-mem reduction).
-//   3. `rms_norm_backward_w_f32` — one block per column, accumulates
-//      `upstream * x * inv_rms` across rows and reduces to grad_w.
-// Returned handles are unevaluated; the terminal `eval` belongs to the
-// caller.
+// Returned handles are unevaluated; the terminal `eval` belongs to the caller.
 #[cfg(not(feature = "no-cuda"))]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn cuda_rms_norm_backward_device(
@@ -314,7 +306,6 @@ pub(super) fn cuda_rms_norm_backward_device(
         });
     }
 
-    // Inv_rms scratch buffer.
     let mut d_inv = backend
         .stream
         .alloc_zeros::<f32>(rows.max(1))

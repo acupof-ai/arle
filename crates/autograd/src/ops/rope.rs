@@ -15,17 +15,13 @@ pub fn rope(
     tape: &mut Tape,
 ) -> Result<TensorId> {
     // Route `x` through the lazy `backend.rope` whenever a live device handle
-    // is available — `Dirty::Device` (device authoritative) or `Dirty::Both`
-    // (host and device in sync; device is cheaper). Wider than the silu /
-    // softmax / exp dispatch (Dirty::Device only) because rope is typically
-    // called on q/k right after a rank-3 matmul + rank-4 reshape; if the
-    // reshape path is ever made lazy too, the output lands Dirty::Both and
-    // we want to stay on-device through rope. cos/sin stay on the host:
-    // Qwen's rope caches are precomputed per seq length and the per-call
-    // uploads are tiny vs. the 4-D rotation. Dirty::Host inputs take the
-    // eager host path. Backward stays on the eager `rope_forward(gy, cos, -sin)`
-    // path; `tape.backward`'s pre-walk batch-flush takes care of the
-    // Dirty::Device output tensors before `rope_backward` reads them.
+    // is available — `Dirty::Device` or `Dirty::Both` (device is cheaper).
+    // Wider than the silu / softmax / exp dispatch (Dirty::Device only)
+    // because rope follows a rank-3 matmul + rank-4 reshape; if the reshape
+    // ever goes lazy its output lands Dirty::Both and we want to stay
+    // on-device. cos/sin stay host: Qwen's rope caches are per-seq-len and
+    // the uploads are tiny vs. the 4-D rotation. Backward stays eager;
+    // `tape.backward`'s pre-walk batch-flush handles Dirty::Device outputs.
     let has_device_handle = {
         let t = store.tensor(x)?;
         t.device_handle.is_some() && t.dirty != Dirty::Host
@@ -53,9 +49,8 @@ fn rope_device_lazy(
     store: &mut TensorStore,
     tape: &mut Tape,
 ) -> Result<TensorId> {
-    // cos/sin are expected to be host-resident (seq-len-keyed caches).
-    // If a caller made them device-resident, readback pays one eval each
-    // but behavior stays correct.
+    // cos/sin are host-resident seq-len-keyed caches; a device-resident
+    // caller pays one readback each, behavior stays correct.
     store.ensure_host(cos)?;
     store.ensure_host(sin)?;
     store.ensure_device(x)?;
@@ -156,8 +151,7 @@ pub(crate) fn rope_backward(
 
     let x_shape = store.tensor(x)?.shape.clone();
     // cos/sin are host caches — ensure_host is a no-op on the canonical
-    // path (caller seeds them host-side). Reading host data here matches
-    // the forward's contract.
+    // path; reading host data here matches the forward's contract.
     store.ensure_host(cos)?;
     store.ensure_host(sin)?;
     let cos_tensor = store.tensor_host(cos)?;
@@ -171,11 +165,10 @@ pub(crate) fn rope_backward(
         });
     }
 
-    // Route through `rope_backward_device` whenever upstream is
-    // device-resident. The kernel handles partial rotary (tail passthrough) —
-    // the full-head `==` gate here would make every Qwen3.6 full-attn q/k grad
-    // fall to host and cascade the whole upstream chain (Transpose/Slice
-    // backwards) onto the CPU.
+    // The kernel handles partial rotary (tail passthrough) — a full-head
+    // `==` gate here would make every Qwen3.6 full-attn q/k grad fall to
+    // host and cascade the upstream chain (Transpose/Slice backwards) onto
+    // the CPU.
     let device_path_ok = {
         let upstream = store.tensor(output_grad_id)?;
         upstream.dirty != Dirty::Host
@@ -201,8 +194,8 @@ pub(crate) fn rope_backward(
         return Ok(smallvec![(x, grad_id)]);
     }
 
-    // Host fallback (CPU/Metal default). rope backward is rope forward
-    // with sin negated:
+    // Host fallback (CPU/Metal). rope backward is rope forward with sin
+    // negated:
     //   forward:  y0 = x0*cos - x1*sin,   y1 = x1*cos + x0*sin
     //   backward: gx0 = gy0*cos + gy1*sin, gx1 = gy1*cos - gy0*sin
     //           = rope_forward(gy, cos, -sin)

@@ -251,11 +251,7 @@ pub(super) fn cuda_causal_sdpa_decode_gqa_cache(
     let rows = q_shape[0] * q_shape[1];
     let head_dim = q_shape[3];
 
-    // Online-softmax fast path for Qwen3.5-style head_dim=256 (default knob:
-    // --autograd-decode-attn-legacy forces the original two-pass kernel).
-    // The online kernel uses HEAD_DIM threads per block (vs 256 in the legacy),
-    // one-pass running-max softmax (vs two-pass with shared-mem scores buffer),
-    // and warp-level reductions throughout.
+    // --autograd-decode-attn-legacy forces the two-pass kernel below.
     let use_online = head_dim == 256 && !crate::runtime_flags::decode_attn_legacy();
     if use_online {
         const BLOCK_ONLINE: u32 = 256; // = HEAD_DIM
@@ -289,8 +285,7 @@ pub(super) fn cuda_causal_sdpa_decode_gqa_cache(
         return Ok((DeviceHandle::Cuda(CudaStorage::new(d_out)), out_shape));
     }
 
-    // Legacy two-pass kernel — kept for head_dim != 256 and as the
-    // legacy escape hatch.
+    // Kept for head_dim != 256 and as the legacy escape hatch.
     const BLOCK: u32 = 256;
     let visible = q_start.saturating_add(1).min(kv_len);
     let shared = BLOCK * std::mem::size_of::<f32>() as u32

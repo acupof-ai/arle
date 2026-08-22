@@ -16,7 +16,7 @@ pub mod lr_schedule;
 pub mod ops;
 #[path = "optim.rs"]
 pub mod optim;
-// CLI-driven runtime toggles (train flags -> statics; no env reads).
+// CLI-driven runtime toggles; no env reads (env-conformance).
 #[path = "runtime_flags.rs"]
 mod runtime_flags;
 pub use runtime_flags::{AutogradRuntimeFlags, TapePrecision, apply_runtime_flags};

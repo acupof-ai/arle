@@ -1,22 +1,20 @@
 //! Learning-rate schedules for the autograd optimizer stack.
 //!
-//! Every schedule is a pure function of the global optimizer step, so the
-//! trait objects can be plugged into any training binary without persisted
-//! state. Values are `f32` to match [`crate::optim::AdamW`]'s LR precision.
+//! Every schedule is a pure function of the global optimizer step. Values are
+//! `f32` to match [`crate::optim::AdamW`]'s LR precision.
 
 use std::f32::consts::PI;
 
 use libm::cosf;
 
-/// Schedule contract used by training binaries. Implementations must be
-/// deterministic across calls and cheap enough to invoke every optimizer step.
+/// Implementations must be deterministic across calls and cheap enough to
+/// invoke every optimizer step.
 pub trait LrSchedule: Send + Sync {
-    /// Learning rate for the given (1-indexed or 0-indexed — schedule
-    /// defines) optimizer step. The wiring layer is responsible for passing
-    /// a consistent step counter across resumes.
+    /// Learning rate for the given optimizer step (1-indexed or 0-indexed —
+    /// schedule defines). The wiring layer must pass a consistent step
+    /// counter across resumes.
     fn lr(&self, step: u64) -> f32;
 
-    /// Human-readable one-liner for logs / config dumps.
     fn describe(&self) -> String;
 }
 
@@ -33,9 +31,8 @@ impl<T: LrSchedule + ?Sized> LrSchedule for Box<T> {
     }
 }
 
-/// Linear warmup to `base_lr`, then half-cosine decay down to `min_lr`
-/// across the remaining `total_steps - warmup_steps`. After `total_steps`
-/// the LR is clamped to `min_lr`.
+/// Linear warmup to `base_lr`, then half-cosine decay to `min_lr`; clamped to
+/// `min_lr` after `total_steps`.
 #[derive(Debug, Clone, Copy)]
 pub struct CosineWithWarmup {
     pub base_lr: f32,

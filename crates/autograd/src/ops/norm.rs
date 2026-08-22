@@ -14,16 +14,14 @@ pub fn rmsnorm(
     store: &mut TensorStore,
     tape: &mut Tape,
 ) -> Result<TensorId> {
-    // Dispatch on device-handle presence (mirrors the rope
-    // pattern so Dirty::Both after `ensure_device` stays lazy too).
-    // When the lazy path wins, forward skips the host-side inv_rms
-    // computation entirely — `rmsnorm_backward` recomputes inv_rms
-    // from x (which `tape.backward`'s pre-walk flush has already
-    // materialized to host). We signal "recompute" by saving an empty
-    // `inv_rms` vec. weight is always made host-resident (its shape is
-    // tiny: [hidden]) because `backend.rms_norm` takes the weight as a
-    // host slice — the per-call upload inside the Metal FFI wrapper is
-    // cheaper than adding a device-handle code path for the weight.
+    // Dispatch on device-handle presence (mirrors rope so Dirty::Both after
+    // `ensure_device` stays lazy too). The lazy path skips the host-side
+    // inv_rms computation — `rmsnorm_backward` recomputes inv_rms from x
+    // (materialized to host by `tape.backward`'s pre-walk flush); an empty
+    // saved `inv_rms` signals "recompute". weight is always host-resident
+    // (shape [hidden]): `backend.rms_norm` takes it as a host slice, and the
+    // per-call upload inside the Metal FFI wrapper is cheaper than a
+    // device-handle code path for the weight.
     let has_device_handle = {
         let t = store.tensor(x)?;
         t.device_handle.is_some() && t.dirty != Dirty::Host
@@ -72,9 +70,8 @@ fn rmsnorm_device_lazy(
         .rms_norm(&x_handle, &weight_tensor.data, &x_shape, eps)?;
     let output_id = store.alloc_device_tensor(x_shape, out_handle)?;
 
-    // Empty inv_rms signals "recompute from x in backward". x is
-    // Dirty::Device here; tape.backward's batch-flush will make it
-    // Dirty::Both before rmsnorm_backward runs.
+    // Empty inv_rms = "recompute from x in backward". x is Dirty::Device
+    // here; tape.backward's batch-flush makes it Dirty::Both first.
     TapeEntry {
         op: BackwardOp::RMSNorm,
         output_id,
@@ -184,12 +181,12 @@ pub(crate) fn rmsnorm_backward(
         return Ok(GradPairs::new());
     }
 
-    // Route through `rms_norm_backward_device` whenever
-    // upstream, x, and weight are all device-resident. A host path would
-    // `ensure_host(x)` + read `tensor_host` for all three operands, demoting
-    // x back to host before any downstream device op could see it. Heal a
-    // host-resident upstream grad first (mirrors matmul_backward) so one host
-    // grad upstream doesn't demote this norm — and everything downstream.
+    // Route through `rms_norm_backward_device` when upstream, x, and weight
+    // are all device-resident. A host path would `ensure_host(x)` for all
+    // three operands, demoting x before any downstream device op could see
+    // it. Heal a host-resident upstream grad first (mirrors matmul_backward)
+    // so one host grad upstream doesn't demote this norm — and everything
+    // downstream.
     if store.backend().device() != Device::Cpu {
         store.ensure_device(output_grad_id)?;
         store.ensure_device(x)?;
@@ -246,8 +243,8 @@ pub(crate) fn rmsnorm_backward(
         return Ok(grads);
     }
 
-    // Host fallback (CPU/Metal). If the forward took the lazy device path,
-    // inv_rms was saved empty — recompute it from the now-host x.
+    // Host fallback (CPU/Metal). A lazy-device forward saved inv_rms empty —
+    // recompute it from the now-host x.
     store.ensure_host(x)?;
     let upstream = store.tensor_host(output_grad_id)?;
     let x_tensor = store.tensor_host(x)?;

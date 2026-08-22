@@ -295,11 +295,8 @@ pub(super) fn cuda_embedding_from_f32_ids_device(
     Ok(DeviceHandle::Cuda(CudaStorage::new(d_out)))
 }
 
-// Device-resident embedding backward. Allocates a
-// zero-filled `[vocab, hidden]` grad on-device and atomicAdd-scatters the
-// per-token-position upstream slice into `grad_table[ids[row], :]`. Only the
-// int32 `indices` array crosses PCIe; the `[n_ids, hidden]` upstream stays
-// on-device. No `synchronize()` — terminal eval is the caller's.
+// Device-resident embedding backward; no `synchronize()` — terminal eval is
+// the caller's.
 #[cfg(not(feature = "no-cuda"))]
 pub(super) fn cuda_embedding_backward_device(
     backend: &CudaBackend,
@@ -350,11 +347,11 @@ pub(super) fn cuda_embedding_backward_device(
         AutogradError::TapeInvariant("cuda embedding_backward vocab_size exceeds i32")
     })?;
 
-    // One thread per token position (block=256 via launch_1d). Inner
-    // per-thread loop strides `hidden_dim` columns with atomicAdd. With
-    // n_ids = B*S = 1024 on the canonical bench shape, this dispatches
-    // 4 blocks × 256 threads — atomicAdd traffic dominates, so block-size
-    // selection beyond "warp-aligned" is in the noise.
+    // One thread per token position; the inner per-thread loop strides
+    // `hidden_dim` columns with atomicAdd. At n_ids = B*S = 1024 (canonical
+    // bench shape) this dispatches 4 blocks × 256 threads — atomicAdd traffic
+    // dominates, so block-size selection beyond "warp-aligned" is in the
+    // noise.
     if up_bf16 {
         let d_up = backend.cuda_bf16_slice(upstream, "embedding_backward_device")?;
         let func = backend

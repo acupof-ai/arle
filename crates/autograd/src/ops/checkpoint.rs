@@ -41,10 +41,10 @@ where
     store.free_new_except(&live_before, &keep)?;
 
     if store.any_requires_grad(&input_ids) {
-        // Offload the saved inputs to host RAM: each layer's input is the prior
-        // layer's output and is untouched until backward replay (which re-fetches
-        // via ensure_device), so this frees the ~30 GB of grad-checkpoints a long
-        // training forward would otherwise pin in VRAM.
+        // Offload the saved inputs to host RAM: each layer's input is the
+        // prior layer's output and is untouched until backward replay (which
+        // re-fetches via ensure_device), so this frees the ~30 GB of
+        // grad-checkpoints a long training forward would otherwise pin in VRAM.
         if tape.offload_checkpoints {
             let skip_hidden = tape.take_skip_next_checkpoint_input_offload();
             for (idx, &id) in input_ids.iter().enumerate() {
@@ -65,16 +65,17 @@ where
         .record(store, tape)?;
     } else if tape.offload_checkpoints {
         let _ = tape.take_skip_next_checkpoint_input_offload();
-        // FROZEN group (no trainable param → no backward replay, no tape entry):
-        // its input hidden (`input_ids[0]`, = the PRIOR group's output) is the
-        // unbounded leak. It's in `keep` here (this group's saved input) so the
-        // free above can't touch it, and it then lands in EVERY later group's
-        // `live_before` — so no later `free_new_except` reclaims it either.
-        // ~+156 MiB/group at seq=8000 (`[1, seq, hidden]`), unbounded over the
-        // frozen prefix → writeback OOM. Nothing reads it once this group's
-        // output exists (frozen ⇒ no replay), so drop its DEVICE residency. Only
-        // `input_ids[0]` (the hidden); `input_ids[1..]` are shared frozen weights.
-        // Gated to the OPD offload path; the default forward never sets
+        // FROZEN group (no trainable param → no backward replay, no tape
+        // entry): its input hidden (`input_ids[0]`, = the PRIOR group's
+        // output) is the unbounded leak. It's in `keep` here (this group's
+        // saved input) so the free above can't touch it, and it then lands
+        // in EVERY later group's `live_before` — so no later
+        // `free_new_except` reclaims it either. ~+156 MiB/group at seq=8000
+        // (`[1, seq, hidden]`), unbounded over the frozen prefix → writeback
+        // OOM. Nothing reads it once this group's output exists (frozen ⇒ no
+        // replay), so drop its DEVICE residency. Only `input_ids[0]` (the
+        // hidden); `input_ids[1..]` are shared frozen weights. Gated to the
+        // OPD offload path; the default forward never sets
         // `offload_checkpoints`, so it stays byte-identical.
         if let Some(&hidden_id) = input_ids.first()
             && hidden_id != output_id
@@ -88,10 +89,9 @@ where
 
 /// Run `num_layers` sequential layers, checkpointing one layer per group.
 /// Each group's saved inputs are `[hidden, ...deduped params of the group's
-/// layers]`; offload (if enabled on the tape) then moves K layers' inputs to
-/// host in one shot. `detach_at`, if set, forces a group boundary there and
-/// detaches the hidden at that index (preserving a model's frozen/LoRA
-/// boundary) — no group spans it, so it stays numerically exact.
+/// layers]`. `detach_at`, if set, forces a group boundary there and detaches
+/// the hidden at that index (preserving a model's frozen/LoRA boundary) — no
+/// group spans it, so it stays numerically exact.
 /// `layer_fn(idx, hidden, store, tape)` runs layer `idx`; `layer_params(idx)`
 /// returns that layer's trainable param ids.
 pub fn checkpoint_sequential<FF, PF>(
@@ -197,7 +197,6 @@ fn trace_checkpoint_group_vram() -> bool {
     std::env::var("ARLE_OPD_VRAM_TRACE").is_ok_and(|v| v != "0" && v != "false")
 }
 
-/// Chunk a position-wise block in forward and backward.
 pub fn checkpoint_seq_chunked<F>(
     input: TensorId,
     param_ids: Vec<TensorId>,

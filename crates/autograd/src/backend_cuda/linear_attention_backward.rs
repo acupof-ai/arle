@@ -22,8 +22,6 @@ pub(super) fn flashqla_gdr_symbols(h: usize, hg: usize) -> Result<&'static ffi::
         })
 }
 
-/// A/B escape hatch: force the legacy monolithic chunked-scan backward (one
-/// block per batch x value_head) instead of the staged chunk-parallel path.
 #[cfg(not(feature = "no-cuda"))]
 /// Max concurrent chunk lanes in the stage-3 grad kernel. Bounds the per-block
 /// history slab at `wave x rows x 64 x state_elems` f32 (1.6 GiB at 48 heads,
@@ -45,9 +43,8 @@ pub(super) fn cuda_linear_attention_backward_device(
         return cuda_linear_attention_backward_device_row(backend, args).map(Some);
     }
 
-    // batch > 1: per-row dispatch to the proven batch==1 path. Upstream, inputs
-    // and every saved ctx tensor are batch-leading contiguous rows; weights pass
-    // through whole. Per-token grads concatenate; weight grads sum across rows.
+    // batch > 1: per-row dispatch to the proven batch==1 path. Tensors are
+    // batch-leading; per-token grads concatenate, weight grads sum across rows.
     let qkv_dim = p.num_key_heads * p.key_dim * 2 + p.num_value_heads * p.value_dim;
     let conv_len = qkv_dim * p.conv_kernel;
     let row_params = LinearAttentionDeviceParams { batch: 1, ..p };
