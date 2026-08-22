@@ -26,7 +26,6 @@ impl fmt::Display for TopoError {
 
 impl std::error::Error for TopoError {}
 
-/// `bail!`-equivalent: build a [`TopoError`] from a format string and return early.
 macro_rules! bail {
     ($($arg:tt)*) => {
         return ::std::result::Result::Err($crate::error::TopoError::new(format!($($arg)*)))

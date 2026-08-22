@@ -1,7 +1,6 @@
 //! `infer-topo` — pure, CPU-verifiable, device-independent topology + sharding
 //! math (TP rank placement, weight/head sharding, the SGLang-style multi-axis
-//! layout, and rank-group builders). Ported from `infer/src/tensor_parallel.rs`
-//! with all GPU/NCCL coupling dropped; depends only on `std`.
+//! layout, and rank-group builders); depends only on `std`.
 //!
 //! Column-parallel splits the output dim (all-reduce to sum partials);
 //! row-parallel splits the input dim (pre-sharded input, all-reduce at output).
