@@ -80,32 +80,21 @@ fn write_file_atomic_impl(path: &Path, bytes: &[u8], durable: bool) -> io::Resul
 }
 
 /// File-backed mmap page-slot store — one file per disk tier namespace, a
-/// fixed-size slot per page. Writes memcpy into the mapping (no per-page
-/// syscall); reads return `&[u8]` slices directly from the mapping (zero-copy).
-/// Built once at disk-tier attach time and held for the process lifetime.
-///
-/// The backing file is created as a **sparse** file — `fallocate` is never
-/// called, so the filesystem only allocates blocks for actually-written pages.
-/// A 274 GB store with 10 pages occupied costs ~23 MB on disk, not 274 GB.
+/// fixed-size slot per page. The backing file is sparse: `fallocate` is never
+/// called, so blocks allocate only for written pages (a 274 GB store with 10
+/// pages occupied costs ~23 MB on disk). Writes memcpy into the mapping; reads
+/// return `&[u8]` slices directly from the mapping (zero-copy).
 pub struct KvMmapStore {
     /// The file keeping the backing store alive (mmap pins it open).
     _file: std::fs::File,
-    /// Mutable mapping over the full slot array.
     mapping: memmap2::MmapMut,
-    /// Size of one slot in bytes.
     slot_bytes: usize,
     stride_bytes: usize,
-    /// Total number of slots.
     num_slots: u32,
-    /// Indices of freed slots, available for re-use.
     free_list: Vec<u32>,
 }
 
 impl KvMmapStore {
-    /// Create a new page-slot sparse mmap file at `path` with `num_slots`
-    /// slots of `slot_bytes` each. The file is set to the logical size but
-    /// NOT pre-allocated — the filesystem lazily allocates blocks for
-    /// slots that are actually written.
     pub fn create(path: &Path, num_slots: usize, slot_bytes: usize) -> io::Result<Self> {
         let stride_bytes = aligned_slot_bytes(slot_bytes)?;
         let num_slots = u32::try_from(num_slots).map_err(|_| invalid("num_slots exceeds u32"))?;
@@ -209,7 +198,6 @@ impl KvMmapStore {
         self.slot_bytes
     }
 
-    /// Allocate a free slot index. Returns `None` when full.
     pub fn alloc_slot(&mut self) -> Option<u32> {
         self.free_list.pop()
     }
@@ -218,8 +206,7 @@ impl KvMmapStore {
         self.free_list.len()
     }
 
-    /// Memcpy `data` into `slot` (`data.len() <= slot_bytes`).
-    /// Trailing bytes are left untouched; callers must track the valid length.
+    /// Trailing bytes are left untouched; callers track the valid length.
     pub fn write_slot(&mut self, slot: u32, data: &[u8]) -> io::Result<()> {
         assert!(
             data.len() <= self.slot_bytes,
@@ -232,7 +219,7 @@ impl KvMmapStore {
         Ok(())
     }
 
-    /// Return a borrowed slice over the slot — **zero-copy** mmap read.
+    /// Zero-copy read: the returned slice borrows the mapping.
     pub fn read_slot(&self, slot: u32) -> &[u8] {
         assert!(
             (slot as usize) < self.num_slots as usize,
@@ -243,22 +230,20 @@ impl KvMmapStore {
         &self.mapping[offset..offset + self.slot_bytes]
     }
 
-    /// msync the mapping (`MS_SYNC`) so all written slots reach disk. Cost is
-    /// proportional to dirty pages, not the sparse file's logical size. The
-    /// durable recall tier calls this before persisting the manifest that names
-    /// the slots — the data-before-manifest ordering barrier.
+    /// Cost is proportional to dirty pages, not the sparse file's logical size.
+    /// The durable recall tier calls this before persisting the manifest that
+    /// names the slots — the data-before-manifest ordering barrier.
     pub fn flush(&self) -> io::Result<()> {
         self.mapping.flush()
     }
 
-    /// Return a slot to the free list.
     pub fn free_slot(&mut self, slot: u32) {
         if !self.free_list.contains(&slot) {
             self.free_list.push(slot);
         }
     }
 
-    /// Reserve `indices` as allocated (manifest replay on load).
+    /// Manifest replay on load: mark `indices` allocated.
     pub fn reserve_indices(&mut self, indices: &[u32]) {
         self.free_list.retain(|i| !indices.contains(i));
     }
