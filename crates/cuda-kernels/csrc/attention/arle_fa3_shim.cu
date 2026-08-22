@@ -351,18 +351,21 @@ cudaError_t arle_fa3_fwd_hd256_bf16_cuda(const ArleFa3FwdHd256Args* a,
 // Quantized-KV variant: convert the 1-byte paged K/V pools the page table
 // names into a per-call temp (compacted: slot b*stride+j holds row b's
 // logical page j) and run FA3 on it. Two operand forms, routed on the KV
-// length: below kFa3Fp8MinSeqlenK a bf16 temp + the bf16 kernel; at or above
-// it an e4m3 temp with one descale per (row, kv_head), Q quantised the same
-// way, and the fp8 kernel. Measured crossover on H20, Qwen3.8-27B, TTFT of
-// one request: 33K +10 %, 66K −1 %, 132K −11 %, 220K −16 % for fp8 — the fp8
-// tensor-core rate only pays once the O(L²) term dominates, and the fp8
-// paged kernel is slower on short q tiles. The temp allocations are
+// shape: a bf16 temp + the bf16 kernel, or — for a prefill chunk
+// (seqlen_q >= kFa3Fp8MinSeqlenQ) over a long KV (seqlen_k >=
+// kFa3Fp8MinSeqlenK) — an e4m3 temp with one descale per (row, kv_head), Q
+// quantised the same way, and the fp8 kernel. Measured on H20, Qwen3.8-27B,
+// TTFT of one request: 33K +10 %, 66K −1 %, 132K −11 %, 220K −16 % for fp8 —
+// the fp8 tensor-core rate only pays once the O(L²) term dominates; on the
+// few-row spec-verify step at 220K the fp8 form cost −21 % decode, hence the
+// q-length floor. The temp allocations are
 // stream-ordered and the kernels read only device tables, so both forms stay
 // CUDA-graph capture-safe. The caller passes the SAME args as the bf16 entry
 // (q/k/v/num_pages are overwritten); the compact pool keeps the HND per-page
 // layout, so the caller's page strides describe it too.
 namespace {
 constexpr int kFa3Fp8MinSeqlenK = 65536;
+constexpr int kFa3Fp8MinSeqlenQ = 256;
 }
 
 typedef struct {
@@ -522,8 +525,8 @@ cudaError_t arle_fa3_fwd_hd256_quant_cuda(const ArleFa3FwdHd256QuantArgs* qa,
         qa->k_scales == nullptr || qa->v_scales == nullptr) {
         return cudaErrorInvalidValue;
     }
-    return b->seqlen_k >= kFa3Fp8MinSeqlenK ? fa3_quant_fp8_form(qa, stream)
-                                            : fa3_quant_bf16_form(qa, stream);
+    const bool fp8 = b->seqlen_k >= kFa3Fp8MinSeqlenK && b->seqlen_q >= kFa3Fp8MinSeqlenQ;
+    return fp8 ? fa3_quant_fp8_form(qa, stream) : fa3_quant_bf16_form(qa, stream);
 }
 
 // Backward (hdim256/bf16/sm_90a). Param-fill mirrors mha_bwd
