@@ -1852,6 +1852,10 @@ async fn anthropic_messages(
             }
         }
     }
+    // Whether the CLIENT enabled extended thinking, which is not the same as
+    // whether the model reasons: `thinking` above also turns on for a chat
+    // template that reasons by default.
+    let emit_thinking = anthropic::ThinkingConfig::client_enabled(request.thinking.as_ref());
     let client_budget = request.thinking.as_ref().and_then(|t| t.budget_tokens);
     let think_budget = state.resolve_think_budget(thinking, None, client_budget, &mut sampling);
     let max_tokens = sampling.max_new_tokens.unwrap_or_else(|| {
@@ -1874,7 +1878,11 @@ async fn anthropic_messages(
         tokio::spawn(async move {
             // `guard` dropped when this task exits, decrementing in_flight + unregistering sink.
             let _guard = guard;
-            let mut encoder = StreamEncoder::new(format!("msg_{}", Uuid::new_v4().simple()), model);
+            let mut encoder = StreamEncoder::new(
+                format!("msg_{}", Uuid::new_v4().simple()),
+                model,
+                emit_thinking,
+            );
             if chunk_tx
                 .send(Ok(encoder.message_start(prompt_token_count).into_bytes()))
                 .await
@@ -2029,7 +2037,7 @@ async fn anthropic_messages(
         tool_calls,
         None,
     );
-    Ok(Json(anthropic::MessagesResponse::from_chat(&chat)).into_response())
+    Ok(Json(anthropic::MessagesResponse::from_chat(&chat, emit_thinking)).into_response())
 }
 
 /// `POST /v1/messages/count_tokens` — render the prompt exactly like

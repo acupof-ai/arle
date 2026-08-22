@@ -61,6 +61,15 @@ pub(crate) struct MessagesRequest {
     pub metadata: Option<Value>,
 }
 
+impl ThinkingConfig {
+    /// Anthropic returns `thinking` content blocks only when the client turned
+    /// extended thinking on. A model whose chat template reasons by default
+    /// still reasons -- that is a generation property, not a wire one.
+    pub(crate) fn client_enabled(config: Option<&Self>) -> bool {
+        config.is_some_and(|c| c.kind == "enabled")
+    }
+}
+
 /// Anthropic `thinking` request parameter.
 #[derive(Debug, Deserialize)]
 pub(crate) struct ThinkingConfig {
@@ -422,12 +431,15 @@ pub(crate) struct MessagesResponse {
 }
 
 impl MessagesResponse {
-    pub(crate) fn from_chat(chat: &ChatCompletionResponse) -> Self {
+    pub(crate) fn from_chat(chat: &ChatCompletionResponse, emit_thinking: bool) -> Self {
         let choice = &chat.choices[0];
         let mut content = Vec::new();
         // Thinking block first (Anthropic convention), when the model produced
-        // reasoning content and the request enabled thinking.
-        if let Some(reasoning) = choice.message.reasoning_content.as_ref()
+        // reasoning content and the request enabled thinking. A client that did
+        // not ask for extended thinking must not receive thinking blocks --
+        // Claude Code aborts the stream over it, which is how this was found.
+        if emit_thinking
+            && let Some(reasoning) = choice.message.reasoning_content.as_ref()
             && !reasoning.trim().is_empty()
         {
             content.push(ResponseBlock::Thinking {
@@ -526,10 +538,13 @@ pub(crate) struct StreamEncoder {
     /// stray newline around a tool call never opens a whitespace-only text
     /// block (mirrors the non-streaming path's trim).
     pending_ws: String,
+    /// The client asked for extended thinking. False drops reasoning deltas
+    /// rather than emitting `thinking` blocks the client never enabled.
+    emit_thinking: bool,
 }
 
 impl StreamEncoder {
-    pub(crate) fn new(id: String, model: String) -> Self {
+    pub(crate) fn new(id: String, model: String, emit_thinking: bool) -> Self {
         Self {
             id,
             model,
@@ -537,6 +552,7 @@ impl StreamEncoder {
             text_index: None,
             thinking_index: None,
             pending_ws: String::new(),
+            emit_thinking,
         }
     }
 
@@ -614,7 +630,7 @@ impl StreamEncoder {
     /// Emit a thinking delta, opening a thinking content block first if none is
     /// open. Thinking blocks always precede text blocks (Anthropic convention).
     pub(crate) fn thinking_delta(&mut self, text: &str) -> String {
-        if text.is_empty() {
+        if text.is_empty() || !self.emit_thinking {
             return String::new();
         }
         let mut out = String::new();
