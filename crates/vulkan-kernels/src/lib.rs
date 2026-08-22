@@ -442,7 +442,6 @@ impl KernelParams {
         self.words.len() * std::mem::size_of::<u32>()
     }
 
-    /// The raw `u32` words (for tests / introspection of a push-constant block).
     pub fn words(&self) -> &[u32] {
         &self.words
     }
@@ -808,8 +807,6 @@ pub fn scaled_add_params(n: u32, scale: f32) -> KernelParams {
     KernelParams::from_words(vec![n, scale.to_bits()])
 }
 
-/// `scaled_add.comp` grid: one thread per element, `local_size_x = 256`, so
-/// `ceil(n / 256)` workgroups cover the row.
 pub fn scaled_add_dispatch(n: u32) -> Dispatch {
     Dispatch::x(n.div_ceil(256).max(1))
 }
@@ -823,8 +820,6 @@ pub fn sigmoid_mul_params(n: u32) -> KernelParams {
     KernelParams::from_words(vec![n])
 }
 
-/// `sigmoid_mul.comp` grid: one thread per element, `local_size_x = 256`, so
-/// `ceil(n / 256)` workgroups cover the row.
 pub fn sigmoid_mul_dispatch(n: u32) -> Dispatch {
     Dispatch::x(n.div_ceil(256).max(1))
 }
@@ -839,8 +834,6 @@ pub fn f16_kv_pack_params(n: u32) -> KernelParams {
     KernelParams::from_words(vec![n])
 }
 
-/// `f16_kv_pack.comp` grid: one thread per element, `local_size_x = 256`, so
-/// `ceil(n / 256)` workgroups cover the head row.
 pub fn f16_kv_pack_dispatch(n: u32) -> Dispatch {
     Dispatch::x(n.div_ceil(256).max(1))
 }
@@ -950,8 +943,6 @@ pub fn qwen36_moe_weighted_accum_params(hidden: u32, count: u32, init: bool) -> 
     KernelParams::from_words(vec![hidden, count, u32::from(init)])
 }
 
-/// Dispatch grid for `qwen36_moe_weighted_accum.comp`: one thread per hidden
-/// element (`local_size_x = 256`), `ceil(hidden/256)` workgroups.
 pub fn qwen36_moe_weighted_accum_dispatch(hidden: u32) -> Dispatch {
     Dispatch::x(hidden.div_ceil(256).max(1))
 }
