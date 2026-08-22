@@ -125,3 +125,134 @@ fn cuda_marlin_fp4_dequant_matches_group_layout() {
     }
     let _ = E2M1;
 }
+
+/// The group layout is the wrong oracle once the repack's lossy step bites:
+/// `repack_for_marlin_fp4` flushes lifted values below 2.0 to zero, so a real
+/// weight's Marlin bytes are NOT the checkpoint's bytes. What the shared base
+/// must reproduce is what the engine actually serves — `marlin_fp4_gemm` over
+/// the same packed buffer.
+#[test]
+fn cuda_marlin_fp4_dequant_matches_the_serving_gemm() {
+    use cuda_kernels::quant_linear as cuda_ql;
+    use cuda_kernels::bf16;
+
+    // Non-power-of-two scales across the full E4M3 range, so the flush and the
+    // S0E5M3 rounding both engage the way they do on a real checkpoint.
+    let (n, k) = (256usize, 512usize);
+    let group_size = 16usize;
+    let scale_cols = k / group_size;
+
+    let mut packed = vec![0u8; n * k / 2];
+    for (i, byte) in packed.iter_mut().enumerate() {
+        *byte = (((i * 13 + 5) % 16) as u8) | ((((i * 29 + 2) % 16) as u8) << 4);
+    }
+    let mut scales = vec![0u8; n * scale_cols];
+    for (i, s) in scales.iter_mut().enumerate() {
+        // Walk E4M3 exponents 2^-9..2^6 including the small ones the repack
+        // flushes, plus a non-zero mantissa so nothing is an exact power of two.
+        let exp = (i % 16) as i32 - 9;
+        *s = ((((exp + 7) as u8) & 0x0f) << 3) | 0b011;
+    }
+    let global_scale = 0.375f32;
+
+    let ctx = DeviceContext::new().expect("device context");
+    let mut matrix = DeviceMatrix::from_fp4_e2m1_group(
+        &ctx,
+        &packed,
+        &scales,
+        &[global_scale],
+        None,
+        n,
+        k,
+        group_size,
+    )
+    .expect("nvfp4 device matrix");
+    matrix.repack_for_marlin_fp4(&ctx).expect("marlin repack");
+    let marlin_buf = matrix.marlin_packed.as_ref().expect("marlin weights");
+    let global_buf = matrix.marlin_scales.as_ref().expect("marlin global scale");
+
+    // What the engine serves: X @ dequant(W) through the Marlin GEMM itself.
+    let m = 64usize;
+    let x: Vec<bf16> = (0..m * k)
+        .map(|i| bf16::from_f32(((i % 7) as f32 - 3.0) * 0.25))
+        .collect();
+    let x_dev = ctx.stream.memcpy_stod(&x).expect("H2D x");
+    let mut serve_out = ctx
+        .stream
+        .alloc_zeros::<bf16>(m * n)
+        .expect("alloc serve out");
+    let sms = ctx.sm_count();
+    let c_tmp = ctx
+        .stream
+        .alloc_zeros::<f32>(cuda_ql::marlin_c_tmp_floats(m, sms).expect("c_tmp size"))
+        .expect("alloc c_tmp");
+    let workspace = ctx
+        .stream
+        .alloc_zeros::<i32>(cuda_ql::marlin_workspace_ints(sms).expect("ws size"))
+        .expect("alloc workspace");
+    cuda_ql::marlin_fp4_gemm(
+        &ctx,
+        &x_dev,
+        marlin_buf,
+        global_buf,
+        &mut serve_out,
+        &c_tmp,
+        &workspace,
+        m,
+        n,
+        k,
+        group_size,
+    )
+    .expect("marlin fp4 gemm");
+    let serve = ctx.stream.clone_dtoh(&serve_out).expect("D2H serve out");
+    ctx.sync().expect("sync");
+
+    // What the student sees: the borrowed Marlin view through autograd's GEMM.
+    let (weight_ptr, _wg) = marlin_buf.device_ptr(&ctx.stream);
+    let scale_tail_ptr = weight_ptr + (n * k / 2) as u64;
+    let folded_bits = ctx
+        .stream
+        .clone_dtoh(global_buf)
+        .expect("D2H marlin global scale");
+    ctx.sync().expect("sync");
+    let folded_global = f32::from_bits(u32::from(folded_bits[0]) << 16);
+
+    let backend = CudaBackend::new(0).expect("cuda backend");
+    let borrowed = backend
+        .import_fp4_marlin_device_ptr(weight_ptr, scale_tail_ptr, folded_global, &[n, k], (n, 0))
+        .expect("import marlin view");
+    let x_f32: Vec<f32> = x.iter().map(|v| v.to_f32()).collect();
+    let x_handle = backend.upload(&x_f32, &[m, k]).expect("upload x");
+    let (student_out, _) = backend
+        .matmul_bt(&x_handle, &[m, k], &borrowed, &[n, k])
+        .expect("student matmul");
+    let student = backend.readback(&student_out).expect("readback student");
+
+    assert_eq!(student.len(), serve.len());
+    let scale = serve
+        .iter()
+        .map(|v| v.to_f32().abs())
+        .fold(0.0f32, f32::max)
+        .max(1e-6);
+    let worst = serve
+        .iter()
+        .zip(student.iter())
+        .enumerate()
+        .map(|(i, (s, &t))| ((s.to_f32() - t).abs(), i, s.to_f32(), t))
+        .max_by(|l, r| l.0.total_cmp(&r.0))
+        .expect("non-empty");
+    assert!(
+        serve.iter().any(|v| v.to_f32() != 0.0),
+        "serving gemm produced zeros"
+    );
+    // Both reduce over k=512 in different orders and land in bf16, so this is a
+    // tolerance on accumulation order, not on the weights themselves.
+    assert!(
+        worst.0 / scale < 2e-2,
+        "student base disagrees with the serving gemm: idx={} serve={} student={} rel={}",
+        worst.1,
+        worst.2,
+        worst.3,
+        worst.0 / scale
+    );
+}
