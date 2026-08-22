@@ -279,13 +279,11 @@ impl EngineLoadConfig {
         }
     }
 
-    /// Whether an L3 (NVMe) KV spill was requested at all.
     #[allow(dead_code)]
     fn kv_ssd_requested(&self) -> bool {
         self.kv_ssd_root.is_some() || self.kv_disk_limit.is_some()
     }
 
-    /// The resolved per-rank L3 spill request: `Some((root, budget_bytes))`.
     /// `default_budget(root, fraction)` probes free disk; `world` divides the
     /// deployment-total cap into per-rank shares.
     #[allow(dead_code)]

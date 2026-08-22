@@ -1,14 +1,7 @@
 //! In-process OpenAI v1 HTTP serving entry.
 //!
-//! [`serve_http`] is the server-START the legacy `infer` / `metal_serve` /
-//! `cpu_serve` bins used to own: build the axum router for the compiled backend,
-//! bind a `TcpListener`, and drive `axum::serve` to graceful (Ctrl-C) shutdown.
-//! Those bins were deleted with the `infer/` crate (PR #53); the runtime now
-//! ships only the `arle` binary, so the CLI calls this in-process instead of
-//! exec'ing a standalone serve binary.
-//!
 //! The CLI is synchronous, so this owns its tokio multi-thread runtime rather
-//! than relying on `#[tokio::main]` (which is what the deleted bins used).
+//! than relying on `#[tokio::main]`.
 //!
 //! Backend is selected at compile time (`metal`/`cuda`/`hip`/`vulkan`/`cpu`) and the router is
 //! built by [`LoadedInferenceEngine::router_for_backend`], which spawns the same
@@ -131,7 +124,6 @@ fn default_cache_root() -> PathBuf {
     std::env::temp_dir()
 }
 
-/// Speculative decode mode requested at the serve boundary.
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
 pub enum ServeSpecType {
     #[default]

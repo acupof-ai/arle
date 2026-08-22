@@ -200,8 +200,6 @@ where
                 Ok((ticket, prompt_token_ids, req))
             })
             .collect::<Result<Vec<_>>>()?;
-        // Pass 2: collect each ticket and project to `CompletionOutput` with the
-        // same stop-string truncation + finish-reason logic as `run`.
         pending
             .into_iter()
             .map(|(ticket, prompt_token_ids, req)| {
@@ -627,8 +625,6 @@ fn server_chat_content(message: &ChatPromptMessage) -> infer_server::ChatContent
     infer_server::ChatContent::Parts(parts)
 }
 
-/// Truncate at the first occurrence of any non-empty stop string, returning the
-/// prefix before it (or `None` if none matched).
 fn truncate_at_first_stop(text: &str, stops: &[String]) -> Option<String> {
     let pos = stops
         .iter()

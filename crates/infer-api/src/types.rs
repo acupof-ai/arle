@@ -1,8 +1,3 @@
-//! Public types mirroring the legacy `infer::server_engine` contract, so a
-//! consumer importing `infer_api::{...}` sees the same shape it imports from
-//! `infer::server_engine::{...}` today. `SamplingParams` is re-exported from
-//! `infer-plan` rather than duplicated.
-
 use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 
@@ -16,10 +11,9 @@ use cudarc::driver::DevicePtr;
 /// Raw `[seq_len, vocab]` logits produced by the CUDA OPD-teacher forward,
 /// carried back to `train` without sampling.
 ///
-/// Mirrors the legacy `infer::server_engine::RawLogits` shape so `train` can swap
-/// `infer` -> `infer-api` with no code change. `logits` is a row-major
-/// `[seq_len, vocab]` device buffer; `device` is the model's context, needed to
-/// sync / consume the buffer (D2H or a D2D import into the train backend).
+/// `logits` is a row-major `[seq_len, vocab]` device buffer; `device` is the
+/// model's context, needed to sync / consume the buffer (D2H or a D2D import
+/// into the train backend).
 #[cfg(feature = "cuda")]
 pub struct RawLogits {
     pub logits: DeviceVec,
@@ -59,8 +53,7 @@ impl RawLogits {
 #[cfg(feature = "cuda")]
 unsafe impl Send for RawLogits {}
 
-/// A single completion request (field-for-field compatible with the legacy
-/// `CompletionRequest`).
+/// A single completion request.
 #[derive(Debug)]
 pub struct CompletionRequest {
     pub prompt: String,
@@ -103,8 +96,8 @@ pub struct MultimodalChatRequest {
     pub sampling: SamplingParams,
 }
 
-/// Why generation stopped (the legacy 2-state public shape;
-/// [`from_plan`](FinishReason::from_plan) maps the rewrite's `Abort` -> `Stop`).
+/// Binary public shape; [`from_plan`](FinishReason::from_plan) maps the plan's
+/// `Abort` to `Stop`.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum FinishReason {
     Length,
@@ -112,8 +105,6 @@ pub enum FinishReason {
 }
 
 impl FinishReason {
-    /// Map a rewrite `infer_plan::FinishReason` into this binary shape
-    /// (`Abort` -> `Stop`).
     #[must_use]
     pub fn from_plan(reason: &infer_plan::FinishReason) -> Self {
         match reason {
@@ -123,7 +114,6 @@ impl FinishReason {
     }
 }
 
-/// A completed (non-streaming) generation result (legacy `CompletionOutput`).
 pub struct CompletionOutput {
     pub text: String,
     pub finish_reason: FinishReason,
@@ -132,7 +122,6 @@ pub struct CompletionOutput {
     pub response_token_ids: Vec<u32>,
 }
 
-/// Prompt / completion / total token accounting.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct TokenUsage {
     pub prompt_tokens: usize,
@@ -141,7 +130,6 @@ pub struct TokenUsage {
 }
 
 impl TokenUsage {
-    /// Build usage with `total_tokens` set to `prompt_tokens + completion_tokens`.
     #[must_use]
     pub fn new(prompt_tokens: usize, completion_tokens: usize) -> Self {
         Self {
@@ -152,13 +140,10 @@ impl TokenUsage {
     }
 }
 
-/// Backend-native chat rendering input.
-///
-/// This is intentionally smaller than the OpenAI wire type: CLI/agent callers
-/// only need role + text content, while HTTP continues to own tools and other
+/// Intentionally smaller than the OpenAI wire type: CLI/agent callers only
+/// need role + text content, while HTTP continues to own tools and other
 /// request-shape details. Backends with checkpoint chat templates override
-/// [`InferenceEngine::render_chat_prompt`]; the default remains ChatML for
-/// legacy autoregressive paths.
+/// [`InferenceEngine::render_chat_prompt`]; the default remains ChatML.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChatPromptMessage {
     pub role: String,
@@ -189,7 +174,6 @@ impl ChatPromptMessage {
     }
 }
 
-/// One streamed delta (legacy `CompletionStreamDelta`).
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct CompletionStreamDelta {
     pub text_delta: String,
@@ -241,9 +225,9 @@ impl CompletionStreamError {
     }
 }
 
-/// Backend-agnostic engine-level telemetry snapshot (legacy `EngineTelemetry`
-/// minus `model_arch`). The rewrite `ServeHandle` surfaces only queue/active
-/// counters; latency / batch-occupancy / spec metrics are not yet tracked.
+/// Backend-agnostic engine-level telemetry snapshot. Only queue/active
+/// counters are tracked; latency / batch-occupancy / spec metrics are not yet
+/// surfaced.
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct EngineTelemetry {
     pub queue_depth: u32,
@@ -251,10 +235,7 @@ pub struct EngineTelemetry {
     pub timestamp_ms: u64,
 }
 
-/// The public inference contract (signature-identical to the legacy
-/// `InferenceEngine`, so consumer bounds compile unchanged after the swap).
 pub trait InferenceEngine: Send {
-    /// The model identifier (e.g. `"Qwen3-8B"`).
     fn model_id(&self) -> &str;
 
     fn complete(&mut self, req: CompletionRequest) -> Result<CompletionOutput>;
@@ -274,14 +255,12 @@ pub trait InferenceEngine: Send {
         tx: tokio::sync::mpsc::UnboundedSender<CompletionStreamDelta>,
     ) -> Result<()>;
 
-    /// Encode `text` to token ids with the backend's tokenizer. The default
-    /// errors (object-safety); treat `Err(_)` as "unavailable", never empty `Vec`.
+    /// The default errors (object-safety); treat `Err(_)` as "unavailable",
+    /// never an empty `Vec`.
     fn tokenize(&self, _text: &str) -> Result<Vec<u32>> {
         Err(anyhow!("backend does not expose tokenize()"))
     }
 
-    /// Render chat messages using the backend's native chat template.
-    ///
     /// The default keeps the historical Qwen-style ChatML prompt for engines
     /// that have not exposed a checkpoint template yet. Template-aware
     /// [`ServeInferenceEngine`](crate::ServeInferenceEngine) instances override
