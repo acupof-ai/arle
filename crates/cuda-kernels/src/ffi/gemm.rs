@@ -547,6 +547,8 @@ unsafe extern "C" {
         k: i32,
         group_size: i32,
         xor_mask: u32,
+        fuse_swiglu: u32,
+        swiglu_limit: f32,
         stream: CUstream,
     ) -> CUresult;
 

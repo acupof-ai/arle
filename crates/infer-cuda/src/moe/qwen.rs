@@ -1531,7 +1531,7 @@ unsafe fn grouped_pair_batch(
                     opt_ptrs(&weights.up_scale_ptrs, "up W4A16 scale")?,
                     cache_ptr(&packed_hidden.data, ctx),
                     cache_ptr(&gate_out.data, ctx),
-                    cache_ptr(&up_out.data, ctx),
+                    Some(cache_ptr(&up_out.data, ctx)),
                     cache_ptr(offsets, ctx),
                     counts,
                     cache_ptr(expert_indices, ctx),
@@ -1541,6 +1541,8 @@ unsafe fn grouped_pair_batch(
                     k,
                     first.group_size,
                     0,
+                    false,
+                    0.0,
                     ctx,
                     ctx.stream.cu_stream(),
                 )

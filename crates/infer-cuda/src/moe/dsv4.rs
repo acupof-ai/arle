@@ -827,9 +827,10 @@ fn build_w4afp8_gemv_tables(
     })
 }
 
-/// W4A16 routed-MoE forward: compact pack, one paired gate/up W4A16 GEMV,
-/// clamped SwiGLU, one down W4A16 GEMV, then the shared scatter/combine
-/// tail. All intermediates are stream-ordered allocs (graph-capture safe).
+/// W4A16 routed-MoE forward: compact pack, one paired gate/up W4A16 GEMV with
+/// fused clamped SwiGLU (writes `act` directly), one down W4A16 GEMV, then the
+/// shared scatter/combine tail. All intermediates are stream-ordered allocs
+/// (graph-capture safe).
 #[allow(clippy::too_many_arguments)]
 fn dsv4_moe_forward_w4a16(
     model: &Dsv4Model,
@@ -929,14 +930,15 @@ fn dsv4_moe_forward_w4a16(
         )?;
     }
 
-    let gate_out = HiddenStates::zeros(ctx, i_dim, rows)?;
-    let up_out = HiddenStates::zeros(ctx, i_dim, rows)?;
-    keepalive.keep_hidden(&gate_out);
-    keepalive.keep_hidden(&up_out);
+    let act = HiddenStates::zeros(ctx, i_dim, rows)?;
+    keepalive.keep_hidden(&act);
 
+    // Fused gate+up GEMV with clamped SwiGLU: the kernel accumulates both
+    // halves and writes `act` directly, skipping the gate_out/up_out
+    // round-trip and the separate SwiGLU launch.
     // SAFETY: `tables` are the layer-resident W4A16 expert tables for
     // `experts_per_rank` experts; `packed_hidden` is [rows, hidden_dim] and
-    // `gate_out`/`up_out` [rows, i_dim], keepalive-held on `ctx.stream`.
+    // `act` [rows, i_dim], keepalive-held on `ctx.stream`.
     unsafe {
         moe::moe_w4a16_grouped_gemv_pair_batch(
             &tables.gate_w,
@@ -944,8 +946,8 @@ fn dsv4_moe_forward_w4a16(
             &tables.up_w,
             &tables.up_s,
             cache_ptr(&packed_hidden.data, ctx),
-            cache_ptr(&gate_out.data, ctx),
-            cache_ptr(&up_out.data, ctx),
+            cache_ptr(&act.data, ctx),
+            None,
             cache_ptr(&offsets, ctx),
             cache_ptr(&counts, ctx),
             cache_ptr(&tables.expert_indices, ctx),
@@ -955,21 +957,9 @@ fn dsv4_moe_forward_w4a16(
             hidden_dim,
             tables.group_size,
             xor_mask,
-            ctx,
-            ctx.stream.cu_stream(),
-        )?;
-    }
-
-    let act = HiddenStates::zeros(ctx, i_dim, rows)?;
-    keepalive.keep_hidden(&act);
-    // SAFETY: `gate_out`, `up_out` and `act` each hold `rows * i_dim` bf16 on `ctx.stream`.
-    unsafe {
-        moe::dsv4_swiglu_clamped_batch(
-            cache_ptr(&gate_out.data, ctx),
-            cache_ptr(&up_out.data, ctx),
-            cache_ptr(&act.data, ctx),
-            rows * i_dim,
+            true,
             model.config.swiglu_limit,
+            ctx,
             ctx.stream.cu_stream(),
         )?;
     }
