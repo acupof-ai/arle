@@ -193,7 +193,7 @@ id = "cuda.qwen35.attn_fa3_hd256"
 semantic = "qwen35.full_attention"
 provider = "fa3"
 source = "crates/infer-cuda/src/qwen35_attention.rs"
-legality = "seq_len>1 && head_dim==256 && sm==9.0 && --qwen35-fa3 && real-kernel marker (stub build declines)"
+legality = "seq_len>1 && head_dim==256 && sm==9.0 && real-kernel marker (stub build declines)"
 fallback = "cuda.qwen35.attn_nonpaged_prefill"
 
 [[implementation]]
@@ -228,7 +228,7 @@ id = "cuda.qwen35.paged_fa3_bf16"
 semantic = "qwen35.full_attention_paged"
 provider = "fa3"
 source = "crates/infer-cuda/src/qwen35_attention.rs"
-legality = "sm==9.0 && --qwen35-fa3 && head_dim==256 && (seq_len<=FA3_MAX_QLEN || batch==1) && pool in {BF16,FP8E4M3,INT8}; the only graph-capture paged lane"
+legality = "sm==9.0 && head_dim==256 && (seq_len<=FA3_MAX_QLEN || batch==1) && pool in {BF16,FP8E4M3,INT8}; the only graph-capture paged lane"
 fallback = "cuda.qwen35.paged_attn_v1"
 
 [[implementation]]
@@ -439,7 +439,7 @@ id = "cuda.qwen35.moe_deepgemm_grouped"
 semantic = "qwen35.moe_experts"
 provider = "deepgemm"
 source = "crates/infer-cuda/src/moe/qwen.rs"
-legality = "expert_format in {Fp8BlockScaled, Fp8PerShard} && --qwen35-deepgemm (default on) && num_tokens*topk >= --qwen35-deepgemm-min-routes (1024)"
+legality = "expert_format in {Fp8BlockScaled, Fp8PerShard} && num_tokens*topk >= --qwen35-deepgemm-min-routes (1024)"
 fallback = "cuda.qwen35.moe_grouped_gemm_batch"
 
 [[implementation]]
@@ -447,7 +447,7 @@ id = "cuda.qwen35.moe_decode_kernel"
 semantic = "qwen35.moe_experts"
 provider = "arle"
 source = "crates/infer-cuda/src/moe/qwen.rs"
-legality = "expert_format in {DenseBf16, Fp8BlockScaled} && num_tokens*topk <= 256 && --qwen35-moe-decode-kernel (default on); CUDA-graph capturable"
+legality = "expert_format in {DenseBf16, Fp8BlockScaled} && num_tokens*topk <= 256; CUDA-graph capturable"
 fallback = "cuda.qwen35.moe_grouped_gemm_batch"
 
 [[implementation]]

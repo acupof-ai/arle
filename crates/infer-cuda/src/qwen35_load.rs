@@ -1522,17 +1522,16 @@ impl SafetensorLoader {
         let mut down = Vec::with_capacity(split.experts_per_rank);
         let per_expert_probe = names.expert_gate_proj(split.local_expert_start);
         let per_expert_quant_probe = self.quant_view_for(&per_expert_probe)?.is_some();
-        let deepgemm_native_ready = crate::runtime_flags::qwen35_deepgemm()
-            && match cuda_kernels::moe::dsv4_deepgemm_native_preflight() {
-                Ok(_) => true,
-                Err(err) => {
-                    log::warn!(
-                        "Qwen3.5 DeepGEMM MoE disabled: native bridge unavailable ({err}); \
+        let deepgemm_native_ready = match cuda_kernels::moe::dsv4_deepgemm_native_preflight() {
+            Ok(_) => true,
+            Err(err) => {
+                log::warn!(
+                    "Qwen3.5 DeepGEMM MoE disabled: native bridge unavailable ({err}); \
                              falling back to the hand grouped kernels"
-                    );
-                    false
-                }
-            };
+                );
+                false
+            }
+        };
         // sm_120 has no DeepGEMM native bridge, but the CUTLASS sm_120a grouped
         // collective
         // consumes the SAME contiguous grouped FP8 caches — build them regardless of
