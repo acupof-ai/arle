@@ -243,7 +243,6 @@ impl StreamingReasoningSplitter {
         self.pending = buf.split_off(buf.len() - held);
     }
 
-    /// Flush any held-back pending, labeled by the current phase.
     pub(crate) fn finish(&mut self) -> Option<ChatDelta> {
         let pending = std::mem::take(&mut self.pending);
         if pending.is_empty() {

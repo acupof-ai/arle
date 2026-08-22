@@ -176,7 +176,6 @@ impl OpenAiTokenizer {
         out
     }
 
-    /// Decode token ids into text, skipping special tokens.
     pub fn decode(&self, token_ids: &[u32]) -> Result<String> {
         self.inner
             .decode(token_ids, true)

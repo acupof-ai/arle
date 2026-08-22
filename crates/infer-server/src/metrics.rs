@@ -8,7 +8,6 @@
 
 use crate::execution::CounterSnapshot;
 
-/// Content type for the Prometheus text exposition format.
 pub(crate) const PROMETHEUS_CONTENT_TYPE: &str = "text/plain; version=0.0.4";
 
 /// Render `counters` as Prometheus text exposition, labelled with the served

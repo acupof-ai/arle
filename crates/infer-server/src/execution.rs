@@ -67,8 +67,6 @@ pub struct CounterSnapshot {
     pub gpu: Option<infer_seam::GpuSample>,
 }
 
-/// Cross-thread handle to the latest [`CounterSnapshot`]: the engine loop writes
-/// it each tick, the frontend reads it.
 type CounterHandle = Arc<Mutex<CounterSnapshot>>;
 
 fn publish_counters<E: BackendExecutor, K: KvPool>(
@@ -101,16 +99,12 @@ fn publish_counters<E: BackendExecutor, K: KvPool>(
 /// has to invoke it.
 pub(crate) type ControlMessage<E, K> = Box<dyn FnOnce(&mut Engine<E, K>) + Send>;
 
-/// One unit of frontend->engine work: a prompt plus a place to send back the
-/// engine-assigned handle and (later) the completion.
 pub(crate) struct Submission {
     pub(crate) prompt: Vec<u32>,
     pub(crate) max_tokens: usize,
     /// Per-request sampling/stop parameters parsed at the HTTP boundary.
     pub(crate) sampling: SamplingParams,
-    /// Carries the engine-assigned handle back to the submitting caller.
     pub(crate) handle_tx: Sender<RequestHandle>,
-    /// Carries the request's single completion back to the submitting caller.
     pub(crate) completion_tx: Sender<CompletedRequest>,
     /// Live token stream for this request: `None` for blocking `submit`, `Some`
     /// for `submit_streaming`.
@@ -210,8 +204,8 @@ fn engine_loop_with_tick_broadcaster<E, K>(
             return;
         }
 
-        // 0. Snapshot queued submissions before controls run. A Serving→Quiesced
-        //    transition aborts this pre-existing batch; later submissions defer.
+        // A Serving→Quiesced transition aborts this pre-existing batch; later
+        // submissions defer.
         let mut drained = std::mem::take(&mut carry);
         loop {
             match submit_rx.try_recv() {
@@ -224,8 +218,8 @@ fn engine_loop_with_tick_broadcaster<E, K>(
             }
         }
 
-        // 1. Run queued out-of-band controls between steps. A closure may cancel
-        //    requests; deliver those completions even if the engine stays idle.
+        // A closure may cancel requests; deliver those completions even if the
+        // engine stays idle.
         let was_quiesced = engine.is_quiesced();
         if drain_control(&mut engine, &control_rx) > 0 {
             deliver_completions(&engine, &mut pending, &streamers);
@@ -310,9 +304,8 @@ fn engine_loop_with_tick_broadcaster<E, K>(
             );
         }
 
-        // 3. If there is engine work, run one tick and deliver any completions.
-        //    Looping here (rather than one tick per outer pass) keeps latency low
-        //    without re-checking the submit channel between every micro-step.
+        // Loop here (rather than one tick per outer pass) to keep latency low
+        // without re-checking the submit channel between every micro-step.
         if !engine.is_idle() {
             let step_start = trace_submit.then(Instant::now);
             let active_before = engine.active_count();
@@ -369,9 +362,9 @@ fn engine_loop_with_tick_broadcaster<E, K>(
             return;
         }
 
-        // 5. Idle but still serving: park on the submit channel instead of
-        //    busy-spinning. The submission is carried to the next pass so it
-        //    rides the same tick broadcast as try_recv'd ones.
+        // Park on the submit channel instead of busy-spinning; the submission is
+        // carried to the next pass so it rides the same tick broadcast as
+        // try_recv'd ones.
         match submit_rx.recv_timeout(IDLE_PARK) {
             Ok(submission) => carry.push(submission),
             Err(RecvTimeoutError::Timeout) => {}

@@ -1,26 +1,9 @@
-//! Multiproc-serve control-plane relay (Stage 1 re-wire scaffold).
+//! Multiproc-serve control-plane relay.
 //!
 //! TCP transport for shipping serve-request payloads from the coordinator
 //! process (rank 0) to worker processes (rank 1..N-1). NCCL handles the
-//! data-plane forward sync (Stage 2); this module handles the per-request
-//! control-plane fanout.
-//!
-//! Ported from `git show e81b98fb^:infer/src/multiproc_relay.rs` and adapted to
-//! the rewrite crate stack:
-//!   - `WireSamplingParams` -> the rewrite [`infer_plan::SamplingParams`] (the
-//!     legacy field-by-field mirror was identical), with [`WireRequest::submit_args`]
-//!     reconstructing the `(prompt, max_tokens, sampling)` triple the rewrite
-//!     [`crate::ServeHandle::submit`] takes.
-//!   - The legacy `WireRequest` carried `priority`/`session_id`/`stop`; the
-//!     rewrite `submit` does not surface those yet, so they are dropped here
-//!     rather than carried inert. Re-add when the rewrite scheduler grows the
-//!     fields. (`// STAGE 2:`)
-//!   - The legacy `Completion` envelope coupled to `infer::server_engine::
-//!     CompletionStreamDelta`. That type now lives in `infer-api` (which depends
-//!     on this crate), so it can't be referenced here. A self-contained
-//!     [`RelayCompletionDelta`] (serde, length-prefixed JSON) carries the
-//!     Stage-1 worker->coordinator output; Stage 2 maps it to the public
-//!     `CompletionStreamDelta` at the `infer-api` boundary. (`// STAGE 2:`)
+//! data-plane forward sync; this module handles the per-request control-plane
+//! fanout.
 //!
 //! Wire format: length-prefixed JSON envelopes.
 //!   [u32 LE: payload_len][payload_len bytes JSON].
@@ -68,7 +51,6 @@ type TickBroadcaster = Box<dyn Fn(u64, Vec<WireRequest>) -> Result<()> + Send + 
 
 static TICK_BROADCASTER: OnceLock<TickBroadcaster> = OnceLock::new();
 
-/// Whether a tick broadcaster is installed (multiproc rank-0 coordinator).
 #[must_use]
 pub fn tick_broadcaster_installed() -> bool {
     TICK_BROADCASTER.get().is_some()
@@ -117,8 +99,6 @@ pub trait RelayChannel: Send {
     }
 }
 
-/// Localhost-TCP [`RelayChannel`] — the only transport; a thin newtype over
-/// [`TcpStream`].
 pub struct TcpChannel(TcpStream);
 
 impl TcpChannel {
@@ -227,7 +207,6 @@ pub fn local_relay_pair() -> (
     )
 }
 
-/// Stats payload for the coordinator `/v1/stats` relay round-trip.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct WireStats {
     #[serde(default)]
@@ -695,13 +674,12 @@ fn merge_wire_stats_dp(acc: &mut WireStats, other: WireStats) {
     }
 }
 
-/// Self-contained worker->coordinator completion delta (Stage 1).
+/// Self-contained worker->coordinator completion delta.
 ///
 /// Mirrors the shape of the public `infer_api::CompletionStreamDelta` minus the
 /// crate coupling, so the relay can ship worker output without depending on
 /// `infer-api`. `finish` marks the terminal delta. `error` carries a terminal
-/// failure. `// STAGE 2:` map this to/from `infer_api::CompletionStreamDelta`
-/// at the boundary once the lockstep forward emits real tokens.
+/// failure.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct RelayCompletionDelta {
     pub text_delta: String,
@@ -724,7 +702,6 @@ pub struct RelayCompletionDelta {
 }
 
 impl RelayCompletionDelta {
-    /// Whether this delta closes the request (terminal finish or error).
     #[must_use]
     pub fn is_done(&self) -> bool {
         self.finish || self.error.is_some()
@@ -795,11 +772,6 @@ pub enum RelayEnvelope {
 /// Serializable counterpart of the rewrite serve request. Captures the minimum
 /// data a worker rank needs to schedule the same forward path as rank 0: the
 /// prompt tokens, the new-token budget, and the sampling params.
-///
-/// `// STAGE 2:` the legacy `WireRequest` also carried `prompt: String`,
-/// `stop`, `priority`, and `session_id`. The rewrite `ServeHandle::submit` takes
-/// only `(prompt_tokens, max_tokens, SamplingParams)`, so those are dropped
-/// until the rewrite scheduler surfaces them.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WireRequest {
     /// Coordinator-assigned logical request id (for completion routing).
@@ -814,8 +786,6 @@ pub struct WireRequest {
 }
 
 impl WireRequest {
-    /// Reconstruct the `(prompt, max_tokens, sampling)` triple the rewrite
-    /// [`crate::ServeHandle::submit`] consumes.
     #[must_use]
     pub fn submit_args(
         self,
@@ -891,8 +861,6 @@ impl TickAckLedger {
     }
 }
 
-/// Coordinator-side TCP relay. Binds a port, accepts N-1 worker connections at
-/// boot, then provides `broadcast()` to send envelopes to every worker stream.
 pub struct RelayCoordinator {
     port: u16,
     workers: BTreeMap<usize, Box<dyn RelayChannel>>,
@@ -1287,8 +1255,6 @@ impl CompletionSinks {
     }
 }
 
-/// Worker-side relay: connects at boot, then `recv()`s one envelope at a time
-/// over a [`RelayChannel`] trait object (transport-agnostic, TCP today).
 pub struct RelayWorker {
     channel: Box<dyn RelayChannel>,
 }

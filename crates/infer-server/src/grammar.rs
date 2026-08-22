@@ -63,8 +63,8 @@ impl GrammarCache {
         })
     }
 
-    /// Build the per-request hook. `Ok(None)` means the format imposes no
-    /// constraint, so the request decodes unmodified.
+    /// `Ok(None)` means the format imposes no constraint, so the request
+    /// decodes unmodified.
     pub fn hook(&self, format: &ResponseFormat) -> Result<Option<GrammarHook>> {
         let Some(key) = format.key() else {
             return Ok(None);
