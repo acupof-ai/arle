@@ -974,15 +974,11 @@ pub(super) fn cuda_import_fp4_marlin_device_ptr(
             .stream
             .upgrade_device_ptr::<u8>(scale_tail_device_ptr as CUdeviceptr, scale_len)
     };
-    let global = backend
-        .stream
-        .clone_htod(&[global_scale])
-        .map_err(|_| AutogradError::TapeInvariant("marlin nvfp4 global scale H2D failed"))?;
     Ok(DeviceHandle::CudaFp4E2M1Group(
         crate::backend::CudaFp4E2M1GroupStorage::new_borrowed_marlin(
             weight_slice,
             scale_slice,
-            global,
+            global_scale,
             rows,
             cols,
         ),
@@ -1088,7 +1084,9 @@ pub(super) fn cuda_readback(backend: &CudaBackend, handle: &DeviceHandle) -> Res
         DeviceHandle::CudaFp4E2M1Group(storage) => {
             let weight = storage.weight();
             let scales = storage.scales();
-            let global = storage.global_scale();
+            let global = storage.global_scale().ok_or(AutogradError::TapeInvariant(
+                "cuda nvfp4 host readback needs the group layout's global scale buffer",
+            ))?;
             let mut host_weight = vec![0u8; weight.len()];
             let mut host_scales = vec![0u8; scales.len()];
             let mut host_global = vec![0.0f32; global.len()];
