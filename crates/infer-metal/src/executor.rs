@@ -15,7 +15,7 @@ use infer_plan::{ForwardPlan, SlotToken, StepOutput};
 use infer_seam::{BackendExecutor, KvPool, PollResult, PrefixBlock};
 
 #[cfg(feature = "metal")]
-use crate::{config, dflash, mlx, model_source, qwen35};
+use crate::{config, dflash, lfm2, mlx, model_source, qwen35};
 
 #[cfg(feature = "metal")]
 const KV_CACHE_CHUNK: i32 = 256;
@@ -56,6 +56,69 @@ impl MetalKvCacheDtype {
                 "Metal KV cache supports bf16/int8; requested {} is CUDA-only",
                 other.label()
             ),
+        }
+    }
+}
+
+/// Session-based compiled forward model. Implemented by the Qwen3.5 and LFM2
+/// C++ models; `recurrent` = GDR states (Qwen3.5) or conv states (LFM2).
+/// Method names differ from the concrete types' inherent methods so the
+/// inherent delegates stay unambiguous.
+#[cfg(feature = "metal")]
+pub(crate) trait CompiledMetalModel {
+    fn session_begin(
+        &self,
+        kv: &[mlx::MlxArray],
+        recurrent: &[mlx::MlxArray],
+    ) -> anyhow::Result<()>;
+    fn session_end(
+        &self,
+        n_kv: usize,
+        n_recurrent: usize,
+    ) -> anyhow::Result<(Vec<mlx::MlxArray>, Vec<mlx::MlxArray>)>;
+    fn session_prefill(
+        &self,
+        tokens: &mlx::MlxArray,
+        prompt_len: i32,
+        cache_pos: i32,
+    ) -> anyhow::Result<mlx::MlxArray>;
+    fn session_step(&self, token: &mlx::MlxArray, cache_pos: i32) -> anyhow::Result<mlx::MlxArray>;
+    fn session_step_paged_bf16(
+        &self,
+        token: &mlx::MlxArray,
+        cache_pos: i32,
+        k: &[mlx::MlxArray],
+        v: &[mlx::MlxArray],
+    ) -> anyhow::Result<mlx::MlxArray>;
+    fn session_step_paged_int8(
+        &self,
+        token: &mlx::MlxArray,
+        cache_pos: i32,
+        k: &[mlx::MlxArray],
+        v: &[mlx::MlxArray],
+    ) -> anyhow::Result<mlx::MlxArray>;
+}
+
+/// Loaded weights for whichever architecture the config selects.
+#[cfg(feature = "metal")]
+enum MetalWeights {
+    Qwen35(qwen35::Qwen35MetalWeights),
+    Lfm2(lfm2::Lfm2MetalWeights),
+}
+
+#[cfg(feature = "metal")]
+impl MetalWeights {
+    fn compiled(&self) -> anyhow::Result<&dyn CompiledMetalModel> {
+        match self {
+            MetalWeights::Qwen35(w) => w.cpp_model().map(|m| m as &dyn CompiledMetalModel),
+            MetalWeights::Lfm2(w) => w.cpp_model().map(|m| m as &dyn CompiledMetalModel),
+        }
+    }
+
+    fn qwen35(&self) -> anyhow::Result<&qwen35::Qwen35MetalWeights> {
+        match self {
+            MetalWeights::Qwen35(w) => Ok(w),
+            MetalWeights::Lfm2(_) => anyhow::bail!("this path requires a Qwen3.5 model"),
         }
     }
 }
@@ -273,7 +336,11 @@ impl MetalExecutor {
             validate_int8_kv_config(&config)?;
         }
         eprintln!("[infer-metal] kv cache dtype = {}", kv_cache_dtype.label());
-        let weights = qwen35::load_qwen35_metal_weights(resolved, &config)?;
+        let weights = if config.arch.lfm2.is_some() {
+            MetalWeights::Lfm2(lfm2::load_lfm2_metal_weights(resolved, &config)?)
+        } else {
+            MetalWeights::Qwen35(qwen35::load_qwen35_metal_weights(resolved, &config)?)
+        };
         let dflash = resolve_dflash(resolved, &config)?;
         Ok(Self {
             real: Some(RealMetalExecutor {
@@ -593,7 +660,7 @@ struct PendingStep {
 struct RealMetalExecutor {
     config: config::MetalModelConfig,
     kv_cache_dtype: MetalKvCacheDtype,
-    weights: qwen35::Qwen35MetalWeights,
+    weights: MetalWeights,
     slots: HashMap<usize, MetalSlotState>,
     page_store: MetalPageStore,
     active_session_slot: Option<usize>,
@@ -629,18 +696,18 @@ impl RealMetalExecutor {
             return Ok(());
         }
         let _guard = mlx_sys::mlx_guard();
-        let model = self.weights.cpp_model()?;
+        let model = self.weights.compiled()?;
         // Throwaway warmup state: a reserved slot id, tiny cache, never inserted
         // into `self.slots` or published to the kv pool. Token id 0 is a valid
         // vocab index; the output is discarded — only the graph JIT matters.
         let mut state = MetalSlotState::new(usize::MAX, 0, &self.config, self.kv_cache_dtype, 8);
         state.ensure_session_active(model)?;
         let prefill = mlx::MlxArray::from_slice_i32(&[0, 0], &[2]);
-        let logits = model.prefill_session(&prefill, 2, 0)?;
+        let logits = model.session_prefill(&prefill, 2, 0)?;
         mlx::async_eval(&[&logits]);
         state.cache_len = 2;
         let step = mlx::MlxArray::from_slice_i32(&[0], &[1]);
-        let logits = model.step_session(&step, state.cache_len as i32)?;
+        let logits = model.session_step(&step, state.cache_len as i32)?;
         mlx::async_eval(&[&logits]);
         state.cache_len += 1;
         // Blocking materialize so the JIT completes before the first request.
@@ -820,7 +887,7 @@ impl RealMetalExecutor {
             self.slots.insert(row.slot, state);
         }
 
-        let model = self.weights.cpp_model()?;
+        let model = self.weights.compiled()?;
         let slot = self.slots.get_mut(&row.slot).expect("slot inserted above");
         anyhow::ensure!(
             row.start_pos == slot.cache_len,
@@ -838,9 +905,13 @@ impl RealMetalExecutor {
         let token_arr = mlx::MlxArray::from_slice_i32(&token_values, &[token_values.len() as i32]);
         let capture_dflash_hidden = self.dflash.is_some();
         if let Some(runtime) = self.dflash.as_ref() {
-            model.set_capture_layers(runtime.target_layer_ids())?;
+            // DFlash targets Qwen3.5 only; resolve_dflash bails for other arches.
+            self.weights
+                .qwen35()?
+                .cpp_model()?
+                .set_capture_layers(runtime.target_layer_ids())?;
         }
-        let logits = match model.prefill_session(
+        let logits = match model.session_prefill(
             &token_arr,
             token_values.len() as i32,
             row.start_pos as i32,
@@ -848,20 +919,21 @@ impl RealMetalExecutor {
             Ok(logits) => logits,
             Err(err) => {
                 if capture_dflash_hidden {
-                    model.clear_capture_layers();
+                    self.weights.qwen35()?.cpp_model()?.clear_capture_layers();
                 }
                 return Err(err);
             }
         };
         let dflash_hidden = if let Some(runtime) = self.dflash.as_ref() {
-            let captured = match model.drain_captured_hidden() {
+            let qmodel = self.weights.qwen35()?.cpp_model()?;
+            let captured = match qmodel.drain_captured_hidden() {
                 Ok(captured) => captured,
                 Err(err) => {
-                    model.clear_capture_layers();
+                    qmodel.clear_capture_layers();
                     return Err(err);
                 }
             };
-            model.clear_capture_layers();
+            qmodel.clear_capture_layers();
             Some(dflash::build_target_hidden_from_captures(
                 &captured,
                 runtime.target_layer_ids().len(),
@@ -933,7 +1005,7 @@ impl RealMetalExecutor {
         &mut self,
         rows: &[infer_plan::DecodeRow],
     ) -> anyhow::Result<StepOutput> {
-        let model = self.weights.cpp_model()?;
+        let model = self.weights.compiled()?;
         let block_size = self
             .dflash
             .as_ref()
@@ -1036,8 +1108,9 @@ impl RealMetalExecutor {
             .dflash
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("DFlash decode requested without a runtime"))?;
-        let qwen35::Qwen35Embedding::Dense(embed_tokens) = &self.weights.embedding;
-        let model = self.weights.cpp_model()?;
+        let qwen35_weights = self.weights.qwen35()?;
+        let qwen35::Qwen35Embedding::Dense(embed_tokens) = &qwen35_weights.embedding;
+        let model = qwen35_weights.cpp_model()?;
         let slot = self
             .slots
             .get_mut(&row.slot)
@@ -1063,7 +1136,7 @@ impl RealMetalExecutor {
             row.last_token,
             target_hidden,
             embed_tokens,
-            &self.weights.lm_head,
+            &qwen35_weights.lm_head,
             &self.config,
             model,
             &row.params,
@@ -1115,7 +1188,7 @@ impl RealMetalExecutor {
 
         self.ensure_no_other_active_session(row.slot)?;
         self.reset_slot_if_epoch_changed(row.slot, kv)?;
-        let model = self.weights.cpp_model()?;
+        let model = self.weights.compiled()?;
         if !self.slots.contains_key(&row.slot) {
             anyhow::ensure!(
                 row.kv_seq_len > 0,
@@ -1215,7 +1288,7 @@ impl RealMetalExecutor {
         row: &infer_plan::DecodeRow,
         kv: &mut dyn KvPool,
     ) -> anyhow::Result<()> {
-        let model = self.weights.cpp_model()?;
+        let model = self.weights.compiled()?;
         {
             let slot = self
                 .slots
@@ -1250,7 +1323,7 @@ impl RealMetalExecutor {
         let Some(seed) = seed else {
             return Ok(());
         };
-        let model = self.weights.cpp_model()?;
+        let model = self.weights.compiled()?;
         let token_arr = mlx::reshape(&seed, &[1]);
         let kv_cache_dtype = self.kv_cache_dtype;
         let slot = self
@@ -1302,7 +1375,7 @@ impl RealMetalExecutor {
             if let Some(mut state) = self.slots.remove(&slot)
                 && state.session_active
             {
-                let model = self.weights.cpp_model()?;
+                let model = self.weights.compiled()?;
                 state.drain_session(model)?;
             }
             if self.active_session_slot == Some(slot) {
@@ -1330,7 +1403,7 @@ use slot::*;
 
 #[cfg(feature = "metal")]
 fn step_session_decode(
-    model: &qwen35::CppQwen35Model,
+    model: &dyn CompiledMetalModel,
     slot: &MetalSlotState,
     kv_cache_dtype: MetalKvCacheDtype,
     token: &mlx::MlxArray,
@@ -1340,11 +1413,11 @@ fn step_session_decode(
         let logits = match kv_cache_dtype {
             MetalKvCacheDtype::Bf16 => {
                 let (k_full, v_full) = slot.bf16_prefix_read_inputs(slot.cache_len)?;
-                model.step_session_paged_bf16(token, cache_pos, &k_full, &v_full)
+                model.session_step_paged_bf16(token, cache_pos, &k_full, &v_full)
             }
             MetalKvCacheDtype::Int8 => {
                 let (k_full, v_full) = slot.int8_prefix_read_inputs(slot.cache_len)?;
-                model.step_session_paged_int8(token, cache_pos, &k_full, &v_full)
+                model.session_step_paged_int8(token, cache_pos, &k_full, &v_full)
             }
         }
         .map_err(|err| anyhow::anyhow!("paged KV read step_session failed: {err}"))?;
@@ -1352,7 +1425,7 @@ fn step_session_decode(
         return Ok(logits);
     }
     probe_paged_kv_read_fallback();
-    model.step_session(token, cache_pos)
+    model.session_step(token, cache_pos)
 }
 
 /// Extend a rank-4 `[B, n_kv, seq, head_dim]` K/V cache array along the seq axis
@@ -1499,6 +1572,10 @@ fn resolve_dflash(
 
 #[cfg(feature = "metal")]
 fn validate_int8_kv_config(config: &config::MetalModelConfig) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        config.arch.lfm2.is_none(),
+        "LFM2 models do not support INT8 KV cache; pass --kv-cache-dtype bf16"
+    );
     let group_size = int8_kv_group_size(config.head_dim)?;
     anyhow::ensure!(
         config.head_dim.is_multiple_of(group_size),

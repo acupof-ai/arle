@@ -200,6 +200,9 @@ pub(crate) fn load_qwen35_metal_weights(
                         load_proj(&format!("{attn_prefix}.out_proj"))?,
                     )?
                 }
+                MetalQwen35LayerType::Conv => {
+                    anyhow::bail!("conv layer type is only supported for lfm2_moe checkpoints")
+                }
             };
             let mlp = if let Some(moe_cfg) = arch.moe.as_ref().filter(|moe| moe.is_moe_layer(i)) {
                 MlpKind::Moe(load_qwen35_moe_layer_weights(
@@ -581,6 +584,48 @@ impl Drop for CppQwen35Model {
         unsafe {
             mlx_sys::qwen35_compiled_free(self.raw);
         }
+    }
+}
+
+impl crate::executor::CompiledMetalModel for CppQwen35Model {
+    fn session_begin(&self, kv: &[MlxArray], recurrent: &[MlxArray]) -> anyhow::Result<()> {
+        self.begin_session(kv, recurrent)
+    }
+    fn session_end(
+        &self,
+        n_kv: usize,
+        n_recurrent: usize,
+    ) -> anyhow::Result<(Vec<MlxArray>, Vec<MlxArray>)> {
+        self.end_session(n_kv, n_recurrent)
+    }
+    fn session_prefill(
+        &self,
+        tokens: &MlxArray,
+        prompt_len: i32,
+        cache_pos: i32,
+    ) -> anyhow::Result<MlxArray> {
+        self.prefill_session(tokens, prompt_len, cache_pos)
+    }
+    fn session_step(&self, token: &MlxArray, cache_pos: i32) -> anyhow::Result<MlxArray> {
+        self.step_session(token, cache_pos)
+    }
+    fn session_step_paged_bf16(
+        &self,
+        token: &MlxArray,
+        cache_pos: i32,
+        k: &[MlxArray],
+        v: &[MlxArray],
+    ) -> anyhow::Result<MlxArray> {
+        self.step_session_paged_bf16(token, cache_pos, k, v)
+    }
+    fn session_step_paged_int8(
+        &self,
+        token: &MlxArray,
+        cache_pos: i32,
+        k: &[MlxArray],
+        v: &[MlxArray],
+    ) -> anyhow::Result<MlxArray> {
+        self.step_session_paged_int8(token, cache_pos, k, v)
     }
 }
 

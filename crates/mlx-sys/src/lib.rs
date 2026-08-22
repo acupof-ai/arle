@@ -902,6 +902,115 @@ unsafe extern "C" {
         out: *mut *mut mlx_array,
     ) -> i32;
 
+    // --- LFM2.5 compiled model (see mlx_lfm2_model.cpp) ---
+    pub fn lfm2_compiled_new() -> *mut std::ffi::c_void;
+    pub fn lfm2_compiled_free(model: *mut std::ffi::c_void);
+    pub fn lfm2_compiled_add_dense_weight(model: *mut std::ffi::c_void, w: *mut mlx_array) -> i32;
+    pub fn lfm2_compiled_add_quant_weight(
+        model: *mut std::ffi::c_void,
+        w: *mut mlx_array,
+        scales: *mut mlx_array,
+        biases: *mut mlx_array,
+        group_size: i32,
+        bits: i32,
+        mode: i32,
+    ) -> i32;
+    pub fn lfm2_compiled_set_config(
+        model: *mut std::ffi::c_void,
+        rope_theta: f32,
+        rms_eps: f32,
+        n_heads: i32,
+        n_kv_heads: i32,
+        head_dim: i32,
+        hidden_size: i32,
+        conv_kernel: i32,
+    );
+    pub fn lfm2_compiled_set_embed(
+        model: *mut std::ffi::c_void,
+        embed_tokens: *mut mlx_array,
+        embedding_norm_w: *mut mlx_array,
+        lm_head_id: i32,
+    );
+    pub fn lfm2_compiled_set_embed_as_linear(model: *mut std::ffi::c_void, embed_id: i32);
+    #[allow(clippy::too_many_arguments)]
+    pub fn lfm2_compiled_push_conv_layer(
+        model: *mut std::ffi::c_void,
+        op_norm: *mut mlx_array,
+        ffn_norm: *mut mlx_array,
+        in_proj_id: i32,
+        conv_w: *mut mlx_array,
+        out_proj_id: i32,
+        gate_up_id: i32,
+        gate_dim: i32,
+        down_id: i32,
+    );
+    #[allow(clippy::too_many_arguments)]
+    pub fn lfm2_compiled_push_attn_layer(
+        model: *mut std::ffi::c_void,
+        op_norm: *mut mlx_array,
+        ffn_norm: *mut mlx_array,
+        q_id: i32,
+        k_id: i32,
+        v_id: i32,
+        o_id: i32,
+        q_norm: *mut mlx_array,
+        k_norm: *mut mlx_array,
+        gate_up_id: i32,
+        gate_dim: i32,
+        down_id: i32,
+    );
+    #[allow(clippy::too_many_arguments)]
+    pub fn lfm2_compiled_set_last_moe(
+        model: *mut std::ffi::c_void,
+        router_w: *mut mlx_array,
+        expert_bias: *mut mlx_array,
+        switch_gate_id: i32,
+        switch_up_id: i32,
+        switch_down_id: i32,
+        expert_group_size: i32,
+        expert_bits: i32,
+        num_experts: i32,
+        top_k: i32,
+        norm_topk_prob: bool,
+    );
+    pub fn lfm2_compiled_finalize(model: *mut std::ffi::c_void) -> i32;
+    pub fn lfm2_session_begin(
+        model: *mut std::ffi::c_void,
+        kv_caches: *mut *mut mlx_array,
+        n_kv: i32,
+        conv_states: *mut *mut mlx_array,
+        n_conv: i32,
+    ) -> i32;
+    pub fn lfm2_session_end(
+        model: *mut std::ffi::c_void,
+        out_kv: *mut *mut mlx_array,
+        n_kv: i32,
+        out_conv: *mut *mut mlx_array,
+        n_conv: i32,
+    ) -> i32;
+    pub fn lfm2_compiled_prefill_session(
+        model: *mut std::ffi::c_void,
+        token_ids: *mut mlx_array,
+        prompt_len: i32,
+        cache_pos: i32,
+        out_logits: *mut *mut mlx_array,
+    ) -> i32;
+    pub fn lfm2_compiled_step_session(
+        model: *mut std::ffi::c_void,
+        token_id: *mut mlx_array,
+        cache_pos: i32,
+        out_logits: *mut *mut mlx_array,
+    ) -> i32;
+    pub fn lfm2_compiled_step_session_paged(
+        model: *mut std::ffi::c_void,
+        token_id: *mut mlx_array,
+        cache_pos: i32,
+        k_full_per_layer: *mut *mut mlx_array,
+        v_full_per_layer: *mut *mut mlx_array,
+        n_layers: i32,
+        out_logits: *mut *mut mlx_array,
+    ) -> i32;
+
     pub fn mlx_eval(arrays: *mut *mut mlx_array, count: usize);
     pub fn mlx_async_eval(arrays: *mut *mut mlx_array, count: usize);
 
