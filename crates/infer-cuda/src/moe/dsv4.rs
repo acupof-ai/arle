@@ -264,10 +264,14 @@ pub(super) fn dsv4_route_device(
         .alloc_zeros::<f32>(total_routes)
         .map_err(|e| anyhow::anyhow!("DSv4 device route-weight alloc failed: {e}"))?;
     let token_ids = if matches!(layer.routing_kind, DeepSeekV4MoeRoutingKind::Hash) {
-        let token_ids = ctx
-            .stream
-            .clone_htod(tokens)
-            .map_err(|e| anyhow::anyhow!("DSv4 device route token-id H2D failed: {e}"))?;
+        let token_ids = if model.graph_mode() {
+            // Graph capture: the persistent pre-replay buffer, not a host-coupled memcpy node.
+            model.graph_token_ids_u32()?
+        } else {
+            ctx.stream
+                .clone_htod(tokens)
+                .map_err(|e| anyhow::anyhow!("DSv4 device route token-id H2D failed: {e}"))?
+        };
         keepalive.keep_u32(&token_ids);
         Some(token_ids)
     } else {

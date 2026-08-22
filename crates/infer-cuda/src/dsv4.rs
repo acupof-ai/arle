@@ -81,6 +81,7 @@ pub(crate) struct Dsv4Model {
     /// H2D copies and reuses persistent device buffers at fixed addresses.
     pub graph_mode: std::sync::atomic::AtomicBool,
     graph_token_ids: std::sync::Mutex<Option<CudaSlice<i32>>>,
+    graph_token_ids_u32: std::sync::Mutex<Option<CudaSlice<u32>>>,
     graph_bufs: std::sync::Mutex<Vec<Option<HiddenStates>>>,
 }
 
@@ -122,6 +123,22 @@ impl Dsv4Model {
                 .memcpy_htod(&host, buf.as_mut().unwrap())
                 .map_err(|e| anyhow!("DSv4 graph token_ids H2D failed: {e}"))?;
         }
+        let mut buf = self.graph_token_ids_u32.lock().unwrap();
+        match buf.as_mut() {
+            None => {
+                *buf = Some(
+                    self.ctx
+                        .stream
+                        .clone_htod(tokens)
+                        .map_err(|e| anyhow!("DSv4 graph token_ids(u32) H2D failed: {e}"))?,
+                )
+            }
+            Some(b) => self
+                .ctx
+                .stream
+                .memcpy_htod(tokens, b)
+                .map_err(|e| anyhow!("DSv4 graph token_ids(u32) H2D failed: {e}"))?,
+        }
         Ok(())
     }
 
@@ -143,6 +160,15 @@ impl Dsv4Model {
             hidden_dim: b.hidden_dim,
             seq_len: b.seq_len,
         })
+    }
+
+    /// Persistent u32 token ids for hash routing (same pre-replay upload).
+    pub(crate) fn graph_token_ids_u32(&self) -> Result<CudaSlice<u32>> {
+        self.graph_token_ids_u32
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| anyhow!("DSv4 graph token_ids not uploaded"))
     }
 
     /// Clone of the persistent stream output buffer (index 0).

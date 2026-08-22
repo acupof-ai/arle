@@ -526,6 +526,7 @@ impl Dsv4Model {
             deepep,
             graph_mode: std::sync::atomic::AtomicBool::new(false),
             graph_token_ids: std::sync::Mutex::new(None),
+            graph_token_ids_u32: std::sync::Mutex::new(None),
             graph_bufs: std::sync::Mutex::new(Vec::new()),
         })
     }
