@@ -1,7 +1,3 @@
-//! Unified logging configuration for ARLE.
-//!
-//! Consistent log initialization across server and tests.
-
 use colored::Color::{Green, Red, Yellow};
 use logforth::diagnostic::ThreadLocalDiagnostic;
 use logforth::layout::TextLayout;
@@ -12,13 +8,11 @@ static INIT: Once = Once::new();
 
 #[derive(Debug, Clone)]
 struct LoggingConfig {
-    /// Log level filter (e.g. `"info"`, `"info,infer=debug"`).
-    /// Falls back to `RUST_LOG` if set.
+    /// Log level filter; falls back to `RUST_LOG` if set.
     level: String,
-    /// Enable colored output (info=green, warn=yellow, error=red).
     colored: bool,
-    /// Fixed prefix prepended to every record (e.g. `"[rank0] "`), so
-    /// interleaved multi-process stderr stays attributable.
+    /// Fixed prefix prepended to every record, so interleaved multi-process
+    /// stderr stays attributable.
     prefix: Option<String>,
 }
 
@@ -32,7 +26,6 @@ impl Default for LoggingConfig {
     }
 }
 
-/// Prepends a fixed prefix to whatever the wrapped layout formats.
 #[derive(Debug)]
 struct PrefixedLayout {
     prefix: String,
@@ -51,7 +44,7 @@ impl logforth::Layout for PrefixedLayout {
     }
 }
 
-/// Default noisy modules to reduce log spam.
+/// Modules clamped to `warn` by default to reduce log spam.
 const DEFAULT_NOISY_MODULE_LEVELS: [(&str, &str); 5] = [
     ("h2", "warn"),
     ("hyper", "warn"),
@@ -75,7 +68,7 @@ fn build_file_append(prefix: &Option<String>) -> Option<Box<dyn logforth::Append
         None => "arle".to_string(),
     };
     // Plain text, never colored — ANSI escapes are noise in a file meant for
-    // `grep`/`tail`. Prefix still applies so multi-rank lines stay attributable.
+    // `grep`/`tail`.
     let layout: Box<dyn logforth::Layout> = match prefix {
         Some(p) => Box::new(PrefixedLayout {
             prefix: p.clone(),
@@ -113,7 +106,7 @@ fn apply_default_module_levels(mut filter: String) -> String {
     filter
 }
 
-/// Initialize logging. Idempotent — subsequent calls are no-ops.
+/// Idempotent — subsequent calls are no-ops.
 ///
 /// `RUST_LOG` takes precedence over `config.level`. When `RUST_LOG` is unset,
 /// noisy dependency modules default to `warn` to keep debug output focused on
@@ -174,7 +167,7 @@ fn init(config: LoggingConfig) {
     });
 }
 
-/// Initialize stderr logging without colors. For tests.
+/// For tests.
 pub fn init_stderr(level: &str) {
     init(LoggingConfig {
         level: level.to_string(),

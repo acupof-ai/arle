@@ -5,13 +5,6 @@
 //! 2. Otherwise treat it as a HF model ID (`org/repo` or `repo`), download
 //!    all relevant files to `~/.cache/huggingface/hub/` and return the cache dir.
 //!
-//! Relevant files downloaded:
-//! - `config.json` — model architecture / hyper-params
-//! - `tokenizer.json` + `tokenizer_config.json` + `special_tokens_map.json`
-//! - `*.safetensors` (preferred over pickle)
-//! - `model.safetensors.index.json` (sharded weight index, if present)
-//! - `generation_config.json` (optional)
-//!
 //! Authentication: reads `HF_TOKEN` env var, then `~/.cache/huggingface/token`.
 
 use std::path::{Path, PathBuf};
@@ -31,10 +24,6 @@ const DEFAULT_DISCOVERY_CANDIDATES: &[&str] = &[
     "Qwen/Qwen3.5-4B",
 ];
 
-/// Resolve a model source string to a local directory containing model files.
-///
-/// Returns the path to the directory that contains `config.json` and weight files.
-///
 /// If the input *looks like* a filesystem path (see [`looks_like_local_path`])
 /// but that path does not exist locally, the call fails immediately rather than
 /// falling through to a HuggingFace Hub download. Repo-id inputs (e.g.
@@ -80,7 +69,7 @@ pub fn resolve_local_weighted_model_path(model_id_or_path: &str) -> Option<PathB
         .find(|candidate| is_weighted_model_dir(candidate))
 }
 
-/// Discover the best local model from a curated candidate list, in priority
+/// Discover the best local model from the curated candidate list, in priority
 /// order. Returns the matched candidate label and its local path.
 pub fn discover_local_model() -> Option<(String, PathBuf)> {
     discover_local_model_from(DEFAULT_DISCOVERY_CANDIDATES)
@@ -103,7 +92,6 @@ pub fn resolve_model_source(explicit_model_path: Option<&str>) -> Result<String>
         return Ok(model_path.to_string());
     }
 
-    // ARLE_MODEL is primary; AGENT_INFER_MODEL is legacy fallback.
     let env_model = std::env::var("ARLE_MODEL")
         .or_else(|_| std::env::var("AGENT_INFER_MODEL"))
         .ok()
@@ -153,7 +141,6 @@ fn download_repo_assets_from_hub(model_id: &str, include_weights: bool) -> Resul
         filenames.len()
     );
 
-    // ── mandatory files ────────────────────────────────────────────────────
     let mandatory = ["config.json", "tokenizer.json", "tokenizer_config.json"];
     for name in &mandatory {
         if filenames.iter().any(|f| f == name) {
@@ -163,7 +150,6 @@ fn download_repo_assets_from_hub(model_id: &str, include_weights: bool) -> Resul
         }
     }
 
-    // ── optional config files ─────────────────────────────────────────────
     let optional = [
         "special_tokens_map.json",
         "generation_config.json",
@@ -177,7 +163,6 @@ fn download_repo_assets_from_hub(model_id: &str, include_weights: bool) -> Resul
         }
     }
 
-    // ── weight shards (safetensors preferred, no pickle) ──────────────────
     if include_weights {
         let weight_files: Vec<&str> = filenames
             .iter()
@@ -365,8 +350,6 @@ fn fetch_file(repo: &ApiRepo, filename: &str, model_id: &str) -> Result<PathBuf>
         .with_context(|| format!("failed to download '{filename}' from '{model_id}'"))
 }
 
-/// Returns true when a `.safetensors` counterpart exists for a `.bin` file,
-/// e.g. `model.bin` → looks for `model.safetensors`.
 fn has_safetensors_twin(all: &[String], bin_file: &str) -> bool {
     let stem = bin_file.strip_suffix(".bin").unwrap_or(bin_file);
     let twin = format!("{stem}.safetensors");
