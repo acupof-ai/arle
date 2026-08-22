@@ -1,13 +1,13 @@
 //! Resident DSv4-Flash A/B harness.
 //!
 //! Loads the TP=8/EP=8 DSv4 executor once, then runs multiple decode variants in
-//! the same process. This removes the 149GB model reload from every scalar vs
-//! FlashMLA comparison and makes kernel A/B loops seconds-scale after load.
+//! the same process. This removes the 149GB model reload from every fused-WQKV
+//! on/off comparison and makes kernel A/B loops seconds-scale after load.
 //!
 //! Env:
 //!   * `INFER_DSV4_MODEL_PATH`       required DSv4 FP8 safetensors dir.
 //!   * `INFER_DSV4_PROMPT_IDS`       comma-separated DeepSeek ids.
-//!   * `INFER_DSV4_AB_VARIANTS`      `scalar,flashmla` by default.
+//!   * `INFER_DSV4_AB_VARIANTS`      `baseline,fused_wqkv` by default.
 //!   * `INFER_DSV4_AB_MAX_NEW`       generated-token count, default 128.
 //!   * `INFER_DSV4_AB_WARMUP_NEW`    decode steps excluded from steady timing,
 //!     default 16.
@@ -39,8 +39,8 @@ mod real {
     use anyhow::{Context, Result, bail};
     use infer_cuda::{
         CudaExecutor, CudaKvPool, print_dsv4_linear_profile, print_dsv4_stage_profile,
-        reset_dsv4_linear_profile, reset_dsv4_stage_profile, set_dsv4_flashmla_decode_override,
-        set_dsv4_fused_wqkv_decode_override, set_dsv4_stage_profile_active,
+        reset_dsv4_linear_profile, reset_dsv4_stage_profile, set_dsv4_fused_wqkv_decode_override,
+        set_dsv4_stage_profile_active,
     };
     use infer_plan::{ForwardMode, ForwardPlan, PrefillRow, SamplingParams};
     use infer_seam::{BackendExecutor, KvAllocator, KvPool, KvQuery, PollResult};
@@ -64,14 +64,12 @@ mod real {
     #[derive(Clone, Copy, Debug)]
     struct Variant {
         name: &'static str,
-        flashmla: bool,
         fused_wqkv: bool,
     }
 
     #[derive(Debug)]
     struct VariantResult {
         name: &'static str,
-        flashmla: bool,
         fused_wqkv: bool,
         tokens: Vec<u32>,
         prefill_ms: f64,
@@ -165,7 +163,7 @@ mod real {
         anyhow::ensure!(repeat >= 1, "INFER_DSV4_AB_REPEAT must be >= 1");
         let variants = parse_variants(
             &std::env::var("INFER_DSV4_AB_VARIANTS")
-                .unwrap_or_else(|_| "scalar,flashmla".to_string()),
+                .unwrap_or_else(|_| "baseline,fused_wqkv".to_string()),
         )?;
         let rank = parse_usize_env("INFER_TP_RANK", 0)?;
         let profile_variant = std::env::var("INFER_DSV4_AB_PROFILE_VARIANT").ok();
@@ -225,7 +223,6 @@ mod real {
                 }
             }
         }
-        set_dsv4_flashmla_decode_override(None);
         set_dsv4_fused_wqkv_decode_override(None);
         Ok(())
     }
@@ -238,7 +235,6 @@ mod real {
         warmup_new: usize,
         profile_variant: Option<&str>,
     ) -> Result<VariantResult> {
-        set_dsv4_flashmla_decode_override(Some(variant.flashmla));
         set_dsv4_fused_wqkv_decode_override(Some(variant.fused_wqkv));
         set_env_var("INFER_DSV4_AB_CURRENT_VARIANT", variant.name);
         reset_dsv4_linear_profile();
@@ -326,7 +322,6 @@ mod real {
 
         Ok(VariantResult {
             name: variant.name,
-            flashmla: variant.flashmla,
             fused_wqkv: variant.fused_wqkv,
             tokens,
             prefill_ms,
@@ -361,13 +356,12 @@ mod real {
             Some(idx) => format!("FAIL@{idx}"),
         };
         println!(
-            "ab_variant={} rep={} flashmla={} fused_wqkv={}  tokens={:?} oracle16={} scalar_ref={} \
+            "ab_variant={} rep={} fused_wqkv={}  tokens={:?} oracle16={} scalar_ref={} \
              load_ms={:.3} prefill_ms={:.3} decode_steps={} decode_ms={:.3} \
              decode_tok_s={:.3} warmup_decode_steps={} timed_decode_steps={} \
              timed_decode_ms={:.3} steady_tok_s={:.3}",
             result.name,
             rep,
-            u8::from(result.flashmla),
             u8::from(result.fused_wqkv),
             result.tokens,
             oracle16_text,
@@ -556,31 +550,21 @@ mod real {
         let mut variants = Vec::new();
         for item in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
             match item {
-                "scalar" | "bf16" | "baseline" => variants.push(Variant {
-                    name: "scalar",
-                    flashmla: false,
+                "baseline" | "scalar" | "bf16" | "flashmla" | "flash" => variants.push(Variant {
+                    name: "baseline",
                     fused_wqkv: false,
                 }),
-                "flashmla" | "flash" => variants.push(Variant {
-                    name: "flashmla",
-                    flashmla: true,
-                    fused_wqkv: false,
-                }),
-                "fused_wqkv" | "fused_linear" | "flashmla_fused" | "flashmla_fused_wqkv" => {
-                    variants.push(Variant {
-                        name: "flashmla_fused_wqkv",
-                        flashmla: true,
-                        fused_wqkv: true,
-                    })
-                }
-                "scalar_fused_wqkv" => variants.push(Variant {
-                    name: "scalar_fused_wqkv",
-                    flashmla: false,
+                "fused_wqkv"
+                | "fused_linear"
+                | "flashmla_fused"
+                | "flashmla_fused_wqkv"
+                | "scalar_fused_wqkv" => variants.push(Variant {
+                    name: "fused_wqkv",
                     fused_wqkv: true,
                 }),
                 other => bail!(
                     "unsupported INFER_DSV4_AB_VARIANTS item `{other}` \
-                     (expected scalar, flashmla, flashmla_fused_wqkv, scalar_fused_wqkv)"
+                     (expected baseline, fused_wqkv)"
                 ),
             }
         }

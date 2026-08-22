@@ -25,9 +25,6 @@ fn d_deepgemm_min_routes() -> usize {
 fn d_dsa_indexer_sms() -> usize {
     78
 }
-fn d_mtp_min_accept() -> f32 {
-    0.55
-}
 fn d_spec_max_batch() -> usize {
     // Qwen3.5 DSpark's measured envelope; every unbatched scheme clamps to 1
     // at its own call site.
@@ -62,26 +59,13 @@ pub struct CudaRuntimeFlags {
     pub numa_pin: bool,
     #[serde(default)]
     pub comm_backend: CommBackend,
-    /// DSv4 FlashMLA sparse decode: None = default (on when compiled in).
-    #[serde(default)]
-    pub dsv4_flashmla_decode: Option<bool>,
     #[serde(default = "d_dsa_indexer_sms")]
     pub dsv4_dsa_indexer_sms: usize,
-    /// Adaptive MTP gate at B=1 (skip speculation below the accept break-even).
-    #[serde(default)]
-    pub mtp_adaptive: bool,
-    #[serde(default = "d_mtp_min_accept")]
-    pub mtp_min_accept: f32,
     /// Speculate (MTP/DSpark) only when the decode batch is ≤ this. Above it,
     /// spec is a compute-bound loss, so route decode to the plain batched path.
     /// Default 1: only true c=1 speculates.
     #[serde(default = "d_spec_max_batch")]
     pub spec_max_batch: usize,
-    /// DSpark confidence-head early stop. `None` = unset, keep the goodput
-    /// budget; `<= 0` proposes the whole block (how DeepSpec's `eval.py`
-    /// measures a drafter apart from its head); `> 0` floors the admission cut.
-    #[serde(default)]
-    pub dspark_confidence_threshold: Option<f32>,
     /// DeepEP intranode SM budget (positive, even).
     #[serde(default = "d_deepep_num_sms")]
     pub deepep_num_sms: u32,
@@ -104,12 +88,8 @@ impl Default for CudaRuntimeFlags {
             shard_cache_bytes: None,
             numa_pin: d_true(),
             comm_backend: CommBackend::default(),
-            dsv4_flashmla_decode: None,
             dsv4_dsa_indexer_sms: d_dsa_indexer_sms(),
-            mtp_adaptive: false,
-            mtp_min_accept: d_mtp_min_accept(),
             spec_max_batch: d_spec_max_batch(),
-            dspark_confidence_threshold: None,
             deepep_num_sms: d_deepep_num_sms(),
             deepep_max_dispatch_tokens_per_rank: None,
             dsv4_moe_transport: None,

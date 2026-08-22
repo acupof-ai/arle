@@ -35,10 +35,6 @@ pub(crate) struct Dsv4CudaExecutor {
     pub(crate) mtp_rejects: usize,
     /// Verified MTP draft chains (one per spec row that reached verify).
     pub(crate) mtp_chains: usize,
-    /// EMA of per-step accepted/depth; init 1.0 so MTP runs until the running
-    /// acceptance proves it loses to no-spec. See `mtp_should_speculate`.
-    pub(crate) mtp_accept_ema: f32,
-    pub(crate) mtp_skip_streak: usize,
     /// Content-keyed cross-request prefix-state pool: one host-resident entry
     /// per completed host page, written from the post-forward choke point.
     pub(super) prefix_state: crate::attention::Dsv4PrefixStatePool,
@@ -393,22 +389,6 @@ impl Dsv4CudaExecutor {
             )?;
             return Ok(vec![token]);
         }
-        // When the acceptance EMA predicts MTP would lose to no-spec, run a warm
-        // no-spec step instead — it keeps the draft head staged so MTP resumes
-        // the moment acceptance recovers. The EMA + skip_streak are
-        // executor-global; make them per-slot before defaulting the gate on.
-        if self.mtp_adaptive_skip() {
-            self.mtp_skip_streak += 1;
-            let token = self.forward_mtp_warm_step(
-                slot_idx,
-                &[last_token],
-                start_pos,
-                params,
-                position,
-                penalty,
-            )?;
-            return Ok(vec![token]);
-        }
         self.spec_step(slot_idx, start_pos, position)
     }
 
@@ -438,13 +418,6 @@ impl Dsv4CudaExecutor {
         let out = self.forward_decode_batch_inner(rows, kv_batch)?;
         // Per-tick D2H capture is graph-incompatible, so finish write-through
         // captures the whole generated region once at finish instead.
-        if !crate::runtime_flags::dsv4_decode_reuse_enabled() {
-            for (row, kv_row) in rows.iter().zip(&kv_batch.rows) {
-                let slot_pages = &kv_batch.flat_slot_page_ids[kv_row.slot_page_range.clone()];
-                let end_pos = self.slots[row.slot].seq_len();
-                self.publish_completed_prefix_pages(row.slot, slot_pages, row.kv_seq_len, end_pos);
-            }
-        }
         Ok(out)
     }
 

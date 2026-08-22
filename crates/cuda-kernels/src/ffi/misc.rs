@@ -574,8 +574,7 @@ unsafe extern "C" {
     // **ARLE's current decode KV pool is bf16, not FP8 — this FFI will
     // return `cudaErrorInvalidValue` until a separate FP8-packing kernel
     // converts the bf16 sliding-window + compressed buffers into the
-    // expected layout. Tracked under `--dsv4-flashmla-decode` (default
-    // OFF).**
+    // expected layout. Dormant until that packing lands.**
     pub fn arle_flashmla_sm90_sparse_decode_fwd(
         q: *const super::Half,
         kv: *const super::Half,

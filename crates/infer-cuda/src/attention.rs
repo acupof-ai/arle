@@ -81,17 +81,7 @@ const DSV4_FLASHMLA_OVERRIDE_ENV: i8 = -1;
 const DSV4_FLASHMLA_OVERRIDE_OFF: i8 = 0;
 const DSV4_FLASHMLA_OVERRIDE_ON: i8 = 1;
 
-static DSV4_FLASHMLA_DECODE_OVERRIDE: AtomicI8 = AtomicI8::new(DSV4_FLASHMLA_OVERRIDE_ENV);
 static DSV4_FUSED_WQKV_DECODE_OVERRIDE: AtomicI8 = AtomicI8::new(DSV4_FLASHMLA_OVERRIDE_ENV);
-
-pub(crate) fn set_dsv4_flashmla_decode_override(enabled: Option<bool>) {
-    let value = match enabled {
-        Some(true) => DSV4_FLASHMLA_OVERRIDE_ON,
-        Some(false) => DSV4_FLASHMLA_OVERRIDE_OFF,
-        None => DSV4_FLASHMLA_OVERRIDE_ENV,
-    };
-    DSV4_FLASHMLA_DECODE_OVERRIDE.store(value, Ordering::Relaxed);
-}
 
 pub(crate) fn set_dsv4_fused_wqkv_decode_override(enabled: Option<bool>) {
     let value = match enabled {
@@ -829,12 +819,6 @@ pub(crate) fn dsv4_linear(
 }
 
 pub(crate) fn dsv4_flashmla_decode_enabled() -> Result<bool> {
-    match DSV4_FLASHMLA_DECODE_OVERRIDE.load(Ordering::Relaxed) {
-        DSV4_FLASHMLA_OVERRIDE_OFF => return Ok(false),
-        DSV4_FLASHMLA_OVERRIDE_ON => return Ok(true),
-        _ => {}
-    }
-    // `--dsv4-flashmla-decode` forces the FlashMLA decode path off/on; default ON.
     // Compile-gated via `cuda_kernels::HAS_FLASHMLA` - a build without FlashMLA
     // reports false and decode is unavailable.
     Ok(cuda_kernels::HAS_FLASHMLA)

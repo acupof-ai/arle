@@ -1261,17 +1261,12 @@ impl DsparkConfig {
 
 /// Draft-keep policy for [`dspark_verify_lens`]: the additive verify-step cost
 /// model `step_ms = bias + row · verify_rows` (the same shape sglang profiles
-/// for its DSpark planner) plus the confidence gate. Cost defaults are H20
+/// for its DSpark planner). Cost defaults are H20
 /// ThinkingCap-27B c=16 measurements (trunk 116 + draft 95 fixed, 0.53/row).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DsparkSps {
     pub bias_ms: f32,
     pub row_ms: f32,
-    /// `--dspark-confidence-threshold`. `None` = unset, keep the goodput budget.
-    /// `<= 0` turns the gate off and proposes the whole block, which is how
-    /// DeepSpec's `eval.py` measures every published accept_len; `> 0` floors
-    /// the budget's admission cut at that survival.
-    pub confidence_threshold: Option<f32>,
 }
 
 impl Default for DsparkSps {
@@ -1279,7 +1274,6 @@ impl Default for DsparkSps {
         Self {
             bias_ms: 211.0,
             row_ms: 0.53,
-            confidence_threshold: None,
         }
     }
 }
@@ -1291,15 +1285,8 @@ impl Default for DsparkSps {
 /// (cumprod of per-position confidence, monotone decreasing). B=0 is an arm,
 /// so the result never predicts worse than not speculating. Survival is
 /// monotone per request, so the global admission cut yields prefix lengths.
-/// A threshold of 0 short-circuits the whole budget (DeepSpec
-/// `_confident_prefix_length`), which is the only way to measure the drafter
-/// separately from its confidence head.
 pub fn dspark_verify_lens(survivals: &[&[f32]], sps: DsparkSps) -> Vec<usize> {
     const EPS: f32 = 1e-6;
-    if sps.confidence_threshold.is_some_and(|t| t <= 0.0) {
-        return survivals.iter().map(|s| s.len()).collect();
-    }
-    let floor = sps.confidence_threshold.unwrap_or(0.0).max(EPS);
     let r = survivals.len() as f32;
     let mut all: Vec<f32> = survivals
         .iter()
@@ -1319,7 +1306,7 @@ pub fn dspark_verify_lens(survivals: &[&[f32]], sps: DsparkSps) -> Vec<usize> {
     }
     survivals
         .iter()
-        .map(|s| s.iter().take_while(|p| **p >= cut.max(floor)).count())
+        .map(|s| s.iter().take_while(|p| **p >= cut).count())
         .collect()
 }
 

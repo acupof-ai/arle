@@ -110,14 +110,6 @@ pub use loader::mint_nccl_unique_id_hex;
 #[cfg(feature = "nccl")]
 pub use loader::nccl_unique_id_from_env;
 
-/// Process-local override for DSv4 FlashMLA decode dispatch. `None` restores
-/// the `--dsv4-flashmla-decode` flag default. Intended for resident A/B
-/// harnesses that need to compare scalar vs FlashMLA after one model load.
-#[cfg(feature = "cuda")]
-pub fn set_dsv4_flashmla_decode_override(enabled: Option<bool>) {
-    attention::set_dsv4_flashmla_decode_override(enabled);
-}
-
 #[cfg(feature = "cuda")]
 pub fn set_dsv4_fused_wqkv_decode_override(enabled: Option<bool>) {
     attention::set_dsv4_fused_wqkv_decode_override(enabled);
