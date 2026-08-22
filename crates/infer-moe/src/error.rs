@@ -4,7 +4,6 @@ use std::fmt;
 
 pub type Result<T> = std::result::Result<T, MoeError>;
 
-/// MoE config / routing-input validation error.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MoeError(pub(crate) String);
 

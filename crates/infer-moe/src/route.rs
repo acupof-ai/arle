@@ -1,13 +1,5 @@
-//! CPU reference MoE routing — the device-independent ground truth, unified in
-//! [`route`] driven by [`MoeConfig`]. Faithful port of two legacy routers
-//! (source line refs inline); they share a selection-then-weight skeleton and
-//! differ only in scoring func, selection key (bias vs none), and renorm timing.
-//!
-//! - **DSv4** (`v4.rs` + `dsv4_route.cu`): scores via softmax/sigmoid/
-//!   sqrt(softplus); top-k by bias-corrected key; `denom = 1.0` (softmax) else
-//!   `selected_sum + 1e-9`; `× routed_scaling_factor`. No softmax renorm.
-//! - **Qwen3.6** (`qwen35/moe.rs` + `qwen36_route.cu`): softmax scores; greedy
-//!   top-k (zero bias); raw probs, then a separate `norm_topk_prob` renorm.
+//! CPU reference MoE routing — device-independent ground truth, driven by
+//! [`MoeConfig`].
 
 use crate::config::{MoeConfig, ScoringFunc, TopkMethod};
 use crate::error::{Result, bail};
@@ -26,9 +18,6 @@ pub struct RoutingDecision {
     pub experts: Vec<ExpertWeight>,
 }
 
-// Scoring primitives — ported from `v4.rs:511-543`.
-
-/// Stable softmax: subtract the max before `exp` (numerical stability).
 /// Port of `stable_softmax` (`v4.rs:511`).
 #[must_use]
 pub fn stable_softmax(logits: &[f32]) -> Vec<f32> {
@@ -45,7 +34,7 @@ pub fn stable_softmax(logits: &[f32]) -> Vec<f32> {
     exp.into_iter().map(|value| value / denom).collect()
 }
 
-/// Numerically-stable sigmoid. Port of `sigmoid` (`v4.rs:528`).
+/// Port of `sigmoid` (`v4.rs:528`).
 #[must_use]
 pub fn sigmoid(value: f32) -> f32 {
     if value >= 0.0 {
@@ -56,7 +45,6 @@ pub fn sigmoid(value: f32) -> f32 {
     }
 }
 
-/// Numerically-stable softplus with the `> 20 → identity` cutoff.
 /// Port of `stable_softplus` (`v4.rs:537`).
 #[must_use]
 pub fn stable_softplus(value: f32) -> f32 {
@@ -79,11 +67,10 @@ pub fn scores_from_logits(logits: &[f32], scoring_func: ScoringFunc) -> Result<V
     })
 }
 
-// Selection — ported from `topk_indices_by_score` (`v4.rs:556`).
-
 /// Top-`k` experts by descending `scores[e] + bias[e]`, tie-broken by lower
 /// index. `bias` is empty (identity) or `scores.len()` long; `mask` (if
 /// present) marks ineligible experts `false` (group-limited routing).
+/// Port of `topk_indices_by_score` (`v4.rs:556`).
 fn topk_indices_by_score(
     scores: &[f32],
     bias: &[f32],
@@ -104,13 +91,10 @@ fn topk_indices_by_score(
     indices
 }
 
-// Group-limited routing — DeepSeek-V2/V3 `n_group`/`topk_group`.
-// Not exercised by either ARLE router; here so this reference can verify a
-// grouped kernel. Group score = top-2 expert scores summed (DeepSeek-V3 rule);
-// the `topk_group` highest groups stay eligible.
+// Group-limited routing — DeepSeek-V2/V3 `n_group`/`topk_group`. Not exercised
+// by either ARLE router; here so this reference can verify a grouped kernel.
+// Group score = top-2 expert scores summed (DeepSeek-V3 rule).
 
-/// Per-group selection score: sum of the top-2 corrected scores in each
-/// contiguous equal-size group.
 fn group_scores(corrected: &[f32], n_group: usize) -> Vec<f32> {
     let experts_per_group = corrected.len() / n_group;
     (0..n_group)
@@ -133,12 +117,8 @@ fn group_scores(corrected: &[f32], n_group: usize) -> Vec<f32> {
         .collect()
 }
 
-/// Eligibility mask for group-limited routing: `true` for experts in one of the
-/// `topk_group` highest-scoring groups, `false` otherwise.
-///
-/// `corrected[e] = scores[e] + bias[e]` (the selection key). Groups are scored
-/// by their top-2 corrected-score sum; the `topk_group` highest groups (ties →
-/// lower group index) keep all their experts eligible.
+/// Eligibility mask for group-limited routing. `corrected[e] = scores[e] + bias[e]`
+/// (the selection key); ties → lower group index.
 pub fn group_limited_mask(corrected: &[f32], n_group: usize, topk_group: usize) -> Vec<bool> {
     let experts_per_group = corrected.len() / n_group;
     let gscores = group_scores(corrected, n_group);
@@ -156,7 +136,7 @@ pub fn group_limited_mask(corrected: &[f32], n_group: usize, topk_group: usize) 
     mask
 }
 
-/// Route one token. `gate_logits` is `[num_experts]`; `bias` is the optional DSv4
+/// `gate_logits` is `[num_experts]`; `bias` is the optional DSv4
 /// `e_score_correction_bias` (or empty).
 pub fn route_token(gate_logits: &[f32], bias: &[f32], cfg: &MoeConfig) -> Result<RoutingDecision> {
     cfg.validate()?;
@@ -223,8 +203,8 @@ pub fn route_token(gate_logits: &[f32], bias: &[f32], cfg: &MoeConfig) -> Result
         })
         .collect();
 
-    // Qwen3.6 `norm_topk_prob` renorm (`qwen36_route.cu:23`). Greedy path only:
-    // renorm the selected weights to sum 1. DSv4 (`NoAuxTc`) never runs it.
+    // Qwen3.6 `norm_topk_prob` renorm (`qwen36_route.cu:23`); DSv4 (`NoAuxTc`)
+    // never runs it.
     if cfg.norm_topk_prob && cfg.topk_method == TopkMethod::Greedy && !normalize {
         let sum: f32 = experts.iter().map(|ew| ew.weight).sum();
         let inv = if sum > 1.0e-20 { 1.0 / sum } else { 0.0 };
@@ -236,8 +216,8 @@ pub fn route_token(gate_logits: &[f32], bias: &[f32], cfg: &MoeConfig) -> Result
     Ok(RoutingDecision { experts })
 }
 
-/// Route a flat batch. `gate_logits` is `[num_tokens * num_experts]` token-major;
-/// `bias` is the shared `[num_experts]` correction (or empty).
+/// `gate_logits` is `[num_tokens * num_experts]` token-major; `bias` is the
+/// shared `[num_experts]` correction (or empty).
 pub fn route(gate_logits: &[f32], bias: &[f32], cfg: &MoeConfig) -> Result<Vec<RoutingDecision>> {
     cfg.validate()?;
     if cfg.num_experts == 0 || !gate_logits.len().is_multiple_of(cfg.num_experts) {

@@ -1,9 +1,3 @@
-//! MoE routing / gating configuration — the device-independent description of
-//! one MoE block's router, covering the knobs both legacy routers read (DSv4:
-//! `noaux_tc` bias selection, no grouping; Qwen3.6: softmax + greedy top-k, one
-//! shared expert). Group-limited routing fields exist for a future grouped
-//! kernel but are wired by neither ARLE router.
-
 use crate::error::{Result, bail};
 
 /// [`Self::scoring_kind`] matches the CUDA `dsv4_route` `scoring_kind` arg (0/1/2).
@@ -16,7 +10,6 @@ pub enum ScoringFunc {
 }
 
 impl ScoringFunc {
-    /// The CUDA `dsv4_route` `scoring_kind` integer for this scoring func.
     #[must_use]
     pub fn scoring_kind(self) -> i32 {
         match self {
@@ -27,10 +20,9 @@ impl ScoringFunc {
     }
 }
 
-/// - [`TopkMethod::Greedy`]: plain top-k over the scores (Qwen3.6).
-/// - [`TopkMethod::NoAuxTc`]: DSv4 no-aux-loss top-k — selection uses the
-///   bias-corrected key `scores[e] + bias[e]`, the weight reads un-biased
-///   `scores[e]`.
+/// [`TopkMethod::NoAuxTc`]: DSv4 no-aux-loss top-k — selection uses the
+/// bias-corrected key `scores[e] + bias[e]`, the weight reads un-biased
+/// `scores[e]`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum TopkMethod {
     Greedy,
@@ -53,7 +45,6 @@ pub struct MoeConfig {
     /// - **sigmoid / sqrtsoftplus**: DSv4 always normalizes regardless of this
     ///   flag (`denom = selected_sum + 1e-9`); the flag only documents intent.
     pub norm_topk_prob: bool,
-    /// Final multiplicative scaling on every routed weight (Qwen3.6 = 1.0).
     pub routed_scaling_factor: f32,
     /// Group-limited routing: expert-group count (DeepSeek-V2/V3 `n_group`).
     /// `None` ⇒ no grouping. See [`crate::route::group_limited_mask`].
@@ -66,8 +57,6 @@ pub struct MoeConfig {
 }
 
 impl MoeConfig {
-    /// Qwen3.6 router: softmax, greedy top-k, no bias, scaling 1.0, one
-    /// sigmoid-gated shared expert.
     #[must_use]
     pub fn qwen36(
         num_experts: usize,
@@ -88,10 +77,7 @@ impl MoeConfig {
         }
     }
 
-    /// DSv4 router: `sqrtsoftplus` scoring, `noaux_tc` top-k (selection bias is
-    /// a runtime gate tensor, not a config field), config `routed_scaling_factor`,
-    /// DSv4 router: `sqrtsoftplus` scoring, `noaux_tc` top-k (selection bias is
-    /// a runtime gate tensor, not a config field), config `routed_scaling_factor`.
+    /// DSv4 router: selection bias is a runtime gate tensor, not a config field.
     /// DSv4-Flash ships no group-limited routing.
     #[must_use]
     pub fn dsv4(
@@ -144,7 +130,6 @@ impl MoeConfig {
                 if topk_group == 0 || topk_group > n_group {
                     bail!("topk_group ({topk_group}) must be in 1..=n_group ({n_group})");
                 }
-                // top_k must be reachable from the kept groups.
                 let experts_per_group = self.num_experts / n_group;
                 if self.top_k > topk_group * experts_per_group {
                     bail!(
