@@ -8,10 +8,7 @@ use half::bf16;
 use crate::ffi::{self, Half};
 use crate::tensor::{DeviceContext, DeviceMatrix, RawDevicePtr};
 
-// Safe wrappers over the grouped-GEMM + DSv4/Qwen3.6 expert-dispatch FFI: they
-// centralize device-pointer extraction + the i32-ABI casts. `RawDevicePtr<T>`
-// (from `cache_ptr`) carries buffers; bf16 (Rust) and Half (u16, kernel ABI)
-// share a 16-bit layout, so pointers cast directly.
+// bf16 (Rust) and Half (u16, kernel ABI) share a 16-bit layout, so pointers cast directly.
 
 #[derive(Clone, Copy, Debug)]
 pub struct Sm90MegaMoeShape {
@@ -274,9 +271,6 @@ pub unsafe fn sm90_mega_moe_launch(args: &Sm90MegaMoeLaunch<'_>) -> Result<()> {
 
 /// Build the device-resident per-expert weight-pointer table the grouped-GEMM
 /// kernels consume (`*const u64`, one dense `data` pointer per expert).
-///
-/// # Errors
-/// Errors if the host→device upload fails.
 pub fn build_expert_weight_ptr_table(
     ctx: &DeviceContext,
     experts: &[&DeviceMatrix],
@@ -312,7 +306,6 @@ fn build_optional_ptr_table<T>(
         .map_err(|e| anyhow::anyhow!("expert {label} ptr table H2D failed: {e}"))
 }
 
-/// Build a per-expert pointer table for ABI-generic uint8 quantized weights.
 pub fn build_expert_qweight_u8_ptr_table(
     ctx: &DeviceContext,
     experts: &[&DeviceMatrix],
@@ -320,7 +313,6 @@ pub fn build_expert_qweight_u8_ptr_table(
     build_optional_ptr_table(ctx, experts, "qweight_u8", |m| m.qweight_u8.as_ref())
 }
 
-/// Build a per-expert pointer table for ABI-generic f32 scales.
 pub fn build_expert_scale_f32_ptr_table(
     ctx: &DeviceContext,
     experts: &[&DeviceMatrix],
@@ -328,7 +320,6 @@ pub fn build_expert_scale_f32_ptr_table(
     build_optional_ptr_table(ctx, experts, "scale_f32", |m| m.scale_f32.as_ref())
 }
 
-/// Build a per-expert pointer table for ABI-generic FP8 scale bytes.
 pub fn build_expert_qscale_fp8_ptr_table(
     ctx: &DeviceContext,
     experts: &[&DeviceMatrix],
@@ -336,7 +327,6 @@ pub fn build_expert_qscale_fp8_ptr_table(
     build_optional_ptr_table(ctx, experts, "qscale_fp8", |m| m.qscale_fp8.as_ref())
 }
 
-/// Build a per-expert pointer table for W4A16 INT4 packed weights (`i8`).
 pub fn build_expert_qweight_i8_ptr_table(
     ctx: &DeviceContext,
     experts: &[&DeviceMatrix],
@@ -344,7 +334,6 @@ pub fn build_expert_qweight_i8_ptr_table(
     build_optional_ptr_table(ctx, experts, "qweight_i8", |m| m.qweight.as_ref())
 }
 
-/// Build a per-expert pointer table for W4A16 BF16 per-group scales.
 pub fn build_expert_qscale_bf16_ptr_table(
     ctx: &DeviceContext,
     experts: &[&DeviceMatrix],
@@ -911,8 +900,6 @@ pub unsafe fn moe_w4a16_grouped_gemv_pair_batch(
     Ok(())
 }
 
-/// Count how many routed tokens fall on each local expert.
-/// Wraps [`ffi::dsv4_count_local_experts_cuda`].
 ///
 /// # Safety
 /// `indices` / `counts` must be valid on `stream` for the given shape.
@@ -1016,8 +1003,6 @@ pub unsafe fn dsv4_route(
     Ok(())
 }
 
-/// Cast a flat `i32` device buffer to `i64` on-device.
-///
 /// # Safety
 /// `src` / `dst` must be valid on `stream` for `n` elements.
 pub unsafe fn dsv4_cast_i32_to_i64(
@@ -1035,8 +1020,6 @@ pub unsafe fn dsv4_cast_i32_to_i64(
     Ok(())
 }
 
-/// Cast a flat `i64` device buffer to `i32` on-device.
-///
 /// # Safety
 /// `src` / `dst` must be valid on `stream` for `n` elements. Values must fit
 /// in `i32` (expert ids always do).
@@ -1087,8 +1070,6 @@ pub unsafe fn moe_exclusive_scan_aligned_i32(
     Ok(())
 }
 
-/// Exclusive prefix-sum over per-expert counts → offsets (+ total).
-/// Wraps [`ffi::dsv4_exclusive_scan_i32_cuda`].
 ///
 /// # Safety
 /// `counts` / `offsets` / `total` must be valid on `stream`; `offsets` holds
@@ -1115,8 +1096,6 @@ pub unsafe fn dsv4_exclusive_scan_i32(
     Ok(())
 }
 
-/// Pack routed tokens into per-local-expert contiguous slots (with route slots).
-/// Wraps [`ffi::dsv4_pack_local_experts_with_slots_cuda`].
 ///
 /// # Safety
 /// All pointers must be valid on `stream` for the given shape; `cursors` is the
@@ -1162,7 +1141,6 @@ pub unsafe fn dsv4_pack_local_experts_with_slots(
     Ok(())
 }
 
-/// Fill DeepGEMM contiguous `m_indices` from compact per-local-expert counts.
 ///
 /// # Safety
 /// `counts`, `offsets`, and `m_indices` must be valid on `stream`;
@@ -1191,8 +1169,6 @@ pub unsafe fn dsv4_fill_m_indices_from_counts(
     Ok(())
 }
 
-/// Pack routed tokens and emit the contiguous DeepGEMM `m_indices` row→local
-/// expert map alongside the compact route-slot metadata.
 ///
 /// # Safety
 /// All pointers must be valid on `stream`; `packed_m_indices` has the same row
@@ -1240,8 +1216,6 @@ pub unsafe fn dsv4_pack_local_experts_with_slots_and_indices(
     Ok(())
 }
 
-/// SwiGLU with the DSv4 route-clamp over packed per-expert rows.
-/// Wraps [`ffi::dsv4_swiglu_clamped_routes_cuda`].
 ///
 /// # Safety
 /// `gate` / `up` / `out` / `route_meta` must be valid on `stream` for the shape.
@@ -1278,8 +1252,6 @@ pub unsafe fn dsv4_swiglu_clamped_routes(
     Ok(())
 }
 
-/// Scatter every packed expert output back to its route slot (weighted).
-/// Wraps [`ffi::dsv4_scatter_all_route_slots_cuda`].
 ///
 /// # Safety
 /// `expert_out` / `route_out` / `expert_route_slot` / `expert_weight` must be
@@ -1311,8 +1283,6 @@ pub unsafe fn dsv4_scatter_all_route_slots(
     Ok(())
 }
 
-/// Combine per-route-slot outputs into per-token routed output (sum over topk).
-/// Wraps [`ffi::dsv4_combine_route_slot_outputs_cuda`].
 ///
 /// # Safety
 /// `route_slot_out` / `routed_out` must be valid on `stream` for the shape.
@@ -1342,7 +1312,6 @@ pub unsafe fn dsv4_combine_route_slot_outputs(
 
 /// Qwen3.6 shared-expert sigmoid-gated accumulate:
 /// `routed[t,:] += sigmoid(gate_logit[t]) * shared_y[t,:]`.
-/// Wraps [`ffi::qwen36_add_shared_expert_gated_cuda`].
 ///
 /// # Safety
 /// `routed` / `shared_y` / `gate_logit` must be valid on `stream` for the shape.
@@ -1398,12 +1367,7 @@ pub unsafe fn qwen36_renorm_topk_weights(
     Ok(())
 }
 
-// The 5-call native DeepGEMM expert path: pack/quantize the packed grouped
-// hidden to FP8 → masked grouped GEMM (w13 fused gate+up) → SwiGLU+requant →
-// masked grouped GEMM (w2 down) → unpad the padded grouped output back to
-// compact rows. `pack`/`swiglu`/`unpad` index per-group via the compact
-// `active_experts` / `active_offsets` / `active_counts` metadata (each length
-// `active_count`); the masked GEMM reads the dense per-group `masked_m`.
+// pack/swiglu/unpad index per-group via the compact `active_experts`/`active_offsets`/`active_counts` metadata; the masked GEMM reads the dense per-group `masked_m`.
 
 /// Pack + per-128-block quantize the packed grouped BF16 hidden to FP8 padded
 /// `[num_groups * max_m, cols]` for the masked GEMM. Wraps
@@ -2159,7 +2123,57 @@ pub unsafe fn dsv4_fp8_grouped_down_decode(
     Ok(())
 }
 
-// --- W4AFP8 (SGLang CUTLASS) MoE kernels ---
+/// W4AFP8 fused gate+up+SwiGLU decode grouped GEMV (w4a16, BF16 per-128-group
+/// scales). Compact M=1 path: each warp owns one row of N, warp-shuffle reduce,
+/// no shared memory. `n` = intermediate, `k` = hidden.
+///
+/// # Safety
+/// See [`dsv4_fp8_grouped_swiglu_decode`].
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn w4afp8_grouped_swiglu_decode(
+    weight_gate_ptrs: RawDevicePtr<u64>,
+    scale_gate_ptrs: RawDevicePtr<u64>,
+    weight_up_ptrs: RawDevicePtr<u64>,
+    scale_up_ptrs: RawDevicePtr<u64>,
+    input: RawDevicePtr<bf16>,
+    act: RawDevicePtr<bf16>,
+    offsets: RawDevicePtr<i32>,
+    counts: RawDevicePtr<i32>,
+    num_experts: usize,
+    max_count: usize,
+    n: usize,
+    k: usize,
+    group_size: usize,
+    xor_mask: u32,
+    limit: f32,
+    stream: CUstream,
+) -> Result<()> {
+    // SAFETY: forwarded — the caller upholds this fn's `# Safety` contract
+    // (all raw pointers valid on `stream` for the shape); i32 casts are checked.
+    unsafe {
+        ffi::w4afp8_grouped_swiglu_decode_cuda(
+            weight_gate_ptrs.as_ptr(),
+            scale_gate_ptrs.as_ptr(),
+            weight_up_ptrs.as_ptr(),
+            scale_up_ptrs.as_ptr(),
+            input.as_ptr() as *const Half,
+            act.as_mut_ptr() as *mut Half,
+            offsets.as_ptr(),
+            counts.as_ptr(),
+            std::ptr::null(),
+            i32::try_from(num_experts)?,
+            i32::try_from(max_count)?,
+            i32::try_from(n)?,
+            i32::try_from(k)?,
+            i32::try_from(group_size)?,
+            xor_mask,
+            limit,
+            stream,
+        )
+        .result()?;
+    }
+    Ok(())
+}
 
 /// Per-tensor BF16→FP8 E4M3 quantization (amax reduction + quantize).
 /// `scale` is a single-device-float scratch; the kernel writes the amax-derived
@@ -2397,7 +2411,6 @@ mod w4a16_tests {
         let ctx = DeviceContext::new().expect("cuda context");
         let (packed, scales) = packed_int4_and_scales();
 
-        // Build the per-expert W4A16 matrices (same weights both experts).
         let w4a16 = (0..NUM_EXPERTS)
             .map(|_| DeviceMatrix::from_quantized_int4(&ctx, &packed, &scales, N, K, GROUP_SIZE))
             .collect::<Result<Vec<_>>>()

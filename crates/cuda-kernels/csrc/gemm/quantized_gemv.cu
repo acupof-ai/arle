@@ -2173,6 +2173,192 @@ __global__ void w4a16_grouped_gemv_pair_batch_kernel(
     }
 }
 
+// ============================================================================
+// W4AFP8 custom M=1 decode kernels — mirror dsv4_fp8_decode_moe.cu structure.
+// Compact (work scales with real routed rows), warp-per-row ownership (no
+// shared-mem reduction), fused gate+up+SwiGLU. W4AFP8 dequant: two's-complement
+// nibble → (n-8) via the 0x6400 half trick, × BF16 per-128-group scale.
+// ============================================================================
+
+#define W4D_WARP_SIZE 32
+#define W4D_WARPS 8
+#define W4D_THREADS (W4D_WARPS * W4D_WARP_SIZE)
+#define W4D_ACT_TILE 8    // activation rows per chunk (grid.y)
+#define W4D_VEC 32        // INT4 elements per uint4 load (2 per byte)
+#define W4D_MIN_BLOCKS_PER_SM 4
+
+static __device__ __forceinline__ float w4d_warp_reduce_sum(float val) {
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        val += __shfl_xor_sync(0xffffffff, val, off);
+    return val;
+}
+
+// DSv4 clamped SwiGLU (matches w4a16_swiglu_clamped / fp8d_swiglu_clamped).
+static __device__ __forceinline__ float w4d_swiglu_clamped(float gate, float up,
+                                                            float limit) {
+    gate = fminf(gate, limit);
+    up = fminf(fmaxf(up, -limit), limit);
+    return (gate / (1.0f + __expf(-gate))) * up;
+}
+
+// Dequant 8 INT4 nibbles (one uint32) to scaled floats, dot with 8 BF16 acts.
+// Float accumulation (matches the FP8 decode kernel's accuracy).
+static __device__ __forceinline__ float
+w4d_dot8(float acc, uint32_t packed, uint32_t xor_mask, half2 scale_h2,
+         const __nv_bfloat16* __restrict__ xp) {
+    const uint32_t MASK4 = 0x0f0f0f0fu;
+    const uint32_t SUB   = 0x64086408u;
+    const half2 SUB_H2   = *reinterpret_cast<const half2*>(&SUB);
+
+    uint32_t lo = (packed & MASK4) ^ xor_mask;
+    uint32_t hi = ((packed >> 4) & MASK4) ^ xor_mask;
+    uint32_t lo01 = (0x6400u | (lo & 0xffu)) | ((0x6400u | ((lo >> 8) & 0xffu)) << 16);
+    uint32_t lo23 = (0x6400u | ((lo >> 16) & 0xffu)) | ((0x6400u | ((lo >> 24) & 0xffu)) << 16);
+    uint32_t hi01 = (0x6400u | (hi & 0xffu)) | ((0x6400u | ((hi >> 8) & 0xffu)) << 16);
+    uint32_t hi23 = (0x6400u | ((hi >> 16) & 0xffu)) | ((0x6400u | ((hi >> 24) & 0xffu)) << 16);
+    half2 w0 = __hsub2(*reinterpret_cast<half2*>(&lo01), SUB_H2);
+    half2 w1 = __hsub2(*reinterpret_cast<half2*>(&hi01), SUB_H2);
+    half2 w2 = __hsub2(*reinterpret_cast<half2*>(&lo23), SUB_H2);
+    half2 w3 = __hsub2(*reinterpret_cast<half2*>(&hi23), SUB_H2);
+    half2 s0 = __hmul2(__halves2half2(w0.x, w1.x), scale_h2);
+    half2 s1 = __hmul2(__halves2half2(w0.y, w1.y), scale_h2);
+    half2 s2 = __hmul2(__halves2half2(w2.x, w3.x), scale_h2);
+    half2 s3 = __hmul2(__halves2half2(w2.y, w3.y), scale_h2);
+
+    float2 f0 = __half22float2(s0);
+    float2 f1 = __half22float2(s1);
+    float2 f2 = __half22float2(s2);
+    float2 f3 = __half22float2(s3);
+
+    acc = __fmaf_rn(f0.x, __bfloat162float(xp[0]), acc);
+    acc = __fmaf_rn(f0.y, __bfloat162float(xp[1]), acc);
+    acc = __fmaf_rn(f1.x, __bfloat162float(xp[2]), acc);
+    acc = __fmaf_rn(f1.y, __bfloat162float(xp[3]), acc);
+    acc = __fmaf_rn(f2.x, __bfloat162float(xp[4]), acc);
+    acc = __fmaf_rn(f2.y, __bfloat162float(xp[5]), acc);
+    acc = __fmaf_rn(f3.x, __bfloat162float(xp[6]), acc);
+    acc = __fmaf_rn(f3.y, __bfloat162float(xp[7]), acc);
+    return acc;
+}
+
+// Fused gate+up+SwiGLU decode grouped GEMV: each warp owns one row of N, reads
+// those gate/up INT4 rows once, writes act = silu(gate·x) * (up·x) directly.
+// Grid: (N/W4D_WARPS, max_count/W4D_ACT_TILE, num_experts). N = intermediate,
+// K = hidden. Scales: BF16 [N, K/group_size] per expert.
+__global__ __launch_bounds__(W4D_THREADS, W4D_MIN_BLOCKS_PER_SM)
+void w4afp8_grouped_swiglu_decode_kernel(
+    const uint64_t* __restrict__ weight_gate_ptrs,
+    const uint64_t* __restrict__ scale_gate_ptrs,
+    const uint64_t* __restrict__ weight_up_ptrs,
+    const uint64_t* __restrict__ scale_up_ptrs,
+    const __nv_bfloat16* __restrict__ input,
+    __nv_bfloat16* __restrict__ act,
+    const int* __restrict__ offsets,
+    const int* __restrict__ counts,
+    const int* __restrict__ expert_indices,
+    int N, int K, int group_size,
+    uint32_t xor_mask,
+    float limit)
+{
+    const int compact_expert_idx = blockIdx.z;
+    const int expert_M = counts[compact_expert_idx];
+    const int chunk_base = blockIdx.y * W4D_ACT_TILE;
+    if (chunk_base >= expert_M) return;
+    const int warp = threadIdx.x / W4D_WARP_SIZE;
+    const int lane = threadIdx.x % W4D_WARP_SIZE;
+    const int row = blockIdx.x * W4D_WARPS + warp;
+    if (row >= N) return;
+    const int tile_raw = expert_M - chunk_base;
+    const int tile = tile_raw < W4D_ACT_TILE ? tile_raw : W4D_ACT_TILE;
+    const int expert_idx = expert_indices ? expert_indices[compact_expert_idx] : compact_expert_idx;
+    const int route_base = offsets[compact_expert_idx] + chunk_base;
+
+    const auto* wg = reinterpret_cast<const uint8_t*>(weight_gate_ptrs[expert_idx]);
+    const auto* wu = reinterpret_cast<const uint8_t*>(weight_up_ptrs[expert_idx]);
+    const auto* sg = reinterpret_cast<const __nv_bfloat16*>(scale_gate_ptrs[expert_idx]);
+    const auto* su = reinterpret_cast<const __nv_bfloat16*>(scale_up_ptrs[expert_idx]);
+    const int num_groups = K / group_size;
+    const int bytes_per_row = K / 2;
+
+    float acc_g[W4D_ACT_TILE];
+    float acc_u[W4D_ACT_TILE];
+#pragma unroll
+    for (int b = 0; b < W4D_ACT_TILE; ++b) {
+        acc_g[b] = 0.0f;
+        acc_u[b] = 0.0f;
+    }
+
+    const int kv = K / W4D_VEC;
+    for (int v = lane; v < kv; v += W4D_WARP_SIZE) {
+        const int k = v * W4D_VEC;
+        const int g = k / group_size;
+        half2 scale_g_h2 = __half2half2(__float2half(__bfloat162float(sg[row * num_groups + g])));
+        half2 scale_u_h2 = __half2half2(__float2half(__bfloat162float(su[row * num_groups + g])));
+
+        const uint8_t* wg_row = wg + (int64_t)row * bytes_per_row;
+        const uint8_t* wu_row = wu + (int64_t)row * bytes_per_row;
+        uint4 wg4 = *reinterpret_cast<const uint4*>(wg_row + k / 2);
+        uint4 wu4 = *reinterpret_cast<const uint4*>(wu_row + k / 2);
+        uint32_t wga[4] = {wg4.x, wg4.y, wg4.z, wg4.w};
+        uint32_t wua[4] = {wu4.x, wu4.y, wu4.z, wu4.w};
+
+#pragma unroll
+        for (int b = 0; b < W4D_ACT_TILE; ++b) {
+            if (b < tile) {
+                const __nv_bfloat16* xp = input + (int64_t)(route_base + b) * K + k;
+#pragma unroll
+                for (int w = 0; w < 4; ++w) {
+                    acc_g[b] = w4d_dot8(acc_g[b], wga[w], xor_mask, scale_g_h2, xp + w * 8);
+                    acc_u[b] = w4d_dot8(acc_u[b], wua[w], xor_mask, scale_u_h2, xp + w * 8);
+                }
+            }
+        }
+    }
+
+#pragma unroll
+    for (int b = 0; b < W4D_ACT_TILE; ++b) {
+        if (b < tile) {
+            acc_g[b] = w4d_warp_reduce_sum(acc_g[b]);
+            acc_u[b] = w4d_warp_reduce_sum(acc_u[b]);
+            if (lane == 0) {
+                act[(int64_t)(route_base + b) * N + row] =
+                    __float2bfloat16(w4d_swiglu_clamped(acc_g[b], acc_u[b], limit));
+            }
+        }
+    }
+}
+
+extern "C" cudaError_t w4afp8_grouped_swiglu_decode_cuda(
+    const uint64_t* weight_gate_ptrs,
+    const uint64_t* scale_gate_ptrs,
+    const uint64_t* weight_up_ptrs,
+    const uint64_t* scale_up_ptrs,
+    const __nv_bfloat16* input,
+    __nv_bfloat16* act,
+    const int* offsets,
+    const int* counts,
+    const int* expert_indices,
+    int num_experts,
+    int max_count,
+    int N, int K, int group_size,
+    uint32_t xor_mask,
+    float limit,
+    cudaStream_t stream)
+{
+    if (num_experts <= 0 || max_count <= 0 || N <= 0 || K <= 0) return cudaSuccess;
+    if (K % W4D_VEC != 0) return cudaErrorInvalidValue;
+    dim3 block(W4D_THREADS);
+    dim3 grid((N + W4D_WARPS - 1) / W4D_WARPS,
+              (max_count + W4D_ACT_TILE - 1) / W4D_ACT_TILE,
+              num_experts);
+    w4afp8_grouped_swiglu_decode_kernel<<<grid, block, 0, stream>>>(
+        weight_gate_ptrs, scale_gate_ptrs, weight_up_ptrs, scale_up_ptrs,
+        input, act, offsets, counts, expert_indices,
+        N, K, group_size, xor_mask, limit);
+    return cudaGetLastError();
+}
+
 // Q6_K (GGUF) native packed GEMV + dequant.
 //
 // One superblock = 256 K-dim elements = 210 bytes:
