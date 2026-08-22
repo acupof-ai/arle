@@ -38,7 +38,6 @@ use deepseek_spec::v4::{DeepSeekV4AttentionLayerPlan, DeepSeekV4Config};
 use crate::kv_pool::Dsv4SlotShape;
 use crate::loader::Residency;
 
-/// Which dispatched kernel serves a kept-quantized matmul tensor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GemvKind {
     Q4K,
@@ -118,7 +117,6 @@ pub fn validate_matmul_residency<'a>(
     Ok(())
 }
 
-/// One launcher → buffers-written row of the §0.1 enumeration.
 pub struct LauncherWrites {
     pub launcher: &'static str,
     pub writes: &'static [&'static str],
@@ -168,7 +166,6 @@ pub const ATTENTION_LAUNCHER_WRITES: &[LauncherWrites] = &[
     },
 ];
 
-/// Element offsets of one compressor/indexer ring family inside a slot arena.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CompressorOffsets {
     pub pending_kv: usize,
@@ -180,7 +177,6 @@ pub struct CompressorOffsets {
     pub compressed_rows: usize,
 }
 
-/// Element offsets of one layer's slot buffers inside the bf16 arena.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LayerOffsets {
     pub sw_window: usize,
@@ -286,8 +282,6 @@ pub fn route_layer_token(
         .collect())
 }
 
-/// Layer schedule straight from the spec crate (mode from compress ratio,
-/// hash routing from `num_hash_layers`).
 pub fn layer_schedule(config: &DeepSeekV4Config) -> Vec<DeepSeekV4AttentionLayerPlan> {
     (0..config.num_hidden_layers)
         .filter_map(|i| config.attention_layer_plan(i))
@@ -388,7 +382,6 @@ mod device {
         epoch: u64,
     }
 
-    /// Device-resident DSv4 model + per-slot attention state.
     pub struct HipDsv4Model {
         pub config: DeepSeekV4Config,
         weights: HashMap<String, WeightEntry>,
@@ -692,8 +685,6 @@ mod device {
             }
         }
 
-        /// Project the stream through one HC mixer and run the sinkhorn
-        /// params kernel into pre/post/comb scratch.
         fn mhc_params(&self, layer: usize, half: &str, stream: *const u16) -> Result<()> {
             let mix = self.lw(layer, &format!("hc_{half}_fn"))?;
             let base = self.lw(layer, &format!("hc_{half}_base"))?;
@@ -831,7 +822,6 @@ mod device {
             let num_layers = self.config.num_hidden_layers;
             let s = self.st();
 
-            // ── Embedding → wide HC stream.
             let embed = self.w("token_embd.weight")?;
             let emb = self.scratch.emb.as_ptr() as *mut u16;
             unsafe {
@@ -872,7 +862,6 @@ mod device {
                 self.layer_forward(slot, layer_idx, token, start_pos)?;
             }
 
-            // ── Head: fold stream → hidden, final norm, lm_head, host f32.
             let stream_a = self.scratch.stream_a.as_ptr() as *const u16;
             let head_mix = self.w("hc_head_fn")?;
             self.gemv_full(head_mix, stream_a, self.scratch.mixes.as_ptr().cast())?;
@@ -969,11 +958,9 @@ mod device {
             let arena = |off: usize| unsafe { (arena_base as *mut u16).add(off) };
             let off = self.offsets[layer_idx];
 
-            // ── Attention half.
             self.mhc_params(layer_idx, "attn", stream_a)?;
             self.mhc_pre_rms_norm(stream_a, self.lw(layer_idx, "attn_norm.weight")?, normed)?;
 
-            // Q-LoRA + KV latent.
             self.gemv_full(
                 self.lw(layer_idx, "attn_q_a.weight")?,
                 normed,
@@ -1174,7 +1161,6 @@ mod device {
                 }
             }
 
-            // O-LoRA + HC post.
             self.gemv_full(
                 self.lw(layer_idx, "attn_output_a.weight")?,
                 self.scratch.attn_local.as_ptr().cast(),
@@ -1190,7 +1176,7 @@ mod device {
             let stream_a = self.scratch.stream_a.as_ptr() as *mut u16;
             let stream_b = self.scratch.stream_b.as_ptr() as *mut u16;
 
-            // ── MoE half (`normed` raw ptr stays valid — only stream buffers swap).
+            // `normed` raw ptr stays valid — only stream buffers swap.
             self.mhc_params(layer_idx, "ffn", stream_a)?;
             self.mhc_pre_rms_norm(stream_a, self.lw(layer_idx, "ffn_norm.weight")?, normed)?;
             self.moe_forward(layer_idx, token, normed)?;
@@ -1292,7 +1278,6 @@ mod device {
                 self.tid2eid_by_layer.get(&layer_idx).map(Vec::as_slice),
             )?;
 
-            // moe_acc ← 0, then add each weighted expert row + shared expert.
             let zero = self.scratch.moe_zero_host.clone();
             self.scratch
                 .moe_acc

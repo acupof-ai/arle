@@ -16,7 +16,6 @@ use infer_seam::{BackendExecutor, KvPool, PollResult};
 
 use crate::kv_pool::HipKvPool;
 
-/// In-flight handle — the MVP resolves synchronously at submit.
 #[derive(Debug)]
 pub enum HipInflight {
     Ready(StepOutput),
@@ -32,7 +31,6 @@ pub struct HipDsv4Executor {
 }
 
 impl HipDsv4Executor {
-    /// An executor with no model — every non-idle submit errors loud.
     #[must_use]
     pub fn unloaded() -> Self {
         Self::default()
