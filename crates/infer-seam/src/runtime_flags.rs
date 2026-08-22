@@ -43,8 +43,8 @@ pub struct CudaRuntimeFlags {
     #[serde(default = "d_true")]
     pub qwen35_decode_graph: bool,
     /// Routed-row floor for the DeepGEMM grouped expert path. Default 1024,
-    /// the compile-time `QWEN35_DEEPGEMM_MIN_ROUTES`; lower it to reach the
-    /// uncharacterized mid-band (batched decode is `R = top_k * B`).
+    /// the compile-time `QWEN35_DEEPGEMM_MIN_ROUTES`; the FP8 mid-band
+    /// (R=129..1023) measured a wash on H20 (2026-08-23).
     #[serde(default = "d_deepgemm_min_routes")]
     pub qwen35_deepgemm_min_routes: usize,
     /// FlashQLA chunked GDN prefill (sm_90a baked Qwen3.6 shard only).

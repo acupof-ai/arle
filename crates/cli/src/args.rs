@@ -812,8 +812,9 @@ pub(crate) struct ServeArgs {
     pub(crate) mtp_draft_topk: Option<usize>,
 
     /// Routed-row floor for the DeepGEMM grouped expert path (default 1024).
-    /// Batched decode is `R = top_k * B`, so 1024 keeps decode off DeepGEMM;
-    /// lower it to reach the uncharacterized mid-band.
+    /// Batched decode is `R = top_k * B`; the FP8 mid-band (R=129..1023) was
+    /// measured a wash on H20 (2026-08-23), so 1024 keeps decode on the hand
+    /// kernels. Lower it only to re-probe on new hardware/kernel versions.
     #[arg(long, default_value_t = 1024)]
     pub(crate) qwen35_deepgemm_min_routes: usize,
 
