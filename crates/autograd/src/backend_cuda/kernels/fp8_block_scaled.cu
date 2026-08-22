@@ -124,13 +124,16 @@ extern "C" __global__ void marlin_fp4_to_bf16(
         const int k = k_tile * 16 + tc_row + tc_offsets[j & 3];
         const int n = n_tile * 64 + cur_n + ((j < 4) ? 0 : 8);
         const int group = k >> 4;
-        // Inverse of the repack's scale permutation: sperm[b*64 + o] came from
-        // sflat[b*64 + (o%8)*8 + o/8], and each quad then swapped 1<->2.
+        // Inverse of the repack's scale permutation, in the order the repack
+        // applied it: sperm[b*64 + o] = sflat[b*64 + (o%8)*8 + o/8] (an 8x8
+        // transpose, self-inverse), and only THEN each quad swapped 1<->2. So
+        // transpose first, then follow the swap — doing it the other way round
+        // misplaces 3 of every 4 scales.
         const int flat = group * size_n + n;
         const int base = flat & ~63;
         const int o = flat - base;
-        const int un8 = (o & 3) == 1 ? o + 1 : ((o & 3) == 2 ? o - 1 : o);
-        const int src = base + (un8 % 8) * 8 + (un8 / 8);
+        const int t = (o % 8) * 8 + (o / 8);
+        const int src = base + ((t & 3) == 1 ? t + 1 : ((t & 3) == 2 ? t - 1 : t));
         // S0E5M3 byte -> f16 (byte << 7) decoded inline: NVRTC compiles these
         // kernels without cuda_fp16.h. Then drop the repack's 2^7 lift.
         const unsigned int sb = scales[src];
