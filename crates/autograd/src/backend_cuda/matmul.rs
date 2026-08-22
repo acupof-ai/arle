@@ -385,6 +385,9 @@ impl CudaBackend {
         storage: &CudaFp4E2M1GroupStorage,
     ) -> Result<(CudaSlice<u16>, Vec<usize>)> {
         let (rows, cols) = (storage.rows(), storage.cols());
+        if storage.is_marlin() {
+            return self.marlin_fp4_to_bf16(storage);
+        }
         let (group_size, scale_cols) = (storage.group_size(), storage.scale_cols());
         let total = rows * cols;
         if storage.weight().len() != total / 2 || storage.scales().len() != rows * scale_cols {
@@ -418,6 +421,60 @@ impl CudaBackend {
                     .arg(&cols_i32)
                     .arg(&group_size_i32)
                     .arg(&scale_cols_i32);
+                builder
+            },
+        )?;
+        Ok((out, vec![rows, cols]))
+    }
+
+    /// Dequantize a shared frozen base that the serving engine already repacked
+    /// into the Marlin layout. Reproduces what the Marlin GEMM computes, so the
+    /// student sees the same weights the rollout engine serves — one resident
+    /// copy instead of two.
+    #[cfg(not(feature = "no-cuda"))]
+    fn marlin_fp4_to_bf16(
+        &self,
+        storage: &CudaFp4E2M1GroupStorage,
+    ) -> Result<(CudaSlice<u16>, Vec<usize>)> {
+        let (rows, cols) = (storage.rows(), storage.cols());
+        let words = rows * cols / 8;
+        let scale_bytes = rows * (cols / 16);
+        if storage.weight().len() < words * 4 || storage.scales().len() < scale_bytes {
+            return Err(AutogradError::TapeInvariant(
+                "cuda backend marlin nvfp4 dequant handle size does not match shape",
+            ));
+        }
+        let global = self
+            .stream
+            .clone_dtoh(storage.global_scale())
+            .map_err(|_| AutogradError::TapeInvariant("marlin nvfp4 global scale D2H failed"))?;
+        let global_scale = global.first().copied().ok_or(AutogradError::TapeInvariant(
+            "marlin nvfp4 global scale is empty",
+        ))?;
+        let total = rows * cols;
+        let mut out = alloc_zeros_retry::<u16>(self, total).map_err(|e| {
+            eprintln!("[autograd] alloc_zeros {total} x u16 failed (marlin nvfp4 dequant): {e}");
+            AutogradError::TapeInvariant("cuda alloc_zeros failed (marlin nvfp4 dequant)")
+        })?;
+        let words_i32 = i32::try_from(words)
+            .map_err(|_| AutogradError::TapeInvariant("marlin nvfp4 words exceeds i32"))?;
+        let k_i32 = i32::try_from(cols)
+            .map_err(|_| AutogradError::TapeInvariant("marlin nvfp4 k exceeds i32"))?;
+        let n_i32 = i32::try_from(rows)
+            .map_err(|_| AutogradError::TapeInvariant("marlin nvfp4 n exceeds i32"))?;
+        launch_1d(
+            &self.stream,
+            self.kernels.function("marlin_fp4_to_bf16")?,
+            words,
+            |mut builder| {
+                builder
+                    .arg(storage.weight())
+                    .arg(storage.scales())
+                    .arg(&global_scale)
+                    .arg(&mut out)
+                    .arg(&words_i32)
+                    .arg(&k_i32)
+                    .arg(&n_i32);
                 builder
             },
         )?;

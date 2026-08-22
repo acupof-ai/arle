@@ -536,6 +536,38 @@ impl Backend for CudaBackend {
         }
     }
 
+    fn import_fp4_marlin_device_ptr(
+        &self,
+        weight_device_ptr: u64,
+        scale_tail_device_ptr: u64,
+        global_scale: f32,
+        shape: &[usize],
+    ) -> Result<DeviceHandle> {
+        #[cfg(feature = "no-cuda")]
+        {
+            let _ = (
+                weight_device_ptr,
+                scale_tail_device_ptr,
+                global_scale,
+                shape,
+            );
+            todo!(
+                "GPU required: cuda marlin nvfp4 device import is unavailable under feature no-cuda"
+            )
+        }
+
+        #[cfg(not(feature = "no-cuda"))]
+        {
+            cuda_import_fp4_marlin_device_ptr(
+                self,
+                weight_device_ptr,
+                scale_tail_device_ptr,
+                global_scale,
+                shape,
+            )
+        }
+    }
+
     fn import_bf16_device_ptr(&self, device_ptr: u64, shape: &[usize]) -> Result<DeviceHandle> {
         #[cfg(feature = "no-cuda")]
         {

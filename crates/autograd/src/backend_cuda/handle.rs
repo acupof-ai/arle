@@ -928,6 +928,67 @@ pub(super) fn cuda_import_fp8_block_scaled_device_ptr(
     ))
 }
 
+pub(super) fn cuda_import_fp4_marlin_device_ptr(
+    backend: &CudaBackend,
+    weight_device_ptr: u64,
+    scale_tail_device_ptr: u64,
+    global_scale: f32,
+    shape: &[usize],
+) -> Result<DeviceHandle> {
+    if shape.len() != 2 {
+        return Err(AutogradError::InvalidRank {
+            expected: "2",
+            got: shape.len(),
+        });
+    }
+    let (rows, cols) = (shape[0], shape[1]);
+    if !cols.is_multiple_of(64) || !rows.is_multiple_of(64) {
+        return Err(AutogradError::TapeInvariant(
+            "marlin nvfp4 import needs the repack's K%64 and N%64 tile grid",
+        ));
+    }
+    // The repack packs [K/16, N*2] i32 = K*N/2 bytes, then the S0E5M3 tail.
+    let weight_len = rows
+        .checked_mul(cols)
+        .map(|t| t / 2)
+        .ok_or(AutogradError::TapeInvariant(
+            "marlin nvfp4 import weight len overflow",
+        ))?;
+    let scale_len = rows
+        .checked_mul(cols / 16)
+        .ok_or(AutogradError::TapeInvariant(
+            "marlin nvfp4 import scale len overflow",
+        ))?;
+
+    // SAFETY: same contract as `cuda_import_fp8_block_scaled_device_ptr` — the
+    // sharing loader guarantees both pointers are resident on this ordinal for
+    // the handle's lifetime, and the borrowed storage leaks instead of freeing.
+    let weight_slice: CudaSlice<u8> = unsafe {
+        backend
+            .stream
+            .upgrade_device_ptr::<u8>(weight_device_ptr as CUdeviceptr, weight_len)
+    };
+    // SAFETY: as above, for the scale tail of the same allocation.
+    let scale_slice: CudaSlice<u8> = unsafe {
+        backend
+            .stream
+            .upgrade_device_ptr::<u8>(scale_tail_device_ptr as CUdeviceptr, scale_len)
+    };
+    let global = backend
+        .stream
+        .clone_htod(&[global_scale])
+        .map_err(|_| AutogradError::TapeInvariant("marlin nvfp4 global scale H2D failed"))?;
+    Ok(DeviceHandle::CudaFp4E2M1Group(
+        crate::backend::CudaFp4E2M1GroupStorage::new_borrowed_marlin(
+            weight_slice,
+            scale_slice,
+            global,
+            rows,
+            cols,
+        ),
+    ))
+}
+
 pub(super) fn cuda_import_bf16_device_ptr(
     backend: &CudaBackend,
     device_ptr: u64,
