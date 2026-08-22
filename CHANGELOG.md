@@ -8,6 +8,12 @@ detail in the linked wins/errors entry. Oldest sections are condensed.
 
 ## [Unreleased]
 
+- **FA3 fp8 prefill attention from 64K tokens — accepted.** The quantized-pool
+  prefill shim runs FA3's e4m3 kernels for prefill chunks over ≥64K KV (one
+  descale per row/kv-head); 220K TTFT 129.7 → 108.2 s (−17 %), 32K and decode
+  unchanged, needle 13/13 DET.
+  ([entry](docs/experience/wins/2026-08-22-fa3-fp8-prefill-attention-long-context.md))
+
 - **Global sequence 262,144 trains on 2 GPUs — accepted.** Sequence-parallel
   linear-attention core with cross-rank state carry (the all-to-all form's
   transient was O(global seq)), layer param grads parked on host, and the CP
