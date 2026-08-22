@@ -28,7 +28,6 @@ pub type BlockId = u32;
 /// it out first (see [`PrefixMatch::local_block_ids`]).
 pub const REPLICA_PAGE: BlockId = u32::MAX - 1;
 
-/// Longest cached prefix result.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrefixMatch {
     /// Number of prompt tokens covered by cached full blocks.
@@ -81,7 +80,6 @@ pub struct TieredPrefixMatch {
     pub blocks: Vec<PrefixBlock>,
 }
 
-/// Fixed-block radix cache for prompt KV reuse.
 #[derive(Debug, Clone)]
 pub struct RadixCache {
     block_size: usize,
@@ -153,7 +151,6 @@ impl Node {
 }
 
 impl RadixCache {
-    /// Create a cache whose block size is the KV pool page size in tokens.
     #[must_use]
     pub fn new(block_size: usize) -> Self {
         Self {
@@ -206,7 +203,6 @@ impl RadixCache {
         std::mem::take(&mut self.dropped_tier_keys)
     }
 
-    /// Find the longest cached full-block prefix and bump recency.
     pub fn longest_prefix_match(&mut self, tokens: &[u32]) -> PrefixMatch {
         let matched = self.match_inner(tokens);
         if !matched.block_ids.is_empty() {
@@ -220,7 +216,6 @@ impl RadixCache {
         matched
     }
 
-    /// Find the longest cached full-block prefix without changing recency.
     #[must_use]
     pub fn peek_longest_prefix_match(&self, tokens: &[u32]) -> PrefixMatch {
         self.match_inner(tokens)
@@ -501,7 +496,6 @@ impl RadixCache {
         newly_cached
     }
 
-    /// Adjust `resident_below` on every ancestor of `idx` by `delta`.
     fn adjust_resident_ancestors(&mut self, mut idx: usize, delta: i64) {
         while let Some(parent) = self.nodes[idx].parent {
             let node = &mut self.nodes[parent];
