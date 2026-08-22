@@ -1,6 +1,7 @@
 # TP decode graph capture: industry path exists — CUDA, 2026-08-22
 
-> Status: Research, implementation started
+> Status: Verified (9b346ea1a) — TP2 decode graph armed + replaying; +10% ITL at
+> c=1, wash at c≥2 (GPU-bound ceiling); needle envelope identical to eager
 
 ## Context
 
@@ -39,6 +40,32 @@ check both premises.
    Architecture everywhere: graph-captured masked/padded grouped GEMM + DeepEP
    low-latency a2a (capturable; normal/high-throughput mode is not — implicit CPU
    wait). Per-token GEMV is nobody's decode MoE strategy.
+
+## Verification
+
+ThinkingCap-Qwen3.6-27B-NVFP4, 8×H20 pod, TP2, FP8 KV, spec off. Graph arm =
+9b346ea1a (gate removed); eager arm = pre-change binary, same model/config.
+Serve log under TP2: `whole-step decode graph ARMED` on both ranks,
+`replay_total=5100 captures_total=16` — graph captured and replayed, no eager
+fallback.
+
+Needle ladder ×3 (NEEDLE_MAX_TOKENS=512): both arms 25/27 exact, identical
+envelope — same len=300 counting-loop degenerate outputs in both arms.
+
+A/B bench (64 synthetic prompts, 128 tokens, c=1..32, simultaneous), ITL mean:
+
+| c | graph ms | eager ms | Δ |
+|---|---|---|---|
+| 1 | 13.79 | 15.30 | +9.9% |
+| 2 | 22.34 | 22.29 | wash |
+| 4 | 44.65 | 44.12 | wash |
+| 8 | 89.78 | 88.86 | wash |
+| 16 | 179.6 | 177.97 | wash |
+| 32 | 360.25 | 356.62 | wash |
+
+c=1 wins ~10% (CPU launch overhead is the c=1 bottleneck; graph removes it).
+c≥2 is flat at the ~88 tok/s TP2 aggregate ceiling — GPU-bound, graph cannot
+help. TTFT noisy, no signal (prefill is not graph-captured).
 
 ## Rule
 
