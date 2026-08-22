@@ -1,6 +1,6 @@
-# Batched DSpark over quantized KV loses from c=8 — the verify path is the slow one
+# Batched DSpark over quantized KV loses from c=8 — cause unknown, verify kernel ruled out
 
-> Status: Rejected on measurement; gate restored. Runtime `2aa569adc` (gate
+> Status: Rejected twice on measurement; gate restored (`1f36fea61`). Runtime `2aa569adc` (gate
 > lifted) vs `7d58850dc`, Qwen3.6-27B-FP8 + `Qwen3.6-27B-DFlash`, fp8 KV,
 > 1×H20, 32K agent chain, 32 req/point, greedy, `--dspark-block-size 6`.
 
@@ -26,21 +26,33 @@ exact, DET — parity holds; throughput does not.
 
 ## Root Cause
 
-At c≥4 on this chain decode is ≈80 % attention. Plain decode rows run the
-tensor-core quantized-pool kernel (`paged_attention_quantized_fa3.cu`); the
-verify step (block + 1 query rows) runs the FA3 dequant shim — a bf16 temp of
-the row's pages plus the bf16 FA3 kernel — which costs several plain steps
-per verify. At ≈1.9 accepted tokens per step that is a loss from c=8. On BF16
-pools verify and decode share the FA3 kernel, which is why the same batched
-path paid +8.5 % at c=16 there.
+Cause unknown. The first hypothesis — the verify step (block + 1 query rows)
+running the FA3 dequant shim instead of the tensor-core quantized-pool kernel
+— was tested and refuted (below).
 
 ## Fix
 
-Gate restored (`paged_kv_bf16()`), with the numbers in the comment. The
-lever is a quantized-pool attention kernel that takes the few-row verify
-shape: extend the 16-row MMA tile from (6 heads × 1 token) to (token, head)
-pairs with the in-block causal mask. One kernel unlocks batched DSpark on
-quantized KV and the batched MTP verify plan.
+Gate restored (`paged_kv_bf16()`), with the numbers in the comment.
+
+## Follow-up: verify-shape MMA kernel does not close the gap
+
+`paged_attention_quantized_fa3.cu` now takes up to 8 query tokens per row
+(`c177cda5b`, 16-row tile of (token, head) pairs, in-block causal mask), so
+verify rows and plain rows share one kernel. Gate lifted again (`6f8d7da6c`),
+same setup, needle ladder ×3 12/12 DET:
+
+| c | no-spec | DSpark, per-row | DSpark, batched + MMA verify |
+|---:|---:|---:|---:|
+| 1 | 55.8 | 84.3 | 82.9 |
+| 4 | 32.2 | 32.3 | 34.2 (+6 %) |
+| 8 | 21.5 | 21.8 | **19.2 (−12 %)** |
+| 16 | 13.5 | 13.9 | **11.2 (−19 %)** |
+
+The c≥8 loss is unchanged, so it does not sit in verify attention. The
+kernel extension stays (one attention path for every decode shape; c=1 is a
+wash); the gate lift is reverted (`1f36fea61`). Remaining candidates are the
+batched draft forward and rejected-token waste at ≈1.9 accepted/step — an
+`ARLE_CUDA_PROFILE=1` op_timing split of the batched step is the next probe.
 
 ## Rule
 
