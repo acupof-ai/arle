@@ -1111,6 +1111,19 @@ mod backend {
         /// the train loader imports a NON-OWNING view over these instead of
         /// allocating its own copy of the shared frozen base.
         #[cfg(feature = "cuda")]
+        pub fn frozen_base_fp4_pointers(&self) -> Result<Vec<infer_cuda::SharedFp4BaseProjection>> {
+            // Every other arm is feature-gated away in a cuda-only build.
+            #[allow(unreachable_patterns)]
+            match self {
+                Self::Cuda(engine) => engine.frozen_base_fp4_pointers(),
+                other => anyhow::bail!(
+                    "frozen-base NVFP4 sharing is CUDA-only; active backend is {}",
+                    other.backend_name()
+                ),
+            }
+        }
+
+        #[cfg(feature = "cuda")]
         pub fn frozen_base_fp8_pointers(&self) -> Result<Vec<infer_cuda::SharedFp8BaseProjection>> {
             match self {
                 Self::Cuda(engine) => engine.frozen_base_fp8_pointers(),

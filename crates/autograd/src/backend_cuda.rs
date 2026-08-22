@@ -206,7 +206,7 @@ pub struct NvrtcIdentity {
 
 #[cfg(not(feature = "no-cuda"))]
 struct DequantCacheEntry {
-    key: usize,
+    key: (usize, usize),
     bf16: Arc<cudarc::driver::CudaSlice<u16>>,
     shape: Vec<usize>,
 }
@@ -542,6 +542,7 @@ impl Backend for CudaBackend {
         scale_tail_device_ptr: u64,
         global_scale: f32,
         shape: &[usize],
+        window: (usize, usize),
     ) -> Result<DeviceHandle> {
         #[cfg(feature = "no-cuda")]
         {
@@ -550,6 +551,7 @@ impl Backend for CudaBackend {
                 scale_tail_device_ptr,
                 global_scale,
                 shape,
+                window,
             );
             todo!(
                 "GPU required: cuda marlin nvfp4 device import is unavailable under feature no-cuda"
@@ -564,6 +566,7 @@ impl Backend for CudaBackend {
                 scale_tail_device_ptr,
                 global_scale,
                 shape,
+                window,
             )
         }
     }

@@ -77,43 +77,51 @@ fn cuda_marlin_fp4_dequant_matches_group_layout() {
         .expect("D2H marlin global scale");
     ctx.sync().expect("sync");
     let folded_global = f32::from_bits(u32::from(folded_bits[0]) << 16);
-    let marlin = backend
-        .import_fp4_marlin_device_ptr(weight_ptr, scale_tail_ptr, folded_global, &[n, k])
-        .expect("import marlin view");
-
     // Dequant is internal; `I @ Wᵀ` reaches it through the public GEMM seam.
     let mut eye = vec![0f32; k * k];
     for i in 0..k {
         eye[i * k + i] = 1.0;
     }
     let eye_handle = backend.upload(&eye, &[k, k]).expect("upload identity");
-    let (a, _) = backend
-        .matmul_bt(&eye_handle, &[k, k], &group, &[n, k])
-        .expect("group matmul");
-    let (b, _) = backend
-        .matmul_bt(&eye_handle, &[k, k], &marlin, &[n, k])
-        .expect("marlin matmul");
-    let a = backend.readback(&a).expect("readback group");
-    let b = backend.readback(&b).expect("readback marlin");
+    let dequant = |handle: &_, rows: usize| {
+        let (out, _) = backend
+            .matmul_bt(&eye_handle, &[k, k], handle, &[rows, k])
+            .expect("matmul");
+        backend.readback(&out).expect("readback")
+    };
 
-    assert_eq!(a.len(), b.len());
-    let worst = a
-        .iter()
-        .zip(b.iter())
-        .enumerate()
-        .map(|(i, (&x, &y))| ((x - y).abs(), i, x, y))
-        .max_by(|l, r| l.0.total_cmp(&r.0))
-        .expect("non-empty");
-    // Both sides land in bf16, so the only legal difference is the repack's own
-    // S0E5M3 rounding of a scale — with powers of two above, that is exact.
+    let full = dequant(&group, n);
     assert!(
-        worst.0 == 0.0,
-        "marlin dequant diverged: idx={} group={} marlin={}",
-        worst.1,
-        worst.2,
-        worst.3
+        full.iter().any(|v| *v != 0.0),
+        "group dequant produced zeros"
     );
-    // Guard against both paths returning zeros.
-    assert!(a.iter().any(|v| *v != 0.0), "group dequant produced zeros");
+
+    // Whole matrix, then a row window — q/k/v share one fused Marlin buffer, so
+    // an offset view has to walk the same tiles and keep only its own rows.
+    for (row_offset, rows) in [(0usize, n), (64usize, 64usize)] {
+        let marlin = backend
+            .import_fp4_marlin_device_ptr(
+                weight_ptr,
+                scale_tail_ptr,
+                folded_global,
+                &[rows, k],
+                (n, row_offset),
+            )
+            .expect("import marlin view");
+        let got = dequant(&marlin, rows);
+        // `matmul_bt` gives [k, rows] — column `r` is output row `row_offset + r`.
+        assert_eq!(got.len(), k * rows);
+        for i in 0..k {
+            for r in 0..rows {
+                let want = full[i * n + row_offset + r];
+                let have = got[i * rows + r];
+                assert!(
+                    want == have,
+                    "marlin dequant diverged at offset={row_offset} [{i},{r}]: \
+                     group={want} marlin={have}"
+                );
+            }
+        }
+    }
     let _ = E2M1;
 }

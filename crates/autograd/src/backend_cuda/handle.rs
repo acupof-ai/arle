@@ -934,6 +934,7 @@ pub(super) fn cuda_import_fp4_marlin_device_ptr(
     scale_tail_device_ptr: u64,
     global_scale: f32,
     shape: &[usize],
+    window: (usize, usize),
 ) -> Result<DeviceHandle> {
     if shape.len() != 2 {
         return Err(AutogradError::InvalidRank {
@@ -942,19 +943,28 @@ pub(super) fn cuda_import_fp4_marlin_device_ptr(
         });
     }
     let (rows, cols) = (shape[0], shape[1]);
-    if !cols.is_multiple_of(64) || !rows.is_multiple_of(64) {
+    let (full_rows, row_offset) = window;
+    if !cols.is_multiple_of(64) || !full_rows.is_multiple_of(64) {
         return Err(AutogradError::TapeInvariant(
             "marlin nvfp4 import needs the repack's K%64 and N%64 tile grid",
         ));
     }
+    if row_offset + rows > full_rows {
+        return Err(AutogradError::TapeInvariant(
+            "marlin nvfp4 import row window runs past the packed matrix",
+        ));
+    }
     // The repack packs [K/16, N*2] i32 = K*N/2 bytes, then the S0E5M3 tail.
-    let weight_len = rows
-        .checked_mul(cols)
-        .map(|t| t / 2)
-        .ok_or(AutogradError::TapeInvariant(
-            "marlin nvfp4 import weight len overflow",
-        ))?;
-    let scale_len = rows
+    // Both cover the FULL matrix — a row window is a tile-walk filter, not a
+    // pointer offset, so the buffer lengths never shrink.
+    let weight_len =
+        full_rows
+            .checked_mul(cols)
+            .map(|t| t / 2)
+            .ok_or(AutogradError::TapeInvariant(
+                "marlin nvfp4 import weight len overflow",
+            ))?;
+    let scale_len = full_rows
         .checked_mul(cols / 16)
         .ok_or(AutogradError::TapeInvariant(
             "marlin nvfp4 import scale len overflow",
@@ -979,6 +989,8 @@ pub(super) fn cuda_import_fp4_marlin_device_ptr(
             weight_slice,
             scale_slice,
             global_scale,
+            full_rows,
+            row_offset,
             rows,
             cols,
         ),

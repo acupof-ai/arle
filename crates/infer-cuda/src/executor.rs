@@ -790,6 +790,19 @@ impl RealCudaExecutor {
         }
     }
 
+    /// The NVFP4 twin of [`Self::frozen_base_fp8_pointers`].
+    pub(crate) fn frozen_base_fp4_pointers(
+        &self,
+    ) -> Result<Vec<crate::qwen35::SharedFp4BaseProjection>> {
+        match self {
+            Self::Qwen35(q) => q.frozen_base_fp4_pointers(),
+            Self::Dsv4(_) => anyhow::bail!(
+                "frozen-base NVFP4 sharing is only wired for the Qwen3.5/3.6 hybrid OPD student; \
+                 the DSv4-Flash executor is not a student target"
+            ),
+        }
+    }
+
     /// Read-only borrow of resident FP8 block-scaled base projection pointers
     /// for train-infer weight sharing (`--share-frozen-base`). Only the
     /// Qwen3.5/3.6 hybrid student carries shareable FP8 base weights.
