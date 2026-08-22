@@ -6,8 +6,6 @@
 //! pre weights collapse the stream to one `hidden_size` row for the sub-block,
 //! and the post/comb weights scatter the sub-block output back across the lanes
 //! and re-mix the residual. Reuses the shared `dsv4_mhc_*` kernels; the math is
-//! the legacy `weights.rs` `gen_mhc_params` / `hc_pre_from_stream` /
-//! `hc_post_to_stream` / `head_hidden_from_stream`, reorganized into one module.
 
 use anyhow::{Result, anyhow, ensure};
 use cuda_kernels::prelude::{DeviceContext, DeviceVec, HiddenStates};
@@ -17,7 +15,6 @@ use deepseek_spec::DeepSeekV4Config;
 
 use crate::dsv4::Dsv4HyperConnection;
 
-/// Per-token sinkhorn-normalized mixing weights for one HC sub-block.
 pub(crate) struct MhcParams {
     /// `[seq_len * hc_mult]` pre-mix lane weights (stream → hidden).
     pub pre: CudaSlice<f32>,
@@ -27,8 +24,6 @@ pub(crate) struct MhcParams {
     pub comb: CudaSlice<f32>,
 }
 
-/// Expand token embeddings `[hidden_size, seq]` into the initial wide HC stream
-/// `[hidden_size * hc_mult, seq]` (each lane seeded from the embedding).
 pub(crate) fn initial_stream_from_embeddings(
     ctx: &DeviceContext,
     embeddings: &HiddenStates,
@@ -60,8 +55,6 @@ pub(crate) fn initial_stream_from_embeddings(
     )
 }
 
-/// Project the wide stream through `hc.mix_fn`, then run the sinkhorn mixer
-/// (`dsv4_mhc_params_cuda`) to produce the per-lane pre/post/comb weights.
 pub(crate) fn gen_mhc_params(
     ctx: &DeviceContext,
     config: &DeepSeekV4Config,
@@ -127,8 +120,6 @@ pub(crate) fn gen_mhc_params(
     Ok(MhcParams { pre, post, comb })
 }
 
-/// Collapse the wide stream to one `hidden_size` row per token using the pre-mix
-/// lane weights (input to the sub-block).
 // Kept as the unfused primitive; current DSv4 decode uses `mhc_pre_rms_norm`.
 #[allow(dead_code)]
 pub(crate) fn hc_pre(
@@ -217,8 +208,6 @@ pub(crate) fn mhc_pre_rms_norm(
     )
 }
 
-/// Scatter the sub-block output back across the lanes and re-mix the residual
-/// stream (output of the sub-block).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn hc_post(
     ctx: &DeviceContext,
@@ -268,8 +257,6 @@ pub(crate) fn hc_post(
     )
 }
 
-/// Fold the `token_idx` row of the wide stream into one `hidden_size` vector via
-/// the head HC mixer (`mix_fn` row gemv → `dsv4_mhc_head_pre_cuda`).
 pub(crate) fn head_hidden_from_stream(
     ctx: &DeviceContext,
     config: &DeepSeekV4Config,
@@ -309,7 +296,6 @@ pub(crate) fn head_hidden_from_stream(
         out.len
     );
 
-    // Extract the single stream row, project it through mix_fn (batch=1).
     // SAFETY: copy_row_to_hidden writes the full one-token stream row.
     let mut stream_row = unsafe { HiddenStates::uninit(ctx, stream.hidden_dim, 1)? };
     // SAFETY: dsv4_linear writes the full head-HC mix buffer.

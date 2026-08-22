@@ -1,9 +1,3 @@
-//! Unified per-op CUDA timing + NVTX observability primitive.
-//!
-//! [`profile_op`] wraps a closure with an NVTX range (always, no-op when
-//! `ARLE_NVTX`/`ARLE_DSV4_NVTX` unset) and, when `ARLE_CUDA_PROFILE` is set,
-//! records CUDA events around it and accumulates device microseconds into the
-//! global [`OpStats`] table keyed by op name (+ optional layer index).
 #![allow(dead_code)]
 
 use std::collections::HashMap;
@@ -31,15 +25,6 @@ fn stats() -> &'static RwLock<HashMap<String, OpStats>> {
     STATS.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
-/// Time a single op on the CUDA stream and accumulate into the global
-/// [`OpStats`] table.
-///
-/// - Always pushes an NVTX range (no-op when neither `ARLE_NVTX` nor
-///   `ARLE_DSV4_NVTX` is set).
-/// - When `ARLE_CUDA_PROFILE` is set, records CUDA events around `f()` and
-///   adds the elapsed device microseconds to the entry keyed by
-///   `{name}_layer{idx}` (or just `{name}` when `layer_idx` is `None`).
-/// - Otherwise calls `f()` directly under the NVTX range.
 pub fn profile_op<T>(
     ctx: &DeviceContext,
     name: &str,
@@ -90,7 +75,6 @@ pub fn profile_op<T>(
         .map_err(|e| anyhow!("elapsed CUDA profile event for {stats_key} failed: {e}"))?;
     let cuda_micros = (cuda_ms * 1000.0).round() as u64;
 
-    // Ensure the stats entry exists, then atomically accumulate.
     {
         let read = stats().read().unwrap();
         if !read.contains_key(&stats_key) {
@@ -110,8 +94,6 @@ pub fn profile_op<T>(
     result
 }
 
-/// Snapshot of the accumulated per-op CUDA timings, sorted by total device
-/// microseconds descending. Returns `(name, total_cuda_micros, count)`.
 pub fn get_op_stats() -> Vec<(String, u64, u64)> {
     let read = stats().read().unwrap();
     let mut out: Vec<(String, u64, u64)> = read

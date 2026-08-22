@@ -635,7 +635,6 @@ impl Qwen35Model {
                 || self.tp.all_reduce_sum(&self.ctx, mlp_out),
             )?;
 
-            // MLP residual add producing the next layer's residual stream.
             // The post-attn sum lives in `hidden_mid`; add_batch reads
             // hidden_mid/mlp_out and writes `hidden` (whose previous value is
             // dead).

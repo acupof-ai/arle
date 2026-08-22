@@ -1,6 +1,3 @@
-//! Content-keyed prefix-state pool: what a forward captures, when a capture
-//! becomes readable, and what a restore is licensed to reuse.
-
 use super::*;
 
 const MAX_PENDING_PREFIX_CAPTURES: usize = 2;
@@ -345,8 +342,6 @@ impl Dsv4CudaExecutor {
         self.prefix_state.remove_provisional_pages(pages);
     }
 
-    /// Radix publish confirmed these pages: flip their pool entries from
-    /// provisional to readable.
     pub(crate) fn confirm_prefix_pages(&mut self, pages: &[u32]) {
         for capture in &mut self.pending_prefix_captures {
             for page in &mut capture.pages {

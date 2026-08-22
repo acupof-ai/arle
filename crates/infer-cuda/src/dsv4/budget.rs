@@ -7,15 +7,11 @@ use deepseek_spec::{DeepSeekV4AttentionMode, DeepSeekV4Config};
 
 use super::{Dsv4Model, Dsv4SlotState, MAX_SPEC_DRAFT_DEPTH, MAX_SPEC_VERIFY_ROWS};
 
-/// MLA latent KV arena descriptor (kv_heads = 1).
-///
 /// Unlike the per-head BF16 [`cuda_kernels::prelude::PagedKVPool`], MLA caches a
 /// single compressed latent per token in the flat FP8 block layout FlashMLA's
 /// sparse-decode consumes: `[NoPE | RoPE]` packed to `bytes_per_token` bytes
 /// (`cuda-kernels/src/attention.rs` `dsv4_fp8_kv_pack`, 584 B/token for the
-/// canonical NoPE=448 / RoPE=64 / head_dim=512 shape). The device arena itself
-/// is allocated by Piece 2 once the FlashMLA decode launch lands; Piece 1 only
-/// pins the shape contract.
+/// canonical NoPE=448 / RoPE=64 / head_dim=512 shape).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Dsv4MlaKvArena {
     /// RoPE-carrying dims (`qk_rope_head_dim`, 64 for DSv4-Flash).
@@ -155,24 +151,12 @@ impl Dsv4Model {
         Dsv4SlotState::new(self, max_seq_len, slot_idx, kv_adapter)
     }
 
-    /// STATIC per-slot device bytes — exactly what one [`Dsv4SlotState::new`]
-    /// allocates, derived from config so [`Self::kv_budget_plan`] can size the
-    /// per-slot divisor BEFORE any slot (or `kv_adapter`) exists (chicken-and-egg:
-    /// the budget runs first). Single source of truth against per-slot
-    /// under-counting; the executor's post-slot-0 drift guard reconciles it with
-    /// the real `slots[0].device_bytes()`. MUST track `Dsv4SlotState::new` — the
-    /// spec_* terms gate on `spec_decode_on` exactly as the constructor does.
-    ///
-    /// EXCLUDES two per-slot terms that live OUTSIDE the slot struct (`kv_budget_plan`
-    /// adds them): the shared-scratch N-row batched-decode buffers and the
-    /// per-(slot,CSA-layer) DSA key-cache band. The FP8 MLA KV arena is drawn from
-    /// the shared pool, never the per-slot divisor.
     /// Verify rows a slot can ever be asked for: DSpark verifies its block plus
     /// the anchor, MTP a depth-clamped chain plus the anchor
     /// ([`crate::executor::spec_decode`] clamps to `MAX_SPEC_DRAFT_DEPTH`).
-    /// `MAX_SPEC_VERIFY_ROWS` is the validation ceiling, not the allocation width
-    /// — sizing the per-slot scratch at it booked ~300MB/slot nothing touches, and
-    /// capped DSpark at 22 slots (#184).
+    /// `MAX_SPEC_VERIFY_ROWS` is the validation ceiling, not the allocation
+    /// width — sizing the per-slot scratch at it booked ~300MB/slot nothing
+    /// touches, and capped DSpark at 22 slots (#184).
     pub(crate) fn spec_verify_rows(&self) -> usize {
         let rows = if self.config.is_dspark() {
             self.config.dspark_block_size + 1
@@ -547,7 +531,6 @@ impl Dsv4Model {
                 .unwrap_or(usize::MAX)
             };
             let affordable = affordable.min(pool_affordable_slots);
-            // NCCL min-reduce stays CUDA-side.
             let (planned, clamped) = infer_seam::clamp_to_affordable(requested, affordable);
             if clamped {
                 log::warn!(

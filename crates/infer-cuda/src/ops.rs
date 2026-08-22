@@ -1,8 +1,3 @@
-//! CUDA op wrappers for the dense-BF16 Qwen3 forward (HOT axis).
-//!
-//! Thin crate-private wrappers over `cuda-kernels` FFI: embedding, RMSNorm,
-//! GEMM/GEMV, add, SwiGLU, row copy, argmax, host uploads, RoPE precompute.
-
 use anyhow::{Result, anyhow, ensure};
 use cuda_kernels::prelude::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStates};
 use cuda_kernels::tensor_ops;
@@ -69,7 +64,6 @@ pub(crate) fn warm_fp4_deepgemm_dense(
 ) -> Result<bool> {
     quant_linear::warm_fp4_deepgemm_dense(ctx, weight, seq_len)
 }
-/// pointer-array batched kernel). Mirrors [`upload_i32`].
 pub(crate) fn upload_u64(ctx: &DeviceContext, values: &[u64]) -> Result<CudaSlice<u64>> {
     ctx.stream
         .clone_htod(values)
@@ -279,8 +273,6 @@ pub(crate) fn silu_mul(
     tensor_ops::silu_mul(ctx, &gate.data, &up.data, &mut out.data, n)
 }
 
-/// Split a row-fused `[seq, first + second]` buffer into two buffers (leading
-/// `first.hidden_dim` of each row → `first`, remainder → `second`).
 pub(crate) fn split2(
     ctx: &DeviceContext,
     fused: &HiddenStates,
@@ -310,7 +302,6 @@ pub(crate) fn split2(
     )
 }
 
-/// Split a row-fused `[seq, q + 2*kv]` qkv buffer into `q`/`k`/`v` buffers.
 pub(crate) fn split_qkv(
     ctx: &DeviceContext,
     qkv: &HiddenStates,
@@ -346,10 +337,7 @@ pub(crate) fn split_qkv(
     )
 }
 
-/// SwiGLU over a row-fused `[seq, 2*inter]` gate_up buffer (gate = first half
-/// of each row, up = second half): `out[seq, inter] = silu(gate) * up`. The
-/// fused layout is what a single GEMM over a rows-concatenated `[2*inter, K]`
-/// weight produces, at any seq_len.
+/// The fused layout is what a single GEMM over a rows-concatenated `[2*inter, K]` weight produces, at any seq_len.
 pub(crate) fn silu_mul_fused(
     ctx: &DeviceContext,
     gate_up: &HiddenStates,
@@ -416,13 +404,6 @@ where
     Ok(())
 }
 
-/// In-place full-buffer scaled add over the first `n` elements:
-/// `out[i] = base[i] + scale·delta[i]`. `base` (len == `n`) is first copied into
-/// `out` (len == `n`) device→device, then the `add_scaled_row` kernel folds in
-/// `scale·delta` over the buffer treated as a single row of `hidden_dim = n`.
-/// Used for the device LoRA merge `W = base + scale·(B·A)`. `delta` is generic
-/// over the buffer view so a reused (over-sized) scratch slice works; only its
-/// first `n` elements are read.
 #[cfg(test)]
 pub(crate) fn lora_scaled_add_into<B, D, O>(
     ctx: &DeviceContext,
@@ -464,9 +445,7 @@ pub(crate) fn copy_row_to_vec(
         .map_err(|e| anyhow!("D2D copy last hidden row failed: {e}"))
 }
 
-/// Copy one token row of a batch into a single-token `HiddenStates` (`seq_len ==
-/// 1`, same `hidden_dim`). The HC head needs the last stream row as a batch-of-1
-/// so the mix_fn GEMM can run on it.
+/// The HC head needs the last stream row as a batch-of-1 so the mix_fn GEMM can run on it.
 pub(crate) fn copy_row_to_hidden(
     ctx: &DeviceContext,
     batch: &HiddenStates,

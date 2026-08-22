@@ -1,5 +1,3 @@
-//! LoRA adapter types and the on-device merge/restore path for Qwen3.5/3.6.
-//!
 //! The merge path supports two base-weight formats:
 //! - **FP8 block-scaled**: the FP8 qweight/scales are kept alive in the matrix
 //!   after BF16 promotion (for the `--share-frozen-base` student alias), and

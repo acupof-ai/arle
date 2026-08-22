@@ -126,7 +126,6 @@ impl Dsv4CudaExecutor {
         (cap / 128 * 128).max(grain)
     }
 
-    /// `BackendExecutor::tp_sync_min` — see there for why the scheduler needs it.
     pub(crate) fn tp_sync_min(&self, local: usize) -> Result<usize> {
         self.tp_min_usize(local, "admission free pages")
     }

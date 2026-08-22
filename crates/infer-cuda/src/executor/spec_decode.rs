@@ -10,8 +10,8 @@ use crate::dsv4::SpecVerifySchedule;
 
 use super::{DeviceVec, Dsv4CudaExecutor};
 
-/// Which speculative-decode scheme a serve is configured for. Both CUDA
-/// executors resolve this from their own state (`dspark`/`mtp` handles).
+/// Both CUDA executors resolve this from their own state (`dspark`/`mtp`
+/// handles).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum SpecKind {
     None,
@@ -19,14 +19,12 @@ pub(super) enum SpecKind {
     Dspark,
 }
 
-/// The decode path a batch of `n_rows` should take this tick.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum DecodeRoute {
-    /// Plain batched (or single-row) decode: 1 token/row, scales with batch.
     Plain,
-    /// MTP speculative decode — c=1 / low-concurrency win.
+    /// c=1 / low-concurrency win.
     Mtp,
-    /// DSpark speculative decode — c=1 / low-concurrency win.
+    /// c=1 / low-concurrency win.
     Dspark,
 }
 
@@ -63,8 +61,6 @@ pub(super) fn route_decode(
 /// Minimum running accept-rate EMA to keep speculating. Default 0.55 = the dt=3
 /// break-even on 8xH20 TP4 (t_mtp ~68ms / t_nospec ~26ms => need >2.6 tok/step =>
 /// accept >~0.55). Override with `--mtp-min-accept` for other depths.
-/// ponytail: a fixed depth-tuned threshold; upgrade path is to self-calibrate
-/// from measured step times.
 ///
 /// Force one real spec step after this many consecutive gated skips, to refresh
 /// the acceptance EMA — else a dip below threshold never recovers (no new accept
@@ -75,9 +71,7 @@ const MTP_PROBE_INTERVAL: usize = 8;
 /// faster to an acceptance shift, noisier.
 const MTP_ACCEPT_EMA_ALPHA: f32 = 0.25;
 
-/// Pure gate decision: speculate iff running acceptance clears the break-even
-/// threshold, OR a probe is due (force one step to refresh the EMA). Pure so the
-/// money path is unit-tested without a GPU.
+/// Pure so the money path is unit-tested without a GPU.
 fn mtp_should_speculate(
     accept_ema: f32,
     skip_streak: usize,
@@ -244,10 +238,8 @@ impl DraftChain {
 }
 
 impl Dsv4CudaExecutor {
-    /// One speculative decode step: draft a top-1 chain, verify it in a single
-    /// frozen forward, accept the matching chain prefix, commit. Returns the
-    /// committed tokens (accepted drafts + the bonus) and advances the per-slot
-    /// spec state (`pending` / `hidden`).
+    /// Returns the committed tokens (accepted drafts + the bonus) and advances
+    /// the per-slot spec state (`pending` / `hidden`).
     pub(crate) fn spec_step(
         &mut self,
         slot_idx: usize,
@@ -275,13 +267,11 @@ impl Dsv4CudaExecutor {
             depth,
         )?;
 
-        // 1. Draft only the top-1 chain. `topk` samples extra candidates from
-        // each existing draft logits row; siblings are verify-only candidates,
-        // not additional MTP forwards.
+        // `topk` samples extra candidates from each existing draft logits row;
+        // siblings are verify-only candidates, not additional MTP forwards.
         let chain = self.draft_chain(slot_idx, pending, &hidden, depth, topk, start_pos)?;
         chain.validate()?;
 
-        // 2. Verify the whole chain in ONE frozen target forward.
         let tokens = chain.tokens();
         let sched = chain.verify_schedule(start_pos);
         crate::attention::set_dsv4_verify_frozen(true);
@@ -306,10 +296,9 @@ impl Dsv4CudaExecutor {
             verify.logits.seq_len
         );
 
-        // 3. Walk the verified chain logits. Target top-1 must match the chain
-        // token to extend the committed prefix. A non-chain top-k hit is still a
-        // valid bonus token, but the path stops at its parent because no later
-        // chain row was conditioned on that token.
+        // A non-chain top-k hit is still a valid bonus token, but the path
+        // stops at its parent because no later chain row was conditioned on
+        // that token.
         let (path, bonus, bonus_parent_row, topk_bonus_hit) = chain.accept_path(&verify.argmax)?;
         let accepted = path.len() - 1;
 
@@ -329,8 +318,6 @@ impl Dsv4CudaExecutor {
             );
         }
 
-        // 4. Commit: truncate, restore the rejected ring tail (draft layer-0
-        //    writes), then fold from the persisted verify rows.
         self.model
             .truncate_slot(&mut self.slots[slot_idx], &mut self.kv_adapter, start_pos)?;
         self.model.restore_spec_ring_tail(
@@ -359,26 +346,12 @@ impl Dsv4CudaExecutor {
         Ok(out)
     }
 
-    /// Cross-slot batched MTP decode step. Each slot drafts a top-1 chain; all
-    /// chain rows are verified in one batched target pass.
     /// Returns one committed-token list per input slot, index-aligned with
     /// `slot_ids`.
     ///
     /// Currently unreachable: the DSv4 gate pins to B=1 and B=1 takes the early
     /// return in `forward_decode_batch_inner`. Preserved for the batched-draft
     /// lever (#230).
-    ///
-    /// §0.1 mutated state (per slot s, looped — no cross-slot aliasing; each
-    /// `Dsv4SlotState` owns its rings):
-    /// - `slots[s]` SW/FP8 rings: snapshot pre-draft (`capture_spec_rings`),
-    ///   rejected tail restored post-accept (`restore_spec_ring_tail`) — looped
-    ///   per slot, the PROVEN per-row calls (NOT a batched snapshot).
-    /// - `slots[s].seq_len` + accepted KV `[start_pos .. start_pos+accepted]`:
-    ///   written by the per-slot commit fold from persisted verify rows.
-    /// - `spec_slots[s].pending` / `.hidden`: set to the bonus token + the
-    ///   accepted chain row's MTP stream hidden.
-    /// - `slot.spec_normed`: the batched verify scatters each slot's chain rows
-    ///   into that slot's own fold cache.
     pub(crate) fn spec_step_batched(
         &mut self,
         slot_ids: &[usize],
@@ -394,7 +367,6 @@ impl Dsv4CudaExecutor {
         let depth = self.spec_depth();
         let topk = self.spec_topk();
 
-        // ── 1. Per-slot pre-draft ring capture, then draft the N chains.
         // Ring capture is per-slot (cheap host snapshot, never batched). Draft
         // runs `depth` batched `mtp_forward_level` calls, one per level.
         let mut scheds: Vec<SpecVerifySchedule> = Vec::with_capacity(n);
@@ -461,9 +433,7 @@ impl Dsv4CudaExecutor {
             scheds.push(chains[s].verify_schedule(start_positions[s]));
         }
 
-        // ── 2. ONE batched verify over the N chains (MoE grouped over all rows,
-        // attention currently runs once per slot chunk, not once per row). The
-        // verify persists per-slot spec_normed for the commit fold.
+        // The verify persists per-slot spec_normed for the commit fold.
         let chain_tokens: Vec<Vec<u32>> = chains.iter().map(DraftChain::tokens).collect();
         let (verified, _verify_logits) = self.model.forward_decode_batch_verify(
             &mut self.slots,
@@ -479,8 +449,8 @@ impl Dsv4CudaExecutor {
             verified.len()
         );
 
-        // ── 3. Per-slot accept / ring-restore / fold commit. The batched verify
-        // above is the amortized phase; commit stays the proven per-slot fold.
+        // The batched verify above is the amortized phase; commit stays the
+        // proven per-slot fold.
         let mut out = Vec::with_capacity(n);
         for (s, (argmax, mut hiddens)) in verified.into_iter().enumerate() {
             let slot_idx = slot_ids[s];
@@ -537,10 +507,9 @@ impl Dsv4CudaExecutor {
         Ok(out)
     }
 
-    /// The draft depth for this step: the explicit `--mtp-draft-tokens` request,
-    /// clamped to `[1, MAX_SPEC_DRAFT_DEPTH]`. The CLI flag is the single source
-    /// of truth; the clamp to the snapshot ceiling keeps an over-large request safe-by-construction
-    /// rather than overflowing the per-slot spec-ring buffers.
+    /// The CLI flag is the single source of truth; the clamp to the snapshot
+    /// ceiling keeps an over-large request safe-by-construction rather than
+    /// overflowing the per-slot spec-ring buffers.
     fn spec_depth(&self) -> usize {
         self.spec_draft_tokens
             .unwrap_or(crate::dsv4::DEFAULT_SPEC_DRAFT_DEPTH)
@@ -557,9 +526,8 @@ impl Dsv4CudaExecutor {
         self.spec_draft_tokens.is_some() || self.spec_draft_topk.is_some() || self.dspark.is_some()
     }
 
-    /// Fold one spec step's acceptance (accepted/`depth`) into the running EMA and
-    /// clear the skip streak. Drives the adaptive gate; B=1 only — the batched
-    /// path is a win and is never gated, so it does not perturb this EMA.
+    /// Drives the adaptive gate; B=1 only — the batched path is a win and is
+    /// never gated, so it does not perturb this EMA.
     fn mtp_note_accept(&mut self, accepted: usize, depth: usize) {
         let rate = if depth > 0 {
             accepted as f32 / depth as f32
@@ -571,8 +539,7 @@ impl Dsv4CudaExecutor {
         self.mtp_skip_streak = 0;
     }
 
-    /// Adaptive gate (B=1): true when MTP should be skipped for a warm no-spec
-    /// step this decode. Off unless `--mtp-adaptive` is set.
+    /// Off unless `--mtp-adaptive` is set.
     pub(super) fn mtp_adaptive_skip(&self) -> bool {
         crate::runtime_flags::mtp_adaptive()
             && !mtp_should_speculate(

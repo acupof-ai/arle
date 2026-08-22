@@ -1,20 +1,14 @@
-//! The MTP draft head: one frozen-KV draft level and its candidate selection.
-
 use super::layer_block::HcHalf;
 use super::*;
 
-/// One draft row to expand in an MTP head pass ([`Dsv4Model::mtp_forward_level`]).
 pub(crate) struct MtpDraftRow {
     pub token: u32,
 }
 
 impl Dsv4Model {
-    /// Draft one MTP matrix level. `rows` is the draft batch for this level
-    /// (`m == 1` single-slot; one row per slot for the cross-slot batched draft).
-    /// `slot_ids[r]` selects row `r`'s KV slot; `positions[r]` is its draft
-    /// position. Returns per row: top-k candidate tokens (highest first) + the
-    /// wide MTP stream the next draft row branches from. Candidates come from k
-    /// rounds of device argmax + mask — no full-vocab D2H.
+    /// Returns per row: top-k candidate tokens (highest first) + the wide MTP
+    /// stream the next draft row branches from. Candidates come from k rounds
+    /// of device argmax + mask — no full-vocab D2H.
     pub(crate) fn mtp_forward_level(
         &self,
         slots: &mut [Dsv4SlotState],
@@ -61,7 +55,7 @@ impl Dsv4Model {
         let ctx = &self.ctx;
         let mut keepalive = Dsv4ForwardKeepalive::new(false);
 
-        // ── h' = e_proj(enorm(emb(token))) + h_proj(hnorm(h_prev)), batched.
+        // h' = e_proj(enorm(emb(token))) + h_proj(hnorm(h_prev)), batched.
         let token_ids_host: Vec<i32> = rows.iter().map(|r| r.token as i32).collect();
         let token_ids = crate::ops::upload_i32(ctx, &token_ids_host)?;
         // SAFETY: embedding_batch writes the full [m, hidden_size] buffer.
@@ -336,8 +330,6 @@ impl Dsv4Model {
         Ok(out)
     }
 
-    /// Batched device argmax over `[m, vocab]` verifier logits — one launch,
-    /// one D2H of m target top-1 ids.
     pub(super) fn mtp_argmax_batch(&self, logits: &HiddenStates) -> Result<Vec<u32>> {
         let ctx = &self.ctx;
         let m = logits.seq_len;
@@ -362,7 +354,6 @@ impl Dsv4Model {
             .collect()
     }
 
-    /// Batched device top-k over `[m, vocab]` logits, highest-first per row.
     /// Masks each selected id to `-inf` in the caller's logits scratch.
     pub(super) fn mtp_topk_device(
         &self,

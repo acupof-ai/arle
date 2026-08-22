@@ -127,8 +127,6 @@ pub(crate) fn detect_quant_format(
             format: QuantFormat::DenseF32,
             scale_names: Vec::new(),
         },
-        // GPTQ/AutoRound W4A16: qweight (I32 [k//8, n]), scales (BF16 [groups, n]),
-        // qzeros (I32 [groups, n//8]). Converted to ARLE W4A16 layout at load time.
         Dtype::I32
             if tensors.contains_key(&format!("{base}.scales"))
                 && tensors.contains_key(&format!("{base}.qzeros")) =>
@@ -186,10 +184,7 @@ pub(crate) fn detect_quant_format(
                 ],
             }
         }
-        // FP8 per-channel (compressed-tensors float-quantized): F8_E4M3 weight
-        // with a [N,1] weight_scale, no input_scale (dynamic activation quant
-        // at runtime). Mapped to Fp8BlockScaled with block_m=1, block_k=K —
-        // the block-scale GEMV indexes scales[row] directly.
+        // Mapped to Fp8BlockScaled with block_m=1, block_k=K: the block-scale GEMV indexes scales[row] directly.
         Dtype::F8_E4M3
             if tensors.contains_key(&format!("{base}.weight_scale"))
                 && !tensors.contains_key(&format!("{base}.input_scale"))
@@ -491,7 +486,6 @@ pub(crate) fn validate_scale_shapes(
                 k
             );
             let num_groups = k / group_size;
-            // scales: BF16 or F16 [num_groups, n]
             let scales = tensor_by_name(tensors, &view.scale_names[0])?;
             ensure!(
                 scales.dtype == Dtype::BF16 || scales.dtype == Dtype::F16,
@@ -507,7 +501,6 @@ pub(crate) fn validate_scale_shapes(
                 num_groups,
                 n
             );
-            // qzeros: I32 [num_groups, n//8]
             let qzeros = tensor_by_name(tensors, &view.scale_names[1])?;
             ensure!(
                 qzeros.dtype == Dtype::I32,

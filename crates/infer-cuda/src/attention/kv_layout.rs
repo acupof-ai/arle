@@ -324,8 +324,6 @@ impl Dsv4CompressorFp32Scratch {
     }
 }
 
-/// Max FP32-probe row width over every compressor that can be probed; 0 ⇔ no probing
-/// layer.
 pub(crate) fn dsv4_compressor_fp32_max_width(
     config: &DeepSeekV4Config,
     layers: impl IntoIterator<Item = (DeepSeekV4AttentionMode, usize)>,
@@ -449,15 +447,12 @@ pub(crate) struct Dsv4LayerKvLayout {
     /// `slot_idx × slot_bytes` arithmetic.
     pub(super) flashmla_kv_pool: Option<TokenKVPool>,
     pub(super) dsa_key_cache: Option<CudaSlice<u8>>,
-    /// Every slot's MAX block-table length (`sw_blocks + comp_blocks` for this layer's
-    /// shape).
     pub(super) flashmla_slot_pages: usize,
     pub(super) flashmla_page_bytes: usize,
     /// Comp pages come from the pool free list as the sequence grows; false = the V32
     /// identity
     /// full band, whose pack lane needs band-base contiguity.
     pub(super) flashmla_demand_paged: bool,
-    /// Ring blocks at the band's logical head (`[0, sw_blocks)`).
     pub(super) flashmla_sw_blocks: usize,
     /// Tokens one comp page covers; 0 = no comp region (SlidingWindow-only layer).
     pub(super) flashmla_comp_tokens_per_page: usize,
@@ -784,7 +779,6 @@ impl Dsv4KvAdapter {
                 num_slots,
                 &layer_shapes,
             )?);
-            // Worst-case-sized across all FlashMLA layers.
             let single = Dsv4FlashMlaDecodeScratch::new(ctx, config, &layer_shapes)?;
             (batch, Some(single))
         } else {
@@ -1106,8 +1100,6 @@ impl Dsv4KvAdapter {
         (pages > 0).then_some(pages)
     }
 
-    /// Materialize `slot`'s band for a prefix restore at `seq_len` matched tokens;
-    /// cursor set to `seq_len`.
     pub(crate) fn mirror_full_band(
         &mut self,
         ctx: &DeviceContext,
@@ -1496,7 +1488,6 @@ impl Dsv4LayerKvLayout {
             .ok_or_else(|| anyhow!("DSv4 FlashMLA shared pool missing"))
     }
 
-    /// Whole-pool data plane (packed records live in the K plane only).
     pub(super) fn flashmla_pool_data(&self) -> Result<&CudaSlice<u8>> {
         Ok(self.flashmla_pool()?.k_data_slice(0))
     }

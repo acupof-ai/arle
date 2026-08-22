@@ -1,6 +1,3 @@
-//! Buffers whose lifetime is exactly one forward: deferred-free retention and
-//! the persistent spec-verify scratch.
-
 use super::*;
 
 pub(super) struct Dsv4SpecVerifyScratch {
@@ -112,8 +109,6 @@ impl Dsv4SpecVerifyLayerScratch {
     }
 }
 
-/// Explicit lifetime owner for DSv4 eager forward temporaries.
-///
 /// `DeviceContext` disables cudarc's implicit event tracking, so without an owner
 /// living until the final host-sync sample, Rust can drop and reuse allocations
 /// the stream still reads. Default-off: `CudaSlice::clone()` is a device-to-device

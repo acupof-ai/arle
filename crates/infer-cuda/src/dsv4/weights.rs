@@ -1,6 +1,3 @@
-//! The on-device DSv4 weight tree: one struct per weight sub-block, plus the
-//! forwards and config derivations that read only weights.
-
 use super::*;
 
 /// Compressor sub-block for CSA/HCA layers (`compress_ratio > 0`): projects the
@@ -211,8 +208,8 @@ pub(crate) struct Dsv4DenseMlp {
     pub intermediate: usize,
 }
 
-/// One DSv4 transformer layer. `mode` records the attention variant (SW / CSA /
-/// HCA) the forward dispatches on.
+/// `mode` records the attention variant (SW / CSA / HCA) the forward dispatches
+/// on.
 pub(crate) struct Dsv4Layer {
     pub hc_attn: Dsv4HyperConnection,
     pub hc_ffn: Dsv4HyperConnection,
@@ -261,16 +258,13 @@ pub(crate) struct Dsv4DsparkStage {
     pub confidence_proj: Option<DeviceMatrix>,
 }
 
-/// The full 3-stage DSpark draft (`stages[0]` = `mtp.0` … `stages[n-1]` =
-/// `mtp.{n-1}`), loaded from a DSpark checkpoint by [`load_dspark_draft`].
 #[allow(dead_code)]
 pub(crate) struct Dsv4DsparkDraft {
     pub stages: Vec<Dsv4DsparkStage>,
 }
 
-/// GLM dense layer (`config.per_layer_dense_mlp[i]`) forward: a plain SwiGLU FFN
-/// replacing the routed-expert + shared-expert MoE, bf16 throughout. `out` must
-/// be `[hidden, tok]` (== `x` hidden); the caller folds it into the residual.
+/// `out` must be `[hidden, tok]` (== `x` hidden); the caller folds it into the
+/// residual.
 pub(super) fn dsv4_dense_mlp_forward(
     ctx: &DeviceContext,
     dense: &Dsv4DenseMlp,
@@ -302,7 +296,6 @@ pub(super) fn dsv4_dense_mlp_forward(
     keepalive.keep_hidden(&up);
     // GLM dense uses plain SiLU(gate)*up with NO clamp (into_deepseek_v4 sets
     // swiglu_limit=0.0, which the clamped kernel rejects).
-    // ponytail: pod-verify GLM dense FFN activation = silu(gate)*up (unclamped)
     let _ = swiglu_limit;
     // SAFETY: uninit device scratch; fully written before first read.
     let mut act = unsafe { HiddenStates::uninit(ctx, inter, tok)? };
@@ -313,7 +306,6 @@ pub(super) fn dsv4_dense_mlp_forward(
 }
 
 impl Dsv4Model {
-    /// MoE config built from the DSv4 router fields (sqrtsoftplus + noaux_tc).
     pub(crate) fn moe_config_from_config(config: &DeepSeekV4Config) -> Result<MoeConfig> {
         let moe = MoeConfig::dsv4(
             config.n_routed_experts,

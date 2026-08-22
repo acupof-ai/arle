@@ -89,7 +89,6 @@ enum DeepEpMode {
 }
 
 impl DeepEpTransport {
-    /// `true` when the LL token-owned path is selected.
     pub(crate) fn is_low_latency(&self) -> bool {
         self.ll.is_some()
     }
@@ -482,8 +481,6 @@ impl DeepEpTransport {
             .combine(&params)
             .map_err(|e| anyhow!("DeepEP combine failed: {e}"))
     }
-
-    // ── NVSHMEM low-latency (token-owned) path ─────────────────────────────
 
     fn ll(&self) -> Result<&DeepEpLlBuffer> {
         self.ll

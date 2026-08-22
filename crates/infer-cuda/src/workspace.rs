@@ -40,7 +40,6 @@ use anyhow::{Result, anyhow};
 use cuda_kernels::prelude::{DeviceContext, DeviceVec, HiddenStates};
 use cudarc::driver::{CudaSlice, DevicePtrMut, DeviceRepr, ValidAsZeroBits};
 
-/// One cached [`HiddenStates`] buffer (`[hidden_dim, seq_len]` bf16).
 #[derive(Default)]
 pub(crate) struct HiddenSlot(Option<HiddenStates>);
 
@@ -93,7 +92,6 @@ impl HiddenSlot {
     }
 }
 
-/// One cached [`DeviceVec`] buffer (`[len]` bf16).
 #[derive(Default)]
 pub(crate) struct VecSlot(Option<DeviceVec>);
 
@@ -170,8 +168,6 @@ impl<T: DeviceRepr + ValidAsZeroBits> SliceSlot<T> {
         self.upload(ctx, host)
     }
 
-    /// Upload `host` into the slot (H2D copy into the reused buffer when the
-    /// length matches; alloc + copy otherwise). Replaces per-call `clone_htod`.
     pub(crate) fn upload(&mut self, ctx: &DeviceContext, host: &[T]) -> Result<&CudaSlice<T>> {
         match &mut self.0 {
             Some(buf) if buf.len() == host.len() => {

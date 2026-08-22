@@ -1,10 +1,6 @@
-//! Token-independent per-layer pipeline pieces every DSv4 forward flavor shares:
-//! the embedding preamble and the hyper-connection pre-norm / post-fold halves.
-
 use super::*;
 
-/// Which half of a layer's hyper-connection a pre-norm / post-fold call belongs
-/// to. Selects the weights and the profile labels.
+/// Selects the weights and the profile labels.
 #[derive(Copy, Clone)]
 pub(super) enum HcHalf {
     Attn,
@@ -49,7 +45,6 @@ impl HcHalf {
 }
 
 impl Dsv4Model {
-    /// Build the per-call attention context for `layer` at `layer_idx`.
     pub(super) fn attn_ctx<'a>(
         &'a self,
         layer: &'a Dsv4Layer,
@@ -70,8 +65,7 @@ impl Dsv4Model {
         }
     }
 
-    /// Embedding lookup for `token_ids` folded into the wide `[stream_dim, seq_len]`
-    /// hyper-connection stream. `stream` must be `[stream_dim, seq_len]`.
+    /// `stream` must be `[stream_dim, seq_len]`.
     pub(super) fn embed_stream(
         &self,
         token_ids: &CudaSlice<i32>,
@@ -98,10 +92,9 @@ impl Dsv4Model {
         Ok(())
     }
 
-    /// Fused hyper-connection pre-mix + RMSNorm of the wide stream into the
-    /// `[hidden_size, seq_len]` block input. `None` ⇒ GLM (`hc_mult == 1`), where
-    /// the C identity placeholders are 1x1 ZERO mixers: `gen_mhc`/`mhc_pre` would
-    /// zero the stream, so a plain RMSNorm runs instead.
+    /// `None` ⇒ GLM (`hc_mult == 1`), where the C identity placeholders are 1x1
+    /// ZERO mixers: `gen_mhc`/`mhc_pre` would zero the stream, so a plain
+    /// RMSNorm runs instead.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn hc_pre_norm(
         &self,
@@ -115,8 +108,6 @@ impl Dsv4Model {
     ) -> Result<Option<crate::hc::MhcParams>> {
         let norm = half.norm(layer);
         let eps = self.config.rms_norm_eps;
-        // ponytail: pod-verify GLM hc_mult==1 plain residual + identity stream (no
-        // hyper-connection)
         if self.config.is_glm() {
             crate::profile::profile_op(
                 &self.ctx,
@@ -158,7 +149,6 @@ impl Dsv4Model {
         Ok(Some(mhc))
     }
 
-    /// Fold a block's `[hidden_size, seq_len]` output back into the wide stream.
     /// `mhc == None` ⇒ GLM plain residual (`stream_dim == hidden_size`).
     #[allow(clippy::too_many_arguments)]
     pub(super) fn hc_post_fold(

@@ -1,12 +1,9 @@
-//! Whole-slot spill tier (host DRAM plus opt-in NVMe) and its counters: a
-//! demoted slot's complete device image out and back.
-
 use super::*;
 
 impl Dsv4CudaExecutor {
-    /// Attach the opt-in NVMe disk spill level (pre-serve only). The cap is
-    /// soft: over it, publish drops the oldest entries — capacity never blocks
-    /// a forward and never enters the reuse license.
+    /// Pre-serve only. The cap is soft: over it, publish drops the oldest
+    /// entries — capacity never blocks a forward and never enters the reuse
+    /// license.
     pub(crate) fn set_kv_tier_disk(
         &mut self,
         root: std::path::PathBuf,

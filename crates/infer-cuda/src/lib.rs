@@ -1,5 +1,3 @@
-//! CUDA backend executor.
-//!
 //! [`CudaKvPool`] is the CUDA name for the backend-neutral host page manager
 //! implementing the [`KvPool`] seam. It is the SINGLE page allocator for the
 //! Qwen-dense paged path: the executor lowers each scheduled row's host page
@@ -196,8 +194,6 @@ pub struct CudaInflight {
     output: StepOutput,
 }
 
-/// CUDA backend executor.
-///
 /// `new()` is the no-GPU placeholder for host tests; the `from_*_safetensors`
 /// constructors (feature `cuda`) build the real executor.
 #[derive(Default)]
@@ -229,7 +225,6 @@ impl fmt::Debug for CudaExecutor {
 }
 
 impl CudaExecutor {
-    /// Build a CUDA executor.
     #[must_use]
     pub fn new() -> Self {
         Self {

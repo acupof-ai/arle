@@ -1,51 +1,22 @@
-//! DSpark block drafter for DeepSeek-V4-Flash CUDA speculative decode.
-//!
-//! MLA-geometry analog of the shipped Qwen3.6 DSpark draft
-//! (`crate::qwen35::dspark`). One step proposes a whole block (`block_size`
-//! positions) from a single non-causal DSv4 forward conditioned on trunk context
-//! features. Unlike Qwen, MLA has NO separate V — K and V are the SAME compressed
-//! latent (`head_dim` = NoPE + RoPE), so this caches ONE `latent_kv` per stage,
-//! not separate `k_ctx`/`v_ctx`.
-//!
-//! Stack: [`Dsv4Model::dspark_append_context`] is the ONE canonical path that
-//! fuses committed trunk taps and accumulates their compressed latent (prompt
-//! prefix at prefill, per-step anchor at decode) into every stage's `latent_kv`,
-//! each token RoPE'd at its own absolute position. [`Dsv4Model::dspark_forward_block`]
-//! then embeds the noise block and chains the 3 stages' dual-stream forwards
-//! ([`Dsv4Model::dspark_stage_forward`] — q/latent project + RoPE, append the
-//! noise block to `latent_kv`, dense MLA-latent attention, o-proj, MoE +
-//! hyper-connection as `mtp_forward_level`), then folds the exit head.
-//! [`Dsv4Model::dspark_build_proposal`] turns the block hidden into a draft chain
-//! via tied-head logits → Markov semi-AR sampling → confidence truncation.
-//! `dead_code` until the verify tranche wires a caller.
-
 use super::layer_block::HcHalf;
 use super::*;
 use cuda_kernels::attention as flash_kv;
 
 /// Per-slot draft context cache. Per stage, ONE `latent_kv` buffer (K==V) laid
-/// out `[position][head_dim]`, LINEAR from `ctx_base` (`row = abs − ctx_base`).
-/// Sized `context_capacity + block_size` (accepted context + one speculative
-/// noise block). Noise rows self-heal: rejected rows are overwritten by the next
-/// block's context/noise writes before any read.
+/// out `[position][head_dim]`, LINEAR from `ctx_base` (`row = abs − ctx_base`),
+/// sized `context_capacity + block_size`. Noise rows self-heal: rejected rows
+/// are overwritten by the next block's context/noise writes before any read.
 #[allow(dead_code)]
 pub(crate) struct Dsv4DsparkSlotState {
-    /// One compressed KV latent buffer per stage (`[cap * head_dim]` bf16).
     latent_kv: Vec<DeviceVec>,
-    /// Absolute trunk position of `latent_kv` row 0.
     ctx_base: usize,
-    /// Absolute end (exclusive) of materialized context rows; the buffer holds
-    /// `ctx_end - ctx_base` context rows before the noise block is appended.
     ctx_end: usize,
-    /// Last emitted token (the next block's anchor), staged by prefill/verify.
     pending: Option<u32>,
 }
 
 #[allow(dead_code)]
 impl Dsv4DsparkSlotState {
-    /// Allocate one latent cache per stage. `context_capacity` = per-request
-    /// context ceiling (accepted tokens the draft ever caches); `block_size` =
-    /// speculative noise block. Call only under `config.is_dspark()`.
+    /// Call only under `config.is_dspark()`.
     pub(crate) fn new(
         ctx: &DeviceContext,
         config: &DeepSeekV4Config,
@@ -69,8 +40,7 @@ impl Dsv4DsparkSlotState {
         self.rebase(0);
     }
 
-    /// Re-key the (empty) latent buffer so row 0 is absolute position `pos`. No
-    /// zeroing: stale rows are overwritten by post-rebase appends before any read.
+    /// No zeroing: stale rows are overwritten by post-rebase appends before any read.
     pub(crate) fn rebase(&mut self, pos: usize) {
         self.ctx_base = pos;
         self.ctx_end = pos;
@@ -78,24 +48,20 @@ impl Dsv4DsparkSlotState {
     }
 }
 
-/// Draft-side persistent scratch (exact-shape reuse; spec steps are serial).
-/// Fixed block-shaped hot buffers pool here so the per-block forward does not
-/// churn allocations; variable-length context buffers are allocated inline (once
-/// per stage per step) in the append path.
+/// Draft-side persistent scratch (exact-shape reuse; spec steps are serial, so
+/// the per-block forward never churns fixed-shaped allocations).
 #[derive(Default)]
 #[allow(dead_code)]
 pub(crate) struct Dsv4DsparkScratch {
-    /// RoPE'd query for the noise block `[local_width, block]`.
     q_prepped: HsSlot,
-    /// Attention output `[local_heads * head_dim, block]` — the full-latent value
-    /// side fed to `mla_oproj` (Flag #1: `local_heads*head_dim == local_width`,
-    /// matching the main model's `local_attn`).
+    /// The full-latent value side fed to `mla_oproj` (Flag #1:
+    /// `local_heads*head_dim == local_width`, matching the main model's
+    /// `local_attn`).
     attn_heads: HsSlot,
 }
 
-/// A single lazily (re)allocated `HiddenStates` slot — DSv4 analog of the Qwen
-/// executor's `HiddenSlot`. Reallocates only on a shape change (never, at fixed
-/// block/config), so steady state is one reused buffer.
+/// A single lazily (re)allocated `HiddenStates` slot. Reallocates only on a
+/// shape change (never, at fixed block/config), so steady state is one reused buffer.
 #[derive(Default)]
 struct HsSlot(Option<HiddenStates>);
 
@@ -120,20 +86,6 @@ impl HsSlot {
 }
 
 impl Dsv4Model {
-    /// One DSpark stage's dual-stream forward. Appends the noise `block` to the
-    /// stage's `latent_kv` (the committed context is already accumulated there by
-    /// prior [`Dsv4Model::dspark_append_context`] calls), runs dense non-causal
-    /// MLA-latent attention over the whole `[accumulated context ++ block]` range,
-    /// and returns the stage's HC output stream `[stream_dim, block]` (after MoE +
-    /// HC), ready to feed the next stage.
-    ///
-    /// `stream_in` = the noise block's HC stream `[stream_dim, block]`.
-    /// `block_tokens` = anchor+draft ids (MoE hash routing; unused for the draft's
-    /// `LearnedBias` layers). `block_abs` = the block's absolute trunk position
-    /// (noise block Q/K RoPE at `block_abs + [0..block)`). The noise block writes
-    /// at buffer offset `df.ctx_end - df.ctx_base` WITHOUT advancing `ctx_end`
-    /// (rejected/next-block writes overwrite it before any read). Attention math
-    /// lives in the pod-stubbed FFI — this only wires shapes/pointers.
     #[allow(dead_code)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn dspark_stage_forward(
@@ -223,7 +175,6 @@ impl Dsv4Model {
         crate::attention::dsv4_linear(ctx, &attention.wq_b, &c_q_normed, &mut q_raw)?;
         keepalive.keep_hidden(&q_raw);
 
-        // the single compressed K==V latent.
         // SAFETY: dsv4_linear writes the full buffer.
         let mut kv_raw = unsafe { HiddenStates::uninit(ctx, head_dim, block)? };
         crate::attention::dsv4_linear(ctx, &attention.wkv, &attn_normed, &mut kv_raw)?;
@@ -269,8 +220,6 @@ impl Dsv4Model {
             )?;
         }
 
-        // Dense non-causal MLA-latent attention over [context ++ block]: every
-        // block row attends the whole kv_len range; K==V head-shared latent.
         let kv_len = (block_start + block) - df.ctx_base;
         let attn_heads = scratch.attn_heads.get(ctx, local_heads * head_dim, block)?;
         {
@@ -334,7 +283,6 @@ impl Dsv4Model {
         keepalive.keep_hidden(&attn_out);
         keepalive.keep_hidden(&attn_stream);
 
-        // identical to mtp_forward_level.
         // SAFETY: uninit device scratch; fully written before first read.
         let mut ffn_normed = unsafe { HiddenStates::uninit(ctx, hidden_size, block)? };
         let ffn_mhc = self.hc_pre_norm(
@@ -395,27 +343,14 @@ impl Dsv4Model {
         Ok(ffn_stream)
     }
 
-    /// The 3-stage DSpark backbone (`mtp.0 → mtp.1 → mtp.2`). Builds the noise
-    /// block's HC stream ONCE, chains every stage's dual-stream forward
-    /// ([`Dsv4Model::dspark_stage_forward`]) over the accumulated context latent,
-    /// then folds the exit head. Returns `block_hidden` `[hidden, block]`
-    /// (base-embed logits are the next tranche).
-    ///
-    /// The committed context (prompt prefix + accepted decode tokens) is seeded
-    /// into `df.latent_kv` by [`Dsv4Model::dspark_append_context`] BEFORE this
-    /// call; the backbone only appends the transient noise block and does NOT
-    /// advance `df.ctx_end` (the noise self-heals).
-    ///
-    /// `attn_states` = one caller-provisioned [`Dsv4LayerAttentionState`] per stage
-    /// (no per-block alloc — spec steps are serial). `anchor` = the last accepted
-    /// token (noise block position 0).
-    ///
-    /// `block_abs` = the block's ABSOLUTE trunk position (executor `verify_pos =
-    /// start_pos + 1`). RoPE runs in the absolute frame (decoupled from the
-    /// draft-local `latent_kv` write offset): the noise block Q/K at
-    /// `block_abs + [0..block)`; each accumulated context token was RoPE'd at its
-    /// OWN absolute position by `dspark_append_context`, so the context→block
-    /// relative offsets the draft attends are the true trunk distances.
+    /// The 3-stage DSpark backbone. The committed context (prompt prefix +
+    /// accepted decode tokens) must already be seeded into `df.latent_kv` by
+    /// [`Dsv4Model::dspark_append_context`]; the backbone only appends the
+    /// transient noise block and does NOT advance `df.ctx_end` (the noise
+    /// self-heals). `block_abs` = the block's ABSOLUTE trunk position: RoPE runs
+    /// in the absolute frame, decoupled from the draft-local `latent_kv` write
+    /// offset, so the context→block relative offsets the draft attends are the
+    /// true trunk distances.
     #[allow(dead_code)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn dspark_forward_block(
@@ -519,15 +454,10 @@ impl Dsv4Model {
     }
 
     /// THE canonical context-append path. Fuses `rows` committed tokens' trunk
-    /// taps into per-token context features and appends their compressed latent to
-    /// EVERY stage's `latent_kv`, RoPE'ing each token at its OWN absolute trunk
-    /// position `start_abs + j` (the geometry invariant). `taps` = `n_taps`
-    /// wide-HC-stream captures, each `[stream_dim * rows]` token-major; `rows` =
-    /// number of committed tokens; `start_abs` = the absolute trunk position of
-    /// tap row 0. Advances `df.ctx_end` by `rows`.
-    ///
-    /// Prefill seeds the prompt; decode appends the anchor-forward row before
-    /// drafting, then the verified anchor plus accepted draft rows after verify.
+    /// taps into per-token context features and appends their compressed latent
+    /// to EVERY stage's `latent_kv`, RoPE'ing each token at its OWN absolute
+    /// trunk position `start_abs + j` (the geometry invariant). Advances
+    /// `df.ctx_end` by `rows`.
     #[allow(dead_code)]
     pub(crate) fn dspark_append_context(
         &self,
@@ -554,7 +484,7 @@ impl Dsv4Model {
             draft.stages.len()
         );
 
-        // Fuse all committed tokens at once. Each tap's HC lanes are mean-reduced
+        // Fuse all committed tokens at once: each tap's HC lanes are mean-reduced
         // before the taps are concatenated for main_proj.
         let stage0 = &draft.stages[0];
         let main_proj = stage0
@@ -687,12 +617,11 @@ impl Dsv4Model {
         Ok(())
     }
 
-    /// Compute the compressed latent for hidden-wide `feats` via
-    /// `wkv → kv_norm → partial-RoPE`, writing it into the draft-local buffer
-    /// `latent_kv[start..start+rows]` (offset `(start - ctx_base) * head_dim`) with
-    /// each row RoPE'd at its own absolute position `positions[row]` (decoupled
-    /// from the write offset). Context rows carry no query, so a discarded dummy q
-    /// is driven through the fused prep kernel (which requires q heads).
+    /// Writes the compressed latent for `feats` into the draft-local buffer
+    /// `latent_kv[start..start+rows]`, each row RoPE'd at its own absolute
+    /// position `positions[row]` (decoupled from the write offset). Context rows
+    /// carry no query, so a discarded dummy q is driven through the fused prep
+    /// kernel (which requires q heads).
     fn dspark_append_latent(
         &self,
         df: &mut Dsv4DsparkSlotState,
@@ -777,22 +706,13 @@ impl Dsv4Model {
 // head = `AcceptRatePredictor` (`proj = Linear(in_dim, 1)`, no bias in this
 // checkpoint) — `sigmoid(logit) < threshold` gives the dynamic draft length.
 
-/// Proposal from one DSpark block draft. `chain[0]` = anchor, `chain[1..]` = the
-/// drafted tokens surviving confidence truncation (`draft_len`). Consumed by the
-/// verify path: `chain` feeds [`Dsv4Model::forward_tokens_verify`] as `tokens`.
 #[allow(dead_code)]
 pub(crate) struct Dsv4DsparkProposal {
-    /// Verify input ids `[anchor, d0 .. d_{L-1}]` (len == `draft_len + 1`).
     pub chain: Vec<u32>,
-    /// Number of drafted tokens `L` surviving confidence truncation.
     pub draft_len: usize,
 }
 
 impl Dsv4Model {
-    /// Turn the backbone's `block_hidden` `[hidden, block]` (from
-    /// [`Dsv4Model::dspark_forward_block`]) into a proposed draft-token block:
-    /// tied-head base logits → Markov semi-AR L→R sampling → confidence truncation.
-    /// `dead_code` until the verify wiring calls it.
     #[allow(dead_code)]
     pub(crate) fn dspark_build_proposal(
         &self,
@@ -824,9 +744,9 @@ impl Dsv4Model {
         let mut base_logits = unsafe { HiddenStates::uninit(ctx, vocab, block)? };
         self.lm_head_project_batch(block_hidden, &mut base_logits)?;
 
-        // Markov semi-AR L→R: step bias = markov_w2 · markov_w1[prev], added to the
-        // base row; sample via the shared DSv4 sampler; feed the sampled token as
-        // the next step's prev. First prev = anchor.
+        // Markov semi-AR L→R: step bias = markov_w2 · markov_w1[prev], added to
+        // the base row; the sampled token feeds the next step's prev. First prev
+        // = anchor.
         let markov = exit.markov_w1.as_ref().zip(exit.markov_w2.as_ref());
         let params = SamplingParams {
             temperature,
