@@ -133,8 +133,8 @@ fn cuda_marlin_fp4_dequant_matches_group_layout() {
 /// the same packed buffer.
 #[test]
 fn cuda_marlin_fp4_dequant_matches_the_serving_gemm() {
-    use cuda_kernels::quant_linear as cuda_ql;
     use cuda_kernels::bf16;
+    use cuda_kernels::quant_linear as cuda_ql;
 
     // Non-power-of-two scales across the full E4M3 range, so the flush and the
     // S0E5M3 rounding both engage the way they do on a real checkpoint.
