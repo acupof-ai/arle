@@ -1,6 +1,7 @@
 //! Tensor-parallel runtime config + communicator handle. Sharding math lives in
 //! `infer-topo`; `world_size == 1` is the no-op path.
 
+#[cfg(feature = "cuda")]
 use cuda_kernels::tensor::CudaPipelineStreamKind;
 use infer_topo::TpConfig;
 
@@ -416,6 +417,7 @@ impl TpRuntime {
     /// on. One-shot always uses the compute stream (small-message fast path).
     /// `Comm` brackets with compute↔comm fences; `Compute` is unfenced for
     /// callers that overlap the AR with comm-stream work (dsv4 shared expert).
+    #[cfg(feature = "cuda")]
     pub fn all_reduce_sum_on(
         &self,
         ctx: &cuda_kernels::prelude::DeviceContext,
@@ -700,6 +702,7 @@ impl TpRuntime {
     /// and every cp-group rank calls with the same `sendcount`. The caller
     /// must fence `comm_waits_for_compute` before the op and
     /// `compute_waits_for_comm` before the first compute reading `recvbuf`.
+    #[cfg(feature = "cuda")]
     #[cfg_attr(not(feature = "nccl"), allow(unused_variables))]
     pub unsafe fn attn_cp_all_gather_bf16_unfenced(
         &self,
@@ -741,6 +744,7 @@ impl TpRuntime {
     /// `comm_waits_for_compute` before the first op reading a compute-written
     /// buffer and `compute_waits_for_comm` before the first compute reading a
     /// comm-written buffer.
+    #[cfg(feature = "cuda")]
     #[cfg_attr(not(feature = "nccl"), allow(unused_variables))]
     pub unsafe fn attn_cp_send_unfenced(
         &self,
@@ -778,6 +782,7 @@ impl TpRuntime {
     ///
     /// `buf` must be writable for `count` elements of `dtype`; the peer must
     /// post the matching send.
+    #[cfg(feature = "cuda")]
     #[cfg_attr(not(feature = "nccl"), allow(unused_variables))]
     pub unsafe fn attn_cp_recv_unfenced(
         &self,
@@ -816,6 +821,7 @@ impl TpRuntime {
     ///
     /// Every cp-group rank calls with the same `count`/`dtype`/`root`; `buf`
     /// must hold `count` elements and stay valid until the op completes.
+    #[cfg(feature = "cuda")]
     #[cfg_attr(not(feature = "nccl"), allow(unused_variables))]
     pub unsafe fn attn_cp_broadcast_unfenced(
         &self,
