@@ -988,6 +988,19 @@ impl Tape {
                         return_filter,
                     )?;
                 }
+                if accumulate_into_store && entry.op == BackwardOp::Checkpoint {
+                    // A layer's param grads are complete once its checkpoint arm
+                    // ran; park them on host so they stop accumulating in VRAM
+                    // across the remaining layers (LoRA f32 grads, ~144 MiB/layer).
+                    for &input_id in &entry.input_ids {
+                        if entry_by_output.contains_key(&input_id) {
+                            continue;
+                        }
+                        if let Some(grad_id) = store.get(input_id).and_then(|t| t.grad) {
+                            store.offload_to_host(grad_id)?;
+                        }
+                    }
+                }
                 let keep_output_grad =
                     return_filter.is_some_and(|targets| targets.contains(&entry.output_id));
                 let release_output_grad = (accumulate_into_store || return_filter.is_some())
