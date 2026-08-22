@@ -1020,14 +1020,6 @@ impl Qwen35CudaExecutor {
         self.full_attn_kv.is_some()
     }
 
-    /// Gates the whole-step decode graph (persistent page table is BF16-only) and the
-    /// DSpark batched draft.
-    fn paged_kv_bf16(&self) -> bool {
-        self.full_attn_kv
-            .as_ref()
-            .is_some_and(|p| p.format == KVFormat::BF16)
-    }
-
     /// Actual pool page count, so the host admission pool mirrors the device 1:1.
     /// `None` only if the pool was dropped (OPD offload).
     pub(crate) fn full_attn_pool_pages(&self) -> Option<usize> {
@@ -2354,14 +2346,12 @@ impl Qwen35CudaExecutor {
         use super::spec_decode::{DecodeRoute, SpecKind};
         let kind = self.spec_kind();
         // Only a batched greedy DSpark draft pays above c=1: sampling loses −15.5% at
-        // c=8 and −26.4% at c=16.
-        // ponytail: batched DSpark is gated to BF16 KV; upgrade path is a quant-KV
-        // parity entry (needle gate ×3 same-config vs the BF16 baseline).
+        // c=8 and −26.4% at c=16. The draft reads its own ctx ring and the verify
+        // is the trunk's paged attention, so the KV format does not enter.
         let spec_compatible = decode_rows
             .iter()
             .all(|r| qwen_spec_decode_compatible(&r.params));
         let batched = kind == SpecKind::Dspark
-            && self.paged_kv_bf16()
             && spec_compatible
             && decode_rows.iter().all(|r| r.params.is_greedy());
         let gate = match batched {
