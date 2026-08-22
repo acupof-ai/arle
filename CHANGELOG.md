@@ -8,6 +8,7 @@ detail in the linked wins/errors entry. Oldest sections are condensed.
 
 ## [Unreleased]
 
+- First agent-OPD rollouts on an NVFP4 27B reach the model: 16/16 `edited=false` with the tool path proven working, so the gap is sustaining tool use under a long agent context rather than emitting it; see `docs/experience/wins/2026-08-23-agent-opd-nvfp4-baseline.md`.
 - **TP batched decode — default flip: the rows>1 `is_single` gate is gone (`ce190fc20`); TP decode batches go through the batched paged forward instead of B per-row forwards.** TP2 NVFP4-27B on H20: c≥2 ITL 1.55×–17.89×, aggregate 87 → 1,300 tok/s at c=32; c=1 wash; concurrent needle 54/54 exact. See `docs/experience/wins/2026-08-23-tp-batched-decode.md`.
 - Emit Anthropic `thinking` content blocks only when the client enabled extended thinking. A chat template that reasons by default was sending them to every client, which aborts Claude Code's stream and took cc-harness agent rollouts to zero reward; see `docs/experience/errors/2026-08-23-anthropic-thinking-blocks-abort-claude-code.md`.
 - **`--numa-pin` — characterized as single-rank-inert: the pin call is gated on `!cfg.is_single()` (`loader.rs:60`), so single-rank serves never pin; a same-binary A/B on Qwen3.6-35B-A3B-FP8 washed at c=1/16/32 (both arms unpinned).** Multi-rank evidence (2026-06-12, TP=8) already supports default ON; flag stays as the multi-rank opt-out. See `docs/experience/wins/2026-08-23-numa-pin-single-rank-inert.md`.
