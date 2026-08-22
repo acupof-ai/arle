@@ -58,13 +58,9 @@ pub(super) fn cuda_softmax_like(
     Ok(host)
 }
 
-// Device-resident sibling of `cuda_softmax_like`: same NVRTC kernel + same
-// 256-thread shared-mem reduction, but takes the input as a borrowed
-// `CudaSlice<f32>` and returns a fresh `CudaSlice<f32>` instead of doing
-// `upload → kernel → readback`. No `synchronize()` — the caller owns the
-// terminal eval (Tape::backward / AdamW::step_device batched flush per the
-// batched-eval contract). Reused for both `softmax_last_axis_f32` and
-// `log_softmax_last_axis_f32` (selected by `kernel_name`).
+// Device-resident sibling of `cuda_softmax_like`; no `synchronize()` — the
+// caller owns the terminal eval. Serves both softmax and log_softmax via
+// `kernel_name`.
 #[cfg(not(feature = "no-cuda"))]
 pub(super) fn cuda_softmax_like_device(
     backend: &CudaBackend,
@@ -140,12 +136,8 @@ pub(super) fn cuda_softmax_like_device(
     Ok(DeviceHandle::Cuda(CudaStorage::new(d_out)))
 }
 
-// Device-resident log_softmax
-// backward. `upstream` and `log_softmax_output` arrive as borrowed CUDA
-// slices via the `Backend::log_softmax_last_axis_backward` contract; the
-// fresh grad allocation stays device-resident and is returned unevaluated
-// for the tape's terminal eval (mirrors the forward helper pattern).
-// Same 256-thread shared-mem reduce shape as `softmax_last_axis_f32`.
+// Device-resident log_softmax backward; returned unevaluated for the tape's
+// terminal eval. Same reduce shape as `softmax_last_axis_f32`.
 #[cfg(not(feature = "no-cuda"))]
 pub(super) fn cuda_log_softmax_last_axis_backward(
     backend: &CudaBackend,
@@ -388,13 +380,9 @@ pub(super) fn cuda_argmax_last_dim(
     Ok(DeviceHandle::Cuda(CudaStorage::new(d_out)))
 }
 
-// Device-resident full reduction `out[0] = sum(x[0..size])`. Multi-pass
-// block reduce via `sum_partial_f32`: pass 1 reduces `size` elements into
-// `ceil(size/BLOCK)` partials; each subsequent pass reduces the partials the
-// same way until one element remains. Returns a 1-element device handle with
-// NO host transfer and NO `synchronize()` — the launches are enqueued on the
-// backend stream and the caller's terminal eval forces them. This is the
-// device-resident sibling of the host-reduce path `sum_all` takes.
+// Device-resident full reduction; no host transfer, no `synchronize()` —
+// the caller's terminal eval forces the passes. Sibling of the host-reduce
+// path `sum_all` takes.
 #[cfg(not(feature = "no-cuda"))]
 pub(super) fn cuda_sum_all_device(
     backend: &CudaBackend,
@@ -413,8 +401,8 @@ pub(super) fn cuda_sum_all_device(
     }
 
     // First pass reads the borrowed input slice; later passes read the
-    // previous pass's owned partial buffer. `function()` is re-fetched inline
-    // per launch (a cheap HashMap lookup) so each `&CudaFunction` borrow is
+    // previous pass's owned partial buffer. `function()` is re-fetched per
+    // launch (a cheap HashMap lookup) so each `&CudaFunction` borrow is
     // scoped to a single `launch_rows` call — mirrors `cuda_sum_squares`.
     let in_slice = backend.cuda_slice(x, "sum_all")?;
     let mut n = size;
@@ -435,7 +423,6 @@ pub(super) fn cuda_sum_all_device(
         },
     )?;
 
-    // Recursively reduce the partials until a single scalar remains.
     while blocks > 1 {
         n = blocks;
         blocks = n.div_ceil(BLOCK as usize);

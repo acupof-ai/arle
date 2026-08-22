@@ -11,9 +11,6 @@ pub(super) fn check_cuda_ffi(status: CUresult, label: &'static str) -> Result<()
     }
 }
 
-/// cuBLAS-backed matmul plus NVRTC-compiled point kernels. Holds an
-/// `Arc<CudaStream>` + `CudaBlas` so the context lives as long as the backend;
-/// safe to share across threads.
 #[cfg(not(feature = "no-cuda"))]
 pub(super) enum F32Operand<'a> {
     Borrowed(&'a CudaSlice<f32>),
@@ -117,8 +114,6 @@ pub(super) fn cuda_concat_parts<T: DeviceRepr>(
     Ok(out)
 }
 
-/// Copy batch row `row` of a batch-leading device tensor into a fresh
-/// device buffer of the same dtype (row length inferred as `len / rows`).
 #[cfg(not(feature = "no-cuda"))]
 pub(super) fn cuda_row_slice(
     backend: &CudaBackend,
@@ -145,7 +140,6 @@ pub(super) fn cuda_row_slice(
     }
 }
 
-/// Concatenate same-dtype device rows into one contiguous batch buffer.
 #[cfg(not(feature = "no-cuda"))]
 pub(super) fn cuda_concat_rows(
     backend: &CudaBackend,
@@ -534,7 +528,6 @@ impl CudaBackend {
         Ok(staging)
     }
 
-    /// First `len` elements of `buf` (identity when unpadded — no copy).
     #[cfg(not(feature = "no-cuda"))]
     pub(super) fn f32_prefix(&self, buf: CudaSlice<f32>, len: usize) -> Result<CudaSlice<f32>> {
         if buf.len() == len {
@@ -715,7 +708,6 @@ impl CudaBackend {
         }
     }
 
-    /// bf16 view of a handle: borrows bf16 storage, quantizes f32.
     #[cfg(not(feature = "no-cuda"))]
     pub(super) fn bf16_operand<'a>(
         &self,

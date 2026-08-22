@@ -59,9 +59,8 @@ pub(super) fn cuda_linear_attention_forward_device(
         return cuda_linear_attention_forward_device_row(backend, args).map(Some);
     }
 
-    // batch > 1: per-row dispatch to the proven batch==1 path. Every input and
-    // result tensor is batch-leading, so row slicing and reassembly are
-    // contiguous-range D2D copies; weights pass through whole.
+    // batch > 1: per-row dispatch to the proven batch==1 path. Tensors are
+    // batch-leading, so row slicing/reassembly are contiguous D2D copies.
     let row_params = LinearAttentionDeviceParams { batch: 1, ..p };
     let rows = (0..p.batch)
         .map(|row| {
@@ -348,8 +347,8 @@ pub(super) fn cuda_linear_attention_forward_device_row(
     let norm_weight =
         backend.cuda_slice(args.norm_weight, "linear_attention_forward norm_weight")?;
 
-    // OPD carry (None = default zero-seed). initial_state seeds final_state (→ chunk_state[0]);
-    // conv_tail feeds the conv1d boundary taps. tail_len = conv_kernel-1 rows of qkv_dim channels.
+    // OPD carry: `initial_state` seeds final_state (→ chunk_state[0]);
+    // `conv_tail` feeds the conv1d boundary taps (None = zero-seed).
     let conv_tail_len = p.conv_kernel - 1;
     let carry_state = args
         .initial_state

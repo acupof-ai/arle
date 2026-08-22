@@ -50,10 +50,9 @@ pub(super) fn cuda_adamw_step(
         backend.kernels.function("adamw_step_f32")?,
         size,
         |mut builder| {
-            // `PushKernelArg<&CudaSlice<T>>` passes the raw CUdeviceptr.
-            // The kernel parameters are mutable `float*`, so CUDA updates
-            // the existing buffers in place. This deliberately avoids
-            // cloning the `CudaSlice`: `CudaSlice::clone()` is a device copy.
+            // `PushKernelArg<&CudaSlice<T>>` passes the raw CUdeviceptr; the
+            // kernel's mutable `float*` params update the buffers in place.
+            // Deliberately no `CudaSlice::clone()` — that is a device copy.
             builder
                 .arg(param_slice)
                 .arg(m_slice)
@@ -71,9 +70,8 @@ pub(super) fn cuda_adamw_step(
         },
     )?;
 
-    // Per the Backend::adamw_step eval contract : return
-    // unevaluated handles. These are Arc clones of the same in-place
-    // buffers, not fresh allocations.
+    // Backend::adamw_step eval contract: return unevaluated handles. These
+    // are Arc clones of the same in-place buffers, not fresh allocations.
     Ok((param.clone(), m.clone(), v.clone()))
 }
 
@@ -115,8 +113,8 @@ pub(super) fn cuda_adamw_step_device(
         });
     }
 
-    // Crucially: no `clone_htod(grad)`. The grad already lives on-device;
-    // we pass the existing `&CudaSlice<f32>` straight into the kernel.
+    // No `clone_htod(grad)`: the grad already lives on-device; pass the
+    // existing `&CudaSlice<f32>` straight into the kernel.
     let n = i32::try_from(size)
         .map_err(|_| AutogradError::TapeInvariant("cuda adamw length exceeds i32"))?;
     launch_1d(
@@ -124,9 +122,9 @@ pub(super) fn cuda_adamw_step_device(
         backend.kernels.function("adamw_step_f32")?,
         size,
         |mut builder| {
-            // In-place update: see `cuda_adamw_step` above. Passing the
-            // borrowed slices avoids `CudaSlice::clone()`, which is a DtoD
-            // allocation+copy in cudarc, not an Arc ref-count bump.
+            // In-place update: see `cuda_adamw_step` above. Borrowed slices
+            // avoid `CudaSlice::clone()`, a DtoD allocation+copy in cudarc,
+            // not an Arc ref-count bump.
             builder
                 .arg(param_slice)
                 .arg(m_slice)
@@ -144,8 +142,8 @@ pub(super) fn cuda_adamw_step_device(
         },
     )?;
 
-    // Eval contract : return unevaluated; caller batches the
-    // terminal `stream.synchronize()` for the whole optimizer step.
+    // Eval contract: return unevaluated; the caller batches the terminal
+    // `stream.synchronize()` for the whole optimizer step.
     Ok((param.clone(), m.clone(), v.clone()))
 }
 

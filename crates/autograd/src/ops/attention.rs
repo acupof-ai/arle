@@ -521,7 +521,7 @@ fn causal_sdpa_recompute_backward_device_chunked(
     let v_3d = reshape(v, &[merged_heads, kv_len, head_dim], store, &mut tape)?;
     let upstream_3d = reshape(upstream, &[merged_heads, q_len, head_dim], store, &mut tape)?;
 
-    // Shared across chunks (no O(seq²) cost): k^T and v^T are `[merged_heads, *, *]`.
+    // Hoisted out of the chunk loop — recomputing per chunk is O(seq²).
     let k_t = transpose(k_3d, 1, 2, store, &mut tape)?;
     let v_t = if need_grad_q || need_grad_k {
         Some(transpose(v_3d, 1, 2, store, &mut tape)?)
@@ -559,17 +559,15 @@ fn causal_sdpa_recompute_backward_device_chunked(
             store,
             &mut tape,
         )?;
-
-        // scores/probs for this q-chunk: `[merged_heads, rows, kv_len]`.
         let scores = matmul(q_chunk_3d, k_t, store, &mut tape)?;
         let scaled = mul_scalar(scores, scale, store, &mut tape)?;
-        // Windowed causal mask `[1, rows, kv_len]`; absolute q position = q_start+q0,
-        // so a shard's local q rows attend the right prefix of the gathered KV.
+
+        // Absolute q position = q_start+q0, so a shard's local q rows attend
+        // the right prefix of the gathered KV.
         let mask = causal_mask_window(rows, kv_len, q_start + q0, store)?;
         let masked = add_broadcast(scaled, mask, store, &mut tape)?;
         let probs = softmax(masked, store, &mut tape)?;
 
-        // grad_v contribution: probs^T @ upstream_chunk → `[merged_heads, seq, head_dim]`.
         if need_grad_v {
             let probs_t = transpose(probs, 1, 2, store, &mut tape)?;
             let grad_v_part = matmul(probs_t, up_chunk_3d, store, &mut tape)?;
@@ -593,13 +591,11 @@ fn causal_sdpa_recompute_backward_device_chunked(
                     "causal_sdpa_recompute device backward missing softmax grad",
                 ))?;
 
-            // grad_q chunk: scale·(d_scores @ k) → `[merged_heads, rows, head_dim]`.
             if let Some(acc) = grad_q_3d.as_mut() {
                 let grad_q_part = matmul(d_scores, k_3d, store, &mut tape)?;
                 let grad_q_part = mul_scalar(grad_q_part, scale, store, &mut tape)?;
                 acc.write_rows(q0, grad_q_part, store)?;
             }
-            // grad_k contribution: scale·(d_scores^T @ q_chunk) → `[merged_heads, seq, head_dim]`.
             if need_grad_k {
                 let d_scores_t = transpose(d_scores, 1, 2, store, &mut tape)?;
                 let grad_k_part = matmul(d_scores_t, q_chunk_3d, store, &mut tape)?;
@@ -608,9 +604,7 @@ fn causal_sdpa_recompute_backward_device_chunked(
             }
         }
 
-        // Free this chunk's `[*, rows, seq]` transients (scores/scaled/masked/
-        // probs/d_probs/d_scores + q/upstream slices); keep only the running
-        // accumulators. Bounds peak to O(q_chunk·seq).
+        // Free this chunk's transients; bounds peak to O(q_chunk·seq).
         let keep = grad_q_3d
             .as_ref()
             .map(SeqAccum::id)
@@ -650,9 +644,8 @@ fn causal_sdpa_recompute_backward_device_chunked(
     Ok(grads)
 }
 
-/// Concatenate rank-4 `[batch, heads_i, seq, head_dim]` tensors along the
-/// head axis (axis 1). Host-only path — runs ~once per layer, not in the
-/// inner softmax loop, so correctness over speed (mirrors `slice_host_eager`).
+/// Concatenate rank-4 tensors along the head axis (axis 1). Host-only: runs
+/// ~once per layer, not in the inner softmax loop, so correctness over speed.
 pub fn cat_heads(
     inputs: &[TensorId],
     store: &mut TensorStore,
@@ -668,7 +661,7 @@ pub fn cat_heads(
         return Ok(inputs[0]);
     }
 
-    // Validate ranks + matching batch/seq/head_dim; heads may differ.
+    // Heads may differ across inputs; batch/seq/head_dim must match.
     let first_shape = store.tensor(inputs[0])?.shape.clone();
     if first_shape.len() != 4 {
         return Err(AutogradError::InvalidRank {
@@ -847,10 +840,9 @@ fn sdpa_head_chunked(
     cat_heads(&chunks, store, tape)
 }
 
-/// Concatenate two rank-4 `[batch, heads, seq_i, head_dim]` tensors along the
-/// SEQUENCE axis (axis 2). Taped: grad flows back to each input's seq slice (a
-/// `requires_grad = false` input — e.g. the OPD frozen prompt KV — is simply
-/// skipped in backward). Batch / heads / head_dim must match; only seq differs.
+/// Concatenate two rank-4 tensors along the sequence axis (axis 2). A
+/// `requires_grad = false` input (e.g. the OPD frozen prompt KV) is skipped
+/// in backward.
 pub fn cat_seq(
     a: TensorId,
     b: TensorId,

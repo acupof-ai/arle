@@ -16,9 +16,6 @@ use crate::{
     tensor::{Dirty, TensorId, TensorStore},
 };
 
-// `Dirty` is used both by the pre-existing batched-flush filter (line ~176)
-// and by the P2 device-residency gate inside `merge_grad`.
-
 #[derive(Debug, Clone)]
 #[allow(clippy::large_enum_variant)]
 pub enum SavedContext {
@@ -1143,7 +1140,6 @@ impl Tape {
         result
     }
 
-    /// Replays position-wise chunks and accumulates their gradients on device.
     fn seq_chunked_recompute_backward(
         &mut self,
         entry: &TapeEntry,
@@ -1420,11 +1416,10 @@ fn merge_grad(
             });
         }
 
-        // P2 (device-resident gradient tape): if both grads are still
-        // device-resident, fuse them with `add_into_device` so neither
-        // side gets pulled back to host. Without this, the second
-        // backward path that arrives at the same parameter would force a
-        // `to_host(new_grad_id)` and the merged sum lives only in
+        // If both grads are still device-resident, fuse them on device so
+        // neither side gets pulled back to host. Without this, the second
+        // backward path arriving at the same parameter would force a
+        // `to_host(new_grad_id)` and the merged sum would live only in
         // `existing.data` — host-resident from then on.
         let both_on_device = {
             let existing = store.tensor(existing_grad_id)?;

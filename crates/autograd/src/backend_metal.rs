@@ -2,8 +2,8 @@
 //! into `mlx_array`, call `mlx_matmul`, `mlx_eval`, copy the result back.
 //!
 //! MLX's `mx::matmul` natively supports batched (rank-3) row-major inputs,
-//! so we pass shape through unchanged. Shape validation mirrors
-//! `cpu_matmul_forward` so the trait contract stays identical.
+//! so shape passes through unchanged; validation mirrors `cpu_matmul_forward`
+//! so the trait contract stays identical.
 
 use crate::{
     AutogradError, Result,
@@ -31,10 +31,9 @@ pub(crate) fn mlx_guard() -> MutexGuard<'static, ()> {
 }
 
 // Per-process counter for every `mlx_eval` call that flows through the
-// Metal backend. Used by M5.3a acceptance tests to confirm that a
-// well-structured forward+backward step terminates in exactly one eval
-// boundary. Covers `MetalBackend::eval` as well as the legacy
-// `eval_and_readback` tail used by non-device-resident ops.
+// Metal backend, so tests can confirm that a forward+backward step
+// terminates in exactly one eval boundary. Covers `MetalBackend::eval` as
+// well as the `eval_and_readback` tail used by non-device-resident ops.
 static METAL_EVAL_COUNT: AtomicU64 = AtomicU64::new(0);
 
 /// Number of `mlx_eval` invocations performed by the Metal backend since
@@ -285,11 +284,9 @@ impl Backend for MetalBackend {
     }
 
     // Lazy right-aligned broadcast-add: MLX's `mlx_add` already implements
-    // NumPy-style right-aligned broadcasting, so the lazy path is just the
-    // same FFI call as `add` — no explicit `mlx_broadcast_to` needed.
-    // `a_shape`/`b_shape` are passed through for the host-fallback contract
-    // but ignored on Metal (MLX reads shapes off the arrays themselves).
-    // Output shape equals `a_shape`.
+    // NumPy-style right-aligned broadcasting, so this is the same FFI call
+    // as `add` — no explicit `mlx_broadcast_to`. `a_shape`/`b_shape` are
+    // passed through for the host-fallback contract but ignored on Metal.
     fn add_broadcast(
         &self,
         a: &DeviceHandle,
@@ -326,10 +323,10 @@ impl Backend for MetalBackend {
         Ok(out)
     }
 
-    // Lazy right-aligned expand via `mlx_broadcast_to` — no readback/upload. The
-    // default `broadcast_expand` round-trips src through host, which is a full
-    // sync + transfer in every GQA `repeat_kv` backward; MLX broadcasts size-1
-    // dims to `target_shape` natively and stays in the graph.
+    // Lazy expand via `mlx_broadcast_to` — no readback/upload. The default
+    // `broadcast_expand` round-trips src through host, a full sync +
+    // transfer in every GQA `repeat_kv` backward; MLX broadcasts size-1
+    // dims natively and stays in the graph.
     fn broadcast_expand(
         &self,
         src: &DeviceHandle,
@@ -359,11 +356,10 @@ impl Backend for MetalBackend {
         Ok(out)
     }
 
-    // Lazy reduce-sum-all: reshape `x` into a 1-D `[N]` view (an MLX no-op
-    // when the input is contiguous) and call `mlx_sum_axis(_, 0, keepdims=false)`
-    // to produce a rank-0 scalar that composes into MLX's lazy graph. NO
-    // `mlx_eval` here — the tape's terminal flush (`ensure_host` on the loss)
-    // is the single eval boundary.
+    // Lazy reduce-sum-all: reshape to a 1-D view (an MLX no-op when
+    // contiguous) and `mlx_sum_axis(_, 0, keepdims=false)` for a rank-0
+    // scalar in the graph. No `mlx_eval` — the tape's terminal flush is
+    // the single eval boundary.
     fn sum_all(&self, x: &DeviceHandle, shape: &[usize]) -> Result<DeviceHandle> {
         let DeviceHandle::Metal(x_handle) = x else {
             return Err(AutogradError::TapeInvariant(
@@ -401,12 +397,9 @@ impl Backend for MetalBackend {
         Ok(out)
     }
 
-    // Lazy row-wise softmax over the last axis. Composes
-    // `mlx_softmax_axis(x, -1, keepdims=true)` into the MLX graph with
-    // no `mlx_eval` — the tape's terminal flush is the single eval
-    // boundary. Mirrors the eager `mlx_softmax_like` path but skips the
-    // upload-from-host + eval+readback tail since `x` is already an MLX
-    // array.
+    // Lazy row-wise softmax over the last axis; no `mlx_eval` — the tape's
+    // terminal flush is the single eval boundary. Skips the eager path's
+    // upload + eval+readback tail since `x` is already an MLX array.
     fn softmax_last_axis(&self, x: &DeviceHandle, shape: &[usize]) -> Result<DeviceHandle> {
         let DeviceHandle::Metal(x_handle) = x else {
             return Err(AutogradError::TapeInvariant(
@@ -433,11 +426,8 @@ impl Backend for MetalBackend {
         Ok(out)
     }
 
-    // Lazy elementwise SiLU: composes `x * mlx_sigmoid(x)` into the MLX
-    // graph with no `mlx_eval`. The intermediate `sig` node is freed after
-    // the multiply; the returned handle owns the multiply result. Shape is
-    // passed through (unused on the MLX side — the output broadcasts to
-    // the input shape automatically).
+    // Lazy SiLU (`x * sigmoid(x)`) in the graph; no `mlx_eval`. The
+    // intermediate `sig` node is freed after the multiply.
     fn silu(&self, x: &DeviceHandle, _shape: &[usize]) -> Result<DeviceHandle> {
         let DeviceHandle::Metal(x_handle) = x else {
             return Err(AutogradError::TapeInvariant(
@@ -470,10 +460,7 @@ impl Backend for MetalBackend {
         Ok(out)
     }
 
-    // Lazy elementwise exp: pipes `x` through `mlx_exp` with no
-    // `mlx_eval`. The returned handle owns the exp result. Shape is
-    // passed through (unused on the MLX side — output broadcasts to the
-    // input shape).
+    // Lazy `mlx_exp` in the graph; no `mlx_eval`.
     fn exp(&self, x: &DeviceHandle, _shape: &[usize]) -> Result<DeviceHandle> {
         let DeviceHandle::Metal(x_handle) = x else {
             return Err(AutogradError::TapeInvariant(
@@ -496,11 +483,7 @@ impl Backend for MetalBackend {
         Ok(out)
     }
 
-    // Lazy elementwise sigmoid: pipes `x` through `mlx_sigmoid` with no
-    // `mlx_eval`. The returned handle owns the sigmoid result. Shape is
-    // passed through (unused on the MLX side — output matches the input
-    // shape). Qwen3.5 attention gates `gate = sigmoid(gate_proj)` once per
-    // layer × 28 layers.
+    // Lazy `mlx_sigmoid` in the graph; no `mlx_eval`.
     fn sigmoid(&self, x: &DeviceHandle, _shape: &[usize]) -> Result<DeviceHandle> {
         let DeviceHandle::Metal(x_handle) = x else {
             return Err(AutogradError::TapeInvariant(
@@ -525,17 +508,9 @@ impl Backend for MetalBackend {
         Ok(out)
     }
 
-    // Lazy scalar-broadcast multiply: composes `mlx_multiply(x, scalar)`
-    // into the MLX graph with no `mlx_eval`. The scalar is allocated as a
-    // rank-0 `mlx_array` via `mlx_array_new_float32` and freed after the
-    // multiply; MLX broadcasts rank-0 scalars across any rank. Shape is
-    // passed through (unused — output matches input shape).
-    // Elementwise `a * b` via `mlx_multiply`. Hot-path in
-    // Qwen3.5: `attn * gate` (sigmoid-gated attention, 1 per layer) and
-    // `silu(gate) * up` (MLP SwiGLU activation, 1 per layer). Shapes must
-    // match on both sides (caller validates; MLX's `mlx_multiply` actually
-    // broadcasts right-aligned but this wrapper is for the elementwise
-    // `ops::mul` which keeps shape equality as a precondition).
+    // Elementwise `a * b` via `mlx_multiply`. Shape equality is a
+    // precondition of `ops::mul` — MLX itself broadcasts right-aligned,
+    // but this wrapper does not rely on it.
     fn mul(&self, a: &DeviceHandle, b: &DeviceHandle, _shape: &[usize]) -> Result<DeviceHandle> {
         let DeviceHandle::Metal(a_handle) = a else {
             return Err(AutogradError::TapeInvariant(
@@ -594,10 +569,8 @@ impl Backend for MetalBackend {
         Ok(out)
     }
 
-    // Lazy row-wise log-softmax over the last axis. Composes
-    // `x - mlx_logsumexp_axis(x, -1, keepdims=true)` into the MLX graph
-    // with no `mlx_eval`. The intermediate `lse` node is freed after the
-    // subtract; the returned handle owns the subtract result.
+    // Lazy row-wise log-softmax (`x - logsumexp(x)`) in the graph; no
+    // `mlx_eval`. The intermediate `lse` node is freed after the subtract.
     fn log_softmax_last_axis(&self, x: &DeviceHandle, shape: &[usize]) -> Result<DeviceHandle> {
         let DeviceHandle::Metal(x_handle) = x else {
             return Err(AutogradError::TapeInvariant(
@@ -709,11 +682,9 @@ impl Backend for MetalBackend {
         mlx_rope(x, x_shape, cos, sin)
     }
 
-    // Lazy fused row-wise RMSNorm: borrows `x` as an existing MLX handle,
-    // uploads `weight` per call (typically host-resident), and returns
-    // the `mlx_fast_rms_norm` output wrapped in an `MlxHandle` without
-    // evaluating. Backward recomputes `inv_rms` host-side from the saved
-    // `x` (flushed to host by `tape.backward` before backward walks).
+    // Lazy fused RMSNorm without evaluating; `weight` is uploaded per call
+    // (typically host-resident). Backward recomputes `inv_rms` host-side
+    // from the saved `x`.
     fn rms_norm(
         &self,
         x: &DeviceHandle,
@@ -729,12 +700,10 @@ impl Backend for MetalBackend {
         mlx_rms_norm_lazy(x_handle.as_ptr(), weight, shape, eps)
     }
 
-    // Lazy half-split rotation: same graph as `mlx_rope` (slice → multiply →
-    // sub/add → concat) but borrows `x` as an existing MLX handle and skips
-    // the final `eval_and_readback`. cos/sin still upload per call from host
-    // slices — the Qwen caches are precomputed per seq length and rarely
-    // benefit from staying device-resident, and this keeps the API from
-    // needing to merge three device handles.
+    // Lazy half-split rotation; skips the eager path's eval+readback.
+    // cos/sin upload per call from host slices — the Qwen caches are
+    // precomputed per seq length and rarely benefit from staying
+    // device-resident.
     fn rope(
         &self,
         x: &DeviceHandle,
@@ -750,12 +719,9 @@ impl Backend for MetalBackend {
         mlx_rope_lazy(x_handle.as_ptr(), x_shape, cos, sin)
     }
 
-    // Lazy erf-based GELU: `0.5 * x * (1 + erf(x * INV_SQRT_2))`. Matches
-    // `ops::activation::gelu`'s CPU inline formula (NOT the tanh-approx
-    // `gelu_forward` on the trait). `gelu_backward` uses the erf-derivative
-    // against the saved input tensor, so the lazy forward must stay on
-    // the erf form or forward/backward become inconsistent by ~1e-3 per
-    // element.
+    // Lazy erf-form GELU — must stay erf, NOT the tanh approx used by the
+    // eager `gelu_forward`: `gelu_backward` uses the erf derivative, so a
+    // tanh forward would be inconsistent by ~1e-3 per element.
     fn gelu(&self, x: &DeviceHandle, _shape: &[usize]) -> Result<DeviceHandle> {
         let DeviceHandle::Metal(x_handle) = x else {
             return Err(AutogradError::TapeInvariant(
@@ -765,13 +731,10 @@ impl Backend for MetalBackend {
         mlx_gelu_erf_lazy(x_handle.as_ptr())
     }
 
-    // Lazy embedding gather: upload the tiny `[seq]` int32 id array per
-    // call (no benefit to caching — ids change every step), `mlx_take_axis`
-    // along axis 0 to pick the rows, then `mlx_reshape` from `[seq, hidden]`
-    // to `[1, seq, hidden]` to match `ops::embedding`'s batch-row
-    // convention. No eval — the whole sequence composes into the MLX
-    // graph. Backward stays on the host scatter-add path (already
-    // `mlx_scatter_add_rows_f32`-backed).
+    // Lazy embedding gather: the tiny `[seq]` int32 ids upload per call
+    // (ids change every step, no caching benefit); reshape to
+    // `[1, seq, hidden]` matches `ops::embedding`'s batch-row convention.
+    // No eval — the sequence composes into the MLX graph.
     fn embedding(
         &self,
         table: &DeviceHandle,
@@ -795,13 +758,9 @@ impl Backend for MetalBackend {
         mlx_gather_last_dim(src, src_shape, ids)
     }
 
-    // Lazy gather along the last axis. `src` is borrowed as a live MLX
-    // handle; flatten to `[prefix*vocab]`, upload the remapped flat ids
-    // (`i * vocab + ids[i]`) as a tiny int32 array, `mlx_take_axis(axis=0)`
-    // picks the chosen element per row, final `mlx_reshape` restores
-    // `src_shape[..-1]`. No eval — the whole chain composes into the MLX
-    // graph. Backward stays on the host scatter-add path (already
-    // `mlx_scatter_add_rows_f32`-backed).
+    // Lazy gather along the last axis: flatten to `[prefix*vocab]`, take
+    // the remapped flat ids, restore `src_shape[..-1]`. No eval — the
+    // chain composes into the MLX graph.
     fn gather_last_dim(
         &self,
         src: &DeviceHandle,
@@ -827,10 +786,8 @@ impl Backend for MetalBackend {
         mlx_scatter_add_rows(upstream, prefix_rows, feature_dim, indices, vocab)
     }
 
-    // Reshape is a pure metadata op on MLX — `mlx_reshape` composes
-    // into the lazy graph without triggering an eval. No new MLX primitives.
-    // Stripped `ensure_host` at ops/layout.rs → reshape now stays device-
-    // resident through q/k/v prep in every Qwen3.5 attention layer.
+    // Reshape is a pure metadata op on MLX — `mlx_reshape` composes into
+    // the lazy graph without triggering an eval.
     fn reshape(&self, x: &DeviceHandle, new_shape: &[usize]) -> Result<DeviceHandle> {
         let DeviceHandle::Metal(x_handle) = x else {
             return Err(AutogradError::TapeInvariant(
@@ -852,11 +809,9 @@ impl Backend for MetalBackend {
         }
     }
 
-    // Transpose is also free on MLX (`mlx_transpose_axes` creates a
-    // lazy view), so the whole attention-prep chain
-    // `matmul → reshape → slice → transpose → rope → matmul`
-    // now stays on the lazy graph. Permutation is identity except axis1↔axis2;
-    // MLX fuses the view into downstream GEMMs.
+    // Transpose is also free on MLX (`mlx_transpose_axes` creates a lazy
+    // view MLX fuses into downstream GEMMs), so the attention-prep chain
+    // stays on the lazy graph.
     fn transpose_axes_swap(
         &self,
         x: &DeviceHandle,
@@ -879,10 +834,8 @@ impl Backend for MetalBackend {
         let mut new_shape = old_shape.to_vec();
         new_shape.swap(axis1, axis2);
         if axis1 == axis2 {
-            // Identity: return a reshape-same-shape clone, matches the
-            // non-swap fast path in `cpu_transpose_swap`. `mlx_reshape`
-            // with identical shape is a cheap view alias; avoids a no-op
-            // permutation and keeps ownership semantics consistent.
+            // Identity: same-shape reshape alias, matching the non-swap fast
+            // path in `cpu_transpose_swap` — avoids a no-op permutation.
             let shape_i32: Vec<i32> = new_shape.iter().map(|&d| d as i32).collect();
             let _guard = mlx_guard();
             // SAFETY: x_handle is a live MlxHandle; shape_i32 matches new_shape
@@ -896,7 +849,6 @@ impl Backend for MetalBackend {
             }
             return Ok((DeviceHandle::Metal(MlxHandle::from_raw(view)), new_shape));
         }
-        // Build identity permutation then swap the two chosen axes.
         let mut perm: Vec<i32> = (0..rank as i32).collect();
         perm.swap(axis1, axis2);
         let _guard = mlx_guard();
@@ -910,16 +862,11 @@ impl Backend for MetalBackend {
                 ));
             }
             // `mlx_transpose_axes` returns a lazy non-contiguous VIEW; the
-            // raw `mlx_array_data_float32` pointer readback uses ignores
-            // strides and yields the original layout, causing a silent
-            // row-ordering parity bug against CPU. Wrap in `mlx_contiguous`
-            // so the returned handle materializes in the new layout on the
-            // next eval. MLX short-circuits `contiguous` on already-contig
-            // arrays, so the cost is zero in the common case; the copy
-            // only fires when the view IS non-contiguous (i.e. always,
-            // for a non-identity swap — but only once per logical op,
-            // the way the host-path always produced
-            // contiguous output).
+            // raw `mlx_array_data_float32` readback ignores strides and
+            // yields the original layout — a silent row-ordering parity bug
+            // against CPU. `mlx_contiguous` materializes the new layout on
+            // the next eval (short-circuits on already-contig arrays, so
+            // the copy fires only for a real swap).
             let out = mlx_contiguous(view);
             mlx_array_free(view);
             if out.is_null() {
@@ -931,16 +878,10 @@ impl Backend for MetalBackend {
         }
     }
 
-    // `mlx_slice` is a lazy view op — fuses with downstream GEMMs
-    // when the slice feeds a matmul (as in Qwen3.5's q/gate split per
-    // attention layer). Strides are all 1 since autograd's `slice` is
-    // always a contiguous window. Same view-materialization trap as
-    // transpose: the raw `mlx_array_data_float32` pointer ignores view
-    // strides/offsets, so wrap the result in `mlx_contiguous` to force
-    // a layout-correct materialization on the next eval. MLX short-
-    // circuits `contiguous` on already-contig arrays; the copy only
-    // fires when the view is non-contiguous (always, for a non-full
-    // slice — but only once per logical op).
+    // `mlx_slice` is a lazy view that fuses with a downstream GEMM. Same
+    // view-materialization trap as transpose: the raw
+    // `mlx_array_data_float32` readback ignores view strides, so wrap the
+    // result in `mlx_contiguous` (short-circuits on already-contig arrays).
     fn slice(
         &self,
         x: &DeviceHandle,
@@ -1002,26 +943,14 @@ impl Backend for MetalBackend {
         }
     }
 
-    // Lazy fused AdamW per-param update. Upload `grad` once as a flat
-    // `[size]` f32 array and compose the entire update into the MLX graph:
-    //
-    //   m' = β1·m + (1-β1)·g
-    //   v' = β2·v + (1-β2)·g²
-    //   param' = (1 - lr·wd)·param - lr·(m'/bc1) / (√(v'/bc2) + eps)
-    //
-    // Returns the three MLX graph nodes UNEVALUATED. The caller
-    // (`AdamW::step_device`) collects every param's triple and issues a
-    // single `backend.eval(&handles)` at the end of the optimizer step,
-    // so per-step eval count is `1` regardless of param count (~200 on
-    // Qwen3.5-class models). Composing independent per-param chains into
-    // one eval is safe — the updates share no sub-node.
-    //
-    // Staying Dirty::Device across steps avoids the host-loop churn of
-    // download + re-upload every param every step.
-    // Scalar constants broadcast-multiply via `mlx_array_new_float32`,
-    // the same primitive the lazy `gelu` uses for 0.5/INV_SQRT_2. No new
-    // MLX primitives introduced — `mlx_divide` does not exist in the
-    // bridge, so we reach the reciprocal via `mlx_reciprocal`.
+    // Lazy fused AdamW: the three nodes return UNEVALUATED —
+    // `AdamW::step_device` collects every param's triple and issues one
+    // `backend.eval` at the end, so per-step eval count is 1 regardless of
+    // param count (~200 on Qwen3.5-class models). Composing independent
+    // per-param chains into one eval is safe — the updates share no
+    // sub-node. Staying Dirty::Device across steps avoids the host-loop
+    // churn of download + re-upload every param every step. The reciprocal
+    // goes through `mlx_reciprocal` — the bridge has no `mlx_divide`.
     #[allow(clippy::too_many_arguments)]
     fn adamw_step(
         &self,
@@ -1081,7 +1010,6 @@ impl Backend for MetalBackend {
         // next allocation fails. Follows the same free-on-null pattern as
         // `mlx_gelu_erf_lazy` in this file.
         unsafe {
-            // Upload grad as a flat [size] f32 array.
             let grad_arr = mlx_array_from_data(
                 grad.as_ptr() as *const c_void,
                 shape_i32.as_ptr(),
@@ -1094,7 +1022,6 @@ impl Backend for MetalBackend {
                 ));
             }
 
-            // Scalar constants for the composition.
             let beta1_arr = mlx_array_new_float32(beta1);
             let one_minus_beta1 = mlx_array_new_float32(1.0_f32 - beta1);
             let beta2_arr = mlx_array_new_float32(beta2);
@@ -1147,7 +1074,6 @@ impl Backend for MetalBackend {
                 ));
             }
 
-            // m' = β1·m + (1-β1)·g
             let m_scaled = mlx_multiply(beta1_arr, m_handle.as_ptr());
             let g_scaled = mlx_multiply(one_minus_beta1, grad_arr);
             mlx_array_free(beta1_arr);
@@ -1188,7 +1114,6 @@ impl Backend for MetalBackend {
                 ));
             }
 
-            // v' = β2·v + (1-β2)·g²
             let g_sq = mlx_multiply(grad_arr, grad_arr);
             mlx_array_free(grad_arr);
             if g_sq.is_null() {
@@ -1241,7 +1166,6 @@ impl Backend for MetalBackend {
                 ));
             }
 
-            // m_hat = new_m / bc1 (multiply by precomputed reciprocal).
             let m_hat = mlx_multiply(new_m, inv_bc1);
             mlx_array_free(inv_bc1);
             if m_hat.is_null() {
@@ -1295,7 +1219,6 @@ impl Backend for MetalBackend {
                 ));
             }
 
-            // update = lr · m_hat / denom = lr · m_hat · reciprocal(denom)
             let denom_recip = mlx_reciprocal(denom);
             mlx_array_free(denom);
             if denom_recip.is_null() {
@@ -1332,7 +1255,6 @@ impl Backend for MetalBackend {
                 ));
             }
 
-            // decayed_param = (1 - lr·wd) · param
             let decayed_param = mlx_multiply(decay_arr, param_handle.as_ptr());
             mlx_array_free(decay_arr);
             if decayed_param.is_null() {
@@ -1344,7 +1266,6 @@ impl Backend for MetalBackend {
                 ));
             }
 
-            // new_param = decayed_param - scaled_update
             let new_param = mlx_subtract(decayed_param, scaled_update);
             mlx_array_free(decayed_param);
             mlx_array_free(scaled_update);
@@ -1356,13 +1277,6 @@ impl Backend for MetalBackend {
                 ));
             }
 
-            // No intra-op eval. The three MLX graph nodes return
-            // unevaluated; `AdamW::step_device` collects every param's
-            // triple and fires a single `backend.eval(...)` at the end of
-            // the optimizer step, turning the per-step eval count from
-            // `num_params` into `1` regardless of how many parameters the
-            // model has. Lazy-graph composition across params is safe — the
-            // updates are independent, no sub-node is shared.
             Ok((
                 DeviceHandle::Metal(MlxHandle::from_raw(new_param)),
                 DeviceHandle::Metal(MlxHandle::from_raw(new_m)),
@@ -1372,15 +1286,11 @@ impl Backend for MetalBackend {
     }
 }
 
-// Compute matmul gradients on-device. `grad_a = grad_out @ B^T` and
-// `grad_b = A^T @ grad_out`; the inner-most two axes of A/B are transposed
-// via `mlx_transpose_axes` (a lazy view that MLX fuses into the GEMM), so
-// no host-side transpose or extra upload is needed. The `need_grad_a`/
-// `need_grad_b` gates let the caller skip whichever SGEMM is not needed.
-//
-// One MLX round-trip per requested gradient: upload A, B, grad_out once,
-// issue two matmuls and one eval, then copy the results back. Mirrors the
-// forward's lock/eval/readback discipline.
+// Matmul gradients on-device: the inner-most two axes of A/B are transposed
+// via `mlx_transpose_axes` (a lazy view MLX fuses into the GEMM), so no
+// host-side transpose or extra upload is needed. One MLX round-trip per
+// requested gradient: upload A, B, grad_out once, issue two matmuls and one
+// eval, then copy the results back.
 fn mlx_matmul_backward(
     a: &[f32],
     a_shape: &[usize],
@@ -1435,8 +1345,6 @@ fn mlx_matmul_backward(
         });
     }
 
-    // Axes permutation that swaps the last two dims (rank 2 or 3). MLX's
-    // transpose_axes takes the full permutation vector.
     let transpose_axes: Vec<i32> = if rank == 2 { vec![1, 0] } else { vec![0, 2, 1] };
 
     let a_shape_i32: Vec<i32> = a_shape.iter().map(|&d| d as i32).collect();
@@ -1461,7 +1369,6 @@ fn mlx_matmul_backward(
             ));
         }
 
-        // grad_a = grad_out @ B^T
         let grad_a_host = if need_grad_a {
             let b_arr = mlx_array_from_data(
                 b.as_ptr() as *const c_void,
@@ -1512,7 +1419,6 @@ fn mlx_matmul_backward(
             Vec::new()
         };
 
-        // grad_b = A^T @ grad_out
         let grad_b_host = if need_grad_b {
             let a_arr = mlx_array_from_data(
                 a.as_ptr() as *const c_void,
@@ -1568,10 +1474,9 @@ fn mlx_matmul_backward(
     }
 }
 
-// Shared shape validation for the lazy softmax / log_softmax device-handle
-// paths. For the lazy path we trust MLX's own shape
-// on the input handle (the caller built it via `upload(shape)`), so we
-// only guard against degenerate rank / last-dim.
+// Shape validation for the lazy softmax / log_softmax paths: the input
+// handle's shape is trusted (caller built it via `upload(shape)`), so only
+// degenerate rank / last-dim are guarded.
 fn validate_softmax_shape(shape: &[usize]) -> Result<()> {
     let last_dim = *shape.last().ok_or(AutogradError::InvalidRank {
         expected: "at least 1",
@@ -1592,8 +1497,7 @@ enum SoftmaxKind {
     LogSoftmax,
 }
 
-// Upload host slice → call mlx_softmax_axis (or x - logsumexp for log form)
-// on axis=-1 → eval → copy back. The intermediate MLX arrays are freed
+// Eager softmax/log_softmax: the intermediate MLX arrays are freed
 // explicitly so the host slice is the only authoritative copy, matching
 // the matmul_forward contract.
 fn mlx_softmax_like(x: &[f32], shape: &[usize], kind: SoftmaxKind) -> Result<Vec<f32>> {
@@ -1711,8 +1615,6 @@ enum ReduceOp {
     Mean,
 }
 
-// Upload a 1-D host slice → apply a single MLX op producing a same-sized
-// array → eval → copy back → free. All MLX calls run under `mlx_guard()`.
 fn mlx_unary_flat(a: &[f32], op: UnaryOp) -> Result<Vec<f32>> {
     let n = a.len();
     let shape_i32 = [n as i32];
@@ -1780,9 +1682,8 @@ fn mlx_unary_flat(a: &[f32], op: UnaryOp) -> Result<Vec<f32>> {
     }
 }
 
-// Compose `0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))` using MLX
-// primitives. Matches `cpu_gelu_forward` (tanh approximation) within f32
-// precision. `input` is borrowed; the returned array is freshly owned.
+// Tanh-approx GELU via MLX primitives; matches `cpu_gelu_forward` within
+// f32 precision. `input` is borrowed; the returned array is freshly owned.
 //
 // Safety: caller holds `mlx_guard()`; `input` is a live MLX array; every
 // intermediate we allocate here is freed before returning.
@@ -1791,7 +1692,6 @@ unsafe fn gelu_tanh(input: *mut mlx_sys::mlx_array) -> Result<*mut mlx_sys::mlx_
     // SAFETY: caller guarantees `input` is live and holds mlx_guard(); we free
     // every intermediate before returning (see function-level safety doc).
     unsafe {
-        // xsq = x * x ; xcube = xsq * x
         let xsq = mlx_multiply(input, input);
         if xsq.is_null() {
             return Err(AutogradError::TapeInvariant("gelu: xsq null"));
@@ -1802,7 +1702,6 @@ unsafe fn gelu_tanh(input: *mut mlx_sys::mlx_array) -> Result<*mut mlx_sys::mlx_
             return Err(AutogradError::TapeInvariant("gelu: xcube null"));
         }
 
-        // inner = K * (x + 0.044715 * xcube)
         let coef = mlx_array_new_float32(0.044_715_f32);
         let coef_times_cube = mlx_multiply(coef, xcube);
         mlx_array_free(coef);
@@ -1823,7 +1722,6 @@ unsafe fn gelu_tanh(input: *mut mlx_sys::mlx_array) -> Result<*mut mlx_sys::mlx_
             return Err(AutogradError::TapeInvariant("gelu: inner null"));
         }
 
-        // tanh_val = tanh(inner); one_plus = 1 + tanh_val
         let tanh_val = mlx_tanh(inner);
         mlx_array_free(inner);
         if tanh_val.is_null() {
@@ -1837,7 +1735,6 @@ unsafe fn gelu_tanh(input: *mut mlx_sys::mlx_array) -> Result<*mut mlx_sys::mlx_
             return Err(AutogradError::TapeInvariant("gelu: 1+tanh null"));
         }
 
-        // out = 0.5 * x * one_plus
         let half = mlx_array_new_float32(0.5_f32);
         let half_x = mlx_multiply(half, input);
         mlx_array_free(half);
@@ -1909,11 +1806,9 @@ fn mlx_binary_flat(a: &[f32], b: &[f32], op: BinaryOp) -> Result<Vec<f32>> {
     }
 }
 
-// Right-aligned broadcast-add via MLX's native NumPy-style broadcasting:
-// `mlx_add(a, b)` accepts operands with different but right-broadcast-compatible
-// shapes and returns an array with the broadcast shape — which, for our
-// contract (b_shape.len() <= a_shape.len() and each b-axis is 1 or matches),
-// equals `a_shape`. No explicit reshape is required on the host side.
+// Right-aligned broadcast-add via MLX's native broadcasting: under the
+// trait contract (each b-axis is 1 or matches) the broadcast shape equals
+// `a_shape`, so no explicit reshape is needed.
 fn mlx_add_broadcast(
     a: &[f32],
     a_shape: &[usize],
@@ -1999,10 +1894,8 @@ fn mlx_add_broadcast(
     }
 }
 
-// Lazy sibling of `mlx_rms_norm`: borrows an existing MLX `x` handle,
-// uploads `weight` as a temporary array, calls `mlx_fast_rms_norm`, and
-// returns the result wrapped in an `MlxHandle` without calling
-// `mlx_eval`. Mirrors the shape validation from `mlx_rms_norm`.
+// Lazy sibling of `mlx_rms_norm`: returns the `mlx_fast_rms_norm` node
+// without calling `mlx_eval`.
 fn mlx_rms_norm_lazy(
     x_ptr: *mut mlx_array,
     weight: &[f32],
@@ -2056,12 +1949,9 @@ fn mlx_rms_norm_lazy(
 }
 
 fn mlx_gelu_erf_lazy(x_ptr: *mut mlx_array) -> Result<DeviceHandle> {
-    // GELU_erf(x) = 0.5 * x * (1 + erf(x * INV_SQRT_2))
-    // Composed lazily so it merges with upstream matmul + downstream
-    // rmsnorm in MLX's lazy graph. Formula mirrors `ops::activation::gelu`
-    // CPU body exactly (same constant, same order of operations); the
-    // chosen `mlx_erf` matches `libm::erff` to within the ULP range MLX
-    // uses for f32 erf — parity test gates at 1e-4.
+    // Lazy erf-form GELU; formula mirrors `ops::activation::gelu`'s CPU body
+    // exactly (same constant, same op order). `mlx_erf` matches `libm::erff`
+    // within MLX's f32 ULP range — parity test gates at 1e-4.
     const INV_SQRT_2: f32 = 0.707_106_77_f32;
     let _guard = mlx_guard();
 
@@ -2207,9 +2097,8 @@ fn mlx_gather_last_dim_lazy(
         }
     }
 
-    // Remap to flat ids on the host: one int32 per output row. Tiny
-    // buffer, re-uploaded per call — the prefix product is typically
-    // `B * S` which is dwarfed by the flattened src.
+    // Remap to flat ids on the host: one int32 per output row, dwarfed by
+    // the flattened src, so re-uploading per call is free.
     let vocab_i32 = vocab as i32;
     let flat_ids: Vec<i32> = ids
         .iter()
@@ -2361,8 +2250,8 @@ fn mlx_embedding(weight: &[f32], vocab: usize, dim: usize, ids: &[i32]) -> Resul
     }
 
     // Sanitize ids on the host: clamp OOB / negative to 0 so `mlx_take_axis`
-    // never trips a bounds assertion, and track which output rows must be
-    // zeroed (matches `cpu_embedding_forward` behavior).
+    // never trips a bounds assertion, and zero the affected output rows
+    // (matches `cpu_embedding_forward` behavior).
     let mut has_invalid = false;
     let (safe_ids, row_mask): (Vec<i32>, Vec<f32>) = ids
         .iter()
@@ -2592,8 +2481,6 @@ fn mlx_rope(x: &[f32], x_shape: &[usize], cos: &[f32], sin: &[f32]) -> Result<Ve
             ));
         }
 
-        // x0 = x[..., :half_dim] ; x1 = x[..., half_dim:]
-        // mlx_slice takes start/stop/strides per dim. ndim=4, strides=all 1.
         let starts_lo: [i32; 4] = [0, 0, 0, 0];
         let stops_lo: [i32; 4] = [batch as i32, heads as i32, seq as i32, half_dim as i32];
         let starts_hi: [i32; 4] = [0, 0, 0, half_dim as i32];
@@ -2627,8 +2514,6 @@ fn mlx_rope(x: &[f32], x_shape: &[usize], cos: &[f32], sin: &[f32]) -> Result<Ve
             return Err(AutogradError::TapeInvariant("mlx_slice returned null"));
         }
 
-        // out0 = x0 * cos - x1 * sin
-        // out1 = x1 * cos + x0 * sin
         let x0c = mlx_multiply(x0, cos_arr);
         let x1s = mlx_multiply(x1, sin_arr);
         let x1c = mlx_multiply(x1, cos_arr);
@@ -2661,7 +2546,6 @@ fn mlx_rope(x: &[f32], x_shape: &[usize], cos: &[f32], sin: &[f32]) -> Result<Ve
             return Err(AutogradError::TapeInvariant("mlx rope add/subtract null"));
         }
 
-        // Concatenate along the last axis (axis=3 for rank-4).
         let mut parts = [out0, out1];
         let concat = mlx_concatenate_axis(parts.as_mut_ptr(), 2, 3);
         mlx_array_free(out0);
@@ -2685,11 +2569,8 @@ fn mlx_rope(x: &[f32], x_shape: &[usize], cos: &[f32], sin: &[f32]) -> Result<Ve
     }
 }
 
-// Lazy sibling of `mlx_rope`: borrows an existing MLX `x` handle, uploads
-// cos/sin as temporary arrays, composes the same rotation graph, and
-// returns the final concat node wrapped in an `MlxHandle` without calling
-// `mlx_eval`. Mirrors every shape/null check in `mlx_rope` but is scoped
-// to the device-handle path.
+// Lazy sibling of `mlx_rope`: returns the final concat node wrapped in an
+// `MlxHandle` without calling `mlx_eval`.
 fn mlx_rope_lazy(
     x_ptr: *mut mlx_array,
     x_shape: &[usize],
@@ -2870,8 +2751,7 @@ fn mlx_gather_last_dim(src: &[f32], src_shape: &[usize], ids: &[i32]) -> Result<
         }
     }
 
-    // Flatten src to `[prefix * vocab]`, then take a single flat index per
-    // output position (`i * vocab + ids[i]`). One `mlx_take_axis` call gives
+    // Flatten src to `[prefix * vocab]` so one `mlx_take_axis` call gives
     // the whole result — no per-row loop.
     let vocab_i32 = vocab as i32;
     let flat_ids: Vec<i32> = ids
@@ -2929,15 +2809,11 @@ fn mlx_gather_last_dim(src: &[f32], src_shape: &[usize], ids: &[i32]) -> Result<
     }
 }
 
-// Scatter-add `prefix_rows` feature vectors into a zero-initialized
-// `[vocab, feature_dim]` output buffer. Matches `cpu_scatter_add_rows_forward`
-// semantics: negative or OOB indices are silently skipped; aliased indices
-// accumulate via MLX's `scatter_add` (atomic/additive, not overwrite).
-//
-// OOB/negative filtering happens host-side here — the C++ helper assumes
-// pre-sanitized in-range indices. This mirrors `mlx_embedding`'s approach,
-// with the difference that we drop invalid rows entirely (no row_mask) since
-// scatter_add would still fault on an OOB destination.
+// Scatter-add into a zero-initialized `[vocab, feature_dim]` buffer.
+// Matches `cpu_scatter_add_rows_forward` semantics: negative/OOB indices
+// are silently skipped; aliased indices accumulate (additive, not
+// overwrite). OOB filtering happens host-side — the C++ helper assumes
+// pre-sanitized in-range indices and would fault on an OOB destination.
 fn mlx_scatter_add_rows(
     upstream: &[f32],
     prefix_rows: usize,
@@ -2969,8 +2845,6 @@ fn mlx_scatter_add_rows(
         return Ok(vec![0.0_f32; out_len]);
     }
 
-    // Filter OOB/negative indices host-side; collect compact (updates, indices)
-    // pairs so the FFI path sees only in-range entries.
     let mut safe_indices: Vec<i32> = Vec::with_capacity(prefix_rows);
     let mut safe_updates: Vec<f32> = Vec::with_capacity(expected_upstream);
     for (row, &id) in indices.iter().enumerate() {
@@ -2982,7 +2856,6 @@ fn mlx_scatter_add_rows(
         safe_updates.extend_from_slice(&upstream[src_base..src_base + feature_dim]);
     }
 
-    // Everything filtered → result is all zeros.
     if safe_indices.is_empty() {
         return Ok(vec![0.0_f32; out_len]);
     }
@@ -3028,13 +2901,11 @@ fn mlx_scatter_add_rows(
     }
 }
 
-// Shared tail: evaluate an MLX array, copy its contents into a freshly-
-// allocated host vector, and return it. Caller holds `mlx_guard()` and is
-// responsible for freeing `arr` afterwards. Does not free on success or
-// failure — the caller controls the array lifetime.
+// Shared tail: evaluate an MLX array and copy it into a fresh host vector.
+// Caller holds `mlx_guard()` and owns/frees `arr` on every path.
 //
-// Safety: `arr` must be a non-null pointer to a live MLX array owned by
-// the caller for the duration of this call.
+// Safety: `arr` must be a non-null pointer to a live MLX array owned by the
+// caller for the duration of this call.
 unsafe fn eval_and_readback(arr: *mut mlx_sys::mlx_array) -> Result<Vec<f32>> {
     // SAFETY: `arr` is a non-null live MLX array owned by the caller for the
     // duration of this call (see function-level safety doc); mlx_guard() is

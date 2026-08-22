@@ -1,12 +1,11 @@
 use super::*;
 
-// --- Context-parallel ring attention (Track A device path) ---
 // Autograd-side adapters only: translate `CudaBackend` + `DeviceHandle` into
-// `CudaSlice` and stage f32↔bf16. q/k/v arrive as f32 handles (tape tensors),
-// converted to bf16 for the kernel (matching the training activation precision);
-// the (m,l,o) accumulators and grads stay f32 for a stable merge. The FA3 pair
-// route and its launches live tape-free in `cuda_kernels::ring_attention`; the
-// scalar one-block kernels below remain the non-sm90 / non-hd256 fallback.
+// `CudaSlice` and stage f32↔bf16. q/k/v arrive as f32 tape tensors, converted
+// to bf16 for the kernel (training activation precision); the (m,l,o)
+// accumulators and grads stay f32 for a stable merge. The FA3 pair route and
+// its launches live tape-free in `cuda_kernels::ring_attention`; the scalar
+// one-block kernels below remain the non-sm90 / non-hd256 fallback.
 #[cfg(not(feature = "no-cuda"))]
 use cuda_kernels::ring_attention::{
     ring_block_attention_bwd_raw, ring_block_attention_finalize_raw,
@@ -88,9 +87,9 @@ pub(super) fn cuda_ring_block_fwd_merge(
         let (oo_ptr, _oog) = o_out.device_ptr_mut(&backend.stream);
         let (qpos_ptr, _qpg) = qpos_slice.device_ptr(&backend.stream);
         let (kpos_ptr, _kpg) = kpos_slice.device_ptr(&backend.stream);
-        // q/k/v are live bf16 copies; acc_*_in are f32 handles of the right
-        // length; *_out are freshly allocated rows / rows*hd; q_pos/k_pos are f32
-        // handles of q_rows / blk_len; dims mirror the shapes.
+        // SAFETY: q/k/v are live bf16 copies; acc_*_in are f32 handles of the
+        // right length; *_out are freshly allocated rows / rows*hd; q_pos/k_pos
+        // are f32 handles of q_rows / blk_len; dims mirror the shapes.
         ring_block_attention_fwd_merge_raw(
             &backend.stream,
             q_ptr,
@@ -138,8 +137,8 @@ pub(super) fn cuda_ring_block_finalize(
         let (o_ptr, _og) = o_slice.device_ptr(&backend.stream);
         let (out_ptr, _outg) = out_f32.device_ptr_mut(&backend.stream);
         let (lse_ptr, _lseg) = lse.device_ptr_mut(&backend.stream);
-        // acc_* are f32 handles length rows / rows*hd; out is rows*hd f32;
-        // lse is rows f32; dims mirror the shapes.
+        // SAFETY: acc_* are f32 handles of length rows / rows*hd; out is
+        // rows*hd f32; lse is rows f32; dims mirror the shapes.
         ring_block_attention_finalize_raw(
             &backend.stream,
             m_ptr,
@@ -186,8 +185,8 @@ pub(super) fn cuda_ring_block_bwd(
     let k_bf16 = backend.local_f32_as_bf16(k_slice, k_slice.len())?;
     let v_bf16 = backend.local_f32_as_bf16(v_slice, v_slice.len())?;
     let do_bf16 = backend.local_f32_as_bf16(do_slice, do_slice.len())?;
-    // grad_q is in/out: copy the running accumulator so the kernel's += lands on a
-    // fresh handle (the tape input stays immutable).
+    // grad_q is in/out: copy the running accumulator so the kernel's += lands
+    // on a fresh handle (the tape input stays immutable).
     let mut gq_out = backend
         .stream
         .alloc_zeros::<f32>(gq_slice.len())
@@ -242,9 +241,9 @@ pub(super) fn cuda_ring_block_bwd(
         let (gv_ptr, _gvg) = gv.device_ptr_mut(&backend.stream);
         let (qpos_ptr, _qpg) = qpos_slice.device_ptr(&backend.stream);
         let (kpos_ptr, _kpg) = kpos_slice.device_ptr(&backend.stream);
-        // bf16 copies + f32 out/lse/grad handles of matching length; gk/gv
-        // sized to one block's [Tkv, blk_len, hd]; q_pos/k_pos f32 of q_rows/blk_len;
-        // dims mirror the shapes.
+        // SAFETY: bf16 copies + f32 out/lse/grad handles of matching length;
+        // gk/gv sized to one block's [Tkv, blk_len, hd]; q_pos/k_pos f32 of
+        // q_rows/blk_len; dims mirror the shapes.
         ring_block_attention_bwd_raw(
             &backend.stream,
             q_ptr,

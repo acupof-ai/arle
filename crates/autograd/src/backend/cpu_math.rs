@@ -1,9 +1,5 @@
-//! CPU math helper functions extracted from `backend.rs`.
-//!
-//! All functions here are pure host-side math; they have no dependency on the
-//! `Backend` trait or any device handle type.  The module is included via
-//! `#[path = "backend/cpu_math.rs"] mod cpu_math;` at the end of `backend.rs`
-//! and its public symbols re-exported into the `backend` module namespace.
+//! Pure host-side math: no dependency on the `Backend` trait or any device
+//! handle type.
 
 use crate::{AutogradError, Result};
 
@@ -12,8 +8,6 @@ use crate::{AutogradError, Result};
 type QwenDecodePrepareQHost = (Vec<f32>, Option<Vec<f32>>, Vec<usize>);
 type QwenDecodePrepareKvHost = (Vec<f32>, Vec<f32>, Vec<usize>);
 
-// Re-export the CausalSdpaHostGradTriplet from parent so we don't have to
-// qualify it here.
 use super::CausalSdpaHostGradTriplet;
 
 pub(crate) fn shape_size(shape: &[usize]) -> usize {
@@ -28,8 +22,7 @@ pub fn bf16_bits_to_f32(bits: u16) -> f32 {
     f32::from_bits((bits as u32) << 16)
 }
 
-/// Truncate f32 to bf16 by keeping the upper 16 bits. Exact for values that
-/// were originally bf16 (lower 16 bits are zero).
+/// Exact for values that were originally bf16 (lower 16 bits are zero).
 pub fn f32_to_bf16_bits(f: f32) -> u16 {
     (f.to_bits() >> 16) as u16
 }
@@ -179,7 +172,6 @@ pub fn validate_fp8_block_scaled(
     Ok(())
 }
 
-/// CPU reference implementation of row-major matmul (2D + batched 3D).
 /// Exposed so other backends can reuse it as a fallback.
 pub fn cpu_matmul_forward(
     a: &[f32],
@@ -249,8 +241,7 @@ pub fn matmul_bt_output_shape(a_shape: &[usize], b_shape: &[usize]) -> Result<Ve
     Ok(vec![a_shape[0], b_shape[0]])
 }
 
-/// CPU `C = A @ B^T` for rank-2 row-major tensors without materialising `B^T`.
-/// Shapes: `A:[M,K]`, `B:[N,K]`, output `[M,N]`.
+/// CPU `C = A @ B^T` without materialising `B^T`.
 pub fn cpu_matmul_bt_forward(
     a: &[f32],
     a_shape: &[usize],
@@ -341,10 +332,8 @@ fn sgemm_row_major(m: usize, k: usize, n: usize, a: &[f32], b: &[f32], out: &mut
     }
 }
 
-/// CPU reference matmul backward. Computes `grad_a = grad_out @ B^T` and
-/// `grad_b = A^T @ grad_out`. Physically transposes the last two axes of the
-/// saved operand on the host and then calls `cpu_matmul_forward` — this is
-/// the authoritative numerical reference every GPU backend must match.
+/// Authoritative numerical reference every GPU backend must match: physically
+/// transposes the saved operand on the host, then calls `cpu_matmul_forward`.
 ///
 /// `need_grad_a`/`need_grad_b` skip the corresponding SGEMM when false; the
 /// returned `Vec<f32>` is empty in that case so callers can cheaply detect
@@ -585,9 +574,8 @@ fn matmul_at_b_into(
     }
 }
 
-/// CPU reference for row-wise softmax over the last axis. Matches the
-/// numerically-stable implementation in `ops::softmax::softmax` so that
-/// backends can fall back to this when GPU acceleration is unavailable.
+/// Matches the numerically-stable `ops::softmax::softmax`; backends fall back
+/// to this without GPU.
 pub fn cpu_softmax_forward_last_axis(x: &[f32], shape: &[usize]) -> Result<Vec<f32>> {
     let last_dim = *shape.last().ok_or(crate::AutogradError::InvalidRank {
         expected: "at least 1",
@@ -616,7 +604,6 @@ pub fn cpu_softmax_forward_last_axis(x: &[f32], shape: &[usize]) -> Result<Vec<f
     Ok(out)
 }
 
-/// CPU reference for row-wise log-softmax over the last axis.
 pub fn cpu_log_softmax_forward_last_axis(x: &[f32], shape: &[usize]) -> Result<Vec<f32>> {
     let last_dim = *shape.last().ok_or(crate::AutogradError::InvalidRank {
         expected: "at least 1",
@@ -646,16 +633,10 @@ pub fn cpu_log_softmax_forward_last_axis(x: &[f32], shape: &[usize]) -> Result<V
     Ok(out)
 }
 
-/// CPU reference for `log_softmax_last_axis_backward`. Computes
-/// `grad_input[i, j] = upstream[i, j] - exp(log_softmax_output[i, j]) * sum_j(upstream[i, j])`
-/// row-wise over the last axis. `log_softmax_output` is the saved
-/// forward output — `softmax(x) = exp(log_softmax(x))`, so the
-/// derivative identity reuses it without recomputing softmax.
-///
-/// Mirrors the inline math in `ops::softmax::log_softmax_backward`
-/// (host-eager path). Kept as a free function so the device-handle
-/// fallback in `Backend::log_softmax_last_axis_backward` can reuse the
-/// same reference and parity tests can compare device against CPU.
+/// `log_softmax_output` is the saved forward output — `softmax(x) =
+/// exp(log_softmax(x))`, so the derivative identity reuses it without
+/// recomputing softmax. Kept as a free function so the device-handle fallback
+/// and parity tests share one reference with `ops::softmax::log_softmax_backward`.
 pub fn cpu_log_softmax_backward(
     upstream: &[f32],
     log_softmax_output: &[f32],
@@ -702,9 +683,6 @@ pub fn cpu_log_softmax_backward(
     Ok(grad)
 }
 
-/// CPU reference for `softmax_last_axis_backward`. Computes
-/// `grad_input[i, j] = y[i, j] * (upstream[i, j] - sum_j(upstream[i, j] * y[i, j]))`
-/// row-wise over the last axis. `softmax_output` is the saved forward output.
 pub fn cpu_softmax_backward(
     upstream: &[f32],
     softmax_output: &[f32],
@@ -750,7 +728,6 @@ pub fn cpu_softmax_backward(
     Ok(grad)
 }
 
-/// CPU reference `out = a * b` for equal-length contiguous slices.
 pub fn cpu_mul_forward(a: &[f32], b: &[f32]) -> Result<Vec<f32>> {
     if a.len() != b.len() {
         return Err(crate::AutogradError::ShapeMismatch {
@@ -761,17 +738,10 @@ pub fn cpu_mul_forward(a: &[f32], b: &[f32]) -> Result<Vec<f32>> {
     Ok(a.iter().zip(b.iter()).map(|(x, y)| x * y).collect())
 }
 
-/// CPU reference `out = a * s`.
 pub fn cpu_mul_scalar_forward(a: &[f32], s: f32) -> Result<Vec<f32>> {
     Ok(a.iter().map(|x| x * s).collect())
 }
 
-/// CPU reference right-aligned broadcast-add.
-///
-/// Output shape equals `a_shape`; `b` is broadcast into `a`. `b_shape.len()`
-/// must be `<= a_shape.len()`; each matching `b`-axis must be either `1` or
-/// equal to the corresponding `a`-axis. See `broadcast_offset` for the
-/// index rule.
 pub fn cpu_add_broadcast_forward(
     a: &[f32],
     a_shape: &[usize],
@@ -802,7 +772,6 @@ pub fn cpu_add_broadcast_forward(
     Ok(out)
 }
 
-/// Validate that `b_shape` is right-aligned broadcast-compatible into `a_shape`.
 pub(crate) fn validate_broadcast(a_shape: &[usize], b_shape: &[usize]) -> Result<()> {
     if b_shape.len() > a_shape.len() {
         return Err(crate::AutogradError::ShapeMismatch {
@@ -825,8 +794,6 @@ pub(crate) fn validate_broadcast(a_shape: &[usize], b_shape: &[usize]) -> Result
     Ok(())
 }
 
-/// Map an output linear index in `out_shape` to the corresponding flat offset
-/// into a right-aligned broadcast operand with shape `b_shape`.
 pub(crate) fn broadcast_offset(out_index: usize, out_shape: &[usize], b_shape: &[usize]) -> usize {
     if b_shape.is_empty() {
         return 0;
@@ -847,8 +814,8 @@ pub(crate) fn broadcast_offset(out_index: usize, out_shape: &[usize], b_shape: &
     offset
 }
 
-/// Row-major contiguous strides for `shape`. Shared helper used by broadcast
-/// math (not the `Tensor` layout stride — that lives in `tensor.rs`).
+/// Row-major strides for broadcast math (not the `Tensor` layout stride in
+/// `tensor.rs`).
 pub(crate) fn broadcast_strides(shape: &[usize]) -> Vec<usize> {
     if shape.is_empty() {
         return Vec::new();
@@ -863,7 +830,6 @@ pub(crate) fn broadcast_strides(shape: &[usize]) -> Vec<usize> {
     strides
 }
 
-/// Unravel a linear index into per-axis coordinates (row-major).
 pub(crate) fn linear_to_coords(mut linear: usize, shape: &[usize]) -> Vec<usize> {
     if shape.is_empty() {
         return Vec::new();
@@ -878,17 +844,14 @@ pub(crate) fn linear_to_coords(mut linear: usize, shape: &[usize]) -> Vec<usize>
     coords
 }
 
-/// CPU reference `out = exp(a)`.
 pub fn cpu_exp_forward(a: &[f32]) -> Result<Vec<f32>> {
     Ok(a.iter().map(|x| x.exp()).collect())
 }
 
-/// CPU reference `out = -a`.
 pub fn cpu_neg_forward(a: &[f32]) -> Result<Vec<f32>> {
     Ok(a.iter().map(|x| -x).collect())
 }
 
-/// CPU reference `out = |a|`.
 pub fn cpu_abs_forward(a: &[f32]) -> Result<Vec<f32>> {
     Ok(a.iter().map(|x| x.abs()).collect())
 }
@@ -916,21 +879,18 @@ pub fn cpu_gelu_forward(a: &[f32]) -> Result<Vec<f32>> {
         .collect())
 }
 
-/// CPU reference SiLU (Swish): `out = a * sigmoid(a)`.
 pub fn cpu_silu_forward(a: &[f32]) -> Result<Vec<f32>> {
     Ok(a.iter()
         .map(|&x| x * (1.0_f32 / (1.0_f32 + (-x).exp())))
         .collect())
 }
 
-/// CPU reference sigmoid: `out = 1 / (1 + exp(-a))`.
 pub fn cpu_sigmoid_forward(a: &[f32]) -> Result<Vec<f32>> {
     Ok(a.iter()
         .map(|&x| 1.0_f32 / (1.0_f32 + (-x).exp()))
         .collect())
 }
 
-/// CPU reference RMSNorm over the last axis.
 pub fn cpu_rms_norm_forward(
     x: &[f32],
     weight: &[f32],
@@ -975,8 +935,7 @@ pub fn cpu_rms_norm_forward(
     Ok(out)
 }
 
-/// CPU reference embedding gather. Returns `[n_ids * dim]` row-major; ids out
-/// of range produce a zero row (matches the CUDA kernel's behavior).
+/// Out-of-range ids produce a zero row (matches the CUDA kernel's behavior).
 pub fn cpu_embedding_forward(
     weight: &[f32],
     vocab: usize,
@@ -1005,7 +964,6 @@ pub fn cpu_embedding_forward(
     Ok(out)
 }
 
-/// CPU reference sum over the last axis.
 pub fn cpu_sum_last_axis_forward(x: &[f32], shape: &[usize]) -> Result<Vec<f32>> {
     let last_dim = *shape.last().ok_or(crate::AutogradError::InvalidRank {
         expected: "at least 1",
@@ -1033,7 +991,6 @@ pub fn cpu_sum_last_axis_forward(x: &[f32], shape: &[usize]) -> Result<Vec<f32>>
     Ok(out)
 }
 
-/// CPU reference mean over the last axis.
 pub fn cpu_mean_last_axis_forward(x: &[f32], shape: &[usize]) -> Result<Vec<f32>> {
     let last_dim = *shape.last().ok_or(crate::AutogradError::InvalidRank {
         expected: "at least 1",
@@ -1047,9 +1004,8 @@ pub fn cpu_mean_last_axis_forward(x: &[f32], shape: &[usize]) -> Result<Vec<f32>
     Ok(out)
 }
 
-/// CPU reference for NeoX RoPE (matches `ops::rope::rope` — element `i` pairs
-/// with `i + half_dim`). `x_shape = [batch, heads, seq, head_dim]`; `cos`/`sin`
-/// are `[seq, half_dim]` row-major.
+/// NeoX RoPE (matches `ops::rope::rope`): element `i` pairs with
+/// `i + half_dim`.
 pub fn cpu_rope_forward(
     x: &[f32],
     x_shape: &[usize],
@@ -1117,10 +1073,8 @@ pub fn cpu_rope_forward(
     Ok(out)
 }
 
-/// CPU reference gather along the last axis.
-/// `out[prefix] = src[prefix * vocab + ids[prefix]]`. Out-of-range or negative
-/// ids produce an error (unlike embedding which zero-fills — the caller is
-/// responsible for validating ids).
+/// Out-of-range or negative ids error (unlike embedding, which zero-fills);
+/// the caller validates ids.
 pub fn cpu_gather_last_dim_forward(
     src: &[f32],
     src_shape: &[usize],
@@ -1164,18 +1118,12 @@ pub fn cpu_gather_last_dim_forward(
     Ok(out)
 }
 
-/// CPU reference for `gather_last_dim_backward`. Zero-fills a
-/// `src_shape = [prefix..., vocab]` buffer then writes
-/// `upstream[row]` into `out[row * vocab + indices[row]]` for each
-/// prefix position. Equivalent to the `scatter_add_rows_forward` call
-/// in `ops::gather::gather_last_dim_backward` with `feature_dim = 1`
-/// and remapped flat ids — kept as a dedicated function so the device
-/// backward override returns the same `[B, S, V]` grad shape the
-/// autograd graph expects without needing the caller to know about
-/// the flat-id trick.
-///
-/// Negative or out-of-range indices are silently skipped (matches
-/// `cpu_scatter_add_rows_forward` and the CUDA kernel's OOB handling).
+/// Kept as a dedicated function (rather than the `scatter_add_rows_forward`
+/// call in `ops::gather::gather_last_dim_backward`) so the device backward
+/// override returns the `[B, S, V]` grad shape the autograd graph expects
+/// without the caller knowing the flat-id trick. Negative or out-of-range
+/// indices are silently skipped (matches `cpu_scatter_add_rows_forward` and
+/// the CUDA kernel's OOB handling).
 pub fn cpu_gather_last_dim_backward(
     upstream: &[f32],
     indices: &[i32],
@@ -1221,14 +1169,9 @@ pub fn cpu_gather_last_dim_backward(
     Ok(grad)
 }
 
-/// CPU reference scatter-add into a `[vocab, feature_dim]` output.
-///
-/// `upstream` has length `prefix_rows * feature_dim`; `indices.len() == prefix_rows`.
-/// For each row, the feature slice is added into the bin selected by the
-/// corresponding index. Negative or out-of-range indices are silently
-/// skipped — matches the prior inline scatter in `embedding_backward`
-/// (which bounds-checked at the op layer) and the CUDA kernel's OOB
-/// handling so behavior is identical across backends.
+/// Negative or out-of-range indices are silently skipped — matches the prior
+/// inline scatter in `embedding_backward` and the CUDA kernel's OOB handling so
+/// behavior is identical across backends.
 pub fn cpu_scatter_add_rows_forward(
     upstream: &[f32],
     prefix_rows: usize,
@@ -1267,12 +1210,8 @@ pub fn cpu_scatter_add_rows_forward(
     Ok(out)
 }
 
-/// CPU reference transpose-swap: swap `axis1` and `axis2` of a contiguous
-/// row-major tensor with shape `old_shape`. Returns `(data, new_shape)`.
-/// Used by the `Backend::transpose_axes_swap` default fallback and by the
-/// ops-layer host-eager path — keeping both on the same function means the
-/// device-default-fallback and the host path produce byte-identical output
-/// for a given input.
+/// Shared by the `Backend::transpose_axes_swap` fallback and the ops-layer
+/// host-eager path so both produce byte-identical output.
 pub fn cpu_transpose_swap(
     data: &[f32],
     old_shape: &[usize],
@@ -1323,11 +1262,8 @@ pub fn cpu_transpose_swap(
     Ok((out, new_shape))
 }
 
-/// CPU reference contiguous slice: copy elements of `data` (row-major over
-/// `old_shape`) whose per-axis coordinate is in `[starts[i], ends[i])`.
-/// Returns `(sliced_data, new_shape)` with `new_shape[i] = ends[i] - starts[i]`.
-/// Used by the `Backend::slice` default fallback so device-default and host
-/// paths share one numerical reference.
+/// Shared by the `Backend::slice` fallback so device-default and host paths
+/// use one numerical reference.
 pub fn cpu_slice(
     data: &[f32],
     old_shape: &[usize],
@@ -1370,8 +1306,7 @@ pub fn cpu_slice(
     Ok((out, new_shape))
 }
 
-/// CPU reference for KV-cache append: concatenate two rank-4 contiguous
-/// tensors shaped `[batch, heads, seq, dim]` along axis 2.
+/// KV-cache append: rank-4 concat along axis 2.
 pub fn cpu_concat_axis2(
     a: &[f32],
     a_shape: &[usize],
@@ -1559,7 +1494,6 @@ fn offset4(
     (((batch * heads + head) * seq_len + token) * head_dim) + dim
 }
 
-/// CPU reference for decode-time GQA causal attention.
 #[allow(clippy::too_many_arguments)]
 pub fn cpu_causal_sdpa_decode_gqa(
     q: &[f32],
@@ -2212,17 +2146,10 @@ pub(crate) fn validate_slice_shape(
         .collect())
 }
 
-/// CPU reference in-place AdamW update. Matches the formula in
-/// `optim.rs::AdamW::step`:
-///
-/// - weight decay (decoupled): `param *= 1 - lr * wd`
-/// - EMAs: `m = β1·m + (1-β1)·g`, `v = β2·v + (1-β2)·g²`
-/// - bias-corrected step: `param -= lr · (m/bc1) / (√(v/bc2) + eps)`
-///
-/// Exposed as a free fn so `Backend::adamw_step` default impl and the
-/// optimizer's host path share one numerical reference. Any backend
-/// override (e.g. `MetalBackend::adamw_step`) MUST match this to the
-/// 1e-5 gate enforced by `metal_adamw_step_stays_device_resident`.
+/// Shared numerical reference for `Backend::adamw_step`'s default impl and the
+/// optimizer's host path. Any backend override (e.g. `MetalBackend::adamw_step`)
+/// MUST match this to the 1e-5 gate enforced by
+/// `metal_adamw_step_stays_device_resident`.
 #[allow(clippy::too_many_arguments)]
 pub fn cpu_adamw_step_in_place(
     param: &mut [f32],

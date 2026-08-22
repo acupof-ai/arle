@@ -7,11 +7,9 @@ use crate::{
 };
 
 pub fn softmax(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<TensorId> {
-    // Route Dirty::Device inputs through the lazy
-    // `backend.softmax_last_axis` (composes `mlx_softmax_axis` into the MLX
-    // graph with no eval). Dirty::Host / Dirty::Both stay on the host fast
-    // path so host-resident producers don't pay an upload+device-reduce
-    // +readback.
+    // Route Dirty::Device through the lazy `backend.softmax_last_axis`
+    // (composes into the MLX graph with no eval); Dirty::Host / Dirty::Both
+    // stay host-side to avoid an upload+device-reduce+readback.
     let dirty = store.tensor(x)?.dirty.clone();
     match dirty {
         Dirty::Device => softmax_device_lazy(x, store, tape, SoftmaxKind::Softmax),
@@ -56,7 +54,7 @@ fn softmax_device_lazy(
     tape: &mut Tape,
     kind: SoftmaxKind,
 ) -> Result<TensorId> {
-    // Defensive `ensure_device`: caller already routed a Dirty::Device
+    // Defensive `ensure_device`: the caller already routed a Dirty::Device
     // tensor, but re-calling guards a future Dirty::Both path from silent
     // drift (mirrors `sum_device_lazy`).
     store.ensure_device(x)?;
@@ -178,9 +176,9 @@ pub(crate) fn softmax_backward(
     let upstream = store.tensor_host(output_grad_id)?;
 
     // dL/dx = y * (dL/dy - sum(dL/dy * y, axis=-1, keepdim))
-    // Stream row-wise so we only allocate the output buffer — full-vocab logits
-    // on training paths make intermediate `mul`/`sub` materializations cost
-    // 3-4× peak memory (codex review 2026-04-19).
+    // Stream row-wise so we only allocate the output buffer — full-vocab
+    // logits make intermediate `mul`/`sub` materializations cost 3-4× peak
+    // memory (codex review 2026-04-19).
     let last = last_dim(&output.shape)?;
     let rows = output.data.len() / last;
     let mut grad = vec![0.0_f32; output.data.len()];
@@ -219,8 +217,8 @@ pub(crate) fn log_softmax_backward(
     };
 
     // Shape check uses borrowed access only — `.clone()` on a
-    // `Dirty::Device` tensor would panic, and the device-aware fast path
-    // (below) does not need a clone.
+    // `Dirty::Device` tensor would panic, and the device fast path below
+    // does not need a clone.
     let output_shape = store.tensor(y)?.shape.clone();
     let upstream_shape = store.tensor(output_grad_id)?.shape.clone();
     if output_shape != upstream_shape {
@@ -230,13 +228,12 @@ pub(crate) fn log_softmax_backward(
         });
     }
 
-    // Fast-path the backward when
-    // BOTH the saved forward output and the upstream gradient are still
-    // device-resident. This is the production CUDA path: the saved
-    // `LogSoftmaxCtx { y }` is produced by `softmax_device_lazy` on a
-    // `Dirty::Device` tensor, and the upstream gradient flows from
+    // Fast-path when BOTH the saved forward output and the upstream grad
+    // are still device-resident. This is the production CUDA path: the
+    // saved `LogSoftmaxCtx { y }` is produced by `softmax_device_lazy` on
+    // a `Dirty::Device` tensor, and the upstream grad flows from
     // `gather_last_dim_backward`'s device override. Skipping the host
-    // round-trip here kills the `[B, S, V] × 4 B ≈ 1 GB` DtoH that nsys
+    // round-trip kills the `[B, S, V] × 4 B ≈ 1 GB` DtoH that nsys
     // identified as the single largest readback per training step.
     let saved_on_device =
         store.tensor(y)?.dirty == Dirty::Device && store.tensor(y)?.device_handle.is_some();
@@ -264,10 +261,9 @@ pub(crate) fn log_softmax_backward(
         return Ok(smallvec![(x, grad_id)]);
     }
 
-    // Host-eager fallback: any backend (CPU/Metal) plus any case where
-    // the upstream or saved tensor is already host-resident. Mirrors the
-    // pre-Wave-1 reference and stays in lock-step with
-    // `cpu_log_softmax_backward` so device + host produce byte-identical
+    // Host-eager fallback: any backend (CPU/Metal) plus any case where the
+    // upstream or saved tensor is already host-resident. Stays in lock-step
+    // with `cpu_log_softmax_backward` so device + host produce identical
     // grads up to fp rounding.
     let output = store.tensor_host(y)?;
     let upstream = store.tensor_host(output_grad_id)?;

@@ -267,25 +267,14 @@ pub fn fused_linear_distill_loss(
     Ok(loss_id)
 }
 
-/// Forward-once chunked fused cross-entropy on HARD target tokens at a sparse
-/// set of hidden positions — the masked-CE writeback core (agent-OPD).
-///
-/// Takes the loss positions as an explicit `position_indices` list into
-/// `hidden`'s rows (the masked / LLM-generated predicting positions are a
-/// non-contiguous subset, so a `row_start..num_rows` range cannot express
-/// them). Per chunk it materializes only `[chunk_len, vocab]` logits in f32,
-/// never the full `[seq, vocab]` tile, and frees each chunk before the next —
+/// Chunked fused cross-entropy on hard target tokens at a sparse set of
+/// hidden positions — the masked-CE writeback core. Positions arrive as an
+/// explicit list: the masked / LLM-generated predicting positions are a
+/// non-contiguous subset a range cannot express. Per chunk it materializes
+/// only `[chunk_len, vocab]` logits and frees the chunk before the next —
 /// peak transient ≈ `chunk * vocab * 4` bytes instead of `seq * vocab * 4`.
-///
-/// `hidden`: `[1, seq, hidden_dim]` (or any shape whose last dim is
-/// `hidden_dim`); `weight`: `[vocab, hidden_dim]` (the lm_head, `logits =
-/// hidden @ weightᵀ`). `position_indices[i]` selects hidden row `p_i`;
-/// `target_tokens[i]` is its hard target token id. Loss = mean over the
-/// supplied positions of `-log_softmax(logits)[target]`; gradient
-/// `d_logits = (softmax - onehot(target)) / N` (N = #positions). `d_hidden`
-/// flows always (if `hidden.requires_grad`); `d_weight` only when the lm_head is
-/// trainable — in `--share-frozen-base` the head is frozen/tied, so only
-/// `d_hidden` is produced. f32 numerics throughout.
+/// `d_weight` is produced only when the lm_head is trainable; under
+/// `--share-frozen-base` the head is frozen/tied, so only `d_hidden` flows.
 #[allow(clippy::too_many_arguments)]
 pub fn fused_linear_ce_loss_indexed(
     hidden: TensorId,
@@ -308,9 +297,8 @@ pub fn fused_linear_ce_loss_indexed(
         ));
     }
 
-    // GPU backends (CUDA/Metal) run the chunked CE through the existing
-    // device-resident ops (embedding row-gather + matmul_bt + log_softmax +
-    // gather + sum); the host scalar loop below stays the CPU reference path.
+    // GPU backends compose the chunked CE from existing device-resident ops;
+    // the host scalar loop below is the CPU reference path.
     if !matches!(store.backend().device(), Device::Cpu) {
         return fused_linear_ce_loss_indexed_device(
             hidden,
@@ -334,8 +322,6 @@ pub fn fused_linear_ce_loss_indexed(
     let mut grad_hidden = need_hidden_grad.then(|| vec![0.0_f32; hidden_data.len()]);
     let mut grad_weight = need_weight_grad.then(|| vec![0.0_f32; weight_data.len()]);
     let num_targets = position_indices.len();
-    // CE with temperature=1: loss = mean over positions of -log p[target];
-    // d_logits = (softmax - onehot) / N. Both share the 1/N mean scale.
     let inv_n = inv_n_override.unwrap_or(1.0_f32 / num_targets as f32);
     let mut loss_sum = 0.0_f32;
 
@@ -414,18 +400,12 @@ pub fn fused_linear_ce_loss_indexed(
     Ok(loss_id)
 }
 
-/// GPU path for [`fused_linear_ce_loss_indexed`] — same masked-CE math and same
-/// per-chunk free discipline, but built from the existing device-resident
-/// autograd ops instead of a host scalar loop (no `to_host` of the
-/// `[vocab, hidden]` lm_head or the `[seq, hidden]` activations). Per
-/// position-chunk: `embedding(hidden_rows, chunk_positions)` (row-gather) →
-/// `matmul_bt(rows, weight)` → `log_softmax` → `gather(targets)` → `sum`, scaled
-/// by `-1/N`; a per-chunk sub-tape `backward_collect` yields the chunk's
-/// `grad_hidden` (and `grad_weight` if the head is trainable), accumulated into a
-/// running full-shape device grad and the chunk's `[chunk, vocab]` logits freed
-/// before the next chunk. The accumulated grads are saved on the `FusedLinearDistill`
-/// tape entry, so outer backward scales them by the upstream exactly like the host
-/// path.
+/// GPU path for [`fused_linear_ce_loss_indexed`] — same math and per-chunk free
+/// discipline, composed from device-resident autograd ops so the lm_head and
+/// activations never round-trip to host. A per-chunk sub-tape yields the
+/// chunk's grads, accumulated into a running full-shape device grad and saved
+/// on the `FusedLinearDistill` tape entry so outer backward scales them like
+/// the host path.
 #[allow(clippy::too_many_arguments)]
 fn fused_linear_ce_loss_indexed_device(
     hidden: TensorId,
@@ -444,8 +424,8 @@ fn fused_linear_ce_loss_indexed_device(
     let num_targets = position_indices.len();
     let inv_n = inv_n_override.unwrap_or(1.0_f32 / num_targets as f32);
 
-    // 2D view [total_rows, hidden_dim] so `embedding` can row-gather chunk
-    // positions. reshape is a metadata-only lazy op; grad flows back to `hidden`.
+    // 2D view so `embedding` can row-gather chunk positions; reshape is
+    // metadata-only and lazy, grad flows back to `hidden`.
     let total_rows = store.tensor(hidden)?.size / shape.hidden_dim;
     let mut view_tape = Tape::new();
     view_tape.set_enabled(false);
@@ -477,9 +457,8 @@ fn fused_linear_ce_loss_indexed_device(
         let mut chunk_tape = Tape::new();
         chunk_tape.set_enabled(requires_grad);
 
-        // `embedding` row-gathers but emits a [1, chunk, hidden] (implicit batch
-        // dim); reshape to rank-2 [chunk, hidden] so matmul_bt's rank-2 backward
-        // applies. reshape grad flows straight through to the embedding output.
+        // `embedding` emits a rank-3 [1, chunk, hidden]; reshape to rank-2 so
+        // matmul_bt's rank-2 backward applies. Grad flows through the reshape.
         let chunk_len = chunk_positions.len();
         let hidden_rows_3d =
             crate::ops::embedding(hidden_2d, &chunk_positions, store, &mut chunk_tape)?;
@@ -494,8 +473,8 @@ fn fused_linear_ce_loss_indexed_device(
         let gathered =
             crate::ops::gather_last_dim(log_probs, &chunk_targets, store, &mut chunk_tape)?;
         let summed = crate::ops::sum(gathered, store, &mut chunk_tape)?;
-        // loss contribution = -(Σ log p[target]) / N; backward seed 1.0 then
-        // gives d_logits = (softmax - onehot)/N, matching the host path.
+        // -(Σ log p[target]) / N; a 1.0 backward seed then yields
+        // d_logits = (softmax - onehot)/N, matching the host path.
         let chunk_loss = crate::ops::mul_scalar(summed, -inv_n, store, &mut chunk_tape)?;
         loss_sum += store.to_host(chunk_loss)?[0];
 
@@ -654,16 +633,12 @@ pub fn pg_token_weight(form: WeightForm, base: f32, r: f32, kl_coef: f32) -> (f3
 
 /// Per-token-weighted policy-gradient twin of [`fused_linear_ce_loss_indexed`]
 /// — a REINFORCE surrogate `Σ_p (-w_p · logπθ(t_p))` at a sparse set of hidden
-/// positions, chunked so it never materializes `[seq, vocab]`. Structure,
-/// dispatch, and grad-writeback mirror the CE op exactly; the ONLY difference is
-/// the per-position scale: the CE op uses a uniform `1/N`, this op uses
-/// `w_p = pg_token_weight(form, token_weight[p], r_p, kl_coef)` with
-/// `r = exp(logp − rollout_logprobs[p])` (importance ratio vs the behavior
-/// policy). `w` is a DETACHED weight: `loss += −w · logp`;
-/// `d_logits_p = w · (softmax(logits_p) − onehot(t))` — the gradient flows
-/// solely through `logp`, never through the ratio. `d_hidden` flows always (if
-/// `hidden.requires_grad`); `d_weight` only when the lm_head is trainable. f32
-/// numerics throughout. Also returns the k3 KL / clip diagnostics.
+/// positions, chunked so it never materializes `[seq, vocab]`. Structure and
+/// grad-writeback mirror the CE op; the only difference is the per-position
+/// scale `w_p = pg_token_weight(form, token_weight[p], r_p, kl_coef)` with
+/// `r = exp(logp − rollout_logprobs[p])`. `w` is DETACHED: the gradient flows
+/// solely through `logp`, never through the ratio. Also returns the k3 KL /
+/// clip diagnostics.
 #[allow(clippy::too_many_arguments)]
 pub fn fused_linear_pg_loss_indexed(
     hidden: TensorId,
@@ -787,7 +762,6 @@ pub fn fused_linear_pg_loss_indexed(
             );
             loss_sum -= w * logp;
 
-            // d_logits = w · (softmax − onehot), the CE gradient scaled by w.
             let mut dlogits = vec![0.0_f32; shape.vocab];
             for (vocab_index, dlogit) in dlogits.iter_mut().enumerate() {
                 *dlogit = w * log_probs[vocab_index].exp();
@@ -839,13 +813,10 @@ pub fn fused_linear_pg_loss_indexed(
 }
 
 /// GPU path for [`fused_linear_pg_loss_indexed`] — mirrors
-/// [`fused_linear_ce_loss_indexed_device`], but replaces the uniform
-/// `mul_scalar(summed, -1/N)` with a per-position detached weight vector
-/// `neg_w_p = -pg_token_weight(...)` applied elementwise to the gathered
-/// target log-probs before the sum. The ratio is evaluated on host from a
-/// per-chunk readback of the gathered log-probs (the only extra readback vs
-/// the CE path); the multiply feeds `d_logits_p = w_p·(softmax − onehot)` back
-/// through log_softmax, matching the host path.
+/// [`fused_linear_ce_loss_indexed_device`] but scales the gathered target
+/// log-probs by a per-position detached weight vector instead of a uniform
+/// `-1/N`. The ratio is evaluated on host from a per-chunk readback of the
+/// gathered log-probs — the only extra readback vs the CE path.
 #[allow(clippy::too_many_arguments)]
 fn fused_linear_pg_loss_indexed_device(
     hidden: TensorId,

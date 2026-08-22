@@ -7,12 +7,10 @@ use crate::{
 };
 
 pub fn sum(a: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<TensorId> {
-    // Route Dirty::Device inputs through the lazy `backend.sum_all`
-    // (composes `reshape -> sum_axis` into the MLX graph with no eval),
-    // but keep Dirty::Host and Dirty::Both inputs on the host fast path
-    // so we don't pay an unnecessary upload+device-reduce+readback for
-    // scalars whose producer already lives on host (e.g. a masked
-    // `sum(..., ...)` right after `mul`).
+    // Route Dirty::Device through the lazy `backend.sum_all` (composes
+    // `reshape -> sum_axis` into the MLX graph with no eval); keep
+    // Dirty::Host / Dirty::Both on the host fast path to avoid an
+    // upload+device-reduce+readback for host-resident scalars.
     let dirty = store.tensor(a)?.dirty.clone();
     match dirty {
         Dirty::Device => sum_device_lazy(a, store, tape),
@@ -21,11 +19,10 @@ pub fn sum(a: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<Tens
 }
 
 fn sum_device_lazy(a: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<TensorId> {
-    // Metal lazy path. `ensure_device` is a no-op here because the caller
-    // already routed in a Dirty::Device tensor; we re-call it defensively
-    // so a future Dirty::Both path lands on the correct side without silent
-    // drift. We extract scalar metadata in a scoped borrow so we never hit
-    // the `Tensor::clone` assert against `Dirty::Device`.
+    // `ensure_device` is a no-op here (caller routed in Dirty::Device);
+    // re-called defensively so a future Dirty::Both path lands correctly
+    // without silent drift. Scalar metadata is extracted in a scoped borrow
+    // to avoid the `Tensor::clone` assert against `Dirty::Device`.
     store.ensure_device(a)?;
     let input_shape = store.tensor(a)?.shape.clone();
     let input_handle = store
@@ -52,9 +49,8 @@ fn sum_device_lazy(a: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Res
 }
 
 fn sum_host_eager(a: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<TensorId> {
-    // Fast path for Dirty::Host / Dirty::Both inputs. Keeps
-    // host-resident reductions purely host-side — no FFI, no upload, no
-    // device scalar that the next op will have to pull back down.
+    // Keeps host-resident reductions purely host-side — no FFI, no upload,
+    // no device scalar the next op would have to pull back down.
     let input = store.tensor_host(a)?;
     let value = input.data.iter().sum::<f32>();
     let output_id = store.alloc(Tensor::new(vec![value], Vec::new(), input.requires_grad)?);
@@ -71,14 +67,12 @@ fn sum_host_eager(a: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Resu
 }
 
 pub fn mean(a: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<TensorId> {
-    // Route Dirty::Device inputs through a lazy `sum_all + mul_scalar`
-    // compose on the MLX graph (no new Backend trait method — reuses the
-    // existing lazy `sum_all` and `mul_scalar`).
-    // Hot path: CE-loss head `log_softmax → gather_last_dim → mean → mul_scalar`
-    // — without this the CE loss per-step flushes the full log-probs tensor
-    // back to host, reversing every upstream lazy win. Dirty::Host and
-    // Dirty::Both stay on the host fast path so host-resident scalars don't
-    // pay an upload+device-reduce+readback.
+    // Route Dirty::Device through a lazy `sum_all + mul_scalar` compose on
+    // the MLX graph (no new Backend trait method). Hot path: CE-loss head
+    // `log_softmax → gather_last_dim → mean → mul_scalar` — without this
+    // the per-step loss flushes the full log-probs tensor back to host,
+    // reversing every upstream lazy win. Dirty::Host / Dirty::Both stay
+    // host-side.
     let dirty = store.tensor(a)?.dirty.clone();
     match dirty {
         Dirty::Device => mean_device_lazy(a, store, tape),
@@ -219,14 +213,13 @@ pub(crate) fn mean_backward(
         return Err(AutogradError::TapeInvariant("mean backward input mismatch"));
     }
 
-    // Route Dirty::Device upstream through `mean_backward_device` so
-    // the scalar gradient is broadcast-scaled on-device. The host fallback
-    // (readback scalar + alloc `vec![v; N]`) is the *first* host op in the
-    // CE-loss backward chain — its Dirty::Host output would demote every
-    // downstream device override (`matmul_backward_device`,
-    // `log_softmax_last_axis_backward`, `gather_last_dim_backward`,
-    // `add_into_device`) to host, dragging the full `[B, S, V] ≈ 1 GB`
-    // logits tile back through DtoH per step.
+    // Route Dirty::Device upstream through `mean_backward_device` so the
+    // scalar grad is broadcast-scaled on-device. The host fallback (readback
+    // scalar + alloc `vec![v; N]`) is the *first* host op in the CE-loss
+    // backward chain — its Dirty::Host output would demote every downstream
+    // device override (`matmul_backward_device`, `log_softmax_last_axis_backward`,
+    // `gather_last_dim_backward`, `add_into_device`) to host, dragging the
+    // `[B, S, V] ≈ 1 GB` logits tile back through DtoH per step.
     let input_shape = store.tensor(a)?.shape.clone();
     let device_path_ok = {
         let upstream = store.tensor(output_grad_id)?;

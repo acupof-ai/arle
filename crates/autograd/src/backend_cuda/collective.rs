@@ -63,8 +63,8 @@ pub(super) fn cuda_all_gather_seq_device(
 
     // No communicator (single-process / CPU parity path): identity — the
     // gathered full sequence equals this rank's local shard (world==1).
-    // Device buffers are functional (write-fresh; see add_into_device), and
-    // this branch skips the in-place NCCL write, so sharing the input Arc is
+    // Buffers are functional (write-fresh; see add_into_device), and this
+    // branch skips the in-place NCCL write, so sharing the input Arc is
     // safe — no alloc, no D2D copy.
     #[cfg(all(feature = "nccl", not(feature = "no-cuda")))]
     let world = backend.comm(axis).map_or(1, |nccl| nccl.world_size());
@@ -327,8 +327,8 @@ pub(super) fn cuda_all_to_all_device(
     let world = backend.comm(axis).map_or(1, |nccl| nccl.world_size());
     #[cfg(not(all(feature = "nccl", not(feature = "no-cuda"))))]
     let world = 1usize;
-    // Single rank: no rank to shuffle to — identity on shape and value.
-    // Share the input Arc (functional buffers) — no alloc, no D2D copy.
+    // Single rank: identity. Share the input Arc (functional buffers) —
+    // no alloc, no D2D copy.
     if world <= 1 {
         return Ok((x.clone(), in_shape.to_vec()));
     }
@@ -414,7 +414,7 @@ pub(super) fn cuda_all_to_all_device(
         }
 
         // Recv assembly: concat the N chunks (source-rank order) along the
-        // scatter axis, on-device (see `cuda_concat_axis`).
+        // scatter axis, on-device.
         let recv_handles: Vec<DeviceHandle> = (0..n)
             .map(|j| {
                 if j == rank {

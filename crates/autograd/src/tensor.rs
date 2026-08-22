@@ -50,25 +50,10 @@ impl Clone for Tensor {
             ),
             "restore an off-host checkpoint before cloning"
         );
-        // P3.1 (post-Wave-1): mirror the `TensorStore::clone_tensor`
-        // discipline at the `Tensor` level — when the source is
-        // `Dirty::Device` (host data is empty/stale, the truth lives on
-        // device), preserve the `Arc`-shared `DeviceHandle` (ref-count
-        // bump, no extra alloc) instead of panicking. Callers that need
-        // host data are expected to `ensure_host` first; callers that
-        // only need shape/metadata or that route the clone back through
-        // a device path (which is the entire post-P3.1 backward chain)
-        // see a clone that still has device residency.
-        //
-        // Pre-P3.1 this asserted `dirty != Dirty::Device`. The
-        // assertion was load-bearing for the *post* M5.3b world where
-        // `Tape::backward`'s `flush_to_host_batch` made every tape output
-        // `Dirty::Both` before any clone. Once P3.1 dropped that flush
-        // on CUDA (it was the 1 GB DtoH), assorted backward ops still
-        // doing `store.tensor(x)?.clone()` (rope, rms_norm, silu, ...)
-        // hit the assert. Preserving the handle is the right fix; the
-        // host-only fallback paths inside those ops already
-        // `ensure_host(x)` before they touch `.data`.
+        // Dirty::Device: host data is empty/stale — preserve the Arc-shared
+        // DeviceHandle (ref-count bump, no alloc) instead of panicking.
+        // Callers needing host data `ensure_host` first; host-only backward
+        // fallbacks already do.
         Self {
             data: if self.dirty == Dirty::Device {
                 Vec::new()
@@ -751,16 +736,11 @@ impl TensorStore {
         Ok(self.alloc(tensor))
     }
 
-    /// Replace an existing tensor's device handle with a fresh one, marking
-    /// the host copy stale (`Dirty::Device`) and clearing the cached host
-    /// `data` buffer.
-    ///
-    /// Used by the device-backed AdamW path (M5.3b.10): the optimizer
-    /// produces a new `DeviceHandle` for each updated parameter and we must
-    /// install it without going through `get_mut` — `get_mut` auto-triggers
-    /// `ensure_host`, which would re-download the old pre-update values and
-    /// then mark the tensor `Dirty::Host`, forcing a full re-upload on the
-    /// next forward pass. That is the exact churn this path exists to kill.
+    /// Replace a tensor's device handle, marking the host copy stale and
+    /// clearing the cached host `data`. Bypasses `get_mut`, whose
+    /// `ensure_host` would re-download the old values, mark `Dirty::Host`,
+    /// and force a full re-upload on the next forward — the churn the
+    /// device-backed AdamW path exists to kill.
     pub fn replace_device_handle(&mut self, id: TensorId, handle: DeviceHandle) -> Result<()> {
         self.discard_checkpoint_copy(id)?;
         let tensor = self.raw_tensor_mut(id)?;
@@ -890,8 +870,6 @@ impl TensorStore {
         Ok(freed)
     }
 
-    /// Checkpoint-only host offload with a reusable host buffer and a minimum
-    /// tensor size threshold. Returns device bytes freed.
     pub fn offload_checkpoint_to_host(&mut self, id: TensorId) -> Result<usize> {
         let min_bytes = crate::runtime_flags::checkpoint_offload_min_bytes();
         let (size, bytes, handle) = {
@@ -981,10 +959,9 @@ impl TensorStore {
         Ok(freed)
     }
 
-    /// Flip a tensor's `requires_grad` flag in place (host-side metadata only;
-    /// does not touch device residency). Used to freeze a parameter — e.g. the
-    /// SOPD EMA adapter, which is a frozen teacher param updated host-side, not
-    /// through autograd.
+    /// Flip `requires_grad` in place (metadata only; device residency
+    /// untouched). Used to freeze a parameter updated host-side, not through
+    /// autograd — e.g. the SOPD EMA adapter.
     pub fn set_requires_grad(&mut self, id: TensorId, requires_grad: bool) -> Result<()> {
         self.raw_tensor_mut(id)?.requires_grad = requires_grad;
         Ok(())
@@ -1127,14 +1104,10 @@ impl TensorStore {
         self.get_mut(id).ok_or(AutogradError::InvalidTensorId(id))
     }
 
-    /// P3.1: Read a tensor by id with `ensure_host` applied first, then
-    /// return an owned clone. This is the "I want host data" version
-    /// that op-backward host fallbacks should call instead of
-    /// `store.tensor(x)?.clone()`. Pre-P3.1, every `tensor(x)?.clone()`
-    /// was safe because `Tape::backward`'s `flush_to_host_batch` made
-    /// every tape output `Dirty::Both` before any backward op ran. With
-    /// the flush gone on CUDA, host-only backward ops have to be
-    /// explicit about their host residency requirement.
+    /// Read a tensor by id with `ensure_host` applied first, then return an
+    /// owned clone. The host-residency version op-backward host fallbacks
+    /// call instead of `tensor(x)?.clone()` — with the pre-backward host
+    /// flush gone, host-only ops must be explicit about residency.
     pub fn tensor_host(&mut self, id: TensorId) -> Result<Tensor> {
         self.ensure_host(id)?;
         Ok(self.tensor(id)?.clone())
@@ -1153,24 +1126,12 @@ impl TensorStore {
     }
 
     pub(crate) fn clone_tensor(&mut self, id: TensorId) -> Result<TensorId> {
-        // Wave 1 (post-M5.3b nsys attribution): preserve the device
-        // handle on `Dirty::Device` tensors so the post-backward grad map
-        // doesn't force a host readback for tensors that subsequent
-        // backward ops will consume on-device. A plain `ensure_host` here
-        // would, on the `[B, S, V] ≈ 1 GB`
-        // log_softmax grad, trigger the same readback the pre-backward
-        // flush used to. The device-aware backward overrides on `CudaBackend`
-        // (and the dispatchers in `ops::softmax::log_softmax_backward` /
-        // `ops::gather::gather_last_dim_backward`) keep the chain
-        // device-resident as long as the grad never gets touched through
-        // a host-only path.
-        //
-        // `DeviceHandle` is `Arc`-shared (`CudaStorage`'s `Arc<CudaSlice<f32>>`,
-        // `MlxHandle`'s `Arc<MlxHandleInner>`), so cloning the handle is a
-        // ref-count bump — no extra device allocation. Grads are write-once
-        // (each backward emits a fresh handle), so aliasing the storage is
-        // sound: nothing in the autograd graph mutates a tape entry's
-        // output buffer in place.
+        // Dirty::Device: preserve the device handle so the grad map doesn't
+        // force a host readback for tensors subsequent backward ops consume
+        // on-device — a plain `ensure_host` would read back the ~1 GB
+        // log_softmax grad. The handle is Arc-shared, so cloning is a
+        // ref-count bump, no extra allocation. Grads are write-once, so
+        // aliasing the storage is sound.
         let dirty = self.tensor(id)?.dirty.clone();
         if dirty == Dirty::Device {
             let source = self.tensor(id)?;

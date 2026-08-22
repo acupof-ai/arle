@@ -26,11 +26,9 @@ pub use cuda_kernels::ring_attention::{
     PairClass, PosRun, classify_pair, contiguous_pos_runs, ring_backward_tile, ring_forward_tile,
 };
 
-// --- Differentiable tape op ---
-//
 // `cp_causal_sdpa` folds q/k/v `[B,H,S,D]` into per-(batch·head) tiles and runs
-// the verified ring kernels. At world==1 there is ONE local KV block (q_abs=0),
-// so it degenerates to plain causal attention and is gate-able on CPU against
+// the verified ring kernels. At world==1 there is ONE local KV block, so it
+// degenerates to plain causal attention and is gate-able on CPU against
 // `causal_sdpa_recompute`. The multi-rank ring feeds additional remote KV blocks
 // into the SAME tile kernels via the pending-remote NCCL transport; the merge and
 // its adjoint (the U2 risk) are identical and already verified.
@@ -121,9 +119,8 @@ pub fn cp_causal_sdpa_with_prefix(
     }
 
     // CPU / world==1: the whole local sequence is one KV block. With a prefix,
-    // concatenate prefix+gen k/v and run plain causal SDPA with q_start=gen_start
-    // (identical to the non-CP frozen path). Gen k/v arrive at kv_heads width;
-    // repeat to full heads to match the prefix (which is repeat_kv'd at capture).
+    // concatenate prefix+gen k/v and run plain causal SDPA with q_start=gen_start.
+    // Gen k/v arrive at kv_heads width; repeat to full heads to match the prefix.
     if let Some((prefix_k, prefix_v)) = prefix {
         let kv_heads = store.tensor(k)?.shape[1];
         let kv_repeat = h / kv_heads;
@@ -228,10 +225,8 @@ fn cp_causal_sdpa_device_ring(
     let scale = 1.0 / (d as f32).sqrt();
     let num_q_tiles = b * h;
     // Absolute position of each local q row: `positions` if given (zigzag shard),
-    // else the contiguous default `cp_rank*s + row`. The kernel masks by these
-    // per-row positions (not a scalar base), so a non-contiguous zigzag shard
-    // attends the right causal prefix. f32 (exact for seq < 2^24) so positions ride
-    // the same f32 ring as k/v — each rank declares only its own, no equal-shard math.
+    // else the contiguous default. f32 (exact for seq < 2^24) so positions ride
+    // the same f32 ring as k/v — each rank declares only its own.
     let q_pos: Vec<usize> = match positions {
         Some(p) => p.to_vec(),
         None => (0..s).map(|r| cp_rank * s + r).collect(),
@@ -255,10 +250,8 @@ fn cp_causal_sdpa_device_ring(
     let rows = num_q_tiles * s;
 
     // Accumulator init: M=-inf, L=0, O=0 (device-resident, f32). With a frozen
-    // prompt prefix, run one extra merge step against the full prefix K/V first —
-    // every q row (abs position >= gen_start) can attend to every prefix row
-    // (0..gen_start), so the causal mask passes all prefix keys. The prefix is
-    // full-heads width (repeat_kv'd at capture), so num_kv_heads = num_q_heads.
+    // prompt prefix, merge against the full prefix K/V first — every q row can
+    // attend to every prefix row, so the causal mask passes all prefix keys.
     let mut acc_m = store
         .backend()
         .upload(&vec![f32::NEG_INFINITY; rows], &[rows])?;
@@ -272,7 +265,6 @@ fn cp_causal_sdpa_device_ring(
         store.ensure_device(prefix_v)?;
         let pk_h = device_handle(store, prefix_k, "ring prefix k")?;
         let pv_h = device_handle(store, prefix_v, "ring prefix v")?;
-        // Prefix positions are always 0..gen_start (contiguous from 0).
         let prefix_pos: Vec<usize> = (0..gen_start).collect();
         let prefix_pos_f32: Vec<f32> = (0..gen_start).map(|p| p as f32).collect();
         let prefix_pos_h = store.backend().upload(&prefix_pos_f32, &[gen_start])?;
@@ -306,15 +298,11 @@ fn cp_causal_sdpa_device_ring(
         None
     };
 
-    // Rotate fresh k/v handles + their positions so the tape inputs stay immutable;
-    // save each step's block handles + k_pos Vec for the backward replay. k_pos
-    // starts as THIS rank's own positions and rings with k/v — the block arriving
-    // at step j carries the true positions of the rank that owns it (contiguous or
-    // zigzag), so no rank computes another's layout.
+    // Rotate fresh k/v handles + their positions so the tape inputs stay
+    // immutable; k_pos starts as THIS rank's own positions and rings with k/v,
+    // so the block arriving at step j carries the true positions of its owner.
     let mut k_cur = device_handle(store, k, "ring k")?;
     let mut v_cur = device_handle(store, v, "ring v")?;
-    // This rank's own k rows. Defaults to the q positions, which is exact when q is
-    // the whole local shard — the only shape that existed before q was tiled.
     let mut kpos_vec: Vec<usize> = match k_positions {
         Some(p) => p.to_vec(),
         None => q_pos.clone(),
@@ -336,8 +324,7 @@ fn cp_causal_sdpa_device_ring(
         acc_m = m2;
         acc_l = l2;
         acc_o = o2;
-        // Persist this step's block + its positions for backward, then rotate all
-        // three (k, v, k_pos) one hop so the next block's positions match its k/v.
+        // Persist this step's block for backward, then rotate all three one hop.
         let k_id = store.alloc_device_tensor(kv_shape.clone(), k_cur.clone())?;
         let v_id = store.alloc_device_tensor(kv_shape.clone(), v_cur.clone())?;
         step_blocks.push((k_id, v_id, kpos_vec.clone()));
@@ -447,7 +434,7 @@ pub(crate) fn cp_ring_attention_backward(
         );
     }
 
-    // world==1: one local block covers everything (host reference path).
+    // world==1 host reference path: one local block covers everything.
     let (k, v, k_pos) = &blocks[0];
     let (k, v, k_pos) = (*k, *v, k_pos.as_slice());
     let need = store.tensor(q)?.requires_grad
@@ -501,16 +488,12 @@ pub(crate) fn cp_ring_attention_backward(
     Ok(grads)
 }
 
-/// Device ring backward. `input_ids = [q, k, v]` are THIS rank's local shards;
-/// `blocks[j]` are the rotated (k, v, k_pos) handles the forward saved per step.
-/// Recompute each block's (grad_q, grad_k, grad_v) from the saved out/lse,
-/// accumulate grad_q locally, and ring grad_k/grad_v BACK to their owners: step j's
-/// block came from j hops forward, so its grad returns via `cp_size - j` more
-/// forward hops (a full loop), landing each on the rank whose LOCAL k/v produced
-/// it, where it sums. Rank-symmetric — the ring-home is a function of the hop
-/// count `j`, not of `cp_rank`. Contiguous only (the scalar kernel), so positions
-/// are `pos[0]` bases; zigzag per-row positions have a CPU forward but no device
-/// kernel.
+/// Device ring backward. Recompute each block's grads from the saved out/lse,
+/// accumulate grad_q locally, and ring grad_k/grad_v BACK to their owners: step
+/// j's block came from j hops forward, so its grad returns via `cp_size - j`
+/// more hops — the ring-home is a function of `j`, not of `cp_rank`.
+/// Contiguous only (the scalar kernel); zigzag per-row positions have a CPU
+/// forward but no device kernel.
 #[allow(clippy::too_many_arguments)]
 fn cp_ring_attention_backward_device(
     input_ids: &[TensorId],
@@ -551,23 +534,20 @@ fn cp_ring_attention_backward_device(
     let lse_h = device_handle(store, lse, "ring lse")?;
     store.ensure_device(output_grad_id)?;
     let dout_h = device_handle(store, output_grad_id, "ring d_out")?;
-    // q positions (this rank's rows) uploaded once; each block re-uploads its saved
-    // k positions so the kernel masks by true position (matches the forward).
+    // q positions uploaded once; each block re-uploads its saved k positions so
+    // the kernel masks by true position (matches the forward).
     let q_pos_f32: Vec<f32> = q_pos.iter().map(|&p| p as f32).collect();
     let q_pos_h = store.backend().upload(&q_pos_f32, &[rows])?;
 
-    // grad_q accumulates across blocks (device-resident); start at zeros.
     let mut grad_q = store.backend().upload(
         &vec![0.0f32; num_q_tiles * rows * d],
         &[num_q_tiles * rows * d],
     )?;
 
-    // Frozen-prompt-KV prefix replay: run the backward block against the full
-    // prefix K/V. The prefix is a constant leaf (requires_grad=false), so its
-    // grad_k/grad_v are dropped — only grad_q is kept. Prefix is full-heads width
-    // (repeat_kv'd at capture), so num_kv_heads = num_q_heads. Prefix is NOT
-    // ring-backed: every rank holds the full prefix, so there's no owner to return
-    // its grad to.
+    // Frozen-prompt prefix replay: the prefix is a constant leaf
+    // (requires_grad=false), so its grad_k/grad_v are dropped — only grad_q is
+    // kept. Prefix is NOT ring-backed: every rank holds the full prefix, so
+    // there's no owner to return its grad to.
     if let Some((prefix_k, prefix_v, gen_start)) = prefix {
         let prefix_len = *gen_start;
         let pk_h = device_handle(store, *prefix_k, "ring prefix k")?;
@@ -601,7 +581,6 @@ fn cp_ring_attention_backward_device(
         grad_q = gq2;
     }
 
-    // Per-step grad_k/grad_v handles, produced in forward-ring order.
     let mut step_gk: smallvec::SmallVec<[DeviceHandle; 4]> = smallvec![];
     let mut step_gv: smallvec::SmallVec<[DeviceHandle; 4]> = smallvec![];
     for (k_id, v_id, k_pos) in blocks.iter() {
@@ -628,10 +607,8 @@ fn cp_ring_attention_backward_device(
         step_gv.push(gv_b);
     }
 
-    // Ring each step's grad block back to its owner and sum. Step j's block was
-    // received after j forward hops; `cp_size - j` more forward hops complete the
-    // loop, returning it to the rank that owns that K/V — where it accumulates
-    // into that rank's local grad. Every rank issues the same symmetric rotations.
+    // Ring each step's grad block back to its owner: `cp_size - j` more forward
+    // hops complete the loop, returning it to the rank that owns that K/V.
     let mut gk_acc = store
         .backend()
         .upload(&vec![0.0f32; block_elems], &[block_elems])?;

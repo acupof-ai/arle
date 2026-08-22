@@ -9,9 +9,9 @@ use crate::{
 
 /// Differentiable all-reduce sum over the world group.
 ///
-/// Forward computes `y = sum_rank(x_rank)` through the backend collective.
-/// Backward applies the adjoint collective, so a loss evaluated on every rank
-/// returns the gradient of the distributed total loss.
+/// Forward is `y = sum_rank(x_rank)`. Backward applies the adjoint collective,
+/// so a loss evaluated on every rank returns the gradient of the distributed
+/// total loss.
 pub fn all_reduce_sum(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<TensorId> {
     store.ensure_device(x)?;
     let (shape, input_handle) = {
@@ -89,9 +89,9 @@ pub(crate) fn all_reduce_sum_backward(
 /// Differentiable all-gather over the sequence axis (context parallelism).
 ///
 /// Forward gathers each rank's local shard `[1, S/N, H]` into the full
-/// `[1, S, H]`; `full_shape` is the gathered result. Backward reduce-scatters the
-/// upstream grad back to this rank's shard (the adjoint of a gather). Single-rank
-/// semantics are identity (`full_shape == local_shape`).
+/// `[1, S, H]` (`full_shape`). Backward reduce-scatters the upstream grad
+/// back to this rank's shard (the adjoint of a gather). Single-rank is
+/// identity (`full_shape == local_shape`).
 pub fn all_gather_seq(
     x: TensorId,
     full_shape: Vec<usize>,
@@ -164,10 +164,10 @@ pub(crate) fn all_gather_seq_backward(
     Ok(smallvec![(x, grad_id)])
 }
 
-/// Differentiable reduce-scatter sum over the sequence axis — the adjoint pair of
-/// [`all_gather_seq`]. Forward sums the full `[1, S, H]` across ranks and keeps
-/// this rank's `[1, S/N, H]` row slice; backward all-gathers the upstream grad
-/// back to full. `local_shape` is this rank's output shard.
+/// Differentiable reduce-scatter sum over the sequence axis — the adjoint
+/// pair of [`all_gather_seq`]. Forward sums the full `[1, S, H]` across ranks
+/// and keeps this rank's `[1, S/N, H]` slice (`local_shape`); backward
+/// all-gathers the upstream grad back to full.
 pub fn reduce_scatter_sum(
     x: TensorId,
     local_shape: Vec<usize>,
@@ -239,14 +239,13 @@ pub(crate) fn reduce_scatter_sum_backward(
     Ok(smallvec![(x, grad_id)])
 }
 
-/// Differentiable all-to-all that swaps a *scatter* axis for a *gather* axis —
-/// the linear-attention CP transport (Megatron `MambaContextParallel`). Forward
-/// splits `scatter_axis` across ranks and concatenates each rank's slice along
-/// `gather_axis`: `[seq/N, b, hidden]` → `[seq, b, hidden/N]` (full sequence for
-/// 1/N of the heads). It is self-adjoint with the two axes swapped, so backward
-/// is the same op reversed. Single-rank / CPU is identity (`out_shape ==
-/// in_shape`), which is the locally-verifiable core; the multi-rank NCCL shuffle
-/// is pod-gated like the other collectives.
+/// Differentiable all-to-all swapping a *scatter* axis for a *gather* axis —
+/// the linear-attention CP transport (Megatron `MambaContextParallel`).
+/// Forward splits `scatter_axis` across ranks and concatenates each rank's
+/// slice along `gather_axis`: `[seq/N, b, hidden]` → `[seq, b, hidden/N]`.
+/// Self-adjoint with the two axes swapped, so backward is the same op
+/// reversed. Single-rank / CPU is identity (`out_shape == in_shape`), the
+/// locally-verifiable core; the multi-rank NCCL shuffle is pod-gated.
 pub fn all_to_all(
     x: TensorId,
     scatter_axis: usize,
@@ -327,8 +326,7 @@ pub(crate) fn all_to_all_backward(
             .clone();
         (handle, tensor.shape.clone())
     };
-    // Adjoint = the same shuffle with scatter/gather swapped, mapping the upstream
-    // grad back to this rank's input shape.
+    // Adjoint = the same shuffle with scatter/gather swapped.
     let (grad_handle, grad_shape) = store.backend().all_to_all_device(
         &upstream_handle,
         &upstream_shape,

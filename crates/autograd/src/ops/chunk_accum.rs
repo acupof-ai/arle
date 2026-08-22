@@ -1,5 +1,5 @@
-//! Chunked forward/backward accumulators. Both write one device buffer in place,
-//! so the quadratic fold that OOM'd the 131072 forward is unwritable here.
+//! Chunked forward/backward accumulators. Both write one device buffer in
+//! place, so the quadratic fold that OOM'd the 131072 forward is unwritable.
 
 use crate::{
     AutogradError, Result,
@@ -27,7 +27,6 @@ fn sole_owned_handle(id: TensorId, store: &mut TensorStore) -> Result<DeviceHand
     Ok(handle.clone())
 }
 
-/// Output rows partition by chunk: disjoint ranges assigned into one buffer.
 pub struct SeqAccum {
     id: TensorId,
     shape: Vec<usize>,
@@ -51,7 +50,6 @@ impl SeqAccum {
         })
     }
 
-    /// Never clone the handle behind it; the next write errors on a shared buffer.
     pub fn id(&self) -> TensorId {
         self.id
     }
@@ -87,7 +85,6 @@ impl SeqAccum {
     }
 }
 
-/// Every chunk contributes to the whole tensor: one buffer summed in place.
 pub struct ChunkSum {
     id: Option<TensorId>,
 }
@@ -97,7 +94,6 @@ impl ChunkSum {
         Self { id: None }
     }
 
-    /// See `SeqAccum::id`.
     pub fn id(&self) -> Option<TensorId> {
         self.id
     }
@@ -123,8 +119,8 @@ impl ChunkSum {
         Ok(())
     }
 
-    /// Evict until the next `add`. Never after the last chunk — `finish` re-uploads,
-    /// making it a whole-accumulator round trip for nothing.
+    /// Evict until the next `add`. Never after the last chunk — `finish`
+    /// re-uploads, a whole-accumulator round trip for nothing.
     pub fn park(&mut self, store: &mut TensorStore) -> Result<()> {
         let Some(id) = self.id else { return Ok(()) };
         if store.tensor(id)?.size * size_of::<f32>()
@@ -135,7 +131,6 @@ impl ChunkSum {
         Ok(())
     }
 
-    /// Brings a parked accumulator back to device.
     pub fn finish(self, store: &mut TensorStore) -> Result<Option<TensorId>> {
         if let Some(id) = self.id {
             store.ensure_device(id)?;

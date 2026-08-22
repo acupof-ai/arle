@@ -11,12 +11,11 @@ const INV_SQRT_2: f32 = 0.707_106_77;
 const INV_SQRT_2PI: f32 = 0.398_942_3;
 
 pub fn exp(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<TensorId> {
-    // Route Dirty::Device inputs through the lazy `backend.exp`
-    // (pipes a single `mlx_exp` node into the MLX graph, no eval).
-    // Dirty::Host / Dirty::Both stay on the host fast path so
-    // host-resident producers don't pay an upload+device-compute+readback.
-    // Backward reads the saved output via `tape.backward`'s pre-walk flush,
-    // so `exp_backward` always sees Dirty::Host even when the forward stays lazy.
+    // Route Dirty::Device through the lazy `backend.exp` (one `mlx_exp`
+    // node, no eval); Dirty::Host / Dirty::Both stay host-side to avoid an
+    // upload+compute+readback. Backward reads the saved output via
+    // `tape.backward`'s pre-walk flush, so `exp_backward` always sees
+    // Dirty::Host even when the forward stays lazy.
     let dirty = store.tensor(x)?.dirty.clone();
     match dirty {
         Dirty::Device => exp_device_lazy(x, store, tape),
@@ -25,7 +24,7 @@ pub fn exp(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<Tens
 }
 
 fn exp_device_lazy(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<TensorId> {
-    // Defensive `ensure_device`: caller already routed a Dirty::Device
+    // Defensive `ensure_device`: the caller already routed a Dirty::Device
     // tensor, but re-calling guards a future Dirty::Both path from silent
     // drift (mirrors `silu_device_lazy`).
     store.ensure_device(x)?;
@@ -70,13 +69,12 @@ fn exp_host_eager(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Resu
 }
 
 pub fn gelu(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<TensorId> {
-    // Route Dirty::Device inputs through the lazy `backend.gelu`
-    // (erf-form, composed from `mlx_multiply → mlx_erf → mlx_add →
-    // mlx_multiply` on the MLX graph). Dispatch covers both Dirty::Device
-    // and Dirty::Both so post-matmul and reshape-reentry inputs both stay
-    // lazy. `gelu_backward` uses the erf derivative of the saved input;
-    // tape.backward's pre-walk batch flush materializes the input before
-    // the backward walk, so saving `x` here is safe.
+    // Route Dirty::Device through the lazy `backend.gelu` (erf-form,
+    // composed from `mlx_multiply → mlx_erf → mlx_add → mlx_multiply`);
+    // dispatch covers Dirty::Both so post-matmul / reshape-reentry inputs
+    // stay lazy. `gelu_backward` uses the erf derivative of the saved
+    // input; tape.backward's pre-walk flush materializes it first, so
+    // saving `x` here is safe.
     let has_device_handle = {
         let t = store.tensor(x)?;
         t.device_handle.is_some() && t.dirty != Dirty::Host
@@ -135,12 +133,10 @@ fn gelu_host_eager(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Res
 }
 
 pub fn silu(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<TensorId> {
-    // Route Dirty::Device inputs through the lazy `backend.silu`
-    // (composes `mlx_multiply(x, mlx_sigmoid(x))` into the MLX graph with
-    // no eval). Dirty::Host / Dirty::Both stay on the host fast path so
-    // host-resident producers don't pay an upload+device-compute+readback.
-    // Backward stays host-only — `silu_backward` clones `x` and forces a host
-    // readback of whatever Dirty state it is in.
+    // Route Dirty::Device through the lazy `backend.silu` (composes
+    // `mlx_multiply(x, mlx_sigmoid(x))` with no eval); Dirty::Host /
+    // Dirty::Both stay host-side. Backward is host-only — `silu_backward`
+    // clones `x` and forces a host readback of whatever Dirty state it is in.
     let dirty = store.tensor(x)?.dirty.clone();
     match dirty {
         Dirty::Device => silu_device_lazy(x, store, tape),
@@ -149,7 +145,7 @@ pub fn silu(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<Ten
 }
 
 fn silu_device_lazy(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<TensorId> {
-    // Defensive `ensure_device`: caller already routed a Dirty::Device
+    // Defensive `ensure_device`: the caller already routed a Dirty::Device
     // tensor, but re-calling guards a future Dirty::Both path from silent
     // drift (mirrors `softmax_device_lazy`).
     store.ensure_device(x)?;
@@ -194,11 +190,10 @@ fn silu_host_eager(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Res
 }
 
 pub fn sigmoid(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<TensorId> {
-    // Route Dirty::Device inputs through the lazy `backend.sigmoid`
-    // (pipes a single `mlx_sigmoid` node into the MLX graph, no eval).
-    // Dirty::Host stays on the host fast path. Dispatch covers Dirty::Both
-    // so post-matmul / post-reshape inputs also stay lazy. Backward reads
-    // the saved output `y` via `tape.backward`'s pre-walk flush, so
+    // Route Dirty::Device through the lazy `backend.sigmoid` (one
+    // `mlx_sigmoid` node, no eval); dispatch covers Dirty::Both so
+    // post-matmul / post-reshape inputs stay lazy. Backward reads the
+    // saved output `y` via `tape.backward`'s pre-walk flush, so
     // `sigmoid_backward` always sees Dirty::Host even when forward stays lazy.
     let has_device_handle = {
         let t = store.tensor(x)?;
@@ -273,10 +268,9 @@ pub(crate) fn exp_backward(
     };
 
     // Route the (upstream, saved-output) pair through `exp_backward_device`
-    // when both tensors are device-resident. A host path (via `tensor_host`'s
-    // `ensure_host`) would demote the saved output from Dirty::Device →
-    // Dirty::Both, poisoning every downstream op that re-reads `y`. Keeping
-    // both on-device keeps the backward chain unbroken.
+    // when both are device-resident. A host path (`tensor_host`'s
+    // `ensure_host`) would demote the saved output Dirty::Device →
+    // Dirty::Both, poisoning every downstream op that re-reads `y`.
     let upstream_shape = store.tensor(output_grad_id)?.shape.clone();
     let y_shape = store.tensor(y_id)?.shape.clone();
     if y_shape != upstream_shape {
@@ -335,8 +329,6 @@ pub(crate) fn gelu_backward(
         return Ok(GradPairs::new());
     }
 
-    // Route through `gelu_backward_device` whenever upstream and
-    // saved input are both device-resident.
     let upstream_shape = store.tensor(output_grad_id)?.shape.clone();
     let x_shape = store.tensor(x)?.shape.clone();
     if x_shape != upstream_shape {
@@ -405,8 +397,6 @@ pub(crate) fn silu_backward(
         return Ok(GradPairs::new());
     }
 
-    // Route through `silu_backward_device` whenever upstream and
-    // saved input are both device-resident.
     let upstream_shape = store.tensor(output_grad_id)?.shape.clone();
     let x_shape = store.tensor(x)?.shape.clone();
     if x_shape != upstream_shape {
@@ -479,8 +469,6 @@ pub(crate) fn sigmoid_backward(
         ));
     };
 
-    // Route through `sigmoid_backward_device` whenever upstream
-    // and saved output are both device-resident.
     let upstream_shape = store.tensor(output_grad_id)?.shape.clone();
     let y_shape = store.tensor(y)?.shape.clone();
     if y_shape != upstream_shape {

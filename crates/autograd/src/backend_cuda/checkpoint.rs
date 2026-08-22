@@ -7,10 +7,10 @@ pub(super) const PINNED_SLOT_GRANULARITY: usize = 16 << 20;
 
 /// Reusable pinned host buffers holding parked checkpoint activations.
 ///
-/// Slots are permanent once allocated; a slot may be larger than the activation, so
-/// every copy names its own length (cudarc's typed memcpy copies the whole dst).
-/// Ordering = the backend's single stream; copies pass plain slices, which record no
-/// host-visible event, so `checkpoint_pin_readback` drains the stream itself.
+/// Slots are permanent once allocated; a slot may be larger than the activation,
+/// so every copy names its own length (cudarc's typed memcpy copies the whole
+/// dst). Copies pass plain slices, which record no host-visible event, so
+/// `checkpoint_pin_readback` drains the stream itself.
 #[cfg(not(feature = "no-cuda"))]
 #[derive(Default)]
 pub(super) struct PinnedCheckpointPool {

@@ -1,12 +1,11 @@
-//! Train-time runtime toggles: `arle train … --flag` →
-//! [`apply_runtime_flags`] once at CLI start. The statics are the single
-//! truth — no env reads.
+//! Train-time runtime toggles: `arle train … --flag` → [`apply_runtime_flags`]
+//! once at CLI start. The statics are the single truth — no env reads.
 
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering::Relaxed};
 
 /// Storage dtype for forward-retained activations + transient emitted grads
-/// (`--tape-precision`). CUDA-only; compute (cuBLAS accumulate), persistent grad
-/// accumulators, and every fp32 island are unaffected.
+/// (`--tape-precision`). CUDA-only; cuBLAS accumulate, persistent grad
+/// accumulators, and fp32 islands are unaffected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TapePrecision {
     Fp32 = 0,
@@ -19,32 +18,20 @@ impl TapePrecision {
     }
 }
 
-/// Autograd knobs the OPD CLI flags control (defaults = shipped behavior).
+/// Autograd knobs the OPD CLI flags control.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AutogradRuntimeFlags {
-    /// Min tensor bytes for checkpoint host offload (`--checkpoint-offload-min-bytes`).
     pub checkpoint_offload_min_bytes: usize,
-    /// Reload a host-offloaded checkpoint to device before its backward replay
-    /// (`--checkpoint-reload-device`).
     pub checkpoint_reload_device: bool,
-    /// Pinned-host byte budget for parked checkpoints; 0 = pageable path
-    /// (`--checkpoint-pinned-offload-bytes`).
+    /// 0 = pageable path.
     pub checkpoint_pinned_offload_bytes: usize,
-    /// Row tile for the LoRA linear backward (`--lora-linear-bwd-tile-rows`).
     pub lora_linear_bwd_tile_rows: usize,
-    /// Expert tile for the MoE LoRA backward (`--moe-lora-bwd-expert-tile`).
     pub moe_lora_bwd_expert_tile: usize,
-    /// FlashQLA chunkwise GDN prefill in the CUDA backend (`--gdr-chunkwise-prefill`).
     pub gdr_chunkwise_prefill: bool,
-    /// Native FP8 DeepGEMM for frozen-weight forward projections (`--fp8-native-gemm`).
     pub fp8_native_gemm: bool,
-    /// Force the monolithic chunked-scan linear-attention backward (`--la-backward-mono`).
     pub la_backward_mono: bool,
-    /// Force the legacy two-pass decode attention kernel (`--autograd-decode-attn-legacy`).
     pub decode_attn_legacy: bool,
-    /// Retain the cuMemAllocAsync pool across syncs (`--cuda-mempool-retain`).
     pub cuda_mempool_retain: bool,
-    /// Storage dtype for retained activations + emitted grads (`--tape-precision`).
     pub tape_precision: TapePrecision,
 }
 
@@ -102,7 +89,6 @@ pub(crate) fn checkpoint_reload_device() -> bool {
 pub(crate) fn checkpoint_pinned_offload_bytes() -> usize {
     CHECKPOINT_PINNED_OFFLOAD_BYTES.load(Relaxed)
 }
-/// Test-only A/B lever for the reload arm (the CLI flag is the production path).
 pub(crate) fn lora_linear_bwd_tile_rows() -> usize {
     LORA_LINEAR_BWD_TILE_ROWS.load(Relaxed)
 }
@@ -130,7 +116,6 @@ pub(crate) fn decode_attn_legacy() -> bool {
 pub(crate) fn tape_precision() -> TapePrecision {
     TapePrecision::from_u8(TAPE_PRECISION.load(Relaxed))
 }
-/// `true` when retained activations + emitted grads store bf16 (CUDA-only path).
 #[cfg_attr(any(not(feature = "cuda"), feature = "no-cuda"), allow(dead_code))]
 pub(crate) fn tape_bf16() -> bool {
     matches!(tape_precision(), TapePrecision::Bf16)

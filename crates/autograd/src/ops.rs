@@ -1,3 +1,7 @@
+// Thin public dispatch layer. No `ensure_host` / `ensure_device` here — the
+// inner ops own residency decisions; a readback at this layer defeats the
+// lazy device path.
+
 #[path = "ops/activation.rs"]
 pub mod activation;
 #[path = "ops/attention.rs"]
@@ -72,10 +76,6 @@ pub(crate) use softmax::{log_softmax_backward, softmax_backward};
 pub use checkpoint::{checkpoint, checkpoint_seq_chunked, checkpoint_sequential};
 
 pub fn exp(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<TensorId> {
-    // Inner `activation::exp` dispatches on `dirty`; a Dirty::Device
-    // input stays lazy via `backend.exp` (MLX `mlx_exp`), while Dirty::Host
-    // / Dirty::Both take the eager host path. No `ensure_host` here — that
-    // would force a readback before the inner fn could see the device state.
     activation::exp(x, store, tape)
 }
 
@@ -112,28 +112,14 @@ pub fn all_to_all(
 }
 
 pub fn gelu(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<TensorId> {
-    // Inner dispatcher picks lazy-device vs host-eager; stripping the
-    // eager readback here lets the lazy branch keep x Dirty::Device.
     activation::gelu(x, store, tape)
 }
 
 pub fn silu(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<TensorId> {
-    // `silu` is device-resident on Metal for Dirty::Device
-    // inputs — `activation::silu` routes to `backend.silu` (composes
-    // `mlx_multiply(x, mlx_sigmoid(x))` into the MLX lazy graph, no eval).
-    // Dirty::Host / Dirty::Both inputs stay on the host fast path. CPU/CUDA
-    // use the default trait fallback (readback → host → upload); lazy
-    // semantics are Metal-only.
     activation::silu(x, store, tape)
 }
 
 pub fn sigmoid(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<TensorId> {
-    // Inner `activation::sigmoid` dispatches on `x.dirty`; a
-    // Dirty::Device/Both input stays lazy via `backend.sigmoid`
-    // (`mlx_sigmoid` single node into the MLX graph), Dirty::Host takes
-    // the eager host path. No `ensure_host` here — Qwen3.5 attention's
-    // `gate = sigmoid(gate_proj)` × 28 layers would otherwise flush the
-    // q_full slice to host before the gate multiply.
     activation::sigmoid(x, store, tape)
 }
 
@@ -153,11 +139,6 @@ pub fn causal_sdpa(
     store: &mut TensorStore,
     tape: &mut Tape,
 ) -> Result<TensorId> {
-    // Composite op — body is pure dispatch over reshape /
-    // transpose / matmul / mul_scalar / add_broadcast / softmax, all of
-    // which are lazy on Metal. No `ensure_host` here, so the entire
-    // attention chain stays in the MLX graph end-to-end for each layer
-    // (Qwen3.5 × 28 layers).
     attention::causal_sdpa(q, k, v, store, tape)
 }
 
@@ -227,13 +208,6 @@ pub fn add_broadcast(
     store: &mut TensorStore,
     tape: &mut Tape,
 ) -> Result<TensorId> {
-    // Inner `broadcast::add_broadcast` dispatches on
-    // `a.dirty`/`b.dirty`; both-Device/Both inputs stay lazy via
-    // `backend.add_broadcast` (MLX `mlx_add` broadcasts natively via
-    // right-alignment). Mixed Host/Device inputs fall back to the host
-    // path. No `ensure_host` here — the hot paths are Qwen3.5 attention's
-    // causal-mask add (`scaled + causal_mask` per layer × 28 layers) and
-    // Linear bias add (`linear_out + bias` per projection × many projections).
     broadcast::add_broadcast(a, b, store, tape)
 }
 
@@ -247,11 +221,6 @@ pub fn abs(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<Tens
 }
 
 pub fn mul(a: TensorId, b: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<TensorId> {
-    // Inner `elementwise::mul` dispatches OR-lazy; if either
-    // operand is Dirty::Device/Both the pair stays on `mlx_multiply`
-    // in the MLX graph, else the host-eager path kicks in. No `ensure_host` —
-    // Qwen3.5 hot paths are `attn * gate` and `silu(gate) * up` per
-    // attention/MLP layer × 28 layers.
     elementwise::mul(a, b, store, tape)
 }
 
@@ -261,13 +230,6 @@ pub fn mul_scalar(
     store: &mut TensorStore,
     tape: &mut Tape,
 ) -> Result<TensorId> {
-    // Inner `elementwise::mul_scalar` dispatches on `a.dirty`;
-    // Dirty::Device/Both inputs stay lazy via `backend.mul_scalar` (MLX
-    // `mlx_multiply(x, scalar_arr)` — broadcast rank-0 scalar).
-    // Dirty::Host takes the host-eager path. No `ensure_host` here —
-    // Qwen3.5 attention scales q by `1/sqrt(d_head)` once per layer, which
-    // would otherwise force a readback of every layer's q projection before
-    // softmax.
     elementwise::mul_scalar(a, k, store, tape)
 }
 
@@ -277,9 +239,6 @@ pub fn embedding(
     store: &mut TensorStore,
     tape: &mut Tape,
 ) -> Result<TensorId> {
-    // Inner dispatcher picks lazy-device vs host-eager via `table`'s dirty
-    // bit + device handle; each branch materializes the table on its own
-    // side. No eager readback here — that would defeat the lazy branch.
     embed::embedding(table, indices, store, tape)
 }
 
@@ -289,12 +248,6 @@ pub fn gather_last_dim(
     store: &mut TensorStore,
     tape: &mut Tape,
 ) -> Result<TensorId> {
-    // Inner `gather::gather_last_dim` dispatches on `src.dirty`;
-    // a Dirty::Device/Both input stays lazy via `backend.gather_last_dim`
-    // (composes `mlx_reshape → mlx_take_axis → mlx_reshape` into the MLX
-    // graph), while Dirty::Host takes the eager host path. No `ensure_host`
-    // here — logits coming out of the final matmul would otherwise be
-    // flushed to host before the gather.
     gather::gather_last_dim(src, indices, store, tape)
 }
 
@@ -367,11 +320,6 @@ pub fn reshape(
     store: &mut TensorStore,
     tape: &mut Tape,
 ) -> Result<TensorId> {
-    // Inner `layout::reshape` dispatches on `x.dirty`; a
-    // Dirty::Device input stays lazy via `backend.reshape` (MLX
-    // `mlx_reshape` — metadata-only, no compute), Dirty::Host takes the
-    // host-eager path. No `ensure_host` here — it would flush the q/k/v
-    // projection matmul's output to host before every attention-layer reshape.
     layout::reshape(x, shape, store, tape)
 }
 
@@ -391,11 +339,6 @@ pub fn transpose(
     store: &mut TensorStore,
     tape: &mut Tape,
 ) -> Result<TensorId> {
-    // Inner `layout::transpose` dispatches on `x.dirty`;
-    // device-resident input stays lazy via `backend.transpose_axes_swap`
-    // (MLX `mlx_transpose_axes` — a lazy view fused into downstream
-    // GEMMs). Same rationale as `reshape` — the hot path is Qwen3.5
-    // q/k/v projections.
     layout::transpose(x, axis1, axis2, store, tape)
 }
 
@@ -406,12 +349,6 @@ pub fn slice(
     store: &mut TensorStore,
     tape: &mut Tape,
 ) -> Result<TensorId> {
-    // Inner `layout::slice` dispatches on `x.dirty`; a
-    // Dirty::Device input stays lazy via `backend.slice` (composes
-    // `mlx_slice → mlx_contiguous` into the MLX graph), Dirty::Host takes
-    // the host-eager path. No `ensure_host` here — it would flush the fused
-    // q_full projection's matmul output to host before every Qwen3.5
-    // attention-layer q/gate split.
     layout::slice(x, starts, ends, store, tape)
 }
 
@@ -494,11 +431,6 @@ pub fn rmsnorm(
     store: &mut TensorStore,
     tape: &mut Tape,
 ) -> Result<TensorId> {
-    // Inner dispatcher chooses lazy-device vs host-eager based on x's
-    // dirty bit + device handle; it handles `ensure_host(weight)` and
-    // `ensure_device(x)` on the lazy branch, `store.tensor(x).clone()`
-    // on the eager branch. No eager readback of `x` here — that would
-    // pay an mlx_eval the lazy path is designed to skip.
     norm::rmsnorm(x, weight, eps, store, tape)
 }
 
@@ -509,45 +441,21 @@ pub fn rope(
     store: &mut TensorStore,
     tape: &mut Tape,
 ) -> Result<TensorId> {
-    // Inner `rope::rope` dispatches on `x.dirty`; a Dirty::Device
-    // `x` stays lazy via `backend.rope` (half-split rotation on device),
-    // while Dirty::Host/Both take the eager host path. cos/sin are
-    // `ensure_host`-ed inside the lazy branch (caches are typically host
-    // already; the readback is a no-op in the common case). No `ensure_host(x)`
-    // here — it would force a readback of every q/k before each layer's rope.
     rope::rope(x, cos, sin, store, tape)
 }
 
 pub fn mean(a: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<TensorId> {
-    // Inner `reduce::mean` dispatches on `a.dirty`; a Dirty::Device
-    // input stays lazy by composing `sum_all + mul_scalar(1/numel)` on the
-    // MLX graph (reusing the lazy `sum_all` + `mul_scalar` — no new trait
-    // method needed), while Dirty::Host / Dirty::Both take the eager host
-    // path. No `ensure_host` here — the CE-loss path
-    // `log_softmax → gather_last_dim → mean` would otherwise flush the full
-    // log-probs tensor to host per step, reversing every upstream lazy win.
     reduce::mean(a, store, tape)
 }
 
 pub fn sum(a: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<TensorId> {
-    // `sum` is device-resident on Metal — `reduce::sum` calls
-    // `store.ensure_device(a)` and `backend.sum_all`, composing into the
-    // MLX lazy graph instead of forcing a host readback. CPU/CUDA still get
-    // a fully-realized scalar handle; lazy semantics are Metal-only.
     reduce::sum(a, store, tape)
 }
 
 pub fn softmax(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<TensorId> {
-    // `softmax` is device-resident on Metal for Dirty::Device
-    // inputs — `softmax::softmax` routes to `backend.softmax_last_axis`
-    // (composes `mlx_softmax_axis` into the MLX lazy graph, no eval).
-    // Dirty::Host / Dirty::Both inputs stay on the host fast path. CPU/CUDA
-    // use the default trait fallback (readback → host → upload); lazy
-    // semantics are Metal-only.
     softmax::softmax(x, store, tape)
 }
 
 pub fn log_softmax(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<TensorId> {
-    // See `softmax`. Metal path composes `mlx_logsumexp_axis + mlx_subtract`.
     softmax::log_softmax(x, store, tape)
 }
