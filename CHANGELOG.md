@@ -8,6 +8,13 @@ detail in the linked wins/errors entry. Oldest sections are condensed.
 
 ## [Unreleased]
 
+- **Quantized paged attention on tensor cores — accepted; the only quantized
+  decode path.** Phase 1 of the quantized-KV unification plan. Qwen3.8-27B-
+  NVFP4, fp8 KV, 32 K prompts: c=16 out tok/s 134–138 → 181 (+33 %), c=32
+  140–141 → 188–191 (+34 %), c=1 wash; kernel 2.7–3.9×; needle 12/12 DET, eval
+  177/200. Deletes the scalar kernel and the varlen fallback (−510 lines).
+  ([entry](docs/experience/wins/2026-08-22-paged-attention-quantized-tensor-core.md))
+
 - **Quantized paged attention dequantizes K/V once per GQA group — accepted.**
   One CTA serves the q-heads sharing a kv-head (group size scales with batch).
   Qwen3.8-27B-NVFP4, fp8 KV, 32 K prompts: c=16 out tok/s 110 → 135–138
