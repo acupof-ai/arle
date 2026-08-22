@@ -50,9 +50,29 @@ same setup, needle ladder ×3 12/12 DET:
 
 The c≥8 loss is unchanged, so it does not sit in verify attention. The
 kernel extension stays (one attention path for every decode shape; c=1 is a
-wash); the gate lift is reverted (`1f36fea61`). Remaining candidates are the
-batched draft forward and rejected-token waste at ≈1.9 accepted/step — an
-`ARLE_CUDA_PROFILE=1` op_timing split of the batched step is the next probe.
+wash); the gate lift is reverted (`1f36fea61`).
+
+## Follow-up 2: the loss is scheduler stalls, and smaller prefill chunks do not fix it
+
+`ARLE_CUDA_PROFILE=1` op_timing at c=8 (same binary, `--spec-max-batch` 1 vs
+16): per-row spec barely engages (11 chains / 3440 tokens, ≈no-spec) while
+batched spec's pure decode steps are actually faster per token (91 ms / 2.55
+tok vs 44 ms / 1 tok). The loss is mixed steps (prefill chunk + decode rows):
+batched takes 57 of them at 1.70 s each vs 19 at 1.97 s per-row — verify rows
+stall behind a 32K prefill. Hypothesis: smaller `--chunked-prefill-size`
+shortens the stall. Measured (batched, decode tok/s per request):
+
+| c | per-row | chunk 2048 | chunk 512 | chunk 1024 |
+|---:|---:|---:|---:|---:|
+| 4 | 32.3 | 34.2 | 23.0 | 20.9 |
+| 8 | 21.8 | 19.2 | 20.2 | 19.8 |
+| 16 | 13.9 | 11.2 | 11.6 | 11.5 |
+
+Refuted. Smaller chunks mix decode rows into 4× more prefill steps; c=4
+collapses (−29 %), c=8 gains 5 % (inside the ≤10 % noise band), c=16 washes.
+Needle ladder ×3 under a concurrent stream on chunk 512: 12/12 DET — parity
+holds throughout. Final verdict: batched DSpark on quantized KV is rejected;
+the gate stays. DSpark ships per-row at c=1 (+51 %), which is the SLO lane.
 
 ## Rule
 
