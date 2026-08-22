@@ -471,6 +471,77 @@ __global__ void dequantize_fp4_marlin_to_fp8_kernel(
     }
 }
 
+// Marlin FP4 tiles + their S0E5M3 scale tail x one F32 global scale -> dense
+// BF16 [N, K]. The FP8 twin above divides out a per-128x128 power of two
+// because DeepGEMM takes it back as sfb; a BF16 consumer wants the true value,
+// so there is no block_pow2 here.
+__global__ void dequantize_fp4_marlin_to_bf16_kernel(
+    const uint32_t* __restrict__ marlin,
+    const uint8_t* __restrict__ tail,
+    const float* __restrict__ global_scales,
+    float inv_lift,
+    __nv_bfloat16* __restrict__ output,
+    int N,
+    int K)
+{
+    __shared__ uint32_t sh[MARLIN_MAT_KTILES * 129];
+    const int n_tiles = N >> 6;
+    const int k_super = blockIdx.x;
+    const int n_tile = blockIdx.y;
+    const int tid = threadIdx.x;
+
+    const int tile0 = (k_super * MARLIN_MAT_KTILES * n_tiles + n_tile) * 128;
+    for (int i = tid; i < MARLIN_MAT_KTILES * 128; i += MARLIN_MAT_THREADS) {
+        sh[(i >> 7) * 129 + (i & 127)] = marlin[tile0 + (i >> 7) * n_tiles * 128 + (i & 127)];
+    }
+    __syncthreads();
+
+    const float gscale = global_scales[0] * inv_lift;
+
+    for (int c = tid; c < 64 * MARLIN_MAT_KTILES; c += MARLIN_MAT_THREADS) {
+        const int nn = c >> 3;
+        const int kt = c & (MARLIN_MAT_KTILES - 1);
+        const int n = (n_tile << 6) + nn;
+        const int g = k_super * MARLIN_MAT_KTILES + kt;
+        const int hi = (nn & 15) >> 3;
+        const uint32_t* w = &sh[kt * 129 + (nn & 7) * 16 + (nn >> 4)];
+        const float scale =
+            marlin_s0e5m3_to_f32(tail[marlin_fp4_scale_tail(n, g, N)]) * gscale;
+        __nv_bfloat16 vals[16];
+        #pragma unroll
+        for (int kk = 0; kk < 16; ++kk) {
+            const int slot = ((kk & 1) << 2) | (hi << 1) | (kk >> 3);
+            const uint32_t word = w[((kk & 7) >> 1) * 4];
+            vals[kk] = __float2bfloat16(
+                dsv4_decode_fp4_e2m1((uint8_t)((word >> (slot * 4)) & 0xf)) * scale);
+        }
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            reinterpret_cast<uint4*>(&output[(long)n * K + (g << 4)])[j] =
+                reinterpret_cast<const uint4*>(vals)[j];
+        }
+    }
+}
+
+extern "C" cudaError_t dequantize_fp4_marlin_to_bf16_cuda(
+    const uint8_t* marlin_packed,
+    const float* global_scales,
+    float inv_lift,
+    __nv_bfloat16* output,
+    int N,
+    int K,
+    int group_size,
+    cudaStream_t stream)
+{
+    if (N <= 0 || K <= 0 || group_size != 16 || (N & 63) != 0 || (K & 127) != 0) {
+        return cudaErrorInvalidValue;
+    }
+    dequantize_fp4_marlin_to_bf16_kernel<<<dim3(K / 128, N / 64), MARLIN_MAT_THREADS, 0, stream>>>(
+        reinterpret_cast<const uint32_t*>(marlin_packed), marlin_packed + (size_t)N * K / 2,
+        global_scales, inv_lift, output, N, K);
+    return cudaGetLastError();
+}
+
 extern "C" cudaError_t dequantize_fp4_marlin_to_fp8_cuda(
     const uint8_t* marlin_packed,
     const float* global_scales,

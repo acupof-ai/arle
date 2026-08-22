@@ -394,6 +394,20 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    /// Marlin NVFP4 tiles -> dense BF16 `[n, k]`. The FP8 twin above divides
+    /// out a per-128x128 power of two because DeepGEMM takes it back as sfb; a
+    /// BF16 consumer wants the true value, so there is no `block_pow2` here.
+    pub fn dequantize_fp4_marlin_to_bf16_cuda(
+        marlin_packed: *const u8,
+        global_scales: *const f32,
+        inv_lift: f32,
+        output: *mut Half,
+        n: i32,
+        k: i32,
+        group_size: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     /// Marlin per-channel FP8 tiles -> the plain `[n, k]` E4M3 bytes DeepGEMM's
     /// dense NT entry takes as B. The repack applies no value transform, so the
     /// output is byte-identical to the checkpoint weight it replaces.
