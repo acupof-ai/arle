@@ -424,7 +424,7 @@ impl Dsv4Model {
                 })?;
                 keepalive.keep_hidden(&moe_with_shared);
             } else {
-                let use_comm_overlap = seq_len == 1 && !use_deepep_transport;
+                let use_comm_overlap = seq_len == 1 && !use_deepep_transport && !graph_mode;
                 let normed_ready = if use_comm_overlap {
                     let fence = ctx.record_pipeline_fence(CudaPipelineStreamKind::Compute)?;
                     ctx.wait_on_pipeline_fence(&fence, CudaPipelineStreamKind::Comm)?;
