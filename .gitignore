@@ -63,3 +63,6 @@ arle-kernels-*.tar.gz*
 # training/eval runs write token dumps to cwd; when cwd is the source tree they
 # must not move the source digest (build receipt guard)
 /dumps/
+
+# OPD training metrics log, written to cwd (same hazard as /dumps/)
+/metrics.jsonl
