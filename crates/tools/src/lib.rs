@@ -383,7 +383,6 @@ impl SandboxConfig {
         cmd.arg("--quiet");
         cmd.arg("--disable_proc");
 
-        // Read-only bind mounts for system dirs
         for dir in &[
             "/bin",
             "/lib",
@@ -398,21 +397,18 @@ impl SandboxConfig {
             }
         }
 
-        // Read-only bind for /usr/local (python, pip packages, cuda libs)
+        // python, pip packages, cuda libs live under /usr/local
         if std::path::Path::new("/usr/local").exists() {
             cmd.arg("-R").arg("/usr/local");
         }
 
-        // Writable /tmp
         cmd.arg("-B").arg(&self.workdir);
-        // Also bind /tmp if workdir is different
         if self.workdir != "/tmp" {
             cmd.arg("-B").arg("/tmp");
         }
 
         cmd.arg("--cwd").arg(&self.workdir);
 
-        // Environment
         cmd.arg("--env").arg(format!("PATH={}", default_env_path()));
         cmd.arg("--env").arg(format!("HOME={}", self.workdir));
         cmd.arg("--env")
@@ -509,7 +505,6 @@ impl Tool {
     }
 }
 
-/// Return the built-in tool definitions.
 pub fn builtin_tools() -> Vec<Tool> {
     BuiltinToolKind::ALL
         .into_iter()
@@ -963,14 +958,12 @@ fn clip_middle(s: &str, max_chars: usize) -> String {
     format!("{head}{TOOL_RESULT_TRUNCATION_MARKER}: {omitted} chars omitted ...\n{tail}")
 }
 
-/// Collect stdout + stderr from a process Output into a truncated string.
-/// Filters out nsjail's own warning/info lines from stderr. Appends the
-/// process exit code so the agent can tell success from failure.
+/// Filters nsjail's own warning/info lines from stderr and appends the exit
+/// code so the agent can tell success from failure.
 fn collect_output(output: &std::process::Output) -> String {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let raw_stderr = String::from_utf8_lossy(&output.stderr);
 
-    // Filter nsjail's own log lines (e.g. "[W][...] logParams()...")
     let stderr: String = raw_stderr
         .lines()
         .filter(|line| {
@@ -1130,9 +1123,6 @@ pub fn format_read(contents: &str, path: &str, start: Option<i64>, end: Option<i
     out
 }
 
-/// Read a file and return its lines numbered as `{n}\t{line}` (1-based `n`).
-/// Resolves the path, handles the is-a-directory / no-such-file cases, reads
-/// the file, then delegates ALL formatting to [`format_read`].
 fn execute_read(path: &str, start: Option<i64>, end: Option<i64>) -> String {
     let resolved = resolve_sandbox_path(path);
     if resolved.is_dir() {
@@ -1146,7 +1136,6 @@ fn execute_read(path: &str, start: Option<i64>, end: Option<i64>) -> String {
     format_read(&contents, path, start, end)
 }
 
-/// Create parent directories and (over)write `content` to `path`.
 fn execute_write(path: &str, content: &str) -> String {
     let resolved = resolve_sandbox_path(path);
     if let Some(parent) = resolved.parent()
@@ -1187,9 +1176,6 @@ pub fn apply_replace(contents: &str, path: &str, old: &str, new: &str) -> Result
     }
 }
 
-/// Replace exactly one unique occurrence of `old` with `new` in `path`.
-/// Resolves the path and reads the file, delegates the match-counting + guard
-/// logic to [`apply_replace`], then writes the result back.
 fn execute_replace(path: &str, old: &str, new: &str) -> String {
     let resolved = resolve_sandbox_path(path);
     let contents = match std::fs::read_to_string(&resolved) {
