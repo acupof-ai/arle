@@ -636,7 +636,6 @@ fn merge_wire_stats_dp(acc: &mut WireStats, other: WireStats) {
     acc.kv_system_resident_pages += other.kv_system_resident_pages;
     acc.kv_system_resident_evictable_pages += other.kv_system_resident_evictable_pages;
     acc.kv_system_host_demoted_pages += other.kv_system_host_demoted_pages;
-    acc.kv_system_host_demoted_pending_inflight += other.kv_system_host_demoted_pending_inflight;
     acc.kv_system_disk_pages += other.kv_system_disk_pages;
     acc.kv_system_reuse_hit_resident += other.kv_system_reuse_hit_resident;
     acc.kv_system_reuse_hit_host_demoted += other.kv_system_reuse_hit_host_demoted;
