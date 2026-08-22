@@ -151,8 +151,6 @@ pub(crate) fn json_object_len(s: &str) -> Option<usize> {
     None
 }
 
-/// Parse a single `<tool_call>` inner JSON payload into a [`ToolCall`].
-///
 /// Shares the exact decoding contract used by [`parse_tool_calls`].
 pub(crate) fn parse_tool_call_block(json_str: &str) -> Option<ToolCall> {
     let value = serde_json::from_str::<Value>(json_str).ok()?;
@@ -434,7 +432,6 @@ fn extract_tool_calls(text: &str) -> (String, Vec<ToolCall>) {
     (out, calls)
 }
 
-/// Structured tool definition used for prompt injection.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ToolDefinition {
     pub name: String,
@@ -488,7 +485,6 @@ fn compact_parameters(parameters: &Value) -> Value {
     Value::Object(compact)
 }
 
-/// Structured tool call emitted by the model or embedded in an assistant turn.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolCall {
     pub name: String,
@@ -537,7 +533,6 @@ fn push_parameter(out: &mut String, key: &str, value: &Value) {
     out.push_str("\n</parameter>\n");
 }
 
-/// Parse `<tool_call>...</tool_call>` blocks from raw assistant output.
 pub fn parse_tool_calls(text: &str) -> super::ParsedAssistantResponse {
     let (stripped, tool_calls) = extract_tool_calls(text);
 

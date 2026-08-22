@@ -35,14 +35,12 @@ const DSV4_REASONING_EFFORT_MAX: &str = concat!(
     "Explicitly write out your entire deliberation process, documenting every intermediate step, considered alternative, and rejected hypothesis to ensure absolutely no assumption is left unchecked.\n\n"
 );
 
-/// A single message in a chat conversation, in OpenAI wire format.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct OpenAiChatMessage {
     pub role: String,
-    /// Text content. `None` when the assistant message contains only tool calls.
+    /// `None` when the assistant message contains only tool calls.
     #[serde(default)]
     pub content: Option<OpenAiChatContent>,
-    /// Tool calls emitted by the assistant.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<OpenAiToolCall>,
     /// Present on `tool` role messages — the call id being responded to.
@@ -73,9 +71,9 @@ pub enum OpenAiChatContent {
 }
 
 impl OpenAiChatContent {
-    /// Flatten to a plain text string. For the Parts form, concatenates
-    /// every `{"type":"text","text":"..."}` part in order; parts whose type
-    /// is not `text` are silently skipped (we are a text-only server).
+    /// For the Parts form, concatenates every `{"type":"text","text":"..."}`
+    /// part in order; parts whose type is not `text` are silently skipped
+    /// (we are a text-only server).
     pub fn to_text(&self) -> String {
         match self {
             Self::Text(s) => s.clone(),
@@ -100,7 +98,6 @@ impl From<&str> for OpenAiChatContent {
     }
 }
 
-/// OpenAI-format tool call object embedded in an assistant message.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct OpenAiToolCall {
     pub id: String,
@@ -109,7 +106,6 @@ pub struct OpenAiToolCall {
     pub function: OpenAiFunctionCall,
 }
 
-/// Function name + JSON-encoded arguments.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct OpenAiFunctionCall {
     pub name: String,
@@ -117,7 +113,6 @@ pub struct OpenAiFunctionCall {
     pub arguments: String,
 }
 
-/// Tool definition passed in a chat completion request.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct OpenAiToolDefinition {
     #[serde(rename = "type")]
@@ -169,8 +164,6 @@ impl From<&OpenAiToolDefinition> for ToolDefinition {
     }
 }
 
-/// Convert an OpenAI messages array + optional tool definitions into a
-/// ChatML prompt string ready for inference.
 pub fn openai_messages_to_prompt(
     messages: &[OpenAiChatMessage],
     tools: &[OpenAiToolDefinition],
@@ -178,8 +171,6 @@ pub fn openai_messages_to_prompt(
     openai_messages_to_prompt_with_tool_choice(messages, tools, &ToolChoiceMode::Auto)
 }
 
-/// Convert an OpenAI messages array + optional tool definitions into a ChatML
-/// prompt, honoring an OpenAI `tool_choice` hint.
 pub fn openai_messages_to_prompt_with_tool_choice(
     messages: &[OpenAiChatMessage],
     tools: &[OpenAiToolDefinition],
@@ -370,7 +361,6 @@ fn render_deepseek_v4_tool_arguments(arguments: &str) -> String {
         .join("\n")
 }
 
-/// Parse `<tool_call>...</tool_call>` blocks from model output.
 /// Returns `(visible_content, tool_calls)` where `visible_content` has the
 /// tool call blocks and `<think>` blocks stripped.
 pub fn openai_parse_tool_calls(text: &str) -> (String, Vec<ToolCall>) {

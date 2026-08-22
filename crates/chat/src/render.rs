@@ -24,7 +24,6 @@ pub struct ChatMlSpan {
     pub supervised: Range<usize>,
 }
 
-/// Fully rendered ChatML prompt plus per-turn byte spans.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RenderedChatMl {
     pub prompt: String,
@@ -227,17 +226,13 @@ fn append_tool_call_block(prompt: &mut String, tool_call: &ToolCall) {
     prompt.push_str(TOOL_CALL_BLOCK.close);
 }
 
-/// Build the tool definitions block for injection into a system prompt.
-///
 /// Thin `Auto` wrapper over [`build_tool_block_with_choice`].
 pub fn build_tool_block(tools: &[ToolDefinition]) -> String {
     build_tool_block_with_choice(tools, &ToolChoiceMode::Auto)
 }
 
-/// Build the tool definitions block honoring an OpenAI `tool_choice` hint.
-///
 /// `None` returns an empty block (no tools are advertised, so the model
-/// answers as plain text). `Required` and `Function` append a directive that
+/// answers as plain text); `Required`/`Function` append a directive that
 /// forces tool emission.
 pub fn build_tool_block_with_choice(tools: &[ToolDefinition], choice: &ToolChoiceMode) -> String {
     if matches!(choice, ToolChoiceMode::None) || tools.is_empty() {
@@ -297,13 +292,10 @@ do not answer in plain prose."
     out
 }
 
-/// Convert structured messages + tool definitions into a ChatML prompt.
 pub fn messages_to_prompt(messages: &[ChatMessage], tools: &[ToolDefinition]) -> String {
     messages_to_prompt_with_tool_choice(messages, tools, &ToolChoiceMode::Auto)
 }
 
-/// Convert structured messages + tool definitions into a ChatML prompt,
-/// honoring an OpenAI `tool_choice` hint via [`build_tool_block_with_choice`].
 pub fn messages_to_prompt_with_tool_choice(
     messages: &[ChatMessage],
     tools: &[ToolDefinition],
@@ -317,7 +309,6 @@ pub fn messages_to_prompt_with_tool_choice(
     renderer.finish()
 }
 
-/// Render structured chat messages and return byte spans for each turn.
 pub fn render_structured_chatml_with_spans(
     messages: &[ChatMessage],
     add_generation_prompt: bool,
@@ -334,13 +325,11 @@ pub fn render_structured_chatml_with_spans(
     RenderedChatMl { prompt, spans }
 }
 
-/// Render a raw ChatML message list using the canonical `<|im_start|>...`
-/// layout without tool or default-system injection.
+/// Raw ChatML rendering without tool or default-system injection.
 pub fn render_chatml(messages: &[ChatMlMessage<'_>], add_generation_prompt: bool) -> String {
     render_chatml_with_spans(messages, add_generation_prompt).prompt
 }
 
-/// Render ChatML and return byte spans for each turn.
 pub fn render_chatml_with_spans(
     messages: &[ChatMlMessage<'_>],
     add_generation_prompt: bool,
