@@ -12,7 +12,7 @@ use cuda_kernels::{BandPage, KVFormat, TokenKVPool};
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 use deepseek_spec::{DeepSeekV4AttentionMode, DeepSeekV4Config};
 use infer_seam::{KvBatchDescriptor, KvBatchRowKind};
-use std::sync::atomic::{AtomicI8, Ordering};
+use std::sync::atomic::Ordering;
 
 use crate::dsv4::{
     Dsv4Attention, Dsv4Compressor, Dsv4ForwardKeepalive, Dsv4Indexer, Dsv4MlaKvArena,
@@ -77,21 +77,6 @@ fn dsv4_flashmla_model_meta(config: &DeepSeekV4Config) -> Result<FlashMlaModelMe
         ),
     }
 }
-const DSV4_FLASHMLA_OVERRIDE_ENV: i8 = -1;
-const DSV4_FLASHMLA_OVERRIDE_OFF: i8 = 0;
-const DSV4_FLASHMLA_OVERRIDE_ON: i8 = 1;
-
-static DSV4_FUSED_WQKV_DECODE_OVERRIDE: AtomicI8 = AtomicI8::new(DSV4_FLASHMLA_OVERRIDE_ENV);
-
-pub(crate) fn set_dsv4_fused_wqkv_decode_override(enabled: Option<bool>) {
-    let value = match enabled {
-        Some(true) => DSV4_FLASHMLA_OVERRIDE_ON,
-        Some(false) => DSV4_FLASHMLA_OVERRIDE_OFF,
-        None => DSV4_FLASHMLA_OVERRIDE_ENV,
-    };
-    DSV4_FUSED_WQKV_DECODE_OVERRIDE.store(value, Ordering::Relaxed);
-}
-
 static DSV4_VERIFY_FROZEN: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -905,11 +890,6 @@ pub(crate) fn dsv4_flashmla_layer_pool_pages(
 }
 
 pub(crate) fn dsv4_fused_wqkv_decode_enabled() -> Result<bool> {
-    match DSV4_FUSED_WQKV_DECODE_OVERRIDE.load(Ordering::Relaxed) {
-        DSV4_FLASHMLA_OVERRIDE_OFF => return Ok(false),
-        DSV4_FLASHMLA_OVERRIDE_ON => return Ok(true),
-        _ => {}
-    }
     // Default ON: fuse wq_a|wkv_a into one FP8 DeepGEMM instead of the scalar
     // `dsv4_fp8_gemv_batch_kernel` (16.9% of decode GPU). Licensed on the TP=8/EP=8
     // pod, 64-tok same-binary A/B: 31.774 -> 37.633 tok/s (+18.4%), token-exact.
