@@ -42,33 +42,51 @@ int parse_env_int(const char* name, int fallback) {
 }
 
 bool use_gdr_metal_kernel() {
-    const char* env = std::getenv("AGENT_INFER_GDR_METAL_KERNEL");
-    return !(env && std::string(env) == "0");
+    static const bool enabled = [] {
+        const char* env = std::getenv("AGENT_INFER_GDR_METAL_KERNEL");
+        return !(env && std::string(env) == "0");
+    }();
+    return enabled;
 }
 
 bool keep_prefill_intermediates() {
-    const char* env = std::getenv("AGENT_INFER_QWEN35_CPP_KEEP_PREFILL_INTERMEDIATES");
-    return env && std::string(env) != "0";
+    static const bool enabled = [] {
+        const char* env = std::getenv("AGENT_INFER_QWEN35_CPP_KEEP_PREFILL_INTERMEDIATES");
+        return env && std::string(env) != "0";
+    }();
+    return enabled;
 }
 
 bool use_qwen35_cpp_prefill_last_logits_only() {
-    const char* env = std::getenv("AGENT_INFER_QWEN35_CPP_PREFILL_LAST_LOGITS_ONLY");
-    return !(env && std::string(env) == "0");
+    static const bool enabled = [] {
+        const char* env = std::getenv("AGENT_INFER_QWEN35_CPP_PREFILL_LAST_LOGITS_ONLY");
+        return !(env && std::string(env) == "0");
+    }();
+    return enabled;
 }
 
 bool use_qwen35_cpp_separate_mlp() {
-    const char* env = std::getenv("AGENT_INFER_QWEN35_CPP_SEPARATE_MLP");
-    return env && std::string(env) != "0";
+    static const bool enabled = [] {
+        const char* env = std::getenv("AGENT_INFER_QWEN35_CPP_SEPARATE_MLP");
+        return env && std::string(env) != "0";
+    }();
+    return enabled;
 }
 
 bool use_qwen35_cpp_prefill_gbeta_helper() {
-    const char* env = std::getenv("AGENT_INFER_QWEN35_CPP_PREFILL_GBETA_HELPER");
-    return !(env && std::string(env) == "0");
+    static const bool enabled = [] {
+        const char* env = std::getenv("AGENT_INFER_QWEN35_CPP_PREFILL_GBETA_HELPER");
+        return !(env && std::string(env) == "0");
+    }();
+    return enabled;
 }
 
 bool use_qwen35_cpp_qk_norm_helper() {
-    const char* env = std::getenv("AGENT_INFER_QWEN35_CPP_QK_NORM_HELPER");
-    return env && std::string(env) != "0";
+    static const bool enabled = [] {
+        const char* env = std::getenv("AGENT_INFER_QWEN35_CPP_QK_NORM_HELPER");
+        return env && std::string(env) != "0";
+    }();
+    return enabled;
 }
 
 array suppress_last_axis_token(const array& logits, int32_t suppress_token_id) {
