@@ -26,6 +26,27 @@ Also cleaned: two stale cuda-kernels comments naming the deleted flag, and the
 
 Serve flags: 53 → 49.
 
+## Follow-up: the resident A/B example and the fused-WQKV override chain
+
+The wave-3 edit agent flagged `examples/dsv4_resident_ab.rs` as a deletion
+candidate: its reason-for-existing was scalar-vs-FlashMLA, and after wave 3 it
+only A/Bed the fused-WQKV axis — itself a proven winner (default ON, +18.4 %
+token-exact, TP=8/EP=8 pod, runtime `has_deepgemm_native()` preflight with
+scalar fallback). Deleted with the full chain:
+
+- `examples/dsv4_resident_ab.rs` (601 lines; no script or CI reference).
+- `set_dsv4_fused_wqkv_decode_override` public re-export, the attention setter
+  + `DSV4_FUSED_WQKV_DECODE_OVERRIDE` static, and the now-orphan
+  `DSV4_FLASHMLA_OVERRIDE_*` constants (wave 3 had left them with one user).
+- `dsv4_fused_wqkv_decode_enabled()` is now unconditional on the preflight,
+  same shape as the FlashMLA deletion.
+- A dangling doc comment + duplicate `#[cfg]` in `lib.rs` for the long-deleted
+  `set_dsv4_moe_contig_decode` — it had re-attached to
+  `set_qwen35_moe_experts_bf16_resident`, polluting its rustdoc.
+
+The stage-profile APIs (`print_dsv4_stage_profile` et al.) stay —
+`examples/dsv4_parity.rs` still uses them.
+
 ## Verification
 
 - `cargo check -p cli --features cpu,no-cuda` clean
@@ -35,6 +56,9 @@ Serve flags: 53 → 49.
 - Metal-lane `cargo check -p cli --features metal,no-cuda` clean
 - `cargo test -p arle --profile release-fast --features cpu,no-cuda,cli`: 5 passed, 0 failed
 - Repo-wide grep for all deleted symbols: 0 hits outside historical docs
+- Follow-up: CUDA-lane clippy clean after the override-chain deletion;
+  `cargo check -p infer-cuda --example dsv4_parity` clean (the surviving
+  example's profile-API users intact).
 
 ## Rule
 
