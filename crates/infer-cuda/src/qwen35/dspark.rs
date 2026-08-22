@@ -457,8 +457,10 @@ fn load_host_vec(loader: &SafetensorLoader, name: &str) -> Result<Vec<bf16>> {
     let t = loader.load_raw_tensor(name)?;
     let bytes = SafetensorLoader::tensor_bytes_to_bf16(name, t.dtype, &t.bytes)?;
     Ok(bytes
-        .chunks_exact(2)
-        .map(|c| bf16::from_le_bytes([c[0], c[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| bf16::from_le_bytes(*c))
         .collect())
 }
 
@@ -490,8 +492,10 @@ fn load_host_matrix(
     );
     let bytes = SafetensorLoader::tensor_bytes_to_bf16(name, t.dtype, &t.bytes)?;
     Ok(bytes
-        .chunks_exact(2)
-        .map(|c| bf16::from_le_bytes([c[0], c[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| bf16::from_le_bytes(*c))
         .collect())
 }
 

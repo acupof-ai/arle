@@ -666,9 +666,11 @@ impl SafetensorLoader {
                     bytes.len()
                 );
                 bytes
-                    .chunks_exact(4)
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
                     .map(|c| {
-                        let bits = u32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+                        let bits = u32::from_le_bytes(*c);
                         ensure!(
                             bits & 0x007f_ffff == 0,
                             "{scale_name}: F32 block scale {} is not a power of two; cannot map losslessly to E8M0",
@@ -1553,8 +1555,10 @@ impl SafetensorLoader {
         );
         Ok(tensor
             .bytes()
-            .chunks_exact(8)
-            .map(|c| i64::from_le_bytes(c.try_into().expect("8-byte chunk")))
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|c| i64::from_le_bytes(*c))
             .collect())
     }
 
@@ -1947,8 +1951,10 @@ impl SafetensorLoader {
         );
         let scales: Vec<f32> = scale
             .bytes()
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
             .collect();
         DeviceMatrix::from_fp8_block_scaled(ctx, weight, &scales, rows, cols, BLOCK, BLOCK)
             .with_context(|| format!("upload GLM FP8 block-scaled MoE weight {name}"))
@@ -1977,8 +1983,10 @@ impl SafetensorLoader {
                     rows * cols * 2
                 );
                 bytes
-                    .chunks_exact(2)
-                    .map(|c| half::bf16::from_le_bytes([c[0], c[1]]).to_f32())
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|c| half::bf16::from_le_bytes(*c).to_f32())
                     .collect()
             }
             Dtype::F32 => {
@@ -1989,8 +1997,10 @@ impl SafetensorLoader {
                     rows * cols * 4
                 );
                 bytes
-                    .chunks_exact(4)
-                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|c| f32::from_le_bytes(*c))
                     .collect()
             }
             other => bail!("{name}: quantize_to_dsv4_fp8_host: unexpected dtype {other:?}"),
@@ -2080,8 +2090,10 @@ impl SafetensorLoader {
                 let (sr, sc) = (s.shape[0], s.shape[1]);
                 let vals: Vec<f32> = s
                     .bytes()
-                    .chunks_exact(4)
-                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|c| f32::from_le_bytes(*c))
                     .collect();
                 // Block dims inferred from the weight/scale shapes (GLM uses
                 // [128,128]).

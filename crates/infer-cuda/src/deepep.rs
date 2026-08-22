@@ -217,11 +217,13 @@ impl DeepEpTransport {
             .map_err(|e| anyhow!("DeepEP device-id all_gather failed: {e}"))?;
 
         let peers = gathered_handles
-            .chunks_exact(deepep_sys::IPC_HANDLE_BYTES)
-            .zip(gathered_ids.chunks_exact(4))
+            .as_chunks::<{ deepep_sys::IPC_HANDLE_BYTES }>()
+            .0
+            .iter()
+            .zip(gathered_ids.as_chunks::<4>().0.iter())
             .map(|(hb, ib)| {
-                let handle: [u8; deepep_sys::IPC_HANDLE_BYTES] = hb.try_into()?;
-                let device_id = u32::from_ne_bytes(ib.try_into()?);
+                let handle: [u8; deepep_sys::IPC_HANDLE_BYTES] = *hb;
+                let device_id = u32::from_ne_bytes(*ib);
                 Ok((handle, device_id))
             })
             .collect::<Result<Vec<_>>>()?;

@@ -46,8 +46,10 @@ pub fn load(path: &Path) -> Result<(Vec<f32>, Vec<f32>)> {
             t.dtype()
         );
         Ok(t.data()
-            .chunks_exact(2)
-            .map(|b| half::bf16::from_le_bytes([b[0], b[1]]).to_f32())
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|b| half::bf16::from_le_bytes(*b).to_f32())
             .collect())
     };
     Ok((read(MARKOV_W1)?, read(MARKOV_W2)?))

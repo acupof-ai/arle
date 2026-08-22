@@ -1089,8 +1089,10 @@ impl TokenKVPool {
                     if self.format.has_scales() {
                         let k_scales: Vec<f32> = payload
                             [cursor..cursor + scale_len * size_of::<f32>()]
-                            .chunks_exact(size_of::<f32>())
-                            .map(|c| f32::from_le_bytes(c.try_into().expect("f32 chunk")))
+                            .as_chunks::<4>()
+                            .0
+                            .iter()
+                            .map(|c| f32::from_le_bytes(*c))
                             .collect();
                         cursor += scale_len * size_of::<f32>();
                         let mut k_scale_view =
@@ -1101,8 +1103,10 @@ impl TokenKVPool {
 
                         let v_scales: Vec<f32> = payload
                             [cursor..cursor + scale_len * size_of::<f32>()]
-                            .chunks_exact(size_of::<f32>())
-                            .map(|c| f32::from_le_bytes(c.try_into().expect("f32 chunk")))
+                            .as_chunks::<4>()
+                            .0
+                            .iter()
+                            .map(|c| f32::from_le_bytes(*c))
                             .collect();
                         cursor += scale_len * size_of::<f32>();
                         let mut v_scale_view =
@@ -1115,8 +1119,10 @@ impl TokenKVPool {
                     if self.format.has_norms() {
                         let k_norms: Vec<u16> = payload
                             [cursor..cursor + scale_len * std::mem::size_of::<u16>()]
-                            .chunks_exact(std::mem::size_of::<u16>())
-                            .map(|c| u16::from_le_bytes(c.try_into().expect("u16 chunk")))
+                            .as_chunks::<2>()
+                            .0
+                            .iter()
+                            .map(|c| u16::from_le_bytes(*c))
                             .collect();
                         cursor += scale_len * std::mem::size_of::<u16>();
                         let mut k_norm_view = self.k_norms[layer].slice_mut(scale_start..scale_end);
@@ -1126,8 +1132,10 @@ impl TokenKVPool {
 
                         let v_norms: Vec<u16> = payload
                             [cursor..cursor + scale_len * std::mem::size_of::<u16>()]
-                            .chunks_exact(std::mem::size_of::<u16>())
-                            .map(|c| u16::from_le_bytes(c.try_into().expect("u16 chunk")))
+                            .as_chunks::<2>()
+                            .0
+                            .iter()
+                            .map(|c| u16::from_le_bytes(*c))
                             .collect();
                         cursor += scale_len * std::mem::size_of::<u16>();
                         let mut v_norm_view = self.v_norms[layer].slice_mut(scale_start..scale_end);

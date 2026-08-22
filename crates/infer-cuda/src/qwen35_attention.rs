@@ -106,9 +106,6 @@ impl Qwen35Model {
             fa3_oaccum: _,
             fa3_lseaccum: _,
             fa3_semaphore,
-            batch_partial_out: _,
-            batch_partial_m: _,
-            batch_partial_l: _,
             ..
         } = fw;
         let qkv_fused = qkv_fused.get(&self.ctx, q_proj_dim + 2 * kv_dim, seq_len)?;

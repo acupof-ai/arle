@@ -303,8 +303,10 @@ fn decode_bf16_le_logits(bytes: &[u8], expected_len: usize) -> Result<Vec<f32>> 
         )));
     }
     Ok(bytes
-        .chunks_exact(2)
-        .map(|chunk| bf16::from_bits(u16::from_le_bytes([chunk[0], chunk[1]])).to_f32())
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|chunk| bf16::from_bits(u16::from_le_bytes(*chunk)).to_f32())
         .collect())
 }
 

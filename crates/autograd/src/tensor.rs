@@ -217,8 +217,10 @@ impl CheckpointL3 {
             ));
         }
         let host = bytes
-            .chunks_exact(std::mem::size_of::<f32>())
-            .map(|chunk| f32::from_ne_bytes(chunk.try_into().expect("four-byte chunk")))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|chunk| f32::from_ne_bytes(*chunk))
             .collect();
         self.store
             .remove_chunked(CHECKPOINT_L3_NS, CHECKPOINT_L3_CHUNK_NS, id as u64);

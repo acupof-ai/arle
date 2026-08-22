@@ -110,8 +110,10 @@ fn read_bf16(pos: &mut usize, bytes: &[u8]) -> Result<Vec<half::bf16>> {
         raw.len()
     );
     Ok(raw
-        .chunks_exact(2)
-        .map(|c| half::bf16::from_le_bytes([c[0], c[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| half::bf16::from_le_bytes(*c))
         .collect())
 }
 

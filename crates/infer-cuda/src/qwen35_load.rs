@@ -1250,13 +1250,17 @@ fn load_v_head_f32_sharded(
     let host: Vec<f32> = match tensor.dtype {
         Dtype::F32 => tensor
             .bytes
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
             .collect(),
         Dtype::BF16 => tensor
             .bytes
-            .chunks_exact(2)
-            .map(|c| bf16::from_le_bytes([c[0], c[1]]).to_f32())
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| bf16::from_le_bytes(*c).to_f32())
             .collect(),
         other => anyhow::bail!("{name}: expected F32/BF16 1D tensor, got {other:?}"),
     };

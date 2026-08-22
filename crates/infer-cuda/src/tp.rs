@@ -980,7 +980,9 @@ impl TpRuntime {
         let payload = [u8::from(ok), 0, 0, 0];
         Ok(self
             .all_gather_bytes(ctx, &payload, 4)?
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .all(|chunk| chunk[0] == 1))
     }
 
@@ -1022,8 +1024,10 @@ impl TpRuntime {
             world * 8
         );
         let rank_bytes = gathered_bytes
-            .chunks_exact(8)
-            .map(|chunk| u64::from_ne_bytes(chunk.try_into().expect("8-byte chunk")))
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|chunk| u64::from_ne_bytes(*chunk))
             .collect::<Vec<_>>();
         ensure!(
             rank_bytes.iter().all(|&value| value == bytes_u64),
@@ -1081,14 +1085,16 @@ impl TpRuntime {
 
         cuda_kernels::comm::bind(ctx)?;
         let mut open_error = None;
-        for (peer_rank, peer_handle) in gathered_handles.chunks_exact(IPC_HANDLE_BYTES).enumerate()
+        for (peer_rank, peer_handle) in gathered_handles
+            .as_chunks::<IPC_HANDLE_BYTES>()
+            .0
+            .iter()
+            .enumerate()
         {
             if peer_rank == rank {
                 buffer.peer_ptrs.push(buffer.local_base());
                 continue;
             }
-            let peer_handle: &[u8; IPC_HANDLE_BYTES] =
-                peer_handle.try_into().expect("64-byte handle");
             match cuda_kernels::comm::PeerMapping::open(
                 ctx,
                 peer_handle,
@@ -1131,8 +1137,10 @@ impl TpRuntime {
             let gathered = self.all_gather_bytes(ctx, &bytes, bytes.len())?;
             // Rank-major layout: rank 0's payload is the leading `bytes.len()`.
             Ok(gathered[..bytes.len()]
-                .chunks_exact(4)
-                .map(|c| i32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| i32::from_ne_bytes(*c))
                 .collect())
         }
         #[cfg(not(all(feature = "cuda", feature = "nccl")))]

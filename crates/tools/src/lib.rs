@@ -754,13 +754,8 @@ fn extract_python_code(text: &str) -> Option<String> {
 
 fn extract_shell_command(text: &str) -> Option<String> {
     extract_fenced_code_block(text, &["bash", "sh", "shell"]).or_else(|| {
-        extract_backticked_snippet(text).and_then(|snippet| {
-            if snippet.contains('\n') || snippet.trim().is_empty() {
-                None
-            } else {
-                Some(snippet)
-            }
-        })
+        extract_backticked_snippet(text)
+            .filter(|snippet| !snippet.contains('\n') && !snippet.trim().is_empty())
     })
 }
 

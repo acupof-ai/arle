@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1.7
 
 ARG CUDA_IMAGE=nvidia/cuda:12.8.0-devel-ubuntu22.04
-ARG RUST_TOOLCHAIN=1.95.0
+ARG RUST_TOOLCHAIN=1.98.0
 
 FROM ${CUDA_IMAGE} AS base
 ARG RUST_TOOLCHAIN
