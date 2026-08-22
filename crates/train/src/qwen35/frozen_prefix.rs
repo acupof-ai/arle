@@ -49,7 +49,7 @@ impl Qwen35Model {
             let mut prefix_tape = Tape::new();
             prefix_tape.set_enabled(false);
 
-            let chunk = crate::runtime_flags::opd_seq_chunk();
+            let chunk = crate::runtime_flags::opd_seq_chunk_for(gen_start);
             let num_chunks = gen_start.div_ceil(chunk);
             let mut layer_prefix: Vec<Option<LayerPrefix>> = vec![None; self.layers.len()];
 
