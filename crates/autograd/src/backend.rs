@@ -329,6 +329,11 @@ pub struct CudaFp4E2M1GroupStorage {
     cols: usize,
     group_size: usize,
     scale_cols: usize,
+    /// `true` when `weight`/`scales` carry the Marlin tensor-core layout instead
+    /// of the group layout — the form a serving engine keeps after its repack
+    /// releases the group bytes, which a shared frozen base has to read as-is.
+    /// `global_scale` then holds the repack's bf16 value (2^119 bias folded in).
+    marlin: bool,
     /// Same foreign-view semantics as `CudaFp8BlockScaledStorage::borrowed`.
     borrowed: bool,
 }
@@ -368,8 +373,57 @@ impl CudaFp4E2M1GroupStorage {
             cols,
             group_size,
             scale_cols,
+            marlin: false,
             borrowed: false,
         }
+    }
+
+    /// Marlin-layout twin of [`Self::new`]: `weight` is the packed tile buffer,
+    /// `scales` the S0E5M3 tail, `global_scale` the repack's folded bf16 value.
+    pub(crate) fn new_marlin(
+        weight: cudarc::driver::CudaSlice<u8>,
+        scales: cudarc::driver::CudaSlice<u8>,
+        global_scale: cudarc::driver::CudaSlice<f32>,
+        rows: usize,
+        cols: usize,
+    ) -> Self {
+        Self {
+            weight: Arc::new(weight),
+            scales: Arc::new(scales),
+            global_scale: Arc::new(global_scale),
+            rows,
+            cols,
+            group_size: 16,
+            scale_cols: cols / 16,
+            marlin: true,
+            borrowed: false,
+        }
+    }
+
+    /// Non-owning Marlin view over a serving engine's resident base. Same
+    /// foreign-ownership contract as `CudaFp8BlockScaledStorage::new_borrowed`.
+    pub(crate) fn new_borrowed_marlin(
+        weight: cudarc::driver::CudaSlice<u8>,
+        scales: cudarc::driver::CudaSlice<u8>,
+        global_scale: cudarc::driver::CudaSlice<f32>,
+        rows: usize,
+        cols: usize,
+    ) -> Self {
+        Self {
+            weight: Arc::new(weight),
+            scales: Arc::new(scales),
+            global_scale: Arc::new(global_scale),
+            rows,
+            cols,
+            group_size: 16,
+            scale_cols: cols / 16,
+            marlin: true,
+            borrowed: true,
+        }
+    }
+
+    pub(crate) fn is_marlin(&self) -> bool {
+        self.marlin
     }
 
     pub(crate) fn weight(&self) -> &cudarc::driver::CudaSlice<u8> {
@@ -794,6 +848,27 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         let _ = (weight_device_ptr, scale_device_ptr, shape, block_m, block_k);
         Err(crate::AutogradError::TapeInvariant(
             "backend does not support importing fp8 block-scaled device pointers",
+        ))
+    }
+
+    /// Import a NON-OWNING view of a serving engine's NVFP4 base that already
+    /// carries the Marlin layout. `global_scale` is the repack's folded value
+    /// (2^119 bias and scale_factor divisor included), read as an f32.
+    fn import_fp4_marlin_device_ptr(
+        &self,
+        weight_device_ptr: u64,
+        scale_tail_device_ptr: u64,
+        global_scale: f32,
+        shape: &[usize],
+    ) -> Result<DeviceHandle> {
+        let _ = (
+            weight_device_ptr,
+            scale_tail_device_ptr,
+            global_scale,
+            shape,
+        );
+        Err(crate::AutogradError::TapeInvariant(
+            "backend does not support importing marlin nvfp4 device pointers",
         ))
     }
 

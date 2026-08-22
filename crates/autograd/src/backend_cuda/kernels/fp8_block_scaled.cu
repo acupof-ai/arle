@@ -73,3 +73,76 @@ extern "C" __global__ void fp4_e2m1_group_to_bf16(
     const unsigned int lsb = (bits >> 16) & 1u;
     out[idx] = static_cast<unsigned short>((bits + 0x7fffu + lsb) >> 16);
 }
+
+// Dequantize an NVFP4 weight that already carries the Marlin tensor-core layout.
+// The serving engine repacks its base once and releases the group-layout bytes,
+// so a student sharing that base reads the Marlin buffer directly instead of
+// keeping a second copy.
+//
+// Layout (device_matrix.rs `repack_for_marlin_fp4` + the vendored
+// `gptq_marlin_repack_kernel`, num_bits=4): tiles of k=16 x n=64 walk k-major,
+// 128 u32 each. Inside a tile, u32 `w` belongs to th_id=w/4, warp=w%4, and its
+// nibble `i` holds source element `pack_idx[i]` of that thread's 8, which maps
+// to k = tc_row + tc_offsets[j%4] and n = warp*16 + th_id/4 + (j<4 ? 0 : 8).
+// The S0E5M3 group scales sit in the tail of the same allocation, permuted 8x8
+// inside each 64-run then swapped [0,2,1,3] per quad. `global_scale` already
+// carries the repack's 2^119 dequant bias and its scale_factor divisor, so
+// dividing it back out here reproduces exactly what the Marlin GEMM computes —
+// including the group scales the repack flushed to zero.
+extern "C" __global__ void marlin_fp4_to_bf16(
+    const unsigned int* __restrict__ marlin,   // [k*n/8] u32, then the scale tail
+    const unsigned char* __restrict__ scales,  // [k/16 * n] S0E5M3 bytes
+    float global_scale,                        // bf16-rounded, includes 2^119
+    unsigned short* __restrict__ out,          // [n, k] BF16 bits
+    int words,                                 // k*n/8
+    int size_k,
+    int size_n)
+{
+    const int w_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (w_idx >= words) return;
+
+    const int n_tiles = size_n / 64;
+    const int tile = w_idx / 128;
+    const int w = w_idx - tile * 128;
+    const int k_tile = tile / n_tiles;
+    const int n_tile = tile - k_tile * n_tiles;
+
+    const int th_id = w >> 2;
+    const int warp_id = w & 3;
+    const int tc_col = th_id >> 2;
+    const int tc_row = (th_id & 3) * 2;
+    const int cur_n = warp_id * 16 + tc_col;
+
+    const int pack_idx[8] = {0, 2, 4, 6, 1, 3, 5, 7};
+    const int tc_offsets[4] = {0, 1, 8, 9};
+    const unsigned int packed = marlin[w_idx];
+    const float gscale = ldexpf(global_scale, -119);
+
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const int j = pack_idx[i];
+        const int k = k_tile * 16 + tc_row + tc_offsets[j & 3];
+        const int n = n_tile * 64 + cur_n + ((j < 4) ? 0 : 8);
+        const int group = k >> 4;
+        // Inverse of the repack's scale permutation: sperm[b*64 + o] came from
+        // sflat[b*64 + (o%8)*8 + o/8], and each quad then swapped 1<->2.
+        const int flat = group * size_n + n;
+        const int base = flat & ~63;
+        const int o = flat - base;
+        const int un8 = (o & 3) == 1 ? o + 1 : ((o & 3) == 2 ? o - 1 : o);
+        const int src = base + (un8 % 8) * 8 + (un8 / 8);
+        // S0E5M3 byte -> f16 (byte << 7) decoded inline: NVRTC compiles these
+        // kernels without cuda_fp16.h. Then drop the repack's 2^7 lift.
+        const unsigned int sb = scales[src];
+        const int sexp = (sb >> 3) & 0x1f;
+        const float smant = static_cast<float>(sb & 0x7) * 0.125f;
+        const float s = (sexp == 0 ? ldexpf(smant, -14) : ldexpf(1.0f + smant, sexp - 15))
+            * 0.0078125f;
+        const float value = ARLE_FP4_E2M1_LUT[(packed >> (i * 4)) & 0xfu] * s * gscale;
+
+        const unsigned int bits = __float_as_uint(value);
+        const unsigned int lsb = (bits >> 16) & 1u;
+        out[static_cast<long long>(n) * size_k + k] =
+            static_cast<unsigned short>((bits + 0x7fffu + lsb) >> 16);
+    }
+}
