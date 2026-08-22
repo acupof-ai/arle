@@ -27,15 +27,19 @@ were rejected as deliberate design (below).
 - `dsv4_moe_transport()` parsed two env vars per call from the decode/prefill/
   spec hot path, in a file whose header contract is "The statics are the single
   truth — no env reads". Now parsed once into a `OnceLock`.
-- 7 per-layer `std::getenv` helpers in `mlx_qwen35_model.cpp` (32+ lookups per
+- 8 per-layer `std::getenv` readers in `mlx_qwen35_model.cpp` (32+ lookups per
   decode step) now use function-local `static const` caching, matching the
-  file's own existing op-profile pattern.
+  file's own existing op-profile pattern. A follow-up simplify pass
+  (`993c3e49b`) collapsed the bool sites into a `parse_env_bool` helper and
+  cached the 8th reader, `qwen35_cpp_gdr_threadgroup_y`.
 
 **Gate loudness.**
 - `lever_gate.sh` with no `BASELINE_LOG` and `LEVER_GATE_REQUIRE_EXACT=0`
   accepted any miss count — the envelope comparison was silently skipped. It
   now exits 3 with an explicit message unless `LEVER_GATE_ALLOW_NO_BASELINE=1`
-  seeds a first baseline. Suite extended with both arms.
+  seeds a first baseline. Suite extended with both arms. The simplify pass
+  exported that opt-out in `gate_arm.sh`'s seed arm, which the new default
+  would otherwise kill.
 
 **Planner tests.**
 - The engine's admission/preempt/park repair — the most livelock-prone code in
@@ -49,7 +53,9 @@ were rejected as deliberate design (below).
 - `mlx-sys/build.rs` stamps the Metal toolchain (compiler path, clang version,
   macOS version) and drops the cmake build dir on a stamp change, so a
   macOS/Xcode update forces a metallib rebuild instead of the runtime "Unable
-  to build metal library from source" panic.
+  to build metal library from source" panic. The simplify pass added matching
+  `rerun-if-changed` triggers for the clang path and `SystemVersion.plist` —
+  every stamp component now has a trigger that re-runs build.rs to compare it.
 
 ## Rejected (deliberate design, not defects)
 
