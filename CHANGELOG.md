@@ -10,15 +10,15 @@ detail in the linked wins/errors entry. Oldest sections are condensed.
 
 - **Quantized paged attention on tensor cores — accepted; the only quantized
   decode path.** Phase 1 of the quantized-KV unification plan. Qwen3.8-27B-
-  NVFP4, fp8 KV, 32 K prompts: c=16 out tok/s 134–138 → 181 (+33 %), c=32
-  140–141 → 188–191 (+34 %), c=1 wash; kernel 2.7–3.9×; needle 12/12 DET, eval
+  NVFP4, fp8 KV, 32 K prompts: per-request decode tok/s c=16 9.9–10.2 → 14.3
+  (+40 %), c=32 5.9–6.0 → 8.9–9.0 (+50 %), c=1 wash; kernel 2.7–3.9×; needle 12/12 DET, eval
   177/200. Deletes the scalar kernel and the varlen fallback (−510 lines).
   ([entry](docs/experience/wins/2026-08-22-paged-attention-quantized-tensor-core.md))
 
 - **Quantized paged attention dequantizes K/V once per GQA group — accepted.**
   One CTA serves the q-heads sharing a kv-head (group size scales with batch).
-  Qwen3.8-27B-NVFP4, fp8 KV, 32 K prompts: c=16 out tok/s 110 → 135–138
-  (+23–25 %), c=32 113 → 141–146 (+24–29 %), c=1 wash; needle 12/12 DET, eval
+  Qwen3.8-27B-NVFP4, fp8 KV, 32 K prompts: per-request decode tok/s c=16 7.9 →
+  10.0–10.2 (+27–29 %), c=32 4.5 → 6.0–6.1 (+33–36 %), c=1 wash; needle 12/12 DET, eval
   179/200 (unchanged).
   ([entry](docs/experience/wins/2026-08-21-paged-attention-quantized-gqa-shared-dequant.md))
 
@@ -28,6 +28,12 @@ detail in the linked wins/errors entry. Oldest sections are condensed.
   made `--mtp-draft-tokens` a loud error when `auto` finds no head, and deleted
   the closed-axis decode GEMM probe.
   ([entry](docs/experience/errors/2026-08-21-spec-auto-missing-on-multiproc.md))
+
+- **W4AFP8 GEMV extended to M>1 for DSpark verify — rejected: 8.8% slower than
+  CUTLASS grouped GEMM (42.4 vs 46.5 tok/s on the same long prompt), reverted in
+  `9e21bcd99`; the same pass pins DSpark to c=1 (−32% at c=8, −47.7% at c=16 —
+  the sequential draft tax scales with batch while verify savings do not).**
+  ([entry](docs/experience/wins/2026-08-21-w4afp8-gemv-decode-lane.md))
 
 ## [0.5.8] - 2026-08-21
 
@@ -57,12 +63,14 @@ ranked their optimisation work turned out to have been taken at the wrong batch.
 - **`--spec-type auto` is the default, and it is implemented.** It speculates
   whenever the checkpoint declares an MTP head (`mtp_num_hidden_layers`, which
   Qwen3.5 nests under `text_config`, or `num_nextn_predict_layers`; GLM ships 0).
-  c=1 goes 20.50 → 11.94 ms per committed token and +21.6% end-to-end tok/s at
-  d=2; d=4 is not better. Above c=1 it is inert. Needle ladder exact x3 DET at
+  c=1 goes 20.50 → 11.94 ms per committed token at d=2; d=4 is not better. Above c=1 it is inert. Needle ladder exact x3 DET at
   four lengths, with engagement proven by a counter rather than by identical
   text — speculation is output-preserving under greedy, so the ladder alone
   cannot tell "ran and was correct" from "never ran".
   ([entry](docs/experience/wins/2026-08-21-spec-type-auto-default.md))
+
+- **`--metal-warmup` defaults off: Metal cold start 0.62 → 0.35 s.**
+  ([entry](docs/experience/wins/2026-08-20-cold-start-warmup-off-config-dedup.md))
 
 ### Decode
 
@@ -96,7 +104,52 @@ ranked their optimisation work turned out to have been taken at the wrong batch.
 ### Verdicts
 
 
-- **NVFP4 decode — verdict: the sm_90 mixed-input collective is a second arm
+- **Metal decode — three directions ruled out on Qwen3.8-27B-MLX-2bit (M4 Pro,
+  27.1 tok/s ceiling): fused GDR postprocessing within noise (21.5 → 21.6 tok/s,
+  MLX async dispatch already hides the launch), the strong norm+gate-in-scan
+  variant saves 0.009% of a step by traffic math, and the 2-bit matmul is at 83%
+  of bandwidth.**
+  ([entry](docs/experience/errors/2026-08-21-metal-decode-three-directions-ruled-out.md))
+- **Conv-pair backward recompute — rejected: 6,720 MiB of tape tensors bought
+  0 MiB residency (69,665 MiB before and after at local 65,536, bit-identical).
+  Tensor bytes are not residency.**
+  ([entry](docs/experience/errors/2026-08-20-tensor-bytes-are-not-residency.md))
+- **`--kv-recall` — rejected and deleted (`3f826c204`): shrinking the attended
+  set buys nothing while HBM is not the binding constraint, and the cost is paid
+  regardless. L2/L3 keep only the lossless capacity path; the five correctness
+  fixes stand as tiering plumbing.**
+  ([entry](docs/experience/wins/2026-08-18-kv-recall-repaired-cp-and-selector.md))
+- **DSv4 32K context cap — accepted (deleted): obsolete four days after the
+  demand-paged joint (num_slots, pool_tokens) budget solve landed; `serve` passes
+  `max_position_embeddings` through unmodified and starts at
+  `max_prompt_tokens=1048576` (budget solver plans 4 slots on 4×H20, no crash).**
+  ([entry](docs/experience/wins/2026-08-19-dsv4-context-cap-deleted.md))
+- **Spec decode on NVFP4 — rejected for both paths: no spec 60.2 tok/s, DSpark
+  16.8 (−72%), MTP 13.9 (−77%); the 6.5× single-token decode speedup makes the
+  verify forward dominate, so speculation's arithmetic is inverted.**
+  ([entry](docs/experience/wins/2026-08-19-nvfp4-marlin-tensorcore.md))
+- **Per-channel FP8 on Marlin — accepted: the 145 GEMMs still on a scalar
+  batched GEMV route to Marlin `kFE4M3fn` (already instantiated, no nvcc cost).
+  +100.2% at c=16 (235.9 → 472.4 tok/s), NVFP4 now passes same-base FP8 through
+  c=8 (+33.4% c=1 … +2.5% c=8); numerics 31/31, engagement proven by counter.**
+  ([entry](docs/experience/wins/2026-08-19-marlin-fp8-per-channel.md))
+- **Marlin blocks-per-SM search — accepted (`MARLIN_MAX_BLOCKS_PER_SM=5`, was
+  pinned to 1): +4.5% decode, needle 6/6. It exposed two latent bugs
+  (shared-mem budget lowered in place across chunks; lock buffer sized for one
+  block per SM — an out-of-bounds write at bps=5), both fixed. The 32K-crash
+  revert experiment was retracted as an unengaged arm — the revert arm never hit
+  a partial prefix restore in 207 requests; cause not established, search stays.**
+  ([entry](docs/experience/errors/2026-08-19-blocks-per-sm-search-two-latent-bugs.md))
+- **Wave-2 dead-code deletion W8A16 27B champion-row A/B — accepted: ITL p50
+  16.72 vs 16.70 ms, p99 +0.9%, TTFT −0.3%, all inside the noise floor; perf
+  license granted for the one live-path touch (the unused `max_shared_mem`
+  Marlin kernel arg).**
+  ([entry](docs/experience/wins/2026-08-18-dead-code-deletion-wave2.md))
+- **All-GPTQ W4A16 on V100 — rejected for non-expert weights: garbage output
+  ("1+1=" → "iginigin_2222222"); the GPTQ kernel is correct for experts only.
+  Workaround: dequantize non-expert weights to BF16 in checkpoint prep (+2 GB
+  VRAM, 30 GB loaded, fits 32 GB).**
+  ([entry](docs/experience/wins/2026-08-17-autoround-w4a16-v100.md))
   above M=32, not a replacement for Marlin.** Driven with one group as a dense
   GEMM it is 0.65x Marlin at M=1 and 0.90x at M=16, then 1.08x at M=32, 1.46x at
   M=48 and 1.90x at M=64. Not tile waste: at M=1 Marlin achieves 1,594 GB/s
