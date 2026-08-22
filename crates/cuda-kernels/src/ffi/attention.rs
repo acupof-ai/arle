@@ -573,49 +573,6 @@ unsafe extern "C" {
         workspace_bytes: usize,
     ) -> CUresult;
 
-    /// Variable-length Q + paged FP8 E4M3 KV attention.
-    ///
-    /// Mirrors the TileLang TC decode shape but reads FP8 KV directly (no bf16
-    /// shadow). Used by the mixed prefill+decode path when KV format is FP8.
-    /// HD128 + page_size=16 only for now.
-    ///
-    /// Q packing: `[total_q_tokens, num_q_heads * HEAD_DIM]` in bf16, where
-    /// `total_q_tokens = qo_indptr[batch_size]`. Output has the same shape.
-    /// `causal=true` enables the causal mask for prefill rows
-    /// (qlen > 1); decode rows (qlen=1) ignore the mask.
-    pub fn decode_attention_varlen_quantized_workspace_bytes(
-        total_q_tokens: i32,
-        num_q_heads: i32,
-        head_dim: i32,
-        num_splits: i32,
-    ) -> usize;
-
-    pub fn decode_attention_varlen_quantized_cuda(
-        q_packed: *const Half,
-        qo_indptr: *const i32,
-        k_pool: *const u8, // INT8 or FP8
-        v_pool: *const u8, // INT8 or FP8
-        k_scales: *const f32,
-        v_scales: *const f32,
-        kv_indptr: *const i32,
-        kv_indices: *const i32,
-        last_page_len: *const i32,
-        output: *mut Half,
-        num_q_heads: i32,
-        num_kv_heads: i32,
-        head_dim: i32,
-        page_size: i32,
-        batch_size: i32,
-        total_q_tokens: i32,
-        max_kv_len: i32,
-        causal: bool,
-        int8_kv: bool,
-        sm_scale: f32,
-        stream: CUstream,
-        workspace: *mut u8,
-        workspace_bytes: usize,
-    ) -> CUresult;
-
     /// Workspace bytes for [`paged_attention_quantized_fa3_cuda`]:
     /// `num_splits * total_q_tokens * num_q_heads * (head_dim + 2)` f32
     /// (partial out + m + l).
@@ -626,14 +583,13 @@ unsafe extern "C" {
         num_splits: i32,
     ) -> usize;
 
-    /// Native persistent paged attention for 1-byte quantized KV (Path B).
+    /// Native paged attention for 1-byte quantized KV.
     ///
     /// Reads the FP8 e4m3 / INT8 pools and per-(token, kv_head) f32 scales
     /// directly from the paged pool (no dequant temp). FA3-style persistent
-    /// split-KV: one CTA per (batch row, group of `heads_per_cta` q-heads
-    /// sharing a kv-head, split), grid
-    /// `[num_q_heads / heads_per_cta * num_splits, batch]`, plus a merge kernel.
-    /// `heads_per_cta` must divide the GQA ratio and be one of 1/2/3/4/6/8. Decode-shaped
+    /// split-KV on tensor cores: one CTA per (batch row, kv-head, split), the
+    /// kv-head's q-heads as the rows of one 16-row MMA tile (GQA ratio <= 16),
+    /// grid `[num_kv_heads * num_splits, batch]`, plus a merge kernel. sm_80+. Decode-shaped
     /// (one q token per row; `cu_seqlens_q` names each row's q token).
     /// `page_table` is the rectangular `[batch, page_table_stride]` table;
     /// `seqused_k` is the per-row KV extent in tokens — the same device
@@ -659,7 +615,6 @@ unsafe extern "C" {
         sm_scale: f32,
         is_fp8: bool,
         num_splits: i32,
-        heads_per_cta: i32,
         stream: CUstream,
         workspace: *mut u8,
         workspace_bytes: usize,

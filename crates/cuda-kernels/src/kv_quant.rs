@@ -696,100 +696,7 @@ pub fn decode_attention_int8_per_channel_k(
     Ok(())
 }
 
-// ─── Varlen-Q + quantized paged KV attention (mixed batch path) ───
-//
-// Generalization of `decode_attention_fp8` to mixed prefill+decode batches.
-// Split-KV decode attention over INT8 paged KV. HD128/256, page_size=16.
-
-pub fn decode_attention_varlen_quantized_workspace_bytes(
-    total_q_tokens: usize,
-    num_q_heads: usize,
-    head_dim: usize,
-    num_splits: usize,
-) -> usize {
-    // SAFETY: pure host-side size computation — no pointers, no device work.
-    unsafe {
-        ffi::decode_attention_varlen_quantized_workspace_bytes(
-            total_q_tokens as i32,
-            num_q_heads as i32,
-            head_dim as i32,
-            num_splits as i32,
-        )
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn decode_attention_varlen_quantized(
-    ctx: &DeviceContext,
-    q_packed: &HiddenStates,
-    qo_indptr: u64,
-    k_pool_ptr: u64,
-    v_pool_ptr: u64,
-    k_scales_ptr: Option<u64>,
-    v_scales_ptr: Option<u64>,
-    kv_indptr: u64,
-    kv_indices: u64,
-    last_page_len: u64,
-    output: &mut HiddenStates,
-    num_q_heads: usize,
-    num_kv_heads: usize,
-    head_dim: usize,
-    page_size: usize,
-    batch_size: usize,
-    total_q_tokens: usize,
-    max_kv_len: usize,
-    causal: bool,
-    kv_format: KVFormat,
-    sm_scale: f32,
-    workspace: &CudaSlice<u8>,
-    workspace_bytes: usize,
-) -> Result<()> {
-    if batch_size == 0 || total_q_tokens == 0 {
-        return Ok(());
-    }
-
-    let int8_kv = matches!(kv_format, KVFormat::INT8);
-    let (q_ptr, _gq) = q_packed.data.device_ptr(&ctx.stream);
-    let (o_ptr, _go) = output.data.device_ptr_mut(&ctx.stream);
-    let (ws_ptr, _gws) = workspace.device_ptr(&ctx.stream);
-
-    // SAFETY: packed-Q/output/workspace pointers come from live buffers pinned
-    // by `_g*`; raw u64 args (qo_indptr, kv_indptr, kv_indices, last_page_len,
-    // k/v pool, scales) are the caller's live device pointers. Reads only pages
-    // named by `kv_indptr`/`kv_indices`, writes `total_q_tokens` output rows,
-    // stream-ordered.
-    unsafe {
-        ffi::decode_attention_varlen_quantized_cuda(
-            q_ptr as *const ffi::Half,
-            qo_indptr as *const i32,
-            k_pool_ptr as *const u8,
-            v_pool_ptr as *const u8,
-            k_scales_ptr.unwrap_or(0) as *const f32,
-            v_scales_ptr.unwrap_or(0) as *const f32,
-            kv_indptr as *const i32,
-            kv_indices as *const i32,
-            last_page_len as *const i32,
-            o_ptr as *mut ffi::Half,
-            num_q_heads as i32,
-            num_kv_heads as i32,
-            head_dim as i32,
-            page_size as i32,
-            batch_size as i32,
-            total_q_tokens as i32,
-            max_kv_len as i32,
-            causal,
-            int8_kv,
-            sm_scale,
-            ctx.stream.cu_stream(),
-            ws_ptr as *mut u8,
-            workspace_bytes,
-        )
-        .result()?;
-    }
-    Ok(())
-}
-
-// ─── Native persistent paged attention for quantized KV (Path B) ───
+// ─── Native paged attention for quantized KV ───
 //
 // FA3-style split-KV over the 1-byte pools directly — no dequant temp. The
 // kernel is decode-shaped (one q token per batch row) and consumes the same
@@ -834,7 +741,6 @@ pub fn paged_attention_quantized_fa3(
     sm_scale: f32,
     kv_format: KVFormat,
     num_splits: usize,
-    heads_per_cta: usize,
     workspace: &CudaSlice<u8>,
     workspace_bytes: usize,
 ) -> Result<()> {
@@ -873,7 +779,6 @@ pub fn paged_attention_quantized_fa3(
             sm_scale,
             is_fp8,
             num_splits as i32,
-            heads_per_cta as i32,
             ctx.stream.cu_stream(),
             ws_ptr as *mut u8,
             workspace_bytes,
