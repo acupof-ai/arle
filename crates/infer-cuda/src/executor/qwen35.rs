@@ -787,9 +787,10 @@ impl Qwen35CudaExecutor {
         let tier_budget_bytes = default_t1_budget_per_rank();
         let slot_tier = KvTierStore::with_budget(tier_budget_bytes, BLOB_CHUNK_BYTES);
 
-        // Single-GPU only: NCCL all-reduce is not graph-capturable on this stack.
+        // The decode forward's only collectives are stream-ordered all-reduces
+        // (one-shot IPC kernel, or NCCL on the compute stream) — both
+        // graph-capturable. Eager fallback disarms on any capture failure.
         let decode_graph_armed = crate::runtime_flags::qwen35_decode_graph()
-            && model.tp.is_single()
             && model.decode_graph_unsupported_reason().is_none();
         let executor = Self {
             model,
@@ -952,19 +953,6 @@ impl Qwen35CudaExecutor {
                 "executor.qwen35_warmup_total",
                 warmup_t0,
                 format_args!("graph=disabled"),
-            );
-            return Ok(());
-        }
-        if !self.model.tp.is_single() {
-            info!(
-                "Qwen3.5 whole-step decode graph disabled under tensor parallelism \
-                 (world_size>1, NCCL collectives are not graph-capturable); \
-                 using eager forward"
-            );
-            cuda_startup_log(
-                "executor.qwen35_warmup_total",
-                warmup_t0,
-                format_args!("graph=tp_disabled"),
             );
             return Ok(());
         }
