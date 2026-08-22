@@ -30,16 +30,16 @@ pub trait KvAllocator {
     ///
     /// This is the one allocator-level operation that makes HBM bounded as a
     /// session grows: it is the *real* page free behind the write-through tiered
-    /// KV model. It is NEVER called on the default decode path — only the opt-in
-    /// `--kv-recall` executor calls it for non-pinned middle pages — so the
-    /// default impl is a no-op and the baseline stays byte-identical.
+    /// KV model. No in-tree caller today — the `--kv-recall` driver was deleted
+    /// (3f826c204); kept as the hole-tolerance primitive a remote L3 needs, so
+    /// the default impl is a no-op and the baseline stays byte-identical.
     fn evict_slot_page(&mut self, _slot: usize, _logical_page: usize) -> Option<u32> {
         None
     }
 
     /// Inverse of [`KvAllocator::evict_slot_page`]: claim a free page back into
-    /// `logical_page`. `None` if it is not evicted or the pool is empty. The
-    /// caller refills the KV. Opt-in (`--kv-recall` prefetch), so default no-op.
+    /// `logical_page`. `None` if it is not evicted or the pool is empty.
+    /// Default no-op (no in-tree caller; see `evict_slot_page`).
     fn reinstate_slot_page(&mut self, _slot: usize, _logical_page: usize) -> Option<u32> {
         None
     }
