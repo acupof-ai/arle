@@ -694,7 +694,6 @@ pub enum AdmissionVerdict {
     Admit,
     /// Admit nothing this tick (memory pressure, foreground contention, …).
     Hold,
-    ShedTo(usize),
 }
 
 /// Per-tick GPU work budget the engine must respect to stay an OS good citizen.

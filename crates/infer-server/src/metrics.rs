@@ -267,12 +267,6 @@ pub(crate) fn render_prometheus(counters: &CounterSnapshot, model: &str) -> Stri
         kv_system.host_demoted_pages as u64,
     );
     push(
-        "kv_system_host_demoted_pending_inflight",
-        "gauge",
-        "KV pages with an in-flight host-demoted transfer.",
-        kv_system.host_demoted_pending_inflight as u64,
-    );
-    push(
         "kv_system_disk_pages",
         "gauge",
         "KV pages currently stored on disk.",

@@ -460,7 +460,6 @@ fn run_lockstep_driver(
                     kv_system_resident_pages: system.resident_pages,
                     kv_system_resident_evictable_pages: system.resident_evictable_pages,
                     kv_system_host_demoted_pages: system.host_demoted_pages,
-                    kv_system_host_demoted_pending_inflight: system.host_demoted_pending_inflight,
                     kv_system_disk_pages: system.disk_pages,
                     kv_system_reuse_hit_resident: system.reuse_hit_resident,
                     kv_system_reuse_hit_host_demoted: system.reuse_hit_host_demoted,
