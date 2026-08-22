@@ -38,12 +38,12 @@ the bandwidth floor (was 11×).
 End-to-end, Qwen3.8-27B-NVFP4, 1×H20, fp8 KV, MTP on, 32 K agent prompts
 ×32, 214 output tokens, two interleaved trials per arm, base = `e3b9b0f81`:
 
-| arm | c=1 decode tok/s | c=16 out tok/s | c=16 decode tok/s | c=32 out tok/s | c=32 decode tok/s |
-|---|---:|---:|---:|---:|---:|
-| base t1 / t2 | 83.1 / 82.7 | 134.3 / 138.0 | 9.9 / 10.2 | 141.4 / 140.4 | 6.0 / 5.9 |
-| new t1 / t2 | 83.8 / 83.9 | 181.2 / 181.0 | 14.3 / 14.3 | 188.0 / 190.8 | 8.9 / 9.0 |
+| arm | c=1 decode tok/s | c=16 decode tok/s | c=32 decode tok/s |
+| --- | ---: | ---: | ---: |
+| base t1 / t2 | 83.1 / 82.7 | 9.9 / 10.2 | 6.0 / 5.9 |
+| new t1 / t2 | 83.8 / 83.9 | 14.3 / 14.3 | 8.9 / 9.0 |
 
-c=16 +33 %, c=32 +34 %, c=1 wash (B=1 decode is GEMM-bound). Needle ladder
+Per-request decode c=16 +40 %, c=32 +50 %, c=1 wash (B=1 decode is GEMM-bound). Needle ladder
 ×3 at 512/4096/16384/32768: 12/12 exact, DET. 200-item GSM8K-train greedy
 eval: 177/200, against 179–180/200 on the two previous binaries and 177/200
 for the same-base FP8 checkpoint (binomial spread at n=200 ≈ 4 items).

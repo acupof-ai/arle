@@ -175,7 +175,7 @@ quoting a reading whose semantics I had not checked.
   6.49 µs/call for a GEMM that must move 84 MB — 12.9 TB/s on a 4 TB/s card. The
   physical impossibility is what caught it; use `cuda_gpu_kern_sum` for GPU time.
 - **A control that moves invalidates the run.** A c=16 row was discarded because
-  the unchanged FP8 arm moved 30.42 → 106.53 out tok/s between runs.
+  the unchanged FP8 arm moved 3.5× between runs.
 - **A roofline bounds a bandwidth-bound kernel and says nothing about an
   issue-bound one.** The widen was predicted at 3.4% of its GEMM and measured at
   52%.

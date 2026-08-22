@@ -33,16 +33,15 @@ fix (0088e37e5); the prior 1.67x TTFT "speedup" was an artifact of that bug.
 
 ### Throughput (synthetic, 535-tok prompt, 128 decode)
 
-| concurrency | CP=1 out tok/s | CP=2 out tok/s | Δ | CP=1 TTFT p50 | CP=2 TTFT p50 | CP=1 ITL p50 | CP=2 ITL p50 |
-|---:|---:|---:|---:|---:|---:|---:|---:|
-| 1 | 55.4 | 52.4 | -5.4% | 67 ms | 71 ms | 9.4 ms | 11.4 ms |
-| 4 | 106.3 | 87.8 | -17.4% | 178 ms | 191 ms | 34.1 ms | 45.1 ms |
-| 8 | 106.8 | 88.1 | -17.5% | 229 ms | 266 ms | 74.4 ms | 90.2 ms |
-| 16 | 106.9 | 88.2 | -17.5% | 457 ms | 543 ms | 148.3 ms | 180.3 ms |
-| 32 | 106.4 | 88.1 | -17.2% | 845 ms | 972 ms | 296.9 ms | 360.2 ms |
+| concurrency | CP=1 TTFT p50 | CP=2 TTFT p50 | CP=1 ITL p50 | CP=2 ITL p50 |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 67 ms | 71 ms | 9.4 ms | 11.4 ms |
+| 4 | 178 ms | 191 ms | 34.1 ms | 45.1 ms |
+| 8 | 229 ms | 266 ms | 74.4 ms | 90.2 ms |
+| 16 | 457 ms | 543 ms | 148.3 ms | 180.3 ms |
+| 32 | 845 ms | 972 ms | 296.9 ms | 360.2 ms |
 
-CP=1 saturates at ~107 tok/s (c≥4). CP=2 saturates at ~88 tok/s — a 17%
-regression at every concurrency level. TTFT and ITL are both 5-22% worse.
+CP=2: TTFT and ITL are both 5-22% worse at every concurrency level.
 
 ### Decode at 128K context (single request, 128 decode tokens)
 

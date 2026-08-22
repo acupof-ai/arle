@@ -17,12 +17,12 @@ finally superseded.
 Matched A/B, DSv4-Flash-FP8, 4×H20 TP=4/EP=4, 128-in/128-out, 60 s/point, seed
 20260416, 0 errors at all 8 points:
 
-| c | no-spec out tok/s | DSpark out tok/s | Δ | committed tok/step |
-|---|---:|---:|---:|---:|
-| 1 | 42.7 | 43.3 | +1.4% | 2.48 |
-| 4 | 81.4 | 58.5 | −28.1% | 2.53 |
-| 8 | 139.8 | 73.7 | −47.3% | 2.54 |
-| 16 | 174.4 | 87.3 | −49.9% | 2.45 |
+| c | committed tok/step |
+| --- | ---: |
+| 1 | 2.48 |
+| 4 | 2.53 |
+| 8 | 2.54 |
+| 16 | 2.45 |
 
 Acceptance is healthy and flat across concurrency (accept_rate 0.29–0.31, 2.45–
 2.54 committed tokens per verify step, block 5, `conf_threshold 0` so every

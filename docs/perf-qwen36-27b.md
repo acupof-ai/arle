@@ -40,7 +40,7 @@ invalidated it. **Check this table before ranking anything off a number.**
 | §1.2 | W8A16 prefill vs SGLang | 08-05 | 1 | 33K cold | current |
 | §2.1 | plain decode step budget | 08-01 | 1 | short | **stale** — its #2 kernel was deleted 08-03; only the 8.9 ms weight-read floor survives |
 | §2.2 | W8A16 decode ledger vs SGLang | 08-03 | 1 | short | **before-state only** — the program it motivated shipped the same day, 26.88 → 21.37 ms |
-| §2.3 | decode throughput vs batch | 08-07 `70760bc09` | 1–16 | 32K | current; the column is `B / TPOT`, decode-only, not end-to-end `out tok/s` |
+| §2.3 | decode throughput vs batch | 08-07 `70760bc09` | 1–16 | 32K | current; the column is `B / TPOT`, decode-only |
 | §2.4 | sampling penalty | 08-07 `7b8a66603` | 1, 8, 16 | 32K | current |
 | §3 | DSpark tick phase split | 08-07 `7b8a66603` | 11.0 rows at nominal 16 | short | split current; the `22 ms + 2.48/row` fit is superseded by a per-row fit |
 | §4.1 | launch-gap histogram | 08-07 | c=16 window | short | current, and it is a **window** not a step |
@@ -687,14 +687,11 @@ decode 214 x 110.52 ms 23.65  95.1%     █████████████�
                                      total 24.87 s
 ```
 
-Concurrency moves a request's latency almost entirely into decode. Aggregate
-*throughput* on the same workload runs the other way — prefill tokens dominate
-the token count, which is why total tok/s scales 10453 → 33780 while decode
-tok/s scales 118 → 145 (§2.3). The two views answer different questions and
-neither substitutes for the other.
+Concurrency moves a request's latency almost entirely into decode; aggregate
+decode tok/s scales only 118 → 145 over the same range (§2.3).
 
-**Three of the four are measured; the sampling row is a mislabeled end-to-end
-number and is not yet a measured cost.** Each measured cost is sized precisely
+**Three of the four are measured; the sampling row is not yet a measured
+decode cost.** Each measured cost is sized precisely
 and its cause is unknown. Quantized GEMM, DeepGEMM FP8, and launch gaps have all
 been measured and priced out (§6) — the FP8 GEMM decisively so, at 87–93% of
 peak (§1.3).
@@ -702,7 +699,7 @@ peak (§1.3).
 | cost | size | what is known | what is not | § |
 |---|---|---|---|---|
 | per-row verify term at c=16 | **5.69 ms/row, 85% of the tick, 9.2× off roofline** | measured 2026-08-08: FA3 decode-verify achieves **1.02 TB/s = 29.2%** at 32.5K/9 rows and 47% at 2.5K/16 rows | why the achieved bandwidth falls with context when row count moved too — two points cannot separate them | ceiling, §2.0 |
-| sampling penalty | −30 to −40% end-to-end out tok/s at c ≥ 8, not decode-only | arms differ 120 vs 128 complete; cache parity unreported; per-row loop is a hypothesis | the batched-draft gate's share, after a same-envelope re-run | §2.4 |
+| sampling penalty | unmeasured as a decode cost | arms differ 120 vs 128 complete; cache parity unreported; per-row loop is a hypothesis | the batched-draft gate's share, after a same-envelope re-run | §2.4 |
 | prefill GPU idle | 3.97 s vs SGLang 0.19 s | GPU-busy is within 0.93 s on identical kernels | what the idle is waiting on | §1.2 |
 | sidecar writes | 9.4% of wall, 83 GB per bench | the cost, exactly | the restore hit rate, so whether it is earned | §4.2 |
 
@@ -921,7 +918,7 @@ sampling                0.06 ms   0.1%
                                         total 96.88 ms
 ```
 
-Row: 407.97 out tok/s, 659.55 total tok/s, ITL mean 31.08 ms, TTFT p50 1.42 s.
+Row: ITL mean 31.08 ms, TTFT p50 1.42 s.
 `accept_rate` 0.475, empirical chain length 3.37 tokens.
 
 **A decode lever's share is workload-dependent, and the two captures disagree
@@ -1041,27 +1038,14 @@ From the anchor row, per-request decode tok/s and the aggregate `B / TPOT`:
 version of this section attributed that to a batch-independent intercept. That
 attribution is withdrawn: on the current binary the tick is **85% per-row**
 (verify 5.69 ms/row), so the flat curve is the per-row term, not a fixed cost.
-Two cautions on the number itself — this column is `B / TPOT`, a decode-only
-aggregate, while §2.4 and §5.1 measure end-to-end `out tok/s` and scale 3.3×
-over the same range; and c=16 is offered concurrency, against a measured mean of
-11.0 rows per tick (§3).
-Aggregate *total* throughput still scales (10453 → 33780 tok/s) because prefill
-tokens dominate the token count on the anchor workload.
+One caution on the number itself — c=16 is offered concurrency, against a
+measured mean of 11.0 rows per tick (§3).
 
-### 2.4 Sampling's cost is not yet isolated (end-to-end metric, envelope mismatch)
+### 2.4 Sampling's cost is not yet isolated (envelope mismatch)
 
 Counterbalanced greedy/sampled sweep, 2026-08-07, `7b8a66603`, long-agent 32K,
-128 requests per point, order greedy, sampled, sampled, greedy.
-
-| c | greedy (temp 0) | sampled (temp 0.7) | Δ |
-|---:|---:|---:|---:|
-| 1 | 34.8 | 33.55 | **−3.6%** |
-| 8 | 108.65 | 65.4 | **−39.8%** |
-| 16 | 113.8 | 78.6 | **−30.9%** |
-
-The cells are `out tok/s` — output tokens over wall time — not decode-only
-throughput. The earlier "decode tok/s" label on this table and in the lever
-register was wrong.
+128 requests per point, order greedy, sampled, sampled, greedy. The sweep
+reported no decode-only metric.
 
 The sweep is not a valid decode comparison as published:
 
@@ -1120,8 +1104,7 @@ real tick time, so the sum is the honest denominator.
 `rollback` splits into restore 0.85, replay 4.18.
 
 **The phase timer synchronizes at each lap, so the total is inflated and only
-the split is meaningful.** The same run measured 149.1 out tok/s against
-236–243 unprofiled.
+the split is meaningful.**
 
 Two structural facts:
 
@@ -1239,25 +1222,17 @@ Two consequences the chain depends on:
 Long-agent 32K × 8 turns, DSpark, `70760bc09`, 2026-08-07 — the row
 [`baselines.md`](baselines.md) tracks:
 
-| c | TTFT cold | TTFT warm | TPOT | total tok/s |
-|---|---:|---:|---:|---:|
-| 1 | 10.82 s | 0.84 s | 8.46 ms | 10453.0 |
-| 8 | 1.60 s | 0.79 s | 62.49 ms | 31334.5 |
-| 16 | 2.90 s | 1.22 s | **110.52 ms** | **33780.3** |
+| c | TTFT cold | TTFT warm | TPOT |
+| --- | ---: | ---: | ---: |
+| 1 | 10.82 s | 0.84 s | 8.46 ms |
+| 8 | 1.60 s | 0.79 s | 62.49 ms |
+| 16 | 2.90 s | 1.22 s | **110.52 ms** |
 
 ### 5.1 Day delta — what the 08-07 decode work moved
 
 Counterbalanced A/D/D/A, `010af0ede` (morning) against `7b8a66603` (evening),
 same anchor workload, 128/128 complete at every point in all four sweeps. Each
 cell is the mean of that arm's two sweeps.
-
-| c | A out tok/s | D out tok/s | Δ | Δ total tok/s |
-|---:|---:|---:|---:|---:|
-| 1 | 34.15 | 35.35 | +3.5% | −0.2% |
-| 2 | 75.20 | 78.70 | +4.7% | +2.9% |
-| 4 | 83.95 | 96.25 | **+14.7%** | +9.6% |
-| 8 | 91.70 | 111.40 | **+21.5%** | +10.0% |
-| 16 | 104.80 | 118.40 | **+13.0%** | **+22.3%** |
 
 The gain appears at c ≥ 4 and is ~flat at c = 1, which is the signature of the
 two mechanisms that were fixed: both were per-row host loops whose cost scales
@@ -1297,7 +1272,7 @@ Ceilings belong to levers, not to categories.
 | GDN / gated-delta at c=16 | decode | c=16, 2.5K ctx | 21.0% of a decode tick | open — a same-binary A/B nulled it at 33K, untested here |
 | >1 ms gaps inside decode ticks | decode | c=16, 2.5K ctx | 13.8% of tick span, 53 gaps | open, cause unknown |
 | full-attn KV bandwidth | decode | c=16 | **47% of achievable at 2.5K, 29.2% at 32.5K** | open, but only 1.8% of a tick at short context |
-| batched-draft gate under sampling | decode | c=1…16, 32K | unverified: −30 to −40% end-to-end out tok/s at c ≥ 8 (120 vs 128 complete, cache parity unreported) | hypothesis — `executor/qwen35.rs:1984` tests all rows greedy; re-run same-envelope before ranking |
+| batched-draft gate under sampling | decode | c=1…16, 32K | unverified (120 vs 128 complete, cache parity unreported) | hypothesis — `executor/qwen35.rs:1984` tests all rows greedy; re-run same-envelope before ranking |
 | prefill GPU idle | prefill | c=1, 33K | 3.97 vs SGLang 0.19 s | **open** — largest single gap, own SLO (TTFT) |
 | sidecar write policy | prefill | c=1…16 | 83 GB / 9.4% of wall | open — hit rate unmeasured |
 | host tail (refresh H2D, sampling sync) | decode | **batch 1** | part of ~4.3 ms residual | open, needs re-pricing at c=16 |
@@ -1484,8 +1459,8 @@ TTFT ratios are hypotheses pending a complete matched run.
    corrected 192-CTA `block_DV=32` candidate fails in-forward numerical parity.
    **The stall is confirmed and the tile-size lever is closed.**
 
-9. **Sampling's −30 to −40% end-to-end out tok/s at c ≥ 8 is not yet a
-   measured decode cost** (§2.4) — the metric was mislabeled, the arms differ
+9. **Sampling's cost at c ≥ 8 is not yet a measured decode cost** (§2.4) —
+   the arms differ
    120 vs 128 complete, and cache parity is unreported. The gate at
    `executor/qwen35.rs:1984` tests *all* rows greedy; that stays a hypothesis
    until a same-envelope re-run. Do **not** re-open "acceptance collapses with
@@ -1501,7 +1476,7 @@ Facts this chain rests on that have not been measured:
 |---|---|
 | **full-run phase accounting** | the selected window over-represents `pack_quantize` by 2.02x; the run-level shares of every other term and the critical-path split remain unknown |
 | prefix sidecar restore hit rate | decides whether 9.4% of wall is earned |
-| acceptance rate under temperature | the sampled arm has no matching `accept_rate`; its −30 to −40% end-to-end out tok/s is still unattributed |
+| acceptance rate under temperature | the sampled arm has no matching `accept_rate`; its cost is still unattributed |
 | whole-slot park cost | `a546ba80a` shipped unmeasured; both routes default-off |
 | tokenize / detokenize share | folded into "GPU idle" in every prefill capture |
 | TP > 1 | every number here is single-GPU |

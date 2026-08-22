@@ -44,12 +44,12 @@ End-to-end, Qwen3.8-27B-NVFP4, 1×H20 (GPU 0, container), fp8 KV, MTP on,
 32 K agent prompts ×32, 214 output tokens, two interleaved trials per arm,
 base = HEAD before this change:
 
-| arm | c=1 decode tok/s | c=16 out tok/s | c=16 decode tok/s | c=32 out tok/s | c=32 decode tok/s |
-|---|---:|---:|---:|---:|---:|
-| base t1 / t2 | 82.7 / 84.1 | 110.0 / 110.1 | 7.9 / 7.9 | 113.8 / 112.9 | 4.5 / 4.5 |
-| new t1 / t2 | 83.3 / 83.7 | 135.2 / 138.1 | 10.0 / 10.2 | 140.5 / 145.7 | 6.0 / 6.1 |
+| arm | c=1 decode tok/s | c=16 decode tok/s | c=32 decode tok/s |
+| --- | ---: | ---: | ---: |
+| base t1 / t2 | 82.7 / 84.1 | 7.9 / 7.9 | 4.5 / 4.5 |
+| new t1 / t2 | 83.3 / 83.7 | 10.0 / 10.2 | 6.0 / 6.1 |
 
-c=16 +23–25 %, c=32 +24–29 %, c=1 wash (H=2 at B=1, the kernel was 1.00×
+Per-request decode c=16 +27–29 %, c=32 +33–36 %, c=1 wash (H=2 at B=1, the kernel was 1.00×
 there). Needle ladder ×3 at 512/4096/16384/32768 on the new binary: 12/12
 exact, DET. 200-item GSM8K-train greedy eval (same recipe as the 0.5.8
 release): 179/200, against 179–180/200 before the change.

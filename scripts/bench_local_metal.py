@@ -10,7 +10,6 @@ single-stream numbers from two non-streaming latency points:
 
   => TPOT       = (lat_N - lat_1) / (N - 1)
      decode tok/s = 1000 / TPOT          (steady-state, prefill excluded)
-     e2e tok/s    = N / lat_N            (includes prefill)
 
 All requests are temp=0 + ignore_eos so output length is exactly N.
 Reports the median over K repeats (after one warmup).
@@ -78,7 +77,6 @@ latN, compN, _ = median_lat(N, f"E2E  (max_tokens={N})")
 decode_ms = (latN - lat1) / (N - 1)
 tpot = decode_ms
 decode_tps = 1000.0 / tpot if tpot > 0 else float("nan")
-e2e_tps = N / (latN / 1000.0)
 
 out = {
     "model": MODEL,
@@ -87,6 +85,5 @@ out = {
     "ttft_ms": round(lat1, 1),
     "tpot_ms": round(tpot, 2),
     "decode_tok_s": round(decode_tps, 1),
-    "e2e_tok_s": round(e2e_tps, 1),
 }
 print(json.dumps(out))

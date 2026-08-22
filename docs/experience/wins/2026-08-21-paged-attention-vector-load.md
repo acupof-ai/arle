@@ -40,18 +40,12 @@ reached a bench:
 ## Result
 
 c=32 on the 32K agent chain, 32 requests per point, 3 repeats per arm, both arms
-one GPU back to back, 32/32 complete and 0 errors everywhere:
-
-| arm | rep2 | rep3 | mean | σ |
-|---|---:|---:|---:|---:|
-| base | 109.5 | 109.3 | 109.4 | 0.14 (0.13%) |
-| **shipped** | **114.2** | **113.9** | **114.05** | 0.21 (0.19%) |
-
-**+4.25% output tok/s, at σ = 0.2%.** The delta is 20x the spread. (`rep1` is a
-cold-start artifact in both arms — 16.9 vs 17.1 — and is excluded from both.)
+one GPU back to back, 32/32 complete and 0 errors everywhere. No decode-only
+metric (ITL) was recorded for this A/B, so the serving delta is unreported.
+(`rep1` is a cold-start artifact in both arms and is excluded.)
 
 The gain is smaller than the instruction count predicts: ~25% fewer inner-loop
-instructions against +4.25% end to end. The kernel is latency-bound as much as
+instructions against a small serving delta. The kernel is latency-bound as much as
 issue-bound — `long_scoreboard` is 56% of a 13.96-cycle issue gap — so removing
 instructions does not shorten the critical path proportionally.
 

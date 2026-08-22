@@ -58,7 +58,7 @@ Client:
 |---|---:|
 | successful scored turns | ... |
 | incomplete scored turns | ... |
-| successful output tok/s | ... |
+| decode tok/s (1000 / ITL mean) | ... |
 | TTFT p50 (ms) | ... |
 | TTFT p99 (ms) | ... |
 | ITL p50 (ms) | ... |
@@ -73,7 +73,7 @@ Client:
 | scored turns | ... | ... |
 | TTFT p50 (ms) | ... | ... |
 | TTFT p99 (ms) | ... | ... |
-| output tok/s | ... | ... |
+| decode tok/s | ... | ... |
 
 ## Results - W4 Resume
 
@@ -113,7 +113,7 @@ Client:
 
 ## Four-Engine Comparison
 
-| engine | commit/tag | output tok/s | TTFT p99 (ms) | E2E p99 (ms) | cache report | raw artefact |
+| engine | commit/tag | decode tok/s | TTFT p99 (ms) | E2E p99 (ms) | cache report | raw artefact |
 |---|---|---:|---:|---:|---|---|
 | ARLE | ... | ... | ... | ... | ... | ... |
 | SGLang | ... | ... | ... | ... | ... | ... |
@@ -141,7 +141,7 @@ Mission margin:
 
 | metric | baseline | now | delta |
 |---|---:|---:|---:|
-| output tok/s | ... | ... | ... |
+| decode tok/s | ... | ... | ... |
 | TTFT p99 | ... | ... | ... |
 | E2E p99 | ... | ... | ... |
 

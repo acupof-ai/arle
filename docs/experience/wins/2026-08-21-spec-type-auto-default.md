@@ -17,25 +17,18 @@ complete everywhere (`/host/arle-runs/specab-20260821/`):
 | c | ms per committed token | A none | B mtp d=2 | C mtp d=4 |
 |---:|---|---:|---:|---:|
 | 1 | | 20.50 | **11.94** | 12.19 |
-| 1 | end-to-end tok/s | 20.4 | **24.9** (+21.6%) | 24.6 (+20.5%) |
 | 1 | tok/decode-step | 1.00 | 1.89 | 2.03 |
 | 1 | rows presented (M) | 1.0 | 2.97 | 4.95 |
 | 1 | accept rate | — | 44.7% | 25.9% |
-| 4 | out tok/s | 85.9 | 85.4 | 85.1 |
-| 8 | out tok/s | 100.2 | 98.7 | 99.4 |
-| 16 | out tok/s | 107.4 | 107.9 | 107.7 |
-| 32 | out tok/s | 111.2 | 112.0 | 111.2 |
 
 **d=2 is the setting.** d=4 buys 2.03 tok/step against 1.89 while the accept rate
-falls 44.7% → 25.9%, and lands the same end to end.
+falls 44.7% → 25.9%, and lands the same ms per committed token.
 
 **Above c=1 the default is inert, not merely harmless.** The `/v1/stats` spec
 chain-counter delta is exactly 0 for B and C at every c≥4 and `tok/decode-step`
 matches the control to four significant digits (4.04 / 8.18 / 16.58 / 32.15), so
 the three arms are literally the same code path — the MTP branch is pinned to a
-single decode row at `executor/qwen35.rs:2369` because it drafts serially. The
-±1.5% spread at those points is this bench's noise floor, measured by that
-accidental no-op control.
+single decode row at `executor/qwen35.rs:2369` because it drafts serially.
 
 `ITL` is unusable for the spec arms: MTP emits several tokens per SSE event, so
 C's c=1 `itl_p50` of 0.04 ms is a burst artifact. The decode SLO here is

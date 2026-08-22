@@ -126,14 +126,14 @@ local pages, so none of it turned recall into a no-op.
 The gates above are all correctness. The wall-clock measurement that was owed:
 TP=2 CP=2, Qwen3.6-27B, same binary, back-to-back on the same four GPUs. TTFT is
 the `max_tokens=1` wall; decode tok/s is `(N-1)/(wall_N - wall_1)`, which
-cancels prefill; conc-16 is aggregate generated tokens over wall.
+cancels prefill.
 
-| ctx | TTFT on/off (s) | decode tok/s on/off | conc-16 tok/s on/off |
-|---|---|---|---|
-| 1,787 | 0.62 / 0.56 | 94.6 / 113.5 | 69.3 / 73.1 |
-| 7,412 | 2.50 / 2.36 | 144.7 / 150.6 | 23.0 / 24.1 |
-| 14,913 | 5.07 / 4.76 | 107.6 / 148.2 | 11.9 / 12.6 |
-| 30,913 | 10.59 / 10.07 | 112.8 / 145.3 | 5.8 / 6.2 |
+| ctx | TTFT on/off (s) | decode tok/s on/off |
+| --- | --- | --- |
+| 1,787 | 0.62 / 0.56 | 94.6 / 113.5 |
+| 7,412 | 2.50 / 2.36 | 144.7 / 150.6 |
+| 14,913 | 5.07 / 4.76 | 107.6 / 148.2 |
+| 30,913 | 10.59 / 10.07 | 112.8 / 145.3 |
 
 **Uniformly slower.** TTFT +5–11% is expected — the scoring cycle is pure added
 work at the prefill tail. Decode −4…−27% is not what the design predicts: the

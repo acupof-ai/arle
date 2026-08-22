@@ -216,15 +216,15 @@ Slopes across the two points: verify **5.69 ms/row**, draft **3.04 ms/row**.
 Then the A/B — same binary, only the GDN lane swapped
 (`--qwen35-gdr-chunked false`):
 
-| arm | draft | snap | verify | commit | tick | bench out tok/s |
-|---|---:|---:|---:|---:|---:|---:|
-| chunked (shipped) | 47.94 | 1.55 | 109.29 | 3.21 | 162.0 | **21.1** |
-| recurrent | 48.05 | 1.55 | 110.14 | 3.21 | 162.9 | 14.8 |
-| Δ | +0.2% | 0 | **+0.8%** | 0 | +0.6% | −29.9% |
+| arm | draft | snap | verify | commit | tick |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| chunked (shipped) | 47.94 | 1.55 | 109.29 | 3.21 | 162.0 |
+| recurrent | 48.05 | 1.55 | 110.14 | 3.21 | 162.9 |
+| Δ | +0.2% | 0 | **+0.8%** | 0 | +0.6% |
 
 The swap changes both the algorithm and the per-(row, layer) launch count by
-2–4×, and verify moved 0.8%. The arm is provably engaged — end-to-end
-throughput moved 30% in the same A/B — so this is a real null, not a dead flag.
+2–4×, and verify moved 0.8%. The arm is provably engaged, so this is a real
+null, not a dead flag.
 **The per-row verify cost is neither the GDN kernel nor its launch overhead.**
 That kills both proposed fixes: the chain-length threshold and the
 batch-across-rows rewrite.

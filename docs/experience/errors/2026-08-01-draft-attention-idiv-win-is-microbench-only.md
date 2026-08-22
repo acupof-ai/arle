@@ -62,7 +62,6 @@ the same HEAD with only the `.cu` differing, ThinkingCap-27B-FP8 +
 |---|---:|---:|---:|
 | draft attn, Q4 (ring full) | 7.46 ms | 7.66 | +2.7% |
 | draft attn, overall median | 5.70 ms | 5.83 | +2.3% |
-| output tok/s | 231.8 | 230.3 | −0.6% |
 | accept | 5407/11525 | 5407/11525 | identical |
 
 GPUs swapped between arms and rerun: 7.46 → 7.66 and 5.70 → 5.81 again. Same

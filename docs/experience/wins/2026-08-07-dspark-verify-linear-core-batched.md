@@ -1,4 +1,4 @@
-# DSpark verify linear core batched: c=8 TPOT −12.7%, c=16 tok/s +10.0% — CUDA, 2026-08-07
+# DSpark verify linear core batched: c=8 TPOT −12.7%, c=16 TPOT −5.8% — CUDA, 2026-08-07
 
 > Status: **accepted at c≥2, null at c=1 as the mechanism predicts.**
 > Counterbalanced A/B — two sweeps per arm in both orders, same box, same
@@ -94,16 +94,16 @@ TPOT is `itl_mean`, the only honest per-token figure on a spec row — `itl_p50`
 samples the within-chain gap at 0.02 ms. Each cell is the mean of the two
 counterbalanced rounds.
 
-| c | A TPOT ms | B TPOT ms | Δ TPOT | A total tok/s | B total tok/s | Δ |
-|---:|---:|---:|---:|---:|---:|---:|
-| 1 | 8.539 | 8.566 | +0.3% | 10433.5 | 10486.0 | +0.5% |
-| 2 | 19.248 | 18.661 | −3.1% | 21670.1 | 21941.2 | +1.3% |
-| 4 | 36.685 | 35.584 | −3.0% | 25925.5 | 26853.3 | +3.6% |
-| 8 | 73.975 | **64.608** | **−12.7%** | 29687.8 | 31457.0 | +6.0% |
-| 16 | 124.986 | **117.678** | **−5.8%** | 29954.7 | **32953.9** | **+10.0%** |
+| c | A TPOT ms | B TPOT ms | Δ TPOT |
+| ---: | ---: | ---: | ---: |
+| 1 | 8.539 | 8.566 | +0.3% |
+| 2 | 19.248 | 18.661 | −3.1% |
+| 4 | 36.685 | 35.584 | −3.0% |
+| 8 | 73.975 | **64.608** | **−12.7%** |
+| 16 | 124.986 | **117.678** | **−5.8%** |
 
 Against the ±2.7% drift band measured yesterday, c=4 sits at its edge and
-c=2/8/16 are outside it on TPOT, aggregate, or both.
+c=2/8/16 are outside it on TPOT.
 
 **The c=1 null is the control, not a disappointment.** The batched lane is
 gated on more than one row, so a single-row forward must be unchanged. It is,
@@ -111,13 +111,13 @@ to 0.3%. Every point from c=2 up moves the same direction.
 
 Arm B's full row, for `docs/baselines.md`:
 
-| c | total tok/s | TPOT ms | out tok/s | ttft p50 | ttft p90 | itl p99 |
-|---:|---:|---:|---:|---:|---:|---:|
-| 1 | 10486.0 | 8.566 | 34.4 | 802 | 10790 | 31.59 |
-| 2 | 21941.2 | 18.661 | 79.9 | 571 | 658 | 205.91 |
-| 4 | 26853.3 | 35.584 | 91.8 | 596 | 1035 | 505.70 |
-| 8 | 31457.0 | 64.608 | 105.6 | 743 | 1508 | 545.90 |
-| 16 | 32953.9 | 117.678 | 113.6 | 1419 | 3459 | 773.57 |
+| c | TPOT ms | ttft p50 | ttft p90 | itl p99 |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 8.566 | 802 | 10790 | 31.59 |
+| 2 | 18.661 | 571 | 658 | 205.91 |
+| 4 | 35.584 | 596 | 1035 | 505.70 |
+| 8 | 64.608 | 743 | 1508 | 545.90 |
+| 16 | 117.678 | 1419 | 3459 | 773.57 |
 
 ## Correctness gate
 

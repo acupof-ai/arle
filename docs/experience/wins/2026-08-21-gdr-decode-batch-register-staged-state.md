@@ -44,10 +44,10 @@ faster, and the 16-way partial sum breaks bit-exactness at 1e-7);
 End-to-end, Qwen3.8-27B-NVFP4, 1×H20 (GPU 4), fp8 KV, 32 K agent prompts
 ×32, 214 output tokens, two interleaved trials per arm, same HEAD otherwise:
 
-| arm | c=1 out tok/s | c=1 decode tok/s | c=16 out tok/s | c=16 decode tok/s |
-|---|---:|---:|---:|---:|
-| base t1 / t2 | 24.8 / 24.7 | 83.8 / 82.9 | 109.9 / 107.1 | 7.8 / 7.7 |
-| new t1 / t2 | 24.8 / 24.9 | 83.0 / 83.4 | 109.1 / 109.6 | 7.8 / 7.9 |
+| arm | c=1 decode tok/s | c=16 decode tok/s |
+| --- | ---: | ---: |
+| base t1 / t2 | 83.8 / 82.9 | 7.8 / 7.7 |
+| new t1 / t2 | 83.0 / 83.4 | 7.8 / 7.9 |
 
 Wash: the kernel saves ≈0.2 ms per token at c=1 (36 linear-attention layers ×
 6 µs) against ≈12 ms per token, ≈2 %; less at c=16. The "13 % of decode GPU

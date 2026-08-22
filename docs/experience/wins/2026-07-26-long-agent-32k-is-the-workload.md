@@ -22,15 +22,14 @@ champion rows are marked retired rather than deleted.
 First anchor (ThinkingCap-Qwen3.6-27B-FP8, 1×H20, no spec, 8 req/point,
 max_tokens 256, measured `prompt_tokens` 33000):
 
-| c | out tok/s | total tok/s | wall s |
-|---|----------:|------------:|-------:|
-| 1 | 3.4       | 486.0       | 547.0  |
-| 4 | 12.9      | 1748.9      | 152.0  |
-| 8 | 14.3      | 1906.7      | 139.5  |
+| c | wall s |
+| --- | -------: |
+| 1 | 547.0 |
+| 4 | 152.0 |
+| 8 | 139.5 |
 
 **68.4 s per request at c=1, of which ~7 s is the 256-token decode — ~89% is the
-33k prefill, running at ~540 tok/s.** The same serve on ~130-token prompts
-reports 38 out tok/s. The 11× gap is entirely prompt length, and it re-scopes
+33k prefill, running at ~540 tok/s.** Prompt length re-scopes
 the whole decode-side effort: speculative decoding accelerates the ~10% slice.
 Prefill throughput also degrades with length (~1270 tok/s at ~5k prompt tokens
 vs ~540 at 33k), which is the next thing to probe.

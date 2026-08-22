@@ -39,12 +39,12 @@ python3 scripts/bench_throughput.py \
 
 ## Results
 
-| concurrency | completed | output tok/s | TTFT p99 ms | ITL p99 ms |
-|---:|---:|---:|---:|---:|
-| 1 | 20/20 | 40.35 | 472.0 | 42.0 |
-| 4 | 20/20 | 73.05 | 1,130.2 | 99.3 |
-| 8 | 20/20 | 109.81 | 1,651.0 | 95.6 |
-| 16 | 20/20 | 121.82 | 3,307.7 | 122.6 |
+| concurrency | completed | TTFT p99 ms | ITL p99 ms |
+| ---: | ---: | ---: | ---: |
+| 1 | 20/20 | 472.0 | 42.0 |
+| 4 | 20/20 | 1,130.2 | 99.3 |
+| 8 | 20/20 | 1,651.0 | 95.6 |
+| 16 | 20/20 | 3,307.7 | 122.6 |
 
 The latest historical DSv4 mmap L2+L3 run was 40.00/72.86/104.60/119.96
 tok/s at c=1/4/8/16. The directional deltas are +0.9%/+0.3%/+5.0%/+1.6%; this

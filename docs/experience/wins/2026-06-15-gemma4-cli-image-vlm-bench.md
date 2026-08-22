@@ -61,10 +61,10 @@ Single image prompt:
 
 Results:
 
-| Shape | Prompt tokens | Output tokens | Avg latency | P50 latency | P95 latency | Output tok/s | Output |
-|---|---:|---:|---:|---:|---:|---:|---|
-| 1 image short answer | 280 | 8 | 1.042s | 1.036s | 1.070s | 7.68 | `The image shows a **cat**.` |
-| text-only short answer | 15 | 4 | 0.297s | 0.298s | 0.300s | 13.45 | `**Cat**` |
+| Shape | Prompt tokens | Output tokens | Avg latency | P50 latency | P95 latency | Output |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| 1 image short answer | 280 | 8 | 1.042s | 1.036s | 1.070s | `The image shows a **cat**.` |
+| text-only short answer | 15 | 4 | 0.297s | 0.298s | 0.300s | `**Cat**` |
 
 Interpretation for this shape: one-image VLM adds about 0.74s over the text-only short-answer baseline on this M4 Pro run. The image path is stable and correct for the cat smoke, but this is not a throughput or multi-image benchmark.
 

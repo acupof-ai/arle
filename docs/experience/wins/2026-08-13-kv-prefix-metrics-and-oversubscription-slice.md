@@ -59,13 +59,13 @@ Needle retrieval passed 3/3 at 512, 4096, 8192, and 12000 tokens.
 The first A/B used an invalid prompt shape: measured prompt p50 was 36159,
 10.35% above the 32K target. It is diagnostic only:
 
-| slice | completed | errors / empty | output tok/s | wall s | park / promote | TTFT p50 / p99 s | ITL p50 / p99 ms |
-|---:|---:|---:|---:|---:|---:|---:|---:|
-| 8 | 20 / 20 | 0 / 0 | 0.941 | 5440.23 | 620 / 620 | 5.084 / 22.57 | 18.06 / 18.35 |
-| 32 | 20 / 20 | 0 / 0 | 3.878 | 1320.26 | 140 / 140 | 5.102 / 22.72 | 18.06 / 18.57 |
+| slice | completed | errors / empty | wall s | park / promote | TTFT p50 / p99 s | ITL p50 / p99 ms |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 8 | 20 / 20 | 0 / 0 | 5440.23 | 620 / 620 | 5.084 / 22.57 | 18.06 / 18.35 |
+| 32 | 20 / 20 | 0 / 0 | 1320.26 | 140 / 140 | 5.102 / 22.72 | 18.06 / 18.57 |
 
-Slice 32 reduced transfers by 77.4% and improved diagnostic throughput by
-312.1%, with TTFT p99 +0.7% and ITL p99 +1.2%.
+Slice 32 reduced transfers by 77.4% and cut wall 5440 → 1320 s, with TTFT p99
++0.7% and ITL p99 +1.2%.
 
 The corrected workload has tokenizer-measured prompt min/p50/max
 30142/33002/35849, p50 +0.71% from target, SHA256

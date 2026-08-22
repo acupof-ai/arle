@@ -36,12 +36,12 @@ hit the 60 tokens/s speed profile, with an explicit quality tradeoff.
 
 ## Results
 
-| Runner | Steps | Warm state | Wall time | Output tok/s | Notes |
-| --- | ---: | --- | ---: | ---: | --- |
-| ARLE before per-step sampling fix | 48 max, adaptive 16 | warm | 8.87 s | 7.2 | Prompt KV cache + sorted MoE, still per-step host loop. |
-| ARLE C++ fast path | 8 | warm | 2.03 s | 31.5 | `prefill_ms=109.4`, `denoise_ms=1673.5`, final canvas eval/copy `246.9`. |
-| ARLE C++ fast path | 4 | warm | 1.026 s | 62.4 | Hits speed gate; output quality visibly degrades with repetitions. |
-| `mlx-vlm` reference | 8 | generation timing | n/a | 43.3 | Same prompt and model; reported `Prompt: 163.0 tok/s`, `Generation: 43.3 tok/s`. |
+| Runner | Steps | Warm state | Wall time | Notes |
+| --- | ---: | --- | ---: | --- |
+| ARLE before per-step sampling fix | 48 max, adaptive 16 | warm | 8.87 s | Prompt KV cache + sorted MoE, still per-step host loop. |
+| ARLE C++ fast path | 8 | warm | 2.03 s | `prefill_ms=109.4`, `denoise_ms=1673.5`, final canvas eval/copy `246.9`. |
+| ARLE C++ fast path | 4 | warm | 1.026 s | Hits speed gate; output quality visibly degrades with repetitions. |
+| `mlx-vlm` reference | 8 | generation timing | n/a | Same prompt and model; reported `Prompt: 163.0 tok/s`, `Generation: 43.3 tok/s`. |
 
 ## What Worked
 
@@ -62,8 +62,7 @@ hit the 60 tokens/s speed profile, with an explicit quality tradeoff.
 
 The 60 tokens/s gate is not a default-quality result. At 4 denoise steps, the
 sample output repeated words and punctuation. The 8-step profile is much more
-usable but reaches 31.5 output tokens/s on the full request wall-clock and
-43.3 generation tokens/s in the `mlx-vlm` reference.
+usable; the `mlx-vlm` reference reports 43.3 generation tokens/s.
 
 ## Learnings
 

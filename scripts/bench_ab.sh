@@ -191,7 +191,7 @@ def load(d):
         rows[key] = {
             "ttft_p50": (m.get("ttft") or {}).get("p50_ms"),
             "itl_p50":  (m.get("itl") or {}).get("p50_ms"),
-            "tok_s":    m.get("output_tokens_per_s"),
+            "tok_s":    (1000.0 / im if (im := (m.get("itl") or {}).get("mean_ms")) else None),
         }
     return rows
 
@@ -217,7 +217,7 @@ lines.append("")
 lines.append(f"- A: {a_dir}")
 lines.append(f"- B: {b_dir}")
 lines.append("")
-lines.append("| rate | A tok/s | B tok/s | Δ tok/s | A TTFT p50 | B TTFT p50 | Δ TTFT |")
+lines.append("| rate | A decode tok/s | B decode tok/s | Δ decode | A TTFT p50 | B TTFT p50 | Δ TTFT |")
 lines.append("|---|---|---|---|---|---|---|")
 for k in keys:
     av, bv = a.get(k, {}), b.get(k, {})

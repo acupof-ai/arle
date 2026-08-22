@@ -268,8 +268,6 @@ for input_path in inputs:
         rows.append({
             "source": str(path),
             "rate": f"conc{metrics.get('concurrency', '?')}",
-            "output_tokens_per_second": metrics.get("output_tokens_per_s"),
-            "tokens_per_second": metrics.get("total_tokens_per_s"),
             "requests_per_second": metrics.get("requests_per_s"),
             "ttft_p50_ms": ttft.get("p50_ms"),
             "ttft_p99_ms": ttft.get("p99_ms"),
@@ -288,13 +286,12 @@ def fmt(value):
     return str(value)
 
 lines = [
-    "| rate | out tok/s | total tok/s | req/s | TTFT p50 | TTFT p99 | ITL p50 | ITL p99 |",
-    "|---|---:|---:|---:|---:|---:|---:|---:|",
+    "| rate | req/s | TTFT p50 | TTFT p99 | ITL p50 | ITL p99 |",
+    "|---|---:|---:|---:|---:|---:|",
 ]
 for row in rows:
     lines.append(
-        f"| {row['rate']} | {fmt(row['output_tokens_per_second'])} | "
-        f"{fmt(row['tokens_per_second'])} | {fmt(row['requests_per_second'])} | "
+        f"| {row['rate']} | {fmt(row['requests_per_second'])} | "
         f"{fmt(row['ttft_p50_ms'])} | {fmt(row['ttft_p99_ms'])} | "
         f"{fmt(row['itl_p50_ms'])} | {fmt(row['itl_p99_ms'])} |"
     )

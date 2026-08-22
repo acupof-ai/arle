@@ -254,9 +254,9 @@ this server today.
 Ran to completion (`--concurrencies 1 --max-seconds 45`, real guidellm 0.6.0
 tool output, not hand-rolled):
 
-| rate (req/s) | TTFT p50 (ms) | TTFT p99¹ (ms) | ITL p50 (ms) | ITL p99¹ (ms) | out tok/s (median) | out tok/s (mean) | req/s actual |
-|---|---|---|---|---|---|---|---|
-| concurrent c=1 | 8091.8 | 8492.0 | 0.121 | 0.163 | 31.5 | 37.5 | 0.1 (6 reqs / 45s) |
+| rate (req/s) | TTFT p50 (ms) | TTFT p99¹ (ms) | ITL p50 (ms) | ITL p99¹ (ms) | req/s actual |
+| --- | --- | --- | --- | --- | --- |
+| concurrent c=1 | 8091.8 | 8492.0 | 0.121 | 0.163 | 0.1 (6 reqs / 45s) |
 
 ¹ guidellm reported these as its p95 columns (its console table only prints
 p95, not p99 — the raw CSV's percentile array top value, used above, is its
@@ -264,10 +264,7 @@ highest reported percentile point, functionally its p95/near-max).
 
 Additional columns from the raw table:
 - Request latency: median 8.1s, p95 8.5s.
-- TPOT: median 31.6ms, p95 33.2ms (~31.6 tok/s single-stream, matches out
-  tok/s median above).
-- Server throughput (aggregate): input tok/s mean 599.8, output tok/s mean
-  37.5, total tok/s mean 637.3.
+- TPOT: median 31.6ms, p95 33.2ms (~31.6 decode tok/s single-stream).
 - 6 successful, 0 errored, 0 incomplete requests in the 45s window (bounded
   correctly — `elapsed_time: 49.0s` including drain of the last in-flight
   request past the nominal cutoff).
@@ -334,7 +331,7 @@ Additional columns from the raw table:
 |---|---|---|---|
 | guidellm preflight | blocked (usage never populated) | **passes** | fixed |
 | canonical sweep | blocked before launch | launches, but capacity-blocked mid-sweep | partial |
-| any real guidellm number | none | TTFT p50 8091.8ms, out tok/s 31.5 (c=1) | first data point |
+| any real guidellm number | none | TTFT p50 8091.8ms, TPOT median 31.6ms (c=1) | first data point |
 
 ## Artefacts
 

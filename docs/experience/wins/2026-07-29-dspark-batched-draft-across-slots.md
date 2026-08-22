@@ -27,16 +27,15 @@ replaces B blocking D2H reads.
 Matched A/B, GPU 0, ThinkingCap-Qwen3.6-27B-FP8 + Qwen3.6-27B-DFlash,
 `bench-agent-32k-16x8`, 48 req/point, max_tokens 214, seed 20260416, c=16.
 
-| | out tok/s | TPOT ms |
-|---|---:|---:|
-| no-spec | 125.5 | 99.69 |
-| DSpark block 16 | 97.1 | 137.70 |
-| DSpark block 6 | 117.5 | 110.52 |
-| **block 6 + batched draft** | **125.7** | **101.86** |
-| block 16 + batched draft | 100.8 | 131.23 |
+|  | TPOT ms |
+| --- | ---: |
+| no-spec | 99.69 |
+| DSpark block 16 | 137.70 |
+| DSpark block 6 | 110.52 |
+| **block 6 + batched draft** | **101.86** |
+| block 16 + batched draft | 131.23 |
 
-Batching is **+7.0%** throughput / **−7.8%** TPOT at block 6, +3.8% / −4.7% at
-block 16. Gate exact=3 DET at 512/4k/16k, 0 errors — the verify is exact, so
+Batching is **−7.8%** TPOT at block 6, −4.7% at block 16. Gate exact=3 DET at 512/4k/16k, 0 errors — the verify is exact, so
 output is unchanged by construction.
 
 Block size is now a live lever at concurrency (it was not on the old engine):

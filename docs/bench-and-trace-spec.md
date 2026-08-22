@@ -17,7 +17,8 @@ Every run records these sections:
 4. **Environment** — commit and binary hash, host, GPU, driver, CUDA/Metal,
    model, dtype, TP/EP, slots, and KV configuration.
 5. **Results** — raw fixed-concurrency rows, completed/incomplete/error counts,
-   output tok/s, req/s, TTFT p50/p99, ITL p50/p99, and A/B delta.
+   decode tok/s (`1000 / ITL mean`), req/s, TTFT p50/p99, ITL p50/p99, and
+   A/B delta.
 6. **Problems** — correctness failures, OOM, retries, cache contamination,
    profiler gaps, and other confounders.
 7. **Learnings** — PASS, KILL, or pending-remote; measured number; next wall.
@@ -29,7 +30,7 @@ Missing one section means the run does not count.
 Use exactly one primary goal per run:
 
 - **Latency:** TTFT or ITL at a fixed concurrency and request shape.
-- **Throughput:** output tok/s at fixed concurrency, or saturation throughput
+- **Throughput:** decode tok/s at fixed concurrency, or saturation throughput
   under an explicit SLO.
 - **Memory:** peak device/host bytes for a fixed workload.
 - **Correctness:** decoded outputs and request status for the failing slice.
@@ -110,8 +111,9 @@ Rules:
   `/v1/stats` and compare against the 95.7% reference. A cold turn 1 means
   reuse is broken (eviction, KV pressure, or a cache-defeating treatment) —
   that is a finding, not a number to average through.
-- Report the cold and warm slices separately. One blended tok/s hides which of
-  the two a treatment moved, and their ratio depends entirely on `turns`.
+- Report the cold and warm slices separately; a single figure across both hides
+  which of the two a treatment moved, and their ratio depends entirely on
+  `turns`.
 - **Confirm the length.** The generator estimates tokens at 3.6 chars/token —
   a ratio, not a tokenizer. Record `usage.prompt_tokens` p50 from the run and
   state it next to the target. Outside ±10%, re-generate with a corrected

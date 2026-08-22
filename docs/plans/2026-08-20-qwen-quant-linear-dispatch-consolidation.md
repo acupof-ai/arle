@@ -488,7 +488,7 @@ measurable regression and identical route engagement.
   `scripts/bench_throughput.py` at `c={1,4,8,16}` with at least 20 completed
   requests per reported point.
 - Record cold and warm slices, prompt/completion token distributions, prefix
-  hits, KV residency, queue/preempt counters, errors, output tok/s, req/s, TTFT
+  hits, KV residency, queue/preempt counters, errors, decode tok/s, req/s, TTFT
   p50/p99, and ITL p50/p99.
 - If delta is within the documented drift band, run at least three trials per
   arm and report median plus range. Any unresolved negative sign blocks the

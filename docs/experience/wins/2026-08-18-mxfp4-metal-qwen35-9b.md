@@ -53,10 +53,10 @@ this context length, reproduced without any arle code in the path.
 
 Decode A/B (c=1, 512→128):
 
-| arm | TTFT ms | TPOT ms | decode tok/s | e2e tok/s |
-|---|---:|---:|---:|---:|
-| affine 4bit | 1456.9 | 20.02 | 50.0 | 32.0 |
-| MXFP4 | 1459.6 | 19.01 | 52.6 | 33.0 |
+| arm | TTFT ms | TPOT ms | decode tok/s |
+| --- | ---: | ---: | ---: |
+| affine 4bit | 1456.9 | 20.02 | 50.0 |
+| MXFP4 | 1459.6 | 19.01 | 52.6 |
 
 MXFP4 decodes 5.2% faster; TTFT is a wash.
 

@@ -34,17 +34,17 @@ grid-parallel (`2e635eda3`). Rates: 20-prompt `bench-prompts.jsonl` (~3352 tok,
 60 s); var-c1/c32: 64-doc varied `bench-prompts-64.jsonl` (~3350 tok, 120 s,
 unique prefixes). guidellm concurrent profile, seed 20260416.
 
-| run | A total tok/s | B total tok/s | Δ | A TTFT p50 | B TTFT p50 |
-|---|---:|---:|---:|---:|---:|
-| rate 1 | 3969.3 | 4116.8 | **+3.7%** | 552 ms | 521 ms |
-| rate 4 | 5149.6 | 5339.4 | **+3.7%** | 1545 ms | 1467 ms |
-| rate 8 | 5271.2 | 5604.5 | **+6.3%** | 4141 ms | 3921 ms |
-| rate 16 | 5217.1 | 5481.2 | **+5.1%** | 7145 ms | 6698 ms |
-| var-c1 | 796.9 (33 ok) | 853.6 (35 ok) | **+7.1%** | 3267 ms | 3019 ms |
-| var-c32 | 847.6 (34 ok) | 1007.5 (41 ok) | **+18.9%** | 60985 ms | 51842 ms |
+| run | A TTFT p50 | B TTFT p50 |
+| --- | ---: | ---: |
+| rate 1 | 552 ms | 521 ms |
+| rate 4 | 1545 ms | 1467 ms |
+| rate 8 | 4141 ms | 3921 ms |
+| rate 16 | 7145 ms | 6698 ms |
+| var-c1 | 3267 ms | 3019 ms |
+| var-c32 | 60985 ms | 51842 ms |
 
-Arm A reproduces the morning fp32all table within noise (−3%..+1.5% per rate;
-different GPU set 1–4 vs 0–3), so the baseline is stable. Raw artifacts:
+Arm A reproduces the morning fp32all table within noise (different GPU set
+1–4 vs 0–3), so the baseline is stable. Raw artifacts:
 `/host/arle-build/bench-output/2026-07-16-{fp32par,fp32serialA}-*/result.{json,csv}`.
 Column semantics as extracted by the driver; result.json is authoritative.
 
@@ -58,13 +58,13 @@ absent.
 
 ## Learnings
 
-- **LICENSED**: stable positive wall-clock gain at every point, needle
+- **LICENSED**: stable TTFT gain at every point, needle
   zero-miss at both depths. The serial-probe cost measures ~30–40 ms per
   ~3352-tok prefill (TTFT c1 delta), i.e. ~0.4 ms per compressor call × 86
   calls — the earlier "hundreds of ms" estimate was 5–10× high, and the
-  all-boundaries entry's −17..−36% was TP=8→TP=4 + workload confounded, not
+  all-boundaries entry's regression was TP=8→TP=4 + workload confounded, not
   the probe's isolated cost. The gain compounds under queue pressure
-  (+18.9% and −15% TTFT at c32) because every queued request repays the
+  (−15% TTFT at c32) because every queued request repays the
   prefill saving.
 - **num_slots is the real high-concurrency wall**: both arms log `requested
   256 slots clamped to 2 (per_slot 9618MB, slot-state 9596MB, budget
@@ -75,5 +75,5 @@ absent.
   slots 2 → ~4).
 - Arm B var-c32 ITL p50 160 ms vs arm A 70 ms while completing +7 requests:
   faster prefills admit more chunked-prefill interleave per decode tick.
-  Total tok/s + completions are the wall-clock verdict; per-token ITL alone
-  would mislead here.
+  Completions are the wall-clock verdict; per-token ITL alone would mislead
+  here.

@@ -74,7 +74,6 @@ occupancy — see Learnings), so the ratio tracks the ~1.94× weight-byte ratio,
 not a bandwidth ceiling. c=4/8 mix decode ITL with in-flight 32k-prefill stalls
 (bf16 c=4 is a non-monotone pothole, 166 ms > its own c=8 51.8 ms — a scheduler
 artifact, not a GEMM property), so their ratios are not a decode measurement.
-Output tok/s is a prefill metric here (256-tok outputs behind 17–81 s TTFT).
 
 ## Results — VRAM (P1: free the int8 source after repack)
 

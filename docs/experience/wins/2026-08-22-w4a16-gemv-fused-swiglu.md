@@ -58,7 +58,7 @@ BF16 round-trip on the intermediates) but not bit-identical.
 
 ## Results
 
-| concurrency | arm | output tok/s | delta |
+| concurrency | arm | decode tok/s | delta |
 |---:|---|---:|---:|
 | 1 | baseline | | — |
 | 1 | treatment | | pending-remote |

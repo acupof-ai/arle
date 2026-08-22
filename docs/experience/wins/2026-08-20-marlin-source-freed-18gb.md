@@ -10,9 +10,9 @@
 
 ## Context
 
-Qwen3.8-27B-NVFP4 served a 32K long-agent workload at 10.04 output tok/s at c=4
-where Qwen3.6-27B-FP8 served 74.79 — and the same NVFP4 arm had done 70.59 on an
-older build. Decode was not the problem: ITL was ahead of FP8 at every
+Qwen3.8-27B-NVFP4 served a 32K long-agent workload at c=4 in ~7× the wall clock
+of Qwen3.6-27B-FP8 — and the same NVFP4 arm had matched FP8 on an older build.
+Decode was not the problem: ITL was ahead of FP8 at every
 concurrency. The wall clock was flat at ~680 s whatever the concurrency, which is
 not a slow kernel, it is work being redone.
 
@@ -69,14 +69,7 @@ half a pool: slots get reused, a cross-slot prefix restore lands between the
 requests/point, `--max-tokens 214`. Both arms on the same binary, FP8
 re-measured rather than reused.
 
-| c | NVFP4 before | NVFP4 after | FP8 | after vs FP8 |
-|---:|---:|---:|---:|---:|
-| 1 | 8.94 | 12.99 | 19.63 | −33.9% |
-| 4 | 10.04 | **84.25** | 74.79 | **+12.7%** |
-| 8 | 10.21 | **98.66** | 92.23 | **+7.0%** |
-
-Output tok/s, end to end. c=4 is 8.4x, c=8 is 9.7x, and c=4 also clears the
-70.59 the older build managed by 19.4%. ITL is ahead at every point: 20.44 /
+ITL is ahead at every point: 20.44 /
 40.04 / 70.81 against 24.80 / 47.38 / 78.96 (+21.3% / +18.4% / +11.5%).
 
 Mechanism confirmed, not inferred:
@@ -91,10 +84,9 @@ full recomputes       24 -> 2              (FP8: 0)
 Correctness: needle ladder 3/3 exact at 512 / 4096 / 16384 / 32768,
 `SERVER_ERRORS=0`, 32/32 requests complete on both arms.
 
-c=1 still trails on end-to-end output because this workload is 154:1
-prefill-to-decode and c=1 has no batching to amortise prefill, where Marlin now
-pays the 12-21% it used to avoid. From c=4 the batching absorbs it and NVFP4
-leads.
+c=1 still pays for prefill because this workload is 154:1 prefill-to-decode
+and c=1 has no batching to amortise it, where Marlin now pays the 12-21% it
+used to avoid. From c=4 the batching absorbs it.
 
 ## Rule
 
