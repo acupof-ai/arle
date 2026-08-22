@@ -510,36 +510,27 @@ pub(super) fn run_rubric_opd_impl(args: TrainRubricOpdArgs) -> Result<()> {
         let keep: std::collections::HashSet<_> = all_params.iter().copied().collect();
         eprintln!("[rubric-opd] before retain_ids: keep={} params", keep.len());
         store.retain_ids(&keep);
-        // DEBUG: account for device memory held by the store's live parameters.
+        // Device memory held by the store's live parameters. Each handle
+        // reports its own bytes, so a new weight format cannot silently land in
+        // a wrong-width bucket here.
         {
-            let mut fp8_bytes = 0usize;
-            let mut bf16_bytes = 0usize;
-            let mut f32_bytes = 0usize;
-            let mut other_bytes = 0usize;
+            let mut by_kind: std::collections::BTreeMap<&'static str, usize> =
+                std::collections::BTreeMap::new();
             for &id in all_params.iter() {
-                if let Some(t) = store.get(id) {
-                    match &t.device_handle {
-                        Some(autograd::DeviceHandle::CudaFp8BlockScaled(_)) => {
-                            fp8_bytes += t.size;
-                        }
-                        Some(autograd::DeviceHandle::CudaBf16(_)) => {
-                            bf16_bytes += t.size * 2;
-                        }
-                        Some(autograd::DeviceHandle::Cuda(_)) => {
-                            f32_bytes += t.size * 4;
-                        }
-                        Some(_) => other_bytes += t.size * 4,
-                        None => {}
-                    }
+                let Some(t) = store.get(id) else { continue };
+                let Some(handle) = t.device_handle.as_ref() else {
+                    continue;
+                };
+                if let Some(bytes) = handle.device_bytes(t.size) {
+                    *by_kind.entry(handle.kind_label()).or_default() += bytes;
                 }
             }
-            eprintln!(
-                "[rubric-opd] store params device bytes: fp8={}MiB bf16={}MiB f32={}MiB other={}MiB",
-                fp8_bytes >> 20,
-                bf16_bytes >> 20,
-                f32_bytes >> 20,
-                other_bytes >> 20
-            );
+            let summary = by_kind
+                .iter()
+                .map(|(k, b)| format!("{k}={}MiB", b >> 20))
+                .collect::<Vec<_>>()
+                .join(" ");
+            eprintln!("[rubric-opd] store params device bytes: {summary}");
         }
         // The optimizer's AdamW moments (m, v) live as DeviceHandles outside the
         // store, so retain_ids does not free them. Drop them here — the next

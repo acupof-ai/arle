@@ -291,6 +291,11 @@ impl CudaFp8BlockScaledStorage {
         (Arc::as_ptr(&self.weight) as usize, 0)
     }
 
+    /// E4M3 bytes plus the f32 block-scale grid.
+    pub fn device_bytes(&self) -> usize {
+        self.weight.len() + self.scales.len() * std::mem::size_of::<f32>()
+    }
+
     pub(crate) fn scales(&self) -> &cudarc::driver::CudaSlice<f32> {
         self.scales.as_ref()
     }
@@ -436,6 +441,13 @@ impl CudaFp4E2M1GroupStorage {
         self.weight.as_ref()
     }
 
+    /// Packed E2M1 bytes plus the group scales. A Marlin view's buffers cover
+    /// the whole matrix even when the view is one row window of it, so this is
+    /// the allocation's size rather than the window's share.
+    pub fn device_bytes(&self) -> usize {
+        self.weight.len() + self.scales.len()
+    }
+
     /// Identity of what this view dequantizes, for the backend's dequant cache.
     /// The row offset is part of it: q/k/v are three windows over ONE fused
     /// Marlin buffer, so the pointer alone would alias them into each other.
@@ -484,7 +496,51 @@ pub enum DeviceHandle {
 }
 
 impl DeviceHandle {
-    /// Strong-count of the backing device buffer when it lives on a refcounted
+    /// Storage-format name, for grouping in VRAM accounting output.
+    pub fn kind_label(&self) -> &'static str {
+        match self {
+            DeviceHandle::Cpu(_) => "cpu",
+            #[cfg(feature = "metal")]
+            DeviceHandle::Metal(_) => "metal",
+            #[cfg(feature = "cuda")]
+            DeviceHandle::Cuda(_) => "f32",
+            #[cfg(feature = "cuda")]
+            DeviceHandle::CudaBf16(_) => "bf16",
+            #[cfg(feature = "cuda")]
+            DeviceHandle::CudaFp8BlockScaled(_) => "fp8",
+            #[cfg(feature = "cuda")]
+            DeviceHandle::CudaFp4E2M1Group(_) => "fp4",
+        }
+    }
+
+    /// Device bytes this handle's weight buffers hold, for VRAM accounting.
+    /// Each storage knows its own element width, so a caller never has to keep
+    /// a bytes-per-element table in step with the format list. `None` where
+    /// there is no device allocation to report (CPU), or where the backend
+    /// owns the residency (Metal).
+    ///
+    /// A borrowed view reports the bytes it reads, which the foreign engine
+    /// also reports -- the two are the same allocation, counted once each.
+    pub fn device_bytes(&self, elements: usize) -> Option<usize> {
+        let _ = elements; // every consumer of it is cuda-gated
+        match self {
+            DeviceHandle::Cpu(_) => None,
+            #[cfg(feature = "metal")]
+            DeviceHandle::Metal(_) => None,
+            #[cfg(feature = "cuda")]
+            DeviceHandle::Cuda(_) => Some(elements * std::mem::size_of::<f32>()),
+            #[cfg(feature = "cuda")]
+            DeviceHandle::CudaBf16(_) => Some(elements * 2),
+            // E4M3 plus its block-scale grid, which the storage sizes itself.
+            #[cfg(feature = "cuda")]
+            DeviceHandle::CudaFp8BlockScaled(storage) => Some(storage.device_bytes()),
+            // Two E2M1 values per byte, plus the group scales.
+            #[cfg(feature = "cuda")]
+            DeviceHandle::CudaFp4E2M1Group(storage) => Some(storage.device_bytes()),
+        }
+    }
+
+    /// Strong-count of the backing device buffer when it lives on a refcounted    /// Strong-count of the backing device buffer when it lives on a refcounted
     /// device allocation (CUDA f32). `Some(1)` means this handle is the sole
     /// owner and an in-place mutation is safe; `Some(n>1)` means a sibling
     /// aliases the same buffer (grads fan out by `Arc` clone — see
