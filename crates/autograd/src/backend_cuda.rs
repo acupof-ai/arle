@@ -213,6 +213,13 @@ pub struct NvrtcIdentity {
     pub cuda_driver_version: i32,
 }
 
+#[cfg(not(feature = "no-cuda"))]
+struct DequantCacheEntry {
+    key: usize,
+    bf16: Arc<cudarc::driver::CudaSlice<u16>>,
+    shape: Vec<usize>,
+}
+
 pub struct CudaBackend {
     tape_dtype: AtomicU8,
     #[cfg(not(feature = "no-cuda"))]
@@ -223,6 +230,11 @@ pub struct CudaBackend {
     kernels: KernelCache,
     #[cfg(not(feature = "no-cuda"))]
     pinned_checkpoints: Mutex<PinnedCheckpointPool>,
+    /// Last frozen weight dequantized to bf16, keyed by its source buffer. A
+    /// chunked backward asks for the same weight once per chunk (16 at rank seq
+    /// 65,536); the weights are frozen, so one entry turns that into one dequant.
+    #[cfg(not(feature = "no-cuda"))]
+    dequant_cache: Mutex<Option<DequantCacheEntry>>,
     #[cfg(all(feature = "nccl", not(feature = "no-cuda")))]
     nccl: Option<Arc<NcclBackend>>,
     /// Seq-collective comm: split subgroup when composed, else same as `nccl`.

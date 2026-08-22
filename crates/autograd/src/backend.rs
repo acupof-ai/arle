@@ -286,6 +286,11 @@ impl CudaFp8BlockScaledStorage {
         self.weight.as_ref()
     }
 
+    /// Identity of the backing weight buffer, for the backend's dequant cache.
+    pub(crate) fn weight_key(&self) -> usize {
+        Arc::as_ptr(&self.weight) as usize
+    }
+
     pub(crate) fn scales(&self) -> &cudarc::driver::CudaSlice<f32> {
         self.scales.as_ref()
     }
@@ -369,6 +374,11 @@ impl CudaFp4E2M1GroupStorage {
 
     pub(crate) fn weight(&self) -> &cudarc::driver::CudaSlice<u8> {
         self.weight.as_ref()
+    }
+
+    /// Identity of the backing weight buffer, for the backend's dequant cache.
+    pub(crate) fn weight_key(&self) -> usize {
+        Arc::as_ptr(&self.weight) as usize
     }
 
     pub(crate) fn scales(&self) -> &cudarc::driver::CudaSlice<u8> {
