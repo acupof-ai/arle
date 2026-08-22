@@ -63,6 +63,20 @@ fn main() {
     // The upstream MLX CMakeLists still references FetchContent, but every
     // dependency is pinned to a repository-local source tree and network
     // access is disabled.
+    //
+    // Toolchain stamp: a macOS/Xcode update leaves the staged mlx.metallib
+    // stale (first forward panics "Unable to build metal library from
+    // source"; the only fix is rebuilding mlx-sys). cmake skips the rebuild
+    // when no source changed, so on a stamp change drop the cmake build dir.
+    let stamp = toolchain_stamp();
+    let stamp_file = out_dir.join("toolchain.stamp");
+    let prev_stamp = fs::read_to_string(&stamp_file).unwrap_or_default();
+    if !prev_stamp.is_empty() && prev_stamp != stamp {
+        let _ = fs::remove_dir_all(out_dir.join("build"));
+    }
+    if prev_stamp != stamp {
+        let _ = fs::write(&stamp_file, &stamp);
+    }
     let mut cmake_cfg = cmake::Config::new(&mlx_vendor_dir);
     cmake_cfg
         .define("MLX_BUILD_METAL", "ON")
@@ -213,6 +227,38 @@ fn main() {
     println!("cargo:rerun-if-changed=src/mlx_common.h");
     println!("cargo:rerun-if-changed=vendor");
     println!("cargo:rerun-if-env-changed=MACOSX_DEPLOYMENT_TARGET");
+    println!("cargo:rerun-if-env-changed=DEVELOPER_DIR");
+    // mtime of the Metal compiler changes on a CommandLineTools/Xcode update,
+    // which is what makes build.rs re-run to compare the toolchain stamp.
+    if let Ok(output) = Command::new("xcrun").args(["-f", "metal"]).output()
+        && output.status.success()
+    {
+        let path = String::from_utf8_lossy(&output.stdout);
+        let path = path.trim();
+        if !path.is_empty() {
+            println!("cargo:rerun-if-changed={path}");
+        }
+    }
+    println!("cargo:rerun-if-changed=/System/Library/Frameworks/Metal.framework/Metal");
+}
+
+/// Toolchain identity for the stale-metallib guard: the Metal compiler path,
+/// the clang version, and the macOS version. Any of these changing after a
+/// system update invalidates the staged metallib.
+fn toolchain_stamp() -> String {
+    let mut stamp = String::new();
+    for (cmd, args) in [
+        ("xcrun", &["-f", "metal"][..]),
+        ("clang", &["--version"][..]),
+        ("sw_vers", &["-productVersion"][..]),
+    ] {
+        if let Ok(output) = Command::new(cmd).args(args).output()
+            && output.status.success()
+        {
+            stamp.push_str(&String::from_utf8_lossy(&output.stdout));
+        }
+    }
+    stamp
 }
 
 /// `OUT_DIR` is `<target>/<profile>/build/mlx-sys-<hash>/out`. Walk three
