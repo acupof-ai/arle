@@ -468,8 +468,7 @@ impl RealCudaExecutor {
     }
 
     /// Write the finishing slot's full frontier state through to the content-keyed
-    /// prefix store (DSv4 finish-write-through, behind `--dsv4-decode-reuse`);
-    /// no-op for the other backends. `slot_pages` is the slot's OWN host page
+    /// prefix store (DSv4 finish-write-through); no-op for the other backends. `slot_pages` is the slot's OWN host page
     /// chain (the pool keys entries by these ids, reconciled to the radix's
     /// canonical ids by the subsequent `save_prefix_sidecar` confirm/repair).
     pub(crate) fn capture_finish_frontier(

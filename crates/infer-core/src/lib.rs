@@ -1356,7 +1356,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         // it publishes PROVISIONAL entries that publish's save_prefix_sidecar
         // confirm/repair then reconciles to the radix's canonical ids (the same
         // path the prefill publish rides). Best-effort; default no-op (only DSv4
-        // under --dsv4-decode-reuse captures).
+        // captures).
         let slot_pages = self.kv.page_indices(slot).to_vec();
         if let Some(reuse) = self.executor.prefix_reuse()
             && let Err(err) = reuse.capture_finish_frontier(slot, &full_tokens, &slot_pages)

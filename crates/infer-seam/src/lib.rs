@@ -512,8 +512,8 @@ pub trait PrefixReuse {
     /// confirm/repair reconciles the provisional entries this publishes) and
     /// before `free_slot_pages`, at the eager finish sync point (graph-safe).
     /// `slot_pages` is the slot's own host page chain. Best-effort: a failure
-    /// only forfeits future reuse, never the finish. Only DSv4 (behind
-    /// `--dsv4-decode-reuse`) captures; others return `Ok`.
+    /// only forfeits future reuse, never the finish. Only DSv4 captures;
+    /// others return `Ok`.
     fn capture_finish_frontier(
         &mut self,
         slot: usize,

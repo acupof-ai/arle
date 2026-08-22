@@ -459,7 +459,7 @@ legality = "always; per-format grouped pair/batch GEMM over DenseBf16 | Fp8 | Fp
 fallback = ""
 
 [policy."qwen35.moe_experts"]
-router = "device top-k (--qwen35-gpu-router, default on); host infer_moe::route when off"
+router = "device top-k (default on); host infer_moe::route when off"
 fallback_status = "legacy-default-unqualified"
 
 [[semantic]]

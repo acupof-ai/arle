@@ -724,15 +724,11 @@ impl Qwen35Model {
                                     // measured optimum from batch 4 up and bound only
                                     // batch 1 (32 tiles, 46 of 78 SMs idle).
                                     let splits = if meta.seq_len <= FA3_MAX_QLEN {
-                                        match crate::runtime_flags::qwen35_fa3_decode_splits() {
-                                            0 => self
-                                                .ctx
-                                                .sm_count()
-                                                .div_ceil(meta.batch.max(1) * kv_heads.max(1))
-                                                .max(FA3_DECODE_SPLITS_FLOOR)
-                                                .clamp(2, 256),
-                                            n => n,
-                                        }
+                                        self.ctx
+                                            .sm_count()
+                                            .div_ceil(meta.batch.max(1) * kv_heads.max(1))
+                                            .max(FA3_DECODE_SPLITS_FLOOR)
+                                            .clamp(2, 256)
                                     } else {
                                         1
                                     };

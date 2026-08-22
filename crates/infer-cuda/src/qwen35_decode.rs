@@ -66,7 +66,7 @@ impl Qwen35Model {
         if !crate::moe::qwen35_decode_moe_graph_capturable(cfg) {
             return Some(
                 "MoE decode is not device-routable (host router fallback active — \
-                 --qwen35-gpu-router false or non-greedy/grouped routing)",
+                 non-greedy/grouped routing)",
             );
         }
         None

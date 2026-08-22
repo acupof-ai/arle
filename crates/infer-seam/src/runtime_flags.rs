@@ -19,9 +19,6 @@ pub enum CommBackend {
 fn d_true() -> bool {
     true
 }
-fn d_fa3_decode_splits() -> usize {
-    0
-}
 fn d_deepgemm_min_routes() -> usize {
     1024
 }
@@ -44,28 +41,19 @@ fn d_deepep_num_sms() -> u32 {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct CudaRuntimeFlags {
     /// Whole-step Qwen3.5/3.6 decode graph (paged lane); off = the eager
-    /// same-binary A/B arm.
+    /// same-binary A/B arm. Serve hardcodes on; the OPD rollout engine keeps
+    /// its own off-by-default lever.
     #[serde(default = "d_true")]
     pub qwen35_decode_graph: bool,
-    /// Batched rows>1 Qwen3.5/3.6 decode; off = sequential per-row A/B arm.
-    #[serde(default = "d_true")]
-    pub qwen35_batched_decode: bool,
     /// DeepGEMM grouped expert GEMMs (load-time: builds grouped weight caches).
     #[serde(default = "d_true")]
     pub qwen35_deepgemm: bool,
     /// Decode-band batch grouped MoE kernels; off = hand batch kernels A/B arm.
     #[serde(default = "d_true")]
     pub qwen35_moe_decode_kernel: bool,
-    /// On-device MoE router; off = host `infer_moe::route` reference.
-    #[serde(default = "d_true")]
-    pub qwen35_gpu_router: bool,
     /// FA3 full-attention prefill (silently ignored on stub builds).
     #[serde(default = "d_true")]
     pub qwen35_fa3: bool,
-    /// FA3 decode split count; 0 derives it from the device SM count so the
-    /// kv-head × split tiles fill the machine. Explicit values clamp to \[2, 256\].
-    #[serde(default = "d_fa3_decode_splits")]
-    pub qwen35_fa3_decode_splits: usize,
     /// Routed-row floor for the DeepGEMM grouped expert path. Default 1024,
     /// the compile-time `QWEN35_DEEPGEMM_MIN_ROUTES`; lower it to reach the
     /// uncharacterized mid-band (batched decode is `R = top_k * B`).
@@ -88,11 +76,6 @@ pub struct CudaRuntimeFlags {
     pub dsv4_flashmla_decode: Option<bool>,
     #[serde(default = "d_dsa_indexer_sms")]
     pub dsv4_dsa_indexer_sms: usize,
-    /// DSv4 decode-region prefix reuse: restore a later turn to the exact finish
-    /// position. OFF here, ON in serve — the 2026-07-11 license measured serve
-    /// only. OFF = byte-identical.
-    #[serde(default)]
-    pub dsv4_decode_reuse: bool,
     /// Adaptive MTP gate at B=1 (skip speculation below the accept break-even).
     #[serde(default)]
     pub mtp_adaptive: bool,
@@ -120,12 +103,9 @@ impl Default for CudaRuntimeFlags {
     fn default() -> Self {
         Self {
             qwen35_decode_graph: d_true(),
-            qwen35_batched_decode: d_true(),
             qwen35_deepgemm: d_true(),
             qwen35_moe_decode_kernel: d_true(),
-            qwen35_gpu_router: d_true(),
             qwen35_fa3: d_true(),
-            qwen35_fa3_decode_splits: d_fa3_decode_splits(),
             qwen35_deepgemm_min_routes: d_deepgemm_min_routes(),
             qwen35_gdr_chunked: d_true(),
             mempool_retain: d_true(),
@@ -134,7 +114,6 @@ impl Default for CudaRuntimeFlags {
             comm_backend: CommBackend::default(),
             dsv4_flashmla_decode: None,
             dsv4_dsa_indexer_sms: d_dsa_indexer_sms(),
-            dsv4_decode_reuse: false,
             mtp_adaptive: false,
             mtp_min_accept: d_mtp_min_accept(),
             spec_max_batch: d_spec_max_batch(),
@@ -149,11 +128,7 @@ impl Default for CudaRuntimeFlags {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MetalRuntimeFlags {
     #[serde(default = "d_true")]
-    pub pipeline: bool,
-    #[serde(default = "d_true")]
     pub warmup: bool,
-    #[serde(default = "d_true")]
-    pub paged_kv_read: bool,
     /// Host (blocking D2H) non-greedy sampler; off = device greedy argmax.
     #[serde(default)]
     pub host_sampling: bool,
@@ -178,9 +153,7 @@ fn d_spec_accept_topk() -> i32 {
 impl Default for MetalRuntimeFlags {
     fn default() -> Self {
         Self {
-            pipeline: d_true(),
             warmup: d_true(),
-            paged_kv_read: d_true(),
             host_sampling: false,
             speculative: d_true(),
             draft_model: None,

@@ -8,9 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 
 use infer_seam::MetalRuntimeFlags;
 
-static PIPELINE: AtomicBool = AtomicBool::new(true);
 static WARMUP: AtomicBool = AtomicBool::new(false);
-static PAGED_KV_READ: AtomicBool = AtomicBool::new(true);
 static HOST_SAMPLING: AtomicBool = AtomicBool::new(false);
 /// Speculative-decode resolver inputs (draft model / depth / accept width).
 static SPEC: LazyLock<Mutex<MetalRuntimeFlags>> =
@@ -18,24 +16,14 @@ static SPEC: LazyLock<Mutex<MetalRuntimeFlags>> =
 
 /// Must run before `MetalExecutor` construction.
 pub fn apply_runtime_flags(f: &MetalRuntimeFlags) {
-    PIPELINE.store(f.pipeline, Relaxed);
     WARMUP.store(f.warmup, Relaxed);
-    PAGED_KV_READ.store(f.paged_kv_read, Relaxed);
     HOST_SAMPLING.store(f.host_sampling, Relaxed);
     *SPEC.lock().expect("metal runtime flags lock") = f.clone();
 }
 
 #[cfg_attr(not(feature = "metal"), allow(dead_code))]
-pub(crate) fn pipeline() -> bool {
-    PIPELINE.load(Relaxed)
-}
-#[cfg_attr(not(feature = "metal"), allow(dead_code))]
 pub(crate) fn warmup() -> bool {
     WARMUP.load(Relaxed)
-}
-#[cfg_attr(not(feature = "metal"), allow(dead_code))]
-pub(crate) fn paged_kv_read() -> bool {
-    PAGED_KV_READ.load(Relaxed)
 }
 #[cfg_attr(not(feature = "metal"), allow(dead_code))]
 pub(crate) fn host_sampling() -> bool {

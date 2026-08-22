@@ -1,7 +1,7 @@
 //! Single-GPU BF16 MoE forward — Qwen3.5/3.6 SparseMoeBlock (all experts local).
 //!
 //! Routing runs on DEVICE: `dsv4_route` with a zero selection bias is exactly
-//! greedy top-k. `--qwen35-gpu-router false` selects the host `infer_moe::route`
+//! greedy top-k. Non-greedy/grouped routing selects the host `infer_moe::route`
 //! reference, which costs a full-stream `ctx.sync` + logits D2H + 2×H2D per layer
 //! per step. DSv4 uses the device route kernel unconditionally.
 

@@ -2599,8 +2599,8 @@ impl Qwen35CudaExecutor {
         self.decode_row_paged_default(row, position, host_kv)
     }
 
-    /// A rows>1 pure-decode sub-batch: ONE batched forward over all rows. With
-    /// `--qwen35-batched-decode false`, runs the rows sequentially instead.
+    /// A rows>1 pure-decode sub-batch: ONE batched forward over all rows.
+    /// Single-GPU only; a multi-rank decode runs the rows sequentially instead.
     ///
     /// Batched steps never capture or replay, and cannot invalidate existing B=1
     /// captures: they mutate per-slot state strictly IN PLACE through pointer tables
@@ -2630,7 +2630,7 @@ impl Qwen35CudaExecutor {
             );
         }
 
-        if crate::runtime_flags::qwen35_batched_decode() && self.model.tp.is_single() {
+        if self.model.tp.is_single() {
             return self.submit_decode_batch_paged(rows, host_kv);
         }
         let mut tokens = Vec::with_capacity(rows.len());
