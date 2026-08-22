@@ -27,9 +27,7 @@ static ENABLED: OnceLock<bool> = OnceLock::new();
 static NVTX: OnceLock<NvtxFns> = OnceLock::new();
 
 fn enabled() -> bool {
-    *ENABLED.get_or_init(|| {
-        std::env::var_os("ARLE_NVTX").is_some() || std::env::var_os("ARLE_DSV4_NVTX").is_some()
-    })
+    *ENABLED.get_or_init(|| std::env::var_os("ARLE_NVTX").is_some())
 }
 
 pub(crate) fn is_enabled() -> bool {

@@ -59,8 +59,8 @@ impl TpConfig {
     }
 
     fn from_lookup(mut lookup: impl FnMut(&str) -> Option<String>) -> Result<Self> {
-        let world_size = parse_parallel_env_usize("INFER_TP_SIZE", "ARLE_TP_SIZE", 1, &mut lookup)?;
-        let rank = parse_parallel_env_usize("INFER_TP_RANK", "ARLE_TP_RANK", 0, &mut lookup)?;
+        let world_size = parse_parallel_env_usize("INFER_TP_SIZE", None, 1, &mut lookup)?;
+        let rank = parse_parallel_env_usize("INFER_TP_RANK", None, 0, &mut lookup)?;
         Self::new(world_size, rank)
     }
 }
@@ -137,17 +137,17 @@ pub fn row_shard(total: usize, tp: &TpConfig) -> ShardingSpec {
 
 pub(crate) fn parse_parallel_env_usize(
     primary: &str,
-    alias: &str,
+    alias: Option<&str>,
     default: usize,
     lookup: &mut impl FnMut(&str) -> Option<String>,
 ) -> Result<usize> {
-    let value = lookup(primary).or_else(|| lookup(alias));
+    let value = lookup(primary).or_else(|| alias.and_then(lookup));
     let Some(value) = value else {
         return Ok(default);
     };
     value.parse::<usize>().map_err(|err| {
         crate::error::TopoError::new(format!(
-            "invalid {primary}/{alias} value `{value}`: expected usize: {err}"
+            "invalid {primary} value `{value}`: expected usize: {err}"
         ))
     })
 }

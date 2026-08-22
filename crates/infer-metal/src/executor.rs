@@ -60,35 +60,24 @@ impl MetalKvCacheDtype {
     }
 }
 
-/// Cross-step decode pipelining (env-gated, default ON since
-/// `wins/2026-06-04-metal-decode-pipeline-c2-safe-default-on.md`).
-///
-/// HEAD decode is strictly submit(N) → poll(N) blocks on `eval` → apply(N) →
-/// submit(N+1): the GPU idles for the host gap between poll(N)'s eval finishing
-/// and submit(N+1) kicking `step_session` again (apply_output + admission +
-/// plan-N+1 build + a fresh `begin_session`). With the pipeline on the decode
-/// session is held open across steps and `submit_decode` eagerly issues the
-/// NEXT greedy step's `step_session` (async) inside the current submit, so step
-/// N+1's GPU forward overlaps step N's host token materialization — the proven
-/// legacy `pending_sampled` shape, kept one step deep. Single-slot greedy only;
-/// a non-greedy or recycled-slot single-row decode drains and takes the cold
-/// (HEAD) path via the `pending_matches_live_slot` guard.
-///
-/// Serve safety: Metal reports one live request and one plan row to the shared
-/// layers. The HTTP frontend rejects a second live request, while the executor's
-/// single-row submit guard remains an internal fail-closed fence before any
-/// pipeline logic. The default-on flip therefore changes only the c=1 greedy
-/// path. Opt OUT with `--metal-pipeline false`.
-#[cfg(feature = "metal")]
-fn pipeline_decode_enabled() -> bool {
-    use std::sync::OnceLock;
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        let on = crate::runtime_flags::pipeline();
-        eprintln!("[infer-metal] decode pipeline (--metal-pipeline) = {on}");
-        on
-    })
-}
+// Cross-step decode pipelining (default ON since
+// `wins/2026-06-04-metal-decode-pipeline-c2-safe-default-on.md`).
+//
+// HEAD decode is strictly submit(N) → poll(N) blocks on `eval` → apply(N) →
+// submit(N+1): the GPU idles for the host gap between poll(N)'s eval finishing
+// and submit(N+1) kicking `step_session` again (apply_output + admission +
+// plan-N+1 build + a fresh `begin_session`). With the pipeline on the decode
+// session is held open across steps and `submit_decode` eagerly issues the
+// NEXT greedy step's `step_session` (async) inside the current submit, so step
+// N+1's GPU forward overlaps step N's host token materialization — the proven
+// legacy `pending_sampled` shape, kept one step deep. Single-slot greedy only;
+// a non-greedy or recycled-slot single-row decode drains and takes the cold
+// (HEAD) path via the `pending_matches_live_slot` guard.
+//
+// Serve safety: Metal reports one live request and one plan row to the shared
+// layers. The HTTP frontend rejects a second live request, while the executor's
+// single-row submit guard remains an internal fail-closed fence before any
+// pipeline logic.
 
 /// One-shot probe printed the first time the pipeline fast path runs, so a bench
 /// can prove the overlapped path is actually live (not just enabled).
@@ -99,20 +88,9 @@ fn probe_pipeline_fast_path() {
     ONCE.call_once(|| eprintln!("[infer-metal] pipeline fast path LIVE (overlapped decode)"));
 }
 
-/// Paged-prefix read path for single-token decode. The C++ session still owns
-/// K/V writes; only SDPA's prefix read source changes. Default on after BF16
-/// and INT8 reachability gates; opt out with `--metal-paged-kv-read false`.
-#[cfg(feature = "metal")]
-fn paged_kv_read_enabled() -> bool {
-    use std::sync::OnceLock;
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        let on = crate::runtime_flags::paged_kv_read();
-        eprintln!("[infer-metal] paged KV read (--metal-paged-kv-read) = {on}");
-        on
-    })
-}
-
+// Paged-prefix read path for single-token decode. The C++ session still owns
+// K/V writes; only SDPA's prefix read source changes. Default on after BF16
+// and INT8 reachability gates.
 #[cfg(feature = "metal")]
 pub(crate) static PAGED_KV_READ_HITS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
@@ -1120,10 +1098,7 @@ impl RealMetalExecutor {
         // into `Decoding` on a recycled slot index, which would otherwise return
         // the prior request's stale token; these checks send that case to the
         // cold path (which resets the slot and drops the stale pending).
-        if pipeline_decode_enabled()
-            && row.params.is_raw_argmax()
-            && self.pending_matches_live_slot(row, kv)
-        {
+        if row.params.is_raw_argmax() && self.pending_matches_live_slot(row, kv) {
             probe_pipeline_fast_path();
             let ready = self.pending.take().expect("pending checked above");
             self.commit_pending_then_prequeue(row, kv)?;
@@ -1197,8 +1172,7 @@ impl RealMetalExecutor {
         // Cold start of a greedy decode run: seed the pipeline. Record this
         // step's sampled token and issue the next step's forward so subsequent
         // ticks take the fast path and overlap.
-        if pipeline_decode_enabled()
-            && row.params.is_raw_argmax()
+        if row.params.is_raw_argmax()
             && let MetalInflight::Sampled { sampled, .. } = &inflight
         {
             if let Some(slot) = self.slots.get_mut(&row.slot) {
@@ -1362,24 +1336,22 @@ fn step_session_decode(
     token: &mlx::MlxArray,
 ) -> anyhow::Result<mlx::MlxArray> {
     let cache_pos = usize_to_i32(slot.cache_len)?;
-    if paged_kv_read_enabled() {
-        if slot.cache_len > 0 {
-            let logits = match kv_cache_dtype {
-                MetalKvCacheDtype::Bf16 => {
-                    let (k_full, v_full) = slot.bf16_prefix_read_inputs(slot.cache_len)?;
-                    model.step_session_paged_bf16(token, cache_pos, &k_full, &v_full)
-                }
-                MetalKvCacheDtype::Int8 => {
-                    let (k_full, v_full) = slot.int8_prefix_read_inputs(slot.cache_len)?;
-                    model.step_session_paged_int8(token, cache_pos, &k_full, &v_full)
-                }
+    if slot.cache_len > 0 {
+        let logits = match kv_cache_dtype {
+            MetalKvCacheDtype::Bf16 => {
+                let (k_full, v_full) = slot.bf16_prefix_read_inputs(slot.cache_len)?;
+                model.step_session_paged_bf16(token, cache_pos, &k_full, &v_full)
             }
-            .map_err(|err| anyhow::anyhow!("paged KV read step_session failed: {err}"))?;
-            probe_paged_kv_read_hit();
-            return Ok(logits);
+            MetalKvCacheDtype::Int8 => {
+                let (k_full, v_full) = slot.int8_prefix_read_inputs(slot.cache_len)?;
+                model.step_session_paged_int8(token, cache_pos, &k_full, &v_full)
+            }
         }
-        probe_paged_kv_read_fallback();
+        .map_err(|err| anyhow::anyhow!("paged KV read step_session failed: {err}"))?;
+        probe_paged_kv_read_hit();
+        return Ok(logits);
     }
+    probe_paged_kv_read_fallback();
     model.step_session(token, cache_pos)
 }
 

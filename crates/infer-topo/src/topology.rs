@@ -106,39 +106,29 @@ impl MultiAxisConfig {
         mut lookup: impl FnMut(&str) -> Option<String>,
     ) -> Result<Self> {
         let cfg = Self {
-            tp_size: parse_parallel_env_usize(
-                "INFER_TP_SIZE",
-                "ARLE_TP_SIZE",
-                tp_default,
-                &mut lookup,
-            )?,
+            tp_size: parse_parallel_env_usize("INFER_TP_SIZE", None, tp_default, &mut lookup)?,
             pp_size: parse_parallel_env_usize(
                 "INFER_PP_SIZE",
-                "ARLE_PP_SIZE",
+                Some("ARLE_PP_SIZE"),
                 pp_default,
                 &mut lookup,
             )?,
             ep_size: parse_parallel_env_usize(
                 "INFER_EP_SIZE",
-                "ARLE_EP_SIZE",
+                Some("ARLE_EP_SIZE"),
                 ep_default,
                 &mut lookup,
             )?,
             attn_dp_size: parse_parallel_env_usize(
                 "INFER_ATTN_DP_SIZE",
-                "ARLE_ATTN_DP_SIZE",
+                Some("ARLE_ATTN_DP_SIZE"),
                 1,
                 &mut lookup,
             )?,
-            attn_cp_size: parse_parallel_env_usize(
-                "INFER_ATTN_CP_SIZE",
-                "ARLE_ATTN_CP_SIZE",
-                1,
-                &mut lookup,
-            )?,
+            attn_cp_size: parse_parallel_env_usize("INFER_ATTN_CP_SIZE", None, 1, &mut lookup)?,
             moe_dp_size: parse_parallel_env_usize(
                 "INFER_MOE_DP_SIZE",
-                "ARLE_MOE_DP_SIZE",
+                Some("ARLE_MOE_DP_SIZE"),
                 1,
                 &mut lookup,
             )?,
@@ -229,7 +219,6 @@ fn subgroup_axis_env_present(lookup: &mut impl FnMut(&str) -> Option<String>) ->
         "INFER_ATTN_DP_SIZE",
         "ARLE_ATTN_DP_SIZE",
         "INFER_ATTN_CP_SIZE",
-        "ARLE_ATTN_CP_SIZE",
         "INFER_MOE_DP_SIZE",
         "ARLE_MOE_DP_SIZE",
     ]

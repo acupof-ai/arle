@@ -112,13 +112,7 @@ pub(crate) fn maybe_spawn_mesh_and_wait(
             // per-rank device via INFER_CUDA_DEVICE). Strip any inherited TP-serving
             // env so resolve_tp_config_from_env doesn't build a spurious rollout TP
             // communicator on the training uid (else rank>0 dies with NCCL RemoteError).
-            for k in [
-                "INFER_TP_SIZE",
-                "INFER_TP_RANK",
-                "INFER_CUDA_DEVICES",
-                "ARLE_TP_SIZE",
-                "ARLE_TP_RANK",
-            ] {
+            for k in ["INFER_TP_SIZE", "INFER_TP_RANK", "INFER_CUDA_DEVICES"] {
                 cmd.env_remove(k);
             }
             let mut child = cmd

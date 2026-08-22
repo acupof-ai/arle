@@ -36,13 +36,6 @@ pub struct EngineLoadConfig {
     /// Per-request prefill chunk size; `None` = backend/model-kind default.
     #[serde(default)]
     pub chunked_prefill_size: Option<usize>,
-    /// Token budget for one scheduler tick — the M dimension of every GEMM in
-    /// the step, so it is the throughput/latency dial: above the roofline ridge
-    /// more tokens buy no throughput and cost step latency linearly, and any
-    /// decode row sharing the tick waits that long. `None` = the shipped
-    /// constant.
-    #[serde(default)]
-    pub max_num_batched_tokens: Option<usize>,
     /// `Some(n)` = MTP spec decode on with draft depth `n`; `None` = off.
     pub mtp_draft_tokens: Option<usize>,
     /// `Some(k)` = D2 MTP root-branch top-k width; verifier rows are root + candidates.
@@ -214,7 +207,6 @@ impl Default for EngineLoadConfig {
             max_prompt_tokens: usize::MAX,
             max_total_tokens: 65_536,
             chunked_prefill_size: None,
-            max_num_batched_tokens: None,
             mtp_draft_tokens: None,
             mtp_draft_topk: None,
             kv_cache_dtype: KvCacheDtype::Auto,
@@ -492,9 +484,6 @@ mod backend {
             // single-threaded MLX encode loop responsive between decode steps).
             // The CUDA load path re-resolves per model kind before use.
             config.chunked_prefill_size = self.chunked_prefill_size.unwrap_or(64);
-            if let Some(v) = self.max_num_batched_tokens {
-                config.max_num_batched_tokens = v.max(1);
-            }
             config.max_running_requests = self.max_running_requests;
             config.slot_oversubscription = self.slot_oversubscription;
             config.oversubscription_min_slice = self.oversubscription_min_slice.max(1);
@@ -2190,15 +2179,12 @@ mod backend {
             }
         };
         let mut executor = executor;
-        // Fail loud on flag+model combos the executor would otherwise silently
-        // ignore, BEFORE any budget setter runs.
-        if config.cuda.dsv4_decode_reuse {
-            anyhow::ensure!(
-                executor.prefix_reuse().is_some(),
-                "--dsv4-decode-reuse: the {kind:?} CUDA executor exposes no \
-                 prefix-reuse capability, so the flag would be silently ignored"
-            );
-        }
+        // Fail loud before any budget setter runs: a CUDA executor without the
+        // prefix-reuse capability would silently no-op decode reuse.
+        anyhow::ensure!(
+            executor.prefix_reuse().is_some(),
+            "the {kind:?} CUDA executor exposes no prefix-reuse capability"
+        );
         // L2 budget: deployment-total → per-rank share, resolved at the ONE
         // constructor every rank runs (world size is env-identical per rank, so
         // the division is lockstep-deterministic).

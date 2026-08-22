@@ -693,13 +693,6 @@ pub(crate) struct ServeArgs {
     #[arg(long, value_parser = parse_positive_usize)]
     pub(crate) chunked_prefill_size: Option<usize>,
 
-    /// Token budget for one scheduler tick (all prefill chunks in that tick
-    /// combined). Sets the M dimension of the step's GEMMs, so it trades step
-    /// latency against GEMM efficiency; a decode row sharing the tick waits a
-    /// whole step. Unset = the shipped constant.
-    #[arg(long, value_parser = parse_positive_usize)]
-    pub(crate) max_num_batched_tokens: Option<usize>,
-
     /// Rotate waiters past the running cap by parking whole decode slots into
     /// the KV tier (whole-slot-tier models only; others fail closed at start).
     #[arg(long, default_value_t = false)]
@@ -732,13 +725,12 @@ pub(crate) struct ServeArgs {
     pub(crate) spec_type: ServeSpecTypeArg,
 
     /// Multi-GPU collective backend for small decode-path messages (CUDA
-    /// multi-rank only). `auto` (default): one-shot custom AR/AG for small
-    /// messages with a self-test and loud degrade to NCCL; large messages stay
-    /// on NCCL. The 2026-06-10 matched A/B measured one-shot wall-neutral when
-    /// NCCL ran on the compute stream unfenced; the comm-stream move added
-    /// per-collective fence overhead that one-shot avoids by running on the
-    /// compute stream. `nccl` forces plain NCCL (opt-out).
-    #[arg(long, value_enum, default_value_t = ServeCommBackendArg::Auto)]
+    /// multi-rank only). `nccl` (default): plain NCCL — the 2026-06-10 matched
+    /// A/B measured the one-shot path wall-neutral on single-node H20 (the
+    /// decode wall is rank-skew-bound, not protocol-bound), and the 2026-08-17
+    /// probe measured one-shot 51-53 tok/s vs NCCL 70-80 on Qwen3.6-27B. `auto`
+    /// boots the one-shot custom AR/AG with a self-test and loud degrade.
+    #[arg(long, value_enum, default_value_t = ServeCommBackendArg::Nccl)]
     pub(crate) comm_backend: ServeCommBackendArg,
 
     /// Tensor-parallel degree: attention heads sharded across N GPUs. World
@@ -830,15 +822,6 @@ pub(crate) struct ServeArgs {
     #[arg(long, value_name = "K")]
     pub(crate) mtp_draft_topk: Option<usize>,
 
-    /// Whole-step Qwen3.5/3.6 decode graph (paged lane licensed 2026-08-03:
-    /// −7.9% ITL, byte-identical greedy, MMLU 84/100 vs 80-81 baseline).
-    #[arg(long, default_value_t = true, action = clap::ArgAction::Set, value_name = "BOOL")]
-    pub(crate) qwen35_decode_graph: bool,
-
-    /// Batched rows>1 Qwen3.5/3.6 decode; false = sequential per-row A/B arm.
-    #[arg(long, default_value_t = true, action = clap::ArgAction::Set, value_name = "BOOL")]
-    pub(crate) qwen35_batched_decode: bool,
-
     /// DeepGEMM grouped expert GEMMs (read at load: builds grouped weight caches).
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set, value_name = "BOOL")]
     pub(crate) qwen35_deepgemm: bool,
@@ -847,18 +830,10 @@ pub(crate) struct ServeArgs {
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set, value_name = "BOOL")]
     pub(crate) qwen35_moe_decode_kernel: bool,
 
-    /// On-device MoE router; false = host `infer_moe::route` reference.
-    #[arg(long, default_value_t = true, action = clap::ArgAction::Set, value_name = "BOOL")]
-    pub(crate) qwen35_gpu_router: bool,
-
     /// FA3 full-attention prefill (silently in-tree on stub builds).
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set, value_name = "BOOL")]
     pub(crate) qwen35_fa3: bool,
 
-    /// FA3 decode split count; 0 derives it from the device SM count so the
-    /// kv-head × split tiles fill the machine. Explicit values clamp to [2, 256].
-    #[arg(long, default_value_t = 0, value_name = "N")]
-    pub(crate) qwen35_fa3_decode_splits: usize,
     /// Routed-row floor for the DeepGEMM grouped expert path (default 1024).
     /// Batched decode is `R = top_k * B`, so 1024 keeps decode off DeepGEMM;
     /// lower it to reach the uncharacterized mid-band.
@@ -894,13 +869,6 @@ pub(crate) struct ServeArgs {
     #[arg(long, default_value_t = 78, value_name = "N")]
     pub(crate) dsv4_dsa_indexer_sms: usize,
 
-    /// DSv4 decode-region prefix reuse: restore a later turn to the exact prior
-    /// finish position. Default ON (2026-07-11 pod license: multi-turn
-    /// concurrent +25% throughput at c=16, no single-shot regression); pass
-    /// `false` to restore the pre-reuse path.
-    #[arg(long, default_value_t = true, action = clap::ArgAction::Set, value_name = "BOOL")]
-    pub(crate) dsv4_decode_reuse: bool,
-
     /// Adaptive MTP gate at B=1: skip speculation below the accept break-even.
     #[arg(long, default_value_t = false, action = clap::ArgAction::Set, value_name = "BOOL")]
     pub(crate) mtp_adaptive: bool,
@@ -912,7 +880,9 @@ pub(crate) struct ServeArgs {
     /// Speculate (MTP/DSpark) only when the decode batch is ≤ this; above it
     /// decode routes to the plain batched path. Default 16 = the measured
     /// DSpark envelope (+77% at c=2, +8.5% at c=16); MTP, which does not batch
-    /// its draft, still wants 1.
+    /// its draft, still wants 1. On DSv4 the gate is pinned to 1 (the draft
+    /// runs per slot and speculation loses above c=1); this flag only governs
+    /// the qwen35 batched greedy DSpark path on BF16 paged KV.
     #[arg(long, default_value_t = 16, value_name = "N")]
     pub(crate) spec_max_batch: usize,
 
@@ -924,19 +894,11 @@ pub(crate) struct ServeArgs {
     #[arg(long, value_name = "N")]
     pub(crate) deepep_max_dispatch_tokens_per_rank: Option<u32>,
 
-    /// Overlapped c=1 greedy decode pipeline.
-    #[arg(long, default_value_t = true, action = clap::ArgAction::Set, value_name = "BOOL")]
-    pub(crate) metal_pipeline: bool,
-
     /// Load-time JIT warmup forward. Off by default — the first request pays
     /// the JIT + embed dequant cost, which is faster overall for cold-start
     /// scenarios. Serving deployments should opt in.
     #[arg(long, default_value_t = false, action = clap::ArgAction::Set, value_name = "BOOL")]
     pub(crate) metal_warmup: bool,
-
-    /// Paged-prefix SDPA read path for single-token decode.
-    #[arg(long, default_value_t = true, action = clap::ArgAction::Set, value_name = "BOOL")]
-    pub(crate) metal_paged_kv_read: bool,
 
     /// Host (blocking D2H) non-greedy sampler; false = device greedy argmax.
     #[arg(long, default_value_t = false, action = clap::ArgAction::Set, value_name = "BOOL")]
@@ -950,36 +912,16 @@ pub(crate) struct ServeArgs {
     /// valve; unset = whole token in one submit).
     #[arg(long, value_name = "N")]
     pub(crate) vulkan_submit_cap: Option<usize>,
-
-    /// Additional engine-pool model metadata to expose from the serving control plane.
-    ///
-    /// Format: `id=path[,type=text-generation|embedding|reranker][,aliases=a|b][,pinned=true][,memory_bytes=N][,ttl_secs=N]`.
-    /// The first implementation is metadata/control-plane only; non-primary
-    /// embedding and reranker entries are explicit stubs, not generation routes.
-    #[arg(long = "pool-model", value_name = "SPEC")]
-    pub(crate) pool_models: Vec<String>,
-
-    /// Forward additional backend-specific flags after `--`.
-    ///
-    /// Always rejected — the in-process serve stack does not forward to a
-    /// standalone binary. Kept as a parse target so users migrating from
-    /// vLLM/SGLang get a clear error instead of a generic clap "unexpected
-    /// argument".
-    #[arg(last = true, allow_hyphen_values = true)]
-    pub(crate) extra_args: Vec<String>,
 }
 
 impl ServeArgs {
     /// CUDA runtime toggles for `EngineLoadConfig.cuda`.
     pub(crate) fn cuda_runtime_flags(&self) -> infer_api::CudaRuntimeFlags {
         infer_api::CudaRuntimeFlags {
-            qwen35_decode_graph: self.qwen35_decode_graph,
-            qwen35_batched_decode: self.qwen35_batched_decode,
+            qwen35_decode_graph: false,
             qwen35_deepgemm: self.qwen35_deepgemm,
             qwen35_moe_decode_kernel: self.qwen35_moe_decode_kernel,
-            qwen35_gpu_router: self.qwen35_gpu_router,
             qwen35_fa3: self.qwen35_fa3,
-            qwen35_fa3_decode_splits: self.qwen35_fa3_decode_splits,
             qwen35_deepgemm_min_routes: self.qwen35_deepgemm_min_routes,
             qwen35_gdr_chunked: self.qwen35_gdr_chunked,
             mempool_retain: self.cuda_mempool_retain,
@@ -991,7 +933,6 @@ impl ServeArgs {
             },
             dsv4_flashmla_decode: self.dsv4_flashmla_decode,
             dsv4_dsa_indexer_sms: self.dsv4_dsa_indexer_sms,
-            dsv4_decode_reuse: self.dsv4_decode_reuse,
             mtp_adaptive: self.mtp_adaptive,
             mtp_min_accept: self.mtp_min_accept,
             spec_max_batch: self.spec_max_batch,
@@ -1005,9 +946,7 @@ impl ServeArgs {
     /// fields ride here (not env) so the executor's resolver sees the flags.
     pub(crate) fn metal_runtime_flags(&self) -> infer_api::MetalRuntimeFlags {
         infer_api::MetalRuntimeFlags {
-            pipeline: self.metal_pipeline,
             warmup: self.metal_warmup,
-            paged_kv_read: self.metal_paged_kv_read,
             host_sampling: self.metal_host_sampling,
             speculative: !self.no_speculative,
             draft_model: self.draft_model.clone(),

@@ -4,14 +4,8 @@
 use cuda_kernels::tensor::CudaPipelineStreamKind;
 use infer_topo::TpConfig;
 
-fn lookup_usize(
-    primary: &str,
-    alias: &str,
-    lookup: &mut impl FnMut(&str) -> Option<String>,
-) -> Option<usize> {
-    lookup(primary)
-        .or_else(|| lookup(alias))
-        .and_then(|value| value.trim().parse::<usize>().ok())
+fn lookup_usize(primary: &str, lookup: &mut impl FnMut(&str) -> Option<String>) -> Option<usize> {
+    lookup(primary).and_then(|value| value.trim().parse::<usize>().ok())
 }
 
 /// Ordinal count of a comma-separated `INFER_CUDA_DEVICES` list = the TP world size.
@@ -23,20 +17,20 @@ fn count_cuda_devices(value: &str) -> Option<usize> {
     (count > 0).then_some(count)
 }
 
-/// World size: `INFER_TP_SIZE`/`ARLE_*`, else `INFER_CUDA_DEVICES` count, else 1.
-/// Rank: `INFER_TP_RANK`/`ARLE_*`, else 0.
+/// World size: `INFER_TP_SIZE`, else `INFER_CUDA_DEVICES` count, else 1.
+/// Rank: `INFER_TP_RANK`, else 0.
 ///
 /// # Errors
 /// Errors if the resolved `(world_size, rank)` is invalid.
 pub fn resolve_tp_config(
     mut lookup: impl FnMut(&str) -> Option<String>,
 ) -> infer_topo::Result<TpConfig> {
-    let explicit_size = lookup_usize("INFER_TP_SIZE", "ARLE_TP_SIZE", &mut lookup);
+    let explicit_size = lookup_usize("INFER_TP_SIZE", &mut lookup);
     let device_count = lookup("INFER_CUDA_DEVICES")
         .as_deref()
         .and_then(count_cuda_devices);
     let world_size = explicit_size.or(device_count).unwrap_or(1).max(1);
-    let rank = lookup_usize("INFER_TP_RANK", "ARLE_TP_RANK", &mut lookup).unwrap_or(0);
+    let rank = lookup_usize("INFER_TP_RANK", &mut lookup).unwrap_or(0);
     TpConfig::new(world_size, rank)
 }
 

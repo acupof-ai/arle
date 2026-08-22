@@ -156,10 +156,7 @@ pub(super) fn marlin_sm_supported(ctx: &DeviceContext) -> bool {
 
 fn qwen_quant_profile_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var_os("ARLE_QWEN35_PROFILE").is_some()
-            || std::env::var_os("ARLE_QWEN35_QUANT_PROFILE").is_some()
-    })
+    *ENABLED.get_or_init(|| std::env::var_os("ARLE_QWEN35_PROFILE").is_some())
 }
 
 pub(super) fn qwen_quant_profile<T>(

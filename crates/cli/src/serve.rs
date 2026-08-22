@@ -273,19 +273,6 @@ fn resolve_config(args: &Args, serve_args: &ServeArgs) -> Result<ServeConfig, St
         return Err("--mtp-draft-topk is currently only supported by the CUDA backend".to_string());
     }
 
-    // Surfaces the rewrite serve router does not expose yet. Reject rather than
-    // silently ignore so the user is not misled into thinking they took effect.
-    if !serve_args.pool_models.is_empty() {
-        return Err(
-            "--pool-model is not yet supported by the in-process serve stack (the rewrite router has no engine-pool /v1/models metadata)".to_string(),
-        );
-    }
-    if !serve_args.extra_args.is_empty() {
-        return Err(format!(
-            "unrecognized backend flags after `--`: {}; the in-process serve stack does not forward to a standalone binary",
-            serve_args.extra_args.join(" ")
-        ));
-    }
     if serve_args.lora_adapters.is_some() && backend != ServeBackend::Cuda {
         return Err("--lora-adapters is currently only supported by the CUDA backend".to_string());
     }
@@ -533,9 +520,6 @@ fn resolve_engine_config(
     config.kv_dram = serve_args.kv_dram;
     if let Some(value) = serve_args.chunked_prefill_size {
         config.chunked_prefill_size = Some(value);
-    }
-    if let Some(value) = serve_args.max_num_batched_tokens {
-        config.max_num_batched_tokens = Some(value);
     }
     config.slot_oversubscription = serve_args.kv_oversubscription;
     if let Some(value) = serve_args.kv_oversubscription_min_slice {

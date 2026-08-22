@@ -223,7 +223,7 @@ impl Dsv4CudaExecutor {
         tokens: &[u32],
         slot_pages: &[u32],
     ) -> Result<()> {
-        if !crate::runtime_flags::dsv4_decode_reuse_enabled() || self.prefix_state.is_inactive() {
+        if self.prefix_state.is_inactive() {
             return Ok(());
         }
         self.poll_prefix_captures();
@@ -379,8 +379,6 @@ impl Dsv4CudaExecutor {
         if page_tokens == 0 {
             return 0;
         }
-        let align = self.model.config.sliding_window.max(1);
-        let reuse = crate::runtime_flags::dsv4_decode_reuse_enabled();
         let mut committed = 0usize;
         for (idx, block) in blocks.iter().enumerate() {
             // Fail closed on demoted keys: DSv4 pages never demote through the
@@ -391,8 +389,7 @@ impl Dsv4CudaExecutor {
             let Some(meta) = self.prefix_state.page_meta(page_id) else {
                 break;
             };
-            let page_end = (idx + 1) * page_tokens;
-            if meta.boundary && (reuse || page_end.is_multiple_of(align)) {
+            if meta.boundary {
                 committed = idx + 1;
             }
         }
@@ -409,9 +406,6 @@ impl Dsv4CudaExecutor {
         blocks: &[PrefixBlock],
         tokens: &[u32],
     ) -> usize {
-        if !crate::runtime_flags::dsv4_decode_reuse_enabled() {
-            return self.reusable_prefix_blocks(blocks);
-        }
         let page_tokens = self.model.kv_arena.page_block_size;
         if page_tokens == 0 {
             return 0;
@@ -467,8 +461,6 @@ impl Dsv4CudaExecutor {
             self.num_slots
         );
         let page_tokens = self.model.kv_arena.page_block_size;
-        let align = self.model.config.sliding_window.max(1);
-        let reuse = crate::runtime_flags::dsv4_decode_reuse_enabled();
         ensure!(
             page_tokens > 0 && matched_len > 0,
             "DSv4 prefix restore needs a non-empty match (matched_len {matched_len})"
@@ -476,8 +468,8 @@ impl Dsv4CudaExecutor {
         // An unaligned match means the engine trim/clamp ordering regressed —
         // fail loud, never silently skip the ring restore.
         ensure!(
-            matched_len.is_multiple_of(page_tokens) && (reuse || matched_len.is_multiple_of(align)),
-            "DSv4 prefix restore matched_len {matched_len} not aligned to ring {align} / page {page_tokens}"
+            matched_len.is_multiple_of(page_tokens),
+            "DSv4 prefix restore matched_len {matched_len} not aligned to page {page_tokens}"
         );
         ensure!(
             prefix_pages.len() == matched_len / page_tokens,
@@ -494,8 +486,7 @@ impl Dsv4CudaExecutor {
         let frontier = *prefix_pages.last().expect("matched_len > 0 ⇒ ≥1 page");
         let tail_len = match self.prefix_state.frontier_tail_tokens(frontier) {
             Some(tail)
-                if reuse
-                    && tokens.len() >= matched_len + tail.len()
+                if tokens.len() >= matched_len + tail.len()
                     && tokens[matched_len..matched_len + tail.len()] == *tail =>
             {
                 tail.len()

@@ -27,9 +27,8 @@ static DSV4_MOE_TRANSPORT: OnceLock<Result<Dsv4MoeTransport, String>> = OnceLock
 
 pub(crate) fn dsv4_moe_transport() -> Result<Dsv4MoeTransport> {
     match DSV4_MOE_TRANSPORT.get_or_init(|| {
-        let value = std::env::var("ARLE_DSV4_MOE_TRANSPORT")
-            .or_else(|_| std::env::var("ARLE_DSV4_MOE_BACKEND"))
-            .unwrap_or_else(|_| "allreduce".to_string());
+        let value =
+            std::env::var("ARLE_DSV4_MOE_TRANSPORT").unwrap_or_else(|_| "allreduce".to_string());
         match value.as_str() {
             "allreduce" | "all_reduce" | "native" | "scalar" | "static" | "deepgemm" | "" => {
                 Ok(Dsv4MoeTransport::AllReduce)
@@ -40,7 +39,7 @@ pub(crate) fn dsv4_moe_transport() -> Result<Dsv4MoeTransport> {
             }
             "mega_moe" => Ok(Dsv4MoeTransport::MegaMoe),
             other => Err(format!(
-                "unsupported ARLE_DSV4_MOE_TRANSPORT/ARLE_DSV4_MOE_BACKEND `{other}` \
+                "unsupported ARLE_DSV4_MOE_TRANSPORT `{other}` \
                  (expected allreduce, deepep, deepep_ll, or mega_moe)"
             )),
         }
@@ -54,15 +53,12 @@ pub(crate) fn dsv4_moe_transport() -> Result<Dsv4MoeTransport> {
 static SHARD_CACHE_BYTES: AtomicUsize = AtomicUsize::new(usize::MAX);
 static DEEPEP_MAX_DISPATCH_TOKENS_PER_RANK: AtomicU32 = AtomicU32::new(0);
 
-static QWEN35_DECODE_GRAPH: AtomicBool = AtomicBool::new(false);
-static QWEN35_BATCHED_DECODE: AtomicBool = AtomicBool::new(true);
+static QWEN35_DECODE_GRAPH: AtomicBool = AtomicBool::new(true);
 static QWEN35_DEEPGEMM: AtomicBool = AtomicBool::new(true);
 static QWEN35_MOE_DECODE_KERNEL: AtomicBool = AtomicBool::new(true);
-static QWEN35_GPU_ROUTER: AtomicBool = AtomicBool::new(true);
 static QWEN35_FA3: AtomicBool = AtomicBool::new(true);
-static QWEN35_FA3_DECODE_SPLITS: AtomicUsize = AtomicUsize::new(0);
 static QWEN35_DEEPGEMM_MIN_ROUTES: AtomicUsize = AtomicUsize::new(1024);
-static QWEN35_GDR_CHUNKED: AtomicBool = AtomicBool::new(false);
+static QWEN35_GDR_CHUNKED: AtomicBool = AtomicBool::new(true);
 static NUMA_PIN: AtomicBool = AtomicBool::new(true);
 static COMM_NCCL_ONLY: AtomicBool = AtomicBool::new(false);
 static DSV4_DSA_INDEXER_SMS: AtomicUsize = AtomicUsize::new(78);
@@ -74,10 +70,9 @@ static QWEN35_MOE_EXPERTS_BF16_RESIDENT: AtomicBool = AtomicBool::new(false);
 // present, and the most a prefill chunk can. `0` = undeclared.
 static DENSE_GEMM_DECODE_ROWS: AtomicUsize = AtomicUsize::new(0);
 static DENSE_GEMM_PREFILL_ROWS: AtomicUsize = AtomicUsize::new(0);
-static DSV4_DECODE_REUSE: AtomicBool = AtomicBool::new(true); // default ON (2026-07-11 pod license)
 static MTP_ADAPTIVE: AtomicBool = AtomicBool::new(false);
 static MTP_MIN_ACCEPT_BITS: AtomicU32 = AtomicU32::new(0x3F0C_CCCD); // 0.55f32
-static SPEC_MAX_BATCH: AtomicUsize = AtomicUsize::new(1);
+static SPEC_MAX_BATCH: AtomicUsize = AtomicUsize::new(16);
 /// NaN = unset, so an explicit `0` stays distinguishable from no flag at all.
 static DSPARK_CONFIDENCE_THRESHOLD_BITS: AtomicU32 = AtomicU32::new(0x7FC0_0000);
 static DEEPEP_NUM_SMS: AtomicU32 = AtomicU32::new(20);
@@ -87,26 +82,15 @@ static DEEPEP_NUM_SMS: AtomicU32 = AtomicU32::new(20);
 /// `DeviceContext` creation.
 pub fn apply_runtime_flags(f: &CudaRuntimeFlags) {
     QWEN35_DECODE_GRAPH.store(f.qwen35_decode_graph, Relaxed);
-    QWEN35_BATCHED_DECODE.store(f.qwen35_batched_decode, Relaxed);
     QWEN35_DEEPGEMM.store(f.qwen35_deepgemm, Relaxed);
     QWEN35_MOE_DECODE_KERNEL.store(f.qwen35_moe_decode_kernel, Relaxed);
-    QWEN35_GPU_ROUTER.store(f.qwen35_gpu_router, Relaxed);
     QWEN35_FA3.store(f.qwen35_fa3, Relaxed);
-    // 0 is the auto sentinel; the decode site derives it from the SM count.
-    QWEN35_FA3_DECODE_SPLITS.store(
-        match f.qwen35_fa3_decode_splits {
-            0 => 0,
-            n => n.clamp(2, 256),
-        },
-        Relaxed,
-    );
     QWEN35_DEEPGEMM_MIN_ROUTES.store(f.qwen35_deepgemm_min_routes.max(1), Relaxed);
     QWEN35_GDR_CHUNKED.store(f.qwen35_gdr_chunked, Relaxed);
     SHARD_CACHE_BYTES.store(f.shard_cache_bytes.unwrap_or(usize::MAX), Relaxed);
     NUMA_PIN.store(f.numa_pin, Relaxed);
     COMM_NCCL_ONLY.store(f.comm_backend == CommBackend::Nccl, Relaxed);
     DSV4_DSA_INDEXER_SMS.store(f.dsv4_dsa_indexer_sms, Relaxed);
-    DSV4_DECODE_REUSE.store(f.dsv4_decode_reuse, Relaxed);
     MTP_ADAPTIVE.store(f.mtp_adaptive, Relaxed);
     MTP_MIN_ACCEPT_BITS.store(f.mtp_min_accept.to_bits(), Relaxed);
     SPEC_MAX_BATCH.store(f.spec_max_batch.max(1), Relaxed);
@@ -129,9 +113,6 @@ pub fn apply_runtime_flags(f: &CudaRuntimeFlags) {
 pub(crate) fn qwen35_decode_graph() -> bool {
     QWEN35_DECODE_GRAPH.load(Relaxed)
 }
-pub(crate) fn qwen35_batched_decode() -> bool {
-    QWEN35_BATCHED_DECODE.load(Relaxed)
-}
 /// `--qwen35-deepgemm` (default on): DeepGEMM SM90 BF16 m-grouped GEMMs for the
 /// expert GEMMs — decode neutral, prefill needle 3k wall 9.10 -> 2.32 s. Also
 /// read at LOAD time (the loader builds the contiguous grouped-B caches only
@@ -146,14 +127,8 @@ pub(crate) fn qwen35_deepgemm() -> bool {
 pub(crate) fn qwen35_moe_decode_kernel() -> bool {
     QWEN35_MOE_DECODE_KERNEL.load(Relaxed)
 }
-pub(crate) fn qwen35_gpu_router() -> bool {
-    QWEN35_GPU_ROUTER.load(Relaxed)
-}
 pub(crate) fn qwen35_fa3() -> bool {
     QWEN35_FA3.load(Relaxed)
-}
-pub(crate) fn qwen35_fa3_decode_splits() -> usize {
-    QWEN35_FA3_DECODE_SPLITS.load(Relaxed)
 }
 pub(crate) fn qwen35_deepgemm_min_routes() -> usize {
     QWEN35_DEEPGEMM_MIN_ROUTES.load(Relaxed)
@@ -212,11 +187,13 @@ pub(crate) fn set_dense_gemm_row_envelope(decode_rows: usize, prefill_rows: usiz
     DENSE_GEMM_DECODE_ROWS.fetch_max(decode_rows, Relaxed);
     DENSE_GEMM_PREFILL_ROWS.fetch_max(prefill_rows, Relaxed);
 }
-pub(crate) fn dsv4_decode_reuse_enabled() -> bool {
-    DSV4_DECODE_REUSE.load(Relaxed)
-}
 pub(crate) fn mtp_adaptive() -> bool {
     MTP_ADAPTIVE.load(Relaxed)
+}
+/// DSv4 decode reuse is unconditional (2026-07-11 license); the accessor stays
+/// because executor/dsv4.rs still names it.
+pub(crate) fn dsv4_decode_reuse_enabled() -> bool {
+    true
 }
 pub(crate) fn mtp_min_accept() -> f32 {
     f32::from_bits(MTP_MIN_ACCEPT_BITS.load(Relaxed))

@@ -11,10 +11,7 @@ pub(crate) use quant_linear::qwen_fp8_dense_operator_stats;
 
 fn qwen_gemm_profile_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var_os("ARLE_QWEN35_PROFILE").is_some()
-            || std::env::var_os("ARLE_QWEN35_QUANT_PROFILE").is_some()
-    })
+    *ENABLED.get_or_init(|| std::env::var_os("ARLE_QWEN35_PROFILE").is_some())
 }
 
 pub(crate) fn precompute_rope(
