@@ -8,6 +8,7 @@ detail in the linked wins/errors entry. Oldest sections are condensed.
 
 ## [Unreleased]
 
+- **Flag deletion wave — accepted: 10 proven A/B flags deleted (qwen35-decode-graph/-batched-decode/-gpu-router/-fa3-decode-splits, max-num-batched-tokens, dsv4-decode-reuse, metal-pipeline/-paged-kv-read, pool-model, extra_args), `--comm-backend` default reverted Auto→Nccl (unlicensed flip in `84c60dee5`; one-shot 51–53 vs NCCL 70–80), 5 env aliases merged, runtime-flags statics fixed** (`1864ddac5`). See `docs/experience/wins/2026-08-22-flag-deletion-wave.md`.
 - **Batched DSpark on quantized KV — closed as rejected: op_timing pins the c≥8 loss on mixed-step scheduler stalls (57× 1.7 s vs 19× 1.97 s), and chunked-prefill 512/1024 does not fix it (c=4 −29 %, c=8 +5 % noise, c=16 wash).** Gate stays off; DSpark ships per-row at c=1. See `docs/experience/errors/2026-08-22-batched-dspark-quant-kv-verify-loses.md`.
 - **Batched DSpark on quantized KV — rejected again with the verify-shape MMA kernel (`c177cda5b`): c=8 19.2 vs 21.8, c=16 11.2 vs 13.9 tok/s per-row; verify attention ruled out as the cause, gate restored (`1f36fea61`).** See `docs/experience/errors/2026-08-22-batched-dspark-quant-kv-verify-loses.md`.
 - Read a shared NVFP4 base in its Marlin layout (`marlin_fp4_to_bf16`), so an OPD student can borrow the serving engine's frozen NVFP4 weights instead of holding a second copy (9 GB/rank vs FP8). Bit-exact against the group layout on sm_90; see `docs/experience/wins/2026-08-22-marlin-nvfp4-base-share-parity.md`.
