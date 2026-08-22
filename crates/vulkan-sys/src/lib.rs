@@ -4,8 +4,6 @@
 //! - `--features vulkan`: dynamically loads the Vulkan loader through `ash`.
 //! - default: every entry point returns [`VULKAN_NOT_COMPILED`].
 
-/// Sentinel error returned by every stub entry point when built without
-/// `vulkan`.
 pub const VULKAN_NOT_COMPILED: VulkanError = VulkanError::NotCompiled;
 
 pub type Result<T> = std::result::Result<T, VulkanError>;
@@ -160,7 +158,6 @@ mod real {
         raw.to_string_lossy().into_owned()
     }
 
-    /// Dynamically loaded Vulkan runtime context with one compute queue.
     pub struct VulkanContext {
         _entry: Entry,
         instance: ash::Instance,
@@ -337,7 +334,6 @@ mod real {
             )
         }
 
-        /// Per-heap `(size_bytes, is_device_local)` for diagnostics / budgeting.
         pub fn memory_heaps(&self) -> Vec<(u64, bool)> {
             let props = unsafe {
                 self.instance
@@ -354,8 +350,6 @@ mod real {
                 .collect()
         }
 
-        /// Per-memory-type `(heap_index, device_local, host_visible)` — lets a
-        /// caller see which heap a HOST_VISIBLE allocation actually lands on.
         pub fn memory_types(&self) -> Vec<(u32, bool, bool)> {
             let props = unsafe {
                 self.instance
@@ -457,8 +451,6 @@ mod real {
         name
     }
 
-    /// Host-visible storage buffer. Device-local staging lands with the first
-    /// throughput-sensitive caller; P0 needs deterministic H2D/D2H smoke.
     pub struct DeviceBuffer<'a> {
         ctx: &'a VulkanContext,
         buffer: vk::Buffer,
@@ -607,8 +599,6 @@ mod real {
             Ok(())
         }
 
-        /// Map `dst.len()` bytes at byte `offset` and read them into `dst`. The
-        /// arena uses this to read one GEMV's result rows back from a named slot.
         pub fn copy_to_host_at(&self, offset: u64, dst: &mut [u8]) -> Result<()> {
             assert!(
                 offset as usize + dst.len() <= self.len,
@@ -655,7 +645,6 @@ mod real {
             if src.is_empty() {
                 return Ok(dst);
             }
-            // Temporary host-visible staging buffer (freed on scope exit).
             let mut staging = Self::alloc_with_usage(
                 ctx,
                 src.len(),
@@ -888,17 +877,12 @@ mod real {
             })
         }
 
-        /// Tag the NEXT recorded dispatch with a category label for the GPU
-        /// timestamp profiler (no-op unless ARLE_GPU_TIMESTAMPS). Consumed by the
-        /// next `dispatch_raw`; unlabeled dispatches fall under "other".
         pub fn label_next(&mut self, label: &'static str) {
             if let Some(p) = self.prof.as_mut() {
                 p.next_label = label;
             }
         }
 
-        /// Drain the accumulated per-category GPU times as `(label, count,
-        /// total_ms)`, sorted by time descending. Cleared after draining.
         pub fn take_gpu_profile(&mut self) -> Vec<(&'static str, u64, f64)> {
             match self.prof.as_mut() {
                 Some(p) => {
@@ -924,9 +908,6 @@ mod real {
             self.dispatches_in_batch
         }
 
-        /// Total `vkQueueSubmit` calls over this recorder's lifetime — the
-        /// submits/token instrument. Snapshot before/after a token to get its
-        /// submit count.
         pub fn submit_count(&self) -> u64 {
             self.submit_count
         }
@@ -962,8 +943,6 @@ mod real {
             }
             .map_err(|e| vk_error("beginning Vulkan command buffer", e))?;
             self.dispatches_in_batch = 0;
-            // GPU profiler: reset the query pool and write the baseline timestamp
-            // (idx 0). Each dispatch then writes idx 1.. ; deltas are per-op times.
             if let Some((pool, cap)) = self.prof.as_ref().map(|p| (p.pool, p.capacity)) {
                 let cmd = self.command_buffer;
                 unsafe {
@@ -1033,8 +1012,6 @@ mod real {
                 device.cmd_dispatch(cmd, groups[0], groups[1], groups[2]);
             }
             self.dispatches_in_batch += 1;
-            // GPU profiler: timestamp this dispatch's completion (BOTTOM_OF_PIPE),
-            // tagged with the pending category label.
             let slot = self.prof.as_mut().and_then(|p| {
                 if p.idx < p.capacity {
                     let s = (p.pool, p.idx);
@@ -1105,8 +1082,6 @@ mod real {
             }
             .map_err(|e| vk_error("waiting for Vulkan fence", e))?;
             self.pending = false;
-            // GPU profiler: read this submit's timestamps and accumulate per-op
-            // deltas into the per-category totals.
             let read = self.prof.as_ref().map(|p| (p.pool, p.idx, p.valid_mask));
             if let Some((pool, idx, mask)) = read {
                 if idx > 1 {
@@ -1415,14 +1390,10 @@ mod real {
         pool: vk::DescriptorPool,
         sets: Vec<vk::DescriptorSet>,
         binding_count: u32,
-        /// Round-robin cursor into `sets`; advanced per `next_updated`, rewound by
-        /// `reset`.
         next: usize,
     }
 
     impl<'a> DescriptorSetRing<'a> {
-        /// Allocate a ring of `ring_size` descriptor sets, each with
-        /// `binding_count` STORAGE_BUFFER bindings, from one persistent pool.
         pub fn new(
             ctx: &'a VulkanContext,
             layout: &DescriptorSetLayout<'_>,
@@ -1439,7 +1410,6 @@ mod real {
             let ring_size = ring_size.max(1);
             let ring_size_u32 = u32::try_from(ring_size)
                 .map_err(|e| runtime_error("converting descriptor ring size", e))?;
-            // One pool sized for ring_size sets × binding_count buffers each.
             let pool_sizes = [vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::STORAGE_BUFFER)
                 .descriptor_count(binding_count * ring_size_u32)];
@@ -1525,7 +1495,6 @@ mod real {
 
     impl Drop for DescriptorSetRing<'_> {
         fn drop(&mut self) {
-            // Freeing the pool frees all its sets.
             unsafe { self.ctx.device.destroy_descriptor_pool(self.pool, None) };
         }
     }
@@ -2148,7 +2117,6 @@ void main() {
         let push_for =
             |addend: i32| -> Vec<u8> { [(N as u32).to_le_bytes(), addend.to_le_bytes()].concat() };
 
-        // --- Path A: ONE CommandRecorder, 3 dispatches, barriers, ONE submit ---
         let chained = {
             let mut buf = DeviceBuffer::alloc(&ctx, N * 4).expect("alloc chained buf");
             buf.copy_from_host(&bytes_of(&initial))
@@ -2162,14 +2130,12 @@ void main() {
                     rec.barrier();
                 }
             }
-            // Exactly one submit for all three dispatches.
             rec.submit_and_wait().expect("recorder submit_and_wait");
             let mut back = vec![0u8; N * 4];
             buf.copy_to_host(&mut back).expect("D2H chained");
             ints_of(&back)
         };
 
-        // --- Path B: 3 sequential one_shot_submits (drain per op) reference ---
         let sequential = {
             let mut buf = DeviceBuffer::alloc(&ctx, N * 4).expect("alloc seq buf");
             buf.copy_from_host(&bytes_of(&initial)).expect("H2D seq");
