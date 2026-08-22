@@ -67,6 +67,11 @@ impl Dsv4CudaExecutor {
         if let Err(e) = model.ctx.trim_memory_pool() {
             log::warn!("pre-KV-budget trim_memory_pool failed (non-fatal): {e}");
         }
+        // Graph capture requires the pool to not query events (illegal during
+        // stream capture). MAX release threshold caches blocks without queries.
+        if let Err(e) = model.ctx.set_pool_retain(true) {
+            log::warn!("set_pool_retain(true) failed (non-fatal): {e}");
+        }
         let weights_used_at_model_load = mem_dbg("after weight-load pool trim");
         // DSpark per-slot runtime is allocated after kv_budget_plan; count it
         // here so num_slots doesn't over-commit.
@@ -208,8 +213,6 @@ impl Dsv4CudaExecutor {
             mtp_accepts: 0,
             mtp_rejects: 0,
             mtp_chains: 0,
-            mtp_accept_ema: 1.0,
-            mtp_skip_streak: 0,
             prefix_state: crate::attention::Dsv4PrefixStatePool::new(
                 default_t1_budget_per_rank(),
                 prefix_entry_bytes,
@@ -289,7 +292,6 @@ impl Dsv4CudaExecutor {
         let sps = qwen35_spec::DsparkSps {
             bias_ms: sps_bias_ms,
             row_ms: sps_row_ms,
-            confidence_threshold: crate::runtime_flags::dspark_confidence_threshold(),
         };
         log::info!(
             "CUDA DSv4 DSpark runtime initialized: stages={num_stages} block={block_size} \

@@ -399,6 +399,28 @@ impl DeviceContext {
         Ok(())
     }
 
+    /// Switch the pool's release threshold at runtime. `retain=true` sets
+    /// MAX (cache blocks, no event queries — required for graph capture);
+    /// `retain=false` sets 0 (release at sync).
+    pub fn set_pool_retain(&self, retain: bool) -> Result<()> {
+        self.ctx
+            .bind_to_thread()
+            .map_err(|e| anyhow!("bind context before pool retain switch failed: {e}"))?;
+        let mut threshold = if retain { u64::MAX } else { 0 };
+        // SAFETY: valid device + pool; threshold is a local that outlives the call.
+        unsafe {
+            let pool = cudarc::driver::result::device::get_mem_pool(self.ctx.cu_device())
+                .map_err(|e| anyhow!("get device mem pool failed: {e}"))?;
+            cudarc::driver::result::mem_pool::set_attribute(
+                pool,
+                cudarc::driver::sys::CUmemPool_attribute::CU_MEMPOOL_ATTR_RELEASE_THRESHOLD,
+                (&mut threshold as *mut u64).cast::<core::ffi::c_void>(),
+            )
+            .map_err(|e| anyhow!("set pool release threshold failed: {e}"))?;
+        }
+        Ok(())
+    }
+
     pub fn sync(&self) -> Result<()> {
         self.stream
             .synchronize()
