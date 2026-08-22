@@ -399,6 +399,21 @@ the FP8 control arm — unchanged code, unchanged config, identical resident byt
 and KV pool — moved 3.5× between runs.** A control that moves
 invalidates the run it is in; the sign of the NVFP4 delta flipped with it.
 
+#### Long context — 256 K total
+
+`--max-prompt-tokens 262144 --max-total-tokens 262144 --max-running-requests 2`;
+the engine caps prompts at `max_total − max_total/8` = 229,376 and keeps the
+rest for decode. Runtime `1df0acf68`, GPU 0, one request.
+
+| prompt tok | TTFT s | decode tok/s | generated | needle |
+|---:|---:|---:|---:|---|
+| 220,054 | 130.4 | 47.9 | 5,015 (EOS) | found at 50 % depth |
+| ≈221 K (`needle_gate.py 200000`) | — | — | — | exact 1/1, DET |
+
+TTFT grows 22× from 32 K (5.9 s) to 220 K for 6.7× the tokens: the O(L²)
+full-attention term dominates prefill at this length, where it was 22 % at
+32 K. Decode at 225 K context is 47.9 tok/s against 73.0 at 32 K.
+
 #### 8-token decode grid
 
 `--seconds-per-concurrency 30 --max-tokens 128`, synthetic prompt (mean 8
