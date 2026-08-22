@@ -7,11 +7,13 @@
 // 2 bytes/elem out + 2 bytes/elem FA3 read vs 1 byte/elem in here).
 //
 // Persistent split-KV on tensor cores: one CTA per (batch row, kv-head,
-// split), grid [num_kv_heads * num_splits, batch]; the kv-head's q-heads are
-// the rows of a 16-row MMA tile. Each CTA walks its KV token range through the
-// rectangular page table (the same metadata the FA3 lane consumes) and writes
-// a partial (o, m, l); a merge kernel combines the splits. Decode-shaped:
-// exactly one query token per batch row (the caller gates on qlen == 1).
+// split, q-tile), grid [num_kv_heads * num_splits, batch, q_tiles]. A q-tile
+// is 16 rows of (query token, q-head) pairs of the kv-head's GQA group —
+// head-fastest, so a decode row (qlen 1, G <= 16) is one tile and a spec
+// verify row (qlen <= PAF3_MAX_QLEN) is ceil(qlen * G / 16) tiles. Each CTA
+// walks its KV token range through the rectangular page table (the same
+// metadata the FA3 lane consumes) with the row's own causal bound and writes
+// a partial (o, m, l); a merge kernel combines the splits.
 // sm_80+ (bf16 mma.sync); the sm_70 lane serves BF16 KV only.
 //
 // Durable pool layout (NHD, token-major):
@@ -84,6 +86,7 @@ __device__ __forceinline__ uint32_t paf3_bytes2_to_bf16x2(uint32_t pair) {
 }
 
 #define PAF3_TILE_TOK 16
+#define PAF3_MAX_QLEN 8
 
 template <int HEAD_DIM, bool INT8_KV>
 __global__ void __launch_bounds__(PAF3_BLOCK_SIZE, 2)
@@ -119,6 +122,7 @@ paged_attention_quantized_fa3_partial_kernel(
     const int kv_head = blockIdx.x / num_splits;
     const int split = blockIdx.x % num_splits;
     const int b = blockIdx.y;
+    const int qtile = blockIdx.z;
     const int G = num_q_heads / num_kv_heads;
     const int q_head0 = kv_head * G;
 
@@ -126,19 +130,30 @@ paged_attention_quantized_fa3_partial_kernel(
     const int lane_id = threadIdx.x % PAF3_WARP_SIZE;
 
     const int kv_len = seqused_k[b];
-    const int q_token = cu_seqlens_q[b];
+    const int q_token0 = cu_seqlens_q[b];
+    const int qlen = cu_seqlens_q[b + 1] - q_token0;
     const int kv_dim = num_kv_heads * HEAD_DIM;
+    const int rows = qlen * G;
+    const int row0 = qtile * 16;
+    if (row0 >= rows) return;
 
+    // Tile row r -> (query token t, head h); partial index of that row.
     const int qh_stride = total_q * num_q_heads;
-    const int out_idx0 = split * qh_stride + q_token * num_q_heads + q_head0;
+    auto row_out_idx = [&](int r) {
+        const int t = r / G, h = r % G;
+        return split * qh_stride + (q_token0 + t) * num_q_heads + q_head0 + h;
+    };
 
     auto write_empty_partial = [&]() {
-        if (threadIdx.x < G) {
-            partial_m[out_idx0 + threadIdx.x] = -FLT_MAX;
-            partial_l[out_idx0 + threadIdx.x] = 0.0f;
-        }
-        for (int e = threadIdx.x; e < G * HEAD_DIM; e += PAF3_BLOCK_SIZE) {
-            partial_out[(size_t)out_idx0 * HEAD_DIM + e] = 0.0f;
+        for (int r = row0; r < min(row0 + 16, rows); r++) {
+            const int out_idx = row_out_idx(r);
+            if (threadIdx.x == 0) {
+                partial_m[out_idx] = -FLT_MAX;
+                partial_l[out_idx] = 0.0f;
+            }
+            for (int e = threadIdx.x; e < HEAD_DIM; e += PAF3_BLOCK_SIZE) {
+                partial_out[(size_t)out_idx * HEAD_DIM + e] = 0.0f;
+            }
         }
     };
 
@@ -163,17 +178,28 @@ paged_attention_quantized_fa3_partial_kernel(
         const __nv_bfloat16 zero = __float2bfloat16(0.0f);
         for (int e = threadIdx.x; e < 16 * HEAD_DIM; e += PAF3_BLOCK_SIZE) {
             const int r = e / HEAD_DIM, d = e % HEAD_DIM;
-            smem_q[r * LD + d] = (r < G)
-                ? Q[(size_t)(q_token * num_q_heads + q_head0 + r) * HEAD_DIM + d]
+            const int gr = row0 + r;
+            smem_q[r * LD + d] = (gr < rows)
+                ? Q[(size_t)(q_token0 + gr / G) * num_q_heads * HEAD_DIM
+                    + (size_t)(q_head0 + gr % G) * HEAD_DIM + d]
                 : zero;
         }
     }
     __syncthreads();
 
-    // Accumulator fragment layout (m16n8): lane holds rows r0 = lane/4 and
-    // r0 + 8, columns (lane%4)*2 + {0,1}.
+    // Causal bound of this lane's two rows: query token t sees kv positions
+    // below kv_len - qlen + 1 + t (the new tokens are already in the pool).
     const int r0 = lane_id >> 2;
     const int c0 = (lane_id & 3) * 2;
+    int row_lim[2];
+    #pragma unroll
+    for (int i = 0; i < 2; i++) {
+        const int gr = row0 + r0 + 8 * i;
+        row_lim[i] = gr < rows ? kv_len - qlen + 1 + gr / G : 0;
+    }
+
+    // Accumulator fragment layout (m16n8): lane holds rows r0 = lane/4 and
+    // r0 + 8, columns (lane%4)*2 + {0,1}.
 
     float o_acc[NT][4];
     #pragma unroll
@@ -265,10 +291,10 @@ paged_attention_quantized_fa3_partial_kernel(
             #pragma unroll
             for (int c = 0; c < 2; c++) {
                 const int tok = 8 * j + c0 + c;
-                const bool ok = tb + tok < tok_end;
+                const int pos = tb + tok;
                 const float sc = ks[tok];
-                s[j][c] = ok ? s[j][c] * sc : -FLT_MAX;
-                s[j][2 + c] = ok ? s[j][2 + c] * sc : -FLT_MAX;
+                s[j][c] = (pos < tok_end && pos < row_lim[0]) ? s[j][c] * sc : -FLT_MAX;
+                s[j][2 + c] = (pos < tok_end && pos < row_lim[1]) ? s[j][2 + c] * sc : -FLT_MAX;
                 rmax[0] = fmaxf(rmax[0], s[j][c]);
                 rmax[1] = fmaxf(rmax[1], s[j][2 + c]);
             }
@@ -285,12 +311,15 @@ paged_attention_quantized_fa3_partial_kernel(
             alpha[i] = __expf(m_row[i] - m_new);
             m_row[i] = m_new;
         }
+        // A row whose causal bound sits below this split's first tile has no
+        // finite score yet: its probabilities must stay 0, not exp(0).
+        const bool live0 = m_row[0] > -FLT_MAX, live1 = m_row[1] > -FLT_MAX;
         #pragma unroll
         for (int j = 0; j < 2; j++) {
             #pragma unroll
             for (int c = 0; c < 2; c++) {
-                p[j][c] = __expf(s[j][c] - m_row[0]);
-                p[j][2 + c] = __expf(s[j][2 + c] - m_row[1]);
+                p[j][c] = live0 ? __expf(s[j][c] - m_row[0]) : 0.0f;
+                p[j][2 + c] = live1 ? __expf(s[j][2 + c] - m_row[1]) : 0.0f;
                 rsum[0] += p[j][c];
                 rsum[1] += p[j][2 + c];
             }
@@ -354,7 +383,7 @@ paged_attention_quantized_fa3_partial_kernel(
         __syncwarp();
     }
 
-    // ── merge the four warps into warp 0 (rows < G only) ──
+    // ── merge the four warps into warp 0 ──
     float* stage_o = reinterpret_cast<float*>(&smem_kv[0][0]);  // [16][HEAD_DIM]
     __shared__ float stage_m[16];
     __shared__ float stage_l[16];
@@ -402,9 +431,9 @@ paged_attention_quantized_fa3_partial_kernel(
     if (warp_id == 0) {
         #pragma unroll
         for (int i = 0; i < 2; i++) {
-            const int h = r0 + 8 * i;
-            if (h >= G) continue;
-            const int out_idx = out_idx0 + h;
+            const int gr = row0 + r0 + 8 * i;
+            if (gr >= rows) continue;
+            const int out_idx = row_out_idx(gr);
             if ((lane_id & 3) == 0) {
                 partial_m[out_idx] = m_row[i];
                 partial_l[out_idx] = l_row[i];
@@ -501,6 +530,7 @@ cudaError_t paged_attention_quantized_fa3_cuda(
     int page_table_stride,
     int batch,
     int total_q,
+    int max_qlen,
     float sm_scale,
     bool is_fp8,
     int num_splits,
@@ -514,8 +544,11 @@ cudaError_t paged_attention_quantized_fa3_cuda(
         (head_dim != 128 && head_dim != 256)) {
         return cudaErrorInvalidValue;
     }
-    // The kv-head's q-heads are the rows of one 16-row MMA tile.
-    if (num_q_heads / num_kv_heads > 16) return cudaErrorInvalidValue;
+    // A decode row's GQA group is one 16-row MMA tile; a verify row of up to
+    // PAF3_MAX_QLEN tokens spans ceil(max_qlen * G / 16) tiles.
+    const int gqa = num_q_heads / num_kv_heads;
+    if (gqa > 16 || max_qlen <= 0 || max_qlen > PAF3_MAX_QLEN) return cudaErrorInvalidValue;
+    const int q_tiles = (max_qlen * gqa + 15) / 16;
     if (q_packed == nullptr || k_pool == nullptr || v_pool == nullptr ||
         k_scales == nullptr || v_scales == nullptr || page_table == nullptr ||
         cu_seqlens_q == nullptr || seqused_k == nullptr || output == nullptr ||
@@ -532,7 +565,7 @@ cudaError_t paged_attention_quantized_fa3_cuda(
     float* partial_m = partial_out + (size_t)num_splits * qh * head_dim;
     float* partial_l = partial_m + (size_t)num_splits * qh;
 
-    const dim3 grid(num_kv_heads * num_splits, batch);
+    const dim3 grid(num_kv_heads * num_splits, batch, q_tiles);
     const dim3 block(PAF3_BLOCK_SIZE);
 
     cudaError_t err = cudaSuccess;

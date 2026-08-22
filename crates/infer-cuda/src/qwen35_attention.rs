@@ -637,11 +637,13 @@ impl Qwen35Model {
                             // Short queries and batch==1 prefill take FA3 paged
                             // split-KV; ragged multi-request prefill keeps TileLang
                             // (routing it here cost c=8 TTFT 12.07→18.23 s).
-                            // Quantized pools: decode rows take the native 1-byte
-                            // tensor-core kernel (one CTA per kv-head group);
-                            // prefill rows and workspace overflow fall through to
-                            // the FA3 quant shim.
-                            if decode && matches!(pool.format, KVFormat::FP8E4M3 | KVFormat::INT8) {
+                            // Quantized pools: decode and spec-verify rows (<= 8
+                            // query tokens) take the native 1-byte tensor-core
+                            // kernel; prefill rows and workspace overflow fall
+                            // through to the FA3 quant shim.
+                            if meta.seq_len <= QUANT_POOL_KERNEL_MAX_QLEN
+                                && matches!(pool.format, KVFormat::FP8E4M3 | KVFormat::INT8)
+                            {
                                 // Splits capped at 16: the pool's split-KV
                                 // workspace is sized for 16 splits.
                                 let splits = self
@@ -683,6 +685,7 @@ impl Qwen35Model {
                                         meta.page_table_stride,
                                         meta.batch,
                                         meta.total_q,
+                                        meta.seq_len,
                                         sm_scale,
                                         pool.format,
                                         splits,
