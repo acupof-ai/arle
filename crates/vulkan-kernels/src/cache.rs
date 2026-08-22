@@ -75,14 +75,10 @@ impl<'a> KernelCache<'a> {
         }
     }
 
-    /// Total cache-miss pipeline builds performed so far (the instrumented
-    /// build counter). One distinct `(kernel, spec, push, bindings)` increments
-    /// this exactly once, on its first `get`.
     pub fn build_count(&self) -> usize {
         self.build_count
     }
 
-    /// Number of distinct cached pipelines.
     pub fn len(&self) -> usize {
         self.entries.len()
     }
@@ -114,7 +110,6 @@ impl<'a> KernelCache<'a> {
             self.build_count += 1;
             self.entries.insert(key.clone(), built);
         }
-        // Present by construction (just inserted or already there).
         Ok(self
             .entries
             .get(&key)
