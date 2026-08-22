@@ -18,7 +18,6 @@ use std::collections::HashMap;
 use deepseek_spec::v4::DeepSeekV4Config;
 use infer_seam::{KvAllocator, KvPrefixStore, KvQuery};
 
-/// Element counts (bf16) of one compressor/indexer ring family.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Dsv4CompressorShapeElems {
     pub pending_kv: usize,
@@ -119,7 +118,6 @@ struct SlotDeviceState {
     _arena: hip_sys::DeviceBuffer,
 }
 
-/// Host-side paged KV bookkeeping for the HIP backend.
 pub struct HipKvPool {
     page_size: usize,
     total_pages: usize,

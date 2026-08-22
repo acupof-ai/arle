@@ -70,7 +70,6 @@ pub fn plan_residency(kind: Dsv4TensorKind, ty: GgmlType) -> Residency {
     }
 }
 
-/// Exact device bytes for one tensor under `residency`.
 pub fn device_bytes(residency: Residency, info: &TensorInfo) -> Result<u64> {
     let n = info.element_count();
     Ok(match residency {
