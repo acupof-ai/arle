@@ -1,6 +1,5 @@
 //! `infer-moe` — pure, CPU-verifiable, device-independent MoE routing / gating
-//! math (the reference the GPU kernel is verified against). Ported from the two
-//! legacy ARLE routers with GPU coupling dropped; depends only on `std`.
+//! math (the reference the GPU kernel is verified against).
 //!
 //! # Which model uses which routing rule
 //!
@@ -17,15 +16,6 @@
 //! Group-limited routing (`n_group`/`topk_group`) is the DeepSeek-V2/V3 mechanism
 //! neither ARLE router wires; the fields + [`group_limited_mask`] exist so this
 //! reference can verify a grouped kernel if a future checkpoint sets them.
-//!
-//! # Routing skeleton (unified in [`route`])
-//!
-//! ```text
-//! logits[E] ──scoring_func──▶ scores[E] ──topk(score[+bias], mask?)──▶ selected[k]
-//!     └─ softmax: weight = score (denom 1.0); optional norm_topk_prob renorm
-//!     └─ sigmoid/sqrtsoftplus: weight = score / (selected_sum + 1e-9)
-//!     └─ × routed_scaling_factor
-//! ```
 
 #[path = "config.rs"]
 mod config;
