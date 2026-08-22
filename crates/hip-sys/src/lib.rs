@@ -21,7 +21,6 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HipError(pub i32);
 
-/// Sentinel returned by every stub entry point when built without `hip`.
 pub const HIP_NOT_COMPILED: HipError = HipError(-1);
 
 pub type Result<T> = std::result::Result<T, HipError>;
@@ -116,7 +115,6 @@ mod real {
         Ok(bytes)
     }
 
-    /// (free, total) device memory bytes — the ROCm analogue of `cudaMemGetInfo`.
     pub fn mem_get_info() -> Result<(usize, usize)> {
         let (mut free, mut total) = (0usize, 0usize);
         check(unsafe { ffi::hipMemGetInfo(&mut free, &mut total) })?;
@@ -184,7 +182,6 @@ mod real {
         }
     }
 
-    /// Owned HIP stream. Destroys on drop.
     pub struct Stream(*mut c_void);
 
     impl Stream {
