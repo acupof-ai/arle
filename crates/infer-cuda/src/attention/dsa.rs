@@ -984,6 +984,20 @@ impl Dsv4LayerAttentionState {
         self.flashmla.as_ref().map(|f| f.slot_idx)
     }
 
+    pub(crate) fn advance_after_replay(
+        &mut self,
+        mode: DeepSeekV4AttentionMode,
+        ratio: usize,
+        total_len: usize,
+    ) {
+        self.advance_decode_len(mode, ratio, total_len);
+        if mode != DeepSeekV4AttentionMode::SlidingWindow
+            && let Some(flash) = &mut self.flashmla
+        {
+            flash.fp8_kv_comp_packed_rows = total_len / ratio.max(1);
+        }
+    }
+
     /// Re-sync this layer's persistent FlashMLA device page table from the
     /// host table. Dirty-bit driven (#154 Phase 0): called via
     /// `Dsv4SlotState::refresh_flashmla_device_page_tables` whenever

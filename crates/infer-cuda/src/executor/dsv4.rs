@@ -311,9 +311,8 @@ impl Dsv4CudaExecutor {
         )?;
         drop(keepalive);
 
-        // On replay the closure (which advances seq_len) did not run.
         if was_replay {
-            slot.seq_len += 1;
+            slot.advance_after_replay(&model.layers);
         }
 
         Ok(Some(vec![token]))

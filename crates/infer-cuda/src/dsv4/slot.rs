@@ -509,6 +509,16 @@ impl Dsv4SlotState {
         Ok(())
     }
 
+    /// Host bookkeeping for one replayed decode step: the captured kernels
+    /// advanced the device state (compressor carry, FP8 compressed-row pack)
+    /// from `start_pos_device`; mirror that in the per-layer host counters.
+    pub(crate) fn advance_after_replay(&mut self, layers: &[Dsv4Layer]) {
+        self.seq_len += 1;
+        for (layer, state) in layers.iter().zip(&mut self.attention) {
+            state.advance_after_replay(layer.mode, layer.compress_ratio, self.seq_len);
+        }
+    }
+
     pub(crate) fn truncate(
         &mut self,
         layers: &[Dsv4Layer],
