@@ -8,6 +8,7 @@ detail in the linked wins/errors entry. Oldest sections are condensed.
 
 ## [Unreleased]
 
+- **Batched DSpark on quantized KV — rejected again with the verify-shape MMA kernel (`c177cda5b`): c=8 19.2 vs 21.8, c=16 11.2 vs 13.9 tok/s per-row; verify attention ruled out as the cause, gate restored (`1f36fea61`).** See `docs/experience/errors/2026-08-22-batched-dspark-quant-kv-verify-loses.md`.
 - Read a shared NVFP4 base in its Marlin layout (`marlin_fp4_to_bf16`), so an OPD student can borrow the serving engine's frozen NVFP4 weights instead of holding a second copy (9 GB/rank vs FP8). Bit-exact against the group layout on sm_90; see `docs/experience/wins/2026-08-22-marlin-nvfp4-base-share-parity.md`.
 - **OPD recompute chunk derives from the rank sequence — accepted.** Was a 4096
   constant. `chunk * rank_seq <= 2^30`, capped 16,384; `--opd-seq-chunk`
