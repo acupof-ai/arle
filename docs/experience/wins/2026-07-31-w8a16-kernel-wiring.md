@@ -12,12 +12,12 @@ Adding "a mainstream quant kernel" looked like a from-scratch job. It wasn't. An
 audit of the tree showed the W8A16 path (per-group signed INT8 weights, BF16
 activations — the Marlin/Machete weight-only shape) was ~90% built and dark:
 
-- ✅ CUDA `w8a16_gemv_cuda` / `w8a16_gemv_batch_cuda` (1 byte/weight, per-group
+- CUDA `w8a16_gemv_cuda` / `w8a16_gemv_batch_cuda` (1 byte/weight, per-group
   BF16 scale, dequant folded into the GEMV inner loop)
-- ✅ `WeightFormat::W8A16` enum + `validate_shape` + `WeightKernelAlignment` +
+- `WeightFormat::W8A16` enum + `validate_shape` + `WeightKernelAlignment` +
   Display, all present
-- ✅ `DeviceMatrix::from_quantized_int8(...)`, complete
-- ✅ FFI decls
+- `DeviceMatrix::from_quantized_int8(...)`, complete
+- FFI decls
 
 What was missing: nothing knew how to *recognize* a W8A16 checkpoint or *route*
 to the kernel. Zero call-sites. The kernel had been written and never connected.
