@@ -22,7 +22,10 @@ Four code paths serve quantized-KV decode today:
 | `decode_attention_quantized.cu` | 970 | KIVI per-channel K | Qwen3 dense (`attention.rs:816`) |
 | FA3 quant shim (`arle_fa3_shim.cu`, dequant temp) | — | per-token | prefill rows, workspace overflow |
 
-## Phase 1 — tensor-core partial kernel, the only decode path
+## Phase 1 — tensor-core partial kernel, the only decode path — CLOSED
+
+Landed `97d28ba2c`; c=16 +33 %, c=32 +34 %, kernel 2.7–3.9×, B=32 now 4× off
+the floor ([entry](../experience/wins/2026-08-22-paged-attention-quantized-tensor-core.md)).
 
 - Rewrite the partial kernel: one CTA per (batch row, kv-head, split); the
   kv-head's q-heads (6 on Qwen3.8, 8 on Qwen3.6, 4 on Qwen3 dense) padded to
