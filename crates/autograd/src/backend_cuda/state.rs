@@ -28,6 +28,7 @@ impl CudaBackend {
                 blas: Arc::new(blas),
                 kernels,
                 pinned_checkpoints: Mutex::default(),
+                dequant_cache: Mutex::default(),
                 #[cfg(all(feature = "nccl", not(feature = "no-cuda")))]
                 nccl: None,
                 #[cfg(all(feature = "nccl", not(feature = "no-cuda")))]

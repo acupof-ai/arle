@@ -325,7 +325,7 @@ impl CudaBackend {
     /// launch; GEMMs then ride the tensor-core cuBLAS BF16 path instead of the
     /// naive per-output-element FP8 kernel this replaced (~290× on 27B OPD).
     #[cfg(not(feature = "no-cuda"))]
-    pub(super) fn fp8_block_scaled_as_bf16(
+    fn fp8_block_scaled_to_bf16(
         &self,
         storage: &CudaFp8BlockScaledStorage,
     ) -> Result<(CudaSlice<u16>, Vec<usize>)> {
@@ -380,7 +380,7 @@ impl CudaBackend {
     /// always rides cuBLAS BF16. Keeping the base at 4 bits is what buys the
     /// memory (15.2 GB against 54 GB for a 27B base).
     #[cfg(not(feature = "no-cuda"))]
-    pub(super) fn fp4_e2m1_group_as_bf16(
+    fn fp4_e2m1_group_to_bf16(
         &self,
         storage: &CudaFp4E2M1GroupStorage,
     ) -> Result<(CudaSlice<u16>, Vec<usize>)> {
@@ -422,6 +422,53 @@ impl CudaBackend {
             },
         )?;
         Ok((out, vec![rows, cols]))
+    }
+
+    /// Frozen weights only: a chunked backward re-requests the same weight once
+    /// per chunk, so one cached entry replaces 16 full dequants at rank seq
+    /// 65,536. Holds at most one weight (<= 180 MiB for the widest projection).
+    #[cfg(not(feature = "no-cuda"))]
+    fn cached_dequant<F>(&self, key: usize, build: F) -> Result<(Arc<CudaSlice<u16>>, Vec<usize>)>
+    where
+        F: FnOnce() -> Result<(CudaSlice<u16>, Vec<usize>)>,
+    {
+        let mut slot = self
+            .dequant_cache
+            .lock()
+            .map_err(|_| AutogradError::TapeInvariant("dequant cache poisoned"))?;
+        if let Some(entry) = slot.as_ref()
+            && entry.key == key
+        {
+            return Ok((entry.bf16.clone(), entry.shape.clone()));
+        }
+        let (bf16, shape) = build()?;
+        let bf16 = Arc::new(bf16);
+        *slot = Some(DequantCacheEntry {
+            key,
+            bf16: bf16.clone(),
+            shape: shape.clone(),
+        });
+        Ok((bf16, shape))
+    }
+
+    #[cfg(not(feature = "no-cuda"))]
+    pub(super) fn fp8_block_scaled_as_bf16(
+        &self,
+        storage: &CudaFp8BlockScaledStorage,
+    ) -> Result<(Arc<CudaSlice<u16>>, Vec<usize>)> {
+        self.cached_dequant(storage.weight_key(), || {
+            self.fp8_block_scaled_to_bf16(storage)
+        })
+    }
+
+    #[cfg(not(feature = "no-cuda"))]
+    pub(super) fn fp4_e2m1_group_as_bf16(
+        &self,
+        storage: &CudaFp4E2M1GroupStorage,
+    ) -> Result<(Arc<CudaSlice<u16>>, Vec<usize>)> {
+        self.cached_dequant(storage.weight_key(), || {
+            self.fp4_e2m1_group_to_bf16(storage)
+        })
     }
 
     #[cfg(not(feature = "no-cuda"))]
