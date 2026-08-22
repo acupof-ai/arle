@@ -461,3 +461,226 @@ pub(crate) fn plan_mode(prefill_empty: bool, decode_empty: bool) -> ForwardMode 
         (false, false) => ForwardMode::Mixed,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    //! Host-only planner gates: the admission/preempt/park repair is the most
+    //! livelock-prone code in the runtime (2026-07-05 TP=4 hang, pod round-5
+    //! park ping-pong), and previously had no fast local guard.
+
+    use super::*;
+    use crate::{
+        Engine, RequestHandle, RequestPhase, RequestPriority, RequestState, SchedulerConfig,
+    };
+    use infer_plan::SamplingParams;
+    use infer_seam::{
+        BackendExecutor, HostPagedKvPool, KvAllocator, KvPool, KvQuery, KvSlotTier, PollResult,
+        StepLimits,
+    };
+
+    #[derive(Default)]
+    struct MockSlotTier {
+        demoted: Vec<(usize, u64)>,
+        refuse: bool,
+    }
+
+    impl KvSlotTier for MockSlotTier {
+        fn demote_slot(&mut self, slot: usize, key: u64) -> anyhow::Result<bool> {
+            if self.refuse {
+                return Ok(false);
+            }
+            self.demoted.push((slot, key));
+            Ok(true)
+        }
+
+        fn promote_slot(
+            &mut self,
+            _key: u64,
+            _slot: usize,
+            _slot_pages: &[u32],
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn drop_kv_slot_entries(&mut self, _keys: &[u64]) {}
+    }
+
+    struct MockExecutor {
+        slot_tier: Option<MockSlotTier>,
+    }
+
+    impl BackendExecutor for MockExecutor {
+        type Inflight = ();
+
+        fn submit(&mut self, _plan: &ForwardPlan, _kv: &mut dyn KvPool) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn poll(
+            &mut self,
+            _inflight: Self::Inflight,
+        ) -> anyhow::Result<PollResult<Self::Inflight>> {
+            unreachable!("planner tests never submit work")
+        }
+
+        fn step_limits(&self) -> StepLimits {
+            StepLimits::default()
+        }
+
+        fn kv_slot_tier(&mut self) -> Option<&mut dyn KvSlotTier> {
+            self.slot_tier.as_mut().map(|t| t as &mut dyn KvSlotTier)
+        }
+    }
+
+    /// 16 tokens/page keeps the page arithmetic below exact.
+    fn engine_with_pool(
+        pages: usize,
+        slot_tier: Option<MockSlotTier>,
+        oversubscription: bool,
+    ) -> anyhow::Result<Engine<MockExecutor, HostPagedKvPool>> {
+        let mut config = SchedulerConfig::for_slots(4);
+        config.slot_oversubscription = oversubscription;
+        Engine::with_config(
+            MockExecutor { slot_tier },
+            HostPagedKvPool::new(4, pages, 16),
+            config,
+        )
+    }
+
+    fn decoding_request(handle: u64, prompt: usize, generated: usize) -> RequestState {
+        let mut req = RequestState::new(
+            RequestHandle(handle),
+            vec![1u32; prompt],
+            RequestPriority::default(),
+            prompt + generated + 100,
+            SamplingParams::default(),
+        );
+        req.phase = RequestPhase::Decoding;
+        req.generated_tokens = vec![7u32; generated];
+        req
+    }
+
+    #[test]
+    fn fit_plan_sheds_prefill_above_capacity() -> anyhow::Result<()> {
+        let mut engine = engine_with_pool(8, None, false)?;
+        // 200-token prompt with 4 pages (64 tokens) already allocated: the
+        // remaining chunk needs 12 pages against 4 free. The repair must SHED
+        // the row, not Err — a step-loop alloc error is engine-fatal (#164).
+        let mut req = RequestState::new(
+            RequestHandle(0),
+            vec![1u32; 200],
+            RequestPriority::default(),
+            300,
+            SamplingParams::default(),
+        );
+        req.phase = RequestPhase::Prefilling { progress: 0 };
+        engine.kv.alloc(0, 64)?;
+        engine.active.insert(0, req);
+
+        let mut plan = engine.build_forward_plan();
+        assert!(!plan.prefill_rows.is_empty());
+        engine.fit_plan_to_kv_pages(&mut plan)?;
+        let capacity = engine.kv.free_pages() + engine.kv.resident_evictable_pages();
+        assert!(engine.plan_new_pages_needed(&plan) <= capacity);
+        assert!(plan.prefill_rows.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn fit_plan_preempts_decode_when_no_prefill_to_shed() -> anyhow::Result<()> {
+        let mut engine = engine_with_pool(8, None, false)?;
+        // Pool fully committed: 2 decoding slots x 4 pages, 0 free. Each decode
+        // row needs 1 more page, so demand 2 > capacity 0 with no prefill row
+        // to shed: the repair preempts the shorter-generation victim.
+        engine.kv.alloc(0, 64)?;
+        engine.kv.alloc(1, 64)?;
+        engine.active.insert(0, decoding_request(0, 48, 16));
+        engine.active.insert(1, decoding_request(1, 48, 32));
+
+        let mut plan = engine.build_forward_plan();
+        assert_eq!(plan.decode_rows.len(), 2);
+        engine.fit_plan_to_kv_pages(&mut plan)?;
+
+        assert_eq!(plan.decode_rows.len(), 1);
+        assert_eq!(plan.decode_rows[0].slot, 1);
+        assert!(engine.active.contains_key(&1));
+        assert!(!engine.active.contains_key(&0));
+        assert_eq!(engine.waiting.len(), 1);
+        assert_eq!(engine.kv_system_metrics.fallback_recompute, 1);
+        let capacity = engine.kv.free_pages() + engine.kv.resident_evictable_pages();
+        assert!(engine.plan_new_pages_needed(&plan) <= capacity);
+        Ok(())
+    }
+
+    #[test]
+    fn park_demotes_decoding_slot_and_frees_pages() -> anyhow::Result<()> {
+        let mut engine = engine_with_pool(8, Some(MockSlotTier::default()), true)?;
+        engine.kv.alloc(0, 48)?; // 3 pages, seq_len 48
+        engine.active.insert(0, decoding_request(0, 32, 16));
+
+        assert!(engine.try_park_for_oversubscription(0));
+        assert!(!engine.active.contains_key(&0));
+        assert_eq!(engine.waiting.len(), 1);
+        let parked = engine.waiting.front().expect("parked request enqueued");
+        assert_eq!(parked.swap_key, Some(0));
+        assert_eq!(parked.swap_seq_len, 48);
+        assert!(matches!(
+            parked.phase,
+            RequestPhase::Prefilling { progress: 0 }
+        ));
+        assert_eq!(engine.kv.free_pages(), 8);
+        assert!(
+            engine
+                .executor
+                .slot_tier
+                .as_ref()
+                .expect("tier present")
+                .demoted
+                .contains(&(0, 0))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn park_refuses_non_decoding_slot() -> anyhow::Result<()> {
+        let mut engine = engine_with_pool(8, Some(MockSlotTier::default()), true)?;
+        engine.kv.alloc(0, 48)?;
+        let mut req = decoding_request(0, 32, 16);
+        req.phase = RequestPhase::Prefilling { progress: 0 };
+        engine.active.insert(0, req);
+
+        assert!(!engine.try_park_for_oversubscription(0));
+        assert!(engine.active.contains_key(&0));
+        assert_eq!(engine.waiting.len(), 0);
+        assert_eq!(engine.kv.free_pages(), 5); // 8 - 3 allocated
+        Ok(())
+    }
+
+    #[test]
+    fn park_refusing_tier_keeps_slot_running() -> anyhow::Result<()> {
+        let mut engine = engine_with_pool(
+            8,
+            Some(MockSlotTier {
+                refuse: true,
+                ..MockSlotTier::default()
+            }),
+            true,
+        )?;
+        engine.kv.alloc(0, 48)?;
+        engine.active.insert(0, decoding_request(0, 32, 16));
+
+        assert!(!engine.try_park_for_oversubscription(0));
+        assert!(engine.active.contains_key(&0));
+        assert_eq!(engine.kv.free_pages(), 5);
+        assert_eq!(engine.kv_tier_stats.slot_demote_failures, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn plan_mode_arms() {
+        assert!(matches!(plan_mode(true, true), ForwardMode::Idle));
+        assert!(matches!(plan_mode(false, true), ForwardMode::Prefill));
+        assert!(matches!(plan_mode(true, false), ForwardMode::Decode));
+        assert!(matches!(plan_mode(false, false), ForwardMode::Mixed));
+    }
+}
