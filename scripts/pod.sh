@@ -88,8 +88,10 @@ case "$cmd" in
     stage="$(mktemp -d -t arle-sync-XXXXXX)"
     trap 'rm -rf "$stage"' EXIT
     head="$(git -C "$ROOT" rev-parse HEAD)"
-    dirty_digest="$(POD_TREE="$ROOT" bash "$ROOT/scripts/pod-remote-build.sh" source-digest "$ROOT")"
+    # The bundle lands in generated/ (inside the digest), so materialise it
+    # before digesting or the remote apply-sync guard sees a different tree.
     bash "$ROOT/scripts/kernel_artifacts.sh" sync || true   # source-matched AOT bundle → generated/ (no-op offline/miss)
+    dirty_digest="$(POD_TREE="$ROOT" bash "$ROOT/scripts/pod-remote-build.sh" source-digest "$ROOT")"
     tarball_files > "$stage/files"
     git -C "$ROOT" ls-files -d -z > "$stage/deletes"
     COPYFILE_DISABLE=1 tar --no-xattrs -C "$ROOT" --null -T "$stage/files" -czf "$stage/tree.tgz"
