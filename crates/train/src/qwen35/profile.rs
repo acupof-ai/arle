@@ -1,5 +1,3 @@
-//! Forward-timing records for the rollout path and the trace sinks that print them.
-
 use super::*;
 
 pub(super) fn trace_model_component(trace: bool, component: &'static str, duration: Duration) {

@@ -2,11 +2,9 @@
 //!
 //! Backs the cc-harness agentic OPD loop ([`crate::cc_harness`]): the agent
 //! edits a real repo checked out at a base commit and hidden tests are the
-//! reward signal. [`boot_workdir`] / [`diff_workdir`] / [`score_workdir`]
-//! manage the workdir lifecycle (no container — the caller is responsible for
-//! isolation if it wants any): stage a tree, diff the agent's candidate patch,
-//! apply the hidden `test_patch` + run `fail_to_pass` tests. [`run_captured`]
-//! is the fork-safe subprocess primitive both scoring and the cc spawn use.
+//! reward signal. No container — the caller is responsible for isolation if it
+//! wants any. [`run_captured`] is the fork-safe subprocess primitive both
+//! scoring and the cc spawn use.
 
 use std::fs;
 use std::path::{Path, PathBuf};

@@ -2,16 +2,16 @@
 //! (DeepSeek-V4-Flash), and parse its structured verdict. Pure host logic — no
 //! engine/GPU — so it unit-tests on CPU.
 //!
-//! The student generates on-policy rollouts; the judge (Flash) scores each against a
-//! rubric at the *text* level (vocab-agnostic, sidestepping cross-tokenizer KD);
-//! accepted rollouts are written back as the student's own training targets (RFT).
+//! The judge scores at the *text* level (vocab-agnostic, sidestepping
+//! cross-tokenizer KD); accepted rollouts become the student's own training
+//! targets (RFT).
 //!
-//! Per the 2026 rubric-reward literature (Rubrics-as-Rewards 2507.17746, step-wise
-//! rubric rewards 2605.17291): split **Factual** criteria (correctness of
-//! intermediate/final results) from **Process** criteria (valid reasoning steps) to
-//! resist reward-hacking, and require all Factual criteria for acceptance. A judge
-//! output that cannot be parsed is **never accepted and never silently bucketed**
-//! (CLAUDE.md §0 case-as-fact: a timeout/parse-fail is not a pass and not a fail-class).
+//! Per the 2026 rubric-reward literature (Rubrics-as-Rewards 2507.17746,
+//! step-wise rubric rewards 2605.17291): split **Factual** criteria from
+//! **Process** criteria to resist reward-hacking, and require all Factual
+//! criteria for acceptance. A judge output that cannot be parsed is **never
+//! accepted and never silently bucketed** (a timeout/parse-fail is not a pass
+//! and not a fail-class).
 
 use serde::{Deserialize, Serialize};
 

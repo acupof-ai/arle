@@ -1,5 +1,3 @@
-//! Input, config, and numeric-shape checks for the OPD step surface.
-
 use std::collections::HashSet;
 
 use autograd::{TensorId, TensorStore};

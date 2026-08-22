@@ -3,26 +3,19 @@
 //! (`prompt_ids`/`response_ids`/`response_mask`) for the agent-OPD masked-CE
 //! replay (`agent-opd --replay-records`). Backend-independent, no CUDA.
 //!
-//! Pipeline per attempt window — one record PER REQUEST: every dump with a
-//! token sidecar (serve-written engine tokens) yields a record whose prompt =
-//! the sidecar's prompt tokens (mask 0) and response = its gen tokens (mask 1).
-//! Token-exact by construction: both halves come from the engine, no re-render,
-//! no prefix matching. Real cc traffic compacts/rewrites history between
-//! requests, so the prefix-merge relation genuinely doesn't hold (pod: 100% of
-//! windows fell back to re-render); cf. Polar per-request traces.
+//! One record PER REQUEST with a token sidecar: prompt = sidecar prompt tokens
+//! (mask 0), response = gen tokens (mask 1). Token-exact by construction — both
+//! halves come from the engine, no re-render, no prefix matching. Real cc traffic
+//! compacts/rewrites history between requests, so the prefix-merge relation
+//! genuinely doesn't hold (pod: 100% of windows fell back to re-render).
 //!
-//! Fallback (window with NO sidecars): pick the dump with the LARGEST
-//! `messages` array (the session-final request = full conversation) → map it
-//! through the serve's own [`infer_server::messages_body_to_chat_request`] →
-//! render as ChatML with per-turn supervised byte spans
-//! ([`chat::render_structured_chatml_with_spans`]) → tokenize with byte
-//! offsets → mask = tokens overlapping an assistant turn's supervised span.
-//!
-//! Render-truth note: the serve renders through the checkpoint's own Jinja
-//! `chat_template` (`infer_server::OpenAiTokenizer::render_chat_full`), which
-//! exposes no supervision spans. For Qwen-family checkpoints that template is
-//! ChatML; the span-carrying ChatML renderer here is the same one the training
-//! stack supervises against, so replayed records match the TRAIN-side format.
+//! Fallback (window with NO sidecars): the session-final request (largest
+//! `messages` array) → the serve's `messages_body_to_chat_request` → ChatML with
+//! per-turn supervised byte spans → tokenize with byte offsets → mask = tokens
+//! overlapping an assistant turn's supervised span. The serve's own Jinja
+//! renderer exposes no spans; for Qwen checkpoints it is ChatML anyway, and the
+//! span-carrying renderer here is the same one the training stack supervises
+//! against, so replayed records match the TRAIN-side format.
 
 use std::fs;
 use std::ops::Range;

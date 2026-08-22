@@ -1,5 +1,3 @@
-//! Dense and sparse MLP forward, plus MoE route build, signature validation, and grouped experts.
-
 use super::*;
 
 impl Qwen35Layer {

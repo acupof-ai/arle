@@ -1,10 +1,7 @@
-//! Teacher-forward abstraction for OPD.
-//!
-//! Phase 2 of the large-to-small OPD path needs two teacher sources behind
-//! the same train-side contract: the in-process `Qwen35Model` teacher and an
-//! `infer` runtime teacher. `DeviceLogits` intentionally carries
-//! a `TensorId` in the caller's `TensorStore` so the KL path can stay on the
-//! same backend without a host materialization.
+//! Two teacher sources behind one train-side contract: the in-process
+//! `Qwen35Model` teacher and an `infer` runtime teacher. `DeviceLogits`
+//! intentionally carries a `TensorId` in the caller's `TensorStore` so the KL
+//! path can stay on the same backend without a host materialization.
 
 #[cfg(feature = "cuda")]
 use std::sync::Arc;
@@ -91,7 +88,6 @@ pub trait TeacherForward {
         ))
     }
 
-    /// Compute logits for a window from cached hidden states.
     fn logits_from_hidden_window_device(
         &self,
         _hidden: TensorId,
@@ -182,7 +178,6 @@ impl ApiTeacher {
             .unwrap_or_default()
     }
 
-    /// POST tokens/positions, return raw bf16-LE logits bytes + `[rows, cols]`.
     /// Body is `application/octet-stream` (~1 GB) — base64+JSON dominated the step.
     fn post_logits(&self, input_ids: &[u32], positions: &[u32]) -> Result<(Vec<u8>, [usize; 2])> {
         let body = ApiTeacherRequest {

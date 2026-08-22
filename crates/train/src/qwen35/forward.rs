@@ -1,5 +1,3 @@
-//! The taped training forward and its public entry points.
-
 use super::*;
 
 impl Qwen35Model {

@@ -1,5 +1,3 @@
-//! Student rollout generation: greedy/sampled decode, device argmax, and the step's rollout phase.
-
 use std::{collections::HashSet, sync::LazyLock, time::Instant};
 
 use autograd::{AutogradError, Device, Tape, TensorId, TensorStore};

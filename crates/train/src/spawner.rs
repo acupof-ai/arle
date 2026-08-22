@@ -1,35 +1,24 @@
 //! Pre-CUDA "sandbox-spawner": a long-lived non-CUDA helper process that owns
 //! ALL sandbox subprocess spawns on behalf of the agent-OPD rollout.
 //!
-//! ## Why this exists
-//! The 8×H20 pod runs an ELKEID kernel HIDS hook that SIGKILLs arle when a
+//! Why: the 8×H20 pod runs an ELKEID kernel HIDS hook that SIGKILLs arle when a
 //! `setsid()` syscall is issued by a process whose ancestor chain contains a
-//! CUDA-resident process. Once the agent-OPD process loads the rollout engine /
-//! autograd CUDA backend it is CUDA-resident, so any subprocess that calls
-//! `setsid()` triggers ELKEID to kill the CUDA-resident ancestor (arle).
+//! CUDA-resident process. Once agent-OPD loads the CUDA backend it is
+//! CUDA-resident, so any `setsid()`-calling subprocess gets arle killed.
 //!
-//! ## The fix (two layers)
-//! **Layer 1 — route forks through a pre-CUDA helper:** Fork ONE helper BEFORE
-//! any CUDA init. The helper is a plain non-CUDA process; its forks are not
-//! direct children of a CUDA-resident process, which dodges the most common
-//! ELKEID trigger.
+//! Fix, two layers:
+//! 1. Fork ONE helper BEFORE any CUDA init. Its forks are not children of a
+//!    CUDA-resident process, dodging the common ELKEID trigger.
+//! 2. The helper avoids `setsid()` itself: spawn with `process_group(0)`
+//!    (`setpgid`, not `setsid`) and tear down with `libc::kill(-pgid, SIGKILL)`
+//!    (no external `kill` fork). ELKEID traces the forked process's ancestor
+//!    chain, so a helper-spawned `setsid` would still find arle.
 //!
-//! **Layer 2 — avoid `setsid()` and external `kill` in the helper:** The
-//! original helper called `Command::new("setsid").arg(program)` for bash-tool
-//! commands; `setsid` calls the `setsid()` syscall, which ELKEID hooks. Even
-//! though the helper is not itself CUDA-resident, ELKEID traces the ancestor
-//! chain of the forked `setsid` process, finds arle, and kills it.
-//! Fix: spawn the program directly with `process_group(0)` (uses `setpgid`, not
-//! `setsid`). Use `libc::kill(-pgid, SIGKILL)` for group teardown (no extra
-//! fork of an external `kill` binary).
-//!
-//! ## Wiring
-//! - The helper is the same `arle` binary re-exec'd with `ARLE_SPAWNER_LISTEN=<sock>`;
-//!   [`serve_loop`] runs the request/response loop and never returns.
-//! - The agent-OPD parent calls [`SpawnerHandle::launch`] before CUDA init, which
-//!   sets `ARLE_SPAWNER_SOCKET=<sock>` so [`crate::sandbox`] routes through
-//!   [`SpawnClient`]. When the env is unset (normal serve/CLI) sandbox.rs spawns
-//!   directly — byte-identical default.
+//! Wiring: the helper is the same `arle` binary re-exec'd with
+//! `ARLE_SPAWNER_LISTEN=<sock>`; [`SpawnerHandle::launch`] runs before CUDA init
+//! and sets `ARLE_SPAWNER_SOCKET=<sock>` so [`crate::sandbox`] routes through
+//! [`SpawnClient`]. When the env is unset, sandbox.rs spawns directly —
+//! byte-identical default.
 //!
 //! Protocol: length-prefixed (u32-LE) JSON. One request, one response, serial.
 
@@ -47,8 +36,6 @@ pub const LISTEN_ENV: &str = "ARLE_SPAWNER_LISTEN";
 pub const SOCKET_ENV: &str = "ARLE_SPAWNER_SOCKET";
 
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
-
-/// Serializes tests that mutate the spawner env vars (parallel tests race).
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SpawnRequest {
@@ -289,7 +276,7 @@ impl SpawnerHandle {
             .spawn()
             .map_err(|e| anyhow::anyhow!("spawn sandbox-spawner helper: {e}"))?;
 
-        // Wait for the helper to bind its socket (sub-second; budget for startup).
+        // Wait for the helper to bind its socket.
         let deadline = Instant::now() + Duration::from_secs(10);
         while !socket.exists() {
             if Instant::now() >= deadline {
@@ -300,7 +287,6 @@ impl SpawnerHandle {
             }
             std::thread::sleep(Duration::from_millis(20));
         }
-        // Route this process's sandbox spawns through the helper.
         // SAFETY: single-threaded before CUDA init and rollout threads.
         unsafe {
             std::env::set_var(SOCKET_ENV, &socket);

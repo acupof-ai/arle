@@ -1,6 +1,4 @@
-//! OPD runtime toggles: `arle train … --flag` → [`apply_runtime_flags`] once
-//! at CLI start (also forwards the autograd knobs). The statics are the single
-//! truth — no env reads.
+//! Train flags -> statics, applied once at CLI start; no env reads.
 
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering::Relaxed};
 
@@ -65,7 +63,7 @@ pub(crate) fn writeback_offload() -> bool {
     WRITEBACK_OFFLOAD.load(Relaxed)
 }
 
-/// Offload only where resident checkpoints no longer fit (seq >= 16384).
+/// Offload only where resident checkpoints no longer fit.
 pub(crate) fn writeback_offload_for_seq(seq_len: usize) -> bool {
     const WRITEBACK_OFFLOAD_MIN_SEQ: usize = 16384;
     writeback_offload() && seq_len >= WRITEBACK_OFFLOAD_MIN_SEQ

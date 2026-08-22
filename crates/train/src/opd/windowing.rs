@@ -1,5 +1,3 @@
-//! Sequence-window and KL-position-range slicing shared by the OPD backward routes.
-
 use autograd::{Tape, TensorId, TensorStore, ops::slice};
 
 use crate::qwen35::SequenceWindow;

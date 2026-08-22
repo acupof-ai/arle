@@ -1,5 +1,3 @@
-//! Whether to gradient-checkpoint, the checkpointed layer stack, and the measured-peak report.
-
 use super::*;
 
 /// The one config→params mapping — every linear-attention call site and the

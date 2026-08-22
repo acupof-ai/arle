@@ -1,5 +1,3 @@
-//! The OPD step driver: validation, rollout, step-body selection, backward, optimizer step.
-
 use std::{collections::HashSet, time::Instant};
 
 use autograd::{Tape, TensorId, TensorStore, optim::Optimizer};
@@ -227,7 +225,6 @@ fn windowed_gkd_step<O: Optimizer, T: TeacherForward + ?Sized>(
     });
     log_opd_step_trace(rt.total_started, "optimizer_step_done", "");
 
-    // Re-acquire the KV pool for the next rollout.
     #[cfg(feature = "cuda")]
     if kv_pool_released
         && let Some(ctx) = rt.infer_rollout
@@ -336,8 +333,6 @@ fn chunked_kl_step<O: Optimizer, T: TeacherForward + ?Sized>(
     })
 }
 
-/// Participants, step inputs and objective config for one OPD step. Optional
-/// fields carry their defaults from `new`; override them with the setters.
 pub struct OpdStepInputs<'a, T: TeacherForward + ?Sized> {
     pub student: &'a Qwen35Model,
     pub teacher: &'a T,

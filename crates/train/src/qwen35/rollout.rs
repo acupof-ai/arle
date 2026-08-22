@@ -1,5 +1,3 @@
-//! Drive one cached decode step: host-token and device-token entry points and their free-function wrappers.
-
 use super::*;
 
 #[doc(hidden)]

@@ -1,5 +1,3 @@
-//! The rollout KV cache: layout, append, row selection, and the decode-only SDPA kernels that read it.
-
 use super::*;
 
 impl Qwen35KvCache {

@@ -1,13 +1,10 @@
-//! ARLE runtime-led post-training substrate (2026-05-18 OPD-only pivot): one
-//! surface — teacher via `infer-api`, student LoRA, rollout→score→LoRA-backward.
-//! Two objective families ride it:
+//! ARLE post-training substrate: teacher via `infer-api`, student LoRA,
+//! rollout→score→LoRA-backward. Two objective families ride it:
 //! - **OPD** (`opd`, `self-opd`): teacher / EMA-self-teacher KL distill.
-//! - **RFT** (`agent-opd`, `rubric-opd`): execution- or rubric-reward selects
-//!   trajectories, trained by masked CE — no teacher, no KL. The `opd` in these
-//!   names is the shared substrate, not the objective.
+//! - **RFT** (`agent-opd`, `rubric-opd`): reward-selected trajectories, masked CE.
 //!
-//! "OPD-only" is the positioning (vs the retired pretrain/SFT/GRPO/multi-turn),
-//! not a claim every subcommand is KL distillation.
+//! The `opd` in every subcommand name is the shared substrate, not the objective
+//! (the 2026-05-18 pivot retired pretrain/SFT/GRPO/multi-turn).
 
 #[path = "aopd_profile.rs"]
 pub mod aopd_profile;
