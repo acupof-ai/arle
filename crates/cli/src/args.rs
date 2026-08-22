@@ -894,6 +894,12 @@ pub(crate) struct ServeArgs {
     #[arg(long, value_name = "N")]
     pub(crate) deepep_max_dispatch_tokens_per_rank: Option<u32>,
 
+    /// DSv4 MoE transport: `allreduce` (default), `deepep`, `deepep_ll`,
+    /// `mega_moe`. Unset = `ARLE_DSV4_MOE_TRANSPORT` env or allreduce. The
+    /// `--deepep-*` flags take effect only under a deepep transport.
+    #[arg(long, value_name = "NAME")]
+    pub(crate) dsv4_moe_transport: Option<String>,
+
     /// Load-time JIT warmup forward. Off by default — the first request pays
     /// the JIT + embed dequant cost, which is faster overall for cold-start
     /// scenarios. Serving deployments should opt in.
@@ -939,6 +945,7 @@ impl ServeArgs {
             dspark_confidence_threshold: self.dspark_confidence_threshold,
             deepep_num_sms: self.deepep_num_sms,
             deepep_max_dispatch_tokens_per_rank: self.deepep_max_dispatch_tokens_per_rank,
+            dsv4_moe_transport: self.dsv4_moe_transport.clone(),
         }
     }
 

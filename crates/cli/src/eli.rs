@@ -380,10 +380,7 @@ pub(crate) fn launch_eli(model: &str, mode: EliMode, backend: &str) -> Result<()
         });
     }
 
-    let served_id = match wait_for_serve(&mut guard, &interrupted) {
-        Ok(id) => id,
-        Err(e) => return Err(e),
-    };
+    let served_id = wait_for_serve(&mut guard, &interrupted)?;
 
     eprintln!(
         "  {} model `{}` via Eli ({})",

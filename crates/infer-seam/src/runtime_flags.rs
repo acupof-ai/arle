@@ -97,6 +97,10 @@ pub struct CudaRuntimeFlags {
     /// DeepEP LL per-rank dispatch-token cap (None = SGLANG env or 256).
     #[serde(default)]
     pub deepep_max_dispatch_tokens_per_rank: Option<u32>,
+    /// DSv4 MoE transport override (`allreduce`|`deepep`|`deepep_ll`|`mega_moe`);
+    /// None = `ARLE_DSV4_MOE_TRANSPORT` env or allreduce.
+    #[serde(default)]
+    pub dsv4_moe_transport: Option<String>,
 }
 
 impl Default for CudaRuntimeFlags {
@@ -120,6 +124,7 @@ impl Default for CudaRuntimeFlags {
             dspark_confidence_threshold: None,
             deepep_num_sms: d_deepep_num_sms(),
             deepep_max_dispatch_tokens_per_rank: None,
+            dsv4_moe_transport: None,
         }
     }
 }
