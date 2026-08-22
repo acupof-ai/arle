@@ -246,6 +246,31 @@ impl DeviceMatrix {
         ))
     }
 
+    /// Device pointers of a Marlin-repacked NVFP4 weight, for the train-infer
+    /// sharing path. Returns `(packed_ptr, scale_tail_ptr, folded_global, rows,
+    /// cols)`; the S0E5M3 scale tail lives in the tail of the packed
+    /// allocation, and `folded_global` is the repack's bf16 global read back to
+    /// host (one 2-byte D2H, called once per weight at export).
+    pub fn marlin_fp4_ptrs(&self, ctx: &DeviceContext) -> Option<(u64, u64, f32, usize, usize)> {
+        use cudarc::driver::DevicePtr;
+        if self.weight_format != WeightFormat::Fp4E2M1Group {
+            return None;
+        }
+        let packed = self.marlin_packed.as_ref()?;
+        let global = self.marlin_scales.as_ref()?;
+        let (wptr, _wsync) = packed.device_ptr(&ctx.stream);
+        let bits = ctx.stream.clone_dtoh(global).ok()?;
+        ctx.sync().ok()?;
+        let folded = f32::from_bits(u32::from(*bits.first()?) << 16);
+        Some((
+            wptr,
+            wptr + (self.rows * self.cols / 2) as u64,
+            folded,
+            self.rows,
+            self.cols,
+        ))
+    }
+
     /// Copy the dense BF16 `data` buffer to host as f32 (for testing/training).
     ///
     /// Mirrors [`DeviceVec::to_host`]; only reads the dense `data` field, not

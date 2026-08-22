@@ -101,8 +101,9 @@ pub use infer_server::{
 // so consumers see them at the `infer-api` surface.
 #[cfg(feature = "cuda")]
 pub use infer_cuda::{
-    SharedFp8BaseProjection, StudentLoraLayer, StudentLoraMatrices, StudentLoraProjection,
-    StudentLoraProjectionUpdate, StudentLoraUpdate, set_qwen35_moe_experts_bf16_resident,
+    SharedFp4BaseProjection, SharedFp8BaseProjection, StudentLoraLayer, StudentLoraMatrices,
+    StudentLoraProjection, StudentLoraProjectionUpdate, StudentLoraUpdate,
+    set_qwen35_moe_experts_bf16_resident,
 };
 /// Rank-0 NCCL `unique_id` mint for the multiproc-serve coordinator.
 #[cfg(feature = "nccl")]

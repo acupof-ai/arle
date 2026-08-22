@@ -99,16 +99,45 @@ pub(super) fn maybe_preoffload_infer_student_before_teacher(
     Ok(())
 }
 
-/// Borrow the rollout engine's resident FP8 base pointers for
+/// Borrow the rollout engine's resident quantized base pointers for
 /// `--share-frozen-base` and map them onto the loader's backend-agnostic table,
-/// so the autograd student's frozen FP8 base projections import a NON-OWNING
-/// view instead of allocating their own ~27 GB copy.
+/// so the autograd student's frozen base projections import a NON-OWNING view
+/// instead of allocating their own copy.
+///
+/// NVFP4 is probed first: its collector returns an empty table for a non-NVFP4
+/// base, while the FP8 one errors out on a Marlin-repacked weight.
 #[cfg(feature = "cuda")]
 pub(super) fn shared_frozen_base_entries(
     engine: &infer_api::LoadedInferenceEngine,
     label: &str,
 ) -> Result<Vec<train::qwen35_loader::SharedFrozenBaseEntry>> {
-    use train::qwen35_loader::SharedFrozenBaseEntry;
+    use train::qwen35_loader::{SharedFrozenBaseEntry, SharedFrozenBaseFormat};
+
+    let fp4 = engine
+        .frozen_base_fp4_pointers()
+        .context("borrow rollout-engine NVFP4 base pointers for --share-frozen-base")?;
+    if !fp4.is_empty() {
+        eprintln!(
+            "[arle train {label}] --share-frozen-base: borrowing {} resident NVFP4 base projections from the rollout engine (zero-copy, marlin layout)",
+            fp4.len()
+        );
+        return Ok(fp4
+            .into_iter()
+            .map(|p| SharedFrozenBaseEntry {
+                layer_idx: p.layer_idx,
+                proj_suffix: p.proj_suffix,
+                weight_ptr: p.weight_ptr,
+                rows: p.rows,
+                cols: p.cols,
+                format: SharedFrozenBaseFormat::Fp4Marlin {
+                    scale_tail_ptr: p.scale_tail_ptr,
+                    global_scale: p.global_scale,
+                    full_rows: p.full_rows,
+                    row_offset: p.row_offset,
+                },
+            })
+            .collect());
+    }
 
     let table = engine
         .frozen_base_fp8_pointers()
@@ -123,11 +152,13 @@ pub(super) fn shared_frozen_base_entries(
             layer_idx: p.layer_idx,
             proj_suffix: p.proj_suffix,
             weight_ptr: p.weight_ptr,
-            scale_ptr: p.scale_ptr,
             rows: p.rows,
             cols: p.cols,
-            block_m: p.block_m,
-            block_k: p.block_k,
+            format: SharedFrozenBaseFormat::Fp8 {
+                scale_ptr: p.scale_ptr,
+                block_m: p.block_m,
+                block_k: p.block_k,
+            },
         })
         .collect())
 }

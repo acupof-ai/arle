@@ -386,6 +386,12 @@ impl ServeInferenceEngine<infer_cuda::CudaExecutor, infer_cuda::CudaKvPool> {
         })?
     }
 
+    /// The NVFP4 twin of [`Self::frozen_base_fp8_pointers`].
+    pub fn frozen_base_fp4_pointers(&self) -> Result<Vec<infer_cuda::SharedFp4BaseProjection>> {
+        self.serve
+            .run_on_executor(|executor| executor.frozen_base_fp4_pointers())?
+    }
+
     /// Read-only borrow of resident FP8 block-scaled base projection pointers
     /// for train-infer weight sharing (`--share-frozen-base`). Runs on the
     /// engine thread via the control seam (exclusive `&mut E`) and returns the

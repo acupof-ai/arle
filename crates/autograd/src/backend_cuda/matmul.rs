@@ -440,8 +440,11 @@ impl CudaBackend {
         storage: &CudaFp4E2M1GroupStorage,
     ) -> Result<(CudaSlice<u16>, Vec<usize>)> {
         let (rows, cols) = (storage.rows(), storage.cols());
-        let words = rows * cols / 8;
-        let scale_bytes = rows * (cols / 16);
+        let (full_rows, row_offset) = storage.marlin_window();
+        // The tile walk covers the whole packed matrix; the window only decides
+        // which rows land in `out`.
+        let words = full_rows * cols / 8;
+        let scale_bytes = full_rows * (cols / 16);
         if storage.weight().len() < words * 4 || storage.scales().len() < scale_bytes {
             return Err(AutogradError::TapeInvariant(
                 "cuda backend marlin nvfp4 dequant handle size does not match shape",
@@ -457,8 +460,12 @@ impl CudaBackend {
             .map_err(|_| AutogradError::TapeInvariant("marlin nvfp4 words exceeds i32"))?;
         let k_i32 = i32::try_from(cols)
             .map_err(|_| AutogradError::TapeInvariant("marlin nvfp4 k exceeds i32"))?;
-        let n_i32 = i32::try_from(rows)
+        let n_i32 = i32::try_from(full_rows)
             .map_err(|_| AutogradError::TapeInvariant("marlin nvfp4 n exceeds i32"))?;
+        let n_lo_i32 = i32::try_from(row_offset)
+            .map_err(|_| AutogradError::TapeInvariant("marlin nvfp4 row offset exceeds i32"))?;
+        let n_hi_i32 = i32::try_from(row_offset + rows)
+            .map_err(|_| AutogradError::TapeInvariant("marlin nvfp4 row end exceeds i32"))?;
         launch_1d(
             &self.stream,
             self.kernels.function("marlin_fp4_to_bf16")?,
@@ -471,7 +478,9 @@ impl CudaBackend {
                     .arg(&mut out)
                     .arg(&words_i32)
                     .arg(&k_i32)
-                    .arg(&n_i32);
+                    .arg(&n_i32)
+                    .arg(&n_lo_i32)
+                    .arg(&n_hi_i32);
                 builder
             },
         )?;
@@ -482,7 +491,11 @@ impl CudaBackend {
     /// per chunk, so one cached entry replaces 16 full dequants at rank seq
     /// 65,536. Holds at most one weight (<= 180 MiB for the widest projection).
     #[cfg(not(feature = "no-cuda"))]
-    fn cached_dequant<F>(&self, key: usize, build: F) -> Result<(Arc<CudaSlice<u16>>, Vec<usize>)>
+    fn cached_dequant<F>(
+        &self,
+        key: (usize, usize),
+        build: F,
+    ) -> Result<(Arc<CudaSlice<u16>>, Vec<usize>)>
     where
         F: FnOnce() -> Result<(CudaSlice<u16>, Vec<usize>)>,
     {

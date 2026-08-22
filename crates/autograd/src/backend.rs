@@ -287,8 +287,8 @@ impl CudaFp8BlockScaledStorage {
     }
 
     /// Identity of the backing weight buffer, for the backend's dequant cache.
-    pub(crate) fn weight_key(&self) -> usize {
-        Arc::as_ptr(&self.weight) as usize
+    pub(crate) fn weight_key(&self) -> (usize, usize) {
+        (Arc::as_ptr(&self.weight) as usize, 0)
     }
 
     pub(crate) fn scales(&self) -> &cudarc::driver::CudaSlice<f32> {
@@ -338,6 +338,11 @@ pub struct CudaFp4E2M1GroupStorage {
     /// releases the group bytes, which a shared frozen base has to read as-is.
     /// `global_scale` then holds the repack's bf16 value (2^119 bias folded in).
     marlin: bool,
+    /// The Marlin tile walk is in full-N coordinates, so a view of a fused
+    /// matrix's row slice (q out of qkv) needs the full N and its offset;
+    /// `rows` stays the slice's own height. `(cols, 0)` for a whole matrix.
+    marlin_full_rows: usize,
+    marlin_row_offset: usize,
     /// Same foreign-view semantics as `CudaFp8BlockScaledStorage::borrowed`.
     borrowed: bool,
 }
@@ -381,6 +386,8 @@ impl CudaFp4E2M1GroupStorage {
             group_size,
             scale_cols,
             marlin: false,
+            marlin_full_rows: rows,
+            marlin_row_offset: 0,
             borrowed: false,
         }
     }
@@ -391,6 +398,8 @@ impl CudaFp4E2M1GroupStorage {
         weight: cudarc::driver::CudaSlice<u8>,
         scales: cudarc::driver::CudaSlice<u8>,
         global_scale: f32,
+        full_rows: usize,
+        row_offset: usize,
         rows: usize,
         cols: usize,
     ) -> Self {
@@ -404,12 +413,19 @@ impl CudaFp4E2M1GroupStorage {
             group_size: 16,
             scale_cols: cols / 16,
             marlin: true,
+            marlin_full_rows: full_rows,
+            marlin_row_offset: row_offset,
             borrowed: true,
         }
     }
 
     pub(crate) fn marlin_global(&self) -> f32 {
         self.marlin_global
+    }
+
+    /// `(full_rows, row_offset)` of the Marlin tile walk backing this view.
+    pub(crate) fn marlin_window(&self) -> (usize, usize) {
+        (self.marlin_full_rows, self.marlin_row_offset)
     }
 
     pub(crate) fn is_marlin(&self) -> bool {
@@ -420,9 +436,11 @@ impl CudaFp4E2M1GroupStorage {
         self.weight.as_ref()
     }
 
-    /// Identity of the backing weight buffer, for the backend's dequant cache.
-    pub(crate) fn weight_key(&self) -> usize {
-        Arc::as_ptr(&self.weight) as usize
+    /// Identity of what this view dequantizes, for the backend's dequant cache.
+    /// The row offset is part of it: q/k/v are three windows over ONE fused
+    /// Marlin buffer, so the pointer alone would alias them into each other.
+    pub(crate) fn weight_key(&self) -> (usize, usize) {
+        (Arc::as_ptr(&self.weight) as usize, self.marlin_row_offset)
     }
 
     pub(crate) fn scales(&self) -> &cudarc::driver::CudaSlice<u8> {
@@ -844,18 +862,22 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
     /// Import a NON-OWNING view of a serving engine's NVFP4 base that already
     /// carries the Marlin layout. `global_scale` is the repack's folded value
     /// (2^119 bias and scale_factor divisor included), read as an f32.
+    /// `shape` is the view's own `[rows, cols]`; `window` is
+    /// `(full_rows, row_offset)` of the packed buffer it slices.
     fn import_fp4_marlin_device_ptr(
         &self,
         weight_device_ptr: u64,
         scale_tail_device_ptr: u64,
         global_scale: f32,
         shape: &[usize],
+        window: (usize, usize),
     ) -> Result<DeviceHandle> {
         let _ = (
             weight_device_ptr,
             scale_tail_device_ptr,
             global_scale,
             shape,
+            window,
         );
         Err(crate::AutogradError::TapeInvariant(
             "backend does not support importing marlin nvfp4 device pointers",

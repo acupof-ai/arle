@@ -93,10 +93,12 @@ extern "C" __global__ void marlin_fp4_to_bf16(
     const unsigned int* __restrict__ marlin,   // [k*n/8] u32, then the scale tail
     const unsigned char* __restrict__ scales,  // [k/16 * n] S0E5M3 bytes
     float global_scale,                        // bf16-rounded, includes 2^119
-    unsigned short* __restrict__ out,          // [n, k] BF16 bits
+    unsigned short* __restrict__ out,          // [n_hi - n_lo, k] BF16 bits
     int words,                                 // k*n/8
     int size_k,
-    int size_n)
+    int size_n,
+    int n_lo,                                  // output-row window, in full-N
+    int n_hi)                                  // coords; the tile walk is global
 {
     const int w_idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (w_idx >= words) return;
@@ -143,9 +145,11 @@ extern "C" __global__ void marlin_fp4_to_bf16(
             * 0.0078125f;
         const float value = ARLE_FP4_E2M1_LUT[(packed >> (i * 4)) & 0xfu] * s * gscale;
 
+        if (n < n_lo || n >= n_hi) continue;
+
         const unsigned int bits = __float_as_uint(value);
         const unsigned int lsb = (bits >> 16) & 1u;
-        out[static_cast<long long>(n) * size_k + k] =
+        out[static_cast<long long>(n - n_lo) * size_k + k] =
             static_cast<unsigned short>((bits + 0x7fffu + lsb) >> 16);
     }
 }

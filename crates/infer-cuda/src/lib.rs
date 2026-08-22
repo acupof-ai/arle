@@ -81,8 +81,8 @@ mod workspace;
 // the train crate pushes into the student engine; re-exported from `infer-api`.
 #[cfg(feature = "cuda")]
 pub use qwen35::{
-    SharedBf16BaseProjection, SharedFp8BaseProjection, StudentLoraLayer, StudentLoraMatrices,
-    StudentLoraProjection, StudentLoraProjectionUpdate, StudentLoraUpdate,
+    SharedBf16BaseProjection, SharedFp4BaseProjection, SharedFp8BaseProjection, StudentLoraLayer,
+    StudentLoraMatrices, StudentLoraProjection, StudentLoraProjectionUpdate, StudentLoraUpdate,
 };
 
 // Load-time decode-graph default setter (CLI `--cuda-graph` → engine). Lets the
@@ -473,6 +473,18 @@ impl CudaExecutor {
                  the no-GPU placeholder has no resident weights"
             ),
             CudaExecutorInner::Real(real) => real.remerge_student_lora(update),
+        }
+    }
+
+    /// The NVFP4 twin of [`Self::frozen_base_fp8_pointers`].
+    #[cfg(feature = "cuda")]
+    pub fn frozen_base_fp4_pointers(&self) -> anyhow::Result<Vec<qwen35::SharedFp4BaseProjection>> {
+        match &self.inner {
+            CudaExecutorInner::Placeholder => anyhow::bail!(
+                "frozen-base NVFP4 sharing requires the real CUDA executor; \
+                 the no-GPU placeholder has no resident weights"
+            ),
+            CudaExecutorInner::Real(real) => real.frozen_base_fp4_pointers(),
         }
     }
 

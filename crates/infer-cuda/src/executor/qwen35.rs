@@ -2935,6 +2935,13 @@ impl Qwen35CudaExecutor {
 
     /// Read-only borrow of resident FP8 block-scaled base projection pointers
     /// (`--share-frozen-base`); no decode-graph invalidation is needed.
+    pub(crate) fn frozen_base_fp4_pointers(
+        &self,
+    ) -> Result<Vec<crate::qwen35::SharedFp4BaseProjection>> {
+        self.ensure_not_collective("frozen_base_fp4_pointers")?;
+        self.model.frozen_base_fp4_pointers()
+    }
+
     pub(crate) fn frozen_base_fp8_pointers(
         &self,
     ) -> Result<Vec<crate::qwen35::SharedFp8BaseProjection>> {

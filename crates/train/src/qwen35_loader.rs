@@ -49,11 +49,29 @@ pub struct SharedFrozenBaseEntry {
     pub layer_idx: usize,
     pub proj_suffix: String,
     pub weight_ptr: u64,
-    pub scale_ptr: u64,
     pub rows: usize,
     pub cols: usize,
-    pub block_m: usize,
-    pub block_k: usize,
+    pub format: SharedFrozenBaseFormat,
+}
+
+/// What the borrowed bytes are, and the per-format metadata the importer needs.
+#[derive(Debug, Clone, Copy)]
+pub enum SharedFrozenBaseFormat {
+    Fp8 {
+        scale_ptr: u64,
+        block_m: usize,
+        block_k: usize,
+    },
+    /// The serving engine's Marlin repack releases the group bytes, so a shared
+    /// NVFP4 base can only be borrowed in this layout. `full_rows`/`row_offset`
+    /// describe the tile walk: it is in full-N coordinates, so a fused matrix's
+    /// row slice is a filter on the walk, not a pointer offset.
+    Fp4Marlin {
+        scale_tail_ptr: u64,
+        global_scale: f32,
+        full_rows: usize,
+        row_offset: usize,
+    },
 }
 
 impl SharedFrozenBaseEntry {
@@ -1283,20 +1301,28 @@ fn load_planned_tensor_into_slot(
         // infer engine exposes the resident FP8 base for this projection and
         // the dims match, import a NON-OWNING device view (zero-copy) instead
         // of uploading a private ~27 GB copy.
-        if let Some(entry) = shared_base.and_then(|table| {
-            table.iter().find(|e| {
-                e.matches(&planned.train_name)
+        if let Some((entry, scale_ptr)) = shared_base.and_then(|table| {
+            table.iter().find_map(|e| match e.format {
+                SharedFrozenBaseFormat::Fp8 {
+                    scale_ptr,
+                    block_m,
+                    block_k,
+                } if e.matches(&planned.train_name)
                     && e.rows == planned.expected_shape[0]
                     && e.cols == planned.expected_shape[1]
-                    && e.block_m == fp8.block_m
-                    && e.block_k == fp8.block_k
+                    && block_m == fp8.block_m
+                    && block_k == fp8.block_k =>
+                {
+                    Some((e, scale_ptr))
+                }
+                _ => None,
             })
         }) {
             let handle = store
                 .backend()
                 .import_fp8_block_scaled_device_ptr(
                     entry.weight_ptr,
-                    entry.scale_ptr,
+                    scale_ptr,
                     &planned.expected_shape,
                     fp8.block_m,
                     fp8.block_k,
@@ -1334,6 +1360,44 @@ fn load_planned_tensor_into_slot(
         return Ok(());
     }
     if let PlannedFrozenBase::Fp4(fp4) = &planned.frozen_base {
+        // Same zero-copy borrow as the FP8 arm above, in the Marlin layout the
+        // serving engine keeps after its repack.
+        if let Some((entry, scale_tail_ptr, global_scale, full_rows, row_offset)) = shared_base
+            .and_then(|table| {
+                table.iter().find_map(|e| match e.format {
+                    SharedFrozenBaseFormat::Fp4Marlin {
+                        scale_tail_ptr,
+                        global_scale,
+                        full_rows,
+                        row_offset,
+                    } if e.matches(&planned.train_name)
+                        && e.rows == planned.expected_shape[0]
+                        && e.cols == planned.expected_shape[1] =>
+                    {
+                        Some((e, scale_tail_ptr, global_scale, full_rows, row_offset))
+                    }
+                    _ => None,
+                })
+            })
+        {
+            let handle = store
+                .backend()
+                .import_fp4_marlin_device_ptr(
+                    entry.weight_ptr,
+                    scale_tail_ptr,
+                    global_scale,
+                    &planned.expected_shape,
+                    (full_rows, row_offset),
+                )
+                .map_err(LoaderError::Autograd)?;
+            store
+                .replace_device_handle(planned.id, handle)
+                .map_err(LoaderError::Autograd)?;
+            store
+                .set_requires_grad(planned.id, false)
+                .map_err(LoaderError::Autograd)?;
+            return Ok(());
+        }
         let scale_view = safetensors_views[fp4.scale_shard_idx]
             .tensor(&fp4.scale_name)
             .map_err(|err| LoaderError::Safetensors(format!("{}: {err}", fp4.scale_name)))?;

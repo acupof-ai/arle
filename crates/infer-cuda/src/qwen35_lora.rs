@@ -129,6 +129,25 @@ pub struct SharedFp8BaseProjection {
     pub block_k: usize,
 }
 
+/// Resident NVFP4 device pointers in the Marlin layout, the FP4 twin of
+/// [`SharedFp8BaseProjection`]. The repack frees the group bytes, so this is
+/// the only form a shared NVFP4 base can be borrowed in. `full_rows` is the
+/// packed matrix's own N: the Marlin tile walk is in full-N coordinates, so a
+/// fused matrix's row slice is a filter on that walk rather than a pointer
+/// offset, and the importer needs both.
+#[derive(Debug, Clone)]
+pub struct SharedFp4BaseProjection {
+    pub layer_idx: usize,
+    pub proj_suffix: String,
+    pub weight_ptr: u64,
+    pub scale_tail_ptr: u64,
+    pub global_scale: f32,
+    pub full_rows: usize,
+    pub row_offset: usize,
+    pub rows: usize,
+    pub cols: usize,
+}
+
 /// Non-owning view of a resident dense-BF16 base projection's device pointer,
 /// for refreshing the train student's frozen base AFTER a LoRA re-merge (the
 /// merged weights live in the BF16 `data` buffer; the retired FP8 buffers are
@@ -149,6 +168,53 @@ pub(crate) struct LoraBaseKey {
 }
 
 impl Qwen35Model {
+    /// Walk every per-matrix base projection once — dense attention, dense MLP,
+    /// the MoE shared expert, and the per-expert `DeviceMatrix` vecs — handing
+    /// each to `f` as `(layer_idx, suffix, matrix, row_offset, sub_rows)`. The
+    /// row window is the fused-matrix slice (q out of qkv); it is `(0, rows)`
+    /// for anything unfused. The three `frozen_base_*_pointers` collectors
+    /// differ only in what they do per matrix.
+    fn for_each_base_projection<F>(&self, mut f: F) -> Result<()>
+    where
+        F: FnMut(usize, String, &DeviceMatrix, usize, usize) -> Result<()>,
+    {
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            let dense: &[StudentLoraProjection] = match &layer.attn {
+                Qwen35Attn::Full(_) => &[FullQ, FullK, FullV, FullO],
+                Qwen35Attn::Linear(_) => &[LinearQkv, LinearZ, LinearB, LinearA, LinearOut],
+            };
+            let windowed = |projections: &[StudentLoraProjection], f: &mut F| -> Result<()> {
+                for &proj in projections {
+                    let m = self.lora_matrix(layer_idx, proj)?;
+                    let (off, n) = self.lora_row_window(layer_idx, proj, m.rows);
+                    f(layer_idx, proj.label().into_owned(), m, off, n)?;
+                }
+                Ok(())
+            };
+            windowed(dense, &mut f)?;
+            if layer.mlp.is_some() {
+                windowed(&[MlpGate, MlpUp, MlpDown], &mut f)?;
+            }
+            if let Some(moe) = &layer.moe {
+                for &proj in &[MoeSharedGate, MoeSharedUp, MoeSharedDown] {
+                    let m = self.lora_matrix(layer_idx, proj)?;
+                    f(layer_idx, proj.label().into_owned(), m, 0, m.rows)?;
+                }
+                for e in 0..moe.gate.len() {
+                    for &proj in &[
+                        MoeExpertGate { expert_idx: e },
+                        MoeExpertUp { expert_idx: e },
+                        MoeExpertDown { expert_idx: e },
+                    ] {
+                        let m = self.lora_matrix(layer_idx, proj)?;
+                        f(layer_idx, proj.label().into_owned(), m, 0, m.rows)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Read-only borrow of every resident FP8 block-scaled base projection's
     /// device pointers, for train-infer weight sharing (`--share-frozen-base`).
     ///
@@ -212,72 +278,14 @@ impl Qwen35Model {
             Ok(())
         }
         let mut out = Vec::new();
+        self.for_each_base_projection(|layer_idx, suffix, m, off, n| {
+            push_row_slice(&mut out, ctx, layer_idx, suffix, m, off, n)
+        })?;
         for (layer_idx, layer) in self.layers.iter().enumerate() {
-            let dense: &[StudentLoraProjection] = match &layer.attn {
-                Qwen35Attn::Full(_) => &[FullQ, FullK, FullV, FullO],
-                Qwen35Attn::Linear(_) => &[LinearQkv, LinearZ, LinearB, LinearA, LinearOut],
-            };
-            for &proj in dense {
-                let m = self.lora_matrix(layer_idx, proj)?;
-                let (off, n) = self.lora_row_window(layer_idx, proj, m.rows);
-                push_row_slice(
-                    &mut out,
-                    ctx,
-                    layer_idx,
-                    proj.label().into_owned(),
-                    m,
-                    off,
-                    n,
-                )?;
-            }
-            if let Some(_mlp) = &layer.mlp {
-                for &proj in &[MlpGate, MlpUp, MlpDown] {
-                    let m = self.lora_matrix(layer_idx, proj)?;
-                    let (off, n) = self.lora_row_window(layer_idx, proj, m.rows);
-                    push_row_slice(
-                        &mut out,
-                        ctx,
-                        layer_idx,
-                        proj.label().into_owned(),
-                        m,
-                        off,
-                        n,
-                    )?;
-                }
-            }
-            if let Some(moe) = &layer.moe {
-                for &proj in &[MoeSharedGate, MoeSharedUp, MoeSharedDown] {
-                    let m = self.lora_matrix(layer_idx, proj)?;
-                    push_row_slice(
-                        &mut out,
-                        ctx,
-                        layer_idx,
-                        proj.label().into_owned(),
-                        m,
-                        0,
-                        m.rows,
-                    )?;
-                }
-                if !moe.gate.is_empty() {
-                    for e in 0..moe.gate.len() {
-                        for &proj in &[
-                            MoeExpertGate { expert_idx: e },
-                            MoeExpertUp { expert_idx: e },
-                            MoeExpertDown { expert_idx: e },
-                        ] {
-                            let m = self.lora_matrix(layer_idx, proj)?;
-                            push_row_slice(
-                                &mut out,
-                                ctx,
-                                layer_idx,
-                                proj.label().into_owned(),
-                                m,
-                                0,
-                                m.rows,
-                            )?;
-                        }
-                    }
-                } else {
+            if let Some(moe) = &layer.moe
+                && moe.gate.is_empty()
+            {
+                {
                     // Grouped FP8 buffers: slice per-expert ptrs directly.
                     if let Some(w13) = &moe.w13_fp8_grouped {
                         let mi = w13.rows / 2;
@@ -330,6 +338,49 @@ impl Qwen35Model {
         Ok(out)
     }
 
+    /// The NVFP4 twin of [`Qwen35Model::frozen_base_fp8_pointers`]. Sharing an
+    /// NVFP4 base costs ~21 GB resident against FP8's ~30 GB, and it is the
+    /// only way to share one at all: `repack_for_marlin_fp4` releases the group
+    /// bytes at load, so there is no group-layout source left to borrow.
+    /// Single-GPU only, for the same reason as the FP8 path.
+    pub(crate) fn frozen_base_fp4_pointers(&self) -> Result<Vec<SharedFp4BaseProjection>> {
+        ensure!(
+            self.tp.is_single(),
+            "frozen-base NVFP4 sharing is single-GPU only; got TP world_size={}",
+            self.tp.config().world_size
+        );
+        self.frozen_base_ptrs_exported
+            .store(true, Ordering::Relaxed);
+        let ctx = &self.ctx;
+        let mut out = Vec::new();
+        self.for_each_base_projection(|layer_idx, suffix, m, row_offset, sub_rows| {
+            // `None` here means "not NVFP4" (in_proj_a/b are tiny BF16) — a
+            // repacked NVFP4 weight always has both buffers.
+            let Some((weight_ptr, scale_tail_ptr, global_scale, full_rows, cols)) =
+                m.marlin_fp4_ptrs(ctx)
+            else {
+                return Ok(());
+            };
+            ensure!(
+                row_offset + sub_rows <= full_rows,
+                "layer {layer_idx} {suffix}: row window {row_offset}+{sub_rows} runs past N={full_rows}"
+            );
+            out.push(SharedFp4BaseProjection {
+                layer_idx,
+                proj_suffix: suffix,
+                weight_ptr,
+                scale_tail_ptr,
+                global_scale,
+                full_rows,
+                row_offset,
+                rows: sub_rows,
+                cols,
+            });
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
     /// Non-owning views of every resident dense-BF16 base projection's device
     /// pointer, for refreshing the train student's frozen base AFTER a LoRA
     /// re-merge. Projections still stored as FP8 block-scaled are skipped (the
@@ -353,9 +404,9 @@ impl Qwen35Model {
             m: &DeviceMatrix,
             row_offset: usize,
             sub_rows: usize,
-        ) {
+        ) -> Result<()> {
             if m.weight_format() != WeightFormat::DenseBf16 {
-                return;
+                return Ok(());
             }
             debug_assert!(row_offset + sub_rows <= m.rows);
             let (ptr, _g) = m.data.device_ptr(ctx.stream.as_ref());
@@ -366,74 +417,12 @@ impl Qwen35Model {
                 rows: sub_rows,
                 cols: m.cols,
             });
+            Ok(())
         }
         let mut out = Vec::new();
-        for (layer_idx, layer) in self.layers.iter().enumerate() {
-            let dense: &[StudentLoraProjection] = match &layer.attn {
-                Qwen35Attn::Full(_) => &[FullQ, FullK, FullV, FullO],
-                Qwen35Attn::Linear(_) => &[LinearQkv, LinearZ, LinearB, LinearA, LinearOut],
-            };
-            for &proj in dense {
-                let m = self.lora_matrix(layer_idx, proj)?;
-                let (off, n) = self.lora_row_window(layer_idx, proj, m.rows);
-                push_row_slice(
-                    &mut out,
-                    ctx,
-                    layer_idx,
-                    proj.label().into_owned(),
-                    m,
-                    off,
-                    n,
-                );
-            }
-            if let Some(_mlp) = &layer.mlp {
-                for &proj in &[MlpGate, MlpUp, MlpDown] {
-                    let m = self.lora_matrix(layer_idx, proj)?;
-                    let (off, n) = self.lora_row_window(layer_idx, proj, m.rows);
-                    push_row_slice(
-                        &mut out,
-                        ctx,
-                        layer_idx,
-                        proj.label().into_owned(),
-                        m,
-                        off,
-                        n,
-                    );
-                }
-            }
-            if let Some(moe) = &layer.moe {
-                for &proj in &[MoeSharedGate, MoeSharedUp, MoeSharedDown] {
-                    let m = self.lora_matrix(layer_idx, proj)?;
-                    push_row_slice(
-                        &mut out,
-                        ctx,
-                        layer_idx,
-                        proj.label().into_owned(),
-                        m,
-                        0,
-                        m.rows,
-                    );
-                }
-                for e in 0..moe.gate.len() {
-                    for &proj in &[
-                        MoeExpertGate { expert_idx: e },
-                        MoeExpertUp { expert_idx: e },
-                        MoeExpertDown { expert_idx: e },
-                    ] {
-                        let m = self.lora_matrix(layer_idx, proj)?;
-                        push_row_slice(
-                            &mut out,
-                            ctx,
-                            layer_idx,
-                            proj.label().into_owned(),
-                            m,
-                            0,
-                            m.rows,
-                        );
-                    }
-                }
-            }
-        }
+        self.for_each_base_projection(|layer_idx, suffix, m, off, n| {
+            push_row_slice(&mut out, ctx, layer_idx, suffix, m, off, n)
+        })?;
         Ok(out)
     }
 
