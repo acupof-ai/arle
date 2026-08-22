@@ -21,9 +21,8 @@ Arm: no-spec, `bench-agent-32k-8x8.jsonl` (8 sessions × 8 turns, sha
 | 4 | 9.1 s | 3951 | 95.2 ms | 8937 ms | 10.5 | 42.0 |
 | 8 | 13.5 s | 3949 | 140.5 ms | 9553 ms | 7.1 | 56.9 |
 
-`output_tokens_per_s` from the runner (4.1 / 7.8 / 8.4) is not decode speed — it
-divides generated tokens by a wall clock that is mostly prefill on a 32k
-workload. Decode speed is `1000 / TPOT`.
+Decode speed is `1000 / TPOT`; the wall clock is mostly prefill on a 32k
+workload.
 
 TPOT is linear in context. Anchoring on a measured short prompt rather than
 extrapolating (see the byte ledger below): **26.6 ms at 66 tokens, 72.1 ms at
@@ -243,9 +242,8 @@ flags only reach the unused one. One `ARLE_QWEN35_PROFILE=1` run answered it,
 and every step before that was wasted.
 
 Report prefill and decode separately or the headline number is meaningless: the
-same run that reads as "4.1 output tok/s" is a saturated 4086 tok/s prefill plus
-a decode at 1% of memory peak, and only one of those is worth an engineer's
-week.
+same run is a saturated 4086 tok/s prefill plus a decode at 1% of memory peak,
+and only one of those is worth an engineer's week.
 
 And when a portability constraint sets a performance constant — `BLOCK_N = 16`
 so the cubin loads on L4 — write down which device pays for it. This one costs

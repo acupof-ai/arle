@@ -62,11 +62,11 @@ python3 scripts/bench_throughput.py \
 
 ## Results
 
-| concurrency | completed | errors | output tok/s | TTFT p50 ms | ITL p50 ms |
-|---:|---:|---:|---:|---:|---:|
-| 1 | 3 | 0 | 9.3 | 811 | 102 |
-| 4 | 4 | 0 | 8.3 | 2219 | 457 |
-| 8 | 8 | 0 | 9.2 | 4619 | 818 |
+| concurrency | completed | errors | TTFT p50 ms | ITL p50 ms |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 3 | 0 | 811 | 102 |
+| 4 | 4 | 0 | 2219 | 457 |
+| 8 | 8 | 0 | 4619 | 818 |
 
 Correctness: `2+3=5` verified via both `arle run` and OpenAI-compatible API.
 

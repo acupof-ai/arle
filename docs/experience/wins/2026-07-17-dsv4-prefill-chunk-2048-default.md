@@ -1,4 +1,4 @@
-# DSv4 prefill chunk 128→2048 default — c1 TTFT −64%, c16 out +126%, c32 +128% — CUDA, 2026-07-17
+# DSv4 prefill chunk 128→2048 default — c1 TTFT −64%, c16 TTFT p50 −87% — CUDA, 2026-07-17
 
 > Status: Shipped
 
@@ -19,16 +19,16 @@ sliding_window alignment; the CLI flag was cosmetic). Effective chunk is now
   chunk 2048; partials identical on the 128 control (baseline behavior).
 - Final c-sweep at the flipped default (needle 9/9 exact):
 
-| c | complete | out tok/s | total tok/s | TTFT p50/p99 ms | ITL p50/p99 ms |
-|---|---|---|---|---|---|
-| 1 | 14 | 38.9 | 460 | 1093 / 1133 | 21.6 / 42.0 |
-| 4 | 28 | 75.0 | 885 | 1794 / 4205 | 44.0 / 89.6 |
-| 16 | 64 | 142.9 | 1684 | 5855 / 16026 | 71.2 / 120.9 |
-| 32 | 96 | 209.9 | 2474 | 4519 / 4558 | 133.0 / 191.5 |
+| c | complete | TTFT p50/p99 ms | ITL p50/p99 ms |
+| --- | --- | --- | --- |
+| 1 | 14 | 1093 / 1133 | 21.6 / 42.0 |
+| 4 | 28 | 1794 / 4205 | 44.0 / 89.6 |
+| 16 | 64 | 5855 / 16026 | 71.2 / 120.9 |
+| 32 | 96 | 4519 / 4558 | 133.0 / 191.5 |
 
-vs 128-era controls: c16 out +126% (63.2→142.9), TTFT p50 −87%, ITL p99
+vs 128-era controls: c16 TTFT p50 −87%, ITL p99
 120.9 vs 416ms (**better** — prefill queueing, not chunk stalls, dominated
-ITL); c32 out +128% vs the cap32 champion (91.9→209.9). The 2026-05-25
+ITL). The 2026-05-25
 ITL-kill precedent inverts at long-prompt shapes.
 
 ## Notes

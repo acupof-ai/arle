@@ -39,12 +39,12 @@ python3 scripts/bench_throughput.py \
 
 ## Results
 
-| concurrency | arm | completed | errors | output tok/s | total tok/s | req/s | TTFT p50/p99 ms | ITL p50/p99 ms |
-|---:|---|---:|---:|---:|---:|---:|---:|---:|
-| 1 | baseline | 3 | 0 | 4.28 | 54.68 | 0.017 | **84,634 / 85,724** | 11.1 / 11.2 |
-| 4 | baseline | 6 | 0 | 5.64 | 74.24 | 0.023 | 119,293 / 172,340 | ~0 / 20.1 |
-| 8 | baseline | 8 | 0 | 9.99 | 147.09 | 0.045 | 175,404 / 175,738 | ~0 / 19.0 |
-| 16 | baseline | 0 | 16 | 0.00 | 0.00 | 0.000 | n/a | n/a |
+| concurrency | arm | completed | errors | req/s | TTFT p50/p99 ms | ITL p50/p99 ms |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| 1 | baseline | 3 | 0 | 0.017 | **84,634 / 85,724** | 11.1 / 11.2 |
+| 4 | baseline | 6 | 0 | 0.023 | 119,293 / 172,340 | ~0 / 20.1 |
+| 8 | baseline | 8 | 0 | 0.045 | 175,404 / 175,738 | ~0 / 19.0 |
+| 16 | baseline | 0 | 16 | 0.000 | n/a | n/a |
 
 Correctness gate PASSED: coherent non-repeating output, `finish_reason=length`,
 `correctness_failed=0`, `error=0` at every valid point.

@@ -85,14 +85,14 @@ order, so none was licensed.
 Throughput is completed output tokens divided by each measured run duration.
 Every row completed 20/20 requests with zero errors and 2,560 output tokens.
 
-| c | duration s | out tok/s | req/s | TTFT p50/p99 ms | ITL p50/p99 ms | request p50/p99 s |
-|---:|---:|---:|---:|---:|---:|---:|
-| 1 | 56.845 | 45.04 | 0.352 | 243.88 / 261.78 | 21.09 / 23.16 | 2.895 / 3.193 |
-| 4 | 31.974 | 80.06 | 0.626 | 509.17 / 705.55 | 46.42 / 48.11 | 6.399 / 6.591 |
-| 8 | 21.217 | 120.66 | 0.943 | 966.22 / 1285.82 | 50.20 / 54.60 | 7.342 / 7.709 |
-| 16 | 18.097 | 141.46 | 1.105 | 2168.85 / 2169.82 | 76.87 / 83.83 | 11.932 / 11.933 |
+| c | duration s | req/s | TTFT p50/p99 ms | ITL p50/p99 ms | request p50/p99 s |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 56.845 | 0.352 | 243.88 / 261.78 | 21.09 / 23.16 | 2.895 / 3.193 |
+| 4 | 31.974 | 0.626 | 509.17 / 705.55 | 46.42 / 48.11 | 6.399 / 6.591 |
+| 8 | 21.217 | 0.943 | 966.22 / 1285.82 | 50.20 / 54.60 | 7.342 / 7.709 |
+| 16 | 18.097 | 1.105 | 2168.85 / 2169.82 | 76.87 / 83.83 | 11.932 / 11.933 |
 
-c=4 repeated at 80.39 tok/s: +0.41% from the first run, 20/20 complete,
+c=4 repeated: 20/20 complete,
 zero errors, and zero prefix hits.
 
 ## Results — service counters
@@ -155,12 +155,12 @@ disk floor, not the former four-rank 1.65 TB amplification.
 Baseline: same binary predecessor, model, dataset, seed, and flags except the
 resident-weight budget and L2/L3 flags. It was limited to one active slot.
 
-| c | baseline tok/s | now tok/s | throughput delta | baseline TTFT p50 ms | now TTFT p50 ms |
-|---:|---:|---:|---:|---:|---:|
-| 1 | 45.51 | 45.04 | -1.0% | 234.20 | 243.88 |
-| 4 | 46.66 | 80.06 | +71.6% | 8466.96 | 509.17 |
-| 8 | 46.57 | 120.66 | +159.1% | 17614.49 | 966.22 |
-| 16 | 46.55 | 141.46 | +203.9% | 27221.12 | 2168.85 |
+| c | baseline TTFT p50 ms | now TTFT p50 ms |
+| ---: | ---: | ---: |
+| 1 | 234.20 | 243.88 |
+| 4 | 8466.96 | 509.17 |
+| 8 | 17614.49 | 966.22 |
+| 16 | 27221.12 | 2168.85 |
 
 ## Artefacts
 

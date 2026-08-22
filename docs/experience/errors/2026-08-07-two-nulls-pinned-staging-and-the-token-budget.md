@@ -35,21 +35,21 @@ overlap, so the −13.9% the c=16 p99 shows is inside the noise.
 Repeated on the long-agent anchor (the other phase, the other dataset), also
 counterbalanced:
 
-| c | C TPOT | D TPOT | Δ | Δ total tok/s |
-|---:|---:|---:|---:|---:|
-| 1 | 8.609 | 8.521 | −1.0% | +0.5% |
-| 2 | 18.618 | 18.444 | −0.9% | −0.1% |
-| 4 | 34.126 | 33.036 | −3.2% | −1.6% |
-| 8 | 60.782 | 61.769 | **+1.6%** | +1.1% |
-| 16 | 115.444 | 112.579 | −2.5% | −0.0% |
+| c | C TPOT | D TPOT | Δ |
+| ---: | ---: | ---: | ---: |
+| 1 | 8.609 | 8.521 | −1.0% |
+| 2 | 18.618 | 18.444 | −0.9% |
+| 4 | 34.126 | 33.036 | −3.2% |
+| 8 | 60.782 | 61.769 | **+1.6%** |
+| 16 | 115.444 | 112.579 | −2.5% |
 
 The sign flips at c=8 and the within-arm spread at c=16 is 3.2% (C
 117.31/113.58), so this is a null on both workloads, not a small win on one.
 
 **Root cause of the wrong prediction: a profiler-measured host-side cost
 fraction does not extrapolate to an unprofiled run.** nsys slows the host far
-more than the GPU — the profiled run did 13687 total tok/s against 32954
-unprofiled, a 2.4× dilation. The 1.64 s of `cuMemHostAlloc` is real wall time
+more than the GPU — the profiled run took 2.4× the unprofiled wall time for
+the same token count. The 1.64 s of `cuMemHostAlloc` is real wall time
 *under nsys*; its **share** of the tick is an artifact of everything around it
 having been slowed differently. A 15% share measured under a profiler is not a
 15% share in production.
@@ -72,12 +72,12 @@ step, and shrinking the budget looked like it would cut it.
 **Exposed in `ed92c6d8c`** as `--max-num-batched-tokens`, then swept on one
 binary with 16384 run twice as its own noise control:
 
-| budget | TPOT | p90 | p99 | total tok/s |
-|---:|---:|---:|---:|---:|
-| 16384 (1st) | 115.34 | 549.6 | 766.3 | 34091.0 |
-| 2048 | 111.98 | 537.1 | 774.7 | 33484.4 |
-| 512 | **126.88** | 586.6 | 828.0 | 33011.0 |
-| 16384 (control) | 108.70 | 518.1 | 755.9 | 33815.6 |
+| budget | TPOT | p90 | p99 |
+| ---: | ---: | ---: | ---: |
+| 16384 (1st) | 115.34 | 549.6 | 766.3 |
+| 2048 | 111.98 | 537.1 | 774.7 |
+| 512 | **126.88** | 586.6 | 828.0 |
+| 16384 (control) | 108.70 | 518.1 | 755.9 |
 
 Same-config repeat spread is **5.7%** — larger than the effect being looked for.
 Against the two 16384 runs' mean of 112.02: **2048 is 0.0%**, and **512 is 13.3%

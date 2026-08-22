@@ -5,8 +5,6 @@
 | time_to_first_token_ms | 2008.9882 | 3.5256 | 0.18% | 2007.55 / 2013.01 / 2006.41 |
 | inter_token_latency_ms | 25.4476 | 0.0172 | 0.07% | 25.43 / 25.44 / 25.47 |
 | time_per_output_token_ms | 33.1901 | 0.0449 | 0.14% | 33.18 / 33.24 / 33.15 |
-| output_tokens_per_second | 79.1128 | 0.9061 | 1.15% | 78.65 / 80.16 / 78.54 |
-| tokens_per_second | 104.6788 | 44.9881 | 42.98% | 78.66 / 156.63 / 78.75 |
 
 | run | successful | errored | total | success% |
 |---|---|---|---|---:|

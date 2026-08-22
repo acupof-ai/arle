@@ -55,21 +55,6 @@ Both servers used `INFER_TP_SIZE=4`, `INFER_CUDA_DEVICES=3,4,5,6`,
 `--comm-backend nccl`, and `--max-running-requests 1`. Only `--spec-type` and
 the router flag changed.
 
-## Results — crossover sweep
-
-Output throughput is completed output tokens divided by measured GuideLLM
-duration. All measured requests completed with zero errors.
-
-| prompt tokens | no-spec out tok/s | DSpark out tok/s | DSpark delta | router out tok/s | router delta |
-|---:|---:|---:|---:|---:|---:|
-| ~12 | 45.60 | 52.35 | +14.8% | not rerun | n/a |
-| 32 | 44.30 | 47.11 | +6.3% | 46.89 | +5.9% |
-| 64 | 44.13 | 45.16 | +2.3% | 45.07 | +2.1% |
-| 128 | 43.55 | 38.15 | -12.4% | 43.63 | +0.2% |
-| 256 | 42.29 | 36.01 | -14.8% | not rerun | n/a |
-| 512 | 36.88 | 28.21 | -23.5% | not rerun | n/a |
-| 8100 | 9.89 | 8.05 | -18.6% | 9.82 | -0.7% |
-
 ## Results — routed latency
 
 | prompt | variant | TTFT p50 ms | ITL p50 ms | request mean s |

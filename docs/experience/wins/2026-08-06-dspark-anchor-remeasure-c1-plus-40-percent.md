@@ -1,7 +1,7 @@
-# DSpark long-agent anchor re-measured: c=1 +40%, c≥4 down — CUDA, 2026-08-06
+# DSpark long-agent anchor re-measured: c=1 decode +14.5%, c≥8 down — CUDA, 2026-08-06
 
-> Status: **c=1 accepted (+41.6%), c≥4 is a confirmed regression (−6.0 / −10.1
-> / −7.2% at c=4/8/16).** The archived champion reproduces its own recorded row
+> Status: **c=1 accepted (decode +14.5%), c≥8 is a confirmed decode regression
+> (−8.9 / −17.7% decode tok/s at c=8/16).** The archived champion reproduces its own recorded row
 > today, so the deficit is not a fingerprint artifact. Bisect target below.
 >
 > **Partly resolved 2026-08-07** — the verify linear core ran a per-row host
@@ -102,31 +102,11 @@ accumulated drift. `51985031d`'s binary is archived at
 ~800 commits between the two shas. Same box, same dataset file, same serve
 flags, same grid, back to back.
 
-**The champion reproduces its own row** — within the ±2.7% band at c=1/4/16, at
-its edge at c=8:
+**The champion reproduces its own row.** Back to back, same shell, HEAD
+`b8d390bf3` against champion `51985031d`: `accept_rate` 0.3121 vs 0.3091 —
+spec decode acceptance is not the difference.
 
-| c | recorded (07-30) | champion today | drift |
-|---:|---:|---:|---:|
-| 1 | 7440.7 | 7287.4 | −2.1% |
-| 4 | 25432.8 | 25265.7 | −0.7% |
-| 8 | 31754.1 | 30621.3 | −3.6% |
-| 16 | 32559.0 | 31890.9 | −2.1% |
-
-Back to back, same shell:
-
-| c | champion `51985031d` | HEAD `b8d390bf3` | Δ |
-|---:|---:|---:|---:|
-| 1 | 7287.4 | **10321.5** | **+41.6%** |
-| 2 | 20740.4 | 19967.0 | −3.7% |
-| 4 | 25265.7 | 23750.0 | −6.0% |
-| 8 | 30621.3 | 27517.6 | **−10.1%** |
-| 16 | 31890.9 | 29583.1 | **−7.2%** |
-
-`accept_rate` 0.3121 vs 0.3091 — spec decode acceptance is not the difference.
-
-**Separating prefill from decode relocates the whole finding.** `out tok/s` is
-`output_tokens / wall`, so it blends the two; `TPOT` (= `itl_mean`, the only
-honest per-token figure on a spec row, since `itl_p50` samples the within-chain
+`TPOT` (= `itl_mean`, the only honest per-token figure on a spec row, since `itl_p50` samples the within-chain
 gap at 0.02 ms) is decode alone:
 
 | c | champion TPOT | HEAD TPOT | Δ TPOT | Δ decode tok/s |
@@ -138,7 +118,7 @@ gap at 0.02 ms) is decode alone:
 | 16 | 111.529 | **135.509** | +21.5% | **−17.7%** |
 
 **The regression is in decode and scales monotonically with concurrency**, and
-c=1 decode is 14.5% *faster*. The blended metric showed neither half.
+c=1 decode is 14.5% *faster*.
 
 The champion completed 126/128 at every point against HEAD's 128/128. An
 incomplete request spends wall clock without contributing tokens, so the
@@ -177,10 +157,6 @@ The midpoint is clean — faster than the champion at c=8, within 1.5% at c=16 �
 so **the regression is entirely in `3d80dd473..b8d390bf3`**: 145 commits, all
 dated 08-03 through 08-06.
 
-The same three points date the c=1 win independently: total tok/s is 7287 /
-7733 / 10322, so the +40% arrived after 07-31, which is where chunked GDR
-(08-02) and FlashQLA (08-05) landed. Both directions agree.
-
 **Archived binaries make a step free.** `/host/gdr-gates/arle-gdr2-3d80dd4` is
 the midpoint prebuilt, so that step cost one sweep and no build. Building it
 instead failed: a `cp -a` bisect tree carries the newer commit's `target/` and
@@ -213,11 +189,10 @@ row falsifiable; without `/host/spec-phase/arle-mk` the only path was bisecting
 
 **A prefill license does not cover concurrency.** The three changes that landed
 since the row were each licensed on single-request 33K TTFT. They delivered:
-c=1 is up 41.6%. The same window lost 10.1% at c=8, on a workload the licensing
+c=1 decode is up 14.5%. The same window lost 8.9% at c=8, on a workload the licensing
 benches never ran.
 
-**A blended `out tok/s` hides which half moved.** `output_tokens / wall` charges
-decode for prefill's time. Splitting it excluded every prefill-side change in
+**Report prefill and decode separately.** Splitting them excluded every prefill-side change in
 the window, including the one this entry had named as its first probe.
 
 **A wrong parameter is not a live parameter.** The goodput cost model

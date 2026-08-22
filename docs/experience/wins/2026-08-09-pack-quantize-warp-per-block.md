@@ -109,13 +109,11 @@ models `mlock`ed so every serve reached ready in 10 s.
 | metric | BASE mean [min–max] | spread | NEW mean [min–max] | spread | Δ | ranges overlap |
 |---|---|---:|---|---:|---:|---|
 | wall | 409.16 [408.37–410.27] | 0.5% | 396.97 [394.08–400.89] | 1.7% | **−2.98%** | no |
-| total tok/s | 10893.9 [10849.7–10940.3] | 0.8% | 11257.3 [11148.3–11337.8] | 1.7% | **+3.34%** | no |
 | TPOT | 271.74 [266.10–277.23] | 4.1% | 257.22 [251.39–261.60] | 4.0% | **−5.34%** | no |
-| out tok/s | 39.01 [37.96–40.10] | 5.5% | 41.38 [40.37–42.67] | 5.6% | **+6.07%** | no |
 | TTFT p50 | 1882.9 [1858.7–1924.3] | 3.5% | 1913.3 [1866.3–1998.4] | 6.9% | +1.62% | **yes** |
 | TTFT p90 | 75794 [72421–77713] | 7.0% | 73595 [73357–73738] | 0.5% | −2.90% | **yes** |
 
-**On wall clock, total tok/s, TPOT and out tok/s the three-trial ranges do not
+**On wall clock and TPOT the three-trial ranges do not
 overlap — the worst NEW trial beats the best BASE trial on each.** Wall clock is
 the tightest: BASE occupies 408.37–410.27 s at 0.5% spread against NEW's
 394.08–400.89 s. **Both TTFT metrics are inside noise and this is not a TTFT
@@ -196,9 +194,9 @@ is worth ~11% of wall; scheduling is worth more and is unmodelled.
 Two numbers from that capture that must **not** be used: the "where did the
 1775 ms go" per-kernel comparison is cross-tree, not cross-kernel — the baseline
 predates the draft-attention change, whose `nonpaged_prefill_attention_kernel`
-went 16 args to 18 and 270 launches to 30 — and the two profiled runs' 11,587
-against 13,760 tok/s is a cross-day, cross-GPU, profiler-loaded comparison, not
-a regression. Only the `pack_quantize` row is comparable across the two captures.
+went 16 args to 18 and 270 launches to 30 — and the two profiled runs' throughput
+figures are a cross-day, cross-GPU, profiler-loaded comparison, not a
+regression. Only the `pack_quantize` row is comparable across the two captures.
 
 ## Open
 

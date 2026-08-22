@@ -34,19 +34,18 @@ Depth 0.0: 27/27 exact, all DET. Depth 0.5: zero miss (115/1000 partial ×3,
 
 ## A/B vs arm B (rolling-champion comparison, same GPUs/config/dataset/seed)
 
-| point | B total tok/s | C total tok/s | B out tok/s | C out tok/s | B TTFT p50 | C TTFT p50 |
-|---|---:|---:|---:|---:|---:|---:|
-| rate 1 | 4117 | 4514 | 19.6 | 21.4 (+9%) | 521 ms | 446 ms |
-| rate 4 | 5339 | 6663 | 25.4 | 31.7 (+25%) | 1467 ms | 1270 ms |
-| rate 8 | 5605 | 7985 | 26.6 | 37.9 (+42%) | 3921 ms | 2612 ms |
-| rate 16 | 5481 | 8130 | 26.0 | 38.6 (+48%) | 6698 ms | 5397 ms |
-| var-c1 | 854 | 850 | 4.9 | 4.9 (wash) | 3019 ms | 3031 ms |
-| var-c32 | 41 done/120 s | **59 done/101 s (+72% req/s)** | — | — | 51.8 s | 32.6 s |
+| point | B TTFT p50 | C TTFT p50 |
+| --- | ---: | ---: |
+| rate 1 | 521 ms | 446 ms |
+| rate 4 | 1467 ms | 1270 ms |
+| rate 8 | 3921 ms | 2612 ms |
+| rate 16 | 6698 ms | 5397 ms |
+| var-c1 | 3019 ms | 3031 ms |
+| var-c32 | 51.8 s | 32.6 s |
 
 var-c1 is a byte-level wash — clean null control (the fix moves concurrency
-headroom only). c32 caveats: arm C `total tok/s` (826) is deflated by a
-successful-set prompt-mean accounting artifact (1311 vs 2763) — completed
-count and TTFT are the robust columns; ITL p50 rises 160 ms → 2079 ms because
+headroom only). c32 caveats: completed count and TTFT are the robust
+columns; ITL p50 rises 160 ms → 2079 ms because
 59 slots actually interleave 32 decodes + chunked prefill (clamp 2 had
 queue-serial tight ITL). **The c32 run ended at ~101 s in a fatal
 `HostPagedKvPool out of pages` teardown** — see

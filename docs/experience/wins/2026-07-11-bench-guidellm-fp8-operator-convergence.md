@@ -61,16 +61,16 @@ via `std::mem::take` at the boundary. Independent launch evidence confirmed:
 
 ### GuideLLM serving (Err=0 every rate)
 
-| conc | TTFT mean (ms) | TTFT p99 | TPOT mean (ms) | ITL p99 (ms) | out tok/s | total tok/s | req/s |
-|---:|---:|---:|---:|---:|---:|---:|---:|
-| 1  | 4894  | 9802  | 54.9  | 55.2  | 18.0  | 306.6  | 0.067 |
-| 2  | 14315 | 18971 | 72.4  | 56.8  | 30.2  | 512.7  | 0.083 |
-| 4  | 22459 | 26245 | 97.6  | 52.1  | 62.4  | 1061.1 | 0.133 |
-| 8  | 42173 | 47560 | 166.2 | 3.8   | 178.2 | 3029.2 | 0.133 |
-| 16 | 41376 | 59667 | 230.0 | 205.8 | 14.2  | 241.5  | 0.033 |
+| conc | TTFT mean (ms) | TTFT p99 | TPOT mean (ms) | ITL p99 (ms) | req/s |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 4894 | 9802 | 54.9 | 55.2 | 0.067 |
+| 2 | 14315 | 18971 | 72.4 | 56.8 | 0.083 |
+| 4 | 22459 | 26245 | 97.6 | 52.1 | 0.133 |
+| 8 | 42173 | 47560 | 166.2 | 3.8 | 0.133 |
+| 16 | 41376 | 59667 | 230.0 | 205.8 | 0.033 |
 
-Throughput saturates at conc8 (3029 total tok/s); conc16 degrades as 4096-token
-prefills serialize on one GPU — expected single-GPU scaling, not a fault.
+conc16 degrades as 4096-token prefills serialize on one GPU (TTFT p99 59.7 s)
+— expected single-GPU scaling, not a fault.
 
 ## Problems
 

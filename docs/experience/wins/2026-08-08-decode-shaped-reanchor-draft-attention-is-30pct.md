@@ -58,7 +58,7 @@ higher, because its window sat inside a queueing ramp.
 
 ## Results
 
-Row: 407.97 out tok/s, 659.55 total tok/s, ITL mean 31.08 ms, TTFT p50 1.42 s,
+Row: ITL mean 31.08 ms, TTFT p50 1.42 s,
 28/32 complete. `accept_rate` 0.4749, prefix hit 0.5152.
 
 ```

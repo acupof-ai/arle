@@ -8,7 +8,7 @@
 
 [`2026-08-20-marlin-source-freed-18gb.md`](2026-08-20-marlin-source-freed-18gb.md)
 left Qwen3.8-27B-NVFP4 ahead of Qwen3.6-27B-FP8 at every decode point and
-**33.9% behind at c=1 end-to-end** on the 32K long-agent workload, which is
+**behind at c=1 on prefill** on the 32K long-agent workload, which is
 154:1 prefill to decode. The cause is structural.
 
 sm_90 has no FP4 tensor core, so any real GEMM widens the nibbles first. Marlin
@@ -54,16 +54,14 @@ Both arms on the same binary, NVFP4 on GPU 0 and FP8 on GPU 1, points back to
 back. `bench-agent-32k-16x8.jsonl` (sha 8867f63e), 32 req/point, `--max-tokens
 214`. 32/32 complete, `SERVER_ERRORS=0` everywhere.
 
-| c | NVFP4 ITL ms | FP8 ITL ms | ITL | NVFP4 out tok/s | FP8 out tok/s | end-to-end |
-|---:|---:|---:|---:|---:|---:|---:|
-| 1 | **20.46** | 24.81 | **+21.3%** | **20.60** | 19.61 | **+5.0%** |
-| 4 | **39.40** | 47.57 | **+20.7%** | **86.24** | 74.79 | **+15.3%** |
-| 8 | **69.81** | 79.00 | **+13.2%** | **100.80** | 92.42 | **+9.1%** |
-| 16 | **130.11** | 137.23 | **+5.5%** | **107.06** | 105.14 | **+1.8%** |
+| c | NVFP4 ITL ms | FP8 ITL ms | ITL |
+| ---: | ---: | ---: | ---: |
+| 1 | **20.46** | 24.81 | **+21.3%** |
+| 4 | **39.40** | 47.57 | **+20.7%** |
+| 8 | **69.81** | 79.00 | **+13.2%** |
+| 16 | **130.11** | 137.23 | **+5.5%** |
 
-The c=1 end-to-end leg went **−33.9%** before the arms, −5.9% with them but both
-sources retained, parity after the VRAM fix, **+5.0%** once the two kernels
-stopped being issue-bound. The ITL lead decays 21.3 → 20.7 → 13.2 → 5.5, which
+The ITL lead decays 21.3 → 20.7 → 13.2 → 5.5, which
 is the `dense_ffn` decode residue
 [the occupancy entry](../errors/2026-08-19-marlin-decode-is-not-occupancy-limited.md)
 measured; this work does not touch it, since the arms sit above an M floor no

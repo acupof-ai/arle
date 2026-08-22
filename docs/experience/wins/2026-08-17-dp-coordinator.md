@@ -67,7 +67,7 @@ python3 scripts/bench_throughput.py \
 
 ## Results
 
-| concurrency | arm | completed | errors | output tok/s | req/s | TTFT p50/p99 ms | ITL p50/p99 ms | delta |
+| concurrency | arm | completed | errors | decode tok/s | req/s | TTFT p50/p99 ms | ITL p50/p99 ms | delta |
 |---:|---|---:|---:|---:|---:|---:|---:|---:|
 | 16 | DP=1 | | | | | | | — |
 | 16 | DP=2 | | | | | | | |

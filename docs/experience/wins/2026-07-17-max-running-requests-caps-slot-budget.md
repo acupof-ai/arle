@@ -33,12 +33,12 @@ budget** (hits the 32 x max_seq cap).
 
 c=32, 300 s, bench-prompts-64.jsonl:
 
-| arm | complete | out tok/s | total tok/s | TTFT p50/p99 | ITL p50/p99 |
-|---|---|---|---|---|---|
-| default (59 slots, oversubscribed) | 74 | 64.5 | 662.5 | 67.2 / 122.0 s | 85.6 / 1955 ms |
-| cap 32 | **121** | **91.9 (+42%)** | **1089.6 (+64%)** | 83.5 / 91.9 s | 134.6 / **308 ms (-84% p99)** |
+| arm | complete | TTFT p50/p99 | ITL p50/p99 |
+| --- | --- | --- | --- |
+| default (59 slots, oversubscribed) | 74 | 67.2 / 122.0 s | 85.6 / 1955 ms |
+| cap 32 | **121** | 83.5 / 91.9 s | 134.6 / **308 ms (-84% p99)** |
 
-Grid c1/4/8/16 with the cap: within +-8% of the accept baseline (noise), TTFT
+Grid c1/4/8/16 with the cap: TTFT
 p50 better at c4 (1194 vs 1532 ms) and c8 (2397 vs 2726 ms). The cap costs
 nothing at low concurrency and removes preempt-recompute storms at c32
 (default arm logged 192 KV-overflow preemptions; cap arm zero).

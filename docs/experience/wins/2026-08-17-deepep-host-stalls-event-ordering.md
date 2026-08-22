@@ -54,7 +54,7 @@ chat completion returned coherent output (reasoning model, 16 tokens).
 No DeepEP errors in the serve log. The event-based ordering is working
 correctly — a stream race would produce NaN or garbage.
 
-| concurrency | arm | completed | errors | output tok/s | req/s | TTFT p50/p99 ms | ITL p50/p99 ms | delta |
+| concurrency | arm | completed | errors | decode tok/s | req/s | TTFT p50/p99 ms | ITL p50/p99 ms | delta |
 |---:|---|---:|---:|---:|---:|---:|---:|---:|
 | 1 | baseline | | | | | | | — |
 | 1 | treatment | | | | | | | |

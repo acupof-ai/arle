@@ -44,13 +44,13 @@ python3 scripts/bench_throughput.py \
 
 ## Results
 
-| concurrency | arm | completed | errors | output tok/s | TTFT mean ms | ITL mean ms |
-|---:|---|---:|---:|---:|---:|---:|
-| 1 | baseline | 5 | 0 | 1.34 | 49,551 | 103.8 |
-| 4 | baseline | 5 | 0 | 1.59 | 127,596 | 802.2 |
-| 8 | baseline | — | — | KV pool exhaustion | — | — |
-| 16 | baseline | — | — | KV pool exhaustion | — | — |
-| 1 | dspark | 1 | 15 | 10.67 | 775 | 33.2 |
+| concurrency | arm | completed | errors | TTFT mean ms | ITL mean ms |
+| ---: | --- | ---: | ---: | ---: | ---: |
+| 1 | baseline | 5 | 0 | 49,551 | 103.8 |
+| 4 | baseline | 5 | 0 | 127,596 | 802.2 |
+| 8 | baseline | — | — | — | — |
+| 16 | baseline | — | — | — | — |
+| 1 | dspark | 1 | 15 | 775 | 33.2 |
 
 DSpark accept rate: **0.15%** (16 accepted / 10,635 drafted).
 

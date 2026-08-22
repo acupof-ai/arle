@@ -67,8 +67,7 @@ chose and nobody could test. Exposed in `ed92c6d8c`.
 
 Aim the capture at the phase being reasoned about, and prove it landed there
 before reading the ledger. Short prompts (~1000 tok) and long generation (512)
-push prefill below the noise; the giveaway that it worked was `out=215 tok/s`
-against `47.5` on the 32K dataset in the same serve config.
+push prefill below the noise.
 
 ## Rule
 

@@ -5,7 +5,7 @@
 DSpark/DFlash speculative decode was enabled on V100 with
 `--spec-type dspark --mtp-draft-model z-lab/Qwen3.6-27B-DFlash`
 (DFlash drafter, block=16, taps=[1,16,31,46,61]) to measure the spec-decode
-gain on the V100 baseline (Qwen3.6-27B-W4A16, no-spec 22.8 out tok/s at c=1).
+gain on the V100 baseline (Qwen3.6-27B-W4A16, no-spec ITL p50 40.4 ms at c=1).
 
 ## Root Cause
 

@@ -366,8 +366,6 @@ def summarize(concurrency: int, results: list[RequestResult], wall_time_s: float
             and all(result.completion_tokens == complete[0].completion_tokens for result in complete)
             else None
         ),
-        "output_tokens_per_s": output_tokens / wall_time_s if wall_time_s else 0.0,
-        "total_tokens_per_s": total_tokens / wall_time_s if wall_time_s else 0.0,
         "requests_per_s": len(complete) / wall_time_s if wall_time_s else 0.0,
         "ttft": latency_summary([result.ttft_s for result in complete if result.ttft_s is not None]),
         "itl": latency_summary([value for result in complete for value in result.itl_s]),
@@ -400,7 +398,7 @@ def write_outputs(output_prefix: Path, report: dict[str, Any]) -> None:
     columns = (
         "concurrency", "wall_time_s", "requests", "complete", "incomplete", "error",
         "correctness_failed_lower_bound", "prompt_tokens", "output_tokens", "total_tokens",
-        "output_tokens_per_s", "total_tokens_per_s", "requests_per_s",
+        "requests_per_s",
         "ttft_mean_ms", "ttft_p50_ms", "ttft_p90_ms", "ttft_p99_ms",
         "itl_mean_ms", "itl_p50_ms", "itl_p90_ms", "itl_p99_ms",
         "e2e_mean_ms", "e2e_p50_ms", "e2e_p90_ms", "e2e_p99_ms",
@@ -532,10 +530,10 @@ async def async_main(args: argparse.Namespace) -> int:
                 "results": [asdict(result) for result in results],
             })
             write_outputs(args.output, report)
-            # `out` is end-to-end (prefill included) and `decode` is per-token;
-            # they are different SLOs and diverge by >2x on long prompts. Print
-            # the mean prompt length too: a short-prompt sweep measures the
-            # weight-read path only and must not be read as a serving number.
+            # `decode` is per-token (1000 / ITL mean); prefill is reported as
+            # TTFT, never blended into a tokens-over-wall figure. Print the mean
+            # prompt length too: a short-prompt sweep measures the weight-read
+            # path only and must not be read as a serving number.
             itl_mean = (summary.get("itl") or {}).get("mean_ms")
             prompt_mean = (
                 summary["prompt_tokens"] / summary["complete"] if summary["complete"] else 0
@@ -543,9 +541,8 @@ async def async_main(args: argparse.Namespace) -> int:
             print(
                 f"c={concurrency}: complete={summary['complete']}/{summary['requests']} "
                 f"prompt={prompt_mean:.0f} tok "
-                f"out={summary['output_tokens_per_s']:.1f} tok/s "
+                f"ttft_p50={(summary.get('ttft') or {}).get('p50_ms') or 0:.0f} ms "
                 f"decode={1000.0 / itl_mean if itl_mean else 0:.1f} tok/s "
-                f"total={summary['total_tokens_per_s']:.1f} tok/s "
                 f"req={summary['requests_per_s']:.2f}/s"
             )
     failed = any(

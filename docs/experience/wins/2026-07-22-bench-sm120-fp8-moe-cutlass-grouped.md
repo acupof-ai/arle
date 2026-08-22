@@ -61,20 +61,20 @@ Canonical `bench_throughput.py`, same params/model/box, 64 prompts (p50 ~3 k tok
 120 s/concurrency, max_tokens 256, seed 20260416. `error=0`, `correctness_failed=0`
 at every point. Raw: `bench-output/2026-07-22-sm120-fp8-moe-cutlass/bench.csv`.
 
-| c | arm | complete | TTFT p50 ms | TTFT mean ms | out tok/s | total tok/s |
-|--:|-----|---------:|------------:|-------------:|----------:|------------:|
-| 1 | baseline (GEMV) | 3 | **84,634** | 84,634 | 4.28 | 54.7 |
-| 1 | **CUTLASS grouped** | 45/46 | **760** | 751 | 60.1 | 1201.6 |
-| 4 | baseline | 6 | 119,293 | — | 5.64 | 74.2 |
-| 4 | **CUTLASS** | 98/100 | 4,306 | 3,731 | 114.0 | 2547.8 |
-| 8 | baseline | 8 | 175,404 | — | 9.99 | 147.1 |
-| 8 | **CUTLASS** | 151/154 | 6,708 | 5,600 | 178.5 | 3898.1 |
-| 16 | baseline | **0/16 (collapsed)** | n/a | n/a | 0 | 0 |
-| 16 | **CUTLASS** | 202/206 | 9,749 | 8,935 | 220.2 | 5209.0 |
+| c | arm | complete | TTFT p50 ms | TTFT mean ms |
+| --: | ----- | ---------: | ------------: | -------------: |
+| 1 | baseline (GEMV) | 3 | **84,634** | 84,634 |
+| 1 | **CUTLASS grouped** | 45/46 | **760** | 751 |
+| 4 | baseline | 6 | 119,293 | — |
+| 4 | **CUTLASS** | 98/100 | 4,306 | 3,731 |
+| 8 | baseline | 8 | 175,404 | — |
+| 8 | **CUTLASS** | 151/154 | 6,708 | 5,600 |
+| 16 | baseline | **0/16 (collapsed)** | n/a | n/a |
+| 16 | **CUTLASS** | 202/206 | 9,749 | 8,935 |
 
 **Δ prefill (the lever): c=1 cold TTFT 84,634 → 760 ms = 111× faster** (~3 k-tok
-prefill ~35 → ~3960 tok/s). Total throughput c=8 **26.5×** (147 → 3898 tok/s); c=16
-went from full collapse to 202/206 complete at 5209 tok/s. Decode ITL stays healthy
+prefill ~35 → ~3960 tok/s). c=16 went from full collapse to 202/206 complete.
+Decode ITL stays healthy
 (c=1 p50 11.3 ms). The GEMV→tensor-core-grouped change is the entire win.
 
 ## Environment

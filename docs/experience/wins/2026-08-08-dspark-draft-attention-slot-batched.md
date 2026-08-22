@@ -6,8 +6,8 @@
 > residual is unexplained, see below.
 >
 > **On the 32K long-agent anchor it is worth nothing measurable** — 3 trials
-> per arm, counterbalanced: TPOT +0.8% (NEW slower), out tok/s −0.7%, total
-> tok/s +3.3%, every delta inside the arm's own trial spread. The champion row
+> per arm, counterbalanced: TPOT +0.8% (NEW slower), TTFT p50 +3.3%, every
+> delta inside the arm's own trial spread. The champion row
 > does not move, and the honest summary is that this optimises a regime the
 > anchor does not exercise.
 
@@ -76,29 +76,26 @@ Matched A/B, two binaries built serially from the same tree — NEW `3a8f99b1f`
 shaped c=16, 32 requests, `max_tokens` 4096, temp 0, arms swapped across GPU 0
 and GPU 1. Artifacts `/host/draftattn/ab/`.
 
-| arm | GPU | out tok/s | total tok/s | ITL mean | TTFT p50 | accept_rate | gen tokens |
-|---|---|---:|---:|---:|---:|---:|---:|
-| BASE | 0 | 394.8 | 616.2 | 31.53 ms | 1403.7 ms | 0.4602 | 63181 |
-| NEW | 0 | 413.0 | 702.8 | **27.47** | 1436.9 | 0.4430 | 50470 |
-| BASE | 1 | 390.2 | 651.4 | 30.57 | 1142.7 | 0.4404 | 52942 |
-| NEW | 1 | 457.8 | 743.0 | **28.15** | 1226.7 | 0.4541 | 56874 |
+| arm | GPU | ITL mean | TTFT p50 | accept_rate | gen tokens |
+| --- | --- | ---: | ---: | ---: | ---: |
+| BASE | 0 | 31.53 ms | 1403.7 ms | 0.4602 | 63181 |
+| NEW | 0 | **27.47** | 1436.9 | 0.4430 | 50470 |
+| BASE | 1 | 30.57 | 1142.7 | 0.4404 | 52942 |
+| NEW | 1 | **28.15** | 1226.7 | 0.4541 | 56874 |
 
 | | GPU 0 | GPU 1 |
 |---|---:|---:|
 | ITL mean | −12.9% | −7.9% |
-| total tok/s | +14.1% | +14.1% |
-| out tok/s | +4.6% | +17.3% |
 | TTFT p50 | +2.4% | +7.3% |
 
-**NEW wins on both devices on both ITL mean and total tok/s**, so the swap rule
+**NEW wins on both devices on ITL mean**, so the swap rule
 is satisfied. Quote **ITL mean, 31.05 → 27.81 ms, −10.4%**: it is
-work-normalized, whereas `out tok/s` spans +4.6% to +17.3% because the arms
-generated 50.5k–63.2k tokens (temp-0 generations diverge under MoE
-non-determinism). TTFT is a wash-to-slightly-worse, as expected for a
+work-normalized, whereas the arms generated 50.5k–63.2k tokens (temp-0
+generations diverge under MoE non-determinism). TTFT is a wash-to-slightly-worse, as expected for a
 decode-side change.
 
 BASE reproduces the documented decode baseline — ITL mean 31.53 / 30.57 against
-31.08 ms recorded on 08-08, and 394.8 / 390.2 out tok/s against 407.97.
+31.08 ms recorded on 08-08.
 
 `accept_rate` symptom check: BASE {0.4602, 0.4404}, NEW {0.4430, 0.4541}. The
 cross-arm gap (≤0.017) is smaller than BASE's own device-to-device spread
@@ -136,17 +133,15 @@ greedy, seed 20260416, c=16). Because a single trial would have landed on the
 ±2.7% drift band edge, 3 trials per arm, counterbalanced BASE/NEW/NEW/BASE/
 BASE/NEW, fresh serve each, all on GPU 0.
 
-| arm | out tok/s | total tok/s | TPOT | TTFT p50 | accept_rate |
-|---|---:|---:|---:|---:|---:|
-| BASE median | 47.21 | 13482.2 | 183.20 ms | 3548.4 ms | 0.4853 |
-| NEW median | 46.87 | 13925.8 | 184.73 ms | 3666.3 ms | 0.4772 |
-| Δ | −0.7% | +3.3% | **+0.8% (slower)** | +3.3% (slower) | — |
+| arm | TPOT | TTFT p50 | accept_rate |
+| --- | ---: | ---: | ---: |
+| BASE median | 183.20 ms | 3548.4 ms | 0.4853 |
+| NEW median | 184.73 ms | 3666.3 ms | 0.4772 |
+| Δ | **+0.8% (slower)** | +3.3% (slower) | — |
 
-**Null.** The deltas point in opposite directions depending on the metric, and
-each is smaller than the arm's own trial-to-trial spread — BASE spans 3.5% on
-total tok/s and 3.8% on TPOT, NEW spans 3.1% and 5.1%, and BASE's best total
-tok/s (13945.9) exceeds NEW's median. On TPOT, the metric a decode-side lever
-must move, NEW is 0.8% *worse*, i.e. flat. **The +14.1% total tok/s on the
+**Null.** Each delta is smaller than the arm's own trial-to-trial spread —
+BASE spans 3.8% on TPOT, NEW 5.1%. On TPOT, the metric a decode-side lever
+must move, NEW is 0.8% *worse*, i.e. flat. **The −10.4% ITL on the
 decode-shaped workload does not transfer to the anchor at all.**
 
 This is what the tick decomposition predicted: all decode together is 2.1–6.1%

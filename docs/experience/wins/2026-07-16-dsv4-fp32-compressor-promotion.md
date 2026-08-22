@@ -42,16 +42,16 @@ bash scripts/run_dsv4_bench.sh <fp32on|fp32off>
 
 ## Results
 
-| concurrency | arm | completed | errors | output tok/s | req/s | TTFT p50/p99 ms | ITL p50/p99 ms | total tok/s | delta tok/s |
-|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| 1 | baseline (OFF) | 20 | 0 | 23.8 | 1.169 | 421.2 / 3664.6 | 19.12 / 20.19 | 5011.5 | — |
-| 1 | treatment (ON) | 20 | 0 | 23.6 | 1.435 | 401.3 / 496.2 | 19.23 / 20.53 | 4976.4 | −0.7% |
-| 4 | baseline (OFF) | 20 | 0 | 35.1 | 2.107 | 1301.5 / 1372.2 | 40.08 / 97.57 | 7390.0 | — |
-| 4 | treatment (ON) | 20 | 0 | 35.4 | 2.115 | 1305.9 / 1379.7 | 40.10 / 96.18 | 7441.6 | +0.7% |
-| 8 | baseline (OFF) | 20 | 0 | 36.4 | 2.187 | 1574.4 / 3431.9 | 100.79 / 135.73 | 7672.2 | — |
-| 8 | treatment (ON) | 20 | 0 | 36.0 | 2.055 | 1652.9 / 3520.8 | 117.91 / 143.76 | 7584.6 | −1.1% |
-| 16 | baseline (OFF) | 20 | 0 | 39.8 | 2.378 | 3692.1 / 6596.9 | 115.75 / 128.12 | 8377.2 | — |
-| 16 | treatment (ON) | 20 | 0 | 38.4 | 2.071 | 3776.4 / 6732.6 | 116.99 / 132.23 | 8076.9 | −3.6% |
+| concurrency | arm | completed | errors | req/s | TTFT p50/p99 ms | ITL p50/p99 ms |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| 1 | baseline (OFF) | 20 | 0 | 1.169 | 421.2 / 3664.6 | 19.12 / 20.19 |
+| 1 | treatment (ON) | 20 | 0 | 1.435 | 401.3 / 496.2 | 19.23 / 20.53 |
+| 4 | baseline (OFF) | 20 | 0 | 2.107 | 1301.5 / 1372.2 | 40.08 / 97.57 |
+| 4 | treatment (ON) | 20 | 0 | 2.115 | 1305.9 / 1379.7 | 40.10 / 96.18 |
+| 8 | baseline (OFF) | 20 | 0 | 2.187 | 1574.4 / 3431.9 | 100.79 / 135.73 |
+| 8 | treatment (ON) | 20 | 0 | 2.055 | 1652.9 / 3520.8 | 117.91 / 143.76 |
+| 16 | baseline (OFF) | 20 | 0 | 2.378 | 3692.1 / 6596.9 | 115.75 / 128.12 |
+| 16 | treatment (ON) | 20 | 0 | 2.071 | 3776.4 / 6732.6 | 116.99 / 132.23 |
 
 Raw artifacts: `bench-output/2026-07-15-fp32on-rate*/result.{json,csv}`,
 `bench-output/2026-07-16-fp32off-rate*/result.{json,csv}` (on pod at
@@ -69,11 +69,11 @@ Raw artifacts: `bench-output/2026-07-15-fp32on-rate*/result.{json,csv}`,
 
 ## Learnings
 
-**PASS.** The FP32 compressor is promoted to default. Throughput impact is
-within noise at rate 1/4 (±0.7%), −1.1% at rate 8, and −3.6% at rate 16
+**PASS.** The FP32 compressor is promoted to default. TTFT and ITL are
+within noise at rate 1/4, ITL p50 +17% at rate 8, TTFT p50 +2% at rate 16
 (high concurrency). This is an acceptable cost for the correctness fix
 (#146: VIOLET-6529→4929, #150: 738291→738292).
 
-The −3.6% at rate 16 is the FP32 prefill overhead showing up under load;
+The rate-16 cost is the FP32 prefill overhead showing up under load;
 optimization (fuse FP32 probe into the main compressor kernel, or run only
 on the first compression boundary) is deferred.

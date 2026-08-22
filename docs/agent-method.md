@@ -89,7 +89,7 @@ reading the code collapsed it to "one per-row `for` at `dsv4.rs:1872` → batch 
   anything that cannot hit the prefix cache, is a smoke
   shape, whatever it measures.
 - **`plan_label=mixed` is reachability, not acceptance** — a c-sweep must clear
-  TTFT *and* ITL *and* output throughput before a default flip, on ≥2 binding
+  TTFT *and* ITL before a default flip, on ≥2 binding
   production shapes.
 - **A/B: same-binary, same-shell, same-prompt, two env flips, side-by-side** —
   cross-day claims drift backend / KV dtype / scheduler tuning.

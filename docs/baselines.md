@@ -59,19 +59,18 @@ One fresh serve, ascending concurrency. ITL mean is the per-output-token latency
 for speculative decode; event-level ITL percentiles include burst emission and
 must not be converted into per-token throughput.
 
-| c | prefix hits | accept | TTFT p50/p99 | ITL mean/p99 | decode tok/s | output tok/s | total tok/s | req/s |
-|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| 1 | 112/128 | 40.64% | 978.4 / 10308.6 ms | 10.89 / 49.53 ms | 91.8 | 46.94 | 7675.73 | 0.219 |
-| 2 | 128/128 | 27.35% | 581.3 / 930.8 ms | 17.06 / 94.93 ms | 58.6 | 99.48 | 16268.54 | 0.465 |
-| 4 | 128/128 | 27.06% | 584.8 / 1395.3 ms | 29.46 / 505.06 ms | 33.9 | 124.42 | 20347.14 | 0.581 |
-| 8 | 128/128 | 27.63% | 625.1 / 3408.2 ms | 48.86 / 544.12 ms | 20.5 | 152.94 | 25011.24 | 0.715 |
-| 16 | 128/128 | 27.28% | 878.6 / 7646.0 ms | 89.34 / 723.44 ms | 11.2 | 168.30 | 27522.30 | 0.786 |
+| c | prefix hits | accept | TTFT p50/p99 | ITL mean/p99 | decode tok/s | req/s |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 112/128 | 40.64% | 978.4 / 10308.6 ms | 10.89 / 49.53 ms | 91.8 | 0.219 |
+| 2 | 128/128 | 27.35% | 581.3 / 930.8 ms | 17.06 / 94.93 ms | 58.6 | 0.465 |
+| 4 | 128/128 | 27.06% | 584.8 / 1395.3 ms | 29.46 / 505.06 ms | 33.9 | 0.581 |
+| 8 | 128/128 | 27.63% | 625.1 / 3408.2 ms | 48.86 / 544.12 ms | 20.5 | 0.715 |
+| 16 | 128/128 | 27.28% | 878.6 / 7646.0 ms | 89.34 / 723.44 ms | 11.2 | 0.786 |
 
 `decode tok/s` = `1000 / ITL mean`, per request. It is the column to compare a
-decode-path change against; `output tok/s` is end-to-end over the sweep point and
-on a 33K prompt is prefill-dominated — at c=1 the two differ by 2.0x. The 35B row
-below carries the same column; this row lacked it, and comparing a short-prompt
-decode measurement against its `output tok/s` is a mistake that has been made
+decode-path change against; prefill is compared on TTFT. Comparing a
+short-prompt decode measurement against a 33K-prompt sweep point is a mistake
+that has been made
 (see [errors/2026-08-19-fp8-dequant-arm-shadows-decode.md](experience/errors/2026-08-19-fp8-dequant-arm-shadows-decode.md)).
 
 Every point completed 128/128 with zero incomplete, error, empty, or
@@ -86,16 +85,13 @@ Correctness: needle ladder 512/4096/16384/32768 ×3 passed 12/12 exact,
 deterministic at every length.
 
 This row replaces `9b38ba6c0` (2026-08-10) under rule 1 taken as
-latest-is-reference, not because a delta was demonstrated. Output tok/s moves
-−1.1 / +0.6 / +1.1 / +0.9 / +3.5% across the grid and acceptance moves under
-1 pp at every point, so the two runtimes are indistinguishable on this
-fingerprint; c=16 alone sits just outside the ±3% band on a single sweep and is
-not a claim of improvement. The GPU differs from the prior row
+latest-is-reference, not because a delta was demonstrated. Acceptance moves
+under 1 pp at every point, so the two runtimes are indistinguishable on this
+fingerprint. The GPU differs from the prior row
 (`GPU-77551814`), which rule 3 counts as part of the fingerprint.
 
 **Re-run 2026-08-17, runtime `5ea12daaa`, same GPU (`GPU-1769a5e7`):**
-47.7 / 95.4 / 118.2 / 139.3 / 154.0 out tok/s at c=1/2/4/8/16 — c=1 matches
-(+1.6%), c≥2 regresses −4.1 / −5.0 / −9.0 / −8.5%. Acceptance is within 2 pp
+c=1 matches, c≥2 regresses. Acceptance is within 2 pp
 of the SOTA row at every point, so the regression is in chain rate, not
 speculation quality. Root cause not yet isolated; 78 commits landed between
 the SOTA row and this re-run (2D KV sharding, decode-path collapse, event
@@ -169,14 +165,14 @@ Same dataset, params, and seed as the 27B row (128 req/point, max_tokens 214,
 greedy, seed 20260416). Throughput bench — TTFT cold is not separately
 measured; TTFT warm is the p50 across all 128 requests.
 
-| c | TTFT warm | TPOT | ITL p50 | decode tok/s | output tok/s | total tok/s |
-|---|---:|---:|---:|---:|---:|---:|
-| 1 | 0.70 s | 6.70 ms | 6.69 ms | 149.3 | 72.5 | 11860.2 |
-| 8 | 0.60 s | 36.12 ms | 29.34 ms | 27.7 | 199.3 | 32589.4 |
-| 16 | 0.75 s | 66.41 ms | 47.71 ms | 15.1 | 220.6 | 36075.0 |
+| c | TTFT warm | TPOT | ITL p50 | decode tok/s |
+| --- | ---: | ---: | ---: | ---: |
+| 1 | 0.70 s | 6.70 ms | 6.69 ms | 149.3 |
+| 8 | 0.60 s | 36.12 ms | 29.34 ms | 27.7 |
+| 16 | 0.75 s | 66.41 ms | 47.71 ms | 15.1 |
 
 vs the prior row (`a956f69b1`, 2026-07-28, pre-decode-graph): TPOT −58.7% /
-−18.1% / −9.9% at c=1/8/16; total tok/s +77% / +17% / +7%. The c=1 effect is
+−18.1% / −9.9% at c=1/8/16. The c=1 effect is
 the decode graph; c≥8 gains are smaller because the GPU is already saturated.
 1–3/128 responses per point tripped the repetition checker (greedy, long
 context) — no errors, no incomplete.
@@ -201,8 +197,7 @@ deterministic at every length.
 - **Metrics** TTFT and decode are separate SLOs, never averaged. Decode =
   token-weighted mean ITL (`Σ itl_s / count`); never `e2e − ttft` (this harness
   carries ~4.7 s teardown, inflating TPOT ~1.85×). Cold = session turn 0,
-  warm = turns 1–7. `total tok/s` = prompt+generated over wall: capacity, not
-  latency.
+  warm = turns 1–7.
 
 **`--qwen35-decode-graph` is DEFAULT-ON and working** (2026-08-03, `cb6b3389d`):
 the paged-KV early return that made it a no-op was removed, and the graph now
@@ -340,7 +335,7 @@ makes the dense_ffn column a clean single-variable comparison.
 
 ## Qwen3.8-27B-NVFP4 · 1×H20 · single-GPU · eager — NVFP4 ANCHOR
 
-### SOTA — runtime `ec5edf987` (2026-08-20)
+### SOTA — runtime `97d28ba2c` (2026-08-22)
 
 Mixed-precision: NVFP4 MLP (group_size=16, E2M1 + E4M3 group scales) on 56 of 64
 layers + FP8 per-channel attention (F8_E4M3 + BF16 `[N,1]` weight_scale)
@@ -363,30 +358,45 @@ that admits 16 — these rows pass it, matching the FP8 anchor above.
 
 `bench-agent-32k-16x8.jsonl` (sha 8867f63e, 1,052,018 prompt / 6,848 output
 tokens per point), 32 req/point, `--max-tokens 214 --temperature 0 --seed 42`.
-Both arms on the same binary, NVFP4 on GPU 0 and Qwen3.6-27B-FP8 on GPU 1, points
-taken back to back. 32/32 complete and `SERVER_ERRORS=0` at every cell.
+Both arms on the same binary. 32/32 complete and `SERVER_ERRORS=0` at every cell.
 
-| c | NVFP4 ITL ms | FP8 ITL ms | ITL | NVFP4 out tok/s | FP8 out tok/s | end-to-end |
-|---:|---:|---:|---:|---:|---:|---:|
-| 1 | **20.46** | 24.81 | **+21.3%** | **20.60** | 19.61 | **+5.0%** |
-| 4 | **39.40** | 47.57 | **+20.7%** | **86.24** | 74.79 | **+15.3%** |
-| 8 | **69.81** | 79.00 | **+13.2%** | **100.80** | 92.42 | **+9.1%** |
-| 16 | **130.11** | 137.23 | **+5.5%** | **107.06** | 105.14 | **+1.8%** |
+Same-base control: `Qwen3.8-27B-FP8` (the Qwen3.6 control of the 2026-08-20
+row compared two different models). Both arms on GPU 0 back to back, no spec,
+decode graph on, p50 of 32 requests. Runtime `97d28ba2c` — the tensor-core
+quantized paged attention ([entry](experience/wins/2026-08-22-paged-attention-quantized-tensor-core.md)).
 
-NVFP4 leads on both metrics at every concurrency. The ITL lead decays
-monotonically — 21.3 → 20.7 → 13.2 → 5.5 — which is the `dense_ffn` decode
-residue [the occupancy entry](experience/errors/2026-08-19-marlin-decode-is-not-occupancy-limited.md)
-measured and three tunings failed to move.
+| c | NVFP4 ITL ms | FP8 ITL ms | ITL | NVFP4 TTFT s | FP8 TTFT s |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | **13.70** | 17.67 | **+29.0%** | 5.93 | 5.56 |
+| 4 | **18.91** | 24.37 | **+28.9%** | 1.21 | 1.26 |
+| 8 | **24.40** | 29.82 | **+22.2%** | 1.46 | 1.50 |
+| 16 | **37.80** | 39.79 | **+5.3%** | 1.52 | 1.56 |
 
-End-to-end went `−0.8 / +11.4 / +7.0 / −0.3` before the two prefill-kernel
-changes below. ITL is unchanged across them (20.45 → 20.46 at c=1) because the
-materialisers only run at M ≥ 512 and no decode batch reaches that; the whole
-gain lands in prefill, which is what an end-to-end-up / ITL-flat split should
-look like on a 154:1 prefill-to-decode workload.
+Against the 2026-08-20 row (`ec5edf987`, NVFP4 ITL 20.46 / 39.40 / 69.81 /
+130.11 ms) ITL is −33 / −52 / −65 / −71 %; TTFT is unchanged (prefill still
+dequantises the quantized prefix into a bf16 temp for FA3). The ITL lead over
+FP8 still decays with concurrency — 29.0 → 28.9 → 22.2 → 5.3 — the
+`dense_ffn` residue [the occupancy entry](experience/errors/2026-08-19-marlin-decode-is-not-occupancy-limited.md)
+measured. TTFT at c≥4 is below c=1 because the 16×8 prompt set shares
+prefixes and the radix cache serves them after the first sweep.
+
+Previous row (`ec5edf987`, 2026-08-20, control Qwen3.6-27B-FP8 on GPU 1):
+
+| c | NVFP4 ITL ms | FP8 ITL ms | ITL |
+| ---: | ---: | ---: | ---: |
+| 1 | 20.46 | 24.81 | +21.3% |
+| 4 | 39.40 | 47.57 | +20.7% |
+| 8 | 69.81 | 79.00 | +13.2% |
+| 16 | 130.11 | 137.23 | +5.5% |
+
+ITL is unchanged across the two prefill-kernel changes below (20.45 → 20.46
+at c=1) because the materialisers only run at M ≥ 512 and no decode batch
+reaches that; their whole gain lands in prefill (TTFT) on this 154:1
+prefill-to-decode workload.
 
 **A c=16 row measured 2026-08-20 on a contended box is discarded, not superseded:
 the FP8 control arm — unchanged code, unchanged config, identical resident bytes
-and KV pool — moved 30.42 → 106.53 out tok/s between runs.** A control that moves
+and KV pool — moved 3.5× between runs.** A control that moves
 invalidates the run it is in; the sign of the NVFP4 delta flipped with it.
 
 #### 8-token decode grid
@@ -394,8 +404,9 @@ invalidates the run it is in; the sign of the NVFP4 delta flipped with it.
 `--seconds-per-concurrency 30 --max-tokens 128`, synthetic prompt (mean 8
 tokens). Measured at `1da4e0422`; the prefill work since does not reach these
 shapes (the DeepGEMM arms sit above an M floor no decode batch reaches).
+`decode tok/s (agg)` = `c × 1000 / ITL mean`.
 
-| c | NVFP4 ITL ms | NVFP4 agg | FP8 agg | vs FP8 |
+| c | NVFP4 ITL ms | NVFP4 decode tok/s (agg) | FP8 decode tok/s (agg) | vs FP8 |
 |---:|---:|---:|---:|---:|
 | 1 | 11.85 | **84.4** | 61.2 | **+37.9%** |
 | 2 | 14.17 | **141.1** | 99.8 | **+41.4%** |
@@ -489,7 +500,7 @@ prefill and fixed without a new GEMM kernel.
 Superseded rows (9.3 tok/s initial support `33f4863c7`, FP4 GEMV vectorization
 `2a3a2164f`) live in
 [wins/2026-08-18-qwen38-27b-nvfp4-inference.md](experience/wins/2026-08-18-qwen38-27b-nvfp4-inference.md);
-the kernel ladder 52.3 → 57.9 → 60.2 → 63.9 (out tok/s, c=1) is in
+the kernel ladder is in
 [wins/2026-08-19-nvfp4-marlin-tensorcore.md](experience/wins/2026-08-19-nvfp4-marlin-tensorcore.md).
 
 ---
@@ -513,25 +524,23 @@ Synthetic prompts (64) over raw `/v1/completions`, **120 s/point**, max_tokens
 128, greedy, seed 42. Not the 32K agent fingerprint — re-anchor on the agent
 workload before ranking.
 
-| c | complete | out tok/s | total tok/s | TTFT p50/p99 | accept | acc/chain | chains/s |
-|---|---:|---:|---:|---|---:|---:|---:|
-| 1 | 62 | 65.56 | 69.82 | 169.8 / 266.7 ms | 50.36% | 2.00 | 16.5 |
-| 8 | 177 | 182.10 | 193.87 | 443.5 / 627.1 ms | 49.02% | 1.84 | 0.5 |
-| 16 | 241 | 244.77 | 260.60 | 870.8 / 971.1 ms | 44.52% | 1.70 | 0.6 |
+| c | complete | TTFT p50/p99 | accept | acc/chain | chains/s |
+| --- | ---: | --- | ---: | ---: | ---: |
+| 1 | 62 | 169.8 / 266.7 ms | 50.36% | 2.00 | 16.5 |
+| 8 | 177 | 443.5 / 627.1 ms | 49.02% | 1.84 | 0.5 |
+| 16 | 241 | 870.8 / 971.1 ms | 44.52% | 1.70 | 0.6 |
 
 **Speculation only engages at c=1.** At c=8/16 the run completes ~60 chains in
 ~125 s against >22000 output tokens, so DSpark contributes under 1% there and
 those acceptance figures are a few-dozen-chain sample, not an indicator. The
-c=8/16 throughput is plain decode.
+c=8/16 points are plain decode.
 
 Rule 3 re-anchor, not a regression against `868043f5f` (2026-08-10). That row
 predates `ef8bcd61e`, which added `ignore_eos=true`: its points average
 120.7 / 110.1 / 113.5 completion tokens per request, so its requests stopped at
 EOS, while every request here emits exactly 128. Forcing generation past EOS is
-where the drafter agrees least, which moves acceptance 58.7% → 50.4%; the
-throughput follows from acceptance at an unchanged chain rate — restoring
-2.42 acc/chain at the measured 16.5 chains/s gives 65.6 + 0.42 × 16.5 =
-72.5 tok/s against the old row's 72.4.
+where the drafter agrees least, which moves acceptance 58.7% → 50.4% at an
+unchanged chain rate (16.5 chains/s).
 
 Correctness: needle ladder 512/4096/16384 ×3 passed 9/9 exact (NONDET at
 4096/16384 is MoE routing). The c=16 point flags 7/241 responses, all from the
@@ -543,8 +552,7 @@ the biased token dominating, two ordinary requests then answer correctly, and
 the serve log carries zero `relay deserialize` lines.
 
 **Re-run 2026-08-17, runtime `5cc681759`** (E8M0 loading fix + event pool +
-comm-stream fix): 64.68 / 178.31 / 241.09 out tok/s at c=1/8/16 — within
-±2% of the SOTA row, net neutral. Needle 512/4096/16384 ×3 = 9/9 exact.
+comm-stream fix): net neutral against the SOTA row at c=1/8/16. Needle 512/4096/16384 ×3 = 9/9 exact.
 The E8M0 fix (`5cc681759`) unblocks DSv4 FP8 loading: the W4A16 detection
 probe called `quant_view_for()` which rejected DSv4's native E8M0 scales;
 the DSv4 path now skips that rejection. See
@@ -563,19 +571,19 @@ the DSv4 path now skips that rejection. See
 Dataset `bench-prompts-20.jsonl`, sha256 `e095ddf1fcc9325a…`, 60 s/point,
 max_tokens 256, seed 20260416. Slot line `59 slots / per_slot 338MB / 84736 tok`.
 
-| c | complete | out tok/s | total tok/s | TTFT p50/p99 ms | ITL p50/p99 ms |
-|---|---:|---:|---:|---|---|
-| 1 | 10 | 38.66 | 456 | 1085 / 1113 | 21.9 / 41.0 |
-| 4 | 20 | 74.67 | 876 | 1447 / 2985 | 43.8 / 89.2 |
-| 8 | 40 | 152.82 | 1793 | 1069 / 1204 | 47.5 / 93.2 |
-| 16 | 48 | 197.51 | 2319 | 2238 / 2265 | 71.4 / 119.0 |
+| c | complete | TTFT p50/p99 ms | ITL p50/p99 ms |
+| --- | ---: | --- | --- |
+| 1 | 10 | 1085 / 1113 | 21.9 / 41.0 |
+| 4 | 20 | 1447 / 2985 | 43.8 / 89.2 |
+| 8 | 40 | 1069 / 1204 | 47.5 / 93.2 |
+| 16 | 48 | 2238 / 2265 | 71.4 / 119.0 |
 
 0 errors / 0 incomplete / 0 correctness_failed at every point. c32 needs
 `--max-running-requests 32`; without it host-admission oversubscription degrades
 to preemption, not a crash (#164/#162 closed).
 
 **Spec decode is c=1-only on this fingerprint and not a default-flip candidate**
-— DSpark +5.0% at c=1, −23/−44/−48% at c=4/8/16; MTP negative everywhere. The
+— DSpark positive at c=1, negative at c=4/8/16; MTP negative everywhere. The
 crossover is the compute-bound transition: verify is free only while the GPU has
 idle compute.
 
@@ -621,16 +629,15 @@ Prefill throughput: 2109 tok/s (1K), 3647 tok/s (4K).
 prompts 64, 60 s/point, max_tokens 256, seed 20260416. KV pool 16384 tok BF16
 (1.1 GB), 86 slots. Serve `--max-total-tokens 16384`.
 
-| c | complete | out tok/s | total tok/s | TTFT p50/p99 ms | ITL p50/p99 ms |
-|---|---:|---:|---:|---|---|
-| 1 | 11 | 22.8 | 24.4 | 251 / 304 | 40.4 / 41.6 |
-| 4 | 12 | 25.5 | 27.4 | 17799 / 25769 | 0.02\* / 270 |
-| 8 | 17 | 28.4 | 30.4 | 30818 / 54318 | 0.02\* / 335 |
-| 16 | 16 | 30.1 | 32.1 | 72270 / 72933 | 0.02\* / 452 |
+| c | complete | TTFT p50/p99 ms | ITL p50/p99 ms |
+| --- | ---: | --- | --- |
+| 1 | 11 | 251 / 304 | 40.4 / 41.6 |
+| 4 | 12 | 17799 / 25769 | 0.02\* / 270 |
+| 8 | 17 | 30818 / 54318 | 0.02\* / 335 |
+| 16 | 16 | 72270 / 72933 | 0.02\* / 452 |
 
-\* ITL p50 ≈ 0.02 ms is a streaming-sampling artifact at c≥4; read out tok/s.
-Decode-bound at every concurrency (+32% from c=1 to c=16); TTFT grows linearly
-with concurrency (queueing).
+\* ITL p50 ≈ 0.02 ms is a streaming-sampling artifact at c≥4; read ITL p99.
+TTFT grows linearly with concurrency (queueing).
 
 **DSpark on V100 is KILLED (−91% at c=1, errors at c≥8).** ITL 40 → 499 ms;
 c=16 produced 131204 errors in 60 s with `[coordinator] lockstep stalled`. The

@@ -44,21 +44,12 @@ are output-format variation. The FP32 probe on ALL boundaries is correct.
 
 ## Performance (guidellm concurrent, 20 prompts, 3352 tok each, 60s max)
 
-| Rate | Successful | Output tok/s | Total tok/s | TTFT p50 ms | ITL p50 ms |
-|------|-----------|--------------|-------------|-------------|------------|
-| 1 | 20 | 19.48 | 4100.55 | 527.5 | 21.36 |
-| 4 | 20 | 24.50 | 5158.27 | 1536.7 | 76.99 |
-| 8 | 20 | 24.91 | 5243.93 | 4096.9 | 74.11 |
-| 16 | 20 | 24.68 | 5194.67 | 7195.7 | 77.88 |
-
-vs previous fp32on (first boundary only, 4096 tok prompts):
-
-| Rate | fp32on (first boundary) | fp32all (all boundaries) | Δ |
-|------|------------------------|-------------------------|---|
-| 1 | 4976 | 4101 | −17.6% |
-| 4 | 7442 | 5158 | −30.7% |
-| 8 | 7585 | 5244 | −30.9% |
-| 16 | 8077 | 5195 | −35.7% |
+| Rate | Successful | TTFT p50 ms | ITL p50 ms |
+| ------ | ----------- | ------------- | ------------ |
+| 1 | 20 | 527.5 | 21.36 |
+| 4 | 20 | 1536.7 | 76.99 |
+| 8 | 20 | 4096.9 | 74.11 |
+| 16 | 20 | 7195.7 | 77.88 |
 
 The FP32 probe re-runs the BF16 input-projection GEMM + FP32 compressor update
 on every prefill call (previously only the first boundary). This is the

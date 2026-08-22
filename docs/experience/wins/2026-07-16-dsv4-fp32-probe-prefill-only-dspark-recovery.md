@@ -48,12 +48,12 @@ Partial results (len=115, 180, 1000) are mid-prompt retrieval behavior
 
 ## Performance (DSpark MTP, guidellm concurrent, 20 prompts, 60s max)
 
-| Rate | Output tok/s | Total tok/s | ITL p50 | ITL p99 | TTFT p50 |
-|------|--------------|-------------|---------|---------|----------|
-| 1 | 47.96 | 50.99 | 40.8ms | 45.8ms | 126.7ms |
-| 4 | 49.11 | 52.23 | 40.8ms | 53.4ms | 7587.4ms |
-| 8 | 48.81 | 51.96 | 40.8ms | 53.8ms | 15644.6ms |
-| 16 | 49.05 | 52.22 | 40.8ms | 53.7ms | 33897.1ms |
+| Rate | ITL p50 | ITL p99 | TTFT p50 |
+| ------ | --------- | --------- | ---------- |
+| 1 | 40.8ms | 45.8ms | 126.7ms |
+| 4 | 40.8ms | 53.4ms | 7587.4ms |
+| 8 | 40.8ms | 53.8ms | 15644.6ms |
+| 16 | 40.8ms | 53.7ms | 33897.1ms |
 
 ITL p50 is flat at 40.8ms across concurrency — decode is compute-bound. Zero
 `fp32_probe` log hits during the decode-heavy bench; the probe no longer runs

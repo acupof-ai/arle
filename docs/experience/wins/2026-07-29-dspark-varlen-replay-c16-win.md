@@ -32,16 +32,16 @@ Matched A/B, one binary, one session, GPU 0, ThinkingCap-Qwen3.6-27B-FP8 +
 Qwen3.6-27B-DFlash, `bench-agent-32k-16x8`, 48 req/point, max_tokens 214,
 seed 20260416, c=16.
 
-| | out tok/s | TPOT ms |
-|---|---:|---:|
-| no-spec | 122.0 | 102.70 |
-| **DSpark block 6** | **130.0** (+6.6%) | **98.29** (−4.3%) |
-| DSpark block 8 | 128.4 (+5.2%) | 98.71 (−3.9%) |
+|  | TPOT ms |
+| --- | ---: |
+| no-spec | 102.70 |
+| **DSpark block 6** | **98.29** (−4.3%) |
+| DSpark block 8 | 98.71 (−3.9%) |
 
-Both metrics clear the ±3% drift band. Gate exact=3 DET at 512/4k/16k, 0 errors.
+TPOT clears the ±3% drift band. Gate exact=3 DET at 512/4k/16k, 0 errors.
 
-Cumulative at c=16, from the pre-batching arm: 97.1 → 117.5 (block 6) → 125.7
-(batched draft) → 130.0 (varlen replay).
+Cumulative TPOT at c=16, from the pre-batching arm: 137.70 → 110.52 (block 6)
+→ 101.86 (batched draft) → 98.29 ms (varlen replay).
 
 Block size peaks at 6: 16 → 6 is +21%, 8 is −1.2% from 6, 4 collapses (its run
 also OOM'd — spec state at c=16 fills a 96 GB H20).

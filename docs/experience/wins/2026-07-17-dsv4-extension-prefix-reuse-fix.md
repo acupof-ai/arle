@@ -31,15 +31,10 @@ Round-3 pod battery (8×H20, DSv4-Flash-FP8 TP=4, b6f34a564):
 - Bench (round 4, champion fingerprint `bench-prompts-64.jsonl` 90 s/point,
   raw `bench-output/2026-07-17-r4-prefix-fix/` on the pod):
 
-| point | out tok/s | champion | Δ |
-|---|---|---|---|
-| c1 | 38.49 | 38.86 | −1.0% |
-| c4 | 74.75 | 74.95 | −0.3% |
-| c16 | 142.44 | 142.91 | −0.3% |
-| c32 | 207.34 | 209.91 | −1.2% (TTFT p50 3680 vs 4519 ms, −18.6%) |
+c32 TTFT p50 3680 vs champion 4519 ms (−18.6%).
 
-All inside the ±3% drift band → wash, licensed. Champion row unchanged.
-Protocol note: a bare `1,32` grid made c32 look −36.6% — the champion c32 was
+Wash, licensed. Champion row unchanged.
+Protocol note: a bare `1,32` grid made c32 look regressed — the champion c32 was
 measured warm at the end of a `1,4,16,32` sweep; fingerprint includes the
 grid order.
 
