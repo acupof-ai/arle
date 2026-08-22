@@ -59,3 +59,7 @@ doc-fetch-resources/Qb9mdxvQaoJbN6xP3TGckwSBnFe/
 .understand-anything/
 doc-fetch-resources/
 arle-kernels-*.tar.gz*
+
+# training/eval runs write token dumps to cwd; when cwd is the source tree they
+# must not move the source digest (build receipt guard)
+/dumps/
