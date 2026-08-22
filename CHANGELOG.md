@@ -8,6 +8,13 @@ detail in the linked wins/errors entry. Oldest sections are condensed.
 
 ## [Unreleased]
 
+- **OPD recompute chunk derives from the rank sequence — accepted.** Was a 4096
+  constant. `chunk * rank_seq <= 2^30`, capped 16,384; `--opd-seq-chunk`
+  overrides. Global 262,144 step: cp=4 692.9 → 618.4 s, cp=2 1,362.8 → 1,163.4 s,
+  peak flat. `--fp8-native-gemm` stays opt-in (loss moves 0.23 %, six to ten
+  times the envelope); the frozen-weight dequant cache measured as no effect.
+  ([entry](docs/experience/wins/2026-08-22-opd-recompute-chunk-from-rank-sequence.md))
+
 - **FA3 fp8 prefill attention from 64K tokens — accepted.** The quantized-pool
   prefill shim runs FA3's e4m3 kernels for prefill chunks over ≥64K KV (one
   descale per row/kv-head); 220K TTFT 129.7 → 108.2 s (−17 %), 32K and decode
