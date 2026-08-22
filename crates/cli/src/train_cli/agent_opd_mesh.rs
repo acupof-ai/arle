@@ -94,7 +94,6 @@ impl MeshUpdateChannel {
         std::fs::write(self.dir.join("end"), b"").map_err(Into::into)
     }
 
-    /// Blocks until the next message (`Some`) or the end marker (`None`).
     fn recv(&mut self) -> Result<Option<MeshMsg>> {
         loop {
             match std::fs::read(self.upd_path(self.seq)) {

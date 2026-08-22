@@ -8,11 +8,10 @@ use {
     },
 };
 
-/// Held-out eval via the cc harness: ONE sample per task (K=1 — best-of-N would
-/// inflate the pass-rate vs the single-shot production setting), no training.
-/// Writes the same `eval_round_{label}.jsonl` shape as the in-house eval pass
-/// and returns the pass-rate. Sampling params are CC's own (the harness has no
-/// temperature knob — cc drives the API request).
+/// ONE sample per task (K=1 — best-of-N would inflate the pass-rate vs the
+/// single-shot production setting). Writes the same `eval_round_{label}.jsonl`
+/// shape as the in-house eval pass. Sampling params are CC's own (the harness
+/// has no temperature knob).
 #[cfg(feature = "cuda")]
 pub(super) fn run_cc_eval(
     harness: &train::cc_harness::CcHarness,
@@ -102,9 +101,7 @@ pub(super) fn run_cc_eval(
     Ok(pass_rate)
 }
 
-/// Eval dumps land in --eval-out-dir, else next to the LoRA adapters / full
-/// checkpoint, else the current dir. Pure function of args so every fleet rank
-/// derives the same shared dump dir.
+/// Pure function of args so every fleet rank derives the same shared dump dir.
 #[cfg(feature = "cuda")]
 pub(super) fn agent_opd_eval_out_dir(args: &TrainAgentOpdArgs) -> PathBuf {
     args.eval_out_dir
@@ -114,8 +111,7 @@ pub(super) fn agent_opd_eval_out_dir(args: &TrainAgentOpdArgs) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
-/// Append-only JSONL metrics sink (`--metrics-out`); write failures log and
-/// never abort training.
+/// Write failures log and never abort training.
 #[cfg(feature = "cuda")]
 pub(super) struct JsonlSink {
     path: PathBuf,

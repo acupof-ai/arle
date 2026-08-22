@@ -27,9 +27,7 @@ pub(super) fn run_rubric_opd_impl(_args: TrainRubricOpdArgs) -> Result<()> {
     )
 }
 
-/// Load the in-process eval set (jsonl `{problem, answer}`), head-`n`, rendered with
-/// the same math prompt prefix the training corpus uses, tokenized. Returns
-/// `(prompt_ids, problem_text, gold_answer)`.
+/// Eval items rendered with the SAME math prompt prefix the training corpus uses.
 #[cfg(feature = "cuda")]
 fn load_rubric_eval_items(
     path: &Path,
@@ -70,8 +68,8 @@ fn load_rubric_eval_items(
     Ok(items)
 }
 
-/// Generate one greedy answer per eval item via the rollout engine (the trained
-/// student after `sync_lora`), and dump `{problem, gold, answer}` jsonl for scoring.
+/// Runs against the trained student AFTER `sync_lora`; dumps
+/// `{problem, gold, answer}` jsonl for scoring.
 #[cfg(feature = "cuda")]
 fn rubric_eval_pass(
     infer_student: &train::infer_student::InferStudent,
@@ -113,9 +111,8 @@ fn rubric_eval_pass(
     Ok(())
 }
 
-/// Rubric-OPD RFT loop: the student samples N rollouts/prompt, DeepSeek-V4-Flash
-/// judges each against a text-level rubric (vocab-agnostic), and the accepted
-/// rollouts are written back as CE targets. Mode A (select-only) for now.
+/// RFT loop: N rollouts/prompt, Flash judges each against a text-level rubric
+/// (vocab-agnostic), accepted rollouts → CE writeback. Mode A (select-only) for now.
 #[cfg(feature = "cuda")]
 pub(super) fn run_rubric_opd_impl(args: TrainRubricOpdArgs) -> Result<()> {
     use std::sync::{Arc, Mutex};
@@ -161,12 +158,10 @@ pub(super) fn run_rubric_opd_impl(args: TrainRubricOpdArgs) -> Result<()> {
         .with_context(|| format!("read config.json from {}", student_dir.display()))?;
     let vocab = hf_config.vocab_size;
 
-    // Student tokenizer: encodes problems, decodes rollouts for the judge.
     let tokenizer_path = resolve_local_tokenizer_path(student_dir)?;
     let tokenizer = ChatTokenizer::from_file(&tokenizer_path)
         .with_context(|| format!("load tokenizer from {}", tokenizer_path.display()))?;
 
-    // Corpus: each JSONL line is {"text": "<problem>"}.
     let raw = fs::read_to_string(&args.prompts_file)
         .with_context(|| format!("read prompts file {}", args.prompts_file.display()))?;
     let mut prompts: Vec<(String, Vec<u32>)> = Vec::new();
@@ -284,10 +279,6 @@ pub(super) fn run_rubric_opd_impl(args: TrainRubricOpdArgs) -> Result<()> {
     )
     .with_context(|| format!("load rollout engine from {}", student_dir.display()))?;
 
-    // Train-infer FP8 weight sharing (`--share-frozen-base`): borrow the rollout
-    // engine's resident FP8 base pointers, map to the loader's backend-agnostic
-    // table, and pass it into the autograd student load so its frozen FP8 base
-    // projections import a NON-OWNING view instead of allocating ~27 GB.
     let shared_base_entries: Vec<SharedFrozenBaseEntry> = if !args.no_share_frozen_base {
         shared_frozen_base_entries(&student_engine, "rubric-opd")?
     } else {
@@ -300,10 +291,7 @@ pub(super) fn run_rubric_opd_impl(args: TrainRubricOpdArgs) -> Result<()> {
     };
 
     let student = match prebuilt_student {
-        // Default path: the student was already loaded first (above), engine second.
         Some(s) => s,
-        // --share-frozen-base: load the student now, AFTER the engine, importing
-        // its resident FP8 base pointers (zero-copy) for the frozen projections.
         None => {
             eprintln!(
                 "[arle train rubric-opd] loading student from {}",
@@ -440,7 +428,6 @@ pub(super) fn run_rubric_opd_impl(args: TrainRubricOpdArgs) -> Result<()> {
         distill_shortest: args.distill_shortest,
     };
 
-    // In-process eval (base + per-round) via the rollout engine — no checkpoint save.
     let eval_items = match args.eval_prompts_file.as_deref() {
         Some(path) => load_rubric_eval_items(path, args.eval_n, &tokenizer, vocab)?,
         None => Vec::new(),
@@ -581,7 +568,7 @@ pub(super) fn run_rubric_opd_impl(args: TrainRubricOpdArgs) -> Result<()> {
             eprintln!("[rubric-opd] re-acquire KV pool after LoRA sync failed: {err}");
         }
 
-        // Eval this round's student in-process (rollout engine now holds round-N LoRA).
+        // Eval this round's student (rollout engine now holds round-N LoRA).
         if let Some(dir) = eval_dir.as_deref()
             && !eval_items.is_empty()
         {
@@ -659,9 +646,6 @@ impl JudgeServer {
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
         let student_gpu = visible.get(student_idx).copied().unwrap_or(student_idx);
-        // Judge GPUs: all visible devices except the student's slot. If
-        // CUDA_VISIBLE_DEVICES is unset, use physical ordinals 1..=tp_size
-        // (student is on 0).
         let judge_gpus: String = if visible.is_empty() {
             (1..=tp_size)
                 .map(|i| i.to_string())

@@ -1,12 +1,6 @@
-//! Interactive model selection UI.
-//!
-//! Uses `dialoguer::Select` for the main picker and `dialoguer::Input` +
-//! HuggingFace model search and picker.
-//!
-//! `dialoguer::Select` assumes each item occupies one terminal row. Long model
-//! paths can wrap and desync cursor math, so every displayed item is forced
-//! onto a single truncated line and the picker always paginates to fit the
-//! current terminal.
+//! `dialoguer::Select` assumes one terminal row per item; long model paths
+//! wrap and desync cursor math, so every item is forced onto one truncated
+//! line and the picker paginates to fit the terminal.
 
 use std::path::{Path, PathBuf};
 
@@ -17,11 +11,8 @@ use dialoguer::{Confirm, Input, Select};
 use crate::hf_search;
 use crate::model_catalog::CatalogEntry;
 
-/// Result of the model picker interaction.
 pub(crate) enum PickerResult {
-    /// User selected a locally available model.
     LocalModel(String),
-    /// User selected a remote model to download.
     RemoteModel(String),
 }
 
@@ -30,11 +21,8 @@ const PICKER_MAX_VISIBLE_ROWS: usize = 12;
 const PICKER_ITEM_MARGIN: usize = 6;
 const PICKER_MIN_WIDTH: usize = 24;
 
-/// Display the interactive model picker.
-///
-/// Shows local models first, then recommended downloads, then a search option.
-/// `default_index` pre-selects the best available option so that pressing
-/// Enter lands on a great model (see [`default_picker_index`]).
+/// Item layout: `[local…, "── download ──"?, recommended…, search]`;
+/// `default_index` pre-selects the best option so Enter lands on a great model.
 pub(crate) fn pick_model(
     local_models: &[(String, PathBuf)],
     recommended: &[&CatalogEntry],
@@ -66,8 +54,7 @@ pub(crate) fn pick_model(
     actions.push(PickerAction::Search);
 
     // Clamp the default into range and never land it on the separator (which
-    // would loop). Callers pass the best available option; this is the seat
-    // belt for an out-of-range or unlucky index.
+    // would loop).
     let default_index = sanitize_default_index(default_index, &actions);
     loop {
         let selection = Select::new()
@@ -87,25 +74,21 @@ pub(crate) fn pick_model(
                 if confirm_download(entry)? {
                     return Ok(PickerResult::RemoteModel(hf_id.clone()));
                 }
-                // User declined, show picker again
                 continue;
             }
             PickerAction::Search => {
                 if let Some(model_id) = run_search_flow()? {
                     return Ok(PickerResult::RemoteModel(model_id));
                 }
-                // User cancelled search, show picker again
                 continue;
             }
             PickerAction::Separator => {
-                // User selected the separator line, ignore
                 continue;
             }
         }
     }
 }
 
-/// Interactive HuggingFace search flow.
 fn run_search_flow() -> Result<Option<String>> {
     let query: String = Input::new()
         .with_prompt(format!("{}", style("search query").bold()))
@@ -175,15 +158,12 @@ fn confirm_download(entry: &CatalogEntry) -> Result<bool> {
     Ok(confirmed)
 }
 
-/// Index the picker should pre-select so that pressing Enter lands on a great
-/// model. Prefers a locally-available flagship (no download), else the first
-/// recommended download. The index is computed against the same item layout
-/// `pick_model` builds: `[local…, "── download ──"?, recommended…, search]`.
+/// Computed against `pick_model`'s item layout:
+/// `[local…, "── download ──"?, recommended…, search]`.
 pub(crate) fn default_picker_index(
     local_models: &[(String, PathBuf)],
     recommended: &[&CatalogEntry],
 ) -> usize {
-    // 1. A flagship the user already has on disk — zero-wait, best pick.
     if let Some(idx) = local_models
         .iter()
         .position(|(name, _)| crate::model_catalog::find_by_hf_id(name).is_some_and(is_flagship))
@@ -191,14 +171,11 @@ pub(crate) fn default_picker_index(
         return idx;
     }
 
-    // 2. Otherwise the first recommended download (the catalog already orders
-    //    flagships first). It sits past the local block and the separator.
     if !recommended.is_empty() {
         let separator = usize::from(!local_models.is_empty());
         return local_models.len() + separator;
     }
 
-    // 3. No recommendations: fall back to the first item (first local model).
     0
 }
 
@@ -206,8 +183,6 @@ fn is_flagship(entry: &CatalogEntry) -> bool {
     entry.recommended.is_some()
 }
 
-/// Keep a default index in range and off the separator row (selecting it would
-/// just loop the picker). On a separator hit, nudge to the next selectable row.
 fn sanitize_default_index(index: usize, actions: &[PickerAction]) -> usize {
     if actions.is_empty() {
         return 0;

@@ -23,9 +23,9 @@ use super::{
 };
 use crate::args::{OpdSftAnchorArg, OpdTeacherRuntimeArg, TrainOpdArgs, TrainSelfOpdArgs};
 
-/// Diagnostic (ARLE_OPD_STEP_TRACE): 128-token probe forward through the
-/// autograd student, bracketing engine load/offload phases to localize when
-/// the weights stop producing finite hidden states.
+/// Diagnostic (ARLE_OPD_STEP_TRACE): probe forward bracketing engine
+/// load/offload phases to localize when weights stop producing finite
+/// hidden states.
 #[cfg(feature = "cuda")]
 fn probe_student_forward(
     student: &train::qwen35::Qwen35Model,

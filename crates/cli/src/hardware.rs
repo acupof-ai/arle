@@ -1,29 +1,24 @@
-//! System hardware detection for CLI startup.
-//!
-//! Detects CPU, RAM, and GPU capabilities to drive model recommendations.
-//! GPU detection uses lightweight methods (subprocess calls, sysctl) to avoid
-//! pulling in full CUDA/Metal runtime just for startup info.
+//! GPU detection uses subprocess calls / sysctl, not the CUDA/Metal runtimes,
+//! to keep startup light.
 
 use std::process::Command;
 
 use sysinfo::System;
 
-/// Detected GPU information.
 #[derive(Debug, Clone)]
 pub(crate) enum GpuInfo {
-    /// NVIDIA GPU detected via nvidia-smi.
-    Cuda { name: String, vram_gb: f64 },
-    /// Apple Silicon with unified memory.
+    Cuda {
+        name: String,
+        vram_gb: f64,
+    },
     Metal {
         chip: String,
         unified_memory_gb: f64,
         recommended_working_set_gb: Option<f64>,
     },
-    /// No GPU detected or not applicable.
     None,
 }
 
-/// Which inference backend was compiled into this binary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CompiledBackend {
     Cuda,
@@ -134,7 +129,6 @@ impl CompiledBackend {
     }
 }
 
-/// Aggregated system information for model recommendation.
 #[derive(Debug, Clone)]
 pub(crate) struct SystemInfo {
     pub(crate) cpu_name: String,
@@ -146,9 +140,8 @@ pub(crate) struct SystemInfo {
 }
 
 impl SystemInfo {
-    /// Effective memory available for model loading (VRAM for CUDA, unified
-    /// RAM for Metal, system RAM for CPU). This is keyed to the backend
-    /// compiled into the current binary, not just the host accelerator.
+    /// Keyed to the backend compiled into this binary, not just the host
+    /// accelerator.
     pub(crate) fn effective_memory_gb(&self) -> f64 {
         match self.compiled_backend {
             CompiledBackend::Cuda => match &self.gpu {
@@ -175,8 +168,7 @@ impl SystemInfo {
             #[cfg(feature = "hip")]
             CompiledBackend::Hip => 0.0,
             // No generic Vulkan VRAM probe yet; report 0 rather than a
-            // fictional figure. On-box validation will add a loader-backed
-            // memory query when model selection needs it.
+            // fictional figure.
             #[cfg(feature = "vulkan")]
             CompiledBackend::Vulkan => 0.0,
             CompiledBackend::Cpu => {
@@ -198,7 +190,7 @@ impl SystemInfo {
     }
 }
 
-/// Detect system hardware. Never panics — returns best-effort info.
+/// Best-effort; never panics.
 pub(crate) fn detect_system() -> SystemInfo {
     let mut sys = System::new();
     sys.refresh_cpu_all();
@@ -235,7 +227,6 @@ fn detect_gpu(total_ram_gb: f64) -> GpuInfo {
     detect_apple_gpu(total_ram_gb)
 }
 
-/// Detect NVIDIA GPU via nvidia-smi subprocess (2s timeout).
 fn detect_nvidia_gpu() -> GpuInfo {
     let output = Command::new("nvidia-smi")
         .args([
@@ -261,7 +252,6 @@ fn detect_nvidia_gpu() -> GpuInfo {
     }
 }
 
-/// Detect Apple Silicon chip name via sysctl.
 fn detect_apple_gpu(total_ram_gb: f64) -> GpuInfo {
     if !cfg!(target_os = "macos") {
         return GpuInfo::None;

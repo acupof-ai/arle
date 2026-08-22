@@ -1,13 +1,6 @@
-//! Phase 1 trajectory writer for the ARLE CLI agent loop.
-//!
-//! v1 captures the message log + per-sub-turn telemetry; v2
-//! (token IDs + response_mask) is deferred until the engine surface
-//! exposes per-token state.
-//!
-//! All IO failures are logged and dropped. A REPL turn must NEVER
-//! crash because the trace file rotated, the disk filled, or the path
-//! went read-only — the run is the source of truth, the trace is a
-//! best-effort sidecar.
+//! IO failures are logged and dropped: a REPL turn must never crash because
+//! the trace file rotated, the disk filled, or the path went read-only — the
+//! run is the source of truth, the trace is a best-effort sidecar.
 
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 use std::fs::OpenOptions;
@@ -40,10 +33,8 @@ pub(crate) struct AgentTrajectoryRecord {
     pub user_input: String,
     pub messages: Vec<TrajectoryMessage>,
     pub sub_turns: Vec<SubTurnRecord>,
-    /// Phase 2 token layer. `Some(record)` when the agent loop tracked
-    /// every component (prompt + each sub-turn response + each tool
-    /// result) successfully; `None` otherwise. Serializes as a JSON
-    /// object or `null` via Option's native serde handling.
+    /// `Some` only when the agent loop tracked every component (prompt + each
+    /// sub-turn response + each tool result); `None` otherwise.
     pub tokens: Option<TokensRecord>,
     pub result: TrajectoryResult,
 }
@@ -89,9 +80,8 @@ impl TraceWriter {
         &self.path
     }
 
-    /// Build a trajectory record from an agent turn and append it to
-    /// the JSONL file. IO failures are logged at warn level and
-    /// dropped — never bubbled back up to the caller.
+    /// IO failures are logged at warn level and dropped — never bubbled to
+    /// the caller.
     pub(crate) fn write_turn(
         &self,
         model_id: &str,
@@ -394,15 +384,12 @@ mod tests {
         assert_eq!(parsed["model_id"], "fake-model");
         assert_eq!(parsed["backend"], "fake-backend");
         assert_eq!(parsed["user_input"], "say hi");
-        // First message is the user prompt.
         assert_eq!(parsed["messages"][0]["role"], "user");
         assert_eq!(parsed["messages"][0]["content"], "say hi");
-        // Second message is the assistant block array carrying the text.
         assert_eq!(parsed["messages"][1]["role"], "assistant");
         let blocks = parsed["messages"][1]["content"].as_array().expect("blocks");
         assert_eq!(blocks[0]["type"], "text");
         assert_eq!(blocks[0]["text"], "hello world");
-        // No tool messages because the turn took the no-tool path.
         assert!(
             parsed["messages"]
                 .as_array()

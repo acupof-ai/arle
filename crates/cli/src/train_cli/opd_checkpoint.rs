@@ -95,8 +95,6 @@ pub(super) fn maybe_save_full_student_checkpoint(
     Ok(Some(saved_dir))
 }
 
-/// PEFT adapter config for `--save-lora-adapters` (mainstream HF PEFT dir:
-/// adapter_config.json + adapter_model.safetensors).
 #[cfg(feature = "cuda")]
 pub(super) fn agent_opd_adapter_config(
     student_dir: &Path,
@@ -121,9 +119,8 @@ pub(super) fn agent_opd_adapter_config(
     config
 }
 
-/// Fast adapter-only (LoRA) save as a mainstream HF PEFT adapter dir — shared
-/// by the per-round agent-OPD save and the replay-mode final save. Avoids the
-/// full-materialize host-loop hang; loadable by HF PEFT / vLLM / SGLang.
+/// Adapter-only save; avoids the full-materialize host-loop hang. Loadable by
+/// HF PEFT / vLLM / SGLang.
 #[cfg(feature = "cuda")]
 pub(super) fn save_agent_opd_adapters(
     adapter_dir: &Path,
@@ -172,8 +169,6 @@ pub(super) fn save_agent_opd_adapters(
     Ok(())
 }
 
-/// Save the student's LoRA adapter as a PEFT-style directory (adapter_model.safetensors
-/// + adapter_config.json + tokenizer/config copies), loadable by `arle serve --lora`.
 pub(super) fn save_w2s_adapter(
     student: &train::qwen35::Qwen35Model,
     store: &mut TensorStore,

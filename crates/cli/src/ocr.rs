@@ -1,10 +1,3 @@
-//! `arle ocr <image>` — one-shot image OCR with DeepSeek-OCR.
-//!
-//! Resolves the DeepSeek-OCR model (local-first, auto-downloading the default
-//! `sahilchachra/unlimited-ocr-mxfp8-mlx` on first use), loads it through the
-//! shared `LoadedInferenceEngine`, and runs the multimodal chat path on a single
-//! image. Metal/Apple Silicon only — DeepSeek-OCR has no CUDA backend.
-
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Instant;
@@ -21,7 +14,6 @@ use crate::model_catalog::DEEPSEEK_OCR_MODEL_ID;
 const DEFAULT_OCR_MAX_TOKENS: usize = 32_768;
 const PDF_RENDERER_ENV: &str = "ARLE_OCR_PDFTOPPM";
 
-/// Run the `ocr` subcommand: load DeepSeek-OCR, read one image, print the text.
 pub(crate) fn run(args: &OcrArgs) -> Result<()> {
     let model_source = match &args.model_path {
         Some(path) => path.clone(),
@@ -101,9 +93,7 @@ pub(crate) fn run(args: &OcrArgs) -> Result<()> {
     Ok(())
 }
 
-/// Resolve the default DeepSeek-OCR model to a local path, downloading it from
-/// HuggingFace on first use (with a progress bar). Mirrors the model picker's
-/// download flow but never prompts — `arle ocr` is meant to "just work".
+/// Never prompts — `arle ocr` is meant to "just work".
 fn resolve_or_download_ocr_model() -> Result<String> {
     if let Some(path) = infer_util::hf_hub::resolve_local_weighted_model_path(DEEPSEEK_OCR_MODEL_ID)
     {

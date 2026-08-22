@@ -1,10 +1,5 @@
-//! HuggingFace hub cache discovery — model auto-discovery wizard data source.
-//!
-//! Walks `~/.cache/huggingface/hub/models--*/snapshots/*/` looking for
-//! snapshot dirs containing `config.json` or `model.safetensors`, filters to
-//! checkpoints the compiled backend's serve path can actually load (by
-//! `config.json` `model_type` / `architectures`, not the id name), and sorts
-//! newest-first.
+//! Walks `~/.cache/huggingface/hub` snapshots, filtered by `config.json`
+//! `model_type`/`architectures` (not the id name), sorted newest-first.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -19,39 +14,28 @@ use std::time::SystemTime;
 /// through; the only honest signal lives in `config.json#architectures`.
 const DRAFT_ONLY_ARCHITECTURES: &[&str] = &["DFlashDraftModel"];
 
-/// A discovered HuggingFace-cache snapshot ready for the picker.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct HubSnapshot {
-    /// Human-friendly model id (`Qwen/Qwen3-4B`), decoded from `models--…`.
     pub(crate) model_id: String,
-    /// Full filesystem path to the snapshot directory.
     pub(crate) path: PathBuf,
 }
 
-/// Decode a path of the form
-/// `~/.cache/huggingface/hub/models--org--repo/snapshots/<hash>/` into the
-/// canonical model id `org/repo`.
-///
-/// Returns `None` if the path shape does not match.
 pub(crate) fn decode_hub_snapshot_path(path: &Path) -> Option<String> {
-    // Expect .../models--X--Y.../snapshots/<hash>
-    let parent = path.parent()?; // snapshots
+    let parent = path.parent()?;
     if parent.file_name()?.to_str()? != "snapshots" {
         return None;
     }
-    let repo_dir = parent.parent()?; // models--X--Y...
+    let repo_dir = parent.parent()?;
     let repo_name = repo_dir.file_name()?.to_str()?;
     let rest = repo_name.strip_prefix("models--")?;
 
-    // `org--repo[--...]` → first `--` splits org from the rest; any additional
-    // `--` inside the repo name are rare but preserved as `-`.
+    // First `--` splits org from repo; any additional `--` inside the repo
+    // name are rare but preserved as `-`.
     let (org, repo) = rest.split_once("--")?;
     let repo = repo.replace("--", "-");
     Some(format!("{org}/{repo}"))
 }
 
-/// Return the user's HuggingFace hub cache dir, honouring `HF_HOME` /
-/// `HUGGINGFACE_HUB_CACHE` if present.
 pub(crate) fn hub_cache_root() -> Option<PathBuf> {
     if let Some(v) = std::env::var_os("HUGGINGFACE_HUB_CACHE") {
         return Some(PathBuf::from(v));
@@ -127,10 +111,8 @@ fn snapshot_has_usable_content(path: &Path) -> bool {
     path.join("config.json").exists() || path.join("model.safetensors").exists()
 }
 
-/// Read `<path>/config.json` and return `true` if its `architectures` list
-/// contains any draft-only architecture (see `DRAFT_ONLY_ARCHITECTURES`).
-/// Best-effort: returns `false` on any parse / read failure so a malformed
-/// config doesn't accidentally hide a usable target model.
+/// Best-effort: `false` on any parse/read failure so a malformed config
+/// doesn't hide a usable target model.
 fn snapshot_is_draft_only(path: &Path) -> bool {
     let cfg = path.join("config.json");
     let Ok(raw) = fs::read_to_string(&cfg) else {
@@ -154,8 +136,6 @@ fn snapshot_mtime(path: &Path) -> SystemTime {
         .unwrap_or(SystemTime::UNIX_EPOCH)
 }
 
-/// Discover HF cache snapshots the compiled backend can serve. Sorted by
-/// mtime descending (newest first).
 pub(crate) fn discover_hub_snapshots() -> Vec<HubSnapshot> {
     let Some(root) = hub_cache_root() else {
         return Vec::new();
@@ -185,9 +165,6 @@ pub(crate) fn discover_hub_snapshots() -> Vec<HubSnapshot> {
             {
                 return None;
             }
-            // Offer only what the compiled backend's serve path can actually
-            // load (config model_type/architectures), and never a draft-only
-            // half (DFlash drafts ship without a tokenizer).
             let model_id = decode_hub_snapshot_path(&snap_path)?;
             Some(HubSnapshot {
                 model_id,

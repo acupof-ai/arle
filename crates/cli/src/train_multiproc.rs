@@ -1,13 +1,12 @@
-//! Context-parallel training launcher: SPMD coordinator that spawns one worker
-//! process per CP rank. Sequence-parallel training shards the sequence across N
-//! GPUs (per-card activation memory O(seq/N)) — the only way to fit the 256K OPD
+//! CP/DP launcher: SPMD coordinator spawning one worker per rank. Sequence
+//! sharding (per-card activation O(seq/N)) is the only way to fit the 256K OPD
 //! writeback, which peaks past one card at ~seq 49152.
 //!
 //! Simpler than `serve_multiproc`: no engine-ready barrier, no lockstep relay —
-//! NCCL collectives are the only cross-rank synchronization. The coordinator mints
-//! the NCCL unique id, re-execs `current_exe()` once per rank with per-rank env
-//! (rank/size/device/uid), waits for the first exit, and kills survivors so one
-//! rank's crash tears the group down instead of wedging NCCL.
+//! NCCL collectives are the only cross-rank sync. The coordinator mints the
+//! NCCL uid, re-execs `current_exe()` once per rank, waits for the first exit,
+//! and kills survivors so one rank's crash tears the group down instead of
+//! wedging NCCL.
 
 #![cfg(all(unix, feature = "cuda"))]
 
@@ -24,9 +23,8 @@ use std::time::Duration;
 use anyhow::Context;
 use anyhow::Result;
 
-/// Spawned mesh worker (`ARLE_TRAIN_WORLD_RANK` set) → install a `[cpNdpM]`-style
-/// stderr prefix. Does NOT short-circuit dispatch — the child flows through clap
-/// into the normal agent-opd handler as its rank.
+/// Does NOT short-circuit dispatch — the child flows through clap into the
+/// normal agent-opd handler as its rank.
 pub(crate) fn install_mesh_worker_logger() -> bool {
     let Ok(rank) = std::env::var("ARLE_TRAIN_WORLD_RANK") else {
         return false;
@@ -43,9 +41,8 @@ pub(crate) fn install_mesh_worker_logger() -> bool {
     true
 }
 
-/// Coordinator: spawn one child per world rank (`cp*dp`, CP inner) with the mesh
-/// env + minted NCCL uid, wait for the first exit. `Ok(true)` = caller returns
-/// without training; `Ok(false)` = run in-process (single card, or IS a worker).
+/// `Ok(true)` = caller returns without training; `Ok(false)` = run in-process
+/// (single card, or IS a worker).
 pub(crate) fn maybe_spawn_mesh_and_wait(
     cp_size: usize,
     dp_size: usize,
@@ -63,7 +60,6 @@ pub(crate) fn maybe_spawn_mesh_and_wait(
         (false, false) => unreachable!("size > 1 above"),
     };
 
-    // Mint + publish the NCCL unique id once; children inherit it via env.
     #[cfg(feature = "nccl")]
     let uid_hex = infer_api::mint_nccl_unique_id_hex().context("mint NCCL unique id")?;
     #[cfg(not(feature = "nccl"))]

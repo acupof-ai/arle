@@ -81,33 +81,26 @@ enum ReplCommand {
     /// supplied we print a friendly pointer to restart with `--model-path`.
     Models(Option<usize>),
     Image(String),
-    /// `/export` → default path; `/export <path>` → explicit path/dir.
     Export(String),
     Exit,
     Unknown(String),
 }
 
-/// Per-session rolling accumulators for `/stats` enrichment.
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 #[derive(Debug, Default, Clone, Copy)]
 struct SessionStats {
-    /// Number of completed turns.
     turn_count: usize,
-    /// Sum of prompt_tokens reported by each turn's final TokenUsage, when
-    /// populated. Falls back to chars/4 for the most recent user message
-    /// if usage was unset (e.g. backend without usage reporting).
+    /// Falls back to chars/4 for the most recent user message when usage was
+    /// unset (e.g. backend without usage reporting).
     prompt_tokens: u64,
-    /// Sum of completion_tokens reported by each turn's final TokenUsage,
-    /// when populated. Falls back to the rolling TpsMeter count.
+    /// Falls back to the rolling TpsMeter count when usage was unset.
     completion_tokens: u64,
     /// Weighted TPS accumulator: sum of (tokens · tokens/elapsed) across
     /// turns; divided by total tokens for the weighted average.
     /// Stored separately rather than as a running avg because a simple mean
     /// over turns would treat a 1-token turn and a 1000-token turn equally.
     weighted_rate_numer: f64,
-    /// Sum of elapsed seconds across turns (the /stats "wall time" row).
     total_secs: f64,
-    /// Number of tool calls executed during the session.
     tool_calls: usize,
 }
 
@@ -228,12 +221,10 @@ fn tool_definitions(enabled: bool) -> Vec<ToolDefinition> {
     }
 }
 
-/// Process-wide cancel flag for an in-flight generation. Flipped by SIGINT;
-/// the streaming loop polls it and short-circuits on cancel.
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 static CANCEL_FLAG: OnceLock<Arc<AtomicBool>> = OnceLock::new();
 
-/// Unix-millis timestamp of the last Ctrl-C. Used to detect double-tap exit.
+/// Last Ctrl-C timestamp, for double-tap exit detection.
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 static LAST_SIGINT_MS: OnceLock<Arc<AtomicU64>> = OnceLock::new();
 
@@ -407,7 +398,6 @@ fn print_repl_banner(
     max_tokens: usize,
     temperature: f32,
 ) {
-    // Dim the whole line; bold the values via nested SGR.
     println!(
         "\x1b[2mmode \x1b[0;1m{mode_name}\x1b[0;2m · tools \x1b[0;1m{}\x1b[0;2m · \
          turns \x1b[0;1m{max_turns}\x1b[0;2m · tokens \x1b[0;1m{max_tokens}\x1b[0;2m · \
@@ -545,7 +535,6 @@ fn run_interactive_repl(
     }
 
     let (cancel, exit) = install_ctrlc_handler();
-    // Reset any stale state from a prior session.
     cancel.store(false, Ordering::Relaxed);
     exit.store(false, Ordering::Relaxed);
 
@@ -595,8 +584,6 @@ fn run_interactive_repl(
                 break;
             }
             Err(ReadlineError::Interrupted) => {
-                // Ctrl-C at the prompt: reset cancel state, print marker,
-                // continue (or exit on double-tap).
                 cancel.store(false, Ordering::Relaxed);
                 println!("^C");
                 if exit.load(Ordering::Relaxed) {
@@ -1187,7 +1174,6 @@ fn run_agent_turn(
             // re-emitting it here would just duplicate.
             return;
         };
-        // Clear the spinner before printing the tool-call line.
         spinner.borrow_mut().stop();
         let mut state = render_state.borrow_mut();
         tps_meter.borrow_mut().hide_before_chunk();
@@ -1647,7 +1633,6 @@ fn handle_models_command(maybe_idx: Option<usize>) {
         return;
     }
 
-    // Listing mode.
     println!("Local models (from HuggingFace hub cache):");
     for (i, snap) in snapshots.iter().enumerate() {
         let size = approx_dir_size_gb(&snap.path);
@@ -1701,8 +1686,6 @@ pub(crate) fn detect_family(model_id: &str) -> &'static str {
         "other"
     }
 }
-
-// /export — markdown conversation dump.
 
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 fn handle_export_command(model_id: &str, history: &[ChatMessage], path_arg: &str) {
@@ -1762,7 +1745,6 @@ fn resolve_export_path(path_arg: &str) -> PathBuf {
     p
 }
 
-/// Build the markdown body for a conversation export.
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 fn render_history_markdown(model_id: &str, history: &[ChatMessage]) -> String {
     let ts = iso8601_utc_now();
@@ -1809,7 +1791,6 @@ pub(crate) fn format_iso8601_utc_secs(unix_secs: u64) -> String {
 
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 fn format_iso8601_utc(unix_secs: u64) -> String {
-    // Days since 1970-01-01.
     let days = unix_secs / 86_400;
     let rem = unix_secs % 86_400;
     let h = rem / 3_600;

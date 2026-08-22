@@ -1,8 +1,3 @@
-//! HuggingFace Hub model search.
-//!
-//! Searches both official and community repos (mlx-community, TheBloke, etc.)
-//! with a 5-second timeout fallback.
-
 use anyhow::Result;
 use serde::Deserialize;
 
@@ -10,7 +5,6 @@ const HF_API_BASE: &str = "https://huggingface.co/api/models";
 const SEARCH_LIMIT: usize = 30;
 const TIMEOUT_SECS: u64 = 5;
 
-/// A model returned from the HuggingFace API.
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct HfSearchResult {
     #[serde(rename = "modelId")]
@@ -25,7 +19,6 @@ pub(crate) struct HfSearchResult {
 }
 
 impl HfSearchResult {
-    /// Format for display in the picker.
     pub(crate) fn display_line(&self) -> String {
         let dl = format_count(self.downloads);
         let lk = format_count(self.likes);
@@ -33,10 +26,6 @@ impl HfSearchResult {
     }
 }
 
-/// Search HuggingFace for text-generation models matching the query.
-///
-/// Returns up to `SEARCH_LIMIT` results sorted by downloads. Falls back
-/// gracefully on network errors.
 pub(crate) fn search_hf_models(query: &str) -> Result<Vec<HfSearchResult>> {
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(TIMEOUT_SECS))

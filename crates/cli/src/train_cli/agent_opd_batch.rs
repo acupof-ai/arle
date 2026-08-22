@@ -7,9 +7,9 @@ struct TaskStats {
     retired: bool,
 }
 
-/// Pass-rate task selection: variance-weighted sampling — concentrate rollout
-/// on the p≈0.5 max-variance band where reward-bearing R(p,k)=1−p^k−(1−p)^k peaks
-/// — plus EMA-pass retirement of mastered tasks, with a 0.1 exploration floor.
+/// Variance-weighted sampling — concentrate rollout on the p≈0.5 max-variance
+/// band where reward-bearing R(p,k)=1−p^k−(1−p)^k peaks — plus EMA-pass
+/// retirement of mastered tasks, with a 0.1 exploration floor.
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 pub(super) struct TaskSelection {
     rng: PromptSampler,
@@ -38,7 +38,7 @@ impl TaskSelection {
         (v / 0.25).max(0.1)
     }
 
-    /// Update from a completed group; skipped rounds freeze the estimate.
+    /// Skipped rounds freeze the estimate.
     pub(super) fn record(&mut self, task: usize, pass_rate: f32) {
         let s = &mut self.stats[task];
         let ema = s.ema_pass.map_or(pass_rate, |e| 0.3 * pass_rate + 0.7 * e);
@@ -52,7 +52,6 @@ impl TaskSelection {
         self.stats[task].retired
     }
 
-    /// Task indices to run this round + (skipped, retired) counts.
     /// Round 0 runs ALL tasks: no history yet, and the baseline needs it.
     pub(super) fn select(&mut self, round: usize) -> (Vec<usize>, usize, usize) {
         let (mut run, mut skipped, mut retired) = (Vec::new(), 0, 0);
@@ -70,7 +69,6 @@ impl TaskSelection {
     }
 }
 
-/// Experience replay: age-bounded, |A|-prioritized buffer of trained groups.
 /// Entries retain the generation-time behavior sidecars, so every reuse stays
 /// corrected against the policy that sampled the trajectories.
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]

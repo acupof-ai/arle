@@ -33,8 +33,6 @@ struct TtyState {
     stderr: bool,
 }
 
-/// Print the `Resolution` section for a resolved (or failed) model source.
-/// Shared by `run` and `list_models`.
 fn print_resolution(selected: &Result<SelectedModelSource>) {
     println!("{}", style("Resolution").bold());
     match selected {

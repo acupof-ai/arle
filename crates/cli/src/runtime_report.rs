@@ -1,5 +1,3 @@
-//! Process resource report printed when the local agent CLI exits.
-
 #[cfg(unix)]
 use std::mem::MaybeUninit;
 
