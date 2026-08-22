@@ -27,7 +27,7 @@ impl Default for TrainRuntimeFlags {
             rollout_retain_interval: 2,
             rollout_progress_interval: 16,
             max_update_seq: 23_000,
-            opd_seq_chunk: 4096,
+            opd_seq_chunk: 0,
             autograd: autograd::AutogradRuntimeFlags::default(),
         }
     }
@@ -40,7 +40,7 @@ static WRITEBACK_FROZEN_PROMPT_KV: AtomicBool = AtomicBool::new(false);
 static ROLLOUT_RETAIN_INTERVAL: AtomicUsize = AtomicUsize::new(2);
 static ROLLOUT_PROGRESS_INTERVAL: AtomicUsize = AtomicUsize::new(16);
 static MAX_UPDATE_SEQ: AtomicUsize = AtomicUsize::new(23_000);
-static OPD_SEQ_CHUNK: AtomicUsize = AtomicUsize::new(4096);
+static OPD_SEQ_CHUNK: AtomicUsize = AtomicUsize::new(0);
 
 pub fn apply_runtime_flags(f: &TrainRuntimeFlags) {
     WRITEBACK_OFFLOAD.store(f.writeback_offload, Relaxed);
@@ -52,7 +52,7 @@ pub fn apply_runtime_flags(f: &TrainRuntimeFlags) {
     ROLLOUT_RETAIN_INTERVAL.store(f.rollout_retain_interval.max(1), Relaxed);
     ROLLOUT_PROGRESS_INTERVAL.store(f.rollout_progress_interval.max(1), Relaxed);
     MAX_UPDATE_SEQ.store(f.max_update_seq, Relaxed);
-    OPD_SEQ_CHUNK.store(f.opd_seq_chunk.max(1), Relaxed);
+    OPD_SEQ_CHUNK.store(f.opd_seq_chunk, Relaxed);
     autograd::apply_runtime_flags(&f.autograd);
 }
 
@@ -61,8 +61,24 @@ pub(crate) fn max_update_seq() -> usize {
 }
 
 /// MLP + full-attention recompute chunk. Always on — exact under position-wise/q-tiling.
-pub fn opd_seq_chunk() -> usize {
-    OPD_SEQ_CHUNK.load(Relaxed)
+///
+/// `0` (the default) derives the chunk from this rank's sequence: fewer, larger
+/// chunks cut the per-chunk slice/alloc/tape overhead, but the replay transient
+/// grows with the chunk while the headroom shrinks as the rank's sequence grows.
+/// Measured on 27B/H20 (wins 2026-08-22): rank 65,536 runs 16,384 with the peak
+/// flat and the step −11%; rank 131,072 runs 8,192 (−15%) and OOMs at 16,384.
+/// Both sit on `chunk * rank_seq <= 2^30`, capped at 16,384 (untested above).
+pub fn opd_seq_chunk_for(rank_seq: usize) -> usize {
+    const CAP: usize = 16384;
+    const FLOOR: usize = 4096;
+    const BUDGET: usize = 1 << 30;
+    match OPD_SEQ_CHUNK.load(Relaxed) {
+        0 => {
+            let derived = BUDGET.checked_div(rank_seq).unwrap_or(CAP);
+            derived.clamp(FLOOR, CAP).next_power_of_two().min(CAP)
+        }
+        fixed => fixed,
+    }
 }
 
 pub(crate) fn writeback_offload() -> bool {

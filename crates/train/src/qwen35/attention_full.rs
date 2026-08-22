@@ -114,7 +114,7 @@ impl Qwen35Layer {
                 local_attention_heads,
                 local_key_value_heads,
                 kv_repeat,
-                crate::runtime_flags::opd_seq_chunk(),
+                crate::runtime_flags::opd_seq_chunk_for(seq_len),
                 store,
                 tape,
             );
@@ -176,7 +176,7 @@ impl Qwen35Layer {
         let out = autograd::ops::checkpoint_seq_chunked(
             h,
             extra,
-            crate::runtime_flags::opd_seq_chunk(),
+            crate::runtime_flags::opd_seq_chunk_for(seq_len),
             store,
             tape,
             move |st, tp, start, inp| {

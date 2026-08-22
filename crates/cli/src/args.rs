@@ -1088,8 +1088,9 @@ pub(crate) struct OpdRuntimeArgs {
     #[arg(long, default_value_t = 23_000, value_name = "TOKENS")]
     pub(crate) max_update_seq: usize,
 
-    /// Sequence rows per position-wise recompute chunk in the OPD backward.
-    #[arg(long, default_value_t = 4096, value_name = "ROWS")]
+    /// Sequence rows per position-wise recompute chunk in the OPD backward
+    /// (0 = derive from this rank's sequence length).
+    #[arg(long, default_value_t = 0, value_name = "ROWS")]
     pub(crate) opd_seq_chunk: usize,
 
     /// Rollout tensor retain interval (steps).

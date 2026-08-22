@@ -113,7 +113,7 @@ impl Qwen35Layer {
             autograd::ops::checkpoint_seq_chunked(
                 h,
                 param_ids,
-                crate::runtime_flags::opd_seq_chunk(),
+                crate::runtime_flags::opd_seq_chunk_for(seq_len),
                 store,
                 tape,
                 move |st, tp_tape, _start, inp| {

@@ -241,10 +241,14 @@ fn chunked_proj(
     collect_linear_ids(proj, &mut param_ids);
     param_ids.retain(|&id| store.get(id).is_some_and(|t| t.requires_grad));
     let proj = proj.clone();
+    let rank_seq = store
+        .get(x)
+        .and_then(|t| t.shape.get(1).copied())
+        .unwrap_or(0);
     Ok(autograd::ops::checkpoint_seq_chunked(
         x,
         param_ids,
-        crate::runtime_flags::opd_seq_chunk(),
+        crate::runtime_flags::opd_seq_chunk_for(rank_seq),
         store,
         tape,
         move |st, tp, _start, inp| proj.forward(inp[0], st, tp),
