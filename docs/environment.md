@@ -39,7 +39,7 @@ workers see them; train flags apply via `train::apply_runtime_flags`):
 | `ARLE_QWEN35_GPU_ROUTER` | `arle serve --qwen35-gpu-router` |
 | `ARLE_QWEN35_FA3` / `_FA3_DECODE_SPLITS` | `arle serve --qwen35-fa3` / `--qwen35-fa3-decode-splits` |
 | `ARLE_QWEN35_GDR_CHUNKED` | `arle serve --qwen35-gdr-chunked` |
-| `INFER_CUDA_DECODE_GRAPH` | `arle serve --cuda-graph` / `--no-cuda-graph` (env override removed) |
+| `INFER_CUDA_DECODE_GRAPH` | removed with the dense Qwen3 CUDA path; Qwen3.5/3.6 use `--qwen35-decode-graph`, DSv4 `ARLE_DSV4_*` |
 | `INFER_DECODE_METADATA_FAST_PAGE16` | `arle serve --decode-metadata-fast-page16` |
 | `ARLE_CUDA_MEMPOOL_RETAIN` | `arle serve --cuda-mempool-retain` |
 | `ARLE_CUDA_SHARD_CACHE_BYTES` | `arle serve --shard-cache-bytes` |
@@ -232,7 +232,7 @@ self-conditioning, and final canvas commit. Set it to `0`, `false`, `off`, or
 The max denoise step budget is a CLI flag:
 `arle serve --diffusion-max-denoising-steps N` (replaced
 `ARLE_DIFFUSION_MAX_DENOISING_STEPS`, 2026-07-10). Lower values can improve
-output tok/s but are not a quality-preserving default unless separately gated.
+decode speed but are not a quality-preserving default unless separately gated.
 
 ```bash
 ARLE_DIFFUSION_CPP_PROFILE=0 ./target/release/arle \

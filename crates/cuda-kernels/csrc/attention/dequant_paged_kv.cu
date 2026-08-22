@@ -1,4 +1,4 @@
-// Dequantize ARLE's 1-byte quantized KV planes (FP8 e4m3 or INT8, KIVI
+// Dequantize ARLE's 1-byte quantized KV planes (FP8 e4m3 or INT8,
 // per-(token, kv_head) f32 scales) to bf16.
 //
 // Entry point:

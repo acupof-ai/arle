@@ -52,7 +52,6 @@ pub(super) fn load_opd_infer_student(
         student_dir
             .to_str()
             .ok_or_else(|| anyhow!("student model path is not valid UTF-8"))?,
-        true,
         EngineLoadConfig {
             dspark_draft_model: runtime.dspark_draft_model.clone(),
             dspark_sps_bias_ms: runtime.dspark_sps_bias_ms,
@@ -236,12 +235,6 @@ pub(super) fn load_agent_opd_serve_student(
         student_dir
             .to_str()
             .ok_or_else(|| anyhow!("student path is not valid UTF-8"))?,
-        // agent-OPD: decode CUDA-graph default-OFF. Its captured workspace (~30 GB
-        // on the 27B MoE, captured during the rollout's decode) would co-reside
-        // with the masked-CE writeback and OOM it (post-rollout engine ~87 GB vs
-        // ~55 GB no-graph). A measured ~26 GB headroom made it worth exposing as
-        // --qwen35-decode-graph; the default flip waits for the co-residency license.
-        args.runtime.qwen35_decode_graph,
         EngineLoadConfig {
             num_slots: width,
             page_size: 16,

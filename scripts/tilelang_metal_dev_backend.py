@@ -35,8 +35,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--heads",
-        default="32,8",
-        help="ARLE HD128 attention head config as '<num_q_heads>,<num_kv_heads>'.",
+        default="16,4",
+        help="ARLE HD256 attention head config as '<num_q_heads>,<num_kv_heads>'.",
     )
     parser.add_argument(
         "--gemm-size",
@@ -80,12 +80,12 @@ def load_arle_kernel_module(arle_root: Path):
         / "cuda-kernels"
         / "tools"
         / "tilelang"
-        / "batch_prefill_paged_hd128.py"
+        / "batch_prefill_paged_hd256.py"
     )
     if not kernel_path.exists():
         raise SystemExit(f"Missing ARLE TileLang kernel: {kernel_path}")
 
-    spec = importlib.util.spec_from_file_location("arle_tilelang_hd128", kernel_path)
+    spec = importlib.util.spec_from_file_location("arle_tilelang_hd256", kernel_path)
     if spec is None or spec.loader is None:
         raise SystemExit(f"Could not load ARLE TileLang kernel: {kernel_path}")
     module = importlib.util.module_from_spec(spec)

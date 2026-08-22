@@ -587,26 +587,11 @@ fn emit_ffi_generated(reg: &Registry, out_dir: &Path) {
     // AttnPhase enum (the distinct ffi=true attention phases).
     s.push_str(
         "#[allow(dead_code)]\n#[derive(Clone, Copy, PartialEq, Eq, Debug)]\n\
-         pub enum AttnPhase { Prefill, Decode, SplitPartial, SplitMerge }\n\n",
+         pub enum AttnPhase { Prefill, Decode }\n\n",
     );
 
-    // (C) resolve_* per ffi=true ABI. paged_attn_v1 keys on (hd,q,kv,phase);
-    // the split ABIs are phase-mono so they key on (hd,q,kv).
+    // (C) resolve_* for the ffi=true paged_attn_v1 ABI, keyed on (hd,q,kv,phase).
     emit_resolve_paged_attn_v1(&mut s, reg);
-    emit_resolve_mono(
-        &mut s,
-        reg,
-        "paged_attn_split_partial_v1",
-        "resolve_paged_attn_split_partial_v1",
-        "PagedAttnSplitPartialV1Fn",
-    );
-    emit_resolve_mono(
-        &mut s,
-        reg,
-        "paged_attn_split_merge_v1",
-        "resolve_paged_attn_split_merge_v1",
-        "PagedAttnSplitMergeV1Fn",
-    );
 
     let out = out_dir.join("ffi_tilelang_generated.rs");
     std::fs::write(&out, s).expect("write ffi_tilelang_generated.rs");
@@ -706,22 +691,6 @@ fn emit_resolve_paged_attn_v1(s: &mut String, reg: &Registry) {
             k.kernel_name
         )
         .unwrap();
-    }
-    s.push_str("        _ => return None,\n    })\n}\n\n");
-}
-
-fn emit_resolve_mono(s: &mut String, reg: &Registry, abi: &str, fn_name: &str, fn_ty: &str) {
-    use std::fmt::Write as _;
-    writeln!(
-        s,
-        "#[allow(dead_code)]\n\
-        pub fn {fn_name}(head_dim: u32, q_heads: u32, kv_heads: u32) -> Option<{fn_ty}> {{\n\
-        \x20   Some(match (head_dim, q_heads, kv_heads) {{"
-    )
-    .unwrap();
-    for k in reg.kernels.iter().filter(|k| k.ffi && k.abi == abi) {
-        let (hd, q, kv) = (k.head_dim.unwrap(), k.q_heads.unwrap(), k.kv_heads.unwrap());
-        writeln!(s, "        ({hd}, {q}, {kv}) => {}_cuda,", k.kernel_name).unwrap();
     }
     s.push_str("        _ => return None,\n    })\n}\n\n");
 }
@@ -1728,12 +1697,12 @@ fn compile_tilelang_aot_kernels(
 
     println!("cargo:rustc-link-lib=cuda");
     println!(
-        "cargo:warning=TileLang AOT: built per-SM cubins for {} target(s) across HD64/HD128/HD256 prefill, HD64/HD128/HD256 decode, and Qwen3.5 GDR; SM dispatch via __thread cache + cuDeviceGetAttribute. See docs/environment.md.",
+        "cargo:warning=TileLang AOT: built per-SM cubins for {} target(s) across HD64/HD256 prefill, HD64/HD256 decode, and Qwen3.5 GDR; SM dispatch via __thread cache + cuDeviceGetAttribute. See docs/environment.md.",
         sm_targets.len()
     );
     if has_legacy_volta(sm_targets) {
         println!(
-            "cargo:warning=sm_70 legacy Volta build: TileLang AOT emits BF16 Qwen3.5/3.6 dense-attention (all HD128/HD256 BF16 configs) and GDR cubins; FP8 KV (sm_80+), DSv4 HD64, and HD64 wrappers return CUDA_ERROR_NOT_SUPPORTED."
+            "cargo:warning=sm_70 legacy Volta build: TileLang AOT emits BF16 Qwen3.5/3.6 full-attention (all HD256 BF16 configs) and GDR cubins; FP8 KV (sm_80+), DSv4 HD64, and HD64 wrappers return CUDA_ERROR_NOT_SUPPORTED."
         );
     }
     for entry in std::fs::read_dir("tools/tilelang")

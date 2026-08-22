@@ -258,7 +258,7 @@ fn run_impl(args: Args, run_args: Option<RunArgs>) -> Result<()> {
 
         log::info!("Loading model from: {}", model_source);
         let load_start = Instant::now();
-        let mut engine = match LoadedInferenceEngine::load(&model_source, !args.no_cuda_graph) {
+        let mut engine = match LoadedInferenceEngine::load(&model_source) {
             Ok(e) => e,
             Err(err) => {
                 // Detect the specific case where a user pointed at a DFlash

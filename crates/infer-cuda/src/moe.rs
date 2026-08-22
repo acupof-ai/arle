@@ -138,6 +138,4 @@ pub(crate) use dsv4::{
 #[cfg(feature = "deepep")]
 pub(crate) use dsv4_deepep::{dsv4_moe_forward_deepep, dsv4_moe_forward_deepep_ll};
 #[cfg(feature = "cuda")]
-pub(crate) use qwen::{
-    MoeForwardScratch, moe_forward, moe_forward_into, qwen35_decode_moe_graph_capturable,
-};
+pub(crate) use qwen::{MoeForwardScratch, moe_forward_into, qwen35_decode_moe_graph_capturable};

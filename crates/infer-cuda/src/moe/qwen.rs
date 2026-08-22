@@ -110,10 +110,6 @@ pub(crate) struct MoeForwardScratch {
 }
 
 impl MoeForwardScratch {
-    pub(crate) fn new() -> Self {
-        Self::default()
-    }
-
     pub(crate) fn release(&mut self) {
         let Self {
             logits,
@@ -195,21 +191,6 @@ pub(crate) fn qwen35_decode_moe_graph_capturable(cfg: &MoeConfig) -> bool {
     crate::runtime_flags::qwen35_gpu_router()
         && device_route_eligible(cfg)
         && cfg.top_k < QWEN35_DEEPGEMM_MIN_ROUTES
-}
-
-/// Allocate-per-call wrapper around [`moe_forward_into`]; the hot loop passes
-/// a persistent scratch instead.
-pub(crate) fn moe_forward(
-    ctx: &DeviceContext,
-    weights: &MoeLayerWeights,
-    normed: &HiddenStates,
-    cfg: &MoeConfig,
-    split: &ExpertSplit,
-) -> Result<HiddenStates> {
-    let mut scratch = MoeForwardScratch::new();
-    let mut out = HiddenStates::zeros(ctx, normed.hidden_dim, normed.seq_len)?;
-    moe_forward_into(ctx, weights, normed, cfg, split, &mut scratch, &mut out)?;
-    Ok(out)
 }
 
 /// BF16 MoE forward for one sparse layer. `normed` is the post-LN hidden

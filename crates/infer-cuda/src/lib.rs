@@ -23,10 +23,6 @@ use infer_seam::{
 
 #[cfg(feature = "cuda")]
 mod attention;
-#[cfg(feature = "cuda")]
-mod decode_graph;
-// Not cuda-gated: pure host capture-key math, CPU-testable without nvcc.
-mod decode_graph_key;
 #[cfg(all(feature = "cuda", feature = "deepep"))]
 mod deepep;
 // DSv4-Flash FP8 model (loader + structs + MLA KV arena). cuda-gated: holds
@@ -59,7 +55,6 @@ mod linear_profile;
 mod loader;
 // GPU-NUMA worker pinning (boot one-shot; rank-skew mitigation).
 #[cfg(feature = "cuda")]
-mod model;
 #[cfg(feature = "cuda")]
 mod numa_pin;
 // CLI-driven runtime toggles (EngineLoadConfig.cuda → statics; no env reads).
@@ -105,7 +100,6 @@ pub use executor::CudaKvCacheDtype;
 /// runs acceptance-weighted policy gradient against the acceptance reward.
 #[cfg(feature = "cuda")]
 #[cfg(feature = "cuda")]
-pub use executor::set_decode_graph_default;
 /// Tier budget resolution: machine-derived disk budget when `--kv-disk` has no
 /// `--kv-disk-limit` (probes free disk), and the per-rank L2 share from a
 /// deployment-total `--kv-dram` request.
@@ -191,7 +185,7 @@ pub mod shard_slice;
 pub mod moe_config;
 
 // Not cuda-gated: the host route→assignment flattening is CPU-tested; the device
-// `moe_forward` lives in the inner `cuda`-gated module.
+// `moe_forward_into` lives in the inner `cuda`-gated module.
 mod moe;
 
 pub type CudaKvPool = HostPagedKvPool;
@@ -204,9 +198,8 @@ pub struct CudaInflight {
 
 /// CUDA backend executor.
 ///
-/// `new()` is the no-GPU placeholder for host tests;
-/// [`CudaExecutor::from_qwen3_bf16_safetensors`] (feature `cuda`) is the real
-/// dense BF16 Qwen3 path.
+/// `new()` is the no-GPU placeholder for host tests; the `from_*_safetensors`
+/// constructors (feature `cuda`) build the real executor.
 #[derive(Default)]
 pub struct CudaExecutor {
     inner: CudaExecutorInner,
@@ -269,35 +262,6 @@ impl CudaExecutor {
             #[cfg(feature = "cuda")]
             CudaExecutorInner::Real(real) => real.set_kv_tier_disk(root, budget_bytes),
         }
-    }
-
-    /// Build the real CUDA executor for dense BF16 Qwen3 safetensors ("bf16"
-    /// names the WEIGHTS dtype; `kv_dtype` selects the paged KV-cache format —
-    /// BF16 default or the INT8/FP8 quant pools, #68 T3).
-    ///
-    /// The shared paged pool is sized from MEASURED free VRAM after weights load
-    /// (`mem_fraction_static`, SGLang-style); `total_pages` is a minimum-capacity
-    /// floor. The ACTUAL page count the host [`CudaKvPool`] must mirror is
-    /// reported by [`Self::effective_total_pages`], not `total_pages`.
-    #[cfg(feature = "cuda")]
-    pub fn from_qwen3_bf16_safetensors(
-        model_path: impl AsRef<Path>,
-        num_slots: usize,
-        total_pages: usize,
-        kv_dtype: CudaKvCacheDtype,
-        mem_fraction_static: f64,
-    ) -> anyhow::Result<Self> {
-        Ok(Self {
-            inner: CudaExecutorInner::Real(Box::new(
-                executor::RealCudaExecutor::from_qwen3_bf16_safetensors(
-                    model_path,
-                    num_slots,
-                    total_pages,
-                    kv_dtype,
-                    mem_fraction_static,
-                )?,
-            )),
-        })
     }
 
     /// Build the real CUDA executor for a BF16 Qwen3.5/3.6 hybrid dense-or-MoE
@@ -502,7 +466,7 @@ impl CudaExecutor {
 
     /// Fold a fresh student LoRA update into the resident Qwen3.5/3.6
     /// projection weights (OPD per-step re-merge). Errors on the no-GPU
-    /// placeholder and on non-student CUDA models (dense Qwen3 / DSv4).
+    /// placeholder and on non-student CUDA models (DSv4).
     #[cfg(feature = "cuda")]
     pub fn remerge_student_lora(
         &mut self,
@@ -883,20 +847,14 @@ impl infer_seam::PrefixReuse for CudaExecutor {
 }
 
 impl infer_seam::KvPageTier for CudaExecutor {
+    // No CUDA arm has a page-addressable device pool; Qwen3.5/3.6 and DSv4
+    // park whole slots via the slot-tier hooks instead.
     fn kv_tier_capacity_pages(&self) -> usize {
-        match &self.inner {
-            CudaExecutorInner::Placeholder => 0,
-            #[cfg(feature = "cuda")]
-            CudaExecutorInner::Real(real) => real.kv_tier_capacity_pages(),
-        }
+        0
     }
 
     fn kv_tier_page_bytes(&self) -> usize {
-        match &self.inner {
-            CudaExecutorInner::Placeholder => 0,
-            #[cfg(feature = "cuda")]
-            CudaExecutorInner::Real(real) => real.kv_tier_page_bytes(),
-        }
+        0
     }
 
     fn kv_tier_host_demoted_pages(&self) -> usize {
@@ -946,37 +904,15 @@ impl infer_seam::KvPageTier for CudaExecutor {
         }
     }
 
-    fn demote_prefix_pages(&mut self, entries: &[(u32, u64)]) -> anyhow::Result<usize> {
-        match &mut self.inner {
-            CudaExecutorInner::Placeholder => {
-                let _ = entries;
-                Ok(0)
-            }
-            #[cfg(feature = "cuda")]
-            CudaExecutorInner::Real(real) => real.demote_prefix_pages(entries),
-        }
+    fn demote_prefix_pages(&mut self, _entries: &[(u32, u64)]) -> anyhow::Result<usize> {
+        Ok(0)
     }
 
-    fn promote_prefix_pages(&mut self, entries: &[(u64, u32)]) -> anyhow::Result<()> {
-        match &mut self.inner {
-            CudaExecutorInner::Placeholder => {
-                let _ = entries;
-                anyhow::bail!("placeholder CUDA executor has no KV tier store")
-            }
-            #[cfg(feature = "cuda")]
-            CudaExecutorInner::Real(real) => real.promote_prefix_pages(entries),
-        }
+    fn promote_prefix_pages(&mut self, _entries: &[(u64, u32)]) -> anyhow::Result<()> {
+        anyhow::bail!("CUDA executor has no page-granular KV tier store")
     }
 
-    fn drop_kv_tier_entries(&mut self, keys: &[u64]) {
-        match &mut self.inner {
-            CudaExecutorInner::Placeholder => {
-                let _ = keys;
-            }
-            #[cfg(feature = "cuda")]
-            CudaExecutorInner::Real(real) => real.drop_kv_tier_entries(keys),
-        }
-    }
+    fn drop_kv_tier_entries(&mut self, _keys: &[u64]) {}
 }
 
 impl infer_seam::KvSlotTier for CudaExecutor {

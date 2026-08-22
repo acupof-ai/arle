@@ -125,7 +125,7 @@ fn main() -> anyhow::Result<()> {
         config.total_pages = min_pages;
     }
 
-    let mut engine = LoadedInferenceEngine::load_with_config(&model, true, config)?;
+    let mut engine = LoadedInferenceEngine::load_with_config(&model, config)?;
     infer_metal::clear_metal_cache();
     let after_load = infer_metal::allocator_memory();
 

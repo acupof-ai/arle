@@ -6,8 +6,6 @@ families:
 
 * ``attention``: paged prefill/decode kernels specialized by
   ``(num_q_heads, num_kv_heads)``.
-* ``attention_bf16_split_partial`` / ``attention_bf16_split_merge``:
-  HD128 BF16 decode split-KV phase kernels.
 * ``gdr``: the seven Qwen3.5 chunk-wise Gated Delta Rule stages, selected by
   ``--kernel-key``.
 
@@ -86,104 +84,6 @@ ATTENTION_SPEC = WrapperSpec(
     int grid_x = (qlen + block_m - 1) / block_m;
     int grid_y = num_q_heads;
     int grid_z = batch_size;""",
-)
-
-ATTENTION_BF16_SPLIT_PARTIAL_PUBLIC_PARAMS = """    uint16_t *q,
-    const int32_t *q_indptr,
-    uint16_t *k_pool,
-    uint16_t *v_pool,
-    const int32_t *kv_indptr,
-    const int32_t *kv_indices,
-    const int32_t *kv_last_page_len,
-    float *partial_out,
-    float *partial_m,
-    float *partial_l,
-    int32_t batch_size,
-    int32_t total_q_tokens,
-    int32_t max_qlen,
-    int32_t num_pages,
-    int32_t total_pages,
-    int32_t num_q_heads,
-    int32_t num_kv_heads,
-    int32_t page_size,
-    float sm_scale,
-    int32_t num_splits,
-    CUstream stream"""
-
-ATTENTION_BF16_SPLIT_PARTIAL_SPEC = WrapperSpec(
-    public_params=ATTENTION_BF16_SPLIT_PARTIAL_PUBLIC_PARAMS,
-    tensor_inputs={
-        "KV_indices": "kv_indices",
-        "KV_indptr": "kv_indptr",
-        "KV_last_page_len": "kv_last_page_len",
-        "K_pool": "k_pool",
-        "Partial_l": "partial_l",
-        "Partial_m": "partial_m",
-        "Partial_out": "partial_out",
-        "Q": "q",
-        "Q_indptr": "q_indptr",
-        "V_pool": "v_pool",
-    },
-    scalar_inputs={
-        "batch_size": ("int32_t", "batch_size"),
-        "max_qlen": ("int32_t", "max_qlen"),
-        "num_pages": ("int32_t", "num_pages"),
-        "num_splits": ("int32_t", "num_splits"),
-        "total_pages": ("int32_t", "total_pages"),
-        "total_q_tokens": ("int32_t", "total_q_tokens"),
-    },
-    prelude="""    (void)q_indptr;
-    (void)max_qlen;
-    (void)num_kv_heads;
-    (void)page_size;
-    (void)sm_scale;""",
-    grid="""    int grid_x = batch_size;
-    int grid_y = num_q_heads;
-    int grid_z = num_splits;""",
-)
-
-ATTENTION_BF16_SPLIT_MERGE_PUBLIC_PARAMS = """    const float *partial_out,
-    const float *partial_m,
-    const float *partial_l,
-    uint16_t *o,
-    int32_t batch_size,
-    int32_t total_q_tokens,
-    int32_t max_qlen,
-    int32_t num_pages,
-    int32_t total_pages,
-    int32_t num_q_heads,
-    int32_t num_kv_heads,
-    int32_t page_size,
-    float sm_scale,
-    int32_t num_splits,
-    CUstream stream"""
-
-ATTENTION_BF16_SPLIT_MERGE_SPEC = WrapperSpec(
-    public_params=ATTENTION_BF16_SPLIT_MERGE_PUBLIC_PARAMS,
-    tensor_inputs={
-        "Output": "o",
-        "Partial_l": "partial_l",
-        "Partial_m": "partial_m",
-        "Partial_out": "partial_out",
-    },
-    scalar_inputs={
-        "batch_size": ("int32_t", "batch_size"),
-        "max_qlen": ("int32_t", "max_qlen"),
-        "num_pages": ("int32_t", "num_pages"),
-        "num_splits": ("int32_t", "num_splits"),
-        "total_pages": ("int32_t", "total_pages"),
-        "total_q_tokens": ("int32_t", "total_q_tokens"),
-    },
-    prelude="""    (void)batch_size;
-    (void)max_qlen;
-    (void)num_pages;
-    (void)total_pages;
-    (void)num_kv_heads;
-    (void)page_size;
-    (void)sm_scale;""",
-    grid="""    int grid_x = total_q_tokens;
-    int grid_y = num_q_heads;
-    int grid_z = 1;""",
 )
 
 # M_b.2 — FP8 E4M3 KV variant. K_pool / V_pool come in as `uint8_t*` (FP8
@@ -932,8 +832,6 @@ def main() -> int:
         "--kernel-family",
         choices=[
             "attention",
-            "attention_bf16_split_partial",
-            "attention_bf16_split_merge",
             "attention_fp8",
             "gdr",
             "flashqla",
@@ -965,30 +863,6 @@ def main() -> int:
             raise RuntimeError("attention kernels require --num-q-heads and --num-kv-heads")
         prim_func = load_attention_kernel(args.kernel_path, args.num_q_heads, args.num_kv_heads)
         wrapper_spec = ATTENTION_SPEC
-    elif args.kernel_family == "attention_bf16_split_partial":
-        if args.num_q_heads is None or args.num_kv_heads is None:
-            raise RuntimeError(
-                "attention_bf16_split_partial kernels require --num-q-heads and --num-kv-heads"
-            )
-        prim_func = load_attention_kernel(
-            args.kernel_path,
-            args.num_q_heads,
-            args.num_kv_heads,
-            kernel_key=args.kernel_key or "split_partial",
-        )
-        wrapper_spec = ATTENTION_BF16_SPLIT_PARTIAL_SPEC
-    elif args.kernel_family == "attention_bf16_split_merge":
-        if args.num_q_heads is None or args.num_kv_heads is None:
-            raise RuntimeError(
-                "attention_bf16_split_merge kernels require --num-q-heads and --num-kv-heads"
-            )
-        prim_func = load_attention_kernel(
-            args.kernel_path,
-            args.num_q_heads,
-            args.num_kv_heads,
-            kernel_key=args.kernel_key or "split_merge",
-        )
-        wrapper_spec = ATTENTION_BF16_SPLIT_MERGE_SPEC
     elif args.kernel_family == "attention_fp8":
         if args.num_q_heads is None or args.num_kv_heads is None:
             raise RuntimeError("attention_fp8 kernels require --num-q-heads and --num-kv-heads")

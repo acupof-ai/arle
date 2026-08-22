@@ -1,7 +1,7 @@
 //! `LoadedInferenceEngine` — the backend-dispatching public engine.
 //!
 //! A feature-gated enum over the available backends (`metal`/`cuda`/`hip`/`vulkan`/`cpu`,
-//! selected at compile time) with a `load(model_path, enable_cuda_graph)`
+//! selected at compile time) with a `load(model_path)`
 //! constructor dispatching to the active variant. [`EngineLoadConfig`] is always
 //! available; the enum + impls require a backend feature.
 
@@ -81,8 +81,8 @@ pub struct EngineLoadConfig {
     /// MEASURED free VRAM after weights load (SGLang's `mem_fraction_static`).
     /// `reserve = total × (1 − frac)` is left for activations/scratch; the rest
     /// of free VRAM becomes the KV token pool. Clamped to `[0.05, 0.97]` by the
-    /// sizer. Wired for the dense Qwen3 CUDA pool (`profile_kv_pool_tokens`);
-    /// Qwen3.5/3.6 and DSv4 keep their per-slot sizing this phase.
+    /// sizer. Wired for the Qwen3.5/3.6 full-attention pool
+    /// (`profile_kv_pool_tokens`); DSv4 keeps its per-slot sizing.
     #[serde(default = "default_mem_fraction_static")]
     pub mem_fraction_static: f64,
     /// L2 (host DRAM) KV tier budget, deployment-total. Default: half of
@@ -339,7 +339,8 @@ impl EngineLoadConfig {
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CudaModelKind {
-    Qwen3Dense,
+    /// Dense Qwen3 (`model_type=qwen3`, `Qwen3ForCausalLM`): no CUDA path.
+    DenseQwen3Unsupported,
     Qwen35,
     /// DeepSeek-V4-Flash (multi-GPU only).
     Dsv4,
@@ -356,7 +357,8 @@ pub(crate) enum CudaModelKind {
 
 /// Pure classification of a parsed `config.json`: DeepSeek-V4 by
 /// `model_type`/`architectures`, else MoE if an expert count or `*Moe*`
-/// architecture is present, else dense Qwen3. Kept dependency-light + testable.
+/// architecture is present, else dense Qwen3 (unsupported). Kept
+/// dependency-light + testable.
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 pub(crate) fn classify_cuda_model(v: &serde_json::Value) -> CudaModelKind {
     let model_type = v.get("model_type").and_then(|x| x.as_str()).unwrap_or("");
@@ -403,7 +405,7 @@ pub(crate) fn classify_cuda_model(v: &serde_json::Value) -> CudaModelKind {
     if is_qwen35 || is_moe {
         CudaModelKind::Qwen35
     } else {
-        CudaModelKind::Qwen3Dense
+        CudaModelKind::DenseQwen3Unsupported
     }
 }
 
@@ -474,7 +476,7 @@ mod backend {
         pub(super) fn scheduler_config(&self) -> SchedulerConfig {
             let mut config = SchedulerConfig::for_slots(self.hot_workspace_slots());
             // Prompt cap = min(requested, KV capacity − gen reserve). For shared
-            // KV pools (dense Qwen3/Qwen3.6/DSv4) the device pool is profiled
+            // KV pools (Qwen3.6/DSv4) the device pool is profiled
             // from free VRAM after load, so `total_pages` here is just the
             // advisory default (8192) — using it would cap prompts at 114k even
             // though the profiled pool holds 770k+. Bind to `max_total_tokens`
@@ -553,28 +555,22 @@ mod backend {
     }
 
     impl LoadedInferenceEngine {
-        /// `enable_cuda_graph` is honored by the CUDA path only.
-        ///
         /// Single-user load (REPL, OCR): caps slots at 1 so the GDR recurrent
         /// state doesn't reserve `num_slots`× per-slot bytes (12 GiB for a 9B
         /// model at the default 256 slots). Multi-request serving uses
         /// `load_with_config` with the serve-derived slot budget.
-        pub fn load(model_path: &str, enable_cuda_graph: bool) -> Result<Self> {
+        pub fn load(model_path: &str) -> Result<Self> {
             let config = EngineLoadConfig {
                 max_running_requests: Some(1),
                 ..EngineLoadConfig::default()
             };
-            Self::load_with_config(model_path, enable_cuda_graph, config)
+            Self::load_with_config(model_path, config)
         }
 
         // Each arm is a feature-gated `return` (the tail arm varies by feature
         // set), so a bare expression would not compile in single-backend builds.
         #[allow(clippy::needless_return)]
-        pub fn load_with_config(
-            model_path: &str,
-            enable_cuda_graph: bool,
-            config: EngineLoadConfig,
-        ) -> Result<Self> {
+        pub fn load_with_config(model_path: &str, config: EngineLoadConfig) -> Result<Self> {
             // Model-driven serve defaults for omitted sampling fields (nucleus +
             // temperature). The cc rollout lane overrides `.temperature` after this.
             infer_server::set_sampling_defaults(
@@ -583,18 +579,16 @@ mod backend {
 
             #[cfg(feature = "metal")]
             {
-                let _ = enable_cuda_graph;
                 return Self::load_metal(model_path, &config);
             }
 
             #[cfg(all(not(feature = "metal"), feature = "cuda"))]
             {
-                return Self::load_cuda(model_path, enable_cuda_graph, &config);
+                return Self::load_cuda(model_path, &config);
             }
 
             #[cfg(all(not(feature = "metal"), not(feature = "cuda"), feature = "hip"))]
             {
-                let _ = enable_cuda_graph;
                 return Self::load_hip(model_path, &config);
             }
 
@@ -605,7 +599,6 @@ mod backend {
                 feature = "vulkan"
             ))]
             {
-                let _ = enable_cuda_graph;
                 return Self::load_vulkan(model_path, &config);
             }
 
@@ -617,7 +610,6 @@ mod backend {
                 feature = "cpu"
             ))]
             {
-                let _ = enable_cuda_graph;
                 return Self::load_cpu(model_path, &config);
             }
         }
@@ -1284,22 +1276,12 @@ mod backend {
         }
 
         #[cfg(feature = "cuda")]
-        fn load_cuda(
-            model_path: &str,
-            enable_cuda_graph: bool,
-            config: &EngineLoadConfig,
-        ) -> Result<Self> {
-            // Single-GPU CUDA load: dispatch by checkpoint kind (Qwen3 dense +
-            // Qwen3.5/3.6 MoE; DSv4 is multi-GPU only and errors). `enable_cuda_graph`
-            // (CLI --cuda-graph, default on) sets the decode-graph default;
-            // `--no-cuda-graph` controls it, `warmup` gates it off under TP/MoE.
-            // Shares the engine builder with `router_cuda` via `cuda_serve_handle`.
-            let (serve, tokenizer, model_id) = cuda_serve_handle(
-                model_path,
-                enable_cuda_graph,
-                config,
-                infer_server::ServeShutdown::new(),
-            )?;
+        fn load_cuda(model_path: &str, config: &EngineLoadConfig) -> Result<Self> {
+            // Single-GPU CUDA load: dispatch by checkpoint kind (Qwen3.5/3.6
+            // MoE; DSv4 is multi-GPU only and errors). Shares the engine
+            // builder with `router_cuda` via `cuda_serve_handle`.
+            let (serve, tokenizer, model_id) =
+                cuda_serve_handle(model_path, config, infer_server::ServeShutdown::new())?;
             Ok(Self::Cuda(ServeInferenceEngine::new(
                 model_id, tokenizer, serve,
             )))
@@ -1374,7 +1356,6 @@ mod backend {
     #[allow(clippy::needless_return)]
     pub(crate) fn router_for_backend(
         model_path: &str,
-        enable_cuda_graph: bool,
         config: EngineLoadConfig,
         shutdown: infer_server::ServeShutdown,
     ) -> Result<(axum::Router, Option<Arc<LoadedInferenceEngine>>)> {
@@ -1395,20 +1376,17 @@ mod backend {
 
         #[cfg(feature = "metal")]
         {
-            let _ = enable_cuda_graph;
             let router = router_metal(model_path, &config, shutdown)?;
             return Ok((router, None));
         }
 
         #[cfg(all(not(feature = "metal"), feature = "cuda"))]
         {
-            return router_cuda(model_path, enable_cuda_graph, &config, shutdown)
-                .map(|(r, e)| (r, Some(e)));
+            return router_cuda(model_path, &config, shutdown).map(|(r, e)| (r, Some(e)));
         }
 
         #[cfg(all(not(feature = "metal"), not(feature = "cuda"), feature = "hip"))]
         {
-            let _ = enable_cuda_graph;
             let router = router_hip(model_path, &config, shutdown)?;
             return Ok((router, None));
         }
@@ -1420,7 +1398,6 @@ mod backend {
             feature = "vulkan"
         ))]
         {
-            let _ = enable_cuda_graph;
             let router = router_vulkan(model_path, &config, shutdown)?;
             return Ok((router, None));
         }
@@ -1433,7 +1410,6 @@ mod backend {
             feature = "cpu"
         ))]
         {
-            let _ = enable_cuda_graph;
             let router = router_cpu(model_path, &config, shutdown)?;
             return Ok((router, None));
         }
@@ -1918,17 +1894,14 @@ mod backend {
         paged_pool_pages: usize,
     ) -> usize {
         let ps = page_size.max(1);
-        // Paged-pool models (dense Qwen3 + Qwen3.6 + DSv4 MLA latent pool): the
-        // host admission pool is exactly the device pool — the profiled page
-        // count, NOT a token-derived re-ceiling, and NOT floored at the requested
+        // Paged-pool models (Qwen3.6 + DSv4 MLA latent pool): the host
+        // admission pool is exactly the device pool — the profiled page count,
+        // NOT a token-derived re-ceiling, and NOT floored at the requested
         // config value. DSv4's MLA pool is now free-VRAM-sized like the others.
-        if matches!(
-            kind,
-            CudaModelKind::Qwen3Dense | CudaModelKind::Qwen35 | CudaModelKind::Dsv4
-        ) {
+        if matches!(kind, CudaModelKind::Qwen35 | CudaModelKind::Dsv4) {
             return paged_pool_pages.max(1);
         }
-        // DiffusionGemma | Qwen3MoeUnsupported
+        // DiffusionGemma | Qwen3MoeUnsupported | DenseQwen3Unsupported
         let capacity_tokens = config.total_pages.saturating_mul(ps);
         capacity_tokens.div_ceil(ps).max(config.total_pages)
     }
@@ -1943,7 +1916,6 @@ mod backend {
     #[cfg(feature = "cuda")]
     fn cuda_serve_handle(
         model_path: &str,
-        enable_cuda_graph: bool,
         config: &EngineLoadConfig,
         shutdown: infer_server::ServeShutdown,
     ) -> Result<(
@@ -1953,7 +1925,6 @@ mod backend {
     )> {
         use infer_server::OpenAiTokenizer;
 
-        infer_cuda::set_decode_graph_default(enable_cuda_graph);
         // Resolve HF id → local cache dir, downloading if absent. Mirrors the
         // Metal path's `infer_metal::resolve_model_path` so `arle serve
         // --model-path Qwen/Qwen3.5-4B` works on CUDA without a pre-download.
@@ -2072,17 +2043,19 @@ mod backend {
                  CUDA backend; use --backend metal"
             );
         }
+        if matches!(kind, CudaModelKind::DenseQwen3Unsupported) {
+            anyhow::bail!("Qwen3 dense is not supported on CUDA; use a Qwen3.5-family checkpoint");
+        }
         // Resolve the requested KV dtype against the CUDA support matrix at the
         // engine boundary, mirroring the Metal path's `MetalKvCacheDtype::resolve`
         // (#68 T2). Admits BF16/INT8/FP8 (tq4 fails loud — see resolve); the
-        // resolved dtype threads into the dense-Qwen3 constructor below (#68 T3).
+        // resolved dtype threads into the Qwen35 constructor below (#68 T3).
         let kv_dtype = infer_cuda::CudaKvCacheDtype::resolve(config.kv_cache_dtype)?;
-        if kv_dtype != infer_cuda::CudaKvCacheDtype::Bf16
-            && !matches!(kind, CudaModelKind::Qwen3Dense | CudaModelKind::Qwen35)
+        if kv_dtype != infer_cuda::CudaKvCacheDtype::Bf16 && !matches!(kind, CudaModelKind::Qwen35)
         {
             anyhow::bail!(
                 "--kv-cache-dtype {} is not supported for {kind:?}; \
-                 only Qwen3Dense and Qwen35 support quantized paged KV",
+                 only Qwen35 supports quantized paged KV",
                 kv_dtype.label()
             );
         }
@@ -2155,13 +2128,6 @@ mod backend {
         // this synchronous constructor call, no global side effects.
         let _tp_guard = TpEnvGuard::new(config.world_size, config.context_parallel_size);
         let executor = match kind {
-            CudaModelKind::Qwen3Dense => CudaExecutor::from_qwen3_bf16_safetensors(
-                model_path,
-                num_slots,
-                config.total_pages,
-                kv_dtype,
-                config.mem_fraction_static,
-            )?,
             // Qwen35 clamps `num_slots` to free HBM inside the constructor
             // (`Qwen35Model::kv_budget_plan`, the DSv4 joint solve via the
             // infer-seam budget kernel) — no longer the #60 OOM risk.
@@ -2206,7 +2172,9 @@ mod backend {
                 config.dspark_sps_bias_ms,
                 config.dspark_sps_row_ms,
             )?,
-            CudaModelKind::DiffusionGemma | CudaModelKind::Qwen3MoeUnsupported => {
+            CudaModelKind::DiffusionGemma
+            | CudaModelKind::Qwen3MoeUnsupported
+            | CudaModelKind::DenseQwen3Unsupported => {
                 unreachable!("checked before CUDA executor build")
             }
         };
@@ -2237,7 +2205,7 @@ mod backend {
             anyhow::ensure!(
                 executor.set_kv_tier_disk(root.clone(), *budget),
                 "--kv-disk: the loaded model has no KV tier store to spill \
-                 (Qwen3-dense page tier + Qwen3.6/DSv4 slot tier; a budget \
+                 (Qwen3.6/DSv4 slot tier; a budget \
                  below one page also lands here — raise --kv-disk-limit)"
             );
         }
@@ -2264,7 +2232,7 @@ mod backend {
         // scheduler-visible capacity that diverged from the executor's would
         // diverge the deterministic planner.
         let num_slots = executor.effective_num_slots().unwrap_or(num_slots);
-        // Paged-pool models (dense Qwen3 + Qwen3.6 + DSv4 MLA pool) profile their
+        // Paged-pool models (Qwen3.6 + DSv4 MLA pool) profile their
         // device KV pool from measured free VRAM (`profile_kv_pool_tokens`), so
         // the host admission pool must mirror that ACTUAL page count, not the
         // requested `config.total_pages`.
@@ -2277,9 +2245,7 @@ mod backend {
         // device token capacity and early-OOM
         let page_size = executor.effective_page_size().unwrap_or(page_size);
         let total_pages = cuda_admission_total_pages(kind, config, page_size, paged_pool_pages);
-        if matches!(kind, CudaModelKind::Qwen3Dense | CudaModelKind::Qwen35)
-            && paged_pool_pages != config.total_pages
-        {
+        if matches!(kind, CudaModelKind::Qwen35) && paged_pool_pages != config.total_pages {
             log::info!(
                 "CUDA {kind:?}: profiled full-attn KV pool {paged_pool_pages} pages from measured \
                  free VRAM (requested total_pages={}, mem_fraction_static={}); host admission \
@@ -2289,12 +2255,12 @@ mod backend {
             );
         }
         // M2: scheduler_config() raised max_prompt_tokens from the REQUESTED
-        // total_pages; on the dense-Qwen3/Qwen3.6 arm the device pool is profiled
+        // total_pages; on the Qwen3.6 arm the device pool is profiled
         // from free VRAM and may be SMALLER, so bind the ingress caps DOWN to the
         // profiled pool capacity and to max_total_tokens — else a long prompt
         // clears ingress, can't draw enough pages, and silently completes empty.
         // Mirrors DSv4 (max_seq clamp) and Metal (resource-guard clamp).
-        if matches!(kind, CudaModelKind::Qwen3Dense | CudaModelKind::Qwen35) {
+        if matches!(kind, CudaModelKind::Qwen35) {
             let profiled_capacity = total_pages.saturating_mul(page_size).max(1);
             scheduler.max_total_tokens = scheduler.max_total_tokens.min(profiled_capacity);
             scheduler.max_prompt_tokens =
@@ -2563,12 +2529,10 @@ mod backend {
     #[cfg(feature = "cuda")]
     fn router_cuda(
         model_path: &str,
-        enable_cuda_graph: bool,
         config: &EngineLoadConfig,
         shutdown: infer_server::ServeShutdown,
     ) -> Result<(axum::Router, Arc<LoadedInferenceEngine>)> {
-        let (serve, tokenizer, model_id) =
-            cuda_serve_handle(model_path, enable_cuda_graph, config, shutdown)?;
+        let (serve, tokenizer, model_id) = cuda_serve_handle(model_path, config, shutdown)?;
         let serve_engine = ServeInferenceEngine::new(model_id.clone(), tokenizer.clone(), serve);
         let serve_arc = serve_engine.serve_arc();
         let engine = Arc::new(LoadedInferenceEngine::Cuda(serve_engine));

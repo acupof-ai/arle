@@ -378,9 +378,6 @@ fn resolve_config(args: &Args, serve_args: &ServeArgs) -> Result<ServeConfig, St
         model_path,
         bind: serve_args.bind.clone(),
         port: serve_args.port,
-        // `--no-cuda-graph` flips the CUDA decode-graph default off; honored by
-        // the CUDA backend only (Metal/CPU ignore it).
-        enable_cuda_graph: !args.no_cuda_graph,
         engine_config,
         spec,
     };

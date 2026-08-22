@@ -807,59 +807,6 @@ pub fn decode_prep_paged_hd256_raw(
     }
 }
 
-/// Qwen3 dense paged prefill prep: q/k-norm + RoPE in place on `q`/`k`, K/V
-/// scattered into the paged pools through the per-request page-table offsets.
-#[allow(clippy::too_many_arguments)]
-pub fn prefill_attention_paged_prep_raw(
-    stream: &CudaStream,
-    q_ptr: u64,
-    k_ptr: u64,
-    v_ptr: u64,
-    q_norm_ptr: u64,
-    k_norm_ptr: u64,
-    cos_ptr: u64,
-    sin_ptr: u64,
-    page_table_ptr: u64,
-    page_table_offset_ptr: u64,
-    page_size: usize,
-    k_pool_ptr: u64,
-    v_pool_ptr: u64,
-    num_q_heads: usize,
-    num_kv_heads: usize,
-    head_dim: usize,
-    seq_len: usize,
-    start_pos_dev_ptr: u64,
-    rms_eps: f32,
-) -> Result<()> {
-    // SAFETY: caller passes live device addresses (batch rows, per-request
-    // page-table slice + offsets, pool bases), stream-ordered on `stream`.
-    unsafe {
-        ffi::prefill_attention_paged_prep_cuda(
-            q_ptr as *mut ffi::Half,
-            k_ptr as *mut ffi::Half,
-            v_ptr as *const ffi::Half,
-            q_norm_ptr as *const ffi::Half,
-            k_norm_ptr as *const ffi::Half,
-            cos_ptr as *const ffi::Half,
-            sin_ptr as *const ffi::Half,
-            page_table_ptr as *const i32,
-            page_table_offset_ptr as *const i32,
-            attn_i32(page_size, "qwen paged prep page_size")?,
-            k_pool_ptr as *mut ffi::Half,
-            v_pool_ptr as *mut ffi::Half,
-            attn_i32(num_q_heads, "qwen paged prep q_heads")?,
-            attn_i32(num_kv_heads, "qwen paged prep kv_heads")?,
-            attn_i32(head_dim, "qwen paged prep head_dim")?,
-            attn_i32(seq_len, "qwen paged prep seq_len")?,
-            start_pos_dev_ptr as *const i32,
-            rms_eps,
-            stream.cu_stream(),
-        )
-        .result()
-        .map_err(|e| anyhow!("prefill_attention_paged_prep_cuda failed at seq={seq_len}: {e}"))
-    }
-}
-
 /// Paged attention v1 (HD128/HD256 BF16 pool), resolved per
 /// `(head_dim, q_heads, kv_heads, phase)` from the generated kernel table;
 /// an unregistered head geometry is an error, never a silent fallback.
@@ -922,62 +869,6 @@ pub fn paged_attention_v1_raw(
         )
         .result()
         .map_err(|e| anyhow!("paged_attn_v1 {phase:?} failed at total_q={total_q}: {e}"))
-    }
-}
-
-/// Qwen3 dense paged decode prep, one q row per batch element: q/k-norm +
-/// RoPE in place on `q`, K/V appended to the paged pools at each row's last
-/// page.
-#[allow(clippy::too_many_arguments)]
-pub fn decode_prep_paged_raw(
-    stream: &CudaStream,
-    q_ptr: u64,
-    k_ptr: u64,
-    v_ptr: u64,
-    q_norm_ptr: u64,
-    k_norm_ptr: u64,
-    cos_ptr: u64,
-    sin_ptr: u64,
-    positions_ptr: u64,
-    k_pool_ptr: u64,
-    v_pool_ptr: u64,
-    page_table_ptr: u64,
-    page_indptr_ptr: u64,
-    last_page_len_ptr: u64,
-    num_qo_heads: usize,
-    num_kv_heads: usize,
-    page_size: usize,
-    stride_page: usize,
-    batch_size: usize,
-    rms_eps: f32,
-) -> Result<()> {
-    // SAFETY: caller passes live device addresses for the decode-prep layout;
-    // tail pages allocated, stream-ordered on `stream`.
-    unsafe {
-        ffi::decode_prep_paged_cuda(
-            q_ptr as *mut ffi::Half,
-            k_ptr as *const ffi::Half,
-            v_ptr as *const ffi::Half,
-            q_norm_ptr as *const ffi::Half,
-            k_norm_ptr as *const ffi::Half,
-            cos_ptr as *const ffi::Half,
-            sin_ptr as *const ffi::Half,
-            positions_ptr as *const i32,
-            k_pool_ptr as *mut ffi::Half,
-            v_pool_ptr as *mut ffi::Half,
-            page_table_ptr as *const i32,
-            page_indptr_ptr as *const i32,
-            last_page_len_ptr as *const i32,
-            attn_i32(num_qo_heads, "qwen decode prep qo_heads")?,
-            attn_i32(num_kv_heads, "qwen decode prep kv_heads")?,
-            attn_i32(page_size, "qwen decode prep page_size")?,
-            attn_i32(stride_page, "qwen decode prep stride_page")?,
-            attn_i32(batch_size, "qwen decode prep batch")?,
-            rms_eps,
-            stream.cu_stream(),
-        )
-        .result()
-        .map_err(|e| anyhow!("decode_prep_paged_cuda failed at batch={batch_size}: {e}"))
     }
 }
 

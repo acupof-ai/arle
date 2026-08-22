@@ -86,7 +86,6 @@ mod app {
         eval_steps: Vec<usize>,
         prompt_max_tokens: usize,
         max_step_seconds: Option<f64>,
-        enable_cuda_graph: bool,
         save_student_checkpoint: Option<PathBuf>,
         save_every: usize,
         gkd_lambda: f32,
@@ -130,7 +129,7 @@ mod app {
              lora_rank={} lora_alpha={:.6} lora_target_set={} \
              steps={} rollout_len={} lr={:.9e} grad_clip={GRAD_CLIP} \
              prompt_source={} train_prompt_count={} heldout_prompt_count={} \
-             eval_steps={:?} cuda_graph={} save_student_checkpoint={} save_every={} \
+             eval_steps={:?} save_student_checkpoint={} save_every={} \
              gkd_lambda={:.6} sft_anchor={} kl_chunk_size={} logits_window_size={} \
              opd_kl_mask={} eval_train_prompt_limit={}",
             args.teacher_model.display(),
@@ -146,7 +145,6 @@ mod app {
             prompts.train.len(),
             prompts.heldout.len(),
             args.eval_steps,
-            args.enable_cuda_graph,
             args.save_student_checkpoint
                 .as_ref()
                 .map(|path| path.display().to_string())
@@ -209,7 +207,6 @@ mod app {
             let engine = load_infer_engine(
                 &args.student_model,
                 args.prompt_max_tokens + args.rollout_len + 32,
-                args.enable_cuda_graph,
             )?;
             let infer_student = InferStudent::new(
                 Arc::new(Mutex::new(engine)),
@@ -287,7 +284,6 @@ mod app {
         let infer_engine = load_infer_engine(
             &args.teacher_model,
             args.prompt_max_tokens + args.rollout_len + 32,
-            args.enable_cuda_graph,
         )?;
         let infer_load_seconds = infer_load_started.elapsed().as_secs_f64();
         log_device_vram("03_after_teacher_infer_load", &cuda_backend);
@@ -330,7 +326,6 @@ mod app {
         let mut eval_steps = Vec::new();
         let mut prompt_max_tokens = DEFAULT_PROMPT_MAX_TOKENS;
         let mut max_step_seconds = None;
-        let mut enable_cuda_graph = true;
         let mut save_student_checkpoint = None;
         let mut save_every = 0usize;
         let mut gkd_lambda = 0.0f32;
@@ -389,7 +384,6 @@ mod app {
                 "--lora-target-set" => {
                     lora_target_set = parse_lora_target_set(&next_arg(&mut args, &arg)?)?
                 }
-                "--no-cuda-graph" => enable_cuda_graph = false,
                 "--help" | "-h" => {
                     println!(
                         "usage: cargo run -p train --example opd_step_cuda_infer_teacher_train \
@@ -404,8 +398,7 @@ mod app {
                          [--eval-train-prompt-limit N|all(default {DEFAULT_EVAL_TRAIN_PROMPT_LIMIT})] \
                          [--lora-rank N(default {DEFAULT_LORA_RANK})] \
                          [--lora-alpha F(default {DEFAULT_LORA_ALPHA})] \
-                         [--lora-target-set attention-qv(default)|all-linear] \
-                         [--no-cuda-graph]"
+                         [--lora-target-set attention-qv(default)|all-linear]"
                     );
                     std::process::exit(0);
                 }
@@ -437,7 +430,6 @@ mod app {
             eval_steps,
             prompt_max_tokens,
             max_step_seconds,
-            enable_cuda_graph,
             save_student_checkpoint,
             save_every,
             gkd_lambda,
@@ -612,7 +604,6 @@ mod app {
     fn load_infer_engine(
         model_dir: &Path,
         max_seq_len: usize,
-        enable_cuda_graph: bool,
     ) -> anyhow::Result<LoadedInferenceEngine> {
         let max_seq_len = max_seq_len.max(128);
         // Single-slot OPD teacher (migrated off the legacy ServerRuntimeConfig
@@ -622,7 +613,6 @@ mod app {
             model_dir
                 .to_str()
                 .ok_or_else(|| anyhow::anyhow!("model path is not valid UTF-8"))?,
-            enable_cuda_graph,
             EngineLoadConfig {
                 num_slots: 1,
                 page_size,

@@ -325,8 +325,8 @@ Apply these by **identifying the binding constraint first** (Phase 3), THEN sele
   - Pattern: KV cache in fixed-size pages, page table indirection, eliminates fragmentation.
   - ARLE has this (`crates/cuda-kernels/csrc/kv/`).
 
-- **TileLang HD128 paged attention** (this repo).
-  - File: `crates/cuda-kernels/tools/tilelang/batch_prefill_paged_hd128.py`
+- **TileLang HD256 paged attention** (this repo).
+  - File: `crates/cuda-kernels/tools/tilelang/batch_prefill_paged_hd256.py`
   - Pattern: TileLang DSL → AOT cubin per (q-heads, kv-heads, SM). Online softmax + paged KV.
   - Constraint: TileLang 0.1.9 codegen rigid on `BLOCK_M / NUM_THREADS` (`warp_col_tiles > 8` rule, fragment layout assert).
 

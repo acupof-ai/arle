@@ -209,7 +209,6 @@ pub(super) fn load_opd_infer_teacher(
         teacher_dir
             .to_str()
             .ok_or_else(|| anyhow!("teacher model path is not valid UTF-8"))?,
-        true,
         EngineLoadConfig {
             // Scoring is single-sequence; the default 0.9 fraction lets the teacher
             // pool starve a co-resident student on one GPU.

@@ -247,12 +247,11 @@ impl Qwen35Model {
             ),
         );
         // Full attention here is the GATED q_proj variant (Qwen3.5/3.6); the
-        // prep+gate kernels assume it. Vanilla un-gated Qwen3 would need
-        // the dense path, not this loader.
+        // prep+gate kernels assume it. Vanilla un-gated Qwen3 has no CUDA path.
         ensure!(
             m.full_attn_gated,
             "clean CUDA Qwen3.5 hybrid path expects the gated full-attention q_proj \
-             (Qwen3.5/3.6); un-gated Qwen3 uses from_qwen3_bf16_safetensors"
+             (Qwen3.5/3.6); un-gated Qwen3 dense is not supported on CUDA"
         );
         ensure!(
             m.rope_scaling.is_none(),
@@ -2358,7 +2357,7 @@ fn routed_expert_weight_format(
 
 /// This EP rank's loaded MoE weights for one sparse layer. Built by
 /// [`SafetensorLoader::load_moe_layer_experts`], consumed by
-/// [`crate::moe::moe_forward`].
+/// [`crate::moe::moe_forward_into`].
 pub(crate) struct MoeLayerWeights {
     /// Per-expert weight matrices (hand grouped-GEMM path). EMPTY when the grouped
     /// caches

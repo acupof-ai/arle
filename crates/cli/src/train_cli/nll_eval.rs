@@ -34,12 +34,9 @@ pub(super) fn run_ppl(args: TrainPplArgs) -> Result<()> {
         );
     }
 
-    let engine = LoadedInferenceEngine::load_with_config(
-        model_path,
-        /*cuda_graph=*/ true,
-        EngineLoadConfig::single_sequence(ctx),
-    )
-    .with_context(|| format!("load engine from {model_path}"))?;
+    let engine =
+        LoadedInferenceEngine::load_with_config(model_path, EngineLoadConfig::single_sequence(ctx))
+            .with_context(|| format!("load engine from {model_path}"))?;
 
     // Non-overlapping windows of `ctx`; each contributes len-1 next-token NLLs.
     let mut sum_nll = 0.0f64;

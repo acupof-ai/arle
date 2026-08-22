@@ -120,7 +120,6 @@ pub(super) fn run_w2s(args: TrainW2sArgs) -> Result<()> {
                 let engine = LoadedInferenceEngine::load_with_config(
                     path.to_str()
                         .ok_or_else(|| anyhow!("aux1 {} path not UTF-8", label))?,
-                    true,
                     aux_cfg.clone(),
                 )
                 .with_context(|| format!("load aux1 {label} infer from {}", path.display()))?;
