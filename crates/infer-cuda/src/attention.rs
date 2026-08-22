@@ -625,9 +625,13 @@ fn prefill_proj_deepgemm_group_scratch(
     );
     let active_count =
         i32::try_from(m).map_err(|_| anyhow!("DSv4 grouped wo_a token count {m} overflows i32"))?;
-    ctx.stream
-        .memcpy_htod(&[active_count], &mut scratch.active_counts)
-        .map_err(|e| anyhow!("DSv4 grouped wo_a active_counts H2D failed: {e}"))?;
+    // active_counts is initialized to [1] at scratch construction; skip the
+    // per-step H2D at m=1 (decode) so the graph capture sees no host memcpy.
+    if m != 1 {
+        ctx.stream
+            .memcpy_htod(&[active_count], &mut scratch.active_counts)
+            .map_err(|e| anyhow!("DSv4 grouped wo_a active_counts H2D failed: {e}"))?;
+    }
     let stream = ctx.stream.cu_stream();
     let (input_ptr, _input_guard) = scratch.oproj_group_in.device_ptr(&ctx.stream);
     let (fp8_ptr, _fp8_guard) = scratch.input_fp8.device_ptr(&ctx.stream);
