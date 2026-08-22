@@ -1,7 +1,7 @@
 //! Host-only KV batch descriptors.
 //!
 //! The engine builds this from a [`ForwardPlan`](infer_plan::ForwardPlan) and a
-//! [`KvPool`](crate::KvPool) after logical KV allocation. Backends lower the
+//! [`KvPool`](crate::KvPool) after logical KV allocation; backends lower the
 //! descriptor into device-specific page tables and model-specific KV views.
 
 use std::ops::Range;
@@ -29,7 +29,6 @@ pub struct KvBatchDescriptor {
     pub flat_slot_page_ids: Vec<u32>,
 }
 
-/// One row in a [`KvBatchDescriptor`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KvBatchRow {
     pub slot: usize,
@@ -48,7 +47,6 @@ pub struct KvBatchRow {
     pub slot_page_range: Range<usize>,
 }
 
-/// Forward row kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KvBatchRowKind {
     Prefill,
@@ -56,8 +54,6 @@ pub enum KvBatchRowKind {
 }
 
 impl KvBatchDescriptor {
-    /// Build a host-only descriptor for `plan`.
-    ///
     /// The engine calls this after [`KvPool::alloc`](crate::KvAllocator::alloc)
     /// has reserved the row's output span, so the pool length must cover
     /// `append_pos + append_len`.

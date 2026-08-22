@@ -1,7 +1,5 @@
-//! Prefix-cache page retention.
-//!
-//! Retain/release ref-counting and attach of externally retained pages — the
-//! surface a `PrefixManager` drives to share prompt prefixes across slots.
+//! Prefix-cache page retention — the retain/release/attach surface a
+//! `PrefixManager` drives to share prompt prefixes across slots.
 
 /// Prefix-cache page retention visible to engine-core.
 ///

@@ -56,7 +56,6 @@ pub use resource::{
 };
 pub use runtime_flags::{CommBackend, CudaRuntimeFlags, MetalRuntimeFlags};
 
-/// Result of polling a submitted executor step.
 #[derive(Debug, Clone)]
 pub enum PollResult<I> {
     Ready(StepOutput),
@@ -151,7 +150,6 @@ pub struct OperatorImplementationHits {
     pub hits: u64,
 }
 
-/// Device-neutral operator-policy identity and cumulative dispatch counters.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct OperatorDispatchStats {
     pub policy_hash: String,
@@ -253,7 +251,6 @@ impl Default for StepLimits {
     }
 }
 
-/// Per-GPU utilization sample from the backend's background sampler.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct GpuDeviceSample {
     pub gpu_index: u8,
@@ -337,7 +334,6 @@ pub trait BackendExecutor {
         StepLimits::default()
     }
 
-    /// Backend counters and artifact identity.
     fn stats(&self) -> BackendStats {
         BackendStats::default()
     }
@@ -373,7 +369,6 @@ pub trait BackendExecutor {
         None
     }
 
-    /// Page-granular host/disk KV tier store.
     fn kv_page_tier(&mut self) -> Option<&mut dyn KvPageTier> {
         None
     }
@@ -553,7 +548,6 @@ pub trait PrefixReuse {
     ) -> anyhow::Result<()>;
 }
 
-/// Page-granular host/disk KV tier store capability.
 pub trait KvPageTier {
     /// Number of KV pages the backend's host-demoted store can hold. `0`
     /// means the tier store is currently unbudgeted and the engine never calls
@@ -688,7 +682,6 @@ pub trait MultimodalGenerate {
     fn multimodal_kind(&self) -> Option<MultimodalKind>;
 }
 
-/// Verdict returned by the resource governor at the admission boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AdmissionVerdict {
     Admit,

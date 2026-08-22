@@ -2,15 +2,10 @@
 //!
 //! This is the *request*, not the resolution: the engine carries it from the
 //! CLI/`EngineLoadConfig` down to a backend builder, which resolves it against
-//! its own support matrix (e.g. Metal → `MetalKvCacheDtype`, CUDA → its paged-KV
-//! dispatch). Keeping the request enum at the seam is what makes KV-quant an
-//! *engine capability* rather than a per-model fork: a backend that cannot honor
-//! a requested dtype fails loud at construction, it does not silently downgrade.
-//!
-//! `Auto` defers to the backend default (Metal resolves it to INT8 after the
-//! Metal int8 gate; CUDA keeps BF16). `Fp8`/`Tq4` are CUDA-only paged-KV quant
-//! modes: the CLI accepts them (#68 T4) but the CUDA resolve fails loud until
-//! each mode's paged kernel path lands (#68 T3).
+//! its own support matrix. Keeping the request enum at the seam is what makes
+//! KV-quant an *engine capability* rather than a per-model fork: a backend
+//! that cannot honor a requested dtype fails loud at construction, it does not
+//! silently downgrade.
 
 /// Requested KV-cache storage dtype, resolved per-backend at construction.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
