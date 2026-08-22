@@ -389,6 +389,9 @@ impl CudaBackend {
             return self.marlin_fp4_to_bf16(storage);
         }
         let (group_size, scale_cols) = (storage.group_size(), storage.scale_cols());
+        let global_scale = storage.global_scale().ok_or(AutogradError::TapeInvariant(
+            "nvfp4 group dequant has no global scale buffer",
+        ))?;
         let total = rows * cols;
         if storage.weight().len() != total / 2 || storage.scales().len() != rows * scale_cols {
             return Err(AutogradError::TapeInvariant(
@@ -415,7 +418,7 @@ impl CudaBackend {
                 builder
                     .arg(storage.weight())
                     .arg(storage.scales())
-                    .arg(storage.global_scale())
+                    .arg(global_scale)
                     .arg(&mut out)
                     .arg(&total_i32)
                     .arg(&cols_i32)
@@ -444,13 +447,7 @@ impl CudaBackend {
                 "cuda backend marlin nvfp4 dequant handle size does not match shape",
             ));
         }
-        let global = self
-            .stream
-            .clone_dtoh(storage.global_scale())
-            .map_err(|_| AutogradError::TapeInvariant("marlin nvfp4 global scale D2H failed"))?;
-        let global_scale = global.first().copied().ok_or(AutogradError::TapeInvariant(
-            "marlin nvfp4 global scale is empty",
-        ))?;
+        let global_scale = storage.marlin_global();
         let total = rows * cols;
         let mut out = alloc_zeros_retry::<u16>(self, total).map_err(|e| {
             eprintln!("[autograd] alloc_zeros {total} x u16 failed (marlin nvfp4 dequant): {e}");

@@ -324,7 +324,11 @@ impl CudaFp8BlockScaledStorage {
 pub struct CudaFp4E2M1GroupStorage {
     weight: Arc<cudarc::driver::CudaSlice<u8>>,
     scales: Arc<cudarc::driver::CudaSlice<u8>>,
-    global_scale: Arc<cudarc::driver::CudaSlice<f32>>,
+    /// `None` on the Marlin path: the repack's folded global lives in
+    /// `marlin_global` as a plain scalar, so a borrowed view owns no buffer it
+    /// would have to leak on drop.
+    global_scale: Option<Arc<cudarc::driver::CudaSlice<f32>>>,
+    marlin_global: f32,
     rows: usize,
     cols: usize,
     group_size: usize,
@@ -349,7 +353,9 @@ impl Drop for CudaFp4E2M1GroupStorage {
         // `CudaFp8BlockScaledStorage` Drop for the full rationale.
         std::mem::forget(self.weight.clone());
         std::mem::forget(self.scales.clone());
-        std::mem::forget(self.global_scale.clone());
+        if let Some(global) = self.global_scale.as_ref() {
+            std::mem::forget(global.clone());
+        }
     }
 }
 
@@ -368,7 +374,8 @@ impl CudaFp4E2M1GroupStorage {
         Self {
             weight: Arc::new(weight),
             scales: Arc::new(scales),
-            global_scale: Arc::new(global_scale),
+            global_scale: Some(Arc::new(global_scale)),
+            marlin_global: 0.0,
             rows,
             cols,
             group_size,
@@ -378,41 +385,20 @@ impl CudaFp4E2M1GroupStorage {
         }
     }
 
-    /// Marlin-layout twin of [`Self::new`]: `weight` is the packed tile buffer,
-    /// `scales` the S0E5M3 tail, `global_scale` the repack's folded bf16 value.
-    pub(crate) fn new_marlin(
-        weight: cudarc::driver::CudaSlice<u8>,
-        scales: cudarc::driver::CudaSlice<u8>,
-        global_scale: cudarc::driver::CudaSlice<f32>,
-        rows: usize,
-        cols: usize,
-    ) -> Self {
-        Self {
-            weight: Arc::new(weight),
-            scales: Arc::new(scales),
-            global_scale: Arc::new(global_scale),
-            rows,
-            cols,
-            group_size: 16,
-            scale_cols: cols / 16,
-            marlin: true,
-            borrowed: false,
-        }
-    }
-
     /// Non-owning Marlin view over a serving engine's resident base. Same
     /// foreign-ownership contract as `CudaFp8BlockScaledStorage::new_borrowed`.
     pub(crate) fn new_borrowed_marlin(
         weight: cudarc::driver::CudaSlice<u8>,
         scales: cudarc::driver::CudaSlice<u8>,
-        global_scale: cudarc::driver::CudaSlice<f32>,
+        global_scale: f32,
         rows: usize,
         cols: usize,
     ) -> Self {
         Self {
             weight: Arc::new(weight),
             scales: Arc::new(scales),
-            global_scale: Arc::new(global_scale),
+            global_scale: None,
+            marlin_global: global_scale,
             rows,
             cols,
             group_size: 16,
@@ -420,6 +406,10 @@ impl CudaFp4E2M1GroupStorage {
             marlin: true,
             borrowed: true,
         }
+    }
+
+    pub(crate) fn marlin_global(&self) -> f32 {
+        self.marlin_global
     }
 
     pub(crate) fn is_marlin(&self) -> bool {
@@ -439,8 +429,8 @@ impl CudaFp4E2M1GroupStorage {
         self.scales.as_ref()
     }
 
-    pub(crate) fn global_scale(&self) -> &cudarc::driver::CudaSlice<f32> {
-        self.global_scale.as_ref()
+    pub(crate) fn global_scale(&self) -> Option<&cudarc::driver::CudaSlice<f32>> {
+        self.global_scale.as_deref()
     }
 
     pub(crate) fn rows(&self) -> usize {
