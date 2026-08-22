@@ -8,6 +8,7 @@ detail in the linked wins/errors entry. Oldest sections are condensed.
 
 ## [Unreleased]
 
+- Close the LoRA merge loop for an NVFP4 base: `dequantize_fp4_marlin_to_bf16` plus FP8 slot setup and a `retired_marlin` keepalive, so `rubric-opd`/`agent-opd` can sync a trained LoRA back into an NVFP4 rollout engine. Verified on Qwen3.6-27B-NVFP4; see `docs/experience/wins/2026-08-22-nvfp4-lora-merge-loop.md`.
 - **Flag deletion wave 3 follow-up — accepted: `examples/dsv4_resident_ab.rs` (601 lines) and the fused-WQKV override chain deleted (the axis was a proven +18.4 % winner with a preflight fallback); a dangling `set_dsv4_moe_contig_decode` doc comment removed.** See `docs/experience/wins/2026-08-22-flag-deletion-wave3.md`.
 - **Flag deletion wave 3 — accepted: `--dspark-confidence-threshold`/`--mtp-adaptive`/`--mtp-min-accept`/`--dsv4-flashmla-decode` deleted with full chains (incl. the FlashMLA override API and the resident A/B example's scalar arm), `dsv4_decode_reuse_enabled()` shim removed; serve flags 53 → 49.** See `docs/experience/wins/2026-08-22-flag-deletion-wave3.md`.
 - **Flag deletion wave 2 — accepted: `--qwen35-fa3`/`--qwen35-deepgemm`/`--qwen35-moe-decode-kernel` deleted (off-arms 2.76×/15.4×/10.8× worse), Metal warmup seam default fixed to match shipped false, 12 stale doc refs cleaned** (`5b880f2f8`). See `docs/experience/wins/2026-08-22-flag-deletion-wave2.md`.
