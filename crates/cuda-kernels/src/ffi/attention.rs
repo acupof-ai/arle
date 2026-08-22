@@ -488,9 +488,11 @@ unsafe extern "C" {
     ///
     /// Reads the FP8 e4m3 / INT8 pools and per-(token, kv_head) f32 scales
     /// directly from the paged pool (no dequant temp). FA3-style persistent
-    /// split-KV on tensor cores: one CTA per (batch row, kv-head, split), the
-    /// kv-head's q-heads as the rows of one 16-row MMA tile (GQA ratio <= 16),
-    /// grid `[num_kv_heads * num_splits, batch]`, plus a merge kernel. sm_80+. Decode-shaped
+    /// split-KV on tensor cores: one CTA per (batch row, kv-head, split,
+    /// q-tile), a q-tile being 16 (query token, q-head) rows of the kv-head's
+    /// GQA group (ratio <= 16), so rows of 1..=8 query tokens (decode and spec
+    /// verify) fit; grid `[num_kv_heads * num_splits, batch, q_tiles]`, plus a
+    /// merge kernel. `max_qlen` is the longest row's query length. sm_80+. Decode-shaped
     /// (one q token per row; `cu_seqlens_q` names each row's q token).
     /// `page_table` is the rectangular `[batch, page_table_stride]` table;
     /// `seqused_k` is the per-row KV extent in tokens — the same device
@@ -513,6 +515,7 @@ unsafe extern "C" {
         page_table_stride: i32,
         batch: i32,
         total_q: i32,
+        max_qlen: i32,
         sm_scale: f32,
         is_fp8: bool,
         num_splits: i32,

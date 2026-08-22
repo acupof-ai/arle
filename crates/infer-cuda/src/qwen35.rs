@@ -69,6 +69,8 @@ const DEFAULT_ROPE_CACHE_LEN: usize = 32_768;
 /// TileLang kernel does the whole batch in one launch (measured 2026-07-28:
 /// c=8 TTFT p50 12.07 → 18.23 s with prefill routed here).
 const FA3_MAX_QLEN: usize = 64;
+/// Longest query row the quantized-pool tensor-core kernel takes (`PAF3_MAX_QLEN`).
+const QUANT_POOL_KERNEL_MAX_QLEN: usize = 8;
 
 /// Floor for the derived FA3 decode split ceiling — the value shipped as a
 /// constant before the ceiling was derived, and the measured optimum from
