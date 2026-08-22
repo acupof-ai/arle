@@ -1851,6 +1851,15 @@ impl SafetensorLoader {
                 })
             }
             QuantMatrixShard::Cols(spec) => {
+                // Per-channel scales (one column): a col shard keeps every row, so
+                // each rank needs the whole scale column — replicate, don't slice.
+                if scale_cols == 1 {
+                    return Ok(ShardedBytesCow {
+                        bytes: Cow::Borrowed(bytes),
+                        rows: scale_rows,
+                        cols: 1,
+                    });
+                }
                 ensure!(
                     spec.offset.is_multiple_of(block_k)
                         && (spec.end() == cols || spec.end().is_multiple_of(block_k)),
